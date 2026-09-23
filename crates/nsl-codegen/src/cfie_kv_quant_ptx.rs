@@ -1,4 +1,4 @@
-//! CFIE Feature 5: per-layer KV-quant decode-attention PTX emitters.
+//! CFIE Feature 5: per-layer KV-quant decode-attention kernels, built as KIR.
 //!
 //! The paper's claim: "Layer 3's attention kernel reads INT8 K/V and
 //! dequantizes in registers; layer 0's kernel reads FP16 directly.  No
@@ -8,9 +8,8 @@
 //! layer's K and V load paths are specialized at compile time to that
 //! layer's `KvPrecision` decision from `cfie_kv_quant::KvQuantPlan`:
 //!
-//!   * `Fp16`: `ld.global.b16` + `cvt.f32.f16` (identical to the base
-//!     kernel's load path).
-//!   * `Int8`: `ld.global.s8` + `cvt.rn.f32.s8` + `mul.f32` by a
+//!   * `Fp16`: an f16 load widened to f32 (the base kernel's load path).
+//!   * `Int8`: an s8 load, `cvt.rn.f32.s8`, and a multiply by a
 //!     per-(layer, kv-half) dequant scale — dequantized in registers.
 //!   * `Int4` / `Bf16`: refused in v1 (loud assert).
 //!
@@ -25,7 +24,7 @@
 //! the cache half is written, and reaches the kernel as a `.f32`
 //! kernel parameter (`k_scale` / `v_scale`).  Baking the scale would
 //! require knowing activation magnitudes at compile time, which the
-//! paper does not claim.  FP16 layers declare but never load the scale
+//! paper does not claim.  FP16 layers declare but never read the scale
 //! params so every layer shares one 7-param launch ABI.
 //!
 //! ## Layout consequence: the pool becomes layer-dependent
@@ -39,12 +38,33 @@
 //! [`pool_layout`] / [`total_pool_bytes`].  An all-FP16 plan
 //! reproduces the base kernel's uniform derivation exactly.
 //!
+//! An f16 half must start on an even byte, and one can only land on an
+//! odd byte after an int8 half with an odd element count
+//! (`max_tokens * n_kv_heads * head_dim`). Such a layout is refused (see
+//! `validate`): the load would be misaligned, which the GPU faults on.
+//!
+//! ## KIR (roadmap A2 step 9)
+//!
+//! Each layer's kernel was hand-assembled PTX text until A2 step 9; it is
+//! now the flash-decode [`KernelIR`] `cfie_decode_attention` builds, over
+//! a [`PoolLayout::Baked`] pool: the kernel names each half by its baked
+//! byte offset from `kv_base` and reads it in the half's element type.
+//! The algorithm and the order of every floating-point operation are the
+//! hand kernels'; `tests/cfie_kv_quant_kir_equivalence.rs` runs the frozen
+//! hand emitter and this one side by side on a PTX interpreter and
+//! requires the same output bits. Like the base kernel, the module now
+//! targets the KIR floor (`.version 7.0` / `.target sm_70`) and the driver
+//! JIT-compiles it forward, so the configuration has no `sm_version`.
+//!
 //! Plan/serve wiring is out of scope here; this module only exposes
 //! the emitters, layout math, and CPU references.
 
 use std::fmt::Write;
 
+use crate::backend_ptx::lower_kir_to_ptx;
+use crate::cfie_decode_attention::{build_flash_decode, BakedHalf, FlashDecode, PoolLayout};
 use crate::cfie_kv_quant::KvPrecision;
+use crate::kernel_ir::KernelIR;
 
 /// Threads per CTA and softmax tile width — must match
 /// `cfie_decode_attention` (same flash-decode scheme).
@@ -57,6 +77,10 @@ pub fn kernel_name_for_layer(layer_idx: u32) -> String {
 }
 
 /// Compile-time layout + per-layer precision configuration.
+///
+/// There is no `sm_version`: each kernel targets the KIR floor and the
+/// driver JIT-compiles it for the device it is loaded on (see the module
+/// docs).
 #[derive(Debug, Clone)]
 pub struct QuantDecodeAttentionConfig {
     pub n_layers: u32,
@@ -65,7 +89,6 @@ pub struct QuantDecodeAttentionConfig {
     pub head_dim: u32,
     pub per_slot_max_tokens: u32,
     pub max_slots: u32,
-    pub sm_version: u32,
     /// `(K precision, V precision)` per layer; `len() == n_layers`.
     pub layer_precisions: Vec<(KvPrecision, KvPrecision)>,
 }
@@ -84,7 +107,7 @@ pub struct QuantDecodeAttentionMeta {
     pub smem_bytes: u32,
     pub block_dim: u32,
     pub grid_dim_is_n_heads: bool,
-    /// Whether the kernel actually loads `k_scale` / `v_scale`.  Both
+    /// Whether the kernel actually reads `k_scale` / `v_scale`.  Both
     /// params are always DECLARED (uniform launch ABI); FP16 halves
     /// ignore theirs.
     pub k_scale_param_used: bool,
@@ -98,10 +121,6 @@ pub struct LayerPoolOffsets {
     pub v_offset_bytes: u64,
     pub k_elem_bytes: u32,
     pub v_elem_bytes: u32,
-}
-
-fn f32_imm(v: f32) -> String {
-    format!("0f{:08X}", v.to_bits())
 }
 
 /// Bytes per stored element for a supported precision; refuses the
@@ -120,6 +139,31 @@ fn elem_bytes(p: KvPrecision) -> u32 {
              only Fp16 and Int8 load paths are emitted; re-plan with Fp16/Int8"
         ),
     }
+}
+
+/// Each layer's K/V half offsets: the byte sizes of all preceding halves
+/// summed (layer order, K half then V half). No checks; see
+/// [`pool_layout`].
+fn offsets(cfg: &QuantDecodeAttentionConfig) -> Vec<LayerPoolOffsets> {
+    let token_stride = cfg.n_kv_heads as u64 * cfg.head_dim as u64;
+    let max_tokens = cfg.max_slots as u64 * cfg.per_slot_max_tokens as u64;
+    let half_elems = max_tokens * token_stride;
+    let mut cursor = 0u64;
+    let mut out = Vec::with_capacity(cfg.n_layers as usize);
+    for &(kp, vp) in &cfg.layer_precisions {
+        let (kb, vb) = (elem_bytes(kp), elem_bytes(vp));
+        let k_offset_bytes = cursor;
+        cursor += half_elems * kb as u64;
+        let v_offset_bytes = cursor;
+        cursor += half_elems * vb as u64;
+        out.push(LayerPoolOffsets {
+            k_offset_bytes,
+            v_offset_bytes,
+            k_elem_bytes: kb,
+            v_elem_bytes: vb,
+        });
+    }
+    out
 }
 
 fn validate(cfg: &QuantDecodeAttentionConfig) {
@@ -157,31 +201,24 @@ fn validate(cfg: &QuantDecodeAttentionConfig) {
         let _ = elem_bytes(kp);
         let _ = elem_bytes(vp);
     }
+    // An f16 half on an odd byte would be a misaligned 2-byte load.
+    for (l, o) in offsets(cfg).iter().enumerate() {
+        for (half, off, elem) in [("K", o.k_offset_bytes, o.k_elem_bytes), ("V", o.v_offset_bytes, o.v_elem_bytes)] {
+            assert!(
+                off % elem as u64 == 0,
+                "layer {l}'s {half} half would start at byte {off}, not a multiple of its \
+                 {elem}-byte element: an int8 half before it has an odd element count \
+                 (max_tokens * n_kv_heads * head_dim); re-plan the precisions or the geometry"
+            );
+        }
+    }
 }
 
 /// Compute each layer's baked K/V half offsets by summing the byte
 /// sizes of all preceding halves (layer order, K half then V half).
 pub fn pool_layout(cfg: &QuantDecodeAttentionConfig) -> Vec<LayerPoolOffsets> {
     validate(cfg);
-    let token_stride = cfg.n_kv_heads as u64 * cfg.head_dim as u64;
-    let max_tokens = cfg.max_slots as u64 * cfg.per_slot_max_tokens as u64;
-    let half_elems = max_tokens * token_stride;
-    let mut cursor = 0u64;
-    let mut out = Vec::with_capacity(cfg.n_layers as usize);
-    for &(kp, vp) in &cfg.layer_precisions {
-        let (kb, vb) = (elem_bytes(kp), elem_bytes(vp));
-        let k_offset_bytes = cursor;
-        cursor += half_elems * kb as u64;
-        let v_offset_bytes = cursor;
-        cursor += half_elems * vb as u64;
-        out.push(LayerPoolOffsets {
-            k_offset_bytes,
-            v_offset_bytes,
-            k_elem_bytes: kb,
-            v_elem_bytes: vb,
-        });
-    }
-    out
+    offsets(cfg)
 }
 
 /// Total pool allocation in bytes for the mixed-precision layout.
@@ -196,11 +233,7 @@ pub fn total_pool_bytes(cfg: &QuantDecodeAttentionConfig) -> u64 {
         .sum()
 }
 
-/// Emit the specialized decode-attention kernel for one layer.
-pub fn emit_layer(
-    cfg: &QuantDecodeAttentionConfig,
-    layer_idx: u32,
-) -> (String, QuantDecodeAttentionMeta) {
+fn check_layer(cfg: &QuantDecodeAttentionConfig, layer_idx: u32) {
     validate(cfg);
     assert!(
         layer_idx < cfg.n_layers,
@@ -208,46 +241,45 @@ pub fn emit_layer(
         layer_idx,
         cfg.n_layers
     );
-    let (kp, vp) = cfg.layer_precisions[layer_idx as usize];
-    let offsets = pool_layout(cfg)[layer_idx as usize];
-    let k_elem = offsets.k_elem_bytes as u64;
-    let v_elem = offsets.v_elem_bytes as u64;
+}
 
-    // Strides re-derived identically to cfie_decode_attention: the
-    // contiguous per-token record is [n_kv_heads][head_dim].
+/// Build one layer's specialized decode-attention kernel as KIR.
+///
+/// The flash-decode kernel `cfie_decode_attention::build` documents, over
+/// this layer's two halves: each at its baked byte offset from `kv_base`,
+/// read as f16, or as int8 dequantized by its half's scale param.
+pub fn build_layer(cfg: &QuantDecodeAttentionConfig, layer_idx: u32) -> KernelIR {
+    check_layer(cfg, layer_idx);
+    let (kp, vp) = cfg.layer_precisions[layer_idx as usize];
+    let o = offsets(cfg)[layer_idx as usize];
+    let name = kernel_name_for_layer(layer_idx);
+    build_flash_decode(&FlashDecode {
+        name: &name,
+        n_heads: cfg.n_heads,
+        n_kv_heads: cfg.n_kv_heads,
+        head_dim: cfg.head_dim,
+        per_slot_max_tokens: cfg.per_slot_max_tokens,
+        max_slots: cfg.max_slots,
+        pool: PoolLayout::Baked {
+            k: BakedHalf { offset_bytes: o.k_offset_bytes, int8: kp == KvPrecision::Int8 },
+            v: BakedHalf { offset_bytes: o.v_offset_bytes, int8: vp == KvPrecision::Int8 },
+        },
+    })
+}
+
+/// The `//` header: the layer's precisions and what its kernel bakes.
+/// The hand emitter's lines, unchanged.
+fn header_comment(cfg: &QuantDecodeAttentionConfig, layer_idx: u32) -> String {
+    let (kp, vp) = cfg.layer_precisions[layer_idx as usize];
+    let o = offsets(cfg)[layer_idx as usize];
     let token_stride = cfg.n_kv_heads as u64 * cfg.head_dim as u64;
     let max_tokens = cfg.max_slots as u64 * cfg.per_slot_max_tokens as u64;
-    let k_token_stride_bytes = token_stride * k_elem;
-    let v_token_stride_bytes = token_stride * v_elem;
-    let k_head_row_bytes = cfg.head_dim as u64 * k_elem;
-    let v_head_row_bytes = cfg.head_dim as u64 * v_elem;
-
-    let group = cfg.n_heads / cfg.n_kv_heads;
-    let inv_sqrt_hd = f32_imm(1.0f32 / (cfg.head_dim as f32).sqrt());
-    let log2e = f32_imm(std::f32::consts::LOG2_E);
-    let neg_inf = f32_imm(f32::NEG_INFINITY);
-    let zero = f32_imm(0.0);
-
-    // SMEM layout (f32): [q: head_dim][scores: TILE][rescale: 1][l: 1]
-    // — identical to the base kernel.
-    let scores_off = cfg.head_dim * 4;
-    let rescale_off = scores_off + TILE * 4;
-    let l_off = rescale_off + 4;
-    let smem_bytes = l_off + 4;
-
-    let hd = cfg.head_dim;
-    let name = kernel_name_for_layer(layer_idx);
-    let k_is_i8 = kp == KvPrecision::Int8;
-    let v_is_i8 = vp == KvPrecision::Int8;
-
-    let mut p = String::new();
-    let w = &mut p;
-
+    let mut w = String::new();
     writeln!(w, "//").unwrap();
     writeln!(
         w,
         "// {} - CFIE per-layer KV-quant decode attention (flash-decode).",
-        name
+        kernel_name_for_layer(layer_idx)
     )
     .unwrap();
     writeln!(
@@ -259,292 +291,67 @@ pub fn emit_layer(
         vp.as_str()
     )
     .unwrap();
-    writeln!(
-        w,
-        "// Int8 dequant scale VALUES arrive as runtime .f32 params; the load",
-    )
-    .unwrap();
-    writeln!(
-        w,
-        "// path, element widths and pool offsets below are all immediates.",
-    )
-    .unwrap();
+    writeln!(w, "// Int8 dequant scale VALUES arrive as runtime .f32 params; the load").unwrap();
+    writeln!(w, "// path, element widths and pool offsets below are all immediates.").unwrap();
     writeln!(w, "// Baked layout constants:").unwrap();
     writeln!(w, "//   token_stride        = {}", token_stride).unwrap();
     writeln!(w, "//   per_slot_max_tokens = {}", cfg.per_slot_max_tokens).unwrap();
     writeln!(w, "//   max_tokens          = {}", max_tokens).unwrap();
-    writeln!(w, "//   gqa_group_size      = {}", group).unwrap();
-    writeln!(w, "//   k_offset_bytes      = {}", offsets.k_offset_bytes).unwrap();
-    writeln!(w, "//   v_offset_bytes      = {}", offsets.v_offset_bytes).unwrap();
-    writeln!(w, "//   k_elem_bytes        = {}", k_elem).unwrap();
-    writeln!(w, "//   v_elem_bytes        = {}", v_elem).unwrap();
+    writeln!(w, "//   gqa_group_size      = {}", cfg.n_heads / cfg.n_kv_heads).unwrap();
+    writeln!(w, "//   k_offset_bytes      = {}", o.k_offset_bytes).unwrap();
+    writeln!(w, "//   v_offset_bytes      = {}", o.v_offset_bytes).unwrap();
+    writeln!(w, "//   k_elem_bytes        = {}", o.k_elem_bytes).unwrap();
+    writeln!(w, "//   v_elem_bytes        = {}", o.v_elem_bytes).unwrap();
     writeln!(w, "//").unwrap();
-    writeln!(w, ".version {}", crate::gpu_specs::ptx_isa_for_sm(cfg.sm_version)).unwrap();
-    writeln!(w, ".target sm_{}", cfg.sm_version).unwrap();
-    writeln!(w, ".address_size 64").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, ".shared .align 4 .b8 cfie_smem[{}];", smem_bytes).unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, ".visible .entry {}(", name).unwrap();
-    writeln!(w, "    .param .u64 q_ptr,").unwrap();
-    writeln!(w, "    .param .u64 kv_base,").unwrap();
-    writeln!(w, "    .param .u64 out_ptr,").unwrap();
-    writeln!(w, "    .param .u32 slot_idx,").unwrap();
-    writeln!(w, "    .param .u32 seq_len,").unwrap();
-    writeln!(w, "    .param .f32 k_scale,").unwrap();
-    writeln!(w, "    .param .f32 v_scale").unwrap();
-    writeln!(w, ")").unwrap();
-    writeln!(w, "{{").unwrap();
-    writeln!(
-        w,
-        "    .reg .pred %p_qd, %p_done, %p_val, %p_d, %p_t0, %p_j, %p_j2, %p_nd, %p_t1, %p_no, %p_lz;"
-    )
-    .unwrap();
-    writeln!(w, "    .reg .b16 %h_k, %h_v;").unwrap();
-    writeln!(
-        w,
-        "    .reg .f32 %f_q, %f_k, %f_v, %f_p, %f_s, %f_dot, %f_acc, %f_m, %f_l, %f_tm, %f_rs, %f_rs2, %f_t1, %f_lf, %f_o, %f_t0, %f_ks, %f_vs;"
-    )
-    .unwrap();
-    writeln!(
-        w,
-        "    .reg .u32 %r_tid, %r_head, %r_kvhead, %r_slot, %r_seqlen, %r_sbase, %r_slotbase, %r_hoff, %r_tile, %r_rem, %r_tcnt, %r_tok, %r_g, %r_g0, %r_d, %r_qsm, %r_j, %r_sp, %r_t1, %r_t2, %r_t3, %r_t4;"
-    )
-    .unwrap();
-    writeln!(
-        w,
-        "    .reg .u64 %rd_q, %rd_kv, %rd_out, %rd_kplane, %rd_vplane, %rd_khoff, %rd_vhoff, %rd_koff, %rd_kaddr, %rd_voff, %rd_vaddr, %rd_t1, %rd_t2, %rd_t3;"
-    )
-    .unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    ld.param.u64 %rd_q, [q_ptr];").unwrap();
-    writeln!(w, "    ld.param.u64 %rd_kv, [kv_base];").unwrap();
-    writeln!(w, "    ld.param.u64 %rd_out, [out_ptr];").unwrap();
-    writeln!(w, "    ld.param.u32 %r_slot, [slot_idx];").unwrap();
-    writeln!(w, "    ld.param.u32 %r_seqlen, [seq_len];").unwrap();
-    if k_is_i8 {
-        writeln!(w, "    // runtime symmetric dequant scale for the int8 K half").unwrap();
-        writeln!(w, "    ld.param.f32 %f_ks, [k_scale];").unwrap();
-    }
-    if v_is_i8 {
-        writeln!(w, "    // runtime symmetric dequant scale for the int8 V half").unwrap();
-        writeln!(w, "    ld.param.f32 %f_vs, [v_scale];").unwrap();
-    }
-    writeln!(w).unwrap();
-    writeln!(w, "    mov.u32 %r_tid, %tid.x;").unwrap();
-    writeln!(w, "    mov.u32 %r_head, %ctaid.x;").unwrap();
-    writeln!(w, "    mov.u32 %r_sbase, cfie_smem;").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    // GQA: kv_head = q_head / group_size (baked divisor)").unwrap();
-    writeln!(w, "    div.u32 %r_kvhead, %r_head, {};", group).unwrap();
-    writeln!(w).unwrap();
-    writeln!(
-        w,
-        "    // per-layer baked pool offsets: layer {} K half at +{}, V half at +{}",
-        layer_idx, offsets.k_offset_bytes, offsets.v_offset_bytes
-    )
-    .unwrap();
-    writeln!(w, "    add.u64 %rd_kplane, %rd_kv, {};", offsets.k_offset_bytes).unwrap();
-    writeln!(w, "    add.u64 %rd_vplane, %rd_kv, {};", offsets.v_offset_bytes).unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    // slot's first global token: slot_idx * per_slot_max_tokens").unwrap();
-    writeln!(
-        w,
-        "    mul.lo.u32 %r_slotbase, %r_slot, {};",
-        cfg.per_slot_max_tokens
-    )
-    .unwrap();
-    writeln!(w).unwrap();
-    writeln!(
-        w,
-        "    // byte offsets of kv_head's row inside one K / V token record"
-    )
-    .unwrap();
-    writeln!(w, "    mul.lo.u32 %r_hoff, %r_kvhead, {};", k_head_row_bytes).unwrap();
-    writeln!(w, "    cvt.u64.u32 %rd_khoff, %r_hoff;").unwrap();
-    writeln!(w, "    mul.lo.u32 %r_hoff, %r_kvhead, {};", v_head_row_bytes).unwrap();
-    writeln!(w, "    cvt.u64.u32 %rd_vhoff, %r_hoff;").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    // load this head's Q row (f32) into SMEM").unwrap();
-    writeln!(w, "    setp.lt.u32 %p_qd, %r_tid, {};", hd).unwrap();
-    writeln!(w, "    @!%p_qd bra Q_DONE;").unwrap();
-    writeln!(w, "    mul.lo.u32 %r_t1, %r_head, {};", hd).unwrap();
-    writeln!(w, "    add.u32 %r_t1, %r_t1, %r_tid;").unwrap();
-    writeln!(w, "    mul.lo.u32 %r_t1, %r_t1, 4;").unwrap();
-    writeln!(w, "    cvt.u64.u32 %rd_t1, %r_t1;").unwrap();
-    writeln!(w, "    add.u64 %rd_t1, %rd_q, %rd_t1;").unwrap();
-    writeln!(w, "    ld.global.f32 %f_t0, [%rd_t1];").unwrap();
-    writeln!(w, "    mul.lo.u32 %r_t2, %r_tid, 4;").unwrap();
-    writeln!(w, "    add.u32 %r_t2, %r_t2, %r_sbase;").unwrap();
-    writeln!(w, "    st.shared.f32 [%r_t2], %f_t0;").unwrap();
-    writeln!(w, "Q_DONE:").unwrap();
-    writeln!(w, "    mov.f32 %f_acc, {};", zero).unwrap();
-    writeln!(w, "    mov.f32 %f_m, {};", neg_inf).unwrap();
-    writeln!(w, "    mov.f32 %f_l, {};", zero).unwrap();
-    writeln!(w, "    bar.sync 0;").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    mov.u32 %r_tile, 0;").unwrap();
-    writeln!(w, "TILE_LOOP:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p_done, %r_tile, %r_seqlen;").unwrap();
-    writeln!(w, "    @%p_done bra LOOP_END;").unwrap();
-    writeln!(w, "    sub.u32 %r_rem, %r_seqlen, %r_tile;").unwrap();
-    writeln!(w, "    min.u32 %r_tcnt, %r_rem, {};", TILE).unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    // pass 1: thread t scores token tile_base + t").unwrap();
-    writeln!(w, "    add.u32 %r_tok, %r_tile, %r_tid;").unwrap();
-    writeln!(w, "    // tail-tile guard: last tile covers seq_len % {} tokens", TILE).unwrap();
-    writeln!(w, "    setp.lt.u32 %p_val, %r_tok, %r_seqlen;").unwrap();
-    writeln!(w, "    @!%p_val bra SCORE_DONE;").unwrap();
-    writeln!(w, "    add.u32 %r_g, %r_slotbase, %r_tok;").unwrap();
-    writeln!(w, "    mul.wide.u32 %rd_koff, %r_g, {};", k_token_stride_bytes).unwrap();
-    writeln!(w, "    add.u64 %rd_kaddr, %rd_kplane, %rd_koff;").unwrap();
-    writeln!(w, "    add.u64 %rd_kaddr, %rd_kaddr, %rd_khoff;").unwrap();
-    writeln!(w, "    mov.f32 %f_dot, {};", zero).unwrap();
-    writeln!(w, "    mov.u32 %r_d, 0;").unwrap();
-    writeln!(w, "    mov.u32 %r_qsm, %r_sbase;").unwrap();
-    writeln!(w, "DOT_LOOP:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p_d, %r_d, {};", hd).unwrap();
-    writeln!(w, "    @%p_d bra DOT_DONE;").unwrap();
-    if k_is_i8 {
-        writeln!(w, "    // K load path: int8, dequantized in registers").unwrap();
-        writeln!(w, "    ld.global.s8 %h_k, [%rd_kaddr];").unwrap();
-        writeln!(w, "    cvt.rn.f32.s8 %f_k, %h_k;").unwrap();
-        writeln!(w, "    mul.f32 %f_k, %f_k, %f_ks;").unwrap();
-    } else {
-        writeln!(w, "    // K load path: fp16, read directly").unwrap();
-        writeln!(w, "    ld.global.b16 %h_k, [%rd_kaddr];").unwrap();
-        writeln!(w, "    cvt.f32.f16 %f_k, %h_k;").unwrap();
-    }
-    writeln!(w, "    ld.shared.f32 %f_q, [%r_qsm];").unwrap();
-    writeln!(w, "    fma.rn.f32 %f_dot, %f_k, %f_q, %f_dot;").unwrap();
-    writeln!(w, "    add.u64 %rd_kaddr, %rd_kaddr, {};", k_elem).unwrap();
-    writeln!(w, "    add.u32 %r_qsm, %r_qsm, 4;").unwrap();
-    writeln!(w, "    add.u32 %r_d, %r_d, 1;").unwrap();
-    writeln!(w, "    bra DOT_LOOP;").unwrap();
-    writeln!(w, "DOT_DONE:").unwrap();
-    writeln!(w, "    // scale by 1/sqrt(head_dim)").unwrap();
-    writeln!(w, "    mul.f32 %f_dot, %f_dot, {};", inv_sqrt_hd).unwrap();
-    writeln!(w, "    mul.lo.u32 %r_t3, %r_tid, 4;").unwrap();
-    writeln!(w, "    add.u32 %r_t3, %r_t3, %r_sbase;").unwrap();
-    writeln!(w, "    st.shared.f32 [%r_t3+{}], %f_dot;", scores_off).unwrap();
-    writeln!(w, "SCORE_DONE:").unwrap();
-    writeln!(w, "    bar.sync 0;").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    // pass 2: online softmax, thread 0 serial over the tile").unwrap();
-    writeln!(w, "    setp.ne.u32 %p_t0, %r_tid, 0;").unwrap();
-    writeln!(w, "    @%p_t0 bra SOFTMAX_DONE;").unwrap();
-    writeln!(w, "    mov.f32 %f_tm, %f_m;").unwrap();
-    writeln!(w, "    mov.u32 %r_j, 0;").unwrap();
-    writeln!(w, "    mov.u32 %r_sp, %r_sbase;").unwrap();
-    writeln!(w, "MAX_LOOP:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p_j, %r_j, %r_tcnt;").unwrap();
-    writeln!(w, "    @%p_j bra MAX_DONE;").unwrap();
-    writeln!(w, "    ld.shared.f32 %f_s, [%r_sp+{}];", scores_off).unwrap();
-    writeln!(w, "    max.f32 %f_tm, %f_tm, %f_s;").unwrap();
-    writeln!(w, "    add.u32 %r_sp, %r_sp, 4;").unwrap();
-    writeln!(w, "    add.u32 %r_j, %r_j, 1;").unwrap();
-    writeln!(w, "    bra MAX_LOOP;").unwrap();
-    writeln!(w, "MAX_DONE:").unwrap();
-    writeln!(w, "    // rescale = exp(m_old - m_new); exp(-inf) = 0 on first tile").unwrap();
-    writeln!(w, "    sub.f32 %f_t1, %f_m, %f_tm;").unwrap();
-    writeln!(w, "    mul.f32 %f_t1, %f_t1, {};", log2e).unwrap();
-    writeln!(w, "    ex2.approx.f32 %f_rs, %f_t1;").unwrap();
-    writeln!(w, "    mul.f32 %f_l, %f_l, %f_rs;").unwrap();
-    writeln!(w, "    mov.f32 %f_m, %f_tm;").unwrap();
-    writeln!(w, "    mov.u32 %r_j, 0;").unwrap();
-    writeln!(w, "    mov.u32 %r_sp, %r_sbase;").unwrap();
-    writeln!(w, "P_LOOP:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p_j, %r_j, %r_tcnt;").unwrap();
-    writeln!(w, "    @%p_j bra P_DONE;").unwrap();
-    writeln!(w, "    ld.shared.f32 %f_s, [%r_sp+{}];", scores_off).unwrap();
-    writeln!(w, "    sub.f32 %f_s, %f_s, %f_m;").unwrap();
-    writeln!(w, "    mul.f32 %f_s, %f_s, {};", log2e).unwrap();
-    writeln!(w, "    ex2.approx.f32 %f_s, %f_s;").unwrap();
-    writeln!(w, "    st.shared.f32 [%r_sp+{}], %f_s;", scores_off).unwrap();
-    writeln!(w, "    add.f32 %f_l, %f_l, %f_s;").unwrap();
-    writeln!(w, "    add.u32 %r_sp, %r_sp, 4;").unwrap();
-    writeln!(w, "    add.u32 %r_j, %r_j, 1;").unwrap();
-    writeln!(w, "    bra P_LOOP;").unwrap();
-    writeln!(w, "P_DONE:").unwrap();
-    writeln!(w, "    st.shared.f32 [%r_sbase+{}], %f_rs;", rescale_off).unwrap();
-    writeln!(w, "SOFTMAX_DONE:").unwrap();
-    writeln!(w, "    bar.sync 0;").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    // pass 3: rescale accumulator, add P*V; thread d owns out[d]").unwrap();
-    writeln!(w, "    setp.ge.u32 %p_nd, %r_tid, {};", hd).unwrap();
-    writeln!(w, "    @%p_nd bra ACC_TAIL;").unwrap();
-    writeln!(w, "    ld.shared.f32 %f_rs2, [%r_sbase+{}];", rescale_off).unwrap();
-    writeln!(w, "    mul.f32 %f_acc, %f_acc, %f_rs2;").unwrap();
-    writeln!(w, "    add.u32 %r_g0, %r_slotbase, %r_tile;").unwrap();
-    writeln!(w, "    mul.wide.u32 %rd_voff, %r_g0, {};", v_token_stride_bytes).unwrap();
-    writeln!(w, "    add.u64 %rd_vaddr, %rd_vplane, %rd_voff;").unwrap();
-    writeln!(w, "    add.u64 %rd_vaddr, %rd_vaddr, %rd_vhoff;").unwrap();
-    writeln!(w, "    mul.wide.u32 %rd_t2, %r_tid, {};", v_elem).unwrap();
-    writeln!(w, "    add.u64 %rd_vaddr, %rd_vaddr, %rd_t2;").unwrap();
-    writeln!(w, "    mov.u32 %r_j, 0;").unwrap();
-    writeln!(w, "    mov.u32 %r_sp, %r_sbase;").unwrap();
-    writeln!(w, "ACC_LOOP:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p_j2, %r_j, %r_tcnt;").unwrap();
-    writeln!(w, "    @%p_j2 bra ACC_TAIL;").unwrap();
-    writeln!(w, "    ld.shared.f32 %f_p, [%r_sp+{}];", scores_off).unwrap();
-    if v_is_i8 {
-        writeln!(w, "    // V load path: int8, dequantized in registers").unwrap();
-        writeln!(w, "    ld.global.s8 %h_v, [%rd_vaddr];").unwrap();
-        writeln!(w, "    cvt.rn.f32.s8 %f_v, %h_v;").unwrap();
-        writeln!(w, "    mul.f32 %f_v, %f_v, %f_vs;").unwrap();
-    } else {
-        writeln!(w, "    // V load path: fp16, read directly").unwrap();
-        writeln!(w, "    ld.global.b16 %h_v, [%rd_vaddr];").unwrap();
-        writeln!(w, "    cvt.f32.f16 %f_v, %h_v;").unwrap();
-    }
-    writeln!(w, "    fma.rn.f32 %f_acc, %f_p, %f_v, %f_acc;").unwrap();
-    writeln!(w, "    add.u64 %rd_vaddr, %rd_vaddr, {};", v_token_stride_bytes).unwrap();
-    writeln!(w, "    add.u32 %r_sp, %r_sp, 4;").unwrap();
-    writeln!(w, "    add.u32 %r_j, %r_j, 1;").unwrap();
-    writeln!(w, "    bra ACC_LOOP;").unwrap();
-    writeln!(w, "ACC_TAIL:").unwrap();
-    writeln!(w, "    // scores SMEM is rewritten next tile; sync before loop back").unwrap();
-    writeln!(w, "    bar.sync 0;").unwrap();
-    writeln!(w, "    add.u32 %r_tile, %r_tile, {};", TILE).unwrap();
-    writeln!(w, "    bra TILE_LOOP;").unwrap();
-    writeln!(w, "LOOP_END:").unwrap();
-    writeln!(w, "    // thread 0 publishes the final softmax denominator").unwrap();
-    writeln!(w, "    setp.ne.u32 %p_t1, %r_tid, 0;").unwrap();
-    writeln!(w, "    @%p_t1 bra L_PUB;").unwrap();
-    writeln!(w, "    st.shared.f32 [%r_sbase+{}], %f_l;", l_off).unwrap();
-    writeln!(w, "L_PUB:").unwrap();
-    writeln!(w, "    bar.sync 0;").unwrap();
-    writeln!(w, "    setp.ge.u32 %p_no, %r_tid, {};", hd).unwrap();
-    writeln!(w, "    @%p_no bra EXIT;").unwrap();
-    writeln!(w, "    ld.shared.f32 %f_lf, [%r_sbase+{}];", l_off).unwrap();
-    writeln!(w, "    // seq_len == 0 leaves l == 0; write 0 instead of NaN").unwrap();
-    writeln!(w, "    mov.f32 %f_o, {};", zero).unwrap();
-    writeln!(w, "    setp.gt.f32 %p_lz, %f_lf, {};", zero).unwrap();
-    writeln!(w, "    @!%p_lz bra STORE_OUT;").unwrap();
-    writeln!(w, "    div.rn.f32 %f_o, %f_acc, %f_lf;").unwrap();
-    writeln!(w, "STORE_OUT:").unwrap();
-    writeln!(w, "    mul.lo.u32 %r_t4, %r_head, {};", hd).unwrap();
-    writeln!(w, "    add.u32 %r_t4, %r_t4, %r_tid;").unwrap();
-    writeln!(w, "    mul.lo.u32 %r_t4, %r_t4, 4;").unwrap();
-    writeln!(w, "    cvt.u64.u32 %rd_t3, %r_t4;").unwrap();
-    writeln!(w, "    add.u64 %rd_t3, %rd_out, %rd_t3;").unwrap();
-    writeln!(w, "    st.global.f32 [%rd_t3], %f_o;").unwrap();
-    writeln!(w, "EXIT:").unwrap();
-    writeln!(w, "    ret;").unwrap();
-    writeln!(w, "}}").unwrap();
+    w
+}
 
+/// Emit the specialized decode-attention kernel for one layer: build,
+/// verify, lower, and prefix the `//` header.
+///
+/// The returned text carries no NUL: the serve path appends the one
+/// `cuModuleLoadData` needs when it embeds the module.
+///
+/// # Panics
+///
+/// On a configuration outside the contract (see `validate`), on a
+/// `layer_idx` out of range, and if the built kernel fails KIR
+/// verification — a bug in the builder, not a condition a caller can
+/// provoke.
+pub fn emit_layer(
+    cfg: &QuantDecodeAttentionConfig,
+    layer_idx: u32,
+) -> (String, QuantDecodeAttentionMeta) {
+    let ir = build_layer(cfg, layer_idx);
+    let name = kernel_name_for_layer(layer_idx);
+    if let Err(errors) = crate::kir_verify::verify(&ir) {
+        panic!("{name} failed KIR verification: {errors:?}");
+    }
+    let smem_bytes = ir
+        .smem_layout
+        .total_bytes()
+        .expect("a verified layout has a size");
+    let module = lower_kir_to_ptx(&ir);
+    let module = module.strip_suffix(&[0]).unwrap_or(&module);
+    let module = std::str::from_utf8(module).expect("the KIR printer emits ASCII");
+
+    let mut p = header_comment(cfg, layer_idx);
+    p.push_str(module);
+
+    let (kp, vp) = cfg.layer_precisions[layer_idx as usize];
+    let o = offsets(cfg)[layer_idx as usize];
     let meta = QuantDecodeAttentionMeta {
         kernel_name: name,
         layer_idx,
         k_precision: kp,
         v_precision: vp,
-        k_offset_bytes: offsets.k_offset_bytes,
-        v_offset_bytes: offsets.v_offset_bytes,
+        k_offset_bytes: o.k_offset_bytes,
+        v_offset_bytes: o.v_offset_bytes,
         smem_bytes,
         block_dim: BLOCK_DIM,
         grid_dim_is_n_heads: true,
-        k_scale_param_used: k_is_i8,
-        v_scale_param_used: v_is_i8,
+        k_scale_param_used: kp == KvPrecision::Int8,
+        v_scale_param_used: vp == KvPrecision::Int8,
     };
     (p, meta)
 }
@@ -621,6 +428,7 @@ mod tests {
     use crate::cfie_decode_attention::{
         cpu_reference, emit_decode_attention_ptx, kv_strides, DecodeAttentionConfig,
     };
+    use crate::kernel_ir::{AddressSpace, ConstValue, KirConst, KirOp, KirType};
 
     /// Mixed 4-layer fixture: paper-shaped edge FP16, middle INT8.
     fn mixed_cfg() -> QuantDecodeAttentionConfig {
@@ -631,7 +439,6 @@ mod tests {
             head_dim: 64,
             per_slot_max_tokens: 256,
             max_slots: 4,
-            sm_version: 80,
             layer_precisions: vec![
                 (KvPrecision::Fp16, KvPrecision::Fp16),
                 (KvPrecision::Fp16, KvPrecision::Int8),
@@ -671,20 +478,34 @@ mod tests {
         line.rsplit('=').next().unwrap().trim().parse().unwrap()
     }
 
-    /// Extract the immediate operand of the first line starting with
-    /// `prefix` (after trimming), e.g. the baked stride of a mul.wide.
-    fn trailing_imm(ptx: &str, prefix: &str) -> u64 {
-        let line = ptx
-            .lines()
-            .map(str::trim)
-            .find(|l| l.starts_with(prefix))
-            .unwrap_or_else(|| panic!("no instruction starting with {prefix:?}"));
-        line.strip_prefix(prefix)
-            .unwrap()
-            .trim()
-            .trim_end_matches(';')
-            .parse()
-            .unwrap()
+    fn ops(ir: &KernelIR) -> impl Iterator<Item = &KirOp> {
+        ir.blocks.iter().flat_map(|b| b.ops.iter())
+    }
+
+    /// How many global loads read an element of type `ty`.
+    fn global_loads_of(ir: &KernelIR, ty: &KirType) -> usize {
+        ops(ir)
+            .filter(|op| {
+                matches!(op, KirOp::Load(d, _, AddressSpace::Global) if ir.var_types.get(d) == Some(ty))
+            })
+            .count()
+    }
+
+    /// How many multiplies read the entry param named `name`.
+    fn multiplies_by_param(ir: &KernelIR, name: &str) -> usize {
+        let param = ir.params.iter().find(|p| p.name == name).expect("a declared param").id;
+        ops(ir)
+            .filter(|op| matches!(op, KirOp::Mul(_, a, b) if *a == param || *b == param))
+            .count()
+    }
+
+    fn u64_constants(ir: &KernelIR) -> Vec<u64> {
+        ops(ir)
+            .filter_map(|op| match op {
+                KirOp::Const(_, KirConst { value: ConstValue::U64(v), .. }) => Some(*v),
+                _ => None,
+            })
+            .collect()
     }
 
     // ── pool layout ────────────────────────────────────────────────
@@ -700,7 +521,6 @@ mod tests {
             head_dim: 4,
             per_slot_max_tokens: 8,
             max_slots: 2,
-            sm_version: 80,
             layer_precisions: vec![
                 (KvPrecision::Fp16, KvPrecision::Fp16),
                 (KvPrecision::Fp16, KvPrecision::Int8),
@@ -740,61 +560,62 @@ mod tests {
         assert_eq!(total_pool_bytes(&cfg), cfg.n_layers as u64 * layer_bytes);
     }
 
-    // ── cross-module stride consistency (string inspection only) ──
+    // ── cross-module stride consistency ────────────────────────────
 
     #[test]
-    fn strides_match_base_kernel_via_ptx_inspection() {
+    fn strides_match_the_base_kernel() {
         let base_ptx = emit_decode_attention_ptx(&matching_base_cfg());
         let (l0_ptx, _) = emit_layer(&all_fp16_cfg(), 0);
-        // Element token stride, from both headers.
-        assert_eq!(
-            comment_value(&base_ptx, "token_stride"),
-            comment_value(&l0_ptx, "token_stride"),
-        );
-        // The base kernel is KIR (roadmap A2 step 9): its address
-        // arithmetic has no hand-named registers to read back, so its
-        // strides come from the one function its builder bakes them from.
-        // f16 elements are 2 bytes; the quant kernel bakes bytes.
         let base = kv_strides(&matching_base_cfg());
-        // Byte token stride baked into the K address arithmetic.
-        let quant_kstride = trailing_imm(&l0_ptx, "mul.wide.u32 %rd_koff, %r_g,");
-        assert_eq!(base.token_stride * 2, quant_kstride);
-        // V-side token stride baked into the accumulate loop.
-        let quant_vstride = trailing_imm(&l0_ptx, "mul.wide.u32 %rd_voff, %r_g0,");
-        assert_eq!(base.token_stride * 2, quant_vstride);
-        // Slot base immediate.
-        let quant_slot = trailing_imm(&l0_ptx, "mul.lo.u32 %r_slotbase, %r_slot,");
-        assert_eq!(u64::from(matching_base_cfg().per_slot_max_tokens), quant_slot);
+        // The element token stride, in both headers and in the one
+        // function the base kernel bakes it from.
+        assert_eq!(comment_value(&base_ptx, "token_stride"), base.token_stride);
+        assert_eq!(comment_value(&l0_ptx, "token_stride"), base.token_stride);
+        // Both kernels are one builder (roadmap A2 step 9): the quant
+        // kernel indexes each half in its own element type, so it bakes
+        // the same element stride the base kernel does, and the same slot
+        // base.
+        let ir = build_layer(&all_fp16_cfg(), 0);
+        assert!(u64_constants(&ir).contains(&base.token_stride));
+        let per_slot = matching_base_cfg().per_slot_max_tokens;
+        assert!(ops(&ir).any(|op| matches!(
+            op,
+            KirOp::Const(_, KirConst { value: ConstValue::U32(v), .. }) if *v == per_slot
+        )));
     }
 
     // ── structural: per-precision load paths ──────────────────────
 
     #[test]
-    fn fp16_layer_reads_f16_directly_and_has_no_s8_loads() {
+    fn fp16_layer_reads_f16_directly_and_never_multiplies_by_a_scale() {
         let (ptx, meta) = emit_layer(&mixed_cfg(), 0);
+        let ir = build_layer(&mixed_cfg(), 0);
         assert!(ptx.contains(".visible .entry nsl_cfie_decode_attn_l0("));
+        assert_eq!(global_loads_of(&ir, &KirType::F16), 2, "K and V");
+        assert_eq!(global_loads_of(&ir, &KirType::I8), 0);
         assert!(ptx.contains("cvt.f32.f16"));
         assert!(!ptx.contains("ld.global.s8"));
         assert!(!ptx.contains("cvt.rn.f32.s8"));
-        // Scale params are declared (uniform ABI) but never loaded.
-        assert!(ptx.contains(".param .f32 k_scale"));
-        assert!(ptx.contains(".param .f32 v_scale"));
-        assert_eq!(ptx.matches("ld.param").count(), 5);
+        // Scale params are declared (uniform ABI) but no multiply reads them.
+        assert!(ptx.contains(".param .f32 param_k_scale"));
+        assert!(ptx.contains(".param .f32 param_v_scale"));
+        assert_eq!(multiplies_by_param(&ir, "k_scale"), 0);
+        assert_eq!(multiplies_by_param(&ir, "v_scale"), 0);
         assert!(!meta.k_scale_param_used && !meta.v_scale_param_used);
     }
 
     #[test]
     fn int8_layer_loads_s8_and_dequantizes_with_scale_params() {
         let (ptx, meta) = emit_layer(&mixed_cfg(), 2);
+        let ir = build_layer(&mixed_cfg(), 2);
         assert!(ptx.contains(".visible .entry nsl_cfie_decode_attn_l2("));
-        assert_eq!(ptx.matches("ld.global.s8").count(), 2, "K and V loads");
+        assert_eq!(global_loads_of(&ir, &KirType::I8), 2, "K and V");
+        assert_eq!(global_loads_of(&ir, &KirType::F16), 0);
+        assert_eq!(ptx.matches("ld.global.s8").count(), 2);
         assert_eq!(ptx.matches("cvt.rn.f32.s8").count(), 2);
-        assert!(ptx.contains("ld.param.f32 %f_ks, [k_scale];"));
-        assert!(ptx.contains("ld.param.f32 %f_vs, [v_scale];"));
-        assert!(ptx.contains("mul.f32 %f_k, %f_k, %f_ks;"));
-        assert!(ptx.contains("mul.f32 %f_v, %f_v, %f_vs;"));
-        // 5 direct params + 2 scales.
-        assert_eq!(ptx.matches("ld.param").count(), 7);
+        // Each half dequantized by its own scale, once.
+        assert_eq!(multiplies_by_param(&ir, "k_scale"), 1);
+        assert_eq!(multiplies_by_param(&ir, "v_scale"), 1);
         // No f16 conversion anywhere in a pure-int8 layer.
         assert!(!ptx.contains("cvt.f32.f16"));
         assert!(meta.k_scale_param_used && meta.v_scale_param_used);
@@ -803,12 +624,12 @@ mod tests {
     #[test]
     fn mixed_layer_specializes_k_and_v_independently() {
         // Layer 1: FP16 K, INT8 V.
-        let (ptx, meta) = emit_layer(&mixed_cfg(), 1);
-        assert!(ptx.contains("cvt.f32.f16 %f_k, %h_k;"), "K path stays f16");
-        assert!(ptx.contains("ld.global.s8 %h_v, [%rd_vaddr];"), "V path is s8");
-        assert!(ptx.contains("mul.f32 %f_v, %f_v, %f_vs;"));
-        assert!(!ptx.contains("mul.f32 %f_k, %f_k, %f_ks;"));
-        assert_eq!(ptx.matches("ld.param").count(), 6, "only v_scale loaded");
+        let (_, meta) = emit_layer(&mixed_cfg(), 1);
+        let ir = build_layer(&mixed_cfg(), 1);
+        assert_eq!(global_loads_of(&ir, &KirType::F16), 1, "K path stays f16");
+        assert_eq!(global_loads_of(&ir, &KirType::I8), 1, "V path is s8");
+        assert_eq!(multiplies_by_param(&ir, "k_scale"), 0);
+        assert_eq!(multiplies_by_param(&ir, "v_scale"), 1);
         assert!(!meta.k_scale_param_used && meta.v_scale_param_used);
     }
 
@@ -817,28 +638,23 @@ mod tests {
         let cfg = mixed_cfg();
         let all = emit_all(&cfg);
         assert_eq!(all.len(), cfg.n_layers as usize);
-        let mut k_offs = Vec::new();
-        let mut v_offs = Vec::new();
+        let mut interleaved: Vec<u64> = Vec::new();
         for (l, (ptx, meta)) in all.iter().enumerate() {
             assert_eq!(meta.kernel_name, kernel_name_for_layer(l as u32));
-            let k = trailing_imm(ptx, "add.u64 %rd_kplane, %rd_kv,");
-            let v = trailing_imm(ptx, "add.u64 %rd_vplane, %rd_kv,");
-            assert_eq!(k, meta.k_offset_bytes);
-            assert_eq!(v, meta.v_offset_bytes);
-            k_offs.push(k);
-            v_offs.push(v);
+            let ir = build_layer(&cfg, l as u32);
+            let consts = u64_constants(&ir);
+            assert!(consts.contains(&meta.k_offset_bytes), "layer {l} bakes its K offset");
+            assert!(consts.contains(&meta.v_offset_bytes), "layer {l} bakes its V offset");
+            assert_eq!(comment_value(ptx, "k_offset_bytes"), meta.k_offset_bytes);
+            assert_eq!(comment_value(ptx, "v_offset_bytes"), meta.v_offset_bytes);
+            // The layer is baked: no layer index is a parameter.
+            assert!(ir.params.iter().all(|p| p.name != "layer_idx"));
+            assert!(!ptx.contains("layer_idx"));
+            interleaved.push(meta.k_offset_bytes);
+            interleaved.push(meta.v_offset_bytes);
         }
         // Offsets strictly increase in (k, v) interleaved order.
-        let mut interleaved: Vec<u64> = Vec::new();
-        for i in 0..k_offs.len() {
-            interleaved.push(k_offs[i]);
-            interleaved.push(v_offs[i]);
-        }
         assert!(interleaved.windows(2).all(|w| w[0] < w[1]));
-        // And no ld.param of a layer index anywhere: the layer is baked.
-        for (ptx, _) in &all {
-            assert!(!ptx.contains("layer_idx"));
-        }
     }
 
     #[test]
@@ -856,12 +672,15 @@ mod tests {
     fn header_and_meta_match_base_kernel_launch_shape() {
         let (ptx, meta) = emit_layer(&mixed_cfg(), 3);
         assert!(ptx.starts_with("//"));
-        assert!(ptx.contains(".version 7.0\n.target sm_80\n.address_size 64"));
+        // The KIR floor, whatever GPU serves it (see the module docs).
+        assert!(ptx.contains(".version 7.0\n.target sm_70\n.address_size 64"));
         assert_eq!(meta.block_dim, 128);
         assert!(meta.grid_dim_is_n_heads);
         // Same SMEM formula as the base kernel: q + scores + rescale + l.
         assert_eq!(meta.smem_bytes, 64 * 4 + 128 * 4 + 8);
-        assert!(ptx.contains(&format!(".shared .align 4 .b8 cfie_smem[{}];", meta.smem_bytes)));
+        assert!(ptx.contains(&format!(".shared .align 4 .b8 shared_mem[{}];", meta.smem_bytes)));
+        // No trailing NUL: the serve path appends the one it needs.
+        assert!(!ptx.ends_with('\0'));
     }
 
     // ── refusals ───────────────────────────────────────────────────
@@ -894,6 +713,42 @@ mod tests {
     #[should_panic(expected = "out of range")]
     fn layer_index_out_of_range_refused() {
         let _ = emit_layer(&mixed_cfg(), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "not a multiple of its 2-byte element")]
+    fn an_f16_half_after_an_odd_int8_half_is_refused() {
+        // half = max_tokens(3) * n_kv_heads(1) * head_dim(1) = 3 elements:
+        // the int8 K half is 3 bytes, so the f16 V half would start on
+        // byte 3 — a misaligned 2-byte load, which the GPU faults on.
+        let cfg = QuantDecodeAttentionConfig {
+            n_layers: 1,
+            n_heads: 1,
+            n_kv_heads: 1,
+            head_dim: 1,
+            per_slot_max_tokens: 3,
+            max_slots: 1,
+            layer_precisions: vec![(KvPrecision::Int8, KvPrecision::Fp16)],
+        };
+        let _ = pool_layout(&cfg);
+    }
+
+    #[test]
+    fn an_odd_int8_half_is_fine_when_nothing_f16_follows_it() {
+        let cfg = QuantDecodeAttentionConfig {
+            n_layers: 2,
+            n_heads: 1,
+            n_kv_heads: 1,
+            head_dim: 1,
+            per_slot_max_tokens: 3,
+            max_slots: 1,
+            layer_precisions: vec![
+                (KvPrecision::Fp16, KvPrecision::Fp16),
+                (KvPrecision::Int8, KvPrecision::Int8),
+            ],
+        };
+        assert_eq!(total_pool_bytes(&cfg), 3 * 2 * 2 + 3 * 2);
+        assert_eq!(emit_all(&cfg).len(), 2);
     }
 
     #[test]

@@ -209,7 +209,6 @@ fn quant_cfg() -> QuantDecodeAttentionConfig {
         head_dim: HEAD_DIM as u32,
         per_slot_max_tokens: PER_SLOT as u32,
         max_slots: MAX_SLOTS as u32,
-        sm_version: 80, // driver JITs sm_80 PTX forward to the local Blackwell
         layer_precisions: vec![
             (KvPrecision::Int8, KvPrecision::Int8),
             (KvPrecision::Fp16, KvPrecision::Fp16),
