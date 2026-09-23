@@ -136,16 +136,55 @@ static SLOTS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
 use std::sync::Mutex;
 
-thread_local! {
-    /// The armed single-shot pin: `(payload_ptr, exact_bytes)`, or `(0, 0)`.
-    ///
-    /// Thread-local for the same reason `CURRENT_POOL` and the surface tag
-    /// are: the allocation it steers happens on the calling thread, inside an
-    /// FFI whose signature has no room for an out-parameter.
-    static PIN: std::cell::Cell<(u64, usize, i64)> = const { std::cell::Cell::new((0, 0, -1)) };
+/// The arena's single-shot placement channel for one thread: the armed pin
+/// and where the current window's pin was consumed.
+///
+/// Per-thread because the allocation it steers happens on the calling
+/// thread, inside an FFI whose signature has no room for an out-parameter —
+/// the same shape as the allocator's pool selector, and it lives beside it:
+/// in a cuda build this is a field of the calling thread's slot on the
+/// current device (roadmap A4 step 4b; it was the `PIN` / `PLACED_AT`
+/// thread-locals). See [`with_pin`].
+pub(crate) struct ArenaPin {
+    /// `(payload_ptr, exact_bytes, slot_index)`, or `(0, 0, -1)` when unarmed.
+    pin: std::cell::Cell<(u64, usize, i64)>,
     /// Payload pointer the CURRENT window's pin was consumed at (0 = not
     /// consumed). Set by `take_pin`, read+cleared by the verify/unbind.
-    static PLACED_AT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    placed_at: std::cell::Cell<u64>,
+}
+
+impl ArenaPin {
+    pub(crate) const fn new() -> Self {
+        Self {
+            pin: std::cell::Cell::new((0, 0, -1)),
+            placed_at: std::cell::Cell::new(0),
+        }
+    }
+}
+
+/// Run `f` against the calling thread's pin.
+///
+/// Never creates a CUDA context: `nsl_arena_unbind` is emitted after every
+/// admitted op and runs whether or not an arena was ever allocated, so a
+/// forcing door would abort a CPU-only run on a driverless machine. The
+/// context's placement door is non-forcing for exactly this caller.
+#[cfg(feature = "cuda")]
+fn with_pin<R>(f: impl FnOnce(&ArenaPin) -> R) -> R {
+    crate::cuda::context::with_placement(|p| f(&p.arena))
+}
+
+/// Without the cuda feature nothing allocates device memory, so nothing in
+/// production ever consumes a pin — `region()` is never set, and bind
+/// returns before arming. The channel still has to behave, because the
+/// gates below exercise `take_pin`'s exact-size rule under plain
+/// `cargo test -p nsl-runtime`; this is the non-cuda build's stand-in for
+/// the slot field, as `region()`'s `CPU_ONLY` is for the context's arena.
+#[cfg(not(feature = "cuda"))]
+fn with_pin<R>(f: impl FnOnce(&ArenaPin) -> R) -> R {
+    thread_local! {
+        static CPU_ONLY_PIN: ArenaPin = const { ArenaPin::new() };
+    }
+    CPU_ONLY_PIN.with(f)
 }
 
 /// True when an arena is allocated.
@@ -264,8 +303,10 @@ pub extern "C" fn nsl_arena_bind(slot_index: i64, payload_offset: i64, bytes: i6
         return;
     }
     BINDS.fetch_add(1, SeqCst);
-    PLACED_AT.with(|c| c.set(0));
-    PIN.with(|p| p.set((payload, bytes as usize, slot_index)));
+    with_pin(|p| {
+        p.placed_at.set(0);
+        p.pin.set((payload, bytes as usize, slot_index));
+    });
 }
 
 /// Unbind that also VERIFIES the placement went to the op's RESULT.
@@ -283,11 +324,7 @@ pub extern "C" fn nsl_arena_bind(slot_index: i64, payload_offset: i64, bytes: i6
 /// teardown reports it — the p8 CUDA-graph gate is `misplaced == 0`.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_arena_unbind_verify(result_tensor: i64) {
-    let placed = PLACED_AT.with(|c| {
-        let v = c.get();
-        c.set(0);
-        v
-    });
+    let placed = with_pin(|p| p.placed_at.replace(0));
     if placed != 0 && result_tensor != 0 {
         let t = crate::tensor::NslTensor::from_ptr_ref(result_tensor);
         if t.data as u64 != placed {
@@ -306,8 +343,8 @@ pub extern "C" fn nsl_arena_unbind_verify(result_tensor: i64) {
 /// into an unrelated allocation if the op took a path that did not allocate.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_arena_unbind() {
-    PIN.with(|p| {
-        let (ptr, want, slot) = p.get();
+    with_pin(|p| {
+        let (ptr, want, slot) = p.pin.get();
         if ptr != 0 {
             // An unconsumed pin means the plan believed this op allocates and
             // it did not. Silently dropping it would leave the slot count —
@@ -321,7 +358,7 @@ pub extern "C" fn nsl_arena_unbind() {
                 );
             }
         }
-        p.set((0, 0, -1));
+        p.pin.set((0, 0, -1));
     });
 }
 
@@ -342,8 +379,8 @@ pub(crate) fn take_pin(size_bytes: usize) -> Option<*mut c_void> {
         return None;
     }
     PIN_PROBES.fetch_add(1, SeqCst);
-    PIN.with(|p| {
-        let (ptr, want, _slot) = p.get();
+    with_pin(|p| {
+        let (ptr, want, _slot) = p.pin.get();
         if ptr != 0 {
             PIN_PROBES_ARMED.fetch_add(1, SeqCst);
         }
@@ -361,8 +398,8 @@ pub(crate) fn take_pin(size_bytes: usize) -> Option<*mut c_void> {
             }
             return None;
         }
-        p.set((0, 0, -1));
-        PLACED_AT.with(|c| c.set(ptr));
+        p.pin.set((0, 0, -1));
+        p.placed_at.set(ptr);
         PLACEMENTS.fetch_add(1, SeqCst);
         Some(ptr as *mut c_void)
     })
@@ -517,7 +554,7 @@ mod tests {
     fn a_pin_is_consumed_only_by_its_exact_size() {
         // With no arena, `take_pin` always declines — pin state is irrelevant.
         assert!(!active());
-        PIN.with(|p| p.set((0x1000, 4096, 0)));
+        with_pin(|p| p.pin.set((0x1000, 4096, 0)));
         assert!(take_pin(4096).is_none(), "an inactive arena must place nothing");
         // Fake an active arena so the SIZE comparison actually executes —
         // without this the test never reached the load-bearing branch and a
@@ -529,14 +566,16 @@ mod tests {
         // `cargo test -p nsl-runtime`, where there is no device to hang one
         // on. The range arithmetic itself is proved in `device_region`.
         region().set(0x1000, 1 << 20);
-        PIN.with(|p| p.set((0x2000, 4096, 0)));
+        with_pin(|p| p.pin.set((0x2000, 4096, 0)));
         assert!(take_pin(4095).is_none(), "smaller must not consume");
         assert!(take_pin(4097).is_none(), "larger must not consume");
         assert_eq!(take_pin(4096), Some(0x2000 as *mut c_void), "exact consumes");
         assert!(take_pin(4096).is_none(), "single-shot: second exact declines");
         region().take();
-        PIN.with(|p| p.set((0, 0, -1)));
-        PLACED_AT.with(|c| c.set(0));
+        with_pin(|p| {
+            p.pin.set((0, 0, -1));
+            p.placed_at.set(0);
+        });
         PLACEMENTS.store(0, SeqCst);
     }
 

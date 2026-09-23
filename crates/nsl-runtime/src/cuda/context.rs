@@ -48,13 +48,18 @@
 //! **Step 4 adds the capture state** to the same slot: `graph_capture`'s
 //! four cells become one `CaptureState` field, and its `cuFuncGetParamInfo`
 //! answers — keyed by `CUfunction`, so device state — move onto
-//! [`CudaContext::with_cache`].
+//! [`CudaContext::with_cache`]. Step 4b adds the allocator's placement
+//! channel — the pool selector and the transient arena's pin — as the
+//! slot's [`Placement`] field, reached through [`with_placement`], which
+//! unlike every other door here does not create a context.
 
 use cudarc::driver::sys::*;
 use std::any::{Any, TypeId};
 
+use super::caching_allocator::AllocPool;
 use super::graph_capture::CaptureState;
 use crate::device_region::Region;
+use crate::transient_arena::ArenaPin;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Mutex, OnceLock};
@@ -399,6 +404,41 @@ pub(crate) struct ThreadSlot {
     /// run is armed, and a field is one pointer hop where the map is a hash.
     /// See [`StreamPool::with_capture`].
     capture: CaptureState,
+    /// Roadmap A4 step 4b: was `caching_allocator`'s `CURRENT_POOL` and the
+    /// transient arena's `PIN` / `PLACED_AT`. See [`with_placement`].
+    placement: Placement,
+}
+
+/// The allocator's placement channel for one (thread, device): what steers
+/// the *next* allocation on this thread, set by a caller that cannot pass it
+/// down because the allocation happens inside an `extern "C"` row whose
+/// signature has no room for it.
+///
+/// Both halves were `thread_local!` cells and both stay thread-affine: a
+/// `PoolGuard` brackets allocations the same thread makes, and an arena bind
+/// is consumed by the next allocation the same thread makes. What the slot
+/// adds is the device half — a bracket on device 1 must not retag device 0's
+/// allocations once step 5 lets a thread switch devices.
+///
+/// Step 5 note: the guards restore through the slot that is current when
+/// they DROP. A bracket that switches device in the middle would restore the
+/// other device's selector; nothing does that today (there is one slot), and
+/// step 5 is where it becomes possible and where the guards learn their slot.
+pub(crate) struct Placement {
+    /// Was `CURRENT_POOL`. Read by every allocation, written by `PoolGuard`
+    /// and the two `nsl_gpu_set_*_pool` rows.
+    pub(crate) pool: Cell<AllocPool>,
+    /// Was `PIN` and `PLACED_AT`.
+    pub(crate) arena: ArenaPin,
+}
+
+impl Placement {
+    const fn new() -> Self {
+        Self {
+            pool: Cell::new(AllocPool::Transient),
+            arena: ArenaPin::new(),
+        }
+    }
 }
 
 impl ThreadSlot {
@@ -409,6 +449,7 @@ impl ThreadSlot {
             inspect: Cell::new(0),
             workspaces: RefCell::new(HashMap::new()),
             capture: CaptureState::default(),
+            placement: Placement::new(),
         }
     }
 }
@@ -507,27 +548,9 @@ impl StreamPool {
     }
 
     /// Run `f` against the calling thread's slot for this pool's device,
-    /// creating the slot on first use.
-    ///
-    /// The `RefCell` borrow is released *before* `f` runs, so a closure that
-    /// reaches back in (the `WS` realloc path calls `current_stream()`) does
-    /// not hit a double borrow. The `Box` keeps the address stable for the
-    /// thread's life, and the higher-ranked closure bound stops the reference
-    /// escaping.
+    /// creating the slot on first use. See [`with_thread_slot`].
     fn with_slot<R>(&self, f: impl FnOnce(&ThreadSlot) -> R) -> R {
-        let ptr = THREAD_SLOTS.with(|slots| {
-            let mut v = slots.borrow_mut();
-            if v.len() <= self.slot {
-                v.resize_with(self.slot + 1, || None);
-            }
-            let entry = v[self.slot].get_or_insert_with(|| Box::new(ThreadSlot::new()));
-            &raw const **entry
-        });
-        // SAFETY: the box was just created or already existed in this
-        // thread's `THREAD_SLOTS`, is never moved out or replaced, and lives
-        // until the thread exits — which cannot happen while this frame is on
-        // that thread's stack.
-        f(unsafe { &*ptr })
+        with_thread_slot(self.slot, f)
     }
 
     /// Run `f` against this (thread, device)'s workspace of type `T`. See
@@ -757,6 +780,72 @@ pub(crate) fn device(slot: usize) -> &'static CudaContext {
     all[slot].get_or_init(|| unsafe { init_device(slot) })
 }
 
+/// Run `f` against the calling thread's slot for registry slot `slot`,
+/// creating the slot on first use.
+///
+/// The `RefCell` borrow is released *before* `f` runs, so a closure that
+/// reaches back in (the `WS` realloc path calls `current_stream()`, and every
+/// allocation made inside a workspace closure reads the pool selector) does
+/// not hit a double borrow. The `Box` keeps the address stable for the
+/// thread's life, and the higher-ranked closure bound stops the reference
+/// escaping.
+///
+/// A free function rather than a `StreamPool` method because it needs no
+/// context: the slot is plain thread-local bookkeeping and creating one makes
+/// no driver call. [`with_placement`] depends on that.
+fn with_thread_slot<R>(slot: usize, f: impl FnOnce(&ThreadSlot) -> R) -> R {
+    let ptr = THREAD_SLOTS.with(|slots| slot_ptr(slots, slot));
+    // SAFETY: the box was just created or already existed in this thread's
+    // `THREAD_SLOTS`, is never moved out or replaced, and lives until the
+    // thread exits — which cannot happen while this frame is on that
+    // thread's stack.
+    f(unsafe { &*ptr })
+}
+
+fn slot_ptr(slots: &RefCell<Vec<Option<Box<ThreadSlot>>>>, slot: usize) -> *const ThreadSlot {
+    let mut v = slots.borrow_mut();
+    if v.len() <= slot {
+        v.resize_with(slot + 1, || None);
+    }
+    let entry = v[slot].get_or_insert_with(|| Box::new(ThreadSlot::new()));
+    &raw const **entry
+}
+
+/// The registry slot [`current`] resolves to, computed without creating a
+/// context. One slot in this step; step 5 reads the thread-current ordinal
+/// here, and both [`current`] and [`with_placement`] follow it.
+fn current_slot() -> usize {
+    0
+}
+
+/// Run `f` against the calling thread's placement channel for the current
+/// device. Roadmap A4 step 4b.
+///
+/// NON-FORCING, unlike [`current`]: no context is created, and that is
+/// load-bearing. The pool selector is written by `nsl_gpu_set_*_pool`, which
+/// codegen emits around every train block whatever device the program runs
+/// on, and the arena's unbind row runs whether or not an arena exists. A
+/// forcing door would make a cuda-featured binary running a CPU-only program
+/// on a machine with no driver abort in `cuInit` — the failure
+/// `initialized()` exists to prevent. The slot needs no context, so there is
+/// nothing to force.
+///
+/// Once this thread's slots have been destroyed (thread-local teardown), `f`
+/// runs against a fresh channel instead: the pool reads `Transient` and no
+/// pin is armed, which is what the cells answered on a new thread, and a
+/// write there is dropped with the thread. The cells this replaced were
+/// const-initialised and never destroyed, so a late allocation in some other
+/// thread-local's destructor could still read them; this keeps that working
+/// rather than panicking inside a destructor.
+pub(crate) fn with_placement<R>(f: impl FnOnce(&Placement) -> R) -> R {
+    let slot = current_slot();
+    match THREAD_SLOTS.try_with(|slots| slot_ptr(slots, slot)) {
+        // SAFETY: as in `with_thread_slot`.
+        Ok(ptr) => f(unsafe { &(*ptr).placement }),
+        Err(_) => f(&Placement::new()),
+    }
+}
+
 /// The context bound to the calling thread's current device.
 ///
 /// One slot in this step, so this is slot 0 and matches the singleton exactly.
@@ -764,7 +853,7 @@ pub(crate) fn device(slot: usize) -> &'static CudaContext {
 /// to `select_device_ordinal()` — so a process that never calls
 /// `nsl_cuda_set_device` keeps binding the device it binds today.
 pub(crate) fn current() -> &'static CudaContext {
-    device(0)
+    device(current_slot())
 }
 
 /// Has any context been initialised yet?
@@ -1024,6 +1113,30 @@ mod tests {
         assert_eq!(b.with_capture(|c| c.nested_skip().get()), 5);
         a.with_capture(|c| c.nested_skip().set(0));
         b.with_capture(|c| c.nested_skip().set(0));
+    }
+
+    /// The placement channel is per (thread, device) and reachable with no
+    /// context at all. The second half is what the stub-library lane proves:
+    /// there every `cuInit` fails, so a door that created a context would
+    /// panic here rather than pass. Roadmap A4 step 4b.
+    #[test]
+    fn placement_is_per_slot_and_needs_no_context() {
+        use super::super::caching_allocator::{get_alloc_pool, PoolGuard};
+
+        assert_eq!(get_alloc_pool(), AllocPool::Transient, "a fresh thread starts Transient");
+        {
+            let _g = PoolGuard::new(AllocPool::Persistent);
+            assert_eq!(with_placement(|p| p.pool.get()), AllocPool::Persistent);
+            // Another device's slot on this thread is untouched...
+            assert_eq!(
+                with_thread_slot(current_slot() + 1, |s| s.placement.pool.get()),
+                AllocPool::Transient
+            );
+            // ...and so is this device's slot on another thread.
+            let other = std::thread::spawn(get_alloc_pool).join().unwrap();
+            assert_eq!(other, AllocPool::Transient);
+        }
+        assert_eq!(get_alloc_pool(), AllocPool::Transient, "the guard restored through the slot");
     }
 
     /// `transfer_if_created` must not create: it is what keeps
