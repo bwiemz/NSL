@@ -409,6 +409,35 @@ frozen throughout, so nothing here blocks a kernel fix.
      (`tests/cfie_ptx_headers_ptxas.rs`);
    - a test that read the base kernel's hand register names
      (`cfie_kv_quant_ptx`'s stride check) reads `kv_strides` instead.
+
+   **`kv_quant` done**; the freeze went from 66 members to 65. Its
+   per-layer kernels run the same algorithm as `decode_attention` with a
+   different pool, so the builder is shared rather than copied:
+   `cfie_decode_attention::build_flash_decode` takes a `PoolLayout`, either
+   the uniform f16 pool with a runtime `layer_idx`, or one layer's K and V
+   halves at baked byte offsets (`Baked`), each f16 or int8. A baked half
+   is `kv_base` (a byte pointer) plus its offset, `Cast` to a pointer of
+   the half's element type — KIR's `Cast` is how one pointer type becomes
+   another, printed `cvt.u64.u64` — and indexed in elements from there.
+   An int8 element is `ld.global.s8`, `cvt.rn.f32.s8` and a multiply by
+   the half's `.f32` scale param, the hand kernel's register dequant; KIR
+   needed nothing new for it. The base kernel still matches its own gate
+   through the refactor. Level 3 again, on the same interpreter, now shared
+   (`tests/support/cta_ptx_interp.rs`) and taught `ld.param.f32`,
+   `ld.global.s8` (sign-extending — a test pins that), `cvt.rn.f32.s8` and
+   `cvt.u64.u64`. The KIR kernels match the frozen hand emitter bit for bit
+   for every layer of four mixed-precision pools, and the gate catches the
+   same mutations plus a nudged half offset and the K and V scales swapped.
+   Two things surfaced:
+
+   - an int8 half with an odd element count
+     (`max_tokens * n_kv_heads * head_dim`) put the next f16 half on an odd
+     byte, a misaligned 2-byte load the GPU faults on. `validate` refuses
+     that layout now (the hand kernel emitted it);
+   - the module targets the KIR floor like the base kernel, so
+     `QuantDecodeAttentionConfig` lost its `sm_version` too.
+     `tests/cfie_ptx_headers_ptxas.rs` still assembles the modules for every
+     architecture in the table.
 10. **Fused loss heads.** `fused_linear_ce.rs`, then `cpkd_fused_loss.rs`.
     Proof: SASS equivalence (the online-softmax loops reorder under
     scheduling).

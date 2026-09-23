@@ -1,0 +1,698 @@
+//! A cooperative-CTA PTX interpreter for the flash-decode subset — the
+//! executable half of the CFIE equivalence gates (roadmap A2 step 9).
+//!
+//! Shared by `cfie_decode_attn_kir_equivalence.rs` and
+//! `cfie_kv_quant_kir_equivalence.rs`, which include it with `#[path]`;
+//! the first of them documents what it models and what it does not.
+//! In short: a CTA runs cooperatively, a `bar.sync` releases only when
+//! every thread waits at it, and an unknown mnemonic or operand form, a
+//! read of an unwritten register, or an access outside the buffers a
+//! launch provides is a hard error, never a skip.
+//!
+//! `ld.global.s8` sign-extends one byte into its register, as the
+//! hardware does, and `cvt.rn.f32.s8` converts the low byte — exact, so
+//! the rounding mode is moot. `cvt.u64.u64` is a copy: it is how the KIR
+//! printer reinterprets one pointer type as another.
+
+use std::collections::HashMap;
+
+use half::f16;
+
+// ---------------------------------------------------------------------------
+// Parsing
+// ---------------------------------------------------------------------------
+
+/// Where shared memory starts in the interpreter's shared window. Non-zero
+/// so a null shared pointer faults; small so the hand kernel's 32-bit
+/// shared addresses hold it.
+pub(crate) const SHARED_BASE: u64 = 0x100;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Special {
+    TidX,
+    CtaidX,
+    NtidX,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Src {
+    Reg(usize),
+    Imm(u64),
+    Special(Special),
+}
+
+/// `[reg]` or `[reg+imm]`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Addr {
+    pub(crate) base: usize,
+    pub(crate) offset: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum W {
+    U32,
+    U64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum IntOp {
+    Add,
+    Sub,
+    MulLo,
+    Div,
+    Min,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum FOp {
+    Add,
+    Sub,
+    Mul,
+    Max,
+    DivRn,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Cmp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum CmpTy {
+    U32,
+    U64,
+    F32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Space {
+    Global,
+    Shared,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum Op {
+    LdParam { d: usize, param: String },
+    Mov { d: usize, s: Src, w: W },
+    Int { op: IntOp, w: W, d: usize, a: Src, b: Src },
+    MulWide { d: usize, a: Src, b: Src },
+    CvtU64U32 { d: usize, a: Src },
+    CvtF32F16 { d: usize, a: Src },
+    /// `cvt.rn.f32.s8`: the low byte, as a signed integer, to f32 (exact).
+    CvtF32S8 { d: usize, a: Src },
+    Setp { cmp: Cmp, ty: CmpTy, d: usize, a: Src, b: Src },
+    F { op: FOp, d: usize, a: Src, b: Src },
+    Fma { d: usize, a: Src, b: Src, c: Src },
+    Ex2 { d: usize, a: Src },
+    Ld { space: Space, bytes: usize, d: usize, addr: Addr },
+    /// `ld.global.s8`: one byte, sign-extended into the register.
+    LdS8 { space: Space, d: usize, addr: Addr },
+    St { space: Space, bytes: usize, addr: Addr, v: Src },
+    Bra { target: usize },
+    Bar,
+    Ret,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Instr {
+    /// `@%p` / `@!%p`: (predicate register, negated).
+    pub(crate) guard: Option<(usize, bool)>,
+    pub(crate) op: Op,
+    pub(crate) text: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct Program {
+    /// `(ptx type, name)` per entry parameter, in declaration order, the
+    /// `param_` prefix the KIR printer adds stripped.
+    pub(crate) params: Vec<(String, String)>,
+    pub(crate) instrs: Vec<Instr>,
+    pub(crate) reg_names: Vec<String>,
+    /// Shared symbol name -> (window address, bytes).
+    pub(crate) shared: HashMap<String, (u64, usize)>,
+    pub(crate) shared_bytes: usize,
+}
+
+pub(crate) struct Parser {
+    pub(crate) regs: HashMap<String, usize>,
+    pub(crate) reg_names: Vec<String>,
+    pub(crate) shared: HashMap<String, (u64, usize)>,
+}
+
+impl Parser {
+    fn reg(&mut self, name: &str) -> usize {
+        assert!(
+            name.starts_with('%') && name.len() > 1,
+            "`{name}` is not a register"
+        );
+        if let Some(&i) = self.regs.get(name) {
+            return i;
+        }
+        let i = self.reg_names.len();
+        self.regs.insert(name.to_string(), i);
+        self.reg_names.push(name.to_string());
+        i
+    }
+
+    fn src(&mut self, tok: &str) -> Src {
+        let tok = tok.trim();
+        match tok {
+            "%tid.x" => return Src::Special(Special::TidX),
+            "%ctaid.x" => return Src::Special(Special::CtaidX),
+            "%ntid.x" => return Src::Special(Special::NtidX),
+            _ => {}
+        }
+        if tok.starts_with('%') {
+            assert!(!tok.contains('.'), "special register `{tok}` is not modelled");
+            return Src::Reg(self.reg(tok));
+        }
+        if let Some(hex) = tok.strip_prefix("0f") {
+            assert_eq!(hex.len(), 8, "`{tok}` is not an f32 immediate");
+            return Src::Imm(u32::from_str_radix(hex, 16).expect("f32 immediate") as u64);
+        }
+        if let Ok(v) = tok.parse::<u64>() {
+            return Src::Imm(v);
+        }
+        if let Some(&(addr, _)) = self.shared.get(tok) {
+            return Src::Imm(addr);
+        }
+        panic!("operand `{tok}` is not modelled");
+    }
+
+    fn dst(&mut self, tok: &str) -> usize {
+        match self.src(tok) {
+            Src::Reg(r) => r,
+            other => panic!("destination `{tok}` is {other:?}, not a register"),
+        }
+    }
+
+    fn addr(&mut self, tok: &str) -> Addr {
+        let inner = tok
+            .trim()
+            .strip_prefix('[')
+            .and_then(|t| t.strip_suffix(']'))
+            .unwrap_or_else(|| panic!("`{tok}` is not an address operand"));
+        let (base, offset) = match inner.split_once('+') {
+            Some((b, o)) => (b, o.trim().parse::<u64>().expect("address offset")),
+            None => (inner, 0),
+        };
+        Addr { base: self.reg(base.trim()), offset }
+    }
+}
+
+pub(crate) fn parse_signature(ptx: &str) -> Vec<(String, String)> {
+    let start = ptx.find(".visible .entry ").expect("an entry");
+    let open = start + ptx[start..].find('(').expect("a parameter list");
+    let close = open + ptx[open..].find(')').expect("a closed parameter list");
+    ptx[open + 1..close]
+        .split(',')
+        .map(|p| {
+            let words: Vec<&str> = p.split_whitespace().collect();
+            assert_eq!(words.len(), 3, "parameter `{p}`");
+            assert_eq!(words[0], ".param");
+            (words[1].to_string(), words[2].trim_start_matches("param_").to_string())
+        })
+        .collect()
+}
+
+/// Parse one module into the executable subset. Declarations are read for
+/// the shared block and the signature and otherwise skipped; anything else
+/// that is not a recognised instruction panics.
+pub(crate) fn parse(ptx: &str) -> Program {
+    let mut p = Parser { regs: HashMap::new(), reg_names: Vec::new(), shared: HashMap::new() };
+    let mut shared_bytes = 0usize;
+
+    // `.shared .align A .b8 NAME[N];`
+    for line in ptx.lines().map(str::trim) {
+        if let Some(rest) = line.strip_prefix(".shared ") {
+            let decl = rest.split_whitespace().last().expect("a shared symbol");
+            let (name, n) = decl.trim_end_matches(';').trim_end_matches(']').split_once('[').expect("a sized block");
+            let n: usize = n.parse().expect("a static shared size");
+            p.shared.insert(name.to_string(), (SHARED_BASE + shared_bytes as u64, n));
+            shared_bytes += n;
+        }
+        assert!(!line.starts_with(".extern"), "dynamic shared memory is not modelled");
+    }
+
+    let mut labels: HashMap<String, usize> = HashMap::new();
+    let mut pending: Vec<(String, String, Option<(usize, bool)>)> = Vec::new(); // (mnemonic, operands, guard)
+
+    for raw in ptx.lines() {
+        let line = raw.split("//").next().unwrap().trim();
+        if line.is_empty() || line.starts_with('.') || matches!(line, "{" | "}" | ")" | "(") {
+            continue;
+        }
+        if let Some(name) = line.strip_suffix(':') {
+            assert!(!name.contains(' '), "`{line}` is not a label");
+            labels.insert(name.to_string(), pending.len());
+            continue;
+        }
+        let body = line.strip_suffix(';').unwrap_or_else(|| panic!("`{line}` is not a statement"));
+        let (guard, body) = match body.strip_prefix('@') {
+            Some(rest) => {
+                let (pred, tail) = rest.split_once(' ').expect("a guarded instruction");
+                let (negated, pred) = match pred.strip_prefix('!') {
+                    Some(p) => (true, p),
+                    None => (false, pred),
+                };
+                (Some((p.reg(pred), negated)), tail.trim())
+            }
+            None => (None, body),
+        };
+        let (mnemonic, operands) = body.split_once(' ').unwrap_or((body, ""));
+        pending.push((mnemonic.to_string(), operands.to_string(), guard));
+    }
+
+    let mut instrs = Vec::with_capacity(pending.len());
+    for (mnemonic, operands, guard) in pending {
+        let ops: Vec<&str> = if operands.is_empty() {
+            vec![]
+        } else {
+            operands.split(',').map(str::trim).collect()
+        };
+        let text = format!("{mnemonic} {operands}");
+        let want = |n: usize| assert_eq!(ops.len(), n, "`{text}` takes {n} operands");
+        let parts: Vec<&str> = mnemonic.split('.').collect();
+        let op = match parts.as_slice() {
+            ["ld", "param", "u64" | "u32" | "f32"] => {
+                want(2);
+                let name = ops[1].trim_start_matches('[').trim_end_matches(']');
+                Op::LdParam { d: p.dst(ops[0]), param: name.trim_start_matches("param_").to_string() }
+            }
+            ["mov", ty] => {
+                want(2);
+                let w = match *ty {
+                    "u32" | "b32" | "f32" | "pred" => W::U32,
+                    "u64" | "b64" => W::U64,
+                    _ => panic!("`{text}`: mov.{ty} is not modelled"),
+                };
+                Op::Mov { d: p.dst(ops[0]), s: p.src(ops[1]), w }
+            }
+            [name @ ("add" | "sub" | "div" | "min"), ty @ ("u32" | "u64")]
+            | [name @ "mul", "lo", ty @ ("u32" | "u64")] => {
+                want(3);
+                let op = match *name {
+                    "add" => IntOp::Add,
+                    "sub" => IntOp::Sub,
+                    "mul" => IntOp::MulLo,
+                    "div" => IntOp::Div,
+                    _ => IntOp::Min,
+                };
+                let w = if *ty == "u32" { W::U32 } else { W::U64 };
+                Op::Int { op, w, d: p.dst(ops[0]), a: p.src(ops[1]), b: p.src(ops[2]) }
+            }
+            ["mul", "wide", "u32"] => {
+                want(3);
+                Op::MulWide { d: p.dst(ops[0]), a: p.src(ops[1]), b: p.src(ops[2]) }
+            }
+            // A pointer reinterpreted as another pointer type: a copy.
+            ["cvt", "u64", "u64"] => {
+                want(2);
+                Op::Mov { d: p.dst(ops[0]), s: p.src(ops[1]), w: W::U64 }
+            }
+            ["cvt", "rn", "f32", "s8"] => {
+                want(2);
+                Op::CvtF32S8 { d: p.dst(ops[0]), a: p.src(ops[1]) }
+            }
+            ["cvt", "u64", "u32"] => {
+                want(2);
+                Op::CvtU64U32 { d: p.dst(ops[0]), a: p.src(ops[1]) }
+            }
+            ["cvt", "f32", "f16"] => {
+                want(2);
+                Op::CvtF32F16 { d: p.dst(ops[0]), a: p.src(ops[1]) }
+            }
+            ["setp", cmp, ty] => {
+                want(3);
+                let cmp = match *cmp {
+                    "eq" => Cmp::Eq,
+                    "ne" => Cmp::Ne,
+                    "lt" => Cmp::Lt,
+                    "le" => Cmp::Le,
+                    "gt" => Cmp::Gt,
+                    "ge" => Cmp::Ge,
+                    _ => panic!("`{text}`: comparison not modelled"),
+                };
+                let ty = match *ty {
+                    "u32" => CmpTy::U32,
+                    "u64" => CmpTy::U64,
+                    "f32" => CmpTy::F32,
+                    _ => panic!("`{text}`: comparison type not modelled"),
+                };
+                Op::Setp { cmp, ty, d: p.dst(ops[0]), a: p.src(ops[1]), b: p.src(ops[2]) }
+            }
+            [name @ ("add" | "sub" | "mul" | "max"), "f32"] | [name @ "div", "rn", "f32"] => {
+                want(3);
+                let op = match *name {
+                    "add" => FOp::Add,
+                    "sub" => FOp::Sub,
+                    "mul" => FOp::Mul,
+                    "max" => FOp::Max,
+                    _ => FOp::DivRn,
+                };
+                Op::F { op, d: p.dst(ops[0]), a: p.src(ops[1]), b: p.src(ops[2]) }
+            }
+            ["fma", "rn", "f32"] => {
+                want(4);
+                Op::Fma { d: p.dst(ops[0]), a: p.src(ops[1]), b: p.src(ops[2]), c: p.src(ops[3]) }
+            }
+            ["ex2", "approx", "f32"] => {
+                want(2);
+                Op::Ex2 { d: p.dst(ops[0]), a: p.src(ops[1]) }
+            }
+            ["ld", space @ ("global" | "shared"), ty @ ("f32" | "b16")] => {
+                want(2);
+                let space = if *space == "global" { Space::Global } else { Space::Shared };
+                let bytes = if *ty == "f32" { 4 } else { 2 };
+                Op::Ld { space, bytes, d: p.dst(ops[0]), addr: p.addr(ops[1]) }
+            }
+            ["ld", space @ ("global" | "shared"), "s8"] => {
+                want(2);
+                let space = if *space == "global" { Space::Global } else { Space::Shared };
+                Op::LdS8 { space, d: p.dst(ops[0]), addr: p.addr(ops[1]) }
+            }
+            ["st", space @ ("global" | "shared"), "f32"] => {
+                want(2);
+                let space = if *space == "global" { Space::Global } else { Space::Shared };
+                Op::St { space, bytes: 4, addr: p.addr(ops[0]), v: p.src(ops[1]) }
+            }
+            ["bra"] => {
+                want(1);
+                // Resolved below, once every label is known.
+                Op::Bra { target: usize::MAX }
+            }
+            ["bar", "sync"] => {
+                assert_eq!(ops, vec!["0"], "`{text}`: only barrier 0 is modelled");
+                Op::Bar
+            }
+            ["ret"] => {
+                want(0);
+                Op::Ret
+            }
+            _ => panic!("interpreter does not know this instruction: `{text}`"),
+        };
+        let op = match op {
+            Op::Bra { .. } => Op::Bra {
+                target: *labels.get(ops[0]).unwrap_or_else(|| panic!("`{text}`: no label {}", ops[0])),
+            },
+            other => other,
+        };
+        instrs.push(Instr { guard, op, text });
+    }
+
+    Program {
+        params: parse_signature(ptx),
+        instrs,
+        reg_names: p.reg_names,
+        shared: p.shared,
+        shared_bytes,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Execution
+// ---------------------------------------------------------------------------
+
+/// A global buffer the launch provides. Every global access must fall
+/// entirely inside one.
+pub(crate) struct Segment {
+    pub(crate) base: u64,
+    pub(crate) bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Order {
+    Ascending,
+    Descending,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum State {
+    Running,
+    AtBarrier,
+    Exited,
+}
+
+pub(crate) struct Thread {
+    pub(crate) pc: usize,
+    pub(crate) regs: Vec<u64>,
+    pub(crate) written: Vec<bool>,
+    pub(crate) state: State,
+}
+
+pub(crate) struct Launch<'a> {
+    pub(crate) prog: &'a Program,
+    pub(crate) args: &'a HashMap<String, u64>,
+    pub(crate) global: &'a mut [Segment],
+    pub(crate) shared: Vec<u8>,
+    pub(crate) ctaid: u32,
+    pub(crate) ntid: u32,
+    pub(crate) steps: u64,
+}
+
+pub(crate) const STEP_LIMIT: u64 = 200_000_000;
+
+impl Launch<'_> {
+    fn global(&mut self, addr: u64, len: usize) -> &mut [u8] {
+        for seg in self.global.iter_mut() {
+            if addr >= seg.base && addr + len as u64 <= seg.base + seg.bytes.len() as u64 {
+                let at = (addr - seg.base) as usize;
+                return &mut seg.bytes[at..at + len];
+            }
+        }
+        panic!("global access of {len} bytes at {addr:#x} is outside every buffer");
+    }
+
+    fn shared(&mut self, addr: u64, len: usize) -> &mut [u8] {
+        let end = SHARED_BASE + self.shared.len() as u64;
+        assert!(
+            addr >= SHARED_BASE && addr + len as u64 <= end,
+            "shared access of {len} bytes at {addr:#x} is outside [{SHARED_BASE:#x}, {end:#x})"
+        );
+        let at = (addr - SHARED_BASE) as usize;
+        &mut self.shared[at..at + len]
+    }
+}
+
+pub(crate) fn read(prog: &Program, t: &Thread, launch: &Launch, tid: u32, s: Src, at: &str) -> u64 {
+    match s {
+        Src::Reg(r) => {
+            assert!(
+                t.written[r],
+                "thread {tid} read `{}` before anything wrote it, in `{at}`",
+                prog.reg_names[r]
+            );
+            t.regs[r]
+        }
+        Src::Imm(v) => v,
+        Src::Special(Special::TidX) => tid as u64,
+        Src::Special(Special::CtaidX) => launch.ctaid as u64,
+        Src::Special(Special::NtidX) => launch.ntid as u64,
+    }
+}
+
+pub(crate) fn f(bits: u64) -> f32 {
+    f32::from_bits(bits as u32)
+}
+
+pub(crate) fn fb(v: f32) -> u64 {
+    v.to_bits() as u64
+}
+
+/// Run thread `tid` until it waits at a barrier or exits.
+pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
+    let prog = launch.prog;
+    loop {
+        launch.steps += 1;
+        assert!(launch.steps < STEP_LIMIT, "kernel did not terminate");
+        let instr = prog.instrs.get(t.pc).unwrap_or_else(|| panic!("thread {tid} ran off the end"));
+        t.pc += 1;
+        if let Some((p, negated)) = instr.guard {
+            let taken = read(prog, t, launch, tid, Src::Reg(p), &instr.text) != 0;
+            if taken == negated {
+                continue;
+            }
+        }
+        let rd = |t: &Thread, launch: &Launch, s: Src| read(prog, t, launch, tid, s, &instr.text);
+        let write = |t: &mut Thread, d: usize, v: u64| {
+            t.regs[d] = v;
+            t.written[d] = true;
+        };
+        match &instr.op {
+            Op::LdParam { d, param } => {
+                let v = *launch.args.get(param).unwrap_or_else(|| panic!("no argument `{param}`"));
+                write(t, *d, v);
+            }
+            Op::Mov { d, s, w } => {
+                let v = rd(t, launch, *s);
+                write(t, *d, if *w == W::U32 { v as u32 as u64 } else { v });
+            }
+            Op::Int { op, w, d, a, b } => {
+                let (a, b) = (rd(t, launch, *a), rd(t, launch, *b));
+                let v = match w {
+                    W::U32 => {
+                        let (a, b) = (a as u32, b as u32);
+                        (match op {
+                            IntOp::Add => a.wrapping_add(b),
+                            IntOp::Sub => a.wrapping_sub(b),
+                            IntOp::MulLo => a.wrapping_mul(b),
+                            IntOp::Div => a.checked_div(b).expect("u32 division by zero"),
+                            IntOp::Min => a.min(b),
+                        }) as u64
+                    }
+                    W::U64 => match op {
+                        IntOp::Add => a.wrapping_add(b),
+                        IntOp::Sub => a.wrapping_sub(b),
+                        IntOp::MulLo => a.wrapping_mul(b),
+                        IntOp::Div => a.checked_div(b).expect("u64 division by zero"),
+                        IntOp::Min => a.min(b),
+                    },
+                };
+                write(t, *d, v);
+            }
+            Op::MulWide { d, a, b } => {
+                let v = (rd(t, launch, *a) as u32 as u64) * (rd(t, launch, *b) as u32 as u64);
+                write(t, *d, v);
+            }
+            Op::CvtU64U32 { d, a } => {
+                let v = rd(t, launch, *a) as u32 as u64;
+                write(t, *d, v);
+            }
+            Op::CvtF32F16 { d, a } => {
+                let v = f16::from_bits(rd(t, launch, *a) as u16).to_f32();
+                write(t, *d, fb(v));
+            }
+            Op::CvtF32S8 { d, a } => {
+                let v = rd(t, launch, *a) as u8 as i8 as f32;
+                write(t, *d, fb(v));
+            }
+            Op::Setp { cmp, ty, d, a, b } => {
+                let (a, b) = (rd(t, launch, *a), rd(t, launch, *b));
+                let r = match ty {
+                    CmpTy::U32 | CmpTy::U64 => {
+                        let (a, b) = if *ty == CmpTy::U32 { (a as u32 as u64, b as u32 as u64) } else { (a, b) };
+                        match cmp {
+                            Cmp::Eq => a == b,
+                            Cmp::Ne => a != b,
+                            Cmp::Lt => a < b,
+                            Cmp::Le => a <= b,
+                            Cmp::Gt => a > b,
+                            Cmp::Ge => a >= b,
+                        }
+                    }
+                    // PTX's ordered comparisons are false on NaN, `ne` too
+                    // (`neu` is the unordered form) — as Rust's operators.
+                    CmpTy::F32 => {
+                        let (a, b) = (f(a), f(b));
+                        match cmp {
+                            Cmp::Eq => a == b,
+                            Cmp::Ne => a < b || a > b,
+                            Cmp::Lt => a < b,
+                            Cmp::Le => a <= b,
+                            Cmp::Gt => a > b,
+                            Cmp::Ge => a >= b,
+                        }
+                    }
+                };
+                write(t, *d, r as u64);
+            }
+            Op::F { op, d, a, b } => {
+                let (a, b) = (f(rd(t, launch, *a)), f(rd(t, launch, *b)));
+                let v = match op {
+                    FOp::Add => a + b,
+                    FOp::Sub => a - b,
+                    FOp::Mul => a * b,
+                    // PTX `max.f32` returns the non-NaN operand, as Rust's.
+                    FOp::Max => a.max(b),
+                    FOp::DivRn => a / b,
+                };
+                write(t, *d, fb(v));
+            }
+            Op::Fma { d, a, b, c } => {
+                let v = f(rd(t, launch, *a)).mul_add(f(rd(t, launch, *b)), f(rd(t, launch, *c)));
+                write(t, *d, fb(v));
+            }
+            Op::Ex2 { d, a } => {
+                let v = f(rd(t, launch, *a)).exp2();
+                write(t, *d, fb(v));
+            }
+            Op::Ld { space, bytes, d, addr } => {
+                let at = rd(t, launch, Src::Reg(addr.base)).wrapping_add(addr.offset);
+                let mem = match space {
+                    Space::Global => launch.global(at, *bytes),
+                    Space::Shared => launch.shared(at, *bytes),
+                };
+                let mut buf = [0u8; 8];
+                buf[..*bytes].copy_from_slice(mem);
+                write(t, *d, u64::from_le_bytes(buf));
+            }
+            Op::LdS8 { space, d, addr } => {
+                let at = rd(t, launch, Src::Reg(addr.base)).wrapping_add(addr.offset);
+                let mem = match space {
+                    Space::Global => launch.global(at, 1),
+                    Space::Shared => launch.shared(at, 1),
+                };
+                write(t, *d, mem[0] as i8 as i64 as u64);
+            }
+            Op::St { space, bytes, addr, v } => {
+                let at = rd(t, launch, Src::Reg(addr.base)).wrapping_add(addr.offset);
+                let val = rd(t, launch, *v).to_le_bytes();
+                let mem = match space {
+                    Space::Global => launch.global(at, *bytes),
+                    Space::Shared => launch.shared(at, *bytes),
+                };
+                mem.copy_from_slice(&val[..*bytes]);
+            }
+            Op::Bra { target } => t.pc = *target,
+            Op::Bar => {
+                t.state = State::AtBarrier;
+                return;
+            }
+            Op::Ret => {
+                t.state = State::Exited;
+                return;
+            }
+        }
+    }
+}
+
+/// Run one CTA to completion under `order`.
+pub(crate) fn run_cta(launch: &mut Launch, order: Order) {
+    let n = launch.ntid;
+    let regs = launch.prog.reg_names.len();
+    let mut threads: Vec<Thread> = (0..n)
+        .map(|_| Thread { pc: 0, regs: vec![0; regs], written: vec![false; regs], state: State::Running })
+        .collect();
+    let visit: Vec<u32> = match order {
+        Order::Ascending => (0..n).collect(),
+        Order::Descending => (0..n).rev().collect(),
+    };
+    loop {
+        for &tid in &visit {
+            let t = &mut threads[tid as usize];
+            if t.state == State::Running {
+                run_until_blocked(t, launch, tid);
+            }
+        }
+        let waiting = threads.iter().filter(|t| t.state == State::AtBarrier).count();
+        let exited = threads.iter().filter(|t| t.state == State::Exited).count();
+        if exited == threads.len() {
+            return;
+        }
+        assert_eq!(
+            waiting,
+            threads.len(),
+            "CTA {}: {waiting} threads wait at a barrier that {exited} exited threads never reach",
+            launch.ctaid
+        );
+        for t in threads.iter_mut() {
+            t.state = State::Running;
+        }
+    }
+}
+

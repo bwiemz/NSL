@@ -14,6 +14,12 @@
 //! in `gpu_specs::GPU_DATABASE` that CUDA 13 still assembles for, and
 //! assembles each with `ptxas --gpu-name sm_{N}`.
 //!
+//! `cfie_kv_quant_ptx` has since moved onto KIR (roadmap A2 step 9): its
+//! per-layer kernels target the KIR floor (`sm_70`) whatever GPU serves
+//! them and take no `sm_version`, so the gate builds them once and still
+//! assembles them for every architecture — the driver JIT-compiles them
+//! forward, and this is the offline form of that.
+//!
 //! Skipped with a note when `ptxas` is not in PATH; CI's cuda-feature lane
 //! installs the toolkit and runs this file in its "PTX emitter ptxas
 //! validation" step. Same harness as `kir_block_params_ptxas.rs`.
@@ -109,7 +115,6 @@ fn modules(sm: u32) -> Vec<(String, String)> {
         head_dim: 64,
         per_slot_max_tokens: 256,
         max_slots: 4,
-        sm_version: sm,
         layer_precisions: vec![(KvPrecision::Fp16, KvPrecision::Int8), (KvPrecision::Int8, KvPrecision::Int8)],
     };
     for (ptx, meta) in cfie_kv_quant_ptx::emit_all(&kv) {

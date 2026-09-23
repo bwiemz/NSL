@@ -8,6 +8,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- The CFIE per-layer KV-quant decode-attention kernels are built as KIR
+  (roadmap A2 step 9, second slice). They were hand-assembled PTX, one
+  kernel per layer with its K and V load paths specialized to that layer's
+  precision. They now share the base decode-attention kernel's KIR builder
+  (`build_flash_decode`) over a pool of baked per-half byte offsets, each
+  half read as f16 or as int8 dequantized by its runtime scale. The
+  hand-PTX freeze drops from 66 files to 65.
+  `tests/cfie_kv_quant_kir_equivalence.rs` runs every layer of four
+  mixed-precision pools through the frozen hand emitter and the KIR one on
+  a PTX interpreter and requires the same output bits. The interpreter is
+  now shared with the base kernel's gate.
+  `QuantDecodeAttentionConfig::sm_version` is gone: the modules target the
+  KIR floor and the driver compiles them forward.
+
 - The CUDA caching allocator is per device (roadmap A4 step 3d, the last
   slice of step 3). It was one process-wide `CACHING_ALLOCATOR` static whose
   free lists held device pointers, so a second device's blocks would have
@@ -330,6 +344,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   every diagnostic line the toolchain prints is a `tracing` event.
 
 ### Fixed
+
+- A KV-quant layout whose int8 half has an odd element count
+  (`max_tokens * n_kv_heads * head_dim`) is refused instead of emitted. The
+  next f16 half would start on an odd byte, and its 2-byte loads would
+  fault on the GPU as misaligned.
 
 - Five CFIE kernel families load on sm_86, sm_87, sm_89 and sm_120 GPUs
   (the RTX 30 and 40 series, Jetson Orin, the RTX 50 series): the
