@@ -1397,7 +1397,6 @@ mod tests {
         let rcfg = RejectionConfig {
             k_tokens: 2,
             vocab_size: vocab as u32,
-            sm_version: 80,
         };
         for seed in [0u64, 1, 42, 0xDEAD_BEEF] {
             let (acc, corr) =
@@ -1435,7 +1434,6 @@ mod tests {
         let rcfg = RejectionConfig {
             k_tokens: 2,
             vocab_size: vocab as u32,
-            sm_version: 80,
         };
         let mut saw_rejection = false;
         for seed in 0..64u64 {

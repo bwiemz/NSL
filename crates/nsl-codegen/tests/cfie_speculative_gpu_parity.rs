@@ -358,7 +358,6 @@ fn reject_cfg() -> RejectionConfig {
     RejectionConfig {
         k_tokens: K_TOKENS as u32,
         vocab_size: R_VOCAB as u32,
-        sm_version: 80,
     }
 }
 
@@ -688,7 +687,6 @@ fn spec_reject_k_tokens_edges_match_cpu_exactly() {
     let cfg1 = RejectionConfig {
         k_tokens: 1,
         vocab_size: R_VOCAB as u32,
-        sm_version: 80,
     };
     let ptx1 = setup_reject_engine(&cfg1);
 
@@ -727,7 +725,6 @@ fn spec_reject_k_tokens_edges_match_cpu_exactly() {
     let cfg32 = RejectionConfig {
         k_tokens: 32,
         vocab_size: R_VOCAB as u32,
-        sm_version: 80,
     };
     let ptx32 = setup_reject_engine(&cfg32);
     let (target32, draft_probs32, draft_tokens32) = seeded_reject_fixture_k(32, 0x3200);

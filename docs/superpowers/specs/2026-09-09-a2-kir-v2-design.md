@@ -467,6 +467,34 @@ frozen throughout, so nothing here blocks a kernel fix.
    -inf leaves the state unchanged). Both redundant barriers stay: removing
    them would change the kernel, which a migration does not.
    `SpecSamplerConfig` lost its `sm_version`, as the other two did.
+
+   **`speculative`, in two slices.** The file holds two unrelated kernels,
+   so each gets its own PR, and the file leaves the freeze with the second.
+   *The rejection epilogue is done* (the first slice). It is a serial
+   thread-0 walk with no shared memory: the acceptance loop, then at the
+   first rejection the Leviathan residual's total mass, the empty-residual
+   fallback to the drafted token, and the CDF walk. Its xorshift64* PRNG is
+   plain KIR — `Shr` / `Shl` / `Xor` / `Mul` on `U64`, a `Cast` to `U32`
+   for the top bits and another to `F32` — so KIR needed nothing new. The
+   interpreter learned 64-bit xor and shifts (PTX's rule: an amount at or
+   past the width gives 0), `cvt.u32.u64`, `cvt.rn.f32.u32`, 32-bit
+   integer loads and hex immediates. Every operation the kernel does is
+   exact in the interpreter, so the gate compares against the CPU
+   reference with bit equality rather than a tolerance, over cases that
+   reach every branch (all-accept, a rejection that resamples, a zero and
+   a negative draft probability, a dominated drafted token, an empty
+   residual, random rows, K = 32, a one-entry vocab) and the zero seed. It
+   catches a nudged xorshift amount, multiplier, golden gamma, 2^-24 scale,
+   sentinel or vocab stride; a forced draft-probability guard; and a
+   dropped residual subtraction or clamp. Two mutants are equivalent and
+   named: forcing the residual-mass test (an empty residual walks a CDF of
+   zeros, which never selects, so it stores the drafted token as the
+   fallback does), and forcing the positive-entry test in the CDF walk
+   (the running sum only grows at a positive entry, so the first index
+   where it reaches the target is positive unless the draw is exactly 0).
+   `RejectionConfig` lost its `sm_version`. *The verify attention kernel*
+   is next: the decode-attention flash loop unrolled once per tree node,
+   plus a masked tile over the appended draft rows.
 10. **Fused loss heads.** `fused_linear_ce.rs`, then `cpkd_fused_loss.rs`.
     Proof: SASS equivalence (the online-softmax loops reorder under
     scheduling).

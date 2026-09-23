@@ -620,6 +620,12 @@ arithmetic order — which the self-speculation anchor needs bit-identical —
 is one piece of code. `tests/cfie_spec_sampler_kir_equivalence.rs` runs
 them against `tests/fixtures/cfie_spec_sampler_hand.rs` on the same
 interpreter.
+`src/cfie_speculative_ptx.rs::build_rejection` is the fourth: the serial
+rejection-sampling epilogue, its xorshift64* PRNG as 64-bit shift/xor/mul
+KIR ops. `tests/cfie_speculative_kir_equivalence.rs` runs it against
+`tests/fixtures/cfie_speculative_hand.rs`; the same file's tree-mask verify
+attention kernel is still hand-assembled, so the file stays a freeze member
+until it moves too.
 
 **Hand-written PTX emitters (frozen).** `src/flash_attention.rs`
 (`synthesize_flash_attention_ptx`, `synthesize_flash_attention_backward_ptx`),

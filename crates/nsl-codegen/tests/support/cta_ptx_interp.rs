@@ -2,8 +2,9 @@
 //! executable half of the CFIE equivalence gates (roadmap A2 step 9).
 //!
 //! Shared by `cfie_decode_attn_kir_equivalence.rs`,
-//! `cfie_kv_quant_kir_equivalence.rs` and
-//! `cfie_spec_sampler_kir_equivalence.rs`, which include it with `#[path]`;
+//! `cfie_kv_quant_kir_equivalence.rs`,
+//! `cfie_spec_sampler_kir_equivalence.rs` and
+//! `cfie_speculative_kir_equivalence.rs`, which include it with `#[path]`;
 //! the first of them documents what it models and what it does not.
 //! In short: a CTA runs cooperatively, a `bar.sync` releases only when
 //! every thread waits at it, and an unknown mnemonic or operand form, a
@@ -20,6 +21,12 @@
 //! `1 / sqrt`: the gates compare two programs on the same model, so what
 //! matters is that the model is a function of its input, not that it
 //! rounds as the hardware's approximation does.
+//!
+//! Shifts follow PTX: `shl` and the unsigned `shr` take their amount from
+//! the low 32 bits of the operand and produce 0 for an amount at or past
+//! the width, rather than wrapping it as Rust's `<<` would.
+//! `cvt.rn.f32.u32` converts with round-to-nearest (Rust's `as`), and
+//! `cvt.u32.u64` keeps the low 32 bits.
 
 use std::collections::HashMap;
 
@@ -68,6 +75,9 @@ pub(crate) enum IntOp {
     MulLo,
     Div,
     Min,
+    Xor,
+    Shl,
+    Shr,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -109,6 +119,10 @@ pub(crate) enum Op {
     Int { op: IntOp, w: W, d: usize, a: Src, b: Src },
     MulWide { d: usize, a: Src, b: Src },
     CvtU64U32 { d: usize, a: Src },
+    /// `cvt.u32.u64`: the low 32 bits.
+    CvtU32U64 { d: usize, a: Src },
+    /// `cvt.rn.f32.u32`: round to nearest.
+    CvtF32U32 { d: usize, a: Src },
     CvtF32F16 { d: usize, a: Src },
     /// `cvt.rn.f32.s8`: the low byte, as a signed integer, to f32 (exact).
     CvtF32S8 { d: usize, a: Src },
@@ -185,6 +199,9 @@ impl Parser {
         }
         if let Ok(v) = tok.parse::<u64>() {
             return Src::Imm(v);
+        }
+        if let Some(hex) = tok.strip_prefix("0x") {
+            return Src::Imm(u64::from_str_radix(hex, 16).expect("hex immediate"));
         }
         if let Some(&(addr, _)) = self.shared.get(tok) {
             return Src::Imm(addr);
@@ -331,6 +348,24 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 want(2);
                 Op::CvtU64U32 { d: p.dst(ops[0]), a: p.src(ops[1]) }
             }
+            ["cvt", "u32", "u64"] => {
+                want(2);
+                Op::CvtU32U64 { d: p.dst(ops[0]), a: p.src(ops[1]) }
+            }
+            ["cvt", "rn", "f32", "u32"] => {
+                want(2);
+                Op::CvtF32U32 { d: p.dst(ops[0]), a: p.src(ops[1]) }
+            }
+            [name @ ("xor" | "shl"), ty @ ("b32" | "b64")] | [name @ "shr", ty @ ("b32" | "b64" | "u32" | "u64")] => {
+                want(3);
+                let op = match *name {
+                    "xor" => IntOp::Xor,
+                    "shl" => IntOp::Shl,
+                    _ => IntOp::Shr,
+                };
+                let w = if ty.ends_with("32") { W::U32 } else { W::U64 };
+                Op::Int { op, w, d: p.dst(ops[0]), a: p.src(ops[1]), b: p.src(ops[2]) }
+            }
             ["cvt", "f32", "f16"] => {
                 want(2);
                 Op::CvtF32F16 { d: p.dst(ops[0]), a: p.src(ops[1]) }
@@ -377,10 +412,10 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 want(2);
                 Op::Rsqrt { d: p.dst(ops[0]), a: p.src(ops[1]) }
             }
-            ["ld", space @ ("global" | "shared"), ty @ ("f32" | "b16")] => {
+            ["ld", space @ ("global" | "shared"), ty @ ("f32" | "b16" | "u32" | "b32")] => {
                 want(2);
                 let space = if *space == "global" { Space::Global } else { Space::Shared };
-                let bytes = if *ty == "f32" { 4 } else { 2 };
+                let bytes = if *ty == "b16" { 2 } else { 4 };
                 Op::Ld { space, bytes, d: p.dst(ops[0]), addr: p.addr(ops[1]) }
             }
             ["ld", space @ ("global" | "shared"), "s8"] => {
@@ -555,6 +590,9 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
                             IntOp::MulLo => a.wrapping_mul(b),
                             IntOp::Div => a.checked_div(b).expect("u32 division by zero"),
                             IntOp::Min => a.min(b),
+                            IntOp::Xor => a ^ b,
+                            IntOp::Shl => a.checked_shl(b).unwrap_or(0),
+                            IntOp::Shr => a.checked_shr(b).unwrap_or(0),
                         }) as u64
                     }
                     W::U64 => match op {
@@ -563,6 +601,10 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
                         IntOp::MulLo => a.wrapping_mul(b),
                         IntOp::Div => a.checked_div(b).expect("u64 division by zero"),
                         IntOp::Min => a.min(b),
+                        IntOp::Xor => a ^ b,
+                        // The amount is a u32 operand, even for a 64-bit shift.
+                        IntOp::Shl => a.checked_shl(b as u32).unwrap_or(0),
+                        IntOp::Shr => a.checked_shr(b as u32).unwrap_or(0),
                     },
                 };
                 write(t, *d, v);
@@ -574,6 +616,14 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
             Op::CvtU64U32 { d, a } => {
                 let v = rd(t, launch, *a) as u32 as u64;
                 write(t, *d, v);
+            }
+            Op::CvtU32U64 { d, a } => {
+                let v = rd(t, launch, *a) as u32 as u64;
+                write(t, *d, v);
+            }
+            Op::CvtF32U32 { d, a } => {
+                let v = rd(t, launch, *a) as u32 as f32;
+                write(t, *d, fb(v));
             }
             Op::CvtF32F16 { d, a } => {
                 let v = f16::from_bits(rd(t, launch, *a) as u16).to_f32();
