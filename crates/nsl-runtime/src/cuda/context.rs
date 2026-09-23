@@ -44,10 +44,16 @@
 //! and they are now *also* device-affine: one [`ThreadSlot`] per (thread,
 //! device), reached through the context. The slot index is what step 1
 //! deliberately left off the context; it earns its place here.
+//!
+//! **Step 4 adds the capture state** to the same slot: `graph_capture`'s
+//! four cells become one `CaptureState` field, and its `cuFuncGetParamInfo`
+//! answers — keyed by `CUfunction`, so device state — move onto
+//! [`CudaContext::with_cache`].
 
 use cudarc::driver::sys::*;
 use std::any::{Any, TypeId};
 
+use super::graph_capture::CaptureState;
 use crate::device_region::Region;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -386,6 +392,12 @@ pub(crate) struct ThreadSlot {
     /// `WS_CACHE`, keyed by the workspace's own type so no workspace type has
     /// to be named here. See [`CudaContext::with_workspace`].
     workspaces: RefCell<HashMap<TypeId, Box<dyn Any>>>,
+    /// Roadmap A4 step 4: was `graph_capture`'s `ACTIVE`, `REGIONS`,
+    /// `OCCURRENCE` and `NESTED_SKIP`. A named field rather than a
+    /// `workspaces` entry because every launch consults it while a capture
+    /// run is armed, and a field is one pointer hop where the map is a hash.
+    /// See [`StreamPool::with_capture`].
+    capture: CaptureState,
 }
 
 impl ThreadSlot {
@@ -395,6 +407,7 @@ impl ThreadSlot {
             transfer: Cell::new(0),
             inspect: Cell::new(0),
             workspaces: RefCell::new(HashMap::new()),
+            capture: CaptureState::default(),
         }
     }
 }
@@ -410,6 +423,13 @@ thread_local! {
     /// workspace type may implement `Drop` with a driver call in it, because
     /// the context may already be gone by then. That matches the previous
     /// behaviour exactly: these cells leaked their device memory too.
+    ///
+    /// The one exception is the capture state, and it is the exception it
+    /// already was: a captured region's pinned staging buffers are freed by
+    /// `cuMemFreeHost` on drop, and the `REGIONS` cell they lived in before
+    /// step 4 dropped them at thread exit in the same way. The call ignores
+    /// its result, and primary contexts are never released, so it is a
+    /// successful free or a no-op.
     static THREAD_SLOTS: RefCell<Vec<Option<Box<ThreadSlot>>>> =
         const { RefCell::new(Vec::new()) };
 }
@@ -528,6 +548,16 @@ impl StreamPool {
         // or moved out, and outlives this frame. Exclusivity is the caller
         // contract documented on `CudaContext::with_workspace`.
         f(unsafe { &mut *ptr })
+    }
+
+    /// Run `f` against this (thread, device)'s CUDA-graph capture state.
+    ///
+    /// A shared reference, not `&mut`: the state keeps the interior
+    /// mutability its four `thread_local!` cells had, so nested calls — the
+    /// capture hooks reach back in from inside each other — are exactly as
+    /// legal as nested `LocalKey::with` calls were. Roadmap A4 step 4.
+    pub(crate) fn with_capture<R>(&self, f: impl FnOnce(&CaptureState) -> R) -> R {
+        self.with_slot(|s| f(&s.capture))
     }
 
     /// Lazily create and return this (thread, device)'s blocking compute
@@ -973,6 +1003,26 @@ mod tests {
         b.with_workspace(|w: &mut ProbeA| w.0 = 22);
         assert_eq!(a.with_workspace(|w: &mut ProbeA| w.0), 11);
         assert_eq!(b.with_workspace(|w: &mut ProbeA| w.0), 22);
+    }
+
+    /// The capture state is per (thread, device), like everything else in
+    /// the slot, and re-entrant: the capture hooks nest their accesses, and
+    /// a slot borrow held across `f` would panic on the inner one.
+    #[test]
+    fn capture_state_is_per_slot_and_reentrant() {
+        let a = test_pool(0);
+        let b = test_pool(4);
+        a.with_capture(|c| {
+            c.nested_skip().set(2);
+            // A nested reach into the same slot, then into another.
+            assert_eq!(a.with_capture(|c| c.nested_skip().get()), 2);
+            assert_eq!(b.with_capture(|c| c.nested_skip().get()), 0);
+        });
+        b.with_capture(|c| c.nested_skip().set(5));
+        assert_eq!(a.with_capture(|c| c.nested_skip().get()), 2);
+        assert_eq!(b.with_capture(|c| c.nested_skip().get()), 5);
+        a.with_capture(|c| c.nested_skip().set(0));
+        b.with_capture(|c| c.nested_skip().set(0));
     }
 
     /// `transfer_if_created` must not create: it is what keeps
