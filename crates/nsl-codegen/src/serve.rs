@@ -1294,7 +1294,6 @@ impl Compiler<'_> {
                 d_model: dd_model,
                 vocab_size: s.vocab_size, // shared vocab
                 vocab_tile: 128,
-                sm_version: gpu.sm_version,
             };
             let (sptx7, smeta7) =
                 crate::cfie_spec_sampler_ptx::emit_draft_sample(&sampler7_cfg);
@@ -1302,7 +1301,6 @@ impl Compiler<'_> {
                 d_model: s.d_model, // TARGET head
                 vocab_size: s.vocab_size,
                 vocab_tile: 128,
-                sm_version: gpu.sm_version,
             };
             let (sptx8, smeta8) =
                 crate::cfie_spec_sampler_ptx::emit_verify_probs(&sampler8_cfg);

@@ -38,7 +38,9 @@
 //! `p_target[tok] = div(ex2(0), sum)` from kind 8 bit-for-bit
 //! (`ex2(+-0) == 1.0` exactly per the PTX ISA).  The reject kernel's
 //! ratio is then exactly 1.0 and every drafted token accepts
-//! regardless of seed.
+//! regardless of seed.  Both kernels are built from the same builder
+//! sections below, so the shared order is one piece of code, not two
+//! copies kept in step.
 //!
 //! `cpu_reference_*` mirror the kernels' arithmetic order exactly
 //! (same strided partial sums + tree reduction, same fma dot order,
@@ -51,8 +53,33 @@
 //! on CPU-vs-GPU parity - it rests on GPU-side kind-7 vs kind-8 BIT
 //! identity (above), proven by the engine's self-speculation contract
 //! (spec generate == plain generate).
+//!
+//! ## KIR (roadmap A2 step 9)
+//!
+//! Both kernels were hand-assembled PTX text until A2 step 9; they are now
+//! [`KernelIR`] that the verifier checks before `nsl_kir`'s printer lowers
+//! it. The algorithm, and the order of every floating-point operation in
+//! it, is the hand kernels' — `tests/cfie_spec_sampler_kir_equivalence.rs`
+//! runs the frozen hand emitter and this one side by side on a PTX
+//! interpreter and requires the same output bits. As for
+//! `cfie_decode_attention`: addresses are element indices through
+//! `PtrOffset`, loop-carried values (the loop cursors, the sum of squares,
+//! the running max / sum / argmax) are block parameters, shared memory is an
+//! [`SmemLayout`] at the hand kernels' packed offsets, and the module
+//! targets the KIR floor (`.version 7.0` / `.target sm_70`) instead of
+//! the serving GPU, so [`SpecSamplerConfig`] has no `sm_version`.
+//! `KirOp::Exp` prints the hand kernels' `mul` by log2(e) then
+//! `ex2.approx`, `KirOp::Rsqrt` their `rsqrt.approx.f32`, and an f32
+//! `KirOp::Div` their `div.rn.f32`.
 
 use std::fmt::Write;
+
+use crate::backend_ptx::lower_kir_to_ptx;
+use crate::cfie_decode_attention::{at, cmp, konst, load, op2, ptr, widen};
+use crate::kernel_ir::{
+    AddressSpace, CmpOp, ConstValue, KernelIR, KirBuilder, KirEdge, KirOp, KirTerminator, KirType,
+    SmemLayout, SmemRegion, VarId,
+};
 
 /// Threads per CTA == vocab tile width (thread t owns row tile_base+t).
 const TILE: u32 = 128;
@@ -76,13 +103,13 @@ pub const VERIFY_PROBS_KERNEL_KIND: u8 = 8;
 /// Compile-time configuration shared by both kernels - mirrors
 /// `cfie_sample_ptx::FusedSampleKernelConfig` minus the sampling
 /// params (the draft is fixed-function greedy; the verify writer has
-/// no sampling at all).
+/// no sampling at all) and minus `sm_version`: the modules target the
+/// KIR floor and the driver JIT-compiles them forward.
 #[derive(Debug, Clone)]
 pub struct SpecSamplerConfig {
     pub d_model: u32,
     pub vocab_size: u32,
     pub vocab_tile: u32,
-    pub sm_version: u32,
 }
 
 /// Host-readable launch metadata emitted alongside the PTX.
@@ -110,313 +137,594 @@ fn validate_config(cfg: &SpecSamplerConfig) {
     assert!(cfg.vocab_size >= 1, "vocab_size must be >= 1");
 }
 
-/// Cooperative hidden load + unconditional RMSNorm in SMEM - the
-/// identical section to `cfie_sample_ptx` (both kernels always
-/// normalize: they consume the raw last-layer hidden state and the
-/// bound final-norm gamma).  The scores region doubles as the
-/// reduction scratch pre-tile-loop, same reuse as the fused sampler.
-fn emit_hidden_load_and_rmsnorm(w: &mut String, dm: u32, scores_off: u32, rms_off: u32) {
-    let zero = f32_imm(0.0);
-    let inv_dm = f32_imm(1.0 / dm as f32);
-    let eps = f32_imm(RMS_EPS);
+// ---------------------------------------------------------------------------
+// Shared memory
+// ---------------------------------------------------------------------------
 
-    writeln!(w, "    // 1. cooperative strided load: hidden [1, d_model] f32 -> SMEM").unwrap();
-    writeln!(w, "    mov.u32 %r_i, %r_tid;").unwrap();
-    writeln!(w, "HLOAD_LOOP:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p_a, %r_i, {};", dm).unwrap();
-    writeln!(w, "    @%p_a bra HLOAD_DONE;").unwrap();
-    writeln!(w, "    mul.lo.u32 %r_t0, %r_i, 4;").unwrap();
-    writeln!(w, "    cvt.u64.u32 %rd_t0, %r_t0;").unwrap();
-    writeln!(w, "    add.u64 %rd_a, %rd_hidden, %rd_t0;").unwrap();
-    writeln!(w, "    ld.global.f32 %f_h, [%rd_a];").unwrap();
-    writeln!(w, "    add.u32 %r_t0, %r_t0, %r_sbase;").unwrap();
-    writeln!(w, "    st.shared.f32 [%r_t0], %f_h;").unwrap();
-    writeln!(w, "    add.u32 %r_i, %r_i, {};", BLOCK_DIM).unwrap();
-    writeln!(w, "    bra HLOAD_LOOP;").unwrap();
-    writeln!(w, "HLOAD_DONE:").unwrap();
-    writeln!(w, "    bar.sync 0;").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    // 2. RMSNorm in SMEM: per-thread strided partial sum of squares").unwrap();
-    writeln!(w, "    mov.f32 %f_ss, {};", zero).unwrap();
-    writeln!(w, "    mov.u32 %r_i, %r_tid;").unwrap();
-    writeln!(w, "SS_LOOP:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p_a, %r_i, {};", dm).unwrap();
-    writeln!(w, "    @%p_a bra SS_DONE;").unwrap();
-    writeln!(w, "    mul.lo.u32 %r_t0, %r_i, 4;").unwrap();
-    writeln!(w, "    add.u32 %r_t0, %r_t0, %r_sbase;").unwrap();
-    writeln!(w, "    ld.shared.f32 %f_h, [%r_t0];").unwrap();
-    writeln!(w, "    fma.rn.f32 %f_ss, %f_h, %f_h, %f_ss;").unwrap();
-    writeln!(w, "    add.u32 %r_i, %r_i, {};", BLOCK_DIM).unwrap();
-    writeln!(w, "    bra SS_LOOP;").unwrap();
-    writeln!(w, "SS_DONE:").unwrap();
-    writeln!(w, "    // scores region doubles as reduction scratch pre-tile-loop").unwrap();
-    writeln!(w, "    mul.lo.u32 %r_t0, %r_tid, 4;").unwrap();
-    writeln!(w, "    add.u32 %r_t0, %r_t0, %r_sbase;").unwrap();
-    writeln!(w, "    st.shared.f32 [%r_t0+{}], %f_ss;", scores_off).unwrap();
-    writeln!(w, "    bar.sync 0;").unwrap();
+const R_HIDDEN: u32 = 0;
+const R_SCORES: u32 = 1;
+const R_RSTD: u32 = 2;
+/// Verify only: pass 1's (max, sum), published by thread 0.
+const R_MAX: u32 = 3;
+const R_SUM: u32 = 4;
+
+/// `[hidden: d_model][scores: TILE][rstd: 1]`, plus `[max: 1][sum: 1]` for
+/// the verify writer; all f32, 4-aligned and a multiple of 4 long, so the
+/// offsets are the hand kernels' packed ones.
+fn smem_layout(d_model: u32, verify: bool) -> SmemLayout {
+    let f32_region = |name: &str, elems: u32| SmemRegion {
+        name: name.to_string(),
+        bytes: elems * 4,
+        align: 4,
+        elem: KirType::F32,
+    };
+    let mut regions = vec![
+        f32_region("hidden", d_model),
+        f32_region("scores", TILE),
+        f32_region("rstd", 1),
+    ];
+    if verify {
+        regions.push(f32_region("max", 1));
+        regions.push(f32_region("sum", 1));
+    }
+    SmemLayout { regions, dynamic: false }
+}
+
+// ---------------------------------------------------------------------------
+// Builder sections, shared by both kernels
+// ---------------------------------------------------------------------------
+
+/// Values every section reads, made once in the entry block.
+struct Common {
+    tid: VarId,
+    hidden: VarId,
+    norm_w: VarId,
+    lm_head: VarId,
+    hidden_smem: VarId,
+    scores: VarId,
+    rstd_smem: VarId,
+    zero: VarId,
+    one: VarId,
+    tile_width: VarId,
+    d_model: VarId,
+    /// The same value as `d_model`, for the `1 / d_model` immediate.
+    d_model_value: u32,
+    d_model_wide: VarId,
+    vocab: VarId,
+    f_zero: VarId,
+    f_neg_inf: VarId,
+}
+
+fn shared_region(b: &mut KirBuilder, region: u32) -> VarId {
+    let dst = b.new_typed_var(ptr(KirType::F32, AddressSpace::Shared));
+    b.emit(KirOp::SharedRegion { dst, region });
+    dst
+}
+
+/// `for (i = tid; i < d_model; i += TILE) body(i)`, entered from the
+/// current block; the builder is left in the loop's exit block.
+fn strided_loop(b: &mut KirBuilder, c: &Common, body: impl FnOnce(&mut KirBuilder, VarId)) {
+    let head = b.new_block();
+    let body_block = b.new_block();
+    let done = b.new_block();
+    let i = b.add_block_param(head, KirType::U32);
+    b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![c.tid])));
+
+    b.set_block(head);
+    let finished = cmp(b, i, c.d_model, CmpOp::Ge);
+    b.terminate(KirTerminator::CondBranch(finished, KirEdge::to(done), KirEdge::to(body_block)));
+
+    b.set_block(body_block);
+    body(b, i);
+    let next = op2(b, KirType::U32, KirOp::Add, i, c.tile_width);
+    b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![next])));
+
+    b.set_block(done);
+}
+
+/// Steps 1 and 2: the hidden row into SMEM, RMSNorm'd in place with the
+/// final-norm gamma. Leaves the builder after the closing barrier.
+fn hidden_load_and_rmsnorm(b: &mut KirBuilder, c: &Common) {
+    use AddressSpace::{Global, Shared};
+    use KirType::F32;
+
+    // 1. cooperative strided load: hidden [1, d_model] f32 -> SMEM
+    strided_loop(b, c, |b, i| {
+        let src = at(b, F32, Global, c.hidden, i);
+        let h = load(b, F32, src, Global);
+        let dst = at(b, F32, Shared, c.hidden_smem, i);
+        b.emit(KirOp::Store(dst, h, Shared));
+    });
+    b.emit(KirOp::Barrier);
+
+    // 2. RMSNorm: per-thread strided partial sum of squares.
+    let head = b.new_block();
+    let body = b.new_block();
+    let done = b.new_block();
+    let i = b.add_block_param(head, KirType::U32);
+    let ss = b.add_block_param(head, F32);
+    b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![c.tid, c.f_zero])));
+
+    b.set_block(head);
+    let finished = cmp(b, i, c.d_model, CmpOp::Ge);
+    b.terminate(KirTerminator::CondBranch(finished, KirEdge::to(done), KirEdge::to(body)));
+
+    b.set_block(body);
+    let slot = at(b, F32, Shared, c.hidden_smem, i);
+    let h = load(b, F32, slot, Shared);
+    let ss_next = b.new_typed_var(F32);
+    b.emit(KirOp::Fma(ss_next, h, h, ss));
+    let i_next = op2(b, KirType::U32, KirOp::Add, i, c.tile_width);
+    b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![i_next, ss_next])));
+
+    // The scores region doubles as the reduction scratch before the tile
+    // loop.
+    b.set_block(done);
+    let mine = at(b, F32, Shared, c.scores, c.tid);
+    b.emit(KirOp::Store(mine, ss, Shared));
+    b.emit(KirOp::Barrier);
+
+    // Tree reduction: scores[tid] += scores[tid + off] for tid < off.
     for off in [64u32, 32, 16, 8, 4, 2, 1] {
-        writeln!(w, "    setp.ge.u32 %p_a, %r_tid, {};", off).unwrap();
-        writeln!(w, "    @%p_a bra RED_{};", off).unwrap();
-        writeln!(w, "    mul.lo.u32 %r_t0, %r_tid, 4;").unwrap();
-        writeln!(w, "    add.u32 %r_t0, %r_t0, %r_sbase;").unwrap();
-        writeln!(w, "    ld.shared.f32 %f_t0, [%r_t0+{}];", scores_off).unwrap();
-        writeln!(w, "    ld.shared.f32 %f_t1, [%r_t0+{}];", scores_off + off * 4).unwrap();
-        writeln!(w, "    add.f32 %f_t0, %f_t0, %f_t1;").unwrap();
-        writeln!(w, "    st.shared.f32 [%r_t0+{}], %f_t0;", scores_off).unwrap();
-        writeln!(w, "RED_{}:", off).unwrap();
-        writeln!(w, "    bar.sync 0;").unwrap();
+        let add = b.new_block();
+        let join = b.new_block();
+        let offset = konst(b, ConstValue::U32(off));
+        let active = cmp(b, c.tid, offset, CmpOp::Lt);
+        b.terminate(KirTerminator::CondBranch(active, KirEdge::to(add), KirEdge::to(join)));
+
+        b.set_block(add);
+        let lo_addr = at(b, F32, Shared, c.scores, c.tid);
+        let lo = load(b, F32, lo_addr, Shared);
+        let partner = op2(b, KirType::U32, KirOp::Add, c.tid, offset);
+        let hi_addr = at(b, F32, Shared, c.scores, partner);
+        let hi = load(b, F32, hi_addr, Shared);
+        let sum = op2(b, F32, KirOp::Add, lo, hi);
+        b.emit(KirOp::Store(lo_addr, sum, Shared));
+        b.terminate(KirTerminator::Branch(KirEdge::to(join)));
+
+        b.set_block(join);
+        b.emit(KirOp::Barrier);
     }
-    writeln!(w, "    // thread 0: rstd = rsqrt(sum_sq / d_model + eps)").unwrap();
-    writeln!(w, "    setp.ne.u32 %p_t0, %r_tid, 0;").unwrap();
-    writeln!(w, "    @%p_t0 bra RSTD_DONE;").unwrap();
-    writeln!(w, "    ld.shared.f32 %f_ss, [%r_sbase+{}];", scores_off).unwrap();
-    writeln!(w, "    mul.f32 %f_ss, %f_ss, {};", inv_dm).unwrap();
-    writeln!(w, "    add.f32 %f_ss, %f_ss, {};", eps).unwrap();
-    writeln!(w, "    rsqrt.approx.f32 %f_rstd, %f_ss;").unwrap();
-    writeln!(w, "    st.shared.f32 [%r_sbase+{}], %f_rstd;", rms_off).unwrap();
-    writeln!(w, "RSTD_DONE:").unwrap();
-    writeln!(w, "    bar.sync 0;").unwrap();
-    writeln!(w, "    ld.shared.f32 %f_rstd, [%r_sbase+{}];", rms_off).unwrap();
-    writeln!(w, "    // scale hidden in place: h = h * rstd * gamma").unwrap();
-    writeln!(w, "    mov.u32 %r_i, %r_tid;").unwrap();
-    writeln!(w, "NRM_LOOP:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p_a, %r_i, {};", dm).unwrap();
-    writeln!(w, "    @%p_a bra NRM_DONE;").unwrap();
-    writeln!(w, "    mul.lo.u32 %r_t0, %r_i, 4;").unwrap();
-    writeln!(w, "    cvt.u64.u32 %rd_t0, %r_t0;").unwrap();
-    writeln!(w, "    add.u64 %rd_a, %rd_norm, %rd_t0;").unwrap();
-    writeln!(w, "    ld.global.f32 %f_g, [%rd_a];").unwrap();
-    writeln!(w, "    add.u32 %r_t1, %r_t0, %r_sbase;").unwrap();
-    writeln!(w, "    ld.shared.f32 %f_h, [%r_t1];").unwrap();
-    writeln!(w, "    mul.f32 %f_h, %f_h, %f_rstd;").unwrap();
-    writeln!(w, "    mul.f32 %f_h, %f_h, %f_g;").unwrap();
-    writeln!(w, "    st.shared.f32 [%r_t1], %f_h;").unwrap();
-    writeln!(w, "    add.u32 %r_i, %r_i, {};", BLOCK_DIM).unwrap();
-    writeln!(w, "    bra NRM_LOOP;").unwrap();
-    writeln!(w, "NRM_DONE:").unwrap();
-    writeln!(w, "    bar.sync 0;").unwrap();
-    writeln!(w).unwrap();
+
+    // Thread 0: rstd = rsqrt(sum_sq / d_model + eps).
+    let rstd_compute = b.new_block();
+    let rstd_done = b.new_block();
+    let is_zero = cmp(b, c.tid, c.zero, CmpOp::Eq);
+    b.terminate(KirTerminator::CondBranch(is_zero, KirEdge::to(rstd_compute), KirEdge::to(rstd_done)));
+
+    b.set_block(rstd_compute);
+    let total = load(b, F32, c.scores, Shared);
+    let inv_dm = konst(b, ConstValue::F32(1.0 / c.d_model_value as f32));
+    let mean = op2(b, F32, KirOp::Mul, total, inv_dm);
+    let eps = konst(b, ConstValue::F32(RMS_EPS));
+    let shifted = op2(b, F32, KirOp::Add, mean, eps);
+    let rstd = b.new_typed_var(F32);
+    b.emit(KirOp::Rsqrt(rstd, shifted));
+    b.emit(KirOp::Store(c.rstd_smem, rstd, Shared));
+    b.terminate(KirTerminator::Branch(KirEdge::to(rstd_done)));
+
+    b.set_block(rstd_done);
+    b.emit(KirOp::Barrier);
+    let rstd = load(b, F32, c.rstd_smem, Shared);
+
+    // Scale hidden in place: h = h * rstd * gamma.
+    strided_loop(b, c, |b, i| {
+        let g_addr = at(b, F32, Global, c.norm_w, i);
+        let g = load(b, F32, g_addr, Global);
+        let slot = at(b, F32, Shared, c.hidden_smem, i);
+        let h = load(b, F32, slot, Shared);
+        let scaled = op2(b, F32, KirOp::Mul, h, rstd);
+        let normed = op2(b, F32, KirOp::Mul, scaled, g);
+        b.emit(KirOp::Store(slot, normed, Shared));
+    });
+    b.emit(KirOp::Barrier);
 }
 
-/// Streaming f16-row matvec for token `%r_tok`: leaves
-/// `dot(x_smem, W[tok])` in `%f_dot` - same fma order + f16 loads as
-/// the fused sampler's DOT_LOOP.  Clobbers `%rd_t0`, `%rd_a`, `%r_d`,
-/// `%r_t1`, `%h_w`, `%f_w`, `%f_h`, `%p_b`.
-fn emit_row_dot(w: &mut String, prefix: &str, dm: u32, w_row_bytes: u64) {
-    let zero = f32_imm(0.0);
-    writeln!(w, "    // f16 row: lm_head_ptr + tok * d_model * 2").unwrap();
-    writeln!(w, "    mul.wide.u32 %rd_t0, %r_tok, {};", w_row_bytes).unwrap();
-    writeln!(w, "    add.u64 %rd_a, %rd_w, %rd_t0;").unwrap();
-    writeln!(w, "    mov.f32 %f_dot, {};", zero).unwrap();
-    writeln!(w, "    mov.u32 %r_d, 0;").unwrap();
-    writeln!(w, "    mov.u32 %r_t1, %r_sbase;").unwrap();
-    writeln!(w, "{}_DOT:", prefix).unwrap();
-    writeln!(w, "    setp.ge.u32 %p_b, %r_d, {};", dm).unwrap();
-    writeln!(w, "    @%p_b bra {}_DOTD;", prefix).unwrap();
-    writeln!(w, "    ld.global.b16 %h_w, [%rd_a];").unwrap();
-    writeln!(w, "    cvt.f32.f16 %f_w, %h_w;").unwrap();
-    writeln!(w, "    ld.shared.f32 %f_h, [%r_t1];").unwrap();
-    writeln!(w, "    fma.rn.f32 %f_dot, %f_w, %f_h, %f_dot;").unwrap();
-    writeln!(w, "    add.u64 %rd_a, %rd_a, 2;").unwrap();
-    writeln!(w, "    add.u32 %r_t1, %r_t1, 4;").unwrap();
-    writeln!(w, "    add.u32 %r_d, %r_d, 1;").unwrap();
-    writeln!(w, "    bra {}_DOT;", prefix).unwrap();
-    writeln!(w, "{}_DOTD:", prefix).unwrap();
+/// `dot(hidden_smem, lm_head[tok])` over the f16 row, in the hand
+/// kernels' fma order: `dot = fma(w, h, dot)` for `d = 0..d_model`.
+/// Entered from the current block; the builder is left in the loop's exit
+/// block, and the returned value is the finished dot.
+fn build_row_dot(b: &mut KirBuilder, c: &Common, tok: VarId) -> VarId {
+    use AddressSpace::{Global, Shared};
+    use KirType::{F16, F32, U32, U64};
+
+    let tok_wide = widen(b, tok);
+    let row = op2(b, U64, KirOp::Mul, tok_wide, c.d_model_wide);
+
+    let head = b.new_block();
+    let body = b.new_block();
+    let done = b.new_block();
+    let d = b.add_block_param(head, U32);
+    let dot = b.add_block_param(head, F32);
+    b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![c.zero, c.f_zero])));
+
+    b.set_block(head);
+    let finished = cmp(b, d, c.d_model, CmpOp::Ge);
+    b.terminate(KirTerminator::CondBranch(finished, KirEdge::to(done), KirEdge::to(body)));
+
+    b.set_block(body);
+    let d_wide = widen(b, d);
+    let index = op2(b, U64, KirOp::Add, row, d_wide);
+    let w_addr = at(b, F16, Global, c.lm_head, index);
+    let w_raw = load(b, F16, w_addr, Global);
+    let w = b.new_typed_var(F32);
+    b.emit(KirOp::Cast(w, w_raw, F32));
+    let h_addr = at(b, F32, Shared, c.hidden_smem, d);
+    let h = load(b, F32, h_addr, Shared);
+    let dot_next = b.new_typed_var(F32);
+    b.emit(KirOp::Fma(dot_next, w, h, dot));
+    let d_next = op2(b, U32, KirOp::Add, d, c.one);
+    b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![d_next, dot_next])));
+
+    b.set_block(done);
+    dot
 }
 
-/// The streaming online-softmax pass shared by the draft kernel and
-/// verify pass 1: per tile all 128 threads score their row into SMEM,
-/// then thread 0 serially merges the tile into the running
-/// (max, sum[, argmax]) state - per element:
-///   if s > m: sum *= ex2((m - s) * log2e); m = s; [sel = token;]
-///   sum += ex2((s - m) * log2e)   (== 1.0 exactly on the max path).
-/// Strict `>` keeps first-max-wins tie-breaks; the CPU reference
-/// mirrors the order exactly.  Thread 0's `%f_m` / `%f_sum`
-/// [/ `%r_sel`] carry the state across tiles.
-fn emit_streaming_pass(
-    w: &mut String,
-    prefix: &str,
-    dm: u32,
-    vocab: u32,
-    w_row_bytes: u64,
-    scores_off: u32,
-    track_argmax: bool,
-) {
-    let neg_inf = f32_imm(f32::NEG_INFINITY);
-    let zero = f32_imm(0.0);
-    let log2e = f32_imm(std::f32::consts::LOG2_E);
+/// The running state of the streaming pass once every tile is merged.
+struct PassResult {
+    max: VarId,
+    sum: VarId,
+    /// Draft only.
+    argmax: Option<VarId>,
+}
 
-    writeln!(w, "    mov.f32 %f_m, {};", neg_inf).unwrap();
-    writeln!(w, "    mov.f32 %f_sum, {};", zero).unwrap();
-    if track_argmax {
-        writeln!(w, "    mov.u32 %r_sel, 0;").unwrap();
+/// Step 3 (both kernels) / pass 1 (verify): per tile every thread scores
+/// its row into SMEM, then thread 0 merges the tile's `cnt` scores into
+/// the running (max, sum[, argmax]) serially — per element
+///   if s > m: sum *= exp(m - s); m = s; [sel = token;]
+///   sum += exp(s - m)   (== 1.0 exactly on the max path).
+/// Strict `>` keeps first-max-wins tie-breaks. Every thread carries the
+/// state through the tile loop; only thread 0's is ever changed or read.
+/// Leaves the builder in the loop's exit block.
+fn streaming_pass(b: &mut KirBuilder, c: &Common, track_argmax: bool) -> PassResult {
+    use AddressSpace::Shared;
+    use KirType::{F32, U32};
+
+    let tile_head = b.new_block();
+    let tile_body = b.new_block();
+    let scored = b.new_block();
+    let merge_start = b.new_block();
+    let merge_head = b.new_block();
+    let merge_body = b.new_block();
+    let new_max = b.new_block();
+    let accumulate = b.new_block();
+    let merged = b.new_block();
+    let tiles_done = b.new_block();
+
+    let state = |b: &mut KirBuilder, block| {
+        let m = b.add_block_param(block, F32);
+        let sum = b.add_block_param(block, F32);
+        let sel = track_argmax.then(|| b.add_block_param(block, U32));
+        (m, sum, sel)
+    };
+    let with_state = |mut args: Vec<VarId>, (m, sum, sel): (VarId, VarId, Option<VarId>)| {
+        args.extend([m, sum]);
+        args.extend(sel);
+        args
+    };
+
+    let tile = b.add_block_param(tile_head, U32);
+    let tile_state = state(b, tile_head);
+    let s_scored = b.add_block_param(scored, F32);
+    let i = b.add_block_param(merge_head, U32);
+    let merge_state = state(b, merge_head);
+    let acc_state = state(b, accumulate);
+    let merged_state = state(b, merged);
+
+    let initial = (c.f_neg_inf, c.f_zero, track_argmax.then_some(c.zero));
+    b.terminate(KirTerminator::Branch(KirEdge::with(tile_head, with_state(vec![c.zero], initial))));
+
+    b.set_block(tile_head);
+    let finished = cmp(b, tile, c.vocab, CmpOp::Ge);
+    b.terminate(KirTerminator::CondBranch(finished, KirEdge::to(tiles_done), KirEdge::to(tile_body)));
+
+    // Tail-tile guard: lanes past vocab keep -inf.
+    b.set_block(tile_body);
+    let tok = op2(b, U32, KirOp::Add, tile, c.tid);
+    let past = cmp(b, tok, c.vocab, CmpOp::Ge);
+    let dot_start = b.new_block();
+    b.terminate(KirTerminator::CondBranch(
+        past,
+        KirEdge::with(scored, vec![c.f_neg_inf]),
+        KirEdge::to(dot_start),
+    ));
+    b.set_block(dot_start);
+    let dot = build_row_dot(b, c, tok);
+    b.terminate(KirTerminator::Branch(KirEdge::with(scored, vec![dot])));
+
+    b.set_block(scored);
+    let mine = at(b, F32, Shared, c.scores, c.tid);
+    b.emit(KirOp::Store(mine, s_scored, Shared));
+    b.emit(KirOp::Barrier);
+    let not_zero = cmp(b, c.tid, c.zero, CmpOp::Ne);
+    b.terminate(KirTerminator::CondBranch(
+        not_zero,
+        KirEdge::with(merged, with_state(vec![], tile_state)),
+        KirEdge::to(merge_start),
+    ));
+
+    // Thread 0: online flash-softmax merge of the tile's cnt scores.
+    b.set_block(merge_start);
+    let remaining = op2(b, U32, KirOp::Sub, c.vocab, tile);
+    let cnt = op2(b, U32, KirOp::Min, remaining, c.tile_width);
+    b.terminate(KirTerminator::Branch(KirEdge::with(merge_head, with_state(vec![c.zero], tile_state))));
+
+    b.set_block(merge_head);
+    let merge_done = cmp(b, i, cnt, CmpOp::Ge);
+    b.terminate(KirTerminator::CondBranch(
+        merge_done,
+        KirEdge::with(merged, with_state(vec![], merge_state)),
+        KirEdge::to(merge_body),
+    ));
+
+    b.set_block(merge_body);
+    let s_addr = at(b, F32, Shared, c.scores, i);
+    let s = load(b, F32, s_addr, Shared);
+    let (m, sum, sel) = merge_state;
+    let above = cmp(b, s, m, CmpOp::Gt);
+    b.terminate(KirTerminator::CondBranch(
+        above,
+        KirEdge::to(new_max),
+        KirEdge::with(accumulate, with_state(vec![], merge_state)),
+    ));
+
+    // New running max: rescale the online sum[, adopt the argmax].
+    b.set_block(new_max);
+    let gap = op2(b, F32, KirOp::Sub, m, s);
+    let factor = b.new_typed_var(F32);
+    b.emit(KirOp::Exp(factor, gap));
+    let rescaled = op2(b, F32, KirOp::Mul, sum, factor);
+    let adopted = sel.map(|_| op2(b, U32, KirOp::Add, tile, i));
+    b.terminate(KirTerminator::Branch(KirEdge::with(accumulate, with_state(vec![], (s, rescaled, adopted)))));
+
+    // exp(0) == 1.0 exactly on the max path.
+    b.set_block(accumulate);
+    let (am, asum, asel) = acc_state;
+    let delta = op2(b, F32, KirOp::Sub, s, am);
+    let term = b.new_typed_var(F32);
+    b.emit(KirOp::Exp(term, delta));
+    let sum_next = op2(b, F32, KirOp::Add, asum, term);
+    let i_next = op2(b, U32, KirOp::Add, i, c.one);
+    b.terminate(KirTerminator::Branch(KirEdge::with(
+        merge_head,
+        with_state(vec![i_next], (am, sum_next, asel)),
+    )));
+
+    // The scores region is rewritten next tile; sync before looping back.
+    b.set_block(merged);
+    b.emit(KirOp::Barrier);
+    let tile_next = op2(b, U32, KirOp::Add, tile, c.tile_width);
+    b.terminate(KirTerminator::Branch(KirEdge::with(tile_head, with_state(vec![tile_next], merged_state))));
+
+    b.set_block(tiles_done);
+    let (max, sum, argmax) = tile_state;
+    PassResult { max, sum, argmax }
+}
+
+/// The builder, the params both kernels share (hidden, norm_w, lm_head)
+/// already added in FFI order, and the entry block started.
+fn begin(name: &str, cfg: &SpecSamplerConfig, verify: bool) -> (KirBuilder, VarId, VarId, VarId) {
+    use AddressSpace::Global;
+    use KirType::{F16, F32};
+
+    let mut b = KirBuilder::new(name);
+    let hidden = b.add_param("hidden_ptr", ptr(F32, Global), Global);
+    let norm_w = b.add_param("norm_w_ptr", ptr(F32, Global), Global);
+    let lm_head = b.add_param("lm_head_ptr", ptr(F16, Global), Global);
+    b.set_smem_layout(smem_layout(cfg.d_model, verify));
+    b.set_workgroup_size([BLOCK_DIM, 1, 1]);
+    (b, hidden, norm_w, lm_head)
+}
+
+/// The entry block's shared values. Call with the builder in the entry
+/// block, after every param is added.
+fn common(b: &mut KirBuilder, cfg: &SpecSamplerConfig, hidden: VarId, norm_w: VarId, lm_head: VarId) -> Common {
+    let tid = b.new_typed_var(KirType::U32);
+    b.emit(KirOp::ThreadId(tid, 0));
+    Common {
+        tid,
+        hidden,
+        norm_w,
+        lm_head,
+        hidden_smem: shared_region(b, R_HIDDEN),
+        scores: shared_region(b, R_SCORES),
+        rstd_smem: shared_region(b, R_RSTD),
+        zero: konst(b, ConstValue::U32(0)),
+        one: konst(b, ConstValue::U32(1)),
+        tile_width: konst(b, ConstValue::U32(TILE)),
+        d_model: konst(b, ConstValue::U32(cfg.d_model)),
+        d_model_value: cfg.d_model,
+        d_model_wide: konst(b, ConstValue::U64(cfg.d_model as u64)),
+        vocab: konst(b, ConstValue::U32(cfg.vocab_size)),
+        f_zero: konst(b, ConstValue::F32(0.0)),
+        f_neg_inf: konst(b, ConstValue::F32(f32::NEG_INFINITY)),
     }
-    writeln!(w, "    mov.u32 %r_tile, 0;").unwrap();
-    writeln!(w, "{}_TILE:", prefix).unwrap();
-    writeln!(w, "    setp.ge.u32 %p_a, %r_tile, {};", vocab).unwrap();
-    writeln!(w, "    @%p_a bra {}_TILES_DONE;", prefix).unwrap();
-    writeln!(w, "    add.u32 %r_tok, %r_tile, %r_tid;").unwrap();
-    writeln!(w, "    mov.f32 %f_s, {};", neg_inf).unwrap();
-    writeln!(w, "    // tail-tile guard: lanes past vocab keep -inf").unwrap();
-    writeln!(w, "    setp.ge.u32 %p_b, %r_tok, {};", vocab).unwrap();
-    writeln!(w, "    @%p_b bra {}_SSTORE;", prefix).unwrap();
-    emit_row_dot(w, prefix, dm, w_row_bytes);
-    writeln!(w, "    mov.f32 %f_s, %f_dot;").unwrap();
-    writeln!(w, "{}_SSTORE:", prefix).unwrap();
-    writeln!(w, "    mul.lo.u32 %r_t0, %r_tid, 4;").unwrap();
-    writeln!(w, "    add.u32 %r_t0, %r_t0, %r_sbase;").unwrap();
-    writeln!(w, "    st.shared.f32 [%r_t0+{}], %f_s;", scores_off).unwrap();
-    writeln!(w, "    bar.sync 0;").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    // thread 0: online flash-softmax merge of the tile's cnt scores").unwrap();
-    writeln!(w, "    setp.ne.u32 %p_t0, %r_tid, 0;").unwrap();
-    writeln!(w, "    @%p_t0 bra {}_MERGED;", prefix).unwrap();
-    writeln!(w, "    sub.u32 %r_cnt, {}, %r_tile;", vocab).unwrap();
-    writeln!(w, "    min.u32 %r_cnt, %r_cnt, {};", TILE).unwrap();
-    writeln!(w, "    mov.u32 %r_i, 0;").unwrap();
-    writeln!(w, "{}_MERGE:", prefix).unwrap();
-    writeln!(w, "    setp.ge.u32 %p_a, %r_i, %r_cnt;").unwrap();
-    writeln!(w, "    @%p_a bra {}_MERGED;", prefix).unwrap();
-    writeln!(w, "    mul.lo.u32 %r_t0, %r_i, 4;").unwrap();
-    writeln!(w, "    add.u32 %r_t0, %r_t0, %r_sbase;").unwrap();
-    writeln!(w, "    ld.shared.f32 %f_s, [%r_t0+{}];", scores_off).unwrap();
-    writeln!(w, "    setp.gt.f32 %p_b, %f_s, %f_m;").unwrap();
-    writeln!(w, "    @!%p_b bra {}_ACC;", prefix).unwrap();
-    if track_argmax {
-        writeln!(w, "    // new running max: rescale the online sum, adopt the argmax").unwrap();
-    } else {
-        writeln!(w, "    // new running max: rescale the online sum").unwrap();
-    }
-    writeln!(w, "    sub.f32 %f_t0, %f_m, %f_s;").unwrap();
-    writeln!(w, "    mul.f32 %f_t0, %f_t0, {};", log2e).unwrap();
-    writeln!(w, "    ex2.approx.f32 %f_t0, %f_t0;").unwrap();
-    writeln!(w, "    mul.f32 %f_sum, %f_sum, %f_t0;").unwrap();
-    writeln!(w, "    mov.f32 %f_m, %f_s;").unwrap();
-    if track_argmax {
-        writeln!(w, "    add.u32 %r_sel, %r_tile, %r_i;").unwrap();
-    }
-    writeln!(w, "{}_ACC:", prefix).unwrap();
-    writeln!(w, "    // ex2(0) == 1.0 exactly on the max path (PTX ISA)").unwrap();
-    writeln!(w, "    sub.f32 %f_t0, %f_s, %f_m;").unwrap();
-    writeln!(w, "    mul.f32 %f_t0, %f_t0, {};", log2e).unwrap();
-    writeln!(w, "    ex2.approx.f32 %f_t0, %f_t0;").unwrap();
-    writeln!(w, "    add.f32 %f_sum, %f_sum, %f_t0;").unwrap();
-    writeln!(w, "    add.u32 %r_i, %r_i, 1;").unwrap();
-    writeln!(w, "    bra {}_MERGE;", prefix).unwrap();
-    writeln!(w, "{}_MERGED:", prefix).unwrap();
-    writeln!(w, "    // scores SMEM rewritten next tile; sync before loop back").unwrap();
-    writeln!(w, "    bar.sync 0;").unwrap();
-    writeln!(w, "    add.u32 %r_tile, %r_tile, {};", TILE).unwrap();
-    writeln!(w, "    bra {}_TILE;", prefix).unwrap();
-    writeln!(w, "{}_TILES_DONE:", prefix).unwrap();
 }
 
 // ---------------------------------------------------------------------------
 // Kind 7: nsl_cfie_draft_sample
 // ---------------------------------------------------------------------------
 
-/// Emit the draft greedy sampler kernel for `cfg`.
-pub fn emit_draft_sample(cfg: &SpecSamplerConfig) -> (String, SpecSamplerMeta) {
+/// The draft greedy sampler for `cfg`, as KIR.
+pub fn build_draft_sample(cfg: &SpecSamplerConfig) -> KernelIR {
+    use AddressSpace::Global;
+    use KirType::{F32, U32, U64};
+
     validate_config(cfg);
-    let dm = cfg.d_model;
-    let vocab = cfg.vocab_size;
-    let w_row_bytes = dm as u64 * 2;
+    let (mut b, hidden, norm_w, lm_head) = begin(DRAFT_SAMPLE_KERNEL_NAME, cfg, false);
+    let out_token = b.add_param("out_token_ptr", ptr(U32, Global), Global);
+    let out_prob = b.add_param("out_prob_ptr", ptr(F32, Global), Global);
+    // ACCEPTED for ABI symmetry with the fused sampler; UNUSED - v1
+    // drafting is greedy.
+    b.add_param("rng_seed", U64, Global);
 
-    // SMEM layout (f32): [hidden: d_model][scores: TILE][rstd: 1].
-    let scores_off = dm * 4;
-    let rms_off = scores_off + TILE * 4;
-    let smem_bytes = rms_off + 4;
+    let entry = b.new_block();
+    b.set_block(entry);
+    let c = common(&mut b, cfg, hidden, norm_w, lm_head);
 
-    let one = f32_imm(1.0);
+    hidden_load_and_rmsnorm(&mut b, &c);
+    let pass = streaming_pass(&mut b, &c, true);
+
+    // Thread 0 publishes; the kernel's only global stores.
+    let publish = b.new_block();
+    let exit = b.new_block();
+    let not_zero = cmp(&mut b, c.tid, c.zero, CmpOp::Ne);
+    b.terminate(KirTerminator::CondBranch(not_zero, KirEdge::to(exit), KirEdge::to(publish)));
+
+    // p(argmax) = 1 / sum_final (exp(x_argmax - max) == 1).
+    b.set_block(publish);
+    let f_one = konst(&mut b, ConstValue::F32(1.0));
+    let p = op2(&mut b, F32, KirOp::Div, f_one, pass.sum);
+    let argmax = pass.argmax.expect("the draft pass tracks the argmax");
+    b.emit(KirOp::Store(out_token, argmax, Global));
+    b.emit(KirOp::Store(out_prob, p, Global));
+    b.terminate(KirTerminator::Branch(KirEdge::to(exit)));
+
+    b.set_block(exit);
+    b.terminate(KirTerminator::Return);
+    b.finalize()
+}
+
+// ---------------------------------------------------------------------------
+// Kind 8: nsl_cfie_verify_probs
+// ---------------------------------------------------------------------------
+
+/// The target prob-row writer for `cfg`, as KIR.
+pub fn build_verify_probs(cfg: &SpecSamplerConfig) -> KernelIR {
+    use AddressSpace::{Global, Shared};
+    use KirType::{F32, U32};
+
+    validate_config(cfg);
+    let (mut b, hidden, norm_w, lm_head) = begin(VERIFY_PROBS_KERNEL_NAME, cfg, true);
+    let out = b.add_param("out_probs_ptr", ptr(F32, Global), Global);
+
+    let entry = b.new_block();
+    b.set_block(entry);
+    let c = common(&mut b, cfg, hidden, norm_w, lm_head);
+    let max_smem = shared_region(&mut b, R_MAX);
+    let sum_smem = shared_region(&mut b, R_SUM);
+
+    hidden_load_and_rmsnorm(&mut b, &c);
+    // Pass 1: identical merge order to nsl_cfie_draft_sample — the
+    // self-speculation anchor relies on bit-identical (max, sum).
+    let pass = streaming_pass(&mut b, &c, false);
+
+    // Thread 0 publishes (max, sum); every thread reloads them.
+    let publish = b.new_block();
+    let published = b.new_block();
+    let is_zero = cmp(&mut b, c.tid, c.zero, CmpOp::Eq);
+    b.terminate(KirTerminator::CondBranch(is_zero, KirEdge::to(publish), KirEdge::to(published)));
+
+    b.set_block(publish);
+    b.emit(KirOp::Store(max_smem, pass.max, Shared));
+    b.emit(KirOp::Store(sum_smem, pass.sum, Shared));
+    b.terminate(KirTerminator::Branch(KirEdge::to(published)));
+
+    b.set_block(published);
+    b.emit(KirOp::Barrier);
+    let m = load(&mut b, F32, max_smem, Shared);
+    let sum = load(&mut b, F32, sum_smem, Shared);
+
+    // Pass 2: recompute the matvec per tile and store the row. No SMEM
+    // writes, so no barriers inside the loop.
+    let tile_head = b.new_block();
+    let tile_body = b.new_block();
+    let dot_start = b.new_block();
+    let next = b.new_block();
+    let exit = b.new_block();
+    let tile = b.add_block_param(tile_head, U32);
+    b.terminate(KirTerminator::Branch(KirEdge::with(tile_head, vec![c.zero])));
+
+    b.set_block(tile_head);
+    let finished = cmp(&mut b, tile, c.vocab, CmpOp::Ge);
+    b.terminate(KirTerminator::CondBranch(finished, KirEdge::to(exit), KirEdge::to(tile_body)));
+
+    // Tail-tile guard: lanes past vocab store nothing.
+    b.set_block(tile_body);
+    let tok = op2(&mut b, U32, KirOp::Add, tile, c.tid);
+    let past = cmp(&mut b, tok, c.vocab, CmpOp::Ge);
+    b.terminate(KirTerminator::CondBranch(past, KirEdge::to(next), KirEdge::to(dot_start)));
+
+    // p = exp(x - max) / sum; div.rn matches the CPU '/'.
+    b.set_block(dot_start);
+    let dot = build_row_dot(&mut b, &c, tok);
+    let shifted = op2(&mut b, F32, KirOp::Sub, dot, m);
+    let e = b.new_typed_var(F32);
+    b.emit(KirOp::Exp(e, shifted));
+    let p = op2(&mut b, F32, KirOp::Div, e, sum);
+    let dst = at(&mut b, F32, Global, out, tok);
+    b.emit(KirOp::Store(dst, p, Global));
+    b.terminate(KirTerminator::Branch(KirEdge::to(next)));
+
+    b.set_block(next);
+    let tile_next = op2(&mut b, U32, KirOp::Add, tile, c.tile_width);
+    b.terminate(KirTerminator::Branch(KirEdge::with(tile_head, vec![tile_next])));
+
+    b.set_block(exit);
+    b.terminate(KirTerminator::Return);
+    b.finalize()
+}
+
+// ---------------------------------------------------------------------------
+// Emission
+// ---------------------------------------------------------------------------
+
+/// The `//` header the hand kernels carried, line for line.
+fn header_comment(cfg: &SpecSamplerConfig, verify: bool) -> String {
     let eps = f32_imm(RMS_EPS);
-
-    let mut p = String::new();
-    let w = &mut p;
-
+    let mut w = String::new();
     writeln!(w, "//").unwrap();
-    writeln!(w, "// {} - CFIE draft-model greedy sampler (Cycle 13, G15).", DRAFT_SAMPLE_KERNEL_NAME).unwrap();
-    writeln!(w, "// One CTA, {} threads; ONE streaming pass over the vocab tiles keeps", BLOCK_DIM).unwrap();
-    writeln!(w, "// a running max + argmax + online sum of exp(x - max) with rescale").unwrap();
-    writeln!(w, "// (flash softmax).  p(argmax) = 1/sum_final because").unwrap();
-    writeln!(w, "// exp(x_argmax - max) == 1 when the argmax attains the max.").unwrap();
-    writeln!(w, "// Outputs: token id (u32) + p(argmax) (f32) - 8 bytes to HBM.").unwrap();
-    writeln!(w, "// LM-head layout: f16 [vocab, d_model], ROW-major per vocab row.").unwrap();
-    writeln!(w, "// rng_seed is ACCEPTED for ABI symmetry with the fused sampler but").unwrap();
-    writeln!(w, "// UNUSED: v1 drafting is greedy (the paper's temperature 0.0).").unwrap();
+    if verify {
+        writeln!(w, "// {} - CFIE target prob-row writer (Cycle 13, G15).", VERIFY_PROBS_KERNEL_NAME).unwrap();
+        writeln!(w, "// One CTA, {} threads; TWO passes over the vocab tiles:", BLOCK_DIM).unwrap();
+        writeln!(w, "//   pass 1: online max + exp-sum (recomputing the matvec per tile),").unwrap();
+        writeln!(w, "//   pass 2: recompute the matvec, store p_i = exp(x_i - max)/sum.").unwrap();
+        writeln!(w, "// This kernel EXISTS to materialize softmaxed f32 rows for the").unwrap();
+        writeln!(w, "// rejection kernel (nsl_cfie_spec_reject) - the fused sampler never").unwrap();
+        writeln!(w, "// writes probs by design.  The 2x matvec is the price and is").unwrap();
+        writeln!(w, "// bounded by K <= 32 verify positions per round.").unwrap();
+        writeln!(w, "// LM-head layout: f16 [vocab, d_model], ROW-major per vocab row.").unwrap();
+    } else {
+        writeln!(w, "// {} - CFIE draft-model greedy sampler (Cycle 13, G15).", DRAFT_SAMPLE_KERNEL_NAME).unwrap();
+        writeln!(w, "// One CTA, {} threads; ONE streaming pass over the vocab tiles keeps", BLOCK_DIM).unwrap();
+        writeln!(w, "// a running max + argmax + online sum of exp(x - max) with rescale").unwrap();
+        writeln!(w, "// (flash softmax).  p(argmax) = 1/sum_final because").unwrap();
+        writeln!(w, "// exp(x_argmax - max) == 1 when the argmax attains the max.").unwrap();
+        writeln!(w, "// Outputs: token id (u32) + p(argmax) (f32) - 8 bytes to HBM.").unwrap();
+        writeln!(w, "// LM-head layout: f16 [vocab, d_model], ROW-major per vocab row.").unwrap();
+        writeln!(w, "// rng_seed is ACCEPTED for ABI symmetry with the fused sampler but").unwrap();
+        writeln!(w, "// UNUSED: v1 drafting is greedy (the paper's temperature 0.0).").unwrap();
+    }
     writeln!(w, "// Baked constants:").unwrap();
-    writeln!(w, "//   d_model    = {}", dm).unwrap();
-    writeln!(w, "//   vocab_size = {}", vocab).unwrap();
+    writeln!(w, "//   d_model    = {}", cfg.d_model).unwrap();
+    writeln!(w, "//   vocab_size = {}", cfg.vocab_size).unwrap();
     writeln!(w, "//   vocab_tile = {}", TILE).unwrap();
     writeln!(w, "//   rms_eps    = {} ({})", RMS_EPS, eps).unwrap();
     writeln!(w, "//").unwrap();
-    writeln!(w, ".version {}", crate::gpu_specs::ptx_isa_for_sm(cfg.sm_version)).unwrap();
-    writeln!(w, ".target sm_{}", cfg.sm_version).unwrap();
-    writeln!(w, ".address_size 64").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, ".shared .align 4 .b8 cfie_draft_sample_smem[{}];", smem_bytes).unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, ".visible .entry {}(", DRAFT_SAMPLE_KERNEL_NAME).unwrap();
-    writeln!(w, "    .param .u64 hidden_ptr,").unwrap();
-    writeln!(w, "    .param .u64 norm_w_ptr,").unwrap();
-    writeln!(w, "    .param .u64 lm_head_ptr,").unwrap();
-    writeln!(w, "    .param .u64 out_token_ptr,").unwrap();
-    writeln!(w, "    .param .u64 out_prob_ptr,").unwrap();
-    writeln!(w, "    .param .u64 rng_seed").unwrap();
-    writeln!(w, ")").unwrap();
-    writeln!(w, "{{").unwrap();
-    writeln!(w, "    .reg .pred %p_a, %p_b, %p_t0;").unwrap();
-    writeln!(w, "    .reg .b16 %h_w;").unwrap();
-    writeln!(
-        w,
-        "    .reg .f32 %f_h, %f_w, %f_dot, %f_s, %f_ss, %f_g, %f_rstd, %f_m, %f_sum, %f_p, %f_t0, %f_t1;"
-    )
-    .unwrap();
-    writeln!(
-        w,
-        "    .reg .u32 %r_tid, %r_sbase, %r_i, %r_d, %r_tile, %r_tok, %r_cnt, %r_sel, %r_t0, %r_t1;"
-    )
-    .unwrap();
-    writeln!(
-        w,
-        "    .reg .u64 %rd_hidden, %rd_norm, %rd_w, %rd_outtok, %rd_outprob, %rd_seed, %rd_a, %rd_t0;"
-    )
-    .unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    ld.param.u64 %rd_hidden, [hidden_ptr];").unwrap();
-    writeln!(w, "    ld.param.u64 %rd_norm, [norm_w_ptr];").unwrap();
-    writeln!(w, "    ld.param.u64 %rd_w, [lm_head_ptr];").unwrap();
-    writeln!(w, "    ld.param.u64 %rd_outtok, [out_token_ptr];").unwrap();
-    writeln!(w, "    ld.param.u64 %rd_outprob, [out_prob_ptr];").unwrap();
-    writeln!(w, "    // ACCEPTED for ABI symmetry; UNUSED - v1 draft is greedy").unwrap();
-    writeln!(w, "    ld.param.u64 %rd_seed, [rng_seed];").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    mov.u32 %r_tid, %tid.x;").unwrap();
-    writeln!(w, "    mov.u32 %r_sbase, cfie_draft_sample_smem;").unwrap();
-    writeln!(w).unwrap();
+    w
+}
 
-    emit_hidden_load_and_rmsnorm(w, dm, scores_off, rms_off);
+/// Verify, lower and prefix the header. The returned text carries no NUL:
+/// the serve path appends the one the driver wants when it embeds the
+/// module.
+fn emit(ir: &KernelIR, cfg: &SpecSamplerConfig, verify: bool) -> (String, SpecSamplerMeta) {
+    if let Err(errors) = crate::kir_verify::verify(ir) {
+        panic!("{} failed KIR verification: {errors:?}", ir.name);
+    }
+    let smem_bytes = ir.smem_layout.total_bytes().expect("a verified layout has a size");
+    let module = lower_kir_to_ptx(ir);
+    let module = module.strip_suffix(&[0]).unwrap_or(&module);
+    let module = std::str::from_utf8(module).expect("the KIR printer emits ASCII");
 
-    writeln!(w, "    // 3. streaming flash-softmax argmax pass over the vocab tiles").unwrap();
-    emit_streaming_pass(w, "DS", dm, vocab, w_row_bytes, scores_off, true);
-    writeln!(w).unwrap();
-    writeln!(w, "    // 4. thread 0 publishes; the kernel's only global stores").unwrap();
-    writeln!(w, "    setp.ne.u32 %p_t0, %r_tid, 0;").unwrap();
-    writeln!(w, "    @%p_t0 bra EXIT;").unwrap();
-    writeln!(w, "    // p(argmax) = 1 / sum_final (exp(x_argmax - max) == 1)").unwrap();
-    writeln!(w, "    mov.f32 %f_t0, {};", one).unwrap();
-    writeln!(w, "    div.rn.f32 %f_p, %f_t0, %f_sum;").unwrap();
-    writeln!(w, "    st.global.u32 [%rd_outtok], %r_sel;").unwrap();
-    writeln!(w, "    st.global.f32 [%rd_outprob], %f_p;").unwrap();
-    writeln!(w, "EXIT:").unwrap();
-    writeln!(w, "    ret;").unwrap();
-    writeln!(w, "}}").unwrap();
-
-    let meta = SpecSamplerMeta {
-        kernel_name: DRAFT_SAMPLE_KERNEL_NAME.to_string(),
-        smem_bytes,
-        block_dim: BLOCK_DIM,
-    };
+    let mut p = header_comment(cfg, verify);
+    p.push_str(module);
+    let meta = SpecSamplerMeta { kernel_name: ir.name.clone(), smem_bytes, block_dim: BLOCK_DIM };
     (p, meta)
+}
+
+/// Emit the draft greedy sampler kernel for `cfg`.
+pub fn emit_draft_sample(cfg: &SpecSamplerConfig) -> (String, SpecSamplerMeta) {
+    emit(&build_draft_sample(cfg), cfg, false)
 }
 
 /// PTX-only convenience wrapper around [`emit_draft_sample`].
@@ -424,138 +732,16 @@ pub fn emit_draft_sample_ptx(cfg: &SpecSamplerConfig) -> String {
     emit_draft_sample(cfg).0
 }
 
-// ---------------------------------------------------------------------------
-// Kind 8: nsl_cfie_verify_probs
-// ---------------------------------------------------------------------------
-
 /// Emit the target prob-row writer kernel for `cfg`.
 pub fn emit_verify_probs(cfg: &SpecSamplerConfig) -> (String, SpecSamplerMeta) {
-    validate_config(cfg);
-    let dm = cfg.d_model;
-    let vocab = cfg.vocab_size;
-    let w_row_bytes = dm as u64 * 2;
-
-    // SMEM layout (f32): [hidden: d_model][scores: TILE][rstd: 1]
-    //                    [max: 1][sum: 1].
-    let scores_off = dm * 4;
-    let rms_off = scores_off + TILE * 4;
-    let max_off = rms_off + 4;
-    let sum_off = max_off + 4;
-    let smem_bytes = sum_off + 4;
-
-    let log2e = f32_imm(std::f32::consts::LOG2_E);
-    let eps = f32_imm(RMS_EPS);
-
-    let mut p = String::new();
-    let w = &mut p;
-
-    writeln!(w, "//").unwrap();
-    writeln!(w, "// {} - CFIE target prob-row writer (Cycle 13, G15).", VERIFY_PROBS_KERNEL_NAME).unwrap();
-    writeln!(w, "// One CTA, {} threads; TWO passes over the vocab tiles:", BLOCK_DIM).unwrap();
-    writeln!(w, "//   pass 1: online max + exp-sum (recomputing the matvec per tile),").unwrap();
-    writeln!(w, "//   pass 2: recompute the matvec, store p_i = exp(x_i - max)/sum.").unwrap();
-    writeln!(w, "// This kernel EXISTS to materialize softmaxed f32 rows for the").unwrap();
-    writeln!(w, "// rejection kernel (nsl_cfie_spec_reject) - the fused sampler never").unwrap();
-    writeln!(w, "// writes probs by design.  The 2x matvec is the price and is").unwrap();
-    writeln!(w, "// bounded by K <= 32 verify positions per round.").unwrap();
-    writeln!(w, "// LM-head layout: f16 [vocab, d_model], ROW-major per vocab row.").unwrap();
-    writeln!(w, "// Baked constants:").unwrap();
-    writeln!(w, "//   d_model    = {}", dm).unwrap();
-    writeln!(w, "//   vocab_size = {}", vocab).unwrap();
-    writeln!(w, "//   vocab_tile = {}", TILE).unwrap();
-    writeln!(w, "//   rms_eps    = {} ({})", RMS_EPS, eps).unwrap();
-    writeln!(w, "//").unwrap();
-    writeln!(w, ".version {}", crate::gpu_specs::ptx_isa_for_sm(cfg.sm_version)).unwrap();
-    writeln!(w, ".target sm_{}", cfg.sm_version).unwrap();
-    writeln!(w, ".address_size 64").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, ".shared .align 4 .b8 cfie_verify_probs_smem[{}];", smem_bytes).unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, ".visible .entry {}(", VERIFY_PROBS_KERNEL_NAME).unwrap();
-    writeln!(w, "    .param .u64 hidden_ptr,").unwrap();
-    writeln!(w, "    .param .u64 norm_w_ptr,").unwrap();
-    writeln!(w, "    .param .u64 lm_head_ptr,").unwrap();
-    writeln!(w, "    .param .u64 out_probs_ptr").unwrap();
-    writeln!(w, ")").unwrap();
-    writeln!(w, "{{").unwrap();
-    writeln!(w, "    .reg .pred %p_a, %p_b, %p_t0;").unwrap();
-    writeln!(w, "    .reg .b16 %h_w;").unwrap();
-    writeln!(
-        w,
-        "    .reg .f32 %f_h, %f_w, %f_dot, %f_s, %f_ss, %f_g, %f_rstd, %f_m, %f_sum, %f_t0, %f_t1;"
-    )
-    .unwrap();
-    writeln!(
-        w,
-        "    .reg .u32 %r_tid, %r_sbase, %r_i, %r_d, %r_tile, %r_tok, %r_cnt, %r_t0, %r_t1;"
-    )
-    .unwrap();
-    writeln!(w, "    .reg .u64 %rd_hidden, %rd_norm, %rd_w, %rd_out, %rd_a, %rd_t0;").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    ld.param.u64 %rd_hidden, [hidden_ptr];").unwrap();
-    writeln!(w, "    ld.param.u64 %rd_norm, [norm_w_ptr];").unwrap();
-    writeln!(w, "    ld.param.u64 %rd_w, [lm_head_ptr];").unwrap();
-    writeln!(w, "    ld.param.u64 %rd_out, [out_probs_ptr];").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    mov.u32 %r_tid, %tid.x;").unwrap();
-    writeln!(w, "    mov.u32 %r_sbase, cfie_verify_probs_smem;").unwrap();
-    writeln!(w).unwrap();
-
-    emit_hidden_load_and_rmsnorm(w, dm, scores_off, rms_off);
-
-    writeln!(w, "    // 3. pass 1: online max + exp-sum over the vocab tiles").unwrap();
-    writeln!(w, "    //    (identical merge order to nsl_cfie_draft_sample - the").unwrap();
-    writeln!(w, "    //    self-speculation anchor relies on bit-identical (max, sum))").unwrap();
-    emit_streaming_pass(w, "P1", dm, vocab, w_row_bytes, scores_off, false);
-    writeln!(w).unwrap();
-    writeln!(w, "    // 4. thread 0 publishes (max, sum); all threads reload them").unwrap();
-    writeln!(w, "    setp.ne.u32 %p_t0, %r_tid, 0;").unwrap();
-    writeln!(w, "    @%p_t0 bra PUB_DONE;").unwrap();
-    writeln!(w, "    st.shared.f32 [%r_sbase+{}], %f_m;", max_off).unwrap();
-    writeln!(w, "    st.shared.f32 [%r_sbase+{}], %f_sum;", sum_off).unwrap();
-    writeln!(w, "PUB_DONE:").unwrap();
-    writeln!(w, "    bar.sync 0;").unwrap();
-    writeln!(w, "    ld.shared.f32 %f_m, [%r_sbase+{}];", max_off).unwrap();
-    writeln!(w, "    ld.shared.f32 %f_sum, [%r_sbase+{}];", sum_off).unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    // 5. pass 2: recompute the matvec per tile, store the row;").unwrap();
-    writeln!(w, "    //    no SMEM writes -> no barriers needed inside the loop").unwrap();
-    writeln!(w, "    mov.u32 %r_tile, 0;").unwrap();
-    writeln!(w, "P2_TILE:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p_a, %r_tile, {};", vocab).unwrap();
-    writeln!(w, "    @%p_a bra P2_DONE;").unwrap();
-    writeln!(w, "    add.u32 %r_tok, %r_tile, %r_tid;").unwrap();
-    writeln!(w, "    // tail-tile guard: lanes past vocab store nothing").unwrap();
-    writeln!(w, "    setp.ge.u32 %p_b, %r_tok, {};", vocab).unwrap();
-    writeln!(w, "    @%p_b bra P2_NEXT;").unwrap();
-    emit_row_dot(w, "P2", dm, w_row_bytes);
-    writeln!(w, "    // p = ex2((x - max) * log2e) / sum; div.rn matches the CPU '/'").unwrap();
-    writeln!(w, "    sub.f32 %f_t0, %f_dot, %f_m;").unwrap();
-    writeln!(w, "    mul.f32 %f_t0, %f_t0, {};", log2e).unwrap();
-    writeln!(w, "    ex2.approx.f32 %f_t0, %f_t0;").unwrap();
-    writeln!(w, "    div.rn.f32 %f_t0, %f_t0, %f_sum;").unwrap();
-    writeln!(w, "    mul.wide.u32 %rd_t0, %r_tok, 4;").unwrap();
-    writeln!(w, "    add.u64 %rd_a, %rd_out, %rd_t0;").unwrap();
-    writeln!(w, "    st.global.f32 [%rd_a], %f_t0;").unwrap();
-    writeln!(w, "P2_NEXT:").unwrap();
-    writeln!(w, "    add.u32 %r_tile, %r_tile, {};", TILE).unwrap();
-    writeln!(w, "    bra P2_TILE;").unwrap();
-    writeln!(w, "P2_DONE:").unwrap();
-    writeln!(w, "    ret;").unwrap();
-    writeln!(w, "}}").unwrap();
-
-    let meta = SpecSamplerMeta {
-        kernel_name: VERIFY_PROBS_KERNEL_NAME.to_string(),
-        smem_bytes,
-        block_dim: BLOCK_DIM,
-    };
-    (p, meta)
+    emit(&build_verify_probs(cfg), cfg, true)
 }
 
 /// PTX-only convenience wrapper around [`emit_verify_probs`].
 pub fn emit_verify_probs_ptx(cfg: &SpecSamplerConfig) -> String {
     emit_verify_probs(cfg).0
 }
+
 
 // ---------------------------------------------------------------------------
 // CPU references
@@ -715,7 +901,6 @@ mod tests {
             d_model,
             vocab_size,
             vocab_tile: 128,
-            sm_version: 80,
         }
     }
 
@@ -745,71 +930,83 @@ mod tests {
         (0..dm).map(|i| 1.0 + i as f32 * 0.01).collect()
     }
 
-    fn param_lines(ptx: &str, entry: &str) -> Vec<String> {
-        let start = ptx.find(entry).unwrap();
-        let end = start + ptx[start..].find(')').unwrap();
-        ptx[start..end]
-            .lines()
-            .filter_map(|l| {
-                let l = l.trim();
-                l.starts_with(".param")
-                    .then(|| l.trim_end_matches(',').to_string())
+    /// Every op of every block, flattened (terminators aside).
+    fn ops(ir: &KernelIR) -> Vec<&KirOp> {
+        ir.blocks.iter().flat_map(|b| b.ops.iter()).collect()
+    }
+
+    fn count(ir: &KernelIR, pred: impl Fn(&KirOp) -> bool) -> usize {
+        ops(ir).into_iter().filter(|op| pred(op)).count()
+    }
+
+    fn global_stores(ir: &KernelIR) -> Vec<(VarId, VarId)> {
+        ops(ir)
+            .into_iter()
+            .filter_map(|op| match op {
+                KirOp::Store(addr, val, AddressSpace::Global) => Some((*addr, *val)),
+                _ => None,
             })
             .collect()
+    }
+
+    fn param_names(ir: &KernelIR) -> Vec<&str> {
+        ir.params.iter().map(|p| p.name.as_str()).collect()
     }
 
     // -- structural ------------------------------------------------------
 
     #[test]
     fn draft_param_list_is_exactly_the_six_params() {
-        let ptx = emit_draft_sample_ptx(&paper_cfg());
+        let ir = build_draft_sample(&paper_cfg());
         assert_eq!(
-            param_lines(&ptx, ".visible .entry nsl_cfie_draft_sample("),
-            vec![
-                ".param .u64 hidden_ptr",
-                ".param .u64 norm_w_ptr",
-                ".param .u64 lm_head_ptr",
-                ".param .u64 out_token_ptr",
-                ".param .u64 out_prob_ptr",
-                ".param .u64 rng_seed",
-            ]
+            param_names(&ir),
+            ["hidden_ptr", "norm_w_ptr", "lm_head_ptr", "out_token_ptr", "out_prob_ptr", "rng_seed"]
         );
-        assert_eq!(ptx.matches("ld.param").count(), 6);
+        // Every param is 8 bytes: five device pointers and the u64 seed.
+        let ptx = emit_draft_sample_ptx(&paper_cfg());
+        for name in param_names(&ir) {
+            assert!(ptx.contains(&format!(".param .u64 param_{name}")), "{name}");
+        }
     }
 
     #[test]
     fn verify_param_list_is_exactly_the_four_params() {
+        let ir = build_verify_probs(&paper_cfg());
+        assert_eq!(param_names(&ir), ["hidden_ptr", "norm_w_ptr", "lm_head_ptr", "out_probs_ptr"]);
         let ptx = emit_verify_probs_ptx(&paper_cfg());
-        assert_eq!(
-            param_lines(&ptx, ".visible .entry nsl_cfie_verify_probs("),
-            vec![
-                ".param .u64 hidden_ptr",
-                ".param .u64 norm_w_ptr",
-                ".param .u64 lm_head_ptr",
-                ".param .u64 out_probs_ptr",
-            ]
-        );
-        assert_eq!(ptx.matches("ld.param").count(), 4);
+        for name in param_names(&ir) {
+            assert!(ptx.contains(&format!(".param .u64 param_{name}")), "{name}");
+        }
     }
 
     #[test]
     fn draft_stores_exactly_token_and_prob() {
-        // The draft sampler's whole output is 8 bytes: token + prob.
+        // The draft sampler's whole output is 8 bytes: token + prob,
+        // stored straight through the two output params.
+        let ir = build_draft_sample(&paper_cfg());
+        let out_token = ir.params[3].id;
+        let out_prob = ir.params[4].id;
+        let stores = global_stores(&ir);
+        assert_eq!(stores.iter().map(|(a, _)| *a).collect::<Vec<_>>(), [out_token, out_prob]);
+        assert_eq!(ir.var_types[&stores[0].1], KirType::U32, "the token is a u32");
+        assert_eq!(ir.var_types[&stores[1].1], KirType::F32, "p(argmax) is an f32");
         let ptx = emit_draft_sample_ptx(&paper_cfg());
         assert_eq!(ptx.matches("st.global").count(), 2);
-        assert!(ptx.contains("st.global.u32 [%rd_outtok], %r_sel;"));
-        assert!(ptx.contains("st.global.f32 [%rd_outprob], %f_p;"));
+        assert_eq!(ptx.matches("st.global.u32").count(), 1);
     }
 
     #[test]
     fn verify_single_global_store_is_the_prob_row() {
-        // One st.global.f32 in the pass-2 loop body - executed once
-        // per vocab entry, the row the reject kernel consumes.
-        let ptx = emit_verify_probs_ptx(&paper_cfg());
-        assert_eq!(ptx.matches("st.global").count(), 1);
-        assert!(ptx.contains("st.global.f32 [%rd_a], %f_t0;"));
-        // Normalization is div.rn so the CPU '/' mirrors it exactly.
-        assert!(ptx.contains("div.rn.f32 %f_t0, %f_t0, %f_sum;"));
+        // One global store in the pass-2 loop body - executed once per
+        // vocab entry, the row the reject kernel consumes.
+        let ir = build_verify_probs(&paper_cfg());
+        let stores = global_stores(&ir);
+        assert_eq!(stores.len(), 1);
+        assert_eq!(ir.var_types[&stores[0].1], KirType::F32);
+        // Normalization is an f32 Div (div.rn) so the CPU '/' mirrors it
+        // exactly.
+        assert_eq!(count(&ir, |op| matches!(op, KirOp::Div(..))), 1);
+        assert!(emit_verify_probs_ptx(&paper_cfg()).contains("div.rn.f32"));
     }
 
     #[test]
@@ -824,8 +1021,11 @@ mod tests {
                 "PTX must be ASCII-only (Unicode -> CUDA_ERROR_INVALID_PTX)"
             );
             assert!(!ptx.ends_with('\0'), "String PTX carries no trailing NUL");
+            // The KIR printer writes the entry signature on one line, as
+            // for every KIR kernel; the column limit was the hand
+            // emitter's style for the rest, and still holds there.
             assert!(
-                ptx.lines().all(|l| l.len() <= 132),
+                ptx.lines().filter(|l| !l.starts_with(".visible .entry ")).all(|l| l.len() <= 132),
                 "PTX lines must stay within 132 columns"
             );
         }
@@ -833,18 +1033,37 @@ mod tests {
 
     #[test]
     fn draft_is_greedy_no_prng_no_temperature() {
+        // rng_seed is ABI symmetry only: no op reads it, no xorshift64*
+        // constants, no RNG mixing, no temperature epilogue on the scores.
+        let ir = build_draft_sample(&paper_cfg());
+        let seed = ir.params[5].id;
+        let reads_seed = ir.blocks.iter().any(|b| {
+            b.ops.iter().any(|op| crate::kir_verify::op_uses(op).contains(&seed))
+                || b.terminator.as_ref().is_some_and(|t| crate::kir_verify::terminator_uses(t).contains(&seed))
+        });
+        assert!(!reads_seed, "the seed must not feed any op");
         let ptx = emit_draft_sample_ptx(&paper_cfg());
-        // rng_seed is ABI symmetry only: no xorshift64* constants, no
-        // RNG mixing, no temperature epilogue on the scores.
         assert!(!ptx.contains("0x2545F4914F6CDD1D"));
         assert!(!ptx.contains("0x9E3779B97F4A7C15"));
         assert!(!ptx.contains("RNG"));
-        assert!(ptx.contains("ACCEPTED for ABI symmetry; UNUSED"));
-        assert!(ptx.contains("ld.param.u64 %rd_seed, [rng_seed];"));
+        assert!(ptx.contains("rng_seed is ACCEPTED for ABI symmetry"));
     }
 
     #[test]
     fn rmsnorm_and_flash_softmax_sections_present_in_both() {
+        for (ir, exps) in [
+            // Rescale + accumulate in the merge.
+            (build_draft_sample(&paper_cfg()), 2),
+            // The same two in pass 1, plus pass 2's p = exp(x - max).
+            (build_verify_probs(&paper_cfg()), 3),
+        ] {
+            assert_eq!(count(&ir, |op| matches!(op, KirOp::Rsqrt(..))), 1, "{}", ir.name);
+            assert_eq!(count(&ir, |op| matches!(op, KirOp::Exp(..))), exps, "{}", ir.name);
+            // One cooperative strided load, one norm scale, one score store
+            // per tile; the 7-step tree reduction.
+            let barriers = count(&ir, |op| matches!(op, KirOp::Barrier));
+            assert!(barriers >= 13, "{}: {barriers} barriers", ir.name);
+        }
         for ptx in [
             emit_draft_sample_ptx(&paper_cfg()),
             emit_verify_probs_ptx(&paper_cfg()),
@@ -852,30 +1071,20 @@ mod tests {
             assert!(ptx.contains("rsqrt.approx.f32"));
             assert!(ptx.contains(&f32_imm(RMS_EPS)));
             assert!(ptx.contains("ex2.approx.f32"));
-            // The online-merge rescale multiply (flash softmax).
-            assert!(ptx.contains("mul.f32 %f_sum, %f_sum, %f_t0;"));
         }
     }
 
     #[test]
-    fn header_matches_sm_version_convention() {
-        for emit_ptx in [
-            emit_draft_sample_ptx as fn(&SpecSamplerConfig) -> String,
-            emit_verify_probs_ptx as fn(&SpecSamplerConfig) -> String,
+    fn header_is_the_kir_floor() {
+        // No sm_version: the modules target the KIR floor and the driver
+        // JIT-compiles them forward (tests/cfie_ptx_headers_ptxas.rs
+        // assembles them for every serving architecture).
+        for ptx in [
+            emit_draft_sample_ptx(&paper_cfg()),
+            emit_verify_probs_ptx(&paper_cfg()),
         ] {
-            let ptx80 = emit_ptx(&paper_cfg());
-            assert!(ptx80.starts_with("//"));
-            assert!(ptx80.contains(".version 7.0\n.target sm_80\n.address_size 64"));
-            let mut c = paper_cfg();
-            c.sm_version = 90;
-            assert!(emit_ptx(&c).contains(".version 8.4\n.target sm_90"));
-            c.sm_version = 100;
-            assert!(emit_ptx(&c).contains(".version 8.6\n.target sm_100"));
-            // The parts whose ISA the old table got wrong.
-            c.sm_version = 86;
-            assert!(emit_ptx(&c).contains(".version 7.1\n.target sm_86"));
-            c.sm_version = 120;
-            assert!(emit_ptx(&c).contains(".version 8.7\n.target sm_120"));
+            assert!(ptx.starts_with("//"));
+            assert!(ptx.contains(".version 7.0\n.target sm_70\n.address_size 64"));
         }
     }
 
@@ -886,20 +1095,14 @@ mod tests {
         assert_eq!(meta.block_dim, 128);
         // hidden(512 f32) + scores(128 f32) + rstd.
         assert_eq!(meta.smem_bytes, 512 * 4 + 128 * 4 + 4);
-        assert!(ptx.contains(&format!(
-            ".shared .align 4 .b8 cfie_draft_sample_smem[{}];",
-            meta.smem_bytes
-        )));
+        assert!(ptx.contains(&format!(".shared .align 4 .b8 shared_mem[{}];", meta.smem_bytes)));
 
         let (ptx, meta) = emit_verify_probs(&paper_cfg());
         assert_eq!(meta.kernel_name, VERIFY_PROBS_KERNEL_NAME);
         assert_eq!(meta.block_dim, 128);
         // hidden + scores + rstd + max + sum.
         assert_eq!(meta.smem_bytes, 512 * 4 + 128 * 4 + 12);
-        assert!(ptx.contains(&format!(
-            ".shared .align 4 .b8 cfie_verify_probs_smem[{}];",
-            meta.smem_bytes
-        )));
+        assert!(ptx.contains(&format!(".shared .align 4 .b8 shared_mem[{}];", meta.smem_bytes)));
     }
 
     #[test]

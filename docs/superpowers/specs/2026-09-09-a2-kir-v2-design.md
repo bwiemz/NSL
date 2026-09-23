@@ -438,6 +438,35 @@ frozen throughout, so nothing here blocks a kernel fix.
      `QuantDecodeAttentionConfig` lost its `sm_version` too.
      `tests/cfie_ptx_headers_ptxas.rs` still assembles the modules for every
      architecture in the table.
+
+   **`spec_sampler` done**; the freeze went from 65 members to 64. Two
+   kernels, the draft greedy sampler (kind 7) and the target prob-row
+   writer (kind 8), each one CTA of 128 threads: a cooperative hidden load
+   and RMSNorm with a seven-step shared-memory tree reduction, then a
+   streaming online-softmax pass over 128-row vocab tiles whose merge runs
+   in thread 0 alone, carrying (max, sum, argmax) through the tile loop as
+   block parameters. The two kernels are built from the same builder
+   sections. That matters beyond tidiness: the engine's self-speculation
+   anchor needs the draft's `1 / sum` and the verify row's `ex2(0) / sum`
+   to be the same bits, so the two kernels' shared arithmetic order is now
+   one piece of code, and a test pins the equality on the interpreter.
+   `KirOp::Exp`, `Rsqrt` and an f32 `Div` print exactly the hand kernels'
+   `mul` by log2(e) + `ex2.approx`, `rsqrt.approx.f32` and `div.rn.f32`, so
+   KIR needed nothing new; the interpreter learned `rsqrt.approx.f32` and
+   32-bit integer stores. The KIR kernels match the frozen hand emitter bit
+   for bit over five geometries (a single token and feature, one past a
+   tile, exactly one tile, a d_model past the block, a ragged three-tile
+   vocab) under both schedules, and the gate catches a deleted barrier,
+   nudged vocab / d_model / `1 / d_model` / epsilon immediates, a relaxed
+   first-max-wins comparison (a planted tie decides it) and each forced
+   tail guard. What it does *not* catch is named in the test, with why:
+   the barrier after the hidden load (each thread's sum of squares reads
+   only what that thread stored), the one after the last reduction step
+   (thread 0 alone is active there and reads its own write), and the
+   tail-tile clamp (the guard stores -inf past the vocab, and merging a
+   -inf leaves the state unchanged). Both redundant barriers stay: removing
+   them would change the kernel, which a migration does not.
+   `SpecSamplerConfig` lost its `sm_version`, as the other two did.
 10. **Fused loss heads.** `fused_linear_ce.rs`, then `cpkd_fused_loss.rs`.
     Proof: SASS equivalence (the online-softmax loops reorder under
     scheduling).
