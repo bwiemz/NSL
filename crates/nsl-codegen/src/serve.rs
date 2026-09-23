@@ -990,7 +990,6 @@ impl Compiler<'_> {
                 let reject_cfg = crate::cfie_speculative_ptx::RejectionConfig {
                     k_tokens,
                     vocab_size: s.vocab_size,
-                    sm_version: gpu.sm_version,
                 };
                 let (rptx, rmeta) =
                     crate::cfie_speculative_ptx::emit_rejection_kernel(&reject_cfg);

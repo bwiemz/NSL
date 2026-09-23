@@ -8,6 +8,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- The CFIE speculative rejection-sampling kernel (`nsl_cfie_spec_reject`)
+  is built as KIR (roadmap A2 step 9, fourth slice). It was hand-assembled
+  PTX: a serial walk that accepts or rejects each drafted token and, at
+  the first rejection, samples the correction from the Leviathan residual
+  with an xorshift64* PRNG. `tests/cfie_speculative_kir_equivalence.rs`
+  runs it through the frozen hand emitter and the KIR one on the shared
+  PTX interpreter, requires the same output bits, and requires the CPU
+  reference's answer exactly. Its cases reach every branch of the kernel.
+  `RejectionConfig::sm_version` is gone. The same file's tree-mask verify
+  attention kernel moves in the next slice.
 - The CFIE speculative-decoding sampler kernels are built as KIR (roadmap
   A2 step 9, third slice): the draft greedy sampler
   (`nsl_cfie_draft_sample`) and the target prob-row writer

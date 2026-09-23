@@ -47,8 +47,24 @@
 //!     rows contiguously (advance + device-side copy — the values are
 //!     already in the pool, no recompute).
 //!     No runtime edits here — the decode-loop cycle wires these calls.
+//!
+//! ## KIR (roadmap A2 step 9)
+//!
+//! The rejection kernel is built as [`KernelIR`] ([`build_rejection`]) and
+//! lowered by `nsl_kir`'s printer; `tests/cfie_speculative_kir_equivalence.rs`
+//! runs it against the frozen hand emitter on a PTX interpreter and
+//! requires the same output bits, and the CPU reference's answer exactly.
+//! It targets the KIR floor (`sm_70`), so [`RejectionConfig`] has no
+//! `sm_version`. The verify attention kernel is still hand-assembled; it
+//! moves in the next slice.
 
+use crate::backend_ptx::lower_kir_to_ptx;
+use crate::cfie_decode_attention::{at, cmp, konst, load, op2, ptr};
 use crate::cfie_speculative::TreeMask;
+use crate::kernel_ir::{
+    AddressSpace, BlockId, CmpOp, ConstValue, KernelIR, KirBuilder, KirEdge, KirOp, KirTerminator,
+    KirType, VarId,
+};
 use std::fmt::Write;
 
 /// Threads per CTA and softmax tile width for the verify kernel.
@@ -80,13 +96,14 @@ pub struct VerifyAttentionConfig {
     pub sm_version: u32,
 }
 
-/// Compile-time configuration for the rejection kernel.
+/// Compile-time configuration for the rejection kernel. No
+/// `sm_version`: the kernel is KIR and targets the backend floor
+/// (roadmap A2 step 9).
 #[derive(Debug, Clone)]
 pub struct RejectionConfig {
     /// Draft tokens per speculative step (1..=32).
     pub k_tokens: u32,
     pub vocab_size: u32,
-    pub sm_version: u32,
 }
 
 /// Host-readable launch metadata emitted alongside the PTX.
@@ -590,34 +607,257 @@ fn emit_pv_accumulate(
 // G13: rejection-sampling epilogue
 // ---------------------------------------------------------------------------
 
-/// xorshift64* state advance + [0,1) draw — the PRNG idiom shared with
-/// `cfie_sample_ptx` (state = post-shift value, output = state * M,
-/// r = top 24 bits over 2^24).
-fn emit_prng_draw(w: &mut String, two_neg24: &str) {
-    writeln!(w, "    shr.b64 %rd_t0, %rd_x, 12;").unwrap();
-    writeln!(w, "    xor.b64 %rd_x, %rd_x, %rd_t0;").unwrap();
-    writeln!(w, "    shl.b64 %rd_t0, %rd_x, 25;").unwrap();
-    writeln!(w, "    xor.b64 %rd_x, %rd_x, %rd_t0;").unwrap();
-    writeln!(w, "    shr.b64 %rd_t0, %rd_x, 27;").unwrap();
-    writeln!(w, "    xor.b64 %rd_x, %rd_x, %rd_t0;").unwrap();
-    writeln!(w, "    mov.u64 %rd_t0, 0x2545F4914F6CDD1D;").unwrap();
-    writeln!(w, "    mul.lo.u64 %rd_t1, %rd_x, %rd_t0;").unwrap();
-    writeln!(w, "    shr.b64 %rd_t1, %rd_t1, 40;").unwrap();
-    writeln!(w, "    cvt.u32.u64 %r_t0, %rd_t1;").unwrap();
-    writeln!(w, "    cvt.rn.f32.u32 %f_r, %r_t0;").unwrap();
-    writeln!(w, "    mul.f32 %f_r, %f_r, {};", two_neg24).unwrap();
+/// One xorshift64* step and its [0,1) draw — the PRNG idiom shared with
+/// `cfie_sample_ptx`, in its order: the state advances by three shift-xors
+/// (`x ^= x >> 12; x ^= x << 25; x ^= x >> 27`) and becomes the new state;
+/// the output is `state * M`, and `r` is its top 24 bits over 2^24, exact
+/// in an f32 mantissa. Returns `(state, r)`.
+fn build_prng_draw(b: &mut KirBuilder, x: VarId) -> (VarId, VarId) {
+    use KirType::{F32, U32, U64};
+
+    let mut x = x;
+    for (shift, op) in [
+        (12u32, KirOp::Shr as fn(VarId, VarId, VarId) -> KirOp),
+        (25, KirOp::Shl),
+        (27, KirOp::Shr),
+    ] {
+        let amount = konst(b, ConstValue::U32(shift));
+        let shifted = op2(b, U64, op, x, amount);
+        x = op2(b, U64, KirOp::Xor, x, shifted);
+    }
+    let m = konst(b, ConstValue::U64(0x2545_F491_4F6C_DD1D));
+    let out = op2(b, U64, KirOp::Mul, x, m);
+    let forty = konst(b, ConstValue::U32(40));
+    let top = op2(b, U64, KirOp::Shr, out, forty);
+    let top32 = b.new_typed_var(U32);
+    b.emit(KirOp::Cast(top32, top, U32));
+    let wide = b.new_typed_var(F32);
+    b.emit(KirOp::Cast(wide, top32, F32));
+    let two_neg24 = konst(b, ConstValue::F32(1.0 / 16_777_216.0));
+    let r = op2(b, F32, KirOp::Mul, wide, two_neg24);
+    (x, r)
 }
 
-/// Emit the rejection-sampling kernel (paper step 3).
+/// The rejection-sampling kernel for `cfg`, as KIR (roadmap A2 step 9).
 ///
-/// Launch shape: grid = 1, block = 32; the walk is serial on thread 0
-/// (correctness first), all other threads exit immediately — no SMEM,
-/// so no barriers are required.  `out_accepted` (i32) = number of
-/// accepted draft tokens; `out_correction_token` = the residual sample
-/// at the first rejection, or the `0xFFFFFFFF` sentinel when all K
-/// accept (the host then samples the K+1-th token normally via the
-/// fused sampler).
-pub fn emit_rejection_kernel(cfg: &RejectionConfig) -> (String, SpecKernelMeta) {
+/// A serial walk on thread 0 (every other thread returns at once), no
+/// shared memory, so no barriers. The branches and the order of every
+/// floating-point operation are the hand kernel's: the acceptance walk
+/// (`r < p_target / p_draft`, a non-positive `p_draft` rejecting before
+/// the division), then at the first rejection the residual's total mass,
+/// the empty-residual fallback to the drafted token, and the CDF walk
+/// whose last positive entry is the fp-drift fallback. Loop-carried
+/// values — the PRNG state, the loop cursors, the running mass and the
+/// selected token — are block parameters.
+pub fn build_rejection(cfg: &RejectionConfig) -> KernelIR {
+    use AddressSpace::Global;
+    use KirType::{F32, U32, U64};
+
+    validate_rejection(cfg);
+    let mut b = KirBuilder::new(REJECT_KERNEL_NAME);
+    let target_probs = b.add_param("target_probs_ptr", ptr(F32, Global), Global);
+    let draft_probs = b.add_param("draft_probs_ptr", ptr(F32, Global), Global);
+    let draft_tokens = b.add_param("draft_tokens_ptr", ptr(U32, Global), Global);
+    let rng_seed = b.add_param("rng_seed", U64, Global);
+    let out_accepted = b.add_param("out_accepted_ptr", ptr(U32, Global), Global);
+    let out_correction = b.add_param("out_correction_token_ptr", ptr(U32, Global), Global);
+    b.set_workgroup_size([REJECT_BLOCK_DIM, 1, 1]);
+
+    let entry = b.new_block();
+    let seed = b.new_block();
+    let acc_head = b.new_block();
+    let acc_body = b.new_block();
+    let acc_ratio = b.new_block();
+    let acc_next = b.new_block();
+    let all_accept = b.new_block();
+    let reject = b.new_block();
+    let tot_head = b.new_block();
+    let tot_body = b.new_block();
+    let tot_sub = b.new_block();
+    let tot_clamp = b.new_block();
+    let tot_done = b.new_block();
+    let fallback = b.new_block();
+    let resample = b.new_block();
+    let walk_head = b.new_block();
+    let walk_body = b.new_block();
+    let walk_sub = b.new_block();
+    let walk_clamp = b.new_block();
+    let walk_select = b.new_block();
+    let walk_next = b.new_block();
+    let walk_done = b.new_block();
+    let exit = b.new_block();
+
+    let j = b.add_block_param(acc_head, U32);
+    let x = b.add_block_param(acc_head, U64);
+    let v = b.add_block_param(tot_head, U32);
+    let tot = b.add_block_param(tot_head, F32);
+    let tot_t = b.add_block_param(tot_clamp, F32);
+    let wv = b.add_block_param(walk_head, U32);
+    let cum = b.add_block_param(walk_head, F32);
+    let sel = b.add_block_param(walk_head, U32);
+    let walk_t = b.add_block_param(walk_clamp, F32);
+    let next_cum = b.add_block_param(walk_next, F32);
+    let next_sel = b.add_block_param(walk_next, U32);
+    let chosen = b.add_block_param(walk_done, U32);
+
+    // Serial kernel: only thread 0 works.
+    b.set_block(entry);
+    let tid = b.new_typed_var(U32);
+    b.emit(KirOp::ThreadId(tid, 0));
+    let zero = konst(&mut b, ConstValue::U32(0));
+    let one = konst(&mut b, ConstValue::U32(1));
+    let k = konst(&mut b, ConstValue::U32(cfg.k_tokens));
+    let vocab = konst(&mut b, ConstValue::U32(cfg.vocab_size));
+    let f_zero = konst(&mut b, ConstValue::F32(0.0));
+    let not_zero = cmp(&mut b, tid, zero, CmpOp::Ne);
+    b.terminate(KirTerminator::CondBranch(not_zero, KirEdge::to(exit), KirEdge::to(seed)));
+
+    // xorshift64*: a zero seed would be a fixed point; substitute the
+    // golden gamma.
+    b.set_block(seed);
+    let zero64 = konst(&mut b, ConstValue::U64(0));
+    let golden = konst(&mut b, ConstValue::U64(0x9E37_79B9_7F4A_7C15));
+    let seeded = cmp(&mut b, rng_seed, zero64, CmpOp::Ne);
+    b.terminate(KirTerminator::CondBranch(
+        seeded,
+        KirEdge::with(acc_head, vec![zero, rng_seed]),
+        KirEdge::with(acc_head, vec![zero, golden]),
+    ));
+
+    // Acceptance walk over the K draft positions.
+    b.set_block(acc_head);
+    let walked = cmp(&mut b, j, k, CmpOp::Ge);
+    b.terminate(KirTerminator::CondBranch(walked, KirEdge::to(all_accept), KirEdge::to(acc_body)));
+
+    b.set_block(acc_body);
+    let (x_next, r) = build_prng_draw(&mut b, x);
+    let d_addr = at(&mut b, F32, Global, draft_probs, j);
+    let d = load(&mut b, F32, d_addr, Global);
+    let tok_addr = at(&mut b, U32, Global, draft_tokens, j);
+    let tok = load(&mut b, U32, tok_addr, Global);
+    // p_draft <= 0 rejects (division guard).
+    let positive = cmp(&mut b, d, f_zero, CmpOp::Gt);
+    b.terminate(KirTerminator::CondBranch(positive, KirEdge::to(acc_ratio), KirEdge::to(reject)));
+
+    // p_target = target_probs[j * vocab + tok_j].
+    b.set_block(acc_ratio);
+    let row_j = op2(&mut b, U32, KirOp::Mul, j, vocab);
+    let t_index = op2(&mut b, U32, KirOp::Add, row_j, tok);
+    let t_addr = at(&mut b, F32, Global, target_probs, t_index);
+    let t = load(&mut b, F32, t_addr, Global);
+    let ratio = op2(&mut b, F32, KirOp::Div, t, d);
+    let accept = cmp(&mut b, r, ratio, CmpOp::Lt);
+    b.terminate(KirTerminator::CondBranch(accept, KirEdge::to(acc_next), KirEdge::to(reject)));
+
+    b.set_block(acc_next);
+    let j_next = op2(&mut b, U32, KirOp::Add, j, one);
+    b.terminate(KirTerminator::Branch(KirEdge::with(acc_head, vec![j_next, x_next])));
+
+    // All K accepted: the sentinel tells the host to sample the K+1-th
+    // token normally.
+    b.set_block(all_accept);
+    b.emit(KirOp::Store(out_accepted, k, Global));
+    let sentinel = konst(&mut b, ConstValue::U32(u32::MAX));
+    b.emit(KirOp::Store(out_correction, sentinel, Global));
+    b.terminate(KirTerminator::Branch(KirEdge::to(exit)));
+
+    // accepted = j; the correction comes from row j's Leviathan residual.
+    // A negative p_draft is garbage input; clamp it for the residual.
+    b.set_block(reject);
+    b.emit(KirOp::Store(out_accepted, j, Global));
+    let d_clamped = op2(&mut b, F32, KirOp::Max, d, f_zero);
+    let row = op2(&mut b, U32, KirOp::Mul, j, vocab);
+    b.terminate(KirTerminator::Branch(KirEdge::with(tot_head, vec![zero, f_zero])));
+
+    // The residual at vocab entry `at_v`: p_target, less the clamped
+    // p_draft at the drafted token, clamped at 0. Entered from the current
+    // block; leaves the builder in `clamp` with the entry in its param.
+    let residual = |b: &mut KirBuilder, at_v: VarId, sub: BlockId, clamp: BlockId| {
+        let index = op2(b, U32, KirOp::Add, row, at_v);
+        let addr = at(b, F32, Global, target_probs, index);
+        let p = load(b, F32, addr, Global);
+        let other = cmp(b, at_v, tok, CmpOp::Ne);
+        b.terminate(KirTerminator::CondBranch(
+            other,
+            KirEdge::with(clamp, vec![p]),
+            KirEdge::to(sub),
+        ));
+        b.set_block(sub);
+        let reduced = op2(b, F32, KirOp::Sub, p, d_clamped);
+        b.terminate(KirTerminator::Branch(KirEdge::with(clamp, vec![reduced])));
+        b.set_block(clamp);
+    };
+
+    // Pass 1: the residual's total mass.
+    b.set_block(tot_head);
+    let tot_walked = cmp(&mut b, v, vocab, CmpOp::Ge);
+    b.terminate(KirTerminator::CondBranch(tot_walked, KirEdge::to(tot_done), KirEdge::to(tot_body)));
+
+    b.set_block(tot_body);
+    residual(&mut b, v, tot_sub, tot_clamp);
+    let q = op2(&mut b, F32, KirOp::Max, tot_t, f_zero);
+    let tot_next = op2(&mut b, F32, KirOp::Add, tot, q);
+    let v_next = op2(&mut b, U32, KirOp::Add, v, one);
+    b.terminate(KirTerminator::Branch(KirEdge::with(tot_head, vec![v_next, tot_next])));
+
+    // An empty residual means the target mass sat on the drafted token;
+    // fall back to it (the argmax of p_target).
+    b.set_block(tot_done);
+    let has_mass = cmp(&mut b, tot, f_zero, CmpOp::Gt);
+    b.terminate(KirTerminator::CondBranch(has_mass, KirEdge::to(resample), KirEdge::to(fallback)));
+
+    b.set_block(fallback);
+    b.emit(KirOp::Store(out_correction, tok, Global));
+    b.terminate(KirTerminator::Branch(KirEdge::to(exit)));
+
+    b.set_block(resample);
+    let (_, r2) = build_prng_draw(&mut b, x_next);
+    let target = op2(&mut b, F32, KirOp::Mul, r2, tot);
+    b.terminate(KirTerminator::Branch(KirEdge::with(walk_head, vec![zero, f_zero, tok])));
+
+    // Walk the residual's CDF; the last positive entry is the fp-drift
+    // fallback (a positive total guarantees one exists).
+    b.set_block(walk_head);
+    let walk_walked = cmp(&mut b, wv, vocab, CmpOp::Ge);
+    b.terminate(KirTerminator::CondBranch(
+        walk_walked,
+        KirEdge::with(walk_done, vec![sel]),
+        KirEdge::to(walk_body),
+    ));
+
+    b.set_block(walk_body);
+    residual(&mut b, wv, walk_sub, walk_clamp);
+    let wq = op2(&mut b, F32, KirOp::Max, walk_t, f_zero);
+    let cum_next = op2(&mut b, F32, KirOp::Add, cum, wq);
+    let positive_q = cmp(&mut b, wq, f_zero, CmpOp::Gt);
+    b.terminate(KirTerminator::CondBranch(
+        positive_q,
+        KirEdge::to(walk_select),
+        KirEdge::with(walk_next, vec![cum_next, sel]),
+    ));
+
+    b.set_block(walk_select);
+    let reached = cmp(&mut b, cum_next, target, CmpOp::Ge);
+    b.terminate(KirTerminator::CondBranch(
+        reached,
+        KirEdge::with(walk_done, vec![wv]),
+        KirEdge::with(walk_next, vec![cum_next, wv]),
+    ));
+
+    b.set_block(walk_next);
+    let wv_next = op2(&mut b, U32, KirOp::Add, wv, one);
+    b.terminate(KirTerminator::Branch(KirEdge::with(walk_head, vec![wv_next, next_cum, next_sel])));
+
+    b.set_block(walk_done);
+    b.emit(KirOp::Store(out_correction, chosen, Global));
+    b.terminate(KirTerminator::Branch(KirEdge::to(exit)));
+
+    b.set_block(exit);
+    b.terminate(KirTerminator::Return);
+    b.finalize()
+}
+
+fn validate_rejection(cfg: &RejectionConfig) {
     assert!(
         cfg.k_tokens >= 1 && cfg.k_tokens <= 32,
         "k_tokens must be in 1..=32 (matches the serve-side clamp)"
@@ -627,191 +867,50 @@ pub fn emit_rejection_kernel(cfg: &RejectionConfig) -> (String, SpecKernelMeta) 
         (cfg.k_tokens as u64) * (cfg.vocab_size as u64) <= u32::MAX as u64,
         "k_tokens * vocab_size must fit in u32 (row index arithmetic)"
     );
+}
 
-    let k = cfg.k_tokens;
-    let vocab = cfg.vocab_size;
-    let zero = f32_imm(0.0);
-    let two_neg24 = f32_imm(1.0 / 16_777_216.0);
-
-    let mut p = String::new();
-    let w = &mut p;
-
+/// The `//` header the hand kernel carried, line for line.
+fn rejection_header(cfg: &RejectionConfig) -> String {
+    let mut w = String::new();
     writeln!(w, "//").unwrap();
-    writeln!(
-        w,
-        "// {} - CFIE speculative rejection-sampling epilogue.",
-        REJECT_KERNEL_NAME
-    )
-    .unwrap();
-    writeln!(
-        w,
-        "// Serial thread-0 walk over K={} draft positions, vocab={}.",
-        k, vocab
-    )
-    .unwrap();
+    writeln!(w, "// {} - CFIE speculative rejection-sampling epilogue.", REJECT_KERNEL_NAME).unwrap();
+    writeln!(w, "// Serial thread-0 walk over K={} draft positions, vocab={}.", cfg.k_tokens, cfg.vocab_size)
+        .unwrap();
     writeln!(w, "// Accept j iff r < p_target[j][tok_j] / p_draft[j];").unwrap();
     writeln!(w, "// p_draft <= 0 rejects (division guard).  First rejection").unwrap();
     writeln!(w, "// samples the Leviathan residual max(p_target - p_draft*").unwrap();
     writeln!(w, "// [x == tok_j], 0) renormalised; empty residual falls back").unwrap();
     writeln!(w, "// to the drafted token (then the argmax of p_target).").unwrap();
     writeln!(w, "// All-accept writes the 0xFFFFFFFF correction sentinel.").unwrap();
-    writeln!(
-        w,
-        "// PRNG: xorshift64* over rng_seed - deterministic given seed (M46)."
-    )
-    .unwrap();
-    writeln!(
-        w,
-        "// Host rollback: linear chain rollback(slot, K - accepted);"
-    )
-    .unwrap();
-    writeln!(
-        w,
-        "// tree method: rollback(slot, num_nodes) + re-append accepted path."
-    )
-    .unwrap();
+    writeln!(w, "// PRNG: xorshift64* over rng_seed - deterministic given seed (M46).").unwrap();
+    writeln!(w, "// Host rollback: linear chain rollback(slot, K - accepted);").unwrap();
+    writeln!(w, "// tree method: rollback(slot, num_nodes) + re-append accepted path.").unwrap();
     writeln!(w, "//").unwrap();
-    writeln!(w, ".version {}", crate::gpu_specs::ptx_isa_for_sm(cfg.sm_version)).unwrap();
-    writeln!(w, ".target sm_{}", cfg.sm_version).unwrap();
-    writeln!(w, ".address_size 64").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, ".visible .entry {}(", REJECT_KERNEL_NAME).unwrap();
-    writeln!(w, "    .param .u64 target_probs_ptr,").unwrap();
-    writeln!(w, "    .param .u64 draft_probs_ptr,").unwrap();
-    writeln!(w, "    .param .u64 draft_tokens_ptr,").unwrap();
-    writeln!(w, "    .param .u64 rng_seed,").unwrap();
-    writeln!(w, "    .param .u64 out_accepted_ptr,").unwrap();
-    writeln!(w, "    .param .u64 out_correction_token_ptr").unwrap();
-    writeln!(w, ")").unwrap();
-    writeln!(w, "{{").unwrap();
-    writeln!(w, "    .reg .pred %p_a, %p_b, %p_c, %p_d, %p_t0;").unwrap();
-    writeln!(w, "    .reg .f32 %f_r, %f_d, %f_t, %f_ratio, %f_tot, %f_tgt, %f_cum;").unwrap();
-    writeln!(w, "    .reg .u32 %r_tid, %r_j, %r_v, %r_tok, %r_sel, %r_t0, %r_t1;").unwrap();
-    writeln!(
-        w,
-        "    .reg .u64 %rd_tp, %rd_dp, %rd_dt, %rd_seed, %rd_oa, %rd_oc, %rd_x, %rd_row, %rd_t0, %rd_t1, %rd_t2;"
-    )
-    .unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    ld.param.u64 %rd_tp, [target_probs_ptr];").unwrap();
-    writeln!(w, "    ld.param.u64 %rd_dp, [draft_probs_ptr];").unwrap();
-    writeln!(w, "    ld.param.u64 %rd_dt, [draft_tokens_ptr];").unwrap();
-    writeln!(w, "    ld.param.u64 %rd_seed, [rng_seed];").unwrap();
-    writeln!(w, "    ld.param.u64 %rd_oa, [out_accepted_ptr];").unwrap();
-    writeln!(w, "    ld.param.u64 %rd_oc, [out_correction_token_ptr];").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    // serial kernel: only thread 0 works; no SMEM, no barriers").unwrap();
-    writeln!(w, "    mov.u32 %r_tid, %tid.x;").unwrap();
-    writeln!(w, "    setp.ne.u32 %p_t0, %r_tid, 0;").unwrap();
-    writeln!(w, "    @%p_t0 bra EXIT;").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    // xorshift64* PRNG: deterministic given rng_seed (M46)").unwrap();
-    writeln!(w, "    mov.u64 %rd_x, %rd_seed;").unwrap();
-    writeln!(w, "    setp.ne.u64 %p_a, %rd_x, 0;").unwrap();
-    writeln!(w, "    @%p_a bra SEEDED;").unwrap();
-    writeln!(w, "    // zero seed would be a fixed point; substitute golden gamma").unwrap();
-    writeln!(w, "    mov.u64 %rd_x, 0x9E3779B97F4A7C15;").unwrap();
-    writeln!(w, "SEEDED:").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    // acceptance walk over the K draft positions").unwrap();
-    writeln!(w, "    mov.u32 %r_j, 0;").unwrap();
-    writeln!(w, "ACC_LOOP:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p_a, %r_j, {};", k).unwrap();
-    writeln!(w, "    @%p_a bra ALL_ACCEPT;").unwrap();
-    emit_prng_draw(w, &two_neg24);
-    writeln!(w, "    mul.wide.u32 %rd_t0, %r_j, 4;").unwrap();
-    writeln!(w, "    add.u64 %rd_t2, %rd_dp, %rd_t0;").unwrap();
-    writeln!(w, "    ld.global.f32 %f_d, [%rd_t2];").unwrap();
-    writeln!(w, "    add.u64 %rd_t2, %rd_dt, %rd_t0;").unwrap();
-    writeln!(w, "    ld.global.u32 %r_tok, [%rd_t2];").unwrap();
-    writeln!(w, "    // p_draft <= 0 => reject (division guard)").unwrap();
-    writeln!(w, "    setp.gt.f32 %p_b, %f_d, {};", zero).unwrap();
-    writeln!(w, "    @!%p_b bra REJECT;").unwrap();
-    writeln!(w, "    // p_target = target_probs[j * vocab + tok_j]").unwrap();
-    writeln!(w, "    mul.lo.u32 %r_t1, %r_j, {};", vocab).unwrap();
-    writeln!(w, "    add.u32 %r_t1, %r_t1, %r_tok;").unwrap();
-    writeln!(w, "    mul.wide.u32 %rd_t0, %r_t1, 4;").unwrap();
-    writeln!(w, "    add.u64 %rd_t2, %rd_tp, %rd_t0;").unwrap();
-    writeln!(w, "    ld.global.f32 %f_t, [%rd_t2];").unwrap();
-    writeln!(w, "    div.rn.f32 %f_ratio, %f_t, %f_d;").unwrap();
-    writeln!(w, "    setp.lt.f32 %p_c, %f_r, %f_ratio;").unwrap();
-    writeln!(w, "    @!%p_c bra REJECT;").unwrap();
-    writeln!(w, "    add.u32 %r_j, %r_j, 1;").unwrap();
-    writeln!(w, "    bra ACC_LOOP;").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "ALL_ACCEPT:").unwrap();
-    writeln!(w, "    mov.u32 %r_t0, {};", k).unwrap();
-    writeln!(w, "    st.global.u32 [%rd_oa], %r_t0;").unwrap();
-    writeln!(w, "    // sentinel: host samples the K+1-th token normally").unwrap();
-    writeln!(w, "    mov.u32 %r_t0, 4294967295;").unwrap();
-    writeln!(w, "    st.global.u32 [%rd_oc], %r_t0;").unwrap();
-    writeln!(w, "    bra EXIT;").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "REJECT:").unwrap();
-    writeln!(w, "    // accepted = j; correction from row j's Leviathan residual").unwrap();
-    writeln!(w, "    st.global.u32 [%rd_oa], %r_j;").unwrap();
-    writeln!(w, "    // negative p_draft is garbage input; clamp for the residual").unwrap();
-    writeln!(w, "    max.f32 %f_d, %f_d, {};", zero).unwrap();
-    writeln!(w, "    mul.lo.u32 %r_t1, %r_j, {};", vocab).unwrap();
-    writeln!(w, "    mul.wide.u32 %rd_t0, %r_t1, 4;").unwrap();
-    writeln!(w, "    add.u64 %rd_row, %rd_tp, %rd_t0;").unwrap();
-    writeln!(w, "    // pass 1: total residual mass").unwrap();
-    writeln!(w, "    mov.f32 %f_tot, {};", zero).unwrap();
-    writeln!(w, "    mov.u32 %r_v, 0;").unwrap();
-    writeln!(w, "    mov.u64 %rd_t2, %rd_row;").unwrap();
-    writeln!(w, "TOT_LOOP:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p_a, %r_v, {};", vocab).unwrap();
-    writeln!(w, "    @%p_a bra TOT_DONE;").unwrap();
-    writeln!(w, "    ld.global.f32 %f_t, [%rd_t2];").unwrap();
-    writeln!(w, "    setp.ne.u32 %p_b, %r_v, %r_tok;").unwrap();
-    writeln!(w, "    @%p_b bra TOT_Q;").unwrap();
-    writeln!(w, "    sub.f32 %f_t, %f_t, %f_d;").unwrap();
-    writeln!(w, "TOT_Q:").unwrap();
-    writeln!(w, "    max.f32 %f_t, %f_t, {};", zero).unwrap();
-    writeln!(w, "    add.f32 %f_tot, %f_tot, %f_t;").unwrap();
-    writeln!(w, "    add.u64 %rd_t2, %rd_t2, 4;").unwrap();
-    writeln!(w, "    add.u32 %r_v, %r_v, 1;").unwrap();
-    writeln!(w, "    bra TOT_LOOP;").unwrap();
-    writeln!(w, "TOT_DONE:").unwrap();
-    writeln!(w, "    // empty residual => target mass sat on the drafted token;").unwrap();
-    writeln!(w, "    // fall back to it (the argmax of p_target)").unwrap();
-    writeln!(w, "    setp.gt.f32 %p_a, %f_tot, {};", zero).unwrap();
-    writeln!(w, "    @%p_a bra RESAMPLE;").unwrap();
-    writeln!(w, "    st.global.u32 [%rd_oc], %r_tok;").unwrap();
-    writeln!(w, "    bra EXIT;").unwrap();
-    writeln!(w, "RESAMPLE:").unwrap();
-    emit_prng_draw(w, &two_neg24);
-    writeln!(w, "    mul.f32 %f_tgt, %f_r, %f_tot;").unwrap();
-    writeln!(w, "    // walk the residual CDF; last positive entry is the").unwrap();
-    writeln!(w, "    // fp-drift fallback (total > 0 guarantees one exists)").unwrap();
-    writeln!(w, "    mov.u32 %r_sel, %r_tok;").unwrap();
-    writeln!(w, "    mov.f32 %f_cum, {};", zero).unwrap();
-    writeln!(w, "    mov.u32 %r_v, 0;").unwrap();
-    writeln!(w, "    mov.u64 %rd_t2, %rd_row;").unwrap();
-    writeln!(w, "WALK:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p_a, %r_v, {};", vocab).unwrap();
-    writeln!(w, "    @%p_a bra WALK_DONE;").unwrap();
-    writeln!(w, "    ld.global.f32 %f_t, [%rd_t2];").unwrap();
-    writeln!(w, "    setp.ne.u32 %p_b, %r_v, %r_tok;").unwrap();
-    writeln!(w, "    @%p_b bra W_Q;").unwrap();
-    writeln!(w, "    sub.f32 %f_t, %f_t, %f_d;").unwrap();
-    writeln!(w, "W_Q:").unwrap();
-    writeln!(w, "    max.f32 %f_t, %f_t, {};", zero).unwrap();
-    writeln!(w, "    add.f32 %f_cum, %f_cum, %f_t;").unwrap();
-    writeln!(w, "    setp.gt.f32 %p_c, %f_t, {};", zero).unwrap();
-    writeln!(w, "    @!%p_c bra W_NEXT;").unwrap();
-    writeln!(w, "    mov.u32 %r_sel, %r_v;").unwrap();
-    writeln!(w, "    setp.ge.f32 %p_d, %f_cum, %f_tgt;").unwrap();
-    writeln!(w, "    @%p_d bra WALK_DONE;").unwrap();
-    writeln!(w, "W_NEXT:").unwrap();
-    writeln!(w, "    add.u64 %rd_t2, %rd_t2, 4;").unwrap();
-    writeln!(w, "    add.u32 %r_v, %r_v, 1;").unwrap();
-    writeln!(w, "    bra WALK;").unwrap();
-    writeln!(w, "WALK_DONE:").unwrap();
-    writeln!(w, "    st.global.u32 [%rd_oc], %r_sel;").unwrap();
-    writeln!(w, "EXIT:").unwrap();
-    writeln!(w, "    ret;").unwrap();
-    writeln!(w, "}}").unwrap();
+    w
+}
+
+/// Emit the rejection-sampling kernel (paper step 3): build, verify, lower,
+/// and prefix the `//` header.
+///
+/// Launch shape: grid = 1, block = 32; the walk is serial on thread 0
+/// (correctness first), all other threads exit immediately — no SMEM,
+/// so no barriers are required.  `out_accepted` (i32) = number of
+/// accepted draft tokens; `out_correction_token` = the residual sample
+/// at the first rejection, or the `0xFFFFFFFF` sentinel when all K
+/// accept (the host then samples the K+1-th token normally via the
+/// fused sampler). The module targets the KIR floor (`sm_70`), so
+/// [`RejectionConfig`] has no `sm_version`. The returned text carries no
+/// NUL.
+pub fn emit_rejection_kernel(cfg: &RejectionConfig) -> (String, SpecKernelMeta) {
+    let ir = build_rejection(cfg);
+    if let Err(errors) = crate::kir_verify::verify(&ir) {
+        panic!("{} failed KIR verification: {errors:?}", ir.name);
+    }
+    let module = lower_kir_to_ptx(&ir);
+    let module = module.strip_suffix(&[0]).unwrap_or(&module);
+    let module = std::str::from_utf8(module).expect("the KIR printer emits ASCII");
+    let mut p = rejection_header(cfg);
+    p.push_str(module);
 
     let meta = SpecKernelMeta {
         kernel_name: REJECT_KERNEL_NAME.to_string(),
@@ -1019,7 +1118,6 @@ mod tests {
         RejectionConfig {
             k_tokens: k,
             vocab_size: vocab,
-            sm_version: 80,
         }
     }
 
@@ -1317,41 +1415,53 @@ mod tests {
 
     #[test]
     fn reject_param_list_is_exactly_the_six_params() {
-        let ptx = emit_rejection_ptx(&reject_cfg(5, 49_152));
-        let start = ptx.find(".visible .entry nsl_cfie_spec_reject(").unwrap();
-        let end = start + ptx[start..].find(')').unwrap();
-        let params: Vec<&str> = ptx[start..end]
-            .lines()
-            .filter_map(|l| {
-                let l = l.trim();
-                l.starts_with(".param").then(|| l.trim_end_matches(','))
-            })
-            .collect();
+        let ir = build_rejection(&reject_cfg(5, 49_152));
+        let names: Vec<&str> = ir.params.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(
-            params,
-            vec![
-                ".param .u64 target_probs_ptr",
-                ".param .u64 draft_probs_ptr",
-                ".param .u64 draft_tokens_ptr",
-                ".param .u64 rng_seed",
-                ".param .u64 out_accepted_ptr",
-                ".param .u64 out_correction_token_ptr",
+            names,
+            [
+                "target_probs_ptr",
+                "draft_probs_ptr",
+                "draft_tokens_ptr",
+                "rng_seed",
+                "out_accepted_ptr",
+                "out_correction_token_ptr",
             ]
         );
-        assert_eq!(ptx.matches("ld.param").count(), 6);
+        // Every param is 8 bytes: five device pointers and the u64 seed.
+        let ptx = emit_rejection_ptx(&reject_cfg(5, 49_152));
+        for name in names {
+            assert!(ptx.contains(&format!(".param .u64 param_{name}")), "{name}");
+        }
     }
 
     #[test]
     fn reject_prng_idiom_and_sentinel_present() {
-        let ptx = emit_rejection_ptx(&reject_cfg(5, 32_000));
-        // Same xorshift64* constants + golden-gamma guard as the
-        // fused sampler.
-        assert!(ptx.contains("0x2545F4914F6CDD1D"));
-        assert!(ptx.contains("0x9E3779B97F4A7C15"));
-        // All-accept correction sentinel.
-        assert!(ptx.contains("mov.u32 %r_t0, 4294967295;"));
-        // Division guard branch exists before the ratio div.
-        assert!(ptx.contains("div.rn.f32 %f_ratio, %f_t, %f_d;"));
+        use crate::kernel_ir::KirConst;
+        let ir = build_rejection(&reject_cfg(5, 32_000));
+        let mut u64s = Vec::new();
+        let mut u32s = Vec::new();
+        for op in ir.blocks.iter().flat_map(|b| b.ops.iter()) {
+            match op {
+                KirOp::Const(_, KirConst { value: ConstValue::U64(v), .. }) => u64s.push(*v),
+                KirOp::Const(_, KirConst { value: ConstValue::U32(v), .. }) => u32s.push(*v),
+                _ => {}
+            }
+        }
+        // Same xorshift64* constants + golden-gamma guard as the fused
+        // sampler, and the all-accept correction sentinel.
+        assert!(u64s.contains(&0x2545_F491_4F6C_DD1D));
+        assert!(u64s.contains(&0x9E37_79B9_7F4A_7C15));
+        assert!(u32s.contains(&u32::MAX));
+        // One ratio division, reached only past the division guard.
+        let divs = ir
+            .blocks
+            .iter()
+            .flat_map(|b| b.ops.iter())
+            .filter(|op| matches!(op, KirOp::Div(..)))
+            .count();
+        assert_eq!(divs, 1);
+        assert!(emit_rejection_ptx(&reject_cfg(5, 32_000)).contains("div.rn.f32"));
     }
 
     #[test]
