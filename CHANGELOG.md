@@ -8,6 +8,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- The CFIE speculative-decoding sampler kernels are built as KIR (roadmap
+  A2 step 9, third slice): the draft greedy sampler
+  (`nsl_cfie_draft_sample`) and the target prob-row writer
+  (`nsl_cfie_verify_probs`). Both are built from the same KIR sections, so
+  the arithmetic order the self-speculation anchor needs identical in the
+  two kernels is written once. `tests/cfie_spec_sampler_kir_equivalence.rs`
+  runs both through the frozen hand emitter and the KIR one on the shared
+  PTX interpreter. It requires the same output bits, checks the answers
+  against the CPU references, and pins the anchor itself: the draft's
+  probability equals the verify row at the drafted token, bit for bit.
+  The hand-PTX freeze drops from 65 files to 64.
+  `SpecSamplerConfig::sm_version` is gone: the modules target the KIR floor
+  and the driver compiles them forward.
 - The allocator's placement channel is per (thread, device) rather than
   per thread (roadmap A4 step 4b, completing step 4). Two things steer the
   next allocation on a thread: the persistent/transient pool selector

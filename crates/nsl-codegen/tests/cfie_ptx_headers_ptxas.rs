@@ -14,9 +14,9 @@
 //! in `gpu_specs::GPU_DATABASE` that CUDA 13 still assembles for, and
 //! assembles each with `ptxas --gpu-name sm_{N}`.
 //!
-//! `cfie_kv_quant_ptx` has since moved onto KIR (roadmap A2 step 9): its
-//! per-layer kernels target the KIR floor (`sm_70`) whatever GPU serves
-//! them and take no `sm_version`, so the gate builds them once and still
+//! `cfie_kv_quant_ptx` and `cfie_spec_sampler_ptx` have since moved onto
+//! KIR (roadmap A2 step 9): their kernels target the KIR floor (`sm_70`)
+//! whatever GPU serves them and take no `sm_version`, and the gate still
 //! assembles them for every architecture — the driver JIT-compiles them
 //! forward, and this is the offline form of that.
 //!
@@ -153,7 +153,6 @@ fn modules(sm: u32) -> Vec<(String, String)> {
         d_model: 512,
         vocab_size: 49_152,
         vocab_tile: 128,
-        sm_version: sm,
     };
     let (ptx, meta) = cfie_spec_sampler_ptx::emit_draft_sample(&spec);
     out.push((meta.kernel_name, ptx));

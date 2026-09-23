@@ -187,11 +187,11 @@ fn smem_layout(head_dim: u32) -> SmemLayout {
     }
 }
 
-fn ptr(elem: KirType, space: AddressSpace) -> KirType {
+pub(crate) fn ptr(elem: KirType, space: AddressSpace) -> KirType {
     KirType::Ptr(Box::new(elem), space)
 }
 
-fn konst(b: &mut KirBuilder, value: ConstValue) -> VarId {
+pub(crate) fn konst(b: &mut KirBuilder, value: ConstValue) -> VarId {
     let ty = match value {
         ConstValue::U32(_) => KirType::U32,
         ConstValue::U64(_) => KirType::U64,
@@ -204,7 +204,7 @@ fn konst(b: &mut KirBuilder, value: ConstValue) -> VarId {
 }
 
 /// `dst = op(x, y)` with `dst` of type `ty`.
-fn op2(
+pub(crate) fn op2(
     b: &mut KirBuilder,
     ty: KirType,
     op: fn(VarId, VarId, VarId) -> KirOp,
@@ -216,27 +216,27 @@ fn op2(
     dst
 }
 
-fn cmp(b: &mut KirBuilder, x: VarId, y: VarId, how: CmpOp) -> VarId {
+pub(crate) fn cmp(b: &mut KirBuilder, x: VarId, y: VarId, how: CmpOp) -> VarId {
     let dst = b.new_typed_var(KirType::Bool);
     b.emit(KirOp::Cmp(dst, x, y, how));
     dst
 }
 
 /// Zero-extend a u32 to u64.
-fn widen(b: &mut KirBuilder, x: VarId) -> VarId {
+pub(crate) fn widen(b: &mut KirBuilder, x: VarId) -> VarId {
     let dst = b.new_typed_var(KirType::U64);
     b.emit(KirOp::Cast(dst, x, KirType::U64));
     dst
 }
 
 /// `&base[index]`, where `base` points at `elem` in `space`.
-fn at(b: &mut KirBuilder, elem: KirType, space: AddressSpace, base: VarId, index: VarId) -> VarId {
+pub(crate) fn at(b: &mut KirBuilder, elem: KirType, space: AddressSpace, base: VarId, index: VarId) -> VarId {
     let dst = b.new_typed_var(ptr(elem, space));
     b.emit(KirOp::PtrOffset(dst, base, index));
     dst
 }
 
-fn load(b: &mut KirBuilder, ty: KirType, addr: VarId, space: AddressSpace) -> VarId {
+pub(crate) fn load(b: &mut KirBuilder, ty: KirType, addr: VarId, space: AddressSpace) -> VarId {
     let dst = b.new_typed_var(ty);
     b.emit(KirOp::Load(dst, addr, space));
     dst

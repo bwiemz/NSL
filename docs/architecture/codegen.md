@@ -612,6 +612,14 @@ or as int8 dequantized by its runtime scale.
 `tests/cfie_kv_quant_kir_equivalence.rs` runs them against their frozen hand
 emitter (`tests/fixtures/cfie_kv_quant_hand.rs`) on the same interpreter,
 which lives in `tests/support/cta_ptx_interp.rs`.
+`src/cfie_spec_sampler_ptx.rs::build_draft_sample` / `build_verify_probs`
+are the third: the draft greedy sampler and the target prob-row writer, one
+CTA each, built from shared sections (hidden load and RMSNorm, the
+row matvec, the streaming online-softmax pass) so the two kernels' shared
+arithmetic order — which the self-speculation anchor needs bit-identical —
+is one piece of code. `tests/cfie_spec_sampler_kir_equivalence.rs` runs
+them against `tests/fixtures/cfie_spec_sampler_hand.rs` on the same
+interpreter.
 
 **Hand-written PTX emitters (frozen).** `src/flash_attention.rs`
 (`synthesize_flash_attention_ptx`, `synthesize_flash_attention_backward_ptx`),
@@ -622,21 +630,22 @@ which lives in `tests/support/cta_ptx_interp.rs`.
 `src/matmul_mma.rs` (MMA fragment primitives), `src/moe_kernels.rs`,
 `src/wrga_fused_ptx.rs`,
 `src/cpkd_fused_loss.rs`, `src/bitnet/`, `src/pca_rope.rs`,
-`src/pca_tilerange.rs`, `src/cfie_*_ptx.rs` (all but `cfie_grammar_ptx.rs`
-and `cfie_kv_quant_ptx.rs`),
+`src/pca_tilerange.rs`, `src/cfie_*_ptx.rs` (all but `cfie_grammar_ptx.rs`,
+`cfie_kv_quant_ptx.rs` and `cfie_spec_sampler_ptx.rs`),
 `src/fusion.rs` (elementwise chains), and the shared preludes
 in `src/kernel_skeleton/` (`header.rs`, `indexing.rs`, `pad.rs`, `params.rs`,
 `smem.rs`) all `push_str` PTX text with hand-numbered registers.
 
 **The freeze (roadmap A2).** `ci/hand-ptx-manifest.txt` lists every file that
-writes PTX into a string (71 members at the 2026-09-02 freeze; 65 today: the
+writes PTX into a string (71 members at the 2026-09-02 freeze; 64 today: the
 codegen files above plus six under `crates/nsl-runtime/src/cuda/` and
 `crates/nsl-runtime/src/flash_attention.rs`; `backend_ptx.rs` is the one
 member that belongs by construction). The list shrinks as A2 migrates
 kernels onto KIR — step 3 retired `src/kernel.rs`, step 7
 `src/precision_cast_ptx.rs` and the PTX text `cuda/precision_cast_kernels.rs`
 used to carry, step 9's first slice `src/cfie_decode_attention.rs` and
-`src/cfie_grammar_ptx.rs`, and its second `src/cfie_kv_quant_ptx.rs`.
+`src/cfie_grammar_ptx.rs`, its second `src/cfie_kv_quant_ptx.rs`, and its
+third `src/cfie_spec_sampler_ptx.rs`.
 `scripts/hand-ptx-freeze.sh --check`
 (membership decided by `scripts/hand-ptx-scan.awk`; `--list`, `--explain`,
 `--write-manifest`, `--self-test`) fails CI (`hand-ptx-freeze` job in

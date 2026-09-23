@@ -371,7 +371,6 @@ fn spec_sampler_cfg() -> SpecSamplerConfig {
         d_model: D_MODEL as u32,
         vocab_size: VOCAB as u32,
         vocab_tile: 128,
-        sm_version: 80,
     }
 }
 

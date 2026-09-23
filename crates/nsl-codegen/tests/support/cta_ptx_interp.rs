@@ -1,8 +1,9 @@
 //! A cooperative-CTA PTX interpreter for the flash-decode subset — the
 //! executable half of the CFIE equivalence gates (roadmap A2 step 9).
 //!
-//! Shared by `cfie_decode_attn_kir_equivalence.rs` and
-//! `cfie_kv_quant_kir_equivalence.rs`, which include it with `#[path]`;
+//! Shared by `cfie_decode_attn_kir_equivalence.rs`,
+//! `cfie_kv_quant_kir_equivalence.rs` and
+//! `cfie_spec_sampler_kir_equivalence.rs`, which include it with `#[path]`;
 //! the first of them documents what it models and what it does not.
 //! In short: a CTA runs cooperatively, a `bar.sync` releases only when
 //! every thread waits at it, and an unknown mnemonic or operand form, a
@@ -13,6 +14,12 @@
 //! hardware does, and `cvt.rn.f32.s8` converts the low byte — exact, so
 //! the rounding mode is moot. `cvt.u64.u64` is a copy: it is how the KIR
 //! printer reinterprets one pointer type as another.
+//!
+//! The two approximate instructions are modelled by their exact
+//! counterparts, `ex2.approx.f32` as `exp2` and `rsqrt.approx.f32` as
+//! `1 / sqrt`: the gates compare two programs on the same model, so what
+//! matters is that the model is a function of its input, not that it
+//! rounds as the hardware's approximation does.
 
 use std::collections::HashMap;
 
@@ -109,6 +116,7 @@ pub(crate) enum Op {
     F { op: FOp, d: usize, a: Src, b: Src },
     Fma { d: usize, a: Src, b: Src, c: Src },
     Ex2 { d: usize, a: Src },
+    Rsqrt { d: usize, a: Src },
     Ld { space: Space, bytes: usize, d: usize, addr: Addr },
     /// `ld.global.s8`: one byte, sign-extended into the register.
     LdS8 { space: Space, d: usize, addr: Addr },
@@ -365,6 +373,10 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 want(2);
                 Op::Ex2 { d: p.dst(ops[0]), a: p.src(ops[1]) }
             }
+            ["rsqrt", "approx", "f32"] => {
+                want(2);
+                Op::Rsqrt { d: p.dst(ops[0]), a: p.src(ops[1]) }
+            }
             ["ld", space @ ("global" | "shared"), ty @ ("f32" | "b16")] => {
                 want(2);
                 let space = if *space == "global" { Space::Global } else { Space::Shared };
@@ -376,7 +388,7 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 let space = if *space == "global" { Space::Global } else { Space::Shared };
                 Op::LdS8 { space, d: p.dst(ops[0]), addr: p.addr(ops[1]) }
             }
-            ["st", space @ ("global" | "shared"), "f32"] => {
+            ["st", space @ ("global" | "shared"), "f32" | "u32" | "b32"] => {
                 want(2);
                 let space = if *space == "global" { Space::Global } else { Space::Shared };
                 Op::St { space, bytes: 4, addr: p.addr(ops[0]), v: p.src(ops[1]) }
@@ -619,6 +631,10 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
             }
             Op::Ex2 { d, a } => {
                 let v = f(rd(t, launch, *a)).exp2();
+                write(t, *d, fb(v));
+            }
+            Op::Rsqrt { d, a } => {
+                let v = 1.0 / f(rd(t, launch, *a)).sqrt();
                 write(t, *d, fb(v));
             }
             Op::Ld { space, bytes, d, addr } => {

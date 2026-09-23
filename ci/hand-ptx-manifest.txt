@@ -14,7 +14,6 @@ crates/nsl-codegen/src/bitnet/phases/packed_load.rs
 crates/nsl-codegen/src/bitnet/phases/ternary_gemm.rs
 crates/nsl-codegen/src/cfie_persistent_ptx.rs
 crates/nsl-codegen/src/cfie_sample_ptx.rs
-crates/nsl-codegen/src/cfie_spec_sampler_ptx.rs
 crates/nsl-codegen/src/cfie_speculative_ptx.rs
 crates/nsl-codegen/src/cpkd_fused_loss.rs
 crates/nsl-codegen/src/flash_attention.rs
