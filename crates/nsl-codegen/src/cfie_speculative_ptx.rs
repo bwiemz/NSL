@@ -99,18 +99,6 @@ pub struct SpecKernelMeta {
     pub grid_dim_is_n_heads: bool,
 }
 
-/// Mirrors `gpu_specs::GpuSpec::ptx_version` (same convention as
-/// `cfie_decode_attention`).
-fn ptx_version_for_sm(sm: u32) -> &'static str {
-    if sm >= 100 {
-        "8.6"
-    } else if sm >= 90 {
-        "8.4"
-    } else {
-        "7.0"
-    }
-}
-
 fn f32_imm(v: f32) -> String {
     format!("0f{:08X}", v.to_bits())
 }
@@ -269,7 +257,7 @@ pub fn emit_verify_attention(cfg: &VerifyAttentionConfig) -> (String, SpecKernel
         writeln!(w, "//   node {:>2} mask = 0x{:016X}", i, row).unwrap();
     }
     writeln!(w, "//").unwrap();
-    writeln!(w, ".version {}", ptx_version_for_sm(cfg.sm_version)).unwrap();
+    writeln!(w, ".version {}", crate::gpu_specs::ptx_isa_for_sm(cfg.sm_version)).unwrap();
     writeln!(w, ".target sm_{}", cfg.sm_version).unwrap();
     writeln!(w, ".address_size 64").unwrap();
     writeln!(w).unwrap();
@@ -683,7 +671,7 @@ pub fn emit_rejection_kernel(cfg: &RejectionConfig) -> (String, SpecKernelMeta) 
     )
     .unwrap();
     writeln!(w, "//").unwrap();
-    writeln!(w, ".version {}", ptx_version_for_sm(cfg.sm_version)).unwrap();
+    writeln!(w, ".version {}", crate::gpu_specs::ptx_isa_for_sm(cfg.sm_version)).unwrap();
     writeln!(w, ".target sm_{}", cfg.sm_version).unwrap();
     writeln!(w, ".address_size 64").unwrap();
     writeln!(w).unwrap();
@@ -1107,7 +1095,6 @@ mod tests {
             per_slot_max_tokens: cfg.per_slot_max_tokens,
             max_slots: cfg.max_slots,
             kv_dtype_bytes: 2,
-            sm_version: cfg.sm_version,
         };
         let verify_ptx = emit_verify_attention_ptx(&cfg);
         let attn_ptx = crate::cfie_decode_attention::emit_decode_attention_ptx(&attn);

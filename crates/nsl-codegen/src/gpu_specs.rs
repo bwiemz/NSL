@@ -108,18 +108,17 @@ impl GpuSpec {
         self.sm_version >= 100
     }
 
-    /// Returns the appropriate PTX version string for this GPU's features.
+    /// The PTX ISA version to pair with [`ptx_target`](Self::ptx_target).
+    ///
+    /// Every sm_100+ part is targeted as `sm_100`, which ISA 8.6 names;
+    /// below that the target is the part's own, and the version is
+    /// [`ptx_isa_for_sm`]'s — sm_86, sm_87 and sm_89 were given 7.0, an ISA
+    /// that cannot name them.
     pub fn ptx_version(&self) -> &'static str {
         if self.sm_version >= 100 {
             "8.6"
-        }
-        // Blackwell requires PTX ISA 8.6+
-        else if self.sm_version >= 90 {
-            "8.4"
-        }
-        // Required for wgmma, TMA, setmaxnreg, mbarrier
-        else {
-            "7.0"
+        } else {
+            ptx_isa_for_sm(self.sm_version)
         }
     }
 
@@ -165,6 +164,41 @@ impl GpuSpec {
         } else {
             32
         }
+    }
+}
+
+/// The PTX ISA version a module declaring `.target sm_{sm}` should carry.
+///
+/// A PTX module names its ISA (`.version`) and its target (`.target`), and
+/// `ptxas` — the driver's JIT included — refuses a target the ISA predates:
+/// `PTX .version 7.0 does not support .target sm_89`. Each architecture in
+/// [`GPU_DATABASE`] first appears in the ISA below (sm_90 and sm_100 are
+/// given the ISA their async and Blackwell features need rather than the
+/// oldest that names them, as the hand-written emitters always did):
+///
+/// | target | ISA |
+/// |---|---|
+/// | sm_75, sm_80 | 7.0 |
+/// | sm_86 | 7.1 |
+/// | sm_87 | 7.4 |
+/// | sm_89 | 7.8 |
+/// | sm_90 | 8.4 (wgmma, TMA, setmaxnreg, mbarrier) |
+/// | sm_100 | 8.6 |
+/// | sm_120 | 8.7 |
+///
+/// Exact for the parts in the table; an architecture between two rows gets
+/// the lower row's ISA, so a new part needs its own row.
+/// `tests/cfie_ptx_headers_ptxas.rs` assembles every emitter that uses this
+/// at every architecture in the table.
+pub fn ptx_isa_for_sm(sm: u32) -> &'static str {
+    match sm {
+        120.. => "8.7",
+        100.. => "8.6",
+        90.. => "8.4",
+        89.. => "7.8",
+        87.. => "7.4",
+        86.. => "7.1",
+        _ => "7.0",
     }
 }
 
@@ -973,6 +1007,51 @@ mod tests {
             assert!(fpga.ocm_latency_cycles > 0);
             assert!(fpga.dsp_slices > 0);
         }
+    }
+
+    /// Roadmap A2 step 9 found the CFIE emitters naming `.target sm_89`
+    /// under `.version 7.0`. The ISA each architecture first appears in,
+    /// from the PTX ISA release notes; `ptx_isa_for_sm` must be at least
+    /// that for every part in the database, and `ptx_version` must be at
+    /// least that for the target `ptx_target` names.
+    #[test]
+    fn every_database_part_gets_an_isa_that_names_its_target() {
+        let introduced = |sm: u32| -> (u32, u32) {
+            match sm {
+                52 | 75 | 80 => (7, 0),
+                86 => (7, 1),
+                87 => (7, 4),
+                89 | 90 => (7, 8),
+                100 => (8, 6),
+                120 => (8, 7),
+                other => panic!("sm_{other} has no row; add one to ptx_isa_for_sm and here"),
+            }
+        };
+        let parse = |v: &str| -> (u32, u32) {
+            let (a, b) = v.split_once('.').unwrap();
+            (a.parse().unwrap(), b.parse().unwrap())
+        };
+        for gpu in GPU_DATABASE {
+            let sm = gpu.sm_version;
+            assert!(
+                parse(ptx_isa_for_sm(sm)) >= introduced(sm),
+                "{}: ptx_isa_for_sm({sm}) = {}",
+                gpu.name,
+                ptx_isa_for_sm(sm)
+            );
+            let target: u32 = gpu.ptx_target().trim_start_matches("sm_").trim_end_matches('a').parse().unwrap();
+            assert!(
+                parse(gpu.ptx_version()) >= introduced(target),
+                "{}: ptx_version {} with ptx_target {}",
+                gpu.name,
+                gpu.ptx_version(),
+                gpu.ptx_target()
+            );
+        }
+        // The rows the hand-written emitters relied on are unchanged.
+        assert_eq!(ptx_isa_for_sm(80), "7.0");
+        assert_eq!(ptx_isa_for_sm(90), "8.4");
+        assert_eq!(ptx_isa_for_sm(100), "8.6");
     }
 
     #[test]

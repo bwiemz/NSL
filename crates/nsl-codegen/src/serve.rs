@@ -849,7 +849,6 @@ impl Compiler<'_> {
                 per_slot_max_tokens: per_slot,
                 max_slots,
                 kv_dtype_bytes: 2,
-                sm_version: gpu.sm_version,
             };
             let supported = prepared.shape.head_dim <= 128
                 && prepared.shape.n_heads % prepared.shape.n_kv_heads.max(1) == 0

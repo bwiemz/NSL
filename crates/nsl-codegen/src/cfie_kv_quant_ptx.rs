@@ -100,19 +100,6 @@ pub struct LayerPoolOffsets {
     pub v_elem_bytes: u32,
 }
 
-/// Mirrors `gpu_specs::GpuSpec::ptx_version` (duplicated here because
-/// the base emitter keeps its copy private): sm_100+ -> 8.6, sm_90+ ->
-/// 8.4, else 7.0 baseline.
-fn ptx_version_for_sm(sm: u32) -> &'static str {
-    if sm >= 100 {
-        "8.6"
-    } else if sm >= 90 {
-        "8.4"
-    } else {
-        "7.0"
-    }
-}
-
 fn f32_imm(v: f32) -> String {
     format!("0f{:08X}", v.to_bits())
 }
@@ -292,7 +279,7 @@ pub fn emit_layer(
     writeln!(w, "//   k_elem_bytes        = {}", k_elem).unwrap();
     writeln!(w, "//   v_elem_bytes        = {}", v_elem).unwrap();
     writeln!(w, "//").unwrap();
-    writeln!(w, ".version {}", ptx_version_for_sm(cfg.sm_version)).unwrap();
+    writeln!(w, ".version {}", crate::gpu_specs::ptx_isa_for_sm(cfg.sm_version)).unwrap();
     writeln!(w, ".target sm_{}", cfg.sm_version).unwrap();
     writeln!(w, ".address_size 64").unwrap();
     writeln!(w).unwrap();
@@ -632,7 +619,7 @@ pub fn cpu_reference_layer(
 mod tests {
     use super::*;
     use crate::cfie_decode_attention::{
-        cpu_reference, emit_decode_attention_ptx, DecodeAttentionConfig,
+        cpu_reference, emit_decode_attention_ptx, kv_strides, DecodeAttentionConfig,
     };
 
     /// Mixed 4-layer fixture: paper-shaped edge FP16, middle INT8.
@@ -671,7 +658,6 @@ mod tests {
             per_slot_max_tokens: 256,
             max_slots: 4,
             kv_dtype_bytes: 2,
-            sm_version: 80,
         }
     }
 
@@ -765,18 +751,20 @@ mod tests {
             comment_value(&base_ptx, "token_stride"),
             comment_value(&l0_ptx, "token_stride"),
         );
+        // The base kernel is KIR (roadmap A2 step 9): its address
+        // arithmetic has no hand-named registers to read back, so its
+        // strides come from the one function its builder bakes them from.
+        // f16 elements are 2 bytes; the quant kernel bakes bytes.
+        let base = kv_strides(&matching_base_cfg());
         // Byte token stride baked into the K address arithmetic.
-        let base_kstride = trailing_imm(&base_ptx, "mul.wide.u32 %rd_koff, %r_g,");
         let quant_kstride = trailing_imm(&l0_ptx, "mul.wide.u32 %rd_koff, %r_g,");
-        assert_eq!(base_kstride, quant_kstride);
+        assert_eq!(base.token_stride * 2, quant_kstride);
         // V-side token stride baked into the accumulate loop.
-        let base_vstride = trailing_imm(&base_ptx, "mul.wide.u32 %rd_voff, %r_g0,");
         let quant_vstride = trailing_imm(&l0_ptx, "mul.wide.u32 %rd_voff, %r_g0,");
-        assert_eq!(base_vstride, quant_vstride);
+        assert_eq!(base.token_stride * 2, quant_vstride);
         // Slot base immediate.
-        let base_slot = trailing_imm(&base_ptx, "mul.lo.u32 %r_slotbase, %r_slot,");
         let quant_slot = trailing_imm(&l0_ptx, "mul.lo.u32 %r_slotbase, %r_slot,");
-        assert_eq!(base_slot, quant_slot);
+        assert_eq!(u64::from(matching_base_cfg().per_slot_max_tokens), quant_slot);
     }
 
     // ── structural: per-precision load paths ──────────────────────

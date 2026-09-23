@@ -16,6 +16,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   captures on. The `cuFuncGetParamInfo` cache is keyed by `CUfunction`, and
   moves from a process static onto the device context. Behaviour is unchanged
   while the registry has one slot.
+- The CUDA caching allocator is per device (roadmap A4 step 3d, the last
+  slice of step 3). It was one process-wide `CACHING_ALLOCATOR` static whose
+  free lists held device pointers, so a second device's blocks would have
+  been filed with the first's; each device context now owns its own.
+  `caching_allocator::allocator()` serves the alloc and free paths;
+  `allocator_if_initialized()` serves the `nsl_gpu_*` stats rows, the
+  per-step reset, the allocation summary and the `NSL_MEMSTATS` report,
+  which must answer zero rather than create a context in a CPU-only run of
+  a CUDA-featured binary. The lock-order rule is restated on the context as
+  what the code does: the allocator's mutex is a leaf, never held while
+  another of the context's mutexes is taken, and a source check keeps the
+  allocator's own methods lock-free.
 
 - The GPU slab and the transient arena are per device rather than per process
   (roadmap A4 step 3c). Both are a device base pointer plus an extent, so
@@ -143,6 +155,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   bytes and — separately — that those bytes match an independent
   reference cast. The interpreter rejects any mnemonic it does not model,
   so a silently-skipped instruction cannot make the comparison vacuous.
+
+- The CFIE decode-attention kernel is KIR (roadmap A2 step 9, first
+  slice). `cfie_decode_attention::build` describes the flash-decode kernel
+  — the tile loop, its dot, max, exp-sum and P*V loops, the running max,
+  sum and accumulator — with block parameters for every loop-carried value
+  and an `SmemLayout` of four f32 regions at the hand kernel's offsets; the
+  verifier checks it before `nsl_kir` prints it. `kv_strides` is the one
+  place the pool strides are computed, for the kernel, its `//` header and
+  the sibling kernel test that used to read them back out of hand-named
+  registers. The grammar mask's initialized `.global` array is printed by
+  `nsl_kir::backend_ptx::global_byte_array`, byte for byte as before. The
+  hand-PTX freeze list drops from 68 files to 66. Equivalence is proved by
+  execution: `cfie_decode_attn_kir_equivalence` keeps the deleted emitter
+  verbatim as a fixture and runs both modules on a PTX interpreter that
+  executes a whole CTA cooperatively (a `bar.sync` releases when every
+  thread waits at it) under two thread schedules, asserting identical
+  global memory over four geometries and twelve calls, agreement with
+  `cpu_reference`, and that deleting any barrier, nudging any baked stride
+  or the softmax scale, or dropping the tail-tile clamp is caught.
+  `tests/cfie_decode_attn_ptxas.rs` assembles the module for sm_75 through
+  sm_120 in CI's cuda lane. The KIR printer now declares `shared_mem` for
+  a kernel whose shared memory is a region layout; nothing had, because no
+  such kernel had reached the printer.
 
 - KIR register allocation (roadmap A2 step 5): `nsl_kir::regalloc` gives
   every value a register class from its type (`RegClass::of`) and a dense
@@ -304,6 +339,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- Five CFIE kernel families load on sm_86, sm_87, sm_89 and sm_120 GPUs
+  (the RTX 30 and 40 series, Jetson Orin, the RTX 50 series): the
+  kv-quant decode attention, the fused sampler, the persistent decode
+  block, the speculative draft/verify samplers and the speculative verify
+  and rejection kernels. Each wrote `.target sm_{N}` for the serving GPU
+  under its own copy of a three-row ISA table — 7.0 below sm_90, 8.4
+  below sm_100, 8.6 above — and `ptxas` refuses `.version 7.0` with
+  sm_86, sm_87 or sm_89 and `.version 8.6` with sm_120; the driver's JIT
+  makes the same check at load. The five copies are replaced by
+  `gpu_specs::ptx_isa_for_sm`, which gives each architecture in the GPU
+  table an ISA that names it (7.1, 7.4, 7.8 and 8.7 for those four;
+  sm_80, sm_90 and sm_100 unchanged), and `GpuSpec::ptx_version` now
+  agrees with the target `ptx_target` names. `tests/cfie_ptx_headers_ptxas.rs`
+  (CI's cuda lane) builds every kernel of the five at every architecture
+  in the table and assembles it. The direct-indexing decode-attention
+  kernel had the same header and is fixed by its move onto KIR.
+
+- The CFIE decode-attention module loads on sm_86, sm_87, sm_89 and sm_120
+  GPUs (the RTX 30 and 40 series, Jetson Orin, the RTX 50 series). Its
+  header named `.target sm_{N}` for the serving GPU with a PTX ISA version
+  too old to name it — `ptxas` refuses `.version 7.0` with sm_86, sm_87 or
+  sm_89 and `.version 8.6` with sm_120, and the driver's JIT applies the
+  same rule. The module now targets `sm_70` and the driver compiles it forward
+  for whatever part loads it; nothing in the kernel needs more.
+  `DecodeAttentionConfig::sm_version` is gone. The other five CFIE
+  emitters (`kv_quant`, `sample`, `spec_sampler`, `speculative`,
+  `persistent`) shared the header convention; the entry above fixes them.
 - The CUDA context's own tests now run in CI. The CUDA lane's two filtered
   test invocations selected the caching allocator and the ptxas gate, so
   everything under `cuda::context` — the device-registry invariant and the
