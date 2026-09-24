@@ -174,25 +174,26 @@ fn smem_layout(d_model: u32, verify: bool) -> SmemLayout {
 // Builder sections, shared by both kernels
 // ---------------------------------------------------------------------------
 
-/// Values every section reads, made once in the entry block.
-struct Common {
-    tid: VarId,
-    hidden: VarId,
-    norm_w: VarId,
-    lm_head: VarId,
-    hidden_smem: VarId,
-    scores: VarId,
-    rstd_smem: VarId,
-    zero: VarId,
-    one: VarId,
-    tile_width: VarId,
-    d_model: VarId,
+/// Values every section reads, made once in the entry block. Shared with
+/// `cfie_sample_ptx`, whose fused sampler starts with the same sections.
+pub(crate) struct Common {
+    pub(crate) tid: VarId,
+    pub(crate) hidden: VarId,
+    pub(crate) norm_w: VarId,
+    pub(crate) lm_head: VarId,
+    pub(crate) hidden_smem: VarId,
+    pub(crate) scores: VarId,
+    pub(crate) rstd_smem: VarId,
+    pub(crate) zero: VarId,
+    pub(crate) one: VarId,
+    pub(crate) tile_width: VarId,
+    pub(crate) d_model: VarId,
     /// The same value as `d_model`, for the `1 / d_model` immediate.
-    d_model_value: u32,
-    d_model_wide: VarId,
-    vocab: VarId,
-    f_zero: VarId,
-    f_neg_inf: VarId,
+    pub(crate) d_model_value: u32,
+    pub(crate) d_model_wide: VarId,
+    pub(crate) vocab: VarId,
+    pub(crate) f_zero: VarId,
+    pub(crate) f_neg_inf: VarId,
 }
 
 fn shared_region(b: &mut KirBuilder, region: u32) -> VarId {
@@ -225,10 +226,16 @@ fn strided_loop(b: &mut KirBuilder, c: &Common, body: impl FnOnce(&mut KirBuilde
 /// Steps 1 and 2: the hidden row into SMEM, RMSNorm'd in place with the
 /// final-norm gamma. Leaves the builder after the closing barrier.
 fn hidden_load_and_rmsnorm(b: &mut KirBuilder, c: &Common) {
+    hidden_load(b, c);
+    rmsnorm_in_place(b, c);
+}
+
+/// Step 1: cooperative strided load of hidden `[1, d_model]` f32 into
+/// SMEM. Leaves the builder after the closing barrier.
+pub(crate) fn hidden_load(b: &mut KirBuilder, c: &Common) {
     use AddressSpace::{Global, Shared};
     use KirType::F32;
 
-    // 1. cooperative strided load: hidden [1, d_model] f32 -> SMEM
     strided_loop(b, c, |b, i| {
         let src = at(b, F32, Global, c.hidden, i);
         let h = load(b, F32, src, Global);
@@ -236,8 +243,15 @@ fn hidden_load_and_rmsnorm(b: &mut KirBuilder, c: &Common) {
         b.emit(KirOp::Store(dst, h, Shared));
     });
     b.emit(KirOp::Barrier);
+}
 
-    // 2. RMSNorm: per-thread strided partial sum of squares.
+/// Step 2: RMSNorm of the staged hidden row, in place, with the final-norm
+/// gamma. Leaves the builder after the closing barrier.
+pub(crate) fn rmsnorm_in_place(b: &mut KirBuilder, c: &Common) {
+    use AddressSpace::{Global, Shared};
+    use KirType::F32;
+
+    // Per-thread strided partial sum of squares.
     let head = b.new_block();
     let body = b.new_block();
     let done = b.new_block();
@@ -324,7 +338,7 @@ fn hidden_load_and_rmsnorm(b: &mut KirBuilder, c: &Common) {
 /// kernels' fma order: `dot = fma(w, h, dot)` for `d = 0..d_model`.
 /// Entered from the current block; the builder is left in the loop's exit
 /// block, and the returned value is the finished dot.
-fn build_row_dot(b: &mut KirBuilder, c: &Common, tok: VarId) -> VarId {
+pub(crate) fn build_row_dot(b: &mut KirBuilder, c: &Common, tok: VarId) -> VarId {
     use AddressSpace::{Global, Shared};
     use KirType::{F16, F32, U32, U64};
 
@@ -519,6 +533,20 @@ fn begin(name: &str, cfg: &SpecSamplerConfig, verify: bool) -> (KirBuilder, VarI
 /// The entry block's shared values. Call with the builder in the entry
 /// block, after every param is added.
 fn common(b: &mut KirBuilder, cfg: &SpecSamplerConfig, hidden: VarId, norm_w: VarId, lm_head: VarId) -> Common {
+    common_at(b, cfg.d_model, cfg.vocab_size, [hidden, norm_w, lm_head], R_RSTD)
+}
+
+/// [`common`] for any kernel whose shared layout starts `[hidden][scores]`
+/// (regions 0 and 1) and keeps `rstd` at region `rstd_region`. `pointers`
+/// are the `hidden`, `norm_w` and `lm_head` params, in that order.
+pub(crate) fn common_at(
+    b: &mut KirBuilder,
+    d_model: u32,
+    vocab_size: u32,
+    pointers: [VarId; 3],
+    rstd_region: u32,
+) -> Common {
+    let [hidden, norm_w, lm_head] = pointers;
     let tid = b.new_typed_var(KirType::U32);
     b.emit(KirOp::ThreadId(tid, 0));
     Common {
@@ -528,14 +556,14 @@ fn common(b: &mut KirBuilder, cfg: &SpecSamplerConfig, hidden: VarId, norm_w: Va
         lm_head,
         hidden_smem: shared_region(b, R_HIDDEN),
         scores: shared_region(b, R_SCORES),
-        rstd_smem: shared_region(b, R_RSTD),
+        rstd_smem: shared_region(b, rstd_region),
         zero: konst(b, ConstValue::U32(0)),
         one: konst(b, ConstValue::U32(1)),
         tile_width: konst(b, ConstValue::U32(TILE)),
-        d_model: konst(b, ConstValue::U32(cfg.d_model)),
-        d_model_value: cfg.d_model,
-        d_model_wide: konst(b, ConstValue::U64(cfg.d_model as u64)),
-        vocab: konst(b, ConstValue::U32(cfg.vocab_size)),
+        d_model: konst(b, ConstValue::U32(d_model)),
+        d_model_value: d_model,
+        d_model_wide: konst(b, ConstValue::U64(d_model as u64)),
+        vocab: konst(b, ConstValue::U32(vocab_size)),
         f_zero: konst(b, ConstValue::F32(0.0)),
         f_neg_inf: konst(b, ConstValue::F32(f32::NEG_INFINITY)),
     }

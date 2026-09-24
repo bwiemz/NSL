@@ -323,7 +323,6 @@ mod tests {
             vocab_size: 256,
             vocab_tile: 128,
             top_k: 8,
-            sm_version: 80,
             grammar_states: dfa.num_states,
         };
         let (sampler, _) = emit_sampler(&program, &cfg);

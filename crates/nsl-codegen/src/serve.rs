@@ -1127,7 +1127,6 @@ impl Compiler<'_> {
                     vocab_size: s.vocab_size,
                     vocab_tile: 128,
                     top_k,
-                    sm_version: gpu.sm_version,
                     grammar_states,
                 };
                 let (ptx, meta) = crate::cfie_sample_ptx::emit(&program, &sample_cfg);

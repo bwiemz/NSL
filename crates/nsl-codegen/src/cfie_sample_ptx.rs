@@ -36,8 +36,27 @@
 //! replace-min/sort/walk tie-breaks, same xorshift64*).  The kernel
 //! uses `rsqrt.approx` / `ex2.approx` where the CPU uses exact libm;
 //! exact GPU parity is verified in a later GPU cycle.
+//!
+//! ## KIR (roadmap A2 step 9)
+//!
+//! The kernel is built as [`KernelIR`] ([`build`]) and lowered by
+//! `nsl_kir`'s printer. It shares its first sections with
+//! `cfie_spec_sampler_ptx` (the hidden-row load, the in-place RMSNorm and
+//! the f16 row dot, through [`Common`]) and its xorshift64* draw with
+//! `cfie_speculative_ptx`. `tests/cfie_sample_kir_equivalence.rs` runs it
+//! against the frozen hand emitter on the cooperative-CTA interpreter and
+//! requires the same output bits, and `cpu_reference`'s token. It targets
+//! the KIR floor (`sm_70`), so [`FusedSampleKernelConfig`] has no
+//! `sm_version`.
 
+use crate::backend_ptx::lower_kir_to_ptx;
+use crate::cfie_decode_attention::{at, cmp, konst, load, op2, ptr};
 use crate::cfie_fused_sample::{FusedSampleOp, FusedSampleProgram};
+use crate::cfie_spec_sampler_ptx::Common;
+use crate::kernel_ir::{
+    AddressSpace, CmpOp, ConstValue, KernelIR, KirBuilder, KirEdge, KirOp, KirTerminator, KirType,
+    SmemLayout, SmemRegion, VarId,
+};
 use std::fmt::Write;
 
 /// Threads per CTA == vocab tile width (thread t owns row tile_base+t).
@@ -60,7 +79,6 @@ pub struct FusedSampleKernelConfig {
     pub vocab_size: u32,
     pub vocab_tile: u32,
     pub top_k: u32,
-    pub sm_version: u32,
     /// Number of grammar DFA states; 0 = no grammar hook emitted.
     pub grammar_states: u32,
 }
@@ -102,34 +120,144 @@ fn nucleus_top_p(program: &FusedSampleProgram) -> Option<f32> {
     })
 }
 
-/// Emit the min-scan over the k-entry candidate list (thread 0 only).
-/// Result: `%f_min` = min value, `%r_minpos` = its index; strict `<`
-/// with first-min-wins — the CPU reference mirrors this tie-break.
-fn emit_min_scan(w: &mut String, label: &str, k: u32, topk_val_off: u32) {
-    writeln!(w, "    ld.shared.f32 %f_min, [%r_sbase+{}];", topk_val_off).unwrap();
-    writeln!(w, "    mov.u32 %r_minpos, 0;").unwrap();
-    writeln!(w, "    mov.u32 %r_j, 1;").unwrap();
-    writeln!(w, "{}_LOOP:", label).unwrap();
-    writeln!(w, "    setp.ge.u32 %p_c, %r_j, {};", k).unwrap();
-    writeln!(w, "    @%p_c bra {}_DONE;", label).unwrap();
-    writeln!(w, "    mul.lo.u32 %r_t3, %r_j, 4;").unwrap();
-    writeln!(w, "    add.u32 %r_t3, %r_t3, %r_sbase;").unwrap();
-    writeln!(w, "    ld.shared.f32 %f_t0, [%r_t3+{}];", topk_val_off).unwrap();
-    writeln!(w, "    setp.lt.f32 %p_d, %f_t0, %f_min;").unwrap();
-    writeln!(w, "    @!%p_d bra {}_NEXT;", label).unwrap();
-    writeln!(w, "    mov.f32 %f_min, %f_t0;").unwrap();
-    writeln!(w, "    mov.u32 %r_minpos, %r_j;").unwrap();
-    writeln!(w, "{}_NEXT:", label).unwrap();
-    writeln!(w, "    add.u32 %r_j, %r_j, 1;").unwrap();
-    writeln!(w, "    bra {}_LOOP;", label).unwrap();
-    writeln!(w, "{}_DONE:", label).unwrap();
+/// Emit the min-scan over the k-entry candidate list: `(min, pos)` with
+/// strict `<`, first min wins (the CPU reference mirrors the tie-break).
+/// Entered from the current block; the builder is left in the loop's exit
+/// block, where the returned pair is the scan's result.
+fn build_min_scan(b: &mut KirBuilder, s: &Sampler) -> (VarId, VarId) {
+    use AddressSpace::Shared;
+    use KirType::{F32, U32};
+
+    let v0 = load(b, F32, s.topk_val, Shared);
+    let head = b.new_block();
+    let body = b.new_block();
+    let done = b.new_block();
+    let j = b.add_block_param(head, U32);
+    let min = b.add_block_param(head, F32);
+    let pos = b.add_block_param(head, U32);
+    b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![s.c.one, v0, s.c.zero])));
+
+    b.set_block(head);
+    let finished = cmp(b, j, s.k, CmpOp::Ge);
+    b.terminate(KirTerminator::CondBranch(finished, KirEdge::to(done), KirEdge::to(body)));
+
+    b.set_block(body);
+    let addr = at(b, F32, Shared, s.topk_val, j);
+    let v = load(b, F32, addr, Shared);
+    let lower = cmp(b, v, min, CmpOp::Lt);
+    let min_next = select(b, F32, lower, v, min);
+    let pos_next = select(b, U32, lower, j, pos);
+    let j_next = op2(b, U32, KirOp::Add, j, s.c.one);
+    b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![j_next, min_next, pos_next])));
+
+    b.set_block(done);
+    (min, pos)
 }
 
-/// Emit the fused decode-sample kernel for `program` under `cfg`.
-pub fn emit(
-    program: &FusedSampleProgram,
-    cfg: &FusedSampleKernelConfig,
-) -> (String, FusedSampleMeta) {
+fn select(b: &mut KirBuilder, ty: KirType, cond: VarId, yes: VarId, no: VarId) -> VarId {
+    let dst = b.new_typed_var(ty);
+    b.emit(KirOp::Select(dst, cond, yes, no));
+    dst
+}
+
+/// `for (j = from; j < k; j++) body(j)`, entered from the current block;
+/// the builder is left in the loop's exit block.
+fn k_loop(b: &mut KirBuilder, s: &Sampler, from: VarId, body: impl FnOnce(&mut KirBuilder, VarId)) {
+    let head = b.new_block();
+    let body_block = b.new_block();
+    let done = b.new_block();
+    let j = b.add_block_param(head, KirType::U32);
+    b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![from])));
+
+    b.set_block(head);
+    let finished = cmp(b, j, s.k, CmpOp::Ge);
+    b.terminate(KirTerminator::CondBranch(finished, KirEdge::to(done), KirEdge::to(body_block)));
+
+    b.set_block(body_block);
+    body(b, j);
+    let next = op2(b, KirType::U32, KirOp::Add, j, s.c.one);
+    b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![next])));
+
+    b.set_block(done);
+}
+
+/// `sum over j < k of topk_val[j]`, in index order, from `0.0`. The loop
+/// carries the sum; the builder is left in the loop's exit block.
+fn build_k_sum(b: &mut KirBuilder, s: &Sampler, rewrite: Option<VarId>) -> VarId {
+    use AddressSpace::Shared;
+    use KirType::{F32, U32};
+
+    let head = b.new_block();
+    let body = b.new_block();
+    let done = b.new_block();
+    let j = b.add_block_param(head, U32);
+    let sum = b.add_block_param(head, F32);
+    b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![s.c.zero, s.c.f_zero])));
+
+    b.set_block(head);
+    let finished = cmp(b, j, s.k, CmpOp::Ge);
+    b.terminate(KirTerminator::CondBranch(finished, KirEdge::to(done), KirEdge::to(body)));
+
+    b.set_block(body);
+    let addr = at(b, F32, Shared, s.topk_val, j);
+    let v = load(b, F32, addr, Shared);
+    // With `rewrite = Some(max)`, the entry becomes exp(v - max) in place
+    // and that is what is summed: the softmax pass.
+    let term = match rewrite {
+        Some(max) => {
+            let shifted = op2(b, F32, KirOp::Sub, v, max);
+            let p = b.new_typed_var(F32);
+            b.emit(KirOp::Exp(p, shifted));
+            b.emit(KirOp::Store(addr, p, Shared));
+            p
+        }
+        None => v,
+    };
+    let sum_next = op2(b, F32, KirOp::Add, sum, term);
+    let j_next = op2(b, U32, KirOp::Add, j, s.c.one);
+    b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![j_next, sum_next])));
+
+    b.set_block(done);
+    sum
+}
+
+/// The values the sampler's own sections read, beside the shared
+/// [`Common`] ones.
+struct Sampler {
+    c: Common,
+    topk_val: VarId,
+    topk_idx: VarId,
+    /// u32 `top_k`.
+    k: VarId,
+}
+
+const R_TOPK_VAL: u32 = 2;
+const R_TOPK_IDX: u32 = 3;
+const R_RSTD: u32 = 4;
+
+/// `[hidden: d_model][scores: TILE][topk_val: k][topk_idx: k u32][rstd: 1]`.
+/// Every region is 4-aligned and a multiple of 4 long, so the offsets are
+/// the hand kernel's packed ones.
+fn smem_layout(d_model: u32, k: u32) -> SmemLayout {
+    let region = |name: &str, elems: u32, elem: KirType| SmemRegion {
+        name: name.to_string(),
+        bytes: elems * 4,
+        align: 4,
+        elem,
+    };
+    SmemLayout {
+        regions: vec![
+            region("hidden", d_model, KirType::F32),
+            region("scores", TILE, KirType::F32),
+            region("topk_val", k, KirType::F32),
+            region("topk_idx", k, KirType::U32),
+            region("rstd", 1, KirType::F32),
+        ],
+        dynamic: false,
+    }
+}
+
+fn validate(program: &FusedSampleProgram, cfg: &FusedSampleKernelConfig) {
     assert_eq!(
         cfg.vocab_tile, TILE,
         "vocab_tile must be {} so thread t owns row tile_base+t",
@@ -160,487 +288,499 @@ pub fn emit(
         program.params.top_k, cfg.top_k,
         "program params top_k mismatch with cfg"
     );
+}
 
+/// Build the fused decode-sample kernel for `program` under `cfg` as KIR.
+///
+/// The sections, in order (each one's barriers are the hand kernel's):
+///
+/// ```text
+/// hidden_load          hidden row -> SMEM                      (shared with
+/// rmsnorm_in_place     only with the RmsNorm op                 cfie_spec_sampler_ptx)
+/// candidate init       topk_val[t] = -inf, topk_idx[t] = 0 for t < k; bar
+/// tile loop            thread t: s = dot(h, W[tile+t]) * (1/T), or -inf past
+///                      the vocab; the grammar hook turns s to -inf where the
+///                      state's mask bit is clear; scores[t] = s; bar;
+///                      thread 0: replace-min merge of the tile's scores into
+///                      the candidate list (strict >, min re-scanned after
+///                      each replacement); bar
+/// thread 0 selection   greedy: argmax (strict >, first wins)
+///                      sampling: max; softmax in place; [nucleus: insertion
+///                      sort desc, cumulative cutoff at top_p, tail zeroed];
+///                      kept mass; xorshift64* draw (cfie_speculative_ptx's
+///                      build_prng_draw); multinomial CDF walk
+/// store                out_token = sel, the kernel's only global store
+/// ```
+pub fn build(program: &FusedSampleProgram, cfg: &FusedSampleKernelConfig) -> KernelIR {
+    use crate::cfie_spec_sampler_ptx::{build_row_dot, common_at, hidden_load, rmsnorm_in_place};
+    use AddressSpace::{Global, Shared};
+    use KirType::{F16, F32, I8, U32, U64};
+
+    validate(program, cfg);
     let has_rms = has_op(program, |op| matches!(op, FusedSampleOp::RmsNorm));
     let greedy = has_op(program, |op| matches!(op, FusedSampleOp::Argmax));
     let top_p = nucleus_top_p(program);
     let inv_temp = temperature_recip(program);
     let grammar_hook = cfg.grammar_states > 0;
 
-    let dm = cfg.d_model;
-    let vocab = cfg.vocab_size;
-    let k = cfg.top_k;
-    // f16 LM-head row stride: W is [vocab, d_model] ROW-major, one
-    // contiguous d_model-long f16 row per vocab entry.
-    let w_row_bytes = dm as u64 * 2;
-    // Grammar bitmask row: one bit per token, rows indexed by DFA state.
-    let mask_row_bytes = vocab.div_ceil(8);
+    let mut b = KirBuilder::new(KERNEL_NAME);
+    let hidden = b.add_param("hidden_ptr", ptr(F32, Global), Global);
+    // Read only when the program has the RmsNorm op.
+    let norm_w = b.add_param("norm_w_ptr", ptr(F32, Global), Global);
+    let lm_head = b.add_param("lm_head_ptr", ptr(F16, Global), Global);
+    let out_token = b.add_param("out_token_ptr", ptr(U32, Global), Global);
+    let rng_seed = b.add_param("rng_seed", U64, Global);
+    // Null when no grammar is live; read only through the hook.
+    let grammar_mask = b.add_param("grammar_mask_ptr", ptr(I8, Global), Global);
+    let grammar_state = b.add_param("grammar_state", U32, Global);
+    b.set_smem_layout(smem_layout(cfg.d_model, cfg.top_k));
+    b.set_workgroup_size([BLOCK_DIM, 1, 1]);
 
-    // SMEM layout (f32 unless noted):
-    //   [hidden: d_model][scores: TILE][topk_val: k][topk_idx: k u32][rstd: 1]
-    // The scores region doubles as the RMSNorm reduction scratch.
-    let scores_off = dm * 4;
-    let topk_val_off = scores_off + TILE * 4;
-    let topk_idx_off = topk_val_off + k * 4;
-    let rms_off = topk_idx_off + k * 4;
-    let smem_bytes = rms_off + 4;
+    let entry = b.new_block();
+    b.set_block(entry);
+    let c = common_at(&mut b, cfg.d_model, cfg.vocab_size, [hidden, norm_w, lm_head], R_RSTD);
+    let region = |b: &mut KirBuilder, r: u32, elem: KirType| {
+        let dst = b.new_typed_var(ptr(elem, Shared));
+        b.emit(KirOp::SharedRegion { dst, region: r });
+        dst
+    };
+    let topk_val = region(&mut b, R_TOPK_VAL, F32);
+    let topk_idx = region(&mut b, R_TOPK_IDX, U32);
+    let k = konst(&mut b, ConstValue::U32(cfg.top_k));
+    let s = Sampler { c, topk_val, topk_idx, k };
+    let c = &s.c;
 
-    let neg_inf = f32_imm(f32::NEG_INFINITY);
-    let zero = f32_imm(0.0);
-    let log2e = f32_imm(std::f32::consts::LOG2_E);
-    let inv_temp_imm = f32_imm(inv_temp);
-    let inv_dm = f32_imm(1.0 / dm as f32);
-    let eps = f32_imm(RMS_EPS);
-    // r in [0,1): top 24 bits of the xorshift64* output over 2^24.
-    let two_neg24 = f32_imm(1.0 / 16_777_216.0);
+    hidden_load(&mut b, c);
+    if has_rms {
+        rmsnorm_in_place(&mut b, c);
+    }
 
-    let mut p = String::new();
-    let w = &mut p;
+    // Candidate list init: threads t < k.
+    let init = b.new_block();
+    let init_done = b.new_block();
+    let inits = cmp(&mut b, c.tid, s.k, CmpOp::Lt);
+    b.terminate(KirTerminator::CondBranch(inits, KirEdge::to(init), KirEdge::to(init_done)));
+    b.set_block(init);
+    let val_slot = at(&mut b, F32, Shared, s.topk_val, c.tid);
+    b.emit(KirOp::Store(val_slot, c.f_neg_inf, Shared));
+    let idx_slot = at(&mut b, U32, Shared, s.topk_idx, c.tid);
+    b.emit(KirOp::Store(idx_slot, c.zero, Shared));
+    b.terminate(KirTerminator::Branch(KirEdge::to(init_done)));
+    b.set_block(init_done);
+    b.emit(KirOp::Barrier);
 
+    // The vocab tile loop.
+    let tile_head = b.new_block();
+    let tile_body = b.new_block();
+    let score = b.new_block();
+    let score_store = b.new_block();
+    let tiles_done = b.new_block();
+    let tile = b.add_block_param(tile_head, U32);
+    let s_final = b.add_block_param(score_store, F32);
+    b.terminate(KirTerminator::Branch(KirEdge::with(tile_head, vec![c.zero])));
+
+    b.set_block(tile_head);
+    let all_tiles = cmp(&mut b, tile, c.vocab, CmpOp::Ge);
+    b.terminate(KirTerminator::CondBranch(all_tiles, KirEdge::to(tiles_done), KirEdge::to(tile_body)));
+
+    // Tail-tile guard: lanes past the vocab keep -inf.
+    b.set_block(tile_body);
+    let tok = op2(&mut b, U32, KirOp::Add, tile, c.tid);
+    let in_vocab = cmp(&mut b, tok, c.vocab, CmpOp::Lt);
+    b.terminate(KirTerminator::CondBranch(
+        in_vocab,
+        KirEdge::to(score),
+        KirEdge::with(score_store, vec![c.f_neg_inf]),
+    ));
+
+    b.set_block(score);
+    let dot = build_row_dot(&mut b, c, tok);
+    let inv_t = konst(&mut b, ConstValue::F32(inv_temp));
+    let scaled = op2(&mut b, F32, KirOp::Mul, dot, inv_t);
+    if grammar_hook {
+        // Bit (state, token) of the mask: clear -> -inf. A null mask
+        // pointer means no grammar is live, and nothing is read.
+        let hook = b.new_block();
+        let mask_addr = b.new_typed_var(U64);
+        b.emit(KirOp::Cast(mask_addr, grammar_mask, U64));
+        let null = konst(&mut b, ConstValue::U64(0));
+        let no_mask = cmp(&mut b, mask_addr, null, CmpOp::Eq);
+        b.terminate(KirTerminator::CondBranch(
+            no_mask,
+            KirEdge::with(score_store, vec![scaled]),
+            KirEdge::to(hook),
+        ));
+
+        b.set_block(hook);
+        let row_bytes = konst(&mut b, ConstValue::U32(cfg.vocab_size.div_ceil(8)));
+        let row = op2(&mut b, U32, KirOp::Mul, grammar_state, row_bytes);
+        let three = konst(&mut b, ConstValue::U32(3));
+        let byte_in_row = op2(&mut b, U32, KirOp::Shr, tok, three);
+        let byte_index = op2(&mut b, U32, KirOp::Add, row, byte_in_row);
+        let byte_addr = at(&mut b, I8, Global, grammar_mask, byte_index);
+        let byte = load(&mut b, I8, byte_addr, Global);
+        // Sign extension leaves the byte's own 8 bits as they were, and
+        // only those are tested.
+        let byte32 = b.new_typed_var(U32);
+        b.emit(KirOp::Cast(byte32, byte, U32));
+        let seven = konst(&mut b, ConstValue::U32(7));
+        let bit_index = op2(&mut b, U32, KirOp::And, tok, seven);
+        let shifted = op2(&mut b, U32, KirOp::Shr, byte32, bit_index);
+        let bit = op2(&mut b, U32, KirOp::And, shifted, c.one);
+        let allowed = cmp(&mut b, bit, c.zero, CmpOp::Ne);
+        let gated = select(&mut b, F32, allowed, scaled, c.f_neg_inf);
+        b.terminate(KirTerminator::Branch(KirEdge::with(score_store, vec![gated])));
+    } else {
+        b.terminate(KirTerminator::Branch(KirEdge::with(score_store, vec![scaled])));
+    }
+
+    b.set_block(score_store);
+    let score_slot = at(&mut b, F32, Shared, c.scores, c.tid);
+    b.emit(KirOp::Store(score_slot, s_final, Shared));
+    b.emit(KirOp::Barrier);
+
+    // Thread 0: replace-min merge of the tile's `cnt` scores.
+    let merge_start = b.new_block();
+    let merge_done = b.new_block();
+    let not_zero = cmp(&mut b, c.tid, c.zero, CmpOp::Ne);
+    b.terminate(KirTerminator::CondBranch(not_zero, KirEdge::to(merge_done), KirEdge::to(merge_start)));
+
+    b.set_block(merge_start);
+    let remaining = op2(&mut b, U32, KirOp::Sub, c.vocab, tile);
+    let cnt = op2(&mut b, U32, KirOp::Min, remaining, c.tile_width);
+    let (min0, pos0) = build_min_scan(&mut b, &s);
+    let merge_head = b.new_block();
+    let merge_body = b.new_block();
+    let replace = b.new_block();
+    let merge_next = b.new_block();
+    let i = b.add_block_param(merge_head, U32);
+    let min = b.add_block_param(merge_head, F32);
+    let pos = b.add_block_param(merge_head, U32);
+    let min_n = b.add_block_param(merge_next, F32);
+    let pos_n = b.add_block_param(merge_next, U32);
+    b.terminate(KirTerminator::Branch(KirEdge::with(merge_head, vec![c.zero, min0, pos0])));
+
+    b.set_block(merge_head);
+    let merged = cmp(&mut b, i, cnt, CmpOp::Ge);
+    b.terminate(KirTerminator::CondBranch(merged, KirEdge::to(merge_done), KirEdge::to(merge_body)));
+
+    b.set_block(merge_body);
+    let cand_addr = at(&mut b, F32, Shared, c.scores, i);
+    let cand = load(&mut b, F32, cand_addr, Shared);
+    let beats = cmp(&mut b, cand, min, CmpOp::Gt);
+    b.terminate(KirTerminator::CondBranch(
+        beats,
+        KirEdge::to(replace),
+        KirEdge::with(merge_next, vec![min, pos]),
+    ));
+
+    b.set_block(replace);
+    let val_at = at(&mut b, F32, Shared, s.topk_val, pos);
+    b.emit(KirOp::Store(val_at, cand, Shared));
+    let token = op2(&mut b, U32, KirOp::Add, tile, i);
+    let idx_at = at(&mut b, U32, Shared, s.topk_idx, pos);
+    b.emit(KirOp::Store(idx_at, token, Shared));
+    let (min1, pos1) = build_min_scan(&mut b, &s);
+    b.terminate(KirTerminator::Branch(KirEdge::with(merge_next, vec![min1, pos1])));
+
+    b.set_block(merge_next);
+    let i_next = op2(&mut b, U32, KirOp::Add, i, c.one);
+    b.terminate(KirTerminator::Branch(KirEdge::with(merge_head, vec![i_next, min_n, pos_n])));
+
+    // The scores region is rewritten next tile; sync before looping back.
+    b.set_block(merge_done);
+    b.emit(KirOp::Barrier);
+    let tile_next = op2(&mut b, U32, KirOp::Add, tile, c.tile_width);
+    b.terminate(KirTerminator::Branch(KirEdge::with(tile_head, vec![tile_next])));
+
+    // Selection is serial on thread 0; the others exit.
+    b.set_block(tiles_done);
+    let select_blk = b.new_block();
+    let store = b.new_block();
+    let exit = b.new_block();
+    let sel_final = b.add_block_param(store, U32);
+    let not_zero = cmp(&mut b, c.tid, c.zero, CmpOp::Ne);
+    b.terminate(KirTerminator::CondBranch(not_zero, KirEdge::to(exit), KirEdge::to(select_blk)));
+    b.set_block(select_blk);
+
+    if greedy {
+        // Argmax over the candidate list: strict >, first wins.
+        let v0 = load(&mut b, F32, s.topk_val, Shared);
+        let i0 = load(&mut b, U32, s.topk_idx, Shared);
+        let head = b.new_block();
+        let body = b.new_block();
+        let j = b.add_block_param(head, U32);
+        let max = b.add_block_param(head, F32);
+        let sel = b.add_block_param(head, U32);
+        b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![c.one, v0, i0])));
+
+        b.set_block(head);
+        let finished = cmp(&mut b, j, s.k, CmpOp::Ge);
+        b.terminate(KirTerminator::CondBranch(
+            finished,
+            KirEdge::with(store, vec![sel]),
+            KirEdge::to(body),
+        ));
+
+        b.set_block(body);
+        let v_addr = at(&mut b, F32, Shared, s.topk_val, j);
+        let v = load(&mut b, F32, v_addr, Shared);
+        let idx_addr = at(&mut b, U32, Shared, s.topk_idx, j);
+        let idx = load(&mut b, U32, idx_addr, Shared);
+        let higher = cmp(&mut b, v, max, CmpOp::Gt);
+        let max_next = select(&mut b, F32, higher, v, max);
+        let sel_next = select(&mut b, U32, higher, idx, sel);
+        let j_next = op2(&mut b, U32, KirOp::Add, j, c.one);
+        b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![j_next, max_next, sel_next])));
+    } else {
+        // Stable-softmax max over the k candidates.
+        let v0 = load(&mut b, F32, s.topk_val, Shared);
+        let head = b.new_block();
+        let body = b.new_block();
+        let done = b.new_block();
+        let j = b.add_block_param(head, U32);
+        let max = b.add_block_param(head, F32);
+        b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![c.one, v0])));
+        b.set_block(head);
+        let finished = cmp(&mut b, j, s.k, CmpOp::Ge);
+        b.terminate(KirTerminator::CondBranch(finished, KirEdge::to(done), KirEdge::to(body)));
+        b.set_block(body);
+        let v_addr = at(&mut b, F32, Shared, s.topk_val, j);
+        let v = load(&mut b, F32, v_addr, Shared);
+        let higher = cmp(&mut b, v, max, CmpOp::Gt);
+        let max_next = select(&mut b, F32, higher, v, max);
+        let j_next = op2(&mut b, U32, KirOp::Add, j, c.one);
+        b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![j_next, max_next])));
+        b.set_block(done);
+
+        // Softmax over k only (not vocab): p = exp(v - max), in place.
+        let sum = build_k_sum(&mut b, &s, Some(max));
+
+        if let Some(tp) = top_p {
+            build_nucleus(&mut b, &s, sum, tp);
+        }
+
+        // Kept probability mass (== sum when no nucleus filter).
+        let kept = build_k_sum(&mut b, &s, None);
+
+        // xorshift64* over rng_seed; a zero seed would be a fixed point, so
+        // it is replaced by the golden gamma.
+        let null_seed = konst(&mut b, ConstValue::U64(0));
+        let seed_zero = cmp(&mut b, rng_seed, null_seed, CmpOp::Eq);
+        let golden = konst(&mut b, ConstValue::U64(0x9E37_79B9_7F4A_7C15));
+        let x = select(&mut b, U64, seed_zero, golden, rng_seed);
+        let (_state, r) = crate::cfie_speculative_ptx::build_prng_draw(&mut b, x);
+        let target = op2(&mut b, F32, KirOp::Mul, r, kept);
+
+        // Multinomial: walk the cumulative distribution. Zero-probability
+        // entries are never selected; the last live entry is the fp-drift
+        // fallback.
+        let i0 = load(&mut b, U32, s.topk_idx, Shared);
+        let head = b.new_block();
+        let body = b.new_block();
+        let live = b.new_block();
+        let next = b.new_block();
+        let j = b.add_block_param(head, U32);
+        let cum = b.add_block_param(head, F32);
+        let sel = b.add_block_param(head, U32);
+        let sel_n = b.add_block_param(next, U32);
+        b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![c.zero, c.f_zero, i0])));
+
+        b.set_block(head);
+        let finished = cmp(&mut b, j, s.k, CmpOp::Ge);
+        b.terminate(KirTerminator::CondBranch(
+            finished,
+            KirEdge::with(store, vec![sel]),
+            KirEdge::to(body),
+        ));
+
+        b.set_block(body);
+        let p_addr = at(&mut b, F32, Shared, s.topk_val, j);
+        let p = load(&mut b, F32, p_addr, Shared);
+        let cum_next = op2(&mut b, F32, KirOp::Add, cum, p);
+        let positive = cmp(&mut b, p, c.f_zero, CmpOp::Gt);
+        b.terminate(KirTerminator::CondBranch(
+            positive,
+            KirEdge::to(live),
+            KirEdge::with(next, vec![sel]),
+        ));
+
+        b.set_block(live);
+        let idx_addr = at(&mut b, U32, Shared, s.topk_idx, j);
+        let idx = load(&mut b, U32, idx_addr, Shared);
+        let reached = cmp(&mut b, cum_next, target, CmpOp::Ge);
+        b.terminate(KirTerminator::CondBranch(
+            reached,
+            KirEdge::with(store, vec![idx]),
+            KirEdge::with(next, vec![idx]),
+        ));
+
+        b.set_block(next);
+        let j_next = op2(&mut b, U32, KirOp::Add, j, c.one);
+        b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![j_next, cum_next, sel_n])));
+    }
+
+    // The kernel's only global store.
+    b.set_block(store);
+    b.emit(KirOp::Store(out_token, sel_final, Global));
+    b.terminate(KirTerminator::Branch(KirEdge::to(exit)));
+
+    b.set_block(exit);
+    b.terminate(KirTerminator::Return);
+    b.finalize()
+}
+
+/// The nucleus filter over the softmaxed candidates: insertion sort
+/// descending (stable, strict `<` shift), then the cumulative share
+/// `p / sum` until it exceeds `top_p` (the crossing entry is kept) and the
+/// tail zeroed. Leaves the builder in the filter's exit block.
+fn build_nucleus(b: &mut KirBuilder, s: &Sampler, sum: VarId, top_p: f32) {
+    use AddressSpace::Shared;
+    use KirType::{F32, U32};
+    let c = &s.c;
+
+    // Insertion sort, j = 1..k.
+    k_loop(b, s, c.one, |b, j| {
+        let key_addr = at(b, F32, Shared, s.topk_val, j);
+        let key = load(b, F32, key_addr, Shared);
+        let kidx_addr = at(b, U32, Shared, s.topk_idx, j);
+        let kidx = load(b, U32, kidx_addr, Shared);
+
+        let inner = b.new_block();
+        let compare = b.new_block();
+        let shift = b.new_block();
+        let place = b.new_block();
+        let i = b.add_block_param(inner, U32);
+        let at_i = b.add_block_param(place, U32);
+        b.terminate(KirTerminator::Branch(KirEdge::with(inner, vec![j])));
+
+        b.set_block(inner);
+        let at_front = cmp(b, i, c.zero, CmpOp::Eq);
+        b.terminate(KirTerminator::CondBranch(
+            at_front,
+            KirEdge::with(place, vec![i]),
+            KirEdge::to(compare),
+        ));
+
+        b.set_block(compare);
+        let prev_i = op2(b, U32, KirOp::Sub, i, c.one);
+        let prev_addr = at(b, F32, Shared, s.topk_val, prev_i);
+        let prev = load(b, F32, prev_addr, Shared);
+        let smaller = cmp(b, prev, key, CmpOp::Lt);
+        b.terminate(KirTerminator::CondBranch(
+            smaller,
+            KirEdge::to(shift),
+            KirEdge::with(place, vec![i]),
+        ));
+
+        b.set_block(shift);
+        let prev_idx_addr = at(b, U32, Shared, s.topk_idx, prev_i);
+        let prev_idx = load(b, U32, prev_idx_addr, Shared);
+        let dst_val = at(b, F32, Shared, s.topk_val, i);
+        b.emit(KirOp::Store(dst_val, prev, Shared));
+        let dst_idx = at(b, U32, Shared, s.topk_idx, i);
+        b.emit(KirOp::Store(dst_idx, prev_idx, Shared));
+        b.terminate(KirTerminator::Branch(KirEdge::with(inner, vec![prev_i])));
+
+        b.set_block(place);
+        let put_val = at(b, F32, Shared, s.topk_val, at_i);
+        b.emit(KirOp::Store(put_val, key, Shared));
+        let put_idx = at(b, U32, Shared, s.topk_idx, at_i);
+        b.emit(KirOp::Store(put_idx, kidx, Shared));
+    });
+
+    // Cumulative share until > top_p; the tail from there is zeroed.
+    let head = b.new_block();
+    let body = b.new_block();
+    let zero_from = b.new_block();
+    let done = b.new_block();
+    let j = b.add_block_param(head, U32);
+    let cum = b.add_block_param(head, F32);
+    let z = b.add_block_param(zero_from, U32);
+    b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![c.zero, c.f_zero])));
+
+    b.set_block(head);
+    let finished = cmp(b, j, s.k, CmpOp::Ge);
+    b.terminate(KirTerminator::CondBranch(finished, KirEdge::to(done), KirEdge::to(body)));
+
+    b.set_block(body);
+    let p_addr = at(b, F32, Shared, s.topk_val, j);
+    let p = load(b, F32, p_addr, Shared);
+    let share = op2(b, F32, KirOp::Div, p, sum);
+    let cum_next = op2(b, F32, KirOp::Add, cum, share);
+    let j_next = op2(b, U32, KirOp::Add, j, c.one);
+    let top_p = konst(b, ConstValue::F32(top_p));
+    let over = cmp(b, cum_next, top_p, CmpOp::Gt);
+    b.terminate(KirTerminator::CondBranch(
+        over,
+        KirEdge::with(zero_from, vec![j_next]),
+        KirEdge::with(head, vec![j_next, cum_next]),
+    ));
+
+    b.set_block(zero_from);
+    k_loop(b, s, z, |b, j| {
+        let addr = at(b, F32, Shared, s.topk_val, j);
+        b.emit(KirOp::Store(addr, c.f_zero, Shared));
+    });
+    b.terminate(KirTerminator::Branch(KirEdge::to(done)));
+
+    b.set_block(done);
+}
+
+/// The `//` header the hand kernel carried, line for line.
+fn header_comment(program: &FusedSampleProgram, cfg: &FusedSampleKernelConfig) -> String {
+    let has_rms = has_op(program, |op| matches!(op, FusedSampleOp::RmsNorm));
+    let top_p = nucleus_top_p(program);
+    let inv_temp = temperature_recip(program);
+    let mut w = String::new();
     writeln!(w, "//").unwrap();
     writeln!(w, "// {} - CFIE fused decode-sample (paper Feature 2).", KERNEL_NAME).unwrap();
-    writeln!(
-        w,
-        "// One CTA, {} threads; logits stay in SMEM/registers, only the",
-        BLOCK_DIM
-    )
-    .unwrap();
+    writeln!(w, "// One CTA, {} threads; logits stay in SMEM/registers, only the", BLOCK_DIM).unwrap();
     writeln!(w, "// sampled token id (4 bytes) is written to HBM.").unwrap();
     writeln!(w, "// LM-head layout: f16 [vocab, d_model], ROW-major per vocab row.").unwrap();
     writeln!(w, "// Baked constants:").unwrap();
-    writeln!(w, "//   d_model          = {}", dm).unwrap();
-    writeln!(w, "//   vocab_size       = {}", vocab).unwrap();
+    writeln!(w, "//   d_model          = {}", cfg.d_model).unwrap();
+    writeln!(w, "//   vocab_size       = {}", cfg.vocab_size).unwrap();
     writeln!(w, "//   vocab_tile       = {}", TILE).unwrap();
-    writeln!(w, "//   top_k            = {}", k).unwrap();
-    writeln!(w, "//   temperature_recip= {} ({})", inv_temp, inv_temp_imm).unwrap();
+    writeln!(w, "//   top_k            = {}", cfg.top_k).unwrap();
+    writeln!(w, "//   temperature_recip= {} ({})", inv_temp, f32_imm(inv_temp)).unwrap();
     if let Some(tp) = top_p {
         writeln!(w, "//   top_p            = {} ({})", tp, f32_imm(tp)).unwrap();
     }
     if has_rms {
-        writeln!(w, "//   rms_eps          = {} ({})", RMS_EPS, eps).unwrap();
+        writeln!(w, "//   rms_eps          = {} ({})", RMS_EPS, f32_imm(RMS_EPS)).unwrap();
     }
-    if grammar_hook {
+    if cfg.grammar_states > 0 {
         writeln!(
             w,
             "//   grammar: {} states x {} mask bytes/row (1 bit/token)",
-            cfg.grammar_states, mask_row_bytes
+            cfg.grammar_states,
+            cfg.vocab_size.div_ceil(8)
         )
         .unwrap();
     }
-    writeln!(
-        w,
-        "// PRNG: xorshift64* over rng_seed - deterministic given seed (M46)."
-    )
-    .unwrap();
+    writeln!(w, "// PRNG: xorshift64* over rng_seed - deterministic given seed (M46).").unwrap();
     writeln!(w, "//").unwrap();
-    writeln!(w, ".version {}", crate::gpu_specs::ptx_isa_for_sm(cfg.sm_version)).unwrap();
-    writeln!(w, ".target sm_{}", cfg.sm_version).unwrap();
-    writeln!(w, ".address_size 64").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, ".shared .align 4 .b8 cfie_sample_smem[{}];", smem_bytes).unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, ".visible .entry {}(", KERNEL_NAME).unwrap();
-    writeln!(w, "    .param .u64 hidden_ptr,").unwrap();
-    writeln!(w, "    .param .u64 norm_w_ptr,").unwrap();
-    writeln!(w, "    .param .u64 lm_head_ptr,").unwrap();
-    writeln!(w, "    .param .u64 out_token_ptr,").unwrap();
-    writeln!(w, "    .param .u64 rng_seed,").unwrap();
-    writeln!(w, "    .param .u64 grammar_mask_ptr,").unwrap();
-    writeln!(w, "    .param .u32 grammar_state").unwrap();
-    writeln!(w, ")").unwrap();
-    writeln!(w, "{{").unwrap();
-    writeln!(w, "    .reg .pred %p_a, %p_b, %p_c, %p_d, %p_t0;").unwrap();
-    writeln!(w, "    .reg .b16 %h_w;").unwrap();
-    writeln!(
-        w,
-        "    .reg .f32 %f_h, %f_w, %f_dot, %f_s, %f_ss, %f_rstd, %f_g, %f_min, %f_max, %f_p, %f_sum, %f_cum, %f_key, %f_tgt, %f_ks, %f_r, %f_t0, %f_t1;"
-    )
-    .unwrap();
-    writeln!(
-        w,
-        "    .reg .u32 %r_tid, %r_sbase, %r_i, %r_j, %r_d, %r_tile, %r_tok, %r_cnt, %r_minpos, %r_sel, %r_gstate, %r_kidx, %r_t0, %r_t1, %r_t2, %r_t3;"
-    )
-    .unwrap();
-    writeln!(
-        w,
-        "    .reg .u64 %rd_hidden, %rd_norm, %rd_w, %rd_out, %rd_seed, %rd_mask, %rd_a, %rd_x, %rd_t0, %rd_t1;"
-    )
-    .unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    ld.param.u64 %rd_hidden, [hidden_ptr];").unwrap();
-    writeln!(w, "    // ignored when the program lacks the RmsNorm op").unwrap();
-    writeln!(w, "    ld.param.u64 %rd_norm, [norm_w_ptr];").unwrap();
-    writeln!(w, "    ld.param.u64 %rd_w, [lm_head_ptr];").unwrap();
-    writeln!(w, "    ld.param.u64 %rd_out, [out_token_ptr];").unwrap();
-    writeln!(w, "    ld.param.u64 %rd_seed, [rng_seed];").unwrap();
-    writeln!(w, "    // 0 when no grammar; Phase B wires the live mask").unwrap();
-    writeln!(w, "    ld.param.u64 %rd_mask, [grammar_mask_ptr];").unwrap();
-    writeln!(w, "    ld.param.u32 %r_gstate, [grammar_state];").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    mov.u32 %r_tid, %tid.x;").unwrap();
-    writeln!(w, "    mov.u32 %r_sbase, cfie_sample_smem;").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    // 1. cooperative strided load: hidden [1, d_model] f32 -> SMEM").unwrap();
-    writeln!(w, "    mov.u32 %r_i, %r_tid;").unwrap();
-    writeln!(w, "HLOAD_LOOP:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p_a, %r_i, {};", dm).unwrap();
-    writeln!(w, "    @%p_a bra HLOAD_DONE;").unwrap();
-    writeln!(w, "    mul.lo.u32 %r_t0, %r_i, 4;").unwrap();
-    writeln!(w, "    cvt.u64.u32 %rd_t0, %r_t0;").unwrap();
-    writeln!(w, "    add.u64 %rd_a, %rd_hidden, %rd_t0;").unwrap();
-    writeln!(w, "    ld.global.f32 %f_h, [%rd_a];").unwrap();
-    writeln!(w, "    add.u32 %r_t0, %r_t0, %r_sbase;").unwrap();
-    writeln!(w, "    st.shared.f32 [%r_t0], %f_h;").unwrap();
-    writeln!(w, "    add.u32 %r_i, %r_i, {};", BLOCK_DIM).unwrap();
-    writeln!(w, "    bra HLOAD_LOOP;").unwrap();
-    writeln!(w, "HLOAD_DONE:").unwrap();
-    writeln!(w, "    bar.sync 0;").unwrap();
-    writeln!(w).unwrap();
+    w
+}
 
-    if has_rms {
-        writeln!(w, "    // 2. RMSNorm in SMEM: per-thread strided partial sum of squares").unwrap();
-        writeln!(w, "    mov.f32 %f_ss, {};", zero).unwrap();
-        writeln!(w, "    mov.u32 %r_i, %r_tid;").unwrap();
-        writeln!(w, "SS_LOOP:").unwrap();
-        writeln!(w, "    setp.ge.u32 %p_a, %r_i, {};", dm).unwrap();
-        writeln!(w, "    @%p_a bra SS_DONE;").unwrap();
-        writeln!(w, "    mul.lo.u32 %r_t0, %r_i, 4;").unwrap();
-        writeln!(w, "    add.u32 %r_t0, %r_t0, %r_sbase;").unwrap();
-        writeln!(w, "    ld.shared.f32 %f_h, [%r_t0];").unwrap();
-        writeln!(w, "    fma.rn.f32 %f_ss, %f_h, %f_h, %f_ss;").unwrap();
-        writeln!(w, "    add.u32 %r_i, %r_i, {};", BLOCK_DIM).unwrap();
-        writeln!(w, "    bra SS_LOOP;").unwrap();
-        writeln!(w, "SS_DONE:").unwrap();
-        writeln!(w, "    // scores region doubles as reduction scratch pre-tile-loop").unwrap();
-        writeln!(w, "    mul.lo.u32 %r_t0, %r_tid, 4;").unwrap();
-        writeln!(w, "    add.u32 %r_t0, %r_t0, %r_sbase;").unwrap();
-        writeln!(w, "    st.shared.f32 [%r_t0+{}], %f_ss;", scores_off).unwrap();
-        writeln!(w, "    bar.sync 0;").unwrap();
-        for off in [64u32, 32, 16, 8, 4, 2, 1] {
-            writeln!(w, "    setp.ge.u32 %p_a, %r_tid, {};", off).unwrap();
-            writeln!(w, "    @%p_a bra RED_{};", off).unwrap();
-            writeln!(w, "    mul.lo.u32 %r_t0, %r_tid, 4;").unwrap();
-            writeln!(w, "    add.u32 %r_t0, %r_t0, %r_sbase;").unwrap();
-            writeln!(w, "    ld.shared.f32 %f_t0, [%r_t0+{}];", scores_off).unwrap();
-            writeln!(w, "    ld.shared.f32 %f_t1, [%r_t0+{}];", scores_off + off * 4).unwrap();
-            writeln!(w, "    add.f32 %f_t0, %f_t0, %f_t1;").unwrap();
-            writeln!(w, "    st.shared.f32 [%r_t0+{}], %f_t0;", scores_off).unwrap();
-            writeln!(w, "RED_{}:", off).unwrap();
-            writeln!(w, "    bar.sync 0;").unwrap();
-        }
-        writeln!(w, "    // thread 0: rstd = rsqrt(sum_sq / d_model + eps)").unwrap();
-        writeln!(w, "    setp.ne.u32 %p_t0, %r_tid, 0;").unwrap();
-        writeln!(w, "    @%p_t0 bra RSTD_DONE;").unwrap();
-        writeln!(w, "    ld.shared.f32 %f_ss, [%r_sbase+{}];", scores_off).unwrap();
-        writeln!(w, "    mul.f32 %f_ss, %f_ss, {};", inv_dm).unwrap();
-        writeln!(w, "    add.f32 %f_ss, %f_ss, {};", eps).unwrap();
-        writeln!(w, "    rsqrt.approx.f32 %f_rstd, %f_ss;").unwrap();
-        writeln!(w, "    st.shared.f32 [%r_sbase+{}], %f_rstd;", rms_off).unwrap();
-        writeln!(w, "RSTD_DONE:").unwrap();
-        writeln!(w, "    bar.sync 0;").unwrap();
-        writeln!(w, "    ld.shared.f32 %f_rstd, [%r_sbase+{}];", rms_off).unwrap();
-        writeln!(w, "    // scale hidden in place: h = h * rstd * gamma").unwrap();
-        writeln!(w, "    mov.u32 %r_i, %r_tid;").unwrap();
-        writeln!(w, "NRM_LOOP:").unwrap();
-        writeln!(w, "    setp.ge.u32 %p_a, %r_i, {};", dm).unwrap();
-        writeln!(w, "    @%p_a bra NRM_DONE;").unwrap();
-        writeln!(w, "    mul.lo.u32 %r_t0, %r_i, 4;").unwrap();
-        writeln!(w, "    cvt.u64.u32 %rd_t0, %r_t0;").unwrap();
-        writeln!(w, "    add.u64 %rd_a, %rd_norm, %rd_t0;").unwrap();
-        writeln!(w, "    ld.global.f32 %f_g, [%rd_a];").unwrap();
-        writeln!(w, "    add.u32 %r_t1, %r_t0, %r_sbase;").unwrap();
-        writeln!(w, "    ld.shared.f32 %f_h, [%r_t1];").unwrap();
-        writeln!(w, "    mul.f32 %f_h, %f_h, %f_rstd;").unwrap();
-        writeln!(w, "    mul.f32 %f_h, %f_h, %f_g;").unwrap();
-        writeln!(w, "    st.shared.f32 [%r_t1], %f_h;").unwrap();
-        writeln!(w, "    add.u32 %r_i, %r_i, {};", BLOCK_DIM).unwrap();
-        writeln!(w, "    bra NRM_LOOP;").unwrap();
-        writeln!(w, "NRM_DONE:").unwrap();
-        writeln!(w, "    bar.sync 0;").unwrap();
-        writeln!(w).unwrap();
+/// Emit the fused decode-sample kernel for `program` under `cfg`: build,
+/// verify, lower, and prefix the `//` header.
+///
+/// Launch shape: grid = 1, block = 128. The module targets the KIR floor
+/// (`sm_70`), so [`FusedSampleKernelConfig`] has no `sm_version`. The
+/// returned text carries no NUL.
+pub fn emit(program: &FusedSampleProgram, cfg: &FusedSampleKernelConfig) -> (String, FusedSampleMeta) {
+    let ir = build(program, cfg);
+    if let Err(errors) = crate::kir_verify::verify(&ir) {
+        panic!("{KERNEL_NAME} failed KIR verification: {errors:?}");
     }
-
-    writeln!(w, "    // 3. candidate list init: threads t < k").unwrap();
-    writeln!(w, "    setp.ge.u32 %p_a, %r_tid, {};", k).unwrap();
-    writeln!(w, "    @%p_a bra TK_INIT_DONE;").unwrap();
-    writeln!(w, "    mul.lo.u32 %r_t0, %r_tid, 4;").unwrap();
-    writeln!(w, "    add.u32 %r_t0, %r_t0, %r_sbase;").unwrap();
-    writeln!(w, "    mov.f32 %f_t0, {};", neg_inf).unwrap();
-    writeln!(w, "    st.shared.f32 [%r_t0+{}], %f_t0;", topk_val_off).unwrap();
-    writeln!(w, "    mov.u32 %r_t1, 0;").unwrap();
-    writeln!(w, "    st.shared.u32 [%r_t0+{}], %r_t1;", topk_idx_off).unwrap();
-    writeln!(w, "TK_INIT_DONE:").unwrap();
-    writeln!(w, "    bar.sync 0;").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    // 4. vocab tile loop: thread t scores row tile_base + t").unwrap();
-    writeln!(w, "    mov.u32 %r_tile, 0;").unwrap();
-    writeln!(w, "TILE_LOOP:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p_a, %r_tile, {};", vocab).unwrap();
-    writeln!(w, "    @%p_a bra TILES_DONE;").unwrap();
-    writeln!(w, "    add.u32 %r_tok, %r_tile, %r_tid;").unwrap();
-    writeln!(w, "    mov.f32 %f_s, {};", neg_inf).unwrap();
-    writeln!(w, "    // tail-tile guard: lanes past vocab keep -inf").unwrap();
-    writeln!(w, "    setp.ge.u32 %p_b, %r_tok, {};", vocab).unwrap();
-    writeln!(w, "    @%p_b bra SCORE_STORE;").unwrap();
-    writeln!(w, "    // f16 row: lm_head_ptr + tok * d_model * 2").unwrap();
-    writeln!(w, "    mul.wide.u32 %rd_t0, %r_tok, {};", w_row_bytes).unwrap();
-    writeln!(w, "    add.u64 %rd_a, %rd_w, %rd_t0;").unwrap();
-    writeln!(w, "    mov.f32 %f_dot, {};", zero).unwrap();
-    writeln!(w, "    mov.u32 %r_d, 0;").unwrap();
-    writeln!(w, "    mov.u32 %r_t1, %r_sbase;").unwrap();
-    writeln!(w, "DOT_LOOP:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p_b, %r_d, {};", dm).unwrap();
-    writeln!(w, "    @%p_b bra DOT_DONE;").unwrap();
-    writeln!(w, "    ld.global.b16 %h_w, [%rd_a];").unwrap();
-    writeln!(w, "    cvt.f32.f16 %f_w, %h_w;").unwrap();
-    writeln!(w, "    ld.shared.f32 %f_h, [%r_t1];").unwrap();
-    writeln!(w, "    fma.rn.f32 %f_dot, %f_w, %f_h, %f_dot;").unwrap();
-    writeln!(w, "    add.u64 %rd_a, %rd_a, 2;").unwrap();
-    writeln!(w, "    add.u32 %r_t1, %r_t1, 4;").unwrap();
-    writeln!(w, "    add.u32 %r_d, %r_d, 1;").unwrap();
-    writeln!(w, "    bra DOT_LOOP;").unwrap();
-    writeln!(w, "DOT_DONE:").unwrap();
-    writeln!(w, "    // baked temperature epilogue").unwrap();
-    writeln!(w, "    mul.f32 %f_s, %f_dot, {};", inv_temp_imm).unwrap();
-
-    if grammar_hook {
-        writeln!(w, "    // grammar bitmask hook: bit (state, token) == 0 -> -inf").unwrap();
-        writeln!(w, "    setp.eq.u64 %p_b, %rd_mask, 0;").unwrap();
-        writeln!(w, "    @%p_b bra GRAMMAR_DONE;").unwrap();
-        writeln!(w, "    mul.lo.u32 %r_t0, %r_gstate, {};", mask_row_bytes).unwrap();
-        writeln!(w, "    shr.u32 %r_t2, %r_tok, 3;").unwrap();
-        writeln!(w, "    add.u32 %r_t0, %r_t0, %r_t2;").unwrap();
-        writeln!(w, "    cvt.u64.u32 %rd_t0, %r_t0;").unwrap();
-        writeln!(w, "    add.u64 %rd_t1, %rd_mask, %rd_t0;").unwrap();
-        writeln!(w, "    ld.global.u8 %r_t3, [%rd_t1];").unwrap();
-        writeln!(w, "    and.b32 %r_t2, %r_tok, 7;").unwrap();
-        writeln!(w, "    shr.u32 %r_t3, %r_t3, %r_t2;").unwrap();
-        writeln!(w, "    and.b32 %r_t3, %r_t3, 1;").unwrap();
-        writeln!(w, "    setp.ne.u32 %p_b, %r_t3, 0;").unwrap();
-        writeln!(w, "    @%p_b bra GRAMMAR_DONE;").unwrap();
-        writeln!(w, "    mov.f32 %f_s, {};", neg_inf).unwrap();
-        writeln!(w, "GRAMMAR_DONE:").unwrap();
-    }
-
-    writeln!(w, "SCORE_STORE:").unwrap();
-    writeln!(w, "    mul.lo.u32 %r_t0, %r_tid, 4;").unwrap();
-    writeln!(w, "    add.u32 %r_t0, %r_t0, %r_sbase;").unwrap();
-    writeln!(w, "    st.shared.f32 [%r_t0+{}], %f_s;", scores_off).unwrap();
-    writeln!(w, "    bar.sync 0;").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    // 5. thread 0: replace-min merge of the tile into the list").unwrap();
-    writeln!(w, "    setp.ne.u32 %p_t0, %r_tid, 0;").unwrap();
-    writeln!(w, "    @%p_t0 bra MERGE_DONE;").unwrap();
-    writeln!(w, "    sub.u32 %r_cnt, {}, %r_tile;", vocab).unwrap();
-    writeln!(w, "    min.u32 %r_cnt, %r_cnt, {};", TILE).unwrap();
-    emit_min_scan(w, "MS0", k, topk_val_off);
-    writeln!(w, "    mov.u32 %r_i, 0;").unwrap();
-    writeln!(w, "MERGE_LOOP:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p_a, %r_i, %r_cnt;").unwrap();
-    writeln!(w, "    @%p_a bra MERGE_DONE;").unwrap();
-    writeln!(w, "    mul.lo.u32 %r_t0, %r_i, 4;").unwrap();
-    writeln!(w, "    add.u32 %r_t0, %r_t0, %r_sbase;").unwrap();
-    writeln!(w, "    ld.shared.f32 %f_s, [%r_t0+{}];", scores_off).unwrap();
-    writeln!(w, "    setp.gt.f32 %p_b, %f_s, %f_min;").unwrap();
-    writeln!(w, "    @!%p_b bra MERGE_NEXT;").unwrap();
-    writeln!(w, "    mul.lo.u32 %r_t1, %r_minpos, 4;").unwrap();
-    writeln!(w, "    add.u32 %r_t1, %r_t1, %r_sbase;").unwrap();
-    writeln!(w, "    st.shared.f32 [%r_t1+{}], %f_s;", topk_val_off).unwrap();
-    writeln!(w, "    add.u32 %r_t2, %r_tile, %r_i;").unwrap();
-    writeln!(w, "    st.shared.u32 [%r_t1+{}], %r_t2;", topk_idx_off).unwrap();
-    emit_min_scan(w, "MS1", k, topk_val_off);
-    writeln!(w, "MERGE_NEXT:").unwrap();
-    writeln!(w, "    add.u32 %r_i, %r_i, 1;").unwrap();
-    writeln!(w, "    bra MERGE_LOOP;").unwrap();
-    writeln!(w, "MERGE_DONE:").unwrap();
-    writeln!(w, "    // scores SMEM is rewritten next tile; sync before loop back").unwrap();
-    writeln!(w, "    bar.sync 0;").unwrap();
-    writeln!(w, "    add.u32 %r_tile, %r_tile, {};", TILE).unwrap();
-    writeln!(w, "    bra TILE_LOOP;").unwrap();
-    writeln!(w, "TILES_DONE:").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    // 6. selection is serial on thread 0; others exit").unwrap();
-    writeln!(w, "    setp.ne.u32 %p_t0, %r_tid, 0;").unwrap();
-    writeln!(w, "    @%p_t0 bra EXIT;").unwrap();
-
-    if greedy {
-        writeln!(w, "    // greedy: argmax over the candidate list, no softmax/RNG").unwrap();
-        writeln!(w, "    ld.shared.f32 %f_max, [%r_sbase+{}];", topk_val_off).unwrap();
-        writeln!(w, "    ld.shared.u32 %r_sel, [%r_sbase+{}];", topk_idx_off).unwrap();
-        writeln!(w, "    mov.u32 %r_j, 1;").unwrap();
-        writeln!(w, "AM_LOOP:").unwrap();
-        writeln!(w, "    setp.ge.u32 %p_a, %r_j, {};", k).unwrap();
-        writeln!(w, "    @%p_a bra STORE_TOKEN;").unwrap();
-        writeln!(w, "    mul.lo.u32 %r_t0, %r_j, 4;").unwrap();
-        writeln!(w, "    add.u32 %r_t0, %r_t0, %r_sbase;").unwrap();
-        writeln!(w, "    ld.shared.f32 %f_t0, [%r_t0+{}];", topk_val_off).unwrap();
-        writeln!(w, "    setp.gt.f32 %p_b, %f_t0, %f_max;").unwrap();
-        writeln!(w, "    @!%p_b bra AM_NEXT;").unwrap();
-        writeln!(w, "    mov.f32 %f_max, %f_t0;").unwrap();
-        writeln!(w, "    ld.shared.u32 %r_sel, [%r_t0+{}];", topk_idx_off).unwrap();
-        writeln!(w, "AM_NEXT:").unwrap();
-        writeln!(w, "    add.u32 %r_j, %r_j, 1;").unwrap();
-        writeln!(w, "    bra AM_LOOP;").unwrap();
-    } else {
-        writeln!(w, "    // stable-softmax max over the k candidates").unwrap();
-        writeln!(w, "    ld.shared.f32 %f_max, [%r_sbase+{}];", topk_val_off).unwrap();
-        writeln!(w, "    mov.u32 %r_j, 1;").unwrap();
-        writeln!(w, "MX_LOOP:").unwrap();
-        writeln!(w, "    setp.ge.u32 %p_a, %r_j, {};", k).unwrap();
-        writeln!(w, "    @%p_a bra MX_DONE;").unwrap();
-        writeln!(w, "    mul.lo.u32 %r_t0, %r_j, 4;").unwrap();
-        writeln!(w, "    add.u32 %r_t0, %r_t0, %r_sbase;").unwrap();
-        writeln!(w, "    ld.shared.f32 %f_t0, [%r_t0+{}];", topk_val_off).unwrap();
-        writeln!(w, "    setp.gt.f32 %p_b, %f_t0, %f_max;").unwrap();
-        writeln!(w, "    @!%p_b bra MX_NEXT;").unwrap();
-        writeln!(w, "    mov.f32 %f_max, %f_t0;").unwrap();
-        writeln!(w, "MX_NEXT:").unwrap();
-        writeln!(w, "    add.u32 %r_j, %r_j, 1;").unwrap();
-        writeln!(w, "    bra MX_LOOP;").unwrap();
-        writeln!(w, "MX_DONE:").unwrap();
-        writeln!(w, "    // softmax over k only (not vocab): p = exp2((v - max) * log2e)").unwrap();
-        writeln!(w, "    mov.f32 %f_sum, {};", zero).unwrap();
-        writeln!(w, "    mov.u32 %r_j, 0;").unwrap();
-        writeln!(w, "SM_LOOP:").unwrap();
-        writeln!(w, "    setp.ge.u32 %p_a, %r_j, {};", k).unwrap();
-        writeln!(w, "    @%p_a bra SM_DONE;").unwrap();
-        writeln!(w, "    mul.lo.u32 %r_t0, %r_j, 4;").unwrap();
-        writeln!(w, "    add.u32 %r_t0, %r_t0, %r_sbase;").unwrap();
-        writeln!(w, "    ld.shared.f32 %f_t0, [%r_t0+{}];", topk_val_off).unwrap();
-        writeln!(w, "    sub.f32 %f_t0, %f_t0, %f_max;").unwrap();
-        writeln!(w, "    mul.f32 %f_t0, %f_t0, {};", log2e).unwrap();
-        writeln!(w, "    ex2.approx.f32 %f_t0, %f_t0;").unwrap();
-        writeln!(w, "    st.shared.f32 [%r_t0+{}], %f_t0;", topk_val_off).unwrap();
-        writeln!(w, "    add.f32 %f_sum, %f_sum, %f_t0;").unwrap();
-        writeln!(w, "    add.u32 %r_j, %r_j, 1;").unwrap();
-        writeln!(w, "    bra SM_LOOP;").unwrap();
-        writeln!(w, "SM_DONE:").unwrap();
-
-        if let Some(tp) = top_p {
-            writeln!(w, "    // nucleus: insertion sort desc (stable, strict-lt shift)").unwrap();
-            writeln!(w, "    mov.u32 %r_j, 1;").unwrap();
-            writeln!(w, "SORT_OUTER:").unwrap();
-            writeln!(w, "    setp.ge.u32 %p_a, %r_j, {};", k).unwrap();
-            writeln!(w, "    @%p_a bra SORT_DONE;").unwrap();
-            writeln!(w, "    mul.lo.u32 %r_t0, %r_j, 4;").unwrap();
-            writeln!(w, "    add.u32 %r_t0, %r_t0, %r_sbase;").unwrap();
-            writeln!(w, "    ld.shared.f32 %f_key, [%r_t0+{}];", topk_val_off).unwrap();
-            writeln!(w, "    ld.shared.u32 %r_kidx, [%r_t0+{}];", topk_idx_off).unwrap();
-            writeln!(w, "    mov.u32 %r_i, %r_j;").unwrap();
-            writeln!(w, "SORT_INNER:").unwrap();
-            writeln!(w, "    setp.eq.u32 %p_b, %r_i, 0;").unwrap();
-            writeln!(w, "    @%p_b bra SORT_PLACE;").unwrap();
-            writeln!(w, "    sub.u32 %r_t1, %r_i, 1;").unwrap();
-            writeln!(w, "    mul.lo.u32 %r_t1, %r_t1, 4;").unwrap();
-            writeln!(w, "    add.u32 %r_t1, %r_t1, %r_sbase;").unwrap();
-            writeln!(w, "    ld.shared.f32 %f_t0, [%r_t1+{}];", topk_val_off).unwrap();
-            writeln!(w, "    setp.lt.f32 %p_c, %f_t0, %f_key;").unwrap();
-            writeln!(w, "    @!%p_c bra SORT_PLACE;").unwrap();
-            writeln!(w, "    ld.shared.u32 %r_t2, [%r_t1+{}];", topk_idx_off).unwrap();
-            writeln!(w, "    mul.lo.u32 %r_t3, %r_i, 4;").unwrap();
-            writeln!(w, "    add.u32 %r_t3, %r_t3, %r_sbase;").unwrap();
-            writeln!(w, "    st.shared.f32 [%r_t3+{}], %f_t0;", topk_val_off).unwrap();
-            writeln!(w, "    st.shared.u32 [%r_t3+{}], %r_t2;", topk_idx_off).unwrap();
-            writeln!(w, "    sub.u32 %r_i, %r_i, 1;").unwrap();
-            writeln!(w, "    bra SORT_INNER;").unwrap();
-            writeln!(w, "SORT_PLACE:").unwrap();
-            writeln!(w, "    mul.lo.u32 %r_t3, %r_i, 4;").unwrap();
-            writeln!(w, "    add.u32 %r_t3, %r_t3, %r_sbase;").unwrap();
-            writeln!(w, "    st.shared.f32 [%r_t3+{}], %f_key;", topk_val_off).unwrap();
-            writeln!(w, "    st.shared.u32 [%r_t3+{}], %r_kidx;", topk_idx_off).unwrap();
-            writeln!(w, "    add.u32 %r_j, %r_j, 1;").unwrap();
-            writeln!(w, "    bra SORT_OUTER;").unwrap();
-            writeln!(w, "SORT_DONE:").unwrap();
-            writeln!(w, "    // cumulative prob until > top_p (crossing entry kept);").unwrap();
-            writeln!(w, "    // baked top_p immediate, tail zeroed").unwrap();
-            writeln!(w, "    mov.f32 %f_cum, {};", zero).unwrap();
-            writeln!(w, "    mov.u32 %r_j, 0;").unwrap();
-            writeln!(w, "NUC_LOOP:").unwrap();
-            writeln!(w, "    setp.ge.u32 %p_a, %r_j, {};", k).unwrap();
-            writeln!(w, "    @%p_a bra NUC_DONE;").unwrap();
-            writeln!(w, "    mul.lo.u32 %r_t0, %r_j, 4;").unwrap();
-            writeln!(w, "    add.u32 %r_t0, %r_t0, %r_sbase;").unwrap();
-            writeln!(w, "    ld.shared.f32 %f_p, [%r_t0+{}];", topk_val_off).unwrap();
-            writeln!(w, "    div.rn.f32 %f_t0, %f_p, %f_sum;").unwrap();
-            writeln!(w, "    add.f32 %f_cum, %f_cum, %f_t0;").unwrap();
-            writeln!(w, "    add.u32 %r_j, %r_j, 1;").unwrap();
-            writeln!(w, "    setp.gt.f32 %p_b, %f_cum, {};", f32_imm(tp)).unwrap();
-            writeln!(w, "    @!%p_b bra NUC_LOOP;").unwrap();
-            writeln!(w, "    mov.f32 %f_t1, {};", zero).unwrap();
-            writeln!(w, "ZERO_LOOP:").unwrap();
-            writeln!(w, "    setp.ge.u32 %p_a, %r_j, {};", k).unwrap();
-            writeln!(w, "    @%p_a bra NUC_DONE;").unwrap();
-            writeln!(w, "    mul.lo.u32 %r_t0, %r_j, 4;").unwrap();
-            writeln!(w, "    add.u32 %r_t0, %r_t0, %r_sbase;").unwrap();
-            writeln!(w, "    st.shared.f32 [%r_t0+{}], %f_t1;", topk_val_off).unwrap();
-            writeln!(w, "    add.u32 %r_j, %r_j, 1;").unwrap();
-            writeln!(w, "    bra ZERO_LOOP;").unwrap();
-            writeln!(w, "NUC_DONE:").unwrap();
-        }
-
-        writeln!(w, "    // kept probability mass (== sum when no nucleus filter)").unwrap();
-        writeln!(w, "    mov.f32 %f_ks, {};", zero).unwrap();
-        writeln!(w, "    mov.u32 %r_j, 0;").unwrap();
-        writeln!(w, "KS_LOOP:").unwrap();
-        writeln!(w, "    setp.ge.u32 %p_a, %r_j, {};", k).unwrap();
-        writeln!(w, "    @%p_a bra KS_DONE;").unwrap();
-        writeln!(w, "    mul.lo.u32 %r_t0, %r_j, 4;").unwrap();
-        writeln!(w, "    add.u32 %r_t0, %r_t0, %r_sbase;").unwrap();
-        writeln!(w, "    ld.shared.f32 %f_t0, [%r_t0+{}];", topk_val_off).unwrap();
-        writeln!(w, "    add.f32 %f_ks, %f_ks, %f_t0;").unwrap();
-        writeln!(w, "    add.u32 %r_j, %r_j, 1;").unwrap();
-        writeln!(w, "    bra KS_LOOP;").unwrap();
-        writeln!(w, "KS_DONE:").unwrap();
-        writeln!(w, "    // xorshift64* PRNG: deterministic given rng_seed (M46)").unwrap();
-        writeln!(w, "    mov.u64 %rd_x, %rd_seed;").unwrap();
-        writeln!(w, "    setp.ne.u64 %p_a, %rd_x, 0;").unwrap();
-        writeln!(w, "    @%p_a bra RNG_MIX;").unwrap();
-        writeln!(w, "    // zero seed would be a fixed point; substitute golden gamma").unwrap();
-        writeln!(w, "    mov.u64 %rd_x, 0x9E3779B97F4A7C15;").unwrap();
-        writeln!(w, "RNG_MIX:").unwrap();
-        writeln!(w, "    shr.b64 %rd_t0, %rd_x, 12;").unwrap();
-        writeln!(w, "    xor.b64 %rd_x, %rd_x, %rd_t0;").unwrap();
-        writeln!(w, "    shl.b64 %rd_t0, %rd_x, 25;").unwrap();
-        writeln!(w, "    xor.b64 %rd_x, %rd_x, %rd_t0;").unwrap();
-        writeln!(w, "    shr.b64 %rd_t0, %rd_x, 27;").unwrap();
-        writeln!(w, "    xor.b64 %rd_x, %rd_x, %rd_t0;").unwrap();
-        writeln!(w, "    mov.u64 %rd_t0, 0x2545F4914F6CDD1D;").unwrap();
-        writeln!(w, "    mul.lo.u64 %rd_x, %rd_x, %rd_t0;").unwrap();
-        writeln!(w, "    // r in [0,1): top 24 bits over 2^24 (f32 mantissa exact)").unwrap();
-        writeln!(w, "    shr.b64 %rd_x, %rd_x, 40;").unwrap();
-        writeln!(w, "    cvt.u32.u64 %r_t0, %rd_x;").unwrap();
-        writeln!(w, "    cvt.rn.f32.u32 %f_r, %r_t0;").unwrap();
-        writeln!(w, "    mul.f32 %f_r, %f_r, {};", two_neg24).unwrap();
-        writeln!(w, "    mul.f32 %f_tgt, %f_r, %f_ks;").unwrap();
-        writeln!(w, "    // multinomial: walk the cumulative distribution").unwrap();
-        writeln!(w, "    ld.shared.u32 %r_sel, [%r_sbase+{}];", topk_idx_off).unwrap();
-        writeln!(w, "    mov.f32 %f_cum, {};", zero).unwrap();
-        writeln!(w, "    mov.u32 %r_j, 0;").unwrap();
-        writeln!(w, "WALK_LOOP:").unwrap();
-        writeln!(w, "    setp.ge.u32 %p_a, %r_j, {};", k).unwrap();
-        writeln!(w, "    @%p_a bra STORE_TOKEN;").unwrap();
-        writeln!(w, "    mul.lo.u32 %r_t0, %r_j, 4;").unwrap();
-        writeln!(w, "    add.u32 %r_t0, %r_t0, %r_sbase;").unwrap();
-        writeln!(w, "    ld.shared.f32 %f_p, [%r_t0+{}];", topk_val_off).unwrap();
-        writeln!(w, "    add.f32 %f_cum, %f_cum, %f_p;").unwrap();
-        writeln!(w, "    // zero-prob entries never selected; last live entry is").unwrap();
-        writeln!(w, "    // the fp-drift fallback").unwrap();
-        writeln!(w, "    setp.gt.f32 %p_b, %f_p, {};", zero).unwrap();
-        writeln!(w, "    @!%p_b bra WALK_NEXT;").unwrap();
-        writeln!(w, "    ld.shared.u32 %r_sel, [%r_t0+{}];", topk_idx_off).unwrap();
-        writeln!(w, "    setp.ge.f32 %p_c, %f_cum, %f_tgt;").unwrap();
-        writeln!(w, "    @%p_c bra STORE_TOKEN;").unwrap();
-        writeln!(w, "WALK_NEXT:").unwrap();
-        writeln!(w, "    add.u32 %r_j, %r_j, 1;").unwrap();
-        writeln!(w, "    bra WALK_LOOP;").unwrap();
-    }
-
-    writeln!(w, "STORE_TOKEN:").unwrap();
-    writeln!(w, "    // the ONLY global store of the kernel").unwrap();
-    writeln!(w, "    st.global.u32 [%rd_out], %r_sel;").unwrap();
-    writeln!(w, "EXIT:").unwrap();
-    writeln!(w, "    ret;").unwrap();
-    writeln!(w, "}}").unwrap();
+    let smem_bytes = ir.smem_layout.total_bytes().expect("a verified layout has a size");
+    let module = lower_kir_to_ptx(&ir);
+    let module = module.strip_suffix(&[0]).unwrap_or(&module);
+    let module = std::str::from_utf8(module).expect("the KIR printer emits ASCII");
+    let mut p = header_comment(program, cfg);
+    p.push_str(module);
 
     let meta = FusedSampleMeta {
         kernel_name: KERNEL_NAME.to_string(),
@@ -891,7 +1031,6 @@ mod tests {
             vocab_size: 49_152,
             vocab_tile: 128,
             top_k: 50,
-            sm_version: 80,
             grammar_states: 0,
         }
     }
@@ -902,49 +1041,85 @@ mod tests {
 
     // ── structural ─────────────────────────────────────────────────
 
-    #[test]
-    fn param_list_is_exactly_the_seven_params() {
-        let ptx = emit_fused_sample_ptx(&paper_program(), &paper_cfg());
-        let start = ptx.find(".visible .entry nsl_cfie_fused_sample(").unwrap();
-        let end = start + ptx[start..].find(')').unwrap();
-        let params: Vec<&str> = ptx[start..end]
-            .lines()
-            .filter_map(|l| {
-                let l = l.trim();
-                l.starts_with(".param").then(|| l.trim_end_matches(','))
-            })
-            .collect();
-        assert_eq!(
-            params,
-            vec![
-                ".param .u64 hidden_ptr",
-                ".param .u64 norm_w_ptr",
-                ".param .u64 lm_head_ptr",
-                ".param .u64 out_token_ptr",
-                ".param .u64 rng_seed",
-                ".param .u64 grammar_mask_ptr",
-                ".param .u32 grammar_state",
-            ]
-        );
-        assert_eq!(ptx.matches("ld.param").count(), 7);
+    /// Every op of `ir`, in block order.
+    fn ops(ir: &KernelIR) -> Vec<&KirOp> {
+        ir.blocks.iter().flat_map(|b| b.ops.iter()).collect()
     }
 
-    #[test]
-    fn exactly_one_global_store() {
-        // The [1, vocab] logits never touch HBM: the token id write is
-        // the kernel's only global store.
-        let ptx = emit_fused_sample_ptx(&paper_program(), &paper_cfg());
-        assert_eq!(ptx.matches("st.global").count(), 1);
-        assert!(ptx.contains("st.global.u32 [%rd_out], %r_sel;"));
-        // Greedy variant too.
+    fn f32_consts(ir: &KernelIR) -> Vec<u32> {
+        ops(ir)
+            .into_iter()
+            .filter_map(|op| match op {
+                KirOp::Const(_, crate::kernel_ir::KirConst { value: ConstValue::F32(v), .. }) => Some(v.to_bits()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn u32_consts(ir: &KernelIR) -> Vec<u32> {
+        ops(ir)
+            .into_iter()
+            .filter_map(|op| match op {
+                KirOp::Const(_, crate::kernel_ir::KirConst { value: ConstValue::U32(v), .. }) => Some(*v),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn greedy_program() -> crate::cfie_fused_sample::FusedSampleProgram {
         let params = SamplingParams {
             strategy: SamplingStrategy::Greedy,
             temperature: 0.0,
             ..Default::default()
         };
-        let prog = emit_program(params, shape(512, 49_152));
-        let ptx = emit_fused_sample_ptx(&prog, &paper_cfg());
-        assert_eq!(ptx.matches("st.global").count(), 1);
+        emit_program(params, shape(512, 49_152))
+    }
+
+    #[test]
+    fn param_list_is_exactly_the_seven_params() {
+        let ir = build(&paper_program(), &paper_cfg());
+        let names: Vec<&str> = ir.params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "hidden_ptr",
+                "norm_w_ptr",
+                "lm_head_ptr",
+                "out_token_ptr",
+                "rng_seed",
+                "grammar_mask_ptr",
+                "grammar_state",
+            ]
+        );
+        let ptx = emit_fused_sample_ptx(&paper_program(), &paper_cfg());
+        for (name, ty) in [
+            ("hidden_ptr", "u64"),
+            ("norm_w_ptr", "u64"),
+            ("lm_head_ptr", "u64"),
+            ("out_token_ptr", "u64"),
+            ("rng_seed", "u64"),
+            ("grammar_mask_ptr", "u64"),
+            ("grammar_state", "u32"),
+        ] {
+            assert!(ptx.contains(&format!(".param .{ty} param_{name}")), "{name}");
+        }
+    }
+
+    #[test]
+    fn exactly_one_global_store() {
+        // The [1, vocab] logits never touch HBM: the token id write is
+        // the kernel's only global store, sampling and greedy alike.
+        for prog in [paper_program(), greedy_program()] {
+            let ir = build(&prog, &paper_cfg());
+            let global_stores = ops(&ir)
+                .into_iter()
+                .filter(|op| matches!(op, KirOp::Store(_, _, AddressSpace::Global)))
+                .count();
+            assert_eq!(global_stores, 1);
+            let ptx = emit_fused_sample_ptx(&prog, &paper_cfg());
+            assert_eq!(ptx.matches("st.global").count(), 1);
+            assert!(ptx.contains("st.global.u32 "));
+        }
     }
 
     #[test]
@@ -959,22 +1134,26 @@ mod tests {
 
     #[test]
     fn baked_temperature_and_top_p_immediates_present() {
-        let ptx = emit_fused_sample_ptx(&paper_program(), &paper_cfg());
+        let consts = f32_consts(&build(&paper_program(), &paper_cfg()));
         // Default temperature 0.7 -> baked 1/0.7 epilogue multiplier.
-        let inv_temp = f32_imm(1.0f32 / 0.7f32);
-        assert!(ptx.contains(&format!("mul.f32 %f_s, %f_dot, {};", inv_temp)));
+        assert!(consts.contains(&(1.0f32 / 0.7f32).to_bits()));
         // Default top_p 0.9 -> baked nucleus threshold.
-        let top_p = f32_imm(0.9f32);
-        assert!(ptx.contains(&format!("setp.gt.f32 %p_b, %f_cum, {};", top_p)));
+        assert!(consts.contains(&0.9f32.to_bits()));
         // RMSNorm epsilon baked (default program has the op).
-        assert!(ptx.contains(&f32_imm(1e-5)));
+        assert!(consts.contains(&1e-5f32.to_bits()));
     }
 
     #[test]
     fn grammar_hook_present_only_when_grammar_states_positive() {
-        let no_grammar = emit_fused_sample_ptx(&paper_program(), &paper_cfg());
-        assert!(!no_grammar.contains("ld.global.u8"));
-        assert!(!no_grammar.contains("GRAMMAR_DONE"));
+        let byte_loads = |ir: &KernelIR| {
+            ops(ir)
+                .into_iter()
+                .filter(|op| matches!(op, KirOp::Load(dst, _, _) if ir.var_types.get(dst) == Some(&KirType::I8)))
+                .count()
+        };
+        let no_grammar = build(&paper_program(), &paper_cfg());
+        assert_eq!(byte_loads(&no_grammar), 0);
+        assert!(!u32_consts(&no_grammar).contains(&6144));
 
         let params = SamplingParams {
             grammar_masked: true,
@@ -983,32 +1162,30 @@ mod tests {
         let prog = emit_program(params, shape(512, 49_152));
         let mut cfg = paper_cfg();
         cfg.grammar_states = 4;
-        let ptx = emit_fused_sample_ptx(&prog, &cfg);
-        assert!(ptx.contains("ld.global.u8"));
+        let ir = build(&prog, &cfg);
+        assert_eq!(byte_loads(&ir), 1);
         // Baked mask row stride: ceil(49152 / 8) = 6144 bytes/state.
-        assert!(ptx.contains("mul.lo.u32 %r_t0, %r_gstate, 6144;"));
-        // Runtime null-ptr guard keeps the hook inert until Phase B.
-        assert!(ptx.contains("setp.eq.u64 %p_b, %rd_mask, 0;"));
+        assert!(u32_consts(&ir).contains(&6144));
+        // The runtime null-pointer guard keeps the hook inert until a mask
+        // is bound: the byte load sits behind a branch on it.
+        let ptx = emit_fused_sample_ptx(&prog, &cfg);
+        assert!(ptx.contains("ld.global.s8 "));
+        assert!(ptx.contains("setp.eq.u64 "));
     }
 
     #[test]
     fn greedy_program_skips_softmax_sort_and_rng() {
-        let params = SamplingParams {
-            strategy: SamplingStrategy::Greedy,
-            temperature: 0.0,
-            ..Default::default()
-        };
-        let prog = emit_program(params, shape(512, 49_152));
-        let ptx = emit_fused_sample_ptx(&prog, &paper_cfg());
-        assert!(!ptx.contains("ex2.approx"));
-        assert!(!ptx.contains("SORT_OUTER"));
-        assert!(!ptx.contains("RNG_MIX"));
-        assert!(ptx.contains("AM_LOOP"));
+        let has_exp = |ir: &KernelIR| ops(ir).into_iter().any(|op| matches!(op, KirOp::Exp(..)));
+        let has_xor = |ir: &KernelIR| ops(ir).into_iter().any(|op| matches!(op, KirOp::Xor(..)));
+        let has_div = |ir: &KernelIR| ops(ir).into_iter().any(|op| matches!(op, KirOp::Div(..)));
 
-        let full = emit_fused_sample_ptx(&paper_program(), &paper_cfg());
-        assert!(full.contains("ex2.approx"));
-        assert!(full.contains("SORT_OUTER"));
-        assert!(full.contains("RNG_MIX"));
+        let greedy = build(&greedy_program(), &paper_cfg());
+        assert!(!has_exp(&greedy), "no softmax");
+        assert!(!has_div(&greedy), "no nucleus cutoff");
+        assert!(!has_xor(&greedy), "no PRNG");
+
+        let full = build(&paper_program(), &paper_cfg());
+        assert!(has_exp(&full) && has_div(&full) && has_xor(&full));
     }
 
     #[test]
@@ -1026,24 +1203,16 @@ mod tests {
     }
 
     #[test]
-    fn header_matches_sm_version_convention() {
-        let ptx80 = emit_fused_sample_ptx(&paper_program(), &paper_cfg());
-        assert!(ptx80.starts_with("//"));
-        assert!(ptx80.contains(".version 7.0\n.target sm_80\n.address_size 64"));
-        let mut cfg = paper_cfg();
-        cfg.sm_version = 90;
-        assert!(emit_fused_sample_ptx(&paper_program(), &cfg)
-            .contains(".version 8.4\n.target sm_90"));
-        cfg.sm_version = 100;
-        assert!(emit_fused_sample_ptx(&paper_program(), &cfg)
-            .contains(".version 8.6\n.target sm_100"));
-        // The parts whose ISA the old table got wrong (7.0 / 7.0 / 8.6).
-        cfg.sm_version = 89;
-        assert!(emit_fused_sample_ptx(&paper_program(), &cfg)
-            .contains(".version 7.8\n.target sm_89"));
-        cfg.sm_version = 120;
-        assert!(emit_fused_sample_ptx(&paper_program(), &cfg)
-            .contains(".version 8.7\n.target sm_120"));
+    fn module_targets_the_kir_floor_after_the_header() {
+        let ptx = emit_fused_sample_ptx(&paper_program(), &paper_cfg());
+        assert!(ptx.starts_with("//"));
+        let directives: Vec<&str> = ptx
+            .lines()
+            .filter(|l| l.starts_with(".version") || l.starts_with(".target") || l.starts_with(".address_size"))
+            .collect();
+        assert_eq!(directives.len(), 3, "{directives:?}");
+        assert!(directives[1].starts_with(".target sm_70"), "{directives:?}");
+        assert_eq!(directives[2], ".address_size 64");
     }
 
     #[test]
@@ -1053,10 +1222,7 @@ mod tests {
         assert_eq!(meta.block_dim, 128);
         // hidden(512 f32) + scores(128 f32) + topk_val(50) + topk_idx(50) + rstd.
         assert_eq!(meta.smem_bytes, 512 * 4 + 128 * 4 + 50 * 4 + 50 * 4 + 4);
-        assert!(ptx.contains(&format!(
-            ".shared .align 4 .b8 cfie_sample_smem[{}];",
-            meta.smem_bytes
-        )));
+        assert!(ptx.contains(&format!(".shared .align 4 .b8 shared_mem[{}];", meta.smem_bytes)));
     }
 
     #[test]

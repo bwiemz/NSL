@@ -631,6 +631,14 @@ sections `build_flash_decode` is made of (`begin_flash_decode`,
 `flash_tile` over the appended draft rows whose score hook applies the
 node's baked mask with a `Select`. `tests/cfie_spec_verify_kir_equivalence.rs`
 runs it against the same fixture.
+`src/cfie_sample_ptx.rs::build` is the sixth: the fused decode-sample
+kernel. Its hidden-row load, RMSNorm and row dot are
+`cfie_spec_sampler_ptx`'s sections (`hidden_load`, `rmsnorm_in_place`,
+`build_row_dot`, over a `Common` built by `common_at`), its PRNG draw is
+`cfie_speculative_ptx::build_prng_draw`, and its own sections are the
+replace-min candidate merge, the argmax, the softmax, the nucleus sort and
+cutoff, and the multinomial walk. `tests/cfie_sample_kir_equivalence.rs`
+runs it against `tests/fixtures/cfie_sample_hand.rs`.
 
 **Hand-written PTX emitters (frozen).** `src/flash_attention.rs`
 (`synthesize_flash_attention_ptx`, `synthesize_flash_attention_backward_ptx`),
@@ -642,8 +650,8 @@ runs it against the same fixture.
 `src/wrga_fused_ptx.rs`,
 `src/cpkd_fused_loss.rs`, `src/bitnet/`, `src/pca_rope.rs`,
 `src/pca_tilerange.rs`, `src/cfie_*_ptx.rs` (all but `cfie_grammar_ptx.rs`,
-`cfie_kv_quant_ptx.rs`, `cfie_spec_sampler_ptx.rs` and
-`cfie_speculative_ptx.rs`),
+`cfie_kv_quant_ptx.rs`, `cfie_spec_sampler_ptx.rs`,
+`cfie_speculative_ptx.rs` and `cfie_sample_ptx.rs`),
 `src/fusion.rs` (elementwise chains), and the shared preludes
 in `src/kernel_skeleton/` (`header.rs`, `indexing.rs`, `pad.rs`, `params.rs`,
 `smem.rs`) all `push_str` PTX text with hand-numbered registers.

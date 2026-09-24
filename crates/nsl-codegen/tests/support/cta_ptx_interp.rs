@@ -127,9 +127,11 @@ pub(crate) enum Op {
     CvtF32F16 { d: usize, a: Src },
     /// `cvt.rn.f32.s8`: the low byte, as a signed integer, to f32 (exact).
     CvtF32S8 { d: usize, a: Src },
+    /// `cvt.u32.s8`: the low byte, sign-extended to 32 bits.
+    CvtU32S8 { d: usize, a: Src },
     Setp { cmp: Cmp, ty: CmpTy, d: usize, a: Src, b: Src },
-    /// `selp.<32-bit type>`: `d = p ? a : b`.
-    Selp { d: usize, a: Src, b: Src, p: Src },
+    /// `selp.<type>`: `d = p ? a : b`, at the type's width.
+    Selp { w: W, d: usize, a: Src, b: Src, p: Src },
     F { op: FOp, d: usize, a: Src, b: Src },
     Fma { d: usize, a: Src, b: Src, c: Src },
     Ex2 { d: usize, a: Src },
@@ -347,6 +349,10 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 want(2);
                 Op::CvtF32S8 { d: p.dst(ops[0]), a: p.src(ops[1]) }
             }
+            ["cvt", "u32", "s8"] => {
+                want(2);
+                Op::CvtU32S8 { d: p.dst(ops[0]), a: p.src(ops[1]) }
+            }
             ["cvt", "u64", "u32"] => {
                 want(2);
                 Op::CvtU64U32 { d: p.dst(ops[0]), a: p.src(ops[1]) }
@@ -393,9 +399,10 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 };
                 Op::Setp { cmp, ty, d: p.dst(ops[0]), a: p.src(ops[1]), b: p.src(ops[2]) }
             }
-            ["selp", "f32" | "b32" | "u32"] => {
+            ["selp", ty @ ("f32" | "b32" | "u32" | "b64" | "u64")] => {
                 want(4);
-                Op::Selp { d: p.dst(ops[0]), a: p.src(ops[1]), b: p.src(ops[2]), p: p.src(ops[3]) }
+                let w = if ty.ends_with("64") { W::U64 } else { W::U32 };
+                Op::Selp { w, d: p.dst(ops[0]), a: p.src(ops[1]), b: p.src(ops[2]), p: p.src(ops[3]) }
             }
             [name @ ("add" | "sub" | "mul" | "max"), "f32"] | [name @ "div", "rn", "f32"] => {
                 want(3);
@@ -425,6 +432,12 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 let space = if *space == "global" { Space::Global } else { Space::Shared };
                 let bytes = if *ty == "b16" { 2 } else { 4 };
                 Op::Ld { space, bytes, d: p.dst(ops[0]), addr: p.addr(ops[1]) }
+            }
+            // One byte, zero-extended into the register.
+            ["ld", space @ ("global" | "shared"), "u8"] => {
+                want(2);
+                let space = if *space == "global" { Space::Global } else { Space::Shared };
+                Op::Ld { space, bytes: 1, d: p.dst(ops[0]), addr: p.addr(ops[1]) }
             }
             ["ld", space @ ("global" | "shared"), "s8"] => {
                 want(2);
@@ -639,6 +652,10 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
                 let v = f16::from_bits(rd(t, launch, *a) as u16).to_f32();
                 write(t, *d, fb(v));
             }
+            Op::CvtU32S8 { d, a } => {
+                let v = rd(t, launch, *a) as u8 as i8 as i32 as u32 as u64;
+                write(t, *d, v);
+            }
             Op::CvtF32S8 { d, a } => {
                 let v = rd(t, launch, *a) as u8 as i8 as f32;
                 write(t, *d, fb(v));
@@ -673,9 +690,9 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
                 };
                 write(t, *d, r as u64);
             }
-            Op::Selp { d, a, b, p } => {
+            Op::Selp { w, d, a, b, p } => {
                 let v = if rd(t, launch, *p) != 0 { rd(t, launch, *a) } else { rd(t, launch, *b) };
-                write(t, *d, v as u32 as u64);
+                write(t, *d, if *w == W::U32 { v as u32 as u64 } else { v });
             }
             Op::F { op, d, a, b } => {
                 let (a, b) = (f(rd(t, launch, *a)), f(rd(t, launch, *b)));
