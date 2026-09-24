@@ -1,7 +1,7 @@
 //! The differential equivalence gate for the CFIE speculative-decoding
-//! kernels (roadmap A2 step 9, fourth slice). This PR moves the rejection
-//! epilogue, `nsl_cfie_spec_reject`; the tree-mask verify attention is the
-//! next one and stays hand-written until then.
+//! rejection epilogue, `nsl_cfie_spec_reject` (roadmap A2 step 9, fourth
+//! slice). The tree-mask verify attention has its own gate,
+//! `cfie_spec_verify_kir_equivalence.rs`.
 //!
 //! This file runs the frozen hand emitter
 //! (`tests/fixtures/cfie_speculative_hand.rs`) and the KIR one side by side

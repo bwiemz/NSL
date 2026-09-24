@@ -392,12 +392,77 @@ pub fn build(cfg: &DecodeAttentionConfig) -> KernelIR {
 /// The caller has checked the geometry (and, for a baked layout, the
 /// offsets' alignment).
 pub(crate) fn build_flash_decode(spec: &FlashDecode<'_>) -> KernelIR {
+    use KirType::U32;
+
+    let (mut b, e) = begin_flash_decode(spec);
+    let row = op2(&mut b, U32, KirOp::Mul, e.head, e.ctx.head_dim);
+    load_q_row(&mut b, &e.ctx, e.q_ptr, row);
+    let (acc, _m, l) = prefix_pass(&mut b, &e.ctx, e.seq_len);
+    publish_output(&mut b, &e.ctx, acc, l, e.out_ptr, row);
+    b.terminate(KirTerminator::Return);
+    b.finalize()
+}
+
+/// The entry of a flash-decode kernel, and the handles its sections need.
+pub(crate) struct FlashEntry {
+    pub ctx: FlashCtx,
+    pub q_ptr: VarId,
+    pub out_ptr: VarId,
+    pub seq_len: VarId,
+    /// This CTA's Q head.
+    pub head: VarId,
+}
+
+/// Values the entry block defines once and every section reads, reaching
+/// each use by dominance.
+pub(crate) struct FlashCtx {
+    pub tid: VarId,
+    /// u32 `0` and `1`.
+    pub zero: VarId,
+    pub one: VarId,
+    /// u32 `head_dim`.
+    pub head_dim: VarId,
+    /// u64 elements per token record.
+    token_stride: VarId,
+    /// u32: the slot's first global token.
+    slot_base: VarId,
+    /// u64: `kv_head`'s row inside one token record.
+    head_off: VarId,
+    /// f32 `1/sqrt(head_dim)`.
+    inv_sqrt_hd: VarId,
+    k_half: HalfReader,
+    v_half: HalfReader,
+    q_smem: VarId,
+    scores: VarId,
+    rescale: VarId,
+    l_smem: VarId,
+}
+
+/// One tile of the flash-decode loop, relative to the slot's first token.
+pub(crate) struct TileSpan {
+    /// u32: the tile's first token (pass 3 walks V from here).
+    pub first: VarId,
+    /// u32: the token this thread scores in pass 1.
+    pub tok: VarId,
+    /// bool: whether this thread scores a token at all.
+    pub scores: VarId,
+    /// u32: how many tokens the tile holds.
+    pub tcnt: VarId,
+}
+
+/// Rewrites a thread's scaled pass-1 score before it is stored (the
+/// verify kernel's tree mask). Runs in the block that stores the score.
+pub(crate) type ScoreHook<'a> = &'a dyn Fn(&mut KirBuilder, VarId) -> VarId;
+
+/// Start a flash-decode kernel: the params in FFI order, the shared
+/// layout, and the entry block's strides, `kv_head`, and region pointers.
+/// Returns with the entry block current and unterminated.
+pub(crate) fn begin_flash_decode(spec: &FlashDecode<'_>) -> (KirBuilder, FlashEntry) {
     use AddressSpace::{Global, Shared};
     use KirType::{F32, U32, U64};
 
     let token_stride_elems = spec.n_kv_heads as u64 * spec.head_dim as u64;
     let hd = spec.head_dim;
-
     let mut b = KirBuilder::new(spec.name);
 
     // The direct params, in FFI order (the launcher marshals them
@@ -428,52 +493,6 @@ pub(crate) fn build_flash_decode(spec: &FlashDecode<'_>) -> KernelIR {
     b.set_workgroup_size([BLOCK_DIM, 1, 1]);
 
     let entry = b.new_block();
-    let q_load = b.new_block();
-    let q_done = b.new_block();
-    let tile_head = b.new_block();
-    let tile_body = b.new_block();
-    let score = b.new_block();
-    let dot_head = b.new_block();
-    let dot_body = b.new_block();
-    let dot_done = b.new_block();
-    let score_done = b.new_block();
-    let max_head = b.new_block();
-    let max_body = b.new_block();
-    let max_done = b.new_block();
-    let p_head = b.new_block();
-    let p_body = b.new_block();
-    let p_done = b.new_block();
-    let softmax_done = b.new_block();
-    let acc_start = b.new_block();
-    let acc_head = b.new_block();
-    let acc_body = b.new_block();
-    let acc_tail = b.new_block();
-    let loop_end = b.new_block();
-    let l_store = b.new_block();
-    let l_pub = b.new_block();
-    let out_load = b.new_block();
-    let out_div = b.new_block();
-    let store_out = b.new_block();
-    let exit = b.new_block();
-
-    let tile = b.add_block_param(tile_head, U32);
-    let acc = b.add_block_param(tile_head, F32);
-    let m = b.add_block_param(tile_head, F32);
-    let l = b.add_block_param(tile_head, F32);
-    let d = b.add_block_param(dot_head, U32);
-    let dot = b.add_block_param(dot_head, F32);
-    let max_j = b.add_block_param(max_head, U32);
-    let tm = b.add_block_param(max_head, F32);
-    let p_j = b.add_block_param(p_head, U32);
-    let lsum = b.add_block_param(p_head, F32);
-    let m_next = b.add_block_param(softmax_done, F32);
-    let l_next = b.add_block_param(softmax_done, F32);
-    let acc_j = b.add_block_param(acc_head, U32);
-    let a = b.add_block_param(acc_head, F32);
-    let acc_next = b.add_block_param(acc_tail, F32);
-    let o = b.add_block_param(store_out, F32);
-
-    // ── entry ────────────────────────────────────────────────────────
     b.set_block(entry);
     let tid = b.new_typed_var(U32);
     b.emit(KirOp::ThreadId(tid, 0));
@@ -526,6 +545,7 @@ pub(crate) fn build_flash_decode(spec: &FlashDecode<'_>) -> KernelIR {
     // kv_head's row inside one token record.
     let head_off32 = op2(&mut b, U32, KirOp::Mul, kv_head, head_dim);
     let head_off = widen(&mut b, head_off32);
+    let inv_sqrt_hd = konst(&mut b, ConstValue::F32(1.0f32 / (hd as f32).sqrt()));
 
     let region = |b: &mut KirBuilder, r: u32| {
         let dst = b.new_typed_var(ptr(F32, Shared));
@@ -537,130 +557,237 @@ pub(crate) fn build_flash_decode(spec: &FlashDecode<'_>) -> KernelIR {
     let rescale = region(&mut b, R_RESCALE);
     let l_smem = region(&mut b, R_L);
 
-    let loads_q = cmp(&mut b, tid, head_dim, CmpOp::Lt);
+    let ctx = FlashCtx {
+        tid,
+        zero,
+        one,
+        head_dim,
+        token_stride,
+        slot_base,
+        head_off,
+        inv_sqrt_hd,
+        k_half,
+        v_half,
+        q_smem,
+        scores,
+        rescale,
+        l_smem,
+    };
+    (b, FlashEntry { ctx, q_ptr, out_ptr, seq_len, head })
+}
+
+/// `q_smem[tid] = q[row + tid]` for `tid < head_dim`, then a barrier.
+/// `row` is the Q row's first element. Terminates the current block and
+/// returns with the post-barrier block current.
+pub(crate) fn load_q_row(b: &mut KirBuilder, c: &FlashCtx, q_ptr: VarId, row: VarId) {
+    use AddressSpace::{Global, Shared};
+    use KirType::{F32, U32};
+
+    let q_load = b.new_block();
+    let q_done = b.new_block();
+    let loads_q = cmp(b, c.tid, c.head_dim, CmpOp::Lt);
     b.terminate(KirTerminator::CondBranch(loads_q, KirEdge::to(q_load), KirEdge::to(q_done)));
 
-    // ── this head's Q row (f32) into SMEM ────────────────────────────
     b.set_block(q_load);
-    let q_row = op2(&mut b, U32, KirOp::Mul, head, head_dim);
-    let q_index = op2(&mut b, U32, KirOp::Add, q_row, tid);
-    let q_addr = at(&mut b, F32, Global, q_ptr, q_index);
-    let q_val = load(&mut b, F32, q_addr, Global);
-    let q_slot = at(&mut b, F32, Shared, q_smem, tid);
+    let q_index = op2(b, U32, KirOp::Add, row, c.tid);
+    let q_addr = at(b, F32, Global, q_ptr, q_index);
+    let q_val = load(b, F32, q_addr, Global);
+    let q_slot = at(b, F32, Shared, c.q_smem, c.tid);
     b.emit(KirOp::Store(q_slot, q_val, Shared));
     b.terminate(KirTerminator::Branch(KirEdge::to(q_done)));
 
     b.set_block(q_done);
     b.emit(KirOp::Barrier);
-    let f_zero = konst(&mut b, ConstValue::F32(0.0));
-    let f_neg_inf = konst(&mut b, ConstValue::F32(f32::NEG_INFINITY));
+}
+
+/// The tile loop over the slot's first `seq_len` tokens, from a fresh
+/// state (`acc = 0`, `m = -inf`, `l = 0`). Terminates the current block
+/// and returns with the loop's exit block current; the returned
+/// `(acc, m, l)` are the loop head's parameters, which dominate it.
+pub(crate) fn prefix_pass(b: &mut KirBuilder, c: &FlashCtx, seq_len: VarId) -> (VarId, VarId, VarId) {
+    use KirType::{F32, U32};
+
+    let tile_head = b.new_block();
+    let tile_body = b.new_block();
+    let loop_end = b.new_block();
+    let tile = b.add_block_param(tile_head, U32);
+    let acc = b.add_block_param(tile_head, F32);
+    let m = b.add_block_param(tile_head, F32);
+    let l = b.add_block_param(tile_head, F32);
+
+    let f_zero = konst(b, ConstValue::F32(0.0));
+    let f_neg_inf = konst(b, ConstValue::F32(f32::NEG_INFINITY));
     b.terminate(KirTerminator::Branch(KirEdge::with(
         tile_head,
-        vec![zero, f_zero, f_neg_inf, f_zero],
+        vec![c.zero, f_zero, f_neg_inf, f_zero],
     )));
 
-    // ── the tile loop ────────────────────────────────────────────────
     b.set_block(tile_head);
-    let tiles_done = cmp(&mut b, tile, seq_len, CmpOp::Ge);
+    let tiles_done = cmp(b, tile, seq_len, CmpOp::Ge);
     b.terminate(KirTerminator::CondBranch(tiles_done, KirEdge::to(loop_end), KirEdge::to(tile_body)));
 
     b.set_block(tile_body);
-    let remaining = op2(&mut b, U32, KirOp::Sub, seq_len, tile);
-    let tile_width = konst(&mut b, ConstValue::U32(TILE));
+    let remaining = op2(b, U32, KirOp::Sub, seq_len, tile);
+    let tile_width = konst(b, ConstValue::U32(TILE));
     // Tail-tile guard: the last tile covers seq_len % TILE tokens.
-    let tcnt = op2(&mut b, U32, KirOp::Min, remaining, tile_width);
-    let tok = op2(&mut b, U32, KirOp::Add, tile, tid);
-    let scores_a_token = cmp(&mut b, tok, seq_len, CmpOp::Lt);
+    let tcnt = op2(b, U32, KirOp::Min, remaining, tile_width);
+    let tok = op2(b, U32, KirOp::Add, tile, c.tid);
+    let scores = cmp(b, tok, seq_len, CmpOp::Lt);
+    let span = TileSpan { first: tile, tok, scores, tcnt };
+    let (acc_next, m_next, l_next) = flash_tile(b, c, &span, (acc, m, l), None);
+
+    let tile_next = op2(b, U32, KirOp::Add, tile, tile_width);
+    b.terminate(KirTerminator::Branch(KirEdge::with(
+        tile_head,
+        vec![tile_next, acc_next, m_next, l_next],
+    )));
+
+    b.set_block(loop_end);
+    (acc, m, l)
+}
+
+/// One flash-decode tile: pass 1 scores, pass 2 folds them into the
+/// running softmax on thread 0, pass 3 rescales the accumulator and adds
+/// P*V. `state` is `(acc, m, l)` coming in. Terminates the current block
+/// and returns with the tile's closing block current, after its barrier
+/// and unterminated, and the `(acc, m, l)` going out.
+///
+/// Only thread 0's `m`/`l` are meaningful: the other threads carry
+/// theirs through unchanged, as the hand kernel's untouched registers did.
+pub(crate) fn flash_tile(
+    b: &mut KirBuilder,
+    c: &FlashCtx,
+    span: &TileSpan,
+    state: (VarId, VarId, VarId),
+    score_hook: Option<ScoreHook<'_>>,
+) -> (VarId, VarId, VarId) {
+    use AddressSpace::Shared;
+    use KirType::{F32, U32, U64};
+
+    let (acc, m, l) = state;
+    let tcnt = span.tcnt;
+    let score = b.new_block();
+    let dot_head = b.new_block();
+    let dot_body = b.new_block();
+    let dot_done = b.new_block();
+    let score_done = b.new_block();
+    let max_head = b.new_block();
+    let max_body = b.new_block();
+    let max_done = b.new_block();
+    let p_head = b.new_block();
+    let p_body = b.new_block();
+    let p_done = b.new_block();
+    let softmax_done = b.new_block();
+    let acc_start = b.new_block();
+    let acc_head = b.new_block();
+    let acc_body = b.new_block();
+    let acc_tail = b.new_block();
+
+    let d = b.add_block_param(dot_head, U32);
+    let dot = b.add_block_param(dot_head, F32);
+    let max_j = b.add_block_param(max_head, U32);
+    let tm = b.add_block_param(max_head, F32);
+    let p_j = b.add_block_param(p_head, U32);
+    let lsum = b.add_block_param(p_head, F32);
+    let m_next = b.add_block_param(softmax_done, F32);
+    let l_next = b.add_block_param(softmax_done, F32);
+    let acc_j = b.add_block_param(acc_head, U32);
+    let a = b.add_block_param(acc_head, F32);
+    let acc_next = b.add_block_param(acc_tail, F32);
+
     b.terminate(KirTerminator::CondBranch(
-        scores_a_token,
+        span.scores,
         KirEdge::to(score),
         KirEdge::to(score_done),
     ));
 
-    // ── pass 1: thread t scores token tile + t ───────────────────────
+    // ── pass 1: thread t scores token `tok` ──────────────────────────
     b.set_block(score);
-    let g = op2(&mut b, U32, KirOp::Add, slot_base, tok);
-    let g_wide = widen(&mut b, g);
-    let k_tok = op2(&mut b, U64, KirOp::Mul, g_wide, token_stride);
-    let k_tok_plane = k_half.in_plane(&mut b, k_tok);
-    let k_row = op2(&mut b, U64, KirOp::Add, k_tok_plane, head_off);
-    let f_zero_dot = konst(&mut b, ConstValue::F32(0.0));
-    b.terminate(KirTerminator::Branch(KirEdge::with(dot_head, vec![zero, f_zero_dot])));
+    let g = op2(b, U32, KirOp::Add, c.slot_base, span.tok);
+    let g_wide = widen(b, g);
+    let k_tok = op2(b, U64, KirOp::Mul, g_wide, c.token_stride);
+    let k_tok_plane = c.k_half.in_plane(b, k_tok);
+    let k_row = op2(b, U64, KirOp::Add, k_tok_plane, c.head_off);
+    let f_zero_dot = konst(b, ConstValue::F32(0.0));
+    b.terminate(KirTerminator::Branch(KirEdge::with(dot_head, vec![c.zero, f_zero_dot])));
 
     b.set_block(dot_head);
-    let dot_complete = cmp(&mut b, d, head_dim, CmpOp::Ge);
+    let dot_complete = cmp(b, d, c.head_dim, CmpOp::Ge);
     b.terminate(KirTerminator::CondBranch(dot_complete, KirEdge::to(dot_done), KirEdge::to(dot_body)));
 
     b.set_block(dot_body);
-    let d_wide = widen(&mut b, d);
-    let k_index = op2(&mut b, U64, KirOp::Add, k_row, d_wide);
-    let k_val = k_half.load(&mut b, k_index);
-    let q_elem = at(&mut b, F32, Shared, q_smem, d);
-    let q_d = load(&mut b, F32, q_elem, Shared);
+    let d_wide = widen(b, d);
+    let k_index = op2(b, U64, KirOp::Add, k_row, d_wide);
+    let k_val = c.k_half.load(b, k_index);
+    let q_elem = at(b, F32, Shared, c.q_smem, d);
+    let q_d = load(b, F32, q_elem, Shared);
     let dot_acc = b.new_typed_var(F32);
     b.emit(KirOp::Fma(dot_acc, k_val, q_d, dot));
-    let d_next = op2(&mut b, U32, KirOp::Add, d, one);
+    let d_next = op2(b, U32, KirOp::Add, d, c.one);
     b.terminate(KirTerminator::Branch(KirEdge::with(dot_head, vec![d_next, dot_acc])));
 
     b.set_block(dot_done);
-    let inv_sqrt_hd = konst(&mut b, ConstValue::F32(1.0f32 / (hd as f32).sqrt()));
-    let scaled = op2(&mut b, F32, KirOp::Mul, dot, inv_sqrt_hd);
-    let score_slot = at(&mut b, F32, Shared, scores, tid);
+    let scaled = op2(b, F32, KirOp::Mul, dot, c.inv_sqrt_hd);
+    let scaled = match score_hook {
+        Some(hook) => hook(b, scaled),
+        None => scaled,
+    };
+    let score_slot = at(b, F32, Shared, c.scores, c.tid);
     b.emit(KirOp::Store(score_slot, scaled, Shared));
     b.terminate(KirTerminator::Branch(KirEdge::to(score_done)));
 
     // ── pass 2: online softmax, thread 0 serial over the tile ────────
     b.set_block(score_done);
     b.emit(KirOp::Barrier);
-    let not_thread0 = cmp(&mut b, tid, zero, CmpOp::Ne);
+    let not_thread0 = cmp(b, c.tid, c.zero, CmpOp::Ne);
     b.terminate(KirTerminator::CondBranch(
         not_thread0,
         KirEdge::with(softmax_done, vec![m, l]),
-        KirEdge::with(max_head, vec![zero, m]),
+        KirEdge::with(max_head, vec![c.zero, m]),
     ));
 
     b.set_block(max_head);
-    let max_complete = cmp(&mut b, max_j, tcnt, CmpOp::Ge);
+    let max_complete = cmp(b, max_j, tcnt, CmpOp::Ge);
     b.terminate(KirTerminator::CondBranch(max_complete, KirEdge::to(max_done), KirEdge::to(max_body)));
 
     b.set_block(max_body);
-    let max_elem = at(&mut b, F32, Shared, scores, max_j);
-    let max_score = load(&mut b, F32, max_elem, Shared);
-    let tm_next = op2(&mut b, F32, KirOp::Max, tm, max_score);
-    let max_j_next = op2(&mut b, U32, KirOp::Add, max_j, one);
+    let max_elem = at(b, F32, Shared, c.scores, max_j);
+    let max_score = load(b, F32, max_elem, Shared);
+    let tm_next = op2(b, F32, KirOp::Max, tm, max_score);
+    let max_j_next = op2(b, U32, KirOp::Add, max_j, c.one);
     b.terminate(KirTerminator::Branch(KirEdge::with(max_head, vec![max_j_next, tm_next])));
 
     // rescale = exp(m_old - m_new); exp(-inf) = 0 on the first tile.
     b.set_block(max_done);
-    let m_delta = op2(&mut b, F32, KirOp::Sub, m, tm);
+    let m_delta = op2(b, F32, KirOp::Sub, m, tm);
     let rs = b.new_typed_var(F32);
     b.emit(KirOp::Exp(rs, m_delta));
-    let l_rescaled = op2(&mut b, F32, KirOp::Mul, l, rs);
-    b.terminate(KirTerminator::Branch(KirEdge::with(p_head, vec![zero, l_rescaled])));
+    let l_rescaled = op2(b, F32, KirOp::Mul, l, rs);
+    b.terminate(KirTerminator::Branch(KirEdge::with(p_head, vec![c.zero, l_rescaled])));
 
     b.set_block(p_head);
-    let p_complete = cmp(&mut b, p_j, tcnt, CmpOp::Ge);
+    let p_complete = cmp(b, p_j, tcnt, CmpOp::Ge);
     b.terminate(KirTerminator::CondBranch(p_complete, KirEdge::to(p_done), KirEdge::to(p_body)));
 
     b.set_block(p_body);
-    let p_elem = at(&mut b, F32, Shared, scores, p_j);
-    let p_score = load(&mut b, F32, p_elem, Shared);
-    let p_shift = op2(&mut b, F32, KirOp::Sub, p_score, tm);
+    let p_elem = at(b, F32, Shared, c.scores, p_j);
+    let p_score = load(b, F32, p_elem, Shared);
+    let p_shift = op2(b, F32, KirOp::Sub, p_score, tm);
     let p = b.new_typed_var(F32);
     b.emit(KirOp::Exp(p, p_shift));
     b.emit(KirOp::Store(p_elem, p, Shared));
-    let lsum_next = op2(&mut b, F32, KirOp::Add, lsum, p);
-    let p_j_next = op2(&mut b, U32, KirOp::Add, p_j, one);
+    let lsum_next = op2(b, F32, KirOp::Add, lsum, p);
+    let p_j_next = op2(b, U32, KirOp::Add, p_j, c.one);
     b.terminate(KirTerminator::Branch(KirEdge::with(p_head, vec![p_j_next, lsum_next])));
 
     b.set_block(p_done);
-    b.emit(KirOp::Store(rescale, rs, Shared));
+    b.emit(KirOp::Store(c.rescale, rs, Shared));
     b.terminate(KirTerminator::Branch(KirEdge::with(softmax_done, vec![tm, lsum])));
 
     // ── pass 3: rescale the accumulator, add P*V; thread d owns out[d] ─
     b.set_block(softmax_done);
     b.emit(KirOp::Barrier);
-    let no_output = cmp(&mut b, tid, head_dim, CmpOp::Ge);
+    let no_output = cmp(b, c.tid, c.head_dim, CmpOp::Ge);
     b.terminate(KirTerminator::CondBranch(
         no_output,
         KirEdge::with(acc_tail, vec![acc]),
@@ -668,19 +795,19 @@ pub(crate) fn build_flash_decode(spec: &FlashDecode<'_>) -> KernelIR {
     ));
 
     b.set_block(acc_start);
-    let rs_shared = load(&mut b, F32, rescale, Shared);
-    let acc_rescaled = op2(&mut b, F32, KirOp::Mul, acc, rs_shared);
-    let g0 = op2(&mut b, U32, KirOp::Add, slot_base, tile);
-    let g0_wide = widen(&mut b, g0);
-    let v_tok = op2(&mut b, U64, KirOp::Mul, g0_wide, token_stride);
-    let v_tok_plane = v_half.in_plane(&mut b, v_tok);
-    let v_head_row = op2(&mut b, U64, KirOp::Add, v_tok_plane, head_off);
-    let tid_wide = widen(&mut b, tid);
-    let v_col = op2(&mut b, U64, KirOp::Add, v_head_row, tid_wide);
-    b.terminate(KirTerminator::Branch(KirEdge::with(acc_head, vec![zero, acc_rescaled])));
+    let rs_shared = load(b, F32, c.rescale, Shared);
+    let acc_rescaled = op2(b, F32, KirOp::Mul, acc, rs_shared);
+    let g0 = op2(b, U32, KirOp::Add, c.slot_base, span.first);
+    let g0_wide = widen(b, g0);
+    let v_tok = op2(b, U64, KirOp::Mul, g0_wide, c.token_stride);
+    let v_tok_plane = c.v_half.in_plane(b, v_tok);
+    let v_head_row = op2(b, U64, KirOp::Add, v_tok_plane, c.head_off);
+    let tid_wide = widen(b, c.tid);
+    let v_col = op2(b, U64, KirOp::Add, v_head_row, tid_wide);
+    b.terminate(KirTerminator::Branch(KirEdge::with(acc_head, vec![c.zero, acc_rescaled])));
 
     b.set_block(acc_head);
-    let acc_complete = cmp(&mut b, acc_j, tcnt, CmpOp::Ge);
+    let acc_complete = cmp(b, acc_j, tcnt, CmpOp::Ge);
     b.terminate(KirTerminator::CondBranch(
         acc_complete,
         KirEdge::with(acc_tail, vec![a]),
@@ -688,45 +815,55 @@ pub(crate) fn build_flash_decode(spec: &FlashDecode<'_>) -> KernelIR {
     ));
 
     b.set_block(acc_body);
-    let w_elem = at(&mut b, F32, Shared, scores, acc_j);
-    let weight = load(&mut b, F32, w_elem, Shared);
-    let j_wide = widen(&mut b, acc_j);
-    let v_step = op2(&mut b, U64, KirOp::Mul, j_wide, token_stride);
-    let v_index = op2(&mut b, U64, KirOp::Add, v_col, v_step);
-    let v_val = v_half.load(&mut b, v_index);
+    let w_elem = at(b, F32, Shared, c.scores, acc_j);
+    let weight = load(b, F32, w_elem, Shared);
+    let j_wide = widen(b, acc_j);
+    let v_step = op2(b, U64, KirOp::Mul, j_wide, c.token_stride);
+    let v_index = op2(b, U64, KirOp::Add, v_col, v_step);
+    let v_val = c.v_half.load(b, v_index);
     let a_next = b.new_typed_var(F32);
     b.emit(KirOp::Fma(a_next, weight, v_val, a));
-    let acc_j_next = op2(&mut b, U32, KirOp::Add, acc_j, one);
+    let acc_j_next = op2(b, U32, KirOp::Add, acc_j, c.one);
     b.terminate(KirTerminator::Branch(KirEdge::with(acc_head, vec![acc_j_next, a_next])));
 
-    // The scores region is rewritten next tile; sync before looping back.
+    // The scores region is rewritten by whatever runs next; sync first.
     b.set_block(acc_tail);
     b.emit(KirOp::Barrier);
-    let tile_next = op2(&mut b, U32, KirOp::Add, tile, tile_width);
-    b.terminate(KirTerminator::Branch(KirEdge::with(
-        tile_head,
-        vec![tile_next, acc_next, m_next, l_next],
-    )));
+    (acc_next, m_next, l_next)
+}
 
-    // ── thread 0 publishes the final softmax denominator ─────────────
-    b.set_block(loop_end);
-    let skips_publish = cmp(&mut b, tid, zero, CmpOp::Ne);
+/// Thread 0 publishes `l`; after a barrier, thread `d < head_dim` stores
+/// `out[row + d] = acc / l` (0 when `l` is not positive, so an empty
+/// prefix writes 0 rather than NaN). Terminates the current block and
+/// returns with a fresh block, where every path meets, current.
+pub(crate) fn publish_output(b: &mut KirBuilder, c: &FlashCtx, acc: VarId, l: VarId, out_ptr: VarId, row: VarId) {
+    use AddressSpace::{Global, Shared};
+    use KirType::{F32, U32};
+
+    let l_store = b.new_block();
+    let l_pub = b.new_block();
+    let out_load = b.new_block();
+    let out_div = b.new_block();
+    let store_out = b.new_block();
+    let done = b.new_block();
+    let o = b.add_block_param(store_out, F32);
+
+    let skips_publish = cmp(b, c.tid, c.zero, CmpOp::Ne);
     b.terminate(KirTerminator::CondBranch(skips_publish, KirEdge::to(l_pub), KirEdge::to(l_store)));
 
     b.set_block(l_store);
-    b.emit(KirOp::Store(l_smem, l, Shared));
+    b.emit(KirOp::Store(c.l_smem, l, Shared));
     b.terminate(KirTerminator::Branch(KirEdge::to(l_pub)));
 
     b.set_block(l_pub);
     b.emit(KirOp::Barrier);
-    let writes_nothing = cmp(&mut b, tid, head_dim, CmpOp::Ge);
-    b.terminate(KirTerminator::CondBranch(writes_nothing, KirEdge::to(exit), KirEdge::to(out_load)));
+    let writes_nothing = cmp(b, c.tid, c.head_dim, CmpOp::Ge);
+    b.terminate(KirTerminator::CondBranch(writes_nothing, KirEdge::to(done), KirEdge::to(out_load)));
 
-    // seq_len == 0 leaves l == 0; write 0 instead of NaN.
     b.set_block(out_load);
-    let l_final = load(&mut b, F32, l_smem, Shared);
-    let f_zero_out = konst(&mut b, ConstValue::F32(0.0));
-    let positive = cmp(&mut b, l_final, f_zero_out, CmpOp::Gt);
+    let l_final = load(b, F32, c.l_smem, Shared);
+    let f_zero_out = konst(b, ConstValue::F32(0.0));
+    let positive = cmp(b, l_final, f_zero_out, CmpOp::Gt);
     b.terminate(KirTerminator::CondBranch(
         positive,
         KirEdge::to(out_div),
@@ -734,20 +871,16 @@ pub(crate) fn build_flash_decode(spec: &FlashDecode<'_>) -> KernelIR {
     ));
 
     b.set_block(out_div);
-    let normalized = op2(&mut b, F32, KirOp::Div, acc, l_final);
+    let normalized = op2(b, F32, KirOp::Div, acc, l_final);
     b.terminate(KirTerminator::Branch(KirEdge::with(store_out, vec![normalized])));
 
     b.set_block(store_out);
-    let out_row = op2(&mut b, U32, KirOp::Mul, head, head_dim);
-    let out_index = op2(&mut b, U32, KirOp::Add, out_row, tid);
-    let out_addr = at(&mut b, F32, Global, out_ptr, out_index);
+    let out_index = op2(b, U32, KirOp::Add, row, c.tid);
+    let out_addr = at(b, F32, Global, out_ptr, out_index);
     b.emit(KirOp::Store(out_addr, o, Global));
-    b.terminate(KirTerminator::Branch(KirEdge::to(exit)));
+    b.terminate(KirTerminator::Branch(KirEdge::to(done)));
 
-    b.set_block(exit);
-    b.terminate(KirTerminator::Return);
-
-    b.finalize()
+    b.set_block(done);
 }
 
 /// The `//` header: what the kernel bakes, in elements. Sibling kernels

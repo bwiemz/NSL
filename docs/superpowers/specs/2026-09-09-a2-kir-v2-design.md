@@ -492,9 +492,27 @@ frozen throughout, so nothing here blocks a kernel fix.
    fallback does), and forcing the positive-entry test in the CDF walk
    (the running sum only grows at a positive entry, so the first index
    where it reaches the target is positive unless the draw is exactly 0).
-   `RejectionConfig` lost its `sm_version`. *The verify attention kernel*
-   is next: the decode-attention flash loop unrolled once per tree node,
-   plus a masked tile over the appended draft rows.
+   `RejectionConfig` lost its `sm_version`. *The verify attention kernel
+   is done* (the second slice). It is the decode-attention kernel run once
+   per tree node, so `build_flash_decode` was cut into the sections it is
+   made of — the entry (`begin_flash_decode`), the Q row load, the prefix
+   tile loop, one tile (`flash_tile`), and the output publish — and the
+   verify kernel is those sections per node plus one more `flash_tile`
+   over the appended draft rows, whose score hook turns a score to -inf
+   where the node's baked mask bit is clear (`Shr`, `And`, `Select`). The
+   decode and KV-quant gates pass unchanged over the refactor. The
+   interpreter learned `and.b32/b64` and `selp`. The gate sweeps the
+   paper's tree(2,2), scattered masks up to 33 nodes, a chain and a single
+   node, prefixes across every tile edge, and GQA/MHA, under two
+   schedules, and checks the answer against `cpu_reference_verify`. It
+   catches a deleted barrier, a nudged stride, scale or node offset, one
+   flipped mask bit, a dropped mask and a dropped prefix clamp. Two
+   barriers per node are equivalent mutants and named: the tree tile's
+   closing barrier (no pass 1 follows before the publish barrier, and the
+   only write between them is to `l`, which pass 3 does not read) and the
+   node's closing one (nothing reads `q` after the tree tile's scores
+   barrier). `VerifyAttentionConfig` lost its `sm_version`, and the file
+   left the freeze (64 → 63).
 10. **Fused loss heads.** `fused_linear_ce.rs`, then `cpkd_fused_loss.rs`.
     Proof: SASS equivalence (the online-softmax loops reorder under
     scheduling).
