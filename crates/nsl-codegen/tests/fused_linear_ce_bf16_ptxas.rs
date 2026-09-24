@@ -145,10 +145,13 @@ fn bf16_forward_assembles_for_sm80_at_v4096() {
         txt.contains("st.shared.b16"),
         "Bf16 forward MUST store SMEM as .b16"
     );
+    // The v1 forward is KIR (roadmap A2 step 10): the printer raises the
+    // ISA to 7.8, the first with the bf16 conversions, when the kernel
+    // uses them (the hand emitter wrote 8.0).
     assert!(
-        txt.contains(".version 8.0"),
-        "Bf16 path MUST bump to .version 8.0 (bf16 cvt requires PTX 7.8+; \
-         F32/F16 stay at 7.0 to preserve byte-identity)"
+        txt.contains(".version 7.8"),
+        "Bf16 forward MUST declare .version 7.8 (bf16 cvt requires PTX 7.8+; \
+         F32/F16 stay at 7.0)"
     );
     // Negative pin: must NOT contain the f16 cvt mnemonics (that would
     // mean we accidentally fell through to the F16 emitter).

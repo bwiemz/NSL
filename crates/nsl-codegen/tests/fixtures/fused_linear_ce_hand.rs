@@ -1,3 +1,14 @@
+// Frozen fixture (roadmap A2 step 10): the hand-written PTX emitters for
+// the fused linear-CE kernels, exactly as `crates/nsl-codegen/src/
+// fused_linear_ce.rs` held them at e0346b5d, before the kernels moved onto
+// KIR. Lines below this comment are that file's first 3818 lines (all but
+// its unit tests), unedited; the `fused_linear_ce_*_kir_equivalence.rs`
+// gates include it with `#[path]` and run its output against the KIR
+// kernels'. Do not change it: it is the pre-migration behaviour the
+// equivalence claims are about.
+//
+// Not scanned by the hand-PTX freeze: nothing under `tests/` is.
+
 //! G3 — Fused linear-CE with separator-skip (v1 single-CTA + v2 two-kernel large-vocab).
 //!
 //! Emits PTX kernels that implement:
@@ -15,8 +26,8 @@
 //! Sprint 3 adds a **two-kernel cross-CTA reduction** path that activates
 //! when `vocab_size > LARGE_VOCAB_THRESHOLD` (= 8192).  Routing is decided
 //! by [`FusedLinearCEConfig::is_large_vocab`]; below the threshold the v1
-//! single-CTA kernel is emitted, computing exactly what it did before
-//! Sprint 3 (see the KIR section below for how that is proved now).
+//! single-CTA kernel is emitted **byte-identical** to pre-Sprint-3 (this
+//! invariant is locked down by `tests/fused_linear_ce_large_vocab_numerical.rs::ptx_byte_identity_at_v4096`).
 //!
 //! ### Large-vocab path — Kernel A + Kernel B (Option 1)
 //!
@@ -69,23 +80,8 @@
 //!
 //! ## Scope
 //!
-//! Both paths are research-grade scalar `fma.rn.f32`, accumulating in f32
-//! whatever the storage dtype. MMA tiling and quantised-W paths are
-//! deferred.
-//!
-//! ## KIR (roadmap A2 step 10)
-//!
-//! The kernels were hand-assembled PTX text and are moving onto
-//! [`KernelIR`], one role at a time with all three dtypes from one builder.
-//! The v1 forward has moved: [`build_forward`] builds it, keeping the hand
-//! kernels' control flow, barriers and floating-point order, and
-//! `tests/fused_linear_ce_fwd_kir_equivalence.rs` runs the frozen hand
-//! emitters (`tests/fixtures/fused_linear_ce_hand.rs`) against it on the PTX
-//! interpreter and requires the same output bits, and an f64 reference's
-//! answer. It targets the KIR floor (`sm_70`; bf16 raises it to `sm_80` and
-//! ISA 7.8), so `gpu_sm` no longer reaches it. The large-vocab pair and the
-//! backward are still hand-written here, and the file stays in the hand-PTX
-//! freeze until they move too.
+//! Both paths are research-grade scalar `fma.rn.f32`, F32 only. MMA tiling,
+//! fp16/bf16 storage, and quantised-W paths are deferred.
 //!
 //! ## API
 //!
@@ -101,18 +97,11 @@
 //! let bwd_ptx = nsl_codegen::fused_linear_ce::synthesize_fused_linear_ce_backward_ptx(&cfg);
 //! ```
 
-use crate::backend_ptx::lower_kir_to_ptx;
-use crate::cfie_decode_attention::{at, cmp, konst, load, op2, ptr, widen};
-use crate::kernel_ir::{
-    AddressSpace, CmpOp, ConstValue, KernelIR, KirBuilder, KirConst, KirEdge, KirOp, KirTerminator,
-    KirType, SmemLayout, SmemRegion, VarId,
-};
-
 // ─── Config ─────────────────────────────────────────────────────────────────
 
-/// Vocab sizes at or below this use the v1 single-CTA path. Above this, the
-/// Sprint-3 two-kernel large-vocab path activates (per-tile partials +
-/// per-row finalize).
+/// Vocab sizes at or below this use the v1 single-CTA path **byte-identical**
+/// to pre-Sprint-3.  Above this, the Sprint-3 two-kernel large-vocab path
+/// activates (per-tile partials + per-row finalize).
 ///
 /// Picked = 8192 because that was the v1 hard cap; using it as the routing
 /// threshold means the legacy path stays bit-for-bit unchanged for every
@@ -267,7 +256,7 @@ impl Default for FusedLinearCEConfig {
 impl FusedLinearCEConfig {
     /// Returns `true` when the Sprint-3 two-kernel large-vocab path will
     /// be selected by [`synthesize_fused_linear_ce_ptx`]. False = legacy
-    /// v1 single-CTA path.
+    /// v1 single-CTA path (byte-identical to pre-Sprint-3).
     #[inline]
     pub fn is_large_vocab(&self) -> bool {
         self.vocab_size > LARGE_VOCAB_THRESHOLD
@@ -442,7 +431,7 @@ impl FusedLinearCEConfig {
 /// Synthesise the forward PTX for the fused linear-CE kernel.
 ///
 /// **Routing**: when `cfg.is_large_vocab()` is `false` (vocab_size ≤ 8192),
-/// this returns the v1 single-CTA kernel ([`build_forward`], lowered).
+/// this returns the v1 single-CTA kernel **byte-identical** to pre-Sprint-3.
 /// When `true`, it returns a single PTX module containing *both* Kernel A
 /// (per-tile partials, name = `cfg.large_partials_kernel_name()`) and
 /// Kernel B (per-row finalize, name = `cfg.large_finalize_kernel_name()`).
@@ -471,9 +460,17 @@ pub fn synthesize_fused_linear_ce_ptx(cfg: &FusedLinearCEConfig) -> Vec<u8> {
     if cfg.is_large_vocab() {
         synthesize_large_vocab_forward_ptx(cfg)
     } else {
-        // Roadmap A2 step 10: one KIR builder for all three dtypes; the
-        // printer's output is already null-terminated.
-        emit_forward(cfg)
+        let mut bytes = match cfg.dtype {
+            // F32 path's *kernel bytes* remain BYTE-IDENTICAL to pre-Sprint-v3-2
+            // — calls the untouched emitter. Sprint 3's v1 byte-identity
+            // snapshot pins those kernel bytes; the snapshot test strips the
+            // trailing null before asserting so the contract is preserved.
+            Dtype::F32 => emit_fwd_kernel(cfg).into_bytes(),
+            Dtype::F16 => emit_fwd_kernel_f16(cfg).into_bytes(),
+            Dtype::Bf16 => emit_fwd_kernel_bf16(cfg).into_bytes(),
+        };
+        bytes.push(0);
+        bytes
     }
 }
 
@@ -553,375 +550,630 @@ pub fn synthesize_fused_linear_ce_backward_ptx(cfg: &FusedLinearCEConfig) -> Vec
     bytes
 }
 
-// ─── KIR — v1 forward ────────────────────────────────────────────────────────
+// ─── PTX emission — forward ───────────────────────────────────────────────────
 //
-// Roadmap A2 step 10: the v1 single-CTA forward kernel is built as KIR, one
-// builder for all three dtypes. It keeps the hand kernels' control flow,
-// barriers and floating-point order (`tests/fused_linear_ce_fwd_kir_equivalence.rs`
-// runs the frozen hand emitters against it on the PTX interpreter and
-// requires the same output bits). Dynamic shared memory is a two-region
-// `SmemLayout` at the hand kernels' offsets: the logits tile in the storage
-// dtype (so a 16-bit logit is rounded to it before the reduction, as the hand
-// kernels did) and the logit-at-target slot after it.
+// Shared-memory layout (4 bytes per float, all at 4-byte aligned offsets):
+//   [0 .. vtile*4)       : logits tile — f32 per vocab entry
+//   [vtile*4 .. vtile*4+4) : logit_at_target scratch (written by whichever
+//                            thread computes the target vocab position)
+//   [vtile*4+4 .. smem)  : alignment / future use
 
-/// Threads per CTA, and the stride of the v1 tile fill.
-const V1_BLOCK: u32 = 128;
-/// Index of each shared region in [`v1_forward_smem`].
-const R_LOGITS: u32 = 0;
-const R_TARGET: u32 = 1;
 
-/// The storage type of `x`, `W`, `bias` and the shared logits tile.
-fn elem_type(dtype: Dtype) -> KirType {
-    match dtype {
-        Dtype::F32 => KirType::F32,
-        Dtype::F16 => KirType::F16,
-        Dtype::Bf16 => KirType::Bf16,
-    }
+/// Clean reimplementation of the forward kernel with correct addressing.
+fn emit_fwd_kernel(cfg: &FusedLinearCEConfig) -> String {
+    let name = cfg.kernel_name();
+    let vocab = cfg.vocab_size;
+    let hidden = cfg.hidden_size;
+    let vtile = cfg.vocab_tile;
+    let n_tiles = vocab.div_ceil(vtile);
+    let vtile_per_thread = vtile / 128;
+    let ignore = cfg.ignore_index;
+    let smem_bytes = cfg.shared_mem_bytes();
+    // Smem layout: [0 .. vtile*4) = logits tile,
+    //              [vtile*4 .. vtile*4+4) = logit_at_target scratch.
+    let lat_offset = vtile * 4;
+
+    // Build PTX as a single format-string vector.
+    let mut lines: Vec<String> = Vec::new();
+    let p = |l: &str| l.to_owned();
+
+    lines.push(cfg.ptx_header());
+    lines.push(format!(".extern .shared .align 4 .b8 smem_scratch[{smem_bytes}];"));
+    lines.push(String::new());
+    lines.push(format!(".visible .entry {name}("));
+    lines.push(p("\t.param .u64 param_x,"));
+    lines.push(p("\t.param .u64 param_w,"));
+    lines.push(p("\t.param .u64 param_bias,"));
+    lines.push(p("\t.param .u64 param_targets,"));
+    lines.push(p("\t.param .u64 param_loss_out,"));
+    lines.push(p("\t.param .u64 param_lse_out,"));
+    lines.push(p("\t.param .u32 param_B, .param .u32 param_S,"));
+    lines.push(p("\t.param .u32 param_V, .param .u32 param_H"));
+    lines.push(p(") {"));
+    // Registers.
+    lines.push(p("\t.reg .u64 %rd<30>;"));
+    lines.push(p("\t.reg .u32 %r<20>;"));
+    lines.push(p("\t.reg .s64 %tgt64;"));
+    lines.push(p("\t.reg .f32 %flog, %facc, %fmax, %fsum, %ftmax, %flse, %floss;"));
+    lines.push(p("\t.reg .f32 %fa, %fb, %flog2e, %fln2, %ftmp;"));
+    lines.push(p("\t.reg .pred %pskip, %pv, %pth0, %ptgt;"));
+    lines.push(String::new());
+
+    // Load params.
+    lines.push(p("\tld.param.u64 %rd0, [param_x];"));
+    lines.push(p("\tld.param.u64 %rd1, [param_w];"));
+    lines.push(p("\tld.param.u64 %rd2, [param_bias];"));
+    lines.push(p("\tld.param.u64 %rd3, [param_targets];"));
+    lines.push(p("\tld.param.u64 %rd4, [param_loss_out];"));
+    lines.push(p("\tld.param.u64 %rd5, [param_lse_out];"));
+    lines.push(p("\tmov.u32 %r0, %ctaid.x;   // row_idx"));
+    lines.push(p("\tmov.u32 %r1, %tid.x;     // tid"));
+    lines.push(p("\tmov.f32 %flog2e, 0f3FB8AA3B; // log2(e)"));
+    lines.push(p("\tmov.f32 %fln2,   0f3F317218; // ln(2)"));
+    lines.push(String::new());
+
+    // Thread 0 initialises logit_at_target smem slot to -INF.
+    lines.push(p("\tsetp.eq.u32 %pth0, %r1, 0;"));
+    lines.push(p("\t@!%pth0 bra INIT_DONE;"));
+    lines.push(p("\tmov.u64 %rd6, smem_scratch;"));
+    lines.push(format!("\tadd.u64 %rd6, %rd6, {lat_offset};"));
+    lines.push(p("\tst.shared.f32 [%rd6], 0fFF800000; // -INF sentinel (f32 IEEE 754 -INF)"));
+    lines.push(p("INIT_DONE:"));
+    lines.push(p("\tbar.sync 0;"));
+    lines.push(String::new());
+
+    // Load target[row_idx].
+    lines.push(p("\t// Load targets[row_idx] (i64)"));
+    lines.push(p("\tcvt.u64.u32 %rd7, %r0;"));
+    lines.push(p("\tmul.lo.u64 %rd7, %rd7, 8;"));
+    lines.push(p("\tadd.u64 %rd7, %rd3, %rd7;"));
+    lines.push(p("\tld.global.s64 %tgt64, [%rd7];"));
+    lines.push(String::new());
+
+    // Skip branch.
+    lines.push(format!("\t// setp.eq.s64: if target == {ignore} skip"));
+    lines.push(format!("\tsetp.eq.s64 %pskip, %tgt64, {ignore};"));
+    lines.push(p("\t@%pskip bra SKIP_LABEL;"));
+    lines.push(String::new());
+
+    // x_row_base = x + row*H*4.
+    lines.push(format!("\t// x_row_base = x + row_idx * {hidden} * 4"));
+    lines.push(p("\tcvt.u64.u32 %rd8, %r0;"));
+    lines.push(format!("\tmov.u32 %r2, {hidden};"));
+    lines.push(p("\tcvt.u64.u32 %rd9, %r2;"));
+    lines.push(p("\tmul.lo.u64 %rd8, %rd8, %rd9;"));
+    lines.push(p("\tshl.b64 %rd8, %rd8, 2;"));
+    lines.push(p("\tadd.u64 %rd8, %rd0, %rd8; // %rd8 = x_row_base"));
+    lines.push(String::new());
+
+    // Init online-softmax accumulators.
+    lines.push(p("\tmov.f32 %fmax, 0fFF800000; // -INF (f32, IEEE 754 binary32)"));
+    lines.push(p("\tmov.f32 %fsum, 0f00000000; // 0.0"));
+    lines.push(String::new());
+
+    // Outer tile loop.
+    lines.push(p("\tmov.u32 %r3, 0; // tile_idx"));
+    lines.push(p("TILE_LOOP:"));
+    lines.push(format!("\t\tmul.lo.u32 %r4, %r3, {vtile}; // v_base"));
+    lines.push(String::new());
+
+    // Inner loop: stride-128 through tile.
+    lines.push(p("\t\tmov.u32 %r5, 0; // sub-tile counter"));
+    lines.push(p("\t\tINNER_LOOP:"));
+    lines.push(p("\t\t\tmul.lo.u32 %r6, %r5, 128;"));
+    lines.push(p("\t\t\tadd.u32 %r6, %r6, %r1;"));
+    lines.push(p("\t\t\tadd.u32 %r6, %r6, %r4; // v_idx"));
+    lines.push(format!("\t\t\tsetp.lt.u32 %pv, %r6, {vocab};"));
+    lines.push(p("\t\t\t@!%pv bra INNER_SKIP;"));
+    lines.push(String::new());
+
+    // W_row_base = W + v_idx * H * 4.
+    lines.push(format!("\t\t\t// W_row_base = W + v_idx * {hidden} * 4"));
+    lines.push(p("\t\t\tcvt.u64.u32 %rd10, %r6;"));
+    lines.push(format!("\t\t\tmov.u32 %r7, {hidden};"));
+    lines.push(p("\t\t\tcvt.u64.u32 %rd11, %r7;"));
+    lines.push(p("\t\t\tmul.lo.u64 %rd10, %rd10, %rd11;"));
+    lines.push(p("\t\t\tshl.b64 %rd10, %rd10, 2;"));
+    lines.push(p("\t\t\tadd.u64 %rd10, %rd1, %rd10; // %rd10 = W_row_base"));
+    lines.push(String::new());
+
+    // Dot-product loop.
+    lines.push(p("\t\t\tmov.f32 %facc, 0f00000000;"));
+    lines.push(p("\t\t\tmov.u32 %r8, 0; // h"));
+    lines.push(p("\t\t\tDOT_LOOP:"));
+    lines.push(p("\t\t\t\tcvt.u64.u32 %rd12, %r8;"));
+    lines.push(p("\t\t\t\tshl.b64 %rd12, %rd12, 2; // h * 4"));
+    lines.push(p("\t\t\t\tadd.u64 %rd13, %rd8, %rd12; // x_row_base + h*4"));
+    lines.push(p("\t\t\t\tld.global.f32 %fa, [%rd13];"));
+    lines.push(p("\t\t\t\tadd.u64 %rd14, %rd10, %rd12; // W_row_base + h*4"));
+    lines.push(p("\t\t\t\tld.global.f32 %fb, [%rd14];"));
+    lines.push(p("\t\t\t\tfma.rn.f32 %facc, %fa, %fb, %facc;"));
+    lines.push(p("\t\t\t\tadd.u32 %r8, %r8, 1;"));
+    lines.push(format!("\t\t\t\tsetp.lt.u32 %pv, %r8, {hidden};"));
+    lines.push(p("\t\t\t\t@%pv bra DOT_LOOP;"));
+    lines.push(String::new());
+
+    // Add bias[v_idx].
+    lines.push(p("\t\t\t// facc += bias[v_idx]"));
+    lines.push(p("\t\t\tcvt.u64.u32 %rd15, %r6;"));
+    lines.push(p("\t\t\tshl.b64 %rd15, %rd15, 2;"));
+    lines.push(p("\t\t\tadd.u64 %rd15, %rd2, %rd15;"));
+    lines.push(p("\t\t\tld.global.f32 %ftmp, [%rd15];"));
+    lines.push(p("\t\t\tadd.f32 %facc, %facc, %ftmp;"));
+    lines.push(String::new());
+
+    // Store logit to smem tile.
+    // thread_local_slot = r5*128 + tid  (unique within vtile since vtile = vtile_per_thread * 128)
+    lines.push(p("\t\t\t// Store logit to smem_scratch[(r5*128+tid)*4]"));
+    lines.push(p("\t\t\tmul.lo.u32 %r9, %r5, 128;"));
+    lines.push(p("\t\t\tadd.u32 %r9, %r9, %r1;"));
+    lines.push(p("\t\t\tshl.b32 %r9, %r9, 2;"));
+    lines.push(p("\t\t\tmov.u64 %rd16, smem_scratch;"));
+    lines.push(p("\t\t\tcvt.u64.u32 %rd17, %r9;"));
+    lines.push(p("\t\t\tadd.u64 %rd16, %rd16, %rd17;"));
+    lines.push(p("\t\t\tst.shared.f32 [%rd16], %facc;"));
+    lines.push(String::new());
+
+    // If v_idx == target, store logit_at_target to smem scratch slot.
+    // Any thread may write here; only one thread will have v_idx == target.
+    lines.push(p("\t\t\t// If v_idx == target, record logit_at_target in smem"));
+    lines.push(p("\t\t\tcvt.s64.u32 %rd18, %r6;"));
+    lines.push(p("\t\t\tsetp.eq.s64 %ptgt, %rd18, %tgt64;"));
+    lines.push(p("\t\t\t@!%ptgt bra NOT_TARGET;"));
+    lines.push(p("\t\t\tmov.u64 %rd19, smem_scratch;"));
+    lines.push(format!("\t\t\tadd.u64 %rd19, %rd19, {lat_offset};"));
+    lines.push(p("\t\t\tst.shared.f32 [%rd19], %facc;"));
+    lines.push(p("\t\t\tNOT_TARGET:"));
+    lines.push(String::new());
+
+    lines.push(p("\t\t\tINNER_SKIP:"));
+    lines.push(p("\t\t\tadd.u32 %r5, %r5, 1;"));
+    lines.push(format!("\t\t\tsetp.lt.u32 %pv, %r5, {vtile_per_thread};"));
+    lines.push(p("\t\t\t@%pv bra INNER_LOOP;"));
+    lines.push(String::new());
+
+    // Sync: all logits now in smem.
+    lines.push(p("\t\tbar.sync 0;"));
+    lines.push(String::new());
+
+    // Thread 0: scan smem tile, update running max+sum via online softmax.
+    lines.push(p("\t\tsetp.eq.u32 %pth0, %r1, 0;"));
+    lines.push(p("\t\t@!%pth0 bra TILE_REDUCE_DONE;"));
+    lines.push(String::new());
+
+    // Step 1: find tile_max.
+    lines.push(p("\t\tmov.f32 %ftmax, 0fFF800000; // -INF (f32)"));
+    lines.push(p("\t\tmov.u32 %r10, 0;"));
+    lines.push(p("\t\tSMEM_MAX_LOOP:"));
+    lines.push(p("\t\t\tadd.u32 %r11, %r4, %r10; // v_base + i"));
+    lines.push(format!("\t\t\tsetp.lt.u32 %pv, %r11, {vocab};"));
+    lines.push(p("\t\t\t@!%pv bra SMEM_MAX_DONE;"));
+    lines.push(p("\t\t\tshl.b32 %r12, %r10, 2;"));
+    lines.push(p("\t\t\tmov.u64 %rd20, smem_scratch;"));
+    lines.push(p("\t\t\tcvt.u64.u32 %rd21, %r12;"));
+    lines.push(p("\t\t\tadd.u64 %rd20, %rd20, %rd21;"));
+    lines.push(p("\t\t\tld.shared.f32 %ftmp, [%rd20];"));
+    lines.push(p("\t\t\tmax.f32 %ftmax, %ftmax, %ftmp;"));
+    lines.push(p("\t\t\tadd.u32 %r10, %r10, 1;"));
+    lines.push(format!("\t\t\tsetp.lt.u32 %pv, %r10, {vtile};"));
+    lines.push(p("\t\t\t@%pv bra SMEM_MAX_LOOP;"));
+    lines.push(p("\t\tSMEM_MAX_DONE:"));
+    lines.push(String::new());
+
+    // Online softmax update: new_max = max(running_max, tile_max).
+    // rescale: fsum *= exp(fmax - new_max)
+    // accumulate: fsum += sum_v exp(logit_v - new_max)
+    lines.push(p("\t\t// Online-softmax update"));
+    lines.push(p("\t\tmax.f32 %flog, %fmax, %ftmax; // new_max (reuse %flog temporarily)"));
+    lines.push(p("\t\tsub.f32 %fmax, %fmax, %flog; // old_max - new_max (negative or 0)"));
+    lines.push(p("\t\tmul.f32 %fmax, %fmax, %flog2e;"));
+    lines.push(p("\t\tex2.approx.f32 %fmax, %fmax; // exp(old_max - new_max)"));
+    lines.push(p("\t\tmul.f32 %fsum, %fsum, %fmax; // rescale"));
+    lines.push(p("\t\tmov.f32 %fmax, %flog; // fmax = new_max"));
+    lines.push(String::new());
+
+    // Accumulate tile sum.
+    lines.push(p("\t\tmov.u32 %r10, 0;"));
+    lines.push(p("\t\tSMEM_SUM_LOOP:"));
+    lines.push(p("\t\t\tadd.u32 %r11, %r4, %r10;"));
+    lines.push(format!("\t\t\tsetp.lt.u32 %pv, %r11, {vocab};"));
+    lines.push(p("\t\t\t@!%pv bra SMEM_SUM_DONE;"));
+    lines.push(p("\t\t\tshl.b32 %r12, %r10, 2;"));
+    lines.push(p("\t\t\tmov.u64 %rd20, smem_scratch;"));
+    lines.push(p("\t\t\tcvt.u64.u32 %rd21, %r12;"));
+    lines.push(p("\t\t\tadd.u64 %rd20, %rd20, %rd21;"));
+    lines.push(p("\t\t\tld.shared.f32 %ftmp, [%rd20];"));
+    lines.push(p("\t\t\tsub.f32 %ftmp, %ftmp, %fmax; // logit - new_max"));
+    lines.push(p("\t\t\tmul.f32 %ftmp, %ftmp, %flog2e;"));
+    lines.push(p("\t\t\tex2.approx.f32 %ftmp, %ftmp;"));
+    lines.push(p("\t\t\tadd.f32 %fsum, %fsum, %ftmp;"));
+    lines.push(p("\t\t\tadd.u32 %r10, %r10, 1;"));
+    lines.push(format!("\t\t\tsetp.lt.u32 %pv, %r10, {vtile};"));
+    lines.push(p("\t\t\t@%pv bra SMEM_SUM_LOOP;"));
+    lines.push(p("\t\tSMEM_SUM_DONE:"));
+    lines.push(String::new());
+
+    lines.push(p("\t\tTILE_REDUCE_DONE:"));
+    lines.push(p("\t\tbar.sync 0;"));
+    lines.push(String::new());
+
+    // Advance tile.
+    lines.push(p("\t\tadd.u32 %r3, %r3, 1;"));
+    lines.push(format!("\t\tsetp.lt.u32 %pv, %r3, {n_tiles};"));
+    lines.push(p("\t\t@%pv bra TILE_LOOP;"));
+    lines.push(String::new());
+
+    // After tile loop: thread 0 computes lse and loss.
+    lines.push(p("\tsetp.eq.u32 %pth0, %r1, 0;"));
+    lines.push(p("\t@!%pth0 bra WRITE_DONE;"));
+    lines.push(String::new());
+
+    // lse = log(fsum) + fmax.
+    lines.push(p("\tlg2.approx.f32 %flse, %fsum; // log2(sum_exp)"));
+    lines.push(p("\tmul.f32 %flse, %flse, %fln2; // ln(sum_exp)"));
+    lines.push(p("\tadd.f32 %flse, %flse, %fmax; // lse = ln(sum_exp) + max"));
+    lines.push(String::new());
+
+    // logit_at_target from smem.
+    lines.push(p("\tmov.u64 %rd22, smem_scratch;"));
+    lines.push(format!("\tadd.u64 %rd22, %rd22, {lat_offset};"));
+    lines.push(p("\tld.shared.f32 %flog, [%rd22]; // logit_at_target"));
+    lines.push(String::new());
+
+    // loss = lse - logit_at_target.
+    lines.push(p("\tsub.f32 %floss, %flse, %flog;"));
+    lines.push(String::new());
+
+    // Write to HBM.
+    lines.push(p("\tcvt.u64.u32 %rd23, %r0;"));
+    lines.push(p("\tshl.b64 %rd23, %rd23, 2;"));
+    lines.push(p("\tadd.u64 %rd24, %rd4, %rd23;"));
+    lines.push(p("\tst.global.f32 [%rd24], %floss;"));
+    lines.push(p("\tadd.u64 %rd24, %rd5, %rd23;"));
+    lines.push(p("\tst.global.f32 [%rd24], %flse;"));
+    lines.push(p("\tbra WRITE_DONE;"));
+    lines.push(String::new());
+
+    // Skip label: write zeros.
+    lines.push(p("SKIP_LABEL:"));
+    lines.push(p("\tsetp.eq.u32 %pth0, %r1, 0;"));
+    lines.push(p("\t@!%pth0 bra WRITE_DONE;"));
+    lines.push(p("\tcvt.u64.u32 %rd23, %r0;"));
+    lines.push(p("\tshl.b64 %rd23, %rd23, 2;"));
+    lines.push(p("\tadd.u64 %rd24, %rd4, %rd23;"));
+    lines.push(p("\tst.global.f32 [%rd24], 0f00000000;"));
+    lines.push(p("\tadd.u64 %rd24, %rd5, %rd23;"));
+    lines.push(p("\tst.global.f32 [%rd24], 0f00000000;"));
+    lines.push(String::new());
+
+    lines.push(p("WRITE_DONE:"));
+    lines.push(p("\tret;"));
+    lines.push(p("}"));
+
+    lines.join("\n")
 }
 
-/// `[logits: vocab_tile][logit_at_target: 1]`, both in the storage dtype,
-/// dynamic (the launcher passes [`FusedLinearCEConfig::shared_mem_bytes`],
-/// which covers it).
-fn v1_forward_smem(cfg: &FusedLinearCEConfig) -> SmemLayout {
-    let elem = elem_type(cfg.dtype);
-    let bytes = cfg.dtype.bytes_per_elem();
-    let region = |name: &str, elems: u32| SmemRegion {
-        name: name.to_string(),
-        bytes: elems * bytes,
-        align: bytes,
-        elem: elem.clone(),
-    };
-    SmemLayout { regions: vec![region("logits", cfg.vocab_tile), region("logit_at_target", 1)], dynamic: true }
-}
+// ── F16 forward kernel ───────────────────────────────────────────────────────
+//
+// Mixed-precision convention (Sprint v3-2):
+//   * HBM loads of x, W, bias are `ld.global.b16` → `cvt.f32.f16` into f32
+//     math registers (the dot-product accumulators).
+//   * SMEM logit tile is stored as `.b16` (2 bytes/elem) — the per-tile
+//     online-LSE reduction loads `.b16`, converts to f32, then folds into
+//     the f32 max + sum registers. This halves the SMEM footprint vs F32.
+//   * +INF / -INF sentinels and the log2e + ln2 constants live in f32
+//     registers; the online-LSE algorithm is bit-for-bit the same as F32.
+//   * HBM outputs `loss_out` and `lse_out` are written as `.f32` (per
+//     convention; downstream backward consumes the same f32 lse).
+//
+// The kernel layout, loop structure, sync points, and SMEM partitioning
+// mirror `emit_fwd_kernel` exactly — only the dtype of HBM/SMEM staging
+// changes. Keeping the structure parallel preserves the option of merging
+// the two emitters in a future refactor (deferred for byte-identity safety).
+fn emit_fwd_kernel_f16(cfg: &FusedLinearCEConfig) -> String {
+    let name = cfg.kernel_name();
+    let vocab = cfg.vocab_size;
+    let hidden = cfg.hidden_size;
+    let vtile = cfg.vocab_tile;
+    let n_tiles = vocab.div_ceil(vtile);
+    let vtile_per_thread = vtile / 128;
+    let ignore = cfg.ignore_index;
+    let smem_bytes = cfg.shared_mem_bytes();
+    // F16 SMEM: 2 bytes/elem instead of 4. logit_at_target scratch slot lives
+    // immediately after the tile and ALSO uses 2 bytes; the +32 padding in
+    // shared_mem_bytes() leaves ample room.
+    let elem_bytes = cfg.dtype.bytes_per_elem(); // = 2 for F16
+    let lat_offset = vtile * elem_bytes;
 
-fn i64_const(b: &mut KirBuilder, v: i64) -> VarId {
-    let dst = b.new_typed_var(KirType::I64);
-    b.emit(KirOp::Const(dst, KirConst { ty: KirType::I64, value: ConstValue::I64(v) }));
-    dst
-}
+    let mut lines: Vec<String> = Vec::new();
+    let p = |l: &str| l.to_owned();
 
-/// A storage-dtype element as f32: loaded, and widened unless it is f32.
-fn load_elem(b: &mut KirBuilder, dtype: Dtype, addr: VarId, space: AddressSpace) -> VarId {
-    let raw = load(b, elem_type(dtype), addr, space);
-    if dtype == Dtype::F32 {
-        return raw;
-    }
-    let wide = b.new_typed_var(KirType::F32);
-    b.emit(KirOp::Cast(wide, raw, KirType::F32));
-    wide
-}
+    lines.push(cfg.ptx_header());
+    // `.align 2` because the SMEM is half-precision; ptxas auto-aligns to 4
+    // for the +INF sentinel store anyway — but the declared align matches
+    // the dtype.
+    lines.push(format!(".extern .shared .align 2 .b8 smem_scratch[{smem_bytes}];"));
+    lines.push(String::new());
+    lines.push(format!(".visible .entry {name}("));
+    lines.push(p("\t.param .u64 param_x,"));
+    lines.push(p("\t.param .u64 param_w,"));
+    lines.push(p("\t.param .u64 param_bias,"));
+    lines.push(p("\t.param .u64 param_targets,"));
+    lines.push(p("\t.param .u64 param_loss_out,"));
+    lines.push(p("\t.param .u64 param_lse_out,"));
+    lines.push(p("\t.param .u32 param_B, .param .u32 param_S,"));
+    lines.push(p("\t.param .u32 param_V, .param .u32 param_H"));
+    lines.push(p(") {"));
+    // Registers.
+    lines.push(p("\t.reg .u64 %rd<30>;"));
+    lines.push(p("\t.reg .u32 %r<20>;"));
+    lines.push(p("\t.reg .s64 %tgt64;"));
+    lines.push(p("\t.reg .b16 %h0, %h1, %h2;"));
+    lines.push(p("\t.reg .f32 %flog, %facc, %fmax, %fsum, %ftmax, %flse, %floss;"));
+    lines.push(p("\t.reg .f32 %fa, %fb, %flog2e, %fln2, %ftmp;"));
+    lines.push(p("\t.reg .pred %pskip, %pv, %pth0, %ptgt;"));
+    lines.push(String::new());
 
-/// An f32 value in the storage dtype: rounded to nearest unless it is f32.
-fn to_elem(b: &mut KirBuilder, dtype: Dtype, v: VarId) -> VarId {
-    if dtype == Dtype::F32 {
-        return v;
-    }
-    let ty = elem_type(dtype);
-    let narrow = b.new_typed_var(ty.clone());
-    b.emit(KirOp::Cast(narrow, v, ty));
-    narrow
-}
+    // Load params.
+    lines.push(p("\tld.param.u64 %rd0, [param_x];"));
+    lines.push(p("\tld.param.u64 %rd1, [param_w];"));
+    lines.push(p("\tld.param.u64 %rd2, [param_bias];"));
+    lines.push(p("\tld.param.u64 %rd3, [param_targets];"));
+    lines.push(p("\tld.param.u64 %rd4, [param_loss_out];"));
+    lines.push(p("\tld.param.u64 %rd5, [param_lse_out];"));
+    lines.push(p("\tmov.u32 %r0, %ctaid.x;   // row_idx"));
+    lines.push(p("\tmov.u32 %r1, %tid.x;     // tid"));
+    lines.push(p("\tmov.f32 %flog2e, 0f3FB8AA3B; // log2(e)"));
+    lines.push(p("\tmov.f32 %fln2,   0f3F317218; // ln(2)"));
+    lines.push(String::new());
 
-/// `for (i = start; i < end; i += step) body(i)`, entered from the current
-/// block; the builder is left in the loop's exit block.
-fn counted_loop(
-    b: &mut KirBuilder,
-    (start, end, step): (VarId, VarId, VarId),
-    body: impl FnOnce(&mut KirBuilder, VarId),
-) {
-    let head = b.new_block();
-    let body_block = b.new_block();
-    let done = b.new_block();
-    let i = b.add_block_param(head, KirType::U32);
-    b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![start])));
+    // Thread 0 initialises logit_at_target smem slot to -INF (as fp16
+    // bit-pattern 0xFBFF = -65504, the most negative finite fp16; the
+    // logit_at_target slot is only consumed if the target was found, so a
+    // strict -INF bit-pattern is not required — but using fp16 -INF
+    // (0xFC00) keeps the semantics matched).
+    lines.push(p("\tsetp.eq.u32 %pth0, %r1, 0;"));
+    lines.push(p("\t@!%pth0 bra INIT_DONE;"));
+    lines.push(p("\tmov.u64 %rd6, smem_scratch;"));
+    lines.push(format!("\tadd.u64 %rd6, %rd6, {lat_offset};"));
+    lines.push(p("\tmov.b16 %h0, 0xFC00; // fp16 -INF sentinel"));
+    lines.push(p("\tst.shared.b16 [%rd6], %h0;"));
+    lines.push(p("INIT_DONE:"));
+    lines.push(p("\tbar.sync 0;"));
+    lines.push(String::new());
 
-    b.set_block(head);
-    let finished = cmp(b, i, end, CmpOp::Ge);
-    b.terminate(KirTerminator::CondBranch(finished, KirEdge::to(done), KirEdge::to(body_block)));
+    // Load target[row_idx].
+    lines.push(p("\t// Load targets[row_idx] (i64)"));
+    lines.push(p("\tcvt.u64.u32 %rd7, %r0;"));
+    lines.push(p("\tmul.lo.u64 %rd7, %rd7, 8;"));
+    lines.push(p("\tadd.u64 %rd7, %rd3, %rd7;"));
+    lines.push(p("\tld.global.s64 %tgt64, [%rd7];"));
+    lines.push(String::new());
 
-    b.set_block(body_block);
-    body(b, i);
-    let next = op2(b, KirType::U32, KirOp::Add, i, step);
-    b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![next])));
+    // Skip branch.
+    lines.push(format!("\t// setp.eq.s64: if target == {ignore} skip"));
+    lines.push(format!("\tsetp.eq.s64 %pskip, %tgt64, {ignore};"));
+    lines.push(p("\t@%pskip bra SKIP_LABEL;"));
+    lines.push(String::new());
 
-    b.set_block(done);
-}
-
-/// Build the v1 single-CTA forward kernel (vocab ≤ 8192) as KIR.
-///
-/// One CTA per token row, 128 threads. The CFG, in the hand kernels' order:
-///
-/// ```text
-/// entry        thread 0 stores -inf to the logit-at-target slot   bar
-///              target = targets[row]; target == ignore_index ? skip : body
-/// body         per vocab tile (tile, max, sum):
-///                per sub-tile j: v = tile*vtile + j*128 + tid; v < V ?
-///                  logit = fma-dot(x[row], W[v]) + bias[v]
-///                  logits[j*128 + tid] = elem(logit)
-///                  v == target ? logit_at_target = elem(logit)
-///                bar
-///                thread 0: tile max (first -inf), rescale, tile sum
-///                bar
-///              thread 0: lse = log(sum) + max; loss = lse - logit_at_target
-///              loss_out[row] = loss; lse_out[row] = lse
-/// skip         thread 0: loss_out[row] = lse_out[row] = 0
-/// ```
-///
-/// Only thread 0's running max and sum are meaningful; the other threads
-/// carry their initial values through the tile loop, as the hand kernels'
-/// untouched registers did.
-pub fn build_forward(cfg: &FusedLinearCEConfig) -> KernelIR {
-    use AddressSpace::{Global, Shared};
-    use KirType::{F32, I64, U32, U64};
-
-    assert!(!cfg.is_large_vocab(), "the v1 forward serves vocab <= {LARGE_VOCAB_THRESHOLD}");
-    let dtype = cfg.dtype;
-    let elem = elem_type(dtype);
-    let n_tiles = cfg.vocab_size.div_ceil(cfg.vocab_tile);
-
-    let mut b = KirBuilder::new(&cfg.kernel_name());
-    // The params, in FFI order (the launcher marshals them positionally).
-    // B, S, V and H are baked; the params stay for the launch ABI.
-    let x = b.add_param("x", ptr(elem.clone(), Global), Global);
-    let w = b.add_param("w", ptr(elem.clone(), Global), Global);
-    let bias = b.add_param("bias", ptr(elem.clone(), Global), Global);
-    let targets = b.add_param("targets", ptr(I64, Global), Global);
-    let loss_out = b.add_param("loss_out", ptr(F32, Global), Global);
-    let lse_out = b.add_param("lse_out", ptr(F32, Global), Global);
-    for name in ["B", "S", "V", "H"] {
-        b.add_param(name, U32, Global);
-    }
-    b.set_smem_layout(v1_forward_smem(cfg));
-    b.set_workgroup_size([V1_BLOCK, 1, 1]);
-
-    let entry = b.new_block();
-    b.set_block(entry);
-    let row = b.new_typed_var(U32);
-    b.emit(KirOp::BlockIdx(row, 0));
-    let tid = b.new_typed_var(U32);
-    b.emit(KirOp::ThreadId(tid, 0));
-    let zero = konst(&mut b, ConstValue::U32(0));
-    let one = konst(&mut b, ConstValue::U32(1));
-    let region = |b: &mut KirBuilder, r: u32| {
-        let dst = b.new_typed_var(ptr(elem.clone(), Shared));
-        b.emit(KirOp::SharedRegion { dst, region: r });
-        dst
-    };
-    let logits = region(&mut b, R_LOGITS);
-    let target_slot = region(&mut b, R_TARGET);
-    let f_neg_inf = konst(&mut b, ConstValue::F32(f32::NEG_INFINITY));
-    let f_zero = konst(&mut b, ConstValue::F32(0.0));
-
-    // Thread 0 initialises the logit-at-target slot to -inf.
-    let init = b.new_block();
-    let init_done = b.new_block();
-    let is_thread0 = cmp(&mut b, tid, zero, CmpOp::Eq);
-    b.terminate(KirTerminator::CondBranch(is_thread0, KirEdge::to(init), KirEdge::to(init_done)));
-    b.set_block(init);
-    let sentinel = to_elem(&mut b, dtype, f_neg_inf);
-    b.emit(KirOp::Store(target_slot, sentinel, Shared));
-    b.terminate(KirTerminator::Branch(KirEdge::to(init_done)));
-
-    b.set_block(init_done);
-    b.emit(KirOp::Barrier);
-    let target_addr = at(&mut b, I64, Global, targets, row);
-    let target = load(&mut b, I64, target_addr, Global);
-    let ignore = i64_const(&mut b, cfg.ignore_index);
-    let skips = cmp(&mut b, target, ignore, CmpOp::Eq);
-    let body = b.new_block();
-    let skip = b.new_block();
-    let exit = b.new_block();
-    b.terminate(KirTerminator::CondBranch(skips, KirEdge::to(skip), KirEdge::to(body)));
-
-    // ── the vocab tile loop ─────────────────────────────────────────────
-    b.set_block(body);
-    let hidden = konst(&mut b, ConstValue::U32(cfg.hidden_size));
-    let hidden_wide = konst(&mut b, ConstValue::U64(cfg.hidden_size as u64));
-    let vocab = konst(&mut b, ConstValue::U32(cfg.vocab_size));
-    let vtile = konst(&mut b, ConstValue::U32(cfg.vocab_tile));
-    let block = konst(&mut b, ConstValue::U32(V1_BLOCK));
-    let row_wide = widen(&mut b, row);
-    let x_row = op2(&mut b, U64, KirOp::Mul, row_wide, hidden_wide);
-
-    let tile_head = b.new_block();
-    let tile_body = b.new_block();
-    let tiles_done = b.new_block();
-    let tile = b.add_block_param(tile_head, U32);
-    let run_max = b.add_block_param(tile_head, F32);
-    let run_sum = b.add_block_param(tile_head, F32);
-    b.terminate(KirTerminator::Branch(KirEdge::with(tile_head, vec![zero, f_neg_inf, f_zero])));
-
-    b.set_block(tile_head);
-    let n_tiles_c = konst(&mut b, ConstValue::U32(n_tiles));
-    let tiles_finished = cmp(&mut b, tile, n_tiles_c, CmpOp::Ge);
-    b.terminate(KirTerminator::CondBranch(tiles_finished, KirEdge::to(tiles_done), KirEdge::to(tile_body)));
-
-    b.set_block(tile_body);
-    let v_base = op2(&mut b, U32, KirOp::Mul, tile, vtile);
-    let per_thread = konst(&mut b, ConstValue::U32(cfg.vocab_tile / V1_BLOCK));
-    counted_loop(&mut b, (zero, per_thread, one), |b, j| {
-        let lane_base = op2(b, U32, KirOp::Mul, j, block);
-        let slot = op2(b, U32, KirOp::Add, lane_base, tid);
-        let v = op2(b, U32, KirOp::Add, slot, v_base);
-        let in_vocab = cmp(b, v, vocab, CmpOp::Lt);
-        let fill = b.new_block();
-        let fill_done = b.new_block();
-        b.terminate(KirTerminator::CondBranch(in_vocab, KirEdge::to(fill), KirEdge::to(fill_done)));
-
-        b.set_block(fill);
-        let v_wide = widen(b, v);
-        let w_row = op2(b, U64, KirOp::Mul, v_wide, hidden_wide);
-        // logit = sum_h fma(x[row, h], W[v, h], acc)
-        let dot_head = b.new_block();
-        let dot_body = b.new_block();
-        let dot_done = b.new_block();
-        let h = b.add_block_param(dot_head, U32);
-        let acc = b.add_block_param(dot_head, F32);
-        b.terminate(KirTerminator::Branch(KirEdge::with(dot_head, vec![zero, f_zero])));
-        b.set_block(dot_head);
-        let dot_finished = cmp(b, h, hidden, CmpOp::Ge);
-        b.terminate(KirTerminator::CondBranch(dot_finished, KirEdge::to(dot_done), KirEdge::to(dot_body)));
-        b.set_block(dot_body);
-        let h_wide = widen(b, h);
-        let x_index = op2(b, U64, KirOp::Add, x_row, h_wide);
-        let x_addr = at(b, elem.clone(), Global, x, x_index);
-        let xv = load_elem(b, dtype, x_addr, Global);
-        let w_index = op2(b, U64, KirOp::Add, w_row, h_wide);
-        let w_addr = at(b, elem.clone(), Global, w, w_index);
-        let wv = load_elem(b, dtype, w_addr, Global);
-        let acc_next = b.new_typed_var(F32);
-        b.emit(KirOp::Fma(acc_next, xv, wv, acc));
-        let h_next = op2(b, U32, KirOp::Add, h, one);
-        b.terminate(KirTerminator::Branch(KirEdge::with(dot_head, vec![h_next, acc_next])));
-
-        b.set_block(dot_done);
-        let bias_addr = at(b, elem.clone(), Global, bias, v);
-        let bias_v = load_elem(b, dtype, bias_addr, Global);
-        let logit = op2(b, F32, KirOp::Add, acc, bias_v);
-        let stored = to_elem(b, dtype, logit);
-        let logit_addr = at(b, elem.clone(), Shared, logits, slot);
-        b.emit(KirOp::Store(logit_addr, stored, Shared));
-        // Only the thread holding the target's column writes the slot.
-        let v_signed = b.new_typed_var(I64);
-        b.emit(KirOp::Cast(v_signed, v, I64));
-        let is_target = cmp(b, v_signed, target, CmpOp::Eq);
-        let record = b.new_block();
-        b.terminate(KirTerminator::CondBranch(is_target, KirEdge::to(record), KirEdge::to(fill_done)));
-        b.set_block(record);
-        b.emit(KirOp::Store(target_slot, stored, Shared));
-        b.terminate(KirTerminator::Branch(KirEdge::to(fill_done)));
-
-        b.set_block(fill_done);
-    });
-    // Every logit of the tile is in shared memory.
-    b.emit(KirOp::Barrier);
-
-    // Thread 0: the tile's max, the rescale, the tile's sum.
-    let reduce = b.new_block();
-    let reduce_done = b.new_block();
-    let max_next = b.add_block_param(reduce_done, F32);
-    let sum_next = b.add_block_param(reduce_done, F32);
-    let not_thread0 = cmp(&mut b, tid, zero, CmpOp::Ne);
-    b.terminate(KirTerminator::CondBranch(
-        not_thread0,
-        KirEdge::with(reduce_done, vec![run_max, run_sum]),
-        KirEdge::to(reduce),
+    // x_row_base = x + row * H * 2 (fp16: 2 bytes/elem).
+    lines.push(format!(
+        "\t// x_row_base = x + row_idx * {hidden} * {elem_bytes}"
     ));
+    lines.push(p("\tcvt.u64.u32 %rd8, %r0;"));
+    lines.push(format!("\tmov.u32 %r2, {hidden};"));
+    lines.push(p("\tcvt.u64.u32 %rd9, %r2;"));
+    lines.push(p("\tmul.lo.u64 %rd8, %rd8, %rd9;"));
+    lines.push(p("\tshl.b64 %rd8, %rd8, 1; // *2 for fp16"));
+    lines.push(p("\tadd.u64 %rd8, %rd0, %rd8; // %rd8 = x_row_base"));
+    lines.push(String::new());
 
-    b.set_block(reduce);
-    // A scan over the tile's first `vtile` entries that stops at the vocab.
-    let scan = |b: &mut KirBuilder, acc0: VarId, step: &dyn Fn(&mut KirBuilder, VarId, VarId) -> VarId| -> VarId {
-        let head = b.new_block();
-        let body = b.new_block();
-        let done = b.new_block();
-        let i = b.add_block_param(head, U32);
-        let acc = b.add_block_param(head, F32);
-        let out = b.add_block_param(done, F32);
-        b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![zero, acc0])));
-        b.set_block(head);
-        let v = op2(b, U32, KirOp::Add, v_base, i);
-        let in_vocab = cmp(b, v, vocab, CmpOp::Lt);
-        let in_tile = b.new_block();
-        b.terminate(KirTerminator::CondBranch(in_vocab, KirEdge::to(in_tile), KirEdge::with(done, vec![acc])));
-        b.set_block(in_tile);
-        let tile_open = cmp(b, i, vtile, CmpOp::Lt);
-        b.terminate(KirTerminator::CondBranch(tile_open, KirEdge::to(body), KirEdge::with(done, vec![acc])));
-        b.set_block(body);
-        let addr = at(b, elem.clone(), Shared, logits, i);
-        let s = load_elem(b, dtype, addr, Shared);
-        let acc_next = step(b, acc, s);
-        let i_next = op2(b, U32, KirOp::Add, i, one);
-        b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![i_next, acc_next])));
-        b.set_block(done);
-        out
-    };
-    let tile_max = scan(&mut b, f_neg_inf, &|b, m, s| op2(b, F32, KirOp::Max, m, s));
-    let new_max = op2(&mut b, F32, KirOp::Max, run_max, tile_max);
-    let shift = op2(&mut b, F32, KirOp::Sub, run_max, new_max);
-    let rescale = b.new_typed_var(F32);
-    b.emit(KirOp::Exp(rescale, shift));
-    let rescaled = op2(&mut b, F32, KirOp::Mul, run_sum, rescale);
-    let tile_sum = scan(&mut b, rescaled, &|b, acc, s| {
-        let d = op2(b, F32, KirOp::Sub, s, new_max);
-        let e = b.new_typed_var(F32);
-        b.emit(KirOp::Exp(e, d));
-        op2(b, F32, KirOp::Add, acc, e)
-    });
-    b.terminate(KirTerminator::Branch(KirEdge::with(reduce_done, vec![new_max, tile_sum])));
+    // Init online-softmax accumulators (f32).
+    lines.push(p("\tmov.f32 %fmax, 0fFF800000; // -INF (f32, IEEE 754 binary32 sign=1 exp=0xFF mant=0)"));
+    lines.push(p("\tmov.f32 %fsum, 0f00000000;"));
+    lines.push(String::new());
 
-    // The logits tile is refilled next tile.
-    b.set_block(reduce_done);
-    b.emit(KirOp::Barrier);
-    let tile_next = op2(&mut b, U32, KirOp::Add, tile, one);
-    b.terminate(KirTerminator::Branch(KirEdge::with(tile_head, vec![tile_next, max_next, sum_next])));
+    // Outer tile loop.
+    lines.push(p("\tmov.u32 %r3, 0; // tile_idx"));
+    lines.push(p("TILE_LOOP:"));
+    lines.push(format!("\t\tmul.lo.u32 %r4, %r3, {vtile}; // v_base"));
+    lines.push(String::new());
 
-    // ── thread 0 writes loss and lse ────────────────────────────────────
-    b.set_block(tiles_done);
-    let write = b.new_block();
-    let not_writer = cmp(&mut b, tid, zero, CmpOp::Ne);
-    b.terminate(KirTerminator::CondBranch(not_writer, KirEdge::to(exit), KirEdge::to(write)));
-    b.set_block(write);
-    let log_sum = b.new_typed_var(F32);
-    b.emit(KirOp::Log(log_sum, run_sum));
-    let lse = op2(&mut b, F32, KirOp::Add, log_sum, run_max);
-    let logit_at_target = load_elem(&mut b, dtype, target_slot, Shared);
-    let loss = op2(&mut b, F32, KirOp::Sub, lse, logit_at_target);
-    let loss_addr = at(&mut b, F32, Global, loss_out, row);
-    b.emit(KirOp::Store(loss_addr, loss, Global));
-    let lse_addr = at(&mut b, F32, Global, lse_out, row);
-    b.emit(KirOp::Store(lse_addr, lse, Global));
-    b.terminate(KirTerminator::Branch(KirEdge::to(exit)));
+    lines.push(p("\t\tmov.u32 %r5, 0; // sub-tile counter"));
+    lines.push(p("\t\tINNER_LOOP:"));
+    lines.push(p("\t\t\tmul.lo.u32 %r6, %r5, 128;"));
+    lines.push(p("\t\t\tadd.u32 %r6, %r6, %r1;"));
+    lines.push(p("\t\t\tadd.u32 %r6, %r6, %r4; // v_idx"));
+    lines.push(format!("\t\t\tsetp.lt.u32 %pv, %r6, {vocab};"));
+    lines.push(p("\t\t\t@!%pv bra INNER_SKIP;"));
+    lines.push(String::new());
 
-    // ── an ignored row: thread 0 writes zeros ───────────────────────────
-    b.set_block(skip);
-    let zero_write = b.new_block();
-    let not_zeroer = cmp(&mut b, tid, zero, CmpOp::Ne);
-    b.terminate(KirTerminator::CondBranch(not_zeroer, KirEdge::to(exit), KirEdge::to(zero_write)));
-    b.set_block(zero_write);
-    let loss_addr = at(&mut b, F32, Global, loss_out, row);
-    b.emit(KirOp::Store(loss_addr, f_zero, Global));
-    let lse_addr = at(&mut b, F32, Global, lse_out, row);
-    b.emit(KirOp::Store(lse_addr, f_zero, Global));
-    b.terminate(KirTerminator::Branch(KirEdge::to(exit)));
+    // W_row_base = W + v_idx * H * 2.
+    lines.push(format!(
+        "\t\t\t// W_row_base = W + v_idx * {hidden} * {elem_bytes}"
+    ));
+    lines.push(p("\t\t\tcvt.u64.u32 %rd10, %r6;"));
+    lines.push(format!("\t\t\tmov.u32 %r7, {hidden};"));
+    lines.push(p("\t\t\tcvt.u64.u32 %rd11, %r7;"));
+    lines.push(p("\t\t\tmul.lo.u64 %rd10, %rd10, %rd11;"));
+    lines.push(p("\t\t\tshl.b64 %rd10, %rd10, 1; // *2 for fp16"));
+    lines.push(p("\t\t\tadd.u64 %rd10, %rd1, %rd10; // %rd10 = W_row_base"));
+    lines.push(String::new());
 
-    b.set_block(exit);
-    b.terminate(KirTerminator::Return);
-    b.finalize()
-}
+    // Dot-product loop — load .b16, cvt to .f32, fma in f32.
+    lines.push(p("\t\t\tmov.f32 %facc, 0f00000000;"));
+    lines.push(p("\t\t\tmov.u32 %r8, 0; // h"));
+    lines.push(p("\t\t\tDOT_LOOP:"));
+    lines.push(p("\t\t\t\tcvt.u64.u32 %rd12, %r8;"));
+    lines.push(p("\t\t\t\tshl.b64 %rd12, %rd12, 1; // h * 2"));
+    lines.push(p("\t\t\t\tadd.u64 %rd13, %rd8, %rd12;"));
+    lines.push(p("\t\t\t\tld.global.b16 %h1, [%rd13];"));
+    lines.push(p("\t\t\t\tcvt.f32.f16 %fa, %h1;"));
+    lines.push(p("\t\t\t\tadd.u64 %rd14, %rd10, %rd12;"));
+    lines.push(p("\t\t\t\tld.global.b16 %h1, [%rd14];"));
+    lines.push(p("\t\t\t\tcvt.f32.f16 %fb, %h1;"));
+    lines.push(p("\t\t\t\tfma.rn.f32 %facc, %fa, %fb, %facc;"));
+    lines.push(p("\t\t\t\tadd.u32 %r8, %r8, 1;"));
+    lines.push(format!("\t\t\t\tsetp.lt.u32 %pv, %r8, {hidden};"));
+    lines.push(p("\t\t\t\t@%pv bra DOT_LOOP;"));
+    lines.push(String::new());
 
-/// The v1 forward module: [`build_forward`], verified and lowered
-/// (null-terminated for `cuModuleLoadData`).
-///
-/// # Panics
-///
-/// If the built kernel fails KIR verification — a bug in this module, not a
-/// condition a caller can provoke.
-fn emit_forward(cfg: &FusedLinearCEConfig) -> Vec<u8> {
-    let ir = build_forward(cfg);
-    if let Err(errors) = crate::kir_verify::verify(&ir) {
-        panic!("{} failed KIR verification: {errors:?}", ir.name);
-    }
-    lower_kir_to_ptx(&ir)
+    // Add bias[v_idx].
+    lines.push(p("\t\t\t// facc += bias[v_idx] (fp16 HBM)"));
+    lines.push(p("\t\t\tcvt.u64.u32 %rd15, %r6;"));
+    lines.push(p("\t\t\tshl.b64 %rd15, %rd15, 1; // *2"));
+    lines.push(p("\t\t\tadd.u64 %rd15, %rd2, %rd15;"));
+    lines.push(p("\t\t\tld.global.b16 %h1, [%rd15];"));
+    lines.push(p("\t\t\tcvt.f32.f16 %ftmp, %h1;"));
+    lines.push(p("\t\t\tadd.f32 %facc, %facc, %ftmp;"));
+    lines.push(String::new());
+
+    // Store logit to smem tile (cvt back to fp16; tile is .b16 stride 2).
+    lines.push(p("\t\t\t// Store logit to smem_scratch[(r5*128+tid)*2] as fp16"));
+    lines.push(p("\t\t\tmul.lo.u32 %r9, %r5, 128;"));
+    lines.push(p("\t\t\tadd.u32 %r9, %r9, %r1;"));
+    lines.push(p("\t\t\tshl.b32 %r9, %r9, 1; // *2"));
+    lines.push(p("\t\t\tmov.u64 %rd16, smem_scratch;"));
+    lines.push(p("\t\t\tcvt.u64.u32 %rd17, %r9;"));
+    lines.push(p("\t\t\tadd.u64 %rd16, %rd16, %rd17;"));
+    lines.push(p("\t\t\tcvt.rn.f16.f32 %h2, %facc;"));
+    lines.push(p("\t\t\tst.shared.b16 [%rd16], %h2;"));
+    lines.push(String::new());
+
+    // If v_idx == target, record logit_at_target in smem (also fp16).
+    lines.push(p("\t\t\t// If v_idx == target, record logit_at_target (fp16)"));
+    lines.push(p("\t\t\tcvt.s64.u32 %rd18, %r6;"));
+    lines.push(p("\t\t\tsetp.eq.s64 %ptgt, %rd18, %tgt64;"));
+    lines.push(p("\t\t\t@!%ptgt bra NOT_TARGET;"));
+    lines.push(p("\t\t\tmov.u64 %rd19, smem_scratch;"));
+    lines.push(format!("\t\t\tadd.u64 %rd19, %rd19, {lat_offset};"));
+    lines.push(p("\t\t\tst.shared.b16 [%rd19], %h2;"));
+    lines.push(p("\t\t\tNOT_TARGET:"));
+    lines.push(String::new());
+
+    lines.push(p("\t\t\tINNER_SKIP:"));
+    lines.push(p("\t\t\tadd.u32 %r5, %r5, 1;"));
+    lines.push(format!("\t\t\tsetp.lt.u32 %pv, %r5, {vtile_per_thread};"));
+    lines.push(p("\t\t\t@%pv bra INNER_LOOP;"));
+    lines.push(String::new());
+
+    // Sync: all logits in smem.
+    lines.push(p("\t\tbar.sync 0;"));
+    lines.push(String::new());
+
+    // Thread 0 reduces smem tile.
+    lines.push(p("\t\tsetp.eq.u32 %pth0, %r1, 0;"));
+    lines.push(p("\t\t@!%pth0 bra TILE_REDUCE_DONE;"));
+    lines.push(String::new());
+
+    // Step 1: find tile_max (read fp16 → cvt to f32, fold into f32 max).
+    lines.push(p("\t\tmov.f32 %ftmax, 0fFF800000; // -INF (f32)"));
+    lines.push(p("\t\tmov.u32 %r10, 0;"));
+    lines.push(p("\t\tSMEM_MAX_LOOP:"));
+    lines.push(p("\t\t\tadd.u32 %r11, %r4, %r10; // v_base + i"));
+    lines.push(format!("\t\t\tsetp.lt.u32 %pv, %r11, {vocab};"));
+    lines.push(p("\t\t\t@!%pv bra SMEM_MAX_DONE;"));
+    lines.push(p("\t\t\tshl.b32 %r12, %r10, 1; // *2"));
+    lines.push(p("\t\t\tmov.u64 %rd20, smem_scratch;"));
+    lines.push(p("\t\t\tcvt.u64.u32 %rd21, %r12;"));
+    lines.push(p("\t\t\tadd.u64 %rd20, %rd20, %rd21;"));
+    lines.push(p("\t\t\tld.shared.b16 %h1, [%rd20];"));
+    lines.push(p("\t\t\tcvt.f32.f16 %ftmp, %h1;"));
+    lines.push(p("\t\t\tmax.f32 %ftmax, %ftmax, %ftmp;"));
+    lines.push(p("\t\t\tadd.u32 %r10, %r10, 1;"));
+    lines.push(format!("\t\t\tsetp.lt.u32 %pv, %r10, {vtile};"));
+    lines.push(p("\t\t\t@%pv bra SMEM_MAX_LOOP;"));
+    lines.push(p("\t\tSMEM_MAX_DONE:"));
+    lines.push(String::new());
+
+    // Online-softmax rescale.
+    lines.push(p("\t\t// Online-softmax update"));
+    lines.push(p("\t\tmax.f32 %flog, %fmax, %ftmax; // new_max"));
+    lines.push(p("\t\tsub.f32 %fmax, %fmax, %flog;"));
+    lines.push(p("\t\tmul.f32 %fmax, %fmax, %flog2e;"));
+    lines.push(p("\t\tex2.approx.f32 %fmax, %fmax;"));
+    lines.push(p("\t\tmul.f32 %fsum, %fsum, %fmax;"));
+    lines.push(p("\t\tmov.f32 %fmax, %flog;"));
+    lines.push(String::new());
+
+    // Tile sum (fp16 load → cvt to f32 → fold into f32 sum).
+    lines.push(p("\t\tmov.u32 %r10, 0;"));
+    lines.push(p("\t\tSMEM_SUM_LOOP:"));
+    lines.push(p("\t\t\tadd.u32 %r11, %r4, %r10;"));
+    lines.push(format!("\t\t\tsetp.lt.u32 %pv, %r11, {vocab};"));
+    lines.push(p("\t\t\t@!%pv bra SMEM_SUM_DONE;"));
+    lines.push(p("\t\t\tshl.b32 %r12, %r10, 1; // *2"));
+    lines.push(p("\t\t\tmov.u64 %rd20, smem_scratch;"));
+    lines.push(p("\t\t\tcvt.u64.u32 %rd21, %r12;"));
+    lines.push(p("\t\t\tadd.u64 %rd20, %rd20, %rd21;"));
+    lines.push(p("\t\t\tld.shared.b16 %h1, [%rd20];"));
+    lines.push(p("\t\t\tcvt.f32.f16 %ftmp, %h1;"));
+    lines.push(p("\t\t\tsub.f32 %ftmp, %ftmp, %fmax;"));
+    lines.push(p("\t\t\tmul.f32 %ftmp, %ftmp, %flog2e;"));
+    lines.push(p("\t\t\tex2.approx.f32 %ftmp, %ftmp;"));
+    lines.push(p("\t\t\tadd.f32 %fsum, %fsum, %ftmp;"));
+    lines.push(p("\t\t\tadd.u32 %r10, %r10, 1;"));
+    lines.push(format!("\t\t\tsetp.lt.u32 %pv, %r10, {vtile};"));
+    lines.push(p("\t\t\t@%pv bra SMEM_SUM_LOOP;"));
+    lines.push(p("\t\tSMEM_SUM_DONE:"));
+    lines.push(String::new());
+
+    lines.push(p("\t\tTILE_REDUCE_DONE:"));
+    lines.push(p("\t\tbar.sync 0;"));
+    lines.push(String::new());
+
+    lines.push(p("\t\tadd.u32 %r3, %r3, 1;"));
+    lines.push(format!("\t\tsetp.lt.u32 %pv, %r3, {n_tiles};"));
+    lines.push(p("\t\t@%pv bra TILE_LOOP;"));
+    lines.push(String::new());
+
+    // Finalize: thread 0 writes loss + lse as f32.
+    lines.push(p("\tsetp.eq.u32 %pth0, %r1, 0;"));
+    lines.push(p("\t@!%pth0 bra WRITE_DONE;"));
+    lines.push(String::new());
+
+    lines.push(p("\tlg2.approx.f32 %flse, %fsum;"));
+    lines.push(p("\tmul.f32 %flse, %flse, %fln2;"));
+    lines.push(p("\tadd.f32 %flse, %flse, %fmax;"));
+    lines.push(String::new());
+
+    // logit_at_target from smem (read fp16, cvt to f32).
+    lines.push(p("\tmov.u64 %rd22, smem_scratch;"));
+    lines.push(format!("\tadd.u64 %rd22, %rd22, {lat_offset};"));
+    lines.push(p("\tld.shared.b16 %h1, [%rd22];"));
+    lines.push(p("\tcvt.f32.f16 %flog, %h1;"));
+    lines.push(String::new());
+
+    lines.push(p("\tsub.f32 %floss, %flse, %flog;"));
+    lines.push(String::new());
+
+    // Write outputs as f32 (loss + lse stay f32 regardless of dtype).
+    lines.push(p("\tcvt.u64.u32 %rd23, %r0;"));
+    lines.push(p("\tshl.b64 %rd23, %rd23, 2;"));
+    lines.push(p("\tadd.u64 %rd24, %rd4, %rd23;"));
+    lines.push(p("\tst.global.f32 [%rd24], %floss;"));
+    lines.push(p("\tadd.u64 %rd24, %rd5, %rd23;"));
+    lines.push(p("\tst.global.f32 [%rd24], %flse;"));
+    lines.push(p("\tbra WRITE_DONE;"));
+    lines.push(String::new());
+
+    // Skip label: write zeros (f32).
+    lines.push(p("SKIP_LABEL:"));
+    lines.push(p("\tsetp.eq.u32 %pth0, %r1, 0;"));
+    lines.push(p("\t@!%pth0 bra WRITE_DONE;"));
+    lines.push(p("\tcvt.u64.u32 %rd23, %r0;"));
+    lines.push(p("\tshl.b64 %rd23, %rd23, 2;"));
+    lines.push(p("\tadd.u64 %rd24, %rd4, %rd23;"));
+    lines.push(p("\tst.global.f32 [%rd24], 0f00000000;"));
+    lines.push(p("\tadd.u64 %rd24, %rd5, %rd23;"));
+    lines.push(p("\tst.global.f32 [%rd24], 0f00000000;"));
+    lines.push(String::new());
+
+    lines.push(p("WRITE_DONE:"));
+    lines.push(p("\tret;"));
+    lines.push(p("}"));
+
+    lines.join("\n")
 }
 
 // ─── PTX emission — large-vocab path (Sprint 3) ──────────────────────────────
@@ -2482,6 +2734,328 @@ fn emit_bwd_kernel_f16(cfg: &FusedLinearCEConfig) -> String {
 // Output buffers `loss_out` / `lse_out` / `dx` / `dW` / `dbias` stay f32 —
 // same master-grad convention as the F16 path.
 
+// ── Bf16 forward kernel ───────────────────────────────────────────────────────
+//
+// Mixed-precision convention (Sprint v3-2):
+//   * HBM loads of x, W, bias are `ld.global.b16` → `cvt.f32.bf16` into f32
+//     math registers (the dot-product accumulators).
+//   * SMEM logit tile is stored as `.b16` (2 bytes/elem) — the per-tile
+//     online-LSE reduction loads `.b16`, converts to f32, then folds into
+//     the f32 max + sum registers. This halves the SMEM footprint vs F32.
+//   * +INF / -INF sentinels and the log2e + ln2 constants live in f32
+//     registers; the online-LSE algorithm is bit-for-bit the same as F32.
+//   * HBM outputs `loss_out` and `lse_out` are written as `.f32` (per
+//     convention; downstream backward consumes the same f32 lse).
+//
+// The kernel layout, loop structure, sync points, and SMEM partitioning
+// mirror `emit_fwd_kernel` exactly — only the dtype of HBM/SMEM staging
+// changes. Keeping the structure parallel preserves the option of merging
+// the two emitters in a future refactor (deferred for byte-identity safety).
+fn emit_fwd_kernel_bf16(cfg: &FusedLinearCEConfig) -> String {
+    let name = cfg.kernel_name();
+    let vocab = cfg.vocab_size;
+    let hidden = cfg.hidden_size;
+    let vtile = cfg.vocab_tile;
+    let n_tiles = vocab.div_ceil(vtile);
+    let vtile_per_thread = vtile / 128;
+    let ignore = cfg.ignore_index;
+    let smem_bytes = cfg.shared_mem_bytes();
+    // Bf16 SMEM: 2 bytes/elem instead of 4. logit_at_target scratch slot lives
+    // immediately after the tile and ALSO uses 2 bytes; the +32 padding in
+    // shared_mem_bytes() leaves ample room.
+    let elem_bytes = cfg.dtype.bytes_per_elem(); // = 2 for Bf16
+    let lat_offset = vtile * elem_bytes;
+
+    let mut lines: Vec<String> = Vec::new();
+    let p = |l: &str| l.to_owned();
+
+    lines.push(cfg.ptx_header());
+    // `.align 2` because the SMEM is half-precision; ptxas auto-aligns to 4
+    // for the +INF sentinel store anyway — but the declared align matches
+    // the dtype.
+    lines.push(format!(".extern .shared .align 2 .b8 smem_scratch[{smem_bytes}];"));
+    lines.push(String::new());
+    lines.push(format!(".visible .entry {name}("));
+    lines.push(p("\t.param .u64 param_x,"));
+    lines.push(p("\t.param .u64 param_w,"));
+    lines.push(p("\t.param .u64 param_bias,"));
+    lines.push(p("\t.param .u64 param_targets,"));
+    lines.push(p("\t.param .u64 param_loss_out,"));
+    lines.push(p("\t.param .u64 param_lse_out,"));
+    lines.push(p("\t.param .u32 param_B, .param .u32 param_S,"));
+    lines.push(p("\t.param .u32 param_V, .param .u32 param_H"));
+    lines.push(p(") {"));
+    // Registers.
+    lines.push(p("\t.reg .u64 %rd<30>;"));
+    lines.push(p("\t.reg .u32 %r<20>;"));
+    lines.push(p("\t.reg .s64 %tgt64;"));
+    lines.push(p("\t.reg .b16 %h0, %h1, %h2;"));
+    lines.push(p("\t.reg .f32 %flog, %facc, %fmax, %fsum, %ftmax, %flse, %floss;"));
+    lines.push(p("\t.reg .f32 %fa, %fb, %flog2e, %fln2, %ftmp;"));
+    lines.push(p("\t.reg .pred %pskip, %pv, %pth0, %ptgt;"));
+    lines.push(String::new());
+
+    // Load params.
+    lines.push(p("\tld.param.u64 %rd0, [param_x];"));
+    lines.push(p("\tld.param.u64 %rd1, [param_w];"));
+    lines.push(p("\tld.param.u64 %rd2, [param_bias];"));
+    lines.push(p("\tld.param.u64 %rd3, [param_targets];"));
+    lines.push(p("\tld.param.u64 %rd4, [param_loss_out];"));
+    lines.push(p("\tld.param.u64 %rd5, [param_lse_out];"));
+    lines.push(p("\tmov.u32 %r0, %ctaid.x;   // row_idx"));
+    lines.push(p("\tmov.u32 %r1, %tid.x;     // tid"));
+    lines.push(p("\tmov.f32 %flog2e, 0f3FB8AA3B; // log2(e)"));
+    lines.push(p("\tmov.f32 %fln2,   0f3F317218; // ln(2)"));
+    lines.push(String::new());
+
+    // Thread 0 initialises logit_at_target smem slot to -INF (as bf16
+    // bit-pattern 0xFBFF = -65504, the most negative finite bf16; the
+    // logit_at_target slot is only consumed if the target was found, so a
+    // strict -INF bit-pattern is not required — but using bf16 -INF
+    // (0xFF80) keeps the semantics matched).
+    lines.push(p("\tsetp.eq.u32 %pth0, %r1, 0;"));
+    lines.push(p("\t@!%pth0 bra INIT_DONE;"));
+    lines.push(p("\tmov.u64 %rd6, smem_scratch;"));
+    lines.push(format!("\tadd.u64 %rd6, %rd6, {lat_offset};"));
+    lines.push(p("\tmov.b16 %h0, 0xFF80; // bf16 -INF sentinel"));
+    lines.push(p("\tst.shared.b16 [%rd6], %h0;"));
+    lines.push(p("INIT_DONE:"));
+    lines.push(p("\tbar.sync 0;"));
+    lines.push(String::new());
+
+    // Load target[row_idx].
+    lines.push(p("\t// Load targets[row_idx] (i64)"));
+    lines.push(p("\tcvt.u64.u32 %rd7, %r0;"));
+    lines.push(p("\tmul.lo.u64 %rd7, %rd7, 8;"));
+    lines.push(p("\tadd.u64 %rd7, %rd3, %rd7;"));
+    lines.push(p("\tld.global.s64 %tgt64, [%rd7];"));
+    lines.push(String::new());
+
+    // Skip branch.
+    lines.push(format!("\t// setp.eq.s64: if target == {ignore} skip"));
+    lines.push(format!("\tsetp.eq.s64 %pskip, %tgt64, {ignore};"));
+    lines.push(p("\t@%pskip bra SKIP_LABEL;"));
+    lines.push(String::new());
+
+    // x_row_base = x + row * H * 2 (bf16: 2 bytes/elem).
+    lines.push(format!(
+        "\t// x_row_base = x + row_idx * {hidden} * {elem_bytes}"
+    ));
+    lines.push(p("\tcvt.u64.u32 %rd8, %r0;"));
+    lines.push(format!("\tmov.u32 %r2, {hidden};"));
+    lines.push(p("\tcvt.u64.u32 %rd9, %r2;"));
+    lines.push(p("\tmul.lo.u64 %rd8, %rd8, %rd9;"));
+    lines.push(p("\tshl.b64 %rd8, %rd8, 1; // *2 for bf16"));
+    lines.push(p("\tadd.u64 %rd8, %rd0, %rd8; // %rd8 = x_row_base"));
+    lines.push(String::new());
+
+    // Init online-softmax accumulators (f32).
+    lines.push(p("\tmov.f32 %fmax, 0fFF800000; // -INF (f32, IEEE 754 binary32 sign=1 exp=0xFF mant=0)"));
+    lines.push(p("\tmov.f32 %fsum, 0f00000000;"));
+    lines.push(String::new());
+
+    // Outer tile loop.
+    lines.push(p("\tmov.u32 %r3, 0; // tile_idx"));
+    lines.push(p("TILE_LOOP:"));
+    lines.push(format!("\t\tmul.lo.u32 %r4, %r3, {vtile}; // v_base"));
+    lines.push(String::new());
+
+    lines.push(p("\t\tmov.u32 %r5, 0; // sub-tile counter"));
+    lines.push(p("\t\tINNER_LOOP:"));
+    lines.push(p("\t\t\tmul.lo.u32 %r6, %r5, 128;"));
+    lines.push(p("\t\t\tadd.u32 %r6, %r6, %r1;"));
+    lines.push(p("\t\t\tadd.u32 %r6, %r6, %r4; // v_idx"));
+    lines.push(format!("\t\t\tsetp.lt.u32 %pv, %r6, {vocab};"));
+    lines.push(p("\t\t\t@!%pv bra INNER_SKIP;"));
+    lines.push(String::new());
+
+    // W_row_base = W + v_idx * H * 2.
+    lines.push(format!(
+        "\t\t\t// W_row_base = W + v_idx * {hidden} * {elem_bytes}"
+    ));
+    lines.push(p("\t\t\tcvt.u64.u32 %rd10, %r6;"));
+    lines.push(format!("\t\t\tmov.u32 %r7, {hidden};"));
+    lines.push(p("\t\t\tcvt.u64.u32 %rd11, %r7;"));
+    lines.push(p("\t\t\tmul.lo.u64 %rd10, %rd10, %rd11;"));
+    lines.push(p("\t\t\tshl.b64 %rd10, %rd10, 1; // *2 for bf16"));
+    lines.push(p("\t\t\tadd.u64 %rd10, %rd1, %rd10; // %rd10 = W_row_base"));
+    lines.push(String::new());
+
+    // Dot-product loop — load .b16, cvt to .f32, fma in f32.
+    lines.push(p("\t\t\tmov.f32 %facc, 0f00000000;"));
+    lines.push(p("\t\t\tmov.u32 %r8, 0; // h"));
+    lines.push(p("\t\t\tDOT_LOOP:"));
+    lines.push(p("\t\t\t\tcvt.u64.u32 %rd12, %r8;"));
+    lines.push(p("\t\t\t\tshl.b64 %rd12, %rd12, 1; // h * 2"));
+    lines.push(p("\t\t\t\tadd.u64 %rd13, %rd8, %rd12;"));
+    lines.push(p("\t\t\t\tld.global.b16 %h1, [%rd13];"));
+    lines.push(p("\t\t\t\tcvt.f32.bf16 %fa, %h1;"));
+    lines.push(p("\t\t\t\tadd.u64 %rd14, %rd10, %rd12;"));
+    lines.push(p("\t\t\t\tld.global.b16 %h1, [%rd14];"));
+    lines.push(p("\t\t\t\tcvt.f32.bf16 %fb, %h1;"));
+    lines.push(p("\t\t\t\tfma.rn.f32 %facc, %fa, %fb, %facc;"));
+    lines.push(p("\t\t\t\tadd.u32 %r8, %r8, 1;"));
+    lines.push(format!("\t\t\t\tsetp.lt.u32 %pv, %r8, {hidden};"));
+    lines.push(p("\t\t\t\t@%pv bra DOT_LOOP;"));
+    lines.push(String::new());
+
+    // Add bias[v_idx].
+    lines.push(p("\t\t\t// facc += bias[v_idx] (bf16 HBM)"));
+    lines.push(p("\t\t\tcvt.u64.u32 %rd15, %r6;"));
+    lines.push(p("\t\t\tshl.b64 %rd15, %rd15, 1; // *2"));
+    lines.push(p("\t\t\tadd.u64 %rd15, %rd2, %rd15;"));
+    lines.push(p("\t\t\tld.global.b16 %h1, [%rd15];"));
+    lines.push(p("\t\t\tcvt.f32.bf16 %ftmp, %h1;"));
+    lines.push(p("\t\t\tadd.f32 %facc, %facc, %ftmp;"));
+    lines.push(String::new());
+
+    // Store logit to smem tile (cvt back to bf16; tile is .b16 stride 2).
+    lines.push(p("\t\t\t// Store logit to smem_scratch[(r5*128+tid)*2] as bf16"));
+    lines.push(p("\t\t\tmul.lo.u32 %r9, %r5, 128;"));
+    lines.push(p("\t\t\tadd.u32 %r9, %r9, %r1;"));
+    lines.push(p("\t\t\tshl.b32 %r9, %r9, 1; // *2"));
+    lines.push(p("\t\t\tmov.u64 %rd16, smem_scratch;"));
+    lines.push(p("\t\t\tcvt.u64.u32 %rd17, %r9;"));
+    lines.push(p("\t\t\tadd.u64 %rd16, %rd16, %rd17;"));
+    lines.push(p("\t\t\tcvt.rn.bf16.f32 %h2, %facc;"));
+    lines.push(p("\t\t\tst.shared.b16 [%rd16], %h2;"));
+    lines.push(String::new());
+
+    // If v_idx == target, record logit_at_target in smem (also bf16).
+    lines.push(p("\t\t\t// If v_idx == target, record logit_at_target (bf16)"));
+    lines.push(p("\t\t\tcvt.s64.u32 %rd18, %r6;"));
+    lines.push(p("\t\t\tsetp.eq.s64 %ptgt, %rd18, %tgt64;"));
+    lines.push(p("\t\t\t@!%ptgt bra NOT_TARGET;"));
+    lines.push(p("\t\t\tmov.u64 %rd19, smem_scratch;"));
+    lines.push(format!("\t\t\tadd.u64 %rd19, %rd19, {lat_offset};"));
+    lines.push(p("\t\t\tst.shared.b16 [%rd19], %h2;"));
+    lines.push(p("\t\t\tNOT_TARGET:"));
+    lines.push(String::new());
+
+    lines.push(p("\t\t\tINNER_SKIP:"));
+    lines.push(p("\t\t\tadd.u32 %r5, %r5, 1;"));
+    lines.push(format!("\t\t\tsetp.lt.u32 %pv, %r5, {vtile_per_thread};"));
+    lines.push(p("\t\t\t@%pv bra INNER_LOOP;"));
+    lines.push(String::new());
+
+    // Sync: all logits in smem.
+    lines.push(p("\t\tbar.sync 0;"));
+    lines.push(String::new());
+
+    // Thread 0 reduces smem tile.
+    lines.push(p("\t\tsetp.eq.u32 %pth0, %r1, 0;"));
+    lines.push(p("\t\t@!%pth0 bra TILE_REDUCE_DONE;"));
+    lines.push(String::new());
+
+    // Step 1: find tile_max (read bf16 → cvt to f32, fold into f32 max).
+    lines.push(p("\t\tmov.f32 %ftmax, 0fFF800000; // -INF (f32)"));
+    lines.push(p("\t\tmov.u32 %r10, 0;"));
+    lines.push(p("\t\tSMEM_MAX_LOOP:"));
+    lines.push(p("\t\t\tadd.u32 %r11, %r4, %r10; // v_base + i"));
+    lines.push(format!("\t\t\tsetp.lt.u32 %pv, %r11, {vocab};"));
+    lines.push(p("\t\t\t@!%pv bra SMEM_MAX_DONE;"));
+    lines.push(p("\t\t\tshl.b32 %r12, %r10, 1; // *2"));
+    lines.push(p("\t\t\tmov.u64 %rd20, smem_scratch;"));
+    lines.push(p("\t\t\tcvt.u64.u32 %rd21, %r12;"));
+    lines.push(p("\t\t\tadd.u64 %rd20, %rd20, %rd21;"));
+    lines.push(p("\t\t\tld.shared.b16 %h1, [%rd20];"));
+    lines.push(p("\t\t\tcvt.f32.bf16 %ftmp, %h1;"));
+    lines.push(p("\t\t\tmax.f32 %ftmax, %ftmax, %ftmp;"));
+    lines.push(p("\t\t\tadd.u32 %r10, %r10, 1;"));
+    lines.push(format!("\t\t\tsetp.lt.u32 %pv, %r10, {vtile};"));
+    lines.push(p("\t\t\t@%pv bra SMEM_MAX_LOOP;"));
+    lines.push(p("\t\tSMEM_MAX_DONE:"));
+    lines.push(String::new());
+
+    // Online-softmax rescale.
+    lines.push(p("\t\t// Online-softmax update"));
+    lines.push(p("\t\tmax.f32 %flog, %fmax, %ftmax; // new_max"));
+    lines.push(p("\t\tsub.f32 %fmax, %fmax, %flog;"));
+    lines.push(p("\t\tmul.f32 %fmax, %fmax, %flog2e;"));
+    lines.push(p("\t\tex2.approx.f32 %fmax, %fmax;"));
+    lines.push(p("\t\tmul.f32 %fsum, %fsum, %fmax;"));
+    lines.push(p("\t\tmov.f32 %fmax, %flog;"));
+    lines.push(String::new());
+
+    // Tile sum (bf16 load → cvt to f32 → fold into f32 sum).
+    lines.push(p("\t\tmov.u32 %r10, 0;"));
+    lines.push(p("\t\tSMEM_SUM_LOOP:"));
+    lines.push(p("\t\t\tadd.u32 %r11, %r4, %r10;"));
+    lines.push(format!("\t\t\tsetp.lt.u32 %pv, %r11, {vocab};"));
+    lines.push(p("\t\t\t@!%pv bra SMEM_SUM_DONE;"));
+    lines.push(p("\t\t\tshl.b32 %r12, %r10, 1; // *2"));
+    lines.push(p("\t\t\tmov.u64 %rd20, smem_scratch;"));
+    lines.push(p("\t\t\tcvt.u64.u32 %rd21, %r12;"));
+    lines.push(p("\t\t\tadd.u64 %rd20, %rd20, %rd21;"));
+    lines.push(p("\t\t\tld.shared.b16 %h1, [%rd20];"));
+    lines.push(p("\t\t\tcvt.f32.bf16 %ftmp, %h1;"));
+    lines.push(p("\t\t\tsub.f32 %ftmp, %ftmp, %fmax;"));
+    lines.push(p("\t\t\tmul.f32 %ftmp, %ftmp, %flog2e;"));
+    lines.push(p("\t\t\tex2.approx.f32 %ftmp, %ftmp;"));
+    lines.push(p("\t\t\tadd.f32 %fsum, %fsum, %ftmp;"));
+    lines.push(p("\t\t\tadd.u32 %r10, %r10, 1;"));
+    lines.push(format!("\t\t\tsetp.lt.u32 %pv, %r10, {vtile};"));
+    lines.push(p("\t\t\t@%pv bra SMEM_SUM_LOOP;"));
+    lines.push(p("\t\tSMEM_SUM_DONE:"));
+    lines.push(String::new());
+
+    lines.push(p("\t\tTILE_REDUCE_DONE:"));
+    lines.push(p("\t\tbar.sync 0;"));
+    lines.push(String::new());
+
+    lines.push(p("\t\tadd.u32 %r3, %r3, 1;"));
+    lines.push(format!("\t\tsetp.lt.u32 %pv, %r3, {n_tiles};"));
+    lines.push(p("\t\t@%pv bra TILE_LOOP;"));
+    lines.push(String::new());
+
+    // Finalize: thread 0 writes loss + lse as f32.
+    lines.push(p("\tsetp.eq.u32 %pth0, %r1, 0;"));
+    lines.push(p("\t@!%pth0 bra WRITE_DONE;"));
+    lines.push(String::new());
+
+    lines.push(p("\tlg2.approx.f32 %flse, %fsum;"));
+    lines.push(p("\tmul.f32 %flse, %flse, %fln2;"));
+    lines.push(p("\tadd.f32 %flse, %flse, %fmax;"));
+    lines.push(String::new());
+
+    // logit_at_target from smem (read bf16, cvt to f32).
+    lines.push(p("\tmov.u64 %rd22, smem_scratch;"));
+    lines.push(format!("\tadd.u64 %rd22, %rd22, {lat_offset};"));
+    lines.push(p("\tld.shared.b16 %h1, [%rd22];"));
+    lines.push(p("\tcvt.f32.bf16 %flog, %h1;"));
+    lines.push(String::new());
+
+    lines.push(p("\tsub.f32 %floss, %flse, %flog;"));
+    lines.push(String::new());
+
+    // Write outputs as f32 (loss + lse stay f32 regardless of dtype).
+    lines.push(p("\tcvt.u64.u32 %rd23, %r0;"));
+    lines.push(p("\tshl.b64 %rd23, %rd23, 2;"));
+    lines.push(p("\tadd.u64 %rd24, %rd4, %rd23;"));
+    lines.push(p("\tst.global.f32 [%rd24], %floss;"));
+    lines.push(p("\tadd.u64 %rd24, %rd5, %rd23;"));
+    lines.push(p("\tst.global.f32 [%rd24], %flse;"));
+    lines.push(p("\tbra WRITE_DONE;"));
+    lines.push(String::new());
+
+    // Skip label: write zeros (f32).
+    lines.push(p("SKIP_LABEL:"));
+    lines.push(p("\tsetp.eq.u32 %pth0, %r1, 0;"));
+    lines.push(p("\t@!%pth0 bra WRITE_DONE;"));
+    lines.push(p("\tcvt.u64.u32 %rd23, %r0;"));
+    lines.push(p("\tshl.b64 %rd23, %rd23, 2;"));
+    lines.push(p("\tadd.u64 %rd24, %rd4, %rd23;"));
+    lines.push(p("\tst.global.f32 [%rd24], 0f00000000;"));
+    lines.push(p("\tadd.u64 %rd24, %rd5, %rd23;"));
+    lines.push(p("\tst.global.f32 [%rd24], 0f00000000;"));
+    lines.push(String::new());
+
+    lines.push(p("WRITE_DONE:"));
+    lines.push(p("\tret;"));
+    lines.push(p("}"));
+
+    lines.join("\n")
+}
 
 // ── Bf16 large-vocab kernels (Sprint v3-2) ────────────────────────────────────
 //
@@ -3253,454 +3827,3 @@ fn emit_bwd_kernel_bf16(cfg: &FusedLinearCEConfig) -> String {
 
 // ─── Inline tests ─────────────────────────────────────────────────────────────
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn default_cfg() -> FusedLinearCEConfig {
-        FusedLinearCEConfig::default()
-    }
-
-    // ── Config validation ────────────────────────────────────────────────
-
-    #[test]
-    fn test_validate_rejects_oversized_vocab() {
-        let mut cfg = default_cfg();
-        cfg.vocab_size = 9000;
-        assert!(cfg.validate().is_err());
-        assert!(cfg.validate().unwrap_err().contains("vocab_size"));
-    }
-
-    #[test]
-    fn test_validate_rejects_unaligned_hidden() {
-        let mut cfg = default_cfg();
-        cfg.hidden_size = 33;
-        assert!(cfg.validate().is_err());
-        assert!(cfg.validate().unwrap_err().contains("hidden_size"));
-    }
-
-    #[test]
-    fn test_validate_rejects_zero_seq() {
-        let mut cfg = default_cfg();
-        cfg.seq_len = 0;
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn test_validate_rejects_unaligned_vocab_tile() {
-        // The v1 inner fill is 128-thread-wide; a non-128-aligned tile leaves
-        // the tail uninitialised in smem and silently corrupts the online-
-        // softmax reduction (caught in adversarial review). Verify validate()
-        // rejects all such configs.
-        for bad in [1u32, 100, 127, 200, 256 + 1, 1023, 1025, 7777] {
-            let mut cfg = default_cfg();
-            cfg.vocab_tile = bad;
-            // Ensure vocab_size is large enough to not hit the [1,vocab_size] gate first.
-            cfg.vocab_size = cfg.vocab_size.max(bad);
-            let err = cfg.validate().expect_err(&format!(
-                "vocab_tile {bad} (not a multiple of 128) MUST be rejected"
-            ));
-            assert!(
-                err.contains("multiple of 128"),
-                "rejection of vocab_tile {bad} should mention 128-alignment; got: {err}"
-            );
-        }
-        // Sanity: 128-aligned values still pass (the existing [1,vocab_size] / 128-divisible gate).
-        for good in [128u32, 256, 512, 1024, 2048] {
-            let mut cfg = default_cfg();
-            cfg.vocab_tile = good;
-            cfg.vocab_size = cfg.vocab_size.max(good);
-            assert!(
-                cfg.validate().is_ok(),
-                "vocab_tile {good} (multiple of 128) MUST be accepted"
-            );
-        }
-    }
-
-    #[test]
-    fn test_validate_accepts_default() {
-        assert!(default_cfg().validate().is_ok());
-    }
-
-    #[test]
-    fn test_validate_rejects_above_hard_ceiling() {
-        let mut cfg = default_cfg();
-        // Raise per-config cap so we don't hit the legacy gate first.
-        cfg.max_vocab_v1 = u32::MAX;
-        cfg.vocab_size = MAX_VOCAB_HARD_CEILING + 1;
-        cfg.vocab_tile = 128;
-        let err = cfg.validate().expect_err("above hard ceiling must reject");
-        assert!(err.contains("hard ceiling"), "{err}");
-    }
-
-    #[test]
-    fn test_is_large_vocab_predicate_matches_threshold() {
-        let mut cfg = default_cfg();
-        cfg.max_vocab_v1 = MAX_VOCAB_HARD_CEILING;
-
-        cfg.vocab_size = LARGE_VOCAB_THRESHOLD;
-        cfg.vocab_tile = 128;
-        assert!(!cfg.is_large_vocab(), "AT threshold must be small-vocab (v1 path)");
-
-        cfg.vocab_size = LARGE_VOCAB_THRESHOLD + 128;
-        assert!(cfg.is_large_vocab(), "above threshold must route to large-vocab path");
-    }
-
-    #[test]
-    fn test_validate_accepts_large_vocab_when_cap_raised() {
-        let cfg = FusedLinearCEConfig {
-            vocab_size: 49152,
-            hidden_size: 128,
-            seq_len: 64,
-            batch_size: 2,
-            vocab_tile: 128,
-            gpu_sm: 80,
-            dtype: Dtype::F32,
-            ignore_index: -100,
-            max_vocab_v1: MAX_VOCAB_HARD_CEILING,
-        };
-        cfg.validate().expect("vocab=49152 with raised cap MUST validate");
-        assert!(cfg.is_large_vocab());
-    }
-
-    #[test]
-    fn test_num_vocab_tiles_div_ceil() {
-        let mut cfg = default_cfg();
-        cfg.vocab_size = 49152;
-        cfg.vocab_tile = 128;
-        cfg.max_vocab_v1 = MAX_VOCAB_HARD_CEILING;
-        assert_eq!(cfg.num_vocab_tiles(), 49152 / 128);
-
-        // Non-divisible: rounds up.
-        cfg.vocab_size = 49153;
-        assert_eq!(cfg.num_vocab_tiles(), (49153 + 127) / 128);
-    }
-
-    #[test]
-    fn test_large_partials_bytes_matches_formula() {
-        let cfg = FusedLinearCEConfig {
-            vocab_size: 49152,
-            hidden_size: 128,
-            seq_len: 64,
-            batch_size: 2,
-            vocab_tile: 128,
-            gpu_sm: 80,
-            dtype: Dtype::F32,
-            ignore_index: -100,
-            max_vocab_v1: MAX_VOCAB_HARD_CEILING,
-        };
-        // (B*S) * num_tiles * 2 floats * 4 bytes = 128 * 384 * 8 = 393_216
-        assert_eq!(cfg.large_partials_bytes(), 128 * 384 * 8);
-    }
-
-    // ── Kernel name ──────────────────────────────────────────────────────
-
-    #[test]
-    fn test_kernel_name_encodes_shape() {
-        let cfg = default_cfg();
-        let name = cfg.kernel_name();
-        assert!(name.contains("f32"), "name should include dtype: {name}");
-        assert!(name.contains("v4096"), "name should include vocab: {name}");
-        assert!(name.contains("h128"), "name should include hidden: {name}");
-    }
-
-    // ── shared_mem_bytes monotonicity ────────────────────────────────────
-
-    #[test]
-    fn test_shared_mem_bytes_monotone_with_vocab_tile() {
-        let mut cfg = default_cfg();
-        cfg.vocab_tile = 512;
-        let sm512 = cfg.shared_mem_bytes();
-        cfg.vocab_tile = 1024;
-        let sm1024 = cfg.shared_mem_bytes();
-        assert!(sm1024 > sm512, "larger vocab_tile must need more smem");
-    }
-
-    // ── PTX round-trip snapshot ──────────────────────────────────────────
-
-    #[test]
-    fn test_fwd_ptx_starts_with_version_target() {
-        // The v1 forward is KIR (roadmap A2 step 10) and targets the KIR
-        // floor, sm_70, whatever `gpu_sm` says (the driver JIT-compiles it
-        // forward); the bf16 conversions raise the ISA to 7.8.
-        let cfg = default_cfg();
-        let ptx_bytes = synthesize_fused_linear_ce_ptx(&cfg);
-        let ptx = std::str::from_utf8(&ptx_bytes).expect("PTX must be valid UTF-8");
-        assert!(
-            ptx.starts_with(".version 7.0\n.target sm_70"),
-            "PTX must start with .version 7.0 + .target sm_70, got: {}",
-            &ptx[..50.min(ptx.len())]
-        );
-        let bf16 = FusedLinearCEConfig { dtype: Dtype::Bf16, ..default_cfg() };
-        let ptx_bytes = synthesize_fused_linear_ce_ptx(&bf16);
-        let ptx = std::str::from_utf8(&ptx_bytes).expect("PTX must be valid UTF-8");
-        assert!(ptx.starts_with(".version 7.8\n"), "{}", &ptx[..50.min(ptx.len())]);
-    }
-
-    #[test]
-    fn test_fwd_ptx_contains_kernel_name() {
-        let cfg = default_cfg();
-        let ptx_bytes = synthesize_fused_linear_ce_ptx(&cfg);
-        let ptx = std::str::from_utf8(&ptx_bytes).unwrap();
-        assert!(
-            ptx.contains(&cfg.kernel_name()),
-            "PTX must contain the kernel name {}",
-            cfg.kernel_name()
-        );
-    }
-
-    #[test]
-    fn test_fwd_ptx_contains_extern_shared() {
-        let cfg = default_cfg();
-        let ptx_bytes = synthesize_fused_linear_ce_ptx(&cfg);
-        let ptx = std::str::from_utf8(&ptx_bytes).unwrap();
-        assert!(
-            ptx.contains(".extern .shared"),
-            "PTX must have .extern .shared scratch declaration"
-        );
-    }
-
-    #[test]
-    fn test_fwd_ptx_contains_skip_predicate() {
-        let cfg = default_cfg();
-        let ptx_bytes = synthesize_fused_linear_ce_ptx(&cfg);
-        let ptx = std::str::from_utf8(&ptx_bytes).unwrap();
-        // The -100 skip predicate is emitted as setp.eq.s64 ... -100
-        assert!(
-            ptx.contains("setp.eq.s64") && ptx.contains("-100"),
-            "PTX must contain setp.eq.s64 ... -100 skip predicate"
-        );
-    }
-
-    #[test]
-    fn test_bwd_ptx_contains_bwd_kernel_name() {
-        let cfg = default_cfg();
-        let ptx_bytes = synthesize_fused_linear_ce_backward_ptx(&cfg);
-        let ptx = std::str::from_utf8(&ptx_bytes).unwrap();
-        assert!(ptx.contains(&cfg.bwd_kernel_name()));
-    }
-
-    // ── Large-vocab two-kernel PTX synthesis (structural) ────────────────
-
-    fn large_vocab_cfg() -> FusedLinearCEConfig {
-        FusedLinearCEConfig {
-            vocab_size: 49152,
-            hidden_size: 128,
-            seq_len: 64,
-            batch_size: 2,
-            vocab_tile: 128,
-            gpu_sm: 80,
-            dtype: Dtype::F32,
-            ignore_index: -100,
-            max_vocab_v1: MAX_VOCAB_HARD_CEILING,
-        }
-    }
-
-    #[test]
-    fn test_large_ptx_contains_both_kernel_entries() {
-        let cfg = large_vocab_cfg();
-        cfg.validate().unwrap();
-        assert!(cfg.is_large_vocab());
-
-        let ptx_bytes = synthesize_fused_linear_ce_ptx(&cfg);
-        let ptx = std::str::from_utf8(&ptx_bytes).unwrap();
-
-        // Kernel A entry.
-        let kname_a = cfg.large_partials_kernel_name();
-        assert!(
-            ptx.contains(&format!(".visible .entry {kname_a}(")),
-            "missing Kernel A entry: {kname_a}"
-        );
-        // Kernel B entry.
-        let kname_b = cfg.large_finalize_kernel_name();
-        assert!(
-            ptx.contains(&format!(".visible .entry {kname_b}(")),
-            "missing Kernel B entry: {kname_b}"
-        );
-    }
-
-    #[test]
-    fn test_large_ptx_header_emitted_once() {
-        let cfg = large_vocab_cfg();
-        let ptx_bytes = synthesize_fused_linear_ce_ptx(&cfg);
-        let ptx = std::str::from_utf8(&ptx_bytes).unwrap();
-        // Exactly one .version line + one .target line at module scope.
-        assert_eq!(
-            ptx.matches(".version 7.0").count(),
-            1,
-            ".version must appear exactly once at module scope"
-        );
-        assert_eq!(
-            ptx.matches(".target sm_80").count(),
-            1,
-            ".target must appear exactly once at module scope"
-        );
-    }
-
-    #[test]
-    fn test_large_ptx_contains_skip_predicate() {
-        let cfg = large_vocab_cfg();
-        let ptx_bytes = synthesize_fused_linear_ce_ptx(&cfg);
-        let ptx = std::str::from_utf8(&ptx_bytes).unwrap();
-        assert!(ptx.contains("setp.eq.s64"));
-        assert!(ptx.contains("-100"));
-    }
-
-    #[test]
-    fn test_large_ptx_partials_pointer_arithmetic_is_present() {
-        let cfg = large_vocab_cfg();
-        let ptx_bytes = synthesize_fused_linear_ce_ptx(&cfg);
-        let ptx = std::str::from_utf8(&ptx_bytes).unwrap();
-        // Both kernels must dereference partials with an 8-byte stride
-        // (one f32 pair per (row, tile) slot). The store in Kernel A
-        // writes ftmax then ftsum at +0 and +4.
-        assert!(ptx.contains("st.global.f32 [%rd5],   %ftmax;"));
-        assert!(ptx.contains("st.global.f32 [%rd5+4], %ftsum;"));
-        // The load in Kernel B reads ftmax then ftsum at +0 and +4.
-        assert!(ptx.contains("ld.global.f32 %ftmax, [%rd13];"));
-        assert!(ptx.contains("ld.global.f32 %ftsum, [%rd13+4];"));
-    }
-
-    #[test]
-    fn test_large_ptx_is_ascii_only() {
-        let cfg = large_vocab_cfg();
-        let bytes = synthesize_fused_linear_ce_ptx(&cfg);
-        for b in bytes.iter() {
-            assert!(*b < 128, "non-ASCII byte 0x{b:02x} in large-vocab PTX");
-        }
-    }
-
-    #[test]
-    fn test_ptx_ascii_only() {
-        // Unicode in PTX triggers CUDA_ERROR_INVALID_PTX under cudarc JIT.
-        let cfg = default_cfg();
-        let fwd = synthesize_fused_linear_ce_ptx(&cfg);
-        let bwd = synthesize_fused_linear_ce_backward_ptx(&cfg);
-        for byte in fwd.iter().chain(bwd.iter()) {
-            assert!(*byte < 128, "non-ASCII byte 0x{byte:02x} found in PTX");
-        }
-    }
-
-    // ── Null-termination contract ─────────────────────────────────────────
-    //
-    // Every public synthesizer in this module returns null-terminated PTX
-    // bytes so they can be passed straight to `cuModuleLoadData` without
-    // the caller having to remember to append `0u8`. This matches the
-    // convention established by `backend_ptx::lower_kir_to_ptx`. Forgetting
-    // the null is silent UB (CUDA driver reads past the buffer) — pin every
-    // (synthesizer × dtype × routing) combination so any future emitter
-    // that bypasses the synthesizer wrapper trips this test.
-
-    fn null_term_cfg(dtype: Dtype, large: bool) -> FusedLinearCEConfig {
-        FusedLinearCEConfig {
-            // 4096 (small-vocab path), 49152 (large-vocab path).
-            vocab_size: if large { 49152 } else { 4096 },
-            hidden_size: 128,
-            seq_len: 32,
-            batch_size: 1,
-            vocab_tile: if large { 128 } else { 1024 },
-            gpu_sm: 80,
-            dtype,
-            ignore_index: -100,
-            max_vocab_v1: if large { MAX_VOCAB_HARD_CEILING } else { 8192 },
-        }
-    }
-
-    #[test]
-    fn fwd_ptx_is_null_terminated_small_vocab_f32() {
-        let cfg = null_term_cfg(Dtype::F32, false);
-        let bytes = synthesize_fused_linear_ce_ptx(&cfg);
-        assert_eq!(bytes.last(), Some(&0u8), "small-vocab F32 forward must end with NUL");
-    }
-
-    #[test]
-    fn fwd_ptx_is_null_terminated_small_vocab_f16() {
-        let cfg = null_term_cfg(Dtype::F16, false);
-        let bytes = synthesize_fused_linear_ce_ptx(&cfg);
-        assert_eq!(bytes.last(), Some(&0u8), "small-vocab F16 forward must end with NUL");
-    }
-
-    #[test]
-    fn fwd_ptx_is_null_terminated_small_vocab_bf16() {
-        let cfg = null_term_cfg(Dtype::Bf16, false);
-        let bytes = synthesize_fused_linear_ce_ptx(&cfg);
-        assert_eq!(bytes.last(), Some(&0u8), "small-vocab Bf16 forward must end with NUL");
-    }
-
-    #[test]
-    fn fwd_ptx_is_null_terminated_large_vocab_f32() {
-        let cfg = null_term_cfg(Dtype::F32, true);
-        assert!(cfg.is_large_vocab());
-        let bytes = synthesize_fused_linear_ce_ptx(&cfg);
-        assert_eq!(bytes.last(), Some(&0u8), "large-vocab F32 forward must end with NUL");
-        // Pin no double-null — dispatcher delegates without re-pushing.
-        let trailing_nulls = bytes.iter().rev().take_while(|&&b| b == 0).count();
-        assert_eq!(trailing_nulls, 1, "dispatcher must not double-null the large-vocab path");
-    }
-
-    #[test]
-    fn fwd_ptx_is_null_terminated_large_vocab_f16() {
-        let cfg = null_term_cfg(Dtype::F16, true);
-        let bytes = synthesize_fused_linear_ce_ptx(&cfg);
-        assert_eq!(bytes.last(), Some(&0u8), "large-vocab F16 forward must end with NUL");
-    }
-
-    #[test]
-    fn fwd_ptx_is_null_terminated_large_vocab_bf16() {
-        let cfg = null_term_cfg(Dtype::Bf16, true);
-        let bytes = synthesize_fused_linear_ce_ptx(&cfg);
-        assert_eq!(bytes.last(), Some(&0u8), "large-vocab Bf16 forward must end with NUL");
-    }
-
-    #[test]
-    fn large_vocab_synth_is_null_terminated_direct_call() {
-        // Direct call to the large-vocab synthesizer (not via dispatcher).
-        let cfg = null_term_cfg(Dtype::F32, true);
-        let bytes = synthesize_large_vocab_forward_ptx(&cfg);
-        assert_eq!(bytes.last(), Some(&0u8), "synthesize_large_vocab_forward_ptx must end with NUL");
-    }
-
-    #[test]
-    fn bwd_ptx_is_null_terminated_f32() {
-        let cfg = null_term_cfg(Dtype::F32, false);
-        let bytes = synthesize_fused_linear_ce_backward_ptx(&cfg);
-        assert_eq!(bytes.last(), Some(&0u8), "F32 backward must end with NUL");
-    }
-
-    #[test]
-    fn bwd_ptx_is_null_terminated_f16() {
-        let cfg = null_term_cfg(Dtype::F16, false);
-        let bytes = synthesize_fused_linear_ce_backward_ptx(&cfg);
-        assert_eq!(bytes.last(), Some(&0u8), "F16 backward must end with NUL");
-    }
-
-    #[test]
-    fn bwd_ptx_is_null_terminated_bf16() {
-        let cfg = null_term_cfg(Dtype::Bf16, false);
-        let bytes = synthesize_fused_linear_ce_backward_ptx(&cfg);
-        assert_eq!(bytes.last(), Some(&0u8), "Bf16 backward must end with NUL");
-    }
-
-    #[test]
-    fn ptx_has_no_interior_nuls() {
-        // CUDA driver stops at the first NUL — if the kernel text itself
-        // contains an embedded NUL, the module load truncates the bytes
-        // silently. Pin that interior NULs never appear (the trailing NUL
-        // is the ONLY 0 byte in a well-formed PTX module).
-        let cfg = default_cfg();
-        for synth_name in ["fwd", "bwd"] {
-            let bytes = if synth_name == "fwd" {
-                synthesize_fused_linear_ce_ptx(&cfg)
-            } else {
-                synthesize_fused_linear_ce_backward_ptx(&cfg)
-            };
-            let n = bytes.len();
-            for (i, b) in bytes[..n - 1].iter().enumerate() {
-                assert_ne!(
-                    *b, 0u8,
-                    "interior NUL at byte {i} in {synth_name} PTX would truncate cuModuleLoadData"
-                );
-            }
-        }
-    }
-}

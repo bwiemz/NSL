@@ -23,8 +23,15 @@
 //! the gates compare two programs on the same model, so what matters is
 //! that the model is a function of its input, not that it rounds as the
 //! hardware's approximation does. `sqrt.rn.f32` is IEEE and so is Rust's.
-//! `cvt.rn.f16.f32` rounds to nearest even, as `half` does, and
-//! `st.b16` stores the register's low two bytes.
+//! `cvt.rn.f16.f32` and `cvt.rn.bf16.f32` round to nearest even, as
+//! `half` does, and `st.b16` stores the register's low two bytes.
+//! `lg2.approx.f32` is modelled as `log2`.
+//!
+//! One `.extern .shared` block (dynamic shared memory) is modelled: it sits
+//! after the static blocks, and its size is what the launch allocates past
+//! them (`Program::shared_bytes` counts the static blocks only).
+//! `.s64` values are two's-complement bit patterns in a register, and a
+//! negative decimal immediate is read as one.
 //!
 //! Shifts follow PTX: `shl` and the unsigned `shr` take their amount from
 //! the low 32 bits of the operand and produce 0 for an amount at or past
@@ -34,7 +41,7 @@
 
 use std::collections::HashMap;
 
-use half::f16;
+use half::{bf16, f16};
 
 // ---------------------------------------------------------------------------
 // Parsing
@@ -109,6 +116,7 @@ pub(crate) enum Cmp {
 pub(crate) enum CmpTy {
     U32,
     U64,
+    S64,
     F32,
 }
 
@@ -146,6 +154,10 @@ pub(crate) enum Op {
     Cos { d: usize, a: Src },
     /// `cvt.rn.f16.f32`: round to nearest even, into the low 16 bits.
     CvtF16F32 { d: usize, a: Src },
+    CvtF32Bf16 { d: usize, a: Src },
+    /// `cvt.rn.bf16.f32`: round to nearest even, into the low 16 bits.
+    CvtBf16F32 { d: usize, a: Src },
+    Lg2 { d: usize, a: Src },
     Ld { space: Space, bytes: usize, d: usize, addr: Addr },
     /// `ld.global.s8`: one byte, sign-extended into the register.
     LdS8 { space: Space, d: usize, addr: Addr },
@@ -172,7 +184,11 @@ pub(crate) struct Program {
     pub(crate) reg_names: Vec<String>,
     /// Shared symbol name -> (window address, bytes).
     pub(crate) shared: HashMap<String, (u64, usize)>,
+    /// Bytes of the static `.shared` blocks; a dynamic block starts here.
     pub(crate) shared_bytes: usize,
+    /// The `.extern .shared` block's declared size, if the module has one
+    /// (0 for `name[]`). The launch decides its real size.
+    pub(crate) dynamic_shared: Option<usize>,
 }
 
 pub(crate) struct Parser {
@@ -214,6 +230,9 @@ impl Parser {
         }
         if let Ok(v) = tok.parse::<u64>() {
             return Src::Imm(v);
+        }
+        if let Ok(v) = tok.parse::<i64>() {
+            return Src::Imm(v as u64);
         }
         if let Some(hex) = tok.strip_prefix("0x") {
             return Src::Imm(u64::from_str_radix(hex, 16).expect("hex immediate"));
@@ -267,7 +286,9 @@ pub(crate) fn parse(ptx: &str) -> Program {
     let mut p = Parser { regs: HashMap::new(), reg_names: Vec::new(), shared: HashMap::new() };
     let mut shared_bytes = 0usize;
 
-    // `.shared .align A .b8 NAME[N];`
+    // `.shared .align A .b8 NAME[N];`, then at most one
+    // `.extern .shared .align A .b8 NAME[N?];` after them.
+    let mut dynamic: Option<(String, usize)> = None;
     for line in ptx.lines().map(str::trim) {
         if let Some(rest) = line.strip_prefix(".shared ") {
             let decl = rest.split_whitespace().last().expect("a shared symbol");
@@ -275,8 +296,17 @@ pub(crate) fn parse(ptx: &str) -> Program {
             let n: usize = n.parse().expect("a static shared size");
             p.shared.insert(name.to_string(), (SHARED_BASE + shared_bytes as u64, n));
             shared_bytes += n;
+        } else if let Some(rest) = line.strip_prefix(".extern .shared ") {
+            assert!(dynamic.is_none(), "one dynamic shared block is modelled");
+            let decl = rest.split_whitespace().last().expect("a shared symbol");
+            let (name, n) = decl.trim_end_matches(';').trim_end_matches(']').split_once('[').expect("a block");
+            dynamic = Some((name.to_string(), if n.is_empty() { 0 } else { n.parse().expect("a shared size") }));
+        } else {
+            assert!(!line.starts_with(".extern"), "`{line}`: only `.extern .shared` is modelled");
         }
-        assert!(!line.starts_with(".extern"), "dynamic shared memory is not modelled");
+    }
+    if let Some((name, n)) = &dynamic {
+        p.shared.insert(name.clone(), (SHARED_BASE + shared_bytes as u64, *n));
     }
 
     let mut labels: HashMap<String, usize> = HashMap::new();
@@ -284,7 +314,7 @@ pub(crate) fn parse(ptx: &str) -> Program {
 
     for raw in ptx.lines() {
         let line = raw.split("//").next().unwrap().trim();
-        if line.is_empty() || line.starts_with('.') || matches!(line, "{" | "}" | ")" | "(") {
+        if line.is_empty() || line.starts_with('.') || matches!(line, "{" | "}" | ")" | "(" | ") {") {
             continue;
         }
         if let Some(name) = line.strip_suffix(':') {
@@ -327,8 +357,9 @@ pub(crate) fn parse(ptx: &str) -> Program {
             ["mov", ty] => {
                 want(2);
                 let w = match *ty {
-                    "u32" | "b32" | "f32" | "pred" => W::U32,
-                    "u64" | "b64" => W::U64,
+                    // A 16-bit value lives in the low half of the register.
+                    "u32" | "b32" | "f32" | "pred" | "b16" | "u16" => W::U32,
+                    "u64" | "b64" | "s64" => W::U64,
                     _ => panic!("`{text}`: mov.{ty} is not modelled"),
                 };
                 Op::Mov { d: p.dst(ops[0]), s: p.src(ops[1]), w }
@@ -364,7 +395,8 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 want(2);
                 Op::CvtU32S8 { d: p.dst(ops[0]), a: p.src(ops[1]) }
             }
-            ["cvt", "u64", "u32"] => {
+            // u32 -> 64 bits zero-extends whatever the destination's sign.
+            ["cvt", "u64" | "s64", "u32"] => {
                 want(2);
                 Op::CvtU64U32 { d: p.dst(ops[0]), a: p.src(ops[1]) }
             }
@@ -395,6 +427,18 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 want(2);
                 Op::CvtF16F32 { d: p.dst(ops[0]), a: p.src(ops[1]) }
             }
+            ["cvt", "f32", "bf16"] => {
+                want(2);
+                Op::CvtF32Bf16 { d: p.dst(ops[0]), a: p.src(ops[1]) }
+            }
+            ["cvt", "rn", "bf16", "f32"] => {
+                want(2);
+                Op::CvtBf16F32 { d: p.dst(ops[0]), a: p.src(ops[1]) }
+            }
+            ["lg2", "approx", "f32"] => {
+                want(2);
+                Op::Lg2 { d: p.dst(ops[0]), a: p.src(ops[1]) }
+            }
             ["setp", cmp, ty] => {
                 want(3);
                 let cmp = match *cmp {
@@ -409,6 +453,7 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 let ty = match *ty {
                     "u32" => CmpTy::U32,
                     "u64" => CmpTy::U64,
+                    "s64" => CmpTy::S64,
                     "f32" => CmpTy::F32,
                     _ => panic!("`{text}`: comparison type not modelled"),
                 };
@@ -454,10 +499,14 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 want(2);
                 Op::Cos { d: p.dst(ops[0]), a: p.src(ops[1]) }
             }
-            ["ld", space @ ("global" | "shared"), ty @ ("f32" | "b16" | "u32" | "b32")] => {
+            ["ld", space @ ("global" | "shared"), ty @ ("f32" | "b16" | "u32" | "b32" | "s64" | "u64")] => {
                 want(2);
                 let space = if *space == "global" { Space::Global } else { Space::Shared };
-                let bytes = if *ty == "b16" { 2 } else { 4 };
+                let bytes = match *ty {
+                    "b16" => 2,
+                    "s64" | "u64" => 8,
+                    _ => 4,
+                };
                 Op::Ld { space, bytes, d: p.dst(ops[0]), addr: p.addr(ops[1]) }
             }
             // One byte, zero-extended into the register.
@@ -507,6 +556,7 @@ pub(crate) fn parse(ptx: &str) -> Program {
         reg_names: p.reg_names,
         shared: p.shared,
         shared_bytes,
+        dynamic_shared: dynamic.map(|(_, n)| n),
     }
 }
 
@@ -693,6 +743,17 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
             Op::Setp { cmp, ty, d, a, b } => {
                 let (a, b) = (rd(t, launch, *a), rd(t, launch, *b));
                 let r = match ty {
+                    CmpTy::S64 => {
+                        let (a, b) = (a as i64, b as i64);
+                        match cmp {
+                            Cmp::Eq => a == b,
+                            Cmp::Ne => a != b,
+                            Cmp::Lt => a < b,
+                            Cmp::Le => a <= b,
+                            Cmp::Gt => a > b,
+                            Cmp::Ge => a >= b,
+                        }
+                    }
                     CmpTy::U32 | CmpTy::U64 => {
                         let (a, b) = if *ty == CmpTy::U32 { (a as u32 as u64, b as u32 as u64) } else { (a, b) };
                         match cmp {
@@ -763,6 +824,18 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
             Op::CvtF16F32 { d, a } => {
                 let v = f16::from_f32(f(rd(t, launch, *a))).to_bits();
                 write(t, *d, v as u64);
+            }
+            Op::CvtF32Bf16 { d, a } => {
+                let v = bf16::from_bits(rd(t, launch, *a) as u16).to_f32();
+                write(t, *d, fb(v));
+            }
+            Op::CvtBf16F32 { d, a } => {
+                let v = bf16::from_f32(f(rd(t, launch, *a))).to_bits();
+                write(t, *d, v as u64);
+            }
+            Op::Lg2 { d, a } => {
+                let v = f(rd(t, launch, *a)).log2();
+                write(t, *d, fb(v));
             }
             Op::Ld { space, bytes, d, addr } => {
                 let at = rd(t, launch, Src::Reg(addr.base)).wrapping_add(addr.offset);
