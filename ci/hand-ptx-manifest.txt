@@ -63,6 +63,5 @@ crates/nsl-kir/src/backend_ptx.rs
 crates/nsl-runtime/src/cuda/fused_kernels.rs
 crates/nsl-runtime/src/cuda/kernels.rs
 crates/nsl-runtime/src/cuda/kernels_hopper.rs
-crates/nsl-runtime/src/cuda/strided_copy.rs
 crates/nsl-runtime/src/cuda/tier_b1_prepass.rs
 crates/nsl-runtime/src/flash_attention.rs

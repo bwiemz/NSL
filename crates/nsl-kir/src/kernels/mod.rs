@@ -1,5 +1,5 @@
 // crates/nsl-kir/src/kernels/mod.rs
-//! Kernels the runtime builds for itself (roadmap A2 step 7).
+//! Kernels the runtime builds for itself (roadmap A2 steps 7 and 11).
 //!
 //! `nsl-kir` is a leaf crate, so `nsl-runtime` can depend on it where it
 //! cannot depend on `nsl-codegen`. That is the whole point of this module:
@@ -9,3 +9,4 @@
 //! keep honest.
 
 pub mod cast;
+pub mod strided_copy;

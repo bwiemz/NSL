@@ -209,6 +209,7 @@ fn run(ptx: &str, g: &Geometry, input: &Inputs, call: Call, order: Order) -> Vec
             shared: vec![0xFF; prog.shared_bytes],
             ctaid,
             ctaid_y: 0,
+            nctaid_y: 1,
             ntid: BLOCK,
             steps: 0,
         };

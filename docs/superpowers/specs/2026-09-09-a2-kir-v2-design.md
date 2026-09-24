@@ -715,6 +715,34 @@ frozen throughout, so nothing here blocks a kernel fix.
     straight-line, SASS equivalence otherwise. `cuda/kernels_hopper.rs`
     (FA-3, sm_90) stays a member, listed with its reason, until the sm_90
     set enters KIR.
+
+    **Proof, revisited: level 3**, as for steps 9 and 10: the runtime
+    kernels loop (a grid-stride walk at least), so they are not
+    straight-line, and executing the frozen hand module against the KIR
+    one bit for bit says more than a SASS instruction count. Each runtime
+    family is described in `nsl_kir::kernels`, as step 7's casts are, and
+    the runtime lowers it once, on first use, into a `OnceLock` (the module
+    cache keys on the buffer's address).
+
+    **`strided_copy` done** (first slice; manifest 59 → 58).
+    `nsl_kir::kernels::strided_copy` builds the four run-copy arms (`run`,
+    `run4`, `bcast`, `bcast4`) as one module with the hand module's entry
+    names and `(src, dst, offsets, run_len, outer)` signature; the runtime's
+    `strided_copy::run_module()` replaces `STRIDED_COPY_RUN_PTX`. KIR needed
+    nothing new. The interpreter learned `%nctaid.y` (every launch now
+    states it), `ld`/`st` `.v4.f32` with a braced register list, and a
+    label on its instruction's line. The gate launches both modules over
+    the whole grid `RunPlan::geometry` gives, under two schedules that
+    reverse the CTA order as well as the thread order, on runs shorter than
+    their block, runs spanning two blocks, fewer y blocks than runs, and
+    overlapping, out-of-order source runs, with NaN payloads and `-0.0` in
+    the source; it requires the same bytes in all of global memory and the
+    exact copy. It catches either bound relaxed, the store dropped, the
+    offsets' or f32's element size nudged, the vector arms' unit width
+    nudged, and either block index read as 0; no mutant is equivalent. The
+    kernels drop to the KIR floor (`sm_70`; the hand module declared
+    `sm_80` for nothing it used) and take 14–24 registers where the hand
+    ones took 16–24 (sm_80/90/120), with no spills.
 12. **FA v2**, by phase directory, tier B.1 and B.2 last; the SASS
     baselines and the two no-spill gates already exist here and are the
     proof. `matmul_mma.rs` and `kernel_skeleton/` are deleted with their

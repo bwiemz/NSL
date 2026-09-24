@@ -33,7 +33,10 @@
 //! `.s64` values are two's-complement bit patterns in a register, and a
 //! negative decimal immediate is read as one; `add`, `sub` and `mul.lo` on
 //! them are the unsigned operations, which give the same bits.
-//! `%ctaid.y` is modelled for a two-dimensional grid.
+//! `%ctaid.y` and `%nctaid.y` are modelled for a two-dimensional grid.
+//! `ld.{global,shared}.v4.f32` and `st.{global,shared}.v4.f32` move four
+//! consecutive f32s through a braced register list, and a label may share
+//! its line with the instruction it names (`DONE: ret;`).
 //!
 //! `red.{global,shared}.add.f32` is a read-modify-write in f32, atomic
 //! because threads run one at a time; the order in which threads (and
@@ -64,6 +67,7 @@ pub(crate) enum Special {
     TidX,
     CtaidX,
     CtaidY,
+    NctaidY,
     NtidX,
 }
 
@@ -172,6 +176,10 @@ pub(crate) enum Op {
     /// `ld.global.s8`: one byte, sign-extended into the register.
     LdS8 { space: Space, d: usize, addr: Addr },
     St { space: Space, bytes: usize, addr: Addr, v: Src },
+    /// `ld.<space>.v4.f32 {d0, d1, d2, d3}, [addr]`.
+    LdV4 { space: Space, d: [usize; 4], addr: Addr },
+    /// `st.<space>.v4.f32 [addr], {v0, v1, v2, v3}`.
+    StV4 { space: Space, addr: Addr, v: [Src; 4] },
     /// `red.<space>.add.f32`: `*addr += v` in f32, as one step of the thread.
     RedAddF32 { space: Space, addr: Addr, v: Src },
     Bra { target: usize },
@@ -230,6 +238,7 @@ impl Parser {
             "%tid.x" => return Src::Special(Special::TidX),
             "%ctaid.x" => return Src::Special(Special::CtaidX),
             "%ctaid.y" => return Src::Special(Special::CtaidY),
+            "%nctaid.y" => return Src::Special(Special::NctaidY),
             "%ntid.x" => return Src::Special(Special::NtidX),
             _ => {}
         }
@@ -335,6 +344,14 @@ pub(crate) fn parse(ptx: &str) -> Program {
             labels.insert(name.to_string(), pending.len());
             continue;
         }
+        // `LABEL: instr;` names the instruction on its own line.
+        let line = match line.split_once(':') {
+            Some((name, rest)) if !name.contains(' ') && !name.contains('[') => {
+                labels.insert(name.to_string(), pending.len());
+                rest.trim()
+            }
+            _ => line,
+        };
         let body = line.strip_suffix(';').unwrap_or_else(|| panic!("`{line}` is not a statement"));
         let (guard, body) = match body.strip_prefix('@') {
             Some(rest) => {
@@ -353,12 +370,20 @@ pub(crate) fn parse(ptx: &str) -> Program {
 
     let mut instrs = Vec::with_capacity(pending.len());
     for (mnemonic, operands, guard) in pending {
+        let text = format!("{mnemonic} {operands}");
+        // A braced register list (`{%f1, %f2, %f3, %f4}`) is one operand.
+        let (operands, group): (String, Vec<&str>) = match operands.split_once('{') {
+            Some((pre, rest)) => {
+                let (inner, post) = rest.split_once('}').unwrap_or_else(|| panic!("`{text}`: unclosed `{{`"));
+                (format!("{pre}{{}}{post}"), inner.split(',').map(str::trim).collect())
+            }
+            None => (operands.clone(), vec![]),
+        };
         let ops: Vec<&str> = if operands.is_empty() {
             vec![]
         } else {
             operands.split(',').map(str::trim).collect()
         };
-        let text = format!("{mnemonic} {operands}");
         let want = |n: usize| assert_eq!(ops.len(), n, "`{text}` takes {n} operands");
         let parts: Vec<&str> = mnemonic.split('.').collect();
         let op = match parts.as_slice() {
@@ -545,6 +570,20 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 let bytes = if *ty == "b16" { 2 } else { 4 };
                 Op::St { space, bytes, addr: p.addr(ops[0]), v: p.src(ops[1]) }
             }
+            ["ld", space @ ("global" | "shared"), "v4", "f32"] => {
+                want(2);
+                assert!(ops[0] == "{}" && group.len() == 4, "`{text}`: four destinations");
+                let space = if *space == "global" { Space::Global } else { Space::Shared };
+                let d = [p.dst(group[0]), p.dst(group[1]), p.dst(group[2]), p.dst(group[3])];
+                Op::LdV4 { space, d, addr: p.addr(ops[1]) }
+            }
+            ["st", space @ ("global" | "shared"), "v4", "f32"] => {
+                want(2);
+                assert!(ops[1] == "{}" && group.len() == 4, "`{text}`: four sources");
+                let space = if *space == "global" { Space::Global } else { Space::Shared };
+                let v = [p.src(group[0]), p.src(group[1]), p.src(group[2]), p.src(group[3])];
+                Op::StV4 { space, addr: p.addr(ops[0]), v }
+            }
             ["red", space @ ("global" | "shared"), "add", "f32"] => {
                 want(2);
                 let space = if *space == "global" { Space::Global } else { Space::Shared };
@@ -623,6 +662,8 @@ pub(crate) struct Launch<'a> {
     pub(crate) ctaid: u32,
     /// `%ctaid.y`: 0 for a one-dimensional grid.
     pub(crate) ctaid_y: u32,
+    /// `%nctaid.y`: 1 for a one-dimensional grid.
+    pub(crate) nctaid_y: u32,
     pub(crate) ntid: u32,
     pub(crate) steps: u64,
 }
@@ -665,6 +706,7 @@ pub(crate) fn read(prog: &Program, t: &Thread, launch: &Launch, tid: u32, s: Src
         Src::Special(Special::TidX) => tid as u64,
         Src::Special(Special::CtaidX) => launch.ctaid as u64,
         Src::Special(Special::CtaidY) => launch.ctaid_y as u64,
+        Src::Special(Special::NctaidY) => launch.nctaid_y as u64,
         Src::Special(Special::NtidX) => launch.ntid as u64,
     }
 }
@@ -894,6 +936,29 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
                     Space::Shared => launch.shared(at, *bytes),
                 };
                 mem.copy_from_slice(&val[..*bytes]);
+            }
+            Op::LdV4 { space, d, addr } => {
+                let at = rd(t, launch, Src::Reg(addr.base)).wrapping_add(addr.offset);
+                let mem = match space {
+                    Space::Global => launch.global(at, 16),
+                    Space::Shared => launch.shared(at, 16),
+                };
+                let lanes: Vec<u64> =
+                    mem.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u64).collect();
+                for (k, &dk) in d.iter().enumerate() {
+                    write(t, dk, lanes[k]);
+                }
+            }
+            Op::StV4 { space, addr, v } => {
+                let at = rd(t, launch, Src::Reg(addr.base)).wrapping_add(addr.offset);
+                let vals: Vec<u64> = v.iter().map(|&s| rd(t, launch, s)).collect();
+                let mem = match space {
+                    Space::Global => launch.global(at, 16),
+                    Space::Shared => launch.shared(at, 16),
+                };
+                for (k, val) in vals.iter().enumerate() {
+                    mem[4 * k..4 * k + 4].copy_from_slice(&(*val as u32).to_le_bytes());
+                }
             }
             Op::RedAddF32 { space, addr, v } => {
                 let at = rd(t, launch, Src::Reg(addr.base)).wrapping_add(addr.offset);

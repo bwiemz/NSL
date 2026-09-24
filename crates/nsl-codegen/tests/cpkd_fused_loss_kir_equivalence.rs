@@ -209,6 +209,7 @@ fn launch_rows(prog: &Program, c: &Case, args: &HashMap<String, u64>, global: &m
             shared: vec![0x7F; shared_len],
             ctaid: row,
             ctaid_y: 0,
+            nctaid_y: 1,
             ntid: BLOCK,
             steps: 0,
         };

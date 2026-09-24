@@ -9694,7 +9694,7 @@ pub(crate) fn gpu_strided_copy_f32(tensor_ptr: i64) -> i64 {
                     &mut outer as *mut _ as *mut std::ffi::c_void,
                 ];
                 let result = inner::kernel_launch(
-                    strided_copy::STRIDED_COPY_RUN_PTX.as_ptr(),
+                    strided_copy::run_module().as_ptr(),
                     resident.plan.kernel_name().as_ptr(),
                     grid,
                     block,
@@ -10329,11 +10329,6 @@ mod tests {
             true,
         ),
         (
-            "STRIDED_COPY_RUN_PTX",
-            super::strided_copy::STRIDED_COPY_RUN_PTX,
-            true,
-        ),
-        (
             "HOPPER_PTX_HEADER",
             super::kernels_hopper::HOPPER_PTX_HEADER,
             false,
@@ -10343,9 +10338,9 @@ mod tests {
     /// `EXTRA_RUNTIME_PTX` plus the modules that are built rather than
     /// declared.
     ///
-    /// The four precision casts moved to `nsl_kir::kernels::cast` (roadmap
-    /// A2 step 7), so they are no longer `const` and cannot sit in the
-    /// array above. They still have to reach both gates: the registry's
+    /// The four precision casts (roadmap A2 step 7) and the strided run
+    /// copy (step 11) moved to `nsl_kir::kernels`, so they are no longer
+    /// `const` and cannot sit in the array above. They still have to reach both gates: the registry's
     /// own comment records that covering a module in only one of them was
     /// the hole that let a whole kernel module ship unassembled. Every
     /// consumer of the registry reads this instead of the array.
@@ -10355,6 +10350,7 @@ mod tests {
             let (ptx, _) = super::precision_cast_kernels::module_for(kind);
             all.push((kind.kernel_name(), ptx, true));
         }
+        all.push(("strided_copy::run_module", super::strided_copy::run_module(), true));
         all
     }
 
