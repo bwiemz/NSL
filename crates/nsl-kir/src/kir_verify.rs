@@ -37,7 +37,8 @@
 //!
 //!   4b. **The scalar ISA (roadmap A2 step 4).** `And`/`Or`/`Xor`/`Not`
 //!      are homogeneous on integers or `Bool`s, `Rem` on integers, `Min`/
-//!      `Max` on any numeric type, `Rcp`/`Rsqrt` on `F32`/`F64`; `Shl`/
+//!      `Max` on any numeric type, `Rcp`/`Rsqrt` on `F32`/`F64`, `Exp2` on
+//!      `F32`; `Shl`/
 //!      `Shr` keep the operand's type and take a `U32` amount;
 //!      `CastRounded` lands in its target; `LoadVec`/`StoreVec` move 2 or
 //!      4 pointee-typed values through a `Ptr` (`BadVectorWidth`); `Vote`
@@ -705,6 +706,7 @@ pub fn op_dst(op: &KirOp) -> Option<VarId> {
         | KirOp::Max(d, _, _)
         | KirOp::Rcp(d, _)
         | KirOp::Rsqrt(d, _)
+        | KirOp::Exp2(d, _)
         | KirOp::CastRounded { dst: d, .. }
         | KirOp::Vote { dst: d, .. }
         | KirOp::LaneId(d)
@@ -765,6 +767,7 @@ pub fn op_uses(op: &KirOp) -> Vec<VarId> {
         | KirOp::Not(_, s)
         | KirOp::Rcp(_, s)
         | KirOp::Rsqrt(_, s)
+        | KirOp::Exp2(_, s)
         | KirOp::Cast(_, s, _)
         | KirOp::CastRounded { src: s, .. }
         | KirOp::LoadVec { ptr: s, .. }
@@ -982,6 +985,10 @@ fn check_types(
                     });
                 }
             }
+        }
+        KirOp::Exp2(d, s) => {
+            expect(*d, "dst (Exp2 takes F32)", &KirType::F32);
+            expect(*s, "src", &KirType::F32);
         }
         KirOp::CastRounded { dst: d, ty: target, .. } => expect(*d, "dst", target),
         // (The width check pushes directly, so it runs after the last use
@@ -1758,6 +1765,22 @@ mod tests {
         b.terminate(KirTerminator::Return);
         let errs = verify(&b.finalize()).unwrap_err();
         assert!(matches!(errs[..], [KirVerifyError::TypeMismatch { var, .. }] if var == r), "{errs:?}");
+    }
+
+    #[test]
+    fn exp2_takes_f32() {
+        // `ex2.approx` has an f32 form only.
+        let (mut b, _) = one_block();
+        let x = b.new_typed_var(KirType::F64);
+        b.emit(KirOp::Const(x, KirConst { ty: KirType::F64, value: ConstValue::F64(1.0) }));
+        let r = b.new_typed_var(KirType::F64);
+        b.emit(KirOp::Exp2(r, x));
+        b.terminate(KirTerminator::Return);
+        let errs = verify(&b.finalize()).unwrap_err();
+        assert!(
+            errs.iter().any(|e| matches!(e, KirVerifyError::TypeMismatch { var, .. } if *var == r)),
+            "{errs:?}"
+        );
     }
 
     #[test]

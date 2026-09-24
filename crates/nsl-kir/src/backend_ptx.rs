@@ -676,6 +676,9 @@ fn emit_op(ptx: &mut String, op: &KirOp, ir: &KernelIR) {
                 if var_ptx_type(ir, *dst, *src) == "f64" { "rsqrt.approx.f64" } else { "rsqrt.approx.f32" };
             writeln!(ptx, "    {} {}{}, {}{};", mnemonic, prefix, dst, prefix, src).unwrap();
         }
+        KirOp::Exp2(dst, src) => {
+            writeln!(ptx, "    ex2.approx.f32 %f{}, %f{};", dst, src).unwrap();
+        }
         KirOp::LoadVec { dsts, ptr, space } => {
             let first = dsts.first().copied().unwrap_or(0);
             let ty = mem_type(var_ptx_type(ir, first, first));
@@ -1884,7 +1887,7 @@ mod tests {
     }
 
     #[test]
-    fn rcp_and_rsqrt_pick_the_float_forms() {
+    fn rcp_rsqrt_and_exp2_pick_the_float_forms() {
         let mut ids = Vec::new();
         let (ptx, al) = ptx_of(|b| {
             let x = f32_const(b, 4.0);
@@ -1898,13 +1901,18 @@ mod tests {
             b.emit(KirOp::Rcp(rd, d));
             let mn = b.new_typed_var(KirType::F32);
             b.emit(KirOp::Min(mn, x, x));
-            ids = vec![x, r, q, d, rd, mn];
+            let e2 = b.new_typed_var(KirType::F32);
+            b.emit(KirOp::Exp2(e2, x));
+            ids = vec![x, r, q, d, rd, mn, e2];
         });
         let n = |k: usize| al.name(ids[k]);
         assert!(ptx.contains(&format!("rcp.approx.f32 {}, {};", n(1), n(0))), "{ptx}");
         assert!(ptx.contains(&format!("rsqrt.approx.f32 {}, {};", n(2), n(0))), "{ptx}");
         assert!(ptx.contains(&format!("rcp.rn.f64 {}, {};", n(4), n(3))), "{ptx}");
         assert!(ptx.contains(&format!("min.f32 {}, {}, {};", n(5), n(0), n(0))), "{ptx}");
+        // Exp2 is the bare instruction: no log2(e) pre-scale, unlike Exp.
+        assert!(ptx.contains(&format!("ex2.approx.f32 {}, {};", n(6), n(0))), "{ptx}");
+        assert!(!ptx.contains("0f3FB8AA3B"), "{ptx}");
         assert!(n(3).starts_with("%fd"));
     }
 

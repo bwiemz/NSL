@@ -14,12 +14,12 @@
 //! in `gpu_specs::GPU_DATABASE` that CUDA 13 still assembles for, and
 //! assembles each with `ptxas --gpu-name sm_{N}`.
 //!
-//! `cfie_kv_quant_ptx`, `cfie_spec_sampler_ptx`, both
-//! `cfie_speculative_ptx` kernels and `cfie_sample_ptx` have since moved
-//! onto KIR (roadmap A2 step 9): those kernels target the KIR floor (`sm_70`)
-//! whatever GPU serves them and take no `sm_version`, and the gate still
-//! assembles them for every architecture — the driver JIT-compiles them
-//! forward, and this is the offline form of that.
+//! All five have since moved onto KIR (roadmap A2 step 9, finished with
+//! `cfie_persistent_ptx`): their kernels target the KIR floor (`sm_70`)
+//! whatever GPU serves them and take no `sm_version`, so each module is
+//! built once, and the gate still assembles it for every architecture —
+//! the driver JIT-compiles it forward, and this is the offline form of
+//! that.
 //!
 //! Skipped with a note when `ptxas` is not in PATH; CI's cuda-feature lane
 //! installs the toolkit and runs this file in its "PTX emitter ptxas
@@ -104,9 +104,9 @@ fn serving_arches() -> Vec<u32> {
     sms
 }
 
-/// `(kernel, PTX)` for every kernel the five emitters build, at `sm`, over
-/// the paper-shaped configurations their own tests use.
-fn modules(sm: u32) -> Vec<(String, String)> {
+/// `(kernel, PTX)` for every kernel the five emitters build, over the
+/// paper-shaped configurations their own tests use.
+fn modules() -> Vec<(String, String)> {
     let mut out = Vec::new();
 
     let kv = cfie_kv_quant_ptx::QuantDecodeAttentionConfig {
@@ -144,7 +144,6 @@ fn modules(sm: u32) -> Vec<(String, String)> {
         n_layers: 8,
         rope_theta: 10000.0,
         eps: 1e-5,
-        sm_version: sm,
     };
     let (ptx, meta) = cfie_persistent_ptx::emit(&block);
     out.push((meta.kernel_name, ptx));
@@ -185,13 +184,14 @@ fn ptxas_accepts_every_cfie_hand_emitter_for_every_serving_arch() {
         return;
     };
     let arches = serving_arches();
+    let modules = modules();
     let mut assembled = 0;
     for &sm in &arches {
-        for (kernel, ptx) in modules(sm) {
+        for (kernel, ptx) in &modules {
             let header: Vec<&str> =
                 ptx.lines().filter(|l| l.starts_with(".version") || l.starts_with(".target")).collect();
             assert_eq!(header.len(), 2, "{kernel} at sm_{sm}: one .version and one .target");
-            if let Err(stderr) = assemble_ptx(&ptxas, &ptx, &format!("sm_{sm}")) {
+            if let Err(stderr) = assemble_ptx(&ptxas, ptx, &format!("sm_{sm}")) {
                 panic!("ptxas rejected {kernel} for sm_{sm} (header {header:?}):\n{stderr}");
             }
             assembled += 1;

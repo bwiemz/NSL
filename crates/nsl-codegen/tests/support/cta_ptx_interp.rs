@@ -3,8 +3,9 @@
 //!
 //! Shared by `cfie_decode_attn_kir_equivalence.rs`,
 //! `cfie_kv_quant_kir_equivalence.rs`,
-//! `cfie_spec_sampler_kir_equivalence.rs` and
-//! `cfie_speculative_kir_equivalence.rs`, which include it with `#[path]`;
+//! `cfie_spec_sampler_kir_equivalence.rs`,
+//! `cfie_speculative_kir_equivalence.rs` and the other CFIE gates, which
+//! include it with `#[path]`;
 //! the first of them documents what it models and what it does not.
 //! In short: a CTA runs cooperatively, a `bar.sync` releases only when
 //! every thread waits at it, and an unknown mnemonic or operand form, a
@@ -16,11 +17,14 @@
 //! the rounding mode is moot. `cvt.u64.u64` is a copy: it is how the KIR
 //! printer reinterprets one pointer type as another.
 //!
-//! The two approximate instructions are modelled by their exact
-//! counterparts, `ex2.approx.f32` as `exp2` and `rsqrt.approx.f32` as
-//! `1 / sqrt`: the gates compare two programs on the same model, so what
-//! matters is that the model is a function of its input, not that it
-//! rounds as the hardware's approximation does.
+//! The approximate instructions are modelled by their exact
+//! counterparts, `ex2.approx.f32` as `exp2`, `rsqrt.approx.f32` as
+//! `1 / sqrt`, and `sin.approx.f32` / `cos.approx.f32` as `sin` / `cos`:
+//! the gates compare two programs on the same model, so what matters is
+//! that the model is a function of its input, not that it rounds as the
+//! hardware's approximation does. `sqrt.rn.f32` is IEEE and so is Rust's.
+//! `cvt.rn.f16.f32` rounds to nearest even, as `half` does, and
+//! `st.b16` stores the register's low two bytes.
 //!
 //! Shifts follow PTX: `shl` and the unsigned `shr` take their amount from
 //! the low 32 bits of the operand and produce 0 for an amount at or past
@@ -74,6 +78,7 @@ pub(crate) enum IntOp {
     Sub,
     MulLo,
     Div,
+    Rem,
     Min,
     And,
     Xor,
@@ -136,6 +141,11 @@ pub(crate) enum Op {
     Fma { d: usize, a: Src, b: Src, c: Src },
     Ex2 { d: usize, a: Src },
     Rsqrt { d: usize, a: Src },
+    Sqrt { d: usize, a: Src },
+    Sin { d: usize, a: Src },
+    Cos { d: usize, a: Src },
+    /// `cvt.rn.f16.f32`: round to nearest even, into the low 16 bits.
+    CvtF16F32 { d: usize, a: Src },
     Ld { space: Space, bytes: usize, d: usize, addr: Addr },
     /// `ld.global.s8`: one byte, sign-extended into the register.
     LdS8 { space: Space, d: usize, addr: Addr },
@@ -323,7 +333,7 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 };
                 Op::Mov { d: p.dst(ops[0]), s: p.src(ops[1]), w }
             }
-            [name @ ("add" | "sub" | "div" | "min"), ty @ ("u32" | "u64")]
+            [name @ ("add" | "sub" | "div" | "rem" | "min"), ty @ ("u32" | "u64")]
             | [name @ "mul", "lo", ty @ ("u32" | "u64")] => {
                 want(3);
                 let op = match *name {
@@ -331,6 +341,7 @@ pub(crate) fn parse(ptx: &str) -> Program {
                     "sub" => IntOp::Sub,
                     "mul" => IntOp::MulLo,
                     "div" => IntOp::Div,
+                    "rem" => IntOp::Rem,
                     _ => IntOp::Min,
                 };
                 let w = if *ty == "u32" { W::U32 } else { W::U64 };
@@ -380,6 +391,10 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 want(2);
                 Op::CvtF32F16 { d: p.dst(ops[0]), a: p.src(ops[1]) }
             }
+            ["cvt", "rn", "f16", "f32"] => {
+                want(2);
+                Op::CvtF16F32 { d: p.dst(ops[0]), a: p.src(ops[1]) }
+            }
             ["setp", cmp, ty] => {
                 want(3);
                 let cmp = match *cmp {
@@ -427,6 +442,18 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 want(2);
                 Op::Rsqrt { d: p.dst(ops[0]), a: p.src(ops[1]) }
             }
+            ["sqrt", "rn", "f32"] => {
+                want(2);
+                Op::Sqrt { d: p.dst(ops[0]), a: p.src(ops[1]) }
+            }
+            ["sin", "approx", "f32"] => {
+                want(2);
+                Op::Sin { d: p.dst(ops[0]), a: p.src(ops[1]) }
+            }
+            ["cos", "approx", "f32"] => {
+                want(2);
+                Op::Cos { d: p.dst(ops[0]), a: p.src(ops[1]) }
+            }
             ["ld", space @ ("global" | "shared"), ty @ ("f32" | "b16" | "u32" | "b32")] => {
                 want(2);
                 let space = if *space == "global" { Space::Global } else { Space::Shared };
@@ -444,10 +471,11 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 let space = if *space == "global" { Space::Global } else { Space::Shared };
                 Op::LdS8 { space, d: p.dst(ops[0]), addr: p.addr(ops[1]) }
             }
-            ["st", space @ ("global" | "shared"), "f32" | "u32" | "b32"] => {
+            ["st", space @ ("global" | "shared"), ty @ ("f32" | "u32" | "b32" | "b16")] => {
                 want(2);
                 let space = if *space == "global" { Space::Global } else { Space::Shared };
-                Op::St { space, bytes: 4, addr: p.addr(ops[0]), v: p.src(ops[1]) }
+                let bytes = if *ty == "b16" { 2 } else { 4 };
+                Op::St { space, bytes, addr: p.addr(ops[0]), v: p.src(ops[1]) }
             }
             ["bra"] => {
                 want(1);
@@ -610,6 +638,7 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
                             IntOp::Sub => a.wrapping_sub(b),
                             IntOp::MulLo => a.wrapping_mul(b),
                             IntOp::Div => a.checked_div(b).expect("u32 division by zero"),
+                            IntOp::Rem => a.checked_rem(b).expect("u32 remainder by zero"),
                             IntOp::Min => a.min(b),
                             IntOp::And => a & b,
                             IntOp::Xor => a ^ b,
@@ -622,6 +651,7 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
                         IntOp::Sub => a.wrapping_sub(b),
                         IntOp::MulLo => a.wrapping_mul(b),
                         IntOp::Div => a.checked_div(b).expect("u64 division by zero"),
+                        IntOp::Rem => a.checked_rem(b).expect("u64 remainder by zero"),
                         IntOp::Min => a.min(b),
                         IntOp::And => a & b,
                         IntOp::Xor => a ^ b,
@@ -717,6 +747,22 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
             Op::Rsqrt { d, a } => {
                 let v = 1.0 / f(rd(t, launch, *a)).sqrt();
                 write(t, *d, fb(v));
+            }
+            Op::Sqrt { d, a } => {
+                let v = f(rd(t, launch, *a)).sqrt();
+                write(t, *d, fb(v));
+            }
+            Op::Sin { d, a } => {
+                let v = f(rd(t, launch, *a)).sin();
+                write(t, *d, fb(v));
+            }
+            Op::Cos { d, a } => {
+                let v = f(rd(t, launch, *a)).cos();
+                write(t, *d, fb(v));
+            }
+            Op::CvtF16F32 { d, a } => {
+                let v = f16::from_f32(f(rd(t, launch, *a))).to_bits();
+                write(t, *d, v as u64);
             }
             Op::Ld { space, bytes, d, addr } => {
                 let at = rd(t, launch, Src::Reg(addr.base)).wrapping_add(addr.offset);

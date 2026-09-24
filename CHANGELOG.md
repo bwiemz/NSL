@@ -8,6 +8,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- The CFIE persistent decode-block kernel (`nsl_cfie_decode_block`) is
+  built as KIR (roadmap A2 step 9, its last slice). It was
+  hand-assembled PTX for a whole layer's decode step in one CTA: RMSNorm,
+  the Q/K/V projections with RoPE, the f16 KV append, flash-decode
+  attention, W_o, RMSNorm and the silu FFN. Its attention now reuses the
+  decode-attention kernel's KIR sections, one head at a time, and its
+  RMSNorms the spec sampler's sum-of-squares tree.
+  `tests/cfie_persistent_kir_equivalence.rs` runs the frozen hand emitter
+  and the KIR one on the shared PTX interpreter across GQA and MHA
+  geometries and sequence lengths over every attention tile edge. It
+  requires the same bytes in the output row and the KV pool, checks both
+  against `cpu_reference`, and names the four barriers that guard nothing.
+  KIR gains `KirOp::Exp2` (a bare `ex2.approx.f32`) for the RoPE
+  frequency. `DecodeBlockConfig::sm_version` is gone, and
+  `cfie_persistent_ptx.rs` leaves the hand-PTX freeze (62 files to 61):
+  every CFIE kernel is KIR now.
 - The CFIE fused decode-sample kernel (`nsl_cfie_fused_sample`) is built
   as KIR (roadmap A2 step 9, sixth slice). It was hand-assembled PTX:
   RMSNorm, the LM-head matvec over vocab tiles, a replace-min top-k list,
