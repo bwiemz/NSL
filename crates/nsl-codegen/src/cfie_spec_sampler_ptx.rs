@@ -251,54 +251,19 @@ pub(crate) fn rmsnorm_in_place(b: &mut KirBuilder, c: &Common) {
     use AddressSpace::{Global, Shared};
     use KirType::F32;
 
-    // Per-thread strided partial sum of squares.
-    let head = b.new_block();
-    let body = b.new_block();
-    let done = b.new_block();
-    let i = b.add_block_param(head, KirType::U32);
-    let ss = b.add_block_param(head, F32);
-    b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![c.tid, c.f_zero])));
-
-    b.set_block(head);
-    let finished = cmp(b, i, c.d_model, CmpOp::Ge);
-    b.terminate(KirTerminator::CondBranch(finished, KirEdge::to(done), KirEdge::to(body)));
-
-    b.set_block(body);
-    let slot = at(b, F32, Shared, c.hidden_smem, i);
-    let h = load(b, F32, slot, Shared);
-    let ss_next = b.new_typed_var(F32);
-    b.emit(KirOp::Fma(ss_next, h, h, ss));
-    let i_next = op2(b, KirType::U32, KirOp::Add, i, c.tile_width);
-    b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![i_next, ss_next])));
-
     // The scores region doubles as the reduction scratch before the tile
     // loop.
-    b.set_block(done);
-    let mine = at(b, F32, Shared, c.scores, c.tid);
-    b.emit(KirOp::Store(mine, ss, Shared));
-    b.emit(KirOp::Barrier);
-
-    // Tree reduction: scores[tid] += scores[tid + off] for tid < off.
-    for off in [64u32, 32, 16, 8, 4, 2, 1] {
-        let add = b.new_block();
-        let join = b.new_block();
-        let offset = konst(b, ConstValue::U32(off));
-        let active = cmp(b, c.tid, offset, CmpOp::Lt);
-        b.terminate(KirTerminator::CondBranch(active, KirEdge::to(add), KirEdge::to(join)));
-
-        b.set_block(add);
-        let lo_addr = at(b, F32, Shared, c.scores, c.tid);
-        let lo = load(b, F32, lo_addr, Shared);
-        let partner = op2(b, KirType::U32, KirOp::Add, c.tid, offset);
-        let hi_addr = at(b, F32, Shared, c.scores, partner);
-        let hi = load(b, F32, hi_addr, Shared);
-        let sum = op2(b, F32, KirOp::Add, lo, hi);
-        b.emit(KirOp::Store(lo_addr, sum, Shared));
-        b.terminate(KirTerminator::Branch(KirEdge::to(join)));
-
-        b.set_block(join);
-        b.emit(KirOp::Barrier);
-    }
+    sum_of_squares_tree(
+        b,
+        SquareSum {
+            tid: c.tid,
+            len: c.d_model,
+            stride: c.tile_width,
+            f_zero: c.f_zero,
+            src: c.hidden_smem,
+            scratch: c.scores,
+        },
+    );
 
     // Thread 0: rstd = rsqrt(sum_sq / d_model + eps).
     let rstd_compute = b.new_block();
@@ -332,6 +297,77 @@ pub(crate) fn rmsnorm_in_place(b: &mut KirBuilder, c: &Common) {
         b.emit(KirOp::Store(slot, normed, Shared));
     });
     b.emit(KirOp::Barrier);
+}
+
+/// The operands of [`sum_of_squares_tree`]: the thread id, the row length
+/// and the block-wide stride (u32), f32 `0`, and two f32 shared pointers.
+pub(crate) struct SquareSum {
+    pub(crate) tid: VarId,
+    pub(crate) len: VarId,
+    pub(crate) stride: VarId,
+    pub(crate) f_zero: VarId,
+    pub(crate) src: VarId,
+    pub(crate) scratch: VarId,
+}
+
+/// The sum of squares of `src[0..len]` across the CTA, in the hand
+/// kernels' order: each thread accumulates `fma(x, x, ss)` over
+/// `i = tid, tid + stride, ...`, stores its partial to `scratch[tid]`, and
+/// a barrier-separated tree folds `scratch[tid] += scratch[tid + off]` for
+/// `off = 64, 32, ..., 1` (so `scratch` holds `TILE` floats and the CTA is
+/// `TILE` threads). Shared with `cfie_persistent_ptx`, whose two RMSNorms
+/// start the same way. Leaves the builder after the last tree barrier,
+/// with the total in `scratch[0]`.
+pub(crate) fn sum_of_squares_tree(b: &mut KirBuilder, s: SquareSum) {
+    use AddressSpace::Shared;
+    use KirType::F32;
+
+    // Per-thread strided partial sum of squares.
+    let head = b.new_block();
+    let body = b.new_block();
+    let done = b.new_block();
+    let i = b.add_block_param(head, KirType::U32);
+    let ss = b.add_block_param(head, F32);
+    b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![s.tid, s.f_zero])));
+
+    b.set_block(head);
+    let finished = cmp(b, i, s.len, CmpOp::Ge);
+    b.terminate(KirTerminator::CondBranch(finished, KirEdge::to(done), KirEdge::to(body)));
+
+    b.set_block(body);
+    let slot = at(b, F32, Shared, s.src, i);
+    let h = load(b, F32, slot, Shared);
+    let ss_next = b.new_typed_var(F32);
+    b.emit(KirOp::Fma(ss_next, h, h, ss));
+    let i_next = op2(b, KirType::U32, KirOp::Add, i, s.stride);
+    b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![i_next, ss_next])));
+
+    b.set_block(done);
+    let mine = at(b, F32, Shared, s.scratch, s.tid);
+    b.emit(KirOp::Store(mine, ss, Shared));
+    b.emit(KirOp::Barrier);
+
+    // Tree reduction: scratch[tid] += scratch[tid + off] for tid < off.
+    for off in [64u32, 32, 16, 8, 4, 2, 1] {
+        let add = b.new_block();
+        let join = b.new_block();
+        let offset = konst(b, ConstValue::U32(off));
+        let active = cmp(b, s.tid, offset, CmpOp::Lt);
+        b.terminate(KirTerminator::CondBranch(active, KirEdge::to(add), KirEdge::to(join)));
+
+        b.set_block(add);
+        let lo_addr = at(b, F32, Shared, s.scratch, s.tid);
+        let lo = load(b, F32, lo_addr, Shared);
+        let partner = op2(b, KirType::U32, KirOp::Add, s.tid, offset);
+        let hi_addr = at(b, F32, Shared, s.scratch, partner);
+        let hi = load(b, F32, hi_addr, Shared);
+        let sum = op2(b, F32, KirOp::Add, lo, hi);
+        b.emit(KirOp::Store(lo_addr, sum, Shared));
+        b.terminate(KirTerminator::Branch(KirEdge::to(join)));
+
+        b.set_block(join);
+        b.emit(KirOp::Barrier);
+    }
 }
 
 /// `dot(hidden_smem, lm_head[tok])` over the f16 row, in the hand

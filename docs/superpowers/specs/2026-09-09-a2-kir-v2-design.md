@@ -542,6 +542,45 @@ frozen throughout, so nothing here blocks a kernel fix.
    clamp (the tail lanes hold -inf, which never beats the list's minimum
    under the strict `>`). `FusedSampleKernelConfig` lost its
    `sm_version`, and the file left the freeze (63 → 62).
+
+   **`persistent` done, and with it step 9.** The persistent decode block
+   runs a whole layer's decode step in one CTA: RMSNorm, the Q/K/V
+   projections with RoPE, the f16 KV append, attention over `pos + 1`
+   tokens, W_o and the residual, RMSNorm again, the silu FFN in 128-row
+   tiles, and the second residual. Its attention is the decode kernel's
+   own sections: the head loop builds a `FlashCtx` per Q head (the head's
+   Q row and its attention-output row live in this kernel's shared
+   memory) and runs `prefix_pass` and `publish_output`, which now takes
+   the output's address space. Its two RMSNorms start with the spec
+   sampler's sum-of-squares tree, now a section of its own
+   (`sum_of_squares_tree`); the finish differs (every thread divides by
+   `sqrt(mean + eps)` and writes a separate row), so it is this kernel's.
+   KIR gained one op, `Exp2`: RoPE's frequency is `ex2(i2 * c)` with no
+   `log2(e)` pre-scale, which `Exp` cannot print. The interpreter learned
+   `sqrt.rn`, `sin.approx` / `cos.approx` (as `sin` / `cos`),
+   `cvt.rn.f16.f32`, `st.b16` and `rem`. The gate is output-rich — a
+   residual row and a pool record rather than one token — so the mutants
+   show without special inputs: over sequence lengths across every
+   attention tile edge, `d_model` past the block, `d_ff` over two FFN
+   tiles, `head_dim` equal to the block, 256 Q pairs, GQA and MHA and a
+   non-default RoPE base and epsilon, the hand and KIR modules leave the
+   same bytes, and the answer matches `cpu_reference` fed the same f16
+   weights and history (within the f16 rounding of the appended record
+   the kernel attends over). It catches every barrier that orders
+   something, nudged pool strides, per-slot, `d_ff`, softmax scale,
+   `1 / d_model`, epsilon, RoPE scale and silu constant, and both dropped
+   tail clamps. Four barriers are named equivalent mutants: after the x
+   load and after the W_o residual (each thread's sum of squares reads
+   only the elements it wrote), after zeroing y (the down projection and
+   the output read `y` the same way), and RMSNorm2's closing barrier
+   (the y-zeroing barrier publishes `xn` just as well; the two are each
+   redundant only while the other stays, and deleting both is caught).
+   One behaviour changed at a caller: the KIR verifier refuses a static
+   shared layout past 48 KB, which the hand emitter would print and
+   `serve.rs` would then decline to use, so the module exposes
+   `smem_bytes` and serve asks it before emitting. `DecodeBlockConfig`
+   lost its `sm_version`, and the file left the freeze (62 → 61). Every
+   CFIE kernel is KIR now.
 10. **Fused loss heads.** `fused_linear_ce.rs`, then `cpkd_fused_loss.rs`.
     Proof: SASS equivalence (the online-softmax loops reorder under
     scheduling).

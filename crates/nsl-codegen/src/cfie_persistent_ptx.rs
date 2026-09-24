@@ -10,7 +10,7 @@
 //!
 //! The KV pool uses the SAME baked layout as `cfie_decode_attention`
 //! (`[n_layers][2][max_tokens][n_kv_heads][head_dim]`, f16, strides as
-//! PTX immediates) — the two emitters share stride derivation and a
+//! immediates) — the two emitters share stride derivation and a
 //! structural test asserts the header constants stay equal.
 //!
 //! Simplest-correct over occupancy (Tier-A convention): block_dim 128,
@@ -26,13 +26,49 @@
 //!     `sin.approx.f32` / `cos.approx.f32` on angle = pos * freq.
 //!   * softmax exponentials: `ex2.approx.f32` with a baked log2(e).
 //!   * silu(g) = g * sigmoid(g) with sigmoid = 1/(1 + ex2(-g*log2(e))).
+//!
+//! ## KIR (roadmap A2 step 9)
+//!
+//! The kernel was hand-assembled PTX text until A2 step 9; it is now a
+//! [`KernelIR`] ([`build`]) that the verifier checks before `nsl_kir`'s
+//! printer lowers it. The phases, the barriers and the order of every
+//! floating-point operation are the hand kernel's —
+//! `tests/cfie_persistent_kir_equivalence.rs` runs the frozen hand emitter
+//! and this one side by side on the cooperative-CTA interpreter and
+//! requires the same output bits. It is assembled from its siblings'
+//! sections where they are the same computation:
+//!
+//! * Attention is `cfie_decode_attention`'s flash-decode tile loop and
+//!   output publish, run once per Q head over a [`FlashCtx`] this kernel's
+//!   head loop builds (the head's Q row and attention-output row live in
+//!   this kernel's shared memory, so the output is published to shared
+//!   rather than global memory).
+//! * Both RMSNorms start with `cfie_spec_sampler_ptx`'s sum-of-squares
+//!   tree; the finish (every thread divides by `sqrt(mean + eps)`, and the
+//!   result goes to its own row) is this kernel's.
+//!
+//! Addresses are element indices through `PtrOffset` rather than byte
+//! offsets; loop-carried values are block parameters; shared memory is an
+//! [`SmemLayout`] of ten f32 regions at the hand kernel's offsets. The
+//! RoPE frequency is a bare `ex2`, [`KirOp::Exp2`] (`KirOp::Exp` is `e^x`
+//! and scales by `log2(e)` first). The module targets the KIR floor
+//! (`sm_70`), so [`DecodeBlockConfig`] has no `sm_version`.
 
 use std::fmt::Write;
+
+use crate::backend_ptx::lower_kir_to_ptx;
+use crate::cfie_decode_attention::{
+    at, cmp, konst, load, op2, prefix_pass, ptr, publish_output, widen, FlashCtx, HalfReader,
+};
+use crate::cfie_spec_sampler_ptx::{sum_of_squares_tree, SquareSum};
+use crate::kernel_ir::{
+    AddressSpace, CmpOp, ConstValue, KernelIR, KirBuilder, KirEdge, KirOp, KirTerminator, KirType,
+    SmemLayout, SmemRegion, VarId,
+};
 
 /// Threads per CTA; also the attention softmax tile width and the FFN
 /// gate/up staging tile width.
 const BLOCK_DIM: u32 = 128;
-const ATTN_TILE: u32 = 128;
 const FFN_TILE: u32 = 128;
 
 pub const KERNEL_NAME: &str = "nsl_cfie_decode_block";
@@ -42,6 +78,9 @@ pub fn kernel_name() -> &'static str {
 }
 
 /// Compile-time model + KV-pool configuration for the decode block.
+///
+/// There is no `sm_version`: the module targets the KIR floor and the
+/// driver JIT-compiles it for the device it is loaded on.
 #[derive(Debug, Clone)]
 pub struct DecodeBlockConfig {
     pub d_model: u32,
@@ -56,7 +95,6 @@ pub struct DecodeBlockConfig {
     pub rope_theta: f32,
     /// RMSNorm epsilon.
     pub eps: f32,
-    pub sm_version: u32,
 }
 
 /// Host-readable launch metadata emitted alongside the PTX.
@@ -67,16 +105,10 @@ pub struct DecodeBlockMeta {
     pub block_dim: u32,
 }
 
-fn f32_imm(v: f32) -> String {
-    format!("0f{:08X}", v.to_bits())
-}
-
-/// Emit the persistent decode-block kernel.
-///
-/// Launch shape: grid = 1 CTA, block = 128 threads; one launch per
-/// layer per decode step.  `pos` drives both the RoPE angle and the
-/// KV-append offset; seq_len after the append is `pos + 1`.
-pub fn emit(cfg: &DecodeBlockConfig) -> (String, DecodeBlockMeta) {
+/// The configuration contract. Panics name the violated condition; every
+/// caller either checks the same conditions first (`serve.rs`) or is a
+/// test.
+fn check(cfg: &DecodeBlockConfig) {
     assert!(cfg.n_layers >= 1, "n_layers must be >= 1");
     assert!(
         cfg.n_heads >= 1 && cfg.n_kv_heads >= 1,
@@ -104,77 +136,600 @@ pub fn emit(cfg: &DecodeBlockConfig) -> (String, DecodeBlockMeta) {
     );
     assert!(
         cfg.d_ff >= 1 && cfg.d_ff <= 32768,
-        "d_ff must be in 1..=32768 (u32 weight-row byte arithmetic)"
+        "d_ff must be in 1..=32768 (u32 weight-row arithmetic)"
     );
     assert!(
         cfg.n_heads * cfg.head_dim <= 8192,
-        "n_heads * head_dim must be <= 8192 (u32 weight-row byte arithmetic)"
+        "n_heads * head_dim must be <= 8192 (u32 weight-row arithmetic)"
     );
     assert!(
         cfg.per_slot_max_tokens >= 1 && cfg.max_slots >= 1,
         "per_slot_max_tokens and max_slots must be >= 1"
     );
-
-    let d = cfg.d_model;
-    let hd = cfg.head_dim;
-    let nh = cfg.n_heads;
-    let nkv = cfg.n_kv_heads;
-    let dff = cfg.d_ff;
-    let nhd = nh * hd; // q/attention width
-    let group = nh / nkv;
-
-    // Baked KV-pool strides — identical derivation to
-    // `cfie_decode_attention` (elements of the contiguous layout
-    // [n_layers][2][max_tokens][n_kv_heads][head_dim], f16).
-    let token_stride = nkv as u64 * hd as u64;
     let max_tokens = cfg.max_slots as u64 * cfg.per_slot_max_tokens as u64;
     assert!(
         max_tokens <= u32::MAX as u64,
         "global token pool (max_slots * per_slot_max_tokens = {max_tokens}) must fit in u32"
     );
-    let kv_half_stride = max_tokens * token_stride;
-    let layer_stride = 2 * kv_half_stride;
-    let tsb = token_stride * 2; // bytes (f16)
-    let kv_half_bytes = kv_half_stride * 2;
-    let layer_bytes = layer_stride * 2;
+}
 
-    // SMEM layout (f32 unless noted), byte offsets:
-    //   X  [d_model]      residual stream (in/out of both sub-blocks)
-    //   XN [d_model]      RMSNorm output (input to matvecs)
-    //   Q  [nh*hd]        rotated query rows
-    //   AO [nh*hd]        attention output rows
-    //   RED[128]          norm tree-reduction scratch
-    //   SC [128]          attention score tile
-    //   RSC[1] LL[1]      online-softmax rescale + denominator
-    //   H  [128]          FFN silu(gate)*up staging tile
-    //   Y  [d_model]      FFN down-projection accumulator
-    let x_off = 0u32;
-    let xn_off = x_off + d * 4;
-    let q_off = xn_off + d * 4;
-    let ao_off = q_off + nhd * 4;
-    let red_off = ao_off + nhd * 4;
-    let sc_off = red_off + BLOCK_DIM * 4;
-    let rsc_off = sc_off + ATTN_TILE * 4;
-    let ll_off = rsc_off + 4;
-    let h_off = ll_off + 4;
-    let y_off = h_off + FFN_TILE * 4;
-    let smem_bytes = y_off + d * 4;
+/// The pool strides for `cfg`, in elements — `cfie_decode_attention`'s
+/// derivation, so both kernels address one pool.
+fn kv_strides(cfg: &DecodeBlockConfig) -> crate::cfie_decode_attention::KvStrides {
+    crate::cfie_decode_attention::kv_strides(&crate::cfie_decode_attention::DecodeAttentionConfig {
+        n_layers: cfg.n_layers,
+        n_heads: cfg.n_heads,
+        n_kv_heads: cfg.n_kv_heads,
+        head_dim: cfg.head_dim,
+        per_slot_max_tokens: cfg.per_slot_max_tokens,
+        max_slots: cfg.max_slots,
+        kv_dtype_bytes: 2,
+    })
+}
 
-    let inv_d = f32_imm(1.0f32 / d as f32);
-    let eps = f32_imm(cfg.eps);
-    let one = f32_imm(1.0);
-    let zero = f32_imm(0.0);
-    let neg_inf = f32_imm(f32::NEG_INFINITY);
-    let log2e = f32_imm(std::f32::consts::LOG2_E);
-    let neg_log2e = f32_imm(-std::f32::consts::LOG2_E);
-    let inv_sqrt_hd = f32_imm(1.0f32 / (hd as f32).sqrt());
-    // freq = theta^(-i2/hd) = ex2(i2 * -log2(theta)/hd), i2 = even
-    // element index within the head (== 2 * pair index).
-    let c_rope = f32_imm(-(cfg.rope_theta.log2()) / hd as f32);
+/// Index of each shared region in [`smem_layout`], in declaration order.
+const R_X: u32 = 0;
+const R_XN: u32 = 1;
+const R_Q: u32 = 2;
+const R_AO: u32 = 3;
+const R_RED: u32 = 4;
+const R_SC: u32 = 5;
+const R_RSC: u32 = 6;
+const R_LL: u32 = 7;
+const R_H: u32 = 8;
+const R_Y: u32 = 9;
 
-    let mut p = String::new();
-    let w = &mut p;
+/// All f32, 4-aligned and a multiple of 4 long, so the offsets are the
+/// hand kernel's packed ones:
+///
+/// ```text
+/// x   [d_model]   residual stream (in/out of both sub-blocks)
+/// xn  [d_model]   RMSNorm output (input to the matvecs)
+/// q   [nh*hd]     rotated query rows
+/// ao  [nh*hd]     attention output rows
+/// red [128]       norm tree-reduction scratch
+/// sc  [128]       attention score tile
+/// rsc [1], ll [1] online-softmax rescale and denominator
+/// h   [128]       FFN silu(gate)*up staging tile
+/// y   [d_model]   FFN down-projection accumulator
+/// ```
+fn smem_layout(cfg: &DecodeBlockConfig) -> SmemLayout {
+    let f32_region = |name: &str, elems: u32| SmemRegion {
+        name: name.to_string(),
+        bytes: elems * 4,
+        align: 4,
+        elem: KirType::F32,
+    };
+    let nhd = cfg.n_heads * cfg.head_dim;
+    SmemLayout {
+        regions: vec![
+            f32_region("x", cfg.d_model),
+            f32_region("xn", cfg.d_model),
+            f32_region("q", nhd),
+            f32_region("ao", nhd),
+            f32_region("red", BLOCK_DIM),
+            f32_region("sc", BLOCK_DIM),
+            f32_region("rsc", 1),
+            f32_region("ll", 1),
+            f32_region("h", FFN_TILE),
+            f32_region("y", cfg.d_model),
+        ],
+        dynamic: false,
+    }
+}
 
+/// Bytes of static shared memory the kernel for `cfg` declares. The KIR
+/// verifier refuses a static layout past the 48 KB per-CTA cap, so a
+/// caller that downgrades on a big footprint (`serve.rs`) asks this before
+/// calling [`emit`].
+pub fn smem_bytes(cfg: &DecodeBlockConfig) -> u32 {
+    check(cfg);
+    smem_layout(cfg)
+        .total_bytes()
+        .expect("`check` bounds every region, so the layout has a size")
+}
+
+/// Values the entry block defines once and every phase reads.
+struct Block {
+    tid: VarId,
+    zero: VarId,
+    one: VarId,
+    /// u32 `BLOCK_DIM`: every strided loop's step.
+    stride: VarId,
+    /// u32 and u64 `d_model`.
+    d: VarId,
+    d_wide: VarId,
+    f_zero: VarId,
+    /// f32 `1.0`.
+    f_one: VarId,
+    /// f32 `pos` (the RoPE angle's factor).
+    pos_f: VarId,
+    /// f32 shared pointers, one per region.
+    x: VarId,
+    xn: VarId,
+    ao: VarId,
+    red: VarId,
+    h: VarId,
+    y: VarId,
+}
+
+/// `for (i = tid; i < end; i += BLOCK_DIM) body(i)`, entered from the
+/// current block; the builder is left in the loop's exit block.
+fn strided(b: &mut KirBuilder, k: &Block, end: VarId, body: impl FnOnce(&mut KirBuilder, VarId)) {
+    let head = b.new_block();
+    let body_block = b.new_block();
+    let done = b.new_block();
+    let i = b.add_block_param(head, KirType::U32);
+    b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![k.tid])));
+
+    b.set_block(head);
+    let finished = cmp(b, i, end, CmpOp::Ge);
+    b.terminate(KirTerminator::CondBranch(finished, KirEdge::to(done), KirEdge::to(body_block)));
+
+    b.set_block(body_block);
+    body(b, i);
+    let next = op2(b, KirType::U32, KirOp::Add, i, k.stride);
+    b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![next])));
+
+    b.set_block(done);
+}
+
+/// One f16 weight row: `weights[start..]`, `start` a u64 element index.
+#[derive(Clone, Copy)]
+struct Row {
+    weights: VarId,
+    start: VarId,
+}
+
+/// The dot products of `rows` with `x[0..len]` (f32, shared), in one loop,
+/// as the hand kernel's matvecs: per `j`, each row's
+/// `acc = fma(w[j], x[j], acc)` — `fma(x[j], w[j], acc)` when `x_first`
+/// (the FFN down projection's operand order). Entered from the current
+/// block; the builder is left in the loop's exit block, and the returned
+/// values are the finished dots, one per row.
+fn dot_rows(b: &mut KirBuilder, k: &Block, x: VarId, len: VarId, rows: &[Row], x_first: bool) -> Vec<VarId> {
+    use AddressSpace::{Global, Shared};
+    use KirType::{F16, F32, U32, U64};
+
+    let head = b.new_block();
+    let body = b.new_block();
+    let done = b.new_block();
+    let j = b.add_block_param(head, U32);
+    let accs: Vec<VarId> = rows.iter().map(|_| b.add_block_param(head, F32)).collect();
+    let mut init = vec![k.zero];
+    init.extend(rows.iter().map(|_| k.f_zero));
+    b.terminate(KirTerminator::Branch(KirEdge::with(head, init)));
+
+    b.set_block(head);
+    let finished = cmp(b, j, len, CmpOp::Ge);
+    b.terminate(KirTerminator::CondBranch(finished, KirEdge::to(done), KirEdge::to(body)));
+
+    b.set_block(body);
+    let x_addr = at(b, F32, Shared, x, j);
+    let xj = load(b, F32, x_addr, Shared);
+    let j_wide = widen(b, j);
+    let mut next = Vec::with_capacity(rows.len() + 1);
+    for (row, &acc) in rows.iter().zip(&accs) {
+        let index = op2(b, U64, KirOp::Add, row.start, j_wide);
+        let w_addr = at(b, F16, Global, row.weights, index);
+        let w_raw = load(b, F16, w_addr, Global);
+        let w = b.new_typed_var(F32);
+        b.emit(KirOp::Cast(w, w_raw, F32));
+        let acc_next = b.new_typed_var(F32);
+        let (p, q) = if x_first { (xj, w) } else { (w, xj) };
+        b.emit(KirOp::Fma(acc_next, p, q, acc));
+        next.push(acc_next);
+    }
+    let j_next = op2(b, U32, KirOp::Add, j, k.one);
+    next.insert(0, j_next);
+    b.terminate(KirTerminator::Branch(KirEdge::with(head, next)));
+
+    b.set_block(done);
+    accs
+}
+
+/// `xn = rmsnorm(x) * weight` over `d_model`: the shared sum-of-squares
+/// tree into `red`, then every thread takes `inv = 1 / sqrt(red[0] / d +
+/// eps)` and scales its strided elements, `xn[i] = (x[i] * inv) *
+/// weight[i]`. Leaves the builder after the closing barrier.
+fn build_rmsnorm(b: &mut KirBuilder, k: &Block, cfg: &DecodeBlockConfig, weight: VarId) {
+    use AddressSpace::{Global, Shared};
+    use KirType::F32;
+
+    sum_of_squares_tree(
+        b,
+        SquareSum { tid: k.tid, len: k.d, stride: k.stride, f_zero: k.f_zero, src: k.x, scratch: k.red },
+    );
+    let total = load(b, F32, k.red, Shared);
+    let inv_d = konst(b, ConstValue::F32(1.0f32 / cfg.d_model as f32));
+    let mean = op2(b, F32, KirOp::Mul, total, inv_d);
+    let eps = konst(b, ConstValue::F32(cfg.eps));
+    let shifted = op2(b, F32, KirOp::Add, mean, eps);
+    let root = b.new_typed_var(F32);
+    b.emit(KirOp::Sqrt(root, shifted));
+    let inv = op2(b, F32, KirOp::Div, k.f_one, root);
+
+    strided(b, k, k.d, |b, i| {
+        let x_addr = at(b, F32, Shared, k.x, i);
+        let xi = load(b, F32, x_addr, Shared);
+        let w_addr = at(b, F32, Global, weight, i);
+        let w = load(b, F32, w_addr, Global);
+        let scaled = op2(b, F32, KirOp::Mul, xi, inv);
+        let normed = op2(b, F32, KirOp::Mul, scaled, w);
+        let xn_addr = at(b, F32, Shared, k.xn, i);
+        b.emit(KirOp::Store(xn_addr, normed, Shared));
+    });
+    b.emit(KirOp::Barrier);
+}
+
+/// Thread `p` of each strided round owns elements `e0 = 2p` and `e0 + 1`
+/// of a `pairs * 2`-wide projection: the dual dot of weight rows `e0` and
+/// `e0 + 1` with `xn`, rotated by RoPE at `pos` (`i2 = e0 % head_dim`,
+/// `angle = pos * 2^(i2 * c_rope)`), handed to `store(e0, even, odd)`.
+/// Leaves the builder in the loop's exit block.
+fn rope_pairs(
+    b: &mut KirBuilder,
+    k: &Block,
+    cfg: &DecodeBlockConfig,
+    pairs: u32,
+    weights: VarId,
+    store: impl Fn(&mut KirBuilder, VarId, VarId, VarId),
+) {
+    use KirType::{F32, U32, U64};
+
+    let end = konst(b, ConstValue::U32(pairs));
+    strided(b, k, end, |b, p| {
+        let e0 = op2(b, U32, KirOp::Shl, p, k.one);
+        let row0 = op2(b, U32, KirOp::Mul, e0, k.d);
+        let start0 = widen(b, row0);
+        let start1 = op2(b, U64, KirOp::Add, start0, k.d_wide);
+        let dots = dot_rows(
+            b,
+            k,
+            k.xn,
+            k.d,
+            &[Row { weights, start: start0 }, Row { weights, start: start1 }],
+            false,
+        );
+        let (e, o) = (dots[0], dots[1]);
+
+        let head_dim = konst(b, ConstValue::U32(cfg.head_dim));
+        let i2 = op2(b, U32, KirOp::Rem, e0, head_dim);
+        let i2_f = b.new_typed_var(F32);
+        b.emit(KirOp::Cast(i2_f, i2, F32));
+        let c_rope = konst(b, ConstValue::F32(-(cfg.rope_theta.log2()) / cfg.head_dim as f32));
+        let exponent = op2(b, F32, KirOp::Mul, i2_f, c_rope);
+        let freq = b.new_typed_var(F32);
+        b.emit(KirOp::Exp2(freq, exponent));
+        let angle = op2(b, F32, KirOp::Mul, k.pos_f, freq);
+        let sin = b.new_typed_var(F32);
+        b.emit(KirOp::Sin(sin, angle));
+        let cos = b.new_typed_var(F32);
+        b.emit(KirOp::Cos(cos, angle));
+
+        // (e', o') = (e*cos - o*sin, e*sin + o*cos)
+        let e_cos = op2(b, F32, KirOp::Mul, e, cos);
+        let o_sin = op2(b, F32, KirOp::Mul, o, sin);
+        let even = op2(b, F32, KirOp::Sub, e_cos, o_sin);
+        let e_sin = op2(b, F32, KirOp::Mul, e, sin);
+        let odd = b.new_typed_var(F32);
+        b.emit(KirOp::Fma(odd, o, cos, e_sin));
+        store(b, e0, even, odd);
+    });
+}
+
+/// `pool[index] = f16(value)`.
+fn store_half(b: &mut KirBuilder, pool: VarId, index: VarId, value: VarId) {
+    let half = b.new_typed_var(KirType::F16);
+    b.emit(KirOp::Cast(half, value, KirType::F16));
+    let addr = at(b, KirType::F16, AddressSpace::Global, pool, index);
+    b.emit(KirOp::Store(addr, half, AddressSpace::Global));
+}
+
+/// Build the persistent decode-block kernel as KIR.
+///
+/// The phases, in order (each strided loop is `for i = tid; i < n;
+/// i += 128`; `bar` is a CTA barrier):
+///
+/// ```text
+/// 1  x[i] = x_in[i]                                          bar
+/// 2  xn = rmsnorm(x) * norm1_w        (sum-of-squares tree)  bar x9
+/// 3a q[2p], q[2p+1]     = rope(wq rows 2p, 2p+1 . xn)
+/// 3b k_pool[pos][2p..]  = f16(rope(wk rows . xn))
+/// 3c v_pool[pos][e]     = f16(wv row e . xn)                 bar
+/// 4  per Q head hh:   (acc, m, l) = flash tile loop over pos+1 tokens
+///                     ao[hh*hd + tid] = acc / l               bar x3 per tile, x2 per head
+/// 5  x[i] += wo row i . ao                                   bar
+/// 6  xn = rmsnorm(x) * norm2_w                               bar x9
+/// 7  y[i] = 0                                                bar
+///    per 128-row d_ff tile tb:
+///      h[tid] = silu(w_gate row . xn) * (w_up row . xn)      bar
+///      y[i] += w_down[i, tb..tb+fcnt] . h                    bar
+/// 8  x_out[i] = x[i] + y[i]
+/// ```
+///
+/// Only thread 0's softmax state is meaningful (see
+/// `cfie_decode_attention::flash_tile`).
+pub fn build(cfg: &DecodeBlockConfig) -> KernelIR {
+    use AddressSpace::{Global, Shared};
+    use KirType::{F16, F32, U32, U64};
+
+    check(cfg);
+    let hd = cfg.head_dim;
+    let nhd = cfg.n_heads * hd;
+    let kv_rows = cfg.n_kv_heads * hd;
+    let strides = kv_strides(cfg);
+
+    let mut b = KirBuilder::new(KERNEL_NAME);
+    // The params, in FFI order (the launcher marshals them positionally).
+    let x_in = b.add_param("x_in_ptr", ptr(F32, Global), Global);
+    let x_out = b.add_param("x_out_ptr", ptr(F32, Global), Global);
+    let wq = b.add_param("wq_ptr", ptr(F16, Global), Global);
+    let wk = b.add_param("wk_ptr", ptr(F16, Global), Global);
+    let wv = b.add_param("wv_ptr", ptr(F16, Global), Global);
+    let wo = b.add_param("wo_ptr", ptr(F16, Global), Global);
+    let w_gate = b.add_param("w_gate_ptr", ptr(F16, Global), Global);
+    let w_up = b.add_param("w_up_ptr", ptr(F16, Global), Global);
+    let w_down = b.add_param("w_down_ptr", ptr(F16, Global), Global);
+    let norm1_w = b.add_param("norm1_w_ptr", ptr(F32, Global), Global);
+    let norm2_w = b.add_param("norm2_w_ptr", ptr(F32, Global), Global);
+    let kv_base = b.add_param("kv_base", ptr(F16, Global), Global);
+    let layer_idx = b.add_param("layer_idx", U32, Global);
+    let slot_idx = b.add_param("slot_idx", U32, Global);
+    let pos = b.add_param("pos", U32, Global);
+
+    b.set_smem_layout(smem_layout(cfg));
+    b.set_workgroup_size([BLOCK_DIM, 1, 1]);
+
+    let entry = b.new_block();
+    b.set_block(entry);
+    let tid = b.new_typed_var(U32);
+    b.emit(KirOp::ThreadId(tid, 0));
+    let region = |b: &mut KirBuilder, r: u32| {
+        let dst = b.new_typed_var(ptr(F32, Shared));
+        b.emit(KirOp::SharedRegion { dst, region: r });
+        dst
+    };
+    let zero = konst(&mut b, ConstValue::U32(0));
+    let one = konst(&mut b, ConstValue::U32(1));
+    let pos_f = b.new_typed_var(F32);
+    b.emit(KirOp::Cast(pos_f, pos, F32));
+    let k = Block {
+        tid,
+        zero,
+        one,
+        stride: konst(&mut b, ConstValue::U32(BLOCK_DIM)),
+        d: konst(&mut b, ConstValue::U32(cfg.d_model)),
+        d_wide: konst(&mut b, ConstValue::U64(cfg.d_model as u64)),
+        f_zero: konst(&mut b, ConstValue::F32(0.0)),
+        f_one: konst(&mut b, ConstValue::F32(1.0)),
+        pos_f,
+        x: region(&mut b, R_X),
+        xn: region(&mut b, R_XN),
+        ao: region(&mut b, R_AO),
+        red: region(&mut b, R_RED),
+        h: region(&mut b, R_H),
+        y: region(&mut b, R_Y),
+    };
+    let q_smem = region(&mut b, R_Q);
+    let scores = region(&mut b, R_SC);
+    let rescale = region(&mut b, R_RSC);
+    let l_smem = region(&mut b, R_LL);
+
+    // seq_len after the KV append below.
+    let seq_len = op2(&mut b, U32, KirOp::Add, pos, one);
+    // K/V planes of this layer, and this slot's token range.
+    let (k_half, v_half) = HalfReader::uniform_f16(&mut b, kv_base, layer_idx, strides.kv_half_stride);
+    let per_slot = konst(&mut b, ConstValue::U32(cfg.per_slot_max_tokens));
+    let slot_base = op2(&mut b, U32, KirOp::Mul, slot_idx, per_slot);
+    let token_stride = konst(&mut b, ConstValue::U64(strides.token_stride));
+    // The append target: token record (layer, slot, pos).
+    let rec = op2(&mut b, U32, KirOp::Add, slot_base, pos);
+    let rec_wide = widen(&mut b, rec);
+    let rec_row = op2(&mut b, U64, KirOp::Mul, rec_wide, token_stride);
+    let k_rec = k_half.in_plane(&mut b, rec_row);
+    let v_rec = v_half.in_plane(&mut b, rec_row);
+
+    // ── phase 1: x -> SMEM ──────────────────────────────────────────
+    strided(&mut b, &k, k.d, |b, i| {
+        let src = at(b, F32, Global, x_in, i);
+        let xi = load(b, F32, src, Global);
+        let dst = at(b, F32, Shared, k.x, i);
+        b.emit(KirOp::Store(dst, xi, Shared));
+    });
+    b.emit(KirOp::Barrier);
+
+    // ── phase 2: RMSNorm1 ───────────────────────────────────────────
+    build_rmsnorm(&mut b, &k, cfg, norm1_w);
+
+    // ── phase 3a: Q = rope(Wq @ xn) -> SMEM ─────────────────────────
+    rope_pairs(&mut b, &k, cfg, nhd / 2, wq, |b, e0, even, odd| {
+        let e_addr = at(b, F32, Shared, q_smem, e0);
+        b.emit(KirOp::Store(e_addr, even, Shared));
+        let e1 = op2(b, U32, KirOp::Add, e0, one);
+        let o_addr = at(b, F32, Shared, q_smem, e1);
+        b.emit(KirOp::Store(o_addr, odd, Shared));
+    });
+
+    // ── phase 3b: K = rope(Wk @ xn), appended to the pool (f16) ────
+    rope_pairs(&mut b, &k, cfg, kv_rows / 2, wk, |b, e0, even, odd| {
+        let e0_wide = widen(b, e0);
+        let index = op2(b, U64, KirOp::Add, k_rec, e0_wide);
+        store_half(b, kv_base, index, even);
+        let next = konst(b, ConstValue::U64(1));
+        let index1 = op2(b, U64, KirOp::Add, index, next);
+        store_half(b, kv_base, index1, odd);
+    });
+
+    // ── phase 3c: V = Wv @ xn, appended to the pool (f16) ───────────
+    let v_end = konst(&mut b, ConstValue::U32(kv_rows));
+    strided(&mut b, &k, v_end, |b, e| {
+        let row = op2(b, U32, KirOp::Mul, e, k.d);
+        let start = widen(b, row);
+        let dot = dot_rows(b, &k, k.xn, k.d, &[Row { weights: wv, start }], false)[0];
+        let e_wide = widen(b, e);
+        let index = op2(b, U64, KirOp::Add, v_rec, e_wide);
+        store_half(b, kv_base, index, dot);
+    });
+    // Publishes q and orders the pool stores before the attention reads
+    // (bar.sync has membar.cta effect).
+    b.emit(KirOp::Barrier);
+
+    // ── phase 4: flash-decode attention, Q heads sequential ─────────
+    let heads_head = b.new_block();
+    let head_body = b.new_block();
+    let heads_done = b.new_block();
+    let hh = b.add_block_param(heads_head, U32);
+    b.terminate(KirTerminator::Branch(KirEdge::with(heads_head, vec![zero])));
+
+    b.set_block(heads_head);
+    let n_heads = konst(&mut b, ConstValue::U32(cfg.n_heads));
+    let heads_finished = cmp(&mut b, hh, n_heads, CmpOp::Ge);
+    b.terminate(KirTerminator::CondBranch(heads_finished, KirEdge::to(heads_done), KirEdge::to(head_body)));
+
+    b.set_block(head_body);
+    // kv_head = q_head / group (baked divisor).
+    let group = konst(&mut b, ConstValue::U32(cfg.n_heads / cfg.n_kv_heads));
+    let kv_head = op2(&mut b, U32, KirOp::Div, hh, group);
+    let head_dim = konst(&mut b, ConstValue::U32(hd));
+    let head_off32 = op2(&mut b, U32, KirOp::Mul, kv_head, head_dim);
+    let head_off = widen(&mut b, head_off32);
+    let row = op2(&mut b, U32, KirOp::Mul, hh, head_dim);
+    let q_row = at(&mut b, F32, Shared, q_smem, row);
+    let inv_sqrt_hd = konst(&mut b, ConstValue::F32(1.0f32 / (hd as f32).sqrt()));
+    let ctx = FlashCtx {
+        tid,
+        zero,
+        one,
+        head_dim,
+        token_stride,
+        slot_base,
+        head_off,
+        inv_sqrt_hd,
+        k_half,
+        v_half,
+        q_smem: q_row,
+        scores,
+        rescale,
+        l_smem,
+    };
+    let (acc, _m, l) = prefix_pass(&mut b, &ctx, seq_len);
+    publish_output(&mut b, &ctx, acc, l, (k.ao, Shared), row);
+    // rescale / l / scores are reused by the next head.
+    b.emit(KirOp::Barrier);
+    let hh_next = op2(&mut b, U32, KirOp::Add, hh, one);
+    b.terminate(KirTerminator::Branch(KirEdge::with(heads_head, vec![hh_next])));
+
+    // ── phase 5: x += Wo @ attn_out (thread d owns x[d]) ────────────
+    b.set_block(heads_done);
+    let nhd_c = konst(&mut b, ConstValue::U32(nhd));
+    strided(&mut b, &k, k.d, |b, i| {
+        let row = op2(b, U32, KirOp::Mul, i, nhd_c);
+        let start = widen(b, row);
+        let dot = dot_rows(b, &k, k.ao, nhd_c, &[Row { weights: wo, start }], false)[0];
+        let x_addr = at(b, F32, Shared, k.x, i);
+        let xi = load(b, F32, x_addr, Shared);
+        let sum = op2(b, F32, KirOp::Add, xi, dot);
+        b.emit(KirOp::Store(x_addr, sum, Shared));
+    });
+    b.emit(KirOp::Barrier);
+
+    // ── phase 6: RMSNorm2 ───────────────────────────────────────────
+    build_rmsnorm(&mut b, &k, cfg, norm2_w);
+
+    // ── phase 7: FFN (tiled gate/up + down accumulation) ────────────
+    strided(&mut b, &k, k.d, |b, i| {
+        let y_addr = at(b, F32, Shared, k.y, i);
+        b.emit(KirOp::Store(y_addr, k.f_zero, Shared));
+    });
+    b.emit(KirOp::Barrier);
+
+    let ft_head = b.new_block();
+    let ft_body = b.new_block();
+    let gate_up = b.new_block();
+    let h_done = b.new_block();
+    let ft_done = b.new_block();
+    let tb = b.add_block_param(ft_head, U32);
+    b.terminate(KirTerminator::Branch(KirEdge::with(ft_head, vec![zero])));
+
+    b.set_block(ft_head);
+    let d_ff = konst(&mut b, ConstValue::U32(cfg.d_ff));
+    let ffn_finished = cmp(&mut b, tb, d_ff, CmpOp::Ge);
+    b.terminate(KirTerminator::CondBranch(ffn_finished, KirEdge::to(ft_done), KirEdge::to(ft_body)));
+
+    b.set_block(ft_body);
+    let remaining = op2(&mut b, U32, KirOp::Sub, d_ff, tb);
+    let ffn_tile = konst(&mut b, ConstValue::U32(FFN_TILE));
+    let fcnt = op2(&mut b, U32, KirOp::Min, remaining, ffn_tile);
+    let idle = cmp(&mut b, tid, fcnt, CmpOp::Ge);
+    b.terminate(KirTerminator::CondBranch(idle, KirEdge::to(h_done), KirEdge::to(gate_up)));
+
+    // gate/up dual matvec for row tb + tid, then h = silu(gate) * up.
+    b.set_block(gate_up);
+    let ff_row = op2(&mut b, U32, KirOp::Add, tb, tid);
+    let ff_row_d = op2(&mut b, U32, KirOp::Mul, ff_row, k.d);
+    let start = widen(&mut b, ff_row_d);
+    let dots = dot_rows(
+        &mut b,
+        &k,
+        k.xn,
+        k.d,
+        &[Row { weights: w_gate, start }, Row { weights: w_up, start }],
+        false,
+    );
+    let (gate, up) = (dots[0], dots[1]);
+    // silu(g) = g * sigmoid(g); sigmoid = 1/(1 + ex2(-g*log2e)).
+    let neg_log2e = konst(&mut b, ConstValue::F32(-std::f32::consts::LOG2_E));
+    let scaled = op2(&mut b, F32, KirOp::Mul, gate, neg_log2e);
+    let e = b.new_typed_var(F32);
+    b.emit(KirOp::Exp2(e, scaled));
+    let den = op2(&mut b, F32, KirOp::Add, e, k.f_one);
+    let sig = op2(&mut b, F32, KirOp::Div, k.f_one, den);
+    let silu = op2(&mut b, F32, KirOp::Mul, gate, sig);
+    let hv = op2(&mut b, F32, KirOp::Mul, silu, up);
+    let h_addr = at(&mut b, F32, Shared, k.h, tid);
+    b.emit(KirOp::Store(h_addr, hv, Shared));
+    b.terminate(KirTerminator::Branch(KirEdge::to(h_done)));
+
+    // down accumulation: y[i] += w_down[i, tb..tb+fcnt] . h
+    b.set_block(h_done);
+    b.emit(KirOp::Barrier);
+    strided(&mut b, &k, k.d, |b, i| {
+        let row = op2(b, U32, KirOp::Mul, i, d_ff);
+        let row_wide = widen(b, row);
+        let col = widen(b, tb);
+        let start = op2(b, U64, KirOp::Add, row_wide, col);
+        let dot = dot_rows(b, &k, k.h, fcnt, &[Row { weights: w_down, start }], true)[0];
+        let y_addr = at(b, F32, Shared, k.y, i);
+        let yi = load(b, F32, y_addr, Shared);
+        let sum = op2(b, F32, KirOp::Add, yi, dot);
+        b.emit(KirOp::Store(y_addr, sum, Shared));
+    });
+    // The h tile is rewritten next iteration.
+    b.emit(KirOp::Barrier);
+    let tb_next = op2(&mut b, U32, KirOp::Add, tb, ffn_tile);
+    b.terminate(KirTerminator::Branch(KirEdge::with(ft_head, vec![tb_next])));
+
+    // ── phase 8: x_out = x + ffn (second residual) ──────────────────
+    b.set_block(ft_done);
+    strided(&mut b, &k, k.d, |b, i| {
+        let x_addr = at(b, F32, Shared, k.x, i);
+        let xi = load(b, F32, x_addr, Shared);
+        let y_addr = at(b, F32, Shared, k.y, i);
+        let yi = load(b, F32, y_addr, Shared);
+        let sum = op2(b, F32, KirOp::Add, xi, yi);
+        let out = at(b, F32, Global, x_out, i);
+        b.emit(KirOp::Store(out, sum, Global));
+    });
+    b.terminate(KirTerminator::Return);
+    b.finalize()
+}
+
+/// The `//` header: the hand kernel's lines, unchanged. The stride lines
+/// are compared with `cfie_decode_attention`'s byte for byte.
+fn header_comment(cfg: &DecodeBlockConfig) -> String {
+    let s = kv_strides(cfg);
+    let mut w = String::new();
     writeln!(w, "//").unwrap();
     writeln!(
         w,
@@ -191,22 +746,22 @@ pub fn emit(cfg: &DecodeBlockConfig) -> (String, DecodeBlockMeta) {
     writeln!(
         w,
         "// Model: d_model={} head_dim={} n_heads={} n_kv_heads={} d_ff={}",
-        d, hd, nh, nkv, dff
+        cfg.d_model, cfg.head_dim, cfg.n_heads, cfg.n_kv_heads, cfg.d_ff
     )
     .unwrap();
     writeln!(
         w,
         "// KV pool layout [n_layers={}][2][max_tokens={}][n_kv_heads={}][head_dim={}], f16.",
-        cfg.n_layers, max_tokens, nkv, hd
+        cfg.n_layers, s.max_tokens, cfg.n_kv_heads, cfg.head_dim
     )
     .unwrap();
     writeln!(w, "// Baked layout constants (elements):").unwrap();
-    writeln!(w, "//   token_stride        = {}", token_stride).unwrap();
-    writeln!(w, "//   kv_half_stride      = {}", kv_half_stride).unwrap();
-    writeln!(w, "//   layer_stride        = {}", layer_stride).unwrap();
+    writeln!(w, "//   token_stride        = {}", s.token_stride).unwrap();
+    writeln!(w, "//   kv_half_stride      = {}", s.kv_half_stride).unwrap();
+    writeln!(w, "//   layer_stride        = {}", s.layer_stride).unwrap();
     writeln!(w, "//   per_slot_max_tokens = {}", cfg.per_slot_max_tokens).unwrap();
-    writeln!(w, "//   max_tokens          = {}", max_tokens).unwrap();
-    writeln!(w, "//   gqa_group_size      = {}", group).unwrap();
+    writeln!(w, "//   max_tokens          = {}", s.max_tokens).unwrap();
+    writeln!(w, "//   gqa_group_size      = {}", s.gqa_group).unwrap();
     writeln!(w, "// rope_theta={} eps={}", cfg.rope_theta, cfg.eps).unwrap();
     writeln!(
         w,
@@ -214,624 +769,40 @@ pub fn emit(cfg: &DecodeBlockConfig) -> (String, DecodeBlockMeta) {
     )
     .unwrap();
     writeln!(w, "//").unwrap();
-    writeln!(w, ".version {}", crate::gpu_specs::ptx_isa_for_sm(cfg.sm_version)).unwrap();
-    writeln!(w, ".target sm_{}", cfg.sm_version).unwrap();
-    writeln!(w, ".address_size 64").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, ".shared .align 4 .b8 cfie_blk_smem[{}];", smem_bytes).unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, ".visible .entry {}(", KERNEL_NAME).unwrap();
-    writeln!(w, "    .param .u64 x_in_ptr,").unwrap();
-    writeln!(w, "    .param .u64 x_out_ptr,").unwrap();
-    writeln!(w, "    .param .u64 wq_ptr,").unwrap();
-    writeln!(w, "    .param .u64 wk_ptr,").unwrap();
-    writeln!(w, "    .param .u64 wv_ptr,").unwrap();
-    writeln!(w, "    .param .u64 wo_ptr,").unwrap();
-    writeln!(w, "    .param .u64 w_gate_ptr,").unwrap();
-    writeln!(w, "    .param .u64 w_up_ptr,").unwrap();
-    writeln!(w, "    .param .u64 w_down_ptr,").unwrap();
-    writeln!(w, "    .param .u64 norm1_w_ptr,").unwrap();
-    writeln!(w, "    .param .u64 norm2_w_ptr,").unwrap();
-    writeln!(w, "    .param .u64 kv_base,").unwrap();
-    writeln!(w, "    .param .u32 layer_idx,").unwrap();
-    writeln!(w, "    .param .u32 slot_idx,").unwrap();
-    writeln!(w, "    .param .u32 pos").unwrap();
-    writeln!(w, ")").unwrap();
-    writeln!(w, "{{").unwrap();
-    writeln!(w, "    .reg .pred %p<4>;").unwrap();
-    writeln!(w, "    .reg .b16 %h<2>;").unwrap();
-    writeln!(w, "    .reg .f32 %f<18>;").unwrap();
-    writeln!(w, "    .reg .f32 %f_acc, %f_m, %f_l;").unwrap();
-    writeln!(w, "    .reg .u32 %r<18>;").unwrap();
-    writeln!(
-        w,
-        "    .reg .u32 %r_tid, %r_sb, %r_pos, %r_sl, %r_slotbase, %r_layer, %r_slot;"
-    )
-    .unwrap();
-    writeln!(
-        w,
-        "    .reg .u32 %r_hh, %r_qb, %r_tile, %r_tcnt, %r_tb, %r_fcnt;"
-    )
-    .unwrap();
-    writeln!(w, "    .reg .u64 %rd<14>;").unwrap();
-    writeln!(
-        w,
-        "    .reg .u64 %rd_xin, %rd_xout, %rd_wq, %rd_wk, %rd_wv, %rd_wo;"
-    )
-    .unwrap();
-    writeln!(
-        w,
-        "    .reg .u64 %rd_wg, %rd_wu, %rd_wd, %rd_n1, %rd_n2, %rd_kv;"
-    )
-    .unwrap();
-    writeln!(
-        w,
-        "    .reg .u64 %rd_kplane, %rd_vplane, %rd_krec, %rd_vrec, %rd_hoff;"
-    )
-    .unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    ld.param.u64 %rd_xin, [x_in_ptr];").unwrap();
-    writeln!(w, "    ld.param.u64 %rd_xout, [x_out_ptr];").unwrap();
-    writeln!(w, "    ld.param.u64 %rd_wq, [wq_ptr];").unwrap();
-    writeln!(w, "    ld.param.u64 %rd_wk, [wk_ptr];").unwrap();
-    writeln!(w, "    ld.param.u64 %rd_wv, [wv_ptr];").unwrap();
-    writeln!(w, "    ld.param.u64 %rd_wo, [wo_ptr];").unwrap();
-    writeln!(w, "    ld.param.u64 %rd_wg, [w_gate_ptr];").unwrap();
-    writeln!(w, "    ld.param.u64 %rd_wu, [w_up_ptr];").unwrap();
-    writeln!(w, "    ld.param.u64 %rd_wd, [w_down_ptr];").unwrap();
-    writeln!(w, "    ld.param.u64 %rd_n1, [norm1_w_ptr];").unwrap();
-    writeln!(w, "    ld.param.u64 %rd_n2, [norm2_w_ptr];").unwrap();
-    writeln!(w, "    ld.param.u64 %rd_kv, [kv_base];").unwrap();
-    writeln!(w, "    ld.param.u32 %r_layer, [layer_idx];").unwrap();
-    writeln!(w, "    ld.param.u32 %r_slot, [slot_idx];").unwrap();
-    writeln!(w, "    ld.param.u32 %r_pos, [pos];").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    mov.u32 %r_tid, %tid.x;").unwrap();
-    writeln!(w, "    mov.u32 %r_sb, cfie_blk_smem;").unwrap();
-    writeln!(w, "    // seq_len after the KV append below").unwrap();
-    writeln!(w, "    add.u32 %r_sl, %r_pos, 1;").unwrap();
-    writeln!(w).unwrap();
-    writeln!(w, "    // K/V plane bases (bytes) + this slot's token range").unwrap();
-    writeln!(w, "    cvt.u64.u32 %rd0, %r_layer;").unwrap();
-    writeln!(w, "    mul.lo.u64 %rd_kplane, %rd0, {};", layer_bytes).unwrap();
-    writeln!(w, "    add.u64 %rd_kplane, %rd_kv, %rd_kplane;").unwrap();
-    writeln!(w, "    add.u64 %rd_vplane, %rd_kplane, {};", kv_half_bytes).unwrap();
-    writeln!(
-        w,
-        "    mul.lo.u32 %r_slotbase, %r_slot, {};",
-        cfg.per_slot_max_tokens
-    )
-    .unwrap();
-    writeln!(w, "    // append target: token record (layer, slot, pos)").unwrap();
-    writeln!(w, "    add.u32 %r0, %r_slotbase, %r_pos;").unwrap();
-    writeln!(w, "    mul.wide.u32 %rd0, %r0, {};", tsb).unwrap();
-    writeln!(w, "    add.u64 %rd_krec, %rd_kplane, %rd0;").unwrap();
-    writeln!(w, "    add.u64 %rd_vrec, %rd_vplane, %rd0;").unwrap();
-    writeln!(w).unwrap();
+    w
+}
 
-    // ── phase 1: load x into SMEM ─────────────────────────────────
-    writeln!(w, "    // phase 1: x -> SMEM (strided over the block)").unwrap();
-    writeln!(w, "    mov.u32 %r0, %r_tid;").unwrap();
-    writeln!(w, "LX:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p0, %r0, {};", d).unwrap();
-    writeln!(w, "    @%p0 bra LX_D;").unwrap();
-    writeln!(w, "    mul.lo.u32 %r1, %r0, 4;").unwrap();
-    writeln!(w, "    cvt.u64.u32 %rd0, %r1;").unwrap();
-    writeln!(w, "    add.u64 %rd0, %rd_xin, %rd0;").unwrap();
-    writeln!(w, "    ld.global.f32 %f0, [%rd0];").unwrap();
-    writeln!(w, "    add.u32 %r2, %r1, %r_sb;").unwrap();
-    writeln!(w, "    st.shared.f32 [%r2+{}], %f0;", x_off).unwrap();
-    writeln!(w, "    add.u32 %r0, %r0, {};", BLOCK_DIM).unwrap();
-    writeln!(w, "    bra LX;").unwrap();
-    writeln!(w, "LX_D:").unwrap();
-    writeln!(w, "    bar.sync 0;").unwrap();
-    writeln!(w).unwrap();
+/// Emit the persistent decode-block kernel: build, verify, lower, and
+/// prefix the `//` header.
+///
+/// Launch shape: grid = 1 CTA, block = 128 threads; one launch per
+/// layer per decode step.  `pos` drives both the RoPE angle and the
+/// KV-append offset; seq_len after the append is `pos + 1`.
+///
+/// The returned text carries no NUL: the serve path appends the one
+/// `cuModuleLoadData` needs when it embeds the module.
+///
+/// # Panics
+///
+/// On a configuration outside the contract (see the asserts in `check`),
+/// on a shared footprint past the 48 KB static cap (check [`smem_bytes`]
+/// first), and if the built kernel otherwise fails KIR verification — a
+/// bug in this module, not a condition a caller can provoke.
+pub fn emit(cfg: &DecodeBlockConfig) -> (String, DecodeBlockMeta) {
+    let ir = build(cfg);
+    if let Err(errors) = crate::kir_verify::verify(&ir) {
+        panic!("{KERNEL_NAME} failed KIR verification: {errors:?}");
+    }
+    let smem_bytes = ir
+        .smem_layout
+        .total_bytes()
+        .expect("a verified layout has a size");
+    let module = lower_kir_to_ptx(&ir);
+    let module = module.strip_suffix(&[0]).unwrap_or(&module);
+    let module = std::str::from_utf8(module).expect("the KIR printer emits ASCII");
 
-    // RMSNorm emitter (X -> XN), used for norm1 and norm2.
-    let emit_rmsnorm = |w: &mut String, prefix: &str, weight_reg: &str| {
-        writeln!(w, "    // RMSNorm({}) X -> XN: tree reduction over 128 partials", prefix)
-            .unwrap();
-        writeln!(w, "    mov.f32 %f1, {};", zero).unwrap();
-        writeln!(w, "    mov.u32 %r0, %r_tid;").unwrap();
-        writeln!(w, "{}_SS:", prefix).unwrap();
-        writeln!(w, "    setp.ge.u32 %p0, %r0, {};", d).unwrap();
-        writeln!(w, "    @%p0 bra {}_SSD;", prefix).unwrap();
-        writeln!(w, "    mul.lo.u32 %r1, %r0, 4;").unwrap();
-        writeln!(w, "    add.u32 %r2, %r1, %r_sb;").unwrap();
-        writeln!(w, "    ld.shared.f32 %f0, [%r2+{}];", x_off).unwrap();
-        writeln!(w, "    fma.rn.f32 %f1, %f0, %f0, %f1;").unwrap();
-        writeln!(w, "    add.u32 %r0, %r0, {};", BLOCK_DIM).unwrap();
-        writeln!(w, "    bra {}_SS;", prefix).unwrap();
-        writeln!(w, "{}_SSD:", prefix).unwrap();
-        writeln!(w, "    mul.lo.u32 %r3, %r_tid, 4;").unwrap();
-        writeln!(w, "    add.u32 %r3, %r3, %r_sb;").unwrap();
-        writeln!(w, "    st.shared.f32 [%r3+{}], %f1;", red_off).unwrap();
-        writeln!(w, "    bar.sync 0;").unwrap();
-        let mut s = BLOCK_DIM / 2;
-        while s >= 1 {
-            writeln!(w, "    setp.ge.u32 %p0, %r_tid, {};", s).unwrap();
-            writeln!(w, "    @%p0 bra {}_R{};", prefix, s).unwrap();
-            writeln!(w, "    ld.shared.f32 %f0, [%r3+{}];", red_off).unwrap();
-            writeln!(w, "    ld.shared.f32 %f2, [%r3+{}];", red_off + s * 4).unwrap();
-            writeln!(w, "    add.f32 %f0, %f0, %f2;").unwrap();
-            writeln!(w, "    st.shared.f32 [%r3+{}], %f0;", red_off).unwrap();
-            writeln!(w, "{}_R{}:", prefix, s).unwrap();
-            writeln!(w, "    bar.sync 0;").unwrap();
-            s /= 2;
-        }
-        writeln!(w, "    ld.shared.f32 %f0, [%r_sb+{}];", red_off).unwrap();
-        writeln!(w, "    mul.f32 %f0, %f0, {};", inv_d).unwrap();
-        writeln!(w, "    add.f32 %f0, %f0, {};", eps).unwrap();
-        writeln!(w, "    sqrt.rn.f32 %f0, %f0;").unwrap();
-        writeln!(w, "    mov.f32 %f1, {};", one).unwrap();
-        writeln!(w, "    div.rn.f32 %f1, %f1, %f0;").unwrap();
-        writeln!(w, "    mov.u32 %r0, %r_tid;").unwrap();
-        writeln!(w, "{}_NM:", prefix).unwrap();
-        writeln!(w, "    setp.ge.u32 %p0, %r0, {};", d).unwrap();
-        writeln!(w, "    @%p0 bra {}_NMD;", prefix).unwrap();
-        writeln!(w, "    mul.lo.u32 %r2, %r0, 4;").unwrap();
-        writeln!(w, "    add.u32 %r4, %r2, %r_sb;").unwrap();
-        writeln!(w, "    ld.shared.f32 %f0, [%r4+{}];", x_off).unwrap();
-        writeln!(w, "    cvt.u64.u32 %rd0, %r2;").unwrap();
-        writeln!(w, "    add.u64 %rd0, {}, %rd0;", weight_reg).unwrap();
-        writeln!(w, "    ld.global.f32 %f2, [%rd0];").unwrap();
-        writeln!(w, "    mul.f32 %f0, %f0, %f1;").unwrap();
-        writeln!(w, "    mul.f32 %f0, %f0, %f2;").unwrap();
-        writeln!(w, "    st.shared.f32 [%r4+{}], %f0;", xn_off).unwrap();
-        writeln!(w, "    add.u32 %r0, %r0, {};", BLOCK_DIM).unwrap();
-        writeln!(w, "    bra {}_NM;", prefix).unwrap();
-        writeln!(w, "{}_NMD:", prefix).unwrap();
-        writeln!(w, "    bar.sync 0;").unwrap();
-        writeln!(w).unwrap();
-    };
-
-    // ── phase 2: RMSNorm1 ─────────────────────────────────────────
-    emit_rmsnorm(w, "N1", "%rd_n1");
-
-    // Dual-row f16 matvec + RoPE pair rotation, shared by the Q and K
-    // pair loops.  `store` emits the two rotated outputs.
-    let emit_pair_loop = |w: &mut String,
-                          prefix: &str,
-                          pairs: u32,
-                          wreg: &str,
-                          store: &dyn Fn(&mut String)| {
-        writeln!(w, "    mov.u32 %r10, %r_tid;").unwrap();
-        writeln!(w, "{}:", prefix).unwrap();
-        writeln!(w, "    setp.ge.u32 %p0, %r10, {};", pairs).unwrap();
-        writeln!(w, "    @%p0 bra {}_D;", prefix).unwrap();
-        writeln!(w, "    shl.b32 %r11, %r10, 1;").unwrap();
-        writeln!(w, "    // dual dot: weight rows e0 and e0+1 against XN").unwrap();
-        writeln!(w, "    mul.lo.u32 %r12, %r11, {};", d * 2).unwrap();
-        writeln!(w, "    cvt.u64.u32 %rd10, %r12;").unwrap();
-        writeln!(w, "    add.u64 %rd10, {}, %rd10;", wreg).unwrap();
-        writeln!(w, "    add.u64 %rd11, %rd10, {};", d * 2).unwrap();
-        writeln!(w, "    mov.f32 %f10, {};", zero).unwrap();
-        writeln!(w, "    mov.f32 %f11, {};", zero).unwrap();
-        writeln!(w, "    mov.u32 %r13, 0;").unwrap();
-        writeln!(w, "    mov.u32 %r14, %r_sb;").unwrap();
-        writeln!(w, "{}_DOT:", prefix).unwrap();
-        writeln!(w, "    setp.ge.u32 %p1, %r13, {};", d).unwrap();
-        writeln!(w, "    @%p1 bra {}_DOTD;", prefix).unwrap();
-        writeln!(w, "    ld.shared.f32 %f12, [%r14+{}];", xn_off).unwrap();
-        writeln!(w, "    ld.global.b16 %h0, [%rd10];").unwrap();
-        writeln!(w, "    cvt.f32.f16 %f13, %h0;").unwrap();
-        writeln!(w, "    fma.rn.f32 %f10, %f13, %f12, %f10;").unwrap();
-        writeln!(w, "    ld.global.b16 %h1, [%rd11];").unwrap();
-        writeln!(w, "    cvt.f32.f16 %f13, %h1;").unwrap();
-        writeln!(w, "    fma.rn.f32 %f11, %f13, %f12, %f11;").unwrap();
-        writeln!(w, "    add.u64 %rd10, %rd10, 2;").unwrap();
-        writeln!(w, "    add.u64 %rd11, %rd11, 2;").unwrap();
-        writeln!(w, "    add.u32 %r14, %r14, 4;").unwrap();
-        writeln!(w, "    add.u32 %r13, %r13, 1;").unwrap();
-        writeln!(w, "    bra {}_DOT;", prefix).unwrap();
-        writeln!(w, "{}_DOTD:", prefix).unwrap();
-        writeln!(w, "    // RoPE: i2 = e0 % head_dim; angle = pos * ex2(i2 * c_rope)").unwrap();
-        writeln!(w, "    div.u32 %r12, %r11, {};", hd).unwrap();
-        writeln!(w, "    mul.lo.u32 %r12, %r12, {};", hd).unwrap();
-        writeln!(w, "    sub.u32 %r12, %r11, %r12;").unwrap();
-        writeln!(w, "    cvt.rn.f32.u32 %f12, %r12;").unwrap();
-        writeln!(w, "    mul.f32 %f12, %f12, {};", c_rope).unwrap();
-        writeln!(w, "    ex2.approx.f32 %f12, %f12;").unwrap();
-        writeln!(w, "    cvt.rn.f32.u32 %f13, %r_pos;").unwrap();
-        writeln!(w, "    mul.f32 %f12, %f13, %f12;").unwrap();
-        writeln!(w, "    sin.approx.f32 %f14, %f12;").unwrap();
-        writeln!(w, "    cos.approx.f32 %f15, %f12;").unwrap();
-        writeln!(w, "    // (e', o') = (e*cos - o*sin, e*sin + o*cos)").unwrap();
-        writeln!(w, "    mul.f32 %f16, %f10, %f15;").unwrap();
-        writeln!(w, "    mul.f32 %f17, %f11, %f14;").unwrap();
-        writeln!(w, "    sub.f32 %f16, %f16, %f17;").unwrap();
-        writeln!(w, "    mul.f32 %f17, %f10, %f14;").unwrap();
-        writeln!(w, "    fma.rn.f32 %f17, %f11, %f15, %f17;").unwrap();
-        store(w);
-        writeln!(w, "    add.u32 %r10, %r10, {};", BLOCK_DIM).unwrap();
-        writeln!(w, "    bra {};", prefix).unwrap();
-        writeln!(w, "{}_D:", prefix).unwrap();
-    };
-
-    // ── phase 3a: Q = rope(Wq @ xn) -> SMEM ───────────────────────
-    writeln!(w, "    // phase 3a: Q pairs (thread p owns elements 2p, 2p+1)").unwrap();
-    emit_pair_loop(w, "QP", nhd / 2, "%rd_wq", &|w| {
-        writeln!(w, "    mul.lo.u32 %r12, %r11, 4;").unwrap();
-        writeln!(w, "    add.u32 %r12, %r12, %r_sb;").unwrap();
-        writeln!(w, "    st.shared.f32 [%r12+{}], %f16;", q_off).unwrap();
-        writeln!(w, "    st.shared.f32 [%r12+{}], %f17;", q_off + 4).unwrap();
-    });
-    writeln!(w).unwrap();
-
-    // ── phase 3b: K = rope(Wk @ xn) -> KV pool append (f16) ───────
-    writeln!(w, "    // phase 3b: K pairs, appended straight to the pool").unwrap();
-    emit_pair_loop(w, "KP", nkv * hd / 2, "%rd_wk", &|w| {
-        writeln!(w, "    mul.lo.u32 %r12, %r11, 2;").unwrap();
-        writeln!(w, "    cvt.u64.u32 %rd12, %r12;").unwrap();
-        writeln!(w, "    add.u64 %rd12, %rd_krec, %rd12;").unwrap();
-        writeln!(w, "    cvt.rn.f16.f32 %h0, %f16;").unwrap();
-        writeln!(w, "    st.global.b16 [%rd12], %h0;").unwrap();
-        writeln!(w, "    cvt.rn.f16.f32 %h1, %f17;").unwrap();
-        writeln!(w, "    st.global.b16 [%rd12+2], %h1;").unwrap();
-    });
-    writeln!(w).unwrap();
-
-    // ── phase 3c: V = Wv @ xn -> KV pool append (f16, no rotation) ─
-    writeln!(w, "    // phase 3c: V elements (no rotation)").unwrap();
-    writeln!(w, "    mov.u32 %r10, %r_tid;").unwrap();
-    writeln!(w, "VP:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p0, %r10, {};", nkv * hd).unwrap();
-    writeln!(w, "    @%p0 bra VP_D;").unwrap();
-    writeln!(w, "    mul.lo.u32 %r12, %r10, {};", d * 2).unwrap();
-    writeln!(w, "    cvt.u64.u32 %rd10, %r12;").unwrap();
-    writeln!(w, "    add.u64 %rd10, %rd_wv, %rd10;").unwrap();
-    writeln!(w, "    mov.f32 %f10, {};", zero).unwrap();
-    writeln!(w, "    mov.u32 %r13, 0;").unwrap();
-    writeln!(w, "    mov.u32 %r14, %r_sb;").unwrap();
-    writeln!(w, "VP_DOT:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p1, %r13, {};", d).unwrap();
-    writeln!(w, "    @%p1 bra VP_DOTD;").unwrap();
-    writeln!(w, "    ld.shared.f32 %f12, [%r14+{}];", xn_off).unwrap();
-    writeln!(w, "    ld.global.b16 %h0, [%rd10];").unwrap();
-    writeln!(w, "    cvt.f32.f16 %f13, %h0;").unwrap();
-    writeln!(w, "    fma.rn.f32 %f10, %f13, %f12, %f10;").unwrap();
-    writeln!(w, "    add.u64 %rd10, %rd10, 2;").unwrap();
-    writeln!(w, "    add.u32 %r14, %r14, 4;").unwrap();
-    writeln!(w, "    add.u32 %r13, %r13, 1;").unwrap();
-    writeln!(w, "    bra VP_DOT;").unwrap();
-    writeln!(w, "VP_DOTD:").unwrap();
-    writeln!(w, "    mul.lo.u32 %r12, %r10, 2;").unwrap();
-    writeln!(w, "    cvt.u64.u32 %rd12, %r12;").unwrap();
-    writeln!(w, "    add.u64 %rd12, %rd_vrec, %rd12;").unwrap();
-    writeln!(w, "    cvt.rn.f16.f32 %h0, %f10;").unwrap();
-    writeln!(w, "    st.global.b16 [%rd12], %h0;").unwrap();
-    writeln!(w, "    add.u32 %r10, %r10, {};", BLOCK_DIM).unwrap();
-    writeln!(w, "    bra VP;").unwrap();
-    writeln!(w, "VP_D:").unwrap();
-    writeln!(
-        w,
-        "    // publishes Q SMEM + orders the KV-pool stores before the"
-    )
-    .unwrap();
-    writeln!(w, "    // attention reads (bar.sync has membar.cta effect)").unwrap();
-    writeln!(w, "    bar.sync 0;").unwrap();
-    writeln!(w).unwrap();
-
-    // ── phase 4: flash-decode attention, Q heads sequential ───────
-    writeln!(
-        w,
-        "    // phase 4: 3-pass flash-decode per Q head (sequential heads,"
-    )
-    .unwrap();
-    writeln!(
-        w,
-        "    // same algorithm as {}); seq_len = pos+1",
-        crate::cfie_decode_attention::KERNEL_NAME
-    )
-    .unwrap();
-    writeln!(w, "    mov.u32 %r_hh, 0;").unwrap();
-    writeln!(w, "AH:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p0, %r_hh, {};", nh).unwrap();
-    writeln!(w, "    @%p0 bra AH_D;").unwrap();
-    writeln!(w, "    // kv_head = q_head / group_size (baked divisor)").unwrap();
-    writeln!(w, "    div.u32 %r10, %r_hh, {};", group).unwrap();
-    writeln!(w, "    mul.lo.u32 %r10, %r10, {};", hd * 2).unwrap();
-    writeln!(w, "    cvt.u64.u32 %rd_hoff, %r10;").unwrap();
-    writeln!(w, "    mul.lo.u32 %r11, %r_hh, {};", hd * 4).unwrap();
-    writeln!(w, "    add.u32 %r_qb, %r11, %r_sb;").unwrap();
-    writeln!(w, "    mov.f32 %f_acc, {};", zero).unwrap();
-    writeln!(w, "    mov.f32 %f_m, {};", neg_inf).unwrap();
-    writeln!(w, "    mov.f32 %f_l, {};", zero).unwrap();
-    writeln!(w, "    mov.u32 %r_tile, 0;").unwrap();
-    writeln!(w, "AT_LOOP:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p0, %r_tile, %r_sl;").unwrap();
-    writeln!(w, "    @%p0 bra AT_END;").unwrap();
-    writeln!(w, "    mov.u32 %r12, %r_sl;").unwrap();
-    writeln!(w, "    sub.u32 %r12, %r12, %r_tile;").unwrap();
-    writeln!(w, "    min.u32 %r_tcnt, %r12, {};", ATTN_TILE).unwrap();
-    writeln!(w, "    // pass 1: thread t scores token tile_base + t").unwrap();
-    writeln!(w, "    add.u32 %r13, %r_tile, %r_tid;").unwrap();
-    writeln!(w, "    setp.lt.u32 %p1, %r13, %r_sl;").unwrap();
-    writeln!(w, "    @!%p1 bra ASC_D;").unwrap();
-    writeln!(w, "    add.u32 %r14, %r_slotbase, %r13;").unwrap();
-    writeln!(w, "    mul.wide.u32 %rd10, %r14, {};", tsb).unwrap();
-    writeln!(w, "    add.u64 %rd10, %rd_kplane, %rd10;").unwrap();
-    writeln!(w, "    add.u64 %rd10, %rd10, %rd_hoff;").unwrap();
-    writeln!(w, "    mov.f32 %f10, {};", zero).unwrap();
-    writeln!(w, "    mov.u32 %r15, 0;").unwrap();
-    writeln!(w, "    mov.u32 %r16, %r_qb;").unwrap();
-    writeln!(w, "ADOT:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p2, %r15, {};", hd).unwrap();
-    writeln!(w, "    @%p2 bra ADOT_D;").unwrap();
-    writeln!(w, "    ld.global.b16 %h0, [%rd10];").unwrap();
-    writeln!(w, "    cvt.f32.f16 %f11, %h0;").unwrap();
-    writeln!(w, "    ld.shared.f32 %f12, [%r16+{}];", q_off).unwrap();
-    writeln!(w, "    fma.rn.f32 %f10, %f11, %f12, %f10;").unwrap();
-    writeln!(w, "    add.u64 %rd10, %rd10, 2;").unwrap();
-    writeln!(w, "    add.u32 %r16, %r16, 4;").unwrap();
-    writeln!(w, "    add.u32 %r15, %r15, 1;").unwrap();
-    writeln!(w, "    bra ADOT;").unwrap();
-    writeln!(w, "ADOT_D:").unwrap();
-    writeln!(w, "    mul.f32 %f10, %f10, {};", inv_sqrt_hd).unwrap();
-    writeln!(w, "    mul.lo.u32 %r15, %r_tid, 4;").unwrap();
-    writeln!(w, "    add.u32 %r15, %r15, %r_sb;").unwrap();
-    writeln!(w, "    st.shared.f32 [%r15+{}], %f10;", sc_off).unwrap();
-    writeln!(w, "ASC_D:").unwrap();
-    writeln!(w, "    bar.sync 0;").unwrap();
-    writeln!(w, "    // pass 2: online softmax, thread 0 serial over the tile").unwrap();
-    writeln!(w, "    setp.ne.u32 %p1, %r_tid, 0;").unwrap();
-    writeln!(w, "    @%p1 bra ASM_D;").unwrap();
-    writeln!(w, "    mov.f32 %f10, %f_m;").unwrap();
-    writeln!(w, "    mov.u32 %r15, 0;").unwrap();
-    writeln!(w, "    mov.u32 %r16, %r_sb;").unwrap();
-    writeln!(w, "AMAX:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p2, %r15, %r_tcnt;").unwrap();
-    writeln!(w, "    @%p2 bra AMAX_D;").unwrap();
-    writeln!(w, "    ld.shared.f32 %f11, [%r16+{}];", sc_off).unwrap();
-    writeln!(w, "    max.f32 %f10, %f10, %f11;").unwrap();
-    writeln!(w, "    add.u32 %r16, %r16, 4;").unwrap();
-    writeln!(w, "    add.u32 %r15, %r15, 1;").unwrap();
-    writeln!(w, "    bra AMAX;").unwrap();
-    writeln!(w, "AMAX_D:").unwrap();
-    writeln!(w, "    // rescale = exp(m_old - m_new); exp(-inf) = 0 on first tile").unwrap();
-    writeln!(w, "    sub.f32 %f11, %f_m, %f10;").unwrap();
-    writeln!(w, "    mul.f32 %f11, %f11, {};", log2e).unwrap();
-    writeln!(w, "    ex2.approx.f32 %f12, %f11;").unwrap();
-    writeln!(w, "    mul.f32 %f_l, %f_l, %f12;").unwrap();
-    writeln!(w, "    mov.f32 %f_m, %f10;").unwrap();
-    writeln!(w, "    mov.u32 %r15, 0;").unwrap();
-    writeln!(w, "    mov.u32 %r16, %r_sb;").unwrap();
-    writeln!(w, "AP:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p2, %r15, %r_tcnt;").unwrap();
-    writeln!(w, "    @%p2 bra AP_D;").unwrap();
-    writeln!(w, "    ld.shared.f32 %f11, [%r16+{}];", sc_off).unwrap();
-    writeln!(w, "    sub.f32 %f11, %f11, %f_m;").unwrap();
-    writeln!(w, "    mul.f32 %f11, %f11, {};", log2e).unwrap();
-    writeln!(w, "    ex2.approx.f32 %f11, %f11;").unwrap();
-    writeln!(w, "    st.shared.f32 [%r16+{}], %f11;", sc_off).unwrap();
-    writeln!(w, "    add.f32 %f_l, %f_l, %f11;").unwrap();
-    writeln!(w, "    add.u32 %r16, %r16, 4;").unwrap();
-    writeln!(w, "    add.u32 %r15, %r15, 1;").unwrap();
-    writeln!(w, "    bra AP;").unwrap();
-    writeln!(w, "AP_D:").unwrap();
-    writeln!(w, "    st.shared.f32 [%r_sb+{}], %f12;", rsc_off).unwrap();
-    writeln!(w, "ASM_D:").unwrap();
-    writeln!(w, "    bar.sync 0;").unwrap();
-    writeln!(w, "    // pass 3: rescale accumulator, add P*V; thread d owns out[d]").unwrap();
-    writeln!(w, "    setp.ge.u32 %p1, %r_tid, {};", hd).unwrap();
-    writeln!(w, "    @%p1 bra AACC_T;").unwrap();
-    writeln!(w, "    ld.shared.f32 %f10, [%r_sb+{}];", rsc_off).unwrap();
-    writeln!(w, "    mul.f32 %f_acc, %f_acc, %f10;").unwrap();
-    writeln!(w, "    add.u32 %r14, %r_slotbase, %r_tile;").unwrap();
-    writeln!(w, "    mul.wide.u32 %rd10, %r14, {};", tsb).unwrap();
-    writeln!(w, "    add.u64 %rd10, %rd_vplane, %rd10;").unwrap();
-    writeln!(w, "    add.u64 %rd10, %rd10, %rd_hoff;").unwrap();
-    writeln!(w, "    mul.wide.u32 %rd11, %r_tid, 2;").unwrap();
-    writeln!(w, "    add.u64 %rd10, %rd10, %rd11;").unwrap();
-    writeln!(w, "    mov.u32 %r15, 0;").unwrap();
-    writeln!(w, "    mov.u32 %r16, %r_sb;").unwrap();
-    writeln!(w, "AACC:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p2, %r15, %r_tcnt;").unwrap();
-    writeln!(w, "    @%p2 bra AACC_T;").unwrap();
-    writeln!(w, "    ld.shared.f32 %f11, [%r16+{}];", sc_off).unwrap();
-    writeln!(w, "    ld.global.b16 %h0, [%rd10];").unwrap();
-    writeln!(w, "    cvt.f32.f16 %f12, %h0;").unwrap();
-    writeln!(w, "    fma.rn.f32 %f_acc, %f11, %f12, %f_acc;").unwrap();
-    writeln!(w, "    add.u64 %rd10, %rd10, {};", tsb).unwrap();
-    writeln!(w, "    add.u32 %r16, %r16, 4;").unwrap();
-    writeln!(w, "    add.u32 %r15, %r15, 1;").unwrap();
-    writeln!(w, "    bra AACC;").unwrap();
-    writeln!(w, "AACC_T:").unwrap();
-    writeln!(w, "    // score tile SMEM rewritten next tile").unwrap();
-    writeln!(w, "    bar.sync 0;").unwrap();
-    writeln!(w, "    add.u32 %r_tile, %r_tile, {};", ATTN_TILE).unwrap();
-    writeln!(w, "    bra AT_LOOP;").unwrap();
-    writeln!(w, "AT_END:").unwrap();
-    writeln!(w, "    setp.ne.u32 %p0, %r_tid, 0;").unwrap();
-    writeln!(w, "    @%p0 bra ALP;").unwrap();
-    writeln!(w, "    st.shared.f32 [%r_sb+{}], %f_l;", ll_off).unwrap();
-    writeln!(w, "ALP:").unwrap();
-    writeln!(w, "    bar.sync 0;").unwrap();
-    writeln!(w, "    setp.ge.u32 %p0, %r_tid, {};", hd).unwrap();
-    writeln!(w, "    @%p0 bra AH_NEXT;").unwrap();
-    writeln!(w, "    ld.shared.f32 %f10, [%r_sb+{}];", ll_off).unwrap();
-    writeln!(w, "    // l > 0 always holds (seq_len = pos+1 >= 1); keep the guard").unwrap();
-    writeln!(w, "    mov.f32 %f11, {};", zero).unwrap();
-    writeln!(w, "    setp.gt.f32 %p1, %f10, {};", zero).unwrap();
-    writeln!(w, "    @!%p1 bra AH_ST;").unwrap();
-    writeln!(w, "    div.rn.f32 %f11, %f_acc, %f10;").unwrap();
-    writeln!(w, "AH_ST:").unwrap();
-    writeln!(w, "    mul.lo.u32 %r12, %r_hh, {};", hd).unwrap();
-    writeln!(w, "    add.u32 %r12, %r12, %r_tid;").unwrap();
-    writeln!(w, "    mul.lo.u32 %r12, %r12, 4;").unwrap();
-    writeln!(w, "    add.u32 %r12, %r12, %r_sb;").unwrap();
-    writeln!(w, "    st.shared.f32 [%r12+{}], %f11;", ao_off).unwrap();
-    writeln!(w, "AH_NEXT:").unwrap();
-    writeln!(w, "    // rescale/l/score SMEM reused by the next head").unwrap();
-    writeln!(w, "    bar.sync 0;").unwrap();
-    writeln!(w, "    add.u32 %r_hh, %r_hh, 1;").unwrap();
-    writeln!(w, "    bra AH;").unwrap();
-    writeln!(w, "AH_D:").unwrap();
-    writeln!(w).unwrap();
-
-    // ── phase 5: W_o matvec + residual into X ─────────────────────
-    writeln!(w, "    // phase 5: x += Wo @ attn_out (thread d owns X[d])").unwrap();
-    writeln!(w, "    mov.u32 %r10, %r_tid;").unwrap();
-    writeln!(w, "WO:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p0, %r10, {};", d).unwrap();
-    writeln!(w, "    @%p0 bra WO_D;").unwrap();
-    writeln!(w, "    mul.lo.u32 %r11, %r10, {};", nhd * 2).unwrap();
-    writeln!(w, "    cvt.u64.u32 %rd10, %r11;").unwrap();
-    writeln!(w, "    add.u64 %rd10, %rd_wo, %rd10;").unwrap();
-    writeln!(w, "    mov.f32 %f10, {};", zero).unwrap();
-    writeln!(w, "    mov.u32 %r12, 0;").unwrap();
-    writeln!(w, "    mov.u32 %r13, %r_sb;").unwrap();
-    writeln!(w, "WO_DOT:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p1, %r12, {};", nhd).unwrap();
-    writeln!(w, "    @%p1 bra WO_DOTD;").unwrap();
-    writeln!(w, "    ld.global.b16 %h0, [%rd10];").unwrap();
-    writeln!(w, "    cvt.f32.f16 %f11, %h0;").unwrap();
-    writeln!(w, "    ld.shared.f32 %f12, [%r13+{}];", ao_off).unwrap();
-    writeln!(w, "    fma.rn.f32 %f10, %f11, %f12, %f10;").unwrap();
-    writeln!(w, "    add.u64 %rd10, %rd10, 2;").unwrap();
-    writeln!(w, "    add.u32 %r13, %r13, 4;").unwrap();
-    writeln!(w, "    add.u32 %r12, %r12, 1;").unwrap();
-    writeln!(w, "    bra WO_DOT;").unwrap();
-    writeln!(w, "WO_DOTD:").unwrap();
-    writeln!(w, "    mul.lo.u32 %r14, %r10, 4;").unwrap();
-    writeln!(w, "    add.u32 %r14, %r14, %r_sb;").unwrap();
-    writeln!(w, "    ld.shared.f32 %f12, [%r14+{}];", x_off).unwrap();
-    writeln!(w, "    add.f32 %f12, %f12, %f10;").unwrap();
-    writeln!(w, "    st.shared.f32 [%r14+{}], %f12;", x_off).unwrap();
-    writeln!(w, "    add.u32 %r10, %r10, {};", BLOCK_DIM).unwrap();
-    writeln!(w, "    bra WO;").unwrap();
-    writeln!(w, "WO_D:").unwrap();
-    writeln!(w, "    bar.sync 0;").unwrap();
-    writeln!(w).unwrap();
-
-    // ── phase 6: RMSNorm2 ─────────────────────────────────────────
-    emit_rmsnorm(w, "N2", "%rd_n2");
-
-    // ── phase 7: FFN (tiled gate/up + down accumulation) ──────────
-    writeln!(w, "    // phase 7: FFN. Y accumulator zeroed, then per 128-wide").unwrap();
-    writeln!(w, "    // d_ff tile: h = silu(gate)*up staged in SMEM, down-").unwrap();
-    writeln!(w, "    // projection accumulated into Y (thread d owns Y[d]).").unwrap();
-    writeln!(w, "    mov.u32 %r10, %r_tid;").unwrap();
-    writeln!(w, "    mov.f32 %f10, {};", zero).unwrap();
-    writeln!(w, "YZ:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p0, %r10, {};", d).unwrap();
-    writeln!(w, "    @%p0 bra YZ_D;").unwrap();
-    writeln!(w, "    mul.lo.u32 %r11, %r10, 4;").unwrap();
-    writeln!(w, "    add.u32 %r11, %r11, %r_sb;").unwrap();
-    writeln!(w, "    st.shared.f32 [%r11+{}], %f10;", y_off).unwrap();
-    writeln!(w, "    add.u32 %r10, %r10, {};", BLOCK_DIM).unwrap();
-    writeln!(w, "    bra YZ;").unwrap();
-    writeln!(w, "YZ_D:").unwrap();
-    writeln!(w, "    bar.sync 0;").unwrap();
-    writeln!(w, "    mov.u32 %r_tb, 0;").unwrap();
-    writeln!(w, "FT:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p0, %r_tb, {};", dff).unwrap();
-    writeln!(w, "    @%p0 bra FT_D;").unwrap();
-    writeln!(w, "    mov.u32 %r10, {};", dff).unwrap();
-    writeln!(w, "    sub.u32 %r10, %r10, %r_tb;").unwrap();
-    writeln!(w, "    min.u32 %r_fcnt, %r10, {};", FFN_TILE).unwrap();
-    writeln!(w, "    // gate/up dual matvec for row tb + tid").unwrap();
-    writeln!(w, "    setp.ge.u32 %p1, %r_tid, %r_fcnt;").unwrap();
-    writeln!(w, "    @%p1 bra FH_D;").unwrap();
-    writeln!(w, "    add.u32 %r11, %r_tb, %r_tid;").unwrap();
-    writeln!(w, "    mul.lo.u32 %r12, %r11, {};", d * 2).unwrap();
-    writeln!(w, "    cvt.u64.u32 %rd10, %r12;").unwrap();
-    writeln!(w, "    add.u64 %rd11, %rd_wg, %rd10;").unwrap();
-    writeln!(w, "    add.u64 %rd12, %rd_wu, %rd10;").unwrap();
-    writeln!(w, "    mov.f32 %f10, {};", zero).unwrap();
-    writeln!(w, "    mov.f32 %f11, {};", zero).unwrap();
-    writeln!(w, "    mov.u32 %r13, 0;").unwrap();
-    writeln!(w, "    mov.u32 %r14, %r_sb;").unwrap();
-    writeln!(w, "FGU:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p2, %r13, {};", d).unwrap();
-    writeln!(w, "    @%p2 bra FGU_D;").unwrap();
-    writeln!(w, "    ld.shared.f32 %f12, [%r14+{}];", xn_off).unwrap();
-    writeln!(w, "    ld.global.b16 %h0, [%rd11];").unwrap();
-    writeln!(w, "    cvt.f32.f16 %f13, %h0;").unwrap();
-    writeln!(w, "    fma.rn.f32 %f10, %f13, %f12, %f10;").unwrap();
-    writeln!(w, "    ld.global.b16 %h1, [%rd12];").unwrap();
-    writeln!(w, "    cvt.f32.f16 %f13, %h1;").unwrap();
-    writeln!(w, "    fma.rn.f32 %f11, %f13, %f12, %f11;").unwrap();
-    writeln!(w, "    add.u64 %rd11, %rd11, 2;").unwrap();
-    writeln!(w, "    add.u64 %rd12, %rd12, 2;").unwrap();
-    writeln!(w, "    add.u32 %r14, %r14, 4;").unwrap();
-    writeln!(w, "    add.u32 %r13, %r13, 1;").unwrap();
-    writeln!(w, "    bra FGU;").unwrap();
-    writeln!(w, "FGU_D:").unwrap();
-    writeln!(w, "    // silu(g) = g * sigmoid(g); sigmoid = 1/(1 + ex2(-g*log2e))").unwrap();
-    writeln!(w, "    mul.f32 %f12, %f10, {};", neg_log2e).unwrap();
-    writeln!(w, "    ex2.approx.f32 %f12, %f12;").unwrap();
-    writeln!(w, "    add.f32 %f12, %f12, {};", one).unwrap();
-    writeln!(w, "    mov.f32 %f13, {};", one).unwrap();
-    writeln!(w, "    div.rn.f32 %f13, %f13, %f12;").unwrap();
-    writeln!(w, "    mul.f32 %f13, %f10, %f13;").unwrap();
-    writeln!(w, "    mul.f32 %f13, %f13, %f11;").unwrap();
-    writeln!(w, "    mul.lo.u32 %r15, %r_tid, 4;").unwrap();
-    writeln!(w, "    add.u32 %r15, %r15, %r_sb;").unwrap();
-    writeln!(w, "    st.shared.f32 [%r15+{}], %f13;", h_off).unwrap();
-    writeln!(w, "FH_D:").unwrap();
-    writeln!(w, "    bar.sync 0;").unwrap();
-    writeln!(w, "    // down accumulation: Y[d] += W_down[d, tb..tb+fcnt] . h").unwrap();
-    writeln!(w, "    mov.u32 %r10, %r_tid;").unwrap();
-    writeln!(w, "FD:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p1, %r10, {};", d).unwrap();
-    writeln!(w, "    @%p1 bra FD_D;").unwrap();
-    writeln!(w, "    mul.lo.u32 %r11, %r10, {};", dff * 2).unwrap();
-    writeln!(w, "    cvt.u64.u32 %rd10, %r11;").unwrap();
-    writeln!(w, "    add.u64 %rd10, %rd_wd, %rd10;").unwrap();
-    writeln!(w, "    mul.lo.u32 %r12, %r_tb, 2;").unwrap();
-    writeln!(w, "    cvt.u64.u32 %rd11, %r12;").unwrap();
-    writeln!(w, "    add.u64 %rd10, %rd10, %rd11;").unwrap();
-    writeln!(w, "    mov.f32 %f10, {};", zero).unwrap();
-    writeln!(w, "    mov.u32 %r13, 0;").unwrap();
-    writeln!(w, "    mov.u32 %r14, %r_sb;").unwrap();
-    writeln!(w, "FDD:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p2, %r13, %r_fcnt;").unwrap();
-    writeln!(w, "    @%p2 bra FDD_D;").unwrap();
-    writeln!(w, "    ld.shared.f32 %f11, [%r14+{}];", h_off).unwrap();
-    writeln!(w, "    ld.global.b16 %h0, [%rd10];").unwrap();
-    writeln!(w, "    cvt.f32.f16 %f12, %h0;").unwrap();
-    writeln!(w, "    fma.rn.f32 %f10, %f11, %f12, %f10;").unwrap();
-    writeln!(w, "    add.u64 %rd10, %rd10, 2;").unwrap();
-    writeln!(w, "    add.u32 %r14, %r14, 4;").unwrap();
-    writeln!(w, "    add.u32 %r13, %r13, 1;").unwrap();
-    writeln!(w, "    bra FDD;").unwrap();
-    writeln!(w, "FDD_D:").unwrap();
-    writeln!(w, "    mul.lo.u32 %r15, %r10, 4;").unwrap();
-    writeln!(w, "    add.u32 %r15, %r15, %r_sb;").unwrap();
-    writeln!(w, "    ld.shared.f32 %f11, [%r15+{}];", y_off).unwrap();
-    writeln!(w, "    add.f32 %f11, %f11, %f10;").unwrap();
-    writeln!(w, "    st.shared.f32 [%r15+{}], %f11;", y_off).unwrap();
-    writeln!(w, "    add.u32 %r10, %r10, {};", BLOCK_DIM).unwrap();
-    writeln!(w, "    bra FD;").unwrap();
-    writeln!(w, "FD_D:").unwrap();
-    writeln!(w, "    // h tile rewritten next iteration").unwrap();
-    writeln!(w, "    bar.sync 0;").unwrap();
-    writeln!(w, "    add.u32 %r_tb, %r_tb, {};", FFN_TILE).unwrap();
-    writeln!(w, "    bra FT;").unwrap();
-    writeln!(w, "FT_D:").unwrap();
-    writeln!(w).unwrap();
-
-    // ── phase 8: x_out = X + Y ────────────────────────────────────
-    writeln!(w, "    // phase 8: x_out = x + ffn (second residual)").unwrap();
-    writeln!(w, "    mov.u32 %r10, %r_tid;").unwrap();
-    writeln!(w, "SO:").unwrap();
-    writeln!(w, "    setp.ge.u32 %p0, %r10, {};", d).unwrap();
-    writeln!(w, "    @%p0 bra SO_D;").unwrap();
-    writeln!(w, "    mul.lo.u32 %r11, %r10, 4;").unwrap();
-    writeln!(w, "    add.u32 %r12, %r11, %r_sb;").unwrap();
-    writeln!(w, "    ld.shared.f32 %f10, [%r12+{}];", x_off).unwrap();
-    writeln!(w, "    ld.shared.f32 %f11, [%r12+{}];", y_off).unwrap();
-    writeln!(w, "    add.f32 %f10, %f10, %f11;").unwrap();
-    writeln!(w, "    cvt.u64.u32 %rd10, %r11;").unwrap();
-    writeln!(w, "    add.u64 %rd10, %rd_xout, %rd10;").unwrap();
-    writeln!(w, "    st.global.f32 [%rd10], %f10;").unwrap();
-    writeln!(w, "    add.u32 %r10, %r10, {};", BLOCK_DIM).unwrap();
-    writeln!(w, "    bra SO;").unwrap();
-    writeln!(w, "SO_D:").unwrap();
-    writeln!(w, "    ret;").unwrap();
-    writeln!(w, "}}").unwrap();
-
+    let mut p = header_comment(cfg);
+    p.push_str(module);
     let meta = DecodeBlockMeta {
         kernel_name: KERNEL_NAME.to_string(),
         smem_bytes,
@@ -844,6 +815,7 @@ pub fn emit(cfg: &DecodeBlockConfig) -> (String, DecodeBlockMeta) {
 pub fn emit_decode_block_ptx(cfg: &DecodeBlockConfig) -> String {
     emit(cfg).0
 }
+
 
 // ---------------------------------------------------------------------------
 // CPU reference
@@ -976,6 +948,7 @@ pub fn cpu_reference(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel_ir::{AddressSpace, ConstValue, KernelIR, KirOp, KirType};
 
     /// Paper-shaped NSL-Coder config (d_model 512 / 8 heads of 64 /
     /// GQA 4 KV heads / d_ff 1408) on the sm_80 baseline target.
@@ -991,44 +964,79 @@ mod tests {
             n_layers: 8,
             rope_theta: 10000.0,
             eps: 1e-5,
-            sm_version: 80,
         }
+    }
+
+    fn ops(ir: &KernelIR) -> Vec<&KirOp> {
+        ir.blocks.iter().flat_map(|b| b.ops.iter()).collect()
+    }
+
+    fn u64_consts(ir: &KernelIR) -> Vec<u64> {
+        ops(ir)
+            .into_iter()
+            .filter_map(|op| match op {
+                KirOp::Const(_, crate::kernel_ir::KirConst { value: ConstValue::U64(v), .. }) => Some(*v),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn u32_consts(ir: &KernelIR) -> Vec<u32> {
+        ops(ir)
+            .into_iter()
+            .filter_map(|op| match op {
+                KirOp::Const(_, crate::kernel_ir::KirConst { value: ConstValue::U32(v), .. }) => Some(*v),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
     fn param_list_is_exactly_the_fifteen_block_params() {
+        let ir = build(&paper_cfg());
+        let names: Vec<&str> = ir.params.iter().map(|p| p.name.as_str()).collect();
+        let pointers = [
+            "x_in_ptr",
+            "x_out_ptr",
+            "wq_ptr",
+            "wk_ptr",
+            "wv_ptr",
+            "wo_ptr",
+            "w_gate_ptr",
+            "w_up_ptr",
+            "w_down_ptr",
+            "norm1_w_ptr",
+            "norm2_w_ptr",
+            "kv_base",
+        ];
+        let scalars = ["layer_idx", "slot_idx", "pos"];
+        assert_eq!(names, [&pointers[..], &scalars[..]].concat());
         let ptx = emit_decode_block_ptx(&paper_cfg());
-        let start = ptx.find(".visible .entry nsl_cfie_decode_block(").unwrap();
-        let end = start + ptx[start..].find(')').unwrap();
-        let params: Vec<&str> = ptx[start..end]
-            .lines()
-            .filter_map(|l| {
-                let l = l.trim();
-                l.starts_with(".param").then(|| l.trim_end_matches(','))
-            })
-            .collect();
-        assert_eq!(
-            params,
-            vec![
-                ".param .u64 x_in_ptr",
-                ".param .u64 x_out_ptr",
-                ".param .u64 wq_ptr",
-                ".param .u64 wk_ptr",
-                ".param .u64 wv_ptr",
-                ".param .u64 wo_ptr",
-                ".param .u64 w_gate_ptr",
-                ".param .u64 w_up_ptr",
-                ".param .u64 w_down_ptr",
-                ".param .u64 norm1_w_ptr",
-                ".param .u64 norm2_w_ptr",
-                ".param .u64 kv_base",
-                ".param .u32 layer_idx",
-                ".param .u32 slot_idx",
-                ".param .u32 pos",
-            ]
-        );
+        for name in pointers {
+            assert!(ptx.contains(&format!(".param .u64 param_{name}")), "{name}");
+        }
+        for name in scalars {
+            assert!(ptx.contains(&format!(".param .u32 param_{name}")), "{name}");
+        }
         // Exactly the declared params are ever loaded.
         assert_eq!(ptx.matches("ld.param").count(), 15);
+    }
+
+    #[test]
+    fn the_global_stores_are_the_output_row_and_the_kv_append() {
+        // f32 stores: x_out only. f16 stores: the K pair (two) and the V
+        // element — the record at (layer, slot, pos).
+        let ir = build(&paper_cfg());
+        let stores: Vec<Option<&KirType>> = ops(&ir)
+            .into_iter()
+            .filter_map(|op| match op {
+                KirOp::Store(_, v, AddressSpace::Global) => Some(ir.var_types.get(v)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stores.iter().filter(|t| **t == Some(&KirType::F32)).count(), 1);
+        assert_eq!(stores.iter().filter(|t| **t == Some(&KirType::F16)).count(), 3);
+        assert_eq!(stores.len(), 4);
     }
 
     #[test]
@@ -1083,18 +1091,44 @@ mod tests {
     fn baked_immediates_and_launch_shape() {
         let cfg = paper_cfg();
         let (ptx, meta) = emit(&cfg);
-        // token_stride = 4*64 = 256 elems -> 512 bytes; layer stride =
-        // 2 * 64*2048*256 * 2 bytes = 134217728 bytes.
+        // token_stride = 4*64 = 256 elements; the layer stride = 2 * 64*2048*256
+        // = 67108864 elements (the hand kernel's 134217728 bytes).
         assert!(ptx.contains("//   token_stride        = 256"));
-        assert!(ptx.contains("mul.lo.u64 %rd_kplane, %rd0, 134217728;"));
-        assert!(ptx.contains("mul.lo.u32 %r_slotbase, %r_slot, 2048;"));
-        assert!(ptx.contains(".version 7.0\n.target sm_80\n.address_size 64"));
+        let ir = build(&cfg);
+        let wide = u64_consts(&ir);
+        for stride in [256u64, 33_554_432, 67_108_864] {
+            assert!(wide.contains(&stride), "{stride} in {wide:?}");
+        }
+        assert!(u32_consts(&ir).contains(&2048), "per_slot_max_tokens");
         assert_eq!(meta.kernel_name, kernel_name());
         assert_eq!(meta.block_dim, 128);
         // SMEM: (3*d_model + 2*nh*hd + 128 + 128 + 2 + 128) * 4.
         let expected = (3 * 512 + 2 * 512 + 128 + 128 + 2 + 128) * 4;
         assert_eq!(meta.smem_bytes, expected);
-        assert!(ptx.contains(&format!(".shared .align 4 .b8 cfie_blk_smem[{}];", expected)));
+        assert!(ptx.contains(&format!("[{}];", expected)), "one static shared block of {expected} bytes");
+    }
+
+    #[test]
+    fn smem_bytes_is_what_emit_declares_and_answers_past_the_cap() {
+        let cfg = paper_cfg();
+        assert_eq!(smem_bytes(&cfg), emit(&cfg).1.smem_bytes);
+        // serve asks before emitting: a footprint past 48 KB is answered,
+        // not refused (d_model 4096: 3 * 16 KB of residual rows alone).
+        let big = DecodeBlockConfig { d_model: 4096, ..paper_cfg() };
+        assert!(smem_bytes(&big) > 48 * 1024);
+    }
+
+    #[test]
+    fn module_targets_the_kir_floor_after_the_header() {
+        let ptx = emit_decode_block_ptx(&paper_cfg());
+        assert!(ptx.starts_with("//"));
+        let directives: Vec<&str> = ptx
+            .lines()
+            .filter(|l| l.starts_with(".version") || l.starts_with(".target") || l.starts_with(".address_size"))
+            .collect();
+        assert_eq!(directives.len(), 3, "{directives:?}");
+        assert!(directives[1].starts_with(".target sm_70"), "{directives:?}");
+        assert_eq!(directives[2], ".address_size 64");
     }
 
     #[test]
@@ -1103,8 +1137,15 @@ mod tests {
         assert!(ptx.contains("sin.approx.f32"));
         assert!(ptx.contains("cos.approx.f32"));
         assert!(ptx.contains("ex2.approx.f32"));
+        let ir = build(&paper_cfg());
+        let count = |f: fn(&KirOp) -> bool| ops(&ir).into_iter().filter(|op| f(op)).count();
+        // RoPE's frequency (the Q and K pair loops) and silu's sigmoid are
+        // bare 2^x; the softmax's two exponentials are e^x.
+        assert_eq!(count(|op| matches!(op, KirOp::Exp2(..))), 3);
+        assert_eq!(count(|op| matches!(op, KirOp::Exp(..))), 2);
+        assert_eq!(count(|op| matches!(op, KirOp::Sin(..))), 2);
         // seq_len derives from pos, not a separate param.
-        assert!(ptx.contains("add.u32 %r_sl, %r_pos, 1;"));
+        assert!(!ir.params.iter().any(|p| p.name == "seq_len"));
     }
 
     #[test]
@@ -1162,7 +1203,6 @@ mod tests {
             n_layers: 1,
             rope_theta: 10000.0,
             eps: 0.0,
-            sm_version: 80,
         }
     }
 
@@ -1312,7 +1352,6 @@ mod tests {
             n_layers: 1,
             rope_theta: 10000.0,
             eps: 1e-5,
-            sm_version: 80,
         };
         let d = 8usize;
         let (hd, nh, nkv) = (4usize, 2usize, 1usize);

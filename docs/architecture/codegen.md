@@ -535,7 +535,8 @@ arguments gets a `BB<n>_else` label). `crates/nsl-codegen/tests/kir_block_params
 assembles a grid-stride loop with `ptxas`. The scalar ISA the hand estate
 is made of is first-class too (roadmap A2 step 4): `And`/`Or`/`Xor`/`Not`,
 `Shl`/`Shr` (arithmetic for signed types), `Rem`, `Min`/`Max`,
-`Rcp`/`Rsqrt`, `WarpShuffle { mode: Down | Up | Xor | Idx, width }`,
+`Rcp`/`Rsqrt`, `Exp2` (a bare `ex2.approx.f32`, where `Exp` is `e^x` and
+scales by `log2(e)` first), `WarpShuffle { mode: Down | Up | Xor | Idx, width }`,
 `Vote { Any | All | Ballot }`, `LaneId`/`WarpId`, `LoadVec`/`StoreVec`
 (2 or 4 pointee-typed values), `CastRounded { mode }` beside `Cast`
 (which now prints the rounding modifier PTX requires: `.rn` for a float
@@ -639,6 +640,17 @@ kernel. Its hidden-row load, RMSNorm and row dot are
 replace-min candidate merge, the argmax, the softmax, the nucleus sort and
 cutoff, and the multinomial walk. `tests/cfie_sample_kir_equivalence.rs`
 runs it against `tests/fixtures/cfie_sample_hand.rs`.
+`src/cfie_persistent_ptx.rs::build` is the seventh and last: the persistent
+decode block, one CTA running a whole layer's decode step. Its attention is
+the flash-decode tile loop and output publish (`prefix_pass`,
+`publish_output`) run once per Q head over a `FlashCtx` its head loop
+builds, publishing each head's row to shared rather than global memory; its
+two RMSNorms start with `cfie_spec_sampler_ptx::sum_of_squares_tree`; its
+own sections are the RoPE pair projections (with `KirOp::Exp2`), the f16 KV
+append, the W_o and FFN matvecs and the silu. `smem_bytes` answers its
+static footprint before `emit`, which the verifier refuses past 48 KB.
+`tests/cfie_persistent_kir_equivalence.rs` runs it against
+`tests/fixtures/cfie_persistent_hand.rs`.
 
 **Hand-written PTX emitters (frozen).** `src/flash_attention.rs`
 (`synthesize_flash_attention_ptx`, `synthesize_flash_attention_backward_ptx`),
@@ -649,23 +661,23 @@ runs it against `tests/fixtures/cfie_sample_hand.rs`.
 `src/matmul_mma.rs` (MMA fragment primitives), `src/moe_kernels.rs`,
 `src/wrga_fused_ptx.rs`,
 `src/cpkd_fused_loss.rs`, `src/bitnet/`, `src/pca_rope.rs`,
-`src/pca_tilerange.rs`, `src/cfie_*_ptx.rs` (all but `cfie_grammar_ptx.rs`,
-`cfie_kv_quant_ptx.rs`, `cfie_spec_sampler_ptx.rs`,
-`cfie_speculative_ptx.rs` and `cfie_sample_ptx.rs`),
+`src/pca_tilerange.rs`,
 `src/fusion.rs` (elementwise chains), and the shared preludes
 in `src/kernel_skeleton/` (`header.rs`, `indexing.rs`, `pad.rs`, `params.rs`,
 `smem.rs`) all `push_str` PTX text with hand-numbered registers.
 
 **The freeze (roadmap A2).** `ci/hand-ptx-manifest.txt` lists every file that
-writes PTX into a string (71 members at the 2026-09-02 freeze; 64 today: the
+writes PTX into a string (71 members at the 2026-09-02 freeze; 61 today: the
 codegen files above plus six under `crates/nsl-runtime/src/cuda/` and
 `crates/nsl-runtime/src/flash_attention.rs`; `backend_ptx.rs` is the one
 member that belongs by construction). The list shrinks as A2 migrates
 kernels onto KIR — step 3 retired `src/kernel.rs`, step 7
 `src/precision_cast_ptx.rs` and the PTX text `cuda/precision_cast_kernels.rs`
 used to carry, step 9's first slice `src/cfie_decode_attention.rs` and
-`src/cfie_grammar_ptx.rs`, its second `src/cfie_kv_quant_ptx.rs`, and its
-third `src/cfie_spec_sampler_ptx.rs`.
+`src/cfie_grammar_ptx.rs`, its second `src/cfie_kv_quant_ptx.rs`, its third
+`src/cfie_spec_sampler_ptx.rs`, and the rest of the CFIE files after them
+(`src/cfie_speculative_ptx.rs`, `src/cfie_sample_ptx.rs` and, last,
+`src/cfie_persistent_ptx.rs`).
 `scripts/hand-ptx-freeze.sh --check`
 (membership decided by `scripts/hand-ptx-scan.awk`; `--list`, `--explain`,
 `--write-manifest`, `--self-test`) fails CI (`hand-ptx-freeze` job in

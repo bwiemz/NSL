@@ -917,13 +917,13 @@ impl Compiler<'_> {
                     // constants are numerically wrong.
                     rope_theta: cfg.rope_theta.unwrap_or(10_000.0) as f32,
                     eps: cfg.norm_eps.unwrap_or(1e-5) as f32,
-                    sm_version: gpu.sm_version,
                 };
-                let (ptx, meta) = crate::cfie_persistent_ptx::emit(&blk_cfg);
                 // Static .shared declarations are capped at 48 KB per
-                // CTA; a bigger footprint would fail module load, so
-                // downgrade to plan-level instead of shipping dead PTX.
-                if meta.smem_bytes <= 48 * 1024 {
+                // CTA; a bigger footprint would fail module load (and the
+                // KIR verifier refuses to build it), so downgrade to
+                // plan-level instead of emitting.
+                if crate::cfie_persistent_ptx::smem_bytes(&blk_cfg) <= 48 * 1024 {
+                    let (ptx, meta) = crate::cfie_persistent_ptx::emit(&blk_cfg);
                     // Persistent block: ONE CTA runs one layer's decode
                     // step (grid = 1 by construction, see emitter doc).
                     plan.decode_block_launch = Some(crate::cfie::CfieLaunchSpec {
@@ -1278,15 +1278,14 @@ impl Compiler<'_> {
                 n_layers: dn_layers,
                 rope_theta: cfg.rope_theta.unwrap_or(10_000.0) as f32,
                 eps: cfg.norm_eps.unwrap_or(1e-5) as f32,
-                sm_version: gpu.sm_version,
             };
-            let (dptx, dmeta) = crate::cfie_persistent_ptx::emit(&draft_blk_cfg);
-            if dmeta.smem_bytes > 48 * 1024 {
+            if crate::cfie_persistent_ptx::smem_bytes(&draft_blk_cfg) > 48 * 1024 {
                 return refuse(
                     "the draft decode block's static .shared footprint exceeds \
                      the 48 KB per-CTA cap (shrink draft d_model/d_ff/head_dim)",
                 );
             }
+            let (dptx, dmeta) = crate::cfie_persistent_ptx::emit(&draft_blk_cfg);
             let sampler7_cfg = crate::cfie_spec_sampler_ptx::SpecSamplerConfig {
                 d_model: dd_model,
                 vocab_size: s.vocab_size, // shared vocab

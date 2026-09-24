@@ -299,7 +299,7 @@ pub fn build_verify_attention(cfg: &VerifyAttentionConfig) -> KernelIR {
         };
         let span = TileSpan { first: e.seq_len, tok: draft_tok, scores: scores_draft, tcnt: nodes };
         let (acc, _m, l) = flash_tile(&mut b, c, &span, state, Some(&mask));
-        publish_output(&mut b, c, acc, l, e.out_ptr, row);
+        publish_output(&mut b, c, acc, l, (e.out_ptr, AddressSpace::Global), row);
         // q and scores are reused by the next node.
         b.emit(KirOp::Barrier);
     }

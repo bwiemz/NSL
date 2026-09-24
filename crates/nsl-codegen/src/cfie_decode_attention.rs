@@ -245,7 +245,7 @@ pub(crate) fn load(b: &mut KirBuilder, ty: KirType, addr: VarId, space: AddressS
 /// How one half (K or V) of the pool is read: where its elements start
 /// and how one becomes an f32.
 #[derive(Clone, Copy)]
-struct HalfReader {
+pub(crate) struct HalfReader {
     /// Points at element 0 of the half's addressing: the pool itself for
     /// the uniform layout (the plane offset is then an element index), the
     /// half's own first element for a baked one.
@@ -258,6 +258,26 @@ struct HalfReader {
 }
 
 impl HalfReader {
+    /// The K and V halves of layer `layer_idx` in the uniform f16 pool at
+    /// `kv_base`: K at `layer_idx * 2 * kv_half_stride` elements, V a
+    /// half-stride later. Emitted into the current block.
+    pub(crate) fn uniform_f16(
+        b: &mut KirBuilder,
+        kv_base: VarId,
+        layer_idx: VarId,
+        kv_half_stride: u64,
+    ) -> (HalfReader, HalfReader) {
+        let layer = widen(b, layer_idx);
+        let layer_stride = konst(b, ConstValue::U64(2 * kv_half_stride));
+        let k_plane = op2(b, KirType::U64, KirOp::Mul, layer, layer_stride);
+        let kv_half = konst(b, ConstValue::U64(kv_half_stride));
+        let v_plane = op2(b, KirType::U64, KirOp::Add, k_plane, kv_half);
+        (
+            HalfReader { base: kv_base, plane: Some(k_plane), int8_scale: None },
+            HalfReader { base: kv_base, plane: Some(v_plane), int8_scale: None },
+        )
+    }
+
     fn elem(&self) -> KirType {
         if self.int8_scale.is_some() { KirType::I8 } else { KirType::F16 }
     }
@@ -276,7 +296,7 @@ impl HalfReader {
     }
 
     /// `row` shifted into this half's plane.
-    fn in_plane(&self, b: &mut KirBuilder, row: VarId) -> VarId {
+    pub(crate) fn in_plane(&self, b: &mut KirBuilder, row: VarId) -> VarId {
         match self.plane {
             Some(plane) => op2(b, KirType::U64, KirOp::Add, plane, row),
             None => row,
@@ -398,7 +418,7 @@ pub(crate) fn build_flash_decode(spec: &FlashDecode<'_>) -> KernelIR {
     let row = op2(&mut b, U32, KirOp::Mul, e.head, e.ctx.head_dim);
     load_q_row(&mut b, &e.ctx, e.q_ptr, row);
     let (acc, _m, l) = prefix_pass(&mut b, &e.ctx, e.seq_len);
-    publish_output(&mut b, &e.ctx, acc, l, e.out_ptr, row);
+    publish_output(&mut b, &e.ctx, acc, l, (e.out_ptr, AddressSpace::Global), row);
     b.terminate(KirTerminator::Return);
     b.finalize()
 }
@@ -414,7 +434,8 @@ pub(crate) struct FlashEntry {
 }
 
 /// Values the entry block defines once and every section reads, reaching
-/// each use by dominance.
+/// each use by dominance. A kernel with its own entry (the persistent
+/// decode block) builds one per head, from values its head loop defines.
 pub(crate) struct FlashCtx {
     pub tid: VarId,
     /// u32 `0` and `1`.
@@ -423,19 +444,21 @@ pub(crate) struct FlashCtx {
     /// u32 `head_dim`.
     pub head_dim: VarId,
     /// u64 elements per token record.
-    token_stride: VarId,
+    pub token_stride: VarId,
     /// u32: the slot's first global token.
-    slot_base: VarId,
+    pub slot_base: VarId,
     /// u64: `kv_head`'s row inside one token record.
-    head_off: VarId,
+    pub head_off: VarId,
     /// f32 `1/sqrt(head_dim)`.
-    inv_sqrt_hd: VarId,
-    k_half: HalfReader,
-    v_half: HalfReader,
-    q_smem: VarId,
-    scores: VarId,
-    rescale: VarId,
-    l_smem: VarId,
+    pub inv_sqrt_hd: VarId,
+    pub k_half: HalfReader,
+    pub v_half: HalfReader,
+    /// f32 shared pointers: the Q row the scores read, the score tile, the
+    /// published rescale factor and the published `l`.
+    pub q_smem: VarId,
+    pub scores: VarId,
+    pub rescale: VarId,
+    pub l_smem: VarId,
 }
 
 /// One tile of the flash-decode loop, relative to the slot's first token.
@@ -459,7 +482,7 @@ pub(crate) type ScoreHook<'a> = &'a dyn Fn(&mut KirBuilder, VarId) -> VarId;
 /// Returns with the entry block current and unterminated.
 pub(crate) fn begin_flash_decode(spec: &FlashDecode<'_>) -> (KirBuilder, FlashEntry) {
     use AddressSpace::{Global, Shared};
-    use KirType::{F32, U32, U64};
+    use KirType::{F32, U32};
 
     let token_stride_elems = spec.n_kv_heads as u64 * spec.head_dim as u64;
     let hd = spec.head_dim;
@@ -511,15 +534,7 @@ pub(crate) fn begin_flash_decode(spec: &FlashDecode<'_>) -> (KirBuilder, FlashEn
         (PoolLayout::UniformF16, Some(layer_idx), None) => {
             // K plane of this layer, and V = K + kv_half_stride (elements).
             let kv_half_stride = spec.max_slots as u64 * spec.per_slot_max_tokens as u64 * token_stride_elems;
-            let layer = widen(&mut b, layer_idx);
-            let layer_stride = konst(&mut b, ConstValue::U64(2 * kv_half_stride));
-            let k_plane = op2(&mut b, U64, KirOp::Mul, layer, layer_stride);
-            let kv_half = konst(&mut b, ConstValue::U64(kv_half_stride));
-            let v_plane = op2(&mut b, U64, KirOp::Add, k_plane, kv_half);
-            (
-                HalfReader { base: kv_base, plane: Some(k_plane), int8_scale: None },
-                HalfReader { base: kv_base, plane: Some(v_plane), int8_scale: None },
-            )
+            HalfReader::uniform_f16(&mut b, kv_base, layer_idx, kv_half_stride)
         }
         (PoolLayout::Baked { k, v }, None, Some((k_scale, v_scale))) => {
             // Each half's first element: kv_base + its baked byte offset,
@@ -834,10 +849,19 @@ pub(crate) fn flash_tile(
 
 /// Thread 0 publishes `l`; after a barrier, thread `d < head_dim` stores
 /// `out[row + d] = acc / l` (0 when `l` is not positive, so an empty
-/// prefix writes 0 rather than NaN). Terminates the current block and
-/// returns with a fresh block, where every path meets, current.
-pub(crate) fn publish_output(b: &mut KirBuilder, c: &FlashCtx, acc: VarId, l: VarId, out_ptr: VarId, row: VarId) {
-    use AddressSpace::{Global, Shared};
+/// prefix writes 0 rather than NaN). `out_ptr` points at f32 in
+/// `out_space`: global for the attention kernels, shared for the
+/// persistent decode block's attention-output rows. Terminates the current
+/// block and returns with a fresh block, where every path meets, current.
+pub(crate) fn publish_output(
+    b: &mut KirBuilder,
+    c: &FlashCtx,
+    acc: VarId,
+    l: VarId,
+    (out_ptr, out_space): (VarId, AddressSpace),
+    row: VarId,
+) {
+    use AddressSpace::Shared;
     use KirType::{F32, U32};
 
     let l_store = b.new_block();
@@ -876,8 +900,8 @@ pub(crate) fn publish_output(b: &mut KirBuilder, c: &FlashCtx, acc: VarId, l: Va
 
     b.set_block(store_out);
     let out_index = op2(b, U32, KirOp::Add, row, c.tid);
-    let out_addr = at(b, F32, Global, out_ptr, out_index);
-    b.emit(KirOp::Store(out_addr, o, Global));
+    let out_addr = at(b, F32, out_space, out_ptr, out_index);
+    b.emit(KirOp::Store(out_addr, o, out_space));
     b.terminate(KirTerminator::Branch(KirEdge::to(done)));
 
     b.set_block(done);

@@ -443,6 +443,9 @@ pub enum KirOp {
     Rcp(VarId, VarId),
     /// `dst = 1 / sqrt(src)` (`rsqrt.approx`).
     Rsqrt(VarId, VarId),
+    /// `dst = 2^src` on `F32` (`ex2.approx.f32`), with no pre-scaling:
+    /// `Exp` is `e^src` and multiplies by `log2(e)` first.
+    Exp2(VarId, VarId),
     /// A conversion with an explicit rounding mode; `Cast` picks the
     /// default (`Rn` for anything that can round, `Rzi` for float → int).
     CastRounded { dst: VarId, src: VarId, ty: KirType, mode: RoundMode },

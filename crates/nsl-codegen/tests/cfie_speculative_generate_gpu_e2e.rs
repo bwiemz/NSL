@@ -126,7 +126,6 @@ fn block_cfg(per_slot: usize, max_slots: usize) -> DecodeBlockConfig {
         n_layers: N_LAYERS as u32,
         rope_theta: 10000.0,
         eps: 1e-5,
-        sm_version: 80, // driver JITs sm_80 PTX forward to the local Blackwell
     }
 }
 
