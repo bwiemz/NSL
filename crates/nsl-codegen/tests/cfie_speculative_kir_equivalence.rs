@@ -187,7 +187,7 @@ fn run(ptx: &str, case: &Case, order: Order) -> Vec<Vec<u8>> {
     .map(|(k, v)| (k.to_string(), v))
     .collect();
     let mut launch =
-        Launch { prog: &prog, args: &args, global: &mut global, shared: vec![], ctaid: 0, ntid: BLOCK, steps: 0 };
+        Launch { prog: &prog, args: &args, global: &mut global, shared: vec![], ctaid: 0, ctaid_y: 0, ntid: BLOCK, steps: 0 };
     run_cta(&mut launch, order);
     global.into_iter().map(|s| s.bytes).collect()
 }
@@ -473,7 +473,7 @@ fn the_interpreter_models_the_new_integer_forms() {
     let prog = parse(ptx);
     let mut global = vec![Segment { base: 0x100, bytes: vec![0; 12] }];
     let args: HashMap<String, u64> = [("o".to_string(), 0x100)].into_iter().collect();
-    let mut launch = Launch { prog: &prog, args: &args, global: &mut global, shared: vec![], ctaid: 0, ntid: 1, steps: 0 };
+    let mut launch = Launch { prog: &prog, args: &args, global: &mut global, shared: vec![], ctaid: 0, ctaid_y: 0, ntid: 1, steps: 0 };
     run_cta(&mut launch, Order::Ascending);
     let w = |i: usize| u32::from_le_bytes(global[0].bytes[4 * i..4 * i + 4].try_into().unwrap());
     // 1 << 64 is 0; (x >> 63) ^ x = 1 ^ 0x8000000000000001, low word 0.

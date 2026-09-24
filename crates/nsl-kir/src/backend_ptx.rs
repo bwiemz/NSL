@@ -12,6 +12,106 @@ use std::fmt::Write;
 
 /// Lower a KernelIR to PTX text bytes (null-terminated).
 pub fn lower_kir_to_ptx(ir: &KernelIR) -> Vec<u8> {
+    lower_kir_module_to_ptx(&[ir])
+}
+
+/// Lower several kernels into one PTX module (null-terminated): one
+/// `.version`/`.target` header covering every kernel's features, the
+/// shared-memory block declared once, then each entry in order.
+///
+/// Roadmap A2 step 10: the fused linear-CE large-vocab forward is two
+/// kernels (per-tile partials, per-row finalize) the launcher loads as one
+/// module. For a single kernel the text is exactly
+/// [`lower_kir_to_ptx`]'s.
+///
+/// # Panics
+///
+/// If `irs` is empty, or two kernels declare different shared blocks:
+/// both would be the module-scope symbol `shared_mem`.
+pub fn lower_kir_module_to_ptx(irs: &[&KernelIR]) -> Vec<u8> {
+    assert!(!irs.is_empty(), "a PTX module needs at least one kernel");
+    let has = |f: FeatureSet| irs.iter().any(|ir| ir.required_features.contains(f));
+    let mut ptx = String::new();
+
+    // Header. `cp.async` (FeatureSet::ASYNC_COPY) is an sm_80 instruction;
+    // every other op lowers on sm_70, the floor this backend has always
+    // targeted, so the bump is taken only when a kernel asks for it.
+    // A bf16 conversion (FeatureSet::BF16_ARITHMETIC) is PTX ISA 7.8 and
+    // sm_80 as well (roadmap A2 step 4).
+    let bf16 = has(FeatureSet::BF16_ARITHMETIC);
+    writeln!(ptx, ".version {}", if bf16 { "7.8" } else { "7.0" }).unwrap();
+    // The tensor-core ops (`ldmatrix`, `mma.sync` m16n8k16 f16) are sm_80
+    // instructions as well.
+    let target = if has(FeatureSet::ASYNC_COPY) || has(FeatureSet::TENSOR_CORES) || bf16 {
+        "sm_80"
+    } else {
+        "sm_70"
+    };
+    writeln!(ptx, ".target {}", target).unwrap();
+    writeln!(ptx, ".address_size 64").unwrap();
+    writeln!(ptx).unwrap();
+
+    let mut declared: Option<(String, &str)> = None;
+    for ir in irs {
+        if let Some(decl) = shared_decl(ir) {
+            match &declared {
+                None => {
+                    ptx.push_str(&decl);
+                    writeln!(ptx).unwrap();
+                    declared = Some((decl, &ir.name));
+                }
+                Some((first, owner)) => assert!(
+                    *first == decl,
+                    "`{}` and `{owner}` declare different shared blocks in one module",
+                    ir.name
+                ),
+            }
+        }
+    }
+
+    for (i, ir) in irs.iter().enumerate() {
+        if i > 0 {
+            writeln!(ptx).unwrap();
+        }
+        ptx.push_str(&print_entry(ir));
+    }
+
+    // Null-terminate
+    let mut bytes = ptx.into_bytes();
+    bytes.push(0);
+    bytes
+}
+
+/// The declaration of `ir`'s shared-memory block (with its newline), if it
+/// has one.
+fn shared_decl(ir: &KernelIR) -> Option<String> {
+    // The flat block and a region layout are alternatives (rule 8 refuses
+    // both); either way the block is the one symbol `shared_mem` that
+    // `SharedBase` and `SharedRegion` address.
+    if ir.shared_mem_bytes > 0 {
+        return Some(format!(".shared .align 4 .b8 shared_mem[{}];\n", ir.shared_mem_bytes));
+    }
+    if ir.smem_layout.regions.is_empty() {
+        return None;
+    }
+    // Roadmap A2 step 9: the first region-layout kernel to reach the
+    // printer (CFIE decode attention) found this branch missing — the
+    // `SharedRegion` arm named `shared_mem` and nothing declared it.
+    // The block is aligned to the strictest region, since `offset_of`
+    // aligns each region relative to the block's start.
+    let align = ir.smem_layout.regions.iter().map(|r| r.align.max(1)).max().unwrap_or(1);
+    Some(if ir.smem_layout.dynamic {
+        format!(".extern .shared .align {} .b8 shared_mem[];\n", align)
+    } else {
+        // Rule 8 has already refused a layout whose size overflows;
+        // `unwrap_or(0)` keeps the printer total for an unverified one.
+        let total = ir.smem_layout.total_bytes().unwrap_or(0);
+        format!(".shared .align {} .b8 shared_mem[{}];\n", align, total)
+    })
+}
+
+/// One `.visible .entry`, from its declaration to its closing brace.
+fn print_entry(ir: &KernelIR) -> String {
     // Roadmap A2 step 5: the body is printed first with virtual
     // `%<class><VarId>` names, the allocator (`crate::regalloc`) renames
     // them to dense per-class indices, and the header's `.reg` declarations
@@ -109,56 +209,6 @@ pub fn lower_kir_to_ptx(ir: &KernelIR) -> Vec<u8> {
 
     let mut ptx = String::new();
 
-    // Header. `cp.async` (FeatureSet::ASYNC_COPY) is an sm_80 instruction;
-    // every other op lowers on sm_70, the floor this backend has always
-    // targeted, so the bump is taken only when a kernel asks for it.
-    // A bf16 conversion (FeatureSet::BF16_ARITHMETIC) is PTX ISA 7.8 and
-    // sm_80 as well (roadmap A2 step 4).
-    let bf16 = ir.required_features.contains(FeatureSet::BF16_ARITHMETIC);
-    writeln!(ptx, ".version {}", if bf16 { "7.8" } else { "7.0" }).unwrap();
-    // The tensor-core ops (`ldmatrix`, `mma.sync` m16n8k16 f16) are sm_80
-    // instructions as well.
-    let target = if ir.required_features.contains(FeatureSet::ASYNC_COPY)
-        || ir.required_features.contains(FeatureSet::TENSOR_CORES)
-        || bf16
-    {
-        "sm_80"
-    } else {
-        "sm_70"
-    };
-    writeln!(ptx, ".target {}", target).unwrap();
-    writeln!(ptx, ".address_size 64").unwrap();
-    writeln!(ptx).unwrap();
-
-    // Shared memory declaration. The flat block and a region layout are
-    // alternatives (rule 8 refuses both); either way the block is the one
-    // symbol `shared_mem` that `SharedBase` and `SharedRegion` address.
-    if ir.shared_mem_bytes > 0 {
-        writeln!(
-            ptx,
-            ".shared .align 4 .b8 shared_mem[{}];",
-            ir.shared_mem_bytes
-        )
-        .unwrap();
-        writeln!(ptx).unwrap();
-    } else if !ir.smem_layout.regions.is_empty() {
-        // Roadmap A2 step 9: the first region-layout kernel to reach the
-        // printer (CFIE decode attention) found this branch missing — the
-        // `SharedRegion` arm named `shared_mem` and nothing declared it.
-        // The block is aligned to the strictest region, since `offset_of`
-        // aligns each region relative to the block's start.
-        let align = ir.smem_layout.regions.iter().map(|r| r.align.max(1)).max().unwrap_or(1);
-        if ir.smem_layout.dynamic {
-            writeln!(ptx, ".extern .shared .align {} .b8 shared_mem[];", align).unwrap();
-        } else {
-            // Rule 8 has already refused a layout whose size overflows;
-            // `unwrap_or(0)` keeps the printer total for an unverified one.
-            let total = ir.smem_layout.total_bytes().unwrap_or(0);
-            writeln!(ptx, ".shared .align {} .b8 shared_mem[{}];", align, total).unwrap();
-        }
-        writeln!(ptx).unwrap();
-    }
-
     // Entry point
     write!(ptx, ".visible .entry {}(", ir.name).unwrap();
     for (i, param) in ir.params.iter().enumerate() {
@@ -238,11 +288,7 @@ pub fn lower_kir_to_ptx(ir: &KernelIR) -> Vec<u8> {
 
     ptx.push_str(&body);
     writeln!(ptx, "}}").unwrap();
-
-    // Null-terminate
-    let mut bytes = ptx.into_bytes();
-    bytes.push(0);
-    bytes
+    ptx
 }
 
 /// Roadmap A2 step 5: rename every virtual `%<class><VarId>` register in
@@ -1362,6 +1408,81 @@ mod tests {
         let sized_at_launch = print(true);
         assert!(sized_at_launch.contains(".extern .shared .align 16 .b8 shared_mem[];\n"), "{sized_at_launch}");
         assert!(!sized_at_launch.contains("shared_mem[80]"), "{sized_at_launch}");
+    }
+
+    /// A kernel that only returns, with an optional dynamic shared region
+    /// and optionally a bf16 conversion.
+    fn bare_kernel(name: &str, shared: bool, bf16: bool) -> KernelIR {
+        let mut b = KirBuilder::new(name);
+        if shared {
+            b.set_smem_layout(SmemLayout {
+                regions: vec![SmemRegion { name: "t".into(), bytes: 64, align: 4, elem: KirType::F32 }],
+                dynamic: true,
+            });
+        }
+        let entry = b.new_block();
+        b.set_block(entry);
+        if bf16 {
+            let f = b.new_typed_var(KirType::F32);
+            b.emit(KirOp::Const(f, KirConst { ty: KirType::F32, value: ConstValue::F32(1.0) }));
+            let h = b.new_typed_var(KirType::Bf16);
+            b.emit(KirOp::Cast(h, f, KirType::Bf16));
+        }
+        b.terminate(KirTerminator::Return);
+        b.finalize()
+    }
+
+    fn module_text(irs: &[&KernelIR]) -> String {
+        let bytes = lower_kir_module_to_ptx(irs);
+        assert_eq!(bytes.last(), Some(&0));
+        String::from_utf8(bytes[..bytes.len() - 1].to_vec()).unwrap()
+    }
+
+    #[test]
+    fn test_module_of_one_kernel_is_that_kernels_ptx() {
+        for (shared, bf16) in [(false, false), (true, false), (true, true)] {
+            let ir = bare_kernel("one", shared, bf16);
+            assert_eq!(lower_kir_module_to_ptx(&[&ir]), lower_kir_to_ptx(&ir));
+        }
+    }
+
+    #[test]
+    fn test_module_of_two_kernels_has_one_header_and_one_shared_block() {
+        // Roadmap A2 step 10: the fused linear-CE large-vocab pair. Only the
+        // second kernel converts to bf16; the header covers it.
+        let a = bare_kernel("kernel_a", true, false);
+        let b = bare_kernel("kernel_b", false, true);
+        let ptx = module_text(&[&a, &b]);
+        assert!(ptx.starts_with(".version 7.8\n.target sm_80\n.address_size 64\n\n"), "{ptx}");
+        assert_eq!(ptx.matches(".version").count(), 1);
+        assert_eq!(ptx.matches(".extern .shared .align 4 .b8 shared_mem[];").count(), 1);
+        let (at_a, at_b) = (ptx.find(".visible .entry kernel_a(").unwrap(), ptx.find(".visible .entry kernel_b(").unwrap());
+        assert!(ptx.find("shared_mem[]").unwrap() < at_a && at_a < at_b, "{ptx}");
+        // Each entry is exactly what it prints alone, past the header.
+        for ir in [&a, &b] {
+            let alone = module_text(&[ir]);
+            let entry = &alone[alone.find(".visible .entry ").unwrap()..];
+            assert!(ptx.contains(entry), "{ptx}");
+        }
+        // Two kernels with the same shared block share its declaration.
+        let a2 = bare_kernel("kernel_a2", true, false);
+        assert_eq!(module_text(&[&a, &a2]).matches("shared_mem[]").count(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "declare different shared blocks")]
+    fn test_module_refuses_two_different_shared_blocks() {
+        let a = bare_kernel("kernel_a", true, false);
+        let mut b = KirBuilder::new("kernel_b");
+        b.set_smem_layout(SmemLayout {
+            regions: vec![SmemRegion { name: "u".into(), bytes: 64, align: 16, elem: KirType::F32 }],
+            dynamic: true,
+        });
+        let entry = b.new_block();
+        b.set_block(entry);
+        b.terminate(KirTerminator::Return);
+        let b = b.finalize();
+        lower_kir_module_to_ptx(&[&a, &b]);
     }
 
     #[test]

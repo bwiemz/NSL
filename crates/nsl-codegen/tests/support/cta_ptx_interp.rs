@@ -31,7 +31,9 @@
 //! after the static blocks, and its size is what the launch allocates past
 //! them (`Program::shared_bytes` counts the static blocks only).
 //! `.s64` values are two's-complement bit patterns in a register, and a
-//! negative decimal immediate is read as one.
+//! negative decimal immediate is read as one; `add`, `sub` and `mul.lo` on
+//! them are the unsigned operations, which give the same bits.
+//! `%ctaid.y` is modelled for a two-dimensional grid.
 //!
 //! Shifts follow PTX: `shl` and the unsigned `shr` take their amount from
 //! the low 32 bits of the operand and produce 0 for an amount at or past
@@ -56,6 +58,7 @@ pub(crate) const SHARED_BASE: u64 = 0x100;
 pub(crate) enum Special {
     TidX,
     CtaidX,
+    CtaidY,
     NtidX,
 }
 
@@ -217,6 +220,7 @@ impl Parser {
         match tok {
             "%tid.x" => return Src::Special(Special::TidX),
             "%ctaid.x" => return Src::Special(Special::CtaidX),
+            "%ctaid.y" => return Src::Special(Special::CtaidY),
             "%ntid.x" => return Src::Special(Special::NtidX),
             _ => {}
         }
@@ -365,7 +369,9 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 Op::Mov { d: p.dst(ops[0]), s: p.src(ops[1]), w }
             }
             [name @ ("add" | "sub" | "div" | "rem" | "min"), ty @ ("u32" | "u64")]
-            | [name @ "mul", "lo", ty @ ("u32" | "u64")] => {
+            | [name @ "mul", "lo", ty @ ("u32" | "u64")]
+            | [name @ ("add" | "sub"), ty @ "s64"]
+            | [name @ "mul", "lo", ty @ "s64"] => {
                 want(3);
                 let op = match *name {
                     "add" => IntOp::Add,
@@ -597,6 +603,8 @@ pub(crate) struct Launch<'a> {
     pub(crate) global: &'a mut [Segment],
     pub(crate) shared: Vec<u8>,
     pub(crate) ctaid: u32,
+    /// `%ctaid.y`: 0 for a one-dimensional grid.
+    pub(crate) ctaid_y: u32,
     pub(crate) ntid: u32,
     pub(crate) steps: u64,
 }
@@ -638,6 +646,7 @@ pub(crate) fn read(prog: &Program, t: &Thread, launch: &Launch, tid: u32, s: Src
         Src::Imm(v) => v,
         Src::Special(Special::TidX) => tid as u64,
         Src::Special(Special::CtaidX) => launch.ctaid as u64,
+        Src::Special(Special::CtaidY) => launch.ctaid_y as u64,
         Src::Special(Special::NtidX) => launch.ntid as u64,
     }
 }

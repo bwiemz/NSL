@@ -216,6 +216,7 @@ fn run(ptx: &str, c: &Case, input: &Inputs, order: Order) -> Vec<Vec<u8>> {
         // thread wrote this launch shows in the output.
         shared: vec![0xFF; prog.shared_bytes],
         ctaid: 0,
+        ctaid_y: 0,
         ntid: BLOCK,
         steps: 0,
     };

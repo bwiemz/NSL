@@ -204,6 +204,7 @@ fn run(ptx: &str, c: &Case, input: &Inputs, order: Order) -> Vec<Vec<u8>> {
             // shared memory no thread wrote this launch shows.
             shared: vec![0xFF; shared_len],
             ctaid,
+            ctaid_y: 0,
             ntid: BLOCK,
             steps: 0,
         };

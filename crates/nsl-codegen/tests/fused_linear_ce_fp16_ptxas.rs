@@ -220,8 +220,9 @@ fn fp16_large_vocab_two_kernel_module_assembles_for_sm80_at_v49152() {
     assert!(txt.contains("cvt.f32.f16"));
     // Kernel A's partials write MUST stay f32 (per design — cross-CTA LSE
     // accuracy). Search for the canonical f32 partials store.
+    let partials_kernel = &txt[..txt.find(&cfg.large_finalize_kernel_name()).unwrap()];
     assert!(
-        txt.contains("st.global.f32 [%rd5],   %ftmax;"),
+        partials_kernel.contains("st.global.f32 ") && !partials_kernel.contains("st.global.b16"),
         "Kernel A partials MUST stay f32 (numerical robustness)"
     );
 
@@ -276,13 +277,14 @@ fn fp16_intermediate_scale_assembles_for_sm80_at_v16384() {
 // fixture used cleanly-divisible vocab (vocab % vocab_tile == 0), so no
 // tail slot was ever exercised by a tile that also held real logits.
 //
-// The fix branches around the cvt and writes the fp16 -INF bit-pattern
-// (`0xFC00`) directly via `mov.b16 %h2, 0xFC00 ; st.shared.b16 …`.
+// The fix branched around the cvt and wrote the fp16 -INF bit-pattern
+// (`0xFC00`) directly via `mov.b16 %h2, 0xFC00 ; st.shared.b16 …`. The
+// KIR kernel (roadmap A2 step 10) instead converts the true f32 -INF,
+// which the cvt maps to `0xFC00` exactly.
 //
 // This regression test asserts:
-//   1. The fixed sentinel pattern is structurally present.
-//   2. The old broken pattern (`mov.f32 %facc, 0f80800000` immediately
-//      before a fall-through into the cvt-store path) is GONE.
+//   1. The tail lanes carry the true f32 -INF through the cvt.
+//   2. The old broken pattern (`0f80800000`) is GONE.
 //   3. The kernel still assembles via ptxas.
 //
 // Non-divisor vocab is also accepted by the kernel — V=49153 produces
@@ -293,7 +295,7 @@ fn fp16_intermediate_scale_assembles_for_sm80_at_v16384() {
 // future GPU runs can pick this fixture up unchanged.
 
 #[test]
-fn fp16_large_vocab_tail_zero_writes_fp16_neg_inf_directly() {
+fn fp16_large_vocab_tail_lanes_hold_fp16_neg_inf() {
     let cfg = FusedLinearCEConfig {
         vocab_size: 49153,
         hidden_size: 128,
@@ -311,17 +313,6 @@ fn fp16_large_vocab_tail_zero_writes_fp16_neg_inf_directly() {
     let ptx = synthesize_fused_linear_ce_ptx(&cfg);
     let txt = std::str::from_utf8(&ptx).expect("PTX must be ASCII");
 
-    // (1) Direct fp16 -INF write at the tail-zero label.
-    assert!(
-        txt.contains("LP_INNER_TAIL_ZERO:"),
-        "Large-vocab fp16 partials must keep the LP_INNER_TAIL_ZERO label"
-    );
-    assert!(
-        txt.contains("mov.b16 %h2, 0xFC00"),
-        "Tail-zero branch MUST write fp16 -INF (0xFC00) directly — the \
-         previous f32 sentinel `0f80800000` was -1.175e-38, NOT -INF, \
-         and cvt'd to fp16 0x0000 (Finding 2)"
-    );
     // (2) The broken pattern must be GONE from the F16 large-vocab
     // partials kernel.  Search restricted: scope to the partials
     // kernel by anchoring on the kernel name and stopping at the
@@ -340,6 +331,26 @@ fn fp16_large_vocab_tail_zero_writes_fp16_neg_inf_directly() {
         .map(|off| partials_start + off)
         .unwrap_or(txt.len());
     let partials_section = &txt[partials_start..partials_end];
+    // (1) The tail lanes hold fp16 -INF. Since roadmap A2 step 10 the
+    // partials kernel is KIR: a lane past the vocab carries the f32 -INF
+    // (`0fFF800000`, never the old `0f80800000`) into the same
+    // `cvt.rn.f16.f32` the real logits take, and converting an infinity
+    // is exact, so the shared tile holds 0xFC00.
+    // `tests/fused_linear_ce_large_kir_equivalence.rs` runs the kernel on
+    // ragged tiles against the hand kernel that wrote 0xFC00 directly, and
+    // catches a finite tail (`a_finite_tail_is_caught`).
+    assert_eq!(half::f16::from_f32(f32::NEG_INFINITY).to_bits(), 0xFC00);
+    assert!(
+        partials_section
+            .lines()
+            .any(|l| l.trim_start().starts_with("mov.f32 %f") && l.ends_with(", 0fFF800000;")),
+        "the tail lanes MUST carry the f32 -INF 0fFF800000 into the cvt"
+    );
+    assert!(partials_section.contains("cvt.rn.f16.f32 "));
+    assert!(
+        !partials_section.contains("st.shared.f32"),
+        "the shared tile MUST hold fp16, so the tail's -INF goes through the cvt"
+    );
     assert!(
         !partials_section.contains("mov.f32 %facc, 0f80800000"),
         "Partials kernel must NOT mov 0f80800000 into %facc — that was \

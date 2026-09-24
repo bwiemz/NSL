@@ -9,7 +9,7 @@
 //!
 //! ## Path exercised
 //! V=49152 routes through `synthesize_large_vocab_forward_ptx`
-//! (`emit_large_partials_kernel_bf16` + `emit_large_finalize_kernel_bf16`),
+//! (`build_large_partials` + `build_large_finalize` at `Dtype::Bf16`),
 //! launched via `nsl_fused_linear_ce_forward_large` with `dtype_tag = 2`
 //! (Bf16). Backward kernel is shared with the v1 path —
 //! `emit_bwd_kernel_bf16` — scanning num_tiles=384 tiles per row, launched
@@ -59,9 +59,9 @@
 //!     f32 registers).  The accumulator chain itself does NOT lose
 //!     mantissa precision at bf16 rates.
 //!   - BUT the per-tile **logit cache in SMEM** is rounded back to bf16
-//!     via `cvt.rn.bf16.f32 %h2, %facc; st.shared.b16` at
-//!     `crates/nsl-codegen/src/fused_linear_ce.rs:3199-3205` (LP_INNER_STORE).
-//!     The reduction loops (`LP_RED_MAX`, `LP_RED_SUM`) then load it back
+//!     via `cvt.rn.bf16.f32; st.shared.b16` in Kernel A's tile fill
+//!     (`build_large_partials` in `crates/nsl-codegen/src/fused_linear_ce.rs`).
+//!     The reduction scans (tile max, tile sum) then load it back
 //!     via `cvt.f32.bf16`, so the max / sum-exp reductions DO see
 //!     bf16-truncated logit values.  This is the 8×-vs-fp16 per-event
 //!     penalty source.
