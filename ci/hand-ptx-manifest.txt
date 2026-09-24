@@ -12,7 +12,6 @@ crates/nsl-codegen/src/bitnet/phases/absmean_quant.rs
 crates/nsl-codegen/src/bitnet/phases/finalize.rs
 crates/nsl-codegen/src/bitnet/phases/packed_load.rs
 crates/nsl-codegen/src/bitnet/phases/ternary_gemm.rs
-crates/nsl-codegen/src/cpkd_fused_loss.rs
 crates/nsl-codegen/src/flash_attention.rs
 crates/nsl-codegen/src/flash_attention_v2/mma_forward.rs
 crates/nsl-codegen/src/flash_attention_v2/mod.rs

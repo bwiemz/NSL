@@ -663,7 +663,11 @@ declared once) and proved by `tests/fused_linear_ce_large_kir_equivalence.rs`.
 The backward, `build_backward`, scatters its gradients with `KirOp::AtomicAdd`
 (printed as `red.global.add.f32`) and is proved by
 `tests/fused_linear_ce_bwd_kir_equivalence.rs`, which runs the atomics in the
-schedule's order.
+schedule's order. `src/cpkd_fused_loss.rs` (the KL-CE distillation loss) is
+KIR the same way: `build_forward` keeps a student and a teacher tile in one
+dynamic `SmemLayout` and three online-softmax families, `build_backward`
+scatters the student's gradients only; `tests/cpkd_fused_loss_kir_equivalence.rs`
+proves both against `tests/fixtures/cpkd_fused_loss_hand.rs`.
 
 **Hand-written PTX emitters (frozen).** `src/flash_attention.rs`
 (`synthesize_flash_attention_ptx`, `synthesize_flash_attention_backward_ptx`),
@@ -672,14 +676,14 @@ schedule's order.
 `src/flash_attention_selector.rs`,
 `src/matmul_mma.rs` (MMA fragment primitives), `src/moe_kernels.rs`,
 `src/wrga_fused_ptx.rs`,
-`src/cpkd_fused_loss.rs`, `src/bitnet/`, `src/pca_rope.rs`,
+`src/bitnet/`, `src/pca_rope.rs`,
 `src/pca_tilerange.rs`,
 `src/fusion.rs` (elementwise chains), and the shared preludes
 in `src/kernel_skeleton/` (`header.rs`, `indexing.rs`, `pad.rs`, `params.rs`,
 `smem.rs`) all `push_str` PTX text with hand-numbered registers.
 
 **The freeze (roadmap A2).** `ci/hand-ptx-manifest.txt` lists every file that
-writes PTX into a string (71 members at the 2026-09-02 freeze; 60 today: the
+writes PTX into a string (71 members at the 2026-09-02 freeze; 59 today: the
 codegen files above plus six under `crates/nsl-runtime/src/cuda/` and
 `crates/nsl-runtime/src/flash_attention.rs`; `backend_ptx.rs` is the one
 member that belongs by construction). The list shrinks as A2 migrates
@@ -689,8 +693,8 @@ used to carry, step 9's first slice `src/cfie_decode_attention.rs` and
 `src/cfie_grammar_ptx.rs`, its second `src/cfie_kv_quant_ptx.rs`, its third
 `src/cfie_spec_sampler_ptx.rs`, and the rest of the CFIE files after them
 (`src/cfie_speculative_ptx.rs`, `src/cfie_sample_ptx.rs` and, last,
-`src/cfie_persistent_ptx.rs`), and step 10's third slice
-`src/fused_linear_ce.rs`.
+`src/cfie_persistent_ptx.rs`), and step 10's loss heads
+`src/fused_linear_ce.rs` and `src/cpkd_fused_loss.rs`.
 `scripts/hand-ptx-freeze.sh --check`
 (membership decided by `scripts/hand-ptx-scan.awk`; `--list`, `--explain`,
 `--write-manifest`, `--self-test`) fails CI (`hand-ptx-freeze` job in

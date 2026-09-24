@@ -674,6 +674,41 @@ frozen throughout, so nothing here blocks a kernel fix.
     equivalent mutant is named: one more trip of the tile loop starts past
     the vocab, where the guard turns every lane away. Registers match or
     beat the hand kernel's (28–40 against 32–40, no spills).
+
+    **`cpkd_fused_loss.rs` done**; the step's second loss head has left the
+    freeze too (manifest 60 → 59). The KL-CE distillation forward and
+    backward are f32 only, so each is one builder with no dtype axis.
+    `build_forward` holds the student and teacher logit tiles and the
+    student's logit-at-target in one dynamic `SmemLayout` at the hand
+    kernel's offsets and carries seven running values through the tile loop
+    (three online-softmax families, the teacher's with its KL cross-term).
+    Its scans stop at the vocab at the top and at the tile at the bottom, as
+    the hand scans did. `build_backward` reuses the fused linear-CE
+    backward's shape with a second dot and three probabilities, and
+    scatters the student's gradients only, so the ABI still has no
+    teacher-gradient output (invariant I-11). The interpreter learned
+    `rcp.approx.f32` (the reciprocal of the temperature), modelled as an
+    exact `1 / x`. The gate runs both kernels, hand and KIR, under two
+    schedules and requires the same bits: the loss and three LSEs, then
+    `dx_s` (pre-filled), `dW_s` and `dbias_s`. It checks them against the
+    crate's own f64 references (`reference_forward_f64`,
+    `reference_backward_f64`) and catches:
+    - every barrier and every scatter deleted;
+    - every guard relaxed and every loop run one trip long, but those
+      named below;
+    - every baked constant nudged (vocab, both hiddens, tile width, tile
+      count, lanes per thread, the ignore index, the `1` in `1 - alpha`);
+    - the `-inf` seeding the maxima replaced by 0. Shared inputs keep every
+      tile's max positive, so a 0 seed never wins a `max`; that mutation is
+      judged on inputs whose logits are all negative.
+
+    Three mutants are equivalent and named. Relaxing either kernel's tile
+    loop adds a trip that starts past the vocab. Relaxing the forward max
+    scan's vocab guard reads a lane an earlier tile wrote, which the running
+    maxima already cover. The max scan's tile bound is caught, since the
+    lane past the student tile is the teacher tile's first. KIR uses 28–33
+    registers where the hand kernels used 32–40 (sm_80/90/120), with no
+    spills.
 11. **The runtime kernels**, by family (`strided_copy`,
     `tier_b1_prepass`, then `kernels.rs` and `fused_kernels.rs` in
     slices), each slice one PR. Proof: normalised identity where
