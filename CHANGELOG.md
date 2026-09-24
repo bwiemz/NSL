@@ -8,6 +8,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- The CPKD fused KL-CE distillation kernels (`nsl_fused_kl_ce_*`, forward
+  and backward) are built as KIR (roadmap A2 step 10), so
+  `cpkd_fused_loss.rs` no longer writes PTX text and leaves the hand-PTX
+  freeze (`ci/hand-ptx-manifest.txt`: 60 → 59 files).
+  `tests/cpkd_fused_loss_kir_equivalence.rs` runs the frozen hand kernels
+  and the KIR ones on the shared PTX interpreter (which learned
+  `rcp.approx.f32`) and requires the same bits in the loss, the three LSEs
+  and the student's gradients, and agreement with the crate's f64
+  references. The kernels target the KIR floor (`sm_70`).
+
 - The fused linear-CE backward (`nsl_fused_linear_ce_backward_*`) is built
   as KIR (roadmap A2 step 10, third slice), one builder for f32, f16 and
   bf16. `fused_linear_ce.rs` no longer writes PTX text and leaves the

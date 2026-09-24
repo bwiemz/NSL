@@ -52,12 +52,23 @@
 //! - spectral top-k logit compression is ADVISORY in v1 (`cpkd_spectral`
 //!   reports the effective rank; this kernel always runs the full vocab).
 //!
-//! PTX conventions follow `fused_linear_ce.rs`: null-terminated module
-//! bytes (`cuModuleLoadData` contract), `.version 7.0` / `.target
-//! sm_max(80, gpu_sm)`, ASCII-only comments (ptxas 13.x rejects Unicode),
-//! `ex2.approx/lg2.approx` with log2(e)/ln(2) conversion constants.
+//! Both kernels are built as KIR ([`build_forward`], [`build_backward`];
+//! roadmap A2 step 10) and lowered to null-terminated module bytes
+//! (`cuModuleLoadData` contract) at the KIR floor, `.version 7.0` /
+//! `.target sm_70`, so `gpu_sm` no longer reaches them.
+//! `tests/cpkd_fused_loss_kir_equivalence.rs` runs the pre-migration hand
+//! emitters (`tests/fixtures/cpkd_fused_loss_hand.rs`) against them on the
+//! PTX interpreter and requires the same output bits.
 
 use serde::Serialize;
+
+use crate::backend_ptx::lower_kir_to_ptx;
+use crate::cfie_decode_attention::{at, cmp, konst, load, op2, ptr, widen};
+use crate::fused_linear_ce::{bottom_tested_loop, i64_const, V1_BLOCK};
+use crate::kernel_ir::{
+    AddressSpace, CmpOp, ConstValue, KernelIR, KirBuilder, KirEdge, KirOp, KirTerminator, KirType, SmemLayout,
+    SmemRegion, VarId,
+};
 
 /// Hard ceiling for the v1 single-CTA path (mirrors
 /// `fused_linear_ce::LARGE_VOCAB_THRESHOLD`; the large-vocab two-kernel
@@ -172,759 +183,570 @@ impl FusedKlCeConfig {
             self.vocab_size, self.student_hidden, self.teacher_hidden
         )
     }
-
-    fn sm_tag(&self) -> u32 {
-        self.gpu_sm.max(80)
-    }
-
-    fn ptx_header(&self) -> String {
-        format!(
-            ".version 7.0\n.target sm_{}\n.address_size 64\n",
-            self.sm_tag()
-        )
-    }
 }
 
-/// Synthesise the forward PTX. Returned bytes are null-terminated
-/// (`cuModuleLoadData` reads a C string; see `fused_linear_ce.rs`).
+/// Synthesise the forward PTX: [`build_forward`], verified and lowered.
+/// Returned bytes are null-terminated (`cuModuleLoadData` reads a C string;
+/// see `fused_linear_ce.rs`).
 pub fn synthesize_fused_kl_ce_ptx(cfg: &FusedKlCeConfig) -> Vec<u8> {
-    let mut bytes = emit_fwd_kernel(cfg).into_bytes();
-    bytes.push(0);
-    bytes
+    lower_verified(build_forward(cfg))
 }
 
-/// Synthesise the backward PTX (null-terminated, same contract).
+/// Synthesise the backward PTX: [`build_backward`], verified and lowered
+/// (null-terminated, same contract).
 pub fn synthesize_fused_kl_ce_backward_ptx(cfg: &FusedKlCeConfig) -> Vec<u8> {
-    let mut bytes = emit_bwd_kernel(cfg).into_bytes();
-    bytes.push(0);
-    bytes
+    lower_verified(build_backward(cfg))
 }
 
-// ─── Forward kernel ─────────────────────────────────────────────────────────
-//
-// Grid (rows, 1, 1), block (128, 1, 1). Per CTA:
-//   1. targets[row] == ignore_index  ->  write four zeros, ret.
-//   2. Tile loop: 128 threads stride-fill the STUDENT and TEACHER logit
-//      tiles in SMEM (each thread computes both dot products for its vocab
-//      slot); the thread whose v == target stashes the student logit in the
-//      scratch slot.
-//   3. Thread 0: one max-scan per model over the tile, then the online
-//      rescale + accumulate pass updating (m_s1,S_s1), (m_sT,S_sT),
-//      (m_tT,S_tT,C).
-//   4. After the loop, thread 0 assembles CE + KL and stores loss + 3 LSEs.
-fn emit_fwd_kernel(cfg: &FusedKlCeConfig) -> String {
-    let name = cfg.kernel_name();
-    let vocab = cfg.vocab_size;
-    let hs = cfg.student_hidden;
-    let ht = cfg.teacher_hidden;
-    let vtile = cfg.vocab_tile;
-    let n_tiles = cfg.num_vocab_tiles();
-    let vtile_per_thread = vtile / 128;
-    let ignore = cfg.ignore_index;
-    let smem_bytes = cfg.shared_mem_bytes();
-    // SMEM offsets.
-    let teacher_tile_offset = vtile * 4;
-    let lat_offset = vtile * 4 * 2;
-
-    let mut s = String::new();
-    s.push_str(&cfg.ptx_header());
-    s.push_str(&format!(
-        ".extern .shared .align 4 .b8 smem_scratch[{smem_bytes}];\n\n"
-    ));
-    s.push_str(&format!(
-        ".visible .entry {name}(\n\
-         \t.param .u64 param_xs,\n\
-         \t.param .u64 param_ws,\n\
-         \t.param .u64 param_bs,\n\
-         \t.param .u64 param_xt,\n\
-         \t.param .u64 param_wt,\n\
-         \t.param .u64 param_bt,\n\
-         \t.param .u64 param_targets,\n\
-         \t.param .u64 param_loss_out,\n\
-         \t.param .u64 param_lse_s1_out,\n\
-         \t.param .u64 param_lse_st_out,\n\
-         \t.param .u64 param_lse_tt_out,\n\
-         \t.param .u32 param_rows,\n\
-         \t.param .u32 param_V,\n\
-         \t.param .u32 param_HS,\n\
-         \t.param .u32 param_HT,\n\
-         \t.param .f32 param_alpha,\n\
-         \t.param .f32 param_temp\n\
-         ) {{\n"
-    ));
-
-    // Registers: numbered families sized generously (declared count must
-    // exceed the highest index used — see bugs.md BIAS_ADD_F32_PTX lesson);
-    // f32 working set uses NAMED registers to avoid the off-by-one class
-    // entirely.
-    s.push_str(
-        "\t.reg .u64 %rd<32>;\n\
-         \t.reg .u32 %r<20>;\n\
-         \t.reg .s64 %tgt64;\n\
-         \t.reg .f32 %facc_s, %facc_t, %fa, %fb, %ftmp, %ftmp2;\n\
-         \t.reg .f32 %fmax_s1, %fsum_s1, %fmax_st, %fsum_st, %fmax_tt, %fsum_tt, %fcross;\n\
-         \t.reg .f32 %ftmax_s, %ftmax_t, %fnewm, %fscale;\n\
-         \t.reg .f32 %flog2e, %fln2, %falpha, %ftemp, %ftinv;\n\
-         \t.reg .f32 %flse_s1, %flse_st, %flse_tt, %fce, %fkl, %floss, %fsv, %ftv;\n\
-         \t.reg .pred %pskip, %pv, %pth0, %ptgt;\n\n",
-    );
-
-    // Params.
-    s.push_str(
-        "\tld.param.u64 %rd0, [param_xs];\n\
-         \tld.param.u64 %rd1, [param_ws];\n\
-         \tld.param.u64 %rd2, [param_bs];\n\
-         \tld.param.u64 %rd3, [param_xt];\n\
-         \tld.param.u64 %rd4, [param_wt];\n\
-         \tld.param.u64 %rd5, [param_bt];\n\
-         \tld.param.u64 %rd6, [param_targets];\n\
-         \tld.param.u64 %rd7, [param_loss_out];\n\
-         \tld.param.u64 %rd8, [param_lse_s1_out];\n\
-         \tld.param.u64 %rd9, [param_lse_st_out];\n\
-         \tld.param.u64 %rd10, [param_lse_tt_out];\n\
-         \tld.param.f32 %falpha, [param_alpha];\n\
-         \tld.param.f32 %ftemp, [param_temp];\n\
-         \tmov.u32 %r0, %ctaid.x;   // row_idx\n\
-         \tmov.u32 %r1, %tid.x;     // tid\n\
-         \tmov.f32 %flog2e, 0f3FB8AA3B; // log2(e)\n\
-         \tmov.f32 %fln2,   0f3F317218; // ln(2)\n\
-         \trcp.approx.f32 %ftinv, %ftemp; // 1/T\n\n",
-    );
-
-    // Thread 0 inits the logit-at-target scratch slot.
-    s.push_str(&format!(
-        "\tsetp.eq.u32 %pth0, %r1, 0;\n\
-         \t@!%pth0 bra INIT_DONE;\n\
-         \tmov.u64 %rd11, smem_scratch;\n\
-         \tadd.u64 %rd11, %rd11, {lat_offset};\n\
-         \tst.shared.f32 [%rd11], 0fFF800000; // -INF sentinel\n\
-         INIT_DONE:\n\
-         \tbar.sync 0;\n\n"
-    ));
-
-    // Load target[row].
-    s.push_str(
-        "\tcvt.u64.u32 %rd12, %r0;\n\
-         \tmul.lo.u64 %rd12, %rd12, 8;\n\
-         \tadd.u64 %rd12, %rd6, %rd12;\n\
-         \tld.global.s64 %tgt64, [%rd12];\n\n",
-    );
-    s.push_str(&format!(
-        "\tsetp.eq.s64 %pskip, %tgt64, {ignore};\n\
-         \t@%pskip bra SKIP_LABEL;\n\n"
-    ));
-
-    // Row bases: xs + row*HS*4, xt + row*HT*4.
-    s.push_str(&format!(
-        "\t// xs_row_base / xt_row_base\n\
-         \tcvt.u64.u32 %rd13, %r0;\n\
-         \tmov.u32 %r2, {hs};\n\
-         \tcvt.u64.u32 %rd14, %r2;\n\
-         \tmul.lo.u64 %rd13, %rd13, %rd14;\n\
-         \tshl.b64 %rd13, %rd13, 2;\n\
-         \tadd.u64 %rd13, %rd0, %rd13; // xs_row_base\n\
-         \tcvt.u64.u32 %rd15, %r0;\n\
-         \tmov.u32 %r2, {ht};\n\
-         \tcvt.u64.u32 %rd16, %r2;\n\
-         \tmul.lo.u64 %rd15, %rd15, %rd16;\n\
-         \tshl.b64 %rd15, %rd15, 2;\n\
-         \tadd.u64 %rd15, %rd3, %rd15; // xt_row_base\n\n"
-    ));
-
-    // Init accumulators.
-    s.push_str(
-        "\tmov.f32 %fmax_s1, 0fFF800000;\n\
-         \tmov.f32 %fsum_s1, 0f00000000;\n\
-         \tmov.f32 %fmax_st, 0fFF800000;\n\
-         \tmov.f32 %fsum_st, 0f00000000;\n\
-         \tmov.f32 %fmax_tt, 0fFF800000;\n\
-         \tmov.f32 %fsum_tt, 0f00000000;\n\
-         \tmov.f32 %fcross, 0f00000000;\n\n",
-    );
-
-    // Tile loop.
-    s.push_str("\tmov.u32 %r3, 0; // tile_idx\nTILE_LOOP:\n");
-    s.push_str(&format!("\t\tmul.lo.u32 %r4, %r3, {vtile}; // v_base\n\n"));
-
-    // Inner fill loop: each thread computes student AND teacher logits for
-    // its vocab slots.
-    s.push_str(
-        "\t\tmov.u32 %r5, 0; // sub-tile counter\n\
-         \t\tINNER_LOOP:\n\
-         \t\t\tmul.lo.u32 %r6, %r5, 128;\n\
-         \t\t\tadd.u32 %r6, %r6, %r1;\n\
-         \t\t\tadd.u32 %r6, %r6, %r4; // v_idx\n",
-    );
-    s.push_str(&format!(
-        "\t\t\tsetp.lt.u32 %pv, %r6, {vocab};\n\
-         \t\t\t@!%pv bra INNER_SKIP;\n\n"
-    ));
-
-    // Student dot: ws_row_base = ws + v*HS*4.
-    s.push_str(&format!(
-        "\t\t\t// student logit\n\
-         \t\t\tcvt.u64.u32 %rd17, %r6;\n\
-         \t\t\tmov.u32 %r7, {hs};\n\
-         \t\t\tcvt.u64.u32 %rd18, %r7;\n\
-         \t\t\tmul.lo.u64 %rd17, %rd17, %rd18;\n\
-         \t\t\tshl.b64 %rd17, %rd17, 2;\n\
-         \t\t\tadd.u64 %rd17, %rd1, %rd17; // ws_row_base\n\
-         \t\t\tmov.f32 %facc_s, 0f00000000;\n\
-         \t\t\tmov.u32 %r8, 0;\n\
-         \t\t\tDOT_S_LOOP:\n\
-         \t\t\t\tcvt.u64.u32 %rd19, %r8;\n\
-         \t\t\t\tshl.b64 %rd19, %rd19, 2;\n\
-         \t\t\t\tadd.u64 %rd20, %rd13, %rd19;\n\
-         \t\t\t\tld.global.f32 %fa, [%rd20];\n\
-         \t\t\t\tadd.u64 %rd20, %rd17, %rd19;\n\
-         \t\t\t\tld.global.f32 %fb, [%rd20];\n\
-         \t\t\t\tfma.rn.f32 %facc_s, %fa, %fb, %facc_s;\n\
-         \t\t\t\tadd.u32 %r8, %r8, 1;\n\
-         \t\t\t\tsetp.lt.u32 %pv, %r8, {hs};\n\
-         \t\t\t\t@%pv bra DOT_S_LOOP;\n\
-         \t\t\t// + bias_s[v]\n\
-         \t\t\tcvt.u64.u32 %rd21, %r6;\n\
-         \t\t\tshl.b64 %rd21, %rd21, 2;\n\
-         \t\t\tadd.u64 %rd21, %rd2, %rd21;\n\
-         \t\t\tld.global.f32 %ftmp, [%rd21];\n\
-         \t\t\tadd.f32 %facc_s, %facc_s, %ftmp;\n\n"
-    ));
-
-    // Teacher dot: wt_row_base = wt + v*HT*4.
-    s.push_str(&format!(
-        "\t\t\t// teacher logit\n\
-         \t\t\tcvt.u64.u32 %rd22, %r6;\n\
-         \t\t\tmov.u32 %r7, {ht};\n\
-         \t\t\tcvt.u64.u32 %rd23, %r7;\n\
-         \t\t\tmul.lo.u64 %rd22, %rd22, %rd23;\n\
-         \t\t\tshl.b64 %rd22, %rd22, 2;\n\
-         \t\t\tadd.u64 %rd22, %rd4, %rd22; // wt_row_base\n\
-         \t\t\tmov.f32 %facc_t, 0f00000000;\n\
-         \t\t\tmov.u32 %r8, 0;\n\
-         \t\t\tDOT_T_LOOP:\n\
-         \t\t\t\tcvt.u64.u32 %rd19, %r8;\n\
-         \t\t\t\tshl.b64 %rd19, %rd19, 2;\n\
-         \t\t\t\tadd.u64 %rd20, %rd15, %rd19;\n\
-         \t\t\t\tld.global.f32 %fa, [%rd20];\n\
-         \t\t\t\tadd.u64 %rd20, %rd22, %rd19;\n\
-         \t\t\t\tld.global.f32 %fb, [%rd20];\n\
-         \t\t\t\tfma.rn.f32 %facc_t, %fa, %fb, %facc_t;\n\
-         \t\t\t\tadd.u32 %r8, %r8, 1;\n\
-         \t\t\t\tsetp.lt.u32 %pv, %r8, {ht};\n\
-         \t\t\t\t@%pv bra DOT_T_LOOP;\n\
-         \t\t\t// + bias_t[v]\n\
-         \t\t\tcvt.u64.u32 %rd21, %r6;\n\
-         \t\t\tshl.b64 %rd21, %rd21, 2;\n\
-         \t\t\tadd.u64 %rd21, %rd5, %rd21;\n\
-         \t\t\tld.global.f32 %ftmp, [%rd21];\n\
-         \t\t\tadd.f32 %facc_t, %facc_t, %ftmp;\n\n"
-    ));
-
-    // Store both logits into SMEM (student tile at 0, teacher tile at
-    // teacher_tile_offset).
-    s.push_str(&format!(
-        "\t\t\t// smem slot = (r5*128 + tid) * 4\n\
-         \t\t\tmul.lo.u32 %r9, %r5, 128;\n\
-         \t\t\tadd.u32 %r9, %r9, %r1;\n\
-         \t\t\tshl.b32 %r9, %r9, 2;\n\
-         \t\t\tmov.u64 %rd24, smem_scratch;\n\
-         \t\t\tcvt.u64.u32 %rd25, %r9;\n\
-         \t\t\tadd.u64 %rd24, %rd24, %rd25;\n\
-         \t\t\tst.shared.f32 [%rd24], %facc_s;\n\
-         \t\t\tadd.u64 %rd24, %rd24, {teacher_tile_offset};\n\
-         \t\t\tst.shared.f32 [%rd24], %facc_t;\n\n"
-    ));
-
-    // Target capture (student logit at temperature 1).
-    s.push_str(&format!(
-        "\t\t\tcvt.s64.u32 %rd26, %r6;\n\
-         \t\t\tsetp.eq.s64 %ptgt, %rd26, %tgt64;\n\
-         \t\t\t@!%ptgt bra NOT_TARGET;\n\
-         \t\t\tmov.u64 %rd27, smem_scratch;\n\
-         \t\t\tadd.u64 %rd27, %rd27, {lat_offset};\n\
-         \t\t\tst.shared.f32 [%rd27], %facc_s;\n\
-         \t\t\tNOT_TARGET:\n\n"
-    ));
-
-    s.push_str(&format!(
-        "\t\t\tINNER_SKIP:\n\
-         \t\t\tadd.u32 %r5, %r5, 1;\n\
-         \t\t\tsetp.lt.u32 %pv, %r5, {vtile_per_thread};\n\
-         \t\t\t@%pv bra INNER_LOOP;\n\n\
-         \t\tbar.sync 0;\n\n"
-    ));
-
-    // Thread 0 reduction.
-    s.push_str(
-        "\t\tsetp.eq.u32 %pth0, %r1, 0;\n\
-         \t\t@!%pth0 bra TILE_REDUCE_DONE;\n\n",
-    );
-
-    // Max scan over both tiles (raw logits).
-    s.push_str(&format!(
-        "\t\t// tile max scan (student + teacher, raw logits)\n\
-         \t\tmov.f32 %ftmax_s, 0fFF800000;\n\
-         \t\tmov.f32 %ftmax_t, 0fFF800000;\n\
-         \t\tmov.u32 %r10, 0;\n\
-         \t\tSMEM_MAX_LOOP:\n\
-         \t\t\tadd.u32 %r11, %r4, %r10;\n\
-         \t\t\tsetp.lt.u32 %pv, %r11, {vocab};\n\
-         \t\t\t@!%pv bra SMEM_MAX_DONE;\n\
-         \t\t\tshl.b32 %r12, %r10, 2;\n\
-         \t\t\tmov.u64 %rd28, smem_scratch;\n\
-         \t\t\tcvt.u64.u32 %rd29, %r12;\n\
-         \t\t\tadd.u64 %rd28, %rd28, %rd29;\n\
-         \t\t\tld.shared.f32 %ftmp, [%rd28];\n\
-         \t\t\tmax.f32 %ftmax_s, %ftmax_s, %ftmp;\n\
-         \t\t\tadd.u64 %rd28, %rd28, {teacher_tile_offset};\n\
-         \t\t\tld.shared.f32 %ftmp, [%rd28];\n\
-         \t\t\tmax.f32 %ftmax_t, %ftmax_t, %ftmp;\n\
-         \t\t\tadd.u32 %r10, %r10, 1;\n\
-         \t\t\tsetp.lt.u32 %pv, %r10, {vtile};\n\
-         \t\t\t@%pv bra SMEM_MAX_LOOP;\n\
-         \t\tSMEM_MAX_DONE:\n\n"
-    ));
-
-    // Online rescale of the three accumulator families.
-    //
-    // (m_s1, S_s1): candidate = ftmax_s.
-    // (m_sT, S_sT): candidate = ftmax_s / T.
-    // (m_tT, S_tT, C): candidate = ftmax_t / T; C rescales with S_tT.
-    s.push_str(
-        "\t\t// online rescale: student T=1\n\
-         \t\tmax.f32 %fnewm, %fmax_s1, %ftmax_s;\n\
-         \t\tsub.f32 %fscale, %fmax_s1, %fnewm;\n\
-         \t\tmul.f32 %fscale, %fscale, %flog2e;\n\
-         \t\tex2.approx.f32 %fscale, %fscale;\n\
-         \t\tmul.f32 %fsum_s1, %fsum_s1, %fscale;\n\
-         \t\tmov.f32 %fmax_s1, %fnewm;\n\
-         \t\t// online rescale: student /T\n\
-         \t\tmul.f32 %ftmp, %ftmax_s, %ftinv;\n\
-         \t\tmax.f32 %fnewm, %fmax_st, %ftmp;\n\
-         \t\tsub.f32 %fscale, %fmax_st, %fnewm;\n\
-         \t\tmul.f32 %fscale, %fscale, %flog2e;\n\
-         \t\tex2.approx.f32 %fscale, %fscale;\n\
-         \t\tmul.f32 %fsum_st, %fsum_st, %fscale;\n\
-         \t\tmov.f32 %fmax_st, %fnewm;\n\
-         \t\t// online rescale: teacher /T (sum AND cross-term)\n\
-         \t\tmul.f32 %ftmp, %ftmax_t, %ftinv;\n\
-         \t\tmax.f32 %fnewm, %fmax_tt, %ftmp;\n\
-         \t\tsub.f32 %fscale, %fmax_tt, %fnewm;\n\
-         \t\tmul.f32 %fscale, %fscale, %flog2e;\n\
-         \t\tex2.approx.f32 %fscale, %fscale;\n\
-         \t\tmul.f32 %fsum_tt, %fsum_tt, %fscale;\n\
-         \t\tmul.f32 %fcross, %fcross, %fscale;\n\
-         \t\tmov.f32 %fmax_tt, %fnewm;\n\n",
-    );
-
-    // Accumulate pass: per tile slot load s_v and t_v once, update all
-    // three families.
-    s.push_str(&format!(
-        "\t\tmov.u32 %r10, 0;\n\
-         \t\tSMEM_ACC_LOOP:\n\
-         \t\t\tadd.u32 %r11, %r4, %r10;\n\
-         \t\t\tsetp.lt.u32 %pv, %r11, {vocab};\n\
-         \t\t\t@!%pv bra SMEM_ACC_DONE;\n\
-         \t\t\tshl.b32 %r12, %r10, 2;\n\
-         \t\t\tmov.u64 %rd28, smem_scratch;\n\
-         \t\t\tcvt.u64.u32 %rd29, %r12;\n\
-         \t\t\tadd.u64 %rd28, %rd28, %rd29;\n\
-         \t\t\tld.shared.f32 %fsv, [%rd28];\n\
-         \t\t\tadd.u64 %rd28, %rd28, {teacher_tile_offset};\n\
-         \t\t\tld.shared.f32 %ftv, [%rd28];\n\
-         \t\t\t// S_s1 += exp(s - m_s1)\n\
-         \t\t\tsub.f32 %ftmp, %fsv, %fmax_s1;\n\
-         \t\t\tmul.f32 %ftmp, %ftmp, %flog2e;\n\
-         \t\t\tex2.approx.f32 %ftmp, %ftmp;\n\
-         \t\t\tadd.f32 %fsum_s1, %fsum_s1, %ftmp;\n\
-         \t\t\t// S_sT += exp(s/T - m_sT)\n\
-         \t\t\tmul.f32 %ftmp, %fsv, %ftinv;\n\
-         \t\t\tsub.f32 %ftmp, %ftmp, %fmax_st;\n\
-         \t\t\tmul.f32 %ftmp, %ftmp, %flog2e;\n\
-         \t\t\tex2.approx.f32 %ftmp, %ftmp;\n\
-         \t\t\tadd.f32 %fsum_st, %fsum_st, %ftmp;\n\
-         \t\t\t// e_t = exp(t/T - m_tT); S_tT += e_t; C += e_t * (t - s)\n\
-         \t\t\tmul.f32 %ftmp, %ftv, %ftinv;\n\
-         \t\t\tsub.f32 %ftmp, %ftmp, %fmax_tt;\n\
-         \t\t\tmul.f32 %ftmp, %ftmp, %flog2e;\n\
-         \t\t\tex2.approx.f32 %ftmp, %ftmp;\n\
-         \t\t\tadd.f32 %fsum_tt, %fsum_tt, %ftmp;\n\
-         \t\t\tsub.f32 %ftmp2, %ftv, %fsv;\n\
-         \t\t\tfma.rn.f32 %fcross, %ftmp, %ftmp2, %fcross;\n\
-         \t\t\tadd.u32 %r10, %r10, 1;\n\
-         \t\t\tsetp.lt.u32 %pv, %r10, {vtile};\n\
-         \t\t\t@%pv bra SMEM_ACC_LOOP;\n\
-         \t\tSMEM_ACC_DONE:\n\n\
-         \t\tTILE_REDUCE_DONE:\n\
-         \t\tbar.sync 0;\n\n\
-         \t\tadd.u32 %r3, %r3, 1;\n\
-         \t\tsetp.lt.u32 %pv, %r3, {n_tiles};\n\
-         \t\t@%pv bra TILE_LOOP;\n\n"
-    ));
-
-    // Final assembly (thread 0).
-    s.push_str(&format!(
-        "\tsetp.eq.u32 %pth0, %r1, 0;\n\
-         \t@!%pth0 bra WRITE_DONE;\n\n\
-         \t// lse_s1 = ln(S_s1) + m_s1  (and the /T pair analogously)\n\
-         \tlg2.approx.f32 %flse_s1, %fsum_s1;\n\
-         \tmul.f32 %flse_s1, %flse_s1, %fln2;\n\
-         \tadd.f32 %flse_s1, %flse_s1, %fmax_s1;\n\
-         \tlg2.approx.f32 %flse_st, %fsum_st;\n\
-         \tmul.f32 %flse_st, %flse_st, %fln2;\n\
-         \tadd.f32 %flse_st, %flse_st, %fmax_st;\n\
-         \tlg2.approx.f32 %flse_tt, %fsum_tt;\n\
-         \tmul.f32 %flse_tt, %flse_tt, %fln2;\n\
-         \tadd.f32 %flse_tt, %flse_tt, %fmax_tt;\n\n\
-         \t// CE = lse_s1 - s_target\n\
-         \tmov.u64 %rd30, smem_scratch;\n\
-         \tadd.u64 %rd30, %rd30, {lat_offset};\n\
-         \tld.shared.f32 %ftmp, [%rd30];\n\
-         \tsub.f32 %fce, %flse_s1, %ftmp;\n\n\
-         \t// KL = (C / S_tT) / T - lse_tT + lse_sT\n\
-         \tdiv.rn.f32 %fkl, %fcross, %fsum_tt;\n\
-         \tmul.f32 %fkl, %fkl, %ftinv;\n\
-         \tsub.f32 %fkl, %fkl, %flse_tt;\n\
-         \tadd.f32 %fkl, %fkl, %flse_st;\n\n\
-         \t// loss = alpha*CE + (1-alpha)*T^2*KL\n\
-         \tmul.f32 %floss, %falpha, %fce;\n\
-         \tmov.f32 %ftmp, 0f3F800000; // 1.0\n\
-         \tsub.f32 %ftmp, %ftmp, %falpha;\n\
-         \tmul.f32 %ftmp2, %ftemp, %ftemp;\n\
-         \tmul.f32 %ftmp, %ftmp, %ftmp2;\n\
-         \tfma.rn.f32 %floss, %ftmp, %fkl, %floss;\n\n\
-         \t// stores\n\
-         \tcvt.u64.u32 %rd31, %r0;\n\
-         \tshl.b64 %rd31, %rd31, 2;\n\
-         \tadd.u64 %rd30, %rd7, %rd31;\n\
-         \tst.global.f32 [%rd30], %floss;\n\
-         \tadd.u64 %rd30, %rd8, %rd31;\n\
-         \tst.global.f32 [%rd30], %flse_s1;\n\
-         \tadd.u64 %rd30, %rd9, %rd31;\n\
-         \tst.global.f32 [%rd30], %flse_st;\n\
-         \tadd.u64 %rd30, %rd10, %rd31;\n\
-         \tst.global.f32 [%rd30], %flse_tt;\n\
-         \tbra WRITE_DONE;\n\n\
-         SKIP_LABEL:\n\
-         \tsetp.eq.u32 %pth0, %r1, 0;\n\
-         \t@!%pth0 bra WRITE_DONE;\n\
-         \tcvt.u64.u32 %rd31, %r0;\n\
-         \tshl.b64 %rd31, %rd31, 2;\n\
-         \tadd.u64 %rd30, %rd7, %rd31;\n\
-         \tst.global.f32 [%rd30], 0f00000000;\n\
-         \tadd.u64 %rd30, %rd8, %rd31;\n\
-         \tst.global.f32 [%rd30], 0f00000000;\n\
-         \tadd.u64 %rd30, %rd9, %rd31;\n\
-         \tst.global.f32 [%rd30], 0f00000000;\n\
-         \tadd.u64 %rd30, %rd10, %rd31;\n\
-         \tst.global.f32 [%rd30], 0f00000000;\n\n\
-         WRITE_DONE:\n\
-         \tret;\n\
-         }}\n"
-    ));
-
-    s
+/// # Panics
+///
+/// If the kernel fails KIR verification — a bug in this module, not a
+/// condition a caller can provoke.
+fn lower_verified(ir: KernelIR) -> Vec<u8> {
+    if let Err(errors) = crate::kir_verify::verify(&ir) {
+        panic!("{} failed KIR verification: {errors:?}", ir.name);
+    }
+    lower_kir_to_ptx(&ir)
 }
 
-// ─── Backward kernel ────────────────────────────────────────────────────────
+// ─── KIR (roadmap A2 step 10) ───────────────────────────────────────────────
 //
-// Grid (rows, 1, 1), block (128, 1, 1). No SMEM. Per (row, v) recomputes
-// both logits, forms
-//   dlogit_v = alpha*(p_s1 - 1{v==tgt}) + (1-alpha)*T*(p_sT - p_tT)
-// scaled by grad/num_valid, then scatters dx_s / dW_s / dbias_s via
-// red.global.add.f32 (dx_s/dW_s/dbias_s must be caller-zero-filled).
-// NO teacher gradient outputs exist in the ABI (I-11).
-fn emit_bwd_kernel(cfg: &FusedKlCeConfig) -> String {
-    let name = cfg.bwd_kernel_name();
-    let vocab = cfg.vocab_size;
-    let hs = cfg.student_hidden;
-    let ht = cfg.teacher_hidden;
-    let vtile = cfg.vocab_tile;
-    let n_tiles = cfg.num_vocab_tiles();
-    let vtile_per_thread = vtile / 128;
-    let ignore = cfg.ignore_index;
+// Both kernels are built as KIR. They keep the hand kernels' control flow,
+// barriers, loop shapes (every loop tested at the bottom, as the hand loops
+// were, but the scans' vocab guard and the ignored row's zeroing, tested at
+// the top) and floating-point order; `tests/cpkd_fused_loss_kir_equivalence.rs`
+// runs the frozen hand emitters (`tests/fixtures/cpkd_fused_loss_hand.rs`)
+// against them on the PTX interpreter and requires the same output bits.
 
-    let mut s = String::new();
-    s.push_str(&cfg.ptx_header());
-    s.push('\n');
+/// Index of each shared region in [`forward_smem`].
+const R_STUDENT: u32 = 0;
+const R_TEACHER: u32 = 1;
+const R_TARGET: u32 = 2;
 
-    s.push_str(&format!(
-        ".visible .entry {name}(\n\
-         \t.param .f32 param_grad_output,\n\
-         \t.param .u64 param_xs,\n\
-         \t.param .u64 param_ws,\n\
-         \t.param .u64 param_bs,\n\
-         \t.param .u64 param_xt,\n\
-         \t.param .u64 param_wt,\n\
-         \t.param .u64 param_bt,\n\
-         \t.param .u64 param_targets,\n\
-         \t.param .u64 param_lse_s1,\n\
-         \t.param .u64 param_lse_st,\n\
-         \t.param .u64 param_lse_tt,\n\
-         \t.param .u64 param_dxs_out,\n\
-         \t.param .u64 param_dws_out,\n\
-         \t.param .u64 param_dbs_out,\n\
-         \t.param .u32 param_rows,\n\
-         \t.param .u32 param_V,\n\
-         \t.param .u32 param_HS,\n\
-         \t.param .u32 param_HT,\n\
-         \t.param .f32 param_alpha,\n\
-         \t.param .f32 param_temp,\n\
-         \t.param .u32 param_num_valid\n\
-         ) {{\n"
-    ));
+/// `[student logits: vtile][teacher logits: vtile][student logit at target]`,
+/// f32, dynamic (the launcher passes [`FusedKlCeConfig::shared_mem_bytes`],
+/// which covers it) — the hand kernel's offsets.
+fn forward_smem(cfg: &FusedKlCeConfig) -> SmemLayout {
+    let region = |name: &str, elems: u32| SmemRegion { name: name.to_string(), bytes: elems * 4, align: 4, elem: KirType::F32 };
+    SmemLayout {
+        regions: vec![region("student", cfg.vocab_tile), region("teacher", cfg.vocab_tile), region("logit_at_target", 1)],
+        dynamic: true,
+    }
+}
 
-    s.push_str(
-        "\t.reg .u64 %rd<34>;\n\
-         \t.reg .u32 %r<20>;\n\
-         \t.reg .s64 %tgt64;\n\
-         \t.reg .f32 %facc_s, %facc_t, %fa, %fb, %ftmp;\n\
-         \t.reg .f32 %fgrad, %fscale, %fnvf, %falpha, %ftemp, %ftinv, %flog2e;\n\
-         \t.reg .f32 %flse_s1, %flse_st, %flse_tt;\n\
-         \t.reg .f32 %fps1, %fpst, %fptt, %fdl, %fsc;\n\
-         \t.reg .pred %pskip, %pv, %ptgt;\n\
-         \t.reg .u32 %nvalid;\n\n",
-    );
+/// `sum_h fma(a[a_row + h], b[b_row + h], acc)` over `h < hidden`, from
+/// zero, in index order, tested at the bottom (`hidden >= 32`).
+fn dot(b: &mut KirBuilder, (a, a_row): (VarId, VarId), (m, m_row): (VarId, VarId), hidden: u32) -> VarId {
+    use AddressSpace::Global;
+    use KirType::{F32, U64};
+    let zero = konst(b, ConstValue::U32(0));
+    let one = konst(b, ConstValue::U32(1));
+    let hidden = konst(b, ConstValue::U32(hidden));
+    let f_zero = konst(b, ConstValue::F32(0.0));
+    bottom_tested_loop(b, (zero, hidden, one), &[f_zero], |b, h, acc| {
+        let h_wide = widen(b, h);
+        let a_index = op2(b, U64, KirOp::Add, a_row, h_wide);
+        let a_addr = at(b, F32, Global, a, a_index);
+        let av = load(b, F32, a_addr, Global);
+        let m_index = op2(b, U64, KirOp::Add, m_row, h_wide);
+        let m_addr = at(b, F32, Global, m, m_index);
+        let mv = load(b, F32, m_addr, Global);
+        let next = b.new_typed_var(F32);
+        b.emit(KirOp::Fma(next, av, mv, acc[0]));
+        vec![next]
+    })[0]
+}
 
-    s.push_str(
-        "\tld.param.f32 %fgrad, [param_grad_output];\n\
-         \tld.param.u64 %rd0, [param_xs];\n\
-         \tld.param.u64 %rd1, [param_ws];\n\
-         \tld.param.u64 %rd2, [param_bs];\n\
-         \tld.param.u64 %rd3, [param_xt];\n\
-         \tld.param.u64 %rd4, [param_wt];\n\
-         \tld.param.u64 %rd5, [param_bt];\n\
-         \tld.param.u64 %rd6, [param_targets];\n\
-         \tld.param.u64 %rd7, [param_lse_s1];\n\
-         \tld.param.u64 %rd8, [param_lse_st];\n\
-         \tld.param.u64 %rd9, [param_lse_tt];\n\
-         \tld.param.u64 %rd10, [param_dxs_out];\n\
-         \tld.param.u64 %rd11, [param_dws_out];\n\
-         \tld.param.u64 %rd12, [param_dbs_out];\n\
-         \tld.param.f32 %falpha, [param_alpha];\n\
-         \tld.param.f32 %ftemp, [param_temp];\n\
-         \tld.param.u32 %nvalid, [param_num_valid];\n\
-         \tcvt.rn.f32.u32 %fnvf, %nvalid;\n\
-         \tmov.u32 %r0, %ctaid.x;\n\
-         \tmov.u32 %r1, %tid.x;\n\
-         \tmov.f32 %flog2e, 0f3FB8AA3B;\n\
-         \trcp.approx.f32 %ftinv, %ftemp;\n\n",
-    );
+/// A scan over the tile's lanes that stops at the vocab: `i = 0; while
+/// v_base + i < V { carried = body(i, carried); i += 1; if !(i < vtile)
+/// break; }` — the hand kernel's shape. The carried values after the last
+/// lane are returned.
+fn tile_scan(
+    b: &mut KirBuilder,
+    (v_base, vocab, vtile): (VarId, VarId, VarId),
+    init: &[VarId],
+    body: impl FnOnce(&mut KirBuilder, VarId, &[VarId]) -> Vec<VarId>,
+) -> Vec<VarId> {
+    use KirType::{F32, U32};
+    let zero = konst(b, ConstValue::U32(0));
+    let one = konst(b, ConstValue::U32(1));
+    let head = b.new_block();
+    let lane = b.new_block();
+    let done = b.new_block();
+    let i = b.add_block_param(head, U32);
+    let carried: Vec<VarId> = init.iter().map(|_| b.add_block_param(head, F32)).collect();
+    let out: Vec<VarId> = init.iter().map(|_| b.add_block_param(done, F32)).collect();
+    let mut entry = vec![zero];
+    entry.extend_from_slice(init);
+    b.terminate(KirTerminator::Branch(KirEdge::with(head, entry)));
 
-    // Target + skip.
-    s.push_str(&format!(
-        "\tcvt.u64.u32 %rd13, %r0;\n\
-         \tmul.lo.u64 %rd13, %rd13, 8;\n\
-         \tadd.u64 %rd13, %rd6, %rd13;\n\
-         \tld.global.s64 %tgt64, [%rd13];\n\
-         \tsetp.eq.s64 %pskip, %tgt64, {ignore};\n\
-         \t@%pskip bra BWD_SKIP_LABEL;\n\n"
-    ));
+    b.set_block(head);
+    let v = op2(b, U32, KirOp::Add, v_base, i);
+    let in_vocab = cmp(b, v, vocab, CmpOp::Lt);
+    b.terminate(KirTerminator::CondBranch(in_vocab, KirEdge::to(lane), KirEdge::with(done, carried.clone())));
 
-    // Saved LSEs.
-    s.push_str(
-        "\tcvt.u64.u32 %rd14, %r0;\n\
-         \tshl.b64 %rd14, %rd14, 2;\n\
-         \tadd.u64 %rd15, %rd7, %rd14;\n\
-         \tld.global.f32 %flse_s1, [%rd15];\n\
-         \tadd.u64 %rd15, %rd8, %rd14;\n\
-         \tld.global.f32 %flse_st, [%rd15];\n\
-         \tadd.u64 %rd15, %rd9, %rd14;\n\
-         \tld.global.f32 %flse_tt, [%rd15];\n\n",
-    );
+    b.set_block(lane);
+    let next = body(b, i, &carried);
+    let i_next = op2(b, U32, KirOp::Add, i, one);
+    let more = cmp(b, i_next, vtile, CmpOp::Lt);
+    let mut back = vec![i_next];
+    back.extend_from_slice(&next);
+    b.terminate(KirTerminator::CondBranch(more, KirEdge::with(head, back), KirEdge::with(done, next)));
+    b.set_block(done);
+    out
+}
 
-    // Row bases.
-    s.push_str(&format!(
-        "\tcvt.u64.u32 %rd16, %r0;\n\
-         \tmov.u32 %r2, {hs};\n\
-         \tcvt.u64.u32 %rd17, %r2;\n\
-         \tmul.lo.u64 %rd16, %rd16, %rd17;\n\
-         \tshl.b64 %rd16, %rd16, 2;\n\
-         \tadd.u64 %rd18, %rd0, %rd16; // xs_row_base\n\
-         \tadd.u64 %rd19, %rd10, %rd16; // dxs_row_base\n\
-         \tcvt.u64.u32 %rd20, %r0;\n\
-         \tmov.u32 %r2, {ht};\n\
-         \tcvt.u64.u32 %rd21, %r2;\n\
-         \tmul.lo.u64 %rd20, %rd20, %rd21;\n\
-         \tshl.b64 %rd20, %rd20, 2;\n\
-         \tadd.u64 %rd20, %rd3, %rd20; // xt_row_base\n\n"
-    ));
+fn f32_exp(b: &mut KirBuilder, x: VarId) -> VarId {
+    let e = b.new_typed_var(KirType::F32);
+    b.emit(KirOp::Exp(e, x));
+    e
+}
 
-    // scale = grad / num_valid.
-    s.push_str("\tdiv.rn.f32 %fscale, %fgrad, %fnvf;\n\n");
+/// Build the forward kernel as KIR.
+///
+/// One CTA per token row, 128 threads. The CFG, in the hand kernel's order:
+///
+/// ```text
+/// entry     thread 0 stores -inf to the logit-at-target slot      bar
+///           target = targets[row]; target == ignore_index ? skip : body
+/// body      per tile (m_s1, S_s1, m_sT, S_sT, m_tT, S_tT, C):
+///             per sub-tile: v = j*128 + tid + tile*vtile; v < V ?
+///               s = fma-dot(xs[row], Ws[v]) + bs[v]
+///               t = fma-dot(xt[row], Wt[v]) + bt[v]
+///               student[slot] = s; teacher[slot] = t
+///               v == target ? logit_at_target = s
+///             bar
+///             thread 0: max of each tile (lanes below V); rescale the
+///               three families; accumulate S_s1, S_sT, S_tT and C
+///             bar
+///           thread 0: the three LSEs, CE, KL, the loss; four stores
+/// skip      thread 0: four zeros
+/// ```
+pub fn build_forward(cfg: &FusedKlCeConfig) -> KernelIR {
+    use AddressSpace::{Global, Shared};
+    use KirType::{F32, I64, U32, U64};
 
-    // Tile loop.
-    s.push_str(&format!(
-        "\tmov.u32 %r3, 0;\n\
-         BWD_TILE_LOOP:\n\
-         \t\tmul.lo.u32 %r4, %r3, {vtile};\n\
-         \t\tmov.u32 %r5, 0;\n\
-         BWD_INNER_LOOP:\n\
-         \t\t\tmul.lo.u32 %r6, %r5, 128;\n\
-         \t\t\tadd.u32 %r6, %r6, %r1;\n\
-         \t\t\tadd.u32 %r6, %r6, %r4; // v_idx\n\
-         \t\t\tsetp.lt.u32 %pv, %r6, {vocab};\n\
-         \t\t\t@!%pv bra BWD_INNER_SKIP;\n\n"
-    ));
+    let mut b = KirBuilder::new(&cfg.kernel_name());
+    // The params, in FFI order; rows, V, HS and HT are baked.
+    let fptr = || ptr(F32, Global);
+    let xs = b.add_param("xs", fptr(), Global);
+    let ws = b.add_param("ws", fptr(), Global);
+    let bs = b.add_param("bs", fptr(), Global);
+    let xt = b.add_param("xt", fptr(), Global);
+    let wt = b.add_param("wt", fptr(), Global);
+    let bt = b.add_param("bt", fptr(), Global);
+    let targets = b.add_param("targets", ptr(I64, Global), Global);
+    let loss_out = b.add_param("loss_out", fptr(), Global);
+    let lse_s1_out = b.add_param("lse_s1_out", fptr(), Global);
+    let lse_st_out = b.add_param("lse_st_out", fptr(), Global);
+    let lse_tt_out = b.add_param("lse_tt_out", fptr(), Global);
+    for name in ["rows", "V", "HS", "HT"] {
+        b.add_param(name, U32, Global);
+    }
+    let alpha = b.add_param("alpha", F32, Global);
+    let temp = b.add_param("temp", F32, Global);
+    b.set_smem_layout(forward_smem(cfg));
+    b.set_workgroup_size([V1_BLOCK, 1, 1]);
 
-    // Recompute student logit.
-    s.push_str(&format!(
-        "\t\t\t// student logit recompute\n\
-         \t\t\tcvt.u64.u32 %rd22, %r6;\n\
-         \t\t\tmov.u32 %r7, {hs};\n\
-         \t\t\tcvt.u64.u32 %rd23, %r7;\n\
-         \t\t\tmul.lo.u64 %rd22, %rd22, %rd23;\n\
-         \t\t\tshl.b64 %rd22, %rd22, 2;\n\
-         \t\t\tadd.u64 %rd22, %rd1, %rd22; // ws_row_base\n\
-         \t\t\tmov.f32 %facc_s, 0f00000000;\n\
-         \t\t\tmov.u32 %r8, 0;\n\
-         BWD_DOT_S_LOOP:\n\
-         \t\t\t\tcvt.u64.u32 %rd24, %r8;\n\
-         \t\t\t\tshl.b64 %rd24, %rd24, 2;\n\
-         \t\t\t\tadd.u64 %rd25, %rd18, %rd24;\n\
-         \t\t\t\tld.global.f32 %fa, [%rd25];\n\
-         \t\t\t\tadd.u64 %rd25, %rd22, %rd24;\n\
-         \t\t\t\tld.global.f32 %fb, [%rd25];\n\
-         \t\t\t\tfma.rn.f32 %facc_s, %fa, %fb, %facc_s;\n\
-         \t\t\t\tadd.u32 %r8, %r8, 1;\n\
-         \t\t\t\tsetp.lt.u32 %pv, %r8, {hs};\n\
-         \t\t\t\t@%pv bra BWD_DOT_S_LOOP;\n\
-         \t\t\tcvt.u64.u32 %rd26, %r6;\n\
-         \t\t\tshl.b64 %rd26, %rd26, 2;\n\
-         \t\t\tadd.u64 %rd27, %rd2, %rd26;\n\
-         \t\t\tld.global.f32 %ftmp, [%rd27];\n\
-         \t\t\tadd.f32 %facc_s, %facc_s, %ftmp;\n\n"
-    ));
+    let entry = b.new_block();
+    b.set_block(entry);
+    let row = b.new_typed_var(U32);
+    b.emit(KirOp::BlockIdx(row, 0));
+    let tid = b.new_typed_var(U32);
+    b.emit(KirOp::ThreadId(tid, 0));
+    let tinv = b.new_typed_var(F32);
+    b.emit(KirOp::Rcp(tinv, temp));
+    let zero = konst(&mut b, ConstValue::U32(0));
+    let one = konst(&mut b, ConstValue::U32(1));
+    let region = |b: &mut KirBuilder, r: u32| {
+        let dst = b.new_typed_var(ptr(F32, Shared));
+        b.emit(KirOp::SharedRegion { dst, region: r });
+        dst
+    };
+    let student = region(&mut b, R_STUDENT);
+    let teacher = region(&mut b, R_TEACHER);
+    let target_slot = region(&mut b, R_TARGET);
+    let f_neg_inf = konst(&mut b, ConstValue::F32(f32::NEG_INFINITY));
+    let f_zero = konst(&mut b, ConstValue::F32(0.0));
 
-    // Recompute teacher logit.
-    s.push_str(&format!(
-        "\t\t\t// teacher logit recompute\n\
-         \t\t\tcvt.u64.u32 %rd28, %r6;\n\
-         \t\t\tmov.u32 %r7, {ht};\n\
-         \t\t\tcvt.u64.u32 %rd29, %r7;\n\
-         \t\t\tmul.lo.u64 %rd28, %rd28, %rd29;\n\
-         \t\t\tshl.b64 %rd28, %rd28, 2;\n\
-         \t\t\tadd.u64 %rd28, %rd4, %rd28; // wt_row_base\n\
-         \t\t\tmov.f32 %facc_t, 0f00000000;\n\
-         \t\t\tmov.u32 %r8, 0;\n\
-         BWD_DOT_T_LOOP:\n\
-         \t\t\t\tcvt.u64.u32 %rd24, %r8;\n\
-         \t\t\t\tshl.b64 %rd24, %rd24, 2;\n\
-         \t\t\t\tadd.u64 %rd25, %rd20, %rd24;\n\
-         \t\t\t\tld.global.f32 %fa, [%rd25];\n\
-         \t\t\t\tadd.u64 %rd25, %rd28, %rd24;\n\
-         \t\t\t\tld.global.f32 %fb, [%rd25];\n\
-         \t\t\t\tfma.rn.f32 %facc_t, %fa, %fb, %facc_t;\n\
-         \t\t\t\tadd.u32 %r8, %r8, 1;\n\
-         \t\t\t\tsetp.lt.u32 %pv, %r8, {ht};\n\
-         \t\t\t\t@%pv bra BWD_DOT_T_LOOP;\n\
-         \t\t\tadd.u64 %rd27, %rd5, %rd26;\n\
-         \t\t\tld.global.f32 %ftmp, [%rd27];\n\
-         \t\t\tadd.f32 %facc_t, %facc_t, %ftmp;\n\n"
-    ));
+    // Thread 0 initialises the logit-at-target slot to -inf.
+    let init = b.new_block();
+    let init_done = b.new_block();
+    let is_thread0 = cmp(&mut b, tid, zero, CmpOp::Eq);
+    b.terminate(KirTerminator::CondBranch(is_thread0, KirEdge::to(init), KirEdge::to(init_done)));
+    b.set_block(init);
+    b.emit(KirOp::Store(target_slot, f_neg_inf, Shared));
+    b.terminate(KirTerminator::Branch(KirEdge::to(init_done)));
 
-    // Softmax probabilities from saved LSEs.
-    s.push_str(
-        "\t\t\t// p_s1 = exp(s - lse_s1)\n\
-         \t\t\tsub.f32 %ftmp, %facc_s, %flse_s1;\n\
-         \t\t\tmul.f32 %ftmp, %ftmp, %flog2e;\n\
-         \t\t\tex2.approx.f32 %fps1, %ftmp;\n\
-         \t\t\t// p_sT = exp(s/T - lse_sT)\n\
-         \t\t\tmul.f32 %ftmp, %facc_s, %ftinv;\n\
-         \t\t\tsub.f32 %ftmp, %ftmp, %flse_st;\n\
-         \t\t\tmul.f32 %ftmp, %ftmp, %flog2e;\n\
-         \t\t\tex2.approx.f32 %fpst, %ftmp;\n\
-         \t\t\t// p_tT = exp(t/T - lse_tT)\n\
-         \t\t\tmul.f32 %ftmp, %facc_t, %ftinv;\n\
-         \t\t\tsub.f32 %ftmp, %ftmp, %flse_tt;\n\
-         \t\t\tmul.f32 %ftmp, %ftmp, %flog2e;\n\
-         \t\t\tex2.approx.f32 %fptt, %ftmp;\n\n",
-    );
+    b.set_block(init_done);
+    b.emit(KirOp::Barrier);
+    let target_addr = at(&mut b, I64, Global, targets, row);
+    let target = load(&mut b, I64, target_addr, Global);
+    let ignore = i64_const(&mut b, cfg.ignore_index);
+    let skips = cmp(&mut b, target, ignore, CmpOp::Eq);
+    let body = b.new_block();
+    let skip = b.new_block();
+    let exit = b.new_block();
+    b.terminate(KirTerminator::CondBranch(skips, KirEdge::to(skip), KirEdge::to(body)));
 
-    // dlogit assembly.
-    s.push_str(
-        "\t\t\t// dl = alpha*(p_s1 - is_target) + (1-alpha)*T*(p_sT - p_tT)\n\
-         \t\t\tcvt.s64.u32 %rd30, %r6;\n\
-         \t\t\tsetp.eq.s64 %ptgt, %rd30, %tgt64;\n\
-         \t\t\t@%ptgt sub.f32 %fps1, %fps1, 0f3F800000;\n\
-         \t\t\tmul.f32 %fdl, %falpha, %fps1;\n\
-         \t\t\tsub.f32 %ftmp, %fpst, %fptt;\n\
-         \t\t\tmov.f32 %fa, 0f3F800000;\n\
-         \t\t\tsub.f32 %fa, %fa, %falpha;\n\
-         \t\t\tmul.f32 %fa, %fa, %ftemp;\n\
-         \t\t\tfma.rn.f32 %fdl, %fa, %ftmp, %fdl;\n\
-         \t\t\tmul.f32 %fsc, %fdl, %fscale;\n\n",
-    );
+    // ── the vocab tile loop ─────────────────────────────────────────────
+    b.set_block(body);
+    let row_wide = widen(&mut b, row);
+    let hs_wide = konst(&mut b, ConstValue::U64(cfg.student_hidden as u64));
+    let ht_wide = konst(&mut b, ConstValue::U64(cfg.teacher_hidden as u64));
+    let xs_row = op2(&mut b, U64, KirOp::Mul, row_wide, hs_wide);
+    let xt_row = op2(&mut b, U64, KirOp::Mul, row_wide, ht_wide);
+    let vocab = konst(&mut b, ConstValue::U32(cfg.vocab_size));
+    let vtile = konst(&mut b, ConstValue::U32(cfg.vocab_tile));
+    let block = konst(&mut b, ConstValue::U32(V1_BLOCK));
+    let n_tiles = konst(&mut b, ConstValue::U32(cfg.num_vocab_tiles()));
+    let per_thread = konst(&mut b, ConstValue::U32(cfg.vocab_tile / V1_BLOCK));
+    let init_acc = [f_neg_inf, f_zero, f_neg_inf, f_zero, f_neg_inf, f_zero, f_zero];
+    let acc = bottom_tested_loop(&mut b, (zero, n_tiles, one), &init_acc, |b, tile, acc| {
+        let v_base = op2(b, U32, KirOp::Mul, tile, vtile);
+        bottom_tested_loop(b, (zero, per_thread, one), &[], |b, j, _| {
+            let lane_base = op2(b, U32, KirOp::Mul, j, block);
+            let slot = op2(b, U32, KirOp::Add, lane_base, tid);
+            let v = op2(b, U32, KirOp::Add, slot, v_base);
+            let in_vocab = cmp(b, v, vocab, CmpOp::Lt);
+            let fill = b.new_block();
+            let fill_done = b.new_block();
+            b.terminate(KirTerminator::CondBranch(in_vocab, KirEdge::to(fill), KirEdge::to(fill_done)));
 
-    // Scatter loops (student only).
-    s.push_str(&format!(
-        "\t\t\t// dW_s row base\n\
-         \t\t\tcvt.u64.u32 %rd31, %r6;\n\
-         \t\t\tmov.u32 %r9, {hs};\n\
-         \t\t\tcvt.u64.u32 %rd32, %r9;\n\
-         \t\t\tmul.lo.u64 %rd31, %rd31, %rd32;\n\
-         \t\t\tshl.b64 %rd31, %rd31, 2;\n\
-         \t\t\tadd.u64 %rd31, %rd11, %rd31;\n\
-         \t\t\tmov.u32 %r9, 0;\n\
-         BWD_H_LOOP:\n\
-         \t\t\t\tcvt.u64.u32 %rd33, %r9;\n\
-         \t\t\t\tshl.b64 %rd33, %rd33, 2;\n\
-         \t\t\t\t// dx_s[row,h] += sc * W_s[v,h]\n\
-         \t\t\t\tadd.u64 %rd25, %rd22, %rd33;\n\
-         \t\t\t\tld.global.f32 %fa, [%rd25];\n\
-         \t\t\t\tmul.f32 %fb, %fsc, %fa;\n\
-         \t\t\t\tadd.u64 %rd25, %rd19, %rd33;\n\
-         \t\t\t\tred.global.add.f32 [%rd25], %fb;\n\
-         \t\t\t\t// dW_s[v,h] += sc * x_s[row,h]\n\
-         \t\t\t\tadd.u64 %rd25, %rd18, %rd33;\n\
-         \t\t\t\tld.global.f32 %fa, [%rd25];\n\
-         \t\t\t\tmul.f32 %fb, %fsc, %fa;\n\
-         \t\t\t\tadd.u64 %rd25, %rd31, %rd33;\n\
-         \t\t\t\tred.global.add.f32 [%rd25], %fb;\n\
-         \t\t\t\tadd.u32 %r9, %r9, 1;\n\
-         \t\t\t\tsetp.lt.u32 %pv, %r9, {hs};\n\
-         \t\t\t\t@%pv bra BWD_H_LOOP;\n\
-         \t\t\t// dbias_s[v] += sc\n\
-         \t\t\tadd.u64 %rd25, %rd12, %rd26;\n\
-         \t\t\tred.global.add.f32 [%rd25], %fsc;\n\n\
-         BWD_INNER_SKIP:\n\
-         \t\t\tadd.u32 %r5, %r5, 1;\n\
-         \t\t\tsetp.lt.u32 %pv, %r5, {vtile_per_thread};\n\
-         \t\t\t@%pv bra BWD_INNER_LOOP;\n\
-         \t\tadd.u32 %r3, %r3, 1;\n\
-         \t\tsetp.lt.u32 %pv, %r3, {n_tiles};\n\
-         \t\t@%pv bra BWD_TILE_LOOP;\n\
-         \tbra BWD_DONE;\n\n"
-    ));
+            b.set_block(fill);
+            let v_wide = widen(b, v);
+            let ws_row = op2(b, U64, KirOp::Mul, v_wide, hs_wide);
+            let s_dot = dot(b, (xs, xs_row), (ws, ws_row), cfg.student_hidden);
+            let bs_addr = at(b, F32, Global, bs, v);
+            let bs_v = load(b, F32, bs_addr, Global);
+            let s = op2(b, F32, KirOp::Add, s_dot, bs_v);
+            let wt_row = op2(b, U64, KirOp::Mul, v_wide, ht_wide);
+            let t_dot = dot(b, (xt, xt_row), (wt, wt_row), cfg.teacher_hidden);
+            let bt_addr = at(b, F32, Global, bt, v);
+            let bt_v = load(b, F32, bt_addr, Global);
+            let t = op2(b, F32, KirOp::Add, t_dot, bt_v);
+            let s_addr = at(b, F32, Shared, student, slot);
+            b.emit(KirOp::Store(s_addr, s, Shared));
+            let t_addr = at(b, F32, Shared, teacher, slot);
+            b.emit(KirOp::Store(t_addr, t, Shared));
+            // Only the thread holding the target's column writes the slot.
+            let v_signed = b.new_typed_var(I64);
+            b.emit(KirOp::Cast(v_signed, v, I64));
+            let is_target = cmp(b, v_signed, target, CmpOp::Eq);
+            let record = b.new_block();
+            b.terminate(KirTerminator::CondBranch(is_target, KirEdge::to(record), KirEdge::to(fill_done)));
+            b.set_block(record);
+            b.emit(KirOp::Store(target_slot, s, Shared));
+            b.terminate(KirTerminator::Branch(KirEdge::to(fill_done)));
 
-    // Skip path: zero dx_s row (dW/dbias untouched — caller zero-fills).
-    s.push_str(&format!(
-        "BWD_SKIP_LABEL:\n\
-         \tcvt.u64.u32 %rd16, %r0;\n\
-         \tmov.u32 %r2, {hs};\n\
-         \tcvt.u64.u32 %rd17, %r2;\n\
-         \tmul.lo.u64 %rd16, %rd16, %rd17;\n\
-         \tshl.b64 %rd16, %rd16, 2;\n\
-         \tadd.u64 %rd16, %rd10, %rd16; // dxs_row_base\n\
-         \tmov.u32 %r5, 0;\n\
-         BWD_ZERO_LOOP:\n\
-         \t\tmul.lo.u32 %r6, %r5, 128;\n\
-         \t\tadd.u32 %r6, %r6, %r1;\n\
-         \t\tsetp.lt.u32 %pv, %r6, {hs};\n\
-         \t\t@!%pv bra BWD_ZERO_DONE;\n\
-         \t\tshl.b32 %r6, %r6, 2;\n\
-         \t\tcvt.u64.u32 %rd17, %r6;\n\
-         \t\tadd.u64 %rd17, %rd16, %rd17;\n\
-         \t\tst.global.f32 [%rd17], 0f00000000;\n\
-         \t\tadd.u32 %r5, %r5, 1;\n\
-         \t\tbra BWD_ZERO_LOOP;\n\
-         BWD_ZERO_DONE:\n\n\
-         BWD_DONE:\n\
-         \tret;\n\
-         }}\n"
-    ));
+            b.set_block(fill_done);
+            vec![]
+        });
+        // Every logit of the tile is in shared memory.
+        b.emit(KirOp::Barrier);
 
-    s
+        // Thread 0: the tile's maxima, the rescale, the accumulation.
+        let reduce = b.new_block();
+        let reduce_done = b.new_block();
+        let next: Vec<VarId> = (0..acc.len()).map(|_| b.add_block_param(reduce_done, F32)).collect();
+        let not_thread0 = cmp(b, tid, zero, CmpOp::Ne);
+        b.terminate(KirTerminator::CondBranch(
+            not_thread0,
+            KirEdge::with(reduce_done, acc.to_vec()),
+            KirEdge::to(reduce),
+        ));
+
+        b.set_block(reduce);
+        let (m_s1, s_s1, m_st, s_st, m_tt, s_tt, cross) = (acc[0], acc[1], acc[2], acc[3], acc[4], acc[5], acc[6]);
+        let maxima = tile_scan(b, (v_base, vocab, vtile), &[f_neg_inf, f_neg_inf], |b, i, m| {
+            let s_addr = at(b, F32, Shared, student, i);
+            let s = load(b, F32, s_addr, Shared);
+            let ms = op2(b, F32, KirOp::Max, m[0], s);
+            let t_addr = at(b, F32, Shared, teacher, i);
+            let t = load(b, F32, t_addr, Shared);
+            let mt = op2(b, F32, KirOp::Max, m[1], t);
+            vec![ms, mt]
+        });
+        let (tmax_s, tmax_t) = (maxima[0], maxima[1]);
+        // Online rescale: student at T = 1.
+        let m_s1n = op2(b, F32, KirOp::Max, m_s1, tmax_s);
+        let d = op2(b, F32, KirOp::Sub, m_s1, m_s1n);
+        let sc = f32_exp(b, d);
+        let s_s1r = op2(b, F32, KirOp::Mul, s_s1, sc);
+        // Student / T.
+        let cand = op2(b, F32, KirOp::Mul, tmax_s, tinv);
+        let m_stn = op2(b, F32, KirOp::Max, m_st, cand);
+        let d = op2(b, F32, KirOp::Sub, m_st, m_stn);
+        let sc = f32_exp(b, d);
+        let s_str = op2(b, F32, KirOp::Mul, s_st, sc);
+        // Teacher / T: the sum and the cross-term.
+        let cand = op2(b, F32, KirOp::Mul, tmax_t, tinv);
+        let m_ttn = op2(b, F32, KirOp::Max, m_tt, cand);
+        let d = op2(b, F32, KirOp::Sub, m_tt, m_ttn);
+        let sc = f32_exp(b, d);
+        let s_ttr = op2(b, F32, KirOp::Mul, s_tt, sc);
+        let crossr = op2(b, F32, KirOp::Mul, cross, sc);
+        let sums = tile_scan(b, (v_base, vocab, vtile), &[s_s1r, s_str, s_ttr, crossr], |b, i, a| {
+            let s_addr = at(b, F32, Shared, student, i);
+            let s = load(b, F32, s_addr, Shared);
+            let t_addr = at(b, F32, Shared, teacher, i);
+            let t = load(b, F32, t_addr, Shared);
+            let d = op2(b, F32, KirOp::Sub, s, m_s1n);
+            let e = f32_exp(b, d);
+            let s_s1 = op2(b, F32, KirOp::Add, a[0], e);
+            let st = op2(b, F32, KirOp::Mul, s, tinv);
+            let d = op2(b, F32, KirOp::Sub, st, m_stn);
+            let e = f32_exp(b, d);
+            let s_st = op2(b, F32, KirOp::Add, a[1], e);
+            let tt = op2(b, F32, KirOp::Mul, t, tinv);
+            let d = op2(b, F32, KirOp::Sub, tt, m_ttn);
+            let e_t = f32_exp(b, d);
+            let s_tt = op2(b, F32, KirOp::Add, a[2], e_t);
+            let t_minus_s = op2(b, F32, KirOp::Sub, t, s);
+            let cross = b.new_typed_var(F32);
+            b.emit(KirOp::Fma(cross, e_t, t_minus_s, a[3]));
+            vec![s_s1, s_st, s_tt, cross]
+        });
+        b.terminate(KirTerminator::Branch(KirEdge::with(
+            reduce_done,
+            vec![m_s1n, sums[0], m_stn, sums[1], m_ttn, sums[2], sums[3]],
+        )));
+
+        // The tiles are refilled next trip.
+        b.set_block(reduce_done);
+        b.emit(KirOp::Barrier);
+        next
+    });
+
+    // ── thread 0 writes the loss and the three LSEs ─────────────────────
+    let write = b.new_block();
+    let not_writer = cmp(&mut b, tid, zero, CmpOp::Ne);
+    b.terminate(KirTerminator::CondBranch(not_writer, KirEdge::to(exit), KirEdge::to(write)));
+    b.set_block(write);
+    let lse = |b: &mut KirBuilder, sum: VarId, max: VarId| {
+        let l = b.new_typed_var(F32);
+        b.emit(KirOp::Log(l, sum));
+        op2(b, F32, KirOp::Add, l, max)
+    };
+    let lse_s1 = lse(&mut b, acc[1], acc[0]);
+    let lse_st = lse(&mut b, acc[3], acc[2]);
+    let lse_tt = lse(&mut b, acc[5], acc[4]);
+    let logit_at_target = load(&mut b, F32, target_slot, Shared);
+    let ce = op2(&mut b, F32, KirOp::Sub, lse_s1, logit_at_target);
+    let kl = op2(&mut b, F32, KirOp::Div, acc[6], acc[5]);
+    let kl = op2(&mut b, F32, KirOp::Mul, kl, tinv);
+    let kl = op2(&mut b, F32, KirOp::Sub, kl, lse_tt);
+    let kl = op2(&mut b, F32, KirOp::Add, kl, lse_st);
+    let ce_part = op2(&mut b, F32, KirOp::Mul, alpha, ce);
+    let f_one = konst(&mut b, ConstValue::F32(1.0));
+    let one_minus_alpha = op2(&mut b, F32, KirOp::Sub, f_one, alpha);
+    let t_squared = op2(&mut b, F32, KirOp::Mul, temp, temp);
+    let kl_weight = op2(&mut b, F32, KirOp::Mul, one_minus_alpha, t_squared);
+    let loss = b.new_typed_var(F32);
+    b.emit(KirOp::Fma(loss, kl_weight, kl, ce_part));
+    for (out, v) in [(loss_out, loss), (lse_s1_out, lse_s1), (lse_st_out, lse_st), (lse_tt_out, lse_tt)] {
+        let addr = at(&mut b, F32, Global, out, row);
+        b.emit(KirOp::Store(addr, v, Global));
+    }
+    b.terminate(KirTerminator::Branch(KirEdge::to(exit)));
+
+    // ── an ignored row: thread 0 writes zeros ───────────────────────────
+    b.set_block(skip);
+    let zero_write = b.new_block();
+    let not_zeroer = cmp(&mut b, tid, zero, CmpOp::Ne);
+    b.terminate(KirTerminator::CondBranch(not_zeroer, KirEdge::to(exit), KirEdge::to(zero_write)));
+    b.set_block(zero_write);
+    for out in [loss_out, lse_s1_out, lse_st_out, lse_tt_out] {
+        let addr = at(&mut b, F32, Global, out, row);
+        b.emit(KirOp::Store(addr, f_zero, Global));
+    }
+    b.terminate(KirTerminator::Branch(KirEdge::to(exit)));
+
+    b.set_block(exit);
+    b.terminate(KirTerminator::Return);
+    b.finalize()
+}
+
+/// Build the backward kernel as KIR.
+///
+/// One CTA per token row, 128 threads, no shared memory. Per (row, v) it
+/// recomputes both logits and forms
+///
+/// ```text
+/// dl = alpha*(p_s1 - [v == target]) + (1 - alpha)*T*(p_sT - p_tT)
+/// ```
+///
+/// scaled by `grad / num_valid`, then scatters `dx_s`, `dW_s` and `dbias_s`
+/// with `red.global.add.f32` (the caller zero-fills them). An ignored row
+/// zeroes its `dx_s` row. There are no teacher-gradient outputs (I-11).
+pub fn build_backward(cfg: &FusedKlCeConfig) -> KernelIR {
+    use AddressSpace::Global;
+    use KirType::{F32, I64, U32, U64};
+
+    let mut b = KirBuilder::new(&cfg.bwd_kernel_name());
+    let fptr = || ptr(F32, Global);
+    let grad_output = b.add_param("grad_output", F32, Global);
+    let xs = b.add_param("xs", fptr(), Global);
+    let ws = b.add_param("ws", fptr(), Global);
+    let bs = b.add_param("bs", fptr(), Global);
+    let xt = b.add_param("xt", fptr(), Global);
+    let wt = b.add_param("wt", fptr(), Global);
+    let bt = b.add_param("bt", fptr(), Global);
+    let targets = b.add_param("targets", ptr(I64, Global), Global);
+    let lse_s1 = b.add_param("lse_s1", fptr(), Global);
+    let lse_st = b.add_param("lse_st", fptr(), Global);
+    let lse_tt = b.add_param("lse_tt", fptr(), Global);
+    let dxs_out = b.add_param("dxs_out", fptr(), Global);
+    let dws_out = b.add_param("dws_out", fptr(), Global);
+    let dbs_out = b.add_param("dbs_out", fptr(), Global);
+    for name in ["rows", "V", "HS", "HT"] {
+        b.add_param(name, U32, Global);
+    }
+    let alpha = b.add_param("alpha", F32, Global);
+    let temp = b.add_param("temp", F32, Global);
+    let num_valid = b.add_param("num_valid", U32, Global);
+    b.set_workgroup_size([V1_BLOCK, 1, 1]);
+
+    let entry = b.new_block();
+    b.set_block(entry);
+    let num_valid_f = b.new_typed_var(F32);
+    b.emit(KirOp::Cast(num_valid_f, num_valid, F32));
+    let row = b.new_typed_var(U32);
+    b.emit(KirOp::BlockIdx(row, 0));
+    let tid = b.new_typed_var(U32);
+    b.emit(KirOp::ThreadId(tid, 0));
+    let tinv = b.new_typed_var(F32);
+    b.emit(KirOp::Rcp(tinv, temp));
+    let zero = konst(&mut b, ConstValue::U32(0));
+    let one = konst(&mut b, ConstValue::U32(1));
+    let block = konst(&mut b, ConstValue::U32(V1_BLOCK));
+    let hs = konst(&mut b, ConstValue::U32(cfg.student_hidden));
+    let hs_wide = konst(&mut b, ConstValue::U64(cfg.student_hidden as u64));
+    let row_wide = widen(&mut b, row);
+    let xs_row = op2(&mut b, U64, KirOp::Mul, row_wide, hs_wide);
+    let target_addr = at(&mut b, I64, Global, targets, row);
+    let target = load(&mut b, I64, target_addr, Global);
+    let ignore = i64_const(&mut b, cfg.ignore_index);
+    let skips = cmp(&mut b, target, ignore, CmpOp::Eq);
+    let live = b.new_block();
+    let skip = b.new_block();
+    let exit = b.new_block();
+    b.terminate(KirTerminator::CondBranch(skips, KirEdge::to(skip), KirEdge::to(live)));
+
+    // ── the live row ────────────────────────────────────────────────────
+    b.set_block(live);
+    let saved = |b: &mut KirBuilder, base: VarId| {
+        let addr = at(b, F32, Global, base, row);
+        load(b, F32, addr, Global)
+    };
+    let lse_s1_row = saved(&mut b, lse_s1);
+    let lse_st_row = saved(&mut b, lse_st);
+    let lse_tt_row = saved(&mut b, lse_tt);
+    let ht_wide = konst(&mut b, ConstValue::U64(cfg.teacher_hidden as u64));
+    let xt_row = op2(&mut b, U64, KirOp::Mul, row_wide, ht_wide);
+    let scale = op2(&mut b, F32, KirOp::Div, grad_output, num_valid_f);
+    let f_one = konst(&mut b, ConstValue::F32(1.0));
+    let vocab = konst(&mut b, ConstValue::U32(cfg.vocab_size));
+    let vtile = konst(&mut b, ConstValue::U32(cfg.vocab_tile));
+    let n_tiles = konst(&mut b, ConstValue::U32(cfg.num_vocab_tiles()));
+    let per_thread = konst(&mut b, ConstValue::U32(cfg.vocab_tile / V1_BLOCK));
+    bottom_tested_loop(&mut b, (zero, n_tiles, one), &[], |b, tile, _| {
+        let v_base = op2(b, U32, KirOp::Mul, tile, vtile);
+        bottom_tested_loop(b, (zero, per_thread, one), &[], |b, j, _| {
+            let lane_base = op2(b, U32, KirOp::Mul, j, block);
+            let slot = op2(b, U32, KirOp::Add, lane_base, tid);
+            let v = op2(b, U32, KirOp::Add, slot, v_base);
+            let in_vocab = cmp(b, v, vocab, CmpOp::Lt);
+            let column = b.new_block();
+            let column_done = b.new_block();
+            b.terminate(KirTerminator::CondBranch(in_vocab, KirEdge::to(column), KirEdge::to(column_done)));
+
+            b.set_block(column);
+            let v_wide = widen(b, v);
+            let ws_row = op2(b, U64, KirOp::Mul, v_wide, hs_wide);
+            let s_dot = dot(b, (xs, xs_row), (ws, ws_row), cfg.student_hidden);
+            let bs_addr = at(b, F32, Global, bs, v);
+            let bs_v = load(b, F32, bs_addr, Global);
+            let s = op2(b, F32, KirOp::Add, s_dot, bs_v);
+            let wt_row = op2(b, U64, KirOp::Mul, v_wide, ht_wide);
+            let t_dot = dot(b, (xt, xt_row), (wt, wt_row), cfg.teacher_hidden);
+            let bt_addr = at(b, F32, Global, bt, v);
+            let bt_v = load(b, F32, bt_addr, Global);
+            let t = op2(b, F32, KirOp::Add, t_dot, bt_v);
+            // The three probabilities, from the saved LSEs.
+            let d = op2(b, F32, KirOp::Sub, s, lse_s1_row);
+            let p_s1 = f32_exp(b, d);
+            let st = op2(b, F32, KirOp::Mul, s, tinv);
+            let d = op2(b, F32, KirOp::Sub, st, lse_st_row);
+            let p_st = f32_exp(b, d);
+            let tt = op2(b, F32, KirOp::Mul, t, tinv);
+            let d = op2(b, F32, KirOp::Sub, tt, lse_tt_row);
+            let p_tt = f32_exp(b, d);
+            // dl = alpha*(p_s1 - [v == target]) + (1 - alpha)*T*(p_sT - p_tT)
+            let v_signed = b.new_typed_var(I64);
+            b.emit(KirOp::Cast(v_signed, v, I64));
+            let is_target = cmp(b, v_signed, target, CmpOp::Eq);
+            let p_s1_minus_one = op2(b, F32, KirOp::Sub, p_s1, f_one);
+            let p_ce = b.new_typed_var(F32);
+            b.emit(KirOp::Select(p_ce, is_target, p_s1_minus_one, p_s1));
+            let dl_ce = op2(b, F32, KirOp::Mul, alpha, p_ce);
+            let p_diff = op2(b, F32, KirOp::Sub, p_st, p_tt);
+            let one_minus_alpha = op2(b, F32, KirOp::Sub, f_one, alpha);
+            let kl_weight = op2(b, F32, KirOp::Mul, one_minus_alpha, temp);
+            let dl = b.new_typed_var(F32);
+            b.emit(KirOp::Fma(dl, kl_weight, p_diff, dl_ce));
+            let g = op2(b, F32, KirOp::Mul, dl, scale);
+            // Scatter into the student's gradients.
+            bottom_tested_loop(b, (zero, hs, one), &[], |b, h, _| {
+                let h_wide = widen(b, h);
+                let w_index = op2(b, U64, KirOp::Add, ws_row, h_wide);
+                let w_addr = at(b, F32, Global, ws, w_index);
+                let wv = load(b, F32, w_addr, Global);
+                let dx_part = op2(b, F32, KirOp::Mul, g, wv);
+                let x_index = op2(b, U64, KirOp::Add, xs_row, h_wide);
+                let dx_addr = at(b, F32, Global, dxs_out, x_index);
+                b.emit(KirOp::AtomicAdd(dx_addr, dx_part, Global));
+                let x_addr = at(b, F32, Global, xs, x_index);
+                let xv = load(b, F32, x_addr, Global);
+                let dw_part = op2(b, F32, KirOp::Mul, g, xv);
+                let dw_addr = at(b, F32, Global, dws_out, w_index);
+                b.emit(KirOp::AtomicAdd(dw_addr, dw_part, Global));
+                vec![]
+            });
+            let db_addr = at(b, F32, Global, dbs_out, v);
+            b.emit(KirOp::AtomicAdd(db_addr, g, Global));
+            b.terminate(KirTerminator::Branch(KirEdge::to(column_done)));
+
+            b.set_block(column_done);
+            vec![]
+        });
+        vec![]
+    });
+    b.terminate(KirTerminator::Branch(KirEdge::to(exit)));
+
+    // ── an ignored row: its dx_s row is zeroed ──────────────────────────
+    b.set_block(skip);
+    let head = b.new_block();
+    let body = b.new_block();
+    let k = b.add_block_param(head, U32);
+    b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![zero])));
+    b.set_block(head);
+    let lane_base = op2(&mut b, U32, KirOp::Mul, k, block);
+    let slot = op2(&mut b, U32, KirOp::Add, lane_base, tid);
+    let in_row = cmp(&mut b, slot, hs, CmpOp::Lt);
+    b.terminate(KirTerminator::CondBranch(in_row, KirEdge::to(body), KirEdge::to(exit)));
+    b.set_block(body);
+    let slot_wide = widen(&mut b, slot);
+    let dx_index = op2(&mut b, U64, KirOp::Add, xs_row, slot_wide);
+    let dx_addr = at(&mut b, F32, Global, dxs_out, dx_index);
+    let f_zero = konst(&mut b, ConstValue::F32(0.0));
+    b.emit(KirOp::Store(dx_addr, f_zero, Global));
+    let k_next = op2(&mut b, U32, KirOp::Add, k, one);
+    b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![k_next])));
+
+    b.set_block(exit);
+    b.terminate(KirTerminator::Return);
+    b.finalize()
 }
 
 // ─── Reference implementation (test oracle) ─────────────────────────────────

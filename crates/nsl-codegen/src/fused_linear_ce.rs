@@ -512,7 +512,7 @@ pub fn synthesize_fused_linear_ce_backward_ptx(cfg: &FusedLinearCEConfig) -> Vec
 // kernels did) and the logit-at-target slot after it.
 
 /// Threads per CTA, and the stride of the v1 tile fill.
-const V1_BLOCK: u32 = 128;
+pub(crate) const V1_BLOCK: u32 = 128;
 /// Index of each shared region in [`v1_forward_smem`].
 const R_LOGITS: u32 = 0;
 const R_TARGET: u32 = 1;
@@ -541,7 +541,7 @@ fn v1_forward_smem(cfg: &FusedLinearCEConfig) -> SmemLayout {
     SmemLayout { regions: vec![region("logits", cfg.vocab_tile), region("logit_at_target", 1)], dynamic: true }
 }
 
-fn i64_const(b: &mut KirBuilder, v: i64) -> VarId {
+pub(crate) fn i64_const(b: &mut KirBuilder, v: i64) -> VarId {
     let dst = b.new_typed_var(KirType::I64);
     b.emit(KirOp::Const(dst, KirConst { ty: KirType::I64, value: ConstValue::I64(v) }));
     dst
@@ -1274,7 +1274,7 @@ fn emit_large_forward(cfg: &FusedLinearCEConfig) -> Vec<u8> {
 /// — a loop tested at the bottom, for a trip count known to be at least one.
 /// The builder is left in the loop's exit block; the carried values after
 /// the last trip are returned.
-fn bottom_tested_loop(
+pub(crate) fn bottom_tested_loop(
     b: &mut KirBuilder,
     (start, end, step): (VarId, VarId, VarId),
     init: &[VarId],

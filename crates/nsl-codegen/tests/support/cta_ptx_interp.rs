@@ -25,7 +25,7 @@
 //! hardware's approximation does. `sqrt.rn.f32` is IEEE and so is Rust's.
 //! `cvt.rn.f16.f32` and `cvt.rn.bf16.f32` round to nearest even, as
 //! `half` does, and `st.b16` stores the register's low two bytes.
-//! `lg2.approx.f32` is modelled as `log2`.
+//! `lg2.approx.f32` is modelled as `log2`, `rcp.approx.f32` as `1 / x`.
 //!
 //! One `.extern .shared` block (dynamic shared memory) is modelled: it sits
 //! after the static blocks, and its size is what the launch allocates past
@@ -166,6 +166,8 @@ pub(crate) enum Op {
     /// `cvt.rn.bf16.f32`: round to nearest even, into the low 16 bits.
     CvtBf16F32 { d: usize, a: Src },
     Lg2 { d: usize, a: Src },
+    /// `rcp.approx.f32`, modelled as `1 / a`.
+    Rcp { d: usize, a: Src },
     Ld { space: Space, bytes: usize, d: usize, addr: Addr },
     /// `ld.global.s8`: one byte, sign-extended into the register.
     LdS8 { space: Space, d: usize, addr: Addr },
@@ -447,6 +449,10 @@ pub(crate) fn parse(ptx: &str) -> Program {
             ["cvt", "rn", "bf16", "f32"] => {
                 want(2);
                 Op::CvtBf16F32 { d: p.dst(ops[0]), a: p.src(ops[1]) }
+            }
+            ["rcp", "approx", "f32"] => {
+                want(2);
+                Op::Rcp { d: p.dst(ops[0]), a: p.src(ops[1]) }
             }
             ["lg2", "approx", "f32"] => {
                 want(2);
@@ -856,6 +862,10 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
             }
             Op::Lg2 { d, a } => {
                 let v = f(rd(t, launch, *a)).log2();
+                write(t, *d, fb(v));
+            }
+            Op::Rcp { d, a } => {
+                let v = 1.0 / f(rd(t, launch, *a));
                 write(t, *d, fb(v));
             }
             Op::Ld { space, bytes, d, addr } => {
