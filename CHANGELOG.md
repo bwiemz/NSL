@@ -8,6 +8,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- The fused linear-CE backward (`nsl_fused_linear_ce_backward_*`) is built
+  as KIR (roadmap A2 step 10, third slice), one builder for f32, f16 and
+  bf16. `fused_linear_ce.rs` no longer writes PTX text and leaves the
+  hand-PTX freeze (`ci/hand-ptx-manifest.txt`: 61 → 60 files).
+  `tests/fused_linear_ce_bwd_kir_equivalence.rs` runs the frozen hand
+  kernels and the KIR one on the shared PTX interpreter (which learned
+  `red.add.f32`, run in the schedule's thread order) and requires the same
+  bits in `dx`, `dW` and `dbias`, and an f64 reference's gradient. The
+  backward byte-identity snapshot is re-blessed to the KIR module.
+
 - The fused linear-CE large-vocab forward pair
   (`nsl_fused_linear_ce_fwd_large_{partials,finalize}_*`) is built as KIR
   (roadmap A2 step 10, second slice): one builder per kernel for f32, f16
@@ -459,6 +469,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- `KirOp::AtomicAdd` printed `atom.<space>.add.<ty> %v, [p], %v`, which
+  writes memory's old value into the added value's register without the
+  register allocator knowing, so a later read of that value, or a value
+  sharing its register, saw the old memory. It returns nothing, so it now
+  prints `red.<space>.add.<ty> [p], %v`.
 - `tests/cfie_speculative_generate_gpu_e2e.rs` compiles again with the
   `cuda` feature: it still set `RejectionConfig::sm_version`, which the
   rejection kernel's move onto KIR removed.

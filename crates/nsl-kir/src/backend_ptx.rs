@@ -594,14 +594,20 @@ fn emit_op(ptx: &mut String, op: &KirOp, ir: &KernelIR) {
             .unwrap();
         }
         KirOp::AtomicAdd(ptr, val, addr_space) => {
+            // `AtomicAdd` returns nothing, so it lowers to `red`, the
+            // reduction without a result. It printed `atom d, [p], v` with
+            // `d` = `v`, writing the old value into the value's register
+            // behind the allocator's back: a later read of `v`, or a value
+            // sharing its register, saw memory's old contents (roadmap A2
+            // step 10, the fused linear-CE backward, found it).
             let space = address_space_str(*addr_space);
             let ty = var_ptx_type(ir, *val, *val);
             let val_prefix = var_reg_prefix(ir, *val, *val);
             let ptr_prefix = var_reg_prefix(ir, *ptr, *ptr);
             writeln!(
                 ptx,
-                "    atom.{}.add.{} {}{}, [{}{}], {}{};",
-                space, ty, val_prefix, val, ptr_prefix, ptr, val_prefix, val
+                "    red.{}.add.{} [{}{}], {}{};",
+                space, ty, ptr_prefix, ptr, val_prefix, val
             )
             .unwrap();
         }
@@ -2264,7 +2270,7 @@ mod tests {
         let n = |v: VarId| al.name(v);
         let (pc, pp, pv, pd, pnc, ps) = (n(c), n(p), n(v), n(d), n(nc), n(s));
         assert!(ptx.contains(&format!("    @{pc} st.global.f32 [{pp}], {pv};")), "{ptx}");
-        assert!(ptx.contains(&format!("    @!{pc} atom.global.add.f32")), "{ptx}");
+        assert!(ptx.contains(&format!("    @!{pc} red.global.add.f32 [{pp}], {pv};")), "{ptx}");
         assert!(ptx.contains(".reg .pred %edge_p;"), "{ptx}");
         assert!(
             ptx.contains(&format!("and.pred %edge_p, {pc}, {pnc};\n    not.pred {pd}, {pc};\n    and.pred {pd}, {pd}, {pc};\n    or.pred {pd}, {pd}, %edge_p;")),

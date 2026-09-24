@@ -14,7 +14,8 @@
 //! that module's text; that it computes what the pre-migration hand kernel
 //! did is proved by `fused_linear_ce_fwd_kir_equivalence.rs`, which runs
 //! both on the PTX interpreter and requires the same output bits. The
-//! backward snapshot still pins the hand kernel.
+//! backward snapshot was re-blessed the same way when the backward moved
+//! (third slice); `fused_linear_ce_bwd_kir_equivalence.rs` proves it.
 //!
 //! Snapshots live in `tests/snapshots/fused_linear_ce_v1_byte_identity__*.snap`.
 

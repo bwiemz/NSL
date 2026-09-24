@@ -656,10 +656,8 @@ pub fn terminator_uses(term: &KirTerminator) -> Vec<VarId> {
 }
 
 /// The `VarId`s an op defines: one for most ops, four for the
-/// warp-collective loads and MACs, none for `Store`, `AtomicAdd`, the
-/// barriers and the async-copy group (`AtomicAdd`'s PTX lowering reuses the
-/// value register for the returned old value, a backend detail, not an IR
-/// definition).
+/// warp-collective loads and MACs, none for `Store`, `AtomicAdd` (it lowers
+/// to `red`, which returns nothing), the barriers and the async-copy group.
 pub fn op_dsts(op: &KirOp) -> Vec<VarId> {
     match op {
         KirOp::LdMatrix { dst, .. } => dst.clone(),

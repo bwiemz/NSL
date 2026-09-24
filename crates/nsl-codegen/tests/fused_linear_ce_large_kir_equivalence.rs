@@ -496,12 +496,13 @@ fn setp_lines(ptx: &str, op: &str) -> Vec<(usize, String)> {
     ptx.lines().enumerate().filter(|(_, l)| l.trim_start().starts_with(op)).map(|(n, l)| (n, l.to_string())).collect()
 }
 
-/// `ptx` with line `n` rewritten from `from` to `to` (two lines may read
-/// the same, so a line is named by its number).
-fn at_line(ptx: &str, n: usize, from: &str, to: &str) -> String {
+/// `ptx` with the `i`th line starting with `op` rewritten from `op` to
+/// `to`. Lines are found in the text being mutated: the f32 and f16
+/// modules number their lines differently, and two lines may read the same.
+fn at_nth(ptx: &str, op: &str, i: usize, to: &str) -> String {
+    let n = setp_lines(ptx, op)[i].0;
     let mut out: Vec<String> = ptx.lines().map(str::to_string).collect();
-    assert!(out[n].contains(from), "line {n} `{}`", out[n]);
-    out[n] = out[n].replacen(from, to, 1);
+    out[n] = out[n].replacen(op, to, 1);
     out.join("\n") + "\n"
 }
 
@@ -532,18 +533,18 @@ fn running_any_loop_one_trip_long_is_caught() {
     for (k, top_tested) in [(0, 2), (1, 2)] {
         let exits = setp_lines(kernel_text(&module, k), "setp.ge.u32 ");
         assert_eq!(exits.len(), top_tested, "kernel {k}: {exits:?}");
-        for (n, exit) in exits {
+        for (i, (_, exit)) in exits.iter().enumerate() {
             assert!(
-                caught(|p| in_kernel(p, k, |t| at_line(t, n, "setp.ge.u32", "setp.gt.u32"))),
+                caught(|p| in_kernel(p, k, |t| at_nth(t, "setp.ge.u32", i, "setp.gt.u32"))),
                 "kernel {k}: `{exit}` one trip long went unnoticed"
             );
         }
     }
     let lts = setp_lines(kernel_text(&module, 0), "setp.lt.u32 ");
     assert_eq!(lts.len(), 3, "{lts:?}");
-    for (n, exit) in &lts[1..] {
+    for (i, (_, exit)) in lts.iter().enumerate().skip(1) {
         assert!(
-            caught(|p| in_kernel(p, 0, |t| at_line(t, *n, "setp.lt.u32", "setp.le.u32"))),
+            caught(|p| in_kernel(p, 0, |t| at_nth(t, "setp.lt.u32", i, "setp.le.u32"))),
             "scan `{exit}` one trip long went unnoticed"
         );
     }
@@ -554,9 +555,9 @@ fn running_any_loop_one_trip_long_is_caught() {
 fn relaxing_the_vocab_guard_is_caught() {
     // `<` -> `<=`: the fill reads W and bias one column past the vocab.
     let c = mutation_cases().remove(0);
-    let (n, guard) = setp_lines(kernel_text(&kir_ptx(&c), 0), "setp.lt.u32 ").remove(0);
+    let (_, guard) = setp_lines(kernel_text(&kir_ptx(&c), 0), "setp.lt.u32 ").remove(0);
     assert!(guard.contains(", %r"), "{guard}");
-    assert!(caught(|p| in_kernel(p, 0, |t| at_line(t, n, "setp.lt.u32", "setp.le.u32"))));
+    assert!(caught(|p| in_kernel(p, 0, |t| at_nth(t, "setp.lt.u32", 0, "setp.le.u32"))));
 }
 
 #[test]

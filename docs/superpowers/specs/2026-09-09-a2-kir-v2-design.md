@@ -650,6 +650,30 @@ frozen throughout, so nothing here blocks a kernel fix.
     hand scans were. Kernel A then takes 31–39 registers on sm_80, sm_90
     and sm_120 in every dtype, where the hand kernels took 160–167 on sm_80;
     Kernel B takes the hand kernels' 32 and 40; nothing spills.
+
+    **The backward done** (third slice); `fused_linear_ce.rs` has left the
+    freeze (manifest 61 → 60). `build_backward` builds it for every dtype,
+    its loops bottom-tested as the hand kernel's were. Its three scatters
+    are `KirOp::AtomicAdd`, and the slice found that op's printer wrong:
+    it printed `atom.global.add.f32 %v, [p], %v`, writing memory's old
+    value into the value's register, a definition the IR does not have and
+    the allocator could not see, so a later read of the value (or a value
+    allocated the same register) saw the old memory. `AtomicAdd` returns
+    nothing, so it now prints `red`, the reduction without a result. The
+    interpreter learned `red.{global,shared}.add.f32` as a read-modify-write
+    in the schedule's thread order, which makes f32 atomics differentially
+    testable: both kernels add the same values in the same per-thread
+    order, so under one schedule their sums agree bit for bit. The gate
+    compares all of global memory (`dx`, pre-filled so an ignored row's
+    zeroing shows, `dW` and `dbias`) across the three dtypes, a ragged and
+    an exact tile, a hidden wider than the block, an ignored row and a
+    target past the vocab, and checks the gradient against an f64
+    reference. It catches every scatter deleted, every loop run one trip
+    long but one, every guard relaxed and every baked constant nudged
+    (including the `1` taken off the target's probability). The one
+    equivalent mutant is named: one more trip of the tile loop starts past
+    the vocab, where the guard turns every lane away. Registers match or
+    beat the hand kernel's (28–40 against 32–40, no spills).
 11. **The runtime kernels**, by family (`strided_copy`,
     `tier_b1_prepass`, then `kernels.rs` and `fused_kernels.rs` in
     slices), each slice one PR. Proof: normalised identity where
