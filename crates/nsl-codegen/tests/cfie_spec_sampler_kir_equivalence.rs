@@ -166,6 +166,7 @@ fn run(ptx: &str, kernel: Kernel, g: Geometry, input: &Inputs, order: Order) -> 
         // thread wrote this launch shows in the output.
         shared: vec![0xFF; prog.shared_bytes],
         ctaid: 0,
+        ctaid_y: 0,
         ntid: BLOCK,
         steps: 0,
     };
@@ -566,7 +567,7 @@ fn the_interpreter_stores_u32_and_models_rsqrt() {
     let prog = parse(ptx);
     let mut global = vec![Segment { base: 0x100, bytes: vec![0; 8] }];
     let args: HashMap<String, u64> = [("o".to_string(), 0x100)].into_iter().collect();
-    let mut launch = Launch { prog: &prog, args: &args, global: &mut global, shared: vec![], ctaid: 0, ntid: 1, steps: 0 };
+    let mut launch = Launch { prog: &prog, args: &args, global: &mut global, shared: vec![], ctaid: 0, ctaid_y: 0, ntid: 1, steps: 0 };
     run_cta(&mut launch, Order::Ascending);
     assert_eq!(words(&global[0].bytes), [0x1234_5678, 0.5f32.to_bits()]);
 }

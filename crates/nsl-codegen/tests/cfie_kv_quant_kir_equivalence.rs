@@ -187,6 +187,7 @@ fn run(ptx: &str, g: &Geometry, input: &Inputs, call: Call, order: Order) -> Vec
             // no thread wrote this launch shows in the output.
             shared: vec![0xFF; prog.shared_bytes],
             ctaid,
+            ctaid_y: 0,
             ntid: BLOCK,
             steps: 0,
         };
@@ -511,7 +512,7 @@ fn the_interpreter_sign_extends_int8() {
     let mut global = vec![Segment { base: 0x100, bytes: vec![0x80] }, Segment { base: 0x200, bytes: vec![0; 4] }];
     let args: HashMap<String, u64> = [("p".to_string(), 0x100), ("o".to_string(), 0x200)].into_iter().collect();
     let mut launch =
-        Launch { prog: &prog, args: &args, global: &mut global, shared: vec![], ctaid: 0, ntid: 1, steps: 0 };
+        Launch { prog: &prog, args: &args, global: &mut global, shared: vec![], ctaid: 0, ctaid_y: 0, ntid: 1, steps: 0 };
     run_cta(&mut launch, Order::Ascending);
     assert_eq!(f32::from_le_bytes(global[1].bytes[..4].try_into().unwrap()), -128.0);
 }

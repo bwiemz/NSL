@@ -656,15 +656,18 @@ A2 step 10): the v1 single-CTA fused linear-CE forward, one builder for f32,
 f16 and bf16 (the storage dtype picks the element type of the inputs and of
 the dynamic shared logits tile). `tests/fused_linear_ce_fwd_kir_equivalence.rs`
 runs it against the frozen emitters in `tests/fixtures/fused_linear_ce_hand.rs`
-on the same interpreter; the file's large-vocab pair and backward are still
-hand-written.
+on the same interpreter. The large-vocab pair, `build_large_partials` and
+`build_large_finalize`, is lowered into one module by
+`nsl_kir::backend_ptx::lower_kir_module_to_ptx` (one header, the shared block
+declared once) and proved by `tests/fused_linear_ce_large_kir_equivalence.rs`;
+the file's backward is still hand-written.
 
 **Hand-written PTX emitters (frozen).** `src/flash_attention.rs`
 (`synthesize_flash_attention_ptx`, `synthesize_flash_attention_backward_ptx`),
 `src/flash_attention_v2/` (`synthesize_flash_attention_ptx_v2`, `phases/`,
 `tier_b1/`, `tier_b2/`, `mma_forward.rs`, `per_doc_cta.rs`, `sinks.rs`),
 `src/flash_attention_selector.rs`, `src/fused_linear_ce.rs`
-(the large-vocab v2 pair and the backward; its v1 forward is KIR),
+(the backward; its forward kernels are KIR),
 `src/matmul_mma.rs` (MMA fragment primitives), `src/moe_kernels.rs`,
 `src/wrga_fused_ptx.rs`,
 `src/cpkd_fused_loss.rs`, `src/bitnet/`, `src/pca_rope.rs`,

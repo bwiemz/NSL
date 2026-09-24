@@ -13,10 +13,10 @@
 //! ## Why bf16 needs PTX 8.0
 //!
 //! `cvt.f32.bf16` / `cvt.rn.bf16.f32` were introduced in PTX ISA 7.8 and
-//! require `.target sm_80+`. The Bf16 path bumps the header to
-//! `.version 8.0` (via `FusedLinearCEConfig::ptx_header()` dtype dispatch);
-//! F32 and F16 stay at `.version 7.0` so their byte-identity snapshots
-//! remain pinned to pre-v4 PTX.
+//! require `.target sm_80+`. The hand-written Bf16 backward bumps the
+//! header to `.version 8.0` (via `FusedLinearCEConfig::ptx_header()` dtype
+//! dispatch); the KIR forward kernels (roadmap A2 step 10) take the KIR
+//! bf16 floor, `.version 7.8` on `sm_80`.
 
 use nsl_codegen::fused_linear_ce::{
     Dtype, FusedLinearCEConfig, MAX_VOCAB_HARD_CEILING,
@@ -251,11 +251,14 @@ fn bf16_large_vocab_two_kernel_module_assembles_for_sm80_at_v49152() {
     // Kernel A is bf16-staged.
     assert!(txt.contains("ld.global.b16"));
     assert!(txt.contains("cvt.f32.bf16"));
-    assert!(txt.contains(".version 8.0"));
+    // The KIR module's bf16 floor: PTX ISA 7.8 on sm_80, once.
+    assert!(txt.starts_with(".version 7.8\n.target sm_80"));
+    assert_eq!(txt.matches(".version ").count(), 1);
     // Kernel A's partials write MUST stay f32 (per design — cross-CTA LSE
-    // accuracy). Search for the canonical f32 partials store.
+    // accuracy).
+    let partials_kernel = &txt[..txt.find(&cfg.large_finalize_kernel_name()).unwrap()];
     assert!(
-        txt.contains("st.global.f32 [%rd5],   %ftmax;"),
+        partials_kernel.contains("st.global.f32 ") && !partials_kernel.contains("st.global.b16"),
         "Kernel A partials MUST stay f32 (numerical robustness)"
     );
 
@@ -300,8 +303,8 @@ fn bf16_intermediate_scale_assembles_for_sm80_at_v16384() {
 
 // ─── Sprint v4-1 — Bf16 tail-zero sentinel regression guard ─────────────
 //
-// Mirrors `fused_linear_ce_fp16_ptxas::fp16_large_vocab_tail_zero_writes_
-// fp16_neg_inf_directly`. For bf16 the correct -INF bit pattern is
+// Mirrors `fused_linear_ce_fp16_ptxas::fp16_large_vocab_tail_lanes_hold_
+// fp16_neg_inf`. For bf16 the correct -INF bit pattern is
 // `0xFF80` (sign bit + all-ones 8-bit exponent + zero 7-bit mantissa);
 // f16's `0xFC00` would round-trip through cvt.rn.bf16.f32 to a finite
 // value (since the bf16 mantissa is smaller than f16's) and silently
@@ -314,7 +317,7 @@ fn bf16_intermediate_scale_assembles_for_sm80_at_v16384() {
 // then-cvt pattern is absent from the partials kernel.
 
 #[test]
-fn bf16_large_vocab_tail_zero_writes_bf16_neg_inf_directly() {
+fn bf16_large_vocab_tail_lanes_hold_bf16_neg_inf() {
     let cfg = FusedLinearCEConfig {
         vocab_size: 49153,
         hidden_size: 128,
@@ -332,17 +335,6 @@ fn bf16_large_vocab_tail_zero_writes_bf16_neg_inf_directly() {
     let ptx = synthesize_fused_linear_ce_ptx(&cfg);
     let txt = std::str::from_utf8(&ptx).expect("PTX must be ASCII");
 
-    // (1) Direct bf16 -INF write at the tail-zero label.
-    assert!(
-        txt.contains("LP_INNER_TAIL_ZERO:"),
-        "Large-vocab bf16 partials must keep the LP_INNER_TAIL_ZERO label"
-    );
-    assert!(
-        txt.contains("mov.b16 %h2, 0xFF80"),
-        "Tail-zero branch MUST write bf16 -INF (0xFF80) directly — using \
-         the fp16 -INF pattern (0xFC00) here would silently corrupt the \
-         per-tile max-reduce, the same hazard class as fp16's Finding 2"
-    );
     // (2) The broken f32-sentinel-then-cvt pattern must NOT appear in the
     // partials kernel section. Scope the search to the partials kernel
     // to avoid false-positives in the finalize kernel (which legitimately
@@ -357,6 +349,26 @@ fn bf16_large_vocab_tail_zero_writes_bf16_neg_inf_directly() {
         .map(|off| partials_start + off)
         .unwrap_or(txt.len());
     let partials_section = &txt[partials_start..partials_end];
+    // (1) The tail lanes hold bf16 -INF. Since roadmap A2 step 10 the
+    // partials kernel is KIR: a lane past the vocab carries the f32 -INF
+    // (`0fFF800000`, never the old `0f80800000`) into the same
+    // `cvt.rn.bf16.f32` the real logits take, and converting an infinity
+    // is exact, so the shared tile holds 0xFF80.
+    // `tests/fused_linear_ce_large_kir_equivalence.rs` runs the kernel on
+    // ragged tiles against the hand kernel that wrote 0xFF80 directly, and
+    // catches a finite tail (`a_finite_tail_is_caught`).
+    assert_eq!(half::bf16::from_f32(f32::NEG_INFINITY).to_bits(), 0xFF80);
+    assert!(
+        partials_section
+            .lines()
+            .any(|l| l.trim_start().starts_with("mov.f32 %f") && l.ends_with(", 0fFF800000;")),
+        "the tail lanes MUST carry the f32 -INF 0fFF800000 into the cvt"
+    );
+    assert!(partials_section.contains("cvt.rn.bf16.f32 "));
+    assert!(
+        !partials_section.contains("st.shared.f32"),
+        "the shared tile MUST hold bf16, so the tail's -INF goes through the cvt"
+    );
     assert!(
         !partials_section.contains("mov.f32 %facc, 0f80800000"),
         "Partials kernel must NOT mov 0f80800000 into %facc — that's the \

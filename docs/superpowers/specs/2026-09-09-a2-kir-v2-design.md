@@ -621,6 +621,35 @@ frozen throughout, so nothing here blocks a kernel fix.
     equivalent and is avoided rather than named: the tile width minus one,
     since it is both the tile's stride and the scans' bound, re-tiles the
     vocab with neither gap nor double count.
+
+    **The large-vocab pair done** (second slice). `build_large_partials`
+    (Kernel A, grid `(num_tiles, B*S)`) and `build_large_finalize` (Kernel
+    B, grid `(B*S)`) build them for every dtype. The launcher loads both
+    from one module, so the printer gained `lower_kir_module_to_ptx`: one
+    header covering every kernel's features, the shared block declared
+    once (two kernels declaring different blocks are refused, since both
+    would be `shared_mem`), then the entries; for one kernel it prints
+    exactly what `lower_kir_to_ptx` does. The hand kernels wrote the
+    16-bit tail sentinel as a literal (`0xFC00`, `0xFF80`); the KIR fill
+    carries the f32 `-inf` through the same `cvt.rn` as the real logits,
+    which converts an infinity exactly. The interpreter learned `%ctaid.y`
+    and `add`/`sub`/`mul.lo` on `.s64`. The gate launches Kernel A over its
+    whole two-dimensional grid and then Kernel B, as the host does, and
+    compares all of global memory, partials included, across the three
+    dtypes, ragged, exact and one-column tiles, ignored rows and a vocab
+    past the routing threshold; it checks loss and log-sum-exp against an
+    f64 reference (over storage-rounded logits for the lse; the target's
+    logit is recomputed in f32 and not rounded). It catches the barrier
+    deleted, every loop of either kernel run one trip long, the relaxed
+    vocab guard, every baked constant of either kernel nudged, and a finite
+    tail. No mutant is equivalent: the shared tile's pad is poisoned with a
+    finite f32, so even the max scan's extra trip shows. Loop shape reaches
+    the machine: with Kernel A's two scans tested at the top, `ptxas`
+    unrolled the f32 ones whole on sm_90 and sm_120 (161 and 130 registers
+    against the hand kernels' 32 and 40), so they are bottom-tested, as the
+    hand scans were. Kernel A then takes 31–39 registers on sm_80, sm_90
+    and sm_120 in every dtype, where the hand kernels took 160–167 on sm_80;
+    Kernel B takes the hand kernels' 32 and 40; nothing spills.
 11. **The runtime kernels**, by family (`strided_copy`,
     `tier_b1_prepass`, then `kernels.rs` and `fused_kernels.rs` in
     slices), each slice one PR. Proof: normalised identity where

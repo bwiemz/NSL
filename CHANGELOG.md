@@ -8,6 +8,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- The fused linear-CE large-vocab forward pair
+  (`nsl_fused_linear_ce_fwd_large_{partials,finalize}_*`) is built as KIR
+  (roadmap A2 step 10, second slice): one builder per kernel for f32, f16
+  and bf16, replacing six hand-assembled PTX kernels.
+  `nsl_kir::backend_ptx::lower_kir_module_to_ptx` lowers several kernels
+  into one module under one header, which the launcher loads as before.
+  `tests/fused_linear_ce_large_kir_equivalence.rs` launches Kernel A over
+  its two-dimensional grid and then Kernel B, hand and KIR, on the shared
+  PTX interpreter (which learned `%ctaid.y` and 64-bit signed arithmetic),
+  and requires the same bits in all of global memory, partials included,
+  and an f64 reference's loss and log-sum-exp; its mutation tests have no
+  equivalent mutant. The module targets the KIR floor (`sm_70`; bf16 uses
+  `sm_80` and ISA 7.8, where the hand bf16 module declared ISA 8.0).
 - The fused linear-CE v1 forward kernel (`nsl_fused_linear_ce_{f32,f16,bf16}_*`)
   is built as KIR (roadmap A2 step 10, first slice). It was three
   hand-assembled PTX kernels, one per dtype; one KIR builder now makes all

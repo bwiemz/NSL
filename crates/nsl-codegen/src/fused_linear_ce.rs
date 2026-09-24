@@ -83,9 +83,12 @@
 //! emitters (`tests/fixtures/fused_linear_ce_hand.rs`) against it on the PTX
 //! interpreter and requires the same output bits, and an f64 reference's
 //! answer. It targets the KIR floor (`sm_70`; bf16 raises it to `sm_80` and
-//! ISA 7.8), so `gpu_sm` no longer reaches it. The large-vocab pair and the
-//! backward are still hand-written here, and the file stays in the hand-PTX
-//! freeze until they move too.
+//! ISA 7.8), so `gpu_sm` no longer reaches it. The large-vocab pair has
+//! moved as well: [`build_large_partials`] and [`build_large_finalize`],
+//! lowered into one module under one header, proved by
+//! `tests/fused_linear_ce_large_kir_equivalence.rs` over Kernel A's
+//! two-dimensional grid then Kernel B. The backward is still hand-written
+//! here, and the file stays in the hand-PTX freeze until it moves too.
 //!
 //! ## API
 //!
@@ -101,7 +104,7 @@
 //! let bwd_ptx = nsl_codegen::fused_linear_ce::synthesize_fused_linear_ce_backward_ptx(&cfg);
 //! ```
 
-use crate::backend_ptx::lower_kir_to_ptx;
+use crate::backend_ptx::{lower_kir_module_to_ptx, lower_kir_to_ptx};
 use crate::cfie_decode_attention::{at, cmp, konst, load, op2, ptr, widen};
 use crate::kernel_ir::{
     AddressSpace, CmpOp, ConstValue, KernelIR, KirBuilder, KirConst, KirEdge, KirOp, KirTerminator,
@@ -481,41 +484,14 @@ pub fn synthesize_fused_linear_ce_ptx(cfg: &FusedLinearCEConfig) -> Vec<u8> {
 /// partials) and Kernel B (per-row finalize) of the Sprint-3 large-vocab
 /// two-kernel forward path.
 ///
-/// Both kernels share the same `.version` / `.target` header and use
-/// separately-named `.extern .shared` allocations so the module compiles
-/// as one ptxas TU.
+/// Both kernels ([`build_large_partials`], [`build_large_finalize`]) share
+/// one `.version` / `.target` header; Kernel A's tile is the module's one
+/// dynamic shared block (Kernel B uses none, and is launched with 0), so
+/// the module compiles as one ptxas TU.
 pub fn synthesize_large_vocab_forward_ptx(cfg: &FusedLinearCEConfig) -> Vec<u8> {
-    // Contract: returned bytes are null-terminated, matching the convention
-    // established by `backend_ptx::lower_kir_to_ptx`. See
-    // `synthesize_fused_linear_ce_ptx` for the rationale.
-    let mut out = String::new();
-    out.push_str(&cfg.ptx_header());
-    out.push('\n');
-    match cfg.dtype {
-        // F32 path's *kernel bytes* remain BYTE-IDENTICAL to pre-Sprint-v3-2
-        // large-vocab — gated by
-        // `tests/fused_linear_ce_large_vocab_numerical.rs::ptx_byte_identity_at_v4096`
-        // (uses the small-vocab routing) and the structural large-vocab ptxas
-        // test at v=49152. Calls the untouched emitters.
-        Dtype::F32 => {
-            out.push_str(&emit_large_partials_kernel(cfg, /*emit_header=*/ false));
-            out.push('\n');
-            out.push_str(&emit_large_finalize_kernel(cfg, /*emit_header=*/ false));
-        }
-        Dtype::F16 => {
-            out.push_str(&emit_large_partials_kernel_f16(cfg));
-            out.push('\n');
-            out.push_str(&emit_large_finalize_kernel_f16(cfg));
-        }
-        Dtype::Bf16 => {
-            out.push_str(&emit_large_partials_kernel_bf16(cfg));
-            out.push('\n');
-            out.push_str(&emit_large_finalize_kernel_bf16(cfg));
-        }
-    }
-    let mut bytes = out.into_bytes();
-    bytes.push(0);
-    bytes
+    // Roadmap A2 step 10: one KIR builder per kernel for all three dtypes;
+    // the module printer's output is already null-terminated.
+    emit_large_forward(cfg)
 }
 
 /// Synthesise the backward PTX for the fused linear-CE kernel.
@@ -924,427 +900,395 @@ fn emit_forward(cfg: &FusedLinearCEConfig) -> Vec<u8> {
     lower_kir_to_ptx(&ir)
 }
 
-// ─── PTX emission — large-vocab path (Sprint 3) ──────────────────────────────
+// ─── KIR — large-vocab forward ───────────────────────────────────────────────
+//
+// Roadmap A2 step 10, second slice: the two large-vocab kernels are built as
+// KIR too, each from one builder for all three dtypes, and lowered into one
+// module under one header (`lower_kir_module_to_ptx`).
+// `tests/fused_linear_ce_large_kir_equivalence.rs` runs Kernel A over every
+// (tile, row) and Kernel B over every row, hand and KIR, on the PTX
+// interpreter and requires the same output bits.
 
-/// Per-tile partials kernel (Kernel A) — see module-level Design block.
-///
-/// Grid: `(num_tiles, B*S, 1)`. Block: `(128, 1, 1)`.
-///
-/// Each CTA:
-///   1. row_idx = ctaid.y, tile_idx = ctaid.x.
-///   2. Loads target = targets[row_idx]; if == ignore_index, writes (0, 0)
-///      to its partials slot and returns (kernel B's same-row guard zeros
-///      the row's loss).
-///   3. Fills smem[0..vocab_tile*4] with logits = x[row] @ W[tile_rows]^T
-///      + bias[tile_rows] using the same 128-thread inner fill v1 uses.
-///   4. bar.sync; then thread 0 reduces smem to (tile_max, tile_sum_unscaled)
-///      where tile_sum_unscaled = sum_v exp(logit_v - tile_max), and stores
-///      both floats to partials[row*num_tiles + tile_idx, 0..2].
-fn emit_large_partials_kernel(cfg: &FusedLinearCEConfig, emit_header: bool) -> String {
-    let name = cfg.large_partials_kernel_name();
-    let vocab = cfg.vocab_size;
-    let hidden = cfg.hidden_size;
-    let vtile = cfg.vocab_tile;
-    let n_tiles = cfg.num_vocab_tiles();
-    let vtile_per_thread = vtile / 128;
-    let ignore = cfg.ignore_index;
-    let smem_bytes = cfg.shared_mem_bytes();
-
-    let mut lines: Vec<String> = Vec::new();
-    let p = |l: &str| l.to_owned();
-
-    if emit_header {
-        lines.push(cfg.ptx_header());
-    }
-    // Each kernel declares its own .extern .shared. Driver allocates per-launch.
-    lines.push(format!(
-        ".extern .shared .align 4 .b8 smem_partials_{vocab}[{smem_bytes}];"
-    ));
-    lines.push(String::new());
-
-    // Signature: x, W, bias, targets, partials, B, S, V, H, num_tiles.
-    lines.push(format!(".visible .entry {name}("));
-    lines.push(p("\t.param .u64 param_x,"));
-    lines.push(p("\t.param .u64 param_w,"));
-    lines.push(p("\t.param .u64 param_bias,"));
-    lines.push(p("\t.param .u64 param_targets,"));
-    lines.push(p("\t.param .u64 param_partials,"));
-    lines.push(p("\t.param .u32 param_B, .param .u32 param_S,"));
-    lines.push(p("\t.param .u32 param_V, .param .u32 param_H,"));
-    lines.push(p("\t.param .u32 param_num_tiles"));
-    lines.push(p(") {"));
-
-    lines.push(p("\t.reg .u64 %rd<30>;"));
-    lines.push(p("\t.reg .u32 %r<24>;"));
-    lines.push(p("\t.reg .s64 %tgt64;"));
-    lines.push(p("\t.reg .f32 %facc, %fa, %fb, %ftmp;"));
-    lines.push(p("\t.reg .f32 %ftmax, %ftsum, %flog2e;"));
-    lines.push(p("\t.reg .pred %pskip, %pv, %pth0;"));
-    lines.push(String::new());
-
-    // Load params.
-    lines.push(p("\tld.param.u64 %rd0, [param_x];"));
-    lines.push(p("\tld.param.u64 %rd1, [param_w];"));
-    lines.push(p("\tld.param.u64 %rd2, [param_bias];"));
-    lines.push(p("\tld.param.u64 %rd3, [param_targets];"));
-    lines.push(p("\tld.param.u64 %rd4, [param_partials];"));
-    lines.push(p("\tmov.u32 %r0, %ctaid.y;   // row_idx"));
-    lines.push(p("\tmov.u32 %r1, %tid.x;     // tid"));
-    lines.push(p("\tmov.u32 %r2, %ctaid.x;   // tile_idx"));
-    lines.push(p("\tmov.f32 %flog2e, 0f3FB8AA3B; // log2(e)"));
-    lines.push(String::new());
-
-    // partials_slot_ptr = partials + (row*num_tiles + tile_idx) * 2 * 4
-    lines.push(format!("\t// partials_slot = partials + (row*{n_tiles}+tile) * 8"));
-    lines.push(p("\tcvt.u64.u32 %rd5, %r0;"));
-    lines.push(format!("\tmov.u32 %r3, {n_tiles};"));
-    lines.push(p("\tcvt.u64.u32 %rd6, %r3;"));
-    lines.push(p("\tmul.lo.u64 %rd5, %rd5, %rd6;"));
-    lines.push(p("\tcvt.u64.u32 %rd7, %r2;"));
-    lines.push(p("\tadd.u64 %rd5, %rd5, %rd7;"));
-    lines.push(p("\tshl.b64 %rd5, %rd5, 3; // *8"));
-    lines.push(p("\tadd.u64 %rd5, %rd4, %rd5; // %rd5 = partials_slot_ptr"));
-    lines.push(String::new());
-
-    // Load target.
-    lines.push(p("\tcvt.u64.u32 %rd8, %r0;"));
-    lines.push(p("\tmul.lo.u64 %rd8, %rd8, 8;"));
-    lines.push(p("\tadd.u64 %rd8, %rd3, %rd8;"));
-    lines.push(p("\tld.global.s64 %tgt64, [%rd8];"));
-    lines.push(String::new());
-
-    // Skip path: thread 0 writes (0, 0) to partials slot, return.
-    lines.push(format!("\tsetp.eq.s64 %pskip, %tgt64, {ignore};"));
-    lines.push(p("\t@!%pskip bra LP_NOTSKIP;"));
-    lines.push(p("\tsetp.eq.u32 %pth0, %r1, 0;"));
-    lines.push(p("\t@!%pth0 bra LP_DONE;"));
-    lines.push(p("\tst.global.f32 [%rd5], 0f00000000;"));
-    lines.push(p("\tst.global.f32 [%rd5+4], 0f00000000;"));
-    lines.push(p("\tbra LP_DONE;"));
-    lines.push(p("LP_NOTSKIP:"));
-    lines.push(String::new());
-
-    // x_row_base = x + row * H * 4.
-    lines.push(p("\tcvt.u64.u32 %rd9, %r0;"));
-    lines.push(format!("\tmov.u32 %r4, {hidden};"));
-    lines.push(p("\tcvt.u64.u32 %rd10, %r4;"));
-    lines.push(p("\tmul.lo.u64 %rd9, %rd9, %rd10;"));
-    lines.push(p("\tshl.b64 %rd9, %rd9, 2;"));
-    lines.push(p("\tadd.u64 %rd9, %rd0, %rd9; // %rd9 = x_row_base"));
-    lines.push(String::new());
-
-    // v_base = tile_idx * vtile.
-    lines.push(format!("\tmul.lo.u32 %r5, %r2, {vtile}; // v_base"));
-    lines.push(String::new());
-
-    // Inner fill loop: each thread writes vtile_per_thread entries in stride-128.
-    lines.push(p("\tmov.u32 %r6, 0; // sub-iter counter"));
-    lines.push(p("LP_INNER:"));
-    lines.push(p("\t\tmul.lo.u32 %r7, %r6, 128;"));
-    lines.push(p("\t\tadd.u32 %r7, %r7, %r1;       // intra-tile slot"));
-    lines.push(p("\t\tadd.u32 %r8, %r7, %r5;       // v_idx = v_base + slot"));
-    lines.push(format!("\t\tsetp.lt.u32 %pv, %r8, {vocab};"));
-    lines.push(p("\t\t@!%pv bra LP_INNER_TAIL_ZERO;"));
-    lines.push(String::new());
-
-    // W_row_base = W + v_idx * H * 4.
-    lines.push(p("\t\tcvt.u64.u32 %rd11, %r8;"));
-    lines.push(format!("\t\tmov.u32 %r9, {hidden};"));
-    lines.push(p("\t\tcvt.u64.u32 %rd12, %r9;"));
-    lines.push(p("\t\tmul.lo.u64 %rd11, %rd11, %rd12;"));
-    lines.push(p("\t\tshl.b64 %rd11, %rd11, 2;"));
-    lines.push(p("\t\tadd.u64 %rd11, %rd1, %rd11; // %rd11 = W_row_base"));
-    lines.push(String::new());
-
-    // Dot product over H.
-    lines.push(p("\t\tmov.f32 %facc, 0f00000000;"));
-    lines.push(p("\t\tmov.u32 %r10, 0; // h"));
-    lines.push(p("\t\tLP_DOT:"));
-    lines.push(p("\t\t\tcvt.u64.u32 %rd13, %r10;"));
-    lines.push(p("\t\t\tshl.b64 %rd13, %rd13, 2;"));
-    lines.push(p("\t\t\tadd.u64 %rd14, %rd9, %rd13;"));
-    lines.push(p("\t\t\tld.global.f32 %fa, [%rd14];"));
-    lines.push(p("\t\t\tadd.u64 %rd14, %rd11, %rd13;"));
-    lines.push(p("\t\t\tld.global.f32 %fb, [%rd14];"));
-    lines.push(p("\t\t\tfma.rn.f32 %facc, %fa, %fb, %facc;"));
-    lines.push(p("\t\t\tadd.u32 %r10, %r10, 1;"));
-    lines.push(format!("\t\t\tsetp.lt.u32 %pv, %r10, {hidden};"));
-    lines.push(p("\t\t\t@%pv bra LP_DOT;"));
-    lines.push(String::new());
-
-    // facc += bias[v_idx].
-    lines.push(p("\t\tcvt.u64.u32 %rd15, %r8;"));
-    lines.push(p("\t\tshl.b64 %rd15, %rd15, 2;"));
-    lines.push(p("\t\tadd.u64 %rd15, %rd2, %rd15;"));
-    lines.push(p("\t\tld.global.f32 %ftmp, [%rd15];"));
-    lines.push(p("\t\tadd.f32 %facc, %facc, %ftmp;"));
-    lines.push(p("\t\tbra LP_INNER_STORE;"));
-    lines.push(String::new());
-
-    // Tail-zero (v_idx out of bounds): store -INF so it doesn't perturb max/sum.
-    lines.push(p("LP_INNER_TAIL_ZERO:"));
-    lines.push(p("\t\tmov.f32 %facc, 0fFF800000; // -INF (f32, IEEE 754 binary32)"));
-    lines.push(String::new());
-
-    // Store logit to smem[slot*4].
-    lines.push(p("LP_INNER_STORE:"));
-    lines.push(p("\t\tshl.b32 %r11, %r7, 2;"));
-    lines.push(format!("\t\tmov.u64 %rd16, smem_partials_{vocab};"));
-    lines.push(p("\t\tcvt.u64.u32 %rd17, %r11;"));
-    lines.push(p("\t\tadd.u64 %rd16, %rd16, %rd17;"));
-    lines.push(p("\t\tst.shared.f32 [%rd16], %facc;"));
-    lines.push(String::new());
-
-    lines.push(p("\t\tadd.u32 %r6, %r6, 1;"));
-    lines.push(format!("\t\tsetp.lt.u32 %pv, %r6, {vtile_per_thread};"));
-    lines.push(p("\t\t@%pv bra LP_INNER;"));
-    lines.push(String::new());
-
-    // bar.sync, then thread 0 reduces smem to (tile_max, tile_sum_unscaled).
-    lines.push(p("\tbar.sync 0;"));
-    lines.push(p("\tsetp.eq.u32 %pth0, %r1, 0;"));
-    lines.push(p("\t@!%pth0 bra LP_DONE;"));
-    lines.push(String::new());
-
-    // Pass 1: find tile_max over smem[0..vtile].
-    lines.push(p("\tmov.f32 %ftmax, 0fFF800000; // -INF (f32)"));
-    lines.push(p("\tmov.u32 %r12, 0;"));
-    lines.push(p("LP_RED_MAX:"));
-    lines.push(p("\t\tshl.b32 %r13, %r12, 2;"));
-    lines.push(format!("\t\tmov.u64 %rd18, smem_partials_{vocab};"));
-    lines.push(p("\t\tcvt.u64.u32 %rd19, %r13;"));
-    lines.push(p("\t\tadd.u64 %rd18, %rd18, %rd19;"));
-    lines.push(p("\t\tld.shared.f32 %ftmp, [%rd18];"));
-    lines.push(p("\t\tmax.f32 %ftmax, %ftmax, %ftmp;"));
-    lines.push(p("\t\tadd.u32 %r12, %r12, 1;"));
-    lines.push(format!("\t\tsetp.lt.u32 %pv, %r12, {vtile};"));
-    lines.push(p("\t\t@%pv bra LP_RED_MAX;"));
-    lines.push(String::new());
-
-    // Pass 2: compute tile_sum_unscaled = sum_v exp(logit_v - tile_max).
-    lines.push(p("\tmov.f32 %ftsum, 0f00000000;"));
-    lines.push(p("\tmov.u32 %r12, 0;"));
-    lines.push(p("LP_RED_SUM:"));
-    lines.push(p("\t\tshl.b32 %r13, %r12, 2;"));
-    lines.push(format!("\t\tmov.u64 %rd18, smem_partials_{vocab};"));
-    lines.push(p("\t\tcvt.u64.u32 %rd19, %r13;"));
-    lines.push(p("\t\tadd.u64 %rd18, %rd18, %rd19;"));
-    lines.push(p("\t\tld.shared.f32 %ftmp, [%rd18];"));
-    lines.push(p("\t\tsub.f32 %ftmp, %ftmp, %ftmax;"));
-    lines.push(p("\t\tmul.f32 %ftmp, %ftmp, %flog2e;"));
-    lines.push(p("\t\tex2.approx.f32 %ftmp, %ftmp;"));
-    lines.push(p("\t\tadd.f32 %ftsum, %ftsum, %ftmp;"));
-    lines.push(p("\t\tadd.u32 %r12, %r12, 1;"));
-    lines.push(format!("\t\tsetp.lt.u32 %pv, %r12, {vtile};"));
-    lines.push(p("\t\t@%pv bra LP_RED_SUM;"));
-    lines.push(String::new());
-
-    // Store (tile_max, tile_sum_unscaled) to partials.
-    lines.push(p("\tst.global.f32 [%rd5],   %ftmax;"));
-    lines.push(p("\tst.global.f32 [%rd5+4], %ftsum;"));
-    lines.push(String::new());
-
-    lines.push(p("LP_DONE:"));
-    lines.push(p("\tret;"));
-    lines.push(p("}"));
-
-    lines.join("\n")
+/// The per-tile logits of Kernel A, in the storage dtype, dynamic (the
+/// launcher passes [`FusedLinearCEConfig::shared_mem_bytes`], which covers
+/// it).
+fn partials_smem(cfg: &FusedLinearCEConfig) -> SmemLayout {
+    let bytes = cfg.dtype.bytes_per_elem();
+    let logits = SmemRegion {
+        name: "logits".to_string(),
+        bytes: cfg.vocab_tile * bytes,
+        align: bytes,
+        elem: elem_type(cfg.dtype),
+    };
+    SmemLayout { regions: vec![logits], dynamic: true }
 }
 
-/// Per-row finalize kernel (Kernel B) — see module-level Design block.
-///
-/// Grid: `(B*S, 1, 1)`. Block: `(128, 1, 1)`. Uses ONE thread (tid 0) to do
-/// the cross-tile reduce — `num_tiles` is at most a few hundred so the
-/// serial reduce per row is cheap; the gain is parallelism across rows
-/// (the loop that was inside one CTA is now ONE iteration per row, with
-/// `num_tiles` independent partials already computed by Kernel A).
-///
-/// Each CTA:
-///   1. row_idx = ctaid.x.
-///   2. Loads targets[row]; if ignore, writes loss=0/lse=0 and returns.
-///   3. Thread 0 reads partials[row, 0..num_tiles], runs online-LSE rescaling
-///      to compute (global_max, global_sum).
-///   4. Thread 0 recomputes logit_at_target = x[row] @ W[tgt] + bias[tgt]
-///      (one dot product of length H — cheap).
-///   5. Writes loss_out[row] = -(logit_at_target - global_max - log(global_sum))
-///      and lse_out[row] = global_max + log(global_sum).
-fn emit_large_finalize_kernel(cfg: &FusedLinearCEConfig, emit_header: bool) -> String {
-    let name = cfg.large_finalize_kernel_name();
-    let vocab = cfg.vocab_size;
-    let hidden = cfg.hidden_size;
-    let n_tiles = cfg.num_vocab_tiles();
-    let ignore = cfg.ignore_index;
+/// `sum_h fma(a[a_row + h], b[b_row + h], acc)` over `h < hidden`, from
+/// zero, in index order — the hand kernels' dot. `a_row` and `b_row` are
+/// 64-bit element offsets, each `U64` or `I64`.
+fn fma_dot(
+    b: &mut KirBuilder,
+    dtype: Dtype,
+    (a, a_row): (VarId, VarId),
+    (bm, b_row): (VarId, VarId),
+    hidden: u32,
+) -> VarId {
+    use AddressSpace::Global;
+    use KirType::{F32, U32};
+    let elem = elem_type(dtype);
+    let zero = konst(b, ConstValue::U32(0));
+    let one = konst(b, ConstValue::U32(1));
+    let f_zero = konst(b, ConstValue::F32(0.0));
+    let hidden = konst(b, ConstValue::U32(hidden));
+    let head = b.new_block();
+    let body = b.new_block();
+    let done = b.new_block();
+    let h = b.add_block_param(head, U32);
+    let acc = b.add_block_param(head, F32);
+    b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![zero, f_zero])));
+    b.set_block(head);
+    let finished = cmp(b, h, hidden, CmpOp::Ge);
+    b.terminate(KirTerminator::CondBranch(finished, KirEdge::to(done), KirEdge::to(body)));
+    b.set_block(body);
+    let index = |b: &mut KirBuilder, row: VarId| {
+        let ty = b.var_type(row).expect("a typed row offset");
+        let h_wide = b.new_typed_var(ty.clone());
+        b.emit(KirOp::Cast(h_wide, h, ty.clone()));
+        op2(b, ty, KirOp::Add, row, h_wide)
+    };
+    let a_index = index(b, a_row);
+    let a_addr = at(b, elem.clone(), Global, a, a_index);
+    let av = load_elem(b, dtype, a_addr, Global);
+    let b_index = index(b, b_row);
+    let b_addr = at(b, elem, Global, bm, b_index);
+    let bv = load_elem(b, dtype, b_addr, Global);
+    let acc_next = b.new_typed_var(F32);
+    b.emit(KirOp::Fma(acc_next, av, bv, acc));
+    let h_next = op2(b, U32, KirOp::Add, h, one);
+    b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![h_next, acc_next])));
+    b.set_block(done);
+    acc
+}
 
-    let mut lines: Vec<String> = Vec::new();
-    let p = |l: &str| l.to_owned();
+/// Build Kernel A, the per-tile partials, as KIR.
+///
+/// Grid `(num_tiles, B*S)`, 128 threads: CTA `(tile, row)` writes the
+/// tile's `(max, sum_v exp(logit_v - max))` to `partials[row][tile]`.
+///
+/// ```text
+/// entry     target = targets[row]; target == ignore_index ? skip : body
+/// body      per sub-tile j: slot = j*128 + tid; v = tile*vtile + slot
+///             logits[slot] = elem(v < V ? fma-dot(x[row], W[v]) + bias[v] : -inf)
+///           bar
+///           thread 0: max over the tile's lanes (from -inf), then the
+///             sum of exp(lane - max) (from 0); partials[row][tile] = (max, sum)
+/// skip      thread 0: partials[row][tile] = (0, 0)
+/// ```
+///
+/// A lane past the vocab holds `-inf`, which neither the max nor the sum
+/// sees; so unlike the v1 kernel's, the scans run over the whole tile.
+pub fn build_large_partials(cfg: &FusedLinearCEConfig) -> KernelIR {
+    use AddressSpace::{Global, Shared};
+    use KirType::{F32, I64, U32, U64};
 
-    if emit_header {
-        lines.push(cfg.ptx_header());
+    let dtype = cfg.dtype;
+    let elem = elem_type(dtype);
+    let mut b = KirBuilder::new(&cfg.large_partials_kernel_name());
+    // The params, in FFI order. B, S, V, H and num_tiles are baked.
+    let x = b.add_param("x", ptr(elem.clone(), Global), Global);
+    let w = b.add_param("w", ptr(elem.clone(), Global), Global);
+    let bias = b.add_param("bias", ptr(elem.clone(), Global), Global);
+    let targets = b.add_param("targets", ptr(I64, Global), Global);
+    let partials = b.add_param("partials", ptr(F32, Global), Global);
+    for name in ["B", "S", "V", "H", "num_tiles"] {
+        b.add_param(name, U32, Global);
     }
-    lines.push(String::new());
+    b.set_smem_layout(partials_smem(cfg));
+    b.set_workgroup_size([V1_BLOCK, 1, 1]);
 
-    lines.push(format!(".visible .entry {name}("));
-    lines.push(p("\t.param .u64 param_x,"));
-    lines.push(p("\t.param .u64 param_w,"));
-    lines.push(p("\t.param .u64 param_bias,"));
-    lines.push(p("\t.param .u64 param_targets,"));
-    lines.push(p("\t.param .u64 param_partials,"));
-    lines.push(p("\t.param .u64 param_loss_out,"));
-    lines.push(p("\t.param .u64 param_lse_out,"));
-    lines.push(p("\t.param .u32 param_B, .param .u32 param_S,"));
-    lines.push(p("\t.param .u32 param_V, .param .u32 param_H,"));
-    lines.push(p("\t.param .u32 param_num_tiles"));
-    lines.push(p(") {"));
+    let entry = b.new_block();
+    b.set_block(entry);
+    let row = b.new_typed_var(U32);
+    b.emit(KirOp::BlockIdx(row, 1));
+    let tid = b.new_typed_var(U32);
+    b.emit(KirOp::ThreadId(tid, 0));
+    let tile = b.new_typed_var(U32);
+    b.emit(KirOp::BlockIdx(tile, 0));
+    let zero = konst(&mut b, ConstValue::U32(0));
+    let one = konst(&mut b, ConstValue::U32(1));
+    let f_zero = konst(&mut b, ConstValue::F32(0.0));
+    let f_neg_inf = konst(&mut b, ConstValue::F32(f32::NEG_INFINITY));
+    // This CTA's (max, sum) pair: partials[(row * num_tiles + tile) * 2].
+    let n_tiles = konst(&mut b, ConstValue::U64(cfg.num_vocab_tiles() as u64));
+    let row_wide = widen(&mut b, row);
+    let row_first = op2(&mut b, U64, KirOp::Mul, row_wide, n_tiles);
+    let tile_wide = widen(&mut b, tile);
+    let pair_index = op2(&mut b, U64, KirOp::Add, row_first, tile_wide);
+    let two = konst(&mut b, ConstValue::U64(2));
+    let first = op2(&mut b, U64, KirOp::Mul, pair_index, two);
+    let max_slot = at(&mut b, F32, Global, partials, first);
+    let sum_slot = at(&mut b, F32, Global, max_slot, one);
 
-    lines.push(p("\t.reg .u64 %rd<24>;"));
-    lines.push(p("\t.reg .u32 %r<16>;"));
-    lines.push(p("\t.reg .s64 %tgt64;"));
-    lines.push(p("\t.reg .f32 %fmax, %fsum, %ftmax, %ftsum, %fnew_max;"));
-    lines.push(p("\t.reg .f32 %ftmp, %fa, %fb, %facc, %flog, %flse, %floss;"));
-    lines.push(p("\t.reg .f32 %flog2e, %fln2;"));
-    lines.push(p("\t.reg .pred %pskip, %pth0, %pv;"));
-    lines.push(String::new());
+    let target_addr = at(&mut b, I64, Global, targets, row);
+    let target = load(&mut b, I64, target_addr, Global);
+    let ignore = i64_const(&mut b, cfg.ignore_index);
+    let skips = cmp(&mut b, target, ignore, CmpOp::Eq);
+    let body = b.new_block();
+    let skip = b.new_block();
+    let exit = b.new_block();
+    b.terminate(KirTerminator::CondBranch(skips, KirEdge::to(skip), KirEdge::to(body)));
 
-    lines.push(p("\tld.param.u64 %rd0, [param_x];"));
-    lines.push(p("\tld.param.u64 %rd1, [param_w];"));
-    lines.push(p("\tld.param.u64 %rd2, [param_bias];"));
-    lines.push(p("\tld.param.u64 %rd3, [param_targets];"));
-    lines.push(p("\tld.param.u64 %rd4, [param_partials];"));
-    lines.push(p("\tld.param.u64 %rd5, [param_loss_out];"));
-    lines.push(p("\tld.param.u64 %rd6, [param_lse_out];"));
-    lines.push(p("\tmov.u32 %r0, %ctaid.x;   // row_idx"));
-    lines.push(p("\tmov.u32 %r1, %tid.x;"));
-    lines.push(p("\tmov.f32 %flog2e, 0f3FB8AA3B;"));
-    lines.push(p("\tmov.f32 %fln2,   0f3F317218;"));
-    lines.push(String::new());
+    // ── the tile fill ───────────────────────────────────────────────────
+    b.set_block(body);
+    let logits = b.new_typed_var(ptr(elem.clone(), Shared));
+    b.emit(KirOp::SharedRegion { dst: logits, region: 0 });
+    let hidden_wide = konst(&mut b, ConstValue::U64(cfg.hidden_size as u64));
+    let x_row = op2(&mut b, U64, KirOp::Mul, row_wide, hidden_wide);
+    let vtile = konst(&mut b, ConstValue::U32(cfg.vocab_tile));
+    let v_base = op2(&mut b, U32, KirOp::Mul, tile, vtile);
+    let vocab = konst(&mut b, ConstValue::U32(cfg.vocab_size));
+    let block = konst(&mut b, ConstValue::U32(V1_BLOCK));
+    let per_thread = konst(&mut b, ConstValue::U32(cfg.vocab_tile / V1_BLOCK));
+    counted_loop(&mut b, (zero, per_thread, one), |b, j| {
+        let lane_base = op2(b, U32, KirOp::Mul, j, block);
+        let slot = op2(b, U32, KirOp::Add, lane_base, tid);
+        let v = op2(b, U32, KirOp::Add, slot, v_base);
+        let in_vocab = cmp(b, v, vocab, CmpOp::Lt);
+        let fill = b.new_block();
+        let store = b.new_block();
+        let logit = b.add_block_param(store, F32);
+        b.terminate(KirTerminator::CondBranch(
+            in_vocab,
+            KirEdge::to(fill),
+            KirEdge::with(store, vec![f_neg_inf]),
+        ));
 
-    // Only thread 0 does the work; other threads idle then exit.
-    lines.push(p("\tsetp.eq.u32 %pth0, %r1, 0;"));
-    lines.push(p("\t@!%pth0 bra LF_DONE;"));
-    lines.push(String::new());
+        b.set_block(fill);
+        let v_wide = widen(b, v);
+        let w_row = op2(b, U64, KirOp::Mul, v_wide, hidden_wide);
+        let dot = fma_dot(b, dtype, (x, x_row), (w, w_row), cfg.hidden_size);
+        let bias_addr = at(b, elem.clone(), Global, bias, v);
+        let bias_v = load_elem(b, dtype, bias_addr, Global);
+        let with_bias = op2(b, F32, KirOp::Add, dot, bias_v);
+        b.terminate(KirTerminator::Branch(KirEdge::with(store, vec![with_bias])));
 
-    // Load target.
-    lines.push(p("\tcvt.u64.u32 %rd7, %r0;"));
-    lines.push(p("\tmul.lo.u64 %rd7, %rd7, 8;"));
-    lines.push(p("\tadd.u64 %rd7, %rd3, %rd7;"));
-    lines.push(p("\tld.global.s64 %tgt64, [%rd7];"));
-    lines.push(String::new());
+        // A 16-bit `-inf` rounds to that dtype's `-inf`.
+        b.set_block(store);
+        let stored = to_elem(b, dtype, logit);
+        let addr = at(b, elem.clone(), Shared, logits, slot);
+        b.emit(KirOp::Store(addr, stored, Shared));
+    });
+    // Every logit of the tile is in shared memory.
+    b.emit(KirOp::Barrier);
 
-    // loss_out_ptr / lse_out_ptr for this row.
-    lines.push(p("\tcvt.u64.u32 %rd8, %r0;"));
-    lines.push(p("\tshl.b64 %rd8, %rd8, 2;"));
-    lines.push(p("\tadd.u64 %rd9, %rd5, %rd8;  // loss_out[row]"));
-    lines.push(p("\tadd.u64 %rd10, %rd6, %rd8; // lse_out[row]"));
-    lines.push(String::new());
+    // ── thread 0 reduces the tile ───────────────────────────────────────
+    let reduce = b.new_block();
+    let not_thread0 = cmp(&mut b, tid, zero, CmpOp::Ne);
+    b.terminate(KirTerminator::CondBranch(not_thread0, KirEdge::to(exit), KirEdge::to(reduce)));
+    b.set_block(reduce);
+    // Bottom-tested, as the hand kernels' scans were (the tile is never
+    // empty): with the test at the top, ptxas unrolled the f32 scans whole
+    // on sm_90 and sm_120 (161 and 130 registers against the hand
+    // kernels' 32 and 40).
+    let scan = |b: &mut KirBuilder, acc0: VarId, step: &dyn Fn(&mut KirBuilder, VarId, VarId) -> VarId| -> VarId {
+        let body = b.new_block();
+        let done = b.new_block();
+        let i = b.add_block_param(body, U32);
+        let acc = b.add_block_param(body, F32);
+        let out = b.add_block_param(done, F32);
+        b.terminate(KirTerminator::Branch(KirEdge::with(body, vec![zero, acc0])));
+        b.set_block(body);
+        let addr = at(b, elem.clone(), Shared, logits, i);
+        let s = load_elem(b, dtype, addr, Shared);
+        let acc_next = step(b, acc, s);
+        let i_next = op2(b, U32, KirOp::Add, i, one);
+        let more = cmp(b, i_next, vtile, CmpOp::Lt);
+        b.terminate(KirTerminator::CondBranch(
+            more,
+            KirEdge::with(body, vec![i_next, acc_next]),
+            KirEdge::with(done, vec![acc_next]),
+        ));
+        b.set_block(done);
+        out
+    };
+    let tile_max = scan(&mut b, f_neg_inf, &|b, m, s| op2(b, F32, KirOp::Max, m, s));
+    let tile_sum = scan(&mut b, f_zero, &|b, acc, s| {
+        let d = op2(b, F32, KirOp::Sub, s, tile_max);
+        let e = b.new_typed_var(F32);
+        b.emit(KirOp::Exp(e, d));
+        op2(b, F32, KirOp::Add, acc, e)
+    });
+    b.emit(KirOp::Store(max_slot, tile_max, Global));
+    b.emit(KirOp::Store(sum_slot, tile_sum, Global));
+    b.terminate(KirTerminator::Branch(KirEdge::to(exit)));
 
-    // Skip path: write 0, 0.
-    lines.push(format!("\tsetp.eq.s64 %pskip, %tgt64, {ignore};"));
-    lines.push(p("\t@!%pskip bra LF_REDUCE;"));
-    lines.push(p("\tst.global.f32 [%rd9],  0f00000000;"));
-    lines.push(p("\tst.global.f32 [%rd10], 0f00000000;"));
-    lines.push(p("\tbra LF_DONE;"));
-    lines.push(p("LF_REDUCE:"));
-    lines.push(String::new());
+    // ── an ignored row: thread 0 writes (0, 0) ──────────────────────────
+    b.set_block(skip);
+    let zero_write = b.new_block();
+    let not_zeroer = cmp(&mut b, tid, zero, CmpOp::Ne);
+    b.terminate(KirTerminator::CondBranch(not_zeroer, KirEdge::to(exit), KirEdge::to(zero_write)));
+    b.set_block(zero_write);
+    b.emit(KirOp::Store(max_slot, f_zero, Global));
+    b.emit(KirOp::Store(sum_slot, f_zero, Global));
+    b.terminate(KirTerminator::Branch(KirEdge::to(exit)));
 
-    // partials_row_base = partials + row * num_tiles * 8.
-    lines.push(p("\tcvt.u64.u32 %rd11, %r0;"));
-    lines.push(format!("\tmov.u32 %r2, {n_tiles};"));
-    lines.push(p("\tcvt.u64.u32 %rd12, %r2;"));
-    lines.push(p("\tmul.lo.u64 %rd11, %rd11, %rd12;"));
-    lines.push(p("\tshl.b64 %rd11, %rd11, 3; // *8"));
-    lines.push(p("\tadd.u64 %rd11, %rd4, %rd11; // partials_row_base"));
-    lines.push(String::new());
+    b.set_block(exit);
+    b.terminate(KirTerminator::Return);
+    b.finalize()
+}
 
-    // Online-LSE reduce across tiles.
-    lines.push(p("\tmov.f32 %fmax, 0fFF800000; // -INF (f32, IEEE 754 binary32)"));
-    lines.push(p("\tmov.f32 %fsum, 0f00000000;"));
-    lines.push(p("\tmov.u32 %r3, 0; // tile_idx"));
-    lines.push(p("LF_LOOP:"));
-    lines.push(p("\t\tcvt.u64.u32 %rd13, %r3;"));
-    lines.push(p("\t\tshl.b64 %rd13, %rd13, 3;"));
-    lines.push(p("\t\tadd.u64 %rd13, %rd11, %rd13;"));
-    lines.push(p("\t\tld.global.f32 %ftmax, [%rd13];"));
-    lines.push(p("\t\tld.global.f32 %ftsum, [%rd13+4];"));
-    lines.push(String::new());
+/// Build Kernel B, the per-row finalize, as KIR.
+///
+/// Grid `(B*S)`, 128 threads, of which thread 0 does the work: an
+/// online-LSE fold of the row's `num_tiles` partials, and one dot for the
+/// target's logit.
+///
+/// ```text
+/// entry     thread 0 ? work : exit
+/// work      target = targets[row]; target == ignore_index ? skip : fold
+/// fold      per tile t (max, sum), from (-inf, 0):
+///             m = max(max, tmax)
+///             sum = sum * exp(max - m) + tsum * exp(tmax - m); max = m
+///           lse = log(sum) + max
+///           loss = lse - (fma-dot(x[row], W[target]) + bias[target])
+///           loss_out[row] = loss; lse_out[row] = lse
+/// skip      loss_out[row] = lse_out[row] = 0
+/// ```
+///
+/// The target is not range-checked (Kernel A's partials hold every other
+/// column): a target outside `[0, V)` other than the ignore index reads
+/// outside `W`, as it did in the hand kernels.
+pub fn build_large_finalize(cfg: &FusedLinearCEConfig) -> KernelIR {
+    use AddressSpace::Global;
+    use KirType::{F32, I64, U32, U64};
 
-    // new_max = max(fmax, ftmax).
-    lines.push(p("\t\tmax.f32 %fnew_max, %fmax, %ftmax;"));
-    // Rescale running sum: fsum *= exp(fmax - new_max).
-    lines.push(p("\t\tsub.f32 %ftmp, %fmax, %fnew_max;"));
-    lines.push(p("\t\tmul.f32 %ftmp, %ftmp, %flog2e;"));
-    lines.push(p("\t\tex2.approx.f32 %ftmp, %ftmp;"));
-    lines.push(p("\t\tmul.f32 %fsum, %fsum, %ftmp;"));
-    // Rescale tile sum: ftsum *= exp(ftmax - new_max).
-    lines.push(p("\t\tsub.f32 %ftmp, %ftmax, %fnew_max;"));
-    lines.push(p("\t\tmul.f32 %ftmp, %ftmp, %flog2e;"));
-    lines.push(p("\t\tex2.approx.f32 %ftmp, %ftmp;"));
-    lines.push(p("\t\tmul.f32 %ftsum, %ftsum, %ftmp;"));
-    // Accumulate.
-    lines.push(p("\t\tadd.f32 %fsum, %fsum, %ftsum;"));
-    lines.push(p("\t\tmov.f32 %fmax, %fnew_max;"));
-    lines.push(String::new());
+    let dtype = cfg.dtype;
+    let elem = elem_type(dtype);
+    let mut b = KirBuilder::new(&cfg.large_finalize_kernel_name());
+    let x = b.add_param("x", ptr(elem.clone(), Global), Global);
+    let w = b.add_param("w", ptr(elem.clone(), Global), Global);
+    let bias = b.add_param("bias", ptr(elem.clone(), Global), Global);
+    let targets = b.add_param("targets", ptr(I64, Global), Global);
+    let partials = b.add_param("partials", ptr(F32, Global), Global);
+    let loss_out = b.add_param("loss_out", ptr(F32, Global), Global);
+    let lse_out = b.add_param("lse_out", ptr(F32, Global), Global);
+    for name in ["B", "S", "V", "H", "num_tiles"] {
+        b.add_param(name, U32, Global);
+    }
+    b.set_workgroup_size([V1_BLOCK, 1, 1]);
 
-    lines.push(p("\t\tadd.u32 %r3, %r3, 1;"));
-    lines.push(format!("\t\tsetp.lt.u32 %pv, %r3, {n_tiles};"));
-    lines.push(p("\t\t@%pv bra LF_LOOP;"));
-    lines.push(String::new());
+    let entry = b.new_block();
+    b.set_block(entry);
+    let row = b.new_typed_var(U32);
+    b.emit(KirOp::BlockIdx(row, 0));
+    let tid = b.new_typed_var(U32);
+    b.emit(KirOp::ThreadId(tid, 0));
+    let zero = konst(&mut b, ConstValue::U32(0));
+    let work = b.new_block();
+    let exit = b.new_block();
+    let not_thread0 = cmp(&mut b, tid, zero, CmpOp::Ne);
+    b.terminate(KirTerminator::CondBranch(not_thread0, KirEdge::to(exit), KirEdge::to(work)));
 
-    // lse = log(sum) + max.
-    lines.push(p("\tlg2.approx.f32 %flse, %fsum;"));
-    lines.push(p("\tmul.f32 %flse, %flse, %fln2;"));
-    lines.push(p("\tadd.f32 %flse, %flse, %fmax;"));
-    lines.push(String::new());
+    b.set_block(work);
+    let target_addr = at(&mut b, I64, Global, targets, row);
+    let target = load(&mut b, I64, target_addr, Global);
+    let loss_addr = at(&mut b, F32, Global, loss_out, row);
+    let lse_addr = at(&mut b, F32, Global, lse_out, row);
+    let ignore = i64_const(&mut b, cfg.ignore_index);
+    let skips = cmp(&mut b, target, ignore, CmpOp::Eq);
+    let fold = b.new_block();
+    let skip = b.new_block();
+    b.terminate(KirTerminator::CondBranch(skips, KirEdge::to(skip), KirEdge::to(fold)));
 
-    // logit_at_target: recompute single dot product x[row] @ W[tgt] + bias[tgt].
-    // x_row_base = x + row*H*4.
-    lines.push(p("\tcvt.u64.u32 %rd14, %r0;"));
-    lines.push(format!("\tmov.u32 %r4, {hidden};"));
-    lines.push(p("\tcvt.u64.u32 %rd15, %r4;"));
-    lines.push(p("\tmul.lo.u64 %rd14, %rd14, %rd15;"));
-    lines.push(p("\tshl.b64 %rd14, %rd14, 2;"));
-    lines.push(p("\tadd.u64 %rd14, %rd0, %rd14; // x_row_base"));
-    // W_tgt_base = W + tgt * H * 4 (tgt is in %tgt64 as s64; mul is u64 since vocab>0).
-    lines.push(p("\tmul.lo.s64 %rd16, %tgt64, %rd15;"));
-    lines.push(p("\tshl.b64 %rd16, %rd16, 2;"));
-    lines.push(p("\tadd.u64 %rd16, %rd1, %rd16; // W_tgt_base"));
-    lines.push(String::new());
+    // ── the online-LSE fold over the row's partials ─────────────────────
+    b.set_block(fold);
+    let one = konst(&mut b, ConstValue::U32(1));
+    let f_zero = konst(&mut b, ConstValue::F32(0.0));
+    let f_neg_inf = konst(&mut b, ConstValue::F32(f32::NEG_INFINITY));
+    let n_tiles = cfg.num_vocab_tiles();
+    let n_tiles_wide = konst(&mut b, ConstValue::U64(n_tiles as u64));
+    let row_wide = widen(&mut b, row);
+    let row_first = op2(&mut b, U64, KirOp::Mul, row_wide, n_tiles_wide);
+    let two = konst(&mut b, ConstValue::U64(2));
+    let row_pairs = op2(&mut b, U64, KirOp::Mul, row_first, two);
+    let row_partials = at(&mut b, F32, Global, partials, row_pairs);
+    let head = b.new_block();
+    let body = b.new_block();
+    let folded = b.new_block();
+    let t = b.add_block_param(head, U32);
+    let run_max = b.add_block_param(head, F32);
+    let run_sum = b.add_block_param(head, F32);
+    b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![zero, f_neg_inf, f_zero])));
+    b.set_block(head);
+    let n_tiles_c = konst(&mut b, ConstValue::U32(n_tiles));
+    let finished = cmp(&mut b, t, n_tiles_c, CmpOp::Ge);
+    b.terminate(KirTerminator::CondBranch(finished, KirEdge::to(folded), KirEdge::to(body)));
+    b.set_block(body);
+    let two32 = konst(&mut b, ConstValue::U32(2));
+    let pair = op2(&mut b, U32, KirOp::Mul, t, two32);
+    let tmax_addr = at(&mut b, F32, Global, row_partials, pair);
+    let tile_max = load(&mut b, F32, tmax_addr, Global);
+    let tsum_addr = at(&mut b, F32, Global, tmax_addr, one);
+    let tile_sum = load(&mut b, F32, tsum_addr, Global);
+    let new_max = op2(&mut b, F32, KirOp::Max, run_max, tile_max);
+    let rescale = |b: &mut KirBuilder, from: VarId, sum: VarId| {
+        let shift = op2(b, F32, KirOp::Sub, from, new_max);
+        let e = b.new_typed_var(F32);
+        b.emit(KirOp::Exp(e, shift));
+        op2(b, F32, KirOp::Mul, sum, e)
+    };
+    let run_scaled = rescale(&mut b, run_max, run_sum);
+    let tile_scaled = rescale(&mut b, tile_max, tile_sum);
+    let sum_next = op2(&mut b, F32, KirOp::Add, run_scaled, tile_scaled);
+    let t_next = op2(&mut b, U32, KirOp::Add, t, one);
+    b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![t_next, new_max, sum_next])));
 
-    // Dot.
-    lines.push(p("\tmov.f32 %facc, 0f00000000;"));
-    lines.push(p("\tmov.u32 %r5, 0;"));
-    lines.push(p("LF_DOT:"));
-    lines.push(p("\t\tcvt.u64.u32 %rd17, %r5;"));
-    lines.push(p("\t\tshl.b64 %rd17, %rd17, 2;"));
-    lines.push(p("\t\tadd.u64 %rd18, %rd14, %rd17;"));
-    lines.push(p("\t\tld.global.f32 %fa, [%rd18];"));
-    lines.push(p("\t\tadd.u64 %rd18, %rd16, %rd17;"));
-    lines.push(p("\t\tld.global.f32 %fb, [%rd18];"));
-    lines.push(p("\t\tfma.rn.f32 %facc, %fa, %fb, %facc;"));
-    lines.push(p("\t\tadd.u32 %r5, %r5, 1;"));
-    lines.push(format!("\t\tsetp.lt.u32 %pv, %r5, {hidden};"));
-    lines.push(p("\t\t@%pv bra LF_DOT;"));
-    lines.push(String::new());
+    b.set_block(folded);
+    let log_sum = b.new_typed_var(F32);
+    b.emit(KirOp::Log(log_sum, run_sum));
+    let lse = op2(&mut b, F32, KirOp::Add, log_sum, run_max);
+    // The target's logit, recomputed: one dot of length H.
+    let hidden_wide = konst(&mut b, ConstValue::U64(cfg.hidden_size as u64));
+    let x_row = op2(&mut b, U64, KirOp::Mul, row_wide, hidden_wide);
+    let hidden_signed = i64_const(&mut b, cfg.hidden_size as i64);
+    let w_row = op2(&mut b, I64, KirOp::Mul, target, hidden_signed);
+    let dot = fma_dot(&mut b, dtype, (x, x_row), (w, w_row), cfg.hidden_size);
+    let bias_addr = at(&mut b, elem.clone(), Global, bias, target);
+    let bias_v = load_elem(&mut b, dtype, bias_addr, Global);
+    let logit_at_target = op2(&mut b, F32, KirOp::Add, dot, bias_v);
+    let loss = op2(&mut b, F32, KirOp::Sub, lse, logit_at_target);
+    b.emit(KirOp::Store(loss_addr, loss, Global));
+    b.emit(KirOp::Store(lse_addr, lse, Global));
+    b.terminate(KirTerminator::Branch(KirEdge::to(exit)));
 
-    // Add bias[tgt].
-    lines.push(p("\tmul.lo.s64 %rd19, %tgt64, 4;"));
-    lines.push(p("\tadd.u64 %rd19, %rd2, %rd19;"));
-    lines.push(p("\tld.global.f32 %ftmp, [%rd19];"));
-    lines.push(p("\tadd.f32 %facc, %facc, %ftmp; // logit_at_target"));
-    lines.push(String::new());
+    // ── an ignored row ──────────────────────────────────────────────────
+    b.set_block(skip);
+    let f_zero = konst(&mut b, ConstValue::F32(0.0));
+    b.emit(KirOp::Store(loss_addr, f_zero, Global));
+    b.emit(KirOp::Store(lse_addr, f_zero, Global));
+    b.terminate(KirTerminator::Branch(KirEdge::to(exit)));
 
-    // loss = lse - logit_at_target.
-    lines.push(p("\tsub.f32 %floss, %flse, %facc;"));
-    lines.push(p("\tst.global.f32 [%rd9],  %floss;"));
-    lines.push(p("\tst.global.f32 [%rd10], %flse;"));
-    lines.push(String::new());
+    b.set_block(exit);
+    b.terminate(KirTerminator::Return);
+    b.finalize()
+}
 
-    lines.push(p("LF_DONE:"));
-    // Suppress unused-V warning: keep V param consumed.
-    let _ = vocab;
-    lines.push(p("\tret;"));
-    lines.push(p("}"));
-
-    lines.join("\n")
+/// The large-vocab forward module: [`build_large_partials`] then
+/// [`build_large_finalize`], verified and lowered under one header
+/// (null-terminated for `cuModuleLoadData`).
+///
+/// # Panics
+///
+/// If either kernel fails KIR verification — a bug in this module, not a
+/// condition a caller can provoke.
+fn emit_large_forward(cfg: &FusedLinearCEConfig) -> Vec<u8> {
+    let kernels = [build_large_partials(cfg), build_large_finalize(cfg)];
+    for ir in &kernels {
+        if let Err(errors) = crate::kir_verify::verify(ir) {
+            panic!("{} failed KIR verification: {errors:?}", ir.name);
+        }
+    }
+    lower_kir_module_to_ptx(&[&kernels[0], &kernels[1]])
 }
 
 // ─── PTX emission — backward ──────────────────────────────────────────────────
@@ -1688,416 +1632,6 @@ fn emit_bwd_kernel(cfg: &FusedLinearCEConfig) -> String {
     s.push_str("BWD_DONE:\n\tret;\n}\n");
 
     s
-}
-
-// ── F16 large-vocab kernels (Sprint v3-2) ────────────────────────────────────
-//
-// Mixed-precision convention for the two-kernel large-vocab path:
-//   * Kernel A (per-tile partials) loads x / W / bias as `.b16` → `cvt.f32.f16`,
-//     accumulates dot products in f32, stages SMEM logits as `.b16`, and
-//     writes the cross-CTA partials buffer as f32 — the partials buffer
-//     stays f32 for cross-CTA numerical robustness (the online-LSE rescale
-//     in Kernel B compounds across tiles; fp16 partials would visibly
-//     degrade lse accuracy at vocab=49152+).
-//   * Kernel B (per-row finalize) reads f32 partials AND ALSO recomputes
-//     `logit_at_target = x[row] @ W[tgt] + bias[tgt]` — at dtype=F16 that
-//     recompute uses the same fp16 HBM staging convention as Kernel A.
-//     The final `loss_out` / `lse_out` writes stay f32 (same as v1).
-fn emit_large_partials_kernel_f16(cfg: &FusedLinearCEConfig) -> String {
-    let name = cfg.large_partials_kernel_name();
-    let vocab = cfg.vocab_size;
-    let hidden = cfg.hidden_size;
-    let vtile = cfg.vocab_tile;
-    let n_tiles = cfg.num_vocab_tiles();
-    let vtile_per_thread = vtile / 128;
-    let ignore = cfg.ignore_index;
-    let smem_bytes = cfg.shared_mem_bytes();
-
-    let mut lines: Vec<String> = Vec::new();
-    let p = |l: &str| l.to_owned();
-
-    // `.align 2` because SMEM is fp16.
-    lines.push(format!(
-        ".extern .shared .align 2 .b8 smem_partials_{vocab}[{smem_bytes}];"
-    ));
-    lines.push(String::new());
-
-    lines.push(format!(".visible .entry {name}("));
-    lines.push(p("\t.param .u64 param_x,"));
-    lines.push(p("\t.param .u64 param_w,"));
-    lines.push(p("\t.param .u64 param_bias,"));
-    lines.push(p("\t.param .u64 param_targets,"));
-    lines.push(p("\t.param .u64 param_partials,"));
-    lines.push(p("\t.param .u32 param_B, .param .u32 param_S,"));
-    lines.push(p("\t.param .u32 param_V, .param .u32 param_H,"));
-    lines.push(p("\t.param .u32 param_num_tiles"));
-    lines.push(p(") {"));
-
-    lines.push(p("\t.reg .u64 %rd<30>;"));
-    lines.push(p("\t.reg .u32 %r<24>;"));
-    lines.push(p("\t.reg .s64 %tgt64;"));
-    lines.push(p("\t.reg .b16 %h0, %h1, %h2;"));
-    lines.push(p("\t.reg .f32 %facc, %fa, %fb, %ftmp;"));
-    lines.push(p("\t.reg .f32 %ftmax, %ftsum, %flog2e;"));
-    lines.push(p("\t.reg .pred %pskip, %pv, %pth0;"));
-    lines.push(String::new());
-
-    lines.push(p("\tld.param.u64 %rd0, [param_x];"));
-    lines.push(p("\tld.param.u64 %rd1, [param_w];"));
-    lines.push(p("\tld.param.u64 %rd2, [param_bias];"));
-    lines.push(p("\tld.param.u64 %rd3, [param_targets];"));
-    lines.push(p("\tld.param.u64 %rd4, [param_partials];"));
-    lines.push(p("\tmov.u32 %r0, %ctaid.y;   // row_idx"));
-    lines.push(p("\tmov.u32 %r1, %tid.x;     // tid"));
-    lines.push(p("\tmov.u32 %r2, %ctaid.x;   // tile_idx"));
-    lines.push(p("\tmov.f32 %flog2e, 0f3FB8AA3B;"));
-    lines.push(String::new());
-
-    // partials_slot = partials + (row*num_tiles + tile) * 2 * 4 (f32 partials).
-    lines.push(format!("\t// partials_slot = partials + (row*{n_tiles}+tile) * 8 (f32 partials)"));
-    lines.push(p("\tcvt.u64.u32 %rd5, %r0;"));
-    lines.push(format!("\tmov.u32 %r3, {n_tiles};"));
-    lines.push(p("\tcvt.u64.u32 %rd6, %r3;"));
-    lines.push(p("\tmul.lo.u64 %rd5, %rd5, %rd6;"));
-    lines.push(p("\tcvt.u64.u32 %rd7, %r2;"));
-    lines.push(p("\tadd.u64 %rd5, %rd5, %rd7;"));
-    lines.push(p("\tshl.b64 %rd5, %rd5, 3; // *8"));
-    lines.push(p("\tadd.u64 %rd5, %rd4, %rd5;"));
-    lines.push(String::new());
-
-    // Load target.
-    lines.push(p("\tcvt.u64.u32 %rd8, %r0;"));
-    lines.push(p("\tmul.lo.u64 %rd8, %rd8, 8;"));
-    lines.push(p("\tadd.u64 %rd8, %rd3, %rd8;"));
-    lines.push(p("\tld.global.s64 %tgt64, [%rd8];"));
-    lines.push(String::new());
-
-    // Skip path: write (0, 0) f32 partials.
-    lines.push(format!("\tsetp.eq.s64 %pskip, %tgt64, {ignore};"));
-    lines.push(p("\t@!%pskip bra LP_NOTSKIP;"));
-    lines.push(p("\tsetp.eq.u32 %pth0, %r1, 0;"));
-    lines.push(p("\t@!%pth0 bra LP_DONE;"));
-    lines.push(p("\tst.global.f32 [%rd5], 0f00000000;"));
-    lines.push(p("\tst.global.f32 [%rd5+4], 0f00000000;"));
-    lines.push(p("\tbra LP_DONE;"));
-    lines.push(p("LP_NOTSKIP:"));
-    lines.push(String::new());
-
-    // x_row_base = x + row * H * 2 (fp16).
-    lines.push(p("\tcvt.u64.u32 %rd9, %r0;"));
-    lines.push(format!("\tmov.u32 %r4, {hidden};"));
-    lines.push(p("\tcvt.u64.u32 %rd10, %r4;"));
-    lines.push(p("\tmul.lo.u64 %rd9, %rd9, %rd10;"));
-    lines.push(p("\tshl.b64 %rd9, %rd9, 1; // *2 fp16"));
-    lines.push(p("\tadd.u64 %rd9, %rd0, %rd9;"));
-    lines.push(String::new());
-
-    lines.push(format!("\tmul.lo.u32 %r5, %r2, {vtile}; // v_base"));
-    lines.push(String::new());
-
-    lines.push(p("\tmov.u32 %r6, 0;"));
-    lines.push(p("LP_INNER:"));
-    lines.push(p("\t\tmul.lo.u32 %r7, %r6, 128;"));
-    lines.push(p("\t\tadd.u32 %r7, %r7, %r1;"));
-    lines.push(p("\t\tadd.u32 %r8, %r7, %r5;"));
-    lines.push(format!("\t\tsetp.lt.u32 %pv, %r8, {vocab};"));
-    lines.push(p("\t\t@!%pv bra LP_INNER_TAIL_ZERO;"));
-    lines.push(String::new());
-
-    // W_row_base — fp16 stride 2.
-    lines.push(p("\t\tcvt.u64.u32 %rd11, %r8;"));
-    lines.push(format!("\t\tmov.u32 %r9, {hidden};"));
-    lines.push(p("\t\tcvt.u64.u32 %rd12, %r9;"));
-    lines.push(p("\t\tmul.lo.u64 %rd11, %rd11, %rd12;"));
-    lines.push(p("\t\tshl.b64 %rd11, %rd11, 1; // *2 fp16"));
-    lines.push(p("\t\tadd.u64 %rd11, %rd1, %rd11;"));
-    lines.push(String::new());
-
-    lines.push(p("\t\tmov.f32 %facc, 0f00000000;"));
-    lines.push(p("\t\tmov.u32 %r10, 0;"));
-    lines.push(p("\t\tLP_DOT:"));
-    lines.push(p("\t\t\tcvt.u64.u32 %rd13, %r10;"));
-    lines.push(p("\t\t\tshl.b64 %rd13, %rd13, 1; // *2 fp16"));
-    lines.push(p("\t\t\tadd.u64 %rd14, %rd9, %rd13;"));
-    lines.push(p("\t\t\tld.global.b16 %h0, [%rd14];"));
-    lines.push(p("\t\t\tcvt.f32.f16 %fa, %h0;"));
-    lines.push(p("\t\t\tadd.u64 %rd14, %rd11, %rd13;"));
-    lines.push(p("\t\t\tld.global.b16 %h1, [%rd14];"));
-    lines.push(p("\t\t\tcvt.f32.f16 %fb, %h1;"));
-    lines.push(p("\t\t\tfma.rn.f32 %facc, %fa, %fb, %facc;"));
-    lines.push(p("\t\t\tadd.u32 %r10, %r10, 1;"));
-    lines.push(format!("\t\t\tsetp.lt.u32 %pv, %r10, {hidden};"));
-    lines.push(p("\t\t\t@%pv bra LP_DOT;"));
-    lines.push(String::new());
-
-    // Bias fp16.
-    lines.push(p("\t\tcvt.u64.u32 %rd15, %r8;"));
-    lines.push(p("\t\tshl.b64 %rd15, %rd15, 1; // *2"));
-    lines.push(p("\t\tadd.u64 %rd15, %rd2, %rd15;"));
-    lines.push(p("\t\tld.global.b16 %h2, [%rd15];"));
-    lines.push(p("\t\tcvt.f32.f16 %ftmp, %h2;"));
-    lines.push(p("\t\tadd.f32 %facc, %facc, %ftmp;"));
-    lines.push(p("\t\tbra LP_INNER_STORE;"));
-    lines.push(String::new());
-
-    // Tail-zero: store fp16 -INF directly to smem so it doesn't perturb
-    // max/sum.  Review Finding 2: previously this path mov'd the f32
-    // bit-pattern 0f80800000 (which is -1.175e-38 — the smallest normal
-    // negative f32, NOT -INF) into %facc and fell through to the shared
-    // store-via-cvt path.  cvt.rn.f16.f32 then mapped -1.175e-38 to fp16
-    // 0x0000 (below fp16 subnormal range), and the downstream
-    // LP_RED_MAX/LP_RED_SUM reads max'd with 0.0 — corrupting the
-    // per-tile LSE whenever all real logits in the tile were negative.
-    // We now branch around the cvt and write 0xFC00 (fp16 -INF) directly.
-    lines.push(p("LP_INNER_TAIL_ZERO:"));
-    lines.push(p("\t\tshl.b32 %r11, %r7, 1; // *2"));
-    lines.push(format!("\t\tmov.u64 %rd16, smem_partials_{vocab};"));
-    lines.push(p("\t\tcvt.u64.u32 %rd17, %r11;"));
-    lines.push(p("\t\tadd.u64 %rd16, %rd16, %rd17;"));
-    lines.push(p("\t\tmov.b16 %h2, 0xFC00; // fp16 -INF (direct, no f32 cvt)"));
-    lines.push(p("\t\tst.shared.b16 [%rd16], %h2;"));
-    lines.push(p("\t\tbra LP_INNER_AFTER_STORE;"));
-    lines.push(String::new());
-
-    // Store logit to smem as fp16 — real-tile path goes through the
-    // f32 → fp16 cvt below.
-    lines.push(p("LP_INNER_STORE:"));
-    lines.push(p("\t\tshl.b32 %r11, %r7, 1; // *2"));
-    lines.push(format!("\t\tmov.u64 %rd16, smem_partials_{vocab};"));
-    lines.push(p("\t\tcvt.u64.u32 %rd17, %r11;"));
-    lines.push(p("\t\tadd.u64 %rd16, %rd16, %rd17;"));
-    lines.push(p("\t\tcvt.rn.f16.f32 %h2, %facc;"));
-    lines.push(p("\t\tst.shared.b16 [%rd16], %h2;"));
-    lines.push(p("LP_INNER_AFTER_STORE:"));
-    lines.push(String::new());
-
-    lines.push(p("\t\tadd.u32 %r6, %r6, 1;"));
-    lines.push(format!("\t\tsetp.lt.u32 %pv, %r6, {vtile_per_thread};"));
-    lines.push(p("\t\t@%pv bra LP_INNER;"));
-    lines.push(String::new());
-
-    lines.push(p("\tbar.sync 0;"));
-    lines.push(p("\tsetp.eq.u32 %pth0, %r1, 0;"));
-    lines.push(p("\t@!%pth0 bra LP_DONE;"));
-    lines.push(String::new());
-
-    // Reduce smem fp16 tile to (tile_max, tile_sum_unscaled) in f32.
-    lines.push(p("\tmov.f32 %ftmax, 0fFF800000; // -INF (f32)"));
-    lines.push(p("\tmov.u32 %r12, 0;"));
-    lines.push(p("LP_RED_MAX:"));
-    lines.push(p("\t\tshl.b32 %r13, %r12, 1; // *2"));
-    lines.push(format!("\t\tmov.u64 %rd18, smem_partials_{vocab};"));
-    lines.push(p("\t\tcvt.u64.u32 %rd19, %r13;"));
-    lines.push(p("\t\tadd.u64 %rd18, %rd18, %rd19;"));
-    lines.push(p("\t\tld.shared.b16 %h0, [%rd18];"));
-    lines.push(p("\t\tcvt.f32.f16 %ftmp, %h0;"));
-    lines.push(p("\t\tmax.f32 %ftmax, %ftmax, %ftmp;"));
-    lines.push(p("\t\tadd.u32 %r12, %r12, 1;"));
-    lines.push(format!("\t\tsetp.lt.u32 %pv, %r12, {vtile};"));
-    lines.push(p("\t\t@%pv bra LP_RED_MAX;"));
-    lines.push(String::new());
-
-    lines.push(p("\tmov.f32 %ftsum, 0f00000000;"));
-    lines.push(p("\tmov.u32 %r12, 0;"));
-    lines.push(p("LP_RED_SUM:"));
-    lines.push(p("\t\tshl.b32 %r13, %r12, 1; // *2"));
-    lines.push(format!("\t\tmov.u64 %rd18, smem_partials_{vocab};"));
-    lines.push(p("\t\tcvt.u64.u32 %rd19, %r13;"));
-    lines.push(p("\t\tadd.u64 %rd18, %rd18, %rd19;"));
-    lines.push(p("\t\tld.shared.b16 %h0, [%rd18];"));
-    lines.push(p("\t\tcvt.f32.f16 %ftmp, %h0;"));
-    lines.push(p("\t\tsub.f32 %ftmp, %ftmp, %ftmax;"));
-    lines.push(p("\t\tmul.f32 %ftmp, %ftmp, %flog2e;"));
-    lines.push(p("\t\tex2.approx.f32 %ftmp, %ftmp;"));
-    lines.push(p("\t\tadd.f32 %ftsum, %ftsum, %ftmp;"));
-    lines.push(p("\t\tadd.u32 %r12, %r12, 1;"));
-    lines.push(format!("\t\tsetp.lt.u32 %pv, %r12, {vtile};"));
-    lines.push(p("\t\t@%pv bra LP_RED_SUM;"));
-    lines.push(String::new());
-
-    // Store (tile_max, tile_sum_unscaled) as f32 partials.
-    lines.push(p("\tst.global.f32 [%rd5],   %ftmax;"));
-    lines.push(p("\tst.global.f32 [%rd5+4], %ftsum;"));
-    lines.push(String::new());
-
-    lines.push(p("LP_DONE:"));
-    lines.push(p("\tret;"));
-    lines.push(p("}"));
-
-    lines.join("\n")
-}
-
-/// F16 finalize kernel.
-///
-/// Reads f32 partials (Kernel A writes f32 regardless of activation dtype),
-/// runs online-LSE rescale in f32, recomputes `logit_at_target = x[row] @
-/// W[tgt] + bias[tgt]` with fp16 staging + f32 fma accumulator, writes
-/// `loss_out` and `lse_out` as f32.
-fn emit_large_finalize_kernel_f16(cfg: &FusedLinearCEConfig) -> String {
-    let name = cfg.large_finalize_kernel_name();
-    let vocab = cfg.vocab_size;
-    let hidden = cfg.hidden_size;
-    let n_tiles = cfg.num_vocab_tiles();
-    let ignore = cfg.ignore_index;
-
-    let mut lines: Vec<String> = Vec::new();
-    let p = |l: &str| l.to_owned();
-    lines.push(String::new());
-
-    lines.push(format!(".visible .entry {name}("));
-    lines.push(p("\t.param .u64 param_x,"));
-    lines.push(p("\t.param .u64 param_w,"));
-    lines.push(p("\t.param .u64 param_bias,"));
-    lines.push(p("\t.param .u64 param_targets,"));
-    lines.push(p("\t.param .u64 param_partials,"));
-    lines.push(p("\t.param .u64 param_loss_out,"));
-    lines.push(p("\t.param .u64 param_lse_out,"));
-    lines.push(p("\t.param .u32 param_B, .param .u32 param_S,"));
-    lines.push(p("\t.param .u32 param_V, .param .u32 param_H,"));
-    lines.push(p("\t.param .u32 param_num_tiles"));
-    lines.push(p(") {"));
-
-    lines.push(p("\t.reg .u64 %rd<24>;"));
-    lines.push(p("\t.reg .u32 %r<16>;"));
-    lines.push(p("\t.reg .s64 %tgt64;"));
-    lines.push(p("\t.reg .b16 %h0, %h1, %h2;"));
-    lines.push(p("\t.reg .f32 %fmax, %fsum, %ftmax, %ftsum, %fnew_max;"));
-    lines.push(p("\t.reg .f32 %ftmp, %fa, %fb, %facc, %flog, %flse, %floss;"));
-    lines.push(p("\t.reg .f32 %flog2e, %fln2;"));
-    lines.push(p("\t.reg .pred %pskip, %pth0, %pv;"));
-    lines.push(String::new());
-
-    lines.push(p("\tld.param.u64 %rd0, [param_x];"));
-    lines.push(p("\tld.param.u64 %rd1, [param_w];"));
-    lines.push(p("\tld.param.u64 %rd2, [param_bias];"));
-    lines.push(p("\tld.param.u64 %rd3, [param_targets];"));
-    lines.push(p("\tld.param.u64 %rd4, [param_partials];"));
-    lines.push(p("\tld.param.u64 %rd5, [param_loss_out];"));
-    lines.push(p("\tld.param.u64 %rd6, [param_lse_out];"));
-    lines.push(p("\tmov.u32 %r0, %ctaid.x;"));
-    lines.push(p("\tmov.u32 %r1, %tid.x;"));
-    lines.push(p("\tmov.f32 %flog2e, 0f3FB8AA3B;"));
-    lines.push(p("\tmov.f32 %fln2,   0f3F317218;"));
-    lines.push(String::new());
-
-    lines.push(p("\tsetp.eq.u32 %pth0, %r1, 0;"));
-    lines.push(p("\t@!%pth0 bra LF_DONE;"));
-    lines.push(String::new());
-
-    lines.push(p("\tcvt.u64.u32 %rd7, %r0;"));
-    lines.push(p("\tmul.lo.u64 %rd7, %rd7, 8;"));
-    lines.push(p("\tadd.u64 %rd7, %rd3, %rd7;"));
-    lines.push(p("\tld.global.s64 %tgt64, [%rd7];"));
-    lines.push(String::new());
-
-    lines.push(p("\tcvt.u64.u32 %rd8, %r0;"));
-    lines.push(p("\tshl.b64 %rd8, %rd8, 2;"));
-    lines.push(p("\tadd.u64 %rd9, %rd5, %rd8;"));
-    lines.push(p("\tadd.u64 %rd10, %rd6, %rd8;"));
-    lines.push(String::new());
-
-    lines.push(format!("\tsetp.eq.s64 %pskip, %tgt64, {ignore};"));
-    lines.push(p("\t@!%pskip bra LF_REDUCE;"));
-    lines.push(p("\tst.global.f32 [%rd9],  0f00000000;"));
-    lines.push(p("\tst.global.f32 [%rd10], 0f00000000;"));
-    lines.push(p("\tbra LF_DONE;"));
-    lines.push(p("LF_REDUCE:"));
-    lines.push(String::new());
-
-    // partials_row_base = partials + row * num_tiles * 8 (f32 partials).
-    lines.push(p("\tcvt.u64.u32 %rd11, %r0;"));
-    lines.push(format!("\tmov.u32 %r2, {n_tiles};"));
-    lines.push(p("\tcvt.u64.u32 %rd12, %r2;"));
-    lines.push(p("\tmul.lo.u64 %rd11, %rd11, %rd12;"));
-    lines.push(p("\tshl.b64 %rd11, %rd11, 3;"));
-    lines.push(p("\tadd.u64 %rd11, %rd4, %rd11;"));
-    lines.push(String::new());
-
-    // Online-LSE reduce — identical to F32 path (partials are f32).
-    lines.push(p("\tmov.f32 %fmax, 0fFF800000; // -INF (f32)"));
-    lines.push(p("\tmov.f32 %fsum, 0f00000000;"));
-    lines.push(p("\tmov.u32 %r3, 0;"));
-    lines.push(p("LF_LOOP:"));
-    lines.push(p("\t\tcvt.u64.u32 %rd13, %r3;"));
-    lines.push(p("\t\tshl.b64 %rd13, %rd13, 3;"));
-    lines.push(p("\t\tadd.u64 %rd13, %rd11, %rd13;"));
-    lines.push(p("\t\tld.global.f32 %ftmax, [%rd13];"));
-    lines.push(p("\t\tld.global.f32 %ftsum, [%rd13+4];"));
-    lines.push(String::new());
-
-    lines.push(p("\t\tmax.f32 %fnew_max, %fmax, %ftmax;"));
-    lines.push(p("\t\tsub.f32 %ftmp, %fmax, %fnew_max;"));
-    lines.push(p("\t\tmul.f32 %ftmp, %ftmp, %flog2e;"));
-    lines.push(p("\t\tex2.approx.f32 %ftmp, %ftmp;"));
-    lines.push(p("\t\tmul.f32 %fsum, %fsum, %ftmp;"));
-    lines.push(p("\t\tsub.f32 %ftmp, %ftmax, %fnew_max;"));
-    lines.push(p("\t\tmul.f32 %ftmp, %ftmp, %flog2e;"));
-    lines.push(p("\t\tex2.approx.f32 %ftmp, %ftmp;"));
-    lines.push(p("\t\tmul.f32 %ftsum, %ftsum, %ftmp;"));
-    lines.push(p("\t\tadd.f32 %fsum, %fsum, %ftsum;"));
-    lines.push(p("\t\tmov.f32 %fmax, %fnew_max;"));
-    lines.push(String::new());
-
-    lines.push(p("\t\tadd.u32 %r3, %r3, 1;"));
-    lines.push(format!("\t\tsetp.lt.u32 %pv, %r3, {n_tiles};"));
-    lines.push(p("\t\t@%pv bra LF_LOOP;"));
-    lines.push(String::new());
-
-    lines.push(p("\tlg2.approx.f32 %flse, %fsum;"));
-    lines.push(p("\tmul.f32 %flse, %flse, %fln2;"));
-    lines.push(p("\tadd.f32 %flse, %flse, %fmax;"));
-    lines.push(String::new());
-
-    // x_row_base — fp16 stride 2.
-    lines.push(p("\tcvt.u64.u32 %rd14, %r0;"));
-    lines.push(format!("\tmov.u32 %r4, {hidden};"));
-    lines.push(p("\tcvt.u64.u32 %rd15, %r4;"));
-    lines.push(p("\tmul.lo.u64 %rd14, %rd14, %rd15;"));
-    lines.push(p("\tshl.b64 %rd14, %rd14, 1; // *2 fp16"));
-    lines.push(p("\tadd.u64 %rd14, %rd0, %rd14;"));
-    // W_tgt_base — fp16 stride 2.
-    lines.push(p("\tmul.lo.s64 %rd16, %tgt64, %rd15;"));
-    lines.push(p("\tshl.b64 %rd16, %rd16, 1; // *2 fp16"));
-    lines.push(p("\tadd.u64 %rd16, %rd1, %rd16;"));
-    lines.push(String::new());
-
-    // Dot loop — fp16 → f32 → fma.
-    lines.push(p("\tmov.f32 %facc, 0f00000000;"));
-    lines.push(p("\tmov.u32 %r5, 0;"));
-    lines.push(p("LF_DOT:"));
-    lines.push(p("\t\tcvt.u64.u32 %rd17, %r5;"));
-    lines.push(p("\t\tshl.b64 %rd17, %rd17, 1; // *2"));
-    lines.push(p("\t\tadd.u64 %rd18, %rd14, %rd17;"));
-    lines.push(p("\t\tld.global.b16 %h0, [%rd18];"));
-    lines.push(p("\t\tcvt.f32.f16 %fa, %h0;"));
-    lines.push(p("\t\tadd.u64 %rd18, %rd16, %rd17;"));
-    lines.push(p("\t\tld.global.b16 %h1, [%rd18];"));
-    lines.push(p("\t\tcvt.f32.f16 %fb, %h1;"));
-    lines.push(p("\t\tfma.rn.f32 %facc, %fa, %fb, %facc;"));
-    lines.push(p("\t\tadd.u32 %r5, %r5, 1;"));
-    lines.push(format!("\t\tsetp.lt.u32 %pv, %r5, {hidden};"));
-    lines.push(p("\t\t@%pv bra LF_DOT;"));
-    lines.push(String::new());
-
-    // Bias[tgt] fp16.
-    lines.push(p("\tmul.lo.s64 %rd19, %tgt64, 2; // fp16 stride"));
-    lines.push(p("\tadd.u64 %rd19, %rd2, %rd19;"));
-    lines.push(p("\tld.global.b16 %h2, [%rd19];"));
-    lines.push(p("\tcvt.f32.f16 %ftmp, %h2;"));
-    lines.push(p("\tadd.f32 %facc, %facc, %ftmp;"));
-    lines.push(String::new());
-
-    lines.push(p("\tsub.f32 %floss, %flse, %facc;"));
-    lines.push(p("\tst.global.f32 [%rd9],  %floss;"));
-    lines.push(p("\tst.global.f32 [%rd10], %flse;"));
-    lines.push(String::new());
-
-    lines.push(p("LF_DONE:"));
-    let _ = vocab;
-    lines.push(p("\tret;"));
-    lines.push(p("}"));
-
-    lines.join("\n")
 }
 
 // ── F16 backward kernel ──────────────────────────────────────────────────────
@@ -2482,416 +2016,6 @@ fn emit_bwd_kernel_f16(cfg: &FusedLinearCEConfig) -> String {
 // Output buffers `loss_out` / `lse_out` / `dx` / `dW` / `dbias` stay f32 —
 // same master-grad convention as the F16 path.
 
-
-// ── Bf16 large-vocab kernels (Sprint v3-2) ────────────────────────────────────
-//
-// Mixed-precision convention for the two-kernel large-vocab path:
-//   * Kernel A (per-tile partials) loads x / W / bias as `.b16` → `cvt.f32.bf16`,
-//     accumulates dot products in f32, stages SMEM logits as `.b16`, and
-//     writes the cross-CTA partials buffer as f32 — the partials buffer
-//     stays f32 for cross-CTA numerical robustness (the online-LSE rescale
-//     in Kernel B compounds across tiles; bf16 partials would visibly
-//     degrade lse accuracy at vocab=49152+).
-//   * Kernel B (per-row finalize) reads f32 partials AND ALSO recomputes
-//     `logit_at_target = x[row] @ W[tgt] + bias[tgt]` — at dtype=Bf16 that
-//     recompute uses the same bf16 HBM staging convention as Kernel A.
-//     The final `loss_out` / `lse_out` writes stay f32 (same as v1).
-fn emit_large_partials_kernel_bf16(cfg: &FusedLinearCEConfig) -> String {
-    let name = cfg.large_partials_kernel_name();
-    let vocab = cfg.vocab_size;
-    let hidden = cfg.hidden_size;
-    let vtile = cfg.vocab_tile;
-    let n_tiles = cfg.num_vocab_tiles();
-    let vtile_per_thread = vtile / 128;
-    let ignore = cfg.ignore_index;
-    let smem_bytes = cfg.shared_mem_bytes();
-
-    let mut lines: Vec<String> = Vec::new();
-    let p = |l: &str| l.to_owned();
-
-    // `.align 2` because SMEM is bf16.
-    lines.push(format!(
-        ".extern .shared .align 2 .b8 smem_partials_{vocab}[{smem_bytes}];"
-    ));
-    lines.push(String::new());
-
-    lines.push(format!(".visible .entry {name}("));
-    lines.push(p("\t.param .u64 param_x,"));
-    lines.push(p("\t.param .u64 param_w,"));
-    lines.push(p("\t.param .u64 param_bias,"));
-    lines.push(p("\t.param .u64 param_targets,"));
-    lines.push(p("\t.param .u64 param_partials,"));
-    lines.push(p("\t.param .u32 param_B, .param .u32 param_S,"));
-    lines.push(p("\t.param .u32 param_V, .param .u32 param_H,"));
-    lines.push(p("\t.param .u32 param_num_tiles"));
-    lines.push(p(") {"));
-
-    lines.push(p("\t.reg .u64 %rd<30>;"));
-    lines.push(p("\t.reg .u32 %r<24>;"));
-    lines.push(p("\t.reg .s64 %tgt64;"));
-    lines.push(p("\t.reg .b16 %h0, %h1, %h2;"));
-    lines.push(p("\t.reg .f32 %facc, %fa, %fb, %ftmp;"));
-    lines.push(p("\t.reg .f32 %ftmax, %ftsum, %flog2e;"));
-    lines.push(p("\t.reg .pred %pskip, %pv, %pth0;"));
-    lines.push(String::new());
-
-    lines.push(p("\tld.param.u64 %rd0, [param_x];"));
-    lines.push(p("\tld.param.u64 %rd1, [param_w];"));
-    lines.push(p("\tld.param.u64 %rd2, [param_bias];"));
-    lines.push(p("\tld.param.u64 %rd3, [param_targets];"));
-    lines.push(p("\tld.param.u64 %rd4, [param_partials];"));
-    lines.push(p("\tmov.u32 %r0, %ctaid.y;   // row_idx"));
-    lines.push(p("\tmov.u32 %r1, %tid.x;     // tid"));
-    lines.push(p("\tmov.u32 %r2, %ctaid.x;   // tile_idx"));
-    lines.push(p("\tmov.f32 %flog2e, 0f3FB8AA3B;"));
-    lines.push(String::new());
-
-    // partials_slot = partials + (row*num_tiles + tile) * 2 * 4 (f32 partials).
-    lines.push(format!("\t// partials_slot = partials + (row*{n_tiles}+tile) * 8 (f32 partials)"));
-    lines.push(p("\tcvt.u64.u32 %rd5, %r0;"));
-    lines.push(format!("\tmov.u32 %r3, {n_tiles};"));
-    lines.push(p("\tcvt.u64.u32 %rd6, %r3;"));
-    lines.push(p("\tmul.lo.u64 %rd5, %rd5, %rd6;"));
-    lines.push(p("\tcvt.u64.u32 %rd7, %r2;"));
-    lines.push(p("\tadd.u64 %rd5, %rd5, %rd7;"));
-    lines.push(p("\tshl.b64 %rd5, %rd5, 3; // *8"));
-    lines.push(p("\tadd.u64 %rd5, %rd4, %rd5;"));
-    lines.push(String::new());
-
-    // Load target.
-    lines.push(p("\tcvt.u64.u32 %rd8, %r0;"));
-    lines.push(p("\tmul.lo.u64 %rd8, %rd8, 8;"));
-    lines.push(p("\tadd.u64 %rd8, %rd3, %rd8;"));
-    lines.push(p("\tld.global.s64 %tgt64, [%rd8];"));
-    lines.push(String::new());
-
-    // Skip path: write (0, 0) f32 partials.
-    lines.push(format!("\tsetp.eq.s64 %pskip, %tgt64, {ignore};"));
-    lines.push(p("\t@!%pskip bra LP_NOTSKIP;"));
-    lines.push(p("\tsetp.eq.u32 %pth0, %r1, 0;"));
-    lines.push(p("\t@!%pth0 bra LP_DONE;"));
-    lines.push(p("\tst.global.f32 [%rd5], 0f00000000;"));
-    lines.push(p("\tst.global.f32 [%rd5+4], 0f00000000;"));
-    lines.push(p("\tbra LP_DONE;"));
-    lines.push(p("LP_NOTSKIP:"));
-    lines.push(String::new());
-
-    // x_row_base = x + row * H * 2 (bf16).
-    lines.push(p("\tcvt.u64.u32 %rd9, %r0;"));
-    lines.push(format!("\tmov.u32 %r4, {hidden};"));
-    lines.push(p("\tcvt.u64.u32 %rd10, %r4;"));
-    lines.push(p("\tmul.lo.u64 %rd9, %rd9, %rd10;"));
-    lines.push(p("\tshl.b64 %rd9, %rd9, 1; // *2 bf16"));
-    lines.push(p("\tadd.u64 %rd9, %rd0, %rd9;"));
-    lines.push(String::new());
-
-    lines.push(format!("\tmul.lo.u32 %r5, %r2, {vtile}; // v_base"));
-    lines.push(String::new());
-
-    lines.push(p("\tmov.u32 %r6, 0;"));
-    lines.push(p("LP_INNER:"));
-    lines.push(p("\t\tmul.lo.u32 %r7, %r6, 128;"));
-    lines.push(p("\t\tadd.u32 %r7, %r7, %r1;"));
-    lines.push(p("\t\tadd.u32 %r8, %r7, %r5;"));
-    lines.push(format!("\t\tsetp.lt.u32 %pv, %r8, {vocab};"));
-    lines.push(p("\t\t@!%pv bra LP_INNER_TAIL_ZERO;"));
-    lines.push(String::new());
-
-    // W_row_base — bf16 stride 2.
-    lines.push(p("\t\tcvt.u64.u32 %rd11, %r8;"));
-    lines.push(format!("\t\tmov.u32 %r9, {hidden};"));
-    lines.push(p("\t\tcvt.u64.u32 %rd12, %r9;"));
-    lines.push(p("\t\tmul.lo.u64 %rd11, %rd11, %rd12;"));
-    lines.push(p("\t\tshl.b64 %rd11, %rd11, 1; // *2 bf16"));
-    lines.push(p("\t\tadd.u64 %rd11, %rd1, %rd11;"));
-    lines.push(String::new());
-
-    lines.push(p("\t\tmov.f32 %facc, 0f00000000;"));
-    lines.push(p("\t\tmov.u32 %r10, 0;"));
-    lines.push(p("\t\tLP_DOT:"));
-    lines.push(p("\t\t\tcvt.u64.u32 %rd13, %r10;"));
-    lines.push(p("\t\t\tshl.b64 %rd13, %rd13, 1; // *2 bf16"));
-    lines.push(p("\t\t\tadd.u64 %rd14, %rd9, %rd13;"));
-    lines.push(p("\t\t\tld.global.b16 %h0, [%rd14];"));
-    lines.push(p("\t\t\tcvt.f32.bf16 %fa, %h0;"));
-    lines.push(p("\t\t\tadd.u64 %rd14, %rd11, %rd13;"));
-    lines.push(p("\t\t\tld.global.b16 %h1, [%rd14];"));
-    lines.push(p("\t\t\tcvt.f32.bf16 %fb, %h1;"));
-    lines.push(p("\t\t\tfma.rn.f32 %facc, %fa, %fb, %facc;"));
-    lines.push(p("\t\t\tadd.u32 %r10, %r10, 1;"));
-    lines.push(format!("\t\t\tsetp.lt.u32 %pv, %r10, {hidden};"));
-    lines.push(p("\t\t\t@%pv bra LP_DOT;"));
-    lines.push(String::new());
-
-    // Bias bf16.
-    lines.push(p("\t\tcvt.u64.u32 %rd15, %r8;"));
-    lines.push(p("\t\tshl.b64 %rd15, %rd15, 1; // *2"));
-    lines.push(p("\t\tadd.u64 %rd15, %rd2, %rd15;"));
-    lines.push(p("\t\tld.global.b16 %h2, [%rd15];"));
-    lines.push(p("\t\tcvt.f32.bf16 %ftmp, %h2;"));
-    lines.push(p("\t\tadd.f32 %facc, %facc, %ftmp;"));
-    lines.push(p("\t\tbra LP_INNER_STORE;"));
-    lines.push(String::new());
-
-    // Tail-zero: store bf16 -INF directly to smem so it doesn't perturb
-    // max/sum.  Review Finding 2: previously this path mov'd the f32
-    // bit-pattern 0f80800000 (which is -1.175e-38 — the smallest normal
-    // negative f32, NOT -INF) into %facc and fell through to the shared
-    // store-via-cvt path.  cvt.rn.bf16.f32 then mapped -1.175e-38 to bf16
-    // 0x0000 (below bf16 subnormal range), and the downstream
-    // LP_RED_MAX/LP_RED_SUM reads max'd with 0.0 — corrupting the
-    // per-tile LSE whenever all real logits in the tile were negative.
-    // We now branch around the cvt and write 0xFF80 (bf16 -INF) directly.
-    lines.push(p("LP_INNER_TAIL_ZERO:"));
-    lines.push(p("\t\tshl.b32 %r11, %r7, 1; // *2"));
-    lines.push(format!("\t\tmov.u64 %rd16, smem_partials_{vocab};"));
-    lines.push(p("\t\tcvt.u64.u32 %rd17, %r11;"));
-    lines.push(p("\t\tadd.u64 %rd16, %rd16, %rd17;"));
-    lines.push(p("\t\tmov.b16 %h2, 0xFF80; // bf16 -INF (direct, no f32 cvt)"));
-    lines.push(p("\t\tst.shared.b16 [%rd16], %h2;"));
-    lines.push(p("\t\tbra LP_INNER_AFTER_STORE;"));
-    lines.push(String::new());
-
-    // Store logit to smem as bf16 — real-tile path goes through the
-    // f32 → bf16 cvt below.
-    lines.push(p("LP_INNER_STORE:"));
-    lines.push(p("\t\tshl.b32 %r11, %r7, 1; // *2"));
-    lines.push(format!("\t\tmov.u64 %rd16, smem_partials_{vocab};"));
-    lines.push(p("\t\tcvt.u64.u32 %rd17, %r11;"));
-    lines.push(p("\t\tadd.u64 %rd16, %rd16, %rd17;"));
-    lines.push(p("\t\tcvt.rn.bf16.f32 %h2, %facc;"));
-    lines.push(p("\t\tst.shared.b16 [%rd16], %h2;"));
-    lines.push(p("LP_INNER_AFTER_STORE:"));
-    lines.push(String::new());
-
-    lines.push(p("\t\tadd.u32 %r6, %r6, 1;"));
-    lines.push(format!("\t\tsetp.lt.u32 %pv, %r6, {vtile_per_thread};"));
-    lines.push(p("\t\t@%pv bra LP_INNER;"));
-    lines.push(String::new());
-
-    lines.push(p("\tbar.sync 0;"));
-    lines.push(p("\tsetp.eq.u32 %pth0, %r1, 0;"));
-    lines.push(p("\t@!%pth0 bra LP_DONE;"));
-    lines.push(String::new());
-
-    // Reduce smem bf16 tile to (tile_max, tile_sum_unscaled) in f32.
-    lines.push(p("\tmov.f32 %ftmax, 0fFF800000; // -INF (f32)"));
-    lines.push(p("\tmov.u32 %r12, 0;"));
-    lines.push(p("LP_RED_MAX:"));
-    lines.push(p("\t\tshl.b32 %r13, %r12, 1; // *2"));
-    lines.push(format!("\t\tmov.u64 %rd18, smem_partials_{vocab};"));
-    lines.push(p("\t\tcvt.u64.u32 %rd19, %r13;"));
-    lines.push(p("\t\tadd.u64 %rd18, %rd18, %rd19;"));
-    lines.push(p("\t\tld.shared.b16 %h0, [%rd18];"));
-    lines.push(p("\t\tcvt.f32.bf16 %ftmp, %h0;"));
-    lines.push(p("\t\tmax.f32 %ftmax, %ftmax, %ftmp;"));
-    lines.push(p("\t\tadd.u32 %r12, %r12, 1;"));
-    lines.push(format!("\t\tsetp.lt.u32 %pv, %r12, {vtile};"));
-    lines.push(p("\t\t@%pv bra LP_RED_MAX;"));
-    lines.push(String::new());
-
-    lines.push(p("\tmov.f32 %ftsum, 0f00000000;"));
-    lines.push(p("\tmov.u32 %r12, 0;"));
-    lines.push(p("LP_RED_SUM:"));
-    lines.push(p("\t\tshl.b32 %r13, %r12, 1; // *2"));
-    lines.push(format!("\t\tmov.u64 %rd18, smem_partials_{vocab};"));
-    lines.push(p("\t\tcvt.u64.u32 %rd19, %r13;"));
-    lines.push(p("\t\tadd.u64 %rd18, %rd18, %rd19;"));
-    lines.push(p("\t\tld.shared.b16 %h0, [%rd18];"));
-    lines.push(p("\t\tcvt.f32.bf16 %ftmp, %h0;"));
-    lines.push(p("\t\tsub.f32 %ftmp, %ftmp, %ftmax;"));
-    lines.push(p("\t\tmul.f32 %ftmp, %ftmp, %flog2e;"));
-    lines.push(p("\t\tex2.approx.f32 %ftmp, %ftmp;"));
-    lines.push(p("\t\tadd.f32 %ftsum, %ftsum, %ftmp;"));
-    lines.push(p("\t\tadd.u32 %r12, %r12, 1;"));
-    lines.push(format!("\t\tsetp.lt.u32 %pv, %r12, {vtile};"));
-    lines.push(p("\t\t@%pv bra LP_RED_SUM;"));
-    lines.push(String::new());
-
-    // Store (tile_max, tile_sum_unscaled) as f32 partials.
-    lines.push(p("\tst.global.f32 [%rd5],   %ftmax;"));
-    lines.push(p("\tst.global.f32 [%rd5+4], %ftsum;"));
-    lines.push(String::new());
-
-    lines.push(p("LP_DONE:"));
-    lines.push(p("\tret;"));
-    lines.push(p("}"));
-
-    lines.join("\n")
-}
-
-/// Bf16 finalize kernel.
-///
-/// Reads f32 partials (Kernel A writes f32 regardless of activation dtype),
-/// runs online-LSE rescale in f32, recomputes `logit_at_target = x[row] @
-/// W[tgt] + bias[tgt]` with bf16 staging + f32 fma accumulator, writes
-/// `loss_out` and `lse_out` as f32.
-fn emit_large_finalize_kernel_bf16(cfg: &FusedLinearCEConfig) -> String {
-    let name = cfg.large_finalize_kernel_name();
-    let vocab = cfg.vocab_size;
-    let hidden = cfg.hidden_size;
-    let n_tiles = cfg.num_vocab_tiles();
-    let ignore = cfg.ignore_index;
-
-    let mut lines: Vec<String> = Vec::new();
-    let p = |l: &str| l.to_owned();
-    lines.push(String::new());
-
-    lines.push(format!(".visible .entry {name}("));
-    lines.push(p("\t.param .u64 param_x,"));
-    lines.push(p("\t.param .u64 param_w,"));
-    lines.push(p("\t.param .u64 param_bias,"));
-    lines.push(p("\t.param .u64 param_targets,"));
-    lines.push(p("\t.param .u64 param_partials,"));
-    lines.push(p("\t.param .u64 param_loss_out,"));
-    lines.push(p("\t.param .u64 param_lse_out,"));
-    lines.push(p("\t.param .u32 param_B, .param .u32 param_S,"));
-    lines.push(p("\t.param .u32 param_V, .param .u32 param_H,"));
-    lines.push(p("\t.param .u32 param_num_tiles"));
-    lines.push(p(") {"));
-
-    lines.push(p("\t.reg .u64 %rd<24>;"));
-    lines.push(p("\t.reg .u32 %r<16>;"));
-    lines.push(p("\t.reg .s64 %tgt64;"));
-    lines.push(p("\t.reg .b16 %h0, %h1, %h2;"));
-    lines.push(p("\t.reg .f32 %fmax, %fsum, %ftmax, %ftsum, %fnew_max;"));
-    lines.push(p("\t.reg .f32 %ftmp, %fa, %fb, %facc, %flog, %flse, %floss;"));
-    lines.push(p("\t.reg .f32 %flog2e, %fln2;"));
-    lines.push(p("\t.reg .pred %pskip, %pth0, %pv;"));
-    lines.push(String::new());
-
-    lines.push(p("\tld.param.u64 %rd0, [param_x];"));
-    lines.push(p("\tld.param.u64 %rd1, [param_w];"));
-    lines.push(p("\tld.param.u64 %rd2, [param_bias];"));
-    lines.push(p("\tld.param.u64 %rd3, [param_targets];"));
-    lines.push(p("\tld.param.u64 %rd4, [param_partials];"));
-    lines.push(p("\tld.param.u64 %rd5, [param_loss_out];"));
-    lines.push(p("\tld.param.u64 %rd6, [param_lse_out];"));
-    lines.push(p("\tmov.u32 %r0, %ctaid.x;"));
-    lines.push(p("\tmov.u32 %r1, %tid.x;"));
-    lines.push(p("\tmov.f32 %flog2e, 0f3FB8AA3B;"));
-    lines.push(p("\tmov.f32 %fln2,   0f3F317218;"));
-    lines.push(String::new());
-
-    lines.push(p("\tsetp.eq.u32 %pth0, %r1, 0;"));
-    lines.push(p("\t@!%pth0 bra LF_DONE;"));
-    lines.push(String::new());
-
-    lines.push(p("\tcvt.u64.u32 %rd7, %r0;"));
-    lines.push(p("\tmul.lo.u64 %rd7, %rd7, 8;"));
-    lines.push(p("\tadd.u64 %rd7, %rd3, %rd7;"));
-    lines.push(p("\tld.global.s64 %tgt64, [%rd7];"));
-    lines.push(String::new());
-
-    lines.push(p("\tcvt.u64.u32 %rd8, %r0;"));
-    lines.push(p("\tshl.b64 %rd8, %rd8, 2;"));
-    lines.push(p("\tadd.u64 %rd9, %rd5, %rd8;"));
-    lines.push(p("\tadd.u64 %rd10, %rd6, %rd8;"));
-    lines.push(String::new());
-
-    lines.push(format!("\tsetp.eq.s64 %pskip, %tgt64, {ignore};"));
-    lines.push(p("\t@!%pskip bra LF_REDUCE;"));
-    lines.push(p("\tst.global.f32 [%rd9],  0f00000000;"));
-    lines.push(p("\tst.global.f32 [%rd10], 0f00000000;"));
-    lines.push(p("\tbra LF_DONE;"));
-    lines.push(p("LF_REDUCE:"));
-    lines.push(String::new());
-
-    // partials_row_base = partials + row * num_tiles * 8 (f32 partials).
-    lines.push(p("\tcvt.u64.u32 %rd11, %r0;"));
-    lines.push(format!("\tmov.u32 %r2, {n_tiles};"));
-    lines.push(p("\tcvt.u64.u32 %rd12, %r2;"));
-    lines.push(p("\tmul.lo.u64 %rd11, %rd11, %rd12;"));
-    lines.push(p("\tshl.b64 %rd11, %rd11, 3;"));
-    lines.push(p("\tadd.u64 %rd11, %rd4, %rd11;"));
-    lines.push(String::new());
-
-    // Online-LSE reduce — identical to F32 path (partials are f32).
-    lines.push(p("\tmov.f32 %fmax, 0fFF800000; // -INF (f32)"));
-    lines.push(p("\tmov.f32 %fsum, 0f00000000;"));
-    lines.push(p("\tmov.u32 %r3, 0;"));
-    lines.push(p("LF_LOOP:"));
-    lines.push(p("\t\tcvt.u64.u32 %rd13, %r3;"));
-    lines.push(p("\t\tshl.b64 %rd13, %rd13, 3;"));
-    lines.push(p("\t\tadd.u64 %rd13, %rd11, %rd13;"));
-    lines.push(p("\t\tld.global.f32 %ftmax, [%rd13];"));
-    lines.push(p("\t\tld.global.f32 %ftsum, [%rd13+4];"));
-    lines.push(String::new());
-
-    lines.push(p("\t\tmax.f32 %fnew_max, %fmax, %ftmax;"));
-    lines.push(p("\t\tsub.f32 %ftmp, %fmax, %fnew_max;"));
-    lines.push(p("\t\tmul.f32 %ftmp, %ftmp, %flog2e;"));
-    lines.push(p("\t\tex2.approx.f32 %ftmp, %ftmp;"));
-    lines.push(p("\t\tmul.f32 %fsum, %fsum, %ftmp;"));
-    lines.push(p("\t\tsub.f32 %ftmp, %ftmax, %fnew_max;"));
-    lines.push(p("\t\tmul.f32 %ftmp, %ftmp, %flog2e;"));
-    lines.push(p("\t\tex2.approx.f32 %ftmp, %ftmp;"));
-    lines.push(p("\t\tmul.f32 %ftsum, %ftsum, %ftmp;"));
-    lines.push(p("\t\tadd.f32 %fsum, %fsum, %ftsum;"));
-    lines.push(p("\t\tmov.f32 %fmax, %fnew_max;"));
-    lines.push(String::new());
-
-    lines.push(p("\t\tadd.u32 %r3, %r3, 1;"));
-    lines.push(format!("\t\tsetp.lt.u32 %pv, %r3, {n_tiles};"));
-    lines.push(p("\t\t@%pv bra LF_LOOP;"));
-    lines.push(String::new());
-
-    lines.push(p("\tlg2.approx.f32 %flse, %fsum;"));
-    lines.push(p("\tmul.f32 %flse, %flse, %fln2;"));
-    lines.push(p("\tadd.f32 %flse, %flse, %fmax;"));
-    lines.push(String::new());
-
-    // x_row_base — bf16 stride 2.
-    lines.push(p("\tcvt.u64.u32 %rd14, %r0;"));
-    lines.push(format!("\tmov.u32 %r4, {hidden};"));
-    lines.push(p("\tcvt.u64.u32 %rd15, %r4;"));
-    lines.push(p("\tmul.lo.u64 %rd14, %rd14, %rd15;"));
-    lines.push(p("\tshl.b64 %rd14, %rd14, 1; // *2 bf16"));
-    lines.push(p("\tadd.u64 %rd14, %rd0, %rd14;"));
-    // W_tgt_base — bf16 stride 2.
-    lines.push(p("\tmul.lo.s64 %rd16, %tgt64, %rd15;"));
-    lines.push(p("\tshl.b64 %rd16, %rd16, 1; // *2 bf16"));
-    lines.push(p("\tadd.u64 %rd16, %rd1, %rd16;"));
-    lines.push(String::new());
-
-    // Dot loop — bf16 → f32 → fma.
-    lines.push(p("\tmov.f32 %facc, 0f00000000;"));
-    lines.push(p("\tmov.u32 %r5, 0;"));
-    lines.push(p("LF_DOT:"));
-    lines.push(p("\t\tcvt.u64.u32 %rd17, %r5;"));
-    lines.push(p("\t\tshl.b64 %rd17, %rd17, 1; // *2"));
-    lines.push(p("\t\tadd.u64 %rd18, %rd14, %rd17;"));
-    lines.push(p("\t\tld.global.b16 %h0, [%rd18];"));
-    lines.push(p("\t\tcvt.f32.bf16 %fa, %h0;"));
-    lines.push(p("\t\tadd.u64 %rd18, %rd16, %rd17;"));
-    lines.push(p("\t\tld.global.b16 %h1, [%rd18];"));
-    lines.push(p("\t\tcvt.f32.bf16 %fb, %h1;"));
-    lines.push(p("\t\tfma.rn.f32 %facc, %fa, %fb, %facc;"));
-    lines.push(p("\t\tadd.u32 %r5, %r5, 1;"));
-    lines.push(format!("\t\tsetp.lt.u32 %pv, %r5, {hidden};"));
-    lines.push(p("\t\t@%pv bra LF_DOT;"));
-    lines.push(String::new());
-
-    // Bias[tgt] bf16.
-    lines.push(p("\tmul.lo.s64 %rd19, %tgt64, 2; // bf16 stride"));
-    lines.push(p("\tadd.u64 %rd19, %rd2, %rd19;"));
-    lines.push(p("\tld.global.b16 %h2, [%rd19];"));
-    lines.push(p("\tcvt.f32.bf16 %ftmp, %h2;"));
-    lines.push(p("\tadd.f32 %facc, %facc, %ftmp;"));
-    lines.push(String::new());
-
-    lines.push(p("\tsub.f32 %floss, %flse, %facc;"));
-    lines.push(p("\tst.global.f32 [%rd9],  %floss;"));
-    lines.push(p("\tst.global.f32 [%rd10], %flse;"));
-    lines.push(String::new());
-
-    lines.push(p("LF_DONE:"));
-    let _ = vocab;
-    lines.push(p("\tret;"));
-    lines.push(p("}"));
-
-    lines.join("\n")
-}
 
 // ── Bf16 backward kernel ──────────────────────────────────────────────────────
 //
@@ -3524,14 +2648,15 @@ mod tests {
         let cfg = large_vocab_cfg();
         let ptx_bytes = synthesize_fused_linear_ce_ptx(&cfg);
         let ptx = std::str::from_utf8(&ptx_bytes).unwrap();
-        // Exactly one .version line + one .target line at module scope.
+        // Exactly one .version line + one .target line at module scope (the
+        // KIR floor, as for every KIR module without bf16).
         assert_eq!(
             ptx.matches(".version 7.0").count(),
             1,
             ".version must appear exactly once at module scope"
         );
         assert_eq!(
-            ptx.matches(".target sm_80").count(),
+            ptx.matches(".target sm_70").count(),
             1,
             ".target must appear exactly once at module scope"
         );
@@ -3547,18 +2672,22 @@ mod tests {
     }
 
     #[test]
-    fn test_large_ptx_partials_pointer_arithmetic_is_present() {
+    fn test_large_ptx_partials_are_f32_pairs() {
+        // Both kernels address partials as f32 pairs, one per (row, tile):
+        // Kernel A stores its tile's (max, sum), or (0, 0) for an ignored
+        // row; Kernel B loads each tile's pair. The addressing itself is
+        // pinned by `tests/fused_linear_ce_large_kir_equivalence.rs`.
         let cfg = large_vocab_cfg();
-        let ptx_bytes = synthesize_fused_linear_ce_ptx(&cfg);
-        let ptx = std::str::from_utf8(&ptx_bytes).unwrap();
-        // Both kernels must dereference partials with an 8-byte stride
-        // (one f32 pair per (row, tile) slot). The store in Kernel A
-        // writes ftmax then ftsum at +0 and +4.
-        assert!(ptx.contains("st.global.f32 [%rd5],   %ftmax;"));
-        assert!(ptx.contains("st.global.f32 [%rd5+4], %ftsum;"));
-        // The load in Kernel B reads ftmax then ftsum at +0 and +4.
-        assert!(ptx.contains("ld.global.f32 %ftmax, [%rd13];"));
-        assert!(ptx.contains("ld.global.f32 %ftsum, [%rd13+4];"));
+        let a = build_large_partials(&cfg);
+        let b = build_large_finalize(&cfg);
+        let partials = |ir: &KernelIR| ir.params.iter().find(|p| p.name == "partials").unwrap().ty.clone();
+        let pair = KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global);
+        assert_eq!(partials(&a), pair);
+        assert_eq!(partials(&b), pair);
+        let ptx = String::from_utf8(synthesize_fused_linear_ce_ptx(&cfg)).unwrap();
+        let (kernel_a, kernel_b) = ptx.split_at(ptx.rfind(".visible .entry ").unwrap());
+        assert_eq!(kernel_a.matches("st.global.f32 ").count(), 4);
+        assert_eq!(kernel_b.matches("ld.global.f32 ").count(), 5, "a pair per tile, x, W and bias");
     }
 
     #[test]

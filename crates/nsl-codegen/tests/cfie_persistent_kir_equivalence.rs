@@ -242,6 +242,7 @@ fn run(ptx: &str, g: &Geometry, input: &Inputs, call: Call, order: Order) -> Vec
         // thread wrote this launch shows in the output.
         shared: vec![0xFF; prog.shared_bytes],
         ctaid: 0,
+        ctaid_y: 0,
         ntid: BLOCK,
         steps: 0,
     };

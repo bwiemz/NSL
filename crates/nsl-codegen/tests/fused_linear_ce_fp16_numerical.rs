@@ -423,7 +423,7 @@ fn fp16_forward_backward_at_v8192_boundary() {
 // We deliberately pick V=8193 (just over the LARGE_VOCAB_THRESHOLD of
 // 8192) instead of V=49153 to keep the CPU f64 reference under a
 // minute even on modest hosts (rows=32 × 8193 × 128 = ~33M f64 muls).
-// Routes through the SAME `emit_large_partials_kernel_f16` path the
+// Routes through the SAME `build_large_partials` (F16) kernel the
 // production V=49152 fixture uses — the tail-zero branch and its
 // reduction-time consumer are identical.
 
