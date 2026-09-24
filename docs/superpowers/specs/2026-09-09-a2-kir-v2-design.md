@@ -584,6 +584,43 @@ frozen throughout, so nothing here blocks a kernel fix.
 10. **Fused loss heads.** `fused_linear_ce.rs`, then `cpkd_fused_loss.rs`.
     Proof: SASS equivalence (the online-softmax loops reorder under
     scheduling).
+
+    **Proof, revisited: level 3.** Scheduling reorders machine
+    instructions, not the PTX's floating-point operations, and the KIR
+    builds keep those in the hand kernels' order, so the loss heads are
+    proved the way step 9 proved CFIE: differential execution against the
+    frozen hand emitters, bit for bit, plus an independent reference and
+    mutation tests. That is a statement about every output bit, which an
+    instruction count within a tolerance is not; the device suites and the
+    `ptxas` gates carry fidelity to the machine, as in step 9.
+    `fused_linear_ce.rs` holds twelve kernels (the v1 forward, the
+    large-vocab partials and finalize, and the backward, each in f32, f16
+    and bf16), so it moves in three slices, one per role with all three
+    dtypes from one builder, and leaves the freeze with the last. The hand
+    emitters are frozen whole in `tests/fixtures/fused_linear_ce_hand.rs`
+    for all three.
+
+    **The v1 forward done** (first slice). `build_forward` builds it for
+    every dtype: the storage dtype picks the element type of `x`, `W`,
+    `bias` and the shared logits tile, so a 16-bit logit is rounded into
+    the tile before the reduction, as the hand kernels did. The tile is a
+    dynamic `SmemLayout` (the launcher's `shared_mem_bytes()` covers it).
+    KIR needed nothing new; the interpreter learned dynamic `.extern
+    .shared` memory, `.s64` loads and compares with negative immediates,
+    `lg2.approx`, the bf16 conversions and 16-bit `mov`. The gate sweeps
+    the three dtypes over ragged and exact tiles, a tile wider than the
+    block, targets in every tile and at lanes past 0, ignored rows and a
+    target past the vocab, under two schedules, and checks each row's loss
+    and log-sum-exp against an f64 reference. It catches every barrier
+    deleted, a nudged vocab, hidden, tile width, tile count, lanes-per-thread
+    or ignore index, and a relaxed fill guard or sum-scan bound. Two
+    mutants are equivalent and named: relaxing either bound of thread 0's
+    max scan, which then reads one lane holding nothing the running max
+    does not already cover (a logit an earlier tile of the row wrote, or
+    the logit-at-target slot), and `max` is idempotent. One more nudge is
+    equivalent and is avoided rather than named: the tile width minus one,
+    since it is both the tile's stride and the scans' bound, re-tiles the
+    vocab with neither gap nor double count.
 11. **The runtime kernels**, by family (`strided_copy`,
     `tier_b1_prepass`, then `kernels.rs` and `fused_kernels.rs` in
     slices), each slice one PR. Proof: normalised identity where

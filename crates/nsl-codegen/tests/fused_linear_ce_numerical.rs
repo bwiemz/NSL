@@ -202,7 +202,8 @@ fn ptx_snapshot_starts_with_header() {
     let cfg = FusedLinearCEConfig::default();
     let ptx = synthesize_fused_linear_ce_ptx(&cfg);
     let s = std::str::from_utf8(&ptx).unwrap();
-    assert!(s.starts_with(".version 7.0\n.target sm_80"), "got: {}", &s[..40.min(s.len())]);
+    // The v1 forward is KIR (roadmap A2 step 10) and targets the KIR floor.
+    assert!(s.starts_with(".version 7.0\n.target sm_70"), "got: {}", &s[..40.min(s.len())]);
 }
 
 #[test]

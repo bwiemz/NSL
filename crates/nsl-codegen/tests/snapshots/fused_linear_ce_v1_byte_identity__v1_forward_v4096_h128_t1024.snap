@@ -3,219 +3,261 @@ source: crates/nsl-codegen/tests/fused_linear_ce_v1_byte_identity.rs
 expression: s
 ---
 .version 7.0
-.target sm_80
+.target sm_70
 .address_size 64
 
-.extern .shared .align 4 .b8 smem_scratch[4128];
+.extern .shared .align 4 .b8 shared_mem[];
 
-.visible .entry nsl_fused_linear_ce_f32_v4096_h128(
-	.param .u64 param_x,
-	.param .u64 param_w,
-	.param .u64 param_bias,
-	.param .u64 param_targets,
-	.param .u64 param_loss_out,
-	.param .u64 param_lse_out,
-	.param .u32 param_B, .param .u32 param_S,
-	.param .u32 param_V, .param .u32 param_H
-) {
-	.reg .u64 %rd<30>;
-	.reg .u32 %r<20>;
-	.reg .s64 %tgt64;
-	.reg .f32 %flog, %facc, %fmax, %fsum, %ftmax, %flse, %floss;
-	.reg .f32 %fa, %fb, %flog2e, %fln2, %ftmp;
-	.reg .pred %pskip, %pv, %pth0, %ptgt;
+.visible .entry nsl_fused_linear_ce_f32_v4096_h128(.param .u64 param_x, .param .u64 param_w, .param .u64 param_bias, .param .u64 param_targets, .param .u64 param_loss_out, .param .u64 param_lse_out, .param .u32 param_B, .param .u32 param_S, .param .u32 param_V, .param .u32 param_H) {
+    .reg .u32 %r<16>;
+    .reg .u64 %rd<14>;
+    .reg .f32 %f<11>;
+    .reg .pred %p<1>;
+    .reg .u32 %edge_r;
+    .reg .u64 %edge_rd;
+    .reg .f32 %edge_f;
+    .reg .f64 %edge_fd;
+    .reg .b16 %edge_h;
+    .reg .pred %edge_p;
+    .reg .b32 %edge_v;
 
-	ld.param.u64 %rd0, [param_x];
-	ld.param.u64 %rd1, [param_w];
-	ld.param.u64 %rd2, [param_bias];
-	ld.param.u64 %rd3, [param_targets];
-	ld.param.u64 %rd4, [param_loss_out];
-	ld.param.u64 %rd5, [param_lse_out];
-	mov.u32 %r0, %ctaid.x;   // row_idx
-	mov.u32 %r1, %tid.x;     // tid
-	mov.f32 %flog2e, 0f3FB8AA3B; // log2(e)
-	mov.f32 %fln2,   0f3F317218; // ln(2)
+    ld.param.u64 %rd0, [param_x];
+    ld.param.u64 %rd1, [param_w];
+    ld.param.u64 %rd2, [param_bias];
+    ld.param.u64 %rd3, [param_targets];
+    ld.param.u64 %rd4, [param_loss_out];
+    ld.param.u64 %rd5, [param_lse_out];
+    ld.param.u32 %r0, [param_B];
+    ld.param.u32 %r1, [param_S];
+    ld.param.u32 %r2, [param_V];
+    ld.param.u32 %r3, [param_H];
 
-	setp.eq.u32 %pth0, %r1, 0;
-	@!%pth0 bra INIT_DONE;
-	mov.u64 %rd6, smem_scratch;
-	add.u64 %rd6, %rd6, 4096;
-	st.shared.f32 [%rd6], 0fFF800000; // -INF sentinel (f32 IEEE 754 -INF)
-INIT_DONE:
-	bar.sync 0;
-
-	// Load targets[row_idx] (i64)
-	cvt.u64.u32 %rd7, %r0;
-	mul.lo.u64 %rd7, %rd7, 8;
-	add.u64 %rd7, %rd3, %rd7;
-	ld.global.s64 %tgt64, [%rd7];
-
-	// setp.eq.s64: if target == -100 skip
-	setp.eq.s64 %pskip, %tgt64, -100;
-	@%pskip bra SKIP_LABEL;
-
-	// x_row_base = x + row_idx * 128 * 4
-	cvt.u64.u32 %rd8, %r0;
-	mov.u32 %r2, 128;
-	cvt.u64.u32 %rd9, %r2;
-	mul.lo.u64 %rd8, %rd8, %rd9;
-	shl.b64 %rd8, %rd8, 2;
-	add.u64 %rd8, %rd0, %rd8; // %rd8 = x_row_base
-
-	mov.f32 %fmax, 0fFF800000; // -INF (f32, IEEE 754 binary32)
-	mov.f32 %fsum, 0f00000000; // 0.0
-
-	mov.u32 %r3, 0; // tile_idx
-TILE_LOOP:
-		mul.lo.u32 %r4, %r3, 1024; // v_base
-
-		mov.u32 %r5, 0; // sub-tile counter
-		INNER_LOOP:
-			mul.lo.u32 %r6, %r5, 128;
-			add.u32 %r6, %r6, %r1;
-			add.u32 %r6, %r6, %r4; // v_idx
-			setp.lt.u32 %pv, %r6, 4096;
-			@!%pv bra INNER_SKIP;
-
-			// W_row_base = W + v_idx * 128 * 4
-			cvt.u64.u32 %rd10, %r6;
-			mov.u32 %r7, 128;
-			cvt.u64.u32 %rd11, %r7;
-			mul.lo.u64 %rd10, %rd10, %rd11;
-			shl.b64 %rd10, %rd10, 2;
-			add.u64 %rd10, %rd1, %rd10; // %rd10 = W_row_base
-
-			mov.f32 %facc, 0f00000000;
-			mov.u32 %r8, 0; // h
-			DOT_LOOP:
-				cvt.u64.u32 %rd12, %r8;
-				shl.b64 %rd12, %rd12, 2; // h * 4
-				add.u64 %rd13, %rd8, %rd12; // x_row_base + h*4
-				ld.global.f32 %fa, [%rd13];
-				add.u64 %rd14, %rd10, %rd12; // W_row_base + h*4
-				ld.global.f32 %fb, [%rd14];
-				fma.rn.f32 %facc, %fa, %fb, %facc;
-				add.u32 %r8, %r8, 1;
-				setp.lt.u32 %pv, %r8, 128;
-				@%pv bra DOT_LOOP;
-
-			// facc += bias[v_idx]
-			cvt.u64.u32 %rd15, %r6;
-			shl.b64 %rd15, %rd15, 2;
-			add.u64 %rd15, %rd2, %rd15;
-			ld.global.f32 %ftmp, [%rd15];
-			add.f32 %facc, %facc, %ftmp;
-
-			// Store logit to smem_scratch[(r5*128+tid)*4]
-			mul.lo.u32 %r9, %r5, 128;
-			add.u32 %r9, %r9, %r1;
-			shl.b32 %r9, %r9, 2;
-			mov.u64 %rd16, smem_scratch;
-			cvt.u64.u32 %rd17, %r9;
-			add.u64 %rd16, %rd16, %rd17;
-			st.shared.f32 [%rd16], %facc;
-
-			// If v_idx == target, record logit_at_target in smem
-			cvt.s64.u32 %rd18, %r6;
-			setp.eq.s64 %ptgt, %rd18, %tgt64;
-			@!%ptgt bra NOT_TARGET;
-			mov.u64 %rd19, smem_scratch;
-			add.u64 %rd19, %rd19, 4096;
-			st.shared.f32 [%rd19], %facc;
-			NOT_TARGET:
-
-			INNER_SKIP:
-			add.u32 %r5, %r5, 1;
-			setp.lt.u32 %pv, %r5, 8;
-			@%pv bra INNER_LOOP;
-
-		bar.sync 0;
-
-		setp.eq.u32 %pth0, %r1, 0;
-		@!%pth0 bra TILE_REDUCE_DONE;
-
-		mov.f32 %ftmax, 0fFF800000; // -INF (f32)
-		mov.u32 %r10, 0;
-		SMEM_MAX_LOOP:
-			add.u32 %r11, %r4, %r10; // v_base + i
-			setp.lt.u32 %pv, %r11, 4096;
-			@!%pv bra SMEM_MAX_DONE;
-			shl.b32 %r12, %r10, 2;
-			mov.u64 %rd20, smem_scratch;
-			cvt.u64.u32 %rd21, %r12;
-			add.u64 %rd20, %rd20, %rd21;
-			ld.shared.f32 %ftmp, [%rd20];
-			max.f32 %ftmax, %ftmax, %ftmp;
-			add.u32 %r10, %r10, 1;
-			setp.lt.u32 %pv, %r10, 1024;
-			@%pv bra SMEM_MAX_LOOP;
-		SMEM_MAX_DONE:
-
-		// Online-softmax update
-		max.f32 %flog, %fmax, %ftmax; // new_max (reuse %flog temporarily)
-		sub.f32 %fmax, %fmax, %flog; // old_max - new_max (negative or 0)
-		mul.f32 %fmax, %fmax, %flog2e;
-		ex2.approx.f32 %fmax, %fmax; // exp(old_max - new_max)
-		mul.f32 %fsum, %fsum, %fmax; // rescale
-		mov.f32 %fmax, %flog; // fmax = new_max
-
-		mov.u32 %r10, 0;
-		SMEM_SUM_LOOP:
-			add.u32 %r11, %r4, %r10;
-			setp.lt.u32 %pv, %r11, 4096;
-			@!%pv bra SMEM_SUM_DONE;
-			shl.b32 %r12, %r10, 2;
-			mov.u64 %rd20, smem_scratch;
-			cvt.u64.u32 %rd21, %r12;
-			add.u64 %rd20, %rd20, %rd21;
-			ld.shared.f32 %ftmp, [%rd20];
-			sub.f32 %ftmp, %ftmp, %fmax; // logit - new_max
-			mul.f32 %ftmp, %ftmp, %flog2e;
-			ex2.approx.f32 %ftmp, %ftmp;
-			add.f32 %fsum, %fsum, %ftmp;
-			add.u32 %r10, %r10, 1;
-			setp.lt.u32 %pv, %r10, 1024;
-			@%pv bra SMEM_SUM_LOOP;
-		SMEM_SUM_DONE:
-
-		TILE_REDUCE_DONE:
-		bar.sync 0;
-
-		add.u32 %r3, %r3, 1;
-		setp.lt.u32 %pv, %r3, 4;
-		@%pv bra TILE_LOOP;
-
-	setp.eq.u32 %pth0, %r1, 0;
-	@!%pth0 bra WRITE_DONE;
-
-	lg2.approx.f32 %flse, %fsum; // log2(sum_exp)
-	mul.f32 %flse, %flse, %fln2; // ln(sum_exp)
-	add.f32 %flse, %flse, %fmax; // lse = ln(sum_exp) + max
-
-	mov.u64 %rd22, smem_scratch;
-	add.u64 %rd22, %rd22, 4096;
-	ld.shared.f32 %flog, [%rd22]; // logit_at_target
-
-	sub.f32 %floss, %flse, %flog;
-
-	cvt.u64.u32 %rd23, %r0;
-	shl.b64 %rd23, %rd23, 2;
-	add.u64 %rd24, %rd4, %rd23;
-	st.global.f32 [%rd24], %floss;
-	add.u64 %rd24, %rd5, %rd23;
-	st.global.f32 [%rd24], %flse;
-	bra WRITE_DONE;
-
-SKIP_LABEL:
-	setp.eq.u32 %pth0, %r1, 0;
-	@!%pth0 bra WRITE_DONE;
-	cvt.u64.u32 %rd23, %r0;
-	shl.b64 %rd23, %rd23, 2;
-	add.u64 %rd24, %rd4, %rd23;
-	st.global.f32 [%rd24], 0f00000000;
-	add.u64 %rd24, %rd5, %rd23;
-	st.global.f32 [%rd24], 0f00000000;
-
-WRITE_DONE:
-	ret;
+BB0:
+    mov.u32 %r0, %ctaid.x;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, 0;
+    mov.u32 %r3, 1;
+    mov.u64 %rd6, shared_mem;
+    mov.u64 %rd7, shared_mem;
+    add.u64 %rd7, %rd7, 4096;
+    mov.f32 %f0, 0fFF800000;
+    mov.f32 %f1, 0f00000000;
+    setp.eq.u32 %p0, %r1, %r2;
+    @%p0 bra BB1;
+    bra BB2;
+BB1:
+    st.shared.f32 [%rd7], %f0;
+    bra BB2;
+BB2:
+    bar.sync 0;
+    cvt.u64.u32 %rd8, %r0;
+    mul.lo.u64 %rd8, %rd8, 8;
+    add.u64 %rd8, %rd3, %rd8;
+    ld.global.s64 %rd3, [%rd8];
+    mov.s64 %rd8, -100;
+    setp.eq.s64 %p0, %rd3, %rd8;
+    @%p0 bra BB4;
+    bra BB3;
+BB3:
+    mov.u32 %r4, 128;
+    mov.u64 %rd8, 128;
+    mov.u32 %r5, 4096;
+    mov.u32 %r6, 1024;
+    mov.u32 %r7, 128;
+    cvt.u64.u32 %rd9, %r0;
+    mul.lo.u64 %rd10, %rd9, %rd8;
+    mov.u32 %r8, %r2;
+    mov.f32 %f2, %f0;
+    mov.f32 %f3, %f1;
+    bra BB6;
+BB4:
+    setp.ne.u32 %p0, %r1, %r2;
+    @%p0 bra BB5;
+    bra BB29;
+BB5:
+    ret;
+BB6:
+    mov.u32 %r9, 4;
+    setp.ge.u32 %p0, %r8, %r9;
+    @%p0 bra BB8;
+    bra BB7;
+BB7:
+    mul.lo.u32 %r9, %r8, %r6;
+    mov.u32 %r10, 8;
+    mov.u32 %r11, %r2;
+    bra BB9;
+BB8:
+    setp.ne.u32 %p0, %r1, %r2;
+    @%p0 bra BB5;
+    bra BB28;
+BB9:
+    setp.ge.u32 %p0, %r11, %r10;
+    @%p0 bra BB11;
+    bra BB10;
+BB10:
+    mul.lo.u32 %r12, %r11, %r7;
+    add.u32 %r13, %r12, %r1;
+    add.u32 %r12, %r13, %r9;
+    setp.lt.u32 %p0, %r12, %r5;
+    @%p0 bra BB12;
+    bra BB13;
+BB11:
+    bar.sync 0;
+    setp.ne.u32 %p0, %r1, %r2;
+    @!%p0 bra BB11_else;
+    mov.f32 %f4, %f2;
+    mov.f32 %f5, %f3;
+    bra BB19;
+BB11_else:
+    bra BB18;
+BB12:
+    cvt.u64.u32 %rd9, %r12;
+    mul.lo.u64 %rd11, %rd9, %rd8;
+    mov.u32 %r14, %r2;
+    mov.f32 %f6, %f1;
+    bra BB14;
+BB13:
+    add.u32 %r15, %r11, %r3;
+    mov.u32 %r11, %r15;
+    bra BB9;
+BB14:
+    setp.ge.u32 %p0, %r14, %r4;
+    @%p0 bra BB16;
+    bra BB15;
+BB15:
+    cvt.u64.u32 %rd9, %r14;
+    add.u64 %rd12, %rd10, %rd9;
+    mov.u64 %rd13, %rd12;
+    mul.lo.u64 %rd13, %rd13, 4;
+    add.u64 %rd13, %rd0, %rd13;
+    ld.global.f32 %f7, [%rd13];
+    add.u64 %rd12, %rd11, %rd9;
+    mov.u64 %rd9, %rd12;
+    mul.lo.u64 %rd9, %rd9, 4;
+    add.u64 %rd9, %rd1, %rd9;
+    ld.global.f32 %f8, [%rd9];
+    fma.rn.f32 %f9, %f7, %f8, %f6;
+    add.u32 %r15, %r14, %r3;
+    mov.u32 %r14, %r15;
+    mov.f32 %f6, %f9;
+    bra BB14;
+BB16:
+    cvt.u64.u32 %rd9, %r12;
+    mul.lo.u64 %rd9, %rd9, 4;
+    add.u64 %rd9, %rd2, %rd9;
+    ld.global.f32 %f7, [%rd9];
+    add.f32 %f8, %f6, %f7;
+    cvt.u64.u32 %rd9, %r13;
+    mul.lo.u64 %rd9, %rd9, 4;
+    add.u64 %rd9, %rd6, %rd9;
+    st.shared.f32 [%rd9], %f8;
+    cvt.s64.u32 %rd9, %r12;
+    setp.eq.s64 %p0, %rd9, %rd3;
+    @%p0 bra BB17;
+    bra BB13;
+BB17:
+    st.shared.f32 [%rd7], %f8;
+    bra BB13;
+BB18:
+    mov.u32 %r10, %r2;
+    mov.f32 %f6, %f0;
+    bra BB20;
+BB19:
+    bar.sync 0;
+    add.u32 %r11, %r8, %r3;
+    mov.u32 %r8, %r11;
+    mov.f32 %f2, %f4;
+    mov.f32 %f3, %f5;
+    bra BB6;
+BB20:
+    add.u32 %r11, %r9, %r10;
+    setp.lt.u32 %p0, %r11, %r5;
+    @!%p0 bra BB20_else;
+    bra BB23;
+BB20_else:
+    mov.f32 %f7, %f6;
+    bra BB22;
+BB21:
+    cvt.u64.u32 %rd9, %r10;
+    mul.lo.u64 %rd9, %rd9, 4;
+    add.u64 %rd9, %rd6, %rd9;
+    ld.shared.f32 %f8, [%rd9];
+    max.f32 %f9, %f6, %f8;
+    add.u32 %r11, %r10, %r3;
+    mov.u32 %r10, %r11;
+    mov.f32 %f6, %f9;
+    bra BB20;
+BB22:
+    max.f32 %f8, %f2, %f7;
+    sub.f32 %f9, %f2, %f8;
+    mul.f32 %f10, %f9, 0f3FB8AA3B;
+    ex2.approx.f32 %f10, %f10;
+    mul.f32 %f9, %f3, %f10;
+    mov.u32 %r11, %r2;
+    mov.f32 %f10, %f9;
+    bra BB24;
+BB23:
+    setp.lt.u32 %p0, %r10, %r6;
+    @!%p0 bra BB23_else;
+    bra BB21;
+BB23_else:
+    mov.f32 %f7, %f6;
+    bra BB22;
+BB24:
+    add.u32 %r10, %r9, %r11;
+    setp.lt.u32 %p0, %r10, %r5;
+    @!%p0 bra BB24_else;
+    bra BB27;
+BB24_else:
+    mov.f32 %f6, %f10;
+    bra BB26;
+BB25:
+    cvt.u64.u32 %rd9, %r11;
+    mul.lo.u64 %rd9, %rd9, 4;
+    add.u64 %rd9, %rd6, %rd9;
+    ld.shared.f32 %f7, [%rd9];
+    sub.f32 %f9, %f7, %f8;
+    mul.f32 %f7, %f9, 0f3FB8AA3B;
+    ex2.approx.f32 %f7, %f7;
+    add.f32 %f9, %f10, %f7;
+    add.u32 %r10, %r11, %r3;
+    mov.u32 %r11, %r10;
+    mov.f32 %f10, %f9;
+    bra BB24;
+BB26:
+    mov.f32 %f4, %f8;
+    mov.f32 %f5, %f6;
+    bra BB19;
+BB27:
+    setp.lt.u32 %p0, %r11, %r6;
+    @!%p0 bra BB27_else;
+    bra BB25;
+BB27_else:
+    mov.f32 %f6, %f10;
+    bra BB26;
+BB28:
+    lg2.approx.f32 %f0, %f3;
+    mul.f32 %f0, %f0, 0f3F317218;
+    add.f32 %f3, %f0, %f2;
+    ld.shared.f32 %f0, [%rd7];
+    sub.f32 %f2, %f3, %f0;
+    cvt.u64.u32 %rd0, %r0;
+    mul.lo.u64 %rd0, %rd0, 4;
+    add.u64 %rd0, %rd4, %rd0;
+    st.global.f32 [%rd0], %f2;
+    cvt.u64.u32 %rd0, %r0;
+    mul.lo.u64 %rd0, %rd0, 4;
+    add.u64 %rd0, %rd5, %rd0;
+    st.global.f32 [%rd0], %f3;
+    bra BB5;
+BB29:
+    cvt.u64.u32 %rd0, %r0;
+    mul.lo.u64 %rd0, %rd0, 4;
+    add.u64 %rd0, %rd4, %rd0;
+    st.global.f32 [%rd0], %f1;
+    cvt.u64.u32 %rd0, %r0;
+    mul.lo.u64 %rd0, %rd0, 4;
+    add.u64 %rd0, %rd5, %rd0;
+    st.global.f32 [%rd0], %f1;
+    bra BB5;
 }

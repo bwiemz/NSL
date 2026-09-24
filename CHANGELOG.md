@@ -8,6 +8,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- The fused linear-CE v1 forward kernel (`nsl_fused_linear_ce_{f32,f16,bf16}_*`)
+  is built as KIR (roadmap A2 step 10, first slice). It was three
+  hand-assembled PTX kernels, one per dtype; one KIR builder now makes all
+  three, keeping their control flow, barriers and floating-point order,
+  including the rounding of each logit to the storage dtype in the shared
+  tile. `tests/fused_linear_ce_fwd_kir_equivalence.rs` runs the frozen hand
+  emitters and the KIR one on the shared PTX interpreter across the three
+  dtypes, ragged and exact vocab tiles, ignored rows and a target past the
+  vocab. It requires the same output bits and an f64 reference's loss and
+  log-sum-exp, and names the mutants that cannot change them. The kernel
+  targets the KIR floor (`sm_70`; bf16 uses `sm_80` and ISA 7.8), and the
+  two v1 forward byte-identity snapshots are re-blessed to the KIR module.
+  The large-vocab pair and the backward follow in their own slices.
 - The CFIE persistent decode-block kernel (`nsl_cfie_decode_block`) is
   built as KIR (roadmap A2 step 9, its last slice). It was
   hand-assembled PTX for a whole layer's decode step in one CTA: RMSNorm,

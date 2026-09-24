@@ -9,6 +9,13 @@
 //! test catches it before it can silently change observed numerical
 //! results on the existing v1 GPU test (`fused_linear_ce_numerical.rs`).
 //!
+//! Roadmap A2 step 10 moved the v1 forward onto KIR, and its two forward
+//! snapshots were re-blessed to the KIR module then. What they pin now is
+//! that module's text; that it computes what the pre-migration hand kernel
+//! did is proved by `fused_linear_ce_fwd_kir_equivalence.rs`, which runs
+//! both on the PTX interpreter and requires the same output bits. The
+//! backward snapshot still pins the hand kernel.
+//!
 //! Snapshots live in `tests/snapshots/fused_linear_ce_v1_byte_identity__*.snap`.
 
 use nsl_codegen::fused_linear_ce::{
