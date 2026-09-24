@@ -10,13 +10,12 @@
 //! Skipped (returns early) when `ptxas` isn't in PATH — keeps Linux dev
 //! boxes and CI lanes without CUDA install green.
 //!
-//! ## Why bf16 needs PTX 8.0
+//! ## Why bf16 needs PTX 7.8
 //!
 //! `cvt.f32.bf16` / `cvt.rn.bf16.f32` were introduced in PTX ISA 7.8 and
-//! require `.target sm_80+`. The hand-written Bf16 backward bumps the
-//! header to `.version 8.0` (via `FusedLinearCEConfig::ptx_header()` dtype
-//! dispatch); the KIR forward kernels (roadmap A2 step 10) take the KIR
-//! bf16 floor, `.version 7.8` on `sm_80`.
+//! require `.target sm_80+`. Every fused linear-CE kernel is KIR (roadmap
+//! A2 step 10) and takes the KIR bf16 floor, `.version 7.8` on `sm_80`
+//! (the hand-written kernels declared `.version 8.0`).
 
 use nsl_codegen::fused_linear_ce::{
     Dtype, FusedLinearCEConfig, MAX_VOCAB_HARD_CEILING,
@@ -202,8 +201,8 @@ fn bf16_backward_assembles_for_sm80_at_v4096() {
         "Bf16 backward MUST load HBM as .b16"
     );
     assert!(
-        txt.contains(".version 8.0"),
-        "Bf16 backward MUST bump to .version 8.0"
+        txt.starts_with(".version 7.8\n.target sm_80"),
+        "Bf16 backward MUST declare PTX ISA 7.8 on sm_80 (the KIR bf16 floor)"
     );
     assert!(
         !txt.contains("cvt.f32.f16"),

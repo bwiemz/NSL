@@ -1,215 +1,200 @@
 ---
 source: crates/nsl-codegen/tests/fused_linear_ce_v1_byte_identity.rs
-assertion_line: 52
 expression: s
 ---
 .version 7.0
-.target sm_80
+.target sm_70
 .address_size 64
 
-.extern .shared .align 4 .b8 smem_scratch[4128];
+.visible .entry nsl_fused_linear_ce_backward_f32_v4096_h128(.param .f32 param_grad_output, .param .u64 param_x, .param .u64 param_w, .param .u64 param_bias, .param .u64 param_targets, .param .u64 param_lse, .param .u64 param_dx_out, .param .u64 param_dw_out, .param .u64 param_dbias_out, .param .u32 param_B, .param .u32 param_S, .param .u32 param_V, .param .u32 param_H, .param .u32 param_num_valid) {
+    .reg .u32 %r<16>;
+    .reg .u64 %rd<13>;
+    .reg .f32 %f<7>;
+    .reg .pred %p<1>;
+    .reg .u32 %edge_r;
+    .reg .u64 %edge_rd;
+    .reg .f32 %edge_f;
+    .reg .f64 %edge_fd;
+    .reg .b16 %edge_h;
+    .reg .pred %edge_p;
+    .reg .b32 %edge_v;
 
-.visible .entry nsl_fused_linear_ce_backward_f32_v4096_h128(
-	.param .f32 param_grad_output,
-	.param .u64 param_x,
-	.param .u64 param_w,
-	.param .u64 param_bias,
-	.param .u64 param_targets,
-	.param .u64 param_lse,
-	.param .u64 param_dx_out,
-	.param .u64 param_dw_out,
-	.param .u64 param_dbias_out,
-	.param .u32 param_B,
-	.param .u32 param_S,
-	.param .u32 param_V,
-	.param .u32 param_H,
-	.param .u32 param_num_valid
-) {
-	.reg .u64 %rd<24>;
-	.reg .u32 %r<20>;
-	.reg .s64 %target_val;
-	.reg .f32 %f<20>;
-	.reg .f32 %logit_acc;
-	.reg .f32 %grad_output;
-	.reg .f32 %lse_val;
-	.reg .f32 %scale;
-	.reg .pred %p_skip;
-	.reg .pred %p_valid;
-	.reg .pred %p_intile;
-	.reg .pred %p_is_target;
-	.reg .u32 %num_valid;
-	.reg .f32 %num_valid_f;
+    ld.param.f32 %f0, [param_grad_output];
+    ld.param.u64 %rd0, [param_x];
+    ld.param.u64 %rd1, [param_w];
+    ld.param.u64 %rd2, [param_bias];
+    ld.param.u64 %rd3, [param_targets];
+    ld.param.u64 %rd4, [param_lse];
+    ld.param.u64 %rd5, [param_dx_out];
+    ld.param.u64 %rd6, [param_dw_out];
+    ld.param.u64 %rd7, [param_dbias_out];
+    ld.param.u32 %r0, [param_B];
+    ld.param.u32 %r1, [param_S];
+    ld.param.u32 %r2, [param_V];
+    ld.param.u32 %r3, [param_H];
+    ld.param.u32 %r4, [param_num_valid];
 
-	ld.param.f32 %grad_output, [param_grad_output];
-	ld.param.u64 %rd0, [param_x];
-	ld.param.u64 %rd1, [param_w];
-	ld.param.u64 %rd2, [param_bias];
-	ld.param.u64 %rd3, [param_targets];
-	ld.param.u64 %rd4, [param_lse];
-	ld.param.u64 %rd5, [param_dx_out];
-	ld.param.u64 %rd6, [param_dw_out];
-	ld.param.u64 %rd7, [param_dbias_out];
-	ld.param.u32 %num_valid, [param_num_valid];
-	cvt.rn.f32.u32 %num_valid_f, %num_valid;
-
-	mov.u32 %r0, %ctaid.x;
-	mov.u32 %r1, %tid.x;
-
-	cvt.u64.u32 %rd8, %r0;
-	mul.lo.u64 %rd8, %rd8, 8;
-	add.u64 %rd8, %rd3, %rd8;
-	ld.global.s64 %target_val, [%rd8];
-
-	setp.eq.s64 %p_skip, %target_val, -100;
-	@%p_skip bra BWD_SKIP_LABEL;
-
-	cvt.u64.u32 %rd9, %r0;
-	shl.b64 %rd9, %rd9, 2;
-	add.u64 %rd9, %rd4, %rd9;
-	ld.global.f32 %lse_val, [%rd9];
-
-	cvt.u64.u32 %rd10, %r0;
-	mov.u32 %r2, 128;
-	cvt.u64.u32 %rd11, %r2;
-	mul.lo.u64 %rd10, %rd10, %rd11;
-	shl.b64 %rd10, %rd10, 2;
-	add.u64 %rd10, %rd0, %rd10;
-	// dx_row_base = dx_out + row_idx * H * 4
-	cvt.u64.u32 %rd20, %r0;
-	mul.lo.u64 %rd20, %rd20, %rd11;
-	shl.b64 %rd20, %rd20, 2;
-	add.u64 %rd20, %rd5, %rd20;
-
-	div.rn.f32 %scale, %grad_output, %num_valid_f;
-
-	mov.f32 %f15, 0f3FB8AA3B; // log2(e)
-
-	mov.u32 %r3, 0; // tile_idx
-BWD_TILE_LOOP:
-		mul.lo.u32 %r4, %r3, 1024; // v_base
-
-		mov.u32 %r5, 0; // inner counter
-BWD_INNER_LOOP:
-			mul.lo.u32 %r6, %r5, 128;
-			add.u32 %r6, %r6, %r1;
-			add.u32 %r6, %r6, %r4;
-			// v_idx = %r6
-			setp.lt.u32 %p_valid, %r6, 4096;
-			@!%p_valid bra BWD_INNER_SKIP;
-
-			// W_row_base for v_idx
-			cvt.u64.u32 %rd12, %r6;
-			mov.u32 %r7, 128;
-			cvt.u64.u32 %rd13, %r7;
-			mul.lo.u64 %rd12, %rd12, %rd13;
-			shl.b64 %rd12, %rd12, 2;
-			add.u64 %rd12, %rd1, %rd12;
-
-			mov.f32 %logit_acc, 0f00000000;
-			mov.u32 %r8, 0;
-BWD_DOT_LOOP:
-				cvt.u64.u32 %rd14, %r8;
-				shl.b64 %rd14, %rd14, 2;
-				add.u64 %rd15, %rd10, %rd14;
-				ld.global.f32 %f0, [%rd15];
-				add.u64 %rd16, %rd12, %rd14;
-				ld.global.f32 %f1, [%rd16];
-				fma.rn.f32 %logit_acc, %f0, %f1, %logit_acc;
-				add.u32 %r8, %r8, 1;
-				setp.lt.u32 %p_valid, %r8, 128;
-				@%p_valid bra BWD_DOT_LOOP;
-
-			// bias
-			cvt.u64.u32 %rd17, %r6;
-			shl.b64 %rd17, %rd17, 2;
-			add.u64 %rd17, %rd2, %rd17;
-			ld.global.f32 %f2, [%rd17];
-			add.f32 %logit_acc, %logit_acc, %f2;
-
-			// p_v = exp(logit_v - lse_val)
-			sub.f32 %f3, %logit_acc, %lse_val;
-			mul.f32 %f3, %f3, %f15; // * log2(e)
-			ex2.approx.f32 %f3, %f3;  // p_v
-
-			// dlogit_v = p_v - (v == target ? 1 : 0)
-			cvt.s64.u32 %rd18, %r6;
-			setp.eq.s64 %p_is_target, %rd18, %target_val;
-			@%p_is_target sub.f32 %f3, %f3, 0f3F800000; // -= 1.0
-			// scaled = dlogit_v * scale
-			mul.f32 %f4, %f3, %scale;
-
-			// Scatter: dx and dW (loop over H)
-			// dW_row_base = dW_out + v_idx * H * 4
-			cvt.u64.u32 %rd21, %r6;
-			mov.u32 %r9, 128;
-			cvt.u64.u32 %rd22, %r9;
-			mul.lo.u64 %rd21, %rd21, %rd22;
-			shl.b64 %rd21, %rd21, 2;
-			add.u64 %rd21, %rd6, %rd21; // dW_row_base
-
-			mov.u32 %r9, 0; // h counter
-BWD_H_LOOP:
-				cvt.u64.u32 %rd23, %r9;
-				shl.b64 %rd23, %rd23, 2;
-				// W[v, h]
-				add.u64 %rd14, %rd12, %rd23;
-				ld.global.f32 %f5, [%rd14];
-				// dx_out[row, h] += scaled * W[v, h]
-				mul.f32 %f6, %f4, %f5;
-				add.u64 %rd14, %rd20, %rd23;
-				red.global.add.f32 [%rd14], %f6;
-				// x[row, h]
-				add.u64 %rd14, %rd10, %rd23;
-				ld.global.f32 %f7, [%rd14];
-				// dW_out[v, h] += scaled * x[row, h]
-				mul.f32 %f8, %f4, %f7;
-				add.u64 %rd14, %rd21, %rd23;
-				red.global.add.f32 [%rd14], %f8;
-				add.u32 %r9, %r9, 1;
-				setp.lt.u32 %p_valid, %r9, 128;
-				@%p_valid bra BWD_H_LOOP;
-
-			// dbias_out[v] += scaled
-			cvt.u64.u32 %rd14, %r6;
-			shl.b64 %rd14, %rd14, 2;
-			add.u64 %rd14, %rd7, %rd14;
-			red.global.add.f32 [%rd14], %f4;
-
-BWD_INNER_SKIP:
-			add.u32 %r5, %r5, 1;
-			setp.lt.u32 %p_valid, %r5, 8;
-			@%p_valid bra BWD_INNER_LOOP;
-
-		add.u32 %r3, %r3, 1;
-		setp.lt.u32 %p_valid, %r3, 4;
-		@%p_valid bra BWD_TILE_LOOP;
-
-	bra BWD_DONE;
-
-BWD_SKIP_LABEL:
-	// Zero dx_out[row, :] for skipped token
-	cvt.u64.u32 %rd10, %r0;
-	mov.u32 %r2, 128;
-	cvt.u64.u32 %rd11, %r2;
-	mul.lo.u64 %rd10, %rd10, %rd11;
-	shl.b64 %rd10, %rd10, 2;
-	add.u64 %rd10, %rd5, %rd10; // dx_row_base
-
-	// Thread r1 zeros H/128 elements (stride 128)
-	mov.u32 %r5, 0;
-BWD_ZERO_LOOP:
-		mul.lo.u32 %r6, %r5, 128;
-		add.u32 %r6, %r6, %r1;
-		setp.lt.u32 %p_valid, %r6, 128;
-		@!%p_valid bra BWD_ZERO_DONE;
-		shl.b32 %r6, %r6, 2;
-		cvt.u64.u32 %rd12, %r6;
-		add.u64 %rd12, %rd10, %rd12;
-		st.global.f32 [%rd12], 0f00000000;
-		add.u32 %r5, %r5, 1;
-		bra BWD_ZERO_LOOP;
-BWD_ZERO_DONE:
-
-BWD_DONE:
-	ret;
+BB0:
+    cvt.rn.f32.u32 %f1, %r4;
+    mov.u32 %r0, %ctaid.x;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, 0;
+    mov.u32 %r3, 1;
+    mov.u32 %r4, 128;
+    mov.u32 %r5, 128;
+    mov.u64 %rd8, 128;
+    cvt.u64.u32 %rd9, %r0;
+    mul.lo.u64 %rd10, %rd9, %rd8;
+    cvt.u64.u32 %rd9, %r0;
+    mul.lo.u64 %rd9, %rd9, 8;
+    add.u64 %rd9, %rd3, %rd9;
+    ld.global.s64 %rd3, [%rd9];
+    mov.s64 %rd9, -100;
+    setp.eq.s64 %p0, %rd3, %rd9;
+    @%p0 bra BB2;
+    bra BB1;
+BB1:
+    cvt.u64.u32 %rd9, %r0;
+    mul.lo.u64 %rd9, %rd9, 4;
+    add.u64 %rd9, %rd4, %rd9;
+    ld.global.f32 %f2, [%rd9];
+    div.rn.f32 %f3, %f0, %f1;
+    mov.f32 %f0, 0f3F800000;
+    mov.u32 %r0, 4096;
+    mov.u32 %r6, 1024;
+    mov.u32 %r7, 4;
+    mov.u32 %r8, 8;
+    mov.u32 %r9, %r2;
+    bra BB4;
+BB2:
+    mov.u32 %r10, %r2;
+    bra BB14;
+BB3:
+    ret;
+BB4:
+    mul.lo.u32 %r11, %r9, %r6;
+    mov.u32 %r12, %r2;
+    bra BB6;
+BB5:
+    bra BB3;
+BB6:
+    mul.lo.u32 %r13, %r12, %r4;
+    add.u32 %r14, %r13, %r1;
+    add.u32 %r13, %r14, %r11;
+    setp.lt.u32 %p0, %r13, %r0;
+    @%p0 bra BB8;
+    bra BB9;
+BB7:
+    add.u32 %r14, %r9, %r3;
+    setp.lt.u32 %p0, %r14, %r7;
+    @!%p0 bra BB7_else;
+    mov.u32 %r9, %r14;
+    bra BB4;
+BB7_else:
+    bra BB5;
+BB8:
+    cvt.u64.u32 %rd4, %r13;
+    mul.lo.u64 %rd9, %rd4, %rd8;
+    mov.f32 %f1, 0f00000000;
+    mov.u32 %r14, %r2;
+    mov.f32 %f4, %f1;
+    bra BB10;
+BB9:
+    add.u32 %r15, %r12, %r3;
+    setp.lt.u32 %p0, %r15, %r8;
+    @!%p0 bra BB9_else;
+    mov.u32 %r12, %r15;
+    bra BB6;
+BB9_else:
+    bra BB7;
+BB10:
+    cvt.u64.u32 %rd4, %r14;
+    add.u64 %rd11, %rd10, %rd4;
+    mov.u64 %rd12, %rd11;
+    mul.lo.u64 %rd12, %rd12, 4;
+    add.u64 %rd12, %rd0, %rd12;
+    ld.global.f32 %f1, [%rd12];
+    add.u64 %rd11, %rd9, %rd4;
+    mov.u64 %rd4, %rd11;
+    mul.lo.u64 %rd4, %rd4, 4;
+    add.u64 %rd4, %rd1, %rd4;
+    ld.global.f32 %f5, [%rd4];
+    fma.rn.f32 %f6, %f1, %f5, %f4;
+    add.u32 %r15, %r14, %r3;
+    setp.lt.u32 %p0, %r15, %r5;
+    @!%p0 bra BB10_else;
+    mov.u32 %r14, %r15;
+    mov.f32 %f4, %f6;
+    bra BB10;
+BB10_else:
+    mov.f32 %f1, %f6;
+    bra BB11;
+BB11:
+    cvt.u64.u32 %rd4, %r13;
+    mul.lo.u64 %rd4, %rd4, 4;
+    add.u64 %rd4, %rd2, %rd4;
+    ld.global.f32 %f4, [%rd4];
+    add.f32 %f5, %f1, %f4;
+    sub.f32 %f1, %f5, %f2;
+    mul.f32 %f4, %f1, 0f3FB8AA3B;
+    ex2.approx.f32 %f4, %f4;
+    cvt.s64.u32 %rd4, %r13;
+    setp.eq.s64 %p0, %rd4, %rd3;
+    sub.f32 %f1, %f4, %f0;
+    selp.f32 %f5, %f1, %f4, %p0;
+    mul.f32 %f1, %f5, %f3;
+    mov.u32 %r14, %r2;
+    bra BB12;
+BB12:
+    cvt.u64.u32 %rd4, %r14;
+    add.u64 %rd11, %rd9, %rd4;
+    mov.u64 %rd12, %rd11;
+    mul.lo.u64 %rd12, %rd12, 4;
+    add.u64 %rd12, %rd1, %rd12;
+    ld.global.f32 %f4, [%rd12];
+    mul.f32 %f5, %f1, %f4;
+    add.u64 %rd12, %rd10, %rd4;
+    mov.u64 %rd4, %rd12;
+    mul.lo.u64 %rd4, %rd4, 4;
+    add.u64 %rd4, %rd5, %rd4;
+    red.global.add.f32 [%rd4], %f5;
+    mov.u64 %rd4, %rd12;
+    mul.lo.u64 %rd4, %rd4, 4;
+    add.u64 %rd4, %rd0, %rd4;
+    ld.global.f32 %f4, [%rd4];
+    mul.f32 %f5, %f1, %f4;
+    mov.u64 %rd4, %rd11;
+    mul.lo.u64 %rd4, %rd4, 4;
+    add.u64 %rd4, %rd6, %rd4;
+    red.global.add.f32 [%rd4], %f5;
+    add.u32 %r15, %r14, %r3;
+    setp.lt.u32 %p0, %r15, %r5;
+    @!%p0 bra BB12_else;
+    mov.u32 %r14, %r15;
+    bra BB12;
+BB12_else:
+    bra BB13;
+BB13:
+    cvt.u64.u32 %rd4, %r13;
+    mul.lo.u64 %rd4, %rd4, 4;
+    add.u64 %rd4, %rd7, %rd4;
+    red.global.add.f32 [%rd4], %f1;
+    bra BB9;
+BB14:
+    mul.lo.u32 %r0, %r10, %r4;
+    add.u32 %r2, %r0, %r1;
+    setp.lt.u32 %p0, %r2, %r5;
+    @%p0 bra BB15;
+    bra BB3;
+BB15:
+    cvt.u64.u32 %rd0, %r2;
+    add.u64 %rd1, %rd10, %rd0;
+    mov.u64 %rd0, %rd1;
+    mul.lo.u64 %rd0, %rd0, 4;
+    add.u64 %rd0, %rd5, %rd0;
+    mov.f32 %f0, 0f00000000;
+    st.global.f32 [%rd0], %f0;
+    add.u32 %r0, %r10, %r3;
+    mov.u32 %r10, %r0;
+    bra BB14;
 }

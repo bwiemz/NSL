@@ -35,6 +35,11 @@
 //! them are the unsigned operations, which give the same bits.
 //! `%ctaid.y` is modelled for a two-dimensional grid.
 //!
+//! `red.{global,shared}.add.f32` is a read-modify-write in f32, atomic
+//! because threads run one at a time; the order in which threads (and
+//! CTAs) add is the schedule's, so two kernels that add the same values in
+//! the same per-thread order agree bit for bit under the same schedule.
+//!
 //! Shifts follow PTX: `shl` and the unsigned `shr` take their amount from
 //! the low 32 bits of the operand and produce 0 for an amount at or past
 //! the width, rather than wrapping it as Rust's `<<` would.
@@ -165,6 +170,8 @@ pub(crate) enum Op {
     /// `ld.global.s8`: one byte, sign-extended into the register.
     LdS8 { space: Space, d: usize, addr: Addr },
     St { space: Space, bytes: usize, addr: Addr, v: Src },
+    /// `red.<space>.add.f32`: `*addr += v` in f32, as one step of the thread.
+    RedAddF32 { space: Space, addr: Addr, v: Src },
     Bra { target: usize },
     Bar,
     Ret,
@@ -532,6 +539,11 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 let bytes = if *ty == "b16" { 2 } else { 4 };
                 Op::St { space, bytes, addr: p.addr(ops[0]), v: p.src(ops[1]) }
             }
+            ["red", space @ ("global" | "shared"), "add", "f32"] => {
+                want(2);
+                let space = if *space == "global" { Space::Global } else { Space::Shared };
+                Op::RedAddF32 { space, addr: p.addr(ops[0]), v: p.src(ops[1]) }
+            }
             ["bra"] => {
                 want(1);
                 // Resolved below, once every label is known.
@@ -872,6 +884,16 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
                     Space::Shared => launch.shared(at, *bytes),
                 };
                 mem.copy_from_slice(&val[..*bytes]);
+            }
+            Op::RedAddF32 { space, addr, v } => {
+                let at = rd(t, launch, Src::Reg(addr.base)).wrapping_add(addr.offset);
+                let add = f(rd(t, launch, *v));
+                let mem = match space {
+                    Space::Global => launch.global(at, 4),
+                    Space::Shared => launch.shared(at, 4),
+                };
+                let old = f32::from_le_bytes([mem[0], mem[1], mem[2], mem[3]]);
+                mem.copy_from_slice(&(old + add).to_le_bytes());
             }
             Op::Bra { target } => t.pc = *target,
             Op::Bar => {

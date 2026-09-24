@@ -75,9 +75,9 @@
 //!
 //! ## KIR (roadmap A2 step 10)
 //!
-//! The kernels were hand-assembled PTX text and are moving onto
-//! [`KernelIR`], one role at a time with all three dtypes from one builder.
-//! The v1 forward has moved: [`build_forward`] builds it, keeping the hand
+//! The kernels were hand-assembled PTX text and moved onto [`KernelIR`],
+//! one role at a time with all three dtypes from one builder; the file no
+//! longer writes PTX text. The v1 forward: [`build_forward`] builds it, keeping the hand
 //! kernels' control flow, barriers and floating-point order, and
 //! `tests/fused_linear_ce_fwd_kir_equivalence.rs` runs the frozen hand
 //! emitters (`tests/fixtures/fused_linear_ce_hand.rs`) against it on the PTX
@@ -87,8 +87,10 @@
 //! moved as well: [`build_large_partials`] and [`build_large_finalize`],
 //! lowered into one module under one header, proved by
 //! `tests/fused_linear_ce_large_kir_equivalence.rs` over Kernel A's
-//! two-dimensional grid then Kernel B. The backward is still hand-written
-//! here, and the file stays in the hand-PTX freeze until it moves too.
+//! two-dimensional grid then Kernel B. The backward, [`build_backward`],
+//! scatters with `red.global.add.f32` and is proved by
+//! `tests/fused_linear_ce_bwd_kir_equivalence.rs`, which runs the
+//! reductions in the interpreter's schedule order.
 //!
 //! ## API
 //!
@@ -417,27 +419,6 @@ impl FusedLinearCEConfig {
     pub fn shared_mem_bytes(&self) -> u32 {
         self.vocab_tile * self.dtype.bytes_per_elem() + 32
     }
-
-    // ── Helpers ──────────────────────────────────────────────────────────
-
-    fn sm_tag(&self) -> u32 {
-        // v1 targets sm_80+; fall back gracefully if caller passes sm_75.
-        self.gpu_sm.max(80)
-    }
-
-    fn ptx_header(&self) -> String {
-        // bf16 cvt mnemonics require PTX ISA 7.8+; bump to 8.0 for the Bf16
-        // path. F32 and F16 stay at 7.0 to preserve byte-identity with the
-        // Sprint v1 and Sprint v3-2 snapshots.
-        let version = match self.dtype {
-            Dtype::F32 | Dtype::F16 => "7.0",
-            Dtype::Bf16 => "8.0",
-        };
-        format!(
-            ".version {version}\n.target sm_{}\n.address_size 64\n",
-            self.sm_tag()
-        )
-    }
 }
 
 // ─── Forward kernel synthesis ────────────────────────────────────────────────
@@ -514,19 +495,9 @@ pub fn synthesize_large_vocab_forward_ptx(cfg: &FusedLinearCEConfig) -> Vec<u8> 
 /// then scatters `dx += dlogits_v * W[v, :]` and
 /// `dW[v, :] += dlogits_v * x[row, :]` via `red.global.add.f32`.
 pub fn synthesize_fused_linear_ce_backward_ptx(cfg: &FusedLinearCEConfig) -> Vec<u8> {
-    // Contract: returned bytes are null-terminated, matching the convention
-    // established by `backend_ptx::lower_kir_to_ptx`. See
-    // `synthesize_fused_linear_ce_ptx` for the rationale.
-    let mut bytes = match cfg.dtype {
-        // F32 path's *kernel bytes* remain BYTE-IDENTICAL to pre-Sprint-v3-2
-        // — pinned by `tests/fused_linear_ce_v1_byte_identity.rs::v1_backward_*`,
-        // which strips the trailing null before snapshot assertion.
-        Dtype::F32 => emit_bwd_kernel(cfg).into_bytes(),
-        Dtype::F16 => emit_bwd_kernel_f16(cfg).into_bytes(),
-        Dtype::Bf16 => emit_bwd_kernel_bf16(cfg).into_bytes(),
-    };
-    bytes.push(0);
-    bytes
+    // Roadmap A2 step 10: one KIR builder for all three dtypes; the
+    // printer's output is already null-terminated.
+    emit_backward(cfg)
 }
 
 // ─── KIR — v1 forward ────────────────────────────────────────────────────────
@@ -1291,1088 +1262,234 @@ fn emit_large_forward(cfg: &FusedLinearCEConfig) -> Vec<u8> {
     lower_kir_module_to_ptx(&[&kernels[0], &kernels[1]])
 }
 
-// ─── PTX emission — backward ──────────────────────────────────────────────────
+// ─── KIR — backward ─────────────────────────────────────────────────────────
+//
+// Roadmap A2 step 10, third slice: the backward is KIR too, one builder for
+// all three dtypes. Its loops are bottom-tested, as the hand kernels' were
+// (every trip count is at least one), and its scatters are `AtomicAdd`s,
+// which lower to `red.global.add.f32`. `tests/fused_linear_ce_bwd_kir_equivalence.rs`
+// runs it against the frozen hand kernels on the PTX interpreter.
 
-fn emit_bwd_kernel(cfg: &FusedLinearCEConfig) -> String {
-    let name = cfg.bwd_kernel_name();
-    let vocab = cfg.vocab_size;
-    let hidden = cfg.hidden_size;
-    let vtile = cfg.vocab_tile;
-    let n_tiles = vocab.div_ceil(vtile);
-    let vtile_per_thread = vtile / 128;
-    let ignore = cfg.ignore_index;
-    let smem_bytes = cfg.shared_mem_bytes();
+/// `for (i = start; ; ) { carried = body(i, carried); i += step; if !(i < end) break; }`
+/// — a loop tested at the bottom, for a trip count known to be at least one.
+/// The builder is left in the loop's exit block; the carried values after
+/// the last trip are returned.
+fn bottom_tested_loop(
+    b: &mut KirBuilder,
+    (start, end, step): (VarId, VarId, VarId),
+    init: &[VarId],
+    body: impl FnOnce(&mut KirBuilder, VarId, &[VarId]) -> Vec<VarId>,
+) -> Vec<VarId> {
+    let tys: Vec<KirType> = init.iter().map(|v| b.var_type(*v).expect("a typed loop value")).collect();
+    let body_block = b.new_block();
+    let done = b.new_block();
+    let i = b.add_block_param(body_block, KirType::U32);
+    let carried: Vec<VarId> = tys.iter().map(|t| b.add_block_param(body_block, t.clone())).collect();
+    let out: Vec<VarId> = tys.iter().map(|t| b.add_block_param(done, t.clone())).collect();
+    let mut entry_args = vec![start];
+    entry_args.extend_from_slice(init);
+    b.terminate(KirTerminator::Branch(KirEdge::with(body_block, entry_args)));
 
-    let mut s = String::new();
-
-    s.push_str(&cfg.ptx_header());
-    s.push('\n');
-
-    s.push_str(&format!(
-        ".extern .shared .align 4 .b8 smem_scratch[{}];\n\n",
-        smem_bytes
+    b.set_block(body_block);
+    let next_carried = body(b, i, &carried);
+    assert_eq!(next_carried.len(), carried.len(), "a loop body returns one value per carried value");
+    let i_next = op2(b, KirType::U32, KirOp::Add, i, step);
+    let more = cmp(b, i_next, end, CmpOp::Lt);
+    let mut back = vec![i_next];
+    back.extend_from_slice(&next_carried);
+    b.terminate(KirTerminator::CondBranch(
+        more,
+        KirEdge::with(body_block, back),
+        KirEdge::with(done, next_carried),
     ));
-
-    // Kernel signature: adds grad_output scalar, saved lse, dx_out, dW_out, dbias_out.
-    // num_valid is passed as a u32 launch param (host-computed).
-    s.push_str(&format!(
-        ".visible .entry {name}(\n\
-         \t.param .f32 param_grad_output,\n\
-         \t.param .u64 param_x,\n\
-         \t.param .u64 param_w,\n\
-         \t.param .u64 param_bias,\n\
-         \t.param .u64 param_targets,\n\
-         \t.param .u64 param_lse,\n\
-         \t.param .u64 param_dx_out,\n\
-         \t.param .u64 param_dw_out,\n\
-         \t.param .u64 param_dbias_out,\n\
-         \t.param .u32 param_B,\n\
-         \t.param .u32 param_S,\n\
-         \t.param .u32 param_V,\n\
-         \t.param .u32 param_H,\n\
-         \t.param .u32 param_num_valid\n\
-         ) {{\n"
-    ));
-
-    // Register declarations.
-    s.push_str(
-        "\t.reg .u64 %rd<24>;\n\
-         \t.reg .u32 %r<20>;\n\
-         \t.reg .s64 %target_val;\n\
-         \t.reg .f32 %f<20>;\n\
-         \t.reg .f32 %logit_acc;\n\
-         \t.reg .f32 %grad_output;\n\
-         \t.reg .f32 %lse_val;\n\
-         \t.reg .f32 %scale;\n\
-         \t.reg .pred %p_skip;\n\
-         \t.reg .pred %p_valid;\n\
-         \t.reg .pred %p_intile;\n\
-         \t.reg .pred %p_is_target;\n\
-         \t.reg .u32 %num_valid;\n\
-         \t.reg .f32 %num_valid_f;\n\
-    \n",
-    );
-
-    // Load parameters.
-    s.push_str(
-        "\tld.param.f32 %grad_output, [param_grad_output];\n\
-         \tld.param.u64 %rd0, [param_x];\n\
-         \tld.param.u64 %rd1, [param_w];\n\
-         \tld.param.u64 %rd2, [param_bias];\n\
-         \tld.param.u64 %rd3, [param_targets];\n\
-         \tld.param.u64 %rd4, [param_lse];\n\
-         \tld.param.u64 %rd5, [param_dx_out];\n\
-         \tld.param.u64 %rd6, [param_dw_out];\n\
-         \tld.param.u64 %rd7, [param_dbias_out];\n\
-         \tld.param.u32 %num_valid, [param_num_valid];\n\
-         \tcvt.rn.f32.u32 %num_valid_f, %num_valid;\n\
-    \n",
-    );
-
-    // row_idx = ctaid.x.
-    s.push_str(
-        "\tmov.u32 %r0, %ctaid.x;\n\
-         \tmov.u32 %r1, %tid.x;\n\
-    \n",
-    );
-
-    // Load target.
-    s.push_str(
-        "\tcvt.u64.u32 %rd8, %r0;\n\
-         \tmul.lo.u64 %rd8, %rd8, 8;\n\
-         \tadd.u64 %rd8, %rd3, %rd8;\n\
-         \tld.global.s64 %target_val, [%rd8];\n\
-    \n",
-    );
-
-    // Skip branch.
-    s.push_str(&format!(
-        "\tsetp.eq.s64 %p_skip, %target_val, {ignore};\n\
-         \t@%p_skip bra BWD_SKIP_LABEL;\n\
-    \n"
-    ));
-
-    // Live path: load saved lse.
-    s.push_str(
-        "\tcvt.u64.u32 %rd9, %r0;\n\
-         \tshl.b64 %rd9, %rd9, 2;\n\
-         \tadd.u64 %rd9, %rd4, %rd9;\n\
-         \tld.global.f32 %lse_val, [%rd9];\n\
-    \n",
-    );
-
-    // x_row_base = x + row_idx * H * 4.
-    s.push_str(&format!(
-        "\tcvt.u64.u32 %rd10, %r0;\n\
-         \tmov.u32 %r2, {hidden};\n\
-         \tcvt.u64.u32 %rd11, %r2;\n\
-         \tmul.lo.u64 %rd10, %rd10, %rd11;\n\
-         \tshl.b64 %rd10, %rd10, 2;\n\
-         \tadd.u64 %rd10, %rd0, %rd10;\n\
-         \t// dx_row_base = dx_out + row_idx * H * 4\n\
-         \tcvt.u64.u32 %rd20, %r0;\n\
-         \tmul.lo.u64 %rd20, %rd20, %rd11;\n\
-         \tshl.b64 %rd20, %rd20, 2;\n\
-         \tadd.u64 %rd20, %rd5, %rd20;\n\
-    \n"
-    ));
-
-    // scale = grad_output / num_valid_f.
-    s.push_str(
-        "\tdiv.rn.f32 %scale, %grad_output, %num_valid_f;\n\
-    \n",
-    );
-
-    // log2e constant for exp.
-    s.push_str("\tmov.f32 %f15, 0f3FB8AA3B; // log2(e)\n\n");
-
-    // Outer tile loop.
-    s.push_str(
-        "\tmov.u32 %r3, 0; // tile_idx\n\
-         BWD_TILE_LOOP:\n",
-    );
-
-    s.push_str(&format!(
-        "\t\tmul.lo.u32 %r4, %r3, {vtile}; // v_base\n\
-    \n"
-    ));
-
-    // Inner loop: each thread handles its vocab slice.
-    s.push_str(
-        "\t\tmov.u32 %r5, 0; // inner counter\n\
-         BWD_INNER_LOOP:\n",
-    );
-
-    s.push_str(
-        "\t\t\tmul.lo.u32 %r6, %r5, 128;\n\
-         \t\t\tadd.u32 %r6, %r6, %r1;\n\
-         \t\t\tadd.u32 %r6, %r6, %r4;\n\
-         \t\t\t// v_idx = %r6\n",
-    );
-
-    s.push_str(&format!(
-        "\t\t\tsetp.lt.u32 %p_valid, %r6, {vocab};\n\
-         \t\t\t@!%p_valid bra BWD_INNER_SKIP;\n\
-    \n"
-    ));
-
-    // Recompute logit_v = dot(x_row, W[v]) + bias[v].
-    s.push_str(&format!(
-        "\t\t\t// W_row_base for v_idx\n\
-         \t\t\tcvt.u64.u32 %rd12, %r6;\n\
-         \t\t\tmov.u32 %r7, {hidden};\n\
-         \t\t\tcvt.u64.u32 %rd13, %r7;\n\
-         \t\t\tmul.lo.u64 %rd12, %rd12, %rd13;\n\
-         \t\t\tshl.b64 %rd12, %rd12, 2;\n\
-         \t\t\tadd.u64 %rd12, %rd1, %rd12;\n\
-    \n"
-    ));
-
-    s.push_str(
-        "\t\t\tmov.f32 %logit_acc, 0f00000000;\n\
-         \t\t\tmov.u32 %r8, 0;\n\
-         BWD_DOT_LOOP:\n\
-         \t\t\t\tcvt.u64.u32 %rd14, %r8;\n\
-         \t\t\t\tshl.b64 %rd14, %rd14, 2;\n\
-         \t\t\t\tadd.u64 %rd15, %rd10, %rd14;\n\
-         \t\t\t\tld.global.f32 %f0, [%rd15];\n\
-         \t\t\t\tadd.u64 %rd16, %rd12, %rd14;\n\
-         \t\t\t\tld.global.f32 %f1, [%rd16];\n\
-         \t\t\t\tfma.rn.f32 %logit_acc, %f0, %f1, %logit_acc;\n\
-         \t\t\t\tadd.u32 %r8, %r8, 1;\n",
-    );
-
-    s.push_str(&format!(
-        "\t\t\t\tsetp.lt.u32 %p_valid, %r8, {hidden};\n\
-         \t\t\t\t@%p_valid bra BWD_DOT_LOOP;\n\
-    \n"
-    ));
-
-    // Add bias.
-    s.push_str(
-        "\t\t\t// bias\n\
-         \t\t\tcvt.u64.u32 %rd17, %r6;\n\
-         \t\t\tshl.b64 %rd17, %rd17, 2;\n\
-         \t\t\tadd.u64 %rd17, %rd2, %rd17;\n\
-         \t\t\tld.global.f32 %f2, [%rd17];\n\
-         \t\t\tadd.f32 %logit_acc, %logit_acc, %f2;\n\
-    \n",
-    );
-
-    // Compute softmax: p_v = exp(logit_v - lse).
-    s.push_str(
-        "\t\t\t// p_v = exp(logit_v - lse_val)\n\
-         \t\t\tsub.f32 %f3, %logit_acc, %lse_val;\n\
-         \t\t\tmul.f32 %f3, %f3, %f15; // * log2(e)\n\
-         \t\t\tex2.approx.f32 %f3, %f3;  // p_v\n\
-    \n",
-    );
-
-    // Subtract 1 if v == target.
-    s.push_str(
-        "\t\t\t// dlogit_v = p_v - (v == target ? 1 : 0)\n\
-         \t\t\tcvt.s64.u32 %rd18, %r6;\n\
-         \t\t\tsetp.eq.s64 %p_is_target, %rd18, %target_val;\n\
-         \t\t\t@%p_is_target sub.f32 %f3, %f3, 0f3F800000; // -= 1.0\n\
-         \t\t\t// scaled = dlogit_v * scale\n\
-         \t\t\tmul.f32 %f4, %f3, %scale;\n\
-    \n",
-    );
-
-    // Scatter to dx_out[row, h] += scaled * W[v, h].
-    // And dW_out[v, h] += scaled * x[row, h].
-    // And dbias_out[v] += scaled.
-    s.push_str(&format!(
-        "\t\t\t// Scatter: dx and dW (loop over H)\n\
-         \t\t\t// dW_row_base = dW_out + v_idx * H * 4\n\
-         \t\t\tcvt.u64.u32 %rd21, %r6;\n\
-         \t\t\tmov.u32 %r9, {hidden};\n\
-         \t\t\tcvt.u64.u32 %rd22, %r9;\n\
-         \t\t\tmul.lo.u64 %rd21, %rd21, %rd22;\n\
-         \t\t\tshl.b64 %rd21, %rd21, 2;\n\
-         \t\t\tadd.u64 %rd21, %rd6, %rd21; // dW_row_base\n\
-    \n"
-    ));
-
-    s.push_str(
-        "\t\t\tmov.u32 %r9, 0; // h counter\n\
-         BWD_H_LOOP:\n\
-         \t\t\t\tcvt.u64.u32 %rd23, %r9;\n\
-         \t\t\t\tshl.b64 %rd23, %rd23, 2;\n\
-         \t\t\t\t// W[v, h]\n\
-         \t\t\t\tadd.u64 %rd14, %rd12, %rd23;\n\
-         \t\t\t\tld.global.f32 %f5, [%rd14];\n\
-         \t\t\t\t// dx_out[row, h] += scaled * W[v, h]\n\
-         \t\t\t\tmul.f32 %f6, %f4, %f5;\n\
-         \t\t\t\tadd.u64 %rd14, %rd20, %rd23;\n\
-         \t\t\t\tred.global.add.f32 [%rd14], %f6;\n\
-         \t\t\t\t// x[row, h]\n\
-         \t\t\t\tadd.u64 %rd14, %rd10, %rd23;\n\
-         \t\t\t\tld.global.f32 %f7, [%rd14];\n\
-         \t\t\t\t// dW_out[v, h] += scaled * x[row, h]\n\
-         \t\t\t\tmul.f32 %f8, %f4, %f7;\n\
-         \t\t\t\tadd.u64 %rd14, %rd21, %rd23;\n\
-         \t\t\t\tred.global.add.f32 [%rd14], %f8;\n\
-         \t\t\t\tadd.u32 %r9, %r9, 1;\n",
-    );
-
-    s.push_str(&format!(
-        "\t\t\t\tsetp.lt.u32 %p_valid, %r9, {hidden};\n\
-         \t\t\t\t@%p_valid bra BWD_H_LOOP;\n\
-    \n"
-    ));
-
-    // dbias_out[v] += scaled.
-    s.push_str(
-        "\t\t\t// dbias_out[v] += scaled\n\
-         \t\t\tcvt.u64.u32 %rd14, %r6;\n\
-         \t\t\tshl.b64 %rd14, %rd14, 2;\n\
-         \t\t\tadd.u64 %rd14, %rd7, %rd14;\n\
-         \t\t\tred.global.add.f32 [%rd14], %f4;\n\
-    \n",
-    );
-
-    s.push_str(
-        "BWD_INNER_SKIP:\n\
-         \t\t\tadd.u32 %r5, %r5, 1;\n",
-    );
-
-    s.push_str(&format!(
-        "\t\t\tsetp.lt.u32 %p_valid, %r5, {vtile_per_thread};\n\
-         \t\t\t@%p_valid bra BWD_INNER_LOOP;\n\
-    \n"
-    ));
-
-    // Advance tile counter.
-    s.push_str("\t\tadd.u32 %r3, %r3, 1;\n");
-
-    s.push_str(&format!(
-        "\t\tsetp.lt.u32 %p_valid, %r3, {n_tiles};\n\
-         \t\t@%p_valid bra BWD_TILE_LOOP;\n\
-    \n"
-    ));
-
-    s.push_str("\tbra BWD_DONE;\n\n");
-
-    // Skip path: zero out dx_out[row, :].
-    s.push_str(
-        "BWD_SKIP_LABEL:\n\
-         \t// Zero dx_out[row, :] for skipped token\n",
-    );
-
-    s.push_str(&format!(
-        "\tcvt.u64.u32 %rd10, %r0;\n\
-         \tmov.u32 %r2, {hidden};\n\
-         \tcvt.u64.u32 %rd11, %r2;\n\
-         \tmul.lo.u64 %rd10, %rd10, %rd11;\n\
-         \tshl.b64 %rd10, %rd10, 2;\n\
-         \tadd.u64 %rd10, %rd5, %rd10; // dx_row_base\n\
-    \n"
-    ));
-
-    // Each thread zeros its slice of H.
-    s.push_str(&format!(
-        "\t// Thread r1 zeros H/128 elements (stride 128)\n\
-         \tmov.u32 %r5, 0;\n\
-         BWD_ZERO_LOOP:\n\
-         \t\tmul.lo.u32 %r6, %r5, 128;\n\
-         \t\tadd.u32 %r6, %r6, %r1;\n\
-         \t\tsetp.lt.u32 %p_valid, %r6, {hidden};\n\
-         \t\t@!%p_valid bra BWD_ZERO_DONE;\n\
-         \t\tshl.b32 %r6, %r6, 2;\n\
-         \t\tcvt.u64.u32 %rd12, %r6;\n\
-         \t\tadd.u64 %rd12, %rd10, %rd12;\n\
-         \t\tst.global.f32 [%rd12], 0f00000000;\n\
-         \t\tadd.u32 %r5, %r5, 1;\n\
-         \t\tbra BWD_ZERO_LOOP;\n\
-         BWD_ZERO_DONE:\n\
-    \n"
-    ));
-
-    s.push_str("BWD_DONE:\n\tret;\n}\n");
-
-    s
+    b.set_block(done);
+    out
 }
 
-// ── F16 backward kernel ──────────────────────────────────────────────────────
-//
-// Mixed-precision convention (Sprint v3-2):
-//   * x / W / bias HBM loads are `ld.global.b16` + `cvt.f32.f16` into f32
-//     math registers. Backward recomputes logits from forward inputs and
-//     the saved f32 lse, so the dtype of `x`/`W`/`bias` is the same as in
-//     the forward kernel.
-//   * The saved `lse` buffer stays `.f32` (written by the forward kernel
-//     as f32 regardless of activation dtype) — `ld.global.f32 %lse_val`.
-//   * The `grad_output` parameter is still `.param .f32` (a scalar; no
-//     reason to halve a single value).
-//   * Gradient outputs `dx`, `dW`, `dbias` stay `.f32` and the cross-CTA
-//     accumulator uses `red.global.add.f32`. Rationale:
-//       - `red.global.add.f16` is not portable across SMs (some pre-sm_70
-//         lack it; sm_80+ supports it but adds a numerical-determinism
-//         risk via non-deterministic accumulation order in fp16).
-//       - PyTorch's standard mixed-precision convention writes master
-//         gradients in f32; downstream optimizer state stays f32.
-//       - Per the Sprint v3-2 spec: "current backward signature returns
-//         f32 dW even when dtype=F16; this matches PyTorch's
-//         mixed-precision convention".
-//     The optional fp16 down-cast in an epilogue kernel is deferred.
-//
-// Output buffers dx/dW/dbias MUST be allocated by the caller as f32 even
-// when `dtype = F16` — the runtime FFI layer threads this convention.
-fn emit_bwd_kernel_f16(cfg: &FusedLinearCEConfig) -> String {
-    let name = cfg.bwd_kernel_name();
-    let vocab = cfg.vocab_size;
-    let hidden = cfg.hidden_size;
-    let vtile = cfg.vocab_tile;
-    let n_tiles = vocab.div_ceil(vtile);
-    let vtile_per_thread = vtile / 128;
-    let ignore = cfg.ignore_index;
-    let smem_bytes = cfg.shared_mem_bytes();
+/// Build the backward kernel as KIR.
+///
+/// One CTA per token row, 128 threads, no shared memory; the same kernel
+/// serves both forward paths (it reads the saved per-row lse).
+///
+/// ```text
+/// entry     target = targets[row]; target == ignore_index ? skip : live
+/// live      scale = grad_output / f32(num_valid)
+///           per tile t, per sub-tile j (bottom-tested):
+///             v = j*128 + tid + t*vtile; v < V ?
+///               logit = fma-dot(x[row], W[v]) + bias[v]
+///               p = exp(logit - lse[row]); v == target ? p -= 1
+///               g = p * scale
+///               per h (bottom-tested):
+///                 red dx[row, h] += g * W[v, h]
+///                 red dW[v, h]   += g * x[row, h]
+///               red dbias[v] += g
+/// skip      every thread zeroes dx[row, tid + 128k] for tid + 128k < H
+/// ```
+///
+/// `x`, `W` and `bias` are in the storage dtype and widened to f32; `lse`
+/// and the three gradients are f32 whatever the dtype.
+pub fn build_backward(cfg: &FusedLinearCEConfig) -> KernelIR {
+    use AddressSpace::Global;
+    use KirType::{F32, I64, U32, U64};
 
-    let mut s = String::new();
+    let dtype = cfg.dtype;
+    let elem = elem_type(dtype);
+    let mut b = KirBuilder::new(&cfg.bwd_kernel_name());
+    // The params, in FFI order. B, S, V and H are baked; num_valid is read.
+    let grad_output = b.add_param("grad_output", F32, Global);
+    let x = b.add_param("x", ptr(elem.clone(), Global), Global);
+    let w = b.add_param("w", ptr(elem.clone(), Global), Global);
+    let bias = b.add_param("bias", ptr(elem.clone(), Global), Global);
+    let targets = b.add_param("targets", ptr(I64, Global), Global);
+    let lse = b.add_param("lse", ptr(F32, Global), Global);
+    let dx_out = b.add_param("dx_out", ptr(F32, Global), Global);
+    let dw_out = b.add_param("dw_out", ptr(F32, Global), Global);
+    let dbias_out = b.add_param("dbias_out", ptr(F32, Global), Global);
+    for name in ["B", "S", "V", "H"] {
+        b.add_param(name, U32, Global);
+    }
+    let num_valid = b.add_param("num_valid", U32, Global);
+    b.set_workgroup_size([V1_BLOCK, 1, 1]);
 
-    s.push_str(&cfg.ptx_header());
-    s.push('\n');
+    let entry = b.new_block();
+    b.set_block(entry);
+    let num_valid_f = b.new_typed_var(F32);
+    b.emit(KirOp::Cast(num_valid_f, num_valid, F32));
+    let row = b.new_typed_var(U32);
+    b.emit(KirOp::BlockIdx(row, 0));
+    let tid = b.new_typed_var(U32);
+    b.emit(KirOp::ThreadId(tid, 0));
+    let zero = konst(&mut b, ConstValue::U32(0));
+    let one = konst(&mut b, ConstValue::U32(1));
+    let block = konst(&mut b, ConstValue::U32(V1_BLOCK));
+    let hidden = konst(&mut b, ConstValue::U32(cfg.hidden_size));
+    let hidden_wide = konst(&mut b, ConstValue::U64(cfg.hidden_size as u64));
+    let row_wide = widen(&mut b, row);
+    let x_row = op2(&mut b, U64, KirOp::Mul, row_wide, hidden_wide);
+    let target_addr = at(&mut b, I64, Global, targets, row);
+    let target = load(&mut b, I64, target_addr, Global);
+    let ignore = i64_const(&mut b, cfg.ignore_index);
+    let skips = cmp(&mut b, target, ignore, CmpOp::Eq);
+    let live = b.new_block();
+    let skip = b.new_block();
+    let exit = b.new_block();
+    b.terminate(KirTerminator::CondBranch(skips, KirEdge::to(skip), KirEdge::to(live)));
 
-    // SMEM not used by backward (forward stored everything it needs in HBM),
-    // but the declaration is kept for ABI parity with the F32 path's launcher.
-    s.push_str(&format!(
-        ".extern .shared .align 2 .b8 smem_scratch[{smem_bytes}];\n\n"
-    ));
+    // ── the live row ────────────────────────────────────────────────────
+    b.set_block(live);
+    let lse_addr = at(&mut b, F32, Global, lse, row);
+    let lse_row = load(&mut b, F32, lse_addr, Global);
+    let scale = op2(&mut b, F32, KirOp::Div, grad_output, num_valid_f);
+    let f_one = konst(&mut b, ConstValue::F32(1.0));
+    let vocab = konst(&mut b, ConstValue::U32(cfg.vocab_size));
+    let vtile = konst(&mut b, ConstValue::U32(cfg.vocab_tile));
+    let n_tiles = konst(&mut b, ConstValue::U32(cfg.num_vocab_tiles()));
+    let per_thread = konst(&mut b, ConstValue::U32(cfg.vocab_tile / V1_BLOCK));
+    let elem_at = |b: &mut KirBuilder, base: VarId, index: VarId| {
+        let addr = at(b, elem.clone(), Global, base, index);
+        load_elem(b, dtype, addr, Global)
+    };
+    bottom_tested_loop(&mut b, (zero, n_tiles, one), &[], |b, tile, _| {
+        let v_base = op2(b, U32, KirOp::Mul, tile, vtile);
+        bottom_tested_loop(b, (zero, per_thread, one), &[], |b, j, _| {
+            let lane_base = op2(b, U32, KirOp::Mul, j, block);
+            let slot = op2(b, U32, KirOp::Add, lane_base, tid);
+            let v = op2(b, U32, KirOp::Add, slot, v_base);
+            let in_vocab = cmp(b, v, vocab, CmpOp::Lt);
+            let column = b.new_block();
+            let column_done = b.new_block();
+            b.terminate(KirTerminator::CondBranch(in_vocab, KirEdge::to(column), KirEdge::to(column_done)));
 
-    s.push_str(&format!(
-        ".visible .entry {name}(\n\
-         \t.param .f32 param_grad_output,\n\
-         \t.param .u64 param_x,\n\
-         \t.param .u64 param_w,\n\
-         \t.param .u64 param_bias,\n\
-         \t.param .u64 param_targets,\n\
-         \t.param .u64 param_lse,\n\
-         \t.param .u64 param_dx_out,\n\
-         \t.param .u64 param_dw_out,\n\
-         \t.param .u64 param_dbias_out,\n\
-         \t.param .u32 param_B,\n\
-         \t.param .u32 param_S,\n\
-         \t.param .u32 param_V,\n\
-         \t.param .u32 param_H,\n\
-         \t.param .u32 param_num_valid\n\
-         ) {{\n"
-    ));
+            b.set_block(column);
+            let v_wide = widen(b, v);
+            let w_row = op2(b, U64, KirOp::Mul, v_wide, hidden_wide);
+            let f_zero = konst(b, ConstValue::F32(0.0));
+            let dot = bottom_tested_loop(b, (zero, hidden, one), &[f_zero], |b, h, acc| {
+                let h_wide = widen(b, h);
+                let x_index = op2(b, U64, KirOp::Add, x_row, h_wide);
+                let xv = elem_at(b, x, x_index);
+                let w_index = op2(b, U64, KirOp::Add, w_row, h_wide);
+                let wv = elem_at(b, w, w_index);
+                let acc_next = b.new_typed_var(F32);
+                b.emit(KirOp::Fma(acc_next, xv, wv, acc[0]));
+                vec![acc_next]
+            })[0];
+            let bias_v = elem_at(b, bias, v);
+            let logit = op2(b, F32, KirOp::Add, dot, bias_v);
+            let shifted = op2(b, F32, KirOp::Sub, logit, lse_row);
+            let p = b.new_typed_var(F32);
+            b.emit(KirOp::Exp(p, shifted));
+            // dlogit = p - [v == target]
+            let v_signed = b.new_typed_var(I64);
+            b.emit(KirOp::Cast(v_signed, v, I64));
+            let is_target = cmp(b, v_signed, target, CmpOp::Eq);
+            let p_minus_one = op2(b, F32, KirOp::Sub, p, f_one);
+            let dlogit = b.new_typed_var(F32);
+            b.emit(KirOp::Select(dlogit, is_target, p_minus_one, p));
+            let g = op2(b, F32, KirOp::Mul, dlogit, scale);
+            bottom_tested_loop(b, (zero, hidden, one), &[], |b, h, _| {
+                let h_wide = widen(b, h);
+                let w_index = op2(b, U64, KirOp::Add, w_row, h_wide);
+                let wv = elem_at(b, w, w_index);
+                let dx_part = op2(b, F32, KirOp::Mul, g, wv);
+                let x_index = op2(b, U64, KirOp::Add, x_row, h_wide);
+                let dx_addr = at(b, F32, Global, dx_out, x_index);
+                b.emit(KirOp::AtomicAdd(dx_addr, dx_part, Global));
+                let xv = elem_at(b, x, x_index);
+                let dw_part = op2(b, F32, KirOp::Mul, g, xv);
+                let dw_addr = at(b, F32, Global, dw_out, w_index);
+                b.emit(KirOp::AtomicAdd(dw_addr, dw_part, Global));
+                vec![]
+            });
+            let dbias_addr = at(b, F32, Global, dbias_out, v);
+            b.emit(KirOp::AtomicAdd(dbias_addr, g, Global));
+            b.terminate(KirTerminator::Branch(KirEdge::to(column_done)));
 
-    s.push_str(
-        "\t.reg .u64 %rd<24>;\n\
-         \t.reg .u32 %r<20>;\n\
-         \t.reg .s64 %target_val;\n\
-         \t.reg .b16 %h0, %h1, %h2;\n\
-         \t.reg .f32 %f<20>;\n\
-         \t.reg .f32 %logit_acc;\n\
-         \t.reg .f32 %grad_output;\n\
-         \t.reg .f32 %lse_val;\n\
-         \t.reg .f32 %scale;\n\
-         \t.reg .pred %p_skip;\n\
-         \t.reg .pred %p_valid;\n\
-         \t.reg .pred %p_intile;\n\
-         \t.reg .pred %p_is_target;\n\
-         \t.reg .u32 %num_valid;\n\
-         \t.reg .f32 %num_valid_f;\n\
-    \n",
-    );
+            b.set_block(column_done);
+            vec![]
+        });
+        vec![]
+    });
+    b.terminate(KirTerminator::Branch(KirEdge::to(exit)));
 
-    s.push_str(
-        "\tld.param.f32 %grad_output, [param_grad_output];\n\
-         \tld.param.u64 %rd0, [param_x];\n\
-         \tld.param.u64 %rd1, [param_w];\n\
-         \tld.param.u64 %rd2, [param_bias];\n\
-         \tld.param.u64 %rd3, [param_targets];\n\
-         \tld.param.u64 %rd4, [param_lse];\n\
-         \tld.param.u64 %rd5, [param_dx_out];\n\
-         \tld.param.u64 %rd6, [param_dw_out];\n\
-         \tld.param.u64 %rd7, [param_dbias_out];\n\
-         \tld.param.u32 %num_valid, [param_num_valid];\n\
-         \tcvt.rn.f32.u32 %num_valid_f, %num_valid;\n\
-    \n",
-    );
+    // ── an ignored row: its dx row is zeroed ────────────────────────────
+    b.set_block(skip);
+    let head = b.new_block();
+    let body = b.new_block();
+    let k = b.add_block_param(head, U32);
+    b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![zero])));
+    b.set_block(head);
+    let lane_base = op2(&mut b, U32, KirOp::Mul, k, block);
+    let slot = op2(&mut b, U32, KirOp::Add, lane_base, tid);
+    let in_row = cmp(&mut b, slot, hidden, CmpOp::Lt);
+    b.terminate(KirTerminator::CondBranch(in_row, KirEdge::to(body), KirEdge::to(exit)));
+    b.set_block(body);
+    let slot_wide = widen(&mut b, slot);
+    let dx_index = op2(&mut b, U64, KirOp::Add, x_row, slot_wide);
+    let dx_addr = at(&mut b, F32, Global, dx_out, dx_index);
+    let f_zero = konst(&mut b, ConstValue::F32(0.0));
+    b.emit(KirOp::Store(dx_addr, f_zero, Global));
+    let k_next = op2(&mut b, U32, KirOp::Add, k, one);
+    b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![k_next])));
 
-    s.push_str(
-        "\tmov.u32 %r0, %ctaid.x;\n\
-         \tmov.u32 %r1, %tid.x;\n\
-    \n",
-    );
-
-    s.push_str(
-        "\tcvt.u64.u32 %rd8, %r0;\n\
-         \tmul.lo.u64 %rd8, %rd8, 8;\n\
-         \tadd.u64 %rd8, %rd3, %rd8;\n\
-         \tld.global.s64 %target_val, [%rd8];\n\
-    \n",
-    );
-
-    s.push_str(&format!(
-        "\tsetp.eq.s64 %p_skip, %target_val, {ignore};\n\
-         \t@%p_skip bra BWD_SKIP_LABEL;\n\
-    \n"
-    ));
-
-    // Saved lse stays f32 even at dtype=F16 (matches forward's f32 write).
-    s.push_str(
-        "\tcvt.u64.u32 %rd9, %r0;\n\
-         \tshl.b64 %rd9, %rd9, 2;\n\
-         \tadd.u64 %rd9, %rd4, %rd9;\n\
-         \tld.global.f32 %lse_val, [%rd9];\n\
-    \n",
-    );
-
-    // x_row_base + dx_row_base. x stride 2 (fp16); dx stride 4 (f32 output).
-    s.push_str(&format!(
-        "\tcvt.u64.u32 %rd10, %r0;\n\
-         \tmov.u32 %r2, {hidden};\n\
-         \tcvt.u64.u32 %rd11, %r2;\n\
-         \tmul.lo.u64 %rd10, %rd10, %rd11;\n\
-         \tshl.b64 %rd10, %rd10, 1; // x: *2 (fp16)\n\
-         \tadd.u64 %rd10, %rd0, %rd10;\n\
-         \t// dx_row_base = dx_out + row_idx * H * 4 (f32 grad)\n\
-         \tcvt.u64.u32 %rd20, %r0;\n\
-         \tmul.lo.u64 %rd20, %rd20, %rd11;\n\
-         \tshl.b64 %rd20, %rd20, 2; // dx: *4 (f32)\n\
-         \tadd.u64 %rd20, %rd5, %rd20;\n\
-    \n"
-    ));
-
-    s.push_str("\tdiv.rn.f32 %scale, %grad_output, %num_valid_f;\n\n");
-    s.push_str("\tmov.f32 %f15, 0f3FB8AA3B; // log2(e)\n\n");
-
-    s.push_str(
-        "\tmov.u32 %r3, 0; // tile_idx\n\
-         BWD_TILE_LOOP:\n",
-    );
-
-    s.push_str(&format!(
-        "\t\tmul.lo.u32 %r4, %r3, {vtile}; // v_base\n\
-    \n"
-    ));
-
-    s.push_str(
-        "\t\tmov.u32 %r5, 0; // inner counter\n\
-         BWD_INNER_LOOP:\n",
-    );
-
-    s.push_str(
-        "\t\t\tmul.lo.u32 %r6, %r5, 128;\n\
-         \t\t\tadd.u32 %r6, %r6, %r1;\n\
-         \t\t\tadd.u32 %r6, %r6, %r4;\n",
-    );
-
-    s.push_str(&format!(
-        "\t\t\tsetp.lt.u32 %p_valid, %r6, {vocab};\n\
-         \t\t\t@!%p_valid bra BWD_INNER_SKIP;\n\
-    \n"
-    ));
-
-    // W_row_base — fp16 stride 2.
-    s.push_str(&format!(
-        "\t\t\t// W_row_base for v_idx (fp16)\n\
-         \t\t\tcvt.u64.u32 %rd12, %r6;\n\
-         \t\t\tmov.u32 %r7, {hidden};\n\
-         \t\t\tcvt.u64.u32 %rd13, %r7;\n\
-         \t\t\tmul.lo.u64 %rd12, %rd12, %rd13;\n\
-         \t\t\tshl.b64 %rd12, %rd12, 1; // *2 fp16\n\
-         \t\t\tadd.u64 %rd12, %rd1, %rd12;\n\
-    \n"
-    ));
-
-    // Dot product — fp16 loads → cvt.f32.f16 → fma.f32.
-    s.push_str(
-        "\t\t\tmov.f32 %logit_acc, 0f00000000;\n\
-         \t\t\tmov.u32 %r8, 0;\n\
-         BWD_DOT_LOOP:\n\
-         \t\t\t\tcvt.u64.u32 %rd14, %r8;\n\
-         \t\t\t\tshl.b64 %rd14, %rd14, 1; // *2 fp16\n\
-         \t\t\t\tadd.u64 %rd15, %rd10, %rd14;\n\
-         \t\t\t\tld.global.b16 %h0, [%rd15];\n\
-         \t\t\t\tcvt.f32.f16 %f0, %h0;\n\
-         \t\t\t\tadd.u64 %rd16, %rd12, %rd14;\n\
-         \t\t\t\tld.global.b16 %h1, [%rd16];\n\
-         \t\t\t\tcvt.f32.f16 %f1, %h1;\n\
-         \t\t\t\tfma.rn.f32 %logit_acc, %f0, %f1, %logit_acc;\n\
-         \t\t\t\tadd.u32 %r8, %r8, 1;\n",
-    );
-
-    s.push_str(&format!(
-        "\t\t\t\tsetp.lt.u32 %p_valid, %r8, {hidden};\n\
-         \t\t\t\t@%p_valid bra BWD_DOT_LOOP;\n\
-    \n"
-    ));
-
-    // Add bias (fp16).
-    s.push_str(
-        "\t\t\t// bias (fp16)\n\
-         \t\t\tcvt.u64.u32 %rd17, %r6;\n\
-         \t\t\tshl.b64 %rd17, %rd17, 1; // *2\n\
-         \t\t\tadd.u64 %rd17, %rd2, %rd17;\n\
-         \t\t\tld.global.b16 %h2, [%rd17];\n\
-         \t\t\tcvt.f32.f16 %f2, %h2;\n\
-         \t\t\tadd.f32 %logit_acc, %logit_acc, %f2;\n\
-    \n",
-    );
-
-    // p_v = exp(logit_v - lse).
-    s.push_str(
-        "\t\t\tsub.f32 %f3, %logit_acc, %lse_val;\n\
-         \t\t\tmul.f32 %f3, %f3, %f15;\n\
-         \t\t\tex2.approx.f32 %f3, %f3;\n\
-    \n",
-    );
-
-    s.push_str(
-        "\t\t\tcvt.s64.u32 %rd18, %r6;\n\
-         \t\t\tsetp.eq.s64 %p_is_target, %rd18, %target_val;\n\
-         \t\t\t@%p_is_target sub.f32 %f3, %f3, 0f3F800000; // -= 1.0\n\
-         \t\t\tmul.f32 %f4, %f3, %scale;\n\
-    \n",
-    );
-
-    // dW_row_base — f32 stride 4 (dW is master-precision f32 regardless of activation dtype).
-    s.push_str(&format!(
-        "\t\t\t// dW_row_base = dW_out + v_idx * H * 4 (f32 master grad)\n\
-         \t\t\tcvt.u64.u32 %rd21, %r6;\n\
-         \t\t\tmov.u32 %r9, {hidden};\n\
-         \t\t\tcvt.u64.u32 %rd22, %r9;\n\
-         \t\t\tmul.lo.u64 %rd21, %rd21, %rd22;\n\
-         \t\t\tshl.b64 %rd21, %rd21, 2; // *4 (f32)\n\
-         \t\t\tadd.u64 %rd21, %rd6, %rd21;\n\
-    \n"
-    ));
-
-    // H-loop scatter.
-    //   W[v, h]  is fp16 (stride 2 from %rd12)
-    //   x[row,h] is fp16 (stride 2 from %rd10)
-    //   dx_out + dW_out are f32 (stride 4 from %rd20 / %rd21)
-    s.push_str(
-        "\t\t\tmov.u32 %r9, 0; // h counter\n\
-         BWD_H_LOOP:\n\
-         \t\t\t\tcvt.u64.u32 %rd23, %r9;\n\
-         \t\t\t\tshl.b64 %rd23, %rd23, 1; // *2 fp16 (for W, x loads)\n\
-         \t\t\t\t// W[v, h] fp16\n\
-         \t\t\t\tadd.u64 %rd14, %rd12, %rd23;\n\
-         \t\t\t\tld.global.b16 %h0, [%rd14];\n\
-         \t\t\t\tcvt.f32.f16 %f5, %h0;\n\
-         \t\t\t\t// f6 = scaled * W[v, h]  (f32 grad slice)\n\
-         \t\t\t\tmul.f32 %f6, %f4, %f5;\n\
-         \t\t\t\t// dx_out[row, h] += f6  (f32 destination - stride 4)\n\
-         \t\t\t\tcvt.u64.u32 %rd14, %r9;\n\
-         \t\t\t\tshl.b64 %rd14, %rd14, 2;\n\
-         \t\t\t\tadd.u64 %rd14, %rd20, %rd14;\n\
-         \t\t\t\tred.global.add.f32 [%rd14], %f6;\n\
-         \t\t\t\t// x[row, h] fp16\n\
-         \t\t\t\tadd.u64 %rd14, %rd10, %rd23;\n\
-         \t\t\t\tld.global.b16 %h1, [%rd14];\n\
-         \t\t\t\tcvt.f32.f16 %f7, %h1;\n\
-         \t\t\t\t// f8 = scaled * x[row, h]\n\
-         \t\t\t\tmul.f32 %f8, %f4, %f7;\n\
-         \t\t\t\t// dW_out[v, h] += f8  (f32 destination - stride 4)\n\
-         \t\t\t\tcvt.u64.u32 %rd14, %r9;\n\
-         \t\t\t\tshl.b64 %rd14, %rd14, 2;\n\
-         \t\t\t\tadd.u64 %rd14, %rd21, %rd14;\n\
-         \t\t\t\tred.global.add.f32 [%rd14], %f8;\n\
-         \t\t\t\tadd.u32 %r9, %r9, 1;\n",
-    );
-
-    s.push_str(&format!(
-        "\t\t\t\tsetp.lt.u32 %p_valid, %r9, {hidden};\n\
-         \t\t\t\t@%p_valid bra BWD_H_LOOP;\n\
-    \n"
-    ));
-
-    // dbias[v] += scaled (f32 output stride 4).
-    s.push_str(
-        "\t\t\t// dbias_out[v] += scaled (f32 output)\n\
-         \t\t\tcvt.u64.u32 %rd14, %r6;\n\
-         \t\t\tshl.b64 %rd14, %rd14, 2; // *4 f32\n\
-         \t\t\tadd.u64 %rd14, %rd7, %rd14;\n\
-         \t\t\tred.global.add.f32 [%rd14], %f4;\n\
-    \n",
-    );
-
-    s.push_str(
-        "BWD_INNER_SKIP:\n\
-         \t\t\tadd.u32 %r5, %r5, 1;\n",
-    );
-
-    s.push_str(&format!(
-        "\t\t\tsetp.lt.u32 %p_valid, %r5, {vtile_per_thread};\n\
-         \t\t\t@%p_valid bra BWD_INNER_LOOP;\n\
-    \n"
-    ));
-
-    s.push_str("\t\tadd.u32 %r3, %r3, 1;\n");
-
-    s.push_str(&format!(
-        "\t\tsetp.lt.u32 %p_valid, %r3, {n_tiles};\n\
-         \t\t@%p_valid bra BWD_TILE_LOOP;\n\
-    \n"
-    ));
-
-    s.push_str("\tbra BWD_DONE;\n\n");
-
-    // Skip path: zero dx_out[row, :] as f32 (stride 4).
-    s.push_str(
-        "BWD_SKIP_LABEL:\n\
-         \t// Zero dx_out[row, :] for skipped token (f32 output)\n",
-    );
-
-    s.push_str(&format!(
-        "\tcvt.u64.u32 %rd10, %r0;\n\
-         \tmov.u32 %r2, {hidden};\n\
-         \tcvt.u64.u32 %rd11, %r2;\n\
-         \tmul.lo.u64 %rd10, %rd10, %rd11;\n\
-         \tshl.b64 %rd10, %rd10, 2; // *4 (f32 dx)\n\
-         \tadd.u64 %rd10, %rd5, %rd10;\n\
-    \n"
-    ));
-
-    s.push_str(&format!(
-        "\tmov.u32 %r5, 0;\n\
-         BWD_ZERO_LOOP:\n\
-         \t\tmul.lo.u32 %r6, %r5, 128;\n\
-         \t\tadd.u32 %r6, %r6, %r1;\n\
-         \t\tsetp.lt.u32 %p_valid, %r6, {hidden};\n\
-         \t\t@!%p_valid bra BWD_ZERO_DONE;\n\
-         \t\tshl.b32 %r6, %r6, 2;\n\
-         \t\tcvt.u64.u32 %rd12, %r6;\n\
-         \t\tadd.u64 %rd12, %rd10, %rd12;\n\
-         \t\tst.global.f32 [%rd12], 0f00000000;\n\
-         \t\tadd.u32 %r5, %r5, 1;\n\
-         \t\tbra BWD_ZERO_LOOP;\n\
-         BWD_ZERO_DONE:\n\
-    \n"
-    ));
-
-    s.push_str("BWD_DONE:\n\tret;\n}\n");
-
-    s
+    b.set_block(exit);
+    b.terminate(KirTerminator::Return);
+    b.finalize()
 }
 
-
-// ─── PTX emission — Bf16 path (Sprint v4-1) ──────────────────────────────────
-//
-// Bf16 emitters mirror the F16 emitters structurally — same kernel layout,
-// loop nesting, sync points, register allocation, and SMEM partitioning.
-// The only differences are:
-//   * `cvt.f32.f16`      -> `cvt.f32.bf16`     (HBM/SMEM bf16 -> f32 math)
-//   * `cvt.rn.f16.f32`   -> `cvt.rn.bf16.f32`  (f32 -> bf16 store)
-//   * `0xFC00`           -> `0xFF80`           (bf16 -INF sentinel —
-//                                              bf16 has an 8-bit exponent
-//                                              like f32, so -INF is sign-bit
-//                                              + all-ones exponent + zero
-//                                              mantissa = 0xFF80)
-//   * `.version 7.0`     -> `.version 8.0`     (bf16 cvt mnemonics require
-//                                              PTX ISA 7.8+; bumped via
-//                                              `ptx_header()` dtype dispatch)
-//
-// SMEM declaration stays `.align 2 .b8` (bf16 is 16-bit storage like f16);
-// the bare `ld.global.b16` / `st.shared.b16` storage instructions are
-// dtype-agnostic — only the surrounding cvt mnemonics differ.
-//
-// Output buffers `loss_out` / `lse_out` / `dx` / `dW` / `dbias` stay f32 —
-// same master-grad convention as the F16 path.
-
-
-// ── Bf16 backward kernel ──────────────────────────────────────────────────────
-//
-// Mixed-precision convention (Sprint v3-2):
-//   * x / W / bias HBM loads are `ld.global.b16` + `cvt.f32.bf16` into f32
-//     math registers. Backward recomputes logits from forward inputs and
-//     the saved f32 lse, so the dtype of `x`/`W`/`bias` is the same as in
-//     the forward kernel.
-//   * The saved `lse` buffer stays `.f32` (written by the forward kernel
-//     as f32 regardless of activation dtype) — `ld.global.f32 %lse_val`.
-//   * The `grad_output` parameter is still `.param .f32` (a scalar; no
-//     reason to halve a single value).
-//   * Gradient outputs `dx`, `dW`, `dbias` stay `.f32` and the cross-CTA
-//     accumulator uses `red.global.add.f32`. Rationale:
-//       - `red.global.add.f16` is not portable across SMs (some pre-sm_70
-//         lack it; sm_80+ supports it but adds a numerical-determinism
-//         risk via non-deterministic accumulation order in bf16).
-//       - PyTorch's standard mixed-precision convention writes master
-//         gradients in f32; downstream optimizer state stays f32.
-//       - Per the Sprint v3-2 spec: "current backward signature returns
-//         f32 dW even when dtype=Bf16; this matches PyTorch's
-//         mixed-precision convention".
-//     The optional bf16 down-cast in an epilogue kernel is deferred.
-//
-// Output buffers dx/dW/dbias MUST be allocated by the caller as f32 even
-// when `dtype = Bf16` — the runtime FFI layer threads this convention.
-fn emit_bwd_kernel_bf16(cfg: &FusedLinearCEConfig) -> String {
-    let name = cfg.bwd_kernel_name();
-    let vocab = cfg.vocab_size;
-    let hidden = cfg.hidden_size;
-    let vtile = cfg.vocab_tile;
-    let n_tiles = vocab.div_ceil(vtile);
-    let vtile_per_thread = vtile / 128;
-    let ignore = cfg.ignore_index;
-    let smem_bytes = cfg.shared_mem_bytes();
-
-    let mut s = String::new();
-
-    s.push_str(&cfg.ptx_header());
-    s.push('\n');
-
-    // SMEM not used by backward (forward stored everything it needs in HBM),
-    // but the declaration is kept for ABI parity with the F32 path's launcher.
-    s.push_str(&format!(
-        ".extern .shared .align 2 .b8 smem_scratch[{smem_bytes}];\n\n"
-    ));
-
-    s.push_str(&format!(
-        ".visible .entry {name}(\n\
-         \t.param .f32 param_grad_output,\n\
-         \t.param .u64 param_x,\n\
-         \t.param .u64 param_w,\n\
-         \t.param .u64 param_bias,\n\
-         \t.param .u64 param_targets,\n\
-         \t.param .u64 param_lse,\n\
-         \t.param .u64 param_dx_out,\n\
-         \t.param .u64 param_dw_out,\n\
-         \t.param .u64 param_dbias_out,\n\
-         \t.param .u32 param_B,\n\
-         \t.param .u32 param_S,\n\
-         \t.param .u32 param_V,\n\
-         \t.param .u32 param_H,\n\
-         \t.param .u32 param_num_valid\n\
-         ) {{\n"
-    ));
-
-    s.push_str(
-        "\t.reg .u64 %rd<24>;\n\
-         \t.reg .u32 %r<20>;\n\
-         \t.reg .s64 %target_val;\n\
-         \t.reg .b16 %h0, %h1, %h2;\n\
-         \t.reg .f32 %f<20>;\n\
-         \t.reg .f32 %logit_acc;\n\
-         \t.reg .f32 %grad_output;\n\
-         \t.reg .f32 %lse_val;\n\
-         \t.reg .f32 %scale;\n\
-         \t.reg .pred %p_skip;\n\
-         \t.reg .pred %p_valid;\n\
-         \t.reg .pred %p_intile;\n\
-         \t.reg .pred %p_is_target;\n\
-         \t.reg .u32 %num_valid;\n\
-         \t.reg .f32 %num_valid_f;\n\
-    \n",
-    );
-
-    s.push_str(
-        "\tld.param.f32 %grad_output, [param_grad_output];\n\
-         \tld.param.u64 %rd0, [param_x];\n\
-         \tld.param.u64 %rd1, [param_w];\n\
-         \tld.param.u64 %rd2, [param_bias];\n\
-         \tld.param.u64 %rd3, [param_targets];\n\
-         \tld.param.u64 %rd4, [param_lse];\n\
-         \tld.param.u64 %rd5, [param_dx_out];\n\
-         \tld.param.u64 %rd6, [param_dw_out];\n\
-         \tld.param.u64 %rd7, [param_dbias_out];\n\
-         \tld.param.u32 %num_valid, [param_num_valid];\n\
-         \tcvt.rn.f32.u32 %num_valid_f, %num_valid;\n\
-    \n",
-    );
-
-    s.push_str(
-        "\tmov.u32 %r0, %ctaid.x;\n\
-         \tmov.u32 %r1, %tid.x;\n\
-    \n",
-    );
-
-    s.push_str(
-        "\tcvt.u64.u32 %rd8, %r0;\n\
-         \tmul.lo.u64 %rd8, %rd8, 8;\n\
-         \tadd.u64 %rd8, %rd3, %rd8;\n\
-         \tld.global.s64 %target_val, [%rd8];\n\
-    \n",
-    );
-
-    s.push_str(&format!(
-        "\tsetp.eq.s64 %p_skip, %target_val, {ignore};\n\
-         \t@%p_skip bra BWD_SKIP_LABEL;\n\
-    \n"
-    ));
-
-    // Saved lse stays f32 even at dtype=Bf16 (matches forward's f32 write).
-    s.push_str(
-        "\tcvt.u64.u32 %rd9, %r0;\n\
-         \tshl.b64 %rd9, %rd9, 2;\n\
-         \tadd.u64 %rd9, %rd4, %rd9;\n\
-         \tld.global.f32 %lse_val, [%rd9];\n\
-    \n",
-    );
-
-    // x_row_base + dx_row_base. x stride 2 (bf16); dx stride 4 (f32 output).
-    s.push_str(&format!(
-        "\tcvt.u64.u32 %rd10, %r0;\n\
-         \tmov.u32 %r2, {hidden};\n\
-         \tcvt.u64.u32 %rd11, %r2;\n\
-         \tmul.lo.u64 %rd10, %rd10, %rd11;\n\
-         \tshl.b64 %rd10, %rd10, 1; // x: *2 (bf16)\n\
-         \tadd.u64 %rd10, %rd0, %rd10;\n\
-         \t// dx_row_base = dx_out + row_idx * H * 4 (f32 grad)\n\
-         \tcvt.u64.u32 %rd20, %r0;\n\
-         \tmul.lo.u64 %rd20, %rd20, %rd11;\n\
-         \tshl.b64 %rd20, %rd20, 2; // dx: *4 (f32)\n\
-         \tadd.u64 %rd20, %rd5, %rd20;\n\
-    \n"
-    ));
-
-    s.push_str("\tdiv.rn.f32 %scale, %grad_output, %num_valid_f;\n\n");
-    s.push_str("\tmov.f32 %f15, 0f3FB8AA3B; // log2(e)\n\n");
-
-    s.push_str(
-        "\tmov.u32 %r3, 0; // tile_idx\n\
-         BWD_TILE_LOOP:\n",
-    );
-
-    s.push_str(&format!(
-        "\t\tmul.lo.u32 %r4, %r3, {vtile}; // v_base\n\
-    \n"
-    ));
-
-    s.push_str(
-        "\t\tmov.u32 %r5, 0; // inner counter\n\
-         BWD_INNER_LOOP:\n",
-    );
-
-    s.push_str(
-        "\t\t\tmul.lo.u32 %r6, %r5, 128;\n\
-         \t\t\tadd.u32 %r6, %r6, %r1;\n\
-         \t\t\tadd.u32 %r6, %r6, %r4;\n",
-    );
-
-    s.push_str(&format!(
-        "\t\t\tsetp.lt.u32 %p_valid, %r6, {vocab};\n\
-         \t\t\t@!%p_valid bra BWD_INNER_SKIP;\n\
-    \n"
-    ));
-
-    // W_row_base — bf16 stride 2.
-    s.push_str(&format!(
-        "\t\t\t// W_row_base for v_idx (bf16)\n\
-         \t\t\tcvt.u64.u32 %rd12, %r6;\n\
-         \t\t\tmov.u32 %r7, {hidden};\n\
-         \t\t\tcvt.u64.u32 %rd13, %r7;\n\
-         \t\t\tmul.lo.u64 %rd12, %rd12, %rd13;\n\
-         \t\t\tshl.b64 %rd12, %rd12, 1; // *2 bf16\n\
-         \t\t\tadd.u64 %rd12, %rd1, %rd12;\n\
-    \n"
-    ));
-
-    // Dot product — bf16 loads → cvt.f32.bf16 → fma.f32.
-    s.push_str(
-        "\t\t\tmov.f32 %logit_acc, 0f00000000;\n\
-         \t\t\tmov.u32 %r8, 0;\n\
-         BWD_DOT_LOOP:\n\
-         \t\t\t\tcvt.u64.u32 %rd14, %r8;\n\
-         \t\t\t\tshl.b64 %rd14, %rd14, 1; // *2 bf16\n\
-         \t\t\t\tadd.u64 %rd15, %rd10, %rd14;\n\
-         \t\t\t\tld.global.b16 %h0, [%rd15];\n\
-         \t\t\t\tcvt.f32.bf16 %f0, %h0;\n\
-         \t\t\t\tadd.u64 %rd16, %rd12, %rd14;\n\
-         \t\t\t\tld.global.b16 %h1, [%rd16];\n\
-         \t\t\t\tcvt.f32.bf16 %f1, %h1;\n\
-         \t\t\t\tfma.rn.f32 %logit_acc, %f0, %f1, %logit_acc;\n\
-         \t\t\t\tadd.u32 %r8, %r8, 1;\n",
-    );
-
-    s.push_str(&format!(
-        "\t\t\t\tsetp.lt.u32 %p_valid, %r8, {hidden};\n\
-         \t\t\t\t@%p_valid bra BWD_DOT_LOOP;\n\
-    \n"
-    ));
-
-    // Add bias (bf16).
-    s.push_str(
-        "\t\t\t// bias (bf16)\n\
-         \t\t\tcvt.u64.u32 %rd17, %r6;\n\
-         \t\t\tshl.b64 %rd17, %rd17, 1; // *2\n\
-         \t\t\tadd.u64 %rd17, %rd2, %rd17;\n\
-         \t\t\tld.global.b16 %h2, [%rd17];\n\
-         \t\t\tcvt.f32.bf16 %f2, %h2;\n\
-         \t\t\tadd.f32 %logit_acc, %logit_acc, %f2;\n\
-    \n",
-    );
-
-    // p_v = exp(logit_v - lse).
-    s.push_str(
-        "\t\t\tsub.f32 %f3, %logit_acc, %lse_val;\n\
-         \t\t\tmul.f32 %f3, %f3, %f15;\n\
-         \t\t\tex2.approx.f32 %f3, %f3;\n\
-    \n",
-    );
-
-    s.push_str(
-        "\t\t\tcvt.s64.u32 %rd18, %r6;\n\
-         \t\t\tsetp.eq.s64 %p_is_target, %rd18, %target_val;\n\
-         \t\t\t@%p_is_target sub.f32 %f3, %f3, 0f3F800000; // -= 1.0\n\
-         \t\t\tmul.f32 %f4, %f3, %scale;\n\
-    \n",
-    );
-
-    // dW_row_base — f32 stride 4 (dW is master-precision f32 regardless of activation dtype).
-    s.push_str(&format!(
-        "\t\t\t// dW_row_base = dW_out + v_idx * H * 4 (f32 master grad)\n\
-         \t\t\tcvt.u64.u32 %rd21, %r6;\n\
-         \t\t\tmov.u32 %r9, {hidden};\n\
-         \t\t\tcvt.u64.u32 %rd22, %r9;\n\
-         \t\t\tmul.lo.u64 %rd21, %rd21, %rd22;\n\
-         \t\t\tshl.b64 %rd21, %rd21, 2; // *4 (f32)\n\
-         \t\t\tadd.u64 %rd21, %rd6, %rd21;\n\
-    \n"
-    ));
-
-    // H-loop scatter.
-    //   W[v, h]  is bf16 (stride 2 from %rd12)
-    //   x[row,h] is bf16 (stride 2 from %rd10)
-    //   dx_out + dW_out are f32 (stride 4 from %rd20 / %rd21)
-    s.push_str(
-        "\t\t\tmov.u32 %r9, 0; // h counter\n\
-         BWD_H_LOOP:\n\
-         \t\t\t\tcvt.u64.u32 %rd23, %r9;\n\
-         \t\t\t\tshl.b64 %rd23, %rd23, 1; // *2 bf16 (for W, x loads)\n\
-         \t\t\t\t// W[v, h] bf16\n\
-         \t\t\t\tadd.u64 %rd14, %rd12, %rd23;\n\
-         \t\t\t\tld.global.b16 %h0, [%rd14];\n\
-         \t\t\t\tcvt.f32.bf16 %f5, %h0;\n\
-         \t\t\t\t// f6 = scaled * W[v, h]  (f32 grad slice)\n\
-         \t\t\t\tmul.f32 %f6, %f4, %f5;\n\
-         \t\t\t\t// dx_out[row, h] += f6  (f32 destination - stride 4)\n\
-         \t\t\t\tcvt.u64.u32 %rd14, %r9;\n\
-         \t\t\t\tshl.b64 %rd14, %rd14, 2;\n\
-         \t\t\t\tadd.u64 %rd14, %rd20, %rd14;\n\
-         \t\t\t\tred.global.add.f32 [%rd14], %f6;\n\
-         \t\t\t\t// x[row, h] bf16\n\
-         \t\t\t\tadd.u64 %rd14, %rd10, %rd23;\n\
-         \t\t\t\tld.global.b16 %h1, [%rd14];\n\
-         \t\t\t\tcvt.f32.bf16 %f7, %h1;\n\
-         \t\t\t\t// f8 = scaled * x[row, h]\n\
-         \t\t\t\tmul.f32 %f8, %f4, %f7;\n\
-         \t\t\t\t// dW_out[v, h] += f8  (f32 destination - stride 4)\n\
-         \t\t\t\tcvt.u64.u32 %rd14, %r9;\n\
-         \t\t\t\tshl.b64 %rd14, %rd14, 2;\n\
-         \t\t\t\tadd.u64 %rd14, %rd21, %rd14;\n\
-         \t\t\t\tred.global.add.f32 [%rd14], %f8;\n\
-         \t\t\t\tadd.u32 %r9, %r9, 1;\n",
-    );
-
-    s.push_str(&format!(
-        "\t\t\t\tsetp.lt.u32 %p_valid, %r9, {hidden};\n\
-         \t\t\t\t@%p_valid bra BWD_H_LOOP;\n\
-    \n"
-    ));
-
-    // dbias[v] += scaled (f32 output stride 4).
-    s.push_str(
-        "\t\t\t// dbias_out[v] += scaled (f32 output)\n\
-         \t\t\tcvt.u64.u32 %rd14, %r6;\n\
-         \t\t\tshl.b64 %rd14, %rd14, 2; // *4 f32\n\
-         \t\t\tadd.u64 %rd14, %rd7, %rd14;\n\
-         \t\t\tred.global.add.f32 [%rd14], %f4;\n\
-    \n",
-    );
-
-    s.push_str(
-        "BWD_INNER_SKIP:\n\
-         \t\t\tadd.u32 %r5, %r5, 1;\n",
-    );
-
-    s.push_str(&format!(
-        "\t\t\tsetp.lt.u32 %p_valid, %r5, {vtile_per_thread};\n\
-         \t\t\t@%p_valid bra BWD_INNER_LOOP;\n\
-    \n"
-    ));
-
-    s.push_str("\t\tadd.u32 %r3, %r3, 1;\n");
-
-    s.push_str(&format!(
-        "\t\tsetp.lt.u32 %p_valid, %r3, {n_tiles};\n\
-         \t\t@%p_valid bra BWD_TILE_LOOP;\n\
-    \n"
-    ));
-
-    s.push_str("\tbra BWD_DONE;\n\n");
-
-    // Skip path: zero dx_out[row, :] as f32 (stride 4).
-    s.push_str(
-        "BWD_SKIP_LABEL:\n\
-         \t// Zero dx_out[row, :] for skipped token (f32 output)\n",
-    );
-
-    s.push_str(&format!(
-        "\tcvt.u64.u32 %rd10, %r0;\n\
-         \tmov.u32 %r2, {hidden};\n\
-         \tcvt.u64.u32 %rd11, %r2;\n\
-         \tmul.lo.u64 %rd10, %rd10, %rd11;\n\
-         \tshl.b64 %rd10, %rd10, 2; // *4 (f32 dx)\n\
-         \tadd.u64 %rd10, %rd5, %rd10;\n\
-    \n"
-    ));
-
-    s.push_str(&format!(
-        "\tmov.u32 %r5, 0;\n\
-         BWD_ZERO_LOOP:\n\
-         \t\tmul.lo.u32 %r6, %r5, 128;\n\
-         \t\tadd.u32 %r6, %r6, %r1;\n\
-         \t\tsetp.lt.u32 %p_valid, %r6, {hidden};\n\
-         \t\t@!%p_valid bra BWD_ZERO_DONE;\n\
-         \t\tshl.b32 %r6, %r6, 2;\n\
-         \t\tcvt.u64.u32 %rd12, %r6;\n\
-         \t\tadd.u64 %rd12, %rd10, %rd12;\n\
-         \t\tst.global.f32 [%rd12], 0f00000000;\n\
-         \t\tadd.u32 %r5, %r5, 1;\n\
-         \t\tbra BWD_ZERO_LOOP;\n\
-         BWD_ZERO_DONE:\n\
-    \n"
-    ));
-
-    s.push_str("BWD_DONE:\n\tret;\n}\n");
-
-    s
+/// The backward module: [`build_backward`], verified and lowered
+/// (null-terminated for `cuModuleLoadData`).
+///
+/// # Panics
+///
+/// If the built kernel fails KIR verification — a bug in this module, not a
+/// condition a caller can provoke.
+fn emit_backward(cfg: &FusedLinearCEConfig) -> Vec<u8> {
+    let ir = build_backward(cfg);
+    if let Err(errors) = crate::kir_verify::verify(&ir) {
+        panic!("{} failed KIR verification: {errors:?}", ir.name);
+    }
+    lower_kir_to_ptx(&ir)
 }
 
 // ─── Inline tests ─────────────────────────────────────────────────────────────

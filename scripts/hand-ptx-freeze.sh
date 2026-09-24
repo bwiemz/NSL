@@ -56,8 +56,8 @@ MANIFEST="ci/hand-ptx-manifest.txt"
 # near-zero matches cannot be blessed by re-running --write-manifest. The
 # freeze started at 71 files (2026-09-02); the count only goes DOWN as
 # kernels migrate to KIR, so the floor is generous and gets lowered on
-# purpose.
-MIN_MEMBERS=60
+# purpose (60 after the fused linear-CE file left, 2026-09-24).
+MIN_MEMBERS=55
 
 # Every candidate Rust file, one per line, sorted.
 candidates() {
