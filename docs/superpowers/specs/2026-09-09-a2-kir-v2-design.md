@@ -513,6 +513,35 @@ frozen throughout, so nothing here blocks a kernel fix.
    node's closing one (nothing reads `q` after the tree tile's scores
    barrier). `VerifyAttentionConfig` lost its `sm_version`, and the file
    left the freeze (64 → 63).
+
+   **`sample` done.** The fused decode-sample kernel starts with the
+   spec sampler's sections (the hidden load and the RMSNorm, now two
+   functions so the norm can be optional, and the row dot, over a
+   `Common` whose rstd region is a parameter) and draws with the
+   rejection kernel's `build_prng_draw`. What is its own: the replace-min
+   candidate merge with its min-scans, the greedy argmax, the softmax, the
+   nucleus insertion sort and cutoff, the multinomial walk, and the
+   grammar hook, which loads its mask byte as `I8` and casts it to `U32`
+   (the low 8 bits are what is tested, and sign extension leaves them
+   alone). The interpreter learned `ld.u8`, `cvt.u32.s8` and 64-bit
+   `selp`. A sampler writes one token, so the gate had to be built to
+   see its mutants: an RMSNorm fault or constant only rescales every
+   logit, which a sharp softmax ignores and a flat one barely feels, so
+   the mutation cases include a top-k program at temperature 2, a hidden
+   row whose one large entry (element 127) reaches thread 0 only through
+   the last lane of every tree-reduction level, 64-bit seeds (small ones
+   leave the xorshift state too small for a low-bit constant nudge to
+   reach the draw), and planted ties for the first-wins comparisons. It
+   catches every barrier that orders something, nudged RMSNorm, PRNG,
+   temperature, top_p and top_k constants, relaxed min-scan, merge and
+   argmax comparisons, a dropped vocab guard and a skipped grammar mask.
+   The equivalent mutants are named: four barriers (after the hidden
+   load, the last tree level, the normalised row and the candidate init;
+   the last two only each on its own), the walk's positive-entry test
+   (the same argument as the rejection kernel's), and the merge's tail
+   clamp (the tail lanes hold -inf, which never beats the list's minimum
+   under the strict `>`). `FusedSampleKernelConfig` lost its
+   `sm_version`, and the file left the freeze (63 → 62).
 10. **Fused loss heads.** `fused_linear_ce.rs`, then `cpkd_fused_loss.rs`.
     Proof: SASS equivalence (the online-softmax loops reorder under
     scheduling).

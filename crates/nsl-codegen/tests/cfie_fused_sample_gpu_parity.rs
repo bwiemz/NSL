@@ -210,7 +210,6 @@ fn kernel_cfg(vocab: u32, grammar_states: u32) -> FusedSampleKernelConfig {
         vocab_size: vocab,
         vocab_tile: 128,
         top_k: TOP_K,
-        sm_version: 80, // driver JITs sm_80 PTX forward to the local Blackwell
         grammar_states,
     }
 }

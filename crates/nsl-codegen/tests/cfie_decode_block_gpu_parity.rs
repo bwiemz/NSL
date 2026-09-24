@@ -526,7 +526,6 @@ fn decode_step_token_sequence_matches_cpu_chain() {
             vocab_size: VOCAB as u32,
             vocab_tile: 128,
             top_k: TOP_K,
-            sm_version: 80,
             grammar_states: 0,
         },
     );
@@ -674,7 +673,6 @@ fn decode_step_pos_mismatch_refuses_minus3_and_rolls_back() {
             vocab_size: VOCAB as u32,
             vocab_tile: 128,
             top_k: TOP_K,
-            sm_version: 80,
             grammar_states: 0,
         },
     );

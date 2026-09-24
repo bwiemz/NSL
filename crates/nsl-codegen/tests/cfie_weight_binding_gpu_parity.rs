@@ -428,7 +428,6 @@ fn build_sampler() -> (
             vocab_size: VOCAB as u32,
             vocab_tile: 128,
             top_k: TOP_K,
-            sm_version: 80,
             grammar_states: 0,
         },
     );

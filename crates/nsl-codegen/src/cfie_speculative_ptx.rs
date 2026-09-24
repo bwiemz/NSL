@@ -352,7 +352,7 @@ pub fn emit_verify_attention_ptx(cfg: &VerifyAttentionConfig) -> String {
 /// (`x ^= x >> 12; x ^= x << 25; x ^= x >> 27`) and becomes the new state;
 /// the output is `state * M`, and `r` is its top 24 bits over 2^24, exact
 /// in an f32 mantissa. Returns `(state, r)`.
-fn build_prng_draw(b: &mut KirBuilder, x: VarId) -> (VarId, VarId) {
+pub(crate) fn build_prng_draw(b: &mut KirBuilder, x: VarId) -> (VarId, VarId) {
     use KirType::{F32, U32, U64};
 
     let mut x = x;

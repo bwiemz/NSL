@@ -409,7 +409,6 @@ fn setup_spec_engine(per_slot: usize) {
             vocab_size: VOCAB as u32,
             vocab_tile: 128,
             top_k: TOP_K,
-            sm_version: 80,
             grammar_states: 0,
         },
     );
@@ -418,7 +417,6 @@ fn setup_spec_engine(per_slot: usize) {
     let (r_ptx, r_meta) = emit_rejection_kernel(&RejectionConfig {
         k_tokens: K_TOKENS as u32,
         vocab_size: VOCAB as u32,
-        sm_version: 80,
     });
     register(4, &r_ptx, &r_meta.kernel_name, 1, r_meta.block_dim as i64);
 
@@ -565,7 +563,6 @@ fn cpu_speculative_mirror(
     let reject_cfg = RejectionConfig {
         k_tokens: K_TOKENS as u32,
         vocab_size: VOCAB as u32,
-        sm_version: 80,
     };
     let mut tseq = CpuSeq::new();
     let mut dseq = CpuSeq::new();

@@ -8,6 +8,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- The CFIE fused decode-sample kernel (`nsl_cfie_fused_sample`) is built
+  as KIR (roadmap A2 step 9, sixth slice). It was hand-assembled PTX:
+  RMSNorm, the LM-head matvec over vocab tiles, a replace-min top-k list,
+  and a greedy argmax or a softmax, optional nucleus filter and
+  xorshift64* multinomial draw, with an optional grammar bitmask. It now
+  reuses the spec sampler's KIR sections and the rejection kernel's PRNG
+  draw. `tests/cfie_sample_kir_equivalence.rs` runs the frozen hand
+  emitter and the KIR one on the shared PTX interpreter across greedy,
+  top-k, top-k + nucleus and multinomial programs, with and without the
+  RMSNorm and the grammar mask. It requires the same output bits and
+  `cpu_reference`'s token, and names the mutants that cannot change the
+  token. `FusedSampleKernelConfig::sm_version` is gone, and
+  `cfie_sample_ptx.rs` leaves the hand-PTX freeze (63 files to 62).
 - The CFIE tree-mask verify attention kernel (`nsl_cfie_spec_verify_attn`)
   is built as KIR (roadmap A2 step 9, fifth slice). It was hand-assembled
   PTX: the decode-attention flash loop written out once per tree node,
@@ -403,6 +416,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   every diagnostic line the toolchain prints is a `tracing` event.
 
 ### Fixed
+
+- `tests/cfie_speculative_generate_gpu_e2e.rs` compiles again with the
+  `cuda` feature: it still set `RejectionConfig::sm_version`, which the
+  rejection kernel's move onto KIR removed.
 
 - A KV-quant layout whose int8 half has an odd element count
   (`max_tokens * n_kv_heads * head_dim`) is refused instead of emitted. The
