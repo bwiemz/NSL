@@ -7,14 +7,14 @@
 //! `nsl_mul_f32`, each `c[i] = a[i] op b[i]` over `n` f32 elements.
 //!
 //! The unary family follows: `nsl_{neg,relu,exp,log,sqrt,abs,sign,sigmoid,
-//! sin,cos,silu}_f32` (`c[i] = f(a[i])`) and `nsl_clamp_f32`
+//! sin,cos,silu,gelu}_f32` (`c[i] = f(a[i])`) and `nsl_clamp_f32`
 //! (`c[i] = min(max(a[i], lo), hi)`), each in the hand kernel's instruction
 //! sequence: `exp` as `ex2.approx` of `x * log2(e)`, `log` as `lg2.approx`
 //! times `ln 2`, the sigmoid family through `ex2.approx` and `rcp.approx`,
-//! `sqrt` IEEE-rounded. `nsl_tanh_f32` stays hand-written: it divides with
-//! `div.approx.f32`. `nsl_gelu_f32` stays too, until its slope is fixed in
-//! place: it multiplies by `0f3FD9999A` (1.7) where its backward and every
-//! description of it use 1.702.
+//! `sqrt` IEEE-rounded. GELU is the sigmoid approximation `x·σ(k·x)` with
+//! `k` = [`GELU_SLOPE`], the slope `nsl_gelu_backward_srcad_f32`
+//! differentiates with. `nsl_tanh_f32` stays hand-written: it divides with
+//! `div.approx.f32`.
 //!
 //! `nsl_div_f32` stays hand-written for now. It divides with
 //! `div.approx.f32`, which is within 2 ulp and returns 0 for a divisor
@@ -159,14 +159,21 @@ pub enum UnaryOp {
     Sin,
     Cos,
     Silu,
+    Gelu,
     Clamp,
 }
 
 /// `log2(e)`, the hand kernels' `0f3FB8AA3B`.
 const LOG2_E: u32 = 0x3FB8_AA3B;
 
+/// GELU's slope `k` in `x·σ(k·x)`: 1.702f, `0f3FD9DB23`. The runtime's
+/// source-AD backward, `nsl_gelu_backward_srcad_f32`, is hand-written with
+/// the same constant; a CPU-lane gate in `nsl-runtime` (`gelu_slope_drift`)
+/// holds the two together.
+pub const GELU_SLOPE: u32 = 0x3FD9_DB23;
+
 impl UnaryOp {
-    pub const ALL: [UnaryOp; 12] = [
+    pub const ALL: [UnaryOp; 13] = [
         UnaryOp::Neg,
         UnaryOp::Relu,
         UnaryOp::Exp,
@@ -178,6 +185,7 @@ impl UnaryOp {
         UnaryOp::Sin,
         UnaryOp::Cos,
         UnaryOp::Silu,
+        UnaryOp::Gelu,
         UnaryOp::Clamp,
     ];
 
@@ -195,6 +203,7 @@ impl UnaryOp {
             UnaryOp::Sin => "nsl_sin_f32",
             UnaryOp::Cos => "nsl_cos_f32",
             UnaryOp::Silu => "nsl_silu_f32",
+            UnaryOp::Gelu => "nsl_gelu_f32",
             UnaryOp::Clamp => "nsl_clamp_f32",
         }
     }
@@ -293,6 +302,12 @@ pub fn build_unary(op: UnaryOp) -> KernelIR {
             let s = sigmoid_of(&mut b, x);
             f32_op2(&mut b, KirOp::Mul, x, s)
         }
+        UnaryOp::Gelu => {
+            let slope = f32_const(&mut b, GELU_SLOPE);
+            let kx = f32_op2(&mut b, KirOp::Mul, x, slope);
+            let s = sigmoid_of(&mut b, kx);
+            f32_op2(&mut b, KirOp::Mul, x, s)
+        }
         UnaryOp::Clamp => {
             let (lo, hi) = bounds.expect("clamp has bounds");
             let t = f32_op2(&mut b, KirOp::Max, x, lo);
@@ -383,6 +398,7 @@ mod tests {
             (UnaryOp::Log, &["lg2.approx.f32 ", "mul.f32 "][..]),
             (UnaryOp::Sqrt, &["sqrt.rn.f32 "][..]),
             (UnaryOp::Sigmoid, &["neg.f32 ", "ex2.approx.f32 ", "rcp.approx.f32 "][..]),
+            (UnaryOp::Gelu, &["0f3FD9DB23", "neg.f32 ", "ex2.approx.f32 ", "rcp.approx.f32 "][..]),
             (UnaryOp::Sin, &["sin.approx.f32 "][..]),
             (UnaryOp::Cos, &["cos.approx.f32 "][..]),
             (UnaryOp::Sign, &["setp.gt.f32 ", "setp.lt.f32 ", "selp.f32 "][..]),

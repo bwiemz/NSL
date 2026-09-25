@@ -806,6 +806,17 @@ frozen throughout, so nothing here blocks a kernel fix.
     GPU gradient was not the derivative of the GPU forward. Per this spec's
     non-goals, that kernel is fixed in place first, as a member, and moves
     after.
+
+    **`kernels.rs`, GELU** (fifth slice). With the slope fixed in place
+    (`0f3FD9DB23`, 1.702), `nsl_gelu_f32` joins the unary family as
+    `x * sigmoid(k * x)`, `k` = `elementwise::GELU_SLOPE`. The fixture
+    freezes the fixed hand kernel, and the gate adds it to every unary test.
+    Among the nudged constants it catches the slope put back to 1.7. The
+    CPU-lane `gelu_slope_drift` gate in `nsl-runtime` now reads the forward
+    slope from the KIR module and holds it to the hand-written source-AD
+    backward's. Registers are 12/12/11 against the hand kernel's 11/11/10
+    (sm_80/90/120). `nsl_tanh_f32` is the family's last hand kernel, waiting
+    on the approximate-division decision.
 12. **FA v2**, by phase directory, tier B.1 and B.2 last; the SASS
     baselines and the two no-spill gates already exist here and are the
     proof. `matmul_mma.rs` and `kernel_skeleton/` are deleted with their

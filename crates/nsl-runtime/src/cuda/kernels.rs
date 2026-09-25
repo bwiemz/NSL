@@ -44,13 +44,12 @@ pub(crate) fn mul_f32_ptx() -> &'static str {
 
 // The unary family, `c[i] = f(a[i])`, likewise built by
 // `nsl_kir::kernels::elementwise` (its `elementwise_unary_kir_equivalence`
-// gate). `nsl_tanh_f32` (`div.approx.f32`) and `nsl_gelu_f32` (a slope to fix
-// in place first) stay hand-written below.
+// gate). `nsl_tanh_f32` (`div.approx.f32`) stays hand-written below.
 
 use nsl_kir::kernels::elementwise::UnaryOp;
 
 pub(crate) fn unary_module(op: UnaryOp) -> &'static str {
-    static MODULES: std::sync::OnceLock<[String; 12]> = std::sync::OnceLock::new();
+    static MODULES: std::sync::OnceLock<[String; 13]> = std::sync::OnceLock::new();
     let modules = MODULES.get_or_init(|| {
         UnaryOp::ALL.map(|op| {
             String::from_utf8(nsl_kir::kernels::elementwise::unary_ptx(op)).expect("PTX must be ASCII")
@@ -113,6 +112,13 @@ pub(crate) fn cos_f32_ptx() -> &'static str {
 /// `nsl_silu_f32`: `c[i] = a[i] * sigmoid(a[i])`, NUL-terminated.
 pub(crate) fn silu_f32_ptx() -> &'static str {
     unary_module(UnaryOp::Silu)
+}
+
+/// `nsl_gelu_f32`: `c[i] = a[i] * sigmoid(1.702 * a[i])`, NUL-terminated. The
+/// slope is `nsl_kir::kernels::elementwise::GELU_SLOPE`, the one
+/// `GELU_BACKWARD_SRCAD_F32_PTX` differentiates with (`super::gelu_slope_drift`).
+pub(crate) fn gelu_f32_ptx() -> &'static str {
+    unary_module(UnaryOp::Gelu)
 }
 
 /// `nsl_clamp_f32`: `c[i] = min(max(a[i], lo), hi)`, NUL-terminated.
@@ -966,7 +972,7 @@ DONE: ret;\n\
 }\0";
 
 // Source-AD GELU backward (Milestone C · p4 GELU fix). One launch computing the
-// EXACT derivative of the GPU forward `GELU_F32_PTX` (gelu(x) = x·σ(1.702x),
+// EXACT derivative of the GPU forward `nsl_gelu_f32` (gelu(x) = x·σ(1.702x),
 // sigmoid approximation):
 //
 //   kx  = 1.702 * x                 (0f3FD9DB23 = 1.702f, matches nsl_tensor_scalar(1.702,1))
@@ -1725,49 +1731,6 @@ pub(crate) const CLAMP_BACKWARD_F32_PTX: &str = "\
 DONE: ret;\n\
 }\0";
 
-/// gelu(x) = x * sigmoid(1.702 * x)  [sigmoid approximation]
-/// sigmoid(1.702*x) = 1 / (1 + exp(-1.702*x))
-///
-/// The slope is `0f3FD9DB23` (1.702f), the value `GELU_BACKWARD_SRCAD_F32_PTX`
-/// differentiates with; `super::gelu_slope_drift` holds the two together.
-pub(crate) const GELU_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_gelu_f32(\n\
-    .param .u64 a, .param .u64 c, .param .u64 n\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<7>;\n\
-    .reg .f32 %fs<4>;\n\
-    .reg .pred %p1;\n\
-    ld.param.u64 %rd1, [a];\n\
-    ld.param.u64 %rd2, [c];\n\
-    ld.param.u64 %rd3, [n];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd4, %r3;\n\
-    setp.ge.u64 %p1, %rd4, %rd3;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd5, %rd4, 2;\n\
-    add.u64 %rd6, %rd1, %rd5;\n\
-    ld.global.f32 %fs1, [%rd6];\n\
-    mul.f32 %fs2, %fs1, 0f3FD9DB23;\n\
-    neg.f32 %fs3, %fs2;\n\
-    mul.f32 %fs3, %fs3, 0f3FB8AA3B;\n\
-    ex2.approx.f32 %fs3, %fs3;\n\
-    add.f32 %fs3, %fs3, 0f3F800000;\n\
-    rcp.approx.f32 %fs3, %fs3;\n\
-    mul.f32 %fs1, %fs1, %fs3;\n\
-    add.u64 %rd6, %rd2, %rd5;\n\
-    st.global.f32 [%rd6], %fs1;\n\
-DONE: ret;\n\
-}\0";
-
 /// tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
 pub(crate) const TANH_F32_PTX: &str = "\
 .version 7.0\n\
@@ -1840,6 +1803,5 @@ pub(crate) const ALL_PTX: &[(&str, &str)] = &[
     ("FASE_FUSED_ADAMW_STEP_BF16SR_PTX", FASE_FUSED_ADAMW_STEP_BF16SR_PTX),
     ("SR_BF16_ROUND_PROBE_PTX", SR_BF16_ROUND_PROBE_PTX),
     ("CLAMP_BACKWARD_F32_PTX", CLAMP_BACKWARD_F32_PTX),
-    ("GELU_F32_PTX", GELU_F32_PTX),
     ("TANH_F32_PTX", TANH_F32_PTX),
 ];

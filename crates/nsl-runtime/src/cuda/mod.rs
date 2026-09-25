@@ -10274,15 +10274,18 @@ mod dtype_guard_drift {
 /// slope.
 ///
 /// `nsl_gelu_f32` computes `x·σ(k·x)` and `nsl_gelu_backward_srcad_f32`
-/// computes that function's derivative for a `k` of its own. The two are
-/// separate hand-written modules, so nothing but this gate ties their `k`s
-/// together, and they did drift: the forward multiplied by `0f3FD9999A`
+/// computes that function's derivative for a `k` of its own. The forward is
+/// built from KIR (`nsl_kir::kernels::elementwise::GELU_SLOPE`) and the
+/// backward is hand-written, so nothing but this gate ties their `k`s
+/// together, and they did drift once: the forward multiplied by `0f3FD9999A`
 /// (1.7) while the backward, every description of the kernel and the host
 /// references used `0f3FD9DB23` (1.702). The GPU finite-difference test did
 /// not notice; its tolerance is wider than the gap. Like `dtype_guard_drift`,
 /// this reads `kernels.rs` as text so it runs in the CPU lane.
 #[cfg(test)]
 mod gelu_slope_drift {
+    use nsl_kir::kernels::elementwise::{unary_ptx, UnaryOp, GELU_SLOPE};
+
     /// The body of the `const NAME: &str = "…";` item in `source`.
     fn ptx_body<'a>(source: &'a str, name: &str) -> &'a str {
         let head = format!("pub(crate) const {name}: &str = \"");
@@ -10302,14 +10305,17 @@ mod gelu_slope_drift {
     #[test]
     fn the_forward_and_its_backward_scale_by_1_702() {
         let source = include_str!("kernels.rs");
-        let forward = slope(ptx_body(source, "GELU_F32_PTX"), "mul.f32 %fs2, %fs1, 0f");
         let backward = slope(ptx_body(source, "GELU_BACKWARD_SRCAD_F32_PTX"), "mul.rn.f32 %fs2, %fs2, 0f");
         let want = 1.702_f32.to_bits();
         assert!(backward == want, "the backward's slope is 0f{backward:08X}, not 1.702f (0f{want:08X})");
         assert!(
-            forward == backward,
-            "nsl_gelu_f32 scales by 0f{forward:08X}; its backward differentiates 0f{backward:08X}"
+            GELU_SLOPE == backward,
+            "nsl_gelu_f32 scales by 0f{GELU_SLOPE:08X}; its backward differentiates 0f{backward:08X}"
         );
+        // The built module carries the constant, once: the slope is not
+        // folded or respelled on the way to PTX.
+        let forward = String::from_utf8(unary_ptx(UnaryOp::Gelu)).expect("ASCII");
+        assert_eq!(forward.matches(&format!("0f{GELU_SLOPE:08X}")).count(), 1, "{forward}");
     }
 }
 
