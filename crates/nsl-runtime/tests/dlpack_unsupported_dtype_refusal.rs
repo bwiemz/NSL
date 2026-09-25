@@ -145,16 +145,17 @@ const WEIGHTS_ENV: &str = "NSL_DLPACK_REFUSAL_WEIGHTS";
 ///   * `delta` — 64Ki elements (256 KiB), the leak-loop payload: big enough
 ///     that a per-call impl-result leak moves RSS by ~500 MiB over the loop
 ///     while a leak-free path stays flat.
-///   * `memcpy` — the NAME is load-bearing: the reverse-interposition gate.
-///     The artifact's statically-linked runtime references libc `memcpy` on
-///     every dispatch copy. When item 7's first interposition fix
-///     (-Bsymbolic-functions) was in place, every intra-image reference
-///     bound at link time — so this export's wrapper CAPTURED the runtime's
-///     own memcpy calls (pointer-args ABI meets memcpy's semantics: crash or
-///     heap corruption on model create / first dispatch). The codegen fix
-///     (dispatch calls a Linkage::Local sibling; no linker flag) must keep
-///     libc references resolving to libc. `assert_survived` plus the value
-///     check on THIS export is the gate; do not rename it.
+///
+/// There is deliberately NO export named after a C-library function. This
+/// file used to carry `@export fn memcpy` as a "reverse-interposition gate"
+/// — and that export was issue #693: on Mach-O and PE the linker binds the
+/// statically-linked runtime's own `memcpy` calls to a same-image definition,
+/// so every runtime copy ran the export wrapper with `memcpy`'s byte-pointer
+/// source as its `NslTensorDesc*` (a misaligned-deref abort in `call_ok_f32`,
+/// the first scenario to dispatch). Only ELF's load-order interposition let
+/// Linux pass. `nsl build --shared-lib` now REFUSES such names on every
+/// platform (`nsl_codegen::linker::refuse_runtime_symbol_shadowing`), gated
+/// by `nsl-cli/tests/shared_lib_refuses_runtime_symbol_shadowing.rs`.
 const EXPORT_SRC: &str = concat!(
     "\n@export\nfn alpha(x: Tensor<[4], f32>) -> Tensor<[4], f32>:\n    return x * 2.0\n",
     "\n@export\nfn beta(x: Tensor<[4], f32>, y: Tensor<[4], f32>) -> Tensor<[4], f32>:\n",
@@ -162,7 +163,6 @@ const EXPORT_SRC: &str = concat!(
     "\n@export\nfn forward(x: Tensor<[4], f32>) -> Tensor<[4], f32>:\n    return x * 2.0\n",
     "\n@export\nfn gamma(x: Tensor<[4], f32>) -> f64:\n    return 7.5\n",
     "\n@export\nfn delta(x: Tensor<[65536], f32>) -> Tensor<[65536], f32>:\n    return x * 2.0\n",
-    "\n@export\nfn memcpy(x: Tensor<[4], f32>) -> Tensor<[4], f32>:\n    return x * 3.0\n",
     "\n@export\nfn ident(x: Tensor<[4], f32>) -> Tensor<[4], f32>:\n    return x\n",
 );
 
@@ -600,26 +600,6 @@ fn run_model_scenario(scenario: &str) {
                 "CHILD-RESULT rc=0 rss_before={rss_before} rss_after={rss_after} \
                  grown_kb={grown_kb} err="
             );
-        }
-        // Item 7 — reverse-interposition gate: an export named `memcpy`
-        // must not capture the runtime's own libc memcpy calls (see the
-        // EXPORT_SRC docs). Reaching CHILD-RESULT at all is half the gate —
-        // under -Bsymbolic-functions this crashed before or during dispatch.
-        "reverse_interpose" => {
-            let memcpy_name = CString::new("memcpy").unwrap();
-            let mut out_buf: Vec<f32> = vec![0.0; 4];
-            let mut input = desc(fdata.as_mut_ptr() as *mut c_void, shape.as_mut_ptr(), 1);
-            let mut output = desc(out_buf.as_mut_ptr() as *mut c_void, shape_o.as_mut_ptr(), 1);
-            nsl_runtime::c_api::nsl_clear_error();
-            let rc = nsl_runtime::c_api::nsl_model_call(
-                model,
-                memcpy_name.as_ptr() as i64,
-                &mut input as *mut _ as i64,
-                1,
-                &mut output as *mut _ as i64,
-                1,
-            );
-            println!("CHILD-RESULT rc={rc} out={out_buf:?} err={}", last_error());
         }
         // Item 7 — an export returning its INPUT parameter. Three properties
         // in one child, all previously uncovered:
@@ -1346,26 +1326,6 @@ fn dlpack_and_export_wrappers_refuse_unsupported_dtypes_without_killing_the_host
             );
         }
     }
-
-    // ── ITEM-7 GATE: reverse interposition ───────────────────────────────
-    // An export deliberately named `memcpy` — the runtime's dispatch copy
-    // path calls libc memcpy, and a regression toward link-time
-    // self-binding (-Bsymbolic-functions or equivalent) makes that call hit
-    // the export wrapper instead: crash before CHILD-RESULT.
-    let rev = run_child("reverse_interpose", &ctx, false);
-    rev.assert_survived("reverse_interpose");
-    assert_eq!(
-        rev.rc(),
-        0,
-        "the memcpy-named export must dispatch cleanly (its presence must \
-         not disturb the runtime's own libc calls)\n{}",
-        rev.stdout
-    );
-    assert!(
-        rev.stdout.contains("out=[3.0, 6.0, 9.0, 12.0]"),
-        "the memcpy-named export must compute ITS OWN body (x * 3.0), got: {}",
-        rev.stdout
-    );
 
     // ── ITEM-7 GATE: input-aliasing, refcount hygiene, re-arm ────────────
     let alias = run_child("ident_alias", &ctx, false);
