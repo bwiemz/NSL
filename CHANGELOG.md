@@ -8,6 +8,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- The scalar-operand kernels `nsl_mul_scalar_f32`, `nsl_add_scalar_f32` and
+  `nsl_sub_scalar_f32` are built as KIR in `nsl_kir::kernels::elementwise`
+  (`ScalarOp`; roadmap A2 step 11, sixth slice). The runtime builds each on
+  first use (`cuda::kernels::{mul,add,sub}_scalar_f32_ptx()`) in place of the
+  hand-written constants. `tests/elementwise_scalar_kir_equivalence.rs` runs
+  the frozen hand kernels and the KIR ones out of place and in place, over
+  IEEE-corner inputs and eleven scalars. It requires the same bytes and the
+  IEEE result. Registers are the hand kernels' 10 on sm_80/90/120.
+  `nsl_div_scalar_f32` stays hand-written with `nsl_div_f32`
+  (`div.approx.f32`). `nsl_scalar_mul_add_inplace_f32` and
+  `nsl_muon_scale_inv_frob_f32` wait for an explicitly rounded (`.rn`)
+  arithmetic form in KIR, which they need to keep ptxas from fusing their
+  multiply and add.
+
 - `nsl_gelu_f32` is built as KIR in `nsl_kir::kernels::elementwise` (roadmap
   A2 step 11, fifth slice), now that its slope is fixed. It computes
   `x * sigmoid(k * x)` with `k = GELU_SLOPE` (`0f3FD9DB23`, 1.702). The

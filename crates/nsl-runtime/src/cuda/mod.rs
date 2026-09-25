@@ -4066,7 +4066,7 @@ pub(crate) fn gpu_scale_raw_f32(dev: *mut std::ffi::c_void, n: usize, scalar: f3
     let block = 256i64;
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
-        kernels::MUL_SCALAR_F32_PTX.as_ptr(),
+        kernels::mul_scalar_f32_ptx().as_ptr(),
         "nsl_mul_scalar_f32\0".as_ptr(),
         [grid, 1, 1],
         [block, 1, 1],
@@ -10378,8 +10378,8 @@ mod tests {
     /// declared.
     ///
     /// The four precision casts (roadmap A2 step 7), the strided run copy,
-    /// the Tier B.1 pre-passes and the binary and unary elementwise kernels
-    /// (step 11) moved to `nsl_kir::kernels`,
+    /// the Tier B.1 pre-passes and the binary, unary and scalar-operand
+    /// elementwise kernels (step 11) moved to `nsl_kir::kernels`,
     /// so they are no longer `const` and cannot sit in the array above.
     /// They still have to reach both gates: the registry's own comment
     /// records that covering a module in only one of them was
@@ -10399,6 +10399,9 @@ mod tests {
         all.push(("nsl_mul_f32", super::kernels::mul_f32_ptx(), true));
         for op in nsl_kir::kernels::elementwise::UnaryOp::ALL {
             all.push((op.kernel_name(), super::kernels::unary_module(op), true));
+        }
+        for op in nsl_kir::kernels::elementwise::ScalarOp::ALL {
+            all.push((op.kernel_name(), super::kernels::scalar_module(op), true));
         }
         all
     }

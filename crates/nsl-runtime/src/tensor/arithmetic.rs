@@ -629,12 +629,12 @@ pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
             #[cfg(feature = "cuda")]
             {
                 if relinq_a && !autodiff::is_recording() {
-                    crate::cuda::gpu_scalar_op_inplace(a_ptr, s as f32, crate::cuda::kernels::ADD_SCALAR_F32_PTX, "nsl_add_scalar_f32\0");
+                    crate::cuda::gpu_scalar_op_inplace(a_ptr, s as f32, crate::cuda::kernels::add_scalar_f32_ptx(), "nsl_add_scalar_f32\0");
                     // Ownership transfer: relinquished A ref becomes the result ref.
                     super::fbip_record_reuse();
                     return a_ptr;
                 }
-                let result = crate::cuda::gpu_scalar_op(a_ptr, s as f32, crate::cuda::kernels::ADD_SCALAR_F32_PTX, "nsl_add_scalar_f32\0");
+                let result = crate::cuda::gpu_scalar_op(a_ptr, s as f32, crate::cuda::kernels::add_scalar_f32_ptx(), "nsl_add_scalar_f32\0");
                 // Tape record on the GPU arm (see nsl_tensor_add).
                 if autodiff::is_recording() {
                     autodiff::maybe_record(autodiff::TapeOp::AddScalar { a: a_ptr, out: result });
@@ -760,12 +760,12 @@ pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
             #[cfg(feature = "cuda")]
             {
                 if relinq_a && !autodiff::is_recording() {
-                    crate::cuda::gpu_scalar_op_inplace(a_ptr, s as f32, crate::cuda::kernels::MUL_SCALAR_F32_PTX, "nsl_mul_scalar_f32\0");
+                    crate::cuda::gpu_scalar_op_inplace(a_ptr, s as f32, crate::cuda::kernels::mul_scalar_f32_ptx(), "nsl_mul_scalar_f32\0");
                     // Ownership transfer: relinquished A ref becomes the result ref.
                     super::fbip_record_reuse();
                     return a_ptr;
                 }
-                let result = crate::cuda::gpu_scalar_op(a_ptr, s as f32, crate::cuda::kernels::MUL_SCALAR_F32_PTX, "nsl_mul_scalar_f32\0");
+                let result = crate::cuda::gpu_scalar_op(a_ptr, s as f32, crate::cuda::kernels::mul_scalar_f32_ptx(), "nsl_mul_scalar_f32\0");
                 // Tape record on the GPU arm (see nsl_tensor_add).
                 if autodiff::is_recording() {
                     autodiff::maybe_record(autodiff::TapeOp::MulScalar { a: a_ptr, scalar: s, out: result });
@@ -1030,12 +1030,12 @@ pub extern "C" fn nsl_tensor_sub_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
             #[cfg(feature = "cuda")]
             {
                 if relinq_a {
-                    crate::cuda::gpu_scalar_op_inplace(a_ptr, s as f32, crate::cuda::kernels::SUB_SCALAR_F32_PTX, "nsl_sub_scalar_f32\0");
+                    crate::cuda::gpu_scalar_op_inplace(a_ptr, s as f32, crate::cuda::kernels::sub_scalar_f32_ptx(), "nsl_sub_scalar_f32\0");
                     // Ownership transfer: relinquished A ref becomes the result ref.
                     super::fbip_record_reuse();
                     return a_ptr;
                 }
-                let result = crate::cuda::gpu_scalar_op(a_ptr, s as f32, crate::cuda::kernels::SUB_SCALAR_F32_PTX, "nsl_sub_scalar_f32\0");
+                let result = crate::cuda::gpu_scalar_op(a_ptr, s as f32, crate::cuda::kernels::sub_scalar_f32_ptx(), "nsl_sub_scalar_f32\0");
                 if relinq_a { nsl_tensor_free(a_ptr); }
                 return result;
             }
