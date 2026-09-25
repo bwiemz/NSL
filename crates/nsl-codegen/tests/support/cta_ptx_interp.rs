@@ -54,7 +54,10 @@
 //! (`[NAME]`). `div.approx.f32` is modelled as `a / b`, the same as
 //! `div.rn.f32`, like every approximate form. `neg.f32` and `abs.f32` flip
 //! and clear the sign bit (NaN included); `min.f32`, like `max.f32`, returns
-//! the non-NaN operand.
+//! the non-NaN operand. `add.rn`, `sub.rn` and `mul.rn` on f32 are the bare
+//! forms: the interpreter never contracts a multiply into an add, so the
+//! modifier (which exists to stop ptxas doing so) changes nothing here, and
+//! a gate that relies on it pins the spelling itself.
 
 use std::collections::HashMap;
 
@@ -541,7 +544,9 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 let w = if ty.ends_with("64") { W::U64 } else { W::U32 };
                 Op::Selp { w, d: p.dst(ops[0]), a: p.src(ops[1]), b: p.src(ops[2]), p: p.src(ops[3]) }
             }
-            [name @ ("add" | "sub" | "mul" | "max" | "min"), "f32"] | [name @ "div", "rn", "f32"] | [name @ "div", "approx", "f32"] => {
+            [name @ ("add" | "sub" | "mul" | "max" | "min"), "f32"]
+            | [name @ ("add" | "sub" | "mul" | "div"), "rn", "f32"]
+            | [name @ "div", "approx", "f32"] => {
                 want(3);
                 let op = match (*name, parts[1]) {
                     ("add", _) => FOp::Add,

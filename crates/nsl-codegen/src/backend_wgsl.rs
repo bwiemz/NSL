@@ -89,6 +89,10 @@ fn lower_op_to_wgsl(op: &KirOp) -> String {
         KirOp::Add(dst, a, b) => format!("var v{} = v{} + v{};", dst, a, b),
         KirOp::Sub(dst, a, b) => format!("var v{} = v{} - v{};", dst, a, b),
         KirOp::Mul(dst, a, b) => format!("var v{} = v{} * v{};", dst, a, b),
+        // No contraction to block here: the rounded forms lower as the bare ones.
+        KirOp::AddRn(dst, a, b) => format!("var v{} = v{} + v{};", dst, a, b),
+        KirOp::SubRn(dst, a, b) => format!("var v{} = v{} - v{};", dst, a, b),
+        KirOp::MulRn(dst, a, b) => format!("var v{} = v{} * v{};", dst, a, b),
         KirOp::Div(dst, a, b) => format!("var v{} = v{} / v{};", dst, a, b),
         KirOp::Fma(dst, a, b, c) => format!("var v{} = fma(v{}, v{}, v{});", dst, a, b, c),
         KirOp::Neg(dst, a) => format!("var v{} = -v{};", dst, a),
