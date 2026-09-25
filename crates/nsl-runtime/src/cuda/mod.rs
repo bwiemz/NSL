@@ -10319,16 +10319,6 @@ mod tests {
     /// (a non-ASCII byte in a header breaks every kernel that embeds it).
     const EXTRA_RUNTIME_PTX: &[(&str, &str, bool)] = &[
         (
-            "CSHA_TIER_B1_PREPASS_X_PTX",
-            super::tier_b1_prepass::CSHA_TIER_B1_PREPASS_X_PTX,
-            true,
-        ),
-        (
-            "CSHA_TIER_B1_PREPASS_W_PTX",
-            super::tier_b1_prepass::CSHA_TIER_B1_PREPASS_W_PTX,
-            true,
-        ),
-        (
             "HOPPER_PTX_HEADER",
             super::kernels_hopper::HOPPER_PTX_HEADER,
             false,
@@ -10338,10 +10328,11 @@ mod tests {
     /// `EXTRA_RUNTIME_PTX` plus the modules that are built rather than
     /// declared.
     ///
-    /// The four precision casts (roadmap A2 step 7) and the strided run
-    /// copy (step 11) moved to `nsl_kir::kernels`, so they are no longer
-    /// `const` and cannot sit in the array above. They still have to reach both gates: the registry's
-    /// own comment records that covering a module in only one of them was
+    /// The four precision casts (roadmap A2 step 7), the strided run copy
+    /// and the Tier B.1 pre-passes (step 11) moved to `nsl_kir::kernels`,
+    /// so they are no longer `const` and cannot sit in the array above.
+    /// They still have to reach both gates: the registry's own comment
+    /// records that covering a module in only one of them was
     /// the hole that let a whole kernel module ship unassembled. Every
     /// consumer of the registry reads this instead of the array.
     fn extra_runtime_ptx() -> Vec<(&'static str, &'static str, bool)> {
@@ -10351,6 +10342,8 @@ mod tests {
             all.push((kind.kernel_name(), ptx, true));
         }
         all.push(("strided_copy::run_module", super::strided_copy::run_module(), true));
+        all.push(("csha_tier_b1_prepass_x", super::tier_b1_prepass::csha_tier_b1_prepass_x_ptx(), true));
+        all.push(("csha_tier_b1_prepass_w", super::tier_b1_prepass::csha_tier_b1_prepass_w_ptx(), true));
         all
     }
 

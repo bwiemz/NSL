@@ -127,14 +127,12 @@ pub use fused_linear_ce::{
 #[doc(hidden)]
 pub use fused_kl_ce::{nsl_fused_kl_ce_backward, nsl_fused_kl_ce_forward};
 
-// CSHA Tier B.1 pre-pass PTX kernels (exposed for the GPU validation
+// CSHA Tier B.1 pre-pass PTX modules (exposed for the GPU validation
 // tests in `tests/tier_b1_prepass_gpu.rs`; the orchestration FFI uses
 // them internally via `cuda::tier_b1_prepass::launch_*`).
 #[doc(hidden)]
 #[cfg(feature = "cuda")]
-pub use cuda::tier_b1_prepass::{
-    CSHA_TIER_B1_PREPASS_W_PTX, CSHA_TIER_B1_PREPASS_X_PTX,
-};
+pub use cuda::tier_b1_prepass::{csha_tier_b1_prepass_w_ptx, csha_tier_b1_prepass_x_ptx};
 
 // Test-only re-export: SM version query for dispatcher tests.
 #[cfg(feature = "test-hooks")]

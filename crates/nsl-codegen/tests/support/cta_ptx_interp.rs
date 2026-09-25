@@ -46,8 +46,13 @@
 //! Shifts follow PTX: `shl` and the unsigned `shr` take their amount from
 //! the low 32 bits of the operand and produce 0 for an amount at or past
 //! the width, rather than wrapping it as Rust's `<<` would.
-//! `cvt.rn.f32.u32` converts with round-to-nearest (Rust's `as`), and
-//! `cvt.u32.u64` keeps the low 32 bits.
+//! `cvt.rn.f32.u32` and `cvt.rn.f32.u64` convert with round-to-nearest
+//! (Rust's `as`), and `cvt.u32.u64` keeps the low 32 bits.
+//!
+//! A `.shared` block may be declared by element (`.shared .f32 NAME[N]`,
+//! `N` elements) as well as in bytes, and an address may name it directly
+//! (`[NAME]`). `div.approx.f32` is modelled as `a / b`, the same as
+//! `div.rn.f32`, like every approximate form.
 
 use std::collections::HashMap;
 
@@ -78,10 +83,10 @@ pub(crate) enum Src {
     Special(Special),
 }
 
-/// `[reg]` or `[reg+imm]`.
+/// `[reg]`, `[reg+imm]`, or `[symbol]` (a shared block's address).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Addr {
-    pub(crate) base: usize,
+    pub(crate) base: Src,
     pub(crate) offset: u64,
 }
 
@@ -112,6 +117,8 @@ pub(crate) enum FOp {
     Mul,
     Max,
     DivRn,
+    /// `div.approx.f32`, modelled as `a / b` like every approximate form.
+    DivApprox,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -149,6 +156,8 @@ pub(crate) enum Op {
     CvtU32U64 { d: usize, a: Src },
     /// `cvt.rn.f32.u32`: round to nearest.
     CvtF32U32 { d: usize, a: Src },
+    /// `cvt.rn.f32.u64`: round to nearest.
+    CvtF32U64 { d: usize, a: Src },
     CvtF32F16 { d: usize, a: Src },
     /// `cvt.rn.f32.s8`: the low byte, as a signed integer, to f32 (exact).
     CvtF32S8 { d: usize, a: Src },
@@ -282,7 +291,12 @@ impl Parser {
             Some((b, o)) => (b, o.trim().parse::<u64>().expect("address offset")),
             None => (inner, 0),
         };
-        Addr { base: self.reg(base.trim()), offset }
+        let base = base.trim();
+        let base = match self.shared.get(base) {
+            Some(&(addr, _)) => Src::Imm(addr),
+            None => Src::Reg(self.reg(base)),
+        };
+        Addr { base, offset }
     }
 }
 
@@ -313,9 +327,18 @@ pub(crate) fn parse(ptx: &str) -> Program {
     let mut dynamic: Option<(String, usize)> = None;
     for line in ptx.lines().map(str::trim) {
         if let Some(rest) = line.strip_prefix(".shared ") {
-            let decl = rest.split_whitespace().last().expect("a shared symbol");
+            let words: Vec<&str> = rest.split_whitespace().collect();
+            let decl = *words.last().expect("a shared symbol");
             let (name, n) = decl.trim_end_matches(';').trim_end_matches(']').split_once('[').expect("a sized block");
-            let n: usize = n.parse().expect("a static shared size");
+            // `.b8 NAME[bytes]`, or an element-typed `.f32 NAME[count]`.
+            let elem = match words.len().checked_sub(2).map(|i| words[i]) {
+                Some(".b8" | ".u8" | ".s8") | None => 1,
+                Some(".b16" | ".u16" | ".f16") => 2,
+                Some(".f32" | ".u32" | ".b32" | ".s32") => 4,
+                Some(".f64" | ".u64" | ".b64" | ".s64") => 8,
+                Some(other) => panic!("`{line}`: shared element type {other} is not modelled"),
+            };
+            let n: usize = n.parse::<usize>().expect("a static shared size") * elem;
             p.shared.insert(name.to_string(), (SHARED_BASE + shared_bytes as u64, n));
             shared_bytes += n;
         } else if let Some(rest) = line.strip_prefix(".extern .shared ") {
@@ -448,6 +471,10 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 want(2);
                 Op::CvtF32U32 { d: p.dst(ops[0]), a: p.src(ops[1]) }
             }
+            ["cvt", "rn", "f32", "u64"] => {
+                want(2);
+                Op::CvtF32U64 { d: p.dst(ops[0]), a: p.src(ops[1]) }
+            }
             [name @ ("and" | "xor" | "shl"), ty @ ("b32" | "b64")] | [name @ "shr", ty @ ("b32" | "b64" | "u32" | "u64")] => {
                 want(3);
                 let op = match *name {
@@ -508,13 +535,14 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 let w = if ty.ends_with("64") { W::U64 } else { W::U32 };
                 Op::Selp { w, d: p.dst(ops[0]), a: p.src(ops[1]), b: p.src(ops[2]), p: p.src(ops[3]) }
             }
-            [name @ ("add" | "sub" | "mul" | "max"), "f32"] | [name @ "div", "rn", "f32"] => {
+            [name @ ("add" | "sub" | "mul" | "max"), "f32"] | [name @ "div", "rn", "f32"] | [name @ "div", "approx", "f32"] => {
                 want(3);
-                let op = match *name {
-                    "add" => FOp::Add,
-                    "sub" => FOp::Sub,
-                    "mul" => FOp::Mul,
-                    "max" => FOp::Max,
+                let op = match (*name, parts[1]) {
+                    ("add", _) => FOp::Add,
+                    ("sub", _) => FOp::Sub,
+                    ("mul", _) => FOp::Mul,
+                    ("max", _) => FOp::Max,
+                    (_, "approx") => FOp::DivApprox,
                     _ => FOp::DivRn,
                 };
                 Op::F { op, d: p.dst(ops[0]), a: p.src(ops[1]), b: p.src(ops[2]) }
@@ -797,6 +825,10 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
                 let v = rd(t, launch, *a) as u32 as f32;
                 write(t, *d, fb(v));
             }
+            Op::CvtF32U64 { d, a } => {
+                let v = rd(t, launch, *a) as f32;
+                write(t, *d, fb(v));
+            }
             Op::CvtF32F16 { d, a } => {
                 let v = f16::from_bits(rd(t, launch, *a) as u16).to_f32();
                 write(t, *d, fb(v));
@@ -862,7 +894,7 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
                     FOp::Mul => a * b,
                     // PTX `max.f32` returns the non-NaN operand, as Rust's.
                     FOp::Max => a.max(b),
-                    FOp::DivRn => a / b,
+                    FOp::DivRn | FOp::DivApprox => a / b,
                 };
                 write(t, *d, fb(v));
             }
@@ -911,7 +943,7 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
                 write(t, *d, fb(v));
             }
             Op::Ld { space, bytes, d, addr } => {
-                let at = rd(t, launch, Src::Reg(addr.base)).wrapping_add(addr.offset);
+                let at = rd(t, launch, addr.base).wrapping_add(addr.offset);
                 let mem = match space {
                     Space::Global => launch.global(at, *bytes),
                     Space::Shared => launch.shared(at, *bytes),
@@ -921,7 +953,7 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
                 write(t, *d, u64::from_le_bytes(buf));
             }
             Op::LdS8 { space, d, addr } => {
-                let at = rd(t, launch, Src::Reg(addr.base)).wrapping_add(addr.offset);
+                let at = rd(t, launch, addr.base).wrapping_add(addr.offset);
                 let mem = match space {
                     Space::Global => launch.global(at, 1),
                     Space::Shared => launch.shared(at, 1),
@@ -929,7 +961,7 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
                 write(t, *d, mem[0] as i8 as i64 as u64);
             }
             Op::St { space, bytes, addr, v } => {
-                let at = rd(t, launch, Src::Reg(addr.base)).wrapping_add(addr.offset);
+                let at = rd(t, launch, addr.base).wrapping_add(addr.offset);
                 let val = rd(t, launch, *v).to_le_bytes();
                 let mem = match space {
                     Space::Global => launch.global(at, *bytes),
@@ -938,7 +970,7 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
                 mem.copy_from_slice(&val[..*bytes]);
             }
             Op::LdV4 { space, d, addr } => {
-                let at = rd(t, launch, Src::Reg(addr.base)).wrapping_add(addr.offset);
+                let at = rd(t, launch, addr.base).wrapping_add(addr.offset);
                 let mem = match space {
                     Space::Global => launch.global(at, 16),
                     Space::Shared => launch.shared(at, 16),
@@ -950,7 +982,7 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
                 }
             }
             Op::StV4 { space, addr, v } => {
-                let at = rd(t, launch, Src::Reg(addr.base)).wrapping_add(addr.offset);
+                let at = rd(t, launch, addr.base).wrapping_add(addr.offset);
                 let vals: Vec<u64> = v.iter().map(|&s| rd(t, launch, s)).collect();
                 let mem = match space {
                     Space::Global => launch.global(at, 16),
@@ -961,7 +993,7 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
                 }
             }
             Op::RedAddF32 { space, addr, v } => {
-                let at = rd(t, launch, Src::Reg(addr.base)).wrapping_add(addr.offset);
+                let at = rd(t, launch, addr.base).wrapping_add(addr.offset);
                 let add = f(rd(t, launch, *v));
                 let mem = match space {
                     Space::Global => launch.global(at, 4),

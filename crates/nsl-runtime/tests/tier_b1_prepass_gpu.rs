@@ -23,7 +23,7 @@
 
 use nsl_runtime::{
     nsl_cuda_init, nsl_test_cuda_alloc, nsl_test_cuda_d2h, nsl_test_cuda_free,
-    nsl_test_cuda_h2d, CSHA_TIER_B1_PREPASS_W_PTX, CSHA_TIER_B1_PREPASS_X_PTX,
+    nsl_test_cuda_h2d, csha_tier_b1_prepass_w_ptx, csha_tier_b1_prepass_x_ptx,
 };
 
 unsafe extern "C" {
@@ -86,7 +86,7 @@ fn x_prepass_matches_cpu_reference() {
     if !cuda_available() {
         return;
     }
-    let ptx = CSHA_TIER_B1_PREPASS_X_PTX;
+    let ptx = csha_tier_b1_prepass_x_ptx();
     let kernel_name = std::ffi::CString::new("csha_tier_b1_prepass_x").unwrap();
 
     let seq: usize = 32;
@@ -209,7 +209,7 @@ fn w_prepass_matches_cpu_reference() {
     if !cuda_available() {
         return;
     }
-    let ptx = CSHA_TIER_B1_PREPASS_W_PTX;
+    let ptx = csha_tier_b1_prepass_w_ptx();
     let kernel_name = std::ffi::CString::new("csha_tier_b1_prepass_w").unwrap();
 
     let d_model: usize = 2048;

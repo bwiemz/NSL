@@ -373,10 +373,10 @@ every launch for bisecting async bugs.
 `src/cuda/kernels.rs` (elementwise, `.target sm_70`),
 `src/cuda/fused_kernels.rs` (embedding, bias, layernorm, rmsnorm, `sm_80`),
 `fused_ce_kernels.rs` / `fused_kl_ce_kernels.rs` (fused linear-CE and KL-CE
-losses), `tier_b1_prepass.rs`, and `kernels_hopper.rs` (`sm_90a`, wgmma/TMA
-FlashAttention-3). Two families are built rather than embedded: the
-precision casts (`precision_cast_kernels.rs`) and the strided run copy
-(`strided_copy.rs`) are described as KIR in `nsl_kir::kernels` and lowered
+losses), and `kernels_hopper.rs` (`sm_90a`, wgmma/TMA FlashAttention-3).
+Three families are built rather than embedded: the precision casts
+(`precision_cast_kernels.rs`), the strided run copy (`strided_copy.rs`) and
+the CSHA Tier B.1 pre-passes (`tier_b1_prepass.rs`) are described as KIR in `nsl_kir::kernels` and lowered
 once, on first use, into a `OnceLock` whose stable address the module cache
 keys on (roadmap A2 steps 7 and 11). A launch is
 `load_module_once(ptx)` → `get_function(module, name)` →
