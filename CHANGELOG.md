@@ -579,6 +579,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- Calibration and quantization requests that were accepted and never
+  honoured are refused at `nsl check` (first slice of "turn ignored
+  calibration requests into implemented behavior or refusal"). The checks
+  live in `nsl-semantic/src/quant_requests.rs` and `fp8.rs`.
+  - **A `quant` block's `calibration:` section.** Its `data` and `samples`
+    were parsed and never read; the block quantized from the weights alone.
+  - **`quant` block `default: awq4 | gptq4 | gptq8`.** The runtime quantizer
+    implements only int8 and int4, so these programs checked, built, and
+    aborted when the block ran. The refusal points to `int4` or `int8`.
+  - **`@quantize(...)` has a closed argument set.** Only `dtype = "awq4"`,
+    the one value codegen reads, is accepted. `group_size` was logged and
+    unused, and any other dtype, argument name or positional argument was
+    dropped.
+  - **`@fp8_compute(calibrate = true)`.** The flag was never read: FP8
+    scales come from each call's absmax. `@fp8_compute` on functions and
+    model methods, which is where codegen reads it, is now validated too.
+    Before, only layer declarations were.
+
 - `nsl build --shared-lib` refuses an `@export` whose name is a symbol the
   library's statically linked runtime calls by name, such as `memcpy`,
   `pow`, `log` or `exp` (#693). The export is defined in the same image as
