@@ -42,6 +42,38 @@ pub(crate) fn mul_f32_ptx() -> &'static str {
     binary_module(BinaryOp::Mul)
 }
 
+// The scalar-operand family, `c[i] = a[i] op s`, likewise built by
+// `nsl_kir::kernels::elementwise` (its `elementwise_scalar_kir_equivalence`
+// gate). `nsl_div_scalar_f32` (`div.approx.f32`) stays hand-written below.
+
+use nsl_kir::kernels::elementwise::ScalarOp;
+
+pub(crate) fn scalar_module(op: ScalarOp) -> &'static str {
+    static MODULES: std::sync::OnceLock<[String; 3]> = std::sync::OnceLock::new();
+    let modules = MODULES.get_or_init(|| {
+        ScalarOp::ALL.map(|op| {
+            String::from_utf8(nsl_kir::kernels::elementwise::scalar_ptx(op)).expect("PTX must be ASCII")
+        })
+    });
+    let slot = ScalarOp::ALL.iter().position(|o| *o == op).expect("every ScalarOp is in ALL");
+    &modules[slot]
+}
+
+/// `nsl_mul_scalar_f32`: `c[i] = a[i] * s`, NUL-terminated.
+pub(crate) fn mul_scalar_f32_ptx() -> &'static str {
+    scalar_module(ScalarOp::Mul)
+}
+
+/// `nsl_add_scalar_f32`: `c[i] = a[i] + s`, NUL-terminated.
+pub(crate) fn add_scalar_f32_ptx() -> &'static str {
+    scalar_module(ScalarOp::Add)
+}
+
+/// `nsl_sub_scalar_f32`: `c[i] = a[i] - s`, NUL-terminated.
+pub(crate) fn sub_scalar_f32_ptx() -> &'static str {
+    scalar_module(ScalarOp::Sub)
+}
+
 // The unary family, `c[i] = f(a[i])`, likewise built by
 // `nsl_kir::kernels::elementwise` (its `elementwise_unary_kir_equivalence`
 // gate). `nsl_tanh_f32` (`div.approx.f32`) stays hand-written below.
@@ -269,40 +301,6 @@ FIRST_HALF:\n\
 DONE: ret;\n\
 }\0";
 
-// --- Scalar ops ---
-
-pub(crate) const MUL_SCALAR_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_mul_scalar_f32(\n\
-    .param .u64 a, .param .u64 c, .param .f32 s, .param .u64 n\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<7>;\n\
-    .reg .f32 %fs<3>;\n\
-    .reg .pred %p1;\n\
-    ld.param.u64 %rd1, [a];\n\
-    ld.param.u64 %rd2, [c];\n\
-    ld.param.f32 %fs2, [s];\n\
-    ld.param.u64 %rd3, [n];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd4, %r3;\n\
-    setp.ge.u64 %p1, %rd4, %rd3;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd5, %rd4, 2;\n\
-    add.u64 %rd6, %rd1, %rd5;\n\
-    ld.global.f32 %fs1, [%rd6];\n\
-    mul.f32 %fs1, %fs1, %fs2;\n\
-    add.u64 %rd6, %rd2, %rd5;\n\
-    st.global.f32 [%rd6], %fs1;\n\
-DONE: ret;\n\
-}\0";
 
 // P1 Muon items 8+10: scale by the inverse Frobenius norm read from a DEVICE
 // buffer — out[i] = x[i] / (sqrt(stats[3]) + 1e-7). `stats` is the 4-slot
@@ -407,39 +405,6 @@ DONE: ret;\n\
 // The batched f32 path (`BMM_F32_PTX`/`nsl_bmm_f32`) is out of scope per
 // spec §6 and remains unchanged.
 
-pub(crate) const ADD_SCALAR_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_add_scalar_f32(\n\
-    .param .u64 a, .param .u64 c, .param .f32 s, .param .u64 n\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<7>;\n\
-    .reg .f32 %fs<3>;\n\
-    .reg .pred %p1;\n\
-    ld.param.u64 %rd1, [a];\n\
-    ld.param.u64 %rd2, [c];\n\
-    ld.param.f32 %fs2, [s];\n\
-    ld.param.u64 %rd3, [n];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd4, %r3;\n\
-    setp.ge.u64 %p1, %rd4, %rd3;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd5, %rd4, 2;\n\
-    add.u64 %rd6, %rd1, %rd5;\n\
-    ld.global.f32 %fs1, [%rd6];\n\
-    add.f32 %fs1, %fs1, %fs2;\n\
-    add.u64 %rd6, %rd2, %rd5;\n\
-    st.global.f32 [%rd6], %fs1;\n\
-DONE: ret;\n\
-}\0";
-
 // Scalar-RHS div (mfu-fusion C3 scalar sweep): out[i] = a[i] / s, with s a
 // .f32 kernel param so ONE kernel serves every immediate value. Replaces the
 // decomposed Div(x, Constant) chain: scalar CPU tensor + synchronous HtoD +
@@ -484,43 +449,6 @@ pub(crate) const DIV_SCALAR_F32_PTX: &str = "\
 DONE: ret;\n\
 }\0";
 
-// Scalar-RHS sub (mfu-fusion C3 scalar sweep): out[i] = a[i] - s. Same
-// contract as DIV_SCALAR_F32_PTX above; `sub.f32` copied verbatim from
-// the hand-written nsl_sub_f32 (identical-opcode rule; a lone sub has no
-// contraction partner, so bare sub.f32 and sub.rn.f32 are bitwise
-// equivalent here and the baseline's spelling wins).
-pub(crate) const SUB_SCALAR_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_sub_scalar_f32(\n\
-    .param .u64 a, .param .u64 c, .param .f32 s, .param .u64 n\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<7>;\n\
-    .reg .f32 %fs<3>;\n\
-    .reg .pred %p1;\n\
-    ld.param.u64 %rd1, [a];\n\
-    ld.param.u64 %rd2, [c];\n\
-    ld.param.f32 %fs2, [s];\n\
-    ld.param.u64 %rd3, [n];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd4, %r3;\n\
-    setp.ge.u64 %p1, %rd4, %rd3;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd5, %rd4, 2;\n\
-    add.u64 %rd6, %rd1, %rd5;\n\
-    ld.global.f32 %fs1, [%rd6];\n\
-    sub.f32 %fs1, %fs1, %fs2;\n\
-    add.u64 %rd6, %rd2, %rd5;\n\
-    st.global.f32 [%rd6], %fs1;\n\
-DONE: ret;\n\
-}\0";
 
 // --- Backward kernels for activation functions ---
 
@@ -1781,12 +1709,9 @@ pub(crate) const ALL_PTX: &[(&str, &str)] = &[
     ("DIV_F32_PTX", DIV_F32_PTX),
     ("ROTATE_HALF_F32_PTX", ROTATE_HALF_F32_PTX),
     ("ROTATE_HALF_NEG_F32_PTX", ROTATE_HALF_NEG_F32_PTX),
-    ("MUL_SCALAR_F32_PTX", MUL_SCALAR_F32_PTX),
     ("MUON_SCALE_INV_FROB_F32_PTX", MUON_SCALE_INV_FROB_F32_PTX),
     ("SCALAR_MUL_ADD_INPLACE_F32_PTX", SCALAR_MUL_ADD_INPLACE_F32_PTX),
-    ("ADD_SCALAR_F32_PTX", ADD_SCALAR_F32_PTX),
     ("DIV_SCALAR_F32_PTX", DIV_SCALAR_F32_PTX),
-    ("SUB_SCALAR_F32_PTX", SUB_SCALAR_F32_PTX),
     ("RELU_BACKWARD_F32_PTX", RELU_BACKWARD_F32_PTX),
     ("SIGMOID_BACKWARD_F32_PTX", SIGMOID_BACKWARD_F32_PTX),
     ("TANH_BACKWARD_F32_PTX", TANH_BACKWARD_F32_PTX),

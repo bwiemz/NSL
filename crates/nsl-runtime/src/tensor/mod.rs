@@ -2232,7 +2232,7 @@ pub extern "C" fn nsl_tensor_mul_scalar_inplace(tensor_ptr: i64, scalar: f64) {
         crate::cuda::gpu_scalar_op_inplace(
             tensor_ptr,
             scalar as f32,
-            crate::cuda::kernels::MUL_SCALAR_F32_PTX,
+            crate::cuda::kernels::mul_scalar_f32_ptx(),
             "nsl_mul_scalar_f32\0",
         );
         return;

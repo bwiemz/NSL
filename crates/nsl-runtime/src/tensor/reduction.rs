@@ -195,7 +195,7 @@ pub extern "C" fn nsl_tensor_mean_dim(tensor_ptr: i64, dim: i64, keepdim: i64) -
                     super::nsl_tensor_free(c_ptr);
                     // Divide by num_elements using scalar op
                     let inv = 1.0_f32 / num_elements as f32;
-                    crate::cuda::gpu_scalar_op_inplace(sum_ptr, inv, crate::cuda::kernels::MUL_SCALAR_F32_PTX, "nsl_mul_scalar_f32\0");
+                    crate::cuda::gpu_scalar_op_inplace(sum_ptr, inv, crate::cuda::kernels::mul_scalar_f32_ptx(), "nsl_mul_scalar_f32\0");
                     if autodiff::is_recording() {
                         autodiff::maybe_record(autodiff::TapeOp::MeanReduce {
                             a: tensor_ptr, out: sum_ptr, dim: -1, keepdim: false,
@@ -212,7 +212,7 @@ pub extern "C" fn nsl_tensor_mean_dim(tensor_ptr: i64, dim: i64, keepdim: i64) -
                 super::nsl_tensor_free(c_ptr);
                 // Divide by dim_size using scalar op
                 let inv = 1.0_f32 / dim_size as f32;
-                crate::cuda::gpu_scalar_op_inplace(sum_ptr, inv, crate::cuda::kernels::MUL_SCALAR_F32_PTX, "nsl_mul_scalar_f32\0");
+                crate::cuda::gpu_scalar_op_inplace(sum_ptr, inv, crate::cuda::kernels::mul_scalar_f32_ptx(), "nsl_mul_scalar_f32\0");
                 if autodiff::is_recording() {
                     autodiff::maybe_record(autodiff::TapeOp::MeanReduce {
                         a: tensor_ptr, out: sum_ptr, dim, keepdim: keepdim_bool,

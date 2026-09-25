@@ -165,7 +165,7 @@ pub extern "C" fn nsl_tensor_reduce_mean_deterministic(input: i64, dim: i64, kee
                 let inv = 1.0_f32 / num_elements as f32;
                 crate::cuda::gpu_scalar_op_inplace(
                     sum_ptr, inv,
-                    crate::cuda::kernels::MUL_SCALAR_F32_PTX, "nsl_mul_scalar_f32\0",
+                    crate::cuda::kernels::mul_scalar_f32_ptx(), "nsl_mul_scalar_f32\0",
                 );
                 return sum_ptr;
             }
@@ -179,7 +179,7 @@ pub extern "C" fn nsl_tensor_reduce_mean_deterministic(input: i64, dim: i64, kee
             let inv = 1.0_f32 / dim_size as f32;
             crate::cuda::gpu_scalar_op_inplace(
                 sum_ptr, inv,
-                crate::cuda::kernels::MUL_SCALAR_F32_PTX, "nsl_mul_scalar_f32\0",
+                crate::cuda::kernels::mul_scalar_f32_ptx(), "nsl_mul_scalar_f32\0",
             );
             return sum_ptr;
         }

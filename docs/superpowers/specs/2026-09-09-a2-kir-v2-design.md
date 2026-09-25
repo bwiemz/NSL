@@ -817,6 +817,25 @@ frozen throughout, so nothing here blocks a kernel fix.
     backward's. Registers are 12/12/11 against the hand kernel's 11/11/10
     (sm_80/90/120). `nsl_tanh_f32` is the family's last hand kernel, waiting
     on the approximate-division decision.
+
+    **`kernels.rs`, the scalar-operand family** (sixth slice).
+    `nsl_{mul,add,sub}_scalar_f32` (`c[i] = a[i] op s`, `s` an `.f32`
+    parameter) are the binary kernels with the second load replaced by the
+    parameter, built as `elementwise::ScalarOp`. The gate runs them over
+    IEEE-corner inputs and eleven scalars, from signed zeros through a
+    subnormal and the extremes to both infinities and a NaN, out of place
+    and in place. It requires the hand kernels' bytes and the IEEE result,
+    and catches the relaxed bound, both element sizes, the subtraction's
+    operands swapped, a neighbour's operation and the block index read as
+    0. Registers are the hand kernels' 10 on sm_80/90/120.
+    `nsl_div_scalar_f32` waits with `nsl_div_f32`. Two kernels that look
+    like this family do not move yet: `nsl_scalar_mul_add_inplace_f32` and
+    `nsl_muon_scale_inv_frob_f32` spell their arithmetic `mul.rn` /
+    `add.rn` precisely so ptxas cannot contract a multiply feeding an add
+    into one `fma`, and KIR's `Add`/`Mul` print the bare, contractible
+    form. They need an explicitly rounded arithmetic form in KIR first, as
+    do the source-AD backward and FASE AdamW kernels that use the same
+    spelling.
 12. **FA v2**, by phase directory, tier B.1 and B.2 last; the SASS
     baselines and the two no-spill gates already exist here and are the
     proof. `matmul_mma.rs` and `kernel_skeleton/` are deleted with their
