@@ -46,7 +46,7 @@ use crate::memory::{checked_alloc, checked_alloc_zeroed};
 
 use super::{
     bf16_bits_to_f32, f16_bits_to_f32, f32_to_bf16_bits, f32_to_f16_bits, NslTensor, DTYPE_BF16,
-    DTYPE_F32, DTYPE_FP16,
+    DTYPE_F32, DTYPE_F64, DTYPE_FP16,
 };
 
 /// Cast a tensor to `target_dtype`, returning a NEW owned tensor.
@@ -1615,6 +1615,389 @@ mod tests {
             crate::tensor::nsl_tensor_free(host);
             crate::tensor::nsl_tensor_free(theta);
             crate::tensor::nsl_tensor_free(cpu);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `.to(dtype)`: the user-facing conversion (dtype-semantics design, step 1)
+// ---------------------------------------------------------------------------
+
+/// The dtypes `.to(dtype)` converts between.
+fn is_convertible_float(dtype: u16) -> bool {
+    matches!(dtype, DTYPE_F64 | DTYPE_F32 | DTYPE_FP16 | DTYPE_BF16)
+}
+
+/// `v` rounded to f32 **to odd**: truncated toward zero, with the last bit
+/// set when the truncation was inexact. Rounding this to any format with at
+/// least two fewer significand bits (f16: 11, bf16: 8, against f32's 24)
+/// gives the same result as rounding `v` directly, so f64 -> f16/bf16 through
+/// it rounds once. `half`'s `from_f64` does not: it rounds to f32 to nearest
+/// first, and a value just above an f16 tie can land on the tie and then round
+/// down (`to_dtype_tests::narrowing_rounds_once_from_the_exact_value`).
+fn f64_to_f32_round_to_odd(v: f64) -> f32 {
+    let t = v as f32;
+    if v.is_nan() || v.is_infinite() || t as f64 == v {
+        return t;
+    }
+    let mut bits = t.to_bits();
+    if t.is_infinite() || (t as f64).abs() > v.abs() {
+        // Round-to-nearest went away from zero: step back one ulp.
+        bits -= 1;
+    }
+    f32::from_bits(bits | 1)
+}
+
+fn f64_to_f16_bits(v: f64) -> u16 {
+    half::f16::from_f32(f64_to_f32_round_to_odd(v)).to_bits()
+}
+
+fn f64_to_bf16_bits(v: f64) -> u16 {
+    half::bf16::from_f32(f64_to_f32_round_to_odd(v)).to_bits()
+}
+
+/// `t` (host, contiguous, one of the convertible dtypes) as a new host
+/// tensor of `target`. Widening is exact; every narrowing rounds to nearest,
+/// ties to even, once, from the exact source value.
+fn host_convert(t: &NslTensor, target: u16) -> i64 {
+    let len = t.len as usize;
+    let src: Vec<f64> = unsafe {
+        match t.dtype {
+            DTYPE_F64 => std::slice::from_raw_parts(t.data as *const f64, len).to_vec(),
+            DTYPE_F32 => std::slice::from_raw_parts(t.data as *const f32, len).iter().map(|&v| v as f64).collect(),
+            DTYPE_FP16 => std::slice::from_raw_parts(t.data as *const u16, len)
+                .iter()
+                .map(|&b| half::f16::from_bits(b).to_f64())
+                .collect(),
+            DTYPE_BF16 => std::slice::from_raw_parts(t.data as *const u16, len)
+                .iter()
+                .map(|&b| half::bf16::from_bits(b).to_f64())
+                .collect(),
+            other => crate::fatal::unsupported_dtype("nsl_tensor_to_dtype (source)", other),
+        }
+    };
+    let data: *mut c_void = match target {
+        DTYPE_F64 => {
+            let p = checked_alloc(len * std::mem::size_of::<f64>()) as *mut f64;
+            for (i, &v) in src.iter().enumerate() {
+                unsafe { *p.add(i) = v };
+            }
+            p as *mut c_void
+        }
+        DTYPE_F32 => {
+            let p = checked_alloc(len * std::mem::size_of::<f32>()) as *mut f32;
+            for (i, &v) in src.iter().enumerate() {
+                unsafe { *p.add(i) = v as f32 };
+            }
+            p as *mut c_void
+        }
+        DTYPE_FP16 => {
+            let p = checked_alloc(len * std::mem::size_of::<u16>()) as *mut u16;
+            for (i, &v) in src.iter().enumerate() {
+                unsafe { *p.add(i) = f64_to_f16_bits(v) };
+            }
+            p as *mut c_void
+        }
+        DTYPE_BF16 => {
+            let p = checked_alloc(len * std::mem::size_of::<u16>()) as *mut u16;
+            for (i, &v) in src.iter().enumerate() {
+                unsafe { *p.add(i) = f64_to_bf16_bits(v) };
+            }
+            p as *mut c_void
+        }
+        other => crate::fatal::unsupported_dtype("nsl_tensor_to_dtype (target)", other),
+    };
+    let shape = NslTensor::copy_shape(t.shape, t.ndim);
+    let strides = NslTensor::compute_strides(shape, t.ndim);
+    NslTensor::publish(Box::new(NslTensor::new(data, shape, strides, t.ndim, t.len, 0, target, 1, 0)))
+}
+
+/// The conversion without a tape record, for `nsl_tensor_to_dtype` and for
+/// the backward of `TapeOp::Cast`. `src` has one of the convertible dtypes
+/// and differs from `target`.
+pub(crate) fn convert_untaped(src_ptr: i64, target: u16) -> i64 {
+    let c = crate::tensor::nsl_tensor_contiguous(src_ptr);
+    let t = NslTensor::from_ptr_ref(c);
+    let out = if t.device > 0 {
+        if t.dtype == DTYPE_F64 || target == DTYPE_F64 {
+            crate::fatal::die(
+                crate::fatal::Fatal::UnsupportedDtype,
+                "`.to(f64)` on a GPU tensor: f64 is not a GPU dtype (every GPU kernel computes in f32). \
+                 Move the tensor to the CPU first, or keep it f32",
+            );
+        }
+        if t.len == 0 {
+            crate::fatal::die(crate::fatal::Fatal::UnsupportedDtype, "`.to(dtype)` of an empty GPU tensor is not supported");
+        }
+        if t.dtype != DTYPE_F32 && target != DTYPE_F32 {
+            // fp16 <-> bf16 has no single kernel: stage through f32.
+            let wide = gpu_cast_and_publish(t, DTYPE_F32);
+            let out = gpu_cast_and_publish(NslTensor::from_ptr_ref(wide), target);
+            crate::tensor::nsl_tensor_free(wide);
+            out
+        } else {
+            gpu_cast_and_publish(t, target)
+        }
+    } else {
+        host_convert(t, target)
+    };
+    crate::tensor::nsl_tensor_free(c);
+    out
+}
+
+/// `tensor.to(dtype)` for a standard dtype tag (`f64`, `f32`, `fp16`,
+/// `bf16`): a converted copy on the same device. The source is not
+/// consumed.
+///
+/// Until this existed, `.to(f32)`/`.to(f64)` on a standard-dtype tensor
+/// compiled to `nsl_tensor_from_custom_dtype`, which returns its input
+/// unchanged, so the conversion the GPU refusals tell users to write did
+/// nothing. Now:
+/// - the same dtype returns the source handle, as before (no copy);
+/// - a custom (BYOD) dtype unpacks, then converts, so `.to(f32)` of a
+///   packed tensor is f32 (the unpack alone produced f64);
+/// - f32/f64/fp16/bf16 convert on the host with one round-to-nearest-even
+///   rounding, and f32/fp16/bf16 on the GPU through the PTX cast kernels;
+///   f64 on a GPU tensor is refused (no GPU kernel computes in f64);
+/// - under a recording tape the conversion is recorded (`TapeOp::Cast`), and
+///   the gradient flows back converted to the source's dtype.
+#[unsafe(no_mangle)]
+pub extern "C" fn nsl_tensor_to_dtype(src_ptr: i64, target_dtype: i64) -> i64 {
+    let target = target_dtype as u16;
+    if !is_convertible_float(target) {
+        crate::fatal::unsupported_dtype("nsl_tensor_to_dtype (target)", target);
+    }
+    let t = NslTensor::from_ptr_ref(src_ptr);
+    if t.dtype >= super::DTYPE_CUSTOM_START {
+        let unpacked = super::nsl_tensor_from_custom_dtype(src_ptr);
+        if NslTensor::from_ptr_ref(unpacked).dtype == target {
+            return unpacked;
+        }
+        let out = convert_untaped(unpacked, target);
+        crate::tensor::nsl_tensor_free(unpacked);
+        return out;
+    }
+    if t.dtype == target {
+        return src_ptr;
+    }
+    if !is_convertible_float(t.dtype) {
+        crate::fatal::unsupported_dtype("nsl_tensor_to_dtype (source)", t.dtype);
+    }
+    let src_dtype = t.dtype;
+    let out = convert_untaped(src_ptr, target);
+    if crate::autodiff::is_recording() {
+        crate::autodiff::maybe_record(crate::autodiff::TapeOp::Cast { a: src_ptr, out, src_dtype });
+    }
+    out
+}
+
+#[cfg(test)]
+mod to_dtype_tests {
+    use super::*;
+    use crate::tensor::nsl_tensor_free;
+
+    fn host(dtype: u16, bits: &[u64]) -> i64 {
+        let t = crate::cpu::create_tensor_with_shape_rs_dtype(&[bits.len() as i64], dtype);
+        let r = NslTensor::from_ptr(t);
+        for (i, &b) in bits.iter().enumerate() {
+            unsafe {
+                match dtype {
+                    DTYPE_F64 => *(r.data as *mut u64).add(i) = b,
+                    DTYPE_F32 => *(r.data as *mut u32).add(i) = b as u32,
+                    _ => *(r.data as *mut u16).add(i) = b as u16,
+                }
+            }
+        }
+        t
+    }
+
+    fn bits(t: i64) -> (u16, Vec<u64>) {
+        let r = NslTensor::from_ptr_ref(t);
+        let v = (0..r.len as usize)
+            .map(|i| unsafe {
+                match r.dtype {
+                    DTYPE_F64 => *(r.data as *const u64).add(i),
+                    DTYPE_F32 => *(r.data as *const u32).add(i) as u64,
+                    _ => *(r.data as *const u16).add(i) as u64,
+                }
+            })
+            .collect();
+        (r.dtype, v)
+    }
+
+    /// IEEE corners as f64: zeros, the extremes, subnormals, NaN, and values
+    /// that sit exactly between two representable f32/f16/bf16 neighbours.
+    fn corners() -> Vec<f64> {
+        vec![
+            0.0,
+            -0.0,
+            1.0,
+            -2.5,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX,
+            f64::MIN_POSITIVE,
+            5e-324,
+            1.0 + f64::EPSILON,
+            1.0 + 2f64.powi(-24),          // f32 tie: rounds to even (1.0)
+            1.0 + 3.0 * 2f64.powi(-24),    // f32 tie: rounds up to even
+            1.0 + 2f64.powi(-11),          // f16 tie
+            1.0 + 2f64.powi(-8),           // bf16 tie
+            65520.0,                       // f16 overflow to inf (tie at max)
+            3.4e38,
+            1e-40,                         // f32 subnormal
+            6e-8,                          // f16 subnormal
+            123456.789,
+        ]
+    }
+
+    /// The 16-bit pattern nearest `v` (ties to an even pattern), found by
+    /// exhaustive search over every finite value of the format: a reference
+    /// independent of any conversion routine. Overflow is judged the IEEE
+    /// way: `v` rounds to infinity when it is at least the largest finite
+    /// value plus half an ulp.
+    fn nearest16(v: f64, decode: fn(u16) -> f64, inf: u16) -> u16 {
+        if v.is_nan() {
+            return 0x7FFF;
+        }
+        let mut best: Option<(f64, u16)> = None;
+        let mut max_finite = 0.0f64;
+        for b in 0..=u16::MAX {
+            let x = decode(b);
+            if !x.is_finite() {
+                continue;
+            }
+            max_finite = max_finite.max(x);
+            let d = (x - v).abs();
+            let better = match best {
+                None => true,
+                Some((bd, bb)) => d < bd || (d == bd && (b & 1) == 0 && (bb & 1) == 1)
+                    || (d == bd && x == 0.0 && v.is_sign_negative() == (b >> 15 == 1)),
+            };
+            if better {
+                best = Some((d, b));
+            }
+        }
+        let (_, b) = best.unwrap();
+        // One ulp at the top of the range, for the overflow threshold.
+        let below_max = decode(inf - 1) - decode(inf - 2);
+        if v.abs() >= max_finite + below_max / 2.0 {
+            return inf | if v < 0.0 { 0x8000 } else { 0 };
+        }
+        b
+    }
+
+    /// Every pair converts to the correctly rounded value of the source,
+    /// bit for bit, including through f64 (no double rounding).
+    #[test]
+    fn every_pair_converts_to_the_correctly_rounded_value() {
+        let dtypes = [DTYPE_F64, DTYPE_F32, DTYPE_FP16, DTYPE_BF16];
+        let encode = |d: u16, v: f64| -> u64 {
+            match d {
+                DTYPE_F64 => v.to_bits(),
+                DTYPE_F32 => (v as f32).to_bits() as u64,
+                DTYPE_FP16 => nearest16(v, |b| half::f16::from_bits(b).to_f64(), 0x7C00) as u64,
+                _ => nearest16(v, |b| half::bf16::from_bits(b).to_f64(), 0x7F80) as u64,
+            }
+        };
+        let decode = |d: u16, b: u64| -> f64 {
+            match d {
+                DTYPE_F64 => f64::from_bits(b),
+                DTYPE_F32 => f32::from_bits(b as u32) as f64,
+                DTYPE_FP16 => half::f16::from_bits(b as u16).to_f64(),
+                _ => half::bf16::from_bits(b as u16).to_f64(),
+            }
+        };
+        for &from in &dtypes {
+            // The source values are the corners as representable in `from`.
+            let src_bits: Vec<u64> = corners().iter().map(|&v| encode(from, v)).collect();
+            for &to in &dtypes {
+                let a = host(from, &src_bits);
+                let out = nsl_tensor_to_dtype(a, to as i64);
+                let (dtype, got) = bits(out);
+                assert_eq!(dtype, to, "{from} -> {to}");
+                for (i, (&g, &s)) in got.iter().zip(&src_bits).enumerate() {
+                    let want = encode(to, decode(from, s));
+                    let nan = decode(to, g).is_nan() && decode(to, want).is_nan();
+                    assert!(g == want || nan, "{from} -> {to} [{i}]: {g:#x} vs {want:#x}");
+                }
+                if out != a {
+                    nsl_tensor_free(out);
+                }
+                nsl_tensor_free(a);
+            }
+        }
+    }
+
+    #[test]
+    fn narrowing_rounds_once_from_the_exact_value() {
+        // 1 + 2^-11 + 2^-40 is just above an f16 tie. Rounding to f32 first
+        // lands exactly on the tie (the 2^-40 is lost), and the tie then
+        // rounds to even (down); the correctly rounded f16 is the upper
+        // neighbour.
+        let v = 1.0 + 2f64.powi(-11) + 2f64.powi(-40);
+        let a = host(DTYPE_F64, &[v.to_bits()]);
+        let out = nsl_tensor_to_dtype(a, DTYPE_FP16 as i64);
+        let (_, got) = bits(out);
+        assert_eq!(got[0] as u16, 0x3C01, "1 + 2^-10, the upper neighbour");
+        assert_eq!(half::f16::from_f32(v as f32).to_bits(), 0x3C00, "through f32 the tie rounds down");
+        // The bf16 twin: 1 + 2^-8 + 2^-40 is just above a bf16 tie.
+        let w = 1.0 + 2f64.powi(-8) + 2f64.powi(-40);
+        let b = host(DTYPE_F64, &[w.to_bits()]);
+        let out_b = nsl_tensor_to_dtype(b, DTYPE_BF16 as i64);
+        assert_eq!(bits(out_b).1[0] as u16, 0x3F81, "1 + 2^-7, the upper neighbour");
+        nsl_tensor_free(out_b);
+        nsl_tensor_free(b);
+        nsl_tensor_free(out);
+        nsl_tensor_free(a);
+    }
+
+    /// The cast is on the tape: d(sum(x.to(f64) * x.to(f64)))/dx = 2x,
+    /// arriving in x's own dtype (f32), which it could not while `.to()`
+    /// was the identity and would not if the cast were unrecorded.
+    #[test]
+    fn the_gradient_flows_back_through_the_cast() {
+        let xs = [1.5f32, -2.0, 0.25];
+        let x = host(DTYPE_F32, &xs.iter().map(|v| v.to_bits() as u64).collect::<Vec<_>>());
+        let params = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(params, x);
+        crate::autodiff::nsl_tape_start(params);
+        let y = nsl_tensor_to_dtype(x, DTYPE_F64 as i64);
+        assert_eq!(NslTensor::from_ptr_ref(y).dtype, DTYPE_F64);
+        let sq = crate::tensor::nsl_tensor_mul(y, y, 0);
+        let loss = crate::tensor::nsl_tensor_sum(sq);
+        let grads = crate::autodiff::nsl_tape_backward(loss, params);
+        crate::autodiff::nsl_tape_stop();
+        let g = crate::list::nsl_list_get(grads, 0);
+        let (dtype, got) = bits(g);
+        assert_eq!(dtype, DTYPE_F32, "the gradient is in the parameter's dtype");
+        let got: Vec<f32> = got.iter().map(|&b| f32::from_bits(b as u32)).collect();
+        assert_eq!(got, xs.iter().map(|v| 2.0 * v).collect::<Vec<_>>());
+        nsl_tensor_free(g);
+        crate::list::nsl_list_free(grads);
+        crate::list::nsl_list_free(params);
+    }
+
+    #[test]
+    fn the_same_dtype_is_the_same_handle() {
+        let a = host(DTYPE_F32, &[1.0f32.to_bits() as u64]);
+        assert_eq!(nsl_tensor_to_dtype(a, DTYPE_F32 as i64), a);
+        nsl_tensor_free(a);
+    }
+
+    #[test]
+    fn a_strided_view_converts_in_index_order() {
+        let base = crate::cpu::create_tensor_with_shape_rs_dtype(&[2, 3], DTYPE_F32);
+        let r = NslTensor::from_ptr(base);
+        for i in 0..6 {
+            unsafe { *r.data_f32().add(i) = i as f32 };
+        }
+        let view = crate::tensor::nsl_tensor_transpose(base, 0, 1);
+        let out = nsl_tensor_to_dtype(view, DTYPE_F64 as i64);
+        let got: Vec<f64> = bits(out).1.iter().map(|&b| f64::from_bits(b)).collect();
+        assert_eq!(got, vec![0.0, 3.0, 1.0, 4.0, 2.0, 5.0]);
+        for t in [out, view, base] {
+            nsl_tensor_free(t);
         }
     }
 }
