@@ -4183,7 +4183,7 @@ pub(crate) fn gpu_scalar_mul_add_inplace_f32(m_ptr: i64, g_ptr: i64, scale: f32)
     let block = 256i64;
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
-        kernels::SCALAR_MUL_ADD_INPLACE_F32_PTX.as_ptr(),
+        kernels::scalar_mul_add_inplace_f32_ptx().as_ptr(),
         b"nsl_scalar_mul_add_inplace_f32\0".as_ptr(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
@@ -7448,7 +7448,6 @@ pub(crate) fn gpu_cross_entropy_backward_f32(
 pub(crate) fn gpu_muon_frobenius_scale_f32(a_ptr: i64) -> i64 {
     use crate::tensor::NslTensor;
     use fused_kernels::TENSOR_STATS_F32_PTX;
-    use kernels::MUON_SCALE_INV_FROB_F32_PTX;
 
     inner::set_oom_context("muon_frobenius_scale_f32");
     let a = NslTensor::from_ptr_ref(a_ptr);
@@ -7529,7 +7528,7 @@ pub(crate) fn gpu_muon_frobenius_scale_f32(a_ptr: i64) -> i64 {
     let block = 256i64;
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
-        MUON_SCALE_INV_FROB_F32_PTX.as_ptr(),
+        kernels::muon_scale_inv_frob_f32_ptx().as_ptr(),
         b"nsl_muon_scale_inv_frob_f32\0".as_ptr(),
         [grid, 1, 1], [block, 1, 1], &scale_args, 0,
     );
@@ -10378,8 +10377,9 @@ mod tests {
     /// declared.
     ///
     /// The four precision casts (roadmap A2 step 7), the strided run copy,
-    /// the Tier B.1 pre-passes and the binary, unary and scalar-operand
-    /// elementwise kernels (step 11) moved to `nsl_kir::kernels`,
+    /// the Tier B.1 pre-passes, the binary, unary and scalar-operand
+    /// elementwise kernels, the scaled accumulate and Muon's inverse-norm
+    /// scale (step 11) moved to `nsl_kir::kernels`,
     /// so they are no longer `const` and cannot sit in the array above.
     /// They still have to reach both gates: the registry's own comment
     /// records that covering a module in only one of them was
@@ -10403,6 +10403,8 @@ mod tests {
         for op in nsl_kir::kernels::elementwise::ScalarOp::ALL {
             all.push((op.kernel_name(), super::kernels::scalar_module(op), true));
         }
+        all.push(("nsl_scalar_mul_add_inplace_f32", super::kernels::scalar_mul_add_inplace_f32_ptx(), true));
+        all.push(("nsl_muon_scale_inv_frob_f32", super::kernels::muon_scale_inv_frob_f32_ptx(), true));
         all
     }
 

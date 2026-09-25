@@ -386,6 +386,25 @@ fn emit_op(ptx: &mut String, op: &KirOp, ir: &KernelIR) {
             )
             .unwrap();
         }
+        KirOp::AddRn(dst, a, b) | KirOp::SubRn(dst, a, b) | KirOp::MulRn(dst, a, b) => {
+            // The verifier holds these to f32/f64, where `.rn` is the IEEE
+            // rounding the bare form already has; spelling it out is what
+            // keeps ptxas from contracting a `mul` and the `add` that reads
+            // it into one `fma`.
+            let name = match op {
+                KirOp::AddRn(..) => "add",
+                KirOp::SubRn(..) => "sub",
+                _ => "mul",
+            };
+            let ty = var_ptx_type(ir, *dst, *a);
+            let prefix = var_reg_prefix(ir, *dst, *a);
+            writeln!(
+                ptx,
+                "    {}.rn.{} {}{}, {}{}, {}{};",
+                name, ty, prefix, dst, prefix, a, prefix, b
+            )
+            .unwrap();
+        }
         KirOp::Div(dst, a, b) => {
             let ty = var_ptx_type(ir, *dst, *a);
             let prefix = var_reg_prefix(ir, *dst, *a);
@@ -2418,6 +2437,41 @@ mod tests {
         assert!(ptx.contains(&format!("mul.lo.u32 {}, {}, {};", alloc.name(im), alloc.name(i), alloc.name(i))), "{ptx}");
         assert!(ptx.contains(&format!("div.u32 {}, {}, {};", alloc.name(id), alloc.name(im), alloc.name(i))), "{ptx}");
         assert!(!ptx.contains("mul.lo.f32") && !ptx.contains("div.f32 "), "{ptx}");
+    }
+
+    /// The explicitly rounded forms print `.rn`, for f32 and f64, and the
+    /// bare forms stay bare: the modifier is what stops ptxas contracting a
+    /// multiply and the add that reads it into one `fma`.
+    #[test]
+    fn rounded_arithmetic_spells_rn() {
+        for (ty, value, suffix) in [
+            (KirType::F32, ConstValue::F32(2.0), "f32"),
+            (KirType::F64, ConstValue::F64(2.0), "f64"),
+        ] {
+            let mut b = KirBuilder::new("rn");
+            let entry = b.new_block();
+            b.set_block(entry);
+            let x = b.new_typed_var(ty.clone());
+            b.emit(KirOp::Const(x, KirConst { ty: ty.clone(), value }));
+            let m = b.new_typed_var(ty.clone());
+            b.emit(KirOp::MulRn(m, x, x));
+            let a = b.new_typed_var(ty.clone());
+            b.emit(KirOp::AddRn(a, m, x));
+            let s = b.new_typed_var(ty.clone());
+            b.emit(KirOp::SubRn(s, a, m));
+            let bare = b.new_typed_var(ty);
+            b.emit(KirOp::Add(bare, s, x));
+            b.terminate(KirTerminator::Return);
+            let ir = b.finalize();
+            crate::kir_verify::verify(&ir).expect("verifies");
+            let ptx = String::from_utf8(lower_kir_to_ptx(&ir)).unwrap();
+            let al = crate::regalloc::allocate(&ir);
+            let n = |v| al.name(v);
+            assert!(ptx.contains(&format!("mul.rn.{suffix} {}, {}, {};", n(m), n(x), n(x))), "{ptx}");
+            assert!(ptx.contains(&format!("add.rn.{suffix} {}, {}, {};", n(a), n(m), n(x))), "{ptx}");
+            assert!(ptx.contains(&format!("sub.rn.{suffix} {}, {}, {};", n(s), n(a), n(m))), "{ptx}");
+            assert!(ptx.contains(&format!("add.{suffix} {}, {}, {};", n(bare), n(s), n(x))), "{ptx}");
+        }
     }
     /// Every register a kernel READS must be one the kernel DEFINES.
     ///

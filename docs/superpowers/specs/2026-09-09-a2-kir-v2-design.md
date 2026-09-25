@@ -836,6 +836,30 @@ frozen throughout, so nothing here blocks a kernel fix.
     form. They need an explicitly rounded arithmetic form in KIR first, as
     do the source-AD backward and FASE AdamW kernels that use the same
     spelling.
+
+    **KIR's explicitly rounded arithmetic, and its first two users**
+    (seventh slice). `KirOp::{AddRn, SubRn, MulRn}` are `Add`/`Sub`/`Mul`
+    on `f32`/`f64` printed with `.rn`. They compute the same IEEE result,
+    but ptxas never contracts a `.rn` multiply and the add that reads it
+    into one `fma`, so each operation rounds on its own, as it would through
+    memory. The verifier holds them to homogeneous float types (a new
+    `RoundedArithNotFloat`). The metal/wgsl/amdgpu backends lower them as
+    the bare forms, and the interpreter treats them as the bare forms,
+    since it never contracts. With them `nsl_scalar_mul_add_inplace_f32`
+    (`m[i] += g[i] * s`, bit-exact with a scalar multiply then an add) and
+    `nsl_muon_scale_inv_frob_f32` (`c[i] = x[i] * (1 / (sqrt(stats[3]) +
+    1e-7))`) move, in the hand kernels' instruction order. Their gate
+    requires the hand kernels' bytes and the formula with every operation
+    rounded. Because the interpreter cannot see a contraction, it pins
+    the `.rn` spellings against the hand kernels, and it names the dropped
+    `.rn` as the equivalent mutant that pin exists for. It also catches the
+    bound, every element size, a neighbour's operation, the stats slot,
+    the epsilon, the one and the block index. On the machine, ptxas turns
+    the bare `mul.f32` + `add.f32` pair into one `FFMA`, and the `.rn` pair
+    into `FMUL` + `FADD`. Assembled and disassembled with `nvdisasm`, both
+    KIR kernels issue exactly the hand kernels' floating-point instruction
+    sequence on sm_80/90/120 (2 and 44 instructions), and use the same
+    registers (10, and 14/13/15). Only the address arithmetic differs.
 12. **FA v2**, by phase directory, tier B.1 and B.2 last; the SASS
     baselines and the two no-spill gates already exist here and are the
     proof. `matmul_mma.rs` and `kernel_skeleton/` are deleted with their

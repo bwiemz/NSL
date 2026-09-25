@@ -8,6 +8,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- KIR has explicitly rounded float arithmetic: `KirOp::{AddRn, SubRn,
+  MulRn}` print `add.rn` / `sub.rn` / `mul.rn`. ptxas never contracts these
+  into an `fma`, so a kernel that must match a decomposed computation bit
+  for bit can be built on KIR (roadmap A2 step 11, seventh slice). The
+  verifier holds them to `f32`/`f64` (`RoundedArithNotFloat`). The first
+  users, `nsl_scalar_mul_add_inplace_f32` and
+  `nsl_muon_scale_inv_frob_f32`, are now built in
+  `nsl_kir::kernels::elementwise` in place of their hand-written constants.
+  `tests/elementwise_rn_kir_equivalence.rs` requires the hand kernels' bytes
+  and formula, and pins the `.rn` spellings, which the interpreter cannot
+  observe. Disassembled, both kernels issue the hand kernels' exact
+  floating-point instruction sequence on sm_80/90/120, with the same
+  registers.
+
 - The scalar-operand kernels `nsl_mul_scalar_f32`, `nsl_add_scalar_f32` and
   `nsl_sub_scalar_f32` are built as KIR in `nsl_kir::kernels::elementwise`
   (`ScalarOp`; roadmap A2 step 11, sixth slice). The runtime builds each on

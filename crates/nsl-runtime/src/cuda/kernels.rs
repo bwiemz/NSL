@@ -74,6 +74,32 @@ pub(crate) fn sub_scalar_f32_ptx() -> &'static str {
     scalar_module(ScalarOp::Sub)
 }
 
+// Two kernels that must match a decomposed computation bit for bit, built by
+// `nsl_kir::kernels::elementwise` with explicitly rounded arithmetic
+// (`KirOp::{AddRn, MulRn}` print `.rn`, which ptxas never contracts into an
+// `fma`); `elementwise_rn_kir_equivalence` holds them to the hand-written
+// modules they replace.
+
+/// `nsl_scalar_mul_add_inplace_f32(m, g, s, n)`: `m[i] = m[i] + g[i] * s`,
+/// the FASE accumulate epilogue, bit-exact with `nsl_mul_scalar_f32` then
+/// `nsl_add_f32`. NUL-terminated.
+pub(crate) fn scalar_mul_add_inplace_f32_ptx() -> &'static str {
+    static MODULE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    MODULE.get_or_init(|| {
+        String::from_utf8(nsl_kir::kernels::elementwise::scalar_mul_add_inplace_ptx()).expect("PTX must be ASCII")
+    })
+}
+
+/// `nsl_muon_scale_inv_frob_f32(x, c, stats, n)`:
+/// `c[i] = x[i] * (1 / (sqrt(stats[3]) + 1e-7))`, with `stats` the output of
+/// `nsl_tensor_stats_f32` read on the device. NUL-terminated.
+pub(crate) fn muon_scale_inv_frob_f32_ptx() -> &'static str {
+    static MODULE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    MODULE.get_or_init(|| {
+        String::from_utf8(nsl_kir::kernels::elementwise::muon_scale_inv_frob_ptx()).expect("PTX must be ASCII")
+    })
+}
+
 // The unary family, `c[i] = f(a[i])`, likewise built by
 // `nsl_kir::kernels::elementwise` (its `elementwise_unary_kir_equivalence`
 // gate). `nsl_tanh_f32` (`div.approx.f32`) stays hand-written below.
@@ -302,99 +328,7 @@ DONE: ret;\n\
 }\0";
 
 
-// P1 Muon items 8+10: scale by the inverse Frobenius norm read from a DEVICE
-// buffer — out[i] = x[i] / (sqrt(stats[3]) + 1e-7). `stats` is the 4-slot
-// output of `nsl_tensor_stats_f32` (slot 3 = raw sum-of-squares); reading it
-// on-device is what removes the per-param `.item()` DtoH sync from the Muon
-// Newton-Schulz pre-normalization. Each thread recomputes the scalar inv
-// (sqrt + div, 2 extra ops) — cheaper than a separate 1-thread prep kernel.
-// 0f33D6BF95 = 1e-7f (the stdlib muon_orthogonalize epsilon), 0f3F800000 = 1.0f.
-pub(crate) const MUON_SCALE_INV_FROB_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_muon_scale_inv_frob_f32(\n\
-    .param .u64 x, .param .u64 c, .param .u64 stats, .param .u64 n\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<9>;\n\
-    .reg .f32 %f<4>;\n\
-    .reg .pred %p1;\n\
-    ld.param.u64 %rd1, [x];\n\
-    ld.param.u64 %rd2, [c];\n\
-    ld.param.u64 %rd3, [stats];\n\
-    ld.param.u64 %rd4, [n];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd5, %r3;\n\
-    setp.ge.u64 %p1, %rd5, %rd4;\n\
-    @%p1 bra DONE;\n\
-    add.u64 %rd6, %rd3, 12;\n\
-    ld.global.f32 %f1, [%rd6];\n\
-    sqrt.rn.f32 %f1, %f1;\n\
-    add.rn.f32 %f1, %f1, 0f33D6BF95;\n\
-    mov.f32 %f2, 0f3F800000;\n\
-    div.rn.f32 %f1, %f2, %f1;\n\
-    shl.b64 %rd7, %rd5, 2;\n\
-    add.u64 %rd8, %rd1, %rd7;\n\
-    ld.global.f32 %f3, [%rd8];\n\
-    mul.rn.f32 %f3, %f3, %f1;\n\
-    add.u64 %rd8, %rd2, %rd7;\n\
-    st.global.f32 [%rd8], %f3;\n\
-DONE: ret;\n\
-}\0";
 
-// Fused scaled-add (FASE accumulate epilogue, Milestone C · p4):
-//   m[i] = m[i] + (g[i] * s)      (m read-write, g read-only, s a host f32)
-// Bit-exact replacement for `nsl_mul_scalar_f32` then `nsl_add_f32`, saving one
-// launch and the scaled-grad temp.
-//
-// LOAD-BEARING `.rn`: the two GPU kernels it replaces double-round (the mul
-// result is stored to global memory as f32, then reloaded and added). Within a
-// single kernel, ptxas would by default CONTRACT a register-dependent
-// `mul.f32`+`add.f32` into one `fma.f32` (a single rounding), diverging from the
-// decomposed path by up to 1 ULP. The explicit `.rn` (round-to-nearest) modifier
-// on `mul.rn.f32`/`add.rn.f32` forbids that contraction — same numerics as plain
-// `.f32` (round-to-nearest is already the default), but each op rounds
-// independently, reproducing the two-kernel double-rounding element-for-element.
-pub(crate) const SCALAR_MUL_ADD_INPLACE_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_scalar_mul_add_inplace_f32(\n\
-    .param .u64 m, .param .u64 g, .param .f32 s, .param .u64 n\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<8>;\n\
-    .reg .f32 %fs<4>;\n\
-    .reg .pred %p1;\n\
-    ld.param.u64 %rd1, [m];\n\
-    ld.param.u64 %rd2, [g];\n\
-    ld.param.f32 %fs3, [s];\n\
-    ld.param.u64 %rd3, [n];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd4, %r3;\n\
-    setp.ge.u64 %p1, %rd4, %rd3;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd5, %rd4, 2;\n\
-    add.u64 %rd6, %rd2, %rd5;\n\
-    ld.global.f32 %fs1, [%rd6];\n\
-    mul.rn.f32 %fs1, %fs1, %fs3;\n\
-    add.u64 %rd7, %rd1, %rd5;\n\
-    ld.global.f32 %fs2, [%rd7];\n\
-    add.rn.f32 %fs2, %fs2, %fs1;\n\
-    st.global.f32 [%rd7], %fs2;\n\
-DONE: ret;\n\
-}\0";
 
 // --- Matrix multiplication ---
 //
@@ -1709,8 +1643,6 @@ pub(crate) const ALL_PTX: &[(&str, &str)] = &[
     ("DIV_F32_PTX", DIV_F32_PTX),
     ("ROTATE_HALF_F32_PTX", ROTATE_HALF_F32_PTX),
     ("ROTATE_HALF_NEG_F32_PTX", ROTATE_HALF_NEG_F32_PTX),
-    ("MUON_SCALE_INV_FROB_F32_PTX", MUON_SCALE_INV_FROB_F32_PTX),
-    ("SCALAR_MUL_ADD_INPLACE_F32_PTX", SCALAR_MUL_ADD_INPLACE_F32_PTX),
     ("DIV_SCALAR_F32_PTX", DIV_SCALAR_F32_PTX),
     ("RELU_BACKWARD_F32_PTX", RELU_BACKWARD_F32_PTX),
     ("SIGMOID_BACKWARD_F32_PTX", SIGMOID_BACKWARD_F32_PTX),
