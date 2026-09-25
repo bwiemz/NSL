@@ -8,6 +8,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- The strided run-copy kernels behind `nsl_tensor_contiguous`'s fast path
+  (`nsl_scopy_{run,run4,bcast,bcast4}_f32`) are built as KIR in
+  `nsl_kir::kernels::strided_copy` (roadmap A2 step 11, first slice). The
+  runtime builds their module on first use in place of the hand-written
+  `STRIDED_COPY_RUN_PTX`, so `cuda/strided_copy.rs` leaves the hand-PTX
+  freeze (`ci/hand-ptx-manifest.txt`: 59 → 58 files).
+  `tests/strided_copy_kir_equivalence.rs` launches the frozen hand module
+  and the KIR one over the whole two-dimensional grid on the shared PTX
+  interpreter (which learned `%nctaid.y`, `v4.f32` loads and stores, and a
+  label sharing its instruction's line) and requires the same bytes in all
+  of global memory and the exact copy. The kernels target the KIR floor
+  (`sm_70`, was `sm_80`) and take 14–24 registers where the hand ones took
+  16–24 (sm_80/90/120).
+
 - The CPKD fused KL-CE distillation kernels (`nsl_fused_kl_ce_*`, forward
   and backward) are built as KIR (roadmap A2 step 10), so
   `cpkd_fused_loss.rs` no longer writes PTX text and leaves the hand-PTX
