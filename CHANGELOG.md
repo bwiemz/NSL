@@ -8,6 +8,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- Twelve unary elementwise kernels are built as KIR in
+  `nsl_kir::kernels::elementwise` (roadmap A2 step 11, fourth slice):
+  - `nsl_{neg,relu,exp,log,sqrt,abs,sign,sigmoid,sin,cos,silu}_f32`
+  - `nsl_clamp_f32`
+
+  Each keeps the hand kernel's instruction sequence. The runtime builds them
+  on first use (`cuda::kernels::*_f32_ptx()`) in place of the hand-written
+  constants. `tests/elementwise_unary_kir_equivalence.rs` runs both on the
+  shared PTX interpreter, which learned `neg.f32`, `abs.f32` and `min.f32`,
+  out of place and in place over IEEE corner cases. It requires the same
+  bytes as the hand kernels and the kernels' formula. Registers are 10–12
+  against the hand kernels' 10–12 (sm_80/120). Two kernels stay
+  hand-written: `nsl_tanh_f32` divides with `div.approx.f32`, and
+  `nsl_gelu_f32` multiplies by 1.7 where its backward uses 1.702, so it
+  gets fixed in place first.
+
 - The binary elementwise kernels `nsl_add_f32`, `nsl_sub_f32` and
   `nsl_mul_f32` are built as KIR in `nsl_kir::kernels::elementwise` (roadmap
   A2 step 11, third slice). The runtime builds each module on first use

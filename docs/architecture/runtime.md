@@ -376,8 +376,8 @@ every launch for bisecting async bugs.
 losses), and `kernels_hopper.rs` (`sm_90a`, wgmma/TMA FlashAttention-3).
 Some families are built rather than embedded: the precision casts
 (`precision_cast_kernels.rs`), the strided run copy (`strided_copy.rs`), the
-CSHA Tier B.1 pre-passes (`tier_b1_prepass.rs`) and the binary elementwise
-add/sub/mul (`kernels.rs`) are described as KIR in `nsl_kir::kernels` and lowered
+CSHA Tier B.1 pre-passes (`tier_b1_prepass.rs`) and the binary and unary
+elementwise kernels (`kernels.rs`) are described as KIR in `nsl_kir::kernels` and lowered
 once, on first use, into a `OnceLock` whose stable address the module cache
 keys on (roadmap A2 steps 7 and 11). A launch is
 `load_module_once(ptx)` → `get_function(module, name)` →

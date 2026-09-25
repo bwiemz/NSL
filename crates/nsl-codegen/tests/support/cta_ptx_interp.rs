@@ -52,7 +52,9 @@
 //! A `.shared` block may be declared by element (`.shared .f32 NAME[N]`,
 //! `N` elements) as well as in bytes, and an address may name it directly
 //! (`[NAME]`). `div.approx.f32` is modelled as `a / b`, the same as
-//! `div.rn.f32`, like every approximate form.
+//! `div.rn.f32`, like every approximate form. `neg.f32` and `abs.f32` flip
+//! and clear the sign bit (NaN included); `min.f32`, like `max.f32`, returns
+//! the non-NaN operand.
 
 use std::collections::HashMap;
 
@@ -116,6 +118,7 @@ pub(crate) enum FOp {
     Sub,
     Mul,
     Max,
+    Min,
     DivRn,
     /// `div.approx.f32`, modelled as `a / b` like every approximate form.
     DivApprox,
@@ -169,6 +172,9 @@ pub(crate) enum Op {
     F { op: FOp, d: usize, a: Src, b: Src },
     Fma { d: usize, a: Src, b: Src, c: Src },
     Ex2 { d: usize, a: Src },
+    /// `neg.f32` / `abs.f32`: the sign bit flipped / cleared, NaN included.
+    Neg { d: usize, a: Src },
+    Abs { d: usize, a: Src },
     Rsqrt { d: usize, a: Src },
     Sqrt { d: usize, a: Src },
     Sin { d: usize, a: Src },
@@ -535,13 +541,14 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 let w = if ty.ends_with("64") { W::U64 } else { W::U32 };
                 Op::Selp { w, d: p.dst(ops[0]), a: p.src(ops[1]), b: p.src(ops[2]), p: p.src(ops[3]) }
             }
-            [name @ ("add" | "sub" | "mul" | "max"), "f32"] | [name @ "div", "rn", "f32"] | [name @ "div", "approx", "f32"] => {
+            [name @ ("add" | "sub" | "mul" | "max" | "min"), "f32"] | [name @ "div", "rn", "f32"] | [name @ "div", "approx", "f32"] => {
                 want(3);
                 let op = match (*name, parts[1]) {
                     ("add", _) => FOp::Add,
                     ("sub", _) => FOp::Sub,
                     ("mul", _) => FOp::Mul,
                     ("max", _) => FOp::Max,
+                    ("min", _) => FOp::Min,
                     (_, "approx") => FOp::DivApprox,
                     _ => FOp::DivRn,
                 };
@@ -550,6 +557,14 @@ pub(crate) fn parse(ptx: &str) -> Program {
             ["fma", "rn", "f32"] => {
                 want(4);
                 Op::Fma { d: p.dst(ops[0]), a: p.src(ops[1]), b: p.src(ops[2]), c: p.src(ops[3]) }
+            }
+            ["neg", "f32"] => {
+                want(2);
+                Op::Neg { d: p.dst(ops[0]), a: p.src(ops[1]) }
+            }
+            ["abs", "f32"] => {
+                want(2);
+                Op::Abs { d: p.dst(ops[0]), a: p.src(ops[1]) }
             }
             ["ex2", "approx", "f32"] => {
                 want(2);
@@ -894,6 +909,8 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
                     FOp::Mul => a * b,
                     // PTX `max.f32` returns the non-NaN operand, as Rust's.
                     FOp::Max => a.max(b),
+                    // Likewise `min.f32`.
+                    FOp::Min => a.min(b),
                     FOp::DivRn | FOp::DivApprox => a / b,
                 };
                 write(t, *d, fb(v));
@@ -901,6 +918,14 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
             Op::Fma { d, a, b, c } => {
                 let v = f(rd(t, launch, *a)).mul_add(f(rd(t, launch, *b)), f(rd(t, launch, *c)));
                 write(t, *d, fb(v));
+            }
+            Op::Neg { d, a } => {
+                let v = (rd(t, launch, *a) as u32) ^ 0x8000_0000;
+                write(t, *d, v as u64);
+            }
+            Op::Abs { d, a } => {
+                let v = (rd(t, launch, *a) as u32) & 0x7FFF_FFFF;
+                write(t, *d, v as u64);
             }
             Op::Ex2 { d, a } => {
                 let v = f(rd(t, launch, *a)).exp2();

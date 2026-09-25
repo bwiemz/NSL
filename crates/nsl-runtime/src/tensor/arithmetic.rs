@@ -509,12 +509,12 @@ pub extern "C" fn nsl_tensor_neg(a_ptr: i64) -> i64 {
             #[cfg(feature = "cuda")]
             {
                 if ta.can_mutate_inplace_gpu() {
-                    crate::cuda::gpu_elementwise_unary_inplace(a_ptr, crate::cuda::kernels::NEG_F32_PTX, "nsl_neg_f32\0");
+                    crate::cuda::gpu_elementwise_unary_inplace(a_ptr, crate::cuda::kernels::neg_f32_ptx(), "nsl_neg_f32\0");
                     ta.refcount.fetch_add(1, Ordering::SeqCst);
                     super::fbip_record_reuse();
                     return a_ptr;
                 }
-                let result = crate::cuda::gpu_elementwise_unary(a_ptr, crate::cuda::kernels::NEG_F32_PTX, "nsl_neg_f32\0");
+                let result = crate::cuda::gpu_elementwise_unary(a_ptr, crate::cuda::kernels::neg_f32_ptx(), "nsl_neg_f32\0");
                 // Tape record on the GPU arm (see nsl_tensor_add).
                 if autodiff::is_recording() {
                     autodiff::maybe_record(autodiff::TapeOp::Neg { a: a_ptr, out: result });

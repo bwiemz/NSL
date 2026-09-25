@@ -786,6 +786,26 @@ frozen throughout, so nothing here blocks a kernel fix.
     with `div.approx.f32` (within 2 ulp, and 0 for a divisor whose magnitude
     is in `(2^126, 2^128)`), KIR's f32 division is `div.rn.f32`, and a
     migration does not change numerics, so its move is a separate decision.
+
+    **`kernels.rs`, the unary family** (fourth slice). `nsl_kir::kernels::
+    elementwise` builds `nsl_{neg,relu,exp,log,sqrt,abs,sign,sigmoid,sin,
+    cos,silu}_f32` and `nsl_clamp_f32` in the hand kernels' instruction
+    sequences: `exp` as `ex2.approx` of `x * log2(e)`, `log` as `lg2.approx`
+    times `ln 2`, the sigmoid family through `ex2.approx` and `rcp.approx`,
+    `sign` as two compares and two selects. The interpreter learned `neg`,
+    `abs` and `min` on f32. The gate runs them out of place and in place over
+    IEEE corners and requires the hand kernels' bytes and the kernels'
+    formula (the approximate instructions modelled exactly), with a sanity
+    check against the f64 functions. It catches the relaxed bound, both
+    addresses' element size, every baked constant nudged one ulp, the
+    clamp's bounds swapped and the block index read as 0. Registers are
+    10–12 against 10–12. Two stay hand-written. `nsl_tanh_f32` divides with
+    `div.approx.f32`. `nsl_gelu_f32` is the second: the gate's f64 check
+    found that it multiplies by `0f3FD9999A`, which is 1.7, where its
+    backward (`0f3FD9DB23`) and every description of it use 1.702. So the
+    GPU gradient was not the derivative of the GPU forward. Per this spec's
+    non-goals, that kernel is fixed in place first, as a member, and moves
+    after.
 12. **FA v2**, by phase directory, tier B.1 and B.2 last; the SASS
     baselines and the two no-spill gates already exist here and are the
     proof. `matmul_mma.rs` and `kernel_skeleton/` are deleted with their
