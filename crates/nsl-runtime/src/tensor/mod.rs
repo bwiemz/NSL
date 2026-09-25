@@ -2117,7 +2117,7 @@ pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
         crate::cuda::gpu_elementwise_binary_inplace(
             dst_ptr,
             src_ptr,
-            crate::cuda::kernels::ADD_F32_PTX,
+            crate::cuda::kernels::add_f32_ptx(),
             "nsl_add_f32\0",
         );
         return;

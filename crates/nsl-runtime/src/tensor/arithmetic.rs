@@ -47,7 +47,7 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64, flags: u8) -> i64 {
                 // from a taped forward today; the guard keeps that a non-event
                 // if a future runtime-internal caller records).
                 if relinq_a && ta.shape_eq(tb) && !autodiff::is_recording() {
-                    crate::cuda::gpu_elementwise_binary_inplace(a, b, crate::cuda::kernels::ADD_F32_PTX, "nsl_add_f32\0");
+                    crate::cuda::gpu_elementwise_binary_inplace(a, b, crate::cuda::kernels::add_f32_ptx(), "nsl_add_f32\0");
                     // Ownership transfer: the caller's relinquished A ref IS the
                     // result ref. Bumping here (as the unary can_mutate_inplace
                     // family does, where the caller keeps its input handle) makes
@@ -65,7 +65,7 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64, flags: u8) -> i64 {
                     }
                     return a;
                 }
-                let result = crate::cuda::gpu_elementwise_binary(a, b, crate::cuda::kernels::ADD_F32_PTX, "nsl_add_f32\0");
+                let result = crate::cuda::gpu_elementwise_binary(a, b, crate::cuda::kernels::add_f32_ptx(), "nsl_add_f32\0");
                 // Tape record on the GPU arm — this return path historically
                 // skipped it, so every GPU train step under tape-AD produced a
                 // graph with no Add edges (and, with the whole elementwise
@@ -184,14 +184,14 @@ pub extern "C" fn nsl_tensor_sub(a: i64, b: i64, flags: u8) -> i64 {
             {
                 let tb = NslTensor::from_ptr_ref(b);
                 if relinq_a && ta.shape_eq(tb) && !autodiff::is_recording() {
-                    crate::cuda::gpu_elementwise_binary_inplace(a, b, crate::cuda::kernels::SUB_F32_PTX, "nsl_sub_f32\0");
+                    crate::cuda::gpu_elementwise_binary_inplace(a, b, crate::cuda::kernels::sub_f32_ptx(), "nsl_sub_f32\0");
                     // Ownership transfer: relinquished A ref becomes the result ref.
                     super::fbip_record_reuse();
                     if relinq_b { nsl_tensor_free(b_orig); }
                     if b_transferred { nsl_tensor_free(b); }
                     return a;
                 }
-                let result = crate::cuda::gpu_elementwise_binary(a, b, crate::cuda::kernels::SUB_F32_PTX, "nsl_sub_f32\0");
+                let result = crate::cuda::gpu_elementwise_binary(a, b, crate::cuda::kernels::sub_f32_ptx(), "nsl_sub_f32\0");
                 // Tape record on the GPU arm (see nsl_tensor_add).
                 if autodiff::is_recording() {
                     let a_shape = autodiff::tape_shape(NslTensor::from_ptr(a));
@@ -284,14 +284,14 @@ pub extern "C" fn nsl_tensor_mul(a: i64, b: i64, flags: u8) -> i64 {
             {
                 let tb = NslTensor::from_ptr_ref(b);
                 if relinq_a && ta.shape_eq(tb) && !autodiff::is_recording() {
-                    crate::cuda::gpu_elementwise_binary_inplace(a, b, crate::cuda::kernels::MUL_F32_PTX, "nsl_mul_f32\0");
+                    crate::cuda::gpu_elementwise_binary_inplace(a, b, crate::cuda::kernels::mul_f32_ptx(), "nsl_mul_f32\0");
                     // Ownership transfer: relinquished A ref becomes the result ref.
                     super::fbip_record_reuse();
                     if relinq_b { nsl_tensor_free(b_orig); }
                     if b_transferred { nsl_tensor_free(b); }
                     return a;
                 }
-                let result = crate::cuda::gpu_elementwise_binary(a, b, crate::cuda::kernels::MUL_F32_PTX, "nsl_mul_f32\0");
+                let result = crate::cuda::gpu_elementwise_binary(a, b, crate::cuda::kernels::mul_f32_ptx(), "nsl_mul_f32\0");
                 // Tape record on the GPU arm (see nsl_tensor_add). Saved refs
                 // are bumped BEFORE the relinquish frees below so the tape's
                 // reference keeps a relinquished operand alive for backward.
