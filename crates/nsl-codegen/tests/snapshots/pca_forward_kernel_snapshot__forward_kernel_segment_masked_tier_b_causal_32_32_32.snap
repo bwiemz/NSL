@@ -554,6 +554,7 @@ V2_LOOP_PV_OVER_K_0:
     add.u32 %r5, %r5, 1;
     setp.lt.u32 %p0, %r5, %r6;
     @%p0 bra V2_LOOP_PV_OVER_K_0;
+    bar.sync 0;  // FENCE: all warps done reading V before the next K tile
 KV_TILE_SKIP_TB_0:
     add.u64 %k_start, %k_start, 64;
     setp.lt.u64 %p0, %k_start, %k_max;
@@ -899,6 +900,7 @@ V2_LOOP_PV_OVER_K_1:
     add.u32 %r5, %r5, 1;
     setp.lt.u32 %p0, %r5, %r6;
     @%p0 bra V2_LOOP_PV_OVER_K_1;
+    bar.sync 0;  // FENCE: all warps done reading V before the next K tile
 KV_TILE_SKIP_TB_1:
     add.u64 %k_start, %k_start, 64;
     setp.lt.u64 %p0, %k_start, %k_max;
@@ -1244,6 +1246,7 @@ V2_LOOP_PV_OVER_K_2:
     add.u32 %r5, %r5, 1;
     setp.lt.u32 %p0, %r5, %r6;
     @%p0 bra V2_LOOP_PV_OVER_K_2;
+    bar.sync 0;  // FENCE: all warps done reading V before the next K tile
 KV_TILE_SKIP_TB_2:
     add.u64 %k_start, %k_start, 64;
     setp.lt.u64 %p0, %k_start, %k_max;
@@ -1589,6 +1592,7 @@ V2_LOOP_PV_OVER_K_3:
     add.u32 %r5, %r5, 1;
     setp.lt.u32 %p0, %r5, %r6;
     @%p0 bra V2_LOOP_PV_OVER_K_3;
+    bar.sync 0;  // FENCE: all warps done reading V before the next K tile
 KV_TILE_SKIP_TB_3:
     add.u64 %k_start, %k_start, 64;
     setp.lt.u64 %p0, %k_start, %k_max;
@@ -1934,6 +1938,7 @@ V2_LOOP_PV_OVER_K_4:
     add.u32 %r5, %r5, 1;
     setp.lt.u32 %p0, %r5, %r6;
     @%p0 bra V2_LOOP_PV_OVER_K_4;
+    bar.sync 0;  // FENCE: all warps done reading V before the next K tile
 KV_TILE_SKIP_TB_4:
     add.u64 %k_start, %k_start, 64;
     setp.lt.u64 %p0, %k_start, %k_max;
@@ -2279,6 +2284,7 @@ V2_LOOP_PV_OVER_K_5:
     add.u32 %r5, %r5, 1;
     setp.lt.u32 %p0, %r5, %r6;
     @%p0 bra V2_LOOP_PV_OVER_K_5;
+    bar.sync 0;  // FENCE: all warps done reading V before the next K tile
 KV_TILE_SKIP_TB_5:
     add.u64 %k_start, %k_start, 64;
     setp.lt.u64 %p0, %k_start, %k_max;
@@ -2624,6 +2630,7 @@ V2_LOOP_PV_OVER_K_6:
     add.u32 %r5, %r5, 1;
     setp.lt.u32 %p0, %r5, %r6;
     @%p0 bra V2_LOOP_PV_OVER_K_6;
+    bar.sync 0;  // FENCE: all warps done reading V before the next K tile
 KV_TILE_SKIP_TB_6:
     add.u64 %k_start, %k_start, 64;
     setp.lt.u64 %p0, %k_start, %k_max;
@@ -2969,6 +2976,7 @@ V2_LOOP_PV_OVER_K_7:
     add.u32 %r5, %r5, 1;
     setp.lt.u32 %p0, %r5, %r6;
     @%p0 bra V2_LOOP_PV_OVER_K_7;
+    bar.sync 0;  // FENCE: all warps done reading V before the next K tile
 KV_TILE_SKIP_TB_7:
     add.u64 %k_start, %k_start, 64;
     setp.lt.u64 %p0, %k_start, %k_max;
@@ -3314,6 +3322,7 @@ V2_LOOP_PV_OVER_K_8:
     add.u32 %r5, %r5, 1;
     setp.lt.u32 %p0, %r5, %r6;
     @%p0 bra V2_LOOP_PV_OVER_K_8;
+    bar.sync 0;  // FENCE: all warps done reading V before the next K tile
 KV_TILE_SKIP_TB_8:
     add.u64 %k_start, %k_start, 64;
     setp.lt.u64 %p0, %k_start, %k_max;
@@ -3659,6 +3668,7 @@ V2_LOOP_PV_OVER_K_9:
     add.u32 %r5, %r5, 1;
     setp.lt.u32 %p0, %r5, %r6;
     @%p0 bra V2_LOOP_PV_OVER_K_9;
+    bar.sync 0;  // FENCE: all warps done reading V before the next K tile
 KV_TILE_SKIP_TB_9:
     add.u64 %k_start, %k_start, 64;
     setp.lt.u64 %p0, %k_start, %k_max;
@@ -4004,6 +4014,7 @@ V2_LOOP_PV_OVER_K_10:
     add.u32 %r5, %r5, 1;
     setp.lt.u32 %p0, %r5, %r6;
     @%p0 bra V2_LOOP_PV_OVER_K_10;
+    bar.sync 0;  // FENCE: all warps done reading V before the next K tile
 KV_TILE_SKIP_TB_10:
     add.u64 %k_start, %k_start, 64;
     setp.lt.u64 %p0, %k_start, %k_max;
@@ -4349,6 +4360,7 @@ V2_LOOP_PV_OVER_K_11:
     add.u32 %r5, %r5, 1;
     setp.lt.u32 %p0, %r5, %r6;
     @%p0 bra V2_LOOP_PV_OVER_K_11;
+    bar.sync 0;  // FENCE: all warps done reading V before the next K tile
 KV_TILE_SKIP_TB_11:
     add.u64 %k_start, %k_start, 64;
     setp.lt.u64 %p0, %k_start, %k_max;
@@ -4694,6 +4706,7 @@ V2_LOOP_PV_OVER_K_12:
     add.u32 %r5, %r5, 1;
     setp.lt.u32 %p0, %r5, %r6;
     @%p0 bra V2_LOOP_PV_OVER_K_12;
+    bar.sync 0;  // FENCE: all warps done reading V before the next K tile
 KV_TILE_SKIP_TB_12:
     add.u64 %k_start, %k_start, 64;
     setp.lt.u64 %p0, %k_start, %k_max;
@@ -5039,6 +5052,7 @@ V2_LOOP_PV_OVER_K_13:
     add.u32 %r5, %r5, 1;
     setp.lt.u32 %p0, %r5, %r6;
     @%p0 bra V2_LOOP_PV_OVER_K_13;
+    bar.sync 0;  // FENCE: all warps done reading V before the next K tile
 KV_TILE_SKIP_TB_13:
     add.u64 %k_start, %k_start, 64;
     setp.lt.u64 %p0, %k_start, %k_max;
@@ -5384,6 +5398,7 @@ V2_LOOP_PV_OVER_K_14:
     add.u32 %r5, %r5, 1;
     setp.lt.u32 %p0, %r5, %r6;
     @%p0 bra V2_LOOP_PV_OVER_K_14;
+    bar.sync 0;  // FENCE: all warps done reading V before the next K tile
 KV_TILE_SKIP_TB_14:
     add.u64 %k_start, %k_start, 64;
     setp.lt.u64 %p0, %k_start, %k_max;
@@ -5729,6 +5744,7 @@ V2_LOOP_PV_OVER_K_15:
     add.u32 %r5, %r5, 1;
     setp.lt.u32 %p0, %r5, %r6;
     @%p0 bra V2_LOOP_PV_OVER_K_15;
+    bar.sync 0;  // FENCE: all warps done reading V before the next K tile
 KV_TILE_SKIP_TB_15:
     add.u64 %k_start, %k_start, 64;
     setp.lt.u64 %p0, %k_start, %k_max;
