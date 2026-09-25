@@ -735,12 +735,12 @@ pub extern "C" fn nsl_tensor_gelu(tensor_ptr: i64) -> i64 {
             #[cfg(feature = "cuda")]
             {
                 if ta.can_mutate_inplace_gpu() {
-                    crate::cuda::gpu_elementwise_unary_inplace(tensor_ptr, crate::cuda::kernels::GELU_F32_PTX, "nsl_gelu_f32\0");
+                    crate::cuda::gpu_elementwise_unary_inplace(tensor_ptr, crate::cuda::kernels::gelu_f32_ptx(), "nsl_gelu_f32\0");
                     ta.refcount.fetch_add(1, Ordering::SeqCst);
                     super::fbip_record_reuse();
                     return tensor_ptr;
                 }
-                let result = crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::GELU_F32_PTX, "nsl_gelu_f32\0");
+                let result = crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::gelu_f32_ptx(), "nsl_gelu_f32\0");
                 // Tape record on the GPU arm (see nsl_tensor_add in arithmetic.rs).
                 if autodiff::is_recording() {
                     NslTensor::from_ptr(tensor_ptr).refcount.fetch_add(1, Ordering::SeqCst);
@@ -1388,7 +1388,7 @@ fn gelu_deriv_cpu(x_ptr: i64) -> i64 {
 /// Source-AD GELU backward, fused (Milestone C · p4 GELU fix): one call computing
 /// `grad * gelu'(x)`, where `gelu'` is the derivative of the forward THIS DEVICE
 /// actually ran:
-/// - **GPU**: sigmoid approximation `x·σ(1.702x)` (`GELU_F32_PTX`) →
+/// - **GPU**: sigmoid approximation `x·σ(1.702x)` (`nsl_gelu_f32`) →
 ///   `GELU_BACKWARD_SRCAD_F32_PTX` computes `σ(1.702x)·(1+1.702x·(1−σ(1.702x)))`.
 /// - **CPU**: tanh approximation (the `nsl_tensor_gelu` CPU loop) →
 ///   `gelu_tanh_deriv_*` above (same formula as the tape backward).
@@ -1753,7 +1753,7 @@ pub extern "C" fn nsl_tensor_gelu_inplace(ptr: i64) -> i64 {
     if t.device > 0 {
         #[cfg(feature = "cuda")]
         {
-            crate::cuda::gpu_elementwise_unary_inplace(ptr, crate::cuda::kernels::GELU_F32_PTX, "nsl_gelu_f32\0");
+            crate::cuda::gpu_elementwise_unary_inplace(ptr, crate::cuda::kernels::gelu_f32_ptx(), "nsl_gelu_f32\0");
             super::fbip_record_reuse();
             return ptr;
         }
@@ -2426,7 +2426,7 @@ mod gelu_backward_tests {
     }
 
     /// GPU f32: fused kernel vs the host-computed sigmoid-approx derivative
-    /// σ(1.702x)·(1+1.702x·(1−σ)) — the derivative of GELU_F32_PTX's forward.
+    /// σ(1.702x)·(1+1.702x·(1−σ)) — the derivative of nsl_gelu_f32's forward.
     /// Tolerance covers ex2.approx/rcp.approx (~1-2 ulp each).
     #[test]
     #[cfg(feature = "cuda")]
@@ -2453,7 +2453,7 @@ mod gelu_backward_tests {
         for p in [x, g, out, cpu] { nsl_tensor_free(p); }
     }
 
-    /// GPU f32 forward (GELU_F32_PTX) vs the host x·σ(1.702x) — the function
+    /// GPU f32 forward (nsl_gelu_f32) vs the host x·σ(1.702x) — the function
     /// the backward above differentiates. The finite-difference test below
     /// cannot see the slope: a forward at 1.7 moves its central difference by
     /// less than that test's tolerance, and one did ship. Here it is ~2.6e-4 at
@@ -2482,7 +2482,7 @@ mod gelu_backward_tests {
         for p in [x, y, cpu] { nsl_tensor_free(p); }
     }
 
-    /// GPU f32 finite differences against the GPU forward (GELU_F32_PTX):
+    /// GPU f32 finite differences against the GPU forward (nsl_gelu_f32):
     /// central difference with h=1e-2; tolerance dominated by f32 rounding noise.
     #[test]
     #[cfg(feature = "cuda")]

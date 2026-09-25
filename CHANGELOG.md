@@ -8,6 +8,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- `nsl_gelu_f32` is built as KIR in `nsl_kir::kernels::elementwise` (roadmap
+  A2 step 11, fifth slice), now that its slope is fixed. It computes
+  `x * sigmoid(k * x)` with `k = GELU_SLOPE` (`0f3FD9DB23`, 1.702). The
+  runtime builds it on first use (`cuda::kernels::gelu_f32_ptx()`) in place
+  of `GELU_F32_PTX`. `tests/elementwise_unary_kir_equivalence.rs` gains it
+  in every test, against the frozen fixed hand kernel. Among its mutants it
+  catches the slope put back to 1.7. The `gelu_slope_drift` gate now reads
+  the forward slope from the KIR module and holds it to the hand-written
+  source-AD backward's. Registers are 12/12/11 against the hand kernel's
+  11/11/10 (sm_80/90/120). `nsl_tanh_f32` is the unary family's last hand
+  kernel.
+
 - Twelve unary elementwise kernels are built as KIR in
   `nsl_kir::kernels::elementwise` (roadmap A2 step 11, fourth slice):
   - `nsl_{neg,relu,exp,log,sqrt,abs,sign,sigmoid,sin,cos,silu}_f32`
