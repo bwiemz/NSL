@@ -494,7 +494,7 @@ pub extern "C" fn nsl_dl_path_for_fn_addr(fn_addr: i64) -> i64 {
     #[cfg(unix)]
     unsafe {
         let mut info: libc::Dl_info = std::mem::zeroed();
-        let probe = fn_addr as *const std::ffi::c_void;
+        let probe = fn_addr as *const c_void;
         if libc::dladdr(probe, &mut info) == 0 || info.dli_fname.is_null() {
             return 0;
         }
@@ -515,17 +515,17 @@ pub extern "C" fn nsl_dl_path_for_fn_addr(fn_addr: i64) -> i64 {
             fn GetModuleHandleExW(
                 flags: u32,
                 module_name: *const u16,
-                handle_out: *mut *mut std::ffi::c_void,
+                handle_out: *mut *mut c_void,
             ) -> i32;
             fn GetModuleFileNameW(
-                module: *mut std::ffi::c_void,
+                module: *mut c_void,
                 filename: *mut u16,
                 size: u32,
             ) -> u32;
         }
         const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x4;
         const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 0x2;
-        let mut module: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut module: *mut c_void = std::ptr::null_mut();
         let ok = GetModuleHandleExW(
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
                 | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
