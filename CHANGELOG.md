@@ -8,6 +8,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- The binary elementwise kernels `nsl_add_f32`, `nsl_sub_f32` and
+  `nsl_mul_f32` are built as KIR in `nsl_kir::kernels::elementwise` (roadmap
+  A2 step 11, third slice). The runtime builds each module on first use
+  (`cuda::kernels::{add,sub,mul}_f32_ptx()`) in place of the hand-written
+  `{ADD,SUB,MUL}_F32_PTX` constants. `tests/elementwise_binary_kir_equivalence.rs`
+  runs the frozen hand kernels and the KIR ones on the shared PTX interpreter,
+  out of place and in place, over IEEE corner cases, and requires the same
+  bytes in all of global memory and the IEEE result. The kernels take the
+  hand kernels' 12 registers on sm_80/90/120. `nsl_div_f32` stays
+  hand-written: it divides with `div.approx.f32`, and KIR's f32 division is
+  `div.rn.f32`, so moving it would change GPU division results.
+  `cuda/kernels.rs` stays in the hand-PTX freeze until its last kernel moves.
+
 - The CSHA Tier B.1 pre-pass kernels (`csha_tier_b1_prepass_x`, RMSNorm +
   narrow + chunkify, and `csha_tier_b1_prepass_w`, narrow + col-major
   chunkify) are built as KIR in `nsl_kir::kernels::tier_b1_prepass`

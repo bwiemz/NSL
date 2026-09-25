@@ -10328,8 +10328,9 @@ mod tests {
     /// `EXTRA_RUNTIME_PTX` plus the modules that are built rather than
     /// declared.
     ///
-    /// The four precision casts (roadmap A2 step 7), the strided run copy
-    /// and the Tier B.1 pre-passes (step 11) moved to `nsl_kir::kernels`,
+    /// The four precision casts (roadmap A2 step 7), the strided run copy,
+    /// the Tier B.1 pre-passes and the binary elementwise add/sub/mul
+    /// (step 11) moved to `nsl_kir::kernels`,
     /// so they are no longer `const` and cannot sit in the array above.
     /// They still have to reach both gates: the registry's own comment
     /// records that covering a module in only one of them was
@@ -10344,6 +10345,9 @@ mod tests {
         all.push(("strided_copy::run_module", super::strided_copy::run_module(), true));
         all.push(("csha_tier_b1_prepass_x", super::tier_b1_prepass::csha_tier_b1_prepass_x_ptx(), true));
         all.push(("csha_tier_b1_prepass_w", super::tier_b1_prepass::csha_tier_b1_prepass_w_ptx(), true));
+        all.push(("nsl_add_f32", super::kernels::add_f32_ptx(), true));
+        all.push(("nsl_sub_f32", super::kernels::sub_f32_ptx(), true));
+        all.push(("nsl_mul_f32", super::kernels::mul_f32_ptx(), true));
         all
     }
 

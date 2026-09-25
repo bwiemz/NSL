@@ -768,6 +768,24 @@ frozen throughout, so nothing here blocks a kernel fix.
     `1` nudged, and the block index read as 0; no mutant is equivalent.
     Registers: X 20–24 against the hand kernel's 20–24, W 10–14 against
     10–11 (sm_80/90/120), no spills.
+
+    **`kernels.rs`, the binary arithmetic family** (third slice; the file
+    stays a member until its last kernel moves). `nsl_kir::kernels::
+    elementwise` builds `nsl_add_f32`, `nsl_sub_f32` and `nsl_mul_f32`, one
+    thread per element with the hand kernels' 32-bit index and 64-bit bound;
+    the runtime's `{add,sub,mul}_f32_ptx()` replace the three constants.
+    Nothing new was needed in KIR or the interpreter. The gate runs sizes
+    below, at and past a block, out of place and in place (`c` aliasing `a`,
+    as the in-place launcher binds it), over IEEE corners (NaN, infinities,
+    signed zeros, subnormals, overflow), under two schedules and with one
+    block past the grid, and requires the same bytes as the hand kernels and
+    the IEEE result, with nothing past `n` written. It catches the relaxed
+    bound, every address's element size nudged, the subtraction's operands
+    swapped and the block index read as 0. Registers are the hand kernels'
+    12 on sm_80/90/120. `nsl_div_f32` is left out on purpose: it divides
+    with `div.approx.f32` (within 2 ulp, and 0 for a divisor whose magnitude
+    is in `(2^126, 2^128)`), KIR's f32 division is `div.rn.f32`, and a
+    migration does not change numerics, so its move is a separate decision.
 12. **FA v2**, by phase directory, tier B.1 and B.2 last; the SASS
     baselines and the two no-spill gates already exist here and are the
     proof. `matmul_mma.rs` and `kernel_skeleton/` are deleted with their

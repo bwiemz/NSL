@@ -6,111 +6,45 @@
 
 // --- Binary ops ---
 
-pub(crate) const ADD_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_add_f32(\n\
-    .param .u64 a, .param .u64 b, .param .u64 c, .param .u64 n\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<8>;\n\
-    .reg .f32 %fs<4>;\n\
-    .reg .pred %p1;\n\
-    ld.param.u64 %rd1, [a];\n\
-    ld.param.u64 %rd2, [b];\n\
-    ld.param.u64 %rd3, [c];\n\
-    ld.param.u64 %rd4, [n];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd5, %r3;\n\
-    setp.ge.u64 %p1, %rd5, %rd4;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd6, %rd5, 2;\n\
-    add.u64 %rd7, %rd1, %rd6;\n\
-    ld.global.f32 %fs1, [%rd7];\n\
-    add.u64 %rd7, %rd2, %rd6;\n\
-    ld.global.f32 %fs2, [%rd7];\n\
-    add.f32 %fs3, %fs1, %fs2;\n\
-    add.u64 %rd7, %rd3, %rd6;\n\
-    st.global.f32 [%rd7], %fs3;\n\
-DONE: ret;\n\
-}\0";
+// `nsl_add_f32`, `nsl_sub_f32` and `nsl_mul_f32` are built from KIR by
+// `nsl_kir::kernels::elementwise` (roadmap A2 step 11); `nsl-codegen`'s
+// `elementwise_binary_kir_equivalence` gate holds them to the hand-written
+// modules they replace. Each module is built once, on first use, and kept:
+// `kernel_launch` keys its module cache on the buffer's address.
 
-pub(crate) const SUB_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_sub_f32(\n\
-    .param .u64 a, .param .u64 b, .param .u64 c, .param .u64 n\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<8>;\n\
-    .reg .f32 %fs<4>;\n\
-    .reg .pred %p1;\n\
-    ld.param.u64 %rd1, [a];\n\
-    ld.param.u64 %rd2, [b];\n\
-    ld.param.u64 %rd3, [c];\n\
-    ld.param.u64 %rd4, [n];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd5, %r3;\n\
-    setp.ge.u64 %p1, %rd5, %rd4;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd6, %rd5, 2;\n\
-    add.u64 %rd7, %rd1, %rd6;\n\
-    ld.global.f32 %fs1, [%rd7];\n\
-    add.u64 %rd7, %rd2, %rd6;\n\
-    ld.global.f32 %fs2, [%rd7];\n\
-    sub.f32 %fs3, %fs1, %fs2;\n\
-    add.u64 %rd7, %rd3, %rd6;\n\
-    st.global.f32 [%rd7], %fs3;\n\
-DONE: ret;\n\
-}\0";
+use nsl_kir::kernels::elementwise::BinaryOp;
 
-pub(crate) const MUL_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_mul_f32(\n\
-    .param .u64 a, .param .u64 b, .param .u64 c, .param .u64 n\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<8>;\n\
-    .reg .f32 %fs<4>;\n\
-    .reg .pred %p1;\n\
-    ld.param.u64 %rd1, [a];\n\
-    ld.param.u64 %rd2, [b];\n\
-    ld.param.u64 %rd3, [c];\n\
-    ld.param.u64 %rd4, [n];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd5, %r3;\n\
-    setp.ge.u64 %p1, %rd5, %rd4;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd6, %rd5, 2;\n\
-    add.u64 %rd7, %rd1, %rd6;\n\
-    ld.global.f32 %fs1, [%rd7];\n\
-    add.u64 %rd7, %rd2, %rd6;\n\
-    ld.global.f32 %fs2, [%rd7];\n\
-    mul.f32 %fs3, %fs1, %fs2;\n\
-    add.u64 %rd7, %rd3, %rd6;\n\
-    st.global.f32 [%rd7], %fs3;\n\
-DONE: ret;\n\
-}\0";
+fn binary_module(op: BinaryOp) -> &'static str {
+    static MODULES: std::sync::OnceLock<[String; 3]> = std::sync::OnceLock::new();
+    let modules = MODULES.get_or_init(|| {
+        // The printer emits ASCII only, so this cannot fail for a kernel
+        // `nsl-kir` builds.
+        BinaryOp::ALL.map(|op| {
+            String::from_utf8(nsl_kir::kernels::elementwise::binary_ptx(op)).expect("PTX must be ASCII")
+        })
+    });
+    let slot = BinaryOp::ALL.iter().position(|o| *o == op).expect("every BinaryOp is in ALL");
+    &modules[slot]
+}
 
+/// `nsl_add_f32`: `c[i] = a[i] + b[i]`, NUL-terminated.
+pub(crate) fn add_f32_ptx() -> &'static str {
+    binary_module(BinaryOp::Add)
+}
+
+/// `nsl_sub_f32`: `c[i] = a[i] - b[i]`, NUL-terminated.
+pub(crate) fn sub_f32_ptx() -> &'static str {
+    binary_module(BinaryOp::Sub)
+}
+
+/// `nsl_mul_f32`: `c[i] = a[i] * b[i]`, NUL-terminated.
+pub(crate) fn mul_f32_ptx() -> &'static str {
+    binary_module(BinaryOp::Mul)
+}
+
+// `nsl_div_f32` stays hand-written: it divides with `div.approx.f32`, and
+// KIR's f32 division is `div.rn.f32`, so moving it would change what GPU
+// division returns (see `nsl_kir::kernels::elementwise`).
 pub(crate) const DIV_F32_PTX: &str = "\
 .version 7.0\n\
 .target sm_70\n\
@@ -535,7 +469,7 @@ DONE: ret;\n\
 
 // Scalar-RHS sub (mfu-fusion C3 scalar sweep): out[i] = a[i] - s. Same
 // contract as DIV_SCALAR_F32_PTX above; `sub.f32` copied verbatim from
-// SUB_F32_PTX's nsl_sub_f32 (identical-opcode rule; a lone sub has no
+// the hand-written nsl_sub_f32 (identical-opcode rule; a lone sub has no
 // contraction partner, so bare sub.f32 and sub.rn.f32 are bitwise
 // equivalent here and the baseline's spelling wins).
 pub(crate) const SUB_SCALAR_F32_PTX: &str = "\
@@ -2219,9 +2153,6 @@ DONE: ret;\n\
 /// error in them is invisible until a kernel launch fails on a real GPU.
 #[cfg(test)]
 pub(crate) const ALL_PTX: &[(&str, &str)] = &[
-    ("ADD_F32_PTX", ADD_F32_PTX),
-    ("SUB_F32_PTX", SUB_F32_PTX),
-    ("MUL_F32_PTX", MUL_F32_PTX),
     ("DIV_F32_PTX", DIV_F32_PTX),
     ("ROTATE_HALF_F32_PTX", ROTATE_HALF_F32_PTX),
     ("ROTATE_HALF_NEG_F32_PTX", ROTATE_HALF_NEG_F32_PTX),
