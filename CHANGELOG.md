@@ -565,6 +565,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- `nsl build --shared-lib` refuses an `@export` whose name is a symbol the
+  library's statically linked runtime calls by name, such as `memcpy`,
+  `pow`, `log` or `exp` (#693). The export is defined in the same image as
+  the runtime. On macOS and Windows the linker binds the runtime's own calls
+  to it, so every `memcpy` ran the export wrapper with `(dst, src, n)` as
+  `(model, desc, ret)`. `dlpack_unsupported_dtype_refusal` exported
+  `memcpy` on purpose, and on those platforms its first dispatch aborted: a
+  misaligned dereference in `nsl_desc_to_tensor`, with an empty panic
+  message because the panic printer's own copies re-entered the export.
+  Linux passed only because ELF load order let libc win. The refusal applies
+  on every platform, before linking, and names every offender. The set is
+  read from the runtime archive the link would use and the program's own
+  objects, not a hand list
+  (`nsl_codegen::linker::refuse_runtime_symbol_shadowing`), and is gated by
+  `nsl-cli/tests/shared_lib_refuses_runtime_symbol_shadowing.rs`. The dlpack
+  suite no longer exports `memcpy`. `nsl_desc_to_tensor` also refuses a
+  pointer that is not 8-byte aligned, returning 0 with an error, instead of
+  dereferencing it.
+
 - The GPU forward GELU, `nsl_gelu_f32`, computes `x·σ(1.702x)`. It
   multiplied by `0f3FD9999A`, which is 1.7, while its source-AD backward
   (`nsl_gelu_backward_srcad_f32`) differentiates `x·σ(1.702x)` and every

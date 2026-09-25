@@ -284,7 +284,10 @@ The gates that make these declarations true: `crates/nsl-codegen/tests/pass_regi
   `default_shared_lib_path`; finds `libnsl_runtime*.a` in the toolchain dir
   (`find_runtime_lib`) and drives the system C compiler (`find_c_compiler`).
   Called from `crates/nsl-cli/src/commands/build/{normal,shared_lib,standalone,zk}.rs`
-  and `commands/test.rs`, never from inside codegen.
+  and `commands/test.rs`, never from inside codegen. Before a shared-library
+  link, `refuse_runtime_symbol_shadowing` refuses `@export` names that the
+  runtime archive or the program's objects import (`memcpy`, `log`, …). A
+  same-image definition captures those calls on Mach-O and PE (#693).
 - `src/c_wrapper.rs` — per-`@export` C-ABI wrapper emission
   (`emit_c_abi_wrapper`, `build_c_abi_wrapper_signature`,
   `emit_c_abi_dispatch_wrapper`); `src/c_export_table.rs` — the export table

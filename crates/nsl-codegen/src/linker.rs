@@ -736,6 +736,132 @@ fn find_c_compiler() -> Result<String, CodegenError> {
     ))
 }
 
+/// Refuse `@export` names that would shadow a symbol the shared library's
+/// own code imports (issue #693).
+///
+/// A `--shared-lib` artifact statically links its own copy of the runtime,
+/// and that copy calls C-library functions by name: `memcpy`, `log`, `exp`,
+/// `pow`, `write`, … An `@export fn memcpy` DEFINES a global `memcpy` in
+/// the same image, and on Mach-O and PE the static linker binds the
+/// runtime's own `memcpy` references to that definition — there is no load
+/// order to lose to, the image satisfies its own reference. Every runtime
+/// copy then runs the export wrapper with `(dst, src, n)` as
+/// `(model, desc, ret)`: `nsl_desc_to_tensor(src)` dereferenced an
+/// arbitrary byte pointer, which is the misaligned-deref abort #693
+/// observed on macOS and Windows (the panic printer copies bytes too, so it
+/// re-entered the export and died with an empty message). ELF happens to
+/// survive by load-order interposition unless the image is linked
+/// `-Bsymbolic`, which is why only Linux passed.
+///
+/// The export's symbol name IS its ABI (`ctypes.CDLL(lib).memcpy`), so it
+/// cannot be quietly renamed. The same source must mean the same thing on
+/// every platform, so it is refused everywhere, before linking, naming
+/// every offender.
+///
+/// The shadowed set is not a hand list: it is every symbol the runtime
+/// archive and the program's own objects reference without defining,
+/// read from the archive the link would use.
+pub fn refuse_runtime_symbol_shadowing(
+    obj_paths: &[PathBuf],
+    export_symbols: &[&str],
+) -> Result<(), CodegenError> {
+    if export_symbols.is_empty() {
+        return Ok(());
+    }
+    let runtime_lib = find_runtime_lib()?;
+    let mut imported = std::collections::BTreeSet::new();
+    let archive = fs::read(&runtime_lib).map_err(|e| {
+        CodegenError::new(format!(
+            "read runtime library {} to check @export names: {e}",
+            runtime_lib.display()
+        ))
+    })?;
+    collect_imported_symbols(&archive, &mut imported);
+    for obj in obj_paths {
+        let bytes = fs::read(obj).map_err(|e| {
+            CodegenError::new(format!(
+                "read object {} to check @export names: {e}",
+                obj.display()
+            ))
+        })?;
+        collect_imported_symbols(&bytes, &mut imported);
+    }
+    let shadowing = shadowing_exports(export_symbols, &imported);
+    if shadowing.is_empty() {
+        return Ok(());
+    }
+    let many = shadowing.len() > 1;
+    Err(CodegenError::new(format!(
+        "@export name{} {} collide{} with {} the shared library's statically \
+         linked runtime calls by name. An export is defined in the same image, \
+         so those calls would run the export wrapper instead — on macOS and \
+         Windows the linker always binds them that way (issue #693). Rename \
+         the export{}.",
+        if many { "s" } else { "" },
+        shadowing
+            .iter()
+            .map(|s| format!("`{s}`"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        if many { "" } else { "s" },
+        if many { "symbols" } else { "a symbol" },
+        if many { "s" } else { "" },
+    )))
+}
+
+/// The export names (in the given order) that appear in `imported`.
+fn shadowing_exports<'a>(
+    export_symbols: &[&'a str],
+    imported: &std::collections::BTreeSet<String>,
+) -> Vec<&'a str> {
+    export_symbols
+        .iter()
+        .copied()
+        .filter(|s| imported.contains(*s))
+        .collect()
+}
+
+/// Add every global symbol `bytes` references without defining — `bytes`
+/// being one object file or a static archive of them — to `out`, spelled
+/// as source-level C names: Mach-O's leading `_` and COFF's `__imp_`
+/// import-thunk prefix are removed. Members that are not object files
+/// (archive symbol tables, rlib metadata, bitcode) are skipped.
+fn collect_imported_symbols(bytes: &[u8], out: &mut std::collections::BTreeSet<String>) {
+    use object::read::archive::ArchiveFile;
+    if let Ok(archive) = ArchiveFile::parse(bytes) {
+        for member in archive.members().flatten() {
+            if let Ok(data) = member.data(bytes) {
+                collect_object_imports(data, out);
+            }
+        }
+    } else {
+        collect_object_imports(bytes, out);
+    }
+}
+
+fn collect_object_imports(bytes: &[u8], out: &mut std::collections::BTreeSet<String>) {
+    use object::{BinaryFormat, Object, ObjectSymbol};
+    let Ok(file) = object::File::parse(bytes) else {
+        return;
+    };
+    let macho = file.format() == BinaryFormat::MachO;
+    for sym in file.symbols() {
+        if !sym.is_undefined() || sym.is_local() {
+            continue;
+        }
+        let Ok(name) = sym.name() else { continue };
+        let name = name.strip_prefix("__imp_").unwrap_or(name);
+        let name = if macho {
+            name.strip_prefix('_').unwrap_or(name)
+        } else {
+            name
+        };
+        if !name.is_empty() {
+            out.insert(name.to_string());
+        }
+    }
+}
+
 /// M62a: Link multiple object files into a shared library (.so/.dylib/.dll).
 pub fn link_shared(obj_paths: &[PathBuf], output_path: &Path) -> Result<(), CodegenError> {
     link_shared_with_exports(obj_paths, output_path, &[])
@@ -769,6 +895,93 @@ mod tests {
     use super::*;
 
     use tempfile::tempdir;
+
+    /// An object in `format` that references `memcpy`, `log` and a COFF-style
+    /// `__imp_pow` without defining them, and defines a global `alpha`.
+    fn object_importing(format: object::BinaryFormat, arch: object::Architecture) -> Vec<u8> {
+        use object::write::{Object, Symbol, SymbolSection};
+        use object::{Endianness, SymbolFlags, SymbolKind, SymbolScope};
+        let mut obj = Object::new(format, arch, Endianness::Little);
+        let text = obj.section_id(object::write::StandardSection::Text);
+        let alpha = obj.add_symbol(Symbol {
+            name: b"alpha".to_vec(),
+            value: 0,
+            size: 0,
+            kind: SymbolKind::Text,
+            scope: SymbolScope::Dynamic,
+            weak: false,
+            section: SymbolSection::Undefined,
+            flags: SymbolFlags::None,
+        });
+        obj.add_symbol_data(alpha, text, &[0xc3; 4], 4);
+        let imports: &[&[u8]] = if format == object::BinaryFormat::Coff {
+            &[b"memcpy", b"log", b"__imp_pow"]
+        } else {
+            &[b"memcpy", b"log"]
+        };
+        for name in imports {
+            obj.add_symbol(Symbol {
+                name: name.to_vec(),
+                value: 0,
+                size: 0,
+                kind: SymbolKind::Text,
+                scope: SymbolScope::Unknown,
+                weak: false,
+                section: SymbolSection::Undefined,
+                flags: SymbolFlags::None,
+            });
+        }
+        obj.write().unwrap()
+    }
+
+    #[test]
+    fn imported_symbols_are_read_as_c_names_on_every_object_format() {
+        use object::{Architecture, BinaryFormat};
+        for (format, arch) in [
+            (BinaryFormat::Elf, Architecture::X86_64),
+            // The Mach-O writer mangles to `_memcpy`; the reader must undo it
+            // or the macOS lane — the one #693 failed on — would never match.
+            (BinaryFormat::MachO, Architecture::Aarch64),
+            (BinaryFormat::Coff, Architecture::X86_64),
+        ] {
+            let bytes = object_importing(format, arch);
+            let mut imported = std::collections::BTreeSet::new();
+            collect_imported_symbols(&bytes, &mut imported);
+            assert!(imported.contains("memcpy"), "{format:?}: {imported:?}");
+            assert!(imported.contains("log"), "{format:?}: {imported:?}");
+            assert!(
+                !imported.contains("alpha"),
+                "{format:?}: a DEFINED symbol is not an import: {imported:?}"
+            );
+            assert!(
+                imported.iter().all(|s| !s.starts_with('_') || s.starts_with("__")),
+                "{format:?}: Mach-O underscore left on: {imported:?}"
+            );
+            if format == BinaryFormat::Coff {
+                assert!(imported.contains("pow"), "__imp_ not stripped: {imported:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn shadowing_names_every_colliding_export_and_nothing_else() {
+        let imported: std::collections::BTreeSet<String> =
+            ["memcpy", "log", "nsl_tensor_free"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            shadowing_exports(&["alpha", "memcpy", "beta", "log"], &imported),
+            vec!["memcpy", "log"]
+        );
+        assert!(shadowing_exports(&["alpha", "gamma"], &imported).is_empty());
+        // Not a prefix or substring match.
+        assert!(shadowing_exports(&["memcpy2", "logit"], &imported).is_empty());
+    }
+
+    #[test]
+    fn non_object_bytes_contribute_nothing() {
+        let mut imported = std::collections::BTreeSet::new();
+        collect_imported_symbols(b"not an object file", &mut imported);
+        assert!(imported.is_empty());
+    }
 
     #[test]
     fn transient_lnk1104_on_output_is_retryable() {
