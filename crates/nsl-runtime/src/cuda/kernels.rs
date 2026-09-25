@@ -42,6 +42,84 @@ pub(crate) fn mul_f32_ptx() -> &'static str {
     binary_module(BinaryOp::Mul)
 }
 
+// The unary family, `c[i] = f(a[i])`, likewise built by
+// `nsl_kir::kernels::elementwise` (its `elementwise_unary_kir_equivalence`
+// gate). `nsl_tanh_f32` (`div.approx.f32`) and `nsl_gelu_f32` (a slope to fix
+// in place first) stay hand-written below.
+
+use nsl_kir::kernels::elementwise::UnaryOp;
+
+pub(crate) fn unary_module(op: UnaryOp) -> &'static str {
+    static MODULES: std::sync::OnceLock<[String; 12]> = std::sync::OnceLock::new();
+    let modules = MODULES.get_or_init(|| {
+        UnaryOp::ALL.map(|op| {
+            String::from_utf8(nsl_kir::kernels::elementwise::unary_ptx(op)).expect("PTX must be ASCII")
+        })
+    });
+    let slot = UnaryOp::ALL.iter().position(|o| *o == op).expect("every UnaryOp is in ALL");
+    &modules[slot]
+}
+
+/// `nsl_neg_f32`: `c[i] = -a[i]`, NUL-terminated.
+pub(crate) fn neg_f32_ptx() -> &'static str {
+    unary_module(UnaryOp::Neg)
+}
+
+/// `nsl_relu_f32`: `c[i] = max(a[i], 0)`, NUL-terminated.
+pub(crate) fn relu_f32_ptx() -> &'static str {
+    unary_module(UnaryOp::Relu)
+}
+
+/// `nsl_exp_f32`: `c[i] = e^a[i] (ex2.approx)`, NUL-terminated.
+pub(crate) fn exp_f32_ptx() -> &'static str {
+    unary_module(UnaryOp::Exp)
+}
+
+/// `nsl_log_f32`: `c[i] = ln a[i] (lg2.approx)`, NUL-terminated.
+pub(crate) fn log_f32_ptx() -> &'static str {
+    unary_module(UnaryOp::Log)
+}
+
+/// `nsl_sqrt_f32`: `c[i] = sqrt(a[i]) (IEEE)`, NUL-terminated.
+pub(crate) fn sqrt_f32_ptx() -> &'static str {
+    unary_module(UnaryOp::Sqrt)
+}
+
+/// `nsl_abs_f32`: `c[i] = |a[i]|`, NUL-terminated.
+pub(crate) fn abs_f32_ptx() -> &'static str {
+    unary_module(UnaryOp::Abs)
+}
+
+/// `nsl_sign_f32`: `c[i] = sign(a[i]) (0 for 0 and NaN)`, NUL-terminated.
+pub(crate) fn sign_f32_ptx() -> &'static str {
+    unary_module(UnaryOp::Sign)
+}
+
+/// `nsl_sigmoid_f32`: `c[i] = 1 / (1 + e^-a[i])`, NUL-terminated.
+pub(crate) fn sigmoid_f32_ptx() -> &'static str {
+    unary_module(UnaryOp::Sigmoid)
+}
+
+/// `nsl_sin_f32`: `c[i] = sin a[i] (sin.approx)`, NUL-terminated.
+pub(crate) fn sin_f32_ptx() -> &'static str {
+    unary_module(UnaryOp::Sin)
+}
+
+/// `nsl_cos_f32`: `c[i] = cos a[i] (cos.approx)`, NUL-terminated.
+pub(crate) fn cos_f32_ptx() -> &'static str {
+    unary_module(UnaryOp::Cos)
+}
+
+/// `nsl_silu_f32`: `c[i] = a[i] * sigmoid(a[i])`, NUL-terminated.
+pub(crate) fn silu_f32_ptx() -> &'static str {
+    unary_module(UnaryOp::Silu)
+}
+
+/// `nsl_clamp_f32`: `c[i] = min(max(a[i], lo), hi)`, NUL-terminated.
+pub(crate) fn clamp_f32_ptx() -> &'static str {
+    unary_module(UnaryOp::Clamp)
+}
+
 // `nsl_div_f32` stays hand-written: it divides with `div.approx.f32`, and
 // KIR's f32 division is `div.rn.f32`, so moving it would change what GPU
 // division returns (see `nsl_kir::kernels::elementwise`).
@@ -182,73 +260,6 @@ FIRST_HALF:\n\
     ld.global.f32 %fs1, [%rd11];\n\
     add.u64 %rd12, %rd2, %rd8;\n\
     st.global.f32 [%rd12], %fs1;\n\
-DONE: ret;\n\
-}\0";
-
-// --- Unary ops ---
-
-pub(crate) const NEG_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_neg_f32(\n\
-    .param .u64 a, .param .u64 c, .param .u64 n\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<7>;\n\
-    .reg .f32 %fs<3>;\n\
-    .reg .pred %p1;\n\
-    ld.param.u64 %rd1, [a];\n\
-    ld.param.u64 %rd2, [c];\n\
-    ld.param.u64 %rd3, [n];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd4, %r3;\n\
-    setp.ge.u64 %p1, %rd4, %rd3;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd5, %rd4, 2;\n\
-    add.u64 %rd6, %rd1, %rd5;\n\
-    ld.global.f32 %fs1, [%rd6];\n\
-    neg.f32 %fs1, %fs1;\n\
-    add.u64 %rd6, %rd2, %rd5;\n\
-    st.global.f32 [%rd6], %fs1;\n\
-DONE: ret;\n\
-}\0";
-
-pub(crate) const RELU_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_relu_f32(\n\
-    .param .u64 a, .param .u64 c, .param .u64 n\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<7>;\n\
-    .reg .f32 %fs<3>;\n\
-    .reg .pred %p1;\n\
-    ld.param.u64 %rd1, [a];\n\
-    ld.param.u64 %rd2, [c];\n\
-    ld.param.u64 %rd3, [n];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd4, %r3;\n\
-    setp.ge.u64 %p1, %rd4, %rd3;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd5, %rd4, 2;\n\
-    add.u64 %rd6, %rd1, %rd5;\n\
-    ld.global.f32 %fs1, [%rd6];\n\
-    mov.f32 %fs2, 0f00000000;\n\
-    max.f32 %fs1, %fs1, %fs2;\n\
-    add.u64 %rd6, %rd2, %rd5;\n\
-    st.global.f32 [%rd6], %fs1;\n\
 DONE: ret;\n\
 }\0";
 
@@ -505,217 +516,6 @@ pub(crate) const SUB_SCALAR_F32_PTX: &str = "\
 DONE: ret;\n\
 }\0";
 
-// --- Unary math ops: exp, log, sqrt, abs, sign ---
-
-/// exp(x) = 2^(x * log2(e))  using ex2.approx
-pub(crate) const EXP_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_exp_f32(\n\
-    .param .u64 a, .param .u64 c, .param .u64 n\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<7>;\n\
-    .reg .f32 %fs<3>;\n\
-    .reg .pred %p1;\n\
-    ld.param.u64 %rd1, [a];\n\
-    ld.param.u64 %rd2, [c];\n\
-    ld.param.u64 %rd3, [n];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd4, %r3;\n\
-    setp.ge.u64 %p1, %rd4, %rd3;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd5, %rd4, 2;\n\
-    add.u64 %rd6, %rd1, %rd5;\n\
-    ld.global.f32 %fs1, [%rd6];\n\
-    mul.f32 %fs2, %fs1, 0f3FB8AA3B;\n\
-    ex2.approx.f32 %fs1, %fs2;\n\
-    add.u64 %rd6, %rd2, %rd5;\n\
-    st.global.f32 [%rd6], %fs1;\n\
-DONE: ret;\n\
-}\0";
-
-/// ln(x) = log2(x) * ln(2)  using lg2.approx
-pub(crate) const LOG_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_log_f32(\n\
-    .param .u64 a, .param .u64 c, .param .u64 n\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<7>;\n\
-    .reg .f32 %fs<3>;\n\
-    .reg .pred %p1;\n\
-    ld.param.u64 %rd1, [a];\n\
-    ld.param.u64 %rd2, [c];\n\
-    ld.param.u64 %rd3, [n];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd4, %r3;\n\
-    setp.ge.u64 %p1, %rd4, %rd3;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd5, %rd4, 2;\n\
-    add.u64 %rd6, %rd1, %rd5;\n\
-    ld.global.f32 %fs1, [%rd6];\n\
-    lg2.approx.f32 %fs2, %fs1;\n\
-    mul.f32 %fs1, %fs2, 0f3F317218;\n\
-    add.u64 %rd6, %rd2, %rd5;\n\
-    st.global.f32 [%rd6], %fs1;\n\
-DONE: ret;\n\
-}\0";
-
-pub(crate) const SQRT_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_sqrt_f32(\n\
-    .param .u64 a, .param .u64 c, .param .u64 n\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<7>;\n\
-    .reg .f32 %fs<3>;\n\
-    .reg .pred %p1;\n\
-    ld.param.u64 %rd1, [a];\n\
-    ld.param.u64 %rd2, [c];\n\
-    ld.param.u64 %rd3, [n];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd4, %r3;\n\
-    setp.ge.u64 %p1, %rd4, %rd3;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd5, %rd4, 2;\n\
-    add.u64 %rd6, %rd1, %rd5;\n\
-    ld.global.f32 %fs1, [%rd6];\n\
-    sqrt.rn.f32 %fs1, %fs1;\n\
-    add.u64 %rd6, %rd2, %rd5;\n\
-    st.global.f32 [%rd6], %fs1;\n\
-DONE: ret;\n\
-}\0";
-
-pub(crate) const ABS_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_abs_f32(\n\
-    .param .u64 a, .param .u64 c, .param .u64 n\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<7>;\n\
-    .reg .f32 %fs<3>;\n\
-    .reg .pred %p1;\n\
-    ld.param.u64 %rd1, [a];\n\
-    ld.param.u64 %rd2, [c];\n\
-    ld.param.u64 %rd3, [n];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd4, %r3;\n\
-    setp.ge.u64 %p1, %rd4, %rd3;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd5, %rd4, 2;\n\
-    add.u64 %rd6, %rd1, %rd5;\n\
-    ld.global.f32 %fs1, [%rd6];\n\
-    abs.f32 %fs1, %fs1;\n\
-    add.u64 %rd6, %rd2, %rd5;\n\
-    st.global.f32 [%rd6], %fs1;\n\
-DONE: ret;\n\
-}\0";
-
-/// sign(x): 1.0 if x>0, -1.0 if x<0, 0.0 if x==0
-pub(crate) const SIGN_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_sign_f32(\n\
-    .param .u64 a, .param .u64 c, .param .u64 n\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<7>;\n\
-    .reg .f32 %fs<3>;\n\
-    .reg .pred %p<3>;\n\
-    ld.param.u64 %rd1, [a];\n\
-    ld.param.u64 %rd2, [c];\n\
-    ld.param.u64 %rd3, [n];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd4, %r3;\n\
-    setp.ge.u64 %p1, %rd4, %rd3;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd5, %rd4, 2;\n\
-    add.u64 %rd6, %rd1, %rd5;\n\
-    ld.global.f32 %fs1, [%rd6];\n\
-    mov.f32 %fs2, 0f00000000;\n\
-    setp.gt.f32 %p1, %fs1, %fs2;\n\
-    setp.lt.f32 %p2, %fs1, %fs2;\n\
-    selp.f32 %fs1, 0f3F800000, 0f00000000, %p1;\n\
-    selp.f32 %fs2, 0fBF800000, %fs1, %p2;\n\
-    mov.f32 %fs1, %fs2;\n\
-    add.u64 %rd6, %rd2, %rd5;\n\
-    st.global.f32 [%rd6], %fs1;\n\
-DONE: ret;\n\
-}\0";
-
-// --- Activation functions ---
-
-/// sigmoid(x) = 1 / (1 + exp(-x))
-pub(crate) const SIGMOID_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_sigmoid_f32(\n\
-    .param .u64 a, .param .u64 c, .param .u64 n\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<7>;\n\
-    .reg .f32 %fs<3>;\n\
-    .reg .pred %p1;\n\
-    ld.param.u64 %rd1, [a];\n\
-    ld.param.u64 %rd2, [c];\n\
-    ld.param.u64 %rd3, [n];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd4, %r3;\n\
-    setp.ge.u64 %p1, %rd4, %rd3;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd5, %rd4, 2;\n\
-    add.u64 %rd6, %rd1, %rd5;\n\
-    ld.global.f32 %fs1, [%rd6];\n\
-    neg.f32 %fs2, %fs1;\n\
-    mul.f32 %fs2, %fs2, 0f3FB8AA3B;\n\
-    ex2.approx.f32 %fs2, %fs2;\n\
-    add.f32 %fs2, %fs2, 0f3F800000;\n\
-    rcp.approx.f32 %fs1, %fs2;\n\
-    add.u64 %rd6, %rd2, %rd5;\n\
-    st.global.f32 [%rd6], %fs1;\n\
-DONE: ret;\n\
-}\0";
-
 // --- Backward kernels for activation functions ---
 
 /// relu_backward: out[i] = input[i] > 0 ? grad[i] : 0
@@ -944,7 +744,7 @@ DONE: ret;\n\
 // Mul, Add, Mul, Mul — into ONE launch, and is BIT-EXACT with them.
 //
 // Computes, per element, in source-AD's exact operation order:
-//   s  = sigmoid(a)                 (identical instructions to SIGMOID_F32_PTX)
+//   s  = sigmoid(a)                 (identical instructions to nsl_sigmoid_f32)
 //   t1 = 1.0 - s
 //   t2 = a * t1
 //   t3 = 1.0 + t2
@@ -961,7 +761,7 @@ DONE: ret;\n\
 // `fma` (one rounding) and diverge by ~1 ULP. `.rn` (round-to-nearest, already
 // the default) forbids contraction so each op rounds independently — exactly
 // like the 6 separate kernels, whose intermediates round to f32 through memory.
-// The sigmoid ops stay plain `.f32` to match SIGMOID_F32_PTX byte-for-byte (they
+// The sigmoid ops stay plain `.f32` to match nsl_sigmoid_f32 byte-for-byte (they
 // contain no contractible mul+add pair — ex2.approx/rcp.approx break the chain).
 // P5 item 20 slice B — fused SwiGLU GATE backward. For f = silu(g) * u the
 // adjoint pair is  t = dy * u  (Mul) followed by silu_backward(t, g); this
@@ -1170,7 +970,7 @@ DONE: ret;\n\
 // sigmoid approximation):
 //
 //   kx  = 1.702 * x                 (0f3FD9DB23 = 1.702f, matches nsl_tensor_scalar(1.702,1))
-//   s   = σ(kx)                     (identical instructions to SIGMOID_F32_PTX)
+//   s   = σ(kx)                     (identical instructions to nsl_sigmoid_f32)
 //   out = grad * s*(1 + kx*(1-s))
 //
 // This REPLACES the source-AD 7-op expansion of `AdjointExpr::GeluBackward`,
@@ -1925,72 +1725,6 @@ pub(crate) const CLAMP_BACKWARD_F32_PTX: &str = "\
 DONE: ret;\n\
 }\0";
 
-/// sin(x) using sin.approx.f32
-pub(crate) const SIN_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_sin_f32(\n\
-    .param .u64 a, .param .u64 c, .param .u64 n\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<7>;\n\
-    .reg .f32 %fs<3>;\n\
-    .reg .pred %p1;\n\
-    ld.param.u64 %rd1, [a];\n\
-    ld.param.u64 %rd2, [c];\n\
-    ld.param.u64 %rd3, [n];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd4, %r3;\n\
-    setp.ge.u64 %p1, %rd4, %rd3;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd5, %rd4, 2;\n\
-    add.u64 %rd6, %rd1, %rd5;\n\
-    ld.global.f32 %fs1, [%rd6];\n\
-    sin.approx.f32 %fs1, %fs1;\n\
-    add.u64 %rd6, %rd2, %rd5;\n\
-    st.global.f32 [%rd6], %fs1;\n\
-DONE: ret;\n\
-}\0";
-
-/// cos(x) using cos.approx.f32
-pub(crate) const COS_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_cos_f32(\n\
-    .param .u64 a, .param .u64 c, .param .u64 n\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<7>;\n\
-    .reg .f32 %fs<3>;\n\
-    .reg .pred %p1;\n\
-    ld.param.u64 %rd1, [a];\n\
-    ld.param.u64 %rd2, [c];\n\
-    ld.param.u64 %rd3, [n];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd4, %r3;\n\
-    setp.ge.u64 %p1, %rd4, %rd3;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd5, %rd4, 2;\n\
-    add.u64 %rd6, %rd1, %rd5;\n\
-    ld.global.f32 %fs1, [%rd6];\n\
-    cos.approx.f32 %fs1, %fs1;\n\
-    add.u64 %rd6, %rd2, %rd5;\n\
-    st.global.f32 [%rd6], %fs1;\n\
-DONE: ret;\n\
-}\0";
-
 /// gelu(x) = x * sigmoid(1.702 * x)  [sigmoid approximation]
 /// sigmoid(1.702*x) = 1 / (1 + exp(-1.702*x))
 pub(crate) const GELU_F32_PTX: &str = "\
@@ -2026,80 +1760,6 @@ pub(crate) const GELU_F32_PTX: &str = "\
     add.f32 %fs3, %fs3, 0f3F800000;\n\
     rcp.approx.f32 %fs3, %fs3;\n\
     mul.f32 %fs1, %fs1, %fs3;\n\
-    add.u64 %rd6, %rd2, %rd5;\n\
-    st.global.f32 [%rd6], %fs1;\n\
-DONE: ret;\n\
-}\0";
-
-/// silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
-pub(crate) const SILU_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_silu_f32(\n\
-    .param .u64 a, .param .u64 c, .param .u64 n\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<7>;\n\
-    .reg .f32 %fs<4>;\n\
-    .reg .pred %p1;\n\
-    ld.param.u64 %rd1, [a];\n\
-    ld.param.u64 %rd2, [c];\n\
-    ld.param.u64 %rd3, [n];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd4, %r3;\n\
-    setp.ge.u64 %p1, %rd4, %rd3;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd5, %rd4, 2;\n\
-    add.u64 %rd6, %rd1, %rd5;\n\
-    ld.global.f32 %fs1, [%rd6];\n\
-    neg.f32 %fs2, %fs1;\n\
-    mul.f32 %fs2, %fs2, 0f3FB8AA3B;\n\
-    ex2.approx.f32 %fs2, %fs2;\n\
-    add.f32 %fs2, %fs2, 0f3F800000;\n\
-    rcp.approx.f32 %fs2, %fs2;\n\
-    mul.f32 %fs1, %fs1, %fs2;\n\
-    add.u64 %rd6, %rd2, %rd5;\n\
-    st.global.f32 [%rd6], %fs1;\n\
-DONE: ret;\n\
-}\0";
-
-/// clamp(x, lo, hi): max(lo, min(x, hi))
-pub(crate) const CLAMP_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_clamp_f32(\n\
-    .param .u64 a, .param .u64 c, .param .u64 n, .param .f32 lo, .param .f32 hi\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<7>;\n\
-    .reg .f32 %fs<4>;\n\
-    .reg .pred %p1;\n\
-    ld.param.u64 %rd1, [a];\n\
-    ld.param.u64 %rd2, [c];\n\
-    ld.param.u64 %rd3, [n];\n\
-    ld.param.f32 %fs2, [lo];\n\
-    ld.param.f32 %fs3, [hi];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd4, %r3;\n\
-    setp.ge.u64 %p1, %rd4, %rd3;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd5, %rd4, 2;\n\
-    add.u64 %rd6, %rd1, %rd5;\n\
-    ld.global.f32 %fs1, [%rd6];\n\
-    max.f32 %fs1, %fs1, %fs2;\n\
-    min.f32 %fs1, %fs1, %fs3;\n\
     add.u64 %rd6, %rd2, %rd5;\n\
     st.global.f32 [%rd6], %fs1;\n\
 DONE: ret;\n\
@@ -2145,7 +1805,6 @@ pub(crate) const TANH_F32_PTX: &str = "\
 DONE: ret;\n\
 }\0";
 
-
 /// Every hand-written PTX module in this file, paired with its constant name.
 ///
 /// Consumed by the `ptxas` gate in `super::tests`, which assembles each one.
@@ -2156,20 +1815,12 @@ pub(crate) const ALL_PTX: &[(&str, &str)] = &[
     ("DIV_F32_PTX", DIV_F32_PTX),
     ("ROTATE_HALF_F32_PTX", ROTATE_HALF_F32_PTX),
     ("ROTATE_HALF_NEG_F32_PTX", ROTATE_HALF_NEG_F32_PTX),
-    ("NEG_F32_PTX", NEG_F32_PTX),
-    ("RELU_F32_PTX", RELU_F32_PTX),
     ("MUL_SCALAR_F32_PTX", MUL_SCALAR_F32_PTX),
     ("MUON_SCALE_INV_FROB_F32_PTX", MUON_SCALE_INV_FROB_F32_PTX),
     ("SCALAR_MUL_ADD_INPLACE_F32_PTX", SCALAR_MUL_ADD_INPLACE_F32_PTX),
     ("ADD_SCALAR_F32_PTX", ADD_SCALAR_F32_PTX),
     ("DIV_SCALAR_F32_PTX", DIV_SCALAR_F32_PTX),
     ("SUB_SCALAR_F32_PTX", SUB_SCALAR_F32_PTX),
-    ("EXP_F32_PTX", EXP_F32_PTX),
-    ("LOG_F32_PTX", LOG_F32_PTX),
-    ("SQRT_F32_PTX", SQRT_F32_PTX),
-    ("ABS_F32_PTX", ABS_F32_PTX),
-    ("SIGN_F32_PTX", SIGN_F32_PTX),
-    ("SIGMOID_F32_PTX", SIGMOID_F32_PTX),
     ("RELU_BACKWARD_F32_PTX", RELU_BACKWARD_F32_PTX),
     ("SIGMOID_BACKWARD_F32_PTX", SIGMOID_BACKWARD_F32_PTX),
     ("TANH_BACKWARD_F32_PTX", TANH_BACKWARD_F32_PTX),
@@ -2186,10 +1837,6 @@ pub(crate) const ALL_PTX: &[(&str, &str)] = &[
     ("FASE_FUSED_ADAMW_STEP_BF16SR_PTX", FASE_FUSED_ADAMW_STEP_BF16SR_PTX),
     ("SR_BF16_ROUND_PROBE_PTX", SR_BF16_ROUND_PROBE_PTX),
     ("CLAMP_BACKWARD_F32_PTX", CLAMP_BACKWARD_F32_PTX),
-    ("SIN_F32_PTX", SIN_F32_PTX),
-    ("COS_F32_PTX", COS_F32_PTX),
     ("GELU_F32_PTX", GELU_F32_PTX),
-    ("SILU_F32_PTX", SILU_F32_PTX),
-    ("CLAMP_F32_PTX", CLAMP_F32_PTX),
     ("TANH_F32_PTX", TANH_F32_PTX),
 ];

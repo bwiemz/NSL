@@ -19,12 +19,12 @@ pub extern "C" fn nsl_tensor_exp(tensor_ptr: i64) -> i64 {
             #[cfg(feature = "cuda")]
             {
                 if ta.can_mutate_inplace_gpu() {
-                    crate::cuda::gpu_elementwise_unary_inplace(tensor_ptr, crate::cuda::kernels::EXP_F32_PTX, "nsl_exp_f32\0");
+                    crate::cuda::gpu_elementwise_unary_inplace(tensor_ptr, crate::cuda::kernels::exp_f32_ptx(), "nsl_exp_f32\0");
                     ta.refcount.fetch_add(1, Ordering::SeqCst);
                     super::fbip_record_reuse();
                     return tensor_ptr;
                 }
-                let result = crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::EXP_F32_PTX, "nsl_exp_f32\0");
+                let result = crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::exp_f32_ptx(), "nsl_exp_f32\0");
                 // Tape record on the GPU arm (see nsl_tensor_add in arithmetic.rs).
                 if autodiff::is_recording() {
                     NslTensor::from_ptr(result).refcount.fetch_add(1, Ordering::SeqCst);
@@ -113,12 +113,12 @@ pub extern "C" fn nsl_tensor_log(tensor_ptr: i64) -> i64 {
             #[cfg(feature = "cuda")]
             {
                 if ta.can_mutate_inplace_gpu() {
-                    crate::cuda::gpu_elementwise_unary_inplace(tensor_ptr, crate::cuda::kernels::LOG_F32_PTX, "nsl_log_f32\0");
+                    crate::cuda::gpu_elementwise_unary_inplace(tensor_ptr, crate::cuda::kernels::log_f32_ptx(), "nsl_log_f32\0");
                     ta.refcount.fetch_add(1, Ordering::SeqCst);
                     super::fbip_record_reuse();
                     return tensor_ptr;
                 }
-                let result = crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::LOG_F32_PTX, "nsl_log_f32\0");
+                let result = crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::log_f32_ptx(), "nsl_log_f32\0");
                 // Tape record on the GPU arm (see nsl_tensor_add in arithmetic.rs).
                 if autodiff::is_recording() {
                     NslTensor::from_ptr(tensor_ptr).refcount.fetch_add(1, Ordering::SeqCst);
@@ -207,12 +207,12 @@ pub extern "C" fn nsl_tensor_sqrt(tensor_ptr: i64) -> i64 {
             #[cfg(feature = "cuda")]
             {
                 if ta.can_mutate_inplace_gpu() {
-                    crate::cuda::gpu_elementwise_unary_inplace(tensor_ptr, crate::cuda::kernels::SQRT_F32_PTX, "nsl_sqrt_f32\0");
+                    crate::cuda::gpu_elementwise_unary_inplace(tensor_ptr, crate::cuda::kernels::sqrt_f32_ptx(), "nsl_sqrt_f32\0");
                     ta.refcount.fetch_add(1, Ordering::SeqCst);
                     super::fbip_record_reuse();
                     return tensor_ptr;
                 }
-                let result = crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::SQRT_F32_PTX, "nsl_sqrt_f32\0");
+                let result = crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::sqrt_f32_ptx(), "nsl_sqrt_f32\0");
                 // Tape record on the GPU arm (see nsl_tensor_add in arithmetic.rs).
                 if autodiff::is_recording() {
                     NslTensor::from_ptr(result).refcount.fetch_add(1, Ordering::SeqCst);
@@ -301,12 +301,12 @@ pub extern "C" fn nsl_tensor_abs(tensor_ptr: i64) -> i64 {
             #[cfg(feature = "cuda")]
             {
                 if ta.can_mutate_inplace_gpu() {
-                    crate::cuda::gpu_elementwise_unary_inplace(tensor_ptr, crate::cuda::kernels::ABS_F32_PTX, "nsl_abs_f32\0");
+                    crate::cuda::gpu_elementwise_unary_inplace(tensor_ptr, crate::cuda::kernels::abs_f32_ptx(), "nsl_abs_f32\0");
                     ta.refcount.fetch_add(1, Ordering::SeqCst);
                     super::fbip_record_reuse();
                     return tensor_ptr;
                 }
-                let result = crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::ABS_F32_PTX, "nsl_abs_f32\0");
+                let result = crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::abs_f32_ptx(), "nsl_abs_f32\0");
                 // Tape record on the GPU arm (see nsl_tensor_add in arithmetic.rs).
                 if autodiff::is_recording() {
                     NslTensor::from_ptr(tensor_ptr).refcount.fetch_add(1, Ordering::SeqCst);
@@ -389,12 +389,12 @@ pub extern "C" fn nsl_tensor_sign(tensor_ptr: i64) -> i64 {
             #[cfg(feature = "cuda")]
             {
                 if ta.can_mutate_inplace_gpu() {
-                    crate::cuda::gpu_elementwise_unary_inplace(tensor_ptr, crate::cuda::kernels::SIGN_F32_PTX, "nsl_sign_f32\0");
+                    crate::cuda::gpu_elementwise_unary_inplace(tensor_ptr, crate::cuda::kernels::sign_f32_ptx(), "nsl_sign_f32\0");
                     ta.refcount.fetch_add(1, Ordering::SeqCst);
                     super::fbip_record_reuse();
                     return tensor_ptr;
                 }
-                return crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::SIGN_F32_PTX, "nsl_sign_f32\0");
+                return crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::sign_f32_ptx(), "nsl_sign_f32\0");
             }
             #[cfg(not(feature = "cuda"))]
             { crate::fatal::cuda_not_compiled(); }
@@ -633,12 +633,12 @@ pub extern "C" fn nsl_tensor_relu(tensor_ptr: i64) -> i64 {
             #[cfg(feature = "cuda")]
             {
                 if ta.can_mutate_inplace_gpu() {
-                    crate::cuda::gpu_elementwise_unary_inplace(tensor_ptr, crate::cuda::kernels::RELU_F32_PTX, "nsl_relu_f32\0");
+                    crate::cuda::gpu_elementwise_unary_inplace(tensor_ptr, crate::cuda::kernels::relu_f32_ptx(), "nsl_relu_f32\0");
                     ta.refcount.fetch_add(1, Ordering::SeqCst);
                     super::fbip_record_reuse();
                     return tensor_ptr;
                 }
-                let result = crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::RELU_F32_PTX, "nsl_relu_f32\0");
+                let result = crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::relu_f32_ptx(), "nsl_relu_f32\0");
                 // Tape record on the GPU arm (see nsl_tensor_add in arithmetic.rs).
                 if autodiff::is_recording() {
                     NslTensor::from_ptr(tensor_ptr).refcount.fetch_add(1, Ordering::SeqCst);
@@ -839,12 +839,12 @@ pub extern "C" fn nsl_tensor_silu(tensor_ptr: i64) -> i64 {
             #[cfg(feature = "cuda")]
             {
                 if ta.can_mutate_inplace_gpu() {
-                    crate::cuda::gpu_elementwise_unary_inplace(tensor_ptr, crate::cuda::kernels::SILU_F32_PTX, "nsl_silu_f32\0");
+                    crate::cuda::gpu_elementwise_unary_inplace(tensor_ptr, crate::cuda::kernels::silu_f32_ptx(), "nsl_silu_f32\0");
                     ta.refcount.fetch_add(1, Ordering::SeqCst);
                     super::fbip_record_reuse();
                     return tensor_ptr;
                 }
-                let result = crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::SILU_F32_PTX, "nsl_silu_f32\0");
+                let result = crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::silu_f32_ptx(), "nsl_silu_f32\0");
                 // Tape record on the GPU arm (see nsl_tensor_add in arithmetic.rs).
                 if autodiff::is_recording() {
                     NslTensor::from_ptr(tensor_ptr).refcount.fetch_add(1, Ordering::SeqCst);
@@ -938,7 +938,7 @@ pub extern "C" fn nsl_tensor_silu(tensor_ptr: i64) -> i64 {
 /// (Sigmoid, Sub, Mul, Add, Mul, Mul) — see `AdjointExpr::SiluBackward`. It is
 /// BIT-EXACT with that decomposed path: the GPU kernel
 /// (`SILU_BACKWARD_SRCAD_F32_PTX`) reproduces the exact operation ORDER and the
-/// SIGMOID_F32_PTX instructions, with `.rn` on the derivative ops to block ptxas
+/// `nsl_sigmoid_f32` instructions, with `.rn` on the derivative ops to block ptxas
 /// fma-contraction; the CPU path computes the same order in f64/f32 (Rust emits
 /// no FMA for separate `*`/`+`). `grad` and `x` are made contiguous first, as the
 /// decomposed path's per-op kernels do.
@@ -1501,12 +1501,12 @@ pub extern "C" fn nsl_tensor_sigmoid(tensor_ptr: i64) -> i64 {
             #[cfg(feature = "cuda")]
             {
                 if ta.can_mutate_inplace_gpu() {
-                    crate::cuda::gpu_elementwise_unary_inplace(tensor_ptr, crate::cuda::kernels::SIGMOID_F32_PTX, "nsl_sigmoid_f32\0");
+                    crate::cuda::gpu_elementwise_unary_inplace(tensor_ptr, crate::cuda::kernels::sigmoid_f32_ptx(), "nsl_sigmoid_f32\0");
                     ta.refcount.fetch_add(1, Ordering::SeqCst);
                     super::fbip_record_reuse();
                     return tensor_ptr;
                 }
-                let result = crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::SIGMOID_F32_PTX, "nsl_sigmoid_f32\0");
+                let result = crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::sigmoid_f32_ptx(), "nsl_sigmoid_f32\0");
                 // Tape record on the GPU arm (see nsl_tensor_add in arithmetic.rs).
                 if autodiff::is_recording() {
                     NslTensor::from_ptr(result).refcount.fetch_add(1, Ordering::SeqCst);
@@ -1735,15 +1735,15 @@ macro_rules! define_inplace_unary {
     };
 }
 
-define_inplace_unary!(nsl_tensor_relu_inplace, |v: f32| if v > 0.0 { v } else { 0.0_f32 }, |v: f64| if v > 0.0 { v } else { 0.0 }, crate::cuda::kernels::RELU_F32_PTX, "nsl_relu_f32\0");
-define_inplace_unary!(nsl_tensor_exp_inplace, |v: f32| v.exp(), |v: f64| v.exp(), crate::cuda::kernels::EXP_F32_PTX, "nsl_exp_f32\0");
-define_inplace_unary!(nsl_tensor_log_inplace, |v: f32| v.ln(), |v: f64| v.ln(), crate::cuda::kernels::LOG_F32_PTX, "nsl_log_f32\0");
-define_inplace_unary!(nsl_tensor_sqrt_inplace, |v: f32| v.sqrt(), |v: f64| v.sqrt(), crate::cuda::kernels::SQRT_F32_PTX, "nsl_sqrt_f32\0");
-define_inplace_unary!(nsl_tensor_abs_inplace, |v: f32| v.abs(), |v: f64| v.abs(), crate::cuda::kernels::ABS_F32_PTX, "nsl_abs_f32\0");
-define_inplace_unary!(nsl_tensor_sigmoid_inplace, |v: f32| 1.0_f32 / (1.0_f32 + (-v).exp()), |v: f64| 1.0 / (1.0 + (-v).exp()), crate::cuda::kernels::SIGMOID_F32_PTX, "nsl_sigmoid_f32\0");
+define_inplace_unary!(nsl_tensor_relu_inplace, |v: f32| if v > 0.0 { v } else { 0.0_f32 }, |v: f64| if v > 0.0 { v } else { 0.0 }, crate::cuda::kernels::relu_f32_ptx(), "nsl_relu_f32\0");
+define_inplace_unary!(nsl_tensor_exp_inplace, |v: f32| v.exp(), |v: f64| v.exp(), crate::cuda::kernels::exp_f32_ptx(), "nsl_exp_f32\0");
+define_inplace_unary!(nsl_tensor_log_inplace, |v: f32| v.ln(), |v: f64| v.ln(), crate::cuda::kernels::log_f32_ptx(), "nsl_log_f32\0");
+define_inplace_unary!(nsl_tensor_sqrt_inplace, |v: f32| v.sqrt(), |v: f64| v.sqrt(), crate::cuda::kernels::sqrt_f32_ptx(), "nsl_sqrt_f32\0");
+define_inplace_unary!(nsl_tensor_abs_inplace, |v: f32| v.abs(), |v: f64| v.abs(), crate::cuda::kernels::abs_f32_ptx(), "nsl_abs_f32\0");
+define_inplace_unary!(nsl_tensor_sigmoid_inplace, |v: f32| 1.0_f32 / (1.0_f32 + (-v).exp()), |v: f64| 1.0 / (1.0 + (-v).exp()), crate::cuda::kernels::sigmoid_f32_ptx(), "nsl_sigmoid_f32\0");
 define_inplace_unary!(nsl_tensor_tanh_inplace, |v: f32| v.tanh(), |v: f64| v.tanh(), crate::cuda::kernels::TANH_F32_PTX, "nsl_tanh_f32\0");
-define_inplace_unary!(nsl_tensor_neg_inplace, |v: f32| -v, |v: f64| -v, crate::cuda::kernels::NEG_F32_PTX, "nsl_neg_f32\0");
-define_inplace_unary!(nsl_tensor_sign_inplace, |v: f32| if v > 0.0 { 1.0_f32 } else if v < 0.0 { -1.0_f32 } else { 0.0_f32 }, |v: f64| if v > 0.0 { 1.0 } else if v < 0.0 { -1.0 } else { 0.0 }, crate::cuda::kernels::SIGN_F32_PTX, "nsl_sign_f32\0");
+define_inplace_unary!(nsl_tensor_neg_inplace, |v: f32| -v, |v: f64| -v, crate::cuda::kernels::neg_f32_ptx(), "nsl_neg_f32\0");
+define_inplace_unary!(nsl_tensor_sign_inplace, |v: f32| if v > 0.0 { 1.0_f32 } else if v < 0.0 { -1.0_f32 } else { 0.0_f32 }, |v: f64| if v > 0.0 { 1.0 } else if v < 0.0 { -1.0 } else { 0.0 }, crate::cuda::kernels::sign_f32_ptx(), "nsl_sign_f32\0");
 
 /// GELU in-place.
 #[unsafe(no_mangle)]
@@ -1790,7 +1790,7 @@ pub extern "C" fn nsl_tensor_silu_inplace(ptr: i64) -> i64 {
     if t.device > 0 {
         #[cfg(feature = "cuda")]
         {
-            crate::cuda::gpu_elementwise_unary_inplace(ptr, crate::cuda::kernels::SILU_F32_PTX, "nsl_silu_f32\0");
+            crate::cuda::gpu_elementwise_unary_inplace(ptr, crate::cuda::kernels::silu_f32_ptx(), "nsl_silu_f32\0");
             super::fbip_record_reuse();
             return ptr;
         }

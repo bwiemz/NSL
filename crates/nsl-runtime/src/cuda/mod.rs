@@ -6067,7 +6067,7 @@ pub(crate) fn gpu_clamp_f32(a_ptr: i64, lo: f32, hi: f32) -> i64 {
     let block = 256i64;
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
-        kernels::CLAMP_F32_PTX.as_ptr(),
+        kernels::clamp_f32_ptx().as_ptr(),
         "nsl_clamp_f32\0".as_ptr(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
@@ -6099,7 +6099,7 @@ pub(crate) fn gpu_clamp_f32_inplace(a_ptr: i64, lo: f32, hi: f32) {
     let block = 256i64;
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
-        kernels::CLAMP_F32_PTX.as_ptr(),
+        kernels::clamp_f32_ptx().as_ptr(),
         "nsl_clamp_f32\0".as_ptr(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
@@ -10329,7 +10329,7 @@ mod tests {
     /// declared.
     ///
     /// The four precision casts (roadmap A2 step 7), the strided run copy,
-    /// the Tier B.1 pre-passes and the binary elementwise add/sub/mul
+    /// the Tier B.1 pre-passes and the binary and unary elementwise kernels
     /// (step 11) moved to `nsl_kir::kernels`,
     /// so they are no longer `const` and cannot sit in the array above.
     /// They still have to reach both gates: the registry's own comment
@@ -10348,6 +10348,9 @@ mod tests {
         all.push(("nsl_add_f32", super::kernels::add_f32_ptx(), true));
         all.push(("nsl_sub_f32", super::kernels::sub_f32_ptx(), true));
         all.push(("nsl_mul_f32", super::kernels::mul_f32_ptx(), true));
+        for op in nsl_kir::kernels::elementwise::UnaryOp::ALL {
+            all.push((op.kernel_name(), super::kernels::unary_module(op), true));
+        }
         all
     }
 

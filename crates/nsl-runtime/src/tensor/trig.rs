@@ -16,7 +16,7 @@ pub extern "C" fn nsl_tensor_sin(tensor_ptr: i64) -> i64 {
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {
-                let result = crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::SIN_F32_PTX, "nsl_sin_f32\0");
+                let result = crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::sin_f32_ptx(), "nsl_sin_f32\0");
                 // Tape record on the GPU arm (see nsl_tensor_add in arithmetic.rs).
                 if autodiff::is_recording() {
                     NslTensor::from_ptr(tensor_ptr).refcount.fetch_add(1, Ordering::SeqCst);
@@ -80,7 +80,7 @@ pub extern "C" fn nsl_tensor_cos(tensor_ptr: i64) -> i64 {
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {
-                let result = crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::COS_F32_PTX, "nsl_cos_f32\0");
+                let result = crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::cos_f32_ptx(), "nsl_cos_f32\0");
                 // Tape record on the GPU arm (see nsl_tensor_add in arithmetic.rs).
                 if autodiff::is_recording() {
                     NslTensor::from_ptr(tensor_ptr).refcount.fetch_add(1, Ordering::SeqCst);
