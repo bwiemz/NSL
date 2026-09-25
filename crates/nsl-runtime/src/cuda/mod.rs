@@ -10270,6 +10270,49 @@ mod dtype_guard_drift {
     }
 }
 
+/// Static drift gate: the GPU forward GELU and its source-AD backward use one
+/// slope.
+///
+/// `nsl_gelu_f32` computes `x·σ(k·x)` and `nsl_gelu_backward_srcad_f32`
+/// computes that function's derivative for a `k` of its own. The two are
+/// separate hand-written modules, so nothing but this gate ties their `k`s
+/// together, and they did drift: the forward multiplied by `0f3FD9999A`
+/// (1.7) while the backward, every description of the kernel and the host
+/// references used `0f3FD9DB23` (1.702). The GPU finite-difference test did
+/// not notice; its tolerance is wider than the gap. Like `dtype_guard_drift`,
+/// this reads `kernels.rs` as text so it runs in the CPU lane.
+#[cfg(test)]
+mod gelu_slope_drift {
+    /// The body of the `const NAME: &str = "…";` item in `source`.
+    fn ptx_body<'a>(source: &'a str, name: &str) -> &'a str {
+        let head = format!("pub(crate) const {name}: &str = \"");
+        let start = source.find(&head).unwrap_or_else(|| panic!("{name} is declared in kernels.rs")) + head.len();
+        let len = source[start..].find("\\0\";").expect("the constant is NUL-terminated");
+        &source[start..start + len]
+    }
+
+    /// The f32 immediate of the one `mul` that scales the input by `k`.
+    fn slope(body: &str, mul: &str) -> u32 {
+        let lines: Vec<&str> = body.lines().map(str::trim).filter(|l| l.starts_with(mul)).collect();
+        assert_eq!(lines.len(), 1, "exactly one `{mul}` line: {lines:?}");
+        let imm = lines[0].rsplit("0f").next().expect("an f32 immediate");
+        u32::from_str_radix(&imm[..8], 16).expect("8 hex digits")
+    }
+
+    #[test]
+    fn the_forward_and_its_backward_scale_by_1_702() {
+        let source = include_str!("kernels.rs");
+        let forward = slope(ptx_body(source, "GELU_F32_PTX"), "mul.f32 %fs2, %fs1, 0f");
+        let backward = slope(ptx_body(source, "GELU_BACKWARD_SRCAD_F32_PTX"), "mul.rn.f32 %fs2, %fs2, 0f");
+        let want = 1.702_f32.to_bits();
+        assert!(backward == want, "the backward's slope is 0f{backward:08X}, not 1.702f (0f{want:08X})");
+        assert!(
+            forward == backward,
+            "nsl_gelu_f32 scales by 0f{forward:08X}; its backward differentiates 0f{backward:08X}"
+        );
+    }
+}
+
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;

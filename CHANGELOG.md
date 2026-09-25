@@ -539,6 +539,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- The GPU forward GELU, `nsl_gelu_f32`, computes `x·σ(1.702x)`. It
+  multiplied by `0f3FD9999A`, which is 1.7, while its source-AD backward
+  (`nsl_gelu_backward_srcad_f32`) differentiates `x·σ(1.702x)` and every
+  description of the kernel says 1.702. So on the GPU the gradients were
+  for a slightly different function than the forward, whose outputs sat
+  low by up to about 2.6e-4 (near |x| = 1). GPU GELU outputs rise by that
+  much now. The GPU finite-difference test missed it because its tolerance
+  is wider than the gap. A CPU-lane test in `cuda/mod.rs`
+  (`gelu_slope_drift`) now reads both kernels' slopes, and a GPU test checks
+  the forward against `x·σ(1.702x)` to 1e-5. Found while moving the unary
+  kernels onto KIR (roadmap A2 step 11).
+
 - `KirOp::AtomicAdd` printed `atom.<space>.add.<ty> %v, [p], %v`, which
   writes memory's old value into the added value's register without the
   register allocator knowing, so a later read of that value, or a value
