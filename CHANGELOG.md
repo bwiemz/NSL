@@ -579,6 +579,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- The fused SDPA forward (the scalar flash-attention v2 path, which Stage C's
+  packed segment-masked kernels use) had a shared-memory race on every
+  sequence longer than one KV tile. K and V share one shared-memory region,
+  and the KV loop branched from the P·V sweep straight into the next tile's
+  K load with no barrier. A warp that finished early overwrote the V tile
+  while slower warps were still reading it. The attention output came out
+  wrong (not the logsumexp), and which rows were wrong depended on warp
+  scheduling. Each KV iteration now ends with a `bar.sync`, in the standard
+  path, the per-document CTA path and the CSHA P·V pass. The tensor-core
+  forward already had this fence. The Stage-C GPU gate could not see the
+  race: its fixture is 64 tokens, one KV tile. Its 2e-2 checkpoint
+  tolerance could not fail on numerics either, since AdamW at lr 2e-3 over
+  8 steps bounds any two runs' drift near 1.6e-2.
+  `nsl-codegen/tests/sdpa_fused_forward_interp.rs` now executes the
+  production segment-masked PTX (base and Tier-B variants, both thread
+  schedules, seq 128, two batch rows, two heads) on the CTA interpreter
+  against f64 oracles. It pins the output to within one f16 rounding of an
+  oracle that stages K and V and the output in f16, as the kernel does
+  (Q stays f32 in registers), and the logsumexp to f32 noise. It catches
+  five named mutants, including the removed fence. The interpreter gained
+  warp-synchronous `shfl.sync.bfly`, `setp.nan`, predicate `and`/`or`,
+  `.u16` loads, stores and compares, `cvta.shared`, `max.u32`,
+  `cvt.u16.u32`/`cvt.u32.u16` and `%laneid`.
 - `nsl build --shared-lib` refuses an `@export` whose name is a symbol the
   library's statically linked runtime calls by name, such as `memcpy`,
   `pow`, `log` or `exp` (#693). The export is defined in the same image as
