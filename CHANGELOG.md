@@ -579,6 +579,41 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- The flash-attention backward on tensor cores (sm_80+) counted three of
+  every four row tiles' gradients twice at head_dim <= 32 whenever its body
+  was the single-warp one: every packed (segment-masked, PCA Stage C) step,
+  and unmasked steps under `NSL_FA_BWD_MULTIWARP=0`. Those launches run
+  `block_q` = 64 threads, two warps. The 4-warp partition (4f8336ca) had
+  started every MMA m-loop at the warp's id but kept a stride of 1 for the
+  single-warp body, and removed the warp-0 gate that used to discard the
+  second warp's duplicate work. So warp 1 re-ran m-tiles 1..3 and their
+  dQ, dK and dV atomics landed twice, giving gradients about 100% wrong.
+  The single-warp body now strides its m-loops by the warps actually
+  launched (`block_q / 32`), so each unit is accumulated once and the
+  second warp does half the work instead of repeating it. The emitted PTX
+  changes in exactly those ten stride lines. The 4-warp `_w4` kernel and
+  the 32-thread launches (head_dim 64 and 128) are byte-identical. The
+  Stage-C GPU gate could not see this: under AdamW each step moves a
+  parameter by about lr whatever the gradient's size, so its 2e-2
+  checkpoint tolerance passes on the sign of the gradient alone.
+  `nsl-codegen/tests/sdpa_fused_backward_interp.rs` runs both phases of the
+  production backward on the CTA interpreter, launched as
+  `nsl_flash_attention_backward` launches them, against f64 gradients:
+  - the packed kernel at sm_75 (scalar; exact to 2e-5);
+  - the packed kernel at sm_90 (MMA);
+  - the unmasked 4-warp kernel at sm_90.
+
+  At sm_90 it pins dV to f32 noise of an oracle that rounds each MMA
+  operand to f16, as the kernel does, and dQ and dK to within a few 1e-4
+  of it. It catches eight named mutants, among them the old stride and
+  five missing fences. The interpreter gained `mma.sync.aligned.m16n8k16`
+  f16 with f32 accumulation (warp-synchronous, using the ISA's fragment
+  layout; checked against the tensor-core forward, which it reproduces to
+  one f16 rounding), statements broken across lines, several braced
+  operand lists, `mov.b32 {lo, hi}`, `mad.lo` and `atom.add.f32`. It also
+  gained two warp-serial schedules, which let one warp run a whole barrier
+  interval ahead of the others.
+
 - The fused SDPA forward (the scalar flash-attention v2 path, which Stage C's
   packed segment-masked kernels use) had a shared-memory race on every
   sequence longer than one KV tile. K and V share one shared-memory region,
