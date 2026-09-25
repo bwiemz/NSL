@@ -179,6 +179,7 @@ fn run_build_shared_single(
     crate::commands::build::emit_pass_trace();
     // Milestone A: reconcile requested surfaces before the artifact links.
     crate::activation_enforce::enforce_from_argv(nsl_codegen::pass_registry::Subcommand::Build);
+    refuse_shadowing_exports_or_exit(std::slice::from_ref(&obj_path), &export_symbols);
     match nsl_codegen::linker::link_shared_with_exports(
         std::slice::from_ref(&obj_path),
         &lib_path,
@@ -195,6 +196,21 @@ fn run_build_shared_single(
     }
 
     emit_c_header_if_any(&exports_slot, &lib_path);
+}
+
+/// Issue #693: an `@export` named like a C-library symbol the runtime calls
+/// (`memcpy`, `log`, …) would capture those calls inside the artifact on
+/// macOS and Windows. Refuse it on every platform before linking — see
+/// `nsl_codegen::linker::refuse_runtime_symbol_shadowing`.
+fn refuse_shadowing_exports_or_exit(obj_paths: &[std::path::PathBuf], export_symbols: &[String]) {
+    let names: Vec<&str> = export_symbols.iter().map(|s| s.as_str()).collect();
+    if let Err(e) = nsl_codegen::linker::refuse_runtime_symbol_shadowing(obj_paths, &names) {
+        for obj in obj_paths {
+            let _ = std::fs::remove_file(obj);
+        }
+        nsl_log::nsl_log!(ERROR, "cli", "{e}");
+        process::exit(1);
+    }
 }
 
 /// M62: Write a matching C header next to the shared library when the
@@ -567,6 +583,7 @@ fn run_build_shared_multi(
     crate::commands::build::emit_pass_trace();
     // Milestone A: reconcile requested surfaces before the artifact links.
     crate::activation_enforce::enforce_from_argv(nsl_codegen::pass_registry::Subcommand::Build);
+    refuse_shadowing_exports_or_exit(&obj_files, &export_symbols);
     match nsl_codegen::linker::link_shared_with_exports(&obj_files, &lib_path, &export_refs) {
         Ok(()) => {
             // Whole scratch directory — see normal.rs.
