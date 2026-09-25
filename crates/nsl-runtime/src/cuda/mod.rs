@@ -5986,7 +5986,7 @@ pub(crate) fn gpu_backward_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_name
 pub(crate) fn gpu_relu_backward(grad: i64, input: i64) -> i64 {
     gpu_backward_binary(
         grad, input,
-        kernels::RELU_BACKWARD_F32_PTX,
+        kernels::backward_module(nsl_kir::kernels::elementwise::BackwardOp::Relu),
         "nsl_relu_backward_f32\0",
     )
 }
@@ -5995,7 +5995,7 @@ pub(crate) fn gpu_relu_backward(grad: i64, input: i64) -> i64 {
 pub(crate) fn gpu_sigmoid_backward(grad: i64, saved_out: i64) -> i64 {
     gpu_backward_binary(
         grad, saved_out,
-        kernels::SIGMOID_BACKWARD_F32_PTX,
+        kernels::backward_module(nsl_kir::kernels::elementwise::BackwardOp::Sigmoid),
         "nsl_sigmoid_backward_f32\0",
     )
 }
@@ -6004,7 +6004,7 @@ pub(crate) fn gpu_sigmoid_backward(grad: i64, saved_out: i64) -> i64 {
 pub(crate) fn gpu_tanh_backward(grad: i64, saved_out: i64) -> i64 {
     gpu_backward_binary(
         grad, saved_out,
-        kernels::TANH_BACKWARD_F32_PTX,
+        kernels::backward_module(nsl_kir::kernels::elementwise::BackwardOp::Tanh),
         "nsl_tanh_backward_f32\0",
     )
 }
@@ -6022,7 +6022,7 @@ pub(crate) fn gpu_gelu_backward(grad: i64, input: i64) -> i64 {
 pub(crate) fn gpu_silu_backward(grad: i64, input: i64) -> i64 {
     gpu_backward_binary(
         grad, input,
-        kernels::SILU_BACKWARD_F32_PTX,
+        kernels::backward_module(nsl_kir::kernels::elementwise::BackwardOp::Silu),
         "nsl_silu_backward_f32\0",
     )
 }
@@ -10273,48 +10273,47 @@ mod dtype_guard_drift {
 /// slope.
 ///
 /// `nsl_gelu_f32` computes `x·σ(k·x)` and `nsl_gelu_backward_srcad_f32`
-/// computes that function's derivative for a `k` of its own. The forward is
-/// built from KIR (`nsl_kir::kernels::elementwise::GELU_SLOPE`) and the
-/// backward is hand-written, so nothing but this gate ties their `k`s
-/// together, and they did drift once: the forward multiplied by `0f3FD9999A`
-/// (1.7) while the backward, every description of the kernel and the host
-/// references used `0f3FD9DB23` (1.702). The GPU finite-difference test did
-/// not notice; its tolerance is wider than the gap. Like `dtype_guard_drift`,
-/// this reads `kernels.rs` as text so it runs in the CPU lane.
+/// computes that function's derivative for a `k` of its own. They did drift
+/// once, while the backward was hand-written: the forward multiplied by
+/// `0f3FD9999A` (1.7) while the backward, every description of the kernel and
+/// the host references used `0f3FD9DB23` (1.702). The GPU finite-difference
+/// test did not notice; its tolerance is wider than the gap. Both are now
+/// built from KIR with `nsl_kir::kernels::elementwise::GELU_SLOPE`; this gate
+/// reads the built modules, so it runs in the CPU lane and still catches a
+/// builder that stops using the shared constant.
 #[cfg(test)]
 mod gelu_slope_drift {
-    use nsl_kir::kernels::elementwise::{unary_ptx, UnaryOp, GELU_SLOPE};
+    use nsl_kir::kernels::elementwise::{backward_ptx, unary_ptx, BackwardOp, UnaryOp, GELU_SLOPE};
 
-    /// The body of the `const NAME: &str = "…";` item in `source`.
-    fn ptx_body<'a>(source: &'a str, name: &str) -> &'a str {
-        let head = format!("pub(crate) const {name}: &str = \"");
-        let start = source.find(&head).unwrap_or_else(|| panic!("{name} is declared in kernels.rs")) + head.len();
-        let len = source[start..].find("\\0\";").expect("the constant is NUL-terminated");
-        &source[start..start + len]
-    }
-
-    /// The f32 immediate of the one `mul` that scales the input by `k`.
-    fn slope(body: &str, mul: &str) -> u32 {
-        let lines: Vec<&str> = body.lines().map(str::trim).filter(|l| l.starts_with(mul)).collect();
-        assert_eq!(lines.len(), 1, "exactly one `{mul}` line: {lines:?}");
-        let imm = lines[0].rsplit("0f").next().expect("an f32 immediate");
-        u32::from_str_radix(&imm[..8], 16).expect("8 hex digits")
+    /// The f32 immediates in the module's one `mul` by a baked constant that
+    /// is not `log2(e)`: the slope.
+    fn slope(module: &str, mul: &str) -> u32 {
+        let log2e = "0f3FB8AA3B";
+        let imms: Vec<&str> = module
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("mov.f32 ") || l.starts_with(mul))
+            .filter_map(|l| l.split("0f").nth(1))
+            .map(|imm| &imm[..8])
+            .filter(|imm| format!("0f{imm}") != log2e && *imm != "3F800000")
+            .collect();
+        assert_eq!(imms.len(), 1, "exactly one slope immediate: {imms:?}\n{module}");
+        u32::from_str_radix(imms[0], 16).expect("8 hex digits")
     }
 
     #[test]
     fn the_forward_and_its_backward_scale_by_1_702() {
-        let source = include_str!("kernels.rs");
-        let backward = slope(ptx_body(source, "GELU_BACKWARD_SRCAD_F32_PTX"), "mul.rn.f32 %fs2, %fs2, 0f");
-        let want = 1.702_f32.to_bits();
-        assert!(backward == want, "the backward's slope is 0f{backward:08X}, not 1.702f (0f{want:08X})");
-        assert!(
-            GELU_SLOPE == backward,
-            "nsl_gelu_f32 scales by 0f{GELU_SLOPE:08X}; its backward differentiates 0f{backward:08X}"
-        );
-        // The built module carries the constant, once: the slope is not
-        // folded or respelled on the way to PTX.
+        let backward = String::from_utf8(backward_ptx(BackwardOp::GeluSrcad)).expect("ASCII");
         let forward = String::from_utf8(unary_ptx(UnaryOp::Gelu)).expect("ASCII");
-        assert_eq!(forward.matches(&format!("0f{GELU_SLOPE:08X}")).count(), 1, "{forward}");
+        let want = 1.702_f32.to_bits();
+        assert_eq!(GELU_SLOPE, want, "GELU_SLOPE is 0f{GELU_SLOPE:08X}, not 1.702f (0f{want:08X})");
+        for (name, module, mul) in [("backward", &backward, "mul.rn.f32 "), ("forward", &forward, "mul.f32 ")] {
+            let k = slope(module, mul);
+            assert!(k == want, "the {name}'s slope is 0f{k:08X}, not 1.702f (0f{want:08X})");
+            // The built module carries the constant, once: the slope is not
+            // folded or respelled on the way to PTX.
+            assert_eq!(module.matches(&format!("0f{GELU_SLOPE:08X}")).count(), 1, "{name}: {module}");
+        }
     }
 }
 
@@ -10378,8 +10377,9 @@ mod tests {
     ///
     /// The four precision casts (roadmap A2 step 7), the strided run copy,
     /// the Tier B.1 pre-passes, the binary, unary and scalar-operand
-    /// elementwise kernels, the scaled accumulate and Muon's inverse-norm
-    /// scale (step 11) moved to `nsl_kir::kernels`,
+    /// elementwise kernels, the scaled accumulate, Muon's inverse-norm
+    /// scale and the activation-backward kernels (step 11) moved to
+    /// `nsl_kir::kernels`,
     /// so they are no longer `const` and cannot sit in the array above.
     /// They still have to reach both gates: the registry's own comment
     /// records that covering a module in only one of them was
@@ -10405,6 +10405,9 @@ mod tests {
         }
         all.push(("nsl_scalar_mul_add_inplace_f32", super::kernels::scalar_mul_add_inplace_f32_ptx(), true));
         all.push(("nsl_muon_scale_inv_frob_f32", super::kernels::muon_scale_inv_frob_f32_ptx(), true));
+        for op in nsl_kir::kernels::elementwise::BackwardOp::ALL {
+            all.push((op.kernel_name(), super::kernels::backward_module(op), true));
+        }
         all
     }
 
