@@ -1993,6 +1993,9 @@ DONE: ret;\n\
 
 /// gelu(x) = x * sigmoid(1.702 * x)  [sigmoid approximation]
 /// sigmoid(1.702*x) = 1 / (1 + exp(-1.702*x))
+///
+/// The slope is `0f3FD9DB23` (1.702f), the value `GELU_BACKWARD_SRCAD_F32_PTX`
+/// differentiates with; `super::gelu_slope_drift` holds the two together.
 pub(crate) const GELU_F32_PTX: &str = "\
 .version 7.0\n\
 .target sm_70\n\
@@ -2019,7 +2022,7 @@ pub(crate) const GELU_F32_PTX: &str = "\
     shl.b64 %rd5, %rd4, 2;\n\
     add.u64 %rd6, %rd1, %rd5;\n\
     ld.global.f32 %fs1, [%rd6];\n\
-    mul.f32 %fs2, %fs1, 0f3FD9999A;\n\
+    mul.f32 %fs2, %fs1, 0f3FD9DB23;\n\
     neg.f32 %fs3, %fs2;\n\
     mul.f32 %fs3, %fs3, 0f3FB8AA3B;\n\
     ex2.approx.f32 %fs3, %fs3;\n\

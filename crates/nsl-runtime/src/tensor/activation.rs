@@ -2453,6 +2453,35 @@ mod gelu_backward_tests {
         for p in [x, g, out, cpu] { nsl_tensor_free(p); }
     }
 
+    /// GPU f32 forward (GELU_F32_PTX) vs the host x·σ(1.702x) — the function
+    /// the backward above differentiates. The finite-difference test below
+    /// cannot see the slope: a forward at 1.7 moves its central difference by
+    /// less than that test's tolerance, and one did ship. Here it is ~2.6e-4 at
+    /// x = 1, far outside the ex2.approx/rcp.approx noise this allows.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn gelu_forward_gpu_f32_matches_sigmoid_form() {
+        let n = 257usize; // 256-block tail guard
+        let xs: Vec<f32> = (0..n).map(|i| (i as f32) * 0.05 - 6.0).collect();
+        let x = crate::tensor::nsl_tensor_to_device(make_f32(&xs), 1);
+        // Held so the op does not run in place on its last reference.
+        NslTensor::from_ptr(x).refcount.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let y = nsl_tensor_gelu(x);
+        NslTensor::from_ptr(x).refcount.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        let cpu = crate::tensor::nsl_tensor_to_device(y, 0);
+        let yt = NslTensor::from_ptr(cpu);
+        for (i, &xv) in xs.iter().enumerate() {
+            let xv = xv as f64;
+            let expected = xv / (1.0 + (-(1.702_f32 as f64) * xv).exp());
+            let got = unsafe { *yt.data_f64().add(i) };
+            assert!(
+                (got - expected).abs() < 1e-5 * (1.0 + expected.abs()),
+                "at {i} (x={xv}): gpu {got} vs x*sigmoid(1.702x) {expected}"
+            );
+        }
+        for p in [x, y, cpu] { nsl_tensor_free(p); }
+    }
+
     /// GPU f32 finite differences against the GPU forward (GELU_F32_PTX):
     /// central difference with h=1e-2; tolerance dominated by f32 rounding noise.
     #[test]
