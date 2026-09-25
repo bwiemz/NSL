@@ -89,6 +89,35 @@ fn a_typo_optimizer_kwarg_refuses_at_check_time_with_the_table_listed() {
     );
 }
 
+/// Adam's weight decay was neither classical (coupled L2) nor stable: the
+/// stdlib step applied the decoupled AdamW form at grad_accumulation = 1
+/// and the FASE path compiled it to zero above that. It is refused now, on
+/// `nsl check` and on the run path, with AdamW named as the way to decay.
+#[test]
+fn adam_weight_decay_refuses_and_points_to_adamw() {
+    let src = fixture("    optimizer: Adam(lr = 0.01, weight_decay = 0.01)");
+    for (tag, args) in [("adam_wd_check", &["check"][..]), ("adam_wd_run", &["run"][..])] {
+        let (ok, stdout, stderr) = run_cmd(tag, &src, args);
+        assert!(!ok, "{tag}: Adam(weight_decay=..) must refuse:\n{stderr}");
+        assert!(
+            stderr.contains("Adam does not accept 'weight_decay'"),
+            "{tag}: the refusal must name the kwarg:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("AdamW(weight_decay=..)"),
+            "{tag}: the refusal must point to AdamW:\n{stderr}"
+        );
+        assert!(
+            !stdout.contains("OPTIM_CONTRACT_DONE"),
+            "{tag}: a refused program must not train:\n{stdout}"
+        );
+    }
+    // The same decay on AdamW still checks clean.
+    let src = fixture("    optimizer: AdamW(lr = 0.01, weight_decay = 0.01)");
+    let (ok, _stdout, stderr) = run_cmd("adamw_wd_check", &src, &["check"]);
+    assert!(ok, "AdamW(weight_decay=..) must still check clean:\n{stderr}");
+}
+
 #[test]
 fn a_typo_optimizer_kwarg_refuses_on_the_run_path_before_codegen() {
     let src = fixture("    optimizer: AdamW(lrr = 0.01)");
