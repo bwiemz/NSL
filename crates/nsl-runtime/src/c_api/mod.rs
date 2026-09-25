@@ -1593,6 +1593,18 @@ pub extern "C" fn nsl_desc_to_tensor(desc_ptr: i64) -> i64 {
     if desc_ptr == 0 {
         return 0;
     }
+    // A misaligned pointer cannot be an `NslTensorDesc*`. Dereferencing it is
+    // UB, and debug builds turn it into a non-unwinding panic that aborts the
+    // host (#693, where the "desc" was really `memcpy`'s byte-pointer source).
+    // Refuse it through the same 0 return the dtype guard uses.
+    if !(desc_ptr as usize).is_multiple_of(std::mem::align_of::<NslTensorDesc>()) {
+        set_error(format!(
+            "nsl_desc_to_tensor: {desc_ptr:#x} is not an NslTensorDesc pointer \
+             (not {}-byte aligned)\0",
+            std::mem::align_of::<NslTensorDesc>()
+        ));
+        return 0;
+    }
     let desc = unsafe { &*(desc_ptr as *const NslTensorDesc) };
     desc_to_nsl_tensor(desc)
 }
@@ -2145,6 +2157,39 @@ mod tests {
         assert_eq!(offset_of!(NslTensorDesc, device_type), 32);
         assert_eq!(offset_of!(NslTensorDesc, device_id), 36);
         assert_eq!(offset_of!(NslTensorDesc, tape_id), 40);
+    }
+
+    /// #693: a misaligned "desc" pointer is refused with a message instead of
+    /// being dereferenced (a debug-build abort, release-build UB). The same
+    /// bytes at an aligned address still import, so the refusal is about the
+    /// address and nothing else.
+    #[test]
+    fn desc_to_tensor_refuses_a_misaligned_pointer() {
+        let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let mut shape: Vec<i64> = vec![4];
+        let desc = NslTensorDesc {
+            data: data.as_ptr() as *mut std::ffi::c_void,
+            shape: shape.as_mut_ptr(),
+            strides: std::ptr::null_mut(),
+            ndim: 1,
+            dtype: 1,
+            device_type: 0,
+            device_id: 0,
+            tape_id: 0,
+        };
+        let aligned = &desc as *const NslTensorDesc as i64;
+        let t = nsl_desc_to_tensor(aligned);
+        assert_ne!(t, 0, "the aligned control must import");
+        crate::tensor::nsl_tensor_free(t);
+
+        nsl_clear_error();
+        for off in 1..align_of::<NslTensorDesc>() as i64 {
+            assert_eq!(nsl_desc_to_tensor(aligned + off), 0, "offset {off}");
+            let p = nsl_get_last_error() as *const std::os::raw::c_char;
+            assert!(!p.is_null(), "offset {off}: no error set");
+            let msg = unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy().into_owned();
+            assert!(msg.contains("not 8-byte aligned"), "offset {off}: {msg}");
+        }
     }
 
     /// The packed `nsl_abi_version()` value must decode to the documented
