@@ -683,8 +683,8 @@ in `src/kernel_skeleton/` (`header.rs`, `indexing.rs`, `pad.rs`, `params.rs`,
 `smem.rs`) all `push_str` PTX text with hand-numbered registers.
 
 **The freeze (roadmap A2).** `ci/hand-ptx-manifest.txt` lists every file that
-writes PTX into a string (71 members at the 2026-09-02 freeze; 58 today: the
-codegen files above plus four under `crates/nsl-runtime/src/cuda/` and
+writes PTX into a string (71 members at the 2026-09-02 freeze; 57 today: the
+codegen files above plus three under `crates/nsl-runtime/src/cuda/` and
 `crates/nsl-runtime/src/flash_attention.rs`; `backend_ptx.rs` is the one
 member that belongs by construction). The list shrinks as A2 migrates
 kernels onto KIR — step 3 retired `src/kernel.rs`, step 7
@@ -695,7 +695,8 @@ used to carry, step 9's first slice `src/cfie_decode_attention.rs` and
 (`src/cfie_speculative_ptx.rs`, `src/cfie_sample_ptx.rs` and, last,
 `src/cfie_persistent_ptx.rs`), step 10's loss heads
 `src/fused_linear_ce.rs` and `src/cpkd_fused_loss.rs`, and step 11's first
-runtime slice, `nsl-runtime`'s `cuda/strided_copy.rs`.
+runtime slices, `nsl-runtime`'s `cuda/strided_copy.rs` and
+`cuda/tier_b1_prepass.rs`.
 `scripts/hand-ptx-freeze.sh --check`
 (membership decided by `scripts/hand-ptx-scan.awk`; `--list`, `--explain`,
 `--write-manifest`, `--self-test`) fails CI (`hand-ptx-freeze` job in

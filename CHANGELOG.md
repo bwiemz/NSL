@@ -8,6 +8,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- The CSHA Tier B.1 pre-pass kernels (`csha_tier_b1_prepass_x`, RMSNorm +
+  narrow + chunkify, and `csha_tier_b1_prepass_w`, narrow + col-major
+  chunkify) are built as KIR in `nsl_kir::kernels::tier_b1_prepass`
+  (roadmap A2 step 11, second slice). The runtime builds each module on
+  first use in place of the hand-written `CSHA_TIER_B1_PREPASS_{X,W}_PTX`
+  (now `csha_tier_b1_prepass_{x,w}_ptx()`), so `cuda/tier_b1_prepass.rs`
+  leaves the hand-PTX freeze (`ci/hand-ptx-manifest.txt`: 58 → 57 files).
+  `tests/tier_b1_prepass_kir_equivalence.rs` runs the frozen hand kernels
+  and the KIR ones on the shared PTX interpreter (which learned
+  element-typed `.shared` blocks addressed by name, `div.approx.f32` and
+  `cvt.rn.f32.u64`) and requires the same bytes in all of global memory, an
+  f64 RMSNorm reference for X and the exact layout for W. The X kernel's
+  mean square is now `div.rn.f32` (KIR's f32 division) where it was
+  `div.approx.f32`. The kernels target the KIR floor (`sm_70`, was
+  `sm_80`) and take 10–24 registers where the hand ones took 10–24
+  (sm_80/90/120).
+
 - The strided run-copy kernels behind `nsl_tensor_contiguous`'s fast path
   (`nsl_scopy_{run,run4,bcast,bcast4}_f32`) are built as KIR in
   `nsl_kir::kernels::strided_copy` (roadmap A2 step 11, first slice). The

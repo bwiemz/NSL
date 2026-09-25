@@ -743,6 +743,31 @@ frozen throughout, so nothing here blocks a kernel fix.
     kernels drop to the KIR floor (`sm_70`; the hand module declared
     `sm_80` for nothing it used) and take 14–24 registers where the hand
     ones took 16–24 (sm_80/90/120), with no spills.
+
+    **`tier_b1_prepass` done** (second slice; manifest 58 → 57).
+    `nsl_kir::kernels::tier_b1_prepass` builds the X pre-pass (one CTA per
+    row: a strided sum of squares, thread 0 adding the other partials to
+    its own in thread order through a static `SmemLayout`, then the
+    normalised, gamma-scaled row narrowed to f16 in chunks-major order) and
+    the W pre-pass (one thread per weight, narrowed to f16 at its
+    col-major-within-chunk position), each its own module as before; the
+    runtime's `csha_tier_b1_prepass_{x,w}_ptx()` replace the two constants.
+    KIR needed nothing new. One instruction changes: the hand X kernel took
+    the mean square with `div.approx.f32`, and KIR's f32 division is
+    `div.rn.f32`, so the mean is now correctly rounded where it was within
+    2 ulp, ahead of an `rsqrt.approx.f32`. The interpreter models every
+    approximate form by its exact counterpart, so the gate sees the two as
+    one; it learned element-typed `.shared` declarations addressed by name,
+    `div.approx.f32` and `cvt.rn.f32.u64`. The gate runs the X pre-pass on
+    fewer columns than threads, a ragged three-trip column loop and CTAs
+    past the rows, and the W pre-pass on a half block and a ragged last
+    block, under two schedules, requiring the same bytes in all of global
+    memory, an f64 RMSNorm reference for X and the exact layout for W. It
+    catches either barrier deleted, every bound relaxed, the column
+    stride, element sizes, the reduction's first partial and the masks'
+    `1` nudged, and the block index read as 0; no mutant is equivalent.
+    Registers: X 20–24 against the hand kernel's 20–24, W 10–14 against
+    10–11 (sm_80/90/120), no spills.
 12. **FA v2**, by phase directory, tier B.1 and B.2 last; the SASS
     baselines and the two no-spill gates already exist here and are the
     proof. `matmul_mma.rs` and `kernel_skeleton/` are deleted with their
