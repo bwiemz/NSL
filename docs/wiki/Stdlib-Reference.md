@@ -24,7 +24,7 @@ Most of NSL's numeric surface is *language*, not library: tensor arithmetic, `ma
 - [`nsl.nn.position`](#nslnnposition) — Learned absolute position embeddings.
 - [`nsl.nn.rope`](#nslnnrope) — Rotary position embeddings.
 - [`nsl.nn.transformer`](#nslnntransformer) — A single transformer block.
-- [`nsl.optim.adam`](#nsloptimadam) — Adam (Kingma & Ba, 2015).
+- [`nsl.optim.adam`](#nsloptimadam) — Adam (Kingma & Ba, 2015), without weight decay.
 - [`nsl.optim.adamw`](#nsloptimadamw) — AdamW: Adam with decoupled weight decay (Loshchilov & Hutter, 2019).
 - [`nsl.optim.lion`](#nsloptimlion) — Lion (EvoLved Sign Momentum; Chen et al., 2023): the update is the SIGN of an interpolated momentum, so every parameter moves by the same magnitude and only one state buffer is needed.
 - [`nsl.optim.muon`](#nsloptimmuon) — Muon: momentum orthogonalized by Newton-Schulz, with AdamW routing.
@@ -526,21 +526,16 @@ normalisation and a residual connection.
 
 *Source: `stdlib/nsl/optim/adam.nsl`*
 
-Adam (Kingma & Ba, 2015).
+Adam (Kingma & Ba, 2015), without weight decay.
 
-`adam_step` below is byte-identical to `adamw_step`, and the decay it
-applies is decoupled — it scales `param` directly rather than entering
-the gradient as classical Adam's coupled L2 term.
-
-The two names are NOT interchangeable, because only part of training
-goes through this function. Under `grad_accumulation = 1` the compiler
-calls it and `adam` and `adamw` behave the same. Under accumulation
-greater than 1 the FASE path emits the update itself, and there
-`adam` is compiled with **weight decay forced to zero** while `adamw`
-applies it (`fase_optimizer.rs::emit_final_step`). Choosing `adam` for
-an accumulating run therefore trains with no regularisation at all.
-
-Prefer `nsl.optim.adamw` unless you specifically want no decay.
+`Adam(weight_decay=..)` and `Adam(no_decay=..)` are refused at compile
+time. Classical Adam's decay is coupled: an L2 term added to the
+gradient before the moment updates. NSL does not implement that, and
+the decay this function used to apply was the decoupled AdamW form,
+and only under `grad_accumulation = 1`. With accumulation above 1 the
+FASE path compiled Adam with the decay forced to zero, so the same
+source trained two different models. For decay, use `nsl.optim.adamw`.
+The compiler now always passes `weight_decay = 0.0` here.
 
 The moment buffers `m` and `v` are allocated by codegen and updated in
 place through `copy_data`, so the step writes through its arguments

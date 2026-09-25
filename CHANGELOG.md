@@ -579,6 +579,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- `Adam(weight_decay=..)` and `Adam(no_decay=..)` are refused at `nsl check`
+  and on the build/run path, with AdamW named as the way to decay.
+  Classical Adam's decay is coupled: an L2 term added to the gradient.
+  NSL never implemented that, and what `Adam` did with the knob depended
+  on `grad_accumulation`. At 1, `adam_step` applied the decoupled AdamW
+  form. Above 1, the FASE path compiled it to zero. The same source
+  trained two different models. Plain `Adam(...)` is unchanged and trains
+  without decay on every path. Refusal chosen over implementing coupled
+  decay because no program in the tree passes decay to Adam, and every
+  update path (stdlib step, FASE, fused and batched GPU steps) would
+  otherwise need it (roadmap item 6). Gated by
+  `optim_config::adam_refuses_weight_decay_and_no_decay_and_points_to_adamw`
+  and `optim_config_contract_gate::adam_weight_decay_refuses_and_points_to_adamw`.
+
 - `nsl build --shared-lib` refuses an `@export` whose name is a symbol the
   library's statically linked runtime calls by name, such as `memcpy`,
   `pow`, `log` or `exp` (#693). The export is defined in the same image as

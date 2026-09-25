@@ -193,7 +193,9 @@ fn emit_adamw(recipe: &UpdateRecipe, decoupled_wd: bool) -> UpdateProgram {
     //   3. v_hat = v * bc2_inv                      [bias-corrected second moment]
     //   4. tmp = sqrt(v_hat) + ε
     //   5. tmp = m_hat / tmp
-    //   6. θ -= lr * (tmp + wd·θ)    [AdamW]   or   θ -= lr·tmp [Adam, coupled]
+    //   6. θ -= lr * (tmp + wd·θ)    [AdamW]   or   θ -= lr·tmp [Adam]
+    //      (Adam takes no weight decay: nsl-semantic refuses
+    //      `Adam(weight_decay=..)`, see ADAM_COUPLED_DECAY_REFUSAL)
     let wd = if decoupled_wd { recipe.weight_decay } else { 0.0 };
 
     let ops = vec![
