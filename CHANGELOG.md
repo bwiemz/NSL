@@ -8,6 +8,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- Nine activation-backward kernels are built by
+  `nsl_kir::kernels::elementwise` (`BackwardOp`) in place of their
+  hand-written constants (roadmap A2 step 11, eighth slice). They are the
+  tape-AD `nsl_{relu,sigmoid,tanh,silu}_backward_f32`, the source-AD
+  `nsl_{sigmoid,tanh,silu,gelu}_backward_srcad_f32` and the fused SwiGLU
+  gate adjoint `nsl_swiglu_gate_backward_f32`.
+  - The tape-AD kernels keep their bare arithmetic, so ptxas contracts
+    exactly what it did before.
+  - The source-AD kernels spell every derivative operation `.rn`, as they
+    must to match the launches they replace.
+  - `tests/elementwise_backward_kir_equivalence.rs` (13 tests) checks them
+    against the frozen hand kernels. It requires the same bytes under two
+    schedules over IEEE corners, the formula with every operation rounded,
+    and the derivative each kernel names. It pins every arithmetic
+    mnemonic's count to the hand module, and it catches mutants of the
+    bound, the element sizes, every baked constant, each operation, relu's
+    strict comparison and the gate's `up` read.
+  - Disassembled on sm_75/80/90/120, eight of the nine issue the hand
+    kernels' exact floating-point instruction sequence. The ninth, the
+    SwiGLU gate on sm_80 and later, schedules its independent `grad * up`
+    multiply at a different point; it has the same instructions and no
+    `FFMA`.
+  - The GELU slope drift gate now reads both built modules.
+  - `nsl_gelu_backward_f32` (`div.approx`) stays hand-written.
+    `nsl_clamp_backward_f32` follows once the interpreter models
+    `and.pred`.
+
 - KIR has explicitly rounded float arithmetic: `KirOp::{AddRn, SubRn,
   MulRn}` print `add.rn` / `sub.rn` / `mul.rn`. ptxas never contracts these
   into an `fma`, so a kernel that must match a decomposed computation bit

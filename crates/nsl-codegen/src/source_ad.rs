@@ -928,7 +928,7 @@ impl AdjointGenerator {
             // Fused (Milestone C · p4 slice 3): the three-op expansion (Sub, Mul,
             // Mul → three kernels + two intermediates) collapses to a single
             // `nsl_tensor_sigmoid_backward(grad, y)` launch, BIT-EXACT with the
-            // decomposed path — see `SIGMOID_BACKWARD_SRCAD_F32_PTX`.
+            // decomposed path — see `nsl_sigmoid_backward_srcad_f32`.
             AdjointExpr::SigmoidBackward(y_bar, y) => {
                 self.emit_op(PrimalOp::Passthrough("sigmoid_backward".into()), vec![y_bar, y])
             }
@@ -938,7 +938,7 @@ impl AdjointGenerator {
             // Mul) collapses to a single `nsl_tensor_tanh_backward(grad, y)`
             // launch, BIT-EXACT with the decomposed path (LOAD-BEARING `.rn`
             // blocks the y*y→1-y*y fma-contraction) — see
-            // `TANH_BACKWARD_SRCAD_F32_PTX`.
+            // `nsl_tanh_backward_srcad_f32`.
             AdjointExpr::TanhBackward(y_bar, y) => {
                 self.emit_op(PrimalOp::Passthrough("tanh_backward".into()), vec![y_bar, y])
             }
@@ -1005,7 +1005,7 @@ impl AdjointGenerator {
             // intermediates) collapses to a single `nsl_tensor_silu_backward`
             // launch. The runtime kernel reproduces this exact operation order,
             // so it is BIT-EXACT with the decomposed path — see
-            // `nsl_tensor_silu_backward` / `SILU_BACKWARD_SRCAD_F32_PTX`.
+            // `nsl_tensor_silu_backward` / `nsl_silu_backward_srcad_f32`.
             AdjointExpr::SiluBackward(y_bar, x) => {
                 self.emit_op(PrimalOp::Passthrough("silu_backward".into()), vec![y_bar, x])
             }
@@ -1595,7 +1595,7 @@ impl AdjointGenerator {
 /// SwiGLU per micro-step. BIT-EXACT: the fused kernel computes
 /// `t = mul.rn(y_bar, u)` exactly as the standalone Mul kernel rounds it,
 /// then runs the identical silu-backward sequence (see
-/// `SWIGLU_GATE_BACKWARD_F32_PTX` / the FFI's CPU arm).
+/// `nsl_swiglu_gate_backward_f32` / the FFI's CPU arm).
 ///
 /// Returns the number of pairs fused. Op ids are renumbered positionally
 /// (they are positional-only at every call site — the CCR splice does the
