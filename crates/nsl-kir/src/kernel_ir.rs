@@ -378,6 +378,17 @@ pub enum KirOp {
     Add(VarId, VarId, VarId),
     Sub(VarId, VarId, VarId),
     Mul(VarId, VarId, VarId),
+    /// `Add`, `Sub` and `Mul` on floats with an explicit round-to-nearest-even
+    /// modifier (`add.rn.f32`, ...). They compute the same IEEE result as the
+    /// bare forms, but ptxas never contracts an explicitly rounded multiply
+    /// and the add that consumes it into one `fma`. So each operation rounds
+    /// on its own, as it would if its result went through memory. Kernels
+    /// that must match a decomposed multi-kernel computation bit for bit use
+    /// these; everything else uses the bare forms and lets ptxas fuse. Float
+    /// types only (`f32`, `f64`): an integer has nothing to round.
+    AddRn(VarId, VarId, VarId),
+    SubRn(VarId, VarId, VarId),
+    MulRn(VarId, VarId, VarId),
     Div(VarId, VarId, VarId),
     Fma(VarId, VarId, VarId, VarId), // dst = a * b + c
     Neg(VarId, VarId),

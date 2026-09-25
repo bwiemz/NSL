@@ -21,6 +21,13 @@
 //! the second load replaced by the parameter. `nsl_div_scalar_f32` stays
 //! hand-written with `nsl_div_f32`, for the reason below.
 //!
+//! Two kernels that must match a decomposed computation bit for bit spell
+//! their arithmetic with `KirOp::{AddRn, MulRn}`, which print `.rn` so ptxas
+//! cannot contract a multiply and the add that reads it into one `fma`:
+//! `nsl_scalar_mul_add_inplace_f32` (`m[i] += g[i] * s`, replacing a
+//! scalar multiply then an add) and `nsl_muon_scale_inv_frob_f32`
+//! (`c[i] = x[i] * (1 / (sqrt(stats[3]) + 1e-7))`).
+//!
 //! `nsl_div_f32` stays hand-written for now. It divides with
 //! `div.approx.f32`, which is within 2 ulp and returns 0 for a divisor
 //! whose magnitude is in `(2^126, 2^128)`; KIR's f32 division is the IEEE
@@ -234,6 +241,120 @@ pub fn scalar_ptx(op: ScalarOp) -> Vec<u8> {
         panic!("elementwise kernel `{}` failed KIR verification: {errors:?}", op.kernel_name());
     }
     lower_kir_to_ptx(&ir)
+}
+
+/// The thread index and the bounds branch every elementwise kernel opens
+/// with: `i = blockIdx.x * blockDim.x + threadIdx.x` taken in 32 bits and
+/// widened, then `if i >= n { exit } else { body }`. Returns `(i, body,
+/// exit)` with the builder in `body`.
+fn index_and_bound(b: &mut KirBuilder, n: VarId) -> (VarId, crate::kernel_ir::BlockId, crate::kernel_ir::BlockId) {
+    let entry = b.new_block();
+    let body = b.new_block();
+    let exit = b.new_block();
+    b.set_block(entry);
+    let i32_ = b.new_typed_var(KirType::U32);
+    b.emit(KirOp::GlobalId(i32_, 0));
+    let i = b.new_typed_var(KirType::U64);
+    b.emit(KirOp::Cast(i, i32_, KirType::U64));
+    let past = b.new_typed_var(KirType::Bool);
+    b.emit(KirOp::Cmp(past, i, n, CmpOp::Ge));
+    b.terminate(KirTerminator::CondBranch(past, KirEdge::to(exit), KirEdge::to(body)));
+    b.set_block(body);
+    (i, body, exit)
+}
+
+/// Close `body` into `exit`, return from `exit`, and set the launch shape.
+fn finish(mut b: KirBuilder, exit: crate::kernel_ir::BlockId) -> KernelIR {
+    b.terminate(KirTerminator::Branch(KirEdge::to(exit)));
+    b.set_block(exit);
+    b.terminate(KirTerminator::Return);
+    b.set_workgroup_size([ELEMENTWISE_BLOCK, 1, 1]);
+    b.set_launch_bounds(ELEMENTWISE_BLOCK, None);
+    b.finalize()
+}
+
+fn load_f32(b: &mut KirBuilder, base: VarId, i: VarId) -> VarId {
+    let addr = b.new_typed_var(f32_ptr());
+    b.emit(KirOp::PtrOffset(addr, base, i));
+    let v = b.new_typed_var(KirType::F32);
+    b.emit(KirOp::Load(v, addr, AddressSpace::Global));
+    v
+}
+
+fn store_f32(b: &mut KirBuilder, base: VarId, i: VarId, v: VarId) {
+    let addr = b.new_typed_var(f32_ptr());
+    b.emit(KirOp::PtrOffset(addr, base, i));
+    b.emit(KirOp::Store(addr, v, AddressSpace::Global));
+}
+
+fn verified_ptx(ir: KernelIR) -> Vec<u8> {
+    if let Err(errors) = crate::kir_verify::verify(&ir) {
+        panic!("elementwise kernel `{}` failed KIR verification: {errors:?}", ir.name);
+    }
+    lower_kir_to_ptx(&ir)
+}
+
+/// `nsl_scalar_mul_add_inplace_f32(m, g, s, n)`: `m[i] = m[i] + g[i] * s`,
+/// the FASE accumulate epilogue. It replaces `nsl_mul_scalar_f32` then
+/// `nsl_add_f32`, whose intermediate rounds to f32 through memory, so the
+/// multiply and the add are both explicitly rounded (`MulRn`, `AddRn`): a
+/// contracted `fma` would round once and differ by up to an ulp. The order
+/// is the hand kernel's: load `g[i]`, scale, load `m[i]`, add, store.
+pub fn build_scalar_mul_add_inplace() -> KernelIR {
+    use AddressSpace::Global;
+    let mut b = KirBuilder::new("nsl_scalar_mul_add_inplace_f32");
+    let m = b.add_param("m", f32_ptr(), Global);
+    let g = b.add_param("g", f32_ptr(), Global);
+    let s = b.add_param("s", KirType::F32, Global);
+    let n = b.add_param("n", KirType::U64, Global);
+    let (i, _, exit) = index_and_bound(&mut b, n);
+    let gi = load_f32(&mut b, g, i);
+    let scaled = f32_op2(&mut b, KirOp::MulRn, gi, s);
+    let mi = load_f32(&mut b, m, i);
+    let sum = f32_op2(&mut b, KirOp::AddRn, mi, scaled);
+    store_f32(&mut b, m, i, sum);
+    finish(b, exit)
+}
+
+/// [`build_scalar_mul_add_inplace`], lowered to a NUL-terminated module.
+pub fn scalar_mul_add_inplace_ptx() -> Vec<u8> {
+    verified_ptx(build_scalar_mul_add_inplace())
+}
+
+/// `1e-7f`, the Muon pre-normalization epsilon (`0f33D6BF95`).
+const MUON_EPS: u32 = 0x33D6_BF95;
+
+/// `nsl_muon_scale_inv_frob_f32(x, c, stats, n)`:
+/// `c[i] = x[i] * (1 / (sqrt(stats[3]) + 1e-7))`, with `stats` the 4-slot
+/// output of `nsl_tensor_stats_f32` (slot 3 the raw sum of squares), read
+/// on the device so Muon's Newton-Schulz pre-normalization needs no host
+/// sync. Every thread recomputes the scale: `sqrt.rn`, an `AddRn` of the
+/// epsilon, `div.rn` of 1, then an `MulRn`, in the hand kernel's order.
+pub fn build_muon_scale_inv_frob() -> KernelIR {
+    use AddressSpace::Global;
+    let mut b = KirBuilder::new("nsl_muon_scale_inv_frob_f32");
+    let x = b.add_param("x", f32_ptr(), Global);
+    let c = b.add_param("c", f32_ptr(), Global);
+    let stats = b.add_param("stats", f32_ptr(), Global);
+    let n = b.add_param("n", KirType::U64, Global);
+    let (i, _, exit) = index_and_bound(&mut b, n);
+    let slot3 = b.new_typed_var(KirType::U64);
+    b.emit(KirOp::Const(slot3, KirConst { ty: KirType::U64, value: ConstValue::U64(3) }));
+    let sumsq = load_f32(&mut b, stats, slot3);
+    let norm = f32_op1(&mut b, KirOp::Sqrt, sumsq);
+    let eps = f32_const(&mut b, MUON_EPS);
+    let denom = f32_op2(&mut b, KirOp::AddRn, norm, eps);
+    let one = f32_const(&mut b, 1.0f32.to_bits());
+    let inv = f32_op2(&mut b, KirOp::Div, one, denom);
+    let xi = load_f32(&mut b, x, i);
+    let y = f32_op2(&mut b, KirOp::MulRn, xi, inv);
+    store_f32(&mut b, c, i, y);
+    finish(b, exit)
+}
+
+/// [`build_muon_scale_inv_frob`], lowered to a NUL-terminated module.
+pub fn muon_scale_inv_frob_ptx() -> Vec<u8> {
+    verified_ptx(build_muon_scale_inv_frob())
 }
 
 /// A unary kernel, `c[i] = f(a[i])`, with signature `(a, c, n)`; `Clamp`
@@ -525,6 +646,30 @@ mod tests {
             assert_eq!(text.matches(mnemonic).count(), 1, "{op:?}");
             assert!(!text.contains("div."), "{op:?}");
         }
+    }
+
+    /// The two kernels that must not be contracted spell their multiply and
+    /// add `.rn` and nothing bare; Muon's division and square root are the
+    /// IEEE forms.
+    #[test]
+    fn the_uncontracted_kernels_spell_rn() {
+        for (ir, names) in [
+            (build_scalar_mul_add_inplace(), ["m", "g", "s", "n"]),
+            (build_muon_scale_inv_frob(), ["x", "c", "stats", "n"]),
+        ] {
+            verify(&ir).unwrap_or_else(|e| panic!("{}: {e:?}", ir.name));
+            let params: Vec<&str> = ir.params.iter().map(|p| p.name.as_str()).collect();
+            assert_eq!(params, names, "{}", ir.name);
+        }
+        let sma = String::from_utf8(scalar_mul_add_inplace_ptx()).unwrap();
+        assert_eq!(sma.matches("mul.rn.f32 ").count(), 1, "{sma}");
+        assert_eq!(sma.matches("add.rn.f32 ").count(), 1, "{sma}");
+        assert!(!sma.contains("mul.f32 ") && !sma.contains("add.f32 ") && !sma.contains("fma"), "{sma}");
+        let muon = String::from_utf8(muon_scale_inv_frob_ptx()).unwrap();
+        for form in ["sqrt.rn.f32 ", "add.rn.f32 ", "div.rn.f32 ", "mul.rn.f32 ", "0f33D6BF95"] {
+            assert_eq!(muon.matches(form).count(), 1, "{form}: {muon}");
+        }
+        assert!(!muon.contains("mul.f32 ") && !muon.contains("add.f32 ") && !muon.contains("fma"), "{muon}");
     }
 
     /// NUL-terminated ASCII at the ISA floor, with the arithmetic in the
