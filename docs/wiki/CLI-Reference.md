@@ -293,11 +293,11 @@ nsl build [OPTIONS] <FILE>
 | `--cpdt-report` |  |  | CPDT: emit the full plan to stdout. Implies `--cpdt` (full mode) |
 | `--cfie` | `<MODE>` (optional) |  | CFIE: compiler-fused inference-engine mode ("full", "sampling", or "off").  Passing `--cfie` without a value enables full mode.  Overrides the serve block's `@cfie` decorator; serve-block CFIE keys (kv_layout, sampling:, ...) activate CFIE even without this flag |
 | `--cfie-report` | `<PATH>` |  | CFIE: also write the inference build report to this file. The report always prints to stderr when CFIE is active |
-| `--calibration-data` | `<PATH>` |  | Path to calibration dataset (.bin or .safetensors).  When omitted, calibration is skipped entirely |
-| `--calibrate` | `<MODE>` | `required` | Calibration failure policy.  Default `required` aborts the build on infrastructure errors; `best-effort` warns and falls back.  Degenerate-data errors are always fatal |
-| `--calibration-samples` | `<N>` | `512` | Number of calibration samples to consume (default 512). Truncated to the dataset size with a warning when smaller |
-| `--calibration-batch-size` | `<N>` | `8` | Calibration batch size: samples per harness forward pass (default 8; must be &gt; 0) |
-| `--calibration-timeout` | `<SECONDS>` | `600` | Wall-clock limit for the calibration run, in seconds (default 600; must be &gt; 0) |
+| `--calibration-data` | `<PATH>` |  | Calibration dataset (.bin or .safetensors). REFUSED: `nsl build` does not run calibration (the harness, `nsl_codegen::compile_and_calibrate`, has no build-path caller), so a corpus would be validated and ignored. Declared so the refusal can name it rather than clap calling it unknown |
+| `--calibrate` | `<MODE>` |  | Calibration failure policy (`required` \| `best-effort`). REFUSED with `--calibration-data`: there is no calibration run to govern |
+| `--calibration-samples` | `<N>` |  | Calibration samples to consume. REFUSED with `--calibration-data` |
+| `--calibration-batch-size` | `<N>` |  | Calibration batch size. REFUSED with `--calibration-data` |
+| `--calibration-timeout` | `<SECONDS>` |  | Calibration wall-clock limit in seconds. REFUSED with `--calibration-data` |
 | `--cep-prune` |  |  | CEP: run compilation-verified pruning (requires --weights) |
 | `--cep-joint` |  |  | CEP Mode 3 (paper §2.2): run joint prune-search (heads + FFN + layer drops). Requires --weights. Mutually exclusive with --cep-prune |
 | `--cep-target` | `<CEP_TARGET>` |  | CEP: target GPU for analysis (e.g. H100-SXM) |

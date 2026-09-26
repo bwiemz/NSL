@@ -8,6 +8,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- `nsl_clamp_backward_f32` is built as KIR
+  (`nsl_kir::kernels::elementwise::build_clamp_backward`), the last
+  activation-style backward kernel to leave hand-written PTX apart from
+  `nsl_gelu_backward_f32` (roadmap A2 step 11). The runtime builds it on
+  first use (`cuda::kernels::clamp_backward_f32_ptx()`) in place of the
+  hand-written constant.
+  `tests/clamp_backward_kir_equivalence.rs` runs the frozen hand kernel and
+  the KIR one on the CTA interpreter over IEEE-corner inputs and seven
+  bound pairs: ordinary, one-sided infinite, a single point, reversed, and
+  a NaN on either side. It requires:
+  - the same bytes in all of global memory;
+  - the formula bit for bit: an input on a bound passes the gradient, and a
+    NaN passes nothing.
+
+  It catches nine named mutants:
+  - a strict comparison on either bound;
+  - `or` for `and`;
+  - either bound read as the other;
+  - the select's arms swapped;
+  - the input passed in place of the gradient;
+  - the index bound relaxed, the block index ignored, and every element
+    size nudged.
+
+  On sm_80/90/120 the SASS has the hand kernel's instruction count, its 12
+  registers and its comparison-and-select core. Only the address arithmetic
+  differs.
+
 - Nine activation-backward kernels are built by
   `nsl_kir::kernels::elementwise` (`BackwardOp`) in place of their
   hand-written constants (roadmap A2 step 11, eighth slice). They are the
@@ -654,6 +681,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
       reference, so a wrong answer fails even when no fusion fires. A gelu
       cubic-coefficient mutant (0.044715 → 0.04) now fails
       `differential_fused_gelu`.
+- **`nsl build` refuses every calibration flag** instead of accepting it
+  and doing nothing (roadmap item 8, second slice). The refused flags are
+  `--calibration-data`, `--calibrate`, `--calibration-samples`,
+  `--calibration-batch-size` and `--calibration-timeout`.
+  - **Why:** the calibration harness lives in
+    `nsl_codegen::compile_and_calibrate`, and no build path calls it.
+    `--calibration-data` was validated, warned "validated but NOT consumed"
+    and was then dropped. The other four configured a run that never
+    happened, and did so silently whenever `--calibration-data` was absent.
+  - **Now:** each flag given is named in one refusal, and nothing is built.
+    The four knobs no longer have defaults to hide behind.
+  - **WGGO grad mode:** its "requires calibration data" refusal no longer
+    tells users to write a `quant awq { calibration_data = ... }` block,
+    which does not exist. It says grad scoring is unavailable from the CLI
+    and points to `--wggo-importance=magnitude`.
+  - **Gates updated:**
+    - the activation contract lists the five flags as refused;
+    - the composition gate allowlists the single-flag refusal;
+    - the `--calibrate best-effort` feature rule is gone;
+    - the CLI reference is regenerated.
+  - **Tests updated:** `calibration_flag_validation` (4),
+    `calibration_pipeline_integration`, and `calibration_no_cargo` pin the
+    refusal. They previously pinned accept-and-drop.
+
 - **`.to(dtype)` converts** (dtype-semantics design, step 1).
   - **What was wrong.** On a standard-dtype tensor, `.to(f32)` and
     `.to(f64)` compiled to `nsl_tensor_from_custom_dtype`, which returns
