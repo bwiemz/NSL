@@ -115,9 +115,13 @@ impl OptimizerKind {
                 "nesterov",
                 "no_decay",
             ],
-            // adam.nsl / adamw.nsl: (.., lr, beta1, beta2, eps,
-            // weight_decay, t)
-            OptimizerKind::Adam | OptimizerKind::AdamW => {
+            // adam.nsl: (.., lr, beta1, beta2, eps, weight_decay, t) — but
+            // weight_decay is REFUSED for Adam (see
+            // `ADAM_COUPLED_DECAY_REFUSAL`), so neither it nor no_decay is
+            // accepted; the step always receives 0.0.
+            OptimizerKind::Adam => &["lr", "beta1", "beta2", "eps"],
+            // adamw.nsl: (.., lr, beta1, beta2, eps, weight_decay, t)
+            OptimizerKind::AdamW => {
                 &["lr", "beta1", "beta2", "eps", "weight_decay", "no_decay"]
             }
             // lion.nsl: (.., lr, beta1, beta2, weight_decay) — no eps.
@@ -144,6 +148,23 @@ impl OptimizerKind {
 }
 
 const OPTIMIZER_NAMES_LABEL: &str = "expected SGD, Adam, AdamW, Lion, Muon, or SOAP";
+
+/// Why `Adam(weight_decay=..)` / `Adam(no_decay=..)` is refused.
+///
+/// Classical Adam's weight decay is COUPLED: an L2 term `wd·θ` added to the
+/// gradient before the moment updates (PyTorch `Adam(weight_decay=..)`).
+/// NSL never implemented that. What it did instead depended on an unrelated
+/// knob: with `grad_accumulation = 1` the stdlib `adam_step` applied
+/// DECOUPLED decay (it is byte-identical to `adamw_step`), and with
+/// accumulation > 1 the FASE path compiled Adam with the decay forced to
+/// zero (`fase_optimizer.rs::emit_final_step`). The same source trained two
+/// different models, neither of them classical Adam. Refusing the knob makes
+/// every path agree (no decay) and sends decay to AdamW, which applies it
+/// the same way everywhere.
+pub const ADAM_COUPLED_DECAY_REFUSAL: &str = "NSL's Adam has no weight decay: \
+    classical Adam's coupled L2 decay is not implemented, and AdamW is the \
+    decoupled form. Use AdamW(weight_decay=..) for decay, or drop the kwarg \
+    for plain Adam";
 
 /// A fully validated optimizer section. Defaults match the pre-contract
 /// codegen locals bit-for-bit, including the Muon spec-default backfill
@@ -512,6 +533,14 @@ fn resolve_optimizer_expr(
             diags.push(
                 Diagnostic::error(format!("duplicate optimizer kwarg '{key}'"))
                     .with_label(arg.span, "already specified"),
+            );
+            continue;
+        }
+
+        if kind == OptimizerKind::Adam && matches!(key.as_str(), "weight_decay" | "no_decay") {
+            diags.push(
+                Diagnostic::error(format!("Adam does not accept '{key}'"))
+                    .with_label(arg.span, ADAM_COUPLED_DECAY_REFUSAL),
             );
             continue;
         }
@@ -1152,6 +1181,55 @@ mod tests {
             &|sym| interner.resolve(sym.0).unwrap_or("<unknown>").to_string(),
             TrainConfigPurpose::UserTrainBlock,
         )
+    }
+
+    /// Roadmap: Adam's weight decay was neither classical (coupled L2) nor
+    /// consistent (decoupled at grad_accumulation=1, zero under FASE
+    /// accumulation). Both knobs are refused with the AdamW pointer, for
+    /// any value (0.0 too: accepting it would suggest the knob exists), while
+    /// AdamW keeps both and a plain Adam still resolves with decay 0.
+    #[test]
+    fn adam_refuses_weight_decay_and_no_decay_and_points_to_adamw() {
+        let wd = || mk_expr(ExprKind::FloatLiteral(0.01));
+        let zero = || mk_expr(ExprKind::FloatLiteral(0.0));
+        let roles = || {
+            mk_expr(ExprKind::ListLiteral(vec![mk_expr(ExprKind::StringLiteral(
+                "embedding".to_string(),
+            ))]))
+        };
+        for (key, value) in [
+            ("weight_decay", wd()),
+            ("weight_decay", zero()),
+            ("no_decay", roles()),
+        ] {
+            let mut interner = nsl_lexer::Interner::new();
+            let kwarg = mk_kwarg(&mut interner, key, value);
+            let call = mk_call(&mut interner, "Adam", vec![kwarg]);
+            let diags = resolve(&interner, &[TrainSection::Optimizer(call)])
+                .expect_err("Adam must refuse the decay knobs");
+            assert_eq!(diags.len(), 1, "{diags:?}");
+            assert_eq!(diags[0].message, format!("Adam does not accept '{key}'"));
+            let label = format!("{:?}", diags[0]);
+            assert!(label.contains("AdamW(weight_decay=..)"), "{label}");
+        }
+
+        // The same knobs stay valid on AdamW.
+        let mut interner = nsl_lexer::Interner::new();
+        let args = vec![
+            mk_kwarg(&mut interner, "weight_decay", wd()),
+            mk_kwarg(&mut interner, "no_decay", roles()),
+        ];
+        let call = mk_call(&mut interner, "AdamW", args);
+        let cfg = resolve(&interner, &[TrainSection::Optimizer(call)]).expect("AdamW keeps decay");
+        assert!((cfg.optimizer.weight_decay - 0.01).abs() < 1e-12);
+
+        // Plain Adam resolves, with no decay reaching either lowering path.
+        let mut interner = nsl_lexer::Interner::new();
+        let lr = mk_kwarg(&mut interner, "lr", mk_expr(ExprKind::FloatLiteral(0.001)));
+        let call = mk_call(&mut interner, "Adam", vec![lr]);
+        let cfg = resolve(&interner, &[TrainSection::Optimizer(call)]).expect("plain Adam");
+        assert_eq!(cfg.optimizer.kind, OptimizerKind::Adam);
+        assert_eq!(cfg.optimizer.weight_decay, 0.0);
     }
 
     /// Bare `Muon()` gets the spec defaults (lr=0.02, momentum=0.95,

@@ -65,7 +65,7 @@ section below.)
 
 | Optimizer | Constructor                                                          | Description                              |
 |-----------|----------------------------------------------------------------------|------------------------------------------|
-| `Adam`    | `Adam(lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.0)` | Standard Adam                            |
+| `Adam`    | `Adam(lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-8)`                   | Adam without weight decay (`weight_decay`/`no_decay` refused — use AdamW) |
 | `AdamW`   | `AdamW(lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.01, no_decay=["vector"])` | Adam with decoupled weight decay; `no_decay=[role...]` exempts parameter roles from decay |
 | `SGD`     | `SGD(lr=0.01, momentum=0.9, dampening=0.0, weight_decay=0.0, nesterov=false)` | Stochastic gradient descent              |
 | `Lion`    | `Lion(lr=1e-4, beta1=0.9, beta2=0.99, weight_decay=0.0)`            | Google Brain's Lion optimizer            |

@@ -41,7 +41,9 @@ pub extern "C" fn nsl_tensor_exp(tensor_ptr: i64) -> i64 {
     // FBIP: mutate in-place when uniquely owned (CPU)
     {
         let t = NslTensor::from_ptr(tensor_ptr);
-        if t.can_mutate_inplace() {
+        // The in-place loops below write f32 or f64 elements; any other
+        // dtype takes the allocating path, whose typed accessors refuse it.
+        if t.can_mutate_inplace() && matches!(t.dtype, super::DTYPE_F32 | super::DTYPE_F64) {
             let len = t.len as usize;
             if t.dtype == 1 {
                 let d = t.data as *mut f32;
@@ -135,7 +137,9 @@ pub extern "C" fn nsl_tensor_log(tensor_ptr: i64) -> i64 {
     // FBIP: mutate in-place when uniquely owned (CPU)
     {
         let t = NslTensor::from_ptr(tensor_ptr);
-        if t.can_mutate_inplace() {
+        // The in-place loops below write f32 or f64 elements; any other
+        // dtype takes the allocating path, whose typed accessors refuse it.
+        if t.can_mutate_inplace() && matches!(t.dtype, super::DTYPE_F32 | super::DTYPE_F64) {
             let len = t.len as usize;
             if t.dtype == 1 {
                 let d = t.data as *mut f32;
@@ -229,7 +233,9 @@ pub extern "C" fn nsl_tensor_sqrt(tensor_ptr: i64) -> i64 {
     // FBIP: mutate in-place when uniquely owned (CPU)
     {
         let t = NslTensor::from_ptr(tensor_ptr);
-        if t.can_mutate_inplace() {
+        // The in-place loops below write f32 or f64 elements; any other
+        // dtype takes the allocating path, whose typed accessors refuse it.
+        if t.can_mutate_inplace() && matches!(t.dtype, super::DTYPE_F32 | super::DTYPE_F64) {
             let len = t.len as usize;
             if t.dtype == 1 {
                 let d = t.data as *mut f32;
@@ -323,7 +329,9 @@ pub extern "C" fn nsl_tensor_abs(tensor_ptr: i64) -> i64 {
     // FBIP: mutate in-place when uniquely owned (CPU)
     {
         let t = NslTensor::from_ptr(tensor_ptr);
-        if t.can_mutate_inplace() {
+        // The in-place loops below write f32 or f64 elements; any other
+        // dtype takes the allocating path, whose typed accessors refuse it.
+        if t.can_mutate_inplace() && matches!(t.dtype, super::DTYPE_F32 | super::DTYPE_F64) {
             let len = t.len as usize;
             if t.dtype == 1 {
                 let d = t.data as *mut f32;
@@ -403,7 +411,9 @@ pub extern "C" fn nsl_tensor_sign(tensor_ptr: i64) -> i64 {
     // FBIP: mutate in-place when uniquely owned (CPU)
     {
         let t = NslTensor::from_ptr(tensor_ptr);
-        if t.can_mutate_inplace() {
+        // The in-place loops below write f32 or f64 elements; any other
+        // dtype takes the allocating path, whose typed accessors refuse it.
+        if t.can_mutate_inplace() && matches!(t.dtype, super::DTYPE_F32 | super::DTYPE_F64) {
             let len = t.len as usize;
             if t.dtype == 1 {
                 let d = t.data as *mut f32;
@@ -498,7 +508,7 @@ pub extern "C" fn nsl_tensor_clamp(tensor_ptr: i64, min_val: f64, max_val: f64) 
     // FBIP: mutate in-place when uniquely owned (skip for i32 — needs dtype conversion)
     {
         let t = NslTensor::from_ptr(tensor_ptr);
-        if t.dtype != super::DTYPE_I32 && t.can_mutate_inplace() {
+        if t.can_mutate_inplace() && matches!(t.dtype, super::DTYPE_F32 | super::DTYPE_F64) {
             let len = t.len as usize;
             if t.dtype == 1 {
                 let d = t.data as *mut f32;
@@ -655,7 +665,9 @@ pub extern "C" fn nsl_tensor_relu(tensor_ptr: i64) -> i64 {
     // FBIP: mutate in-place when uniquely owned (CPU)
     {
         let t = NslTensor::from_ptr(tensor_ptr);
-        if t.can_mutate_inplace() {
+        // The in-place loops below write f32 or f64 elements; any other
+        // dtype takes the allocating path, whose typed accessors refuse it.
+        if t.can_mutate_inplace() && matches!(t.dtype, super::DTYPE_F32 | super::DTYPE_F64) {
             let len = t.len as usize;
             if t.dtype == 1 {
                 let d = t.data as *mut f32;
@@ -757,7 +769,9 @@ pub extern "C" fn nsl_tensor_gelu(tensor_ptr: i64) -> i64 {
     // FBIP: mutate in-place when uniquely owned
     {
         let t = NslTensor::from_ptr(tensor_ptr);
-        if t.can_mutate_inplace() {
+        // The in-place loops below write f32 or f64 elements; any other
+        // dtype takes the allocating path, whose typed accessors refuse it.
+        if t.can_mutate_inplace() && matches!(t.dtype, super::DTYPE_F32 | super::DTYPE_F64) {
             let len = t.len as usize;
             if t.dtype == 1 {
                 let d = t.data as *mut f32;
@@ -861,7 +875,9 @@ pub extern "C" fn nsl_tensor_silu(tensor_ptr: i64) -> i64 {
     // FBIP: mutate in-place when uniquely owned
     {
         let t = NslTensor::from_ptr(tensor_ptr);
-        if t.can_mutate_inplace() {
+        // The in-place loops below write f32 or f64 elements; any other
+        // dtype takes the allocating path, whose typed accessors refuse it.
+        if t.can_mutate_inplace() && matches!(t.dtype, super::DTYPE_F32 | super::DTYPE_F64) {
             let len = t.len as usize;
             if t.dtype == 1 {
                 let d = t.data as *mut f32;
@@ -937,7 +953,7 @@ pub extern "C" fn nsl_tensor_silu(tensor_ptr: i64) -> i64 {
 /// One call replaces the six adjoint ops source-AD emits for `SiluBackward`
 /// (Sigmoid, Sub, Mul, Add, Mul, Mul) — see `AdjointExpr::SiluBackward`. It is
 /// BIT-EXACT with that decomposed path: the GPU kernel
-/// (`SILU_BACKWARD_SRCAD_F32_PTX`) reproduces the exact operation ORDER and the
+/// (`nsl_silu_backward_srcad_f32`) reproduces the exact operation ORDER and the
 /// `nsl_sigmoid_f32` instructions, with `.rn` on the derivative ops to block ptxas
 /// fma-contraction; the CPU path computes the same order in f64/f32 (Rust emits
 /// no FMA for separate `*`/`+`). `grad` and `x` are made contiguous first, as the
@@ -990,7 +1006,7 @@ pub extern "C" fn nsl_tensor_silu_backward(grad_ptr: i64, x_ptr: i64) -> i64 {
             let out = crate::cuda::gpu_backward_binary(
                 grad_c,
                 x_c,
-                crate::cuda::kernels::SILU_BACKWARD_SRCAD_F32_PTX,
+                crate::cuda::kernels::backward_module(nsl_kir::kernels::elementwise::BackwardOp::SiluSrcad),
                 "nsl_silu_backward_srcad_f32\0",
             );
             nsl_tensor_free(grad_c);
@@ -1093,7 +1109,7 @@ pub extern "C" fn nsl_tensor_swiglu_gate_backward(
                 grad_c,
                 up_c,
                 x_c,
-                crate::cuda::kernels::SWIGLU_GATE_BACKWARD_F32_PTX,
+                crate::cuda::kernels::backward_module(nsl_kir::kernels::elementwise::BackwardOp::SwigluGate),
                 "nsl_swiglu_gate_backward_f32\0",
             );
             nsl_tensor_free(grad_c);
@@ -1162,7 +1178,7 @@ pub extern "C" fn nsl_tensor_swiglu_gate_backward(
 /// One call replaces the three adjoint ops source-AD emits for `SigmoidBackward`
 /// (Sub, Mul, Mul) — see `AdjointExpr::SigmoidBackward`, whose second operand is
 /// the sigmoid OUTPUT `y`. It is BIT-EXACT with that decomposed path: the GPU
-/// kernel (`SIGMOID_BACKWARD_SRCAD_F32_PTX`) reproduces the exact operation
+/// kernel (`nsl_sigmoid_backward_srcad_f32`) reproduces the exact operation
 /// ORDER with `.rn` on every op; the CPU path computes the same order in f64/f32
 /// (Rust emits no FMA for separate `*`/`-`). `grad` and `y` are made contiguous
 /// first, as the decomposed path's per-op kernels do.
@@ -1197,7 +1213,7 @@ pub extern "C" fn nsl_tensor_sigmoid_backward(grad_ptr: i64, y_ptr: i64) -> i64 
             let out = crate::cuda::gpu_backward_binary(
                 grad_c,
                 y_c,
-                crate::cuda::kernels::SIGMOID_BACKWARD_SRCAD_F32_PTX,
+                crate::cuda::kernels::backward_module(nsl_kir::kernels::elementwise::BackwardOp::SigmoidSrcad),
                 "nsl_sigmoid_backward_srcad_f32\0",
             );
             nsl_tensor_free(grad_c);
@@ -1252,7 +1268,7 @@ pub extern "C" fn nsl_tensor_sigmoid_backward(grad_ptr: i64, y_ptr: i64) -> i64 
 /// One call replaces the three adjoint ops source-AD emits for `TanhBackward`
 /// (Mul, Sub, Mul) — see `AdjointExpr::TanhBackward`, whose second operand is the
 /// tanh OUTPUT `y`. It is BIT-EXACT with that decomposed path: the GPU kernel
-/// (`TANH_BACKWARD_SRCAD_F32_PTX`) reproduces the exact operation ORDER with
+/// (`nsl_tanh_backward_srcad_f32`) reproduces the exact operation ORDER with
 /// LOAD-BEARING `.rn` blocking the `y*y`→`1-y*y` fma-contraction; the CPU path
 /// computes the same order in f64/f32. `grad` and `y` are made contiguous first.
 #[unsafe(no_mangle)]
@@ -1286,7 +1302,7 @@ pub extern "C" fn nsl_tensor_tanh_backward(grad_ptr: i64, y_ptr: i64) -> i64 {
             let out = crate::cuda::gpu_backward_binary(
                 grad_c,
                 y_c,
-                crate::cuda::kernels::TANH_BACKWARD_SRCAD_F32_PTX,
+                crate::cuda::kernels::backward_module(nsl_kir::kernels::elementwise::BackwardOp::TanhSrcad),
                 "nsl_tanh_backward_srcad_f32\0",
             );
             nsl_tensor_free(grad_c);
@@ -1389,7 +1405,7 @@ fn gelu_deriv_cpu(x_ptr: i64) -> i64 {
 /// `grad * gelu'(x)`, where `gelu'` is the derivative of the forward THIS DEVICE
 /// actually ran:
 /// - **GPU**: sigmoid approximation `x·σ(1.702x)` (`nsl_gelu_f32`) →
-///   `GELU_BACKWARD_SRCAD_F32_PTX` computes `σ(1.702x)·(1+1.702x·(1−σ(1.702x)))`.
+///   `nsl_gelu_backward_srcad_f32` computes `σ(1.702x)·(1+1.702x·(1−σ(1.702x)))`.
 /// - **CPU**: tanh approximation (the `nsl_tensor_gelu` CPU loop) →
 ///   `gelu_tanh_deriv_*` above (same formula as the tape backward).
 ///
@@ -1424,7 +1440,7 @@ pub extern "C" fn nsl_tensor_gelu_backward(grad_ptr: i64, x_ptr: i64) -> i64 {
                 let d = crate::cuda::gpu_backward_binary(
                     ones,
                     x_c,
-                    crate::cuda::kernels::GELU_BACKWARD_SRCAD_F32_PTX,
+                    crate::cuda::kernels::backward_module(nsl_kir::kernels::elementwise::BackwardOp::GeluSrcad),
                     "nsl_gelu_backward_srcad_f32\0",
                 );
                 nsl_tensor_free(ones);
@@ -1448,7 +1464,7 @@ pub extern "C" fn nsl_tensor_gelu_backward(grad_ptr: i64, x_ptr: i64) -> i64 {
             let out = crate::cuda::gpu_backward_binary(
                 grad_c,
                 x_c,
-                crate::cuda::kernels::GELU_BACKWARD_SRCAD_F32_PTX,
+                crate::cuda::kernels::backward_module(nsl_kir::kernels::elementwise::BackwardOp::GeluSrcad),
                 "nsl_gelu_backward_srcad_f32\0",
             );
             nsl_tensor_free(grad_c);
@@ -1523,7 +1539,9 @@ pub extern "C" fn nsl_tensor_sigmoid(tensor_ptr: i64) -> i64 {
     // FBIP: mutate in-place when uniquely owned (CPU)
     {
         let t = NslTensor::from_ptr(tensor_ptr);
-        if t.can_mutate_inplace() {
+        // The in-place loops below write f32 or f64 elements; any other
+        // dtype takes the allocating path, whose typed accessors refuse it.
+        if t.can_mutate_inplace() && matches!(t.dtype, super::DTYPE_F32 | super::DTYPE_F64) {
             let len = t.len as usize;
             if t.dtype == 1 {
                 let d = t.data as *mut f32;
@@ -1625,7 +1643,9 @@ pub extern "C" fn nsl_tensor_tanh_act(tensor_ptr: i64) -> i64 {
     // FBIP: mutate in-place when uniquely owned (CPU)
     {
         let t = NslTensor::from_ptr(tensor_ptr);
-        if t.can_mutate_inplace() {
+        // The in-place loops below write f32 or f64 elements; any other
+        // dtype takes the allocating path, whose typed accessors refuse it.
+        if t.can_mutate_inplace() && matches!(t.dtype, super::DTYPE_F32 | super::DTYPE_F64) {
             let len = t.len as usize;
             if t.dtype == 1 {
                 let d = t.data as *mut f32;

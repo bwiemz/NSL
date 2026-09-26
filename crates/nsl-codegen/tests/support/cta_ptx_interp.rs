@@ -58,6 +58,17 @@
 //! forms: the interpreter never contracts a multiply into an add, so the
 //! modifier (which exists to stop ptxas doing so) changes nothing here, and
 //! a gate that relies on it pins the spelling itself.
+//!
+//! `shfl.sync.bfly.b32` is warp-synchronous: a lane that reaches it waits
+//! until every lane of its 32-thread warp has reached the same instruction,
+//! then all of them exchange at once (lane `l` reads lane `l ^ b`, clamped
+//! by `c` as PTX specifies; a lane past the clamp keeps its own value). The
+//! member mask must be the full warp and every lane of the warp must be
+//! live — a divergent or partial shuffle is a hard error, not a guess.
+//! `and.pred` / `or.pred` combine 0/1 predicates, `setp.nan.f32` is true if
+//! either operand is NaN, `.u16` loads zero-extend two bytes and `.u16`
+//! compares look at the low 16 bits. `cvta.shared.u64` of a shared symbol is
+//! its window address: the model has one address space for shared memory.
 
 use std::collections::HashMap;
 
@@ -75,6 +86,8 @@ pub(crate) const SHARED_BASE: u64 = 0x100;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Special {
     TidX,
+    /// `%laneid`: `%tid.x % 32` for the one-dimensional blocks modelled.
+    LaneId,
     CtaidX,
     CtaidY,
     NctaidY,
@@ -109,7 +122,9 @@ pub(crate) enum IntOp {
     Div,
     Rem,
     Min,
+    Max,
     And,
+    Or,
     Xor,
     Shl,
     Shr,
@@ -135,10 +150,13 @@ pub(crate) enum Cmp {
     Le,
     Gt,
     Ge,
+    /// `setp.nan.f32`: true if either operand is NaN.
+    Nan,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum CmpTy {
+    U16,
     U32,
     U64,
     S64,
@@ -160,6 +178,8 @@ pub(crate) enum Op {
     CvtU64U32 { d: usize, a: Src },
     /// `cvt.u32.u64`: the low 32 bits.
     CvtU32U64 { d: usize, a: Src },
+    /// `cvt.u16.u32` / `cvt.u32.u16`: the low 16 bits, zero-extended.
+    CvtU16 { d: usize, a: Src },
     /// `cvt.rn.f32.u32`: round to nearest.
     CvtF32U32 { d: usize, a: Src },
     /// `cvt.rn.f32.u64`: round to nearest.
@@ -200,6 +220,9 @@ pub(crate) enum Op {
     StV4 { space: Space, addr: Addr, v: [Src; 4] },
     /// `red.<space>.add.f32`: `*addr += v` in f32, as one step of the thread.
     RedAddF32 { space: Space, addr: Addr, v: Src },
+    /// `shfl.sync.bfly.b32 d, a, b, c, members`: warp-synchronous, resolved
+    /// by `run_cta` once every lane of the warp waits at it.
+    ShflBfly { d: usize, a: Src, b: Src, c: Src, members: Src },
     Bra { target: usize },
     Bar,
     Ret,
@@ -254,6 +277,7 @@ impl Parser {
         let tok = tok.trim();
         match tok {
             "%tid.x" => return Src::Special(Special::TidX),
+            "%laneid" => return Src::Special(Special::LaneId),
             "%ctaid.x" => return Src::Special(Special::CtaidX),
             "%ctaid.y" => return Src::Special(Special::CtaidY),
             "%nctaid.y" => return Src::Special(Special::NctaidY),
@@ -434,7 +458,7 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 };
                 Op::Mov { d: p.dst(ops[0]), s: p.src(ops[1]), w }
             }
-            [name @ ("add" | "sub" | "div" | "rem" | "min"), ty @ ("u32" | "u64")]
+            [name @ ("add" | "sub" | "div" | "rem" | "min" | "max"), ty @ ("u32" | "u64")]
             | [name @ "mul", "lo", ty @ ("u32" | "u64")]
             | [name @ ("add" | "sub"), ty @ "s64"]
             | [name @ "mul", "lo", ty @ "s64"] => {
@@ -445,6 +469,7 @@ pub(crate) fn parse(ptx: &str) -> Program {
                     "mul" => IntOp::MulLo,
                     "div" => IntOp::Div,
                     "rem" => IntOp::Rem,
+                    "max" => IntOp::Max,
                     _ => IntOp::Min,
                 };
                 let w = if *ty == "u32" { W::U32 } else { W::U64 };
@@ -453,6 +478,11 @@ pub(crate) fn parse(ptx: &str) -> Program {
             ["mul", "wide", "u32"] => {
                 want(3);
                 Op::MulWide { d: p.dst(ops[0]), a: p.src(ops[1]), b: p.src(ops[2]) }
+            }
+            // A shared symbol's generic address is its window address.
+            ["cvta", "shared", "u64"] => {
+                want(2);
+                Op::Mov { d: p.dst(ops[0]), s: p.src(ops[1]), w: W::U64 }
             }
             // A pointer reinterpreted as another pointer type: a copy.
             ["cvt", "u64", "u64"] => {
@@ -476,6 +506,11 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 want(2);
                 Op::CvtU32U64 { d: p.dst(ops[0]), a: p.src(ops[1]) }
             }
+            // Narrowing to / widening from 16 bits: the low half, zero-extended.
+            ["cvt", "u16", "u32"] | ["cvt", "u32", "u16"] => {
+                want(2);
+                Op::CvtU16 { d: p.dst(ops[0]), a: p.src(ops[1]) }
+            }
             ["cvt", "rn", "f32", "u32"] => {
                 want(2);
                 Op::CvtF32U32 { d: p.dst(ops[0]), a: p.src(ops[1]) }
@@ -484,10 +519,16 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 want(2);
                 Op::CvtF32U64 { d: p.dst(ops[0]), a: p.src(ops[1]) }
             }
-            [name @ ("and" | "xor" | "shl"), ty @ ("b32" | "b64")] | [name @ "shr", ty @ ("b32" | "b64" | "u32" | "u64")] => {
+            [name @ ("and" | "or"), "pred"] => {
+                want(3);
+                let op = if *name == "and" { IntOp::And } else { IntOp::Or };
+                Op::Int { op, w: W::U32, d: p.dst(ops[0]), a: p.src(ops[1]), b: p.src(ops[2]) }
+            }
+            [name @ ("and" | "or" | "xor" | "shl"), ty @ ("b32" | "b64")] | [name @ "shr", ty @ ("b32" | "b64" | "u32" | "u64")] => {
                 want(3);
                 let op = match *name {
                     "and" => IntOp::And,
+                    "or" => IntOp::Or,
                     "xor" => IntOp::Xor,
                     "shl" => IntOp::Shl,
                     _ => IntOp::Shr,
@@ -528,15 +569,18 @@ pub(crate) fn parse(ptx: &str) -> Program {
                     "le" => Cmp::Le,
                     "gt" => Cmp::Gt,
                     "ge" => Cmp::Ge,
+                    "nan" => Cmp::Nan,
                     _ => panic!("`{text}`: comparison not modelled"),
                 };
                 let ty = match *ty {
+                    "u16" => CmpTy::U16,
                     "u32" => CmpTy::U32,
                     "u64" => CmpTy::U64,
                     "s64" => CmpTy::S64,
                     "f32" => CmpTy::F32,
                     _ => panic!("`{text}`: comparison type not modelled"),
                 };
+                assert!(cmp != Cmp::Nan || ty == CmpTy::F32, "`{text}`: `nan` is a float comparison");
                 Op::Setp { cmp, ty, d: p.dst(ops[0]), a: p.src(ops[1]), b: p.src(ops[2]) }
             }
             ["selp", ty @ ("f32" | "b32" | "u32" | "b64" | "u64")] => {
@@ -591,11 +635,11 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 want(2);
                 Op::Cos { d: p.dst(ops[0]), a: p.src(ops[1]) }
             }
-            ["ld", space @ ("global" | "shared"), ty @ ("f32" | "b16" | "u32" | "b32" | "s64" | "u64")] => {
+            ["ld", space @ ("global" | "shared"), ty @ ("f32" | "b16" | "u16" | "u32" | "b32" | "s64" | "u64")] => {
                 want(2);
                 let space = if *space == "global" { Space::Global } else { Space::Shared };
                 let bytes = match *ty {
-                    "b16" => 2,
+                    "b16" | "u16" => 2,
                     "s64" | "u64" => 8,
                     _ => 4,
                 };
@@ -612,10 +656,10 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 let space = if *space == "global" { Space::Global } else { Space::Shared };
                 Op::LdS8 { space, d: p.dst(ops[0]), addr: p.addr(ops[1]) }
             }
-            ["st", space @ ("global" | "shared"), ty @ ("f32" | "u32" | "b32" | "b16")] => {
+            ["st", space @ ("global" | "shared"), ty @ ("f32" | "u32" | "b32" | "b16" | "u16")] => {
                 want(2);
                 let space = if *space == "global" { Space::Global } else { Space::Shared };
-                let bytes = if *ty == "b16" { 2 } else { 4 };
+                let bytes = if matches!(*ty, "b16" | "u16") { 2 } else { 4 };
                 Op::St { space, bytes, addr: p.addr(ops[0]), v: p.src(ops[1]) }
             }
             ["ld", space @ ("global" | "shared"), "v4", "f32"] => {
@@ -636,6 +680,16 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 want(2);
                 let space = if *space == "global" { Space::Global } else { Space::Shared };
                 Op::RedAddF32 { space, addr: p.addr(ops[0]), v: p.src(ops[1]) }
+            }
+            ["shfl", "sync", "bfly", "b32"] => {
+                want(5);
+                Op::ShflBfly {
+                    d: p.dst(ops[0]),
+                    a: p.src(ops[1]),
+                    b: p.src(ops[2]),
+                    c: p.src(ops[3]),
+                    members: p.src(ops[4]),
+                }
             }
             ["bra"] => {
                 want(1);
@@ -692,7 +746,19 @@ pub(crate) enum Order {
 pub(crate) enum State {
     Running,
     AtBarrier,
+    /// Waiting at the `shfl.sync` at instruction `at` for the rest of its warp.
+    AtShfl { at: usize },
     Exited,
+}
+
+/// A lane's half of a pending `shfl.sync.bfly`.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ShflPending {
+    pub(crate) d: usize,
+    pub(crate) value: u64,
+    pub(crate) b: u64,
+    pub(crate) c: u64,
+    pub(crate) members: u64,
 }
 
 pub(crate) struct Thread {
@@ -700,6 +766,7 @@ pub(crate) struct Thread {
     pub(crate) regs: Vec<u64>,
     pub(crate) written: Vec<bool>,
     pub(crate) state: State,
+    pub(crate) shfl: ShflPending,
 }
 
 pub(crate) struct Launch<'a> {
@@ -752,6 +819,7 @@ pub(crate) fn read(prog: &Program, t: &Thread, launch: &Launch, tid: u32, s: Src
         }
         Src::Imm(v) => v,
         Src::Special(Special::TidX) => tid as u64,
+        Src::Special(Special::LaneId) => (tid % 32) as u64,
         Src::Special(Special::CtaidX) => launch.ctaid as u64,
         Src::Special(Special::CtaidY) => launch.ctaid_y as u64,
         Src::Special(Special::NctaidY) => launch.nctaid_y as u64,
@@ -807,7 +875,9 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
                             IntOp::Div => a.checked_div(b).expect("u32 division by zero"),
                             IntOp::Rem => a.checked_rem(b).expect("u32 remainder by zero"),
                             IntOp::Min => a.min(b),
+                            IntOp::Max => a.max(b),
                             IntOp::And => a & b,
+                            IntOp::Or => a | b,
                             IntOp::Xor => a ^ b,
                             IntOp::Shl => a.checked_shl(b).unwrap_or(0),
                             IntOp::Shr => a.checked_shr(b).unwrap_or(0),
@@ -820,7 +890,9 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
                         IntOp::Div => a.checked_div(b).expect("u64 division by zero"),
                         IntOp::Rem => a.checked_rem(b).expect("u64 remainder by zero"),
                         IntOp::Min => a.min(b),
+                        IntOp::Max => a.max(b),
                         IntOp::And => a & b,
+                        IntOp::Or => a | b,
                         IntOp::Xor => a ^ b,
                         // The amount is a u32 operand, even for a 64-bit shift.
                         IntOp::Shl => a.checked_shl(b as u32).unwrap_or(0),
@@ -839,6 +911,10 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
             }
             Op::CvtU32U64 { d, a } => {
                 let v = rd(t, launch, *a) as u32 as u64;
+                write(t, *d, v);
+            }
+            Op::CvtU16 { d, a } => {
+                let v = rd(t, launch, *a) as u16 as u64;
                 write(t, *d, v);
             }
             Op::CvtF32U32 { d, a } => {
@@ -873,10 +949,15 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
                             Cmp::Le => a <= b,
                             Cmp::Gt => a > b,
                             Cmp::Ge => a >= b,
+                            Cmp::Nan => unreachable!("rejected at parse"),
                         }
                     }
-                    CmpTy::U32 | CmpTy::U64 => {
-                        let (a, b) = if *ty == CmpTy::U32 { (a as u32 as u64, b as u32 as u64) } else { (a, b) };
+                    CmpTy::U16 | CmpTy::U32 | CmpTy::U64 => {
+                        let (a, b) = match ty {
+                            CmpTy::U16 => (a as u16 as u64, b as u16 as u64),
+                            CmpTy::U32 => (a as u32 as u64, b as u32 as u64),
+                            _ => (a, b),
+                        };
                         match cmp {
                             Cmp::Eq => a == b,
                             Cmp::Ne => a != b,
@@ -884,6 +965,7 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
                             Cmp::Le => a <= b,
                             Cmp::Gt => a > b,
                             Cmp::Ge => a >= b,
+                            Cmp::Nan => unreachable!("rejected at parse"),
                         }
                     }
                     // PTX's ordered comparisons are false on NaN, `ne` too
@@ -897,6 +979,7 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
                             Cmp::Le => a <= b,
                             Cmp::Gt => a > b,
                             Cmp::Ge => a >= b,
+                            Cmp::Nan => a.is_nan() || b.is_nan(),
                         }
                     }
                 };
@@ -1033,6 +1116,17 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
                 mem.copy_from_slice(&(old + add).to_le_bytes());
             }
             Op::Bra { target } => t.pc = *target,
+            Op::ShflBfly { d, a, b, c, members } => {
+                t.shfl = ShflPending {
+                    d: *d,
+                    value: rd(t, launch, *a),
+                    b: rd(t, launch, *b),
+                    c: rd(t, launch, *c),
+                    members: rd(t, launch, *members),
+                };
+                t.state = State::AtShfl { at: t.pc - 1 };
+                return;
+            }
             Op::Bar => {
                 t.state = State::AtBarrier;
                 return;
@@ -1045,12 +1139,53 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
     }
 }
 
+/// Complete every warp whose lanes all wait at the same `shfl.sync.bfly`.
+/// Returns whether any warp was released. A warp with some lanes at a
+/// shuffle and others elsewhere (another shuffle, a barrier, exited) is
+/// divergent, which the model does not guess at.
+fn resolve_shuffles(threads: &mut [Thread], ctaid: u32) -> bool {
+    let mut released = false;
+    for (w, warp) in threads.chunks_mut(32).enumerate() {
+        let Some(at) = warp.iter().find_map(|t| match t.state {
+            State::AtShfl { at } => Some(at),
+            _ => None,
+        }) else {
+            continue;
+        };
+        assert!(
+            warp.len() == 32 && warp.iter().all(|t| t.state == State::AtShfl { at }),
+            "CTA {ctaid} warp {w}: a shfl.sync at instruction {at} that not every lane of a full warp reached"
+        );
+        let values: Vec<u64> = warp.iter().map(|t| t.shfl.value).collect();
+        for (lane, t) in warp.iter_mut().enumerate() {
+            let ShflPending { d, b, c, members, .. } = t.shfl;
+            assert_eq!(members as u32, u32::MAX, "CTA {ctaid} warp {w}: only full-warp shuffles are modelled");
+            // PTX: c packs the clamp (bits 0-4) and the segment mask (bits 8-12).
+            let seg_mask = ((c >> 8) & 0x1f) as usize;
+            let max_lane = (lane & seg_mask) | ((c & 0x1f) as usize & !seg_mask);
+            let src = lane ^ (b as usize & 0x1f);
+            let v = if src > max_lane { values[lane] } else { values[src] };
+            t.regs[d] = v as u32 as u64;
+            t.written[d] = true;
+            t.state = State::Running;
+        }
+        released = true;
+    }
+    released
+}
+
 /// Run one CTA to completion under `order`.
 pub(crate) fn run_cta(launch: &mut Launch, order: Order) {
     let n = launch.ntid;
     let regs = launch.prog.reg_names.len();
     let mut threads: Vec<Thread> = (0..n)
-        .map(|_| Thread { pc: 0, regs: vec![0; regs], written: vec![false; regs], state: State::Running })
+        .map(|_| Thread {
+            pc: 0,
+            regs: vec![0; regs],
+            written: vec![false; regs],
+            state: State::Running,
+            shfl: ShflPending::default(),
+        })
         .collect();
     let visit: Vec<u32> = match order {
         Order::Ascending => (0..n).collect(),
@@ -1062,6 +1197,9 @@ pub(crate) fn run_cta(launch: &mut Launch, order: Order) {
             if t.state == State::Running {
                 run_until_blocked(t, launch, tid);
             }
+        }
+        if resolve_shuffles(&mut threads, launch.ctaid) {
+            continue;
         }
         let waiting = threads.iter().filter(|t| t.state == State::AtBarrier).count();
         let exited = threads.iter().filter(|t| t.state == State::Exited).count();

@@ -311,6 +311,9 @@ pub fn synthesize_flash_attention_ptx_v2_with_tier_b(
             ptx.push_str(&format!("V2_LOOP_KV_PV_{}:\n", q_iter));
             emit_v_tile_load(&mut ptx, config, q_iter);
             phases::pv_accum::emit(&mut ptx, config, q_iter);
+            // When V is loaded per tile, the next load overwrites what slower
+            // warps may still be reading — see the standard path's fence.
+            ptx.push_str("    bar.sync 0;  // FENCE: all warps done reading V before the next V tile\n");
             ptx.push_str(&format!("    add.u64 %k_start, %k_start, {};\n", config.block_kv));
             ptx.push_str("    setp.lt.u64 %p0, %k_start, %k_max;\n");
             ptx.push_str(&format!("    @%p0 bra V2_LOOP_KV_PV_{};\n", q_iter));
@@ -467,6 +470,16 @@ pub fn synthesize_flash_attention_ptx_v2_with_tier_b(
                 ptx.push_str("    // CSHA Tier C V-save: save_activations=false, no emission\n");
             }
             phases::pv_accum::emit(&mut ptx, config, q_iter);
+            // K and V share the kv_offset SMEM region, and the next
+            // iteration's K-tile load overwrites it. Without this fence a
+            // warp that finishes its P·V sweep early starts writing the next
+            // K tile while slower warps are still reading this V tile: a
+            // write-after-read race on every sequence longer than one KV
+            // tile (the output — not the logsumexp — comes out wrong, and
+            // which rows depends on warp scheduling). Found by executing the
+            // kernel on `tests/support/cta_ptx_interp.rs`
+            // (`sdpa_fused_forward_interp.rs`, seq 128).
+            ptx.push_str("    bar.sync 0;  // FENCE: all warps done reading V before the next K tile\n");
 
             // PCA Tier B: KV_TILE_SKIP_TB_{q_iter} label emitted ONLY when
             // tier_b.is_some() — preserves byte-identical output for non-Tier-B
