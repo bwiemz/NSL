@@ -310,7 +310,8 @@ fn adamw_fase_deferred_pipeline_equivalence() {
         /*lr=*/ 0.001,
         /*beta1=*/ 0.9,
         /*beta2=*/ 0.999,
-        /*eps=*/ 1e-8,
+        // eps near |g| so the update sees gradient magnitude (see the fixture).
+        /*eps=*/ 1.0,
         /*wd=*/ 0.01,
         /*windows=*/ 3,
     );
@@ -431,7 +432,8 @@ fn adamw_deferred_with_grad_clip() {
         /*lr=*/ 0.001,
         /*beta1=*/ 0.9,
         /*beta2=*/ 0.999,
-        /*eps=*/ 1e-8,
+        // eps near the clipped |g| so the clip factor is observable (see the fixture).
+        /*eps=*/ 1e-2,
         /*wd=*/ 0.01,
         /*tau=*/ 0.01,
         /*windows=*/ 3,
@@ -494,7 +496,8 @@ fn adamw_fase_deferred_source_ad_pipeline_equivalence() {
         /*lr=*/ 0.001,
         /*beta1=*/ 0.9,
         /*beta2=*/ 0.999,
-        /*eps=*/ 1e-8,
+        // eps near |g| so the update sees gradient magnitude (see the fixture).
+        /*eps=*/ 1.0,
         /*wd=*/ 0.01,
         /*windows=*/ 3,
     );

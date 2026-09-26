@@ -1,0 +1,8 @@
+# Differential test: layernorm with a non-trivial weight and bias, then an
+# elementwise tail. The input is quadratic in position, so every row has a
+# different shape (layernorm ignores a per-row shift and scale).
+let x = (arange(12).reshape([3, 4])) * 0.4 - full([3, 4], 1.7)
+let w = arange(4) * 0.5 + full([4], 0.75)
+let b = arange(4) * -0.2
+let y = layernorm(x * x - x, w, b, 0.00001) * 3.0 + full([3, 4], 0.1)
+print(y)
