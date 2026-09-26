@@ -383,6 +383,18 @@ impl<'a> TypeChecker<'a> {
                             .resolve(deco.name[0].0)
                             .unwrap_or("")
                             .to_string();
+                        // `@fp8_compute` on a method is what codegen reads
+                        // (compiler/functions.rs); validate it here too.
+                        if dname == "fp8_compute" {
+                            let resolve = |s: nsl_ast::Symbol| -> String {
+                                self.interner.resolve(s.0).unwrap_or("").to_string()
+                            };
+                            crate::fp8::validate_fp8_compute_decorator(
+                                deco,
+                                &resolve,
+                                &mut self.diagnostics,
+                            );
+                        }
                         if dname == "wggo_target" {
                             let fn_name = self
                                 .interner

@@ -8,6 +8,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- Nine activation-backward kernels are built by
+  `nsl_kir::kernels::elementwise` (`BackwardOp`) in place of their
+  hand-written constants (roadmap A2 step 11, eighth slice). They are the
+  tape-AD `nsl_{relu,sigmoid,tanh,silu}_backward_f32`, the source-AD
+  `nsl_{sigmoid,tanh,silu,gelu}_backward_srcad_f32` and the fused SwiGLU
+  gate adjoint `nsl_swiglu_gate_backward_f32`.
+  - The tape-AD kernels keep their bare arithmetic, so ptxas contracts
+    exactly what it did before.
+  - The source-AD kernels spell every derivative operation `.rn`, as they
+    must to match the launches they replace.
+  - `tests/elementwise_backward_kir_equivalence.rs` (13 tests) checks them
+    against the frozen hand kernels. It requires the same bytes under two
+    schedules over IEEE corners, the formula with every operation rounded,
+    and the derivative each kernel names. It pins every arithmetic
+    mnemonic's count to the hand module, and it catches mutants of the
+    bound, the element sizes, every baked constant, each operation, relu's
+    strict comparison and the gate's `up` read.
+  - Disassembled on sm_75/80/90/120, eight of the nine issue the hand
+    kernels' exact floating-point instruction sequence. The ninth, the
+    SwiGLU gate on sm_80 and later, schedules its independent `grad * up`
+    multiply at a different point; it has the same instructions and no
+    `FFMA`.
+  - The GELU slope drift gate now reads both built modules.
+  - `nsl_gelu_backward_f32` (`div.approx`) stays hand-written.
+    `nsl_clamp_backward_f32` follows once the interpreter models
+    `and.pred`.
+
 - KIR has explicitly rounded float arithmetic: `KirOp::{AddRn, SubRn,
   MulRn}` print `add.rn` / `sub.rn` / `mul.rn`. ptxas never contracts these
   into an `fma`, so a kernel that must match a decomposed computation bit
@@ -627,6 +654,89 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
       reference, so a wrong answer fails even when no fusion fires. A gelu
       cubic-coefficient mutant (0.044715 → 0.04) now fails
       `differential_fused_gelu`.
+- **`.to(dtype)` converts** (dtype-semantics design, step 1).
+  - **What was wrong.** On a standard-dtype tensor, `.to(f32)` and
+    `.to(f64)` compiled to `nsl_tensor_from_custom_dtype`, which returns
+    its input unchanged. The cast the GPU refusals tell users to write
+    ("cast with `.to(f32)`") did nothing. `.to(f32)` of a packed BYOD
+    tensor produced f64. `.to(fp16)` / `.to(bf16)` did not check.
+  - **Now `.to(f32 | f64 | fp16 | bf16)` calls the new
+    `nsl_tensor_to_dtype`:**
+    - a converted copy on the same device;
+    - host conversions round once, to nearest even, from the exact source
+      value (f64 → f16/bf16 goes through a round-to-odd f32 step, because
+      `half`'s `from_f64` double-rounds);
+    - GPU conversions use the PTX cast kernels, staging fp16 ↔ bf16
+      through f32;
+    - f64 on a GPU tensor is refused;
+    - strided views convert in index order;
+    - the same dtype returns the source unchanged, as before.
+  - **Gradients flow through the cast.** Under a recording tape the cast is
+    a `TapeOp::Cast`, whose backward converts the gradient back to the
+    source dtype.
+  - **Checker:** `fp16` and `bf16` are now dtype identifiers next to `f32`
+    and `f64`.
+  - **Tests:** every conversion pair is checked against an exhaustive
+    nearest-value search over each 16-bit format, over IEEE corners
+    (ties, subnormals, overflow). Separate tests cover the double-rounding
+    counterexamples for f16 and bf16, gradient flow through the cast, and
+    a strided source.
+
+- The CPU fused kernels no longer misread memory or return a null tensor
+  (dtype-semantics design, step 0).
+  - **`nsl_fused_elementwise_2`** returned the null handle 0 for operands
+    of different lengths (any broadcast). Neither codegen call site checks
+    for it, so the next op aborted on a null tensor.
+  - **All three kernels misread memory.** `nsl_fused_elementwise_{1,2}`
+    and `nsl_fused_matmul_epilogue` read their operands as flat host arrays
+    in the first operand's dtype. A GPU tensor, a strided view, an f64 `b`
+    next to an f32 `a`, or a 3-D/f64 matmul operand came out as the wrong
+    numbers, and a K mismatch read past the end of `b`.
+  - **Now:** each fast path requires what it reads: contiguous host tensors
+    of one dtype and one shape, or 2-D f32 with matching K and bias.
+    Everything else runs the same chain through the ordinary ops, which
+    broadcast, dispatch to the GPU and check dtypes, and the result is
+    identical to the unfused computation.
+  - **f64 fused loops compute in f64.** They used to narrow each element to
+    f32 and widen it back.
+  - **In-place arms guard their dtype.** The CPU FBIP in-place arms (exp,
+    log, sqrt, abs, sign, clamp, relu, gelu, silu, sigmoid, tanh, neg) now
+    check the dtype they write, so a non-float buffer can never be
+    overwritten with 8-byte f64 elements. They are unreachable today
+    (`can_mutate_inplace()` is `false`), so this closes the hazard before
+    FBIP is re-enabled.
+
+- Calibration and quantization requests that were accepted and never
+  honoured are refused at `nsl check` (first slice of "turn ignored
+  calibration requests into implemented behavior or refusal"). The checks
+  live in `nsl-semantic/src/quant_requests.rs` and `fp8.rs`.
+  - **A `quant` block's `calibration:` section.** Its `data` and `samples`
+    were parsed and never read; the block quantized from the weights alone.
+  - **`quant` block `default: awq4 | gptq4 | gptq8`.** The runtime quantizer
+    implements only int8 and int4, so these programs checked, built, and
+    aborted when the block ran. The refusal points to `int4` or `int8`.
+  - **`@quantize(...)` has a closed argument set.** Only `dtype = "awq4"`,
+    the one value codegen reads, is accepted. `group_size` was logged and
+    unused, and any other dtype, argument name or positional argument was
+    dropped.
+  - **`@fp8_compute(calibrate = true)`.** The flag was never read: FP8
+    scales come from each call's absmax. `@fp8_compute` on functions and
+    model methods, which is where codegen reads it, is now validated too.
+    Before, only layer declarations were.
+
+- `Adam(weight_decay=..)` and `Adam(no_decay=..)` are refused at `nsl check`
+  and on the build/run path, with AdamW named as the way to decay.
+  Classical Adam's decay is coupled: an L2 term added to the gradient.
+  NSL never implemented that, and what `Adam` did with the knob depended
+  on `grad_accumulation`. At 1, `adam_step` applied the decoupled AdamW
+  form. Above 1, the FASE path compiled it to zero. The same source
+  trained two different models. Plain `Adam(...)` is unchanged and trains
+  without decay on every path. Refusal chosen over implementing coupled
+  decay because no program in the tree passes decay to Adam, and every
+  update path (stdlib step, FASE, fused and batched GPU steps) would
+  otherwise need it (roadmap item 6). Gated by
+  `optim_config::adam_refuses_weight_decay_and_no_decay_and_points_to_adamw`
+  and `optim_config_contract_gate::adam_weight_decay_refuses_and_points_to_adamw`.
 
 - The fused SDPA forward (the scalar flash-attention v2 path, which Stage C's
   packed segment-masked kernels use) had a shared-memory race on every

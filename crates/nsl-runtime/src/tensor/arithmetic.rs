@@ -525,10 +525,12 @@ pub extern "C" fn nsl_tensor_neg(a_ptr: i64) -> i64 {
             { crate::fatal::cuda_not_compiled(); }
         }
     }
-    // FBIP: mutate in-place when uniquely owned (CPU)
+    // FBIP: mutate in-place when uniquely owned (CPU). The loops handle
+    // fp16, bf16, f32 and f64; any other dtype takes the allocating path.
     {
+        use crate::tensor::{DTYPE_BF16, DTYPE_F32, DTYPE_F64, DTYPE_FP16};
         let t = NslTensor::from_ptr(a_ptr);
-        if t.can_mutate_inplace() {
+        if t.can_mutate_inplace() && matches!(t.dtype, DTYPE_FP16 | DTYPE_BF16 | DTYPE_F32 | DTYPE_F64) {
             let len = t.len as usize;
             if t.dtype == crate::tensor::DTYPE_FP16 {
                 let d = t.data as *mut u16;
