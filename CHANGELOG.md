@@ -1182,6 +1182,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- **The train block's planning modules take facts, not Cranelift handles**
+  (roadmap A1, `TrainPlan` step 2).
+  - **The change.** `plan_wggo` took Muon's mode-table base `Value` only to
+    ask whether a mode table had been emitted. It now takes
+    `mode_table_emitted: bool`. This removes the last planning-time
+    `Value` read.
+  - **The gate.** `tests/train_plan_handle_free.rs` refuses any non-comment
+    line naming a Cranelift type or crate (`Value`, `Variable`,
+    `FunctionBuilder`, `InstBuilder`, `cranelift*`). It covers the
+    planning modules: `plan*.rs`, `csla_precompute`, `adjoint_tape_opt` and
+    `ccr_adjoint_frees`.
+  - No behaviour change: the CLIF snapshots and
+    `wggo_prepass_consumption` pass unchanged.
+
 - `KernelIR`, `KirBuilder`, the KIR verifier, the PTX printer and
   `FeatureSet` moved from `nsl-codegen` into a new leaf crate `nsl-kir`
   (roadmap A2 step 1), so the runtime can build kernels on the same IR
