@@ -528,9 +528,6 @@ mod tests {
     #[test]
     fn fase_adamw_multi_verifies_and_spells_its_rounding() {
         let ptx = String::from_utf8(fase_adamw_multi_ptx()).unwrap();
-        if std::env::var("NSL_DUMP_PTX").is_ok() {
-            println!("{ptx}");
-        }
         assert!(ptx.contains(".visible .entry nsl_fase_fused_adamw_multi_f32("), "{ptx}");
         assert_eq!(ptx.matches("div.approx.f32").count(), 1, "{ptx}");
         assert_eq!(ptx.matches("sqrt.rn.f32").count(), 1, "{ptx}");
