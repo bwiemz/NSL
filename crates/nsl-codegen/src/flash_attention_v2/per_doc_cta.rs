@@ -270,6 +270,9 @@ pub fn synthesize_per_doc_cta_forward(
             &mut ptx, &cfg, q_iter, phases::csha_hooks::SaveSet::V,
         );
         phases::pv_accum::emit(&mut ptx, &cfg, q_iter);
+        // The next iteration's K load overwrites the V tile slower warps may
+        // still be reading — see the same fence in `mod.rs`'s standard path.
+        ptx.push_str("    bar.sync 0;  // FENCE: all warps done reading V before the next K tile\n");
 
         ptx.push_str(&format!(
             "    add.u64 %k_start, %k_start, {};\n",

@@ -430,7 +430,7 @@ the CLIF snapshot suite.
 
 Every runtime call the codegen can emit is declared once, in the typed
 ABI table `crates/nsl-abi/src/table.rs` (roadmap A3): one row
-`[group] name(params) -> ret = runtime::path;` per function, 682 of them,
+`[group] name(params) -> ret = runtime::path;` per function, 683 of them,
 exposed as the X-macro `nsl_abi::for_each_runtime_fn!` and as data
 (`nsl_abi::RUNTIME_ABI`). The groups are the split PR #600 made along
 "what the language exposes vs what the runtime implements": `memory`,
@@ -684,6 +684,12 @@ proves both against `tests/fixtures/cpkd_fused_loss_hand.rs`.
 `src/fusion.rs` (elementwise chains), and the shared preludes
 in `src/kernel_skeleton/` (`header.rs`, `indexing.rs`, `pad.rs`, `params.rs`,
 `smem.rs`) all `push_str` PTX text with hand-numbered registers.
+`tests/sdpa_fused_forward_interp.rs` executes the production segment-masked
+v2 forward (the Stage-C packed kernels, base and Tier-B) on the CTA
+interpreter against f64 oracles, over two KV tiles and both thread schedules.
+It pins the kernel's storage (K, V and the output staged in f16, Q in f32
+registers). It is also how the missing end-of-iteration fence between the P·V
+sweep and the next K load was found: K and V share one SMEM region.
 
 **The freeze (roadmap A2).** `ci/hand-ptx-manifest.txt` lists every file that
 writes PTX into a string (71 members at the 2026-09-02 freeze; 57 today: the
