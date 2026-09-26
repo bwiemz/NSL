@@ -3804,7 +3804,7 @@ pub(crate) fn gpu_rotate_half_f32(tensor_ptr: i64) -> i64 {
     let block = 256i64;
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
-        kernels::ROTATE_HALF_F32_PTX.as_ptr(),
+        kernels::rotate_half_module(nsl_kir::kernels::elementwise::RotateHalfOp::Plain).as_ptr(),
         KERNEL_NAME.as_ptr(),
         [grid, 1, 1],
         [block, 1, 1],
@@ -3927,7 +3927,7 @@ pub(crate) fn gpu_rotate_half_neg_f32(tensor_ptr: i64) -> i64 {
     let block = 256i64;
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
-        kernels::ROTATE_HALF_NEG_F32_PTX.as_ptr(),
+        kernels::rotate_half_module(nsl_kir::kernels::elementwise::RotateHalfOp::Neg).as_ptr(),
         KERNEL_NAME.as_ptr(),
         [grid, 1, 1],
         [block, 1, 1],
@@ -6151,7 +6151,7 @@ pub(crate) fn gpu_clamp_backward(grad: i64, input: i64, min_val: f32, max_val: f
     let block = 256i64;
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
-        kernels::CLAMP_BACKWARD_F32_PTX.as_ptr(),
+        kernels::clamp_backward_f32_ptx().as_ptr(),
         "nsl_clamp_backward_f32\0".as_ptr(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
@@ -10407,6 +10407,10 @@ mod tests {
         all.push(("nsl_muon_scale_inv_frob_f32", super::kernels::muon_scale_inv_frob_f32_ptx(), true));
         for op in nsl_kir::kernels::elementwise::BackwardOp::ALL {
             all.push((op.kernel_name(), super::kernels::backward_module(op), true));
+        }
+        all.push((nsl_kir::kernels::elementwise::CLAMP_BACKWARD_NAME, super::kernels::clamp_backward_f32_ptx(), true));
+        for op in nsl_kir::kernels::elementwise::RotateHalfOp::ALL {
+            all.push((op.kernel_name(), super::kernels::rotate_half_module(op), true));
         }
         all
     }

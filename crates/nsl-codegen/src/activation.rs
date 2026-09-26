@@ -192,18 +192,14 @@ pub static MANUAL_CONTRACTS: &[Contract] = &[
     // audit. `on` mirrors the arg structs that declare the flag and is
     // gated against args.rs; witness strings/sites are gated for existence.
     //
-    // The autotune / calibration families (driver-owned, not passes).
+    // The autotune family (driver-owned, not a pass). The calibration
+    // flags are refused by `nsl build`; see UNCONTRACTED_FLAGS.
     // ------------------------------------------------------------------
     flag("autotune-clean", B_ONLY, "autotune", Witness::Config("crates/nsl-cli/src/commands/build/options.rs")),
     flag("autotune-db", B_ONLY, "autotune", Witness::Marker("[autotune]")),
     flag("autotune-db-sha256", B_ONLY, "autotune", Witness::Config("crates/nsl-codegen/src/autotune.rs")),
     flag("autotune-fresh", B_ONLY, "autotune", Witness::Marker("[autotune]")),
     flag("no-autotune", B_ONLY, "autotune", Witness::Config("crates/nsl-codegen/src/compiler/kernel.rs")),
-    flag("calibrate", B_ONLY, "calibration", Witness::Config("crates/nsl-codegen/src/calibration/mod.rs")),
-    flag("calibration-batch-size", B_ONLY, "calibration", Witness::Config("crates/nsl-codegen/src/calibration/mod.rs")),
-    flag("calibration-data", B_ONLY, "calibration", Witness::Marker("[calibration]")),
-    flag("calibration-samples", B_ONLY, "calibration", Witness::Config("crates/nsl-codegen/src/calibration/mod.rs")),
-    flag("calibration-timeout", B_ONLY, "calibration", Witness::Config("crates/nsl-codegen/src/calibration/mod.rs")),
     // Gated optimizations with stderr markers (the strongest witnesses).
     flag("cuda-graphs", BR, "cuda-graphs", Witness::Marker("[cuda-graph]")),
     flag("fuse-lm-head", BR, "lm-head-fusion", Witness::Marker("[lm-head-fusion]")),
@@ -302,6 +298,17 @@ pub static UNCONTRACTED_FLAGS: &[(&str, &str)] = &[
     ("bf16-lt", "runtime cuBLASLt dispatch; fingerprint key `mmlt`"),
     ("bf16-lt-workspace-mib", "runtime Lt workspace cap; fingerprint key `mmltws` (arithmetic class -- the cap filters kernel candidates)"),
     ("no-bf16-lt-tune", "disables Lt timed plan selection; fingerprint key `mmlttune`"),
+    // ---- calibration (roadmap item 8) --------------------------------
+    // Refused by `nsl build` (commands/build/options.rs): no build path runs
+    // the calibration harness, so these flags cannot be honoured, and a
+    // refusal is the observable outcome. They used to carry contracts whose
+    // witnesses (`[calibration]`, calibration/mod.rs) only
+    // `compile_and_calibrate` reaches, which nothing calls.
+    ("calibration-data", "refused by `nsl build`: calibration is not wired into the build"),
+    ("calibrate", "refused by `nsl build`: calibration is not wired into the build"),
+    ("calibration-samples", "refused by `nsl build`: calibration is not wired into the build"),
+    ("calibration-batch-size", "refused by `nsl build`: calibration is not wired into the build"),
+    ("calibration-timeout", "refused by `nsl build`: calibration is not wired into the build"),
     ("file", "positional input path, not a feature request"),
     ("args", "positional program arguments forwarded to the compiled binary"),
     ("output", "artifact path plumbing"),

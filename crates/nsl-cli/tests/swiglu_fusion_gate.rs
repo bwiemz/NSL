@@ -64,19 +64,25 @@ fn parse_between(stdout: &str, begin: &str, end: &str) -> Vec<f64> {
 fn swiglu_fused_backward_matches_tape_ad_cpu() {
     let fused = run_fixture("cpu_sa", false, &["--source-ad"]);
     let tape = run_fixture("cpu_tape", false, &[]);
-    for (name, b, e) in [("w_gate", "WG_BEGIN", "WG_END"), ("w_up", "WU_BEGIN", "WU_END")] {
+    // The fixture's inits, to measure movement against: a weight that never
+    // left its init would "match" trivially.
+    let inits: [(&str, &str, &str, fn(usize) -> f64); 2] = [
+        ("w_gate", "WG_BEGIN", "WG_END", |i| i as f64 * 0.02),
+        ("w_up", "WU_BEGIN", "WU_END", |i| i as f64 * 0.01 + 0.05),
+    ];
+    for (name, b, e, init) in inits {
         let f = parse_between(&fused, b, e);
         let t = parse_between(&tape, b, e);
         assert_eq!(f.len(), 32, "{name}: fused produced {} values", f.len());
         assert_eq!(t.len(), 32, "{name}: tape produced {} values", t.len());
-        // Real training signal reached the gate weight (non-vacuous).
-        assert!(
-            f.iter().zip(&t).any(|(a, _)| a.abs() > 1e-4),
-            "{name} never moved: {f:?}"
-        );
+        let moved = t.iter().enumerate().map(|(i, v)| (v - init(i)).abs()).fold(0.0, f64::max);
+        assert!(moved > 1e-2, "{name} barely moved off its init ({moved:.2e}): {t:?}");
+        // Both paths run the same f64 formulas on the CPU; they differ by f32
+        // rounding (~1e-8). Under SGD a wrong silu' moves a weight by a
+        // fraction of its displacement, far past 1e-5.
         for (i, (a, b)) in f.iter().zip(&t).enumerate() {
             assert!(
-                (a - b).abs() < 2e-3,
+                (a - b).abs() < 1e-5,
                 "{name}[{i}] fused={a} vs tape={b} (|Δ|={})",
                 (a - b).abs()
             );

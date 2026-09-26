@@ -13,8 +13,11 @@ let y = zeros([4, 1])
 
 # 12 epochs × 1 step = 12 micro-batches, 3 optimizer windows.
 # grad_clip = 0.01 — small enough that clipping fires every window.
+# eps = 1e-2 is the clipped gradient's size (0.01 / sqrt(2) per component)
+# on purpose: with eps << |g| AdamW's update ignores the gradient's
+# magnitude, and a dropped clip factor would pass unseen.
 train(model = m, epochs = 12, grad_accumulation = 4, grad_clip = 0.01):
-    optimizer: AdamW(lr = 0.001, beta1 = 0.9, beta2 = 0.999, eps = 1e-8, weight_decay = 0.01)
+    optimizer: AdamW(lr = 0.001, beta1 = 0.9, beta2 = 0.999, eps = 1e-2, weight_decay = 0.01)
     step(batch):
         let pred = m.forward(x)
         let loss = mse_loss(pred, y)

@@ -1,13 +1,13 @@
-//! `nsl build --calibration-data …` must work where cargo/rustc are not on
-//! PATH: a shipped `nsl` links with the system C compiler and must never
-//! reach for the Rust toolchain, whatever flags it was given.
+//! `nsl build` must work where cargo/rustc are not on PATH: a shipped `nsl`
+//! links with the system C compiler and must never reach for the Rust
+//! toolchain. And with `--calibration-data`, which `nsl build` refuses
+//! (roadmap item 8; see `calibration_pipeline_integration.rs`), the refusal
+//! must not need the toolchain either.
 //!
 //! History: added 2026-04-13 with a skip-if-missing branch for a fixture
 //! that was never committed, so it did not run until the fixture landed.
-//! Note that the calibration harness itself does not fire on the CLI build
-//! path (see `calibration_pipeline_integration.rs`); what this proves is
-//! that the compile + link with the flag set needs nothing from `~/.cargo`
-//! or a rustup toolchain.
+//! It used to build WITH `--calibration-data` and expect success, which
+//! pinned that the corpus was accepted and dropped.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -22,7 +22,7 @@ fn workspace_root() -> PathBuf {
 }
 
 #[test]
-fn nsl_build_with_calibration_data_succeeds_without_cargo_on_path() {
+fn nsl_build_succeeds_without_cargo_on_path_and_calibration_refuses_there_too() {
     let dir = tempfile::tempdir().unwrap();
     let model = dir.path().join("minimal_model.nsl");
     std::fs::copy(
@@ -57,17 +57,23 @@ fn nsl_build_with_calibration_data_succeeds_without_cargo_on_path() {
         "PATH was nothing but toolchain entries; the linker needs a C compiler somewhere"
     );
 
-    let out = Command::new(env!("CARGO_BIN_EXE_nsl"))
-        .arg("build")
-        .arg(&model)
-        .args(["--calibration-data"])
-        .arg(&data)
-        .args(["--calibrate", "best-effort"])
-        .env("PATH", &stripped_path)
-        .env("NSL_STDLIB_PATH", workspace_root().join("stdlib"))
-        .output()
-        .expect("run nsl");
+    let build = |extra: &[&std::ffi::OsStr]| {
+        Command::new(env!("CARGO_BIN_EXE_nsl"))
+            .arg("build")
+            .arg(&model)
+            .args(extra)
+            .env("PATH", &stripped_path)
+            .env("NSL_STDLIB_PATH", workspace_root().join("stdlib"))
+            .output()
+            .expect("run nsl")
+    };
 
+    let refused = build(&["--calibration-data".as_ref(), data.as_os_str()]);
+    let refused_err = String::from_utf8_lossy(&refused.stderr);
+    assert_ne!(refused.status.code(), Some(0), "--calibration-data must be refused:\n{refused_err}");
+    assert!(refused_err.contains("--calibration-data is refused"), "{refused_err}");
+
+    let out = build(&[]);
     assert_eq!(
         out.status.code(),
         Some(0),
