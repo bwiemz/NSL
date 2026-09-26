@@ -535,12 +535,13 @@ fn enforce_grad_mode_refusals(
         return Err(CodegenError::new(format!(
             "calibration: --wggo-importance=grad requires calibration data, but none was provided.\n\
   requested: gradient-importance scoring with @wggo_target-decorated attention\n\
-  expected:  a calibration data file via `quant awq {{ calibration_data = \"...\" }}`\n\
+  expected:  a calibration sidecar, which only the calibration harness\n\
+             (nsl_codegen::compile_and_calibrate) produces\n\
   found:     {n} @wggo_target target(s) discovered, model instantiated, but\n\
-             no calibration data was provided.\n\
-  fix:       add a `quant awq {{ calibration_data = \"path/to/data.safetensors\" }}`\n\
-             block. If you don't have calibration data,\n\
-             use --wggo-importance=magnitude."
+             no calibration data; `nsl build` does not run the harness and\n\
+             refuses calibration corpora, so grad scoring is not available\n\
+             from the CLI.\n\
+  fix:       use --wggo-importance=magnitude (or auto, which falls back to it)."
         )));
     }
 

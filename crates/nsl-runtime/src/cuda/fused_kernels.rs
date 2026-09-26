@@ -3999,7 +3999,13 @@ DQ4G_DONE: ret;\n\
 // FP8 E4M3 dequantization: bit manipulation to convert u8 → f32
 // E4M3: 1 sign + 4 exponent + 3 mantissa, bias=7
 // Params: inp (u8*), out (f32*), n
-pub(crate) const DEQUANT_FP8_E4M3_F32_PTX: &str = "\
+// E4M3 per the OCP FP8 spec: bias 7, no infinities, S.1111.111 the only NaN,
+// and exponent field 0 the subnormals m/8 * 2^-6 (= m * 2^-9). The kernel used
+// to send subnormal codes through the normal-number path, decoding code m as
+// (1 + m/8) * 2^-7, and turn the NaN code into 480. The CPU decoder in
+// `kv_compress::quantize` is the reference; `tests/fp8_e4m3_dequant_interp.rs`
+// runs this module on the CTA interpreter over all 256 codes against it.
+pub const DEQUANT_FP8_E4M3_F32_PTX: &str = "\
 .version 7.0\n\
 .target sm_70\n\
 .address_size 64\n\
@@ -4030,26 +4036,35 @@ pub(crate) const DEQUANT_FP8_E4M3_F32_PTX: &str = "\
     // Extract sign (bit 7), exp (bits 6-3), mantissa (bits 2-0)\n\
     shr.u32 %r5, %r4, 7;\n\
     and.b32 %r5, %r5, 1;\n\
+    shl.b32 %r5, %r5, 31;\n\
     shr.u32 %r6, %r4, 3;\n\
     and.b32 %r6, %r6, 15;\n\
     and.b32 %r7, %r4, 7;\n\
-    // Check for zero (exp==0 && mantissa==0)\n\
-    or.b32 %r8, %r6, %r7;\n\
-    setp.eq.u32 %p2, %r8, 0;\n\
-    @%p2 bra DQFP8_ZERO;\n\
-    // Build f32: sign<<31 | (exp-7+127)<<23 | mantissa<<20\n\
+    // NaN: S.1111.111\n\
+    and.b32 %r8, %r4, 127;\n\
+    setp.eq.u32 %p2, %r8, 127;\n\
+    @%p2 bra DQFP8_NAN;\n\
+    // Zero and subnormals: exp == 0\n\
+    setp.eq.u32 %p2, %r6, 0;\n\
+    @%p2 bra DQFP8_SUB;\n\
+    // Normal: sign<<31 | (exp-7+127)<<23 | mantissa<<20\n\
     add.u32 %r6, %r6, 120;\n\
-    shl.b32 %r5, %r5, 31;\n\
     shl.b32 %r6, %r6, 23;\n\
     shl.b32 %r7, %r7, 20;\n\
     or.b32 %r8, %r5, %r6;\n\
     or.b32 %r8, %r8, %r7;\n\
     mov.b32 %f1, %r8;\n\
     bra DQFP8_STORE;\n\
-DQFP8_ZERO:\n\
-    // Preserve signed zero\n\
-    shl.b32 %r5, %r5, 31;\n\
-    mov.b32 %f1, %r5;\n\
+DQFP8_SUB:\n\
+    // m * 2^-9 is exact in f32; OR in the sign so zero keeps it\n\
+    cvt.rn.f32.u32 %f1, %r7;\n\
+    mul.f32 %f1, %f1, 0f3B000000;\n\
+    mov.b32 %r8, %f1;\n\
+    or.b32 %r8, %r8, %r5;\n\
+    mov.b32 %f1, %r8;\n\
+    bra DQFP8_STORE;\n\
+DQFP8_NAN:\n\
+    mov.b32 %f1, 0f7FC00000;\n\
 DQFP8_STORE:\n\
     shl.b64 %rd6, %rd4, 2;\n\
     add.u64 %rd6, %rd2, %rd6;\n\
