@@ -99,24 +99,46 @@ fn compute_scale_f32(data: &[f32], fp8_format: i64) -> f64 {
     }
 }
 
-/// Quantize a single f64 value to FP8 (simulated as clamped+scaled f64).
+/// Round `x` (a value already divided by its scale) to the nearest value the
+/// OCP FP8 format can represent: E4M3 (3 mantissa bits, exponent bias 7, max
+/// 448, subnormal step 2^-9) or E5M2 (2 mantissa bits, bias 15, max 57344,
+/// subnormal step 2^-16). Ties round to even. Magnitudes past the format's
+/// maximum saturate to it, like PTX `cvt.rn.satfinite`. NaN propagates and the
+/// sign of zero is kept.
+///
+/// FP8 is floating point: the spacing between neighbours is `2^(e - m)` in
+/// the binade `[2^e, 2^(e+1))`, so the relative error is at most 2^-4 (E4M3)
+/// or 2^-3 (E5M2) for normal values. This replaced a uniform grid of 0.125
+/// (E4M3) or 0.5 (E5M2) over the whole range, which was far finer than FP8
+/// near the maximum and flushed everything below a quarter-step to zero.
+pub fn round_to_fp8(x: f64, fp8_format: i64) -> f64 {
+    let (fp8_max, mantissa_bits, min_normal_exp) = match fp8_format {
+        FP8_FORMAT_E5M2 => (FP8E5M2_MAX as f64, 2, -14),
+        _ => (FP8E4M3_MAX as f64, 3, -6),
+    };
+    if x.is_nan() {
+        return x;
+    }
+    let a = x.abs().min(fp8_max);
+    if a == 0.0 {
+        return x * 0.0;
+    }
+    // floor(log2(a)) read from the f64 exponent field; below the format's
+    // smallest normal the spacing stays at the subnormal step.
+    let e = (((a.to_bits() >> 52) & 0x7ff) as i32 - 1023).max(min_normal_exp);
+    let step = 2f64.powi(e - mantissa_bits);
+    // `a / step` is exact (power-of-two divide), and `fp8_max` sits on the
+    // grid, so rounding a clamped value never lands above it.
+    ((a / step).round_ties_even() * step).copysign(x)
+}
+
+/// Quantize a single f64 value to FP8: `value / scale` rounded onto the FP8
+/// grid by [`round_to_fp8`], kept as an f64 in scaled units.
 pub fn quantize_fp8(value: f64, scale: f64, fp8_format: i64) -> f64 {
     if scale == 0.0 {
         return 0.0;
     }
-    let fp8_max = match fp8_format {
-        FP8_FORMAT_E4M3 => FP8E4M3_MAX as f64,
-        FP8_FORMAT_E5M2 => FP8E5M2_MAX as f64,
-        _ => FP8E4M3_MAX as f64,
-    };
-    let scaled = value / scale;
-    let clamped = scaled.clamp(-fp8_max, fp8_max);
-    let precision = match fp8_format {
-        FP8_FORMAT_E4M3 => 0.125,
-        FP8_FORMAT_E5M2 => 0.5,
-        _ => 0.125,
-    };
-    (clamped / precision).round() * precision
+    round_to_fp8(value / scale, fp8_format)
 }
 
 /// Dequantize a simulated FP8 value back to f64.
@@ -710,11 +732,6 @@ pub fn quantize_mxfp8(data: &[f32], block_size: usize, fp8_format: i64) -> MxFp8
         FP8_FORMAT_E5M2 => FP8E5M2_MAX,
         _ => FP8E4M3_MAX,
     };
-    let precision = match fp8_format {
-        FP8_FORMAT_E4M3 => 0.125f32,
-        FP8_FORMAT_E5M2 => 0.5f32,
-        _ => 0.125f32,
-    };
 
     let mut quantized = vec![0.0f32; n];
     let mut scales = Vec::with_capacity(num_blocks);
@@ -735,9 +752,7 @@ pub fn quantize_mxfp8(data: &[f32], block_size: usize, fp8_format: i64) -> MxFp8
 
         // Quantize each element in the block
         for (i, &v) in block.iter().enumerate() {
-            let scaled = v / actual_scale;
-            let clamped = scaled.clamp(-fp8_max, fp8_max);
-            let quantized_val = (clamped / precision).round() * precision;
+            let quantized_val = round_to_fp8((v / actual_scale) as f64, fp8_format) as f32;
             quantized[start + i] = quantized_val * actual_scale;
         }
     }
@@ -1015,11 +1030,14 @@ mod tests {
 
     #[test]
     fn test_quantize_dequantize_roundtrip() {
+        // 1.5 / 0.01 = 150 lies in E4M3's [128, 256) binade, where the
+        // spacing is 16: 150 rounds to 144, a 4% error (bound 2^-4).
         let value = 1.5;
         let scale = 0.01;
         let fp8 = quantize_fp8(value, scale, FP8_FORMAT_E4M3);
+        assert_eq!(fp8, 144.0);
         let recovered = dequantize_fp8(fp8, scale);
-        assert!((recovered - value).abs() < scale * 0.125 + 1e-10);
+        assert!((recovered - value).abs() <= value / 16.0);
     }
 
     #[test]
@@ -1035,20 +1053,17 @@ mod tests {
         let data = vec![1.0f64, 2.0, -3.0, 4.0];
         let scale = compute_scale(&data, FP8_FORMAT_E4M3);
 
-        // Quantize each element and verify round-trip
-        for &v in &data {
+        // scale = 4/448, so the scaled values are 112, 224, -336, 448. All
+        // but -336 are on the E4M3 grid; -336 is the midpoint of 320
+        // (mantissa 010) and 352 (011) and ties to the even 320.
+        let expected = [112.0, 224.0, -320.0, 448.0];
+        for (&v, &want) in data.iter().zip(&expected) {
             let quant = quantize_fp8(v, scale, FP8_FORMAT_E4M3);
+            assert_eq!(quant, want, "E4M3 quantization of {v}");
             let recovered = dequantize_fp8(quant, scale);
-            let rel_error = if v.abs() > 1e-10 {
-                (recovered - v).abs() / v.abs()
-            } else {
-                0.0
-            };
             assert!(
-                rel_error < 0.01,
-                "FP8 E4M3 relative error {} too high for value {}",
-                rel_error,
-                v
+                (recovered - v).abs() <= v.abs() / 16.0,
+                "FP8 E4M3 round trip of {v} gave {recovered}"
             );
         }
     }
@@ -1115,13 +1130,14 @@ mod tests {
 
     #[test]
     fn test_e5m2_quantize_roundtrip() {
-        // E5M2 has precision 0.5, so max round-trip error per value is 0.5 * scale
+        // E5M2 keeps 2 mantissa bits, so a normal value's round-trip error
+        // is at most 2^-3 of its magnitude.
         let values = vec![1.5, -3.0, 0.25, 100.0, -200.0];
         let scale = compute_scale(&values, FP8_FORMAT_E5M2);
         for &v in &values {
             let quant = quantize_fp8(v, scale, FP8_FORMAT_E5M2);
             let recovered = dequantize_fp8(quant, scale);
-            let max_err = 0.5 * scale;
+            let max_err = v.abs() / 8.0;
             assert!(
                 (recovered - v).abs() <= max_err + 1e-10,
                 "E5M2 round-trip error {} > max {} for value {} (scale={})",
@@ -1136,9 +1152,10 @@ mod tests {
         // Values near 1000 should survive E5M2 but would clamp hard in E4M3
         let value = 1000.0;
         let scale_e5m2 = 1.0; // scale = 1.0 — value is well within E5M2 range
+        // In [512, 1024) E5M2's spacing is 128, so 1000 rounds up to 1024:
+        // representable (no clamp), but only to 2 mantissa bits.
         let quant = quantize_fp8(value, scale_e5m2, FP8_FORMAT_E5M2);
-        let recovered = dequantize_fp8(quant, scale_e5m2);
-        assert!((recovered - value).abs() < 1.0, "E5M2 should handle value={}", value);
+        assert_eq!(dequantize_fp8(quant, scale_e5m2), 1024.0, "E5M2 of value={}", value);
 
         // Same value in E4M3 would clamp to 448
         let quant_e4m3 = quantize_fp8(value, 1.0, FP8_FORMAT_E4M3);
@@ -1182,7 +1199,8 @@ mod tests {
         // Forward: C = A @ B
         // Backward: grad_A = G @ B^T, grad_B = A^T @ G (where G = ones)
         //
-        // E5M2 should match f32 within tolerance (E5M2 precision = 0.5).
+        // E5M2 rounds each operand to 2 mantissa bits; the result must be
+        // the exact product of those rounded operands.
 
         let a = vec![1.0, 2.0, 3.0, 4.0];
         let b = vec![5.0, 6.0, 7.0, 8.0];
@@ -1216,22 +1234,22 @@ mod tests {
             .collect();
         let e5m2_grad_b = fp8_matmul_cpu(&at_e5m2, &g_e5m2, 2, 2, 2);
 
-        // Check relative error ≤ 1% for small matrices
-        for (i, (&ref_val, &e5m2_val)) in ref_grad_a.iter().zip(e5m2_grad_a.iter()).enumerate() {
-            let rel_err = (e5m2_val - ref_val).abs() / ref_val.abs().max(1e-10);
-            assert!(
-                rel_err < 0.01,
-                "grad_A[{}]: E5M2={} vs f32={}, rel_err={:.4}%",
-                i, e5m2_val, ref_val, rel_err * 100.0
-            );
+        // E5M2 keeps 2 mantissa bits. With scale 8/57344, B's 5, 6, 7 scale to
+        // 35840, 43008, 50176 in the [32768, 65536) binade (spacing 8192) and
+        // round to 32768, 40960, 49152: B^T becomes [32/7, 48/7, 40/7, 8].
+        // With scale 4/57344, A's 3 scales to 43008 and becomes 40960 (20/7).
+        // G = ones and every other operand is exact.
+        let want_grad_a = [72.0 / 7.0, 104.0 / 7.0, 72.0 / 7.0, 104.0 / 7.0];
+        let want_grad_b = [27.0 / 7.0, 27.0 / 7.0, 6.0, 6.0];
+        for (i, (&want, &got)) in want_grad_a.iter().zip(e5m2_grad_a.iter()).enumerate() {
+            assert!((got - want).abs() < 1e-9, "grad_A[{i}]: E5M2={got}, exact {want}");
         }
-        for (i, (&ref_val, &e5m2_val)) in ref_grad_b.iter().zip(e5m2_grad_b.iter()).enumerate() {
-            let rel_err = (e5m2_val - ref_val).abs() / ref_val.abs().max(1e-10);
-            assert!(
-                rel_err < 0.01,
-                "grad_B[{}]: E5M2={} vs f32={}, rel_err={:.4}%",
-                i, e5m2_val, ref_val, rel_err * 100.0
-            );
+        for (i, (&want, &got)) in want_grad_b.iter().zip(e5m2_grad_b.iter()).enumerate() {
+            assert!((got - want).abs() < 1e-9, "grad_B[{i}]: E5M2={got}, exact {want}");
+        }
+        // And against f32: each product carries at most two 2^-3 roundings.
+        for (&r, &e) in ref_grad_a.iter().zip(&e5m2_grad_a).chain(ref_grad_b.iter().zip(&e5m2_grad_b)) {
+            assert!((e - r).abs() / r <= 0.25, "E5M2 {e} vs f32 {r}");
         }
     }
 
@@ -1333,16 +1351,21 @@ mod tests {
         assert_eq!(rows, 2);
         assert_eq!(cols, 2);
 
-        // Check values (E5M2 precision loss is small for these magnitudes)
+        // E5M2 keeps 2 mantissa bits, so the operands move by up to 2^-3:
+        // with scale 6/57344, A becomes [15/14, 15/7, 3, 30/7, 36/7, 6]; with
+        // 12/57344, B becomes [48/7, 60/7, 60/7, 72/7, 72/7, 12]. The result
+        // is their exact product, not the f32 [[58,64],[139,154]].
         let v00 = unsafe { *r.data_f32() } as f64;
         let v01 = unsafe { *r.data_f32().add(1) } as f64;
         let v10 = unsafe { *r.data_f32().add(2) } as f64;
         let v11 = unsafe { *r.data_f32().add(3) } as f64;
 
-        assert!((v00 - 58.0).abs() < 2.0, "C[0,0]={} expected ~58", v00);
-        assert!((v01 - 64.0).abs() < 2.0, "C[0,1]={} expected ~64", v01);
-        assert!((v10 - 139.0).abs() < 3.0, "C[1,0]={} expected ~139", v10);
-        assert!((v11 - 154.0).abs() < 3.0, "C[1,1]={} expected ~154", v11);
+        let aq = [15.0 / 14.0, 15.0 / 7.0, 3.0, 30.0 / 7.0, 36.0 / 7.0, 6.0];
+        let bq = [48.0 / 7.0, 60.0 / 7.0, 60.0 / 7.0, 72.0 / 7.0, 72.0 / 7.0, 12.0];
+        let want = |i: usize, j: usize| (0..3).map(|p| aq[i * 3 + p] * bq[p * 2 + j]).sum::<f64>();
+        for (got, i, j) in [(v00, 0, 0), (v01, 0, 1), (v10, 1, 0), (v11, 1, 1)] {
+            assert!((got - want(i, j)).abs() < 1e-4, "C[{i},{j}]={got}, exact {}", want(i, j));
+        }
 
         crate::tensor::nsl_tensor_free(result);
         crate::tensor::nsl_tensor_free(a);
@@ -1418,7 +1441,7 @@ mod tests {
         let per_tensor_scale = data.iter().map(|x| x.abs()).fold(0.0f32, f32::max) / FP8E4M3_MAX;
         let per_tensor_err: f32 = data[..32].iter()
             .map(|&v| {
-                let q = (v / per_tensor_scale / 0.125).round() * 0.125 * per_tensor_scale;
+                let q = round_to_fp8((v / per_tensor_scale) as f64, FP8_FORMAT_E4M3) as f32 * per_tensor_scale;
                 (v - q).abs()
             })
             .sum::<f32>() / 32.0;
