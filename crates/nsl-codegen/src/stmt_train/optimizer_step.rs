@@ -344,7 +344,7 @@ impl Compiler<'_> {
                 // into ONE multi-tensor pointer-table launch. The clip arm
                 // additionally folds its Phase B pre-scale into the same
                 // launch via the kernel's mp_scale argument (bit-identical
-                // to scale-then-step; see FASE_FUSED_ADAMW_MULTI_F32_PTX).
+                // to scale-then-step; see nsl_kir::kernels::optim::build_fase_adamw_multi).
                 // Kill-switches NSL_FASE_FUSED_STEP=0 / NSL_FASE_MULTI_STEP=0
                 // (compile-time).
                 let multi_scalars = if cpdt_precision_dtypes.is_none()

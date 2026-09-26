@@ -22,6 +22,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
     mutant; swapped operands and a neighbour's operation caught.
   - **SASS** on sm_80/90/120: the same instruction count and
     floating-point multiset; registers within two of the hand kernels'.
+- **`nsl_fase_fused_adamw_multi_f32` is built by
+  `nsl_kir::kernels::optim` in place of its hand-written constant**
+  (new-roadmap item 5, after the single-parameter step). It is the
+  multi-tensor FASE AdamW launch: one flat grid over every parameter,
+  bit-exact with the per-parameter steps.
+  - **The kernel** (`build_fase_adamw_multi`) reads each parameter's
+    θ/m/v/mp bases from device pointer tables and its element from the
+    host-built block tables, keeps the per-operation rounding, branches
+    around the Phase-B clip pre-scale at `mp_scale == 1.0`, and zeroes the
+    accumulated gradient after the step.
+  - **The gate.** `tests/fase_adamw_multi_kir_equivalence.rs` (13 tests)
+    runs the frozen hand kernel and the KIR one on the CTA interpreter over
+    five ragged parameters, one of them empty.
+    - It requires identical global memory under two schedules and five
+      hyperparameter sets (with and without decay and clip pre-scale), and
+      AdamW rounded per operation with `mp` zeroed and every tail intact.
+    - It catches mutants of the bound, the block and thread indices, the
+      block-base add, all fifteen element sizes, every scalar and table
+      slot, both branches, each add and multiply, the square root, the
+      division and the zeroing store.
+  - **SASS** on sm_80/90/120: the same floating-point instructions,
+    identically ordered on sm_80. Registers are 20/20/20 against the hand
+    kernel's 24/24/21.
 - **`nsl_fase_fused_adamw_step_f32` is built by
   `nsl_kir::kernels::optim` in place of its hand-written constant**
   (new-roadmap item 5). This is the fused FASE-Deferred AdamW/Adam step,
@@ -1195,6 +1218,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   restored to their pre-700bfaa8 structural assertions now that R7 is retired.
 
 ### Changed
+
+- **The train block's planning modules take facts, not Cranelift handles**
+  (roadmap A1, `TrainPlan` step 2).
+  - **The change.** `plan_wggo` took Muon's mode-table base `Value` only to
+    ask whether a mode table had been emitted. It now takes
+    `mode_table_emitted: bool`. This removes the last planning-time
+    `Value` read.
+  - **The gate.** `tests/train_plan_handle_free.rs` refuses any non-comment
+    line naming a Cranelift type or crate (`Value`, `Variable`,
+    `FunctionBuilder`, `InstBuilder`, `cranelift*`). It covers the
+    planning modules: `plan*.rs`, `csla_precompute`, `adjoint_tape_opt` and
+    `ccr_adjoint_frees`.
+  - No behaviour change: the CLIF snapshots and
+    `wggo_prepass_consumption` pass unchanged.
 
 - `KernelIR`, `KirBuilder`, the KIR verifier, the PTX printer and
   `FeatureSet` moved from `nsl-codegen` into a new leaf crate `nsl-kir`
