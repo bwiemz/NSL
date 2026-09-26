@@ -690,6 +690,15 @@ interpreter against f64 oracles, over two KV tiles and both thread schedules.
 It pins the kernel's storage (K, V and the output staged in f16, Q in f32
 registers). It is also how the missing end-of-iteration fence between the P·V
 sweep and the next K load was found: K and V share one SMEM region.
+`tests/sdpa_fused_backward_interp.rs` does the same for the backward the
+packed path pairs it with: `synthesize_flash_attention_backward_ptx`'s D and
+main kernels, launched as the runtime launches them. It covers the scalar
+sm_75 body against exact gradients, and the tensor-core sm_90 bodies (packed
+single-warp and unmasked `_w4`) against an oracle that rounds each MMA operand
+to f16. It runs under four schedules, two of them warp-serial. It found that
+the single-warp body, launched as `block_q / 32` warps, walked its m-tiles
+with a stride of 1 and so double-counted dQ/dK/dV at head_dim <= 32. The
+interpreter models `mma.sync` m16n8k16 with the ISA's fragment layout.
 
 **The freeze (roadmap A2).** `ci/hand-ptx-manifest.txt` lists every file that
 writes PTX into a string (71 members at the 2026-09-02 freeze; 57 today: the
@@ -1041,7 +1050,7 @@ different thing.
 | `verilog_emission_snapshots`, `hir_pass_snapshots`, `yosys_gate` | `ci.yml` `fpga` |
 | `csha_ptx_ptxas_validation`, `fused_linear_ce_{bf16,fp16,large_vocab}_ptxas`, `bitnet_gpu_correctness` under `--features cuda` against cudart stubs (assembles PTX, executes nothing) | `ci.yml` `cuda-feature` |
 | `scripts/hand-ptx-freeze.sh --self-test` / `--check` | `ci.yml` `hand-ptx-freeze` |
-| `scripts/gpu-cert.sh --check-inventory` / `--check-reasons` / `--check-long-arms` (manifest `ci/gpu-cert-manifest.tsv`: 471 gates, 198 in this crate) | `ci.yml` `gpu-gate-inventory` |
+| `scripts/gpu-cert.sh --check-inventory` / `--check-reasons` / `--check-long-arms` (manifest `ci/gpu-cert-manifest.tsv`: 470 gates, 198 in this crate) | `ci.yml` `gpu-gate-inventory` |
 | `scripts/check-doc-agreement.sh`, version agreement | `ci.yml` `doc-agreement`, `version-agreement` |
 | `scripts/gpu-cert.sh --run [--tier gpu\|toolchain\|multiproc\|isolate\|all]` — every `#[ignore]`d device test, under `scripts/gpu-guard.sh`; known-red list `ci/gpu-cert-known-red.txt` | `.github/workflows/gpu-cert.yml`, nightly + `workflow_dispatch` on the self-hosted sm_120 box; or locally |
 | `scripts/gpu-tier.sh smoke\|certify\|endurance` | local only |

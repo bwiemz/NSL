@@ -69,6 +69,20 @@
 //! either operand is NaN, `.u16` loads zero-extend two bytes and `.u16`
 //! compares look at the low 16 bits. `cvta.shared.u64` of a shared symbol is
 //! its window address: the model has one address space for shared memory.
+//!
+//! `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` is warp-synchronous
+//! like the shuffle: once all 32 lanes of a full warp wait at the same one,
+//! the fragments are gathered with the PTX ISA's m16n8k16 layout (lane
+//! `4g + t` holds A rows `g`/`g+8`, columns `2t..2t+1` and `2t+8..2t+9`; B
+//! columns `g`, rows `2t..2t+1` and `2t+8..2t+9`; C/D rows `g`/`g+8`,
+//! columns `2t..2t+1`) and `D = A·B + C` is formed per element as an f64
+//! sum rounded once to f32. The f16×f16 products are exact in f32 already;
+//! the hardware's accumulation order is unspecified, so the model picks the
+//! most accurate one rather than guessing a rounding sequence. A statement
+//! may span lines (the emitters break `mma` operand lists), and an
+//! instruction may carry several braced register lists. `mov.b32 d, {lo,
+//! hi}` packs two 16-bit registers; `mad.lo` is `a * b + c` at the width;
+//! `atom.<space>.add.f32` is `red` that also returns the old value.
 
 use std::collections::HashMap;
 
@@ -220,6 +234,15 @@ pub(crate) enum Op {
     StV4 { space: Space, addr: Addr, v: [Src; 4] },
     /// `red.<space>.add.f32`: `*addr += v` in f32, as one step of the thread.
     RedAddF32 { space: Space, addr: Addr, v: Src },
+    /// `atom.<space>.add.f32 d, [addr], v`: `red`, and `d` = the old value.
+    AtomAddF32 { space: Space, d: usize, addr: Addr, v: Src },
+    /// `mad.lo.<ty> d, a, b, c`: `a * b + c`, the low bits, at the width.
+    MadLo { w: W, d: usize, a: Src, b: Src, c: Src },
+    /// `mov.b32 d, {lo, hi}`: two 16-bit registers packed, `lo` in bits 0-15.
+    Pack16x2 { d: usize, lo: Src, hi: Src },
+    /// `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32`: warp-synchronous,
+    /// resolved by `run_cta` once every lane of the warp waits at it.
+    Mma { d: [usize; 4], a: [Src; 4], b: [Src; 2], c: [Src; 4] },
     /// `shfl.sync.bfly.b32 d, a, b, c, members`: warp-synchronous, resolved
     /// by `run_cta` once every lane of the warp waits at it.
     ShflBfly { d: usize, a: Src, b: Src, c: Src, members: Src },
@@ -390,11 +413,26 @@ pub(crate) fn parse(ptx: &str) -> Program {
     let mut labels: HashMap<String, usize> = HashMap::new();
     let mut pending: Vec<(String, String, Option<(usize, bool)>)> = Vec::new(); // (mnemonic, operands, guard)
 
+    // A statement the emitter broke across lines (an `mma` and its four
+    // operand lists) is gathered here until its `;`.
+    let mut carry = String::new();
     for raw in ptx.lines() {
         let line = raw.split("//").next().unwrap().trim();
-        if line.is_empty() || line.starts_with('.') || matches!(line, "{" | "}" | ")" | "(" | ") {") {
+        if !carry.is_empty() {
+            assert!(!line.is_empty(), "`{carry}`: a statement ends without `;`");
+            carry.push(' ');
+            carry.push_str(line);
+            if !line.ends_with(';') {
+                continue;
+            }
+        } else if line.is_empty() || line.starts_with('.') || matches!(line, "{" | "}" | ")" | "(" | ") {") {
+            continue;
+        } else if !line.ends_with(';') && !line.ends_with(':') {
+            carry.push_str(line);
             continue;
         }
+        let joined = std::mem::take(&mut carry);
+        let line = if joined.is_empty() { line } else { joined.as_str() };
         if let Some(name) = line.strip_suffix(':') {
             assert!(!name.contains(' '), "`{line}` is not a label");
             labels.insert(name.to_string(), pending.len());
@@ -427,14 +465,21 @@ pub(crate) fn parse(ptx: &str) -> Program {
     let mut instrs = Vec::with_capacity(pending.len());
     for (mnemonic, operands, guard) in pending {
         let text = format!("{mnemonic} {operands}");
-        // A braced register list (`{%f1, %f2, %f3, %f4}`) is one operand.
-        let (operands, group): (String, Vec<&str>) = match operands.split_once('{') {
-            Some((pre, rest)) => {
-                let (inner, post) = rest.split_once('}').unwrap_or_else(|| panic!("`{text}`: unclosed `{{`"));
-                (format!("{pre}{{}}{post}"), inner.split(',').map(str::trim).collect())
-            }
-            None => (operands.clone(), vec![]),
-        };
+        // A braced register list (`{%f1, %f2, %f3, %f4}`) is one operand,
+        // `{}` in `operands`; `groups` holds the lists in order.
+        let mut groups: Vec<Vec<&str>> = Vec::new();
+        let mut flat = String::new();
+        let mut rest = operands.as_str();
+        while let Some((pre, tail)) = rest.split_once('{') {
+            let (inner, post) = tail.split_once('}').unwrap_or_else(|| panic!("`{text}`: unclosed `{{`"));
+            flat.push_str(pre);
+            flat.push_str("{}");
+            groups.push(inner.split(',').map(str::trim).collect());
+            rest = post;
+        }
+        flat.push_str(rest);
+        let operands = flat;
+        let group: Vec<&str> = groups.first().cloned().unwrap_or_default();
         let ops: Vec<&str> = if operands.is_empty() {
             vec![]
         } else {
@@ -447,6 +492,30 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 want(2);
                 let name = ops[1].trim_start_matches('[').trim_end_matches(']');
                 Op::LdParam { d: p.dst(ops[0]), param: name.trim_start_matches("param_").to_string() }
+            }
+            ["mov", "b32"] if ops.get(1) == Some(&"{}") => {
+                want(2);
+                assert_eq!(group.len(), 2, "`{text}`: two 16-bit halves");
+                Op::Pack16x2 { d: p.dst(ops[0]), lo: p.src(group[0]), hi: p.src(group[1]) }
+            }
+            ["mad", "lo", ty @ ("u32" | "u64")] => {
+                want(4);
+                let w = if *ty == "u32" { W::U32 } else { W::U64 };
+                Op::MadLo { w, d: p.dst(ops[0]), a: p.src(ops[1]), b: p.src(ops[2]), c: p.src(ops[3]) }
+            }
+            ["mma", "sync", "aligned", "m16n8k16", "row", "col", "f32", "f16", "f16", "f32"] => {
+                want(4);
+                assert!(
+                    ops.iter().all(|o| *o == "{}")
+                        && groups.iter().map(Vec::len).collect::<Vec<_>>() == [4, 4, 2, 4],
+                    "`{text}`: four register lists of 4, 4, 2 and 4"
+                );
+                let four = |p: &mut Parser, g: &[&str]| [p.src(g[0]), p.src(g[1]), p.src(g[2]), p.src(g[3])];
+                let d = [p.dst(groups[0][0]), p.dst(groups[0][1]), p.dst(groups[0][2]), p.dst(groups[0][3])];
+                let a = four(&mut p, &groups[1]);
+                let b = [p.src(groups[2][0]), p.src(groups[2][1])];
+                let c = four(&mut p, &groups[3]);
+                Op::Mma { d, a, b, c }
             }
             ["mov", ty] => {
                 want(2);
@@ -681,6 +750,11 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 let space = if *space == "global" { Space::Global } else { Space::Shared };
                 Op::RedAddF32 { space, addr: p.addr(ops[0]), v: p.src(ops[1]) }
             }
+            ["atom", space @ ("global" | "shared"), "add", "f32"] => {
+                want(3);
+                let space = if *space == "global" { Space::Global } else { Space::Shared };
+                Op::AtomAddF32 { space, d: p.dst(ops[0]), addr: p.addr(ops[1]), v: p.src(ops[2]) }
+            }
             ["shfl", "sync", "bfly", "b32"] => {
                 want(5);
                 Op::ShflBfly {
@@ -740,6 +814,15 @@ pub(crate) struct Segment {
 pub(crate) enum Order {
     Ascending,
     Descending,
+    /// Warp by warp, lowest first: each warp runs alone — its shuffles and
+    /// MMAs resolved as it reaches them — until every lane waits at a
+    /// barrier or has exited, then the next warp. The interleavings above
+    /// keep warps within one warp-synchronous instruction of each other;
+    /// these let a warp run a whole barrier interval ahead, which is what a
+    /// missing fence between warps needs to show.
+    WarpsAscending,
+    /// As `WarpsAscending`, highest warp first.
+    WarpsDescending,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -748,7 +831,19 @@ pub(crate) enum State {
     AtBarrier,
     /// Waiting at the `shfl.sync` at instruction `at` for the rest of its warp.
     AtShfl { at: usize },
+    /// Waiting at the `mma.sync` at instruction `at` for the rest of its warp.
+    AtMma { at: usize },
     Exited,
+}
+
+/// A lane's fragments of a pending `mma.sync` m16n8k16: the packed f16
+/// pairs of A and B, the f32 bits of C, and D's registers.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct MmaPending {
+    pub(crate) d: [usize; 4],
+    pub(crate) a: [u32; 4],
+    pub(crate) b: [u32; 2],
+    pub(crate) c: [u32; 4],
 }
 
 /// A lane's half of a pending `shfl.sync.bfly`.
@@ -767,6 +862,7 @@ pub(crate) struct Thread {
     pub(crate) written: Vec<bool>,
     pub(crate) state: State,
     pub(crate) shfl: ShflPending,
+    pub(crate) mma: MmaPending,
 }
 
 pub(crate) struct Launch<'a> {
@@ -1115,6 +1211,39 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
                 let old = f32::from_le_bytes([mem[0], mem[1], mem[2], mem[3]]);
                 mem.copy_from_slice(&(old + add).to_le_bytes());
             }
+            Op::AtomAddF32 { space, d, addr, v } => {
+                let at = rd(t, launch, addr.base).wrapping_add(addr.offset);
+                let add = f(rd(t, launch, *v));
+                let mem = match space {
+                    Space::Global => launch.global(at, 4),
+                    Space::Shared => launch.shared(at, 4),
+                };
+                let old = f32::from_le_bytes([mem[0], mem[1], mem[2], mem[3]]);
+                mem.copy_from_slice(&(old + add).to_le_bytes());
+                write(t, *d, fb(old));
+            }
+            Op::MadLo { w, d, a, b, c } => {
+                let (a, b, c) = (rd(t, launch, *a), rd(t, launch, *b), rd(t, launch, *c));
+                let v = match w {
+                    W::U32 => (a as u32).wrapping_mul(b as u32).wrapping_add(c as u32) as u64,
+                    W::U64 => a.wrapping_mul(b).wrapping_add(c),
+                };
+                write(t, *d, v);
+            }
+            Op::Pack16x2 { d, lo, hi } => {
+                let (lo, hi) = (rd(t, launch, *lo) & 0xFFFF, rd(t, launch, *hi) & 0xFFFF);
+                write(t, *d, lo | (hi << 16));
+            }
+            Op::Mma { d, a, b, c } => {
+                t.mma = MmaPending {
+                    d: *d,
+                    a: a.map(|s| rd(t, launch, s) as u32),
+                    b: b.map(|s| rd(t, launch, s) as u32),
+                    c: c.map(|s| rd(t, launch, s) as u32),
+                };
+                t.state = State::AtMma { at: t.pc - 1 };
+                return;
+            }
             Op::Bra { target } => t.pc = *target,
             Op::ShflBfly { d, a, b, c, members } => {
                 t.shfl = ShflPending {
@@ -1174,6 +1303,58 @@ fn resolve_shuffles(threads: &mut [Thread], ctaid: u32) -> bool {
     released
 }
 
+/// Complete every warp whose lanes all wait at the same `mma.sync`
+/// m16n8k16 (see the module docs for the fragment layout and rounding).
+/// Returns whether any warp was released; a partial or divergent warp is a
+/// hard error, as for the shuffle.
+fn resolve_mmas(threads: &mut [Thread], ctaid: u32) -> bool {
+    let half = |bits: u32, hi: bool| f16::from_bits(if hi { (bits >> 16) as u16 } else { bits as u16 }).to_f64();
+    let mut released = false;
+    for (w, warp) in threads.chunks_mut(32).enumerate() {
+        let Some(at) = warp.iter().find_map(|t| match t.state {
+            State::AtMma { at } => Some(at),
+            _ => None,
+        }) else {
+            continue;
+        };
+        assert!(
+            warp.len() == 32 && warp.iter().all(|t| t.state == State::AtMma { at }),
+            "CTA {ctaid} warp {w}: an mma.sync at instruction {at} that not every lane of a full warp reached"
+        );
+        // Gather A [16x16], B [16x8] (k x n) and C [16x8] from the lanes.
+        let mut a = [[0f64; 16]; 16];
+        let mut b = [[0f64; 8]; 16];
+        let mut c = [[0f64; 8]; 16];
+        for (lane, t) in warp.iter().enumerate() {
+            let (g, t2) = (lane / 4, (lane % 4) * 2);
+            let m = &t.mma;
+            for (reg, (row, col)) in [(g, t2), (g + 8, t2), (g, t2 + 8), (g + 8, t2 + 8)].into_iter().enumerate() {
+                a[row][col] = half(m.a[reg], false);
+                a[row][col + 1] = half(m.a[reg], true);
+            }
+            for (reg, k) in [t2, t2 + 8].into_iter().enumerate() {
+                b[k][g] = half(m.b[reg], false);
+                b[k + 1][g] = half(m.b[reg], true);
+            }
+            for (reg, (row, col)) in [(g, t2), (g, t2 + 1), (g + 8, t2), (g + 8, t2 + 1)].into_iter().enumerate() {
+                c[row][col] = f32::from_bits(m.c[reg]) as f64;
+            }
+        }
+        for (lane, t) in warp.iter_mut().enumerate() {
+            let (g, t2) = (lane / 4, (lane % 4) * 2);
+            for (reg, (row, col)) in [(g, t2), (g, t2 + 1), (g + 8, t2), (g + 8, t2 + 1)].into_iter().enumerate() {
+                let v = (0..16).map(|k| a[row][k] * b[k][col]).sum::<f64>() + c[row][col];
+                let d = t.mma.d[reg];
+                t.regs[d] = fb(v as f32);
+                t.written[d] = true;
+            }
+            t.state = State::Running;
+        }
+        released = true;
+    }
+    released
+}
+
 /// Run one CTA to completion under `order`.
 pub(crate) fn run_cta(launch: &mut Launch, order: Order) {
     let n = launch.ntid;
@@ -1185,21 +1366,47 @@ pub(crate) fn run_cta(launch: &mut Launch, order: Order) {
             written: vec![false; regs],
             state: State::Running,
             shfl: ShflPending::default(),
+            mma: MmaPending::default(),
         })
         .collect();
-    let visit: Vec<u32> = match order {
-        Order::Ascending => (0..n).collect(),
-        Order::Descending => (0..n).rev().collect(),
+    let warps = (n as usize).div_ceil(32);
+    let (visit, warp_order): (Vec<u32>, Vec<usize>) = match order {
+        Order::Ascending => ((0..n).collect(), vec![]),
+        Order::Descending => ((0..n).rev().collect(), vec![]),
+        Order::WarpsAscending => (vec![], (0..warps).collect()),
+        Order::WarpsDescending => (vec![], (0..warps).rev().collect()),
     };
     loop {
-        for &tid in &visit {
-            let t = &mut threads[tid as usize];
-            if t.state == State::Running {
-                run_until_blocked(t, launch, tid);
+        if warp_order.is_empty() {
+            for &tid in &visit {
+                let t = &mut threads[tid as usize];
+                if t.state == State::Running {
+                    run_until_blocked(t, launch, tid);
+                }
             }
-        }
-        if resolve_shuffles(&mut threads, launch.ctaid) {
-            continue;
+            // Non-short-circuiting: a pass may leave one warp at a shuffle
+            // and another at an mma.
+            if resolve_shuffles(&mut threads, launch.ctaid) | resolve_mmas(&mut threads, launch.ctaid) {
+                continue;
+            }
+        } else {
+            for &w in &warp_order {
+                let lanes = (w * 32) as u32..((w + 1) * 32).min(n as usize) as u32;
+                loop {
+                    for tid in lanes.clone() {
+                        let t = &mut threads[tid as usize];
+                        if t.state == State::Running {
+                            run_until_blocked(t, launch, tid);
+                        }
+                    }
+                    // Only this warp can be waiting at a warp-synchronous
+                    // instruction: every other one is at a barrier, exited,
+                    // or has not run since the last barrier.
+                    if !(resolve_shuffles(&mut threads, launch.ctaid) | resolve_mmas(&mut threads, launch.ctaid)) {
+                        break;
+                    }
+                }
+            }
         }
         let waiting = threads.iter().filter(|t| t.state == State::AtBarrier).count();
         let exited = threads.iter().filter(|t| t.state == State::Exited).count();

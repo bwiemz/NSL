@@ -2178,9 +2178,15 @@ impl Compiler<'_> {
         )?;
 
         // 7e2. Gradient clipping (only if grad_clip was specified).
-        // Skip when FASE hook is active — clip is applied via two_phase_clip
-        // on m_partial (Phase A/B in the optimizer block below), not on grads_list.
-        if !fase_hook_active && grad_clip < f64::MAX {
+        // Skip whenever two_phase_clip is active — the window's accumulated
+        // m_partial is clipped once, in Phase A/B of the optimizer block below.
+        // Clipping each micro-batch here as well (as the tape path used to,
+        // since only the hook disabled this) clipped twice: a micro-batch
+        // whose gradient exceeds the threshold was shrunk before it was
+        // averaged, so the window mean, and the Phase-A norm, were not the
+        // ones the global-norm clip is defined on. With the hook active
+        // there is no grads_list to clip either.
+        if !fase_hook_active && !fase_plan.two_phase_clip && grad_clip < f64::MAX {
             let max_norm_val = builder.ins().f64const(grad_clip);
             self.compile_call_by_name(builder, "nsl_clip_grad_norm", &[grads_list, max_norm_val])?;
         }
