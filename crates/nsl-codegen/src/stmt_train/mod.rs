@@ -144,6 +144,7 @@ pub(crate) mod plan;
 pub(crate) mod csla_precompute;
 pub(crate) mod csla_window;
 pub(crate) mod driver;
+pub(crate) mod emit_state;
 pub(crate) mod epoch_close;
 pub(crate) mod fase_hook_lowering;
 pub(crate) mod forward_lowering;

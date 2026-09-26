@@ -249,6 +249,20 @@ becomes `if let Some(csla) = &plan.techniques.csla`.
    emitters produce into one struct; the late emitters take it by `&mut`.
    The 30-field `OptimizerStepInputs` / `CslaWindowInputs` become
    `(&TrainPlan, &mut EmitState)`.
+   *Status:* done for the late emitters. `stmt_train/emit_state.rs`
+   collects the setup handles (the parameter, route, exempt and checkpoint
+   name lists, the optimizer state, the accumulation and CSLA window
+   buffers, the resume handles, `lr` / `step_count` / `epoch_counter`). It
+   is `Copy`, and the driver builds it once before the epoch loop.
+   `OptimizerStepInputs`, `CslaWindowInputs`, `SchedulerStepInputs` and
+   `HealthHooksInputs` take `(&plan, &emit)` plus the handles one
+   micro-batch produces (`grads_list`, `loss_val`, `should_step_var`,
+   `csla_pending`). They take `&EmitState`, not `&mut`: nothing past the
+   setup writes a setup handle. The setup emitters still return their own
+   structs (`ModelParams`, `OptimizerState`) that the driver copies from;
+   folding those in, and the per-step handles into an `EmitState::step`,
+   waits for step 5, when the driver splits. Gate:
+   `tests/train_plan_emit_state.rs`.
 4. **`TrainPass` + `PASS_ORDER`.** Wrap each planning module in the trait;
    replace the driver's planning stretch with `for pass in PASS_ORDER { if
    pass.applies(..) { pass.apply(..)? } }`. Add a drift gate that the table's

@@ -25,6 +25,7 @@ use cranelift_frontend::{FunctionBuilder, Variable};
 use crate::compiler::Compiler;
 use crate::context::FuncState;
 use crate::error::CodegenError;
+use crate::stmt_train::emit_state::EmitState;
 use crate::stmt_train::plan::TrainPlan;
 use crate::stmt::{
     MomentFill, ParamHookEntry, SURFACE_WEIGHTS, WS_PCIE_FIXED_LAT_US, WS_PREFETCH_MIN_OPS_PER_RANGE,
@@ -156,31 +157,13 @@ pub(crate) struct CslaSchedule {
 /// Every binding of `compile_train_block_inner` the window backward reads;
 /// names are the driver's.
 pub(crate) struct CslaWindowInputs<'a> {
-    /// The gradient-accumulation buffer list (`Some` whenever CSLA is on).
-    pub(crate) accum_list: Option<Value>,
-    /// The CPDT per-parameter dtype-code lists (m, v).
-    pub(crate) cpdt_precision_dtypes: Option<(Value, Value)>,
-    /// Muon's per-parameter m dtype codes (`--muon-state-dtype bf16`).
-    pub(crate) muon_state_m_codes: Option<Value>,
-    /// The window save-list and dict-list variables (allocated when CSLA is on).
-    pub(crate) csla_buffers: Option<(Variable, Variable)>,
-    /// The compile-time context the save phase left for this site (taken here).
-    pub(crate) csla_pending: Option<CslaPending>,
-    /// The DataLoader handle, when the `data:` section declared one.
-    pub(crate) has_dataloader: Option<Value>,
-    pub(crate) lr_var: Variable,
-    pub(crate) should_step_var: Variable,
-    pub(crate) step_count_var: Variable,
-    /// The stage-3 deferred-moment latch.
-    pub(crate) moment_fill_latch: Option<Value>,
-    /// Muon's per-parameter route flags.
-    pub(crate) muon_route_list: Option<Value>,
-    pub(crate) num_params_val: Value,
-    pub(crate) param_list: Value,
-    pub(crate) state_list_1: Value,
-    pub(crate) state_list_2: Value,
     /// The block's planning-time facts (roadmap A1, TrainPlan step 1).
     pub(crate) plan: &'a TrainPlan,
+    /// The setup handles (roadmap A1, TrainPlan step 3).
+    pub(crate) emit: &'a EmitState,
+    /// The compile-time context the save phase left for this site (taken here).
+    pub(crate) csla_pending: Option<CslaPending>,
+    pub(crate) should_step_var: Variable,
 }
 
 impl Compiler<'_> {
@@ -193,14 +176,17 @@ impl Compiler<'_> {
     ) -> Result<(), CodegenError> {
         let CslaWindowInputs {
             plan,
+            mut csla_pending,
+            should_step_var,
+            emit,
+        } = inputs;
+        let EmitState {
             accum_list,
             cpdt_precision_dtypes,
             muon_state_m_codes,
             csla_buffers,
-            mut csla_pending,
             has_dataloader,
             lr_var,
-            should_step_var,
             step_count_var,
             moment_fill_latch,
             muon_route_list,
@@ -208,7 +194,8 @@ impl Compiler<'_> {
             param_list,
             state_list_1,
             state_list_2,
-        } = inputs;
+            ..
+        } = *emit;
         // TrainPlan step 1 (roadmap A1): the facts this phase used to receive
         // as copied fields, read from the carrier under their old names so
         // the body below is unchanged.

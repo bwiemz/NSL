@@ -1205,6 +1205,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- **The train block's late emitters take their setup handles as one
+  `EmitState`** (roadmap A1, `TrainPlan` step 3).
+  - **The change.** `stmt_train/emit_state.rs` holds the Cranelift handles
+    the setup phase produces: the parameter, route, exempt and checkpoint
+    name lists, the optimizer state lists, the accumulation buffers, the
+    CSLA window lists, the resume handles and the loop variables. The
+    driver builds it once, before the epoch loop.
+  - `OptimizerStepInputs`, `CslaWindowInputs`, `SchedulerStepInputs` and
+    `HealthHooksInputs` now take `plan: &TrainPlan` and `emit: &EmitState`,
+    plus only what one micro-batch produces: its gradients, its loss, its
+    `should_step` flag and the CSLA window's pending save.
+    `OptimizerStepInputs` went from 15 fields to 5, `CslaWindowInputs` from
+    16 to 4, and `SchedulerStepInputs` from 10 to 2.
+  - **No behaviour change.** Each emitter destructures `EmitState` under the
+    old names, so its body, and the CLIF it emits, is unchanged. The 28
+    CLIF snapshots pass untouched.
+  - **The gate.** `tests/train_plan_emit_state.rs` reads `EmitState`'s
+    fields and refuses any of them as a field of a late emitter's `Inputs`
+    struct.
 - **The train block's planning modules take facts, not Cranelift handles**
   (roadmap A1, `TrainPlan` step 2).
   - **The change.** `plan_wggo` took Muon's mode-table base `Value` only to
