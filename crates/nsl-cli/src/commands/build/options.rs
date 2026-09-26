@@ -305,74 +305,36 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 None
             };
 
-            // Calibration-flag validation per spec §8.
-            if calibration_data.is_none() && calibrate.as_str() != "required" {
-                nsl_log::nsl_log!(ERROR, "cli", 
-                    "error: --calibrate={} requires --calibration-data <PATH>",
-                    calibrate
+            // Calibration is refused, not validated-and-ignored. The harness
+            // (hook registry, run_harness_*, the sidecar writer) lives in
+            // `nsl_codegen::compile_and_calibrate`, which e3ab23ad moved it
+            // into on 2026-05-10 and which NOTHING in the workspace calls, so
+            // no build has ever run it. Accepting a corpus here meant
+            // validating it and then dropping it (this used to warn); the
+            // other four flags configured a run that never happened. Wiring
+            // calibration in is a decision about WHERE it fires (it reorders
+            // WGGO against kernel emission and needs weights plumbing); until
+            // then every calibration flag refuses, naming what was asked.
+            let requested_calibration: Vec<&str> = [
+                (calibration_data.is_some(), "--calibration-data"),
+                (calibrate.is_some(), "--calibrate"),
+                (calibration_samples.is_some(), "--calibration-samples"),
+                (calibration_batch_size.is_some(), "--calibration-batch-size"),
+                (calibration_timeout.is_some(), "--calibration-timeout"),
+            ]
+            .into_iter()
+            .filter_map(|(given, flag)| given.then_some(flag))
+            .collect();
+            if !requested_calibration.is_empty() {
+                nsl_log::nsl_log!(ERROR, "cli",
+                    "error: {} {}: calibration is not implemented by `nsl build`.\n\
+                     \x20      The calibration harness exists in nsl-codegen but no build path runs it,\n\
+                     \x20      so a corpus would be validated and then ignored: no calibration hooks\n\
+                     \x20      run and no sidecar is written. Remove the flag(s). For WGGO, use\n\
+                     \x20      --wggo-importance=magnitude (or auto), which needs no calibration data.",
+                    requested_calibration.join(", "),
+                    if requested_calibration.len() == 1 { "is refused" } else { "are refused" }
                 );
-                process::exit(1);
-            }
-            match calibrate.as_str() {
-                "required" | "best-effort" => {}
-                other => {
-                    nsl_log::nsl_log!(ERROR, "cli", 
-                        "error: --calibrate value '{}' is not one of required|best-effort",
-                        other
-                    );
-                    process::exit(1);
-                }
-            }
-            if let Some(ref p) = calibration_data {
-                if !p.exists() {
-                    nsl_log::nsl_log!(ERROR, "cli", "error: --calibration-data path does not exist: {}", p.display());
-                    process::exit(1);
-                }
-                let ext = p.extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase());
-                match ext.as_deref() {
-                    Some("bin") | Some("safetensors") => {}
-                    other => {
-                        nsl_log::nsl_log!(ERROR, "cli", 
-                            "error: --calibration-data extension {:?} is not one of .bin|.safetensors",
-                            other
-                        );
-                        process::exit(1);
-                    }
-                }
-                // The corpus is validated above and then goes nowhere. The
-                // harness (hook registry + run_harness_* + the no-consumer
-                // warning) lives in `nsl_codegen::compile_and_calibrate`, which
-                // e3ab23ad moved it into on 2026-05-10 and which NOTHING in the
-                // workspace calls -- so no CLI build has ever run it. Only that
-                // wrapper populates `calibration.sidecar`, which is also why
-                // `--wggo-importance=grad` is unreachable from the CLI: it
-                // refuses on the missing sidecar, and supplying
-                // --calibration-data cannot produce one.
-                //
-                // Wiring it up is a decision about WHERE calibration fires
-                // (it reorders WGGO against kernel emission and needs weights
-                // plumbing), so this warns rather than refusing: accepting a
-                // corpus and silently ignoring it is the one behaviour with no
-                // defence. `calibration_pipeline_integration.rs` holds the
-                // contract test, ignored until the wiring lands.
-                nsl_log::nsl_log!(WARN, "cli", 
-                    "warning: --calibration-data is validated but NOT consumed by `nsl build`.\n\
-                     \x20        {} is ignored: no calibration hooks run, no sidecar is\n\
-                     \x20        written, and --wggo-importance=grad stays unavailable.\n\
-                     \x20        Tracked by crates/nsl-cli/tests/calibration_pipeline_integration.rs.",
-                    p.display()
-                );
-            }
-            if calibration_samples == 0 {
-                nsl_log::nsl_log!(ERROR, "cli", "error: --calibration-samples must be > 0");
-                process::exit(1);
-            }
-            if calibration_batch_size == 0 {
-                nsl_log::nsl_log!(ERROR, "cli", "error: --calibration-batch-size must be > 0");
-                process::exit(1);
-            }
-            if calibration_timeout == 0 {
-                nsl_log::nsl_log!(ERROR, "cli", "error: --calibration-timeout must be > 0");
                 process::exit(1);
             }
 
@@ -671,12 +633,14 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                     // CompileOptions with a populated `wrga.check` (wrga_check.rs).
                     check: nsl_codegen::WrgaCheckContext::default(),
                 },
+                // Every calibration flag refused above, so these are the
+                // defaults a calibration-free build has always carried.
                 calibration: nsl_codegen::CalibrationOptions {
-                    data: calibration_data.clone(),
-                    mode: Some(calibrate.clone()),
-                    samples: calibration_samples,
-                    batch_size: calibration_batch_size,
-                    timeout_secs: calibration_timeout,
+                    data: None,
+                    mode: Some("required".to_string()),
+                    samples: 512,
+                    batch_size: 8,
+                    timeout_secs: 600,
                     sidecar: None,
                     retention: None,
                     // Task 6: peek_batch_seq is called inside the compiler when

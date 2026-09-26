@@ -1188,31 +1188,31 @@ pub(crate) struct BuildArgs {
         #[arg(long, value_name = "PATH")]
         pub(crate) cfie_report: Option<PathBuf>,
 
-        /// Path to calibration dataset (.bin or .safetensors).  When
-        /// omitted, calibration is skipped entirely.
+        /// Calibration dataset (.bin or .safetensors). REFUSED: `nsl build`
+        /// does not run calibration (the harness,
+        /// `nsl_codegen::compile_and_calibrate`, has no build-path caller),
+        /// so a corpus would be validated and ignored. Declared so the
+        /// refusal can name it rather than clap calling it unknown.
         #[arg(long, value_name = "PATH")]
         pub(crate) calibration_data: Option<PathBuf>,
 
-        /// Calibration failure policy.  Default `required` aborts the
-        /// build on infrastructure errors; `best-effort` warns and
-        /// falls back.  Degenerate-data errors are always fatal.
-        #[arg(long, value_name = "MODE", default_value = "required")]
-        pub(crate) calibrate: String,
+        /// Calibration failure policy (`required` | `best-effort`). REFUSED
+        /// with `--calibration-data`: there is no calibration run to govern.
+        #[arg(long, value_name = "MODE")]
+        pub(crate) calibrate: Option<String>,
 
-        /// Number of calibration samples to consume (default 512).
-        /// Truncated to the dataset size with a warning when smaller.
-        #[arg(long, value_name = "N", default_value_t = 512)]
-        pub(crate) calibration_samples: u32,
+        /// Calibration samples to consume. REFUSED with `--calibration-data`.
+        #[arg(long, value_name = "N")]
+        pub(crate) calibration_samples: Option<u32>,
 
-        /// Calibration batch size: samples per harness forward pass
-        /// (default 8; must be > 0).
-        #[arg(long, value_name = "N", default_value_t = 8)]
-        pub(crate) calibration_batch_size: u32,
+        /// Calibration batch size. REFUSED with `--calibration-data`.
+        #[arg(long, value_name = "N")]
+        pub(crate) calibration_batch_size: Option<u32>,
 
-        /// Wall-clock limit for the calibration run, in seconds (default
-        /// 600; must be > 0).
-        #[arg(long, value_name = "SECONDS", default_value_t = 600)]
-        pub(crate) calibration_timeout: u64,
+        /// Calibration wall-clock limit in seconds. REFUSED with
+        /// `--calibration-data`.
+        #[arg(long, value_name = "SECONDS")]
+        pub(crate) calibration_timeout: Option<u64>,
 
         /// CEP: run compilation-verified pruning (requires --weights).
         #[arg(long)]

@@ -633,6 +633,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **`nsl build` refuses every calibration flag** instead of accepting it
+  and doing nothing (roadmap item 8, second slice). The refused flags are
+  `--calibration-data`, `--calibrate`, `--calibration-samples`,
+  `--calibration-batch-size` and `--calibration-timeout`.
+  - **Why:** the calibration harness lives in
+    `nsl_codegen::compile_and_calibrate`, and no build path calls it.
+    `--calibration-data` was validated, warned "validated but NOT consumed"
+    and was then dropped. The other four configured a run that never
+    happened, and did so silently whenever `--calibration-data` was absent.
+  - **Now:** each flag given is named in one refusal, and nothing is built.
+    The four knobs no longer have defaults to hide behind.
+  - **WGGO grad mode:** its "requires calibration data" refusal no longer
+    tells users to write a `quant awq { calibration_data = ... }` block,
+    which does not exist. It says grad scoring is unavailable from the CLI
+    and points to `--wggo-importance=magnitude`.
+  - **Gates updated:**
+    - the activation contract lists the five flags as refused;
+    - the composition gate allowlists the single-flag refusal;
+    - the `--calibrate best-effort` feature rule is gone;
+    - the CLI reference is regenerated.
+  - **Tests updated:** `calibration_flag_validation` (4),
+    `calibration_pipeline_integration`, and `calibration_no_cargo` pin the
+    refusal. They previously pinned accept-and-drop.
+
 - **`.to(dtype)` converts** (dtype-semantics design, step 1).
   - **What was wrong.** On a standard-dtype tensor, `.to(f32)` and
     `.to(f64)` compiled to `nsl_tensor_from_custom_dtype`, which returns
