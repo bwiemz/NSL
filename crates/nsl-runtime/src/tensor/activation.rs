@@ -1626,12 +1626,12 @@ pub extern "C" fn nsl_tensor_tanh_act(tensor_ptr: i64) -> i64 {
             #[cfg(feature = "cuda")]
             {
                 if ta.can_mutate_inplace_gpu() {
-                    crate::cuda::gpu_elementwise_unary_inplace(tensor_ptr, crate::cuda::kernels::TANH_F32_PTX, "nsl_tanh_f32\0");
+                    crate::cuda::gpu_elementwise_unary_inplace(tensor_ptr, crate::cuda::kernels::tanh_f32_ptx(), "nsl_tanh_f32\0");
                     ta.refcount.fetch_add(1, Ordering::SeqCst);
                     super::fbip_record_reuse();
                     return tensor_ptr;
                 }
-                let result = crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::TANH_F32_PTX, "nsl_tanh_f32\0");
+                let result = crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::tanh_f32_ptx(), "nsl_tanh_f32\0");
                 // Tape record on the GPU arm (see nsl_tensor_add in arithmetic.rs).
                 if autodiff::is_recording() {
                     NslTensor::from_ptr(result).refcount.fetch_add(1, Ordering::SeqCst);
@@ -1766,7 +1766,7 @@ define_inplace_unary!(nsl_tensor_log_inplace, |v: f32| v.ln(), |v: f64| v.ln(), 
 define_inplace_unary!(nsl_tensor_sqrt_inplace, |v: f32| v.sqrt(), |v: f64| v.sqrt(), crate::cuda::kernels::sqrt_f32_ptx(), "nsl_sqrt_f32\0");
 define_inplace_unary!(nsl_tensor_abs_inplace, |v: f32| v.abs(), |v: f64| v.abs(), crate::cuda::kernels::abs_f32_ptx(), "nsl_abs_f32\0");
 define_inplace_unary!(nsl_tensor_sigmoid_inplace, |v: f32| 1.0_f32 / (1.0_f32 + (-v).exp()), |v: f64| 1.0 / (1.0 + (-v).exp()), crate::cuda::kernels::sigmoid_f32_ptx(), "nsl_sigmoid_f32\0");
-define_inplace_unary!(nsl_tensor_tanh_inplace, |v: f32| v.tanh(), |v: f64| v.tanh(), crate::cuda::kernels::TANH_F32_PTX, "nsl_tanh_f32\0");
+define_inplace_unary!(nsl_tensor_tanh_inplace, |v: f32| v.tanh(), |v: f64| v.tanh(), crate::cuda::kernels::tanh_f32_ptx(), "nsl_tanh_f32\0");
 define_inplace_unary!(nsl_tensor_neg_inplace, |v: f32| -v, |v: f64| -v, crate::cuda::kernels::neg_f32_ptx(), "nsl_neg_f32\0");
 define_inplace_unary!(nsl_tensor_sign_inplace, |v: f32| if v > 0.0 { 1.0_f32 } else if v < 0.0 { -1.0_f32 } else { 0.0_f32 }, |v: f64| if v > 0.0 { 1.0 } else if v < 0.0 { -1.0 } else { 0.0 }, crate::cuda::kernels::sign_f32_ptx(), "nsl_sign_f32\0");
 
@@ -2565,5 +2565,86 @@ mod gelu_backward_tests {
             );
         }
         for p in [x, grad, out, cpu] { nsl_tensor_free(p); }
+    }
+}
+
+/// The GPU tanh and the tape-AD GELU adjoint saturate on the device. Both
+/// divide with `div.approx.f32`, which returns 0 for a divisor in
+/// `(2^126, 2^128)`. The hand kernels reached that range: tanh returned 0
+/// from about 43.67 up (NaN too), and the adjoint went wrong past `x ≈ 10`.
+/// `nsl-codegen`'s `tanh_gelu_backward_kir_equivalence` proves the fix on
+/// the interpreter, which models that range; these check it on hardware.
+#[cfg(all(test, feature = "cuda"))]
+mod tanh_saturation_gpu_tests {
+    use super::*;
+    use crate::tensor::NslTensor;
+
+    fn to_gpu(data: &[f32]) -> i64 {
+        let h = crate::cpu::create_tensor_with_shape_rs_dtype(&[data.len() as i64], 1);
+        let t = NslTensor::from_ptr(h);
+        for (i, v) in data.iter().enumerate() { unsafe { *t.data_f32().add(i) = *v }; }
+        let d = crate::tensor::nsl_tensor_to_device(h, 1);
+        nsl_tensor_free(h);
+        d
+    }
+
+    fn to_host(d: i64) -> Vec<f64> {
+        let c = crate::tensor::nsl_tensor_to_device(d, 0);
+        let ct = NslTensor::from_ptr(c);
+        let out = (0..ct.len as usize).map(|i| unsafe { *ct.data_f64().add(i) }).collect();
+        nsl_tensor_free(c);
+        out
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU"]
+    fn tanh_gpu_f32_saturates_and_keeps_nan() {
+        let xs = [
+            -f32::INFINITY, -1e30, -50.0, -44.0, -43.5, -3.0, -1e-3, 0.0, 1e-3, 3.0, 20.0, 43.5, 43.7, 44.0, 50.0,
+            1e30, f32::INFINITY, f32::NAN,
+        ];
+        let x = to_gpu(&xs);
+        // Held so the op does not run in place on its last reference.
+        NslTensor::from_ptr(x).refcount.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let y = nsl_tensor_tanh_act(x);
+        NslTensor::from_ptr(x).refcount.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        let got = to_host(y);
+        for (&xv, &g) in xs.iter().zip(&got) {
+            if xv.is_nan() {
+                assert!(g.is_nan(), "tanh(NaN) = {g}");
+                continue;
+            }
+            let want = (xv as f64).tanh();
+            assert!((g - want).abs() <= 1e-6, "tanh({xv:e}) = {g:e}, want {want:e}");
+        }
+        for p in [x, y] { nsl_tensor_free(p); }
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU"]
+    fn gelu_backward_gpu_f32_saturates_to_its_limits() {
+        let xs = [
+            -f32::INFINITY, -1e30, -100.0, -12.0, -10.5, -9.9, -1.0, 0.0, 1.0, 9.9, 10.0, 10.5, 12.0, 20.0, 100.0,
+            1e6, 1e30, f32::INFINITY,
+        ];
+        let gs: Vec<f32> = (0..xs.len()).map(|i| if i % 2 == 0 { 1.5 } else { -0.75 }).collect();
+        let (x, g) = (to_gpu(&xs), to_gpu(&gs));
+        let out = crate::cuda::gpu_gelu_backward(g, x);
+        let got = to_host(out);
+        let c = |w: u32| f32::from_bits(w) as f64;
+        for i in 0..xs.len() {
+            let (xv, gv) = (xs[i] as f64, gs[i] as f64);
+            let deriv = if xv.is_infinite() || xv.abs() > 1e3 {
+                if xv > 0.0 { 1.0 } else { 0.0 }
+            } else {
+                let k = c(0x3D12_4925) * xv * xv * xv + c(0x3F4C_422A) * xv;
+                let t = k.tanh();
+                0.5 * (1.0 + t + xv * (1.0 - t * t) * (c(0x3DD8_ECA1) * xv * xv + c(0x3F4C_422A)))
+            };
+            let want = gv * deriv;
+            assert!(got[i].is_finite(), "x={xv:e}: {}", got[i]);
+            assert!((got[i] - want).abs() <= 1e-4 * (1.0 + want.abs()), "x={xv:e}: got {}, want {want}", got[i]);
+        }
+        for p in [x, g, out] { nsl_tensor_free(p); }
     }
 }

@@ -8,6 +8,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **`nsl_tanh_f32` and `nsl_gelu_backward_f32` are built by
+  `nsl_kir::kernels::elementwise` in place of their hand-written constants**
+  (new-roadmap item 5). They move with the saturation fix listed under
+  *Fixed*.
+  - **The kernels** (`build_tanh`, `build_gelu_backward`) keep the hand
+    kernels' arithmetic: bare, contractible operations, `ex2.approx`, then
+    `div.approx.f32`. Past `|v| = 43.5` (`TANH_SATURATION`) they saturate.
+  - **The gate.** `tests/tanh_gelu_backward_kir_equivalence.rs` (16 tests)
+    runs the frozen hand kernels and the KIR ones on the CTA interpreter.
+    - The hand kernels' failure reproduces on the interpreter.
+    - Where the hand kernels were right (`|x| ≤ 43.5`, `|k(x)| ≤ 43.5`),
+      it requires identical global memory under two schedules.
+    - Past that point it pins the limits, and over the whole range it
+      holds the kernels to the f64 formulas.
+    - It catches mutants of the bound, the block index, every element
+      size, the old clamp, both arms of every select, the quotient's
+      operands and each constant.
+    - `div.approx` → `div.rn` is a named equivalent mutant: the
+      saturation keeps the divisor out of the flush range.
+  - **The interpreter** models `div.approx.f32`'s documented flush range.
+    For `2^126 < |b| < 2^128` the result is `a * ±0`: 0, or NaN for an
+    infinite `a`.
+  - **SASS** on sm_80/90/120: tanh's floating-point sequence is the hand
+    kernel's, with one `FSETP.NEU`; ptxas turns the NaN `selp` into a
+    predicated quotient. The adjoint's is the hand kernel's plus two
+    `FSETP` and two `FSEL`. Registers are 12/14/12 (tanh) and 15/13/13
+    (adjoint), against 10 and 14.
+
 - **`nsl_fase_fused_adamw_multi_f32` is built by
   `nsl_kir::kernels::optim` in place of its hand-written constant**
   (new-roadmap item 5, after the single-parameter step). It is the
@@ -750,6 +778,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   every diagnostic line the toolchain prints is a `tracing` event.
 
 ### Fixed
+
+- **GPU `tanh` returned 0 for large inputs, and the tape-AD GELU gradient
+  returned NaN past `x ≈ 10`.**
+  - **The cause.** Both kernels compute `tanh(v)` as `(e − 1) / (e + 1)`
+    with `div.approx.f32`, which returns 0 for a divisor whose magnitude is
+    in `(2^126, 2^128)` and NaN for `∞ / ∞`.
+    - `nsl_tanh_f32` clamped its input at 44, inside that range. It
+      returned 0 for every `x` from about 43.67 up, `+∞` included, and for
+      NaN.
+    - `nsl_gelu_backward_f32` did not clamp. It returned garbage and then
+      NaN once `k = 0.0356774·x³ + 0.797885·x` passed the same point.
+  - **Now.** tanh clamps at 43.5, which gives ±1 in f32, and returns a
+    NaN input as it is. The adjoint's derivative takes its limits past
+    `|k| = 43.5`: 1 above, 0 below. Below that point both kernels are the
+    old ones bit for bit.
+  - **Other paths.** The CPU paths and the source-AD GELU backward were
+    not affected.
 
 - **The SwiGLU gate-backward peephole fires** (P5 item 20 slice B). It
   never had.

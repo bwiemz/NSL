@@ -815,8 +815,9 @@ frozen throughout, so nothing here blocks a kernel fix.
     CPU-lane `gelu_slope_drift` gate in `nsl-runtime` now reads the forward
     slope from the KIR module and holds it to the hand-written source-AD
     backward's. Registers are 12/12/11 against the hand kernel's 11/11/10
-    (sm_80/90/120). `nsl_tanh_f32` is the family's last hand kernel, waiting
-    on the approximate-division decision.
+    (sm_80/90/120). `nsl_tanh_f32` was the family's last hand kernel,
+    waiting on the approximate-division decision; it moved with
+    `div.approx` (item 11's last entry).
 
     **`kernels.rs`, the scalar-operand family** (sixth slice).
     `nsl_{mul,add,sub}_scalar_f32` (`c[i] = a[i] op s`, `s` an `.f32`
@@ -889,8 +890,8 @@ frozen throughout, so nothing here blocks a kernel fix.
       `rotate_half_kir_equivalence`. The SASS keeps the registers and the
       64-bit remainder call on sm_80/90/120; the address arithmetic
       (`IMAD.WIDE` for `LEA`) adds 2 to 8 instructions.
-    - **Still hand-written:** `nsl_gelu_backward_f32` (tanh approximation,
-      `div.approx`).
+    - **Tape-AD GELU adjoint:** `nsl_gelu_backward_f32` moved with
+      `nsl_tanh_f32` once `div.approx` existed (see below).
 
     **`div.approx`, and the fused FASE AdamW step** (new-roadmap item 5).
     - **The op:** `KirOp::DivApprox` prints `div.approx.f32`. It is f32
@@ -930,6 +931,30 @@ frozen throughout, so nothing here blocks a kernel fix.
       sequence identical on sm_80, and registers are 20/20/20 against
       24/24/21; the rest of the difference is address arithmetic
       (`IMAD.WIDE` for shift and add).
+    - **tanh and the tape-AD GELU adjoint, with their saturation fixed:**
+      `nsl_tanh_f32` (`build_tanh`) and `nsl_gelu_backward_f32`
+      (`build_gelu_backward`) compute `tanh(v)` as `(e − 1) / (e + 1)`
+      through `div.approx.f32`. That returns 0 for a divisor in
+      `(2^126, 2^128)`.
+      - **The interpreter** now models that documented range as `a * ±0`.
+        Every earlier gate still passes: none divides by anything that
+        large.
+      - **The hand kernels' bug.** Under that model the gate shows the hand
+        tanh returning 0 at 44, `+∞` and NaN (it clamped at 44), and the
+        hand adjoint going wrong past `x ≈ 10`.
+      - **The fix.** The KIR tanh clamps at `TANH_SATURATION` (43.5) and
+        returns a NaN input through an ordered `setp.eq` and a `selp`. The
+        adjoint keeps its arithmetic and selects the derivative's limits
+        (1, 0) past `|k| = 43.5`.
+      - **The gate,** `tanh_gelu_backward_kir_equivalence`, requires the
+        hand kernels' bytes where they were right and pins the limits
+        past it. It holds both kernels to f64 over the whole range and
+        names `div.approx` → `div.rn` as an equivalent mutant: the
+        saturation keeps the divisor out of the range.
+      - **SASS:** tanh's floating-point sequence is the hand kernel's plus
+        an `FSETP.NEU`, the `selp` becoming a predicated quotient. The
+        adjoint's is the hand kernel's plus two `FSETP` and two `FSEL`,
+        on sm_80/90/120.
 12. **FA v2**, by phase directory, tier B.1 and B.2 last; the SASS
     baselines and the two no-spill gates already exist here and are the
     proof. `matmul_mma.rs` and `kernel_skeleton/` are deleted with their

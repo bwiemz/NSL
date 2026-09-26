@@ -378,6 +378,8 @@ crates/nsl-runtime/src/muon_batch.rs	batch_nesterov_runs_and_is_deterministic	gp
 crates/nsl-runtime/src/muon_batch.rs	workspace_grow_realloc_same_oriented_key	gpu	requires CUDA GPU
 crates/nsl-runtime/src/muon_batch.rs	profile_batch_ns_500m_step	diagnostic	requires CUDA GPU (timing driver, not a correctness gate)
 crates/nsl-runtime/src/tensor/activation.rs	swiglu_gate_backward_gpu_f32_bit_exact_vs_pair	gpu	requires CUDA GPU
+crates/nsl-runtime/src/tensor/activation.rs	tanh_gpu_f32_saturates_and_keeps_nan	gpu	requires CUDA GPU
+crates/nsl-runtime/src/tensor/activation.rs	gelu_backward_gpu_f32_saturates_to_its_limits	gpu	requires CUDA GPU
 crates/nsl-runtime/src/tensor/ad_ops.rs	embedding_backward_deterministic_gpu_matches_cpu_and_is_stable	gpu	GPU: requires CUDA device
 crates/nsl-runtime/src/tensor/ad_ops.rs	test_gpu_ce_backward_matches_cpu_bounce	gpu	requires CUDA GPU
 crates/nsl-runtime/src/tensor/mod.rs	sum_sq_gpu_matches_cpu_reference	gpu	GPU: requires CUDA device

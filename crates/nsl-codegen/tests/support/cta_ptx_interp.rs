@@ -51,8 +51,13 @@
 //!
 //! A `.shared` block may be declared by element (`.shared .f32 NAME[N]`,
 //! `N` elements) as well as in bytes, and an address may name it directly
-//! (`[NAME]`). `div.approx.f32` is modelled as `a / b`, the same as
-//! `div.rn.f32`, like every approximate form. `neg.f32` and `abs.f32` flip
+//! (`[NAME]`). `div.approx.f32` is `a / b`, the same as `div.rn.f32`, like
+//! every approximate form, except for a divisor whose magnitude is in
+//! `(2^126, 2^128)`. There the PTX ISA documents the result as 0, or NaN for
+//! an infinite dividend: the instruction is `a * (1/b)`, and the reciprocal
+//! flushes to zero. The model follows it, `a * ±0`, since a kernel that
+//! divides by a value that large is wrong on the hardware in a way the
+//! gates must be able to see. `neg.f32` and `abs.f32` flip
 //! and clear the sign bit (NaN included); `min.f32`, like `max.f32`, returns
 //! the non-NaN operand. `add.rn`, `sub.rn` and `mul.rn` on f32 are the bare
 //! forms: the interpreter never contracts a multiply into an add, so the
@@ -1095,7 +1100,13 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
                     FOp::Max => a.max(b),
                     // Likewise `min.f32`.
                     FOp::Min => a.min(b),
-                    FOp::DivRn | FOp::DivApprox => a / b,
+                    FOp::DivRn => a / b,
+                    // `a * (1/b)`, the reciprocal flushed to zero for
+                    // 2^126 < |b| < 2^128 (the PTX ISA's documented range).
+                    FOp::DivApprox if b.abs() > f32::from_bits(0x7E80_0000) && b.is_finite() => {
+                        a * 0.0f32.copysign(b)
+                    }
+                    FOp::DivApprox => a / b,
                 };
                 write(t, *d, fb(v));
             }
