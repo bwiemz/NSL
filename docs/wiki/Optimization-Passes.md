@@ -66,7 +66,7 @@ The optimization passes that operate on the `WengertList` run inside `compile_tr
 
 1. **FASE planning** — `fase::plan` / `fase::plan_with_overrides` is called **first**, before source AD, using `wggo_overrides` stashed by a prior WGGO run (or `None` on a fresh compile). Produces a `FasePlan` describing accumulation mode, update rule, and two-phase clip structure. FASE codegen (applying the plan) fires later in the same function.
 2. **Source AD extraction** — `WengertExtractor::extract_stmts` builds the `WengertList`.
-3. **Calibration** — optional; runs the calibration harness and populates `calibration_sidecar` if `--calibration-data` is set. Feeds gradient-importance scores to WGGO.
+3. **Calibration** — only through the library entry `nsl_codegen::compile_and_calibrate`, which runs the calibration harness and populates `calibration_sidecar` (feeding gradient-importance scores to WGGO). No `nsl build` path calls it, so the CLI refuses `--calibration-data` and the other calibration flags rather than ignoring them.
 4. **WGGO** — `wggo::run_on_wengert_with_weights`; consumes the `WengertList` and emits a `WggoPlan` + `AppliedPlan`. Stashes `WggoOverrides` for all downstream passes (and for the NEXT compile's FASE planning).
 5. **CSHA** — `csha::run_on_wengert`; consumes the `WengertList` + `WggoOverrides`; emits a `CshaPlan` and bridges it into kernel-site annotations (the `csha_bridge` channel — see the pass bus below).
 6. **WRGA** — `invoke_wrga_if_enabled`; consumes the `WengertList`; runs dead-gradient elimination (`wrga_prune`), rank allocation (`wrga_roofline`), memory planning (`wrga_memory`), and fusion decisions (`wrga_fusion`).

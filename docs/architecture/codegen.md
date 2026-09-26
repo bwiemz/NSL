@@ -1050,7 +1050,7 @@ different thing.
 | `verilog_emission_snapshots`, `hir_pass_snapshots`, `yosys_gate` | `ci.yml` `fpga` |
 | `csha_ptx_ptxas_validation`, `fused_linear_ce_{bf16,fp16,large_vocab}_ptxas`, `bitnet_gpu_correctness` under `--features cuda` against cudart stubs (assembles PTX, executes nothing) | `ci.yml` `cuda-feature` |
 | `scripts/hand-ptx-freeze.sh --self-test` / `--check` | `ci.yml` `hand-ptx-freeze` |
-| `scripts/gpu-cert.sh --check-inventory` / `--check-reasons` / `--check-long-arms` (manifest `ci/gpu-cert-manifest.tsv`: 471 gates, 198 in this crate) | `ci.yml` `gpu-gate-inventory` |
+| `scripts/gpu-cert.sh --check-inventory` / `--check-reasons` / `--check-long-arms` (manifest `ci/gpu-cert-manifest.tsv`: 470 gates, 198 in this crate) | `ci.yml` `gpu-gate-inventory` |
 | `scripts/check-doc-agreement.sh`, version agreement | `ci.yml` `doc-agreement`, `version-agreement` |
 | `scripts/gpu-cert.sh --run [--tier gpu\|toolchain\|multiproc\|isolate\|all]` — every `#[ignore]`d device test, under `scripts/gpu-guard.sh`; known-red list `ci/gpu-cert-known-red.txt` | `.github/workflows/gpu-cert.yml`, nightly + `workflow_dispatch` on the self-hosted sm_120 box; or locally |
 | `scripts/gpu-tier.sh smoke\|certify\|endurance` | local only |

@@ -1,13 +1,20 @@
-//! `nsl build` refuses malformed calibration flags before it reads the
-//! source (spec §8). Every case here fails validation, so the model path
-//! only has to be a real file; nothing is compiled.
+//! `nsl build` refuses every calibration flag before it reads the source
+//! (roadmap item 8: an ignored request is either implemented or refused).
+//!
+//! The calibration harness lives in `nsl_codegen::compile_and_calibrate`,
+//! which no build path calls, so `--calibration-data` used to be validated
+//! and then dropped (with a warning), and `--calibrate`,
+//! `--calibration-samples`, `--calibration-batch-size` and
+//! `--calibration-timeout` configured a run that never happened. Each is now
+//! a refusal that names the flag, so the model path only has to be a real
+//! file; nothing is compiled.
 
 use std::path::PathBuf;
 use std::process::Command;
 
-/// A source file that exists. Validation runs before the source is opened,
-/// but a path that resolves keeps the failure pinned to the flag under
-/// test rather than to a missing file.
+/// A source file that exists. The refusal fires before the source is
+/// opened, but a path that resolves keeps the failure pinned to the flag
+/// under test rather than to a missing file.
 fn model() -> PathBuf {
     // CARGO_MANIFEST_DIR = <root>/crates/nsl-cli
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -33,75 +40,52 @@ fn run(args: &[&str]) -> (String, String, i32) {
     )
 }
 
-#[test]
-fn calibrate_without_data_errors() {
-    let (_o, e, code) = run(&["--calibrate", "best-effort"]);
-    assert_ne!(code, 0);
-    assert!(e.contains("--calibrate") && e.contains("--calibration-data"), "stderr: {e}");
+/// The refusal names the flag, says calibration is not implemented, and
+/// points WGGO users at a scoring mode that needs no data.
+fn assert_refused(args: &[&str], flags: &str) {
+    let (_o, e, code) = run(args);
+    assert_ne!(code, 0, "{args:?} must refuse:\n{e}");
+    assert!(e.contains(&format!("error: {flags}")), "{args:?}: the refusal must name {flags}:\n{e}");
+    assert!(e.contains("calibration is not implemented by `nsl build`"), "{args:?}:\n{e}");
+    assert!(e.contains("--wggo-importance=magnitude"), "{args:?}: the fix must be named:\n{e}");
 }
 
 #[test]
-fn bad_calibrate_mode_errors() {
-    let (_o, e, code) = run(&["--calibration-data", "/tmp/any.bin", "--calibrate", "maybe"]);
-    assert_ne!(code, 0);
-    assert!(e.contains("required") || e.contains("best-effort"), "stderr: {e}");
-}
-
-#[test]
-fn nonexistent_calibration_data_errors() {
-    let (_o, e, code) = run(&["--calibration-data", "/nonexistent/path/to/data.bin"]);
-    assert_ne!(code, 0);
-    assert!(e.contains("calibration-data") && e.contains("does not exist"), "stderr: {e}");
-}
-
-#[test]
-fn bad_extension_errors() {
+fn calibration_data_is_refused_not_ignored() {
     let dir = tempfile::tempdir().unwrap();
-    let p = dir.path().join("nsl-calib-bad-ext.jsonl");
-    std::fs::write(&p, b"x").unwrap();
-    let (_o, e, code) = run(&["--calibration-data", p.to_str().unwrap()]);
-    assert_ne!(code, 0);
-    assert!(e.contains(".bin") && e.contains(".safetensors"), "stderr: {e}");
+    let corpus = dir.path().join("c.bin");
+    std::fs::write(&corpus, b"NSLB").unwrap();
+    assert_refused(&["--calibration-data", corpus.to_str().unwrap()], "--calibration-data is refused");
+    // The old validated-then-ignored warning is gone.
+    let (_o, e, _) = run(&["--calibration-data", corpus.to_str().unwrap()]);
+    assert!(!e.contains("NOT consumed"), "{e}");
+}
+
+/// Refused before any path check: a missing or oddly named corpus gets the
+/// same answer, because no corpus can be honoured.
+#[test]
+fn calibration_data_refuses_before_validating_the_path() {
+    assert_refused(&["--calibration-data", "/nonexistent/path/to/data.bin"], "--calibration-data is refused");
+    assert_refused(&["--calibration-data", "/tmp/any.jsonl"], "--calibration-data is refused");
 }
 
 #[test]
-fn samples_zero_errors() {
-    let (_o, e, code) = run(&["--calibration-samples", "0"]);
-    assert_ne!(code, 0);
-    assert!(e.contains("calibration-samples"), "stderr: {e}");
+fn each_calibration_knob_is_refused_on_its_own() {
+    for (args, flag) in [
+        (&["--calibrate", "best-effort"][..], "--calibrate"),
+        (&["--calibrate", "required"][..], "--calibrate"),
+        (&["--calibration-samples", "64"][..], "--calibration-samples"),
+        (&["--calibration-batch-size", "4"][..], "--calibration-batch-size"),
+        (&["--calibration-timeout", "30"][..], "--calibration-timeout"),
+    ] {
+        assert_refused(args, &format!("{flag} is refused"));
+    }
 }
 
-/// `--calibration-data` is accepted and then IGNORED: the harness lives in
-/// `nsl_codegen::compile_and_calibrate`, which no CLI path calls, so the
-/// corpus is validated and dropped. Until the wiring lands that has to be
-/// LOUD -- accepting a corpus and silently discarding it is the one behaviour
-/// with no defence, and it is what let the gap survive from 2026-05-10 to
-/// 2026-09-01.
-///
-/// Paired with `--calibration-samples 0`, which is rejected immediately after
-/// the calibration-data block, so this pins the warning without compiling.
 #[test]
-fn calibration_data_warns_that_it_is_not_consumed() {
-    let dir = std::env::temp_dir().join(format!("nsl_calibwarn_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    let corpus = dir.join("c.bin");
-    std::fs::write(&corpus, b"NSLB").expect("write corpus");
-
-    let (_o, e, code) = run(&[
-        "--calibration-data",
-        corpus.to_str().expect("utf-8 path"),
-        "--calibration-samples",
-        "0",
-    ]);
-
-    assert_ne!(code, 0, "the samples=0 refusal still has to fire: {e}");
-    assert!(
-        e.contains("NOT consumed by `nsl build`"),
-        "a supplied calibration corpus must say it is ignored:\n{e}"
+fn several_flags_are_named_together() {
+    assert_refused(
+        &["--calibration-data", "/tmp/c.bin", "--calibration-samples", "8"],
+        "--calibration-data, --calibration-samples are refused",
     );
-    assert!(
-        e.contains(corpus.to_str().expect("utf-8 path")),
-        "the warning must name the corpus it is discarding:\n{e}"
-    );
-    std::fs::remove_dir_all(&dir).ok();
 }
