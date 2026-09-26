@@ -134,6 +134,12 @@ pub use fused_kl_ce::{nsl_fused_kl_ce_backward, nsl_fused_kl_ce_forward};
 #[cfg(feature = "cuda")]
 pub use cuda::tier_b1_prepass::{csha_tier_b1_prepass_w_ptx, csha_tier_b1_prepass_x_ptx};
 
+// Test-only re-export: the KV-cache E4M3 dequant module, run on the CTA
+// interpreter by `tests/fp8_e4m3_dequant_interp.rs` (no GPU needed).
+#[doc(hidden)]
+#[cfg(all(feature = "cuda", feature = "test-hooks"))]
+pub use cuda::fused_kernels::DEQUANT_FP8_E4M3_F32_PTX;
+
 // Test-only re-export: SM version query for dispatcher tests.
 #[cfg(feature = "test-hooks")]
 pub use cuda::test_detect_sm_version;

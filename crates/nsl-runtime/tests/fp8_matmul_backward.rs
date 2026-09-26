@@ -2,7 +2,8 @@
 
 //! Integration tests for E5M2 backward matmul — output of
 //! fp8_matmul_e5m2_backward agrees with the scalar reference within
-//! E5M2_REL_TOL (10%).
+//! E5M2_REL_TOL. Both sides multiply the same FP8-rounded operands, so the
+//! tolerance only covers f32-vs-f64 accumulation, not FP8 rounding.
 
 mod common;
 use common::fp8_reference::*;

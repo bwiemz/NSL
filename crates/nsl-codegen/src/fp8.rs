@@ -126,9 +126,9 @@ pub fn extract_fp4_compute_decorator<'a>(
 /// FP8 sub-format: E4M3 for forward (higher precision), E5M2 for backward (wider range).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Fp8Format {
-    /// 4-bit exponent, 3-bit mantissa. Max 448. Precision 0.125.
+    /// 4-bit exponent, 3-bit mantissa. Max 448. Relative spacing 2^-3 (error <= 2^-4).
     E4M3,
-    /// 5-bit exponent, 2-bit mantissa. Max 57344. Precision 0.5.
+    /// 5-bit exponent, 2-bit mantissa. Max 57344. Relative spacing 2^-2 (error <= 2^-3).
     E5M2,
 }
 
