@@ -198,8 +198,8 @@ fn bwd_step_partition(m_tiles: usize, n_tiles: usize, warps: usize) -> Option<(u
 
 /// Partition-aware head for a backward MMA m-loop: each warp's m-tile starts
 /// at wid / w_nt and strides by m_w; %bwd_mma_wpart is set to wid % w_nt for
-/// the nt arms. With warps=1 this degenerates to the historical
-/// m_tile=0/byte_off=0 init. `m_adv_bytes` is the per-m-tile advance of
+/// the nt arms. With w_nt = 1 each warp starts at m-tile wid; a single
+/// launched warp degenerates to the historical m_tile=0/byte_off=0 init. `m_adv_bytes` is the per-m-tile advance of
 /// %bwd_mma_m_byte_off (the same constant the loop tail adds).
 fn emit_bwd_m_loop_init(ptx: &mut String, w_nt: usize, m_adv_bytes: usize) {
     let shift = w_nt.trailing_zeros();
@@ -4918,16 +4918,29 @@ fn emit_bwd_main_q_tile_loop_mma(
     let m_tiles_kv = block_kv_u / MMA_M; // m-tiles for dV/dK (rows = block_kv)
     let hd_padded_u = hd_padded as usize;
 
-    // Warp partition per step (backward_main_warps guaranteed divisibility;
-    // warps == 1 degenerates to (1, 1) = the historical single-warp flow).
+    // Warp partition per step (backward_main_warps guaranteed divisibility).
+    //
+    // The single-warp BODY (warps == 1: segment-masked, the multi-warp kill
+    // switch, or a shape the 4-warp partition refuses) is still LAUNCHED with
+    // block_q threads — no `_w<N>` suffix — which is block_q / 32 physical
+    // warps (2 at the 64/64 tiles head_dim <= 32 selects). Every m-loop
+    // starts at m_tile = wid, so those warps must stride by their own count:
+    // each warp takes m-tiles wid, wid + W, ..., and every (m, n) unit is
+    // accumulated exactly once. A stride of 1 (the old `(1, 1)`) let warp 1
+    // repeat tiles 1..m_tiles, double-counting their dQ / dK / dV atomics.
     let warps_u = warps as usize;
     let nthreads = if warps > 1 { 32 * warps } else { config.block_q };
-    let (s_mw, s_wnt) =
-        bwd_step_partition(m_tiles_q, n_tiles_s, warps_u).expect("S/dP partition");
-    let (g_mw, g_wnt) =
-        bwd_step_partition(m_tiles_kv, n_tiles_hd, warps_u).expect("dV/dK partition");
-    let (q_mw, q_wnt) =
-        bwd_step_partition(m_tiles_q, n_tiles_hd, warps_u).expect("dQ partition");
+    let launched_warps = (nthreads as usize / 32).max(1);
+    let partition = |m_tiles: usize, n_tiles: usize| {
+        if warps > 1 {
+            bwd_step_partition(m_tiles, n_tiles, warps_u)
+        } else {
+            Some((launched_warps, 1))
+        }
+    };
+    let (s_mw, s_wnt) = partition(m_tiles_q, n_tiles_s).expect("S/dP partition");
+    let (g_mw, g_wnt) = partition(m_tiles_kv, n_tiles_hd).expect("dV/dK partition");
+    let (q_mw, q_wnt) = partition(m_tiles_q, n_tiles_hd).expect("dQ partition");
 
     // Helper: V tile starts right after K tile
     let v_shmem_offset = k_tile_bytes;
