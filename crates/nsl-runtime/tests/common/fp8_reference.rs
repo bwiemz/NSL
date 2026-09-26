@@ -6,8 +6,7 @@
 //! published FP8 format spec) before assuming the runtime is at fault.
 
 use nsl_runtime::fp8::{
-    compute_scale, dequantize_fp8, fp8_matmul_cpu, quantize_fp8, FP8E4M3_MAX, FP8E5M2_MAX,
-    FP8_FORMAT_E4M3, FP8_FORMAT_E5M2,
+    compute_scale, fp8_matmul_cpu, FP8E4M3_MAX, FP8E5M2_MAX, FP8_FORMAT_E4M3, FP8_FORMAT_E5M2,
 };
 
 // Not every test binary uses both helpers (fp8_scale only builds tensors;
@@ -39,29 +38,102 @@ impl Fp8Format {
     }
 }
 
-pub const E4M3_REL_TOL: f32 = 0.02;
-pub const E5M2_REL_TOL: f32 = 0.10;
+/// Runtime FP8 matmul vs this reference: both multiply the SAME FP8-rounded
+/// operands, so the only difference is the runtime's f32 accumulation against
+/// the reference's f64 one. Relative to the largest |output|, that stays
+/// around 1e-7 at K = 128; 1e-5 leaves headroom and is still thousands of
+/// times smaller than one FP8 rounding step (2^-4 for E4M3, 2^-3 for E5M2).
+pub const E4M3_REL_TOL: f32 = 1e-5;
+pub const E5M2_REL_TOL: f32 = 1e-5;
 pub const DISPATCH_ABS_TOL: f32 = 1e-5;
 
+impl Fp8Format {
+    /// Decode one FP8 byte per the OCP 8-bit floating point spec (v1.0).
+    /// `None` for the NaN codes (and E5M2's infinities).
+    pub fn decode(self, code: u8) -> Option<f64> {
+        let sign = if code & 0x80 != 0 { -1.0 } else { 1.0 };
+        let (exp_bits, man_bits, bias) = match self {
+            Fp8Format::E4M3 => (4u32, 3u32, 7i32),
+            Fp8Format::E5M2 => (5, 2, 15),
+        };
+        let exp = ((code as u32 >> man_bits) & ((1 << exp_bits) - 1)) as i32;
+        let man = (code as u32 & ((1 << man_bits) - 1)) as f64;
+        let man_scale = (1u32 << man_bits) as f64;
+        let exp_max = (1i32 << exp_bits) - 1;
+        match self {
+            // E4M3 has no infinities; only S.1111.111 is NaN.
+            Fp8Format::E4M3 if exp == exp_max && man == 7.0 => return None,
+            // E5M2 is IEEE-like: the top exponent is Inf/NaN.
+            Fp8Format::E5M2 if exp == exp_max => return None,
+            _ => {}
+        }
+        let magnitude = if exp == 0 {
+            man / man_scale * 2f64.powi(1 - bias)
+        } else {
+            (1.0 + man / man_scale) * 2f64.powi(exp - bias)
+        };
+        Some(sign * magnitude)
+    }
+
+    /// The finite value nearest to `x` among all 256 codes; a tie goes to the
+    /// code with an even mantissa. `x` beyond the maximum saturates to it.
+    pub fn nearest(self, x: f64) -> f64 {
+        if x.is_nan() {
+            return x;
+        }
+        let x = x.clamp(-(self.max_repr() as f64), self.max_repr() as f64);
+        let mut best: Option<(f64, u8)> = None;
+        for code in 0..=255u8 {
+            let Some(v) = self.decode(code) else { continue };
+            let better = match best {
+                None => true,
+                Some((b, bcode)) => {
+                    let (d, bd) = ((v - x).abs(), (b - x).abs());
+                    d < bd || (d == bd && v != b && code & 1 == 0 && bcode & 1 == 1)
+                }
+            };
+            if better {
+                best = Some((v, code));
+            }
+        }
+        let v = best.unwrap().0;
+        // Both zero codes are finite; keep the sign of the input like IEEE.
+        if v == 0.0 { 0.0f64.copysign(x) } else { v }
+    }
+
+    /// Half the spacing between FP8 neighbours around `|x|` — the largest
+    /// round-to-nearest error at that magnitude, in scaled units.
+    pub fn half_ulp(self, x: f64) -> f64 {
+        let (man_bits, min_normal_exp) = match self {
+            Fp8Format::E4M3 => (3, -6),
+            Fp8Format::E5M2 => (2, -14),
+        };
+        let a = x.abs().min(self.max_repr() as f64);
+        let e = if a == 0.0 { min_normal_exp } else { (a.log2().floor() as i32).max(min_normal_exp) };
+        2f64.powi(e - man_bits) / 2.0
+    }
+}
+
+/// Reference quantization, independent of the runtime: `x / scale` onto the
+/// FP8 grid by exhaustive search over the decoded codes.
 pub fn quantize(x: f32, scale: f32, fmt: Fp8Format) -> f32 {
-    quantize_fp8(x as f64, scale as f64, fmt.dtype_code()) as f32
+    fmt.nearest(x as f64 / scale as f64) as f32
 }
 
 pub fn dequantize(q: f32, scale: f32) -> f32 {
-    dequantize_fp8(q as f64, scale as f64) as f32
+    (q as f64 * scale as f64) as f32
 }
 
+/// `x` after an FP8 round trip at `scale`, computed in f64 the way the
+/// runtime's `nsl_fp8_cast` does, so the two agree bit for bit.
 pub fn round_trip(x: f32, scale: f32, fmt: Fp8Format) -> f32 {
-    dequantize(quantize(x, scale, fmt), scale)
+    (fmt.nearest(x as f64 / scale as f64) * scale as f64) as f32
 }
 
+/// The largest round-trip error allowed at `x` (half an FP8 ulp at
+/// `x / scale`, back in unscaled units).
 pub fn quantization_step(x: f32, scale: f32, fmt: Fp8Format) -> f32 {
-    let precision = match fmt {
-        Fp8Format::E4M3 => 0.125,
-        Fp8Format::E5M2 => 0.5,
-    };
-    let _ = x; // magnitude-dependent bound could vary; uniform bound chosen for simplicity
-    (precision as f32) * scale / 2.0
+    (fmt.half_ulp(x as f64 / scale as f64) * scale as f64) as f32
 }
 
 pub struct Fp8ReferenceMatmul {

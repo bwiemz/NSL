@@ -481,6 +481,12 @@ jobs:
           cargo test -p nsl-runtime --features cuda --lib -- \
             --exact cuda::tests::all_handwritten_ptx_assembles_with_ptxas --nocapture
 
+      # The KV-cache E4M3 dequant kernel on the CTA interpreter over all 256
+      # codes, and against the CPU decoder. Needs no GPU. Would have caught the
+      # kernel decoding subnormal codes as normals and NaN as 480.
+      - name: FP8 E4M3 dequant kernel (interpreter)
+        run: cargo test -p nsl-runtime --features cuda,test-hooks --test fp8_e4m3_dequant_interp
+
       # Pure logic over a mock driver; no CUDA calls. Would have caught the
       # small-pool free-list bug.
       - name: GPU caching allocator tests
