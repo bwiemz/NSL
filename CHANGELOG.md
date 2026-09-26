@@ -606,6 +606,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- The CPU fused kernels no longer misread memory or return a null tensor
+  (dtype-semantics design, step 0).
+  - **`nsl_fused_elementwise_2`** returned the null handle 0 for operands
+    of different lengths (any broadcast). Neither codegen call site checks
+    for it, so the next op aborted on a null tensor.
+  - **All three kernels misread memory.** `nsl_fused_elementwise_{1,2}`
+    and `nsl_fused_matmul_epilogue` read their operands as flat host arrays
+    in the first operand's dtype. A GPU tensor, a strided view, an f64 `b`
+    next to an f32 `a`, or a 3-D/f64 matmul operand came out as the wrong
+    numbers, and a K mismatch read past the end of `b`.
+  - **Now:** each fast path requires what it reads: contiguous host tensors
+    of one dtype and one shape, or 2-D f32 with matching K and bias.
+    Everything else runs the same chain through the ordinary ops, which
+    broadcast, dispatch to the GPU and check dtypes, and the result is
+    identical to the unfused computation.
+  - **f64 fused loops compute in f64.** They used to narrow each element to
+    f32 and widen it back.
+  - **In-place arms guard their dtype.** The CPU FBIP in-place arms (exp,
+    log, sqrt, abs, sign, clamp, relu, gelu, silu, sigmoid, tanh, neg) now
+    check the dtype they write, so a non-float buffer can never be
+    overwritten with 8-byte f64 elements. They are unreachable today
+    (`can_mutate_inplace()` is `false`), so this closes the hazard before
+    FBIP is re-enabled.
+
 - Calibration and quantization requests that were accepted and never
   honoured are refused at `nsl check` (first slice of "turn ignored
   calibration requests into implemented behavior or refusal"). The checks

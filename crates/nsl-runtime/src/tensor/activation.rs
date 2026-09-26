@@ -41,7 +41,9 @@ pub extern "C" fn nsl_tensor_exp(tensor_ptr: i64) -> i64 {
     // FBIP: mutate in-place when uniquely owned (CPU)
     {
         let t = NslTensor::from_ptr(tensor_ptr);
-        if t.can_mutate_inplace() {
+        // The in-place loops below write f32 or f64 elements; any other
+        // dtype takes the allocating path, whose typed accessors refuse it.
+        if t.can_mutate_inplace() && matches!(t.dtype, super::DTYPE_F32 | super::DTYPE_F64) {
             let len = t.len as usize;
             if t.dtype == 1 {
                 let d = t.data as *mut f32;
@@ -135,7 +137,9 @@ pub extern "C" fn nsl_tensor_log(tensor_ptr: i64) -> i64 {
     // FBIP: mutate in-place when uniquely owned (CPU)
     {
         let t = NslTensor::from_ptr(tensor_ptr);
-        if t.can_mutate_inplace() {
+        // The in-place loops below write f32 or f64 elements; any other
+        // dtype takes the allocating path, whose typed accessors refuse it.
+        if t.can_mutate_inplace() && matches!(t.dtype, super::DTYPE_F32 | super::DTYPE_F64) {
             let len = t.len as usize;
             if t.dtype == 1 {
                 let d = t.data as *mut f32;
@@ -229,7 +233,9 @@ pub extern "C" fn nsl_tensor_sqrt(tensor_ptr: i64) -> i64 {
     // FBIP: mutate in-place when uniquely owned (CPU)
     {
         let t = NslTensor::from_ptr(tensor_ptr);
-        if t.can_mutate_inplace() {
+        // The in-place loops below write f32 or f64 elements; any other
+        // dtype takes the allocating path, whose typed accessors refuse it.
+        if t.can_mutate_inplace() && matches!(t.dtype, super::DTYPE_F32 | super::DTYPE_F64) {
             let len = t.len as usize;
             if t.dtype == 1 {
                 let d = t.data as *mut f32;
@@ -323,7 +329,9 @@ pub extern "C" fn nsl_tensor_abs(tensor_ptr: i64) -> i64 {
     // FBIP: mutate in-place when uniquely owned (CPU)
     {
         let t = NslTensor::from_ptr(tensor_ptr);
-        if t.can_mutate_inplace() {
+        // The in-place loops below write f32 or f64 elements; any other
+        // dtype takes the allocating path, whose typed accessors refuse it.
+        if t.can_mutate_inplace() && matches!(t.dtype, super::DTYPE_F32 | super::DTYPE_F64) {
             let len = t.len as usize;
             if t.dtype == 1 {
                 let d = t.data as *mut f32;
@@ -403,7 +411,9 @@ pub extern "C" fn nsl_tensor_sign(tensor_ptr: i64) -> i64 {
     // FBIP: mutate in-place when uniquely owned (CPU)
     {
         let t = NslTensor::from_ptr(tensor_ptr);
-        if t.can_mutate_inplace() {
+        // The in-place loops below write f32 or f64 elements; any other
+        // dtype takes the allocating path, whose typed accessors refuse it.
+        if t.can_mutate_inplace() && matches!(t.dtype, super::DTYPE_F32 | super::DTYPE_F64) {
             let len = t.len as usize;
             if t.dtype == 1 {
                 let d = t.data as *mut f32;
@@ -498,7 +508,7 @@ pub extern "C" fn nsl_tensor_clamp(tensor_ptr: i64, min_val: f64, max_val: f64) 
     // FBIP: mutate in-place when uniquely owned (skip for i32 — needs dtype conversion)
     {
         let t = NslTensor::from_ptr(tensor_ptr);
-        if t.dtype != super::DTYPE_I32 && t.can_mutate_inplace() {
+        if t.can_mutate_inplace() && matches!(t.dtype, super::DTYPE_F32 | super::DTYPE_F64) {
             let len = t.len as usize;
             if t.dtype == 1 {
                 let d = t.data as *mut f32;
@@ -655,7 +665,9 @@ pub extern "C" fn nsl_tensor_relu(tensor_ptr: i64) -> i64 {
     // FBIP: mutate in-place when uniquely owned (CPU)
     {
         let t = NslTensor::from_ptr(tensor_ptr);
-        if t.can_mutate_inplace() {
+        // The in-place loops below write f32 or f64 elements; any other
+        // dtype takes the allocating path, whose typed accessors refuse it.
+        if t.can_mutate_inplace() && matches!(t.dtype, super::DTYPE_F32 | super::DTYPE_F64) {
             let len = t.len as usize;
             if t.dtype == 1 {
                 let d = t.data as *mut f32;
@@ -757,7 +769,9 @@ pub extern "C" fn nsl_tensor_gelu(tensor_ptr: i64) -> i64 {
     // FBIP: mutate in-place when uniquely owned
     {
         let t = NslTensor::from_ptr(tensor_ptr);
-        if t.can_mutate_inplace() {
+        // The in-place loops below write f32 or f64 elements; any other
+        // dtype takes the allocating path, whose typed accessors refuse it.
+        if t.can_mutate_inplace() && matches!(t.dtype, super::DTYPE_F32 | super::DTYPE_F64) {
             let len = t.len as usize;
             if t.dtype == 1 {
                 let d = t.data as *mut f32;
@@ -861,7 +875,9 @@ pub extern "C" fn nsl_tensor_silu(tensor_ptr: i64) -> i64 {
     // FBIP: mutate in-place when uniquely owned
     {
         let t = NslTensor::from_ptr(tensor_ptr);
-        if t.can_mutate_inplace() {
+        // The in-place loops below write f32 or f64 elements; any other
+        // dtype takes the allocating path, whose typed accessors refuse it.
+        if t.can_mutate_inplace() && matches!(t.dtype, super::DTYPE_F32 | super::DTYPE_F64) {
             let len = t.len as usize;
             if t.dtype == 1 {
                 let d = t.data as *mut f32;
@@ -1523,7 +1539,9 @@ pub extern "C" fn nsl_tensor_sigmoid(tensor_ptr: i64) -> i64 {
     // FBIP: mutate in-place when uniquely owned (CPU)
     {
         let t = NslTensor::from_ptr(tensor_ptr);
-        if t.can_mutate_inplace() {
+        // The in-place loops below write f32 or f64 elements; any other
+        // dtype takes the allocating path, whose typed accessors refuse it.
+        if t.can_mutate_inplace() && matches!(t.dtype, super::DTYPE_F32 | super::DTYPE_F64) {
             let len = t.len as usize;
             if t.dtype == 1 {
                 let d = t.data as *mut f32;
@@ -1625,7 +1643,9 @@ pub extern "C" fn nsl_tensor_tanh_act(tensor_ptr: i64) -> i64 {
     // FBIP: mutate in-place when uniquely owned (CPU)
     {
         let t = NslTensor::from_ptr(tensor_ptr);
-        if t.can_mutate_inplace() {
+        // The in-place loops below write f32 or f64 elements; any other
+        // dtype takes the allocating path, whose typed accessors refuse it.
+        if t.can_mutate_inplace() && matches!(t.dtype, super::DTYPE_F32 | super::DTYPE_F64) {
             let len = t.len as usize;
             if t.dtype == 1 {
                 let d = t.data as *mut f32;
