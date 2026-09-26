@@ -13,8 +13,9 @@
 //! times `ln 2`, the sigmoid family through `ex2.approx` and `rcp.approx`,
 //! `sqrt` IEEE-rounded. GELU is the sigmoid approximation `x·σ(k·x)` with
 //! `k` = [`GELU_SLOPE`], the slope `nsl_gelu_backward_srcad_f32`
-//! differentiates with. `nsl_tanh_f32` stays hand-written: it divides with
-//! `div.approx.f32`.
+//! differentiates with. `nsl_tanh_f32` is built on its own ([`build_tanh`]),
+//! as is the tape-AD GELU adjoint ([`build_gelu_backward`]). Both divide
+//! with `div.approx.f32` and saturate at [`TANH_SATURATION`].
 //!
 //! The scalar-operand family, `nsl_{mul,add,sub}_scalar_f32`
 //! (`c[i] = a[i] op s`, `s` an `.f32` parameter), is the binary kernels with
@@ -566,7 +567,7 @@ pub fn unary_ptx(op: UnaryOp) -> Vec<u8> {
 /// operation is explicitly rounded (`MulRn`/`AddRn`/`SubRn`); their sigmoid
 /// stays bare, as in `nsl_sigmoid_f32`, since `ex2.approx`/`rcp.approx`
 /// leave no contractible pair. `nsl_gelu_backward_f32` (the tape-AD tanh
-/// approximation) stays hand-written: it divides with `div.approx.f32`.
+/// approximation) is [`build_gelu_backward`].
 /// `nsl_clamp_backward_f32` follows once the interpreter its gate runs on
 /// models `and.pred`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -854,6 +855,163 @@ pub fn clamp_backward_ptx() -> Vec<u8> {
     verified_ptx(build_clamp_backward())
 }
 
+/// The tanh forward's entry name.
+pub const TANH_NAME: &str = "nsl_tanh_f32";
+
+/// The tape-AD GELU adjoint's entry name.
+pub const GELU_BACKWARD_NAME: &str = "nsl_gelu_backward_f32";
+
+/// Where the kernels' tanh saturates: 43.5, `0f422E0000`.
+///
+/// `tanh(v)` is computed as `(e − 1) / (e + 1)` with `e = 2^(2v·log2 e)`,
+/// and the quotient is `div.approx.f32`. That instruction returns 0 for a
+/// divisor whose magnitude is in `(2^126, 2^128)`, and NaN for `∞ / ∞`. The
+/// hand kernels hit both. `nsl_tanh_f32` clamped at 44, where `e + 1` is
+/// about `2^126.96`, so it returned 0 for every `x` from about 43.67 up,
+/// NaN and `+∞` included. `nsl_gelu_backward_f32` did not clamp, so it
+/// returned garbage and then NaN once `k(x)` passed the same point (`x`
+/// about 10). At `|v| ≤ 43.5` the divisor stays below `2^125.6`.
+pub const TANH_SATURATION: u32 = 0x422E_0000;
+
+/// The GELU tanh-approximation constants the hand adjoint used:
+/// `k = 0.0356774·x³ + 0.797885·x` and `k' = 0.107032·x² + 0.797885`.
+const GELU_TANH_CUBIC: u32 = 0x3D12_4925;
+const GELU_TANH_LINEAR: u32 = 0x3F4C_422A;
+const GELU_TANH_SLOPE_SQUARE: u32 = 0x3DD8_ECA1;
+
+/// `(e − 1) / (e + 1)`, `e = 2^(2v·log2 e)`, in the hand kernels' order: the
+/// doubling, the pre-scale, `ex2.approx`, then the denominator, the
+/// numerator, and `div.approx.f32`. Every step is bare, as in the hand
+/// kernels; none is a multiply feeding an add, so none contracts.
+fn tanh_of(b: &mut KirBuilder, v: VarId) -> VarId {
+    let twice = f32_op2(b, KirOp::Add, v, v);
+    let log2e = f32_const(b, LOG2_E);
+    let scaled = f32_op2(b, KirOp::Mul, twice, log2e);
+    let e = f32_op1(b, KirOp::Exp2, scaled);
+    let one = f32_const(b, 1.0f32.to_bits());
+    let den = f32_op2(b, KirOp::Add, e, one);
+    let one = f32_const(b, 1.0f32.to_bits());
+    let num = f32_op2(b, KirOp::Sub, e, one);
+    f32_op2(b, KirOp::DivApprox, num, den)
+}
+
+/// `nsl_tanh_f32(a, c, n)`: `c[i] = tanh(a[i])`.
+///
+/// The hand kernel's instruction sequence with the clamp moved from 44 to
+/// [`TANH_SATURATION`], so the quotient never meets `div.approx.f32`'s
+/// flush range. Past the clamp the result is `tanh(±43.5)`, which is ±1 in
+/// f32. A NaN input is returned as it is. `min.f32`/`max.f32` return the
+/// non-NaN operand, so the clamp alone would turn a NaN into `tanh(43.5)`
+/// (the hand kernel turned it into 0). An ordered `setp.eq` of the input
+/// with itself and a `selp` put the NaN back. For `|x| ≤ 43.5` the result
+/// is the hand kernel's bit for bit.
+pub fn build_tanh() -> KernelIR {
+    use AddressSpace::Global;
+    let mut b = KirBuilder::new(TANH_NAME);
+    let a = b.add_param("a", f32_ptr(), Global);
+    let c = b.add_param("c", f32_ptr(), Global);
+    let n = b.add_param("n", KirType::U64, Global);
+    let (i, _, exit) = index_and_bound(&mut b, n);
+
+    let x = load_f32(&mut b, a, i);
+    let hi = f32_const(&mut b, TANH_SATURATION);
+    let v = f32_op2(&mut b, KirOp::Min, x, hi);
+    let lo = f32_const(&mut b, TANH_SATURATION | 0x8000_0000);
+    let v = f32_op2(&mut b, KirOp::Max, v, lo);
+    let t = tanh_of(&mut b, v);
+    let ordered = b.new_typed_var(KirType::Bool);
+    b.emit(KirOp::Cmp(ordered, x, x, CmpOp::Eq));
+    let y = b.new_typed_var(KirType::F32);
+    b.emit(KirOp::Select(y, ordered, t, x));
+    store_f32(&mut b, c, i, y);
+    finish(b, exit)
+}
+
+/// [`build_tanh`] lowered to a NUL-terminated PTX module.
+///
+/// # Panics
+///
+/// If the built kernel fails verification: a bug in this module.
+pub fn tanh_ptx() -> Vec<u8> {
+    verified_ptx(build_tanh())
+}
+
+/// `nsl_gelu_backward_f32(grad, input, out, n)`: the tape-AD adjoint of the
+/// GELU tanh approximation.
+///
+/// `k = 0.0356774·x³ + 0.797885·x`, `t = tanh(k)`, and
+/// `d = 0.5·(1 + t + x·(1 − t²)·(0.107032·x² + 0.797885))`. `out = grad·d`.
+///
+/// The arithmetic is the hand kernel's, bare. ptxas contracts it as it did
+/// (`0.797885·x` into the `k` sum, `t·t` into `1 − t²`, and so on). Past
+/// [`TANH_SATURATION`] in `k` the hand kernel's tanh fell into
+/// `div.approx.f32`'s flush range. Even a correct `t` there would leave
+/// `1 − t²` as rounding noise multiplied by a large `x·(…)`. So two selects
+/// on `k` replace the derivative with its limit: 1 above, 0 below. A NaN
+/// `k` passes through both, and `x` carries its NaN into `d`. For
+/// `|k| ≤ 43.5` the result is the hand kernel's bit for bit.
+pub fn build_gelu_backward() -> KernelIR {
+    use AddressSpace::Global;
+    let mut b = KirBuilder::new(GELU_BACKWARD_NAME);
+    let grad = b.add_param("grad", f32_ptr(), Global);
+    let input = b.add_param("input", f32_ptr(), Global);
+    let out = b.add_param("out", f32_ptr(), Global);
+    let n = b.add_param("n", KirType::U64, Global);
+    let (i, _, exit) = index_and_bound(&mut b, n);
+
+    let g = load_f32(&mut b, grad, i);
+    let x = load_f32(&mut b, input, i);
+    let x2 = f32_op2(&mut b, KirOp::Mul, x, x);
+    let x3 = f32_op2(&mut b, KirOp::Mul, x2, x);
+    let cubic = f32_const(&mut b, GELU_TANH_CUBIC);
+    let kc = f32_op2(&mut b, KirOp::Mul, x3, cubic);
+    let linear = f32_const(&mut b, GELU_TANH_LINEAR);
+    let kl = f32_op2(&mut b, KirOp::Mul, x, linear);
+    let k = f32_op2(&mut b, KirOp::Add, kc, kl);
+    let t = tanh_of(&mut b, k);
+    let tt = f32_op2(&mut b, KirOp::Mul, t, t);
+    let one = f32_const(&mut b, 1.0f32.to_bits());
+    let sech2 = f32_op2(&mut b, KirOp::Sub, one, tt);
+    let p = f32_op2(&mut b, KirOp::Mul, x, x);
+    let slope_sq = f32_const(&mut b, GELU_TANH_SLOPE_SQUARE);
+    let p = f32_op2(&mut b, KirOp::Mul, p, slope_sq);
+    let linear = f32_const(&mut b, GELU_TANH_LINEAR);
+    let p = f32_op2(&mut b, KirOp::Add, p, linear);
+    let p = f32_op2(&mut b, KirOp::Mul, x, p);
+    let p = f32_op2(&mut b, KirOp::Mul, sech2, p);
+    let p = f32_op2(&mut b, KirOp::Add, t, p);
+    let one = f32_const(&mut b, 1.0f32.to_bits());
+    let p = f32_op2(&mut b, KirOp::Add, one, p);
+    let half = f32_const(&mut b, 0.5f32.to_bits());
+    let d = f32_op2(&mut b, KirOp::Mul, half, p);
+
+    let sat = f32_const(&mut b, TANH_SATURATION);
+    let above = b.new_typed_var(KirType::Bool);
+    b.emit(KirOp::Cmp(above, k, sat, CmpOp::Gt));
+    let one = f32_const(&mut b, 1.0f32.to_bits());
+    let d_hi = b.new_typed_var(KirType::F32);
+    b.emit(KirOp::Select(d_hi, above, one, d));
+    let neg_sat = f32_const(&mut b, TANH_SATURATION | 0x8000_0000);
+    let below = b.new_typed_var(KirType::Bool);
+    b.emit(KirOp::Cmp(below, k, neg_sat, CmpOp::Lt));
+    let zero = f32_const(&mut b, 0);
+    let d = b.new_typed_var(KirType::F32);
+    b.emit(KirOp::Select(d, below, zero, d_hi));
+
+    let y = f32_op2(&mut b, KirOp::Mul, g, d);
+    store_f32(&mut b, out, i, y);
+    finish(b, exit)
+}
+
+/// [`build_gelu_backward`] lowered to a NUL-terminated PTX module.
+///
+/// # Panics
+///
+/// If the built kernel fails verification: a bug in this module.
+pub fn gelu_backward_ptx() -> Vec<u8> {
+    verified_ptx(build_gelu_backward())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1057,6 +1215,28 @@ mod tests {
             let t = text(op);
             assert!(!t.contains("div.") && !t.contains("fma."), "{op:?}");
         }
+    }
+
+    #[test]
+    fn the_tanh_kernels_verify_keep_their_signatures_and_saturate() {
+        for (ir, name, params) in [
+            (build_tanh(), TANH_NAME, &["a", "c", "n"][..]),
+            (build_gelu_backward(), GELU_BACKWARD_NAME, &["grad", "input", "out", "n"][..]),
+        ] {
+            verify(&ir).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            assert_eq!(ir.name, name);
+            let names: Vec<&str> = ir.params.iter().map(|p| p.name.as_str()).collect();
+            assert_eq!(names, params, "{name}");
+        }
+        let text = |ptx: Vec<u8>| String::from_utf8(ptx).unwrap();
+        let (t, g) = (text(tanh_ptx()), text(gelu_backward_ptx()));
+        for (name, p) in [(TANH_NAME, &t), (GELU_BACKWARD_NAME, &g)] {
+            assert_eq!(p.matches("div.approx.f32 ").count(), 1, "{name}");
+            assert!(p.contains(&format!("0f{TANH_SATURATION:08X}")), "{name}");
+        }
+        // 2·43.5·log2(e) < 126: the divisor stays out of `div.approx`'s
+        // flush range.
+        assert!(2.0 * f32::from_bits(TANH_SATURATION) * f32::from_bits(LOG2_E) < 126.0);
     }
 
     /// NUL-terminated ASCII at the ISA floor, with the arithmetic in the
