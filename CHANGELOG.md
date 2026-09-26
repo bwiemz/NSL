@@ -8,6 +8,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- The CSHA reference backward's finite-difference gradcheck
+  (`csha_reference_backward_finite_difference_gradcheck`) is exhaustive
+  (roadmap tolerance audit, fourth slice). Every CSHA GPU backward test
+  trusts `csha_reference_backward` as its oracle.
+  - **The old test** probed 4 entries each of dx, dwq and dwk (never dwv)
+    at an absolute 1e-2. It used one head, Adjacent RoPE, unit norm weights
+    and `dO = ones`.
+  - **It passed with three backward bugs:** Adjacent pairing under
+    HalfSplit, packed rows rotated by their absolute position, and the norm
+    weight dropped from the RMSNorm backward.
+  - **The new test** perturbs every entry of x, wq, wk and wv, with an f64
+    loss. It uses two heads, non-uniform norm weights and a random `dO`, in
+    four configs: Adjacent; causal HalfSplit; RoPE off; and packed causal.
+  - **Tolerance.** It asserts 2e-3 of each tensor's largest gradient; the
+    worst measured is 2.7e-4.
+  - **Mutants.** It fails all nine named mutants of the reference backward.
+
 - Nine activation-backward kernels are built by
   `nsl_kir::kernels::elementwise` (`BackwardOp`) in place of their
   hand-written constants (roadmap A2 step 11, eighth slice). They are the
