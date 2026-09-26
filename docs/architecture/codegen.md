@@ -1159,7 +1159,12 @@ review. See `docs/wiki/GPU-Test-Harness.md` and `docs/wiki/Testing-Strategy.md`.
    contracts into an `fma`; the bare `Add`/`Sub`/`Mul` leave ptxas free to
    fuse. `KirOp::DivApprox` is `div.approx.f32` (f32 only), for a kernel
    that must reproduce an existing `div.approx` quotient; `Div` is the IEEE
-   `div.rn`.
+   `div.rn`. `KirOp::Bitcast` keeps the bits between same-width scalars
+   (`mov.b32` / `mov.b64`, e.g. an f32 and its IEEE pattern), where `Cast`
+   converts the value. `KirType::U16` holds raw 16-bit storage bits (bf16
+   and the like) in a 32-bit register: `.u16` loads and stores, and
+   `cvt.u32.u16` / `cvt.u16.u32` to widen and narrow. The Metal, WGSL and
+   AMDGPU printers lower neither `Cast` nor `Bitcast` yet.
 2. Lower with `backend_ptx::lower_kir_to_ptx` at the launch site and embed
    the bytes the way `Compiler::compile_kernels` does (`declare_data` /
    `define_data`, `src/compiler/kernel.rs`); launch through the existing

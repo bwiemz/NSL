@@ -930,6 +930,27 @@ frozen throughout, so nothing here blocks a kernel fix.
       sequence identical on sm_80, and registers are 20/20/20 against
       24/24/21; the rest of the difference is address arithmetic
       (`IMAD.WIDE` for shift and add).
+    - **SR-BF16, and the ops it needed.** Two additions to KIR:
+      - `KirType::U16`: raw 16-bit bits in a `%r` register, loaded and
+        stored as `.u16` and widened with `cvt.u32.u16`. PTX lets
+        `ld`/`st`/`cvt` take a wider register.
+      - `KirOp::Bitcast`: `mov.b32` / `mov.b64` between same-width
+        scalars. The verifier's `BitcastWidth` refuses anything else.
+      - With them, `nsl_sr_bf16_round_probe` and
+        `nsl_fase_fused_adamw_step_bf16sr` moved (`optim.rs`). They share
+        one tail, `sr_bf16_bits`: the splitmix64 dither on `u64`, then the
+        saturate, ∞ and quiet-NaN paths, joined by a block parameter. The
+        f32 single and multi steps now share their AdamW body with it,
+        with byte-identical PTX.
+      - **The gate,** `sr_bf16_kir_equivalence`, requires the hand
+        kernels' bytes and the host's `sr_bf16` reference bit for bit.
+        Crafted inputs reach the saturating carry. It kills mutants of
+        every hash constant, shift, mask and special value.
+      - **SASS:** the step issues the hand kernel's floating-point
+        instructions (16/16/18 registers against 18/18/18), and the probe
+        keeps the hand kernel's registers.
+      - **Still hand-written:** the multi-tensor
+        `nsl_fase_fused_adamw_multi_bf16sr`, next.
 12. **FA v2**, by phase directory, tier B.1 and B.2 last; the SASS
     baselines and the two no-spill gates already exist here and are the
     proof. `matmul_mma.rs` and `kernel_skeleton/` are deleted with their

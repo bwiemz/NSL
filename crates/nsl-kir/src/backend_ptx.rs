@@ -594,6 +594,12 @@ fn emit_op(ptx: &mut String, op: &KirOp, ir: &KernelIR) {
         KirOp::Cast(dst, src, target_ty) => {
             emit_cvt(ptx, ir, *dst, *src, target_ty, None);
         }
+        KirOp::Bitcast(dst, src) => {
+            // The verifier holds both sides to one width (32 or 64 bits).
+            let bits = ir.var_types.get(dst).map_or(4, KirType::size_bytes) * 8;
+            let (dp, sp) = (var_reg_prefix(ir, *dst, *dst), var_reg_prefix(ir, *src, *src));
+            writeln!(ptx, "    mov.b{bits} {dp}{dst}, {sp}{src};").unwrap();
+        }
         KirOp::CastRounded { dst, src, ty, mode } => {
             emit_cvt(ptx, ir, *dst, *src, ty, Some(*mode));
         }
@@ -2501,6 +2507,51 @@ mod tests {
         let al = crate::regalloc::allocate(&ir);
         assert!(ptx.contains(&format!("div.approx.f32 {}, {}, {};", al.name(q), al.name(x), al.name(x))), "{ptx}");
         assert!(ptx.contains(&format!("div.rn.f32 {}, {}, {};", al.name(r), al.name(q), al.name(x))), "{ptx}");
+    }
+
+    /// `Bitcast` keeps the bits: `mov.b32` between `F32` and `U32`, `mov.b64`
+    /// between `F64` and `U64`. A `U16` loads and stores as `.u16` through a
+    /// 32-bit `%r` register and widens with `cvt.u32.u16`.
+    #[test]
+    fn bitcast_and_u16_spell_the_bf16_bit_path() {
+        let mut b = KirBuilder::new("bits");
+        let p = b.add_param("p", KirType::Ptr(Box::new(KirType::U16), AddressSpace::Global), AddressSpace::Global);
+        let entry = b.new_block();
+        b.set_block(entry);
+        let h = b.new_typed_var(KirType::U16);
+        b.emit(KirOp::Load(h, p, AddressSpace::Global));
+        let w = b.new_typed_var(KirType::U32);
+        b.emit(KirOp::Cast(w, h, KirType::U32));
+        let f = b.new_typed_var(KirType::F32);
+        b.emit(KirOp::Bitcast(f, w));
+        let back = b.new_typed_var(KirType::U32);
+        b.emit(KirOp::Bitcast(back, f));
+        let d = b.new_typed_var(KirType::F64);
+        b.emit(KirOp::Const(d, KirConst { ty: KirType::F64, value: ConstValue::F64(2.0) }));
+        let dbits = b.new_typed_var(KirType::U64);
+        b.emit(KirOp::Bitcast(dbits, d));
+        let narrow = b.new_typed_var(KirType::U16);
+        b.emit(KirOp::Cast(narrow, back, KirType::U16));
+        b.emit(KirOp::Store(p, narrow, AddressSpace::Global));
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+        crate::kir_verify::verify(&ir).expect("verifies");
+        let ptx = String::from_utf8(lower_kir_to_ptx(&ir)).unwrap();
+        let al = crate::regalloc::allocate(&ir);
+        let n = |v| al.name(v);
+        for want in [
+            format!("ld.global.u16 {}, [", n(h)),
+            format!("cvt.u32.u16 {}, {};", n(w), n(h)),
+            format!("mov.b32 {}, {};", n(f), n(w)),
+            format!("mov.b32 {}, {};", n(back), n(f)),
+            format!("mov.b64 {}, {};", n(dbits), n(d)),
+            format!("cvt.u16.u32 {}, {};", n(narrow), n(back)),
+            format!("], {};", n(narrow)),
+        ] {
+            assert!(ptx.contains(&want), "{want}\n{ptx}");
+        }
+        assert!(n(h).starts_with("%r") && n(f).starts_with("%f") && n(dbits).starts_with("%rd"), "{ptx}");
+        assert!(ptx.contains("st.global.u16 ["), "{ptx}");
     }
 
     /// Every register a kernel READS must be one the kernel DEFINES.
