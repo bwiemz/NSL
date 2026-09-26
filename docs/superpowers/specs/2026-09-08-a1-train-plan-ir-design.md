@@ -240,6 +240,11 @@ becomes `if let Some(csla) = &plan.techniques.csla`.
    `mode_table_base` becomes a `params.roles` read (the emitter keeps the
    handle); `plan_ccr`'s `sched` moves into `PassCtx`. After this, no
    planning module names a `Value`, which the `grep` gate enforces.
+   *Status:* the handle half is done. `plan_wggo` takes
+   `mode_table_emitted: bool`, and `tests/train_plan_handle_free.rs` is the
+   gate over `plan*.rs`, `csla_precompute`, `adjoint_tape_opt` and
+   `ccr_adjoint_frees`. `plan_ccr`'s `sched` is a `PassScheduler`, not a
+   Cranelift handle; it moves with `PassCtx` in step 4.
 3. **`EmitState`.** Collect the runtime handles and loop variables the setup
    emitters produce into one struct; the late emitters take it by `&mut`.
    The 30-field `OptimizerStepInputs` / `CslaWindowInputs` become
