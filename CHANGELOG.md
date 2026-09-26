@@ -8,6 +8,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **`nsl_div_f32` and `nsl_div_scalar_f32` are built by
+  `nsl_kir::kernels::elementwise` in place of their hand-written constants**
+  (new-roadmap item 5), as `BinaryOp::Div` and `ScalarOp::Div`, lowered to
+  `KirOp::DivApprox`. The approximate division is kept on purpose: the fused
+  kernels held bit-exact to decomposed chains divide the way these do.
+  - **The gates.** The hand modules are frozen beside their families'
+    (`elementwise_binary_hand.rs`, `elementwise_scalar_hand.rs`), and
+    `elementwise_binary_kir_equivalence` / `elementwise_scalar_kir_equivalence`
+    now cover the divisions: identical global memory under two schedules,
+    in and out of place, IEEE-corner inputs and scalars; `div.approx`
+    pinned in both modules with `div.approx` → `div.rn` a named equivalent
+    mutant; swapped operands and a neighbour's operation caught.
+  - **SASS** on sm_80/90/120: the same instruction count and
+    floating-point multiset; registers within two of the hand kernels'.
 - **`nsl_fase_fused_adamw_step_f32` is built by
   `nsl_kir::kernels::optim` in place of its hand-written constant**
   (new-roadmap item 5). This is the fused FASE-Deferred AdamW/Adam step,

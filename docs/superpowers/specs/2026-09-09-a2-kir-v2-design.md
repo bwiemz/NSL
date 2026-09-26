@@ -900,6 +900,16 @@ frozen throughout, so nothing here blocks a kernel fix.
       for their `div.approx`: `nsl_div_f32`, `nsl_div_scalar_f32`,
       `nsl_tanh_f32`, `nsl_gelu_backward_f32`, and the three other FASE
       AdamW variants.
+    - **The two divisions:** `nsl_div_f32` and `nsl_div_scalar_f32` join
+      the binary and scalar-operand families as `BinaryOp::Div` /
+      `ScalarOp::Div`, lowered to `DivApprox`. Their frozen hand modules
+      join `elementwise_binary_hand.rs` / `elementwise_scalar_hand.rs`, and
+      the two family gates now pin `div.approx` against them, name
+      `div.approx` → `div.rn` as an equivalent mutant, and catch the
+      swapped operands and a neighbour's operation. SASS: the same
+      instruction count and floating-point multiset on sm_80/90/120; the
+      scalar kernel's sm_80 schedule moves one `FMUL` of the reciprocal
+      expansion, and registers are up to two above the hand kernels'.
     - **The kernel:** `nsl_fase_fused_adamw_step_f32` moves to
       `nsl_kir::kernels::optim`. It keeps the hand kernel's rounding (every
       arithmetic op `.rn`, then `sqrt.rn` and `div.approx`) and its

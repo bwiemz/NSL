@@ -1,9 +1,10 @@
 //! The differential equivalence gate for the scalar-operand elementwise
 //! kernels `nsl_mul_scalar_f32`, `nsl_add_scalar_f32` and
-//! `nsl_sub_scalar_f32` (roadmap A2 step 11).
+//! `nsl_sub_scalar_f32` (roadmap A2 step 11), and `nsl_div_scalar_f32`
+//! (new-roadmap item 5, once KIR gained `div.approx`).
 //!
 //! The runtime carried them as hand-written PTX
-//! (`nsl_runtime::cuda::kernels::{MUL,ADD,SUB}_SCALAR_F32_PTX`); they are now
+//! (`nsl_runtime::cuda::kernels::{MUL,ADD,SUB,DIV}_SCALAR_F32_PTX`); they are now
 //! built as KIR by `nsl_kir::kernels::elementwise`. This file runs the frozen
 //! hand modules (`tests/fixtures/elementwise_scalar_hand.rs`) and the KIR ones
 //! side by side on the cooperative-CTA interpreter
@@ -16,9 +17,11 @@
 //!    (`c` aliasing `a`), for scalars across the IEEE corners.
 //! 2. **Correctness**: `c[i]` is the IEEE f32 `a[i] op s` for every `i < n`,
 //!    and nothing past `n` is written.
-//! 3. **The gate bites**: relaxing the bound, nudging the element size,
-//!    swapping the operands of the subtraction, or reading the index from
-//!    block 0 is caught.
+//! 3. **The spelling**: the interpreter models `div.approx.f32` as the IEEE
+//!    quotient, so the division's mnemonic is pinned against the hand module.
+//! 4. **The gate bites**: relaxing the bound, nudging the element size,
+//!    swapping the operands of the subtraction or the division, or reading
+//!    the index from block 0 is caught.
 
 use std::collections::HashMap;
 
@@ -67,6 +70,7 @@ fn hand_ptx(op: ScalarOp) -> String {
         ScalarOp::Mul => hand::MUL_SCALAR_F32_PTX,
         ScalarOp::Add => hand::ADD_SCALAR_F32_PTX,
         ScalarOp::Sub => hand::SUB_SCALAR_F32_PTX,
+        ScalarOp::Div => hand::DIV_SCALAR_F32_PTX,
     }
     .trim_end_matches('\0')
     .to_string()
@@ -77,6 +81,8 @@ fn apply(op: ScalarOp, x: f32, s: f32) -> f32 {
         ScalarOp::Mul => x * s,
         ScalarOp::Add => x + s,
         ScalarOp::Sub => x - s,
+        // The interpreter's `div.approx` is the IEEE quotient.
+        ScalarOp::Div => x / s,
     }
 }
 
@@ -282,22 +288,38 @@ fn nudging_the_element_size_is_caught() {
     }
 }
 
+/// `p` with the source operands of every `mnemonic` line swapped.
+fn swap_operands(p: &str, mnemonic: &str) -> String {
+    p.lines()
+        .map(|l| match l.trim_start().strip_prefix(mnemonic) {
+            Some(ops) => {
+                let v: Vec<&str> = ops.trim_end_matches(';').split(", ").collect();
+                format!("    {mnemonic}{}, {}, {};", v[0], v[2], v[1])
+            }
+            None => l.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
+}
+
 #[test]
-fn swapping_the_operands_of_the_subtraction_is_caught() {
-    let swap = |p: &str| {
-        p.lines()
-            .map(|l| match l.trim_start().strip_prefix("sub.f32 ") {
-                Some(ops) => {
-                    let v: Vec<&str> = ops.trim_end_matches(';').split(", ").collect();
-                    format!("    sub.f32 {}, {}, {};", v[0], v[2], v[1])
-                }
-                None => l.to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n"
-    };
-    assert!(caught(ScalarOp::Sub, swap));
+fn swapping_the_operands_of_the_subtraction_or_the_division_is_caught() {
+    assert!(caught(ScalarOp::Sub, |p| swap_operands(p, "sub.f32 ")));
+    assert!(caught(ScalarOp::Div, |p| swap_operands(p, "div.approx.f32 ")));
+}
+
+/// The division is `div.approx.f32` in both modules, once, never the IEEE
+/// `div.rn.f32`; the interpreter cannot tell the two apart, so the spelling
+/// is pinned and `div.approx` → `div.rn` is a named equivalent mutant.
+#[test]
+fn the_division_is_spelled_div_approx_as_in_the_hand_kernel() {
+    let (h, k) = (hand_ptx(ScalarOp::Div), kir_ptx(ScalarOp::Div));
+    for p in [&h, &k] {
+        assert_eq!(p.matches("div.approx.f32 ").count(), 1);
+        assert!(!p.contains("div.rn") && !p.contains("div.full") && !p.contains("rcp."));
+    }
+    assert!(!caught(ScalarOp::Div, |p| p.replacen("div.approx.f32 ", "div.rn.f32 ", 1)), "a named equivalent mutant");
 }
 
 /// Each kernel's one arithmetic instruction, changed to another family
@@ -308,6 +330,7 @@ fn a_neighbours_operation_is_caught() {
         (ScalarOp::Mul, "mul.f32 ", "add.f32 "),
         (ScalarOp::Add, "add.f32 ", "sub.f32 "),
         (ScalarOp::Sub, "sub.f32 ", "add.f32 "),
+        (ScalarOp::Div, "div.approx.f32 ", "mul.f32 "),
     ] {
         assert_eq!(kir_ptx(op).matches(from).count(), 1, "{op:?}");
         assert!(caught(op, |p| p.replacen(from, to, 1)), "{op:?}: {from} -> {to}");

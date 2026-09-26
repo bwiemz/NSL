@@ -55,15 +55,20 @@ use crate::kernel_ir::{
 pub const ELEMENTWISE_BLOCK: u32 = 256;
 
 /// A binary arithmetic kernel, `c[i] = a[i] op b[i]`.
+///
+/// `Div` divides with `div.approx.f32` (`KirOp::DivApprox`), as the
+/// hand-written `nsl_div_f32` did: the decomposed kernels that the fused ones
+/// are held bit-exact to divide with it, so it is the runtime's f32 division.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOp {
     Add,
     Sub,
     Mul,
+    Div,
 }
 
 impl BinaryOp {
-    pub const ALL: [BinaryOp; 3] = [BinaryOp::Add, BinaryOp::Sub, BinaryOp::Mul];
+    pub const ALL: [BinaryOp; 4] = [BinaryOp::Add, BinaryOp::Sub, BinaryOp::Mul, BinaryOp::Div];
 
     /// The `.visible .entry` name. Pinned: the runtime launches by it.
     pub fn kernel_name(self) -> &'static str {
@@ -71,6 +76,7 @@ impl BinaryOp {
             BinaryOp::Add => "nsl_add_f32",
             BinaryOp::Sub => "nsl_sub_f32",
             BinaryOp::Mul => "nsl_mul_f32",
+            BinaryOp::Div => "nsl_div_f32",
         }
     }
 
@@ -79,6 +85,7 @@ impl BinaryOp {
             BinaryOp::Add => KirOp::Add,
             BinaryOp::Sub => KirOp::Sub,
             BinaryOp::Mul => KirOp::Mul,
+            BinaryOp::Div => KirOp::DivApprox,
         }
     }
 }
@@ -157,16 +164,18 @@ pub fn binary_ptx(op: BinaryOp) -> Vec<u8> {
 }
 
 /// A scalar-operand kernel, `c[i] = a[i] op s`, with signature
-/// `(a, c, s, n)`: `s` is an `.f32` parameter, the rest `.u64`.
+/// `(a, c, s, n)`: `s` is an `.f32` parameter, the rest `.u64`. `Div`
+/// divides with `div.approx.f32`, like [`BinaryOp::Div`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarOp {
     Mul,
     Add,
     Sub,
+    Div,
 }
 
 impl ScalarOp {
-    pub const ALL: [ScalarOp; 3] = [ScalarOp::Mul, ScalarOp::Add, ScalarOp::Sub];
+    pub const ALL: [ScalarOp; 4] = [ScalarOp::Mul, ScalarOp::Add, ScalarOp::Sub, ScalarOp::Div];
 
     /// The `.visible .entry` name. Pinned: the runtime launches by it.
     pub fn kernel_name(self) -> &'static str {
@@ -174,6 +183,7 @@ impl ScalarOp {
             ScalarOp::Mul => "nsl_mul_scalar_f32",
             ScalarOp::Add => "nsl_add_scalar_f32",
             ScalarOp::Sub => "nsl_sub_scalar_f32",
+            ScalarOp::Div => "nsl_div_scalar_f32",
         }
     }
 
@@ -182,6 +192,7 @@ impl ScalarOp {
             ScalarOp::Mul => KirOp::Mul,
             ScalarOp::Add => KirOp::Add,
             ScalarOp::Sub => KirOp::Sub,
+            ScalarOp::Div => KirOp::DivApprox,
         }
     }
 }
@@ -871,7 +882,7 @@ mod tests {
     #[test]
     fn the_signature_and_names_are_pinned() {
         let names: Vec<&str> = BinaryOp::ALL.iter().map(|o| o.kernel_name()).collect();
-        assert_eq!(names, ["nsl_add_f32", "nsl_sub_f32", "nsl_mul_f32"]);
+        assert_eq!(names, ["nsl_add_f32", "nsl_sub_f32", "nsl_mul_f32", "nsl_div_f32"]);
         for op in BinaryOp::ALL {
             let ir = build_binary(op);
             assert_eq!(ir.name, op.kernel_name());
@@ -930,8 +941,13 @@ mod tests {
     #[test]
     fn every_scalar_kernel_verifies_and_keeps_its_signature() {
         let names: Vec<&str> = ScalarOp::ALL.iter().map(|o| o.kernel_name()).collect();
-        assert_eq!(names, ["nsl_mul_scalar_f32", "nsl_add_scalar_f32", "nsl_sub_scalar_f32"]);
-        for (op, mnemonic) in [(ScalarOp::Mul, "mul.f32 "), (ScalarOp::Add, "add.f32 "), (ScalarOp::Sub, "sub.f32 ")] {
+        assert_eq!(names, ["nsl_mul_scalar_f32", "nsl_add_scalar_f32", "nsl_sub_scalar_f32", "nsl_div_scalar_f32"]);
+        for (op, mnemonic) in [
+            (ScalarOp::Mul, "mul.f32 "),
+            (ScalarOp::Add, "add.f32 "),
+            (ScalarOp::Sub, "sub.f32 "),
+            (ScalarOp::Div, "div.approx.f32 "),
+        ] {
             let ir = build_scalar(op);
             if let Err(errors) = verify(&ir) {
                 panic!("{op:?} failed verification: {errors:?}");
@@ -945,7 +961,8 @@ mod tests {
             assert!(bytes.is_ascii(), "{op:?}");
             let text = std::str::from_utf8(&bytes[..bytes.len() - 1]).unwrap();
             assert_eq!(text.matches(mnemonic).count(), 1, "{op:?}");
-            assert!(!text.contains("div."), "{op:?}");
+            assert!(!text.contains("div.rn") && !text.contains("fma"), "{op:?}");
+            assert_eq!(text.contains("div."), op == ScalarOp::Div, "{op:?}");
         }
     }
 
@@ -1064,7 +1081,12 @@ mod tests {
     /// no contraction partner here, so it rounds as the IEEE operation does.
     #[test]
     fn the_modules_are_nul_terminated_ascii_with_the_expected_op() {
-        for (op, mnemonic) in [(BinaryOp::Add, "add.f32 "), (BinaryOp::Sub, "sub.f32 "), (BinaryOp::Mul, "mul.f32 ")] {
+        for (op, mnemonic) in [
+            (BinaryOp::Add, "add.f32 "),
+            (BinaryOp::Sub, "sub.f32 "),
+            (BinaryOp::Mul, "mul.f32 "),
+            (BinaryOp::Div, "div.approx.f32 "),
+        ] {
             let bytes = binary_ptx(op);
             assert_eq!(bytes.last(), Some(&0), "{op:?}");
             assert!(!bytes[..bytes.len() - 1].contains(&0), "{op:?}");

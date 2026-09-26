@@ -400,14 +400,14 @@ pub extern "C" fn nsl_tensor_div(a: i64, b: i64, flags: u8) -> i64 {
             {
                 let tb = NslTensor::from_ptr_ref(b);
                 if relinq_a && ta.shape_eq(tb) && !autodiff::is_recording() {
-                    crate::cuda::gpu_elementwise_binary_inplace(a, b, crate::cuda::kernels::DIV_F32_PTX, "nsl_div_f32\0");
+                    crate::cuda::gpu_elementwise_binary_inplace(a, b, crate::cuda::kernels::div_f32_ptx(), "nsl_div_f32\0");
                     // Ownership transfer: relinquished A ref becomes the result ref.
                     super::fbip_record_reuse();
                     if relinq_b { nsl_tensor_free(b_orig); }
                     if b_transferred { nsl_tensor_free(b); }
                     return a;
                 }
-                let result = crate::cuda::gpu_elementwise_binary(a, b, crate::cuda::kernels::DIV_F32_PTX, "nsl_div_f32\0");
+                let result = crate::cuda::gpu_elementwise_binary(a, b, crate::cuda::kernels::div_f32_ptx(), "nsl_div_f32\0");
                 // Tape record on the GPU arm (see nsl_tensor_mul for the
                 // saved-ref-before-relinquish ordering).
                 if autodiff::is_recording() {
@@ -908,12 +908,12 @@ pub extern "C" fn nsl_tensor_div_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
             #[cfg(feature = "cuda")]
             {
                 if relinq_a {
-                    crate::cuda::gpu_scalar_op_inplace(a_ptr, s as f32, crate::cuda::kernels::DIV_SCALAR_F32_PTX, "nsl_div_scalar_f32\0");
+                    crate::cuda::gpu_scalar_op_inplace(a_ptr, s as f32, crate::cuda::kernels::div_scalar_f32_ptx(), "nsl_div_scalar_f32\0");
                     // Ownership transfer: relinquished A ref becomes the result ref.
                     super::fbip_record_reuse();
                     return a_ptr;
                 }
-                let result = crate::cuda::gpu_scalar_op(a_ptr, s as f32, crate::cuda::kernels::DIV_SCALAR_F32_PTX, "nsl_div_scalar_f32\0");
+                let result = crate::cuda::gpu_scalar_op(a_ptr, s as f32, crate::cuda::kernels::div_scalar_f32_ptx(), "nsl_div_scalar_f32\0");
                 if relinq_a { nsl_tensor_free(a_ptr); }
                 return result;
             }
