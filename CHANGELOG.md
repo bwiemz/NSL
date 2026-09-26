@@ -633,6 +633,54 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- With `grad_clip` and FASE-Deferred accumulation on the tape path, the
+  gradients were clipped twice. Section 7e2 clipped every micro-batch
+  (`nsl_clip_grad_norm`), and the optimizer's two-phase clip then clipped
+  the window's accumulated mean again. Only an active source-AD hook turned
+  the first clip off. The two-phase clip is defined on the window mean's
+  global norm. Clipping each micro-batch first shrank any micro-batch whose
+  gradient was over the threshold before it was averaged, so the mean
+  differed whenever micro-batches did. 7e2 now also skips when two-phase
+  clip is active.
+
+  Found by the tolerance mutation audit below: removing either clip alone
+  left `adamw_deferred_with_grad_clip` green, because the other clip did the
+  work. With the fix, removing the two-phase clip fails that test.
+- Tolerance mutation audit (roadmap item 9). Each change below is backed
+  by a named mutant that used to survive its gate and now fails it:
+  - **FASE-Deferred AdamW gates** (`fase_numerical_validation`): the
+    fixtures set `eps` near the gradient's size (1.0; 1e-2 for the clipped
+    one), and the Rust references use the same values. With `eps = 1e-8`,
+    AdamW's update does not depend on the gradient's magnitude. A sum where
+    the window should average (`accum_scale` → 1, on both the hook and the
+    accumulate paths) therefore passed.
+  - **Dropout backward parity** (`dropout_backward_parity_gate`): trains
+    with SGD, and the tolerance is 2e-3 → 1e-5. Measured source-vs-tape
+    noise is about 1e-8 against about 0.2 of movement. A dropped 1/(1-p)
+    rescale (a constant factor on w1's gradient, which AdamW cancels)
+    passed before.
+  - **SwiGLU fusion gate** (`swiglu_fusion_gate`): trains with SGD, the
+    tolerance is 2e-3 → 1e-5 (noise 6e-8), and the anti-vacuity check
+    measures movement from init. The old check, `|w| > 1e-4`, always passed
+    because every init is non-zero.
+
+    The audit also found that the SwiGLU gate-backward peephole never fires
+    in a real program. The source-AD Mul adjoint is wrapped in
+    `reduce_to_shape`, so the `Mul → silu_backward` pattern does not match,
+    and `nsl_tensor_swiglu_gate_backward` is never called. The gate compares
+    two unfused runs. Fixing that is a separate change.
+  - **Differential tests** (`nsl-cli/tests/differential.rs`): all four
+    passed without comparing anything. Three named scripts did not exist,
+    `diff_basic_matmul.nsl` did not compile (`tensor` is not a builtin),
+    and the harness skipped on a missing or failing script. Now:
+    - a missing or failing script fails the test;
+    - the three scripts are written and the fourth is fixed;
+    - each runs from a scratch copy, since `nsl run` leaves objects beside
+      the script;
+    - both the fused and the `--disable-fusion` runs are held to an f64
+      reference, so a wrong answer fails even when no fusion fires. A gelu
+      cubic-coefficient mutant (0.044715 → 0.04) now fails
+      `differential_fused_gelu`.
 - The flash-attention backward on tensor cores (sm_80+) counted three of
   every four row tiles' gradients twice at head_dim <= 32 whenever its body
   was the single-warp one: every packed (segment-masked, PCA Stage C) step,

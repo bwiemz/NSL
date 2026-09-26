@@ -11,10 +11,14 @@ let m = Linear()
 let x = ones([4, 2])
 let y = zeros([4, 1])
 
+# eps is set near the gradient's size on purpose: with eps << |g| AdamW's
+# update is m_hat/sqrt(v_hat), which does not depend on the gradient's
+# magnitude, so a constant gradient scale (a sum where the accumulation
+# window should average, a dropped clip factor) would pass unseen.
 # 12 epochs × 1 step/epoch (no dataloader) = 12 steps.
 # grad_accumulation = 4 → optimizer fires 3 times (after steps 3, 7, 11).
 train(model = m, epochs = 12, grad_accumulation = 4):
-    optimizer: AdamW(lr = 0.001, beta1 = 0.9, beta2 = 0.999, eps = 1e-8, weight_decay = 0.01)
+    optimizer: AdamW(lr = 0.001, beta1 = 0.9, beta2 = 0.999, eps = 1.0, weight_decay = 0.01)
     step(batch):
         let pred = m.forward(x)
         let loss = mse_loss(pred, y)

@@ -1,6 +1,6 @@
-# Differential test: basic matmul
-# This script outputs numeric values for comparison
-let a = tensor([[1.0, 2.0], [3.0, 4.0]])
-let b = tensor([[5.0, 6.0], [7.0, 8.0]])
-let c = matmul(a, b)
+# Differential test: a plain matmul followed by an elementwise tail.
+# The harness also checks the printed values against an f64 reference.
+let a = (arange(6).reshape([2, 3])) * 0.5 - full([2, 3], 1.0)
+let b = (arange(12).reshape([3, 4])) * 0.25 + full([3, 4], 0.1)
+let c = (a @ b) * 2.0 + full([2, 4], 0.5)
 print(c)

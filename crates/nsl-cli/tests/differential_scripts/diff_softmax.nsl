@@ -1,0 +1,5 @@
+# Differential test: softmax over rows. The input is quadratic in position,
+# so every row has a different shape (softmax ignores a per-row shift).
+let x = (arange(12).reshape([3, 4])) * 0.3 - full([3, 4], 1.5)
+let s = softmax(x * x + x * 0.5, 1)
+print(s)
