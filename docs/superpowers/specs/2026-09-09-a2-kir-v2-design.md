@@ -883,6 +883,12 @@ frozen throughout, so nothing here blocks a kernel fix.
       `FSETP.GTU`/`FSETP.GE`/`FSEL` core with 12 registers on sm_80/90/120;
       only the address arithmetic differs (`IMAD.WIDE` in place of shift
       and add), with the same instruction count.
+    - **RoPE `rotate_half` pair:** `nsl_rotate_half_f32` and the fused
+      backward `nsl_rotate_half_neg_f32` (`build_rotate_half`), branching
+      on `i % last_dim < half` as the hand kernels do. The gate is
+      `rotate_half_kir_equivalence`. The SASS keeps the registers and the
+      64-bit remainder call on sm_80/90/120; the address arithmetic
+      (`IMAD.WIDE` for `LEA`) adds 2 to 8 instructions.
     - **Still hand-written:** `nsl_gelu_backward_f32` (tanh approximation,
       `div.approx`).
 12. **FA v2**, by phase directory, tier B.1 and B.2 last; the SASS
