@@ -15,9 +15,10 @@
 //! seeds the tape run's masks ARE the source run's masks, per element, per
 //! iteration. The forward kernels are line-identical (the source-AD FFI
 //! `nsl_tensor_dropout_fwd_mask` reuses the tape kernel's rounding), so the
-//! FIRST printed loss must match bit-for-bit; trained weights get a small
-//! f32 tolerance (the source backward's 1/(1-p) constant is an f32 scalar
-//! tensor, the tape's an f64 immediate).
+//! FIRST printed loss must match bit-for-bit; trained weights get a 1e-5
+//! tolerance (the source backward's 1/(1-p) constant is an f32 scalar
+//! tensor, the tape's an f64 immediate: measured differences are ~1e-8,
+//! against ~0.2 of movement, and a wrong rescale at p=0.1 moves w1 ~1e-2).
 //!
 //! Discrimination check (why the tolerance still catches the old defect):
 //! at p=0.5 the old backward scaled every gradient element by p/(1-p) = 1.0
@@ -40,6 +41,11 @@ fn repo_root() -> std::path::PathBuf {
 /// mask-applied forward output. 6 epochs advance the RNG stream across
 /// iterations. Deterministic init, no DataLoader — no RNG draws besides
 /// dropout itself.
+///
+/// SGD, not AdamW: the 1/(1-p) rescale multiplies w1's whole gradient by
+/// one constant, which AdamW's update (m_hat / sqrt(v_hat)) cancels — a
+/// backward that dropped or doubled it trained w1 to the same place. SGD's
+/// update is the gradient, so the scale shows in the weights.
 fn fixture(p_expr: &str) -> String {
     format!(
         r#"from nsl.nn.losses import mse_loss
@@ -59,7 +65,7 @@ let y = zeros([2, 4])
 
 print("LOSS_STREAM_BEGIN")
 train(model=m, epochs=6, grad_accumulation=1):
-    optimizer: AdamW(lr=0.01, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.0)
+    optimizer: SGD(lr=0.1)
     step(batch):
         let pred = m.forward(x, true)
         let loss = mse_loss(pred, y)
@@ -256,12 +262,12 @@ fn p_zero_elision_matches_tape() {
     // to return a BARE clone (no tape node), silently disconnecting the
     // graph at p=0 — w1 never received a gradient. The runtime now records
     // a same-shape Reshape relabel there, so the tape oracle trains w1.
-    parity_case("p00", "0.0", &[], 2e-3);
+    parity_case("p00", "0.0", &[], 1e-5);
 }
 
 #[test]
 fn p01_source_backward_matches_tape_mask_backward() {
-    parity_case("p01", "0.1", &[], 2e-3);
+    parity_case("p01", "0.1", &[], 1e-5);
 }
 
 #[test]
@@ -269,7 +275,7 @@ fn p05_source_backward_matches_tape_mask_backward() {
     // p=0.5 is the discriminating case: the old broken backward scaled
     // gradients by exactly 1.0 (the expected value of the correct one) —
     // only the per-element mask pattern tells them apart.
-    parity_case("p05", "0.5", &[], 2e-3);
+    parity_case("p05", "0.5", &[], 1e-5);
 }
 
 #[test]
@@ -287,7 +293,7 @@ fn config_scalar_p_through_item_matches_tape() {
     assert!(sa.ok, "source-AD run failed:\n{}", sa.stderr);
     assert_source_ad_actually_ran(&sa);
     assert_first_loss_bit_equal(&sa, &tape);
-    assert_weight_parity(&sa, &tape, 2e-3);
+    assert_weight_parity(&sa, &tape, 1e-5);
 }
 
 /// A 2-block residual MLP with dropout inside each block. `--checkpoint-blocks`

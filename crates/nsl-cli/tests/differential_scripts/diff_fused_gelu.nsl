@@ -1,0 +1,6 @@
+# Differential test: an elementwise chain around gelu (a fusion candidate).
+# Inputs span negative and positive values, so a wrong gelu or a mis-fused
+# chain changes the printed numbers.
+let x = (arange(16).reshape([4, 4])) * 0.35 - full([4, 4], 2.5)
+let y = gelu(x * 1.5 + full([4, 4], 0.25)) * 2.0 - x
+print(y)
