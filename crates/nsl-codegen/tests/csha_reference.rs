@@ -769,104 +769,122 @@ mod tests {
         }
     }
 
-    /// Finite-difference gradcheck on a small 2-head config. Numerically
-    /// perturbs a handful of input entries and compares the analytical
-    /// gradients from `csha_reference_backward` against central-difference
-    /// estimates. This is the real correctness test — if the backward
-    /// pass is algebraically wrong, this catches it at f32 precision
-    /// (max_abs_err ≲ 1e-3 is expected; scalar sum-of-O loss is O(1)).
-    #[test]
-    fn csha_reference_backward_finite_difference_gradcheck() {
-        let shape = CshaShape {
-            seq: 3,
-            heads: 1,
+    /// One exhaustive gradcheck config: every entry of x, wq, wk and wv is
+    /// perturbed, and `loss = sum(O * dO)` with a random `dO`.
+    struct GradcheckCase {
+        name: &'static str,
+        shape: CshaShape,
+        packing: Option<(Vec<u16>, Vec<i32>)>,
+    }
+
+    /// Worst |analytic - central difference| / max|analytic| per tensor, and
+    /// that max, for `case`.
+    fn gradcheck_errors(case: &GradcheckCase) -> Vec<(&'static str, f64, f64)> {
+        let shape = &case.shape;
+        let kv_dim = shape.heads * shape.head_dim;
+        let half = shape.head_dim / 2;
+        let x = det_seq(7, shape.seq * shape.d_model);
+        let wq = det_seq(8, shape.d_model * kv_dim);
+        let wk = det_seq(9, shape.d_model * kv_dim);
+        let wv = det_seq(10, shape.d_model * kv_dim);
+        // Non-uniform, so a dropped `* norm_weight` in the backward shows.
+        let norm_weight: Vec<f32> = det_seq(11, shape.d_model).iter().map(|v| 1.0 + v).collect();
+        let (cos, sin): (Vec<f32>, Vec<f32>) = if shape.rope_q {
+            (0..shape.seq * half).map(|i| ((i as f32) * 0.37 + 0.2).sin_cos()).map(|(s, c)| (c, s)).unzip()
+        } else {
+            (vec![], vec![])
+        };
+        // Random dO: all-ones would hide transposed or row-summed mistakes.
+        let do_out = det_seq(12, shape.seq * kv_dim);
+        let packed = case.packing.as_ref().map(|(ids, starts)| PackedDocs { segment_ids: ids, doc_starts: starts });
+
+        let g = csha_reference_backward_packed(
+            &CshaInputs { x: &x, wq: &wq, wk: &wk, wv: &wv, norm_weight: &norm_weight, cos: &cos, sin: &sin },
+            shape,
+            &do_out,
+            packed.as_ref(),
+        );
+        let loss = |t: &[&[f32]; 4]| -> f64 {
+            let inputs = CshaInputs { x: t[0], wq: t[1], wk: t[2], wv: t[3], norm_weight: &norm_weight, cos: &cos, sin: &sin };
+            csha_reference_packed(&inputs, shape, packed.as_ref())
+                .iter()
+                .zip(&do_out)
+                .map(|(&o, &d)| o as f64 * d as f64)
+                .sum()
+        };
+        let eps = 1e-2f32;
+        let base = [x.clone(), wq.clone(), wk.clone(), wv.clone()];
+        let analytic = [&g.dx, &g.dwq, &g.dwk, &g.dwv];
+        let names = ["dx", "dwq", "dwk", "dwv"];
+        let mut out = Vec::new();
+        for t in 0..4 {
+            let mut worst = 0.0f64;
+            let scale = analytic[t].iter().fold(0.0f64, |m, &v| m.max(v.abs() as f64));
+            for i in 0..base[t].len() {
+                let mut probe = base.clone();
+                probe[t][i] = base[t][i] + eps;
+                let lp = loss(&[&probe[0], &probe[1], &probe[2], &probe[3]]);
+                probe[t][i] = base[t][i] - eps;
+                let lm = loss(&[&probe[0], &probe[1], &probe[2], &probe[3]]);
+                let fd = (lp - lm) / (2.0 * eps as f64);
+                worst = worst.max((fd - analytic[t][i] as f64).abs());
+            }
+            out.push((names[t], worst / scale, scale));
+        }
+        out
+    }
+
+    fn gradcheck_cases() -> Vec<GradcheckCase> {
+        let base = CshaShape {
+            seq: 5,
+            heads: 2,
             head_dim: 4,
-            d_model: 4,
+            d_model: 6,
             causal: false,
             norm_eps: 1e-5,
             rope_q: true,
             rope_style: RopeStyle::Adjacent,
         };
-        let kv_dim = shape.heads * shape.head_dim;
-        let mut x = det_seq(7, shape.seq * shape.d_model);
-        let mut wq = det_seq(8, shape.d_model * kv_dim);
-        let mut wk = det_seq(9, shape.d_model * kv_dim);
-        let wv = det_seq(10, shape.d_model * kv_dim);
-        let norm_weight = vec![1.0f32; shape.d_model];
-        // Non-trivial RoPE angles.
-        let cos: Vec<f32> = (0..shape.seq * shape.head_dim / 2)
-            .map(|i| ((i as f32) * 0.1).cos()).collect();
-        let sin: Vec<f32> = (0..shape.seq * shape.head_dim / 2)
-            .map(|i| ((i as f32) * 0.1).sin()).collect();
-        let do_out = vec![1.0f32; shape.seq * kv_dim]; // loss = sum(O)
+        vec![
+            GradcheckCase { name: "adjacent", shape: CshaShape { ..base }, packing: None },
+            GradcheckCase {
+                name: "causal half-split",
+                shape: CshaShape { causal: true, rope_style: RopeStyle::HalfSplit, ..base },
+                packing: None,
+            },
+            GradcheckCase { name: "no rope", shape: CshaShape { rope_q: false, ..base }, packing: None },
+            GradcheckCase {
+                name: "packed causal",
+                shape: CshaShape { causal: true, ..base },
+                packing: Some((vec![0, 0, 1, 1, 1], vec![0, 2, -1])),
+            },
+        ]
+    }
 
-        // Compute analytical gradients once.
-        let g = {
-            let inputs = CshaInputs {
-                x: &x, wq: &wq, wk: &wk, wv: &wv,
-                norm_weight: &norm_weight, cos: &cos, sin: &sin,
-            };
-            csha_reference_backward(&inputs, &shape, &do_out)
-        };
-
-        // Loss helper: sum of forward output (dO = ones → dL/dparam == g.*).
-        let eps = 1e-3f32;
-        let loss_of = |x_: &[f32], wq_: &[f32], wk_: &[f32]| {
-            let inputs = CshaInputs {
-                x: x_, wq: wq_, wk: wk_, wv: &wv,
-                norm_weight: &norm_weight, cos: &cos, sin: &sin,
-            };
-            csha_reference(&inputs, &shape).iter().sum::<f32>()
-        };
-
-        // Probe a handful of positions per tensor.
-        let probes_x = [0, 3, 5, shape.seq * shape.d_model - 1];
-        let probes_w = [0, 2, 7, shape.d_model * kv_dim - 1];
-
-        for &i in &probes_x {
-            let saved = x[i];
-            x[i] = saved + eps;
-            let lp = loss_of(&x, &wq, &wk);
-            x[i] = saved - eps;
-            let lm = loss_of(&x, &wq, &wk);
-            x[i] = saved;
-            let fd = (lp - lm) / (2.0 * eps);
-            let diff = (fd - g.dx[i]).abs();
-            assert!(
-                diff < 1e-2,
-                "dx[{i}]: analytical={}, fd={}, diff={}",
-                g.dx[i], fd, diff
-            );
-        }
-        for &i in &probes_w {
-            let saved = wq[i];
-            wq[i] = saved + eps;
-            let lp = loss_of(&x, &wq, &wk);
-            wq[i] = saved - eps;
-            let lm = loss_of(&x, &wq, &wk);
-            wq[i] = saved;
-            let fd = (lp - lm) / (2.0 * eps);
-            let diff = (fd - g.dwq[i]).abs();
-            assert!(
-                diff < 1e-2,
-                "dwq[{i}]: analytical={}, fd={}, diff={}",
-                g.dwq[i], fd, diff
-            );
-        }
-        for &i in &probes_w {
-            let saved = wk[i];
-            wk[i] = saved + eps;
-            let lp = loss_of(&x, &wq, &wk);
-            wk[i] = saved - eps;
-            let lm = loss_of(&x, &wq, &wk);
-            wk[i] = saved;
-            let fd = (lp - lm) / (2.0 * eps);
-            let diff = (fd - g.dwk[i]).abs();
-            assert!(
-                diff < 1e-2,
-                "dwk[{i}]: analytical={}, fd={}, diff={}",
-                g.dwk[i], fd, diff
-            );
+    /// Finite-difference gradcheck of `csha_reference_backward`, which every
+    /// CSHA GPU backward test trusts as its oracle. Every entry of x, wq, wk
+    /// and wv is perturbed (f64 loss, eps 1e-2) in four configs: two heads,
+    /// non-uniform norm weights, a random dO, Adjacent and HalfSplit RoPE,
+    /// causal, RoPE off, and PCA packing.
+    ///
+    /// The worst error measured is 2.7e-4 of the tensor's largest gradient
+    /// (dx, from the eps^2 truncation term); the bound is 2e-3. The old test
+    /// probed four entries of three tensors at an absolute 1e-2, with one
+    /// head, Adjacent RoPE, unit norm weights and dO = ones. It never read
+    /// dwv, and it passed with the backward pairing Adjacent under HalfSplit,
+    /// with packed rows rotated by their absolute position, and with the norm
+    /// weight dropped from the RMSNorm backward; this test fails all three.
+    #[test]
+    fn csha_reference_backward_finite_difference_gradcheck() {
+        for case in gradcheck_cases() {
+            for (name, rel, scale) in gradcheck_errors(&case) {
+                assert!(scale > 0.1, "{}: {name} is too small to check (max |g| = {scale})", case.name);
+                assert!(
+                    rel <= 2e-3,
+                    "{}: {name} disagrees with central differences by {rel:.3e} of max |g| = {scale:.3e}",
+                    case.name
+                );
+            }
         }
     }
 
