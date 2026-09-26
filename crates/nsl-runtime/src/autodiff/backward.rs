@@ -1458,6 +1458,16 @@ pub(crate) fn run_backward_core_strict(
                     accumulate_grad(&mut grad_map, *b, grad_b);
                 }
             }
+            TapeOp::Cast { a, out, src_dtype } => {
+                if let Some(&g) = grad_map.get(out) {
+                    let g_src = if crate::tensor::NslTensor::from_ptr_ref(g).dtype == *src_dtype {
+                        tensor_clone(g)
+                    } else {
+                        crate::tensor::precision_cast::convert_untaped(g, *src_dtype)
+                    };
+                    accumulate_grad(&mut grad_map, *a, g_src);
+                }
+            }
             TapeOp::Neg { a, out } => {
                 if let Some(&g) = grad_map.get(out) {
                     let g_clone = tensor_clone(g);

@@ -606,6 +606,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **`.to(dtype)` converts** (dtype-semantics design, step 1).
+  - **What was wrong.** On a standard-dtype tensor, `.to(f32)` and
+    `.to(f64)` compiled to `nsl_tensor_from_custom_dtype`, which returns
+    its input unchanged. The cast the GPU refusals tell users to write
+    ("cast with `.to(f32)`") did nothing. `.to(f32)` of a packed BYOD
+    tensor produced f64. `.to(fp16)` / `.to(bf16)` did not check.
+  - **Now `.to(f32 | f64 | fp16 | bf16)` calls the new
+    `nsl_tensor_to_dtype`:**
+    - a converted copy on the same device;
+    - host conversions round once, to nearest even, from the exact source
+      value (f64 → f16/bf16 goes through a round-to-odd f32 step, because
+      `half`'s `from_f64` double-rounds);
+    - GPU conversions use the PTX cast kernels, staging fp16 ↔ bf16
+      through f32;
+    - f64 on a GPU tensor is refused;
+    - strided views convert in index order;
+    - the same dtype returns the source unchanged, as before.
+  - **Gradients flow through the cast.** Under a recording tape the cast is
+    a `TapeOp::Cast`, whose backward converts the gradient back to the
+    source dtype.
+  - **Checker:** `fp16` and `bf16` are now dtype identifiers next to `f32`
+    and `f64`.
+  - **Tests:** every conversion pair is checked against an exhaustive
+    nearest-value search over each 16-bit format, over IEEE corners
+    (ties, subnormals, overflow). Separate tests cover the double-rounding
+    counterexamples for f16 and bf16, gradient flow through the cast, and
+    a strided source.
+
 - The CPU fused kernels no longer misread memory or return a null tensor
   (dtype-semantics design, step 0).
   - **`nsl_fused_elementwise_2`** returned the null handle 0 for operands

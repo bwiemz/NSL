@@ -147,7 +147,11 @@ the host with no dtype is `DTYPE_F64`, and `nsl_tensor_to_device` produces a
 `DTYPE_F32` device buffer. Typed accessors (`data_f64`, `data_f32`,
 `data_f16_bits`, ...) assert the dtype they read. Kernels that need bf16 or
 fp8 storage live behind explicit modes (`src/sr_bf16.rs`, `src/fp8.rs`,
-`src/tensor/precision_cast.rs`) rather than changing the default.
+`src/tensor/precision_cast.rs`) rather than changing the default. A program converts
+explicitly with `.to(f32 | f64 | fp16 | bf16)`, which lowers to
+`nsl_tensor_to_dtype` (`precision_cast.rs`): a converted copy, rounded once
+to nearest even, recorded on the tape as `TapeOp::Cast`. The dtype semantics
+these defaults should become are roadmap item 7's design.
 
 **Strides and contiguity (PR #585).** `compute_strides` produces row-major
 strides; `is_contiguous` compares the stored strides against that expectation

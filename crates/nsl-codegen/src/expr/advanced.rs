@@ -1299,12 +1299,23 @@ impl Compiler<'_> {
                             &[obj_val, id_val],
                         );
                     }
-                    // .to(f32) / .to(f64) -- convert from custom dtype back to standard
-                    if matches!(arg_name.as_str(), "f32" | "f64" | "float") {
+                    // .to(f32) / .to(f64) / .to(fp16) / .to(bf16): a converted copy
+                    // (nsl_tensor_to_dtype). A custom-dtype source unpacks first.
+                    // This used to call nsl_tensor_from_custom_dtype, which returns a
+                    // standard-dtype tensor unchanged, so the cast did nothing.
+                    let tag = match arg_name.as_str() {
+                        "f64" => Some(nsl_abi::wire::dtype::DTYPE_F64),
+                        "f32" | "float" => Some(nsl_abi::wire::dtype::DTYPE_F32),
+                        "fp16" => Some(nsl_abi::wire::dtype::DTYPE_FP16),
+                        "bf16" => Some(nsl_abi::wire::dtype::DTYPE_BF16),
+                        _ => None,
+                    };
+                    if let Some(tag) = tag {
+                        let tag_val = builder.ins().iconst(cl_types::I64, tag as i64);
                         return self.compile_call_by_name(
                             builder,
-                            "nsl_tensor_from_custom_dtype",
-                            &[obj_val],
+                            "nsl_tensor_to_dtype",
+                            &[obj_val, tag_val],
                         );
                     }
                 }
