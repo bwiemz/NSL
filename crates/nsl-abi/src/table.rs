@@ -436,6 +436,7 @@ macro_rules! for_each_runtime_fn {
             [abi_tensor] nsl_tensor_to_bf16(i64) -> i64 = tensor::precision_cast::nsl_tensor_to_bf16;
             [abi_tensor] nsl_tensor_to_fp16(i64) -> i64 = tensor::precision_cast::nsl_tensor_to_fp16;
             [abi_tensor] nsl_tensor_to_f32(i64) -> i64 = tensor::precision_cast::nsl_tensor_to_f32;
+            [abi_tensor] nsl_tensor_to_dtype(i64, i64) -> i64 = tensor::precision_cast::nsl_tensor_to_dtype;
             // M52c: CSR sparse matmul (row_ptrs, col_indices, values, B, nrows, ncols, nnz) -> C
             [abi_tensor] nsl_sparse_matmul(i64, i64, i64, i64, i64, i64, i64) -> i64 = tensor::arithmetic::nsl_sparse_matmul;
             // Fused RoPE backward: -rotate_half(dy) in one launch (bit-exact)
@@ -1355,6 +1356,6 @@ mod tests {
     fn table_is_the_recorded_size() {
         // The count is pinned so a row dropped by a bad merge is noticed; move
         // it with a row that is deliberately added or removed.
-        assert_eq!(RUNTIME_ABI.len(), 682);
+        assert_eq!(RUNTIME_ABI.len(), 683);
     }
 }

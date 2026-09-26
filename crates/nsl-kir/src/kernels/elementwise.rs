@@ -553,6 +553,190 @@ pub fn unary_ptx(op: UnaryOp) -> Vec<u8> {
     lower_kir_to_ptx(&ir)
 }
 
+/// An activation-backward kernel: the gradient of a unary activation, one
+/// thread per element. Each reads the upstream gradient and one saved
+/// tensor, `(grad, input | saved, out, n)`; `SwigluGate` reads a second
+/// operand, `(grad, up, input, out, n)`.
+///
+/// Two families share the shapes. The tape-AD kernels (`Relu`, `Sigmoid`,
+/// `Tanh`, `Silu`) spell their arithmetic bare, so ptxas may
+/// contract a multiply and the add that reads it, as it did for the hand
+/// kernels. The source-AD kernels (`*Srcad`, `SwigluGate`) replace a chain
+/// of separate launches and must match it bit for bit, so every derivative
+/// operation is explicitly rounded (`MulRn`/`AddRn`/`SubRn`); their sigmoid
+/// stays bare, as in `nsl_sigmoid_f32`, since `ex2.approx`/`rcp.approx`
+/// leave no contractible pair. `nsl_gelu_backward_f32` (the tape-AD tanh
+/// approximation) stays hand-written: it divides with `div.approx.f32`.
+/// `nsl_clamp_backward_f32` follows once the interpreter its gate runs on
+/// models `and.pred`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackwardOp {
+    /// `out = input > 0 ? grad : 0`.
+    Relu,
+    /// `out = grad * (y * (1 - y))`, `y` the saved sigmoid output.
+    Sigmoid,
+    /// `out = grad * (1 - y * y)`, `y` the saved tanh output.
+    Tanh,
+    /// `s = σ(x)`; `out = grad * (s + s * (x * (1 - s)))`.
+    Silu,
+    /// Source-AD `grad * (y * (1 - y))`, every operation rounded.
+    SigmoidSrcad,
+    /// Source-AD `grad * (1 - y * y)`, every operation rounded.
+    TanhSrcad,
+    /// Source-AD `s = σ(x)`; `grad * (s * (1 + x * (1 - s)))`.
+    SiluSrcad,
+    /// Source-AD `kx = k·x`, `s = σ(kx)`; `grad * (s * (1 + kx * (1 - s)))`,
+    /// `k` = [`GELU_SLOPE`]: the exact derivative of `nsl_gelu_f32`.
+    GeluSrcad,
+    /// `t = grad * up`, then [`BackwardOp::SiluSrcad`] of `t` at `input`:
+    /// the SwiGLU gate adjoint, bit-exact with the multiply launch and the
+    /// silu-backward launch it replaces.
+    SwigluGate,
+}
+
+impl BackwardOp {
+    pub const ALL: [BackwardOp; 9] = [
+        BackwardOp::Relu,
+        BackwardOp::Sigmoid,
+        BackwardOp::Tanh,
+        BackwardOp::Silu,
+        BackwardOp::SigmoidSrcad,
+        BackwardOp::TanhSrcad,
+        BackwardOp::SiluSrcad,
+        BackwardOp::GeluSrcad,
+        BackwardOp::SwigluGate,
+    ];
+
+    /// The `.visible .entry` name. Pinned: the runtime launches by it.
+    pub fn kernel_name(self) -> &'static str {
+        match self {
+            BackwardOp::Relu => "nsl_relu_backward_f32",
+            BackwardOp::Sigmoid => "nsl_sigmoid_backward_f32",
+            BackwardOp::Tanh => "nsl_tanh_backward_f32",
+            BackwardOp::Silu => "nsl_silu_backward_f32",
+            BackwardOp::SigmoidSrcad => "nsl_sigmoid_backward_srcad_f32",
+            BackwardOp::TanhSrcad => "nsl_tanh_backward_srcad_f32",
+            BackwardOp::SiluSrcad => "nsl_silu_backward_srcad_f32",
+            BackwardOp::GeluSrcad => "nsl_gelu_backward_srcad_f32",
+            BackwardOp::SwigluGate => "nsl_swiglu_gate_backward_f32",
+        }
+    }
+
+    /// The parameter names, in order. Pinned: the launchers pass arguments
+    /// positionally, and the tape-AD sigmoid/tanh kernels call their saved
+    /// operand `saved` (it is the forward's output, not its input).
+    pub fn param_names(self) -> &'static [&'static str] {
+        match self {
+            BackwardOp::Sigmoid | BackwardOp::Tanh => &["grad", "saved", "out", "n"],
+            BackwardOp::SwigluGate => &["grad", "up", "input", "out", "n"],
+            _ => &["grad", "input", "out", "n"],
+        }
+    }
+}
+
+/// `s·(1 + x·(1 − s))` in explicitly rounded steps, `s` already computed:
+/// the source-AD derivative tail shared by SiLU, GELU and the SwiGLU gate.
+fn srcad_silu_tail(b: &mut KirBuilder, x: VarId, s: VarId) -> VarId {
+    let one = f32_const(b, 1.0f32.to_bits());
+    let t = f32_op2(b, KirOp::SubRn, one, s);
+    let t = f32_op2(b, KirOp::MulRn, x, t);
+    let one = f32_const(b, 1.0f32.to_bits());
+    let t = f32_op2(b, KirOp::AddRn, one, t);
+    f32_op2(b, KirOp::MulRn, s, t)
+}
+
+/// Build `op` as KIR, in the hand kernel's instruction order: the index and
+/// bound, the loads in parameter order (the SwiGLU gate scales `grad` by
+/// `up` before it loads `input`), the derivative, one store.
+pub fn build_backward(op: BackwardOp) -> KernelIR {
+    use AddressSpace::Global;
+    let mut b = KirBuilder::new(op.kernel_name());
+    let names = op.param_names();
+    let mut params = Vec::with_capacity(names.len());
+    for &name in names {
+        let ty = if name == "n" { KirType::U64 } else { f32_ptr() };
+        params.push(b.add_param(name, ty, Global));
+    }
+    let param = |name: &str| params[names.iter().position(|n| *n == name).expect("a declared parameter")];
+    let (i, _, exit) = index_and_bound(&mut b, param("n"));
+
+    let mut g = load_f32(&mut b, param("grad"), i);
+    if op == BackwardOp::SwigluGate {
+        let up = load_f32(&mut b, param("up"), i);
+        g = f32_op2(&mut b, KirOp::MulRn, g, up);
+    }
+    let saved = if matches!(op, BackwardOp::Sigmoid | BackwardOp::Tanh) { "saved" } else { "input" };
+    let x = load_f32(&mut b, param(saved), i);
+
+    let y = match op {
+        BackwardOp::Relu => {
+            let zero = f32_const(&mut b, 0);
+            let pos = b.new_typed_var(KirType::Bool);
+            b.emit(KirOp::Cmp(pos, x, zero, CmpOp::Gt));
+            let zero = f32_const(&mut b, 0);
+            let y = b.new_typed_var(KirType::F32);
+            b.emit(KirOp::Select(y, pos, g, zero));
+            y
+        }
+        BackwardOp::Sigmoid => {
+            let one = f32_const(&mut b, 1.0f32.to_bits());
+            let t = f32_op2(&mut b, KirOp::Sub, one, x);
+            let t = f32_op2(&mut b, KirOp::Mul, x, t);
+            f32_op2(&mut b, KirOp::Mul, g, t)
+        }
+        BackwardOp::Tanh => {
+            let t = f32_op2(&mut b, KirOp::Mul, x, x);
+            let one = f32_const(&mut b, 1.0f32.to_bits());
+            let t = f32_op2(&mut b, KirOp::Sub, one, t);
+            f32_op2(&mut b, KirOp::Mul, g, t)
+        }
+        BackwardOp::Silu => {
+            let s = sigmoid_of(&mut b, x);
+            let one = f32_const(&mut b, 1.0f32.to_bits());
+            let t = f32_op2(&mut b, KirOp::Sub, one, s);
+            let t = f32_op2(&mut b, KirOp::Mul, x, t);
+            let t = f32_op2(&mut b, KirOp::Mul, s, t);
+            let t = f32_op2(&mut b, KirOp::Add, s, t);
+            f32_op2(&mut b, KirOp::Mul, g, t)
+        }
+        BackwardOp::SigmoidSrcad => {
+            let one = f32_const(&mut b, 1.0f32.to_bits());
+            let t = f32_op2(&mut b, KirOp::SubRn, one, x);
+            let t = f32_op2(&mut b, KirOp::MulRn, x, t);
+            f32_op2(&mut b, KirOp::MulRn, g, t)
+        }
+        BackwardOp::TanhSrcad => {
+            let t = f32_op2(&mut b, KirOp::MulRn, x, x);
+            let one = f32_const(&mut b, 1.0f32.to_bits());
+            let t = f32_op2(&mut b, KirOp::SubRn, one, t);
+            f32_op2(&mut b, KirOp::MulRn, g, t)
+        }
+        BackwardOp::SiluSrcad | BackwardOp::SwigluGate => {
+            let s = sigmoid_of(&mut b, x);
+            let t = srcad_silu_tail(&mut b, x, s);
+            f32_op2(&mut b, KirOp::MulRn, g, t)
+        }
+        BackwardOp::GeluSrcad => {
+            let slope = f32_const(&mut b, GELU_SLOPE);
+            let kx = f32_op2(&mut b, KirOp::MulRn, x, slope);
+            let s = sigmoid_of(&mut b, kx);
+            let t = srcad_silu_tail(&mut b, kx, s);
+            f32_op2(&mut b, KirOp::MulRn, g, t)
+        }
+    };
+    store_f32(&mut b, param("out"), i, y);
+    finish(b, exit)
+}
+
+/// Build `op` and lower it to a NUL-terminated PTX module.
+///
+/// # Panics
+///
+/// If the built kernel fails verification: a bug in this module.
+pub fn backward_ptx(op: BackwardOp) -> Vec<u8> {
+    verified_ptx(build_backward(op))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -670,6 +854,49 @@ mod tests {
             assert_eq!(muon.matches(form).count(), 1, "{form}: {muon}");
         }
         assert!(!muon.contains("mul.f32 ") && !muon.contains("add.f32 ") && !muon.contains("fma"), "{muon}");
+    }
+
+    #[test]
+    fn every_backward_kernel_verifies_and_keeps_its_signature() {
+        for op in BackwardOp::ALL {
+            let ir = build_backward(op);
+            if let Err(errors) = verify(&ir) {
+                panic!("{op:?} failed verification: {errors:?}");
+            }
+            assert_eq!(ir.name, op.kernel_name());
+            let params: Vec<&str> = ir.params.iter().map(|p| p.name.as_str()).collect();
+            assert_eq!(params, op.param_names(), "{op:?}");
+            assert_eq!(ir.params.last().map(|p| p.ty.clone()), Some(KirType::U64), "{op:?}: n is u64");
+            let bytes = backward_ptx(op);
+            assert_eq!(bytes.last(), Some(&0), "{op:?}");
+            assert!(bytes.is_ascii(), "{op:?}");
+        }
+    }
+
+    /// The tape-AD kernels are bare, the source-AD ones explicitly rounded
+    /// in every derivative operation; GELU's backward carries the forward's
+    /// slope.
+    #[test]
+    fn the_backward_kernels_spell_their_rounding() {
+        let text = |op| String::from_utf8(backward_ptx(op)).unwrap();
+        for op in [BackwardOp::Relu, BackwardOp::Sigmoid, BackwardOp::Tanh, BackwardOp::Silu] {
+            assert!(!text(op).contains(".rn."), "{op:?}");
+        }
+        for (op, rounded) in [
+            (BackwardOp::SigmoidSrcad, 3),
+            (BackwardOp::TanhSrcad, 3),
+            (BackwardOp::SiluSrcad, 5),
+            (BackwardOp::GeluSrcad, 6),
+            (BackwardOp::SwigluGate, 6),
+        ] {
+            let t = text(op);
+            assert_eq!(t.matches(".rn.f32 ").count(), rounded, "{op:?}: {t}");
+        }
+        assert!(text(BackwardOp::GeluSrcad).contains(&format!("0f{GELU_SLOPE:08X}")));
+        for op in BackwardOp::ALL {
+            let t = text(op);
+            assert!(!t.contains("div.") && !t.contains("fma."), "{op:?}");
+        }
     }
 
     /// NUL-terminated ASCII at the ISA floor, with the arithmetic in the
