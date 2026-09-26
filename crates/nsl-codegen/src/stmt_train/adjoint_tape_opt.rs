@@ -76,7 +76,10 @@ impl Compiler<'_> {
         }
         // P5 item 20 slice B: fuse SwiGLU gate-gradient pairs
         // (bit-exact — see fuse_swiglu_gate_backward).
-        crate::source_ad::fuse_swiglu_gate_backward(&mut adjoint.ops, &adjoint_needed);
+        let swiglu_fused = crate::source_ad::fuse_swiglu_gate_backward(&mut adjoint.ops, &adjoint_needed);
+        if swiglu_fused > 0 {
+            nsl_log::nsl_log!(INFO, "fuse", "[fuse] swiglu gate-backward pairs: {swiglu_fused}");
+        }
         // P5 slice C: fold residual-gradient accumulates into fused
         // RMSNorm dx ops (bit-exact; no-op unless
         // --fuse-rmsnorm-backward emitted them).

@@ -636,6 +636,15 @@ pub static REGISTRY: &[EnvVar] = &[
         "Kill switch for rewriting x OP const backward ops into scalar-immediate launches (bit-exact; skips the host scalar alloc/HtoD)."
     ),
     var!(
+        "NSL_FUSE_SWIGLU_GATE",
+        Bool,
+        "0 disables; anything else or unset = on",
+        "on",
+        Perf,
+        Compile,
+        "Kill switch for fusing the SwiGLU gate gradient (Mul, reduce_to_shape, silu_backward) into one swiglu_gate_backward op (bit-exact)."
+    ),
+    var!(
         "NSL_GATHER_DIM_GPU",
         Bool,
         "0 disables; anything else on",

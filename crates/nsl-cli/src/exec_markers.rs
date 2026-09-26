@@ -685,6 +685,24 @@ pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
         )],
     },
     NegativeNeedle {
+        test: "crates/nsl-cli/tests/swiglu_fusion_gate.rs",
+        asserts: "the SwiGLU gate-backward peephole did NOT fire with \
+                  NSL_FUSE_SWIGLU_GATE=0",
+        // Two emit sites: the train-block tape optimizer and the grad-block
+        // lowering. Either one printing the line is what the negative
+        // assertion would catch, so both are pinned.
+        parts: &[
+            (
+                "[fuse] swiglu gate-backward pairs:",
+                "crates/nsl-codegen/src/stmt_train/adjoint_tape_opt.rs",
+            ),
+            (
+                "[fuse] swiglu gate-backward pairs:",
+                "crates/nsl-codegen/src/stmt_grad.rs",
+            ),
+        ],
+    },
+    NegativeNeedle {
         test: "crates/nsl-cli/tests/fused_lm_ce_decline_gate.rs",
         asserts: "a matching LM head, and a disabled decorator, produced NO \
                   fused linear-CE fallback diagnostic",

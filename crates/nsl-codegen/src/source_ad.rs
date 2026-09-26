@@ -1587,12 +1587,25 @@ impl AdjointGenerator {
 /// P5 item 20 slice B: fuse the SwiGLU gate-gradient pair.
 ///
 /// For `f = silu(g) * u` the adjoint contains
-///     t  = Mul(y_bar, u)                  (gate-branch upstream grad)
-///     dg = Passthrough("silu_backward")(t, g)
-/// When `t` has exactly ONE reader (that silu_backward), rewrite to
+///     raw = Mul(y_bar, u)                              (gate-branch upstream grad)
+///     t   = Passthrough("reduce_to_shape")(raw, s)     (s = silu(g))
+///     dg  = Passthrough("silu_backward")(t, g)
+/// (`MulElementwise` always wraps its product in `reduce_to_shape` for
+/// broadcasting; a bare `t = Mul(y_bar, u)` is accepted too). When every
+/// intermediate has exactly ONE reader, rewrite to
 ///     dg = Passthrough("swiglu_gate_backward")(y_bar, u, g)
-/// and drop the Mul — one launch and one full-size temporary saved per
-/// SwiGLU per micro-step. BIT-EXACT: the fused kernel computes
+/// and drop the Mul (and the reduce) — one launch and one full-size temporary
+/// saved per SwiGLU per micro-step. The peephole used to require `t` to be
+/// the Mul itself, so the `reduce_to_shape` wrapper kept it from ever
+/// firing.
+///
+/// The reduce is an identity whenever `y_bar * u` already has `g`'s shape,
+/// which is the only case the fused kernel takes. Otherwise the runtime op
+/// runs the decomposed chain, reducing to `g`'s shape (`silu` is elementwise,
+/// so `g` and `s` have one shape). `NSL_FUSE_SWIGLU_GATE=0` (compile-time
+/// env) disables the fusion for differential gating.
+///
+/// BIT-EXACT: the fused kernel computes
 /// `t = mul.rn(y_bar, u)` exactly as the standalone Mul kernel rounds it,
 /// then runs the identical silu-backward sequence (see
 /// `nsl_swiglu_gate_backward_f32` / the FFI's CPU arm).
@@ -1719,6 +1732,9 @@ pub fn fuse_swiglu_gate_backward(
     use crate::wengert::PrimalOp;
     use std::collections::HashMap;
 
+    if std::env::var("NSL_FUSE_SWIGLU_GATE").ok().as_deref() == Some("0") {
+        return 0;
+    }
     // Both in-tree call sites run right after eliminate_dead_gradients and
     // BEFORE the CCR splice, so no FreeTensor markers exist yet — fusing
     // across a free would hoist a read past it (review L3).
@@ -1737,6 +1753,7 @@ pub fn fuse_swiglu_gate_backward(
     }
 
     let mut remove: Vec<usize> = Vec::new();
+    let mut fused = 0usize;
     for i in 0..ops.len() {
         let is_silu_bwd = matches!(
             &ops[i].op,
@@ -1757,19 +1774,36 @@ pub fn fuse_swiglu_gate_backward(
         if j >= i || remove.contains(&j) {
             continue;
         }
-        if !matches!(ops[j].op, PrimalOp::Mul) || ops[j].inputs.len() != 2 {
+        // See through `reduce_to_shape(raw, s)` to the product it wraps.
+        let mut dropped = vec![j];
+        let mut mul_at = j;
+        if matches!(&ops[j].op, PrimalOp::Passthrough(name) if name == "reduce_to_shape")
+            && ops[j].inputs.len() == 2
+        {
+            let raw = ops[j].inputs[0];
+            if reads.get(&raw).copied() != Some(1) || needed.contains(&raw) {
+                continue;
+            }
+            let Some(&k) = producer.get(&raw) else { continue };
+            if k >= j || remove.contains(&k) {
+                continue;
+            }
+            mul_at = k;
+            dropped.push(k);
+        }
+        if !matches!(ops[mul_at].op, PrimalOp::Mul) || ops[mul_at].inputs.len() != 2 {
             continue;
         }
-        let y_bar = ops[j].inputs[0];
-        let u = ops[j].inputs[1];
+        let y_bar = ops[mul_at].inputs[0];
+        let u = ops[mul_at].inputs[1];
         ops[i].op = PrimalOp::Passthrough("swiglu_gate_backward".into());
         ops[i].inputs = vec![y_bar, u, g];
-        remove.push(j);
+        remove.extend(dropped);
+        fused += 1;
     }
     if remove.is_empty() {
         return 0;
     }
-    let fused = remove.len();
     let removed: std::collections::HashSet<usize> = remove.into_iter().collect();
     let mut idx = 0;
     ops.retain(|_| {
@@ -6561,6 +6595,54 @@ mod tests {
             crate::wengert::adjoint_op_id(0),
             "ids renumbered positionally within the adjoint id space"
         );
+    }
+
+    #[test]
+    fn swiglu_peephole_sees_through_reduce_to_shape() {
+        use crate::wengert::{adjoint_op_id, PrimalOp, WengertOp};
+        let op = |id: u32, result: u32, op: PrimalOp, inputs: Vec<u32>| WengertOp {
+            id: adjoint_op_id(id as usize),
+            result,
+            op,
+            inputs,
+            saved_for_backward: false,
+            checkpointed: false,
+        };
+        // What `MulElementwise` actually emits for `silu(g) * u`:
+        // raw = Mul(yb=10, u=11); t = reduce_to_shape(raw, s=13);
+        // dg = silu_backward(t, g=12). Both intermediates are dropped.
+        let mut ops = vec![
+            op(0, 100, PrimalOp::Mul, vec![10, 11]),
+            op(1, 101, PrimalOp::Passthrough("reduce_to_shape".into()), vec![100, 13]),
+            op(2, 102, PrimalOp::Passthrough("silu_backward".into()), vec![101, 12]),
+        ];
+        assert_eq!(super::fuse_swiglu_gate_backward(&mut ops, &Default::default()), 1);
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(&ops[0].op, PrimalOp::Passthrough(n) if n == "swiglu_gate_backward"));
+        assert_eq!(ops[0].inputs, vec![10, 11, 12]);
+        assert_eq!(ops[0].result, 102);
+
+        // The raw product read elsewhere, or the reduced value a needed
+        // gradient: leave the chain alone.
+        let chain = || {
+            vec![
+                op(0, 100, PrimalOp::Mul, vec![10, 11]),
+                op(1, 101, PrimalOp::Passthrough("reduce_to_shape".into()), vec![100, 13]),
+                op(2, 102, PrimalOp::Passthrough("silu_backward".into()), vec![101, 12]),
+            ]
+        };
+        let mut shared = chain();
+        shared.push(op(3, 103, PrimalOp::Add, vec![100, 102]));
+        assert_eq!(super::fuse_swiglu_gate_backward(&mut shared, &Default::default()), 0);
+        assert_eq!(shared.len(), 4);
+        let mut needed_raw = chain();
+        assert_eq!(super::fuse_swiglu_gate_backward(&mut needed_raw, &[100].into_iter().collect()), 0);
+        let mut needed_reduced = chain();
+        assert_eq!(super::fuse_swiglu_gate_backward(&mut needed_reduced, &[101].into_iter().collect()), 0);
+        // A reduce over something other than a Mul is not a SwiGLU gate.
+        let mut not_mul = chain();
+        not_mul[0].op = PrimalOp::Add;
+        assert_eq!(super::fuse_swiglu_gate_backward(&mut not_mul, &Default::default()), 0);
     }
 
     #[test]
