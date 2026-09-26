@@ -233,6 +233,28 @@ impl<'a> TypeChecker<'a> {
                             }
                         }
 
+                        if dname == "quantize" {
+                            let resolve = |s: nsl_ast::Symbol| -> String {
+                                self.interner.resolve(s.0).unwrap_or("").to_string()
+                            };
+                            crate::quant_requests::validate_quantize_decorator(
+                                deco,
+                                &resolve,
+                                &mut self.diagnostics,
+                            );
+                        }
+
+                        if dname == "fp8_compute" {
+                            let resolve = |s: nsl_ast::Symbol| -> String {
+                                self.interner.resolve(s.0).unwrap_or("").to_string()
+                            };
+                            crate::fp8::validate_fp8_compute_decorator(
+                                deco,
+                                &resolve,
+                                &mut self.diagnostics,
+                            );
+                        }
+
                         if dname == "fuse" {
                             match &stmt.kind {
                                 StmtKind::FnDef(_) => {
@@ -1406,18 +1428,9 @@ impl<'a> TypeChecker<'a> {
                     Vec::new()
                 };
 
-                // Validate calibration data variable if present
-                if let Some(ref cal) = quant.calibration
-                    && self.scopes.lookup(self.current_scope, cal.data).is_none()
-                {
-                    let data_name = self.interner.resolve(cal.data.0).unwrap_or("<unknown>").to_string();
-                    self.diagnostics.push(
-                        Diagnostic::error(format!(
-                            "calibration data variable '{data_name}' is not defined"
-                        ))
-                        .with_label(quant.span, "undefined calibration data"),
-                    );
-                }
+                // `calibration:` and the AWQ/GPTQ dtypes were accepted and
+                // never honoured; they refuse (quant_requests.rs).
+                crate::quant_requests::check_quant_block_requests(quant, &mut self.diagnostics);
 
                 // Build quantized model type: clone fields, replace tensor types
                 // for non-excluded fields with QuantizedTensor
