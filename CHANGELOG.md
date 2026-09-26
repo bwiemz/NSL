@@ -8,6 +8,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- Nine activation-backward kernels are built by
+  `nsl_kir::kernels::elementwise` (`BackwardOp`) in place of their
+  hand-written constants (roadmap A2 step 11, eighth slice). They are the
+  tape-AD `nsl_{relu,sigmoid,tanh,silu}_backward_f32`, the source-AD
+  `nsl_{sigmoid,tanh,silu,gelu}_backward_srcad_f32` and the fused SwiGLU
+  gate adjoint `nsl_swiglu_gate_backward_f32`.
+  - The tape-AD kernels keep their bare arithmetic, so ptxas contracts
+    exactly what it did before.
+  - The source-AD kernels spell every derivative operation `.rn`, as they
+    must to match the launches they replace.
+  - `tests/elementwise_backward_kir_equivalence.rs` (13 tests) checks them
+    against the frozen hand kernels. It requires the same bytes under two
+    schedules over IEEE corners, the formula with every operation rounded,
+    and the derivative each kernel names. It pins every arithmetic
+    mnemonic's count to the hand module, and it catches mutants of the
+    bound, the element sizes, every baked constant, each operation, relu's
+    strict comparison and the gate's `up` read.
+  - Disassembled on sm_75/80/90/120, eight of the nine issue the hand
+    kernels' exact floating-point instruction sequence. The ninth, the
+    SwiGLU gate on sm_80 and later, schedules its independent `grad * up`
+    multiply at a different point; it has the same instructions and no
+    `FFMA`.
+  - The GELU slope drift gate now reads both built modules.
+  - `nsl_gelu_backward_f32` (`div.approx`) stays hand-written.
+    `nsl_clamp_backward_f32` follows once the interpreter models
+    `and.pred`.
+
 - KIR has explicitly rounded float arithmetic: `KirOp::{AddRn, SubRn,
   MulRn}` print `add.rn` / `sub.rn` / `mul.rn`. ptxas never contracts these
   into an `fma`, so a kernel that must match a decomposed computation bit
@@ -597,6 +624,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
     model methods, which is where codegen reads it, is now validated too.
     Before, only layer declarations were.
 
+- `Adam(weight_decay=..)` and `Adam(no_decay=..)` are refused at `nsl check`
+  and on the build/run path, with AdamW named as the way to decay.
+  Classical Adam's decay is coupled: an L2 term added to the gradient.
+  NSL never implemented that, and what `Adam` did with the knob depended
+  on `grad_accumulation`. At 1, `adam_step` applied the decoupled AdamW
+  form. Above 1, the FASE path compiled it to zero. The same source
+  trained two different models. Plain `Adam(...)` is unchanged and trains
+  without decay on every path. Refusal chosen over implementing coupled
+  decay because no program in the tree passes decay to Adam, and every
+  update path (stdlib step, FASE, fused and batched GPU steps) would
+  otherwise need it (roadmap item 6). Gated by
+  `optim_config::adam_refuses_weight_decay_and_no_decay_and_points_to_adamw`
+  and `optim_config_contract_gate::adam_weight_decay_refuses_and_points_to_adamw`.
+
+- The fused SDPA forward (the scalar flash-attention v2 path, which Stage C's
+  packed segment-masked kernels use) had a shared-memory race on every
+  sequence longer than one KV tile. K and V share one shared-memory region,
+  and the KV loop branched from the P·V sweep straight into the next tile's
+  K load with no barrier. A warp that finished early overwrote the V tile
+  while slower warps were still reading it. The attention output came out
+  wrong (not the logsumexp), and which rows were wrong depended on warp
+  scheduling. Each KV iteration now ends with a `bar.sync`, in the standard
+  path, the per-document CTA path and the CSHA P·V pass. The tensor-core
+  forward already had this fence. The Stage-C GPU gate could not see the
+  race: its fixture is 64 tokens, one KV tile. Its 2e-2 checkpoint
+  tolerance could not fail on numerics either, since AdamW at lr 2e-3 over
+  8 steps bounds any two runs' drift near 1.6e-2.
+  `nsl-codegen/tests/sdpa_fused_forward_interp.rs` now executes the
+  production segment-masked PTX (base and Tier-B variants, both thread
+  schedules, seq 128, two batch rows, two heads) on the CTA interpreter
+  against f64 oracles. It pins the output to within one f16 rounding of an
+  oracle that stages K and V and the output in f16, as the kernel does
+  (Q stays f32 in registers), and the logsumexp to f32 noise. It catches
+  five named mutants, including the removed fence. The interpreter gained
+  warp-synchronous `shfl.sync.bfly`, `setp.nan`, predicate `and`/`or`,
+  `.u16` loads, stores and compares, `cvta.shared`, `max.u32`,
+  `cvt.u16.u32`/`cvt.u32.u16` and `%laneid`.
 - `nsl build --shared-lib` refuses an `@export` whose name is a symbol the
   library's statically linked runtime calls by name, such as `memcpy`,
   `pow`, `log` or `exp` (#693). The export is defined in the same image as

@@ -174,7 +174,7 @@ pub(crate) fn silu_f32_ptx() -> &'static str {
 
 /// `nsl_gelu_f32`: `c[i] = a[i] * sigmoid(1.702 * a[i])`, NUL-terminated. The
 /// slope is `nsl_kir::kernels::elementwise::GELU_SLOPE`, the one
-/// `GELU_BACKWARD_SRCAD_F32_PTX` differentiates with (`super::gelu_slope_drift`).
+/// `nsl_gelu_backward_srcad_f32` differentiates with (`BackwardOp::GeluSrcad`).
 pub(crate) fn gelu_f32_ptx() -> &'static str {
     unary_module(UnaryOp::Gelu)
 }
@@ -328,8 +328,6 @@ DONE: ret;\n\
 }\0";
 
 
-
-
 // --- Matrix multiplication ---
 //
 // The f32 single-matmul PTX kernel (`nsl_matmul_f32`) was deleted 2026-04-21
@@ -385,122 +383,28 @@ DONE: ret;\n\
 
 
 // --- Backward kernels for activation functions ---
+//
+// The tape-AD `nsl_{relu,sigmoid,tanh,silu}_backward_f32`, the source-AD
+// `nsl_{sigmoid,tanh,silu,gelu}_backward_srcad_f32` and the fused SwiGLU gate
+// adjoint `nsl_swiglu_gate_backward_f32` are built by
+// `nsl_kir::kernels::elementwise` (its `elementwise_backward_kir_equivalence`
+// gate). The source-AD kernels match a chain of separate launches bit for
+// bit, so their derivative arithmetic is explicitly rounded (`.rn`, which
+// ptxas never contracts into an `fma`). `nsl_gelu_backward_f32`
+// (`div.approx.f32`) and `nsl_clamp_backward_f32` stay hand-written below.
 
-/// relu_backward: out[i] = input[i] > 0 ? grad[i] : 0
-pub(crate) const RELU_BACKWARD_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_relu_backward_f32(\n\
-    .param .u64 grad, .param .u64 input, .param .u64 out, .param .u64 n\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<9>;\n\
-    .reg .f32 %fs<4>;\n\
-    .reg .pred %p<2>;\n\
-    ld.param.u64 %rd1, [grad];\n\
-    ld.param.u64 %rd2, [input];\n\
-    ld.param.u64 %rd3, [out];\n\
-    ld.param.u64 %rd4, [n];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd5, %r3;\n\
-    setp.ge.u64 %p1, %rd5, %rd4;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd6, %rd5, 2;\n\
-    add.u64 %rd7, %rd1, %rd6;\n\
-    ld.global.f32 %fs1, [%rd7];\n\
-    add.u64 %rd7, %rd2, %rd6;\n\
-    ld.global.f32 %fs2, [%rd7];\n\
-    mov.f32 %fs3, 0f00000000;\n\
-    setp.gt.f32 %p1, %fs2, %fs3;\n\
-    selp.f32 %fs3, %fs1, 0f00000000, %p1;\n\
-    add.u64 %rd8, %rd3, %rd6;\n\
-    st.global.f32 [%rd8], %fs3;\n\
-DONE: ret;\n\
-}\0";
+use nsl_kir::kernels::elementwise::BackwardOp;
 
-/// sigmoid_backward: out[i] = grad[i] * saved[i] * (1 - saved[i])
-/// saved[i] is the sigmoid output
-pub(crate) const SIGMOID_BACKWARD_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_sigmoid_backward_f32(\n\
-    .param .u64 grad, .param .u64 saved, .param .u64 out, .param .u64 n\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<9>;\n\
-    .reg .f32 %fs<5>;\n\
-    .reg .pred %p1;\n\
-    ld.param.u64 %rd1, [grad];\n\
-    ld.param.u64 %rd2, [saved];\n\
-    ld.param.u64 %rd3, [out];\n\
-    ld.param.u64 %rd4, [n];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd5, %r3;\n\
-    setp.ge.u64 %p1, %rd5, %rd4;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd6, %rd5, 2;\n\
-    add.u64 %rd7, %rd1, %rd6;\n\
-    ld.global.f32 %fs1, [%rd7];\n\
-    add.u64 %rd7, %rd2, %rd6;\n\
-    ld.global.f32 %fs2, [%rd7];\n\
-    sub.f32 %fs3, 0f3F800000, %fs2;\n\
-    mul.f32 %fs3, %fs2, %fs3;\n\
-    mul.f32 %fs3, %fs1, %fs3;\n\
-    add.u64 %rd8, %rd3, %rd6;\n\
-    st.global.f32 [%rd8], %fs3;\n\
-DONE: ret;\n\
-}\0";
-
-/// tanh_backward: out[i] = grad[i] * (1 - saved[i] * saved[i])
-/// saved[i] is the tanh output
-pub(crate) const TANH_BACKWARD_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_tanh_backward_f32(\n\
-    .param .u64 grad, .param .u64 saved, .param .u64 out, .param .u64 n\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<9>;\n\
-    .reg .f32 %fs<5>;\n\
-    .reg .pred %p1;\n\
-    ld.param.u64 %rd1, [grad];\n\
-    ld.param.u64 %rd2, [saved];\n\
-    ld.param.u64 %rd3, [out];\n\
-    ld.param.u64 %rd4, [n];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd5, %r3;\n\
-    setp.ge.u64 %p1, %rd5, %rd4;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd6, %rd5, 2;\n\
-    add.u64 %rd7, %rd1, %rd6;\n\
-    ld.global.f32 %fs1, [%rd7];\n\
-    add.u64 %rd7, %rd2, %rd6;\n\
-    ld.global.f32 %fs2, [%rd7];\n\
-    mul.f32 %fs3, %fs2, %fs2;\n\
-    sub.f32 %fs3, 0f3F800000, %fs3;\n\
-    mul.f32 %fs3, %fs1, %fs3;\n\
-    add.u64 %rd8, %rd3, %rd6;\n\
-    st.global.f32 [%rd8], %fs3;\n\
-DONE: ret;\n\
-}\0";
+pub(crate) fn backward_module(op: BackwardOp) -> &'static str {
+    static MODULES: std::sync::OnceLock<[String; 9]> = std::sync::OnceLock::new();
+    let modules = MODULES.get_or_init(|| {
+        BackwardOp::ALL.map(|op| {
+            String::from_utf8(nsl_kir::kernels::elementwise::backward_ptx(op)).expect("PTX must be ASCII")
+        })
+    });
+    let slot = BackwardOp::ALL.iter().position(|o| *o == op).expect("every BackwardOp is in ALL");
+    &modules[slot]
+}
 
 /// gelu_backward using tanh approximation derivative
 /// k = 0.0356774*x^3 + 0.797885*x
@@ -562,341 +466,6 @@ pub(crate) const GELU_BACKWARD_F32_PTX: &str = "\
 DONE: ret;\n\
 }\0";
 
-/// silu_backward: sig = 1/(1+exp(-x)); out[i] = grad[i] * (sig + x*sig*(1-sig))
-pub(crate) const SILU_BACKWARD_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_silu_backward_f32(\n\
-    .param .u64 grad, .param .u64 input, .param .u64 out, .param .u64 n\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<9>;\n\
-    .reg .f32 %fs<8>;\n\
-    .reg .pred %p1;\n\
-    ld.param.u64 %rd1, [grad];\n\
-    ld.param.u64 %rd2, [input];\n\
-    ld.param.u64 %rd3, [out];\n\
-    ld.param.u64 %rd4, [n];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd5, %r3;\n\
-    setp.ge.u64 %p1, %rd5, %rd4;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd6, %rd5, 2;\n\
-    add.u64 %rd7, %rd1, %rd6;\n\
-    ld.global.f32 %fs1, [%rd7];\n\
-    add.u64 %rd7, %rd2, %rd6;\n\
-    ld.global.f32 %fs2, [%rd7];\n\
-    neg.f32 %fs3, %fs2;\n\
-    mul.f32 %fs3, %fs3, 0f3FB8AA3B;\n\
-    ex2.approx.f32 %fs3, %fs3;\n\
-    add.f32 %fs3, %fs3, 0f3F800000;\n\
-    rcp.approx.f32 %fs3, %fs3;\n\
-    sub.f32 %fs4, 0f3F800000, %fs3;\n\
-    mul.f32 %fs4, %fs2, %fs4;\n\
-    mul.f32 %fs4, %fs3, %fs4;\n\
-    add.f32 %fs4, %fs3, %fs4;\n\
-    mul.f32 %fs4, %fs1, %fs4;\n\
-    add.u64 %rd8, %rd3, %rd6;\n\
-    st.global.f32 [%rd8], %fs4;\n\
-DONE: ret;\n\
-}\0";
-
-// Source-AD SiLU backward, fused (Milestone C · p4 slice 2). Collapses the 6
-// separate adjoint kernels source-AD emits for `SiluBackward` — Sigmoid, Sub,
-// Mul, Add, Mul, Mul — into ONE launch, and is BIT-EXACT with them.
-//
-// Computes, per element, in source-AD's exact operation order:
-//   s  = sigmoid(a)                 (identical instructions to nsl_sigmoid_f32)
-//   t1 = 1.0 - s
-//   t2 = a * t1
-//   t3 = 1.0 + t2
-//   t4 = s * t3
-//   out = grad * t4     => grad * s*(1 + a*(1-s))
-//
-// This differs from `SILU_BACKWARD_F32_PTX` above (the tape-AD kernel) only in
-// operation ORDER: that one computes grad*(s + s*a*(1-s)), which is the same
-// value but rounds differently. Matching source-AD's order is what makes this
-// byte-identical to the decomposed path it replaces.
-//
-// LOAD-BEARING `.rn` on the derivative ops (`t2`→`t3` is a mul feeding an add):
-// ptxas would otherwise contract the register-dependent mul+add into a single
-// `fma` (one rounding) and diverge by ~1 ULP. `.rn` (round-to-nearest, already
-// the default) forbids contraction so each op rounds independently — exactly
-// like the 6 separate kernels, whose intermediates round to f32 through memory.
-// The sigmoid ops stay plain `.f32` to match nsl_sigmoid_f32 byte-for-byte (they
-// contain no contractible mul+add pair — ex2.approx/rcp.approx break the chain).
-// P5 item 20 slice B — fused SwiGLU GATE backward. For f = silu(g) * u the
-// adjoint pair is  t = dy * u  (Mul) followed by silu_backward(t, g); this
-// kernel folds the Mul into the silu-backward launch. BIT-EXACT with the
-// two-kernel path: t = mul.rn(dy, u) exactly as the standalone Mul kernel
-// rounds it, then the identical SILU_BACKWARD_SRCAD instruction sequence
-// (sigmoid via ex2/rcp.approx, then .rn ops that forbid fma-contraction).
-pub(crate) const SWIGLU_GATE_BACKWARD_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_swiglu_gate_backward_f32(\n\
-    .param .u64 grad, .param .u64 up, .param .u64 input,\n\
-    .param .u64 out, .param .u64 n\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<10>;\n\
-    .reg .f32 %fs<6>;\n\
-    .reg .pred %p1;\n\
-    ld.param.u64 %rd1, [grad];\n\
-    ld.param.u64 %rd2, [up];\n\
-    ld.param.u64 %rd3, [input];\n\
-    ld.param.u64 %rd4, [out];\n\
-    ld.param.u64 %rd5, [n];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd6, %r3;\n\
-    setp.ge.u64 %p1, %rd6, %rd5;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd7, %rd6, 2;\n\
-    add.u64 %rd8, %rd1, %rd7;\n\
-    ld.global.f32 %fs1, [%rd8];\n\
-    add.u64 %rd8, %rd2, %rd7;\n\
-    ld.global.f32 %fs5, [%rd8];\n\
-    mul.rn.f32 %fs1, %fs1, %fs5;\n\
-    add.u64 %rd8, %rd3, %rd7;\n\
-    ld.global.f32 %fs2, [%rd8];\n\
-    neg.f32 %fs3, %fs2;\n\
-    mul.f32 %fs3, %fs3, 0f3FB8AA3B;\n\
-    ex2.approx.f32 %fs3, %fs3;\n\
-    add.f32 %fs3, %fs3, 0f3F800000;\n\
-    rcp.approx.f32 %fs3, %fs3;\n\
-    sub.rn.f32 %fs4, 0f3F800000, %fs3;\n\
-    mul.rn.f32 %fs4, %fs2, %fs4;\n\
-    add.rn.f32 %fs4, 0f3F800000, %fs4;\n\
-    mul.rn.f32 %fs4, %fs3, %fs4;\n\
-    mul.rn.f32 %fs4, %fs1, %fs4;\n\
-    add.u64 %rd9, %rd4, %rd7;\n\
-    st.global.f32 [%rd9], %fs4;\n\
-DONE: ret;\n\
-}\0";
-
-pub(crate) const SILU_BACKWARD_SRCAD_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_silu_backward_srcad_f32(\n\
-    .param .u64 grad, .param .u64 input, .param .u64 out, .param .u64 n\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<9>;\n\
-    .reg .f32 %fs<5>;\n\
-    .reg .pred %p1;\n\
-    ld.param.u64 %rd1, [grad];\n\
-    ld.param.u64 %rd2, [input];\n\
-    ld.param.u64 %rd3, [out];\n\
-    ld.param.u64 %rd4, [n];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd5, %r3;\n\
-    setp.ge.u64 %p1, %rd5, %rd4;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd6, %rd5, 2;\n\
-    add.u64 %rd7, %rd1, %rd6;\n\
-    ld.global.f32 %fs1, [%rd7];\n\
-    add.u64 %rd7, %rd2, %rd6;\n\
-    ld.global.f32 %fs2, [%rd7];\n\
-    neg.f32 %fs3, %fs2;\n\
-    mul.f32 %fs3, %fs3, 0f3FB8AA3B;\n\
-    ex2.approx.f32 %fs3, %fs3;\n\
-    add.f32 %fs3, %fs3, 0f3F800000;\n\
-    rcp.approx.f32 %fs3, %fs3;\n\
-    sub.rn.f32 %fs4, 0f3F800000, %fs3;\n\
-    mul.rn.f32 %fs4, %fs2, %fs4;\n\
-    add.rn.f32 %fs4, 0f3F800000, %fs4;\n\
-    mul.rn.f32 %fs4, %fs3, %fs4;\n\
-    mul.rn.f32 %fs4, %fs1, %fs4;\n\
-    add.u64 %rd8, %rd3, %rd6;\n\
-    st.global.f32 [%rd8], %fs4;\n\
-DONE: ret;\n\
-}\0";
-
-// Source-AD SIGMOID backward (Milestone C · p4 slice 3). Fuses the three
-// adjoint kernels source-AD emits for `SigmoidBackward` — Sub, Mul, Mul — into
-// ONE launch, and is BIT-EXACT with them. Input `y` is the sigmoid OUTPUT (the
-// adjoint carries `op.result`, not the pre-activation).
-//
-// Computes, per element, in source-AD's exact operation order:
-//   t1 = 1.0 - y
-//   t2 = y * t1
-//   out = grad * t2     => grad * y*(1 - y)
-//
-// `.rn` on every op (round-to-nearest, already the default) forbids ptxas from
-// contracting any register-dependent mul+add into a single `fma` — each op
-// rounds independently, exactly like the three separate kernels whose
-// intermediates round to f32 through global memory. (Sigmoid backward has no
-// mul-feeding-add pair, but `.rn` documents intent and is zero-cost.)
-pub(crate) const SIGMOID_BACKWARD_SRCAD_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_sigmoid_backward_srcad_f32(\n\
-    .param .u64 grad, .param .u64 input, .param .u64 out, .param .u64 n\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<9>;\n\
-    .reg .f32 %fs<4>;\n\
-    .reg .pred %p1;\n\
-    ld.param.u64 %rd1, [grad];\n\
-    ld.param.u64 %rd2, [input];\n\
-    ld.param.u64 %rd3, [out];\n\
-    ld.param.u64 %rd4, [n];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd5, %r3;\n\
-    setp.ge.u64 %p1, %rd5, %rd4;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd6, %rd5, 2;\n\
-    add.u64 %rd7, %rd1, %rd6;\n\
-    ld.global.f32 %fs1, [%rd7];\n\
-    add.u64 %rd7, %rd2, %rd6;\n\
-    ld.global.f32 %fs2, [%rd7];\n\
-    sub.rn.f32 %fs3, 0f3F800000, %fs2;\n\
-    mul.rn.f32 %fs3, %fs2, %fs3;\n\
-    mul.rn.f32 %fs3, %fs1, %fs3;\n\
-    add.u64 %rd8, %rd3, %rd6;\n\
-    st.global.f32 [%rd8], %fs3;\n\
-DONE: ret;\n\
-}\0";
-
-// Source-AD TANH backward (Milestone C · p4 slice 3). Fuses the three adjoint
-// kernels source-AD emits for `TanhBackward` — Mul, Sub, Mul — into ONE launch,
-// and is BIT-EXACT with them. Input `y` is the tanh OUTPUT.
-//
-// Computes, per element, in source-AD's exact operation order:
-//   t1 = y * y
-//   t2 = 1.0 - t1
-//   out = grad * t2     => grad * (1 - y*y)
-//
-// LOAD-BEARING `.rn`: `t1 = y*y` feeds `t2 = 1.0 - t1`, a mul-feeding-sub that
-// ptxas would otherwise contract into a single-rounding `fma(-y, y, 1.0)` (~1
-// ULP drift). `.rn` on the mul forces `y*y` to round to f32 first — exactly as
-// the decomposed path does when it stores `y_sq` to global memory before the
-// subtract — and `.rn` on the sub keeps them separate.
-pub(crate) const TANH_BACKWARD_SRCAD_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_tanh_backward_srcad_f32(\n\
-    .param .u64 grad, .param .u64 input, .param .u64 out, .param .u64 n\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<9>;\n\
-    .reg .f32 %fs<4>;\n\
-    .reg .pred %p1;\n\
-    ld.param.u64 %rd1, [grad];\n\
-    ld.param.u64 %rd2, [input];\n\
-    ld.param.u64 %rd3, [out];\n\
-    ld.param.u64 %rd4, [n];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd5, %r3;\n\
-    setp.ge.u64 %p1, %rd5, %rd4;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd6, %rd5, 2;\n\
-    add.u64 %rd7, %rd1, %rd6;\n\
-    ld.global.f32 %fs1, [%rd7];\n\
-    add.u64 %rd7, %rd2, %rd6;\n\
-    ld.global.f32 %fs2, [%rd7];\n\
-    mul.rn.f32 %fs3, %fs2, %fs2;\n\
-    sub.rn.f32 %fs3, 0f3F800000, %fs3;\n\
-    mul.rn.f32 %fs3, %fs1, %fs3;\n\
-    add.u64 %rd8, %rd3, %rd6;\n\
-    st.global.f32 [%rd8], %fs3;\n\
-DONE: ret;\n\
-}\0";
-
-// Source-AD GELU backward (Milestone C · p4 GELU fix). One launch computing the
-// EXACT derivative of the GPU forward `nsl_gelu_f32` (gelu(x) = x·σ(1.702x),
-// sigmoid approximation):
-//
-//   kx  = 1.702 * x                 (0f3FD9DB23 = 1.702f, matches nsl_tensor_scalar(1.702,1))
-//   s   = σ(kx)                     (identical instructions to nsl_sigmoid_f32)
-//   out = grad * s*(1 + kx*(1-s))
-//
-// This REPLACES the source-AD 7-op expansion of `AdjointExpr::GeluBackward`,
-// which was numerically WRONG: its internal temp `kx` (refcount 1) was
-// FBIP-mutated in place by the expansion's own `Sigmoid(kx)` during the adjoint
-// pass (where the in-place-suppression guard is deliberately clear), so the
-// later `Mul(kx, 1-s)` read σ(kx) and the whole thing computed s·(1+s·(1-s)).
-// Fusing eliminates the temp — no aliasing is possible inside one kernel.
-//
-// NOTE the CPU forward gelu uses the TANH approximation, so the CPU path of
-// `nsl_tensor_gelu_backward` computes the tanh-approx derivative instead — each
-// device gets the derivative of the forward it actually ran. `.rn` on the
-// derivative ops blocks ptxas fma-contraction (family convention; the kx·(1-s)
-// mul feeding the 1+· add is a contractible pair).
-pub(crate) const GELU_BACKWARD_SRCAD_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_gelu_backward_srcad_f32(\n\
-    .param .u64 grad, .param .u64 input, .param .u64 out, .param .u64 n\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<9>;\n\
-    .reg .f32 %fs<5>;\n\
-    .reg .pred %p1;\n\
-    ld.param.u64 %rd1, [grad];\n\
-    ld.param.u64 %rd2, [input];\n\
-    ld.param.u64 %rd3, [out];\n\
-    ld.param.u64 %rd4, [n];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd5, %r3;\n\
-    setp.ge.u64 %p1, %rd5, %rd4;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd6, %rd5, 2;\n\
-    add.u64 %rd7, %rd1, %rd6;\n\
-    ld.global.f32 %fs1, [%rd7];\n\
-    add.u64 %rd7, %rd2, %rd6;\n\
-    ld.global.f32 %fs2, [%rd7];\n\
-    mul.rn.f32 %fs2, %fs2, 0f3FD9DB23;\n\
-    neg.f32 %fs3, %fs2;\n\
-    mul.f32 %fs3, %fs3, 0f3FB8AA3B;\n\
-    ex2.approx.f32 %fs3, %fs3;\n\
-    add.f32 %fs3, %fs3, 0f3F800000;\n\
-    rcp.approx.f32 %fs3, %fs3;\n\
-    sub.rn.f32 %fs4, 0f3F800000, %fs3;\n\
-    mul.rn.f32 %fs4, %fs2, %fs4;\n\
-    add.rn.f32 %fs4, 0f3F800000, %fs4;\n\
-    mul.rn.f32 %fs4, %fs3, %fs4;\n\
-    mul.rn.f32 %fs4, %fs1, %fs4;\n\
-    add.u64 %rd8, %rd3, %rd6;\n\
-    st.global.f32 [%rd8], %fs4;\n\
-DONE: ret;\n\
-}\0";
 
 // Fused per-parameter FASE-Deferred AdamW/Adam optimizer step (Milestone C ·
 // p9). ONE launch replacing the ~15-launch interpreted `UpdateProgram`
@@ -1644,16 +1213,7 @@ pub(crate) const ALL_PTX: &[(&str, &str)] = &[
     ("ROTATE_HALF_F32_PTX", ROTATE_HALF_F32_PTX),
     ("ROTATE_HALF_NEG_F32_PTX", ROTATE_HALF_NEG_F32_PTX),
     ("DIV_SCALAR_F32_PTX", DIV_SCALAR_F32_PTX),
-    ("RELU_BACKWARD_F32_PTX", RELU_BACKWARD_F32_PTX),
-    ("SIGMOID_BACKWARD_F32_PTX", SIGMOID_BACKWARD_F32_PTX),
-    ("TANH_BACKWARD_F32_PTX", TANH_BACKWARD_F32_PTX),
     ("GELU_BACKWARD_F32_PTX", GELU_BACKWARD_F32_PTX),
-    ("SILU_BACKWARD_F32_PTX", SILU_BACKWARD_F32_PTX),
-    ("SWIGLU_GATE_BACKWARD_F32_PTX", SWIGLU_GATE_BACKWARD_F32_PTX),
-    ("SILU_BACKWARD_SRCAD_F32_PTX", SILU_BACKWARD_SRCAD_F32_PTX),
-    ("SIGMOID_BACKWARD_SRCAD_F32_PTX", SIGMOID_BACKWARD_SRCAD_F32_PTX),
-    ("TANH_BACKWARD_SRCAD_F32_PTX", TANH_BACKWARD_SRCAD_F32_PTX),
-    ("GELU_BACKWARD_SRCAD_F32_PTX", GELU_BACKWARD_SRCAD_F32_PTX),
     ("FASE_FUSED_ADAMW_STEP_F32_PTX", FASE_FUSED_ADAMW_STEP_F32_PTX),
     ("FASE_FUSED_ADAMW_MULTI_F32_PTX", FASE_FUSED_ADAMW_MULTI_F32_PTX),
     ("FASE_FUSED_ADAMW_MULTI_BF16SR_PTX", FASE_FUSED_ADAMW_MULTI_BF16SR_PTX),
