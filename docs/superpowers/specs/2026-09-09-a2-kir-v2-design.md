@@ -916,6 +916,20 @@ frozen throughout, so nothing here blocks a kernel fix.
     - **SASS:** the floating-point multiset is identical on sm_80/90/120,
       and the sequence is identical on sm_80. On sm_90/120 two independent
       `FMUL`s trade places. Registers are 16/16/18 against 18/18/18.
+    - **The multi-tensor step:** `nsl_fase_fused_adamw_multi_f32`
+      (`build_fase_adamw_multi`) follows. It reads its θ/m/v/mp bases from
+      device pointer tables and its element from the host-built
+      `bptab`/`bbtab` block tables (`bbtab[b] + tid`, never `%ntid`). It
+      branches around the Phase-B clip pre-scale when `mp_scale == 1.0`
+      and zeroes `mp` after the step. Its gate,
+      `fase_adamw_multi_kir_equivalence`, runs the flat grid over five
+      ragged parameters, one of them empty, and catches the bound, both
+      indices, the `bbtab + tid` add, all fifteen element sizes, every
+      scalar and table slot, both branches and the zeroing store. SASS:
+      the floating-point multiset is identical on sm_80/90/120, the
+      sequence identical on sm_80, and registers are 20/20/20 against
+      24/24/21; the rest of the difference is address arithmetic
+      (`IMAD.WIDE` for shift and add).
 12. **FA v2**, by phase directory, tier B.1 and B.2 last; the SASS
     baselines and the two no-spill gates already exist here and are the
     proof. `matmul_mma.rs` and `kernel_skeleton/` are deleted with their

@@ -8,6 +8,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **`nsl_fase_fused_adamw_multi_f32` is built by
+  `nsl_kir::kernels::optim` in place of its hand-written constant**
+  (new-roadmap item 5, after the single-parameter step). It is the
+  multi-tensor FASE AdamW launch: one flat grid over every parameter,
+  bit-exact with the per-parameter steps.
+  - **The kernel** (`build_fase_adamw_multi`) reads each parameter's
+    θ/m/v/mp bases from device pointer tables and its element from the
+    host-built block tables, keeps the per-operation rounding, branches
+    around the Phase-B clip pre-scale at `mp_scale == 1.0`, and zeroes the
+    accumulated gradient after the step.
+  - **The gate.** `tests/fase_adamw_multi_kir_equivalence.rs` (13 tests)
+    runs the frozen hand kernel and the KIR one on the CTA interpreter over
+    five ragged parameters, one of them empty.
+    - It requires identical global memory under two schedules and five
+      hyperparameter sets (with and without decay and clip pre-scale), and
+      AdamW rounded per operation with `mp` zeroed and every tail intact.
+    - It catches mutants of the bound, the block and thread indices, the
+      block-base add, all fifteen element sizes, every scalar and table
+      slot, both branches, each add and multiply, the square root, the
+      division and the zeroing store.
+  - **SASS** on sm_80/90/120: the same floating-point instructions,
+    identically ordered on sm_80. Registers are 20/20/20 against the hand
+    kernel's 24/24/21.
 - **`nsl_fase_fused_adamw_step_f32` is built by
   `nsl_kir::kernels::optim` in place of its hand-written constant**
   (new-roadmap item 5). This is the fused FASE-Deferred AdamW/Adam step,
