@@ -34,6 +34,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
     order is identical on sm_80; on sm_90/120 two independent multiplies
     trade places. Registers are 16/16/18 against the hand kernel's
     18/18/18.
+- `nsl_clamp_backward_f32` is built as KIR
+  (`nsl_kir::kernels::elementwise::build_clamp_backward`), the last
+  activation-style backward kernel to leave hand-written PTX apart from
+  `nsl_gelu_backward_f32` (roadmap A2 step 11). The runtime builds it on
+  first use (`cuda::kernels::clamp_backward_f32_ptx()`) in place of the
+  hand-written constant.
+  `tests/clamp_backward_kir_equivalence.rs` runs the frozen hand kernel and
+  the KIR one on the CTA interpreter over IEEE-corner inputs and seven
+  bound pairs: ordinary, one-sided infinite, a single point, reversed, and
+  a NaN on either side. It requires:
+  - the same bytes in all of global memory;
+  - the formula bit for bit: an input on a bound passes the gradient, and a
+    NaN passes nothing.
+
+  It catches nine named mutants:
+  - a strict comparison on either bound;
+  - `or` for `and`;
+  - either bound read as the other;
+  - the select's arms swapped;
+  - the input passed in place of the gradient;
+  - the index bound relaxed, the block index ignored, and every element
+    size nudged.
+
+  On sm_80/90/120 the SASS has the hand kernel's instruction count, its 12
+  registers and its comparison-and-select core. Only the address arithmetic
+  differs.
 
 - Nine activation-backward kernels are built by
   `nsl_kir::kernels::elementwise` (`BackwardOp`) in place of their

@@ -737,6 +737,48 @@ pub fn backward_ptx(op: BackwardOp) -> Vec<u8> {
     verified_ptx(build_backward(op))
 }
 
+/// The clamp adjoint's entry name.
+pub const CLAMP_BACKWARD_NAME: &str = "nsl_clamp_backward_f32";
+
+/// `nsl_clamp_backward_f32(grad, input, out, min_val, max_val, n)`:
+/// `out[i] = (input[i] >= min_val && input[i] <= max_val) ? grad[i] : 0`.
+/// Both comparisons are ordered, so a NaN input (or bound) passes nothing:
+/// the hand kernel's `setp.ge`, `setp.le`, `and.pred`, `selp`.
+pub fn build_clamp_backward() -> KernelIR {
+    use AddressSpace::Global;
+    let mut b = KirBuilder::new(CLAMP_BACKWARD_NAME);
+    let grad = b.add_param("grad", f32_ptr(), Global);
+    let input = b.add_param("input", f32_ptr(), Global);
+    let out = b.add_param("out", f32_ptr(), Global);
+    let lo = b.add_param("min_val", KirType::F32, Global);
+    let hi = b.add_param("max_val", KirType::F32, Global);
+    let n = b.add_param("n", KirType::U64, Global);
+    let (i, _, exit) = index_and_bound(&mut b, n);
+
+    let g = load_f32(&mut b, grad, i);
+    let x = load_f32(&mut b, input, i);
+    let above = b.new_typed_var(KirType::Bool);
+    b.emit(KirOp::Cmp(above, x, lo, CmpOp::Ge));
+    let below = b.new_typed_var(KirType::Bool);
+    b.emit(KirOp::Cmp(below, x, hi, CmpOp::Le));
+    let inside = b.new_typed_var(KirType::Bool);
+    b.emit(KirOp::And(inside, above, below));
+    let zero = f32_const(&mut b, 0);
+    let y = b.new_typed_var(KirType::F32);
+    b.emit(KirOp::Select(y, inside, g, zero));
+    store_f32(&mut b, out, i, y);
+    finish(b, exit)
+}
+
+/// [`build_clamp_backward`] lowered to a NUL-terminated PTX module.
+///
+/// # Panics
+///
+/// If the built kernel fails verification: a bug in this module.
+pub fn clamp_backward_ptx() -> Vec<u8> {
+    verified_ptx(build_clamp_backward())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -871,6 +913,32 @@ mod tests {
             assert_eq!(bytes.last(), Some(&0), "{op:?}");
             assert!(bytes.is_ascii(), "{op:?}");
         }
+    }
+
+    #[test]
+    fn the_clamp_backward_kernel_verifies_and_keeps_its_signature() {
+        let ir = build_clamp_backward();
+        if let Err(errors) = verify(&ir) {
+            panic!("clamp backward failed verification: {errors:?}");
+        }
+        assert_eq!(ir.name, CLAMP_BACKWARD_NAME);
+        let params: Vec<(&str, KirType)> = ir.params.iter().map(|p| (p.name.as_str(), p.ty.clone())).collect();
+        assert_eq!(
+            params,
+            [
+                ("grad", f32_ptr()),
+                ("input", f32_ptr()),
+                ("out", f32_ptr()),
+                ("min_val", KirType::F32),
+                ("max_val", KirType::F32),
+                ("n", KirType::U64),
+            ]
+        );
+        let text = String::from_utf8(clamp_backward_ptx()).expect("ASCII");
+        for mnemonic in ["setp.ge.f32 ", "setp.le.f32 ", "and.pred ", "selp.f32 "] {
+            assert_eq!(text.matches(mnemonic).count(), 1, "{mnemonic}");
+        }
+        assert!(text.ends_with('\0'));
     }
 
     /// The tape-AD kernels are bare, the source-AD ones explicitly rounded

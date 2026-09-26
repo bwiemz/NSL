@@ -876,9 +876,15 @@ frozen throughout, so nothing here blocks a kernel fix.
       except the SwiGLU gate on sm_80+. There the independent `grad * up`
       `FMUL` is scheduled elsewhere, with the same multiset and no `FFMA`.
       Registers are within two of the hand kernels.
+    - **Clamp adjoint:** `nsl_clamp_backward_f32` followed once the
+      interpreter gained `and.pred` (`build_clamp_backward`). Its gate,
+      `clamp_backward_kir_equivalence`, runs bounds that are ordinary,
+      equal, reversed, infinite and NaN. The SASS is the hand kernel's
+      `FSETP.GTU`/`FSETP.GE`/`FSEL` core with 12 registers on sm_80/90/120;
+      only the address arithmetic differs (`IMAD.WIDE` in place of shift
+      and add), with the same instruction count.
     - **Still hand-written:** `nsl_gelu_backward_f32` (tanh approximation,
-      `div.approx`). `nsl_clamp_backward_f32` waits for `and.pred` in the
-      interpreter.
+      `div.approx`).
 
     **`div.approx`, and the fused FASE AdamW step** (new-roadmap item 5).
     - **The op:** `KirOp::DivApprox` prints `div.approx.f32`. It is f32

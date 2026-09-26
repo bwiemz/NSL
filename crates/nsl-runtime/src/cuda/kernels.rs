@@ -390,8 +390,9 @@ DONE: ret;\n\
 // `nsl_kir::kernels::elementwise` (its `elementwise_backward_kir_equivalence`
 // gate). The source-AD kernels match a chain of separate launches bit for
 // bit, so their derivative arithmetic is explicitly rounded (`.rn`, which
-// ptxas never contracts into an `fma`). `nsl_gelu_backward_f32`
-// (`div.approx.f32`) and `nsl_clamp_backward_f32` stay hand-written below.
+// ptxas never contracts into an `fma`). So is `nsl_clamp_backward_f32`
+// (`clamp_backward_kir_equivalence`). `nsl_gelu_backward_f32`
+// (`div.approx.f32`) stays hand-written below.
 
 use nsl_kir::kernels::elementwise::BackwardOp;
 
@@ -1037,47 +1038,16 @@ STORE:\n\
 DONE: ret;\n\
 }\0";
 
-/// clamp_backward: out[i] = (input[i] >= min_val && input[i] <= max_val) ? grad[i] : 0
-pub(crate) const CLAMP_BACKWARD_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_clamp_backward_f32(\n\
-    .param .u64 grad, .param .u64 input, .param .u64 out,\n\
-    .param .f32 min_val, .param .f32 max_val, .param .u64 n\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<9>;\n\
-    .reg .f32 %fs<6>;\n\
-    .reg .pred %p<3>;\n\
-    ld.param.u64 %rd1, [grad];\n\
-    ld.param.u64 %rd2, [input];\n\
-    ld.param.u64 %rd3, [out];\n\
-    ld.param.f32 %fs4, [min_val];\n\
-    ld.param.f32 %fs5, [max_val];\n\
-    ld.param.u64 %rd4, [n];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd5, %r3;\n\
-    setp.ge.u64 %p1, %rd5, %rd4;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd6, %rd5, 2;\n\
-    add.u64 %rd7, %rd1, %rd6;\n\
-    ld.global.f32 %fs1, [%rd7];\n\
-    add.u64 %rd7, %rd2, %rd6;\n\
-    ld.global.f32 %fs2, [%rd7];\n\
-    setp.ge.f32 %p1, %fs2, %fs4;\n\
-    setp.le.f32 %p2, %fs2, %fs5;\n\
-    and.pred %p1, %p1, %p2;\n\
-    selp.f32 %fs3, %fs1, 0f00000000, %p1;\n\
-    add.u64 %rd8, %rd3, %rd6;\n\
-    st.global.f32 [%rd8], %fs3;\n\
-DONE: ret;\n\
-}\0";
+/// `nsl_clamp_backward_f32(grad, input, out, min_val, max_val, n)`:
+/// `out[i] = (input[i] >= min_val && input[i] <= max_val) ? grad[i] : 0`,
+/// built by `nsl_kir::kernels::elementwise` (its
+/// `clamp_backward_kir_equivalence` gate). NUL-terminated.
+pub(crate) fn clamp_backward_f32_ptx() -> &'static str {
+    static MODULE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    MODULE.get_or_init(|| {
+        String::from_utf8(nsl_kir::kernels::elementwise::clamp_backward_ptx()).expect("PTX must be ASCII")
+    })
+}
 
 /// tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
 pub(crate) const TANH_F32_PTX: &str = "\
@@ -1135,6 +1105,5 @@ pub(crate) const ALL_PTX: &[(&str, &str)] = &[
     ("FASE_FUSED_ADAMW_MULTI_BF16SR_PTX", FASE_FUSED_ADAMW_MULTI_BF16SR_PTX),
     ("FASE_FUSED_ADAMW_STEP_BF16SR_PTX", FASE_FUSED_ADAMW_STEP_BF16SR_PTX),
     ("SR_BF16_ROUND_PROBE_PTX", SR_BF16_ROUND_PROBE_PTX),
-    ("CLAMP_BACKWARD_F32_PTX", CLAMP_BACKWARD_F32_PTX),
     ("TANH_F32_PTX", TANH_F32_PTX),
 ];
