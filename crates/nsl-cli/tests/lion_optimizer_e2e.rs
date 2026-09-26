@@ -12,7 +12,7 @@
 //! encodes Lion's signature property (each weight moves by exactly `lr`, so
 //! `w = 1.0 - 0.01 = 0.99`). A pass proves the whole pipeline — semantic →
 //! codegen → runtime → stdlib `lion.nsl` — is correct end to end. CPU-only; no
-//! GPU required.
+//! GPU required. A second, multi-step fixture pins the momentum wiring.
 
 use std::process::Command;
 
@@ -26,10 +26,9 @@ fn workspace_root() -> std::path::PathBuf {
         .to_path_buf()
 }
 
-#[test]
-fn e2e_lion_optimizer_trains_and_verifies() {
+fn run_fixture(fixture: &str, marker: &str) {
     let root = workspace_root();
-    let example_path = root.join("examples/lion_optimizer_sign_e2e.nsl");
+    let example_path = root.join(fixture);
     let output = Command::new(env!("CARGO"))
         .args(["run", "-q", "-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run"])
         .arg(&example_path)
@@ -44,15 +43,32 @@ fn e2e_lion_optimizer_trains_and_verifies() {
     // in-program `assert_close` aborted (wrong Lion update).
     assert!(
         output.status.success(),
-        "Lion training e2e failed (exit {:?}).\nstdout:\n{}\nstderr:\n{}",
+        "Lion training e2e {} failed (exit {:?}).\nstdout:\n{}\nstderr:\n{}",
+        fixture,
         output.status.code(),
         stdout,
         stderr
     );
     assert!(
-        stdout.contains("lion-verified"),
-        "Expected 'lion-verified' (post-assert_close) in stdout, got:\nstdout:\n{}\nstderr:\n{}",
+        stdout.contains(marker),
+        "Expected '{}' (post-assert_close) in stdout, got:\nstdout:\n{}\nstderr:\n{}",
+        marker,
         stdout,
         stderr
     );
+}
+
+#[test]
+fn e2e_lion_optimizer_trains_and_verifies() {
+    run_fixture("examples/lion_optimizer_sign_e2e.nsl", "lion-verified");
+}
+
+/// The single-step fixture starts from m = 0, where the update is sign(g) for
+/// any beta1/beta2, so it cannot see the momentum. This one runs 8 steps
+/// through a gradient sign change: swapping beta1/beta2, dropping the momentum
+/// from the update, setting m = g, or never updating m each land a whole `lr`
+/// away from the exact final weight.
+#[test]
+fn e2e_lion_momentum_trajectory_is_exact() {
+    run_fixture("examples/lion_optimizer_momentum_e2e.nsl", "lion-momentum-verified");
 }

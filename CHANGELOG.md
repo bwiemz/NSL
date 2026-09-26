@@ -34,6 +34,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
     order is identical on sm_80; on sm_90/120 two independent multiplies
     trade places. Registers are 16/16/18 against the hand kernel's
     18/18/18.
+- A multi-step Lion gate (`e2e_lion_momentum_trajectory_is_exact`, fixture
+  `examples/lion_optimizer_momentum_e2e.nsl`) pins the stdlib optimizer's
+  momentum (roadmap tolerance audit, second slice).
+  - The existing Lion gate takes one step from `m = 0`. There the update is
+    `sign(g)` whatever `beta1`, `beta2` and the momentum update are, so it
+    cannot see any of them.
+  - The new fixture runs 8 steps through a gradient sign change and asserts
+    the exact final weight (0.4, tolerance 1e-4). It fails the run if
+    `beta1` and `beta2` are swapped, if the momentum is dropped from the
+    update, if `m` is set to `g`, or if `m` is never updated. Each of these
+    lands a whole `lr` away.
+  - The smallest pre-sign value along the trajectory is about 0.016, far
+    above f32 noise.
 - The RoPE `rotate_half` pair is built as KIR: `nsl_rotate_half_f32`
   (`out[..h] = -in[h..]`, `out[h..] = in[..h]` over the last dimension) and
   the fused backward `nsl_rotate_half_neg_f32` (the negation on the other
@@ -680,6 +693,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **FP8 simulation rounds onto the FP8 grid** (roadmap tolerance audit,
+  third slice).
+  - **What was wrong.** `fp8::quantize_fp8` (behind `nsl_fp8_cast`,
+    `@fp8_compute` and the E5M2 backward) and `quantize_mxfp8` rounded
+    `x / scale` onto a uniform grid of 0.125 (E4M3) or 0.5 (E5M2) across
+    the whole range. That grid has about 7,000 (E4M3) or 230,000 (E5M2)
+    levels, so values near the maximum kept far more precision than FP8
+    can hold. Anything under a quarter step flushed to zero where FP8 has
+    subnormals.
+  - **Why the tests passed.** The test "reference" called the runtime's
+    own `quantize_fp8`. It then compared the matmuls at 2% (E4M3) and 10%
+    (E5M2).
+  - **Now.** Both quantizers call `fp8::round_to_fp8`. It rounds to the
+    nearest OCP E4M3/E5M2 value, ties to even, with subnormals, and
+    saturates at ±448 / ±57344. NaN propagates.
+  - **The reference is independent.** `tests/common/fp8_reference.rs`
+    decodes the 256 codes itself and searches them.
+    - The cast outputs must match it bit for bit.
+    - The matmul tolerances drop to 1e-5, which only covers f32 against
+      f64 accumulation. The old quantizer is 3–9% away from it; the E5M2
+      10% bound passed all four shapes.
+    - New tests cover every code and every midpoint between neighbours,
+      hand-checked spec values, and a check that E5M2's error really is
+      about 2^-3.
+  - **KV-cache E4M3 bytes** (`kv_compress::quantize`).
+    - The encoder truncated the mantissa: 447 became 416. It also flushed
+      everything below 2^-6 to zero. Now it rounds with `round_to_fp8` and
+      encodes subnormals.
+    - The CPU decoder and the GPU `nsl_dequant_fp8_e4m3_f32` kernel both
+      decoded subnormal codes as normals: code 1 read as 0.0088, not
+      2^-9. The GPU kernel also decoded the NaN code as ±480. Both are
+      fixed.
+    - `tests/fp8_e4m3_dequant_interp.rs` runs the kernel on the CTA
+      interpreter over all 256 codes and against the CPU decoder. It runs
+      in CI, needs no GPU, and fails on the old kernel.
+  - **Unit tests** that encoded the uniform grid now assert the exact FP8
+    values. Examples: 1000 in E5M2 is 1024, and 5 at scale 8/57344 is 32/7.
 - With `grad_clip` and FASE-Deferred accumulation on the tape path, the
   gradients were clipped twice. Section 7e2 clipped every micro-batch
   (`nsl_clip_grad_norm`), and the optimizer's two-phase clip then clipped

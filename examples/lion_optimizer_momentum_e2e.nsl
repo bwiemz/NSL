@@ -1,0 +1,37 @@
+# Multi-step regression for the stdlib Lion optimizer's momentum.
+#
+# `lion_optimizer_sign_e2e.nsl` takes one step from m = 0, where the update is
+# sign(g) for any beta1/beta2 — so it cannot see the momentum at all. Here the
+# weights overshoot their optimum and the gradient changes sign, so the sign
+# of `beta1*m + (1-beta1)*g` depends on the momentum history.
+#
+# pred = x @ w = 2w (both weights stay equal), loss = mean((2w - 1.1)^2), so
+# g = 2(2w - 1.1) and the optimum is w = 0.55. Exact trajectory (lr = 0.1,
+# beta1 = 0.9, beta2 = 0.99, m0 = 0), one step per epoch:
+#   step: 1    2    3    4    5    6    7    8
+#   w:    0.9  0.8  0.7  0.6  0.5  0.4  0.5  0.4
+# Step 6 keeps descending past the optimum because the momentum still points
+# down; step 7 turns around. Final w = 0.4. Wrong momentum wiring lands a
+# whole lr away: beta1/beta2 swapped or m updated with beta1 -> 0.2;
+# no momentum in the update, m = g, or m never updated -> 0.6. The smallest
+# |beta1*m + (1-beta1)*g| along the trajectory is ~0.016, far above f32 noise.
+from nsl.nn.losses import mse_loss
+
+model Linear:
+    w: Tensor = ones([2, 1])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+let m = Linear()
+let x = ones([4, 2])
+let y = full([4, 1], 1.1)
+
+train(model = m, epochs = 8):
+    optimizer: Lion(lr = 0.1, beta1 = 0.9, beta2 = 0.99)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y)
+
+assert_close(m.w, full([2, 1], 0.4), 0.0001, 0.0001)
+print("lion-momentum-verified")
