@@ -282,45 +282,43 @@ pub fn dequantize_fp8(packed: &[u8], output: &mut [f32]) {
     }
 }
 
-/// Convert a single f32 to FP8 E4M3.
+/// Convert a single f32 to FP8 E4M3: round to nearest (ties to even) onto the
+/// E4M3 grid, saturating at ±448, then encode the rounded value exactly.
+///
+/// This used to truncate the mantissa to its top 3 bits (a bias of up to one
+/// ulp toward zero — 447 became 416) and flush everything below 2^-6 to zero
+/// instead of encoding E4M3's subnormals.
 fn f32_to_fp8_e4m3(v: f32) -> u8 {
-    let clamped = v.clamp(-448.0, 448.0);
-    let bits = clamped.to_bits();
-    let sign = (bits >> 31) & 1;
-    let exp = ((bits >> 23) & 0xFF) as i32 - 127; // f32 exponent bias
-    let mantissa = bits & 0x7F_FFFF;
-
-    if clamped == 0.0 || exp < -6 {
-        return (sign << 7) as u8; // zero or denorm -> zero
+    let r = crate::fp8::round_to_fp8(v as f64, crate::fp8::FP8_FORMAT_E4M3);
+    if r.is_nan() {
+        return 0x7F;
     }
-    // E4M3: bias = 7, exp range [-6, 8]
-    let biased_exp = (exp + 7).clamp(0, 15) as u8;
-    let m3 = (mantissa >> 20) as u8; // top 3 mantissa bits
-
-    // CRITICAL-1 fix: E4M3 NaN is exp=15, mantissa=7 (0x7F/0xFF) — clamp to ±416
-    if biased_exp == 15 && m3 == 7 {
-        return ((sign as u8) << 7) | (15 << 3) | 6; // largest finite: ±416
+    let sign = if r.is_sign_negative() { 0x80u8 } else { 0 };
+    let a = r.abs();
+    if a < 2f64.powi(-6) {
+        // Zero or subnormal: a = m * 2^-9 exactly, m in 0..=7.
+        return sign | (a * 512.0) as u8;
     }
-    ((sign as u8) << 7) | (biased_exp << 3) | m3
+    // Normal: a = (1 + m/8) * 2^e exactly, e in -6..=8, m in 0..=7.
+    let e = ((a.to_bits() >> 52) & 0x7ff) as i32 - 1023;
+    let m = ((a / 2f64.powi(e) - 1.0) * 8.0) as u8;
+    sign | (((e + 7) as u8) << 3) | m
 }
 
 /// Convert a single FP8 E4M3 to f32.
 fn fp8_e4m3_to_f32(b: u8) -> f32 {
-    let sign = (b >> 7) & 1;
+    let sign = if b & 0x80 != 0 { -1.0f32 } else { 1.0 };
     let exp = ((b >> 3) & 0x0F) as i32;
-    let mantissa = (b & 0x07) as u32;
-
-    if exp == 0 && mantissa == 0 {
-        return if sign == 1 { -0.0 } else { 0.0 };
-    }
-    // CRITICAL-2 fix: E4M3 NaN is exp=15, mantissa=7 — decode as f32 NaN
-    if exp == 15 && mantissa == 7 {
+    let mantissa = (b & 0x07) as f32;
+    // E4M3 has no infinities; S.1111.111 is its only NaN.
+    if exp == 15 && mantissa == 7.0 {
         return f32::NAN;
     }
-    let f32_exp = (exp - 7 + 127) as u32; // unbias E4M3, rebias f32
-    let f32_mantissa = mantissa << 20;     // position in f32 mantissa
-    let bits = ((sign as u32) << 31) | (f32_exp << 23) | f32_mantissa;
-    f32::from_bits(bits)
+    if exp == 0 {
+        // Subnormal (and signed zero): m/8 * 2^-6.
+        return sign * mantissa / 8.0 * 2f32.powi(-6);
+    }
+    sign * (1.0 + mantissa / 8.0) * 2f32.powi(exp - 7)
 }
 
 #[cfg(test)]
@@ -401,17 +399,43 @@ mod tests {
 
     #[test]
     fn fp8_roundtrip() {
-        let values = vec![0.0, 1.0, -1.0, 0.5, -0.5, 100.0, -100.0, 448.0];
+        // Each value lands on its nearest E4M3 neighbour: 1, 0.5 and 448 are
+        // exact, 100 lies in [64, 128) where the spacing is 8 (100 is a tie
+        // between 96 and 104 and goes to the even 96), 447 rounds up to 448,
+        // and 0.003 is a subnormal: 0.003 * 2^9 = 1.536 rounds to 2, i.e.
+        // 2 * 2^-9.
+        let values = vec![0.0, 1.0, -1.0, 0.5, -0.5, 100.0, -100.0, 448.0, 447.0, 0.003];
+        let want = [0.0, 1.0, -1.0, 0.5, -0.5, 96.0, -96.0, 448.0, 448.0, 2.0 / 512.0];
         let mut packed = vec![0u8; values.len()];
         quantize_fp8(&values, &mut packed);
 
         let mut restored = vec![0.0f32; values.len()];
         dequantize_fp8(&packed, &mut restored);
+        assert_eq!(restored, want);
+    }
 
-        // FP8 E4M3 has limited precision — check within ~10% for non-zero
-        assert_eq!(restored[0], 0.0);
-        assert!((restored[1] - 1.0).abs() < 0.2);
-        assert!((restored[2] + 1.0).abs() < 0.2);
+    /// Every E4M3 code survives decode → encode, and encoding agrees with
+    /// the runtime's FP8 rounding on the midpoints between neighbours.
+    #[test]
+    fn fp8_e4m3_codes_round_trip_and_round_to_nearest() {
+        for code in 0..=255u8 {
+            let v = fp8_e4m3_to_f32(code);
+            if v.is_nan() {
+                assert_eq!(code & 0x7F, 0x7F, "only S.1111.111 is NaN");
+                continue;
+            }
+            assert_eq!(f32_to_fp8_e4m3(v), code, "code {code:#04x} decodes to {v}");
+        }
+        let mut grid: Vec<f32> = (0..0x7Fu8).map(fp8_e4m3_to_f32).collect();
+        grid.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        for w in grid.windows(2) {
+            for x in [(w[0] + w[1]) / 2.0, w[0] * 0.7 + w[1] * 0.3, w[0] * 0.3 + w[1] * 0.7] {
+                let want = crate::fp8::round_to_fp8(x as f64, crate::fp8::FP8_FORMAT_E4M3) as f32;
+                assert_eq!(fp8_e4m3_to_f32(f32_to_fp8_e4m3(x)), want, "x = {x}");
+            }
+        }
+        assert_eq!(fp8_e4m3_to_f32(f32_to_fp8_e4m3(1e9)), 448.0);
+        assert!(fp8_e4m3_to_f32(f32_to_fp8_e4m3(f32::NAN)).is_nan());
     }
 
     #[test]

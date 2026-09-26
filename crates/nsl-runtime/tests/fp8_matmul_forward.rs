@@ -1,7 +1,9 @@
 #![cfg(feature = "test-hooks")]
 
 //! Integration tests for E4M3 forward matmul — output of nsl_fp8_matmul
-//! agrees with the scalar reference within E4M3_REL_TOL (2%).
+//! agrees with the scalar reference within E4M3_REL_TOL. Both sides multiply
+//! the same FP8-rounded operands, so the tolerance only covers f32-vs-f64
+//! accumulation, not FP8 rounding.
 
 mod common;
 use common::fp8_reference::*;
