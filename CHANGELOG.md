@@ -34,6 +34,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
     order is identical on sm_80; on sm_90/120 two independent multiplies
     trade places. Registers are 16/16/18 against the hand kernel's
     18/18/18.
+- A finite-difference gradcheck of the CPU-naive attention backward oracles
+  (`crates/nsl-test/tests/cpu_naive_backward_gradcheck.rs`) — roadmap
+  tolerance audit, fifth slice.
+  - **What it covers.** The tier-B2 GPU backward tests compare against
+    `cpu_naive_backward_{dq,dkdv,proj}`. On CPU, those oracles were checked
+    only by the following:
+    - an inline copy of the dQ formula (non-causal, one head);
+    - an `s = 1` dK/dV case;
+    - a one-row projection smoke test.
+  - **What the new test does.** It differentiates an independent f64
+    forward by central differences at the f16 inputs. It uses two batches
+    and two heads, causal and non-causal, with a random `dO`.
+  - **Tolerances.** dQ/dK must agree within 2e-3 of the largest gradient
+    (they read the f16 `O`; measured 4.6e-4). dV and the projection must
+    agree within 1e-5 (measured 1.8e-7).
+  - **Mutants.** Of 11 oracle mutants, the old tests missed 5: causal
+    masking dropped from either oracle, dK built from K, dV with its row
+    and column swapped, and the dV path dropped from dx. The gradcheck
+    fails all 11.
 - The CSHA reference backward's finite-difference gradcheck
   (`csha_reference_backward_finite_difference_gradcheck`) is exhaustive
   (roadmap tolerance audit, fourth slice). Every CSHA GPU backward test
@@ -709,6 +728,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **The SwiGLU gate-backward peephole fires** (P5 item 20 slice B). It
+  never had.
+  - **Why it never fired.** `fuse_swiglu_gate_backward` looked for
+    `silu_backward(Mul(y_bar, u), g)`. But `MulElementwise` always wraps its
+    product in `reduce_to_shape` (for broadcasting), so the tape actually
+    held `silu_backward(reduce_to_shape(Mul(y_bar, u), s), g)`. The
+    peephole never matched, and `swiglu_fusion_gate` compared the unfused
+    path with tape-AD.
+  - **The rewrite.** The peephole now sees through the reduce when both
+    intermediates have one reader and neither is a needed gradient. It
+    drops the Mul and the reduce and emits one `swiglu_gate_backward`
+    launch. The reduce is an identity whenever the fused kernel runs, since
+    it requires `y_bar`, `u` and `g` to share a shape.
+  - **The runtime fallback.** The non-uniform fallback in
+    `nsl_tensor_swiglu_gate_backward` now reduces the product to `g`'s shape
+    before `silu_backward`, as the decomposed chain did.
+  - **New kill switch.** `NSL_FUSE_SWIGLU_GATE=0` (compile-time) disables
+    the fusion. A new marker, `[fuse] swiglu gate-backward pairs: N`,
+    reports how many pairs were fused.
+  - **New gate.** `swiglu_peephole_fires_and_is_bit_exact_cpu` requires the
+    marker on the fixture. It also requires the fused weights to equal the
+    `NSL_FUSE_SWIGLU_GATE=0` weights digit for digit.
+  - **GPU.** The fused kernel now runs in GPU SwiGLU training for the first
+    time. The ignored `swiglu_fused_backward_gpu_deterministic_and_matches_reference`
+    gate covers it.
 - **FP8 simulation rounds onto the FP8 grid** (roadmap tolerance audit,
   third slice).
   - **What was wrong.** `fp8::quantize_fp8` (behind `nsl_fp8_cast`,

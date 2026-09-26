@@ -1092,11 +1092,16 @@ pub extern "C" fn nsl_tensor_swiglu_gate_backward(
         && gt.dtype == xt.dtype
         && ut.dtype == xt.dtype;
     if !uniform {
-        // Decomposed pair (broadcasting/mixed cases): exactly what the
-        // compiler emitted before the peephole fused it.
+        // Decomposed chain (broadcasting/mixed cases): exactly what the
+        // compiler emitted before the peephole fused it —
+        // `silu_backward(reduce_to_shape(grad * up, s), x)`, where `s =
+        // silu(x)` has `x`'s shape, so `x` anchors the reduce. An identity
+        // when the product already has `x`'s shape.
         let t = crate::tensor::nsl_tensor_mul(grad_ptr, up_ptr, 0);
-        let out = nsl_tensor_silu_backward(t, x_ptr);
+        let r = crate::tensor::ad_ops::nsl_tensor_reduce_to_shape(t, x_ptr);
         nsl_tensor_free(t);
+        let out = nsl_tensor_silu_backward(r, x_ptr);
+        nsl_tensor_free(r);
         return out;
     }
     if xt.device > 0 {
