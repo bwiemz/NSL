@@ -8,6 +8,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **KIR gains a `U16` type and a `Bitcast` op. With them, the SR-BF16
+  rounding probe and the single-parameter bf16 FASE AdamW step are built
+  by `nsl_kir::kernels::optim` in place of their hand-written constants**
+  (new-roadmap item 5).
+  - **`KirType::U16`** carries raw 16-bit storage bits in a 32-bit `%r`
+    register. A `.u16` load zero-extends, a `.u16` store writes the low
+    half, and `Cast` to or from `U32` is `cvt.u32.u16` / `cvt.u16.u32`.
+  - **`KirOp::Bitcast`** reinterprets the bits between the 32-bit scalars
+    (`U32`/`I32`/`F32`) or between the 64-bit ones, printed `mov.b32` /
+    `mov.b64`. The verifier's new `BitcastWidth` rejects any other pair.
+  - **The kernels.** `nsl_sr_bf16_round_probe` and
+    `nsl_fase_fused_adamw_step_bf16sr` share one stochastic-rounding tail
+    (`sr_bf16_bits`): the splitmix64 dither, then saturate, ∞ and quiet-NaN
+    branches that join through a block parameter. The step reuses the f32
+    step's AdamW body, which the f32 single and multi kernels now share;
+    their PTX is byte-identical to before.
+  - **The gate.** `tests/sr_bf16_kir_equivalence.rs` (13 tests) runs the
+    frozen hand kernels and the KIR ones on the CTA interpreter.
+    - The inputs cover every f32 bit-pattern class, four
+      `(key, counter base)` pairs (one wrapping `u64`) and the f32 step's
+      hyperparameter sets.
+    - It requires identical global memory under two schedules, and the
+      host's `sr_bf16` reference bit for bit. For the step that is the f32
+      step followed by the host rounding. Crafted elements exercise the
+      saturating carry.
+    - It catches mutants of every splitmix64 constant and shift, the
+      dither mask, the key and counter, every mask and special value, each
+      branch, the widening and truncating shifts, the bound, the block
+      index and every element size.
+  - **SASS** on sm_80/90/120: the step issues the hand kernel's
+    floating-point instructions, with 16/16/18 registers against
+    18/18/18. The probe keeps the hand kernel's registers (10/10/11). The
+    rest is address arithmetic.
+
 - **`nsl_fase_fused_adamw_multi_f32` is built by
   `nsl_kir::kernels::optim` in place of its hand-written constant**
   (new-roadmap item 5, after the single-parameter step). It is the

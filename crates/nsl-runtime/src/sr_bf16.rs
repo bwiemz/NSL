@@ -15,7 +15,7 @@
 //! stable `param_base` (its index in the train block's canonical param list
 //! `<< 40`, far above any element count), the runtime threads the CLI
 //! `--seed` and the step counter, and the SAME function runs on CPU (here)
-//! and in PTX (`FASE_FUSED_ADAMW_STEP_BF16SR_PTX`), bit-for-bit. Reruns with
+//! and in PTX (`nsl_fase_fused_adamw_step_bf16sr`, built by `nsl_kir::kernels::optim`), bit-for-bit. Reruns with
 //! equal (seed, step, param, element) produce identical weights on every
 //! rank and every backend.
 //!

@@ -4845,7 +4845,7 @@ pub(crate) fn gpu_fase_fused_adamw_step_bf16sr_raw(
     let block = 256i64;
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
-        kernels::FASE_FUSED_ADAMW_STEP_BF16SR_PTX.as_ptr(),
+        kernels::fase_fused_adamw_step_bf16sr_ptx().as_ptr(),
         b"nsl_fase_fused_adamw_step_bf16sr\0".as_ptr(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
@@ -4859,7 +4859,7 @@ pub(crate) fn gpu_fase_fused_adamw_step_bf16sr_raw(
 /// Stochastically-rounded f32 -> bf16 cast over raw device buffers, for the
 /// BF16 matmul mode's operand staging (`NSL_MATMUL_BF16_ROUND=sr`).
 ///
-/// Shares `SR_BF16_ROUND_PROBE_PTX` with the parity probe below — same
+/// Shares `sr_bf16_round_probe_ptx()` with the parity probe below — same
 /// arithmetic, same `(seed-key, counter)` dither contract, so the CPU
 /// reference `sr_bf16::sr_bf16_round` covers both. Two differences from the
 /// probe, and both matter on the hot path:
@@ -4896,7 +4896,7 @@ pub(crate) fn gpu_cast_raw_f32_to_bf16_sr(
     let block = 256i64;
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
-        kernels::SR_BF16_ROUND_PROBE_PTX.as_ptr(),
+        kernels::sr_bf16_round_probe_ptx().as_ptr(),
         b"nsl_sr_bf16_round_probe\0".as_ptr(),
         [grid, 1, 1],
         [block, 1, 1],
@@ -4911,7 +4911,7 @@ pub(crate) fn gpu_cast_raw_f32_to_bf16_sr(
 }
 
 /// P4 item 17: SR-BF16 rounding-tail probe over raw device buffers — parity
-/// gate hook only (see `SR_BF16_ROUND_PROBE_PTX`).
+/// gate hook only (see `sr_bf16_round_probe_ptx()`).
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_sr_bf16_round_probe(
     src_f32_dev: u64, dst_bf16_dev: u64, n: usize, sr_key: u64, sr_ctr_base: u64,
@@ -4933,7 +4933,7 @@ pub(crate) fn gpu_sr_bf16_round_probe(
     let block = 256i64;
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
-        kernels::SR_BF16_ROUND_PROBE_PTX.as_ptr(),
+        kernels::sr_bf16_round_probe_ptx().as_ptr(),
         b"nsl_sr_bf16_round_probe\0".as_ptr(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
@@ -10414,6 +10414,8 @@ mod tests {
         }
         all.push(("nsl_fase_fused_adamw_step_f32", super::kernels::fase_fused_adamw_step_f32_ptx(), true));
         all.push(("nsl_fase_fused_adamw_multi_f32", super::kernels::fase_fused_adamw_multi_f32_ptx(), true));
+        all.push((nsl_kir::kernels::optim::FASE_ADAMW_STEP_BF16SR_NAME, super::kernels::fase_fused_adamw_step_bf16sr_ptx(), true));
+        all.push((nsl_kir::kernels::optim::SR_BF16_ROUND_PROBE_NAME, super::kernels::sr_bf16_round_probe_ptx(), true));
         all
     }
 
