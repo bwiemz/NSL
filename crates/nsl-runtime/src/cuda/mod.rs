@@ -6151,7 +6151,7 @@ pub(crate) fn gpu_clamp_backward(grad: i64, input: i64, min_val: f32, max_val: f
     let block = 256i64;
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
-        kernels::CLAMP_BACKWARD_F32_PTX.as_ptr(),
+        kernels::clamp_backward_f32_ptx().as_ptr(),
         "nsl_clamp_backward_f32\0".as_ptr(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
@@ -10408,6 +10408,7 @@ mod tests {
         for op in nsl_kir::kernels::elementwise::BackwardOp::ALL {
             all.push((op.kernel_name(), super::kernels::backward_module(op), true));
         }
+        all.push((nsl_kir::kernels::elementwise::CLAMP_BACKWARD_NAME, super::kernels::clamp_backward_f32_ptx(), true));
         all
     }
 
