@@ -599,20 +599,8 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         "--muon-batch-ns requires the muon optimizer",
     ),
     // ── build / cep / calibration subcommands ──────────────────────────────
-    // All twelve found by the widened sweep, none by hand.
-    // CORRECTED after review. The guard is
-    // `calibration_data.is_none() && calibrate != "required"`, and `required`
-    // is the DEFAULT — so this fires only for `--calibrate best-effort`. The
-    // first version claimed a rule the CLI does not enforce for the common
-    // invocation. `flag` names the value, not just the option, so the entry
-    // cannot be read as covering both.
-    src_rule(
-        "--calibrate best-effort",
-        RuleKind::Requires,
-        "--calibration-data",
-        CLI_OPTIONS,
-        "requires --calibration-data <PATH>",
-    ),
+    // Found by the widened sweep, none by hand. (The `--calibrate best-effort`
+    // rule is gone: every calibration flag now refuses outright, roadmap 8.)
     src_rule(
         "--standalone",
         RuleKind::Requires,

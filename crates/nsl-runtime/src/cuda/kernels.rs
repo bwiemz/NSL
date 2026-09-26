@@ -222,110 +222,23 @@ pub(crate) const DIV_F32_PTX: &str = "\
 DONE: ret;\n\
 }\0";
 
-pub(crate) const ROTATE_HALF_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_rotate_half_f32(\n\
-    .param .u64 a, .param .u64 c, .param .u64 n, .param .u64 last_dim, .param .u64 half\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<14>;\n\
-    .reg .f32 %fs<3>;\n\
-    .reg .pred %p<3>;\n\
-    ld.param.u64 %rd1, [a];\n\
-    ld.param.u64 %rd2, [c];\n\
-    ld.param.u64 %rd3, [n];\n\
-    ld.param.u64 %rd4, [last_dim];\n\
-    ld.param.u64 %rd5, [half];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd6, %r3;\n\
-    setp.ge.u64 %p1, %rd6, %rd3;\n\
-    @%p1 bra DONE;\n\
-    rem.u64 %rd7, %rd6, %rd4;\n\
-    shl.b64 %rd8, %rd6, 2;\n\
-    setp.lt.u64 %p2, %rd7, %rd5;\n\
-    @%p2 bra FIRST_HALF;\n\
-    sub.u64 %rd9, %rd6, %rd5;\n\
-    shl.b64 %rd10, %rd9, 2;\n\
-    add.u64 %rd11, %rd1, %rd10;\n\
-    ld.global.f32 %fs1, [%rd11];\n\
-    add.u64 %rd12, %rd2, %rd8;\n\
-    st.global.f32 [%rd12], %fs1;\n\
-    bra DONE;\n\
-FIRST_HALF:\n\
-    add.u64 %rd9, %rd6, %rd5;\n\
-    shl.b64 %rd10, %rd9, 2;\n\
-    add.u64 %rd11, %rd1, %rd10;\n\
-    ld.global.f32 %fs1, [%rd11];\n\
-    neg.f32 %fs2, %fs1;\n\
-    add.u64 %rd12, %rd2, %rd8;\n\
-    st.global.f32 [%rd12], %fs2;\n\
-DONE: ret;\n\
-}\0";
-
-// Fused RoPE backward `neg(rotate_half(x))` (mfu-fusion C2). Clone of
-// ROTATE_HALF_F32_PTX with the negation MOVED to match the composition
-// being replaced, not the textbook rotate_half formula:
-//   rotate_half:  out[..h] = -in[h..],  out[h..] =  in[..h]   (neg on the
-//                 FIRST-half branch above)
-//   then neg:     out[..h] =  in[h..],  out[h..] = -in[..h]
-// So this kernel stores the FIRST-half outputs raw (the two negations
-// cancel) and negates the SECOND-half outputs. f32 negation is a pure
-// sign-bit flip, so one flip here is bit-identical to running
-// nsl_rotate_half_f32 then nsl_neg_f32 (which nsl_tensor_rotate_half's CPU
-// arm plus nsl_tensor_neg also compose to, elementwise).
-pub(crate) const ROTATE_HALF_NEG_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_rotate_half_neg_f32(\n\
-    .param .u64 a, .param .u64 c, .param .u64 n, .param .u64 last_dim, .param .u64 half\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<14>;\n\
-    .reg .f32 %fs<3>;\n\
-    .reg .pred %p<3>;\n\
-    ld.param.u64 %rd1, [a];\n\
-    ld.param.u64 %rd2, [c];\n\
-    ld.param.u64 %rd3, [n];\n\
-    ld.param.u64 %rd4, [last_dim];\n\
-    ld.param.u64 %rd5, [half];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd6, %r3;\n\
-    setp.ge.u64 %p1, %rd6, %rd3;\n\
-    @%p1 bra DONE;\n\
-    rem.u64 %rd7, %rd6, %rd4;\n\
-    shl.b64 %rd8, %rd6, 2;\n\
-    setp.lt.u64 %p2, %rd7, %rd5;\n\
-    @%p2 bra FIRST_HALF;\n\
-    sub.u64 %rd9, %rd6, %rd5;\n\
-    shl.b64 %rd10, %rd9, 2;\n\
-    add.u64 %rd11, %rd1, %rd10;\n\
-    ld.global.f32 %fs1, [%rd11];\n\
-    neg.f32 %fs2, %fs1;\n\
-    add.u64 %rd12, %rd2, %rd8;\n\
-    st.global.f32 [%rd12], %fs2;\n\
-    bra DONE;\n\
-FIRST_HALF:\n\
-    add.u64 %rd9, %rd6, %rd5;\n\
-    shl.b64 %rd10, %rd9, 2;\n\
-    add.u64 %rd11, %rd1, %rd10;\n\
-    ld.global.f32 %fs1, [%rd11];\n\
-    add.u64 %rd12, %rd2, %rd8;\n\
-    st.global.f32 [%rd12], %fs1;\n\
-DONE: ret;\n\
-}\0";
+/// `nsl_rotate_half_f32` / `nsl_rotate_half_neg_f32` (`a, c, n, last_dim,
+/// half`), built by `nsl_kir::kernels::elementwise::build_rotate_half` (its
+/// `rotate_half_kir_equivalence` gate). The `_neg` form is the fused RoPE
+/// backward `neg(rotate_half(x))` (mfu-fusion C2): the negation moves to the
+/// second half, bit-identical to the two-launch composition because an f32
+/// negation is a sign-bit flip. NUL-terminated.
+pub(crate) fn rotate_half_module(op: nsl_kir::kernels::elementwise::RotateHalfOp) -> &'static str {
+    use nsl_kir::kernels::elementwise::RotateHalfOp;
+    static MODULES: std::sync::OnceLock<[String; 2]> = std::sync::OnceLock::new();
+    let modules = MODULES.get_or_init(|| {
+        RotateHalfOp::ALL.map(|op| {
+            String::from_utf8(nsl_kir::kernels::elementwise::rotate_half_ptx(op)).expect("PTX must be ASCII")
+        })
+    });
+    let slot = RotateHalfOp::ALL.iter().position(|o| *o == op).expect("every RotateHalfOp is in ALL");
+    &modules[slot]
+}
 
 
 // --- Matrix multiplication ---
@@ -390,8 +303,9 @@ DONE: ret;\n\
 // `nsl_kir::kernels::elementwise` (its `elementwise_backward_kir_equivalence`
 // gate). The source-AD kernels match a chain of separate launches bit for
 // bit, so their derivative arithmetic is explicitly rounded (`.rn`, which
-// ptxas never contracts into an `fma`). `nsl_gelu_backward_f32`
-// (`div.approx.f32`) and `nsl_clamp_backward_f32` stay hand-written below.
+// ptxas never contracts into an `fma`). So is `nsl_clamp_backward_f32`
+// (`clamp_backward_kir_equivalence`). `nsl_gelu_backward_f32`
+// (`div.approx.f32`) stays hand-written below.
 
 use nsl_kir::kernels::elementwise::BackwardOp;
 
@@ -1120,47 +1034,16 @@ STORE:\n\
 DONE: ret;\n\
 }\0";
 
-/// clamp_backward: out[i] = (input[i] >= min_val && input[i] <= max_val) ? grad[i] : 0
-pub(crate) const CLAMP_BACKWARD_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_clamp_backward_f32(\n\
-    .param .u64 grad, .param .u64 input, .param .u64 out,\n\
-    .param .f32 min_val, .param .f32 max_val, .param .u64 n\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<9>;\n\
-    .reg .f32 %fs<6>;\n\
-    .reg .pred %p<3>;\n\
-    ld.param.u64 %rd1, [grad];\n\
-    ld.param.u64 %rd2, [input];\n\
-    ld.param.u64 %rd3, [out];\n\
-    ld.param.f32 %fs4, [min_val];\n\
-    ld.param.f32 %fs5, [max_val];\n\
-    ld.param.u64 %rd4, [n];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd5, %r3;\n\
-    setp.ge.u64 %p1, %rd5, %rd4;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd6, %rd5, 2;\n\
-    add.u64 %rd7, %rd1, %rd6;\n\
-    ld.global.f32 %fs1, [%rd7];\n\
-    add.u64 %rd7, %rd2, %rd6;\n\
-    ld.global.f32 %fs2, [%rd7];\n\
-    setp.ge.f32 %p1, %fs2, %fs4;\n\
-    setp.le.f32 %p2, %fs2, %fs5;\n\
-    and.pred %p1, %p1, %p2;\n\
-    selp.f32 %fs3, %fs1, 0f00000000, %p1;\n\
-    add.u64 %rd8, %rd3, %rd6;\n\
-    st.global.f32 [%rd8], %fs3;\n\
-DONE: ret;\n\
-}\0";
+/// `nsl_clamp_backward_f32(grad, input, out, min_val, max_val, n)`:
+/// `out[i] = (input[i] >= min_val && input[i] <= max_val) ? grad[i] : 0`,
+/// built by `nsl_kir::kernels::elementwise` (its
+/// `clamp_backward_kir_equivalence` gate). NUL-terminated.
+pub(crate) fn clamp_backward_f32_ptx() -> &'static str {
+    static MODULE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    MODULE.get_or_init(|| {
+        String::from_utf8(nsl_kir::kernels::elementwise::clamp_backward_ptx()).expect("PTX must be ASCII")
+    })
+}
 
 /// tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
 pub(crate) const TANH_F32_PTX: &str = "\
@@ -1210,8 +1093,6 @@ DONE: ret;\n\
 #[cfg(test)]
 pub(crate) const ALL_PTX: &[(&str, &str)] = &[
     ("DIV_F32_PTX", DIV_F32_PTX),
-    ("ROTATE_HALF_F32_PTX", ROTATE_HALF_F32_PTX),
-    ("ROTATE_HALF_NEG_F32_PTX", ROTATE_HALF_NEG_F32_PTX),
     ("DIV_SCALAR_F32_PTX", DIV_SCALAR_F32_PTX),
     ("GELU_BACKWARD_F32_PTX", GELU_BACKWARD_F32_PTX),
     ("FASE_FUSED_ADAMW_STEP_F32_PTX", FASE_FUSED_ADAMW_STEP_F32_PTX),
@@ -1219,6 +1100,5 @@ pub(crate) const ALL_PTX: &[(&str, &str)] = &[
     ("FASE_FUSED_ADAMW_MULTI_BF16SR_PTX", FASE_FUSED_ADAMW_MULTI_BF16SR_PTX),
     ("FASE_FUSED_ADAMW_STEP_BF16SR_PTX", FASE_FUSED_ADAMW_STEP_BF16SR_PTX),
     ("SR_BF16_ROUND_PROBE_PTX", SR_BF16_ROUND_PROBE_PTX),
-    ("CLAMP_BACKWARD_F32_PTX", CLAMP_BACKWARD_F32_PTX),
     ("TANH_F32_PTX", TANH_F32_PTX),
 ];
