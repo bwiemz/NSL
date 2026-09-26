@@ -391,6 +391,96 @@ fn apply_fused_op_f32(op: i64, val: f32, rhs: f32) -> f32 {
     }
 }
 
+/// [`apply_fused_op_f32`] in f64, for f64 tensors: the fused f64 loops used
+/// to narrow each element to f32, compute, and widen back, so a fused chain
+/// on f64 data disagreed with the same ops unfused.
+#[inline(always)]
+fn apply_fused_op_f64(op: i64, val: f64, rhs: f64) -> f64 {
+    match op {
+        FUSED_OP_ADD => val + rhs,
+        FUSED_OP_MUL => val * rhs,
+        FUSED_OP_SUB => val - rhs,
+        FUSED_OP_DIV => val / rhs,
+        FUSED_OP_RELU => val.max(0.0),
+        FUSED_OP_SIGMOID => 1.0 / (1.0 + (-val).exp()),
+        FUSED_OP_TANH => val.tanh(),
+        FUSED_OP_NEG => -val,
+        FUSED_OP_EXP => val.exp(),
+        FUSED_OP_LOG => val.ln(),
+        FUSED_OP_SQRT => val.sqrt(),
+        FUSED_OP_ABS => val.abs(),
+        FUSED_OP_GELU => {
+            let c = (2.0_f64 / std::f64::consts::PI).sqrt();
+            val * 0.5 * (1.0 + (c * (val + 0.044715 * val * val * val)).tanh())
+        }
+        FUSED_OP_SILU => val * (1.0 / (1.0 + (-val).exp())),
+        _ => val,
+    }
+}
+
+/// Whether a fused CPU loop may read `t`'s buffer directly as a flat array
+/// of its dtype: a contiguous host tensor holding f32 or f64. Anything else
+/// (a device tensor, a strided view, a 16-bit or integer tensor) would be
+/// misread, so the chain runs through [`fused_chain_unfused`] instead.
+fn fused_cpu_readable(t: &NslTensor) -> bool {
+    t.device == 0
+        && t.is_contiguous()
+        && (t.dtype == crate::tensor::DTYPE_F32 || t.dtype == crate::tensor::DTYPE_F64)
+}
+
+fn is_fused_binary(op: i64) -> bool {
+    matches!(op, FUSED_OP_ADD | FUSED_OP_MUL | FUSED_OP_SUB | FUSED_OP_DIV)
+}
+
+/// Apply one fused op code through the ordinary runtime op, which handles
+/// broadcasting, device dispatch and dtype checks. Unknown codes are the
+/// identity, as in [`apply_fused_op_f32`]; the caller owns the result.
+fn fused_op_unfused(op: i64, acc: i64, rhs: i64) -> i64 {
+    use crate::tensor::*;
+    match op {
+        FUSED_OP_ADD => nsl_tensor_add(acc, rhs, 0),
+        FUSED_OP_MUL => nsl_tensor_mul(acc, rhs, 0),
+        FUSED_OP_SUB => nsl_tensor_sub(acc, rhs, 0),
+        FUSED_OP_DIV => nsl_tensor_div(acc, rhs, 0),
+        FUSED_OP_RELU => nsl_tensor_relu(acc),
+        FUSED_OP_SIGMOID => nsl_tensor_sigmoid(acc),
+        FUSED_OP_TANH => nsl_tensor_tanh_act(acc),
+        FUSED_OP_NEG => nsl_tensor_neg(acc),
+        FUSED_OP_EXP => nsl_tensor_exp(acc),
+        FUSED_OP_LOG => nsl_tensor_log(acc),
+        FUSED_OP_SQRT => nsl_tensor_sqrt(acc),
+        FUSED_OP_ABS => nsl_tensor_abs(acc),
+        FUSED_OP_GELU => nsl_tensor_gelu(acc),
+        FUSED_OP_SILU => nsl_tensor_silu(acc),
+        _ => nsl_tensor_clone(acc),
+    }
+}
+
+/// The fused chain computed by the unfused ops, with the fused loops'
+/// operand rule: `ops[0]` combines `a` with `b` when `b` is given, and
+/// every other op sees a right operand of zero (so a binary code after the
+/// first is `acc op 0`, exactly as `apply_fused_op_f32(op, acc, 0.0)`).
+/// Intermediates are freed; the result is owned by the caller.
+fn fused_chain_unfused(a_ptr: i64, b_ptr: Option<i64>, ops: &[i64]) -> i64 {
+    use crate::tensor::*;
+    let mut acc = nsl_tensor_clone(a_ptr);
+    for (i, &op) in ops.iter().enumerate() {
+        let next = match (i, b_ptr) {
+            (0, Some(b)) if is_fused_binary(op) => fused_op_unfused(op, acc, b),
+            _ => match op {
+                FUSED_OP_ADD => nsl_tensor_add_scalar(acc, 0.0, 0),
+                FUSED_OP_SUB => nsl_tensor_sub_scalar(acc, 0.0, 0),
+                FUSED_OP_MUL => nsl_tensor_mul_scalar(acc, 0.0, 0),
+                FUSED_OP_DIV => nsl_tensor_div_scalar(acc, 0.0, 0),
+                _ => fused_op_unfused(op, acc, 0),
+            },
+        };
+        crate::tensor::nsl_tensor_free(acc);
+        acc = next;
+    }
+    acc
+}
+
 /// Fused elementwise binary op: applies op_chain to `a op[0] b`, then unary ops.
 /// `a_ptr` and `b_ptr` are tensor pointers. `ops_ptr` is an NslList of op codes.
 /// `num_binary` is how many ops consume a second input (the rest are unary on the accumulator).
@@ -413,10 +503,13 @@ pub extern "C" fn nsl_fused_elementwise_2(
         .map(|i| unsafe { *ops_list.data.add(i) })
         .collect();
 
-    // Same-shape fast path only — if shapes differ (broadcast), fall back to unfused ops.
-    // Return 0 to signal the caller that fusion was rejected at runtime.
-    if a.len != b.len {
-        return 0;
+    // The fused loop reads both buffers flat, in `a`'s dtype and shape. Any
+    // other case (broadcasting shapes, mixed dtypes, a device or strided
+    // tensor, a 16-bit or integer tensor) runs through the unfused ops.
+    // Neither codegen call site checks for a rejection, so this path must
+    // compute the answer rather than return a sentinel handle.
+    if !(fused_cpu_readable(a) && fused_cpu_readable(b) && a.dtype == b.dtype && a.shape_eq(b)) {
+        return fused_chain_unfused(a_ptr, Some(b_ptr), &ops);
     }
     let len = a.len as usize;
 
@@ -459,13 +552,13 @@ pub extern "C" fn nsl_fused_elementwise_2(
         let da = a.data as *const f64;
         let db = b.data as *const f64;
         for i in 0..len {
-            let a_val = unsafe { *da.add(i) } as f32;
-            let b_val = unsafe { *db.add(i) } as f32;
-            let mut acc = apply_fused_op_f32(ops[0], a_val, b_val);
+            let a_val = unsafe { *da.add(i) };
+            let b_val = unsafe { *db.add(i) };
+            let mut acc = apply_fused_op_f64(ops[0], a_val, b_val);
             for &op in &ops[1..] {
-                acc = apply_fused_op_f32(op, acc, 0.0);
+                acc = apply_fused_op_f64(op, acc, 0.0);
             }
-            unsafe { *buf.add(i) = acc as f64 };
+            unsafe { *buf.add(i) = acc };
         }
         let result = Box::new(NslTensor::new(
             buf as *mut c_void,
@@ -497,6 +590,12 @@ pub extern "C" fn nsl_fused_elementwise_1(
         .map(|i| unsafe { *ops_list.data.add(i) })
         .collect();
 
+    // See `nsl_fused_elementwise_2`: only a contiguous host f32/f64 buffer
+    // may be read flat; everything else runs through the unfused ops.
+    if !fused_cpu_readable(a) {
+        return fused_chain_unfused(a_ptr, None, &ops);
+    }
+
     let len = a.len as usize;
     let out_shape = NslTensor::copy_shape(a.shape, a.ndim);
     let out_strides = NslTensor::compute_strides(out_shape, a.ndim);
@@ -527,11 +626,11 @@ pub extern "C" fn nsl_fused_elementwise_1(
         let buf = checked_alloc(len * std::mem::size_of::<f64>()) as *mut f64;
         let da = a.data as *const f64;
         for i in 0..len {
-            let mut acc = unsafe { *da.add(i) } as f32;
+            let mut acc = unsafe { *da.add(i) };
             for &op in &ops {
-                acc = apply_fused_op_f32(op, acc, 0.0);
+                acc = apply_fused_op_f64(op, acc, 0.0);
             }
-            unsafe { *buf.add(i) = acc as f64 };
+            unsafe { *buf.add(i) = acc };
         }
         let result = Box::new(NslTensor::new(
             buf as *mut c_void,
@@ -564,15 +663,6 @@ pub extern "C" fn nsl_fused_matmul_epilogue(
     let a = NslTensor::from_ptr_ref(a_ptr);
     let b = NslTensor::from_ptr_ref(b_ptr);
 
-    if a.ndim < 2 || b.ndim < 2 {
-        crate::nsl_log!(ERROR, "nsl", "nsl: fused_matmul_epilogue requires 2D+ tensors");
-        std::process::abort();
-    }
-
-    let m = unsafe { *a.shape.add(a.ndim as usize - 2) } as usize;
-    let k = unsafe { *a.shape.add(a.ndim as usize - 1) } as usize;
-    let n = unsafe { *b.shape.add(b.ndim as usize - 1) } as usize;
-
     let epilogue_ops: Vec<i64> = if num_epilogue_ops > 0 && epilogue_ops_ptr != 0 {
         let list = crate::list::NslList::from_ptr(epilogue_ops_ptr);
         (0..num_epilogue_ops as usize)
@@ -581,6 +671,35 @@ pub extern "C" fn nsl_fused_matmul_epilogue(
     } else {
         Vec::new()
     };
+
+    // The fused loop below reads `a` [M,K], `b` [K,N] and `bias` [N] as flat
+    // host f32 arrays. It used to do so whatever the tensors were: a device
+    // pointer, an f64 buffer, a strided view or a batched (3D+) operand was
+    // misread, and a K mismatch read past `b`. Anything the loop cannot read
+    // correctly runs as matmul, bias add and the epilogue ops unfused.
+    let f32_host_2d = |t: &NslTensor| t.ndim == 2 && t.device == 0 && t.dtype == crate::tensor::DTYPE_F32 && t.is_contiguous();
+    let bias_ok = bias_ptr == 0 || {
+        let bt = NslTensor::from_ptr_ref(bias_ptr);
+        bt.device == 0 && bt.dtype == crate::tensor::DTYPE_F32 && bt.is_contiguous() && bt.ndim == 1 && b.ndim >= 1
+            && bt.len == unsafe { *b.shape.add(b.ndim as usize - 1) }
+    };
+    if !(f32_host_2d(a) && f32_host_2d(b) && bias_ok && unsafe { *a.shape.add(1) == *b.shape }) {
+        let product = crate::tensor::nsl_tensor_matmul(a_ptr, b_ptr, 0);
+        let biased = if bias_ptr != 0 {
+            let r = crate::tensor::nsl_tensor_add(product, bias_ptr, 0);
+            crate::tensor::nsl_tensor_free(product);
+            r
+        } else {
+            product
+        };
+        let out = fused_chain_unfused(biased, None, &epilogue_ops);
+        crate::tensor::nsl_tensor_free(biased);
+        return out;
+    }
+
+    let m = unsafe { *a.shape } as usize;
+    let k = unsafe { *a.shape.add(1) } as usize;
+    let n = unsafe { *b.shape.add(1) } as usize;
 
     let has_bias = bias_ptr != 0;
     let bias_data: *const f32 = if has_bias {
@@ -966,5 +1085,199 @@ mod matmul_tests {
         let mut c = vec![0.0f64];
         tiled_matmul_f64(a.as_ptr(), b.as_ptr(), c.as_mut_ptr(), 1, 1, 1);
         assert_eq!(c[0], 15.0);
+    }
+}
+
+/// The fused CPU kernels (`nsl_fused_elementwise_{1,2}`,
+/// `nsl_fused_matmul_epilogue`) read their operands as flat host arrays.
+/// Whenever that would misread memory they now run the chain through the
+/// unfused ops, and those are the reference here: the fallback must produce
+/// exactly the unfused result (same tag, shape and bytes). Each case below
+/// was a wrong answer or a null handle before the guard.
+#[cfg(test)]
+mod fused_guard_tests {
+    use super::*;
+    use crate::list::{nsl_list_free, nsl_list_new, nsl_list_push};
+    use crate::tensor::*;
+
+    fn filled(shape: &[i64], dtype: u16, f: impl Fn(usize) -> f64) -> i64 {
+        let t = create_tensor_with_shape_rs_dtype(shape, dtype);
+        let r = NslTensor::from_ptr(t);
+        for i in 0..r.len as usize {
+            unsafe {
+                if dtype == DTYPE_F32 {
+                    *r.data_f32().add(i) = f(i) as f32;
+                } else {
+                    *r.data_f64().add(i) = f(i);
+                }
+            }
+        }
+        t
+    }
+
+    /// (dtype, shape, element bits in logical row-major order).
+    fn contents(t: i64) -> (u16, Vec<i64>, Vec<u64>) {
+        let c = nsl_tensor_contiguous(t);
+        let r = NslTensor::from_ptr(c);
+        let shape = unsafe { std::slice::from_raw_parts(r.shape, r.ndim as usize) }.to_vec();
+        let bits = (0..r.len as usize)
+            .map(|i| unsafe {
+                if r.dtype == DTYPE_F32 { (*r.data_f32().add(i)).to_bits() as u64 } else { (*r.data_f64().add(i)).to_bits() }
+            })
+            .collect();
+        let out = (r.dtype, shape, bits);
+        nsl_tensor_free(c);
+        out
+    }
+
+    fn ops(codes: &[i64]) -> i64 {
+        let l = nsl_list_new();
+        for &c in codes {
+            nsl_list_push(l, c);
+        }
+        l
+    }
+
+    fn fused2(a: i64, b: i64, codes: &[i64]) -> i64 {
+        let l = ops(codes);
+        let r = nsl_fused_elementwise_2(a, b, l, codes.len() as i64);
+        nsl_list_free(l);
+        r
+    }
+
+    fn fused1(a: i64, codes: &[i64]) -> i64 {
+        let l = ops(codes);
+        let r = nsl_fused_elementwise_1(a, l, codes.len() as i64);
+        nsl_list_free(l);
+        r
+    }
+
+    fn vals(i: usize) -> f64 {
+        (i as f64 * 0.37).sin() * 3.0 - 0.25
+    }
+
+    /// `[2,3] + [3]` used to return the null handle, which no caller checks.
+    #[test]
+    fn a_broadcast_runs_unfused_instead_of_returning_null() {
+        let a = filled(&[2, 3], DTYPE_F32, vals);
+        let b = filled(&[3], DTYPE_F32, |i| i as f64 - 1.0);
+        let got = fused2(a, b, &[FUSED_OP_ADD, FUSED_OP_RELU]);
+        assert_ne!(got, 0, "the fused op must not hand back a null tensor");
+        let s = nsl_tensor_add(a, b, 0);
+        let want = nsl_tensor_relu(s);
+        assert_eq!(contents(got), contents(want));
+        for t in [got, want, s, a, b] {
+            nsl_tensor_free(t);
+        }
+    }
+
+    /// An f32 `a` with an f64 `b` read `b`'s 8-byte elements as f32.
+    #[test]
+    fn mixed_dtypes_run_unfused() {
+        let a = filled(&[5], DTYPE_F32, vals);
+        let b = filled(&[5], DTYPE_F64, |i| 1.5 + i as f64);
+        let got = fused2(a, b, &[FUSED_OP_MUL]);
+        let want = nsl_tensor_mul(a, b, 0);
+        assert_eq!(contents(got), contents(want));
+        for t in [got, want, a, b] {
+            nsl_tensor_free(t);
+        }
+    }
+
+    /// The f64 loops narrowed each element to f32; now they compute in f64,
+    /// as the unfused ops do.
+    #[test]
+    fn f64_chains_compute_in_f64() {
+        let a = filled(&[7], DTYPE_F64, |i| 0.1 + vals(i) / 7.0);
+        let b = filled(&[7], DTYPE_F64, |i| 1e-9 * (i as f64 + 1.0));
+        let got = fused2(a, b, &[FUSED_OP_ADD, FUSED_OP_EXP]);
+        let (dtype, _, bits) = contents(got);
+        assert_eq!(dtype, DTYPE_F64);
+        for (i, &g) in bits.iter().enumerate() {
+            let want = ((0.1 + vals(i) / 7.0) + 1e-9 * (i as f64 + 1.0)).exp();
+            assert_eq!(f64::from_bits(g), want, "element {i}");
+        }
+        let one = fused1(a, &[FUSED_OP_NEG, FUSED_OP_EXP]);
+        let (_, _, bits) = contents(one);
+        for (i, &g) in bits.iter().enumerate() {
+            assert_eq!(f64::from_bits(g), (-(0.1 + vals(i) / 7.0)).exp(), "element {i}");
+        }
+        for t in [got, one, a, b] {
+            nsl_tensor_free(t);
+        }
+    }
+
+    /// A transposed view was read in storage order rather than index order.
+    #[test]
+    fn a_strided_view_runs_unfused() {
+        let base = filled(&[2, 3], DTYPE_F32, vals);
+        let view = nsl_tensor_transpose(base, 0, 1);
+        let got = fused1(view, &[FUSED_OP_NEG, FUSED_OP_ABS]);
+        let n = nsl_tensor_neg(view);
+        let want = nsl_tensor_abs(n);
+        assert_eq!(contents(got), contents(want));
+        for t in [got, want, n, view, base] {
+            nsl_tensor_free(t);
+        }
+    }
+
+    /// A binary code after the first op applies with a zero right operand,
+    /// as in the fused loops (`x * 0`, `x / 0`), on the fallback too.
+    #[test]
+    fn later_binary_codes_keep_the_zero_operand_rule() {
+        let a = filled(&[2, 3], DTYPE_F32, vals);
+        let b = filled(&[3], DTYPE_F32, |_| 2.0);
+        let got = fused2(a, b, &[FUSED_OP_ADD, FUSED_OP_MUL]);
+        let (_, _, bits) = contents(got);
+        assert!(bits.iter().all(|&g| f32::from_bits(g as u32) == 0.0), "{bits:?}");
+        nsl_tensor_free(got);
+        nsl_tensor_free(a);
+        nsl_tensor_free(b);
+    }
+
+    /// f64 operands were read as f32 by the epilogue loop.
+    #[test]
+    fn a_non_f32_matmul_epilogue_runs_unfused() {
+        let a = filled(&[2, 3], DTYPE_F64, vals);
+        let b = filled(&[3, 4], DTYPE_F64, |i| vals(i + 11));
+        let bias = filled(&[4], DTYPE_F64, |i| 0.5 - i as f64);
+        let l = ops(&[FUSED_OP_RELU]);
+        let got = nsl_fused_matmul_epilogue(a, b, bias, l, 1);
+        nsl_list_free(l);
+        let m = nsl_tensor_matmul(a, b, 0);
+        let s = nsl_tensor_add(m, bias, 0);
+        let want = nsl_tensor_relu(s);
+        assert_eq!(contents(got), contents(want));
+        for t in [got, want, s, m, bias, b, a] {
+            nsl_tensor_free(t);
+        }
+    }
+
+    /// The f32 fast paths are unchanged: same-shape contiguous f32 operands
+    /// still run the fused loops.
+    #[test]
+    fn the_f32_fast_paths_still_fuse() {
+        let a = filled(&[6], DTYPE_F32, vals);
+        let b = filled(&[6], DTYPE_F32, |i| vals(i + 3));
+        let got = fused2(a, b, &[FUSED_OP_SUB, FUSED_OP_TANH]);
+        let (dtype, shape, bits) = contents(got);
+        assert_eq!((dtype, shape), (DTYPE_F32, vec![6]));
+        for (i, &g) in bits.iter().enumerate() {
+            let want = (vals(i) as f32 - vals(i + 3) as f32).tanh();
+            assert_eq!(f32::from_bits(g as u32), want, "element {i}");
+        }
+        let a2 = filled(&[2, 3], DTYPE_F32, vals);
+        let b2 = filled(&[3, 2], DTYPE_F32, |i| vals(i + 5));
+        let got2 = nsl_fused_matmul_epilogue(a2, b2, 0, 0, 0);
+        let want2 = nsl_tensor_matmul(a2, b2, 0);
+        let ((dg, sg, bg), (dw, sw, bw)) = (contents(got2), contents(want2));
+        assert_eq!((dg, sg), (dw, sw));
+        for (g, w) in bg.iter().zip(&bw) {
+            let (g, w) = (f32::from_bits(*g as u32), f32::from_bits(*w as u32));
+            assert!((g - w).abs() <= 1e-5 * w.abs().max(1.0), "{g} vs {w}");
+        }
+        for t in [got, got2, want2, a, b, a2, b2] {
+            nsl_tensor_free(t);
+        }
     }
 }

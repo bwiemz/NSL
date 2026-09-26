@@ -876,6 +876,13 @@ frozen throughout, so nothing here blocks a kernel fix.
       except the SwiGLU gate on sm_80+. There the independent `grad * up`
       `FMUL` is scheduled elsewhere, with the same multiset and no `FFMA`.
       Registers are within two of the hand kernels.
+    - **Clamp adjoint:** `nsl_clamp_backward_f32` followed once the
+      interpreter gained `and.pred` (`build_clamp_backward`). Its gate,
+      `clamp_backward_kir_equivalence`, runs bounds that are ordinary,
+      equal, reversed, infinite and NaN. The SASS is the hand kernel's
+      `FSETP.GTU`/`FSETP.GE`/`FSEL` core with 12 registers on sm_80/90/120;
+      only the address arithmetic differs (`IMAD.WIDE` in place of shift
+      and add), with the same instruction count.
     - **RoPE `rotate_half` pair:** `nsl_rotate_half_f32` and the fused
       backward `nsl_rotate_half_neg_f32` (`build_rotate_half`), branching
       on `i % last_dim < half` as the hand kernels do. The gate is
@@ -883,8 +890,7 @@ frozen throughout, so nothing here blocks a kernel fix.
       64-bit remainder call on sm_80/90/120; the address arithmetic
       (`IMAD.WIDE` for `LEA`) adds 2 to 8 instructions.
     - **Still hand-written:** `nsl_gelu_backward_f32` (tanh approximation,
-      `div.approx`). `nsl_clamp_backward_f32` waits for `and.pred` in the
-      interpreter.
+      `div.approx`).
 12. **FA v2**, by phase directory, tier B.1 and B.2 last; the SASS
     baselines and the two no-spill gates already exist here and are the
     proof. `matmul_mma.rs` and `kernel_skeleton/` are deleted with their

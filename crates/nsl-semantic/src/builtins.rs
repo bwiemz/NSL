@@ -833,8 +833,11 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
     def("cpu", Type::Int);
 
     // Dtype identifier constants (M23 BYOD) — used in .to(f32), .to(f64) etc.
+    // `.to(fp16)` / `.to(bf16)` convert too (nsl_tensor_to_dtype).
     def("f32", Type::Int);
     def("f64", Type::Int);
+    def("fp16", Type::Int);
+    def("bf16", Type::Int);
 
     // Higher-order functions
     def(

@@ -430,7 +430,7 @@ the CLIF snapshot suite.
 
 Every runtime call the codegen can emit is declared once, in the typed
 ABI table `crates/nsl-abi/src/table.rs` (roadmap A3): one row
-`[group] name(params) -> ret = runtime::path;` per function, 682 of them,
+`[group] name(params) -> ret = runtime::path;` per function, 683 of them,
 exposed as the X-macro `nsl_abi::for_each_runtime_fn!` and as data
 (`nsl_abi::RUNTIME_ABI`). The groups are the split PR #600 made along
 "what the language exposes vs what the runtime implements": `memory`,

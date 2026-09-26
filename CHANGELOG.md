@@ -29,6 +29,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   sm_80/90/120 the SASS keeps the hand kernels' registers and 64-bit
   remainder call. The address arithmetic (`IMAD.WIDE` for `LEA`) adds 2
   to 8 instructions.
+- `nsl_clamp_backward_f32` is built as KIR
+  (`nsl_kir::kernels::elementwise::build_clamp_backward`), the last
+  activation-style backward kernel to leave hand-written PTX apart from
+  `nsl_gelu_backward_f32` (roadmap A2 step 11). The runtime builds it on
+  first use (`cuda::kernels::clamp_backward_f32_ptx()`) in place of the
+  hand-written constant.
+  `tests/clamp_backward_kir_equivalence.rs` runs the frozen hand kernel and
+  the KIR one on the CTA interpreter over IEEE-corner inputs and seven
+  bound pairs: ordinary, one-sided infinite, a single point, reversed, and
+  a NaN on either side. It requires:
+  - the same bytes in all of global memory;
+  - the formula bit for bit: an input on a bound passes the gradient, and a
+    NaN passes nothing.
+
+  It catches nine named mutants:
+  - a strict comparison on either bound;
+  - `or` for `and`;
+  - either bound read as the other;
+  - the select's arms swapped;
+  - the input passed in place of the gradient;
+  - the index bound relaxed, the block index ignored, and every element
+    size nudged.
+
+  On sm_80/90/120 the SASS has the hand kernel's instruction count, its 12
+  registers and its comparison-and-select core. Only the address arithmetic
+  differs.
 
 - Nine activation-backward kernels are built by
   `nsl_kir::kernels::elementwise` (`BackwardOp`) in place of their
@@ -627,6 +653,76 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   every diagnostic line the toolchain prints is a `tracing` event.
 
 ### Fixed
+
+- **`.to(dtype)` converts** (dtype-semantics design, step 1).
+  - **What was wrong.** On a standard-dtype tensor, `.to(f32)` and
+    `.to(f64)` compiled to `nsl_tensor_from_custom_dtype`, which returns
+    its input unchanged. The cast the GPU refusals tell users to write
+    ("cast with `.to(f32)`") did nothing. `.to(f32)` of a packed BYOD
+    tensor produced f64. `.to(fp16)` / `.to(bf16)` did not check.
+  - **Now `.to(f32 | f64 | fp16 | bf16)` calls the new
+    `nsl_tensor_to_dtype`:**
+    - a converted copy on the same device;
+    - host conversions round once, to nearest even, from the exact source
+      value (f64 → f16/bf16 goes through a round-to-odd f32 step, because
+      `half`'s `from_f64` double-rounds);
+    - GPU conversions use the PTX cast kernels, staging fp16 ↔ bf16
+      through f32;
+    - f64 on a GPU tensor is refused;
+    - strided views convert in index order;
+    - the same dtype returns the source unchanged, as before.
+  - **Gradients flow through the cast.** Under a recording tape the cast is
+    a `TapeOp::Cast`, whose backward converts the gradient back to the
+    source dtype.
+  - **Checker:** `fp16` and `bf16` are now dtype identifiers next to `f32`
+    and `f64`.
+  - **Tests:** every conversion pair is checked against an exhaustive
+    nearest-value search over each 16-bit format, over IEEE corners
+    (ties, subnormals, overflow). Separate tests cover the double-rounding
+    counterexamples for f16 and bf16, gradient flow through the cast, and
+    a strided source.
+
+- The CPU fused kernels no longer misread memory or return a null tensor
+  (dtype-semantics design, step 0).
+  - **`nsl_fused_elementwise_2`** returned the null handle 0 for operands
+    of different lengths (any broadcast). Neither codegen call site checks
+    for it, so the next op aborted on a null tensor.
+  - **All three kernels misread memory.** `nsl_fused_elementwise_{1,2}`
+    and `nsl_fused_matmul_epilogue` read their operands as flat host arrays
+    in the first operand's dtype. A GPU tensor, a strided view, an f64 `b`
+    next to an f32 `a`, or a 3-D/f64 matmul operand came out as the wrong
+    numbers, and a K mismatch read past the end of `b`.
+  - **Now:** each fast path requires what it reads: contiguous host tensors
+    of one dtype and one shape, or 2-D f32 with matching K and bias.
+    Everything else runs the same chain through the ordinary ops, which
+    broadcast, dispatch to the GPU and check dtypes, and the result is
+    identical to the unfused computation.
+  - **f64 fused loops compute in f64.** They used to narrow each element to
+    f32 and widen it back.
+  - **In-place arms guard their dtype.** The CPU FBIP in-place arms (exp,
+    log, sqrt, abs, sign, clamp, relu, gelu, silu, sigmoid, tanh, neg) now
+    check the dtype they write, so a non-float buffer can never be
+    overwritten with 8-byte f64 elements. They are unreachable today
+    (`can_mutate_inplace()` is `false`), so this closes the hazard before
+    FBIP is re-enabled.
+
+- Calibration and quantization requests that were accepted and never
+  honoured are refused at `nsl check` (first slice of "turn ignored
+  calibration requests into implemented behavior or refusal"). The checks
+  live in `nsl-semantic/src/quant_requests.rs` and `fp8.rs`.
+  - **A `quant` block's `calibration:` section.** Its `data` and `samples`
+    were parsed and never read; the block quantized from the weights alone.
+  - **`quant` block `default: awq4 | gptq4 | gptq8`.** The runtime quantizer
+    implements only int8 and int4, so these programs checked, built, and
+    aborted when the block ran. The refusal points to `int4` or `int8`.
+  - **`@quantize(...)` has a closed argument set.** Only `dtype = "awq4"`,
+    the one value codegen reads, is accepted. `group_size` was logged and
+    unused, and any other dtype, argument name or positional argument was
+    dropped.
+  - **`@fp8_compute(calibrate = true)`.** The flag was never read: FP8
+    scales come from each call's absmax. `@fp8_compute` on functions and
+    model methods, which is where codegen reads it, is now validated too.
+    Before, only layer declarations were.
 
 - `Adam(weight_decay=..)` and `Adam(no_decay=..)` are refused at `nsl check`
   and on the build/run path, with AdamW named as the way to decay.

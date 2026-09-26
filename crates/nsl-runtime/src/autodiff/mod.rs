@@ -64,6 +64,9 @@ pub enum TapeOp {
         device: u8,
     },
     Neg { a: i64, out: i64 },
+    /// `out = a.to(dtype)` (`nsl_tensor_to_dtype`). The gradient is `out`'s,
+    /// converted back to `a`'s dtype.
+    Cast { a: i64, out: i64, src_dtype: u16 },
     MulScalar { a: i64, scalar: f64, out: i64 },
     AddScalar { a: i64, out: i64 },
     Transpose { a: i64, out: i64, dim0: i64, dim1: i64 },
@@ -167,7 +170,7 @@ impl TapeOp {
             | TapeOp::MatMul { a, b, out, .. } | TapeOp::Fp8MatMul { a, b, out, .. } => {
                 *a = tape.get_or_assign_id(*a); *b = tape.get_or_assign_id(*b); *out = tape.get_or_assign_id(*out);
             }
-            TapeOp::Neg { a, out } | TapeOp::MulScalar { a, out, .. } | TapeOp::AddScalar { a, out }
+            TapeOp::Neg { a, out } | TapeOp::Cast { a, out, .. } | TapeOp::MulScalar { a, out, .. } | TapeOp::AddScalar { a, out }
             | TapeOp::Transpose { a, out, .. } | TapeOp::SumReduce { a, out, .. }
             | TapeOp::MeanReduce { a, out, .. } | TapeOp::ReduceMax { a, out, .. }
             | TapeOp::Gather { a, out, .. } | TapeOp::Exp { a, out, .. } | TapeOp::Log { a, out, .. }
@@ -378,6 +381,7 @@ fn tape_op_trace(op: &TapeOp) -> String {
         TapeOp::MulScalar { a, out, scalar } => format!("MulScalar a={a} out={out} s={scalar}"),
         TapeOp::AddScalar { a, out } => format!("AddScalar a={a} out={out}"),
         TapeOp::Neg { a, out } => format!("Neg a={a} out={out}"),
+        TapeOp::Cast { a, out, src_dtype } => format!("Cast a={a} out={out} src_dtype={src_dtype}"),
         TapeOp::SumReduce { a, out, dim, .. } => format!("SumReduce a={a} out={out} dim={dim}"),
         TapeOp::MeanReduce { a, out, dim, .. } => format!("MeanReduce a={a} out={out} dim={dim}"),
         TapeOp::Transpose { a, out, .. } => format!("Transpose a={a} out={out}"),

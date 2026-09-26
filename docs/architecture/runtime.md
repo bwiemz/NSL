@@ -147,7 +147,11 @@ the host with no dtype is `DTYPE_F64`, and `nsl_tensor_to_device` produces a
 `DTYPE_F32` device buffer. Typed accessors (`data_f64`, `data_f32`,
 `data_f16_bits`, ...) assert the dtype they read. Kernels that need bf16 or
 fp8 storage live behind explicit modes (`src/sr_bf16.rs`, `src/fp8.rs`,
-`src/tensor/precision_cast.rs`) rather than changing the default.
+`src/tensor/precision_cast.rs`) rather than changing the default. A program converts
+explicitly with `.to(f32 | f64 | fp16 | bf16)`, which lowers to
+`nsl_tensor_to_dtype` (`precision_cast.rs`): a converted copy, rounded once
+to nearest even, recorded on the tape as `TapeOp::Cast`. The dtype semantics
+these defaults should become are roadmap item 7's design.
 
 **Strides and contiguity (PR #585).** `compute_strides` produces row-major
 strides; `is_contiguous` compares the stored strides against that expectation
@@ -378,7 +382,7 @@ Some families are built rather than embedded: the precision casts
 (`precision_cast_kernels.rs`), the strided run copy (`strided_copy.rs`), the
 CSHA Tier B.1 pre-passes (`tier_b1_prepass.rs`), the binary, unary and scalar-operand
 elementwise kernels, the FASE scaled accumulate, Muon's inverse-norm scale, the
-activation-backward kernels and the RoPE `rotate_half` pair (`kernels.rs`) are described as KIR in `nsl_kir::kernels` and lowered
+activation-backward kernels, the clamp adjoint and the RoPE `rotate_half` pair (`kernels.rs`) are described as KIR in `nsl_kir::kernels` and lowered
 once, on first use, into a `OnceLock` whose stable address the module cache
 keys on (roadmap A2 steps 7 and 11). A launch is
 `load_module_once(ptx)` → `get_function(module, name)` →
