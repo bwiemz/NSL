@@ -8,6 +8,54 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- The RoPE `rotate_half` pair is built as KIR: `nsl_rotate_half_f32`
+  (`out[..h] = -in[h..]`, `out[h..] = in[..h]` over the last dimension) and
+  the fused backward `nsl_rotate_half_neg_f32` (the negation on the other
+  half) come from `nsl_kir::kernels::elementwise::build_rotate_half`
+  (roadmap A2 step 11). The runtime builds them on first use
+  (`cuda::kernels::rotate_half_module`) in place of the hand-written
+  constants.
+  `tests/rotate_half_kir_equivalence.rs` runs the frozen hand kernels and
+  the KIR ones on the CTA interpreter over IEEE-corner values (NaN payloads
+  included) and six shapes (last dimension 2 to 128, an odd half, ragged
+  final blocks). It requires:
+  - the same bytes in all of global memory;
+  - the formula bit for bit;
+  - `_neg` to be exactly the plain kernel's sign flip.
+
+  It catches named mutants: the partner on the wrong side, the negation
+  dropped or in the other arm, `<=` for `<`, the flat index for the row
+  position, the index bound, the block index, and each element size. On
+  sm_80/90/120 the SASS keeps the hand kernels' registers and 64-bit
+  remainder call. The address arithmetic (`IMAD.WIDE` for `LEA`) adds 2
+  to 8 instructions.
+- `nsl_clamp_backward_f32` is built as KIR
+  (`nsl_kir::kernels::elementwise::build_clamp_backward`), the last
+  activation-style backward kernel to leave hand-written PTX apart from
+  `nsl_gelu_backward_f32` (roadmap A2 step 11). The runtime builds it on
+  first use (`cuda::kernels::clamp_backward_f32_ptx()`) in place of the
+  hand-written constant.
+  `tests/clamp_backward_kir_equivalence.rs` runs the frozen hand kernel and
+  the KIR one on the CTA interpreter over IEEE-corner inputs and seven
+  bound pairs: ordinary, one-sided infinite, a single point, reversed, and
+  a NaN on either side. It requires:
+  - the same bytes in all of global memory;
+  - the formula bit for bit: an input on a bound passes the gradient, and a
+    NaN passes nothing.
+
+  It catches nine named mutants:
+  - a strict comparison on either bound;
+  - `or` for `and`;
+  - either bound read as the other;
+  - the select's arms swapped;
+  - the input passed in place of the gradient;
+  - the index bound relaxed, the block index ignored, and every element
+    size nudged.
+
+  On sm_80/90/120 the SASS has the hand kernel's instruction count, its 12
+  registers and its comparison-and-select core. Only the address arithmetic
+  differs.
+
 - Nine activation-backward kernels are built by
   `nsl_kir::kernels::elementwise` (`BackwardOp`) in place of their
   hand-written constants (roadmap A2 step 11, eighth slice). They are the
@@ -643,6 +691,111 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
       in CI, needs no GPU, and fails on the old kernel.
   - **Unit tests** that encoded the uniform grid now assert the exact FP8
     values. Examples: 1000 in E5M2 is 1024, and 5 at scale 8/57344 is 32/7.
+- With `grad_clip` and FASE-Deferred accumulation on the tape path, the
+  gradients were clipped twice. Section 7e2 clipped every micro-batch
+  (`nsl_clip_grad_norm`), and the optimizer's two-phase clip then clipped
+  the window's accumulated mean again. Only an active source-AD hook turned
+  the first clip off. The two-phase clip is defined on the window mean's
+  global norm. Clipping each micro-batch first shrank any micro-batch whose
+  gradient was over the threshold before it was averaged, so the mean
+  differed whenever micro-batches did. 7e2 now also skips when two-phase
+  clip is active.
+
+  Found by the tolerance mutation audit below: removing either clip alone
+  left `adamw_deferred_with_grad_clip` green, because the other clip did the
+  work. With the fix, removing the two-phase clip fails that test.
+- Tolerance mutation audit (roadmap item 9). Each change below is backed
+  by a named mutant that used to survive its gate and now fails it:
+  - **FASE-Deferred AdamW gates** (`fase_numerical_validation`): the
+    fixtures set `eps` near the gradient's size (1.0; 1e-2 for the clipped
+    one), and the Rust references use the same values. With `eps = 1e-8`,
+    AdamW's update does not depend on the gradient's magnitude. A sum where
+    the window should average (`accum_scale` → 1, on both the hook and the
+    accumulate paths) therefore passed.
+  - **Dropout backward parity** (`dropout_backward_parity_gate`): trains
+    with SGD, and the tolerance is 2e-3 → 1e-5. Measured source-vs-tape
+    noise is about 1e-8 against about 0.2 of movement. A dropped 1/(1-p)
+    rescale (a constant factor on w1's gradient, which AdamW cancels)
+    passed before.
+  - **SwiGLU fusion gate** (`swiglu_fusion_gate`): trains with SGD, the
+    tolerance is 2e-3 → 1e-5 (noise 6e-8), and the anti-vacuity check
+    measures movement from init. The old check, `|w| > 1e-4`, always passed
+    because every init is non-zero.
+
+    The audit also found that the SwiGLU gate-backward peephole never fires
+    in a real program. The source-AD Mul adjoint is wrapped in
+    `reduce_to_shape`, so the `Mul → silu_backward` pattern does not match,
+    and `nsl_tensor_swiglu_gate_backward` is never called. The gate compares
+    two unfused runs. Fixing that is a separate change.
+  - **Differential tests** (`nsl-cli/tests/differential.rs`): all four
+    passed without comparing anything. Three named scripts did not exist,
+    `diff_basic_matmul.nsl` did not compile (`tensor` is not a builtin),
+    and the harness skipped on a missing or failing script. Now:
+    - a missing or failing script fails the test;
+    - the three scripts are written and the fourth is fixed;
+    - each runs from a scratch copy, since `nsl run` leaves objects beside
+      the script;
+    - both the fused and the `--disable-fusion` runs are held to an f64
+      reference, so a wrong answer fails even when no fusion fires. A gelu
+      cubic-coefficient mutant (0.044715 → 0.04) now fails
+      `differential_fused_gelu`.
+- The flash-attention backward on tensor cores (sm_80+) counted three of
+  every four row tiles' gradients twice at head_dim <= 32 whenever its body
+  was the single-warp one: every packed (segment-masked, PCA Stage C) step,
+  and unmasked steps under `NSL_FA_BWD_MULTIWARP=0`. Those launches run
+  `block_q` = 64 threads, two warps. The 4-warp partition (4f8336ca) had
+  started every MMA m-loop at the warp's id but kept a stride of 1 for the
+  single-warp body, and removed the warp-0 gate that used to discard the
+  second warp's duplicate work. So warp 1 re-ran m-tiles 1..3 and their
+  dQ, dK and dV atomics landed twice, giving gradients about 100% wrong.
+  The single-warp body now strides its m-loops by the warps actually
+  launched (`block_q / 32`), so each unit is accumulated once and the
+  second warp does half the work instead of repeating it. The emitted PTX
+  changes in exactly those ten stride lines. The 4-warp `_w4` kernel and
+  the 32-thread launches (head_dim 64 and 128) are byte-identical. The
+  Stage-C GPU gate could not see this: under AdamW each step moves a
+  parameter by about lr whatever the gradient's size, so its 2e-2
+  checkpoint tolerance passes on the sign of the gradient alone.
+  `nsl-codegen/tests/sdpa_fused_backward_interp.rs` runs both phases of the
+  production backward on the CTA interpreter, launched as
+  `nsl_flash_attention_backward` launches them, against f64 gradients:
+  - the packed kernel at sm_75 (scalar; exact to 2e-5);
+  - the packed kernel at sm_90 (MMA);
+  - the unmasked 4-warp kernel at sm_90.
+
+  At sm_90 it pins dV to f32 noise of an oracle that rounds each MMA
+  operand to f16, as the kernel does, and dQ and dK to within a few 1e-4
+  of it. It catches eight named mutants, among them the old stride and
+  five missing fences. The interpreter gained `mma.sync.aligned.m16n8k16`
+  f16 with f32 accumulation (warp-synchronous, using the ISA's fragment
+  layout; checked against the tensor-core forward, which it reproduces to
+  one f16 rounding), statements broken across lines, several braced
+  operand lists, `mov.b32 {lo, hi}`, `mad.lo` and `atom.add.f32`. It also
+  gained two warp-serial schedules, which let one warp run a whole barrier
+  interval ahead of the others.
+- **`nsl build` refuses every calibration flag** instead of accepting it
+  and doing nothing (roadmap item 8, second slice). The refused flags are
+  `--calibration-data`, `--calibrate`, `--calibration-samples`,
+  `--calibration-batch-size` and `--calibration-timeout`.
+  - **Why:** the calibration harness lives in
+    `nsl_codegen::compile_and_calibrate`, and no build path calls it.
+    `--calibration-data` was validated, warned "validated but NOT consumed"
+    and was then dropped. The other four configured a run that never
+    happened, and did so silently whenever `--calibration-data` was absent.
+  - **Now:** each flag given is named in one refusal, and nothing is built.
+    The four knobs no longer have defaults to hide behind.
+  - **WGGO grad mode:** its "requires calibration data" refusal no longer
+    tells users to write a `quant awq { calibration_data = ... }` block,
+    which does not exist. It says grad scoring is unavailable from the CLI
+    and points to `--wggo-importance=magnitude`.
+  - **Gates updated:**
+    - the activation contract lists the five flags as refused;
+    - the composition gate allowlists the single-flag refusal;
+    - the `--calibrate best-effort` feature rule is gone;
+    - the CLI reference is regenerated.
+  - **Tests updated:** `calibration_flag_validation` (4),
+    `calibration_pipeline_integration`, and `calibration_no_cargo` pin the
+    refusal. They previously pinned accept-and-drop.
 
 - **`.to(dtype)` converts** (dtype-semantics design, step 1).
   - **What was wrong.** On a standard-dtype tensor, `.to(f32)` and

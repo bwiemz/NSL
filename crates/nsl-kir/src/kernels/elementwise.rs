@@ -737,6 +737,123 @@ pub fn backward_ptx(op: BackwardOp) -> Vec<u8> {
     verified_ptx(build_backward(op))
 }
 
+/// The RoPE `rotate_half` pair over the last dimension: with `col = i %
+/// last_dim` and `half = last_dim / 2`, element `i` takes the partner
+/// `half` away (`i + half` in the first half, `i - half` in the second).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RotateHalfOp {
+    /// `nsl_rotate_half_f32`: `out[..h] = -in[h..]`, `out[h..] = in[..h]`.
+    Plain,
+    /// `nsl_rotate_half_neg_f32`, the fused RoPE backward
+    /// `neg(rotate_half(x))`: `out[..h] = in[h..]`, `out[h..] = -in[..h]`.
+    /// A negation is a sign-bit flip, so this is bit-identical to the
+    /// two-launch composition it replaces.
+    Neg,
+}
+
+impl RotateHalfOp {
+    pub const ALL: [RotateHalfOp; 2] = [RotateHalfOp::Plain, RotateHalfOp::Neg];
+
+    pub fn kernel_name(self) -> &'static str {
+        match self {
+            RotateHalfOp::Plain => "nsl_rotate_half_f32",
+            RotateHalfOp::Neg => "nsl_rotate_half_neg_f32",
+        }
+    }
+}
+
+/// `nsl_rotate_half[_neg]_f32(a, c, n, last_dim, half)`, as the hand kernels
+/// branch: `col < half` takes the first-half arm, anything else the second.
+/// [`RotateHalfOp::Plain`] negates in the first arm, [`RotateHalfOp::Neg`]
+/// in the second.
+pub fn build_rotate_half(op: RotateHalfOp) -> KernelIR {
+    use AddressSpace::Global;
+    let mut b = KirBuilder::new(op.kernel_name());
+    let a = b.add_param("a", f32_ptr(), Global);
+    let c = b.add_param("c", f32_ptr(), Global);
+    let n = b.add_param("n", KirType::U64, Global);
+    let last_dim = b.add_param("last_dim", KirType::U64, Global);
+    let half = b.add_param("half", KirType::U64, Global);
+    let (i, _, exit) = index_and_bound(&mut b, n);
+
+    let col = b.new_typed_var(KirType::U64);
+    b.emit(KirOp::Rem(col, i, last_dim));
+    let first = b.new_typed_var(KirType::Bool);
+    b.emit(KirOp::Cmp(first, col, half, CmpOp::Lt));
+    let first_block = b.new_block();
+    let second_block = b.new_block();
+    b.terminate(KirTerminator::CondBranch(first, KirEdge::to(first_block), KirEdge::to(second_block)));
+
+    for (block, from_second_half) in [(second_block, false), (first_block, true)] {
+        b.set_block(block);
+        let src = b.new_typed_var(KirType::U64);
+        b.emit(if from_second_half { KirOp::Add(src, i, half) } else { KirOp::Sub(src, i, half) });
+        let v = load_f32(&mut b, a, src);
+        // Plain negates what the first half reads; Neg what the second does.
+        let negate = from_second_half == (op == RotateHalfOp::Plain);
+        let v = if negate { f32_op1(&mut b, KirOp::Neg, v) } else { v };
+        store_f32(&mut b, c, i, v);
+        b.terminate(KirTerminator::Branch(KirEdge::to(exit)));
+    }
+
+    b.set_block(exit);
+    b.terminate(KirTerminator::Return);
+    b.set_workgroup_size([ELEMENTWISE_BLOCK, 1, 1]);
+    b.set_launch_bounds(ELEMENTWISE_BLOCK, None);
+    b.finalize()
+}
+
+/// [`build_rotate_half`] lowered to a NUL-terminated PTX module.
+///
+/// # Panics
+///
+/// If the built kernel fails verification: a bug in this module.
+pub fn rotate_half_ptx(op: RotateHalfOp) -> Vec<u8> {
+    verified_ptx(build_rotate_half(op))
+}
+
+/// The clamp adjoint's entry name.
+pub const CLAMP_BACKWARD_NAME: &str = "nsl_clamp_backward_f32";
+
+/// `nsl_clamp_backward_f32(grad, input, out, min_val, max_val, n)`:
+/// `out[i] = (input[i] >= min_val && input[i] <= max_val) ? grad[i] : 0`.
+/// Both comparisons are ordered, so a NaN input (or bound) passes nothing:
+/// the hand kernel's `setp.ge`, `setp.le`, `and.pred`, `selp`.
+pub fn build_clamp_backward() -> KernelIR {
+    use AddressSpace::Global;
+    let mut b = KirBuilder::new(CLAMP_BACKWARD_NAME);
+    let grad = b.add_param("grad", f32_ptr(), Global);
+    let input = b.add_param("input", f32_ptr(), Global);
+    let out = b.add_param("out", f32_ptr(), Global);
+    let lo = b.add_param("min_val", KirType::F32, Global);
+    let hi = b.add_param("max_val", KirType::F32, Global);
+    let n = b.add_param("n", KirType::U64, Global);
+    let (i, _, exit) = index_and_bound(&mut b, n);
+
+    let g = load_f32(&mut b, grad, i);
+    let x = load_f32(&mut b, input, i);
+    let above = b.new_typed_var(KirType::Bool);
+    b.emit(KirOp::Cmp(above, x, lo, CmpOp::Ge));
+    let below = b.new_typed_var(KirType::Bool);
+    b.emit(KirOp::Cmp(below, x, hi, CmpOp::Le));
+    let inside = b.new_typed_var(KirType::Bool);
+    b.emit(KirOp::And(inside, above, below));
+    let zero = f32_const(&mut b, 0);
+    let y = b.new_typed_var(KirType::F32);
+    b.emit(KirOp::Select(y, inside, g, zero));
+    store_f32(&mut b, out, i, y);
+    finish(b, exit)
+}
+
+/// [`build_clamp_backward`] lowered to a NUL-terminated PTX module.
+///
+/// # Panics
+///
+/// If the built kernel fails verification: a bug in this module.
+pub fn clamp_backward_ptx() -> Vec<u8> {
+    verified_ptx(build_clamp_backward())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -871,6 +988,49 @@ mod tests {
             assert_eq!(bytes.last(), Some(&0), "{op:?}");
             assert!(bytes.is_ascii(), "{op:?}");
         }
+    }
+
+    #[test]
+    fn the_rotate_half_kernels_verify_and_keep_their_signature() {
+        for op in RotateHalfOp::ALL {
+            let ir = build_rotate_half(op);
+            if let Err(errors) = verify(&ir) {
+                panic!("{op:?} failed verification: {errors:?}");
+            }
+            assert_eq!(ir.name, op.kernel_name());
+            let params: Vec<&str> = ir.params.iter().map(|p| p.name.as_str()).collect();
+            assert_eq!(params, ["a", "c", "n", "last_dim", "half"], "{op:?}");
+            let text = String::from_utf8(rotate_half_ptx(op)).expect("ASCII");
+            for mnemonic in ["rem.u64 ", "setp.lt.u64 ", "neg.f32 "] {
+                assert_eq!(text.matches(mnemonic).count(), 1, "{op:?} {mnemonic}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_clamp_backward_kernel_verifies_and_keeps_its_signature() {
+        let ir = build_clamp_backward();
+        if let Err(errors) = verify(&ir) {
+            panic!("clamp backward failed verification: {errors:?}");
+        }
+        assert_eq!(ir.name, CLAMP_BACKWARD_NAME);
+        let params: Vec<(&str, KirType)> = ir.params.iter().map(|p| (p.name.as_str(), p.ty.clone())).collect();
+        assert_eq!(
+            params,
+            [
+                ("grad", f32_ptr()),
+                ("input", f32_ptr()),
+                ("out", f32_ptr()),
+                ("min_val", KirType::F32),
+                ("max_val", KirType::F32),
+                ("n", KirType::U64),
+            ]
+        );
+        let text = String::from_utf8(clamp_backward_ptx()).expect("ASCII");
+        for mnemonic in ["setp.ge.f32 ", "setp.le.f32 ", "and.pred ", "selp.f32 "] {
+            assert_eq!(text.matches(mnemonic).count(), 1, "{mnemonic}");
+        }
+        assert!(text.ends_with('\0'));
     }
 
     /// The tape-AD kernels are bare, the source-AD ones explicitly rounded
