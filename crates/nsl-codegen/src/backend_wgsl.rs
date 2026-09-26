@@ -93,7 +93,7 @@ fn lower_op_to_wgsl(op: &KirOp) -> String {
         KirOp::AddRn(dst, a, b) => format!("var v{} = v{} + v{};", dst, a, b),
         KirOp::SubRn(dst, a, b) => format!("var v{} = v{} - v{};", dst, a, b),
         KirOp::MulRn(dst, a, b) => format!("var v{} = v{} * v{};", dst, a, b),
-        KirOp::Div(dst, a, b) => format!("var v{} = v{} / v{};", dst, a, b),
+        KirOp::Div(dst, a, b) | KirOp::DivApprox(dst, a, b) => format!("var v{} = v{} / v{};", dst, a, b),
         KirOp::Fma(dst, a, b, c) => format!("var v{} = fma(v{}, v{}, v{});", dst, a, b, c),
         KirOp::Neg(dst, a) => format!("var v{} = -v{};", dst, a),
         KirOp::Abs(dst, a) => format!("var v{} = abs(v{});", dst, a),

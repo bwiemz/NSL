@@ -1616,6 +1616,7 @@ pub(crate) fn kir_op_kind_name(op: &KirOp) -> &'static str {
         KirOp::SubRn(..) => "SubRn",
         KirOp::MulRn(..) => "MulRn",
         KirOp::Div(..) => "Div",
+        KirOp::DivApprox(..) => "DivApprox",
         KirOp::Fma(..) => "Fma",
         KirOp::Neg(..) => "Neg",
         KirOp::Abs(..) => "Abs",

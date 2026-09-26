@@ -72,7 +72,7 @@ fn lower_op_to_amdgpu(op: &KirOp, ir: &KernelIR) -> String {
         KirOp::AddRn(dst, a, b) => format!("; add.rn v{}, v{}, v{}", dst, a, b),
         KirOp::SubRn(dst, a, b) => format!("; sub.rn v{}, v{}, v{}", dst, a, b),
         KirOp::MulRn(dst, a, b) => format!("; mul.rn v{}, v{}, v{}", dst, a, b),
-        KirOp::Div(dst, a, b) => format!("; div v{}, v{}, v{}", dst, a, b),
+        KirOp::Div(dst, a, b) | KirOp::DivApprox(dst, a, b) => format!("; div v{}, v{}, v{}", dst, a, b),
         KirOp::Fma(dst, a, b, c) => format!("v_fma_f32 v{}, v{}, v{}, v{}", dst, a, b, c),
         KirOp::Neg(dst, a) => format!("; neg v{}, v{}", dst, a),
         KirOp::Abs(dst, a) => format!("; abs v{}, v{}", dst, a),

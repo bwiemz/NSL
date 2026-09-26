@@ -3218,7 +3218,7 @@ pub extern "C" fn nsl_zero3_reduce_grad_slot(list_ptr: i64, idx: i64) -> i64 {
 /// Item 11: the elementwise fused-AdamW step — EVERY rank updates its own
 /// `[rank*shard, (rank+1)*shard)` region using the reduce_scattered gradient
 /// slice, with the EXACT per-element math of `nsl_fase_fused_adamw_step`
-/// (GPU: the same `FASE_FUSED_ADAMW_STEP_F32_PTX` kernel launched on the
+/// (GPU: the same `nsl_fase_fused_adamw_step_f32` kernel launched on the
 /// region; CPU: the same loops). AdamW has no cross-element terms, so the
 /// result is bit-identical to the baseline full-tensor step restricted to
 /// this region. The updated theta region is then persisted into the slice
