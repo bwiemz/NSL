@@ -43,8 +43,8 @@ const fn k(name: &'static str, read_by: &'static str) -> KnownDecorator {
 }
 
 /// Every decorator name the toolchain reads anywhere, from the 2026-08-15
-/// empirical inventory: 34 validated in `checker/stmt.rs`, 13 in
-/// `checker/model.rs`, 3 in other semantic modules, and 9 read only by
+/// empirical inventory (updated as consumers move): 35 validated in `checker/stmt.rs`, 13 in
+/// `checker/model.rs`, 3 in other semantic modules, and 8 read only by
 /// codegen. Names consumed by the parser before a `Decorator` node exists
 /// (`pack`, `unpack`, `backward`, `*_ptx` in datatype blocks; `endpoint` in
 /// serve blocks) are deliberately absent — their namespaces were already
@@ -86,6 +86,7 @@ pub static KNOWN_DECORATORS: &[KnownDecorator] = &[
     k("wggo", "crates/nsl-semantic/src/checker/stmt.rs"),
     k("wggo_target", "crates/nsl-semantic/src/checker/stmt.rs"),
     k("wrga", "crates/nsl-semantic/src/checker/stmt.rs"),
+    k("quantize", "crates/nsl-semantic/src/checker/stmt.rs"),
     // --- validated in nsl-semantic/src/checker/model.rs ---
     k("context_parallel", "crates/nsl-semantic/src/checker/model.rs"),
     k("fp8_compute", "crates/nsl-semantic/src/checker/model.rs"),
@@ -108,7 +109,6 @@ pub static KNOWN_DECORATORS: &[KnownDecorator] = &[
     k("fp4_compute", "crates/nsl-codegen/src/fp8.rs"),
     k("no_grad", "crates/nsl-codegen/src/compiler/declaration.rs"),
     k("param_role", "crates/nsl-codegen/src/compiler/collection.rs"),
-    k("quantize", "crates/nsl-codegen/src/compiler/collection.rs"),
     k("real_time", "crates/nsl-codegen/src/wcet.rs"),
     k("search", "crates/nsl-codegen/src/cep_extract.rs"),
     k("wcet_budget", "crates/nsl-codegen/src/wcet.rs"),

@@ -860,6 +860,25 @@ frozen throughout, so nothing here blocks a kernel fix.
     KIR kernels issue exactly the hand kernels' floating-point instruction
     sequence on sm_80/90/120 (2 and 44 instructions), and use the same
     registers (10, and 14/13/15). Only the address arithmetic differs.
+
+    **The activation-backward kernels** (eighth slice): nine kernels built
+    by `nsl_kir::kernels::elementwise::build_backward` (`BackwardOp`).
+    - **Tape-AD**, `nsl_{relu,sigmoid,tanh,silu}_backward_f32`: bare
+      arithmetic, so ptxas may contract, as before. Tape-AD tanh's
+      `1 - y*y` becomes one `FFMA` on both sides.
+    - **Source-AD**, `nsl_{sigmoid,tanh,silu,gelu}_backward_srcad_f32` and
+      `nsl_swiglu_gate_backward_f32`: every derivative operation is
+      `.rn`, and the sigmoid stays bare.
+    - **The gate:** `elementwise_backward_kir_equivalence` requires the
+      frozen hand kernels' bytes and the rounded formula, and pins every
+      mnemonic count.
+    - **SASS:** identical floating-point sequences on sm_75/80/90/120,
+      except the SwiGLU gate on sm_80+. There the independent `grad * up`
+      `FMUL` is scheduled elsewhere, with the same multiset and no `FFMA`.
+      Registers are within two of the hand kernels.
+    - **Still hand-written:** `nsl_gelu_backward_f32` (tanh approximation,
+      `div.approx`). `nsl_clamp_backward_f32` waits for `and.pred` in the
+      interpreter.
 12. **FA v2**, by phase directory, tier B.1 and B.2 last; the SASS
     baselines and the two no-spill gates already exist here and are the
     proof. `matmul_mma.rs` and `kernel_skeleton/` are deleted with their
