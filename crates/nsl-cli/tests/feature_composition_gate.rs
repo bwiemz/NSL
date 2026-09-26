@@ -1085,15 +1085,14 @@ const SWEEP_ALLOWLIST: &[(&str, &str)] = &[
         "staleness refusal, not a flag-pair incompatibility",
     ),
     ("warning \u{2014} --wrga-ablate=spectral", "advisory warning, run continues"),
-    // ADVISORY, and pointedly so: --calibration-data is ACCEPTED and then
-    // ignored, because the harness lives in `compile_and_calibrate` and no CLI
-    // path calls it. The build succeeds. Registering it as a refusal would
-    // claim an enforcement that does not exist -- the exact overstatement this
-    // allowlist protects the registry from. It names --wggo-importance only to
-    // say that grad mode stays unavailable.
+    // A single-flag refusal, not a composition rule: every calibration flag
+    // is refused on its own because `nsl build` does not run the calibration
+    // harness (roadmap item 8; it used to be accepted and dropped with a
+    // warning). It names --wggo-importance only to point at magnitude
+    // scoring, which needs no calibration data.
     (
-        "is validated but NOT consumed",
-        "advisory warning, build succeeds; the corpus is dropped, not refused",
+        "calibration is not implemented by `nsl build`",
+        "single-flag refusal (calibration is not wired into the build), not a flag-pair rule",
     ),
     // ADVISORY: the --wggo-importance=auto fallback note. It names
     // --calibration-data only to say that supplying it will NOT lift the note

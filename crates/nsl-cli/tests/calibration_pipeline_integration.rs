@@ -74,20 +74,23 @@ fn build_without_calibration_data_is_unchanged() {
     assert!(linked_binary(dir.path()).is_file(), "no linked binary beside the source");
 }
 
-/// A `--calibration-data` that nothing consumes must say so: the build is
-/// not allowed to accept a corpus and then silently do nothing with it.
+/// A `--calibration-data` the build cannot honour is refused, and nothing is
+/// built. This replaces two older contracts:
 ///
-/// The warning this asserts on has never been reachable from the CLI for
-/// this fixture: when the test was written (f05917a7, 2026-04-13) it fired
-/// from inside `compile_train_block`, so only for programs with a `train`
-/// block; e3ab23ad (2026-05-10) moved it — with the whole harness firing —
-/// into the library wrapper `nsl_codegen::compile_and_calibrate`, which
-/// nothing in the workspace calls (the codegen tests drive
-/// `real_subprocess_entry` directly). Unblocking is not a revert: the CLI
-/// build entry has to run that wrapper-level block for every program.
+/// - `build_with_calibration_data_emits_no_consumer_warning` (ignored since
+///   e3ab23ad, 2026-05-10): it wanted the harness to run from `nsl build` and
+///   warn that no hook consumed the corpus. The harness lives in
+///   `nsl_codegen::compile_and_calibrate`, which nothing calls, so the
+///   warning was unreachable.
+/// - `build_with_calibration_data_and_no_consumer_still_builds`: it pinned
+///   that such a build succeeded, i.e. that the corpus was accepted and
+///   dropped.
+///
+/// Roadmap item 8 settles it the other way: an ignored request is refused.
+/// Wiring the harness into the build is future work; when it lands, this
+/// test flips to asserting the harness ran.
 #[test]
-#[ignore = "blocked: `nsl build` never runs the calibration harness — the no-consumer warning lives in `compile_and_calibrate` (e3ab23ad, 2026-05-10), which nothing in the workspace calls, and before that it was gated behind a `train` block; on the CLI path --calibration-data is validated and the harness never fires"]
-fn build_with_calibration_data_emits_no_consumer_warning() {
+fn build_with_calibration_data_is_refused_and_builds_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let model = fixture_in(dir.path());
     let data = calibration_bin(dir.path());
@@ -95,26 +98,11 @@ fn build_with_calibration_data_emits_no_consumer_warning() {
         &model,
         &["--calibration-data", data.to_str().unwrap(), "--calibrate", "best-effort"],
     );
-    assert_eq!(code, 0, "best-effort should not fail the build; stderr:\n{err}");
+    assert_ne!(code, 0, "a calibration corpus nothing consumes must be refused:\n{err}");
     assert!(
-        err.contains("no calibration hooks registered") || err.contains("no consumers"),
-        "expected a no-consumer warning in stderr, got: {err}"
+        err.contains("--calibration-data, --calibrate are refused")
+            && err.contains("calibration is not implemented by `nsl build`"),
+        "the refusal must name the flags and the reason:\n{err}"
     );
-}
-
-/// What the CLI does today with a corpus nothing consumes: the build
-/// succeeds. This is the half of the contract that holds; the half that
-/// does not (it should also say the corpus was unused) is the ignored test
-/// above.
-#[test]
-fn build_with_calibration_data_and_no_consumer_still_builds() {
-    let dir = tempfile::tempdir().unwrap();
-    let model = fixture_in(dir.path());
-    let data = calibration_bin(dir.path());
-    let (_, err, code) = run(
-        &model,
-        &["--calibration-data", data.to_str().unwrap(), "--calibrate", "best-effort"],
-    );
-    assert_eq!(code, 0, "best-effort should not fail the build; stderr:\n{err}");
-    assert!(linked_binary(dir.path()).is_file(), "no linked binary beside the source");
+    assert!(!linked_binary(dir.path()).exists(), "a refused build must not link a binary");
 }
