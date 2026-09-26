@@ -156,7 +156,14 @@ driver runs it:
    state-buffer count as `ParamPlan`, accumulation and checkpointing as
    `TrainSchedule` — plain data, no Cranelift handle), which the
    checkpoint-identity record and the late emitters below read as `&plan`
-   (roadmap A1, TrainPlan design step 1).
+   (roadmap A1, TrainPlan design step 1). Its counterpart for handles is
+   `EmitState` (`src/stmt_train/emit_state.rs`, step 3). It holds the
+   setup lists, the optimizer state, the accumulation and CSLA window
+   buffers, the resume handles and the loop variables, and the driver
+   builds it once before the epoch loop. The late emitters take
+   `(&plan, &emit)` plus only the handles one micro-batch produces.
+   `tests/train_plan_emit_state.rs` keeps setup handles out of their
+   `Inputs` structs.
 5. Epoch/batch loops; forward extraction into a `WengertList` by
    `WengertExtractor` (`src/source_ad.rs`), then the initial primal
    `VarMap` (`src/stmt_train/primal_vars.rs`: `emit_primal_vars` — named
