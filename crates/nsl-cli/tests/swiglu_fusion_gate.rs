@@ -111,3 +111,46 @@ fn swiglu_fused_backward_gpu_deterministic_and_matches_reference() {
         }
     }
 }
+
+/// The peephole must actually fire on the fixture, and must be bit-exact:
+/// the fused source-AD run prints the same weights, to the last digit, as a
+/// source-AD run with `NSL_FUSE_SWIGLU_GATE=0`. (It used to never fire —
+/// `MulElementwise` wraps the product in `reduce_to_shape`, which the
+/// peephole did not see through — so the gates above compared the unfused
+/// path with itself.)
+#[test]
+fn swiglu_peephole_fires_and_is_bit_exact_cpu() {
+    let root = repo_root();
+    let tmp = std::env::temp_dir().join(format!("nsl_swiglu_fires_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::copy(root.join("crates/nsl-cli/tests/fixtures/swiglu_parity.nsl"), tmp.join("prog.nsl")).unwrap();
+    let run = |fuse: bool| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_nsl"));
+        cmd.args(["run", "--deterministic", "--source-ad", "prog.nsl"])
+            .current_dir(&tmp)
+            .env("NSL_STDLIB_PATH", root.join("stdlib"));
+        if !fuse {
+            cmd.env("NSL_FUSE_SWIGLU_GATE", "0");
+        }
+        let out = cmd.output().expect("spawn nsl run");
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "run failed (fuse={fuse}):\n{stderr}");
+        (String::from_utf8_lossy(&out.stdout).into_owned(), stderr)
+    };
+    let (fused_out, fused_err) = run(true);
+    let (plain_out, plain_err) = run(false);
+    assert!(
+        fused_err.contains("[fuse] swiglu gate-backward pairs: 1"),
+        "the SwiGLU gate peephole did not fire on the fixture:\n{fused_err}"
+    );
+    assert!(
+        !plain_err.contains("[fuse] swiglu gate-backward"),
+        "NSL_FUSE_SWIGLU_GATE=0 did not disable the peephole:\n{plain_err}"
+    );
+    for (b, e) in [("WG_BEGIN", "WG_END"), ("WU_BEGIN", "WU_END")] {
+        let section = |s: &str| s.split_once(b).and_then(|(_, r)| r.split_once(e)).map(|(v, _)| v.to_string());
+        let (f, p) = (section(&fused_out), section(&plain_out));
+        assert!(f.is_some(), "{b} missing from fused output:\n{fused_out}");
+        assert_eq!(f, p, "{b}: fused and unfused weights differ");
+    }
+}

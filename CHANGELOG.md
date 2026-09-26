@@ -702,6 +702,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **The SwiGLU gate-backward peephole fires** (P5 item 20 slice B). It
+  never had.
+  - **Why it never fired.** `fuse_swiglu_gate_backward` looked for
+    `silu_backward(Mul(y_bar, u), g)`. But `MulElementwise` always wraps its
+    product in `reduce_to_shape` (for broadcasting), so the tape actually
+    held `silu_backward(reduce_to_shape(Mul(y_bar, u), s), g)`. The
+    peephole never matched, and `swiglu_fusion_gate` compared the unfused
+    path with tape-AD.
+  - **The rewrite.** The peephole now sees through the reduce when both
+    intermediates have one reader and neither is a needed gradient. It
+    drops the Mul and the reduce and emits one `swiglu_gate_backward`
+    launch. The reduce is an identity whenever the fused kernel runs, since
+    it requires `y_bar`, `u` and `g` to share a shape.
+  - **The runtime fallback.** The non-uniform fallback in
+    `nsl_tensor_swiglu_gate_backward` now reduces the product to `g`'s shape
+    before `silu_backward`, as the decomposed chain did.
+  - **New kill switch.** `NSL_FUSE_SWIGLU_GATE=0` (compile-time) disables
+    the fusion. A new marker, `[fuse] swiglu gate-backward pairs: N`,
+    reports how many pairs were fused.
+  - **New gate.** `swiglu_peephole_fires_and_is_bit_exact_cpu` requires the
+    marker on the fixture. It also requires the fused weights to equal the
+    `NSL_FUSE_SWIGLU_GATE=0` weights digit for digit.
+  - **GPU.** The fused kernel now runs in GPU SwiGLU training for the first
+    time. The ignored `swiglu_fused_backward_gpu_deterministic_and_matches_reference`
+    gate covers it.
 - **FP8 simulation rounds onto the FP8 grid** (roadmap tolerance audit,
   third slice).
   - **What was wrong.** `fp8::quantize_fp8` (behind `nsl_fp8_cast`,

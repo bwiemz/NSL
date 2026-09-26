@@ -303,7 +303,10 @@ impl Compiler<'_> {
             adjoint.ops = crate::source_ad::eliminate_dead_gradients(&adjoint.ops, &needed);
             // P5 item 20 slice B (bit-exact SwiGLU gate fusion; also applied
             // on the train path).
-            crate::source_ad::fuse_swiglu_gate_backward(&mut adjoint.ops, &needed);
+            let swiglu_fused = crate::source_ad::fuse_swiglu_gate_backward(&mut adjoint.ops, &needed);
+            if swiglu_fused > 0 {
+                nsl_log::nsl_log!(INFO, "fuse", "[fuse] swiglu gate-backward pairs: {swiglu_fused}");
+            }
             // P5 slice C (residual fold — see the train path).
             crate::source_ad::fuse_rmsnorm_dx_residual(&mut adjoint.ops, &needed);
 
