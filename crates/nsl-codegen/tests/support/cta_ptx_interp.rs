@@ -48,6 +48,9 @@
 //! the width, rather than wrapping it as Rust's `<<` would.
 //! `cvt.rn.f32.u32` and `cvt.rn.f32.u64` convert with round-to-nearest
 //! (Rust's `as`), and `cvt.u32.u64` keeps the low 32 bits.
+//! `cvt.rzi.u64.f32` truncates toward zero and saturates, a NaN or a
+//! negative value giving 0: PTX's float-to-integer rule, which Rust's `as`
+//! also follows.
 //!
 //! A `.shared` block may be declared by element (`.shared .f32 NAME[N]`,
 //! `N` elements) as well as in bytes, and an address may name it directly
@@ -198,6 +201,9 @@ pub(crate) enum Op {
     CvtF32U32 { d: usize, a: Src },
     /// `cvt.rn.f32.u64`: round to nearest.
     CvtF32U64 { d: usize, a: Src },
+    /// `cvt.rzi.u64.f32`: toward zero, saturating to `[0, 2^64)`, NaN to 0
+    /// (PTX's float-to-integer rule, and Rust's `as`).
+    CvtU64F32Rzi { d: usize, a: Src },
     CvtF32F16 { d: usize, a: Src },
     /// `cvt.rn.f32.s8`: the low byte, as a signed integer, to f32 (exact).
     CvtF32S8 { d: usize, a: Src },
@@ -587,6 +593,10 @@ pub(crate) fn parse(ptx: &str) -> Program {
             ["cvt", "rn", "f32", "u64"] => {
                 want(2);
                 Op::CvtF32U64 { d: p.dst(ops[0]), a: p.src(ops[1]) }
+            }
+            ["cvt", "rzi", "u64", "f32"] => {
+                want(2);
+                Op::CvtU64F32Rzi { d: p.dst(ops[0]), a: p.src(ops[1]) }
             }
             [name @ ("and" | "or"), "pred"] => {
                 want(3);
@@ -1020,6 +1030,10 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
             Op::CvtF32U64 { d, a } => {
                 let v = rd(t, launch, *a) as f32;
                 write(t, *d, fb(v));
+            }
+            Op::CvtU64F32Rzi { d, a } => {
+                let v = f32::from_bits(rd(t, launch, *a) as u32) as u64;
+                write(t, *d, v);
             }
             Op::CvtF32F16 { d, a } => {
                 let v = f16::from_bits(rd(t, launch, *a) as u16).to_f32();

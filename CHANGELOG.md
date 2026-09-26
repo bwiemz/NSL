@@ -8,6 +8,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **Four data-movement kernels from `cuda/fused_kernels.rs` are built by
+  `nsl_kir::kernels::data_movement`** in place of their hand-written
+  constants (new-roadmap item 5): `nsl_bias_add_f32`, `nsl_gather_dim_f32`,
+  `nsl_strided_copy_f32` and `nsl_slice_f32`.
+  - **The kernels** keep the hand kernels' instruction sequences: the
+    32-bit index widened and a 64-bit bound, and a bare `add.f32` for the
+    bias. The gather truncates its f32 index with `cvt.rzi.u64.f32` and
+    writes 0 past `gather_dim_size`. The strided walk is a KIR loop over
+    `(dim, remaining, src_offset)` block parameters, with the zero-stride
+    skip and the broadcast modulus. The slice adds `slice_start` on
+    `slice_dim` with a select.
+  - **The interpreter** gains `cvt.rzi.u64.f32`: toward zero, saturating,
+    NaN to 0.
+  - **The gate.** `tests/data_movement_kir_equivalence.rs` (9 tests) runs
+    the frozen hand kernels and the KIR ones on the CTA interpreter.
+    - It requires identical global memory under two schedules and each
+      kernel's formula bit for bit.
+    - The inputs: IEEE-corner values; gather indices that are fractional,
+      negative, NaN, at or past the bound, or huge; and strided views that
+      are contiguous, transposed, broadcast, zero-destination-stride or
+      0-d.
+    - It catches mutants of the bound, the block index, every f32 and
+      table element size, the bias modulus, the gather's quotient,
+      remainder and range test, the walk's zero-stride skip, quotient,
+      remainders and increment, and the slice's dimension test and start.
+  - **SASS** on sm_80/90/120: registers are equal or fewer (bias 16/18/20,
+    gather 18/20/20, copy 26/26/26, slice 26/28/28). The instruction
+    count is within 16, mostly in the emulated 64-bit divisions.
+
 - **`nsl_fase_fused_adamw_multi_f32` is built by
   `nsl_kir::kernels::optim` in place of its hand-written constant**
   (new-roadmap item 5, after the single-parameter step). It is the
