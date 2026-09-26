@@ -8,6 +8,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- A finite-difference gradcheck of the CPU-naive attention backward oracles
+  (`crates/nsl-test/tests/cpu_naive_backward_gradcheck.rs`) — roadmap
+  tolerance audit, fifth slice.
+  - **What it covers.** The tier-B2 GPU backward tests compare against
+    `cpu_naive_backward_{dq,dkdv,proj}`. On CPU, those oracles were checked
+    only by the following:
+    - an inline copy of the dQ formula (non-causal, one head);
+    - an `s = 1` dK/dV case;
+    - a one-row projection smoke test.
+  - **What the new test does.** It differentiates an independent f64
+    forward by central differences at the f16 inputs. It uses two batches
+    and two heads, causal and non-causal, with a random `dO`.
+  - **Tolerances.** dQ/dK must agree within 2e-3 of the largest gradient
+    (they read the f16 `O`; measured 4.6e-4). dV and the projection must
+    agree within 1e-5 (measured 1.8e-7).
+  - **Mutants.** Of 11 oracle mutants, the old tests missed 5: causal
+    masking dropped from either oracle, dK built from K, dV with its row
+    and column swapped, and the dV path dropped from dx. The gradcheck
+    fails all 11.
+
 - Nine activation-backward kernels are built by
   `nsl_kir::kernels::elementwise` (`BackwardOp`) in place of their
   hand-written constants (roadmap A2 step 11, eighth slice). They are the
