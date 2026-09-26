@@ -10397,6 +10397,7 @@ mod tests {
         all.push(("nsl_add_f32", super::kernels::add_f32_ptx(), true));
         all.push(("nsl_sub_f32", super::kernels::sub_f32_ptx(), true));
         all.push(("nsl_mul_f32", super::kernels::mul_f32_ptx(), true));
+        all.push(("nsl_div_f32", super::kernels::div_f32_ptx(), true));
         for op in nsl_kir::kernels::elementwise::UnaryOp::ALL {
             all.push((op.kernel_name(), super::kernels::unary_module(op), true));
         }
