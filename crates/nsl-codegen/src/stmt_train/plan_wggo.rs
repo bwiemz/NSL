@@ -19,8 +19,6 @@
 //! `wggo_preplans` read is the driver-mediated edge the channel inventory
 //! already declares, not a pass-to-pass dependency.
 
-use cranelift_codegen::ir::Value;
-
 use crate::compiler::Compiler;
 use crate::error::CodegenError;
 
@@ -29,8 +27,11 @@ use crate::error::CodegenError;
 pub(crate) struct WggoPlanningInputs<'a> {
     /// The forward extractor (the planner and the pre-plan fingerprint read its Wengert list).
     pub(crate) extractor: &'a crate::source_ad::WengertExtractor<'a>,
-    /// The Muon mode-table base, when one was allocated (a pre-plan cannot be reused over it).
-    pub(crate) mode_table_base: Option<Value>,
+    /// Whether section 3 emitted a FASE per-parameter mode table (Muon's
+    /// route table) from a pre-plan. A stale pre-plan cannot be replanned in
+    /// place over one. A fact, not the table's handle: planning reads no
+    /// Cranelift values (roadmap A1, `TrainPlan` step 2).
+    pub(crate) mode_table_emitted: bool,
     /// The train block (the planner reads its optimizer and schedule facts).
     pub(crate) train: &'a nsl_ast::block::TrainBlock,
     /// The train block statement id the wrapper keyed its pre-plan by.
@@ -56,7 +57,7 @@ impl Compiler<'_> {
     ) -> Result<WggoPlanning, CodegenError> {
         let WggoPlanningInputs {
             extractor,
-            mode_table_base,
+            mode_table_emitted,
             train,
             train_block_stmt_id,
         } = inputs;
@@ -212,7 +213,7 @@ impl Compiler<'_> {
                     _ => false,
                 } || forced_stale;
                 if fase_diverged {
-                    if mode_table_base.is_some() {
+                    if mode_table_emitted {
                         return Err(CodegenError::new(
                             "the FASE per-param mode table for this train \
                                  block was emitted from a WGGO pre-plan whose \

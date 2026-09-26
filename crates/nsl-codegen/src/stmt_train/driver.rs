@@ -1315,7 +1315,7 @@ impl Compiler<'_> {
                     preplan_was_rejected: wggo_preplan_was_rejected,
                 } = self.plan_wggo(WggoPlanningInputs {
                     extractor: &extractor,
-                    mode_table_base,
+                    mode_table_emitted: mode_table_base.is_some(),
                     train,
                     train_block_stmt_id,
                 })?;
