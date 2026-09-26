@@ -8,6 +8,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- The RoPE `rotate_half` pair is built as KIR: `nsl_rotate_half_f32`
+  (`out[..h] = -in[h..]`, `out[h..] = in[..h]` over the last dimension) and
+  the fused backward `nsl_rotate_half_neg_f32` (the negation on the other
+  half) come from `nsl_kir::kernels::elementwise::build_rotate_half`
+  (roadmap A2 step 11). The runtime builds them on first use
+  (`cuda::kernels::rotate_half_module`) in place of the hand-written
+  constants.
+  `tests/rotate_half_kir_equivalence.rs` runs the frozen hand kernels and
+  the KIR ones on the CTA interpreter over IEEE-corner values (NaN payloads
+  included) and six shapes (last dimension 2 to 128, an odd half, ragged
+  final blocks). It requires:
+  - the same bytes in all of global memory;
+  - the formula bit for bit;
+  - `_neg` to be exactly the plain kernel's sign flip.
+
+  It catches named mutants: the partner on the wrong side, the negation
+  dropped or in the other arm, `<=` for `<`, the flat index for the row
+  position, the index bound, the block index, and each element size. On
+  sm_80/90/120 the SASS keeps the hand kernels' registers and 64-bit
+  remainder call. The address arithmetic (`IMAD.WIDE` for `LEA`) adds 2
+  to 8 instructions.
+
 - Nine activation-backward kernels are built by
   `nsl_kir::kernels::elementwise` (`BackwardOp`) in place of their
   hand-written constants (roadmap A2 step 11, eighth slice). They are the

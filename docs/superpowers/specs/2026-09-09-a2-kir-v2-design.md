@@ -876,6 +876,12 @@ frozen throughout, so nothing here blocks a kernel fix.
       except the SwiGLU gate on sm_80+. There the independent `grad * up`
       `FMUL` is scheduled elsewhere, with the same multiset and no `FFMA`.
       Registers are within two of the hand kernels.
+    - **RoPE `rotate_half` pair:** `nsl_rotate_half_f32` and the fused
+      backward `nsl_rotate_half_neg_f32` (`build_rotate_half`), branching
+      on `i % last_dim < half` as the hand kernels do. The gate is
+      `rotate_half_kir_equivalence`. The SASS keeps the registers and the
+      64-bit remainder call on sm_80/90/120; the address arithmetic
+      (`IMAD.WIDE` for `LEA`) adds 2 to 8 instructions.
     - **Still hand-written:** `nsl_gelu_backward_f32` (tanh approximation,
       `div.approx`). `nsl_clamp_backward_f32` waits for `and.pred` in the
       interpreter.

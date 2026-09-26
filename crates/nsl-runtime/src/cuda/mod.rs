@@ -3804,7 +3804,7 @@ pub(crate) fn gpu_rotate_half_f32(tensor_ptr: i64) -> i64 {
     let block = 256i64;
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
-        kernels::ROTATE_HALF_F32_PTX.as_ptr(),
+        kernels::rotate_half_module(nsl_kir::kernels::elementwise::RotateHalfOp::Plain).as_ptr(),
         KERNEL_NAME.as_ptr(),
         [grid, 1, 1],
         [block, 1, 1],
@@ -3927,7 +3927,7 @@ pub(crate) fn gpu_rotate_half_neg_f32(tensor_ptr: i64) -> i64 {
     let block = 256i64;
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
-        kernels::ROTATE_HALF_NEG_F32_PTX.as_ptr(),
+        kernels::rotate_half_module(nsl_kir::kernels::elementwise::RotateHalfOp::Neg).as_ptr(),
         KERNEL_NAME.as_ptr(),
         [grid, 1, 1],
         [block, 1, 1],
@@ -10407,6 +10407,9 @@ mod tests {
         all.push(("nsl_muon_scale_inv_frob_f32", super::kernels::muon_scale_inv_frob_f32_ptx(), true));
         for op in nsl_kir::kernels::elementwise::BackwardOp::ALL {
             all.push((op.kernel_name(), super::kernels::backward_module(op), true));
+        }
+        for op in nsl_kir::kernels::elementwise::RotateHalfOp::ALL {
+            all.push((op.kernel_name(), super::kernels::rotate_half_module(op), true));
         }
         all
     }
