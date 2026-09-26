@@ -4550,7 +4550,7 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi(
     ];
     let grid_x = blk_count as i64;
     let result = inner::kernel_launch(
-        kernels::FASE_FUSED_ADAMW_MULTI_F32_PTX.as_ptr(),
+        kernels::fase_fused_adamw_multi_f32_ptx().as_ptr(),
         b"nsl_fase_fused_adamw_multi_f32\0".as_ptr(),
         [grid_x, 1, 1], [block, 1, 1], &args, 0,
     );
@@ -10413,6 +10413,7 @@ mod tests {
             all.push((op.kernel_name(), super::kernels::rotate_half_module(op), true));
         }
         all.push(("nsl_fase_fused_adamw_step_f32", super::kernels::fase_fused_adamw_step_f32_ptx(), true));
+        all.push(("nsl_fase_fused_adamw_multi_f32", super::kernels::fase_fused_adamw_multi_f32_ptx(), true));
         all
     }
 
