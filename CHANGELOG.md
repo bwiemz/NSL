@@ -8,6 +8,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- A multi-step Lion gate (`e2e_lion_momentum_trajectory_is_exact`, fixture
+  `examples/lion_optimizer_momentum_e2e.nsl`) pins the stdlib optimizer's
+  momentum (roadmap tolerance audit, second slice).
+  - The existing Lion gate takes one step from `m = 0`. There the update is
+    `sign(g)` whatever `beta1`, `beta2` and the momentum update are, so it
+    cannot see any of them.
+  - The new fixture runs 8 steps through a gradient sign change and asserts
+    the exact final weight (0.4, tolerance 1e-4). It fails the run if
+    `beta1` and `beta2` are swapped, if the momentum is dropped from the
+    update, if `m` is set to `g`, or if `m` is never updated. Each of these
+    lands a whole `lr` away.
+  - The smallest pre-sign value along the trajectory is about 0.016, far
+    above f32 noise.
+
 - Nine activation-backward kernels are built by
   `nsl_kir::kernels::elementwise` (`BackwardOp`) in place of their
   hand-written constants (roadmap A2 step 11, eighth slice). They are the
