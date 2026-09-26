@@ -8,6 +8,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **`nsl_fase_fused_adamw_step_f32` is built by
+  `nsl_kir::kernels::optim` in place of its hand-written constant**
+  (new-roadmap item 5). This is the fused FASE-Deferred AdamW/Adam step,
+  bit-exact with the decomposed update program.
+  - **New KIR op.** `KirOp::DivApprox` prints `div.approx.f32` (f32 only;
+    `ApproxDivNotF32` rejects any other type). KIR's `Div` is the IEEE
+    `div.rn`, so the step could not move without it. It is also what the
+    still hand-written `div.approx` kernels need: `nsl_div_f32`,
+    `nsl_tanh_f32` and the other AdamW variants.
+  - **The kernel** keeps the hand kernel's per-operation rounding (`.rn`,
+    `sqrt.rn`, `div.approx`) and instruction order. Weight decay is a
+    branch joined through a block parameter.
+  - **The gate.** `tests/fase_adamw_step_kir_equivalence.rs` (12 tests)
+    runs the frozen hand kernel and the KIR one on the CTA interpreter.
+    - It requires identical global memory under two schedules and five
+      hyperparameter sets (with and without decay), and AdamW rounded per
+      operation.
+    - It pins every mnemonic count. `div.approx` → `div.rn` and a dropped
+      `.rn` are named equivalent mutants the pin exists for.
+    - It catches mutants of the bound, the block index, the seven element
+      sizes, each hyperparameter slot, the decay branch, each add and
+      multiply, the square root and the division.
+  - **SASS** on sm_80/90/120: the same floating-point instructions. The
+    order is identical on sm_80; on sm_90/120 two independent multiplies
+    trade places. Registers are 16/16/18 against the hand kernel's
+    18/18/18.
+
 - Nine activation-backward kernels are built by
   `nsl_kir::kernels::elementwise` (`BackwardOp`) in place of their
   hand-written constants (roadmap A2 step 11, eighth slice). They are the

@@ -422,6 +422,15 @@ fn emit_op(ptx: &mut String, op: &KirOp, ir: &KernelIR) {
             )
             .unwrap();
         }
+        KirOp::DivApprox(dst, a, b) => {
+            let prefix = var_reg_prefix(ir, *dst, *a);
+            writeln!(
+                ptx,
+                "    div.approx.f32 {}{}, {}{}, {}{};",
+                prefix, dst, prefix, a, prefix, b
+            )
+            .unwrap();
+        }
         KirOp::Fma(dst, a, b, c) => {
             let ty = var_ptx_type(ir, *dst, *a);
             let prefix = var_reg_prefix(ir, *dst, *a);
@@ -2473,6 +2482,27 @@ mod tests {
             assert!(ptx.contains(&format!("add.{suffix} {}, {}, {};", n(bare), n(s), n(x))), "{ptx}");
         }
     }
+    /// `DivApprox` prints `div.approx.f32`; the IEEE `Div` stays `div.rn`.
+    #[test]
+    fn approximate_division_spells_div_approx() {
+        let mut b = KirBuilder::new("divapprox");
+        let entry = b.new_block();
+        b.set_block(entry);
+        let x = b.new_typed_var(KirType::F32);
+        b.emit(KirOp::Const(x, KirConst { ty: KirType::F32, value: ConstValue::F32(3.0) }));
+        let q = b.new_typed_var(KirType::F32);
+        b.emit(KirOp::DivApprox(q, x, x));
+        let r = b.new_typed_var(KirType::F32);
+        b.emit(KirOp::Div(r, q, x));
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+        crate::kir_verify::verify(&ir).expect("verifies");
+        let ptx = String::from_utf8(lower_kir_to_ptx(&ir)).unwrap();
+        let al = crate::regalloc::allocate(&ir);
+        assert!(ptx.contains(&format!("div.approx.f32 {}, {}, {};", al.name(q), al.name(x), al.name(x))), "{ptx}");
+        assert!(ptx.contains(&format!("div.rn.f32 {}, {}, {};", al.name(r), al.name(q), al.name(x))), "{ptx}");
+    }
+
     /// Every register a kernel READS must be one the kernel DEFINES.
     ///
     /// This is the property both of the bugs below violated, and it is

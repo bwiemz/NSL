@@ -83,7 +83,7 @@ impl BinaryOp {
     }
 }
 
-fn f32_ptr() -> KirType {
+pub(crate) fn f32_ptr() -> KirType {
     KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global)
 }
 
@@ -247,7 +247,7 @@ pub fn scalar_ptx(op: ScalarOp) -> Vec<u8> {
 /// with: `i = blockIdx.x * blockDim.x + threadIdx.x` taken in 32 bits and
 /// widened, then `if i >= n { exit } else { body }`. Returns `(i, body,
 /// exit)` with the builder in `body`.
-fn index_and_bound(b: &mut KirBuilder, n: VarId) -> (VarId, crate::kernel_ir::BlockId, crate::kernel_ir::BlockId) {
+pub(crate) fn index_and_bound(b: &mut KirBuilder, n: VarId) -> (VarId, crate::kernel_ir::BlockId, crate::kernel_ir::BlockId) {
     let entry = b.new_block();
     let body = b.new_block();
     let exit = b.new_block();
@@ -264,7 +264,7 @@ fn index_and_bound(b: &mut KirBuilder, n: VarId) -> (VarId, crate::kernel_ir::Bl
 }
 
 /// Close `body` into `exit`, return from `exit`, and set the launch shape.
-fn finish(mut b: KirBuilder, exit: crate::kernel_ir::BlockId) -> KernelIR {
+pub(crate) fn finish(mut b: KirBuilder, exit: crate::kernel_ir::BlockId) -> KernelIR {
     b.terminate(KirTerminator::Branch(KirEdge::to(exit)));
     b.set_block(exit);
     b.terminate(KirTerminator::Return);
@@ -273,7 +273,7 @@ fn finish(mut b: KirBuilder, exit: crate::kernel_ir::BlockId) -> KernelIR {
     b.finalize()
 }
 
-fn load_f32(b: &mut KirBuilder, base: VarId, i: VarId) -> VarId {
+pub(crate) fn load_f32(b: &mut KirBuilder, base: VarId, i: VarId) -> VarId {
     let addr = b.new_typed_var(f32_ptr());
     b.emit(KirOp::PtrOffset(addr, base, i));
     let v = b.new_typed_var(KirType::F32);
@@ -281,13 +281,13 @@ fn load_f32(b: &mut KirBuilder, base: VarId, i: VarId) -> VarId {
     v
 }
 
-fn store_f32(b: &mut KirBuilder, base: VarId, i: VarId, v: VarId) {
+pub(crate) fn store_f32(b: &mut KirBuilder, base: VarId, i: VarId, v: VarId) {
     let addr = b.new_typed_var(f32_ptr());
     b.emit(KirOp::PtrOffset(addr, base, i));
     b.emit(KirOp::Store(addr, v, AddressSpace::Global));
 }
 
-fn verified_ptx(ir: KernelIR) -> Vec<u8> {
+pub(crate) fn verified_ptx(ir: KernelIR) -> Vec<u8> {
     if let Err(errors) = crate::kir_verify::verify(&ir) {
         panic!("elementwise kernel `{}` failed KIR verification: {errors:?}", ir.name);
     }
@@ -428,13 +428,13 @@ fn f32_const(b: &mut KirBuilder, bits: u32) -> VarId {
     dst
 }
 
-fn f32_op1(b: &mut KirBuilder, op: fn(VarId, VarId) -> KirOp, x: VarId) -> VarId {
+pub(crate) fn f32_op1(b: &mut KirBuilder, op: fn(VarId, VarId) -> KirOp, x: VarId) -> VarId {
     let dst = b.new_typed_var(KirType::F32);
     b.emit(op(dst, x));
     dst
 }
 
-fn f32_op2(b: &mut KirBuilder, op: fn(VarId, VarId, VarId) -> KirOp, x: VarId, y: VarId) -> VarId {
+pub(crate) fn f32_op2(b: &mut KirBuilder, op: fn(VarId, VarId, VarId) -> KirOp, x: VarId, y: VarId) -> VarId {
     let dst = b.new_typed_var(KirType::F32);
     b.emit(op(dst, x, y));
     dst

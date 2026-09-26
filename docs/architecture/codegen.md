@@ -1148,7 +1148,9 @@ review. See `docs/wiki/GPU-Test-Harness.md` and `docs/wiki/Testing-Strategy.md`.
    a decomposed, multi-kernel computation bit for bit) uses
    `KirOp::{AddRn, SubRn, MulRn}`. These print `.rn`, which ptxas never
    contracts into an `fma`; the bare `Add`/`Sub`/`Mul` leave ptxas free to
-   fuse.
+   fuse. `KirOp::DivApprox` is `div.approx.f32` (f32 only), for a kernel
+   that must reproduce an existing `div.approx` quotient; `Div` is the IEEE
+   `div.rn`.
 2. Lower with `backend_ptx::lower_kir_to_ptx` at the launch site and embed
    the bytes the way `Compiler::compile_kernels` does (`declare_data` /
    `define_data`, `src/compiler/kernel.rs`); launch through the existing

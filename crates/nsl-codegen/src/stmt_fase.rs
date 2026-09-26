@@ -265,7 +265,7 @@ impl Compiler<'_> {
         // structural match below — anything else falls through to the
         // interpreter), replace the ~15-launch interpreted execution with ONE
         // fused kernel launch, BIT-EXACT with it (the kernel mirrors every
-        // op's rounding; see FASE_FUSED_ADAMW_STEP_F32_PTX and the CPU twin in
+        // op's rounding; see nsl_kir::kernels::optim::build_fase_adamw_step and the CPU twin in
         // nsl-runtime/src/fase_step.rs). It runs on the envelope-resolved
         // working pointers, so the CPDT precision and offload envelopes above/
         // below compose unchanged, and the shared tail (zero m_partial,

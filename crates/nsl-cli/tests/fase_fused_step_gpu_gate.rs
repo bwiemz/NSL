@@ -3,7 +3,7 @@
 //! `fase_emit_final_step` interprets the AdamW `UpdateProgram` as ~15 kernel
 //! launches + 3 DtoD copies + ~10 transient alloc/frees per parameter per
 //! optimizer step. p9 replaces that with ONE fused kernel launch per parameter
-//! (`nsl_fase_fused_adamw_step` / `FASE_FUSED_ADAMW_STEP_F32_PTX`), which
+//! (`nsl_fase_fused_adamw_step` / `nsl_kir::kernels::optim::build_fase_adamw_step`), which
 //! mirrors every interpreted op's rounding (`.rn`, `sqrt.rn`, `div.approx`)
 //! and so must be **bit-identical**.
 //!
@@ -179,7 +179,7 @@ fn fused_step_matches_interpreted_bit_exact() {
         "fused optimizer step diverged from the interpreted per-op program — \
          the kernel does not mirror the program's rounding. Re-run with \
          NSL_FASE_FUSED_STEP=0 to confirm, then audit \
-         FASE_FUSED_ADAMW_STEP_F32_PTX against fase_emit_final_step's op order."
+         nsl_kir::kernels::optim::build_fase_adamw_step against fase_emit_final_step's op order."
     );
 
     eprintln!(

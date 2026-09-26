@@ -4195,7 +4195,7 @@ pub(crate) fn gpu_scalar_mul_add_inplace_f32(m_ptr: i64, g_ptr: i64, scale: f32)
 }
 
 /// p9: fused per-parameter FASE-Deferred AdamW step — one launch for the whole
-/// m/v/θ update (see `FASE_FUSED_ADAMW_STEP_F32_PTX`). All scalars are already
+/// m/v/θ update (see `kernels::fase_fused_adamw_step_f32_ptx`). All scalars are already
 /// f32 (converted by the FFI with the same `as f32` every scalar op uses).
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
@@ -4266,7 +4266,7 @@ pub(crate) fn gpu_fase_fused_adamw_step_raw(
     let block = 256i64;
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
-        kernels::FASE_FUSED_ADAMW_STEP_F32_PTX.as_ptr(),
+        kernels::fase_fused_adamw_step_f32_ptx().as_ptr(),
         b"nsl_fase_fused_adamw_step_f32\0".as_ptr(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
@@ -10408,6 +10408,7 @@ mod tests {
         for op in nsl_kir::kernels::elementwise::BackwardOp::ALL {
             all.push((op.kernel_name(), super::kernels::backward_module(op), true));
         }
+        all.push(("nsl_fase_fused_adamw_step_f32", super::kernels::fase_fused_adamw_step_f32_ptx(), true));
         all
     }
 

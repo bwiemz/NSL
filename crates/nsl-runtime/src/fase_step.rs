@@ -14,7 +14,7 @@
 //!   θ  = rn(θ + rn(rn(-lr·u) + rn(-lr·wd·θ)))  [Update; wd term skipped when wd==0,
 //!                                               exactly like the emitted program]
 //!
-//! GPU: `FASE_FUSED_ADAMW_STEP_F32_PTX` mirrors each decomposed kernel's
+//! GPU: `nsl_fase_fused_adamw_step_f32` (built by `nsl_kir::kernels::optim`) mirrors each decomposed kernel's
 //! rounding (`.rn`, `sqrt.rn`, `div.approx` — the same instructions the
 //! separate SQRT/DIV kernels use), with all scalars converted f64→f32 at this
 //! boundary exactly as every `nsl_tensor_*_scalar` op does. CPU: the same

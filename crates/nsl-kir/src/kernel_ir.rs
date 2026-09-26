@@ -390,6 +390,12 @@ pub enum KirOp {
     SubRn(VarId, VarId, VarId),
     MulRn(VarId, VarId, VarId),
     Div(VarId, VarId, VarId),
+    /// `div.approx.f32`: the fast f32 quotient, within 2 ulp of the IEEE
+    /// one, and 0 when the divisor's magnitude is in `(2^126, 2^128)`. `Div`
+    /// prints the IEEE `div.rn`; this exists so kernels that must reproduce a
+    /// hand kernel's (or a decomposed chain's) `div.approx` bit for bit can.
+    /// `f32` only: PTX has no approximate division for any other type.
+    DivApprox(VarId, VarId, VarId),
     Fma(VarId, VarId, VarId, VarId), // dst = a * b + c
     Neg(VarId, VarId),
     Abs(VarId, VarId),

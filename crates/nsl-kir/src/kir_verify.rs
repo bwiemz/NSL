@@ -161,6 +161,9 @@ pub enum KirVerifyError {
     /// Rule 3: `AddRn` / `SubRn` / `MulRn` on a type that is not `f32` or
     /// `f64`. The `.rn` modifier exists only on float arithmetic.
     RoundedArithNotFloat { block: BlockId, op_index: usize, found: KirType },
+    /// Rule 3: `DivApprox` on a type other than `f32`. PTX's approximate
+    /// division exists only as `div.approx.f32`.
+    ApproxDivNotF32 { block: BlockId, op_index: usize, found: KirType },
 }
 
 impl fmt::Display for KirVerifyError {
@@ -268,6 +271,10 @@ impl fmt::Display for KirVerifyError {
             KirVerifyError::RoundedArithNotFloat { block, op_index, found } => write!(
                 f,
                 "block {block} op {op_index}: an explicitly rounded (.rn) add/sub/mul needs f32 or f64, found {found:?}"
+            ),
+            KirVerifyError::ApproxDivNotF32 { block, op_index, found } => write!(
+                f,
+                "block {block} op {op_index}: div.approx exists only for f32, found {found:?}"
             ),
             KirVerifyError::BadVectorWidth { block, op_index, width } => write!(
                 f,
@@ -686,6 +693,7 @@ pub fn op_dst(op: &KirOp) -> Option<VarId> {
         | KirOp::SubRn(d, _, _)
         | KirOp::MulRn(d, _, _)
         | KirOp::Div(d, _, _)
+        | KirOp::DivApprox(d, _, _)
         | KirOp::Pow(d, _, _)
         | KirOp::Fma(d, _, _, _)
         | KirOp::Neg(d, _)
@@ -754,6 +762,7 @@ pub fn op_uses(op: &KirOp) -> Vec<VarId> {
         | KirOp::SubRn(_, a, b)
         | KirOp::MulRn(_, a, b)
         | KirOp::Div(_, a, b)
+        | KirOp::DivApprox(_, a, b)
         | KirOp::Pow(_, a, b)
         | KirOp::And(_, a, b)
         | KirOp::Or(_, a, b)
@@ -901,7 +910,10 @@ fn check_types(
         // no rounding to make explicit.
         // (The float requirement is checked after this match, where
         // `errors` is free of `expect`'s borrow.)
-        KirOp::AddRn(d, a, b) | KirOp::SubRn(d, a, b) | KirOp::MulRn(d, a, b) => {
+        KirOp::AddRn(d, a, b)
+        | KirOp::SubRn(d, a, b)
+        | KirOp::MulRn(d, a, b)
+        | KirOp::DivApprox(d, a, b) => {
             if let Some(dt) = ty(d) {
                 expect(*a, "a", &dt);
                 expect(*b, "b", &dt);
@@ -1236,6 +1248,12 @@ fn check_types(
         && !matches!(found, KirType::F32 | KirType::F64)
     {
         errors.push(KirVerifyError::RoundedArithNotFloat { block, op_index, found: found.clone() });
+    }
+    if let KirOp::DivApprox(d, ..) = op
+        && let Some(found) = ir.var_types.get(d)
+        && *found != KirType::F32
+    {
+        errors.push(KirVerifyError::ApproxDivNotF32 { block, op_index, found: found.clone() });
     }
 }
 
@@ -2448,6 +2466,30 @@ mod tests {
         b.terminate(KirTerminator::Return);
         let errs = verify(&b.finalize()).unwrap_err();
         assert!(matches!(errs.as_slice(), [KirVerifyError::TypeMismatch { var, role: "b", .. }] if *var == n), "{errs:?}");
+    }
+
+    /// `DivApprox` is f32-only and homogeneous: on f64 or an integer the
+    /// verifier names the op, since only `div.approx.f32` exists.
+    #[test]
+    fn approximate_division_is_f32_only() {
+        let build = |ty: KirType, value: ConstValue| {
+            let mut b = KirBuilder::new("divapprox");
+            let e = b.new_block();
+            b.set_block(e);
+            let x = b.new_typed_var(ty.clone());
+            b.emit(KirOp::Const(x, KirConst { ty: ty.clone(), value }));
+            let y = b.new_typed_var(ty);
+            b.emit(KirOp::DivApprox(y, x, x));
+            b.terminate(KirTerminator::Return);
+            b.finalize()
+        };
+        assert_eq!(verify(&build(KirType::F32, ConstValue::F32(1.5))), Ok(()));
+        for (ty, value) in [(KirType::F64, ConstValue::F64(1.5)), (KirType::U32, ConstValue::U32(3))] {
+            assert_eq!(
+                verify(&build(ty.clone(), value)),
+                Err(vec![KirVerifyError::ApproxDivNotF32 { block: 0, op_index: 1, found: ty }])
+            );
+        }
     }
 
     #[test]

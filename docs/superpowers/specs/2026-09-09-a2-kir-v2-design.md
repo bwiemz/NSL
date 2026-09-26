@@ -879,6 +879,31 @@ frozen throughout, so nothing here blocks a kernel fix.
     - **Still hand-written:** `nsl_gelu_backward_f32` (tanh approximation,
       `div.approx`). `nsl_clamp_backward_f32` waits for `and.pred` in the
       interpreter.
+
+    **`div.approx`, and the fused FASE AdamW step** (new-roadmap item 5).
+    - **The op:** `KirOp::DivApprox` prints `div.approx.f32`. It is f32
+      only; the verifier's `ApproxDivNotF32` rejects any other type. `Div`
+      stays the IEEE `div.rn`. The metal/wgsl/amdgpu backends lower it as
+      `Div`. This unblocks the kernels the earlier slices left hand-written
+      for their `div.approx`: `nsl_div_f32`, `nsl_div_scalar_f32`,
+      `nsl_tanh_f32`, `nsl_gelu_backward_f32`, and the three other FASE
+      AdamW variants.
+    - **The kernel:** `nsl_fase_fused_adamw_step_f32` moves to
+      `nsl_kir::kernels::optim`. It keeps the hand kernel's rounding (every
+      arithmetic op `.rn`, then `sqrt.rn` and `div.approx`) and its
+      instruction order. Decoupled weight decay is a branch that joins
+      through a block parameter.
+    - **The gate:** `fase_adamw_step_kir_equivalence` requires the frozen
+      hand kernel's bytes across five hyperparameter sets with and without
+      decay, and the AdamW formula rounded per operation. It pins every
+      mnemonic count. The interpreter computes `div.approx` as the IEEE
+      quotient, so `div.approx` → `div.rn` is a named equivalent mutant.
+      The gate catches the bound, the block index, all seven element
+      sizes, each hyperparameter's slot, the decay branch inverted, each
+      add and multiply, the square root and the division.
+    - **SASS:** the floating-point multiset is identical on sm_80/90/120,
+      and the sequence is identical on sm_80. On sm_90/120 two independent
+      `FMUL`s trade places. Registers are 16/16/18 against 18/18/18.
 12. **FA v2**, by phase directory, tier B.1 and B.2 last; the SASS
     baselines and the two no-spill gates already exist here and are the
     proof. `matmul_mma.rs` and `kernel_skeleton/` are deleted with their
