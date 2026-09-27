@@ -997,6 +997,20 @@ frozen throughout, so nothing here blocks a kernel fix.
       - **SASS:** the same floating-point and memory instructions as the
         hand kernel, in 20/20/22 registers against 22/22/24.
       - Every FASE AdamW kernel is now KIR.
+    - **`fused_kernels.rs`, data movement** (the first slice there).
+      `nsl_bias_add_f32`, `nsl_gather_dim_f32`, `nsl_strided_copy_f32` and
+      `nsl_slice_f32` are in `nsl_kir::kernels::data_movement`. The strided
+      walk is a loop with `(dim, remaining, src_offset)` block parameters.
+      The interpreter gained `cvt.rzi.u64.f32`.
+      - **The gate,** `data_movement_kir_equivalence`, requires the hand
+        kernels' bytes and formulas. It covers gather indices that are
+        fractional, negative, NaN or out of range, and transposed,
+        broadcast, zero-stride and 0-d views, and it kills the index
+        arithmetic's mutants.
+      - **SASS:** registers are equal or fewer.
+      - **Still hand-written:** the 2-D-block kernels (embedding forward,
+        the index gathers). They wait on the interpreter modelling
+        `%tid.y`.
 12. **FA v2**, by phase directory, tier B.1 and B.2 last; the SASS
     baselines and the two no-spill gates already exist here and are the
     proof. `matmul_mma.rs` and `kernel_skeleton/` are deleted with their

@@ -6720,7 +6720,6 @@ pub(crate) fn gpu_embedding_backward(
 pub(crate) fn gpu_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
     inner::set_oom_context("bias_add");
     use crate::tensor::NslTensor;
-    use fused_kernels::BIAS_ADD_F32_PTX;
 
     let tensor = NslTensor::from_ptr_ref(tensor_ptr);
     let bias_ref = NslTensor::from_ptr_ref(bias_ptr);
@@ -6773,7 +6772,7 @@ pub(crate) fn gpu_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
     let grid = ((total as i64) + block - 1) / block;
 
     let result = inner::kernel_launch(
-        BIAS_ADD_F32_PTX.as_ptr(), b"nsl_bias_add_f32\0".as_ptr(),
+        fused_kernels::bias_add_f32_ptx().as_ptr(), b"nsl_bias_add_f32\0".as_ptr(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU bias_add kernel failed: {:?}", result);
@@ -8624,7 +8623,7 @@ pub(crate) fn gpu_gather_dim_f32(
     let block = 256i64;
     let grid = (out_elems as i64 + block - 1) / block;
     let rc = inner::kernel_launch(
-        fused_kernels::GATHER_DIM_F32_PTX.as_ptr(),
+        fused_kernels::gather_dim_f32_ptx().as_ptr(),
         b"nsl_gather_dim_f32\0".as_ptr(),
         [grid, 1, 1],
         [block, 1, 1],
@@ -9043,7 +9042,6 @@ pub(crate) fn gpu_dropout_f32(input_ptr: i64, p: f64) -> (i64, i64) {
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_slice_f32(tensor_ptr: i64, dim: usize, start: usize) -> i64 {
     use crate::tensor::NslTensor;
-    use fused_kernels::GPU_SLICE_F32_PTX;
 
     let t = NslTensor::from_ptr_ref(tensor_ptr);
     let ndim = t.ndim as usize;
@@ -9078,7 +9076,6 @@ pub(crate) fn gpu_slice_f32_with_shape(
     slice_len: usize,
 ) -> i64 {
     use crate::tensor::NslTensor;
-    use fused_kernels::GPU_SLICE_F32_PTX;
 
     let t = NslTensor::from_ptr_ref(tensor_ptr);
     assert_gpu_f32(t, "slice_f32_with_shape", "input");
@@ -9131,7 +9128,7 @@ pub(crate) fn gpu_slice_f32_with_shape(
     let grid = ((total as i64) + block - 1) / block;
 
     let result = inner::kernel_launch(
-        GPU_SLICE_F32_PTX.as_ptr(), b"nsl_slice_f32\0".as_ptr(),
+        fused_kernels::slice_f32_ptx().as_ptr(), b"nsl_slice_f32\0".as_ptr(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU slice kernel failed: {:?}", result);
@@ -9652,7 +9649,6 @@ pub(crate) fn gpu_sparse_matmul_csr_f32(
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_strided_copy_f32(tensor_ptr: i64) -> i64 {
     use crate::tensor::NslTensor;
-    use fused_kernels::STRIDED_COPY_F32_PTX;
 
     let t = NslTensor::from_ptr_ref(tensor_ptr);
     assert_gpu_f32(t, "strided_copy_f32", "input");
@@ -9746,7 +9742,7 @@ pub(crate) fn gpu_strided_copy_f32(tensor_ptr: i64) -> i64 {
     let grid = ((total as i64) + block - 1) / block;
 
     let result = inner::kernel_launch(
-        STRIDED_COPY_F32_PTX.as_ptr(), b"nsl_strided_copy_f32\0".as_ptr(),
+        fused_kernels::strided_copy_f32_ptx().as_ptr(), b"nsl_strided_copy_f32\0".as_ptr(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU strided copy kernel failed: {:?}", result);
@@ -10421,6 +10417,10 @@ mod tests {
         all.push(("nsl_fase_fused_adamw_multi_bf16sr", super::kernels::fase_fused_adamw_multi_bf16sr_ptx(), true));
         all.push((nsl_kir::kernels::optim::FASE_ADAMW_STEP_BF16SR_NAME, super::kernels::fase_fused_adamw_step_bf16sr_ptx(), true));
         all.push((nsl_kir::kernels::optim::SR_BF16_ROUND_PROBE_NAME, super::kernels::sr_bf16_round_probe_ptx(), true));
+        all.push((nsl_kir::kernels::data_movement::BIAS_ADD_NAME, super::fused_kernels::bias_add_f32_ptx(), true));
+        all.push((nsl_kir::kernels::data_movement::GATHER_DIM_NAME, super::fused_kernels::gather_dim_f32_ptx(), true));
+        all.push(("nsl_strided_copy_f32", super::fused_kernels::strided_copy_f32_ptx(), true));
+        all.push(("nsl_slice_f32", super::fused_kernels::slice_f32_ptx(), true));
         all
     }
 
