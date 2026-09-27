@@ -52,6 +52,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
       the product.
   - **SASS** on sm_80/90/120: the same instruction mix. Registers are
     12/16/14 against 12/13/12, with no occupancy effect at 256 threads.
+- **The 2-D-block row lookups are built by `nsl_kir::kernels::lookup`** in
+  place of their hand-written constants (new-roadmap item 5):
+  `nsl_embedding_f32`, `nsl_embedding_i32idx`, `nsl_gather_f32` and
+  `nsl_gather_i32idx`.
+  - **The kernels** are the hand kernels' sequence:
+    - the row from `x` and the column from `y` of a 16 × 16 block;
+    - the row bound, then the column bound;
+    - the index, truncated from f32 (`cvt.rzi.u64.f32`) or sign-extended
+      from i32 (`cvt.u64.s32`);
+    - for the gather, the unsigned index bound, which also skips a
+      negative i32 index;
+    - one load and one store.
+  - **The CTA interpreter models two-dimensional blocks.**
+    - `run_cta_2d` runs a `launch.ntid` × `ntid_y` block with `%tid.y` and
+      `%ntid.y`, numbering threads `x + y · ntid.x` for the warps and the
+      schedule.
+    - `run_cta` is the one-row case, so no existing gate changes.
+    - It also gained `ld.s32`, `cvt.s64.s32`, `cvt.u64.s32` and
+      `cvt.rzi.s64.f32`.
+  - **The gate.** `tests/lookup_kir_equivalence.rs` (8 tests) runs the
+    frozen hand kernels and the KIR ones under two schedules, on the
+    runtime's 16 × 16 block and on an 8 × 4 one, where `%ntid.x` and
+    `%ntid.y` differ.
+    - It requires identical global memory and the lookup's formula.
+    - The f32 indices are fractional, negative, NaN, at the bound, past it
+      and infinite. The i32 ones are negative, past the bound, `i32::MIN`
+      and `i32::MAX`.
+    - It kills mutants of each bound, both block indices, `%tid.y`,
+      `%ntid.y`, each element size, every 64-bit add and row stride, and
+      the f32 truncation.
+    - The i32 index read zero-extended is named as an equivalent mutant: a
+      negative index is past every table either way.
+  - **SASS** on sm_80/90/120: the same loads, stores and compares.
+    - Registers are 16 against 14 for the embedding (14 for the i32 one on
+      sm_120) and 14 against 12 for the gather.
+    - The KIR address arithmetic (`mul.lo.u64 ·, 4`) becomes `IMAD.WIDE`
+      where the hand kernels' `shl` became `LEA`.
+    - There is no occupancy effect at 256 threads.
 - **The int8 and int4 KV dequantization kernels are built by
   `nsl_kir::kernels::dequant`** in place of their hand-written constants
   (new-roadmap item 5): `nsl_dequant_int8_per_head_f32`,
