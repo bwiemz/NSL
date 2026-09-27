@@ -1,5 +1,5 @@
 // crates/nsl-kir/src/kernels/dequant.rs
-//! The runtime's integer dequantization kernels from
+//! The runtime's KV dequantization kernels from
 //! `cuda/fused_kernels.rs`, as KIR (new-roadmap item 5).
 //!
 //! - `nsl_dequant_int8_per_head_f32(inp, out, scales, n, head_stride)`:
@@ -12,6 +12,9 @@
 //!   group_size)`: two unsigned nibbles per byte, low nibble first.
 //!   `out[i] = fma(nibble(i), scales[g], zero_points[g])` with
 //!   `g = i / group_size`: one rounding, as the hand kernel's `fma.rn`.
+//! - `nsl_dequant_fp8_e4m3_f32(inp, out, n)`: one OCP E4M3 byte to f32,
+//!   by bit assembly (normals), `m · 2^-9` (zero and subnormals, the sign
+//!   OR-ed back in) or the quiet NaN (`S.1111.111`).
 //!
 //! `inp` is `s8` for the int8 pair (a `.s8` load, sign-extended, then
 //! `cvt.rn.f32.s8`, exact) and packed `u8` for int4 (a `.u8` load and
@@ -199,6 +202,127 @@ pub fn int4_per_group_ptx() -> Vec<u8> {
     verified_ptx(build_int4_per_group())
 }
 
+/// `nsl_dequant_fp8_e4m3_f32`.
+pub const FP8_E4M3_NAME: &str = "nsl_dequant_fp8_e4m3_f32";
+
+/// Build `nsl_dequant_fp8_e4m3_f32(inp, out, n)`: one OCP E4M3 byte to f32
+/// per thread (bias 7, no infinities, `S.1111.111` the only NaN, exponent
+/// field 0 the subnormals `m · 2^-9`).
+///
+/// ```text
+/// entry:  i (u32, widened); if i >= n { exit }
+/// body:   w = u32(inp[i]); sign = ((w >> 7) & 1) << 31
+///         e = (w >> 3) & 15; m = w & 7
+///         if w & 127 == 127 { br store(NaN) }
+/// sub?:   if e == 0 { br sub } else { br normal }
+/// normal: br store(bits(sign | (e + 120) << 23 | m << 20))
+/// sub:    br store(bits(bits(f32(m) · 2^-9) | sign))   exact; keeps -0
+/// store(f): out[i] = f
+/// ```
+pub fn build_fp8_e4m3() -> KernelIR {
+    use AddressSpace::Global;
+    let mut b = KirBuilder::new(FP8_E4M3_NAME);
+    let inp = b.add_param("inp", KirType::Ptr(Box::new(KirType::U8), Global), Global);
+    let out = b.add_param("out", f32_ptr(), Global);
+    let n = b.add_param("n", KirType::U64, Global);
+
+    let u32c = |b: &mut KirBuilder, v: u32| int_const(b, KirType::U32, ConstValue::U32(v));
+    let op = |b: &mut KirBuilder, f: fn(VarId, VarId, VarId) -> KirOp, x: VarId, y: VarId| {
+        let dst = b.new_typed_var(KirType::U32);
+        b.emit(f(dst, x, y));
+        dst
+    };
+    let bits_to_f32 = |b: &mut KirBuilder, bits: VarId| {
+        let f = b.new_typed_var(KirType::F32);
+        b.emit(KirOp::Bitcast(f, bits));
+        f
+    };
+
+    let (i, _, exit) = index_and_bound(&mut b, n);
+    let byte = load_byte(&mut b, inp, i, KirType::U8);
+    let w = b.new_typed_var(KirType::U32);
+    b.emit(KirOp::Cast(w, byte, KirType::U32));
+    // sign << 31
+    let c7 = u32c(&mut b, 7);
+    let sign = op(&mut b, KirOp::Shr, w, c7);
+    let c1 = u32c(&mut b, 1);
+    let sign = op(&mut b, KirOp::And, sign, c1);
+    let c31 = u32c(&mut b, 31);
+    let sign = op(&mut b, KirOp::Shl, sign, c31);
+    // exponent and mantissa fields
+    let c3 = u32c(&mut b, 3);
+    let e = op(&mut b, KirOp::Shr, w, c3);
+    let c15 = u32c(&mut b, 15);
+    let e = op(&mut b, KirOp::And, e, c15);
+    let c7m = u32c(&mut b, 7);
+    let m = op(&mut b, KirOp::And, w, c7m);
+    // NaN: S.1111.111
+    let c127 = u32c(&mut b, 127);
+    let low7 = op(&mut b, KirOp::And, w, c127);
+    let c127b = u32c(&mut b, 127);
+    let is_nan = b.new_typed_var(KirType::Bool);
+    b.emit(KirOp::Cmp(is_nan, low7, c127b, CmpOp::Eq));
+
+    let not_nan = b.new_block();
+    let nan = b.new_block();
+    let sub = b.new_block();
+    let normal = b.new_block();
+    let store = b.new_block();
+    let value = b.add_block_param(store, KirType::F32);
+    b.terminate(KirTerminator::CondBranch(is_nan, KirEdge::to(nan), KirEdge::to(not_nan)));
+
+    b.set_block(not_nan);
+    let zero = u32c(&mut b, 0);
+    let is_sub = b.new_typed_var(KirType::Bool);
+    b.emit(KirOp::Cmp(is_sub, e, zero, CmpOp::Eq));
+    b.terminate(KirTerminator::CondBranch(is_sub, KirEdge::to(sub), KirEdge::to(normal)));
+
+    // Normal: sign | (e - 7 + 127) << 23 | m << 20.
+    b.set_block(normal);
+    let c120 = u32c(&mut b, 120);
+    let eb = op(&mut b, KirOp::Add, e, c120);
+    let c23 = u32c(&mut b, 23);
+    let eb = op(&mut b, KirOp::Shl, eb, c23);
+    let c20 = u32c(&mut b, 20);
+    let mb = op(&mut b, KirOp::Shl, m, c20);
+    let bits = op(&mut b, KirOp::Or, sign, eb);
+    let bits = op(&mut b, KirOp::Or, bits, mb);
+    let f = bits_to_f32(&mut b, bits);
+    b.terminate(KirTerminator::Branch(KirEdge::with(store, vec![f])));
+
+    // Zero and subnormals: m · 2^-9 is exact; OR in the sign so zero keeps it.
+    b.set_block(sub);
+    let mf = b.new_typed_var(KirType::F32);
+    b.emit(KirOp::Cast(mf, m, KirType::F32));
+    let scale = b.new_typed_var(KirType::F32);
+    b.emit(KirOp::Const(scale, KirConst { ty: KirType::F32, value: ConstValue::F32(f32::from_bits(0x3B00_0000)) }));
+    let v = b.new_typed_var(KirType::F32);
+    b.emit(KirOp::Mul(v, mf, scale));
+    let vb = b.new_typed_var(KirType::U32);
+    b.emit(KirOp::Bitcast(vb, v));
+    let vb = op(&mut b, KirOp::Or, vb, sign);
+    let f = bits_to_f32(&mut b, vb);
+    b.terminate(KirTerminator::Branch(KirEdge::with(store, vec![f])));
+
+    b.set_block(nan);
+    let q = u32c(&mut b, 0x7FC0_0000);
+    let f = bits_to_f32(&mut b, q);
+    b.terminate(KirTerminator::Branch(KirEdge::with(store, vec![f])));
+
+    b.set_block(store);
+    store_f32(&mut b, out, i, value);
+    finish(b, exit)
+}
+
+/// [`build_fp8_e4m3`] lowered to a NUL-terminated PTX module.
+///
+/// # Panics
+///
+/// If the built kernel fails verification: a bug in this module.
+pub fn fp8_e4m3_ptx() -> Vec<u8> {
+    verified_ptx(build_fp8_e4m3())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,5 +344,10 @@ mod tests {
             assert_eq!(ptx.matches(form).count(), count, "{form}\n{ptx}");
         }
         assert!(!ptx.contains("mul.f32") && !ptx.contains("add.f32"), "one rounding: {ptx}");
+        let ptx = String::from_utf8(fp8_e4m3_ptx()).unwrap();
+        assert!(ptx.contains(".visible .entry nsl_dequant_fp8_e4m3_f32("), "{ptx}");
+        for (form, count) in [("ld.global.u8 ", 1), ("cvt.u32.u8 ", 1), ("cvt.rn.f32.u32 ", 1), ("mul.f32 ", 1), ("mov.b32 ", 4)] {
+            assert_eq!(ptx.matches(form).count(), count, "{form}\n{ptx}");
+        }
     }
 }

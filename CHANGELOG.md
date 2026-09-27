@@ -8,6 +8,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **The fp8 E4M3 KV dequantization kernel, `nsl_dequant_fp8_e4m3_f32`, is
+  built by `nsl_kir::kernels::dequant::build_fp8_e4m3`** in place of its
+  hand-written constant (new-roadmap item 5). With it, every KV
+  dequantization kernel is KIR.
+  - **The kernel** is the hand kernel's decode:
+    - normals by bit assembly, `sign | (e + 120) << 23 | m << 20`;
+    - zero and subnormals as `m · 2^-9`, exact, with the sign OR-ed back
+      in so `-0` stays `-0`;
+    - the quiet NaN for `S.1111.111`.
+  - **The gates.**
+    - `tests/fp8_e4m3_kir_equivalence.rs` (9 tests) requires identical
+      global memory with the frozen hand kernel over all 256 codes, and the
+      restated OCP value for each. It kills the mutants of every field
+      constant, both branches, each OR and the subnormal scale. Widening
+      the sign mask from 1 to 3 is named as an equivalent mutant.
+    - `nsl-runtime`'s `tests/fp8_e4m3_dequant_interp.rs` now runs the KIR
+      module the runtime launches (`dequant_fp8_e4m3_f32_ptx()`), against
+      the OCP reference and the CPU decoder.
+  - **SASS** on sm_80/90/120: registers 10/10/10 against the hand kernel's
+    10/9/12.
+
 - **The int8 and int4 KV dequantization kernels are built by
   `nsl_kir::kernels::dequant`** in place of their hand-written constants
   (new-roadmap item 5): `nsl_dequant_int8_per_head_f32`,

@@ -19,7 +19,7 @@ mod interp;
 use interp::*;
 
 use nsl_runtime::kv_compress::quantize::{dequantize_fp8, quantize_fp8};
-use nsl_runtime::DEQUANT_FP8_E4M3_F32_PTX;
+use nsl_runtime::dequant_fp8_e4m3_f32_ptx;
 use std::collections::HashMap;
 
 const INP: u64 = 0x10_0000;
@@ -32,7 +32,7 @@ const TAIL: usize = 5;
 /// `ceil(n / 256)` blocks of 256, plus one spare block that must write
 /// nothing) and returns the output words, including a poisoned tail.
 fn run(codes: &[u8], order: Order) -> Vec<u32> {
-    let ptx = DEQUANT_FP8_E4M3_F32_PTX.trim_end_matches('\0');
+    let ptx = dequant_fp8_e4m3_f32_ptx().trim_end_matches('\0');
     let prog = parse(ptx);
     let n = codes.len();
     let mut global = vec![
