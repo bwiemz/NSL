@@ -7561,8 +7561,6 @@ pub(crate) fn gpu_dequant_int8_per_head_f32(
     n: u64,
     head_stride: u64,
 ) {
-    use fused_kernels::DEQUANT_INT8_PER_HEAD_F32_PTX;
-
     let mut inp = data_ptr as u64;
     let mut out = out_ptr as u64;
     let mut sc = scales_ptr as u64;
@@ -7581,7 +7579,7 @@ pub(crate) fn gpu_dequant_int8_per_head_f32(
     let grid = ((n + 255) / 256) as i64;
 
     let result = inner::kernel_launch(
-        DEQUANT_INT8_PER_HEAD_F32_PTX.as_ptr(), b"nsl_dequant_int8_per_head_f32\0".as_ptr(),
+        fused_kernels::dequant_int8_per_head_f32_ptx().as_ptr(), b"nsl_dequant_int8_per_head_f32\0".as_ptr(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU dequant_int8_per_head kernel failed: {:?}", result);
@@ -7600,8 +7598,6 @@ pub(crate) fn gpu_dequant_int8_per_token_f32(
     head_stride: u64,
     head_dim: u64,
 ) {
-    use fused_kernels::DEQUANT_INT8_PER_TOKEN_F32_PTX;
-
     let mut inp = data_ptr as u64;
     let mut out = out_ptr as u64;
     let mut sc = scales_ptr as u64;
@@ -7622,7 +7618,7 @@ pub(crate) fn gpu_dequant_int8_per_token_f32(
     let grid = ((n + 255) / 256) as i64;
 
     let result = inner::kernel_launch(
-        DEQUANT_INT8_PER_TOKEN_F32_PTX.as_ptr(), b"nsl_dequant_int8_per_token_f32\0".as_ptr(),
+        fused_kernels::dequant_int8_per_token_f32_ptx().as_ptr(), b"nsl_dequant_int8_per_token_f32\0".as_ptr(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU dequant_int8_per_token kernel failed: {:?}", result);
@@ -7641,8 +7637,6 @@ pub(crate) fn gpu_dequant_int4_per_group_f32(
     n: u64,
     group_size: u64,
 ) {
-    use fused_kernels::DEQUANT_INT4_PER_GROUP_F32_PTX;
-
     let mut inp = data_ptr as u64;
     let mut out = out_ptr as u64;
     let mut sc = scales_ptr as u64;
@@ -7663,7 +7657,7 @@ pub(crate) fn gpu_dequant_int4_per_group_f32(
     let grid = ((n + 255) / 256) as i64;
 
     let result = inner::kernel_launch(
-        DEQUANT_INT4_PER_GROUP_F32_PTX.as_ptr(), b"nsl_dequant_int4_per_group_f32\0".as_ptr(),
+        fused_kernels::dequant_int4_per_group_f32_ptx().as_ptr(), b"nsl_dequant_int4_per_group_f32\0".as_ptr(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU dequant_int4_per_group kernel failed: {:?}", result);
@@ -10418,6 +10412,21 @@ mod tests {
         all.push((nsl_kir::kernels::optim::FASE_ADAMW_STEP_BF16SR_NAME, super::kernels::fase_fused_adamw_step_bf16sr_ptx(), true));
         all.push((nsl_kir::kernels::optim::SR_BF16_ROUND_PROBE_NAME, super::kernels::sr_bf16_round_probe_ptx(), true));
         all.push((nsl_kir::kernels::data_movement::BIAS_ADD_NAME, super::fused_kernels::bias_add_f32_ptx(), true));
+        all.push((
+            nsl_kir::kernels::dequant::Int8Scale::PerHead.kernel_name(),
+            super::fused_kernels::dequant_int8_per_head_f32_ptx(),
+            true,
+        ));
+        all.push((
+            nsl_kir::kernels::dequant::Int8Scale::PerToken.kernel_name(),
+            super::fused_kernels::dequant_int8_per_token_f32_ptx(),
+            true,
+        ));
+        all.push((
+            nsl_kir::kernels::dequant::INT4_PER_GROUP_NAME,
+            super::fused_kernels::dequant_int4_per_group_f32_ptx(),
+            true,
+        ));
         all.push((nsl_kir::kernels::data_movement::GATHER_DIM_NAME, super::fused_kernels::gather_dim_f32_ptx(), true));
         all.push(("nsl_strided_copy_f32", super::fused_kernels::strided_copy_f32_ptx(), true));
         all.push(("nsl_slice_f32", super::fused_kernels::slice_f32_ptx(), true));
