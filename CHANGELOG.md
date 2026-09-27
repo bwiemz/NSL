@@ -1358,6 +1358,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- **The train-block driver's planning order is a value: `PASS_ORDER`**
+  (roadmap A1, `TrainPlan` step 4a).
+  - **The table.** `stmt_train/pass_order.rs` lists the 17 planning steps
+    `compile_train_block` runs, in order. It runs from the CPDT pre-plan
+    offer and the FASE contract, through the admissions, extraction, CPKD,
+    WGGO, CSHA and the prune, WRGA and CPDT, the CCR plan and adjoint
+    generation, to the adjoint passes, the arena projection and the CSLA
+    precompute. Each step names its stage, the registry passes it
+    schedules, its file and the call the driver makes.
+  - **The gate.** `tests/train_pass_order.rs` (8 tests) holds the table to
+    the tree:
+    - The driver makes the calls in table order, and each call is defined
+      where the table says.
+    - The `schedule` sites in the driver's files are exactly the table's
+      `(file, pass)` pairs, and every `TrainBlock`-phase registry pass has
+      a step.
+    - The table inverts none of the pass bus's `InvocationOrdered` edges.
+      Reversed, it is refused.
+    - Stages never go backwards, and no tape-touching pass precedes
+      extraction.
+  - **No behaviour change.** The driver still makes the calls itself; the
+    CLIF snapshots are untouched. Wrapping the rows whose inputs are
+    already plan facts in a `TrainPass` trait is step 4b.
+
 - **The train block's late emitters take their setup handles as one
   `EmitState`** (roadmap A1, `TrainPlan` step 3).
   - **The change.** `stmt_train/emit_state.rs` holds the Cranelift handles
