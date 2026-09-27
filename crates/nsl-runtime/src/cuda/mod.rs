@@ -6013,7 +6013,7 @@ pub(crate) fn gpu_tanh_backward(grad: i64, saved_out: i64) -> i64 {
 pub(crate) fn gpu_gelu_backward(grad: i64, input: i64) -> i64 {
     gpu_backward_binary(
         grad, input,
-        kernels::GELU_BACKWARD_F32_PTX,
+        kernels::gelu_backward_f32_ptx(),
         "nsl_gelu_backward_f32\0",
     )
 }
@@ -10393,6 +10393,7 @@ mod tests {
         all.push(("nsl_add_f32", super::kernels::add_f32_ptx(), true));
         all.push(("nsl_sub_f32", super::kernels::sub_f32_ptx(), true));
         all.push(("nsl_mul_f32", super::kernels::mul_f32_ptx(), true));
+        all.push(("nsl_div_f32", super::kernels::div_f32_ptx(), true));
         for op in nsl_kir::kernels::elementwise::UnaryOp::ALL {
             all.push((op.kernel_name(), super::kernels::unary_module(op), true));
         }
@@ -10405,6 +10406,8 @@ mod tests {
             all.push((op.kernel_name(), super::kernels::backward_module(op), true));
         }
         all.push((nsl_kir::kernels::elementwise::CLAMP_BACKWARD_NAME, super::kernels::clamp_backward_f32_ptx(), true));
+        all.push((nsl_kir::kernels::elementwise::TANH_NAME, super::kernels::tanh_f32_ptx(), true));
+        all.push((nsl_kir::kernels::elementwise::GELU_BACKWARD_NAME, super::kernels::gelu_backward_f32_ptx(), true));
         for op in nsl_kir::kernels::elementwise::RotateHalfOp::ALL {
             all.push((op.kernel_name(), super::kernels::rotate_half_module(op), true));
         }

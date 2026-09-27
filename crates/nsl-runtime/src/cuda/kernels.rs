@@ -6,7 +6,7 @@
 
 // --- Binary ops ---
 
-// `nsl_add_f32`, `nsl_sub_f32` and `nsl_mul_f32` are built from KIR by
+// `nsl_add_f32`, `nsl_sub_f32`, `nsl_mul_f32` and `nsl_div_f32` are built from KIR by
 // `nsl_kir::kernels::elementwise` (roadmap A2 step 11); `nsl-codegen`'s
 // `elementwise_binary_kir_equivalence` gate holds them to the hand-written
 // modules they replace. Each module is built once, on first use, and kept:
@@ -15,7 +15,7 @@
 use nsl_kir::kernels::elementwise::BinaryOp;
 
 fn binary_module(op: BinaryOp) -> &'static str {
-    static MODULES: std::sync::OnceLock<[String; 3]> = std::sync::OnceLock::new();
+    static MODULES: std::sync::OnceLock<[String; 4]> = std::sync::OnceLock::new();
     let modules = MODULES.get_or_init(|| {
         // The printer emits ASCII only, so this cannot fail for a kernel
         // `nsl-kir` builds.
@@ -42,14 +42,22 @@ pub(crate) fn mul_f32_ptx() -> &'static str {
     binary_module(BinaryOp::Mul)
 }
 
+/// `nsl_div_f32`: `c[i] = a[i] / b[i]` with `div.approx.f32`, NUL-terminated.
+/// The approximate division is load-bearing: the fused kernels that are held
+/// bit-exact to a decomposed chain (the FASE AdamW steps among them) divide
+/// the way this kernel does.
+pub(crate) fn div_f32_ptx() -> &'static str {
+    binary_module(BinaryOp::Div)
+}
+
 // The scalar-operand family, `c[i] = a[i] op s`, likewise built by
 // `nsl_kir::kernels::elementwise` (its `elementwise_scalar_kir_equivalence`
-// gate). `nsl_div_scalar_f32` (`div.approx.f32`) stays hand-written below.
+// gate), `nsl_div_scalar_f32` included (`div.approx.f32`, like `nsl_div_f32`).
 
 use nsl_kir::kernels::elementwise::ScalarOp;
 
 pub(crate) fn scalar_module(op: ScalarOp) -> &'static str {
-    static MODULES: std::sync::OnceLock<[String; 3]> = std::sync::OnceLock::new();
+    static MODULES: std::sync::OnceLock<[String; 4]> = std::sync::OnceLock::new();
     let modules = MODULES.get_or_init(|| {
         ScalarOp::ALL.map(|op| {
             String::from_utf8(nsl_kir::kernels::elementwise::scalar_ptx(op)).expect("PTX must be ASCII")
@@ -72,6 +80,13 @@ pub(crate) fn add_scalar_f32_ptx() -> &'static str {
 /// `nsl_sub_scalar_f32`: `c[i] = a[i] - s`, NUL-terminated.
 pub(crate) fn sub_scalar_f32_ptx() -> &'static str {
     scalar_module(ScalarOp::Sub)
+}
+
+/// `nsl_div_scalar_f32`: `c[i] = a[i] / s` with `div.approx.f32`, the
+/// division `nsl_div_f32` performs, so the scalar sweep's `Div(x, Constant)`
+/// fold stays bit-exact with the broadcast divide it replaces. NUL-terminated.
+pub(crate) fn div_scalar_f32_ptx() -> &'static str {
+    scalar_module(ScalarOp::Div)
 }
 
 // Two kernels that must match a decomposed computation bit for bit, built by
@@ -102,7 +117,8 @@ pub(crate) fn muon_scale_inv_frob_f32_ptx() -> &'static str {
 
 // The unary family, `c[i] = f(a[i])`, likewise built by
 // `nsl_kir::kernels::elementwise` (its `elementwise_unary_kir_equivalence`
-// gate). `nsl_tanh_f32` (`div.approx.f32`) stays hand-written below.
+// gate). `nsl_tanh_f32` is built there too, as its own function
+// ([`tanh_f32_ptx`]).
 
 use nsl_kir::kernels::elementwise::UnaryOp;
 
@@ -184,43 +200,7 @@ pub(crate) fn clamp_f32_ptx() -> &'static str {
     unary_module(UnaryOp::Clamp)
 }
 
-// `nsl_div_f32` stays hand-written: it divides with `div.approx.f32`, and
-// KIR's f32 division is `div.rn.f32`, so moving it would change what GPU
-// division returns (see `nsl_kir::kernels::elementwise`).
-pub(crate) const DIV_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_div_f32(\n\
-    .param .u64 a, .param .u64 b, .param .u64 c, .param .u64 n\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<8>;\n\
-    .reg .f32 %fs<4>;\n\
-    .reg .pred %p1;\n\
-    ld.param.u64 %rd1, [a];\n\
-    ld.param.u64 %rd2, [b];\n\
-    ld.param.u64 %rd3, [c];\n\
-    ld.param.u64 %rd4, [n];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd5, %r3;\n\
-    setp.ge.u64 %p1, %rd5, %rd4;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd6, %rd5, 2;\n\
-    add.u64 %rd7, %rd1, %rd6;\n\
-    ld.global.f32 %fs1, [%rd7];\n\
-    add.u64 %rd7, %rd2, %rd6;\n\
-    ld.global.f32 %fs2, [%rd7];\n\
-    div.approx.f32 %fs3, %fs1, %fs2;\n\
-    add.u64 %rd7, %rd3, %rd6;\n\
-    st.global.f32 [%rd7], %fs3;\n\
-DONE: ret;\n\
-}\0";
+
 
 /// `nsl_rotate_half_f32` / `nsl_rotate_half_neg_f32` (`a, c, n, last_dim,
 /// half`), built by `nsl_kir::kernels::elementwise::build_rotate_half` (its
@@ -250,49 +230,7 @@ pub(crate) fn rotate_half_module(op: nsl_kir::kernels::elementwise::RotateHalfOp
 // The batched f32 path (`BMM_F32_PTX`/`nsl_bmm_f32`) is out of scope per
 // spec §6 and remains unchanged.
 
-// Scalar-RHS div (mfu-fusion C3 scalar sweep): out[i] = a[i] / s, with s a
-// .f32 kernel param so ONE kernel serves every immediate value. Replaces the
-// decomposed Div(x, Constant) chain: scalar CPU tensor + synchronous HtoD +
-// full-size broadcast materialize + nsl_div_f32.
-//
-// ARITHMETIC INSTRUCTION IS LOAD-BEARING: `div.approx.f32`, copied verbatim
-// from DIV_F32_PTX's nsl_div_f32 (NOT the correctly-rounded `div.rn.f32`) —
-// bit-exactness with the decomposed baseline requires the IDENTICAL opcode,
-// and the baseline kernel this replaces divides with div.approx. A
-// single-instruction kernel has no mul+add pair, so FMA contraction (the
-// usual reason for .rn) cannot arise here.
-pub(crate) const DIV_SCALAR_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_div_scalar_f32(\n\
-    .param .u64 a, .param .u64 c, .param .f32 s, .param .u64 n\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<7>;\n\
-    .reg .f32 %fs<3>;\n\
-    .reg .pred %p1;\n\
-    ld.param.u64 %rd1, [a];\n\
-    ld.param.u64 %rd2, [c];\n\
-    ld.param.f32 %fs2, [s];\n\
-    ld.param.u64 %rd3, [n];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd4, %r3;\n\
-    setp.ge.u64 %p1, %rd4, %rd3;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd5, %rd4, 2;\n\
-    add.u64 %rd6, %rd1, %rd5;\n\
-    ld.global.f32 %fs1, [%rd6];\n\
-    div.approx.f32 %fs1, %fs1, %fs2;\n\
-    add.u64 %rd6, %rd2, %rd5;\n\
-    st.global.f32 [%rd6], %fs1;\n\
-DONE: ret;\n\
-}\0";
+
 
 
 // --- Backward kernels for activation functions ---
@@ -304,8 +242,8 @@ DONE: ret;\n\
 // gate). The source-AD kernels match a chain of separate launches bit for
 // bit, so their derivative arithmetic is explicitly rounded (`.rn`, which
 // ptxas never contracts into an `fma`). So is `nsl_clamp_backward_f32`
-// (`clamp_backward_kir_equivalence`). `nsl_gelu_backward_f32`
-// (`div.approx.f32`) stays hand-written below.
+// (`clamp_backward_kir_equivalence`). So is `nsl_gelu_backward_f32`
+// ([`gelu_backward_f32_ptx`]).
 
 use nsl_kir::kernels::elementwise::BackwardOp;
 
@@ -320,65 +258,19 @@ pub(crate) fn backward_module(op: BackwardOp) -> &'static str {
     &modules[slot]
 }
 
-/// gelu_backward using tanh approximation derivative
-/// k = 0.0356774*x^3 + 0.797885*x
-/// sech2 = 1 - tanh(k)^2
-/// out[i] = grad[i] * 0.5 * (1 + tanh(k) + x * sech2 * (0.107032*x + 0.797885))
-pub(crate) const GELU_BACKWARD_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_gelu_backward_f32(\n\
-    .param .u64 grad, .param .u64 input, .param .u64 out, .param .u64 n\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<9>;\n\
-    .reg .f32 %fs<12>;\n\
-    .reg .pred %p1;\n\
-    ld.param.u64 %rd1, [grad];\n\
-    ld.param.u64 %rd2, [input];\n\
-    ld.param.u64 %rd3, [out];\n\
-    ld.param.u64 %rd4, [n];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd5, %r3;\n\
-    setp.ge.u64 %p1, %rd5, %rd4;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd6, %rd5, 2;\n\
-    add.u64 %rd7, %rd1, %rd6;\n\
-    ld.global.f32 %fs1, [%rd7];\n\
-    add.u64 %rd7, %rd2, %rd6;\n\
-    ld.global.f32 %fs2, [%rd7];\n\
-    mul.f32 %fs3, %fs2, %fs2;\n\
-    mul.f32 %fs3, %fs3, %fs2;\n\
-    mul.f32 %fs3, %fs3, 0f3D124925;\n\
-    mul.f32 %fs4, %fs2, 0f3F4C422A;\n\
-    add.f32 %fs3, %fs3, %fs4;\n\
-    add.f32 %fs4, %fs3, %fs3;\n\
-    mul.f32 %fs4, %fs4, 0f3FB8AA3B;\n\
-    ex2.approx.f32 %fs4, %fs4;\n\
-    add.f32 %fs5, %fs4, 0f3F800000;\n\
-    sub.f32 %fs4, %fs4, 0f3F800000;\n\
-    div.approx.f32 %fs6, %fs4, %fs5;\n\
-    mul.f32 %fs7, %fs6, %fs6;\n\
-    sub.f32 %fs7, 0f3F800000, %fs7;\n\
-    mul.f32 %fs8, %fs2, %fs2;\n\
-    mul.f32 %fs8, %fs8, 0f3DD8ECA1;\n\
-    add.f32 %fs8, %fs8, 0f3F4C422A;\n\
-    mul.f32 %fs8, %fs2, %fs8;\n\
-    mul.f32 %fs8, %fs7, %fs8;\n\
-    add.f32 %fs8, %fs6, %fs8;\n\
-    add.f32 %fs8, 0f3F800000, %fs8;\n\
-    mul.f32 %fs8, 0f3F000000, %fs8;\n\
-    mul.f32 %fs8, %fs1, %fs8;\n\
-    add.u64 %rd8, %rd3, %rd6;\n\
-    st.global.f32 [%rd8], %fs8;\n\
-DONE: ret;\n\
-}\0";
+/// `nsl_gelu_backward_f32(grad, input, out, n)`: the tape-AD adjoint of the
+/// GELU tanh approximation, built by
+/// `nsl_kir::kernels::elementwise::build_gelu_backward` (its
+/// `tanh_gelu_backward_kir_equivalence` gate). Past `|k| = 43.5` the
+/// derivative is its limit, 1 above and 0 below; the hand kernel returned
+/// garbage and then NaN there (`div.approx.f32`'s flush range).
+/// NUL-terminated.
+pub(crate) fn gelu_backward_f32_ptx() -> &'static str {
+    static MODULE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    MODULE.get_or_init(|| {
+        String::from_utf8(nsl_kir::kernels::elementwise::gelu_backward_ptx()).expect("PTX must be ASCII")
+    })
+}
 
 
 // Fused per-parameter FASE-Deferred AdamW/Adam optimizer step (Milestone C ·
@@ -869,45 +761,18 @@ pub(crate) fn clamp_backward_f32_ptx() -> &'static str {
     })
 }
 
-/// tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
-pub(crate) const TANH_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_tanh_f32(\n\
-    .param .u64 a, .param .u64 c, .param .u64 n\n\
-) {\n\
-    .reg .u32 %r<4>;\n\
-    .reg .u64 %rd<7>;\n\
-    .reg .f32 %fs<4>;\n\
-    .reg .pred %p1;\n\
-    ld.param.u64 %rd1, [a];\n\
-    ld.param.u64 %rd2, [c];\n\
-    ld.param.u64 %rd3, [n];\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r3, %r1, %r2;\n\
-    mov.u32 %r1, %tid.x;\n\
-    add.u32 %r3, %r3, %r1;\n\
-    cvt.u64.u32 %rd4, %r3;\n\
-    setp.ge.u64 %p1, %rd4, %rd3;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd5, %rd4, 2;\n\
-    add.u64 %rd6, %rd1, %rd5;\n\
-    ld.global.f32 %fs1, [%rd6];\n\
-    min.f32 %fs1, %fs1, 0f42300000;\n\
-    max.f32 %fs1, %fs1, 0fC2300000;\n\
-    add.f32 %fs2, %fs1, %fs1;\n\
-    mul.f32 %fs2, %fs2, 0f3FB8AA3B;\n\
-    ex2.approx.f32 %fs2, %fs2;\n\
-    add.f32 %fs3, %fs2, 0f3F800000;\n\
-    sub.f32 %fs2, %fs2, 0f3F800000;\n\
-    div.approx.f32 %fs1, %fs2, %fs3;\n\
-    add.u64 %rd6, %rd2, %rd5;\n\
-    st.global.f32 [%rd6], %fs1;\n\
-DONE: ret;\n\
-}\0";
+/// `nsl_tanh_f32(a, c, n)`: `c[i] = tanh(a[i])`, built by
+/// `nsl_kir::kernels::elementwise::build_tanh` (its
+/// `tanh_gelu_backward_kir_equivalence` gate). It saturates at `|x| = 43.5`
+/// and returns a NaN as it is; the hand kernel returned 0 for every `x`
+/// from about 43.67 up, NaN included (`div.approx.f32`'s flush range).
+/// NUL-terminated.
+pub(crate) fn tanh_f32_ptx() -> &'static str {
+    static MODULE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    MODULE.get_or_init(|| {
+        String::from_utf8(nsl_kir::kernels::elementwise::tanh_ptx()).expect("PTX must be ASCII")
+    })
+}
 
 /// Every hand-written PTX module in this file, paired with its constant name.
 ///
@@ -916,11 +781,7 @@ DONE: ret;\n\
 /// error in them is invisible until a kernel launch fails on a real GPU.
 #[cfg(test)]
 pub(crate) const ALL_PTX: &[(&str, &str)] = &[
-    ("DIV_F32_PTX", DIV_F32_PTX),
-    ("DIV_SCALAR_F32_PTX", DIV_SCALAR_F32_PTX),
-    ("GELU_BACKWARD_F32_PTX", GELU_BACKWARD_F32_PTX),
     ("FASE_FUSED_ADAMW_MULTI_BF16SR_PTX", FASE_FUSED_ADAMW_MULTI_BF16SR_PTX),
     ("FASE_FUSED_ADAMW_STEP_BF16SR_PTX", FASE_FUSED_ADAMW_STEP_BF16SR_PTX),
     ("SR_BF16_ROUND_PROBE_PTX", SR_BF16_ROUND_PROBE_PTX),
-    ("TANH_F32_PTX", TANH_F32_PTX),
 ];
