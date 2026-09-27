@@ -12,110 +12,33 @@
 // Params: weight ptr, indices ptr, out ptr, seq_len (u64), embed_dim (u64)
 // indices are stored as f32 (matching GPU dtype=1 convention)
 // ---------------------------------------------------------------------------
-pub(crate) const EMBEDDING_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_80\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_embedding_f32(\n\
-    .param .u64 weight, .param .u64 indices, .param .u64 out,\n\
-    .param .u64 seq_len, .param .u64 embed_dim\n\
-) {\n\
-    .reg .u64 %rd<12>;\n\
-    .reg .u32 %r<6>;\n\
-    .reg .f32 %f<2>;\n\
-    .reg .pred %p1;\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r1, %r1, %r2;\n\
-    mov.u32 %r2, %tid.x;\n\
-    add.u32 %r1, %r1, %r2;\n\
-    mov.u32 %r3, %ctaid.y;\n\
-    mov.u32 %r4, %ntid.y;\n\
-    mul.lo.u32 %r3, %r3, %r4;\n\
-    mov.u32 %r4, %tid.y;\n\
-    add.u32 %r3, %r3, %r4;\n\
-    ld.param.u64 %rd1, [weight];\n\
-    ld.param.u64 %rd2, [indices];\n\
-    ld.param.u64 %rd3, [out];\n\
-    ld.param.u64 %rd4, [seq_len];\n\
-    ld.param.u64 %rd5, [embed_dim];\n\
-    cvt.u64.u32 %rd6, %r1;\n\
-    cvt.u64.u32 %rd7, %r3;\n\
-    setp.ge.u64 %p1, %rd6, %rd4;\n\
-    @%p1 bra DONE;\n\
-    setp.ge.u64 %p1, %rd7, %rd5;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd8, %rd6, 2;\n\
-    add.u64 %rd8, %rd2, %rd8;\n\
-    ld.global.f32 %f1, [%rd8];\n\
-    cvt.rzi.u64.f32 %rd9, %f1;\n\
-    mul.lo.u64 %rd10, %rd9, %rd5;\n\
-    add.u64 %rd10, %rd10, %rd7;\n\
-    shl.b64 %rd10, %rd10, 2;\n\
-    add.u64 %rd10, %rd1, %rd10;\n\
-    ld.global.f32 %f1, [%rd10];\n\
-    mul.lo.u64 %rd11, %rd6, %rd5;\n\
-    add.u64 %rd11, %rd11, %rd7;\n\
-    shl.b64 %rd11, %rd11, 2;\n\
-    add.u64 %rd11, %rd3, %rd11;\n\
-    st.global.f32 [%rd11], %f1;\n\
-DONE: ret;\n\
-}\0";
+/// `nsl_embedding_f32` (header above). The four 2-D-block row lookups (the
+/// embedding and dim-0 gather kernels, with f32 or i32 indices) are built by
+/// `nsl_kir::kernels::lookup`; its `lookup_kir_equivalence` gate holds them
+/// to the hand-written modules they replaced. NUL-terminated.
+pub(crate) fn embedding_f32_ptx() -> &'static str {
+    lookup_module(nsl_kir::kernels::lookup::LookupOp::Embedding, nsl_kir::kernels::lookup::IndexDtype::F32)
+}
 
-/// GPU embedding lookup kernel with i32 integer indices.
-/// Same as EMBEDDING_F32_PTX but reads indices via ld.global.s32 + cvt.s64.s32
-/// instead of ld.global.f32 + cvt.rzi.u64.f32 to correctly handle i32 token IDs.
-pub(crate) const EMBEDDING_I32IDX_PTX: &str = "\
-.version 7.0\n\
-.target sm_80\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_embedding_i32idx(\n\
-    .param .u64 weight, .param .u64 indices, .param .u64 out,\n\
-    .param .u64 seq_len, .param .u64 embed_dim\n\
-) {\n\
-    .reg .u64 %rd<12>;\n\
-    .reg .u32 %r<6>;\n\
-    .reg .f32 %f<2>;\n\
-    .reg .pred %p1;\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r1, %r1, %r2;\n\
-    mov.u32 %r2, %tid.x;\n\
-    add.u32 %r1, %r1, %r2;\n\
-    mov.u32 %r3, %ctaid.y;\n\
-    mov.u32 %r4, %ntid.y;\n\
-    mul.lo.u32 %r3, %r3, %r4;\n\
-    mov.u32 %r4, %tid.y;\n\
-    add.u32 %r3, %r3, %r4;\n\
-    ld.param.u64 %rd1, [weight];\n\
-    ld.param.u64 %rd2, [indices];\n\
-    ld.param.u64 %rd3, [out];\n\
-    ld.param.u64 %rd4, [seq_len];\n\
-    ld.param.u64 %rd5, [embed_dim];\n\
-    cvt.u64.u32 %rd6, %r1;\n\
-    cvt.u64.u32 %rd7, %r3;\n\
-    setp.ge.u64 %p1, %rd6, %rd4;\n\
-    @%p1 bra DONE;\n\
-    setp.ge.u64 %p1, %rd7, %rd5;\n\
-    @%p1 bra DONE;\n\
-    shl.b64 %rd8, %rd6, 2;\n\
-    add.u64 %rd8, %rd2, %rd8;\n\
-    ld.global.s32 %r5, [%rd8];\n\
-    cvt.s64.s32 %rd9, %r5;\n\
-    mul.lo.u64 %rd10, %rd9, %rd5;\n\
-    add.u64 %rd10, %rd10, %rd7;\n\
-    shl.b64 %rd10, %rd10, 2;\n\
-    add.u64 %rd10, %rd1, %rd10;\n\
-    ld.global.f32 %f1, [%rd10];\n\
-    mul.lo.u64 %rd11, %rd6, %rd5;\n\
-    add.u64 %rd11, %rd11, %rd7;\n\
-    shl.b64 %rd11, %rd11, 2;\n\
-    add.u64 %rd11, %rd3, %rd11;\n\
-    st.global.f32 [%rd11], %f1;\n\
-DONE: ret;\n\
-}\0";
+/// `nsl_embedding_i32idx`: `nsl_embedding_f32` for i32 token ids, read
+/// with `ld.global.s32` and sign-extended instead of truncated from f32.
+pub(crate) fn embedding_i32idx_ptx() -> &'static str {
+    lookup_module(nsl_kir::kernels::lookup::LookupOp::Embedding, nsl_kir::kernels::lookup::IndexDtype::I32)
+}
+
+/// The KIR-built row-lookup module for `(op, idx)`, built once.
+fn lookup_module(op: nsl_kir::kernels::lookup::LookupOp, idx: nsl_kir::kernels::lookup::IndexDtype) -> &'static str {
+    use nsl_kir::kernels::lookup::{lookup_ptx, IndexDtype, LookupOp};
+    use std::sync::OnceLock;
+    static MODULES: [OnceLock<String>; 4] = [OnceLock::new(), OnceLock::new(), OnceLock::new(), OnceLock::new()];
+    let slot = match (op, idx) {
+        (LookupOp::Embedding, IndexDtype::F32) => 0,
+        (LookupOp::Embedding, IndexDtype::I32) => 1,
+        (LookupOp::Gather, IndexDtype::F32) => 2,
+        (LookupOp::Gather, IndexDtype::I32) => 3,
+    };
+    MODULES[slot].get_or_init(|| String::from_utf8(lookup_ptx(op, idx)).expect("PTX must be ASCII"))
+}
 
 // ---------------------------------------------------------------------------
 // GPU Embedding Backward (scatter-add)
@@ -189,7 +112,7 @@ DONE: ret;\n\
 }\0";
 
 /// GPU embedding backward with i32 integer indices (mirrors
-/// EMBEDDING_I32IDX_PTX's ld.global.s32 + cvt.s64.s32 index read).
+/// `nsl_embedding_i32idx`'s ld.global.s32 + cvt.s64.s32 index read).
 pub(crate) const EMBEDDING_BWD_I32IDX_PTX: &str = "\
 .version 7.0\n\
 .target sm_80\n\
@@ -1816,124 +1739,17 @@ pub(crate) fn gather_dim_f32_ptx() -> &'static str {
     MODULE.get_or_init(|| String::from_utf8(nsl_kir::kernels::data_movement::gather_dim_ptx()).expect("PTX must be ASCII"))
 }
 
-pub(crate) const GATHER_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_80\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_gather_f32(\n\
-    .param .u64 input, .param .u64 indices, .param .u64 out,\n\
-    .param .u64 num_indices, .param .u64 inner_dim, .param .u64 input_rows\n\
-) {\n\
-    .reg .u64 %rd<14>;\n\
-    .reg .u32 %r<6>;\n\
-    .reg .f32 %f<2>;\n\
-    .reg .pred %p<3>;\n\
-    // i = blockIdx.x * blockDim.x + threadIdx.x\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r1, %r1, %r2;\n\
-    mov.u32 %r2, %tid.x;\n\
-    add.u32 %r1, %r1, %r2;\n\
-    // j = blockIdx.y * blockDim.y + threadIdx.y\n\
-    mov.u32 %r3, %ctaid.y;\n\
-    mov.u32 %r4, %ntid.y;\n\
-    mul.lo.u32 %r3, %r3, %r4;\n\
-    mov.u32 %r4, %tid.y;\n\
-    add.u32 %r3, %r3, %r4;\n\
-    // Load params\n\
-    ld.param.u64 %rd1, [input];\n\
-    ld.param.u64 %rd2, [indices];\n\
-    ld.param.u64 %rd3, [out];\n\
-    ld.param.u64 %rd4, [num_indices];\n\
-    ld.param.u64 %rd5, [inner_dim];\n\
-    ld.param.u64 %rd6, [input_rows];\n\
-    // Bounds check\n\
-    cvt.u64.u32 %rd7, %r1;\n\
-    cvt.u64.u32 %rd8, %r3;\n\
-    setp.ge.u64 %p1, %rd7, %rd4;\n\
-    @%p1 bra G_DONE;\n\
-    setp.ge.u64 %p2, %rd8, %rd5;\n\
-    @%p2 bra G_DONE;\n\
-    // Load index: idx = (int)indices[i]\n\
-    shl.b64 %rd9, %rd7, 2;\n\
-    add.u64 %rd9, %rd2, %rd9;\n\
-    ld.global.f32 %f1, [%rd9];\n\
-    cvt.rzi.u64.f32 %rd10, %f1;\n\
-    // Bounds check: idx < input_rows\n\
-    setp.ge.u64 %p1, %rd10, %rd6;\n\
-    @%p1 bra G_DONE;\n\
-    // Load input[idx, j]\n\
-    mul.lo.u64 %rd11, %rd10, %rd5;\n\
-    add.u64 %rd11, %rd11, %rd8;\n\
-    shl.b64 %rd11, %rd11, 2;\n\
-    add.u64 %rd11, %rd1, %rd11;\n\
-    ld.global.f32 %f1, [%rd11];\n\
-    // Store out[i, j]\n\
-    mul.lo.u64 %rd12, %rd7, %rd5;\n\
-    add.u64 %rd12, %rd12, %rd8;\n\
-    shl.b64 %rd12, %rd12, 2;\n\
-    add.u64 %rd12, %rd3, %rd12;\n\
-    st.global.f32 [%rd12], %f1;\n\
-G_DONE: ret;\n\
-}\0";
+/// `nsl_gather_f32`: see [`embedding_f32_ptx`].
+pub(crate) fn gather_f32_ptx() -> &'static str {
+    lookup_module(nsl_kir::kernels::lookup::LookupOp::Gather, nsl_kir::kernels::lookup::IndexDtype::F32)
+}
 
-/// GPU gather kernel with i32 integer indices.
-/// Same as GATHER_F32_PTX but reads indices via ld.global.s32 + cvt.s64.s32.
-pub(crate) const GATHER_I32IDX_PTX: &str = "\
-.version 7.0\n\
-.target sm_80\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_gather_i32idx(\n\
-    .param .u64 input, .param .u64 indices, .param .u64 out,\n\
-    .param .u64 num_indices, .param .u64 inner_dim, .param .u64 input_rows\n\
-) {\n\
-    .reg .u64 %rd<14>;\n\
-    .reg .u32 %r<6>;\n\
-    .reg .f32 %f<2>;\n\
-    .reg .pred %p<3>;\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r1, %r1, %r2;\n\
-    mov.u32 %r2, %tid.x;\n\
-    add.u32 %r1, %r1, %r2;\n\
-    mov.u32 %r3, %ctaid.y;\n\
-    mov.u32 %r4, %ntid.y;\n\
-    mul.lo.u32 %r3, %r3, %r4;\n\
-    mov.u32 %r4, %tid.y;\n\
-    add.u32 %r3, %r3, %r4;\n\
-    ld.param.u64 %rd1, [input];\n\
-    ld.param.u64 %rd2, [indices];\n\
-    ld.param.u64 %rd3, [out];\n\
-    ld.param.u64 %rd4, [num_indices];\n\
-    ld.param.u64 %rd5, [inner_dim];\n\
-    ld.param.u64 %rd6, [input_rows];\n\
-    cvt.u64.u32 %rd7, %r1;\n\
-    cvt.u64.u32 %rd8, %r3;\n\
-    setp.ge.u64 %p1, %rd7, %rd4;\n\
-    @%p1 bra G_DONE;\n\
-    setp.ge.u64 %p2, %rd8, %rd5;\n\
-    @%p2 bra G_DONE;\n\
-    // Load index as i32: idx = indices[i]\n\
-    shl.b64 %rd9, %rd7, 2;\n\
-    add.u64 %rd9, %rd2, %rd9;\n\
-    ld.global.s32 %r5, [%rd9];\n\
-    cvt.s64.s32 %rd10, %r5;\n\
-    setp.ge.u64 %p1, %rd10, %rd6;\n\
-    @%p1 bra G_DONE;\n\
-    mul.lo.u64 %rd11, %rd10, %rd5;\n\
-    add.u64 %rd11, %rd11, %rd8;\n\
-    shl.b64 %rd11, %rd11, 2;\n\
-    add.u64 %rd11, %rd1, %rd11;\n\
-    ld.global.f32 %f1, [%rd11];\n\
-    mul.lo.u64 %rd12, %rd7, %rd5;\n\
-    add.u64 %rd12, %rd12, %rd8;\n\
-    shl.b64 %rd12, %rd12, 2;\n\
-    add.u64 %rd12, %rd3, %rd12;\n\
-    st.global.f32 [%rd12], %f1;\n\
-G_DONE: ret;\n\
-}\0";
+/// `nsl_gather_i32idx`: `nsl_gather_f32` with i32 indices, read with
+/// `ld.global.s32` and sign-extended, so a negative one fails the unsigned
+/// row test.
+pub(crate) fn gather_i32idx_ptx() -> &'static str {
+    lookup_module(nsl_kir::kernels::lookup::LookupOp::Gather, nsl_kir::kernels::lookup::IndexDtype::I32)
+}
 
 // ---------------------------------------------------------------------------
 // GPU Conv2d (implicit GEMM, direct convolution)
@@ -4558,8 +4374,6 @@ pub(crate) const ALL_PTX: &[(&str, &str)] = &[
     ("MUON_BATCH_UPDATE_F32_PTX", MUON_BATCH_UPDATE_F32_PTX),
     ("CE_BWD_COUNT_F32_PTX", CE_BWD_COUNT_F32_PTX),
     ("CE_BWD_FINISH_F32_PTX", CE_BWD_FINISH_F32_PTX),
-    ("EMBEDDING_F32_PTX", EMBEDDING_F32_PTX),
-    ("EMBEDDING_I32IDX_PTX", EMBEDDING_I32IDX_PTX),
     ("EMBEDDING_BWD_F32_PTX", EMBEDDING_BWD_F32_PTX),
     ("EMBEDDING_BWD_I32IDX_PTX", EMBEDDING_BWD_I32IDX_PTX),
     ("EMBEDDING_BWD_DET_F32_PTX", EMBEDDING_BWD_DET_F32_PTX),
@@ -4577,8 +4391,6 @@ pub(crate) const ALL_PTX: &[(&str, &str)] = &[
     ("RMSNORM_DX_BWD_ADD_F32_PTX", RMSNORM_DX_BWD_ADD_F32_PTX),
     ("RMSNORM_DX_BWD_F32_PTX", RMSNORM_DX_BWD_F32_PTX),
     ("SCATTER_ADD_F32_PTX", SCATTER_ADD_F32_PTX),
-    ("GATHER_F32_PTX", GATHER_F32_PTX),
-    ("GATHER_I32IDX_PTX", GATHER_I32IDX_PTX),
     ("CONV2D_F32_PTX", CONV2D_F32_PTX),
     ("MAXPOOL2D_F32_PTX", MAXPOOL2D_F32_PTX),
     ("FLASH_LSE_F32_PTX", FLASH_LSE_F32_PTX),

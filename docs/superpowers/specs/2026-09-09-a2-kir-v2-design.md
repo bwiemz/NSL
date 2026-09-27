@@ -1008,9 +1008,30 @@ frozen throughout, so nothing here blocks a kernel fix.
         broadcast, zero-stride and 0-d views, and it kills the index
         arithmetic's mutants.
       - **SASS:** registers are equal or fewer.
-      - **Still hand-written:** the 2-D-block kernels (embedding forward,
-        the index gathers). They wait on the interpreter modelling
-        `%tid.y`.
+    - **`fused_kernels.rs`, the 2-D-block row lookups.**
+      `nsl_embedding_f32`, `nsl_embedding_i32idx`, `nsl_gather_f32` and
+      `nsl_gather_i32idx` are in `nsl_kir::kernels::lookup`. The index is
+      truncated from f32 or sign-extended from i32 (`cvt.u64.s32`), and the
+      gather bounds it unsigned.
+      - **The interpreter models two-dimensional blocks.** `run_cta_2d`
+        numbers a block's threads `x + y · ntid.x`. The warps and the
+        schedules follow that number, and each thread reads its `%tid.x`,
+        `%tid.y` and the block's `%ntid.y`. `run_cta` is the one-row case,
+        so no earlier gate changed. It also gained `ld.s32`, `cvt.s64.s32`, `cvt.u64.s32` and
+        `cvt.rzi.s64.f32`.
+      - **The gate,** `lookup_kir_equivalence`, requires the hand kernels'
+        bytes and the lookup formula. It runs on a 16 × 16 block and on an
+        8 × 4 one, so that `%ntid.x` and `%ntid.y` differ. It kills mutants
+        of the bounds, the 2-D index, the element sizes, the adds and
+        strides, and the f32 truncation. The i32 index read zero-extended
+        is named as an equivalent mutant.
+      - **SASS:** the same memory and compare instructions. Registers are
+        up by at most two (16 against 14, 14 against 12). The difference is
+        the `IMAD.WIDE` address arithmetic, where the hand kernels' `shl`
+        gave `LEA`.
+      - **Still hand-written:** the embedding backward family (atomic and
+        deterministic, f32 and i32 indices) and the uncalled
+        `nsl_scatter_add_f32`.
     - **`fused_kernels.rs`, integer dequantization.**
       `nsl_dequant_int8_per_head_f32`, `nsl_dequant_int8_per_token_f32` and
       `nsl_dequant_int4_per_group_f32` are in `nsl_kir::kernels::dequant`.

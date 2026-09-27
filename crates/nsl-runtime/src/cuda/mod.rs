@@ -6572,9 +6572,9 @@ pub(crate) fn gpu_embedding_lookup(weight_ptr: i64, indices_ptr: i64) -> i64 {
     // Select kernel based on indices dtype: i32 indices use ld.global.s32,
     // f32 indices use ld.global.f32 + cvt.rzi.u64.f32
     let (ptx, kernel_name): (&str, &[u8]) = if indices_gpu.dtype == crate::tensor::DTYPE_I32 {
-        (fused_kernels::EMBEDDING_I32IDX_PTX, b"nsl_embedding_i32idx\0")
+        (fused_kernels::embedding_i32idx_ptx(), b"nsl_embedding_i32idx\0")
     } else {
-        (fused_kernels::EMBEDDING_F32_PTX, b"nsl_embedding_f32\0")
+        (fused_kernels::embedding_f32_ptx(), b"nsl_embedding_f32\0")
     };
 
     let result = inner::kernel_launch(
@@ -8637,7 +8637,6 @@ pub(crate) fn gpu_gather_dim_f32(
 pub(crate) fn gpu_gather_f32(input_ptr: i64, indices_ptr: i64) -> i64 {
     inner::set_oom_context("gather_f32");
     use crate::tensor::NslTensor;
-    use fused_kernels::GATHER_F32_PTX;
 
     let input = NslTensor::from_ptr_ref(input_ptr);
     let indices = NslTensor::from_ptr_ref(indices_ptr);
@@ -8699,9 +8698,9 @@ pub(crate) fn gpu_gather_f32(input_ptr: i64, indices_ptr: i64) -> i64 {
 
     // Select kernel based on indices dtype: i32 uses ld.global.s32
     let (ptx, kernel_name): (&str, &[u8]) = if indices_gpu.dtype == crate::tensor::DTYPE_I32 {
-        (fused_kernels::GATHER_I32IDX_PTX, b"nsl_gather_i32idx\0")
+        (fused_kernels::gather_i32idx_ptx(), b"nsl_gather_i32idx\0")
     } else {
-        (GATHER_F32_PTX, b"nsl_gather_f32\0")
+        (fused_kernels::gather_f32_ptx(), b"nsl_gather_f32\0")
     };
 
     let result = inner::kernel_launch(
@@ -10428,6 +10427,10 @@ mod tests {
         ));
         all.push((nsl_kir::kernels::dropout::DROPOUT_NAME, super::fused_kernels::dropout_f32_ptx(), true));
         all.push((nsl_kir::kernels::data_movement::GATHER_DIM_NAME, super::fused_kernels::gather_dim_f32_ptx(), true));
+        all.push(("nsl_embedding_f32", super::fused_kernels::embedding_f32_ptx(), true));
+        all.push(("nsl_embedding_i32idx", super::fused_kernels::embedding_i32idx_ptx(), true));
+        all.push(("nsl_gather_f32", super::fused_kernels::gather_f32_ptx(), true));
+        all.push(("nsl_gather_i32idx", super::fused_kernels::gather_i32idx_ptx(), true));
         all.push(("nsl_strided_copy_f32", super::fused_kernels::strided_copy_f32_ptx(), true));
         all.push(("nsl_slice_f32", super::fused_kernels::slice_f32_ptx(), true));
         all

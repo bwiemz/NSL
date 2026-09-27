@@ -13,6 +13,7 @@ pub mod data_movement;
 pub mod dequant;
 pub mod dropout;
 pub mod elementwise;
+pub mod lookup;
 pub mod optim;
 pub mod strided_copy;
 pub mod tier_b1_prepass;
