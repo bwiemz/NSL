@@ -268,6 +268,30 @@ becomes `if let Some(csla) = &plan.techniques.csla`.
    pass.applies(..) { pass.apply(..)? } }`. Add a drift gate that the table's
    order agrees with `pass_registry` / `PassManager::dependency_order_violations`,
    the way `pass_scheduler_coverage.rs` pins the scheduled set today.
+   *Status:* split in two. **4a is done.** `stmt_train/pass_order.rs` is
+   the table, 17 steps from the CPDT pre-plan offer to the CSLA
+   precompute. Each step names its stage, the registry passes it
+   schedules, its file and the driver call. `tests/train_pass_order.rs` is
+   the drift gate:
+   - the calls appear in the driver in table order, each defined where the
+     table says;
+   - the `schedule` sites in the driver's files are exactly the table's
+     `(file, pass)` pairs, and every `TrainBlock`-phase registry pass has
+     a step;
+   - the order inverts no `InvocationOrdered` bus edge (the pass manager's
+     per-compile check applied to the declared order), and a reversed
+     table is refused;
+   - stages are monotone, with no tape-touching pass before extraction.
+
+   The table surfaced two facts the design table above did not have.
+   CPDT runs twice: a weights-only pre-plan offer in `compile_train_block`
+   before the inner driver, and the planning site after WRGA. CPKD is
+   hosted by the primal `VarMap` build. **4b** is the trait: the rows
+   whose inputs are already plan facts (the admissions, the adjoint
+   passes) become `TrainPass` impls driven from the table. The rows that
+   take the builder (the CSHA prune, and the WRGA adapter sites between
+   them) stay driver calls until step 5 splits planning from emission.
+   Otherwise the trait's context would have to carry most of the driver.
 5. **Split the driver.** `lower_train_block(&self, train) -> TrainPlan` (steps
    1–17, no `builder`) and `emit_train_plan(plan, builder, state)`; the loop
    emission stays in the emitter. `compile_train_block_inner` becomes the
