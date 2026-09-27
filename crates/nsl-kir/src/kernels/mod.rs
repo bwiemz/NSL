@@ -10,6 +10,7 @@
 
 pub mod cast;
 pub mod data_movement;
+pub mod dequant;
 pub mod elementwise;
 pub mod optim;
 pub mod strided_copy;

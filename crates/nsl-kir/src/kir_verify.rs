@@ -651,7 +651,14 @@ fn is_float(ty: &KirType) -> bool {
 fn is_integer(ty: &KirType) -> bool {
     matches!(
         ty,
-        KirType::U32 | KirType::I32 | KirType::U64 | KirType::I64 | KirType::I8 | KirType::I16 | KirType::U16
+        KirType::U32
+            | KirType::I32
+            | KirType::U64
+            | KirType::I64
+            | KirType::I8
+            | KirType::U8
+            | KirType::I16
+            | KirType::U16
     )
 }
 

@@ -1000,6 +1000,23 @@ frozen throughout, so nothing here blocks a kernel fix.
       - **Still hand-written:** the 2-D-block kernels (embedding forward,
         the index gathers). They wait on the interpreter modelling
         `%tid.y`.
+    - **`fused_kernels.rs`, integer dequantization.**
+      `nsl_dequant_int8_per_head_f32`, `nsl_dequant_int8_per_token_f32` and
+      `nsl_dequant_int4_per_group_f32` are in `nsl_kir::kernels::dequant`.
+      The int8 pair loads `s8` through `KirType::I8`. For int4's packed
+      nibbles KIR gained `KirType::U8`, a byte in a `%r` register (`.u8`,
+      `cvt.u32.u8`). The interpreter gained `cvt.rn.f32.s16` (the hand
+      kernels' widening) and `cvt.u32.u8`.
+      - **The gate,** `dequant_kir_equivalence`, requires the hand kernels'
+        bytes over every byte value and IEEE-corner scales. It checks the
+        formulas, and that int4's result is one `fma` rounding, not two.
+        It kills mutants of the scale index, the signed widening and every
+        part of the nibble unpack. `cvt.u32.u8` → `.s8` is named as an
+        equivalent mutant, since the nibble masks remove the sign.
+      - **SASS:** the same registers and floating-point instructions as
+        the hand kernels on sm_80/90/120.
+      - **Still hand-written:** the fp8 E4M3 decoder, which has its own
+        interpreter gate in `nsl-runtime` (`fp8_e4m3_dequant_interp`).
 12. **FA v2**, by phase directory, tier B.1 and B.2 last; the SASS
     baselines and the two no-spill gates already exist here and are the
     proof. `matmul_mma.rs` and `kernel_skeleton/` are deleted with their

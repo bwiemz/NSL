@@ -214,6 +214,11 @@ pub(crate) enum Op {
     CvtF32S8 { d: usize, a: Src },
     /// `cvt.u32.s8`: the low byte, sign-extended to 32 bits.
     CvtU32S8 { d: usize, a: Src },
+    /// `cvt.rn.f32.s16`: the low 16 bits, as a signed integer, to f32
+    /// (exact).
+    CvtF32S16 { d: usize, a: Src },
+    /// `cvt.u32.u8`: the low byte, zero-extended.
+    CvtU32U8 { d: usize, a: Src },
     Setp { cmp: Cmp, ty: CmpTy, d: usize, a: Src, b: Src },
     /// `selp.<type>`: `d = p ? a : b`, at the type's width.
     Selp { w: W, d: usize, a: Src, b: Src, p: Src },
@@ -576,6 +581,14 @@ pub(crate) fn parse(ptx: &str) -> Program {
             ["cvt", "u32", "s8"] => {
                 want(2);
                 Op::CvtU32S8 { d: p.dst(ops[0]), a: p.src(ops[1]) }
+            }
+            ["cvt", "rn", "f32", "s16"] => {
+                want(2);
+                Op::CvtF32S16 { d: p.dst(ops[0]), a: p.src(ops[1]) }
+            }
+            ["cvt", "u32", "u8"] => {
+                want(2);
+                Op::CvtU32U8 { d: p.dst(ops[0]), a: p.src(ops[1]) }
             }
             // u32 -> 64 bits zero-extends whatever the destination's sign.
             ["cvt", "u64" | "s64", "u32"] => {
@@ -1051,6 +1064,14 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
             Op::CvtF32S8 { d, a } => {
                 let v = rd(t, launch, *a) as u8 as i8 as f32;
                 write(t, *d, fb(v));
+            }
+            Op::CvtF32S16 { d, a } => {
+                let v = rd(t, launch, *a) as u16 as i16 as f32;
+                write(t, *d, fb(v));
+            }
+            Op::CvtU32U8 { d, a } => {
+                let v = rd(t, launch, *a) as u8 as u64;
+                write(t, *d, v);
             }
             Op::Setp { cmp, ty, d, a, b } => {
                 let (a, b) = (rd(t, launch, *a), rd(t, launch, *b));
