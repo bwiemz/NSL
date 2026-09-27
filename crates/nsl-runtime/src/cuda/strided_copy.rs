@@ -1,6 +1,6 @@
 //! Fast paths for `nsl_tensor_contiguous` on GPU views.
 //!
-//! The generic materializer (`STRIDED_COPY_F32_PTX` in `fused_kernels`) decomposes
+//! The generic materializer (`nsl_strided_copy_f32`, `fused_kernels::strided_copy_f32_ptx`) decomposes
 //! every output element's flat index into N-dimensional coordinates with a
 //! per-dimension `div.u64` / `rem.u64` pair. 64-bit integer division has no
 //! hardware unit on any current SM, so a 5-D view costs ~10 emulated divisions

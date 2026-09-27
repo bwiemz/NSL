@@ -9,6 +9,7 @@
 //! keep honest.
 
 pub mod cast;
+pub mod data_movement;
 pub mod elementwise;
 pub mod optim;
 pub mod strided_copy;
