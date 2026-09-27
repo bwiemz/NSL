@@ -33,7 +33,11 @@
 //! `.s64` values are two's-complement bit patterns in a register, and a
 //! negative decimal immediate is read as one; `add`, `sub` and `mul.lo` on
 //! them are the unsigned operations, which give the same bits.
-//! `%ctaid.y` and `%nctaid.y` are modelled for a two-dimensional grid.
+//! `%ctaid.y` and `%nctaid.y` are modelled for a two-dimensional grid,
+//! and `%tid.y` and `%ntid.y` for a two-dimensional block ([`run_cta_2d`]):
+//! the block's threads are numbered `x + y * ntid.x`, as on the hardware,
+//! and that linear number is what the warps, `%laneid` and the schedule
+//! orders see.
 //! `ld.{global,shared}.v4.f32` and `st.{global,shared}.v4.f32` move four
 //! consecutive f32s through a braced register list, and a label may share
 //! its line with the instruction it names (`DONE: ret;`).
@@ -50,7 +54,10 @@
 //! (Rust's `as`), and `cvt.u32.u64` keeps the low 32 bits.
 //! `cvt.rzi.u64.f32` truncates toward zero and saturates, a NaN or a
 //! negative value giving 0: PTX's float-to-integer rule, which Rust's `as`
-//! also follows.
+//! also follows. `cvt.rzi.s64.f32` is the signed form (NaN gives 0), and
+//! `cvt.s64.s32` and `cvt.u64.s32` sign-extend the low 32 bits; `ld.s32`
+//! loads four bytes like `ld.u32`, the sign mattering only to the widening
+//! that follows.
 //!
 //! A `.shared` block may be declared by element (`.shared .f32 NAME[N]`,
 //! `N` elements) as well as in bytes, and an address may name it directly
@@ -108,12 +115,14 @@ pub(crate) const SHARED_BASE: u64 = 0x100;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Special {
     TidX,
-    /// `%laneid`: `%tid.x % 32` for the one-dimensional blocks modelled.
+    TidY,
+    /// `%laneid`: the thread's linear number in its block, mod 32.
     LaneId,
     CtaidX,
     CtaidY,
     NctaidY,
     NtidX,
+    NtidY,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -209,6 +218,10 @@ pub(crate) enum Op {
     /// `cvt.rzi.u64.f32`: toward zero, saturating to `[0, 2^64)`, NaN to 0
     /// (PTX's float-to-integer rule, and Rust's `as`).
     CvtU64F32Rzi { d: usize, a: Src },
+    /// `cvt.rzi.s64.f32`: toward zero, saturating to the i64 range, NaN to 0.
+    CvtS64F32Rzi { d: usize, a: Src },
+    /// `cvt.s64.s32` / `cvt.u64.s32`: the low 32 bits, sign-extended.
+    CvtS64S32 { d: usize, a: Src },
     CvtF32F16 { d: usize, a: Src },
     /// `cvt.rn.f32.s8`: the low byte, as a signed integer, to f32 (exact).
     CvtF32S8 { d: usize, a: Src },
@@ -316,11 +329,13 @@ impl Parser {
         let tok = tok.trim();
         match tok {
             "%tid.x" => return Src::Special(Special::TidX),
+            "%tid.y" => return Src::Special(Special::TidY),
             "%laneid" => return Src::Special(Special::LaneId),
             "%ctaid.x" => return Src::Special(Special::CtaidX),
             "%ctaid.y" => return Src::Special(Special::CtaidY),
             "%nctaid.y" => return Src::Special(Special::NctaidY),
             "%ntid.x" => return Src::Special(Special::NtidX),
+            "%ntid.y" => return Src::Special(Special::NtidY),
             _ => {}
         }
         if tok.starts_with('%') {
@@ -616,6 +631,15 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 want(2);
                 Op::CvtU64F32Rzi { d: p.dst(ops[0]), a: p.src(ops[1]) }
             }
+            ["cvt", "rzi", "s64", "f32"] => {
+                want(2);
+                Op::CvtS64F32Rzi { d: p.dst(ops[0]), a: p.src(ops[1]) }
+            }
+            // s32 -> 64 bits sign-extends whatever the destination's sign.
+            ["cvt", "u64" | "s64", "s32"] => {
+                want(2);
+                Op::CvtS64S32 { d: p.dst(ops[0]), a: p.src(ops[1]) }
+            }
             [name @ ("and" | "or"), "pred"] => {
                 want(3);
                 let op = if *name == "and" { IntOp::And } else { IntOp::Or };
@@ -732,7 +756,7 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 want(2);
                 Op::Cos { d: p.dst(ops[0]), a: p.src(ops[1]) }
             }
-            ["ld", space @ ("global" | "shared"), ty @ ("f32" | "b16" | "u16" | "u32" | "b32" | "s64" | "u64")] => {
+            ["ld", space @ ("global" | "shared"), ty @ ("f32" | "b16" | "u16" | "u32" | "s32" | "b32" | "s64" | "u64")] => {
                 want(2);
                 let space = if *space == "global" { Space::Global } else { Space::Shared };
                 let bytes = match *ty {
@@ -885,6 +909,11 @@ pub(crate) struct ShflPending {
 }
 
 pub(crate) struct Thread {
+    /// `%tid.x` and `%tid.y`: the thread's place in its block.
+    pub(crate) tid_x: u32,
+    pub(crate) tid_y: u32,
+    /// `%ntid.y`, the block's height: the same in every thread of a CTA.
+    pub(crate) ntid_y: u32,
     pub(crate) pc: usize,
     pub(crate) regs: Vec<u64>,
     pub(crate) written: Vec<bool>,
@@ -903,6 +932,8 @@ pub(crate) struct Launch<'a> {
     pub(crate) ctaid_y: u32,
     /// `%nctaid.y`: 1 for a one-dimensional grid.
     pub(crate) nctaid_y: u32,
+    /// `%ntid.x`. A one-dimensional block ([`run_cta`]) has `ntid`
+    /// threads; a two-dimensional one ([`run_cta_2d`]) has `ntid` columns.
     pub(crate) ntid: u32,
     pub(crate) steps: u64,
 }
@@ -942,12 +973,14 @@ pub(crate) fn read(prog: &Program, t: &Thread, launch: &Launch, tid: u32, s: Src
             t.regs[r]
         }
         Src::Imm(v) => v,
-        Src::Special(Special::TidX) => tid as u64,
+        Src::Special(Special::TidX) => t.tid_x as u64,
+        Src::Special(Special::TidY) => t.tid_y as u64,
         Src::Special(Special::LaneId) => (tid % 32) as u64,
         Src::Special(Special::CtaidX) => launch.ctaid as u64,
         Src::Special(Special::CtaidY) => launch.ctaid_y as u64,
         Src::Special(Special::NctaidY) => launch.nctaid_y as u64,
         Src::Special(Special::NtidX) => launch.ntid as u64,
+        Src::Special(Special::NtidY) => t.ntid_y as u64,
     }
 }
 
@@ -1051,6 +1084,14 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
             }
             Op::CvtU64F32Rzi { d, a } => {
                 let v = f32::from_bits(rd(t, launch, *a) as u32) as u64;
+                write(t, *d, v);
+            }
+            Op::CvtS64F32Rzi { d, a } => {
+                let v = f32::from_bits(rd(t, launch, *a) as u32) as i64 as u64;
+                write(t, *d, v);
+            }
+            Op::CvtS64S32 { d, a } => {
+                let v = rd(t, launch, *a) as u32 as i32 as i64 as u64;
                 write(t, *d, v);
             }
             Op::CvtF32F16 { d, a } => {
@@ -1401,12 +1442,25 @@ fn resolve_mmas(threads: &mut [Thread], ctaid: u32) -> bool {
     released
 }
 
-/// Run one CTA to completion under `order`.
+/// Run one CTA of a one-dimensional block (`launch.ntid` threads) to
+/// completion under `order`.
 pub(crate) fn run_cta(launch: &mut Launch, order: Order) {
-    let n = launch.ntid;
+    run_cta_2d(launch, 1, order);
+}
+
+/// Run one CTA of a `launch.ntid` × `ntid_y` block to completion under
+/// `order`. Thread `x + y * ntid.x` has `%tid.x = x` and `%tid.y = y`, and
+/// it is that linear number the warps and `order` follow.
+pub(crate) fn run_cta_2d(launch: &mut Launch, ntid_y: u32, order: Order) {
+    assert!(ntid_y >= 1, "a block has at least one row");
+    let ntid_x = launch.ntid;
+    let n = ntid_x.checked_mul(ntid_y).expect("block size overflows u32");
     let regs = launch.prog.reg_names.len();
     let mut threads: Vec<Thread> = (0..n)
-        .map(|_| Thread {
+        .map(|tid| Thread {
+            tid_x: tid % ntid_x,
+            tid_y: tid / ntid_x,
+            ntid_y,
             pc: 0,
             regs: vec![0; regs],
             written: vec![false; regs],
