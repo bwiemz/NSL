@@ -7673,8 +7673,6 @@ pub(crate) fn gpu_dequant_fp8_e4m3_f32(
     out_ptr: *mut std::ffi::c_void,
     n: u64,
 ) {
-    use fused_kernels::DEQUANT_FP8_E4M3_F32_PTX;
-
     let mut inp = data_ptr as u64;
     let mut out = out_ptr as u64;
     let mut n_val = n;
@@ -7689,7 +7687,7 @@ pub(crate) fn gpu_dequant_fp8_e4m3_f32(
     let grid = ((n + 255) / 256) as i64;
 
     let result = inner::kernel_launch(
-        DEQUANT_FP8_E4M3_F32_PTX.as_ptr(), b"nsl_dequant_fp8_e4m3_f32\0".as_ptr(),
+        fused_kernels::dequant_fp8_e4m3_f32_ptx().as_ptr(), b"nsl_dequant_fp8_e4m3_f32\0".as_ptr(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU dequant_fp8_e4m3 kernel failed: {:?}", result);
@@ -10425,6 +10423,7 @@ mod tests {
             super::fused_kernels::dequant_int4_per_group_f32_ptx(),
             true,
         ));
+        all.push((nsl_kir::kernels::dequant::FP8_E4M3_NAME, super::fused_kernels::dequant_fp8_e4m3_f32_ptx(), true));
         all.push((nsl_kir::kernels::dropout::DROPOUT_NAME, super::fused_kernels::dropout_f32_ptx(), true));
         all.push((nsl_kir::kernels::data_movement::GATHER_DIM_NAME, super::fused_kernels::gather_dim_f32_ptx(), true));
         all.push(("nsl_embedding_f32", super::fused_kernels::embedding_f32_ptx(), true));
