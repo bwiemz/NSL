@@ -1028,6 +1028,17 @@ frozen throughout, so nothing here blocks a kernel fix.
         the hand kernels on sm_80/90/120.
       - **Still hand-written:** the fp8 E4M3 decoder, which has its own
         interpreter gate in `nsl-runtime` (`fp8_e4m3_dequant_interp`).
+    - **`fused_kernels.rs`, dropout.** `nsl_dropout_f32` is in
+      `nsl_kir::kernels::dropout`: the 32-bit multiply-xorshift hash of
+      `seed + i`, a strict unsigned threshold compare, and two `selp`s
+      (the scale factor and the mask).
+      - **The gate,** `dropout_kir_equivalence`, requires the hand kernel's
+        bytes and the restated hash's decisions. A pair of thresholds,
+        `hash(e7)` and `hash(e7) + 1`, makes every hash mutant a
+        deterministic kill: a changed hash lands below the first or at or
+        above the second.
+      - **SASS:** the same instruction mix. Registers are 12/16/14 against
+        12/13/12, with no occupancy effect at 256 threads.
 12. **FA v2**, by phase directory, tier B.1 and B.2 last; the SASS
     baselines and the two no-spill gates already exist here and are the
     proof. `matmul_mma.rs` and `kernel_skeleton/` are deleted with their

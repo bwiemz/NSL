@@ -8,6 +8,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **`nsl_dropout_f32` is built by `nsl_kir::kernels::dropout`** in place of
+  its hand-written constant (new-roadmap item 5).
+  - **The kernel** is the hand kernel's sequence:
+    - the 32-bit multiply-xorshift hash of `seed + i`;
+    - `keep = hash < threshold`, unsigned and strict;
+    - `out = x · (keep ? scale : 0)` with a bare `mul.f32`, so a dropped
+      NaN stays NaN;
+    - `mask = keep ? 1 : 0`.
+  - **The gate.** `tests/dropout_kir_equivalence.rs` (12 tests) runs the
+    frozen hand kernel and the KIR one on the CTA interpreter.
+    - It requires identical global memory under two schedules and the
+      restated hash's decision for every element.
+    - The thresholds include keep-nothing, keep-everything and the
+      runtime's p = 0.1 and 0.5. Seeds include one whose `seed + i`
+      crosses 2^32.
+    - A pair of thresholds at `hash(e7)` and `hash(e7) + 1` makes every
+      hash mutant a deterministic kill.
+    - It kills mutants of the bound, the block index, each element size and
+      parameter slot, each multiplier and shift, the counter, the
+      comparison (`<=`, signed), both selects' constants and operands, and
+      the product.
+  - **SASS** on sm_80/90/120: the same instruction mix. Registers are
+    12/16/14 against 12/13/12, with no occupancy effect at 256 threads.
 - **The int8 and int4 KV dequantization kernels are built by
   `nsl_kir::kernels::dequant`** in place of their hand-written constants
   (new-roadmap item 5): `nsl_dequant_int8_per_head_f32`,

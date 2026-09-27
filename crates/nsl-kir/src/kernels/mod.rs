@@ -11,6 +11,7 @@
 pub mod cast;
 pub mod data_movement;
 pub mod dequant;
+pub mod dropout;
 pub mod elementwise;
 pub mod optim;
 pub mod strided_copy;
