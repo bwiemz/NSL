@@ -163,7 +163,11 @@ driver runs it:
    builds it once before the epoch loop. The late emitters take
    `(&plan, &emit)` plus only the handles one micro-batch produces.
    `tests/train_plan_emit_state.rs` keeps setup handles out of their
-   `Inputs` structs.
+   `Inputs` structs. The planning steps below, from the CPDT pre-plan offer
+   to the CSLA precompute, are listed in order in
+   `src/stmt_train/pass_order.rs` (`PASS_ORDER`, step 4a).
+   `tests/train_pass_order.rs` holds that table to the driver's calls, the
+   `schedule` sites, the registry and the pass bus's ordering edges.
 5. Epoch/batch loops; forward extraction into a `WengertList` by
    `WengertExtractor` (`src/source_ad.rs`), then the initial primal
    `VarMap` (`src/stmt_train/primal_vars.rs`: `emit_primal_vars` — named

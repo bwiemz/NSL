@@ -120,6 +120,9 @@
 //!     and the health-monitor hooks (loss record, per-parameter gradient
 //!     and weight norms, snapshot flush), fed by a
 //!     [`health_hooks::HealthHooksInputs`].
+//!   - [`pass_order`] — `PASS_ORDER`, the driver's planning steps in the
+//!     order it runs them, held to the driver, the scheduled sites, the
+//!     registry and the pass bus by `tests/train_pass_order.rs`.
 //!   - [`param_lists`] — the per-parameter runtime lists built at setup:
 //!     the Muon/AdamW route flags, the weight-decay exemption flags and
 //!     the gradient-accumulation buffers.
@@ -151,6 +154,7 @@ pub(crate) mod forward_lowering;
 pub(crate) mod health_hooks;
 pub(crate) mod identity;
 pub(crate) mod optimizer_step;
+pub mod pass_order;
 pub(crate) mod param_lists;
 pub(crate) mod pipelined;
 pub(crate) mod primal_vars;
