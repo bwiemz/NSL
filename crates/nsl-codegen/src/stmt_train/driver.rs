@@ -30,6 +30,7 @@ use crate::error::CodegenError;
 use crate::stmt_train::csla_window::{
     CslaPending, CslaSaveInputs, CslaWindowInputs, CslaWindowSave,
 };
+use crate::stmt_train::emit_state::EmitState;
 use crate::stmt_train::model_params::ModelParams;
 use crate::stmt_train::adapter_sites::AdapterSitesInputs;
 use crate::stmt_train::adjoint_tape_opt::AdjointTapeOptInputs;
@@ -657,6 +658,29 @@ impl Compiler<'_> {
             builder.ins().iconst(cl_types::I64, 0)
         };
         builder.def_var(epoch_counter_var, epoch_start);
+
+        // TrainPlan step 3 (roadmap A1): the setup handles above, as the one
+        // value the late emitters take next to `&plan`.
+        let emit = EmitState {
+            param_list,
+            num_params_val,
+            mode_table_base,
+            cpdt_precision_dtypes,
+            checkpoint_names_list,
+            muon_route_list,
+            decay_exempt_list,
+            state_list_1,
+            state_list_2,
+            muon_state_m_codes,
+            moment_fill_latch,
+            accum_list,
+            csla_buffers,
+            has_dataloader,
+            checkpoint_dl_handle,
+            lr_var,
+            step_count_var,
+            epoch_counter_var,
+        };
 
         let epochs_val = builder.ins().iconst(cl_types::I64, epochs);
 
@@ -2168,12 +2192,10 @@ impl Compiler<'_> {
             state,
             HealthHooksInputs {
                 plan: &plan,
+                emit: &emit,
                 fase_hook_active,
                 grads_list,
                 loss_val,
-                num_params_val,
-                param_list,
-                step_count_var,
             },
         )?;
 
@@ -2359,21 +2381,9 @@ impl Compiler<'_> {
             state,
             CslaWindowInputs {
                 plan: &plan,
-                accum_list,
-                cpdt_precision_dtypes,
-                muon_state_m_codes,
-                csla_buffers,
+                emit: &emit,
                 csla_pending,
-                has_dataloader,
-                lr_var,
                 should_step_var,
-                step_count_var,
-                moment_fill_latch,
-                muon_route_list,
-                num_params_val,
-                param_list,
-                state_list_1,
-                state_list_2,
             },
         )?;
 
@@ -2387,20 +2397,10 @@ impl Compiler<'_> {
             state,
             OptimizerStepInputs {
                 plan: &plan,
-                accum_list,
-                cpdt_precision_dtypes,
+                emit: &emit,
                 fase_hook_active,
-                decay_exempt_list,
                 grads_list,
-                lr_var,
                 should_step_var,
-                step_count_var,
-                mode_table_base,
-                muon_route_list,
-                num_params_val,
-                param_list,
-                state_list_1,
-                state_list_2,
             },
         )?;
 
@@ -2410,18 +2410,7 @@ impl Compiler<'_> {
         self.emit_scheduler_step(
             builder,
             state,
-            SchedulerStepInputs {
-                plan: &plan,
-                checkpoint_dl_handle,
-                checkpoint_names_list,
-                epoch_counter_var,
-                has_dataloader,
-                lr_var,
-                param_list,
-                state_list_1,
-                state_list_2,
-                step_count_var,
-            },
+            SchedulerStepInputs { plan: &plan, emit: &emit },
         )?;
 
         // 7i. Callbacks: compile on_step body with step_count and loss bound
