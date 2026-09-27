@@ -10427,6 +10427,15 @@ mod tests {
         all.push((nsl_kir::kernels::dequant::FP8_E4M3_NAME, super::fused_kernels::dequant_fp8_e4m3_f32_ptx(), true));
         all.push((nsl_kir::kernels::dropout::DROPOUT_NAME, super::fused_kernels::dropout_f32_ptx(), true));
         all.push((nsl_kir::kernels::data_movement::GATHER_DIM_NAME, super::fused_kernels::gather_dim_f32_ptx(), true));
+        for (op, module) in [
+            (nsl_kir::kernels::muon_batch::MuonBatchOp::Mom, super::fused_kernels::muon_batch_mom_f32_ptx()),
+            (nsl_kir::kernels::muon_batch::MuonBatchOp::Sumsq, super::fused_kernels::muon_batch_sumsq_f32_ptx()),
+            (nsl_kir::kernels::muon_batch::MuonBatchOp::Pack, super::fused_kernels::muon_batch_pack_f32_ptx()),
+            (nsl_kir::kernels::muon_batch::MuonBatchOp::Poly, super::fused_kernels::muon_batch_poly_f32_ptx()),
+            (nsl_kir::kernels::muon_batch::MuonBatchOp::Update, super::fused_kernels::muon_batch_update_f32_ptx()),
+        ] {
+            all.push((op.kernel_name(), module, true));
+        }
         all.push(("nsl_strided_copy_f32", super::fused_kernels::strided_copy_f32_ptx(), true));
         all.push(("nsl_slice_f32", super::fused_kernels::slice_f32_ptx(), true));
         all

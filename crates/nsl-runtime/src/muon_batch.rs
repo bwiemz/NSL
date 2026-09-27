@@ -191,8 +191,8 @@ fn run_chunk(
     weight_decay: f64,
 ) {
     use crate::cuda::fused_kernels::{
-        MUON_BATCH_MOM_F32_PTX, MUON_BATCH_PACK_F32_PTX, MUON_BATCH_POLY_F32_PTX,
-        MUON_BATCH_SUMSQ_F32_PTX, MUON_BATCH_UPDATE_F32_PTX,
+        muon_batch_mom_f32_ptx, muon_batch_pack_f32_ptx, muon_batch_poly_f32_ptx,
+        muon_batch_sumsq_f32_ptx, muon_batch_update_f32_ptx,
     };
 
     let n = (r * c) as i64;
@@ -219,7 +219,7 @@ fn run_chunk(
             &mut a3 as *mut _ as *mut std::ffi::c_void,
         ];
         launch(
-            MUON_BATCH_MOM_F32_PTX,
+            muon_batch_mom_f32_ptx(),
             b"nsl_muon_batch_mom_f32\0",
             grid_n,
             blk,
@@ -246,7 +246,7 @@ fn run_chunk(
             &mut a5 as *mut _ as *mut std::ffi::c_void,
         ];
         launch(
-            MUON_BATCH_SUMSQ_F32_PTX,
+            muon_batch_sumsq_f32_ptx(),
             b"nsl_muon_batch_sumsq_f32\0",
             [k, 1, 1],
             blk,
@@ -281,7 +281,7 @@ fn run_chunk(
             &mut a9 as *mut _ as *mut std::ffi::c_void,
         ];
         launch(
-            MUON_BATCH_PACK_F32_PTX,
+            muon_batch_pack_f32_ptx(),
             b"nsl_muon_batch_pack_f32\0",
             grid_n,
             blk,
@@ -365,7 +365,7 @@ fn run_chunk(
                 &mut a6 as *mut _ as *mut std::ffi::c_void,
             ];
             launch(
-                MUON_BATCH_POLY_F32_PTX,
+                muon_batch_poly_f32_ptx(),
                 b"nsl_muon_batch_poly_f32\0",
                 [(r2 + BLOCK - 1) / BLOCK, k, 1],
                 blk,
@@ -427,7 +427,7 @@ fn run_chunk(
             &mut a6 as *mut _ as *mut std::ffi::c_void,
         ];
         launch(
-            MUON_BATCH_UPDATE_F32_PTX,
+            muon_batch_update_f32_ptx(),
             b"nsl_muon_batch_update_f32\0",
             grid_n,
             blk,
