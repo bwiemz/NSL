@@ -1026,8 +1026,18 @@ frozen throughout, so nothing here blocks a kernel fix.
         equivalent mutant, since the nibble masks remove the sign.
       - **SASS:** the same registers and floating-point instructions as
         the hand kernels on sm_80/90/120.
-      - **Still hand-written:** the fp8 E4M3 decoder, which has its own
-        interpreter gate in `nsl-runtime` (`fp8_e4m3_dequant_interp`).
+      - **The fp8 E4M3 decoder,** `nsl_dequant_fp8_e4m3_f32`, followed
+        (`build_fp8_e4m3`). It builds normals by bit assembly, zero and
+        subnormals as `m · 2^-9` with the sign OR-ed back in, and the
+        quiet NaN for `S.1111.111`. It uses `U8` and `Bitcast`.
+        - **Gates:** `fp8_e4m3_kir_equivalence` requires the hand kernel's
+          bytes and the restated OCP value for all 256 codes, and kills
+          the mutants of every field constant, both branches and each OR.
+          Widening the sign mask from 1 to 3 is named as an equivalent
+          mutant. `nsl-runtime`'s `fp8_e4m3_dequant_interp` now runs the
+          KIR module the runtime launches, against the OCP reference and
+          the CPU decoder.
+        - **SASS:** registers 10/10/10 against 10/9/12.
     - **`fused_kernels.rs`, dropout.** `nsl_dropout_f32` is in
       `nsl_kir::kernels::dropout`: the 32-bit multiply-xorshift hash of
       `seed + i`, a strict unsigned threshold compare, and two `selp`s
