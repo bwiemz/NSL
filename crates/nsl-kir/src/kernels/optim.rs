@@ -149,6 +149,56 @@ pub fn fase_adamw_step_ptx() -> Vec<u8> {
     verified_ptx(build_fase_adamw_step())
 }
 
+/// `base[idx]` for a table of `elem` and a u64 index.
+fn table_load(b: &mut KirBuilder, base: VarId, idx: VarId, elem: KirType) -> VarId {
+    let addr = b.new_typed_var(KirType::Ptr(Box::new(elem.clone()), AddressSpace::Global));
+    b.emit(KirOp::PtrOffset(addr, base, idx));
+    let v = b.new_typed_var(elem);
+    b.emit(KirOp::Load(v, addr, AddressSpace::Global));
+    v
+}
+
+fn widen_u64(b: &mut KirBuilder, x: VarId) -> VarId {
+    let w = b.new_typed_var(KirType::U64);
+    b.emit(KirOp::Cast(w, x, KirType::U64));
+    w
+}
+
+/// The multi-tensor kernels' flat-grid header.
+struct MultiHeader {
+    /// The block's parameter index, widened.
+    param: VarId,
+    /// The element within that parameter, `bbtab[b] + tid`, in 32 bits.
+    e32: VarId,
+    /// The block the element's work goes in (the builder is left in it).
+    body: crate::kernel_ir::BlockId,
+    exit: crate::kernel_ir::BlockId,
+}
+
+/// `p = bptab[b]; e = bbtab[b] + tid (u32); if e >= ntab[p] { exit }`. The
+/// kernel reads neither `%ntid` nor `%nctaid`.
+fn multi_header(b: &mut KirBuilder, bptab: VarId, bbtab: VarId, ntab: VarId) -> MultiHeader {
+    let entry = b.new_block();
+    let body = b.new_block();
+    let exit = b.new_block();
+    b.set_block(entry);
+    let blk = b.new_typed_var(KirType::U32);
+    b.emit(KirOp::BlockIdx(blk, 0));
+    let blk = widen_u64(b, blk);
+    let param = table_load(b, bptab, blk, KirType::U32);
+    let first = table_load(b, bbtab, blk, KirType::U32);
+    let tid = b.new_typed_var(KirType::U32);
+    b.emit(KirOp::ThreadId(tid, 0));
+    let e32 = b.new_typed_var(KirType::U32);
+    b.emit(KirOp::Add(e32, first, tid));
+    let param = widen_u64(b, param);
+    let len = table_load(b, ntab, param, KirType::U32);
+    let past = b.new_typed_var(KirType::Bool);
+    b.emit(KirOp::Cmp(past, e32, len, CmpOp::Ge));
+    b.terminate(KirTerminator::CondBranch(past, KirEdge::to(exit), KirEdge::to(body)));
+    MultiHeader { param, e32, body, exit }
+}
+
 /// The multi-tensor entry name the runtime launches.
 pub const FASE_ADAMW_MULTI_NAME: &str = "nsl_fase_fused_adamw_multi_f32";
 
@@ -194,44 +244,14 @@ pub fn build_fase_adamw_multi() -> KernelIR {
     let bbtab = b.add_param("bbtab", u32_ptr(), Global);
     let mp_scale = b.add_param("mp_scale", KirType::F32, Global);
 
-    let entry = b.new_block();
-    let body = b.new_block();
-    let exit = b.new_block();
-    b.set_block(entry);
-    // `ptr[idx]` for a u32 table and a u64 index.
-    let load_at = |b: &mut KirBuilder, base: VarId, idx: VarId, elem: KirType| {
-        let addr = b.new_typed_var(KirType::Ptr(Box::new(elem.clone()), Global));
-        b.emit(KirOp::PtrOffset(addr, base, idx));
-        let v = b.new_typed_var(elem);
-        b.emit(KirOp::Load(v, addr, Global));
-        v
-    };
-    let widen = |b: &mut KirBuilder, x: VarId| {
-        let w = b.new_typed_var(KirType::U64);
-        b.emit(KirOp::Cast(w, x, KirType::U64));
-        w
-    };
-    let blk = b.new_typed_var(KirType::U32);
-    b.emit(KirOp::BlockIdx(blk, 0));
-    let blk = widen(&mut b, blk);
-    let param = load_at(&mut b, bptab, blk, KirType::U32);
-    let first = load_at(&mut b, bbtab, blk, KirType::U32);
-    let tid = b.new_typed_var(KirType::U32);
-    b.emit(KirOp::ThreadId(tid, 0));
-    let e32 = b.new_typed_var(KirType::U32);
-    b.emit(KirOp::Add(e32, first, tid));
-    let param = widen(&mut b, param);
-    let len = load_at(&mut b, ntab, param, KirType::U32);
-    let past = b.new_typed_var(KirType::Bool);
-    b.emit(KirOp::Cmp(past, e32, len, CmpOp::Ge));
-    b.terminate(KirTerminator::CondBranch(past, KirEdge::to(exit), KirEdge::to(body)));
+    let MultiHeader { param, e32, body, exit } = multi_header(&mut b, bptab, bbtab, ntab);
 
     b.set_block(body);
-    let theta = load_at(&mut b, ttab, param, f32_ptr());
-    let m = load_at(&mut b, mtab, param, f32_ptr());
-    let v = load_at(&mut b, vtab, param, f32_ptr());
-    let mp = load_at(&mut b, mptab, param, f32_ptr());
-    let i = widen(&mut b, e32);
+    let theta = table_load(&mut b, ttab, param, f32_ptr());
+    let m = table_load(&mut b, mtab, param, f32_ptr());
+    let v = table_load(&mut b, vtab, param, f32_ptr());
+    let mp = table_load(&mut b, mptab, param, f32_ptr());
+    let i = widen_u64(&mut b, e32);
     let th = load_f32(&mut b, theta, i);
     let mi = load_f32(&mut b, m, i);
     let vi = load_f32(&mut b, v, i);
@@ -423,26 +443,35 @@ pub fn build_fase_adamw_step_bf16sr() -> KernelIR {
     let ctr_base = b.add_param("sr_ctr_base", KirType::U64, Global);
 
     let (i, _, exit) = index_and_bound(&mut b, n);
-    // θ: bf16 bits, widened exactly.
-    let addr = b.new_typed_var(u16_ptr());
-    b.emit(KirOp::PtrOffset(addr, theta, i));
-    let h = b.new_typed_var(KirType::U16);
-    b.emit(KirOp::Load(h, addr, Global));
-    let w = b.new_typed_var(KirType::U32);
-    b.emit(KirOp::Cast(w, h, KirType::U32));
-    let w = u32_imm(&mut b, KirOp::Shl, w, 16);
-    let th = b.new_typed_var(KirType::F32);
-    b.emit(KirOp::Bitcast(th, w));
+    let th = load_bf16(&mut b, theta, i);
     let mi = load_f32(&mut b, m, i);
     let vi = load_f32(&mut b, v, i);
     let g = load_f32(&mut b, mp, i);
     let th_next = adamw_update(&mut b, &s, (th, mi, vi, g), m, v, i);
-
-    let bits = b.new_typed_var(KirType::U32);
-    b.emit(KirOp::Bitcast(bits, th_next));
-    let out = sr_bf16_bits(&mut b, bits, i, key, ctr_base);
-    store_u16(&mut b, theta, i, out);
+    store_bf16_sr(&mut b, theta, i, th_next, key, ctr_base);
     finish(b, exit)
+}
+
+/// `base[i]`, a bf16, widened exactly to f32: `bits << 16`, `mov.b32`.
+fn load_bf16(b: &mut KirBuilder, base: VarId, i: VarId) -> VarId {
+    let addr = b.new_typed_var(u16_ptr());
+    b.emit(KirOp::PtrOffset(addr, base, i));
+    let h = b.new_typed_var(KirType::U16);
+    b.emit(KirOp::Load(h, addr, AddressSpace::Global));
+    let w = b.new_typed_var(KirType::U32);
+    b.emit(KirOp::Cast(w, h, KirType::U32));
+    let w = u32_imm(b, KirOp::Shl, w, 16);
+    let x = b.new_typed_var(KirType::F32);
+    b.emit(KirOp::Bitcast(x, w));
+    x
+}
+
+/// `base[i] = sr_bf16(x)` with the counter `ctr_base + i`.
+fn store_bf16_sr(b: &mut KirBuilder, base: VarId, i: VarId, x: VarId, key: VarId, ctr_base: VarId) {
+    let bits = b.new_typed_var(KirType::U32);
+    b.emit(KirOp::Bitcast(bits, x));
+    let out = sr_bf16_bits(b, bits, i, key, ctr_base);
+    store_u16(b, base, i, out);
 }
 
 /// [`build_fase_adamw_step_bf16sr`], lowered to a NUL-terminated PTX module.
@@ -452,6 +481,73 @@ pub fn build_fase_adamw_step_bf16sr() -> KernelIR {
 /// If the built kernel fails verification: a bug in this module.
 pub fn fase_adamw_step_bf16sr_ptx() -> Vec<u8> {
     verified_ptx(build_fase_adamw_step_bf16sr())
+}
+
+/// The multi-tensor SR-BF16 step's entry name.
+pub const FASE_ADAMW_MULTI_BF16SR_NAME: &str = "nsl_fase_fused_adamw_multi_bf16sr";
+
+/// `nsl_fase_fused_adamw_multi_bf16sr`: [`build_fase_adamw_step_bf16sr`]
+/// over every parameter in one launch, on [`build_fase_adamw_multi`]'s flat
+/// grid.
+///
+/// Signature `(ttab, mtab, vtab, mptab, ntab, b1, omb1, b2, omb2, eps,
+/// neg_lr, neg_lr_wd, bc1, bc2, has_wd, sr_key, ctrtab, bptab, bbtab)`.
+/// `ttab` holds bf16 θ pointers, `ctrtab` one `u64` SR counter base per
+/// parameter; element `e` of parameter `p` rounds with the counter
+/// `ctrtab[p] + e`, exactly the per-parameter kernel's `sr_ctr_base + i`.
+///
+/// Per element it is the per-parameter SR step, with neither of the f32
+/// multi kernel's extras: no `mp_scale` (the SR path has no two-phase clip
+/// to fold in) and no `mp` zeroing (the per-parameter SR kernel leaves `mp`
+/// to the FASE-Deferred lifecycle, and this kernel replaces it
+/// observationally).
+///
+/// ```text
+/// entry:  p = bptab[b]; e = bbtab[b] + tid (u32); if e >= ntab[p] exit
+/// body:   bases and ctrtab[p] from the tables; θ (bf16), m, v, mp at e
+///         the single-parameter body; wd branch; SR tail; θ[e] stored
+/// ```
+pub fn build_fase_adamw_multi_bf16sr() -> KernelIR {
+    use AddressSpace::Global;
+    let mut b = KirBuilder::new(FASE_ADAMW_MULTI_BF16SR_NAME);
+    let table = |elem: KirType| KirType::Ptr(Box::new(elem), Global);
+    let ttab = b.add_param("ttab", table(u16_ptr()), Global);
+    let mtab = b.add_param("mtab", table(f32_ptr()), Global);
+    let vtab = b.add_param("vtab", table(f32_ptr()), Global);
+    let mptab = b.add_param("mptab", table(f32_ptr()), Global);
+    let ntab = b.add_param("ntab", table(KirType::U32), Global);
+    let s = add_adamw_scalars(&mut b);
+    let key = b.add_param("sr_key", KirType::U64, Global);
+    let ctrtab = b.add_param("ctrtab", table(KirType::U64), Global);
+    let bptab = b.add_param("bptab", table(KirType::U32), Global);
+    let bbtab = b.add_param("bbtab", table(KirType::U32), Global);
+
+    let MultiHeader { param, e32, body, exit } = multi_header(&mut b, bptab, bbtab, ntab);
+
+    b.set_block(body);
+    let theta = table_load(&mut b, ttab, param, u16_ptr());
+    let m = table_load(&mut b, mtab, param, f32_ptr());
+    let v = table_load(&mut b, vtab, param, f32_ptr());
+    let mp = table_load(&mut b, mptab, param, f32_ptr());
+    let ctr_base = table_load(&mut b, ctrtab, param, KirType::U64);
+    let i = widen_u64(&mut b, e32);
+    let th = load_bf16(&mut b, theta, i);
+    let mi = load_f32(&mut b, m, i);
+    let vi = load_f32(&mut b, v, i);
+    let g = load_f32(&mut b, mp, i);
+    let th_next = adamw_update(&mut b, &s, (th, mi, vi, g), m, v, i);
+    store_bf16_sr(&mut b, theta, i, th_next, key, ctr_base);
+    finish(b, exit)
+}
+
+/// [`build_fase_adamw_multi_bf16sr`], lowered to a NUL-terminated PTX
+/// module.
+///
+/// # Panics
+///
+/// If the built kernel fails verification: a bug in this module.
+pub fn fase_adamw_multi_bf16sr_ptx() -> Vec<u8> {
+    verified_ptx(build_fase_adamw_multi_bf16sr())
 }
 
 /// `nsl_sr_bf16_round_probe(src, dst, n, sr_key, sr_ctr_base)`: the SR-BF16
@@ -496,22 +592,29 @@ mod tests {
         for (ir, name) in [
             (build_sr_bf16_round_probe(), SR_BF16_ROUND_PROBE_NAME),
             (build_fase_adamw_step_bf16sr(), FASE_ADAMW_STEP_BF16SR_NAME),
+            (build_fase_adamw_multi_bf16sr(), FASE_ADAMW_MULTI_BF16SR_NAME),
         ] {
             crate::kir_verify::verify(&ir).unwrap_or_else(|e| panic!("{name}: {e:?}"));
             assert_eq!(ir.name, name);
         }
         let probe = String::from_utf8(sr_bf16_round_probe_ptx()).unwrap();
         let step = String::from_utf8(fase_adamw_step_bf16sr_ptx()).unwrap();
-        for p in [&probe, &step] {
+        let multi = String::from_utf8(fase_adamw_multi_bf16sr_ptx()).unwrap();
+        for p in [&probe, &step, &multi] {
             for c in [SR_SPLITMIX_GAMMA, SR_SPLITMIX_M1, SR_SPLITMIX_M2] {
                 assert_eq!(p.matches(&format!(", {c};")).count(), 1, "{c:#x}");
             }
             assert_eq!(p.matches("st.global.u16 ").count(), 1);
             assert_eq!(p.matches("cvt.u16.u32 ").count(), 1);
         }
-        assert_eq!(step.matches("mov.b32 ").count(), 2, "θ in, θ' out");
-        assert_eq!(step.matches("ld.global.u16 ").count(), 1);
-        assert_eq!(step.matches("div.approx.f32").count(), 1);
+        for p in [&step, &multi] {
+            assert_eq!(p.matches("mov.b32 ").count(), 2, "θ in, θ' out");
+            assert_eq!(p.matches("ld.global.u16 ").count(), 1);
+            assert_eq!(p.matches("div.approx.f32").count(), 1);
+            assert_eq!(p.matches("mul.rn.f32").count(), 9, "no mp_scale");
+            assert_eq!(p.matches("st.global.f32 ").count(), 2, "m and v only: no mp zeroing");
+        }
+        assert!(!multi.contains("%ntid"), "the element is bbtab[b] + tid: {multi}");
     }
 
     #[test]
