@@ -984,8 +984,19 @@ frozen throughout, so nothing here blocks a kernel fix.
       - **SASS:** the step issues the hand kernel's floating-point
         instructions (16/16/18 registers against 18/18/18), and the probe
         keeps the hand kernel's registers.
-      - **Still hand-written:** the multi-tensor
-        `nsl_fase_fused_adamw_multi_bf16sr`, next.
+      - **The multi-tensor SR step,** `nsl_fase_fused_adamw_multi_bf16sr`,
+        followed (`build_fase_adamw_multi_bf16sr`). It is assembled from
+        parts the other kernels already use: the f32 multi kernel's
+        flat-grid header (`multi_header`), the SR step's bf16 load, AdamW
+        body and tail, plus a `u64` counter table. Its gate,
+        `fase_adamw_multi_bf16sr_kir_equivalence`, requires the hand
+        kernel's bytes and the host reference at each parameter's own
+        counter. It also requires that every parameter is byte-identical to
+        the per-parameter kernel launched on it alone, which is the
+        contract the batching entry relies on.
+      - **SASS:** the same floating-point and memory instructions as the
+        hand kernel, in 20/20/22 registers against 22/22/24.
+      - Every FASE AdamW kernel is now KIR.
 12. **FA v2**, by phase directory, tier B.1 and B.2 last; the SASS
     baselines and the two no-spill gates already exist here and are the
     proof. `matmul_mma.rs` and `kernel_skeleton/` are deleted with their

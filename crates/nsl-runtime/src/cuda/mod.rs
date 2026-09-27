@@ -4750,7 +4750,7 @@ pub(crate) fn gpu_fase_fused_adamw_step_bf16sr_multi(
     ];
     let grid_x = blk_count as i64;
     let result = inner::kernel_launch(
-        kernels::FASE_FUSED_ADAMW_MULTI_BF16SR_PTX.as_ptr(),
+        kernels::fase_fused_adamw_multi_bf16sr_ptx().as_ptr(),
         b"nsl_fase_fused_adamw_multi_bf16sr\0".as_ptr(),
         [grid_x, 1, 1], [block, 1, 1], &args, 0,
     );
@@ -10347,13 +10347,14 @@ mod tests {
     /// for the newest of (its declared target, this floor).
     const MIN_PTXAS_GPU_ARCH: u32 = 75;
 
-    /// Assemble every hand-written PTX module in `kernels.rs` and `fused_kernels.rs`.
+    /// Assemble every hand-written PTX module in `fused_kernels.rs`, and every
+    /// runtime-loaded module (KIR-built ones included) in `extra_runtime_ptx`.
     ///
     /// These modules are only ever handed to `cuModuleLoadData`, so a syntax error
     /// in one stays invisible until a kernel launch fails on a real GPU. `ptxas`
     /// needs no GPU, only the CUDA toolkit, so this gate runs anywhere the
     /// toolkit is installed.
-    /// Runtime-loaded PTX that lives outside the two `ALL_PTX` tables, with a
+    /// Runtime-loaded PTX that lives outside the `ALL_PTX` table, with a
     /// flag for whether it is standalone-assemblable.
     ///
     /// Both PTX gates read this one list, so a module registered here is covered
@@ -10417,6 +10418,7 @@ mod tests {
         }
         all.push(("nsl_fase_fused_adamw_step_f32", super::kernels::fase_fused_adamw_step_f32_ptx(), true));
         all.push(("nsl_fase_fused_adamw_multi_f32", super::kernels::fase_fused_adamw_multi_f32_ptx(), true));
+        all.push(("nsl_fase_fused_adamw_multi_bf16sr", super::kernels::fase_fused_adamw_multi_bf16sr_ptx(), true));
         all.push((nsl_kir::kernels::optim::FASE_ADAMW_STEP_BF16SR_NAME, super::kernels::fase_fused_adamw_step_bf16sr_ptx(), true));
         all.push((nsl_kir::kernels::optim::SR_BF16_ROUND_PROBE_NAME, super::kernels::sr_bf16_round_probe_ptx(), true));
         all
@@ -10433,9 +10435,8 @@ mod tests {
 
         let mut failures = Vec::new();
         let extra = extra_runtime_ptx();
-        let modules = super::kernels::ALL_PTX
+        let modules = super::fused_kernels::ALL_PTX
             .iter()
-            .chain(super::fused_kernels::ALL_PTX.iter())
             .map(|(name, ptx)| (*name, *ptx))
             .chain(
                 extra
@@ -10503,8 +10504,8 @@ mod tests {
     /// may swallow, or asserts). Two such em-dashes -- in MAXPOOL2D_F32_PTX and
     /// COO_SPMM_F32_PTX -- shipped invalid for exactly this reason.
     ///
-    /// Coverage: the two registered kernel tables (`kernels::ALL_PTX` +
-    /// `fused_kernels::ALL_PTX`), plus the runtime-loaded PTX in the `cuda::`
+    /// Coverage: the registered kernel table (`fused_kernels::ALL_PTX`), the
+    /// KIR-built `kernels.rs` modules, plus the runtime-loaded PTX in the `cuda::`
     /// submodules that those tables omit -- the tier-B1 prepass kernels (which
     /// had NO ASCII guard before this), the precision-cast kernels (also
     /// covered by their own `built_ptx_modules_are_ascii`), and the shared
@@ -10515,12 +10516,11 @@ mod tests {
     /// `csha_cast_ptx_is_ascii_and_nul_terminated`).
     #[test]
     fn all_handwritten_ptx_is_pure_ascii() {
-        // Runtime-loaded PTX outside the two ALL_PTX tables comes from the
+        // Runtime-loaded PTX outside the ALL_PTX table comes from the
         // shared registry, which the ptxas gate reads too.
         let extra = extra_runtime_ptx();
-        let modules = super::kernels::ALL_PTX
+        let modules = super::fused_kernels::ALL_PTX
             .iter()
-            .chain(super::fused_kernels::ALL_PTX.iter())
             .map(|(name, ptx)| (*name, *ptx))
             .chain(extra.iter().map(|(name, ptx, _)| (*name, *ptx)));
         let mut failures = Vec::new();

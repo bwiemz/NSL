@@ -8,6 +8,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **The multi-tensor SR-BF16 AdamW step, `nsl_fase_fused_adamw_multi_bf16sr`,
+  is built by `nsl_kir::kernels::optim::build_fase_adamw_multi_bf16sr`** in
+  place of its hand-written constant (new-roadmap item 5). With it, every
+  FASE AdamW kernel is KIR.
+  - **One set of parts.** The kernel is the f32 multi kernel's flat-grid
+    header (`multi_header`: `p = bptab[b]`, `e = bbtab[b] + tid`, bound on
+    `ntab[p]`), the per-parameter SR step's bf16 load, AdamW body and SR
+    tail, and a `u64` counter table (`ctrtab[p] + e`). It has neither of
+    the f32 multi kernel's extras: no `mp_scale` and no `mp` zeroing. The
+    f32 multi and per-parameter SR kernels were refactored onto the same
+    helpers; their PTX is byte-identical to before.
+  - **The gate.** `tests/fase_adamw_multi_bf16sr_kir_equivalence.rs` (13
+    tests) runs the frozen hand kernel and the KIR one on the CTA
+    interpreter over a ragged parameter list with an empty member.
+    - It requires identical global memory under two schedules, with and
+      without decay, under four `(key, ctrtab)` sets. One set's counter
+      wraps `u64` inside a parameter.
+    - Each parameter must be the host `sr_bf16` reference applied to the
+      f32 step, at its own counter base. Crafted elements reach the
+      saturating carry.
+    - It also checks the batching contract: every parameter is
+      byte-identical to the per-parameter KIR kernel run on it alone at
+      `sr_ctr_base = ctrtab[p]`.
+    - It catches mutants of the bound, both indices, every element size,
+      every scalar and table slot, the counter add, each hash constant and
+      shift, each mask and special value, every branch and each arithmetic
+      operation.
+  - **SASS** on sm_80/90/120: the same floating-point and memory
+    instructions as the hand kernel, in fewer registers (20/20/22 against
+    22/22/24). The address arithmetic differs by −2/+8/+22 instructions:
+    KIR scales with `mul.lo.u64` where the hand kernel shifts.
+
 - **KIR gains a `U16` type and a `Bitcast` op. With them, the SR-BF16
   rounding probe and the single-parameter bf16 FASE AdamW step are built
   by `nsl_kir::kernels::optim` in place of their hand-written constants**

@@ -378,7 +378,6 @@ the transfer stream and the lease pool. `NSL_CUDA_SYNC=1` synchronises after
 every launch for bisecting async bugs.
 
 **Kernel launch path.** PTX is embedded as NUL-terminated `&str` constants:
-`src/cuda/kernels.rs` (elementwise, `.target sm_70`),
 `src/cuda/fused_kernels.rs` (embedding, bias, layernorm, rmsnorm, `sm_80`),
 `fused_ce_kernels.rs` / `fused_kl_ce_kernels.rs` (fused linear-CE and KL-CE
 losses), and `kernels_hopper.rs` (`sm_90a`, wgmma/TMA FlashAttention-3).
@@ -386,7 +385,7 @@ Some families are built rather than embedded: the precision casts
 (`precision_cast_kernels.rs`), the strided run copy (`strided_copy.rs`), the
 CSHA Tier B.1 pre-passes (`tier_b1_prepass.rs`), the binary, unary and scalar-operand
 elementwise kernels (their `div.approx` divisions included), the FASE scaled accumulate, Muon's inverse-norm scale, the
-activation-backward kernels, the clamp adjoint, the RoPE `rotate_half` pair, tanh and its tape-AD GELU adjoint, the f32 fused FASE AdamW steps (single- and multi-tensor), and the SR-BF16 single-parameter step and rounding probe (`kernels.rs`) are described as KIR in `nsl_kir::kernels` and lowered
+activation-backward kernels, the clamp adjoint, the RoPE `rotate_half` pair, tanh and its tape-AD GELU adjoint, the f32 fused FASE AdamW steps (single- and multi-tensor), and the SR-BF16 steps (single- and multi-tensor) and rounding probe (all of `src/cuda/kernels.rs`, which holds no hand-written PTX) are described as KIR in `nsl_kir::kernels` and lowered
 once, on first use, into a `OnceLock` whose stable address the module cache
 keys on (roadmap A2 steps 7 and 11). A launch is
 `load_module_once(ptx)` → `get_function(module, name)` →
