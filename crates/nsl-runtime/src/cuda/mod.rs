@@ -8964,7 +8964,6 @@ pub(crate) fn gpu_maxpool2d_f32(
 pub(crate) fn gpu_dropout_f32(input_ptr: i64, p: f64) -> (i64, i64) {
     inner::set_oom_context("dropout_f32");
     use crate::tensor::NslTensor;
-    use fused_kernels::DROPOUT_F32_PTX;
 
     let input = NslTensor::from_ptr_ref(input_ptr);
     assert_gpu_f32(input, "dropout_f32", "input");
@@ -9011,7 +9010,7 @@ pub(crate) fn gpu_dropout_f32(input_ptr: i64, p: f64) -> (i64, i64) {
     let grid = ((len as i64) + block - 1) / block;
 
     let result = inner::kernel_launch(
-        DROPOUT_F32_PTX.as_ptr(), b"nsl_dropout_f32\0".as_ptr(),
+        fused_kernels::dropout_f32_ptx().as_ptr(), b"nsl_dropout_f32\0".as_ptr(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU dropout kernel failed: {:?}", result);
@@ -10416,6 +10415,7 @@ mod tests {
         all.push((nsl_kir::kernels::optim::FASE_ADAMW_STEP_BF16SR_NAME, super::kernels::fase_fused_adamw_step_bf16sr_ptx(), true));
         all.push((nsl_kir::kernels::optim::SR_BF16_ROUND_PROBE_NAME, super::kernels::sr_bf16_round_probe_ptx(), true));
         all.push((nsl_kir::kernels::data_movement::BIAS_ADD_NAME, super::fused_kernels::bias_add_f32_ptx(), true));
+        all.push((nsl_kir::kernels::dropout::DROPOUT_NAME, super::fused_kernels::dropout_f32_ptx(), true));
         all.push((nsl_kir::kernels::data_movement::GATHER_DIM_NAME, super::fused_kernels::gather_dim_f32_ptx(), true));
         all.push(("nsl_strided_copy_f32", super::fused_kernels::strided_copy_f32_ptx(), true));
         all.push(("nsl_slice_f32", super::fused_kernels::slice_f32_ptx(), true));
