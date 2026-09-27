@@ -16,11 +16,13 @@
 //!    (`c` aliasing `a`, as `gpu_elementwise_binary_inplace` launches).
 //! 2. **Correctness**: `c[i]` is the IEEE f32 `a[i] op b[i]` for every
 //!    `i < n` (NaN, infinities, signed zeros, subnormals and overflow among
-//!    the inputs), and nothing past `n` is written.
-//! 3. **The spelling**: the interpreter models `div.approx.f32` as the IEEE
-//!    quotient, so `div.approx` → `div.rn` is invisible to execution; on the
-//!    machine the two differ by up to 2 ulp. The division's mnemonic is
-//!    pinned against the hand module instead.
+//!    the inputs), and nothing past `n` is written. The division is
+//!    `div.approx`'s documented result: `a * ±0` for a divisor of magnitude
+//!    in `(2^126, 2^128)`, where the reciprocal flushes.
+//! 3. **The spelling**: outside that range the interpreter models
+//!    `div.approx.f32` as the IEEE quotient, so `div.approx` → `div.rn` is
+//!    invisible to execution; on the machine the two differ by up to 2 ulp.
+//!    The division's mnemonic is pinned against the hand module instead.
 //! 4. **The gate bites**: relaxing the bound, nudging the element size,
 //!    swapping the operands of the subtraction or the division, or reading
 //!    the index from block 0 is caught.
@@ -65,8 +67,18 @@ fn apply(op: BinaryOp, x: f32, y: f32) -> f32 {
         BinaryOp::Add => x + y,
         BinaryOp::Sub => x - y,
         BinaryOp::Mul => x * y,
-        // The interpreter's `div.approx` is the IEEE quotient.
-        BinaryOp::Div => x / y,
+        BinaryOp::Div => div_approx(x, y),
+    }
+}
+
+/// `div.approx.f32` as the interpreter models it, after the PTX ISA: the IEEE
+/// quotient, except that a divisor of magnitude in `(2^126, 2^128)` flushes
+/// the reciprocal to zero, giving `x * ±0`.
+fn div_approx(x: f32, y: f32) -> f32 {
+    if y.is_finite() && y.abs() > f32::from_bits(0x7E80_0000) {
+        x * 0.0f32.copysign(y)
+    } else {
+        x / y
     }
 }
 
