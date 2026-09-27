@@ -31,6 +31,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
       the product.
   - **SASS** on sm_80/90/120: the same instruction mix. Registers are
     12/16/14 against 12/13/12, with no occupancy effect at 256 threads.
+- **The int8 and int4 KV dequantization kernels are built by
+  `nsl_kir::kernels::dequant`** in place of their hand-written constants
+  (new-roadmap item 5): `nsl_dequant_int8_per_head_f32`,
+  `nsl_dequant_int8_per_token_f32` and `nsl_dequant_int4_per_group_f32`.
+  - **KIR gains `KirType::U8`**, an unsigned byte in a 32-bit `%r` register,
+    as `U16` is for 16 bits: `.u8` loads and stores, `cvt.u32.u8`. The int4
+    kernel reads its packed nibbles through it. The int8 pair loads `s8`
+    through the existing `I8`.
+  - **The kernels** keep the hand kernels' sequence:
+    - int8: a sign-extending byte load and an exact `cvt.rn.f32.s8`, times
+      the head's or the token's scale (a bare `mul.f32`);
+    - int4: the low nibble first, then one `fma.rn` of nibble, scale and
+      zero point.
+  - **The gate.** `tests/dequant_kir_equivalence.rs` (13 tests) runs the
+    frozen hand kernels and the KIR ones on the CTA interpreter. The
+    interpreter gained `cvt.rn.f32.s16` and `cvt.u32.u8` for them.
+    - It requires identical global memory under two schedules and several
+      layouts, for every byte value and scales and zero points with signed
+      zeros, subnormals, infinities and NaN.
+    - It checks each formula bit for bit, and that the int4 result is
+      fused, on a case where one rounding and two differ.
+    - It kills mutants of the bound, the block index, every element size
+      and parameter slot, the scale index arithmetic, the signed widening
+      and every part of the nibble unpack.
+  - **SASS** on sm_80/90/120: the same registers and floating-point
+    instructions as the hand kernels.
 - **The multi-tensor SR-BF16 AdamW step, `nsl_fase_fused_adamw_multi_bf16sr`,
   is built by `nsl_kir::kernels::optim::build_fase_adamw_multi_bf16sr`** in
   place of its hand-written constant (new-roadmap item 5). With it, every

@@ -1174,7 +1174,8 @@ review. See `docs/wiki/GPU-Test-Harness.md` and `docs/wiki/Testing-Strategy.md`.
    (`mov.b32` / `mov.b64`, e.g. an f32 and its IEEE pattern), where `Cast`
    converts the value. `KirType::U16` holds raw 16-bit storage bits (bf16
    and the like) in a 32-bit register: `.u16` loads and stores, and
-   `cvt.u32.u16` / `cvt.u16.u32` to widen and narrow. The Metal, WGSL and
+   `cvt.u32.u16` / `cvt.u16.u32` to widen and narrow. `KirType::U8` is the
+   same for a byte (`.u8`, `cvt.u32.u8`). The Metal, WGSL and
    AMDGPU printers lower neither `Cast` nor `Bitcast` yet.
 2. Lower with `backend_ptx::lower_kir_to_ptx` at the launch site and embed
    the bytes the way `Compiler::compile_kernels` does (`declare_data` /
