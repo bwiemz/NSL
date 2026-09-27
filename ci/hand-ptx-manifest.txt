@@ -61,6 +61,5 @@ crates/nsl-codegen/src/wrga_fused_ptx.rs
 crates/nsl-codegen/src/wrga_kernel_helpers.rs
 crates/nsl-kir/src/backend_ptx.rs
 crates/nsl-runtime/src/cuda/fused_kernels.rs
-crates/nsl-runtime/src/cuda/kernels.rs
 crates/nsl-runtime/src/cuda/kernels_hopper.rs
 crates/nsl-runtime/src/flash_attention.rs

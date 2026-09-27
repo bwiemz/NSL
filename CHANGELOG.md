@@ -31,6 +31,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
       the product.
   - **SASS** on sm_80/90/120: the same instruction mix. Registers are
     12/16/14 against 12/13/12, with no occupancy effect at 256 threads.
+- **The multi-tensor SR-BF16 AdamW step, `nsl_fase_fused_adamw_multi_bf16sr`,
+  is built by `nsl_kir::kernels::optim::build_fase_adamw_multi_bf16sr`** in
+  place of its hand-written constant (new-roadmap item 5). With it, every
+  FASE AdamW kernel is KIR.
+  - **One set of parts.** The kernel is the f32 multi kernel's flat-grid
+    header (`multi_header`: `p = bptab[b]`, `e = bbtab[b] + tid`, bound on
+    `ntab[p]`), the per-parameter SR step's bf16 load, AdamW body and SR
+    tail, and a `u64` counter table (`ctrtab[p] + e`). It has neither of
+    the f32 multi kernel's extras: no `mp_scale` and no `mp` zeroing. The
+    f32 multi and per-parameter SR kernels were refactored onto the same
+    helpers; their PTX is byte-identical to before.
+  - **The gate.** `tests/fase_adamw_multi_bf16sr_kir_equivalence.rs` (13
+    tests) runs the frozen hand kernel and the KIR one on the CTA
+    interpreter over a ragged parameter list with an empty member.
+    - It requires identical global memory under two schedules, with and
+      without decay, under four `(key, ctrtab)` sets. One set's counter
+      wraps `u64` inside a parameter.
+    - Each parameter must be the host `sr_bf16` reference applied to the
+      f32 step, at its own counter base. Crafted elements reach the
+      saturating carry.
+    - It also checks the batching contract: every parameter is
+      byte-identical to the per-parameter KIR kernel run on it alone at
+      `sr_ctr_base = ctrtab[p]`.
+    - It catches mutants of the bound, both indices, every element size,
+      every scalar and table slot, the counter add, each hash constant and
+      shift, each mask and special value, every branch and each arithmetic
+      operation.
+  - **SASS** on sm_80/90/120: the same floating-point and memory
+    instructions as the hand kernel, in fewer registers (20/20/22 against
+    22/22/24). The address arithmetic differs by −2/+8/+22 instructions:
+    KIR scales with `mul.lo.u64` where the hand kernel shifts.
 
 - **Four data-movement kernels from `cuda/fused_kernels.rs` are built by
   `nsl_kir::kernels::data_movement`** in place of their hand-written
@@ -1349,6 +1380,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   restored to their pre-700bfaa8 structural assertions now that R7 is retired.
 
 ### Changed
+
+- **The train-block driver's planning order is a value: `PASS_ORDER`**
+  (roadmap A1, `TrainPlan` step 4a).
+  - **The table.** `stmt_train/pass_order.rs` lists the 17 planning steps
+    `compile_train_block` runs, in order. It runs from the CPDT pre-plan
+    offer and the FASE contract, through the admissions, extraction, CPKD,
+    WGGO, CSHA and the prune, WRGA and CPDT, the CCR plan and adjoint
+    generation, to the adjoint passes, the arena projection and the CSLA
+    precompute. Each step names its stage, the registry passes it
+    schedules, its file and the call the driver makes.
+  - **The gate.** `tests/train_pass_order.rs` (8 tests) holds the table to
+    the tree:
+    - The driver makes the calls in table order, and each call is defined
+      where the table says.
+    - The `schedule` sites in the driver's files are exactly the table's
+      `(file, pass)` pairs, and every `TrainBlock`-phase registry pass has
+      a step.
+    - The table inverts none of the pass bus's `InvocationOrdered` edges.
+      Reversed, it is refused.
+    - Stages never go backwards, and no tape-touching pass precedes
+      extraction.
+  - **No behaviour change.** The driver still makes the calls itself; the
+    CLIF snapshots are untouched. Wrapping the rows whose inputs are
+    already plan facts in a `TrainPass` trait is step 4b.
 
 - **The train block's late emitters take their setup handles as one
   `EmitState`** (roadmap A1, `TrainPlan` step 3).
