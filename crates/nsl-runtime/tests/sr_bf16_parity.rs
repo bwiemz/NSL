@@ -1,10 +1,11 @@
 //! P4 item 17: GPU/CPU bit-parity for the SR-BF16 rounding tail.
 //!
-//! The PTX kernels (`FASE_FUSED_ADAMW_STEP_BF16SR_PTX`, probe) and the CPU
-//! reference (`sr_bf16::sr_bf16_round_counter`) must agree BIT-FOR-BIT: the
-//! dither hash is pure integer arithmetic and the rounding rule is pure bit
-//! manipulation, so any divergence is a defect, not numerics. The probe
-//! kernel duplicates the fused kernel's exact tail so this gate covers the
+//! The PTX kernels (`nsl_fase_fused_adamw_step_bf16sr` and the probe, both
+//! built by `nsl_kir::kernels::optim`) and the CPU reference
+//! (`sr_bf16::sr_bf16_round_counter`) must agree BIT-FOR-BIT: the dither hash
+//! is pure integer arithmetic and the rounding rule is pure bit manipulation,
+//! so any divergence is a defect, not numerics. The probe's tail comes from
+//! the same KIR helper as the fused kernel's, so this gate covers the
 //! production rounding path without needing to reproduce div.approx-based
 //! optimizer arithmetic on the host.
 

@@ -1628,6 +1628,7 @@ pub(crate) fn kir_op_kind_name(op: &KirOp) -> &'static str {
         KirOp::Tanh(..) => "Tanh",
         KirOp::Pow(..) => "Pow",
         KirOp::Cast(..) => "Cast",
+        KirOp::Bitcast(..) => "Bitcast",
         KirOp::Load(..) => "Load",
         KirOp::Store(..) => "Store",
         KirOp::AtomicAdd(..) => "AtomicAdd",

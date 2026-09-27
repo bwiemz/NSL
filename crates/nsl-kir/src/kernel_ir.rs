@@ -123,6 +123,13 @@ pub enum KirType {
     // I16 → intermediate headroom dtype (spec §4.6 headroom math)
     I8,
     I16,
+    /// An unsigned 16-bit integer in a 32-bit `%r` register. It carries raw
+    /// 16-bit storage bits: a `.u16` load zero-extends into the register, a
+    /// `.u16` store writes its low half, and `Cast` to or from `U32` is
+    /// `cvt.u32.u16` / `cvt.u16.u32`. PTX lets `ld`, `st` and `cvt` take a
+    /// register wider than their type. The bf16 stochastic-rounding kernels
+    /// use it for their bf16 bits (new-roadmap item 5).
+    U16,
     F16,
     Bf16,
     F32,
@@ -155,7 +162,7 @@ impl KirType {
     pub fn size_bytes(&self) -> usize {
         match self {
             KirType::Bool | KirType::I8 | KirType::Tq2Packed | KirType::TernaryUnpacked => 1,
-            KirType::I16 | KirType::F16 | KirType::Bf16 => 2,
+            KirType::I16 | KirType::U16 | KirType::F16 | KirType::Bf16 => 2,
             KirType::U32 | KirType::I32 | KirType::F32 => 4,
             KirType::U64 | KirType::I64 | KirType::F64 => 8,
             KirType::Ptr(_, _) => 8,
@@ -167,7 +174,7 @@ impl KirType {
     pub fn ptx_reg_prefix(&self) -> &'static str {
         match self {
             KirType::U32 | KirType::I32
-            | KirType::I8 | KirType::I16
+            | KirType::I8 | KirType::I16 | KirType::U16
             | KirType::Tq2Packed | KirType::TernaryUnpacked => "%r",
             // `setp` writes and `@%p` reads the predicate class (roadmap A2
             // step 5: the prefix said `%r` while every printer used `%p`).
@@ -192,6 +199,7 @@ impl KirType {
             KirType::I64 => "s64",
             KirType::I8 => "s8",
             KirType::I16 => "s16",
+            KirType::U16 => "u16",
             KirType::F16 => "f16",
             KirType::Bf16 => "bf16",
             KirType::F32 => "f32",
@@ -411,6 +419,12 @@ pub enum KirOp {
 
     // Type conversion
     Cast(VarId, VarId, KirType),
+    /// `dst = src` reinterpreted: the same bits under another type of the
+    /// same width, printed `mov.b32` / `mov.b64`. It works between the
+    /// 32-bit scalars (`U32`, `I32`, `F32`) or between the 64-bit ones
+    /// (`U64`, `I64`, `F64`). `Cast` converts the value; this keeps the bits
+    /// (`f32` ↔ its IEEE pattern).
+    Bitcast(VarId, VarId),
 
     // Memory
     Load(VarId, VarId, AddressSpace),

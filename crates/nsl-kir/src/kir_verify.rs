@@ -164,6 +164,10 @@ pub enum KirVerifyError {
     /// Rule 3: `DivApprox` on a type other than `f32`. PTX's approximate
     /// division exists only as `div.approx.f32`.
     ApproxDivNotF32 { block: BlockId, op_index: usize, found: KirType },
+    /// Rule 3: `Bitcast` between types that are not both 32-bit scalars
+    /// (`U32`/`I32`/`F32`) or both 64-bit scalars (`U64`/`I64`/`F64`).
+    /// `mov.bN` needs one width and one register size on each side.
+    BitcastWidth { block: BlockId, op_index: usize, from: KirType, to: KirType },
 }
 
 impl fmt::Display for KirVerifyError {
@@ -275,6 +279,10 @@ impl fmt::Display for KirVerifyError {
             KirVerifyError::ApproxDivNotF32 { block, op_index, found } => write!(
                 f,
                 "block {block} op {op_index}: div.approx exists only for f32, found {found:?}"
+            ),
+            KirVerifyError::BitcastWidth { block, op_index, from, to } => write!(
+                f,
+                "block {block} op {op_index}: a bitcast needs two 32-bit or two 64-bit scalars, found {from:?} -> {to:?}"
             ),
             KirVerifyError::BadVectorWidth { block, op_index, width } => write!(
                 f,
@@ -643,7 +651,7 @@ fn is_float(ty: &KirType) -> bool {
 fn is_integer(ty: &KirType) -> bool {
     matches!(
         ty,
-        KirType::U32 | KirType::I32 | KirType::U64 | KirType::I64 | KirType::I8 | KirType::I16
+        KirType::U32 | KirType::I32 | KirType::U64 | KirType::I64 | KirType::I8 | KirType::I16 | KirType::U16
     )
 }
 
@@ -705,6 +713,7 @@ pub fn op_dst(op: &KirOp) -> Option<VarId> {
         | KirOp::Cos(d, _)
         | KirOp::Tanh(d, _)
         | KirOp::Cast(d, _, _)
+        | KirOp::Bitcast(d, _)
         | KirOp::Load(d, _, _)
         | KirOp::ThreadId(d, _)
         | KirOp::BlockIdx(d, _)
@@ -789,6 +798,7 @@ pub fn op_uses(op: &KirOp) -> Vec<VarId> {
         | KirOp::Rsqrt(_, s)
         | KirOp::Exp2(_, s)
         | KirOp::Cast(_, s, _)
+        | KirOp::Bitcast(_, s)
         | KirOp::CastRounded { src: s, .. }
         | KirOp::LoadVec { ptr: s, .. }
         | KirOp::Vote { pred: s, .. }
@@ -1083,6 +1093,18 @@ fn check_types(
             check_types(ir, inner, block, op_index, errors);
         }
         KirOp::Cast(d, _, target) => expect(*d, "dst", target),
+        KirOp::Bitcast(d, s) => {
+            let width = |t: &KirType| match t {
+                KirType::U32 | KirType::I32 | KirType::F32 => Some(32),
+                KirType::U64 | KirType::I64 | KirType::F64 => Some(64),
+                _ => None,
+            };
+            if let (Some(to), Some(from)) = (ty(d), ty(s))
+                && (width(&to).is_none() || width(&to) != width(&from))
+            {
+                errors.push(KirVerifyError::BitcastWidth { block, op_index, from, to });
+            }
+        }
         KirOp::Load(d, p, _) => match ty(p) {
             Some(KirType::Ptr(pointee, _)) => expect(*d, "dst", &pointee),
             Some(found) => errors.push(KirVerifyError::NotAPointer { var: *p, block, op_index, found }),
@@ -2466,6 +2488,44 @@ mod tests {
         b.terminate(KirTerminator::Return);
         let errs = verify(&b.finalize()).unwrap_err();
         assert!(matches!(errs.as_slice(), [KirVerifyError::TypeMismatch { var, role: "b", .. }] if *var == n), "{errs:?}");
+    }
+
+    /// `Bitcast` needs one width on both sides, 32 or 64 bits, between
+    /// scalars: `mov.bN` cannot widen, narrow or reach a predicate.
+    #[test]
+    fn bitcast_is_same_width_between_scalars() {
+        let build = |from: KirType, value: ConstValue, to: KirType| {
+            let mut b = KirBuilder::new("bitcast");
+            let e = b.new_block();
+            b.set_block(e);
+            let x = b.new_typed_var(from.clone());
+            b.emit(KirOp::Const(x, KirConst { ty: from, value }));
+            let y = b.new_typed_var(to);
+            b.emit(KirOp::Bitcast(y, x));
+            b.terminate(KirTerminator::Return);
+            b.finalize()
+        };
+        for (from, value, to) in [
+            (KirType::F32, ConstValue::F32(1.5), KirType::U32),
+            (KirType::U32, ConstValue::U32(7), KirType::F32),
+            (KirType::I32, ConstValue::I32(-7), KirType::F32),
+            (KirType::F64, ConstValue::F64(1.5), KirType::U64),
+            (KirType::U64, ConstValue::U64(7), KirType::F64),
+        ] {
+            assert_eq!(verify(&build(from.clone(), value, to.clone())), Ok(()), "{from:?} -> {to:?}");
+        }
+        for (from, value, to) in [
+            (KirType::F32, ConstValue::F32(1.5), KirType::U64),
+            (KirType::U64, ConstValue::U64(7), KirType::F32),
+            (KirType::U32, ConstValue::U32(7), KirType::U16),
+            (KirType::U32, ConstValue::U32(7), KirType::Bool),
+        ] {
+            assert_eq!(
+                verify(&build(from.clone(), value, to.clone())),
+                Err(vec![KirVerifyError::BitcastWidth { block: 0, op_index: 1, from: from.clone(), to: to.clone() }]),
+                "{from:?} -> {to:?}"
+            );
+        }
     }
 
     /// `DivApprox` is f32-only and homogeneous: on f64 or an integer the
