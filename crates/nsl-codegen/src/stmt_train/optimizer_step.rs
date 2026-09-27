@@ -22,34 +22,21 @@ use cranelift_frontend::{FunctionBuilder, Variable};
 use crate::compiler::Compiler;
 use crate::context::FuncState;
 use crate::error::CodegenError;
+use crate::stmt_train::emit_state::EmitState;
 use crate::stmt_train::plan::TrainPlan;
 
 /// Every binding of `compile_train_block_inner` the optimizer step reads;
 /// names are the driver's.
 pub(crate) struct OptimizerStepInputs<'a> {
-    /// The gradient-accumulation buffer list (`None` = step on the direct grads).
-    pub(crate) accum_list: Option<Value>,
-    /// The CPDT per-parameter dtype-code lists (m, v).
-    pub(crate) cpdt_precision_dtypes: Option<(Value, Value)>,
-    pub(crate) fase_hook_active: bool,
-    /// AdamW parameter groups: the per-parameter decay-exempt flags.
-    pub(crate) decay_exempt_list: Option<Value>,
-    /// The direct gradient list (a null sentinel when the FASE hook consumed them).
-    pub(crate) grads_list: Value,
-    pub(crate) lr_var: Variable,
-    /// Computed once before the accumulation loop; read at the gate.
-    pub(crate) should_step_var: Variable,
-    pub(crate) step_count_var: Variable,
-    /// WGGO's per-parameter mode table (the unified dispatch arm).
-    pub(crate) mode_table_base: Option<Value>,
-    /// Muon's per-parameter route flags (`--muon-batch-ns`).
-    pub(crate) muon_route_list: Option<Value>,
-    pub(crate) num_params_val: Value,
-    pub(crate) param_list: Value,
-    pub(crate) state_list_1: Value,
-    pub(crate) state_list_2: Value,
     /// The block's planning-time facts (roadmap A1, TrainPlan step 1).
     pub(crate) plan: &'a TrainPlan,
+    /// The setup handles (roadmap A1, TrainPlan step 3).
+    pub(crate) emit: &'a EmitState,
+    pub(crate) fase_hook_active: bool,
+    /// The direct gradient list (a null sentinel when the FASE hook consumed them).
+    pub(crate) grads_list: Value,
+    /// Computed once before the accumulation loop; read at the gate.
+    pub(crate) should_step_var: Variable,
 }
 
 impl Compiler<'_> {
@@ -62,13 +49,16 @@ impl Compiler<'_> {
     ) -> Result<(), CodegenError> {
         let OptimizerStepInputs {
             plan,
+            fase_hook_active,
+            grads_list,
+            should_step_var,
+            emit,
+        } = inputs;
+        let EmitState {
             accum_list,
             cpdt_precision_dtypes,
-            fase_hook_active,
             decay_exempt_list,
-            grads_list,
             lr_var,
-            should_step_var,
             step_count_var,
             mode_table_base,
             muon_route_list,
@@ -76,7 +66,8 @@ impl Compiler<'_> {
             param_list,
             state_list_1,
             state_list_2,
-        } = inputs;
+            ..
+        } = *emit;
         // TrainPlan step 1 (roadmap A1): the facts this phase used to receive
         // as copied fields, read from the carrier under their old names so
         // the body below is unchanged.

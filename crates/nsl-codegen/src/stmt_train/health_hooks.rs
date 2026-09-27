@@ -13,32 +13,29 @@
 //! that turns a diagnostic on.
 
 use cranelift_codegen::ir::{InstBuilder, Value};
-use cranelift_frontend::{FunctionBuilder, Variable};
+use cranelift_frontend::FunctionBuilder;
 use cranelift_module::Module;
 
 use crate::compiler::Compiler;
 use crate::context::FuncState;
 use crate::error::CodegenError;
+use crate::stmt_train::emit_state::EmitState;
 use crate::stmt_train::plan::TrainPlan;
 use crate::stmt::parse_layer_idx_for_health;
 
 /// Every binding of `compile_train_block_inner` the per-step diagnostics
 /// read; names are the driver's.
 pub(crate) struct HealthHooksInputs<'a> {
+    /// The block's planning-time facts (roadmap A1, TrainPlan step 1).
+    pub(crate) plan: &'a TrainPlan,
+    /// The setup handles (roadmap A1, TrainPlan step 3).
+    pub(crate) emit: &'a EmitState,
     /// Whether the FASE-Deferred hook consumed the gradients (then `grads_list` is a null sentinel and the per-gradient hooks are skipped).
     pub(crate) fase_hook_active: bool,
     /// The per-batch gradient list.
     pub(crate) grads_list: Value,
     /// The loss tensor of this step.
     pub(crate) loss_val: Value,
-    /// `param_paths.len()` as an `iconst`.
-    pub(crate) num_params_val: Value,
-    /// The model parameter list.
-    pub(crate) param_list: Value,
-    /// The step counter variable.
-    pub(crate) step_count_var: Variable,
-    /// The block's planning-time facts (roadmap A1, TrainPlan step 1).
-    pub(crate) plan: &'a TrainPlan,
 }
 
 impl Compiler<'_> {
@@ -54,10 +51,14 @@ impl Compiler<'_> {
             fase_hook_active,
             grads_list,
             loss_val,
+            emit,
+        } = inputs;
+        let EmitState {
             num_params_val,
             param_list,
             step_count_var,
-        } = inputs;
+            ..
+        } = *emit;
         // TrainPlan step 1 (roadmap A1): the facts this phase used to receive
         // as copied fields, read from the carrier under their old names so
         // the body below is unchanged.

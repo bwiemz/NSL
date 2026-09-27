@@ -42,6 +42,48 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
     18/18/18. The probe keeps the hand kernel's registers (10/10/11). The
     rest is address arithmetic.
 
+- **`nsl_tanh_f32` and `nsl_gelu_backward_f32` are built by
+  `nsl_kir::kernels::elementwise` in place of their hand-written constants**
+  (new-roadmap item 5). They move with the saturation fix listed under
+  *Fixed*.
+  - **The kernels** (`build_tanh`, `build_gelu_backward`) keep the hand
+    kernels' arithmetic: bare, contractible operations, `ex2.approx`, then
+    `div.approx.f32`. Past `|v| = 43.5` (`TANH_SATURATION`) they saturate.
+  - **The gate.** `tests/tanh_gelu_backward_kir_equivalence.rs` (16 tests)
+    runs the frozen hand kernels and the KIR ones on the CTA interpreter.
+    - The hand kernels' failure reproduces on the interpreter.
+    - Where the hand kernels were right (`|x| ≤ 43.5`, `|k(x)| ≤ 43.5`),
+      it requires identical global memory under two schedules.
+    - Past that point it pins the limits, and over the whole range it
+      holds the kernels to the f64 formulas.
+    - It catches mutants of the bound, the block index, every element
+      size, the old clamp, both arms of every select, the quotient's
+      operands and each constant.
+    - `div.approx` → `div.rn` is a named equivalent mutant: the
+      saturation keeps the divisor out of the flush range.
+  - **The interpreter** models `div.approx.f32`'s documented flush range.
+    For `2^126 < |b| < 2^128` the result is `a * ±0`: 0, or NaN for an
+    infinite `a`.
+  - **SASS** on sm_80/90/120: tanh's floating-point sequence is the hand
+    kernel's, with one `FSETP.NEU`; ptxas turns the NaN `selp` into a
+    predicated quotient. The adjoint's is the hand kernel's plus two
+    `FSETP` and two `FSEL`. Registers are 12/14/12 (tanh) and 15/13/13
+    (adjoint), against 10 and 14.
+
+- **`nsl_div_f32` and `nsl_div_scalar_f32` are built by
+  `nsl_kir::kernels::elementwise` in place of their hand-written constants**
+  (new-roadmap item 5), as `BinaryOp::Div` and `ScalarOp::Div`, lowered to
+  `KirOp::DivApprox`. The approximate division is kept on purpose: the fused
+  kernels held bit-exact to decomposed chains divide the way these do.
+  - **The gates.** The hand modules are frozen beside their families'
+    (`elementwise_binary_hand.rs`, `elementwise_scalar_hand.rs`), and
+    `elementwise_binary_kir_equivalence` / `elementwise_scalar_kir_equivalence`
+    now cover the divisions: identical global memory under two schedules,
+    in and out of place, IEEE-corner inputs and scalars; `div.approx`
+    pinned in both modules with `div.approx` → `div.rn` a named equivalent
+    mutant; swapped operands and a neighbour's operation caught.
+  - **SASS** on sm_80/90/120: the same instruction count and
+    floating-point multiset; registers within two of the hand kernels'.
 - **`nsl_fase_fused_adamw_multi_f32` is built by
   `nsl_kir::kernels::optim` in place of its hand-written constant**
   (new-roadmap item 5, after the single-parameter step). It is the
@@ -785,6 +827,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **GPU `tanh` returned 0 for large inputs, and the tape-AD GELU gradient
+  returned NaN past `x ≈ 10`.**
+  - **The cause.** Both kernels compute `tanh(v)` as `(e − 1) / (e + 1)`
+    with `div.approx.f32`, which returns 0 for a divisor whose magnitude is
+    in `(2^126, 2^128)` and NaN for `∞ / ∞`.
+    - `nsl_tanh_f32` clamped its input at 44, inside that range. It
+      returned 0 for every `x` from about 43.67 up, `+∞` included, and for
+      NaN.
+    - `nsl_gelu_backward_f32` did not clamp. It returned garbage and then
+      NaN once `k = 0.0356774·x³ + 0.797885·x` passed the same point.
+  - **Now.** tanh clamps at 43.5, which gives ±1 in f32, and returns a
+    NaN input as it is. The adjoint's derivative takes its limits past
+    `|k| = 43.5`: 1 above, 0 below. Below that point both kernels are the
+    old ones bit for bit.
+  - **Other paths.** The CPU paths and the source-AD GELU backward were
+    not affected.
+
 - **The SwiGLU gate-backward peephole fires** (P5 item 20 slice B). It
   never had.
   - **Why it never fired.** `fuse_swiglu_gate_backward` looked for
@@ -1239,6 +1298,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- **The train block's late emitters take their setup handles as one
+  `EmitState`** (roadmap A1, `TrainPlan` step 3).
+  - **The change.** `stmt_train/emit_state.rs` holds the Cranelift handles
+    the setup phase produces: the parameter, route, exempt and checkpoint
+    name lists, the optimizer state lists, the accumulation buffers, the
+    CSLA window lists, the resume handles and the loop variables. The
+    driver builds it once, before the epoch loop.
+  - `OptimizerStepInputs`, `CslaWindowInputs`, `SchedulerStepInputs` and
+    `HealthHooksInputs` now take `plan: &TrainPlan` and `emit: &EmitState`,
+    plus only what one micro-batch produces: its gradients, its loss, its
+    `should_step` flag and the CSLA window's pending save.
+    `OptimizerStepInputs` went from 15 fields to 5, `CslaWindowInputs` from
+    16 to 4, and `SchedulerStepInputs` from 10 to 2.
+  - **No behaviour change.** Each emitter destructures `EmitState` under the
+    old names, so its body, and the CLIF it emits, is unchanged. The 28
+    CLIF snapshots pass untouched.
+  - **The gate.** `tests/train_plan_emit_state.rs` reads `EmitState`'s
+    fields and refuses any of them as a field of a late emitter's `Inputs`
+    struct.
 - **The train block's planning modules take facts, not Cranelift handles**
   (roadmap A1, `TrainPlan` step 2).
   - **The change.** `plan_wggo` took Muon's mode-table base `Value` only to

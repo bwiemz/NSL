@@ -1,8 +1,9 @@
 //! The differential equivalence gate for the binary elementwise kernels
-//! `nsl_add_f32`, `nsl_sub_f32` and `nsl_mul_f32` (roadmap A2 step 11).
+//! `nsl_add_f32`, `nsl_sub_f32` and `nsl_mul_f32` (roadmap A2 step 11), and
+//! `nsl_div_f32` (new-roadmap item 5, once KIR gained `div.approx`).
 //!
 //! The runtime carried them as hand-written PTX
-//! (`nsl_runtime::cuda::kernels::{ADD,SUB,MUL}_F32_PTX`); they are now built
+//! (`nsl_runtime::cuda::kernels::{ADD,SUB,MUL,DIV}_F32_PTX`); they are now built
 //! as KIR by `nsl_kir::kernels::elementwise`. This file runs the frozen hand
 //! modules (`tests/fixtures/elementwise_binary_hand.rs`) and the KIR ones
 //! side by side on the cooperative-CTA interpreter
@@ -15,10 +16,16 @@
 //!    (`c` aliasing `a`, as `gpu_elementwise_binary_inplace` launches).
 //! 2. **Correctness**: `c[i]` is the IEEE f32 `a[i] op b[i]` for every
 //!    `i < n` (NaN, infinities, signed zeros, subnormals and overflow among
-//!    the inputs), and nothing past `n` is written.
-//! 3. **The gate bites**: relaxing the bound, nudging the element size,
-//!    swapping the operands of the subtraction, or reading the index from
-//!    block 0 is caught.
+//!    the inputs), and nothing past `n` is written. The division is
+//!    `div.approx`'s documented result: `a * ±0` for a divisor of magnitude
+//!    in `(2^126, 2^128)`, where the reciprocal flushes.
+//! 3. **The spelling**: outside that range the interpreter models
+//!    `div.approx.f32` as the IEEE quotient, so `div.approx` → `div.rn` is
+//!    invisible to execution; on the machine the two differ by up to 2 ulp.
+//!    The division's mnemonic is pinned against the hand module instead.
+//! 4. **The gate bites**: relaxing the bound, nudging the element size,
+//!    swapping the operands of the subtraction or the division, or reading
+//!    the index from block 0 is caught.
 
 use std::collections::HashMap;
 
@@ -49,6 +56,7 @@ fn hand_ptx(op: BinaryOp) -> String {
         BinaryOp::Add => hand::ADD_F32_PTX,
         BinaryOp::Sub => hand::SUB_F32_PTX,
         BinaryOp::Mul => hand::MUL_F32_PTX,
+        BinaryOp::Div => hand::DIV_F32_PTX,
     }
     .trim_end_matches('\0')
     .to_string()
@@ -59,6 +67,18 @@ fn apply(op: BinaryOp, x: f32, y: f32) -> f32 {
         BinaryOp::Add => x + y,
         BinaryOp::Sub => x - y,
         BinaryOp::Mul => x * y,
+        BinaryOp::Div => div_approx(x, y),
+    }
+}
+
+/// `div.approx.f32` as the interpreter models it, after the PTX ISA: the IEEE
+/// quotient, except that a divisor of magnitude in `(2^126, 2^128)` flushes
+/// the reciprocal to zero, giving `x * ±0`.
+fn div_approx(x: f32, y: f32) -> f32 {
+    if y.is_finite() && y.abs() > f32::from_bits(0x7E80_0000) {
+        x * 0.0f32.copysign(y)
+    } else {
+        x / y
     }
 }
 
@@ -252,22 +272,39 @@ fn nudging_the_element_size_is_caught() {
     }
 }
 
+/// `p` with the source operands of every `mnemonic` line swapped.
+fn swap_operands(p: &str, mnemonic: &str) -> String {
+    p.lines()
+        .map(|l| match l.trim_start().strip_prefix(mnemonic) {
+            Some(ops) => {
+                let v: Vec<&str> = ops.trim_end_matches(';').split(", ").collect();
+                format!("    {mnemonic}{}, {}, {};", v[0], v[2], v[1])
+            }
+            None => l.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
+}
+
 #[test]
-fn swapping_the_operands_of_the_subtraction_is_caught() {
-    let swap = |p: &str| {
-        p.lines()
-            .map(|l| match l.trim_start().strip_prefix("sub.f32 ") {
-                Some(ops) => {
-                    let v: Vec<&str> = ops.trim_end_matches(';').split(", ").collect();
-                    format!("    sub.f32 {}, {}, {};", v[0], v[2], v[1])
-                }
-                None => l.to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n"
-    };
-    assert!(caught(BinaryOp::Sub, swap));
+fn swapping_the_operands_of_the_subtraction_or_the_division_is_caught() {
+    assert!(caught(BinaryOp::Sub, |p| swap_operands(p, "sub.f32 ")));
+    assert!(caught(BinaryOp::Div, |p| swap_operands(p, "div.approx.f32 ")));
+}
+
+/// The division is `div.approx.f32` in both modules, once, and never the
+/// IEEE `div.rn.f32`; the interpreter cannot tell the two apart, which is
+/// why the spelling is pinned.
+#[test]
+fn the_division_is_spelled_div_approx_as_in_the_hand_kernel() {
+    let (h, k) = (hand_ptx(BinaryOp::Div), kir_ptx(BinaryOp::Div));
+    for p in [&h, &k] {
+        assert_eq!(p.matches("div.approx.f32 ").count(), 1);
+        assert!(!p.contains("div.rn") && !p.contains("div.full") && !p.contains("rcp."));
+    }
+    assert!(!caught(BinaryOp::Div, |p| p.replacen("div.approx.f32 ", "div.rn.f32 ", 1)), "a named equivalent mutant");
+    assert!(caught(BinaryOp::Div, |p| p.replacen("div.approx.f32 ", "mul.f32 ", 1)), "the operation");
 }
 
 #[test]

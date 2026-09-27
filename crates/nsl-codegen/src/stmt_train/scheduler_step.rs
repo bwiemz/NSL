@@ -17,37 +17,22 @@
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types as cl_types;
-use cranelift_codegen::ir::{InstBuilder, Value};
-use cranelift_frontend::{FunctionBuilder, Variable};
+use cranelift_codegen::ir::InstBuilder;
+use cranelift_frontend::FunctionBuilder;
 
 use crate::compiler::Compiler;
 use crate::context::FuncState;
 use crate::error::CodegenError;
+use crate::stmt_train::emit_state::EmitState;
 use crate::stmt_train::plan::TrainPlan;
 
 /// Every binding of `compile_train_block_inner` the step tail reads;
 /// names are the driver's.
 pub(crate) struct SchedulerStepInputs<'a> {
-    /// The DataLoader handle recorded in a checkpoint (null without a loader).
-    pub(crate) checkpoint_dl_handle: Value,
-    /// The parameter-name list built at setup whenever `checkpoint_save` is set.
-    pub(crate) checkpoint_names_list: Option<Value>,
-    /// The epoch counter variable.
-    pub(crate) epoch_counter_var: Variable,
-    /// The DataLoader value when the `data:` section declares one.
-    pub(crate) has_dataloader: Option<Value>,
-    /// The learning-rate variable the scheduler redefines.
-    pub(crate) lr_var: Variable,
-    /// The model parameter list.
-    pub(crate) param_list: Value,
-    /// The first optimizer-state list.
-    pub(crate) state_list_1: Value,
-    /// The second optimizer-state list.
-    pub(crate) state_list_2: Value,
-    /// The step counter variable (incremented here, after the scheduler call).
-    pub(crate) step_count_var: Variable,
     /// The block's planning-time facts (roadmap A1, TrainPlan step 1).
     pub(crate) plan: &'a TrainPlan,
+    /// The setup handles (roadmap A1, TrainPlan step 3).
+    pub(crate) emit: &'a EmitState,
 }
 
 impl Compiler<'_> {
@@ -61,6 +46,9 @@ impl Compiler<'_> {
     ) -> Result<(), CodegenError> {
         let SchedulerStepInputs {
             plan,
+            emit,
+        } = inputs;
+        let EmitState {
             checkpoint_dl_handle,
             checkpoint_names_list,
             epoch_counter_var,
@@ -70,7 +58,8 @@ impl Compiler<'_> {
             state_list_1,
             state_list_2,
             step_count_var,
-        } = inputs;
+            ..
+        } = *emit;
         // TrainPlan step 1 (roadmap A1): the facts this phase used to receive
         // as copied fields, read from the carrier under their old names so
         // the body below is unchanged.
