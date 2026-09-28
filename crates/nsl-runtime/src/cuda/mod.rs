@@ -9352,7 +9352,7 @@ pub(crate) fn gpu_csr_spmv_f32(sparse: &crate::sparse::NslSparseTensor, vec_ptr:
     let block = 256i64;
     let grid = ((m as i64) + block - 1) / block;
     let result = inner::kernel_launch(
-        fused_kernels::CSR_SPMV_F32_PTX.as_ptr(), b"nsl_csr_spmv_f32\0".as_ptr(),
+        fused_kernels::csr_spmv_f32_ptx().as_ptr(), b"nsl_csr_spmv_f32\0".as_ptr(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU CSR SpMV kernel failed");
@@ -9508,7 +9508,7 @@ pub(crate) fn gpu_coo_spmv_f32(sparse: &crate::sparse::NslSparseTensor, vec_ptr:
     let block = 256i64;
     let grid = ((nnz as i64) + block - 1) / block;
     let result = inner::kernel_launch(
-        fused_kernels::COO_SPMV_F32_PTX.as_ptr(), b"nsl_coo_spmv_f32\0".as_ptr(),
+        fused_kernels::coo_spmv_f32_ptx().as_ptr(), b"nsl_coo_spmv_f32\0".as_ptr(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU COO SpMV kernel failed");
@@ -10443,6 +10443,8 @@ mod tests {
         }
         all.push(("nsl_det_global_sum_f32", super::fused_kernels::det_global_sum_f32_ptx(), true));
         all.push(("nsl_det_sum_dim_f32", super::fused_kernels::det_sum_dim_f32_ptx(), true));
+        all.push(("nsl_csr_spmv_f32", super::fused_kernels::csr_spmv_f32_ptx(), true));
+        all.push(("nsl_coo_spmv_f32", super::fused_kernels::coo_spmv_f32_ptx(), true));
         all.push(("nsl_strided_copy_f32", super::fused_kernels::strided_copy_f32_ptx(), true));
         all.push(("nsl_slice_f32", super::fused_kernels::slice_f32_ptx(), true));
         all
