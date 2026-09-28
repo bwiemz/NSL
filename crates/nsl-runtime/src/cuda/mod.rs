@@ -7005,7 +7005,7 @@ pub(crate) fn gpu_sum_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) -> i64
     let result = if (short_axis_max > 0 && reduce_size <= short_axis_max) || coalesced_ok {
         let grid = (out_total as i64 + block - 1) / block;
         inner::kernel_launch(
-            fused_kernels::SUM_DIM_SHORT_F32_PTX.as_ptr(),
+            fused_kernels::sum_dim_short_f32_ptx().as_ptr(),
             b"nsl_sum_dim_short_f32\0".as_ptr(),
             [grid, 1, 1],
             [block, 1, 1],
@@ -10445,6 +10445,7 @@ mod tests {
         all.push(("nsl_coo_spmv_f32", super::fused_kernels::coo_spmv_f32_ptx(), true));
         all.push(("nsl_rmsnorm_rinv_rows_f32", super::fused_kernels::rmsnorm_rinv_rows_f32_ptx(), true));
         all.push(("nsl_rmsnorm_dgamma_f32", super::fused_kernels::rmsnorm_dgamma_f32_ptx(), true));
+        all.push(("nsl_sum_dim_short_f32", super::fused_kernels::sum_dim_short_f32_ptx(), true));
         all.push(("nsl_ce_bwd_count_f32", super::fused_kernels::ce_bwd_count_f32_ptx(), true));
         all.push(("nsl_ce_bwd_finish_f32", super::fused_kernels::ce_bwd_finish_f32_ptx(), true));
         all.push(("nsl_strided_copy_f32", super::fused_kernels::strided_copy_f32_ptx(), true));
