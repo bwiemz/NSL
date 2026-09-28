@@ -6637,19 +6637,19 @@ pub(crate) fn gpu_embedding_backward(
     let deterministic = crate::deterministic_ops::is_deterministic();
     let (ptx, kernel_name): (&str, &[u8]) = match (deterministic, indices.dtype) {
         (true, crate::tensor::DTYPE_I32) => (
-            fused_kernels::EMBEDDING_BWD_DET_I32IDX_PTX,
+            fused_kernels::embedding_bwd_det_i32idx_ptx(),
             b"nsl_embedding_bwd_det_i32idx\0",
         ),
         (true, 1) => (
-            fused_kernels::EMBEDDING_BWD_DET_F32_PTX,
+            fused_kernels::embedding_bwd_det_f32_ptx(),
             b"nsl_embedding_bwd_det_f32\0",
         ),
         (false, crate::tensor::DTYPE_I32) => (
-            fused_kernels::EMBEDDING_BWD_I32IDX_PTX,
+            fused_kernels::embedding_bwd_i32idx_ptx(),
             b"nsl_embedding_bwd_i32idx\0",
         ),
         (false, 1) => (
-            fused_kernels::EMBEDDING_BWD_F32_PTX,
+            fused_kernels::embedding_bwd_f32_ptx(),
             b"nsl_embedding_bwd_f32\0",
         ),
         _ => return 0,
@@ -10430,6 +10430,10 @@ mod tests {
         all.push(("nsl_embedding_i32idx", super::fused_kernels::embedding_i32idx_ptx(), true));
         all.push(("nsl_gather_f32", super::fused_kernels::gather_f32_ptx(), true));
         all.push(("nsl_gather_i32idx", super::fused_kernels::gather_i32idx_ptx(), true));
+        all.push(("nsl_embedding_bwd_f32", super::fused_kernels::embedding_bwd_f32_ptx(), true));
+        all.push(("nsl_embedding_bwd_i32idx", super::fused_kernels::embedding_bwd_i32idx_ptx(), true));
+        all.push(("nsl_embedding_bwd_det_f32", super::fused_kernels::embedding_bwd_det_f32_ptx(), true));
+        all.push(("nsl_embedding_bwd_det_i32idx", super::fused_kernels::embedding_bwd_det_i32idx_ptx(), true));
         for (op, module) in [
             (nsl_kir::kernels::muon_batch::MuonBatchOp::Mom, super::fused_kernels::muon_batch_mom_f32_ptx()),
             (nsl_kir::kernels::muon_batch::MuonBatchOp::Sumsq, super::fused_kernels::muon_batch_sumsq_f32_ptx()),
