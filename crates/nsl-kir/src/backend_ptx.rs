@@ -194,16 +194,18 @@ fn print_entry(ir: &KernelIR) -> String {
     }
     writeln!(body).unwrap();
 
-    // Emit blocks
+    // Emit blocks, then the edge trampolines conditional branches need.
+    let mut trampolines = String::new();
     for block in &ir.blocks {
         writeln!(body, "BB{}:", block.id).unwrap();
         for op in &block.ops {
             emit_op(&mut body, op, ir);
         }
         if let Some(ref term) = block.terminator {
-            emit_terminator(&mut body, term, ir, block.id);
+            emit_terminator(&mut body, &mut trampolines, term, ir, block.id);
         }
     }
+    body.push_str(&trampolines);
     let alloc = crate::regalloc::allocate(ir);
     let (body, extra) = rename_registers(&body, &alloc);
 
@@ -1088,7 +1090,7 @@ fn emit_edge_copies(ptx: &mut String, ir: &KernelIR, edge: &KirEdge) {
     }
 }
 
-fn emit_terminator(ptx: &mut String, term: &KirTerminator, ir: &KernelIR, block: BlockId) {
+fn emit_terminator(ptx: &mut String, trampolines: &mut String, term: &KirTerminator, ir: &KernelIR, block: BlockId) {
     match term {
         KirTerminator::Branch(edge) => {
             emit_edge_copies(ptx, ir, edge);
@@ -1101,14 +1103,30 @@ fn emit_terminator(ptx: &mut String, term: &KirTerminator, ir: &KernelIR, block:
             writeln!(ptx, "    bra BB{};", fallthrough.target).unwrap();
         }
         KirTerminator::CondBranch(cond, taken, fallthrough) => {
-            // Each edge's copies run only when that edge is taken, so the
-            // not-taken path gets its own label in this block.
-            writeln!(ptx, "    @!%p{} bra BB{}_else;", cond, block).unwrap();
-            emit_edge_copies(ptx, ir, taken);
-            writeln!(ptx, "    bra BB{};", taken.target).unwrap();
-            writeln!(ptx, "BB{}_else:", block).unwrap();
-            emit_edge_copies(ptx, ir, fallthrough);
-            writeln!(ptx, "    bra BB{};", fallthrough.target).unwrap();
+            // Each edge's copies run only when that edge is taken. An edge
+            // that carries copies branches to a trampoline of its own,
+            // printed after the last block, which makes the copies and then
+            // jumps to the target. The branch itself stays a plain
+            // `@p bra; bra` pair: with the copies printed inline around it
+            // (the earlier `@!p bra else; copies; bra; else: ...` form),
+            // ptxas stopped recognising the loops such branches close, and
+            // neither unrolled nor if-converted them (new-roadmap item 5,
+            // found migrating the batched Muon reduction).
+            let mut target = |edge: &crate::kernel_ir::KirEdge, tag: &str| -> String {
+                if edge.args.is_empty() {
+                    format!("BB{}", edge.target)
+                } else {
+                    let label = format!("BB{block}_{tag}");
+                    writeln!(trampolines, "{label}:").unwrap();
+                    emit_edge_copies(trampolines, ir, edge);
+                    writeln!(trampolines, "    bra BB{};", edge.target).unwrap();
+                    label
+                }
+            };
+            let t = target(taken, "t");
+            let f = target(fallthrough, "f");
+            writeln!(ptx, "    @%p{} bra {t};", cond).unwrap();
+            writeln!(ptx, "    bra {f};").unwrap();
         }
         KirTerminator::Return => {
             writeln!(ptx, "    ret;").unwrap();
@@ -1898,10 +1916,14 @@ mod tests {
         let ptx = String::from_utf8(lower_kir_to_ptx(&ir)).unwrap();
         let al = crate::regalloc::allocate(&ir);
         let (f, r0, r1) = (al.name(flag), al.name(p0), al.name(p1));
-        let expected = format!(
-            "    @!{f} bra BB1_else;\n    mov.f32 %edge_f, {r0};\n    mov.f32 {r0}, {r1};\n    mov.f32 {r1}, %edge_f;\n    bra BB1;\nBB1_else:\n    bra BB2;\n"
+        // The copy-carrying back edge goes through a trampoline printed
+        // after the last block; the branch itself is a plain pair.
+        let branch = format!("    @{f} bra BB1_t;\n    bra BB2;\n");
+        let trampoline = format!(
+            "BB1_t:\n    mov.f32 %edge_f, {r0};\n    mov.f32 {r0}, {r1};\n    mov.f32 {r1}, %edge_f;\n    bra BB1;\n"
         );
-        assert!(ptx.contains(&expected), "{ptx}");
+        assert!(ptx.contains(&branch) && ptx.contains(&trampoline), "{ptx}");
+        assert!(ptx.find(&trampoline) > ptx.find("BB2:"), "the trampoline follows the last block\n{ptx}");
     }
 
     #[test]
