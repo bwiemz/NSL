@@ -1070,6 +1070,30 @@ frozen throughout, so nothing here blocks a kernel fix.
         above the second.
       - **SASS:** the same instruction mix. Registers are 12/16/14 against
         12/13/12, with no occupancy effect at 256 threads.
+    - **`fused_kernels.rs`, the batched Muon Newton-Schulz kernels.**
+      `nsl_muon_batch_{mom,sumsq,pack,poly,update}_f32` are in
+      `nsl_kir::kernels::muon_batch`. The matrices are reached through
+      `u64` pointer tables. Every float operation is `.rn`, so none fuses.
+      - **Loop shape.** The reduction hoists the `nest` test out of its
+        loop into two straight-line loops. Each loop leaves through an exit
+        block whose incoming edge carries no block arguments. When the exit
+        edge's copies were printed inline in the loop header (`@!p bra
+        else; mov ...; bra out; else: bra body`), ptxas did not unroll the
+        loop. With the copies out of line, it unrolls it 4× as it did the
+        hand kernel's loop. The `muon_batch` unit tests pin that shape.
+        Other KIR loops whose exit edge carries arguments may be losing the
+        same unroll; the printer could place such copies out of line.
+      - **The gate,** `muon_batch_kir_equivalence`, requires the hand
+        kernels' bytes and formulas over batched, scattered matrices,
+        square, wide and tall, with both flags. It kills mutants of every
+        bound, block index, element size and rounded float operation, the
+        flags, the transpose, the diagonal and the reduction's stride, tree
+        and barriers. Poly's quotient read as a remainder is named as an
+        equivalent mutant.
+      - **SASS:** the same float and memory instructions as the hand
+        kernels, with registers equal or fewer. The exception is the
+        reduction: its two loops are each unrolled, and it uses fewer
+        registers (25–28 against 30–38).
 12. **FA v2**, by phase directory, tier B.1 and B.2 last; the SASS
     baselines and the two no-spill gates already exist here and are the
     proof. `matmul_mma.rs` and `kernel_skeleton/` are deleted with their
