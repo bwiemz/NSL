@@ -87,10 +87,7 @@ BB6:
 BB7:
     add.u32 %r14, %r9, %r3;
     setp.lt.u32 %p0, %r14, %r7;
-    @!%p0 bra BB7_else;
-    mov.u32 %r9, %r14;
-    bra BB4;
-BB7_else:
+    @%p0 bra BB7_t;
     bra BB5;
 BB8:
     cvt.u64.u32 %rd4, %r13;
@@ -102,10 +99,7 @@ BB8:
 BB9:
     add.u32 %r15, %r12, %r3;
     setp.lt.u32 %p0, %r15, %r8;
-    @!%p0 bra BB9_else;
-    mov.u32 %r12, %r15;
-    bra BB6;
-BB9_else:
+    @%p0 bra BB9_t;
     bra BB7;
 BB10:
     cvt.u64.u32 %rd4, %r14;
@@ -122,13 +116,8 @@ BB10:
     fma.rn.f32 %f6, %f1, %f5, %f4;
     add.u32 %r15, %r14, %r3;
     setp.lt.u32 %p0, %r15, %r5;
-    @!%p0 bra BB10_else;
-    mov.u32 %r14, %r15;
-    mov.f32 %f4, %f6;
-    bra BB10;
-BB10_else:
-    mov.f32 %f1, %f6;
-    bra BB11;
+    @%p0 bra BB10_t;
+    bra BB10_f;
 BB11:
     cvt.u64.u32 %rd4, %r13;
     mul.lo.u64 %rd4, %rd4, 4;
@@ -169,10 +158,7 @@ BB12:
     red.global.add.f32 [%rd4], %f5;
     add.u32 %r15, %r14, %r3;
     setp.lt.u32 %p0, %r15, %r5;
-    @!%p0 bra BB12_else;
-    mov.u32 %r14, %r15;
-    bra BB12;
-BB12_else:
+    @%p0 bra BB12_t;
     bra BB13;
 BB13:
     cvt.u64.u32 %rd4, %r13;
@@ -197,4 +183,20 @@ BB15:
     add.u32 %r0, %r10, %r3;
     mov.u32 %r10, %r0;
     bra BB14;
+BB7_t:
+    mov.u32 %r9, %r14;
+    bra BB4;
+BB9_t:
+    mov.u32 %r12, %r15;
+    bra BB6;
+BB10_t:
+    mov.u32 %r14, %r15;
+    mov.f32 %f4, %f6;
+    bra BB10;
+BB10_f:
+    mov.f32 %f1, %f6;
+    bra BB11;
+BB12_t:
+    mov.u32 %r14, %r15;
+    bra BB12;
 }
