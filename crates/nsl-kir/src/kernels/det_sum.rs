@@ -2,8 +2,8 @@
 //! The runtime's deterministic sum kernels from `cuda/fused_kernels.rs`, as
 //! KIR (new-roadmap item 5).
 //!
-//! Both sum in ascending index order with one thread per result, so the
-//! result does not depend on scheduling:
+//! All three sum in ascending index order with one thread per result, so
+//! the result does not depend on scheduling:
 //!
 //! - `nsl_det_global_sum_f32(inp, out, len)`: one thread, launched as a
 //!   single one-thread block, adds `inp[0..len]` in order into `out[0]`.
@@ -12,6 +12,12 @@
 //!   adds `inp[(o·reduce_size + r)·inner + i]` for `r` in
 //!   `0..reduce_size`, in order, into `out[t]`. A block at or past
 //!   `outer·inner` does nothing.
+//! - `nsl_sum_dim_short_f32(inp, out, outer, reduce_size, inner)`: the same
+//!   sum on blocks of [`SUM_DIM_SHORT_BLOCK`] threads, the output being the
+//!   thread's global index `%ctaid.x · %ntid.x + %tid.x`. Consecutive
+//!   threads take consecutive `i`, so the loads stay coalesced when `inner`
+//!   is large. It replaced a shared-memory tree per output for reductions
+//!   too short to fill one.
 //!
 //! The accumulator starts at `+0.0`, and every add is `add.rn.f32`: the
 //! hand kernels' `add.f32` rounds the same way, and the explicit rounding
@@ -26,26 +32,34 @@ use crate::kernel_ir::{
     AddressSpace, BlockId, CmpOp, ConstValue, KernelIR, KirBuilder, KirConst, KirEdge, KirOp, KirTerminator, KirType, VarId,
 };
 
-/// The block both kernels are launched with: one thread.
+/// The block the deterministic kernels are launched with: one thread.
 pub const DET_SUM_BLOCK: u32 = 1;
+
+/// The block `nsl_sum_dim_short_f32` is launched with.
+pub const SUM_DIM_SHORT_BLOCK: u32 = 256;
 
 /// Which deterministic sum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DetSumOp {
     /// `out[0] = inp[0] + inp[1] + … + inp[len - 1]`.
     Global,
-    /// The sum over the middle axis of an `[outer, reduce_size, inner]` view.
+    /// The sum over the middle axis of an `[outer, reduce_size, inner]` view,
+    /// a one-thread block per output.
     Dim,
+    /// [`DetSumOp::Dim`] with a thread per output on blocks of
+    /// [`SUM_DIM_SHORT_BLOCK`].
+    DimShort,
 }
 
 impl DetSumOp {
-    pub const ALL: [DetSumOp; 2] = [DetSumOp::Global, DetSumOp::Dim];
+    pub const ALL: [DetSumOp; 3] = [DetSumOp::Global, DetSumOp::Dim, DetSumOp::DimShort];
 
     /// The `.visible .entry` name. Pinned: the runtime launches by it.
     pub fn kernel_name(self) -> &'static str {
         match self {
             DetSumOp::Global => "nsl_det_global_sum_f32",
             DetSumOp::Dim => "nsl_det_sum_dim_f32",
+            DetSumOp::DimShort => "nsl_sum_dim_short_f32",
         }
     }
 
@@ -53,7 +67,15 @@ impl DetSumOp {
     pub fn param_names(self) -> &'static [&'static str] {
         match self {
             DetSumOp::Global => &["inp", "out", "len"],
-            DetSumOp::Dim => &["inp", "out", "outer", "reduce_size", "inner"],
+            DetSumOp::Dim | DetSumOp::DimShort => &["inp", "out", "outer", "reduce_size", "inner"],
+        }
+    }
+
+    /// The block the runtime launches the kernel with.
+    pub fn block(self) -> u32 {
+        match self {
+            DetSumOp::Global | DetSumOp::Dim => DET_SUM_BLOCK,
+            DetSumOp::DimShort => SUM_DIM_SHORT_BLOCK,
         }
     }
 }
@@ -117,11 +139,12 @@ fn build_global() -> KernelIR {
     b.finalize()
 }
 
-fn build_dim() -> KernelIR {
+/// `Dim` (`t = %ctaid.x`) or `DimShort` (`t` = the global thread index).
+fn build_dim(op: DetSumOp) -> KernelIR {
     use AddressSpace::Global;
     use KirType::{U32, U64};
-    let names = DetSumOp::Dim.param_names();
-    let mut b = KirBuilder::new(DetSumOp::Dim.kernel_name());
+    let names = op.param_names();
+    let mut b = KirBuilder::new(op.kernel_name());
     let inp = b.add_param(names[0], f32_ptr(), Global);
     let out = b.add_param(names[1], f32_ptr(), Global);
     let outer = b.add_param(names[2], U64, Global);
@@ -133,7 +156,10 @@ fn build_dim() -> KernelIR {
 
     b.set_block(entry);
     let t32 = b.new_typed_var(U32);
-    b.emit(KirOp::BlockIdx(t32, 0));
+    b.emit(match op {
+        DetSumOp::DimShort => KirOp::GlobalId(t32, 0),
+        _ => KirOp::BlockIdx(t32, 0),
+    });
     let t = b.new_typed_var(U64);
     b.emit(KirOp::Cast(t, t32, U64));
     let total = op2(&mut b, U64, KirOp::Mul, outer, inner);
@@ -156,7 +182,7 @@ fn build_dim() -> KernelIR {
 
     b.set_block(exit);
     b.terminate(KirTerminator::Return);
-    b.set_workgroup_size([DET_SUM_BLOCK, 1, 1]);
+    b.set_workgroup_size([op.block(), 1, 1]);
     b.finalize()
 }
 
@@ -164,7 +190,7 @@ fn build_dim() -> KernelIR {
 pub fn build(op: DetSumOp) -> KernelIR {
     match op {
         DetSumOp::Global => build_global(),
-        DetSumOp::Dim => build_dim(),
+        DetSumOp::Dim | DetSumOp::DimShort => build_dim(op),
     }
 }
 
@@ -198,18 +224,21 @@ mod tests {
         }
     }
 
-    /// One load and one explicitly rounded add per iteration, and no
-    /// thread index: the result is the block's (or the launch's).
+    /// One load and one explicitly rounded add per iteration. Only the
+    /// short kernel reads a thread index: the deterministic ones' result is
+    /// the block's (or the launch's).
     #[test]
     fn the_loop_is_one_rounded_add_per_element() {
         for op in DetSumOp::ALL {
             let p = text(op);
             assert_eq!(p.matches("ld.global.f32").count(), 1, "{p}");
             assert_eq!(p.matches("add.rn.f32").count(), 1, "{p}");
-            assert!(!p.contains("fma") && !p.contains("%tid"), "{p}");
+            assert!(!p.contains("fma"), "{p}");
+            assert_eq!(p.contains("%tid"), op == DetSumOp::DimShort, "{p}");
         }
         assert!(!text(DetSumOp::Global).contains("%ctaid"));
         assert!(text(DetSumOp::Dim).contains("%ctaid.x"));
+        assert!(text(DetSumOp::DimShort).contains("%ctaid.x") && text(DetSumOp::DimShort).contains("%ntid.x"));
     }
 
     /// The loop's bound test branches straight out, with no edge copies
