@@ -8,6 +8,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **The shared-memory tree reductions are built by
+  `nsl_kir::kernels::block_reduce`** in place of their hand-written
+  constants (new-roadmap item 5): `nsl_global_sum_f32`, `nsl_sum_dim_f32`
+  and `nsl_max_dim_f32`.
+  - **The kernels** keep the hand kernels' order of combines. Thread `k`
+    folds `k, k + 256, …` from the identity, then a shared-memory tree
+    combines the 256 partials, so each result is the same bit for bit. The
+    sums use `add.rn.f32`, which rounds as `add.f32` did, and the max uses
+    `max.f32`. The per-dim loop carries its offset instead of multiplying
+    on every trip.
+  - **The gate,** `block_reduce_kir_equivalence` (11 tests), runs the
+    frozen hand modules (`tests/fixtures/block_reduce_hand.rs`) and the KIR
+    ones on the CTA interpreter.
+    - The two leave the same bytes, and they match the restated tree
+      order.
+    - It runs under all four thread schedules and both block orders, over
+      order-sensitive data, signed zeros and NaNs.
+    - Mutants of every bound, address, stride, tree step, barrier, combine
+      and identity are killed.
+    - Two mutants are named as equivalent: every thread writing the result,
+      and the max's stride halved.
+  - **SASS** (sm_80/90/120): the same unrolled loads, shared-memory
+    traffic, barriers and float instructions as the hand kernels, with
+    registers within two of them.
+
 - **The sparse matrix-vector kernels are built by
   `nsl_kir::kernels::spmv`** in place of their hand-written constants
   (new-roadmap item 5): `nsl_csr_spmv_f32` and `nsl_coo_spmv_f32`.
