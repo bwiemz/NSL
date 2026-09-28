@@ -8,6 +8,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **The deterministic sum kernels are built by `nsl_kir::kernels::det_sum`**
+  in place of their hand-written constants (new-roadmap item 5):
+  `nsl_det_global_sum_f32` and `nsl_det_sum_dim_f32`.
+  - **The kernels** keep the hand kernels' contract: one thread per result,
+    adding in ascending index order from `+0.0`. The global sum is a single
+    thread; the per-dim sum is a one-thread block per output. Each add is
+    now `add.rn.f32`: the rounding is unchanged, and the explicit mode keeps
+    a multiply from being contracted into the sum.
+  - **The gate,** `det_sum_kir_equivalence` (8 tests), runs the frozen hand
+    modules (`tests/fixtures/det_sum_hand.rs`) and the KIR ones on the CTA
+    interpreter. It requires the same bytes, and the ascending f32 sum bit
+    for bit, over empty and ragged extents with order-sensitive data,
+    signed zeros and an infinity, in both block orders. It kills mutants of
+    each bound, the block index, the output's split into quotient and
+    remainder, every element size, add and stride, the step, the
+    accumulator's start and the add.
+  - **SASS** (sm_80/90/120): the same 8× unrolled loop as the hand kernels,
+    with 8 loads and 8 adds per trip. Registers are equal on sm_90 and
+    sm_120, and two more on sm_80, on a one-thread block.
+
 - **The embedding backward kernels are built by
   `nsl_kir::kernels::embedding_bwd`** in place of their hand-written
   constants (new-roadmap item 5): the atomic `nsl_embedding_bwd_f32` and

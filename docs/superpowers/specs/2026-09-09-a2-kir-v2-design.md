@@ -1093,6 +1093,24 @@ frozen throughout, so nothing here blocks a kernel fix.
         above the second.
       - **SASS:** the same instruction mix. Registers are 12/16/14 against
         12/13/12, with no occupancy effect at 256 threads.
+    - **`fused_kernels.rs`, the deterministic sums.**
+      `nsl_det_global_sum_f32` and `nsl_det_sum_dim_f32` are in
+      `nsl_kir::kernels::det_sum`: one thread per result (the launch's one
+      thread, or `%ctaid.x`), adding in ascending index order from `+0.0`.
+      Each add is `add.rn.f32`, where the hand kernels' was `add.f32`: the
+      rounding is the same, and a multiply can no longer contract into it.
+      The loop leaves its header for a block the header dominates, so the
+      exit edge carries no copies.
+      - **The gate,** `det_sum_kir_equivalence`, requires the hand kernels'
+        bytes and the ascending sum, bit for bit, over empty and ragged
+        extents with order-sensitive data, signed zeros and an infinity, in
+        both block orders. It kills mutants of each bound, the block index,
+        the quotient and remainder, every element size, add and stride, the
+        step, the accumulator's start (`-0.0` and `1.0`) and the add.
+      - **SASS:** the same 8× unrolled loop (8 `LDG`, 8 `FADD`) as the hand
+        kernels on sm_80/90/120. Registers are equal on sm_90 and sm_120 and
+        two more on sm_80 (16 against 14; 30 against 28), on a one-thread
+        block.
     - **`fused_kernels.rs`, the batched Muon Newton-Schulz kernels.**
       `nsl_muon_batch_{mom,sumsq,pack,poly,update}_f32` are in
       `nsl_kir::kernels::muon_batch`. The matrices are reached through
