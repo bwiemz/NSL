@@ -10434,6 +10434,15 @@ mod tests {
         all.push(("nsl_embedding_bwd_i32idx", super::fused_kernels::embedding_bwd_i32idx_ptx(), true));
         all.push(("nsl_embedding_bwd_det_f32", super::fused_kernels::embedding_bwd_det_f32_ptx(), true));
         all.push(("nsl_embedding_bwd_det_i32idx", super::fused_kernels::embedding_bwd_det_i32idx_ptx(), true));
+        for (op, module) in [
+            (nsl_kir::kernels::muon_batch::MuonBatchOp::Mom, super::fused_kernels::muon_batch_mom_f32_ptx()),
+            (nsl_kir::kernels::muon_batch::MuonBatchOp::Sumsq, super::fused_kernels::muon_batch_sumsq_f32_ptx()),
+            (nsl_kir::kernels::muon_batch::MuonBatchOp::Pack, super::fused_kernels::muon_batch_pack_f32_ptx()),
+            (nsl_kir::kernels::muon_batch::MuonBatchOp::Poly, super::fused_kernels::muon_batch_poly_f32_ptx()),
+            (nsl_kir::kernels::muon_batch::MuonBatchOp::Update, super::fused_kernels::muon_batch_update_f32_ptx()),
+        ] {
+            all.push((op.kernel_name(), module, true));
+        }
         all.push(("nsl_strided_copy_f32", super::fused_kernels::strided_copy_f32_ptx(), true));
         all.push(("nsl_slice_f32", super::fused_kernels::slice_f32_ptx(), true));
         all

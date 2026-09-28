@@ -50,6 +50,51 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   - **SASS** on sm_80/90/120: the same memory, conversion and atomic
     instructions as the hand kernels. Registers are 14 against 12 for the
     atomic pair, and within ±4 either way for the deterministic pair.
+- **The batched Muon Newton-Schulz kernels are built by
+  `nsl_kir::kernels::muon_batch`** in place of their hand-written constants
+  (new-roadmap item 5): `nsl_muon_batch_{mom,sumsq,pack,poly,update}_f32`.
+  - **The kernels** keep the hand kernels' order of loads, operations and
+    stores:
+    - the momentum update;
+    - the per-matrix sum of squares of the update direction;
+    - the normalised pack into the workspace, transposed for tall matrices;
+    - the polynomial combine with `nsa` on the diagonal;
+    - the decayed parameter update.
+
+    Every multiply and add is explicitly rounded (`mul.rn`, `add.rn`,
+    `sub.rn`), so the momentum update stays bit-exact against the stdlib
+    arm, and the sums stay bit-exact against the sequential Frobenius path.
+  - **One structural difference.** The reduction tests `nest` once, before
+    two straight-line loops, where the hand kernel tested it inside its
+    loop. Each loop leaves through its own exit block, whose incoming edge
+    carries no block arguments. With the edge copies printed inline in the
+    loop header, ptxas did not unroll the loop. It now unrolls it 4× as it
+    did the hand kernel, keeping several loads in flight in a reduction that
+    runs one block per matrix. The additions happen in the same order.
+  - **The gate.** `tests/muon_batch_kir_equivalence.rs` (15 tests) runs the
+    frozen hand kernels and the KIR ones on the CTA interpreter under two
+    schedules.
+    - The cases batch 1–3 matrices at scattered addresses through the
+      pointer tables. The shapes are square, wide and tall, with `n` below,
+      at and past the 256-thread block, both `nest` and both `tr` settings,
+      and IEEE-corner data.
+    - It requires identical global memory and each kernel's formula. The
+      sum follows the reduction's own stride-256 and tree order.
+    - It kills mutants of:
+      - each bound and both block indices;
+      - every element size, including the pointer tables' 8;
+      - every rounded float operation, and the pack's `sqrt`;
+      - the `nest` and `tr` tests;
+      - the transpose arithmetic, poly's diagonal test and its select;
+      - the reduction's stride, tree start, step and end, and both
+        barriers.
+    - Poly's quotient read as a remainder is named as an equivalent mutant.
+      It swaps row and column, and the diagonal test is symmetric.
+  - **SASS** on sm_80/90/120: the same float and memory instructions as the
+    hand kernels for mom, pack, poly and update, with registers equal or
+    fewer. The reduction's two unrolled loops use 25–28 registers against
+    the hand kernel's 30–38.
+
 - **The fp8 E4M3 KV dequantization kernel, `nsl_dequant_fp8_e4m3_f32`, is
   built by `nsl_kir::kernels::dequant::build_fp8_e4m3`** in place of its
   hand-written constant (new-roadmap item 5). With it, every KV
