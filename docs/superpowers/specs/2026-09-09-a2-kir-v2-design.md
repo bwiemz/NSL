@@ -1029,9 +1029,32 @@ frozen throughout, so nothing here blocks a kernel fix.
         up by at most two (16 against 14, 14 against 12). The difference is
         the `IMAD.WIDE` address arithmetic, where the hand kernels' `shl`
         gave `LEA`.
-      - **Still hand-written:** the embedding backward family (atomic and
-        deterministic, f32 and i32 indices) and the uncalled
-        `nsl_scatter_add_f32`.
+    - **`fused_kernels.rs`, the embedding backward family.**
+      `nsl_embedding_bwd_{f32,i32idx}` (the `red.global.add` scatter) and
+      `nsl_embedding_bwd_det_{f32,i32idx}` (the per-output loop over the
+      positions) are in `nsl_kir::kernels::embedding_bwd`.
+      - **Index and bounds.** The index is widened signed. The atomic
+        kernels keep the hand kernels' `idx < 0` guard, then bound `vocab`
+        on the index's bits, unsigned. Given the guard, that agrees with the
+        hand kernels' signed bound.
+      - **Loop shape.** The deterministic loop's conditional branches carry
+        no block arguments: a hit and a skip block join at a latch. With a
+        copy-carrying edge on the match test, ptxas neither if-converted
+        nor unrolled the loop. Now it does both, as for the hand kernel.
+      - **The gate,** `embedding_bwd_kir_equivalence`, requires the hand
+        kernels' bytes on 16 × 16 and 8 × 4 blocks. The output starts
+        non-zero, so an add is told from a store. The atomic sums follow the
+        schedule's order and the deterministic ones follow the positions. It
+        kills mutants of the bounds, the 2-D index, the address arithmetic,
+        the negative guard's boundary, the f32 truncation, the atomic add,
+        and the loop's match, step, start and accumulate. Two mutants are
+        named as equivalent: the i32 index zero-extended, and the atomic
+        guard removed outright (the unsigned bound rejects a negative index
+        too).
+      - **SASS:** the same memory, conversion and atomic instructions as the
+        hand kernels. Registers are 14 against 12 for the atomic pair, and
+        within ±4 of the hand kernels for the unrolled deterministic pair.
+      - **Still hand-written:** the uncalled `nsl_scatter_add_f32`.
     - **`fused_kernels.rs`, integer dequantization.**
       `nsl_dequant_int8_per_head_f32`, `nsl_dequant_int8_per_token_f32` and
       `nsl_dequant_int4_per_group_f32` are in `nsl_kir::kernels::dequant`.
