@@ -13,6 +13,7 @@ pub mod data_movement;
 pub mod dequant;
 pub mod dropout;
 pub mod elementwise;
+pub mod embedding_bwd;
 pub mod lookup;
 pub mod optim;
 pub mod strided_copy;

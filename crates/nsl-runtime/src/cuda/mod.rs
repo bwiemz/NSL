@@ -6637,19 +6637,19 @@ pub(crate) fn gpu_embedding_backward(
     let deterministic = crate::deterministic_ops::is_deterministic();
     let (ptx, kernel_name): (&str, &[u8]) = match (deterministic, indices.dtype) {
         (true, crate::tensor::DTYPE_I32) => (
-            fused_kernels::EMBEDDING_BWD_DET_I32IDX_PTX,
+            fused_kernels::embedding_bwd_det_i32idx_ptx(),
             b"nsl_embedding_bwd_det_i32idx\0",
         ),
         (true, 1) => (
-            fused_kernels::EMBEDDING_BWD_DET_F32_PTX,
+            fused_kernels::embedding_bwd_det_f32_ptx(),
             b"nsl_embedding_bwd_det_f32\0",
         ),
         (false, crate::tensor::DTYPE_I32) => (
-            fused_kernels::EMBEDDING_BWD_I32IDX_PTX,
+            fused_kernels::embedding_bwd_i32idx_ptx(),
             b"nsl_embedding_bwd_i32idx\0",
         ),
         (false, 1) => (
-            fused_kernels::EMBEDDING_BWD_F32_PTX,
+            fused_kernels::embedding_bwd_f32_ptx(),
             b"nsl_embedding_bwd_f32\0",
         ),
         _ => return 0,
@@ -10430,6 +10430,10 @@ mod tests {
         all.push(("nsl_embedding_i32idx", super::fused_kernels::embedding_i32idx_ptx(), true));
         all.push(("nsl_gather_f32", super::fused_kernels::gather_f32_ptx(), true));
         all.push(("nsl_gather_i32idx", super::fused_kernels::gather_i32idx_ptx(), true));
+        all.push(("nsl_embedding_bwd_f32", super::fused_kernels::embedding_bwd_f32_ptx(), true));
+        all.push(("nsl_embedding_bwd_i32idx", super::fused_kernels::embedding_bwd_i32idx_ptx(), true));
+        all.push(("nsl_embedding_bwd_det_f32", super::fused_kernels::embedding_bwd_det_f32_ptx(), true));
+        all.push(("nsl_embedding_bwd_det_i32idx", super::fused_kernels::embedding_bwd_det_i32idx_ptx(), true));
         all.push(("nsl_strided_copy_f32", super::fused_kernels::strided_copy_f32_ptx(), true));
         all.push(("nsl_slice_f32", super::fused_kernels::slice_f32_ptx(), true));
         all
@@ -10585,9 +10589,19 @@ mod tests {
                 declared.push(name);
             }
         }
+        // The parser must see every constant the table registers: if the
+        // declaration form changed under it, the registered ones go missing
+        // here. (A fixed floor on the count was the old guard; the KIR
+        // migrations keep lowering the count, so it would trip on progress.)
+        let unseen: Vec<&str> = fused_kernels::ALL_PTX
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| !declared.contains(name))
+            .collect();
         assert!(
-            declared.len() > 40,
-            "parser found only {} PTX constants; the declaration form must have changed",
+            !declared.is_empty() && unseen.is_empty(),
+            "the parser found {} PTX constants and missed {unseen:?} from ALL_PTX; \
+             the declaration form must have changed",
             declared.len()
         );
 
