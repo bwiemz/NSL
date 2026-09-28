@@ -10594,9 +10594,19 @@ mod tests {
                 declared.push(name);
             }
         }
+        // The parser must see every constant the table registers: if the
+        // declaration form changed under it, the registered ones go missing
+        // here. (A fixed floor on the count was the old guard; the KIR
+        // migrations keep lowering the count, so it would trip on progress.)
+        let unseen: Vec<&str> = fused_kernels::ALL_PTX
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| !declared.contains(name))
+            .collect();
         assert!(
-            declared.len() > 40,
-            "parser found only {} PTX constants; the declaration form must have changed",
+            !declared.is_empty() && unseen.is_empty(),
+            "the parser found {} PTX constants and missed {unseen:?} from ALL_PTX; \
+             the declaration form must have changed",
             declared.len()
         );
 
