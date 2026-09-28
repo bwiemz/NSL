@@ -29,6 +29,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
     the hand kernels, the CSR loop unrolled 8× as before, with 0–4 more
     registers.
 
+- **The deterministic sum kernels are built by `nsl_kir::kernels::det_sum`**
+  in place of their hand-written constants (new-roadmap item 5):
+  `nsl_det_global_sum_f32` and `nsl_det_sum_dim_f32`.
+  - **The kernels** keep the hand kernels' contract: one thread per result,
+    adding in ascending index order from `+0.0`. The global sum is a single
+    thread; the per-dim sum is a one-thread block per output. Each add is
+    now `add.rn.f32`: the rounding is unchanged, and the explicit mode keeps
+    a multiply from being contracted into the sum.
+  - **The gate,** `det_sum_kir_equivalence` (8 tests), runs the frozen hand
+    modules (`tests/fixtures/det_sum_hand.rs`) and the KIR ones on the CTA
+    interpreter. It requires the same bytes, and the ascending f32 sum bit
+    for bit, over empty and ragged extents with order-sensitive data,
+    signed zeros and an infinity, in both block orders. It kills mutants of
+    each bound, the block index, the output's split into quotient and
+    remainder, every element size, add and stride, the step, the
+    accumulator's start and the add.
+  - **SASS** (sm_80/90/120): the same 8× unrolled loop as the hand kernels,
+    with 8 loads and 8 adds per trip. Registers are equal on sm_90 and
+    sm_120, and two more on sm_80, on a one-thread block.
+
 - **The embedding backward kernels are built by
   `nsl_kir::kernels::embedding_bwd`** in place of their hand-written
   constants (new-roadmap item 5): the atomic `nsl_embedding_bwd_f32` and
@@ -1573,6 +1593,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   restored to their pre-700bfaa8 structural assertions now that R7 is retired.
 
 ### Changed
+
+- **The KIR PTX printer places a conditional edge's copies out of line**
+  (new-roadmap item 5). A `CondBranch` edge that carries block arguments
+  now branches to a trampoline printed after the kernel's last block. The
+  trampoline makes the edge's copies and jumps to the target. The branch
+  itself stays a plain `@p bra; bra` pair. The earlier form printed the
+  copies inline around the branch (`@!p bra BBn_else; copies; bra; BBn_else:
+  ...`), and ptxas then neither unrolled nor if-converted the loops such
+  branches close.
+  - **What moves.** Across the runtime's 67 KIR modules, SASS changes only
+    for `nsl_csha_tier_b1_prepass_x`, whose loops now unroll (sm_80: 22
+    memory instructions against 8, registers 24 → 26). The other ten
+    modules that printed the old form assemble to identical SASS.
+  - **fused_linear_ce v1.** The forward's SASS is unchanged. The backward's
+    tiled loop now unrolls again, as the hand kernel's did before #723:
+    at `V = 4096, H = 128`, sm_80, 340 memory instructions against 17, with
+    32 registers either way (the frozen hand kernel: 772 and 32). On sm_120
+    registers go 38 → 40, the hand kernel's count.
+  - **Snapshots.** The three `fused_linear_ce_v1_byte_identity` snapshots
+    and the `kernel_block_for_range` / `kernel_block_while_break_continue`
+    kernel-block snapshots are re-blessed for the new branch form. The
+    `emit_terminator` unit test pins the trampoline and its placement.
 
 - **The train-block driver's planning order is a value: `PASS_ORDER`**
   (roadmap A1, `TrainPlan` step 4a).

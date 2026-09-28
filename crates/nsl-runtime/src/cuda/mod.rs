@@ -7703,7 +7703,6 @@ pub(crate) fn gpu_dequant_fp8_e4m3_f32(
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_det_global_sum_f32(tensor_ptr: i64) -> i64 {
     use crate::tensor::NslTensor;
-    use fused_kernels::DET_GLOBAL_SUM_F32_PTX;
 
     let t = NslTensor::from_ptr(tensor_ptr);
     assert_gpu_f32(t, "det_global_sum_f32", "input");
@@ -7727,7 +7726,7 @@ pub(crate) fn gpu_det_global_sum_f32(tensor_ptr: i64) -> i64 {
 
     // Single block, single thread — guarantees sequential deterministic accumulation
     let result = inner::kernel_launch(
-        DET_GLOBAL_SUM_F32_PTX.as_ptr(), b"nsl_det_global_sum_f32\0".as_ptr(),
+        fused_kernels::det_global_sum_f32_ptx().as_ptr(), b"nsl_det_global_sum_f32\0".as_ptr(),
         [1, 1, 1], [1, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU det_global_sum kernel failed: {:?}", result);
@@ -7757,7 +7756,6 @@ pub(crate) fn gpu_det_global_sum_f32(tensor_ptr: i64) -> i64 {
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_det_sum_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) -> i64 {
     use crate::tensor::NslTensor;
-    use fused_kernels::DET_SUM_DIM_F32_PTX;
 
     let t = NslTensor::from_ptr(tensor_ptr);
     assert_gpu_f32(t, "det_sum_dim_f32", "input");
@@ -7807,7 +7805,7 @@ pub(crate) fn gpu_det_sum_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) ->
     // One block per output element, single thread per block — sequential accumulation
     let grid = out_total as i64;
     let result = inner::kernel_launch(
-        DET_SUM_DIM_F32_PTX.as_ptr(), b"nsl_det_sum_dim_f32\0".as_ptr(),
+        fused_kernels::det_sum_dim_f32_ptx().as_ptr(), b"nsl_det_sum_dim_f32\0".as_ptr(),
         [grid, 1, 1], [1, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU det_sum_dim kernel failed: {:?}", result);
@@ -10443,6 +10441,8 @@ mod tests {
         ] {
             all.push((op.kernel_name(), module, true));
         }
+        all.push(("nsl_det_global_sum_f32", super::fused_kernels::det_global_sum_f32_ptx(), true));
+        all.push(("nsl_det_sum_dim_f32", super::fused_kernels::det_sum_dim_f32_ptx(), true));
         all.push(("nsl_csr_spmv_f32", super::fused_kernels::csr_spmv_f32_ptx(), true));
         all.push(("nsl_coo_spmv_f32", super::fused_kernels::coo_spmv_f32_ptx(), true));
         all.push(("nsl_strided_copy_f32", super::fused_kernels::strided_copy_f32_ptx(), true));

@@ -38,11 +38,8 @@ BB0:
     bra BB1;
 BB1:
     setp.lt.u32 %p0, %r3, %r1;
-    @!%p0 bra BB1_else;
-    bra BB2;
-BB1_else:
-    mov.f32 %f0, %f1;
-    bra BB3;
+    @%p0 bra BB2;
+    bra BB1_f;
 BB2:
     mov.u32 %r2, 4;
     mul.lo.u32 %r4, %r0, %r2;
@@ -63,4 +60,7 @@ BB3:
     add.u64 %rd0, %rd1, %rd0;
     st.global.f32 [%rd0], %f0;
     ret;
+BB1_f:
+    mov.f32 %f0, %f1;
+    bra BB3;
 }

@@ -2644,108 +2644,36 @@ pub(crate) fn coo_spmv_f32_ptx() -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
-// M46b: Deterministic Global Sum (single-thread sequential accumulation)
-// Thread 0 accumulates ALL elements in order (no parallelism = deterministic).
-// This is slow but guarantees bit-identical results regardless of scheduling.
-// Grid: (1, 1, 1), Block: (1, 1, 1)
-// Params: inp ptr (f32), out ptr (f32), n (u64)
+// M46b: the deterministic sums — one thread per result, adding in ascending
+// index order, so the result does not depend on scheduling.
 // ---------------------------------------------------------------------------
-pub(crate) const DET_GLOBAL_SUM_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_80\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_det_global_sum_f32(\n\
-    .param .u64 inp, .param .u64 out, .param .u64 len\n\
-) {\n\
-    .reg .u64 %rd<6>;\n\
-    .reg .f32 %f<3>;\n\
-    .reg .pred %p1;\n\
-    ld.param.u64 %rd1, [inp];\n\
-    ld.param.u64 %rd2, [out];\n\
-    ld.param.u64 %rd3, [len];\n\
-    // acc = 0.0\n\
-    mov.f32 %f1, 0f00000000;\n\
-    mov.u64 %rd4, 0;\n\
-DET_SUM_LOOP:\n\
-    setp.ge.u64 %p1, %rd4, %rd3;\n\
-    @%p1 bra DET_SUM_DONE;\n\
-    // Load inp[i]\n\
-    shl.b64 %rd5, %rd4, 2;\n\
-    add.u64 %rd5, %rd1, %rd5;\n\
-    ld.global.f32 %f2, [%rd5];\n\
-    // acc += inp[i] (deterministic order: 0, 1, 2, ...)\n\
-    add.f32 %f1, %f1, %f2;\n\
-    add.u64 %rd4, %rd4, 1;\n\
-    bra DET_SUM_LOOP;\n\
-DET_SUM_DONE:\n\
-    st.global.f32 [%rd2], %f1;\n\
-    ret;\n\
-}\0";
 
-// ---------------------------------------------------------------------------
-// M46b: Deterministic Per-Dim Sum (one thread per output element, sequential)
-// Each thread sequentially sums its reduce_size elements in ascending order.
-// Grid: (outer * inner, 1, 1), Block: (1, 1, 1)
-// This is deterministic because each output is computed by exactly one thread
-// with elements accumulated in ascending index order (no shared-memory tree).
-// Params: inp ptr, out ptr, outer (u64), reduce_size (u64), inner (u64)
-// ---------------------------------------------------------------------------
-pub(crate) const DET_SUM_DIM_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_80\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_det_sum_dim_f32(\n\
-    .param .u64 inp, .param .u64 out,\n\
-    .param .u64 outer, .param .u64 reduce_size, .param .u64 inner\n\
-) {\n\
-    .reg .u64 %rd<14>;\n\
-    .reg .u32 %r<4>;\n\
-    .reg .f32 %f<3>;\n\
-    .reg .pred %p<3>;\n\
-    // tid = blockIdx.x (one thread per output element)\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    cvt.u64.u32 %rd0, %r1;\n\
-    ld.param.u64 %rd1, [inp];\n\
-    ld.param.u64 %rd2, [out];\n\
-    ld.param.u64 %rd3, [outer];\n\
-    ld.param.u64 %rd4, [reduce_size];\n\
-    ld.param.u64 %rd5, [inner];\n\
-    // total_outputs = outer * inner\n\
-    mul.lo.u64 %rd6, %rd3, %rd5;\n\
-    setp.ge.u64 %p1, %rd0, %rd6;\n\
-    @%p1 bra DET_SDIM_DONE;\n\
-    // Compute o = tid / inner, i = tid % inner\n\
-    div.u64 %rd7, %rd0, %rd5;\n\
-    rem.u64 %rd8, %rd0, %rd5;\n\
-    // Sequential accumulate: sum inp[o * reduce_size * inner + r * inner + i] for r in 0..reduce_size\n\
-    mov.f32 %f1, 0f00000000;\n\
-    mov.u64 %rd9, 0;\n\
-    // base = (o * reduce_size * inner + i) * 4\n\
-    mul.lo.u64 %rd10, %rd7, %rd4;\n\
-    mul.lo.u64 %rd10, %rd10, %rd5;\n\
-    add.u64 %rd10, %rd10, %rd8;\n\
-    // stride = inner\n\
-DET_SDIM_LOOP:\n\
-    setp.ge.u64 %p2, %rd9, %rd4;\n\
-    @%p2 bra DET_SDIM_STORE;\n\
-    // addr = inp + (base + r * inner) * 4\n\
-    mul.lo.u64 %rd11, %rd9, %rd5;\n\
-    add.u64 %rd11, %rd10, %rd11;\n\
-    shl.b64 %rd11, %rd11, 2;\n\
-    add.u64 %rd12, %rd1, %rd11;\n\
-    ld.global.f32 %f2, [%rd12];\n\
-    add.f32 %f1, %f1, %f2;\n\
-    add.u64 %rd9, %rd9, 1;\n\
-    bra DET_SDIM_LOOP;\n\
-DET_SDIM_STORE:\n\
-    // out[tid] = acc\n\
-    shl.b64 %rd13, %rd0, 2;\n\
-    add.u64 %rd13, %rd2, %rd13;\n\
-    st.global.f32 [%rd13], %f1;\n\
-DET_SDIM_DONE: ret;\n\
-}\0";
+/// The KIR-built deterministic-sum module for `op`, built once. Both kernels
+/// are built by `nsl_kir::kernels::det_sum`; its `det_sum_kir_equivalence`
+/// gate holds them to the hand-written modules they replaced.
+/// NUL-terminated.
+fn det_sum_module(op: nsl_kir::kernels::det_sum::DetSumOp) -> &'static str {
+    use nsl_kir::kernels::det_sum::DetSumOp;
+    use std::sync::OnceLock;
+    static MODULES: [OnceLock<String>; 2] = [OnceLock::new(), OnceLock::new()];
+    let slot = DetSumOp::ALL.iter().position(|o| *o == op).expect("a deterministic sum");
+    MODULES[slot].get_or_init(|| String::from_utf8(nsl_kir::kernels::det_sum::ptx(op)).expect("PTX must be ASCII"))
+}
+
+/// `nsl_det_global_sum_f32(inp, out, len)`: `out[0] = inp[0] + … +
+/// inp[len - 1]`, in that order, by one thread. Grid (1, 1, 1), block
+/// (1, 1, 1).
+pub(crate) fn det_global_sum_f32_ptx() -> &'static str {
+    det_sum_module(nsl_kir::kernels::det_sum::DetSumOp::Global)
+}
+
+/// `nsl_det_sum_dim_f32(inp, out, outer, reduce_size, inner)`: the sum over
+/// the middle axis of an `[outer, reduce_size, inner]` view, one one-thread
+/// block per output (`%ctaid.x`), adding in ascending order. Grid
+/// (outer · inner, 1, 1), block (1, 1, 1).
+pub(crate) fn det_sum_dim_f32_ptx() -> &'static str {
+    det_sum_module(nsl_kir::kernels::det_sum::DetSumOp::Dim)
+}
 
 // ---------------------------------------------------------------------------
 // M46c: Deterministic Scatter-Add (output-centric, no atomics)
@@ -3746,8 +3674,6 @@ pub(crate) const ALL_PTX: &[(&str, &str)] = &[
     ("CSR_SPMM_F32_PTX", CSR_SPMM_F32_PTX),
     ("COO_SPMM_F32_PTX", COO_SPMM_F32_PTX),
     ("BSR_SPMM_F32_PTX", BSR_SPMM_F32_PTX),
-    ("DET_GLOBAL_SUM_F32_PTX", DET_GLOBAL_SUM_F32_PTX),
-    ("DET_SUM_DIM_F32_PTX", DET_SUM_DIM_F32_PTX),
     ("DET_SCATTER_ADD_F32_PTX", DET_SCATTER_ADD_F32_PTX),
     ("TENSOR_STATS_F32_PTX", TENSOR_STATS_F32_PTX),
     ("SUM_SQ_F64_ACC_F32_PTX", SUM_SQ_F64_ACC_F32_PTX),
