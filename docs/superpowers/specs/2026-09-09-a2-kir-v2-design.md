@@ -1055,6 +1055,27 @@ frozen throughout, so nothing here blocks a kernel fix.
         hand kernels. Registers are 14 against 12 for the atomic pair, and
         within ±4 of the hand kernels for the unrolled deterministic pair.
       - **Still hand-written:** the uncalled `nsl_scatter_add_f32`.
+    - **`fused_kernels.rs`, the fused RMSNorm gamma backward.**
+      `nsl_rmsnorm_rinv_rows_f32` (a thread per row, `1 / sqrt(Σ x² /
+      cols + eps)`) and `nsl_rmsnorm_dgamma_f32` (a thread per column,
+      `Σ_i (dy · x) · rinv[i]` in row order) are in
+      `nsl_kir::kernels::rmsnorm_dgamma`. Every float operation is
+      correctly rounded: `fma.rn`, `cvt.rn.f32.u64`, `div.rn`, `add.rn`,
+      `sqrt.rn`, `mul.rn`. The dgamma loop carries the element offset and
+      steps it by `cols`, as the hand kernel stepped its pointers. Forming
+      `i · cols + j` each trip cost 69 more instructions on sm_80.
+      - **The gate,** `rmsnorm_dgamma_kir_equivalence`, requires the hand
+        kernels' bytes and the formulas, bit for bit, over single-row,
+        single-column and ragged shapes with signed zeros, on 256- and
+        32-thread blocks under two schedules. It kills mutants of each
+        bound, the block index, every element size, add and stride, the
+        step, the start, and every float operation.
+      - **SASS:** the same loads, `FFMA`, `FMUL` and `FADD` as the hand
+        kernels, each loop unrolled 8× as before. Registers: rinv 22/22/24
+        against 20/18/22, dgamma 30/32/38 against 31/31/32 (sm_80/90/120).
+        With 256-thread blocks, neither costs occupancy: sm_120's 1,536
+        threads per SM hold six blocks either way. Instruction counts are
+        15–23% higher, from per-trip address arithmetic.
     - **`fused_kernels.rs`, integer dequantization.**
       `nsl_dequant_int8_per_head_f32`, `nsl_dequant_int8_per_token_f32` and
       `nsl_dequant_int4_per_group_f32` are in `nsl_kir::kernels::dequant`.
