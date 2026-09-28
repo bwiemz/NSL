@@ -82,7 +82,7 @@ fn u64_op2(b: &mut KirBuilder, op: fn(VarId, VarId, VarId) -> KirOp, x: VarId, y
 }
 
 /// `%ctaid.d · %ntid.d + %tid.d`, widened to 64 bits.
-fn coordinate(b: &mut KirBuilder, dim: u8) -> VarId {
+pub(super) fn coordinate(b: &mut KirBuilder, dim: u8) -> VarId {
     let c32 = b.new_typed_var(KirType::U32);
     b.emit(KirOp::GlobalId(c32, dim));
     let c = b.new_typed_var(KirType::U64);

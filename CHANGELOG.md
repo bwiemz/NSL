@@ -28,6 +28,48 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
     with 8 loads and 8 adds per trip. Registers are equal on sm_90 and
     sm_120, and two more on sm_80, on a one-thread block.
 
+- **The embedding backward kernels are built by
+  `nsl_kir::kernels::embedding_bwd`** in place of their hand-written
+  constants (new-roadmap item 5): the atomic `nsl_embedding_bwd_f32` and
+  `nsl_embedding_bwd_i32idx`, and the deterministic
+  `nsl_embedding_bwd_det_f32` and `nsl_embedding_bwd_det_i32idx`.
+  - **The kernels** keep the hand kernels' sequence:
+    - the index is truncated from f32 or sign-extended from i32, to a
+      signed 64-bit integer;
+    - the atomic pair skips a negative index or one past `vocab`, then adds
+      with `red.global.add.f32`;
+    - the deterministic pair walks the positions in order and writes each
+      output element once, bit-exact against the CPU reference.
+
+    The atomic `vocab` bound compares the index's bits unsigned, after the
+    signed `idx < 0` guard. The hand kernels compared it signed; given the
+    guard, the two agree.
+  - **Loop shape.** In the deterministic loop, the hit and skip paths join
+    at a latch block, so no conditional branch carries block arguments.
+    With edge copies inline around the match test, ptxas neither
+    if-converted nor unrolled the loop. It now unrolls it as it did the hand
+    kernel's, with the same 17–18 memory instructions.
+  - **The gate.** `tests/embedding_bwd_kir_equivalence.rs` (10 tests) runs
+    the frozen hand kernels and the KIR ones on the CTA interpreter's 2-D
+    blocks (16 × 16 and 8 × 4) under two schedules.
+    - The output starts non-zero, so an add is told from a store.
+    - The indices include repeated rows, rows never hit, skipped indices
+      (negative, at or past `vocab`, infinite) and indices that land on row
+      0 (NaN, -0.5).
+    - It requires identical global memory. The atomic sums must follow the
+      schedule's order and the deterministic ones the positions'.
+    - It kills mutants of:
+      - each bound, both block indices, `%tid.y` and `%ntid.y`;
+      - every element size, 64-bit add and row stride;
+      - the negative guard's boundary and the f32 truncation;
+      - the atomic add, read as a store;
+      - the deterministic loop's match test, step, start and accumulate.
+    - Two mutants are named as equivalent: the i32 index zero-extended, and
+      the atomic guard removed outright (the unsigned bound rejects a
+      negative index as well).
+  - **SASS** on sm_80/90/120: the same memory, conversion and atomic
+    instructions as the hand kernels. Registers are 14 against 12 for the
+    atomic pair, and within ±4 either way for the deterministic pair.
 - **The batched Muon Newton-Schulz kernels are built by
   `nsl_kir::kernels::muon_batch`** in place of their hand-written constants
   (new-roadmap item 5): `nsl_muon_batch_{mom,sumsq,pack,poly,update}_f32`.

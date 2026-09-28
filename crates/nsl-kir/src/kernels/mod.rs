@@ -14,6 +14,7 @@ pub mod dequant;
 pub mod det_sum;
 pub mod dropout;
 pub mod elementwise;
+pub mod embedding_bwd;
 pub mod lookup;
 pub mod muon_batch;
 pub mod optim;
