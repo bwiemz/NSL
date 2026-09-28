@@ -1104,8 +1104,8 @@ frozen throughout, so nothing here blocks a kernel fix.
         else; mov ...; bra out; else: bra body`), ptxas did not unroll the
         loop. With the copies out of line, it unrolls it 4× as it did the
         hand kernel's loop. The `muon_batch` unit tests pin that shape.
-        Other KIR loops whose exit edge carries arguments may be losing the
-        same unroll; the printer could place such copies out of line.
+        The printer now places such copies out of line for every
+        conditional edge (see "The printer's conditional edges" below).
       - **The gate,** `muon_batch_kir_equivalence`, requires the hand
         kernels' bytes and formulas over batched, scattered matrices,
         square, wide and tall, with both flags. It kills mutants of every
@@ -1117,6 +1117,18 @@ frozen throughout, so nothing here blocks a kernel fix.
         kernels, with registers equal or fewer. The exception is the
         reduction: its two loops are each unrolled, and it uses fewer
         registers (25–28 against 30–38).
+    - **The printer's conditional edges.** A `CondBranch` edge that
+      carries block arguments branches to a trampoline printed after the
+      last block, which makes the copies and jumps to the target; the
+      branch is a plain `@p bra; bra` pair. With the copies inline around
+      the branch, ptxas neither unrolled nor if-converted the loops those
+      branches close.
+      - **SASS across the runtime's KIR modules:** unchanged except
+        `nsl_csha_tier_b1_prepass_x`, whose loops now unroll (sm_80 memory
+        instructions 8 → 22).
+      - **fused_linear_ce v1:** the forward is unchanged; the backward's
+        tiled loop unrolls again (sm_80 memory instructions 17 → 340, the
+        hand kernel 772), recovering the unroll #723's migration lost.
 12. **FA v2**, by phase directory, tier B.1 and B.2 last; the SASS
     baselines and the two no-spill gates already exist here and are the
     proof. `matmul_mma.rs` and `kernel_skeleton/` are deleted with their

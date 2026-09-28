@@ -1553,6 +1553,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- **The KIR PTX printer places a conditional edge's copies out of line**
+  (new-roadmap item 5). A `CondBranch` edge that carries block arguments
+  now branches to a trampoline printed after the kernel's last block. The
+  trampoline makes the edge's copies and jumps to the target. The branch
+  itself stays a plain `@p bra; bra` pair. The earlier form printed the
+  copies inline around the branch (`@!p bra BBn_else; copies; bra; BBn_else:
+  ...`), and ptxas then neither unrolled nor if-converted the loops such
+  branches close.
+  - **What moves.** Across the runtime's 67 KIR modules, SASS changes only
+    for `nsl_csha_tier_b1_prepass_x`, whose loops now unroll (sm_80: 22
+    memory instructions against 8, registers 24 → 26). The other ten
+    modules that printed the old form assemble to identical SASS.
+  - **fused_linear_ce v1.** The forward's SASS is unchanged. The backward's
+    tiled loop now unrolls again, as the hand kernel's did before #723:
+    at `V = 4096, H = 128`, sm_80, 340 memory instructions against 17, with
+    32 registers either way (the frozen hand kernel: 772 and 32). On sm_120
+    registers go 38 → 40, the hand kernel's count.
+  - **Snapshots.** The three `fused_linear_ce_v1_byte_identity` snapshots
+    and the `kernel_block_for_range` / `kernel_block_while_break_continue`
+    kernel-block snapshots are re-blessed for the new branch form. The
+    `emit_terminator` unit test pins the trampoline and its placement.
+
 - **The train-block driver's planning order is a value: `PASS_ORDER`**
   (roadmap A1, `TrainPlan` step 4a).
   - **The table.** `stmt_train/pass_order.rs` lists the 17 planning steps
