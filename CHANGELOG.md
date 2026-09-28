@@ -8,6 +8,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **`nsl_sum_dim_short_f32` is built by `nsl_kir::kernels::det_sum`**
+  (`DetSumOp::DimShort`) in place of its hand-written constant (new-roadmap
+  item 5). It is the per-dim sum used by most `sum_dim` calls: one thread
+  per output on 256-thread blocks, walking the reduced axis in order from
+  `+0.0`. It is the deterministic per-dim sum's loop, with the thread's
+  global index in place of `%ctaid.x`.
+  - **The gate:** `det_sum_kir_equivalence` now covers it, on 256- and
+    4-thread blocks, with a 300-output shape that spans two 256-thread
+    blocks. The `%tid.x` and `%ntid.x` mutants are killed along with the
+    per-dim sum's.
+  - **SASS** (sm_80/90/120): the hand kernel's 8× unrolled loop, with 2–5
+    more registers and no occupancy change at 256 threads.
+
 - **The deterministic sum kernels are built by `nsl_kir::kernels::det_sum`**
   in place of their hand-written constants (new-roadmap item 5):
   `nsl_det_global_sum_f32` and `nsl_det_sum_dim_f32`.
