@@ -33,6 +33,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
     traffic, barriers and float instructions as the hand kernels, with
     registers within two of them.
 
+- **The fused RMSNorm gamma-backward kernels are built by
+  `nsl_kir::kernels::rmsnorm_dgamma`** in place of their hand-written
+  constants (new-roadmap item 5): `nsl_rmsnorm_rinv_rows_f32` and
+  `nsl_rmsnorm_dgamma_f32`.
+  - **The kernels** keep the hand kernels' loads and correctly rounded
+    arithmetic:
+    - `rinv[r] = 1 / sqrt(Σ x² / cols + eps)`, a thread per row;
+    - `dgamma[j] = Σ_i (dy · x) · rinv[i]` in row order, a thread per
+      column, so the result stays bit-deterministic.
+  - **The gate,** `rmsnorm_dgamma_kir_equivalence` (9 tests), runs the
+    frozen hand modules (`tests/fixtures/rmsnorm_dgamma_hand.rs`) and the
+    KIR ones on the CTA interpreter. It requires the same bytes and the
+    formulas, bit for bit, on 256- and 32-thread blocks under two
+    schedules. Mutants of every bound, index, element size, add, stride,
+    the step, start and every float operation are killed.
+  - **SASS** (sm_80/90/120): the same loads and float instructions as the
+    hand kernels, each loop unrolled 8×. Registers are within 6 of the hand
+    kernels, with no occupancy change at 256 threads.
+
 - **The sparse matrix-vector kernels are built by
   `nsl_kir::kernels::spmv`** in place of their hand-written constants
   (new-roadmap item 5): `nsl_csr_spmv_f32` and `nsl_coo_spmv_f32`.

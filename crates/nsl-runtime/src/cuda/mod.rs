@@ -8150,7 +8150,6 @@ pub(crate) fn gpu_rmsnorm_dgamma_backward_f32(
 ) -> i64 {
     inner::set_oom_context("rmsnorm_dgamma_bwd_f32");
     use crate::tensor::NslTensor;
-    use fused_kernels::{RMSNORM_DGAMMA_F32_PTX, RMSNORM_RINV_ROWS_F32_PTX};
 
     let x = NslTensor::from_ptr(x_ptr);
     assert_gpu_f32(x, "rmsnorm_dgamma_backward_f32", "x");
@@ -8198,7 +8197,7 @@ pub(crate) fn gpu_rmsnorm_dgamma_backward_f32(
     ];
     let grid_rows = rows.div_ceil(256) as i64;
     let result = inner::kernel_launch(
-        RMSNORM_RINV_ROWS_F32_PTX.as_ptr(),
+        fused_kernels::rmsnorm_rinv_rows_f32_ptx().as_ptr(),
         b"nsl_rmsnorm_rinv_rows_f32\0".as_ptr(),
         [grid_rows.max(1), 1, 1],
         [256, 1, 1],
@@ -8217,7 +8216,7 @@ pub(crate) fn gpu_rmsnorm_dgamma_backward_f32(
     ];
     let grid_cols = cols.div_ceil(256) as i64;
     let result = inner::kernel_launch(
-        RMSNORM_DGAMMA_F32_PTX.as_ptr(),
+        fused_kernels::rmsnorm_dgamma_f32_ptx().as_ptr(),
         b"nsl_rmsnorm_dgamma_f32\0".as_ptr(),
         [grid_cols.max(1), 1, 1],
         [256, 1, 1],
@@ -10442,6 +10441,8 @@ mod tests {
         all.push(("nsl_det_sum_dim_f32", super::fused_kernels::det_sum_dim_f32_ptx(), true));
         all.push(("nsl_csr_spmv_f32", super::fused_kernels::csr_spmv_f32_ptx(), true));
         all.push(("nsl_coo_spmv_f32", super::fused_kernels::coo_spmv_f32_ptx(), true));
+        all.push(("nsl_rmsnorm_rinv_rows_f32", super::fused_kernels::rmsnorm_rinv_rows_f32_ptx(), true));
+        all.push(("nsl_rmsnorm_dgamma_f32", super::fused_kernels::rmsnorm_dgamma_f32_ptx(), true));
         all.push(("nsl_global_sum_f32", super::fused_kernels::global_sum_f32_ptx(), true));
         all.push(("nsl_sum_dim_f32", super::fused_kernels::sum_dim_f32_ptx(), true));
         all.push(("nsl_max_dim_f32", super::fused_kernels::max_dim_f32_ptx(), true));
