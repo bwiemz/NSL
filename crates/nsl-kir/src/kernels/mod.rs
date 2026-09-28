@@ -18,5 +18,6 @@ pub mod embedding_bwd;
 pub mod lookup;
 pub mod muon_batch;
 pub mod optim;
+pub mod spmv;
 pub mod strided_copy;
 pub mod tier_b1_prepass;

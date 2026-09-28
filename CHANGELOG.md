@@ -21,6 +21,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   - **SASS** (sm_80/90/120): the hand kernel's 8× unrolled loop, with 2–5
     more registers and no occupancy change at 256 threads.
 
+- **The sparse matrix-vector kernels are built by
+  `nsl_kir::kernels::spmv`** in place of their hand-written constants
+  (new-roadmap item 5): `nsl_csr_spmv_f32` and `nsl_coo_spmv_f32`.
+  - **The kernels** keep the hand kernels' loads and rounding. CSR is a
+    thread per row, `fma`-accumulating from `+0.0` in nonzero order over
+    `u32` indices. COO is a thread per nonzero, adding `values[k] ·
+    x[col]` (`mul.rn`) into `y[row]` atomically over `i64` indices; its
+    atomic is now `red.global.add.f32`, the result-less form of the hand
+    kernel's `atom`.
+  - **The gate,** `spmv_kir_equivalence` (10 tests), runs the frozen hand
+    modules (`tests/fixtures/spmv_hand.rs`) and the KIR ones on the CTA
+    interpreter. The two leave the same bytes over empty, long and repeated
+    rows, on 256- and 32-thread blocks, under two schedules. On exact data
+    they are the fused CSR sum and the COO atomic update of the `y` they
+    were given. Mutants of every bound, the block index, every element size
+    and 64-bit add, the CSR step, start and `fma`, the COO product and the
+    atomic add are killed.
+  - **SASS** (sm_80/90/120): the same loads, multiply-adds and atomics as
+    the hand kernels, the CSR loop unrolled 8× as before, with 0–4 more
+    registers.
+
 - **The deterministic sum kernels are built by `nsl_kir::kernels::det_sum`**
   in place of their hand-written constants (new-roadmap item 5):
   `nsl_det_global_sum_f32` and `nsl_det_sum_dim_f32`.

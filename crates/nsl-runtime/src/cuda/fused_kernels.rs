@@ -2562,137 +2562,33 @@ BSR_DONE: ret;\n\
 }\0";
 
 // ---------------------------------------------------------------------------
-// M50: CSR SpMV — y[M] = A_csr[M,K] @ x[K]
-// One thread per row: each thread computes the dot product for one output row.
+// M50: sparse matrix-vector products, y[M] = A[M,K] @ x[K].
 // ---------------------------------------------------------------------------
 
-/// CSR SpMV kernel: row_ptrs[M+1], col_indices[nnz], values[nnz], x[K], y[M], M
-pub(crate) const CSR_SPMV_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_csr_spmv_f32(\n\
-    .param .u64 row_ptrs,\n\
-    .param .u64 col_indices,\n\
-    .param .u64 values,\n\
-    .param .u64 x,\n\
-    .param .u64 y,\n\
-    .param .u64 M\n\
-) {\n\
-    .reg .u64 %rd<14>;\n\
-    .reg .u32 %r<4>;\n\
-    .reg .f32 %f<4>;\n\
-    .reg .pred %p1;\n\
-    // row = blockIdx.x * blockDim.x + threadIdx.x\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r1, %r1, %r2;\n\
-    mov.u32 %r2, %tid.x;\n\
-    add.u32 %r1, %r1, %r2;\n\
-    cvt.u64.u32 %rd0, %r1;\n\
-    ld.param.u64 %rd1, [row_ptrs];\n\
-    ld.param.u64 %rd2, [col_indices];\n\
-    ld.param.u64 %rd3, [values];\n\
-    ld.param.u64 %rd4, [x];\n\
-    ld.param.u64 %rd5, [y];\n\
-    ld.param.u64 %rd6, [M];\n\
-    setp.ge.u64 %p1, %rd0, %rd6;\n\
-    @%p1 bra SPMV_DONE;\n\
-    // Load row_ptrs[row] and row_ptrs[row+1]\n\
-    shl.b64 %rd7, %rd0, 2;\n\
-    add.u64 %rd7, %rd1, %rd7;\n\
-    ld.global.u32 %r1, [%rd7];\n\
-    ld.global.u32 %r2, [%rd7+4];\n\
-    cvt.u64.u32 %rd8, %r1;   // start\n\
-    cvt.u64.u32 %rd9, %r2;   // end\n\
-    mov.f32 %f1, 0f00000000; // sum = 0\n\
-    mov.u64 %rd10, %rd8;\n\
-SPMV_LOOP:\n\
-    setp.ge.u64 %p1, %rd10, %rd9;\n\
-    @%p1 bra SPMV_WRITE;\n\
-    // col = col_indices[idx]\n\
-    shl.b64 %rd11, %rd10, 2;\n\
-    add.u64 %rd11, %rd2, %rd11;\n\
-    ld.global.u32 %r3, [%rd11];\n\
-    cvt.u64.u32 %rd12, %r3;\n\
-    // val = values[idx]\n\
-    shl.b64 %rd11, %rd10, 2;\n\
-    add.u64 %rd11, %rd3, %rd11;\n\
-    ld.global.f32 %f2, [%rd11];\n\
-    // x[col]\n\
-    shl.b64 %rd13, %rd12, 2;\n\
-    add.u64 %rd13, %rd4, %rd13;\n\
-    ld.global.f32 %f3, [%rd13];\n\
-    fma.rn.f32 %f1, %f2, %f3, %f1;\n\
-    add.u64 %rd10, %rd10, 1;\n\
-    bra SPMV_LOOP;\n\
-SPMV_WRITE:\n\
-    shl.b64 %rd7, %rd0, 2;\n\
-    add.u64 %rd7, %rd5, %rd7;\n\
-    st.global.f32 [%rd7], %f1;\n\
-SPMV_DONE: ret;\n\
-}\0";
+/// The KIR-built SpMV module for `format`, built once. Both kernels are
+/// built by `nsl_kir::kernels::spmv`; its `spmv_kir_equivalence` gate holds
+/// them to the hand-written modules they replaced. NUL-terminated.
+fn spmv_module(format: nsl_kir::kernels::spmv::SpmvFormat) -> &'static str {
+    use nsl_kir::kernels::spmv::SpmvFormat;
+    use std::sync::OnceLock;
+    static MODULES: [OnceLock<String>; 2] = [OnceLock::new(), OnceLock::new()];
+    let slot = SpmvFormat::ALL.iter().position(|f| *f == format).expect("a sparse format");
+    MODULES[slot].get_or_init(|| String::from_utf8(nsl_kir::kernels::spmv::ptx(format)).expect("PTX must be ASCII"))
+}
 
-// ---------------------------------------------------------------------------
-// M50: COO SpMV — y[M] = A_coo[M,K] @ x[K]
-// Grid-stride: each thread handles one nonzero, atomically adds to y.
-// ---------------------------------------------------------------------------
+/// `nsl_csr_spmv_f32(row_ptrs, col_indices, values, x, y, M)`: one thread
+/// per row, `u32` row pointers and column indices, `fma`-accumulated from
+/// `+0.0` in nonzero order.
+pub(crate) fn csr_spmv_f32_ptx() -> &'static str {
+    spmv_module(nsl_kir::kernels::spmv::SpmvFormat::Csr)
+}
 
-/// COO SpMV kernel: row_indices[nnz], col_indices[nnz], values[nnz], x[K], y[M], nnz
-pub(crate) const COO_SPMV_F32_PTX: &str = "\
-.version 7.0\n\
-.target sm_70\n\
-.address_size 64\n\
-\n\
-.visible .entry nsl_coo_spmv_f32(\n\
-    .param .u64 row_indices,\n\
-    .param .u64 col_indices,\n\
-    .param .u64 values,\n\
-    .param .u64 x,\n\
-    .param .u64 y,\n\
-    .param .u64 nnz\n\
-) {\n\
-    .reg .u64 %rd<12>;\n\
-    .reg .u32 %r<4>;\n\
-    .reg .f32 %f<4>;\n\
-    .reg .pred %p1;\n\
-    mov.u32 %r1, %ctaid.x;\n\
-    mov.u32 %r2, %ntid.x;\n\
-    mul.lo.u32 %r1, %r1, %r2;\n\
-    mov.u32 %r2, %tid.x;\n\
-    add.u32 %r1, %r1, %r2;\n\
-    cvt.u64.u32 %rd0, %r1;\n\
-    ld.param.u64 %rd1, [row_indices];\n\
-    ld.param.u64 %rd2, [col_indices];\n\
-    ld.param.u64 %rd3, [values];\n\
-    ld.param.u64 %rd4, [x];\n\
-    ld.param.u64 %rd5, [y];\n\
-    ld.param.u64 %rd6, [nnz];\n\
-    setp.ge.u64 %p1, %rd0, %rd6;\n\
-    @%p1 bra COOV_DONE;\n\
-    // Load row_indices[i], col_indices[i] (i64)\n\
-    shl.b64 %rd7, %rd0, 3;\n\
-    add.u64 %rd8, %rd1, %rd7;\n\
-    ld.global.s64 %rd9, [%rd8];   // row\n\
-    add.u64 %rd8, %rd2, %rd7;\n\
-    ld.global.s64 %rd10, [%rd8];  // col\n\
-    // Load values[i] (f32)\n\
-    shl.b64 %rd7, %rd0, 2;\n\
-    add.u64 %rd8, %rd3, %rd7;\n\
-    ld.global.f32 %f1, [%rd8];\n\
-    // Load x[col]\n\
-    shl.b64 %rd7, %rd10, 2;\n\
-    add.u64 %rd7, %rd4, %rd7;\n\
-    ld.global.f32 %f2, [%rd7];\n\
-    // product = val * x[col]\n\
-    mul.rn.f32 %f3, %f1, %f2;\n\
-    // y[row] += product (atomic)\n\
-    shl.b64 %rd7, %rd9, 2;\n\
-    add.u64 %rd7, %rd5, %rd7;\n\
-    atom.global.add.f32 %f2, [%rd7], %f3;\n\
-COOV_DONE: ret;\n\
-}\0";
+/// `nsl_coo_spmv_f32(row_indices, col_indices, values, x, y, nnz)`: one
+/// thread per nonzero, `i64` indices, `y[row] += value · x[col]` atomically
+/// into a zeroed `y`.
+pub(crate) fn coo_spmv_f32_ptx() -> &'static str {
+    spmv_module(nsl_kir::kernels::spmv::SpmvFormat::Coo)
+}
 
 // ---------------------------------------------------------------------------
 // M46b: the deterministic sums — one thread per result, adding in ascending
@@ -3724,8 +3620,6 @@ pub(crate) const ALL_PTX: &[(&str, &str)] = &[
     ("CSR_SPMM_F32_PTX", CSR_SPMM_F32_PTX),
     ("COO_SPMM_F32_PTX", COO_SPMM_F32_PTX),
     ("BSR_SPMM_F32_PTX", BSR_SPMM_F32_PTX),
-    ("CSR_SPMV_F32_PTX", CSR_SPMV_F32_PTX),
-    ("COO_SPMV_F32_PTX", COO_SPMV_F32_PTX),
     ("DET_SCATTER_ADD_F32_PTX", DET_SCATTER_ADD_F32_PTX),
     ("TENSOR_STATS_F32_PTX", TENSOR_STATS_F32_PTX),
     ("SUM_SQ_F64_ACC_F32_PTX", SUM_SQ_F64_ACC_F32_PTX),
