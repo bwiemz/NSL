@@ -1103,6 +1103,25 @@ frozen throughout, so nothing here blocks a kernel fix.
           KIR module the runtime launches, against the OCP reference and
           the CPU decoder.
         - **SASS:** registers 10/10/10 against 10/9/12.
+    - **`fused_kernels.rs`, the sparse matrix-vector products.**
+      `nsl_csr_spmv_f32` and `nsl_coo_spmv_f32` are in
+      `nsl_kir::kernels::spmv`. CSR is a thread per row over `u32` row
+      pointers and column indices, `fma.rn`-accumulated from `+0.0` in
+      nonzero order. COO is a thread per nonzero over `i64` indices, adding
+      an unfused `mul.rn` product into `y` with `red.global.add.f32` (the
+      hand kernel's `atom`, whose result it never read). The CSR loop exits
+      to a block its header dominates, so the exit edge carries no copies.
+      - **The gate,** `spmv_kir_equivalence`, requires the hand kernels'
+        bytes over empty, long and repeated rows, on 256- and 32-thread
+        blocks under two schedules, and, on exact data, the fused CSR sum
+        and the COO atomic update of a non-zero `y`. It kills mutants of
+        each bound, the block index, every element size (4 against 8 bytes
+        either way) and 64-bit add, the CSR `+ 1`, step, start and
+        `fma`, the COO product and the atomic add read as a store.
+      - **SASS** (sm_80/90/120): the same loads, `FFMA`/`FMUL` and atomics
+        as the hand kernels, the CSR loop unrolled 8× as before. Registers
+        are 0–4 more (CSR 28/26/28 against 24/24/26, COO 18/14/16 against
+        16/14/14).
     - **`fused_kernels.rs`, dropout.** `nsl_dropout_f32` is in
       `nsl_kir::kernels::dropout`: the 32-bit multiply-xorshift hash of
       `seed + i`, a strict unsigned threshold compare, and two `selp`s
