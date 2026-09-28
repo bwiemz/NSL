@@ -1154,6 +1154,36 @@ frozen throughout, so nothing here blocks a kernel fix.
         kernels, with registers equal or fewer. The exception is the
         reduction: its two loops are each unrolled, and it uses fewer
         registers (25–28 against 30–38).
+    - **`fused_kernels.rs`, the GPU cross-entropy backward pair.**
+      `nsl_ce_bwd_count_f32` and `nsl_ce_bwd_finish_f32` are in
+      `nsl_kir::kernels::ce_bwd`. The count is one 256-thread block. Each
+      thread counts the valid targets (`t >= 0`) at a stride of 256, a
+      `u32` shared-memory tree sums the counts, and thread 0 writes
+      `max(count, 1)` as f32. The finish is a thread per element, with
+      `div.u32` splitting the index into row and column. It writes 0 for
+      an invalid row, and otherwise `(sm - [j == t]) · (go / denom)` with
+      `sub.rn`, `div.rn` and `mul.rn`. `gop` is read only when the scale
+      comes from the device (the host passes null otherwise). A target is
+      loaded once as `u32` and read both ways, f32 truncated by
+      `cvt.rzi.s32.f32` and s32 by `Bitcast`, and a `selp` picks one. The
+      hand kernels branched between two loads. The interpreter gained
+      `cvt.rzi.s32.f32`, `cvt.u32.s32`, `setp.*.s32` and `mov.s32`.
+      - **The gate,** `ce_bwd_kir_equivalence`, requires the hand
+        kernels' bytes and the restated formulas. It covers f32 targets
+        with fractions, `-0.5`, NaN and out-of-range values, and s32
+        targets down to `i32::MIN`. The count runs under all four
+        schedules. The finish runs on 256- and 32-thread blocks with the
+        device scale and the immediate one, where a null `gop` faults if it
+        is read. It kills mutants of each bound, the stride, the tree's
+        half and halving, both barriers, the valid test (strict or
+        unsigned), the reading's choice and flag, the increment, the clamp,
+        the row and column split, the one-hot test, its `1` and
+        subtraction, the scale's source, the divide, the multiply, the
+        invalid rows' `0`, every element size and every 64-bit add.
+      - **SASS** (sm_80/90/120): the same `LDG`, `LDS` and `BAR` counts
+        and float instructions as the hand kernels. Registers are equal or
+        fewer (count 17/20/19 against 20/22/20, finish 17/18/16 against
+        17/18/18).
     - **The printer's conditional edges.** A `CondBranch` edge that
       carries block arguments branches to a trampoline printed after the
       last block, which makes the copies and jumps to the target; the
