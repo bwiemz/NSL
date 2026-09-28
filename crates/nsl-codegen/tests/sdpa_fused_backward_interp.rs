@@ -262,7 +262,7 @@ fn run(config: &FlashAttentionBackwardConfig, p1: &Program, p2: &Program, x: &In
                     shared: vec![0xFF; smem],
                     ctaid: bh,
                     ctaid_y: y,
-                    nctaid_y: grid_y,
+                    nctaid_x: 0, nctaid_y: grid_y,
                     ntid: threads,
                     steps: 0,
                 };

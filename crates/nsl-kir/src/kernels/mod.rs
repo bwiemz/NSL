@@ -21,4 +21,5 @@ pub mod optim;
 pub mod rmsnorm_dgamma;
 pub mod spmv;
 pub mod strided_copy;
+pub mod sum_sq;
 pub mod tier_b1_prepass;

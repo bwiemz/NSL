@@ -154,7 +154,7 @@ fn launch(ptx: &str, global: Vec<Segment>, args: &[(&str, u64)], n: usize, order
             shared: vec![],
             ctaid: cta,
             ctaid_y: 0,
-            nctaid_y: 1,
+            nctaid_x: 0, nctaid_y: 1,
             ntid: ELEMENTWISE_BLOCK,
             steps: 0,
         };

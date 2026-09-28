@@ -8,6 +8,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **The f64 sum-of-squares kernel is built by `nsl_kir::kernels::sum_sq`**
+  in place of its hand-written constant (new-roadmap item 5):
+  `nsl_sum_sq_f64_acc_f32`, which gradient clipping uses for its norm.
+  - **The kernel** keeps the hand kernel's order and precision. It is
+    grid-strided with the stride `%ntid.x · %nctaid.x`, squares and
+    accumulates each value in f64 with one `fma`, and sums the block's
+    partials with an f64 shared-memory tree. Thread 0 writes the block's
+    partial.
+  - **The CTA interpreter** gained `%nctaid.x` and f64 accumulation.
+    `Launch` has a `nctaid_x` field; every existing gate sets it to 0,
+    which makes a read panic rather than default.
+  - **The gate,** `sum_sq_kir_equivalence` (9 tests), runs the frozen hand
+    module (`tests/fixtures/sum_sq_hand.rs`) and the KIR one over whole
+    grids, including the runtime's.
+    - It uses all four thread schedules and both block orders.
+    - The values' squares leave f32's range at both ends.
+    - The two leave the same bytes and match the restated per-block fold
+      and tree, bit for bit.
+    - Mutants of the bound, the stride, both block indices, the widening,
+      the fused square-accumulate, the tree, both barriers, the identity
+      and every address are killed.
+  - **SASS** (sm_80/90/120): the same loads, f64 arithmetic, shared-memory
+    traffic and barriers as the hand kernel, with registers within three.
+
 - **`nsl_sum_dim_short_f32` is built by `nsl_kir::kernels::det_sum`**
   (`DetSumOp::DimShort`) in place of its hand-written constant (new-roadmap
   item 5). It is the per-dim sum used by most `sum_dim` calls: one thread

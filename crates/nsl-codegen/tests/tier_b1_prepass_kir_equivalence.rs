@@ -112,7 +112,7 @@ fn launch(ptx: &str, args: &HashMap<String, u64>, global: &mut [Segment], grid: 
             shared: vec![0x3F; prog.shared_bytes],
             ctaid: cta,
             ctaid_y: 0,
-            nctaid_y: 1,
+            nctaid_x: 0, nctaid_y: 1,
             ntid: PREPASS_BLOCK,
             steps: 0,
         };
