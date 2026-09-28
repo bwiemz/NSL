@@ -1151,6 +1151,12 @@ frozen throughout, so nothing here blocks a kernel fix.
         kernels on sm_80/90/120. Registers are equal on sm_90 and sm_120 and
         two more on sm_80 (16 against 14; 30 against 28), on a one-thread
         block.
+      - **The short-axis per-dim sum.** `nsl_sum_dim_short_f32` is the same
+        loop (`DetSumOp::DimShort`), with the thread's global index as the
+        output on 256-thread blocks. The gate runs it on 256- and 4-thread
+        blocks, which kills `%tid.x` and `%ntid.x` mutants. Its SASS is the
+        hand kernel's 8× unrolled loop; registers are 32/28/30 against
+        27/26/28, with no occupancy change at 256 threads.
     - **`fused_kernels.rs`, the batched Muon Newton-Schulz kernels.**
       `nsl_muon_batch_{mom,sumsq,pack,poly,update}_f32` are in
       `nsl_kir::kernels::muon_batch`. The matrices are reached through

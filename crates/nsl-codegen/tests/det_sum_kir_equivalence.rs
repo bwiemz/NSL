@@ -1,14 +1,16 @@
 //! The differential equivalence gate for the deterministic sum kernels from
 //! `nsl_runtime::cuda::fused_kernels` (new-roadmap item 5):
-//! `nsl_det_global_sum_f32` and `nsl_det_sum_dim_f32`, now built by
-//! `nsl_kir::kernels::det_sum`.
+//! `nsl_det_global_sum_f32`, `nsl_det_sum_dim_f32` and
+//! `nsl_sum_dim_short_f32`, now built by `nsl_kir::kernels::det_sum`.
 //!
 //! This file runs the frozen hand modules (`tests/fixtures/det_sum_hand.rs`)
 //! and the KIR ones side by side on the cooperative-CTA interpreter
 //! (`tests/support/cta_ptx_interp.rs`), with the runtime's launch shape: one
-//! one-thread block for the global sum, and one one-thread block per output
-//! for the per-dim sum, plus two blocks past the end, run in ascending and in
-//! descending block order:
+//! one-thread block for the global sum, one one-thread block per output for
+//! the per-dim sum, plus two blocks past the end, and for the short per-dim
+//! sum a thread per output on the runtime's 256-thread blocks and on 4-thread
+//! ones, plus a block past the end; run in ascending and in descending block
+//! order:
 //!
 //! 1. **Agreement**: the two kernels leave *the same bytes* in all of global
 //!    memory, over empty, single-element and ragged extents, with inputs
@@ -16,13 +18,13 @@
 //!    an infinity.
 //! 2. **Correctness**: each result is the ascending left-to-right f32 sum
 //!    from `+0.0`, bit for bit; nothing past the output is written.
-//! 3. **The gate bites**: each bound, the block index, the output's split
+//! 3. **The gate bites**: each bound, the block and thread index, the output's split
 //!    into `(o, i)`, every element size, every 64-bit add and multiply, the
 //!    step, the accumulator's start and the add itself are caught.
 
 use std::collections::HashMap;
 
-use nsl_kir::kernels::det_sum::{ptx, DetSumOp, DET_SUM_BLOCK};
+use nsl_kir::kernels::det_sum::{ptx, DetSumOp, SUM_DIM_SHORT_BLOCK};
 
 #[allow(dead_code)]
 #[path = "fixtures/det_sum_hand.rs"]
@@ -46,6 +48,7 @@ fn hand_ptx(op: DetSumOp) -> String {
     match op {
         DetSumOp::Global => hand::DET_GLOBAL_SUM_F32_PTX,
         DetSumOp::Dim => hand::DET_SUM_DIM_F32_PTX,
+        DetSumOp::DimShort => hand::SUM_DIM_SHORT_F32_PTX,
     }
     .trim_end_matches('\0')
     .to_string()
@@ -89,9 +92,18 @@ fn input(len: usize, seed: u64) -> Vec<u32> {
 }
 
 /// `(outer, reduce_size, inner)`. For the global sum, the length is the
-/// product.
-const SHAPES: [(usize, usize, usize); 8] =
-    [(1, 0, 1), (1, 1, 1), (2, 0, 3), (1, 17, 1), (3, 1, 5), (2, 3, 4), (4, 9, 3), (5, 13, 2)];
+/// product. The last has 300 outputs, more than one 256-thread block.
+const SHAPES: [(usize, usize, usize); 9] =
+    [(1, 0, 1), (1, 1, 1), (2, 0, 3), (1, 17, 1), (3, 1, 5), (2, 3, 4), (4, 9, 3), (5, 13, 2), (3, 2, 100)];
+
+/// The blocks each kernel runs on: the runtime's, and for the short sum a
+/// 4-thread one too, so `%ntid.x` and `%tid.x` carry weight.
+fn blocks(op: DetSumOp) -> Vec<u32> {
+    match op {
+        DetSumOp::DimShort => vec![SUM_DIM_SHORT_BLOCK, 4],
+        _ => vec![op.block()],
+    }
+}
 
 /// All-`-0.0` input: a sum from `-0.0` would stay `-0.0`, one from `+0.0`
 /// does not.
@@ -117,11 +129,11 @@ struct Run {
 fn outputs(op: DetSumOp, (outer, _, inner): (usize, usize, usize)) -> usize {
     match op {
         DetSumOp::Global => 1,
-        DetSumOp::Dim => outer * inner,
+        DetSumOp::Dim | DetSumOp::DimShort => outer * inner,
     }
 }
 
-fn run(op: DetSumOp, ptx: &str, shape: (usize, usize, usize), seed: u64, order: Order) -> Run {
+fn run(op: DetSumOp, ptx: &str, shape: (usize, usize, usize), block: u32, seed: u64, order: Order) -> Run {
     let (outer, reduce, inner) = shape;
     let inp = data(outer * reduce * inner, seed);
     let n_out = outputs(op, shape);
@@ -132,12 +144,13 @@ fn run(op: DetSumOp, ptx: &str, shape: (usize, usize, usize), seed: u64, order: 
     ];
     let values: Vec<u64> = match op {
         DetSumOp::Global => vec![INP, OUT, (outer * reduce * inner) as u64],
-        DetSumOp::Dim => vec![INP, OUT, outer as u64, reduce as u64, inner as u64],
+        DetSumOp::Dim | DetSumOp::DimShort => vec![INP, OUT, outer as u64, reduce as u64, inner as u64],
     };
     let args: HashMap<String, u64> = op.param_names().iter().zip(values).map(|(n, v)| (n.to_string(), v)).collect();
     let grid = match op {
         DetSumOp::Global => 1,
         DetSumOp::Dim => n_out as u32 + 2,
+        DetSumOp::DimShort => n_out.div_ceil(block as usize) as u32 + 1,
     };
     let mut ctas: Vec<u32> = (0..grid).collect();
     if order == Order::Descending {
@@ -152,7 +165,7 @@ fn run(op: DetSumOp, ptx: &str, shape: (usize, usize, usize), seed: u64, order: 
             ctaid,
             ctaid_y: 0,
             nctaid_y: 1,
-            ntid: DET_SUM_BLOCK,
+            ntid: block,
             steps: 0,
         };
         run_cta(&mut l, order);
@@ -174,18 +187,20 @@ fn the_kernels_agree_and_are_the_ascending_sum() {
         for shape in SHAPES {
             let (outer, reduce, inner) = shape;
             for seed in SEEDS {
-                for order in ORDERS {
-                    let h = run(op, &hand, shape, seed, order);
-                    let q = run(op, &kir, shape, seed, order);
-                    assert!(h.out == q.out, "{op:?} {shape:?} seed {seed} {order:?}: outputs differ");
-                    assert!(h.inp == q.inp);
+                for block in blocks(op) {
+                    for order in ORDERS {
+                        let h = run(op, &hand, shape, block, seed, order);
+                        let q = run(op, &kir, shape, block, seed, order);
+                        assert!(h.out == q.out, "{op:?} {shape:?} block {block} seed {seed} {order:?}: outputs differ");
+                        assert!(h.inp == q.inp);
+                    }
                 }
-                let r = run(op, &kir, shape, seed, Order::Ascending);
+                let r = run(op, &kir, shape, op.block(), seed, Order::Ascending);
                 let n_out = outputs(op, shape);
                 for t in 0..n_out {
                     let want = match op {
                         DetSumOp::Global => sum(r.inp[..outer * reduce * inner].iter().copied()),
-                        DetSumOp::Dim => {
+                        DetSumOp::Dim | DetSumOp::DimShort => {
                             let (o, i) = (t / inner, t % inner);
                             sum((0..reduce).map(|k| r.inp[(o * reduce + k) * inner + i]))
                         }
@@ -215,18 +230,20 @@ fn the_data_tells_the_order_apart() {
 // ---------------------------------------------------------------------------
 
 /// Whether `mutate(kir)` is told apart from the hand kernel on any case,
-/// under either block order (or faults).
+/// block or block order (or faults).
 fn caught(op: DetSumOp, mutate: impl Fn(&str) -> String) -> bool {
     let hand = hand_ptx(op);
     let mutant = mutate(&kir_ptx(op));
     SHAPES.iter().any(|&shape| {
         SEEDS.iter().any(|&seed| {
-            ORDERS.into_iter().any(|order| {
-                let expect = run(op, &hand, shape, seed, order).out;
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(op, &mutant, shape, seed, order))) {
-                    Ok(r) => r.out != expect,
-                    Err(_) => true,
-                }
+            blocks(op).into_iter().any(|block| {
+                ORDERS.into_iter().any(|order| {
+                    let expect = run(op, &hand, shape, block, seed, order).out;
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(op, &mutant, shape, block, seed, order))) {
+                        Ok(r) => r.out != expect,
+                        Err(_) => true,
+                    }
+                })
             })
         })
     })
@@ -265,11 +282,11 @@ fn the_unmutated_kernels_are_not_caught() {
     }
 }
 
-/// The loop bound and, for the per-dim sum, the output bound.
+/// The loop bound and, for the per-dim sums, the output bound.
 #[test]
 fn relaxing_a_bound_is_caught() {
     for op in DetSumOp::ALL {
-        let bounds = if op == DetSumOp::Dim { 2 } else { 1 };
+        let bounds = if op == DetSumOp::Global { 1 } else { 2 };
         assert_eq!(kir_ptx(op).matches("setp.ge.u64 ").count(), bounds, "{op:?}");
         for i in 0..bounds {
             assert!(caught(op, |p| nudge(p, "setp.ge.u64 ", "setp.gt.u64 ", i)), "{op:?} bound {i}");
@@ -277,14 +294,20 @@ fn relaxing_a_bound_is_caught() {
     }
 }
 
-/// The per-dim sum's output is its block's: `%ctaid.x`, split into
-/// `o = t / inner` and `i = t % inner`.
+/// The per-dim sums' output is the block's (`%ctaid.x`) or the thread's
+/// (`%ctaid.x · %ntid.x + %tid.x`), split into `o = t / inner` and
+/// `i = t % inner`. `%ntid.x` read as 256 is caught only because the gate
+/// runs 4-thread blocks too.
 #[test]
 fn the_output_index_is_caught() {
-    let op = DetSumOp::Dim;
-    assert!(caught(op, |p| p.replacen("%ctaid.x;", "0;", 1)), "ctaid.x");
-    assert!(caught(op, |p| nudge(p, "div.u64 ", "rem.u64 ", 0)), "the quotient");
-    assert!(caught(op, |p| nudge(p, "rem.u64 ", "div.u64 ", 0)), "the remainder");
+    for op in [DetSumOp::Dim, DetSumOp::DimShort] {
+        assert!(caught(op, |p| p.replacen("%ctaid.x;", "0;", 1)), "{op:?} ctaid.x");
+        assert!(caught(op, |p| nudge(p, "div.u64 ", "rem.u64 ", 0)), "{op:?} the quotient");
+        assert!(caught(op, |p| nudge(p, "rem.u64 ", "div.u64 ", 0)), "{op:?} the remainder");
+    }
+    let op = DetSumOp::DimShort;
+    assert!(caught(op, |p| p.replacen("%tid.x;", "0;", 1)), "tid.x");
+    assert!(caught(op, |p| p.replacen("%ntid.x;", "256;", 1)), "ntid.x");
 }
 
 /// Every address's element size: the input and, for the per-dim sum, the
@@ -294,7 +317,7 @@ fn nudging_an_element_size_is_caught() {
     for op in DetSumOp::ALL {
         let p = kir_ptx(op);
         let sizes = p.lines().filter(|l| l.contains("mul.lo.u64") && l.ends_with(", 4;")).count();
-        assert_eq!(sizes, if op == DetSumOp::Dim { 2 } else { 1 }, "{op:?}");
+        assert_eq!(sizes, if op == DetSumOp::Global { 1 } else { 2 }, "{op:?}");
         for i in 0..sizes {
             let size_line = |p: &str| {
                 let at = p.lines().enumerate().filter(|(_, l)| l.contains("mul.lo.u64") && l.ends_with(", 4;")).nth(i).expect("site").0;
@@ -318,7 +341,7 @@ fn dropping_an_add_or_a_stride_is_caught() {
     for op in DetSumOp::ALL {
         let p = kir_ptx(op);
         let adds = p.matches("add.u64 ").count();
-        assert_eq!(adds, if op == DetSumOp::Dim { 5 } else { 2 }, "{op:?}");
+        assert_eq!(adds, if op == DetSumOp::Global { 2 } else { 5 }, "{op:?}");
         for i in 0..adds {
             assert!(caught(op, |p| drop_op(p, "add.u64 ", i)), "{op:?} add {i}");
         }
@@ -329,7 +352,7 @@ fn dropping_an_add_or_a_stride_is_caught() {
             .filter(|(_, l)| !l.ends_with(", 4;"))
             .map(|(n, _)| n)
             .collect();
-        assert_eq!(strides.len(), if op == DetSumOp::Dim { 4 } else { 0 }, "{op:?}");
+        assert_eq!(strides.len(), if op == DetSumOp::Global { 0 } else { 4 }, "{op:?}");
         for i in strides {
             assert!(caught(op, |p| drop_op(p, "mul.lo.u64 ", i)), "{op:?} stride {i}");
         }
