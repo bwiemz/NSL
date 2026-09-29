@@ -1349,6 +1349,42 @@ frozen throughout, so nothing here blocks a kernel fix.
       - **SASS** (sm_80/90/120): the same 8× unrolled loop (17 `LDG`), 8
         `F2I`, 8 `FADD` and the same compares and branches as the hand
         kernel, at the same registers (32/32/38).
+    - **`fused_kernels.rs`, the row softmax and log-softmax.**
+      `nsl_softmax_f32` and `nsl_log_softmax_f32` are in
+      `nsl_kir::kernels::softmax`, one 256-thread block per row. Each keeps
+      the hand kernel's three passes and order of combines: a per-thread
+      max over columns `k, k + 256, …`, folded by thread 0 in order through
+      shared memory; a per-thread sum of `2^((x - max) · log2 e)` (the
+      softmax stores each exponential), folded the same way and finished
+      with `rcp.approx` or `lg2 · ln 2`; then `out *= 1 / sum` or `out = (x
+      - max) - ln sum`. Every add, subtract and multiply is `.rn`. None of
+      the hand kernels' multiply-add pairs could contract, and ptxas made
+      no `FFMA` of either. The CTA interpreter learned to read several
+      statements on one line, as the hand kernels write their shared
+      accesses.
+      - **The gate,** `softmax_kir_equivalence`, launches one block per
+        row plus one past the last, under all four thread schedules. Rows
+        are 0, 1, 255, 256, 257 and 700 columns wide, with order-sensitive
+        sums, masked (`-inf`) columns, a fully masked row, a NaN and
+        `+inf`. It requires the hand kernels' bytes and the restated
+        passes, bit for bit. It kills mutants of the row bound, every
+        column loop's bound and stride, each fold's start, bound and step,
+        the thread-0 test, all four barriers, the row base, the sum
+        region's offset, every element size and 64-bit add, every combine,
+        `ex2` and its `log2 e` scale, the finish (`rcp`, or `lg2` and `ln
+        2`), the softmax's store of the exponentials, and each identity.
+        Named equivalent mutants: the max fold starting on thread 0's own
+        partial and the max loop striding by 128 (the max is idempotent),
+        the log-softmax's last loop striding by 128 (a pure map), the
+        sum's identity as `-0` (every exponential is `+0` or more), and
+        the element size of the fold's final `sm[0]` store (it has none).
+      - **SASS** (sm_80/90/120): the same 10/17 `LDG`, 2/1 `STG`, 18
+        `LDS`, 4 `STS`, `BAR`, `MUFU`, `FMUL`, `FADD` and 16 `FMNMX` as the
+        hand kernels. Registers are 24/28/24 and 28/32/24 against 19/24/20
+        and 24/27/24, all at or under 32, so occupancy at 256 threads is
+        unchanged. Thread 0 reads `%ntid.x` once, before its fold: read in
+        the fold's header, ptxas left both folds rolled for sm_90 and
+        sm_120 (4 `LDS` against 18).
     - **`fused_kernels.rs`, the row LayerNorm and RMSNorm forwards.**
       `nsl_layernorm_f32` and `nsl_rmsnorm_f32` are in
       `nsl_kir::kernels::norm`, one 256-thread block per row. Each statistic

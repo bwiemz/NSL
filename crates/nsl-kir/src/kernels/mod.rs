@@ -24,6 +24,7 @@ pub mod muon_batch;
 pub mod norm;
 pub mod optim;
 pub mod rmsnorm_dgamma;
+pub mod softmax;
 pub mod spmv;
 pub mod strided_copy;
 pub mod sum_sq;
