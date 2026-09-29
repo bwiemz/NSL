@@ -162,7 +162,7 @@ fn run(op: BlockReduceOp, ptx: &str, c: &Case, order: Order, reverse_ctas: bool)
             shared: vec![0; B * 4],
             ctaid,
             ctaid_y: 0,
-            nctaid_y: 1,
+            nctaid_x: 0, nctaid_y: 1,
             ntid: BLOCK_REDUCE_BLOCK,
             steps: 0,
         };

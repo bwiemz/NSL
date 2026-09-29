@@ -170,7 +170,7 @@ fn run(f: SpmvFormat, ptx: &str, c: &Case, block: u32, order: Order) -> Vec<u32>
         ctas.reverse();
     }
     for ctaid in ctas {
-        let mut l = Launch { prog: &prog, args: &args, global: &mut global, shared: vec![], ctaid, ctaid_y: 0, nctaid_y: 1, ntid: block, steps: 0 };
+        let mut l = Launch { prog: &prog, args: &args, global: &mut global, shared: vec![], ctaid, ctaid_y: 0, nctaid_x: 0, nctaid_y: 1, ntid: block, steps: 0 };
         run_cta(&mut l, order);
     }
     words(&global[4].bytes)

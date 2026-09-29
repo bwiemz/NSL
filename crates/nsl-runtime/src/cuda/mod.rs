@@ -7162,7 +7162,6 @@ pub(crate) fn gpu_tensor_stats_f32(tensor_ptr: i64) -> [f32; 4] {
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_sum_sq_many_f32(tensors: &[i64]) -> f64 {
     use crate::tensor::NslTensor;
-    use fused_kernels::SUM_SQ_F64_ACC_F32_PTX;
 
     let live: Vec<i64> = tensors
         .iter()
@@ -7218,7 +7217,7 @@ pub(crate) fn gpu_sum_sq_many_f32(tensors: &[i64]) -> f64 {
             &mut n_val as *mut _ as *mut std::ffi::c_void,
         ];
         let rc = inner::kernel_launch(
-            SUM_SQ_F64_ACC_F32_PTX.as_ptr(),
+            fused_kernels::sum_sq_f64_acc_f32_ptx().as_ptr(),
             b"nsl_sum_sq_f64_acc_f32\0".as_ptr(),
             [grid_for(t.len), 1, 1],
             [BLOCK, 1, 1],
@@ -10440,6 +10439,7 @@ mod tests {
         all.push(("nsl_det_sum_dim_f32", super::fused_kernels::det_sum_dim_f32_ptx(), true));
         all.push(("nsl_csr_spmv_f32", super::fused_kernels::csr_spmv_f32_ptx(), true));
         all.push(("nsl_coo_spmv_f32", super::fused_kernels::coo_spmv_f32_ptx(), true));
+        all.push(("nsl_sum_sq_f64_acc_f32", super::fused_kernels::sum_sq_f64_acc_f32_ptx(), true));
         all.push(("nsl_rmsnorm_rinv_rows_f32", super::fused_kernels::rmsnorm_rinv_rows_f32_ptx(), true));
         all.push(("nsl_rmsnorm_dgamma_f32", super::fused_kernels::rmsnorm_dgamma_f32_ptx(), true));
         all.push(("nsl_sum_dim_short_f32", super::fused_kernels::sum_dim_short_f32_ptx(), true));

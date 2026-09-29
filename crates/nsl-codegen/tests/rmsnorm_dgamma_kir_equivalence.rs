@@ -129,7 +129,7 @@ fn run(op: RmsNormDgammaOp, ptx: &str, (rows, cols): (usize, usize), d: &Data, b
         ctas.reverse();
     }
     for ctaid in ctas {
-        let mut l = Launch { prog: &prog, args: &args, global: &mut global, shared: vec![], ctaid, ctaid_y: 0, nctaid_y: 1, ntid: block, steps: 0 };
+        let mut l = Launch { prog: &prog, args: &args, global: &mut global, shared: vec![], ctaid, ctaid_y: 0, nctaid_x: 0, nctaid_y: 1, ntid: block, steps: 0 };
         run_cta(&mut l, order);
     }
     // Every segment but the output must come back untouched.

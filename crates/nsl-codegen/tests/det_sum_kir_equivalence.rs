@@ -164,7 +164,7 @@ fn run(op: DetSumOp, ptx: &str, shape: (usize, usize, usize), block: u32, seed: 
             shared: vec![],
             ctaid,
             ctaid_y: 0,
-            nctaid_y: 1,
+            nctaid_x: 0, nctaid_y: 1,
             ntid: block,
             steps: 0,
         };

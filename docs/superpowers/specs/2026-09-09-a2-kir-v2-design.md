@@ -1240,6 +1240,29 @@ frozen throughout, so nothing here blocks a kernel fix.
         are within two of them (global sum 17/22/20 against 16/20/20,
         per-dim 28/27/32 against 28/29/32 and 28/27/30 against 28/29/30),
         all at or under 32, so occupancy at 256 threads is unchanged.
+    - **`fused_kernels.rs`, the f64 sum of squares.**
+      `nsl_sum_sq_f64_acc_f32` (gradient clipping's norm) is in
+      `nsl_kir::kernels::sum_sq`. It is grid-strided on 256-thread blocks,
+      with the stride `%ntid.x · %nctaid.x` (KIR's `GridDim`). Each value is
+      widened to f64 and square-accumulated with one `fma.rn.f64`. An f64
+      shared-memory tree follows, and thread 0 writes the block's partial
+      to `out[%ctaid.x]`. The interpreter gained `%nctaid.x` (a
+      `Launch::nctaid_x` field; 0, the default for every other gate, makes a
+      read panic) and f64 accumulation: `0d` immediates, `mov`/`ld`/`st` of
+      `.f64`, `cvt.f64.f32`, `add(.rn).f64` and `fma.rn.f64`.
+      - **The gate,** `sum_sq_kir_equivalence`, launches whole grids: the
+        runtime's `clamp(ceil(n / 256), 1, 256)`, a single block, and three
+        blocks that do not divide the work. They run under all four thread
+        schedules and both block orders, over values from `2^-140`
+        (subnormal) to `2^100`, whose squares leave f32's range at both
+        ends. It requires the hand kernel's bytes and the restated per-block
+        fold and tree, bit for bit. It kills mutants of the bound, the
+        stride and its factors, both block indices, the widening, the fused
+        square-accumulate, the tree's half, halving, partner and add, both
+        barriers, the identity, every element size and every 64-bit add.
+      - **SASS** (sm_80/90/120): the same one `LDG`, `DFMA`, `DADD`, `F2F`,
+        three `LDS` and three `BAR` as the hand kernel. Registers are 16/16/18
+        against 16/14/15, so there is no occupancy change at 256 threads.
     - **The printer's conditional edges.** A `CondBranch` edge that
       carries block arguments branches to a trampoline printed after the
       last block, which makes the copies and jumps to the target; the
