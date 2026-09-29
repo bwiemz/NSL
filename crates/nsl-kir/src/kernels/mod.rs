@@ -13,6 +13,7 @@ pub mod cast;
 pub mod ce_bwd;
 pub mod data_movement;
 pub mod dequant;
+pub mod det_scatter;
 pub mod det_sum;
 pub mod dropout;
 pub mod elementwise;

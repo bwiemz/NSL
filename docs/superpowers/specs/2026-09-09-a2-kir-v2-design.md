@@ -1327,6 +1327,28 @@ frozen throughout, so nothing here blocks a kernel fix.
         (lg2), one `FFMA`, and the same float and compare instructions as
         the hand kernel. Registers are 18/28/28 against 20/20/22, all at or
         under 32, so occupancy at 256 threads is unchanged.
+    - **`fused_kernels.rs`, the deterministic scatter-add.**
+      `nsl_det_scatter_add_f32` is in `nsl_kir::kernels::det_scatter`. On a
+      `(vocab_size, embed_dim)` grid of 16 × 16 blocks, thread `(row, col)`
+      starts from `input[row, col]`, walks every position in order, adds
+      `src[i, col]` wherever the index names `row`, and writes the sum once
+      (no atomics, so the result is the same on every run). The f32 index
+      converts with the hand kernel's `cvt.rzi.u64.f32`, which saturates: a
+      negative index and a NaN land on row 0. The kernel keeps that, and the
+      gate pins it. The sum adds with `add.rn.f32`.
+      - **The gate,** `det_scatter_kir_equivalence`, runs the 16 × 16 block
+        and an 8 × 4 one (so `%ntid.x` and `%ntid.y` differ), with a spare
+        block in each direction, under two schedules. The indices repeat
+        rows, skip rows, and include fractions, `-0.5`, `-1.5`, NaN,
+        `-inf`, `vocab`, `1e30` and `+inf`. It requires the hand kernel's
+        bytes and the restated ordered scatter, bit for bit. It kills
+        mutants of each bound, both block indices, `%tid.y`, `%ntid.y`,
+        every element size, row stride and 64-bit add, the match test, the
+        loop's step, the start from `input`, the accumulate, the conversion
+        read as signed, and every pointer.
+      - **SASS** (sm_80/90/120): the same 8× unrolled loop (17 `LDG`), 8
+        `F2I`, 8 `FADD` and the same compares and branches as the hand
+        kernel, at the same registers (32/32/38).
     - **The printer's conditional edges.** A `CondBranch` edge that
       carries block arguments branches to a trampoline printed after the
       last block, which makes the copies and jumps to the target; the
