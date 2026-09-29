@@ -1385,6 +1385,43 @@ frozen throughout, so nothing here blocks a kernel fix.
         unchanged. Thread 0 reads `%ntid.x` once, before its fold: read in
         the fold's header, ptxas left both folds rolled for sm_90 and
         sm_120 (4 `LDS` against 18).
+    - **`fused_kernels.rs`, the row LayerNorm and RMSNorm forwards.**
+      `nsl_layernorm_f32` and `nsl_rmsnorm_f32` are in
+      `nsl_kir::kernels::norm`, one 256-thread block per row. Each statistic
+      is a per-thread partial sum over columns `k, k + 256, …`, folded by
+      thread 0 in order through shared memory, divided by `cols` with
+      `div.approx`; the LayerNorm's mean, then `rsqrt(Σ(x - mean)² / cols +
+      eps)`, the RMSNorm's `rsqrt(Σx² / cols + eps)`. Every add, subtract and
+      multiply is `.rn`: ptxas contracted the hand kernels' squares, `Σ /
+      cols + eps` (`div.approx` is a multiply by the reciprocal) and the
+      LayerNorm's `· gamma + beta` into `FFMA`, and the KIR kernels round
+      twice, as the PTX and the CPU reference do. The hand LayerNorm reduced both statistics
+      through one region, and thread 0 stored its variance partial to the
+      mean's slot with no barrier after the other threads read the mean: a
+      race. The KIR LayerNorm gives each statistic its own region.
+      - **The gate,** `norm_kir_equivalence`, launches one block per row
+        plus one past the last, with shared memory poisoned, under all four
+        thread schedules. Rows are 0, 1, 255, 256, 257, 300, 700 and 40
+        columns wide, with order-sensitive sums, a constant row, a NaN,
+        `+inf`, squares that overflow and a zero `eps`. The KIR kernels
+        match the restated passes bit for bit under every schedule. The
+        hand RMSNorm agrees with them byte for byte under every schedule;
+        the hand LayerNorm only under the one that runs thread 0 last, and
+        the gate shows it wrong under the other three. It kills mutants of
+        the row bound, every column loop's bound and stride, each fold's
+        start, bound and step, the thread-0 test, every barrier, the row
+        base, the LayerNorm's variance region (moved back onto the mean's),
+        every element size and 64-bit add, every add, subtract and multiply
+        (flipped and dropped), the `div.approx`, the `rsqrt` and each sum's
+        identity. Named equivalent mutants: the last pass striding by 128
+        (a pure map) and each sum's identity as `-0` (a sum of squares is
+        never `-0`, and no row is all `-0`).
+      - **SASS** (sm_80/90/120): the same 19/10 `LDG`, one `STG`, 18/9
+        `LDS`, 4/2 `STS`, `BAR` and `MUFU` as the hand kernels, and the same
+        unrolling. The hand kernels' 10/9 `FFMA` are as many `FMUL` and
+        `FADD`. Registers are 28/30/24 and 24/26/20 against 22/26/24 and
+        22/24/22, all at or under 32, so occupancy at 256 threads is
+        unchanged.
     - **`fused_kernels.rs`, the sparse matrix-matrix products.**
       `nsl_csr_spmm_f32`, `nsl_coo_spmm_f32` and `nsl_bsr_spmm_f32` are in
       `nsl_kir::kernels::spmm`. CSR runs a block per (row, 256 output
