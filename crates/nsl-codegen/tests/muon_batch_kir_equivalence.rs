@@ -253,7 +253,7 @@ fn run(op: MuonBatchOp, text: &str, case: Case, seed: u64, order: Order) -> Vec<
             shared: vec![0; BLOCK * 4],
             ctaid: x,
             ctaid_y: y,
-            nctaid_y: rows as u32,
+            nctaid_x: 0, nctaid_y: rows as u32,
             ntid: MUON_BATCH_BLOCK,
             steps: 0,
         };

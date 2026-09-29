@@ -229,7 +229,7 @@ fn run(ptx: &str, op: BackwardOp, case: &Case, order: Order) -> Vec<Vec<u8>> {
             shared: vec![],
             ctaid: cta,
             ctaid_y: 0,
-            nctaid_y: 1,
+            nctaid_x: 0, nctaid_y: 1,
             ntid: ELEMENTWISE_BLOCK,
             steps: 0,
         };

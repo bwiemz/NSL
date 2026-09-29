@@ -61,6 +61,11 @@
 //! loads four bytes like `ld.u32`, the sign mattering only to the widening
 //! that follows.
 //!
+//! f64 is modelled for accumulation: `0d` immediates, `mov`, `ld` and `st`
+//! of `.f64`, `cvt.f64.f32` (exact), `add(.rn).f64` and `fma.rn.f64` (one
+//! rounding, Rust's `mul_add`). `%nctaid.x` reads [`Launch::nctaid_x`], which
+//! a gate launching a grid-strided kernel sets; the others leave it 0.
+//!
 //! A `.shared` block may be declared by element (`.shared .f32 NAME[N]`,
 //! `N` elements) as well as in bytes, and an address may name it directly
 //! (`[NAME]`). `div.approx.f32` is `a / b`, the same as `div.rn.f32`, like
@@ -122,6 +127,8 @@ pub(crate) enum Special {
     LaneId,
     CtaidX,
     CtaidY,
+    /// `%nctaid.x`: [`Launch::nctaid_x`], which must be set to read it.
+    NctaidX,
     NctaidY,
     NtidX,
     NtidY,
@@ -225,6 +232,12 @@ pub(crate) enum Op {
     CvtS64F32Rzi { d: usize, a: Src },
     /// `cvt.rzi.s32.f32`: toward zero, saturating to the i32 range, NaN to 0.
     CvtS32F32Rzi { d: usize, a: Src },
+    /// `cvt.f64.f32`: exact.
+    CvtF64F32 { d: usize, a: Src },
+    /// `add.f64` / `add.rn.f64`.
+    AddF64 { d: usize, a: Src, b: Src },
+    /// `fma.rn.f64`: one rounding.
+    FmaF64 { d: usize, a: Src, b: Src, c: Src },
     /// `cvt.s64.s32` / `cvt.u64.s32`: the low 32 bits, sign-extended.
     CvtS64S32 { d: usize, a: Src },
     CvtF32F16 { d: usize, a: Src },
@@ -338,6 +351,7 @@ impl Parser {
             "%laneid" => return Src::Special(Special::LaneId),
             "%ctaid.x" => return Src::Special(Special::CtaidX),
             "%ctaid.y" => return Src::Special(Special::CtaidY),
+            "%nctaid.x" => return Src::Special(Special::NctaidX),
             "%nctaid.y" => return Src::Special(Special::NctaidY),
             "%ntid.x" => return Src::Special(Special::NtidX),
             "%ntid.y" => return Src::Special(Special::NtidY),
@@ -346,6 +360,10 @@ impl Parser {
         if tok.starts_with('%') {
             assert!(!tok.contains('.'), "special register `{tok}` is not modelled");
             return Src::Reg(self.reg(tok));
+        }
+        if let Some(hex) = tok.strip_prefix("0d") {
+            assert_eq!(hex.len(), 16, "`{tok}` is not an f64 immediate");
+            return Src::Imm(u64::from_str_radix(hex, 16).expect("f64 immediate"));
         }
         if let Some(hex) = tok.strip_prefix("0f") {
             assert_eq!(hex.len(), 8, "`{tok}` is not an f32 immediate");
@@ -558,7 +576,7 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 let w = match *ty {
                     // A 16-bit value lives in the low half of the register.
                     "u32" | "s32" | "b32" | "f32" | "pred" | "b16" | "u16" => W::U32,
-                    "u64" | "b64" | "s64" => W::U64,
+                    "u64" | "b64" | "s64" | "f64" => W::U64,
                     _ => panic!("`{text}`: mov.{ty} is not modelled"),
                 };
                 Op::Mov { d: p.dst(ops[0]), s: p.src(ops[1]), w }
@@ -644,6 +662,18 @@ pub(crate) fn parse(ptx: &str) -> Program {
             ["cvt", "rzi", "s32", "f32"] => {
                 want(2);
                 Op::CvtS32F32Rzi { d: p.dst(ops[0]), a: p.src(ops[1]) }
+            }
+            ["cvt", "f64", "f32"] => {
+                want(2);
+                Op::CvtF64F32 { d: p.dst(ops[0]), a: p.src(ops[1]) }
+            }
+            ["add", "f64"] | ["add", "rn", "f64"] => {
+                want(3);
+                Op::AddF64 { d: p.dst(ops[0]), a: p.src(ops[1]), b: p.src(ops[2]) }
+            }
+            ["fma", "rn", "f64"] => {
+                want(4);
+                Op::FmaF64 { d: p.dst(ops[0]), a: p.src(ops[1]), b: p.src(ops[2]), c: p.src(ops[3]) }
             }
             // s32 -> 64 bits sign-extends whatever the destination's sign.
             ["cvt", "u64" | "s64", "s32"] => {
@@ -767,12 +797,12 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 want(2);
                 Op::Cos { d: p.dst(ops[0]), a: p.src(ops[1]) }
             }
-            ["ld", space @ ("global" | "shared"), ty @ ("f32" | "b16" | "u16" | "u32" | "s32" | "b32" | "s64" | "u64")] => {
+            ["ld", space @ ("global" | "shared"), ty @ ("f32" | "b16" | "u16" | "u32" | "s32" | "b32" | "s64" | "u64" | "f64")] => {
                 want(2);
                 let space = if *space == "global" { Space::Global } else { Space::Shared };
                 let bytes = match *ty {
                     "b16" | "u16" => 2,
-                    "s64" | "u64" => 8,
+                    "s64" | "u64" | "f64" => 8,
                     _ => 4,
                 };
                 Op::Ld { space, bytes, d: p.dst(ops[0]), addr: p.addr(ops[1]) }
@@ -788,10 +818,14 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 let space = if *space == "global" { Space::Global } else { Space::Shared };
                 Op::LdS8 { space, d: p.dst(ops[0]), addr: p.addr(ops[1]) }
             }
-            ["st", space @ ("global" | "shared"), ty @ ("f32" | "u32" | "b32" | "b16" | "u16")] => {
+            ["st", space @ ("global" | "shared"), ty @ ("f32" | "u32" | "b32" | "b16" | "u16" | "f64")] => {
                 want(2);
                 let space = if *space == "global" { Space::Global } else { Space::Shared };
-                let bytes = if matches!(*ty, "b16" | "u16") { 2 } else { 4 };
+                let bytes = match *ty {
+                    "b16" | "u16" => 2,
+                    "f64" => 8,
+                    _ => 4,
+                };
                 Op::St { space, bytes, addr: p.addr(ops[0]), v: p.src(ops[1]) }
             }
             ["ld", space @ ("global" | "shared"), "v4", "f32"] => {
@@ -941,6 +975,10 @@ pub(crate) struct Launch<'a> {
     pub(crate) ctaid: u32,
     /// `%ctaid.y`: 0 for a one-dimensional grid.
     pub(crate) ctaid_y: u32,
+    /// `%nctaid.x`, the grid's width. 0 means the gate did not set it, and
+    /// reading `%nctaid.x` then panics: a grid-strided kernel's stride must
+    /// be given, not defaulted.
+    pub(crate) nctaid_x: u32,
     /// `%nctaid.y`: 1 for a one-dimensional grid.
     pub(crate) nctaid_y: u32,
     /// `%ntid.x`. A one-dimensional block ([`run_cta`]) has `ntid`
@@ -989,6 +1027,10 @@ pub(crate) fn read(prog: &Program, t: &Thread, launch: &Launch, tid: u32, s: Src
         Src::Special(Special::LaneId) => (tid % 32) as u64,
         Src::Special(Special::CtaidX) => launch.ctaid as u64,
         Src::Special(Special::CtaidY) => launch.ctaid_y as u64,
+        Src::Special(Special::NctaidX) => {
+            assert!(launch.nctaid_x > 0, "`%nctaid.x` read, but the launch did not set `nctaid_x`");
+            launch.nctaid_x as u64
+        }
         Src::Special(Special::NctaidY) => launch.nctaid_y as u64,
         Src::Special(Special::NtidX) => launch.ntid as u64,
         Src::Special(Special::NtidY) => t.ntid_y as u64,
@@ -1104,6 +1146,19 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
             Op::CvtS32F32Rzi { d, a } => {
                 let v = f32::from_bits(rd(t, launch, *a) as u32) as i32 as u32 as u64;
                 write(t, *d, v);
+            }
+            Op::CvtF64F32 { d, a } => {
+                let v = f32::from_bits(rd(t, launch, *a) as u32) as f64;
+                write(t, *d, v.to_bits());
+            }
+            Op::AddF64 { d, a, b } => {
+                let v = f64::from_bits(rd(t, launch, *a)) + f64::from_bits(rd(t, launch, *b));
+                write(t, *d, v.to_bits());
+            }
+            Op::FmaF64 { d, a, b, c } => {
+                let (a, b, c) = (rd(t, launch, *a), rd(t, launch, *b), rd(t, launch, *c));
+                let v = f64::from_bits(a).mul_add(f64::from_bits(b), f64::from_bits(c));
+                write(t, *d, v.to_bits());
             }
             Op::CvtS64S32 { d, a } => {
                 let v = rd(t, launch, *a) as u32 as i32 as i64 as u64;

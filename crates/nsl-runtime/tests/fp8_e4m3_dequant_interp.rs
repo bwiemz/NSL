@@ -59,7 +59,7 @@ fn run(codes: &[u8], order: Order) -> Vec<u32> {
             shared: vec![],
             ctaid: cta,
             ctaid_y: 0,
-            nctaid_y: 1,
+            nctaid_x: 0, nctaid_y: 1,
             ntid: BLOCK,
             steps: 0,
         };

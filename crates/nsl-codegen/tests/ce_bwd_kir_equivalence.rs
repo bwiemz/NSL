@@ -162,7 +162,7 @@ fn run_count(ptx: &str, c: &CountCase, order: Order) -> Vec<u32> {
         shared: vec![0; CE_BWD_BLOCK as usize * 4],
         ctaid: 0,
         ctaid_y: 0,
-        nctaid_y: 1,
+        nctaid_x: 0, nctaid_y: 1,
         ntid: CE_BWD_BLOCK,
         steps: 0,
     };
@@ -268,7 +268,7 @@ fn run_finish(ptx: &str, c: &FinishCase, block: u32, order: Order) -> Vec<u32> {
         ctas.reverse();
     }
     for ctaid in ctas {
-        let mut l = Launch { prog: &prog, args: &args, global: &mut global, shared: vec![], ctaid, ctaid_y: 0, nctaid_y: 1, ntid: block, steps: 0 };
+        let mut l = Launch { prog: &prog, args: &args, global: &mut global, shared: vec![], ctaid, ctaid_y: 0, nctaid_x: 0, nctaid_y: 1, ntid: block, steps: 0 };
         run_cta(&mut l, order);
     }
     global.iter().flat_map(|s| words(&s.bytes)).collect()

@@ -320,7 +320,7 @@ fn run_ctas(prog: &Program, args: &HashMap<String, u64>, global: &mut Vec<Segmen
     }
     for cta in ctas {
         let mut launch =
-            Launch { prog, args, global, shared: vec![], ctaid: cta, ctaid_y: 0, nctaid_y: 1, ntid: ELEMENTWISE_BLOCK, steps: 0 };
+            Launch { prog, args, global, shared: vec![], ctaid: cta, ctaid_y: 0, nctaid_x: 0, nctaid_y: 1, ntid: ELEMENTWISE_BLOCK, steps: 0 };
         run_cta(&mut launch, order);
     }
 }

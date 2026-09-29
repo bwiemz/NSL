@@ -141,7 +141,7 @@ fn run(ptx: &str, c: &Case, src: &[u32], order: Order) -> Vec<Vec<u8>> {
             shared: vec![],
             ctaid: x,
             ctaid_y: y,
-            nctaid_y: c.grid_y,
+            nctaid_x: 0, nctaid_y: c.grid_y,
             ntid: block,
             steps: 0,
         };

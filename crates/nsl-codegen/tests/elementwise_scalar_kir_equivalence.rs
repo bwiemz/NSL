@@ -166,7 +166,7 @@ fn run(ptx: &str, n: usize, a: &[u32], s: u32, in_place: bool, order: Order) -> 
             shared: vec![],
             ctaid: cta,
             ctaid_y: 0,
-            nctaid_y: 1,
+            nctaid_x: 0, nctaid_y: 1,
             ntid: ELEMENTWISE_BLOCK,
             steps: 0,
         };

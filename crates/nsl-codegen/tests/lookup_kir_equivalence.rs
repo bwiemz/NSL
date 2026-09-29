@@ -157,7 +157,7 @@ fn run(k: K, ptx: &str, (rows, cols, table_rows): (usize, usize, usize), block: 
             shared: vec![],
             ctaid: x,
             ctaid_y: y,
-            nctaid_y: grid_y,
+            nctaid_x: 0, nctaid_y: grid_y,
             ntid: block[0],
             steps: 0,
         };

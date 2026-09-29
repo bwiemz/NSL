@@ -209,7 +209,7 @@ fn run(prog: &Program, smem: usize, q: &[f32], k: &[f32], v: &[f32], seg: Option
                     shared: vec![0xFF; smem],
                     ctaid,
                     ctaid_y,
-                    nctaid_y: H as u32,
+                    nctaid_x: 0, nctaid_y: H as u32,
                     ntid: THREADS,
                     steps: 0,
                 };
