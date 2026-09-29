@@ -6167,7 +6167,6 @@ pub(crate) fn gpu_clamp_backward(grad: i64, input: i64, min_val: f32, max_val: f
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_log_softmax_f32(tensor_ptr: i64) -> i64 {
     use crate::tensor::NslTensor;
-    use fused_kernels::LOG_SOFTMAX_F32_PTX;
 
     let t = NslTensor::from_ptr(tensor_ptr);
     assert_gpu_f32(t, "log_softmax_f32", "input");
@@ -6193,7 +6192,7 @@ pub(crate) fn gpu_log_softmax_f32(tensor_ptr: i64) -> i64 {
     let block = 256i64;
     let grid = rows as i64;
     let result = inner::kernel_launch(
-        LOG_SOFTMAX_F32_PTX.as_ptr(), b"nsl_log_softmax_f32\0".as_ptr(),
+        fused_kernels::log_softmax_f32_ptx().as_ptr(), b"nsl_log_softmax_f32\0".as_ptr(),
         [grid, 1, 1], [block, 1, 1], &args, 256 * 4 * 2,
     );
     assert_eq!(result as u32, 0, "GPU log_softmax kernel failed: {:?}", result);
@@ -6800,7 +6799,6 @@ pub(crate) fn gpu_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
 pub(crate) fn gpu_softmax_f32(tensor_ptr: i64) -> i64 {
     inner::set_oom_context("softmax_f32");
     use crate::tensor::NslTensor;
-    use fused_kernels::SOFTMAX_F32_PTX;
 
     let t = NslTensor::from_ptr(tensor_ptr);
     assert_gpu_f32(t, "softmax_f32", "input");
@@ -6833,7 +6831,7 @@ pub(crate) fn gpu_softmax_f32(tensor_ptr: i64) -> i64 {
     let grid = rows as i64;
 
     let result = inner::kernel_launch(
-        SOFTMAX_F32_PTX.as_ptr(), b"nsl_softmax_f32\0".as_ptr(),
+        fused_kernels::softmax_f32_ptx().as_ptr(), b"nsl_softmax_f32\0".as_ptr(),
         [grid, 1, 1], [block, 1, 1], &args, 256 * 4 * 2, // shared mem: smax[256] + ssum[256]
     );
     assert_eq!(result as u32, 0, "GPU softmax kernel failed: {:?}", result);
@@ -10438,6 +10436,8 @@ mod tests {
         all.push(("nsl_coo_spmv_f32", super::fused_kernels::coo_spmv_f32_ptx(), true));
         all.push(("nsl_sum_sq_f64_acc_f32", super::fused_kernels::sum_sq_f64_acc_f32_ptx(), true));
         all.push(("nsl_lce_finalize_f32", super::fused_kernels::lce_finalize_f32_ptx(), true));
+        all.push(("nsl_softmax_f32", super::fused_kernels::softmax_f32_ptx(), true));
+        all.push(("nsl_log_softmax_f32", super::fused_kernels::log_softmax_f32_ptx(), true));
         all.push(("nsl_rmsnorm_rinv_rows_f32", super::fused_kernels::rmsnorm_rinv_rows_f32_ptx(), true));
         all.push(("nsl_rmsnorm_dgamma_f32", super::fused_kernels::rmsnorm_dgamma_f32_ptx(), true));
         all.push(("nsl_sum_dim_short_f32", super::fused_kernels::sum_dim_short_f32_ptx(), true));
