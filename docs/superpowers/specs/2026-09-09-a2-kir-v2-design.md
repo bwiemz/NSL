@@ -1385,6 +1385,35 @@ frozen throughout, so nothing here blocks a kernel fix.
         unchanged. Thread 0 reads `%ntid.x` once, before its fold: read in
         the fold's header, ptxas left both folds rolled for sm_90 and
         sm_120 (4 `LDS` against 18).
+    - **`fused_kernels.rs`, the sparse matrix-matrix products.**
+      `nsl_csr_spmm_f32`, `nsl_coo_spmm_f32` and `nsl_bsr_spmm_f32` are in
+      `nsl_kir::kernels::spmm`. CSR runs a block per (row, 256 output
+      columns) and BSR a two-dimensional block per (block row, output
+      columns), row within the block `%tid.y`; each output is `fma.rn`-
+      accumulated from `+0.0` over the row's terms in order (BSR over each
+      block's sub-columns). COO runs a thread per nonzero that atomically
+      adds its `mul.rn` products into the zeroed `C` across all `N`
+      columns, as `red.global.add.f32` where the hand kernel's `atom`
+      result was unread. BSR's launch block is sized from the shapes, so it
+      declares no launch bounds, as the hand kernel did not.
+      - **The gate,** `spmm_kir_equivalence`, launches whole grids with a
+        spare block in every dimension, on the runtime's blocks and smaller
+        ones, and for BSR one a row taller than a block (so its sub-row
+        guard has a thread to stop), under two schedules. On general data
+        the two kernels leave the same bytes; on exact data both are the
+        restated product. The data has empty rows, a single nonzero, ragged
+        rows, repeated COO rows and columns, outputs narrower than, equal to
+        and wider than a block, and BSR blocks of 1×1, 2×3 and 3×2. It
+        kills mutants of every bound, block and thread index, the output
+        column's 32-bit multiply and add, every element size, every index
+        add and multiply, the row pointer's `+ 1`, each loop's step and
+        start, the accumulator's start, the `fma`s (without their addend,
+        or squaring the value), the COO product and the atomic add.
+      - **SASS** (sm_80/90/120): the same `LDG`, `STG`, `RED`, `FFMA` and
+        `FMUL` as the hand kernels, and the same unrolling. Registers are
+        28/32/32 (CSR), 30/32/30 (COO) and 32/32/40 (BSR) against 28/30/32,
+        30/28/28 and 32/32/36; BSR's 40 and 36 on sm_120 allocate alike, so
+        occupancy is unchanged.
     - **The printer's conditional edges.** A `CondBranch` edge that
       carries block arguments branches to a trampoline printed after the
       last block, which makes the copies and jumps to the target; the
