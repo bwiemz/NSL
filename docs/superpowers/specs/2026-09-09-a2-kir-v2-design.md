@@ -1211,6 +1211,35 @@ frozen throughout, so nothing here blocks a kernel fix.
         and float instructions as the hand kernels. Registers are equal or
         fewer (count 17/20/19 against 20/22/20, finish 17/18/16 against
         17/18/18).
+    - **`fused_kernels.rs`, the shared-memory tree reductions.**
+      `nsl_global_sum_f32`, `nsl_sum_dim_f32` and `nsl_max_dim_f32` are in
+      `nsl_kir::kernels::block_reduce`: one 256-thread block per result
+      (one block for the global sum, `%ctaid.x` per output for the per-dim
+      pair). Thread `k` folds `k, k + 256, …` from the identity (`+0.0`,
+      or `-inf` for the max). A 256-entry `f32` shared buffer then takes a
+      tree (`s[k] ⊕= s[k + h]`, `h = 128 … 1`, a barrier per level), and
+      thread 0 writes `s[0]`. The sums add with `add.rn.f32` (the hand
+      kernels' `add.f32` rounds the same), and the max is `max.f32`. The
+      per-dim loop carries its element offset and steps it by
+      `256 · inner`, where the hand kernel formed `k · inner` on each trip.
+      - **The gate,** `block_reduce_kir_equivalence`, requires the hand
+        kernels' bytes and the restated tree order, bit for bit. It runs
+        under all four thread schedules and both block orders. The data
+        covers empty, single and ragged extents longer than two strides,
+        order-sensitive values, signed zeros, NaNs for the max, an
+        all-`-0.0` extent, and a spike only the second trip reaches. It
+        kills mutants of every bound, the block index, the quotient and
+        remainder, every element size, 64-bit add and multiply, the
+        stride, the tree's half, halving and partner, both barriers, both
+        combines and the identity. Two mutants are named as equivalent:
+        every thread writing the result (each stores the same final
+        `s[0]`), and the max's stride halved (each value is read twice,
+        and `max.f32` is idempotent).
+      - **SASS** (sm_80/90/120): the same 8× unrolled loop (8 `LDG`), 3
+        `LDS`, 3 `BAR` and 9 `FADD`/`FMNMX` as the hand kernels. Registers
+        are within two of them (global sum 17/22/20 against 16/20/20,
+        per-dim 28/27/32 against 28/29/32 and 28/27/30 against 28/29/30),
+        all at or under 32, so occupancy at 256 threads is unchanged.
     - **`fused_kernels.rs`, the f64 sum of squares.**
       `nsl_sum_sq_f64_acc_f32` (gradient clipping's norm) is in
       `nsl_kir::kernels::sum_sq`. It is grid-strided on 256-thread blocks,

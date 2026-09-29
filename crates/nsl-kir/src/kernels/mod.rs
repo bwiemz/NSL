@@ -8,6 +8,7 @@
 //! then transcribed into the runtime as PTX text that a parity test has to
 //! keep honest.
 
+pub mod block_reduce;
 pub mod cast;
 pub mod ce_bwd;
 pub mod data_movement;
