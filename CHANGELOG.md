@@ -8,6 +8,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **The deterministic scatter-add is built by
+  `nsl_kir::kernels::det_scatter`** in place of its hand-written constant
+  (new-roadmap item 5): `nsl_det_scatter_add_f32`, `out = input` plus `src`
+  scattered by index, one thread per output element and no atomics.
+  - **The kernel** starts each output from `input[row, col]`, walks every
+    position in order and adds `src[i, col]` where the index names the row,
+    so the result is the same on every run. The f32 index converts with
+    the hand kernel's saturating `cvt.rzi.u64.f32` (a negative index or a
+    NaN lands on row 0, as before), and the sum adds with `add.rn.f32`.
+  - **The gate,** `det_scatter_kir_equivalence` (10 tests), runs the frozen
+    hand module (`tests/fixtures/det_scatter_hand.rs`) and the KIR one on
+    the CTA interpreter's two-dimensional blocks (16 × 16 and 8 × 4).
+    - The two leave the same bytes, and they match the restated ordered
+      scatter.
+    - The indices include repeats, unhit rows, fractions, negatives, NaN,
+      infinities and out-of-range values.
+    - Mutants of every bound, block and thread index, address, the match,
+      the step, the start, the accumulate, the signed conversion and every
+      pointer are killed.
+  - **SASS** (sm_80/90/120): the same unrolled loop, loads, conversions,
+    adds, compares and registers as the hand kernel.
+
 - **The tensor statistics kernel is built by
   `nsl_kir::kernels::tensor_stats`** in place of its hand-written constant
   (new-roadmap item 5): `nsl_tensor_stats_f32`, which writes `[min, max,
