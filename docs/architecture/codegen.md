@@ -550,7 +550,8 @@ assembles a grid-stride loop with `ptxas`. The scalar ISA the hand estate
 is made of is first-class too (roadmap A2 step 4): `And`/`Or`/`Xor`/`Not`,
 `Shl`/`Shr` (arithmetic for signed types), `Rem`, `Min`/`Max`,
 `Rcp`/`Rsqrt`, `Exp2` (a bare `ex2.approx.f32`, where `Exp` is `e^x` and
-scales by `log2(e)` first), `WarpShuffle { mode: Down | Up | Xor | Idx, width }`,
+scales by `log2(e)` first), `Log2` (a bare `lg2.approx.f32`, where `Log`
+is `ln` and scales by `ln 2` after), `WarpShuffle { mode: Down | Up | Xor | Idx, width }`,
 `Vote { Any | All | Ballot }`, `LaneId`/`WarpId`, `LoadVec`/`StoreVec`
 (2 or 4 pointee-typed values), `CastRounded { mode }` beside `Cast`
 (which now prints the rounding modifier PTX requires: `.rn` for a float

@@ -1301,6 +1301,32 @@ frozen throughout, so nothing here blocks a kernel fix.
         kernel. The 8 `FFMA` become 8 `FMUL` + 8 `FADD`. Registers are
         22/26/34 against 20/20/24; it is a single-block kernel, so
         occupancy does not bear on it.
+    - **`fused_kernels.rs`, the fused linear cross-entropy finalize.**
+      `nsl_lce_finalize_f32` is in `nsl_kir::kernels::lce_finalize`. It is
+      grid-strided over rows (stride `%ntid.x · %nctaid.x`) and writes
+      `lse = m + ln s` and `loss = t >= 0 ? lse - tl : 0` per row. KIR
+      gained one op for it, `Log2`, the bare `lg2.approx.f32`: `Log` is `ln`
+      and multiplies by `ln 2` after, which would round twice where the hand
+      kernel folds `ln 2` into the add as one `fma.rn.f32` (`lse = lg2(s) ·
+      ln 2 + m`). The target is read as `s64`, `tl` is loaded only for a
+      valid row, and the loss subtracts with `sub.rn.f32`.
+      - **The gate,** `lce_finalize_kir_equivalence`, launches whole grids
+        (the runtime's `ceil(rows / 256)`, one block, three) under all four
+        thread schedules and both block orders. The sums have full
+        significands and include zero, a subnormal, `inf` and NaN. The
+        targets are valid, zero, negative and `i64::MIN`. It requires the
+        hand kernel's bytes and the restated formulas, bit for bit. It
+        kills mutants of the bound, the start's block index, a stride that
+        skips rows or never advances, the `lg2`, `ln 2`, each `fma`
+        operand, the `fma` rounded twice, the target's sign test, the
+        invalid row's zero, the subtraction, every element size, 64-bit
+        add and pointer. A stride that shrinks but stays nonzero is named as
+        an equivalent mutant: every row is still covered, and a row
+        computed twice is written with the same bytes.
+      - **SASS** (sm_80/90/120): the same 4 `LDG`, 2 `STG`, one `MUFU`
+        (lg2), one `FFMA`, and the same float and compare instructions as
+        the hand kernel. Registers are 18/28/28 against 20/20/22, all at or
+        under 32, so occupancy at 256 threads is unchanged.
     - **The printer's conditional edges.** A `CondBranch` edge that
       carries block arguments branches to a trampoline printed after the
       last block, which makes the copies and jumps to the target; the

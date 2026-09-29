@@ -10437,6 +10437,7 @@ mod tests {
         all.push(("nsl_csr_spmv_f32", super::fused_kernels::csr_spmv_f32_ptx(), true));
         all.push(("nsl_coo_spmv_f32", super::fused_kernels::coo_spmv_f32_ptx(), true));
         all.push(("nsl_sum_sq_f64_acc_f32", super::fused_kernels::sum_sq_f64_acc_f32_ptx(), true));
+        all.push(("nsl_lce_finalize_f32", super::fused_kernels::lce_finalize_f32_ptx(), true));
         all.push(("nsl_rmsnorm_rinv_rows_f32", super::fused_kernels::rmsnorm_rinv_rows_f32_ptx(), true));
         all.push(("nsl_rmsnorm_dgamma_f32", super::fused_kernels::rmsnorm_dgamma_f32_ptx(), true));
         all.push(("nsl_sum_dim_short_f32", super::fused_kernels::sum_dim_short_f32_ptx(), true));

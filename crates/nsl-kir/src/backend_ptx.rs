@@ -767,6 +767,9 @@ fn emit_op(ptx: &mut String, op: &KirOp, ir: &KernelIR) {
         KirOp::Exp2(dst, src) => {
             writeln!(ptx, "    ex2.approx.f32 %f{}, %f{};", dst, src).unwrap();
         }
+        KirOp::Log2(dst, src) => {
+            writeln!(ptx, "    lg2.approx.f32 %f{}, %f{};", dst, src).unwrap();
+        }
         KirOp::LoadVec { dsts, ptr, space } => {
             let first = dsts.first().copied().unwrap_or(0);
             let ty = mem_type(var_ptx_type(ir, first, first));
@@ -2086,7 +2089,9 @@ mod tests {
             b.emit(KirOp::Min(mn, x, x));
             let e2 = b.new_typed_var(KirType::F32);
             b.emit(KirOp::Exp2(e2, x));
-            ids = vec![x, r, q, d, rd, mn, e2];
+            let l2 = b.new_typed_var(KirType::F32);
+            b.emit(KirOp::Log2(l2, x));
+            ids = vec![x, r, q, d, rd, mn, e2, l2];
         });
         let n = |k: usize| al.name(ids[k]);
         assert!(ptx.contains(&format!("rcp.approx.f32 {}, {};", n(1), n(0))), "{ptx}");
@@ -2096,6 +2101,9 @@ mod tests {
         // Exp2 is the bare instruction: no log2(e) pre-scale, unlike Exp.
         assert!(ptx.contains(&format!("ex2.approx.f32 {}, {};", n(6), n(0))), "{ptx}");
         assert!(!ptx.contains("0f3FB8AA3B"), "{ptx}");
+        // Log2 likewise: no ln(2) post-scale, unlike Log.
+        assert!(ptx.contains(&format!("lg2.approx.f32 {}, {};", n(7), n(0))), "{ptx}");
+        assert!(!ptx.contains("0f3F317218"), "{ptx}");
         assert!(n(3).starts_with("%fd"));
     }
 
