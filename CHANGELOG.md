@@ -8,6 +8,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **The row LayerNorm and RMSNorm forwards are built by
+  `nsl_kir::kernels::norm`** in place of their hand-written constants
+  (new-roadmap item 5): `nsl_layernorm_f32` and `nsl_rmsnorm_f32`, one
+  256-thread block per row. The LayerNorm's shared-slot race is fixed.
+  - **The race:** the hand LayerNorm reduced the mean and the variance
+    through one 256-float region. Thread 0 stored its variance partial to the
+    slot that held the mean with no barrier after the other threads read the
+    mean, so a warp that fell a pass behind normalized with thread 0's
+    partial as the mean. The KIR kernel gives each statistic its own region.
+  - **The kernels** otherwise keep the hand kernels' passes and order of
+    combines: per-thread partial sums over columns `k, k + 256, …`, folded by
+    thread 0 in order, divided by `cols` (`div.approx`), `eps` added and
+    `rsqrt` taken. Every add, subtract and multiply rounds explicitly
+    (`.rn`). ptxas contracted the hand kernels' squares and `· gamma + beta`
+    into `FFMA`; the KIR kernels round twice, as the PTX and the CPU
+    reference do.
+  - **The gate,** `norm_kir_equivalence` (10 tests), runs the frozen hand
+    modules (`tests/fixtures/norm_hand.rs`) and the KIR ones on the CTA
+    interpreter, one block per row plus one past the last, with shared
+    memory poisoned.
+    - The KIR kernels match the restated passes under all four thread
+      schedules; the hand RMSNorm agrees byte for byte under all four, the
+      hand LayerNorm only where thread 0 runs last.
+    - Under the other three schedules the hand LayerNorm reads thread 0's
+      variance partial as the mean on every case with more than one column.
+      Moving the KIR variance region back onto the mean's is caught.
+    - Rows are 0 to 700 columns wide, with order-sensitive sums, a constant
+      row, a NaN, `+inf`, squares that overflow and a zero `eps`.
+    - Mutants of every bound, stride, fold start and step, the thread-0
+      test, every barrier, the row base, every element size and 64-bit add,
+      every add, subtract and multiply (flipped and dropped), the
+      `div.approx`, the `rsqrt` and each identity are killed. The last pass
+      striding by 128 and each sum's identity as `-0` are named as
+      equivalent.
+  - **SASS** (sm_80/90/120): the same loads, stores, shared accesses,
+    barriers and `MUFU` as the hand kernels, with the same unrolling. Each
+    hand `FFMA` is an `FMUL` and an `FADD`. Registers are at or under 30.
+
 - **The fused linear cross-entropy finalize is built by
   `nsl_kir::kernels::lce_finalize`** in place of its hand-written constant
   (new-roadmap item 5): `nsl_lce_finalize_f32`, which turns the GEMM-chunked

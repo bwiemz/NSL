@@ -7999,7 +7999,6 @@ pub(crate) fn gpu_max_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) -> i64
 pub(crate) fn gpu_layernorm_f32(input_ptr: i64, gamma_ptr: i64, beta_ptr: i64, eps: f32) -> i64 {
     inner::set_oom_context("layernorm_f32");
     use crate::tensor::NslTensor;
-    use fused_kernels::LAYERNORM_F32_PTX;
 
     let t = NslTensor::from_ptr(input_ptr);
     assert_gpu_f32(t, "layernorm_f32", "input");
@@ -8041,7 +8040,7 @@ pub(crate) fn gpu_layernorm_f32(input_ptr: i64, gamma_ptr: i64, beta_ptr: i64, e
     let grid = rows as i64;
 
     let result = inner::kernel_launch(
-        LAYERNORM_F32_PTX.as_ptr(), b"nsl_layernorm_f32\0".as_ptr(),
+        fused_kernels::layernorm_f32_ptx().as_ptr(), b"nsl_layernorm_f32\0".as_ptr(),
         [grid, 1, 1], [block, 1, 1], &args, 256 * 4,
     );
     assert_eq!(result as u32, 0, "GPU layernorm kernel failed: {:?}", result);
@@ -8068,7 +8067,6 @@ pub(crate) fn gpu_layernorm_f32(input_ptr: i64, gamma_ptr: i64, beta_ptr: i64, e
 pub(crate) fn gpu_rmsnorm_f32(input_ptr: i64, gamma_ptr: i64, eps: f32) -> i64 {
     inner::set_oom_context("rmsnorm_f32");
     use crate::tensor::NslTensor;
-    use fused_kernels::RMSNORM_F32_PTX;
 
     let t = NslTensor::from_ptr(input_ptr);
     assert_gpu_f32(t, "rmsnorm_f32", "input");
@@ -8106,7 +8104,7 @@ pub(crate) fn gpu_rmsnorm_f32(input_ptr: i64, gamma_ptr: i64, eps: f32) -> i64 {
     let grid = rows as i64;
 
     let result = inner::kernel_launch(
-        RMSNORM_F32_PTX.as_ptr(), b"nsl_rmsnorm_f32\0".as_ptr(),
+        fused_kernels::rmsnorm_f32_ptx().as_ptr(), b"nsl_rmsnorm_f32\0".as_ptr(),
         [grid, 1, 1], [block, 1, 1], &args, 256 * 4,
     );
     assert_eq!(result as u32, 0, "GPU rmsnorm kernel failed: {:?}", result);
@@ -10438,6 +10436,8 @@ mod tests {
         all.push(("nsl_coo_spmv_f32", super::fused_kernels::coo_spmv_f32_ptx(), true));
         all.push(("nsl_sum_sq_f64_acc_f32", super::fused_kernels::sum_sq_f64_acc_f32_ptx(), true));
         all.push(("nsl_lce_finalize_f32", super::fused_kernels::lce_finalize_f32_ptx(), true));
+        all.push(("nsl_layernorm_f32", super::fused_kernels::layernorm_f32_ptx(), true));
+        all.push(("nsl_rmsnorm_f32", super::fused_kernels::rmsnorm_f32_ptx(), true));
         all.push(("nsl_rmsnorm_rinv_rows_f32", super::fused_kernels::rmsnorm_rinv_rows_f32_ptx(), true));
         all.push(("nsl_rmsnorm_dgamma_f32", super::fused_kernels::rmsnorm_dgamma_f32_ptx(), true));
         all.push(("nsl_sum_dim_short_f32", super::fused_kernels::sum_dim_short_f32_ptx(), true));
