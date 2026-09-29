@@ -7831,7 +7831,6 @@ pub(crate) fn gpu_det_scatter_add_f32(
     src_ptr: i64,
 ) -> i64 {
     use crate::tensor::NslTensor;
-    use fused_kernels::DET_SCATTER_ADD_F32_PTX;
 
     let input = NslTensor::from_ptr(input_ptr);
     let src = NslTensor::from_ptr_ref(src_ptr);
@@ -7894,7 +7893,7 @@ pub(crate) fn gpu_det_scatter_add_f32(
     let grid_y = ((embed_dim as i64) + block_y - 1) / block_y;
 
     let result = inner::kernel_launch(
-        DET_SCATTER_ADD_F32_PTX.as_ptr(), b"nsl_det_scatter_add_f32\0".as_ptr(),
+        fused_kernels::det_scatter_add_f32_ptx().as_ptr(), b"nsl_det_scatter_add_f32\0".as_ptr(),
         [grid_x, grid_y, 1], [block_x, block_y, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU det_scatter_add kernel failed: {:?}", result);
@@ -10432,6 +10431,7 @@ mod tests {
         }
         all.push(("nsl_det_global_sum_f32", super::fused_kernels::det_global_sum_f32_ptx(), true));
         all.push(("nsl_det_sum_dim_f32", super::fused_kernels::det_sum_dim_f32_ptx(), true));
+        all.push(("nsl_det_scatter_add_f32", super::fused_kernels::det_scatter_add_f32_ptx(), true));
         all.push(("nsl_csr_spmv_f32", super::fused_kernels::csr_spmv_f32_ptx(), true));
         all.push(("nsl_coo_spmv_f32", super::fused_kernels::coo_spmv_f32_ptx(), true));
         all.push(("nsl_sum_sq_f64_acc_f32", super::fused_kernels::sum_sq_f64_acc_f32_ptx(), true));
