@@ -7319,7 +7319,6 @@ pub(crate) fn gpu_cross_entropy_backward_f32(
     grad_out_ptr: i64,
 ) -> i64 {
     use crate::tensor::NslTensor;
-    use fused_kernels::{CE_BWD_COUNT_F32_PTX, CE_BWD_FINISH_F32_PTX};
 
     inner::set_oom_context("ce_backward_f32");
     // Logits only. `targets_ptr` is an index tensor and `grad_out_ptr` is
@@ -7365,12 +7364,12 @@ pub(crate) fn gpu_cross_entropy_backward_f32(
             &mut a3 as *mut _ as *mut std::ffi::c_void,
         ];
         let r = inner::kernel_launch(
-            CE_BWD_COUNT_F32_PTX.as_ptr(),
+            fused_kernels::ce_bwd_count_f32_ptx().as_ptr(),
             b"nsl_ce_bwd_count_f32\0".as_ptr(),
             [1, 1, 1],
             [256, 1, 1],
             &args,
-            0, // smem is STATIC in the kernel (.shared .u32 cnt[256])
+            0, // smem is STATIC in the kernel (the 256-entry count buffer)
         );
         assert_eq!(r as u32, 0, "GPU ce_bwd_count kernel failed: {r:?}");
     }
@@ -7421,7 +7420,7 @@ pub(crate) fn gpu_cross_entropy_backward_f32(
         let block = 256i64;
         let grid = ((total as i64) + block - 1) / block;
         let r = inner::kernel_launch(
-            CE_BWD_FINISH_F32_PTX.as_ptr(),
+            fused_kernels::ce_bwd_finish_f32_ptx().as_ptr(),
             b"nsl_ce_bwd_finish_f32\0".as_ptr(),
             [grid, 1, 1],
             [block, 1, 1],
@@ -10447,6 +10446,8 @@ mod tests {
         all.push(("nsl_rmsnorm_rinv_rows_f32", super::fused_kernels::rmsnorm_rinv_rows_f32_ptx(), true));
         all.push(("nsl_rmsnorm_dgamma_f32", super::fused_kernels::rmsnorm_dgamma_f32_ptx(), true));
         all.push(("nsl_sum_dim_short_f32", super::fused_kernels::sum_dim_short_f32_ptx(), true));
+        all.push(("nsl_ce_bwd_count_f32", super::fused_kernels::ce_bwd_count_f32_ptx(), true));
+        all.push(("nsl_ce_bwd_finish_f32", super::fused_kernels::ce_bwd_finish_f32_ptx(), true));
         all.push(("nsl_strided_copy_f32", super::fused_kernels::strided_copy_f32_ptx(), true));
         all.push(("nsl_slice_f32", super::fused_kernels::slice_f32_ptx(), true));
         all

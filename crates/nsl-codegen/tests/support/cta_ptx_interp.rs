@@ -54,8 +54,10 @@
 //! (Rust's `as`), and `cvt.u32.u64` keeps the low 32 bits.
 //! `cvt.rzi.u64.f32` truncates toward zero and saturates, a NaN or a
 //! negative value giving 0: PTX's float-to-integer rule, which Rust's `as`
-//! also follows. `cvt.rzi.s64.f32` is the signed form (NaN gives 0), and
-//! `cvt.s64.s32` and `cvt.u64.s32` sign-extend the low 32 bits; `ld.s32`
+//! also follows. `cvt.rzi.s64.f32` and `cvt.rzi.s32.f32` are the signed
+//! forms (NaN gives 0, and each saturates to its range), `cvt.u32.s32`
+//! keeps the low 32 bits, and `setp.*.s32` compares the low 32 bits as
+//! signed. `cvt.s64.s32` and `cvt.u64.s32` sign-extend the low 32 bits; `ld.s32`
 //! loads four bytes like `ld.u32`, the sign mattering only to the widening
 //! that follows.
 //!
@@ -197,6 +199,7 @@ pub(crate) enum CmpTy {
     U16,
     U32,
     U64,
+    S32,
     S64,
     F32,
 }
@@ -227,6 +230,8 @@ pub(crate) enum Op {
     CvtU64F32Rzi { d: usize, a: Src },
     /// `cvt.rzi.s64.f32`: toward zero, saturating to the i64 range, NaN to 0.
     CvtS64F32Rzi { d: usize, a: Src },
+    /// `cvt.rzi.s32.f32`: toward zero, saturating to the i32 range, NaN to 0.
+    CvtS32F32Rzi { d: usize, a: Src },
     /// `cvt.f64.f32`: exact.
     CvtF64F32 { d: usize, a: Src },
     /// `add.f64` / `add.rn.f64`.
@@ -570,7 +575,7 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 want(2);
                 let w = match *ty {
                     // A 16-bit value lives in the low half of the register.
-                    "u32" | "b32" | "f32" | "pred" | "b16" | "u16" => W::U32,
+                    "u32" | "s32" | "b32" | "f32" | "pred" | "b16" | "u16" => W::U32,
                     "u64" | "b64" | "s64" | "f64" => W::U64,
                     _ => panic!("`{text}`: mov.{ty} is not modelled"),
                 };
@@ -628,7 +633,8 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 want(2);
                 Op::CvtU64U32 { d: p.dst(ops[0]), a: p.src(ops[1]) }
             }
-            ["cvt", "u32", "u64"] => {
+            // Both keep the low 32 bits.
+            ["cvt", "u32", "u64" | "s32"] => {
                 want(2);
                 Op::CvtU32U64 { d: p.dst(ops[0]), a: p.src(ops[1]) }
             }
@@ -652,6 +658,10 @@ pub(crate) fn parse(ptx: &str) -> Program {
             ["cvt", "rzi", "s64", "f32"] => {
                 want(2);
                 Op::CvtS64F32Rzi { d: p.dst(ops[0]), a: p.src(ops[1]) }
+            }
+            ["cvt", "rzi", "s32", "f32"] => {
+                want(2);
+                Op::CvtS32F32Rzi { d: p.dst(ops[0]), a: p.src(ops[1]) }
             }
             ["cvt", "f64", "f32"] => {
                 want(2);
@@ -727,6 +737,7 @@ pub(crate) fn parse(ptx: &str) -> Program {
                     "u16" => CmpTy::U16,
                     "u32" => CmpTy::U32,
                     "u64" => CmpTy::U64,
+                    "s32" => CmpTy::S32,
                     "s64" => CmpTy::S64,
                     "f32" => CmpTy::F32,
                     _ => panic!("`{text}`: comparison type not modelled"),
@@ -1132,6 +1143,10 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
                 let v = f32::from_bits(rd(t, launch, *a) as u32) as i64 as u64;
                 write(t, *d, v);
             }
+            Op::CvtS32F32Rzi { d, a } => {
+                let v = f32::from_bits(rd(t, launch, *a) as u32) as i32 as u32 as u64;
+                write(t, *d, v);
+            }
             Op::CvtF64F32 { d, a } => {
                 let v = f32::from_bits(rd(t, launch, *a) as u32) as f64;
                 write(t, *d, v.to_bits());
@@ -1172,8 +1187,11 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
             Op::Setp { cmp, ty, d, a, b } => {
                 let (a, b) = (rd(t, launch, *a), rd(t, launch, *b));
                 let r = match ty {
-                    CmpTy::S64 => {
-                        let (a, b) = (a as i64, b as i64);
+                    CmpTy::S32 | CmpTy::S64 => {
+                        let (a, b) = match ty {
+                            CmpTy::S32 => (a as u32 as i32 as i64, b as u32 as i32 as i64),
+                            _ => (a as i64, b as i64),
+                        };
                         match cmp {
                             Cmp::Eq => a == b,
                             Cmp::Ne => a != b,
