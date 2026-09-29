@@ -8241,7 +8241,6 @@ pub(crate) fn gpu_rmsnorm_dx_backward_add_f32(
 ) -> i64 {
     inner::set_oom_context("rmsnorm_dx_bwd_add_f32");
     use crate::tensor::NslTensor;
-    use fused_kernels::RMSNORM_DX_BWD_ADD_F32_PTX;
 
     let x = NslTensor::from_ptr(x_ptr);
     assert_gpu_f32(x, "rmsnorm_dx_backward_add_f32", "x");
@@ -8293,7 +8292,7 @@ pub(crate) fn gpu_rmsnorm_dx_backward_add_f32(
     ];
 
     let result = inner::kernel_launch(
-        RMSNORM_DX_BWD_ADD_F32_PTX.as_ptr(),
+        fused_kernels::rmsnorm_dx_bwd_add_f32_ptx().as_ptr(),
         b"nsl_rmsnorm_dx_bwd_add_f32\0".as_ptr(),
         [rows as i64, 1, 1],
         [256, 1, 1],
@@ -8318,7 +8317,6 @@ pub(crate) fn gpu_rmsnorm_dx_backward_f32(
 ) -> i64 {
     inner::set_oom_context("rmsnorm_dx_bwd_f32");
     use crate::tensor::NslTensor;
-    use fused_kernels::RMSNORM_DX_BWD_F32_PTX;
 
     let x = NslTensor::from_ptr(x_ptr);
     assert_gpu_f32(x, "rmsnorm_dx_backward_f32", "x");
@@ -8356,7 +8354,7 @@ pub(crate) fn gpu_rmsnorm_dx_backward_f32(
     ];
 
     let result = inner::kernel_launch(
-        RMSNORM_DX_BWD_F32_PTX.as_ptr(),
+        fused_kernels::rmsnorm_dx_bwd_f32_ptx().as_ptr(),
         b"nsl_rmsnorm_dx_bwd_f32\0".as_ptr(),
         [rows as i64, 1, 1],
         [256, 1, 1],
@@ -10438,6 +10436,8 @@ mod tests {
         all.push(("nsl_log_softmax_f32", super::fused_kernels::log_softmax_f32_ptx(), true));
         all.push(("nsl_layernorm_f32", super::fused_kernels::layernorm_f32_ptx(), true));
         all.push(("nsl_rmsnorm_f32", super::fused_kernels::rmsnorm_f32_ptx(), true));
+        all.push(("nsl_rmsnorm_dx_bwd_f32", super::fused_kernels::rmsnorm_dx_bwd_f32_ptx(), true));
+        all.push(("nsl_rmsnorm_dx_bwd_add_f32", super::fused_kernels::rmsnorm_dx_bwd_add_f32_ptx(), true));
         all.push(("nsl_rmsnorm_rinv_rows_f32", super::fused_kernels::rmsnorm_rinv_rows_f32_ptx(), true));
         all.push(("nsl_rmsnorm_dgamma_f32", super::fused_kernels::rmsnorm_dgamma_f32_ptx(), true));
         all.push(("nsl_sum_dim_short_f32", super::fused_kernels::sum_dim_short_f32_ptx(), true));
