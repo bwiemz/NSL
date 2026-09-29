@@ -8,6 +8,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **The fused linear cross-entropy finalize is built by
+  `nsl_kir::kernels::lce_finalize`** in place of its hand-written constant
+  (new-roadmap item 5): `nsl_lce_finalize_f32`, which turns the GEMM-chunked
+  loss's per-row online-softmax state into `lse` and `loss`.
+  - **KIR gains `Log2`,** the bare `lg2.approx.f32` (as `Exp2` is the bare
+    `ex2`). `Log` multiplies by `ln 2` after, which would round twice; the
+    kernel keeps the hand kernel's single `fma.rn.f32` for `lg2(s) · ln 2 +
+    m`.
+  - **The kernel** is grid-strided over rows, reads the target as `s64`,
+    loads `tl` only for a valid row, and subtracts with `sub.rn.f32`.
+  - **The gate,** `lce_finalize_kir_equivalence` (9 tests), runs the frozen
+    hand module (`tests/fixtures/lce_finalize_hand.rs`) and the KIR one on
+    the CTA interpreter over whole grids.
+    - The two leave the same bytes, and they match the restated formulas.
+    - The sums include zero, a subnormal, `inf` and NaN; the targets are
+      valid, zero, negative and `i64::MIN`.
+    - Mutants of the bound, stride, `lg2`, `ln 2`, the `fma` (including
+      rounded twice), the sign test, the subtraction, every element size,
+      64-bit add and pointer are killed.
+    - A stride that shrinks but stays nonzero is named as an equivalent
+      mutant.
+  - **SASS** (sm_80/90/120): the same loads, stores, `MUFU`, `FFMA` and
+    compares as the hand kernel, at or under 32 registers.
+
 - **The f64 sum-of-squares kernel is built by `nsl_kir::kernels::sum_sq`**
   in place of its hand-written constant (new-roadmap item 5):
   `nsl_sum_sq_f64_acc_f32`, which gradient clipping uses for its norm.

@@ -484,6 +484,9 @@ pub enum KirOp {
     /// `dst = 2^src` on `F32` (`ex2.approx.f32`), with no pre-scaling:
     /// `Exp` is `e^src` and multiplies by `log2(e)` first.
     Exp2(VarId, VarId),
+    /// `dst = log2(src)` on `F32` (`lg2.approx.f32`), with no post-scaling:
+    /// `Log` is `ln(src)` and multiplies by `ln(2)` after.
+    Log2(VarId, VarId),
     /// A conversion with an explicit rounding mode; `Cast` picks the
     /// default (`Rn` for anything that can round, `Rzi` for float → int).
     CastRounded { dst: VarId, src: VarId, ty: KirType, mode: RoundMode },
