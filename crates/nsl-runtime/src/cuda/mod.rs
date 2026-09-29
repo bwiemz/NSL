@@ -6859,7 +6859,6 @@ pub(crate) fn gpu_softmax_f32(tensor_ptr: i64) -> i64 {
 pub(crate) fn gpu_sum_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) -> i64 {
     inner::set_oom_context("sum_dim_f32");
     use crate::tensor::NslTensor;
-    use fused_kernels::SUM_DIM_F32_PTX;
 
     let t = NslTensor::from_ptr(tensor_ptr);
     assert_gpu_f32(t, "sum_dim_f32", "input");
@@ -7014,7 +7013,7 @@ pub(crate) fn gpu_sum_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) -> i64
         )
     } else {
         inner::kernel_launch(
-            SUM_DIM_F32_PTX.as_ptr(),
+            fused_kernels::sum_dim_f32_ptx().as_ptr(),
             b"nsl_sum_dim_f32\0".as_ptr(),
             [out_total as i64, 1, 1],
             [block, 1, 1],
@@ -7044,7 +7043,6 @@ pub(crate) fn gpu_sum_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) -> i64
 pub(crate) fn gpu_global_sum_f32(tensor_ptr: i64) -> i64 {
     inner::set_oom_context("global_sum_f32");
     use crate::tensor::NslTensor;
-    use fused_kernels::GLOBAL_SUM_F32_PTX;
 
     let t = NslTensor::from_ptr(tensor_ptr);
     assert_gpu_f32(t, "global_sum_f32", "input");
@@ -7070,7 +7068,7 @@ pub(crate) fn gpu_global_sum_f32(tensor_ptr: i64) -> i64 {
     let grid = 1i64;
 
     let result = inner::kernel_launch(
-        GLOBAL_SUM_F32_PTX.as_ptr(), b"nsl_global_sum_f32\0".as_ptr(),
+        fused_kernels::global_sum_f32_ptx().as_ptr(), b"nsl_global_sum_f32\0".as_ptr(),
         [grid, 1, 1], [block, 1, 1], &args, 256 * 4,
     );
     assert_eq!(result as u32, 0, "GPU global_sum kernel failed: {:?}", result);
@@ -7929,7 +7927,6 @@ pub(crate) fn gpu_det_scatter_add_f32(
 pub(crate) fn gpu_max_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) -> i64 {
     inner::set_oom_context("max_dim_f32");
     use crate::tensor::NslTensor;
-    use fused_kernels::MAX_DIM_F32_PTX;
 
     let t = NslTensor::from_ptr(tensor_ptr);
     assert_gpu_f32(t, "max_dim_f32", "input");
@@ -7979,7 +7976,7 @@ pub(crate) fn gpu_max_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) -> i64
     let grid = out_total as i64;
 
     let result = inner::kernel_launch(
-        MAX_DIM_F32_PTX.as_ptr(), b"nsl_max_dim_f32\0".as_ptr(),
+        fused_kernels::max_dim_f32_ptx().as_ptr(), b"nsl_max_dim_f32\0".as_ptr(),
         [grid, 1, 1], [block, 1, 1], &args, 256 * 4,
     );
     assert_eq!(result as u32, 0, "GPU max_dim kernel failed: {:?}", result);
@@ -10448,6 +10445,9 @@ mod tests {
         all.push(("nsl_sum_dim_short_f32", super::fused_kernels::sum_dim_short_f32_ptx(), true));
         all.push(("nsl_ce_bwd_count_f32", super::fused_kernels::ce_bwd_count_f32_ptx(), true));
         all.push(("nsl_ce_bwd_finish_f32", super::fused_kernels::ce_bwd_finish_f32_ptx(), true));
+        all.push(("nsl_global_sum_f32", super::fused_kernels::global_sum_f32_ptx(), true));
+        all.push(("nsl_sum_dim_f32", super::fused_kernels::sum_dim_f32_ptx(), true));
+        all.push(("nsl_max_dim_f32", super::fused_kernels::max_dim_f32_ptx(), true));
         all.push(("nsl_strided_copy_f32", super::fused_kernels::strided_copy_f32_ptx(), true));
         all.push(("nsl_slice_f32", super::fused_kernels::slice_f32_ptx(), true));
         all
