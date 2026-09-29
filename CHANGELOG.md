@@ -32,6 +32,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   - **SASS** (sm_80/90/120): the same loads, stores, `MUFU`, `FFMA` and
     compares as the hand kernel, at or under 32 registers.
 
+- **The tensor statistics kernel is built by
+  `nsl_kir::kernels::tensor_stats`** in place of its hand-written constant
+  (new-roadmap item 5): `nsl_tensor_stats_f32`, which writes `[min, max,
+  Σx, Σx²]` for `tensor_stats`, gradient-norm and Muon's Frobenius scale.
+  - **The kernel** keeps the hand kernel's order of combines. Thread `k`
+    folds `k, k + 256, …` into four partials, and one shared-memory tree
+    over four regions combines them. The sums use `add.rn.f32` and the
+    square `mul.rn.f32`; min and max are `min.f32` and `max.f32`.
+  - **Σx² now rounds the square on hardware.** ptxas contracted the hand
+    kernel's `mul.f32` + `add.f32` into an `FFMA`, so its sum of squares
+    rounded once per element. `nsl_muon_batch_sumsq_f32` rounds twice and
+    was documented as bit-identical to this sum, which held only in the
+    PTX. It now holds on the GPU, and the result no longer depends on
+    ptxas. The last bits of `Σx²` (and so of a GPU `std` or Frobenius
+    norm) can differ from before.
+  - **The gate,** `tensor_stats_kir_equivalence` (9 tests), runs the frozen
+    hand module (`tests/fixtures/tensor_stats_hand.rs`) and the KIR one on
+    the CTA interpreter.
+    - The two leave the same bytes, and they match the restated order.
+    - It runs under all four thread schedules, over order-sensitive data
+      with full significands, signed zeros, NaNs, infinities, a subnormal
+      and squares out of range.
+    - Mutants of every bound, address, stride, tree step, barrier, combine,
+      identity and output slot are killed, as is the square fused into its
+      accumulate.
+    - Three mutants are named as equivalent: every thread writing the
+      result, and the first output slot's element size and address add.
+  - **SASS** (sm_80/90/120): the same loads, shared-memory traffic,
+    barriers and min/max as the hand kernel; the 8 `FFMA` become `FMUL` +
+    `FADD`.
+
 - **The f64 sum-of-squares kernel is built by `nsl_kir::kernels::sum_sq`**
   in place of its hand-written constant (new-roadmap item 5):
   `nsl_sum_sq_f64_acc_f32`, which gradient clipping uses for its norm.

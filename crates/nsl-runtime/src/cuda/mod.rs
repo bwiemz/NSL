@@ -7097,7 +7097,6 @@ pub(crate) fn gpu_global_sum_f32(tensor_ptr: i64) -> i64 {
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_tensor_stats_f32(tensor_ptr: i64) -> [f32; 4] {
     use crate::tensor::NslTensor;
-    use fused_kernels::TENSOR_STATS_F32_PTX;
 
     let t = NslTensor::from_ptr(tensor_ptr);
     assert_gpu_f32(t, "tensor_stats_f32", "input");
@@ -7120,7 +7119,7 @@ pub(crate) fn gpu_tensor_stats_f32(tensor_ptr: i64) -> [f32; 4] {
     ];
 
     let result = inner::kernel_launch(
-        TENSOR_STATS_F32_PTX.as_ptr(), b"nsl_tensor_stats_f32\0".as_ptr(),
+        fused_kernels::tensor_stats_f32_ptx().as_ptr(), b"nsl_tensor_stats_f32\0".as_ptr(),
         [1, 1, 1], [256, 1, 1], &args, 256 * 4 * 4, // 4 shared arrays of 256 f32
     );
     assert_eq!(result as u32, 0, "GPU tensor_stats kernel failed: {:?}", result);
@@ -7264,7 +7263,6 @@ pub(crate) fn gpu_sum_sq_many_f32(tensors: &[i64]) -> f64 {
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_tensor_sum_sq_f32(tensor_ptr: i64) -> f64 {
     use crate::tensor::NslTensor;
-    use fused_kernels::TENSOR_STATS_F32_PTX;
 
     let t = NslTensor::from_ptr(tensor_ptr);
     assert_gpu_f32(t, "tensor_sum_sq_f32", "input");
@@ -7286,7 +7284,7 @@ pub(crate) fn gpu_tensor_sum_sq_f32(tensor_ptr: i64) -> f64 {
     ];
 
     let result = inner::kernel_launch(
-        TENSOR_STATS_F32_PTX.as_ptr(), b"nsl_tensor_stats_f32\0".as_ptr(),
+        fused_kernels::tensor_stats_f32_ptx().as_ptr(), b"nsl_tensor_stats_f32\0".as_ptr(),
         [1, 1, 1], [256, 1, 1], &args, 256 * 4 * 4,
     );
     assert_eq!(result as u32, 0, "GPU tensor_stats kernel failed: {:?}", result);
@@ -7442,7 +7440,6 @@ pub(crate) fn gpu_cross_entropy_backward_f32(
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_muon_frobenius_scale_f32(a_ptr: i64) -> i64 {
     use crate::tensor::NslTensor;
-    use fused_kernels::TENSOR_STATS_F32_PTX;
 
     inner::set_oom_context("muon_frobenius_scale_f32");
     let a = NslTensor::from_ptr_ref(a_ptr);
@@ -7487,7 +7484,7 @@ pub(crate) fn gpu_muon_frobenius_scale_f32(a_ptr: i64) -> i64 {
         &mut n_val as *mut _ as *mut std::ffi::c_void,
     ];
     let result = inner::kernel_launch(
-        TENSOR_STATS_F32_PTX.as_ptr(), b"nsl_tensor_stats_f32\0".as_ptr(),
+        fused_kernels::tensor_stats_f32_ptx().as_ptr(), b"nsl_tensor_stats_f32\0".as_ptr(),
         [1, 1, 1], [256, 1, 1], &stats_args, 256 * 4 * 4,
     );
     assert_eq!(result as u32, 0, "GPU tensor_stats kernel failed: {:?}", result);
@@ -10449,6 +10446,7 @@ mod tests {
         all.push(("nsl_global_sum_f32", super::fused_kernels::global_sum_f32_ptx(), true));
         all.push(("nsl_sum_dim_f32", super::fused_kernels::sum_dim_f32_ptx(), true));
         all.push(("nsl_max_dim_f32", super::fused_kernels::max_dim_f32_ptx(), true));
+        all.push(("nsl_tensor_stats_f32", super::fused_kernels::tensor_stats_f32_ptx(), true));
         all.push(("nsl_strided_copy_f32", super::fused_kernels::strided_copy_f32_ptx(), true));
         all.push(("nsl_slice_f32", super::fused_kernels::slice_f32_ptx(), true));
         all
