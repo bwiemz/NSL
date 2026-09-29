@@ -8,6 +8,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **The row softmax and log-softmax are built by `nsl_kir::kernels::softmax`**
+  in place of their hand-written constants (new-roadmap item 5):
+  `nsl_softmax_f32` and `nsl_log_softmax_f32`, one 256-thread block per row.
+  - **The kernels** keep the hand kernels' three passes and order of
+    combines. Each thread folds its columns into a partial max, then a
+    partial sum of `2^((x - max) · log2 e)`. Thread 0 folds the partials in
+    order and finishes with `rcp` (softmax) or `lg2 · ln 2` (log-softmax).
+    Every add, subtract and multiply rounds explicitly (`.rn`); none of the
+    hand kernels' pairs could contract.
+  - **The CTA interpreter** reads several statements on one line (`mov …;
+    add …; st …;`), as the hand kernels write their shared-memory accesses.
+  - **The gate,** `softmax_kir_equivalence` (8 tests), runs the frozen hand
+    modules (`tests/fixtures/softmax_hand.rs`) and the KIR ones on the CTA
+    interpreter, one block per row plus one past the last.
+    - The two leave the same bytes, and they match the restated passes.
+    - The rows are 0 to 700 columns wide, with order-sensitive sums, masked
+      (`-inf`) columns, a fully masked row, a NaN and `+inf`.
+    - Mutants of every bound, stride, fold start and step, the thread-0
+      test, all four barriers, the row base, the sum region, every element
+      size and 64-bit add, every combine, `ex2` and its scale, the finish,
+      the exponentials' store and each identity are killed.
+    - Five mutants are named as equivalent: the max's idempotence covers
+      two, the log-softmax's pure last pass one, the sum's `-0` identity
+      one, and the fold's final `sm[0]` store one.
+  - **SASS** (sm_80/90/120): the same loads, stores, shared accesses,
+    barriers, `MUFU`, float and `FMNMX` instructions as the hand kernels,
+    with no `FFMA` on either side, at or under 32 registers. Thread 0 reads
+    `%ntid.x` before its fold; read in the fold's header, ptxas left the
+    fold rolled for sm_90 and sm_120.
+
 - **The fused linear cross-entropy finalize is built by
   `nsl_kir::kernels::lce_finalize`** in place of its hand-written constant
   (new-roadmap item 5): `nsl_lce_finalize_f32`, which turns the GEMM-chunked

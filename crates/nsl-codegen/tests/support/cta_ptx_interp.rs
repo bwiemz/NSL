@@ -68,7 +68,8 @@
 //!
 //! A `.shared` block may be declared by element (`.shared .f32 NAME[N]`,
 //! `N` elements) as well as in bytes, and an address may name it directly
-//! (`[NAME]`). `div.approx.f32` is `a / b`, the same as `div.rn.f32`, like
+//! (`[NAME]`) or move it into a register (`mov.u32 %r, NAME`). Several
+//! statements may share a line (`mov …; add …; st …;`). `div.approx.f32` is `a / b`, the same as `div.rn.f32`, like
 //! every approximate form, except for a divisor whose magnitude is in
 //! `(2^126, 2^128)`. There the PTX ISA documents the result as 0, or NaN for
 //! an infinite dividend: the instruction is `a * (1/b)`, and the reciprocal
@@ -501,19 +502,22 @@ pub(crate) fn parse(ptx: &str) -> Program {
             _ => line,
         };
         let body = line.strip_suffix(';').unwrap_or_else(|| panic!("`{line}` is not a statement"));
-        let (guard, body) = match body.strip_prefix('@') {
-            Some(rest) => {
-                let (pred, tail) = rest.split_once(' ').expect("a guarded instruction");
-                let (negated, pred) = match pred.strip_prefix('!') {
-                    Some(p) => (true, p),
-                    None => (false, pred),
-                };
-                (Some((p.reg(pred), negated)), tail.trim())
-            }
-            None => (None, body),
-        };
-        let (mnemonic, operands) = body.split_once(' ').unwrap_or((body, ""));
-        pending.push((mnemonic.to_string(), operands.to_string(), guard));
+        // Several statements may share a line (`mov …; add …; st …;`).
+        for body in body.split(';').map(str::trim) {
+            let (guard, body) = match body.strip_prefix('@') {
+                Some(rest) => {
+                    let (pred, tail) = rest.split_once(' ').expect("a guarded instruction");
+                    let (negated, pred) = match pred.strip_prefix('!') {
+                        Some(p) => (true, p),
+                        None => (false, pred),
+                    };
+                    (Some((p.reg(pred), negated)), tail.trim())
+                }
+                None => (None, body),
+            };
+            let (mnemonic, operands) = body.split_once(' ').unwrap_or((body, ""));
+            pending.push((mnemonic.to_string(), operands.to_string(), guard));
+        }
     }
 
     let mut instrs = Vec::with_capacity(pending.len());
