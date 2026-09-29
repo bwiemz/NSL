@@ -8,6 +8,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **The fused RMSNorm input-gradient backward pair is built by
+  `nsl_kir::kernels::rmsnorm_dx`** in place of its hand-written constants
+  (new-roadmap item 5): `nsl_rmsnorm_dx_bwd_f32` and its residual-folding
+  twin `nsl_rmsnorm_dx_bwd_add_f32`, one 256-thread block per row.
+  - **The kernels** keep the hand kernels' order: per-thread `S1 = Σ x²` and
+    `S2 = Σ (dy · γ) · x` with the hand kernels' explicit `fma.rn`, folded
+    by thread 0 in order; `rinv = min(rsqrt(S1 / cols + eps), 1e12)`;
+    `coeff = ((rinv · rinv) · rinv) · S2 / cols`; `dx = (γ · dy) · rinv - x ·
+    coeff`, plus `res` for the twin. Every other add, subtract and multiply
+    rounds explicitly (`.rn`). ptxas fused `S1 / cols + eps` and the multiply
+    by `rinv` into the subtraction into `FFMA` on hardware; the KIR kernels
+    round twice, as the PTX and the CPU reference do.
+  - **Registers:** the entry caps them at 32 (`.maxnreg`). Left alone,
+    ptxas gave the plain kernel 35–36 where the hand kernel had 32, which
+    would drop a 256-thread block's occupancy on sm_80 and sm_90 from 64
+    warps to 48. At 32 nothing spills and the loops unroll as before.
+  - **The gate,** `rmsnorm_dx_kir_equivalence` (8 tests), runs the frozen
+    hand modules (`tests/fixtures/rmsnorm_dx_hand.rs`) and the KIR ones on
+    the CTA interpreter under all four thread schedules, one block per row
+    plus one past the last, with shared memory poisoned.
+    - The two leave the same bytes, and both match the restated passes.
+    - Rows are 0 to 700 columns wide, with order-sensitive sums, a constant
+      row, a NaN, `+inf`, squares that overflow, and zero and tiny rows at
+      `eps = 0` whose `rsqrt` the clamp holds.
+    - Mutants of every bound, stride, the fold's start and step, the
+      thread-0 test, both barriers, the row base, the second region, every
+      element size and 64-bit add, both `fma`s (dropped, or without their
+      accumulate), every add, subtract and multiply (flipped and dropped),
+      both `div.approx`, the `rsqrt`, the clamp and each identity are
+      killed. The write pass striding by 128 and each sum's identity as
+      `-0` are named as equivalent.
+  - **SASS** (sm_80/90/120): the same loads, stores, shared accesses,
+    barriers and `MUFU` as the hand kernels, and the same unrolling. The
+    hand kernels' 18 `FFMA` are the 16 of the explicit `fma`s plus 2
+    contractions, which become `FMUL` + `FADD`. Registers are 32/29/32 and
+    29/30/30 against 32/32/34.
+
 - **The deterministic scatter-add is built by
   `nsl_kir::kernels::det_scatter`** in place of its hand-written constant
   (new-roadmap item 5): `nsl_det_scatter_add_f32`, `out = input` plus `src`

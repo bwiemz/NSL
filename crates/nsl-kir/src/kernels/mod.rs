@@ -23,6 +23,7 @@ pub mod lookup;
 pub mod muon_batch;
 pub mod optim;
 pub mod rmsnorm_dgamma;
+pub mod rmsnorm_dx;
 pub mod spmv;
 pub mod strided_copy;
 pub mod sum_sq;
