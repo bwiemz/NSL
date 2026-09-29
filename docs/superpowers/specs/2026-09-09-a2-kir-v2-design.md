@@ -1240,6 +1240,44 @@ frozen throughout, so nothing here blocks a kernel fix.
         are within two of them (global sum 17/22/20 against 16/20/20,
         per-dim 28/27/32 against 28/29/32 and 28/27/30 against 28/29/30),
         all at or under 32, so occupancy at 256 threads is unchanged.
+    - **`fused_kernels.rs`, the tensor statistics.**
+      `nsl_tensor_stats_f32` is in `nsl_kir::kernels::tensor_stats`: one
+      256-thread block writes `out[0..4] = [min, max, Σx, Σx²]`. Thread `k`
+      folds `k, k + 256, …` into four partials from `+inf`, `-inf`, `+0.0`
+      and `+0.0`. Four shared regions of 256 `f32` then take one tree
+      (`s[k] ⊕= s[k + h]`, `h = 128 … 1`, a barrier per level, the four
+      statistics in order at each step), and thread 0 writes the four
+      `s[0]`. The order of every combine is the hand kernel's. The sums use
+      `add.rn.f32` and the square `mul.rn.f32`; the min and max are
+      `min.f32` and `max.f32`, as before.
+      - **One deliberate change on hardware.** ptxas contracted the hand
+        kernel's `mul.f32` + `add.f32` into an `FFMA` (8 per unrolled loop
+        on sm_80/90/120), so its `Σx²` rounded once per element where the
+        PTX reads twice. `nsl_muon_batch_sumsq_f32` squares and adds with
+        two roundings and is documented as bit-identical to this sum (the
+        sequential Frobenius path), which held only in the PTX. With the
+        rounding explicit, it holds on hardware, and the result no longer
+        depends on ptxas.
+      - **The gate,** `tensor_stats_kir_equivalence`, requires the hand
+        kernel's bytes on the interpreter (which reads `mul.f32` and
+        `add.f32` as two roundings) and the restated order, bit for bit.
+        It runs under all four thread schedules. The data covers empty,
+        single and ragged extents past two strides, full 24-bit
+        significands, signed zeros, NaNs, infinities, a subnormal,
+        squares out of range at both ends, all-positive and all-negative
+        extents, and a two-value extent on which a fused square rounds
+        differently. It kills mutants of the bound, stride, the tree's
+        half, halving, idle test and partner, both barriers, every region
+        offset, element size, 64-bit add and output slot, every combine,
+        the square, each identity, and the square fused into its
+        accumulate (`fma.rn.f32`). Three mutants are named as equivalent:
+        every thread writing the result, and the first output slot's
+        element size and address add (its offset is `0 · 4`).
+      - **SASS** (sm_80/90/120): the same 8× unrolled loop (8 `LDG`), 8
+        `STS`, 12 `LDS`, 3 `BAR`, 4 `STG` and 18 `FMNMX` as the hand
+        kernel. The 8 `FFMA` become 8 `FMUL` + 8 `FADD`. Registers are
+        22/26/34 against 20/20/24; it is a single-block kernel, so
+        occupancy does not bear on it.
     - **The printer's conditional edges.** A `CondBranch` edge that
       carries block arguments branches to a trampoline printed after the
       last block, which makes the copies and jumps to the target; the
