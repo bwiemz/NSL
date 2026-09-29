@@ -8,6 +8,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **The GPU cross-entropy backward kernels are built by
+  `nsl_kir::kernels::ce_bwd`** in place of their hand-written constants
+  (new-roadmap item 5): `nsl_ce_bwd_count_f32` and `nsl_ce_bwd_finish_f32`.
+  - **The kernels:**
+    - The count is one 256-thread block. Each thread counts valid targets
+      at a stride of 256, a shared-memory tree sums the counts, and thread
+      0 writes `max(count, 1)`.
+    - The finish writes 0 for an invalid row, and otherwise
+      `(sm - onehot) · (go / denom)` with `sub.rn`, `div.rn` and `mul.rn`.
+      It reads `gop` only when the scale is on the device.
+    - A target is loaded once and read as truncated f32 or as s32 through
+      a `selp`, where the hand kernels branched between two loads.
+  - **The gate,** `ce_bwd_kir_equivalence` (11 tests), runs the frozen hand
+    modules (`tests/fixtures/ce_bwd_hand.rs`) and the KIR ones on the CTA
+    interpreter, which gained the s32 compare and truncation.
+    - The two leave the same bytes and match the restated formulas. The
+      targets include NaN, `-0.5`, out-of-range floats and `i32::MIN`.
+    - The count runs under four schedules. The finish runs on 256- and
+      32-thread blocks, with a null `gop` whenever the scale is the
+      immediate.
+    - Mutants of every bound, the tree, both barriers, the valid test, the
+      reading, the clamp, the row and column split, the one-hot, the scale
+      and every address are killed.
+  - **SASS** (sm_80/90/120): the same loads, shared-memory traffic,
+    barriers and float instructions as the hand kernels, with equal or
+    fewer registers.
+
 - **`nsl_sum_dim_short_f32` is built by `nsl_kir::kernels::det_sum`**
   (`DetSumOp::DimShort`) in place of its hand-written constant (new-roadmap
   item 5). It is the per-dim sum used by most `sum_dim` calls: one thread
