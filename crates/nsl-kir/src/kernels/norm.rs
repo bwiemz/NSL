@@ -26,8 +26,8 @@
 //! and sum do.
 //!
 //! Every add, subtract and multiply rounds explicitly (`.rn`), as the hand
-//! PTX spells them. ptxas contracted the hand kernels' squares, `Σ / cols
-//! + eps` (the `div.approx` is a multiply by the reciprocal) and the
+//! PTX spells them. ptxas contracted the hand kernels' squares, `Σ / cols +
+//! eps` (the `div.approx` is a multiply by the reciprocal) and the
 //! LayerNorm's `· gamma + beta` into `fma` on hardware; these kernels round
 //! twice, as the PTX (and the CPU reference) do. Thread 0 reads `%ntid.x` once, before
 //! its fold, so ptxas unrolls the fold as it does the hand kernels'.
