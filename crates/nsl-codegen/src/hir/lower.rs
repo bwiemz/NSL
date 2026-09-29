@@ -1654,6 +1654,7 @@ pub(crate) fn kir_op_kind_name(op: &KirOp) -> &'static str {
         KirOp::Rcp(..) => "Rcp",
         KirOp::Rsqrt(..) => "Rsqrt",
         KirOp::Exp2(..) => "Exp2",
+        KirOp::Log2(..) => "Log2",
         KirOp::CastRounded { .. } => "CastRounded",
         KirOp::LoadVec { .. } => "LoadVec",
         KirOp::StoreVec { .. } => "StoreVec",

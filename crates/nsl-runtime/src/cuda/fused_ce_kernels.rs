@@ -445,7 +445,7 @@ pub(crate) fn gemm_forward(
     ];
     let grid = ((rows as i64) + 255) / 256;
     let rc = inner::kernel_launch(
-        super::fused_kernels::LCE_FINALIZE_F32_PTX.as_ptr(),
+        super::fused_kernels::lce_finalize_f32_ptx().as_ptr(),
         b"nsl_lce_finalize_f32\0".as_ptr(),
         [grid.max(1), 1, 1],
         [256, 1, 1],
