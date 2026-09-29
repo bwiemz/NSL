@@ -21,9 +21,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
     combines: per-thread partial sums over columns `k, k + 256, …`, folded by
     thread 0 in order, divided by `cols` (`div.approx`), `eps` added and
     `rsqrt` taken. Every add, subtract and multiply rounds explicitly
-    (`.rn`). ptxas contracted the hand kernels' squares and `· gamma + beta`
-    into `FFMA`; the KIR kernels round twice, as the PTX and the CPU
-    reference do.
+    (`.rn`). ptxas contracted the hand kernels' squares, `Σ / cols + eps`
+    (`div.approx` is a multiply by the reciprocal) and the LayerNorm's `·
+    gamma + beta` into `FFMA`; the KIR kernels round twice, as the PTX and
+    the CPU reference do.
   - **The gate,** `norm_kir_equivalence` (10 tests), runs the frozen hand
     modules (`tests/fixtures/norm_hand.rs`) and the KIR ones on the CTA
     interpreter, one block per row plus one past the last, with shared

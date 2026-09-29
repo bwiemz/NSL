@@ -1356,9 +1356,10 @@ frozen throughout, so nothing here blocks a kernel fix.
       thread 0 in order through shared memory, divided by `cols` with
       `div.approx`; the LayerNorm's mean, then `rsqrt(Σ(x - mean)² / cols +
       eps)`, the RMSNorm's `rsqrt(Σx² / cols + eps)`. Every add, subtract and
-      multiply is `.rn`: ptxas contracted the hand kernels' squares and `·
-      gamma + beta` into `FFMA`, and the KIR kernels round twice, as the PTX
-      and the CPU reference do. The hand LayerNorm reduced both statistics
+      multiply is `.rn`: ptxas contracted the hand kernels' squares, `Σ /
+      cols + eps` (`div.approx` is a multiply by the reciprocal) and the
+      LayerNorm's `· gamma + beta` into `FFMA`, and the KIR kernels round
+      twice, as the PTX and the CPU reference do. The hand LayerNorm reduced both statistics
       through one region, and thread 0 stored its variance partial to the
       mean's slot with no barrier after the other threads read the mean: a
       race. The KIR LayerNorm gives each statistic its own region.
