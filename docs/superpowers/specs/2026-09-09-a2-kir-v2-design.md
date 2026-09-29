@@ -1422,6 +1422,30 @@ frozen throughout, so nothing here blocks a kernel fix.
         `FADD`. Registers are 28/30/24 and 24/26/20 against 22/26/24 and
         22/24/22, all at or under 32, so occupancy at 256 threads is
         unchanged.
+    - **`fused_kernels.rs`, the 2-D max pooling forward.**
+      `nsl_maxpool2d_f32` is in `nsl_kir::kernels::maxpool`, a thread per
+      output element. It splits the flat index with `rem`/`div` into `(n,
+      c, oh, ow)`, walks the window in `ky`, `kx` order, skips taps in the
+      padding (`oh · stride + ky < padding`, likewise across) or past the
+      input, and keeps the running `(max, argmax)` from `(-inf, 0)` unless
+      `x <= max`, as the hand kernel does: ties keep the first tap, a NaN
+      tap wins and the next tap displaces it. The update is two `selp`s
+      where the hand kernel branched around two moves. The argmax is stored
+      as `u64`, which the CTA interpreter now models (`st` of `.u64`,
+      `.b64`, `.s64`).
+      - **The gate,** `maxpool_kir_equivalence`, launches whole grids with a
+        spare block on 256- and 32-thread blocks under two schedules, over
+        overlapping, tiling and gapped windows, padding of 0 to 2 with
+        windows wholly in the padding, ties (`-0` against `+0` among them),
+        NaNs and infinities. It requires the hand kernel's bytes and the
+        restated walk, and kills mutants of every bound and padding test,
+        every `div` and `rem`, every index multiply, add and subtract, the
+        loop starts and steps, the tie test (`le` as `lt` or `ge`), both
+        `selp`s, the max's start, every element size and the argmax's
+        64-bit store.
+      - **SASS** (sm_80/90/120): the same one load, two stores, one float
+        compare, branches and six 64-bit `div`/`rem` calls as the hand
+        kernel, in 28/28/26 registers against 30.
     - **The printer's conditional edges.** A `CondBranch` edge that
       carries block arguments branches to a trampoline printed after the
       last block, which makes the copies and jumps to the target; the
