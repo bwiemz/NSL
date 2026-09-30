@@ -405,3 +405,187 @@ mod nslm {
         json[abs..abs + end].trim().parse().expect(key)
     }
 }
+
+/// Richer comparison than `checkpoint_max_diff`: max-abs is one order
+/// statistic over one coordinate and says nothing about whether two tensors
+/// point the same way.
+fn checkpoint_metrics(a: &Path, b: &Path) -> (f64, String, f64, f64) {
+    let ca = nslm::read(a);
+    let cb = nslm::read(b);
+    assert_eq!(ca.len(), cb.len(), "checkpoint param-count mismatch");
+    let (mut max_diff, mut worst) = (0.0f64, String::new());
+    let (mut sq_diff, mut sq_b, mut dot, mut sq_a) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    for (name, va) in &ca {
+        let vb = cb.get(name).unwrap_or_else(|| panic!("param {name} missing"));
+        assert_eq!(va.len(), vb.len(), "param {name} length mismatch");
+        for (x, y) in va.iter().zip(vb) {
+            let (x, y) = (*x as f64, *y as f64);
+            let d = (x - y).abs();
+            if d > max_diff {
+                max_diff = d;
+                worst = name.clone();
+            }
+            sq_diff += (x - y) * (x - y);
+            sq_a += x * x;
+            sq_b += y * y;
+            dot += x * y;
+        }
+    }
+    let rel_l2 = sq_diff.sqrt() / sq_b.sqrt().max(f64::EPSILON);
+    let cos = dot / (sq_a.sqrt() * sq_b.sqrt()).max(f64::EPSILON);
+    (max_diff, worst, rel_l2, cos)
+}
+
+/// SAME-ARM CONTROL — does this gate discriminate at all?
+///
+/// `packed_fused_matches_decomposed_on_gpu` compares the largest single
+/// checkpoint element after a whole training run: two different attention
+/// algorithms through grad_accumulation=2, GLOBAL grad_clip=1.0 and AdamW at
+/// lr=2e-3, and WITHOUT `--deterministic`. Before reading its 2.350e-2 as an
+/// algorithmic difference, measure what the SAME algorithm produces against
+/// itself under exactly the same harness.
+///
+/// If fused-vs-fused reaches the same order as fused-vs-decomposed, the gate
+/// has no discriminative power and the number is run-to-run noise. If the
+/// same-arm pairs are ~0, the cross-arm difference is real and belongs to the
+/// algorithms.
+///
+/// Diagnostic only — never part of the certification tier.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "diagnostic: same-arm control for the packed-parity oracle"]
+fn zz_same_arm_control_diagnostic() {
+    if !gpu_present() {
+        eprintln!("[skip] no GPU visible");
+        return;
+    }
+    let tmp = std::env::temp_dir();
+    let pid = std::process::id();
+
+    let mut fused = Vec::new();
+    let mut decomp = Vec::new();
+    for i in 0..3 {
+        let f = tmp.join(format!("sac_fused_{pid}_{i}.nslm"));
+        let r = run_program(&program(false, true, false, &f), &format!("sac_f{i}"), true, &[], &[]);
+        assert_trains(&r, "fused");
+        assert!(r.stderr.contains("sdpa fused forward: launched"), "arm {i} did not fuse");
+        fused.push(f);
+
+        let d = tmp.join(format!("sac_decomp_{pid}_{i}.nslm"));
+        let r = run_program(
+            &program(false, true, false, &d),
+            &format!("sac_d{i}"),
+            true,
+            &[("NSL_SDPA_FUSED_DISABLE", "1")],
+            &[],
+        );
+        assert_trains(&r, "decomposed");
+        assert!(!r.stderr.contains("sdpa fused forward: launched"), "arm {i} fused anyway");
+        decomp.push(d);
+    }
+
+    let show = |label: &str, a: &Path, b: &Path| {
+        let (m, w, l2, cos) = checkpoint_metrics(a, b);
+        println!("SAC {label:<22} max={m:.6e} relL2={l2:.6e} cos={cos:.12} worst={w}");
+    };
+    println!("--- same-arm (fused vs fused) ---");
+    show("fusedA-fusedB", &fused[0], &fused[1]);
+    show("fusedA-fusedC", &fused[0], &fused[2]);
+    println!("--- same-arm (decomp vs decomp) ---");
+    show("decompA-decompB", &decomp[0], &decomp[1]);
+    show("decompA-decompC", &decomp[0], &decomp[2]);
+    println!("--- cross-arm (the gate) ---");
+    show("fusedA-decompA", &fused[0], &decomp[0]);
+    show("fusedB-decompB", &fused[1], &decomp[1]);
+    show("fusedC-decompC", &fused[2], &decomp[2]);
+
+    for p in fused.iter().chain(decomp.iter()) {
+        std::fs::remove_file(p).ok();
+    }
+}
+
+/// Rewrite the fixture's train-block header for a diagnostic arm.
+///
+/// The gate's fixture is `grad_accumulation=2, grad_clip=1.0` with AdamW at
+/// lr=2e-3. Global clipping scales EVERY parameter's update by
+/// `clip / ||g||`, so one attention-gradient difference perturbs all of them
+/// and Adam's moments carry it forward. Removing the clip is the cheapest
+/// discriminator between "trajectory amplification" and "fused-path defect".
+fn with_train_header(src: &str, header: &str) -> String {
+    let from = "train(model=m, epochs=1, grad_accumulation=2, grad_clip=1.0):";
+    assert!(src.contains(from), "train header marker not found — resync fixture");
+    src.replace(from, header)
+}
+
+/// CLIP / OPTIMIZER DISCRIMINATOR.
+///
+/// Four cells, same init and same data, fused vs decomposed in each:
+///
+///   1. the gate as shipped        accum=2, clip=1.0, AdamW
+///   2. no global clip             accum=2,           AdamW
+///   3. no clip, no accumulation   accum=1,           AdamW
+///   4. plain SGD microscope       accum=1,           SGD lr=1e-4
+///
+/// If the divergence collapses as the amplifiers are removed, the checkpoint
+/// oracle is measuring training dynamics rather than kernel correctness. If it
+/// survives into cell 4, the difference is in the operator and the fused path
+/// needs fixing.
+///
+/// Diagnostic only — never part of the certification tier.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "diagnostic: clip/optimizer discriminator for the packed-parity oracle"]
+fn zz_clip_discriminator_diagnostic() {
+    if !gpu_present() {
+        eprintln!("[skip] no GPU visible");
+        return;
+    }
+    let tmp = std::env::temp_dir();
+    let pid = std::process::id();
+
+    let cells: &[(&str, &str)] = &[
+        ("1-shipped", "train(model=m, epochs=1, grad_accumulation=2, grad_clip=1.0):"),
+        ("2-noclip", "train(model=m, epochs=1, grad_accumulation=2):"),
+        ("3-noclip-noaccum", "train(model=m, epochs=1):"),
+        ("4-sgd", "train(model=m, epochs=1):"),
+    ];
+
+    for (name, header) in cells {
+        let f = tmp.join(format!("clip_f_{pid}_{name}.nslm"));
+        let d = tmp.join(format!("clip_d_{pid}_{name}.nslm"));
+        let mut mk = |save: &Path| {
+            let mut s = with_train_header(&program(false, true, false, save), header);
+            if *name == "4-sgd" {
+                let from = "optimizer: AdamW(lr=0.002, weight_decay=0.0, beta1=0.9, beta2=0.95, eps=1e-8)";
+                assert!(s.contains(from), "optimizer marker not found — resync fixture");
+                s = s.replace(from, "optimizer: SGD(lr=0.0001)");
+            }
+            s
+        };
+        let rf = run_program(&mk(&f), &format!("clip_f_{name}"), true, &[], &[]);
+        let rd = run_program(
+            &mk(&d),
+            &format!("clip_d_{name}"),
+            true,
+            &[("NSL_SDPA_FUSED_DISABLE", "1")],
+            &[],
+        );
+        if !rf.success || !rd.success {
+            println!("CLIP {name:<18} SKIPPED (arm failed to compile/run)");
+            println!("     fused stderr tail: {}", tail_lines(&rf.stderr, 3));
+            println!("     decomp stderr tail: {}", tail_lines(&rd.stderr, 3));
+            continue;
+        }
+        assert!(rf.stderr.contains("sdpa fused forward: launched"), "{name}: fused arm did not fuse");
+        assert!(!rd.stderr.contains("sdpa fused forward: launched"), "{name}: decomp arm fused");
+        let (m, w, l2, cos) = checkpoint_metrics(&f, &d);
+        println!("CLIP {name:<18} max={m:.6e} relL2={l2:.6e} cos={cos:.12} worst={w}");
+        std::fs::remove_file(&f).ok();
+        std::fs::remove_file(&d).ok();
+    }
+}
+
+fn tail_lines(s: &str, n: usize) -> String {
+    let v: Vec<&str> = s.lines().collect();
+    v[v.len().saturating_sub(n)..].join(" | ")
+}
