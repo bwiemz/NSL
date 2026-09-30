@@ -8,6 +8,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **The 2-D max pooling forward is built by `nsl_kir::kernels::maxpool`** in
+  place of its hand-written constant (new-roadmap item 5):
+  `nsl_maxpool2d_f32`, a thread per output element that writes the window's
+  max and its flat input index.
+  - **The kernel** keeps the hand kernel's walk: the index split by `rem` /
+    `div`, taps in `ky`, `kx` order, padding and out-of-range taps skipped,
+    and the running `(max, argmax)` from `(-inf, 0)` replaced unless `x <=
+    max`. So ties keep the first tap, a NaN tap wins and the next tap
+    displaces it, and a window wholly in the padding stays at `(-inf, 0)`.
+    The update is two `selp`s where the hand kernel branched around two
+    moves.
+  - **The CTA interpreter** models `st` of `.u64`, `.b64` and `.s64` (the
+    argmax store).
+  - **The gate,** `maxpool_kir_equivalence` (8 tests), runs the frozen hand
+    module (`tests/fixtures/maxpool_hand.rs`) and the KIR one over whole
+    grids on 256- and 32-thread blocks. The two leave the same bytes and
+    match the restated walk, over overlapping, tiling and gapped windows,
+    padding of 0 to 2 (with windows wholly in the padding), ties, NaNs and
+    infinities. Mutants of every bound and padding test, every `div` and
+    `rem`, every index multiply, add and subtract, the loop starts and
+    steps, the tie test, both `selp`s, the max's start, every element size
+    and the argmax's 64-bit store are killed.
+  - **SASS** (sm_80/90/120): the same load, stores, compare, branches and
+    64-bit `div`/`rem` calls as the hand kernel, in 28/28/26 registers
+    against 30.
+
 - **The sparse matrix-matrix kernels are built by `nsl_kir::kernels::spmm`**
   in place of their hand-written constants (new-roadmap item 5):
   `nsl_csr_spmm_f32`, `nsl_coo_spmm_f32` and `nsl_bsr_spmm_f32`.
