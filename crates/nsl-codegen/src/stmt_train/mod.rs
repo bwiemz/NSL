@@ -59,8 +59,9 @@
 //!   - [`transient_arena_projection`] — section 6e of the source-AD arm:
 //!     the Stage-2A element hints, the arena report and the Stage-2B
 //!     `--transient-arena` placement with its runtime slot declarations,
-//!     fed by a [`transient_arena_projection::TransientArenaInputs`] and
-//!     returning the element hints.
+//!     fed by a [`transient_arena_projection::TransientArenaInputs`]: planned
+//!     without a builder into an
+//!     [`transient_arena_projection::ArenaProjection`], then declared.
 //!   - [`csla_precompute`] — the D2b part 2 CSLA schedule precompute of
 //!     the source-AD arm: the layerwise plan, per-param facts, replay
 //!     ranges and update grouping, and the `--weight-stream` sliced-forward
@@ -92,9 +93,9 @@
 //!     [`plan_wggo::WggoPlanning`]; pure planning.
 //!   - [`plan_csha_prune`] — the CSHA planner schedule and the WGGO prune
 //!     of the source-AD arm (with the ELTLS tape-held free and the
-//!     `NSL_DEBUG_WENGERT` dump between them), fed by a
-//!     [`plan_csha_prune::CshaPruneInputs`]; the prune is the one place
-//!     WGGO mutates the tape.
+//!     `NSL_DEBUG_WENGERT` dump between them), as three calls: two plans
+//!     that take no builder and the emission between them; the prune is the
+//!     one place WGGO mutates the tape.
 //!   - [`fase_hook_lowering`] — the FASE-hook arm of section 7 of the
 //!     source-AD arm: the adjoint lowering with the per-parameter
 //!     accumulate callback and the grad-integrity bracket, fed by a
@@ -103,8 +104,9 @@
 //!   - [`primal_vars`] — section 3 of the source-AD arm: the initial
 //!     `VarMap` (named inputs / parameters to their Cranelift values, the
 //!     input device guards, the nested parameter and frozen teacher loads,
-//!     the CPKD report facts), fed by a [`primal_vars::PrimalVarsInputs`]
-//!     and returning the map.
+//!     the CPKD report facts): [`primal_vars::PrimalFacts`] planned without
+//!     a builder, then emitted with a [`primal_vars::PrimalVarsHandles`],
+//!     returning the map.
 //!   - [`source_ad_grads`] — section 8 of the source-AD arm: the
 //!     parameter-gradient list (or the FASE-hook null sentinel) and the
 //!     ownership sweep of the lowering's intermediates, fed by a

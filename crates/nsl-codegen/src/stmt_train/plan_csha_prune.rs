@@ -10,49 +10,32 @@
 //! refuses the whole plan on any refusal, records the `Applied`
 //! disposition and prints the per-rewrite `[prune]` lines.
 //!
-//! Moved out of `compile_train_block_inner` (roadmap A1): 152 lines,
-//! 4 inputs ([`CshaPruneInputs`]); the scheduler handle the driver
-//! goes on to hand the CCR planning is the function's result. The
-//! train-block CLIF snapshots
+//! Moved out of `compile_train_block_inner` (roadmap A1). TrainPlan step 5
+//! splits it in three, in the order the driver calls them:
+//! - [`Compiler::plan_csha`], the scheduled CSHA planner;
+//! - `emit_tape_region_close` (in `forward_lowering.rs`, since it opens the
+//!   forward lowering), the one part that emits: the ELTLS free, the flag
+//!   clear and the debug dump, which reads the VarMap;
+//! - [`Compiler::run_wggo_prune`], the prune, returning the scheduler handle
+//!   the driver goes on to hand the CCR planning.
+//!
+//! The two that stay here take no builder, so this file is a planning
+//! module (`tests/train_plan_handle_free.rs`). The train-block CLIF snapshots
 //! (`tests/train_clif_snapshots.rs`) pin the forward every fixture lowers
 //! after this point.
 
-use cranelift_frontend::FunctionBuilder;
-
 use crate::compiler::Compiler;
-use crate::context::FuncState;
 use crate::error::CodegenError;
 use crate::pass_manager::PassScheduler;
 
-/// Every binding of `compile_train_block_inner` this phase reads; names
-/// are the driver's.
-pub(crate) struct CshaPruneInputs<'a, 'e> {
-    /// The forward extractor; the WGGO prune rewrites its Wengert list in place.
-    pub(crate) extractor: &'a mut crate::source_ad::WengertExtractor<'e>,
-    /// The resolved model type name (the CSHA planner is keyed by it).
-    pub(crate) model_type_name: &'a String,
-    /// The initial VarMap (read by the `NSL_DEBUG_WENGERT` dump only).
-    pub(crate) primal_vars: &'a crate::wengert_lower::VarMap,
-    /// The applied WGGO plan; `None` means no prune.
-    pub(crate) wggo_applied: &'a Option<crate::wggo_apply::AppliedPlan>,
-}
-
 impl Compiler<'_> {
-    /// Run the CSHA planner schedule and the WGGO prune (see the module
-    /// header); returns the scheduler handle the CCR planning reuses.
-    pub(crate) fn run_csha_and_wggo_prune(
+    /// Run the CSHA planner under its schedule (see the module header).
+    /// `model_type_name` keys the planner.
+    pub(crate) fn plan_csha(
         &mut self,
-        builder: &mut FunctionBuilder,
-        state: &mut FuncState,
-        inputs: CshaPruneInputs<'_, '_>,
-    ) -> Result<PassScheduler, CodegenError> {
-        let CshaPruneInputs {
-            extractor,
-            model_type_name,
-            primal_vars,
-            wggo_applied,
-        } = inputs;
-
+        extractor: &crate::source_ad::WengertExtractor<'_>,
+        model_type_name: &str,
+    ) -> Result<(), CodegenError> {
         // CSHA: Compiler-Synthesized Holistic Attention planner.
         // Runs the boundary-fusion scan, SMEM feasibility model,
         // and weight-informed specialization.  Emits either the
@@ -95,37 +78,17 @@ impl Compiler<'_> {
             .map_err(CodegenError::new)?
             .finish(&self.bus)
             .map_err(CodegenError::new)?;
+        Ok(())
+    }
 
-        // 5. Lower PRIMAL Wengert list to Cranelift IR.
-        //    This IS the forward pass — each WengertOp is compiled to
-        //    its runtime FFI call, and ALL intermediate VarId → Value
-        //    mappings are recorded in full_vars.
-        // ELTLS: free tape-held tensors before clearing the tape flag.
-        self.free_tape_held_tensors(builder, state);
-        state.flags.in_tape_region = false;
-        // Debug: dump primal Wengert ops
-        if std::env::var("NSL_DEBUG_WENGERT").is_ok() {
-            nsl_log::nsl_log!(INFO, "wengert", 
-                "[wengert] primal_vars: {:?}",
-                primal_vars.keys().collect::<Vec<_>>()
-            );
-            for op in &extractor.wengert_list().ops {
-                let name = extractor
-                    .wengert_list()
-                    .var_names
-                    .get(&op.result)
-                    .cloned()
-                    .unwrap_or_default();
-                nsl_log::nsl_log!(INFO, "wengert", 
-                    "[wengert] VarId {} '{}' = {:?} inputs={:?} in_primal={}",
-                    op.result,
-                    name,
-                    op.op,
-                    op.inputs,
-                    primal_vars.contains_key(&op.result)
-                );
-            }
-        }
+    /// The spec §4 WGGO prune over the extracted list (see the module
+    /// header); `wggo_applied` of `None` means no prune. Returns the
+    /// scheduler handle the CCR planning reuses.
+    pub(crate) fn run_wggo_prune(
+        &mut self,
+        extractor: &mut crate::source_ad::WengertExtractor<'_>,
+        wggo_applied: &Option<crate::wggo_apply::AppliedPlan>,
+    ) -> Result<PassScheduler, CodegenError> {
         // --- NEW: spec §4 WGGO Prune, runs BEFORE wrga so WRGA sees reduced forward ---
         // When WGGO produced a plan, run the prune IR rewriter. On any refusal the
         // whole plan is rejected (spec §5.3 dry-run-then-commit contract) and
@@ -206,6 +169,6 @@ impl Compiler<'_> {
         }
         // --- END NEW ---
 
-        Ok(sched)
+        Ok(self.passes.scheduler())
     }
 }

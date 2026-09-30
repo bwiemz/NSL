@@ -295,7 +295,46 @@ becomes `if let Some(csla) = &plan.techniques.csla`.
 5. **Split the driver.** `lower_train_block(&self, train) -> TrainPlan` (steps
    1–17, no `builder`) and `emit_train_plan(plan, builder, state)`; the loop
    emission stays in the emitter. `compile_train_block_inner` becomes the
-   two calls plus the `@inspect` / CSHA-cache epilogue.
+   two calls plus the `@inspect` / CSHA-cache epilogue. Step 4b's trait
+   folds into this step: it wraps the rows once they take no builder.
+   *Status:* **5a is done**: the rows inside the batch-loop body that took
+   the builder are split in place into a plan and an emitter, called at the
+   same point, with the snapshots unchanged.
+   - `primal_vars.rs`: `plan_primal_facts` (the symbol map, the `Input`
+     leaves and the guarded inputs taken off the tape as extracted, the step
+     parameter, the named-parameter and frozen-input lists),
+     `plan_cpkd_report`, then `emit_primal_vars` from the facts.
+   - `plan_csha_prune.rs`: `plan_csha` and `run_wggo_prune`; the emission
+     between them (`emit_tape_region_close`) moved to `forward_lowering.rs`.
+   - `transient_arena_projection.rs`: `plan_transient_arena_projection`
+     returns an `ArenaProjection` whose declaration `emit_arena_declaration`
+     emits.
+
+   `train_plan_handle_free.rs` holds the new planning functions to the no-
+   handle rule (`PLANNING_FNS`), and `plan_csha_prune.rs` joins its planning
+   files.
+
+   What 5b (the hoist above the epoch loop) must still solve:
+   - **The CCR owned restriction reads the VarMap's key set**
+     (`inferred_owned`, seeded with `primal_vars.keys()`). That set is what
+     the emitter managed to map, adapter-site loads included. The hoist needs
+     it as a fact: a builder-free replica of `load_nested_field`'s and the
+     adapter walk's resolvability.
+   - **Two rows above the loop still take the builder.**
+     `resolve_train_contract` compiles the `data:` section and the bare
+     statements (which bind variables extraction later registers), and
+     `emit_model_params` interleaves the parameter facts with the list
+     emission (the CPDT dtype lists, the Muon mode table).
+   - **The source-AD / tape decision** (`extraction_ok`) becomes a plan fact
+     (`tapes: None`), with the tape fallback's `compile_tape_backward` on the
+     emission side.
+   - Extraction registers every `state.variables` entry as an input. The set
+     is complete once the step parameter is bound (before the epoch loop), so
+     planning there sees the same inputs, but the hoist should assert it.
+   - The WGGO layer prune can never fire in a real compile: no importance
+     scores reach `per_layer`, whole blocks are refused, and the name prefix
+     does not match. No snapshot can pin it, so `plan_primal_facts` takes the
+     tape facts before it by construction rather than by test.
 
 Each step keeps `scripts/gated-tests.sh`, the ten drift gates, the composition
 gate and `clippy -D warnings` green; steps 1 and 3 are the ones the CLIF
