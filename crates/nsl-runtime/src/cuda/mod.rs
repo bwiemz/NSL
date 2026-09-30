@@ -10504,6 +10504,8 @@ mod tests {
         all.push(("nsl_coo_spmv_f32", super::fused_kernels::coo_spmv_f32_ptx(), true));
         all.push(("nsl_sum_sq_f64_acc_f32", super::fused_kernels::sum_sq_f64_acc_f32_ptx(), true));
         all.push(("nsl_lce_finalize_f32", super::fused_kernels::lce_finalize_f32_ptx(), true));
+        all.push(("nsl_flash_lse_f32", super::fused_kernels::flash_lse_f32_ptx(), true));
+        all.push(("nsl_flash_lse_gqa_f32", super::fused_kernels::flash_lse_gqa_f32_ptx(), true));
         all.push(("nsl_bmm_f32", super::fused_kernels::bmm_f32_ptx(), true));
         all.push(("nsl_csr_spmm_f32", super::fused_kernels::csr_spmm_f32_ptx(), true));
         all.push(("nsl_coo_spmm_f32", super::fused_kernels::coo_spmm_f32_ptx(), true));

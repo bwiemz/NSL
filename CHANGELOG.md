@@ -34,6 +34,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
     hand kernel, in 32/30/28 registers against 32/30/32 and 160/176/152
     instructions against 216/224/200.
 
+- **The flash-attention log-sum-exp pair is built by
+  `nsl_kir::kernels::flash_lse`** in place of its hand-written constants
+  (new-roadmap item 5): `nsl_flash_lse_f32` and its native-GQA twin
+  `nsl_flash_lse_gqa_f32`, a thread per attention row, which the flash
+  backward uses to recompute `lse` from Q and K on the device.
+  - **The kernels** keep the hand kernels' two passes: the row max of
+    `score = (Σ q · k) · scale` from `-inf`, replaced when `score > max`,
+    then `max + lg2(Σ ex2((score - max) · log2 e)) · ln 2`, over keys `j <
+    qi + 1` when causal. The GQA twin reads kv-head `(bh / heads) ·
+    kv_heads + (bh % heads) / (heads / kv_heads)`.
+  - **Rounding:** every add, subtract and multiply is explicitly rounded
+    (`.rn`). The hand kernels' comment asked for mul-then-add to mirror the
+    CPU reference (`compute_logsumexp_gqa`), but ptxas contracted their 16
+    unrolled dot-product terms, `score · scale - max` and `lg2 · ln 2 + max`
+    into 18 `FFMA` on hardware. The KIR kernels round twice, as the PTX
+    text and the CPU reference do, so on hardware the GPU `lse` now follows
+    the CPU's rounding.
+  - **The gate,** `flash_lse_kir_equivalence` (8 tests), runs the frozen
+    hand modules (`tests/fixtures/flash_lse_hand.rs`) and the KIR ones over
+    whole grids on 256- and 32-thread blocks, causal and not, with one to
+    eight Q heads per kv-head, full-mantissa data, a NaN row and an `inf`
+    row. The two leave the same bytes and match the restated passes.
+    Mutants of every bound, the causal test and its `+ 1`, both `selp`s,
+    the max's comparison, every `div`/`rem`, every index multiply and add,
+    the loop starts and steps, every element size, the accumulators'
+    starts, every float multiply, add and subtract, the `ex2` and `lg2`,
+    both constants, and the dot product's and final sum's roundings (fused
+    into an `fma`) are killed.
+  - **SASS** (sm_80/90/120): the same 32 `LDG`, one `STG`, `MUFU`, float
+    compares and 64-bit `div`/`rem` calls as the hand kernels, and the same
+    unrolling; the hand kernels' 18 `FFMA` are as many `FMUL` and `FADD`.
+    Registers are 30/32/35 against 30/32/34 (35 and 34 allocate alike).
+
 - **The direct 2-D convolution forward is built by `nsl_kir::kernels::conv2d`**
   in place of its hand-written constant (new-roadmap item 5):
   `nsl_conv2d_f32`, a thread per output element over NCHW input and
