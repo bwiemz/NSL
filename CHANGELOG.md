@@ -32,6 +32,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
     branches and six 64-bit `div`/`rem` calls as the hand kernel, in
     28/30/38 registers against 30/30/36 (38 and 36 allocate alike).
 
+- **The sparse matrix-matrix kernels are built by `nsl_kir::kernels::spmm`**
+  in place of their hand-written constants (new-roadmap item 5):
+  `nsl_csr_spmm_f32`, `nsl_coo_spmm_f32` and `nsl_bsr_spmm_f32`.
+  - **The kernels** keep the hand kernels' order of loads and rounding. CSR
+    and BSR accumulate each output with `fma.rn` from `+0.0` over the row's
+    terms (BSR over each block's sub-columns) in order. COO adds each
+    nonzero's `mul.rn` product into `C` atomically, as `red.global.add.f32`
+    where the hand kernel used `atom` with an unread result. BSR's block
+    is sized from the shapes at launch, so it declares no launch bounds, as
+    before; CSR and COO keep `.maxntid 256`.
+  - **The gate,** `spmm_kir_equivalence` (10 tests), runs the frozen hand
+    modules (`tests/fixtures/spmm_hand.rs`) and the KIR ones on the CTA
+    interpreter over whole grids with a spare block in each dimension, on
+    the runtime's blocks and smaller ones (and, for BSR, one a row taller
+    than a block so the sub-row guard has a thread to stop).
+    - The two leave the same bytes on general data, and on exact data both
+      are the restated product.
+    - The data has empty rows, a single nonzero, ragged rows, repeated COO
+      rows and columns, outputs narrower than, equal to and wider than a
+      block, and BSR blocks of 1×1, 2×3 and 3×2.
+    - Mutants of every bound, block and thread index, the output column's
+      multiply and add, every element size, index add and multiply, the
+      row pointer's `+ 1`, each loop's step and start, the accumulator's
+      start, the `fma`s, the COO product and the atomic add are killed.
+  - **SASS** (sm_80/90/120): the same loads, stores, atomics and `FFMA` /
+    `FMUL` as the hand kernels, and the same unrolling. Registers are at
+    or under 32, except BSR on sm_120 at 40 against 36, which allocate
+    alike.
+
 - **The fused RMSNorm input-gradient backward pair is built by
   `nsl_kir::kernels::rmsnorm_dx`** in place of its hand-written constants
   (new-roadmap item 5): `nsl_rmsnorm_dx_bwd_f32` and its residual-folding
