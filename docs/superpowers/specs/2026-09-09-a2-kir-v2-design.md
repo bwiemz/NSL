@@ -1571,6 +1571,31 @@ frozen throughout, so nothing here blocks a kernel fix.
         dot-product terms, the scale-and-subtract, the final sum) are as
         many `FMUL` and `FADD`. Registers are 30/32/35 against 30/32/34; 35
         and 34 both allocate 40.
+    - **`fusion.rs`, the fused adjoint elementwise-chain kernel (C3).**
+      `synthesize_fused_chain_ptx` is `nsl_codegen::ew_chain_ptx::emit`, a
+      codegen-side builder like `cfie_sample_ptx`, since the kernel is one
+      per `ChainSig`. A thread per element loads every input slot in slot
+      order, runs the steps register to register (`AddRn`/`SubRn`/`MulRn`,
+      `DivApprox` as `nsl_div_f32`, `Neg`, nothing for `RtsCheck`) and
+      stores the last result. An immediate is a `Const` of its bits. The
+      header is ISA 7.0 / `sm_70` where the hand emitter clamped to
+      `sm_80`. `fusion.rs` stays a freeze member for the `@fuse` emitter
+      `synthesize_fused_ptx_sm`.
+      - **The gate,** `ew_chain_kir_equivalence`, runs 35 chains: every
+        opcode with every operand kind on each side, `RtsCheck` mid-chain
+        and last, an unread slot, the widest fused chain, and 24 seeded
+        random ones. They run on 256- and 32-thread blocks under four
+        schedules, with signed zeros, infinities, a NaN and a 2^127
+        divisor. The gate requires the hand kernel's bytes and the chain
+        restated in Rust, and kills all 118 sweep mutants, `div.approx` as
+        `div.rn` included. The sweep's canonical chain also reads its
+        like-reference slot before the divide. A slot no step reads is
+        loaded for nothing, and an add after the divide would absorb the
+        flushed quotient.
+      - **SASS** (sm_80/90/120): the same loads, float arithmetic and store.
+        Address arithmetic is an `IMAD.WIDE` per input where the hand
+        kernel shifted once (sm_120: 38/52 instructions against 33/42).
+        Registers are at most 18.
     - **The printer's conditional edges.** A `CondBranch` edge that
       carries block arguments branches to a trampoline printed after the
       last block, which makes the copies and jumps to the target; the

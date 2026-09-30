@@ -683,6 +683,13 @@ KIR the same way: `build_forward` keeps a student and a teacher tile in one
 dynamic `SmemLayout` and three online-softmax families, `build_backward`
 scatters the student's gradients only; `tests/cpkd_fused_loss_kir_equivalence.rs`
 proves both against `tests/fixtures/cpkd_fused_loss_hand.rs`.
+`src/ew_chain_ptx.rs::build` is the fused adjoint elementwise-chain kernel
+(MFU campaign C3), one per `ew_chain_fusion::ChainSig`, which
+`fusion::synthesize_fused_chain_ptx` emits for the lowerer's `fused_ew:v1:`
+ops: one load per input slot, the steps as `.rn` adds, subtracts and
+multiplies, `div.approx` and `neg`, one store.
+`tests/ew_chain_kir_equivalence.rs` proves it against the frozen hand
+emitter in `tests/fixtures/ew_chain_hand.rs`.
 
 **Hand-written PTX emitters (frozen).** `src/flash_attention.rs`
 (`synthesize_flash_attention_ptx`, `synthesize_flash_attention_backward_ptx`),
@@ -693,7 +700,8 @@ proves both against `tests/fixtures/cpkd_fused_loss_hand.rs`.
 `src/wrga_fused_ptx.rs`,
 `src/bitnet/`, `src/pca_rope.rs`,
 `src/pca_tilerange.rs`,
-`src/fusion.rs` (elementwise chains), and the shared preludes
+`src/fusion.rs` (the `@fuse` elementwise chains of
+`synthesize_fused_ptx_sm`), and the shared preludes
 in `src/kernel_skeleton/` (`header.rs`, `indexing.rs`, `pad.rs`, `params.rs`,
 `smem.rs`) all `push_str` PTX text with hand-numbered registers.
 `tests/sdpa_fused_forward_interp.rs` executes the production segment-masked

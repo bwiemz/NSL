@@ -4222,10 +4222,8 @@ fn embed_fused_ew_data(
                 })?;
                 Ok(id)
             };
-            // The emitter already NUL-terminates the PTX. gpu_sm = 80
-            // follows the fused-CE precedent (the emitter clamps to the
-            // sm_80 floor regardless; the driver JIT forward-compiles).
-            let ptx_bytes = crate::fusion::synthesize_fused_chain_ptx(sig, &kname, 80);
+            // The emitter already NUL-terminates the PTX.
+            let ptx_bytes = crate::fusion::synthesize_fused_chain_ptx(sig, &kname);
             let ptx_id = define("ptx", ptx_bytes)?;
             let mut kname_nul = kname.clone().into_bytes();
             kname_nul.push(0);

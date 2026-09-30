@@ -8,6 +8,50 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **The fused adjoint elementwise-chain kernel is built as KIR by
+  `nsl_codegen::ew_chain_ptx`** in place of `fusion::synthesize_fused_chain_ptx`'s
+  hand-written PTX (new-roadmap item 5). This is the MFU campaign C3
+  kernel the lowerer ships for every `fused_ew:v1:` chain that
+  `ew_chain_fusion` collapses on the adjoint tape, and that
+  `nsl_fused_ew_chain` launches on its fast path.
+  - **The kernel** keeps the hand emitter's contract:
+    - the `(out, in0…, n)` parameters;
+    - one load per input slot, in slot order;
+    - `add.rn`/`sub.rn`/`mul.rn`, which forbid contraction into an `FFMA`;
+    - `div.approx.f32`, as `nsl_div_f32`;
+    - `neg.f32`;
+    - nothing for an `RtsCheck`;
+    - one store.
+
+    An immediate is a `mov.f32` of its bits where the hand emitter wrote it
+    inline. The header is the KIR backend's ISA 7.0 / `sm_70`. The hand
+    emitter clamped to `sm_80`, but the kernel uses no sm_80 instruction.
+    `synthesize_fused_chain_ptx` drops its now-unused `gpu_sm` argument.
+  - **The gate,** `ew_chain_kir_equivalence` (5 tests), runs the frozen hand
+    emitter (`tests/fixtures/ew_chain_hand.rs`) and the KIR one on the CTA
+    interpreter. It covers 35 chains:
+    - every opcode with every operand kind on each side it may take;
+    - an `RtsCheck` mid-chain and at the end;
+    - an input no step reads;
+    - the widest chain the fuser builds (six inputs, six steps);
+    - 24 seeded random chains.
+
+    Each chain runs over whole grids with a spare block, on 256- and
+    32-thread blocks, under four schedules. The data includes signed zeros,
+    infinities, a NaN and a 2^127 divisor. The two kernels leave the same
+    bytes and match the chain restated in Rust. All 118 mutants of the
+    sweep are killed. They cover every comparison, integer and float
+    operation (dropped, swapped for a sibling, operands exchanged), every
+    constant, the special registers, every parameter read, and
+    `div.approx` as `div.rn`.
+  - **SASS** (sm_80/90/120): the same loads, float arithmetic and store as
+    the hand kernel, with no `FFMA`. Only the address arithmetic differs:
+    one `IMAD.WIDE` per input, where the hand kernel shifted once. On
+    sm_120 that is 38 and 52 instructions against 33 and 42. Registers are
+    at most 18 against 18.
+  - `fused_ew_ptx_pin.rs` now pins the `sm_70` header in place of the
+    `sm_80` clamp.
+
 - **The flash-attention log-sum-exp pair is built by
   `nsl_kir::kernels::flash_lse`** in place of its hand-written constants
   (new-roadmap item 5): `nsl_flash_lse_f32` and its native-GQA twin
