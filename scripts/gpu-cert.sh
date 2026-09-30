@@ -482,7 +482,11 @@ cmd_run() {
             exit 2
         fi
         local sel="${tmpdir}/selected.tsv" missing
-        grep -vE '^[[:space:]]*(#|$)' "${NSL_CERT_GATES}" | awk -F'\t' 'NF >= 2 { print $1 "\t" $2 }' > "${sel}"
+        # `|| true`: a list of only comments makes grep exit 1, and under
+        # pipefail that would abort here silently instead of reaching the
+        # "nothing to run" refusal below.
+        { grep -vE '^[[:space:]]*(#|$)' "${NSL_CERT_GATES}" || true; } \
+            | awk -F'\t' 'NF >= 2 { print $1 "\t" $2 }' > "${sel}"
         missing="$(awk -F'\t' 'NR == FNR { have[$1 "\t" $2] = 1; next } !(($1 "\t" $2) in have)' "${inv}" "${sel}")"
         if [[ -n "${missing}" ]]; then
             echo "gpu-cert: ${NSL_CERT_GATES} names gate(s) absent from tier '${tier}':" >&2

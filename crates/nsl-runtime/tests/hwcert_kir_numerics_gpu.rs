@@ -214,11 +214,20 @@ fn layernorm_ref(row: &[f32], gamma: &[f32], beta: &[f32], eps: f64) -> Vec<f64>
         .collect()
 }
 
-/// Absolute tolerance for one LayerNorm row. The mean's error is bounded by
-/// its fold chain times Σ|x|/n; divided by the row's std it becomes a relative
-/// error in every normalized value — that ratio is the row's CONDITION NUMBER,
-/// which is why an offset row needs a looser bound than a centred one. The
-/// variance adds a comparable term, rsqrt.approx a few ulp.
+/// Absolute tolerance for one LayerNorm row, LINEAR in its condition number.
+///
+/// The mean's absolute error is bounded by its fold chain times `U · Σ|x|/n`.
+/// Subtracting it and scaling by `1/std` turns that into an absolute error of
+/// `chain · U · cond` in every normalized value, where `cond = mean|x| / std`
+/// is the row's condition number — which is why an offset row needs a looser
+/// bound than a centred one. `gamma` then multiplies it ONCE. The variance's
+/// own summation and rsqrt.approx add a relative `chain · U` on the
+/// normalized value, whose magnitude is at most a few units.
+///
+/// An earlier version multiplied a `(cond + 1)` factor by a `gamma·(1 + cond)`
+/// factor, which is QUADRATIC in `cond`: on the +1000 row it allowed an
+/// absolute error of ~65 on outputs of order 1, so the row could not catch the
+/// one-pass-variance regression it exists for (review, 2026-09-29).
 fn layernorm_tol(row: &[f32], gamma: &[f32], beta: &[f32]) -> f64 {
     let n = row.len() as f64;
     let mean = row.iter().map(|&v| v as f64).sum::<f64>() / n;
@@ -228,7 +237,7 @@ fn layernorm_tol(row: &[f32], gamma: &[f32], beta: &[f32]) -> f64 {
     let gmax = gamma.iter().map(|&g| (g as f64).abs()).fold(0.0, f64::max);
     let bmax = beta.iter().map(|&b| (b as f64).abs()).fold(0.0, f64::max);
     let chain = fold_chain(row.len());
-    4.0 * U * (chain * (cond + 1.0) * 2.0 + 16.0) * (gmax * (1.0 + cond) + bmax) + 1e-7
+    4.0 * U * (chain * (cond + 4.0) + 16.0) * (gmax + bmax) + 1e-7
 }
 
 /// `nsl_layernorm_f32` on silicon: correct against f64, AND bit-stable across
