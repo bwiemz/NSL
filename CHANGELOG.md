@@ -1493,6 +1493,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- Mutation audit, slice 2 (roadmap item 5): **Lion's decoupled weight decay
+  was untested.** Neither Lion fixture sets `weight_decay`, so `lion_step`'s
+  `if weight_decay > 0.0` branch never ran under any gate: dropping `lr` from
+  the decay factor, or flipping its sign, left every Lion gate green.
+  `examples/lion_optimizer_weight_decay_e2e.nsl` takes the branch on every
+  step and pins an exact 8-step trajectory (final `w = 0.534154`, equal in f32
+  and f64 to 5e-9, smallest sign argument 0.0086). Each wrong variant lands at
+  least 0.13 away, and both mutants now fail. The five momentum mutants the
+  existing fixture's comment claims to catch were each planted and confirmed
+  killed, as was a sign-flip control proving the mutants reach the executed
+  path (`nsl_optim_lion__lion_step`).
+
 - **GPU `tanh` returned 0 for large inputs, and the tape-AD GELU gradient
   returned NaN past `x ≈ 10`.**
   - **The cause.** Both kernels compute `tanh(v)` as `(e − 1) / (e + 1)`
