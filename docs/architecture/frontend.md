@@ -682,6 +682,22 @@ is refused with one diagnostic, the cascade is dropped), `agent_parse.rs`.
 Unit tests inside `src/block.rs` (serve/tokenizer/dataset) and
 `src/types.rs` (borrow types). `cargo test -p nsl-parser`.
 
+**Table tests** (`crates/nsl-parser/tests/*_table.rs`): one `#[test]` per
+construct, each pinning how a line or two of source parses in the compact
+S-expression form of `tests/common/sexpr.rs` (spans and node ids left out;
+`(paren e)` marks explicit parentheses, a domain block such as `train`
+renders as its kind alone). `expr_table.rs` covers every precedence row
+against its neighbours, associativity, unary and postfix binding, slices,
+collection literals, comprehensions, lambdas, f-strings and literal forms;
+`stmt_table.rs` bindings, assignments, control flow, `fn`/`struct`/`enum`/
+`trait`/`model` declarations, decorators and imports; `type_table.rs` and
+`pattern_table.rs` every annotation and pattern form. `refusal_table.rs`
+pins, for one malformed line followed by `let after = 0`, the first
+diagnostic and whether `let after = 0` still reached the module — only the
+first diagnostic, so a recovery improvement flips one `false` rather than
+breaking a pinned cascade; the cases that swallow the next line today are
+grouped and marked `false`. A new case is one line in the table.
+
 **Fuzzing** — `fuzz/` is its own cargo workspace (so the stable build never
 sees `libfuzzer-sys`) with two targets, `lex` and `parse`, both one-liners
 over `nsl_fuzz::check`, which is
@@ -775,7 +791,9 @@ nsl-lexer` (bytes/s), `cargo bench -p nsl-parser` (tokens/s); baselines via
    call `skip_to_next_line`.
 3. Keyword: steps 1–3 of the token recipe, including `synchronize`.
 4. Tests: a fixture in `crates/nsl-parser/tests/parse/` (a clean one and,
-   for the error shapes, an `err_*` one) and their `.ast.snap`; a seed in
+   for the error shapes, an `err_*` one) and their `.ast.snap`; a case in
+   `crates/nsl-parser/tests/stmt_table.rs` and, for each malformed spelling
+   worth pinning, one in `refusal_table.rs`; a seed in
    `fuzz/corpus/parse/`; if the body is a non-statement loop, a case in
    `crates/nsl-parser/tests/body_recovery.rs`.
 5. Downstream, `nsl-semantic` and `nsl-codegen` `match` on `StmtKind`; the
@@ -799,11 +817,13 @@ nsl-lexer` (bytes/s), `cargo bench -p nsl-parser` (tokens/s); baselines via
    variant in `crates/nsl-ast/src/expr.rs`, and an arm in `walk_expr` in
    `visitor.rs`. Every recursive operand must go through `parse_expr_bp`
    (not `parse_prefix_or_atom`) so it is nesting-counted.
-4. Tests: extend `crates/nsl-parser/tests/parse/operators.nsl` (or
-   `calls_and_access.nsl`) with cases that pin the *tree shape* against
-   neighbouring precedence rows — the golden shows the nesting, which is the
-   only executable statement of precedence. If a deep chain of the new form
-   is possible, add a shape to `shapes()` in `crates/nsl-parser/tests/nesting_limit.rs`.
+4. Tests: a case per neighbouring precedence row in
+   `crates/nsl-parser/tests/expr_table.rs` (and a rendering arm in
+   `tests/common/sexpr.rs` for a new `ExprKind`) pinning the *tree shape*,
+   plus a line in `crates/nsl-parser/tests/parse/operators.nsl` (or
+   `calls_and_access.nsl`) for the full golden. If a deep chain of the new
+   form is possible, add a shape to `shapes()` in
+   `crates/nsl-parser/tests/nesting_limit.rs`.
 
 ### A new decorator
 
