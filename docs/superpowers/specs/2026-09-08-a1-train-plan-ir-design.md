@@ -315,11 +315,17 @@ becomes `if let Some(csla) = &plan.techniques.csla`.
    files.
 
    What 5b (the hoist above the epoch loop) must still solve:
-   - **The CCR owned restriction reads the VarMap's key set**
-     (`inferred_owned`, seeded with `primal_vars.keys()`). That set is what
-     the emitter managed to map, adapter-site loads included. The hoist needs
-     it as a fact: a builder-free replica of `load_nested_field`'s and the
-     adapter walk's resolvability.
+   - ~~**The CCR owned restriction reads the VarMap's key set**~~ **Done
+     (5b-1).** `load_nested_field` is now `plan_nested_field` (a
+     `FieldPlan`: every step the walk takes, and whether it resolved) plus
+     `emit_field_plan`, which replays all the steps. A failed walk keeps the
+     dead loads it always emitted, so the IR is unchanged. The frozen-input
+     loader and the WRGA adapter walk are planned the same way. So
+     `PrimalFacts::mapped` and `AdapterLoads::mapped` give the key set before
+     anything is emitted, and CCR's owned restriction is seeded from them. The
+     driver holds the planned set to the emitted map on every compile (an
+     internal compiler error if they differ; a mutant that drops the
+     named-parameter rule fails 24 of the 32 snapshots).
    - **Two rows above the loop still take the builder.**
      `resolve_train_contract` compiles the `data:` section and the bare
      statements (which bind variables extraction later registers), and

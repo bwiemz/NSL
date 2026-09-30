@@ -36,6 +36,11 @@ const PLANNING_FNS: &[(&str, &str)] = &[
     ("primal_vars.rs", "plan_primal_facts"),
     ("primal_vars.rs", "plan_cpkd_report"),
     ("transient_arena_projection.rs", "plan_transient_arena_projection"),
+    ("adapter_sites.rs", "plan_wrga_adapter_loads"),
+    // The field walks the VarMap planning is built from (step 5b), beside the
+    // loaders that replay them.
+    ("../stmt.rs", "plan_nested_field"),
+    ("../stmt.rs", "plan_source_ad_named_param"),
 ];
 
 /// Names that only emission code has any reason to spell.

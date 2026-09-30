@@ -6,10 +6,13 @@
 //! adapter's tensor into the VarMap so the forward reads it like a
 //! parameter.
 //!
-//! Moved out of `compile_train_block_inner` (roadmap A1): 158 lines,
-//! 6 inputs ([`AdapterSitesInputs`]) plus the function builder
-//! and state. A no-op without a WRGA plan. The train-block CLIF snapshots
-//! (`tests/train_clif_snapshots.rs`) pin the lowering around it.
+//! Moved out of `compile_train_block_inner` (roadmap A1). A no-op without a
+//! WRGA plan. TrainPlan step 5b plans the adapter-tensor walks without a
+//! builder ([`Compiler::plan_wrga_adapter_loads`], an [`AdapterLoads`]), so
+//! which VarIds they map is known before anything is emitted;
+//! [`Compiler::emit_wrga_adapter_sites`] replays them. The train-block CLIF
+//! snapshots (`tests/train_clif_snapshots.rs`) pin the lowering around it,
+//! and `wrga_lora_source_ad` engages the adapter loads.
 
 use cranelift_codegen::ir::types as cl_types;
 use cranelift_codegen::ir::{InstBuilder, Value};
@@ -24,13 +27,11 @@ use crate::wengert_lower::VarMap;
 /// Every binding of `compile_train_block_inner` the adapter sites read;
 /// names are the driver's.
 pub(crate) struct AdapterSitesInputs<'a> {
-    /// The forward extractor (its named parameters locate the adapter sites).
-    pub(crate) extractor: &'a crate::source_ad::WengertExtractor<'a>,
-    /// The model struct layout (the adapter-tensor loads walk it).
-    pub(crate) layout: &'a StructLayout,
+    /// The planned adapter-tensor walks.
+    pub(crate) adapter_loads: &'a AdapterLoads,
     /// The model struct pointer.
     pub(crate) model_ptr: Value,
-    /// The resolved model type name (the adapter init side-table is keyed by it; the layout walk starts from a clone).
+    /// The resolved model type name (the adapter init side-table is keyed by it).
     pub(crate) model_type_name: &'a String,
     /// The initial VarMap; the adapter tensors are inserted into it.
     pub(crate) primal_vars: &'a mut VarMap,
@@ -38,7 +39,93 @@ pub(crate) struct AdapterSitesInputs<'a> {
     pub(crate) wrga_plan: &'a Option<crate::wrga::WrgaPlan>,
 }
 
+/// The adapter-tensor walks, as data: for each named parameter whose last
+/// component is a synthesized adapter field and which the primal VarMap does
+/// not already hold, the loads from the model pointer down to the adapter
+/// side-table, then the table slot and the tensor's byte offset in it when
+/// both resolve. Like [`crate::stmt::FieldPlan`], a walk that stops early
+/// keeps the loads it made: the emitter replays them.
+pub(crate) struct AdapterLoads {
+    walks: Vec<(crate::wengert::VarId, Vec<crate::stmt::FieldStep>, Option<(i32, i32)>)>,
+}
+
+impl AdapterLoads {
+    /// The VarIds these loads add to the primal VarMap.
+    pub(crate) fn mapped(&self) -> impl Iterator<Item = crate::wengert::VarId> + '_ {
+        self.walks.iter().filter(|(_, _, tail)| tail.is_some()).map(|(vid, _, _)| *vid)
+    }
+}
+
 impl Compiler<'_> {
+    /// Plan the adapter-tensor walks (see [`AdapterLoads`]) for the named
+    /// parameters `facts` does not already map. Emits nothing.
+    pub(crate) fn plan_wrga_adapter_loads(
+        &self,
+        facts: &crate::stmt_train::primal_vars::PrimalFacts,
+        extractor: &crate::source_ad::WengertExtractor<'_>,
+        layout: &StructLayout,
+        model_type_name: &str,
+    ) -> AdapterLoads {
+        let mut walks = Vec::new();
+        for (compound_name, vid) in extractor.named_param_var_ids() {
+            if facts.mapped.contains(vid) {
+                continue;
+            }
+            let parts: Vec<&str> = compound_name.split('.').collect();
+            if parts.len() < 2 {
+                continue;
+            }
+            let last = parts[parts.len() - 1];
+            if !crate::expr::access::is_synthesized_adapter_field_name(last) {
+                continue;
+            }
+            let mut steps = Vec::new();
+            let mut current_type_name = model_type_name.to_string();
+            let mut current_layout = layout.clone();
+            let mut ok = true;
+            for part in &parts[1..parts.len() - 1] {
+                if let Ok(array_idx) = part.parse::<usize>() {
+                    steps.push(crate::stmt::FieldStep::ArrayElement { offset: (array_idx * 8) as i32 });
+                    continue;
+                }
+                if let Some(field) = current_layout.fields.iter().find(|f| &f.name == part) {
+                    steps.push(crate::stmt::FieldStep::Load { ty: field.cl_type, offset: field.offset as i32 });
+                    let field_type = self
+                        .models
+                        .model_field_types
+                        .get(&current_type_name)
+                        .and_then(|ft| ft.get(part.to_owned()))
+                        .cloned();
+                    if let Some(ft) = field_type {
+                        if let Some(inner_layout) = self.types.struct_layouts.get(&ft) {
+                            current_layout = inner_layout.clone();
+                            current_type_name = ft;
+                        } else {
+                            ok = false;
+                            break;
+                        }
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            let tail = if ok {
+                current_layout
+                    .adapter_sidetable_offset
+                    .zip(self.adapter_field_index(&current_type_name, last))
+                    .map(|(slot_off, index)| (slot_off as i32, (index * 8) as i32))
+            } else {
+                None
+            };
+            walks.push((*vid, steps, tail));
+        }
+        AdapterLoads { walks }
+    }
+
     /// Emit the WRGA adapter sites (see the module header).
     pub(crate) fn emit_wrga_adapter_sites(
         &mut self,
@@ -47,8 +134,7 @@ impl Compiler<'_> {
         inputs: AdapterSitesInputs<'_>,
     ) -> Result<(), CodegenError> {
         let AdapterSitesInputs {
-            extractor,
-            layout,
+            adapter_loads,
             model_ptr,
             model_type_name,
             primal_vars,
@@ -131,85 +217,17 @@ impl Compiler<'_> {
         // field names now return real tensor pointers — emit
         // those loads here, after the init instructions in IR
         // order, so they execute with a valid table pointer.
-        for (compound_name, vid) in extractor.named_param_var_ids() {
+        let flags = cranelift_codegen::ir::MemFlagsData::trusted();
+        for (vid, steps, tail) in &adapter_loads.walks {
             if primal_vars.contains_key(vid) {
                 continue;
             }
-            let parts: Vec<&str> = compound_name.split('.').collect();
-            if parts.len() < 2 {
-                continue;
-            }
-            let last = parts[parts.len() - 1];
-            if !crate::expr::access::is_synthesized_adapter_field_name(last) {
-                continue;
-            }
-            let mut current_ptr = model_ptr;
-            let mut current_type_name = model_type_name.clone();
-            let mut current_layout = layout.clone();
-            let mut ok = true;
-            for part in &parts[1..parts.len() - 1] {
-                if let Ok(array_idx) = part.parse::<usize>() {
-                    current_ptr = builder.ins().load(
-                        cl_types::I64,
-                        cranelift_codegen::ir::MemFlagsData::trusted(),
-                        current_ptr,
-                        (array_idx * 8) as i32,
-                    );
-                    continue;
-                }
-                if let Some(field) =
-                    current_layout.fields.iter().find(|f| &f.name == part)
-                {
-                    let offset = field.offset as i32;
-                    let field_val = builder.ins().load(
-                        field.cl_type,
-                        cranelift_codegen::ir::MemFlagsData::trusted(),
-                        current_ptr,
-                        offset,
-                    );
-                    current_ptr = field_val;
-                    let field_type = self
-                        .models
-                        .model_field_types
-                        .get(&current_type_name)
-                        .and_then(|ft| ft.get(part.to_owned()))
-                        .cloned();
-                    if let Some(ft) = field_type {
-                        if let Some(inner_layout) = self.types.struct_layouts.get(&ft) {
-                            current_layout = inner_layout.clone();
-                            current_type_name = ft;
-                        } else {
-                            ok = false;
-                            break;
-                        }
-                    } else {
-                        ok = false;
-                        break;
-                    }
-                } else {
-                    ok = false;
-                    break;
-                }
-            }
-            if !ok {
-                continue;
-            }
-            if let Some(slot_off) = current_layout.adapter_sidetable_offset
-                && let Some(index) = self.adapter_field_index(&current_type_name, last)
-            {
-                let table_ptr = builder.ins().load(
-                    cl_types::I64,
-                    cranelift_codegen::ir::MemFlagsData::trusted(),
-                    current_ptr,
-                    slot_off as i32,
-                );
-                let byte_off = (index * 8) as i32;
-                let tensor_ptr = builder.ins().load(
-                    cl_types::I64,
-                    cranelift_codegen::ir::MemFlagsData::trusted(),
-                    table_ptr,
-                    byte_off,
-                );
+            let plan = crate::stmt::FieldPlan { steps: steps.clone(), resolved: true };
+            let current_ptr = crate::stmt::emit_field_plan(builder, model_ptr, &plan)
+                .expect("a resolved plan yields its last value");
+            if let Some((slot_off, byte_off)) = *tail {
+                let table_ptr = builder.ins().load(cl_types::I64, flags, current_ptr, slot_off);
+                let tensor_ptr = builder.ins().load(cl_types::I64, flags, table_ptr, byte_off);
                 primal_vars.insert(*vid, tensor_ptr);
             }
         }

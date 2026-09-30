@@ -43,19 +43,22 @@ pub(crate) struct PrimalFacts {
     guarded_inputs: Vec<crate::wengert::VarId>,
     /// The step parameter's VarId, if the step body reads it.
     step_vid: Option<crate::wengert::VarId>,
-    /// Model parameters by compound name, in the extractor's order.
-    named_params: Vec<(String, crate::wengert::VarId)>,
-    /// CPKD: frozen teacher inputs by compound name, in the extractor's order.
-    frozen_inputs: Vec<(String, crate::wengert::VarId)>,
+    /// Model parameters in the extractor's order, each with its field walk
+    /// through the model's layout.
+    named_params: Vec<(crate::wengert::VarId, crate::stmt::FieldPlan)>,
+    /// CPKD: frozen teacher inputs in the extractor's order, each with its
+    /// root variable and field walk; `None` when the root, its model type or
+    /// its layout does not resolve (nothing is emitted for those).
+    frozen_inputs: Vec<(crate::wengert::VarId, Option<(nsl_ast::Symbol, crate::stmt::FieldPlan)>)>,
+    /// The VarIds the emitter will map: the VarMap's key set, known before
+    /// anything is emitted (TrainPlan step 5b). WRGA's adapter loads add to
+    /// it later; see `plan_wrga_adapter_loads`.
+    pub(crate) mapped: std::collections::HashSet<crate::wengert::VarId>,
 }
 
-/// The emission handles and layout facts the VarMap build reads; names are
-/// the driver's.
-pub(crate) struct PrimalVarsHandles<'a> {
-    /// The model's struct layout (nested parameter loads walk it).
-    pub(crate) layout: &'a StructLayout,
+/// The emission handles the VarMap build reads; names are the driver's.
+pub(crate) struct PrimalVarsHandles {
     pub(crate) model_ptr: Value,
-    pub(crate) model_type_name: &'a str,
     pub(crate) param_list: Value,
     /// The step parameter's Cranelift variable.
     pub(crate) step_param_var: Variable,
@@ -69,6 +72,8 @@ impl Compiler<'_> {
         state: &FuncState,
         extractor: &crate::source_ad::WengertExtractor<'_>,
         step_param_sym: nsl_ast::Symbol,
+        layout: &StructLayout,
+        model_type_name: &str,
     ) -> PrimalFacts {
         let mut symbol_vars: Vec<(nsl_ast::Symbol, crate::wengert::VarId)> = extractor
             .symbol_var_map()
@@ -143,14 +148,46 @@ impl Compiler<'_> {
             .map(|(vid, _)| *vid)
             .collect();
 
-        PrimalFacts {
-            symbol_vars,
-            input_leaves,
-            guarded_inputs,
-            step_vid: extractor.symbol_var_map().get(&step_param_sym).copied(),
-            named_params: extractor.named_param_var_ids().to_vec(),
-            frozen_inputs: extractor.frozen_input_var_ids().to_vec(),
+        let named_params: Vec<_> = extractor
+            .named_param_var_ids()
+            .iter()
+            .map(|(name, vid)| (*vid, self.plan_nested_field(layout, model_type_name, name)))
+            .collect();
+        let frozen_inputs: Vec<_> = extractor
+            .frozen_input_var_ids()
+            .iter()
+            .map(|(name, vid)| (*vid, self.plan_source_ad_named_param(state, name)))
+            .collect();
+        let step_vid = extractor.symbol_var_map().get(&step_param_sym).copied();
+
+        // The key set, by the emitter's own rules in its order: a VarId the
+        // map already holds is skipped, so the first rule to claim it wins.
+        let state_names: std::collections::HashSet<&str> =
+            state.variables.keys().map(|sym| self.resolve_sym(*sym)).collect();
+        let mut mapped = std::collections::HashSet::new();
+        for &(sym, vid) in &symbol_vars {
+            if state.variables.contains_key(&sym) || state_names.contains(self.resolve_sym(sym)) {
+                mapped.insert(vid);
+            }
         }
+        for (vid, name) in &input_leaves {
+            if state_names.contains(name.as_str()) {
+                mapped.insert(*vid);
+            }
+        }
+        mapped.extend(step_vid);
+        for (vid, plan) in &named_params {
+            if plan.resolved {
+                mapped.insert(*vid);
+            }
+        }
+        for (vid, frozen) in &frozen_inputs {
+            if frozen.as_ref().is_some_and(|(_, plan)| plan.resolved) {
+                mapped.insert(*vid);
+            }
+        }
+
+        PrimalFacts { symbol_vars, input_leaves, guarded_inputs, step_vid, named_params, frozen_inputs, mapped }
     }
 
     /// Build the initial primal `VarMap` from [`PrimalFacts`] and emit the
@@ -160,15 +197,9 @@ impl Compiler<'_> {
         builder: &mut FunctionBuilder,
         state: &mut FuncState,
         facts: &PrimalFacts,
-        handles: PrimalVarsHandles<'_>,
+        handles: PrimalVarsHandles,
     ) -> Result<crate::wengert_lower::VarMap, CodegenError> {
-        let PrimalVarsHandles {
-            layout,
-            model_ptr,
-            model_type_name,
-            param_list,
-            step_param_var,
-        } = handles;
+        let PrimalVarsHandles { model_ptr, param_list, step_param_var } = handles;
 
         // 3. Build initial VarMap: map named input/param VarIds to
         //    Cranelift Values already present in state.variables.
@@ -233,18 +264,12 @@ impl Compiler<'_> {
         // Compound names like "m.blocks.0.attn.wq" are split into path
         // components and walked through struct layouts + array indices,
         // emitting a chain of Cranelift loads at each level.
-        for (compound_name, vid) in &facts.named_params {
+        for (vid, plan) in &facts.named_params {
             if primal_vars.contains_key(vid) {
                 continue;
             }
 
-            if let Some(val) = self.load_nested_field(
-                builder,
-                model_ptr,
-                layout,
-                model_type_name,
-                compound_name,
-            ) {
+            if let Some(val) = crate::stmt::emit_field_plan(builder, model_ptr, plan) {
                 primal_vars.insert(*vid, val);
             } else {
                 // Param not resolvable through struct layouts — this is expected
@@ -262,14 +287,16 @@ impl Compiler<'_> {
         // fail loudly downstream: wengert_lower hard-errors on any
         // unresolved Input leaf (unlike Params, which degrade to a
         // null placeholder).
-        for (compound_name, vid) in &facts.frozen_inputs {
+        for (vid, frozen) in &facts.frozen_inputs {
             if primal_vars.contains_key(vid) {
                 continue;
             }
-            if let Some(val) =
-                self.load_source_ad_named_param(builder, state, compound_name)
-            {
-                primal_vars.insert(*vid, val);
+            if let Some((root_sym, plan)) = frozen {
+                let (root_var, _) = state.variables[root_sym];
+                let root_ptr = builder.use_var(root_var);
+                if let Some(val) = crate::stmt::emit_field_plan(builder, root_ptr, plan) {
+                    primal_vars.insert(*vid, val);
+                }
             }
         }
 
