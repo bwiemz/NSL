@@ -292,7 +292,7 @@ pub(crate) fn launch_backward(
 //
 // Never materializes the full [rows, V] logits: one [rows, chunk] scratch is
 // reused across chunks (chunk = 4096 columns), with per-row online-softmax
-// state folded chunk by chunk (LCE_CHUNK_STATS_F32_PTX). The GEMMs route
+// state folded chunk by chunk (`lce_chunk_stats_f32_ptx`). The GEMMs route
 // through `cublas_inner`, so the NSL_MATMUL_TF32 / NSL_MATMUL_BF16 math modes
 // apply to the head exactly as they do to every other product.
 //
@@ -412,7 +412,7 @@ pub(crate) fn gemm_forward(
             &mut a_hb as *mut _ as *mut c_void,
         ];
         let rc = inner::kernel_launch(
-            super::fused_kernels::LCE_CHUNK_STATS_F32_PTX.as_ptr(),
+            super::fused_kernels::lce_chunk_stats_f32_ptx().as_ptr(),
             b"nsl_lce_chunk_stats_f32\0".as_ptr(),
             [rows as i64, 1, 1],
             [256, 1, 1],
@@ -543,7 +543,7 @@ pub(crate) fn gemm_backward(
         let total = (rows * cols) as i64;
         let grid = ((total + 255) / 256).max(1);
         let rc = inner::kernel_launch(
-            super::fused_kernels::LCE_CHUNK_DLOGITS_F32_PTX.as_ptr(),
+            super::fused_kernels::lce_chunk_dlogits_f32_ptx().as_ptr(),
             b"nsl_lce_chunk_dlogits_f32\0".as_ptr(),
             [grid, 1, 1],
             [256, 1, 1],

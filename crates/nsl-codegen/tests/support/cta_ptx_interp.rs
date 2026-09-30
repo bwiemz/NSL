@@ -15,7 +15,8 @@
 //! `ld.global.s8` sign-extends one byte into its register, as the
 //! hardware does, and `cvt.rn.f32.s8` converts the low byte — exact, so
 //! the rounding mode is moot. `cvt.u64.u64` is a copy: it is how the KIR
-//! printer reinterprets one pointer type as another.
+//! printer reinterprets one pointer type as another. `cvt.s64.u64` and
+//! `cvt.u64.s64` are copies too: a 64-bit integer keeps its bits.
 //!
 //! The approximate instructions are modelled by their exact
 //! counterparts, `ex2.approx.f32` as `exp2`, `rsqrt.approx.f32` as
@@ -612,8 +613,9 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 want(2);
                 Op::Mov { d: p.dst(ops[0]), s: p.src(ops[1]), w: W::U64 }
             }
-            // A pointer reinterpreted as another pointer type: a copy.
-            ["cvt", "u64", "u64"] => {
+            // A pointer reinterpreted as another pointer type, or a 64-bit
+            // integer reinterpreted between signed and unsigned: a copy.
+            ["cvt", "u64" | "s64", "u64" | "s64"] => {
                 want(2);
                 Op::Mov { d: p.dst(ops[0]), s: p.src(ops[1]), w: W::U64 }
             }
