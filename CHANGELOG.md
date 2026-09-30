@@ -8,6 +8,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **The direct 2-D convolution forward is built by `nsl_kir::kernels::conv2d`**
+  in place of its hand-written constant (new-roadmap item 5):
+  `nsl_conv2d_f32`, a thread per output element over NCHW input and
+  `[C_out, C_in, kH, kW]` weights, with an optional bias.
+  - **The kernel** keeps the hand kernel's walk: the index split by `rem` /
+    `div`, taps in `ci`, `ky`, `kx` order, padding and out-of-range taps
+    skipped, the accumulator from `0` updated by the hand kernel's explicit
+    `fma.rn`, and `bias[co]` added (`add.f32`) when the bias pointer is not
+    null.
+  - **The gate,** `conv2d_kir_equivalence` (8 tests), runs the frozen hand
+    module (`tests/fixtures/conv2d_hand.rs`) and the KIR one over whole
+    grids on 256- and 32-thread blocks, each shape with a bias and with a
+    null one. The two leave the same bytes and match the restated walk,
+    over strides and paddings that differ between the axes, windows wholly
+    in the padding, and full-mantissa data on which a separately rounded
+    multiply and add differ from the `fma`. Mutants of every bound, padding
+    and null test, every `div` and `rem`, every index multiply, add and
+    subtract, the loop starts and steps, the accumulator's start, the
+    `fma`'s addend and its fusion, the bias add and every element size are
+    killed. Swapping the `fma`'s factors is named equivalent.
+  - **SASS** (sm_80/90/120): the same three loads, store, `FFMA`, `FADD`,
+    branches and six 64-bit `div`/`rem` calls as the hand kernel, in
+    28/30/38 registers against 30/30/36 (38 and 36 allocate alike).
+
 - **The fused RMSNorm input-gradient backward pair is built by
   `nsl_kir::kernels::rmsnorm_dx`** in place of its hand-written constants
   (new-roadmap item 5): `nsl_rmsnorm_dx_bwd_f32` and its residual-folding
