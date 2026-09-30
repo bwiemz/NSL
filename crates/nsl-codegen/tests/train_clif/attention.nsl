@@ -1,0 +1,58 @@
+# Two pre-norm attention blocks under AdamW, shaped like the CSHA GPU gate
+# (`crates/nsl-cli/tests/csha_gap_gpu_e2e_smoke.rs`). It exists so the
+# snapshot matrix drives the CSHA planner AND its rewrite, which no other
+# fixture reaches; without it, the "snapshots unchanged" proof for TrainPlan
+# step 5 would cover only CSHA's OFF path.
+#
+# `@flash_attention(head_dim=32)` is what makes this work, found by the
+# matrix's vacuity check refusing an earlier draft (base and `--csha` compiled
+# to the same CLIF). CSHA's planner and `--csha-report` run without the
+# decorator, but the rewrite is gated on it: without it the report claimed a
+# fused L2 pipeline ("6.00x speedup") while the linked binary was
+# byte-identical to the `--csha`-free build.
+#
+# The block array is NOT needed for CSHA to engage (checked both ways); it is
+# here so the plan covers two named layers (`blocks.0`, `blocks.1`) and the
+# loop over them, the shape real models have.
+#
+# The WGGO prune is NOT driven here: with no weights file WGGO scores every
+# unit uniformly, a single-head block has nothing to prune, and no test in the
+# workspace drives the prune end to end at all.
+# Import-free on purpose: the harness compiles the entry module alone.
+
+model Blk:
+    w_norm: Tensor = ones([32])
+    wq: Tensor = ones([32, 32]) * 0.01
+    wk: Tensor = ones([32, 32]) * 0.02
+    wv: Tensor = ones([32, 32]) * 0.03
+
+    @flash_attention(head_dim=32)
+    fn forward(self, x: Tensor) -> Tensor:
+        let x_norm = rmsnorm(x, self.w_norm, 0.00001)
+        let q = x_norm @ self.wq
+        let k = x_norm @ self.wk
+        let v = x_norm @ self.wv
+        let scale = 1.0 / sqrt(32.0)
+        return scaled_dot_product_attention(q, k, v, scale)
+
+model Net:
+    blocks: [Blk; 2] = Blk()
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = x
+        for block in self.blocks:
+            h = block.forward(h)
+        return h
+
+let m = Net()
+let x = ones([16, 32])
+let y = zeros([16, 32])
+
+train(model = m, epochs = 1):
+    optimizer: AdamW(lr = 0.001, weight_decay = 0.01)
+    step(batch):
+        let pred = m.forward(x)
+        let d = pred - y
+        let loss = mean(d * d)
+
+print(sum(m.blocks[0].wq))

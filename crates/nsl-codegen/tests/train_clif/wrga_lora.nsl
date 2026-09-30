@@ -1,0 +1,26 @@
+# A LoRA adapter on the one weight, under AdamW. It exists so the snapshot
+# matrix drives WRGA: the adapter injection, the AST rewrite of the forward,
+# and `emit_wrga_adapter_sites` -- which TrainPlan step 5 must split, and
+# which no other fixture reached. Its base, identical but for the
+# `@adapter` line, is `wrga_base.nsl`.
+# Import-free on purpose: the harness compiles the entry module alone.
+
+model Toy:
+    w: Tensor = ones([8, 8]) * 0.1
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+@adapter(type=lora, target=["Toy.w"], rank=2, alpha=2)
+let m = Toy()
+let x = ones([4, 8])
+let y = zeros([4, 8])
+
+train(model = m, epochs = 1):
+    optimizer: AdamW(lr = 0.01)
+    step(batch):
+        let pred = m.forward(x)
+        let d = pred - y
+        let loss = mean(d * d)
+
+print(sum(m.w))
