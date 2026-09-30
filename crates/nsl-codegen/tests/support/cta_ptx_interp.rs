@@ -34,7 +34,10 @@
 //! negative decimal immediate is read as one; `add`, `sub` and `mul.lo` on
 //! them are the unsigned operations, which give the same bits.
 //! `%ctaid.y` and `%nctaid.y` are modelled for a two-dimensional grid,
-//! and `%tid.y` and `%ntid.y` for a two-dimensional block ([`run_cta_2d`]):
+//! and `%ctaid.z` for a third dimension: it reads the launch's `args` under
+//! the key `%ctaid.z` (0 when absent), so a batched gate sets it without a
+//! [`Launch`] field every other gate would have to spell out. `%tid.y` and
+//! `%ntid.y` are modelled for a two-dimensional block ([`run_cta_2d`]):
 //! the block's threads are numbered `x + y * ntid.x`, as on the hardware,
 //! and that linear number is what the warps, `%laneid` and the schedule
 //! orders see.
@@ -129,6 +132,8 @@ pub(crate) enum Special {
     LaneId,
     CtaidX,
     CtaidY,
+    /// `%ctaid.z`: the launch's `args["%ctaid.z"]`, 0 when absent.
+    CtaidZ,
     /// `%nctaid.x`: [`Launch::nctaid_x`], which must be set to read it.
     NctaidX,
     NctaidY,
@@ -353,6 +358,7 @@ impl Parser {
             "%laneid" => return Src::Special(Special::LaneId),
             "%ctaid.x" => return Src::Special(Special::CtaidX),
             "%ctaid.y" => return Src::Special(Special::CtaidY),
+            "%ctaid.z" => return Src::Special(Special::CtaidZ),
             "%nctaid.x" => return Src::Special(Special::NctaidX),
             "%nctaid.y" => return Src::Special(Special::NctaidY),
             "%ntid.x" => return Src::Special(Special::NtidX),
@@ -1032,6 +1038,7 @@ pub(crate) fn read(prog: &Program, t: &Thread, launch: &Launch, tid: u32, s: Src
         Src::Special(Special::LaneId) => (tid % 32) as u64,
         Src::Special(Special::CtaidX) => launch.ctaid as u64,
         Src::Special(Special::CtaidY) => launch.ctaid_y as u64,
+        Src::Special(Special::CtaidZ) => launch.args.get("%ctaid.z").copied().unwrap_or(0),
         Src::Special(Special::NctaidX) => {
             assert!(launch.nctaid_x > 0, "`%nctaid.x` read, but the launch did not set `nctaid_x`");
             launch.nctaid_x as u64

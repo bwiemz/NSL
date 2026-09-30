@@ -1538,6 +1538,35 @@ frozen throughout, so nothing here blocks a kernel fix.
         `FFMA`, one `FADD`, branches and six 64-bit `div`/`rem` calls as the
         hand kernel, in 28/30/38 registers against 30/30/36; 38 and 36
         both allocate 40, so occupancy is unchanged.
+    - **`fused_kernels.rs`, the strided batched matmul.** `nsl_bmm_f32` is
+      in `nsl_kir::kernels::bmm`: 16×16 blocks over a `(ceil(N / 16),
+      ceil(M / 16), batch_count)` grid, `row = %ctaid.y · %ntid.y + %tid.y`,
+      `col = %ctaid.x · %ntid.x + %tid.x`, the slice `z = %ctaid.z`, each
+      operand's slice `z · stride` elements in (0 broadcasts). The bounds are
+      tested as the hand kernel tested them (`row`, `col`, the batch), and
+      `C[row, col] = Σ_k A[row, k] · B[k, col]` from `+0` in `k` order by
+      explicit `fma.rn`. The `k` loop carries pointers into `A`'s row and
+      `B`'s column (steps of one element and of `N`), where the hand kernel
+      formed both indices on every trip. The CTA interpreter models
+      `%ctaid.z` through the launch's args (key `%ctaid.z`, 0 when absent),
+      so no other gate needed a new `Launch` field. This was the last
+      hand-written kernel in `fused_kernels.rs` other than the scatter-add
+      kept on purpose.
+      - **The gate,** `bmm_kir_equivalence`, launches whole three-axis grids
+        with a spare block along each on 16×16, 8×4 and 4×8 blocks (so a
+        block axis read as the other skips rows or columns rather than
+        repeating them), under all four thread schedules and both block
+        orders, over one and several blocks per axis, `K = 0`, and
+        broadcasts of `A`, `B` and both, with full-mantissa data. It
+        requires the hand kernel's bytes and the restated product, and
+        sweeps every line of the KIR module: each comparison flipped, each
+        integer operation dropped (a literal step nudged), each constant
+        nudged, each element size doubled, each special register read as
+        each other one, the `fma`'s operands swapped, the `fma` dropped and
+        split. Every mutant parses and is killed.
+      - **SASS** (sm_80/90/120): the same 16 `LDG`, one `STG` and 8 `FFMA`
+        (the explicit `fma`s, unrolled) as the hand kernel, in 32/30/28
+        registers against 32/30/32.
     - **The printer's conditional edges.** A `CondBranch` edge that
       carries block arguments branches to a trampoline printed after the
       last block, which makes the copies and jumps to the target; the

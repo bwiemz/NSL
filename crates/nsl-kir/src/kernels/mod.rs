@@ -9,6 +9,7 @@
 //! keep honest.
 
 pub mod block_reduce;
+pub mod bmm;
 pub mod cast;
 pub mod ce_bwd;
 pub mod conv2d;
