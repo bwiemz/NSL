@@ -72,3 +72,14 @@ fn e2e_lion_optimizer_trains_and_verifies() {
 fn e2e_lion_momentum_trajectory_is_exact() {
     run_fixture("examples/lion_optimizer_momentum_e2e.nsl", "lion-momentum-verified");
 }
+
+/// Neither fixture above sets `weight_decay`, so `lion_step`'s
+/// `if weight_decay > 0.0` branch never ran under any Lion gate. The mutation
+/// audit (2026-09-29) found that dropping `lr` from the decay factor, or
+/// flipping its sign, left both green. This one takes the branch on every step
+/// and pins its exact trajectory: the decoupled factor `1 - lr*wd` lands on
+/// 0.534154, and each wrong variant lands at least 0.13 away.
+#[test]
+fn e2e_lion_weight_decay_trajectory_is_exact() {
+    run_fixture("examples/lion_optimizer_weight_decay_e2e.nsl", "lion-weight-decay-verified");
+}
