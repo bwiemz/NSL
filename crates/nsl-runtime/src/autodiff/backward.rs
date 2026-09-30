@@ -862,18 +862,22 @@ fn dropout_backward(grad_ptr: i64, mask_ptr: i64, scale: f64) -> i64 {
     let strides = NslTensor::compute_strides(shape, ndim);
     let elem_size = if grad_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
     let data_raw = crate::memory::checked_alloc(len * elem_size);
+    // The branch is on GRAD's dtype; `mask` is a separate tensor whose dtype
+    // need not match (on the GPU path each is downloaded on its own, and a
+    // download keeps the device's f32 since C5 step 2a). Read it through the
+    // dtype-dispatching accessor in both arms rather than assume f64.
     if grad_dtype == 1 {
         let data = data_raw as *mut f32;
         for i in 0..len {
             let g = unsafe { *grad.data_f32().add(i) as f64 };
-            let m = unsafe { *mask.data_f64().add(i) };
+            let m = mask.read_scalar_as_f64(i);
             unsafe { *data.add(i) = (g * m * scale) as f32 };
         }
     } else {
         let data = data_raw as *mut f64;
         for i in 0..len {
             let g = unsafe { *grad.data_f64().add(i) };
-            let m = unsafe { *mask.data_f64().add(i) };
+            let m = mask.read_scalar_as_f64(i);
             unsafe { *data.add(i) = g * m * scale };
         }
     }
@@ -1733,12 +1737,12 @@ pub(crate) fn run_backward_core_strict(
                         if idx < vocab_size {
                             for j in 0..embed_dim {
                                 if grad_w_dtype == 1 {
-                                    // The f64 arm here is not hypothetical: a GPU
-                                    // f32 grad DOWNLOADS as f64 (nsl_tensor_to_device
-                                    // converts by ABI design), while grad_w is the
-                                    // runtime's f32 zeros — reading g as f32
-                                    // unconditionally was the first GPU tape
-                                    // backward's abort site.
+                                    // Read g by its own tag. A GPU f32 grad used to
+                                    // DOWNLOAD as f64 while grad_w is the runtime's
+                                    // f32 zeros, and reading g as f32 unconditionally
+                                    // was the first GPU tape backward's abort site.
+                                    // The download keeps f32 since C5 step 2a; a CPU
+                                    // tape can still hand over an f64 grad.
                                     let g_val = if g_t.dtype == 1 { unsafe { *g_t.data_f32().add(i * embed_dim + j) } }
                                                 else { unsafe { *g_t.data_f64().add(i * embed_dim + j) as f32 } };
                                     unsafe { *grad_w_t.data_f32().add(idx * embed_dim + j) += g_val };

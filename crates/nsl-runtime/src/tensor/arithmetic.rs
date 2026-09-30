@@ -1819,9 +1819,10 @@ mod fbip_add_tests {
             crate::tensor::nsl_tensor_to_device(cpu, 1) // CPU f32 -> GPU f32
         };
         let upcast = |gpu_ptr: i64| -> Vec<f64> {
-            let cpu = crate::tensor::nsl_tensor_to_device(gpu_ptr, 0); // GPU f32 -> CPU f64
+            let cpu = crate::tensor::nsl_tensor_to_device(gpu_ptr, 0); // GPU f32 -> CPU f32
             let t = NslTensor::from_ptr(cpu);
-            (0..n).map(|i| unsafe { *(t.data as *const f64).add(i) }).collect()
+            assert_eq!(t.dtype, 1, "the download keeps the f32 tag (C5 step 2a)");
+            (0..n).map(|i| t.read_scalar_as_f64(i)).collect()
         };
         // Reference (two GPU kernels).
         let m_ref = to_gpu(&m0);

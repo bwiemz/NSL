@@ -2002,7 +2002,7 @@ mod silu_backward_tests {
         let up = |p: i64| -> Vec<f64> {
             let c = crate::tensor::nsl_tensor_to_device(p, 0);
             let t = NslTensor::from_ptr(c);
-            (0..n).map(|i| unsafe { *t.data_f64().add(i) }).collect()
+            (0..n).map(|i| t.read_scalar_as_f64(i)).collect()
         };
         let (r, f) = (up(ref_out), up(fused));
         for i in 0..n {
@@ -2026,7 +2026,7 @@ mod silu_backward_tests {
         for (i, &xv) in xs.iter().enumerate() {
             let s = 1.0 / (1.0 + (-xv).exp());
             let expected = c * s * (1.0 + xv * (1.0 - s));
-            let got = unsafe { *ot.data_f64().add(i) };
+            let got = ot.read_scalar_as_f64(i);
             assert!((got - expected).abs() < 1e-5, "at {i}: {got} vs {expected}");
         }
         for p in [x, grad, out] { nsl_tensor_free(p); }
@@ -2117,7 +2117,7 @@ mod swiglu_gate_backward_tests {
         let f = nsl_tensor_swiglu_gate_backward(g, u, x);
         let (rt, ft) = (NslTensor::from_ptr(r), NslTensor::from_ptr(f));
         for i in 0..xs.len() {
-            let a = unsafe { *rt.data_f64().add(i) };
+            let a = rt.read_scalar_as_f64(i);
             let b = unsafe { *ft.data_f64().add(i) };
             assert_eq!(
                 a.to_bits(),
@@ -2153,9 +2153,10 @@ mod swiglu_gate_backward_tests {
         let fc = crate::tensor::nsl_tensor_to_device(f, 0);
         let (rt, ft) = (NslTensor::from_ptr(rc), NslTensor::from_ptr(fc));
         for i in 0..n {
-            // CPU copies widen f32 -> f64 losslessly, so bit-compare in f64.
-            let a = unsafe { *rt.data_f64().add(i) };
-            let b = unsafe { *ft.data_f64().add(i) };
+            // Downloads keep the device's f32 (C5 step 2a); the accessor widens f32 -> f64
+            // losslessly, so bit-comparing in f64 is still exact.
+            let a = rt.read_scalar_as_f64(i);
+            let b = ft.read_scalar_as_f64(i);
             assert_eq!(a.to_bits(), b.to_bits(), "elem {i}: pair={a} fused={b}");
         }
         for p in [x, u, g, r, f, rc, fc] { nsl_tensor_free(p); }
@@ -2306,7 +2307,7 @@ mod sigmoid_tanh_backward_tests {
         let up = |p: i64| -> Vec<f64> {
             let c = crate::tensor::nsl_tensor_to_device(p, 0);
             let t = NslTensor::from_ptr(c);
-            (0..n).map(|i| unsafe { *t.data_f64().add(i) }).collect()
+            (0..n).map(|i| t.read_scalar_as_f64(i)).collect()
         };
         let (r, f) = (up(ref_out), up(fused));
         for i in 0..n {
@@ -2331,7 +2332,7 @@ mod sigmoid_tanh_backward_tests {
         let ot = NslTensor::from_ptr(cpu);
         for (i, &yv) in ys.iter().enumerate() {
             let expected = (c * yv * (1.0 - yv)) as f64;
-            let got = unsafe { *ot.data_f64().add(i) };
+            let got = ot.read_scalar_as_f64(i);
             assert!((got - expected).abs() < 1e-5, "at {i}: {got} vs {expected}");
         }
         for p in [y, grad, out, cpu] { nsl_tensor_free(p); }
@@ -2351,7 +2352,7 @@ mod sigmoid_tanh_backward_tests {
         let up = |p: i64| -> Vec<f64> {
             let c = crate::tensor::nsl_tensor_to_device(p, 0);
             let t = NslTensor::from_ptr(c);
-            (0..n).map(|i| unsafe { *t.data_f64().add(i) }).collect()
+            (0..n).map(|i| t.read_scalar_as_f64(i)).collect()
         };
         let (r, f) = (up(ref_out), up(fused));
         for i in 0..n {
@@ -2444,7 +2445,7 @@ mod gelu_backward_tests {
         let ot = NslTensor::from_ptr(out);
         for (i, &xv) in xs.iter().enumerate() {
             let expected = c * gelu_tanh_deriv_f64(xv);
-            let got = unsafe { *ot.data_f64().add(i) };
+            let got = ot.read_scalar_as_f64(i);
             assert!((got - expected).abs() < 1e-12, "at {i}: {got} vs {expected}");
         }
         for p in [x, grad, out] { nsl_tensor_free(p); }
@@ -2469,7 +2470,7 @@ mod gelu_backward_tests {
             let kx = 1.702_f32 as f64 * xv;
             let s = 1.0 / (1.0 + (-kx).exp());
             let expected = gv * (s * (1.0 + kx * (1.0 - s)));
-            let got = unsafe { *ot.data_f64().add(i) };
+            let got = ot.read_scalar_as_f64(i);
             assert!(
                 (got - expected).abs() < 1e-5 * (1.0 + expected.abs()),
                 "at {i} (x={xv}): fused {got} vs analytic {expected}"
@@ -2498,7 +2499,7 @@ mod gelu_backward_tests {
         for (i, &xv) in xs.iter().enumerate() {
             let xv = xv as f64;
             let expected = xv / (1.0 + (-(1.702_f32 as f64) * xv).exp());
-            let got = unsafe { *yt.data_f64().add(i) };
+            let got = yt.read_scalar_as_f64(i);
             assert!(
                 (got - expected).abs() < 1e-5 * (1.0 + expected.abs()),
                 "at {i} (x={xv}): gpu {got} vs x*sigmoid(1.702x) {expected}"
@@ -2522,7 +2523,7 @@ mod gelu_backward_tests {
             NslTensor::from_ptr(t).refcount.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             let c = crate::tensor::nsl_tensor_to_device(y, 0);
             let ct = NslTensor::from_ptr(c);
-            let out = (0..n).map(|i| unsafe { *ct.data_f64().add(i) }).collect();
+            let out = (0..n).map(|i| ct.read_scalar_as_f64(i)).collect();
             for p in [t, y, c] { nsl_tensor_free(p); }
             out
         };
@@ -2535,7 +2536,7 @@ mod gelu_backward_tests {
         let ot = NslTensor::from_ptr(cpu);
         for i in 0..n {
             let fd = (up[i] - dn[i]) / (2.0 * h as f64);
-            let got = unsafe { *ot.data_f64().add(i) };
+            let got = ot.read_scalar_as_f64(i);
             assert!((got - fd).abs() < 5e-3, "at {i} (x={}): fused {got} vs FD {fd}", xs[i]);
         }
         for p in [x, ones, out, cpu] { nsl_tensor_free(p); }
@@ -2558,7 +2559,7 @@ mod gelu_backward_tests {
             let kx = 1.702_f32 as f64 * xv as f64;
             let s = 1.0 / (1.0 + (-kx).exp());
             let expected = c as f64 * (s * (1.0 + kx * (1.0 - s)));
-            let got = unsafe { *ot.data_f64().add(i) };
+            let got = ot.read_scalar_as_f64(i);
             assert!(
                 (got - expected).abs() < 1e-5 * (1.0 + expected.abs()),
                 "at {i} (x={xv}): {got} vs {expected}"
@@ -2591,7 +2592,7 @@ mod tanh_saturation_gpu_tests {
     fn to_host(d: i64) -> Vec<f64> {
         let c = crate::tensor::nsl_tensor_to_device(d, 0);
         let ct = NslTensor::from_ptr(c);
-        let out = (0..ct.len as usize).map(|i| unsafe { *ct.data_f64().add(i) }).collect();
+        let out = (0..ct.len as usize).map(|i| ct.read_scalar_as_f64(i)).collect();
         nsl_tensor_free(c);
         out
     }
