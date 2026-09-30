@@ -6395,7 +6395,7 @@ fn flash_attention_backward_gpu(
                     &mut kv_heads_arg as *mut _ as *mut c_void,
                 ];
                 inner::kernel_launch(
-                    crate::cuda::fused_kernels::FLASH_LSE_GQA_F32_PTX.as_ptr(),
+                    crate::cuda::fused_kernels::flash_lse_gqa_f32_ptx().as_ptr(),
                     b"nsl_flash_lse_gqa_f32\0".as_ptr(),
                     lse_grid,
                     [lse_block, 1, 1],
@@ -6414,7 +6414,7 @@ fn flash_attention_backward_gpu(
                     &mut causal_arg as *mut _ as *mut c_void,
                 ];
                 inner::kernel_launch(
-                    crate::cuda::fused_kernels::FLASH_LSE_F32_PTX.as_ptr(),
+                    crate::cuda::fused_kernels::flash_lse_f32_ptx().as_ptr(),
                     b"nsl_flash_lse_f32\0".as_ptr(),
                     lse_grid,
                     [lse_block, 1, 1],
@@ -7502,7 +7502,7 @@ mod tests {
         unsafe { nsl_csha_free_backward_activations(r); }
     }
 
-    /// The device-resident logsumexp kernel (`FLASH_LSE_F32_PTX`) must match
+    /// The device-resident logsumexp kernel (`flash_lse_f32_ptx`) must match
     /// the CPU reference `compute_logsumexp_gqa` within GPU transcendental
     /// tolerance. It replaced the per-call Q/K host round-trip + CPU score
     /// recompute in the flash backward, so a drift here would perturb every
@@ -7567,7 +7567,7 @@ mod tests {
             let block = 256i64;
             let grid = [(total_lse as i64 + block - 1) / block, 1, 1];
             let res = inner::kernel_launch(
-                crate::cuda::fused_kernels::FLASH_LSE_F32_PTX.as_ptr(),
+                crate::cuda::fused_kernels::flash_lse_f32_ptx().as_ptr(),
                 b"nsl_flash_lse_f32\0".as_ptr(),
                 grid,
                 [block, 1, 1],
