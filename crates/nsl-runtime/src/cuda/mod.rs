@@ -5742,7 +5742,7 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
         ];
 
         let result = inner::kernel_launch(
-            fused_kernels::BMM_F32_PTX.as_ptr(),
+            fused_kernels::bmm_f32_ptx().as_ptr(),
             b"nsl_bmm_f32\0".as_ptr(),
             [grid_x, grid_y, grid_z],
             [block, block, 1],
@@ -10508,6 +10508,7 @@ mod tests {
         all.push(("nsl_flash_lse_gqa_f32", super::fused_kernels::flash_lse_gqa_f32_ptx(), true));
         all.push(("nsl_lce_chunk_stats_f32", super::fused_kernels::lce_chunk_stats_f32_ptx(), true));
         all.push(("nsl_lce_chunk_dlogits_f32", super::fused_kernels::lce_chunk_dlogits_f32_ptx(), true));
+        all.push(("nsl_bmm_f32", super::fused_kernels::bmm_f32_ptx(), true));
         all.push(("nsl_csr_spmm_f32", super::fused_kernels::csr_spmm_f32_ptx(), true));
         all.push(("nsl_coo_spmm_f32", super::fused_kernels::coo_spmm_f32_ptx(), true));
         all.push(("nsl_bsr_spmm_f32", super::fused_kernels::bsr_spmm_f32_ptx(), true));

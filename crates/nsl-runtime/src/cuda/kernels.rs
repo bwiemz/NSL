@@ -227,8 +227,8 @@ pub(crate) fn rotate_half_module(op: nsl_kir::kernels::elementwise::RotateHalfOp
 // as part of the cuBLAS swap (spec docs/superpowers/specs/2026-04-21-matmul-
 // cublas-swap-design.md). f32 single matmul now dispatches to cuBLAS sgemm
 // via `cuda::cublas_inner::sgemm_row_major` — see `cuda::gpu_matmul_f32`.
-// The batched f32 path (`BMM_F32_PTX`/`nsl_bmm_f32`) is out of scope per
-// spec §6 and remains unchanged.
+// The batched f32 path (`nsl_bmm_f32`) is out of scope per spec §6 and
+// stays a PTX kernel (since built by `nsl_kir::kernels::bmm`).
 
 
 
