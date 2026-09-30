@@ -290,6 +290,34 @@ fn source_ad() -> CompileOptions {
     }
 }
 
+/// `options` carrying the WRGA inputs `wrga_lora.nsl`'s one decorator,
+/// `@adapter(type=lora, target=["Toy.w"], rank=2, alpha=2)`, produces.
+///
+/// WRGA reads its decorators from `CompileOptions::wrga.inputs`, which the CLI
+/// builds from nsl-semantic's analysis (`nsl-cli/src/pipeline.rs`,
+/// `module_data_to_wrga_inputs`). This harness constructs `CompileOptions`
+/// directly, so without this the field is `None` and WRGA is off: the matrix's
+/// vacuity check showed `wrga_lora` compiling to the same CLIF as
+/// `wrga_base`, the `@adapter` line alone engaging nothing. Keep this in step
+/// with the fixture's decorator.
+fn with_lora_adapter(options: CompileOptions) -> CompileOptions {
+    let inputs = nsl_codegen::WrgaInputs {
+        wrga: Vec::new(),
+        freeze: Vec::new(),
+        adapter: vec![nsl_codegen::AdapterDecoratorConfig {
+            kind: nsl_codegen::AdapterKind::Lora,
+            targets: vec!["Toy.w".to_string()],
+            rank: Some(2),
+            alpha: Some(2),
+        }],
+        ablation: Default::default(),
+    };
+    CompileOptions {
+        wrga: nsl_codegen::WrgaOptions { inputs: Some(inputs), ..Default::default() },
+        ..options
+    }
+}
+
 /// One snapshot per (program, options) pair. The program name is the
 /// fixture file under `tests/train_clif/`; the snapshot is named
 /// `<program>_<variant>`. Also defines `matrix()`, the whole table, for
@@ -399,9 +427,33 @@ fn main():
     );
 }
 
+// COVERAGE — what "the snapshots are unchanged" does and does not prove.
+//
+// A technique is only pinned if some entry ENGAGES it; an entry that compiles
+// to its base's CLIF is refused by `no_two_entries_produce_the_same_clif`.
+//
+// Engaged: every optimizer, both lowerings, the dataloader, CCR checkpointing,
+// CSLA layerwise accumulation, the transient arena, wgrad fusion, CUDA graphs,
+// optimizer-state offload, Muon's resident momentum -- and, since TrainPlan
+// step 5 needed them, CSHA (`attention_csha`) and WRGA (`wrga_lora_*`).
+//
+// NOT engaged, so a change confined to these passes is UNPINNED here:
+//  * CPKD (`@fused_kl_ce` on a `distill` block). This harness calls
+//    `compile_entry_capturing_ir` with EMPTY analysis maps where the CLI passes
+//    the configs its decorator bridges build (`nsl-cli/src/analysis_bridges.rs`),
+//    so every bridge-driven technique is off in every entry. WRGA is supplied
+//    by hand (`with_lora_adapter`) because its config names a string target;
+//    CPKD's is keyed by the `distill` block's AST NodeId.
+//  * The WGGO prune. With no weights file WGGO scores every unit uniformly,
+//    and no test in the workspace drives the prune end to end.
+//  * CPDT, and WGGO planning generally.
 snapshots! {
     // Both lowerings of each program.
     sgd_tape: "sgd", tape();
+    attention_source_ad: "attention", source_ad();
+    attention_csha: "attention", CompileOptions { csha: nsl_codegen::CshaOptions { mode: Some("auto".to_string()), ..Default::default() }, ..source_ad() };
+    wrga_base_source_ad: "wrga_base", source_ad();
+    wrga_lora_source_ad: "wrga_lora", with_lora_adapter(source_ad());
     sgd_source_ad: "sgd", source_ad();
     mlp_adamw_tape: "mlp_adamw", tape();
     mlp_adamw_source_ad: "mlp_adamw", source_ad();

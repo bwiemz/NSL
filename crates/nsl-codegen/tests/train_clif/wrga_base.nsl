@@ -1,0 +1,24 @@
+# The `wrga_lora` fixture WITHOUT its `@adapter` decorator: the base the
+# snapshot matrix's vacuity check compares it against, so a distinct CLIF
+# proves the decorator engaged WRGA rather than the programs merely differing.
+# Keep the two files identical except for that one line.
+# Import-free on purpose: the harness compiles the entry module alone.
+
+model Toy:
+    w: Tensor = ones([8, 8]) * 0.1
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+let m = Toy()
+let x = ones([4, 8])
+let y = zeros([4, 8])
+
+train(model = m, epochs = 1):
+    optimizer: AdamW(lr = 0.01)
+    step(batch):
+        let pred = m.forward(x)
+        let d = pred - y
+        let loss = mean(d * d)
+
+print(sum(m.w))
