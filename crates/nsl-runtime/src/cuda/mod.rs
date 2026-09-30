@@ -9189,7 +9189,7 @@ pub(crate) fn gpu_csr_spmm_f32_from_sparse(sparse: &crate::sparse::NslSparseTens
     let grid_x = m as i64;
     let grid_y = ((n_out as i64) + block - 1) / block;
     let result = inner::kernel_launch(
-        fused_kernels::CSR_SPMM_F32_PTX.as_ptr(), b"nsl_csr_spmm_f32\0".as_ptr(),
+        fused_kernels::csr_spmm_f32_ptx().as_ptr(), b"nsl_csr_spmm_f32\0".as_ptr(),
         [grid_x, grid_y, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU CSR SpMM kernel failed");
@@ -9260,7 +9260,7 @@ pub(crate) fn gpu_coo_spmm_f32(sparse: &crate::sparse::NslSparseTensor, dense_pt
     let block = 256i64;
     let grid = ((nnz as i64) + block - 1) / block;
     let result = inner::kernel_launch(
-        fused_kernels::COO_SPMM_F32_PTX.as_ptr(), b"nsl_coo_spmm_f32\0".as_ptr(),
+        fused_kernels::coo_spmm_f32_ptx().as_ptr(), b"nsl_coo_spmm_f32\0".as_ptr(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU COO SpMM kernel failed");
@@ -9428,7 +9428,7 @@ pub(crate) fn gpu_bsr_spmm_f32(sparse: &crate::sparse::NslSparseTensor, dense_pt
     let grid_x = nblk_rows as i64;
     let grid_y = ((n_out as i64) + block_x - 1) / block_x;
     let result = inner::kernel_launch(
-        fused_kernels::BSR_SPMM_F32_PTX.as_ptr(), b"nsl_bsr_spmm_f32\0".as_ptr(),
+        fused_kernels::bsr_spmm_f32_ptx().as_ptr(), b"nsl_bsr_spmm_f32\0".as_ptr(),
         [grid_x, grid_y, 1], [block_x, br as i64, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU BSR SpMM kernel failed");
@@ -9536,7 +9536,6 @@ pub(crate) fn gpu_sparse_matmul_csr_f32(
     nnz: usize,
 ) -> i64 {
     use crate::tensor::NslTensor;
-    use fused_kernels::CSR_SPMM_F32_PTX;
 
     let b = NslTensor::from_ptr_ref(b_ptr);
     assert_gpu_f32(b, "sparse_matmul_csr_f32", "dense operand");
@@ -9590,7 +9589,7 @@ pub(crate) fn gpu_sparse_matmul_csr_f32(
     let grid_y = ((n_out as i64) + block - 1) / block;
 
     let result = inner::kernel_launch(
-        CSR_SPMM_F32_PTX.as_ptr(), b"nsl_csr_spmm_f32\0".as_ptr(),
+        fused_kernels::csr_spmm_f32_ptx().as_ptr(), b"nsl_csr_spmm_f32\0".as_ptr(),
         [grid_x, grid_y, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU CSR SpMM kernel failed: {:?}", result);
@@ -10432,6 +10431,9 @@ mod tests {
         all.push(("nsl_coo_spmv_f32", super::fused_kernels::coo_spmv_f32_ptx(), true));
         all.push(("nsl_sum_sq_f64_acc_f32", super::fused_kernels::sum_sq_f64_acc_f32_ptx(), true));
         all.push(("nsl_lce_finalize_f32", super::fused_kernels::lce_finalize_f32_ptx(), true));
+        all.push(("nsl_csr_spmm_f32", super::fused_kernels::csr_spmm_f32_ptx(), true));
+        all.push(("nsl_coo_spmm_f32", super::fused_kernels::coo_spmm_f32_ptx(), true));
+        all.push(("nsl_bsr_spmm_f32", super::fused_kernels::bsr_spmm_f32_ptx(), true));
         all.push(("nsl_softmax_f32", super::fused_kernels::softmax_f32_ptx(), true));
         all.push(("nsl_log_softmax_f32", super::fused_kernels::log_softmax_f32_ptx(), true));
         all.push(("nsl_layernorm_f32", super::fused_kernels::layernorm_f32_ptx(), true));

@@ -1406,7 +1406,7 @@ pub extern "C" fn nsl_sparse_matmul(
             let grid_y = ((n_out as i64) + block - 1) / block;
 
             let result = crate::cuda::inner::kernel_launch(
-                crate::cuda::fused_kernels::CSR_SPMM_F32_PTX.as_ptr(),
+                crate::cuda::fused_kernels::csr_spmm_f32_ptx().as_ptr(),
                 b"nsl_csr_spmm_f32\0".as_ptr(),
                 [grid_x, grid_y, 1], [block, 1, 1], &args, 0,
             );
