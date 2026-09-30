@@ -2046,6 +2046,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- **`STATUS.md` reviewed against `main` @ 3a5b1654** (new-roadmap item 11,
+  after the KIR and per-device context campaigns). No subsystem changes
+  tier.
+  - **CUDA row:** it now states which runtime kernels are KernelIR and how
+    they were proved. It records the hand-PTX set at 56 files and the
+    per-device `CudaContext`, with single-device execution only (A4 step 5
+    not done). It also says the September migrations have not been
+    re-certified on hardware, because the GPU runner has been offline since
+    2026-09-18.
+  - **Other rows:** they record `.to(dtype)` converting, the Adam
+    decay refusal and the calibration/quantization refusals.
+  - **Operator fusion:** a `@fuse` chain runs through the runtime's fused
+    elementwise ops.
+  - **Pretokenization:** the stale "in review" note for the fast encoder
+    (#527/#528, merged) is gone.
+
 - **The KIR PTX printer places a conditional edge's copies out of line**
   (new-roadmap item 5). A `CondBranch` edge that carries block arguments
   now branches to a trampoline printed after the kernel's last block. The
