@@ -92,16 +92,15 @@ fn cpu_f32_tensor(vals: &[f32]) -> i64 {
 
 /// Read a GPU f32 tensor back to host as `Vec<f32>`.
 ///
-/// `nsl_tensor_to_device(ptr, 0)` upcasts GPU f32 -> CPU f64 (runtime
-/// invariant from MEMORY.md: CPU=f64, GPU=f32). We read the f64 buffer
-/// and narrow to f32 for the round-trip-error comparison.
+/// `nsl_tensor_to_device(ptr, 0)` preserves the tag (C5 step 2a): a GPU f32
+/// tensor downloads as CPU f32, byte for byte. It used to widen to f64, and
+/// this helper asserted that; the assert now pins the new contract instead.
 fn read_gpu_f32_as_host_f32(ptr: i64) -> Vec<f32> {
     let cpu = unsafe { nsl_tensor_to_device(ptr, 0) };
     let t = unsafe { &*(cpu as *const TensorView) };
-    assert_eq!(t.dtype, 0, "to_device(_, 0) must yield CPU f64 (dtype=0)");
+    assert_eq!(t.dtype, 1, "to_device(_, 0) must preserve the f32 tag (C5 step 2a)");
     let len = t.len as usize;
-    let slice = unsafe { std::slice::from_raw_parts(t._data as *const f64, len) };
-    let out: Vec<f32> = slice.iter().map(|&x| x as f32).collect();
+    let out: Vec<f32> = unsafe { std::slice::from_raw_parts(t._data as *const f32, len) }.to_vec();
     if cpu != ptr {
         unsafe { nsl_tensor_free(cpu) };
     }

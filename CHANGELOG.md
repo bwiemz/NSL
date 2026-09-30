@@ -2135,6 +2135,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- **A GPU → CPU transfer keeps the dtype tag** (C5 step 2a,
+  `docs/superpowers/specs/2026-09-26-dtype-semantics-design.md`). The
+  download arm of `nsl_tensor_to_device` used to widen f32 to f64, so an f32
+  tensor that went CPU → GPU → CPU came back f64. Every dtype is now a byte
+  copy. A device tensor tagged f64 is refused rather than read at a guessed
+  width; no device path produces one. The upload still narrows f64 to f32
+  until step 2b turns it into a refusal.
+  - **The gate,** `transfer_preserves_dtype_gpu` (4 GPU tests), round-trips
+    f32 edge values by bit pattern: ±0, a NaN payload, a signalling NaN,
+    ±inf, subnormals and full significands. It also covers 134k random f32
+    bit patterns, every other byte-copied dtype, a transposed device view,
+    and an f64 upload.
+  - **`model_load` compares the real tags.** The `.nslm` header wrote "f64"
+    for every tag but f32, so an fp16 checkpoint loaded into a bf16 model and
+    its bytes were reinterpreted. Each tag now has its own name; "f32" and
+    "f64" are unchanged, so existing files still load. `model_save` drops its
+    f64-staging downcast, which no download produces any more.
+  - **Code that relied on the widening:**
+    - `nsl_sparse_spmv` falls back to the CPU for BSR, which has no GPU
+      kernel. That CPU path, `nsl_sparse_spmm`'s and `nsl_sparse_from_dense`
+      read the dense operand as raw f64. They now decode it by tag, which also
+      fixes f32 CPU operands such as those `zeros`/`ones` make.
+    - The CPU fallback for unary GPU ops on allocation failure read and wrote
+      raw f64. It now reads and writes by tag.
+    - `nsl_grad_accumulate_add` with a CPU f64 accumulator and a GPU f32
+      gradient would have returned -1, which codegen discards, dropping the
+      gradient. A CPU destination now takes the per-element CPU arm.
+    - Dropout backward read its mask with `data_f64()`. It now reads by tag.
+
 - **`STATUS.md` reviewed against `main` @ bba1b564** (new-roadmap item 11,
   after the KIR and per-device context campaigns). No subsystem changes
   tier.

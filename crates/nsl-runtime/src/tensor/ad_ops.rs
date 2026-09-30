@@ -1081,11 +1081,12 @@ pub extern "C" fn nsl_l1_backward(
     let pred = NslTensor::from_ptr(pred_cpu);
     let target = NslTensor::from_ptr(target_cpu);
 
-    // Branch on the CPU-RESIDENT dtype, not the original device dtype:
-    // `nsl_tensor_to_device(x, 0)` widens device f32 to CPU f64, so a GPU
-    // f32 pred arrives here as f64 — reading it through data_f32() tripped
-    // the accessor assert (P5 fix). The output tensor is built with the
-    // same CPU dtype; publish converts back for the device as usual.
+    // Branch on the CPU-RESIDENT dtype, not the original device dtype. They
+    // used to differ: the download widened device f32 to CPU f64, so a GPU
+    // f32 pred arrived here as f64 and reading it through data_f32() tripped
+    // the accessor assert (P5 fix). Since C5 step 2a the download keeps the
+    // tag, but a CPU caller can still pass f64. The output tensor is built
+    // with the same CPU dtype; publish converts back for the device as usual.
     let cpu_dtype = pred.dtype;
     let elem_size = if cpu_dtype == 1 {
         std::mem::size_of::<f32>()
@@ -1818,11 +1819,11 @@ mod tests {
             let grad_gpu = nsl_tensor_to_device(grad_cpu, 1);
             let idx_gpu = nsl_tensor_to_device(idx_cpu, 1);
             let dw = nsl_embedding_backward(grad_gpu, idx_gpu, weight_cpu);
-            // GPU f32 -> CPU f64 (the CPU=f64/GPU=f32 convention). The
-            // conversion is lossless, so cast back to the exact f32.
+            // GPU f32 -> CPU f32: the download keeps the tag (C5 step 2a),
+            // and the f64 read widens losslessly, so the cast back is exact.
             let dw_cpu = nsl_tensor_to_device(dw, 0);
             let out: Vec<f32> = (0..vocab * embed)
-                .map(|k| unsafe { *NslTensor::from_ptr(dw_cpu).data_f64().add(k) } as f32)
+                .map(|k| NslTensor::from_ptr(dw_cpu).read_scalar_as_f64(k) as f32)
                 .collect();
             nsl_tensor_free(grad_cpu);
             nsl_tensor_free(idx_cpu);
@@ -1970,7 +1971,7 @@ mod tests {
         assert_eq!(unsafe { *grad_t.shape.add(0) }, 2);
         assert_eq!(unsafe { *grad_t.shape.add(1) }, 3);
         for i in 0..6 {
-            let value = unsafe { *grad_t.data_f64().add(i) };
+            let value = grad_t.read_scalar_as_f64(i);
             assert!(value.is_finite(), "gradient element {i} was not finite: {value}");
         }
 
@@ -2189,8 +2190,8 @@ mod tests {
     /// to mse targets and 2D-logits cross_entropy at the time).
     #[test]
     fn compare_mixed_dtypes_dispatches_per_operand() {
-        // a: f64 (as produced by a GPU->CPU download), b: f32 scalar 0.0
-        // (as produced by the relu-backward Condition constant).
+        // a: f64 (a CPU tensor; before C5 step 2a, also every GPU->CPU
+        // download), b: f32 scalar 0.0 (the relu-backward Condition constant).
         let a = make_1d_f64(&[-1.0, 0.0, 2.5]);
         let b = make_1d_f32(&[0.0]);
         let gt = nsl_tensor_compare(a, b, 0); // Gt — the relu-backward kind

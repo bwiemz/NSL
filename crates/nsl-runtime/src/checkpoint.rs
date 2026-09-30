@@ -1,5 +1,9 @@
 use crate::list::NslList;
-use crate::tensor::NslTensor;
+use crate::tensor::{
+    DTYPE_BF16, DTYPE_CUSTOM_START, DTYPE_F32, DTYPE_F64, DTYPE_FP16, DTYPE_FP8E4M3,
+    DTYPE_FP8E5M2, DTYPE_I32, DTYPE_INT8, DTYPE_INT8_BLOCKWISE, DTYPE_U16_SEGMENT,
+    DTYPE_U16_TOKEN, NslTensor,
+};
 use std::io::Write;
 
 const MAGIC: &[u8; 4] = b"NSLM";
@@ -11,6 +15,32 @@ fn write_or_abort(file: &mut std::fs::File, buf: &[u8], context: &str) {
         crate::nsl_log!(ERROR, "nsl", "nsl: model_save: {}: {}", context, e);
         std::process::abort();
     }
+}
+
+/// The `dtype` string an `.nslm` header records for a tensor tag.
+///
+/// `model_load` compares these strings for equality, so every tag needs its
+/// own name. Until C5 step 2a every tag other than f32 was written as "f64":
+/// an fp16 checkpoint then loaded into a bf16 model without complaint and its
+/// bytes were reinterpreted. "f32" and "f64" keep their spelling so files
+/// saved before the change still load into f32/f64 models.
+fn checkpoint_dtype_name(dtype: u16) -> String {
+    let name = match dtype {
+        DTYPE_F64 => "f64",
+        DTYPE_F32 => "f32",
+        DTYPE_FP16 => "fp16",
+        DTYPE_BF16 => "bf16",
+        DTYPE_INT8 => "int8",
+        DTYPE_FP8E4M3 => "fp8e4m3",
+        DTYPE_FP8E5M2 => "fp8e5m2",
+        DTYPE_U16_TOKEN => "u16_token",
+        DTYPE_U16_SEGMENT => "u16_segment",
+        DTYPE_I32 => "i32",
+        DTYPE_INT8_BLOCKWISE => "int8_blockwise",
+        id if id >= DTYPE_CUSTOM_START => return format!("custom{id}"),
+        id => return format!("tag{id}"),
+    };
+    name.to_string()
 }
 
 /// Save model parameters to .nslm binary format.
@@ -53,7 +83,7 @@ pub extern "C" fn nsl_model_save(
         let name = unsafe {
             std::ffi::CStr::from_ptr(name_ptr as *const std::os::raw::c_char)
         }.to_str().unwrap_or("?");
-        let dtype_str = if tensor.dtype == 1 { "f32" } else { "f64" };
+        let dtype_str = checkpoint_dtype_name(tensor.dtype);
         params_json.push(format!(
             r#"{{"name":"{}","shape":{:?},"dtype":"{}","offset":{},"nbytes":{}}}"#,
             name, shape, dtype_str, data_offset, nbytes
@@ -117,17 +147,13 @@ pub extern "C" fn nsl_model_save(
         if tensor.device > 0 {
             // GPU tensor: copy to CPU staging buffer before writing.
             //
-            // CRITICAL dtype trap: `nsl_tensor_to_device(_, 0)` follows the
-            // runtime convention CPU=f64 / GPU=f32 and CONVERTS the staged
-            // buffer to f64 (len*8 bytes). The header above was built from
-            // the GPU tensor (dtype "f32", nbytes = len*4), so writing
-            // `byte_count` raw bytes from the f64 staging buffer serialized
-            // interleaved f64 halves as "f32" data — every checkpoint saved
-            // from a GPU-resident model was garbage (found by the roadmap-4.3
-            // FASE-parity gate: |max| ~ 3.7e19 in freshly-initialized
-            // weights). Downcast the staging buffer element-wise so the bytes
-            // match the declared dtype; fall through to a raw write only when
-            // the staging preserved the dtype.
+            // The header above was built from the GPU tensor, so the staged
+            // bytes must carry the same tag. The download preserves it (C5
+            // step 2a). Before that it widened f32 to f64, and this loop had to
+            // narrow the staging buffer back: writing it raw once serialized
+            // interleaved f64 halves as "f32" data (the roadmap-4.3
+            // FASE-parity gate saw |max| ~ 3.7e19 in freshly-initialized
+            // weights). The mismatch arm stays as a guard, not a fallback.
             let cpu_ptr = crate::tensor::nsl_tensor_to_device(tensor_ptr, 0);
             let cpu_tensor = NslTensor::from_ptr(cpu_ptr);
             if cpu_tensor.dtype == tensor.dtype {
@@ -135,17 +161,6 @@ pub extern "C" fn nsl_model_save(
                     std::slice::from_raw_parts(cpu_tensor.data as *const u8, byte_count)
                 };
                 write_or_abort(&mut file, data_slice, "write tensor data (GPU->CPU)");
-            } else if tensor.dtype == 1 && cpu_tensor.dtype == 0 {
-                // GPU f32 declared in the header; staging is f64 — downcast.
-                let n = tensor.len as usize;
-                let src = unsafe {
-                    std::slice::from_raw_parts(cpu_tensor.data as *const f64, n)
-                };
-                let mut buf = Vec::with_capacity(n * 4);
-                for v in src {
-                    buf.extend_from_slice(&(*v as f32).to_le_bytes());
-                }
-                write_or_abort(&mut file, &buf, "write tensor data (GPU f32 via f64 staging)");
             } else {
                 crate::nsl_log!(ERROR, "nsl", "nsl: model_save: unsupported dtype transition in GPU staging \
                      (device dtype {} -> staged dtype {}) for tensor #{}",
@@ -274,15 +289,16 @@ pub extern "C" fn nsl_model_load(path_ptr: i64, path_len: i64, param_tensors_ptr
         let tensor_ptr = unsafe { *tensors.data.add(i) };
         let tensor = NslTensor::from_ptr(tensor_ptr);
         if let Some(file_dtype) = file_dtypes.get(i) {
-            let live_dtype: &[u8] = if tensor.dtype == 1 { b"f32" } else { b"f64" };
-            if *file_dtype != live_dtype {
+            let live_dtype = checkpoint_dtype_name(tensor.dtype);
+            if *file_dtype != live_dtype.as_bytes() {
                 crate::nsl_log!(ERROR, "nsl", "nsl: model_load: dtype mismatch for tensor #{}: file has {}, \
                      model expects {} — raw byte copy would corrupt this tensor and \
                      misalign all subsequent ones. Re-save the checkpoint from a \
-                     model on the same device convention (CPU=f64, GPU=f32).",
+                     model whose parameters have the same dtype (a CPU-resident \
+                     model holds f64 parameters, a GPU-resident one f32).",
                     i,
                     String::from_utf8_lossy(file_dtype),
-                    String::from_utf8_lossy(live_dtype),
+                    live_dtype,
                 );
                 std::process::abort();
             }

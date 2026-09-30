@@ -128,8 +128,8 @@ pub(crate) fn read_host_f64(handle: i64, t: &NslTensor) -> Result<Vec<f64>, &'st
 ///
 /// `nsl_tensor_contiguous` and `nsl_tensor_to_device` BOTH return owned refs
 /// (project invariant) that must be released here via `nsl_tensor_free`.
-/// `nsl_tensor_to_device(_, 0)` context-syncs and widens f32 -> f64 (runtime
-/// invariant: CPU=f64, GPU=f32), so `read_cpu_f64` sees a plain CPU tensor.
+/// `nsl_tensor_to_device(_, 0)` context-syncs and keeps the device tag (C5
+/// step 2a), so `read_cpu_f64` sees a plain CPU f32 tensor.
 #[cfg(feature = "cuda")]
 fn read_gpu_f64(handle: i64) -> Result<Vec<f64>, &'static str> {
     crate::cuda::inner::ensure_context();

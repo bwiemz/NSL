@@ -2240,11 +2240,11 @@ pub extern "C" fn nsl_tensor_mul_scalar_inplace(tensor_ptr: i64, scalar: f64) {
 
     #[cfg(feature = "cuda")]
     if tensor.device > 0 {
-        // Round-trip: pull to CPU, scale, push back. `nsl_tensor_to_device`
-        // upcasts the GPU f32 buffer to CPU f64, so the scaled CPU result is
-        // f64. Copying f64-sized bytes back into the f32 device buffer would
-        // reinterpret f64 bit patterns as f32 (garbage), so down-convert to
-        // f32 before the HtoD when needed (mirrors nsl_tensor_add_inplace).
+        // Round-trip: pull to CPU, scale, push back. The download keeps the
+        // f32 tag (C5 step 2a), so the direct copy below is the path taken.
+        // It used to widen to f64, and copying f64-sized bytes back into the
+        // f32 device buffer reinterpreted f64 bit patterns as f32 (garbage);
+        // the down-convert arm stays for any f64 that reaches here.
         let cpu_ptr = nsl_tensor_to_device(tensor_ptr, 0);
         nsl_tensor_mul_scalar_inplace(cpu_ptr, scalar);
         let cpu_tensor = NslTensor::from_ptr(cpu_ptr);
@@ -4261,53 +4261,46 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
         {
             unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
 
-            if transfer_src.dtype != 0 && transfer_src.dtype != 1 {
-                assert_elementwise_byte_copy(transfer_src.dtype, "nsl_tensor_to_device");
-                let dst_size = len * transfer_src.element_size();
-                let dst = checked_alloc(dst_size);
-                crate::cuda::inner::memcpy_dtoh(
-                    dst as *mut std::ffi::c_void,
-                    transfer_src.data,
-                    dst_size,
+            // C5 step 2a (docs/superpowers/specs/2026-09-26-dtype-semantics-design.md):
+            // download PRESERVES THE TAG -- every dtype, f32 included, is a byte
+            // copy. f32 used to widen to f64 here, so an f32 tensor that went
+            // CPU -> GPU -> CPU came back f64; the `l1_backward` bug in the
+            // CHANGELOG came from exactly that.
+            //
+            // A GPU tensor tagged f64 must not exist ("no GPU f64 for now"; the
+            // upload arm still narrows f64 to f32 until step 2b refuses it). The
+            // old code sent one down the f32 widening path, reading the buffer
+            // as 4-byte elements; a byte copy would read it as 8-byte ones. With
+            // no device producer of f64 there is no way to know which width the
+            // buffer really has, so refuse rather than guess.
+            if transfer_src.dtype == 0 {
+                crate::fatal::die(
+                    crate::fatal::Fatal::UnsupportedDtype,
+                    "nsl_tensor_to_device: a GPU tensor is tagged f64, which no device \
+                     path produces; its element width is unknown, so it cannot be \
+                     downloaded",
                 );
-                let shape = NslTensor::copy_shape(transfer_src.shape, transfer_src.ndim);
-                let strides = NslTensor::compute_strides(shape, transfer_src.ndim);
-                let new_t = Box::new(NslTensor::new(
-                    dst as *mut std::ffi::c_void,
-                    shape,
-                    strides,
-                    transfer_src.ndim,
-                    transfer_src.len,
-                    0,
-                    transfer_src.dtype,
-                    1,
-                    0,
-                ));
-                if transfer_src_ptr != tensor_ptr {
-                    nsl_tensor_free(transfer_src_ptr);
-                }
-                return NslTensor::publish(new_t);
             }
-
-            // f32 (GPU) → f64 (CPU): copy to a temporary heap buffer, then convert.
-            let src_size = len * std::mem::size_of::<f32>();
-            let staging = checked_alloc(src_size) as *mut f32;
+            assert_elementwise_byte_copy(transfer_src.dtype, "nsl_tensor_to_device");
+            let dst_size = len * transfer_src.element_size();
+            let dst = checked_alloc(dst_size);
             crate::cuda::inner::memcpy_dtoh(
-                staging as *mut std::ffi::c_void,
+                dst as *mut std::ffi::c_void,
                 transfer_src.data,
-                src_size,
+                dst_size,
             );
-            let dst_size = len * std::mem::size_of::<f64>();
-            let dst = checked_alloc(dst_size) as *mut f64;
-            for i in 0..len {
-                unsafe { *dst.add(i) = *staging.add(i) as f64; }
-            }
-            unsafe { checked_free(staging as *mut u8, src_size); }
             let shape = NslTensor::copy_shape(transfer_src.shape, transfer_src.ndim);
             let strides = NslTensor::compute_strides(shape, transfer_src.ndim);
             let new_t = Box::new(NslTensor::new(
                 dst as *mut std::ffi::c_void,
-                shape, strides, transfer_src.ndim, transfer_src.len, 0, 0, 1, 0,
+                shape,
+                strides,
+                transfer_src.ndim,
+                transfer_src.len,
+                0,
+                transfer_src.dtype,
+                1,
+                0,
             ));
             if transfer_src_ptr != tensor_ptr {
                 nsl_tensor_free(transfer_src_ptr);
@@ -5128,7 +5121,7 @@ mod tests {
             let read = |p: i64| -> f64 {
                 let h = nsl_tensor_to_device(p, 0);
                 let t = NslTensor::from_ptr(h);
-                let v = unsafe { *t.data_f64() };
+                let v = t.read_scalar_as_f64(0);
                 nsl_tensor_free(h);
                 v
             };

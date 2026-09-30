@@ -648,7 +648,7 @@ mod tests {
     fn read_gpu_f32(ptr: i64) -> Vec<f32> {
         let cpu = nsl_tensor_to_device(ptr, 0);
         let t = NslTensor::from_ptr(cpu);
-        // CPU transfer widens to f64 by convention; read whichever landed.
+        // The download keeps f32 (C5 step 2a); the f64 arm is for older paths.
         let out: Vec<f32> = (0..t.len as usize)
             .map(|i| match t.dtype {
                 1 => unsafe { *t.data_f32().add(i) },
