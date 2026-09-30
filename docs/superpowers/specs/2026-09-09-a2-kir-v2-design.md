@@ -1513,6 +1513,31 @@ frozen throughout, so nothing here blocks a kernel fix.
       - **SASS** (sm_80/90/120): the same one load, two stores, one float
         compare, branches and six 64-bit `div`/`rem` calls as the hand
         kernel, in 28/28/26 registers against 30.
+    - **`fused_kernels.rs`, the direct 2-D convolution forward.**
+      `nsl_conv2d_f32` is in `nsl_kir::kernels::conv2d`, a thread per
+      output element. It splits the flat index with `rem`/`div` into `(n,
+      co, oh, ow)`, walks `ci`, `ky`, `kx` in order, skips taps in the
+      padding (`oh · stride_h + ky < pad_h`, likewise across) or past the
+      input, and accumulates from `0` with the hand kernel's explicit
+      `fma.rn`. When the bias pointer is not null (a 64-bit `setp.eq`
+      against a null constant) it adds `bias[co]` with `add.f32`, which has
+      no product to contract with.
+      - **The gate,** `conv2d_kir_equivalence`, launches whole grids with a
+        spare block on 256- and 32-thread blocks under two schedules, each
+        shape with a bias and a null one, over strides and paddings that
+        differ between the axes, windows wholly in the padding, and
+        full-mantissa data on which a separately rounded multiply and add
+        differ from the `fma`. It requires the hand kernel's bytes and the
+        restated walk, and kills mutants of every bound, padding and null
+        test, every `div` and `rem`, every index multiply, add and
+        subtract, the loop starts and steps, the accumulator's start, the
+        `fma`'s addend and its fusion (split into `mul.rn` and `add.rn`),
+        the bias add and every element size. Named equivalent mutant: the
+        `fma`'s two factors swapped.
+      - **SASS** (sm_80/90/120): the same three loads, one store, one
+        `FFMA`, one `FADD`, branches and six 64-bit `div`/`rem` calls as the
+        hand kernel, in 28/30/38 registers against 30/30/36; 38 and 36
+        both allocate 40, so occupancy is unchanged.
     - **`fused_kernels.rs`, the GEMM-chunked fused linear-CE's chunk
       kernels.** `nsl_lce_chunk_stats_f32` and `nsl_lce_chunk_dlogits_f32`
       are in `nsl_kir::kernels::lce_chunk` (`LceChunkOp::{Stats,

@@ -1,0 +1,96 @@
+# Focused hardware-certification bundle -- roadmap item 2
+# ============================================================
+#
+# ~80 commits between 2026-09-02 and 2026-09-29 moved most of the runtime's
+# hand-written PTX into KIR (`crates/nsl-kir/src/kernels/`). Every migration is
+# gated by `crates/nsl-codegen/tests/*_kir_equivalence.rs`, which proves on the
+# cooperative-CTA INTERPRETER that the KIR kernel leaves the same bytes as its
+# frozen predecessor. That is strong evidence and it is not silicon evidence:
+#
+#  * ptxas contracts an un-rounded `mul` + `add` into `fma` on hardware, which a
+#    PTX-semantics interpreter cannot see. `nsl_kir::kernels::norm` records that
+#    the hand norm kernels WERE contracted and the KIR ones round twice -- so for
+#    those kernels interpreter equivalence and silicon equivalence differ.
+#  * A missing barrier is a timing race. The hand LayerNorm had one (a warp could
+#    normalize with the VARIANCE partial in place of the mean); KIR fixed it.
+#
+# This file names the GPU gates that exercise those kernels on the device, so
+# they can be run on their own in minutes instead of inside the 400-gate lane:
+#
+#   NSL_CERT_GATES=ci/gpu-hwcert-bundle.txt \
+#   NSL_CERT_OUT=<evidence-dir>/hwcert-report-$(git rev-parse --short HEAD).tsv \
+#     scripts/gpu-cert.sh --run
+#
+# It runs through gpu-cert.sh itself -- same guard, timeouts, per-gate logs and
+# known-red verdict. A line naming a gate that is not in the `gpu` tier REFUSES
+# the run, so a renamed or re-tiered gate cannot silently leave an area bare.
+# Point NSL_CERT_OUT outside the worktree: the per-gate logs are written beside
+# the report, and a report inside a worktree dies with it.
+#
+# Known holes -- listed so nobody reads a green bundle as covering them:
+#  * dropout BACKWARD: `dropout_backward_parity_gate.rs::
+#    gpu_source_backward_matches_tape_mask_backward` is tiered `broken` for a
+#    `nsl_tensor_compare` dtype abort that acd2535c FIXED on 2026-08-25, nine
+#    days after the gate was parked. It joins this list once it passes on the
+#    device and is re-tiered; until then the filter would (rightly) refuse it.
+#  * SpMM (CSR/COO/BSR, which #785 moves to KIR): NO GPU gate exists at all.
+#  * `nsl_log_softmax_f32`: no public entry point, no GPU gate.
+#  * Performance: nothing here times a kernel. Benchmarks are a separate step.
+
+
+# ── 01  multi-tile packed FlashAttention forward ──
+crates/nsl-codegen/tests/csha_cuda_launch_fused.rs	t1_forward_output_invariant_under_save_activations_flag_multitile_segmented_two_equal
+crates/nsl-codegen/tests/csha_cuda_launch_fused.rs	t1_forward_output_invariant_under_save_activations_flag_multitile_segmented_three_unequal
+crates/nsl-codegen/tests/pca_tier_a_forward_correctness.rs	tier_a_forward_two_equal_segments_matches_unpacked_reference
+crates/nsl-codegen/tests/pca_tier_a_forward_correctness.rs	tier_a_forward_unequal_segments_matches_unpacked_reference
+crates/nsl-codegen/tests/pca_per_doc_cta_forward_correctness.rs	per_doc_cta_four_short_docs_matches_segmented_reference
+crates/nsl-codegen/tests/sdpa_fused_forward_gpu_parity.rs	sdpa_fused_forward_segment_masked_matches_oracle
+crates/nsl-codegen/tests/sdpa_mma_forward_gpu_parity.rs	mma_multitile_hd64_causal
+
+# ── 02  packed FlashAttention backward at head_dim <= 32 (PCA gates are packed at hd=32; the two flash_attention_backward_gpu gates are the UNPACKED small-hd control) ──
+crates/nsl-codegen/tests/pca_tier_a_backward_correctness.rs	tier_a_backward_unequal_segments_matches_unpacked_reference
+crates/nsl-codegen/tests/pca_tier_a_backward_correctness.rs	tier_a_backward_batch2_distinct_row_segments_matches_reference
+crates/nsl-codegen/tests/pca_per_doc_cta_backward_correctness.rs	per_doc_cta_backward_four_docs_matches_cpu_reference
+crates/nsl-codegen/tests/flash_attention_backward_gpu.rs	plain_bwd_multitile_heads4_hd32_scalar
+crates/nsl-codegen/tests/flash_attention_backward_gpu.rs	mma_bwd_multitile_heads4_hd32
+
+# ── 03  SwiGLU fused backward -- and that it LAUNCHES on the device (kernel-profile proof + kill-switch control) ──
+crates/nsl-cli/tests/swiglu_fusion_gate.rs	swiglu_fused_backward_gpu_deterministic_and_matches_reference
+crates/nsl-runtime/src/tensor/activation.rs	swiglu_gate_backward_gpu_f32_bit_exact_vs_pair
+
+# ── 04  tanh / GELU saturation ──
+crates/nsl-runtime/src/tensor/activation.rs	tanh_gpu_f32_saturates_and_keeps_nan
+crates/nsl-runtime/src/tensor/activation.rs	gelu_backward_gpu_f32_saturates_to_its_limits
+
+# ── 05  FASE AdamW, f32 and BF16-SR ──
+crates/nsl-cli/tests/fase_fused_step_gpu_gate.rs	fused_step_matches_interpreted_bit_exact
+crates/nsl-cli/tests/multi_adamw_gate.rs	multi_adamw_gpu_bit_identical_and_fires
+crates/nsl-runtime/src/fase_step.rs	unaligned_parameter_lengths_are_numerically_correct
+crates/nsl-cli/tests/sr_bf16_gate.rs	srbf16_batched_step_matches_per_param_gpu
+crates/nsl-runtime/tests/sr_bf16_parity.rs	sr_bf16_gpu_tail_is_bit_identical_to_cpu_reference
+crates/nsl-runtime/tests/sr_bf16_parity.rs	sr_bf16_gpu_streams_vary_with_counters
+
+# ── 06  dropout (bit-exact against the kernel's documented hash) ──
+crates/nsl-runtime/tests/hwcert_kir_numerics_gpu.rs	dropout_kir_kernel_is_bit_exact_against_its_documented_hash_on_silicon
+
+# ── 07  gradient-clip sum of squares ──
+crates/nsl-runtime/src/tensor/mod.rs	sum_sq_gpu_matches_cpu_reference
+crates/nsl-cli/tests/multi_adamw_gate.rs	batched_phase_a_sumsq_gpu_close_to_per_param
+crates/nsl-cli/tests/multi_adamw_gate.rs	multi_adamw_clip_gpu_bit_identical_and_fires
+
+# ── 08  tensor stats ──
+crates/nsl-runtime/tests/inspect_ffi.rs	gpu_stats_parity_with_cpu
+
+# ── 09  softmax ──
+crates/nsl-runtime/tests/hwcert_kir_numerics_gpu.rs	softmax_kir_kernel_matches_an_independent_f64_softmax_on_silicon
+
+# ── 10  LayerNorm (correctness AND launch-to-launch bit stability: the hand kernel had a shared-memory race) ──
+crates/nsl-runtime/tests/hwcert_kir_numerics_gpu.rs	layernorm_kir_kernel_is_correct_and_race_free_on_silicon
+
+# ── 11  RMSNorm forward and backward ──
+crates/nsl-runtime/tests/hwcert_kir_numerics_gpu.rs	rmsnorm_forward_kir_kernel_matches_an_independent_f64_rmsnorm_on_silicon
+crates/nsl-runtime/tests/rmsnorm_dx_backward_gpu.rs	rmsnorm_dx_gpu_matches_cpu_reference
+crates/nsl-cli/tests/rmsnorm_dx_parity_gate.rs	fused_rmsnorm_gamma_backward_gpu_matches_reference
+
+# ── 12  2-D max pooling (#786 moves it to KIR) ──
+crates/nsl-runtime/tests/gpu_maxpool2d_argmax_readback.rs	gpu_maxpool2d_argmax_readback_does_not_segfault
