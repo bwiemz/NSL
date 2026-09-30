@@ -50,6 +50,41 @@ fn run_fixture(tag: &str, gpu: bool, extra: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// The GPU fixture under `--source-ad` with the kernel profiler on, returning
+/// (stderr, kernel_profile.json). The child writes the profile into its working
+/// directory at exit; its trace names every kernel `kernel_launch` issued, so a
+/// name there means the kernel really ran on the device.
+fn run_gpu_fixture_profiled(tag: &str, fuse: bool) -> (String, String) {
+    let root = repo_root();
+    let tmp = std::env::temp_dir().join(format!("nsl_swiglu_{tag}_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let src = std::fs::read_to_string(root.join("crates/nsl-cli/tests/fixtures/swiglu_parity.nsl"))
+        .unwrap()
+        .replace("# GPU_PLACEMENT", "m.to(cuda)\nlet xg = x.to(cuda)\nlet yg = y.to(cuda)")
+        .replace("m.forward(x)", "m.forward(xg)")
+        .replace("l1_loss(pred, y)", "l1_loss(pred, yg)");
+    let prog = tmp.join("prog.nsl");
+    std::fs::write(&prog, src).unwrap();
+    let profile = tmp.join("kernel_profile.json");
+    let _ = std::fs::remove_file(&profile);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nsl"));
+    cmd.args(["run", "--deterministic", "--source-ad"])
+        .arg(&prog)
+        .current_dir(&tmp)
+        .env("NSL_STDLIB_PATH", root.join("stdlib"))
+        .env("NSL_PROFILE_KERNELS", "1");
+    if !fuse {
+        cmd.env("NSL_FUSE_SWIGLU_GATE", "0");
+    }
+    let out = cmd.output().expect("spawn nsl run");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "run failed (tag={tag}):\n{stderr}");
+    let json = std::fs::read_to_string(&profile).unwrap_or_else(|e| {
+        panic!("no {} after a profiled run (tag={tag}): {e}\n{stderr}", profile.display())
+    });
+    (stderr, json)
+}
+
 fn parse_between(stdout: &str, begin: &str, end: &str) -> Vec<f64> {
     let after = stdout.split_once(begin).map(|(_, r)| r).unwrap_or("");
     let inner = after.split_once(end).map(|(l, _)| l).unwrap_or("");
@@ -110,6 +145,34 @@ fn swiglu_fused_backward_gpu_deterministic_and_matches_reference() {
             );
         }
     }
+
+    // ANTI-VACUITY — the fused backward must actually RUN on the device.
+    //
+    // This gate once compared the UNFUSED path for as long as the peephole
+    // failed to fire (see the CPU gate below), and nothing in it noticed: the
+    // values above are equally right either way. The firing proof was added to
+    // the CPU gate only. Here it is on silicon, at both layers:
+    //  * the codegen marker says the fused op was EMITTED;
+    //  * the kernel profile says `nsl_swiglu_gate_backward_f32` LAUNCHED.
+    // The kill-switch run is the control: without it, a name in the profile
+    // could come from some other op and the check would not discriminate.
+    let kernel = "\"name\":\"nsl_swiglu_gate_backward_f32\"";
+    let (err_on, prof_on) = run_gpu_fixture_profiled("gpu_prof_on", true);
+    assert!(
+        err_on.contains("[fuse] swiglu gate-backward pairs: "),
+        "the GPU source-AD run did not report fusing any SwiGLU gate-backward pair:\n{err_on}"
+    );
+    assert!(
+        prof_on.contains(kernel),
+        "codegen fused the pair, but the fused kernel never launched on the device \
+         (no {kernel} in the kernel profile) — the values above certified the unfused path"
+    );
+    let (_err_off, prof_off) = run_gpu_fixture_profiled("gpu_prof_off", false);
+    assert!(
+        !prof_off.contains(kernel),
+        "control: with NSL_FUSE_SWIGLU_GATE=0 the fused kernel still launched, so the \
+         profile check above cannot tell the fused path from the unfused one"
+    );
 }
 
 /// The peephole must actually fire on the fixture, and must be bit-exact:

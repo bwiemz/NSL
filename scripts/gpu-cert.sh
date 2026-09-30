@@ -53,6 +53,10 @@
 #   NSL_CERT_OUT       report path (default: target/gpu-cert-report.tsv)
 #   NSL_CERT_FEATURES  cargo features
 #                      (default: cuda,test-hooks,test-helpers,nsl-test/cuda)
+#   NSL_CERT_GATES     path to a gate list (`<file>\t<fn>` lines, `#` comments)
+#                      restricting --run to a named subset of the tier -- e.g.
+#                      ci/gpu-hwcert-bundle.txt. A listed gate absent from the
+#                      tier REFUSES the run rather than silently shrinking it.
 #   CARGO_TARGET_DIR   respected as usual
 #
 # --run refuses to start when the device is busy or another guarded run holds
@@ -461,6 +465,39 @@ cmd_run() {
         BEGIN { n = split(want, a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") keep[a[i]] = 1 }
         ($3 in keep) { print $1 "\t" $2 }
     ' "${full_inv}" > "${inv}"
+
+    # NSL_CERT_GATES: run a NAMED SUBSET of the tier -- a focused bundle such as
+    # ci/gpu-hwcert-bundle.txt -- through this same machinery, so it inherits the
+    # timeouts, per-gate logs, isolate handling and known-red verdict instead of
+    # reimplementing them. Lines are `<file>\t<fn>` as in the manifest; `#`
+    # comments and blank lines are ignored.
+    #
+    # Every listed gate MUST be in the tier's inventory. A renamed, deleted or
+    # typo'd gate otherwise drops out of the bundle silently and its area reports
+    # green with nothing having run -- the exact vacuity this lane exists to
+    # prevent. So a miss refuses the run and names the line.
+    if [[ -n "${NSL_CERT_GATES:-}" ]]; then
+        if [[ ! -r "${NSL_CERT_GATES}" ]]; then
+            echo "gpu-cert: NSL_CERT_GATES=${NSL_CERT_GATES} is not readable" >&2
+            exit 2
+        fi
+        local sel="${tmpdir}/selected.tsv" missing
+        # `|| true`: a list of only comments makes grep exit 1, and under
+        # pipefail that would abort here silently instead of reaching the
+        # "nothing to run" refusal below.
+        { grep -vE '^[[:space:]]*(#|$)' "${NSL_CERT_GATES}" || true; } \
+            | awk -F'\t' 'NF >= 2 { print $1 "\t" $2 }' > "${sel}"
+        missing="$(awk -F'\t' 'NR == FNR { have[$1 "\t" $2] = 1; next } !(($1 "\t" $2) in have)' "${inv}" "${sel}")"
+        if [[ -n "${missing}" ]]; then
+            echo "gpu-cert: ${NSL_CERT_GATES} names gate(s) absent from tier '${tier}':" >&2
+            printf '    %s\n' "${missing}" >&2
+            echo "          Refusing: a missing gate would silently leave its area uncovered." >&2
+            exit 2
+        fi
+        awk -F'\t' 'NR == FNR { want[$1 "\t" $2] = 1; next } (($1 "\t" $2) in want)' "${sel}" "${inv}" > "${inv}.sel"
+        mv "${inv}.sel" "${inv}"
+        echo "gpu-cert: NSL_CERT_GATES=${NSL_CERT_GATES} selects $(wc -l < "${inv}") gate(s)"
+    fi
 
     # Targets holding any `isolate`-class gate. Such a gate declares that a
     # faulting kernel poisons the CUDA context for everything sharing the

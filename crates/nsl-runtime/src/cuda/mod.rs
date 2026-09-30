@@ -63,6 +63,73 @@ pub fn test_lt_matmul_reset() {
     lt_matmul::reset_for_test()
 }
 
+/// Opt-in, per-kernel-name launch counts for GPU gates (`test-hooks` only).
+///
+/// Several ops take a native kernel on one path and a CPU redirect on another
+/// that still returns a device tensor -- `nsl_tensor_softmax` redirects every
+/// non-last dim, for instance. A numerics gate over such an op passes either
+/// way, so on its own it cannot certify the KERNEL. Arming the census and then
+/// asserting `count(name) > 0` closes that hole.
+///
+/// Costs one relaxed atomic load per launch unless armed, so the timing gates
+/// the certification lane also builds with `test-hooks` are not perturbed.
+/// Counts only `kernel_launch`; `launch_function_raw` (CFIE's engine) is not
+/// recorded, so a gate over a kernel launched that way reads zero and fails --
+/// loudly, the safe direction.
+#[cfg(all(feature = "cuda", feature = "test-hooks"))]
+pub(crate) mod launch_census {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static ARMED: AtomicBool = AtomicBool::new(false);
+    static COUNTS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+
+    pub(crate) fn record(name_ptr: *const u8) {
+        if !ARMED.load(Ordering::Relaxed) {
+            return;
+        }
+        // SAFETY: `kernel_launch`'s callers pass a NUL-terminated kernel name,
+        // the same pointer it already hands to `cuModuleGetFunction`.
+        let name = unsafe { std::ffi::CStr::from_ptr(name_ptr as *const std::ffi::c_char) };
+        let name = name.to_string_lossy();
+        let mut guard = COUNTS.lock().unwrap_or_else(|p| p.into_inner());
+        let map = guard.get_or_insert_with(HashMap::new);
+        match map.get_mut(name.as_ref()) {
+            Some(n) => *n += 1,
+            None => {
+                map.insert(name.into_owned(), 1);
+            }
+        }
+    }
+
+    pub(crate) fn arm() {
+        *COUNTS.lock().unwrap_or_else(|p| p.into_inner()) = Some(HashMap::new());
+        ARMED.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn count(name: &str) -> u64 {
+        COUNTS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .and_then(|m| m.get(name).copied())
+            .unwrap_or(0)
+    }
+}
+
+/// Start (or restart) counting kernel launches by name. See `launch_census`.
+#[cfg(all(feature = "cuda", feature = "test-hooks"))]
+pub fn test_kernel_launch_census_arm() {
+    launch_census::arm()
+}
+
+/// Successful launches of the kernel named `name` since the census was armed.
+#[cfg(all(feature = "cuda", feature = "test-hooks"))]
+pub fn test_kernel_launch_count(name: &str) -> u64 {
+    launch_census::count(name)
+}
+
 pub(crate) mod graph_capture;
 
 /// Roadmap A4 step 1: the per-device CUDA context. `inner` below is now a
@@ -2040,6 +2107,14 @@ pub(crate) mod inner {
                 kernel_args_ptr, std::ptr::null_mut(),
             )
         };
+
+        // Test-hooks launch census: lets a GPU gate prove the kernel it is
+        // certifying actually launched, rather than the op silently taking a
+        // CPU redirect that returns an equally correct device tensor.
+        #[cfg(feature = "test-hooks")]
+        if res == CUresult::CUDA_SUCCESS {
+            super::launch_census::record(name_ptr);
+        }
 
         // Sync after launch if sync mode is enabled (surfaces async GPU errors)
         if sync_mode_enabled() {
