@@ -68,7 +68,7 @@ use nsl_codegen::pca_tilerange::tier_b_range_table_bytes;
 use nsl_runtime::flash_attention::{nsl_flash_attention_backward, nsl_sdpa_fused_forward, nsl_sdpa_fused_launch_count};
 use nsl_runtime::list::{nsl_list_free, nsl_list_get, nsl_list_new, nsl_list_push};
 use nsl_runtime::pca_tier_b_runtime::TIER_B_MAX_BAKED_SEQ_LEN;
-use nsl_runtime::tensor::{nsl_tensor_data_ptr, nsl_tensor_free, nsl_tensor_zeros_on};
+use nsl_runtime::tensor::{nsl_tensor_data_ptr, nsl_tensor_free, nsl_tensor_to_device, nsl_tensor_zeros_on};
 use nsl_runtime::{
     nsl_cuda_init, nsl_test_cuda_d2h, nsl_test_cuda_h2d, nsl_test_cuda_jit_log, test_kernel_launch_census_arm,
     test_kernel_launch_count,
@@ -190,8 +190,30 @@ fn read_gpu(t: i64, len: usize) -> Vec<f32> {
     out
 }
 
-/// A host `[B, S]` segment-id tensor, as `packing.rs` emits it: f32 ids.
-fn host_segment_tensor(seg: &[u16]) -> i64 {
+/// Minimal mirror of the runtime's `#[repr(C)]` `NslTensor` header, to read
+/// the device tag (the same mirror `gpu_dtype_refusal.rs` carries).
+#[repr(C)]
+struct TensorHeader {
+    _magic: u32,
+    _data: *mut std::ffi::c_void,
+    _shape: *mut i64,
+    _strides: *mut i64,
+    _ndim: i64,
+    _len: i64,
+    _refcount: std::sync::atomic::AtomicI64,
+    device: u8,
+}
+
+fn tensor_device(ptr: i64) -> u8 {
+    unsafe { (*(ptr as *const TensorHeader)).device }
+}
+
+/// The `[B, S]` segment-id tensor as the attention ops receive it in a GPU
+/// packed step: `packing.rs` emits f32 ids on the host, and
+/// `nsl_packed_batch_align_device` moves them to the parameters' device
+/// before anything consumes them. So the runtime's device-to-host staging
+/// branch (`segment_ids_host_u16`, `device > 0`) is the one a real step takes.
+fn device_segment_tensor(seg: &[u16]) -> i64 {
     let shape_list = nsl_list_new();
     nsl_list_push(shape_list, B as i64);
     nsl_list_push(shape_list, S as i64);
@@ -202,7 +224,10 @@ fn host_segment_tensor(seg: &[u16]) -> i64 {
     for (i, &v) in seg.iter().enumerate() {
         unsafe { *p.add(i) = f32::from(v) };
     }
-    t
+    let on_device = nsl_tensor_to_device(t, 1);
+    nsl_tensor_free(t);
+    assert_eq!(tensor_device(on_device), 1, "segment ids did not reach the device");
+    on_device
 }
 
 fn jit_log(ptx: &[u8]) -> String {
@@ -288,7 +313,7 @@ fn fused_forward(x: &Inputs, tier_b: bool) -> (Vec<f32>, Vec<f32>) {
 
     let shape = [B as i64, H as i64, S as i64, D as i64];
     let (q_t, k_t, v_t) = (gpu_tensor(&shape, &x.q), gpu_tensor(&shape, &x.k), gpu_tensor(&shape, &x.v));
-    let seg_t = host_segment_tensor(&x.seg);
+    let seg_t = device_segment_tensor(&x.seg);
     let variant = usize::from(tier_b) as i64;
     let before = nsl_sdpa_fused_launch_count(variant);
     let scale = 1.0f32 / (D as f32).sqrt();
@@ -342,7 +367,7 @@ fn fused_backward(x: &Inputs, out: &[f32], lse: &[f32]) -> Grads {
     let (q_t, k_t, v_t) = (gpu_tensor(&shape, &x.q), gpu_tensor(&shape, &x.k), gpu_tensor(&shape, &x.v));
     let (out_t, dout_t) = (gpu_tensor(&shape, out), gpu_tensor(&shape, &x.dout));
     let lse_t = gpu_tensor(&[B as i64, H as i64, S as i64], lse);
-    let seg_t = host_segment_tensor(&x.seg);
+    let seg_t = device_segment_tensor(&x.seg);
     let (before1, before2) = (test_kernel_launch_count(&name1), test_kernel_launch_count(&name2));
     let scale = 1.0f32 / (D as f32).sqrt();
     let list = nsl_flash_attention_backward(
