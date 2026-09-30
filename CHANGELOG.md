@@ -8,6 +8,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **Parser table tests** (roadmap T1): 312 new `#[test]`s in `nsl-parser`,
+  one per construct, bringing the crate from 33 tests to 345. The roadmap's
+  Phase 1 exit criterion asked for at least 300.
+  - `tests/common/sexpr.rs` renders the AST as compact S-expressions, without
+    spans or node ids.
+  - `expr_table.rs` (143) covers each precedence row against its
+    neighbours, associativity, unary and postfix binding, slices,
+    collections, comprehensions, lambdas, f-strings and literals.
+  - `stmt_table.rs` (73) covers bindings, assignments, control flow, the
+    declarations, decorators and imports.
+  - `type_table.rs` (25) and `pattern_table.rs` (21) cover every annotation
+    and pattern form.
+  - `refusal_table.rs` (50) pins the first diagnostic for one malformed line,
+    and whether the statement after it still parses. Twelve cases swallow
+    the next line today; they are marked, so a recovery fix flips one entry
+    rather than breaking a pinned cascade.
+  - `docs/architecture/frontend.md` describes the tables and adds them to
+    the new-statement and new-operator recipes.
+
 - **The fused adjoint elementwise-chain kernel is built as KIR by
   `nsl_codegen::ew_chain_ptx`** in place of `fusion::synthesize_fused_chain_ptx`'s
   hand-written PTX (new-roadmap item 5). This is the MFU campaign C3
