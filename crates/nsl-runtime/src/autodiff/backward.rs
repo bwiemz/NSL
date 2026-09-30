@@ -840,7 +840,7 @@ fn rmsnorm_backward(grad_ptr: i64, input_ptr: i64, rms_ptr: i64, weight_ptr: i64
 /// Dropout backward: grad_input = grad_output * mask * scale
 fn dropout_backward(grad_ptr: i64, mask_ptr: i64, scale: f64) -> i64 {
     let grad = NslTensor::from_ptr(grad_ptr);
-    let mask = NslTensor::from_ptr(mask_ptr); // always f64
+    let mask = NslTensor::from_ptr(mask_ptr); // read by tag below: f64 on CPU, f32 after a download
 
     // Device memory: transfer to CPU, compute, transfer back
     #[cfg(feature = "cuda")]
