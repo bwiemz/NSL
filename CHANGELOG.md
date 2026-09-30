@@ -52,6 +52,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   - `fused_ew_ptx_pin.rs` now pins the `sm_70` header in place of the
     `sm_80` clamp.
 
+- **The strided batched matmul is built by `nsl_kir::kernels::bmm`** in
+  place of its hand-written constant (new-roadmap item 5): `nsl_bmm_f32`,
+  every batch slice (`%ctaid.z`) of `C = A · B` in one launch of 16×16
+  blocks, with stride-0 broadcasting. It was the last hand-written kernel in
+  `cuda/fused_kernels.rs` other than the deliberately kept scatter-add.
+  - **The kernel** keeps the hand kernel's bounds (`row`, then `col`, then the
+    batch) and its `Σ_k` from `+0` in `k` order by explicit `fma.rn`. The
+    `k` loop walks `A`'s row and `B`'s column by pointer where the hand kernel
+    formed `row · K + k` and `k · N + col` on every trip; ptxas reduced
+    those to the same walk.
+  - **The CTA interpreter** models `%ctaid.z`, read from the launch's args
+    under the key `%ctaid.z` (0 when absent), so no other gate changes.
+  - **The gate,** `bmm_kir_equivalence` (5 tests), runs the frozen hand
+    module (`tests/fixtures/bmm_hand.rs`) and the KIR one over whole
+    three-dimensional grids with a spare block along every axis, on 16×16,
+    8×4 and 4×8 blocks, under all four thread schedules and both block
+    orders: one block and several along both axes, `K = 0`, and broadcasts of
+    `A`, `B` and both. The two leave the same bytes and match the restated
+    product. A sweep mutates every comparison, integer operation, constant,
+    element size, special register (each grid or block axis read as
+    another) and the `fma` (operands, dropped, split); every mutant parses
+    and is killed.
+  - **SASS** (sm_80/90/120): the same 16 `LDG`, one `STG` and 8 `FFMA` as the
+    hand kernel, in 32/30/28 registers against 32/30/32 and 160/176/152
+    instructions against 216/224/200.
+
 - **The GEMM-chunked fused linear-CE's chunk kernels are built by
   `nsl_kir::kernels::lce_chunk`** in place of their hand-written constants
   (new-roadmap item 5): `nsl_lce_chunk_stats_f32`, one 256-thread block per
