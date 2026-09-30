@@ -10,7 +10,7 @@ expectation. Beta features work but may change. Experimental features are
 research vehicles: they may change shape, regress, or be removed between
 releases, and they are not part of the green-build contract.
 
-Last reviewed against: `main` @ 3a5b1654 (2026-09-30), the new-roadmap
+Last reviewed against: `main` @ bba1b564 (2026-09-30), the new-roadmap
 item-11 reconciliation after the KIR (A2) and per-device context (A4)
 campaigns. No subsystem changed tier; the rows below record what those
 campaigns and the refusals of September changed inside a tier, and what is
@@ -90,17 +90,16 @@ edges and occasional API churn.
   cross-vendor guarantee.
   - **Kernels (roadmap A2).** The runtime's own kernels — the elementwise,
     activation, reduction, norm, softmax, loss, optimizer-step, sparse,
-    embedding, dequantization, pooling, convolution and data-movement
-    families, the CFIE inference kernels, and the fused linear-CE and
-    CPKD losses — are built from KernelIR, not hand-written PTX. Each was
-    proved against its frozen hand-written predecessor on the CTA
-    interpreter, with a mutation sweep and a `ptxas` gate. The hand-PTX
+    embedding, dequantization, pooling, convolution, batched-matmul and
+    data-movement families, the CFIE inference kernels, and the fused
+    linear-CE and CPKD losses — are built from KernelIR, not hand-written
+    PTX. Each was proved against its frozen hand-written predecessor on the
+    CTA interpreter, with a mutation sweep and a `ptxas` gate. The hand-PTX
     set (`ci/hand-ptx-manifest.txt`, frozen at 71 files on 2026-09-02) is
     56 files, among them the flash-attention v1/v2 and CSHA tier
     emitters, the MMA fragment primitives, BitNet, WRGA, PCA, MoE, the
     Hopper FA3 template, the `@fuse` emitter, and `fused_kernels.rs`'s
-    last constants (a kept scatter kernel and, until #792 lands, the
-    batched matmul).
+    one kept scatter kernel.
   - **Per-device context (roadmap A4).** Streams, workspaces, cuBLAS
     handles, device caches, the slab and transient arena, the caching
     allocator, capture state and the placement channel are per device or

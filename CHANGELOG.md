@@ -2072,7 +2072,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
-- **`STATUS.md` reviewed against `main` @ 3a5b1654** (new-roadmap item 11,
+- **`STATUS.md` reviewed against `main` @ bba1b564** (new-roadmap item 11,
   after the KIR and per-device context campaigns). No subsystem changes
   tier.
   - **CUDA row:** it now states which runtime kernels are KernelIR and how
