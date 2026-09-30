@@ -10,11 +10,15 @@ expectation. Beta features work but may change. Experimental features are
 research vehicles: they may change shape, regress, or be removed between
 releases, and they are not part of the green-build contract.
 
-Last reviewed against: `main` @ v0.10.0 (2026-09-06, the roadmap D5 release
-cut). The tier table is unchanged since the item-19 reconciliation of
-2026-08-25; the only edit since is the hand-PTX freeze note (2026-09-02).
-v0.10.0 is the first tag since v0.9.0 (2026-03-19); no v0.9.1 was ever
-tagged. Releases are monthly from here, each with a review of this file.
+Last reviewed against: `main` @ bba1b564 (2026-09-30), the new-roadmap
+item-11 reconciliation after the KIR (A2) and per-device context (A4)
+campaigns. No subsystem changed tier; the rows below record what those
+campaigns and the refusals of September changed inside a tier, and what is
+still unproven on hardware. The previous review was the v0.10.0 release cut
+(2026-09-06, roadmap D5), itself unchanged since the item-19 reconciliation
+of 2026-08-25. v0.10.0 is the first tag since v0.9.0 (2026-03-19); no
+v0.9.1 was ever tagged. Releases are monthly from here, each with a review
+of this file.
 If you change a subsystem's maturity, update this file in the same PR.
 
 ---
@@ -48,7 +52,11 @@ The boring, must-always-work core.
 - **Operator fusion** — automatic elementwise-chain fusion (M31). The
   elementwise-chain core is the stable part; broader graph-rewrite integration
   is still uneven (see `docs/summaries/06-implementation-status.md`) and is
-  NOT covered by the stable contract.
+  NOT covered by the stable contract. A `@fuse` chain executes through the
+  runtime's fused elementwise ops (`nsl_fused_elementwise_N`); the PTX
+  `fusion::synthesize_fused_ptx` builds for it is not loaded. The training
+  backward's adjoint-chain fusion (MFU C3, `ew_chain_fusion`) is a separate
+  source-AD peephole and rides the Beta Autodiff/CUDA rows.
 - **DataLoader** — zero-copy mmap tokenized-data loading (M19).
 - **CLI** — `nsl check`, `nsl run`, `nsl build`, `nsl fmt`, `nsl test` carry
   the stability promise. The full shipped surface is larger (`export, convert,
@@ -80,17 +88,51 @@ edges and occasional API churn.
 - **CUDA / PTX backend** — native GPU codegen and kernel launch. Validated on
   specific hardware (see [`docs/hardware/`](docs/hardware/)); not yet a
   cross-vendor guarantee.
+  - **Kernels (roadmap A2).** The runtime's own kernels — the elementwise,
+    activation, reduction, norm, softmax, loss, optimizer-step, sparse,
+    embedding, dequantization, pooling, convolution, batched-matmul and
+    data-movement families, the CFIE inference kernels, and the fused
+    linear-CE and CPKD losses — are built from KernelIR, not hand-written
+    PTX. Each was proved against its frozen hand-written predecessor on the
+    CTA interpreter, with a mutation sweep and a `ptxas` gate. The hand-PTX
+    set (`ci/hand-ptx-manifest.txt`, frozen at 71 files on 2026-09-02) is
+    56 files, among them the flash-attention v1/v2 and CSHA tier
+    emitters, the MMA fragment primitives, BitNet, WRGA, PCA, MoE, the
+    Hopper FA3 template, the `@fuse` emitter, and `fused_kernels.rs`'s
+    one kept scatter kernel.
+  - **Per-device context (roadmap A4).** Streams, workspaces, cuBLAS
+    handles, device caches, the slab and transient arena, the caching
+    allocator, capture state and the placement channel are per device or
+    per (thread, device) (`CudaContext`). Only single-device execution is
+    exercised; switching devices in one process (A4 step 5) is not done
+    and waits for hardware to validate it.
+  - **Not re-certified on hardware since 2026-09-18.** The self-hosted GPU
+    runner is offline, so the September kernel migrations are validated
+    on the interpreter and by `ptxas`, not by the LOCAL certification lane
+    (`scripts/gpu-tier.sh`). The packed fused-attention Stage-C GPU gate
+    waits on the same hardware.
 - **Autodiff** — tape-based reverse-mode AD (default) and `--source-ad`
   compile-time lowering. Source AD REFUSES what it cannot lower soundly
   (unresolved dropout probability, unresolved Input leaves) rather than
   falling back silently; `distill` refuses the tape fallback outright.
   Dropout under source AD carries the exact forward mask (P0 fix, 2026-08).
+  `.to(f32 | f64 | fp16 | bf16)` converts (and its gradient converts back);
+  it used to return its input. The rest of the CPU/GPU dtype-semantics
+  redesign (a tensor's dtype tag surviving device transfer) is in
+  progress and is a pre-1.0 item.
 - **Training DSL** — `train` blocks, optimizers, LR schedulers. The config
   namespace is CLOSED (unknown/duplicate/non-literal keys are compile errors
   — the Training Configuration Contract), and training state is resumable:
   the `.optim` sidecar v2 restores optimizer moments, data position, and every
   RNG stream, refusing on corpus/geometry drift (item 8).
+  `Adam(weight_decay=..)` / `Adam(no_decay=..)` are refused (use AdamW):
+  NSL never implemented coupled decay, and the knob meant different things
+  on different update paths.
 - **Quantization** — FP8, BitNet, AWQ/GPTQ precision tiering (`quantization`).
+  Requests that were accepted and never honoured are refused: `nsl build`'s
+  calibration flags, a `quant` block's `calibration:` section and its
+  `awq4`/`gptq*` defaults, `@quantize` arguments other than `dtype =
+  "awq4"`, and `@fp8_compute(calibrate = true)`.
 - **FlashAttention** — codegen path and selector (`analysis`).
 - **C ABI / shared-library export** — `nsl_model_*` C API and generated headers
   (M62), including the DLPack output-ownership models `nsl_model_call_into` /
@@ -102,9 +144,8 @@ edges and occasional API churn.
   stderr stays byte-identical.
 - **Pretokenization pipeline** — two-stage BPE tokenizers of record
   (`models/tokenizers/`) and the headerless u16 corpus format
-  (`load_mmap(path, 3)`). The fast byte-domain encoder (`tokbench --backend
-  fast`, same-token parity gated; items 15/16) is in review in PRs #527/#528
-  and joins this row when they merge.
+  (`load_mmap(path, 3)`), and the fast byte-domain encoder (`tokbench
+  --backend fast`, same-token parity gated; items 15/16, #527/#528).
 
 ---
 
