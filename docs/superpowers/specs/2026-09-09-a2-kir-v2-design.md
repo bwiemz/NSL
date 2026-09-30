@@ -1422,6 +1422,44 @@ frozen throughout, so nothing here blocks a kernel fix.
         `FADD`. Registers are 28/30/24 and 24/26/20 against 22/26/24 and
         22/24/22, all at or under 32, so occupancy at 256 threads is
         unchanged.
+    - **`fused_kernels.rs`, the fused RMSNorm input-gradient backward.**
+      `nsl_rmsnorm_dx_bwd_f32` and its residual-folding twin
+      `nsl_rmsnorm_dx_bwd_add_f32` are in `nsl_kir::kernels::rmsnorm_dx`,
+      one 256-thread block per row. Each thread accumulates `S1 = Σ x²` and
+      `S2 = Σ (dy · γ) · x` with the hand kernel's explicit `fma.rn`; thread
+      0 folds both partials in one in-order loop and stores `rinv =
+      min(rsqrt(S1 / cols + eps), 1e12)` (the CPU and tape-AD underflow
+      guard) and `S2`; then `dx = (γ · dy) · rinv - x · ((rinv · rinv) ·
+      rinv) · S2 / cols`, plus `res` for the twin. Every other add, subtract
+      and multiply is `.rn`: ptxas fused the hand kernels' `S1 / cols + eps`
+      and `(γ · dy) · rinv - …` (the multiply by `rinv` into the
+      subtraction) into `FFMA`, and the KIR kernels round twice, as
+      the PTX and the CPU reference do. The entry caps registers at 32
+      (`.maxnreg`): left alone, ptxas gave the plain kernel 35–36 where the
+      hand kernel had 32, which would drop a 256-thread block from 64 warps
+      to 48 on sm_80 and sm_90. At 32 nothing spills.
+      - **The gate,** `rmsnorm_dx_kir_equivalence`, launches one block per
+        row plus one past the last, with shared memory poisoned, under all
+        four thread schedules. Rows are 0, 1, 255, 256, 257, 300, 700 and
+        40 columns wide, with order-sensitive sums, a constant row, a NaN,
+        `+inf`, squares that overflow, and zero and tiny rows at `eps = 0`
+        whose `rsqrt` the clamp holds. It requires the hand kernels' bytes
+        and the restated passes, bit for bit. It kills mutants of the row
+        bound, both column loops' bounds and strides, the fold's start,
+        bound and step, the thread-0 test, both barriers, the row base, the
+        second region's offset, every element size and 64-bit add, both
+        `fma`s (dropped, or without their accumulate), every add, subtract
+        and multiply (flipped and dropped), both `div.approx`, the `rsqrt`,
+        the clamp (flipped and dropped) and each identity. Named equivalent
+        mutants: the write pass striding by 128 (a pure map), and each
+        sum's identity as `-0` (a `-0` partial survives only in a zero sum,
+        which multiplies an `x` of zero).
+      - **SASS** (sm_80/90/120): the same 27/28 `LDG`, one `STG`, 18 `LDS`,
+        4 `STS`, `BAR` and `MUFU` as the hand kernels, and the same
+        unrolling. The hand kernels' 18 `FFMA` are the explicit `fma`s' 16
+        and 2 contractions; the KIR kernels have the 16, and the 2 are
+        `FMUL` + `FADD`. Registers are 32/29/32 and 29/30/30 against
+        32/32/34.
     - **`fused_kernels.rs`, the 2-D max pooling forward.**
       `nsl_maxpool2d_f32` is in `nsl_kir::kernels::maxpool`, a thread per
       output element. It splits the flat index with `rem`/`div` into `(n,
