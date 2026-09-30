@@ -1633,6 +1633,46 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- Mutation audit, slice 6 (roadmap item 5): **three gradient gates could not
+  see a gradient's size.** Every mutant below was planted and run against the
+  gate before and after; evidence in
+  `.claude/campaign-evidence/mutation-audit-slice6/`.
+  - **RMSNorm dx and dgamma** (`rmsnorm_dx_parity_gate`, all three lowerings:
+    tape, source-AD decomposition, fused op).
+    - **Why it was blind:** the fixture regressed `rmsnorm(x @ w)` onto
+      `y = 0`, and RMSNorm fixes each row's norm, so the loss hardly depended
+      on `w` (dL/dw about 1e-5). It trained with AdamW, which steps by
+      `lr · sign(grad)`, and the three lowerings were compared only with each
+      other at 2e-3.
+    - **Before:** 8 of 9 mutants survived. They doubled dx or dgamma in each
+      lowering, took dgamma's mean in place of its sum, or doubled
+      `mse_loss`.
+    - **Now:** the target is non-uniform and the optimizer is SGD. Every
+      lowering is held to an f64 reference trajectory whose gradients are
+      central differences of the forward. They land within 1e-6, against a
+      1e-5 tolerance, and all 10 mutants fail.
+    - The GPU leg's fixture rewrites now assert that they fired: its anchor
+      was the old `y`, and a stale anchor would have left the run on the host.
+  - **Cross-entropy and embedding backwards**
+    (`nsl_cross_entropy_backward`, `nsl_embedding_backward`).
+    - **Before:** their only CPU guard was the tape × loader AD differential:
+      AdamW loss streams under `grad_clip = 1.0`, with no ignored labels. A CE
+      gradient doubled in either dtype branch, a dropped upstream gradient, and
+      dividing by the row count instead of the valid-row count all passed it.
+    - **Now:** two unit gates compare the backwards with the gradients of the
+      functions they differentiate. For CE that is central differences with
+      two ignored rows and an upstream gradient of 0.7, in f32 and f64. For
+      the embedding it is a scatter-add with repeated indices. Every mutant
+      fails.
+  - **Muon's Nesterov combine** (`muon_orthogonalize_matches_reference`).
+    - **Before:** the step pin fed both steps the same gradient. Every
+      candidate update was then a multiple of it and Newton-Schulz normalizes
+      the scale away, so `update = m`, `= gradient` and `= gradient + m` all
+      passed.
+    - **Now:** the second step takes a nearly orthogonal gradient (cosine
+      0.10), and the tolerance goes from 1e-4 to 1e-5 (measured noise 1.2e-6).
+      All three mutants fail.
+
 - Mutation audit, slice 2 (roadmap item 5): **Lion's decoupled weight decay
   was untested.** Neither Lion fixture sets `weight_decay`, so `lion_step`'s
   `if weight_decay > 0.0` branch never ran under any gate: dropping `lr` from

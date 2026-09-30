@@ -2253,6 +2253,114 @@ mod tests {
             nsl_tensor_free(p);
         }
     }
+
+    // ── Audit slice 6: CE and embedding backwards against their definitions ──
+    //
+    // `nsl_cross_entropy_backward` and `nsl_embedding_backward` were guarded on
+    // the CPU only through `tape_dataloader_train_gate.rs`: two AD modes'
+    // AdamW loss streams compared with each other under `grad_clip = 1.0`.
+    // AdamW steps by `lr * sign(grad)` and a clip rescales to a fixed norm, so
+    // a gradient off by any positive factor left the stream unchanged, and the
+    // fixture has no ignored labels, so the `num_valid` denominator was never
+    // distinguished from the row count. These hold each backward to the
+    // gradient of the loss it differentiates.
+
+    /// A CPU tensor of `shape` and `dtype` holding `vals`.
+    fn cpu_tensor(shape: &[i64], dtype: u16, vals: &[f64]) -> i64 {
+        let ptr = create_tensor_with_shape_rs_dtype(shape, dtype);
+        let t = NslTensor::from_ptr(ptr);
+        assert_eq!(t.len as usize, vals.len());
+        for (i, &v) in vals.iter().enumerate() {
+            t.write_scalar_from_f64(i, v);
+        }
+        ptr
+    }
+
+    fn read_all(ptr: i64) -> Vec<f64> {
+        let t = NslTensor::from_ptr(ptr);
+        (0..t.len as usize).map(|i| t.read_scalar_as_f64(i)).collect()
+    }
+
+    /// `go * mean over non-ignored rows of (logsumexp(z_i) - z_i[t_i])`, the
+    /// loss `cross_entropy` computes, differentiated by central differences
+    /// in f64. Two of five rows are ignored (target -100) and the upstream
+    /// gradient is 0.7, so dividing by the row count instead of the valid
+    /// count, dropping `go`, or scaling by any factor misses by >= 30%.
+    #[test]
+    fn cross_entropy_backward_is_the_gradient_of_the_mean_over_valid_rows() {
+        const N: usize = 5;
+        const C: usize = 4;
+        let targets = [2.0, -100.0, 0.0, 3.0, -100.0];
+        let go = 0.7;
+        let logits: Vec<f64> = (0..N * C).map(|i| ((i * 7919) % 23) as f64 * 0.13 - 1.4).collect();
+        let loss = |z: &[f64]| -> f64 {
+            let (mut sum, mut valid) = (0.0, 0usize);
+            for (i, &t) in targets.iter().enumerate() {
+                if t < 0.0 {
+                    continue;
+                }
+                let row = &z[i * C..(i + 1) * C];
+                let m = row.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let lse = m + row.iter().map(|v| (v - m).exp()).sum::<f64>().ln();
+                sum += lse - row[t as usize];
+                valid += 1;
+            }
+            go * sum / valid as f64
+        };
+        let want: Vec<f64> = (0..N * C)
+            .map(|i| {
+                let (mut up, mut down) = (logits.clone(), logits.clone());
+                up[i] += 1e-6;
+                down[i] -= 1e-6;
+                (loss(&up) - loss(&down)) / 2e-6
+            })
+            .collect();
+
+        // Both dtype branches of the CPU backward: f64 to f64 accuracy, f32
+        // to f32 accuracy.
+        for (dtype, tol) in [(0u16, 1e-9), (1u16, 1e-6)] {
+            let z = cpu_tensor(&[N as i64, C as i64], dtype, &logits);
+            let t = cpu_tensor(&[N as i64], dtype, &targets);
+            let g = cpu_tensor(&[1], dtype, &[go]);
+            let got = read_all(nsl_cross_entropy_backward(g, z, t));
+            assert_eq!(got.len(), N * C);
+            for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+                if targets[i / C] < 0.0 {
+                    assert_eq!(*a, 0.0, "dtype {dtype}: ignored row {} must be exactly zero, got {a}", i / C);
+                } else {
+                    assert!((a - b).abs() < tol, "dtype {dtype}: d/dz[{i}] = {a}, want {b} (|Δ|={:.2e})", (a - b).abs());
+                }
+            }
+        }
+    }
+
+    /// `d/dW` of `sum(out * G)` where `out[i] = W[idx[i]]` is the scatter-add
+    /// of G's rows by index. Indices repeat (row 4 three times) and skip rows,
+    /// so an overwrite in place of an add, a dropped repeat or a row written
+    /// to the wrong index all miss.
+    #[test]
+    fn embedding_backward_scatter_adds_gradient_rows_by_index() {
+        const V: usize = 6;
+        const E: usize = 3;
+        let idx = [4.0, 1.0, 4.0, 0.0, 4.0];
+        let grad: Vec<f64> = (0..idx.len() * E).map(|i| (i as f64 + 1.0) * 0.25 - 1.5).collect();
+        let mut want = vec![0.0; V * E];
+        for (i, &tok) in idx.iter().enumerate() {
+            for e in 0..E {
+                want[tok as usize * E + e] += grad[i * E + e];
+            }
+        }
+        for dtype in [0u16, 1u16] {
+            let g = cpu_tensor(&[idx.len() as i64, E as i64], dtype, &grad);
+            let ix = cpu_tensor(&[idx.len() as i64], dtype, &idx);
+            let w = cpu_tensor(&[V as i64, E as i64], dtype, &vec![0.0; V * E]);
+            let got = read_all(nsl_embedding_backward(g, ix, w));
+            assert_eq!(got.len(), V * E);
+            for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+                assert!((a - b).abs() < 1e-6, "dtype {dtype}: dW[{}][{}] = {a}, want {b}", i / E, i % E);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

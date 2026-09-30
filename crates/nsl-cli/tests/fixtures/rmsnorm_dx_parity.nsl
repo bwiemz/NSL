@@ -4,6 +4,14 @@
 # mean-subtracts) for RMSNorm — wrong. This fixture prints the final `w` so the
 # gate can assert source-AD now matches the tape-AD reference (tolerance, f32).
 # Non-uniform w/x so the LayerNorm-vs-RMSNorm difference is not masked.
+#
+# The target is non-uniform and the optimizer is plain SGD (audit slice 6).
+# With `y = 0` the loss was about mean(g^2) whatever w is, since RMSNorm fixes
+# each row's norm: dL/dw started near 1e-5. And AdamW moves every weight by
+# lr * sign(grad) on its first step, so the old gate compared gradient SIGNS: a
+# dgamma or dx off by any positive factor passed. SGD makes the trained values
+# a function of the gradients' size, and the gate holds every lowering to an
+# f64 reference trajectory computed in the test.
 from nsl.nn.losses import mse_loss
 
 model M:
@@ -16,10 +24,10 @@ model M:
 
 let m = M()
 let x = (arange(8).reshape([2, 4])) * 0.1 + full([2, 4], 0.1)
-let y = zeros([2, 4])
+let y = (arange(8).reshape([2, 4])) * 0.3 - full([2, 4], 1.0)
 
 train(model=m, epochs=6, grad_accumulation=1):
-    optimizer: AdamW(lr=0.01, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.0)
+    optimizer: SGD(lr=0.1)
     step(batch):
         let pred = m.forward(x)
         let loss = mse_loss(pred, y)
