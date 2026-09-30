@@ -4,8 +4,13 @@
 //! (which subtracts the per-row mean) — wrong for RMSNorm, which does not
 //! mean-subtract. An upstream weight whose gradient flows through the norm was
 //! therefore trained on a wrong direction. This gate trains the same model both
-//! ways and asserts the final weights agree to an f32 tolerance (tape-AD is the
-//! independent reference; it uses the fused `rmsnorm_backward`).
+//! ways and asserts the final weights agree to an f32 tolerance.
+//!
+//! Audit slice 6: every lowering is also held to [`reference`], the fixture's
+//! training run in f64 with gradients taken by central differences of the
+//! forward. The lowerings used to be compared only with each other, under
+//! AdamW (which steps by `lr * sign(grad)`), at 2e-3: a dx or dgamma off by
+//! any positive factor, or wrong the same way in every lowering, passed.
 
 use std::process::Command;
 
@@ -60,10 +65,79 @@ fn parse_between(stdout: &str, begin: &str, end: &str) -> Vec<f64> {
         .collect()
 }
 
+/// The fixture's SGD run in f64: `(w, g)` after its six steps. Gradients are
+/// central differences of the forward (`h = x @ w`, RMSNorm with gain `g` and
+/// eps 1e-5, `mean((pred - y)^2)`), so no backward formula is shared with the
+/// code under test.
+fn reference() -> (Vec<f64>, Vec<f64>) {
+    const LR: f64 = 0.1;
+    const STEPS: usize = 6;
+    let x = |r: usize, c: usize| (4 * r + c) as f64 * 0.1 + 0.1;
+    let y = |r: usize, c: usize| (4 * r + c) as f64 * 0.3 - 1.0;
+    // params[0..16] = w (row-major 4x4), params[16..20] = g.
+    let loss = |p: &[f64]| -> f64 {
+        let mut total = 0.0;
+        for r in 0..2 {
+            let h: Vec<f64> = (0..4).map(|j| (0..4).map(|k| x(r, k) * p[4 * k + j]).sum()).collect();
+            let rms = (h.iter().map(|v| v * v).sum::<f64>() / 4.0 + 1e-5).sqrt();
+            for j in 0..4 {
+                let d = h[j] / rms * p[16 + j] - y(r, j);
+                total += d * d;
+            }
+        }
+        total / 8.0
+    };
+    let mut p: Vec<f64> = (0..16).map(|i| i as f64 * 0.05).chain([1.0; 4]).collect();
+    for _ in 0..STEPS {
+        let grad: Vec<f64> = (0..p.len())
+            .map(|i| {
+                let (mut up, mut down) = (p.clone(), p.clone());
+                up[i] += 1e-6;
+                down[i] -= 1e-6;
+                (loss(&up) - loss(&down)) / 2e-6
+            })
+            .collect();
+        for (v, g) in p.iter_mut().zip(&grad) {
+            *v -= LR * g;
+        }
+    }
+    (p[..16].to_vec(), p[16..].to_vec())
+}
+
+/// The trained values of one lowering against [`reference`]. f32 training
+/// over six steps lands within about 1e-6; a gradient off by 10% lands at
+/// least ~1e-3 away.
+fn assert_matches_reference(label: &str, w: &[f64], g: &[f64]) {
+    const TOL: f64 = 1e-5;
+    let (rw, rg) = reference();
+    assert_eq!((w.len(), g.len()), (16, 4), "{label}: expected 16 weights and 4 gains");
+    let worst = w.iter().zip(&rw).chain(g.iter().zip(&rg)).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+    eprintln!("{label}: max |Δ| from the f64 reference {worst:.2e} (tolerance {TOL:.0e})");
+    for (i, (a, b)) in w.iter().zip(&rw).enumerate() {
+        assert!((a - b).abs() < TOL, "{label}: w[{i}]={a} vs f64 reference {b} (|Δ|={:.2e})", (a - b).abs());
+    }
+    for (i, (a, b)) in g.iter().zip(&rg).enumerate() {
+        assert!((a - b).abs() < TOL, "{label}: g[{i}]={a} vs f64 reference {b} (|Δ|={:.2e})", (a - b).abs());
+    }
+}
+
+/// The reference is not vacuous: both parameter groups travel far beyond the
+/// tolerance, so a wrong gradient cannot hide inside it.
+#[test]
+fn the_reference_trajectory_moves_both_parameter_groups() {
+    let (w, g) = reference();
+    let w_move = w.iter().enumerate().map(|(i, v)| (v - i as f64 * 0.05).abs()).fold(0.0, f64::max);
+    let g_move = g.iter().map(|v| (v - 1.0).abs()).fold(0.0, f64::max);
+    assert!(w_move > 0.05 && g_move > 0.1, "reference barely moves: |Δw| {w_move}, |Δg| {g_move}");
+}
+
 #[test]
 fn source_ad_rmsnorm_dx_matches_tape_ad() {
-    let sa = parse_w(&run(true));
-    let tape = parse_w(&run(false));
+    let (sa_out, tape_out) = (run(true), run(false));
+    assert_matches_reference("source-AD", &parse_w(&sa_out), &parse_g(&sa_out));
+    assert_matches_reference("tape-AD", &parse_w(&tape_out), &parse_g(&tape_out));
+    let sa = parse_w(&sa_out);
+    let tape = parse_w(&tape_out);
     assert_eq!(sa.len(), 16, "expected 16 weight values, got {}", sa.len());
     assert_eq!(tape.len(), 16, "tape produced {} values", tape.len());
     // The weight moved off its init (arange*0.05) — dx is a real, nonzero grad.
@@ -91,6 +165,7 @@ fn fused_rmsnorm_dx_matches_decomposition_and_tape_ad() {
     let fused_out = run_args(&["--source-ad", "--fuse-rmsnorm-backward"]);
     let decomp_out = run(true);
     let tape_out = run(false);
+    assert_matches_reference("fused", &parse_w(&fused_out), &parse_g(&fused_out));
     let fused = parse_w(&fused_out);
     let decomp = parse_w(&decomp_out);
     let tape = parse_w(&tape_out);
@@ -144,17 +219,20 @@ fn fused_rmsnorm_gamma_backward_gpu_matches_reference() {
         root.join("crates/nsl-cli/tests/fixtures/rmsnorm_dx_parity.nsl"),
     )
     .unwrap();
-    // Device placement: model + inputs on cuda.
-    src = src.replace("let m = M()", "let m = M()
-m.to(cuda)");
-    src = src.replace(
-        "let y = zeros([2, 4])",
-        "let y = zeros([2, 4])
-let xg = x.to(cuda)
-let yg = y.to(cuda)",
+    // Device placement: model + inputs on cuda. Each rewrite must fire once:
+    // a stale anchor would leave the inputs on the host and the run on CPU.
+    let replace_once = |src: String, from: &str, to: &str| {
+        assert_eq!(src.matches(from).count(), 1, "fixture rewrite anchor `{from}` must occur once");
+        src.replacen(from, to, 1)
+    };
+    src = replace_once(src, "let m = M()", "let m = M()\nm.to(cuda)");
+    src = replace_once(
+        src,
+        "let y = (arange(8).reshape([2, 4])) * 0.3 - full([2, 4], 1.0)",
+        "let y = (arange(8).reshape([2, 4])) * 0.3 - full([2, 4], 1.0)\nlet xg = x.to(cuda)\nlet yg = y.to(cuda)",
     );
-    src = src.replace("m.forward(x)", "m.forward(xg)");
-    src = src.replace("mse_loss(pred, y)", "mse_loss(pred, yg)");
+    src = replace_once(src, "m.forward(x)", "m.forward(xg)");
+    src = replace_once(src, "mse_loss(pred, y)", "mse_loss(pred, yg)");
     let prog = tmp.join("prog.nsl");
     std::fs::write(&prog, src).unwrap();
 
@@ -185,6 +263,7 @@ let yg = y.to(cuda)",
 
     let tape = run(false); // CPU tape-AD reference
     let (wg, gg) = (parse_w(&out1), parse_g(&out1));
+    assert_matches_reference("GPU fused", &wg, &gg);
     let (wt, gt) = (parse_w(&tape), parse_g(&tape));
     assert_eq!(wg.len(), 16);
     assert_eq!(gg.len(), 4);
