@@ -8,6 +8,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **A silicon gate for the packed (Stage C) fused attention, forward and
+  backward, against f64 oracles across KV tiles** (roadmap item 3,
+  `crates/nsl-codegen/tests/sdpa_fused_packed_gpu_parity.rs`). The packed
+  path's only silicon evidence was a one-epoch training run at seq 64 (one KV
+  tile, 8 optimizer steps), fused against decomposed, checkpoint-compared at
+  2e-2. Every GPU gate of the classic backward ran unmasked, against the
+  runtime's own CPU fallback.
+  - **Geometry:** seq 448 (seven 64-wide tiles, not a multiple of 128),
+    2 batches × 2 heads, head_dim 32, 100-token documents at a different
+    phase per row. The PTX and launch parameters are the ones a default
+    packed build embeds, including the Tier-B forward the runtime selects at
+    this length.
+  - **Three gates:**
+    - the forward (base and Tier-B) against the exact output and logsumexp;
+    - the backward, fed the oracle's O and logsumexp, against the exact and
+      f16-operand gradients;
+    - the forward feeding the backward, against the exact gradients, which
+      catches a disagreement between the two about the logsumexp or O.
+  - **Launch proof:** the launch census proves both backward phases ran, since
+    the FFI falls back to the CPU on any refusal, and the fused-launch
+    counters prove which forward variant ran.
+  - **Measured on the RTX PRO 4500 (sm_120), 2026-09-30, all within bounds:**
+    - forward (base and Tier-B): out 4.95e-4 of max |out| (bound 2e-3),
+      logsumexp 6.5e-4 absolute (bound 5e-3);
+    - backward against the f16-operand oracle: dV 8.1e-6 (bound 2e-5), dK
+      1.9e-5 and dQ 1.5e-4 (bound 5e-4); against the exact gradients 1.5e-3,
+      which is within 5e-3 and above the 1e-4 floor;
+    - forward then backward: 1.4e-3 from the exact gradients (bound 1e-2).
+  - `stage_c_packed_parity.rs::packed_fused_matches_decomposed_on_gpu` is now
+    `packed_fused_training_smoke_on_gpu`, documented as the integration
+    smoke it is. The three gates join the hardware-cert bundle.
+
 - **The fused adjoint elementwise-chain kernel is built as KIR by
   `nsl_codegen::ew_chain_ptx`** in place of `fusion::synthesize_fused_chain_ptx`'s
   hand-written PTX (new-roadmap item 5). This is the MFU campaign C3
