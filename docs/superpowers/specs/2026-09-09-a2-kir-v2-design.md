@@ -1538,6 +1538,39 @@ frozen throughout, so nothing here blocks a kernel fix.
         `FFMA`, one `FADD`, branches and six 64-bit `div`/`rem` calls as the
         hand kernel, in 28/30/38 registers against 30/30/36; 38 and 36
         both allocate 40, so occupancy is unchanged.
+    - **`fused_kernels.rs`, the flash-attention log-sum-exp pair.**
+      `nsl_flash_lse_f32` and its native-GQA twin `nsl_flash_lse_gqa_f32`
+      are in `nsl_kir::kernels::flash_lse` (`LseOp::{Mha, Gqa}`), a thread
+      per `(batch, head, query row)`. Both walk the row's keys (`j < qi + 1`
+      when causal) twice: the max of `score = (Σ_d q · k) · scale` from
+      `-inf`, replaced when `score > max` (a `selp`, where the hand kernels
+      predicated a move), then `lse = max + lg2(Σ ex2((score - max) · log2
+      e)) · ln 2`. The GQA twin maps Q head `bh` to kv-head `(bh / heads) ·
+      kv_heads + (bh % heads) / (heads / kv_heads)`. The dot loops walk Q
+      and K by pointer, as the hand kernels did. Every add, subtract and
+      multiply is `.rn`: ptxas contracted the hand kernels' dot-product
+      terms, `score · scale - max` and `lg2 · ln 2 + max` into `FFMA`,
+      against their own comment's intent to mirror the CPU reference; the
+      KIR kernels round twice, as the PTX text and `compute_logsumexp_gqa`
+      do.
+      - **The gate,** `flash_lse_kir_equivalence`, launches whole grids with
+        a spare block on 256- and 32-thread blocks under two schedules,
+        causal and not, over one to eight Q heads per kv-head, head dims of
+        1 to 8, sequences of 1 to 40, full-mantissa data, a NaN row and an
+        `inf` row. It requires the hand kernels' bytes and the restated
+        passes, and kills mutants of every bound, the causal test and its
+        `+ 1`, both `selp`s, the max's comparison (`gt` as `lt`), every
+        `div` and `rem`, every index multiply and add, the loop starts and
+        steps, every element size, the accumulators' starts, every float
+        multiply, add and subtract, the `ex2`, the `lg2`, both constants,
+        and the dot product's and final sum's roundings (fused into an
+        `fma`). Every mutant parses.
+      - **SASS** (sm_80/90/120): the same 32 `LDG`, one `STG`, four `MUFU`,
+        three `FSETP` and the 64-bit `div`/`rem` calls as the hand kernels,
+        with the same unrolling. The hand kernels' 18 `FFMA` (16 unrolled
+        dot-product terms, the scale-and-subtract, the final sum) are as
+        many `FMUL` and `FADD`. Registers are 30/32/35 against 30/32/34; 35
+        and 34 both allocate 40.
     - **`fused_kernels.rs`, the GEMM-chunked fused linear-CE's chunk
       kernels.** `nsl_lce_chunk_stats_f32` and `nsl_lce_chunk_dlogits_f32`
       are in `nsl_kir::kernels::lce_chunk` (`LceChunkOp::{Stats,
