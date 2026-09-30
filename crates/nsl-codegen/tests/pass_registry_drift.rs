@@ -664,6 +664,12 @@ const NOT_A_PASS: &[(&str, &str)] = &[
          reports its own effect (`[fuse] elementwise backward chains: N`, \
          pinned by an exec-marker)",
     ),
+    (
+        "ew_chain_ptx",
+        "KIR kernel builder for `ew_chain_fusion`'s fused chains, called by \
+         `fusion::synthesize_fused_chain_ptx` at lowering — a kernel emitter \
+         like `fused_linear_ce`, not a pass",
+    ),
     ("fusion", "elementwise fusion (M31) - graph/report/driver"),
     ("gpu_spec", "GPU capability tables"),
     ("gpu_target", "GPU target selection"),

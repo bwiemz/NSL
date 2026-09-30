@@ -84,6 +84,7 @@ pub mod dynamic_shapes;
 pub mod error;
 pub mod escape;
 pub mod ew_chain_fusion;
+pub mod ew_chain_ptx;
 pub mod expr;
 pub mod ffi_ownership;
 pub mod func;

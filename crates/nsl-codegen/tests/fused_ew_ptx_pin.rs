@@ -1,8 +1,11 @@
 //! Pin the fused elementwise-chain PTX emitter's load-bearing properties:
 //! `.rn` on every arithmetic instruction (forbids ptxas FMA contraction —
 //! the bit-exactness contract vs the standalone kernels), no `mad.lo.u32`
-//! at ISA 7.0, sm_80 floor, ASCII-only, NUL-terminated, and the
-//! `(out, in0.., n)` param order the runtime launcher marshals against.
+//! at ISA 7.0, the KIR backend's ISA 7.0 / sm_70 header (new-roadmap item
+//! 5; the hand emitter clamped to sm_80, and the driver JIT forward-compiles
+//! either), ASCII-only, NUL-terminated, and the `(out, in0.., n)` param
+//! order the runtime launcher marshals against. The kernel's behaviour is
+//! proved against the frozen hand emitter by `ew_chain_kir_equivalence`.
 
 use nsl_codegen::ew_chain_fusion::{ChainSig, ChainStep, EwOpcode, Operand};
 use nsl_codegen::fusion::synthesize_fused_chain_ptx;
@@ -43,7 +46,7 @@ fn canonical_sig() -> ChainSig {
 
 fn emit(sig: &ChainSig) -> (Vec<u8>, String) {
     let kname = sig.kernel_name();
-    let bytes = synthesize_fused_chain_ptx(sig, &kname, 80);
+    let bytes = synthesize_fused_chain_ptx(sig, &kname);
     let text = std::str::from_utf8(&bytes[..bytes.len() - 1])
         .expect("PTX body is valid UTF-8")
         .to_string();
@@ -94,13 +97,14 @@ fn no_mad_lo_at_isa_7_0() {
 }
 
 #[test]
-fn sm_80_floor_holds() {
+fn header_is_isa_7_0_sm_70() {
     let sig = canonical_sig();
-    let bytes = synthesize_fused_chain_ptx(&sig, "k", 52);
+    let bytes = synthesize_fused_chain_ptx(&sig, "k");
     let text = std::str::from_utf8(&bytes[..bytes.len() - 1]).unwrap();
     assert!(
-        text.contains(".target sm_80"),
-        "requested sm below the floor must clamp to sm_80"
+        text.starts_with(".version 7.0\n.target sm_70\n"),
+        "the chain kernel uses no sm_80 instruction, so the KIR backend's \
+         sm_70 floor holds and every device the runtime supports JITs it"
     );
 }
 
