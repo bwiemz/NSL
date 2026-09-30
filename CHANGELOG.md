@@ -41,6 +41,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
     unrolling; the hand kernels' 18 `FFMA` are as many `FMUL` and `FADD`.
     Registers are 30/32/35 against 30/32/34 (35 and 34 allocate alike).
 
+- **The direct 2-D convolution forward is built by `nsl_kir::kernels::conv2d`**
+  in place of its hand-written constant (new-roadmap item 5):
+  `nsl_conv2d_f32`, a thread per output element over NCHW input and
+  `[C_out, C_in, kH, kW]` weights, with an optional bias.
+  - **The kernel** keeps the hand kernel's walk: the index split by `rem` /
+    `div`, taps in `ci`, `ky`, `kx` order, padding and out-of-range taps
+    skipped, the accumulator from `0` updated by the hand kernel's explicit
+    `fma.rn`, and `bias[co]` added (`add.f32`) when the bias pointer is not
+    null.
+  - **The gate,** `conv2d_kir_equivalence` (8 tests), runs the frozen hand
+    module (`tests/fixtures/conv2d_hand.rs`) and the KIR one over whole
+    grids on 256- and 32-thread blocks, each shape with a bias and with a
+    null one. The two leave the same bytes and match the restated walk,
+    over strides and paddings that differ between the axes, windows wholly
+    in the padding, and full-mantissa data on which a separately rounded
+    multiply and add differ from the `fma`. Mutants of every bound, padding
+    and null test, every `div` and `rem`, every index multiply, add and
+    subtract, the loop starts and steps, the accumulator's start, the
+    `fma`'s addend and its fusion, the bias add and every element size are
+    killed. Swapping the `fma`'s factors is named equivalent.
+  - **SASS** (sm_80/90/120): the same three loads, store, `FFMA`, `FADD`,
+    branches and six 64-bit `div`/`rem` calls as the hand kernel, in
+    28/30/38 registers against 30/30/36 (38 and 36 allocate alike).
+
 - **The 2-D max pooling forward is built by `nsl_kir::kernels::maxpool`** in
   place of its hand-written constant (new-roadmap item 5):
   `nsl_maxpool2d_f32`, a thread per output element that writes the window's
@@ -1501,6 +1525,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   every diagnostic line the toolchain prints is a `tracing` event.
 
 ### Fixed
+
+- Mutation audit, slice 2 (roadmap item 5): **Lion's decoupled weight decay
+  was untested.** Neither Lion fixture sets `weight_decay`, so `lion_step`'s
+  `if weight_decay > 0.0` branch never ran under any gate: dropping `lr` from
+  the decay factor, or flipping its sign, left every Lion gate green.
+  `examples/lion_optimizer_weight_decay_e2e.nsl` takes the branch on every
+  step and pins an exact 8-step trajectory (final `w = 0.534154`, equal in f32
+  and f64 to 5e-9, smallest sign argument 0.0086). Each wrong variant lands at
+  least 0.13 away, and both mutants now fail. The five momentum mutants the
+  existing fixture's comment claims to catch were each planted and confirmed
+  killed, as was a sign-flip control proving the mutants reach the executed
+  path (`nsl_optim_lion__lion_step`).
 
 - **GPU `tanh` returned 0 for large inputs, and the tape-AD GELU gradient
   returned NaN past `x ≈ 10`.**

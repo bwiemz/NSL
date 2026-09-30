@@ -1,0 +1,42 @@
+# Multi-step regression for the stdlib Lion optimizer's decoupled weight decay.
+#
+# `lion_optimizer_momentum_e2e.nsl` sets no `weight_decay`, so `lion_step`'s
+# `if weight_decay > 0.0` branch never runs there: the mutation audit found
+# that dropping `lr` from the decay factor, or flipping its sign, left every
+# Lion gate green. This fixture takes that branch on every step.
+#
+# Same model and loss as the momentum fixture: pred = x @ w = 2w, loss =
+# mean((2w - 1.1)^2), g = 2(2w - 1.1). Lion with decoupled decay:
+#   update = sign(beta1*m + (1-beta1)*g)
+#   w      = w * (1 - lr*wd) - lr*update
+#   m      = beta2*m + (1-beta2)*g
+# With lr = 0.1, wd = 1.0, beta1 = 0.9, beta2 = 0.99, m0 = 0, w0 = 1, the
+# exact trajectory (one step per epoch) is
+#   step: 1    2     3      4       5        6         7         8
+#   w:    0.8  0.62  0.458  0.5122  0.36098  0.424882  0.482394  0.534154
+# It overshoots at step 5, so decay and momentum genuinely interact. Final
+# w = 0.534154, identical in f32 and f64 to 5e-9. Wrong decay lands far away:
+# dropping lr from the factor -> 0.1, flipping its sign -> 1.0, never
+# applying it -> 0.4 (the momentum fixture's answer). The smallest
+# |beta1*m + (1-beta1)*g| along the trajectory is ~0.0086, far above f32
+# noise, so no sign decision is fragile.
+from nsl.nn.losses import mse_loss
+
+model Linear:
+    w: Tensor = ones([2, 1])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+let m = Linear()
+let x = ones([4, 2])
+let y = full([4, 1], 1.1)
+
+train(model = m, epochs = 8):
+    optimizer: Lion(lr = 0.1, beta1 = 0.9, beta2 = 0.99, weight_decay = 1.0)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y)
+
+assert_close(m.w, full([2, 1], 0.534154), 0.0001, 0.0001)
+print("lion-weight-decay-verified")
