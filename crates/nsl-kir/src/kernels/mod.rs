@@ -21,6 +21,7 @@ pub mod embedding_bwd;
 pub mod flash_lse;
 pub mod lce_finalize;
 pub mod lookup;
+pub mod maxpool;
 pub mod muon_batch;
 pub mod norm;
 pub mod optim;

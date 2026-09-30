@@ -63,7 +63,8 @@
 //!
 //! f64 is modelled for accumulation: `0d` immediates, `mov`, `ld` and `st`
 //! of `.f64`, `cvt.f64.f32` (exact), `add(.rn).f64` and `fma.rn.f64` (one
-//! rounding, Rust's `mul_add`). `%nctaid.x` reads [`Launch::nctaid_x`], which
+//! rounding, Rust's `mul_add`). `st` of `.u64`, `.b64` and `.s64` stores
+//! all eight bytes of the register. `%nctaid.x` reads [`Launch::nctaid_x`], which
 //! a gate launching a grid-strided kernel sets; the others leave it 0.
 //!
 //! A `.shared` block may be declared by element (`.shared .f32 NAME[N]`,
@@ -822,12 +823,12 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 let space = if *space == "global" { Space::Global } else { Space::Shared };
                 Op::LdS8 { space, d: p.dst(ops[0]), addr: p.addr(ops[1]) }
             }
-            ["st", space @ ("global" | "shared"), ty @ ("f32" | "u32" | "b32" | "b16" | "u16" | "f64")] => {
+            ["st", space @ ("global" | "shared"), ty @ ("f32" | "u32" | "b32" | "b16" | "u16" | "f64" | "u64" | "b64" | "s64")] => {
                 want(2);
                 let space = if *space == "global" { Space::Global } else { Space::Shared };
                 let bytes = match *ty {
                     "b16" | "u16" => 2,
-                    "f64" => 8,
+                    "f64" | "u64" | "b64" | "s64" => 8,
                     _ => 4,
                 };
                 Op::St { space, bytes, addr: p.addr(ops[0]), v: p.src(ops[1]) }

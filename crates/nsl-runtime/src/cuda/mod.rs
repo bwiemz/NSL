@@ -8842,7 +8842,6 @@ pub(crate) fn gpu_maxpool2d_f32(
     input_ptr: i64, kh: u64, kw: u64, stride: u64, padding: u64,
 ) -> (i64, Vec<u64>) {
     use crate::tensor::NslTensor;
-    use fused_kernels::MAXPOOL2D_F32_PTX;
 
     let input = NslTensor::from_ptr_ref(input_ptr);
     assert_gpu_f32(input, "maxpool2d_f32", "input");
@@ -8897,7 +8896,7 @@ pub(crate) fn gpu_maxpool2d_f32(
     let grid = ((total as i64) + block - 1) / block;
 
     let result = inner::kernel_launch(
-        MAXPOOL2D_F32_PTX.as_ptr(), b"nsl_maxpool2d_f32\0".as_ptr(),
+        fused_kernels::maxpool2d_f32_ptx().as_ptr(), b"nsl_maxpool2d_f32\0".as_ptr(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU maxpool2d kernel failed: {:?}", result);
@@ -10436,6 +10435,7 @@ mod tests {
         all.push(("nsl_csr_spmm_f32", super::fused_kernels::csr_spmm_f32_ptx(), true));
         all.push(("nsl_coo_spmm_f32", super::fused_kernels::coo_spmm_f32_ptx(), true));
         all.push(("nsl_bsr_spmm_f32", super::fused_kernels::bsr_spmm_f32_ptx(), true));
+        all.push(("nsl_maxpool2d_f32", super::fused_kernels::maxpool2d_f32_ptx(), true));
         all.push(("nsl_softmax_f32", super::fused_kernels::softmax_f32_ptx(), true));
         all.push(("nsl_log_softmax_f32", super::fused_kernels::log_softmax_f32_ptx(), true));
         all.push(("nsl_layernorm_f32", super::fused_kernels::layernorm_f32_ptx(), true));
