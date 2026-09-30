@@ -1513,6 +1513,49 @@ frozen throughout, so nothing here blocks a kernel fix.
       - **SASS** (sm_80/90/120): the same one load, two stores, one float
         compare, branches and six 64-bit `div`/`rem` calls as the hand
         kernel, in 28/28/26 registers against 30.
+    - **`fused_kernels.rs`, the GEMM-chunked fused linear-CE's chunk
+      kernels.** `nsl_lce_chunk_stats_f32` and `nsl_lce_chunk_dlogits_f32`
+      are in `nsl_kir::kernels::lce_chunk` (`LceChunkOp::{Stats,
+      Dlogits}`). The stats kernel, a 256-thread block per row, folds `max`
+      and then `Σ ex2((val - m_new) · log2 e)` over the row's chunk columns,
+      combines the partials through one 256-slot shared buffer by thread 0's
+      in-order folds (to the constant 256, as the hand kernel's did), behind
+      the hand kernel's four barriers (the third keeps a thread from
+      overwriting `sdata[0]` before every thread has read `m_new`). Thread 0
+      publishes `m_new = max(m_old, block max)`, then stores `s = fma(s_old,
+      ex2((m_old - m_new) · log2 e), sum)`, `m_new`, and the target logit
+      when `chunk_start <= t < chunk_start + cols` (`s64` compares).
+      `m_old` reaches the second fold as a block parameter of the join
+      after the first (the other threads carry `-inf`), where the hand
+      kernel kept it in a register. The dlogits kernel is grid-strided
+      (`%nctaid.x`); it computes `j = idx - (idx / cols) · cols`, selects
+      the one-hot `- 1` where the hand kernel branched, and adds each `dl`
+      into `dbias` with `red.global.add.f32`. The bias is loaded only behind
+      `has_bias`, as before. Every add, subtract and multiply is `.rn`; none
+      of the hand kernels' pairs could contract. The stats entry caps
+      registers at 32 (`.maxnreg`): left alone ptxas gave it 34 on sm_80
+      against the hand kernel's 32, which would drop a 256-thread block from
+      64 warps to 48. The CTA interpreter now models `cvt.s64.u64` and
+      `cvt.u64.s64` as copies.
+      - **The gate,** `lce_chunk_kir_equivalence`, runs both kernels under
+        all four thread schedules and both block orders with shared memory
+        poisoned: chunks of 1 to 700 columns (a row's max just past one
+        stride) at offsets 0 and past, with and without a bias, fresh and
+        running states (a rescale whose `fma` rounds once where a multiply
+        and an add would round twice), every kind of target, and dlogits
+        grids of the runtime's size, one block and three. It requires the
+        hand kernels' bytes and the restated passes, and sweeps every line
+        of the KIR modules: each comparison flipped, each integer and float
+        operation dropped (an add of a literal step through its literal),
+        each constant nudged, each element size doubled, each barrier
+        dropped, each `selp` swapped, the `fma`'s operands swapped, the
+        `fma` dropped and split, `ex2` dropped, and the atomic add made a
+        store. Every mutant parses and is killed.
+      - **SASS** (sm_80/90/120): the same 37/4 `LDG`, 3/1 `STG`, 129 `LDS`,
+        3 `STS`, 5/5/4 `BAR`, one `RED`, 264 `FMNMX`, 289/3 `FADD`, 27/4
+        `FMUL`, one `FFMA` (the explicit `fma`) and 9/2 `MUFU` as the hand
+        kernels. Registers: stats 32/32/32 against 32/30/34, dlogits
+        22/30/30 against 19/20/22, all at or under 32.
     - **The printer's conditional edges.** A `CondBranch` edge that
       carries block arguments branches to a trampoline printed after the
       last block, which makes the copies and jumps to the target; the

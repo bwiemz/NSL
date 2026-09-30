@@ -18,6 +18,7 @@ pub mod det_sum;
 pub mod dropout;
 pub mod elementwise;
 pub mod embedding_bwd;
+pub mod lce_chunk;
 pub mod lce_finalize;
 pub mod lookup;
 pub mod maxpool;

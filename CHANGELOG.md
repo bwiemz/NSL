@@ -8,6 +8,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **The GEMM-chunked fused linear-CE's chunk kernels are built by
+  `nsl_kir::kernels::lce_chunk`** in place of their hand-written constants
+  (new-roadmap item 5): `nsl_lce_chunk_stats_f32`, one 256-thread block per
+  row folding a logits chunk into the running online-softmax state, and
+  `nsl_lce_chunk_dlogits_f32`, the grid-strided in-place gradient with its
+  atomic bias gradient.
+  - **The kernels** keep the hand kernels' order: the stats kernel's
+    per-thread `max` and `Σ ex2` over columns `tid, tid + 256, …`, thread
+    0's in-order folds to 256 through one shared buffer behind the same four
+    barriers, `m_new = max(m_old, block max)`, `s = fma(s_old, ex2((m_old -
+    m_new) · log2 e), sum)` and the target logit when the target is in the
+    chunk; the gradient's `r = idx / cols`, `j = idx - r · cols`, `(ex2((val
+    - lse) · log2 e) - [t == chunk_start + j]) · scale` (a `selp` where the
+    hand kernel branched) and its `red.global.add.f32` into `dbias`. The
+    bias is read only behind `has_bias`. Every add, subtract and multiply is
+    `.rn`; none of the hand kernels' pairs could contract, so nothing
+    changes.
+  - **The CTA interpreter** models `cvt.s64.u64` and `cvt.u64.s64` (copies).
+  - **Registers:** the stats entry caps them at 32 (`.maxnreg`). Left
+    alone, ptxas gave it 34 on sm_80 where the hand kernel had 32, which
+    would drop a 256-thread block from 64 warps to 48. At 32 nothing spills.
+  - **The gate,** `lce_chunk_kir_equivalence` (6 tests), runs the frozen
+    hand modules (`tests/fixtures/lce_chunk_hand.rs`) and the KIR ones on
+    the CTA interpreter under all four thread schedules and both block
+    orders, with shared memory poisoned: chunks 1 to 700 columns wide at
+    offsets 0 and past, with and without a bias, fresh and running states,
+    targets before, at the start of, inside, at the end of and just past the
+    chunk, negative and `i64::MIN`, and dlogits grids of the runtime's size,
+    one block and three. The two leave the same bytes and match the restated
+    passes. A sweep mutates every comparison, integer and float operation,
+    constant, element size, barrier, `selp`, the `fma` (operands, dropped,
+    split), `ex2` and the atomic add; every mutant parses and is killed.
+  - **SASS** (sm_80/90/120): the same loads, stores, shared-memory traffic,
+    barriers, atomics, `FMNMX`, `FADD`, `FMUL`, `FFMA` and `MUFU` as the hand
+    kernels. Registers: stats 32/32/32 against 32/30/34; dlogits 22/30/30
+    against 19/20/22, all at or under 32.
+
 - **The 2-D max pooling forward is built by `nsl_kir::kernels::maxpool`** in
   place of its hand-written constant (new-roadmap item 5):
   `nsl_maxpool2d_f32`, a thread per output element that writes the window's
