@@ -270,7 +270,7 @@ becomes `if let Some(csla) = &plan.techniques.csla`.
    the way `pass_scheduler_coverage.rs` pins the scheduled set today.
    *Status:* split in two. **4a is done.** `stmt_train/pass_order.rs` is
    the table, 17 steps from the CPDT pre-plan offer to the CSLA
-   precompute. Each step names its stage, the registry passes it
+   precompute (18 since step 5a split the CSHA and prune row). Each step names its stage, the registry passes it
    schedules, its file and the driver call. `tests/train_pass_order.rs` is
    the drift gate:
    - the calls appear in the driver in table order, each defined where the

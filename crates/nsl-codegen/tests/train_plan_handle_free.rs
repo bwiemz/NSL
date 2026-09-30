@@ -51,13 +51,18 @@ fn is_word(line: &str, name: &str) -> bool {
 }
 
 /// The lines of the `impl` method `name` in `src`: from its `fn` line to the
-/// closing brace at the method's four-space indent. `None` if it is absent.
+/// closing brace at the method's four-space indent. `None` if it is absent,
+/// or if that brace is not where the method ends: a nested block closing at
+/// four spaces would stop the scan early and let the rest of the body pass
+/// unread, so the next non-blank line must be back at method level.
 fn method_lines<'a>(src: &'a str, name: &str) -> Option<Vec<(usize, &'a str)>> {
     let sig = format!("fn {name}(");
     let lines: Vec<&str> = src.lines().collect();
     let start = lines.iter().position(|l| l.trim_start().starts_with("pub(crate) fn ") && l.contains(&sig))?;
     let end = (start..lines.len()).find(|&i| lines[i] == "    }")?;
-    Some((start..=end).map(|i| (i, lines[i])).collect())
+    let next = lines[end + 1..].iter().find(|l| !l.trim().is_empty());
+    let at_method_level = next.is_none_or(|l| l.starts_with('}') || (l.starts_with("    ") && !l.starts_with("     ")));
+    at_method_level.then(|| (start..=end).map(|i| (i, lines[i])).collect())
 }
 
 fn handle_offences<'a>(label: &str, lines: impl Iterator<Item = (usize, &'a str)>) -> Vec<String> {
@@ -122,6 +127,9 @@ fn the_scanner_sees_a_handle() {
     assert_eq!(body.len(), 3, "the body ends at the method's closing brace");
     assert_eq!(handle_offences("t", body.into_iter()).len(), 1);
     assert!(method_lines(src, "plan_b").is_none());
+    // A block closing at the method's indent is not the method's end.
+    let early = "impl X {\n    pub(crate) fn plan_c(&self) {\n        if x {\n    }\n        let v: Value = x;\n    }\n}\n";
+    assert!(method_lines(early, "plan_c").is_none(), "an early close must not be taken as the end");
     assert!(is_word("pub(crate) mode_table_base: Option<Value>,", "Value"));
     assert!(!is_word("let values = ValueList::new();", "Value"));
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/stmt_train");
