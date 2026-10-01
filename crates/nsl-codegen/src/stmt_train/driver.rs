@@ -39,11 +39,10 @@ use crate::stmt_train::csla_precompute::CslaPrecomputeInputs;
 use crate::stmt_train::fase_hook_lowering::FaseHookLoweringInputs;
 use crate::stmt_train::forward_lowering::ForwardLoweringInputs;
 use crate::stmt_train::health_hooks::HealthHooksInputs;
-use crate::stmt_train::primal_vars::PrimalVarsInputs;
+use crate::stmt_train::primal_vars::PrimalVarsHandles;
 use crate::stmt_train::scheduler_step::SchedulerStepInputs;
 use crate::stmt_train::source_ad_grads::SourceAdGradsInputs;
 use crate::stmt_train::transient_arena_projection::TransientArenaInputs;
-use crate::stmt_train::plan_csha_prune::CshaPruneInputs;
 use crate::stmt_train::plan_ccr::{PreForwardPlanInputs, PreForwardPlans};
 use crate::stmt_train::plan_wggo::{WggoPlanning, WggoPlanningInputs};
 use crate::stmt_train::plan_wrga_cpdt::WrgaCpdtInputs;
@@ -1201,22 +1200,17 @@ impl Compiler<'_> {
                 // Moved to `stmt_train/primal_vars.rs` byte-for-byte (roadmap A1):
                 // the two name-order passes, the input device guards, the step
                 // parameter, the nested model-parameter and frozen teacher
-                // loads, and the CPKD report facts. The map is still mutated
-                // below (WRGA's adapter tensors), so it stays a driver binding.
+                // loads, and the CPKD report facts. TrainPlan step 5 splits the
+                // facts from the emission. The map is still mutated below
+                // (WRGA's adapter tensors), so it stays a driver binding.
+                let primal_facts =
+                    self.plan_primal_facts(state, &extractor, step_param_sym, &layout, &model_type_name);
+                self.plan_cpkd_report(&extractor, &fase_plan, grad_accumulation_steps)?;
                 let mut primal_vars = self.emit_primal_vars(
                     builder,
                     state,
-                    PrimalVarsInputs {
-                        extractor: &extractor,
-                        fase_plan: &fase_plan,
-                        grad_accumulation_steps,
-                        layout: &layout,
-                        model_ptr,
-                        model_type_name: &model_type_name,
-                        param_list,
-                        step_param_sym,
-                        step_param_var,
-                    },
+                    &primal_facts,
+                    PrimalVarsHandles { model_ptr, param_list, step_param_var },
                 )?;
 
                 // 4. Find the loss symbol's VarId and set it as the Wengert
@@ -1346,17 +1340,11 @@ impl Compiler<'_> {
 
                 // CSHA planner schedule, the ELTLS tape-held free, the
                 // NSL_DEBUG_WENGERT dump and the spec §4 WGGO prune.
-                // Moved to `stmt_train/plan_csha_prune.rs` byte-for-byte (roadmap A1).
-                let sched = self.run_csha_and_wggo_prune(
-                    builder,
-                    state,
-                    CshaPruneInputs {
-                        extractor: &mut extractor,
-                        model_type_name: &model_type_name,
-                        primal_vars: &primal_vars,
-                        wggo_applied: &wggo_applied,
-                    },
-                )?;
+                // Moved to `stmt_train/plan_csha_prune.rs` byte-for-byte (roadmap A1);
+                // TrainPlan step 5 splits the emission from the two plans.
+                self.plan_csha(&extractor, &model_type_name)?;
+                self.emit_tape_region_close(builder, state, &extractor, &primal_vars);
+                let sched = self.run_wggo_prune(&mut extractor, &wggo_applied)?;
 
                 // Task 4: WRGA driver + CPDT planning.
                 // Moved to `stmt_train/plan_wrga_cpdt.rs` byte-for-byte (roadmap A1):
@@ -1379,18 +1367,35 @@ impl Compiler<'_> {
                 // Moved to `stmt_train/adapter_sites.rs` byte-for-byte (roadmap A1):
                 // the override-rejected diagnostics, the adapter init side-table
                 // and the adapter-tensor loads into the VarMap.
+                let adapter_loads =
+                    self.plan_wrga_adapter_loads(&primal_facts, &extractor, &layout, &model_type_name);
                 self.emit_wrga_adapter_sites(
                     builder,
                     state,
                     AdapterSitesInputs {
-                        extractor: &extractor,
-                        layout: &layout,
+                        adapter_loads: &adapter_loads,
                         model_ptr,
                         model_type_name: &model_type_name,
                         primal_vars: &mut primal_vars,
                         wrga_plan: &wrga_plan,
                     },
                 )?;
+                // The primal VarMap's key set, planned (TrainPlan step 5b):
+                // the primal facts plus the adapter loads. The CCR owned
+                // restriction below is seeded with it, and the adapter walks
+                // above were planned from it, so hold it to the map the
+                // emitters built: a planner that drifts from its emitter
+                // must stop the compile, not silently change what is emitted.
+                let planned_primal_keys: std::collections::HashSet<crate::wengert::VarId> =
+                    primal_facts.mapped.iter().copied().chain(adapter_loads.mapped()).collect();
+                if planned_primal_keys.len() != primal_vars.len()
+                    || !primal_vars.keys().all(|vid| planned_primal_keys.contains(vid))
+                {
+                    return Err(CodegenError::new(
+                        "internal compiler error (TrainPlan): the planned primal VarMap keys \
+                         differ from the emitted ones; please report this",
+                    ));
+                }
                 // WRGA fork + CCR planning.
                 // Moved to `stmt_train/plan_ccr.rs` byte-for-byte (roadmap A1):
                 // the positional-reference guard, the fork of the extractor's list
@@ -1427,9 +1432,8 @@ impl Compiler<'_> {
                         crate::wengert::WengertType,
                     >,
                 > = ccr_plan.as_ref().map(|_| {
-                    let seed: std::collections::HashSet<crate::wengert::VarId> =
-                        primal_vars.keys().copied().collect();
-                    crate::wengert_lower::infer_primal_owned(&effective_primal, &seed)
+                    // Seeded with the planned key set (TrainPlan step 5b).
+                    crate::wengert_lower::infer_primal_owned(&effective_primal, &planned_primal_keys)
                 });
 
                 // CCR P1.a: restrict the recompute set to what the primal
@@ -1662,18 +1666,18 @@ impl Compiler<'_> {
                 // Moved to `stmt_train/transient_arena_projection.rs` byte-for-byte
                 // (roadmap A1): the Stage-2A element hints, the arena report
                 // and the Stage-2B placement (`--transient-arena`), whose
-                // slot geometry is declared to the runtime here. Returns the
+                // slot geometry is declared to the runtime here. Yields the
                 // element hints the CSLA schedule precompute below shares.
-                let elem_hints = self.emit_transient_arena_projection(
-                    builder,
-                    TransientArenaInputs {
-                        adjoint: &adjoint,
-                        csla_active,
-                        effective_primal: &effective_primal,
-                        extractor: &extractor,
-                        generator: &generator,
-                    },
-                )?;
+                // TrainPlan step 5 splits the plan from the declaration.
+                let arena = self.plan_transient_arena_projection(TransientArenaInputs {
+                    adjoint: &adjoint,
+                    csla_active,
+                    effective_primal: &effective_primal,
+                    extractor: &extractor,
+                    generator: &generator,
+                })?;
+                self.emit_arena_declaration(builder, &arena)?;
+                let elem_hints = arena.elem_hints;
 
                 // ── D2b part 2: CSLA schedule precompute (pre-forward) ──
                 // Moved to `stmt_train/csla_precompute.rs` byte-for-byte (roadmap A1):

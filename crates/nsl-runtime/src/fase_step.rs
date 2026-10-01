@@ -842,7 +842,7 @@ mod tests {
             let up = |p: i64| -> Vec<f64> {
                 let c = nsl_tensor_to_device(p, 0);
                 let t = NslTensor::from_ptr(c);
-                let out = (0..n).map(|i| unsafe { *t.data_f64().add(i) }).collect();
+                let out = (0..n).map(|i| t.read_scalar_as_f64(i)).collect();
                 nsl_tensor_free(c);
                 out
             };

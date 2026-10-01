@@ -218,17 +218,20 @@ fn muon_orthogonalize_matches_reference() {
         );
     }
 
-    // Review L9 — full Muon-arm step pin: 2 steps on a tall 4x3 param with
-    // constant grad (momentum accumulate, nesterov combine on the UPDATED
-    // buffer, sqrt(rows/cols) scale, decoupled weight decay). Mirrors the
-    // fixture's STEP block exactly.
+    // Review L9 — full Muon-arm step pin: 2 steps on a tall 4x3 param
+    // (momentum accumulate, nesterov combine on the UPDATED buffer,
+    // sqrt(rows/cols) scale, decoupled weight decay). Mirrors the fixture's
+    // STEP block exactly. The two steps take different gradients: with one
+    // constant gradient every combine is a multiple of it, and Newton-Schulz
+    // normalizes the scale away (audit slice 6).
     let (rows, cols) = (4usize, 3usize);
     let mut p: Vec<f64> = (0..12).map(|i| (i as f64 * 1.3 + 0.5).sqrt() - 1.2).collect();
-    let g: Vec<f64> = (0..12).map(|i| (i as f64 * 0.9 + 0.9).sqrt() - 1.0).collect();
+    let g1: Vec<f64> = (0..12).map(|i| (i as f64 * 0.9 + 0.9).sqrt() - 1.0).collect();
+    let g2: Vec<f64> = (0..12).map(|i| (i as f64 - 5.5).abs() * 0.3 - 0.8).collect();
     let mut m = vec![0.0f64; 12];
     let (lr, momentum, wd) = (0.02f64, 0.95f64, 0.01f64);
     let scale = (rows as f64 / cols as f64).sqrt();
-    for _ in 0..2 {
+    for g in [&g1, &g2] {
         for i in 0..12 {
             m[i] = momentum * m[i] + g[i];
         }
@@ -250,10 +253,13 @@ fn muon_orthogonalize_matches_reference() {
         ("fro2(p)", want[1], got[1]),
         ("sum(m)", want[2], got[2]),
     ] {
-        // 1e-4: f32 tensor creation noise compounds over 2 steps; a wrong
-        // sign/coefficient/order moves these at O(1e-2)+.
+        eprintln!("STEP {name}: reference {w} vs NSL {h} (|Δ|={:.2e})", (w - h).abs());
+        // 1e-5: f32 tensor creation noise over 2 steps measures at most
+        // 1.2e-6 here (sum(m), 2026-09-30). The subtlest wrong combine,
+        // `gradient + m` for `gradient + momentum * m`, moves sum(p) by about
+        // 2e-4; `m` or `gradient` alone move the stats by 2e-3 or more.
         assert!(
-            (w - h).abs() < 1e-4,
+            (w - h).abs() < 1e-5,
             "STEP {name}: reference {w} vs NSL {h}"
         );
     }

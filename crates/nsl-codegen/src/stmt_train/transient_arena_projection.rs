@@ -10,10 +10,13 @@
 //! runtime (`nsl_arena_init` / `nsl_arena_declare_slot`).
 //!
 //! Moved out of `compile_train_block_inner` (roadmap A1): 573 lines,
-//! 5 inputs ([`TransientArenaInputs`]) plus the function builder.
-//! Returns the element hints, which the driver's CSLA schedule precompute
-//! shares. The train-block CLIF snapshots (`tests/train_clif_snapshots.rs`)
-//! pin the arena declarations on the `--transient-arena` fixture.
+//! 5 inputs ([`TransientArenaInputs`]). TrainPlan step 5 splits planning
+//! from emission: [`Compiler::plan_transient_arena_projection`] takes no
+//! builder and returns an [`ArenaProjection`], the element hints (which the
+//! driver's CSLA schedule precompute shares) and the arena to declare;
+//! [`Compiler::emit_arena_declaration`] emits that declaration. The
+//! train-block CLIF snapshots (`tests/train_clif_snapshots.rs`) pin the
+//! arena declarations on the `--transient-arena` fixture.
 
 use std::collections::HashMap;
 
@@ -40,14 +43,29 @@ pub(crate) struct TransientArenaInputs<'a> {
     pub(crate) generator: &'a crate::source_ad::AdjointGenerator,
 }
 
+/// The arena the runtime is told about under `--transient-arena`: the
+/// payload and each slot's `(offset, bytes)`, in dense order, as the
+/// `iconst` operands of `nsl_arena_init` / `nsl_arena_declare_slot`.
+pub(crate) struct ArenaDeclaration {
+    payload: i64,
+    slots: Vec<(i64, i64)>,
+}
+
+/// What the arena projection decided.
+pub(crate) struct ArenaProjection {
+    /// The Stage-2A element hints.
+    pub(crate) elem_hints: HashMap<VarId, u64>,
+    /// The arena to declare; `None` when there is nothing to place.
+    declaration: Option<ArenaDeclaration>,
+}
+
 impl Compiler<'_> {
     /// Project the transient-memory arena over the final tape (see the
-    /// module header) and return the Stage-2A element hints.
-    pub(crate) fn emit_transient_arena_projection(
+    /// module header). Emits nothing.
+    pub(crate) fn plan_transient_arena_projection(
         &mut self,
-        builder: &mut FunctionBuilder,
         inputs: TransientArenaInputs<'_>,
-    ) -> Result<HashMap<VarId, u64>, CodegenError> {
+    ) -> Result<ArenaProjection, CodegenError> {
         let TransientArenaInputs {
             adjoint,
             csla_active,
@@ -55,6 +73,7 @@ impl Compiler<'_> {
             extractor,
             generator,
         } = inputs;
+        let mut declaration: Option<ArenaDeclaration> = None;
 
         // 6e. Milestone C·p2: transient-memory arena projection.
         // Reuses the M36 interference/BFD engine (transient_arena.rs)
@@ -605,31 +624,41 @@ impl Compiler<'_> {
                 self.arena_placements =
                     placements.iter().map(|p| (p.var, *p)).collect();
                 if !placements.is_empty() {
-                    let total = builder.ins().iconst(cl_types::I64, payload as i64);
-                    let nslots =
-                        builder.ins().iconst(cl_types::I64, placements.len() as i64);
-                    self.compile_call_by_name(
-                        builder, "nsl_arena_init", &[total, nslots])?;
-                    // Slot geometry, in dense order, so the runtime
-                    // can verify the INTERIOR red zones — without it
-                    // only the arena's outermost guards are
-                    // checkable and a slot-k overrun into slot k+1
-                    // goes unseen.
-                    for p in &placements {
-                        let off =
-                            builder.ins().iconst(cl_types::I64, p.offset as i64);
-                        let bytes =
-                            builder.ins().iconst(cl_types::I64, p.bytes as i64);
-                        self.compile_call_by_name(
-                            builder,
-                            "nsl_arena_declare_slot",
-                            &[off, bytes],
-                        )?;
-                    }
+                    declaration = Some(ArenaDeclaration {
+                        payload: payload as i64,
+                        slots: placements
+                            .iter()
+                            .map(|p| (p.offset as i64, p.bytes as i64))
+                            .collect(),
+                    });
                 }
             }
         }
 
-        Ok(elem_hints)
+        Ok(ArenaProjection { elem_hints, declaration })
+    }
+
+    /// Declare the planned arena to the runtime (`nsl_arena_init`, then one
+    /// `nsl_arena_declare_slot` per slot). Emits nothing without one.
+    pub(crate) fn emit_arena_declaration(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        projection: &ArenaProjection,
+    ) -> Result<(), CodegenError> {
+        let Some(decl) = &projection.declaration else {
+            return Ok(());
+        };
+        let total = builder.ins().iconst(cl_types::I64, decl.payload);
+        let nslots = builder.ins().iconst(cl_types::I64, decl.slots.len() as i64);
+        self.compile_call_by_name(builder, "nsl_arena_init", &[total, nslots])?;
+        // Slot geometry, in dense order, so the runtime can verify the
+        // INTERIOR red zones — without it only the arena's outermost guards
+        // are checkable and a slot-k overrun into slot k+1 goes unseen.
+        for &(offset, bytes) in &decl.slots {
+            let off = builder.ins().iconst(cl_types::I64, offset);
+            let bytes = builder.ins().iconst(cl_types::I64, bytes);
+            self.compile_call_by_name(builder, "nsl_arena_declare_slot", &[off, bytes])?;
+        }
+        Ok(())
     }
 }

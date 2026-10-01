@@ -24,10 +24,14 @@
 //!   or rewrites the tape is placed before extraction.
 //!
 //! This step changes nothing the compiler does. The driver still makes the
-//! calls itself: its planning stretch interleaves emission (the CSHA prune
-//! and the WRGA adapter sites take the builder), so a `TrainPass` trait
-//! object per row would have to carry most of the driver's bindings. Step
-//! 4b wraps the rows whose inputs are already plan facts.
+//! calls itself: its planning stretch interleaves emission, so a
+//! `TrainPass` trait object per row would have to carry most of the
+//! driver's bindings. Step 5a split the rows inside the batch-loop body
+//! that took the builder into a plan and an emitter, so every step from
+//! extraction on names a function that takes no builder. Two rows above the
+//! loop still do: `resolve_train_contract` compiles the `data:` section and
+//! the bare statements, and `emit_model_params` builds the parameter lists.
+//! The trait (4b, folded into step 5) wraps the rows once 5b hoists them.
 
 use crate::pass_bus::Channel;
 
@@ -98,12 +102,13 @@ pub const PASS_ORDER: &[TrainPassDecl] = &[
     step("ParamPlanPass", &[], PreTape, "stmt_train/model_params.rs", "emit_model_params"),
     step("NoDecayAdmission", &[], PreTape, "stmt_admission.rs", "no_decay_composition_admission"),
     step("ExtractPass", &[], Tape, "source_ad.rs", "WengertExtractor::new"),
-    // The primal VarMap build hosts the CPKD plan: the driver scans the
-    // extracted tape for the fused KL-CE op and hands the result to
-    // `cpkd::build_plan`, which itself never sees the tape.
-    step("CpkdPass", &["CPKD"], Tape, "stmt_train/primal_vars.rs", "emit_primal_vars"),
+    // The primal VarMap module hosts the CPKD plan: `plan_cpkd_report`
+    // scans the extracted tape for the fused KL-CE op and hands the result
+    // to `cpkd::build_plan`, which itself never sees the tape.
+    step("CpkdPass", &["CPKD"], Tape, "stmt_train/primal_vars.rs", "plan_cpkd_report"),
     step("WggoPlanPass", &["WGGO"], Tape, "stmt_train/plan_wggo.rs", "plan_wggo"),
-    step("CshaPass+WggoPrunePass", &["CSHA"], Tape, "stmt_train/plan_csha_prune.rs", "run_csha_and_wggo_prune"),
+    step("CshaPass", &["CSHA"], Tape, "stmt_train/plan_csha_prune.rs", "plan_csha"),
+    step("WggoPrunePass", &[], Tape, "stmt_train/plan_csha_prune.rs", "run_wggo_prune"),
     step("WrgaPass+CpdtPass", &["WRGA", "CPDT"], Tape, "stmt_train/plan_wrga_cpdt.rs", "run_wrga_and_plan_cpdt"),
     step("CcrPlanPass", &["CCR"], Tape, "stmt_train/plan_ccr.rs", "fork_wrga_and_plan_ccr"),
     step("AdjointGenPass", &[], Adjoint, "source_ad.rs", "AdjointGenerator::new"),
@@ -114,7 +119,7 @@ pub const PASS_ORDER: &[TrainPassDecl] = &[
         &["MemoryPlanner"],
         Adjoint,
         "stmt_train/transient_arena_projection.rs",
-        "emit_transient_arena_projection",
+        "plan_transient_arena_projection",
     ),
     step("CslaPrecomputePass", &[], Adjoint, "stmt_train/csla_precompute.rs", "precompute_csla_schedule"),
 ];

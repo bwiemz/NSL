@@ -2693,13 +2693,30 @@ impl Compiler<'_> {
         top_type_name: &str,
         compound_name: &str,
     ) -> Option<Value> {
+        let plan = self.plan_nested_field(top_layout, top_type_name, compound_name);
+        emit_field_plan(builder, base_ptr, &plan)
+    }
+
+    /// The walk [`Self::load_nested_field`] makes, as data (TrainPlan step
+    /// 5b). Compound names like "m.blocks.0.attn.wq" are split into path
+    /// components (the first, the model variable, is skipped) and walked
+    /// through struct layouts and inline fixed-array slots. The plan records
+    /// every step the walk takes, INCLUDING the steps before a component
+    /// fails to resolve: the emitter replays them all, so a failed walk
+    /// leaves the same dead loads it always did and the IR is unchanged.
+    pub(crate) fn plan_nested_field(
+        &self,
+        top_layout: &crate::context::StructLayout,
+        top_type_name: &str,
+        compound_name: &str,
+    ) -> FieldPlan {
+        let mut plan = FieldPlan { steps: Vec::new(), resolved: false };
         let parts: Vec<&str> = compound_name.split('.').collect();
         if parts.len() < 2 {
-            return None;
+            return plan;
         }
 
-        // State: current struct pointer and current type name (for layout/field_type lookup)
-        let mut current_ptr = base_ptr;
+        // State: current type name (for layout/field_type lookup).
         let mut current_type_name = top_type_name.to_string();
         let mut current_layout = top_layout.clone();
 
@@ -2713,19 +2730,14 @@ impl Compiler<'_> {
 
             // Check if this is a numeric array index (from FixedArray unrolling)
             if let Ok(array_idx) = part.parse::<usize>() {
-                // current_ptr is already pointing to the base of the inline array
+                // The pointer is already at the base of the inline array
                 // region (set by the preceding FixedArray field handler).
                 // Each element is an i64 pointer at offset array_idx * 8.
-                let elem_ptr = builder.ins().load(
-                    cl_types::I64,
-                    cranelift_codegen::ir::MemFlagsData::trusted(),
-                    current_ptr,
-                    (array_idx * 8) as i32,
-                );
+                plan.steps.push(FieldStep::ArrayElement { offset: (array_idx * 8) as i32 });
                 if is_last {
-                    return Some(elem_ptr);
+                    plan.resolved = true;
+                    return plan;
                 }
-                current_ptr = elem_ptr;
                 // current_layout and current_type_name were already set to the
                 // element type by the preceding array field handler.
                 i += 1;
@@ -2733,7 +2745,9 @@ impl Compiler<'_> {
             }
 
             // Named field: look up in current struct layout
-            let field = current_layout.fields.iter().find(|f| f.name == part)?;
+            let Some(field) = current_layout.fields.iter().find(|f| f.name == part) else {
+                return plan;
+            };
 
             // Check if this field is a FixedArray type
             let field_type = self
@@ -2752,41 +2766,41 @@ impl Compiler<'_> {
                 let inner = ft.trim_start_matches('[').trim_end_matches(']');
                 let elem_type = inner.split(';').next().unwrap_or("").trim();
 
-                // Set current_ptr to address of array base in parent struct
-                current_ptr = builder.ins().iadd_imm_s(current_ptr, field.offset as i64);
+                plan.steps.push(FieldStep::InlineArrayBase { offset: field.offset as i64 });
                 current_type_name = elem_type.to_string();
-                current_layout = self.types.struct_layouts.get(elem_type)?.clone();
+                let Some(elem_layout) = self.types.struct_layouts.get(elem_type) else {
+                    return plan;
+                };
+                current_layout = elem_layout.clone();
                 // Next component should be a numeric index
                 i += 1;
                 continue;
             }
 
             // Regular field: load the value
-            let field_val = builder.ins().load(
-                field.cl_type,
-                cranelift_codegen::ir::MemFlagsData::trusted(),
-                current_ptr,
-                field.offset as i32,
-            );
+            plan.steps.push(FieldStep::Load { ty: field.cl_type, offset: field.offset as i32 });
 
             if is_last {
-                return Some(field_val);
+                plan.resolved = true;
+                return plan;
             }
 
             // Navigate into sub-model struct
-            current_ptr = field_val;
             if let Some(ref ft) = field_type {
+                let Some(sub_layout) = self.types.struct_layouts.get(ft) else {
+                    return plan;
+                };
                 current_type_name = ft.clone();
-                current_layout = self.types.struct_layouts.get(ft)?.clone();
+                current_layout = sub_layout.clone();
             } else {
                 // No type info — can't continue traversal
-                return None;
+                return plan;
             }
 
             i += 1;
         }
 
-        None
+        plan
     }
 
     /// Emit the runtime in-place-suppression guard around a source-AD FORWARD
@@ -2958,16 +2972,67 @@ impl Compiler<'_> {
         state: &FuncState,
         compound_name: &str,
     ) -> Option<Value> {
+        let (root_sym, plan) = self.plan_source_ad_named_param(state, compound_name)?;
+        let (root_var, _) = state.variables[&root_sym];
+        let root_ptr = builder.use_var(root_var);
+        emit_field_plan(builder, root_ptr, &plan)
+    }
+
+    /// [`Self::load_source_ad_named_param`] as data: the root variable the
+    /// compound name starts at and the walk from it. `None` when the root,
+    /// its model type or that type's layout does not resolve, in which case
+    /// the loader emits nothing at all.
+    pub(crate) fn plan_source_ad_named_param(
+        &self,
+        state: &FuncState,
+        compound_name: &str,
+    ) -> Option<(nsl_ast::Symbol, FieldPlan)> {
         let root_name = compound_name.split('.').next()?;
-        let (&root_sym, &(root_var, _)) = state
+        let (&root_sym, _) = state
             .variables
             .iter()
             .find(|(sym, _)| self.resolve_sym(**sym) == root_name)?;
         let model_type_name = self.resolve_source_ad_model_type_name(state, root_sym)?;
         let layout = self.types.struct_layouts.get(&model_type_name)?;
-        let root_ptr = builder.use_var(root_var);
-        self.load_nested_field(builder, root_ptr, layout, &model_type_name, compound_name)
+        Some((root_sym, self.plan_nested_field(layout, &model_type_name, compound_name)))
     }
+}
+
+/// A nested-field walk as data: the steps [`Compiler::plan_nested_field`]
+/// took, and whether the last one reached the named field. Planning code
+/// holds these and knows, without a builder, which fields resolve.
+#[derive(Clone, Debug)]
+pub(crate) struct FieldPlan {
+    pub(crate) steps: Vec<FieldStep>,
+    pub(crate) resolved: bool,
+}
+
+/// One step of a [`FieldPlan`], applied to the running pointer.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum FieldStep {
+    /// Load the i64 element pointer of an inline fixed array at `offset`.
+    ArrayElement { offset: i32 },
+    /// Point at an inline fixed array's base, `offset` bytes in (no load).
+    InlineArrayBase { offset: i64 },
+    /// Load a struct field of type `ty` at `offset`.
+    Load { ty: cranelift_codegen::ir::Type, offset: i32 },
+}
+
+/// Emit a [`FieldPlan`]'s steps from `base_ptr`, in order, and return the
+/// field's value if the plan resolved. An unresolved plan still emits its
+/// steps: [`Compiler::load_nested_field`] always emitted the loads it made
+/// before a component failed, and the IR keeps them.
+pub(crate) fn emit_field_plan(builder: &mut FunctionBuilder, base_ptr: Value, plan: &FieldPlan) -> Option<Value> {
+    let flags = cranelift_codegen::ir::MemFlagsData::trusted();
+    let mut current = base_ptr;
+    for step in &plan.steps {
+        current = match *step {
+            FieldStep::ArrayElement { offset } => builder.ins().load(cl_types::I64, flags, current, offset),
+            FieldStep::InlineArrayBase { offset } => builder.ins().iadd_imm_s(current, offset),
+            FieldStep::Load { ty, offset } => builder.ins().load(ty, flags, current, offset),
+        };
+    }
+    plan.resolved.then_some(current)
 }
 
 /// Simple glob matching supporting `*` (any sequence) and `?` (single char) wildcards.

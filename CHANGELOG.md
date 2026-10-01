@@ -8,6 +8,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **Parser table tests** (roadmap T1): 312 new `#[test]`s in `nsl-parser`,
+  one per construct, bringing the crate from 33 tests to 345. The roadmap's
+  Phase 1 exit criterion asked for at least 300.
+  - `tests/common/sexpr.rs` renders the AST as compact S-expressions, without
+    spans or node ids.
+  - `expr_table.rs` (143) covers each precedence row against its
+    neighbours, associativity, unary and postfix binding, slices,
+    collections, comprehensions, lambdas, f-strings and literals.
+  - `stmt_table.rs` (73) covers bindings, assignments, control flow, the
+    declarations, decorators and imports.
+  - `type_table.rs` (25) and `pattern_table.rs` (21) cover every annotation
+    and pattern form.
+  - `refusal_table.rs` (50) pins the first diagnostic for one malformed line,
+    and whether the statement after it still parses. Twelve cases swallow
+    the next line today; they are marked, so a recovery fix flips one entry
+    rather than breaking a pinned cascade.
+  - `docs/architecture/frontend.md` describes the tables and adds them to
+    the new-statement and new-operator recipes.
+
 - **The fused adjoint elementwise-chain kernel is built as KIR by
   `nsl_codegen::ew_chain_ptx`** in place of `fusion::synthesize_fused_chain_ptx`'s
   hand-written PTX (new-roadmap item 5). This is the MFU campaign C3
@@ -1665,6 +1684,46 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
     `a_mean_inside_a_forward_trains_like_its_gradient_under_source_ad`
     reproduces it.
 
+- Mutation audit, slice 6 (roadmap item 5): **three gradient gates could not
+  see a gradient's size.** Every mutant below was planted and run against the
+  gate before and after; evidence in
+  `.claude/campaign-evidence/mutation-audit-slice6/`.
+  - **RMSNorm dx and dgamma** (`rmsnorm_dx_parity_gate`, all three lowerings:
+    tape, source-AD decomposition, fused op).
+    - **Why it was blind:** the fixture regressed `rmsnorm(x @ w)` onto
+      `y = 0`, and RMSNorm fixes each row's norm, so the loss hardly depended
+      on `w` (dL/dw about 1e-5). It trained with AdamW, which steps by
+      `lr · sign(grad)`, and the three lowerings were compared only with each
+      other at 2e-3.
+    - **Before:** 8 of 9 mutants survived. They doubled dx or dgamma in each
+      lowering, took dgamma's mean in place of its sum, or doubled
+      `mse_loss`.
+    - **Now:** the target is non-uniform and the optimizer is SGD. Every
+      lowering is held to an f64 reference trajectory whose gradients are
+      central differences of the forward. They land within 1e-6, against a
+      1e-5 tolerance, and all 10 mutants fail.
+    - The GPU leg's fixture rewrites now assert that they fired: its anchor
+      was the old `y`, and a stale anchor would have left the run on the host.
+  - **Cross-entropy and embedding backwards**
+    (`nsl_cross_entropy_backward`, `nsl_embedding_backward`).
+    - **Before:** their only CPU guard was the tape × loader AD differential:
+      AdamW loss streams under `grad_clip = 1.0`, with no ignored labels. A CE
+      gradient doubled in either dtype branch, a dropped upstream gradient, and
+      dividing by the row count instead of the valid-row count all passed it.
+    - **Now:** two unit gates compare the backwards with the gradients of the
+      functions they differentiate. For CE that is central differences with
+      two ignored rows and an upstream gradient of 0.7, in f32 and f64. For
+      the embedding it is a scatter-add with repeated indices. Every mutant
+      fails.
+  - **Muon's Nesterov combine** (`muon_orthogonalize_matches_reference`).
+    - **Before:** the step pin fed both steps the same gradient. Every
+      candidate update was then a multiple of it and Newton-Schulz normalizes
+      the scale away, so `update = m`, `= gradient` and `= gradient + m` all
+      passed.
+    - **Now:** the second step takes a nearly orthogonal gradient (cosine
+      0.10), and the tolerance goes from 1e-4 to 1e-5 (measured noise 1.2e-6).
+      All three mutants fail.
+
 - Mutation audit, slice 2 (roadmap item 5): **Lion's decoupled weight decay
   was untested.** Neither Lion fixture sets `weight_decay`, so `lion_step`'s
   `if weight_decay > 0.0` branch never ran under any gate: dropping `lr` from
@@ -2147,6 +2206,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   restored to their pre-700bfaa8 structural assertions now that R7 is retired.
 
 ### Changed
+
+- **A GPU → CPU transfer keeps the dtype tag** (C5 step 2a,
+  `docs/superpowers/specs/2026-09-26-dtype-semantics-design.md`). The
+  download arm of `nsl_tensor_to_device` used to widen f32 to f64, so an f32
+  tensor that went CPU → GPU → CPU came back f64. Every dtype is now a byte
+  copy. A device tensor tagged f64 is refused rather than read at a guessed
+  width; no device path produces one. The upload still narrows f64 to f32
+  until step 2b turns it into a refusal.
+  - **The gate,** `transfer_preserves_dtype_gpu` (4 GPU tests), round-trips
+    f32 edge values by bit pattern: ±0, a NaN payload, a signalling NaN,
+    ±inf, subnormals and full significands. It also covers 134k random f32
+    bit patterns, every other byte-copied dtype, a transposed device view,
+    and an f64 upload.
+  - **`model_load` compares the real tags.** The `.nslm` header wrote "f64"
+    for every tag but f32, so an fp16 checkpoint loaded into a bf16 model and
+    its bytes were reinterpreted. Each tag now has its own name; "f32" and
+    "f64" are unchanged, so existing files still load. `model_save` drops its
+    f64-staging downcast, which no download produces any more.
+  - **Code that relied on the widening:**
+    - `nsl_sparse_spmv` falls back to the CPU for BSR, which has no GPU
+      kernel. That CPU path, `nsl_sparse_spmm`'s and `nsl_sparse_from_dense`
+      read the dense operand as raw f64. They now decode it by tag, which also
+      fixes f32 CPU operands such as those `zeros`/`ones` make.
+    - The CPU fallback for unary GPU ops on allocation failure read and wrote
+      raw f64. It now reads and writes by tag.
+    - `nsl_grad_accumulate_add` with a CPU f64 accumulator and a GPU f32
+      gradient would have returned -1, which codegen discards, dropping the
+      gradient. A CPU destination now takes the per-element CPU arm.
+    - Dropout backward read its mask with `data_f64()`. It now reads by tag.
 
 - **`STATUS.md` reviewed against `main` @ bba1b564** (new-roadmap item 11,
   after the KIR and per-device context campaigns). No subsystem changes

@@ -1533,13 +1533,10 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
             continue;
         }
 
-        // GPU: round-trip through the CPU with an explicit f64 -> f32
-        // down-convert on the way back (same staged pattern as
-        // nsl_tensor_add_inplace's GPU arm). NOT delegated to
-        // nsl_tensor_mul_scalar_inplace: its GPU arm copies
-        // `len * element_size()` bytes straight from the round-trip CPU
-        // buffer, but `nsl_tensor_to_device(gpu_f32, 0)` upcasts to CPU f64,
-        // so that copy would push raw f64 bytes into the f32 device buffer.
+        // GPU: round-trip through the CPU, staging into a host f32 buffer
+        // (same pattern as nsl_tensor_add_inplace's GPU arm). Written when
+        // the download widened f32 to f64, which is why both source dtypes
+        // are handled; since C5 step 2a the download keeps the f32 tag.
         #[cfg(feature = "cuda")]
         {
             let cpu_ptr = crate::tensor::nsl_tensor_to_device(tensor_raw, 0);
@@ -1890,9 +1887,10 @@ pub extern "C" fn nsl_zero_destroy() -> i64 {
 /// with proper casts. Any pair with a GPU-resident side — including the
 /// live single-GPU FullBuffer path (GPU accum buffer += tape gradient,
 /// reached by `grad_accumulation > 1` with lion/muon/soap) — migrates
-/// `src` to `dst`'s device via `nsl_tensor_to_device_like` (owned ref,
-/// canonical dtype: CPU=f64, GPU=f32) and delegates to the GPU-safe
-/// `nsl_tensor_add_inplace` round-trip.
+/// `src` to `dst`'s device via `nsl_tensor_to_device_like` (owned ref).
+/// A GPU `dst` then delegates to the GPU-safe `nsl_tensor_add_inplace`; a
+/// CPU `dst` re-enters the CPU arms, since the migrated gradient keeps its
+/// f32 tag.
 ///
 /// Non-f32/f64 dtypes refuse loudly with -1: the previous fallback promoted
 /// both pointers to f64 blindly, which read out of bounds whenever `src`
@@ -1976,13 +1974,23 @@ pub extern "C" fn nsl_grad_accumulate_add(
     // nsl_tensor_to_device_like returns an OWNED ref (refcount++ when the
     // devices already match, a fresh tensor otherwise) that must be freed
     // exactly once below (FBIP ownership, see stmt_fase.rs accumulate arm).
-    // Migration canonicalizes dtype (CPU=f64, GPU=f32), so the delegated
-    // nsl_tensor_add_inplace sees matching same-device operands and its
-    // GPU arm performs the proven CPU round-trip with f64 -> f32 staging.
     let migrated = crate::tensor::nsl_tensor_to_device_like(src_ptr, dst_ptr);
     if migrated == 0 {
         return -1;
     }
+    // A CPU destination: both operands are on the host now, so take the CPU
+    // arms above, which convert per element. The download keeps the GPU
+    // gradient's f32 tag (C5 step 2a), so a CPU f64 accumulator beside it is a
+    // mixed pair, not a mismatch; the equality check below would refuse it,
+    // and codegen discards the -1, dropping the gradient.
+    if dst.device == 0 {
+        let rc = nsl_grad_accumulate_add(dst_ptr, migrated, num_elems);
+        crate::tensor::nsl_tensor_free(migrated);
+        return rc;
+    }
+    // A GPU destination: the upload narrows an f64 source to f32 (until C5
+    // step 2b refuses it), so the delegated nsl_tensor_add_inplace sees two
+    // f32 device operands.
     let mig = NslTensor::from_ptr_ref(migrated);
     if mig.dtype != dst.dtype || mig.len != dst.len {
         crate::nsl_log!(WARN, "nsl", "nsl: nsl_grad_accumulate_add: post-migration mismatch \

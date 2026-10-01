@@ -100,15 +100,16 @@ fn cpu_f64_tensor(vals: &[f64]) -> i64 {
 }
 
 /// Read a GPU f32 tensor back to host as `Vec<f32>`.
-/// `nsl_tensor_to_device(ptr, 0)` upcasts GPU f32 -> CPU f64 (runtime
-/// invariant: CPU=f64, GPU=f32); narrow back to f32 for comparison.
+///
+/// `nsl_tensor_to_device(ptr, 0)` preserves the tag (C5 step 2a): a GPU f32
+/// tensor downloads as CPU f32, byte for byte. It used to widen to f64, and
+/// this helper asserted that; the assert now pins the new contract instead.
 fn read_gpu_f32_as_host_f32(ptr: i64) -> Vec<f32> {
     let cpu = unsafe { nsl_tensor_to_device(ptr, 0) };
     let t = unsafe { &*(cpu as *const TensorView) };
-    assert_eq!(t.dtype, 0, "to_device(_, 0) must yield CPU f64 (dtype=0)");
+    assert_eq!(t.dtype, 1, "to_device(_, 0) must preserve the f32 tag (C5 step 2a)");
     let len = t.len as usize;
-    let slice = unsafe { std::slice::from_raw_parts(t._data as *const f64, len) };
-    let out: Vec<f32> = slice.iter().map(|&x| x as f32).collect();
+    let out: Vec<f32> = unsafe { std::slice::from_raw_parts(t._data as *const f32, len) }.to_vec();
     if cpu != ptr {
         unsafe { nsl_tensor_free(cpu) };
     }
@@ -195,6 +196,43 @@ fn gpu_dst_cpu_f64_src_accumulate() {
         nsl_tensor_free(cpu_dst);
         nsl_tensor_free(gpu_dst);
         nsl_tensor_free(cpu_src);
+    }
+}
+
+/// (b2) CPU f64 dst += GPU f32 src. The download keeps the gradient's f32
+/// tag (C5 step 2a), so after migration the pair is CPU f64 += CPU f32 and
+/// must take the per-element CPU arm. Before the fix for 2a it hit the
+/// post-migration dtype-equality check and returned -1, which codegen
+/// discards: the gradient was dropped without a word.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn cpu_f64_dst_gpu_f32_src_accumulate() {
+    if !cuda_available() {
+        return;
+    }
+    let dst_vals = [0.25_f64, -1.5, 3.0];
+    let src_vals = [8.0_f32, 0.5, -2.25];
+
+    let cpu_dst = cpu_f64_tensor(&dst_vals);
+    let cpu_src = cpu_f32_tensor(&src_vals);
+    let gpu_src = unsafe { nsl_tensor_to_device(cpu_src, 1) };
+
+    let rc_before = refcount(gpu_src);
+    let rc = unsafe { nsl_grad_accumulate_add(cpu_dst, gpu_src, dst_vals.len() as i64) };
+    assert_eq!(rc, 0, "CPU f64 dst + GPU f32 src accumulate must succeed");
+    assert_eq!(refcount(gpu_src), rc_before, "the source keeps its refcount");
+
+    let dst_view = unsafe { &*(cpu_dst as *const TensorView) };
+    assert_eq!(dst_view.dtype, 0, "the accumulator keeps its f64 tag");
+    let got = unsafe { std::slice::from_raw_parts(dst_view._data as *const f64, dst_vals.len()) };
+    for (i, (&d, &s)) in dst_vals.iter().zip(src_vals.iter()).enumerate() {
+        assert_eq!(got[i], d + f64::from(s), "elem {i}");
+    }
+
+    unsafe {
+        nsl_tensor_free(cpu_dst);
+        nsl_tensor_free(cpu_src);
+        nsl_tensor_free(gpu_src);
     }
 }
 

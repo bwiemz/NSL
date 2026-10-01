@@ -127,7 +127,9 @@ pub extern "C" fn nsl_sparse_from_dense(dense_ptr: i64, format: i64, threshold_b
     let shape = unsafe { std::slice::from_raw_parts(tensor.shape, 2) };
     let rows = shape[0] as usize;
     let cols = shape[1] as usize;
-    let data = unsafe { std::slice::from_raw_parts(tensor.data as *const f64, rows * cols) };
+    // Decode by tag: NSL-level creation builtins make f32 tensors, and a raw
+    // f64 read of one walks twice its buffer.
+    let data = tensor.as_f64_owned();
 
     // Scan for non-zeros
     let mut row_indices = Vec::new();
@@ -390,7 +392,9 @@ pub extern "C" fn nsl_sparse_spmm(sparse_ptr: i64, dense_ptr: i64) -> i64 {
         };
     }
 
-    let d_data = unsafe { std::slice::from_raw_parts(dense.data as *const f64, k * n) };
+    // Decode by tag: NSL-level creation builtins make f32 tensors, and a raw
+    // f64 read of one walks twice its buffer.
+    let d_data = dense.as_f64_owned();
     let s_vals = unsafe { std::slice::from_raw_parts(sparse.data as *const f64, nnz) };
     let mut output = vec![0.0f64; m * n];
 
@@ -899,7 +903,10 @@ pub extern "C" fn nsl_sparse_spmv(sparse_ptr: i64, vec_ptr: i64) -> i64 {
         };
     }
 
-    let x = unsafe { std::slice::from_raw_parts(vec_t.data as *const f64, k) };
+    // Decode by tag. The GPU fallback above hands this path a DOWNLOADED
+    // vector for BSR, which keeps its f32 tag (C5 step 2a); a raw f64 read
+    // would walk twice its buffer, as it already did for any f32 CPU operand.
+    let x = vec_t.as_f64_owned();
     let s_vals = unsafe { std::slice::from_raw_parts(sparse.data as *const f64, nnz) };
     let mut output = vec![0.0f64; m];
 
@@ -1387,5 +1394,73 @@ mod tests {
         nsl_sparse_free(result);
         nsl_sparse_free(a);
         nsl_sparse_free(b);
+    }
+
+    // ── f32 dense operands ──────────────────────────────────────────
+    //
+    // NSL-level creation builtins make f32 tensors, and since C5 step 2a a
+    // downloaded GPU operand stays f32 too: that is what SpMV's GPU fallback
+    // (BSR, which has no GPU kernel) hands its CPU path. These paths used to
+    // read every dense operand as raw f64, walking twice an f32 buffer. The
+    // decode runs before the format dispatch, so CSR exercises it for both.
+
+    fn f32_tensor(shape: &[i64], vals: &[f32]) -> i64 {
+        let ptr = crate::cpu::create_tensor_with_shape_rs_dtype(shape, 1);
+        let t = crate::tensor::NslTensor::from_ptr(ptr);
+        for (i, v) in vals.iter().enumerate() {
+            unsafe { *t.data_f32().add(i) = *v };
+        }
+        ptr
+    }
+
+    #[test]
+    fn spmm_and_spmv_read_an_f32_dense_operand_by_its_tag() {
+        // A = [[1, 0, 2], [0, 3, 0]].
+        let rows = [0i64, 0, 1];
+        let cols = [0i64, 2, 1];
+        let vals = [1.0f64, 2.0, 3.0];
+        let coo = nsl_sparse_coo(
+            rows.as_ptr() as i64, cols.as_ptr() as i64, vals.as_ptr() as i64,
+            2, 3, 3,
+        );
+        let csr = nsl_sparse_coo_to_csr(coo);
+
+        // B = [[1, 2], [3, 4], [5, 6]] -> A @ B = [[11, 14], [9, 12]].
+        let b = f32_tensor(&[3, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let c = nsl_sparse_spmm(csr, b);
+        assert_ne!(c, 0);
+        let ct = crate::tensor::NslTensor::from_ptr_ref(c);
+        let got: Vec<f64> = (0..4).map(|i| ct.read_scalar_as_f64(i)).collect();
+        assert_eq!(got, [11.0, 14.0, 9.0, 12.0], "SpMM with an f32 dense operand");
+
+        // x = [1, 2, 3] -> A @ x = [7, 6].
+        let x = f32_tensor(&[3], &[1.0, 2.0, 3.0]);
+        let y = nsl_sparse_spmv(csr, x);
+        assert_ne!(y, 0);
+        let yt = crate::tensor::NslTensor::from_ptr_ref(y);
+        let got: Vec<f64> = (0..2).map(|i| yt.read_scalar_as_f64(i)).collect();
+        assert_eq!(got, [7.0, 6.0], "SpMV with an f32 dense vector");
+
+        for t in [c, b, y, x] {
+            crate::tensor::nsl_tensor_free(t);
+        }
+        nsl_sparse_free(csr);
+        nsl_sparse_free(coo);
+    }
+
+    #[test]
+    fn from_dense_reads_an_f32_tensor_by_its_tag() {
+        let d = f32_tensor(&[2, 3], &[0.0, 4.5, 0.0, -2.0, 0.0, 0.25]);
+        let s = nsl_sparse_from_dense(d, 0, 0.1f64.to_bits() as i64);
+        assert_ne!(s, 0);
+        assert_eq!(nsl_sparse_nnz(s), 3, "three entries clear the 0.1 threshold");
+        let back = nsl_sparse_to_dense(s);
+        let bt = crate::tensor::NslTensor::from_ptr_ref(back);
+        let got: Vec<f64> = (0..6).map(|i| bt.read_scalar_as_f64(i)).collect();
+        assert_eq!(got, [0.0, 4.5, 0.0, -2.0, 0.0, 0.25]);
+
+        crate::tensor::nsl_tensor_free(back);
+        nsl_sparse_free(s);
+        crate::tensor::nsl_tensor_free(d);
     }
 }
