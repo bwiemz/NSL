@@ -3592,6 +3592,20 @@ fn lower_single_op(
                         &[inputs[0], inputs[1]],
                     )
                 }
+                "mean_grad_scale" => {
+                    // The adjoint of a mean, before the broadcast: the output
+                    // gradient times numel(mean result) / numel(mean input),
+                    // i.e. 1/N for a full mean and 1/size(dim) for one dim.
+                    // The shapes are only known here, at run time. Inputs are
+                    // (gradient, the mean's operand, the mean's result).
+                    let out_len = call(compiler, builder, "nsl_tensor_len", &[inputs[2]])?;
+                    let in_len = call(compiler, builder, "nsl_tensor_len", &[inputs[1]])?;
+                    let out_f = builder.ins().fcvt_from_sint(cl_types::F64, out_len);
+                    let in_f = builder.ins().fcvt_from_sint(cl_types::F64, in_len);
+                    let ratio = builder.ins().fdiv(out_f, in_f);
+                    let flags = builder.ins().iconst(cl_types::I8, 0);
+                    call(compiler, builder, "nsl_tensor_mul_scalar", &[inputs[0], ratio, flags])
+                }
                 "mean_keepdim_last" => {
                     // Mean along the LAST dimension with keepdim=true.
                     // Used by LayerNorm/RMSNorm backward to compute
