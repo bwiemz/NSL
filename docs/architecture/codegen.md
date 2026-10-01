@@ -170,15 +170,17 @@ driver runs it:
    `schedule` sites, the registry and the pass bus's ordering edges.
 5. Epoch/batch loops; forward extraction into a `WengertList` by
    `WengertExtractor` (`src/source_ad.rs`), then the initial primal
-   `VarMap` (`src/stmt_train/primal_vars.rs`: `emit_primal_vars` — named
-   inputs / parameters to their Cranelift values, the input device guards,
-   the nested parameter and frozen teacher loads, the CPKD report facts);
+   `VarMap` (`src/stmt_train/primal_vars.rs`: `plan_primal_facts` takes
+   the facts without a builder, `plan_cpkd_report` the CPKD report facts,
+   and `emit_primal_vars` maps named inputs / parameters to their Cranelift
+   values and emits the input device guards and the nested parameter and
+   frozen teacher loads);
    the in-pipeline passes, each under
    `PassScheduler::schedule`: CPKD, WGGO (with the tape;
    `src/stmt_train/plan_wggo.rs`: `plan_wggo`, which also folds the
    wrapper's pre-plan and publishes the `WggoOverrides`), CSHA and the
-   WGGO prune (`src/stmt_train/plan_csha_prune.rs`:
-   `run_csha_and_wggo_prune`), WRGA (with
+   WGGO prune (`src/stmt_train/plan_csha_prune.rs`: `plan_csha`, then the
+   tape-region close `emit_tape_region_close`, then `run_wggo_prune`), WRGA (with
    the tape) and CPDT (both in `src/stmt_train/plan_wrga_cpdt.rs`:
    `run_wrga_and_plan_cpdt`; the plan's adapter sites — the override
    diagnostics, the adapter init side-table and the adapter-tensor loads
@@ -203,7 +205,8 @@ driver runs it:
    inserts the adjoint-region last-use frees on the tape, protecting the
    parameter-gradient adjoints and the planned wgrad fusion chains; section
    6e (`src/stmt_train/transient_arena_projection.rs`:
-   `emit_transient_arena_projection`) then projects the transient-memory
+   `plan_transient_arena_projection`, then `emit_arena_declaration`)
+   then projects the transient-memory
    arena over the final tape — the element hints, the `--memory-report`
    arena report and the `--transient-arena` placement with its runtime slot
    declarations; the CSLA schedule precompute

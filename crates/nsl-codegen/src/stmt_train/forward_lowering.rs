@@ -10,8 +10,12 @@
 //! 6 inputs ([`ForwardLoweringInputs`]) plus the function builder
 //! and state. Returns the early-free plan ([`CcrSegmentFree`], `None` when
 //! it does not apply) and the [`LoweredWengert`] the adjoint lowering
-//! reads through. The train-block CLIF snapshots
-//! (`tests/train_clif_snapshots.rs`) pin every forward this emits.
+//! reads through. `emit_tape_region_close`, which runs just before (the
+//! ELTLS free of tape-held tensors, the tape-region flag, the
+//! `NSL_DEBUG_WENGERT` dump), moved here from `plan_csha_prune.rs` when
+//! TrainPlan step 5 split that file's plans from its emission. The
+//! train-block CLIF snapshots (`tests/train_clif_snapshots.rs`) pin every
+//! forward this emits.
 
 use cranelift_codegen::ir::types as cl_types;
 use cranelift_codegen::ir::{InstBuilder, Value};
@@ -355,5 +359,47 @@ impl Compiler<'_> {
         self.emit_inplace_suppress(builder, false)?;
 
         Ok((ccr_segment_free, full_lowered))
+    }
+
+    /// Close the tape region before the forward is lowered: free the
+    /// tape-held tensors, clear the flag, and dump the primal list under
+    /// `NSL_DEBUG_WENGERT`. `primal_vars` is read by the dump only.
+    pub(crate) fn emit_tape_region_close(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        extractor: &crate::source_ad::WengertExtractor<'_>,
+        primal_vars: &crate::wengert_lower::VarMap,
+    ) {
+        // 5. Lower PRIMAL Wengert list to Cranelift IR.
+        //    This IS the forward pass — each WengertOp is compiled to
+        //    its runtime FFI call, and ALL intermediate VarId → Value
+        //    mappings are recorded in full_vars.
+        // ELTLS: free tape-held tensors before clearing the tape flag.
+        self.free_tape_held_tensors(builder, state);
+        state.flags.in_tape_region = false;
+        // Debug: dump primal Wengert ops
+        if std::env::var("NSL_DEBUG_WENGERT").is_ok() {
+            nsl_log::nsl_log!(INFO, "wengert", 
+                "[wengert] primal_vars: {:?}",
+                primal_vars.keys().collect::<Vec<_>>()
+            );
+            for op in &extractor.wengert_list().ops {
+                let name = extractor
+                    .wengert_list()
+                    .var_names
+                    .get(&op.result)
+                    .cloned()
+                    .unwrap_or_default();
+                nsl_log::nsl_log!(INFO, "wengert", 
+                    "[wengert] VarId {} '{}' = {:?} inputs={:?} in_primal={}",
+                    op.result,
+                    name,
+                    op.op,
+                    op.inputs,
+                    primal_vars.contains_key(&op.result)
+                );
+            }
+        }
     }
 }

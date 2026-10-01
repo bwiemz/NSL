@@ -473,10 +473,15 @@ crates/nsl-runtime/tests/sr_bf16_parity.rs	sr_bf16_gpu_tail_is_bit_identical_to_
 crates/nsl-runtime/tests/sr_bf16_parity.rs	sr_bf16_gpu_streams_vary_with_counters	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/tier_b1_prepass_gpu.rs	x_prepass_matches_cpu_reference	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/tier_b1_prepass_gpu.rs	w_prepass_matches_cpu_reference	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/transfer_preserves_dtype_gpu.rs	f32_round_trip_keeps_the_tag_and_every_bit	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/transfer_preserves_dtype_gpu.rs	every_byte_copied_dtype_round_trips_unchanged	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/transfer_preserves_dtype_gpu.rs	a_transposed_f32_device_view_downloads_as_contiguous_f32	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/transfer_preserves_dtype_gpu.rs	an_f64_upload_narrows_and_the_download_keeps_the_narrowed_tag	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/wgrad_accum_fused.rs	fused_wgrad_matches_decomposed_chain_and_cpu	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/wgrad_accum_fused.rs	fused_wgrad_comparison_is_sensitive	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/zero_grad_gpu.rs	gpu_dst_gpu_src_accumulate_matches_cpu_reference	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/zero_grad_gpu.rs	gpu_dst_cpu_f64_src_accumulate	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/zero_grad_gpu.rs	cpu_f64_dst_gpu_f32_src_accumulate	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/zero_grad_gpu.rs	grad_zero_gpu_clears_buffer	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/zero_grad_gpu.rs	zero_reduce_grads_refuses_gpu_tensor_without_cuda_aware_backend	gpu	requires CUDA GPU
 crates/nsl-test/tests/fpga_mlp_v1_parity.rs	fpga_mlp_v1_parity_full_diagnostic	broken	M57.1 v1 closure prerequisite: AST->KIR dispatch, HIR port/wire generation, end-to-end CLI wiring (nsl fpga-compile), and Verilog synthesizability. See spec §1.5 deferred-roadmap / crates/nsl-test/tests/fpga_mlp_v1_parity.rs header.

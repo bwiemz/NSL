@@ -3708,12 +3708,14 @@ fn cpu_fallback_unary(a_ptr: i64, kernel_name: &str) -> i64 {
     };
     let a_t = crate::tensor::NslTensor::from_ptr_ref(a_cpu);
     let n = a_t.len as usize;
-    let src = a_t.data as *const f64;
     let result_ptr = crate::tensor::nsl_tensor_zeros_like(a_cpu);
     let result_t = crate::tensor::NslTensor::from_ptr_ref(result_ptr);
-    let dst = result_t.data as *mut f64;
+    // Read and write by tag. The download keeps the device's f32 (C5 step 2a),
+    // so a raw f64 read would walk past the input; `zeros_like` makes the
+    // runtime's default dtype rather than the input's, so the output gets the
+    // same treatment.
     for i in 0..n {
-        unsafe { *dst.add(i) = op_fn(*src.add(i)); }
+        result_t.write_scalar_from_f64(i, op_fn(a_t.read_scalar_as_f64(i)));
     }
     let result_gpu = crate::tensor::nsl_tensor_to_device(result_ptr, a.device as i64);
     if a_cpu != a_ptr { crate::tensor::nsl_tensor_free(a_cpu); }
@@ -11098,11 +11100,14 @@ DONE:
         let cpu_back = nsl_tensor_to_device(gpu_tensor, 0);
         let cpu_t = NslTensor::from_ptr_ref(cpu_back);
         assert_eq!(cpu_t.device, 0);
-        assert_eq!(cpu_t.dtype, 0); // f64
+        // The download keeps the device tag (C5 step 2a); the f64 -> f32
+        // narrowing happened on the upload. Bit-level round-trip gates live in
+        // tests/transfer_preserves_dtype_gpu.rs.
+        assert_eq!(cpu_t.dtype, 1);
 
-        // Verify values survived the roundtrip (f64 → f32 → f64)
+        // Verify values survived the roundtrip (f64 → f32 on upload)
         for i in 0..4 {
-            let val = unsafe { *cpu_t.data_f64().add(i) };
+            let val = cpu_t.read_scalar_as_f64(i);
             let expected = (i + 1) as f64;
             assert!((val - expected).abs() < 1e-6, "mismatch at {}: {} vs {}", i, val, expected);
         }
@@ -11165,7 +11170,7 @@ DONE:
         // 4*7+5*9+6*11=139, 4*8+5*10+6*12=154
         let expected = [58.0, 64.0, 139.0, 154.0];
         for i in 0..4 {
-            let val = unsafe { *c.data_f64().add(i) };
+            let val = c.read_scalar_as_f64(i);
             assert!((val - expected[i]).abs() < 0.5, "matmul mismatch at {}: {} vs {}", i, val, expected[i]);
         }
     }
@@ -11224,7 +11229,7 @@ DONE:
 
         let expected = [11.0, 22.0, 33.0, 44.0];
         for i in 0..4 {
-            let val = unsafe { *c.data_f64().add(i) };
+            let val = c.read_scalar_as_f64(i);
             assert!((val - expected[i]).abs() < 0.1, "mismatch at {}: {} vs {}", i, val, expected[i]);
         }
     }

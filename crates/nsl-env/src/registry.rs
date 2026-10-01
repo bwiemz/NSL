@@ -204,6 +204,24 @@ pub static REGISTRY: &[EnvVar] = &[
         "Kill switch for CCR per-segment forward early-free (memory only; already skipped under --weight-stream or --layerwise-accum)."
     ),
     var!(
+        "NSL_CKPT_DTYPE_PATH",
+        Path,
+        "path to the .nslm checkpoint",
+        "unset",
+        Test,
+        Test,
+        "Test harness only: the checkpoint the model_load dtype-refusal child loads."
+    ),
+    var!(
+        "NSL_CKPT_DTYPE_SCENARIO",
+        Str,
+        "load_into_bf16",
+        "unset (child returns)",
+        Test,
+        Test,
+        "Test harness only: names the model_load dtype-mismatch scenario the re-exec'd child runs (expected to abort)."
+    ),
+    var!(
         "NSL_COLLECTIVES",
         Enum,
         "sim or empty / sim-gpu / nccl; anything else refuses init (rc -2)",
