@@ -95,6 +95,13 @@ pub enum AdjointExpr {
     Scale(VarId, f64),
     Negate(VarId),
     Broadcast(VarId),
+    /// MeanBackward(grad, input, result): the adjoint of a mean, `grad`
+    /// scaled by `numel(result) / numel(input)` (1/N for a full mean,
+    /// 1/size(dim) for a mean over one dim), then broadcast. The ratio is
+    /// taken at run time, from the mean's own operand and result, because the
+    /// Wengert list does not carry shapes (and the incoming gradient's shape
+    /// is not always the result's).
+    MeanBackward(VarId, VarId, VarId),
     ScaleBroadcast(VarId, f64),
     Transpose(VarId, usize, usize),
     ReshapeLike(VarId, VarId),
@@ -384,13 +391,19 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             input_var: op.inputs[0],
             expr: AdjointExpr::Broadcast(output_bar),
         }],
-        // Mean backward: broadcast(grad) / n.  The exact 1/n factor depends on the
-        // reduced dimension size which isn't available in the Wengert list.  The tape-based
-        // runtime backward (backward.rs) handles this correctly with num_elements.
-        // For source AD analysis, we emit Broadcast (correct structure, conservative scale).
+        // Mean backward: broadcast(grad) / n. The 1/n factor depends on the
+        // reduced size, which the Wengert list does not carry, so it is taken
+        // at run time (`MeanBackward` -> the `mean_grad_scale` passthrough).
+        //
+        // This rule used to emit a bare Broadcast, commented as "for source AD
+        // analysis": but source AD LOWERS these rules, and never runs the
+        // tape's `MeanReduce` backward. Every `mean(...)` in a source-AD step
+        // got a gradient N times too large. AdamW is invariant to a uniform
+        // scale, which hid it for a mean-reduced loss; SGD, clipping and any
+        // mean inside a forward (where it scales only some paths) were wrong.
         PrimalOp::Mean { .. } => vec![InputAdjoint {
             input_var: op.inputs[0],
-            expr: AdjointExpr::Broadcast(output_bar),
+            expr: AdjointExpr::MeanBackward(output_bar, op.inputs[0], op.result),
         }],
         PrimalOp::Reshape { .. } => vec![InputAdjoint {
             input_var: op.inputs[0],
@@ -936,7 +949,6 @@ pub fn saved_for_backward(op: &PrimalOp) -> SavedRequirement {
         | PrimalOp::Transpose { .. }
         | PrimalOp::Reshape { .. }
         | PrimalOp::Sum { .. }
-        | PrimalOp::Mean { .. }
         | PrimalOp::Broadcast
         | PrimalOp::Concat { .. }
         | PrimalOp::Split { .. }
@@ -988,6 +1000,10 @@ pub fn saved_for_backward(op: &PrimalOp) -> SavedRequirement {
 
         // Non-differentiable — nothing needed
         PrimalOp::Condition(_) => SavedRequirement::Nothing,
+        // `MeanBackward` reads the mean's operand AND its result (their
+        // lengths give the 1/N); this enum has no "both", and the live table
+        // that drives saving is `wrga_prune::save_requirements`.
+        PrimalOp::Mean { .. } => SavedRequirement::Inputs,
         _ => SavedRequirement::Nothing,
     }
 }
@@ -1111,11 +1127,13 @@ mod tests {
     }
 
     #[test]
-    fn test_mean_broadcasts() {
-        // Mean backward: broadcast grad (1/n scaling deferred to runtime tape backward)
+    fn test_mean_scales_then_broadcasts() {
+        // Mean backward: grad scaled by numel(out)/numel(in) at run time, then
+        // broadcast. A bare Broadcast is the N-times-too-large gradient this
+        // rule used to produce.
         let op = make_op(1, PrimalOp::Mean { dim: Some(0) }, vec![0]);
         let adj = apply_ad_rule(&op, 100);
-        assert!(matches!(adj[0].expr, AdjointExpr::Broadcast(100)));
+        assert!(matches!(adj[0].expr, AdjointExpr::MeanBackward(100, 0, 1)));
     }
 
     #[test]

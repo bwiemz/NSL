@@ -1684,6 +1684,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **Source AD: the gradient of a `mean` was N times too large.**
+  - **The bug.** The Mean adjoint rule (`ad_rules.rs`) emitted a bare
+    broadcast of the output gradient. It was commented as "for source AD
+    analysis", with the 1/N left to "the tape-based runtime backward". But
+    source AD lowers these rules and never runs the tape, so every
+    `mean(...)` in a source-AD train step had a gradient N× too large.
+  - **Who it hit.** Stdlib `mse_loss` has its own op and was correct, as was
+    `sum(...) / n`. An inline `mean(d * d)`, which is the loss of every train
+    CLIF fixture, was not. Under SGD such a program trained uphill: a
+    one-weight-matrix model moved 32× too far per step at N = 32. AdamW is
+    invariant to a uniform gradient scale, so a mean-reduced loss trained
+    almost the same, and every gate that trains with AdamW missed it.
+  - **The fix.** The adjoint now scales the gradient by
+    `numel(result) / numel(input)` at run time (the new `mean_grad_scale`
+    passthrough) before the broadcast.
+  - **The gate.** `source_ad_mean_backward_gate` trains an inline mean loss
+    with SGD in both AD modes against an f64 reference. Source AD was 0.387
+    off before the fix and is 4.5e-8 after. A mean inside a forward
+    (`x @ w + mean(x @ v)`) is also checked against its reference under tape
+    AD.
+  - **Snapshots.** 23 of the 24 source-AD train CLIF snapshots gain the
+    scaling: two `nsl_tensor_len` calls, a division, a `mul_scalar` and one
+    free. The three CSLA layerwise entries also buffer the mean's operand and
+    result for the window replay.
+  - **Found, not fixed here.** The source-AD Add/Sub adjoint is `Identity`,
+    with no reduction to the operand's shape. Parameter gradients are reduced
+    to their parameter's shape at the end, which is why bias adds work. A
+    broadcast *intermediate*, such as the scalar in `x @ w + mean(x @ v)`,
+    receives the unreduced gradient. The ignored test
+    `a_mean_inside_a_forward_trains_like_its_gradient_under_source_ad`
+    reproduces it.
+
 - Mutation audit, slice 6 (roadmap item 5): **three gradient gates could not
   see a gradient's size.** Every mutant below was planted and run against the
   gate before and after; evidence in
