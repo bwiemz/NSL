@@ -32,6 +32,7 @@ fn backward_live_filter_drops_adjoint_ops_for_frozen_param() {
                 freeze: vec![FreezeDecoratorConfig {
                     include: vec!["m.w".into()],
                     exclude: vec![],
+                    scope: None,
                 }],
                 ..Default::default()
             }),

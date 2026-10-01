@@ -124,7 +124,13 @@ impl Compiler<'_> {
         let surface_weights = builder.ins().iconst(cl_types::I8, SURFACE_WEIGHTS);
         self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[surface_weights])?;
 
+        self.freeze_ctx = Some(crate::stmt::TrainedModel {
+            var: model_var_name.clone(),
+            model: model_type_name.clone(),
+            binding: state.binding_stmts.get(&model_sym).copied(),
+        });
         let param_paths = self.enumerate_model_tensor_paths(&model_var_name, &model_type_name);
+        self.check_freeze_patterns(&model_var_name, &model_type_name, &param_paths)?;
         let param_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
         for path in &param_paths {
             let param_ptr = self

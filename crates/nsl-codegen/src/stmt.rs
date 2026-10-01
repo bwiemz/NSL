@@ -196,6 +196,16 @@ pub(crate) fn parse_layer_idx_for_health(path: &str) -> u32 {
         .unwrap_or(u32::MAX)
 }
 
+/// The model a train block trains: its variable, its model type, and the
+/// `let` statement that bound the variable (`None` for a parameter or a
+/// destructured name). A scoped `@freeze` is checked against it.
+#[derive(Debug, Clone)]
+pub(crate) struct TrainedModel {
+    pub(crate) var: String,
+    pub(crate) model: String,
+    pub(crate) binding: Option<nsl_ast::NodeId>,
+}
+
 pub(crate) fn classify_source_ad_param_name(
     param_name: &str,
     tensor_param_paths: &std::collections::HashSet<String>,
@@ -255,6 +265,7 @@ impl Compiler<'_> {
                 match &pattern.kind {
                     PatternKind::Ident(sym) => {
                         let sym = *sym;
+                        state.binding_stmts.insert(sym, stmt.id);
                         if let Some(expr) = value
                             && self.expr_is_borrowed_batch_handle(state, expr)
                         {
@@ -2569,7 +2580,185 @@ impl Compiler<'_> {
     ///      and `nsl_pipeline_destroy()`.
     ///
     pub(crate) fn is_trainable_param_name(&self, param_name: &str) -> bool {
-        is_trainable_param_leaf_name(param_name)
+        is_trainable_param_leaf_name(param_name) && !self.is_frozen_param_path(param_name)
+    }
+
+    /// Refuse an `@freeze` pattern that matches no parameter it reaches (a
+    /// typo would otherwise freeze nothing, silently), and warn when a freeze
+    /// leaves nothing to train. Only the
+    /// decorators that reach this train block's model are checked; one on
+    /// another model is that model's business. `param_paths` is the train
+    /// block's parameter list, frozen ones already left out.
+    pub(crate) fn check_freeze_patterns(
+        &self,
+        model_var_name: &str,
+        model_type_name: &str,
+        param_paths: &[String],
+    ) -> Result<(), crate::error::CodegenError> {
+        let Some(inputs) = self.wrga_inputs.as_ref() else {
+            return Ok(());
+        };
+        if inputs.freeze.is_empty() {
+            return Ok(());
+        }
+        let candidates: Vec<String> = self
+            .enumerate_all_model_tensor_paths(model_var_name, model_type_name)
+            .into_iter()
+            .filter(|p| {
+                let leaf = p.rsplit('.').next().unwrap_or(p);
+                is_trainable_param_leaf_name(p)
+                    && !crate::expr::access::is_synthesized_adapter_field_name(leaf)
+            })
+            .collect();
+        for f in &inputs.freeze {
+            let reached: Vec<(&String, Vec<String>)> = candidates
+                .iter()
+                .map(|p| (p, self.freeze_views(f, p)))
+                .filter(|(_, views)| !views.is_empty())
+                .collect();
+            if reached.is_empty() {
+                continue;
+            }
+            for pat in f.include.iter().chain(&f.exclude) {
+                if !reached.iter().any(|(_, views)| views.iter().any(|v| glob_match(pat, v))) {
+                    let names: Vec<&str> = reached.iter().map(|(p, _)| p.as_str()).collect();
+                    return Err(crate::error::CodegenError::new(format!(
+                        "@freeze pattern '{pat}' matches no parameter it reaches in \
+                         '{model_var_name}' (a pattern matches a full path, or the path \
+                         below the binding or model the @freeze decorates); those \
+                         parameters are: {}",
+                        names.join(", ")
+                    )));
+                }
+            }
+        }
+        // Freezing every parameter is an explicit request (a bare `@freeze`,
+        // or patterns naming them all), not a silent miss like a pattern that
+        // matches nothing, and `nsl check --wrga-analyze` / `--wrga-report`
+        // analyse fully frozen models on purpose. The train block runs and
+        // updates nothing; say so.
+        if param_paths.is_empty() {
+            nsl_log::nsl_log!(
+                WARN,
+                "nsl",
+                "[nsl] @freeze leaves '{model_var_name}' with no trainable parameter: \
+                 the train block will update nothing (add an @adapter to train \
+                 against the frozen base)"
+            );
+        }
+        Ok(())
+    }
+
+    /// Whether `@freeze` freezes the parameter at `path` (`m.blocks.0.w`).
+    ///
+    /// Each `@freeze` reaches only what it decorates ([`Self::freeze_views`]):
+    /// - `@freeze(include=[...])` freezes the parameters a pattern matches;
+    /// - `@freeze(exclude=[...])` freezes every parameter no pattern matches;
+    /// - a bare `@freeze` freezes every parameter.
+    ///
+    /// Several decorators freeze the union. Patterns use `*` and `?`
+    /// ([`glob_match`]). An adapter's synthesized tensor (`lora_A_*`, ...) is
+    /// never frozen: it exists to be trained against a frozen base.
+    pub(crate) fn is_frozen_param_path(&self, path: &str) -> bool {
+        let Some(inputs) = self.wrga_inputs.as_ref() else {
+            return false;
+        };
+        if inputs.freeze.is_empty() {
+            return false;
+        }
+        let leaf = path.rsplit('.').next().unwrap_or(path);
+        if crate::expr::access::is_synthesized_adapter_field_name(leaf) {
+            return false;
+        }
+        inputs.freeze.iter().any(|f| {
+            let views = self.freeze_views(f, path);
+            if views.is_empty() {
+                false
+            } else if !f.include.is_empty() {
+                f.include.iter().any(|pat| views.iter().any(|v| glob_match(pat, v)))
+            } else if !f.exclude.is_empty() {
+                !f.exclude.iter().any(|pat| views.iter().any(|v| glob_match(pat, v)))
+            } else {
+                true
+            }
+        })
+    }
+
+    /// The names one `@freeze` matches its patterns against for `path`, or
+    /// none when the decorator does not reach `path`. A scoped freeze reaches
+    /// only the model the current train block trains ([`TrainedModel`]):
+    /// - on `let m = ...`: when that model is the one this `let` bound, the
+    ///   path as written and below `m` (`m.blocks.0.w` and `blocks.0.w`);
+    /// - on `model Blk:`: the path below every `Blk` instance the model holds
+    ///   (`w` for `m.blocks.0.w`), plus the full path.
+    ///
+    /// A hand-built unscoped config reaches any path, the same two ways.
+    fn freeze_views(&self, cfg: &crate::FreezeDecoratorConfig, path: &str) -> Vec<String> {
+        let parts: Vec<&str> = path.split('.').collect();
+        let rooted = || -> Vec<String> {
+            let mut v = vec![path.to_string()];
+            if parts.len() > 1 {
+                v.push(parts[1..].join("."));
+            }
+            v
+        };
+        let trained = self
+            .freeze_ctx
+            .as_ref()
+            .filter(|t| parts.first() == Some(&t.var.as_str()));
+        match &cfg.scope {
+            None => rooted(),
+            Some(crate::FreezeScope::Binding { var, stmt }) => match trained {
+                Some(t) if t.var == *var && t.binding == Some(*stmt) => rooted(),
+                _ => Vec::new(),
+            },
+            Some(crate::FreezeScope::Model(model)) => match trained {
+                Some(t) => {
+                    let mut v = self.model_instance_suffixes(&t.model, &parts, model);
+                    if !v.is_empty() {
+                        v.push(path.to_string());
+                    }
+                    v
+                }
+                None => Vec::new(),
+            },
+        }
+    }
+
+    /// For a parameter path of the trained model (of type `root_model`), the
+    /// path below each instance of `model` along it: the root itself, a
+    /// sub-model field, or an element of an inline `[Model; N]` array.
+    fn model_instance_suffixes(&self, root_model: &str, parts: &[&str], model: &str) -> Vec<String> {
+        let mut current = root_model.to_string();
+        let mut out = Vec::new();
+        if current == model && parts.len() > 1 {
+            out.push(parts[1..].join("."));
+        }
+        // The last component is the tensor itself; every earlier one walks
+        // into a sub-model or an array element.
+        let mut i = 1;
+        while i + 1 < parts.len() {
+            let Some(field_type) =
+                self.models.model_field_types.get(&current).and_then(|f| f.get(parts[i])).cloned()
+            else {
+                break;
+            };
+            if field_type.starts_with('[') && field_type.contains(';') {
+                // `blocks: [Blk; N]`: the next component is the element index.
+                let inner = field_type.trim_start_matches('[').trim_end_matches(']');
+                current = inner.split(';').next().unwrap_or("").trim().to_string();
+                i += 1;
+            } else if self.types.struct_layouts.contains_key(&field_type) {
+                current = field_type;
+            } else {
+                break;
+            }
+            if current == model && i + 1 < parts.len() {
+                out.push(parts[i + 1..].join("."));
+            }
+            i += 1;
+        }
+        out
     }
 
     pub(crate) fn enumerate_all_model_tensor_paths(&self, var_name: &str, type_name: &str) -> Vec<String> {

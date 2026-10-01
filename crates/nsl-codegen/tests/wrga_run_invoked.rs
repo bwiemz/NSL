@@ -45,6 +45,7 @@ fn wrga_run_fires_for_train_block_with_freeze() {
                 freeze: vec![FreezeDecoratorConfig {
                     include: vec!["m.w".into()],
                     exclude: vec![],
+                    scope: None,
                 }],
                 ..Default::default()
             }),

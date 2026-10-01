@@ -1753,6 +1753,76 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **`@freeze` froze nothing.** The decorator was validated and handed to
+  WRGA's analysis, and nothing in the train block read it. A frozen weight
+  stayed in the optimizer's parameter list and trained exactly as if
+  unfrozen, in both AD modes, so a LoRA fine-tune that froze its base
+  trained the base anyway.
+  - **The fix.** One predicate, `Compiler::is_frozen_param_path`, decides
+    which parameters are frozen, and every "is this trainable?" question
+    asks it:
+    - a frozen parameter is left out of `param_list`, so the optimizer never
+      steps it, the tape does not track it, and it is not in checkpoint
+      names or ZeRO's partition;
+    - its adjoint is not "needed", so source AD's dead-gradient pass drops
+      its weight gradient;
+    - source AD's gradient alignment skips it, and its summary line counts
+      it as `frozen`;
+    - WRGA's trainable allowlist is built from the same predicate.
+  - **Semantics.**
+    - `include=[...]` freezes the matches; `exclude=[...]` freezes every
+      parameter no pattern matches; a bare `@freeze` freezes every
+      parameter. Several decorators freeze the union.
+    - A freeze reaches only what it decorates. The checker records the
+      target, and patterns are matched against what that target can see:
+      - on `let m = ...`, the parameters of the model that statement bound,
+        when a train block trains it, with or without the `m.` (`blocks.*.w`
+        names `m.blocks.0.w`). The target is the `let` statement's id, not
+        the name, so another `let m` (rebinding the name) is another model;
+      - on `model Blk:`, the path below every `Blk` instance the trained
+        model holds, array elements included.
+
+      A freeze on one model never reaches another model's same-named
+      weights (CPKD's teacher and student, say). Each train block records
+      the model it trains (variable, type, binding statement), and clears
+      the record when the block ends.
+    - Patterns use `*` and `?` anywhere.
+    - An adapter's tensors are never frozen, so `@freeze` beside `@adapter`
+      trains only the adapter.
+  - **A typo is refused.** A pattern that matches no parameter its freeze
+    reaches used to freeze nothing silently; it is now a compile error that
+    lists those parameters. A freeze on another model is not checked against
+    this one.
+  - **Freezing everything warns.** A freeze that leaves nothing to train is
+    an explicit request (`nsl check --wrga-analyze` and `--wrga-report`
+    analyse fully frozen models on purpose). The train block runs, updates
+    nothing, and says so.
+  - **The gate.** `freeze_decorator_gate` trains with SGD in both AD modes
+    (9 tests). Cases:
+    - `include`, `exclude`, and a frozen weight downstream of a trained
+      one (its gradient still flows through);
+    - a bare `@freeze` with a LoRA adapter;
+    - a freeze on other bindings, one of the trained model's own type, and
+      on an earlier `let` of the trained model's own name;
+    - `@freeze` on a model definition, over a `[Blk; 2]` array.
+
+    Each frozen weight comes out of training bit-identical. Every trained
+    tensor is within 7.1e-8 of an f64 reference computed with the frozen
+    ones held fixed. The typo refusal is tested, and so is a fully frozen
+    model, which runs, warns and leaves every weight unchanged. Mutants:
+    - disabling the predicate fails the freezing tests;
+    - ignoring the scope fails the scoping tests;
+    - matching a binding by name alone fails the rebinding test.
+  - **Snapshot.** The new `wrga_lora_frozen_source_ad` is `wrga_lora` with a
+    bare `@freeze`. Against `wrga_lora_source_ad`, its backward drops the
+    base weight's `x^T @ dy` (one matmul, one transpose, two reduces and
+    their frees), and its parameter list drops `w`.
+  - **Found, not fixed here.** A train block inside a user function
+    (`fn warm(): ... train(...)`) using `SGD` fails to link
+    (`undefined function 'nsl_optim_sgd__sgd_step'`). So the
+    same-name-in-another-function case is tested through a rebinding in one
+    scope, which exercises the same check.
+
 - **LoRA adapters crashed under tape AD and on `[Blk; N]` layers, and never
   trained in either AD mode.** `@adapter(type=lora, target=["Toy.w"])`
   rewrites `x @ self.w` into `x @ w + ((x @ A) @ B) * (alpha / rank)`, with

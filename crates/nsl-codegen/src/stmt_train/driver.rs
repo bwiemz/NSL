@@ -352,6 +352,10 @@ impl Compiler<'_> {
         let result =
             self.compile_train_block_inner(builder, state, train, train_block_stmt_id);
         self.restore_active_fused_ce_config(saved_active_fused_ce);
+        // The scoped-`@freeze` context names THIS block's model; a later
+        // block (or code after this one) must not see it. Cleared on every
+        // path, like the two below.
+        self.freeze_ctx = None;
         // Item 5: the placement map is keyed by VarIds from THIS block's
         // extraction, and the VarId counter restarts per extraction — so
         // leaving it installed would apply this block's byte offsets to the

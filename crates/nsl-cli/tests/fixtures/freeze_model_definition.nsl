@@ -1,0 +1,51 @@
+# @freeze on a model DEFINITION (see freeze_decorator_gate.rs) freezes every
+# instance of that model the trained model holds: both `Blk`s of `blocks`.
+# `Net`'s own `head` trains. Every weight is a random draw, printed for the
+# test's reference.
+from nsl.nn.losses import mse_loss
+
+@freeze
+model Blk:
+    w: Tensor = randn([4, 4]) * 0.3
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+model Net:
+    blocks: [Blk; 2] = Blk()
+    head: Tensor = randn([4, 4]) * 0.3
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = x
+        for block in self.blocks:
+            h = block.forward(h)
+        return h @ self.head
+
+let m = Net()
+print("W0_BEGIN")
+for block in m.blocks:
+    let w0: Tensor = block.w
+    print(w0)
+print("W0_END")
+let head0: Tensor = m.head
+print("HEAD0_BEGIN")
+print(head0)
+print("HEAD0_END")
+
+let x = (arange(12).reshape([3, 4])) * 0.1 + full([3, 4], 0.1)
+let y = (arange(12).reshape([3, 4])) * 0.2 - full([3, 4], 1.0)
+
+train(model = m, epochs = 4):
+    optimizer: SGD(lr = 0.1)
+    step(batch):
+        let loss = mse_loss(m.forward(x), y)
+
+print("W_BEGIN")
+for block in m.blocks:
+    let w: Tensor = block.w
+    print(w)
+print("W_END")
+let head: Tensor = m.head
+print("HEAD_BEGIN")
+print(head)
+print("HEAD_END")

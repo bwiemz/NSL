@@ -318,6 +318,21 @@ fn with_lora_adapter(options: CompileOptions) -> CompileOptions {
     }
 }
 
+/// [`with_lora_adapter`] plus the bare `@freeze` of `wrga_lora_frozen.nsl`.
+fn with_lora_adapter_frozen(options: CompileOptions) -> CompileOptions {
+    let mut options = with_lora_adapter(options);
+    if let Some(inputs) = options.wrga.inputs.as_mut() {
+        inputs.freeze.push(nsl_codegen::FreezeDecoratorConfig {
+            exclude: Vec::new(),
+            include: Vec::new(),
+            // Unscoped: a hand-built config has no `let` statement id to bind
+            // to, and the fixture trains its one model.
+            scope: None,
+        });
+    }
+    options
+}
+
 /// One snapshot per (program, options) pair. The program name is the
 /// fixture file under `tests/train_clif/`; the snapshot is named
 /// `<program>_<variant>`. Also defines `matrix()`, the whole table, for
@@ -454,6 +469,7 @@ snapshots! {
     attention_csha: "attention", CompileOptions { csha: nsl_codegen::CshaOptions { mode: Some("auto".to_string()), ..Default::default() }, ..source_ad() };
     wrga_base_source_ad: "wrga_base", source_ad();
     wrga_lora_source_ad: "wrga_lora", with_lora_adapter(source_ad());
+    wrga_lora_frozen_source_ad: "wrga_lora_frozen", with_lora_adapter_frozen(source_ad());
     sgd_source_ad: "sgd", source_ad();
     mlp_adamw_tape: "mlp_adamw", tape();
     mlp_adamw_source_ad: "mlp_adamw", source_ad();

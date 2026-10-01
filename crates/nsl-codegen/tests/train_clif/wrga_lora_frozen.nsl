@@ -1,0 +1,26 @@
+# `wrga_lora.nsl` with its base frozen: a bare `@freeze` beside the LoRA
+# adapter, as a LoRA fine-tune is written. Its snapshot pins what freezing
+# removes: the base weight's place in the parameter list and its weight
+# gradient (the dead-gradient pass drops the `x^T @ dy` matmul for `w`).
+# Import-free on purpose: the harness compiles the entry module alone.
+
+model Toy:
+    w: Tensor = ones([8, 8]) * 0.1
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+@freeze
+@adapter(type=lora, target=["Toy.w"], rank=2, alpha=2)
+let m = Toy()
+let x = ones([4, 8])
+let y = zeros([4, 8])
+
+train(model = m, epochs = 1):
+    optimizer: AdamW(lr = 0.01)
+    step(batch):
+        let pred = m.forward(x)
+        let d = pred - y
+        let loss = mean(d * d)
+
+print(sum(m.w))

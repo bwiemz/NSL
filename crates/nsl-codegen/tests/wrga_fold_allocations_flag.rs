@@ -35,6 +35,7 @@ fn compile_with_flag(flag: bool) -> Option<()> {
                 freeze: vec![FreezeDecoratorConfig {
                     include: vec!["m.w1".into(), "m.w2".into()],
                     exclude: vec![],
+                    scope: None,
                 }],
                 ..Default::default()
             }),

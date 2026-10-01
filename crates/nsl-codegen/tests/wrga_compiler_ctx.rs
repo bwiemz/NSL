@@ -28,6 +28,7 @@ fn wrga_inputs_reach_compiler_without_crashing() {
                 freeze: vec![FreezeDecoratorConfig {
                     exclude: vec!["blocks.6.*".into()],
                     include: vec![],
+                    scope: None,
                 }],
                 ..Default::default()
             }),
