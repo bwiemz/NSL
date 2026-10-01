@@ -268,7 +268,7 @@ scheduled passes.
   (callee-side), which is what covers drivers nobody wrapped.
 - `src/pass_bus.rs` — `PassBus` (reached as `compiler.bus`) with one private
   field per `Channel` (`CshaBridge`, `CshaClaimedOps`, `CshaBackwardClaims`,
-  `WrgaPlan`, `AdapterPrescanPlan`, `CpkdPlan`, `CpdtPlan`, `CfiePlan`,
+  `WrgaPlan`, `CpkdPlan`, `CpdtPlan`, `CfiePlan`,
   `WggoOverrides`, `WggoPreplans`, `AdapterSites`, `CfieServeGen`), each
   described by a `ChannelDescriptor` in `CHANNELS` (producer, consumers,
   `consumed_by_passes`, `dead_output` / `applied_implies_published` /

@@ -1105,6 +1105,23 @@ impl Compiler<'_> {
             &[model_ptr, num_fields, device_val],
         )?;
 
+        // The instance's adapter side-table (`wrga_adapter_init`) is a block
+        // of tensor slots too; the same walk moves it with the weights it
+        // adapts. A null table (no adapter) is a no-op in the runtime.
+        if let Some(slot_off) = layout.adapter_sidetable_offset {
+            let n_slots = crate::wrga_adapter_init::sidetable_len(self, model_name);
+            if n_slots > 0 {
+                let table = builder.ins().load(
+                    cl_types::I64,
+                    cranelift_codegen::ir::MemFlagsData::trusted(),
+                    model_ptr,
+                    slot_off as i32,
+                );
+                let n = builder.ins().iconst(cl_types::I64, n_slots as i64);
+                self.compile_call_by_name(builder, "nsl_model_to_device", &[table, n, device_val])?;
+            }
+        }
+
         // Recurse into sub-model fields and fixed-size model arrays
         let field_types = self.models.model_field_types.get(model_name).cloned();
         for field in &layout.fields {

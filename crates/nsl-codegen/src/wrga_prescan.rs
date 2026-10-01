@@ -197,8 +197,7 @@ pub(crate) fn prescan_adapter_sites_from_decorators(compiler: &mut Compiler<'_>)
     }
 
     compiler.bus.publish_adapter_sites(sites);
-    compiler.bus.publish_wrga_plan(plan.clone());
-    compiler.bus.publish_adapter_prescan_plan(plan);
+    compiler.bus.publish_wrga_plan(plan);
 }
 
 /// WRGA B.3.2 Option 3 phase 3e: apply the adapter rewrite to

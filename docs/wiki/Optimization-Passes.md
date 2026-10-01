@@ -116,7 +116,6 @@ on `compiler.bus`, each filled by exactly one pass and read by later stages.
 | `csha_claimed_ops` | CSHA | `Compiler::is_csha_claimed` |
 | `csha_backward_claims` | CSHA | the source-AD reverse walk, CCR's claim exemption |
 | `wrga_plan` | WRGA | adapter init/inject, `compile*_returning_plan` |
-| `adapter_prescan_plan` | WRGA | train-block adapter injection |
 | `adapter_sites` | WRGA | adapter rewrite, synthesized-field access |
 | `cpkd_plan` | CPKD | the distillation build report |
 | `cpdt_plan` | CPDT | the precision-adaptive optimizer path |

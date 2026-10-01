@@ -1,0 +1,42 @@
+# LoRA adapter training (see lora_adapter_training_gate.rs). The adapter on
+# `Toy.w` makes the forward `x @ w + ((x @ A) @ B) * (alpha / rank)`; A is a
+# random draw and w is one too; both are printed so the test can start its
+# reference from them, and B starts at zero. All three tensors train.
+from nsl.nn.losses import mse_loss
+
+model Toy:
+    w: Tensor = randn([4, 4]) * 0.3
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+@adapter(type=lora, target=["Toy.w"], rank=2, alpha=4)
+let m = Toy()
+let w0: Tensor = m.w
+print("W0_BEGIN")
+print(w0)
+print("W0_END")
+let a0: Tensor = m.lora_A_Toy_w__lora
+print("A0_BEGIN")
+print(a0)
+print("A0_END")
+
+let x = (arange(12).reshape([3, 4])) * 0.1 + full([3, 4], 0.1)
+let y = (arange(12).reshape([3, 4])) * 0.2 - full([3, 4], 1.0)
+
+train(model = m, epochs = 4):
+    optimizer: SGD(lr = 0.1)
+    step(batch):
+        let loss = mse_loss(m.forward(x), y)
+
+print("W_BEGIN")
+print(m.w)
+print("W_END")
+let a: Tensor = m.lora_A_Toy_w__lora
+print("A_BEGIN")
+print(a)
+print("A_END")
+let b: Tensor = m.lora_B_Toy_w__lora
+print("B_BEGIN")
+print(b)
+print("B_END")

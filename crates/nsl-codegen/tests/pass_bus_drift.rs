@@ -93,8 +93,11 @@ fn every_channel_producer_is_a_registered_pass() {
             d.producer
         );
     }
+    // 11 since `adapter_prescan_plan` was retired: its one reader, the
+    // train-block adapter init, moved into the model constructor, which
+    // builds the side-table from `adapter_sites`.
     assert!(
-        CHANNELS.len() >= 12,
+        CHANNELS.len() >= 11,
         "only {} channels — the list shrank; if a channel was genuinely \
          removed, lower this floor deliberately",
         CHANNELS.len()

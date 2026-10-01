@@ -198,21 +198,11 @@ impl Compiler<'_> {
             };
             grad_connected += 1;
 
-            // WRGA B.3.2 Option 3: adapter-injected params (lora_A_*,
-            // lora_B_*, ia3_scale_*, gate_*) are NOT in the runtime
-            // param_list (the runtime list is built from
-            // `enumerate_model_tensor_paths`, which excludes side-table
-            // entries). Skip the align-with-runtime scan for them —
-            // we count them as connected for the gradient-summary
-            // diagnostic but don't emit the `nsl_assert` that would
-            // always fire "missing param" for these paths.
-            let leaf = param_name
-                .rsplit('.')
-                .next()
-                .unwrap_or(param_name.as_str());
-            if crate::expr::access::is_synthesized_adapter_field_name(leaf) {
-                continue;
-            }
+            // Adapter tensors (lora_A_*, ...) are in the runtime param_list
+            // (`enumerate_model_tensor_paths`), so their gradients align and
+            // reach the optimizer like any parameter's. They used to be
+            // skipped here, which computed every adapter gradient and then
+            // dropped it.
 
             let scan_i_var = builder.declare_var(cl_types::I64);
             let scan_match_count_var = builder.declare_var(cl_types::I64);

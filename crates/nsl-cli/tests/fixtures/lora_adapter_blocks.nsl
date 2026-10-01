@@ -1,0 +1,57 @@
+# LoRA adapters on the layers of a `[Blk; 2]` array (see
+# lora_adapter_training_gate.rs). Each element is its own instance with its
+# own adapter tensors, built by its constructor. Each block's random w and A
+# are printed so the test can start its reference from them.
+from nsl.nn.losses import mse_loss
+
+model Blk:
+    w: Tensor = randn([4, 4]) * 0.3
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+model Net:
+    blocks: [Blk; 2] = Blk()
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = x
+        for block in self.blocks:
+            h = block.forward(h)
+        return h
+
+@adapter(type=lora, target=["Blk.w"], rank=2, alpha=2)
+let m = Net()
+print("W0_BEGIN")
+for block in m.blocks:
+    let w0: Tensor = block.w
+    print(w0)
+print("W0_END")
+print("A0_BEGIN")
+for block in m.blocks:
+    let a0: Tensor = block.lora_A_Blk_w__lora
+    print(a0)
+print("A0_END")
+
+let x = (arange(12).reshape([3, 4])) * 0.1 + full([3, 4], 0.1)
+let y = (arange(12).reshape([3, 4])) * 0.2 - full([3, 4], 1.0)
+
+train(model = m, epochs = 4):
+    optimizer: SGD(lr = 0.1)
+    step(batch):
+        let loss = mse_loss(m.forward(x), y)
+
+print("W_BEGIN")
+for block in m.blocks:
+    let w: Tensor = block.w
+    print(w)
+print("W_END")
+print("A_BEGIN")
+for block in m.blocks:
+    let a: Tensor = block.lora_A_Blk_w__lora
+    print(a)
+print("A_END")
+print("B_BEGIN")
+for block in m.blocks:
+    let b: Tensor = block.lora_B_Blk_w__lora
+    print(b)
+print("B_END")
