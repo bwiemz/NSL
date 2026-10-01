@@ -406,10 +406,9 @@ impl PassScheduler {
         // every later module, so a later compile whose own epoch has no WGGO
         // would be refused. That is the #466 finding exactly. And even scoped
         // to this compile's bus it stays wrong, because publisher and
-        // recorded pass legitimately differ — `adapter_prescan_plan`'s own
-        // descriptor says it is "published by the driver prescan, which never
-        // records WRGA as having run, so the antecedent cannot be
-        // established for it".
+        // recorded pass legitimately differ — `adapter_sites`' own
+        // descriptor says it is "also published by the driver prescan, which
+        // never records WRGA as having run".
         //
         // Enforcement therefore stays where it is sound:
         // [`PassManager::enforce_dependency_order`], which fires only when

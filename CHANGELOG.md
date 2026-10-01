@@ -1684,6 +1684,60 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **LoRA adapters crashed under tape AD and on `[Blk; N]` layers, and never
+  trained in either AD mode.** `@adapter(type=lora, target=["Toy.w"])`
+  rewrites `x @ self.w` into `x @ w + ((x @ A) @ B) * (alpha / rank)`, with
+  A and B in a side-table hanging off the model instance.
+  - **Tape AD aborted on the first forward.** The side-table was built only
+    at source-AD train-block entry. Under tape AD (the default) the forward
+    read a null A, and `x @ A` aborted with `invalid tensor handle 0x0`.
+  - **Adapters on the layers of a `[Blk; N]` array aborted under source AD
+    too.** Only the top-level instance got a table, and the adapter load
+    walk could not step through an inline array field. Each
+    `m.blocks.0.lora_A_…` resolved to a null placeholder.
+  - **A and B never trained.** They were in neither AD mode's optimizer
+    parameter list, so source AD computed their gradients and then dropped
+    them. A run that worked trained `w` alone, and B stayed at zero, so the
+    adapter contributed nothing.
+  - **The fix.**
+    - Each model constructor now builds its instance's side-table
+      (`wrga_adapter_init`). That covers a top-level model, a sub-model
+      field and every array element, in either AD mode and outside train
+      blocks. The table is laid out from `bus.adapter_sites()` in the order
+      `adapter_field_index` counts, and every temporary of the init is freed.
+    - An adapter tensor is an ordinary parameter path. `plan_nested_field`
+      reaches it through a new `FieldStep::AdapterSlot`, so the param list
+      (and with it the tape, the optimizer, checkpoint names and ZeRO's
+      partition) and source AD's primal map include it.
+    - The hand-rolled `AdapterLoads` walk is gone.
+    - `.to(device)` moves the side-table with the instance's weights.
+    - The train-block WRGA run no longer replaces a pre-scan site list,
+      since the constructors were built against it.
+    - The `adapter_prescan_plan` bus channel lost its only reader and is
+      retired.
+  - **The gate.** `lora_adapter_training_gate` trains a flat model and a
+    `[Blk; 2]` model with SGD in both AD modes. Each fixture prints its
+    random initial `w` and `A`, and the test holds the final `w`, `A` and `B`
+    to an f64 reference trajectory started from them. Both modes are within
+    6e-8 everywhere. Two planted mutants each fail it: source AD dropping
+    adapter gradients again, and adapters left out of the param list.
+  - **On the device.** The WRGA adapter suites, run on sm_120 with
+    `--features cuda --include-ignored`, are 26/26: both gate tests, the
+    fused LoRA/GatedLoRA/IA³ fixtures, and `wrga_gatedlora_backward_trigger`.
+    `cranelift_and_source_ad_see_same_rewritten_ast` passes too. It had been
+    parked as `broken` for a segfault on a top-level read of an adapter
+    field after a train block; it is now a `requires CUDA GPU` cert gate.
+  - **Snapshot.** In `wrga_lora_source_ad` the adapter init moves from the
+    train block into the `Toy` constructor. The train block gains the two
+    adapters' param-list entries and gradient alignment.
+  - **Found, not fixed here.**
+    - `@freeze(include=[...])` does not freeze anything: the base weight
+      trains identically with or without it, in both AD modes. A LoRA
+      fine-tune that means to freeze its base does not.
+    - Reading a synthesized adapter field in NSL source needs a typed `let`
+      (`let a: Tensor = m.lora_A_Toy_w__lora`); a bare `print(m.lora_A_…)`
+      prints the handle as an integer.
+
 - **Source AD: the gradient of a `mean` was N times too large.**
   - **The bug.** The Mean adjoint rule (`ad_rules.rs`) emitted a bare
     broadcast of the output gradient. It was commented as "for source AD

@@ -165,9 +165,6 @@ pub enum Channel {
     CshaBackwardClaims,
     /// The WRGA plan: adapter placement, freeze decisions, fusion groups.
     WrgaPlan,
-    /// WRGA's prescan plan, produced before any train block so adapter
-    /// injection can rewrite model methods that the main plan has not seen.
-    AdapterPrescanPlan,
     /// CPKD's distillation facts, rendered as a build report.
     CpkdPlan,
     /// The CPDT plan, read by the precision-adaptive optimizer path.
@@ -207,7 +204,6 @@ impl Channel {
         Channel::CshaClaimedOps,
         Channel::CshaBackwardClaims,
         Channel::WrgaPlan,
-        Channel::AdapterPrescanPlan,
         Channel::CpkdPlan,
         Channel::CpdtPlan,
         Channel::CfiePlan,
@@ -401,8 +397,8 @@ pub struct ChannelDescriptor {
 ///   the same driver that reads it. A guard, not a channel.
 /// * `last_csha_bridge`-adjacent emission state (`csha_forward_saves`,
 ///   `csha_fa_call_ordinal`) — written by op lowering, read by op lowering.
-/// * `retention_arena_data_id` / `retention_offsets` / `adapter_prescan_plan`'s
-///   sibling `synth_member_names` — codegen layout tables.
+/// * `retention_arena_data_id` / `retention_offsets` / `synth_member_names` —
+///   codegen layout tables.
 ///
 /// The first two are the ones most likely to be genuine channels on a closer
 /// look. Neither is claimed here to be settled.
@@ -514,29 +510,6 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
              before the entry compile publishes, and the profile pre-pass \
              deliberately reads at compile start",
         ),
-    },
-    ChannelDescriptor {
-        channel: Channel::AdapterPrescanPlan,
-        name: "adapter_prescan_plan",
-        producer: "WRGA",
-        carries: "crate::wrga::WrgaPlan",
-        consumers: &["crates/nsl-codegen/src/stmt_train/adapter_sites.rs"],
-        empty_means: "the prescan did not run (no adapter decorators), so \
-                      train-block adapter injection has nothing to apply",
-        consumed_by_passes: &[],
-        dead_output: Invariant::Exempt(
-            "the prescan publishes unconditionally, and the train-block plan \
-             supersedes it whenever that block has decorated placements — an \
-             unread prescan plan is the designed-for case, not a defect",
-        ),
-        applied_implies_published: Invariant::Exempt(
-            "published by the driver prescan, which never records WRGA as \
-             having run, so the antecedent cannot be established for it",
-        ),
-        // The prescan publishes before any train block; the sole read is
-        // train-block adapter injection. A compile with no prescan never
-        // publishes, so its empty reads cannot arm the finding.
-        read_before_publish: Invariant::Enforced,
     },
     ChannelDescriptor {
         channel: Channel::CpkdPlan,
@@ -725,6 +698,11 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
             "crates/nsl-codegen/src/wrga_adapter_rewrite.rs",
             "crates/nsl-codegen/src/stmt.rs",
             "crates/nsl-codegen/src/expr/access.rs",
+            // Each model constructor builds its adapter side-table from the
+            // sites (slot layout = `adapter_field_index`'s order).
+            "crates/nsl-codegen/src/wrga_adapter_init.rs",
+            // The train-block WRGA run keeps a pre-scan list it finds.
+            "crates/nsl-codegen/src/stmt_pass_bridges.rs",
         ],
         empty_means: "no adapter decorators resolved, so field access finds no \
                       synthesized adapter members and nothing is injected",
@@ -942,7 +920,6 @@ pub struct PassBus {
     csha_claimed_ops: std::collections::HashSet<u32>,
     csha_backward_claims: Option<crate::source_ad::CshaBackwardClaims>,
     wrga_plan: Option<crate::wrga::WrgaPlan>,
-    adapter_prescan_plan: Option<crate::wrga::WrgaPlan>,
     cpkd_plan: Option<crate::cpkd::CpkdPlan>,
     cpdt_plan: Option<crate::cpdt::CpdtPlan>,
     cfie_plan: Option<crate::cfie::CfiePlan>,
@@ -1040,7 +1017,6 @@ impl PassBus {
             Channel::CshaClaimedOps => !self.csha_claimed_ops.is_empty(),
             Channel::CshaBackwardClaims => self.csha_backward_claims.is_some(),
             Channel::WrgaPlan => self.wrga_plan.is_some(),
-            Channel::AdapterPrescanPlan => self.adapter_prescan_plan.is_some(),
             Channel::CpkdPlan => self.cpkd_plan.is_some(),
             Channel::CpdtPlan => self.cpdt_plan.is_some(),
             Channel::CfiePlan => self.cfie_plan.is_some(),
@@ -1113,17 +1089,6 @@ impl PassBus {
 
     pub fn wrga_plan(&self) -> Option<&crate::wrga::WrgaPlan> {
         note_read(Channel::WrgaPlan, self.wrga_plan.as_ref())
-    }
-
-    // ── WRGA adapter prescan plan ────────────────────────────────────
-
-    pub fn publish_adapter_prescan_plan(&mut self, v: crate::wrga::WrgaPlan) {
-        note_publish(Channel::AdapterPrescanPlan);
-        self.adapter_prescan_plan = Some(v);
-    }
-
-    pub fn adapter_prescan_plan(&self) -> Option<&crate::wrga::WrgaPlan> {
-        note_read(Channel::AdapterPrescanPlan, self.adapter_prescan_plan.as_ref())
     }
 
     // ── CPKD plan ────────────────────────────────────────────────────
@@ -1300,10 +1265,10 @@ pub enum BusFinding {
 ///
 /// Even with all of that, neither rule is universal — see [`Invariant`]. Both
 /// consult the channel's own declaration, because for several channels the
-/// tree does the flagged thing deliberately: `adapter_prescan_plan` is
-/// published speculatively and superseded, and `csha_backward_claims` is
-/// legitimately left empty by a CSHA that applies but whose chains the backward
-/// SMEM validator rejects. Reporting those would be reporting correct code, and
+/// tree does the flagged thing deliberately: `adapter_sites` is also published
+/// by a driver prescan that never records WRGA as having run, and
+/// `csha_backward_claims` is legitimately left empty by a CSHA that applies but
+/// whose chains the backward SMEM validator rejects. Reporting those would be reporting correct code, and
 /// a finding that cries wolf is a finding nobody reads.
 pub fn findings() -> Vec<BusFinding> {
     let ran = crate::pass_trace::observed();
@@ -1530,12 +1495,11 @@ pub fn report() -> String {
 /// The phases the producing PASS declares it is invoked from.
 ///
 /// **Not a claim about where the publish happens**, and the difference is
-/// real: WRGA's adapter prescan fills [`Channel::AdapterPrescanPlan`] and
-/// [`Channel::AdapterSites`] from the driver, before any train block, without
-/// calling `pass_trace::record("WRGA")` — so for those two edges this returns
-/// `[TrainBlock]`, a phase in which the publish demonstrably does not occur.
-/// Both descriptors record that, and both exempt themselves from
-/// `applied_implies_published` for the same reason.
+/// real: WRGA's adapter prescan fills [`Channel::AdapterSites`] from the
+/// driver, before any train block, without calling `pass_trace::record("WRGA")`
+/// — so for that edge this returns `[TrainBlock]`, a phase in which the publish
+/// demonstrably does not occur. Its descriptor records that, and exempts itself
+/// from `applied_implies_published` for that reason.
 ///
 /// This is step 1's finding recurring one level down: the phase a pass is
 /// *invoked* from is not the phase its *output* appears in, any more than the

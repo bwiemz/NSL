@@ -2650,27 +2650,22 @@ impl Compiler<'_> {
             }
         }
 
-        // WRGA B.3.2 Option 3: include synthesized adapter-injected fields
-        // (lora_A_*, lora_B_*, ia3_scale_*, gate_*) in the ALL-paths
-        // enumeration. Source-AD reads this as `trainable_tensor_param_paths`
-        // so the gradient-summary diagnostic counts them (B.5 direct probe).
-        //
-        // Gated on `include_nontrainable` so `enumerate_model_tensor_paths`
-        // (used to build the runtime param_list) does NOT return these —
-        // runtime load via `load_nested_field` can't traverse the adapter
-        // side-table at that point in codegen.
-        if include_nontrainable {
-            for site in self.bus.adapter_sites() {
-                if site.target_model != type_name {
-                    continue;
-                }
-                if site.input_dim == 0 || site.output_dim == 0 {
-                    continue;
-                }
-                for synth in &site.synthesized_fields {
-                    let synth_path = format!("{}.{}", prefix, synth);
-                    paths.push(synth_path);
-                }
+        // WRGA: the synthesized adapter tensors (lora_A_*, lora_B_*,
+        // ia3_scale_*, gate_*) are trainable parameters of this instance, in
+        // the runtime param_list like any other: the optimizer updates them
+        // and the tape tracks them. They live in the instance's side-table,
+        // built by its constructor; `load_nested_field` reaches them through
+        // a `FieldStep::AdapterSlot`. Same filter and order as
+        // `adapter_field_index`.
+        for site in self.bus.adapter_sites() {
+            if site.target_model != type_name {
+                continue;
+            }
+            if site.input_dim == 0 || site.output_dim == 0 {
+                continue;
+            }
+            for synth in &site.synthesized_fields {
+                paths.push(format!("{}.{}", prefix, synth));
             }
         }
     }
@@ -2746,6 +2741,20 @@ impl Compiler<'_> {
 
             // Named field: look up in current struct layout
             let Some(field) = current_layout.fields.iter().find(|f| f.name == part) else {
+                // A synthesized adapter tensor (`lora_A_*`, ...) is no struct
+                // field: it lives in the instance's adapter side-table, which
+                // the constructor built (`wrga_adapter_init`).
+                if is_last
+                    && crate::expr::access::is_synthesized_adapter_field_name(part)
+                    && let Some(slot_offset) = current_layout.adapter_sidetable_offset
+                    && let Some(index) = self.adapter_field_index(&current_type_name, part)
+                {
+                    plan.steps.push(FieldStep::AdapterSlot {
+                        slot_offset: slot_offset as i32,
+                        byte_offset: (index * 8) as i32,
+                    });
+                    plan.resolved = true;
+                }
                 return plan;
             };
 
@@ -3016,6 +3025,9 @@ pub(crate) enum FieldStep {
     InlineArrayBase { offset: i64 },
     /// Load a struct field of type `ty` at `offset`.
     Load { ty: cranelift_codegen::ir::Type, offset: i32 },
+    /// Load the adapter side-table pointer at `slot_offset`, then the
+    /// adapter tensor at `byte_offset` in it.
+    AdapterSlot { slot_offset: i32, byte_offset: i32 },
 }
 
 /// Emit a [`FieldPlan`]'s steps from `base_ptr`, in order, and return the
@@ -3030,6 +3042,10 @@ pub(crate) fn emit_field_plan(builder: &mut FunctionBuilder, base_ptr: Value, pl
             FieldStep::ArrayElement { offset } => builder.ins().load(cl_types::I64, flags, current, offset),
             FieldStep::InlineArrayBase { offset } => builder.ins().iadd_imm_s(current, offset),
             FieldStep::Load { ty, offset } => builder.ins().load(ty, flags, current, offset),
+            FieldStep::AdapterSlot { slot_offset, byte_offset } => {
+                let table = builder.ins().load(cl_types::I64, flags, current, slot_offset);
+                builder.ins().load(cl_types::I64, flags, table, byte_offset)
+            }
         };
     }
     plan.resolved.then_some(current)

@@ -480,16 +480,12 @@ impl Compiler<'_> {
                 }
             }
 
-            // B.2.1: Zero-initialise the adapter-sidetable slot when present.
-            // Actual tensor allocation is deferred to a later pass that runs
-            // after `invoke_wrga_if_enabled` populates `bus.wrga_plan` — at
-            // constructor codegen time the adapter-site list is not yet known
-            // because WRGA fires during train-step source-AD compilation.
-            // Field-access codegen in `expr/access.rs` tolerates a null slot
-            // by falling through to the normal struct-offset path when the
-            // synthesized name also happens to match a real field (it does
-            // not in practice, so access returns null until the init pass is
-            // wired). See DONE_WITH_CONCERNS in the B.2.1 Task 2 report.
+            // WRGA: the adapter side-table. The pre-scan
+            // (`wrga_prescan::prescan_adapter_sites_from_decorators`) runs
+            // before any constructor is compiled, so the adapter sites are
+            // known here: every instance gets its table now, after its fields
+            // (the device reference) are initialised. A model no adapter
+            // targets keeps a null slot.
             if let Some(layout) = self.types.struct_layouts.get(&model_name)
                 && let Some(slot_off) = layout.adapter_sidetable_offset
             {
@@ -497,6 +493,12 @@ impl Compiler<'_> {
                 builder
                     .ins()
                     .store(MemFlagsData::trusted(), zero, ptr, slot_off as i32);
+                crate::wrga_adapter_init::emit_adapter_init_sidetable(
+                    self,
+                    &mut builder,
+                    ptr,
+                    &model_name,
+                )?;
             }
 
             // M25: Initialize paged KV cache if model has @paged_kv
