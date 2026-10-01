@@ -27,7 +27,7 @@ use crate::wengert::{PrimalOp, VarId, WengertList};
 ///
 /// This mirrors the `DataRequired` classification used by `source_ad.rs`: some
 /// ops (e.g. `Matmul`) need at least one input live at backward time; others
-/// (e.g. `Relu`) need the *output* live; and some (e.g. `Add`) need neither.
+/// (e.g. `Relu`) need the *output* live; and some (e.g. `Neg`) need neither.
 pub(crate) fn save_requirements(op: &PrimalOp) -> SaveRequirements {
     use PrimalOp::*;
     match op {
@@ -46,13 +46,11 @@ pub(crate) fn save_requirements(op: &PrimalOp) -> SaveRequirements {
             needs_inputs: true,
             needs_output: false,
         },
-        // Binary elementwise — only mul/div need inputs; add/sub are pure-scalar
-        Mul | Div => SaveRequirements {
+        // Binary elementwise — mul/div read their operands' values; add/sub
+        // read their operands' shapes (to sum a broadcast operand's gradient
+        // back to its shape), which the backward takes from the live tensor.
+        Mul | Div | Add | Sub => SaveRequirements {
             needs_inputs: true,
-            needs_output: false,
-        },
-        Add | Sub => SaveRequirements {
-            needs_inputs: false,
             needs_output: false,
         },
         Softmax { .. } | LogSoftmax { .. } => SaveRequirements {
@@ -88,6 +86,12 @@ pub(crate) fn save_requirements(op: &PrimalOp) -> SaveRequirements {
         Mean { .. } => SaveRequirements {
             needs_inputs: true,
             needs_output: true,
+        },
+        // A full Sum expands its gradient to its operand's shape, read off
+        // the live operand (`ExpandLike`).
+        Sum { dim: None } => SaveRequirements {
+            needs_inputs: true,
+            needs_output: false,
         },
         // Everything else: conservative — no saves.
         _ => SaveRequirements {

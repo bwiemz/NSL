@@ -1,0 +1,32 @@
+# Source-AD Add/Sub backward with broadcast operands (see
+# source_ad_broadcast_backward_gate.rs). `b` and `c` are [4] and broadcast over
+# the 3 rows of `x @ w`, so each one's gradient must be summed back over the
+# rows; `c` is a Sub's subtrahend, so its gradient is also negated.
+from nsl.nn.losses import mse_loss
+
+model BiasSub:
+    w: Tensor = (arange(16).reshape([4, 4])) * 0.05 - full([4, 4], 0.3)
+    b: Tensor = (arange(4)) * 0.1
+    c: Tensor = ones([4]) * 0.2
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w + self.b - self.c
+
+let m = BiasSub()
+let x = (arange(12).reshape([3, 4])) * 0.1 + full([3, 4], 0.1)
+let y = (arange(12).reshape([3, 4])) * 0.2 - full([3, 4], 1.0)
+
+train(model = m, epochs = 4):
+    optimizer: SGD(lr = 0.1)
+    step(batch):
+        let loss = mse_loss(m.forward(x), y)
+
+print("W_BEGIN")
+print(m.w)
+print("W_END")
+print("B_BEGIN")
+print(m.b)
+print("B_END")
+print("C_BEGIN")
+print(m.c)
+print("C_END")
