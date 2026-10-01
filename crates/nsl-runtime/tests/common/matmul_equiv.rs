@@ -24,7 +24,7 @@ use nsl_runtime::kernel_profiler::{
 };
 use nsl_runtime::tensor::{
     nsl_tensor_free, nsl_tensor_matmul, nsl_tensor_to_device, test_build_tensor_2d_f32,
-    test_read_tensor_f64,
+    test_read_tensor_f32,
 };
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -125,8 +125,8 @@ fn gpu_matmul(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
 
     let c_gpu = nsl_tensor_matmul(a_gpu, b_gpu, 0);
     let c_cpu = nsl_tensor_to_device(c_gpu, 0);
-    let out_f64 = test_read_tensor_f64(c_cpu);
-    let out: Vec<f32> = out_f64.into_iter().map(|v| v as f32).collect();
+    // The download keeps the device's f32 (C5 step 2a).
+    let out: Vec<f32> = test_read_tensor_f32(c_cpu);
 
     nsl_tensor_free(a_cpu);
     nsl_tensor_free(b_cpu);

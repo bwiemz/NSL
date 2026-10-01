@@ -66,7 +66,7 @@ use nsl_runtime::nsl_test_cuda_d2h;
 use nsl_runtime::test_set_transpose_views;
 use nsl_runtime::tensor::{
     nsl_tensor_data_ptr, nsl_tensor_free, nsl_tensor_matmul, nsl_tensor_to_device,
-    test_build_tensor_2d_f32, test_read_tensor_f64, NslTensor,
+    test_build_tensor_2d_f32, test_read_tensor_f32, NslTensor,
 };
 
 static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -137,7 +137,8 @@ fn transposed_view(rows: usize, cols: usize, data: &[f32]) -> (i64, i64) {
 
 fn read_back(gpu_ptr: i64) -> Vec<f32> {
     let cpu = nsl_tensor_to_device(gpu_ptr, 0);
-    let v: Vec<f32> = test_read_tensor_f64(cpu).into_iter().map(|x| x as f32).collect();
+    // The download keeps the device's f32 (C5 step 2a).
+    let v: Vec<f32> = test_read_tensor_f32(cpu);
     if cpu != gpu_ptr {
         nsl_tensor_free(cpu);
     }
