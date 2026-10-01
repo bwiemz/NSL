@@ -119,7 +119,7 @@ crates/nsl-cli/tests/sr_bf16_gate.rs	srbf16_batched_step_matches_per_param_gpu	g
 crates/nsl-cli/tests/sr_bf16_gate.rs	srbf16_e2e_deterministic_and_sane_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/sr_bf16_gate.rs	srbf16_tracks_f32_baseline_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/sr_bf16_gate.rs	srbf16_parameter_surface_is_accounted_as_weights_gpu	gpu	requires GPU
-crates/nsl-cli/tests/stage_c_packed_parity.rs	packed_fused_matches_decomposed_on_gpu	gpu	requires CUDA GPU (two real training runs)
+crates/nsl-cli/tests/stage_c_packed_parity.rs	packed_fused_training_smoke_on_gpu	gpu	requires CUDA GPU (two real training runs)
 crates/nsl-cli/tests/stage_c_packed_parity.rs	wggo_reports_fused_consumption_on_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/stream_migration_gpu_gate.rs	compute_stream_matches_legacy_null_stream_bit_exact	gpu	requires a CUDA GPU (2 CSHA training runs)
 crates/nsl-cli/tests/stream_ordering_gpu_gate.rs	stream_ordered_matches_eager_bit_exact	gpu	requires CUDA GPU (2 training runs)
@@ -136,7 +136,7 @@ crates/nsl-cli/tests/view_chain_leak_gate.rs	view_chain_results_are_numerically_
 crates/nsl-cli/tests/weight_decay_groups_gate.rs	fused_multi_launch_partitions_on_weight_decay_gpu	gpu	requires a CUDA GPU
 crates/nsl-cli/tests/wgrad_accum_fusion_gate.rs	gpu_identity_reduce_chain_uses_the_fused_gemm	gpu	requires a CUDA GPU
 crates/nsl-cli/tests/wgrad_accum_fusion_gate.rs	gpu_fused_wgrad_matches_the_unfused_chain_within_f32_tolerance	gpu	requires a CUDA GPU (2 FASE training runs)
-crates/nsl-cli/tests/wrga_adapter_runtime_equivalence.rs	cranelift_and_source_ad_see_same_rewritten_ast	broken	Pre-existing inference-path segfault when adapter synth fields (m.gate_...) are overwritten at top-level after the train block — verified failing at HEAD by both Commit A and Commit B subagents without any option-3 changes to the segfaulting path. The anti-drift intent of this test still has value: if the shared rewrite_stmts_for_model helper were ever forked, Cranelift's and source-AD's AST copies would diverge in a runnable way. Unblock when the top-level synth-field-read / inference-path lowering bug lands as a separate milestone; see the synth-field-read follow-up in project_wrga_b32_measurement.md.
+crates/nsl-cli/tests/wrga_adapter_runtime_equivalence.rs	cranelift_and_source_ad_see_same_rewritten_ast	gpu	requires CUDA GPU (anti-drift: Cranelift and source-AD see the same rewritten AST). Parked as broken until the adapter side-table moved into the model constructor; passes on sm_120 since then.
 crates/nsl-cli/tests/wrga_b32_per_op_breakdown.rs	b32_per_op_breakdown_prescribed_shape	diagnostic	diagnostic: WRGA B.3.2 per-op profiling bench at the prescribed shape; smoke asserts only (rc, profile present, fused markers launched), prints a table, no numerical gate
 crates/nsl-cli/tests/wrga_gatedlora_backward_trigger.rs	wrga_b32_trigger_measurement	diagnostic	diagnostic: WRGA B.3.2 trigger measurement; writes target/wrga_b32_trigger_report.md, asserts nothing
 crates/nsl-cli/tests/wrga_gatedlora_backward_trigger.rs	wrga_b32_trigger_measurement_requires_cuda	cpu-stub	diagnostic: cpu-stub twin of wrga_b32_trigger_measurement; prints a pointer to --features cuda, asserts nothing
@@ -323,6 +323,9 @@ crates/nsl-codegen/tests/pca_tier_b_sass_baselines.rs	regenerate_baseline_32_32_
 crates/nsl-codegen/tests/pca_tier_b_sass_baselines.rs	regenerate_baseline_64_64_64	generator	baseline generator — run with --ignored to regenerate
 crates/nsl-codegen/tests/sdpa_fused_forward_gpu_parity.rs	sdpa_fused_forward_unmasked_matches_oracle	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/sdpa_fused_forward_gpu_parity.rs	sdpa_fused_forward_segment_masked_matches_oracle	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/sdpa_fused_packed_gpu_parity.rs	packed_forward_matches_the_oracle_across_kv_tiles	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/sdpa_fused_packed_gpu_parity.rs	packed_backward_is_the_f16_operand_gradient_across_kv_tiles	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/sdpa_fused_packed_gpu_parity.rs	packed_forward_then_backward_is_the_attention_gradient	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/sdpa_mma_forward_gpu_parity.rs	mma_multitile_hd64_causal	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/sdpa_mma_forward_gpu_parity.rs	mma_multitile_hd64_noncausal	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/sdpa_mma_forward_gpu_parity.rs	scalar_pinned_multitile_hd64_causal	gpu	requires CUDA GPU

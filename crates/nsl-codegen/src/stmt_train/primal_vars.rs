@@ -51,8 +51,9 @@ pub(crate) struct PrimalFacts {
     /// its layout does not resolve (nothing is emitted for those).
     frozen_inputs: Vec<(crate::wengert::VarId, Option<(nsl_ast::Symbol, crate::stmt::FieldPlan)>)>,
     /// The VarIds the emitter will map: the VarMap's key set, known before
-    /// anything is emitted (TrainPlan step 5b). WRGA's adapter loads add to
-    /// it later; see `plan_wrga_adapter_loads`.
+    /// anything is emitted (TrainPlan step 5b). Adapter tensors are among
+    /// them: `plan_nested_field` reaches each through a
+    /// `FieldStep::AdapterSlot`.
     pub(crate) mapped: std::collections::HashSet<crate::wengert::VarId>,
 }
 

@@ -32,7 +32,6 @@ use crate::stmt_train::csla_window::{
 };
 use crate::stmt_train::emit_state::EmitState;
 use crate::stmt_train::model_params::ModelParams;
-use crate::stmt_train::adapter_sites::AdapterSitesInputs;
 use crate::stmt_train::adjoint_tape_opt::AdjointTapeOptInputs;
 use crate::stmt_train::ccr_adjoint_frees::CcrAdjointFreesInputs;
 use crate::stmt_train::csla_precompute::CslaPrecomputeInputs;
@@ -79,6 +78,39 @@ impl Compiler<'_> {
         let _phase = crate::pass_trace::enter_phase(
             crate::pass_registry::CompilePhase::TrainBlock,
         );
+        // A WGGO layer prune (`--wggo-prune-layers` /
+        // `--wggo-layer-prune-fraction`) is a WGGO plan decision executed by
+        // rewriting the source-AD forward Wengert list (`wggo_prune.rs`).
+        // Without source-AD the forward is compiled from the AST, and with
+        // WGGO off the planner never runs — either way the request would
+        // vanish and the full model would train. Refuse, naming the fix.
+        if self.compile_options.wggo.layer_prune_requested() {
+            if !self.features.source_ad_enabled {
+                return Err(CodegenError::new(
+                    "--wggo-prune-layers / --wggo-layer-prune-fraction requires \
+                     --source-ad: the layer prune rewrites the source-AD forward \
+                     Wengert list, and the tape path compiles the forward from the \
+                     AST, so the requested layers would silently keep training. \
+                     Add --source-ad (or --pretrain-optimized, which implies it)",
+                ));
+            }
+            if !crate::wggo_prepass::wggo_mode_enabled(&self.compile_options) {
+                return Err(CodegenError::new(
+                    "--wggo-prune-layers / --wggo-layer-prune-fraction requires \
+                     --wggo <full|greedy|auto>: the prune is a WGGO plan decision, \
+                     and with WGGO off the planner never runs, so nothing would be \
+                     pruned. Add --wggo greedy (or full)",
+                ));
+            }
+            if self.features.pipeline_config.is_some() {
+                return Err(CodegenError::new(
+                    "--wggo-prune-layers / --wggo-layer-prune-fraction is not \
+                     supported on the pipelined train path (@pipeline): WGGO \
+                     planning and the prune rewrite run only on the single-device \
+                     source-AD path. Drop one",
+                ));
+            }
+        }
         // M43b: Pipeline parallel detection
         if self.features.pipeline_config.is_some() {
             if self.compile_options.train.layerwise_accum {
@@ -1182,6 +1214,23 @@ impl Compiler<'_> {
                         "--fuse-lm-head require: source-AD extraction failed,                          and the tape fallback cannot fuse an LM head.                          Restrict the step body to source-AD-supported                          operations or drop `require`",
                     ));
                 }
+                // A WGGO layer prune rewrites the extracted forward; the
+                // tape fallback has none, so the requested layers would
+                // silently keep training.
+                if self.compile_options.wggo.layer_prune_requested() {
+                    let flag = if self.compile_options.wggo.prune_layers.is_empty() {
+                        "--wggo-layer-prune-fraction"
+                    } else {
+                        "--wggo-prune-layers"
+                    };
+                    return Err(CodegenError::new(format!(
+                        "{flag} requires source-AD extraction, but the step body \
+                         could not be extracted (dynamic control flow?), and the \
+                         tape fallback has no Wengert forward to prune. Restrict \
+                         the step body to source-AD-supported operations or drop \
+                         {flag}"
+                    )));
+                }
                 // Source AD extraction failed — fall back to tape
                 nsl_log::nsl_log!(WARN, "nsl", "[nsl] source AD extraction failed, falling back to tape-based AD");
 
@@ -1206,7 +1255,7 @@ impl Compiler<'_> {
                 let primal_facts =
                     self.plan_primal_facts(state, &extractor, step_param_sym, &layout, &model_type_name);
                 self.plan_cpkd_report(&extractor, &fase_plan, grad_accumulation_steps)?;
-                let mut primal_vars = self.emit_primal_vars(
+                let primal_vars = self.emit_primal_vars(
                     builder,
                     state,
                     &primal_facts,
@@ -1363,31 +1412,18 @@ impl Compiler<'_> {
                     wggo_preplan_offered,
                     wggo_preplan_was_rejected,
                 })?;
-                // Task 6: WRGA adapter sites.
-                // Moved to `stmt_train/adapter_sites.rs` byte-for-byte (roadmap A1):
-                // the override-rejected diagnostics, the adapter init side-table
-                // and the adapter-tensor loads into the VarMap.
-                let adapter_loads =
-                    self.plan_wrga_adapter_loads(&primal_facts, &extractor, &layout, &model_type_name);
-                self.emit_wrga_adapter_sites(
-                    builder,
-                    state,
-                    AdapterSitesInputs {
-                        adapter_loads: &adapter_loads,
-                        model_ptr,
-                        model_type_name: &model_type_name,
-                        primal_vars: &mut primal_vars,
-                        wrga_plan: &wrga_plan,
-                    },
-                )?;
-                // The primal VarMap's key set, planned (TrainPlan step 5b):
-                // the primal facts plus the adapter loads. The CCR owned
-                // restriction below is seeded with it, and the adapter walks
-                // above were planned from it, so hold it to the map the
-                // emitters built: a planner that drifts from its emitter
-                // must stop the compile, not silently change what is emitted.
+                // Task 6: the WRGA override-rejected diagnostics
+                // (`stmt_train/adapter_sites.rs`). Adapter tensors resolve in
+                // the primal facts: each instance's side-table is built by its
+                // constructor.
+                self.report_wrga_override_diagnostics(&wrga_plan);
+                // The primal VarMap's key set, planned (TrainPlan step 5b).
+                // The CCR owned restriction below is seeded with it, so hold
+                // it to the map the emitters built: a planner that drifts
+                // from its emitter must stop the compile, not silently change
+                // what is emitted.
                 let planned_primal_keys: std::collections::HashSet<crate::wengert::VarId> =
-                    primal_facts.mapped.iter().copied().chain(adapter_loads.mapped()).collect();
+                    primal_facts.mapped.iter().copied().collect();
                 if planned_primal_keys.len() != primal_vars.len()
                     || !primal_vars.keys().all(|vid| planned_primal_keys.contains(vid))
                 {

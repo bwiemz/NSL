@@ -145,6 +145,11 @@ pub struct WggoInput<'a> {
     /// unlocked when documents are dense enough to strand whole `bkv` tiles.
     /// `None` → the legacy constants, byte-identical to every pre-item-6 plan.
     pub packing_stats: Option<DatasetPackingConfig>,
+    /// Layer indices the user asked to prune (`--wggo-prune-layers` /
+    /// `--wggo-layer-prune-fraction`, resolved by `wggo_forced_prune`),
+    /// handed to the Level-1 DP as [`DpConfig::forced_prune`]. Empty = no
+    /// request, every plan byte-identical to a build without the flags.
+    pub forced_prune: std::collections::BTreeSet<u32>,
 }
 
 /// Fatal marker set when `--wggo-memory-budget` is on and the plan cannot fit
@@ -592,6 +597,7 @@ pub fn run(mut input: WggoInput) -> WggoPlan {
         let dp_cfg = DpConfig {
             cluster: input.cluster.clone(),
             importance: input.importance.clone(),
+            forced_prune: input.forced_prune.clone(),
             ..Default::default()
         };
         // Off mode bypasses optimization, so an over-budget passthrough is the
@@ -663,6 +669,7 @@ pub fn run(mut input: WggoInput) -> WggoPlan {
     let dp_cfg = DpConfig {
         cluster: input.cluster.clone(),
         importance: input.importance.clone(),
+        forced_prune: input.forced_prune.clone(),
         ..Default::default()
     };
     // G4 degradation ladder, rung 0: the inter-layer DP is shared by Full and
@@ -1274,6 +1281,8 @@ pub fn run_on_wengert(
         memory_budget_bytes: None,
         // No dataset/stmt context here → legacy flat packing constants.
         packing_stats: None,
+        // No CompileOptions → no user prune request.
+        forced_prune: std::collections::BTreeSet::new(),
     };
     Some(run(input))
 }
@@ -1430,6 +1439,17 @@ pub fn run_on_wengert_with_weights(
         layer_shape.seq = cfg.max_sequence_length as u64;
     }
 
+    // `--wggo-prune-layers` / `--wggo-layer-prune-fraction`: the user's
+    // layer-prune request, resolved against THIS list's layer graph (the
+    // same `build_graph` `run` builds, so the indices agree). Empty when
+    // neither flag is set — no graph is built and the plan is unchanged.
+    let forced_prune = match compile_options {
+        Some(opts) if opts.wggo.layer_prune_requested() => {
+            resolve_forced_prune(wengert, &opts.wggo, checkpoint.as_ref(), weights_path)?
+        }
+        _ => std::collections::BTreeSet::new(),
+    };
+
     let mut input = WggoInput {
         mode,
         target,
@@ -1446,6 +1466,7 @@ pub fn run_on_wengert_with_weights(
         cached_analysis: cached_report.clone(),
         memory_budget_bytes,
         packing_stats,
+        forced_prune: forced_prune.clone(),
     };
     // WRGA budget semantics (paper §7.1 @wrga(mode=auto): errata E3's
     // two-level split): when the user opted into adapters via
@@ -1467,6 +1488,13 @@ pub fn run_on_wengert_with_weights(
         }
     }
     let mut plan = run(input);
+
+    // A forced prune the plan does not carry would compile and train the
+    // full model while the user believes layers were removed — the §2.4
+    // shape refusal, for one, returns a decision-free plan. Refuse instead.
+    if !forced_prune.is_empty() {
+        check_forced_prune_applied(&plan, &forced_prune)?;
+    }
 
     // `--wggo-memory-budget` HARD refusal: `run()` set `budget_infeasible`
     // when the plan cannot fit even at the fp16-moment floor. This is a
@@ -1513,6 +1541,122 @@ pub fn run_on_wengert_with_weights(
     }
 
     Ok(Some(plan))
+}
+
+/// Resolve the user's layer-prune request (`--wggo-prune-layers` names,
+/// plus the `--wggo-layer-prune-fraction` magnitude selection) to the union
+/// of their layer indices in `wengert`'s WGGO graph, and print what will be
+/// pruned.
+///
+/// `loaded` is the Stage-3 checkpoint when it was loaded; the fraction
+/// loads `weights_path` itself otherwise (a Stage-3 cache hit skips the
+/// load, and a failed Stage-3 load degrades to uniform scores — neither is
+/// acceptable for a selection that is made FROM the weights, so a load
+/// failure here is a hard error).
+fn resolve_forced_prune(
+    wengert: &WengertList,
+    opts: &crate::WggoOptions,
+    loaded: Option<&crate::wggo_weight_analysis_nslweights::NslWeightsCheckpoint>,
+    weights_path: Option<&std::path::Path>,
+) -> Result<std::collections::BTreeSet<u32>, CodegenError> {
+    use crate::wggo_forced_prune::{resolve_named, select_by_magnitude};
+    use crate::wggo_weight_analysis_nslweights::NslWeightsCheckpoint;
+
+    let graph = build_graph(wengert);
+    let mut forced = resolve_named(&graph, &opts.prune_layers).map_err(CodegenError::new)?;
+    let mut detail = String::new();
+    if let Some(fraction) = opts.layer_prune_fraction {
+        let owned: NslWeightsCheckpoint;
+        let checkpoint = match (loaded, weights_path) {
+            (Some(ck), _) => Some(ck),
+            (None, Some(p)) => {
+                owned = NslWeightsCheckpoint::load(p).map_err(|e| {
+                    CodegenError::new(format!(
+                        "--wggo-layer-prune-fraction: could not load the weights file {}: \
+                         {e}. The layers to prune are ranked from it, so the request \
+                         cannot be honored without it",
+                        p.display()
+                    ))
+                })?;
+                Some(&owned)
+            }
+            (None, None) => None,
+        };
+        let tensors = checkpoint.map(|ck| ck.tensors_by_name());
+        let label = weights_path.map_or_else(|| "-".to_string(), |p| p.display().to_string());
+        let selected = select_by_magnitude(&graph, fraction, tensors.as_deref(), &label)
+            .map_err(CodegenError::new)?;
+        detail = format!(
+            " (fraction {fraction} of {} block layer(s) by weight-RMS importance: {})",
+            selected.ranking.len(),
+            selected
+                .ranking
+                .iter()
+                .map(|r| format!("{}={:.4}", r.layer_name, r.importance))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        forced.extend(selected.layers.iter().copied());
+    }
+    let names: Vec<&str> = graph
+        .layers
+        .iter()
+        .filter(|l| forced.contains(&l.index))
+        .map(|l| l.name.as_str())
+        .collect();
+    nsl_log::nsl_log!(INFO, "wggo",
+        "[wggo] layer-prune: forcing Prune for {}{detail}",
+        names.join(", ")
+    );
+    Ok(forced)
+}
+
+/// Refuse a plan that does not carry every forced prune as a `Prune`
+/// decision (see the call site).
+fn check_forced_prune_applied(
+    plan: &WggoPlan,
+    forced: &std::collections::BTreeSet<u32>,
+) -> Result<(), CodegenError> {
+    use crate::wggo_dp::CoarseDecision;
+    let decision_of = |idx: u32| {
+        plan.applied
+            .layers
+            .iter()
+            .find(|l| l.layer_index == idx)
+            .map(|l| l.coarse)
+    };
+    let missing: Vec<String> = forced
+        .iter()
+        .filter(|&&idx| decision_of(idx) != Some(CoarseDecision::Prune))
+        .map(|&idx| {
+            let name = plan
+                .graph
+                .layers
+                .iter()
+                .find(|l| l.index == idx)
+                .map_or_else(|| format!("layer {idx}"), |l| l.name.clone());
+            match decision_of(idx) {
+                Some(d) => format!("{name}={}", d.as_str()),
+                None => format!("{name}=<no decision>"),
+            }
+        })
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(CodegenError::new(format!(
+        "WGGO layer prune: the plan does not prune every requested layer.\n  \
+         requested:  forced Prune for {} layer(s)\n  \
+         expected:   coarse decision `prune` for each of them in the applied plan\n  \
+         found:      {}{}",
+        forced.len(),
+        missing.join(", "),
+        if plan.warnings.is_empty() {
+            String::new()
+        } else {
+            format!("; plan warnings: {}", plan.warnings.join("; "))
+        }
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -1576,6 +1720,39 @@ mod tests {
             packing_supported: true,
             memory_budget_bytes: None,
             packing_stats: None,
+            forced_prune: std::collections::BTreeSet::new(),
+        }
+    }
+
+    // ---- --wggo-prune-layers / --wggo-layer-prune-fraction ----
+
+    #[test]
+    fn forced_prune_reaches_the_plan_and_a_missing_one_is_refused() {
+        let w = two_block_wengert();
+        let idx = build_graph(&w)
+            .layers
+            .iter()
+            .find(|l| l.name == "blocks.1")
+            .expect("blocks.1 layer")
+            .index;
+        let forced: std::collections::BTreeSet<u32> = [idx].into_iter().collect();
+
+        // A plan solved WITHOUT the forced set keeps the layer: the check
+        // must refuse it, naming the layer and the decision it got.
+        let unforced = run(toy_input(&w));
+        let err = check_forced_prune_applied(&unforced, &forced).unwrap_err();
+        assert!(err.message.contains("blocks.1=keep_full"), "{}", err.message);
+        assert!(err.message.contains("requested:") && err.message.contains("found:"));
+
+        // Solved WITH it, the layer is pruned and nothing else moves.
+        let mut input = toy_input(&w);
+        input.forced_prune = forced.clone();
+        let plan = run(input);
+        check_forced_prune_applied(&plan, &forced).expect("forced layer carried as Prune");
+        for (a, b) in plan.applied.layers.iter().zip(&unforced.applied.layers) {
+            if a.layer_index != idx {
+                assert_eq!(a.coarse, b.coarse, "layer {} changed", a.layer_name);
+            }
         }
     }
 

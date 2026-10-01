@@ -174,17 +174,14 @@ impl Compiler<'_> {
                     slot_off as i32,
                 );
                 let byte_off = (index * 8) as i32;
-                // Guard the side-table base for null. The table is
-                // materialized by `emit_adapter_init_sidetable`, which
-                // runs ONLY inside a train block (`stmt.rs`). A
-                // forward-only program that uses `@adapter` never
-                // materializes it, so this slot is still 0 from
-                // constructor zero-init — dereferencing it segfaults
-                // (0xC0000005). Return a null tensor pointer (0) for the
-                // unmaterialized case; the adapter FFI
-                // (`nsl_adapter_fused_*_matmul`) detects null adapters
-                // and falls back to the base `x @ W` forward. See
-                // docs/plans/2026-05-23-wrga-b4-fused-forward-staging-scope.md.
+                // Guard the side-table base for null. Every constructor of
+                // a model an adapter targets builds the table
+                // (`wrga_adapter_init::emit_adapter_init_sidetable`), so a
+                // null slot means a model no adapter targets. Return a null
+                // tensor pointer (0) for it rather than dereferencing 0;
+                // the adapter FFI (`nsl_adapter_fused_*_matmul`) detects
+                // null adapters and falls back to the base `x @ W` forward.
+                // See docs/plans/2026-05-23-wrga-b4-fused-forward-staging-scope.md.
                 let deref_blk = builder.create_block();
                 let null_blk = builder.create_block();
                 let merge_blk = builder.create_block();

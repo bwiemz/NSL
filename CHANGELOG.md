@@ -8,6 +8,107 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **WGGO layer prune is reachable: whole-block chain-collapse, plus
+  `--wggo-prune-layers` and `--wggo-layer-prune-fraction` to request it.**
+  Until now no program could prune a layer, and nothing said so:
+  - the Level-1 DP offers `Prune` only below an importance floor, and
+    production planning never fills per-layer importance (every layer reads
+    1.0). The existing `--wggo-prune-fraction` drives per-HEAD scores only;
+  - every layer WGGO's graph names is a whole block (`blocks.N`), which
+    `wggo_prune` refused outright (`WholeBlockUnsupported`, spec §3.6);
+  - its parameter matcher looked for `blocks.0.`, while source AD names
+    every model field with its variable (`m.blocks.0.wq`), so even a
+    sub-block prune would have found an empty closure.
+
+  What changed:
+  - **v2 chain-collapse** (`wggo_prune.rs`). A `LayerRole::Block` layer's
+    residual Adds must form ONE chain `h0 -> Add(h0, out1)=h1 -> ... -> hk`.
+    Each intermediate `h_i` may be read only by the block's own ops and the
+    next Add (an outside reader is a skip connection), and each `out_i` only
+    by its own Add. The closure and every chain Add are deleted and `hk` is
+    aliased to `h0`; a violation refuses with the new three-part
+    `BrokenResidualChain` (`OverrideRejectReason::PruneBrokenResidualChain`).
+  - **Adjacent prunes** (`blocks.1,blocks.2`, or one block's `.attn` and
+    `.ffn`) share a stream value that both rewrites were validated against.
+    The commit now resolves it through the earlier collapse; the v1 commit
+    repointed the second layer's readers at the VarId the first one had
+    deleted. A post-commit assert refuses any surviving read of a pruned
+    value, and `ops_deleted` now counts what actually left the list.
+  - **Prefix matching:** a parameter belongs to layer `L` when its name
+    starts with `L.` directly or after the model variable. Only one
+    component is stripped: `m.encoder.blocks.0.w` does not match `blocks.0`.
+  - **`--wggo-prune-layers blocks.1,blocks.3`** (`nsl build` and `nsl run`)
+    forces `Prune` for the named layers through a new
+    `DpConfig::forced_prune` set. `importance.per_layer` stays empty, so a
+    build without the flags plans byte-identically. An unknown name, or a
+    layer with no residual identity (`other`, an embedding), is a hard
+    error listing the graph's layers.
+  - **`--wggo-layer-prune-fraction F`** prunes the `floor(F x n)`
+    least-important of the `n` block layers. Importance is the RMS of the
+    block's weights in `--wggo-weights`, normalized by the max; ties go to
+    the lower index, and all `n` are never pruned. It is refused without
+    `--wggo-weights`, when the file cannot be loaded, when a block has no
+    weights in it, and when `floor(F x n)` is 0. A `[wggo] layer-prune:`
+    line prints the ranking.
+  - Both flags require `--source-ad` and a WGGO mode other than off. The
+    train-block driver refuses them otherwise, on `@pipeline`, and on a
+    tape fallback; the refusals are registered in `feature_rules.rs`. A
+    plan that does not carry every forced prune (the §2.4 shape refusal, or
+    a planner that declined the block) fails the compile.
+    `--training-reference` strips them with the other WGGO transformations.
+  - **Removed:** the PR #102 `[prune] ... reason=ir_rewrite_not_implemented`
+    stub (`collect_prune_diagnostics`,
+    `whole_block_prune_not_implemented_reason`,
+    `OverrideRejectReason::{WholeBlockPruneNotImplemented,
+    PruneWholeBlockUnsupported}`). No plan can reach an unimplemented prune
+    any more. `wggo_overrides_rename_test.rs`, which pinned that string, is
+    deleted, and the whole-block refusal tests became chain-collapse tests.
+  - **The gate,** `crates/nsl-cli/tests/wggo_layer_prune_gate.rs` (7 tests,
+    CPU), trains a 4-block two-residual model with SGD; every block has the
+    same deterministic init. With `--wggo-prune-layers blocks.1`, the loss
+    trajectory and the surviving blocks' weights are BIT-IDENTICAL to the
+    3-block model's, and blocks.1's weights come out of training untouched.
+    The unpruned 4-block run differs (anti-vacuity). `blocks.1,blocks.2`
+    is held to the 2-block model the same way, and the fraction flag
+    prunes exactly blocks.2, the block at 1/50th the magnitude. Four
+    refusal tests cover a missing `--source-ad`, a missing `--wggo`, an
+    unknown layer, and a fraction without weights. Mutation-checked: each
+    of these fails it — repointing to `h1`, keeping the second Add,
+    collapsing only the last link, dropping the alias resolution, the
+    model-variable strip, or the DP's forced set.
+
+- **A silicon gate for the packed (Stage C) fused attention, forward and
+  backward, against f64 oracles across KV tiles** (roadmap item 3,
+  `crates/nsl-codegen/tests/sdpa_fused_packed_gpu_parity.rs`). The packed
+  path's only silicon evidence was a one-epoch training run at seq 64 (one KV
+  tile, 8 optimizer steps), fused against decomposed, checkpoint-compared at
+  2e-2. Every GPU gate of the classic backward ran unmasked, against the
+  runtime's own CPU fallback.
+  - **Geometry:** seq 448 (seven 64-wide tiles, not a multiple of 128),
+    2 batches × 2 heads, head_dim 32, 100-token documents at a different
+    phase per row. The PTX and launch parameters are the ones a default
+    packed build embeds, including the Tier-B forward the runtime selects at
+    this length.
+  - **Three gates:**
+    - the forward (base and Tier-B) against the exact output and logsumexp;
+    - the backward, fed the oracle's O and logsumexp, against the exact and
+      f16-operand gradients;
+    - the forward feeding the backward, against the exact gradients, which
+      catches a disagreement between the two about the logsumexp or O.
+  - **Launch proof:** the launch census proves both backward phases ran, since
+    the FFI falls back to the CPU on any refusal, and the fused-launch
+    counters prove which forward variant ran.
+  - **Measured on the RTX PRO 4500 (sm_120), 2026-09-30, all within bounds:**
+    - forward (base and Tier-B): out 4.95e-4 of max |out| (bound 2e-3),
+      logsumexp 6.5e-4 absolute (bound 5e-3);
+    - backward against the f16-operand oracle: dV 8.1e-6 (bound 2e-5), dK
+      1.9e-5 and dQ 1.5e-4 (bound 5e-4); against the exact gradients 1.5e-3,
+      which is within 5e-3 and above the 1e-4 floor;
+    - forward then backward: 1.4e-3 from the exact gradients (bound 1e-2).
+  - `stage_c_packed_parity.rs::packed_fused_matches_decomposed_on_gpu` is now
+    `packed_fused_training_smoke_on_gpu`, documented as the integration
+    smoke it is. The three gates join the hardware-cert bundle.
+
 - **Parser table tests** (roadmap T1): 312 new `#[test]`s in `nsl-parser`,
   one per construct, bringing the crate from 33 tests to 345. The roadmap's
   Phase 1 exit criterion asked for at least 300.
@@ -1651,6 +1752,60 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   every diagnostic line the toolchain prints is a `tracing` event.
 
 ### Fixed
+
+- **LoRA adapters crashed under tape AD and on `[Blk; N]` layers, and never
+  trained in either AD mode.** `@adapter(type=lora, target=["Toy.w"])`
+  rewrites `x @ self.w` into `x @ w + ((x @ A) @ B) * (alpha / rank)`, with
+  A and B in a side-table hanging off the model instance.
+  - **Tape AD aborted on the first forward.** The side-table was built only
+    at source-AD train-block entry. Under tape AD (the default) the forward
+    read a null A, and `x @ A` aborted with `invalid tensor handle 0x0`.
+  - **Adapters on the layers of a `[Blk; N]` array aborted under source AD
+    too.** Only the top-level instance got a table, and the adapter load
+    walk could not step through an inline array field. Each
+    `m.blocks.0.lora_A_…` resolved to a null placeholder.
+  - **A and B never trained.** They were in neither AD mode's optimizer
+    parameter list, so source AD computed their gradients and then dropped
+    them. A run that worked trained `w` alone, and B stayed at zero, so the
+    adapter contributed nothing.
+  - **The fix.**
+    - Each model constructor now builds its instance's side-table
+      (`wrga_adapter_init`). That covers a top-level model, a sub-model
+      field and every array element, in either AD mode and outside train
+      blocks. The table is laid out from `bus.adapter_sites()` in the order
+      `adapter_field_index` counts, and every temporary of the init is freed.
+    - An adapter tensor is an ordinary parameter path. `plan_nested_field`
+      reaches it through a new `FieldStep::AdapterSlot`, so the param list
+      (and with it the tape, the optimizer, checkpoint names and ZeRO's
+      partition) and source AD's primal map include it.
+    - The hand-rolled `AdapterLoads` walk is gone.
+    - `.to(device)` moves the side-table with the instance's weights.
+    - The train-block WRGA run no longer replaces a pre-scan site list,
+      since the constructors were built against it.
+    - The `adapter_prescan_plan` bus channel lost its only reader and is
+      retired.
+  - **The gate.** `lora_adapter_training_gate` trains a flat model and a
+    `[Blk; 2]` model with SGD in both AD modes. Each fixture prints its
+    random initial `w` and `A`, and the test holds the final `w`, `A` and `B`
+    to an f64 reference trajectory started from them. Both modes are within
+    6e-8 everywhere. Two planted mutants each fail it: source AD dropping
+    adapter gradients again, and adapters left out of the param list.
+  - **On the device.** The WRGA adapter suites, run on sm_120 with
+    `--features cuda --include-ignored`, are 26/26: both gate tests, the
+    fused LoRA/GatedLoRA/IA³ fixtures, and `wrga_gatedlora_backward_trigger`.
+    `cranelift_and_source_ad_see_same_rewritten_ast` passes too. It had been
+    parked as `broken` for a segfault on a top-level read of an adapter
+    field after a train block; it is now a `requires CUDA GPU` cert gate.
+  - **Snapshot.** In `wrga_lora_source_ad` the adapter init moves from the
+    train block into the `Toy` constructor. The train block gains the two
+    adapters' param-list entries and gradient alignment.
+  - **Found, not fixed here.**
+    - `@freeze(include=[...])` does not freeze anything: the base weight
+      trains identically with or without it, in both AD modes. A LoRA
+      fine-tune that means to freeze its base does not.
+    - Reading a synthesized adapter field in NSL source needs a typed `let`
+      (`let a: Tensor = m.lora_A_Toy_w__lora`); a bare `print(m.lora_A_…)`
+      prints the handle as an integer.
 
 - **Source AD: the gradient of a `mean` was N times too large.**
   - **The bug.** The Mean adjoint rule (`ad_rules.rs`) emitted a bare

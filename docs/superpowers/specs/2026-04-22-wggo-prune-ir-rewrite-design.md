@@ -1,9 +1,16 @@
 # WGGO Prune v1 — Real IR Rewrite Design
 
-**Status:** design approved 2026-04-22; implementation plan pending.
-**Branch:** `feat/wggo-prune-ir-rewrite`.
-**Predecessor:** PR #102 landed the diagnostic stub (stderr `[prune] … reason=ir_rewrite_not_implemented`).
-**Scope:** v1 (sub-block residual pruning). Whole-block chain-collapse deferred to v2.
+**Status:** design approved 2026-04-22. v1 (sub-block) implemented; **v2 whole-block chain-collapse implemented 2026-09-30** (§3.6, §9), and the prune is reachable from real programs through `--wggo-prune-layers` / `--wggo-layer-prune-fraction` (source-AD only; see the v2 notes below).
+**Branch:** `feat/wggo-prune-ir-rewrite` (v1); `feat/wggo-whole-block-layer-prune` (v2).
+**Predecessor:** PR #102 landed the diagnostic stub (stderr `[prune] … reason=ir_rewrite_not_implemented`). v2 removed it: no plan can reach an unimplemented prune any more.
+**Scope:** v1 (sub-block residual pruning) and v2 (whole-block chain-collapse for `LayerRole::Block`).
+
+> **v2 notes (2026-09-30).** What the original v1 text below does not say:
+>
+> - **Reachability.** Before v2 no real program could prune a layer: the DP offers `Prune` only below `prune_floor`, and production never fills per-layer importance; every planner layer is a `blocks.N` whole block (refused by §3.6); and §2.2's prefix rule missed the model-variable prefix source AD puts on every parameter (`m.blocks.0.wq`). v2 adds `DpConfig::forced_prune` (fed by `--wggo-prune-layers` names and by `--wggo-layer-prune-fraction`'s weight-RMS ranking over `--wggo-weights`), leaving `importance.per_layer` untouched so unflagged plans are byte-identical.
+> - **Prefix rule (§2.2, §2.3 #1, §3.5).** A parameter belongs to layer `L` when its var name starts with `L.` directly or after its first dot-component (the model variable). Exactly one component is stripped.
+> - **Adjacent prunes (§3.7, §5.3 Phase 3).** Two prunes whose layers are adjacent on the stream (`blocks.1` + `blocks.2`, or one block's `.attn` + `.ffn`) are not conflicts, but the second was validated against a stream value the first one's commit deletes. Phase 3 resolves each rewrite's `h_before` through an alias map of the collapses already committed; v1 repointed the second layer's readers at the deleted VarId. Phase 3 then asserts that no surviving op reads a pruned value.
+> - **Diagnostics (§5.5, §6).** `OverrideRejectReason::{WholeBlockPruneNotImplemented, PruneWholeBlockUnsupported}` and `collect_prune_diagnostics` are gone; `PruneBrokenResidualChain` is new. The §6.1 success line is unchanged; for a chain, `residual_add_op` is the LAST Add and `ops_deleted` counts the closure plus every Add (measured from the list, not the plan).
 
 ---
 
@@ -19,9 +26,9 @@ Every precondition the rewrite depends on is a first-class check with a three-pa
 
 **v1 supports** pre-norm transformer sub-blocks with residual structure, specifically `LayerRole::{Attention, Ffn}`. The planner's current `CoarseDecision::Prune` emission criterion is unchanged; v1 faithfully executes those decisions for sub-block roles.
 
-**Out of scope (v2):**
+**Out of scope:**
 
-- Whole-block prune (`LayerRole::Block`). Requires chain-collapse across multiple residual Adds; its preconditions are a separate design exercise.
+- ~~Whole-block prune (`LayerRole::Block`).~~ Implemented in v2 as chain-collapse (§3.6).
 - Non-residual architectures (SSM, Mamba, non-standard MoE). These naturally hit v1's refusal cases §3.2 and §3.5 at the sub-block level; no special handling is added.
 - Post-norm transformers and scaled-residual architectures. These pattern-match as non-standard and may hit §3.3 (parallel residuals) or §3.4 (ambiguous pattern). A future version can relax the pattern-match; v1 rejects them loudly.
 - WGGO Phase 2 integration. Phase 2 (gradient-based importance scoring) is blocked on AWQ retention debug. v1 is independent: the rewrite consumes any `AppliedPlan` with `CoarseDecision::Prune` entries regardless of how the planner produced them.
@@ -188,23 +195,31 @@ prune: no parameters match the requested layer prefix.
 
 Variant: `PruneRefusal::EmptyClosure`.
 
-### §3.6 Whole-block prune unsupported (v1)
+### §3.6 Broken residual chain (v2 whole-block prune)
 
-Trigger: `AppliedLayer.coarse == CoarseDecision::Prune` with `layer_role == LayerRole::Block`.
+*v1 refused every `LayerRole::Block` prune here (`WholeBlockUnsupported`, pointing at two sub-block prunes as the workaround). v2 executes it as a **chain-collapse**.*
+
+A pre-norm block threads the stream through k ≥ 1 residual Adds: `h0 → Add(h0, out1) = h1 → … → Add(h(k-1), outk) = hk`. The closure (§2.2) already stops at each `Add(tainted, untainted)`, so it yields the block's ops plus k boundary candidates. Preconditions, in addition to §2.3 #1–#2:
+
+1. **One chain.** Ordered by position, candidate i's stream (untainted) operand is candidate i−1's result. The first one's stream operand, `h0`, is untainted and therefore produced outside the closure. (Zero candidates is §3.2; ≥2 sharing one `h_before` is §3.4.)
+2. **No escaping intermediate.** Each of `h1..h(k-1)` is read only by closure ops and by the next chain Add, and is not the program output. An outside reader is a skip connection — or a parameter-free op on the stream that the parameter-anchored closure does not own; deleting the Add that produces it would leave the reader dangling, and repointing it to `h0` would silently change its value.
+3. **Single-consumer block outputs.** Each `out_i` is read only by its own Add (§1.3).
+
+Commit: delete the closure and all k Adds; repoint every reader of `hk` (and `wengert.output`, if it is `hk`) to `h0`. A one-Add block is a chain of length one. The §2.3 #2 leak check exempts every chain Add, not just one.
+
+Trigger for the refusal: any of 1–3 fails.
 
 ```text
-prune: whole-block pruning (LayerRole::Block) is not supported in v1.
+prune: whole-block residual chain cannot be collapsed (v2 chain-collapse refused).
   requested:  prune {layer_name}  (role=Block)
-  supported:  prune {layer_name}.attn  (role=Attention)
-              prune {layer_name}.ffn   (role=Ffn)
-  workaround: emit two sub-block prune decisions for layer {N}; their combined
-              effect is semantically equivalent to whole-block prune in standard
-              pre-norm transformer architectures (NOT equivalent for post-norm,
-              parallel, or scaled-residual architectures).
-  planned:    whole-block prune tracked for v2 (chain-collapse transformation).
+  expected:   the block's residual Adds form ONE stream chain
+              h0 -> Add(h0, out1)=h1 -> ... -> Add(h(k-1), outk)=hk, each
+              intermediate h1..h(k-1) read only by the block's own ops and the
+              next Add, each block output out_i read only by its own Add
+  found:      {k} residual Add(s) at ops {adds}: {reason}
 ```
 
-Variant: `PruneRefusal::WholeBlockUnsupported`.
+Variant: `PruneRefusal::BrokenResidualChain`.
 
 ### §3.7 Conflicting prune decisions (defensive, v1)
 
@@ -274,8 +289,10 @@ pub struct PruneRewrite {
     pub layer_role: LayerRole,
     pub h_before_var: VarId,
     pub h_after_var: VarId,
-    pub residual_add_op: OpId,
+    pub residual_add_op: OpId,          // v2: the LAST chain Add
+    pub residual_add_ops: Vec<OpId>,    // v2: every chain Add, stream order
     pub closure_ops: Vec<OpId>,
+    pub ops_deleted: usize,
 }
 
 pub enum PruneRefusal {
@@ -308,8 +325,12 @@ pub enum PruneRefusal {
         layer_role: LayerRole,
         prefix: String,
     },
-    WholeBlockUnsupported {
+    // v2: replaces v1's `WholeBlockUnsupported { layer_name }`.
+    BrokenResidualChain {
         layer_name: String,
+        layer_role: LayerRole,
+        adds: Vec<OpId>,
+        reason: String,
     },
     ConflictingPruneDecisions {
         decision_a: String,
@@ -384,7 +405,7 @@ Example:
 
 Multi-line three-part error per refusal, format fixed in §3. Each refusal emission is terminated by a blank line so multiple refusals are visually separable.
 
-PR #102's `reason=ir_rewrite_not_implemented` string survives ONLY for refusal §3.6 (`WholeBlockUnsupported`). All other refusals use the new three-part format.
+PR #102's `reason=ir_rewrite_not_implemented` string survived in v1 ONLY for `LayerRole::Block` decisions. v2 removed it with the stub that printed it: every refusal, §3.6 included, uses the three-part format.
 
 ### §6.3 Structured diagnostic envelope
 
@@ -396,7 +417,7 @@ DiagnosticCode::PruneNoResidualAdd
 DiagnosticCode::PruneParallelResidualBranches
 DiagnosticCode::PruneAmbiguousPatternMatch
 DiagnosticCode::PruneEmptyClosure
-DiagnosticCode::PruneWholeBlockUnsupported
+DiagnosticCode::PruneBrokenResidualChain   // v2; was PruneWholeBlockUnsupported
 DiagnosticCode::PruneConflictingDecisions
 ```
 
@@ -467,7 +488,7 @@ Negative tests (one per refusal case, using synthetic Wengert lists designed to 
 - `parallel_residuals_refusal` — closure contains two Adds with distinct h_before → `PruneRefusal::ParallelResidualBranches`.
 - `ambiguous_pattern_match_refusal` — closure contains two Adds with same h_before → `PruneRefusal::AmbiguousPatternMatch`.
 - `empty_closure_refusal` — no VarIds match prefix → `PruneRefusal::EmptyClosure`.
-- `whole_block_refusal_from_planner` — `LayerRole::Block` in the plan → `PruneRefusal::WholeBlockUnsupported`.
+- ~~`whole_block_refusal_from_planner`~~ — v2: replaced by the `whole_block_*` chain-collapse tests (two-Add, one-Add, last-block output repoint, adjacent blocks, and the `BrokenResidualChain` refusals for non-chaining Adds, an escaping intermediate, and a multi-consumer block output).
 - `conflicting_decisions_refusal` — two decisions whose closures would alias conflicting VarIds → `PruneRefusal::ConflictingPruneDecisions`.
 
 Refusal-message format tests — one per refusal variant — assert the exact stderr text matches §3's template, using string comparison (not snapshot; these are short and format-critical).
@@ -545,7 +566,7 @@ The module doc-comment cites (1) explicitly. The spec's scope section (§ Scope 
 
 Tracked here so future work can plan against v1's contract.
 
-- **Whole-block prune (`LayerRole::Block`) via chain-collapse.** Requires new preconditions (single h-stream thread, no op consumes intermediate h_i except the next residual Add, all residuals pattern-match consistently). Each needs its own refusal case with its own error message. A chain-collapse design deserves its own spec. Tracked in refusal §3.6's `planned` line.
+- ~~**Whole-block prune (`LayerRole::Block`) via chain-collapse.**~~ Implemented in v2 (§3.6); the gate is `crates/nsl-cli/tests/wggo_layer_prune_gate.rs`. Still open: a parameter-free op on the residual stream inside a block (an unweighted norm, a scalar scale) is not owned by the parameter-anchored closure and refuses as an escaping intermediate rather than being collapsed with the block.
 
 - **Scaled residuals (DeepNorm etc.).** Pattern `h + alpha * block(h)`. v1 refuses via §3.4 (pattern doesn't match single-factor Add); v2 may relax the pattern-match to recognize the scaled form and delete the multiplier alongside the block ops.
 
@@ -577,5 +598,5 @@ Informative only — implementer has latitude to split differently; what matters
 3. Each of the seven refusal variants produces its three-part error, verified by both text snapshot and `DiagnosticCode` assertion.
 4. `wggo_prune::run()` returns `rewrites: Vec::new()` and untouched `wengert` whenever ANY refusal occurs (dry-run-then-commit invariant).
 5. Pipeline position verified: WGGO Prune runs before `wrga_prune::run()`; `backward_live` is computed on the reduced forward; source-AD sees the reduced forward.
-6. PR #102's `[prune] … reason=ir_rewrite_not_implemented` stderr format survives for `LayerRole::Block` decisions only.
+6. ~~PR #102's `[prune] … reason=ir_rewrite_not_implemented` stderr format survives for `LayerRole::Block` decisions only.~~ Superseded by v2: `LayerRole::Block` prunes are executed, and the stub is removed.
 7. Manual smoke check: a plan with mixed supported + unsupported prune decisions fails compilation with ALL refusals emitted in one pass — no fix-one-recompile loop.

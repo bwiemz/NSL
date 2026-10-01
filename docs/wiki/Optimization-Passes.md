@@ -116,7 +116,6 @@ on `compiler.bus`, each filled by exactly one pass and read by later stages.
 | `csha_claimed_ops` | CSHA | `Compiler::is_csha_claimed` |
 | `csha_backward_claims` | CSHA | the source-AD reverse walk, CCR's claim exemption |
 | `wrga_plan` | WRGA | adapter init/inject, `compile*_returning_plan` |
-| `adapter_prescan_plan` | WRGA | train-block adapter injection |
 | `adapter_sites` | WRGA | adapter rewrite, synthesized-field access |
 | `cpkd_plan` | CPKD | the distillation build report |
 | `cpdt_plan` | CPDT | the precision-adaptive optimizer path |
@@ -381,7 +380,7 @@ Source: [`crates/nsl-codegen/src/wggo.rs`](../../crates/nsl-codegen/src/wggo.rs)
 
 Research paper: [`docs/research/NSL-WGGO-Research.md.pdf`](../../docs/research/NSL-WGGO-Research.md.pdf).
 
-The WGGO driver orchestrates eight stages (§5 of the research paper): (1) Wengert graph extraction (from `wengert.rs`); (2) cost-model annotation (`wggo_cost::build_lut`); (3) optional weight-analysis; (4) Level 1 inter-layer DP (`wggo_dp::solve`); (5) Level 2 per-layer ILP (greedy or templated solvers in `wggo_ilp`); (6) Level 3 kernel generation (delegated to backend); (7) memory planning (delegated to M36 `memory_planner.rs`); (8) communication schedule (`wggo_schedule::build_schedule`). The driver is pure data-in / data-out and has no backend side effects. It produces a `WggoPlan` (with embedded `AppliedPlan`) that all downstream passes consume as `WggoOverrides`. WGGO's `CoarseDecision::Prune` decisions are surfaced as `[prune]` diagnostics to stderr and, for sub-block layers, applied by the layer-to-residual-identity IR rewrite in `wggo_prune.rs` (`apply_rewrite` repoints consumers to `h_before` and deletes the pruned closure ops plus the residual Add), wired at the train-block lowering site. Whole-block prune (`LayerRole::Block`) is explicitly refused in v1 per spec §3.6 (the v2 chain-collapse rewrite remains deferred), so those decisions are reported but not applied.
+The WGGO driver orchestrates eight stages (§5 of the research paper): (1) Wengert graph extraction (from `wengert.rs`); (2) cost-model annotation (`wggo_cost::build_lut`); (3) optional weight-analysis; (4) Level 1 inter-layer DP (`wggo_dp::solve`); (5) Level 2 per-layer ILP (greedy or templated solvers in `wggo_ilp`); (6) Level 3 kernel generation (delegated to backend); (7) memory planning (delegated to M36 `memory_planner.rs`); (8) communication schedule (`wggo_schedule::build_schedule`). The driver is pure data-in / data-out and has no backend side effects. It produces a `WggoPlan` (with embedded `AppliedPlan`) that all downstream passes consume as `WggoOverrides`. WGGO's `CoarseDecision::Prune` decisions are applied by the layer-to-residual-identity IR rewrite in `wggo_prune.rs`, wired at the train-block lowering site (source-AD only): a sub-block (`.attn` / `.ffn`) has its closure ops and residual Add deleted and its output aliased to its input, and a whole block (`LayerRole::Block`, `blocks.N`) is **chain-collapsed** — its residual Adds must form one stream chain `h0 → h1 → … → hk`, the closure and every Add are deleted, and `hk` is aliased to `h0` (spec §3.6). Each applied prune prints `[prune] layer=N name=… role=… applied=true closure_size=… ops_deleted=… residual_add_op=…`; a prune whose preconditions fail refuses the compile with a three-part `prune: …` error. The DP only emits `Prune` on its own below an importance floor production planning never fills, so a prune is requested explicitly with `--wggo-prune-layers` or `--wggo-layer-prune-fraction` (below).
 
 Fires: **train-block, when `--wggo <mode>` is set.** Pure advisory on forward-only builds.
 
@@ -394,6 +393,8 @@ Fires: **train-block, when `--wggo <mode>` is set.** Pure advisory on forward-on
 | `--wggo-weights <path>` | none | A `.nslweights` sidecar for real weight-based head-importance scoring. On load failure WGGO falls back to uniform scores and records a warning in the report. |
 | `--wggo-importance <mode>` | `auto` (default) \| `magnitude` \| `grad` | Head-importance scoring source. `auto` uses gradient scoring when a calibration sidecar is present, else magnitude; `grad` errors if no sidecar is present. |
 | `--wggo-prune-fraction <F>` | `0.25`, clamped `[0.0, 0.9]` | Fraction of heads the default `min_retained_importance` threshold may prune. |
+| `--wggo-prune-layers <NAMES>` | none | Prune these layers, comma-separated, named as WGGO's layer graph names them (`blocks.1,blocks.3`). A whole block is chain-collapsed to an identity. An unknown name, or a layer with no residual identity (`other`, an embedding), is a hard error listing the graph's layers. Requires `--source-ad` and `--wggo <full\|greedy\|auto>`; refused on `@pipeline`. |
+| `--wggo-layer-prune-fraction <F>` | none, `0 < F < 1` | Additionally prune the `floor(F × n)` of the `n` block layers with the lowest weight-magnitude importance: the RMS of each block's weights in `--wggo-weights` (names map to layers like `blocks.2.wq` or `m.blocks.2.wq`), normalized by the max; ties go to the lower layer index, and all `n` are never pruned. Refused without `--wggo-weights`, when a block has no weights in the file, and when `floor(F × n) = 0`. The `[wggo] layer-prune:` line prints the ranking. Same `--source-ad` / `--wggo` requirements. |
 | `--devices <N>` | `1` | Cluster size (compile-time `world_size`). Drives WGGO's ZeRO-sharding budget — the DP only shards (`shard > 1`) when `N > 1` and memory pressure requires it. Unlike `nsl run --devices`, this spawns no processes; it only informs the plan. |
 | `--explain-wggo` *(on `nsl profile`)* | off | Runs WGGO Full and emits a per-layer decision explanation covering all six dimensions: CEP (head prune), CSHA (fusion level), WRGA (adapter rank/placement), CPDT (optimizer precision), FASE (fused step), PCA (sequence packing). |
 
@@ -409,6 +410,16 @@ nsl build model.nsl --source-ad --emit-obj -o model_out \
 ```
 
 If `--wggo full` is infeasible for the given `--devices` / memory budget, WGGO degrades **Full → Greedy → Off**, recording a warning at each step rather than silently producing an over-budget plan.
+
+Pruning blocks explicitly, or the least important quarter of them by weight magnitude (the gate `crates/nsl-cli/tests/wggo_layer_prune_gate.rs` holds a pruned 4-block model bit-identical to the 3-block one):
+
+```sh
+nsl run model.nsl --source-ad --wggo greedy --wggo-prune-layers blocks.1,blocks.3
+nsl run model.nsl --source-ad --wggo greedy \
+  --wggo-weights model.nslweights --wggo-layer-prune-fraction 0.25
+```
+
+A pruned block's parameters receive no gradient, so the optimizer still allocates their state and (with decoupled weight decay) still decays them; the forward and backward simply no longer compute the block.
 
 ---
 

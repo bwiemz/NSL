@@ -148,6 +148,20 @@ impl NslWeightsCheckpoint {
     pub fn is_empty(&self) -> bool {
         self.tensors.is_empty()
     }
+
+    /// Every tensor as `(name, f32 data)`, sorted by name — the
+    /// whole-checkpoint view `--wggo-layer-prune-fraction` ranks layers
+    /// from (the [`WeightProvider`] trait only answers lookups by name).
+    /// Sorted so any reduction over it is deterministic.
+    pub fn tensors_by_name(&self) -> Vec<(&str, &[f32])> {
+        let mut v: Vec<(&str, &[f32])> = self
+            .tensors
+            .iter()
+            .map(|(n, d)| (n.as_str(), d.as_slice()))
+            .collect();
+        v.sort_by(|a, b| a.0.cmp(b.0));
+        v
+    }
 }
 
 impl std::fmt::Debug for NslWeightsCheckpoint {

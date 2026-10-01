@@ -256,6 +256,7 @@ pub mod wggo_cpkd;
 pub mod wggo_conflicts;
 pub mod wggo_cost;
 pub mod wggo_dp;
+pub mod wggo_forced_prune;
 pub mod wggo_gradient_scorer;
 pub mod wggo_graph;
 pub mod layerwise;
@@ -934,6 +935,29 @@ pub struct WggoOptions {
     /// plan that cannot fit even at the fp16-moment floor is a HARD
     /// compile failure (no silent degradation).
     pub memory_budget_bytes: Option<u64>,
+    /// `--wggo-prune-layers`: layers to prune, named as WGGO's layer graph
+    /// names them (`blocks.1`, `layers.3`, `h.0`). Each must be a prunable
+    /// layer of the train block's graph — an unknown name is a hard compile
+    /// error listing the known ones. Executed by the WGGO prune rewrite
+    /// (whole-block chain-collapse for `blocks.N`), so it needs `source_ad`
+    /// and a WGGO mode other than off; both are refused otherwise. Empty =
+    /// no forced prune, every plan byte-identical to a build without it.
+    pub prune_layers: Vec<String>,
+    /// `--wggo-layer-prune-fraction F` (0 < F < 1): additionally prune the
+    /// `floor(F * n)` of the `n` whole-block layers with the lowest
+    /// weight-magnitude importance read from `weights` (RMS over every
+    /// element of the layer's weights, normalized by the max). Refused
+    /// without `weights`, when a block layer has no weights in the file, or
+    /// when `F * n` rounds down to zero layers. Same `source_ad` / mode
+    /// requirements as `prune_layers`.
+    pub layer_prune_fraction: Option<f64>,
+}
+
+impl WggoOptions {
+    /// Whether the user asked WGGO to prune layers (either flag).
+    pub fn layer_prune_requested(&self) -> bool {
+        !self.prune_layers.is_empty() || self.layer_prune_fraction.is_some()
+    }
 }
 
 /// CFIE: compiler-fused inference-engine options (paper: docs/research/CFIE.pdf).

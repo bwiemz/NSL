@@ -36,7 +36,7 @@ use nsl_runtime::kernel_profiler::{
 };
 use nsl_runtime::tensor::{
     nsl_tensor_free, nsl_tensor_matmul, nsl_tensor_to_device, test_build_tensor_2d_f32,
-    test_read_tensor_f64, NslTensor,
+    test_read_tensor_f32, NslTensor,
 };
 use nsl_runtime::{test_cuda_device_synchronize, test_set_batch_collapse_disabled};
 
@@ -119,11 +119,11 @@ fn gpu_tensor(shape: &[i64], data: &[f32]) -> i64 {
     view
 }
 
-/// GPU->CPU transfer widens f32 to f64 (the CPU tensor dtype), exactly as
-/// `tests/common/matmul_equiv.rs` does it; narrow back for comparison.
+/// GPU->CPU transfer keeps the f32 tag (C5 step 2a), as
+/// `tests/common/matmul_equiv.rs` reads it.
 fn read_back(gpu_ptr: i64) -> Vec<f32> {
     let cpu = nsl_tensor_to_device(gpu_ptr, 0);
-    let v: Vec<f32> = test_read_tensor_f64(cpu).into_iter().map(|x| x as f32).collect();
+    let v: Vec<f32> = test_read_tensor_f32(cpu);
     if cpu != gpu_ptr {
         nsl_tensor_free(cpu);
     }

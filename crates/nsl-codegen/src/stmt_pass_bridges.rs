@@ -473,14 +473,19 @@ pub(crate) fn invoke_wrga_if_enabled(
         }
     }
     let inject = crate::wrga_adapter_inject::run_with_compiler(&mut plan, compiler);
-    // B.2.1 Task 5.5: only clobber `adapter_sites` when this invocation
+    // B.2.1 Task 5.5: only publish `adapter_sites` when this invocation
     // actually produced sites. Otherwise we'd wipe the pre-scan result
     // (which runs before user-function compilation) when a target pattern
     // like "Toy.w" doesn't match any placement name emitted by
     // `infer_sites_from_wengert` (which uses bare "w"-style names).
+    //
+    // Nor does it replace a pre-scan result: every model constructor built
+    // its adapter side-table from the pre-scan sites, and the model methods
+    // were rewritten against their names, so a different list here would
+    // index those tables with a layout they were not built with.
     // `bus.wrga_plan` is always overwritten — the train-block plan is
     // strictly more informative (real Wengert list, real placements).
-    if !inject.sites.is_empty() {
+    if !inject.sites.is_empty() && compiler.bus.adapter_sites().is_empty() {
         // B.3 Task 4: wire fusion decisions onto each newly-injected site.
         let mut sites = inject.sites;
         for site in sites.iter_mut() {
