@@ -86,17 +86,24 @@ fn refusal_empty_closure_three_part_format() {
 }
 
 #[test]
-fn refusal_whole_block_unsupported_three_part_format() {
-    let r = PruneRefusal::WholeBlockUnsupported {
+fn refusal_broken_residual_chain_three_part_format() {
+    // v2 whole-block chain-collapse refusal. Replaces the v1
+    // `WholeBlockUnsupported` format test: role=Block prunes are executed
+    // now, and refuse only when the block's Adds cannot be collapsed.
+    let r = PruneRefusal::BrokenResidualChain {
         layer_name: "blocks.7".into(),
+        layer_role: LayerRole::Block,
+        adds: vec![12, 19],
+        reason: "intermediate stream value VarId 13 (the result of Add op 12) is also read by op 40 (Add), outside the block".into(),
     };
     let text = format_refusal(&r);
-    assert!(text.contains("whole-block pruning"));
-    assert!(text.contains("not supported in v1"));
-    assert!(text.contains("blocks.7.attn"));
-    assert!(text.contains("blocks.7.ffn"));
-    assert!(text.contains("planned:"));
-    assert_eq!(diagnostic_code(&r), OverrideRejectReason::PruneWholeBlockUnsupported);
+    assert!(text.starts_with("prune: whole-block residual chain cannot be collapsed"),
+        "expected three-part header; got: {text}");
+    assert!(text.contains("requested:  prune blocks.7  (role=Block)"));
+    assert!(text.contains("expected:"));
+    assert!(text.contains("found:      2 residual Add(s) at ops [12, 19]"));
+    assert!(text.contains("read by op 40"));
+    assert_eq!(diagnostic_code(&r), OverrideRejectReason::PruneBrokenResidualChain);
 }
 
 #[test]
@@ -122,6 +129,7 @@ fn success_stderr_format_matches_spec() {
         h_before_var: 100,
         h_after_var: 202,
         residual_add_op: 42,
+        residual_add_ops: vec![42],
         closure_ops: vec![10, 11, 12, 13],
         ops_deleted: 5,  // 4 closure ops + 1 residual Add
     };
@@ -138,6 +146,27 @@ fn success_stderr_format_matches_spec() {
 }
 
 #[test]
+fn whole_block_success_line_reports_the_last_chain_add() {
+    // A two-Add block: ops_deleted counts the closure plus BOTH Adds, and
+    // residual_add_op is the LAST Add of the chain (the one producing h_after).
+    let rewrite = PruneRewrite {
+        layer_name: "blocks.1".into(),
+        layer_role: LayerRole::Block,
+        h_before_var: 9,
+        h_after_var: 15,
+        residual_add_op: 15,
+        residual_add_ops: vec![12, 15],
+        closure_ops: vec![10, 11, 13, 14],
+        ops_deleted: 6,
+    };
+    let line = format_success_stderr(&rewrite, 2, rewrite.ops_deleted);
+    assert_eq!(
+        line,
+        "[prune] layer=2 name=blocks.1 role=Block applied=true closure_size=4 ops_deleted=6 residual_add_op=15"
+    );
+}
+
+#[test]
 fn multi_rewrite_stderr_reports_per_rewrite_ops_deleted_not_aggregate() {
     // Regression: stmt.rs previously passed wggo_prune_result.ops_deleted
     // (aggregate) to format_success_stderr for each rewrite, so multi-prune
@@ -150,6 +179,7 @@ fn multi_rewrite_stderr_reports_per_rewrite_ops_deleted_not_aggregate() {
         h_before_var: 100,
         h_after_var: 110,
         residual_add_op: 9,
+        residual_add_ops: vec![9],
         closure_ops: vec![1, 2, 3],
         ops_deleted: 4,  // 3 + 1
     };
@@ -159,6 +189,7 @@ fn multi_rewrite_stderr_reports_per_rewrite_ops_deleted_not_aggregate() {
         h_before_var: 200,
         h_after_var: 220,
         residual_add_op: 19,
+        residual_add_ops: vec![19],
         closure_ops: vec![11, 12, 13, 14, 15],
         ops_deleted: 6,  // 5 + 1
     };

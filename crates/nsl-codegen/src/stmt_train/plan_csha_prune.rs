@@ -89,6 +89,18 @@ impl Compiler<'_> {
         extractor: &mut crate::source_ad::WengertExtractor<'_>,
         wggo_applied: &Option<crate::wggo_apply::AppliedPlan>,
     ) -> Result<PassScheduler, CodegenError> {
+        // A requested layer prune (`--wggo-prune-layers` /
+        // `--wggo-layer-prune-fraction`) with no plan to carry it — WGGO
+        // declined to plan this block (its scorer could not be built, say) —
+        // would train the full model. The driver already refused a missing
+        // `--source-ad` / `--wggo` mode; this is the last place it can vanish.
+        if wggo_applied.is_none() && self.compile_options.wggo.layer_prune_requested() {
+            return Err(CodegenError::new(
+                "WGGO layer prune: a layer prune was requested, but WGGO produced \
+                 no plan for this train block, so no layer would be pruned. See \
+                 the [wggo] lines above for why planning did not run",
+            ));
+        }
         // --- NEW: spec §4 WGGO Prune, runs BEFORE wrga so WRGA sees reduced forward ---
         // When WGGO produced a plan, run the prune IR rewriter. On any refusal the
         // whole plan is rejected (spec §5.3 dry-run-then-commit contract) and

@@ -457,6 +457,19 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
          NEGATIVE form: the pre-2026-08-16 wrong-backward warning must never \
          return (see its NEGATIVE_NEEDLES tombstone entry)",
     ),
+    m(
+        "[prune]",
+        &[
+            // `format_success_stderr` builds the line; the WGGO consumption
+            // fork (`stmt_train/plan_csha_prune.rs`) prints it per rewrite.
+            "crates/nsl-codegen/src/wggo_prune.rs",
+        ],
+        "a WGGO prune decision was APPLIED to the source-AD forward: \
+         `[prune] layer=N name=<layer> role=<role> applied=true ...` once per \
+         rewritten layer (sub-block residual alias, or whole-block \
+         chain-collapse for role=Block). A refused prune fails the compile \
+         with a three-part `prune: ...` error instead",
+    ),
 ];
 
 /// Look a marker up by token. Panics if it is not registered — call sites are

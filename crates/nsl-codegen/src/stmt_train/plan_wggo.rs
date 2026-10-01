@@ -65,13 +65,14 @@ impl Compiler<'_> {
         // WGGO: run the global optimization planner if enabled.  The
         // planner call itself is pure data-in/data-out — it produces a
         // plan of globally-optimal per-layer decisions.  Several of
-        // those decisions are now lowered downstream: sub-block prune
-        // rewrites the Wengert list below (via `wggo_prune::run`), and
+        // those decisions are now lowered downstream: prune (sub-block
+        // and whole-block) rewrites the Wengert list after this site (via
+        // `wggo_prune::run`), and
         // the resulting `WggoOverrides` drive CSHA fusion level, WRGA
         // adapter placement, FASE fused-step, and the CPDT shard factor.
         // Some decisions remain advisory/report-only for now (WGGO-side
-        // PCA packing_mode, per-layer optimizer precision, whole-block
-        // prune, and CFIE inference decisions).
+        // PCA packing_mode, per-layer optimizer precision, and CFIE
+        // inference decisions).
         //
         let mut wggo_applied: Option<crate::wggo_apply::AppliedPlan> = None;
         // Whether a pre-plan existed for this block (=> the wrapper
@@ -246,44 +247,13 @@ impl Compiler<'_> {
                 } else {
                     nsl_log::nsl_log!(INFO, "wggo", "[wggo] {}", plan.summary());
                 }
-                // Prune consumer (diagnostic stub): WGGO's DP can
-                // emit `CoarseDecision::Prune` for low-importance
-                // layers, but no downstream codegen implements
-                // the layer-to-residual-identity IR rewrite.
-                // Surface the gap via the `[prune]` stderr
-                // diagnostic matching the CSHA/WRGA/CPDT/FASE
-                // pattern, so users and the future IR-rewrite
-                // session can see the planner's intent instead
-                // of the decision silently no-opping.  Empty
-                // iterator when no layer is planned for pruning
-                // (shipped-binary common case).
-                for diag in crate::wggo_overrides::collect_prune_diagnostics(&plan.applied) {
-                    // Dispatch through `diag.reason` rather than
-                    // calling the reason-string helper directly,
-                    // so a future Prune-adjacent reason variant
-                    // automatically renders its own string and
-                    // this match statement surfaces the missing
-                    // case at compile time via a non-exhaustive
-                    // warning (or new arm) rather than silently
-                    // printing the wrong string.
-                    let reason_str: std::borrow::Cow<'static, str> = match &diag.reason {
-                        crate::wggo_overrides::OverrideRejectReason::WholeBlockPruneNotImplemented => {
-                            std::borrow::Cow::Borrowed(
-                                crate::wggo_overrides::whole_block_prune_not_implemented_reason(),
-                            )
-                        }
-                        other => std::borrow::Cow::Owned(format!("{:?}", other)),
-                    };
-                    nsl_log::nsl_log!(INFO, "prune", 
-                        "[prune] layer:{} name={} wggo-override-rejected \
-                             requested={} applied={} reason={}",
-                        diag.layer_index,
-                        diag.layer_name,
-                        diag.requested,
-                        diag.applied,
-                        reason_str,
-                    );
-                }
+                // Prune decisions are not reported here: every one (sub-block
+                // or whole-block) is executed by `wggo_prune::run()` at the
+                // consumption fork (`plan_csha_prune.rs::run_wggo_prune`),
+                // which prints a `[prune] ... applied=true` line per rewrite
+                // or refuses the compile. The PR #102 stub that printed
+                // `reason=ir_rewrite_not_implemented` for whole-block
+                // prunes was removed when v2 chain-collapse landed.
                 // PCA packing consumption (errata E2 / audit gap #4):
                 // validate the plan's per-layer packing_mode against
                 // the attention kernels the module-scan emitter

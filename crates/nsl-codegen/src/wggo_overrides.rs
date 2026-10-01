@@ -54,19 +54,11 @@ pub enum OverrideRejectReason {
     // convention for FullBuffer params whenever two_phase_clip is active,
     // so the global ||m_partial||² norm stays uniform and there is nothing
     // to clamp. See fase::plan_with_overrides.)
-    // Prune:
-    /// Whole-block prune (LayerRole::Block) — not yet implemented; see spec §3.6.
-    /// Sub-block prune is handled by wggo_prune.rs.
-    ///
-    /// WGGO decided `CoarseDecision::Prune` for a layer whose weight
-    /// analysis score fell below `prune_floor`, but no downstream
-    /// codegen consumer implements the layer-to-residual-identity IR
-    /// rewrite required to honor the decision.  The layer still executes
-    /// at full cost; the `[prune] layer:N wggo-override-rejected` stderr
-    /// diagnostic surfaces the gap so users and future wiring work can
-    /// see the planner's intent.  Full IR rewrite is tracked as a
-    /// separate follow-up on top of this diagnostic stub.
-    WholeBlockPruneNotImplemented,
+    // Prune (each variant is `wggo_prune::diagnostic_code` of one
+    // `PruneRefusal`). There is no "prune not implemented" reason any more:
+    // sub-block prune (v1) and whole-block chain-collapse (v2) are both
+    // executed by `wggo_prune::run()`, which either applies a decision or
+    // refuses the compile — a planned prune never silently runs at full cost.
     /// Prune refusal — spec §3.1. Cross-layer parameter consumption.
     PruneCrossLayerParam,
     /// Prune refusal — spec §3.2. Layer lacks a residual `Add`.
@@ -77,12 +69,9 @@ pub enum OverrideRejectReason {
     PruneAmbiguousPatternMatch,
     /// Prune refusal — spec §3.5. No parameters match the requested layer prefix.
     PruneEmptyClosure,
-    /// Prune refusal — spec §3.6. Whole-block prune (LayerRole::Block) unsupported in v1.
-    /// Distinct from `WholeBlockPruneNotImplemented`: this variant is emitted by
-    /// `wggo_prune::run()` via the new sub-block flow; `WholeBlockPruneNotImplemented`
-    /// is emitted by the legacy `collect_prune_diagnostics` path. Both coexist
-    /// during v1; v2 will consolidate.
-    PruneWholeBlockUnsupported,
+    /// Prune refusal — v2 whole-block chain-collapse: the block's residual
+    /// Adds do not form one collapsible stream chain.
+    PruneBrokenResidualChain,
     /// Prune refusal — spec §3.7. Two prune decisions in the same plan conflict.
     PruneConflictingDecisions,
     // PCA packing (errata E2 / audit gap #4):
@@ -220,53 +209,6 @@ fn map_csha_level(raw: u8) -> Option<FusionLevel> {
         3 => Some(FusionLevel::Level3),
         _ => None,
     }
-}
-
-/// Walk an `AppliedPlan` and collect one `OverrideDiagnostic` per layer
-/// whose coarse decision is `Prune`.  The downstream codegen consumer
-/// that would honor these decisions (layer-to-residual-identity IR
-/// rewrite) is not yet implemented; this helper makes the gap visible
-/// via the `[prune] layer:N wggo-override-rejected requested=prune
-/// applied=keepfull reason=ir_rewrite_not_implemented` stderr format
-/// that matches the existing CSHA/WRGA/CPDT/FASE diagnostic pattern.
-///
-/// Empty when no layer is planned for pruning (the shipped-binary
-/// common case) — caller can iterate and emit without extra gating.
-pub fn collect_prune_diagnostics(
-    applied: &crate::wggo_apply::AppliedPlan,
-) -> Vec<OverrideDiagnostic> {
-    use crate::wggo_dp::CoarseDecision;
-    applied
-        .layers
-        .iter()
-        // Spec §3.6 + Task 2: this function now surfaces only whole-block prune
-        // decisions. Sub-block prune decisions (Attention / Ffn) flow through
-        // `wggo_prune::run()`. Role classification is delegated to
-        // `wggo_graph::infer_role` so all consumers use the same authority.
-        .filter(|l| {
-            matches!(l.coarse, CoarseDecision::Prune)
-                && matches!(
-                    crate::wggo_graph::infer_role(&l.layer_name),
-                    crate::wggo_graph::LayerRole::Block
-                )
-        })
-        .map(|l| OverrideDiagnostic {
-            layer_index: l.layer_index,
-            layer_name: l.layer_name.clone(),
-            reason: OverrideRejectReason::WholeBlockPruneNotImplemented,
-            requested: "prune".to_string(),
-            applied: "keepfull".to_string(),
-        })
-        .collect()
-}
-
-/// Stable reason-string for `OverrideRejectReason::WholeBlockPruneNotImplemented`,
-/// used by the `[prune]` stderr diagnostic emitter.  Factored out so
-/// tests can assert on the literal string without reaching into private
-/// rendering code in `stmt.rs`.
-pub fn whole_block_prune_not_implemented_reason() -> &'static str {
-    // Stable string preserved from PR #102; see spec §5.5.
-    "ir_rewrite_not_implemented"
 }
 
 // ─── PCA packing_mode consumption (errata E2 / audit gap #4) ────────────────
@@ -544,95 +486,6 @@ mod tests {
             param_bytes: 0,
             activation_bytes: 0,
         }
-    }
-
-    #[test]
-    fn collect_prune_diagnostics_empty_when_no_layer_pruned() {
-        let plan = AppliedPlan {
-            layers: vec![
-                layer("blocks.0", 0, CoarseDecision::KeepFull),
-                layer("blocks.1", 1, CoarseDecision::Thin),
-            ],
-            total_us: 20.0,
-            peak_memory_bytes: 0,
-        };
-        assert!(collect_prune_diagnostics(&plan).is_empty());
-    }
-
-    #[test]
-    fn collect_prune_diagnostics_emits_one_per_pruned_layer() {
-        let plan = AppliedPlan {
-            layers: vec![
-                layer("blocks.0", 0, CoarseDecision::KeepFull),
-                layer("blocks.1", 1, CoarseDecision::Prune),
-                layer("blocks.2", 2, CoarseDecision::Thin),
-                layer("blocks.3", 3, CoarseDecision::Prune),
-            ],
-            total_us: 40.0,
-            peak_memory_bytes: 0,
-        };
-        let diags = collect_prune_diagnostics(&plan);
-        assert_eq!(diags.len(), 2);
-
-        // Order matches AppliedPlan.layers iteration order.
-        assert_eq!(diags[0].layer_index, 1);
-        assert_eq!(diags[0].layer_name, "blocks.1");
-        assert_eq!(diags[0].requested, "prune");
-        assert_eq!(diags[0].applied, "keepfull");
-        assert!(matches!(diags[0].reason, OverrideRejectReason::WholeBlockPruneNotImplemented));
-
-        assert_eq!(diags[1].layer_index, 3);
-        assert_eq!(diags[1].layer_name, "blocks.3");
-    }
-
-    #[test]
-    fn collect_prune_diagnostics_excludes_sub_block_layers() {
-        // Spec §3.6 + Task 2: sub-block prune decisions (Attention / Ffn role)
-        // are routed through wggo_prune::run() and must NOT be surfaced here.
-        // Only whole-block prune (LayerRole::Block) appears in this diagnostic.
-        let plan = AppliedPlan {
-            layers: vec![
-                layer("blocks.3.attn", 0, CoarseDecision::Prune),
-                layer("blocks.3.ffn",  1, CoarseDecision::Prune),
-                layer("blocks.3",      2, CoarseDecision::Prune),
-            ],
-            total_us: 30.0,
-            peak_memory_bytes: 0,
-        };
-        let diags = collect_prune_diagnostics(&plan);
-        // Only the whole-block layer (blocks.3) should appear.
-        assert_eq!(diags.len(), 1, "expected 1 diagnostic for whole-block only; got {}", diags.len());
-        assert_eq!(diags[0].layer_name, "blocks.3");
-    }
-
-    #[test]
-    fn whole_block_prune_not_implemented_reason_string_is_stable() {
-        // The reason string is part of the externally-observable stderr
-        // format `[prune] layer:N name=<N> wggo-override-rejected ...
-        // reason=<S>` which future tools (decision explainer, CI log
-        // scanners) may match against.  Pin the literal value here so
-        // drift is caught as a test failure rather than a quiet parser
-        // regression.
-        assert_eq!(whole_block_prune_not_implemented_reason(), "ir_rewrite_not_implemented");
-    }
-
-    #[test]
-    fn prune_diagnostic_carries_layer_name_for_stderr_format() {
-        // The `[prune] layer:N name=<N>` stderr format depends on
-        // `OverrideDiagnostic.layer_name` being populated (not just
-        // `layer_index`).  Match the precedent the CSHA/WRGA/FASE/CPDT
-        // emitters set — they all carry both fields.  Guards the
-        // emitter at stmt.rs against regression if a future refactor
-        // drops `layer_name` from the diagnostic construction.
-        let plan = AppliedPlan {
-            layers: vec![layer("h.5", 5, CoarseDecision::Prune)],
-            total_us: 0.1,
-            peak_memory_bytes: 0,
-        };
-        let diags = collect_prune_diagnostics(&plan);
-        assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].layer_index, 5);
-        assert_eq!(diags[0].layer_name, "h.5");
     }
 
     // ─── PCA packing consumption (errata E2 / audit gap #4) ────────────────

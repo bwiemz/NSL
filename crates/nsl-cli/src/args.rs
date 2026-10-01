@@ -888,6 +888,22 @@ pub(crate) struct BuildArgs {
         #[arg(long, value_name = "F")]
         pub(crate) wggo_prune_fraction: Option<f64>,
 
+        /// WGGO: prune these layers (comma-separated, named as WGGO's layer
+        /// graph names them, e.g. `blocks.1,blocks.3`). A whole block is
+        /// removed by collapsing its residual chain to an identity; an
+        /// unknown or non-prunable name is a hard error listing the known
+        /// layers. Requires --source-ad and --wggo <full|greedy|auto>.
+        #[arg(long, value_name = "NAMES")]
+        pub(crate) wggo_prune_layers: Option<String>,
+
+        /// WGGO: additionally prune floor(F x n) of the n block layers with the
+        /// lowest weight-magnitude importance (RMS of each block's weights in
+        /// --wggo-weights, normalized by the max), 0 < F < 1, never every
+        /// block. Requires --wggo-weights, --source-ad and --wggo
+        /// <full|greedy|auto>; a fraction that selects no layer is refused.
+        #[arg(long, value_name = "F")]
+        pub(crate) wggo_layer_prune_fraction: Option<f64>,
+
         /// WGGO: per-device resident training-memory budget in MiB. When
         /// set, the planner enforces the cap at both optimization levels
         /// (inter-layer DP + per-layer ILP) and, under budget pressure,
@@ -1518,6 +1534,22 @@ pub(crate) struct RunArgs {
         /// Clamped to [0.0, 0.9]; default 0.25.
         #[arg(long, value_name = "F")]
         pub(crate) wggo_prune_fraction: Option<f64>,
+
+        /// WGGO: prune these layers (comma-separated, named as WGGO's layer
+        /// graph names them, e.g. `blocks.1,blocks.3`). A whole block is
+        /// removed by collapsing its residual chain to an identity; an
+        /// unknown or non-prunable name is a hard error listing the known
+        /// layers. Requires --source-ad and --wggo <full|greedy|auto>.
+        #[arg(long, value_name = "NAMES")]
+        pub(crate) wggo_prune_layers: Option<String>,
+
+        /// WGGO: additionally prune floor(F x n) of the n block layers with the
+        /// lowest weight-magnitude importance (RMS of each block's weights in
+        /// --wggo-weights, normalized by the max), 0 < F < 1, never every
+        /// block. Requires --wggo-weights, --source-ad and --wggo
+        /// <full|greedy|auto>; a fraction that selects no layer is refused.
+        #[arg(long, value_name = "F")]
+        pub(crate) wggo_layer_prune_fraction: Option<f64>,
 
         /// WGGO: per-device resident training-memory budget in MiB. When
         /// set, the planner enforces the cap at both optimization levels

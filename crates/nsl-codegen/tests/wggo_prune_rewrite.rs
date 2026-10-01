@@ -462,48 +462,68 @@ fn empty_plan_no_rewrites() {
 }
 
 // --------------------------------------------------------------------------
-// Test 5: whole-block prune attempt (blocks.1 with role=Block) → refusal
-//   with WholeBlockUnsupported. Spec §3.6: v1 does not support whole-block
-//   prune; only attn / ffn sub-layer prune is implemented.
+// Test 5: whole-block prune (blocks.1, role=Block) → v2 chain-collapse.
+//
+//   Until v2 this was `whole_block_prune_refused` (spec §3.6,
+//   `WholeBlockUnsupported`). blocks.1 threads the stream through TWO
+//   residual Adds — op 8 (B0_OUT → B1_MID) and op 11 (B1_MID → B1_OUT) — and
+//   B1_MID is read only by blocks.1's own ffn op and the second Add, so the
+//   chain collapses: ops 6..=11 are deleted and blocks.2's readers of B1_OUT
+//   now read B0_OUT.
 // --------------------------------------------------------------------------
 
 #[test]
-fn whole_block_prune_refused() {
+fn whole_block_prune_chain_collapses() {
     let mut wengert = mk_toy_wengert();
     let weight_map = WeightMap::default();
+    let baseline_ops = wengert.ops.len();
 
     // "blocks.1" has role Block (inferred by wggo_graph::infer_role).
     let applied = AppliedPlan {
-        layers: vec![
-            mk_prune_layer(0, "blocks.1"),  // whole-block prune — should be refused
-        ],
+        layers: vec![mk_prune_layer(1, "blocks.1")],
         total_us: 0.0,
         peak_memory_bytes: 0,
     };
 
     let result = run(&mut wengert, &applied, &weight_map);
 
-    assert_eq!(result.rewrites.len(), 0, "no rewrites expected on refusal");
-    assert_eq!(result.refusals.len(), 1, "expected exactly 1 refusal");
-    assert!(
-        matches!(&result.refusals[0], PruneRefusal::WholeBlockUnsupported { layer_name }
-            if layer_name == "blocks.1"),
-        "expected WholeBlockUnsupported for blocks.1, got: {:?}",
-        result.refusals[0]
-    );
+    assert!(result.refusals.is_empty(), "expected no refusals; got {:?}", result.refusals);
+    assert_eq!(result.rewrites.len(), 1);
+    let rw = &result.rewrites[0];
+    assert_eq!(rw.layer_name, "blocks.1");
+    assert_eq!(rw.h_before_var, 6, "h0 = B0_OUT");
+    assert_eq!(rw.h_after_var, 12, "hk = B1_OUT");
+    assert_eq!(rw.residual_add_ops, vec![8, 11], "both residual Adds, in stream order");
+    assert_eq!(rw.residual_add_op, 11);
+    assert_eq!(rw.closure_ops, vec![6, 7, 9, 10]);
+    assert_eq!(result.ops_deleted, 6);
+    assert_eq!(wengert.ops.len(), baseline_ops - 6);
+
+    // blocks.2's two readers of B1_OUT (its attn op and its residual Add)
+    // now read B0_OUT.
+    for id in [12u32, 14] {
+        let op = wengert.ops.iter().find(|o| o.id == id).expect("blocks.2 op survives");
+        assert!(op.inputs.contains(&6) && !op.inputs.contains(&12),
+            "op {id} must read B0_OUT (6) instead of the pruned B1_OUT (12); inputs {:?}", op.inputs);
+    }
+    assert_eq!(wengert.output, 24, "output (B3_OUT) is untouched");
+    for v in [9, 12] {
+        assert!(result.pruned_forward_var_ids.contains(&v), "stream value {v} pruned");
+    }
 }
 
 // --------------------------------------------------------------------------
-// Test 6 (Task 16 — merge-gate smoke test): mixed plan with one supported
-//   sub-block prune (blocks.1.attn) AND one unsupported whole-block prune
-//   (blocks.0) must:
-//     (a) emit the WholeBlockUnsupported refusal for blocks.0
+// Test 6 (Task 16 — merge-gate smoke test): a mixed plan with one supported
+//   prune (blocks.1.attn) AND two that refuse must:
+//     (a) emit EVERY refusal in one pass (no fix-one-recompile loop)
 //     (b) apply zero rewrites (dry-run-then-commit invariant — any refusal
 //         aborts the entire commit phase)
 //     (c) leave wengert.ops and wengert.output completely unchanged
 //
 // Spec §11 criterion #7. Validates the three-phase run() orchestration from
 // Task 11 under the realistic scenario of a partially-unsupported plan.
+// (Before v2 the unsupported half was a whole-block `blocks.0`; that prune
+// now succeeds, so the refusals are two layers that do not exist.)
 // --------------------------------------------------------------------------
 
 #[test]
@@ -512,12 +532,11 @@ fn mixed_plan_emits_all_refusals_in_one_pass_with_wengert_untouched() {
     let baseline_op_count = wengert.ops.len();
     let baseline_output = wengert.output;
 
-    // Mixed plan: blocks.1.attn is a valid sub-block prune; blocks.0 is a
-    // whole-block prune which is unsupported in v1 (LayerRole::Block).
     let plan = AppliedPlan {
         layers: vec![
             mk_prune_layer(2, "blocks.1.attn"), // supported sub-block prune
-            mk_prune_layer(0, "blocks.0"),      // whole-block — should be refused
+            mk_prune_layer(9, "blocks.9"),      // no such block — refused
+            mk_prune_layer(7, "blocks.7.ffn"),  // no such sub-block — refused
         ],
         total_us: 0.0,
         peak_memory_bytes: 0,
@@ -525,14 +544,14 @@ fn mixed_plan_emits_all_refusals_in_one_pass_with_wengert_untouched() {
 
     let result = run(&mut wengert, &plan, &WeightMap::default());
 
-    // (a) WholeBlockUnsupported refusal must be present for blocks.0.
-    let has_whole_block_refusal = result.refusals.iter().any(|r| {
-        matches!(r, PruneRefusal::WholeBlockUnsupported { layer_name }
-            if layer_name == "blocks.0")
-    });
-    assert!(
-        has_whole_block_refusal,
-        "expected WholeBlockUnsupported for blocks.0; got refusals: {:?}",
+    // (a) Both refusals are present.
+    let empty: Vec<&str> = result.refusals.iter().filter_map(|r| match r {
+        PruneRefusal::EmptyClosure { layer_name, .. } => Some(layer_name.as_str()),
+        _ => None,
+    }).collect();
+    assert_eq!(
+        empty, vec!["blocks.9", "blocks.7.ffn"],
+        "expected EmptyClosure for both missing layers; got refusals: {:?}",
         result.refusals
     );
 
@@ -558,4 +577,37 @@ fn mixed_plan_emits_all_refusals_in_one_pass_with_wengert_untouched() {
         wengert.output, baseline_output,
         "wengert.output should be untouched on refusal"
     );
+}
+
+// --------------------------------------------------------------------------
+// Test 7: both sub-blocks of one layer in one plan (spec §7.1 "prune both
+//   sub-blocks of one layer"). blocks.1.attn's output (B1_MID) IS
+//   blocks.1.ffn's input; the ffn rewrite was validated against the
+//   unmutated list, so its h_before names a value the attn commit deletes.
+//   The commit must resolve through the attn alias: blocks.2 ends up reading
+//   B0_OUT, and nothing reads a deleted VarId.
+// --------------------------------------------------------------------------
+
+#[test]
+fn adjacent_sub_blocks_resolve_through_each_others_alias() {
+    let mut wengert = mk_toy_wengert();
+    let plan = AppliedPlan {
+        layers: vec![mk_prune_layer(2, "blocks.1.attn"), mk_prune_layer(3, "blocks.1.ffn")],
+        total_us: 0.0,
+        peak_memory_bytes: 0,
+    };
+
+    let result = run(&mut wengert, &plan, &WeightMap::default());
+
+    assert!(result.refusals.is_empty(), "expected no refusals; got {:?}", result.refusals);
+    assert_eq!(result.rewrites.len(), 2);
+    let produced: std::collections::BTreeSet<VarId> =
+        wengert.ops.iter().map(|o| o.result).chain(std::iter::once(0)).collect();
+    for op in &wengert.ops {
+        for v in &op.inputs {
+            assert!(produced.contains(v), "op {} reads deleted VarId {v}", op.id);
+        }
+    }
+    let b2_attn = wengert.ops.iter().find(|o| o.id == 12).unwrap();
+    assert_eq!(b2_attn.inputs, vec![6], "blocks.2 must read B0_OUT once blocks.1 is gone");
 }

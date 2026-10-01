@@ -133,6 +133,7 @@ const CLI_REPORTS: &str = "crates/nsl-cli/src/commands/build/reports.rs";
 const CLI_OPTIONS: &str = "crates/nsl-cli/src/commands/build/options.rs";
 const CLI_CEP: &str = "crates/nsl-cli/src/commands/cep.rs";
 const WGGO_SCORER: &str = "crates/nsl-codegen/src/wggo_gradient_scorer.rs";
+const WGGO_FORCED_PRUNE: &str = "crates/nsl-codegen/src/wggo_forced_prune.rs";
 const CPDT_CALIB: &str = "crates/nsl-codegen/src/bin/cpdt_calibrate.rs";
 const ENTRY_POINTS: &str = "crates/nsl-codegen/src/compiler/entry_points.rs";
 
@@ -680,6 +681,47 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         "--medium-dir",
         CPDT_CALIB,
         "--emit-calibration requires --medium-dir <path>",
+    ),
+    // ── WGGO layer prune (`--wggo-prune-layers` / `--wggo-layer-prune-fraction`)
+    // The prune rewrites the source-AD forward Wengert list as a WGGO plan
+    // decision: no source-AD, no list to rewrite; WGGO off, no plan. One
+    // message names both flags, so both rules pin the same fragment.
+    src_rule(
+        "--wggo-prune-layers",
+        RuleKind::Requires,
+        "--source-ad",
+        STMT_DRIVER,
+        "--wggo-prune-layers / --wggo-layer-prune-fraction requires --source-ad",
+    ),
+    src_rule(
+        "--wggo-layer-prune-fraction",
+        RuleKind::Requires,
+        "--source-ad",
+        STMT_DRIVER,
+        "--wggo-prune-layers / --wggo-layer-prune-fraction requires --source-ad",
+    ),
+    src_rule(
+        "--wggo-prune-layers",
+        RuleKind::Requires,
+        "--wggo",
+        STMT_DRIVER,
+        "--wggo-prune-layers / --wggo-layer-prune-fraction requires --wggo <full|greedy|auto>",
+    ),
+    src_rule(
+        "--wggo-layer-prune-fraction",
+        RuleKind::Requires,
+        "--wggo",
+        STMT_DRIVER,
+        "--wggo-prune-layers / --wggo-layer-prune-fraction requires --wggo <full|greedy|auto>",
+    ),
+    // The magnitude ranking reads the weights file; without one there is
+    // nothing to rank, and pruning nothing must not look like success.
+    src_rule(
+        "--wggo-layer-prune-fraction",
+        RuleKind::Requires,
+        "--wggo-weights",
+        WGGO_FORCED_PRUNE,
+        "--wggo-layer-prune-fraction requires --wggo-weights",
     ),
     // ── CUDA graphs ────────────────────────────────────────────────────────
     src_rule(

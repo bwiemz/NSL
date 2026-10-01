@@ -71,6 +71,8 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
             wggo_weights,
             wggo_importance,
             wggo_prune_fraction,
+            wggo_prune_layers,
+            wggo_layer_prune_fraction,
             wggo_memory_budget,
             optim_state_offload,
             checkpoint_blocks,
@@ -232,6 +234,20 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
             };
             let wggo_moment_precision =
                 wggo_moment_precision || wggo_memory_budget_bytes.is_some();
+            // --wggo-prune-layers / --wggo-layer-prune-fraction: the CLI-shaped
+            // checks, shared with the other dispatcher. Codegen resolves the
+            // names against the layer graph and refuses a missing --source-ad
+            // or WGGO mode there.
+            let wggo_prune_layers = match crate::commands::parse_wggo_layer_prune(
+                wggo_prune_layers.as_deref(),
+                wggo_layer_prune_fraction,
+            ) {
+                Ok(names) => names,
+                Err(msg) => {
+                    nsl_log::nsl_log!(ERROR, "cli", "{msg}");
+                    process::exit(1);
+                }
+            };
 
             if cep_prune && cep_joint {
                 nsl_log::nsl_log!(ERROR, "cli", 
@@ -603,6 +619,8 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                     importance: nsl_codegen::WggoImportance::from(wggo_importance),
                     prune_fraction: wggo_prune_fraction,
                     memory_budget_bytes: wggo_memory_budget_bytes,
+                    prune_layers: wggo_prune_layers.clone(),
+                    layer_prune_fraction: wggo_layer_prune_fraction,
                 },
                 cfie: nsl_codegen::CfieOptions {
                     mode_override: cfie.clone(),

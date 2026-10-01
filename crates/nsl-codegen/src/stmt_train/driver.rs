@@ -79,6 +79,39 @@ impl Compiler<'_> {
         let _phase = crate::pass_trace::enter_phase(
             crate::pass_registry::CompilePhase::TrainBlock,
         );
+        // A WGGO layer prune (`--wggo-prune-layers` /
+        // `--wggo-layer-prune-fraction`) is a WGGO plan decision executed by
+        // rewriting the source-AD forward Wengert list (`wggo_prune.rs`).
+        // Without source-AD the forward is compiled from the AST, and with
+        // WGGO off the planner never runs — either way the request would
+        // vanish and the full model would train. Refuse, naming the fix.
+        if self.compile_options.wggo.layer_prune_requested() {
+            if !self.features.source_ad_enabled {
+                return Err(CodegenError::new(
+                    "--wggo-prune-layers / --wggo-layer-prune-fraction requires \
+                     --source-ad: the layer prune rewrites the source-AD forward \
+                     Wengert list, and the tape path compiles the forward from the \
+                     AST, so the requested layers would silently keep training. \
+                     Add --source-ad (or --pretrain-optimized, which implies it)",
+                ));
+            }
+            if !crate::wggo_prepass::wggo_mode_enabled(&self.compile_options) {
+                return Err(CodegenError::new(
+                    "--wggo-prune-layers / --wggo-layer-prune-fraction requires \
+                     --wggo <full|greedy|auto>: the prune is a WGGO plan decision, \
+                     and with WGGO off the planner never runs, so nothing would be \
+                     pruned. Add --wggo greedy (or full)",
+                ));
+            }
+            if self.features.pipeline_config.is_some() {
+                return Err(CodegenError::new(
+                    "--wggo-prune-layers / --wggo-layer-prune-fraction is not \
+                     supported on the pipelined train path (@pipeline): WGGO \
+                     planning and the prune rewrite run only on the single-device \
+                     source-AD path. Drop one",
+                ));
+            }
+        }
         // M43b: Pipeline parallel detection
         if self.features.pipeline_config.is_some() {
             if self.compile_options.train.layerwise_accum {
@@ -1181,6 +1214,23 @@ impl Compiler<'_> {
                     return Err(CodegenError::new(
                         "--fuse-lm-head require: source-AD extraction failed,                          and the tape fallback cannot fuse an LM head.                          Restrict the step body to source-AD-supported                          operations or drop `require`",
                     ));
+                }
+                // A WGGO layer prune rewrites the extracted forward; the
+                // tape fallback has none, so the requested layers would
+                // silently keep training.
+                if self.compile_options.wggo.layer_prune_requested() {
+                    let flag = if self.compile_options.wggo.prune_layers.is_empty() {
+                        "--wggo-layer-prune-fraction"
+                    } else {
+                        "--wggo-prune-layers"
+                    };
+                    return Err(CodegenError::new(format!(
+                        "{flag} requires source-AD extraction, but the step body \
+                         could not be extracted (dynamic control flow?), and the \
+                         tape fallback has no Wengert forward to prune. Restrict \
+                         the step body to source-AD-supported operations or drop \
+                         {flag}"
+                    )));
                 }
                 // Source AD extraction failed — fall back to tape
                 nsl_log::nsl_log!(WARN, "nsl", "[nsl] source AD extraction failed, falling back to tape-based AD");
