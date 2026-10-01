@@ -1203,19 +1203,14 @@ impl Compiler<'_> {
                 // loads, and the CPKD report facts. TrainPlan step 5 splits the
                 // facts from the emission. The map is still mutated below
                 // (WRGA's adapter tensors), so it stays a driver binding.
-                let primal_facts = self.plan_primal_facts(state, &extractor, step_param_sym);
+                let primal_facts =
+                    self.plan_primal_facts(state, &extractor, step_param_sym, &layout, &model_type_name);
                 self.plan_cpkd_report(&extractor, &fase_plan, grad_accumulation_steps)?;
                 let mut primal_vars = self.emit_primal_vars(
                     builder,
                     state,
                     &primal_facts,
-                    PrimalVarsHandles {
-                        layout: &layout,
-                        model_ptr,
-                        model_type_name: &model_type_name,
-                        param_list,
-                        step_param_var,
-                    },
+                    PrimalVarsHandles { model_ptr, param_list, step_param_var },
                 )?;
 
                 // 4. Find the loss symbol's VarId and set it as the Wengert
@@ -1372,18 +1367,35 @@ impl Compiler<'_> {
                 // Moved to `stmt_train/adapter_sites.rs` byte-for-byte (roadmap A1):
                 // the override-rejected diagnostics, the adapter init side-table
                 // and the adapter-tensor loads into the VarMap.
+                let adapter_loads =
+                    self.plan_wrga_adapter_loads(&primal_facts, &extractor, &layout, &model_type_name);
                 self.emit_wrga_adapter_sites(
                     builder,
                     state,
                     AdapterSitesInputs {
-                        extractor: &extractor,
-                        layout: &layout,
+                        adapter_loads: &adapter_loads,
                         model_ptr,
                         model_type_name: &model_type_name,
                         primal_vars: &mut primal_vars,
                         wrga_plan: &wrga_plan,
                     },
                 )?;
+                // The primal VarMap's key set, planned (TrainPlan step 5b):
+                // the primal facts plus the adapter loads. The CCR owned
+                // restriction below is seeded with it, and the adapter walks
+                // above were planned from it, so hold it to the map the
+                // emitters built: a planner that drifts from its emitter
+                // must stop the compile, not silently change what is emitted.
+                let planned_primal_keys: std::collections::HashSet<crate::wengert::VarId> =
+                    primal_facts.mapped.iter().copied().chain(adapter_loads.mapped()).collect();
+                if planned_primal_keys.len() != primal_vars.len()
+                    || !primal_vars.keys().all(|vid| planned_primal_keys.contains(vid))
+                {
+                    return Err(CodegenError::new(
+                        "internal compiler error (TrainPlan): the planned primal VarMap keys \
+                         differ from the emitted ones; please report this",
+                    ));
+                }
                 // WRGA fork + CCR planning.
                 // Moved to `stmt_train/plan_ccr.rs` byte-for-byte (roadmap A1):
                 // the positional-reference guard, the fork of the extractor's list
@@ -1420,9 +1432,8 @@ impl Compiler<'_> {
                         crate::wengert::WengertType,
                     >,
                 > = ccr_plan.as_ref().map(|_| {
-                    let seed: std::collections::HashSet<crate::wengert::VarId> =
-                        primal_vars.keys().copied().collect();
-                    crate::wengert_lower::infer_primal_owned(&effective_primal, &seed)
+                    // Seeded with the planned key set (TrainPlan step 5b).
+                    crate::wengert_lower::infer_primal_owned(&effective_primal, &planned_primal_keys)
                 });
 
                 // CCR P1.a: restrict the recompute set to what the primal
