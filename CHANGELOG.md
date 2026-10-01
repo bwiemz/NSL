@@ -1676,17 +1676,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
     scaling: two `nsl_tensor_len` calls, a division, a `mul_scalar` and one
     free. The three CSLA layerwise entries also buffer the mean's operand and
     result for the window replay.
-  - **Found, not fixed here.** The source-AD Add/Sub adjoint is `Identity`,
-    with no reduction to the operand's shape. Parameter gradients are reduced
-    to their parameter's shape at the end, which is why bias adds work. A
-    broadcast *intermediate*, such as the scalar in `x @ w + mean(x @ v)`,
-    receives the unreduced gradient. The ignored test
-    `a_mean_inside_a_forward_trains_like_its_gradient_under_source_ad`
-    reproduces it.
-
   - **A mean inside a forward under source AD** also needed the broadcast
     fix below; `a_mean_inside_a_forward_trains_like_its_gradient_under_source_ad`
     runs with it.
+
 - **Source AD: a broadcast operand's gradient had the output's shape, not its
   own.**
   - **The bug.** The Add and Sub adjoints were `Identity` and `Negate`, and
@@ -1743,6 +1736,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
       free (1 to 4 per fixture);
     - the CSLA layerwise entries also buffer the Sub's operands for the
       window replay.
+
 - Mutation audit, slice 6 (roadmap item 5): **three gradient gates could not
   see a gradient's size.** Every mutant below was planted and run against the
   gate before and after; evidence in
