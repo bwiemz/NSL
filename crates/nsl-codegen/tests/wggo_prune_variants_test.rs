@@ -1,6 +1,12 @@
-// Verifies the 7 new OverrideRejectReason variants exist per spec §6.3,
+// Verifies the prune OverrideRejectReason variants exist per spec §6.3,
 // using the OverrideRejectReason enum in place of the spec's DiagnosticCode
 // (the codebase has no parallel DiagnosticCode enum).
+//
+// `PruneWholeBlockUnsupported` (spec §3.6) is gone: whole-block prune is
+// implemented by the v2 chain-collapse, so no plan can reach a "Block is
+// unsupported" refusal any more. Its v2 replacement is
+// `PruneBrokenResidualChain` — the refusal for a block whose residual Adds
+// cannot be collapsed.
 
 use nsl_codegen::wggo_overrides::OverrideRejectReason;
 
@@ -14,6 +20,6 @@ fn prune_refusal_variants_exist() {
     let _ = OverrideRejectReason::PruneParallelResidualBranches;
     let _ = OverrideRejectReason::PruneAmbiguousPatternMatch;
     let _ = OverrideRejectReason::PruneEmptyClosure;
-    let _ = OverrideRejectReason::PruneWholeBlockUnsupported;
+    let _ = OverrideRejectReason::PruneBrokenResidualChain;
     let _ = OverrideRejectReason::PruneConflictingDecisions;
 }

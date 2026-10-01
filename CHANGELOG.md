@@ -8,6 +8,75 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **WGGO layer prune is reachable: whole-block chain-collapse, plus
+  `--wggo-prune-layers` and `--wggo-layer-prune-fraction` to request it.**
+  Until now no program could prune a layer, and nothing said so:
+  - the Level-1 DP offers `Prune` only below an importance floor, and
+    production planning never fills per-layer importance (every layer reads
+    1.0). The existing `--wggo-prune-fraction` drives per-HEAD scores only;
+  - every layer WGGO's graph names is a whole block (`blocks.N`), which
+    `wggo_prune` refused outright (`WholeBlockUnsupported`, spec §3.6);
+  - its parameter matcher looked for `blocks.0.`, while source AD names
+    every model field with its variable (`m.blocks.0.wq`), so even a
+    sub-block prune would have found an empty closure.
+
+  What changed:
+  - **v2 chain-collapse** (`wggo_prune.rs`). A `LayerRole::Block` layer's
+    residual Adds must form ONE chain `h0 -> Add(h0, out1)=h1 -> ... -> hk`.
+    Each intermediate `h_i` may be read only by the block's own ops and the
+    next Add (an outside reader is a skip connection), and each `out_i` only
+    by its own Add. The closure and every chain Add are deleted and `hk` is
+    aliased to `h0`; a violation refuses with the new three-part
+    `BrokenResidualChain` (`OverrideRejectReason::PruneBrokenResidualChain`).
+  - **Adjacent prunes** (`blocks.1,blocks.2`, or one block's `.attn` and
+    `.ffn`) share a stream value that both rewrites were validated against.
+    The commit now resolves it through the earlier collapse; the v1 commit
+    repointed the second layer's readers at the VarId the first one had
+    deleted. A post-commit assert refuses any surviving read of a pruned
+    value, and `ops_deleted` now counts what actually left the list.
+  - **Prefix matching:** a parameter belongs to layer `L` when its name
+    starts with `L.` directly or after the model variable. Only one
+    component is stripped: `m.encoder.blocks.0.w` does not match `blocks.0`.
+  - **`--wggo-prune-layers blocks.1,blocks.3`** (`nsl build` and `nsl run`)
+    forces `Prune` for the named layers through a new
+    `DpConfig::forced_prune` set. `importance.per_layer` stays empty, so a
+    build without the flags plans byte-identically. An unknown name, or a
+    layer with no residual identity (`other`, an embedding), is a hard
+    error listing the graph's layers.
+  - **`--wggo-layer-prune-fraction F`** prunes the `floor(F x n)`
+    least-important of the `n` block layers. Importance is the RMS of the
+    block's weights in `--wggo-weights`, normalized by the max; ties go to
+    the lower index, and all `n` are never pruned. It is refused without
+    `--wggo-weights`, when the file cannot be loaded, when a block has no
+    weights in it, and when `floor(F x n)` is 0. A `[wggo] layer-prune:`
+    line prints the ranking.
+  - Both flags require `--source-ad` and a WGGO mode other than off. The
+    train-block driver refuses them otherwise, on `@pipeline`, and on a
+    tape fallback; the refusals are registered in `feature_rules.rs`. A
+    plan that does not carry every forced prune (the §2.4 shape refusal, or
+    a planner that declined the block) fails the compile.
+    `--training-reference` strips them with the other WGGO transformations.
+  - **Removed:** the PR #102 `[prune] ... reason=ir_rewrite_not_implemented`
+    stub (`collect_prune_diagnostics`,
+    `whole_block_prune_not_implemented_reason`,
+    `OverrideRejectReason::{WholeBlockPruneNotImplemented,
+    PruneWholeBlockUnsupported}`). No plan can reach an unimplemented prune
+    any more. `wggo_overrides_rename_test.rs`, which pinned that string, is
+    deleted, and the whole-block refusal tests became chain-collapse tests.
+  - **The gate,** `crates/nsl-cli/tests/wggo_layer_prune_gate.rs` (7 tests,
+    CPU), trains a 4-block two-residual model with SGD; every block has the
+    same deterministic init. With `--wggo-prune-layers blocks.1`, the loss
+    trajectory and the surviving blocks' weights are BIT-IDENTICAL to the
+    3-block model's, and blocks.1's weights come out of training untouched.
+    The unpruned 4-block run differs (anti-vacuity). `blocks.1,blocks.2`
+    is held to the 2-block model the same way, and the fraction flag
+    prunes exactly blocks.2, the block at 1/50th the magnitude. Four
+    refusal tests cover a missing `--source-ad`, a missing `--wggo`, an
+    unknown layer, and a fraction without weights. Mutation-checked: each
+    of these fails it — repointing to `h1`, keeping the second Add,
+    collapsing only the last link, dropping the alias resolution, the
+    model-variable strip, or the DP's forced set.
+
 - **A silicon gate for the packed (Stage C) fused attention, forward and
   backward, against f64 oracles across KV tiles** (roadmap item 3,
   `crates/nsl-codegen/tests/sdpa_fused_packed_gpu_parity.rs`). The packed

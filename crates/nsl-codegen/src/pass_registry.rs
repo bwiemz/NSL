@@ -347,6 +347,7 @@ pub const PASSES: &[PassDescriptor] = &[
         source_files: &[
             "crates/nsl-codegen/src/wggo.rs",
             "crates/nsl-codegen/src/wggo_apply.rs",
+            "crates/nsl-codegen/src/wggo_forced_prune.rs",
             "crates/nsl-codegen/src/wggo_graph.rs",
             "crates/nsl-codegen/src/wggo_ilp.rs",
             "crates/nsl-codegen/src/wggo_overrides.rs",
@@ -362,6 +363,8 @@ pub const PASSES: &[PassDescriptor] = &[
             f("wggo-moment-precision", BR),
             f("wggo-prune-fraction", BR),
             f("wggo-weights", BR),
+            f("wggo-prune-layers", BR),
+            f("wggo-layer-prune-fraction", BR),
         ],
         stage: PipelineStage::OnWengert,
         // TWO phases, and the second is not theoretical: the prepass runs

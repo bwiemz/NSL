@@ -9,12 +9,32 @@
 //! therefore before source-AD's adjoint generation. The rewrite produces
 //! the final forward Wengert that both WRGA Prune and source-AD will consume.
 //!
+//! Two shapes of prune are executed (spec
+//! `docs/superpowers/specs/2026-04-22-wggo-prune-ir-rewrite-design.md`):
+//!
+//! - **v1, sub-block** (`LayerRole::{Attention, Ffn}` and the other non-Block
+//!   roles): exactly one residual `Add(h_before, block_output)` bounds the
+//!   layer's closure; the closure and the Add are deleted and `h_after` is
+//!   aliased to `h_before`.
+//! - **v2, whole block — chain-collapse** (`LayerRole::Block`, `blocks.N` /
+//!   `layers.N` / `h.N`): a pre-norm block threads the residual stream
+//!   through k ≥ 1 Adds, `h0 → Add(h0, out1) = h1 → … → Add(h(k-1), outk) =
+//!   hk`. The Adds must form ONE chain, every intermediate `h1..h(k-1)` must be
+//!   read only by the block's own ops and the next Add, and every `out_i` only
+//!   by its own Add; the closure and all k Adds are then deleted and `hk` is
+//!   aliased to `h0`.
+//!
+//! A parameter belongs to layer `L` when its Wengert var name starts with
+//! `"{L}."`, either directly or after the model variable (`m.blocks.0.wq`
+//! belongs to `blocks.0`) — the source-AD extractor names every model field
+//! by its full access path, while WGGO names layers bare.
+//!
 //! Design principle: this module refuses transformations when preconditions
 //! aren't met; it does not fall back to weaker transformations with different
 //! semantics. See memory/feedback_transformation_precondition_refusal.md for
 //! the generalized rule.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::wengert::{OpId, VarId, WengertList};
 use crate::weight_aware::WeightMap;
@@ -37,17 +57,30 @@ pub struct PruneRewriteResult {
 pub struct PruneRewrite {
     pub layer_name: String,
     pub layer_role: LayerRole,
+    /// The residual stream value entering the layer (`h0`). Consumers of
+    /// `h_after_var` now read it (or, when an adjacent earlier layer was
+    /// pruned in the same plan, whatever that layer's input resolved to).
     pub h_before_var: VarId,
+    /// The residual stream value leaving the layer (`hk`, the LAST chain
+    /// Add's result).
     pub h_after_var: VarId,
+    /// The last residual Add of the chain — the one producing `h_after_var`.
+    /// Equal to `residual_add_ops.last()`; kept as its own field because the
+    /// spec §6.1 success line reports exactly this op.
     pub residual_add_op: OpId,
+    /// Every residual Add deleted, in stream order: one for a sub-block,
+    /// k for a whole block.
+    pub residual_add_ops: Vec<OpId>,
     pub closure_ops: Vec<OpId>,
-    /// Ops removed from wengert by this rewrite (closure_ops.len() + 1 for
-    /// the residual Add). Tracked per-rewrite to enable spec §6.1 stderr
+    /// Ops this rewrite actually removed from wengert (measured as the
+    /// list's shrink: `closure_ops.len()` plus one per residual Add when the
+    /// commit is correct). Tracked per-rewrite to enable spec §6.1 stderr
     /// emission without ambiguity on multi-rewrite plans.
     pub ops_deleted: usize,
 }
 
-/// A refusal. One variant per precondition failure enumerated in spec §3.
+/// A refusal. One variant per precondition failure enumerated in spec §3,
+/// plus the v2 chain-collapse precondition (`BrokenResidualChain`).
 #[derive(Debug)]
 pub enum PruneRefusal {
     CrossLayerParam {
@@ -79,14 +112,43 @@ pub enum PruneRefusal {
         layer_role: LayerRole,
         prefix: String,
     },
-    WholeBlockUnsupported {
+    /// v2 whole-block prune: the block's residual Adds do not form one
+    /// collapsible stream chain (they do not chain, an intermediate stream
+    /// value escapes the block, or a block output feeds something other
+    /// than its own Add). `reason` names the first violation found.
+    BrokenResidualChain {
         layer_name: String,
+        layer_role: LayerRole,
+        adds: Vec<OpId>,
+        reason: String,
     },
     ConflictingPruneDecisions {
         decision_a: String,
         decision_b: String,
         reason: String,
     },
+}
+
+/// Whether the Wengert var `var_name` belongs to layer `layer_name`: it
+/// starts with `"{layer_name}."`, either as written or after its first
+/// dot-component (the model variable — the source-AD extractor names a
+/// model field `m.blocks.0.wq`, while WGGO names the layer `blocks.0`).
+///
+/// Only ONE leading component is stripped: a field nested deeper
+/// (`m.encoder.blocks.0.wq`) does not match `blocks.0`, so such a prune
+/// refuses with `EmptyClosure` rather than guessing which `blocks` was meant.
+pub fn var_in_layer(var_name: &str, layer_name: &str) -> bool {
+    let has_layer_prefix = |s: &str| {
+        s.len() > layer_name.len()
+            && s.starts_with(layer_name)
+            && s.as_bytes()[layer_name.len()] == b'.'
+    };
+    if has_layer_prefix(var_name) {
+        return true;
+    }
+    var_name
+        .split_once('.')
+        .is_some_and(|(_, rest)| has_layer_prefix(rest))
 }
 
 /// Entry point. Dry-run-then-commit: validates all decisions first; applies
@@ -116,14 +178,15 @@ pub fn run(
 
     // Phase 1b: cross-plan conflict detection (spec §3.7). Two plans
     // conflict if they claim overlapping OpIds (same ops would be deleted
-    // twice) OR target the same h_after_var (VarId aliasing undefined).
+    // twice — closure ops OR residual Adds) OR target the same h_after_var
+    // (VarId aliasing undefined).
     if refusals.is_empty() {
         'outer: for i in 0..plans.len() {
             for j in (i + 1)..plans.len() {
                 let a = &plans[i];
                 let b = &plans[j];
-                let a_ops: BTreeSet<OpId> = a.closure_op_ids.iter().copied().collect();
-                let b_ops: BTreeSet<OpId> = b.closure_op_ids.iter().copied().collect();
+                let a_ops = a.deleted_op_ids();
+                let b_ops = b.deleted_op_ids();
                 let overlap: Vec<OpId> = a_ops.intersection(&b_ops).copied().collect();
                 if !overlap.is_empty() {
                     refusals.push(PruneRefusal::ConflictingPruneDecisions {
@@ -163,22 +226,28 @@ pub fn run(
 
     // Phase 3: commit all plans. Captures pruned VarIds BEFORE the mutation
     // so we can return them to the caller for WRGA / source-AD handoff.
+    //
+    // `aliases` records every `h_after → h_before` collapse committed so
+    // far. Two ADJACENT layers in one plan share a stream value — the first
+    // layer's output is the second's input — and every plan was validated
+    // against the unmutated list, so the second plan's `h_before_var` names
+    // a value the first commit deleted. Resolving through the alias map
+    // repoints the second layer's consumers at the first layer's input
+    // instead of at a dangling VarId, in whichever order the plans commit.
+    let mut aliases: BTreeMap<VarId, VarId> = BTreeMap::new();
     let mut rewrites: Vec<PruneRewrite> = Vec::with_capacity(plans.len());
     let mut pruned_forward_var_ids: BTreeSet<VarId> = BTreeSet::new();
     let mut ops_deleted: usize = 0;
     for plan in plans {
         // Capture pruned VarIds BEFORE the mutation (apply_rewrite will
-        // delete ops and lose this info).
-        let mut removed_vars: Vec<VarId> = wengert.ops.iter()
-            .filter(|o| plan.closure_op_ids.contains(&o.id))
-            .map(|o| o.result)
-            .collect();
-        removed_vars.push(plan.h_after_var);
-        for v in removed_vars {
-            pruned_forward_var_ids.insert(v);
+        // delete ops and lose this info): every closure op's result and
+        // every residual Add's result (h1..hk).
+        let deleted = plan.deleted_op_ids();
+        for o in wengert.ops.iter().filter(|o| deleted.contains(&o.id)) {
+            pruned_forward_var_ids.insert(o.result);
         }
 
-        let rewrite = apply_rewrite(wengert, plan);
+        let rewrite = apply_rewrite(wengert, plan, &mut aliases);
         ops_deleted += rewrite.ops_deleted;
         rewrites.push(rewrite);
     }
@@ -188,6 +257,28 @@ pub fn run(
     // future rewrite that mints ids cannot silently break the uniqueness
     // the claim tables assume.
     wengert.assert_unique_op_ids("wggo_prune::run (post-commit)");
+    // The same belt for the rewrite's own contract: nothing that survived
+    // may read a value the commit deleted. Phase 1 proved every reader of a
+    // deleted value is itself deleted or repointed; a violation is a
+    // compiler bug, and lowering would otherwise skip the ghost read
+    // silently (a dead op over deleted inputs lowers to nothing).
+    let dangling: Vec<(OpId, VarId)> = wengert
+        .ops
+        .iter()
+        .flat_map(|o| {
+            o.inputs
+                .iter()
+                .filter(|v| pruned_forward_var_ids.contains(v))
+                .map(move |v| (o.id, *v))
+        })
+        .collect();
+    assert!(
+        dangling.is_empty() && !pruned_forward_var_ids.contains(&wengert.output),
+        "wggo_prune::run (post-commit): surviving (op, VarId) reads of pruned values {dangling:?}; \
+         output VarId {} pruned: {}",
+        wengert.output,
+        pruned_forward_var_ids.contains(&wengert.output)
+    );
 
     PruneRewriteResult {
         rewrites,
@@ -197,40 +288,71 @@ pub fn run(
     }
 }
 
-/// Phase 3 mutation. Deletes closure ops, repoints consumers of h_after to
-/// h_before, then deletes the residual Add. Also cleans up stale var_names
-/// / var_types entries and repoints wengert.output when h_after was it.
+/// Follow `aliases` from `v` to the value it now stands for.
+fn resolve_alias(aliases: &BTreeMap<VarId, VarId>, mut v: VarId) -> VarId {
+    // Each committed collapse maps a deleted value to one that is still
+    // live or itself aliased further upstream; the walk is bounded by the
+    // number of commits (a cycle would need a layer whose output feeds its
+    // own input, which a topologically ordered list cannot contain).
+    let mut hops = 0usize;
+    while let Some(&next) = aliases.get(&v) {
+        v = next;
+        hops += 1;
+        assert!(
+            hops <= aliases.len(),
+            "wggo_prune: residual alias cycle through VarId {v}"
+        );
+    }
+    v
+}
+
+/// Phase 3 mutation. Deletes the closure ops and every residual Add of the
+/// chain, and repoints consumers of the chain's final `h_after` (and
+/// `wengert.output`, if it was that value) to the layer's input stream
+/// value. Also cleans up stale var_names / var_types entries.
 ///
 /// Spec §1.1 / §2.2 three-category treatment:
 ///   - closure ops → DELETED
-///   - residual Add → REWRITTEN (consumers repointed) then DELETED
+///   - residual Add(s) → REWRITTEN (consumers of the last one repointed)
+///     then DELETED
 ///   - h_before → UNTOUCHED (belongs to the prior stream)
+///
+/// The intermediate stream values h1..h(k-1) of a whole-block chain need no
+/// repointing: Phase 1 proved their only readers are closure ops and the
+/// next chain Add, all of which are deleted here.
 fn apply_rewrite(
     wengert: &mut WengertList,
     plan: PruneRewritePlan,
+    aliases: &mut BTreeMap<VarId, VarId>,
 ) -> PruneRewrite {
-    use std::collections::BTreeSet;
+    let to_delete = plan.deleted_op_ids();
+    let target = resolve_alias(aliases, plan.h_before_var);
 
-    // Collect the set of OpIds to delete: every closure op + the residual Add.
-    let mut to_delete: BTreeSet<OpId> = plan.closure_op_ids.iter().copied().collect();
-    to_delete.insert(plan.residual_add_op_id);
-
-    // Repoint every surviving op's inputs from h_after_var → h_before_var.
+    // Repoint every surviving op's inputs from h_after_var → the layer's
+    // (alias-resolved) input.
     for op in wengert.ops.iter_mut() {
-        if to_delete.contains(&op.id) { continue; }
+        if to_delete.contains(&op.id) {
+            continue;
+        }
         for input in op.inputs.iter_mut() {
             if *input == plan.h_after_var {
-                *input = plan.h_before_var;
+                *input = target;
             }
         }
     }
     // Repoint wengert.output too, if it pointed at h_after.
     if wengert.output == plan.h_after_var {
-        wengert.output = plan.h_before_var;
+        wengert.output = target;
     }
+    aliases.insert(plan.h_after_var, target);
 
-    // Delete closure ops + residual Add from wengert.ops.
+    // Delete closure ops + residual Adds from wengert.ops. `ops_deleted` is
+    // what actually left the list (spec §6.1: "ops actually removed"), not
+    // the plan's count — the two can only differ through a bug, and the
+    // success line is where that would show.
+    let before = wengert.ops.len();
     wengert.ops.retain(|op| !to_delete.contains(&op.id));
+    let ops_deleted = before - wengert.ops.len();
 
     // Prune stale var_names / var_types for VarIds that no surviving op produces.
     // (h_before_var survives because it's produced by an upstream op outside the
@@ -239,13 +361,17 @@ fn apply_rewrite(
     wengert.var_names.retain(|v, _| surviving_var_ids.contains(v) || *v == wengert.output);
     wengert.var_types.retain(|v, _| surviving_var_ids.contains(v) || *v == wengert.output);
 
-    let ops_deleted = plan.closure_op_ids.len() + 1; // +1 for the residual Add
+    let residual_add_op = *plan
+        .residual_add_op_ids
+        .last()
+        .expect("Phase 1 only builds plans with at least one residual Add");
     PruneRewrite {
         layer_name: plan.layer_name,
         layer_role: plan.layer_role,
         h_before_var: plan.h_before_var,
         h_after_var: plan.h_after_var,
-        residual_add_op: plan.residual_add_op_id,
+        residual_add_op,
+        residual_add_ops: plan.residual_add_op_ids,
         closure_ops: plan.closure_op_ids,
         ops_deleted,
     }
@@ -268,7 +394,10 @@ pub(crate) struct PruneRewritePlan {
     pub(crate) layer_name: String,
     pub(crate) layer_role: LayerRole,
     pub(crate) closure_op_ids: Vec<OpId>,    // deleted in Phase 3 (sorted in wengert order)
-    pub(crate) residual_add_op_id: OpId,     // rewritten then deleted
+    /// The residual Adds, in stream order (exactly one for a sub-block;
+    /// k ≥ 1 for a whole block). All are deleted; consumers of the last
+    /// one's result (`h_after_var`) are repointed.
+    pub(crate) residual_add_op_ids: Vec<OpId>,
     pub(crate) h_before_var: VarId,
     pub(crate) h_after_var: VarId,
     // Populated by Phase 1's residual-add resolver. Phase 3 deletes by op-id
@@ -279,48 +408,64 @@ pub(crate) struct PruneRewritePlan {
     pub(crate) parameter_var_ids: std::collections::BTreeSet<VarId>,
 }
 
-/// Intermediate refusal emitted by `find_residual_add` before context is
-/// bound by the caller. `plan_rewrite` wraps into a `PruneRefusal`.
+impl PruneRewritePlan {
+    /// Every op this plan deletes: the closure plus the residual Adds.
+    fn deleted_op_ids(&self) -> BTreeSet<OpId> {
+        self.closure_op_ids
+            .iter()
+            .chain(self.residual_add_op_ids.iter())
+            .copied()
+            .collect()
+    }
+}
+
+/// One residual-Add candidate: an op outside the closure computing
+/// `Add(h_before, block_output)` with exactly one tainted operand.
+#[derive(Debug, Clone, Copy)]
+struct ResidualCandidate {
+    add_op: OpId,
+    /// The untainted (stream) operand.
+    h_before: VarId,
+    /// The tainted operand — the (sub-)block's contribution.
+    block_output: VarId,
+    /// The Add's result.
+    h_after: VarId,
+}
+
+/// Intermediate refusal emitted by the residual resolvers before context
+/// is bound by the caller. `plan_rewrite` wraps into a `PruneRefusal`.
 #[derive(Debug)]
 enum PartialRefusal {
     NoResidualAdd,
     ParallelResidualBranches { add_ops: Vec<OpId> },
     AmbiguousPatternMatch { h_before: VarId, candidate_adds: Vec<OpId> },
+    BrokenChain { adds: Vec<OpId>, reason: String },
 }
 
-// --- Phase 1 validator (positive case only — refusals land in Tasks 5-11) ---
+// --- Phase 1 validator ---
 
 /// Phase 1 validator for a single `CoarseDecision::Prune` decision. Does
 /// NOT mutate `wengert`. Called once per Prune decision from `run()`.
 ///
-/// Spec §2 (closure), §1.3 (pattern-match), §3 (refusals).
+/// Spec §2 (closure), §1.3 (pattern-match), §3 (refusals); the
+/// `LayerRole::Block` branch is the v2 chain-collapse (module docs).
 pub(crate) fn plan_rewrite(
     wengert: &WengertList,
     layer: &crate::wggo_apply::AppliedLayer,
     _weight_map: &WeightMap,
 ) -> PlanResult {
     use crate::wggo_graph::infer_role;
-    use std::collections::BTreeSet;
 
     let layer_role = infer_role(&layer.layer_name);
+    let whole_block = matches!(layer_role, LayerRole::Block);
 
-    // Spec §3.6: whole-block prune (LayerRole::Block) is not supported in v1.
-    // Refuse immediately — don't compute a closure or pattern-match, since
-    // the refusal semantic is role-based and the plan structure is
-    // independent of the Wengert state.
-    if matches!(layer_role, LayerRole::Block) {
-        return PlanResult::Refused(PruneRefusal::WholeBlockUnsupported {
-            layer_name: layer.layer_name.clone(),
-        });
-    }
-
-    // (b) Find parameter VarIds matching `{layer_name}.` prefix.
-    //     Spec §2.3 precondition #1 (non-empty parameters) lands in Task 8.
+    // (b) Find parameter VarIds belonging to the layer (`{layer_name}.`
+    //     prefix, optionally behind the model variable — see `var_in_layer`).
     let prefix = format!("{}.", layer.layer_name);
     let parameter_var_ids: BTreeSet<VarId> = wengert
         .var_names
         .iter()
-        .filter_map(|(v, name)| name.starts_with(&prefix).then_some(*v))
+        .filter_map(|(v, name)| var_in_layer(name, &layer.layer_name).then_some(*v))
         .collect();
 
     // Spec §2.3 precondition #1 / §3.5: if no VarIds match the layer prefix,
@@ -337,32 +482,38 @@ pub(crate) fn plan_rewrite(
     // (c) Compute the data-flow closure.
     let closure_op_ids = compute_closure(wengert, &parameter_var_ids);
 
-    // (d) Find the residual Add. Positive case only — Tasks 5-7 extend with
-    //     NoResidualAdd, ParallelResidualBranches, AmbiguousPatternMatch.
-    //     Task 9 (§3.1 CrossLayerParam) fires BEFORE this step; it doesn't
-    //     exist yet — lands there.
-    let (residual_add_op_id, h_before_var, h_after_var) =
-        match find_residual_add(wengert, &closure_op_ids, &parameter_var_ids) {
-            Ok(triple) => triple,
-            Err(partial) => {
-                return PlanResult::Refused(refusal_with_context(
-                    partial,
-                    layer,
-                    layer_role,
-                    closure_op_ids.len(),
-                ));
-            }
-        };
+    // (d) Resolve the residual boundary: one Add for a sub-block, a chain
+    //     of Adds for a whole block.
+    let resolved = if whole_block {
+        find_residual_chain(wengert, &closure_op_ids, &parameter_var_ids)
+    } else {
+        find_residual_add(wengert, &closure_op_ids, &parameter_var_ids).map(|c| vec![c])
+    };
+    let chain = match resolved {
+        Ok(chain) => chain,
+        Err(partial) => {
+            return PlanResult::Refused(refusal_with_context(
+                partial,
+                layer,
+                layer_role,
+                closure_op_ids.len(),
+            ));
+        }
+    };
+    let residual_add_op_ids: Vec<OpId> = chain.iter().map(|c| c.add_op).collect();
+    let chain_adds: BTreeSet<OpId> = residual_add_op_ids.iter().copied().collect();
+    let h_before_var = chain.first().expect("resolver returns a non-empty chain").h_before;
+    let h_after_var = chain.last().expect("resolver returns a non-empty chain").h_after;
 
     // Spec §2.3 precondition #2 / §3.1: detect leaks out of the closure.
     //
     // A "leak" is any closure op whose result escapes the closure without
-    // going through the residual Add. There are two forms:
+    // going through a residual Add of the chain. There are two forms:
     //
-    //   (a) A non-closure op (other than the residual Add) reads a
-    //       closure op's result.
-    //   (b) wengert.output is a closure op's result AND is not the
-    //       residual Add's h_after_var.
+    //   (a) A non-closure op (other than a chain Add) reads a closure op's
+    //       result.
+    //   (b) wengert.output is a closure op's result (the chain's final
+    //       `h_after_var` is not a closure op result, so it never matches).
     //
     // Prefer to cite layer-N parameter VarIds when the leaked value is one
     // (matches the spec's "cross-layer parameter sharing" framing); fall
@@ -378,7 +529,7 @@ pub(crate) fn plan_rewrite(
 
             for other_op in &wengert.ops {
                 if closure_set.contains(&other_op.id) { continue; }
-                if other_op.id == residual_add_op_id { continue; }
+                if chain_adds.contains(&other_op.id) { continue; }
                 if !other_op.inputs.contains(&result_var) { continue; }
 
                 // Leak detected. Choose citation VarId: prefer the param itself
@@ -417,8 +568,7 @@ pub(crate) fn plan_rewrite(
             }
         }
 
-        // (b) wengert.output is a closure op's result (and not the residual
-        //     Add's result — which is `h_after_var`).
+        // (b) wengert.output is a closure op's result.
         if wengert.output != h_after_var {
             for closure_op_id in &closure_op_ids {
                 let closure_op = wengert.ops.iter().find(|o| o.id == *closure_op_id)
@@ -456,7 +606,7 @@ pub(crate) fn plan_rewrite(
         layer_name: layer.layer_name.clone(),
         layer_role,
         closure_op_ids,
-        residual_add_op_id,
+        residual_add_op_ids,
         h_before_var,
         h_after_var,
         parameter_var_ids,
@@ -472,7 +622,6 @@ pub(crate) fn compute_closure(
     param_var_ids: &std::collections::BTreeSet<VarId>,
 ) -> Vec<OpId> {
     use crate::wengert::PrimalOp;
-    use std::collections::BTreeSet;
 
     // Tainted VarIds: layer-N params OR outputs of closure ops.
     let mut tainted_vars: BTreeSet<VarId> = param_var_ids.clone();
@@ -507,23 +656,15 @@ pub(crate) fn compute_closure(
     closure
 }
 
-/// Pattern-match residual Add candidates in the non-closure region.
-///
-/// Spec §1.3 / §3.2 / §3.3 / §3.4. Returns:
-/// - `Ok((add_op, h_before, h_after))` when exactly one candidate matches
-///   the residual pattern Add(h_before, block_output).
-/// - `Err(PartialRefusal::NoResidualAdd)` when zero candidates match.
-/// - `Err(PartialRefusal::ParallelResidualBranches)` when ≥2 candidates
-///   have DISTINCT h_before values (parallel residual paths).
-/// - `Err(PartialRefusal::AmbiguousPatternMatch)` when ≥2 candidates share
-///   the SAME h_before (architecturally ambiguous boundary; Task 7 covers).
-fn find_residual_add(
+/// Collect every residual-Add candidate, in wengert (= topological) order:
+/// ops outside the closure computing `Add(a, b)` with exactly one of `a`,
+/// `b` tainted (a layer parameter or a closure op's result).
+fn residual_candidates(
     wengert: &WengertList,
     closure: &[OpId],
-    param_var_ids: &std::collections::BTreeSet<VarId>,
-) -> Result<(OpId, VarId, VarId), PartialRefusal> {
+    param_var_ids: &BTreeSet<VarId>,
+) -> Vec<ResidualCandidate> {
     use crate::wengert::PrimalOp;
-    use std::collections::BTreeSet;
 
     let closure_set: BTreeSet<OpId> = closure.iter().copied().collect();
 
@@ -538,9 +679,7 @@ fn find_residual_add(
         t
     };
 
-    // Collect ALL candidate residual Adds (outside closure; inputs.len() == 2;
-    // exactly one input tainted).
-    let mut candidates: Vec<(OpId, VarId, VarId)> = Vec::new(); // (add_op_id, h_before_var, h_after_var)
+    let mut candidates: Vec<ResidualCandidate> = Vec::new();
     for op in &wengert.ops {
         if closure_set.contains(&op.id) { continue; }
         if !matches!(op.op, PrimalOp::Add) { continue; }
@@ -552,30 +691,160 @@ fn find_residual_add(
         let b_tainted = tainted.contains(&b);
 
         if a_tainted != b_tainted {
-            let h_before = if a_tainted { b } else { a };
-            candidates.push((op.id, h_before, op.result));
+            let (h_before, block_output) = if a_tainted { (b, a) } else { (a, b) };
+            candidates.push(ResidualCandidate {
+                add_op: op.id,
+                h_before,
+                block_output,
+                h_after: op.result,
+            });
         }
     }
+    candidates
+}
 
+/// v1 (sub-block) pattern-match: exactly one residual Add candidate.
+///
+/// Spec §1.3 / §3.2 / §3.3 / §3.4. Returns:
+/// - `Ok(candidate)` when exactly one candidate matches the residual
+///   pattern Add(h_before, block_output).
+/// - `Err(PartialRefusal::NoResidualAdd)` when zero candidates match.
+/// - `Err(PartialRefusal::ParallelResidualBranches)` when ≥2 candidates
+///   have DISTINCT h_before values (parallel residual paths).
+/// - `Err(PartialRefusal::AmbiguousPatternMatch)` when ≥2 candidates share
+///   the SAME h_before (architecturally ambiguous boundary).
+fn find_residual_add(
+    wengert: &WengertList,
+    closure: &[OpId],
+    param_var_ids: &BTreeSet<VarId>,
+) -> Result<ResidualCandidate, PartialRefusal> {
+    let candidates = residual_candidates(wengert, closure, param_var_ids);
     match candidates.len() {
         0 => Err(PartialRefusal::NoResidualAdd),
         1 => Ok(candidates[0]),
-        _ => {
-            // Multiple candidates: distinguish shared-h_before (ambiguous) from
-            // distinct-h_before (parallel branches).
-            let first_h_before = candidates[0].1;
-            if candidates.iter().all(|(_, h, _)| *h == first_h_before) {
-                Err(PartialRefusal::AmbiguousPatternMatch {
-                    h_before: first_h_before,
-                    candidate_adds: candidates.iter().map(|(op, _, _)| *op).collect(),
-                })
-            } else {
-                Err(PartialRefusal::ParallelResidualBranches {
-                    add_ops: candidates.iter().map(|(op, _, _)| *op).collect(),
-                })
-            }
+        _ => Err(multi_candidate_refusal(&candidates)),
+    }
+}
+
+/// ≥2 candidates that a sub-block cannot accept: all sharing one `h_before`
+/// is an ambiguous boundary, otherwise they are parallel branches.
+fn multi_candidate_refusal(candidates: &[ResidualCandidate]) -> PartialRefusal {
+    let first_h_before = candidates[0].h_before;
+    if candidates.iter().all(|c| c.h_before == first_h_before) {
+        PartialRefusal::AmbiguousPatternMatch {
+            h_before: first_h_before,
+            candidate_adds: candidates.iter().map(|c| c.add_op).collect(),
+        }
+    } else {
+        PartialRefusal::ParallelResidualBranches {
+            add_ops: candidates.iter().map(|c| c.add_op).collect(),
         }
     }
+}
+
+/// v2 (whole-block) pattern-match: the residual Add candidates must form ONE
+/// stream chain `h0 → h1 → … → hk`. Returns the chain in stream order.
+///
+/// Preconditions, each refusing with `BrokenChain` naming the violation:
+/// 1. **One chain** — ordered by position, candidate i's stream operand is
+///    candidate i-1's result. (The first candidate's stream operand, h0, is
+///    untainted by construction, so it is produced outside the closure.)
+/// 2. **No escaping intermediate** — every h1..h(k-1) is read only by closure
+///    ops and by the NEXT chain Add, and is not `wengert.output`. An outside
+///    reader is a skip connection (or a parameter-free op on the stream that
+///    the parameter-anchored closure does not own): deleting the Add that
+///    produces it would leave that reader dangling, and repointing it to h0
+///    would silently change what it computes.
+/// 3. **Single-consumer block outputs** — every out_i is read only by its
+///    own Add (spec §1.3's `consumers(block_output) == {this_Add}`).
+///
+/// Zero candidates is `NoResidualAdd`; ≥2 candidates that all share one
+/// stream operand is `AmbiguousPatternMatch` (as for a sub-block).
+fn find_residual_chain(
+    wengert: &WengertList,
+    closure: &[OpId],
+    param_var_ids: &BTreeSet<VarId>,
+) -> Result<Vec<ResidualCandidate>, PartialRefusal> {
+    let chain = residual_candidates(wengert, closure, param_var_ids);
+    if chain.is_empty() {
+        return Err(PartialRefusal::NoResidualAdd);
+    }
+    if chain.len() >= 2 && chain.iter().all(|c| c.h_before == chain[0].h_before) {
+        return Err(multi_candidate_refusal(&chain));
+    }
+    let adds: Vec<OpId> = chain.iter().map(|c| c.add_op).collect();
+    let broken = |reason: String| PartialRefusal::BrokenChain { adds: adds.clone(), reason };
+    let op_kind = |id: OpId| -> String {
+        wengert
+            .ops
+            .iter()
+            .find(|o| o.id == id)
+            .map_or_else(|| "?".to_string(), |o| format!("{:?}", o.op))
+    };
+
+    // (1) One chain.
+    for pair in chain.windows(2) {
+        let (prev, next) = (pair[0], pair[1]);
+        if next.h_before != prev.h_after {
+            return Err(broken(format!(
+                "Add op {} reads stream value VarId {}, not VarId {} (the result of the \
+                 previous residual Add, op {}); the Adds are not one residual stream",
+                next.add_op, next.h_before, prev.h_after, prev.add_op
+            )));
+        }
+    }
+
+    let closure_set: BTreeSet<OpId> = closure.iter().copied().collect();
+
+    // (2) Intermediate stream values stay inside the block.
+    for (i, link) in chain[..chain.len() - 1].iter().enumerate() {
+        let h = link.h_after;
+        let next_add = chain[i + 1].add_op;
+        if wengert.output == h {
+            return Err(broken(format!(
+                "intermediate stream value VarId {h} (the result of Add op {}) is the \
+                 program output",
+                link.add_op
+            )));
+        }
+        if let Some(reader) = wengert.ops.iter().find(|o| {
+            o.inputs.contains(&h) && !closure_set.contains(&o.id) && o.id != next_add
+        }) {
+            return Err(broken(format!(
+                "intermediate stream value VarId {h} (the result of Add op {}) is also read \
+                 by op {} ({}), outside the block -- a skip connection, or a parameter-free \
+                 op on the residual stream that the block's closure does not own",
+                link.add_op,
+                reader.id,
+                op_kind(reader.id)
+            )));
+        }
+    }
+
+    // (3) Each block output feeds only its own Add.
+    for link in &chain {
+        if wengert.output == link.block_output {
+            return Err(broken(format!(
+                "block output VarId {} (added by Add op {}) is the program output",
+                link.block_output, link.add_op
+            )));
+        }
+        if let Some(reader) = wengert
+            .ops
+            .iter()
+            .find(|o| o.inputs.contains(&link.block_output) && o.id != link.add_op)
+        {
+            return Err(broken(format!(
+                "block output VarId {} (added by Add op {}) is also read by op {} ({})",
+                link.block_output,
+                link.add_op,
+                reader.id,
+                op_kind(reader.id)
+            )));
+        }
+    }
+
+    Ok(chain)
 }
 
 /// Wrap a partial refusal in the caller's context.
@@ -602,6 +871,12 @@ fn refusal_with_context(
             h_before_var: h_before,
             candidate_adds,
         },
+        PartialRefusal::BrokenChain { adds, reason } => PruneRefusal::BrokenResidualChain {
+            layer_name: layer.layer_name.clone(),
+            layer_role,
+            adds,
+            reason,
+        },
     }
 }
 
@@ -619,14 +894,15 @@ pub fn diagnostic_code(r: &PruneRefusal) -> crate::wggo_overrides::OverrideRejec
         PruneRefusal::ParallelResidualBranches { .. } => OverrideRejectReason::PruneParallelResidualBranches,
         PruneRefusal::AmbiguousPatternMatch { .. } => OverrideRejectReason::PruneAmbiguousPatternMatch,
         PruneRefusal::EmptyClosure { .. } => OverrideRejectReason::PruneEmptyClosure,
-        PruneRefusal::WholeBlockUnsupported { .. } => OverrideRejectReason::PruneWholeBlockUnsupported,
+        PruneRefusal::BrokenResidualChain { .. } => OverrideRejectReason::PruneBrokenResidualChain,
         PruneRefusal::ConflictingPruneDecisions { .. } => OverrideRejectReason::PruneConflictingDecisions,
     }
 }
 
 /// Spec §6.1 success-path stderr line. Format:
 ///   [prune] layer=N name=... role=... applied=true closure_size=K ops_deleted=K residual_add_op=ID
-/// Separator convention: key=value throughout (no colons).
+/// Separator convention: key=value throughout (no colons). For a whole-block
+/// chain-collapse `residual_add_op` is the LAST Add of the chain.
 pub fn format_success_stderr(rewrite: &PruneRewrite, layer_index: u32, ops_deleted: usize) -> String {
     format!(
         "[prune] layer={} name={} role={:?} applied=true closure_size={} ops_deleted={} residual_add_op={}",
@@ -692,22 +968,22 @@ pub fn format_refusal(r: &PruneRefusal) -> String {
 "prune: no parameters match the requested layer prefix.
   requested:  prune {layer_name}  (role={layer_role:?})
   expected:   at least one parameter VarId with var_name starting
-              with `{prefix}`
+              with `{prefix}` (directly, or after the model variable as
+              in `m.{prefix}`)
   found:      zero matching parameters in the WeightMap. Check layer name /
               index; the requested layer does not exist in the compiled model.
 "
         ),
-        PruneRefusal::WholeBlockUnsupported { layer_name } => format!(
-"prune: whole-block pruning (LayerRole::Block) is not supported in v1.
-  requested:  prune {layer_name}  (role=Block)
-  supported:  prune {layer_name}.attn  (role=Attention)
-              prune {layer_name}.ffn   (role=Ffn)
-  workaround: emit two sub-block prune decisions for this layer; their combined
-              effect is semantically equivalent to whole-block prune in standard
-              pre-norm transformer architectures (NOT equivalent for post-norm,
-              parallel, or scaled-residual architectures).
-  planned:    whole-block prune tracked for v2 (chain-collapse transformation).
-"
+        PruneRefusal::BrokenResidualChain { layer_name, layer_role, adds, reason } => format!(
+"prune: whole-block residual chain cannot be collapsed (v2 chain-collapse refused).
+  requested:  prune {layer_name}  (role={layer_role:?})
+  expected:   the block's residual Adds form ONE stream chain
+              h0 -> Add(h0, out1)=h1 -> ... -> Add(h(k-1), outk)=hk, each
+              intermediate h1..h(k-1) read only by the block's own ops and the
+              next Add, each block output out_i read only by its own Add
+  found:      {k} residual Add(s) at ops {adds:?}: {reason}
+",
+            k = adds.len(),
         ),
         PruneRefusal::ConflictingPruneDecisions { decision_a, decision_b, reason } => format!(
 "prune: two prune decisions in the same plan conflict.
@@ -719,6 +995,7 @@ pub fn format_refusal(r: &PruneRefusal) -> String {
         ),
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -816,7 +1093,7 @@ mod tests {
         match result {
             PlanResult::Ok(plan) => {
                 assert_eq!(plan.closure_op_ids, vec![0, 1], "closure should include op0 (param producer) and op1 (compute), NOT op2 (residual Add)");
-                assert_eq!(plan.residual_add_op_id, 2);
+                assert_eq!(plan.residual_add_op_ids, vec![2]);
                 assert_eq!(plan.h_before_var, v_hb);
                 assert_eq!(plan.h_after_var, v_ha);
             }
@@ -995,35 +1272,6 @@ mod tests {
             }
             PlanResult::Ok(plan) => panic!("expected CrossLayerParam, got Ok({plan:?})"),
             PlanResult::Refused(other) => panic!("expected CrossLayerParam, got: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn whole_block_refusal_from_planner() {
-        // Layer with role=Block — the planner shouldn't emit this in v1's
-        // supported flow, but if something does, plan_rewrite refuses
-        // immediately per spec §3.6.
-        //
-        // `infer_role("blocks.7")` returns LayerRole::Block (no .attn/.ffn
-        // suffix; matches the `blocks.N` pattern).
-
-        let v_hb: VarId = 100;
-        let v_p:  VarId = 200;
-        let v_y:  VarId = 300;
-        let ops = vec![
-            op_unary(0, v_p, v_hb, PrimalOp::Relu),
-            op_add  (1, v_y, v_hb, v_p),
-        ];
-        let wengert = mk_wengert(ops, v_y, &[(v_hb, "h_before"), (v_p, "blocks.7.wq")]);
-        let layer = mk_prune_layer(7, "blocks.7");   // Block role — no .attn/.ffn suffix
-        let weight_map = WeightMap::default();
-
-        match plan_rewrite(&wengert, &layer, &weight_map) {
-            PlanResult::Refused(PruneRefusal::WholeBlockUnsupported { layer_name }) => {
-                assert_eq!(layer_name, "blocks.7");
-            }
-            PlanResult::Ok(plan) => panic!("expected WholeBlockUnsupported, got Ok({plan:?})"),
-            PlanResult::Refused(other) => panic!("expected WholeBlockUnsupported, got: {other:?}"),
         }
     }
 
@@ -1249,5 +1497,352 @@ mod tests {
             PlanResult::Ok(plan) => panic!("expected NoResidualAdd refusal, got Ok({plan:?})"),
             PlanResult::Refused(other) => panic!("expected NoResidualAdd refusal, got other variant: {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // v2 whole-block chain-collapse (LayerRole::Block) + model-variable
+    // prefix matching. The fixtures mirror what the source-AD extractor
+    // actually emits for
+    //
+    //     model Blk:  fn forward(self, x): let h = x + (x @ self.wa)
+    //                                      return h + (h @ self.wb)
+    //     model Net:  blocks: [Blk; N];  for block in self.blocks: h = block.forward(h)
+    //
+    // (NSL_DEBUG_WENGERT dump, 2026-09-30): `Param("m.blocks.N.wa")` leaves
+    // named with the model variable, `Matmul(h, w)`, `Add(h, mm)`.
+    // -----------------------------------------------------------------------
+
+    /// Shorthand: a zero-input leaf op (`Input` / `Param`).
+    fn op_leaf(id: OpId, result: VarId, kind: PrimalOp) -> WengertOp {
+        WengertOp {
+            id, result, op: kind, inputs: vec![],
+            saved_for_backward: false, checkpointed: false,
+        }
+    }
+
+    /// Shorthand: Matmul op.
+    fn op_matmul(id: OpId, result: VarId, a: VarId, b: VarId) -> WengertOp {
+        WengertOp {
+            id, result, op: PrimalOp::Matmul, inputs: vec![a, b],
+            saved_for_backward: false, checkpointed: false,
+        }
+    }
+
+    /// Ids of one two-residual block in [`mk_blocks_wengert`].
+    #[derive(Debug, Clone, Copy)]
+    struct BlkIds {
+        h0: VarId,
+        wa_op: OpId,
+        mm_a_op: OpId,
+        add1_op: OpId,
+        h1: VarId,
+        wb_op: OpId,
+        mm_b_op: OpId,
+        add2_op: OpId,
+        h2: VarId,
+    }
+
+    /// `n_blocks` two-residual blocks in a chain over Input `x`, followed by
+    /// a downstream `Relu(h_final)` consumer when `tail_consumer` (otherwise
+    /// `wengert.output` is the last block's h2 directly). Op id == VarId for
+    /// readability.
+    fn mk_blocks_wengert(n_blocks: u32, tail_consumer: bool) -> (WengertList, Vec<BlkIds>, Option<OpId>) {
+        let mut ops = vec![op_leaf(0, 0, PrimalOp::Input("x".into()))];
+        let mut names: Vec<(VarId, String)> = vec![(0, "x".into())];
+        let mut blocks = Vec::new();
+        let mut h: VarId = 0;
+        let mut next: u32 = 1;
+        let mut alloc = || { let v = next; next += 1; v };
+        for b in 0..n_blocks {
+            let (wa, mm_a, h1, wb, mm_b, h2) = (alloc(), alloc(), alloc(), alloc(), alloc(), alloc());
+            ops.push(op_leaf(wa, wa, PrimalOp::Param(format!("m.blocks.{b}.wa"))));
+            ops.push(op_matmul(mm_a, mm_a, h, wa));
+            ops.push(op_add(h1, h1, h, mm_a));
+            ops.push(op_leaf(wb, wb, PrimalOp::Param(format!("m.blocks.{b}.wb"))));
+            ops.push(op_matmul(mm_b, mm_b, h1, wb));
+            ops.push(op_add(h2, h2, h1, mm_b));
+            names.push((wa, format!("m.blocks.{b}.wa")));
+            names.push((wb, format!("m.blocks.{b}.wb")));
+            names.push((h1, "h".into()));
+            names.push((h2, "x".into()));
+            blocks.push(BlkIds {
+                h0: h, wa_op: wa, mm_a_op: mm_a, add1_op: h1, h1,
+                wb_op: wb, mm_b_op: mm_b, add2_op: h2, h2,
+            });
+            h = h2;
+        }
+        let (output, tail) = if tail_consumer {
+            let t = alloc();
+            ops.push(op_unary(t, t, h, PrimalOp::Relu));
+            (t, Some(t))
+        } else {
+            (h, None)
+        };
+        let named: Vec<(VarId, &str)> = names.iter().map(|(v, s)| (*v, s.as_str())).collect();
+        (mk_wengert(ops, output, &named), blocks, tail)
+    }
+
+    /// Every input of every surviving op is produced by a surviving op, and
+    /// so is `wengert.output` — the rewrite left nothing dangling.
+    fn assert_no_dangling(w: &WengertList) {
+        let produced: BTreeSet<VarId> = w.ops.iter().map(|o| o.result).collect();
+        for op in &w.ops {
+            for v in &op.inputs {
+                assert!(produced.contains(v), "op {} reads VarId {v}, which no surviving op produces", op.id);
+            }
+        }
+        assert!(produced.contains(&w.output), "wengert.output VarId {} is not produced", w.output);
+    }
+
+    fn plan_of(layers: Vec<AppliedLayer>) -> AppliedPlan {
+        AppliedPlan { layers, total_us: 0.0, peak_memory_bytes: 0 }
+    }
+
+    #[test]
+    fn var_in_layer_matches_bare_and_model_variable_prefixed_names() {
+        assert!(var_in_layer("blocks.1.wa", "blocks.1"));
+        assert!(var_in_layer("m.blocks.1.wa", "blocks.1"));
+        assert!(var_in_layer("m.blocks.1.attn.wq", "blocks.1.attn"));
+        // Dot boundary: blocks.10 is not blocks.1.
+        assert!(!var_in_layer("m.blocks.10.wa", "blocks.1"));
+        assert!(!var_in_layer("blocks.10.wa", "blocks.1"));
+        // The layer itself is not one of its params.
+        assert!(!var_in_layer("blocks.1", "blocks.1"));
+        assert!(!var_in_layer("m.blocks.1", "blocks.1"));
+        // Only ONE leading component is stripped: a deeper nesting refuses
+        // (EmptyClosure) rather than guessing.
+        assert!(!var_in_layer("m.encoder.blocks.1.wa", "blocks.1"));
+        assert!(!var_in_layer("x", "blocks.1"));
+    }
+
+    #[test]
+    fn whole_block_two_add_chain_collapses_middle_block() {
+        let (mut w, blocks, tail) = mk_blocks_wengert(3, true);
+        let b1 = blocks[1];
+        let b2 = blocks[2];
+        let before = w.ops.len();
+
+        let result = run(&mut w, &plan_of(vec![mk_prune_layer(2, "blocks.1")]), &WeightMap::default());
+
+        assert!(result.refusals.is_empty(), "expected no refusals; got {:?}", result.refusals);
+        assert_eq!(result.rewrites.len(), 1);
+        let rw = &result.rewrites[0];
+        assert_eq!(rw.layer_role, LayerRole::Block);
+        assert_eq!(rw.h_before_var, b1.h0);
+        assert_eq!(rw.h_after_var, b1.h2);
+        assert_eq!(rw.residual_add_ops, vec![b1.add1_op, b1.add2_op], "both residual Adds, stream order");
+        assert_eq!(rw.residual_add_op, b1.add2_op, "the success line reports the LAST Add");
+        assert_eq!(rw.closure_ops, vec![b1.wa_op, b1.mm_a_op, b1.wb_op, b1.mm_b_op]);
+        assert_eq!(rw.ops_deleted, 6, "4 closure ops + 2 residual Adds");
+        assert_eq!(result.ops_deleted, 6);
+        assert_eq!(w.ops.len(), before - 6);
+
+        // Every op of blocks.1 is gone.
+        let surviving: BTreeSet<OpId> = w.ops.iter().map(|o| o.id).collect();
+        for id in [b1.wa_op, b1.mm_a_op, b1.add1_op, b1.wb_op, b1.mm_b_op, b1.add2_op] {
+            assert!(!surviving.contains(&id), "op {id} of blocks.1 survived");
+        }
+        // blocks.2's stream consumers (its first Matmul and first Add) now
+        // read blocks.1's input h0 — the block is an identity.
+        let mm = w.ops.iter().find(|o| o.id == b2.mm_a_op).unwrap();
+        assert_eq!(mm.inputs[0], b1.h0, "blocks.2 matmul must read h0 of blocks.1");
+        let add = w.ops.iter().find(|o| o.id == b2.add1_op).unwrap();
+        assert_eq!(add.inputs[0], b1.h0, "blocks.2 residual Add must read h0 of blocks.1");
+        assert_eq!(Some(w.output), tail, "output (a downstream op) is untouched");
+        assert_no_dangling(&w);
+
+        // pruned_forward_var_ids: the closure results and BOTH stream values.
+        for v in [b1.wa_op, b1.mm_a_op, b1.h1, b1.wb_op, b1.mm_b_op, b1.h2] {
+            assert!(result.pruned_forward_var_ids.contains(&v), "VarId {v} missing from pruned set");
+        }
+        // The pruned params' names are gone; the survivors' are not.
+        assert!(!w.var_names.values().any(|n| n.starts_with("m.blocks.1.")));
+        assert!(w.var_names.values().any(|n| n == "m.blocks.2.wa"));
+    }
+
+    #[test]
+    fn whole_block_last_block_repoints_wengert_output() {
+        // wengert.output IS the last block's h2: it must become that block's h0.
+        let (mut w, blocks, _) = mk_blocks_wengert(2, false);
+        let b1 = blocks[1];
+        assert_eq!(w.output, b1.h2);
+
+        let result = run(&mut w, &plan_of(vec![mk_prune_layer(2, "blocks.1")]), &WeightMap::default());
+
+        assert!(result.refusals.is_empty(), "expected no refusals; got {:?}", result.refusals);
+        assert_eq!(w.output, b1.h0, "output repointed from the pruned block's h2 to its h0");
+        assert_eq!(w.ops.len(), 1 + 6, "Input + blocks.0 survive");
+        assert_no_dangling(&w);
+    }
+
+    #[test]
+    fn whole_block_single_add_block_is_a_chain_of_one() {
+        // Blk.forward(x) = x + (x @ wa): one residual Add.
+        let ops = vec![
+            op_leaf(0, 0, PrimalOp::Input("x".into())),
+            op_leaf(1, 1, PrimalOp::Param("m.blocks.0.wa".into())),
+            op_matmul(2, 2, 0, 1),
+            op_add(3, 3, 0, 2),
+            op_unary(4, 4, 3, PrimalOp::Relu),
+        ];
+        let mut w = mk_wengert(ops, 4, &[(0, "x"), (1, "m.blocks.0.wa")]);
+
+        let result = run(&mut w, &plan_of(vec![mk_prune_layer(1, "blocks.0")]), &WeightMap::default());
+
+        assert!(result.refusals.is_empty(), "expected no refusals; got {:?}", result.refusals);
+        let rw = &result.rewrites[0];
+        assert_eq!(rw.residual_add_ops, vec![3]);
+        assert_eq!(rw.closure_ops, vec![1, 2]);
+        assert_eq!(rw.ops_deleted, 3);
+        assert_eq!(w.ops.iter().map(|o| o.id).collect::<Vec<_>>(), vec![0, 4]);
+        assert_eq!(w.ops[1].inputs, vec![0], "consumer of h1 now reads h0");
+        assert_no_dangling(&w);
+    }
+
+    #[test]
+    fn whole_block_intermediate_with_outside_reader_is_refused() {
+        // A skip connection: an op after blocks.0 reads blocks.0's
+        // intermediate stream value h1. Deleting Add#1 would leave it
+        // dangling; repointing it to h0 would silently change its value.
+        let (mut w, blocks, _) = mk_blocks_wengert(2, false);
+        let b0 = blocks[0];
+        let skip: VarId = 100;
+        w.ops.push(op_add(skip, skip, blocks[1].h2, b0.h1));
+        w.output = skip;
+        let snapshot = w.ops.len();
+
+        let result = run(&mut w, &plan_of(vec![mk_prune_layer(1, "blocks.0")]), &WeightMap::default());
+
+        assert!(result.rewrites.is_empty());
+        match &result.refusals[..] {
+            [PruneRefusal::BrokenResidualChain { layer_name, adds, reason, .. }] => {
+                assert_eq!(layer_name, "blocks.0");
+                assert_eq!(adds, &vec![b0.add1_op, b0.add2_op]);
+                assert!(reason.contains(&format!("VarId {}", b0.h1)), "reason must name h1: {reason}");
+                assert!(reason.contains(&format!("op {skip}")), "reason must name the outside reader: {reason}");
+                assert!(reason.contains("skip connection"), "{reason}");
+            }
+            other => panic!("expected one BrokenResidualChain, got {other:?}"),
+        }
+        assert_eq!(w.ops.len(), snapshot, "wengert untouched on refusal");
+    }
+
+    #[test]
+    fn whole_block_adds_that_do_not_chain_are_refused() {
+        // Two residual Adds on DIFFERENT streams (x and z): neither one's
+        // stream operand is the other's result, so there is no single
+        // stream to collapse.
+        let ops = vec![
+            op_leaf(0, 0, PrimalOp::Input("x".into())),
+            op_leaf(1, 1, PrimalOp::Input("z".into())),
+            op_leaf(2, 2, PrimalOp::Param("m.blocks.0.wa".into())),
+            op_matmul(3, 3, 0, 2),
+            op_add(4, 4, 0, 3),             // x + x@wa
+            op_leaf(5, 5, PrimalOp::Param("m.blocks.0.wb".into())),
+            op_matmul(6, 6, 1, 5),
+            op_add(7, 7, 1, 6),             // z + z@wb — a different stream
+            op_add(8, 8, 4, 7),
+        ];
+        let mut w = mk_wengert(ops, 8, &[(0, "x"), (1, "z"), (2, "m.blocks.0.wa"), (5, "m.blocks.0.wb")]);
+
+        let result = run(&mut w, &plan_of(vec![mk_prune_layer(1, "blocks.0")]), &WeightMap::default());
+
+        match &result.refusals[..] {
+            [r @ PruneRefusal::BrokenResidualChain { adds, reason, .. }] => {
+                assert_eq!(adds, &vec![4, 7]);
+                assert!(reason.contains("not one residual stream"), "{reason}");
+                assert_eq!(
+                    diagnostic_code(r),
+                    crate::wggo_overrides::OverrideRejectReason::PruneBrokenResidualChain
+                );
+                let text = format_refusal(r);
+                assert!(text.contains("requested:  prune blocks.0  (role=Block)"), "{text}");
+                assert!(text.contains("expected:"), "{text}");
+                assert!(text.contains("found:      2 residual Add(s) at ops [4, 7]"), "{text}");
+            }
+            other => panic!("expected one BrokenResidualChain, got {other:?}"),
+        }
+        assert_eq!(w.ops.len(), 9, "wengert untouched on refusal");
+    }
+
+    #[test]
+    fn whole_block_output_with_a_second_reader_is_refused() {
+        // blocks.0's first block output (x @ wa) also feeds an op outside the
+        // block: the residual pattern requires it to feed only its Add.
+        let (mut w, blocks, _) = mk_blocks_wengert(1, false);
+        let b0 = blocks[0];
+        let extra: VarId = 100;
+        w.ops.push(op_add(extra, extra, b0.h2, b0.mm_a_op));
+        w.output = extra;
+
+        let result = run(&mut w, &plan_of(vec![mk_prune_layer(1, "blocks.0")]), &WeightMap::default());
+
+        match &result.refusals[..] {
+            [PruneRefusal::BrokenResidualChain { reason, .. }] => {
+                assert!(reason.contains(&format!("block output VarId {}", b0.mm_a_op)), "{reason}");
+                assert!(reason.contains(&format!("also read by op {extra}")), "{reason}");
+            }
+            other => panic!("expected one BrokenResidualChain, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn whole_block_unknown_layer_is_empty_closure() {
+        let (mut w, _, _) = mk_blocks_wengert(2, true);
+        let result = run(&mut w, &plan_of(vec![mk_prune_layer(9, "blocks.9")]), &WeightMap::default());
+        match &result.refusals[..] {
+            [PruneRefusal::EmptyClosure { layer_name, layer_role, prefix }] => {
+                assert_eq!(layer_name, "blocks.9");
+                assert_eq!(*layer_role, LayerRole::Block);
+                assert_eq!(prefix, "blocks.9.");
+            }
+            other => panic!("expected one EmptyClosure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn adjacent_whole_blocks_collapse_through_the_alias_map() {
+        // blocks.1's output IS blocks.2's input. Both plans were validated
+        // against the unmutated list, so blocks.2's h_before names a value
+        // blocks.1's commit deletes. The consumer after blocks.2 must end up
+        // reading blocks.1's h0 — not the deleted stream value.
+        for order in [["blocks.1", "blocks.2"], ["blocks.2", "blocks.1"]] {
+            let (mut w, blocks, tail) = mk_blocks_wengert(4, true);
+            let (b1, b3) = (blocks[1], blocks[3]);
+            let plan = plan_of(vec![mk_prune_layer(2, order[0]), mk_prune_layer(3, order[1])]);
+
+            let result = run(&mut w, &plan, &WeightMap::default());
+
+            assert!(result.refusals.is_empty(), "{order:?}: refusals {:?}", result.refusals);
+            assert_eq!(result.rewrites.len(), 2);
+            assert_eq!(result.ops_deleted, 12);
+            let mm = w.ops.iter().find(|o| o.id == b3.mm_a_op).unwrap();
+            assert_eq!(mm.inputs[0], b1.h0, "{order:?}: blocks.3 must read blocks.1's input");
+            assert_eq!(Some(w.output), tail);
+            assert_no_dangling(&w);
+        }
+    }
+
+    #[test]
+    fn whole_block_and_its_sub_block_conflict() {
+        // `blocks.0` and `blocks.0.attn` claim the same ops — refuse both
+        // rather than delete twice.
+        let ops = vec![
+            op_leaf(0, 0, PrimalOp::Input("x".into())),
+            op_leaf(1, 1, PrimalOp::Param("m.blocks.0.attn.wq".into())),
+            op_matmul(2, 2, 0, 1),
+            op_add(3, 3, 0, 2),
+        ];
+        let mut w = mk_wengert(ops, 3, &[(0, "x"), (1, "m.blocks.0.attn.wq")]);
+        let plan = plan_of(vec![mk_prune_layer(1, "blocks.0"), mk_prune_layer(2, "blocks.0.attn")]);
+
+        let result = run(&mut w, &plan, &WeightMap::default());
+
+        assert!(
+            result.refusals.iter().any(|r| matches!(r, PruneRefusal::ConflictingPruneDecisions { .. })),
+            "expected ConflictingPruneDecisions; got {:?}",
+            result.refusals
+        );
+        assert_eq!(w.ops.len(), 4, "wengert untouched on refusal");
     }
 }

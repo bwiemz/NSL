@@ -237,6 +237,15 @@ pub struct DpConfig {
     /// would under-report its sharding to them. Update those consumers to honour
     /// all three factors before enabling this in production.
     pub zero_stage_search: bool,
+    /// Layers (by [`Layer::index`]) the USER asked to prune
+    /// (`--wggo-prune-layers` / `--wggo-layer-prune-fraction`, resolved by
+    /// `wggo_forced_prune`). For these the DP offers `Prune` and nothing
+    /// else, independent of `importance` — the request is a decision, not a
+    /// hint. Empty (the default) leaves every plan byte-identical to a build
+    /// without the flags; `importance.per_layer` is deliberately NOT used to
+    /// carry the request, because filling it would also re-enable the
+    /// importance-driven `Thin` candidates for every other layer.
+    pub forced_prune: std::collections::BTreeSet<u32>,
 }
 
 impl Default for DpConfig {
@@ -247,12 +256,16 @@ impl Default for DpConfig {
             prune_floor: 0.05,
             thin_floor: 0.25,
             zero_stage_search: false,
+            forced_prune: std::collections::BTreeSet::new(),
         }
     }
 }
 
 /// Candidate transitions the DP considers for one layer.
 fn candidate_decisions(layer: &Layer, cfg: &DpConfig) -> Vec<CoarseDecision> {
+    if cfg.forced_prune.contains(&layer.index) {
+        return vec![CoarseDecision::Prune];
+    }
     let mut out = vec![CoarseDecision::KeepFull];
     if layer.role == LayerRole::Block || layer.role == LayerRole::Attention || layer.role == LayerRole::Ffn {
         let score = cfg
@@ -596,9 +609,11 @@ pub fn solve(
 }
 
 /// Budget-agnostic passthrough plan: every layer `KeepFull` at the cluster's
-/// default shard factor, single stage.  Used by Off mode (which bypasses
-/// optimization) and as the driver's interim fallback when [`solve`] refuses a
-/// budget.
+/// default shard factor, single stage — except the layers in
+/// [`DpConfig::forced_prune`], which stay `Prune` (a user's prune request is
+/// not an optimization the fallback may drop). Used by Off mode (which
+/// bypasses optimization) and as the driver's interim fallback when [`solve`]
+/// refuses a budget.
 pub fn passthrough_plan(
     graph: &OptGraph,
     luts: &[LayerCostLut],
@@ -612,8 +627,13 @@ pub fn passthrough_plan(
     for (i, layer) in graph.layers.iter().enumerate() {
         let lut = luts.get(i).or_else(|| luts.first());
         let lut_best = lut.and_then(|l| l.argmin_feasible().map(|(_, _, _, _, e)| e));
+        let decision = if cfg.forced_prune.contains(&layer.index) {
+            CoarseDecision::Prune
+        } else {
+            CoarseDecision::KeepFull
+        };
         let (compute_us, _bytes, param_bytes, activation_bytes) =
-            layer_cost(CoarseDecision::KeepFull, lut_best);
+            layer_cost(decision, lut_best);
         let (comm_us, optim_us) =
             comm_optim_us(param_bytes, shard, shard, cfg.cluster.interconnect_gbs, gpu);
         let resident = resident_bytes(param_bytes, activation_bytes, shard);
@@ -623,7 +643,7 @@ pub fn passthrough_plan(
         plans.push(LayerPlan {
             layer_index: layer.index,
             name: layer.name.clone(),
-            decision: CoarseDecision::KeepFull,
+            decision,
             pipeline_stage: 0,
             shard_params: shard,
             shard_grads: shard,
@@ -696,6 +716,45 @@ mod tests {
         assert_eq!(plan.layers.len(), 8);
         assert_eq!(plan.kept_layers(), 8);
         assert_eq!(plan.pruned_layers(), 0);
+    }
+
+    #[test]
+    fn forced_prune_prunes_exactly_the_forced_layers() {
+        // `--wggo-prune-layers` / `--wggo-layer-prune-fraction`: the forced
+        // layers become Prune with NO importance scores at all (every layer
+        // reads the 1.0 default, so nothing would be prunable organically),
+        // and every other layer stays exactly as the unforced plan had it.
+        let g = toy_graph(6);
+        let lut = build_lut(&shape(), gpu(), &LutAxes::default());
+        let baseline = solve(&g, std::slice::from_ref(&lut), &DpConfig::default(), gpu()).expect("feasible");
+        let cfg = DpConfig {
+            forced_prune: [1u32, 4].into_iter().collect(),
+            ..Default::default()
+        };
+        let plan = solve(&g, std::slice::from_ref(&lut), &cfg, gpu()).expect("feasible");
+        let pruned: Vec<u32> = plan
+            .layers
+            .iter()
+            .filter(|l| l.decision == CoarseDecision::Prune)
+            .map(|l| l.layer_index)
+            .collect();
+        assert_eq!(pruned, vec![1, 4]);
+        for (forced, base) in plan.layers.iter().zip(&baseline.layers) {
+            if !cfg.forced_prune.contains(&forced.layer_index) {
+                assert_eq!(forced.decision, base.decision, "layer {} changed", forced.layer_index);
+            }
+        }
+
+        // The budget-refusal fallback keeps the request too: a user's prune
+        // is not an optimization the passthrough may silently drop.
+        let pass = passthrough_plan(&g, &[lut], &cfg, gpu());
+        let pass_pruned: Vec<u32> = pass
+            .layers
+            .iter()
+            .filter(|l| l.decision == CoarseDecision::Prune)
+            .map(|l| l.layer_index)
+            .collect();
+        assert_eq!(pass_pruned, vec![1, 4]);
     }
 
     #[test]

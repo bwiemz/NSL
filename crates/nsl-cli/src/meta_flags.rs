@@ -333,6 +333,15 @@ pub(crate) fn apply_training_reference(opts: &mut nsl_codegen::CompileOptions) {
         opts.wggo.memory_budget_bytes = None;
         disabled.push("--wggo-memory-budget");
     }
+    // A WGGO layer prune is a WGGO plan decision; with WGGO forced off above
+    // codegen would (rightly) refuse the request as unplannable. Announce
+    // the strip like every other override: the reference arm trains the
+    // UNPRUNED model.
+    if opts.wggo.layer_prune_requested() {
+        opts.wggo.prune_layers.clear();
+        opts.wggo.layer_prune_fraction = None;
+        disabled.push("WGGO layer prune (--wggo-prune-layers / --wggo-layer-prune-fraction; the unpruned model trains)");
+    }
     // CPDT precision-adaptive path (independent moment-precision lowering).
     if opts.cpdt.mode != nsl_codegen::cpdt::CpdtMode::Off {
         opts.cpdt.mode = nsl_codegen::cpdt::CpdtMode::Off;
