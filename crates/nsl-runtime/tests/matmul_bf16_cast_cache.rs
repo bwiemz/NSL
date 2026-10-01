@@ -23,7 +23,7 @@
 use nsl_runtime::fase_step::nsl_fase_fused_adamw_step;
 use nsl_runtime::tensor::{
     nsl_tensor_copy_data, nsl_tensor_free, nsl_tensor_matmul, nsl_tensor_to_device,
-    test_build_tensor_2d_f32, test_read_tensor_f64,
+    test_build_tensor_2d_f32, test_read_tensor_f32,
 };
 use nsl_runtime::{test_bf16_cast_cache_reset, test_bf16_cast_cache_stats};
 
@@ -55,10 +55,9 @@ fn gpu_2d(rows: usize, cols: usize, data: &[f32]) -> i64 {
 
 fn matmul_read(a: i64, b: i64) -> Vec<f64> {
     let c = nsl_tensor_matmul(a, b, 0);
-    // GPU->CPU migration converts f32 -> f64 by the params ABI; the reader
-    // requires a CPU f64 tensor.
+    // The download keeps the device's f32 (C5 step 2a); widen for the f64 checks.
     let c_cpu = nsl_tensor_to_device(c, 0);
-    let out = test_read_tensor_f64(c_cpu);
+    let out: Vec<f64> = test_read_tensor_f32(c_cpu).into_iter().map(f64::from).collect();
     if c_cpu != c {
         nsl_tensor_free(c_cpu);
     }
