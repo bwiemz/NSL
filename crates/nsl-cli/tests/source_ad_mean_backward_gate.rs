@@ -170,7 +170,7 @@ fn a_mean_inside_a_forward_trains_like_its_gradient_under_tape_ad() {
 /// broadcast INTERMEDIATE is not. Fixing it touches every Add/Sub adjoint, so
 /// it is its own change; this test is its reproduction.
 #[test]
-#[ignore = "known bug: the source-AD Add/Sub adjoint does not reduce a broadcast operand (see the doc comment)"]
+#[ignore = "blocked: the source-AD Add/Sub adjoint does not reduce a broadcast operand (see the doc comment)"]
 fn a_mean_inside_a_forward_trains_like_its_gradient_under_source_ad() {
     check_mean_inside_a_forward(true);
 }
