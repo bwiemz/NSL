@@ -161,16 +161,11 @@ fn a_mean_inside_a_forward_trains_like_its_gradient_under_tape_ad() {
     check_mean_inside_a_forward(false);
 }
 
-/// Source AD gets this program wrong for a second, separate reason: the Add
-/// (and Sub) adjoint is `Identity`, with no reduction to the operand's shape,
-/// so the [3, 4] gradient of `x @ w + mean(x @ v)` reaches the scalar
-/// `mean(x @ v)` unreduced, and v trains like w (its rows vary by column; the
-/// true gradient is constant along each row). Parameter gradients are reduced
-/// to their parameter's shape at the end, which is why a bias add works; a
-/// broadcast INTERMEDIATE is not. Fixing it touches every Add/Sub adjoint, so
-/// it is its own change; this test is its reproduction.
+/// Under source AD this program also needs the Add adjoint to reduce the
+/// [3, 4] gradient of `x @ w + mean(x @ v)` to the one-element mean, and the
+/// mean's backward to expand it back for the matmul; see
+/// `source_ad_broadcast_backward_gate.rs`.
 #[test]
-#[ignore = "blocked: the source-AD Add/Sub adjoint does not reduce a broadcast operand (see the doc comment)"]
 fn a_mean_inside_a_forward_trains_like_its_gradient_under_source_ad() {
     check_mean_inside_a_forward(true);
 }

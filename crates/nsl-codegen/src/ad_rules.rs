@@ -95,13 +95,20 @@ pub enum AdjointExpr {
     Scale(VarId, f64),
     Negate(VarId),
     Broadcast(VarId),
-    /// MeanBackward(grad, input, result): the adjoint of a mean, `grad`
-    /// scaled by `numel(result) / numel(input)` (1/N for a full mean,
-    /// 1/size(dim) for a mean over one dim), then broadcast. The ratio is
-    /// taken at run time, from the mean's own operand and result, because the
-    /// Wengert list does not carry shapes (and the incoming gradient's shape
-    /// is not always the result's).
+    /// MeanBackward(grad, input, result): the adjoint of a full mean, `grad`
+    /// scaled by `numel(result) / numel(input)` (1/N), then expanded to the
+    /// input's shape. The ratio is taken at run time, from the mean's own
+    /// operand and result, because the Wengert list does not carry shapes.
     MeanBackward(VarId, VarId, VarId),
+    /// ExpandLike(grad, input): the adjoint of a full sum, the one-element
+    /// `grad` expanded to (and materialized at) the input's shape. Every
+    /// element of the input contributed once, so every element receives the
+    /// gradient; leaving it one element relied on each consumer to broadcast
+    /// it, which a matmul's backward does not.
+    ExpandLike(VarId, VarId),
+    /// MeanDimBackward(grad, input, result): a mean over ONE dim, scaled like
+    /// `MeanBackward` but passed through un-expanded (see the Sum rule).
+    MeanDimBackward(VarId, VarId, VarId),
     ScaleBroadcast(VarId, f64),
     Transpose(VarId, usize, usize),
     ReshapeLike(VarId, VarId),
@@ -113,7 +120,11 @@ pub enum AdjointExpr {
     TanhBackward(VarId, VarId),
     LogBackward(VarId, VarId),
     SqrtBackward(VarId, VarId),
-    DivNumeratorBackward(VarId, VarId),
+    /// DivNumeratorBackward(grad, b, a): `grad / b`, reduced to the
+    /// numerator `a`'s shape.
+    DivNumeratorBackward(VarId, VarId, VarId),
+    /// DivDenominatorBackward(grad, a, b): `-grad * a / b²`, reduced to the
+    /// denominator `b`'s shape (`x / sum(x)` broadcasts a scalar `b`).
     DivDenominatorBackward(VarId, VarId, VarId),
     // New elementwise backward rules
     /// GELU backward: grad * (0.5*(1+erf(x/√2)) + x*exp(-x²/2)/√(2π))
@@ -278,7 +289,11 @@ pub enum AdjointExpr {
     // Shape backward (broadcast reduction)
     /// Expand backward: sum-reduce gradient over expanded dims to match original shape.
     /// args: (grad, original_input) — original_input provides the target shape.
+    /// Also the Add/Sub operand adjoint: either operand may have been
+    /// broadcast, and its gradient must be summed back to its own shape.
     ReduceToShape(VarId, VarId),
+    /// Sub's subtrahend adjoint: `-reduce_to_shape(grad, target)`.
+    NegReduceToShape(VarId, VarId),
 
     // Control flow backward rules
     /// SelectTrue: adj_true = cond ? adj_out : 0.  inputs: (adj_out, cond_var)
@@ -297,24 +312,28 @@ pub struct InputAdjoint {
 /// Apply the reverse-mode AD rule for a primal operation.
 pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
     match &op.op {
+        // Either operand may have been broadcast (a bias `x @ w + b`, a
+        // scalar `x + mean(y)`), so each gradient is summed back to its
+        // operand's shape. The reduce returns its input when no broadcast
+        // happened, so the common case costs a shape compare.
         PrimalOp::Add => vec![
             InputAdjoint {
                 input_var: op.inputs[0],
-                expr: AdjointExpr::Identity(output_bar),
+                expr: AdjointExpr::ReduceToShape(output_bar, op.inputs[0]),
             },
             InputAdjoint {
                 input_var: op.inputs[1],
-                expr: AdjointExpr::Identity(output_bar),
+                expr: AdjointExpr::ReduceToShape(output_bar, op.inputs[1]),
             },
         ],
         PrimalOp::Sub => vec![
             InputAdjoint {
                 input_var: op.inputs[0],
-                expr: AdjointExpr::Identity(output_bar),
+                expr: AdjointExpr::ReduceToShape(output_bar, op.inputs[0]),
             },
             InputAdjoint {
                 input_var: op.inputs[1],
-                expr: AdjointExpr::Negate(output_bar),
+                expr: AdjointExpr::NegReduceToShape(output_bar, op.inputs[1]),
             },
         ],
         PrimalOp::Mul => vec![
@@ -338,7 +357,7 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
         PrimalOp::Div => vec![
             InputAdjoint {
                 input_var: op.inputs[0],
-                expr: AdjointExpr::DivNumeratorBackward(output_bar, op.inputs[1]),
+                expr: AdjointExpr::DivNumeratorBackward(output_bar, op.inputs[1], op.inputs[0]),
             },
             InputAdjoint {
                 input_var: op.inputs[1],
@@ -387,7 +406,15 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             input_var: op.inputs[0],
             expr: AdjointExpr::Transpose(output_bar, *dim0, *dim1),
         }],
-        PrimalOp::Sum { .. } => vec![InputAdjoint {
+        // The extractor emits every primal sum and mean as a FULL reduction
+        // (`dim: None`); a `dim: Some(_)` reduction only ever appears inside
+        // adjoint code, which these rules never see, and keeps its old
+        // pass-through rule rather than guess an unsqueeze axis.
+        PrimalOp::Sum { dim: None } => vec![InputAdjoint {
+            input_var: op.inputs[0],
+            expr: AdjointExpr::ExpandLike(output_bar, op.inputs[0]),
+        }],
+        PrimalOp::Sum { dim: Some(_) } => vec![InputAdjoint {
             input_var: op.inputs[0],
             expr: AdjointExpr::Broadcast(output_bar),
         }],
@@ -401,9 +428,13 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
         // got a gradient N times too large. AdamW is invariant to a uniform
         // scale, which hid it for a mean-reduced loss; SGD, clipping and any
         // mean inside a forward (where it scales only some paths) were wrong.
-        PrimalOp::Mean { .. } => vec![InputAdjoint {
+        PrimalOp::Mean { dim: None } => vec![InputAdjoint {
             input_var: op.inputs[0],
             expr: AdjointExpr::MeanBackward(output_bar, op.inputs[0], op.result),
+        }],
+        PrimalOp::Mean { dim: Some(_) } => vec![InputAdjoint {
+            input_var: op.inputs[0],
+            expr: AdjointExpr::MeanDimBackward(output_bar, op.inputs[0], op.result),
         }],
         PrimalOp::Reshape { .. } => vec![InputAdjoint {
             input_var: op.inputs[0],
@@ -943,12 +974,10 @@ pub enum SavedRequirement {
 pub fn saved_for_backward(op: &PrimalOp) -> SavedRequirement {
     match op {
         // Nothing saved — gradient is independent of forward values
-        PrimalOp::Add
-        | PrimalOp::Sub
-        | PrimalOp::Neg
+        PrimalOp::Neg
         | PrimalOp::Transpose { .. }
         | PrimalOp::Reshape { .. }
-        | PrimalOp::Sum { .. }
+        | PrimalOp::Sum { dim: Some(_) }
         | PrimalOp::Broadcast
         | PrimalOp::Concat { .. }
         | PrimalOp::Split { .. }
@@ -958,8 +987,14 @@ pub fn saved_for_backward(op: &PrimalOp) -> SavedRequirement {
         | PrimalOp::AvgPool2d { .. }
         | PrimalOp::Passthrough(_) => SavedRequirement::Nothing,
 
-        // Save inputs — gradient depends on forward input values
-        PrimalOp::Mul
+        // Save inputs — gradient depends on forward input values. Add/Sub
+        // read only their operands' SHAPES, to undo a broadcast, and a full
+        // Sum its operand's, to expand its gradient back; the shape is read
+        // off the live tensor.
+        PrimalOp::Add
+        | PrimalOp::Sub
+        | PrimalOp::Sum { dim: None }
+        | PrimalOp::Mul
         | PrimalOp::Div
         | PrimalOp::Matmul
         | PrimalOp::Relu
@@ -1029,16 +1064,16 @@ mod tests {
         let op = make_op(2, PrimalOp::Add, vec![0, 1]);
         let adj = apply_ad_rule(&op, 100);
         assert_eq!(adj.len(), 2);
-        assert!(matches!(adj[0].expr, AdjointExpr::Identity(100)));
-        assert!(matches!(adj[1].expr, AdjointExpr::Identity(100)));
+        assert!(matches!(adj[0].expr, AdjointExpr::ReduceToShape(100, 0)));
+        assert!(matches!(adj[1].expr, AdjointExpr::ReduceToShape(100, 1)));
     }
 
     #[test]
     fn test_sub_rule() {
         let op = make_op(2, PrimalOp::Sub, vec![0, 1]);
         let adj = apply_ad_rule(&op, 100);
-        assert!(matches!(adj[0].expr, AdjointExpr::Identity(100)));
-        assert!(matches!(adj[1].expr, AdjointExpr::Negate(100)));
+        assert!(matches!(adj[0].expr, AdjointExpr::ReduceToShape(100, 0)));
+        assert!(matches!(adj[1].expr, AdjointExpr::NegReduceToShape(100, 1)));
     }
 
     #[test]
@@ -1111,7 +1146,7 @@ mod tests {
         let adj = apply_ad_rule(&op, 100);
         assert!(matches!(
             adj[0].expr,
-            AdjointExpr::DivNumeratorBackward(100, 1)
+            AdjointExpr::DivNumeratorBackward(100, 1, 0)
         ));
         assert!(matches!(
             adj[1].expr,
@@ -1126,14 +1161,26 @@ mod tests {
         assert!(matches!(adj[0].expr, AdjointExpr::Broadcast(100)));
     }
 
+    /// A full sum's gradient is expanded to its operand's shape; a bare
+    /// Broadcast left it one element, which a matmul backward rejects.
+    #[test]
+    fn test_full_sum_expands_to_its_operand() {
+        let op = make_op(1, PrimalOp::Sum { dim: None }, vec![0]);
+        let adj = apply_ad_rule(&op, 100);
+        assert!(matches!(adj[0].expr, AdjointExpr::ExpandLike(100, 0)));
+    }
+
     #[test]
     fn test_mean_scales_then_broadcasts() {
         // Mean backward: grad scaled by numel(out)/numel(in) at run time, then
         // broadcast. A bare Broadcast is the N-times-too-large gradient this
         // rule used to produce.
-        let op = make_op(1, PrimalOp::Mean { dim: Some(0) }, vec![0]);
+        let op = make_op(1, PrimalOp::Mean { dim: None }, vec![0]);
         let adj = apply_ad_rule(&op, 100);
         assert!(matches!(adj[0].expr, AdjointExpr::MeanBackward(100, 0, 1)));
+        let op = make_op(1, PrimalOp::Mean { dim: Some(0) }, vec![0]);
+        let adj = apply_ad_rule(&op, 100);
+        assert!(matches!(adj[0].expr, AdjointExpr::MeanDimBackward(100, 0, 1)));
     }
 
     #[test]
@@ -1146,7 +1193,7 @@ mod tests {
     #[test]
     fn test_saved_nothing() {
         assert_eq!(
-            saved_for_backward(&PrimalOp::Add),
+            saved_for_backward(&PrimalOp::Neg),
             SavedRequirement::Nothing
         );
         assert_eq!(
@@ -1158,6 +1205,9 @@ mod tests {
     #[test]
     fn test_saved_inputs() {
         assert_eq!(saved_for_backward(&PrimalOp::Mul), SavedRequirement::Inputs);
+        // Add/Sub read their operands' shapes to undo a broadcast.
+        assert_eq!(saved_for_backward(&PrimalOp::Add), SavedRequirement::Inputs);
+        assert_eq!(saved_for_backward(&PrimalOp::Sub), SavedRequirement::Inputs);
         assert_eq!(
             saved_for_backward(&PrimalOp::Matmul),
             SavedRequirement::Inputs

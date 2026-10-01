@@ -1,0 +1,32 @@
+# Source-AD Div backward with a broadcast denominator (see
+# source_ad_broadcast_backward_gate.rs). `s` is [4] and divides every row of
+# `x @ w`, so its gradient is summed over the rows. `mean(x @ v) + 2.0` adds a
+# float literal, which has no shape to reduce to.
+from nsl.nn.losses import mse_loss
+
+model DivBcast:
+    w: Tensor = (arange(16).reshape([4, 4])) * 0.05 - full([4, 4], 0.3)
+    s: Tensor = (arange(4)) * 0.5 + full([4], 2.0)
+    v: Tensor = ones([4, 4]) * 0.1
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return (x @ self.w) / self.s + (mean(x @ self.v) + 2.0)
+
+let m = DivBcast()
+let x = (arange(12).reshape([3, 4])) * 0.1 + full([3, 4], 0.1)
+let y = (arange(12).reshape([3, 4])) * 0.2 - full([3, 4], 1.0)
+
+train(model = m, epochs = 4):
+    optimizer: SGD(lr = 0.1)
+    step(batch):
+        let loss = mse_loss(m.forward(x), y)
+
+print("W_BEGIN")
+print(m.w)
+print("W_END")
+print("S_BEGIN")
+print(m.s)
+print("S_END")
+print("V_BEGIN")
+print(m.v)
+print("V_END")

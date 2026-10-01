@@ -1,6 +1,5 @@
 ---
 source: crates/nsl-codegen/tests/train_clif_snapshots.rs
-assertion_line: 255
 expression: render(&first)
 ---
 --- IR: model ctor 'Mlp' ---
@@ -149,40 +148,40 @@ function <main>(i32, i64) -> i32 <callconv> {
     sig54 = (i64) -> i64 <callconv>
     sig55 = (i64, f64, i8) -> i64 <callconv>
     sig56 = (i64) -> i64 <callconv>
-    sig57 = (i64, i64, i8) -> i64 <callconv>
-    sig58 = (i64, i64) -> i64 <callconv>
+    sig57 = (i64, i64) -> i64 <callconv>
+    sig58 = (i64) -> i64 <callconv>
     sig59 = (i64, i64, i8) -> i64 <callconv>
     sig60 = (i64, i64) -> i64 <callconv>
     sig61 = (i64, i64, i8) -> i64 <callconv>
-    sig62 = (i64, i64, i64) -> i64 <callconv>
+    sig62 = (i64, i64) -> i64 <callconv>
     sig63 = (i64, i64, i8) -> i64 <callconv>
-    sig64 = (i64, i64, i64) -> i64 <callconv>
-    sig65 = (i64, i64, i8) -> i64 <callconv>
-    sig66 = (i64, i64) -> i64 <callconv>
-    sig67 = (i64, i64) -> i64 <callconv>
-    sig68 = (i64, i64) -> i64 <callconv>
-    sig69 = (i64, i64, f64) <callconv>
-    sig70 = (i64) <callconv>
-    sig71 = (i64) <callconv>
-    sig72 = (i64) <callconv>
-    sig73 = (i64, i64) -> i64 <callconv>
-    sig74 = (i64, i64) -> i64 <callconv>
-    sig75 = (i64, i64) -> i64 <callconv>
-    sig76 = (i64, i64, f64) <callconv>
-    sig77 = (i64) <callconv>
-    sig78 = (i64, i64, i64) -> i64 <callconv>
-    sig79 = (i64, i64, i8) -> i64 <callconv>
+    sig64 = (i64, i64) -> i64 <callconv>
+    sig65 = (i64, i64, i64) -> i64 <callconv>
+    sig66 = (i64, i64, i8) -> i64 <callconv>
+    sig67 = (i64, i64, i64) -> i64 <callconv>
+    sig68 = (i64, i64, i8) -> i64 <callconv>
+    sig69 = (i64, i64) -> i64 <callconv>
+    sig70 = (i64, i64) -> i64 <callconv>
+    sig71 = (i64, i64) -> i64 <callconv>
+    sig72 = (i64, i64, f64) <callconv>
+    sig73 = (i64) <callconv>
+    sig74 = (i64) <callconv>
+    sig75 = (i64) <callconv>
+    sig76 = (i64, i64) -> i64 <callconv>
+    sig77 = (i64, i64) -> i64 <callconv>
+    sig78 = (i64, i64) -> i64 <callconv>
+    sig79 = (i64, i64) -> i64 <callconv>
     sig80 = (i64, i64) -> i64 <callconv>
-    sig81 = (i64, i64) -> i64 <callconv>
-    sig82 = (i64, i64) -> i64 <callconv>
-    sig83 = (i64, i64, f64) <callconv>
+    sig81 = (i64, i64, f64) <callconv>
+    sig82 = (i64) <callconv>
+    sig83 = (i64) <callconv>
     sig84 = (i64) <callconv>
-    sig85 = (i64) <callconv>
-    sig86 = (i64) <callconv>
-    sig87 = (i64) <callconv>
-    sig88 = (i64) <callconv>
-    sig89 = (i64) <callconv>
-    sig90 = (i64) <callconv>
+    sig85 = (i64, i64, i64) -> i64 <callconv>
+    sig86 = (i64, i64, i8) -> i64 <callconv>
+    sig87 = (i64, i64) -> i64 <callconv>
+    sig88 = (i64, i64) -> i64 <callconv>
+    sig89 = (i64, i64) -> i64 <callconv>
+    sig90 = (i64, i64, f64) <callconv>
     sig91 = (i64) <callconv>
     sig92 = (i64) <callconv>
     sig93 = (i64) <callconv>
@@ -197,38 +196,48 @@ function <main>(i32, i64) -> i32 <callconv> {
     sig102 = (i64) <callconv>
     sig103 = (i64) <callconv>
     sig104 = (i64) <callconv>
-    sig105 = (i8) <callconv>
-    sig106 = (f64, i64) -> f64 <callconv>
-    sig107 = (f64, i64) -> f64 <callconv>
-    sig108 = (i64) -> f64 <callconv>
-    sig109 = (i64, i64, i64, i64, f64, f64, f64, f64, f64, f64, f64, f64, f64, i64, i64, f64) <callconv>
-    sig110 = (f64, f64, f64, f64, f64) -> f64 <callconv>
+    sig105 = (i64) <callconv>
+    sig106 = (i64) <callconv>
+    sig107 = (i64) <callconv>
+    sig108 = (i64) <callconv>
+    sig109 = (i64) <callconv>
+    sig110 = (i64) <callconv>
     sig111 = (i64) <callconv>
     sig112 = (i64) <callconv>
-    sig113 = (i64) -> i64 <callconv>
+    sig113 = (i64) <callconv>
     sig114 = (i64) <callconv>
-    sig115 = () <callconv>
-    sig116 = (i8) <callconv>
-    sig117 = () <callconv>
-    sig118 = (i64) <callconv>
-    sig119 = (i64) <callconv>
-    sig120 = (i64) <callconv>
+    sig115 = (i8) <callconv>
+    sig116 = (f64, i64) -> f64 <callconv>
+    sig117 = (f64, i64) -> f64 <callconv>
+    sig118 = (i64) -> f64 <callconv>
+    sig119 = (i64, i64, i64, i64, f64, f64, f64, f64, f64, f64, f64, f64, f64, i64, i64, f64) <callconv>
+    sig120 = (f64, f64, f64, f64, f64) -> f64 <callconv>
     sig121 = (i64) <callconv>
     sig122 = (i64) <callconv>
-    sig123 = (i64, i64) -> i64 <callconv>
+    sig123 = (i64) -> i64 <callconv>
     sig124 = (i64) <callconv>
-    sig125 = (i64, i64) -> i64 <callconv>
-    sig126 = (i64) <callconv>
-    sig127 = (i64) <callconv>
+    sig125 = () <callconv>
+    sig126 = (i8) <callconv>
+    sig127 = () <callconv>
     sig128 = (i64) <callconv>
-    sig129 = (i64, i64) -> i64 <callconv>
+    sig129 = (i64) <callconv>
     sig130 = (i64) <callconv>
     sig131 = (i64) <callconv>
-    sig132 = (i64) -> i64 <callconv>
-    sig133 = (i64) <callconv>
+    sig132 = (i64) <callconv>
+    sig133 = (i64, i64) -> i64 <callconv>
     sig134 = (i64) <callconv>
-    sig135 = (i64) <callconv>
+    sig135 = (i64, i64) -> i64 <callconv>
     sig136 = (i64) <callconv>
+    sig137 = (i64) <callconv>
+    sig138 = (i64) <callconv>
+    sig139 = (i64, i64) -> i64 <callconv>
+    sig140 = (i64) <callconv>
+    sig141 = (i64) <callconv>
+    sig142 = (i64) -> i64 <callconv>
+    sig143 = (i64) <callconv>
+    sig144 = (i64) <callconv>
+    sig145 = (i64) <callconv>
+    sig146 = (i64) <callconv>
     fn0 = nsl_args_init sig0
     fn1 = nsl_set_exec_fingerprint sig1
     fn2 = nsl_set_matmul_config sig2
@@ -285,46 +294,46 @@ function <main>(i32, i64) -> i32 <callconv> {
     fn53 = nsl_tensor_len sig53
     fn54 = nsl_tensor_len sig54
     fn55 = nsl_tensor_mul_scalar sig55
-    fn56 = nsl_tensor_clone sig56
-    fn57 = nsl_tensor_mul sig57
-    fn58 = nsl_tensor_reduce_to_shape sig58
+    fn56 = nsl_tensor_shape sig56
+    fn57 = nsl_tensor_expand sig57
+    fn58 = nsl_tensor_contiguous sig58
     fn59 = nsl_tensor_mul sig59
     fn60 = nsl_tensor_reduce_to_shape sig60
-    fn61 = nsl_tensor_add sig61
-    fn62 = nsl_tensor_transpose sig62
-    fn63 = nsl_tensor_matmul sig63
-    fn64 = nsl_tensor_transpose sig64
-    fn65 = nsl_tensor_matmul sig65
-    fn66 = nsl_tensor_reduce_to_shape sig66
-    fn67 = nsl_list_get sig67
-    fn68 = nsl_tensor_to_device_like sig68
-    fn69 = nsl_tensor_scalar_mul_add_inplace sig69
-    fn70 = nsl_tensor_free sig70
-    fn71 = nsl_tensor_free sig71
-    fn72 = nsl_tensor_free sig72
-    fn73 = nsl_tensor_silu_backward sig73
-    fn74 = nsl_list_get sig74
-    fn75 = nsl_tensor_to_device_like sig75
-    fn76 = nsl_tensor_scalar_mul_add_inplace sig76
-    fn77 = nsl_tensor_free sig77
-    fn78 = nsl_tensor_transpose sig78
-    fn79 = nsl_tensor_matmul sig79
-    fn80 = nsl_tensor_reduce_to_shape sig80
-    fn81 = nsl_list_get sig81
-    fn82 = nsl_tensor_to_device_like sig82
-    fn83 = nsl_tensor_scalar_mul_add_inplace sig83
+    fn61 = nsl_tensor_mul sig61
+    fn62 = nsl_tensor_reduce_to_shape sig62
+    fn63 = nsl_tensor_add sig63
+    fn64 = nsl_tensor_reduce_to_shape sig64
+    fn65 = nsl_tensor_transpose sig65
+    fn66 = nsl_tensor_matmul sig66
+    fn67 = nsl_tensor_transpose sig67
+    fn68 = nsl_tensor_matmul sig68
+    fn69 = nsl_tensor_reduce_to_shape sig69
+    fn70 = nsl_list_get sig70
+    fn71 = nsl_tensor_to_device_like sig71
+    fn72 = nsl_tensor_scalar_mul_add_inplace sig72
+    fn73 = nsl_tensor_free sig73
+    fn74 = nsl_tensor_free sig74
+    fn75 = nsl_tensor_free sig75
+    fn76 = nsl_tensor_silu_backward sig76
+    fn77 = nsl_tensor_reduce_to_shape sig77
+    fn78 = nsl_tensor_reduce_to_shape sig78
+    fn79 = nsl_list_get sig79
+    fn80 = nsl_tensor_to_device_like sig80
+    fn81 = nsl_tensor_scalar_mul_add_inplace sig81
+    fn82 = nsl_tensor_free sig82
+    fn83 = nsl_tensor_free sig83
     fn84 = nsl_tensor_free sig84
-    fn85 = nsl_tensor_free sig85
-    fn86 = nsl_tensor_free sig86
-    fn87 = nsl_tensor_free sig87
-    fn88 = nsl_tensor_free sig88
-    fn89 = nsl_tensor_free sig89
-    fn90 = nsl_tensor_free sig90
+    fn85 = nsl_tensor_transpose sig85
+    fn86 = nsl_tensor_matmul sig86
+    fn87 = nsl_tensor_reduce_to_shape sig87
+    fn88 = nsl_list_get sig88
+    fn89 = nsl_tensor_to_device_like sig89
+    fn90 = nsl_tensor_scalar_mul_add_inplace sig90
     fn91 = nsl_tensor_free sig91
     fn92 = nsl_tensor_free sig92
     fn93 = nsl_tensor_free sig93
     fn94 = nsl_tensor_free sig94
-    fn95 = nsl_tensor_free sig95
+    fn95 = nsl_list_free sig95
     fn96 = nsl_tensor_free sig96
     fn97 = nsl_tensor_free sig97
     fn98 = nsl_tensor_free sig98
@@ -334,38 +343,48 @@ function <main>(i32, i64) -> i32 <callconv> {
     fn102 = nsl_tensor_free sig102
     fn103 = nsl_tensor_free sig103
     fn104 = nsl_tensor_free sig104
-    fn105 = nsl_set_training_mode sig105
-    fn106 = nsl_bias_correction_inv sig106
-    fn107 = nsl_bias_correction_inv sig107
-    fn108 = nsl_fase_sum_sq_list sig108
-    fn109 = nsl_fase_fused_adamw_step_multi sig109
-    fn110 = nsl_optim_schedulers__warmup_cosine sig110
-    fn111 = nsl_tensor_print sig111
-    fn112 = nsl_tensor_free_if_valid sig112
-    fn113 = nsl_tensor_clone sig113
+    fn105 = nsl_tensor_free sig105
+    fn106 = nsl_tensor_free sig106
+    fn107 = nsl_tensor_free sig107
+    fn108 = nsl_tensor_free sig108
+    fn109 = nsl_tensor_free sig109
+    fn110 = nsl_tensor_free sig110
+    fn111 = nsl_tensor_free sig111
+    fn112 = nsl_tensor_free sig112
+    fn113 = nsl_tensor_free sig113
     fn114 = nsl_tensor_free sig114
-    fn115 = nsl_gpu_set_persistent_pool sig115
-    fn116 = nsl_gpu_set_alloc_surface sig116
-    fn117 = nsl_gpu_drain_cache sig117
-    fn118 = nsl_debug_gpu_mem sig118
-    fn119 = nsl_debug_gpu_alloc_summary sig119
-    fn120 = nsl_print_int sig120
-    fn121 = nsl_tensor_free_if_valid sig121
-    fn122 = nsl_list_free sig122
-    fn123 = nsl_list_get sig123
+    fn115 = nsl_set_training_mode sig115
+    fn116 = nsl_bias_correction_inv sig116
+    fn117 = nsl_bias_correction_inv sig117
+    fn118 = nsl_fase_sum_sq_list sig118
+    fn119 = nsl_fase_fused_adamw_step_multi sig119
+    fn120 = nsl_optim_schedulers__warmup_cosine sig120
+    fn121 = nsl_tensor_print sig121
+    fn122 = nsl_tensor_free_if_valid sig122
+    fn123 = nsl_tensor_clone sig123
     fn124 = nsl_tensor_free sig124
-    fn125 = nsl_list_get sig125
-    fn126 = nsl_tensor_free sig126
-    fn127 = nsl_list_free sig127
-    fn128 = nsl_list_free sig128
-    fn129 = nsl_list_get sig129
-    fn130 = nsl_tensor_free sig130
-    fn131 = nsl_list_free sig131
-    fn132 = nsl_tensor_sum sig132
-    fn133 = nsl_tensor_print sig133
+    fn125 = nsl_gpu_set_persistent_pool sig125
+    fn126 = nsl_gpu_set_alloc_surface sig126
+    fn127 = nsl_gpu_drain_cache sig127
+    fn128 = nsl_debug_gpu_mem sig128
+    fn129 = nsl_debug_gpu_alloc_summary sig129
+    fn130 = nsl_print_int sig130
+    fn131 = nsl_tensor_free_if_valid sig131
+    fn132 = nsl_list_free sig132
+    fn133 = nsl_list_get sig133
     fn134 = nsl_tensor_free sig134
-    fn135 = nsl_tensor_free_if_valid sig135
-    fn136 = nsl_tensor_free_if_valid sig136
+    fn135 = nsl_list_get sig135
+    fn136 = nsl_tensor_free sig136
+    fn137 = nsl_list_free sig137
+    fn138 = nsl_list_free sig138
+    fn139 = nsl_list_get sig139
+    fn140 = nsl_tensor_free sig140
+    fn141 = nsl_list_free sig141
+    fn142 = nsl_tensor_sum sig142
+    fn143 = nsl_tensor_print sig143
+    fn144 = nsl_tensor_free sig144
+    fn145 = nsl_tensor_free_if_valid sig145
+    fn146 = nsl_tensor_free_if_valid sig146
 
 block0(v0: i32, v1: i64):
     call fn0(v0, v1)
@@ -386,11 +405,11 @@ block0(v0: i32, v1: i64):
     v16 = call fn4(v15)  ; v15 = 42
     v17 = call fn5()
     v87 -> v17
-    v260 -> v17
-    v261 -> v17
-    v290 -> v17
-    v291 -> v17
-    v262 -> v87
+    v270 -> v17
+    v271 -> v17
+    v300 -> v17
+    v301 -> v17
+    v272 -> v87
     v18 = call fn6()
     v19 = iconst.i64 4
     call fn7(v18, v19)  ; v19 = 4
@@ -398,11 +417,11 @@ block0(v0: i32, v1: i64):
     call fn7(v18, v20)  ; v20 = 4
     v21 = call fn8(v18)
     v88 -> v21
-    v263 -> v21
-    v264 -> v21
-    v296 -> v21
-    v297 -> v21
-    v265 -> v88
+    v273 -> v21
+    v274 -> v21
+    v306 -> v21
+    v307 -> v21
+    v275 -> v88
     v22 = call fn9()
     v23 = iconst.i64 4
     call fn10(v22, v23)  ; v23 = 4
@@ -410,11 +429,11 @@ block0(v0: i32, v1: i64):
     call fn10(v22, v24)  ; v24 = 2
     v25 = call fn11(v22)
     v89 -> v25
-    v266 -> v25
-    v267 -> v25
-    v299 -> v25
-    v300 -> v25
-    v268 -> v89
+    v276 -> v25
+    v277 -> v25
+    v309 -> v25
+    v310 -> v25
+    v278 -> v89
     call fn12()
     v26 = iconst.i64 0
     v27 = call fn13()
@@ -465,9 +484,9 @@ block3:
     call fn29(v27)
     v55 = iconst.i64 0
     v56 = f64const 0x1.47ae147ae147bp-7
-    v269 -> v56
+    v279 -> v56
     v57 = iconst.i64 0
-    v259 -> v57
+    v269 -> v57
     v58 = symbol_value.i64 gv1
     v59 = iconst.i64 192
     v60 = call fn30(v58, v59)  ; v59 = 192
@@ -499,16 +518,16 @@ block6:
     v75 = iconst.i64 2
     jump block7(v74, v57, v56)  ; v74 = 0, v57 = 0, v56 = 0x1.47ae147ae147bp-7
 
-block7(v76: i64, v83: i64, v199: f64):
-    v253 -> v76
-    v234 -> v83
+block7(v76: i64, v83: i64, v209: f64):
+    v263 -> v76
+    v244 -> v83
     v77 = icmp slt v76, v75  ; v75 = 2
     brif v77, block8, block10
 
 block8:
     v78 = iconst.i64 0
     v79 = iconst.i64 0
-    v243 -> v79
+    v253 -> v79
     call fn37()
     v80 = iconst.i64 0
     v81 = iconst.i8 6
@@ -556,243 +575,258 @@ block8:
     v120 = fdiv v118, v119
     v121 = iconst.i8 0
     v122 = call fn55(v115, v120, v121)  ; v121 = 0
-    v123 = call fn56(v122)
-    v124 = iconst.i8 0
-    v125 = call fn57(v123, v105, v124)  ; v124 = 0
-    v126 = call fn58(v125, v105)
-    v127 = iconst.i8 0
-    v128 = call fn59(v123, v105, v127)  ; v127 = 0
-    v129 = call fn60(v128, v105)
-    v130 = iconst.i8 0
-    v131 = call fn61(v126, v129, v130)  ; v130 = 0
-    v132 = iconst.i64 -2
-    v133 = iconst.i64 -1
-    v134 = call fn62(v94, v132, v133)  ; v132 = -2, v133 = -1
-    v135 = iconst.i8 0
-    v136 = call fn63(v131, v134, v135)  ; v135 = 0
-    v137 = iconst.i64 -2
-    v138 = iconst.i64 -1
-    v139 = call fn64(v101, v137, v138)  ; v137 = -2, v138 = -1
-    v140 = iconst.i8 0
-    v141 = call fn65(v139, v131, v140)  ; v140 = 0
-    v142 = call fn66(v141, v94)
-    v143 = iconst.i64 2
-    v144 = call fn67(v62, v143)  ; v143 = 2
-    v145 = call fn68(v142, v144)
-    v146 = f64const 0x1.0000000000000p-1
-    call fn69(v144, v145, v146)  ; v146 = 0x1.0000000000000p-1
-    v147 = iconst.i64 0
-    call fn70(v145)
-    v148 = iconst.i64 0
-    call fn71(v142)
-    v149 = iconst.i64 0
-    call fn72(v141)
+    v123 = call fn56(v107)
+    v124 = call fn57(v122, v123)
+    v125 = call fn58(v124)
+    v126 = iconst.i8 0
+    v127 = call fn59(v125, v105, v126)  ; v126 = 0
+    v128 = call fn60(v127, v105)
+    v129 = iconst.i8 0
+    v130 = call fn61(v125, v105, v129)  ; v129 = 0
+    v131 = call fn62(v130, v105)
+    v132 = iconst.i8 0
+    v133 = call fn63(v128, v131, v132)  ; v132 = 0
+    v134 = call fn64(v133, v103)
+    v135 = iconst.i64 -2
+    v136 = iconst.i64 -1
+    v137 = call fn65(v94, v135, v136)  ; v135 = -2, v136 = -1
+    v138 = iconst.i8 0
+    v139 = call fn66(v134, v137, v138)  ; v138 = 0
+    v140 = iconst.i64 -2
+    v141 = iconst.i64 -1
+    v142 = call fn67(v101, v140, v141)  ; v140 = -2, v141 = -1
+    v143 = iconst.i8 0
+    v144 = call fn68(v142, v134, v143)  ; v143 = 0
+    v145 = call fn69(v144, v94)
+    v146 = iconst.i64 2
+    v147 = call fn70(v62, v146)  ; v146 = 2
+    v148 = call fn71(v145, v147)
+    v149 = f64const 0x1.0000000000000p-1
+    call fn72(v147, v148, v149)  ; v149 = 0x1.0000000000000p-1
     v150 = iconst.i64 0
-    v151 = call fn73(v136, v100)
-    v152 = iconst.i64 1
-    v153 = call fn74(v62, v152)  ; v152 = 1
-    v154 = call fn75(v151, v153)
-    v155 = f64const 0x1.0000000000000p-1
-    call fn76(v153, v154, v155)  ; v155 = 0x1.0000000000000p-1
-    v156 = iconst.i64 0
-    call fn77(v154)
-    v157 = iconst.i64 0
-    v158 = iconst.i64 -2
-    v159 = iconst.i64 -1
-    v160 = call fn78(v88, v158, v159)  ; v158 = -2, v159 = -1
-    v161 = iconst.i8 0
-    v162 = call fn79(v160, v151, v161)  ; v161 = 0
-    v163 = call fn80(v162, v92)
+    call fn73(v148)
+    v151 = iconst.i64 0
+    call fn74(v145)
+    v152 = iconst.i64 0
+    call fn75(v144)
+    v153 = iconst.i64 0
+    v154 = call fn76(v139, v100)
+    v155 = call fn77(v154, v98)
+    v156 = call fn78(v154, v93)
+    v157 = iconst.i64 1
+    v158 = call fn79(v62, v157)  ; v157 = 1
+    v159 = call fn80(v156, v158)
+    v160 = f64const 0x1.0000000000000p-1
+    call fn81(v158, v159, v160)  ; v160 = 0x1.0000000000000p-1
+    v161 = iconst.i64 0
+    call fn82(v159)
+    v162 = iconst.i64 0
+    call fn83(v156)
+    v163 = iconst.i64 0
+    call fn84(v154)
     v164 = iconst.i64 0
-    v165 = call fn81(v62, v164)  ; v164 = 0
-    v166 = call fn82(v163, v165)
-    v167 = f64const 0x1.0000000000000p-1
-    call fn83(v165, v166, v167)  ; v167 = 0x1.0000000000000p-1
-    v168 = iconst.i64 0
-    call fn84(v166)
-    v169 = iconst.i64 0
-    call fn85(v163)
-    v170 = iconst.i64 0
-    call fn86(v162)
+    v165 = iconst.i64 -2
+    v166 = iconst.i64 -1
+    v167 = call fn85(v88, v165, v166)  ; v165 = -2, v166 = -1
+    v168 = iconst.i8 0
+    v169 = call fn86(v167, v155, v168)  ; v168 = 0
+    v170 = call fn87(v169, v92)
     v171 = iconst.i64 0
-    v172 = iconst.i64 0
-    call fn87(v122)
-    v173 = iconst.i64 0
-    call fn88(v123)
-    v174 = iconst.i64 0
-    call fn89(v125)
+    v172 = call fn88(v62, v171)  ; v171 = 0
+    v173 = call fn89(v170, v172)
+    v174 = f64const 0x1.0000000000000p-1
+    call fn90(v172, v173, v174)  ; v174 = 0x1.0000000000000p-1
     v175 = iconst.i64 0
-    call fn90(v126)
+    call fn91(v173)
     v176 = iconst.i64 0
-    call fn91(v128)
+    call fn92(v170)
     v177 = iconst.i64 0
-    call fn92(v129)
+    call fn93(v169)
     v178 = iconst.i64 0
-    call fn93(v131)
     v179 = iconst.i64 0
-    call fn94(v134)
+    call fn94(v122)
     v180 = iconst.i64 0
-    call fn95(v136)
+    call fn95(v123)
     v181 = iconst.i64 0
-    call fn96(v139)
+    call fn96(v124)
     v182 = iconst.i64 0
-    call fn97(v151)
+    call fn97(v125)
     v183 = iconst.i64 0
-    call fn98(v160)
+    call fn98(v127)
     v184 = iconst.i64 0
-    call fn99(v98)
+    call fn99(v128)
     v185 = iconst.i64 0
-    call fn100(v100)
+    call fn100(v130)
     v186 = iconst.i64 0
-    call fn101(v101)
+    call fn101(v131)
     v187 = iconst.i64 0
-    call fn102(v103)
+    call fn102(v133)
     v188 = iconst.i64 0
-    call fn103(v105)
+    call fn103(v134)
     v189 = iconst.i64 0
-    call fn104(v107)
+    call fn104(v137)
     v190 = iconst.i64 0
-    v191 = iconst.i8 0
-    call fn105(v191)  ; v191 = 0
+    call fn105(v139)
+    v191 = iconst.i64 0
+    call fn106(v142)
     v192 = iconst.i64 0
-    v193 = iconst.i64 1
-    v194 = iadd.i64 v83, v193  ; v193 = 1
-    v195 = iconst.i64 2
-    v196 = srem v194, v195  ; v195 = 2
+    call fn107(v155)
+    v193 = iconst.i64 0
+    call fn108(v167)
+    v194 = iconst.i64 0
+    call fn109(v98)
+    v195 = iconst.i64 0
+    call fn110(v100)
+    v196 = iconst.i64 0
+    call fn111(v101)
     v197 = iconst.i64 0
-    v198 = icmp eq v196, v197  ; v197 = 0
-    brif v198, block12, block13
+    call fn112(v103)
+    v198 = iconst.i64 0
+    call fn113(v105)
+    v199 = iconst.i64 0
+    call fn114(v107)
+    v200 = iconst.i64 0
+    v201 = iconst.i8 0
+    call fn115(v201)  ; v201 = 0
+    v202 = iconst.i64 0
+    v203 = iconst.i64 1
+    v204 = iadd.i64 v83, v203  ; v203 = 1
+    v205 = iconst.i64 2
+    v206 = srem v204, v205  ; v205 = 2
+    v207 = iconst.i64 0
+    v208 = icmp eq v206, v207  ; v207 = 0
+    brif v208, block12, block13
 
 block12:
-    v200 = f64const 0.0
-    v201 = f64const 0.0
-    v202 = f64const 0x1.47ae147ae147bp-7
-    v203 = iconst.i8 0
-    v204 = f64const 0x1.ccccccccccccdp-1
-    v205 = f64const 0x1.ff7ced916872bp-1
-    v206 = f64const 0x1.5798ee2308c3ap-27
-    v207 = iconst.i64 1
-    v208 = iadd.i64 v83, v207  ; v207 = 1
-    v209 = iconst.i64 2
-    v210 = sdiv v208, v209  ; v209 = 2
-    v211 = f64const 0x1.ccccccccccccdp-1
-    v212 = f64const 0x1.ff7ced916872bp-1
-    v213 = call fn106(v211, v210)  ; v211 = 0x1.ccccccccccccdp-1
-    v214 = call fn107(v212, v210)  ; v212 = 0x1.ff7ced916872bp-1
-    v215 = f64const 0.0
-    v216 = call fn108(v62)
-    v217 = sqrt v216
-    v218 = f64const 0x1.0c6f7a0b5ed8dp-20
-    v219 = fadd v217, v218  ; v218 = 0x1.0c6f7a0b5ed8dp-20
-    v220 = f64const 0x1.0000000000000p0
-    v221 = fdiv v220, v219  ; v220 = 0x1.0000000000000p0
-    v222 = f64const 0x1.0000000000000p0
-    v223 = fmin v222, v221  ; v222 = 0x1.0000000000000p0
-    v224 = iconst.i64 0
-    v225 = iconst.i64 0
-    v226 = f64const 0x1.ccccccccccccdp-1
-    v227 = f64const 0x1.9999999999998p-4
-    v228 = f64const 0x1.ff7ced916872bp-1
-    v229 = f64const 0x1.0624dd2f1aa00p-10
-    v230 = f64const 0x1.5798ee2308c3ap-27
-    v231 = f64const 0x1.47ae147ae147bp-7
-    call fn109(v30, v39, v40, v62, v199, v226, v227, v228, v229, v230, v231, v213, v214, v224, v225, v223)  ; v226 = 0x1.ccccccccccccdp-1, v227 = 0x1.9999999999998p-4, v228 = 0x1.ff7ced916872bp-1, v229 = 0x1.0624dd2f1aa00p-10, v230 = 0x1.5798ee2308c3ap-27, v231 = 0x1.47ae147ae147bp-7, v224 = 0, v225 = 0
-    v232 = iconst.i64 0
+    v210 = f64const 0.0
+    v211 = f64const 0.0
+    v212 = f64const 0x1.47ae147ae147bp-7
+    v213 = iconst.i8 0
+    v214 = f64const 0x1.ccccccccccccdp-1
+    v215 = f64const 0x1.ff7ced916872bp-1
+    v216 = f64const 0x1.5798ee2308c3ap-27
+    v217 = iconst.i64 1
+    v218 = iadd.i64 v83, v217  ; v217 = 1
+    v219 = iconst.i64 2
+    v220 = sdiv v218, v219  ; v219 = 2
+    v221 = f64const 0x1.ccccccccccccdp-1
+    v222 = f64const 0x1.ff7ced916872bp-1
+    v223 = call fn116(v221, v220)  ; v221 = 0x1.ccccccccccccdp-1
+    v224 = call fn117(v222, v220)  ; v222 = 0x1.ff7ced916872bp-1
+    v225 = f64const 0.0
+    v226 = call fn118(v62)
+    v227 = sqrt v226
+    v228 = f64const 0x1.0c6f7a0b5ed8dp-20
+    v229 = fadd v227, v228  ; v228 = 0x1.0c6f7a0b5ed8dp-20
+    v230 = f64const 0x1.0000000000000p0
+    v231 = fdiv v230, v229  ; v230 = 0x1.0000000000000p0
+    v232 = f64const 0x1.0000000000000p0
+    v233 = fmin v232, v231  ; v232 = 0x1.0000000000000p0
+    v234 = iconst.i64 0
+    v235 = iconst.i64 0
+    v236 = f64const 0x1.ccccccccccccdp-1
+    v237 = f64const 0x1.9999999999998p-4
+    v238 = f64const 0x1.ff7ced916872bp-1
+    v239 = f64const 0x1.0624dd2f1aa00p-10
+    v240 = f64const 0x1.5798ee2308c3ap-27
+    v241 = f64const 0x1.47ae147ae147bp-7
+    call fn119(v30, v39, v40, v62, v209, v236, v237, v238, v239, v240, v241, v223, v224, v234, v235, v233)  ; v236 = 0x1.ccccccccccccdp-1, v237 = 0x1.9999999999998p-4, v238 = 0x1.ff7ced916872bp-1, v239 = 0x1.0624dd2f1aa00p-10, v240 = 0x1.5798ee2308c3ap-27, v241 = 0x1.47ae147ae147bp-7, v234 = 0, v235 = 0
+    v242 = iconst.i64 0
     jump block13
 
 block13:
-    v233 = f64const 0x1.47ae147ae147bp-7
-    v235 = fcvt_from_sint.f64 v83
-    v236 = f64const 0x1.0000000000000p0
-    v237 = f64const 0x1.0000000000000p2
-    v238 = f64const 0x1.0624dd2f1a9fcp-10
-    v239 = call fn110(v233, v235, v236, v237, v238)  ; v233 = 0x1.47ae147ae147bp-7, v236 = 0x1.0000000000000p0, v237 = 0x1.0000000000000p2, v238 = 0x1.0624dd2f1a9fcp-10
-    v240 = iconst.i64 1
-    v241 = iadd.i64 v234, v240  ; v240 = 1
-    call fn111(v110)
-    v242 = iconst.i64 0
-    call fn112(v79)  ; v79 = 0
-    v244 = iconst.i64 0
-    v245 = call fn113(v110)
-    call fn114(v110)
-    v246 = iconst.i64 0
-    v247 = iconst.i64 0
-    call fn115()
-    v248 = iconst.i64 0
-    call fn116(v27)
-    v249 = iconst.i64 0
-    call fn117()
-    v250 = iconst.i64 0
-    call fn118(v241)
-    v251 = iconst.i64 0
-    call fn119(v241)
+    v243 = f64const 0x1.47ae147ae147bp-7
+    v245 = fcvt_from_sint.f64 v83
+    v246 = f64const 0x1.0000000000000p0
+    v247 = f64const 0x1.0000000000000p2
+    v248 = f64const 0x1.0624dd2f1a9fcp-10
+    v249 = call fn120(v243, v245, v246, v247, v248)  ; v243 = 0x1.47ae147ae147bp-7, v246 = 0x1.0000000000000p0, v247 = 0x1.0000000000000p2, v248 = 0x1.0624dd2f1a9fcp-10
+    v250 = iconst.i64 1
+    v251 = iadd.i64 v244, v250  ; v250 = 1
+    call fn121(v110)
     v252 = iconst.i64 0
-    call fn120(v76)
+    call fn122(v79)  ; v79 = 0
     v254 = iconst.i64 0
-    call fn121(v245)
-    v255 = iconst.i64 0
+    v255 = call fn123(v110)
+    call fn124(v110)
     v256 = iconst.i64 0
+    v257 = iconst.i64 0
+    call fn125()
+    v258 = iconst.i64 0
+    call fn126(v27)
+    v259 = iconst.i64 0
+    call fn127()
+    v260 = iconst.i64 0
+    call fn128(v251)
+    v261 = iconst.i64 0
+    call fn129(v251)
+    v262 = iconst.i64 0
+    call fn130(v76)
+    v264 = iconst.i64 0
+    call fn131(v255)
+    v265 = iconst.i64 0
+    v266 = iconst.i64 0
     jump block9
 
 block9:
-    v257 = iconst.i64 1
-    v258 = iadd.i64 v253, v257  ; v257 = 1
-    jump block7(v258, v241, v239)
+    v267 = iconst.i64 1
+    v268 = iadd.i64 v263, v267  ; v267 = 1
+    jump block7(v268, v251, v249)
 
 block10:
-    call fn122(v30)
-    v270 = iconst.i64 0
-    v271 = iconst.i64 0
-    jump block14(v271)  ; v271 = 0
+    call fn132(v30)
+    v280 = iconst.i64 0
+    v281 = iconst.i64 0
+    jump block14(v281)  ; v281 = 0
 
-block14(v272: i64):
-    v273 = icmp slt v272, v38  ; v38 = 3
-    brif v273, block15, block16
+block14(v282: i64):
+    v283 = icmp slt v282, v38  ; v38 = 3
+    brif v283, block15, block16
 
 block15:
-    v274 = call fn123(v39, v272)
-    call fn124(v274)
-    v275 = iconst.i64 0
-    v276 = call fn125(v40, v272)
-    call fn126(v276)
-    v277 = iconst.i64 0
-    v278 = iconst.i64 1
-    v279 = iadd.i64 v272, v278  ; v278 = 1
-    jump block14(v279)
+    v284 = call fn133(v39, v282)
+    call fn134(v284)
+    v285 = iconst.i64 0
+    v286 = call fn135(v40, v282)
+    call fn136(v286)
+    v287 = iconst.i64 0
+    v288 = iconst.i64 1
+    v289 = iadd.i64 v282, v288  ; v288 = 1
+    jump block14(v289)
 
 block16:
-    call fn127(v39)
-    v280 = iconst.i64 0
-    call fn128(v40)
-    v281 = iconst.i64 0
-    v282 = iconst.i64 0
-    jump block17(v282)  ; v282 = 0
+    call fn137(v39)
+    v290 = iconst.i64 0
+    call fn138(v40)
+    v291 = iconst.i64 0
+    v292 = iconst.i64 0
+    jump block17(v292)  ; v292 = 0
 
-block17(v283: i64):
-    v284 = icmp slt v283, v38  ; v38 = 3
-    brif v284, block18, block19
+block17(v293: i64):
+    v294 = icmp slt v293, v38  ; v38 = 3
+    brif v294, block18, block19
 
 block18:
-    v285 = call fn129(v62, v283)
-    call fn130(v285)
-    v286 = iconst.i64 0
-    v287 = iconst.i64 1
-    v288 = iadd.i64 v283, v287  ; v287 = 1
-    jump block17(v288)
+    v295 = call fn139(v62, v293)
+    call fn140(v295)
+    v296 = iconst.i64 0
+    v297 = iconst.i64 1
+    v298 = iadd.i64 v293, v297  ; v297 = 1
+    jump block17(v298)
 
 block19:
-    call fn131(v62)
-    v289 = iconst.i64 0
-    v292 = load.i64 notrap aligned v17+16
-    v293 = call fn132(v292)
-    call fn133(v293)
-    v294 = iconst.i64 0
-    call fn134(v293)
-    v295 = iconst.i64 0
-    call fn135(v21)
-    v298 = iconst.i64 0
-    call fn136(v25)
-    v301 = iconst.i64 0
-    v302 = iconst.i32 0
-    return v302  ; v302 = 0
+    call fn141(v62)
+    v299 = iconst.i64 0
+    v302 = load.i64 notrap aligned v17+16
+    v303 = call fn142(v302)
+    call fn143(v303)
+    v304 = iconst.i64 0
+    call fn144(v303)
+    v305 = iconst.i64 0
+    call fn145(v21)
+    v308 = iconst.i64 0
+    call fn146(v25)
+    v311 = iconst.i64 0
+    v312 = iconst.i32 0
+    return v312  ; v312 = 0
 }

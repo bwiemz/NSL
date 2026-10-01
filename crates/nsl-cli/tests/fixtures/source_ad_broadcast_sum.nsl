@@ -1,0 +1,28 @@
+# Source-AD backward through a broadcast INTERMEDIATE (see
+# source_ad_broadcast_backward_gate.rs). `sum(x @ v)` is one element added to
+# every element of `x @ w`, so its gradient is the SUM of the [3, 4] gradient;
+# the sum's own backward then expands that back to [3, 4] for the matmul.
+from nsl.nn.losses import mse_loss
+
+model SumBcast:
+    w: Tensor = (arange(16).reshape([4, 4])) * 0.05 - full([4, 4], 0.3)
+    v: Tensor = ones([4, 4]) * 0.1
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w + sum(x @ self.v)
+
+let m = SumBcast()
+let x = (arange(12).reshape([3, 4])) * 0.1 + full([3, 4], 0.1)
+let y = (arange(12).reshape([3, 4])) * 0.2 - full([3, 4], 1.0)
+
+train(model = m, epochs = 3):
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let loss = mse_loss(m.forward(x), y)
+
+print("W_BEGIN")
+print(m.w)
+print("W_END")
+print("V_BEGIN")
+print(m.v)
+print("V_END")

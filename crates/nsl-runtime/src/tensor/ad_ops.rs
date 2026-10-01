@@ -2282,6 +2282,54 @@ mod tests {
         (0..t.len as usize).map(|i| t.read_scalar_as_f64(i)).collect()
     }
 
+    fn shape_of(ptr: i64) -> Vec<i64> {
+        let t = NslTensor::from_ptr(ptr);
+        (0..t.ndim as usize).map(|i| unsafe { *t.shape.add(i) }).collect()
+    }
+
+    /// Source AD reduces every Add/Sub operand's gradient to the operand's
+    /// shape, so the target is no longer always a parameter whose dims are
+    /// the grad's trailing dims. A `[1]` or `[3, 1]` operand under a
+    /// `[3, 4]` grad must be summed over EVERY broadcast dim; the leading-dim
+    /// shortcut alone turned `[3, 4]` into `[4]` for a `[1]` target.
+    #[test]
+    fn reduce_to_shape_sums_every_broadcast_dim() {
+        let vals: Vec<f64> = (0..12).map(f64::from).collect();
+        let cases: [(&[i64], Vec<f64>); 6] = [
+            (&[3, 4], vals.clone()),
+            (&[4], vec![12.0, 15.0, 18.0, 21.0]),
+            (&[1], vec![66.0]),
+            (&[], vec![66.0]),
+            (&[3, 1], vec![6.0, 22.0, 38.0]),
+            (&[1, 4], vec![12.0, 15.0, 18.0, 21.0]),
+        ];
+        for (shape, want) in cases {
+            let g = cpu_tensor(&[3, 4], 0, &vals);
+            let n: i64 = shape.iter().product();
+            let target = cpu_tensor(shape, 0, &vec![0.0; n as usize]);
+            let r = nsl_tensor_reduce_to_shape(g, target);
+            assert_eq!(shape_of(r), shape, "target {shape:?}: result shape");
+            assert_eq!(read_all(r), want, "target {shape:?}: result values");
+            nsl_tensor_free(r);
+            nsl_tensor_free(target);
+            nsl_tensor_free(g);
+        }
+    }
+
+    /// A 0-d seed meeting a one-element `[1]` operand has fewer dims than
+    /// its target; there is nothing to reduce, and it passes through.
+    #[test]
+    fn reduce_to_shape_passes_a_lower_rank_grad_through() {
+        let g = cpu_tensor(&[], 0, &[2.5]);
+        let target = cpu_tensor(&[1], 0, &[0.0]);
+        let r = nsl_tensor_reduce_to_shape(g, target);
+        assert_eq!(r, g, "pass-through returns the grad itself, retained");
+        assert_eq!(read_all(r), [2.5]);
+        nsl_tensor_free(r);
+        nsl_tensor_free(target);
+        nsl_tensor_free(g);
+    }
+
     /// `go * mean over non-ignored rows of (logsumexp(z_i) - z_i[t_i])`, the
     /// loss `cross_entropy` computes, differentiated by central differences
     /// in f64. Two of five rows are ignored (target -100) and the upstream
@@ -2444,8 +2492,23 @@ pub extern "C" fn nsl_tensor_reduce_to_shape(grad_ptr: i64, target_ptr: i64) -> 
         }
     }
 
-    // If grad has more dims, sum over the leading dims
-    if g_ndim > t_ndim {
+    // A grad with FEWER dims than its target is a scalar seed meeting a
+    // one-element operand (a `[1]` loss term under a 0-d seed): there is no
+    // broadcast to undo, and the right-aligned reduction below would index
+    // below dim 0. Pass it through, as the reduce-free adjoint always did.
+    if g_ndim < t_ndim {
+        super::nsl_tensor_retain(grad_ptr);
+        return grad_ptr;
+    }
+
+    // If grad has more dims and its trailing dims ARE the target's shape,
+    // sum over the leading dims. A target whose own dims were broadcast too
+    // (`[1]` or `[3, 1]` under a `[3, 4]` grad) takes the general path below.
+    let trailing_match = g_ndim > t_ndim
+        && (0..t_ndim).all(|i| unsafe {
+            *grad.shape.add(g_ndim - t_ndim + i) == *target.shape.add(i)
+        });
+    if trailing_match {
         let extra = g_ndim - t_ndim;
         let mut result = super::nsl_tensor_clone(grad_ptr);
         // Sum over dim 0, `extra` times (each sum reduces ndim by 1 if keepdim=0)
@@ -2459,7 +2522,8 @@ pub extern "C" fn nsl_tensor_reduce_to_shape(grad_ptr: i64, target_ptr: i64) -> 
         return result;
     }
 
-    // Same ndim but different shape — sum over broadcast dims
+    // Any other broadcast (same ndim with size-1 dims, or fewer target dims
+    // some of which are size 1) — sum over every broadcast dim
     let target_shape: Vec<i64> = (0..t_ndim).map(|i| unsafe { *target.shape.add(i) }).collect();
     crate::autodiff::grad_utils::reduce_grad_for_broadcast(grad_ptr, &target_shape)
 }

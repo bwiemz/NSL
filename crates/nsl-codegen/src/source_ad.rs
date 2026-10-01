@@ -170,6 +170,9 @@ pub struct AdjointGenerator {
     /// bit-close decomposition stays the reference; the fused kernel matches it
     /// to an f32 tolerance (approx rsqrt/div), so this is an opt-in speedup.
     fuse_rmsnorm_backward: bool,
+    /// The primal list's var types, taken at `generate()`: a reduce or
+    /// expand target must be a tensor handle.
+    primal_var_types: HashMap<VarId, WengertType>,
 }
 
 impl AdjointGenerator {
@@ -187,6 +190,7 @@ impl AdjointGenerator {
             csha_fused_events: Vec::new(),
             conv_grad_materialize_cache: HashMap::new(),
             fuse_rmsnorm_backward: false,
+            primal_var_types: HashMap::new(),
         }
     }
 
@@ -270,6 +274,7 @@ impl AdjointGenerator {
 
     /// Generate the backward Wengert list by walking primal ops in reverse.
     pub fn generate(&mut self, primal: &WengertList) -> WengertList {
+        self.primal_var_types = primal.var_types.clone();
         let loss_bar = self.next_var();
         let seed_op_id = self.next_op();
         self.adjoint_vars.insert(primal.output, loss_bar);
@@ -832,6 +837,35 @@ impl AdjointGenerator {
         self.emit_op(PrimalOp::Constant(value), vec![])
     }
 
+    /// Whether a primal var lowers to a tensor handle. A float literal lowers
+    /// to a raw `f64` and a shape subscript to an `i64`; an untyped var lowers
+    /// as a tensor.
+    fn is_tensor_var(&self, v: VarId) -> bool {
+        self.primal_var_types
+            .get(&v)
+            .is_none_or(|t| *t == WengertType::Tensor)
+    }
+
+    /// `grad` summed over whatever dims `target` was broadcast along, so it
+    /// has `target`'s shape (the runtime returns `grad` itself when nothing
+    /// was broadcast). A non-tensor target has no shape and was never
+    /// broadcast; its adjoint is `grad`.
+    fn reduce_to(&mut self, grad: VarId, target: VarId) -> VarId {
+        if !self.is_tensor_var(target) {
+            return grad;
+        }
+        self.emit_op(PrimalOp::Passthrough("reduce_to_shape".into()), vec![grad, target])
+    }
+
+    /// `grad` broadcast to `target`'s shape and materialized: the adjoint of
+    /// a full reduction, as the tape's `SumReduce`/`MeanReduce` backward
+    /// builds it.
+    fn expand_like(&mut self, grad: VarId, target: VarId) -> VarId {
+        let shape = self.emit_op(PrimalOp::Passthrough("shape".into()), vec![target]);
+        let view = self.emit_op(PrimalOp::Passthrough("expand".into()), vec![grad, shape]);
+        self.emit_op(PrimalOp::Passthrough("contiguous".into()), vec![view])
+    }
+
     fn lower_adjoint_expr(&mut self, expr: AdjointExpr) -> VarId {
         // Identity: pass-through, no op needed
         if let AdjointExpr::Identity(v) = expr {
@@ -856,10 +890,7 @@ impl AdjointGenerator {
                 // sibling arms MatmulTransposeRight, Expand/ReduceToShape,
                 // and the RMSNorm dgamma path.
                 let raw = self.emit_op(PrimalOp::Mul, vec![grad, other]);
-                self.emit_op(
-                    PrimalOp::Passthrough("reduce_to_shape".into()),
-                    vec![raw, target],
-                )
+                self.reduce_to(raw, target)
             }
             AdjointExpr::MatmulTransposeLeft(grad, b) => {
                 // d_loss/d_A = grad @ B^T (transpose last two dims for N-D support)
@@ -899,8 +930,14 @@ impl AdjointGenerator {
             AdjointExpr::MeanBackward(v, input, result) => {
                 let scaled =
                     self.emit_op(PrimalOp::Passthrough("mean_grad_scale".into()), vec![v, input, result]);
+                self.expand_like(scaled, input)
+            }
+            AdjointExpr::MeanDimBackward(v, input, result) => {
+                let scaled =
+                    self.emit_op(PrimalOp::Passthrough("mean_grad_scale".into()), vec![v, input, result]);
                 self.emit_op(PrimalOp::Broadcast, vec![scaled])
             }
+            AdjointExpr::ExpandLike(v, input) => self.expand_like(v, input),
             AdjointExpr::ScaleBroadcast(v, n) => {
                 let scale = self.emit_constant(n);
                 let scaled = self.emit_op(PrimalOp::Mul, vec![v, scale]);
@@ -914,10 +951,13 @@ impl AdjointGenerator {
                 self.emit_op(PrimalOp::Passthrough("reshape".into()), vec![v, shape])
             }
             // --- Expand backward: sum-reduce gradient over broadcast-expanded dims ---
-            AdjointExpr::ReduceToShape(grad, target) => self.emit_op(
-                PrimalOp::Passthrough("reduce_to_shape".into()),
-                vec![grad, target],
-            ),
+            AdjointExpr::ReduceToShape(grad, target) => self.reduce_to(grad, target),
+            // Reduce first: when the operand was broadcast the negation then
+            // runs on the smaller tensor, and negation is exact either way.
+            AdjointExpr::NegReduceToShape(grad, target) => {
+                let reduced = self.reduce_to(grad, target);
+                self.emit_op(PrimalOp::Neg, vec![reduced])
+            }
 
             // --- Exp backward: d(exp(x))/dx = exp(x) = y. grad * y (correct as-is) ---
             AdjointExpr::ExpBackward(y_bar, y) => self.emit_op(PrimalOp::Mul, vec![y_bar, y]),
@@ -959,8 +999,9 @@ impl AdjointGenerator {
             }
 
             // --- Div numerator backward: d(a/b)/da = 1/b, so grad / b ---
-            AdjointExpr::DivNumeratorBackward(y_bar, b) => {
-                self.emit_op(PrimalOp::Div, vec![y_bar, b])
+            AdjointExpr::DivNumeratorBackward(y_bar, b, a) => {
+                let raw = self.emit_op(PrimalOp::Div, vec![y_bar, b]);
+                self.reduce_to(raw, a)
             }
 
             // --- Div denominator backward: d(a/b)/db = -a/b², so grad * (-a/b²) ---
@@ -968,7 +1009,8 @@ impl AdjointGenerator {
                 let b_sq = self.emit_op(PrimalOp::Mul, vec![b, b]);
                 let a_over_b_sq = self.emit_op(PrimalOp::Div, vec![a, b_sq]);
                 let neg = self.emit_op(PrimalOp::Neg, vec![a_over_b_sq]);
-                self.emit_op(PrimalOp::Mul, vec![y_bar, neg])
+                let raw = self.emit_op(PrimalOp::Mul, vec![y_bar, neg]);
+                self.reduce_to(raw, b)
             }
 
             // --- Select backward (control flow) ---

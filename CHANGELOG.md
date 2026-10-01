@@ -1831,13 +1831,66 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
     scaling: two `nsl_tensor_len` calls, a division, a `mul_scalar` and one
     free. The three CSLA layerwise entries also buffer the mean's operand and
     result for the window replay.
-  - **Found, not fixed here.** The source-AD Add/Sub adjoint is `Identity`,
-    with no reduction to the operand's shape. Parameter gradients are reduced
-    to their parameter's shape at the end, which is why bias adds work. A
-    broadcast *intermediate*, such as the scalar in `x @ w + mean(x @ v)`,
-    receives the unreduced gradient. The ignored test
-    `a_mean_inside_a_forward_trains_like_its_gradient_under_source_ad`
-    reproduces it.
+  - **A mean inside a forward under source AD** also needed the broadcast
+    fix below; `a_mean_inside_a_forward_trains_like_its_gradient_under_source_ad`
+    runs with it.
+
+- **Source AD: a broadcast operand's gradient had the output's shape, not its
+  own.**
+  - **The bug.** The Add and Sub adjoints were `Identity` and `Negate`, and
+    the Div adjoints reduced nothing. A broadcast operand therefore received
+    the gradient at the output's shape. Two ways it showed:
+    - a `[4]` bias in `x @ w + b` got a `[3, 4]` gradient, and SGD's update
+      aborted on the length mismatch;
+    - a one-element `sum(x @ v)` added to `x @ w` got the whole `[3, 4]`
+      gradient element for element, so `v` trained as if it were `w`.
+  - **A second bug it hid.** A full `sum`'s backward was a plain copy and
+    never expanded its gradient to the operand's shape. It only worked
+    because the Add above it had not reduced, so the copy was already full
+    size. Reduced correctly, a one-element gradient reached the matmul
+    backward, which rejects a 0-d operand.
+  - **The fix.**
+    - The Add, Sub and Div adjoints sum each operand's gradient back to that
+      operand's shape with `reduce_to_shape`. When nothing was broadcast the
+      runtime returns the gradient itself.
+    - A full `sum` or `mean` expands its gradient to the operand's shape and
+      materializes it, as the tape's `SumReduce`/`MeanReduce` backward does.
+    - A float-literal or integer operand has no shape and keeps the
+      pass-through.
+    - `nsl_tensor_reduce_to_shape` now sums every broadcast dim. Its
+      leading-dims shortcut turned a `[3, 4]` gradient into `[4]` for a
+      `[1]` target. A gradient with fewer dims than its target (a 0-d seed
+      meeting a `[1]` operand) now passes through instead of indexing below
+      dim 0.
+  - **Saved tensors.** The Add/Sub backward now reads its operands' shapes off
+    the live tensors, and a full Sum's backward reads its operand's, so
+    `wrga_prune` and `ad_rules::saved_for_backward` list Add, Sub and full
+    Sum as saving their inputs. Forward values already live to the
+    end of the step, and CCR recomputes every interior value, so no extra
+    tensor is kept alive.
+  - **The gate.** `source_ad_broadcast_backward_gate` trains three fixtures
+    with SGD in both AD modes against an f64 reference:
+    - a broadcast bias and subtrahend;
+    - a `sum` intermediate;
+    - a broadcast `[4]` denominator.
+    Source AD is within 6.1e-8 of the reference on every parameter. Three
+    planted mutants each fail it: Add/Sub back to `Identity`/`Negate`, the
+    Div denominator unreduced, and the full sum's expand removed.
+  - **It also broke the CLIF fixture that stands in for a production train
+    block.** `mlp_adamw` (`x @ w1 + b1`, gradient accumulation 2) aborted
+    under `--source-ad`: the accumulation add met an `[8]` buffer and a
+    `[4, 8]` gradient. The snapshot tests only compile it, so nothing ran
+    it. It now runs and prints the same losses as tape AD to every digit.
+    Its `--transient-arena` plan had placed three slots that the run never
+    allocated into; it now places one.
+  - **Snapshots.** All 24 source-AD train CLIF snapshots change:
+    - each full-mean loss swaps one `nsl_tensor_clone` for
+      `nsl_tensor_shape`, `nsl_tensor_expand` and `nsl_tensor_contiguous`
+      (plus two frees);
+    - each Add and Sub adjoint gains an `nsl_tensor_reduce_to_shape` and its
+      free (1 to 4 per fixture);
+    - the CSLA layerwise entries also buffer the Sub's operands for the
+      window replay.
 
 - Mutation audit, slice 6 (roadmap item 5): **three gradient gates could not
   see a gradient's size.** Every mutant below was planted and run against the
