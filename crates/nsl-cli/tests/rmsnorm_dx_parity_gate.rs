@@ -247,6 +247,12 @@ fn fused_rmsnorm_gamma_backward_gpu_matches_reference() {
             .arg(&prog)
             .current_dir(&tmp)
             .env("NSL_STDLIB_PATH", root.join("stdlib"))
+            // Full-f32 cuBLAS for the `x @ w` that feeds the RMSNorm. Under the
+            // default TF32 (10-bit mantissa) this leg lands 3.8e-5 from the f64
+            // reference; with TF32 off, 7.1e-8 (measured 2026-09-30). The leg is
+            // about the fused RMSNorm kernels, so it holds them at f32 instead
+            // of loosening the tolerance to absorb the matmul's rounding.
+            .env("NSL_MATMUL_TF32", "0")
             .output()
             .expect("spawn nsl run");
         assert!(

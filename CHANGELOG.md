@@ -8,6 +8,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **A silicon gate for the packed (Stage C) fused attention, forward and
+  backward, against f64 oracles across KV tiles** (roadmap item 3,
+  `crates/nsl-codegen/tests/sdpa_fused_packed_gpu_parity.rs`). The packed
+  path's only silicon evidence was a one-epoch training run at seq 64 (one KV
+  tile, 8 optimizer steps), fused against decomposed, checkpoint-compared at
+  2e-2. Every GPU gate of the classic backward ran unmasked, against the
+  runtime's own CPU fallback.
+  - **Geometry:** seq 448 (seven 64-wide tiles, not a multiple of 128),
+    2 batches × 2 heads, head_dim 32, 100-token documents at a different
+    phase per row. The PTX and launch parameters are the ones a default
+    packed build embeds, including the Tier-B forward the runtime selects at
+    this length.
+  - **Three gates:**
+    - the forward (base and Tier-B) against the exact output and logsumexp;
+    - the backward, fed the oracle's O and logsumexp, against the exact and
+      f16-operand gradients;
+    - the forward feeding the backward, against the exact gradients, which
+      catches a disagreement between the two about the logsumexp or O.
+  - **Launch proof:** the launch census proves both backward phases ran, since
+    the FFI falls back to the CPU on any refusal, and the fused-launch
+    counters prove which forward variant ran.
+  - **Measured on the RTX PRO 4500 (sm_120), 2026-09-30, all within bounds:**
+    - forward (base and Tier-B): out 4.95e-4 of max |out| (bound 2e-3),
+      logsumexp 6.5e-4 absolute (bound 5e-3);
+    - backward against the f16-operand oracle: dV 8.1e-6 (bound 2e-5), dK
+      1.9e-5 and dQ 1.5e-4 (bound 5e-4); against the exact gradients 1.5e-3,
+      which is within 5e-3 and above the 1e-4 floor;
+    - forward then backward: 1.4e-3 from the exact gradients (bound 1e-2).
+  - `stage_c_packed_parity.rs::packed_fused_matches_decomposed_on_gpu` is now
+    `packed_fused_training_smoke_on_gpu`, documented as the integration
+    smoke it is. The three gates join the hardware-cert bundle.
+
 - **Parser table tests** (roadmap T1): 312 new `#[test]`s in `nsl-parser`,
   one per construct, bringing the crate from 33 tests to 345. The roadmap's
   Phase 1 exit criterion asked for at least 300.
@@ -1705,6 +1737,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
     - Reading a synthesized adapter field in NSL source needs a typed `let`
       (`let a: Tensor = m.lora_A_Toy_w__lora`); a bare `print(m.lora_A_…)`
       prints the handle as an integer.
+
+- **Source AD: the gradient of a `mean` was N times too large.**
+  - **The bug.** The Mean adjoint rule (`ad_rules.rs`) emitted a bare
+    broadcast of the output gradient. It was commented as "for source AD
+    analysis", with the 1/N left to "the tape-based runtime backward". But
+    source AD lowers these rules and never runs the tape, so every
+    `mean(...)` in a source-AD train step had a gradient N× too large.
+  - **Who it hit.** Stdlib `mse_loss` has its own op and was correct, as was
+    `sum(...) / n`. An inline `mean(d * d)`, which is the loss of every train
+    CLIF fixture, was not. Under SGD such a program trained uphill: a
+    one-weight-matrix model moved 32× too far per step at N = 32. AdamW is
+    invariant to a uniform gradient scale, so a mean-reduced loss trained
+    almost the same, and every gate that trains with AdamW missed it.
+  - **The fix.** The adjoint now scales the gradient by
+    `numel(result) / numel(input)` at run time (the new `mean_grad_scale`
+    passthrough) before the broadcast.
+  - **The gate.** `source_ad_mean_backward_gate` trains an inline mean loss
+    with SGD in both AD modes against an f64 reference. Source AD was 0.387
+    off before the fix and is 4.5e-8 after. A mean inside a forward
+    (`x @ w + mean(x @ v)`) is also checked against its reference under tape
+    AD.
+  - **Snapshots.** 23 of the 24 source-AD train CLIF snapshots gain the
+    scaling: two `nsl_tensor_len` calls, a division, a `mul_scalar` and one
+    free. The three CSLA layerwise entries also buffer the mean's operand and
+    result for the window replay.
+  - **Found, not fixed here.** The source-AD Add/Sub adjoint is `Identity`,
+    with no reduction to the operand's shape. Parameter gradients are reduced
+    to their parameter's shape at the end, which is why bias adds work. A
+    broadcast *intermediate*, such as the scalar in `x @ w + mean(x @ v)`,
+    receives the unreduced gradient. The ignored test
+    `a_mean_inside_a_forward_trains_like_its_gradient_under_source_ad`
+    reproduces it.
+
 - Mutation audit, slice 6 (roadmap item 5): **three gradient gates could not
   see a gradient's size.** Every mutant below was planted and run against the
   gate before and after; evidence in

@@ -1,0 +1,24 @@
+# Source-AD `mean` backward, as a loss (see source_ad_mean_backward_gate.rs).
+# The loss is an inline `mean(d * d)`, which source AD lowers through the
+# Mean adjoint (stdlib `mse_loss` has its own op and never did). Plain SGD, so
+# the trained weights are a function of the gradient's size.
+
+model Lin:
+    w: Tensor = (arange(16).reshape([4, 4])) * 0.05 - full([4, 4], 0.3)
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+let m = Lin()
+let x = (arange(12).reshape([3, 4])) * 0.1 - full([3, 4], 0.5)
+let y = (arange(12).reshape([3, 4])) * 0.2 - full([3, 4], 1.0)
+
+train(model = m, epochs = 4):
+    optimizer: SGD(lr = 0.1)
+    step(batch):
+        let d = m.forward(x) - y
+        let loss = mean(d * d)
+
+print("W_BEGIN")
+print(m.w)
+print("W_END")

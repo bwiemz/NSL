@@ -30,7 +30,7 @@
 
 use nsl_runtime::tensor::{
     nsl_tensor_free, nsl_tensor_matmul, nsl_tensor_to_device, test_build_tensor_2d_f32,
-    test_read_tensor_f64,
+    test_read_tensor_f32,
 };
 
 const N: usize = 2048;
@@ -98,7 +98,8 @@ fn measure() -> Probe {
 
     let c = nsl_tensor_matmul(a, b, 0);
     let c_cpu = nsl_tensor_to_device(c, 0);
-    let got = test_read_tensor_f64(c_cpu);
+    // The download keeps the device's f32 (C5 step 2a); compare in f64.
+    let got: Vec<f64> = test_read_tensor_f32(c_cpu).into_iter().map(f64::from).collect();
     let row = 7usize;
     let want = cpu_ref_row(&a_data, &b_data, row, N);
     let rms = (want.iter().map(|w| w * w).sum::<f64>() / want.len() as f64).sqrt();

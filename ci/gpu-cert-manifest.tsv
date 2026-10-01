@@ -115,11 +115,12 @@ crates/nsl-cli/tests/sampling_device_gate.rs	returned_sampling_results_do_not_do
 crates/nsl-cli/tests/sampling_device_gate.rs	topk_dicts_no_longer_strand	gpu	requires CUDA GPU
 crates/nsl-cli/tests/scalar_immediate_fold_gate.rs	scalar_immediates_bit_exact_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/sdpa_decorator_free_gpu_backward.rs	decorator_free_sdpa_backward_dispatches_on_gpu	gpu	requires a CUDA-capable GPU
+crates/nsl-cli/tests/source_ad_mean_backward_gate.rs	a_mean_inside_a_forward_trains_like_its_gradient_under_source_ad	broken	blocked: the source-AD Add/Sub adjoint does not reduce a broadcast operand (see the doc comment)
 crates/nsl-cli/tests/sr_bf16_gate.rs	srbf16_batched_step_matches_per_param_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/sr_bf16_gate.rs	srbf16_e2e_deterministic_and_sane_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/sr_bf16_gate.rs	srbf16_tracks_f32_baseline_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/sr_bf16_gate.rs	srbf16_parameter_surface_is_accounted_as_weights_gpu	gpu	requires GPU
-crates/nsl-cli/tests/stage_c_packed_parity.rs	packed_fused_matches_decomposed_on_gpu	gpu	requires CUDA GPU (two real training runs)
+crates/nsl-cli/tests/stage_c_packed_parity.rs	packed_fused_training_smoke_on_gpu	gpu	requires CUDA GPU (two real training runs)
 crates/nsl-cli/tests/stage_c_packed_parity.rs	wggo_reports_fused_consumption_on_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/stream_migration_gpu_gate.rs	compute_stream_matches_legacy_null_stream_bit_exact	gpu	requires a CUDA GPU (2 CSHA training runs)
 crates/nsl-cli/tests/stream_ordering_gpu_gate.rs	stream_ordered_matches_eager_bit_exact	gpu	requires CUDA GPU (2 training runs)
@@ -323,6 +324,9 @@ crates/nsl-codegen/tests/pca_tier_b_sass_baselines.rs	regenerate_baseline_32_32_
 crates/nsl-codegen/tests/pca_tier_b_sass_baselines.rs	regenerate_baseline_64_64_64	generator	baseline generator — run with --ignored to regenerate
 crates/nsl-codegen/tests/sdpa_fused_forward_gpu_parity.rs	sdpa_fused_forward_unmasked_matches_oracle	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/sdpa_fused_forward_gpu_parity.rs	sdpa_fused_forward_segment_masked_matches_oracle	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/sdpa_fused_packed_gpu_parity.rs	packed_forward_matches_the_oracle_across_kv_tiles	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/sdpa_fused_packed_gpu_parity.rs	packed_backward_is_the_f16_operand_gradient_across_kv_tiles	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/sdpa_fused_packed_gpu_parity.rs	packed_forward_then_backward_is_the_attention_gradient	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/sdpa_mma_forward_gpu_parity.rs	mma_multitile_hd64_causal	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/sdpa_mma_forward_gpu_parity.rs	mma_multitile_hd64_noncausal	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/sdpa_mma_forward_gpu_parity.rs	scalar_pinned_multitile_hd64_causal	gpu	requires CUDA GPU

@@ -896,6 +896,11 @@ impl AdjointGenerator {
                 self.emit_op(PrimalOp::Mul, vec![v, scale])
             }
             AdjointExpr::Broadcast(v) => self.emit_op(PrimalOp::Broadcast, vec![v]),
+            AdjointExpr::MeanBackward(v, input, result) => {
+                let scaled =
+                    self.emit_op(PrimalOp::Passthrough("mean_grad_scale".into()), vec![v, input, result]);
+                self.emit_op(PrimalOp::Broadcast, vec![scaled])
+            }
             AdjointExpr::ScaleBroadcast(v, n) => {
                 let scale = self.emit_constant(n);
                 let scaled = self.emit_op(PrimalOp::Mul, vec![v, scale]);

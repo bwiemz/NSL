@@ -46,6 +46,9 @@ crates/nsl-codegen/tests/pca_tier_a_forward_correctness.rs	tier_a_forward_unequa
 crates/nsl-codegen/tests/pca_per_doc_cta_forward_correctness.rs	per_doc_cta_four_short_docs_matches_segmented_reference
 crates/nsl-codegen/tests/sdpa_fused_forward_gpu_parity.rs	sdpa_fused_forward_segment_masked_matches_oracle
 crates/nsl-codegen/tests/sdpa_mma_forward_gpu_parity.rs	mma_multitile_hd64_causal
+# The decorator-free packed forward a packed train step launches (base and
+# Tier-B-on), across seven KV tiles, against an f64 oracle:
+crates/nsl-codegen/tests/sdpa_fused_packed_gpu_parity.rs	packed_forward_matches_the_oracle_across_kv_tiles
 
 # ── 02  packed FlashAttention backward at head_dim <= 32 (PCA gates are packed at hd=32; the two flash_attention_backward_gpu gates are the UNPACKED small-hd control) ──
 crates/nsl-codegen/tests/pca_tier_a_backward_correctness.rs	tier_a_backward_unequal_segments_matches_unpacked_reference
@@ -53,6 +56,12 @@ crates/nsl-codegen/tests/pca_tier_a_backward_correctness.rs	tier_a_backward_batc
 crates/nsl-codegen/tests/pca_per_doc_cta_backward_correctness.rs	per_doc_cta_backward_four_docs_matches_cpu_reference
 crates/nsl-codegen/tests/flash_attention_backward_gpu.rs	plain_bwd_multitile_heads4_hd32_scalar
 crates/nsl-codegen/tests/flash_attention_backward_gpu.rs	mma_bwd_multitile_heads4_hd32
+# The Tier-A and per-doc gates above test the CSHA v2 and per-document CTA
+# kernels. These test the `_segmask` classic backward a decorator-free packed
+# step launches, raw gradients against f64 oracles, alone and fed by the
+# fused forward:
+crates/nsl-codegen/tests/sdpa_fused_packed_gpu_parity.rs	packed_backward_is_the_f16_operand_gradient_across_kv_tiles
+crates/nsl-codegen/tests/sdpa_fused_packed_gpu_parity.rs	packed_forward_then_backward_is_the_attention_gradient
 
 # ── 03  SwiGLU fused backward -- and that it LAUNCHES on the device (kernel-profile proof + kill-switch control) ──
 crates/nsl-cli/tests/swiglu_fusion_gate.rs	swiglu_fused_backward_gpu_deterministic_and_matches_reference

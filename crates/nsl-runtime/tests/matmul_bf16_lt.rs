@@ -35,7 +35,7 @@
 
 use nsl_runtime::tensor::{
     nsl_tensor_free, nsl_tensor_matmul, nsl_tensor_to_device, nsl_tensor_wgrad_accum,
-    test_build_tensor_2d_f32, test_read_tensor_f64,
+    test_build_tensor_2d_f32, test_read_tensor_f32,
 };
 use nsl_runtime::{test_lt_matmul_reset, test_lt_matmul_stats};
 
@@ -73,10 +73,9 @@ fn gpu_2d(rows: usize, cols: usize, data: &[f32]) -> i64 {
 }
 
 fn read_gpu(t: i64) -> Vec<f64> {
-    // GPU->CPU migration converts f32 -> f64 by the params ABI; the reader
-    // requires a CPU f64 tensor.
+    // The download keeps the device's f32 (C5 step 2a); widen for the f64 checks.
     let cpu = nsl_tensor_to_device(t, 0);
-    let out = test_read_tensor_f64(cpu);
+    let out: Vec<f64> = test_read_tensor_f32(cpu).into_iter().map(f64::from).collect();
     if cpu != t {
         nsl_tensor_free(cpu);
     }

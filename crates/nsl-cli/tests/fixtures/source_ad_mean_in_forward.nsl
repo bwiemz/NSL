@@ -1,0 +1,30 @@
+# Source-AD `mean` backward, inside a forward (see source_ad_mean_backward_gate.rs).
+# `mean(x @ v)` feeds one path of the prediction and `x @ w` the other, so a
+# mean adjoint off by its 1/N scales only v's gradient: the direction is wrong,
+# which no optimizer's scale invariance hides. The loss goes through stdlib
+# `mse_loss` (its own op) so only the inner mean is under test.
+from nsl.nn.losses import mse_loss
+
+model Two:
+    w: Tensor = (arange(16).reshape([4, 4])) * 0.05 - full([4, 4], 0.3)
+    v: Tensor = ones([4, 4]) * 0.1
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w + mean(x @ self.v)
+
+let m = Two()
+# Positive inputs: a centred x cancels in v's gradient and v would barely move.
+let x = (arange(12).reshape([3, 4])) * 0.1 + full([3, 4], 0.1)
+let y = (arange(12).reshape([3, 4])) * 0.2 - full([3, 4], 1.0)
+
+train(model = m, epochs = 4):
+    optimizer: SGD(lr = 0.1)
+    step(batch):
+        let loss = mse_loss(m.forward(x), y)
+
+print("W_BEGIN")
+print(m.w)
+print("W_END")
+print("V_BEGIN")
+print(m.v)
+print("V_END")

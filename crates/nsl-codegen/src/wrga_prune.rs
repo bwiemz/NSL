@@ -82,6 +82,13 @@ pub(crate) fn save_requirements(op: &PrimalOp) -> SaveRequirements {
             needs_inputs: true,
             needs_output: false,
         },
+        // The Mean adjoint scales the gradient by len(result) / len(input),
+        // read at run time from the mean's operand and result
+        // (`ad_rules.rs`, `MeanBackward`), so both must survive to backward.
+        Mean { .. } => SaveRequirements {
+            needs_inputs: true,
+            needs_output: true,
+        },
         // Everything else: conservative — no saves.
         _ => SaveRequirements {
             needs_inputs: false,
@@ -333,6 +340,14 @@ pub fn glob_match(pattern: &str, candidate: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Mean adjoint reads its operand and its result (the 1/N ratio), so
+    /// a pass deciding what to keep for backward must keep both.
+    #[test]
+    fn mean_saves_its_operand_and_result() {
+        let req = save_requirements(&PrimalOp::Mean { dim: None });
+        assert!(req.needs_inputs && req.needs_output);
+    }
     use crate::wengert::{PrimalOp, WengertList, WengertOp};
     use std::collections::HashMap;
 

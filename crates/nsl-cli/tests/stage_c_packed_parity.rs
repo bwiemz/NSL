@@ -12,11 +12,16 @@
 //!   segment-aware f32 CPU reference), so agreement here validates the
 //!   Stage-C CPU reference backward against the Stage-B oracle.
 //!
-//! * `packed_fused_matches_decomposed_on_gpu` (cuda, ignored) — the real
-//!   Stage C gate: the same packed program on the GPU with the fused
+//! * `packed_fused_training_smoke_on_gpu` (cuda, ignored) — an integration
+//!   smoke: the same packed program on the GPU with the fused
 //!   segment-masked flash kernels ON (default) vs OFF
-//!   (`NSL_SDPA_FUSED_DISABLE=1`), checkpoint-compared. Launch-level proof
-//!   comes from the once-per-process `sdpa fused forward: launched` marker.
+//!   (`NSL_SDPA_FUSED_DISABLE=1`). Both must train, the fused run must
+//!   launch the fused forward (the once-per-process `sdpa fused forward:
+//!   launched` marker), and the checkpoints must neither diverge nor be
+//!   identical. It is not the numerics gate: 8 optimizer steps at seq 64
+//!   (one KV tile) average a gradient error away. The kernels' outputs and raw
+//!   gradients are gated against f64 oracles, across KV tiles, by
+//!   `crates/nsl-codegen/tests/sdpa_fused_packed_gpu_parity.rs`.
 //!
 //! * `wggo_reports_fused_consumption_on_gpu` (cuda, ignored) — under
 //!   `--pretrain-optimized` the plan's segment_id packing decision must be
@@ -245,14 +250,15 @@ fn gpu_present() -> bool {
         .unwrap_or(false)
 }
 
-/// GPU: fused segment-masked kernels vs the decomposed fallback, same
-/// program, same data. Checkpoints agree within a fused-flash-vs-decomposed
-/// f32 tolerance; the once-per-process launch marker proves the fused path
-/// actually fired (and that the kill-switch actually disabled it).
+/// GPU integration smoke: fused segment-masked kernels vs the decomposed
+/// fallback, same program, same data. Both train; the once-per-process
+/// launch marker proves the fused path fired (and that the kill-switch
+/// disabled it); the checkpoints stay within 2e-2 of each other and are not
+/// identical. The numerics are gated by `sdpa_fused_packed_gpu_parity.rs`.
 #[cfg(feature = "cuda")]
 #[test]
 #[ignore = "requires CUDA GPU (two real training runs)"]
-fn packed_fused_matches_decomposed_on_gpu() {
+fn packed_fused_training_smoke_on_gpu() {
     if !gpu_present() {
         eprintln!("[skip] no GPU visible");
         return;
@@ -287,7 +293,8 @@ fn packed_fused_matches_decomposed_on_gpu() {
     let (max_diff, worst) = checkpoint_max_diff(&save_fused, &save_plain);
     assert!(
         max_diff < 2e-2,
-        "fused vs decomposed GPU checkpoints diverged: max_diff={max_diff:.3e} at {worst}"
+        "fused vs decomposed GPU checkpoints diverged: max_diff={max_diff:.3e} at {worst} \
+         (a smoke bound; run sdpa_fused_packed_gpu_parity for the kernels' numerics)"
     );
     // And they must not be trivially identical — that would mean the fused
     // path silently declined every step despite printing nothing.
