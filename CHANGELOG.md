@@ -1689,6 +1689,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
     to an f64 reference trajectory started from them. Both modes are within
     6e-8 everywhere. Two planted mutants each fail it: source AD dropping
     adapter gradients again, and adapters left out of the param list.
+  - **On the device.** The WRGA adapter suites, run on sm_120 with
+    `--features cuda --include-ignored`, are 26/26: both gate tests, the
+    fused LoRA/GatedLoRA/IA³ fixtures, and `wrga_gatedlora_backward_trigger`.
+    `cranelift_and_source_ad_see_same_rewritten_ast` passes too. It had been
+    parked as `broken` for a segfault on a top-level read of an adapter
+    field after a train block; it is now a `requires CUDA GPU` cert gate.
   - **Snapshot.** In `wrga_lora_source_ad` the adapter init moves from the
     train block into the `Toy` constructor. The train block gains the two
     adapters' param-list entries and gradient alignment.
