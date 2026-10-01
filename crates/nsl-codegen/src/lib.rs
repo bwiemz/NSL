@@ -712,6 +712,21 @@ pub struct WrgaDecoratorConfig {
 pub struct FreezeDecoratorConfig {
     pub exclude: Vec<String>,
     pub include: Vec<String>,
+    /// What the `@freeze` decorates. The CLI always sets it; `None` (a
+    /// hand-built config) applies the patterns to whichever model a train
+    /// block trains.
+    pub scope: Option<FreezeScope>,
+}
+
+/// The binding or model an `@freeze` decorates (`nsl_semantic::wrga::FreezeTarget`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FreezeScope {
+    /// `@freeze` on `let m = Toy()`: patterns apply to the parameters of the
+    /// model that `let` statement (`stmt`) bound, when a train block trains it.
+    Binding { var: String, stmt: nsl_ast::NodeId },
+    /// `@freeze` on `model Toy:`: patterns apply below every `Toy` instance
+    /// the trained model holds, itself included.
+    Model(String),
 }
 
 #[derive(Debug, Clone)]

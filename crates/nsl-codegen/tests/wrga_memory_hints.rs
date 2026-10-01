@@ -58,6 +58,7 @@ fn wrga_memory_hints_reduce_or_maintain_slot_count() {
                 freeze: vec![FreezeDecoratorConfig {
                     include: vec!["m.w1".into(), "m.w2".into()],
                     exclude: vec![],
+                    scope: None,
                 }],
                 ..Default::default()
             }),

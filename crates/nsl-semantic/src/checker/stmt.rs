@@ -671,11 +671,38 @@ impl<'a> TypeChecker<'a> {
                                 let resolve = |s: nsl_ast::Symbol| -> String {
                                     self.interner.resolve(s.0).unwrap_or("").to_string()
                                 };
-                                let cfg = crate::wrga::validate_freeze_decorator(
+                                let mut cfg = crate::wrga::validate_freeze_decorator(
                                     deco,
                                     &resolve,
                                     &mut self.diagnostics,
                                 );
+                                // Scope the patterns to what the decorator
+                                // sits on, so a freeze on one model cannot
+                                // reach another model's same-named weights.
+                                cfg.target = match &stmt.kind {
+                                    StmtKind::ModelDef(md) => {
+                                        Some(crate::wrga::FreezeTarget::Model(resolve(md.name)))
+                                    }
+                                    StmtKind::VarDecl { pattern, .. } => match &pattern.kind {
+                                        nsl_ast::pattern::PatternKind::Ident(sym) => {
+                                            Some(crate::wrga::FreezeTarget::Binding {
+                                                name: resolve(*sym),
+                                                stmt: stmt.id,
+                                            })
+                                        }
+                                        _ => None,
+                                    },
+                                    _ => None,
+                                };
+                                if cfg.target.is_none() {
+                                    self.diagnostics.push(
+                                        Diagnostic::error(
+                                            "@freeze on a let-binding must bind a single name"
+                                                .to_string(),
+                                        )
+                                        .with_label(deco.span, "cannot tell which model this freezes"),
+                                    );
+                                }
                                 self.freeze_configs.push(cfg);
                             }
                         }

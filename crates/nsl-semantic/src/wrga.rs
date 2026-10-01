@@ -192,6 +192,20 @@ pub fn validate_wrga_decorator(
     })
 }
 
+/// What an `@freeze` decorates: the `let` binding it sits on, or the model
+/// definition. Its patterns apply only to that binding's parameters, or to
+/// every instance of that model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FreezeTarget {
+    /// `@freeze` on `let m = Toy()`: the variable name and that `let`
+    /// statement's id. The id is what ties the freeze to this binding: another
+    /// `let m` (in another function, or shadowing this one) is a different
+    /// model.
+    Binding { name: String, stmt: nsl_ast::NodeId },
+    /// `@freeze` on `model Toy:`: the model name.
+    Model(String),
+}
+
 /// Validated `@freeze(exclude=[...], include=[...])` configuration.
 #[derive(Debug, Clone, Default)]
 pub struct FreezeConfig {
@@ -200,6 +214,8 @@ pub struct FreezeConfig {
     /// Patterns to *include* (freeze explicitly); cannot be combined with exclude.
     pub include: Vec<String>,
     pub span: Option<Span>,
+    /// What the decorator sits on; `None` only before the checker sets it.
+    pub target: Option<FreezeTarget>,
 }
 
 pub fn validate_freeze_decorator(

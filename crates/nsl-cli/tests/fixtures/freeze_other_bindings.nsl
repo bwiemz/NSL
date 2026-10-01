@@ -1,0 +1,46 @@
+# @freeze reaches only what it decorates (see freeze_decorator_gate.rs). Two
+# other bindings are frozen -- one of the trained model's own type, with the
+# same field names -- and neither freeze touches the trained `m`, whose w1 and
+# w2 both train. `include=["v"]` matches nothing in `m`, and is not refused.
+from nsl.nn.losses import mse_loss
+
+model Two:
+    w1: Tensor = randn([4, 4]) * 0.3
+    w2: Tensor = randn([4, 4]) * 0.3
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return (x @ self.w1) @ self.w2
+
+model Other:
+    v: Tensor = ones([4, 4])
+
+@freeze(include=["v"])
+let other = Other()
+@freeze
+let twin = Two()
+let m = Two()
+let w1_0: Tensor = m.w1
+let w2_0: Tensor = m.w2
+print("W1_0_BEGIN")
+print(w1_0)
+print("W1_0_END")
+print("W2_0_BEGIN")
+print(w2_0)
+print("W2_0_END")
+
+let x = (arange(12).reshape([3, 4])) * 0.1 + full([3, 4], 0.1)
+let y = (arange(12).reshape([3, 4])) * 0.2 - full([3, 4], 1.0)
+
+train(model = m, epochs = 4):
+    optimizer: SGD(lr = 0.1)
+    step(batch):
+        let loss = mse_loss(m.forward(x), y)
+
+let w1: Tensor = m.w1
+let w2: Tensor = m.w2
+print("W1_BEGIN")
+print(w1)
+print("W1_END")
+print("W2_BEGIN")
+print(w2)
+print("W2_END")

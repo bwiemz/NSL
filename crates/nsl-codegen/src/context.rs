@@ -216,6 +216,10 @@ pub enum SelfResolution {
 /// Per-function compilation state (variables, loops).
 pub struct FuncState {
     pub variables: HashMap<Symbol, (Variable, cl_types::Type)>,
+    /// The `let` statement that last bound each name in this function: a
+    /// binding-scoped `@freeze` applies to a train block's model only when
+    /// that model's variable was bound by the decorated statement.
+    pub binding_stmts: HashMap<Symbol, nsl_ast::NodeId>,
     /// Scope-aware liveness for FUNCTION-VALUED local bindings (nested
     /// `fn`s, lambda / fn-typed `let`s, params). `variables` is
     /// function-flat by Cranelift-frontend design and NEVER unbinds, but
@@ -335,6 +339,7 @@ impl FuncState {
     pub fn new() -> Self {
         FuncState {
             variables: HashMap::new(),
+            binding_stmts: HashMap::new(),
             live_fn_bindings: HashMap::new(),
             fn_binding_scopes: Vec::new(),
             closure_info: HashMap::new(),

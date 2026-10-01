@@ -163,7 +163,15 @@ impl Compiler<'_> {
         let mut grad_skipped_no_primal = 0usize;
         let mut grad_skipped_no_adjoint = 0usize;
         let mut grad_skipped_no_lowered = 0usize;
+        let mut grad_frozen = 0usize;
         for (param_name, vid) in extractor.named_param_var_ids() {
+            // An `@freeze`-frozen parameter is not in the runtime param_list
+            // and gets no optimizer step; its gradient is not needed, so the
+            // dead-gradient pass already dropped it.
+            if self.is_frozen_param_path(param_name) {
+                grad_frozen += 1;
+                continue;
+            }
             match classify_source_ad_param_name(param_name, &tensor_param_paths) {
                 SourceAdParamDiagnosticKind::Trainable => {
                     seen_trainable_tensor_params.insert(param_name.clone());
@@ -280,7 +288,7 @@ impl Compiler<'_> {
             .len()
             .saturating_sub(seen_trainable_tensor_params.len());
         nsl_log::nsl_log!(WARN, "nsl", 
-            "[nsl] source AD gradient summary: {}/{} trainable tensor params connected, {} missing-from-forward, {} no-primal, {} no-adjoint, {} cascade-skip, {} ignored config-tensor, {} ignored non-tensor",
+            "[nsl] source AD gradient summary: {}/{} trainable tensor params connected, {} missing-from-forward, {} no-primal, {} no-adjoint, {} cascade-skip, {} ignored config-tensor, {} ignored non-tensor, {} frozen",
             grad_connected,
             trainable_tensor_param_paths.len(),
             grad_missing_trainable,
@@ -289,6 +297,7 @@ impl Compiler<'_> {
             grad_skipped_no_lowered,
             grad_ignored_config_tensor,
             grad_ignored_non_tensor,
+            grad_frozen,
         );
         grads_inner // value returned from the `if !fase_hook_active` arm
         } else {

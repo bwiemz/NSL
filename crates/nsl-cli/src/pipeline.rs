@@ -146,6 +146,14 @@ pub(crate) fn module_data_to_wrga_inputs(
             .map(|c| FreezeDecoratorConfig {
                 exclude: c.exclude.clone(),
                 include: c.include.clone(),
+                scope: c.target.as_ref().map(|t| match t {
+                    nsl_semantic::wrga::FreezeTarget::Binding { name, stmt } => {
+                        nsl_codegen::FreezeScope::Binding { var: name.clone(), stmt: *stmt }
+                    }
+                    nsl_semantic::wrga::FreezeTarget::Model(m) => {
+                        nsl_codegen::FreezeScope::Model(m.clone())
+                    }
+                }),
             })
             .collect(),
         adapter: m

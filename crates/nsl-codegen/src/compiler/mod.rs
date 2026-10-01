@@ -896,6 +896,10 @@ pub struct Compiler<'a> {
     /// Consumed inside `compile_train_step_with_source_ad` when a `@train` block
     /// is lowered.  `None` means WRGA is disabled for this build.
     pub wrga_inputs: Option<crate::WrgaInputs>,
+    /// The model the train block being compiled trains, recorded by
+    /// `emit_model_params` and cleared when the block ends: what a scoped
+    /// `@freeze` is checked against (`Compiler::is_frozen_param_path`).
+    pub(crate) freeze_ctx: Option<crate::stmt::TrainedModel>,
 
     // ── CFIE side-channel (Tier-A wiring) ────────────────────────────
     /// `@cfie(mode=..., target=...)` decorator values captured in the
@@ -1290,6 +1294,7 @@ impl<'a> Compiler<'a> {
             fused_kl_ce_fwd_saves: HashMap::new(),
             fused_kl_ce_bwd_cache: HashMap::new(),
             wrga_inputs: options.wrga.inputs.clone(),
+            freeze_ctx: None,
             cfie_decorator_mode: None,
             fase_decorator: None,
             cfie_decorator_target: None,

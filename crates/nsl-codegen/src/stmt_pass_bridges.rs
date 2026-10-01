@@ -338,41 +338,22 @@ pub(crate) fn invoke_wrga_if_enabled(
         .map(|c| c.mode)
         .unwrap_or(nsl_ast::block::WrgaMode::Auto);
 
-    // Collect param names present in the Wengert list so we can synthesise
-    // the "complement" of an `@freeze(include=...)` spec.  `WrgaInput` only
-    // takes a "trainable" allowlist, so `include` (= "these are frozen") is
-    // translated to "everything else is trainable".
-    let mut param_names: Vec<String> = Vec::new();
-    for op in &list.ops {
-        if let crate::wengert::PrimalOp::Param(name) = &op.op {
-            param_names.push(name.clone());
-        }
-    }
-
+    // `WrgaInput` takes a "trainable" allowlist. With an `@freeze`, it is
+    // every parameter of the Wengert list that `is_frozen_param_path` does not
+    // freeze: the same predicate that keeps a frozen parameter out of the
+    // train block's param_list, so WRGA's analysis and the training agree.
     let mut trainable_owned: Vec<String> = Vec::new();
-    for f in &inputs.freeze {
-        // `exclude` semantics: these patterns mark params to *keep* trainable.
-        for pat in &f.exclude {
-            trainable_owned.push(pat.clone());
-        }
-        // `include` semantics: these patterns mark params to *freeze*; the
-        // complement is trainable.  `wrga_prune::glob_match` is the pattern
-        // language.
-        if !f.include.is_empty() {
-            for name in &param_names {
-                let frozen = f
-                    .include
-                    .iter()
-                    .any(|pat| crate::wrga_prune::glob_match(pat, name));
-                if !frozen {
-                    trainable_owned.push(name.clone());
-                }
+    if inputs.freeze.is_empty() {
+        // No freeze config at all → everything trainable.
+        trainable_owned.push("*".to_string());
+    } else {
+        for op in &list.ops {
+            if let crate::wengert::PrimalOp::Param(name) = &op.op
+                && !compiler.is_frozen_param_path(name)
+            {
+                trainable_owned.push(name.clone());
             }
         }
-    }
-    if trainable_owned.is_empty() && inputs.freeze.is_empty() {
-        // No freeze config at all → default to "everything trainable".
-        trainable_owned.push("*".to_string());
     }
     // Deduplicate to keep the allowlist compact.
     trainable_owned.sort();

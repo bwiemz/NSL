@@ -61,6 +61,7 @@ fn freeze_eliminates_frozen_param_from_backward_live() {
                 freeze: vec![FreezeDecoratorConfig {
                     include: vec!["m.w".into()],
                     exclude: vec![],
+                    scope: None,
                 }],
                 ..Default::default()
             }),

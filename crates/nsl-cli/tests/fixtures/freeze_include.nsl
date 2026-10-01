@@ -1,0 +1,39 @@
+# @freeze (see freeze_decorator_gate.rs): `include=["w1"]` freezes `m.w1` (a pattern may omit the model variable).
+# Both weights are random draws, printed so the test can start its reference
+# from them; only w2 trains.
+from nsl.nn.losses import mse_loss
+
+model Two:
+    w1: Tensor = randn([4, 4]) * 0.3
+    w2: Tensor = randn([4, 4]) * 0.3
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return (x @ self.w1) @ self.w2
+
+@freeze(include=["w1"])
+let m = Two()
+let w1_0: Tensor = m.w1
+let w2_0: Tensor = m.w2
+print("W1_0_BEGIN")
+print(w1_0)
+print("W1_0_END")
+print("W2_0_BEGIN")
+print(w2_0)
+print("W2_0_END")
+
+let x = (arange(12).reshape([3, 4])) * 0.1 + full([3, 4], 0.1)
+let y = (arange(12).reshape([3, 4])) * 0.2 - full([3, 4], 1.0)
+
+train(model = m, epochs = 4):
+    optimizer: SGD(lr = 0.1)
+    step(batch):
+        let loss = mse_loss(m.forward(x), y)
+
+let w1: Tensor = m.w1
+let w2: Tensor = m.w2
+print("W1_BEGIN")
+print(w1)
+print("W1_END")
+print("W2_BEGIN")
+print(w2)
+print("W2_END")
