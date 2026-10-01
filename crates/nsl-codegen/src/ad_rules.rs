@@ -949,7 +949,6 @@ pub fn saved_for_backward(op: &PrimalOp) -> SavedRequirement {
         | PrimalOp::Transpose { .. }
         | PrimalOp::Reshape { .. }
         | PrimalOp::Sum { .. }
-        | PrimalOp::Mean { .. }
         | PrimalOp::Broadcast
         | PrimalOp::Concat { .. }
         | PrimalOp::Split { .. }
@@ -1001,6 +1000,10 @@ pub fn saved_for_backward(op: &PrimalOp) -> SavedRequirement {
 
         // Non-differentiable — nothing needed
         PrimalOp::Condition(_) => SavedRequirement::Nothing,
+        // `MeanBackward` reads the mean's operand AND its result (their
+        // lengths give the 1/N); this enum has no "both", and the live table
+        // that drives saving is `wrga_prune::save_requirements`.
+        PrimalOp::Mean { .. } => SavedRequirement::Inputs,
         _ => SavedRequirement::Nothing,
     }
 }
