@@ -1845,6 +1845,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
     the backward skipped the kept size-1 dim without stepping past it. A
     reverted fix makes `sum_dim_keepdim` read an out-of-bounds denormal.
 
+- **Source-AD LayerNorm: wrong `dx`, unreduced `db`, ignored eps**
+  (`layernorm`, `layernorm_eps`, `rmsnorm_eps` delisted; `layernorm_3d`
+  added):
+  - `dx` was the normalization backward of `ȳ`, not of `ȳ·γ`: right only
+    for γ = 1. `LayerNormBackward` now takes γ (its two unused slots are
+    gone).
+  - `db` flowed through unreduced, at the input's shape (`[3, 4]` for a
+    `[4]` β); it is now reduced to β's shape.
+  - The extractor built every `layernorm`/`rmsnorm` with eps 1e-5. A
+    literal eps, or one that resolves to a constant, is now baked in.
+    **Still open:** an eps read from a model field (`self.eps`, as the
+    stdlib `LayerNorm`/`RMSNorm` modules pass it) cannot be read at compile
+    time and stays 1e-5 -- the modules' default, but source AD ignores a
+    reassigned `m.eps` that the tape honours. Certificate
+    `layernorm_field_eps` pins it as a known source-AD failure.
+
 - **`@freeze` froze nothing.** The decorator was validated and handed to
   WRGA's analysis, and nothing in the train block read it. A frozen weight
   stayed in the optimizer's parameter list and trained exactly as if

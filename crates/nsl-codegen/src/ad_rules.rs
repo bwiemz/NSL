@@ -157,9 +157,10 @@ pub enum AdjointExpr {
     LogSoftmaxBackward(VarId, VarId, i64),
 
     // Normalization backward
-    /// LayerNorm backward: 3 adjoint components for input, gamma, beta
-    /// args: (grad, input, mean_unused, rstd_unused, eps)
-    LayerNormBackward(VarId, VarId, VarId, VarId, f64),
+    /// LayerNorm INPUT gradient. args: (grad, input, gamma, eps). For
+    /// `y = gamma * x_hat + beta` the input gradient is the plain
+    /// normalization backward of `grad * gamma`; `None` means no gamma.
+    LayerNormBackward(VarId, VarId, Option<VarId>, f64),
     /// BatchNorm backward: similar to LayerNorm but over batch dimension
     /// args: (grad, input, mean_unused, rstd_unused, eps)
     BatchNormBackward(VarId, VarId, VarId, VarId, f64),
@@ -512,7 +513,7 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             let input = op.inputs[0];
             let mut adjoints = vec![InputAdjoint {
                 input_var: input,
-                expr: AdjointExpr::LayerNormBackward(output_bar, input, op.result, op.result, *eps),
+                expr: AdjointExpr::LayerNormBackward(output_bar, input, op.inputs.get(1).copied(), *eps),
             }];
             // gamma gradient: grad * x_hat (normalized input, NOT the output)
             if op.inputs.len() > 1 {
@@ -521,11 +522,12 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
                     expr: AdjointExpr::NormGammaBackward(output_bar, input, *eps, -1, op.inputs[1]),
                 });
             }
-            // beta gradient: identity (grad flows through)
+            // beta gradient: grad summed over every dim beta was broadcast
+            // across (it used to flow through unreduced, at the input's shape)
             if op.inputs.len() > 2 {
                 adjoints.push(InputAdjoint {
                     input_var: op.inputs[2],
-                    expr: AdjointExpr::Identity(output_bar),
+                    expr: AdjointExpr::ReduceToShape(output_bar, op.inputs[2]),
                 });
             }
             adjoints
@@ -555,9 +557,7 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             } else {
                 adjoints.push(InputAdjoint {
                     input_var: input,
-                    expr: AdjointExpr::LayerNormBackward(
-                        output_bar, input, op.result, op.result, *eps,
-                    ),
+                    expr: AdjointExpr::LayerNormBackward(output_bar, input, None, *eps),
                 });
             }
             adjoints
@@ -1170,7 +1170,12 @@ pub fn ad_cert_status(op: &PrimalOp) -> AdCertStatus {
         PrimalOp::Gather { .. } => Certified(&["gather"]),
         PrimalOp::ScatterAdd { .. } => AdjointOnly("the Gather and Embedding adjoints"),
         PrimalOp::Embedding => Certified(&["embedding"]),
-        PrimalOp::LayerNorm { .. } => Certified(&["layernorm", "layernorm_eps"]),
+        PrimalOp::LayerNorm { .. } => Certified(&[
+            "layernorm",
+            "layernorm_eps",
+            "layernorm_3d",
+            "layernorm_field_eps",
+        ]),
         PrimalOp::RMSNorm { .. } => Certified(&["rmsnorm", "rmsnorm_eps"]),
         PrimalOp::BatchNorm { .. } => {
             Unreachable("the extractor maps `batch_norm`, but no builtin or stdlib fn defines it")
@@ -1911,13 +1916,13 @@ mod tests {
         );
         assert!(matches!(
             adj[0].expr,
-            AdjointExpr::LayerNormBackward(100, 0, 3, 3, _)
+            AdjointExpr::LayerNormBackward(100, 0, Some(1), _)
         ));
         assert!(matches!(
             adj[1].expr,
             AdjointExpr::NormGammaBackward(100, 0, _, -1, 1)
         )); // gamma grad
-        assert!(matches!(adj[2].expr, AdjointExpr::Identity(100))); // beta grad
+        assert!(matches!(adj[2].expr, AdjointExpr::ReduceToShape(100, 2))); // beta grad
         assert_eq!(
             saved_for_backward(&PrimalOp::LayerNorm { eps: 1e-5 }),
             SavedRequirement::Inputs

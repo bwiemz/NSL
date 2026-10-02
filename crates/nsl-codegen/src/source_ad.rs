@@ -1141,7 +1141,14 @@ impl AdjointGenerator {
             // Recomputes mean/rstd from input (not op.result) for correctness.
             // Every Mean{dim} reduction MUST be followed by Broadcast before use in
             // Sub/Mul with full-shape tensors to avoid shape mismatch.
-            AdjointExpr::LayerNormBackward(y_bar, x, _mean_unused, _rstd_unused, eps_val) => {
+            AdjointExpr::LayerNormBackward(y_bar, x, gamma, eps_val) => {
+                // The input gradient of `gamma * x_hat + beta` is the plain
+                // normalization backward of `grad * gamma`; leaving gamma out
+                // was right only for gamma = 1.
+                let y_bar = match gamma {
+                    Some(g) => self.emit_op(PrimalOp::Mul, vec![y_bar, g]),
+                    None => y_bar,
+                };
                 // Recompute mean and rstd from input (standard approach, matches PyTorch).
                 // All mean_keepdim_last calls reduce the last dim with keepdim=1,
                 // so the result broadcasts naturally against the full-shape tensors
@@ -3604,6 +3611,24 @@ impl<'a> WengertExtractor<'a> {
         }
     }
 
+    /// The eps of a norm call whose eps is argument `index`: the literal, or
+    /// the constant the argument provably still holds
+    /// (`resolve_const_config_scalar`, the resolver for values baked into
+    /// emitted code), else the 1e-5 default (see the `layernorm` arm).
+    fn norm_eps(
+        &self,
+        args: &[nsl_ast::expr::Arg],
+        input_vars: &[VarId],
+        index: usize,
+    ) -> f64 {
+        args.get(index)
+            .and_then(|a| Self::extract_f64_literal(&a.value))
+            .or_else(|| {
+                input_vars.get(index).and_then(|&v| self.resolve_const_config_scalar(v))
+            })
+            .unwrap_or(1e-5)
+    }
+
     /// A numeric literal (int or float, optionally negated) as f64.
     fn extract_f64_literal(expr: &nsl_ast::expr::Expr) -> Option<f64> {
         match &expr.kind {
@@ -4829,12 +4854,22 @@ impl<'a> WengertExtractor<'a> {
                         PrimalOp::LogSoftmax { dim }
                     }
                     // Normalization
-                    "layer_norm" | "layernorm" => PrimalOp::LayerNorm { eps: 1e-5 },
+                    // eps: a literal, or a var that resolves to a constant, is
+                    // baked into the op. A model-field read (`self.eps`, the
+                    // stdlib modules) cannot be read at compile time and keeps
+                    // the default 1e-5 -- right for those modules unless the
+                    // field is reassigned; certificate `layernorm_field_eps`
+                    // pins that gap.
+                    "layer_norm" | "layernorm" => PrimalOp::LayerNorm {
+                        eps: self.norm_eps(args, &input_vars, 3),
+                    },
                     "batch_norm" | "batchnorm" => PrimalOp::BatchNorm {
                         eps: 1e-5,
                         training: true,
                     },
-                    "rmsnorm" | "rms_norm" => PrimalOp::RMSNorm { eps: 1e-5 },
+                    "rmsnorm" | "rms_norm" => PrimalOp::RMSNorm {
+                        eps: self.norm_eps(args, &input_vars, 2),
+                    },
                     // CFTP §4.4 G3 (Sprint 4): user-facing `fused_linear_ce`.
                     //
                     // When the active train block carries `@fused_lm_ce(enabled=true)`
