@@ -46,6 +46,11 @@ pub(crate) fn save_requirements(op: &PrimalOp) -> SaveRequirements {
             needs_inputs: true,
             needs_output: false,
         },
+        // d cos(x) = -sin(x), d sin(x) = cos(x): both read x.
+        Passthrough(name) if name == "cos" || name == "sin" => SaveRequirements {
+            needs_inputs: true,
+            needs_output: false,
+        },
         // Binary elementwise — mul/div read their operands' values; add/sub
         // read their operands' shapes (to sum a broadcast operand's gradient
         // back to its shape), which the backward takes from the live tensor.

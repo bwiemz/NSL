@@ -476,7 +476,7 @@ fn certs() -> Vec<Cert> {
         Cert { name: "matmul_3d_2d", inputs: vec![inp("a", &[2, 3, 4]), inp("b", &[4, 5])], expr: "a @ b", wrt: &["a", "b"], out_shape: &[2, 3, 5],
             oracle: oracle!(|e| matmul(get(e, "a"), get(e, "b"))), known: &[], prelude: "" },
         Cert { name: "matmul_2d_3d", inputs: vec![inp("a", &[3, 4]), inp("b", &[2, 4, 5])], expr: "a @ b", wrt: &["a", "b"], out_shape: &[2, 3, 5],
-            oracle: oracle!(|e| matmul(get(e, "a"), get(e, "b"))), known: &[(Mode::Source, "da keeps the broadcast batch dim (24 values, not 12)")], prelude: "" },
+            oracle: oracle!(|e| matmul(get(e, "a"), get(e, "b"))), known: &[], prelude: "" },
         Cert { name: "matmul_3d_3d", inputs: vec![inp("a", &[2, 3, 4]), inp("b", &[2, 4, 5])], expr: "a @ b", wrt: &["a", "b"], out_shape: &[2, 3, 5],
             oracle: oracle!(|e| matmul(get(e, "a"), get(e, "b"))), known: &[], prelude: "" },
         // --- unary -------------------------------------------------------
@@ -499,13 +499,13 @@ fn certs() -> Vec<Cert> {
         Cert { name: "silu", inputs: X_34.to_vec(), expr: "silu(x)", wrt: &["x"], out_shape: &[3, 4],
             oracle: oracle!(|e| unary(get(e, "x"), |a| a * sigmoid_ref(a))), known: &[], prelude: "" },
         Cert { name: "abs", inputs: X_34.to_vec(), expr: "abs(x)", wrt: &["x"], out_shape: &[3, 4],
-            oracle: oracle!(|e| unary(get(e, "x"), f64::abs)), known: &[(Mode::Source, "the gradient has the wrong sign wherever x < 0")], prelude: "" },
+            oracle: oracle!(|e| unary(get(e, "x"), f64::abs)), known: &[], prelude: "" },
         Cert { name: "clamp", inputs: X_34.to_vec(), expr: "clamp(x, -0.5, 0.5)", wrt: &["x"], out_shape: &[3, 4],
-            oracle: oracle!(|e| unary(get(e, "x"), |a| a.clamp(-0.5, 0.5))), known: &[(Mode::Source, "the extractor drops the bounds (Clamp{-inf, +inf}): the forward is the identity")], prelude: "" },
+            oracle: oracle!(|e| unary(get(e, "x"), |a| a.clamp(-0.5, 0.5))), known: &[], prelude: "" },
         Cert { name: "cos", inputs: X_34.to_vec(), expr: "tensor_cos(x)", wrt: &["x"], out_shape: &[3, 4],
-            oracle: oracle!(|e| unary(get(e, "x"), f64::cos)), known: &[(Mode::Source, "the cos passthrough rule is the identity, not -sin(x)")], prelude: "" },
+            oracle: oracle!(|e| unary(get(e, "x"), f64::cos)), known: &[], prelude: "" },
         Cert { name: "sin", inputs: X_34.to_vec(), expr: "tensor_sin(x)", wrt: &["x"], out_shape: &[3, 4],
-            oracle: oracle!(|e| unary(get(e, "x"), f64::sin)), known: &[(Mode::Source, "the sin passthrough rule is the identity, not cos(x)")], prelude: "" },
+            oracle: oracle!(|e| unary(get(e, "x"), f64::sin)), known: &[], prelude: "" },
         Cert { name: "rotate_half", inputs: X_34.to_vec(), expr: "rotate_half(x)", wrt: &["x"], out_shape: &[3, 4],
             oracle: oracle!(|e| along_dim(get(e, "x"), 1, |v| {
                 let h = v.len() / 2;
@@ -589,12 +589,12 @@ fn certs() -> Vec<Cert> {
             oracle: oracle!(|e| {
                 let (x, y) = (get(e, "x"), get(e, "y"));
                 scalar(x.data.iter().zip(&y.data).map(|(a, b)| (a - b) * (a - b)).sum::<f64>() / 12.0)
-            }), known: &[(Mode::Source, "the target gets no gradient (dy = 0)")], prelude: "from nsl.nn.losses import cross_entropy, mse_loss, l1_loss" },
+            }), known: &[], prelude: "from nsl.nn.losses import cross_entropy, mse_loss, l1_loss" },
         Cert { name: "l1_loss", inputs: XY_SAME.to_vec(), expr: "l1_loss(x, y)", wrt: &["x", "y"], out_shape: &[],
             oracle: oracle!(|e| {
                 let (x, y) = (get(e, "x"), get(e, "y"));
                 scalar(x.data.iter().zip(&y.data).map(|(a, b)| (a - b).abs()).sum::<f64>() / 12.0)
-            }), known: &[(Mode::Source, "the target gets no gradient (dy = 0)")], prelude: "from nsl.nn.losses import cross_entropy, mse_loss, l1_loss" },
+            }), known: &[], prelude: "from nsl.nn.losses import cross_entropy, mse_loss, l1_loss" },
         // --- conv / attention --------------------------------------------
         Cert { name: "conv2d", inputs: vec![inp("x", &[1, 2, 5, 5]), inp("w", &[3, 2, 3, 3]), inp("b", &[3])],
             expr: "conv2d(x, w, b, 1, 1, 1, 1)", wrt: &["x", "w", "b"], out_shape: &[1, 3, 5, 5],

@@ -88,7 +88,10 @@ pub enum AdjointExpr {
     /// broadcasting occurred, and a sum-reduction over the broadcast axes
     /// when it did. Mirrors `MatmulTransposeRight`'s third-field pattern.
     MulElementwise(VarId, VarId, VarId),
-    MatmulTransposeLeft(VarId, VarId),
+    /// MatmulTransposeLeft(grad, b, a) — grad_a = reduce_to_shape(grad @ b.T, a).
+    /// `a @ b` broadcasts a lower-rank `a` against a batched `b`, so the raw
+    /// product can carry batch dims `a` does not have.
+    MatmulTransposeLeft(VarId, VarId, VarId),
     /// MatmulTransposeRight(a, grad, b) — grad_b = reduce_to_shape(a.T @ grad, b)
     /// The third field `b` is the original weight for shape reduction.
     MatmulTransposeRight(VarId, VarId, VarId),
@@ -133,6 +136,10 @@ pub enum AdjointExpr {
     SiluBackward(VarId, VarId),
     /// Abs backward: sign(x) * grad
     SignMul(VarId, VarId),
+    /// cos backward: `-sin(x) * grad`. args: (grad, x)
+    CosBackward(VarId, VarId),
+    /// sin backward: `cos(x) * grad`. args: (grad, x)
+    SinBackward(VarId, VarId),
     /// Clamp backward: grad * (min <= x <= max), with actual min/max bounds
     ClampBackward(VarId, VarId, f64, f64),
 
@@ -210,6 +217,12 @@ pub enum AdjointExpr {
     MSEBackward(VarId, VarId, VarId),
     /// L1 backward: sign(pred - target)/n. args: (grad, pred, target)
     L1Backward(VarId, VarId, VarId),
+    /// The TARGET's gradient of an MSE / L1 loss: the pred gradient negated
+    /// (both losses depend on `pred - target` alone) and reduced to the
+    /// target's shape, in case the target was broadcast. args: (grad, pred,
+    /// target)
+    MSETargetBackward(VarId, VarId, VarId),
+    L1TargetBackward(VarId, VarId, VarId),
 
     // Attention backward — per-component (Q, K, V) for correct causal masking
     /// Attention backward for Q: args: (grad, Q, K, V, fwd_result, causal)
@@ -395,7 +408,7 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
         PrimalOp::Matmul => vec![
             InputAdjoint {
                 input_var: op.inputs[0],
-                expr: AdjointExpr::MatmulTransposeLeft(output_bar, op.inputs[1]),
+                expr: AdjointExpr::MatmulTransposeLeft(output_bar, op.inputs[1], op.inputs[0]),
             },
             InputAdjoint {
                 input_var: op.inputs[1],
@@ -819,18 +832,30 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
         PrimalOp::MSELoss => {
             let pred = op.inputs[0];
             let target = op.inputs[1];
-            vec![InputAdjoint {
-                input_var: pred,
-                expr: AdjointExpr::MSEBackward(output_bar, pred, target),
-            }]
+            vec![
+                InputAdjoint {
+                    input_var: pred,
+                    expr: AdjointExpr::MSEBackward(output_bar, pred, target),
+                },
+                InputAdjoint {
+                    input_var: target,
+                    expr: AdjointExpr::MSETargetBackward(output_bar, pred, target),
+                },
+            ]
         }
         PrimalOp::L1Loss => {
             let pred = op.inputs[0];
             let target = op.inputs[1];
-            vec![InputAdjoint {
-                input_var: pred,
-                expr: AdjointExpr::L1Backward(output_bar, pred, target),
-            }]
+            vec![
+                InputAdjoint {
+                    input_var: pred,
+                    expr: AdjointExpr::L1Backward(output_bar, pred, target),
+                },
+                InputAdjoint {
+                    input_var: target,
+                    expr: AdjointExpr::L1TargetBackward(output_bar, pred, target),
+                },
+            ]
         }
 
         // --- Attention ---
@@ -917,18 +942,36 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
                     }
                 }
                 // Shape-preserving identity: gradient flows through unchanged.
-                // NOTE: cos/sin are NOT mathematically identity backward
-                // (correct: -sin(x)*g, cos(x)*g) but in this codebase they
-                // are only ever called on frozen RoPE inv_freq tables, never
-                // on trainable parameters, so the identity rule is harmless.
-                // If you ever apply cos/sin to a trainable tensor, FIX THIS.
-                "contiguous" | "cos" | "sin" | "sum_keepdim_last" | "mean_keepdim_last" => {
+                "contiguous" | "sum_keepdim_last" | "mean_keepdim_last" => {
                     if op.inputs.is_empty() {
                         vec![]
                     } else {
                         vec![InputAdjoint {
                             input_var: op.inputs[0],
                             expr: AdjointExpr::Identity(output_bar),
+                        }]
+                    }
+                }
+                // cos/sin used to share the identity rule above, on the
+                // theory that they only ever touch frozen RoPE tables; the
+                // certificates `cos`/`sin` hold the real derivatives.
+                "cos" => {
+                    if op.inputs.is_empty() {
+                        vec![]
+                    } else {
+                        vec![InputAdjoint {
+                            input_var: op.inputs[0],
+                            expr: AdjointExpr::CosBackward(output_bar, op.inputs[0]),
+                        }]
+                    }
+                }
+                "sin" => {
+                    if op.inputs.is_empty() {
+                        vec![]
+                    } else {
+                        vec![InputAdjoint {
+                            input_var: op.inputs[0],
+                            expr: AdjointExpr::SinBackward(output_bar, op.inputs[0]),
                         }]
                     }
                 }
@@ -989,8 +1032,12 @@ pub fn saved_for_backward(op: &PrimalOp) -> SavedRequirement {
         | PrimalOp::Slice { .. }
         | PrimalOp::RoPE { .. }
         | PrimalOp::RoPEInverse { .. }
-        | PrimalOp::AvgPool2d { .. }
-        | PrimalOp::Passthrough(_) => SavedRequirement::Nothing,
+        | PrimalOp::AvgPool2d { .. } => SavedRequirement::Nothing,
+        // d cos(x) = -sin(x), d sin(x) = cos(x): both read x.
+        PrimalOp::Passthrough(name) if name == "cos" || name == "sin" => {
+            SavedRequirement::Inputs
+        }
+        PrimalOp::Passthrough(_) => SavedRequirement::Nothing,
 
         // Save inputs — gradient depends on forward input values. Add/Sub
         // read only their operands' SHAPES, to undo a broadcast, and a full
@@ -1569,7 +1616,7 @@ mod tests {
         let adj = apply_ad_rule(&op, 100);
         assert!(matches!(
             adj[0].expr,
-            AdjointExpr::MatmulTransposeLeft(100, 1)
+            AdjointExpr::MatmulTransposeLeft(100, 1, 0)
         ));
         assert!(matches!(
             adj[1].expr,
@@ -2078,16 +2125,20 @@ mod tests {
     fn test_mse_loss_backward() {
         let op = make_op(2, PrimalOp::MSELoss, vec![0, 1]);
         let adj = apply_ad_rule(&op, 100);
-        assert_eq!(adj.len(), 1);
+        assert_eq!(adj.len(), 2);
         assert!(matches!(adj[0].expr, AdjointExpr::MSEBackward(100, 0, 1)));
+        assert_eq!(adj[1].input_var, 1);
+        assert!(matches!(adj[1].expr, AdjointExpr::MSETargetBackward(100, 0, 1)));
     }
 
     #[test]
     fn test_l1_loss_backward() {
         let op = make_op(2, PrimalOp::L1Loss, vec![0, 1]);
         let adj = apply_ad_rule(&op, 100);
-        assert_eq!(adj.len(), 1);
+        assert_eq!(adj.len(), 2);
         assert!(matches!(adj[0].expr, AdjointExpr::L1Backward(100, 0, 1)));
+        assert_eq!(adj[1].input_var, 1);
+        assert!(matches!(adj[1].expr, AdjointExpr::L1TargetBackward(100, 0, 1)));
     }
 
     // --- Tier 4: Attention ---

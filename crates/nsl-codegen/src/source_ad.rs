@@ -892,8 +892,9 @@ impl AdjointGenerator {
                 let raw = self.emit_op(PrimalOp::Mul, vec![grad, other]);
                 self.reduce_to(raw, target)
             }
-            AdjointExpr::MatmulTransposeLeft(grad, b) => {
-                // d_loss/d_A = grad @ B^T (transpose last two dims for N-D support)
+            AdjointExpr::MatmulTransposeLeft(grad, b, a) => {
+                // d_loss/d_A = grad @ B^T (transpose last two dims for N-D support),
+                // summed over any batch dims a 2-D A was broadcast across.
                 let b_t = self.emit_op(
                     PrimalOp::Transpose {
                         dim0: usize::MAX - 1,
@@ -901,7 +902,8 @@ impl AdjointGenerator {
                     },
                     vec![b],
                 );
-                self.emit_op(PrimalOp::Matmul, vec![grad, b_t])
+                let raw_grad = self.emit_op(PrimalOp::Matmul, vec![grad, b_t]);
+                self.reduce_to(raw_grad, a)
             }
             AdjointExpr::MatmulTransposeRight(a, grad, b) => {
                 // d_loss/d_B = A^T @ grad (transpose last two dims for N-D support)
@@ -961,6 +963,15 @@ impl AdjointGenerator {
 
             // --- Exp backward: d(exp(x))/dx = exp(x) = y. grad * y (correct as-is) ---
             AdjointExpr::ExpBackward(y_bar, y) => self.emit_op(PrimalOp::Mul, vec![y_bar, y]),
+            AdjointExpr::CosBackward(y_bar, x) => {
+                let sin_x = self.emit_op(PrimalOp::Passthrough("sin".into()), vec![x]);
+                let prod = self.emit_op(PrimalOp::Mul, vec![y_bar, sin_x]);
+                self.emit_op(PrimalOp::Neg, vec![prod])
+            }
+            AdjointExpr::SinBackward(y_bar, x) => {
+                let cos_x = self.emit_op(PrimalOp::Passthrough("cos".into()), vec![x]);
+                self.emit_op(PrimalOp::Mul, vec![y_bar, cos_x])
+            }
 
             // --- ReLU backward: grad * (x > 0), NOT grad * x ---
             AdjointExpr::ReluBackward(y_bar, x) => {
@@ -1439,6 +1450,22 @@ impl AdjointGenerator {
                 PrimalOp::Passthrough("l1_backward".into()),
                 vec![y_bar, pred, target],
             ),
+            AdjointExpr::MSETargetBackward(y_bar, pred, target) => {
+                let d_pred = self.emit_op(
+                    PrimalOp::Passthrough("mse_backward".into()),
+                    vec![y_bar, pred, target],
+                );
+                let neg = self.emit_op(PrimalOp::Neg, vec![d_pred]);
+                self.reduce_to(neg, target)
+            }
+            AdjointExpr::L1TargetBackward(y_bar, pred, target) => {
+                let d_pred = self.emit_op(
+                    PrimalOp::Passthrough("l1_backward".into()),
+                    vec![y_bar, pred, target],
+                );
+                let neg = self.emit_op(PrimalOp::Neg, vec![d_pred]);
+                self.reduce_to(neg, target)
+            }
 
             // --- Attention backward: per-component extraction from fused kernel ---
             // Each component (dQ=0, dK=1, dV=2) is extracted via a dedicated op
@@ -3551,6 +3578,19 @@ impl<'a> WengertExtractor<'a> {
         }
     }
 
+    /// A numeric literal (int or float, optionally negated) as f64.
+    fn extract_f64_literal(expr: &nsl_ast::expr::Expr) -> Option<f64> {
+        match &expr.kind {
+            ExprKind::FloatLiteral(v) => Some(*v),
+            ExprKind::IntLiteral(v) => Some(*v as f64),
+            ExprKind::UnaryOp {
+                op: AstUnaryOp::Neg,
+                operand,
+            } => Self::extract_f64_literal(operand).map(|v| -v),
+            _ => None,
+        }
+    }
+
     fn encode_transpose_dim(dim: i64) -> Option<usize> {
         match dim {
             -2 => Some(usize::MAX - 1),
@@ -5494,10 +5534,22 @@ impl<'a> WengertExtractor<'a> {
                     // Negative
                     "neg" => PrimalOp::Neg,
                     // Clamp
-                    "clamp" => PrimalOp::Clamp {
-                        min: f64::NEG_INFINITY,
-                        max: f64::INFINITY,
-                    },
+                    // The bounds are baked into the op; only literal bounds
+                    // can be. Anything else stays on the tape rather than
+                    // silently clamping to (-inf, inf).
+                    "clamp" => {
+                        let bound = |i: usize| {
+                            args.get(i).and_then(|a| Self::extract_f64_literal(&a.value))
+                        };
+                        let (Some(min), Some(max)) = (bound(1), bound(2)) else {
+                            nsl_log::nsl_log!(WARN, "source-ad",
+                                "[source-ad] clamp bounds are not numeric literals; \
+                                 falling back to tape-based AD for this grad block"
+                            );
+                            return None;
+                        };
+                        PrimalOp::Clamp { min, max }
+                    }
                     // Scalar extraction (non-differentiable)
                     "int" | "float" => PrimalOp::Passthrough(func_name.clone()),
                     // WRGA B.3 fused LoRA forward FFI.

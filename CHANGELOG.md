@@ -1791,6 +1791,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **Source AD: seven wrong gradients the rule certificates caught**
+  (`source_ad_rule_cert.rs`; each fix delists its ratchet entry, and every
+  one of them passed under the tape):
+  - **`abs`** applied `sign(x[0])` to every element. Its backward is
+    `where(x > 0, 1, -1)`, and `nsl_tensor_where` took the output's SHAPE
+    from the true branch, here a scalar, so the 12-element result claimed
+    shape `[]` and the next multiply broadcast its first element.
+    `where` now takes shape, device and dtype from the first full-size
+    operand and refuses any operand that is neither full-size nor scalar
+    (it used to read past the end of one).
+  - **`clamp`** never clamped: the extractor built `Clamp{-inf, +inf}` for
+    every call. Literal bounds are now read off the call; a grad block with
+    non-literal bounds falls back to the tape instead.
+  - **`tensor_cos`/`tensor_sin`** used the identity rule, kept on the
+    theory that they only ever see frozen RoPE tables. They now have
+    `-sin(x)·ȳ` and `cos(x)·ȳ` and save their input.
+  - **`matmul([3, 4], [2, 4, 3])`** returned `da` with the batch dim left
+    in (24 values for a 12-element `a`). `dA = ȳ @ Bᵀ` is now reduced to
+    `A`'s shape, as `dB` always was. The reduce is a refcount bump when
+    nothing was broadcast; every training CLIF snapshot gains one
+    `reduce_to_shape` and one `free` per backward `dA` matmul, nothing
+    else.
+  - **`mse_loss` / `l1_loss`** gave the target no gradient. It now gets
+    the negated pred gradient, reduced to its own shape.
+
 - **`@freeze` froze nothing.** The decorator was validated and handed to
   WRGA's analysis, and nothing in the train block read it. A frozen weight
   stayed in the optimizer's parameter list and trained exactly as if
