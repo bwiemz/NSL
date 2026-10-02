@@ -191,28 +191,47 @@ fn compare_mixed(av: f64, bv: f64, cmp_kind: i64) -> bool {
 
 /// Elementwise ternary: `result[i] = cond[i] != 0 ? true_val[i] : false_val[i]`.
 ///
-/// All three tensors must have the same shape. `cond` is read as the dtype of
-/// the condition tensor (0.0 = false, anything else = true).
+/// Each operand is either the full output or a one-element scalar broadcast
+/// to it; any other length is a shape mismatch. The output takes its shape,
+/// device and value dtype from the first full-size operand among
+/// (true_val, false_val, cond), so a scalar branch -- `Select(x > 0, 1, -1)`,
+/// abs's backward -- cannot shrink the result to the scalar's shape. `cond` is
+/// read as its own dtype (0.0 = false, anything else = true).
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_where(cond_ptr: i64, true_ptr: i64, false_ptr: i64) -> i64 {
-    let (cond_contig, cond_cpu, _cond_device) = prepare_cpu_input(cond_ptr);
+    let (cond_contig, cond_cpu, cond_device) = prepare_cpu_input(cond_ptr);
     let (true_contig, true_cpu, true_device) = prepare_cpu_input(true_ptr);
-    let (false_contig, false_cpu, _false_device) = prepare_cpu_input(false_ptr);
+    let (false_contig, false_cpu, false_device) = prepare_cpu_input(false_ptr);
 
     let cond = NslTensor::from_ptr_ref(cond_cpu);
     let tv = NslTensor::from_ptr_ref(true_cpu);
     let fv = NslTensor::from_ptr_ref(false_cpu);
 
-    let len = tv.len as usize;
     let cond_scalar = cond.len == 1;
     let fv_scalar = fv.len == 1;
     let tv_scalar = tv.len == 1;
-    // Determine output length: max of all inputs (broadcast scalars)
-    let out_len = len.max(cond.len as usize).max(fv.len as usize);
-    let len = out_len;
-    let ndim = tv.ndim;
-    let dtype = tv.dtype;
-    let shape = NslTensor::copy_shape(tv.shape, ndim);
+    let len = (tv.len as usize).max(cond.len as usize).max(fv.len as usize);
+    for (name, t) in [("cond", cond), ("true", tv), ("false", fv)] {
+        let n = t.len as usize;
+        if n != len && n != 1 {
+            crate::fatal::die(
+                crate::fatal::Fatal::ShapeMismatch,
+                &format!("nsl_tensor_where: {name} operand has {n} elements; expected {len} or 1"),
+            );
+        }
+    }
+    // The shape source: the first full-size operand, values before the
+    // condition. Its dtype is the output's only when it is a value operand.
+    let (shape_src, device) = if tv.len as usize == len {
+        (tv, true_device)
+    } else if fv.len as usize == len {
+        (fv, false_device)
+    } else {
+        (cond, cond_device)
+    };
+    let dtype = if !tv_scalar || fv_scalar { tv.dtype } else { fv.dtype };
+    let ndim = shape_src.ndim;
+    let shape = NslTensor::copy_shape(shape_src.shape, ndim);
     let strides = NslTensor::compute_strides(shape, ndim);
 
     // Value reads dispatch on EACH tensor's own dtype (item 2, 2026-08-25).
@@ -259,7 +278,7 @@ pub extern "C" fn nsl_tensor_where(cond_ptr: i64, true_ptr: i64, false_ptr: i64)
     release_cpu_input(cond_contig, cond_cpu);
     release_cpu_input(true_contig, true_cpu);
     release_cpu_input(false_contig, false_cpu);
-    publish_cpu_result_to_device(result, true_device, "ad_where")
+    publish_cpu_result_to_device(result, device, "ad_where")
 }
 
 // ---------------------------------------------------------------------------
@@ -1889,6 +1908,29 @@ mod tests {
         nsl_tensor_free(out);
     }
 
+    /// abs's backward is `where(x > 0, 1, -1)`: both branches are scalars, so
+    /// the result must take the CONDITION's shape. It used to take the true
+    /// branch's, and the 4-element result claimed shape [] -- so the next
+    /// broadcast multiply applied sign(x[0]) to every element.
+    #[test]
+    fn test_tensor_where_scalar_branches_take_the_condition_shape() {
+        let cond = make_1d_f32(&[1.0, 0.0, 0.0, 1.0]);
+        let one = nsl_tensor_scalar(1.0, 1);
+        let neg_one = nsl_tensor_scalar(-1.0, 1);
+        let out = nsl_tensor_where(cond, one, neg_one);
+        let t = NslTensor::from_ptr(out);
+        assert_eq!((t.ndim, unsafe { *t.shape }), (1, 4));
+        assert_eq!(read_1d_f32(out), vec![1.0_f32, -1.0, -1.0, 1.0]);
+        // A full false branch is the shape source when the true one is scalar.
+        let fv = make_1d_f32(&[5.0, 6.0, 7.0, 8.0]);
+        let out2 = nsl_tensor_where(cond, one, fv);
+        assert_eq!(NslTensor::from_ptr(out2).ndim, 1);
+        assert_eq!(read_1d_f32(out2), vec![1.0_f32, 6.0, 7.0, 1.0]);
+        for p in [cond, one, neg_one, out, fv, out2] {
+            nsl_tensor_free(p);
+        }
+    }
+
     #[test]
     fn test_tensor_scalar_creation_f32() {
         let s = nsl_tensor_scalar(3.14, 1); // dtype=1 (f32)
@@ -2420,7 +2462,8 @@ mod tests {
 /// over leading batch dimensions. Used in matmul backward when the input
 /// has more dimensions than the weight (broadcasting).
 ///
-/// If grad and target already have the same shape, returns a clone of grad.
+/// If grad and target already have the same shape, returns grad itself with
+/// its refcount bumped (no copy); the caller frees its own reference.
 /// Otherwise sums over leading dimensions until ndims match, then reshapes.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_reduce_to_shape(grad_ptr: i64, target_ptr: i64) -> i64 {
