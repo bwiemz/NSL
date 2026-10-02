@@ -1924,6 +1924,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
     `gather(t, d, idx)` selects whole `prod(shape[d+1..])`-wide slices, but
     the shared backward (`scatter_gather_grad`) added back ONE element per
     index; it now mirrors the forward's loop (`gather_dim0`, `gather_mid`).
+- **Source AD: a grad block over SDPA crashed the compiler, and the
+  attention backward ignored a non-default scale** (`sdpa`, `sdpa_causal`,
+  `sdpa_scale` delisted):
+  - "FunctionBuilder finalized, but block block3 is not filled". The fused
+    SDPA dispatch ends in its join block, but callers track where to keep
+    emitting through `state.current_block`, which nothing updated: `main`
+    read the entry block, saw its `brif`, and skipped its `return`.
+    `compile_wengert_ops` now leaves `state.current_block` at the builder's
+    actual block, for every lowering that switches blocks.
+  - The backward computed with `1/sqrt(head_dim)` whatever scale the
+    forward was given. It now reads the forward's scale operand (one
+    `nsl_tensor_item` per SDPA backward; the `attention_source_ad`
+    snapshot gains two).
 
 - **`@freeze` froze nothing.** The decorator was validated and handed to
   WRGA's analysis, and nothing in the train block read it. A frozen weight

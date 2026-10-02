@@ -237,8 +237,10 @@ pub enum AdjointExpr {
     L1TargetBackward(VarId, VarId, VarId),
 
     // Attention backward — per-component (Q, K, V) for correct causal masking
-    /// Attention backward for Q: args: (grad, Q, K, V, fwd_result, causal)
-    AttentionBackwardQ(VarId, VarId, VarId, VarId, VarId, bool),
+    /// Attention backward for Q: args: (grad, Q, K, V, fwd_result, causal,
+    /// scale). `scale` is the forward's scale operand; `None` means the
+    /// default `1/sqrt(head_dim)`.
+    AttentionBackwardQ(VarId, VarId, VarId, VarId, VarId, bool, Option<VarId>),
     /// PCA Stage C: packed (segment-masked) attention backward —
     /// (output_bar, q, k, v, fwd_out, segment_ids). Causal-within-segment
     /// by contract, so no causal flag.
@@ -247,10 +249,10 @@ pub enum AdjointExpr {
     AttentionBackwardKPacked(VarId, VarId, VarId, VarId, VarId, VarId, VarId),
     /// See [`AdjointExpr::AttentionBackwardQPacked`].
     AttentionBackwardVPacked(VarId, VarId, VarId, VarId, VarId, VarId, VarId),
-    /// Attention backward for K: args: (grad, Q, K, V, fwd_result, causal)
-    AttentionBackwardK(VarId, VarId, VarId, VarId, VarId, bool),
-    /// Attention backward for V: args: (grad, Q, K, V, fwd_result, causal)
-    AttentionBackwardV(VarId, VarId, VarId, VarId, VarId, bool),
+    /// Attention backward for K: see [`AdjointExpr::AttentionBackwardQ`].
+    AttentionBackwardK(VarId, VarId, VarId, VarId, VarId, bool, Option<VarId>),
+    /// Attention backward for V: see [`AdjointExpr::AttentionBackwardQ`].
+    AttentionBackwardV(VarId, VarId, VarId, VarId, VarId, bool, Option<VarId>),
     /// CFTP §4.4 G3 (Sprint 4): fused linear-CE backward — per-component extract.
     ///
     /// args: (grad, x, W, bias, targets, fwd_result, component,
@@ -876,18 +878,27 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             let k = op.inputs[1];
             let v = op.inputs[2];
             let fwd_result = op.result;
+            // The backward must use the forward's scale; it used to assume
+            // 1/sqrt(head_dim) whatever scale the call passed.
+            let scale = op.inputs.get(3).copied();
             vec![
                 InputAdjoint {
                     input_var: q,
-                    expr: AdjointExpr::AttentionBackwardQ(output_bar, q, k, v, fwd_result, *causal),
+                    expr: AdjointExpr::AttentionBackwardQ(
+                        output_bar, q, k, v, fwd_result, *causal, scale,
+                    ),
                 },
                 InputAdjoint {
                     input_var: k,
-                    expr: AdjointExpr::AttentionBackwardK(output_bar, q, k, v, fwd_result, *causal),
+                    expr: AdjointExpr::AttentionBackwardK(
+                        output_bar, q, k, v, fwd_result, *causal, scale,
+                    ),
                 },
                 InputAdjoint {
                     input_var: v,
-                    expr: AdjointExpr::AttentionBackwardV(output_bar, q, k, v, fwd_result, *causal),
+                    expr: AdjointExpr::AttentionBackwardV(
+                        output_bar, q, k, v, fwd_result, *causal, scale,
+                    ),
                 },
             ]
         }
@@ -2183,15 +2194,15 @@ mod tests {
         );
         assert!(matches!(
             adj[0].expr,
-            AdjointExpr::AttentionBackwardQ(100, 0, 1, 2, 3, true)
+            AdjointExpr::AttentionBackwardQ(100, 0, 1, 2, 3, true, None)
         ));
         assert!(matches!(
             adj[1].expr,
-            AdjointExpr::AttentionBackwardK(100, 0, 1, 2, 3, true)
+            AdjointExpr::AttentionBackwardK(100, 0, 1, 2, 3, true, None)
         ));
         assert!(matches!(
             adj[2].expr,
-            AdjointExpr::AttentionBackwardV(100, 0, 1, 2, 3, true)
+            AdjointExpr::AttentionBackwardV(100, 0, 1, 2, 3, true, None)
         ));
         assert_eq!(
             saved_for_backward(&PrimalOp::ScaledDotProductAttention { causal: true }),
