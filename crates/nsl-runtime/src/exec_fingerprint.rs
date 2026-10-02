@@ -69,6 +69,13 @@ const ARITHMETIC_KEYS: &[&str] = &[
     //                 softmax state (corrupts the backward)
     // The RUNTIME-read half of the tier is `env_record.rs`.
     "fa_mma", "lce_gemm", "fase_sumsq", "fase_override", "csha_save",
+    // WGGO layer prune (#807): the train block's forward deletes these
+    // blocks. Emitted only when a prune is requested, so an unpruned build
+    // and an older checkpoint agree by both lacking them.
+    //   prune_layers  --wggo-prune-layers, sorted
+    //   prune_frac    --wggo-layer-prune-fraction and a digest of the
+    //                 --wggo-weights file it ranks blocks by
+    "prune_layers", "prune_frac",
 ];
 
 /// Keys that move bytes without changing the value computed.
@@ -168,6 +175,28 @@ pub fn render(diffs: &[FieldDiff]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The WGGO layer-prune keys refuse a resume across a prune change, and
+    /// cost nothing to an unpruned resume of an older checkpoint: both lack
+    /// them, which `diff` treats as agreement.
+    #[test]
+    fn a_layer_prune_change_refuses_and_an_unpruned_resume_does_not() {
+        let unpruned = "ad=source,dtype=f32";
+        let pruned = "ad=source,dtype=f32,prune_layers=blocks.1";
+        assert!(super::arithmetic_diff(unpruned, unpruned).is_empty());
+        for (saved, live) in [(unpruned, pruned), (pruned, unpruned)] {
+            let d = super::arithmetic_diff(saved, live);
+            assert!(d.iter().any(|f| f.key == "prune_layers"), "{saved} -> {live}: {d:?}");
+        }
+        let other = "ad=source,dtype=f32,prune_layers=blocks.2";
+        assert!(super::arithmetic_diff(pruned, other).iter().any(|f| f.key == "prune_layers"));
+        let frac_a = "ad=source,prune_frac=0.25-aaaa";
+        let frac_b = "ad=source,prune_frac=0.25-bbbb";
+        assert!(super::arithmetic_diff(frac_a, frac_b).iter().any(|f| f.key == "prune_frac"));
+        for k in ["prune_layers", "prune_frac"] {
+            assert!(!super::PLACEMENT_KEYS.contains(&k), "{k} must not merely warn");
+        }
+    }
+
     #[test]
     fn the_compile_time_environment_keys_are_arithmetic_class() {
         for k in ["fa_mma", "lce_gemm", "fase_sumsq", "fase_override", "csha_save"] {

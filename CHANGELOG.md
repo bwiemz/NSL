@@ -146,6 +146,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   - `stage_c_packed_parity.rs::packed_fused_matches_decomposed_on_gpu` is now
     `packed_fused_training_smoke_on_gpu`, documented as the integration
     smoke it is. The three gates join the hardware-cert bundle.
+- **The Stage-C GPU smoke no longer measures how close its two checkpoints
+  are.** `packed_fused_training_smoke_on_gpu` trains the packed program with
+  the fused segment-masked kernels and with the decomposed fallback, and
+  used to assert the checkpoints within 2e-2 of each other. That bound read
+  as fused-kernel parity, which eight short steps at one KV tile cannot
+  establish. It now asserts only what a smoke can:
+  - each run trains (its loss falls);
+  - the fused run launches the fused forward and the other does not;
+  - each checkpoint is complete and finite;
+  - the two are not bit-identical.
+
+  Fused-kernel parity is `sdpa_fused_packed_gpu_parity.rs`, against f64
+  oracles. The CPU packed-vs-masked differential in the same file stays a
+  parity gate (1e-4), since its oracle is the Stage-B per-op adjoint chain.
 
 - **Parser table tests** (roadmap T1): 312 new `#[test]`s in `nsl-parser`,
   one per construct, bringing the crate from 33 tests to 345. The roadmap's
@@ -1815,6 +1829,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
     else.
   - **`mse_loss` / `l1_loss`** gave the target no gradient. It now gets
     the negated pred gradient, reduced to its own shape.
+
+- **A WGGO layer prune is part of the checkpoint's execution record.** #807
+  made `--wggo-prune-layers` / `--wggo-layer-prune-fraction` delete whole
+  blocks from the forward, but left them out of the exec fingerprint. A
+  resume that dropped or changed the prune continued the checkpoint under a
+  different model without a word.
+  - **The keys.** The record now carries two arithmetic-class keys, so a
+    mismatch refuses the resume:
+    - `prune_layers=` holds the sorted, deduplicated layer names;
+    - `prune_frac=` holds the fraction and an FNV-1a digest of the
+      `--wggo-weights` file it ranks blocks by, so the same request over
+      different weights is a different model.
+  - **Only when requested.** The keys are the one deliberate exception to
+    the fingerprint's "no key omitted" rule. Layer prune did not exist before
+    them, so a checkpoint without them was unpruned, and a key absent on both
+    sides is the runtime's back-compatible case. An unpruned build therefore
+    still resumes every existing checkpoint.
+  - **Gates.**
+    - `exec_fingerprint_resume_gate::changing_the_layer_prune_on_resume_is_refused`
+      saves a pruned run, resumes it with the same prune, then refuses an
+      unpruned resume naming `prune_layers: checkpoint blocks.1 -> this run
+      <absent>`.
+    - Unit tests pin the rendering (sorted, absent when off, the digest
+      follows the file's content) and the refusal in both directions.
+    - Dropping the key from the arithmetic class fails the gate.
 
 - **`@freeze` froze nothing.** The decorator was validated and handed to
   WRGA's analysis, and nothing in the train block read it. A frozen weight
