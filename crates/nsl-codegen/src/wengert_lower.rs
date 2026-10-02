@@ -3678,6 +3678,38 @@ fn lower_single_op(
                     let dim = resolve_baked_dim(compiler, builder, d, inputs[1])?;
                     call(compiler, builder, "nsl_tensor_unsqueeze", &[inputs[0], dim])
                 }
+                _ if name.starts_with(crate::source_ad::GATHER_BACKWARD_PREFIX) => {
+                    // inputs = [grad, input, indices]; the FFI resolves a negative dim
+                    let d = parse_baked_dim(name, crate::source_ad::GATHER_BACKWARD_PREFIX)?;
+                    let dim = builder.ins().iconst(cl_types::I64, d);
+                    call(
+                        compiler,
+                        builder,
+                        "nsl_tensor_gather_backward",
+                        &[inputs[0], inputs[1], inputs[2], dim],
+                    )
+                }
+                _ if name.starts_with(crate::source_ad::CONCAT_GRAD_SLICE_PREFIX) => {
+                    // inputs = [grad, part_0, .., part_n-1]; name = <prefix><dim>:<index>
+                    let spec = &name[crate::source_ad::CONCAT_GRAD_SLICE_PREFIX.len()..];
+                    let parsed = spec
+                        .split_once(':')
+                        .and_then(|(d, i)| Some((d.parse::<i64>().ok()?, i.parse::<usize>().ok()?)));
+                    let Some((d, index)) = parsed else {
+                        return Err(CodegenError::new(format!("malformed passthrough `{name}`")));
+                    };
+                    // Both FFIs resolve a negative dim themselves.
+                    let dim = builder.ins().iconst(cl_types::I64, d);
+                    let mut start = builder.ins().iconst(cl_types::I64, 0);
+                    for &part in &inputs[1..1 + index] {
+                        let size = call(compiler, builder, "nsl_tensor_shape_dim", &[part, dim])?;
+                        start = builder.ins().iadd(start, size);
+                    }
+                    let size =
+                        call(compiler, builder, "nsl_tensor_shape_dim", &[inputs[1 + index], dim])?;
+                    let end = builder.ins().iadd(start, size);
+                    call(compiler, builder, "nsl_tensor_slice", &[inputs[0], dim, start, end])
+                }
                 _ if name.starts_with(crate::source_ad::SUM_KEEPDIM_AT_PREFIX) => {
                     // inputs = [x]
                     let d = parse_baked_dim(name, crate::source_ad::SUM_KEEPDIM_AT_PREFIX)?;

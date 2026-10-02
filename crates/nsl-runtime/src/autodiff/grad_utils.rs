@@ -486,65 +486,36 @@ pub(crate) fn scatter_gather_grad(
         tensor_free(cpu_out);
         return gpu_out;
     }
+    // The exact mirror of `nsl_tensor_gather`'s CPU loop: with
+    // `outer = prod(shape[..dim])` and `inner = prod(shape[dim+1..])`, the
+    // forward is `out[o, k] = in[o, indices[o], k]`, so the backward adds
+    // each `inner`-wide gradient row back at `indices[o]`. This used to read
+    // ONE gradient element per index -- right only when `dim` is the last
+    // axis (`inner == 1`); `gather(t, 0, i)` lost all but one element of
+    // every row (certificates `gather_dim0`, `gather_mid`).
+    let grad_c = crate::tensor::nsl_tensor_contiguous(grad_ptr);
+    let grad = NslTensor::from_ptr(grad_c);
     let grad_dtype = grad.dtype;
-
-    // Create zero gradient with input_shape, matching grad dtype
     let out_ptr = create_tensor_with_shape_dtype(input_shape, 0.0, grad_dtype);
     let out = NslTensor::from_ptr(out_ptr);
-
-    let ndim = input_shape.len();
-    let out_strides: Vec<usize> = (0..ndim)
-        .map(|i| unsafe { *out.strides.add(i) } as usize)
-        .collect();
-
-    // General N-dimensional scatter-add for gather backward.
-    // For each element b in the batch (all dims except `dim`):
-    //   output[..., indices[b], ...] += grad[b]
-    // where `dim` is the axis along which gather selected elements.
-    let batch = indices.len as usize;
-    let dim_usize = dim; // already usize; caller handles negative dim normalization
-
-    for b in 0..batch {
-        let idx = indices.read_index(b) as usize;
-
-        // Decompose flat index `b` into multi-index over non-dim axes
-        let mut out_offset = 0usize;
-        let remaining = b;
-
-        if ndim == 1 {
-            // 1D case: output[indices[b]] += grad[b]
-            out_offset = idx * out_strides[0];
-        } else if ndim == 2 && dim_usize == 1 {
-            // Common 2D case: output[b, indices[b]] += grad[b]
-            out_offset = b * out_strides[0] + idx * out_strides[1];
-        } else if ndim == 2 && dim_usize == 0 {
-            out_offset = idx * out_strides[0] + b * out_strides[1];
-        } else {
-            // General N-dim: decompose `b` into coordinates for non-dim axes
-            let mut coords = vec![0usize; ndim];
-            coords[dim_usize] = idx;
-            let mut flat = remaining;
-            for d in (0..ndim).rev() {
-                if d == dim_usize { continue; }
-                let dim_size = input_shape[d] as usize;
-                if dim_size > 0 {
-                    coords[d] = flat % dim_size;
-                    flat /= dim_size;
-                }
+    let gather_dim_size = input_shape[dim] as usize;
+    let outer: usize = input_shape[..dim].iter().map(|&s| s as usize).product::<usize>().max(1);
+    let inner: usize = input_shape[dim + 1..].iter().map(|&s| s as usize).product::<usize>().max(1);
+    let n = (indices.len as usize).min(outer);
+    for o in 0..n {
+        let idx = indices.read_index(o) as usize;
+        let out_base = o * gather_dim_size * inner + idx * inner;
+        let grad_base = o * inner;
+        for k in 0..inner {
+            if grad_dtype == 1 {
+                let g = unsafe { *grad.data_f32().add(grad_base + k) };
+                unsafe { *out.data_f32().add(out_base + k) += g };
+            } else {
+                let g = unsafe { *grad.data_f64().add(grad_base + k) };
+                unsafe { *out.data_f64().add(out_base + k) += g };
             }
-            for d in 0..ndim {
-                out_offset += coords[d] * out_strides[d];
-            }
-        }
-
-        if grad_dtype == 1 {
-            let g_val = unsafe { *grad.data_f32().add(b) };
-            unsafe { *out.data_f32().add(out_offset) += g_val };
-        } else {
-            let g_val = unsafe { *grad.data_f64().add(b) };
-            unsafe { *out.data_f64().add(out_offset) += g_val };
         }
     }
-
+    tensor_free(grad_c);
     out_ptr
 }

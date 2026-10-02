@@ -82,6 +82,7 @@ fn build_table() -> HashMap<&'static str, FfiOwnershipKind> {
     m.insert("nsl_tensor_cat", OwnedNewResult);
     m.insert("nsl_tensor_stack", OwnedNewResult);
     m.insert("nsl_tensor_gather", OwnedNewResult);
+    m.insert("nsl_tensor_gather_backward", OwnedNewResult);
     m.insert("nsl_tensor_expand", OwnedNewResult);
     // Corrected 2026-07-29 (was BorrowedFromInput(0), documented
     // KNOWN-WRONG since 2026-07-27): the runtime allocates FRESH storage
