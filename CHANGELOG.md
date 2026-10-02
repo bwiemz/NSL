@@ -108,6 +108,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   - `stage_c_packed_parity.rs::packed_fused_matches_decomposed_on_gpu` is now
     `packed_fused_training_smoke_on_gpu`, documented as the integration
     smoke it is. The three gates join the hardware-cert bundle.
+- **The Stage-C GPU smoke no longer measures how close its two checkpoints
+  are.** `packed_fused_training_smoke_on_gpu` trains the packed program with
+  the fused segment-masked kernels and with the decomposed fallback, and
+  used to assert the checkpoints within 2e-2 of each other. That bound read
+  as fused-kernel parity, which eight short steps at one KV tile cannot
+  establish. It now asserts only what a smoke can:
+  - each run trains (its loss falls);
+  - the fused run launches the fused forward and the other does not;
+  - each checkpoint is complete and finite;
+  - the two are not bit-identical.
+
+  Fused-kernel parity is `sdpa_fused_packed_gpu_parity.rs`, against f64
+  oracles. The CPU packed-vs-masked differential in the same file stays a
+  parity gate (1e-4), since its oracle is the Stage-B per-op adjoint chain.
 
 - **Parser table tests** (roadmap T1): 312 new `#[test]`s in `nsl-parser`,
   one per construct, bringing the crate from 33 tests to 345. The roadmap's

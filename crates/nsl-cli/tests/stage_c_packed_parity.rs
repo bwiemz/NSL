@@ -1,4 +1,5 @@
-//! PCA Stage C — packed-attention parity gates.
+//! PCA Stage C — packed-attention gates: one CPU parity differential, one
+//! GPU training smoke, one WGGO consumption check.
 //!
 //! Three differentials over the shared fixture
 //! `fixtures/stage_c_packed_gqa.nsl` (2-block GQA, head_dim=32, seq=64,
@@ -12,16 +13,17 @@
 //!   segment-aware f32 CPU reference), so agreement here validates the
 //!   Stage-C CPU reference backward against the Stage-B oracle.
 //!
-//! * `packed_fused_training_smoke_on_gpu` (cuda, ignored) — an integration
-//!   smoke: the same packed program on the GPU with the fused
-//!   segment-masked flash kernels ON (default) vs OFF
-//!   (`NSL_SDPA_FUSED_DISABLE=1`). Both must train, the fused run must
+//! * `packed_fused_training_smoke_on_gpu` (cuda, ignored) — a training /
+//!   integration SMOKE, not a parity gate: the same packed program on the
+//!   GPU with the fused segment-masked flash kernels ON (default) and OFF
+//!   (`NSL_SDPA_FUSED_DISABLE=1`). Each run must train, the fused run must
 //!   launch the fused forward (the once-per-process `sdpa fused forward:
-//!   launched` marker), and the checkpoints must neither diverge nor be
-//!   identical. It is not the numerics gate: 8 optimizer steps at seq 64
-//!   (one KV tile) average a gradient error away. The kernels' outputs and raw
-//!   gradients are gated against f64 oracles, across KV tiles, by
-//!   `crates/nsl-codegen/tests/sdpa_fused_packed_gpu_parity.rs`.
+//!   launched` marker) and the other must not, and each checkpoint must be
+//!   complete and finite. The two checkpoints are NOT compared within a
+//!   tolerance: 8 optimizer steps at seq 64 (one KV tile) average a gradient
+//!   error away, so no bound on their distance could prove the kernels right.
+//!   The kernels' outputs and raw gradients are gated against f64 oracles,
+//!   across KV tiles, by `crates/nsl-codegen/tests/sdpa_fused_packed_gpu_parity.rs`.
 //!
 //! * `wggo_reports_fused_consumption_on_gpu` (cuda, ignored) — under
 //!   `--pretrain-optimized` the plan's segment_id packing decision must be
@@ -157,6 +159,29 @@ fn assert_trains(r: &RunOutput, tag: &str) {
     );
 }
 
+/// The smoke's checkpoint check: both runs saved the same parameters, every
+/// value is finite, and the two are not bit-identical. No distance bound.
+#[cfg(feature = "cuda")]
+fn assert_complete_finite_and_distinct(a: &Path, b: &Path) {
+    let ca = nslm::read(a);
+    let cb = nslm::read(b);
+    let mut names_a: Vec<&String> = ca.keys().collect();
+    let mut names_b: Vec<&String> = cb.keys().collect();
+    names_a.sort();
+    names_b.sort();
+    assert_eq!(names_a, names_b, "the two runs saved different parameters");
+    let mut differs = false;
+    for (name, va) in &ca {
+        let vb = &cb[name];
+        assert_eq!(va.len(), vb.len(), "param {name} length mismatch");
+        for (x, y) in va.iter().zip(vb) {
+            assert!(x.is_finite() && y.is_finite(), "param {name} holds a non-finite value");
+            differs |= x != y;
+        }
+    }
+    assert!(differs, "checkpoints bit-identical — the fused path likely never ran");
+}
+
 fn checkpoint_max_diff(a: &Path, b: &Path) -> (f64, String) {
     let ca = nslm::read(a);
     let cb = nslm::read(b);
@@ -250,11 +275,14 @@ fn gpu_present() -> bool {
         .unwrap_or(false)
 }
 
-/// GPU integration smoke: fused segment-masked kernels vs the decomposed
-/// fallback, same program, same data. Both train; the once-per-process
-/// launch marker proves the fused path fired (and that the kill-switch
-/// disabled it); the checkpoints stay within 2e-2 of each other and are not
-/// identical. The numerics are gated by `sdpa_fused_packed_gpu_parity.rs`.
+/// GPU training smoke: the packed program with the fused segment-masked
+/// kernels, and with the decomposed fallback. Each trains (its loss falls);
+/// the once-per-process launch marker proves the fused path fired, and that
+/// the kill-switch disabled it; each checkpoint is complete and finite; and
+/// they are not bit-identical (which would mean the fused path never changed
+/// a step). How close the two checkpoints are is deliberately NOT asserted:
+/// it was once read as fused-kernel parity at 2e-2, which eight short steps
+/// cannot establish. The numerics are gated by `sdpa_fused_packed_gpu_parity.rs`.
 #[cfg(feature = "cuda")]
 #[test]
 #[ignore = "requires CUDA GPU (two real training runs)"]
@@ -290,18 +318,7 @@ fn packed_fused_training_smoke_on_gpu() {
         plain.stderr
     );
 
-    let (max_diff, worst) = checkpoint_max_diff(&save_fused, &save_plain);
-    assert!(
-        max_diff < 2e-2,
-        "fused vs decomposed GPU checkpoints diverged: max_diff={max_diff:.3e} at {worst} \
-         (a smoke bound; run sdpa_fused_packed_gpu_parity for the kernels' numerics)"
-    );
-    // And they must not be trivially identical — that would mean the fused
-    // path silently declined every step despite printing nothing.
-    assert!(
-        max_diff > 0.0,
-        "checkpoints bit-identical — fused path likely never ran"
-    );
+    assert_complete_finite_and_distinct(&save_fused, &save_plain);
     let _ = std::fs::remove_file(&save_fused);
     let _ = std::fs::remove_file(&save_plain);
 }
