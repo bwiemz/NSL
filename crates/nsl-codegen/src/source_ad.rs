@@ -5197,25 +5197,20 @@ impl<'a> WengertExtractor<'a> {
                     "mse_loss" => PrimalOp::MSELoss,
                     "l1_loss" => PrimalOp::L1Loss,
                     // Reductions
-                    // `sum(x)` reduces everything; `sum(x, d)` and
-                    // `sum(x, d, 0)` reduce one literal dim. A non-literal
-                    // dim, or keepdim on, stays on the tape: this extractor
-                    // used to return a FULL reduction for all of them.
+                    // `sum(x)` reduces everything; `sum(x, d, 0)` reduces one
+                    // literal dim (a negative one counts from the end, as in
+                    // the general call path). A non-literal dim, or keepdim
+                    // on, stays on the tape: this extractor used to return a
+                    // FULL reduction for all of them. The general path takes
+                    // only these two arities, so neither does this.
                     "sum" | "mean" => {
                         let dim = match args.len() {
                             1 => None,
-                            2 | 3 => {
+                            3 => {
                                 let d = Self::extract_int_literal(&args[1].value);
-                                let keepdim = match args.get(2).map(|a| &a.value.kind) {
-                                    None => Some(false),
-                                    Some(ExprKind::BoolLiteral(b)) => Some(*b),
-                                    Some(_) => args
-                                        .get(2)
-                                        .and_then(|a| Self::extract_int_literal(&a.value))
-                                        .map(|k| k != 0),
-                                };
+                                let keepdim = Self::extract_int_literal(&args[2].value);
                                 match (d, keepdim) {
-                                    (Some(d), Some(false)) => Some(d),
+                                    (Some(d), Some(0)) => Some(d),
                                     _ => {
                                         nsl_log::nsl_log!(WARN, "source-ad",
                                             "[source-ad] {}() needs a literal dim and keepdim off; \

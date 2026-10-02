@@ -1820,12 +1820,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   (`source_ad_rule_cert.rs`: `sum_dim`, `mean_dim`, `softmax_dim0`,
   `log_softmax_dim0` delisted; `sum_dim_neg`, `sum_dim_keepdim`,
   `softmax_mid`, `log_softmax_mid` added):
-  - **Source AD turned `sum(x, d)` / `mean(x, d)` into a FULL reduction**:
-    the extractor built `Sum{dim: None}` whatever the arguments. A literal
-    dim with keepdim off is now honoured, and its backward re-inserts the
-    dim and expands (`SumDimBackward`; `MeanDimBackward` now does the same
-    after its 1/size scale). A non-literal dim, or keepdim on, falls back
-    to the tape.
+  - **Source AD turned `sum(x, d, 0)` / `mean(x, d, 0)` into a FULL
+    reduction**: the extractor built `Sum{dim: None}` whatever the
+    arguments. A literal dim with keepdim off is now honoured, and its
+    backward re-inserts the dim and expands (`SumDimBackward`;
+    `MeanDimBackward` now does the same after its 1/size scale). A
+    non-literal dim, or keepdim on, falls back to the tape.
+  - **`sum(x, -1, 0)` and `mean(x, -1, 0)` reduced EVERYTHING** outside
+    source AD: `-1` is the runtime's global-reduction sentinel, and the
+    call path passed the user's dim straight through (so
+    `examples/m31_reduction_fusion.nsl`'s softmax divided by the global
+    sum). A negative dim is now resolved against the rank first, so `-1`
+    is the last dim, as for `reduce_max` and `softmax`, in both AD modes
+    (`sum_dim_last`, `mean_dim_last`).
   - **Softmax / log-softmax backward summed along the LAST dim** whatever
     the softmax's `dim`, so `softmax(x, 0)` had a wrong gradient. The sum
     now runs along the softmax's own dim. `dim = -1` keeps the old code; a

@@ -1152,9 +1152,9 @@ pub fn ad_cert_status(op: &PrimalOp) -> AdCertStatus {
         }
         PrimalOp::Transpose { .. } => Certified(&["transpose", "transpose_3d"]),
         PrimalOp::Sum { .. } => {
-            Certified(&["sum_all", "sum_dim", "sum_dim_neg", "sum_dim_keepdim"])
+            Certified(&["sum_all", "sum_dim", "sum_dim_neg", "sum_dim_keepdim", "sum_dim_last"])
         }
-        PrimalOp::Mean { .. } => Certified(&["mean_all", "mean_dim"]),
+        PrimalOp::Mean { .. } => Certified(&["mean_all", "mean_dim", "mean_dim_last"]),
         PrimalOp::Softmax { .. } => Certified(&["softmax_last", "softmax_dim0", "softmax_mid"]),
         PrimalOp::LogSoftmax { .. } => {
             Certified(&["log_softmax_last", "log_softmax_dim0", "log_softmax_mid"])
