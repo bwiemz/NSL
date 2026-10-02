@@ -217,3 +217,78 @@ fn toggling_placement_flags_warns_but_resumes() {
         b.stderr
     );
 }
+
+/// A residual-block model WGGO can prune (`blocks.N`, two residual Adds per
+/// block), for the layer-prune resume gate below. AdamW because checkpoints
+/// carry only Adam-family moments; this gate is about the record, not numerics.
+fn prunable_fixture(train_cfg: &str) -> String {
+    format!(
+        r#"from nsl.nn.losses import mse_loss
+
+model Blk:
+    wa: Tensor = ones([4, 4]) * 0.05
+    wb: Tensor = ones([4, 4]) * 0.05
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = x + (x @ self.wa)
+        return h + (h @ self.wb)
+
+model Net:
+    blocks: [Blk; 3] = Blk()
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = x
+        for block in self.blocks:
+            h = block.forward(h)
+        return h
+
+let m = Net()
+let x = ones([2, 4]) * 0.1
+let y = zeros([2, 4])
+
+train(model = m{train_cfg}):
+    optimizer: AdamW(lr = 0.01)
+    step(batch):
+        let loss = mse_loss(m.forward(x), y)
+
+print("FIXTURE_DONE")
+"#
+    )
+}
+
+/// A WGGO layer prune deletes blocks from the model a step computes, so a
+/// resume across a prune change is refused, naming `prune_layers`; the same
+/// prune resumes. (#807 left the prune out of the record.)
+#[test]
+fn changing_the_layer_prune_on_resume_is_refused() {
+    let tmp = fresh_dir("prune");
+    let pruned: &[&str] = &["--source-ad", "--wggo", "greedy", "--wggo-prune-layers", "blocks.1"];
+    let save = prunable_fixture(r#", epochs = 1, checkpoint_save = "ck.nslm", checkpoint_every = 1"#);
+    let load = prunable_fixture(r#", epochs = 2, checkpoint_load = "ck.nslm""#);
+
+    let a = run_in(&tmp, "a.nsl", pruned, &save);
+    assert!(a.ok, "pruned save run failed:\n{}", a.stderr);
+    assert!(
+        sidecar_text(&tmp).contains("prune_layers=blocks.1"),
+        "the record must carry the prune:\n{}",
+        sidecar_text(&tmp)
+    );
+
+    let same = run_in(&tmp, "b.nsl", pruned, &load);
+    assert!(same.ok, "resuming with the same prune must succeed:\n{}", same.stderr);
+    assert!(!same.stderr.contains("ARITHMETIC differs"), "{}", same.stderr);
+
+    let dropped = run_in(&tmp, "c.nsl", &["--source-ad", "--wggo", "greedy"], &load);
+    assert!(
+        !dropped.ok,
+        "resuming a pruned checkpoint unpruned must be refused:\n{}",
+        dropped.stderr
+    );
+    assert!(
+        dropped.stderr.contains("prune_layers: checkpoint blocks.1 -> this run <absent>"),
+        "the refusal must name the prune:\n{}",
+        dropped.stderr
+    );
+    assert!(!dropped.stdout.contains("FIXTURE_DONE"), "the refusal must land before training resumes");
+}
+
