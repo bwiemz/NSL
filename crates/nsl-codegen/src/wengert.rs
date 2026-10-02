@@ -183,10 +183,12 @@ pub fn type_for_op(op: &PrimalOp) -> WengertType {
 pub fn is_view_producing_op(op: &PrimalOp) -> bool {
     match op {
         PrimalOp::Transpose { .. } | PrimalOp::Reshape { .. } => true,
-        PrimalOp::Passthrough(name) => matches!(
-            name.as_str(),
-            "reshape" | "contiguous" | "expand" | "squeeze" | "unsqueeze"
-        ),
+        PrimalOp::Passthrough(name) => {
+            matches!(
+                name.as_str(),
+                "reshape" | "contiguous" | "expand" | "squeeze" | "unsqueeze"
+            ) || name.starts_with(crate::source_ad::UNSQUEEZE_AT_PREFIX)
+        }
         _ => false,
     }
 }

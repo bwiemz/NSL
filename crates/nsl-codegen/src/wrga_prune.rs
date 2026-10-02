@@ -92,9 +92,9 @@ pub(crate) fn save_requirements(op: &PrimalOp) -> SaveRequirements {
             needs_inputs: true,
             needs_output: true,
         },
-        // A full Sum expands its gradient to its operand's shape, read off
-        // the live operand (`ExpandLike`).
-        Sum { dim: None } => SaveRequirements {
+        // A Sum expands its gradient to its operand's shape, read off the
+        // live operand (`ExpandLike`; over one dim, `SumDimBackward`).
+        Sum { .. } => SaveRequirements {
             needs_inputs: true,
             needs_output: false,
         },

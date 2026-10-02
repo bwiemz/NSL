@@ -1816,6 +1816,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   - **`mse_loss` / `l1_loss`** gave the target no gradient. It now gets
     the negated pred gradient, reduced to its own shape.
 
+- **Reductions and softmax over a dim, in both AD modes**
+  (`source_ad_rule_cert.rs`: `sum_dim`, `mean_dim`, `softmax_dim0`,
+  `log_softmax_dim0` delisted; `sum_dim_neg`, `sum_dim_keepdim`,
+  `softmax_mid`, `log_softmax_mid` added):
+  - **Source AD turned `sum(x, d)` / `mean(x, d)` into a FULL reduction**:
+    the extractor built `Sum{dim: None}` whatever the arguments. A literal
+    dim with keepdim off is now honoured, and its backward re-inserts the
+    dim and expands (`SumDimBackward`; `MeanDimBackward` now does the same
+    after its 1/size scale). A non-literal dim, or keepdim on, falls back
+    to the tape.
+  - **Softmax / log-softmax backward summed along the LAST dim** whatever
+    the softmax's `dim`, so `softmax(x, 0)` had a wrong gradient. The sum
+    now runs along the softmax's own dim. `dim = -1` keeps the old code; a
+    literal positive dim (`log_softmax(logits, 1)` in the `csla_ffn`
+    fixtures, the last dim there) drops one `nsl_tensor_ndim` call.
+  - **Tape: `sum(x, -2)` aborted the backward.** The forward resolved the
+    negative dim and recorded it raw; the backward cast -2 to `usize`.
+    Reductions now resolve it in the backward, for sum, mean and max.
+  - **Tape: a keepdim reduction's gradient read the wrong stride**, since
+    the backward skipped the kept size-1 dim without stepping past it. A
+    reverted fix makes `sum_dim_keepdim` read an out-of-bounds denormal.
+
 - **`@freeze` froze nothing.** The decorator was validated and handed to
   WRGA's analysis, and nothing in the train block read it. A frozen weight
   stayed in the optimizer's parameter list and trained exactly as if

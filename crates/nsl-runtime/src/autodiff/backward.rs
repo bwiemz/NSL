@@ -33,6 +33,19 @@ use super::grad_utils::{
 use super::{ones_from_shape, TapeOp, TAPE};
 
 /// Read a tensor's shape into an owned Vec (for capture before an eager free).
+/// A reduction's recorded dim as an axis of its input. The forward resolves
+/// a negative dim locally but records it raw (`sum(x, -2)` records -2), so the
+/// backward resolves it again; casting it straight to usize indexed past the
+/// end. (Sum/Mean record -1 for a GLOBAL reduction, which their backward
+/// handles before reaching here; reduce_max's -1 is the last dim.)
+fn reduced_dim(dim: i64, input_shape: &[i64]) -> usize {
+    if dim < 0 {
+        (dim + input_shape.len() as i64) as usize
+    } else {
+        dim as usize
+    }
+}
+
 fn shape_vec_of(ptr: i64) -> Vec<i64> {
     let t = NslTensor::from_ptr(ptr);
     (0..t.ndim as usize).map(|i| unsafe { *t.shape.add(i) }).collect()
@@ -1528,7 +1541,8 @@ pub(crate) fn run_backward_core_strict(
                         accumulate_grad(&mut grad_map, *a, grad_a);
                     } else {
                         // Dimensional reduction: broadcast g along reduced dim
-                        let grad_a = broadcast_grad_along_dim(g, input_shape, *dim as usize);
+                        let d = reduced_dim(*dim, input_shape);
+                        let grad_a = broadcast_grad_along_dim(g, input_shape, d);
                         accumulate_grad(&mut grad_map, *a, grad_a);
                     }
                 }
@@ -1555,7 +1569,8 @@ pub(crate) fn run_backward_core_strict(
                         accumulate_grad(&mut grad_map, *a, grad_a);
                     } else {
                         // Dimensional reduction: broadcast then scale
-                        let expanded = broadcast_grad_along_dim(g, input_shape, *dim as usize);
+                        let d = reduced_dim(*dim, input_shape);
+                        let expanded = broadcast_grad_along_dim(g, input_shape, d);
                         let grad_a = tensor_mul_scalar(expanded, 1.0 / (*num_elements as f64), 0);
                         tensor_free(expanded);
                         accumulate_grad(&mut grad_map, *a, grad_a);
@@ -1565,7 +1580,8 @@ pub(crate) fn run_backward_core_strict(
             TapeOp::ReduceMax { a, out, dim, saved_argmax, input_shape, .. } => {
                 if let Some(&g) = grad_map.get(out) {
                     // Scatter grad to argmax positions, zero elsewhere
-                    let grad_a = scatter_grad_to_argmax(g, input_shape, *dim as usize, saved_argmax);
+                    let d = reduced_dim(*dim, input_shape);
+                    let grad_a = scatter_grad_to_argmax(g, input_shape, d, saved_argmax);
                     accumulate_grad(&mut grad_map, *a, grad_a);
                 }
             }

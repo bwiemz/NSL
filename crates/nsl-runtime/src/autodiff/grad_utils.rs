@@ -305,7 +305,8 @@ pub(crate) fn reduce_grad_for_broadcast(grad_ptr: i64, orig_shape: &[i64]) -> i6
 }
 
 /// Broadcast a gradient tensor along a reduced dimension back to input_shape.
-/// grad has the reduced shape; we need to expand it along `dim` to match input_shape.
+/// grad has the reduced shape -- `dim` removed, or kept as size 1 by a keepdim
+/// reduction -- and is expanded along `dim` to match input_shape.
 pub(crate) fn broadcast_grad_along_dim(grad_ptr: i64, input_shape: &[i64], dim: usize) -> i64 {
     let grad = NslTensor::from_ptr(grad_ptr);
     // Device bounce: the loop below reads grad data through host pointers.
@@ -361,6 +362,11 @@ pub(crate) fn broadcast_grad_along_dim(grad_ptr: i64, input_shape: &[i64], dim: 
         let mut gi = 0usize;
         for (d, &idx) in indices.iter().enumerate().take(ndim) {
             if d == dim {
+                // A keepdim grad still has this (size-1) dim: step past its
+                // stride, or every later dim reads the wrong one.
+                if grad_ndim == ndim {
+                    gi += 1;
+                }
                 continue;
             }
             grad_idx += idx * grad_strides[gi];
