@@ -8,6 +8,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **Source-AD rule certification (`source_ad_rule_cert.rs`) and a coverage
+  gate.** Each of 60 certificates spells one primitive as NSL source, takes
+  `grad` of `sum(EXPR * r)` for a random `r`, and holds the forward loss and
+  the RAW gradients to an f64 central-difference oracle, under both the tape
+  and `--source-ad`. A source run must also prove it engaged (one
+  `Using source-to-source AD` per block, no fallback line). No optimizer is
+  involved, so a gradient-scale bug cannot hide behind AdamW. Shape variants
+  cover broadcasting (row, column, scalar, numerator), batched matmul in
+  each direction, reductions and softmax over a non-last dim, and
+  non-default eps/scale/causal arguments.
+
+  The first run found 20 source-AD failures, now a RATCHET (`known` per
+  certificate: a listed failure must keep failing, so a fix must delist it).
+  The tape passes all 60.
+  - **Wrong gradient:**
+    - `abs` has the wrong sign where x < 0.
+    - `tensor_cos`/`tensor_sin` use an identity rule.
+    - Softmax/log-softmax over dim 0 reduce along the last dim.
+    - `layernorm` gets dx wrong and leaves db at the broadcast shape.
+    - The mse/l1 target gets no gradient.
+    - `tensor_cat` operands get none either.
+  - **Wrong shape:** `matmul([3,4], [2,4,3])` returns da with the batch dim
+    left in.
+  - **Wrong forward:** the extractor maps `clamp` to infinite bounds, `sum`/
+    `mean` with a dim to a full reduction, and layernorm/rmsnorm to eps 1e-5
+    whatever the argument.
+  - **Crash:** `gather` reads its dim literal as the index tensor. An SDPA
+    grad block panics Cranelift ("block3 is not filled").
+
+  Coverage: `ad_rules::ad_cert_status` gives every `PrimalOp` a status
+  (certified by named certificates, not differentiable, adjoint-only,
+  unreachable, or uncertified with what exists instead) with no wildcard
+  arm, so a new op does not compile without one. Unit tests tie the statuses
+  to the rules that exist (a rule added to an op re-opens its status) and
+  hold the inventory to the enum's source. `RULED_PASSTHROUGHS` now gates
+  the passthrough rules, so a new passthrough rule cannot fire unlisted. The
+  CLI test holds the certificate names on both sides to each other.
+
 - **WGGO layer prune is reachable: whole-block chain-collapse, plus
   `--wggo-prune-layers` and `--wggo-layer-prune-fraction` to request it.**
   Until now no program could prune a layer, and nothing said so:
