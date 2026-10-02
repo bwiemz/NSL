@@ -712,6 +712,29 @@ fn call(
     compiler.compile_call_by_name(builder, name, args)
 }
 
+/// The dim baked into a `<prefix><dim>` passthrough name.
+fn parse_baked_dim(name: &str, prefix: &str) -> Result<i64, CodegenError> {
+    name[prefix.len()..]
+        .parse()
+        .map_err(|_| CodegenError::new(format!("malformed passthrough `{name}`: no integer dim")))
+}
+
+/// A dim as a Cranelift value, a negative one resolved against `reference`'s
+/// rank at run time (the runtime reads `-1` as "all dims", not "last").
+fn resolve_baked_dim(
+    compiler: &mut Compiler,
+    builder: &mut FunctionBuilder,
+    dim: i64,
+    reference: Value,
+) -> Result<Value, CodegenError> {
+    if dim >= 0 {
+        return Ok(builder.ins().iconst(cl_types::I64, dim));
+    }
+    let ndim = call(compiler, builder, "nsl_tensor_ndim", &[reference])?;
+    let offset = builder.ins().iconst(cl_types::I64, dim);
+    Ok(builder.ins().iadd(ndim, offset))
+}
+
 fn should_cleanup_result(op: &PrimalOp, result_type: WengertType) -> bool {
     if !matches!(result_type, WengertType::Tensor | WengertType::List) {
         return false;
@@ -3646,6 +3669,22 @@ fn lower_single_op(
                 // "causal_mask_add" was used by the decomposed SDPA path
                 // (commit e8d5a76) and has been removed in favor of the fused
                 // ScaledDotProductAttention + FlashAttentionBackwardExtract path.
+                // Source-AD reduction adjoints with the dim baked into the
+                // name (see `source_ad::UNSQUEEZE_AT_PREFIX`). A negative
+                // dim counts from the end of the reference tensor's rank.
+                _ if name.starts_with(crate::source_ad::UNSQUEEZE_AT_PREFIX) => {
+                    // inputs = [grad, reduced_input]
+                    let d = parse_baked_dim(name, crate::source_ad::UNSQUEEZE_AT_PREFIX)?;
+                    let dim = resolve_baked_dim(compiler, builder, d, inputs[1])?;
+                    call(compiler, builder, "nsl_tensor_unsqueeze", &[inputs[0], dim])
+                }
+                _ if name.starts_with(crate::source_ad::SUM_KEEPDIM_AT_PREFIX) => {
+                    // inputs = [x]
+                    let d = parse_baked_dim(name, crate::source_ad::SUM_KEEPDIM_AT_PREFIX)?;
+                    let dim = resolve_baked_dim(compiler, builder, d, inputs[0])?;
+                    let keepdim = builder.ins().iconst(cl_types::I64, 1);
+                    call(compiler, builder, "nsl_tensor_sum_dim", &[inputs[0], dim, keepdim])
+                }
                 _ if name.starts_with("dict_get:") => {
                     // inputs = [dict_ptr]
                     // Dict field access: batch.input_ids -> nsl_dict_get_str(batch, "input_ids")

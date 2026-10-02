@@ -109,9 +109,14 @@ pub enum AdjointExpr {
     /// gradient; leaving it one element relied on each consumer to broadcast
     /// it, which a matmul's backward does not.
     ExpandLike(VarId, VarId),
-    /// MeanDimBackward(grad, input, result): a mean over ONE dim, scaled like
-    /// `MeanBackward` but passed through un-expanded (see the Sum rule).
-    MeanDimBackward(VarId, VarId, VarId),
+    /// SumDimBackward(grad, input, dim): the adjoint of a sum over `dim`
+    /// (keepdim off). The reduced dim is re-inserted at `dim` and the gradient
+    /// expanded to the input's shape.
+    SumDimBackward(VarId, VarId, i64),
+    /// MeanDimBackward(grad, input, result, dim): a mean over `dim`, scaled
+    /// like `MeanBackward` (by numel(result)/numel(input), i.e. 1/size(dim))
+    /// and then re-expanded like `SumDimBackward`.
+    MeanDimBackward(VarId, VarId, VarId, i64),
     ScaleBroadcast(VarId, f64),
     Transpose(VarId, usize, usize),
     ReshapeLike(VarId, VarId),
@@ -144,10 +149,12 @@ pub enum AdjointExpr {
     ClampBackward(VarId, VarId, f64, f64),
 
     // Softmax/LogSoftmax backward
-    /// Softmax backward: grad - sum(grad * y) * y  (y = softmax output)
-    SoftmaxBackward(VarId, VarId),
-    /// LogSoftmax backward: grad - exp(y) * sum(grad)  (y = log_softmax output)
-    LogSoftmaxBackward(VarId, VarId),
+    /// Softmax backward: y * (grad - sum_dim(grad * y))  (y = softmax output),
+    /// the sum taken along the softmax's own `dim`. args: (grad, y, dim)
+    SoftmaxBackward(VarId, VarId, i64),
+    /// LogSoftmax backward: grad - exp(y) * sum_dim(grad)  (y = log_softmax
+    /// output), along `dim`. args: (grad, y, dim)
+    LogSoftmaxBackward(VarId, VarId, i64),
 
     // Normalization backward
     /// LayerNorm backward: 3 adjoint components for input, gamma, beta
@@ -419,17 +426,16 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             input_var: op.inputs[0],
             expr: AdjointExpr::Transpose(output_bar, *dim0, *dim1),
         }],
-        // The extractor emits every primal sum and mean as a FULL reduction
-        // (`dim: None`); a `dim: Some(_)` reduction only ever appears inside
-        // adjoint code, which these rules never see, and keeps its old
-        // pass-through rule rather than guess an unsqueeze axis.
+        // `sum(x)` is a full reduction; `sum(x, d)` / `sum(x, d, 0)` reduces
+        // one dim (the extractor sends a keepdim sum to the tape). The dim's
+        // gradient is the upstream gradient re-inserted at `d` and expanded.
         PrimalOp::Sum { dim: None } => vec![InputAdjoint {
             input_var: op.inputs[0],
             expr: AdjointExpr::ExpandLike(output_bar, op.inputs[0]),
         }],
-        PrimalOp::Sum { dim: Some(_) } => vec![InputAdjoint {
+        PrimalOp::Sum { dim: Some(d) } => vec![InputAdjoint {
             input_var: op.inputs[0],
-            expr: AdjointExpr::Broadcast(output_bar),
+            expr: AdjointExpr::SumDimBackward(output_bar, op.inputs[0], *d),
         }],
         // Mean backward: broadcast(grad) / n. The 1/n factor depends on the
         // reduced size, which the Wengert list does not carry, so it is taken
@@ -445,9 +451,9 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             input_var: op.inputs[0],
             expr: AdjointExpr::MeanBackward(output_bar, op.inputs[0], op.result),
         }],
-        PrimalOp::Mean { dim: Some(_) } => vec![InputAdjoint {
+        PrimalOp::Mean { dim: Some(d) } => vec![InputAdjoint {
             input_var: op.inputs[0],
-            expr: AdjointExpr::MeanDimBackward(output_bar, op.inputs[0], op.result),
+            expr: AdjointExpr::MeanDimBackward(output_bar, op.inputs[0], op.result, *d),
         }],
         PrimalOp::Reshape { .. } => vec![InputAdjoint {
             input_var: op.inputs[0],
@@ -489,13 +495,13 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
         }],
 
         // --- Softmax / LogSoftmax ---
-        PrimalOp::Softmax { .. } => vec![InputAdjoint {
+        PrimalOp::Softmax { dim } => vec![InputAdjoint {
             input_var: op.inputs[0],
-            expr: AdjointExpr::SoftmaxBackward(output_bar, op.result),
+            expr: AdjointExpr::SoftmaxBackward(output_bar, op.result, *dim),
         }],
-        PrimalOp::LogSoftmax { .. } => vec![InputAdjoint {
+        PrimalOp::LogSoftmax { dim } => vec![InputAdjoint {
             input_var: op.inputs[0],
-            expr: AdjointExpr::LogSoftmaxBackward(output_bar, op.result),
+            expr: AdjointExpr::LogSoftmaxBackward(output_bar, op.result, *dim),
         }],
 
         // --- Normalization ---
@@ -1025,7 +1031,6 @@ pub fn saved_for_backward(op: &PrimalOp) -> SavedRequirement {
         PrimalOp::Neg
         | PrimalOp::Transpose { .. }
         | PrimalOp::Reshape { .. }
-        | PrimalOp::Sum { dim: Some(_) }
         | PrimalOp::Broadcast
         | PrimalOp::Concat { .. }
         | PrimalOp::Split { .. }
@@ -1045,7 +1050,7 @@ pub fn saved_for_backward(op: &PrimalOp) -> SavedRequirement {
         // off the live tensor.
         PrimalOp::Add
         | PrimalOp::Sub
-        | PrimalOp::Sum { dim: None }
+        | PrimalOp::Sum { .. }
         | PrimalOp::Mul
         | PrimalOp::Div
         | PrimalOp::Matmul
@@ -1146,10 +1151,14 @@ pub fn ad_cert_status(op: &PrimalOp) -> AdCertStatus {
             Certified(&["matmul_2d", "matmul_3d_2d", "matmul_2d_3d", "matmul_3d_3d"])
         }
         PrimalOp::Transpose { .. } => Certified(&["transpose", "transpose_3d"]),
-        PrimalOp::Sum { .. } => Certified(&["sum_all", "sum_dim"]),
-        PrimalOp::Mean { .. } => Certified(&["mean_all", "mean_dim"]),
-        PrimalOp::Softmax { .. } => Certified(&["softmax_last", "softmax_dim0"]),
-        PrimalOp::LogSoftmax { .. } => Certified(&["log_softmax_last", "log_softmax_dim0"]),
+        PrimalOp::Sum { .. } => {
+            Certified(&["sum_all", "sum_dim", "sum_dim_neg", "sum_dim_keepdim", "sum_dim_last"])
+        }
+        PrimalOp::Mean { .. } => Certified(&["mean_all", "mean_dim", "mean_dim_last"]),
+        PrimalOp::Softmax { .. } => Certified(&["softmax_last", "softmax_dim0", "softmax_mid"]),
+        PrimalOp::LogSoftmax { .. } => {
+            Certified(&["log_softmax_last", "log_softmax_dim0", "log_softmax_mid"])
+        }
         PrimalOp::Reshape { .. } => AdjointOnly(
             "the full-reduction adjoints; NSL `.reshape` lowers to Passthrough(\"reshape\")",
         ),
@@ -1675,10 +1684,10 @@ mod tests {
     }
 
     #[test]
-    fn test_sum_broadcasts() {
-        let op = make_op(1, PrimalOp::Sum { dim: Some(0) }, vec![0]);
+    fn test_sum_over_a_dim_reexpands_along_it() {
+        let op = make_op(1, PrimalOp::Sum { dim: Some(-1) }, vec![0]);
         let adj = apply_ad_rule(&op, 100);
-        assert!(matches!(adj[0].expr, AdjointExpr::Broadcast(100)));
+        assert!(matches!(adj[0].expr, AdjointExpr::SumDimBackward(100, 0, -1)));
     }
 
     /// A full sum's gradient is expanded to its operand's shape; a bare
@@ -1700,7 +1709,7 @@ mod tests {
         assert!(matches!(adj[0].expr, AdjointExpr::MeanBackward(100, 0, 1)));
         let op = make_op(1, PrimalOp::Mean { dim: Some(0) }, vec![0]);
         let adj = apply_ad_rule(&op, 100);
-        assert!(matches!(adj[0].expr, AdjointExpr::MeanDimBackward(100, 0, 1)));
+        assert!(matches!(adj[0].expr, AdjointExpr::MeanDimBackward(100, 0, 1, 0)));
     }
 
     #[test]
@@ -1862,7 +1871,12 @@ mod tests {
         let op = make_op(1, PrimalOp::Softmax { dim: -1 }, vec![0]);
         let adj = apply_ad_rule(&op, 100);
         assert_eq!(adj.len(), 1);
-        assert!(matches!(adj[0].expr, AdjointExpr::SoftmaxBackward(100, 1)));
+        assert!(matches!(adj[0].expr, AdjointExpr::SoftmaxBackward(100, 1, -1)));
+        let op = make_op(1, PrimalOp::Softmax { dim: 0 }, vec![0]);
+        assert!(matches!(
+            apply_ad_rule(&op, 100)[0].expr,
+            AdjointExpr::SoftmaxBackward(100, 1, 0)
+        ));
         assert_eq!(
             saved_for_backward(&PrimalOp::Softmax { dim: -1 }),
             SavedRequirement::Output
@@ -2193,7 +2207,7 @@ mod tests {
         assert_eq!(adj.len(), 1);
         assert!(matches!(
             adj[0].expr,
-            AdjointExpr::LogSoftmaxBackward(100, 1)
+            AdjointExpr::LogSoftmaxBackward(100, 1, -1)
         ));
         assert_eq!(
             saved_for_backward(&PrimalOp::LogSoftmax { dim: -1 }),

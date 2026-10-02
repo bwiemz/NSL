@@ -1830,6 +1830,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   - **`mse_loss` / `l1_loss`** gave the target no gradient. It now gets
     the negated pred gradient, reduced to its own shape.
 
+- **Reductions and softmax over a dim, in both AD modes**
+  (`source_ad_rule_cert.rs`: `sum_dim`, `mean_dim`, `softmax_dim0`,
+  `log_softmax_dim0` delisted; `sum_dim_neg`, `sum_dim_keepdim`,
+  `softmax_mid`, `log_softmax_mid` added):
+  - **Source AD turned `sum(x, d, 0)` / `mean(x, d, 0)` into a FULL
+    reduction**: the extractor built `Sum{dim: None}` whatever the
+    arguments. A literal dim with keepdim off is now honoured, and its
+    backward re-inserts the dim and expands (`SumDimBackward`;
+    `MeanDimBackward` now does the same after its 1/size scale). A
+    non-literal dim, or keepdim on, falls back to the tape.
+  - **`sum(x, -1, 0)` and `mean(x, -1, 0)` reduced EVERYTHING** outside
+    source AD: `-1` is the runtime's global-reduction sentinel, and the
+    call path passed the user's dim straight through (so
+    `examples/m31_reduction_fusion.nsl`'s softmax divided by the global
+    sum). A negative dim is now resolved against the rank first, so `-1`
+    is the last dim, as for `reduce_max` and `softmax`, in both AD modes
+    (`sum_dim_last`, `mean_dim_last`).
+  - **Softmax / log-softmax backward summed along the LAST dim** whatever
+    the softmax's `dim`, so `softmax(x, 0)` had a wrong gradient. The sum
+    now runs along the softmax's own dim. `dim = -1` keeps the old code; a
+    literal positive dim (`log_softmax(logits, 1)` in the `csla_ffn`
+    fixtures, the last dim there) drops one `nsl_tensor_ndim` call.
+  - **Tape: `sum(x, -2)` aborted the backward.** The forward resolved the
+    negative dim and recorded it raw; the backward cast -2 to `usize`.
+    Reductions now resolve it in the backward, for sum, mean and max.
+  - **Tape: a keepdim reduction's gradient read the wrong stride**, since
+    the backward skipped the kept size-1 dim without stepping past it. A
+    reverted fix makes `sum_dim_keepdim` read an out-of-bounds denormal.
 - **A WGGO layer prune is part of the checkpoint's execution record.** #807
   made `--wggo-prune-layers` / `--wggo-layer-prune-fraction` delete whole
   blocks from the forward, but left them out of the exec fingerprint. A

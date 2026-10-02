@@ -1715,6 +1715,15 @@ impl Compiler<'_> {
                 let t = self.compile_nested_expr(builder, state, &args[0].value)?;
                 let dim = self.compile_nested_expr(builder, state, &args[1].value)?;
                 let keepdim = self.compile_nested_expr(builder, state, &args[2].value)?;
+                // To the user `-1` is the LAST dim, as for reduce_max and
+                // softmax (and source AD's lowering); to nsl_tensor_sum_dim
+                // and mean_dim it is the GLOBAL-reduction sentinel, so
+                // `sum(x, -1, 0)` summed everything. Resolve a negative dim
+                // against the rank before the call.
+                let ndim = self.compile_call_by_name(builder, "nsl_tensor_ndim", &[t])?;
+                let from_end = builder.ins().iadd(ndim, dim);
+                let is_negative = builder.ins().icmp_imm_s(IntCC::SignedLessThan, dim, 0);
+                let dim = builder.ins().select(is_negative, from_end, dim);
                 // M46: Swap to deterministic kernel variants when deterministic mode is active
                 let rt_name = if self.compile_options.determinism.enabled {
                     match func_name.as_str() {

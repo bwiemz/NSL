@@ -866,6 +866,27 @@ impl AdjointGenerator {
         self.emit_op(PrimalOp::Passthrough("contiguous".into()), vec![view])
     }
 
+    /// The adjoint of a reduction over `dim` (keepdim off): `grad` with the
+    /// reduced dim re-inserted at `dim`, expanded to `input`'s shape.
+    fn unreduce_dim(&mut self, grad: VarId, input: VarId, dim: i64) -> VarId {
+        let kept = self.emit_op(
+            PrimalOp::Passthrough(format!("{UNSQUEEZE_AT_PREFIX}{dim}")),
+            vec![grad, input],
+        );
+        self.expand_like(kept, input)
+    }
+
+    /// `x` summed along `dim` with the dim kept (size 1), for a backward that
+    /// broadcasts it straight back. `sum_keepdim_last` for the last dim.
+    fn sum_keepdim(&mut self, x: VarId, dim: i64) -> VarId {
+        let name = if dim == -1 {
+            "sum_keepdim_last".to_string()
+        } else {
+            format!("{SUM_KEEPDIM_AT_PREFIX}{dim}")
+        };
+        self.emit_op(PrimalOp::Passthrough(name), vec![x])
+    }
+
     fn lower_adjoint_expr(&mut self, expr: AdjointExpr) -> VarId {
         // Identity: pass-through, no op needed
         if let AdjointExpr::Identity(v) = expr {
@@ -934,10 +955,11 @@ impl AdjointGenerator {
                     self.emit_op(PrimalOp::Passthrough("mean_grad_scale".into()), vec![v, input, result]);
                 self.expand_like(scaled, input)
             }
-            AdjointExpr::MeanDimBackward(v, input, result) => {
+            AdjointExpr::SumDimBackward(v, input, dim) => self.unreduce_dim(v, input, dim),
+            AdjointExpr::MeanDimBackward(v, input, result, dim) => {
                 let scaled =
                     self.emit_op(PrimalOp::Passthrough("mean_grad_scale".into()), vec![v, input, result]);
-                self.emit_op(PrimalOp::Broadcast, vec![scaled])
+                self.unreduce_dim(scaled, input, dim)
             }
             AdjointExpr::ExpandLike(v, input) => self.expand_like(v, input),
             AdjointExpr::ScaleBroadcast(v, n) => {
@@ -1097,24 +1119,20 @@ impl AdjointGenerator {
             // nsl_tensor_sum_dim(input, ndim-1, keepdim=1). Using keepdim=1
             // preserves the trailing dimension as size-1, so the subsequent
             // Sub broadcasts naturally (e.g. [B,nh,S,1] against [B,nh,S,S]).
-            AdjointExpr::SoftmaxBackward(y_bar, y) => {
+            // A softmax over another dim sums along THAT dim (`sum_keepdim`);
+            // summing the last one regardless was the `softmax(x, 0)` bug.
+            AdjointExpr::SoftmaxBackward(y_bar, y, dim) => {
                 let dot = self.emit_op(PrimalOp::Mul, vec![y_bar, y]);
-                let dot_sum = self.emit_op(
-                    PrimalOp::Passthrough("sum_keepdim_last".into()),
-                    vec![dot],
-                );
+                let dot_sum = self.sum_keepdim(dot, dim);
                 let diff = self.emit_op(PrimalOp::Sub, vec![y_bar, dot_sum]);
                 self.emit_op(PrimalOp::Mul, vec![y, diff])
             }
 
             // --- LogSoftmax backward: grad - exp(y) * sum(grad) ---
-            // Same sum_keepdim_last pattern as softmax backward.
-            AdjointExpr::LogSoftmaxBackward(y_bar, y) => {
+            // Same keepdim-sum pattern as softmax backward.
+            AdjointExpr::LogSoftmaxBackward(y_bar, y, dim) => {
                 let exp_y = self.emit_op(PrimalOp::Exp, vec![y]);
-                let grad_sum = self.emit_op(
-                    PrimalOp::Passthrough("sum_keepdim_last".into()),
-                    vec![y_bar],
-                );
+                let grad_sum = self.sum_keepdim(y_bar, dim);
                 let correction = self.emit_op(PrimalOp::Mul, vec![exp_y, grad_sum]);
                 self.emit_op(PrimalOp::Sub, vec![y_bar, correction])
             }
@@ -1950,6 +1968,14 @@ pub fn reachable_result_vars(
     }
     reachable
 }
+
+/// `unsqueeze_at:<d>` -- inputs `[grad, input]`: `grad` (a reduction of
+/// `input` over dim `d`, keepdim off) with that dim re-inserted. A negative
+/// `d` counts from the end of `input`'s rank. Lowered in `wengert_lower`.
+pub(crate) const UNSQUEEZE_AT_PREFIX: &str = "unsqueeze_at:";
+/// `sum_keepdim_at:<d>` -- input `[x]`: `x` summed along `d`, keepdim on; a
+/// negative `d` counts from the end of `x`'s rank. Lowered in `wengert_lower`.
+pub(crate) const SUM_KEEPDIM_AT_PREFIX: &str = "sum_keepdim_at:";
 
 /// Task 4: WRGA backward-live filter.
 ///
@@ -5171,8 +5197,38 @@ impl<'a> WengertExtractor<'a> {
                     "mse_loss" => PrimalOp::MSELoss,
                     "l1_loss" => PrimalOp::L1Loss,
                     // Reductions
-                    "sum" => PrimalOp::Sum { dim: None },
-                    "mean" => PrimalOp::Mean { dim: None },
+                    // `sum(x)` reduces everything; `sum(x, d, 0)` reduces one
+                    // literal dim (a negative one counts from the end, as in
+                    // the general call path). A non-literal dim, or keepdim
+                    // on, stays on the tape: this extractor used to return a
+                    // FULL reduction for all of them. The general path takes
+                    // only these two arities, so neither does this.
+                    "sum" | "mean" => {
+                        let dim = match args.len() {
+                            1 => None,
+                            3 => {
+                                let d = Self::extract_int_literal(&args[1].value);
+                                let keepdim = Self::extract_int_literal(&args[2].value);
+                                match (d, keepdim) {
+                                    (Some(d), Some(0)) => Some(d),
+                                    _ => {
+                                        nsl_log::nsl_log!(WARN, "source-ad",
+                                            "[source-ad] {}() needs a literal dim and keepdim off; \
+                                             falling back to tape-based AD for this grad block",
+                                            func_name
+                                        );
+                                        return None;
+                                    }
+                                }
+                            }
+                            _ => return None,
+                        };
+                        if func_name == "sum" {
+                            PrimalOp::Sum { dim }
+                        } else {
+                            PrimalOp::Mean { dim }
+                        }
+                    }
                     // Regularization — extract p from second arg if literal.
                     //
                     // CRITICAL: dropout(x, p, training) — when the training
