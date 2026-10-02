@@ -2083,7 +2083,9 @@ impl CompileOptions {
     ///    `exec_fingerprint::tests` in nsl-runtime), so two builds that
     ///    disagree about whether a key exists cannot be silently treated as
     ///    agreeing on its value. Omitting false values would therefore make
-    ///    every default build refuse against every checkpoint.
+    ///    every default build refuse against every checkpoint. The WGGO
+    ///    layer-prune keys are the one exception, and why it is sound is
+    ///    spelled out where they are emitted.
     ///
     /// The five `NSL_*` variables codegen reads at compile time that change
     /// the arithmetic of the emitted program (the `behavior` tier of
@@ -2144,7 +2146,7 @@ impl CompileOptions {
         // back on an unparseable ratio, so fingerprinting the raw values would
         // let two runs with identical arithmetic disagree.
         let mm = self.matmul.clamped();
-        [
+        let mut fields = vec![
             format!("ad={}", if self.source_ad { "source" } else { "tape" }),
             format!("det={}", b(self.determinism.enabled)),
             format!("dtype={dtype}"),
@@ -2178,9 +2180,64 @@ impl CompileOptions {
             format!("graphs={}", b(self.train.cuda_graphs)),
             format!("ckpt={ckpt}"),
             format!("offload={}", b(self.train.optim_state_offload)),
-        ]
-        .join(",")
+        ];
+        // WGGO layer prune (#807) deletes whole blocks from the model a train
+        // block computes, so it is arithmetic. The keys are emitted ONLY when
+        // a prune is requested: the one deliberate exception to property 3.
+        // Layer prune did not exist before these keys, so a checkpoint without
+        // them was written unpruned, and "absent on both sides" is the
+        // runtime's back-compatible case; a key on every build would refuse
+        // every existing checkpoint. Present on one side only refuses, which is
+        // right in both directions (pruned vs unpruned).
+        //
+        // The record is the REQUEST, rendered at compile start, before any
+        // train block has a plan. For the fraction that is complete only with
+        // the weights it ranks blocks by, so the key carries a digest of the
+        // `--wggo-weights` file: the same file always selects the same blocks.
+        if !self.wggo.prune_layers.is_empty() {
+            let mut layers: Vec<String> =
+                self.wggo.prune_layers.iter().map(|l| sanitize_fingerprint_value(l)).collect();
+            layers.sort();
+            layers.dedup();
+            fields.push(format!("prune_layers={}", layers.join("-")));
+        }
+        if let Some(fraction) = self.wggo.layer_prune_fraction {
+            fields.push(format!(
+                "prune_frac={}-{}",
+                sanitize_fingerprint_value(&fraction.to_string()),
+                file_digest(self.wggo.weights.as_deref())
+            ));
+        }
+        fields.join(",")
     }
+}
+
+/// FNV-1a 64 over a file's bytes, as 16 hex digits, for the `prune_frac`
+/// fingerprint key; `noweights` without a path, `unreadable` when it cannot
+/// be read (the prune itself refuses that file later in the compile).
+fn file_digest(path: Option<&std::path::Path>) -> String {
+    use std::io::Read;
+    let Some(path) = path else {
+        return "noweights".to_string();
+    };
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return "unreadable".to_string();
+    };
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut buf = vec![0u8; 1 << 16];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                for &byte in &buf[..n] {
+                    hash ^= u64::from(byte);
+                    hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+            Err(_) => return "unreadable".to_string(),
+        }
+    }
+    format!("{hash:016x}")
 }
 
 /// A value bound for the `k=v,k=v` execution fingerprint, which is embedded
@@ -2785,5 +2842,53 @@ mod exec_fingerprint_tests {
         let o2 = CompileOptions::default();
         let fp2 = o2.exec_fingerprint();
         assert!(fp2.contains("ad=tape") && fp2.contains("det=0"), "{fp2}");
+    }
+}
+
+#[cfg(test)]
+mod prune_fingerprint_tests {
+    use super::*;
+
+    /// A WGGO layer prune is arithmetic and reaches the fingerprint, but only
+    /// when requested: an unpruned build renders no prune key, so it still
+    /// agrees with every checkpoint written before the keys existed.
+    #[test]
+    fn a_layer_prune_reaches_the_fingerprint_only_when_requested() {
+        let base = CompileOptions::default().exec_fingerprint();
+        assert!(!base.contains("prune_"), "an unpruned build must render no prune key: {base}");
+
+        let mut o = CompileOptions::default();
+        o.wggo.prune_layers = vec!["blocks.3".into(), "blocks.1".into(), "blocks.3".into()];
+        let fp = o.exec_fingerprint();
+        assert!(fp.contains("prune_layers=blocks.1-blocks.3"), "sorted and deduplicated: {fp}");
+        assert_eq!(fp.split(',').count(), base.split(',').count() + 1, "{fp}");
+    }
+
+    /// The fraction selects blocks from the weights file, so its key follows
+    /// the file's CONTENT: the same request over different weights is a
+    /// different model, and the same file is the same model wherever it lives.
+    #[test]
+    fn the_prune_fraction_key_follows_the_weights_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, c) = (dir.path().join("a.nslweights"), dir.path().join("b.nslweights"), dir.path().join("c.nslweights"));
+        std::fs::write(&a, b"weights one").unwrap();
+        std::fs::write(&b, b"weights two").unwrap();
+        std::fs::write(&c, b"weights one").unwrap();
+        let fp = |path: &std::path::Path, f: f64| {
+            let mut o = CompileOptions::default();
+            o.wggo.layer_prune_fraction = Some(f);
+            o.wggo.weights = Some(path.to_path_buf());
+            o.exec_fingerprint()
+        };
+        let key = |fp: &str| fp.split(',').find(|f| f.starts_with("prune_frac=")).map(str::to_string);
+        let ka = key(&fp(&a, 0.25)).expect("a requested fraction renders prune_frac");
+        assert!(ka.starts_with("prune_frac=0.25-"), "{ka}");
+        assert_ne!(Some(ka.clone()), key(&fp(&b, 0.25)), "different weights must differ");
+        assert_eq!(Some(ka.clone()), key(&fp(&c, 0.25)), "same content must agree");
+        assert_ne!(Some(ka), key(&fp(&a, 0.5)), "a different fraction must differ");
+
+        let mut none = CompileOptions::default();
+        none.wggo.layer_prune_fraction = Some(0.25);
+        assert!(none.exec_fingerprint().contains("prune_frac=0.25-noweights"));
     }
 }
