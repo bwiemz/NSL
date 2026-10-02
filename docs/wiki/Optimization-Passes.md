@@ -421,6 +421,8 @@ nsl run model.nsl --source-ad --wggo greedy \
 
 A pruned block's parameters receive no gradient, so the optimizer still allocates their state and (with decoupled weight decay) still decays them; the forward and backward simply no longer compute the block.
 
+A layer prune is part of the checkpoint's execution record. The record gains `prune_layers=` (the sorted layer names) and `prune_frac=` (the fraction and a digest of the `--wggo-weights` file it ranks by), each only when requested. A resume that changes the prune is refused like any other arithmetic change: pruned onto unpruned, unpruned onto pruned, other layers, or other weights. An unpruned build still resumes checkpoints written before the keys existed.
+
 ---
 
 ### CSHA — Compiler-Synthesized Holistic Attention

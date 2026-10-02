@@ -1753,6 +1753,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **A WGGO layer prune is part of the checkpoint's execution record.** #807
+  made `--wggo-prune-layers` / `--wggo-layer-prune-fraction` delete whole
+  blocks from the forward, but left them out of the exec fingerprint. A
+  resume that dropped or changed the prune continued the checkpoint under a
+  different model without a word.
+  - **The keys.** The record now carries two arithmetic-class keys, so a
+    mismatch refuses the resume:
+    - `prune_layers=` holds the sorted, deduplicated layer names;
+    - `prune_frac=` holds the fraction and an FNV-1a digest of the
+      `--wggo-weights` file it ranks blocks by, so the same request over
+      different weights is a different model.
+  - **Only when requested.** The keys are the one deliberate exception to
+    the fingerprint's "no key omitted" rule. Layer prune did not exist before
+    them, so a checkpoint without them was unpruned, and a key absent on both
+    sides is the runtime's back-compatible case. An unpruned build therefore
+    still resumes every existing checkpoint.
+  - **Gates.**
+    - `exec_fingerprint_resume_gate::changing_the_layer_prune_on_resume_is_refused`
+      saves a pruned run, resumes it with the same prune, then refuses an
+      unpruned resume naming `prune_layers: checkpoint blocks.1 -> this run
+      <absent>`.
+    - Unit tests pin the rendering (sorted, absent when off, the digest
+      follows the file's content) and the refusal in both directions.
+    - Dropping the key from the arithmetic class fails the gate.
+
 - **`@freeze` froze nothing.** The decorator was validated and handed to
   WRGA's analysis, and nothing in the train block read it. A frozen weight
   stayed in the optimizer's parameter list and trained exactly as if
