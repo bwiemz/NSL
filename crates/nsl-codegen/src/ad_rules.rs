@@ -899,6 +899,11 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
         // Non-differentiable metadata ops (shape, ndim, item, int, subscript, list, arange, etc.)
         // do NOT propagate gradients — they produce non-tensor values.
         PrimalOp::Passthrough(name) => {
+            // Only listed passthroughs have a rule (and a certification
+            // status); see `RULED_PASSTHROUGHS`.
+            if !RULED_PASSTHROUGHS.contains(&name.as_str()) {
+                return vec![];
+            }
             match name.as_str() {
                 // Reshape-like ops must restore the original input shape in backward.
                 "reshape" | "squeeze" | "unsqueeze" => {
@@ -1043,6 +1048,356 @@ pub fn saved_for_backward(op: &PrimalOp) -> SavedRequirement {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Source-AD rule certification: coverage
+// ---------------------------------------------------------------------------
+
+/// How a `PrimalOp`'s source-AD gradient is certified against an independent
+/// oracle. [`ad_cert_status`] matches every variant with no wildcard, so a new
+/// op does not compile until it states one; `crates/nsl-cli/tests/
+/// source_ad_rule_cert.rs` checks that each named certificate exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdCertStatus {
+    /// Certified by these certificates in `source_ad_rule_cert.rs`: raw
+    /// gradients of a source-level grad block against an f64
+    /// central-difference oracle, under both source AD and the tape.
+    Certified(&'static [&'static str]),
+    /// No gradient flows through it (leaves, comparisons, markers).
+    NotDifferentiable(&'static str),
+    /// Emitted only inside generated adjoint code, never as a primal op that
+    /// `apply_ad_rule` differentiates.
+    AdjointOnly(&'static str),
+    /// No NSL source spelling reaches it as a primal op of a grad block, so
+    /// there is nothing end-to-end to certify.
+    Unreachable(&'static str),
+    /// Reachable and differentiable, with no raw-gradient certificate of the
+    /// source-AD rule yet; the reason says what exists instead. This is the
+    /// campaign's visible debt.
+    Uncertified(&'static str),
+}
+
+/// The certification status of every `PrimalOp` variant.
+pub fn ad_cert_status(op: &PrimalOp) -> AdCertStatus {
+    use AdCertStatus::*;
+    match op {
+        PrimalOp::Relu => Certified(&["relu"]),
+        PrimalOp::Sigmoid => Certified(&["sigmoid"]),
+        PrimalOp::Tanh => Certified(&["tanh"]),
+        PrimalOp::Gelu => Certified(&["gelu"]),
+        PrimalOp::Silu => Certified(&["silu"]),
+        PrimalOp::Exp => Certified(&["exp"]),
+        PrimalOp::Log => Certified(&["log"]),
+        PrimalOp::Sqrt => Certified(&["sqrt"]),
+        PrimalOp::Abs => Certified(&["abs"]),
+        PrimalOp::Neg => Certified(&["neg"]),
+        PrimalOp::Clamp { .. } => Certified(&["clamp"]),
+        PrimalOp::Add => Certified(&["add_same", "add_row", "add_col", "add_one", "add_literal"]),
+        PrimalOp::Sub => Certified(&["sub_row", "sub_col"]),
+        PrimalOp::Mul => Certified(&["mul_row", "mul_col", "mul_literal"]),
+        PrimalOp::Div => Certified(&["div_row", "div_col", "div_numerator_broadcast"]),
+        PrimalOp::Matmul => {
+            Certified(&["matmul_2d", "matmul_3d_2d", "matmul_2d_3d", "matmul_3d_3d"])
+        }
+        PrimalOp::Transpose { .. } => Certified(&["transpose", "transpose_3d"]),
+        PrimalOp::Sum { .. } => Certified(&["sum_all", "sum_dim"]),
+        PrimalOp::Mean { .. } => Certified(&["mean_all", "mean_dim"]),
+        PrimalOp::Softmax { .. } => Certified(&["softmax_last", "softmax_dim0"]),
+        PrimalOp::LogSoftmax { .. } => Certified(&["log_softmax_last", "log_softmax_dim0"]),
+        PrimalOp::Reshape { .. } => AdjointOnly(
+            "the full-reduction adjoints; NSL `.reshape` lowers to Passthrough(\"reshape\")",
+        ),
+        PrimalOp::Broadcast => AdjointOnly("the full-reduction and mean adjoints"),
+        PrimalOp::Concat { .. } => Certified(&["cat_dim0", "cat_dim1"]),
+        PrimalOp::Split { .. } => Unreachable("the extractor never builds a Split primal"),
+        PrimalOp::Slice { .. } => Unreachable("the extractor never builds a Slice primal"),
+        PrimalOp::PadZero { .. } => AdjointOnly("the Slice adjoint"),
+        PrimalOp::Gather { .. } => Certified(&["gather"]),
+        PrimalOp::ScatterAdd { .. } => AdjointOnly("the Gather and Embedding adjoints"),
+        PrimalOp::Embedding => Certified(&["embedding"]),
+        PrimalOp::LayerNorm { .. } => Certified(&["layernorm", "layernorm_eps"]),
+        PrimalOp::RMSNorm { .. } => Certified(&["rmsnorm", "rmsnorm_eps"]),
+        PrimalOp::BatchNorm { .. } => {
+            Unreachable("the extractor maps `batch_norm`, but no builtin or stdlib fn defines it")
+        }
+        PrimalOp::MaxPool2d { .. } => Unreachable(
+            "the extractor has no `maxpool2d` mapping; a grad block using it falls back",
+        ),
+        PrimalOp::AvgPool2d { .. } => Unreachable("the extractor never builds an AvgPool2d primal"),
+        PrimalOp::Conv2d { .. } => Certified(&["conv2d"]),
+        PrimalOp::ConvTranspose2d { .. } => {
+            Unreachable("the extractor never builds a ConvTranspose2d primal")
+        }
+        PrimalOp::Conv2dBackward { .. } => AdjointOnly("the Conv2d adjoint"),
+        PrimalOp::MaterializeConvOutputGrad { .. } => AdjointOnly("the Conv2d adjoint"),
+        PrimalOp::Repeat { .. } => AdjointOnly("the pooling adjoints"),
+        PrimalOp::CrossEntropyLoss => Certified(&["cross_entropy"]),
+        PrimalOp::MSELoss => Certified(&["mse_loss"]),
+        PrimalOp::L1Loss => Certified(&["l1_loss"]),
+        PrimalOp::ScaledDotProductAttention { .. } => {
+            Certified(&["sdpa", "sdpa_causal", "sdpa_scale"])
+        }
+        PrimalOp::FlashAttentionBackwardExtract { .. } => AdjointOnly("the SDPA adjoint"),
+        PrimalOp::ScaledDotProductAttentionPacked => Uncertified(
+            "the kernels are held to an f64 oracle (nsl-codegen/tests/sdpa_fused_packed_gpu_parity.rs); the source-AD wiring is not",
+        ),
+        PrimalOp::FlashAttentionBackwardExtractPacked { .. } => {
+            AdjointOnly("the packed SDPA adjoint")
+        }
+        PrimalOp::CshaFusedBackwardExtract { .. } => AdjointOnly("the CSHA fused backward"),
+        PrimalOp::FusedCshaBackward { .. } => AdjointOnly("the CSHA fused backward"),
+        PrimalOp::PrologueRecompute { .. } => NotDifferentiable("a CCR recompute marker"),
+        PrimalOp::FreeTensor => NotDifferentiable("a lifetime marker"),
+        PrimalOp::RoPE { .. } => Unreachable(
+            "built only by CSHA chain matching; stdlib RoPE is `x*cos + rotate_half(x)*sin`",
+        ),
+        PrimalOp::RoPEInverse { .. } => AdjointOnly("the RoPE adjoint"),
+        PrimalOp::FusedGatedLoraMatmul { .. } => Uncertified(
+            "held to the unfused graph (wrga_adapter_runtime_equivalence.rs), not to an oracle",
+        ),
+        PrimalOp::FusedLoraMatmul { .. } => Uncertified(
+            "sm>=80 only; the unfused LoRA path is held to an f64 reference by lora_adapter_training_gate.rs",
+        ),
+        PrimalOp::FusedIa3Matmul { .. } => Uncertified("forward fixtures only"),
+        PrimalOp::FusedLinearCe { .. } => Uncertified(
+            "the kernels are held to an f64 reference (nsl-codegen/tests/common/fused_lce_cpu_f64.rs); the source-AD wiring is not",
+        ),
+        PrimalOp::FusedLinearCeBackwardExtract { .. } => AdjointOnly("the FusedLinearCe adjoint"),
+        PrimalOp::FusedKlCe { .. } => Uncertified(
+            "the kernels are held to an f64 reference (nsl-codegen/tests/cpkd_fused_kl_ce_numerical.rs); the source-AD wiring is not",
+        ),
+        PrimalOp::FusedKlCeBackwardExtract { .. } => AdjointOnly("the FusedKlCe adjoint"),
+        PrimalOp::Dropout { .. } => Uncertified(
+            "held to tape parity (dropout_backward_parity_gate.rs); a random mask has no finite-difference oracle",
+        ),
+        PrimalOp::DropoutMask { .. } => NotDifferentiable(
+            "the RNG mask; the gradient flows through the Dropout that applies it",
+        ),
+        PrimalOp::Select => Uncertified("a tensor `if`/`else`; no certificate yet"),
+        PrimalOp::Condition(_) => NotDifferentiable("a comparison"),
+        PrimalOp::Input(_) | PrimalOp::Param(_) => NotDifferentiable("a leaf"),
+        PrimalOp::Constant(_) => NotDifferentiable("a constant"),
+        PrimalOp::Passthrough(name) => ad_cert_status_passthrough(name),
+    }
+}
+
+/// The passthroughs `apply_ad_rule` gives an adjoint. Its passthrough arm
+/// returns no adjoint for any other name, so a rule cannot fire until it is
+/// listed here (and [`ad_cert_status_passthrough`] states its status).
+pub const RULED_PASSTHROUGHS: &[&str] = &[
+    "reshape",
+    "squeeze",
+    "unsqueeze",
+    "contiguous",
+    "cos",
+    "sin",
+    "sum_keepdim_last",
+    "mean_keepdim_last",
+    "rotate_half",
+    "expand",
+];
+
+/// The certification status of a passthrough, by name.
+pub fn ad_cert_status_passthrough(name: &str) -> AdCertStatus {
+    use AdCertStatus::*;
+    match name {
+        "reshape" => Certified(&["reshape"]),
+        "unsqueeze" => Certified(&["unsqueeze"]),
+        "squeeze" => Uncertified("shares the reshape-like rule certified by `reshape`/`unsqueeze`"),
+        "contiguous" => Certified(&["contiguous"]),
+        "cos" => Certified(&["cos"]),
+        "sin" => Certified(&["sin"]),
+        "rotate_half" => Certified(&["rotate_half"]),
+        "expand" => Certified(&["expand"]),
+        "sum_keepdim_last" | "mean_keepdim_last" => {
+            AdjointOnly("the softmax and normalization adjoints")
+        }
+        _ => NotDifferentiable("a passthrough with no adjoint rule"),
+    }
+}
+
+/// Every `PrimalOp` variant (one sample each, passthroughs by rule name) with
+/// its status. The coverage gate reads this; a unit test holds it to the
+/// enum's definition in `wengert.rs`.
+pub fn ad_cert_inventory() -> Vec<(String, AdCertStatus)> {
+    let mut out: Vec<(String, AdCertStatus)> = ad_cert_samples()
+        .iter()
+        .map(|op| (variant_name(op), ad_cert_status(op)))
+        .collect();
+    out.extend(
+        RULED_PASSTHROUGHS
+            .iter()
+            .map(|n| (format!("Passthrough({n})"), ad_cert_status_passthrough(n))),
+    );
+    out
+}
+
+/// The variant name of `op` (its `Debug` text up to the first field).
+fn variant_name(op: &PrimalOp) -> String {
+    format!("{op:?}")
+        .chars()
+        .take_while(|c| c.is_alphanumeric())
+        .collect()
+}
+
+/// One sample of every `PrimalOp` variant except `Passthrough`.
+fn ad_cert_samples() -> Vec<PrimalOp> {
+    use crate::wengert::{CompareKind, ConvGradKind, SubgraphId};
+    vec![
+        PrimalOp::Relu,
+        PrimalOp::Sigmoid,
+        PrimalOp::Tanh,
+        PrimalOp::Gelu,
+        PrimalOp::Silu,
+        PrimalOp::Exp,
+        PrimalOp::Log,
+        PrimalOp::Sqrt,
+        PrimalOp::Abs,
+        PrimalOp::Neg,
+        PrimalOp::Clamp { min: 0.0, max: 1.0 },
+        PrimalOp::Add,
+        PrimalOp::Sub,
+        PrimalOp::Mul,
+        PrimalOp::Div,
+        PrimalOp::Matmul,
+        PrimalOp::Transpose { dim0: 0, dim1: 1 },
+        PrimalOp::Sum { dim: None },
+        PrimalOp::Mean { dim: None },
+        PrimalOp::Softmax { dim: -1 },
+        PrimalOp::LogSoftmax { dim: -1 },
+        PrimalOp::Reshape { target_ndim: 1 },
+        PrimalOp::Broadcast,
+        PrimalOp::Concat { dim: 0 },
+        PrimalOp::Split { dim: 0, chunks: 2 },
+        PrimalOp::Slice {
+            dim: 0,
+            start: 0,
+            end: 1,
+            orig_dim_size: 2,
+        },
+        PrimalOp::PadZero {
+            dim: 0,
+            pad_before: 0,
+            pad_after: 1,
+        },
+        PrimalOp::Gather { dim: 0 },
+        PrimalOp::ScatterAdd { dim: 0 },
+        PrimalOp::Embedding,
+        PrimalOp::LayerNorm { eps: 1e-5 },
+        PrimalOp::RMSNorm { eps: 1e-5 },
+        PrimalOp::BatchNorm {
+            eps: 1e-5,
+            training: true,
+        },
+        PrimalOp::MaxPool2d {
+            kernel: 2,
+            stride: 2,
+        },
+        PrimalOp::AvgPool2d {
+            kernel: 2,
+            stride: 2,
+        },
+        PrimalOp::Conv2d {
+            stride: 1,
+            padding: 0,
+        },
+        PrimalOp::ConvTranspose2d {
+            stride: 1,
+            padding: 0,
+        },
+        PrimalOp::Conv2dBackward {
+            kind: ConvGradKind::Input,
+            stride: 1,
+            padding: 0,
+        },
+        PrimalOp::MaterializeConvOutputGrad {
+            stride: 1,
+            padding: 0,
+        },
+        PrimalOp::Repeat { kernel: 2 },
+        PrimalOp::CrossEntropyLoss,
+        PrimalOp::MSELoss,
+        PrimalOp::L1Loss,
+        PrimalOp::ScaledDotProductAttention { causal: false },
+        PrimalOp::FlashAttentionBackwardExtract {
+            causal: false,
+            component: 0,
+        },
+        PrimalOp::ScaledDotProductAttentionPacked,
+        PrimalOp::FlashAttentionBackwardExtractPacked { component: 0 },
+        PrimalOp::CshaFusedBackwardExtract { component: 0 },
+        PrimalOp::FusedCshaBackward {
+            layer: String::new(),
+        },
+        PrimalOp::PrologueRecompute {
+            subgraph_id: SubgraphId(0),
+        },
+        PrimalOp::FreeTensor,
+        PrimalOp::RoPE { dim: 2 },
+        PrimalOp::RoPEInverse { dim: 2 },
+        PrimalOp::FusedGatedLoraMatmul {
+            scale: 1.0,
+            kernel_handle: 0,
+        },
+        PrimalOp::FusedLoraMatmul {
+            scale: 1.0,
+            kernel_handle: 0,
+        },
+        PrimalOp::FusedIa3Matmul { kernel_handle: 0 },
+        PrimalOp::FusedLinearCe {
+            vocab_size: 0,
+            hidden_size: 0,
+            batch_size: 0,
+            seq_len: 0,
+            vocab_tile: 0,
+            ignore_index: -100,
+            is_large: false,
+            has_bias: false,
+            x_rank3: false,
+        },
+        PrimalOp::FusedLinearCeBackwardExtract {
+            component: 0,
+            vocab_size: 0,
+            hidden_size: 0,
+            batch_size: 0,
+            seq_len: 0,
+            vocab_tile: 0,
+            ignore_index: -100,
+            has_bias: false,
+            x_rank3: false,
+        },
+        PrimalOp::FusedKlCe {
+            vocab_size: 0,
+            student_hidden: 0,
+            teacher_hidden: 0,
+            batch_size: 0,
+            seq_len: 0,
+            vocab_tile: 0,
+            ignore_index: -100,
+            alpha_bits: 0,
+            temperature_bits: 0,
+        },
+        PrimalOp::FusedKlCeBackwardExtract {
+            component: 0,
+            vocab_size: 0,
+            student_hidden: 0,
+            teacher_hidden: 0,
+            batch_size: 0,
+            seq_len: 0,
+            vocab_tile: 0,
+            ignore_index: -100,
+            alpha_bits: 0,
+            temperature_bits: 0,
+        },
+        PrimalOp::Dropout { p: 0.1 },
+        PrimalOp::DropoutMask { p: 0.1 },
+        PrimalOp::Select,
+        PrimalOp::Condition(CompareKind::Gt),
+        PrimalOp::Input(String::new()),
+        PrimalOp::Param(String::new()),
+        PrimalOp::Constant(0.0),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1057,6 +1412,124 @@ mod tests {
             saved_for_backward: false,
             checkpointed: false,
         }
+    }
+
+    /// Every `PrimalOp` variant in `wengert.rs` has an entry in
+    /// [`ad_cert_inventory`] (and nothing else does), so the coverage gate in
+    /// `source_ad_rule_cert.rs` sees every certificate name.
+    #[test]
+    fn ad_cert_inventory_covers_every_variant() {
+        let src = include_str!("wengert.rs");
+        let body = &src[src.find("pub enum PrimalOp {").expect("PrimalOp")..];
+        let body = &body[..body.find("\n}\n").expect("end of PrimalOp")];
+        let mut declared: Vec<String> = body
+            .lines()
+            .skip(1)
+            .filter_map(|l| {
+                let rest = l.strip_prefix("    ")?;
+                if !rest.starts_with(|c: char| c.is_ascii_uppercase()) {
+                    return None;
+                }
+                let name: String = rest.chars().take_while(|c| c.is_alphanumeric()).collect();
+                Some(name)
+            })
+            .collect();
+        declared.sort();
+        let mut listed: Vec<String> = ad_cert_inventory()
+            .into_iter()
+            .map(|(n, _)| n.split('(').next().unwrap_or("").to_string())
+            .collect();
+        listed.sort();
+        listed.dedup();
+        assert!(
+            declared.len() > 60,
+            "the scan found only {} variants",
+            declared.len()
+        );
+        assert_eq!(
+            declared, listed,
+            "ad_cert_inventory is out of step with PrimalOp"
+        );
+    }
+
+    /// The passthrough names `apply_ad_rule` matches are exactly
+    /// [`RULED_PASSTHROUGHS`]: a new passthrough rule must be listed (and so
+    /// given a status) before it can fire.
+    #[test]
+    fn ruled_passthroughs_match_the_rule_arm() {
+        let src = include_str!("ad_rules.rs");
+        let arm = &src[src
+            .find("PrimalOp::Passthrough(name) => {\n            // Only listed")
+            .expect("arm")..];
+        let arm = &arm[..arm.find("_ => vec![],").expect("end of arm")];
+        let mut matched: Vec<&str> = arm
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with('"') && l.ends_with("=> {"))
+            .flat_map(|l| l.trim_end_matches("=> {").split('|'))
+            .map(|n| n.trim().trim_matches('"'))
+            .collect();
+        matched.sort();
+        let mut listed = RULED_PASSTHROUGHS.to_vec();
+        listed.sort();
+        assert_eq!(matched, listed);
+        for name in RULED_PASSTHROUGHS {
+            let op = make_op(1, PrimalOp::Passthrough((*name).to_string()), vec![0]);
+            assert!(
+                !apply_ad_rule(&op, 9).is_empty(),
+                "{name} is listed but has no rule"
+            );
+        }
+        let unlisted = make_op(1, PrimalOp::Passthrough("floor".into()), vec![0]);
+        assert!(apply_ad_rule(&unlisted, 9).is_empty());
+    }
+
+    /// A status agrees with whether the op has a rule (in `apply_ad_rule`, or
+    /// one of the fused-adapter rules `source_ad.rs` applies before it):
+    /// certified and uncertified ops have one, non-differentiable ops do not,
+    /// and the unreachable or adjoint-only ops that carry a rule anyway are
+    /// pinned, so a rule added to any op forces its status to be revisited.
+    #[test]
+    fn ad_cert_status_agrees_with_the_rules() {
+        const RULED_BUT_UNCERTIFIABLE: &[&str] = &[
+            "Reshape",
+            "Split",
+            "Slice",
+            "ScatterAdd",
+            "BatchNorm",
+            "MaxPool2d",
+            "AvgPool2d",
+            "RoPE",
+        ];
+        let source_ad = include_str!("source_ad.rs");
+        let inputs: Vec<VarId> = (0..8).collect();
+        let mut ruled_uncertifiable = Vec::new();
+        for op in ad_cert_samples() {
+            let (name, status) = (variant_name(&op), ad_cert_status(&op));
+            let inline_rule = source_ad.contains(&format!("if let PrimalOp::{name} {{"));
+            let has_rule =
+                inline_rule || !apply_ad_rule(&make_op(100, op, inputs.clone()), 101).is_empty();
+            match status {
+                AdCertStatus::Certified(_) | AdCertStatus::Uncertified(_) => {
+                    assert!(
+                        has_rule,
+                        "{name} is {status:?} but apply_ad_rule has no rule"
+                    );
+                }
+                AdCertStatus::NotDifferentiable(_) => {
+                    assert!(!has_rule, "{name} is NotDifferentiable but has a rule");
+                }
+                AdCertStatus::Unreachable(_) | AdCertStatus::AdjointOnly(_) => {
+                    if has_rule {
+                        ruled_uncertifiable.push(name);
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            ruled_uncertifiable, RULED_BUT_UNCERTIFIABLE,
+            "the unreachable/adjoint-only ops with a rule changed; revisit their statuses"
+        );
     }
 
     #[test]
