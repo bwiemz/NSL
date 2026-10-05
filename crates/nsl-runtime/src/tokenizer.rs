@@ -64,7 +64,11 @@ fn alloc_cstring(s: &str) -> i64 {
     ptr as i64
 }
 
-/// Create a 1-D `NslTensor` from a slice of f64 values.
+/// Create a 1-D f32 `NslTensor` of token ids (or a mask) from f64 values.
+///
+/// f32, the default float dtype (C5): exact for every id below 2^24, and a
+/// GPU upload is then a byte copy. These used to be f64, which the upload
+/// narrowed and an f64-refusing upload cannot.
 fn make_1d_tensor(values: &[f64]) -> i64 {
     let len = values.len() as i64;
     let ndim: i64 = 1;
@@ -75,9 +79,9 @@ fn make_1d_tensor(values: &[f64]) -> i64 {
     let strides = checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
     unsafe { *strides = 1 };
 
-    let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+    let data = checked_alloc((len as usize) * std::mem::size_of::<f32>()) as *mut f32;
     for (i, &v) in values.iter().enumerate() {
-        unsafe { *data.add(i) = v };
+        unsafe { *data.add(i) = v as f32 };
     }
 
     let tensor = Box::new(NslTensor::new(
@@ -87,14 +91,15 @@ fn make_1d_tensor(values: &[f64]) -> i64 {
         ndim,
         len,
         0,
-        0,
+        1,
         1,
         0,
     ));
     Box::into_raw(tensor) as i64
 }
 
-/// Create a 2-D `NslTensor` (rows x cols) from a flat Vec<f64>.
+/// Create a 2-D f32 `NslTensor` (rows x cols) from a flat Vec<f64>; f32 for
+/// the reason [`make_1d_tensor`] gives.
 fn make_2d_tensor(rows: usize, cols: usize, flat: &[f64]) -> i64 {
     let len = (rows * cols) as i64;
     let ndim: i64 = 2;
@@ -115,11 +120,11 @@ fn make_2d_tensor(rows: usize, cols: usize, flat: &[f64]) -> i64 {
         "make_2d_tensor got {} values for a {rows}x{cols} tensor",
         flat.len()
     );
-    let data = checked_alloc((len as usize) * std::mem::size_of::<f64>()) as *mut f64;
+    let data = checked_alloc((len as usize) * std::mem::size_of::<f32>()) as *mut f32;
     // `flat` is clamped rather than trusted: callers that build ragged rows
     // would otherwise write past an allocation sized rows*cols.
     for (i, &v) in flat.iter().take(len as usize).enumerate() {
-        unsafe { *data.add(i) = v };
+        unsafe { *data.add(i) = v as f32 };
     }
     for i in flat.len()..(len as usize) {
         unsafe { *data.add(i) = 0.0 };
@@ -132,7 +137,7 @@ fn make_2d_tensor(rows: usize, cols: usize, flat: &[f64]) -> i64 {
         ndim,
         len,
         0,
-        0,
+        1,
         1,
         0,
     ));
@@ -504,7 +509,8 @@ mod tests {
 
         let t = NslTensor::from_ptr(ids);
         assert_eq!(t.len, rows * cols);
-        let read = |r: i64, c: i64| unsafe { *t.data_f64().add((r * cols + c) as usize) };
+        assert_eq!(t.dtype, 1, "token ids are f32 (C5)");
+        let read = |r: i64, c: i64| unsafe { *t.data_f32().add((r * cols + c) as usize) as f64 };
         assert_eq!(
             [read(0, 0), read(0, 1), read(0, 2), read(0, 3)],
             [b'a' as f64; 4]
@@ -513,7 +519,8 @@ mod tests {
         // Short rows are zero-filled, and the mask marks the padding.
         assert_eq!([read(1, 1), read(1, 2), read(1, 3)], [0.0; 3]);
         let m = NslTensor::from_ptr(mask);
-        let mread = |r: i64, c: i64| unsafe { *m.data_f64().add((r * cols + c) as usize) };
+        assert_eq!(m.dtype, 1, "the attention mask is f32 (C5)");
+        let mread = |r: i64, c: i64| unsafe { *m.data_f32().add((r * cols + c) as usize) as f64 };
         assert_eq!([mread(1, 0), mread(1, 1)], [1.0, 0.0]);
     }
 

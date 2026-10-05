@@ -11069,8 +11069,8 @@ DONE:
     fn test_tensor_to_device_roundtrip() {
         use crate::tensor::{NslTensor, nsl_tensor_to_device};
 
-        // Create a CPU tensor manually: [1.0, 2.0, 3.0, 4.0]
-        let data = vec![1.0f64, 2.0, 3.0, 4.0];
+        // Create an f32 CPU tensor manually: [1.0, 2.0, 3.0, 4.0]
+        let data = vec![1.0f32, 2.0, 3.0, 4.0];
         let shape = vec![4i64];
         let strides = vec![1i64];
         let t = Box::new(NslTensor::new(
@@ -11080,7 +11080,7 @@ DONE:
             1,
             4,
             0,
-            0,
+            1,
             1,
             0,
         ));
@@ -11100,12 +11100,12 @@ DONE:
         let cpu_back = nsl_tensor_to_device(gpu_tensor, 0);
         let cpu_t = NslTensor::from_ptr_ref(cpu_back);
         assert_eq!(cpu_t.device, 0);
-        // The download keeps the device tag (C5 step 2a); the f64 -> f32
-        // narrowing happened on the upload. Bit-level round-trip gates live in
+        // Both directions are byte copies of the same dtype (C5 steps 2a/2b);
+        // an f64 upload is refused. Bit-level round-trip gates live in
         // tests/transfer_preserves_dtype_gpu.rs.
         assert_eq!(cpu_t.dtype, 1);
 
-        // Verify values survived the roundtrip (f64 → f32 on upload)
+        // Verify values survived the roundtrip
         for i in 0..4 {
             let val = cpu_t.read_scalar_as_f64(i);
             let expected = (i + 1) as f64;
@@ -11118,7 +11118,7 @@ DONE:
         use crate::tensor::{NslTensor, nsl_tensor_to_device, nsl_tensor_matmul};
 
         // A = [[1,2,3],[4,5,6]] (2x3)
-        let a_data = vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let a_data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
         let a_shape = vec![2i64, 3];
         let a_strides = vec![3i64, 1];
         let a = Box::new(NslTensor::new(
@@ -11128,7 +11128,7 @@ DONE:
             2,
             6,
             0,
-            0,
+            1,
             1,
             0,
         ));
@@ -11136,7 +11136,7 @@ DONE:
         let a_cpu = Box::into_raw(a) as i64;
 
         // B = [[7,8],[9,10],[11,12]] (3x2)
-        let b_data = vec![7.0f64, 8.0, 9.0, 10.0, 11.0, 12.0];
+        let b_data = vec![7.0f32, 8.0, 9.0, 10.0, 11.0, 12.0];
         let b_shape = vec![3i64, 2];
         let b_strides = vec![2i64, 1];
         let b = Box::new(NslTensor::new(
@@ -11146,7 +11146,7 @@ DONE:
             2,
             6,
             0,
-            0,
+            1,
             1,
             0,
         ));
@@ -11180,8 +11180,8 @@ DONE:
         use crate::tensor::{NslTensor, nsl_tensor_to_device, nsl_tensor_add};
 
         // Create CPU tensors manually
-        let a_data = vec![1.0f64, 2.0, 3.0, 4.0];
-        let b_data = vec![10.0f64, 20.0, 30.0, 40.0];
+        let a_data = vec![1.0f32, 2.0, 3.0, 4.0];
+        let b_data = vec![10.0f32, 20.0, 30.0, 40.0];
         let shape = vec![4i64];
         let strides = vec![1i64];
 
@@ -11192,7 +11192,7 @@ DONE:
             1,
             4,
             0,
-            0,
+            1,
             1,
             0,
         ));
@@ -11208,7 +11208,7 @@ DONE:
             1,
             4,
             0,
-            0,
+            1,
             1,
             0,
         ));

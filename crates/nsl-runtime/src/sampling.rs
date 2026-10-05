@@ -23,11 +23,9 @@ use crate::tensor::{nsl_tensor_free, nsl_tensor_to_device, NslTensor};
 /// result back on the input's device — mirroring the non-dim-0 arm of
 /// `nsl_tensor_gather`.
 ///
-/// Index precision: CPU-side index outputs (argmax, multinomial, topk
-/// indices) are f64, but the upload converts to the GPU's f32 — exact only
-/// below 2^24 (16.7M). Vocab-scale dims are far under that; a >=2^24-wide
-/// dim would silently round indices, matching the runtime-wide
-/// "CPU=f64, GPU=f32" convention rather than guarding here.
+/// Index outputs (argmax, multinomial, topk indices) come back in the
+/// input's dtype -- see [`index_output_in_operand_dtype`] -- so the upload
+/// here is a byte copy, not a narrowing.
 fn redirect_gpu_input_to_host(tensor_ptr: i64, op: impl FnOnce(i64) -> i64) -> i64 {
     let device = NslTensor::from_ptr(tensor_ptr).device;
     // Pause the tape across the CPU redirect (see nsl_tensor_stack).
@@ -38,6 +36,20 @@ fn redirect_gpu_input_to_host(tensor_ptr: i64, op: impl FnOnce(i64) -> i64) -> i
     nsl_tensor_free(cpu_in);
     nsl_tensor_free(cpu_out);
     dev_out
+}
+
+/// An index output in its operand's dtype: f64 only for an f64 input, f32
+/// for anything else (C5: helpers mint their operand's dtype). The ops build
+/// indices in f64 and convert once here; f32 is exact below 2^24, far above
+/// any vocab. They used to return f64 whatever the input, which an upload to
+/// the input's GPU then narrowed, and which an f64-refusing upload cannot.
+fn index_output_in_operand_dtype(f64_ptr: i64, in_dtype: u16) -> i64 {
+    if in_dtype == 0 {
+        return f64_ptr;
+    }
+    let out = crate::tensor::precision_cast::convert_untaped(f64_ptr, 1);
+    nsl_tensor_free(f64_ptr);
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -130,9 +142,10 @@ pub extern "C" fn nsl_tensor_topk(tensor_ptr: i64, k: i64, dim: i64) -> i64 {
     let mut out_shape: Vec<i64> = shape.clone();
     out_shape[d] = k as i64;
 
-    // values output matches input dtype; indices are always f64
+    // values output matches input dtype; indices are built in f64 and take
+    // the input's dtype at the end (`index_output_in_operand_dtype`)
     let values_ptr = create_tensor_with_shape_rs_dtype(&out_shape, in_dtype);
-    let indices_ptr = create_tensor_with_shape_rs(&out_shape); // always f64
+    let indices_ptr = create_tensor_with_shape_rs(&out_shape);
     let values_tensor = NslTensor::from_ptr(values_ptr);
     let indices_tensor = NslTensor::from_ptr(indices_ptr);
     let idx_data = indices_tensor.data_f64();
@@ -202,6 +215,8 @@ pub extern "C" fn nsl_tensor_topk(tensor_ptr: i64, k: i64, dim: i64) -> i64 {
         }
     }
 
+    let indices_ptr = index_output_in_operand_dtype(indices_ptr, in_dtype);
+
     // Hand the results back on the input's device and drop the CPU staging
     // copies — the dict must hold the device-resident tensors.
     let (values_ptr, indices_ptr) = if in_device != 0 {
@@ -263,7 +278,7 @@ pub extern "C" fn nsl_tensor_multinomial(tensor_ptr: i64, num_samples: i64) -> i
     } else {
         vec![batch_size as i64, num_samples as i64]
     };
-    // indices output is always f64
+    // indices are built in f64 and take the input's dtype at the end
     let result_ptr = create_tensor_with_shape_rs(&out_shape);
     let result_tensor = NslTensor::from_ptr(result_ptr);
     let result_data = result_tensor.data_f64();
@@ -308,7 +323,7 @@ pub extern "C" fn nsl_tensor_multinomial(tensor_ptr: i64, num_samples: i64) -> i
         });
     }
 
-    result_ptr
+    index_output_in_operand_dtype(result_ptr, in_dtype)
 }
 
 // ---------------------------------------------------------------------------
@@ -338,7 +353,8 @@ pub extern "C" fn nsl_tensor_argmax(tensor_ptr: i64, dim: i64) -> i64 {
     assert!(d < ndim, "argmax: dim {} out of range for ndim {}", dim, ndim);
     let dim_size = shape[d] as usize;
 
-    // Output shape: input shape with dim d removed (always f64 — index tensor)
+    // Output shape: input shape with dim d removed (built in f64; the result
+    // takes the input's dtype)
     let out_shape: Vec<i64> = if ndim == 1 {
         vec![1]
     } else {
@@ -348,7 +364,7 @@ pub extern "C" fn nsl_tensor_argmax(tensor_ptr: i64, dim: i64) -> i64 {
             .collect()
     };
 
-    let result_ptr = create_tensor_with_shape_rs(&out_shape); // always f64
+    let result_ptr = create_tensor_with_shape_rs(&out_shape);
     let result_tensor = NslTensor::from_ptr(result_ptr);
     let result_data = result_tensor.data_f64();
 
@@ -395,7 +411,7 @@ pub extern "C" fn nsl_tensor_argmax(tensor_ptr: i64, dim: i64) -> i64 {
         }
     }
 
-    result_ptr
+    index_output_in_operand_dtype(result_ptr, in_dtype)
 }
 
 // ---------------------------------------------------------------------------
@@ -558,6 +574,42 @@ mod tests {
         let data = t.data_f64();
         let len = t.len as usize;
         (0..len).map(|i| unsafe { *data.add(i) }).collect()
+    }
+
+    /// Index outputs take their operand's dtype (C5): f32 logits give f32
+    /// indices -- which the GPU path can upload as a byte copy -- and f64
+    /// logits keep f64. They used to be f64 whatever the input.
+    #[test]
+    fn test_index_outputs_take_the_operand_dtype() {
+        let f32_logits = crate::tensor::precision_cast::convert_untaped(
+            make_1d_tensor(&[0.5, 2.5, -1.0, 2.0]),
+            1,
+        );
+        let f64_logits = make_1d_tensor(&[0.5, 2.5, -1.0, 2.0]);
+        let tag = |p: i64| NslTensor::from_ptr(p).dtype;
+        let key_i = nsl_str_from_rust("indices");
+
+        let am32 = nsl_tensor_argmax(f32_logits, 0);
+        assert_eq!(tag(am32), 1);
+        assert_eq!(unsafe { *NslTensor::from_ptr(am32).data_f32() }, 1.0);
+        assert_eq!(tag(nsl_tensor_argmax(f64_logits, 0)), 0);
+
+        let tk32 = nsl_dict_get_str(nsl_tensor_topk(f32_logits, 2, 0), key_i);
+        assert_eq!(tag(tk32), 1);
+        let t = NslTensor::from_ptr(tk32);
+        let got: Vec<f32> = (0..2).map(|i| unsafe { *t.data_f32().add(i) }).collect();
+        assert_eq!(got, vec![1.0, 3.0]);
+        assert_eq!(tag(nsl_dict_get_str(nsl_tensor_topk(f64_logits, 2, 0), key_i)), 0);
+
+        let probs32 = crate::tensor::precision_cast::convert_untaped(
+            make_1d_tensor(&[0.0, 1.0, 0.0]),
+            1,
+        );
+        let mn32 = nsl_tensor_multinomial(probs32, 3);
+        assert_eq!(tag(mn32), 1);
+        let m = NslTensor::from_ptr(mn32);
+        assert!((0..3).all(|i| unsafe { *m.data_f32().add(i) } == 1.0));
+        assert_eq!(tag(nsl_tensor_multinomial(make_1d_tensor(&[0.0, 1.0]), 1)), 0);
     }
 
     #[test]

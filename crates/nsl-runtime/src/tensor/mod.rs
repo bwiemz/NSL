@@ -4207,6 +4207,18 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
                 return NslTensor::publish(new_t);
             }
 
+            // C5 step 2b: an upload is a byte copy of the same dtype. The GPU
+            // stores and computes f32, so an f64 tensor is refused here --
+            // before any device allocation -- instead of being narrowed
+            // behind the program's back. The fix is an explicit `.to(f32)`.
+            if transfer_src.dtype == 0 {
+                crate::fatal::die(
+                    crate::fatal::Fatal::UnsupportedDtype,
+                    "nsl_tensor_to_device: an f64 tensor cannot be moved to the GPU, \
+                     which stores and computes f32; convert it first with `.to(f32)`",
+                );
+            }
+
             let dst_size = len * std::mem::size_of::<f32>();
             let dst = crate::cuda::inner::alloc_managed(dst_size);
             if dst_size == 12_582_912 {
@@ -4226,22 +4238,8 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
                     transfer_src.data
                 );
             }
-            if transfer_src.dtype == 1 {
-                // f32→f32: direct host-to-device copy
-                crate::cuda::inner::memcpy_htod(dst, transfer_src.data, dst_size);
-            } else {
-                // f64→f32: convert on CPU into a temporary heap buffer, then copy to device.
-                // Avoid the pinned staging pool here; source-AD backward performs many
-                // large conversions of temporary tensors, and simple heap staging is more
-                // robust than reusing pinned buffers in this hot path.
-                let staging = checked_alloc(dst_size) as *mut f32;
-                let src = transfer_src.data_f64();
-                for i in 0..len {
-                    unsafe { *staging.add(i) = *src.add(i) as f32; }
-                }
-                crate::cuda::inner::memcpy_htod(dst, staging as *const std::ffi::c_void, dst_size);
-                unsafe { checked_free(staging as *mut u8, dst_size); }
-            }
+            // f32 -> f32: a direct host-to-device copy (f64 was refused above).
+            crate::cuda::inner::memcpy_htod(dst, transfer_src.data, dst_size);
             let shape = NslTensor::copy_shape(transfer_src.shape, transfer_src.ndim);
             let strides = NslTensor::compute_strides(shape, transfer_src.ndim);
             let new_t = Box::new(NslTensor::new(
@@ -4268,7 +4266,7 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
             // CHANGELOG came from exactly that.
             //
             // A GPU tensor tagged f64 must not exist ("no GPU f64 for now"; the
-            // upload arm still narrows f64 to f32 until step 2b refuses it). The
+            // upload arm refuses f64, C5 step 2b). The
             // old code sent one down the f32 widening path, reading the buffer
             // as 4-byte elements; a byte copy would read it as 8-byte ones. With
             // no device producer of f64 there is no way to know which width the
@@ -4327,6 +4325,30 @@ pub extern "C" fn nsl_tensor_to_device_like(src_ptr: i64, ref_ptr: i64) -> i64 {
     nsl_tensor_to_device(src_ptr, r.device as i64)
 }
 
+/// Move a gradient to its accumulator's device AND dtype: the operand of an
+/// in-place accumulation into `acc_ptr`. A host gradient in another float
+/// dtype (an f64 grad for an f32 device accumulator) is converted on the host
+/// first, explicitly -- the accumulator's dtype is the one the sum is kept in,
+/// as `nsl_tensor_add_inplace` already does -- and only then copied, because
+/// an upload is a byte copy that refuses f64 (C5 step 2b). Returns an OWNED
+/// reference, like [`nsl_tensor_to_device_like`].
+#[unsafe(no_mangle)]
+pub extern "C" fn nsl_grad_migrate_like(grad_ptr: i64, acc_ptr: i64) -> i64 {
+    let g = NslTensor::from_ptr_ref(grad_ptr);
+    let acc = NslTensor::from_ptr_ref(acc_ptr);
+    let convert = g.device == 0
+        && g.dtype != acc.dtype
+        && matches!(g.dtype, 0 | 1)
+        && matches!(acc.dtype, 0 | 1);
+    if !convert {
+        return nsl_tensor_to_device_like(grad_ptr, acc_ptr);
+    }
+    let converted = precision_cast::convert_untaped(grad_ptr, acc.dtype);
+    let migrated = nsl_tensor_to_device_like(converted, acc_ptr);
+    nsl_tensor_free(converted);
+    migrated
+}
+
 /// Refuse a host-resident dense-float step input on a GPU-parameter train.
 ///
 /// Item 2 (2026-08-25). Binary ops reconcile devices by moving the RIGHT
@@ -4357,7 +4379,7 @@ pub extern "C" fn nsl_train_input_device_guard(input_ptr: i64, param_list_ptr: i
         crate::nsl_log!(ERROR, "nsl", "nsl: a train-step input tensor ({} elements, dtype {}) is \
              host-resident while the model's parameters are on the GPU. \
              Every op would silently reconcile the WEIGHTS down to the host \
-             (f64, single-threaded). Move the input first: `x.to(cuda)`.",
+             (single-threaded). Move the input first: `x.to(cuda)`.",
             input.len, input.dtype
         );
         std::process::abort();

@@ -258,9 +258,9 @@ pub extern "C" fn nsl_model_load(path_ptr: i64, path_len: i64, param_tensors_ptr
     // In-order dtype guard (same lightweight no-JSON-parser style as the
     // count check above): this loader walks the data section by the LIVE
     // tensor's element size and raw-copies bytes, so a dtype mismatch
-    // between a file entry and the destination tensor (e.g. a CPU-saved
-    // f64 checkpoint loaded into a GPU-resident f32 model, or vice versa)
-    // would silently reinterpret bytes AND misalign every subsequent
+    // between a file entry and the destination tensor (e.g. an f64
+    // checkpoint loaded into an f32 model, or vice versa) would silently
+    // reinterpret bytes AND misalign every subsequent
     // tensor. Refuse loudly instead — found while fixing the model_save
     // GPU-staging dtype bug (f64 staging serialized under an f32 header).
     let file_dtypes: Vec<&[u8]> = {
@@ -294,8 +294,8 @@ pub extern "C" fn nsl_model_load(path_ptr: i64, path_len: i64, param_tensors_ptr
                 crate::nsl_log!(ERROR, "nsl", "nsl: model_load: dtype mismatch for tensor #{}: file has {}, \
                      model expects {} — raw byte copy would corrupt this tensor and \
                      misalign all subsequent ones. Re-save the checkpoint from a \
-                     model whose parameters have the same dtype (a CPU-resident \
-                     model holds f64 parameters, a GPU-resident one f32).",
+                     model whose parameters have the same dtype, or convert the \
+                     model's parameters with `.to(dtype)` before loading.",
                     i,
                     String::from_utf8_lossy(file_dtype),
                     live_dtype,

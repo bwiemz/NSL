@@ -2,15 +2,16 @@
 //!
 //! The generation driver (`nsl_cfie_generate`, engine.rs) speaks host
 //! i64 arrays; the tokenizer surface (`nsl_tokenizer_encode` /
-//! `nsl_tokenizer_decode`, tokenizer.rs) speaks 1-D f64 `NslTensor`s.
+//! `nsl_tokenizer_decode`, tokenizer.rs) speaks 1-D f32 `NslTensor`s (f32
+//! since C5; `nsl_cfie_tensor_to_tokens` still accepts f64).
 //! These two FFIs are the missing conversion in each direction, closing
 //! the Cycle-11 deferrals ("prompt is byte-baked", "generate() prints a
 //! count, not text"):
 //!
-//!   * `nsl_cfie_tokens_to_tensor`: host i64 token ids -> NEW 1-D f64
+//!   * `nsl_cfie_tokens_to_tensor`: host i64 token ids -> NEW 1-D f32
 //!     tensor (feeds `nsl_tokenizer_decode` so generated ids become
 //!     TEXT).
-//!   * `nsl_cfie_tensor_to_tokens`: 1-D f64 tensor (the
+//!   * `nsl_cfie_tensor_to_tokens`: 1-D f32 or f64 tensor (the
 //!     `nsl_tokenizer_encode` output) -> host i64 buffer (feeds
 //!     `nsl_cfie_generate`'s prompt ABI so the configured prompt is
 //!     runtime-encoded by the REAL tokenizer).
@@ -42,14 +43,14 @@ fn checked_host_8byte_len(count: i64) -> Option<usize> {
         .map(|_| count as usize)
 }
 
-/// Build a fresh 1-D f64 CPU `NslTensor` from `values`, following the
+/// Build a fresh 1-D f32 CPU `NslTensor` from `values`, following the
 /// tokenizer module's `make_1d_tensor` layout (tokenizer.rs — the house
 /// per-file convention for constructing the tokenizer-ABI tensor):
 /// heap shape/strides/data via `checked_alloc`, `NslTensor::new` (magic
 /// set, refcount 1, owns_data 1), published through `NslTensor::publish`
 /// so scope tracking + alloc accounting see it.  The caller owns the
 /// reference and frees it with `nsl_tensor_free`.
-fn make_1d_f64_tensor(values: &[f64]) -> i64 {
+fn make_1d_token_tensor(values: &[f64]) -> i64 {
     let len = values.len() as i64;
     let ndim: i64 = 1;
 
@@ -59,9 +60,9 @@ fn make_1d_f64_tensor(values: &[f64]) -> i64 {
     let strides = checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
     unsafe { *strides = 1 };
 
-    let data = checked_alloc(std::mem::size_of_val(values)) as *mut f64;
+    let data = checked_alloc(values.len() * std::mem::size_of::<f32>()) as *mut f32;
     for (i, &v) in values.iter().enumerate() {
-        unsafe { *data.add(i) = v };
+        unsafe { *data.add(i) = v as f32 };
     }
 
     let tensor = Box::new(NslTensor::new(
@@ -71,7 +72,7 @@ fn make_1d_f64_tensor(values: &[f64]) -> i64 {
         ndim,
         len,
         0, // device: CPU
-        0, // dtype: f64 (the tokenizer ABI dtype)
+        1, // dtype: f32, the tokenizer's id dtype (C5)
         1, // owns_data
         0, // data_owner: self
     ));
@@ -79,16 +80,15 @@ fn make_1d_f64_tensor(values: &[f64]) -> i64 {
 }
 
 /// Copy `count` i64 token ids from host memory at `tokens_ptr` into a
-/// NEW 1-D f64 `NslTensor` (the dtype `nsl_tokenizer_decode` consumes).
+/// NEW 1-D f32 `NslTensor` (the dtype `nsl_tokenizer_encode` produces).
 /// Returns the tensor pointer (> 0) — a fresh refcount-1 owner the
 /// caller frees with `nsl_tensor_free` — or 0 on bad args: null
 /// `tokens_ptr`, `count <= 0`, or a `count` whose byte total would
 /// exceed `isize::MAX` (the Cycle-9 host-read guard; reading past it is
 /// UB, so an oversized count must refuse, not abort).
 ///
-/// The i64 -> f64 value copy is exact for every real token id (f64 holds
-/// integers up to 2^53 exactly; vocab ids are far below), matching the
-/// precision contract of `nsl_tokenizer_encode`'s own f64 ids.
+/// The copy is exact for every id below 2^24 (f32's integer range), far
+/// above any real vocabulary; `nsl_tokenizer_encode`'s ids are f32 too.
 ///
 /// # Safety
 /// `tokens_ptr` must point to at least `count` readable i64s.
@@ -103,10 +103,10 @@ pub extern "C" fn nsl_cfie_tokens_to_tensor(tokens_ptr: i64, count: i64) -> i64 
     };
     let src = unsafe { std::slice::from_raw_parts(tokens_ptr as *const i64, n) };
     let values: Vec<f64> = src.iter().map(|&t| t as f64).collect();
-    make_1d_f64_tensor(&values)
+    make_1d_token_tensor(&values)
 }
 
-/// Read a 1-D f64 `NslTensor` of token ids (the `nsl_tokenizer_encode`
+/// Read a 1-D f32 or f64 `NslTensor` of token ids (the `nsl_tokenizer_encode`
 /// output shape) and write them as i64 into the host buffer at
 /// `out_ptr`, clamped to `cap` (no overrun).  Returns the FULL token
 /// count — the caller detects truncation by `count > cap`, mirroring
@@ -114,7 +114,7 @@ pub extern "C" fn nsl_cfie_tokens_to_tensor(tokens_ptr: i64, count: i64) -> i64 
 /// (nothing written).
 ///
 /// Refuses (-1) on: null/invalid tensor (magic check against
-/// `TENSOR_MAGIC`), a non-CPU or non-f64 tensor, a non-1-D tensor, a
+/// `TENSOR_MAGIC`), a non-CPU tensor, a dtype other than f32/f64, a non-1-D tensor, a
 /// null `out_ptr` (when anything would be written), a negative `cap`,
 /// a tensor length whose byte total exceeds `isize::MAX` (host-read
 /// guard), or ANY element that is not a non-negative integer
@@ -137,8 +137,8 @@ pub extern "C" fn nsl_cfie_tensor_to_tokens(tensor_ptr: i64, out_ptr: i64, cap: 
     if t.magic != TENSOR_MAGIC {
         return -1;
     }
-    // The tokenizer-encode contract: 1-D f64 host tensor.
-    if t.device != 0 || t.dtype != 0 || t.ndim != 1 || t.data.is_null() {
+    // The tokenizer-encode contract: a 1-D f32 host tensor (f64 accepted).
+    if t.device != 0 || !matches!(t.dtype, 0 | 1) || t.ndim != 1 || t.data.is_null() {
         return -1;
     }
     if t.len < 0 {
@@ -156,13 +156,18 @@ pub extern "C" fn nsl_cfie_tensor_to_tokens(tensor_ptr: i64, out_ptr: i64, cap: 
     if out_ptr == 0 {
         return -1;
     }
-    let src = unsafe { std::slice::from_raw_parts(t.data as *const f64, n) };
+    let src: Vec<f64> = if t.dtype == 1 {
+        let f = unsafe { std::slice::from_raw_parts(t.data as *const f32, n) };
+        f.iter().map(|&v| v as f64).collect()
+    } else {
+        unsafe { std::slice::from_raw_parts(t.data as *const f64, n) }.to_vec()
+    };
     // Validate EVERY element (not just the ones that fit in cap) before
     // writing anything: a corrupt encode must refuse, never silently
     // truncate into token 0.  2^63 is the first f64 double boundary
     // above i64::MAX; `v < 2^63` exactly bounds representable i64s.
     const I64_BOUND: f64 = 9_223_372_036_854_775_808.0; // 2^63
-    for &v in src {
+    for &v in &src {
         if !v.is_finite() || v < 0.0 || v.trunc() != v || v >= I64_BOUND {
             return -1;
         }
@@ -195,11 +200,11 @@ mod tests {
             let t = NslTensor::from_ptr(tptr);
             assert_eq!(t.ndim, 1);
             assert_eq!(t.len, 5);
-            assert_eq!(t.dtype, 0, "tokenizer ABI dtype is f64");
+            assert_eq!(t.dtype, 1, "token ids are f32 (C5)");
             assert_eq!(t.device, 0);
-            let data = t.data as *const f64;
+            let data = t.data as *const f32;
             for (i, &tok) in tokens.iter().enumerate() {
-                assert_eq!(unsafe { *data.add(i) }, tok as f64);
+                assert_eq!(unsafe { *data.add(i) }, tok as f32);
             }
         }
         // Round-trip back through tensor_to_tokens.
@@ -247,7 +252,7 @@ mod tests {
 
     #[test]
     fn tensor_to_tokens_zero_len_tensor_returns_zero() {
-        let tptr = make_1d_f64_tensor(&[]);
+        let tptr = make_1d_token_tensor(&[]);
         assert!(tptr > 0);
         let mut out = [0i64; 1];
         assert_eq!(
@@ -263,7 +268,7 @@ mod tests {
         let out_ptr = out.as_mut_ptr() as i64;
         // Null tensor / negative cap.
         assert_eq!(nsl_cfie_tensor_to_tokens(0, out_ptr, 4), -1);
-        let tptr = make_1d_f64_tensor(&[1.0, 2.0]);
+        let tptr = make_1d_token_tensor(&[1.0, 2.0]);
         assert_eq!(nsl_cfie_tensor_to_tokens(tptr, out_ptr, -1), -1);
         // Null out_ptr with a non-empty tensor.
         assert_eq!(nsl_cfie_tensor_to_tokens(tptr, 0, 4), -1);
@@ -280,14 +285,14 @@ mod tests {
             // magic is currently poisoned and it would refuse the handle.
             unsafe { (*(tptr as *mut NslTensor)).magic = live };
         }
-        // Non-f64 dtype (the encode ABI is f64; refuse f32 rather than
-        // silently reinterpret the bytes).
+        // A dtype other than f32/f64 (bf16 here) refuses rather than
+        // silently reinterpreting the bytes.
         {
             let t = NslTensor::from_ptr(tptr);
-            t.dtype = 1;
+            t.dtype = 3;
             assert_eq!(nsl_cfie_tensor_to_tokens(tptr, out_ptr, 4), -1);
             // Re-derive (same reason); the magic is intact here.
-            NslTensor::from_ptr(tptr).dtype = 0;
+            NslTensor::from_ptr(tptr).dtype = 1;
         }
         // Non-1-D.
         {
@@ -306,7 +311,7 @@ mod tests {
         // NaN, negative, fractional, and >= 2^63 each refuse — a corrupt
         // encode must not silently become token 0.
         for bad in [f64::NAN, -1.0, 2.5, 9.3e18, f64::INFINITY] {
-            let tptr = make_1d_f64_tensor(&[1.0, bad, 3.0]);
+            let tptr = make_1d_token_tensor(&[1.0, bad, 3.0]);
             assert_eq!(
                 nsl_cfie_tensor_to_tokens(tptr, out_ptr, 4),
                 -1,
@@ -316,7 +321,7 @@ mod tests {
         }
         // Validation covers elements PAST cap too: a corrupt tail refuses
         // even when the write window is clean.
-        let tptr = make_1d_f64_tensor(&[1.0, 2.0, f64::NAN]);
+        let tptr = make_1d_token_tensor(&[1.0, 2.0, f64::NAN]);
         assert_eq!(nsl_cfie_tensor_to_tokens(tptr, out_ptr, 2), -1);
         nsl_tensor_free(tptr);
     }

@@ -357,6 +357,19 @@ pub extern "C" fn nsl_sparse_density(sparse_ptr: i64) -> i64 {
 /// sparse_ptr: NslSparseTensor (COO or CSR)
 /// dense_ptr: NslTensor (2D, f64)
 /// Returns pointer to new NslTensor, or 0 on error.
+/// A CPU sparse result (built in f64) in the dense operand's dtype, before
+/// the GPU fallbacks hand it back: an upload does not narrow (C5 step 2b),
+/// and the GPU operand is f32. A null result passes through.
+#[cfg(feature = "cuda")]
+fn result_in_dtype(result: i64, dtype: u16) -> i64 {
+    if result == 0 || crate::tensor::NslTensor::from_ptr_ref(result).dtype == dtype {
+        return result;
+    }
+    let converted = crate::tensor::precision_cast::convert_untaped(result, dtype);
+    crate::tensor::nsl_tensor_free(result);
+    converted
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_sparse_spmm(sparse_ptr: i64, dense_ptr: i64) -> i64 {
     if sparse_ptr == 0 || dense_ptr == 0 { return 0; }
@@ -383,7 +396,7 @@ pub extern "C" fn nsl_sparse_spmm(sparse_ptr: i64, dense_ptr: i64) -> i64 {
             _ => {
                 // Unsupported format on GPU: fall through to CPU
                 let cpu_dense = crate::tensor::nsl_tensor_to_device(dense_ptr, 0);
-                let result = nsl_sparse_spmm(sparse_ptr, cpu_dense);
+                let result = result_in_dtype(nsl_sparse_spmm(sparse_ptr, cpu_dense), dense.dtype);
                 let gpu_result = crate::tensor::nsl_tensor_to_device(result, dense.device as i64);
                 crate::tensor::nsl_tensor_free(cpu_dense);
                 crate::tensor::nsl_tensor_free(result);
@@ -894,7 +907,7 @@ pub extern "C" fn nsl_sparse_spmv(sparse_ptr: i64, vec_ptr: i64) -> i64 {
             _ => {
                 // Unsupported: fall back to CPU
                 let cpu_vec = crate::tensor::nsl_tensor_to_device(vec_ptr, 0);
-                let result = nsl_sparse_spmv(sparse_ptr, cpu_vec);
+                let result = result_in_dtype(nsl_sparse_spmv(sparse_ptr, cpu_vec), vec_t.dtype);
                 let gpu_result = crate::tensor::nsl_tensor_to_device(result, vec_t.device as i64);
                 crate::tensor::nsl_tensor_free(cpu_vec);
                 crate::tensor::nsl_tensor_free(result);

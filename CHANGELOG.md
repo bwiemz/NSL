@@ -1805,6 +1805,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **C5 step 2b: moving a tensor to the GPU no longer changes its dtype.**
+  An upload is now a byte copy of the same dtype, like the download since
+  step 2a. The GPU stores and computes f32, so an f64 tensor is refused --
+  `Fatal::UnsupportedDtype`, naming `.to(f32)` -- instead of being narrowed
+  behind the program's back
+  (`docs/superpowers/specs/2026-09-26-dtype-semantics-design.md`).
+  Runtime parameters were already f32 on both devices (every creation FFI
+  makes f32), so a normal model moves unchanged. What still minted f64 now
+  mints its operand's dtype, so nothing in a normal program reaches the
+  refusal:
+  - **Source-AD scalar operands** (`x * float(n)`, an int shape term) were
+    f64 rank-0 tensors that `reconcile_device` uploaded next to a GPU
+    tensor. They now take the tensor operand's dtype (f32 without one), and
+    the SDPA scale is read straight to f64 instead of round-tripping
+    through a tensor.
+  - **`argmax`, `multinomial` and `topk` indices** were f64 whatever the
+    input; they now take the input's dtype (exact below 2^24).
+  - **Token ids** from `tokenizer.encode`/`encode_batch`, the CFIE bridge,
+    speculative and disaggregated decoding are f32 (they were f64);
+    `nsl_cfie_tensor_to_tokens` accepts f32 and f64.
+  - **The sparse SpMM/SpMV GPU fallbacks** convert their CPU result to the
+    dense operand's dtype before handing it back.
+  - **Gradient accumulation into a GPU buffer** (`nsl_grad_accumulate_add`,
+    FASE's grad migration) converts a host gradient to the accumulator's
+    dtype on the host -- explicitly, through the new
+    `nsl_grad_migrate_like` -- before the upload.
+  The `model_load` dtype-mismatch message no longer claims a CPU model
+  holds f64 parameters.
+
 - **Source AD: seven wrong gradients the rule certificates caught**
   (`source_ad_rule_cert.rs`; each fix delists its ratchet entry, and every
   one of them passed under the tape):

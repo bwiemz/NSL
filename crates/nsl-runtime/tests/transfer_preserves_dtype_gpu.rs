@@ -15,6 +15,8 @@
 //! through f64 is exact for every finite f32, so only the NaNs would catch
 //! that; the tag assertion catches the plain widen.
 //!
+//! An f64 upload is refused (step 2b): `an_f64_upload_is_refused`.
+//!
 //! Not covered here: `DTYPE_U16_TOKEN`, which the upload deliberately widens to
 //! i32 for the index kernels, and the FP8 tags, which `dtype_element_size`
 //! does not know and so cannot be transferred in either direction.
@@ -255,38 +257,51 @@ fn a_transposed_f32_device_view_downloads_as_contiguous_f32() {
     }
 }
 
+/// Set by the parent to make `zz_f64_upload_child` do its one poisoned call.
+const F64_UPLOAD_CHILD: &str = "NSL_TEST_F64_UPLOAD_CHILD";
+
+/// The child half of `an_f64_upload_is_refused`: uploads an f64 tensor, which
+/// must abort the process. Cargo runs every `#[test]`, so this returns at once
+/// unless the parent set the variable.
 #[test]
-#[ignore = "requires CUDA GPU"]
-fn an_f64_upload_narrows_and_the_download_keeps_the_narrowed_tag() {
+fn zz_f64_upload_child() {
+    if std::env::var(F64_UPLOAD_CHILD).is_err() {
+        return;
+    }
     init_cuda();
-
-    // The interim state between steps 2a and 2b: the upload still narrows f64
-    // to f32 (step 2b turns it into a refusal naming `.to(f32)`), and the
-    // download no longer widens it back. So the host copy is f32, holding the
-    // round-to-nearest narrowing of each input.
-    let values: [f64; 6] = [1.0, -0.0, 0.1, 1.0 / 3.0, 1e-40, f64::INFINITY];
+    let values: [f64; 3] = [1.0, 0.1, -2.5];
     let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-
     let cpu = cpu_tensor(&bytes, &[values.len() as i64], DTYPE_F64);
-    let gpu = unsafe { nsl_tensor_to_device(cpu, 1) };
-    assert_eq!(view(gpu).dtype, DTYPE_F32, "f64 upload is expected to narrow until step 2b");
+    let _ = unsafe { nsl_tensor_to_device(cpu, 1) };
+    // Only reached if the upload did NOT refuse.
+    println!("UPLOAD-DID-NOT-REFUSE");
+}
 
-    let back = unsafe { nsl_tensor_to_device(gpu, 0) };
-    assert_eq!(
-        (view(back).device, view(back).dtype),
-        (0, DTYPE_F32),
-        "the download must not widen the narrowed tensor back to f64"
+/// C5 step 2b: an upload is a byte copy of the same dtype, and the GPU holds
+/// no f64, so an f64 upload is refused -- naming `.to(f32)` -- instead of
+/// being narrowed behind the program's back (which is what this gate pinned
+/// between steps 2a and 2b). Run in a re-exec'd child because the refusal
+/// terminates the process.
+#[test]
+#[ignore = "requires CUDA GPU (re-execs this binary)"]
+fn an_f64_upload_is_refused() {
+    init_cuda();
+    let exe = std::env::current_exe().expect("test binary path");
+    let out = std::process::Command::new(exe)
+        .args(["zz_f64_upload_child", "--exact", "--nocapture", "--test-threads=1", "--include-ignored"])
+        .env(F64_UPLOAD_CHILD, "1")
+        .env("RUST_BACKTRACE", "0")
+        .output()
+        .expect("failed to re-exec the test binary");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains("UPLOAD-DID-NOT-REFUSE"),
+        "the f64 upload went through.\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
     );
-    let got = host_bytes(back, 4);
-    for (i, v) in values.iter().enumerate() {
-        let want = (*v as f32).to_bits();
-        let have = u32::from_le_bytes([got[4 * i], got[4 * i + 1], got[4 * i + 2], got[4 * i + 3]]);
-        assert_eq!(have, want, "element {i} ({v:e}): got {have:#010x}, want {want:#010x}");
-    }
-
-    unsafe {
-        nsl_tensor_free(back);
-        nsl_tensor_free(gpu);
-        nsl_tensor_free(cpu);
-    }
+    assert!(!out.status.success(), "the child exited 0.\n--- stderr ---\n{stderr}");
+    assert!(
+        stderr.contains("cannot be moved to the GPU") && stderr.contains(".to(f32)"),
+        "the child failed, but not with the f64 upload refusal.\n--- stderr ---\n{stderr}"
+    );
 }

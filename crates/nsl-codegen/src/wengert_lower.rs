@@ -901,32 +901,58 @@ fn emit_sdpa_fused_dispatch(
     Ok(Some((join_block, out_param, lse_param)))
 }
 
-/// Promote an Integer (i64) to a scalar Tensor if needed for mixed-type arithmetic.
+/// Promote an Integer or Scalar operand to a rank-0 tensor for tensor
+/// arithmetic with `like`, in `like`'s dtype -- f64 only when `like` is f64,
+/// f32 otherwise -- or the f32 default when no tensor partner exists. It
+/// used to be f64 always: the CPU's "f32 wins" rule then discarded it, and
+/// against a GPU partner `reconcile_device` uploaded it, which narrowed it
+/// (C5: no layer changes a dtype implicitly). The bool is "caller owns it".
 fn promote_to_tensor(
     compiler: &mut Compiler,
     builder: &mut FunctionBuilder,
     val: Value,
     ty: WengertType,
+    like: Option<Value>,
 ) -> Result<(Value, bool), CodegenError> {
-    match ty {
-        WengertType::Integer => {
-            let f = builder.ins().fcvt_from_sint(cl_types::F64, val);
-            let dt = builder.ins().iconst(cl_types::I64, 0); // f64
-            Ok((
-                call(compiler, builder, "nsl_tensor_scalar", &[f, dt])?,
-                true,
-            ))
+    let value = match ty {
+        WengertType::Integer => builder.ins().fcvt_from_sint(cl_types::F64, val),
+        WengertType::Scalar => val,
+        _ => return Ok((val, false)), // Already a tensor pointer (i64)
+    };
+    let dt = match like {
+        Some(t) => {
+            let tag = call(compiler, builder, "nsl_tensor_get_dtype", &[t])?;
+            let is_f64 = builder.ins().icmp_imm_s(IntCC::Equal, tag, 0);
+            let f64_tag = builder.ins().iconst(cl_types::I64, 0);
+            let f32_tag = builder.ins().iconst(cl_types::I64, 1);
+            builder.ins().select(is_f64, f64_tag, f32_tag)
         }
-        WengertType::Scalar => {
-            // f64 scalar → wrap in a scalar tensor for tensor arithmetic
-            let dt = builder.ins().iconst(cl_types::I64, 0); // f64
-            Ok((
-                call(compiler, builder, "nsl_tensor_scalar", &[val, dt])?,
-                true,
-            ))
-        }
-        _ => Ok((val, false)), // Already a tensor pointer (i64)
+        None => builder.ins().iconst(cl_types::I64, 1),
+    };
+    Ok((call(compiler, builder, "nsl_tensor_scalar", &[value, dt])?, true))
+}
+
+/// The tensor partner of a binary op's operand, for `promote_to_tensor`.
+fn tensor_partner(other: Value, other_ty: WengertType) -> Option<Value> {
+    matches!(other_ty, WengertType::Tensor).then_some(other)
+}
+
+/// A scalar operand (Integer, Scalar, or a rank-0 tensor) read as an f64
+/// Value. The SDPA scale used to round-trip through `promote_to_tensor` and
+/// `.item()`; this reads it directly, keeping it exact.
+fn scalar_operand_f64(
+    compiler: &mut Compiler,
+    builder: &mut FunctionBuilder,
+    val: Value,
+    ty: WengertType,
+) -> Result<Value, CodegenError> {
+    if builder.func.dfg.value_type(val) == cl_types::F64 {
+        return Ok(val);
     }
+    if ty == WengertType::Integer {
+        return Ok(builder.ins().fcvt_from_sint(cl_types::F64, val));
+    }
+    call(compiler, builder, "nsl_tensor_item", &[val])
 }
 
 /// Option 3a — emit the fused CSHA forward FFI under a backward-dispatcher
@@ -1492,7 +1518,7 @@ fn lower_single_op(
                 .get(&op.inputs[0])
                 .copied()
                 .unwrap_or(WengertType::Tensor);
-            let (a, free_a) = promote_to_tensor(compiler, builder, inputs[0], a_ty)?;
+            let (a, free_a) = promote_to_tensor(compiler, builder, inputs[0], a_ty, None)?;
             let rt_name = match &op.op {
                 PrimalOp::Relu => "nsl_tensor_relu",
                 PrimalOp::Sigmoid => "nsl_tensor_sigmoid",
@@ -1536,8 +1562,20 @@ fn lower_single_op(
             if a_ty == WengertType::Integer && b_ty == WengertType::Integer {
                 Ok(builder.ins().iadd(inputs[0], inputs[1]))
             } else {
-                let (a, free_a) = promote_to_tensor(compiler, builder, inputs[0], a_ty)?;
-                let (b, free_b) = promote_to_tensor(compiler, builder, inputs[1], b_ty)?;
+                let (a, free_a) = promote_to_tensor(
+                    compiler,
+                    builder,
+                    inputs[0],
+                    a_ty,
+                    tensor_partner(inputs[1], b_ty),
+                )?;
+                let (b, free_b) = promote_to_tensor(
+                    compiler,
+                    builder,
+                    inputs[1],
+                    b_ty,
+                    tensor_partner(inputs[0], a_ty),
+                )?;
                 // ELTLS (FBIP-3): nsl_tensor_add takes a flags byte (flags=0 here).
                 let flags_zero = builder.ins().iconst(cl_types::I8, 0);
                 let result = call(compiler, builder, "nsl_tensor_add", &[a, b, flags_zero])?;
@@ -1558,8 +1596,20 @@ fn lower_single_op(
             if a_ty == WengertType::Integer && b_ty == WengertType::Integer {
                 Ok(builder.ins().isub(inputs[0], inputs[1]))
             } else {
-                let (a, free_a) = promote_to_tensor(compiler, builder, inputs[0], a_ty)?;
-                let (b, free_b) = promote_to_tensor(compiler, builder, inputs[1], b_ty)?;
+                let (a, free_a) = promote_to_tensor(
+                    compiler,
+                    builder,
+                    inputs[0],
+                    a_ty,
+                    tensor_partner(inputs[1], b_ty),
+                )?;
+                let (b, free_b) = promote_to_tensor(
+                    compiler,
+                    builder,
+                    inputs[1],
+                    b_ty,
+                    tensor_partner(inputs[0], a_ty),
+                )?;
                 // ELTLS (FBIP-3): nsl_tensor_sub takes a flags byte.
                 let flags_zero = builder.ins().iconst(cl_types::I8, 0);
                 let result = call(compiler, builder, "nsl_tensor_sub", &[a, b, flags_zero])?;
@@ -1580,8 +1630,20 @@ fn lower_single_op(
             if a_ty == WengertType::Integer && b_ty == WengertType::Integer {
                 Ok(builder.ins().imul(inputs[0], inputs[1]))
             } else {
-                let (a, free_a) = promote_to_tensor(compiler, builder, inputs[0], a_ty)?;
-                let (b, free_b) = promote_to_tensor(compiler, builder, inputs[1], b_ty)?;
+                let (a, free_a) = promote_to_tensor(
+                    compiler,
+                    builder,
+                    inputs[0],
+                    a_ty,
+                    tensor_partner(inputs[1], b_ty),
+                )?;
+                let (b, free_b) = promote_to_tensor(
+                    compiler,
+                    builder,
+                    inputs[1],
+                    b_ty,
+                    tensor_partner(inputs[0], a_ty),
+                )?;
                 // ELTLS (FBIP-3): nsl_tensor_mul takes a flags byte.
                 let flags_zero = builder.ins().iconst(cl_types::I8, 0);
                 let result = call(compiler, builder, "nsl_tensor_mul", &[a, b, flags_zero])?;
@@ -1602,8 +1664,20 @@ fn lower_single_op(
             if a_ty == WengertType::Integer && b_ty == WengertType::Integer {
                 Ok(builder.ins().sdiv(inputs[0], inputs[1]))
             } else {
-                let (a, free_a) = promote_to_tensor(compiler, builder, inputs[0], a_ty)?;
-                let (b, free_b) = promote_to_tensor(compiler, builder, inputs[1], b_ty)?;
+                let (a, free_a) = promote_to_tensor(
+                    compiler,
+                    builder,
+                    inputs[0],
+                    a_ty,
+                    tensor_partner(inputs[1], b_ty),
+                )?;
+                let (b, free_b) = promote_to_tensor(
+                    compiler,
+                    builder,
+                    inputs[1],
+                    b_ty,
+                    tensor_partner(inputs[0], a_ty),
+                )?;
                 // ELTLS (FBIP-3): nsl_tensor_div takes a flags byte.
                 let flags_zero = builder.ins().iconst(cl_types::I8, 0);
                 let result = call(compiler, builder, "nsl_tensor_div", &[a, b, flags_zero])?;
@@ -2338,22 +2412,13 @@ fn lower_single_op(
                 .get(3)
                 .and_then(|vid| var_types.get(vid).copied())
                 .unwrap_or(WengertType::Tensor);
-            let (scale, free_scale) = if inputs.len() > 3 {
-                promote_to_tensor(compiler, builder, inputs[3], scale_ty)?
-            } else {
-                // Default scale: 1.0
-                let one = builder.ins().f64const(1.0);
-                let dt = builder.ins().iconst(cl_types::I64, 1);
-                (
-                    call(compiler, builder, "nsl_tensor_scalar", &[one, dt])?,
-                    true,
-                )
-            };
-
             // Scale item hoisted ahead of the fused dispatch: both the fused
             // FFI (as f32 bits) and the decomposed chain (as f64) consume it.
-            let scale_item = call(compiler, builder, "nsl_tensor_item", &[scale])?;
-            free_tensor_if_owned(compiler, builder, scale, free_scale)?;
+            let scale_item = if inputs.len() > 3 {
+                scalar_operand_f64(compiler, builder, inputs[3], scale_ty)?
+            } else {
+                builder.ins().f64const(1.0)
+            };
 
             // PCA Stage C: fused-forward dispatch (the forward analog of
             // PR #347's backward variant table). Decorator-free compiles
@@ -2494,9 +2559,7 @@ fn lower_single_op(
                 .get(3)
                 .and_then(|vid| var_types.get(vid).copied())
                 .unwrap_or(WengertType::Tensor);
-            let (scale, free_scale) = promote_to_tensor(compiler, builder, inputs[3], scale_ty)?;
-            let scale_item = call(compiler, builder, "nsl_tensor_item", &[scale])?;
-            free_tensor_if_owned(compiler, builder, scale, free_scale)?;
+            let scale_item = scalar_operand_f64(compiler, builder, inputs[3], scale_ty)?;
 
             let scale_f32 = builder.ins().fdemote(cl_types::F32, scale_item);
             let scale_bits_i32 = builder.ins().bitcast(

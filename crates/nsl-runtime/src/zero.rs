@@ -1974,7 +1974,7 @@ pub extern "C" fn nsl_grad_accumulate_add(
     // nsl_tensor_to_device_like returns an OWNED ref (refcount++ when the
     // devices already match, a fresh tensor otherwise) that must be freed
     // exactly once below (FBIP ownership, see stmt_fase.rs accumulate arm).
-    let migrated = crate::tensor::nsl_tensor_to_device_like(src_ptr, dst_ptr);
+    let migrated = crate::tensor::nsl_grad_migrate_like(src_ptr, dst_ptr);
     if migrated == 0 {
         return -1;
     }
@@ -1988,9 +1988,9 @@ pub extern "C" fn nsl_grad_accumulate_add(
         crate::tensor::nsl_tensor_free(migrated);
         return rc;
     }
-    // A GPU destination: the upload narrows an f64 source to f32 (until C5
-    // step 2b refuses it), so the delegated nsl_tensor_add_inplace sees two
-    // f32 device operands.
+    // A GPU destination: `nsl_grad_migrate_like` converted an f64 host source
+    // to the accumulator's f32 before the (byte-copy) upload, so the delegated
+    // nsl_tensor_add_inplace sees two f32 device operands.
     let mig = NslTensor::from_ptr_ref(migrated);
     if mig.dtype != dst.dtype || mig.len != dst.len {
         crate::nsl_log!(WARN, "nsl", "nsl: nsl_grad_accumulate_add: post-migration mismatch \
