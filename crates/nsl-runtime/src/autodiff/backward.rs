@@ -33,11 +33,12 @@ use super::grad_utils::{
 use super::{ones_from_shape, TapeOp, TAPE};
 
 /// Read a tensor's shape into an owned Vec (for capture before an eager free).
-/// A reduction's recorded dim as an axis of its input. The forward resolves
-/// a negative dim locally but records it raw (`sum(x, -2)` records -2), so the
-/// backward resolves it again; casting it straight to usize indexed past the
-/// end. (Sum/Mean record -1 for a GLOBAL reduction, which their backward
-/// handles before reaching here; reduce_max's -1 is the last dim.)
+/// A recorded dim as an axis of a tensor with `input_shape`'s rank. Forwards
+/// (reductions, gather, slice, cat) resolve a negative dim locally but record
+/// it raw (`sum(x, -2)` records -2), so the backward resolves it again;
+/// casting it straight to usize indexed past the end. (Sum/Mean record -1 for
+/// a GLOBAL reduction, which their backward handles before reaching here;
+/// everywhere else -1 is the last dim.)
 fn reduced_dim(dim: i64, input_shape: &[i64]) -> usize {
     if dim < 0 {
         (dim + input_shape.len() as i64) as usize
@@ -1587,7 +1588,8 @@ pub(crate) fn run_backward_core_strict(
             }
             TapeOp::Gather { a, out, dim, indices_ptr, input_shape } => {
                 if let Some(&g) = grad_map.get(out) {
-                    let grad_a = scatter_gather_grad(g, input_shape, *dim as usize, *indices_ptr);
+                    let d = reduced_dim(*dim, input_shape);
+                    let grad_a = scatter_gather_grad(g, input_shape, d, *indices_ptr);
                     accumulate_grad(&mut grad_map, *a, grad_a);
                 }
             }
@@ -1718,7 +1720,8 @@ pub(crate) fn run_backward_core_strict(
             TapeOp::Slice { a, out, dim, start, input_shape } => {
                 // Backward: create zeros with original input shape, copy grad into [start, start+slice_len)
                 if let Some(&g) = grad_map.get(out) {
-                    let grad_a = slice_backward(g, input_shape, *dim as usize, *start as usize);
+                    let d = reduced_dim(*dim, input_shape);
+                    let grad_a = slice_backward(g, input_shape, d, *start as usize);
                     accumulate_grad(&mut grad_map, *a, grad_a);
                 }
             }
@@ -1792,7 +1795,7 @@ pub(crate) fn run_backward_core_strict(
             TapeOp::Cat { inputs, out, dim, split_sizes } => {
                 // Backward: split the gradient along the cat dim into pieces
                 if let Some(&g) = grad_map.get(out) {
-                    let grads = cat_backward(g, *dim as usize, split_sizes);
+                    let grads = cat_backward(g, reduced_dim(*dim, &shape_vec_of(g)), split_sizes);
                     for (i, grad_piece) in grads.into_iter().enumerate() {
                         accumulate_grad(&mut grad_map, inputs[i], grad_piece);
                     }

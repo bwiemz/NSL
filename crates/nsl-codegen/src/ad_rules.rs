@@ -194,14 +194,18 @@ pub enum AdjointExpr {
     // Indexing backward
     /// Embedding backward: scatter_add(grad, indices, weight). args: (grad, indices, weight_var)
     EmbeddingBackward(VarId, VarId, VarId),
-    /// Gather backward: scatter_add(grad, indices, dim). args: (grad, indices, dim)
-    GatherBackward(VarId, VarId, i64),
+    /// Gather backward: `grad` scattered into zeros shaped like `input`, at
+    /// `indices` along `dim`. args: (grad, input, indices, dim)
+    GatherBackward(VarId, VarId, VarId, i64),
     /// ScatterAdd backward for src: gather(grad, indices). args: (grad, indices, dim)
     ScatterAddSrcBackward(VarId, VarId, i64),
 
     // Shape backward
-    /// Concat backward: split grad along dim. args: (grad, dim, offset, size)
-    ConcatSplit(VarId, i64, usize, usize),
+    /// Concat backward: the slice of `grad` along `dim` that concat operand
+    /// `index` occupied. Its offset is the sum of the preceding operands'
+    /// sizes along `dim`, read at run time (the Wengert list has no shapes).
+    /// args: (grad, dim, index, operands)
+    ConcatSplit(VarId, i64, usize, Vec<VarId>),
     /// Split backward: concat grads along dim
     SplitConcat(VarId, i64),
     /// Slice backward: zero-pad grad into original shape.
@@ -618,7 +622,7 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
         }],
         PrimalOp::Gather { dim } => vec![InputAdjoint {
             input_var: op.inputs[0],
-            expr: AdjointExpr::GatherBackward(output_bar, op.inputs[1], *dim),
+            expr: AdjointExpr::GatherBackward(output_bar, op.inputs[0], op.inputs[1], *dim),
         }],
         PrimalOp::ScatterAdd { dim } => {
             // scatter_add(input, indices, src) -> output
@@ -643,7 +647,7 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             for (i, &input) in op.inputs.iter().enumerate() {
                 adjoints.push(InputAdjoint {
                     input_var: input,
-                    expr: AdjointExpr::ConcatSplit(output_bar, *dim, i, 1),
+                    expr: AdjointExpr::ConcatSplit(output_bar, *dim, i, op.inputs.clone()),
                 });
             }
             adjoints
@@ -1163,11 +1167,13 @@ pub fn ad_cert_status(op: &PrimalOp) -> AdCertStatus {
             "the full-reduction adjoints; NSL `.reshape` lowers to Passthrough(\"reshape\")",
         ),
         PrimalOp::Broadcast => AdjointOnly("the full-reduction and mean adjoints"),
-        PrimalOp::Concat { .. } => Certified(&["cat_dim0", "cat_dim1"]),
+        PrimalOp::Concat { .. } => Certified(&["cat_dim0", "cat_dim1", "cat_three", "cat_neg"]),
         PrimalOp::Split { .. } => Unreachable("the extractor never builds a Split primal"),
         PrimalOp::Slice { .. } => Unreachable("the extractor never builds a Slice primal"),
         PrimalOp::PadZero { .. } => AdjointOnly("the Slice adjoint"),
-        PrimalOp::Gather { .. } => Certified(&["gather"]),
+        PrimalOp::Gather { .. } => {
+            Certified(&["gather", "gather_neg", "gather_dim0", "gather_mid"])
+        }
         PrimalOp::ScatterAdd { .. } => AdjointOnly("the Gather and Embedding adjoints"),
         PrimalOp::Embedding => Certified(&["embedding"]),
         PrimalOp::LayerNorm { .. } => Certified(&[
@@ -1992,7 +1998,7 @@ mod tests {
         assert_eq!(adj.len(), 1);
         assert!(matches!(
             adj[0].expr,
-            AdjointExpr::GatherBackward(100, 1, 1)
+            AdjointExpr::GatherBackward(100, 0, 1, 1)
         ));
     }
 
@@ -2003,7 +2009,7 @@ mod tests {
         assert_eq!(adj.len(), 3, "Concat of 3 inputs should produce 3 adjoints");
         for (i, a) in adj.iter().enumerate() {
             assert_eq!(a.input_var, i as VarId);
-            assert!(matches!(a.expr, AdjointExpr::ConcatSplit(100, 0, _, 1)));
+            assert_eq!(a.expr, AdjointExpr::ConcatSplit(100, 0, i, vec![0, 1, 2]));
         }
     }
 

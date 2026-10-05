@@ -588,11 +588,39 @@ fn certs() -> Vec<Cert> {
             oracle: oracle!(|e| {
                 let (t, g) = (get(e, "t"), get(e, "g"));
                 Arr { shape: vec![3], data: (0..3).map(|r| t.data[r * 4 + g.data[r] as usize]).collect() }
-            }), known: &[(Mode::Source, "the dim literal is read as the index tensor: invalid tensor handle 0x1")], prelude: "" },
+            }), known: &[], prelude: "" },
+        Cert { name: "gather_neg", inputs: vec![inp("t", &[3, 4]), idx("g", &[3], "abs(arange(-1.0, 2.0)) + 1.0")],
+            expr: "gather(t, -1, g).reshape([3])", wrt: &["t"], out_shape: &[3],
+            oracle: oracle!(|e| {
+                let (t, g) = (get(e, "t"), get(e, "g"));
+                Arr { shape: vec![3], data: (0..3).map(|r| t.data[r * 4 + g.data[r] as usize]).collect() }
+            }), known: &[], prelude: "" },
+        Cert { name: "gather_dim0", inputs: vec![inp("t", &[3, 4]), idx("g", &[1], "abs(arange(-1.0, 0.0)) + 1.0")],
+            expr: "gather(t, 0, g).reshape([4])", wrt: &["t"], out_shape: &[4],
+            oracle: oracle!(|e| {
+                let (t, g) = (get(e, "t"), get(e, "g"));
+                let r = g.data[0] as usize;
+                Arr { shape: vec![4], data: t.data[r * 4..r * 4 + 4].to_vec() }
+            }), known: &[], prelude: "" },
+        Cert { name: "gather_mid", inputs: vec![inp("t", &[2, 3, 4]), idx("g", &[2], "abs(arange(-1.0, 1.0))")],
+            expr: "gather(t, 1, g).reshape([2, 4])", wrt: &["t"], out_shape: &[2, 4],
+            oracle: oracle!(|e| {
+                let (t, g) = (get(e, "t"), get(e, "g"));
+                let data = (0..2).flat_map(|o| {
+                    let r = g.data[o] as usize;
+                    t.data[o * 12 + r * 4..o * 12 + r * 4 + 4].to_vec()
+                }).collect();
+                Arr { shape: vec![2, 4], data }
+            }), known: &[], prelude: "" },
         Cert { name: "cat_dim0", inputs: vec![inp("a", &[2, 3]), inp("b", &[1, 3])], expr: "tensor_cat([a, b], 0)", wrt: &["a", "b"], out_shape: &[3, 3],
-            oracle: oracle!(|e| concat(get(e, "a"), get(e, "b"), 0)), known: &[(Mode::Source, "the tensor list operand gets no adjoint: both gradients are zero")], prelude: "" },
+            oracle: oracle!(|e| concat(get(e, "a"), get(e, "b"), 0)), known: &[], prelude: "" },
         Cert { name: "cat_dim1", inputs: vec![inp("a", &[2, 3]), inp("b", &[2, 2])], expr: "tensor_cat([a, b], 1)", wrt: &["a", "b"], out_shape: &[2, 5],
-            oracle: oracle!(|e| concat(get(e, "a"), get(e, "b"), 1)), known: &[(Mode::Source, "the tensor list operand gets no adjoint: both gradients are zero")], prelude: "" },
+            oracle: oracle!(|e| concat(get(e, "a"), get(e, "b"), 1)), known: &[], prelude: "" },
+        Cert { name: "cat_three", inputs: vec![inp("a", &[2, 3]), inp("b", &[2, 1]), inp("c", &[2, 2])],
+            expr: "tensor_cat([a, b, c], 1)", wrt: &["a", "b", "c"], out_shape: &[2, 6],
+            oracle: oracle!(|e| concat(&concat(get(e, "a"), get(e, "b"), 1), get(e, "c"), 1)), known: &[], prelude: "" },
+        Cert { name: "cat_neg", inputs: vec![inp("a", &[2, 3]), inp("b", &[2, 2])], expr: "tensor_cat([a, b], -1)", wrt: &["a", "b"], out_shape: &[2, 5],
+            oracle: oracle!(|e| concat(get(e, "a"), get(e, "b"), 1)), known: &[], prelude: "" },
         // --- losses (scalar outputs) -------------------------------------
         Cert { name: "cross_entropy", inputs: vec![inp("z", &[4, 5]), idx("t", &[4], "abs(arange(-1.0, 3.0)) + 1.0")],
             expr: "cross_entropy(z, t)", wrt: &["z"], out_shape: &[],
@@ -949,7 +977,7 @@ cert_tests! {
     sum_all, mean_all, sum_dim, mean_dim, sum_dim_neg, sum_dim_keepdim, sum_dim_last, mean_dim_last,
     softmax_last, softmax_dim0, softmax_mid, log_softmax_last, log_softmax_dim0, log_softmax_mid,
     layernorm, layernorm_eps, rmsnorm, rmsnorm_eps, layernorm_3d, layernorm_field_eps,
-    embedding, gather, cat_dim0, cat_dim1,
+    embedding, gather, gather_neg, gather_dim0, gather_mid, cat_dim0, cat_dim1, cat_three, cat_neg,
     cross_entropy, mse_loss, l1_loss,
     conv2d, sdpa, sdpa_causal, sdpa_scale,
 }
