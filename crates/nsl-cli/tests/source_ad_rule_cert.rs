@@ -650,13 +650,13 @@ fn certs() -> Vec<Cert> {
             oracle: oracle!(|e| conv2d_ref(get(e, "x"), get(e, "w"), get(e, "b"), 1, 1)), known: &[], prelude: "" },
         Cert { name: "sdpa", inputs: vec![inp("q", &[1, 2, 4, 8]), inp("k", &[1, 2, 4, 8]), inp("v", &[1, 2, 4, 8])],
             expr: "scaled_dot_product_attention(q, k, v, 0.35355339059327373, false)", wrt: &["q", "k", "v"], out_shape: &[1, 2, 4, 8],
-            oracle: oracle!(|e| sdpa_ref(get(e, "q"), get(e, "k"), get(e, "v"), 0.35355339059327373, false)), known: &[(Mode::Source, "compile panic in the grad block: FunctionBuilder finalized, but block3 is not filled")], prelude: "" },
+            oracle: oracle!(|e| sdpa_ref(get(e, "q"), get(e, "k"), get(e, "v"), 0.35355339059327373, false)), known: &[], prelude: "" },
         Cert { name: "sdpa_causal", inputs: vec![inp("q", &[1, 2, 4, 8]), inp("k", &[1, 2, 4, 8]), inp("v", &[1, 2, 4, 8])],
             expr: "scaled_dot_product_attention(q, k, v, 0.35355339059327373, true)", wrt: &["q", "k", "v"], out_shape: &[1, 2, 4, 8],
-            oracle: oracle!(|e| sdpa_ref(get(e, "q"), get(e, "k"), get(e, "v"), 0.35355339059327373, true)), known: &[(Mode::Source, "compile panic in the grad block: FunctionBuilder finalized, but block3 is not filled")], prelude: "" },
+            oracle: oracle!(|e| sdpa_ref(get(e, "q"), get(e, "k"), get(e, "v"), 0.35355339059327373, true)), known: &[], prelude: "" },
         Cert { name: "sdpa_scale", inputs: vec![inp("q", &[1, 2, 4, 8]), inp("k", &[1, 2, 4, 8]), inp("v", &[1, 2, 4, 8])],
             expr: "scaled_dot_product_attention(q, k, v, 0.9, false)", wrt: &["q", "k", "v"], out_shape: &[1, 2, 4, 8],
-            oracle: oracle!(|e| sdpa_ref(get(e, "q"), get(e, "k"), get(e, "v"), 0.9, false)), known: &[(Mode::Source, "compile panic in the grad block: FunctionBuilder finalized, but block3 is not filled")], prelude: "" },
+            oracle: oracle!(|e| sdpa_ref(get(e, "q"), get(e, "k"), get(e, "v"), 0.9, false)), known: &[], prelude: "" },
     ]
 }
 

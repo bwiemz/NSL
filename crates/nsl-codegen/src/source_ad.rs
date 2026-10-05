@@ -1500,26 +1500,26 @@ impl AdjointGenerator {
             // --- Attention backward: per-component extraction from fused kernel ---
             // Each component (dQ=0, dK=1, dV=2) is extracted via a dedicated op
             // that carries the causal flag so the runtime can apply the correct mask.
-            AdjointExpr::AttentionBackwardQ(y_bar, q, k, v, fwd_out, causal) => self.emit_op(
+            AdjointExpr::AttentionBackwardQ(y_bar, q, k, v, fwd_out, causal, scale) => self.emit_op(
                 PrimalOp::FlashAttentionBackwardExtract {
                     causal,
                     component: 0,
                 },
-                vec![y_bar, q, k, v, fwd_out],
+                [y_bar, q, k, v, fwd_out].into_iter().chain(scale).collect(),
             ),
-            AdjointExpr::AttentionBackwardK(y_bar, q, k, v, fwd_out, causal) => self.emit_op(
+            AdjointExpr::AttentionBackwardK(y_bar, q, k, v, fwd_out, causal, scale) => self.emit_op(
                 PrimalOp::FlashAttentionBackwardExtract {
                     causal,
                     component: 1,
                 },
-                vec![y_bar, q, k, v, fwd_out],
+                [y_bar, q, k, v, fwd_out].into_iter().chain(scale).collect(),
             ),
-            AdjointExpr::AttentionBackwardV(y_bar, q, k, v, fwd_out, causal) => self.emit_op(
+            AdjointExpr::AttentionBackwardV(y_bar, q, k, v, fwd_out, causal, scale) => self.emit_op(
                 PrimalOp::FlashAttentionBackwardExtract {
                     causal,
                     component: 2,
                 },
-                vec![y_bar, q, k, v, fwd_out],
+                [y_bar, q, k, v, fwd_out].into_iter().chain(scale).collect(),
             ),
 
             // PCA Stage C: packed (segment-masked) attention backward — same

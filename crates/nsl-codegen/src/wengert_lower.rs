@@ -207,7 +207,7 @@ pub fn compile_wengert_ops(
 pub fn compile_wengert_ops_range(
     compiler: &mut Compiler,
     builder: &mut FunctionBuilder,
-    _state: &mut FuncState,
+    state: &mut FuncState,
     wengert: &WengertList,
     range: std::ops::Range<usize>,
     var_map: &mut VarMap,
@@ -616,6 +616,15 @@ pub fn compile_wengert_ops_range(
     if let Some(id) = graph_region_id {
         let idv = builder.ins().iconst(cl_types::I64, id);
         call(compiler, builder, "nsl_cuda_graph_region_end", &[idv])?;
+    }
+    // An op's lowering may move the builder to a new block -- the fused-SDPA
+    // dispatch ends in its join block, the CSHA launch check in its ok block.
+    // Callers decide where to keep emitting (and whether a block still needs
+    // its terminator) from `state.current_block`, so it must follow: left
+    // stale, `main` saw the entry block's `brif` and skipped its `return`,
+    // and a grad block over SDPA died with "block3 is not filled".
+    if let Some(block) = builder.current_block() {
+        state.current_block = Some(block);
     }
     Ok(())
 }
@@ -2706,14 +2715,29 @@ fn lower_single_op(
             let list_val = if let Some(&cached) = compiler.flash_attn_bwd_cache.get(&fwd_out) {
                 cached
             } else {
-                // Extract scale from Q's head_dim: scale = 1/sqrt(head_dim)
+                // The forward's scale, as its operand inputs[5] when the
+                // adjoint carries one (it read like the forward reads it);
+                // else the default 1/sqrt(head_dim). The backward used to
+                // assume the default whatever scale the forward used.
                 let dim3 = builder.ins().iconst(cl_types::I64, 3);
                 let head_dim = call(compiler, builder, "nsl_tensor_shape_dim", &[q, dim3])?;
-                // Convert head_dim (i64) to f64, compute 1/sqrt, reinterpret as f32 bits
-                let hd_f64 = builder.ins().fcvt_from_sint(cl_types::F64, head_dim);
-                let hd_sqrt = builder.ins().sqrt(hd_f64);
-                let one_f64 = builder.ins().f64const(1.0);
-                let scale_f64 = builder.ins().fdiv(one_f64, hd_sqrt);
+                let scale_f64 = if inputs.len() > 5 {
+                    // The scale is a PRIMAL var, which the adjoint's
+                    // var_types does not carry: drive the conversion off the
+                    // Cranelift value type, as the packed arm does (F64 =
+                    // scalar, I64 = tensor pointer).
+                    let scale_in = inputs[5];
+                    if builder.func.dfg.value_type(scale_in) == cl_types::F64 {
+                        scale_in
+                    } else {
+                        call(compiler, builder, "nsl_tensor_item", &[scale_in])?
+                    }
+                } else {
+                    let hd_f64 = builder.ins().fcvt_from_sint(cl_types::F64, head_dim);
+                    let hd_sqrt = builder.ins().sqrt(hd_f64);
+                    let one_f64 = builder.ins().f64const(1.0);
+                    builder.ins().fdiv(one_f64, hd_sqrt)
+                };
                 // Convert to f32 then reinterpret as i32 bits for scale_bits param
                 let scale_f32 = builder.ins().fdemote(cl_types::F32, scale_f64);
                 let scale_bits_i32 = builder.ins().bitcast(cl_types::I32, cranelift_codegen::ir::MemFlagsData::new(), scale_f32);
