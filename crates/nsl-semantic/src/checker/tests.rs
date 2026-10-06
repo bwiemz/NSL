@@ -3536,3 +3536,12 @@ model M:
     let ok = "model M:\n    w: Tensor<[2], f32> = zeros([2])\n    h: Tensor<[2], f32, cpu> = zeros([2])\n";
     assert!(error_messages(ok).is_empty(), "{:?}", error_messages(ok));
 }
+
+/// A function's annotations are resolved at pre-declaration and again for
+/// the body; the refusal is still reported once.
+#[test]
+fn a_refused_parameter_type_is_reported_once() {
+    let errs = error_messages("fn f(x: Tensor<[4], f64, cuda>) -> int:\n    return 0\n");
+    let n = errs.iter().filter(|m| m.contains("f64 tensors cannot be on cuda")).count();
+    assert_eq!(n, 1, "{errs:?}");
+}

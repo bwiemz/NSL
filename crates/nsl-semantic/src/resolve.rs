@@ -32,7 +32,15 @@ impl<'a> TypeResolver<'a> {
                 let device = self.resolve_device(device);
                 // C5 step 5: a type naming a (device, dtype) pair the device
                 // cannot hold describes no tensor that can exist.
-                if let Some(msg) = device_refusal(&device, dtype) {
+                // A function's annotations are resolved more than once (its
+                // type is built at pre-declaration and again at the body), so
+                // the refusal is reported once per annotation.
+                if let Some(msg) = device_refusal(&device, dtype)
+                    && !self
+                        .diagnostics
+                        .iter()
+                        .any(|d| d.message == msg && d.labels.iter().any(|l| l.span == type_expr.span))
+                {
                     self.diagnostics.push(
                         Diagnostic::error(msg).with_label(type_expr.span, "not a tensor the device can hold"),
                     );

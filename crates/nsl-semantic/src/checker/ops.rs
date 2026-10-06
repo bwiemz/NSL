@@ -217,18 +217,25 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    /// The device a `.to(...)` argument names: `cuda`, `cuda(n)` or `cpu`.
+    /// The device a `.to(...)` argument names: `cuda`, `cuda(n)` or `cpu`,
+    /// unless a user binding shadows the name.
     fn device_operand(&self, arg: &Expr) -> Option<Device> {
-        match &arg.kind {
-            ExprKind::Ident(sym) => match self.resolve_name(*sym).as_str() {
-                "cuda" => Some(Device::Cuda(None)),
-                "cpu" => Some(Device::Cpu),
-                _ => None,
-            },
+        let (sym, called) = match &arg.kind {
+            ExprKind::Ident(sym) => (*sym, false),
             ExprKind::Call { callee, .. } => match &callee.kind {
-                ExprKind::Ident(sym) if self.resolve_name(*sym) == "cuda" => Some(Device::Cuda(None)),
-                _ => None,
+                ExprKind::Ident(sym) => (*sym, true),
+                _ => return None,
             },
+            _ => return None,
+        };
+        let builtin = self
+            .scopes
+            .lookup(self.current_scope, sym)
+            .is_none_or(|(_, info)| info.is_builtin);
+        match (self.resolve_name(sym).as_str(), called) {
+            _ if !builtin => None,
+            ("cuda", _) => Some(Device::Cuda(None)),
+            ("cpu", false) => Some(Device::Cpu),
             _ => None,
         }
     }
