@@ -1847,6 +1847,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   - `ad_cert_status` now names these certificates. The coverage gate reads
     them from a `GPU_CERTS` list, each entry checked to be a GPU-ignored
     test of that name.
+  - Packed attention also gets a GPU twin, `sdpa_packed_step`. It is one
+    compiled step through the FUSED kernels, with the forward's launch
+    counter and the GPU backward's dispatch line asserted.
+    - Shape: 1×2×64×32, three uneven documents.
+    - Reference: exact f64 gradients, the analytic attention backward,
+      itself spot-checked against central differences.
+    - Measured: dq/dk/dv at 7.3e-4 / 8.8e-4 / 5.8e-4 of scale, inside the
+      packed parity gate's f16-operand bound of 1e-2.
+    - An oracle that ignores document boundaries fails it.
 
 - **Source AD trains with the norm epsilon the program set.** The stdlib
   `LayerNorm` / `RMSNorm` pass their `eps` field to the kernel; source AD

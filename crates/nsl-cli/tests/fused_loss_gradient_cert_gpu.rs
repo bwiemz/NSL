@@ -170,6 +170,10 @@ fn fused_linear_ce_step() {
 /// Run `src` with `nsl run --source-ad` on the GPU. `None` when there is no
 /// CUDA driver (the gate is GPU-only; the cert lane has one).
 fn run(src: &str, tag: &str) -> Option<(String, String)> {
+    run_env(src, tag, &[])
+}
+
+fn run_env(src: &str, tag: &str, env: &[(&str, &str)]) -> Option<(String, String)> {
     let root = repo_root();
     let tmp = std::env::temp_dir().join(format!("nsl_fused_cert_{tag}_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
@@ -182,6 +186,7 @@ fn run(src: &str, tag: &str) -> Option<(String, String)> {
         .arg(&prog)
         .current_dir(&tmp)
         .env("NSL_STDLIB_PATH", root.join("stdlib"))
+        .envs(env.iter().copied())
         .output()
         .expect("spawn nsl run");
     let _ = std::fs::remove_dir_all(&tmp);
@@ -393,4 +398,194 @@ fn fd_grad_some(p: &[Vec<f64>], f: fn(&[Vec<f64>]) -> f64, k: usize) -> Vec<Vec<
                 .collect()
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// ScaledDotProductAttentionPacked on the GPU kernels
+// ---------------------------------------------------------------------------
+
+// The fused packed kernels need head_dim in {32, 64, 128} and the sequence a
+// multiple of the 64-row tile. Three uneven documents.
+const PB: usize = 1;
+const PH: usize = 2;
+const PS: usize = 64;
+const PD: usize = 32;
+const DOCS: [usize; 3] = [20, 30, 14];
+
+fn packed_program() -> String {
+    let scale = 1.0 / (PD as f64).sqrt();
+    let seg = DOCS
+        .iter()
+        .enumerate()
+        .map(|(d, n)| format!("full([1, {n}], {d}.0)"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        r#"model Attn:
+    q: Tensor = randn([{PB}, {PH}, {PS}, {PD}])
+    k: Tensor = randn([{PB}, {PH}, {PS}, {PD}])
+    v: Tensor = randn([{PB}, {PH}, {PS}, {PD}])
+
+let m = Attn()
+m.to(cuda)
+let seg = tensor_cat([{seg}], 1).to(cuda)
+let r = randn([{PB}, {PH}, {PS}, {PD}]).to(cuda)
+
+print("R_BEGIN")
+print(r)
+print("R_END")
+print("Q0_BEGIN")
+print(m.q)
+print("Q0_END")
+print("K0_BEGIN")
+print(m.k)
+print("K0_END")
+print("V0_BEGIN")
+print(m.v)
+print("V0_END")
+
+train(model=m, epochs=1):
+    optimizer: SGD(lr={LR:.1})
+    step(batch):
+        let loss = sum(scaled_dot_product_attention_packed(m.q, m.k, m.v, {scale}, seg) * r)
+
+print("Q1_BEGIN")
+print(m.q)
+print("Q1_END")
+print("K1_BEGIN")
+print(m.k)
+print("K1_END")
+print("V1_BEGIN")
+print(m.v)
+print("V1_END")
+print("FUSED_BEGIN")
+print(sdpa_fused_launch_count(0) + sdpa_fused_launch_count(1))
+print("FUSED_END")
+"#
+    )
+}
+
+fn doc_of(i: usize) -> usize {
+    let mut end = 0;
+    for (d, n) in DOCS.iter().enumerate() {
+        end += n;
+        if i < end {
+            return d;
+        }
+    }
+    unreachable!("position {i} past the packed sequence")
+}
+
+/// Exact f64 gradients of `sum(packed_attention(q, k, v) * r)` w.r.t. q, k
+/// and v: the standard attention backward with dO = r, causal within each
+/// document.
+fn packed_grads(q: &[f64], k: &[f64], v: &[f64], r: &[f64]) -> [Vec<f64>; 3] {
+    let scale = 1.0 / (PD as f64).sqrt();
+    let (mut dq, mut dk, mut dv) = (vec![0.0; q.len()], vec![0.0; k.len()], vec![0.0; v.len()]);
+    for bh in 0..PB * PH {
+        let base = bh * PS * PD;
+        let at = |t: &[f64], i: usize, c: usize| t[base + i * PD + c];
+        for i in 0..PS {
+            let vis: Vec<usize> = (0..=i).filter(|&j| doc_of(j) == doc_of(i)).collect();
+            let scores: Vec<f64> =
+                vis.iter().map(|&j| (0..PD).map(|c| at(q, i, c) * at(k, j, c)).sum::<f64>() * scale).collect();
+            let m = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let e: Vec<f64> = scores.iter().map(|s| (s - m).exp()).collect();
+            let z: f64 = e.iter().sum();
+            let p: Vec<f64> = e.iter().map(|x| x / z).collect();
+            // dP_ij = dO_i . V_j; dS = P (dP - sum_k P_ik dP_ik).
+            let dp: Vec<f64> = vis.iter().map(|&j| (0..PD).map(|c| at(r, i, c) * at(v, j, c)).sum()).collect();
+            let pdp: f64 = p.iter().zip(&dp).map(|(a, b)| a * b).sum();
+            for (n, &j) in vis.iter().enumerate() {
+                let ds = p[n] * (dp[n] - pdp);
+                for c in 0..PD {
+                    dv[base + j * PD + c] += p[n] * at(r, i, c);
+                    dq[base + i * PD + c] += scale * ds * at(k, j, c);
+                    dk[base + j * PD + c] += scale * ds * at(q, i, c);
+                }
+            }
+        }
+    }
+    [dq, dk, dv]
+}
+
+/// The forward of [`packed_grads`]' loss, for a finite-difference spot check
+/// of the analytic oracle itself.
+fn packed_loss(q: &[f64], k: &[f64], v: &[f64], r: &[f64]) -> f64 {
+    let scale = 1.0 / (PD as f64).sqrt();
+    let mut total = 0.0;
+    for bh in 0..PB * PH {
+        let base = bh * PS * PD;
+        let at = |t: &[f64], i: usize, c: usize| t[base + i * PD + c];
+        for i in 0..PS {
+            let vis: Vec<usize> = (0..=i).filter(|&j| doc_of(j) == doc_of(i)).collect();
+            let scores: Vec<f64> =
+                vis.iter().map(|&j| (0..PD).map(|c| at(q, i, c) * at(k, j, c)).sum::<f64>() * scale).collect();
+            let m = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let e: Vec<f64> = scores.iter().map(|s| (s - m).exp()).collect();
+            let z: f64 = e.iter().sum();
+            for c in 0..PD {
+                let o: f64 = vis.iter().zip(&e).map(|(&j, w)| w / z * at(v, j, c)).sum();
+                total += o * at(r, i, c);
+            }
+        }
+    }
+    total
+}
+
+/// Certificate `sdpa_packed_step` (named by `ad_cert_status` for
+/// `ScaledDotProductAttentionPacked`, beside the CPU `grad` certificates):
+/// q, k and v gradients through a compiled step on the FUSED kernels --
+/// the forward's launch counter and the GPU backward's dispatch line prove
+/// which path ran -- against exact f64 gradients. The kernels' MMA operands
+/// are f16, so the bound is the packed parity gate's composed
+/// forward-then-backward bound (1e-2 of the largest gradient), not f32
+/// noise.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn sdpa_packed_step() {
+    let Some((stdout, stderr)) = run_env(&packed_program(), "packed", &[("NSL_FLASH_DEBUG", "1")]) else {
+        return;
+    };
+    assert!(stderr.contains("Using source-to-source AD for backward pass"), "{stderr}");
+    assert!(!stderr.contains("falling back to tape-based AD"), "{stderr}");
+    assert!(between(&stdout, "FUSED")[0] >= 1.0, "the fused packed forward must have launched:\n{stderr}");
+    assert!(
+        stderr.contains("[flash-bwd] GPU backward dispatched"),
+        "the GPU packed backward must have run, not the CPU reference:\n{stderr}"
+    );
+
+    let r = between(&stdout, "R");
+    let before = [between(&stdout, "Q0"), between(&stdout, "K0"), between(&stdout, "V0")];
+    let after = [between(&stdout, "Q1"), between(&stdout, "K1"), between(&stdout, "V1")];
+    let n = PB * PH * PS * PD;
+    assert_eq!(r.len(), n);
+    for k in 0..3 {
+        assert_eq!((before[k].len(), after[k].len()), (n, n), "operand {k}");
+    }
+    let exact = packed_grads(&before[0], &before[1], &before[2], &r);
+
+    // The oracle itself, against central differences at a spread of entries.
+    let h = 1e-6;
+    for (k, stride) in [(0usize, 97usize), (1, 89), (2, 83)] {
+        for i in (0..n).step_by(stride) {
+            let mut p = before.clone();
+            p[k][i] += h;
+            let up = packed_loss(&p[0], &p[1], &p[2], &r);
+            p[k][i] -= 2.0 * h;
+            let down = packed_loss(&p[0], &p[1], &p[2], &r);
+            let fd = (up - down) / (2.0 * h);
+            assert!((fd - exact[k][i]).abs() <= 1e-6 * exact[k][i].abs().max(1.0), "oracle {k}[{i}]: {fd} vs {}", exact[k][i]);
+        }
+    }
+
+    let mut report = Vec::new();
+    for (k, name) in ["dq", "dk", "dv"].into_iter().enumerate() {
+        let got: Vec<f64> = before[k].iter().zip(&after[k]).map(|(b, a)| (b - a) / LR).collect();
+        let scale = exact[k].iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        let worst = got.iter().zip(&exact[k]).fold(0.0f64, |m, (g, w)| m.max((g - w).abs()));
+        report.push(format!("{name}: max |got - exact| = {worst:.3e}, scale {scale:.3e}, rel {:.3e}", worst / scale));
+        assert!(worst <= 1e-2 * scale, "{name} disagrees with the exact gradient:\n{}", report.join("\n"));
+    }
+    eprintln!("{}", report.join("\n"));
 }

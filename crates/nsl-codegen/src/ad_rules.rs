@@ -1224,6 +1224,7 @@ pub fn ad_cert_status(op: &PrimalOp) -> AdCertStatus {
             "sdpa_packed_docs",
             "sdpa_packed_batch",
             "sdpa_packed_scale",
+            "sdpa_packed_step",
         ]),
         PrimalOp::FlashAttentionBackwardExtractPacked { .. } => {
             AdjointOnly("the packed SDPA adjoint")

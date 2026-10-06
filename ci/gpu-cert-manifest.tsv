@@ -74,6 +74,7 @@ crates/nsl-cli/tests/fused_lm_ce_hint_pin_gate.rs	the_rank3_biasless_fixture_sti
 crates/nsl-cli/tests/fused_lm_ce_hint_pin_gate.rs	the_unmodified_fixture_still_trains_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/fused_loss_gradient_cert_gpu.rs	fused_linear_ce_step	gpu	requires CUDA GPU
 crates/nsl-cli/tests/fused_loss_gradient_cert_gpu.rs	fused_kl_ce_step	gpu	requires CUDA GPU
+crates/nsl-cli/tests/fused_loss_gradient_cert_gpu.rs	sdpa_packed_step	gpu	requires CUDA GPU
 crates/nsl-cli/tests/inference_loop_leak_gate.rs	inference_loop_method_call_live_blocks_iteration_independent	gpu	requires CUDA GPU
 crates/nsl-cli/tests/inference_loop_leak_gate.rs	inference_loop_method_temp_live_blocks_iteration_independent	gpu	requires CUDA GPU
 crates/nsl-cli/tests/inference_loop_leak_gate.rs	inference_loop_borrow_rebind_does_not_free_weights	gpu	requires CUDA GPU

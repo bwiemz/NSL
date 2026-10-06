@@ -1006,7 +1006,7 @@ fn certificate_names_are_unique() {
 /// `grad` spelling reaches them): one compiled SGD step whose update is the
 /// raw gradient, against f64 central differences. They live in
 /// `fused_loss_gradient_cert_gpu.rs` and run in the GPU cert lane.
-const GPU_CERTS: &[&str] = &["fused_linear_ce_step", "fused_kl_ce_step"];
+const GPU_CERTS: &[&str] = &["fused_linear_ce_step", "fused_kl_ce_step", "sdpa_packed_step"];
 
 /// The coverage gate: every certificate a `PrimalOp` status names exists here
 /// (or in `GPU_CERTS`), and every certificate here is named by some status.
