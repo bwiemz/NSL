@@ -1002,8 +1002,14 @@ fn certificate_names_are_unique() {
     assert_eq!(before, names.len(), "duplicate certificate names");
 }
 
-/// The coverage gate: every certificate a `PrimalOp` status names exists here,
-/// and every certificate here is named by some status.
+/// Certificates for ops that exist only in a GPU `train` block (no CPU
+/// `grad` spelling reaches them): one compiled SGD step whose update is the
+/// raw gradient, against f64 central differences. They live in
+/// `fused_loss_gradient_cert_gpu.rs` and run in the GPU cert lane.
+const GPU_CERTS: &[&str] = &["fused_linear_ce_step", "fused_kl_ce_step"];
+
+/// The coverage gate: every certificate a `PrimalOp` status names exists here
+/// (or in `GPU_CERTS`), and every certificate here is named by some status.
 #[test]
 fn certificates_match_the_codegen_inventory() {
     let all = certs();
@@ -1013,12 +1019,28 @@ fn certificates_match_the_codegen_inventory() {
         if let AdCertStatus::Certified(named) = status {
             for n in named {
                 assert!(
-                    names.contains(n),
-                    "{op} names certificate `{n}`, which is not in certs()"
+                    names.contains(n) || GPU_CERTS.contains(n),
+                    "{op} names certificate `{n}`, which is not in certs() or GPU_CERTS"
                 );
                 claimed.push(n);
             }
         }
+    }
+    // A GPU certificate is a GPU-ignored test fn of that exact name in
+    // fused_loss_gradient_cert_gpu.rs, run by the cert lane.
+    let gpu_src = include_str!("fused_loss_gradient_cert_gpu.rs");
+    // Assembled, not written out: scripts/gpu-gate-inventory.awk reads the
+    // attribute text line by line and would take a literal for a gate.
+    let gpu_attr = concat!("#[", "ignore = \"requires CUDA GPU\"]");
+    for n in GPU_CERTS {
+        let at = gpu_src
+            .find(&format!("\nfn {n}() {{"))
+            .unwrap_or_else(|| panic!("GPU certificate `{n}` has no test fn in fused_loss_gradient_cert_gpu.rs"));
+        assert!(
+            gpu_src[..at].trim_end().ends_with(gpu_attr),
+            "GPU certificate `{n}` must carry {gpu_attr}, so the cert lane runs it"
+        );
+        assert!(claimed.contains(n), "GPU certificate `{n}` is not named by any PrimalOp status");
     }
     for n in &names {
         assert!(

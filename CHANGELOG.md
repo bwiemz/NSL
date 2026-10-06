@@ -1819,6 +1819,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   - On the CPU these cover the decomposed forward and the segment-aware
     flash backward reference, not the GPU kernels.
 
+- **The fused loss kernels' source-AD wiring is certified on silicon**
+  (finding 6). `FusedLinearCe` and `FusedKlCe` were `Uncertified`: their
+  kernels had f64 references, but a compiled program's gradients through
+  them did not. They exist only inside a GPU `train`/`distill` block, so a
+  CPU `grad` certificate cannot reach them.
+  - `fused_loss_gradient_cert_gpu.rs` certifies each with ONE compiled
+    `SGD` step.
+    - Every loss operand is a model field.
+    - SGD has no momentum or decay, so the update is exactly `lr * grad`.
+    - The loss is scaled by 0.37, so the backward must honour the upstream
+      gradient.
+    - Two of the eight targets are the ignore index.
+  - `(before - after) / lr` is compared to an f64 central difference of the
+    composite loss over every parameter entry. The distill certificate also
+    asserts the teacher did not move.
+  - Measured on the RTX PRO 4500 (worst absolute error):
+
+    | Loss | dx | dW | db |
+    |---|---|---|---|
+    | LCE | 1.6e-8 | 1.5e-8 | 6e-9 |
+    | KL-CE | 1.4e-8 | 8e-9 | 6e-9 |
+
+    Tolerance is 1e-4 of the largest gradient.
+  - A mismatched loss scale fails the LCE certificate, and a wrong KL
+    weight fails the KL-CE one.
+  - `ad_cert_status` now names these certificates. The coverage gate reads
+    them from a `GPU_CERTS` list, each entry checked to be a GPU-ignored
+    test of that name.
+
 - **Source AD trains with the norm epsilon the program set.** The stdlib
   `LayerNorm` / `RMSNorm` pass their `eps` field to the kernel; source AD
   could not read a float field at compile time and baked 1e-5, so after
