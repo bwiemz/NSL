@@ -49,7 +49,7 @@ fn op(id: u32, result: u32, primitive: PrimalOp, inputs: Vec<u32>) -> WengertOp 
 fn three_chain_attn() -> WengertList {
     let ops = vec![
         op(0, 0, PrimalOp::Input("x".into()), vec![]),
-        op(1, 1, PrimalOp::RMSNorm { eps: 1e-5 }, vec![0]),
+        op(1, 1, PrimalOp::RMSNorm { eps: nsl_codegen::wengert::NormEps::Const(1e-5) }, vec![0]),
         op(2, 2, PrimalOp::Param("blocks.0.attn.wq".into()), vec![]),
         op(3, 3, PrimalOp::Matmul, vec![1, 2]),
         op(4, 4, PrimalOp::RoPE { dim: 64 }, vec![3]),
@@ -397,7 +397,7 @@ fn gap_i3_save_layer_key_matches_backward_mark_layer() {
     // strips the last `.wq` / `.wk` / `.wv` and yields `"m"`.
     let ops = vec![
         op(0, 0, PrimalOp::Input("x".into()), vec![]),
-        op(1, 1, PrimalOp::RMSNorm { eps: 1e-5 }, vec![0]),
+        op(1, 1, PrimalOp::RMSNorm { eps: nsl_codegen::wengert::NormEps::Const(1e-5) }, vec![0]),
         op(2, 2, PrimalOp::Param("m.wq".into()), vec![]),
         op(3, 3, PrimalOp::Matmul, vec![1, 2]),
         op(4, 4, PrimalOp::Param("m.wk".into()), vec![]),

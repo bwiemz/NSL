@@ -68,6 +68,7 @@ fn csha_save_pointers_carries_forward_out_value() {
         // kernel) reads the same Values the forward FFI was handed.
         cos:     Value::from_u32(407),
         sin:     Value::from_u32(408),
+        eps_bits: Value::from_u32(499),
         backward_ptx_data_id: None,
         backward_name_data_id: None,
         backward_tier_b_on_ptx_data_id: None,
@@ -107,6 +108,7 @@ fn csha_save_pointers_carries_rope_cos_and_sin_values() {
         out:     Value::from_u32(506),
         cos:     Value::from_u32(507),
         sin:     Value::from_u32(508),
+        eps_bits: Value::from_u32(499),
         backward_ptx_data_id: None,
         backward_name_data_id: None,
         backward_tier_b_on_ptx_data_id: None,

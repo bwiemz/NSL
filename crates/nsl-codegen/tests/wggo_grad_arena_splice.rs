@@ -25,9 +25,12 @@ fn fixture_path() -> std::path::PathBuf {
 }
 
 fn parse_attn4_fixture() -> (nsl_ast::Module, Interner) {
-    let src = std::fs::read_to_string(fixture_path()).expect("fixture readable");
+    parse_src(&std::fs::read_to_string(fixture_path()).expect("fixture readable"))
+}
+
+fn parse_src(src: &str) -> (nsl_ast::Module, Interner) {
     let mut interner = Interner::new();
-    let (tokens, lex_diags) = tokenize(&src, FileId(0), &mut interner);
+    let (tokens, lex_diags) = tokenize(src, FileId(0), &mut interner);
     assert!(
         lex_diags.iter().all(|d| !matches!(d.level, Level::Error)),
         "fixture must lex cleanly: {lex_diags:?}"
@@ -135,4 +138,50 @@ fn model_backward_emits_grad_arena_memcpy_for_each_w_star() {
         count >= 4,
         "expected ≥4 relocations targeting __nsl_calib_grad_arena (one per W_*); got {count}"
     );
+}
+
+/// The fixture with an RMSNorm after the projections, its eps a model field
+/// (`eps_decl`). Source AD reads a norm's eps field at run time
+/// (`NormEps::Var`); a calibration binary binds no model struct, so it binds
+/// the field's declared literal -- and refuses a field it cannot evaluate
+/// rather than training against some other eps.
+fn norm_eps_fixture(eps_decl: &str) -> String {
+    format!(
+        r#"@quantize(dtype="awq4")
+model TinyAttn4:
+    q_proj: Tensor = zeros([16, 16])
+    k_proj: Tensor = zeros([16, 16])
+    v_proj: Tensor = zeros([16, 16])
+    o_proj: Tensor = zeros([16, 16])
+    g: Tensor = ones([16])
+    {eps_decl}
+
+    @wggo_target(w_q=self.q_proj, w_k=self.k_proj, w_v=self.v_proj, w_o=self.o_proj, head_dim=4)
+    fn forward(self, x: Tensor) -> Tensor:
+        return rmsnorm(x |> q_proj |> k_proj |> v_proj |> o_proj, self.g, self.eps)
+
+fn main():
+    let m = TinyAttn4()
+"#
+    )
+}
+
+fn emit(src: &str) -> Result<(), String> {
+    let (ast, interner) = parse_src(src);
+    let projections = nsl_codegen::calibration::pre_scan_awq_projections_from_ast(&ast, &interner);
+    let arena_layout = build_arena_layout(&projections, 4, 4);
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let opts = opts_with_backward(&ast, &interner);
+    emit_calibration_model_object(&ast, &opts, &arena_layout, &tmp.path().join("calib.o"))
+        .map(|_| ())
+        .map_err(|e| format!("{e:?}"))
+}
+
+#[test]
+fn model_backward_binds_a_norm_eps_field_to_its_declared_value() {
+    emit(&norm_eps_fixture("eps: float = 0.5"))
+        .expect("a literal eps field is bound to its declared value");
+    let err = emit(&norm_eps_fixture("eps: float = 0.25 * 2.0"))
+        .expect_err("an eps field calibration cannot evaluate must be refused, not defaulted");
+    assert!(err.contains("eps"), "the refusal must name the field: {err}");
 }

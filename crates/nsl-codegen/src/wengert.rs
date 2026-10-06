@@ -212,6 +212,20 @@ pub enum ConvGradKind {
     Bias,
 }
 
+/// The epsilon of a LayerNorm / RMSNorm.
+///
+/// `Const` is a compile-time value: a literal, or one the extractor proves the
+/// argument still holds. `Var` is the op's scalar eps operand, read at run
+/// time -- a model field such as the stdlib norms' `self.eps`. Source AD used
+/// to bake 1e-5 for any eps it could not read at compile time, silently
+/// replacing a field the program had set (external review 2026-10-06).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NormEps {
+    Const(f64),
+    /// A Scalar-typed var holding the eps at run time.
+    Var(VarId),
+}
+
 /// Primitive operations in the computation graph.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PrimalOp {
@@ -288,10 +302,10 @@ pub enum PrimalOp {
     Embedding,
     // Normalization
     LayerNorm {
-        eps: f64,
+        eps: NormEps,
     },
     RMSNorm {
-        eps: f64,
+        eps: NormEps,
     },
     BatchNorm {
         eps: f64,

@@ -6,7 +6,7 @@ use crate::ad_rules::{
 };
 use crate::csha_apply::FusionMark;
 use crate::wengert::{
-    type_for_op, CompareKind, OpId, PrimalOp, SubgraphId, VarId, WengertList, WengertOp,
+    type_for_op, CompareKind, NormEps, OpId, PrimalOp, SubgraphId, VarId, WengertList, WengertOp,
     WengertType,
 };
 use std::collections::{HashMap, HashSet};
@@ -569,14 +569,14 @@ impl AdjointGenerator {
                                 // dgamma values when the CSHA
                                 // dispatcher claim fired on programs
                                 // with trainable gamma.
-                                if let (Some(gamma_var), Some(x_raw_var)) =
-                                    (v.norm_weight_var, v.x_raw_var)
+                                if let (Some(gamma_var), Some(x_raw_var), Some(norm_eps)) =
+                                    (v.norm_weight_var, v.x_raw_var, v.rmsnorm_eps)
                                 {
                                     let dgamma = self.lower_adjoint_expr(
                                         AdjointExpr::RmsNormGammaBackward(
                                             extract_results[7],
                                             x_raw_var,
-                                            v.rmsnorm_eps,
+                                            norm_eps,
                                             gamma_var,
                                         ),
                                     );
@@ -589,11 +589,11 @@ impl AdjointGenerator {
                                     nsl_log::nsl_log!(INFO, "nsl", 
                                         "[nsl] CSHA fused backward: emitted dgamma \
                                              (NormGammaBackward) for layer '{}' → \
-                                             gamma VarId {} (x_raw VarId {}, eps={:e})",
+                                             gamma VarId {} (x_raw VarId {}, eps={:?})",
                                         mark_layer,
                                         gamma_var,
                                         x_raw_var,
-                                        v.rmsnorm_eps,
+                                        norm_eps,
                                     );
                                 }
                             } else {
@@ -809,6 +809,17 @@ impl AdjointGenerator {
         for op in &self.adjoint_ops {
             adjoint_var_types.insert(op.result, type_for_op(&op.op));
         }
+        // A primal Scalar the adjoint reads (a norm's run-time eps, `NormEps::
+        // Var`) keeps its type: untyped, it would lower as a tensor pointer.
+        for op in &self.adjoint_ops {
+            for v in &op.inputs {
+                if !adjoint_var_types.contains_key(v)
+                    && self.primal_var_types.get(v) == Some(&WengertType::Scalar)
+                {
+                    adjoint_var_types.insert(*v, WengertType::Scalar);
+                }
+            }
+        }
         WengertList {
             ops: self.adjoint_ops.clone(),
             output: loss_bar,
@@ -835,6 +846,29 @@ impl AdjointGenerator {
     /// Emit a constant value and return its VarId.
     fn emit_constant(&mut self, value: f64) -> VarId {
         self.emit_op(PrimalOp::Constant(value), vec![])
+    }
+
+    /// A norm backward's eps operand: the constant, or the forward's run-time
+    /// scalar operand itself (a binary op promotes it to its partner's dtype).
+    fn eps_operand(&mut self, eps: NormEps) -> VarId {
+        match eps {
+            NormEps::Const(v) => self.emit_constant(v),
+            NormEps::Var(v) => v,
+        }
+    }
+
+    /// A fused norm-backward passthrough: `<base>:<eps bits>` for a constant,
+    /// `<base>:var` with the eps var appended as the last input otherwise
+    /// (wengert_lower reads it back from the name or that input).
+    fn emit_eps_passthrough(&mut self, base: &str, eps: NormEps, mut inputs: Vec<VarId>) -> VarId {
+        let name = match eps {
+            NormEps::Const(v) => format!("{base}:{}", v.to_bits()),
+            NormEps::Var(v) => {
+                inputs.push(v);
+                format!("{base}:var")
+            }
+        };
+        self.emit_op(PrimalOp::Passthrough(name), inputs)
     }
 
     /// Whether a primal var lowers to a tensor handle. A float literal lowers
@@ -1157,7 +1191,7 @@ impl AdjointGenerator {
                 let x_centered = self.emit_op(PrimalOp::Sub, vec![x, mean]);
                 let x_sq = self.emit_op(PrimalOp::Mul, vec![x_centered, x_centered]);
                 let var = self.emit_op(PrimalOp::Passthrough("mean_keepdim_last".into()), vec![x_sq]);
-                let eps = self.emit_constant(eps_val);
+                let eps = self.eps_operand(eps_val);
                 let var_eps = self.emit_op(PrimalOp::Add, vec![var, eps]);
                 let std = self.emit_op(PrimalOp::Sqrt, vec![var_eps]);
                 let one = self.emit_constant(1.0);
@@ -1219,15 +1253,13 @@ impl AdjointGenerator {
             AdjointExpr::RmsNormGammaBackward(y_bar, x, eps_val, weight) => {
                 // P5 item 20 slice A: fused single-op path (two deterministic
                 // GPU launches inside the FFI, no [rows, cols] temporaries),
-                // opt-in behind the same flag as the dx fusion. eps rides
-                // bit-exact in the passthrough name; `weight` supplies the
+                // opt-in behind the same flag as the dx fusion. eps rides as in
+                // the dx path (`emit_eps_passthrough`); `weight` supplies the
                 // output shape.
                 if self.fuse_rmsnorm_backward {
-                    return self.emit_op(
-                        PrimalOp::Passthrough(format!(
-                            "rmsnorm_dgamma_backward:{}",
-                            eps_val.to_bits()
-                        )),
+                    return self.emit_eps_passthrough(
+                        "rmsnorm_dgamma_backward",
+                        eps_val,
                         vec![y_bar, x, weight],
                     );
                 }
@@ -1238,7 +1270,7 @@ impl AdjointGenerator {
                     PrimalOp::Passthrough("mean_keepdim_last".into()),
                     vec![x_sq],
                 );
-                let eps = self.emit_constant(eps_val);
+                let eps = self.eps_operand(eps_val);
                 let ms_eps = self.emit_op(PrimalOp::Add, vec![mean_sq, eps]);
                 let rms = self.emit_op(PrimalOp::Sqrt, vec![ms_eps]);
                 // x_hat = x / rms (elementwise, with rms broadcasting along
@@ -1261,21 +1293,20 @@ impl AdjointGenerator {
             AdjointExpr::RmsNormInputBackward(y_bar, x, gamma, eps_val) => {
                 // Item 9: fused single-op path (native GPU kernel / CPU ref),
                 // opt-in — collapses the ~11-op decomposition below into one
-                // `nsl_rmsnorm_dx_backward` launch. eps rides bit-exact in the
-                // passthrough name (wengert_lower parses it back to f64).
+                // `nsl_rmsnorm_dx_backward` launch. A constant eps rides
+                // bit-exact in the passthrough name (wengert_lower parses it
+                // back to f64); a run-time eps is the last input.
                 if self.fuse_rmsnorm_backward {
-                    return self.emit_op(
-                        PrimalOp::Passthrough(format!(
-                            "rmsnorm_dx_backward:{}",
-                            eps_val.to_bits()
-                        )),
+                    return self.emit_eps_passthrough(
+                        "rmsnorm_dx_backward",
+                        eps_val,
                         vec![y_bar, x, gamma],
                     );
                 }
                 let x_sq = self.emit_op(PrimalOp::Mul, vec![x, x]);
                 let mean_sq =
                     self.emit_op(PrimalOp::Passthrough("mean_keepdim_last".into()), vec![x_sq]);
-                let eps = self.emit_constant(eps_val);
+                let eps = self.eps_operand(eps_val);
                 let ms_eps = self.emit_op(PrimalOp::Add, vec![mean_sq, eps]);
                 let rms = self.emit_op(PrimalOp::Sqrt, vec![ms_eps]);
                 // g·ȳ (gamma [D] broadcasts against ȳ [.,D], as in the forward).
@@ -1314,7 +1345,7 @@ impl AdjointGenerator {
                 let x_centered = self.emit_op(PrimalOp::Sub, vec![x, mean_val]);
                 let x_sq = self.emit_op(PrimalOp::Mul, vec![x_centered, x_centered]);
                 let var = self.emit_op(mean_op, vec![x_sq]);
-                let eps = self.emit_constant(eps_val);
+                let eps = self.eps_operand(eps_val);
                 let var_eps = self.emit_op(PrimalOp::Add, vec![var, eps]);
                 let std = self.emit_op(PrimalOp::Sqrt, vec![var_eps]);
                 let one = self.emit_constant(1.0);
@@ -1769,10 +1800,11 @@ pub fn fuse_rmsnorm_dx_residual(
         producer.insert(op.result, i);
     }
 
+    // A constant eps is in the name; a run-time one (`:var`) is a 4th input.
     let is_dx = |op: &crate::wengert::WengertOp| -> Option<String> {
         if let PrimalOp::Passthrough(name) = &op.op
             && let Some(suffix) = name.strip_prefix("rmsnorm_dx_backward:")
-            && op.inputs.len() == 3
+            && op.inputs.len() == if suffix == "var" { 4 } else { 3 }
         {
             return Some(suffix.to_string());
         }
@@ -1799,8 +1831,12 @@ pub fn fuse_rmsnorm_dx_residual(
         });
         let Some((j, other, suffix)) = cand else { continue };
         let (dy, xv, gv) = (ops[j].inputs[0], ops[j].inputs[1], ops[j].inputs[2]);
+        let mut inputs = vec![dy, xv, gv, other];
+        if suffix == "var" {
+            inputs.push(ops[j].inputs[3]);
+        }
         ops[i].op = PrimalOp::Passthrough(format!("rmsnorm_dx_backward_add:{suffix}"));
-        ops[i].inputs = vec![dy, xv, gv, other];
+        ops[i].inputs = inputs;
         remove.push(j);
     }
     if remove.is_empty() {
@@ -3637,22 +3673,49 @@ impl<'a> WengertExtractor<'a> {
         }
     }
 
-    /// The eps of a norm call whose eps is argument `index`: the literal, or
-    /// the constant the argument provably still holds
+    /// The eps of a norm call whose eps is argument `index`.
+    ///
+    /// A literal, or the constant the argument provably still holds
     /// (`resolve_const_config_scalar`, the resolver for values baked into
-    /// emitted code), else the 1e-5 default (see the `layernorm` arm).
+    /// emitted code), is `Const`. A scalar leaf -- a model field such as the
+    /// stdlib norms' `self.eps`, or a float variable -- is `Var`: the op reads
+    /// it at run time, so a reassigned field is honoured (it used to be
+    /// replaced by a baked 1e-5). Anything else is declined (`None`), and the
+    /// block falls back to the tape, which evaluates the argument as written.
     fn norm_eps(
-        &self,
+        &mut self,
         args: &[nsl_ast::expr::Arg],
         input_vars: &[VarId],
         index: usize,
-    ) -> f64 {
-        args.get(index)
-            .and_then(|a| Self::extract_f64_literal(&a.value))
-            .or_else(|| {
-                input_vars.get(index).and_then(|&v| self.resolve_const_config_scalar(v))
-            })
-            .unwrap_or(1e-5)
+        op_name: &str,
+    ) -> Option<NormEps> {
+        let Some(arg) = args.get(index) else {
+            return Some(NormEps::Const(1e-5));
+        };
+        if let Some(v) = Self::extract_f64_literal(&arg.value) {
+            return Some(NormEps::Const(v));
+        }
+        let var = *input_vars.get(index)?;
+        if let Some(v) = self.resolve_const_config_scalar(var) {
+            return Some(NormEps::Const(v));
+        }
+        let leaf = self
+            .list
+            .ops
+            .iter()
+            .find(|op| op.result == var)
+            .is_some_and(|op| matches!(op.op, PrimalOp::Param(_) | PrimalOp::Input(_)));
+        if !leaf {
+            nsl_log::nsl_log!(WARN, "source-ad",
+                "[source-ad] the eps of {op_name}() is computed by an expression source AD \
+                 cannot pass at run time; falling back to tape-based AD for this grad block"
+            );
+            return None;
+        }
+        // A scalar operand: lowered as the raw f64 the caller binds (a field
+        // load), not as a tensor pointer.
+        self.list.var_types.insert(var, WengertType::Scalar);
+        Some(NormEps::Var(var))
     }
 
     /// A numeric literal (int or float, optionally negated) as f64.
@@ -4903,22 +4966,19 @@ impl<'a> WengertExtractor<'a> {
                             .unwrap_or(-1);
                         PrimalOp::LogSoftmax { dim }
                     }
-                    // Normalization
-                    // eps: a literal, or a var that resolves to a constant, is
-                    // baked into the op. A model-field read (`self.eps`, the
-                    // stdlib modules) cannot be read at compile time and keeps
-                    // the default 1e-5 -- right for those modules unless the
-                    // field is reassigned; certificate `layernorm_field_eps`
-                    // pins that gap.
+                    // Normalization. eps: a constant is baked into the op; a
+                    // model field (`self.eps`, the stdlib modules) or other
+                    // scalar leaf is read at run time (`norm_eps`);
+                    // certificates `layernorm_field_eps` / `rmsnorm_field_eps`.
                     "layer_norm" | "layernorm" => PrimalOp::LayerNorm {
-                        eps: self.norm_eps(args, &input_vars, 3),
+                        eps: self.norm_eps(args, &input_vars, 3, "layernorm")?,
                     },
                     "batch_norm" | "batchnorm" => PrimalOp::BatchNorm {
                         eps: 1e-5,
                         training: true,
                     },
                     "rmsnorm" | "rms_norm" => PrimalOp::RMSNorm {
-                        eps: self.norm_eps(args, &input_vars, 2),
+                        eps: self.norm_eps(args, &input_vars, 2, "rmsnorm")?,
                     },
                     // CFTP §4.4 G3 (Sprint 4): user-facing `fused_linear_ce`.
                     //

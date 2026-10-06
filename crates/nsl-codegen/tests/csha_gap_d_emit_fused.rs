@@ -591,7 +591,7 @@ fn gap_d1_sdpa_is_claim_primary_for_full_qkv_chain_group() {
     let w = WengertList {
         ops: vec![
             mk(0, 0, PrimalOp::Input("x".into()), vec![]),
-            mk(1, 1, PrimalOp::RMSNorm { eps: 1e-5 }, vec![0]),
+            mk(1, 1, PrimalOp::RMSNorm { eps: nsl_codegen::wengert::NormEps::Const(1e-5) }, vec![0]),
             mk(2, 2, PrimalOp::Param("blocks.0.attn.wq".into()), vec![]),
             mk(3, 3, PrimalOp::Matmul, vec![1, 2]),
             mk(4, 4, PrimalOp::RoPE { dim: 64 }, vec![3]),
@@ -721,7 +721,7 @@ fn gap_d1_adjoint_routing_populates_correct_varids() {
     let primal = WengertList {
         ops: vec![
             mk(0, 0, PrimalOp::Input("x".into()), vec![]),
-            mk(1, 1, PrimalOp::RMSNorm { eps: 1e-5 }, vec![0]),
+            mk(1, 1, PrimalOp::RMSNorm { eps: nsl_codegen::wengert::NormEps::Const(1e-5) }, vec![0]),
             mk(2, 2, PrimalOp::Param("wq".into()), vec![]),
             mk(3, 3, PrimalOp::Matmul, vec![1, 2]),
             mk(4, 4, PrimalOp::RoPE { dim: 64 }, vec![3]),
@@ -783,7 +783,7 @@ fn gap_d1_adjoint_routing_populates_correct_varids() {
         norm_weight_var: None,
         // Gap I step K: no gamma → no x_raw / eps for dgamma emission.
         x_raw_var: None,
-        rmsnorm_eps: 0.0,
+        rmsnorm_eps: None,
     };
     let mark = FusionMark {
         layer: "blocks.0".into(),
@@ -909,7 +909,7 @@ fn gap_i4_norm_weight_var_populated_for_trainable_gamma() {
         ops: vec![
             mk(0, 0, PrimalOp::Input("x".into()), vec![]),
             mk(1, 1, PrimalOp::Param("blocks.0.attn.norm_weight".into()), vec![]),
-            mk(2, 2, PrimalOp::RMSNorm { eps: 1e-5 }, vec![0, 1]),
+            mk(2, 2, PrimalOp::RMSNorm { eps: nsl_codegen::wengert::NormEps::Const(1e-5) }, vec![0, 1]),
             mk(3, 3, PrimalOp::Param("blocks.0.attn.wq".into()), vec![]),
             mk(4, 4, PrimalOp::Matmul, vec![2, 3]),
             mk(5, 5, PrimalOp::RoPE { dim: 64 }, vec![4]),
@@ -994,7 +994,7 @@ fn gap_i4_norm_weight_var_none_for_gammaless_rmsnorm() {
     let w = WengertList {
         ops: vec![
             mk(0, 0, PrimalOp::Input("x".into()), vec![]),
-            mk(1, 1, PrimalOp::RMSNorm { eps: 1e-5 }, vec![0]),
+            mk(1, 1, PrimalOp::RMSNorm { eps: nsl_codegen::wengert::NormEps::Const(1e-5) }, vec![0]),
             mk(2, 2, PrimalOp::Param("blocks.0.attn.wq".into()), vec![]),
             mk(3, 3, PrimalOp::Matmul, vec![1, 2]),
             mk(4, 4, PrimalOp::RoPE { dim: 64 }, vec![3]),
@@ -1075,7 +1075,7 @@ fn gap_i4_launch_inputs_thread_weight_and_norm_pointers() {
         ops: vec![
             mk(0, 0, PrimalOp::Input("x".into()), vec![]),
             mk(1, 1, PrimalOp::Param("norm_w".into()), vec![]),
-            mk(2, 2, PrimalOp::RMSNorm { eps: 1e-5 }, vec![0, 1]),
+            mk(2, 2, PrimalOp::RMSNorm { eps: nsl_codegen::wengert::NormEps::Const(1e-5) }, vec![0, 1]),
             mk(3, 3, PrimalOp::Param("wq".into()), vec![]),
             mk(4, 4, PrimalOp::Matmul, vec![2, 3]),
             mk(5, 5, PrimalOp::RoPE { dim: 64 }, vec![4]),
@@ -1133,7 +1133,7 @@ fn gap_i4_launch_inputs_thread_weight_and_norm_pointers() {
         // Gap I step K: RMSNorm op lives at VarId 2, its input
         // (pre-norm x) is VarId 0, and eps matches the op above.
         x_raw_var: Some(0),
-        rmsnorm_eps: 1e-5,
+        rmsnorm_eps: Some(nsl_codegen::wengert::NormEps::Const(1e-5)),
     };
     let mark = FusionMark {
         layer: "blocks.0".into(),
@@ -1218,7 +1218,7 @@ fn gap_i4_launch_inputs_pass_null_for_none_norm_weight() {
     let primal = WengertList {
         ops: vec![
             mk(0, 0, PrimalOp::Input("x".into()), vec![]),
-            mk(1, 1, PrimalOp::RMSNorm { eps: 1e-5 }, vec![0]),
+            mk(1, 1, PrimalOp::RMSNorm { eps: nsl_codegen::wengert::NormEps::Const(1e-5) }, vec![0]),
             mk(2, 2, PrimalOp::Param("wq".into()), vec![]),
             mk(3, 3, PrimalOp::Matmul, vec![1, 2]),
             mk(4, 4, PrimalOp::RoPE { dim: 64 }, vec![3]),
@@ -1272,7 +1272,7 @@ fn gap_i4_launch_inputs_pass_null_for_none_norm_weight() {
         norm_weight_var: None,
         // Gap I step K: no gamma → no dgamma emission.
         x_raw_var: None,
-        rmsnorm_eps: 0.0,
+        rmsnorm_eps: None,
     };
     let mark = FusionMark {
         layer: "blocks.0".into(),
@@ -1365,7 +1365,7 @@ fn gap_i_step_k_dgamma_accumulates_into_gamma_adjoint() {
         ops: vec![
             mk(0, 0, PrimalOp::Input("x".into()), vec![]),
             mk(1, 1, PrimalOp::Param("norm_weight".into()), vec![]),
-            mk(2, 2, PrimalOp::RMSNorm { eps: 1e-5 }, vec![0, 1]),
+            mk(2, 2, PrimalOp::RMSNorm { eps: nsl_codegen::wengert::NormEps::Const(1e-5) }, vec![0, 1]),
             mk(3, 3, PrimalOp::Param("wq".into()), vec![]),
             mk(4, 4, PrimalOp::Matmul, vec![2, 3]),
             mk(5, 5, PrimalOp::RoPE { dim: 32 }, vec![4]),
@@ -1428,7 +1428,7 @@ fn gap_i_step_k_dgamma_accumulates_into_gamma_adjoint() {
         sdpa_out_var: 11,
         norm_weight_var: Some(gamma_vid),
         x_raw_var: Some(x_raw_vid),
-        rmsnorm_eps: 1e-5,
+        rmsnorm_eps: Some(nsl_codegen::wengert::NormEps::Const(1e-5)),
     };
     let mark = FusionMark {
         layer: "blocks.0".into(),

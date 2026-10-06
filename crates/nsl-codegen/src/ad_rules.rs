@@ -2,7 +2,7 @@
 
 use crate::csha_apply::FusionMark;
 use crate::flash_attention_v2::smem_layout::{self, Direction};
-use crate::wengert::{ConvGradKind, PrimalOp, VarId, WengertOp};
+use crate::wengert::{ConvGradKind, NormEps, PrimalOp, VarId, WengertOp};
 
 /// Tier C (T5.2): decision the reverse-walk dispatcher makes when it
 /// encounters a Wengert op that belongs to a CSHA-claimed chain.
@@ -160,7 +160,7 @@ pub enum AdjointExpr {
     /// LayerNorm INPUT gradient. args: (grad, input, gamma, eps). For
     /// `y = gamma * x_hat + beta` the input gradient is the plain
     /// normalization backward of `grad * gamma`; `None` means no gamma.
-    LayerNormBackward(VarId, VarId, Option<VarId>, f64),
+    LayerNormBackward(VarId, VarId, Option<VarId>, NormEps),
     /// BatchNorm backward: similar to LayerNorm but over batch dimension
     /// args: (grad, input, mean_unused, rstd_unused, eps)
     BatchNormBackward(VarId, VarId, VarId, VarId, f64),
@@ -170,14 +170,14 @@ pub enum AdjointExpr {
     ///
     /// NOT valid for RMSNorm (which does NOT mean-subtract); use
     /// `RmsNormGammaBackward` instead.
-    NormGammaBackward(VarId, VarId, f64, i64, VarId),
+    NormGammaBackward(VarId, VarId, NormEps, i64, VarId),
     /// Gamma gradient for RMSNorm: `grad * x_hat` where
     /// `x_hat = x / rms` and `rms = sqrt(mean(x^2) + eps)` over the last
     /// dimension (keepdim).  Unlike `NormGammaBackward`, this does NOT
     /// subtract the per-row mean from `x` before normalizing, which matches
     /// RMSNorm's forward definition `y = gamma * x / rms`.
     /// args: (grad, input, eps, weight)
-    RmsNormGammaBackward(VarId, VarId, f64, VarId),
+    RmsNormGammaBackward(VarId, VarId, NormEps, VarId),
     /// INPUT gradient for RMSNorm — the correct dx that does NOT mean-subtract
     /// (RMSNorm's forward is `y = gamma * x / rms`, `rms = sqrt(mean(x²)+eps)`,
     /// with no per-row mean removal). Reusing `LayerNormBackward` here — as the
@@ -185,7 +185,7 @@ pub enum AdjointExpr {
     /// WRONG input gradients for RMSNorm and matching neither tape-AD nor the
     /// math. Formula: `dx_j = g_j·ȳ_j/rms − x_j·mean_k(ȳ_k·g_k·x_k)/rms³`.
     /// args: (grad, input, gamma, eps)
-    RmsNormInputBackward(VarId, VarId, VarId, f64),
+    RmsNormInputBackward(VarId, VarId, VarId, NormEps),
 
     // Regularization
     /// Dropout backward: grad * mask / (1-p).  args: (grad, mask)
@@ -538,7 +538,8 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             }
             adjoints
         }
-        // RMSNorm(input, weight) -> output  (no bias, eps is compile-time constant)
+        // RMSNorm(input, weight, eps) -> output (no bias; eps is a constant or
+        // the run-time operand, `NormEps`)
         PrimalOp::RMSNorm { eps } => {
             let input = op.inputs[0];
             let mut adjoints = Vec::new();
@@ -578,7 +579,7 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             if op.inputs.len() > 1 {
                 adjoints.push(InputAdjoint {
                     input_var: op.inputs[1],
-                    expr: AdjointExpr::NormGammaBackward(output_bar, input, *eps, 0, op.inputs[1]),
+                    expr: AdjointExpr::NormGammaBackward(output_bar, input, NormEps::Const(*eps), 0, op.inputs[1]),
                 });
             }
             if op.inputs.len() > 2 {
@@ -1193,7 +1194,7 @@ pub fn ad_cert_status(op: &PrimalOp) -> AdCertStatus {
             "layernorm_3d",
             "layernorm_field_eps",
         ]),
-        PrimalOp::RMSNorm { .. } => Certified(&["rmsnorm", "rmsnorm_eps"]),
+        PrimalOp::RMSNorm { .. } => Certified(&["rmsnorm", "rmsnorm_eps", "rmsnorm_field_eps", "rmsnorm_field_eps_reused"]),
         PrimalOp::BatchNorm { .. } => {
             Unreachable("the extractor maps `batch_norm`, but no builtin or stdlib fn defines it")
         }
@@ -1360,8 +1361,8 @@ fn ad_cert_samples() -> Vec<PrimalOp> {
         PrimalOp::Gather { dim: 0 },
         PrimalOp::ScatterAdd { dim: 0 },
         PrimalOp::Embedding,
-        PrimalOp::LayerNorm { eps: 1e-5 },
-        PrimalOp::RMSNorm { eps: 1e-5 },
+        PrimalOp::LayerNorm { eps: NormEps::Const(1e-5) },
+        PrimalOp::RMSNorm { eps: NormEps::Const(1e-5) },
         PrimalOp::BatchNorm {
             eps: 1e-5,
             training: true,
@@ -1924,7 +1925,7 @@ mod tests {
 
     #[test]
     fn test_layer_norm_backward() {
-        let op = make_op(3, PrimalOp::LayerNorm { eps: 1e-5 }, vec![0, 1, 2]);
+        let op = make_op(3, PrimalOp::LayerNorm { eps: NormEps::Const(1e-5) }, vec![0, 1, 2]);
         let adj = apply_ad_rule(&op, 100);
         assert_eq!(
             adj.len(),
@@ -1941,7 +1942,7 @@ mod tests {
         )); // gamma grad
         assert!(matches!(adj[2].expr, AdjointExpr::ReduceToShape(100, 2))); // beta grad
         assert_eq!(
-            saved_for_backward(&PrimalOp::LayerNorm { eps: 1e-5 }),
+            saved_for_backward(&PrimalOp::LayerNorm { eps: NormEps::Const(1e-5) }),
             SavedRequirement::Inputs
         );
     }
@@ -2286,7 +2287,7 @@ mod tests {
             SavedRequirement::Inputs
         );
         assert_eq!(
-            saved_for_backward(&PrimalOp::LayerNorm { eps: 1e-5 }),
+            saved_for_backward(&PrimalOp::LayerNorm { eps: NormEps::Const(1e-5) }),
             SavedRequirement::Inputs
         );
         assert_eq!(

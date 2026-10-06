@@ -679,6 +679,34 @@ fn awq_model_def_from_ast<'a>(
     })
 }
 
+/// The numeric literal a model field is declared with (`eps: float =
+/// 0.00001`), if any: what the field holds in a calibration binary, which runs
+/// no program statements.
+fn model_scalar_field_default(
+    model_def: &nsl_ast::decl::ModelDef,
+    interner: &nsl_lexer::Interner,
+    field: &str,
+) -> Option<f64> {
+    fn literal(e: &nsl_ast::expr::Expr) -> Option<f64> {
+        match &e.kind {
+            nsl_ast::expr::ExprKind::FloatLiteral(v) => Some(*v),
+            nsl_ast::expr::ExprKind::IntLiteral(v) => Some(*v as f64),
+            nsl_ast::expr::ExprKind::UnaryOp { op: nsl_ast::operator::UnaryOp::Neg, operand } => {
+                literal(operand).map(|v| -v)
+            }
+            _ => None,
+        }
+    }
+    model_def.members.iter().find_map(|member| match member {
+        nsl_ast::decl::ModelMember::LayerDecl { name, init: Some(init), .. }
+            if interner.resolve(name.0) == Some(field) =>
+        {
+            literal(init)
+        }
+        _ => None,
+    })
+}
+
 /// Collect the declaration-order names of every tensor-typed `LayerDecl` field
 /// on `model_def`.
 ///
@@ -1515,6 +1543,15 @@ fn emit_model_backward_bridge(
             };
             if let Some(&tensor_val) = field_values.get(field_name) {
                 primal_vars.insert(*primal_vid, tensor_val);
+            } else if extractor.wengert_list().var_types.get(primal_vid)
+                == Some(&crate::wengert::WengertType::Scalar)
+                && let Some(v) = model_scalar_field_default(model_def, compiler.interner, field_name)
+            {
+                // A scalar field read by value (a norm's eps, `NormEps::Var`).
+                // A calibration binary runs no program statements, so the
+                // field holds its declared default. Left unbound, lowering
+                // refuses it rather than using some other value.
+                primal_vars.insert(*primal_vid, b.ins().f64const(v));
             }
         }
         // Also seed Input ops by name in the Wengert list.

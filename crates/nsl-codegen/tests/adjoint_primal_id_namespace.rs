@@ -65,7 +65,7 @@ fn two_block_primal() -> (WengertList, Vec<BlockSegment>) {
     let x = push(&mut ops, PrimalOp::Input("x".into()), vec![]);
     for b in 0..2u32 {
         let start = ops.len();
-        let n = push(&mut ops, PrimalOp::RMSNorm { eps: 1e-5 }, vec![x]);
+        let n = push(&mut ops, PrimalOp::RMSNorm { eps: nsl_codegen::wengert::NormEps::Const(1e-5) }, vec![x]);
         let wq = push(&mut ops, PrimalOp::Param(format!("blocks.{b}.wq")), vec![]);
         let q = push(&mut ops, PrimalOp::Matmul, vec![n, wq]);
         let wk = push(&mut ops, PrimalOp::Param(format!("blocks.{b}.wk")), vec![]);
