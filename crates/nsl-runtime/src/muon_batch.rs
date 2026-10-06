@@ -639,7 +639,10 @@ mod tests {
         let data: Vec<f64> = (0..n)
             .map(|i| ((i as f64) * 0.37 + seed).sin() * 0.02)
             .collect();
-        let cpu = crate::tensor::creation::create_tensor_from_f64_data(&data, &[rows, cols]);
+        let cpu64 = crate::tensor::creation::create_tensor_from_f64_data(&data, &[rows, cols]);
+        // f32 explicitly: an upload is a byte copy that refuses f64 (C5 step 2b).
+        let cpu = crate::tensor::precision_cast::convert_untaped(cpu64, 1);
+        nsl_tensor_free(cpu64);
         let gpu = nsl_tensor_to_device(cpu, 1);
         nsl_tensor_free(cpu);
         gpu
