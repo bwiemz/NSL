@@ -130,6 +130,10 @@ pub extern "C" fn nsl_sparse_from_dense(dense_ptr: i64, format: i64, threshold_b
     // Decode by tag: NSL-level creation builtins make f32 tensors, and a raw
     // f64 read of one walks twice its buffer.
     let data = tensor.as_f64_owned();
+    // The dtype the sparse tensor records, and `nsl_sparse_to_dense` hands
+    // back: its source's (f64 only for an f64 source; values are stored as
+    // f64 either way). It used to record f64 whatever the source.
+    let src_dtype: u16 = if tensor.dtype == 0 { 0 } else { 1 };
 
     // Scan for non-zeros
     let mut row_indices = Vec::new();
@@ -203,7 +207,7 @@ pub extern "C" fn nsl_sparse_from_dense(dense_ptr: i64, format: i64, threshold_b
 
         let sparse = Box::new(NslSparseTensor {
             format: SparseFmtId::Bsr as u8,
-            device: 0, dtype: 0, ndim: 2,
+            device: 0, dtype: src_dtype, ndim: 2,
             nnz: num_blocks as i64, // nnz = number of nonzero blocks
             rows: rows as i64, cols: cols as i64,
             data: Box::into_raw(val_bytes.into_boxed_slice()) as *mut u8,
@@ -229,7 +233,7 @@ pub extern "C" fn nsl_sparse_from_dense(dense_ptr: i64, format: i64, threshold_b
 
         let sparse = Box::new(NslSparseTensor {
             format: SparseFmtId::Csr as u8,
-            device: 0, dtype: 0, ndim: 2,
+            device: 0, dtype: src_dtype, ndim: 2,
             nnz,
             rows: rows as i64, cols: cols as i64,
             data: Box::into_raw(val_bytes.into_boxed_slice()) as *mut u8,
@@ -245,7 +249,7 @@ pub extern "C" fn nsl_sparse_from_dense(dense_ptr: i64, format: i64, threshold_b
 
         let sparse = Box::new(NslSparseTensor {
             format: SparseFmtId::Coo as u8,
-            device: 0, dtype: 0, ndim: 2,
+            device: 0, dtype: src_dtype, ndim: 2,
             nnz,
             rows: rows as i64, cols: cols as i64,
             data: Box::into_raw(val_bytes.into_boxed_slice()) as *mut u8,
@@ -330,8 +334,9 @@ pub extern "C" fn nsl_sparse_to_dense(sparse_ptr: i64) -> i64 {
         _ => return 0,
     }
 
-    // Create NslTensor — use nsl_tensor_create_from_data
-    crate::tensor::creation::create_tensor_from_f64_data(&dense, &[rows as i64, cols as i64])
+    let out =
+        crate::tensor::creation::create_tensor_from_f64_data(&dense, &[rows as i64, cols as i64]);
+    result_in_dtype(out, sparse.dtype)
 }
 
 /// Get the number of nonzero elements.
@@ -357,6 +362,21 @@ pub extern "C" fn nsl_sparse_density(sparse_ptr: i64) -> i64 {
 /// sparse_ptr: NslSparseTensor (COO or CSR)
 /// dense_ptr: NslTensor (2D, f64)
 /// Returns pointer to new NslTensor, or 0 on error.
+/// A sparse result (computed in f64, the values' storage type) in its
+/// operand's dtype: f64 only for an f64 operand, f32 otherwise (C5: helpers
+/// mint their operand's dtype). Every result goes through here, so the GPU
+/// fallbacks hand back a tensor whose upload is a byte copy -- an upload does
+/// not narrow (step 2b). A null result passes through.
+fn result_in_dtype(result: i64, operand_dtype: u16) -> i64 {
+    let target = if operand_dtype == 0 { 0 } else { 1 };
+    if result == 0 || crate::tensor::NslTensor::from_ptr_ref(result).dtype == target {
+        return result;
+    }
+    let converted = crate::tensor::precision_cast::convert_untaped(result, target);
+    crate::tensor::nsl_tensor_free(result);
+    converted
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_sparse_spmm(sparse_ptr: i64, dense_ptr: i64) -> i64 {
     if sparse_ptr == 0 || dense_ptr == 0 { return 0; }
@@ -463,7 +483,8 @@ pub extern "C" fn nsl_sparse_spmm(sparse_ptr: i64, dense_ptr: i64) -> i64 {
         _ => return 0,
     }
 
-    crate::tensor::creation::create_tensor_from_f64_data(&output, &[m as i64, n as i64])
+    let out = crate::tensor::creation::create_tensor_from_f64_data(&output, &[m as i64, n as i64]);
+    result_in_dtype(out, dense.dtype)
 }
 
 /// Free a sparse tensor and its owned arrays.
@@ -965,7 +986,8 @@ pub extern "C" fn nsl_sparse_spmv(sparse_ptr: i64, vec_ptr: i64) -> i64 {
         _ => return 0,
     }
 
-    crate::tensor::creation::create_tensor_from_f64_data(&output, &[m as i64])
+    let out = crate::tensor::creation::create_tensor_from_f64_data(&output, &[m as i64]);
+    result_in_dtype(out, vec_t.dtype)
 }
 
 // ---------------------------------------------------------------------------
@@ -1432,6 +1454,7 @@ mod tests {
         let ct = crate::tensor::NslTensor::from_ptr_ref(c);
         let got: Vec<f64> = (0..4).map(|i| ct.read_scalar_as_f64(i)).collect();
         assert_eq!(got, [11.0, 14.0, 9.0, 12.0], "SpMM with an f32 dense operand");
+        assert_eq!(ct.dtype, 1, "the SpMM result takes the f32 operand's dtype (C5)");
 
         // x = [1, 2, 3] -> A @ x = [7, 6].
         let x = f32_tensor(&[3], &[1.0, 2.0, 3.0]);
@@ -1440,6 +1463,7 @@ mod tests {
         let yt = crate::tensor::NslTensor::from_ptr_ref(y);
         let got: Vec<f64> = (0..2).map(|i| yt.read_scalar_as_f64(i)).collect();
         assert_eq!(got, [7.0, 6.0], "SpMV with an f32 dense vector");
+        assert_eq!(yt.dtype, 1, "the SpMV result takes the f32 vector's dtype (C5)");
 
         for t in [c, b, y, x] {
             crate::tensor::nsl_tensor_free(t);
@@ -1458,6 +1482,7 @@ mod tests {
         let bt = crate::tensor::NslTensor::from_ptr_ref(back);
         let got: Vec<f64> = (0..6).map(|i| bt.read_scalar_as_f64(i)).collect();
         assert_eq!(got, [0.0, 4.5, 0.0, -2.0, 0.0, 0.25]);
+        assert_eq!(bt.dtype, 1, "to_dense hands back the f32 source's dtype (C5)");
 
         crate::tensor::nsl_tensor_free(back);
         nsl_sparse_free(s);

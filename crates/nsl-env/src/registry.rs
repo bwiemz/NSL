@@ -1347,6 +1347,15 @@ pub static REGISTRY: &[EnvVar] = &[
         "Test harness only: marks the re-exec'd child of the null-desc C-API test so its body runs; no effect elsewhere."
     ),
     var!(
+        "NSL_TEST_F64_UPLOAD_CHILD",
+        Bool,
+        "1",
+        "unset (child returns)",
+        Test,
+        Test,
+        "Test harness only: makes transfer_preserves_dtype_gpu's re-exec'd child upload an f64 tensor, which must abort (C5 step 2b)."
+    ),
+    var!(
         "NSL_TF32_DISPATCH_EXPECT_COPIED",
         Bool,
         "1 = expect the strided-copy arm, 0 = expect OP_T; anything else panics",

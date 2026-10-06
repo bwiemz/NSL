@@ -208,10 +208,12 @@ impl DraftModelRunner {
         (vocab - 1) as i64
     }
 
-    /// Create a 1-element tensor containing a single token ID.
+    /// Create a 1-element f32 tensor containing a single token ID (f32, the
+    /// default float dtype -- exact below 2^24 -- so a GPU upload is a byte
+    /// copy; C5).
     fn make_token_tensor(token: i64) -> Box<NslTensor> {
-        let data = checked_alloc(std::mem::size_of::<f64>()) as *mut f64;
-        unsafe { *data = token as f64 };
+        let data = checked_alloc(std::mem::size_of::<f32>()) as *mut f32;
+        unsafe { *data = token as f32 };
 
         let shape = checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
         unsafe { *shape = 1 };
@@ -226,7 +228,7 @@ impl DraftModelRunner {
             1,
             1,
             0,
-            0,
+            1,
             1,
             0,
         ))
@@ -541,7 +543,8 @@ mod tests {
         let t = NslTensor::from_ptr(ptr as i64);
         assert_eq!(t.ndim, 1);
         assert_eq!(t.len, 1);
-        let val = unsafe { *(t.data as *const f64) };
+        assert_eq!(t.dtype, 1, "token ids are f32 (C5)");
+        let val = unsafe { *(t.data as *const f32) };
         assert_eq!(val as i64, 42);
         crate::tensor::nsl_tensor_free(ptr as i64);
     }

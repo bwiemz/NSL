@@ -265,21 +265,26 @@ fn nsl_tensor_scatter_add_deterministic_cpu(
     let n = idx_tensor.len as usize;
     if n == 0 { return output; }
 
-    // Build sorted (index, value) pairs for deterministic ordering
+    // Build sorted (index, value) pairs for deterministic ordering. Each
+    // operand is read in its own dtype: these used to be raw f64 reads, which
+    // misread the f32 tensors the runtime makes (and walked past an f32
+    // index tensor's buffer).
     let mut pairs: Vec<(i64, f64)> = Vec::with_capacity(n);
     for i in 0..n {
-        let idx = unsafe { *(idx_tensor.data as *const f64).add(i) } as i64;
-        let val = unsafe { *(src_tensor.data as *const f64).add(i) };
-        pairs.push((idx, val));
+        pairs.push((idx_tensor.read_index(i), src_tensor.read_scalar_as_f64(i)));
     }
     // Sort by index — ensures deterministic accumulation order
     pairs.sort_by_key(|&(idx, _)| idx);
 
-    // Sequential accumulate in sorted order
-    let out_data = out_tensor.data as *mut f64;
+    // Sequential accumulate in sorted order, in the output's dtype
     for (idx, val) in &pairs {
         if *idx >= 0 && (*idx as usize) < out_tensor.len as usize {
-            unsafe { *out_data.add(*idx as usize) += val; }
+            let at = *idx as usize;
+            if out_tensor.dtype == 1 {
+                unsafe { *out_tensor.data_f32().add(at) += *val as f32; }
+            } else {
+                unsafe { *out_tensor.data_f64().add(at) += val; }
+            }
         }
     }
 
@@ -296,6 +301,32 @@ mod tests {
         let mean_fn: extern "C" fn(i64, i64, i64) -> i64 = nsl_tensor_reduce_mean_deterministic;
         assert!(!std::ptr::addr_of!(sum_fn).is_null());
         assert!(!std::ptr::addr_of!(mean_fn).is_null());
+    }
+
+    /// Each operand is read in its own dtype: f32 input/src with f32 indices
+    /// (what the runtime makes) accumulate correctly. The CPU kernel used to
+    /// read all three as raw f64.
+    #[test]
+    fn scatter_add_reads_each_operand_by_its_dtype() {
+        let f32_1d = |vals: &[f32]| {
+            let p = crate::cpu::create_tensor_with_shape_rs_dtype(&[vals.len() as i64], 1);
+            let t = crate::tensor::NslTensor::from_ptr(p);
+            for (i, v) in vals.iter().enumerate() {
+                unsafe { *t.data_f32().add(i) = *v };
+            }
+            p
+        };
+        let input = f32_1d(&[0.0, 0.0, 0.0, 0.0]);
+        let indices = f32_1d(&[2.0, 0.0, 2.0]);
+        let src = f32_1d(&[1.5, 4.0, 0.25]);
+        let out = nsl_tensor_scatter_add_deterministic(input, indices, src);
+        let t = crate::tensor::NslTensor::from_ptr_ref(out);
+        assert_eq!(t.dtype, 1);
+        let got: Vec<f32> = (0..4).map(|i| unsafe { *t.data_f32().add(i) }).collect();
+        assert_eq!(got, vec![4.0, 0.0, 1.75, 0.0]);
+        for p in [input, indices, src, out] {
+            crate::tensor::nsl_tensor_free(p);
+        }
     }
 
     #[test]

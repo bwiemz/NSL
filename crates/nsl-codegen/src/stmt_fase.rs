@@ -868,14 +868,14 @@ impl Compiler<'_> {
             return Ok(());
         }
 
-        // Step 0: migrate grad to m_partial's (device, dtype). Tape-AD produces
-        // CPU f64 gradients while m_partial is GPU f32 (it was allocated via
-        // zeros_like(param), inheriting the parameter's placement). Without
-        // this, `nsl_tensor_add_inplace` below hits a device/dtype mismatch
-        // (CPU f64 src into GPU f32 dst) and panics inside the runtime.
-        // `to_device_like` is a no-op (refcount++) when placements already match.
+        // Step 0: migrate grad to m_partial's (device, dtype). m_partial was
+        // allocated via zeros_like(param), so it carries the parameter's
+        // placement; a host gradient in another dtype is converted on the host
+        // by `nsl_grad_migrate_like` before the upload, which is a byte copy
+        // that refuses f64 (C5 step 2b). A no-op (refcount++) when placements
+        // and dtypes already match.
         let grad_migrated =
-            self.compile_call_by_name(builder, "nsl_tensor_to_device_like", &[grad_ptr, m_partial_ptr])?;
+            self.compile_call_by_name(builder, "nsl_grad_migrate_like", &[grad_ptr, m_partial_ptr])?;
 
         // Steps 1+2 fused (p4): m_partial += accum_scale * grad_migrated in ONE
         // kernel launch, bit-exact with the prior `mul_scalar` then

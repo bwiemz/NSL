@@ -317,7 +317,7 @@ function <main>(i32, i64) -> i32 <callconv> {
     fn70 = nsl_tensor_reduce_to_shape sig70
     fn71 = nsl_list_get sig71
     fn72 = nsl_grad_integrity_note sig72
-    fn73 = nsl_tensor_to_device_like sig73
+    fn73 = nsl_grad_migrate_like sig73
     fn74 = nsl_tensor_scalar_mul_add_inplace sig74
     fn75 = nsl_tensor_free sig75
     fn76 = nsl_tensor_free sig76
@@ -327,7 +327,7 @@ function <main>(i32, i64) -> i32 <callconv> {
     fn80 = nsl_tensor_reduce_to_shape sig80
     fn81 = nsl_list_get sig81
     fn82 = nsl_grad_integrity_note sig82
-    fn83 = nsl_tensor_to_device_like sig83
+    fn83 = nsl_grad_migrate_like sig83
     fn84 = nsl_tensor_scalar_mul_add_inplace sig84
     fn85 = nsl_tensor_free sig85
     fn86 = nsl_tensor_free sig86
@@ -337,7 +337,7 @@ function <main>(i32, i64) -> i32 <callconv> {
     fn90 = nsl_tensor_reduce_to_shape sig90
     fn91 = nsl_list_get sig91
     fn92 = nsl_grad_integrity_note sig92
-    fn93 = nsl_tensor_to_device_like sig93
+    fn93 = nsl_grad_migrate_like sig93
     fn94 = nsl_tensor_scalar_mul_add_inplace sig94
     fn95 = nsl_tensor_free sig95
     fn96 = nsl_tensor_free sig96

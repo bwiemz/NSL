@@ -2095,12 +2095,17 @@ mod tests {
         let n = 5usize;
         let c = 7usize;
         let vals: Vec<f64> = (0..n * c).map(|i| ((i as f64) * 0.83).sin() * 2.0).collect();
-        let logits = crate::tensor::creation::create_tensor_from_f64_data(
-            &vals,
-            &[n as i64, c as i64],
-        );
+        // f32 inputs on both paths: an upload is a byte copy that refuses f64
+        // (C5 step 2b), and the CPU reference then sees what the GPU sees.
+        let f32_of = |data: &[f64], shape: &[i64]| {
+            let t64 = crate::tensor::creation::create_tensor_from_f64_data(data, shape);
+            let t32 = crate::tensor::precision_cast::convert_untaped(t64, 1);
+            crate::tensor::nsl_tensor_free(t64);
+            t32
+        };
+        let logits = f32_of(&vals, &[n as i64, c as i64]);
         let tvals = [3.0f64, 0.0, -100.0, 6.0, 2.0];
-        let targets = crate::tensor::creation::create_tensor_from_f64_data(&tvals, &[n as i64]);
+        let targets = f32_of(&tvals, &[n as i64]);
         let go = nsl_tensor_scalar(2.5, 1);
 
         // CPU reference (all-CPU inputs -> bounce path untouched).

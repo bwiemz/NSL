@@ -1265,6 +1265,7 @@ macro_rules! for_each_runtime_fn {
             [interop] nsl_kernel_launch_tensors(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 = cuda::nsl_kernel_launch_tensors;
             [interop] nsl_tensor_to_device(i64, i64) -> i64 = tensor::nsl_tensor_to_device;
             [interop] nsl_tensor_to_device_like(i64, i64) -> i64 = tensor::nsl_tensor_to_device_like;
+            [interop] nsl_grad_migrate_like(i64, i64) -> i64 = tensor::nsl_grad_migrate_like;
             // Safetensors I/O (M18b)
             [interop] nsl_safetensors_load(i64, i64, i64) -> i64 = safetensors_io::nsl_safetensors_load [interop];
             [interop] nsl_safetensors_save(i64, i64, i64) -> () = safetensors_io::nsl_safetensors_save [interop];
@@ -1357,6 +1358,6 @@ mod tests {
     fn table_is_the_recorded_size() {
         // The count is pinned so a row dropped by a bad merge is noticed; move
         // it with a row that is deliberately added or removed.
-        assert_eq!(RUNTIME_ABI.len(), 684);
+        assert_eq!(RUNTIME_ABI.len(), 685);
     }
 }

@@ -258,7 +258,8 @@ fn call_model_forward(model_ptr: i64, input_tensor_ptr: i64) -> Vec<i64> {
 /// `token_ids_ptr`: pointer to an array of i64 token IDs (0 = no tokens available)
 /// `num_tokens`: number of tokens
 ///
-/// Returns an NslTensor* (as i64) with shape [num_tokens] and dtype f64 (NSL default).
+/// Returns an NslTensor* (as i64) with shape [num_tokens] and dtype f32 (the
+/// default float dtype; exact below 2^24, and a GPU upload is a byte copy).
 /// The tensor owns a copy of the data. Returns 0 if token_ids_ptr is null/zero.
 fn create_token_tensor(token_ids_ptr: i64, num_tokens: u32) -> i64 {
     use crate::tensor::NslTensor;
@@ -269,13 +270,13 @@ fn create_token_tensor(token_ids_ptr: i64, num_tokens: u32) -> i64 {
     }
 
     let n = num_tokens as usize;
-    let data_bytes = n * std::mem::size_of::<f64>();
-    let data_ptr = checked_alloc(data_bytes) as *mut f64;
+    let data_bytes = n * std::mem::size_of::<f32>();
+    let data_ptr = checked_alloc(data_bytes) as *mut f32;
 
-    // Copy token IDs (i64) into f64 buffer (NSL's default CPU dtype)
+    // Copy token IDs (i64) into an f32 buffer (the default float dtype)
     let src = token_ids_ptr as *const i64;
     for i in 0..n {
-        unsafe { *data_ptr.add(i) = *src.add(i) as f64; }
+        unsafe { *data_ptr.add(i) = *src.add(i) as f32; }
     }
 
     let shape_ptr = checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
@@ -291,7 +292,7 @@ fn create_token_tensor(token_ids_ptr: i64, num_tokens: u32) -> i64 {
         1,      // ndim
         n as i64,
         0,      // device = CPU
-        0,      // dtype = f64
+        1,      // dtype = f32
         1,      // owns_data
         0,      // data_owner
     ));

@@ -476,7 +476,7 @@ crates/nsl-runtime/tests/tier_b1_prepass_gpu.rs	w_prepass_matches_cpu_reference	
 crates/nsl-runtime/tests/transfer_preserves_dtype_gpu.rs	f32_round_trip_keeps_the_tag_and_every_bit	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/transfer_preserves_dtype_gpu.rs	every_byte_copied_dtype_round_trips_unchanged	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/transfer_preserves_dtype_gpu.rs	a_transposed_f32_device_view_downloads_as_contiguous_f32	gpu	requires CUDA GPU
-crates/nsl-runtime/tests/transfer_preserves_dtype_gpu.rs	an_f64_upload_narrows_and_the_download_keeps_the_narrowed_tag	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/transfer_preserves_dtype_gpu.rs	an_f64_upload_is_refused	gpu	requires CUDA GPU (re-execs this binary)
 crates/nsl-runtime/tests/wgrad_accum_fused.rs	fused_wgrad_matches_decomposed_chain_and_cpu	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/wgrad_accum_fused.rs	fused_wgrad_comparison_is_sensitive	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/zero_grad_gpu.rs	gpu_dst_gpu_src_accumulate_matches_cpu_reference	gpu	requires CUDA GPU
