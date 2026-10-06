@@ -215,16 +215,28 @@ fn commit_rename(from: &str, to: &str, what: &str) {
     sync_parent_dir(to);
 }
 
-/// fsync the directory holding `path` (a rename is a directory update). A
-/// platform that cannot open a directory for syncing (Windows) skips it.
+/// fsync the directory holding `path` (a rename is a directory update).
+///
+/// A failure aborts: the train save relies on the model's rename being
+/// durable before the sidecar's, and losing that order silently could leave
+/// a new sidecar beside an old model after a power cut. A filesystem that
+/// does not support syncing a directory (EINVAL / ENOTSUP) is tolerated, and
+/// Windows, which cannot open a directory as a file, skips it.
 fn sync_parent_dir(path: &str) {
     let dir = std::path::Path::new(path)
         .parent()
         .filter(|d| !d.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("."));
     #[cfg(unix)]
-    if let Ok(d) = std::fs::File::open(dir) {
-        let _ = d.sync_all();
+    {
+        use std::io::ErrorKind;
+        let r = std::fs::File::open(dir).and_then(|d| d.sync_all());
+        if let Err(e) = r
+            && !matches!(e.kind(), ErrorKind::InvalidInput | ErrorKind::Unsupported)
+        {
+            crate::nsl_log!(ERROR, "nsl", "nsl: checkpoint: fsync of directory '{}': {e}", dir.display());
+            std::process::abort();
+        }
     }
     #[cfg(not(unix))]
     let _ = dir;
@@ -711,9 +723,11 @@ fn read_moment_bytes(tensor_ptr: i64, which: &str, idx: usize, buf: &mut Vec<u8>
 /// Save the FULL training state: θ as a normal `.nslm` (via
 /// [`nsl_model_save`], so the streamed/bf16-sr materialization logic is
 /// shared) plus a `<path>.optim` sidecar holding the AdamW moments and the
-/// micro-batch step counter. Both files are written to a `.tmp` and renamed,
-/// so a crash mid-save leaves the previous checkpoint intact — "clean
-/// checkpoint" means the on-disk state is never half-written.
+/// micro-batch step counter. Both files are written to a `.tmp`, fsynced, and
+/// renamed model first: a crash before the first rename leaves the previous
+/// pair intact, and one between the renames leaves the new pair complete,
+/// which `recover_interrupted_commit` finishes at the next load. No crash
+/// leaves a half-written file or a mixed pair that loads.
 ///
 /// The sidecar extends the checkpoint WITHOUT touching `.nslm` version 1:
 /// `nsl_model_load` hard-aborts on any unknown version, so a v2 container
@@ -722,7 +736,9 @@ fn read_moment_bytes(tensor_ptr: i64, which: &str, idx: usize, buf: &mut Vec<u8>
 ///
 /// Sidecar format (mirrors `.nslm` deliberately): magic `NSLO`, u32 LE
 /// version, u64 LE header size, JSON header
-/// `{"step_count":N,"model_sig":S,"resume":{…},"params":[{name,shape,dtype,offset,nbytes}...]}`
+/// `{"step_count":N,"model_sig":S,"model_sha256":"<hex>","resume":{…},"params":[{name,shape,dtype,offset,nbytes}...]}`
+/// (`model_sha256` pairs the sidecar with the exact model file; `model_sig`,
+/// the older sampled signature, is still written for older readers)
 /// (all m entries in param order, then all v entries), zero-pad to 64, raw
 /// little-endian f32 data back to back.
 ///
@@ -1082,8 +1098,8 @@ pub extern "C" fn nsl_train_checkpoint_load(
             std::process::abort();
         }
         Pairing::NoRecord => {
-            crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: sidecar header has no model_sig \
-                 — not a checkpoint this runtime wrote"
+            crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: sidecar header has neither \
+                 model_sha256 nor model_sig — not a checkpoint this runtime wrote"
             );
             std::process::abort();
         }
