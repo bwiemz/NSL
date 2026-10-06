@@ -1911,6 +1911,65 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   `source_ad_norm_field_eps_gate` trains a model with reassigned stdlib norm
   eps under SGD -- tape, source AD and the fused RMSNorm backward agree, and a
   control at the default eps does not; a calibration build test.
+- **Checkpoints survive a crash during the save, and the sidecar pairs with
+  the whole model file** (external review 2026-10-06).
+  - `model_save` wrote the `.nslm` in place, so a crash mid-write destroyed
+    the previous checkpoint. It now writes a temporary unique to the process
+    and call (`<path>.tmp.<pid>.<n>`, so two processes saving one path
+    cannot take each other's file away), fsyncs it, and renames it into
+    place.
+  - `train_checkpoint_save` already used temporaries but renamed them
+    without an fsync and with nothing to undo a half-finished commit: a
+    crash between the two renames left the new model beside the old
+    sidecar, which the next load refused while the previous model was
+    already gone. Both temporaries are now fsynced, the renames run model
+    then sidecar with a directory fsync after each, and the load completes
+    the commit when `<path>.optim.tmp` pairs with the model and the current
+    sidecar does not.
+  - The pairing signature sampled the model's first and last MiB, so a
+    same-size change in between went unnoticed and the resume applied
+    moments saved for different weights. The sidecar now records
+    `model_sha256`, a SHA-256 of the whole `.nslm`, and the load checks it
+    in preference to the old `model_sig` (still read for older sidecars).
+  - The bf16 operand-cast stochastic-rounding counter
+    (`NSL_MATMUL_BF16_ROUND=sr`) was not saved, so a resume restarted it at
+    zero and reused the first steps' dither. It is now `bf16_sr_ctr` in the
+    sidecar (0 when an older sidecar has none).
+  - Gates: `train_checkpoint_gate.rs` builds the interrupted state exactly
+    (step-4 model, step-2 sidecar, step-4 sidecar as the temporary) and
+    requires a bit-exact continuation, plus refusal without the temporary;
+    a 3.2 MB model with one byte flipped in the middle must be refused by
+    the hash. Removing the recovery call or the hash check fails them.
+
+- **Checkpoint loads validate the whole file before changing anything.**
+  (External review 2026-10-06.)
+  - `model_load` counted entries by substring and only WARNED on a count
+    mismatch, then copied positionally. It ignored offsets and sizes, sliced
+    an unchecked header length, and found a short file mid-copy, after
+    earlier tensors were overwritten.
+  - It now parses the header as JSON and requires the entries to tile the
+    data section exactly. Every entry must match the live parameter at its
+    position in count, dtype, shape and size, and all of this is checked
+    before the first byte is copied.
+  - `model_load` now also passes the parameter names (new ABI row
+    `nsl_model_load_named`), so a model whose same-shaped parameters were
+    reordered is refused instead of loaded swapped. Names match across the
+    train checkpoint's `m.blocks.0.w` and `model_save`'s `blocks[0].w`, so
+    loading a checkpoint for a weights-only warm start still works.
+  - The train resume (`nsl_train_checkpoint_load`, which now takes the names
+    list) validates the model file the same way. It also checks every
+    sidecar entry's name, dtype, shape, size and offset, and the sidecar's
+    total length, before restoring θ or the moments. A truncated sidecar
+    used to be found after θ was overwritten.
+  - **Behaviour change:** a count mismatch is now an error, not a warning.
+    A train-block checkpoint holds only the trained parameters, so loading
+    one into a model with buffers needs `tools/nslm_splice.py`. That was
+    always the case; the loader used to proceed and misload.
+  - Gates:
+    - `model_checkpoint_dtype_tags.rs`: count, truncation, oversized header,
+      reorder, and the cross-scheme name match.
+    - `train_checkpoint_gate.rs`: a reordered model refused by both the
+      resume and `model_load`, and a truncated sidecar.
 
 - **C5 step 3: one default float dtype, f32, and an `f64` annotation stores
   f64.** The checker typed every `zeros`/`ones`/`full`/`rand`/`randn`/

@@ -107,7 +107,7 @@ pub fn classify_builtin_effects(name: &str) -> EffectSet {
         | "read_line" | "read_file" | "write_file" | "open" | "close"
         | "nsl_trace_record_op" | "nsl_trace_flush"
         | "model_save" | "model_load"
-        | "nsl_model_save" | "nsl_model_load"
+        | "nsl_model_save" | "nsl_model_load" | "nsl_model_load_named"
         => EffectSet::IO,
 
         // Random effects

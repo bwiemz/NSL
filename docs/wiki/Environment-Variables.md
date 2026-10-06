@@ -178,8 +178,8 @@ Every `NSL_*` variable the toolchain reads (172 of them), from the registry in `
 | `NSL_BF16_CACHE_PROBE` | bool | presence marks the child; parent sets 1 | unset | test | Test harness only: marks the re-exec'd child of the bf16 weight-cast cache GPU gate; the parent returns when it is set. |
 | `NSL_BF16_LT_PROBE` | enum | on = Lt-armed child, off = GemmEx child; anything else = parent | unset | test | Test harness only: selects which re-exec'd child of the cublasLt bf16 GEMM gate runs (on = Lt path, off = GemmEx control). |
 | `NSL_BF16_PROBE` | bool | 1 only | unset | test | Test harness only: marks the re-exec'd timing child of the bf16 matmul mode gate, which prints one PROBE line for the parent. |
-| `NSL_CKPT_DTYPE_PATH` | path | path to the .nslm checkpoint | unset | test | Test harness only: the checkpoint the model_load dtype-refusal child loads. |
-| `NSL_CKPT_DTYPE_SCENARIO` | string | load_into_bf16 | unset (child returns) | test | Test harness only: names the model_load dtype-mismatch scenario the re-exec'd child runs (expected to abort). |
+| `NSL_CKPT_DTYPE_PATH` | path | path to the .nslm checkpoint | unset | test | Test harness only: the checkpoint the model_load refusal child loads. |
+| `NSL_CKPT_DTYPE_SCENARIO` | string | load_into_bf16 \| count \| truncated \| header \| reordered | unset (child returns) | test | Test harness only: names the model_load refusal scenario the re-exec'd child runs (expected to abort). |
 | `NSL_CUDA_GRAPH_TEST_DIVERGE_FIRST` | bool | 1 only | off | runtime | Test hook: force each graph region's first replay verification to report a mismatch at op 0, exercising the eager-repair path. |
 | `NSL_DLPACK_REFUSAL_LIB` | path | path to the built shared library | unset | test | Test harness only: shared-library path handed to the DLPack unsupported-dtype refusal child scenarios. |
 | `NSL_DLPACK_REFUSAL_SCENARIO` | string | desc42 or a model scenario name | unset (child returns) | test | Test harness only: names the DLPack unsupported-dtype refusal scenario the re-exec'd child runs. |

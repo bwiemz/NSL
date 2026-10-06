@@ -57,7 +57,7 @@ impl Compiler<'_> {
         state: &mut FuncState,
         model_sym: nsl_ast::Symbol,
         optimizer_name: &str,
-        checkpoint_save_path: &Option<String>,
+        want_checkpoint_names: bool,
         csla_active: bool,
         fase_deferred: bool,
         fase_plan: &crate::fase::FasePlan,
@@ -149,7 +149,9 @@ impl Compiler<'_> {
         // Milestone B: the .nslm header names for periodic checkpoints,
         // built ONCE at setup (host allocations — no surface bracket needed).
         // Same paths param_list was built from, so save order == list order.
-        let checkpoint_names_list: Option<Value> = if checkpoint_save_path.is_some() {
+        // A resume needs them too: the load checks each saved entry's name
+        // against the live parameter at its position.
+        let checkpoint_names_list: Option<Value> = if want_checkpoint_names {
             let l = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
             for path in &param_paths {
                 let display = path.strip_prefix("$model.").unwrap_or(path);

@@ -197,6 +197,7 @@ impl Compiler<'_> {
         state: &FuncState,
         checkpoint_load_path: &Option<String>,
         epochs: i64,
+        checkpoint_names_list: Option<Value>,
         param_list: Value,
         state_list_1: Value,
         state_list_2: Value,
@@ -229,12 +230,18 @@ impl Compiler<'_> {
             let path_val = self.compile_string_literal(builder, &load_path)?;
             let path_len = builder.ins().iconst(cl_types::I64, load_path.len() as i64);
             let epochs_val_for_resume = builder.ins().iconst(cl_types::I64, epochs);
+            let names_list = checkpoint_names_list.ok_or_else(|| {
+                CodegenError::new(
+                    "internal: checkpoint_load without the parameter names list".to_string(),
+                )
+            })?;
             let restored = self.compile_call_by_name(
                 builder,
                 "nsl_train_checkpoint_load",
                 &[
                     path_val,
                     path_len,
+                    names_list,
                     param_list,
                     state_list_1,
                     state_list_2,
