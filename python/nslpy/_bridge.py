@@ -11,8 +11,8 @@ named-dispatch :meth:`NslModel.call` Python facade.
 from __future__ import annotations
 
 import ctypes
+import struct
 from typing import Any, Callable, Optional, Sequence
-
 
 # ---------------------------------------------------------------------------
 # NslTensorDesc — ctypes mirror of the runtime C struct
@@ -208,57 +208,84 @@ def allocate_output_descs_sized(n_out: int, capacity_bytes: int):
     return arr, keepalive, caps
 
 
+# The C API dtype tags a result can carry, as (bytes per element, decoder).
+# The runtime refuses every other tag at the export boundary (C5 step 6).
+def _decode_f16(raw: bytes) -> list[float]:
+    return [v[0] for v in struct.iter_unpack("<e", raw)]
+
+
+def _decode_bf16(raw: bytes) -> list[float]:
+    # bf16 is the high half of an f32.
+    return [
+        struct.unpack("<f", b"\x00\x00" + raw[i : i + 2])[0]
+        for i in range(0, len(raw), 2)
+    ]
+
+
+_TAG_READERS: dict[int, tuple[int, Callable[[bytes], list]]] = {
+    0: (8, lambda raw: [v[0] for v in struct.iter_unpack("<d", raw)]),
+    1: (4, lambda raw: [v[0] for v in struct.iter_unpack("<f", raw)]),
+    2: (2, _decode_f16),
+    3: (2, _decode_bf16),
+    4: (1, lambda raw: [v[0] for v in struct.iter_unpack("<b", raw)]),
+    9: (4, lambda raw: [v[0] for v in struct.iter_unpack("<i", raw)]),
+}
+
+
+def _read_desc_values(desc: NslTensorDesc) -> list:
+    """The elements of a CPU result desc, decoded by its dtype TAG.
+
+    The readers used to accept only tags 0 and 1, and the gradient reader
+    ignored the tag altogether and read f32 -- an f64 gradient came back as
+    reinterpreted halves. Now every tag the C API carries is decoded as what
+    it is, and anything else is refused by name.
+    """
+    if not desc.data:
+        raise ValueError("output desc has null data pointer")
+    if desc.device_type != 0:
+        raise ValueError("output desc is on a CUDA device; nslpy reads CPU results")
+    reader = _TAG_READERS.get(int(desc.dtype))
+    if reader is None:
+        raise ValueError(
+            f"unsupported output dtype tag {desc.dtype} "
+            "(nslpy reads 0=f64, 1=f32, 2=f16, 3=bf16, 4=int8, 9=int32)"
+        )
+    n_elems = 1
+    for i in range(desc.ndim):
+        n_elems *= int(desc.shape[i])
+    if n_elems < 0:
+        raise ValueError(f"output desc resolves to a negative element count: {n_elems}")
+    size, decode = reader
+    raw = ctypes.string_at(desc.data, n_elems * size)
+    return decode(raw)
+
+
 def read_output_desc(desc: NslTensorDesc):
     """Read a call_into output desc into Python values.
 
-    Handles the shapes the item-7 dispatch contract can produce: rank-0
-    f64 scalars (returned as ``float``) and CPU f32/f64 tensors (returned
-    as ``list[float]``).
+    A rank-0 result (a scalar export) is returned as a single value, any
+    other rank as a flat ``list``, decoded by the desc's dtype tag (see
+    ``_read_desc_values``). A zero-element result is the empty list.
     """
-    if not desc.data:
-        raise ValueError("output desc has null data pointer")
+    values = _read_desc_values(desc)
     if desc.ndim == 0:
-        return ctypes.cast(desc.data, ctypes.POINTER(ctypes.c_double))[0]
-    n_elems = 1
-    for i in range(desc.ndim):
-        n_elems *= int(desc.shape[i])
-    if n_elems == 0:
-        # A zero-element result is legitimate (the runtime succeeds with
-        # rc=0 and skips the copy); return the empty list rather than
-        # raising after a successful dispatch.
-        return []
-    if n_elems < 0:
-        raise ValueError(f"output desc resolves to a negative element count: {n_elems}")
-    if desc.dtype == 0:  # f64
-        arr = ctypes.cast(desc.data, ctypes.POINTER(ctypes.c_double * n_elems))
-        return list(arr.contents)
-    if desc.dtype == _DTYPE_F32:
-        arr = ctypes.cast(desc.data, ctypes.POINTER(ctypes.c_float * n_elems))
-        return list(arr.contents)
-    raise ValueError(
-        f"read_output_desc: unsupported output dtype tag {desc.dtype} "
-        "(v1 reads f64/f32 CPU results)"
-    )
+        return values[0]
+    return values
 
 
 def read_f32_output_desc(desc: NslTensorDesc) -> list[float]:
-    """Read a CPU f32 ``NslTensorDesc`` into a Python ``list[float]``.
+    """Read a CPU result ``NslTensorDesc`` (a gradient) into a flat list.
 
-    Computes the element count from ``ndim`` + ``shape[i]`` and copies
-    ``ndim`` worth of f32 elements out of ``desc.data``. Raises
-    :class:`ValueError` on a degenerate (null-data) result.
+    Despite the name it decodes by the desc's dtype tag, so an f64 gradient
+    is read as f64. Raises :class:`ValueError` on a degenerate (null-data,
+    rank-0 or empty) result.
     """
-    if not desc.data:
-        raise ValueError("output desc has null data pointer")
     if desc.ndim <= 0:
         raise ValueError(f"output desc has non-positive ndim={desc.ndim}")
-    n_elems = 1
-    for i in range(desc.ndim):
-        n_elems *= int(desc.shape[i])
-    if n_elems <= 0:
-        raise ValueError(f"output desc resolves to <=0 elements: {n_elems}")
-    arr = ctypes.cast(desc.data, ctypes.POINTER(ctypes.c_float * n_elems))
-    return list(arr.contents)
+    values = _read_desc_values(desc)
+    if not values:
+        raise ValueError("output desc resolves to <=0 elements: 0")
+    return [float(v) for v in values]
 
 # ---------------------------------------------------------------------------
 # Tensor validation for zero-copy safety

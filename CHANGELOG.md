@@ -1911,6 +1911,48 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   `source_ad_norm_field_eps_gate` trains a model with reassigned stdlib norm
   eps under SGD -- tape, source AD and the fused RMSNorm backward agree, and a
   control at the default eps does not; a calibration build test.
+- **`@export` and DLPack hold tensors to what they declare (C5 step 6).**
+  - **Declared dtype and device, both directions.**
+    - The wrapper discarded an export's declared dtype and device. A
+      host descriptor under the wrong tag reached the implementation: f64
+      under an f32 declaration computed garbage, and int8/int32 hit an
+      `assert_eq!` inside `extern "C"`, which aborted the host (a Python
+      interpreter under nslpy).
+    - Results went back with whatever tag the runtime tensor had, under the
+      declared signature.
+    - Every import now goes through `nsl_desc_to_tensor_expect`, and every
+      result through `nsl_export_check_result`. A mismatch returns -1, and
+      the error names the parameter and the reason.
+  - **Malformed descriptors are refused instead of crashing the host.**
+    These used to abort or misread:
+    - a negative or huge `ndim`;
+    - a null shape;
+    - a negative dimension;
+    - an element count that overflows;
+    - null data;
+    - a negative stride;
+    - a CUDA `device_id` that wrapped to the CPU (-1, 255);
+    - tag 10 (`int8_blockwise`, an internal tag whose buffer is not `len`
+      bytes).
+  - **DLPack import validates the same fields**, plus `lanes` (vector dtypes
+    used to import as their scalar) and `byte_offset` alignment. Every
+    refusal now sets the error; `nsl_model_call_dlpack` used to report every
+    one as an unsupported dtype.
+  - **The checker refuses an `@export` tensor dtype with no C API tag**
+    (int64, uint8, bool, fp8, …). The header lowering used to turn an unknown
+    spelling into f32.
+  - **nslpy decodes results by tag** (f64, f32, f16, bf16, int8, int32).
+    `read_output_desc` used to accept only tags 0 and 1, and the gradient
+    reader read f32 whatever the tag said.
+  - **Gate:** `exports_hold_descriptors_and_results_to_their_declared_dtype`
+    (interop) checks two things:
+    - a byte-and-tag round trip through an identity export per dtype;
+    - seven refusals (wrong tag in, wrong tag out, four malformed layouts,
+      tag 10).
+
+    Disabling either check fails it. With the input check off, the child
+    aborts exactly as before. There are also unit tests for the DLPack
+    fields, the declared device, the checker refusal and the nslpy decoders.
 - **Checkpoints survive a crash during the save, and the sidecar pairs with
   the whole model file** (external review 2026-10-06).
   - `model_save` wrote the `.nslm` in place, so a crash mid-write destroyed

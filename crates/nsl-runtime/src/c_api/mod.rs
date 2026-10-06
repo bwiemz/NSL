@@ -66,12 +66,103 @@ pub(crate) const CAPI_DTYPE_TAGS: &str = "0=f64, 1=f32, 2=f16, 3=bf16, 4=int8, \
 /// desc. `nsl_dispatch_apply_result` treats the identical input as a plain
 /// `-1` + `set_error` eighty lines below; this now mirrors it.
 pub fn capi_dtype_to_nsl(capi_dtype: i32) -> Option<u16> {
-    // The canonical built-in tags are `0..=DTYPE_INT8_BLOCKWISE` (nsl-abi
-    // `wire::dtype`); anything else is refused here.
-    if !(0..=crate::tensor::DTYPE_INT8_BLOCKWISE as i32).contains(&capi_dtype) {
+    // The C API tags are `0..=DTYPE_I32`, the ones the header documents.
+    // `DTYPE_INT8_BLOCKWISE` (10) is internal: its buffer is not `len` bytes
+    // (it carries per-block scales), so a host desc tagged 10 described a
+    // buffer of the wrong size (C5 step 6).
+    if !(0..=crate::tensor::DTYPE_I32 as i32).contains(&capi_dtype) {
         return None;
     }
     Some(capi_dtype as u16)
+}
+
+/// Bytes per element of a C API tag (`0..=9`). fp8 (5, 6) is one byte, as
+/// the header documents, though no runtime path computes in it.
+fn capi_element_size(tag: u16) -> usize {
+    match tag {
+        crate::tensor::DTYPE_F64 => 8,
+        crate::tensor::DTYPE_F32 | crate::tensor::DTYPE_I32 => 4,
+        crate::tensor::DTYPE_FP16
+        | crate::tensor::DTYPE_BF16
+        | crate::tensor::DTYPE_U16_TOKEN
+        | crate::tensor::DTYPE_U16_SEGMENT => 2,
+        _ => 1,
+    }
+}
+
+/// The name of a C API tag in refusal messages.
+fn capi_dtype_name(tag: i64) -> &'static str {
+    match tag {
+        0 => "f64",
+        1 => "f32",
+        2 => "f16",
+        3 => "bf16",
+        4 => "int8",
+        5 => "fp8e4m3",
+        6 => "fp8e5m2",
+        7 => "u16-token",
+        8 => "u16-segment",
+        9 => "int32",
+        _ => "no C API dtype",
+    }
+}
+
+/// The most dimensions a host descriptor may claim. Far above any real
+/// tensor; it bounds the shape/stride reads and allocations a host value
+/// controls.
+const MAX_DESC_NDIM: i32 = 64;
+
+/// Structural validation of a host-supplied descriptor, before any field is
+/// dereferenced or allocated from (C5 step 6). Returns the canonical tag and
+/// the runtime device byte.
+///
+/// Every check here used to be missing: a negative `ndim` reached an
+/// allocation's `Layout` unwrap, a null shape was read, a shape whose
+/// element count overflows hit `total_elements`' abort, and
+/// `device_id as u8 + 1` wrapped `-1` and `255` to the CPU. Each of those
+/// took the HOST process down, or misread memory, on a bad descriptor.
+fn validate_desc(desc: &NslTensorDesc) -> Result<(u16, u8), String> {
+    let tag = capi_dtype_to_nsl(desc.dtype).ok_or_else(|| {
+        format!("unrecognized dtype tag {} (valid: {})", desc.dtype, CAPI_DTYPE_TAGS)
+    })?;
+    if !(0..=MAX_DESC_NDIM).contains(&desc.ndim) {
+        return Err(format!("ndim {} is outside 0..={MAX_DESC_NDIM}", desc.ndim));
+    }
+    let ndim = desc.ndim as usize;
+    if ndim > 0 && desc.shape.is_null() {
+        return Err(format!("ndim is {ndim} but the shape pointer is null"));
+    }
+    let mut numel: i64 = 1;
+    for i in 0..ndim {
+        let d = unsafe { std::ptr::read_unaligned(desc.shape.add(i)) };
+        if d < 0 {
+            return Err(format!("dimension {i} is {d}"));
+        }
+        numel = numel
+            .checked_mul(d)
+            .ok_or_else(|| format!("the shape's element count overflows at dimension {i}"))?;
+    }
+    if (numel as u64).checked_mul(capi_element_size(tag) as u64).is_none_or(|b| b > isize::MAX as u64) {
+        return Err(format!("{numel} elements of {} do not fit in memory", capi_dtype_name(tag as i64)));
+    }
+    if numel > 0 && desc.data.is_null() {
+        return Err(format!("{numel} elements but the data pointer is null"));
+    }
+    if !desc.strides.is_null() {
+        for i in 0..ndim {
+            let st = unsafe { std::ptr::read_unaligned(desc.strides.add(i)) };
+            if st < 0 {
+                return Err(format!("stride {i} is {st}; negative strides are not supported"));
+            }
+        }
+    }
+    let device = match desc.device_type {
+        0 => 0u8,
+        1 if (0..=254).contains(&desc.device_id) => desc.device_id as u8 + 1,
+        1 => return Err(format!("CUDA device id {} is outside 0..=254", desc.device_id)),
+        t => return Err(format!("device_type {t} is neither 0 (CPU) nor 1 (CUDA)")),
+    };
+    Ok((tag, device))
 }
 
 /// Validate a canonical internal dtype tag for export through the C API.
@@ -142,7 +233,7 @@ thread_local! {
     static LAST_ERROR: RefCell<Option<std::ffi::CString>> = const { RefCell::new(None) };
 }
 
-fn set_error(msg: String) {
+pub(crate) fn set_error(msg: String) {
     // `new` rejects interior nulls — strip them instead of panicking in the
     // FFI surface.
     let cleaned: String = msg.chars().filter(|c| *c != '\0').collect();
@@ -1119,18 +1210,17 @@ pub extern "C" fn nsl_model_call_dlpack(
             let managed = unsafe { &*dl };
             let ptr = crate::dlpack::dlpack_to_nsl_tensor(managed);
             if ptr == 0 {
-                let dt = managed.dl_tensor.dtype;
                 // Free the inputs imported before the bad one — an early
                 // return must not leak the tensors that already succeeded.
                 for &p in &input_tensor_ptrs {
                     crate::tensor::nsl_tensor_free(p);
                 }
-                set_error(format!(
-                    "nsl_model_call_dlpack: input {i} has an unsupported DLPack dtype \
-                     (code={}, bits={}, lanes={}); supported: float64/float32/float16, \
-                     bfloat16, int8, int32 (DLPack code 0=int, 1=uint, 2=float, 4=bfloat)\0",
-                    dt.code, dt.bits, dt.lanes
-                ));
+                // The import set the reason (dtype, device or layout); this
+                // used to report every refusal as an unsupported dtype.
+                let why = LAST_ERROR
+                    .with(|e| e.borrow().as_ref().map(|c| c.to_string_lossy().into_owned()))
+                    .unwrap_or_default();
+                set_error(format!("nsl_model_call_dlpack: input {i}: {why}"));
                 return -1;
             }
             input_tensor_ptrs.push(ptr);
@@ -1591,6 +1681,7 @@ pub fn desc_to_nsl_tensor_pub(desc: &NslTensorDesc) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_desc_to_tensor(desc_ptr: i64) -> i64 {
     if desc_ptr == 0 {
+        set_error("nsl_desc_to_tensor: null NslTensorDesc pointer".to_string());
         return 0;
     }
     // A misaligned pointer cannot be an `NslTensorDesc*`. Dereferencing it is
@@ -1607,6 +1698,103 @@ pub extern "C" fn nsl_desc_to_tensor(desc_ptr: i64) -> i64 {
     }
     let desc = unsafe { &*(desc_ptr as *const NslTensorDesc) };
     desc_to_nsl_tensor(desc)
+}
+
+/// The declared dtype and device of an `@export` tensor, as the wrapper
+/// passes them: a C API tag (`0..=9`) or `-1` when the declaration names no
+/// runtime dtype, and `0` (CPU), `1` (CUDA) or `-1` (any device).
+fn check_declared(tag: i64, device: u8, expected_dtype: i64, expected_device: i64) -> Result<(), String> {
+    if expected_dtype >= 0 && tag != expected_dtype {
+        return Err(format!(
+            "dtype tag {tag} ({}) where the export declares {} ({})",
+            capi_dtype_name(tag),
+            expected_dtype,
+            capi_dtype_name(expected_dtype)
+        ));
+    }
+    let on_gpu = device > 0;
+    match expected_device {
+        0 if on_gpu => Err("a CUDA tensor where the export declares cpu".to_string()),
+        1 if !on_gpu => Err("a CPU tensor where the export declares cuda".to_string()),
+        _ => Ok(()),
+    }
+}
+
+/// [`nsl_desc_to_tensor`] that also holds the descriptor to the `@export`
+/// declaration (C5 step 6). The wrapper used to discard the declared dtype,
+/// so a mislabelled buffer reached the implementation: an f64 buffer under
+/// an f32 declaration computed garbage, and an int tag hit an `assert_eq!`
+/// inside `extern "C"` and aborted the host. Returns 0 with the error set.
+#[unsafe(no_mangle)]
+pub extern "C" fn nsl_desc_to_tensor_expect(desc_ptr: i64, expected_dtype: i64, expected_device: i64) -> i64 {
+    if desc_ptr == 0 {
+        set_error("null NslTensorDesc pointer".to_string());
+        return 0;
+    }
+    if !(desc_ptr as usize).is_multiple_of(std::mem::align_of::<NslTensorDesc>()) {
+        set_error(format!(
+            "{desc_ptr:#x} is not an NslTensorDesc pointer (not {}-byte aligned)",
+            std::mem::align_of::<NslTensorDesc>()
+        ));
+        return 0;
+    }
+    let desc = unsafe { &*(desc_ptr as *const NslTensorDesc) };
+    let (tag, device) = match validate_desc(desc) {
+        Ok(v) => v,
+        Err(e) => {
+            set_error(e);
+            return 0;
+        }
+    };
+    if let Err(e) = check_declared(tag as i64, device, expected_dtype, expected_device) {
+        set_error(format!("{e}; convert it before the call"));
+        return 0;
+    }
+    desc_to_nsl_tensor(desc)
+}
+
+/// The return-side check for an `@export` result: the tensor's tag and
+/// device against the declaration, before `nsl_tensor_to_desc_ffi` hands
+/// them to the host. The desc carries the runtime tag, so a result whose
+/// tag differs from the declaration used to reach the host as mislabelled
+/// memory under the declared signature. Returns 0, or -1 with the error set.
+#[unsafe(no_mangle)]
+pub extern "C" fn nsl_export_check_result(tensor_ptr: i64, expected_dtype: i64, expected_device: i64) -> i64 {
+    if tensor_ptr == 0 {
+        set_error("the implementation returned a null tensor".to_string());
+        return -1;
+    }
+    let tensor = NslTensor::from_ptr(tensor_ptr);
+    if capi_dtype_to_nsl(tensor.dtype as i32).is_none() {
+        set_error(format!(
+            "the result has internal dtype tag {}, which has no C API representation (valid: {})",
+            tensor.dtype, CAPI_DTYPE_TAGS
+        ));
+        return -1;
+    }
+    match check_declared(tensor.dtype as i64, tensor.device, expected_dtype, expected_device) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_error(format!("{e}; the implementation returns a tensor its signature does not describe"));
+            -1
+        }
+    }
+}
+
+/// Prefix the current error with `ctx` ("parameter 'x' of 'f'"), so a
+/// wrapper's refusal names the parameter without discarding the runtime's
+/// reason. With no error set, `ctx` becomes the error.
+#[unsafe(no_mangle)]
+pub extern "C" fn nsl_error_add_context_cstr(ctx_ptr: i64) {
+    if ctx_ptr == 0 {
+        return;
+    }
+    let ctx = unsafe { CStr::from_ptr(ctx_ptr as *const c_char).to_string_lossy().into_owned() };
+    let old = LAST_ERROR.with(|e| e.borrow().as_ref().map(|c| c.to_string_lossy().into_owned()));
+    set_error(match old {
+        Some(o) if !o.is_empty() => format!("{ctx}: {o}"),
+        _ => ctx,
+    });
 }
 
 /// C-ABI version of `nsl_tensor_to_desc` for use by Cranelift-emitted
@@ -2017,21 +2205,18 @@ pub extern "C" fn nsl_dispatch_apply_scalar_result(src_desc_ptr: i64, dst_desc_p
 /// the monotonicity invariant; the debug-assert below catches any future
 /// regression that violates it.
 pub(crate) fn desc_to_nsl_tensor(desc: &NslTensorDesc) -> i64 {
-    let ndim = desc.ndim as usize;
-    // Returns 0 (not abort) on an out-of-range tag — see `capi_dtype_to_nsl`.
+    // Returns 0 (not abort) on a malformed descriptor -- see `validate_desc`.
     // Every caller must treat 0 as a failure; the codegen-emitted `@export`
     // wrappers do so via the null guard `c_wrapper::emit_null_tensor_guard`
-    // emits after each `nsl_desc_to_tensor` call.
-    let nsl_dtype = match capi_dtype_to_nsl(desc.dtype) {
-        Some(d) => d,
-        None => {
-            set_error(format!(
-                "desc_to_nsl_tensor: unrecognized dtype tag {} (valid: {})\0",
-                desc.dtype, CAPI_DTYPE_TAGS
-            ));
+    // emits after each import.
+    let (nsl_dtype, device) = match validate_desc(desc) {
+        Ok(v) => v,
+        Err(e) => {
+            set_error(format!("desc_to_nsl_tensor: {e}"));
             return 0;
         }
     };
+    let ndim = desc.ndim as usize;
 
     let shape_ptr = checked_alloc(ndim * std::mem::size_of::<i64>()) as *mut i64;
     for i in 0..ndim {
@@ -2053,7 +2238,6 @@ pub(crate) fn desc_to_nsl_tensor(desc: &NslTensorDesc) -> i64 {
     };
 
     let len = NslTensor::total_elements(shape_ptr, desc.ndim as i64);
-    let device = if desc.device_type > 0 { desc.device_id as u8 + 1 } else { 0 };
     capi_trace(format!(
         "desc_to_tensor ndim={} len={} device={} dtype={} tape_id={}",
         desc.ndim,
@@ -2253,11 +2437,45 @@ mod tests {
         assert_eq!(version_str, format!("NSL {}", env!("CARGO_PKG_VERSION")));
     }
 
+    /// C5 step 6: the declared device is checked before the tensor is built,
+    /// and a descriptor that fails it sets the reason.
+    #[test]
+    fn a_descriptor_on_the_wrong_device_is_refused() {
+        let data = [1.0f32; 4];
+        let mut shape = [4i64];
+        let mut d = NslTensorDesc {
+            data: data.as_ptr() as *mut c_void,
+            shape: shape.as_mut_ptr(),
+            strides: std::ptr::null_mut(),
+            ndim: 1,
+            dtype: 1,
+            device_type: 0,
+            device_id: 0,
+            tape_id: 0,
+        };
+        let read = || unsafe { CStr::from_ptr(nsl_get_last_error() as *const c_char) }.to_string_lossy().into_owned();
+        assert_eq!(nsl_desc_to_tensor_expect(&d as *const _ as i64, 1, 1), 0);
+        assert!(read().contains("a CPU tensor where the export declares cuda"), "{}", read());
+        d.device_type = 1;
+        assert_eq!(nsl_desc_to_tensor_expect(&d as *const _ as i64, 1, 0), 0);
+        assert!(read().contains("a CUDA tensor where the export declares cpu"), "{}", read());
+        d.device_type = 0;
+        let t = nsl_desc_to_tensor_expect(&d as *const _ as i64, 1, -1);
+        assert_ne!(t, 0, "{}", read());
+        crate::tensor::nsl_tensor_free(t);
+        nsl_clear_error();
+        nsl_error_add_context_cstr(c"parameter 'x' of 'f'".as_ptr() as i64);
+        assert_eq!(read(), "parameter 'x' of 'f'");
+    }
+
     #[test]
     fn test_dtype_mapping() {
-        // P4 item 16: the C API tag space IS the canonical tag space — both
-        // chokepoints are validating identity maps.
-        let last = crate::tensor::DTYPE_INT8_BLOCKWISE as i32; // 10
+        // P4 item 16: the C API tag space is the canonical tag space up to
+        // int32 -- both chokepoints are validating identity maps. Tag 10
+        // (int8_blockwise) is internal: its buffer is not `len` bytes, so a
+        // host desc carrying it is refused (C5 step 6).
+        let last = crate::tensor::DTYPE_I32 as i32; // 9
+        assert_eq!(capi_dtype_to_nsl(crate::tensor::DTYPE_INT8_BLOCKWISE as i32), None);
         for capi_d in 0..=last {
             let nsl_d = capi_dtype_to_nsl(capi_d)
                 .unwrap_or_else(|| panic!("tag {capi_d} must be accepted"));

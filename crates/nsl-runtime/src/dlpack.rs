@@ -356,36 +356,93 @@ pub fn nsl_tensor_to_dlpack_owned(
 /// responsible for keeping the DLManagedTensor alive while the NslTensor
 /// is in use, then calling the DLManagedTensor's deleter.
 ///
-/// Returns null (0) if the DLPack dtype is unsupported OR the device type
-/// is one NSL cannot address (see `dl_device_to_nsl` — unknown backends
-/// used to silently map to CPU, turning e.g. a Metal buffer into a wild
-/// CPU pointer).
+/// Returns null (0) with the C API error set when the tensor cannot be
+/// imported faithfully (see [`validate_dl_tensor`]).
 pub fn dlpack_to_nsl_tensor(managed: &DLManagedTensor) -> i64 {
-    let dl = &managed.dl_tensor;
+    match import_dl_tensor(&managed.dl_tensor) {
+        Ok(t) => t,
+        Err(e) => {
+            crate::c_api::set_error(format!("DLPack import refused: {e}"));
+            0
+        }
+    }
+}
 
-    let nsl_dtype = match dl_dtype_to_nsl(&dl.dtype) {
-        Some(d) => d,
-        None => return 0,
-    };
-    let device = match dl_device_to_nsl(&dl.device) {
-        Some(d) => d,
-        None => return 0,
-    };
+/// The most dimensions an imported tensor may claim (it bounds the shape
+/// and stride reads and allocations a producer controls).
+const MAX_DL_NDIM: c_int = 64;
 
+/// Everything about a producer's `DLTensor` the import would otherwise
+/// trust (C5 step 6). The import used to check only the dtype code/bits and
+/// the device type: `lanes` was ignored (a vector dtype imported as its
+/// scalar), a negative `ndim` reached `from_raw_parts`, a null shape was
+/// read through `compute_strides`, the element count could overflow,
+/// `byte_offset` was added unchecked, and a CUDA `device_id` of -1 or 255
+/// wrapped to the CPU. Returns the tag, the device byte and the element
+/// count.
+fn validate_dl_tensor(dl: &DLTensor) -> Result<(u16, u8, i64), String> {
+    let dt = dl.dtype;
+    let tag = dl_dtype_to_nsl(&dt).filter(|_| dt.lanes == 1).ok_or_else(|| {
+        format!(
+            "unsupported dtype (code={}, bits={}, lanes={}); supported: float64/float32/float16, \
+             bfloat16, int8, int32 with lanes=1 (DLPack code 0=int, 1=uint, 2=float, 4=bfloat)",
+            dt.code, dt.bits, dt.lanes
+        )
+    })?;
+    let device = match (dl.device.device_type, dl.device.device_id) {
+        (KDL_CUDA, id) if !(0..=254).contains(&id) => {
+            return Err(format!("CUDA device id {id} is outside 0..=254"));
+        }
+        _ => dl_device_to_nsl(&dl.device)
+            .ok_or_else(|| format!("device type {} is not addressable", dl.device.device_type))?,
+    };
+    if !(0..=MAX_DL_NDIM).contains(&dl.ndim) {
+        return Err(format!("ndim {} is outside 0..={MAX_DL_NDIM}", dl.ndim));
+    }
+    let ndim = dl.ndim as usize;
+    if ndim > 0 && dl.shape.is_null() {
+        return Err(format!("ndim is {ndim} but the shape pointer is null"));
+    }
+    let mut numel: i64 = 1;
+    for i in 0..ndim {
+        let d = unsafe { *dl.shape.add(i) };
+        if d < 0 {
+            return Err(format!("dimension {i} is {d}"));
+        }
+        numel = numel
+            .checked_mul(d)
+            .ok_or_else(|| format!("the shape's element count overflows at dimension {i}"))?;
+    }
+    let elem = crate::tensor::dtype_element_size(tag) as u64;
+    if (numel as u64).checked_mul(elem).is_none_or(|b| b > isize::MAX as u64) {
+        return Err(format!("{numel} elements do not fit in memory"));
+    }
+    if !dl.strides.is_null() {
+        for i in 0..ndim {
+            let st = unsafe { *dl.strides.add(i) };
+            if st < 0 {
+                return Err(format!("stride {i} is {st}; negative strides are not supported"));
+            }
+        }
+    }
+    if numel > 0 && dl.data.is_null() {
+        return Err(format!("{numel} elements but the data pointer is null"));
+    }
+    if dl.byte_offset > isize::MAX as u64 || !dl.byte_offset.is_multiple_of(elem) {
+        return Err(format!(
+            "byte_offset {} is not a multiple of the {elem}-byte element",
+            dl.byte_offset
+        ));
+    }
+    Ok((tag, device, numel))
+}
+
+fn import_dl_tensor(dl: &DLTensor) -> Result<i64, String> {
+    let (nsl_dtype, device, len) = validate_dl_tensor(dl)?;
     let ndim = dl.ndim as usize;
 
-    // Compute total element count from shape.
-    let len: i64 = if ndim == 0 {
-        1
-    } else if dl.shape.is_null() {
-        0
-    } else {
-        let shape_slice = unsafe { std::slice::from_raw_parts(dl.shape, ndim) };
-        shape_slice.iter().product()
-    };
-
     // Copy shape into NSL-managed memory.
-    let shape_ptr = if ndim > 0 && !dl.shape.is_null() {
+    let shape_ptr = if ndim > 0 {
         let ptr = checked_alloc(ndim * std::mem::size_of::<i64>()) as *mut i64;
         unsafe { std::ptr::copy_nonoverlapping(dl.shape, ptr, ndim); }
         ptr
@@ -407,8 +464,13 @@ pub fn dlpack_to_nsl_tensor(managed: &DLManagedTensor) -> i64 {
         std::ptr::null_mut()
     };
 
-    // Compute the actual data pointer with byte_offset applied.
-    let data = unsafe { (dl.data as *mut u8).add(dl.byte_offset as usize) as *mut c_void };
+    // The data pointer with byte_offset applied (validated above). A null
+    // base only reaches here for an empty tensor, which is never read.
+    let data = if dl.data.is_null() {
+        dl.data
+    } else {
+        unsafe { (dl.data as *mut u8).add(dl.byte_offset as usize) as *mut c_void }
+    };
 
     let tensor = Box::new(NslTensor::new(
         data,
@@ -422,7 +484,7 @@ pub fn dlpack_to_nsl_tensor(managed: &DLManagedTensor) -> i64 {
         0,
     ));
 
-    Box::into_raw(tensor) as i64
+    Ok(Box::into_raw(tensor) as i64)
 }
 
 // ---------------------------------------------------------------------------
@@ -447,6 +509,7 @@ pub extern "C" fn nsl_dlpack_export(tensor_ptr: i64) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_dlpack_import(dlpack_ptr: i64) -> i64 {
     if dlpack_ptr == 0 {
+        crate::c_api::set_error("DLPack import refused: null DLManagedTensor pointer".to_string());
         return 0;
     }
     let managed = unsafe { &*(dlpack_ptr as *const DLManagedTensor) };
@@ -919,5 +982,63 @@ mod tests {
 
         nsl_dlpack_free(dlpack_ptr);
         unsafe { drop(Box::from_raw(imported_ptr as *mut NslTensor)); }
+    }
+
+    /// C5 step 6: every producer field the import used to trust. Each
+    /// malformed tensor differs from the well-formed f32 one in ONE field,
+    /// and the well-formed one imports, so each refusal is for its reason.
+    #[test]
+    fn import_validates_every_producer_field() {
+        let data = vec![0f32; 8];
+        let mut shape = vec![2i64, 4];
+        let mut neg_shape = vec![2i64, -4];
+        let mut huge_shape = vec![i64::MAX, 4];
+        let mut neg_strides = vec![4i64, -1];
+        let base = || DLTensor {
+            data: data.as_ptr() as *mut c_void,
+            device: DLDevice { device_type: KDL_CPU, device_id: 0 },
+            ndim: 2,
+            dtype: DLDataType { code: DLDataTypeCode::KDLFloat as u8, bits: 32, lanes: 1 },
+            shape: shape.as_ptr() as *mut i64,
+            strides: std::ptr::null_mut(),
+            byte_offset: 0,
+        };
+        let ok = base();
+        let t = import_dl_tensor(&ok).expect("the well-formed tensor imports");
+        unsafe { drop(Box::from_raw(t as *mut NslTensor)) };
+
+        let cases: Vec<(DLTensor, &str)> = vec![
+            (DLTensor { dtype: DLDataType { lanes: 2, ..ok.dtype }, ..base() }, "lanes=2"),
+            (DLTensor { ndim: -1, ..base() }, "ndim -1"),
+            (DLTensor { ndim: 65, ..base() }, "ndim 65"),
+            (DLTensor { shape: std::ptr::null_mut(), ..base() }, "shape pointer is null"),
+            (DLTensor { shape: neg_shape.as_mut_ptr(), ..base() }, "dimension 1 is -4"),
+            (DLTensor { shape: huge_shape.as_mut_ptr(), ..base() }, "overflows"),
+            (DLTensor { strides: neg_strides.as_mut_ptr(), ..base() }, "stride 1 is -1"),
+            (DLTensor { data: std::ptr::null_mut(), ..base() }, "data pointer is null"),
+            (DLTensor { byte_offset: 2, ..base() }, "byte_offset 2"),
+            (
+                DLTensor { device: DLDevice { device_type: KDL_CUDA, device_id: 255 }, ..base() },
+                "device id 255",
+            ),
+            (
+                DLTensor { device: DLDevice { device_type: KDL_CUDA, device_id: -1 }, ..base() },
+                "device id -1",
+            ),
+        ];
+        for (dl, why) in cases {
+            let err = import_dl_tensor(&dl).expect_err(why);
+            assert!(err.contains(why), "{why}: {err}");
+        }
+        // The FFI refusal sets the error instead of returning a bare 0.
+        let managed = DLManagedTensor {
+            dl_tensor: DLTensor { ndim: -1, ..base() },
+            manager_ctx: std::ptr::null_mut(),
+            deleter: None,
+        };
+        crate::c_api::nsl_clear_error();
+        assert_eq!(nsl_dlpack_import(&managed as *const _ as i64), 0);
+        let msg = unsafe { std::ffi::CStr::from_ptr(crate::c_api::nsl_get_last_error() as *const std::os::raw::c_char) };
+        assert!(msg.to_string_lossy().contains("ndim -1"), "{msg:?}");
     }
 }
