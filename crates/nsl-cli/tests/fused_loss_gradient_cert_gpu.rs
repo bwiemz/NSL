@@ -148,7 +148,7 @@ fn fd_grad(p: &[Vec<f64>], f: fn(&[Vec<f64>]) -> f64) -> Vec<Vec<f64>> {
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn fused_linear_ce_step() {
-    let Some((stdout, stderr)) = run(&program(), "lce") else { return };
+    let (stdout, stderr) = run(&program(), "lce");
 
     // The fused path ran, under source AD, with no tape fallback.
     assert!(stderr.contains("Using source-to-source AD for backward pass"), "{stderr}");
@@ -167,13 +167,12 @@ fn fused_linear_ce_step() {
     compare(&before, &after, &["dx", "dW", "db"], |q| fd_grad(q, LCE));
 }
 
-/// Run `src` with `nsl run --source-ad` on the GPU. `None` when there is no
-/// CUDA driver (the gate is GPU-only; the cert lane has one).
-fn run(src: &str, tag: &str) -> Option<(String, String)> {
+/// Run `src` with `nsl run --source-ad` on the GPU; its (stdout, stderr).
+fn run(src: &str, tag: &str) -> (String, String) {
     run_env(src, tag, &[])
 }
 
-fn run_env(src: &str, tag: &str, env: &[(&str, &str)]) -> Option<(String, String)> {
+fn run_env(src: &str, tag: &str, env: &[(&str, &str)]) -> (String, String) {
     let root = repo_root();
     let tmp = std::env::temp_dir().join(format!("nsl_fused_cert_{tag}_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
@@ -194,12 +193,10 @@ fn run_env(src: &str, tag: &str, env: &[(&str, &str)]) -> Option<(String, String
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     );
-    if stderr.contains("CUDA driver") && stderr.contains("not found") {
-        eprintln!("SKIP: no CUDA driver");
-        return None;
-    }
+    // No skip on a missing driver: these run only in the GPU cert lane, where
+    // a skip would report an unrun certificate as passing.
     assert!(out.status.success(), "the program failed:\nstdout:\n{stdout}\nstderr:\n{stderr}");
-    Some((stdout, stderr))
+    (stdout, stderr)
 }
 
 /// `(before - after) / LR` for each operand against `oracle`'s f64 gradient
@@ -346,7 +343,7 @@ fn kl_loss(p: &[Vec<f64>]) -> f64 {
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn fused_kl_ce_step() {
-    let Some((stdout, stderr)) = run(&kl_program(), "klce") else { return };
+    let (stdout, stderr) = run(&kl_program(), "klce");
     assert!(stderr.contains("Using source-to-source AD"), "{stderr}");
     assert!(!stderr.contains("falling back to tape-based AD"), "{stderr}");
     assert!(
@@ -544,9 +541,7 @@ fn packed_loss(q: &[f64], k: &[f64], v: &[f64], r: &[f64]) -> f64 {
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn sdpa_packed_step() {
-    let Some((stdout, stderr)) = run_env(&packed_program(), "packed", &[("NSL_FLASH_DEBUG", "1")]) else {
-        return;
-    };
+    let (stdout, stderr) = run_env(&packed_program(), "packed", &[("NSL_FLASH_DEBUG", "1")]);
     assert!(stderr.contains("Using source-to-source AD for backward pass"), "{stderr}");
     assert!(!stderr.contains("falling back to tape-based AD"), "{stderr}");
     assert!(between(&stdout, "FUSED")[0] >= 1.0, "the fused packed forward must have launched:\n{stderr}");

@@ -1036,9 +1036,10 @@ fn certificates_match_the_codegen_inventory() {
         let at = gpu_src
             .find(&format!("\nfn {n}() {{"))
             .unwrap_or_else(|| panic!("GPU certificate `{n}` has no test fn in fused_loss_gradient_cert_gpu.rs"));
+        let attrs = gpu_src[..at].trim_end();
         assert!(
-            gpu_src[..at].trim_end().ends_with(gpu_attr),
-            "GPU certificate `{n}` must carry {gpu_attr}, so the cert lane runs it"
+            attrs.ends_with(gpu_attr) && attrs[..attrs.len() - gpu_attr.len()].trim_end().ends_with("#[test]"),
+            "GPU certificate `{n}` must be a #[test] carrying {gpu_attr}, so the cert lane runs it"
         );
         assert!(claimed.contains(n), "GPU certificate `{n}` is not named by any PrimalOp status");
     }
