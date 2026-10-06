@@ -1828,8 +1828,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - **Checkpoints survive a crash during the save, and the sidecar pairs with
   the whole model file** (external review 2026-10-06).
   - `model_save` wrote the `.nslm` in place, so a crash mid-write destroyed
-    the previous checkpoint. It now writes `<path>.tmp`, fsyncs it, and
-    renames it into place.
+    the previous checkpoint. It now writes a temporary unique to the process
+    and call (`<path>.tmp.<pid>.<n>`, so two processes saving one path
+    cannot take each other's file away), fsyncs it, and renames it into
+    place.
   - `train_checkpoint_save` already used temporaries but renamed them
     without an fsync and with nothing to undo a half-finished commit: a
     crash between the two renames left the new model beside the old

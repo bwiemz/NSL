@@ -281,3 +281,33 @@ fn zz_structural_child() {
     }
     eprintln!("CHILD_LOADED");
 }
+
+/// Two saves of the same path at once must both commit. The temporary used
+/// to be `<path>.tmp` for every writer, so one writer's rename took the
+/// other's file away and its rename failed -- an abort, seen when a test ran
+/// one fixture twice in parallel. Each save now writes its own temporary.
+#[test]
+fn concurrent_saves_of_one_path_both_commit() {
+    let path = scratch("concurrent.nslm");
+    let threads: Vec<_> = (0..4)
+        .map(|k| {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                for i in 0..25 {
+                    let (t, _) = cpu_tensor(&f32_bytes((k * 100 + i) as f32, 4), &[2, 2], DTYPE_F32);
+                    save_many(&path, &[("a", t)]);
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().expect("a save thread panicked");
+    }
+    // The last commit is one complete file from some writer.
+    let (dst, _) = cpu_tensor(&[0u8; 16], &[2, 2], DTYPE_F32);
+    load_named(&path, &[("a", dst)]);
+    let dir = path.parent().unwrap();
+    let left: Vec<_> = std::fs::read_dir(dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
+    assert_eq!(left.len(), 1, "no temporary may be left behind: {left:?}");
+    let _ = std::fs::remove_dir_all(dir);
+}

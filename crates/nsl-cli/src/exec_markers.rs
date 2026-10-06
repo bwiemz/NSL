@@ -548,6 +548,15 @@ pub struct NegativeNeedle {
 /// fail at all, so each is pinned.
 pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
     NegativeNeedle {
+        test: "crates/nsl-cli/tests/train_checkpoint_gate.rs",
+        asserts: "a resume refused because the model's parameters were reordered \
+                  never reports a completed resume",
+        parts: &[
+            // nsl_log!(INFO, "checkpoint", "[checkpoint] resumed: {path} ...")
+            ("[checkpoint] resumed:", "crates/nsl-runtime/src/checkpoint.rs"),
+        ],
+    },
+    NegativeNeedle {
         test: "crates/nsl-cli/tests/dropout_backward_parity_gate.rs",
         asserts: "the pre-2026-08-16 wrong-backward dropout warning \
                   (\"[source-ad] WARNING: dropout\") never returns. TOMBSTONE: \

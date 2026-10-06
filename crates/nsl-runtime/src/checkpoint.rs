@@ -97,8 +97,13 @@ pub extern "C" fn nsl_model_save(
     // Written to a temporary and committed by rename, so an interrupted save
     // leaves the previous file intact: `File::create` on the final path used
     // to truncate it before the first byte was written (external review
-    // 2026-10-06).
-    let tmp = format!("{path}.tmp");
+    // 2026-10-06). The temporary is unique to this process and call: two
+    // processes saving the same path (a test running one fixture twice in
+    // parallel) would otherwise share it, and one's rename would take the
+    // other's file away mid-commit. A crash leaves the temporary behind.
+    static SAVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SAVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = format!("{path}.tmp.{}.{seq}", std::process::id());
     let mut file = match std::fs::File::create(&tmp) {
         Ok(f) => f,
         Err(e) => {
