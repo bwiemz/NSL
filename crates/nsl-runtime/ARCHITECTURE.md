@@ -33,7 +33,7 @@ Boundary fuzz/property tests live in `src/fuzz.rs` (`cfg(test)`).
 Modules are declared at the crate root (keeping `nsl_runtime::foo` paths stable)
 and re-surfaced through facade namespaces in `lib.rs`. Facade names avoid
 colliding with the real `autodiff`/`data`/`serving`/`peft` modules and with the
-`core` extern-prelude crate (`unikernel` uses bare `core::arch`).
+`core` extern-prelude crate.
 
 | Facade | Responsibility | Representative modules |
 |--------|----------------|------------------------|
@@ -49,7 +49,7 @@ colliding with the real `autodiff`/`data`/`serving`/`peft` modules and with the
 | `observability` | Profiling / tracing / health | `profiler`, `profiling`, `kernel_profiler`, `tensor_trace`, `trace_diff`, `health`, `inspect`, `deterministic_ops` |
 | `ffi` | Always-on interop | `c_api`, `dlpack`, `weight_provider` |
 | `interop` (`feature = "interop"`) | Optional framework bridges | `safetensors_io`, `huggingface`, `onnx`, `onnx_proto`, `weight_map`, `trace` |
-| `experimental` | Research subsystems (**unstable**) | `cfie`, `cpdt`, `sparse`, `multimodal`, `unikernel`, `agent` |
+| `experimental` | Research subsystems (**unstable**) | `cfie`, `cpdt`, `sparse`, `multimodal`, `agent` |
 
 ## Feature flags
 

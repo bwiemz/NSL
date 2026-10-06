@@ -296,10 +296,8 @@ block_kv with fused projections) are rejected at compile time.
 - C API: `nsl build --shared-lib` for model lifecycle management
 - Safetensors import/export
 
-### Unikernel (M54)
-- `nsl build --unikernel` for bare-metal deployment
-- Memory layout computation and linker script generation
-- Hypervisor targets: KVM, Firecracker
+### Unikernel (M54) — removed
+- Removed in the Phase 0.6 scope freeze (`nsl build --unikernel`, `--listen`, `--memory` are gone); preserved at tag `attic/scope-freeze-2026-10`
 
 ### ZK Inference (M55)
 - `@zk_proof(mode="weight_private")` decorator
@@ -396,7 +394,7 @@ Milestone work from M9-M55 is present in the repo, with maturity ranging from pr
 | v1.0 | M56-M62 | Multi-agent, FPGA, elastic fault tolerance, cluster debugging |
 | v1.1 | M63-M64 | Compiled MCTS tree search, online DPO alignment |
 | v1.2 | M65-M67 | Ternary 1.58-bit types, format-agnostic sparsity, neuromorphic |
-| v1.3 | M68-M71 | Refinement types (Z3 SMT), phase-split inference, unikernels, universal ZKML |
+| v1.3 | M68-M71 | Refinement types (Z3 SMT), phase-split inference, universal ZKML |
 
 See [docs/plans/](docs/plans/) for detailed designs and [docs/research/](docs/research/) for the supporting research set.
 

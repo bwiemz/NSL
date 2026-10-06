@@ -314,9 +314,6 @@ pub mod fused_linear_ce;
 // CPKD: fused KL-CE distillation loss (teacher+student LM heads + KL + CE in one kernel)
 pub mod fused_kl_ce;
 
-// M54: Unikernel runtime (bare-metal deployment)
-pub mod unikernel;
-
 // M62: Legacy Interop — DLPack bridge + C API
 pub mod dlpack;
 pub mod c_api;
@@ -339,7 +336,7 @@ mod fuzz;
 
 // Facade names are chosen to avoid colliding with real crate-root modules
 // (`autodiff`, `data`, `serving`, `peft`) and with the `core` extern-prelude
-// crate (`unikernel` uses bare `core::arch` paths).
+// crate.
 
 /// Language builtins and the base runtime: scalars, strings, containers,
 /// tensors, memory, and process I/O.
@@ -425,5 +422,5 @@ pub mod interop {
 /// Experimental research subsystems. **APIs here are unstable** and may change
 /// or be removed between releases.
 pub mod experimental {
-    pub use crate::{agent, cfie, cpdt, multimodal, sparse, unikernel};
+    pub use crate::{agent, cfie, cpdt, multimodal, sparse};
 }

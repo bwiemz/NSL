@@ -23,7 +23,7 @@
 //! - [`analysis`] — cost model, autotuning, fusion, memory planning, WCET,
 //!   FlashAttention codegen, calibration.
 //! - [`experimental`] — research subsystems (CEP, CFIE, CSHA, WGGO, WRGA,
-//!   FASE, ZK, FPGA, unikernel, sparse, speculative, multimodal). These APIs
+//!   FASE, ZK, FPGA, sparse, speculative, multimodal). These APIs
 //!   are **not stable** and may change or be removed between releases.
 //!
 //! These facades re-export the same modules that remain available at the crate
@@ -247,8 +247,6 @@ pub mod fase_optimizer;
 pub mod multimodal;
 pub mod sparse;
 pub mod speculative;
-pub mod unikernel;
-pub mod unikernel_boot;
 pub mod wggo;
 pub mod wggo_apply;
 pub mod wggo_cfie;
@@ -363,7 +361,7 @@ pub mod experimental {
         cfie_kv_quant, cfie_persistent, cfie_speculative, csha, csha_apply,
         csha_boundary, csha_patterns, csha_pipeline, csha_specialize, fase,
         fase_clip, fase_codegen_table, fase_memory, fase_optimizer, multimodal,
-        sparse, speculative, unikernel, unikernel_boot, wggo, wggo_apply,
+        sparse, speculative, wggo, wggo_apply,
         wggo_conflicts, wggo_cost, wggo_dp, wggo_gradient_scorer, wggo_graph,
         wggo_ilp, wggo_overrides, wggo_prune, wggo_schedule, wggo_weight_analysis,
         wggo_weight_analysis_cache, wggo_weight_analysis_nslweights, wrga,
@@ -2047,8 +2045,6 @@ pub struct CompileOptions {
     /// Weight-aware compilation (`--weights`, the M52 config, the analysis
     /// report) and the `@export` weight-index map; see [`WeightsOptions`].
     pub weights: WeightsOptions,
-    /// M54: Unikernel build configuration (None = normal build)
-    pub unikernel_config: Option<crate::unikernel::UnikernelConfig>,
     /// M53: Worst-case-execution-time analysis / certification options.
     pub wcet: WcetOptions,
     /// M38a: Enable linear types ownership checking.
@@ -2332,7 +2328,6 @@ impl Default for CompileOptions {
             source_ad: false,
             determinism: DeterminismOptions::default(),
             weights: WeightsOptions::default(),
-            unikernel_config: None,
             wcet: WcetOptions::default(),
             linear_types_enabled: false,
             analysis: AnalysisOptions::default(),

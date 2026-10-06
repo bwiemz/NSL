@@ -170,7 +170,8 @@ tests that are *not* part of the green-build contract (see README → Benchmarks
   refused at compile time.
 - **FPGA / Verilog** — HDL backend (Yosys/Verilator nightly job). See
   [`docs/hardware/fpga_status.md`](docs/hardware/fpga_status.md).
-- **Unikernel** — `nsl build --unikernel` deployment target.
+- **Unikernel** (M54) — **Removed** in the Phase 0.6 scope freeze; preserved at
+  tag `attic/scope-freeze-2026-10`.
 - **Distributed** — tensor / pipeline / context parallelism, MoE serving.
 - **Inference serving** — speculative decoding, paged KV, disaggregated serving.
 - **Non-CUDA GPU backends** — AMDGPU/ROCm, Metal, WGSL/WebGPU KIR are built but

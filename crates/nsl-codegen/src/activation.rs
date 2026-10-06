@@ -319,8 +319,6 @@ pub static UNCONTRACTED_FLAGS: &[(&str, &str)] = &[
     ("dump-types", "debug dump plumbing"),
     ("shared-lib", "build-flavor selector (dispatches to run_build_shared)"),
     ("standalone", "build-flavor selector (dispatches to run_build_standalone)"),
-    ("unikernel", "build-flavor selector (M54)"),
-    ("listen", "serve-mode selector"),
     ("trace", "refused on nsl check (see commands/check.rs); nsl debug owns traces"),
     (
         "distribute",

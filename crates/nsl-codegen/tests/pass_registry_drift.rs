@@ -454,7 +454,7 @@ fn every_pass_prefixed_cli_flag_is_registered() {
         "cep_", "cfie_", "checkpoint_",
     ];
     // Exactly-named flags that are a pass's own switch rather than prefixed.
-    const PASS_EXACT: &[&str] = &["wggo", "csha", "cpdt", "cfie", "memory"];
+    const PASS_EXACT: &[&str] = &["wggo", "csha", "cpdt", "cfie"];
 
     let mut unregistered: Vec<&String> = all
         .iter()
@@ -749,7 +749,6 @@ const NOT_A_PASS: &[(&str, &str)] = &[
     ("training_report", "training report emission"),
     ("transient_arena", "transient-memory arena (roadmap item 4)"),
     ("types", "type machinery"),
-    ("unikernel", "M54 unikernel targets"),
     ("use_count", "dead use-count analysis (zero readers since 5e2740bc)"),
     ("vmap", "M39 vmap"),
     ("wcet", "M53 worst-case execution time"),

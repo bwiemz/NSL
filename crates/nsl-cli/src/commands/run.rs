@@ -475,7 +475,6 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     // run_build_single (where analysis is in scope).
                     ..Default::default()
                 },
-                unikernel_config: None,
                 wcet: nsl_codegen::WcetOptions {
                     enabled: wcet,
                     gpu,

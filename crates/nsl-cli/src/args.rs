@@ -785,18 +785,6 @@ pub(crate) struct BuildArgs {
         #[arg(long)]
         pub(crate) shared_lib: bool,
 
-        /// M54: Build as a bare-metal unikernel image
-        #[arg(long)]
-        pub(crate) unikernel: bool,
-
-        /// M54: Unikernel listen address (default: "0.0.0.0:8080")
-        #[arg(long, default_value = "0.0.0.0:8080")]
-        pub(crate) listen: String,
-
-        /// M54: Unikernel total memory (e.g., "16G", "512M"). 0 or omitted = auto-detect at boot.
-        #[arg(long)]
-        pub(crate) memory: Option<String>,
-
         /// M53: Enable WCET analysis for @real_time functions
         #[arg(long)]
         pub(crate) wcet: bool,

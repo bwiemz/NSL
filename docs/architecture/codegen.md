@@ -86,7 +86,7 @@ later emission consults.
                      nsl-cli: linker::link / link_multi / link_shared_with_exports
                               c_header::emit for --shared-lib     src/linker.rs, src/c_header.rs
                                         ▼
-                     executable · shared library (+ .h) · standalone · unikernel image
+                     executable · shared library (+ .h) · standalone
 ```
 
 The phases are literal method calls in `compile_returning_plan_impl`
@@ -319,8 +319,7 @@ The gates that make these declarations true: `crates/nsl-codegen/tests/pass_regi
   `crates/nsl-codegen/tests/exported_symbols_are_dlsym_findable.rs`,
   `crates/nsl-codegen/tests/export_table_runtime_ffis.rs`.
 - `src/standalone.rs` (`create_weight_object`) and `StandaloneConfig`
-  (`src/compiler/mod.rs`) back `nsl build --standalone`; `src/unikernel.rs` /
-  `src/unikernel_boot.rs` back `--unikernel`.
+  (`src/compiler/mod.rs`) back `nsl build --standalone`.
 
 ## Entry points and CompileOptions
 
@@ -937,7 +936,7 @@ Cargo feature at its `stmt.rs` entry), **CEP** `src/cep.rs`, **CFIE**
 **FASE** `src/fase.rs`, **ZK** `src/zk/` (`nsl zk`, Plonky3 and folding
 backends), **FPGA/HIR** `src/hir/` + `src/backend_verilog/` +
 `src/kernel_lower_fpga.rs` + `src/fpga_error.rs` (`nsl fpga-compile`),
-**WCET** `src/wcet.rs`, **unikernel** `src/unikernel.rs`, **sparse**
+**WCET** `src/wcet.rs`, **sparse**
 `src/sparse.rs`, **speculative** `src/speculative.rs`, **multimodal**
 `src/multimodal.rs`, **BitNet** `src/bitnet/`. Their APIs, flags and on-disk
 formats are not stable; see `STATUS.md` ("Experimental" and "Opting out of

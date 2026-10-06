@@ -242,9 +242,6 @@ nsl build [OPTIONS] <FILE>
 | `--no-dead-weight` |  |  | M52: Disable dead weight elimination |
 | `--no-sparse-codegen` |  |  | M52: Disable sparsity-aware codegen annotations |
 | `--shared-lib` |  |  | M62: Build as shared library (.so/.dylib/.dll) with stable C API |
-| `--unikernel` |  |  | M54: Build as a bare-metal unikernel image |
-| `--listen` | `<LISTEN>` | `0.0.0.0:8080` | M54: Unikernel listen address (default: "0.0.0.0:8080") |
-| `--memory` | `<MEMORY>` |  | M54: Unikernel total memory (e.g., "16G", "512M"). 0 or omitted = auto-detect at boot |
 | `--wcet` |  |  | M53: Enable WCET analysis for @real_time functions |
 | `--wcet-cert` | `<WCET_CERT>` |  | M53: Write WCET certificate JSON to file |
 | `--cpu` | `<CPU>` |  | M53: CPU target for WCET analysis (e.g., "cortex-a78") |

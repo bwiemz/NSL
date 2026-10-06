@@ -49,9 +49,6 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
             no_dead_weight,
             no_sparse_codegen,
             shared_lib,
-            unikernel,
-            listen,
-            memory,
             wcet,
             wcet_cert,
             cpu,
@@ -291,36 +288,6 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 return;
             }
 
-            // M54: Parse unikernel configuration if --unikernel is set.
-            let unikernel_config = if unikernel {
-                let listen_addr = match nsl_codegen::unikernel::parse_listen_addr(&listen) {
-                    Ok(addr) => addr,
-                    Err(e) => {
-                        nsl_log::nsl_log!(ERROR, "cli", "error: invalid --listen value: {e}");
-                        process::exit(1);
-                    }
-                };
-                let memory_bytes = match memory.as_deref() {
-                    Some(s) => match nsl_codegen::unikernel::parse_memory_size(s) {
-                        Ok(n) => n,
-                        Err(e) => {
-                            nsl_log::nsl_log!(ERROR, "cli", "error: invalid --memory value: {e}");
-                            process::exit(1);
-                        }
-                    },
-                    None => 0, // auto-detect at boot
-                };
-                let cfg = nsl_codegen::unikernel::UnikernelConfig {
-                    listen_addr,
-                    memory_bytes,
-                    ..Default::default()
-                };
-                cfg.print_summary();
-                Some(cfg)
-            } else {
-                None
-            };
-
             // Calibration is refused, not validated-and-ignored. The harness
             // (hook registry, run_harness_*, the sidecar writer) lives in
             // `nsl_codegen::compile_and_calibrate`, which e3ab23ad moved it
@@ -507,7 +474,6 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                     // that have it in scope.
                     index_map: std::collections::HashMap::new(),
                 },
-                unikernel_config,
                 wcet: nsl_codegen::WcetOptions {
                     enabled: wcet,
                     gpu: None, // reuse --gpu from Check variant; Build uses target for backend

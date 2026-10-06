@@ -3645,6 +3645,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   training-reference override macro now takes a field path. 72 → 67 flat
   fields.
 
+### Removed
+
+- **Unikernel deployment (M54)**, in the Phase 0.6 scope freeze. The code is
+  preserved at tag `attic/scope-freeze-2026-10`. `nsl build --unikernel`
+  parsed `--listen` and `--memory` into a configuration that was printed and
+  never read: no build path emitted the boot stub, the linker script or an
+  image. Removed: `nsl-codegen`'s `unikernel`/`unikernel_boot` modules,
+  `nsl-runtime`'s `unikernel` module, the eight `nsl_unikernel_*` runtime ABI
+  rows (692 → 684), `CompileOptions::unikernel_config`, and the three flags.
+  Two registry entries had been misattributed: the pass registry listed
+  `--memory` as a MemoryPlanner flag, and the activation allowlist called
+  `--listen` a serve-mode selector. Both flags belonged only to the unikernel.
+  They are removed with it. MemoryPlanner keeps `--memory-report`, and `nsl
+  profile --memory` is a different flag that is unaffected.
+
 _v0.10.0 below is the whole of the 0.9 line's unreleased work
 (2026-03-19 → 2026-09-06); from here releases are cut monthly (roadmap D5),
 so this section stays short._

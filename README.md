@@ -168,9 +168,6 @@ nsl check --deterministic file.nsl  # Determinism verification
 # GPU (the toolchain itself must be built with `cargo build --features cuda`)
 nsl run file.nsl --target cuda      # Run with the CUDA backend (the default --target)
 
-# Unikernel deployment
-nsl build file.nsl --unikernel --listen 0.0.0.0:8080 --memory 16G
-
 # ZK proofs
 nsl build --zk-circuit file.nsl                                # Compile @zk_proof functions to a circuit
 nsl zk stats model.zkir                                        # Circuit statistics
