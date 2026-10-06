@@ -268,20 +268,20 @@ nsl test file.nsl                 # Run @test functions
 ```rust
 #[repr(C)]
 pub struct NslTensor {
-    pub data: *mut c_void,      // CPU: f64*, GPU: f32*
+    pub data: *mut c_void,      // elements of the type `dtype` names
     pub shape: *mut i64,
     pub strides: *mut i64,
     pub ndim: i64,
     pub len: i64,
     pub refcount: AtomicI64,
     pub device: u8,             // 0=CPU, 1+=CUDA device
-    pub dtype: u16,             // 0=f64, 1=f32, 256+=custom
+    pub dtype: u16,             // 0=f64, 1=f32, 2=fp16, 3=bf16, ... 9=i32; 256+=custom
     pub owns_data: u8,
     pub data_owner: i64,        // for view tensors
 }
 ```
 
-Key: CPU uses f64, GPU uses f32. Device transfer (`.to(cuda)`) handles dtype conversion automatically.
+Key: the `dtype` tag is the storage type on every device, and the default is f32 on both (f64 by annotation, CPU only). Device transfer (`.to(cuda)`) keeps the dtype and refuses f64; mixed dtypes are refused, never promoted, and `.to(dtype)` converts explicitly.
 
 ---
 

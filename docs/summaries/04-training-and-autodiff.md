@@ -242,7 +242,7 @@ load_checkpoint(model, "checkpoint.nslm")
 Binary format:
 - **Magic**: `NSLM` (4 bytes)
 - **Header**: JSON metadata (parameter names, shapes, dtypes)
-- **Data**: 64-byte aligned f64 arrays for each parameter
+- **Data**: 64-byte aligned raw bytes for each parameter, in its own dtype (the header names it; `model_load` refuses a mismatch)
 
 No pickle, no Python — safe, portable, and fast.
 
@@ -303,4 +303,4 @@ The runtime (`nsl-runtime`) provides all tensor operations via C ABI:
 ### Math
 `exp`, `log`, `sqrt`, `abs`, `sign`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`
 
-All operations support both CPU (f64) and GPU (f32) with automatic device dispatch.
+All operations support both CPU and GPU (f32 by default on both) with automatic device dispatch.

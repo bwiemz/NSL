@@ -69,7 +69,7 @@ Everything a program calls a "tensor" is an `i64` that is really a
 
 ```
 magic: u32          // MUST be first: 0x4E534C54 ("NSLT") live, 0x0000DEAD freed
-data: *mut c_void   // opaque: CPU f64 or GPU f32 by default
+data: *mut c_void   // elements of the type `dtype` names, on any device
 shape: *mut i64
 strides: *mut i64
 ndim: i64
@@ -142,10 +142,29 @@ layout), custom dtypes from `DTYPE_CUSTOM_START = 256` (registered once at init 
 test in the same file fails if any value moves. Add new tags at the next free
 slot; never reuse one.
 
-**The opaque default.** `data` is "CPU f64 or GPU f32": a tensor created on
-the host with no dtype is `DTYPE_F64`, and `nsl_tensor_to_device` produces a
-`DTYPE_F32` device buffer. Typed accessors (`data_f64`, `data_f32`,
-`data_f16_bits`, ...) assert the dtype they read. Kernels that need bf16 or
+**The tag names the storage type.** `data` holds elements of the type
+`dtype` names, on the CPU and on the GPU alike; code decodes the buffer by
+the tag, never by `device`. The default float dtype is f32 everywhere: every
+creation FFI (`zeros`, `ones`, `full`, `rand`, `randn`, `arange`, `empty`)
+makes `DTYPE_F32`, as do parameters, stdlib layers and optimizer moments. An
+f64 annotation (a `Tensor<[4], f64>` binding, or an f64 model field) gets
+`DTYPE_F64` storage. `nsl_tensor_to_device` keeps the tag: upload and
+download are byte copies of the same dtype. It refuses to upload f64
+(`Fatal::UnsupportedDtype`, naming `.to(f32)`), since no GPU kernel computes
+in f64. The one deliberate widening is `DTYPE_U16_TOKEN` → `DTYPE_I32` on
+upload, because tokens are an index type.
+
+Which (device, dtype) pairs are legal is the checker's table,
+`nsl_semantic::types::device_support`: the GPU computes f32 and stores fp16,
+bf16 and i32; the CPU computes f32 and f64 and stores fp16, bf16 and i32
+(plus the loader's u16 tokens). On the CPU, fp16/bf16 elementwise
+add/sub/mul/div widen, compute and narrow, and matmul, conv and reductions
+refuse them. A refused pair, such as an f64 tensor moved to `cuda`, is a
+compile error when the dtype is known. Two operands of different dtypes are
+never promoted. The checker refuses them when both dtypes are known, and
+`require_same_dtype` refuses them at run time through `fatal::mixed_dtypes`
+(the CPU's old "f32 wins" rule is gone). Typed accessors (`data_f64`,
+`data_f32`, `data_f16_bits`, ...) assert the dtype they read. Kernels that need bf16 or
 fp8 storage live behind explicit modes (`src/sr_bf16.rs`, `src/fp8.rs`,
 `src/tensor/precision_cast.rs`) rather than changing the default. FP8 is
 simulated in f32: `nsl_fp8_cast` rounds `x / scale` onto the OCP E4M3 or E5M2
@@ -153,9 +172,12 @@ grid (`fp8::round_to_fp8`: ties to even, subnormals, saturating at the
 format's maximum) and stores the dequantized value; the KV-cache E4M3 bytes
 (`kv_compress::quantize`) are encoded with the same rounding. A program converts
 explicitly with `.to(f32 | f64 | fp16 | bf16)`, which lowers to
-`nsl_tensor_to_dtype` (`precision_cast.rs`): a converted copy, rounded once
-to nearest even, recorded on the tape as `TapeOp::Cast`. The dtype semantics
-these defaults should become are roadmap item 7's design.
+`nsl_tensor_to_dtype` (`precision_cast.rs`): a converted copy (the source
+itself when the dtype already matches), rounded once to nearest even, and
+recorded as `TapeOp::Cast` when a tape is recording. The host converts
+among all four; the GPU converts f32 ↔ fp16/bf16 and refuses f64. The
+contract and the steps that built it are
+`docs/superpowers/specs/2026-09-26-dtype-semantics-design.md` (roadmap C5).
 
 **Strides and contiguity (PR #585).** `compute_strides` produces row-major
 strides; `is_contiguous` compares the stored strides against that expectation
@@ -245,7 +267,7 @@ stderr, and `fatal::tests` pins them:
 | `CudaAsync` | **14** | the `cuCtxSynchronize` that `--cuda-sync` inserts after a kernel or cuBLAS call reported an asynchronous device error |
 | `Cublas` | **15** | a cuBLAS call failed on an in-place operation (the fused wgrad accumulate), where no partial result is safe to continue from |
 | `CudaNotCompiled` | **16** | a device tensor reached a tensor op in a runtime built without the `cuda` feature — the `#[cfg(not(feature = "cuda"))]` arm of every GPU-capable op (`fatal::cuda_not_compiled`) and the cast paths' "compiled without the `cuda` feature" checks |
-| `UnsupportedDtype` | **17** | a tensor op was asked to work on a dtype it does not implement (the cast family in `tensor/precision_cast.rs`, the scalar readers in `tensor/mod.rs`, `nsl_tensor_compare` / `nsl_tensor_where`, the f16 elementwise readers in `cpu.rs`, the token readers in `packing.rs` / `dataloader.rs` — `fatal::unsupported_dtype(op, dtype)` prints the family's one message): a compiler/runtime contract violation, not a user error |
+| `UnsupportedDtype` | **17** | a tensor op was asked to work on a dtype it does not implement (the cast family in `tensor/precision_cast.rs`, the scalar readers in `tensor/mod.rs`, `nsl_tensor_compare` / `nsl_tensor_where`, the f16 elementwise readers in `cpu.rs`, the token readers in `packing.rs` / `dataloader.rs` — `fatal::unsupported_dtype(op, dtype)` prints the family's one message): a compiler/runtime contract violation, not a user error. Two program errors share the code, and both messages name the `.to(dtype)` fix: operands of different dtypes (`fatal::mixed_dtypes`, at the arithmetic, matmul, compare/where, cat, norm and conv entries), and an f64 tensor moved to the GPU (`nsl_tensor_to_device`) |
 | `ShapeMismatch` | **18** | a tensor op's operands do not satisfy its shape contract: `nsl_tensor_compare`'s `b` shorter than `a`, `fase_fused_step`'s CPU path handed mixed dtypes — likewise a contract violation |
 | `Unsupported` | **19** | a runtime operation this build does not implement was reached: a device-to-device `nsl_tensor_to_device`, an ONNX export of a block-packed dtype |
 
@@ -558,6 +580,15 @@ host uses against a shared library built by `nsl build --shared`:
   `nsl_model_forward[_dlpack]`, `nsl_model_lookup_function`,
   `nsl_model_get_export_signature`, `nsl_model_get_weight`,
   `nsl_model_destroy`;
+- the two checks every generated `@export` wrapper makes: each input
+  descriptor goes through `nsl_desc_to_tensor_expect` and each result
+  through `nsl_export_check_result`, which hold it to the export's declared
+  dtype tag and device. A malformed descriptor is refused too: a bad `ndim`
+  or shape, an overflowing element count, a negative stride, null data, a
+  wrapped device id, or a tag outside the C API's 0..=9. A refusal returns
+  -1 with the error naming the parameter. An exported tensor's dtype must
+  have a C API tag (f64, f32, f16, bf16, int8, int32), and the checker
+  refuses any other;
 - the autograd pair `nsl_model_forward_grad` / `nsl_model_backward` from
   `src/grad_context.rs`;
 - `nsl_abi_version`, and the error slot: `nsl_get_last_error` returns the
@@ -569,7 +600,10 @@ host uses against a shared library built by `nsl build --shared`:
 `nsl_dlpack_free` implement DLPack v0.8 zero-copy in both directions; an
 imported tensor has `owns_data = 0` and its buffer dies in the foreign
 allocator. Unsupported dtypes are refused, not coerced
-(`crates/nsl-runtime/tests/dlpack_unsupported_dtype_refusal.rs`).
+(`crates/nsl-runtime/tests/dlpack_unsupported_dtype_refusal.rs`), and an
+import checks the descriptor fields the C API checks, plus `lanes` (a
+vector dtype is refused, not read as its scalar) and `byte_offset`
+alignment.
 
 **Interop bridges** (`feature = "interop"`). `src/safetensors_io.rs`
 (`nsl_safetensors_load` / `nsl_safetensors_save`), `src/huggingface.rs`
