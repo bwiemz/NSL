@@ -153,12 +153,13 @@ impl<'a> TypeChecker<'a> {
                                 let pname = self.resolve_name(param.name);
                                 match pname.as_str() {
                                     "step" | "epoch" => Type::Int,
-                                    // The loss has the model's dtype: f32 by
-                                    // default, f64 in an f64 program.
+                                    // The loss has the model's dtype (f32 by
+                                    // default, f64 in an f64 program) and
+                                    // lives on the model's device.
                                     "loss" => Type::Tensor {
                                         shape: Shape::unknown(),
                                         dtype: DType::Unknown,
-                                        device: Device::Cpu,
+                                        device: Device::Unknown,
                                     },
                                     _ => Type::Unknown,
                                 }
@@ -550,11 +551,11 @@ impl<'a> TypeChecker<'a> {
                                 let pname = self.resolve_name(param.name);
                                 match pname.as_str() {
                                     "step" | "epoch" => Type::Int,
-                                    // The model's dtype (see above).
+                                    // The model's dtype and device (see above).
                                     "loss" => Type::Tensor {
                                         shape: crate::types::Shape::unknown(),
                                         dtype: crate::types::DType::Unknown,
-                                        device: crate::types::Device::Cpu,
+                                        device: crate::types::Device::Unknown,
                                     },
                                     _ => Type::Unknown,
                                 }

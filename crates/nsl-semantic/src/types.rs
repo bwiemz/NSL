@@ -462,6 +462,12 @@ pub fn is_assignable(source: &Type, target: &Type) -> bool {
         if *vd != *ad && !matches!(vd, DType::Unknown) && !matches!(ad, DType::Unknown) {
             return false;
         }
+        // Device: unknown matches anything. Also before the shape (C5 step
+        // 5): a known device is honest now -- only creation builtins and
+        // annotations name one -- so an unknown shape must not skip it.
+        if !matches!(vdev, Device::Unknown) && !matches!(adev, Device::Unknown) && vdev != adev {
+            return false;
+        }
         // Unknown shape is always compatible
         if vs.rank() == 0 || as_.rank() == 0 {
             return true;
@@ -469,13 +475,7 @@ pub fn is_assignable(source: &Type, target: &Type) -> bool {
         if vs.rank() != as_.rank() {
             return false;
         }
-        for (v, a) in vs.dims.iter().zip(as_.dims.iter()) {
-            if shapes::unify_dim(v, a).is_none() {
-                return false;
-            }
-        }
-        // Device: unknown matches anything
-        return matches!(vdev, Device::Unknown) || matches!(adev, Device::Unknown) || vdev == adev;
+        return vs.dims.iter().zip(as_.dims.iter()).all(|(v, a)| shapes::unify_dim(v, a).is_some());
     }
     // Numeric widening: only within same family (int->int or float->float)
     let (src_family, src_rank) = dtype_rank(source);
@@ -484,6 +484,57 @@ pub fn is_assignable(source: &Type, target: &Type) -> bool {
         return true;
     }
     false
+}
+
+/// What a device does with a tensor of a given dtype: the (device, dtype)
+/// table of C5 step 5 (docs/superpowers/specs/2026-09-26-dtype-semantics-design.md).
+///
+/// It describes the runtime as it is. Every non-CPU device lowers to the
+/// CUDA runtime, whose kernels compute in f32 (`assert_gpu_f32`), store fp16
+/// and bf16 for the cast and optimizer paths, and take i32 as an index
+/// operand; an f64 upload is a fatal there. The CPU computes in f32 and f64
+/// and stores fp16, bf16 and i32.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceSupport {
+    /// Kernels compute in it.
+    Compute,
+    /// Stored, copied and cast; compute ops refuse it at run time.
+    Storage,
+    /// The device cannot hold it, so a move there is a compile error.
+    Refused,
+    /// No rule: the device or dtype is unknown, or the dtype has no runtime
+    /// tag of its own (bool, the int widths other than i32, fp8, ternary).
+    Unchecked,
+}
+
+pub fn device_support(device: &Device, dtype: DType) -> DeviceSupport {
+    use DeviceSupport::*;
+    match device {
+        Device::Cuda(_) | Device::Rocm(_) | Device::Metal => match dtype {
+            DType::F32 => Compute,
+            DType::Fp16 | DType::Bf16 | DType::Int32 => Storage,
+            DType::F64 => Refused,
+            _ => Unchecked,
+        },
+        Device::Cpu => match dtype {
+            DType::F32 | DType::F64 => Compute,
+            DType::Fp16 | DType::Bf16 | DType::Int32 => Storage,
+            _ => Unchecked,
+        },
+        Device::Npu(_) | Device::Unknown => Unchecked,
+    }
+}
+
+/// The error for a tensor of `dtype` placed on `device`, when the table
+/// refuses the pair.
+pub fn device_refusal(device: &Device, dtype: DType) -> Option<String> {
+    (device_support(device, dtype) == DeviceSupport::Refused).then(|| {
+        format!(
+            "{} tensors cannot be on {}: the GPU stores and computes f32. Convert first with `.to(f32)`",
+            display_dtype(&dtype),
+            display_device(device)
+        )
+    })
 }
 
 /// Returns (family, rank) for numeric types. Family: 0=non-numeric, 1=int, 2=float.

@@ -3411,3 +3411,137 @@ fn bitwise_and_on_ints_still_type_checks_as_before() {
     let diags = check_source(src);
     assert!(diags.is_empty(), "scalar `&` must stay legal, got: {diags:?}");
 }
+
+// -----------------------------------------------------------------------
+// C5 step 5: the (device, dtype) table
+// -----------------------------------------------------------------------
+
+/// The GPU stores and computes f32; an f64 upload is a runtime fatal. A
+/// type naming that pair is refused where it is written.
+#[test]
+fn an_f64_tensor_type_on_the_gpu_is_refused() {
+    let errs = error_messages("fn f(x: Tensor<[3], f64, cuda>) -> int:\n    return 0\n");
+    assert!(errs.iter().any(|m| m.contains("f64 tensors cannot be on cuda")), "{errs:?}");
+    for ok in [
+        "fn f(x: Tensor<[3], f32, cuda>) -> int:\n    return 0\n",
+        "fn f(x: Tensor<[3], bf16, cuda>) -> int:\n    return 0\n",
+        "fn f(x: Tensor<[3], f64, cpu>) -> int:\n    return 0\n",
+        "fn f(x: Tensor<[3], f64>) -> int:\n    return 0\n",
+    ] {
+        assert!(error_messages(ok).is_empty(), "{ok}: {:?}", error_messages(ok));
+    }
+}
+
+#[test]
+fn moving_an_f64_tensor_to_the_gpu_is_refused() {
+    let src = r#"
+fn main():
+    let a: Tensor<[3], f64> = zeros([3])
+    let b = a.to(cuda)
+"#;
+    let errs = error_messages(src);
+    assert!(errs.len() == 1 && errs[0].contains("f64 tensors cannot be on cuda"), "{errs:?}");
+    assert!(errs[0].contains("`.to(f32)`"), "the refusal names the fix: {errs:?}");
+    let ok = r#"
+fn main():
+    let a: Tensor<[3], f64> = zeros([3])
+    let b = a.to(f32).to(cuda)
+    let c = a.to(cpu)
+    let d = zeros([3]).to(cuda)
+"#;
+    assert!(error_messages(ok).is_empty(), "{:?}", error_messages(ok));
+}
+
+/// `m.to(cuda)` moves every tensor field, so one f64 field refuses the move
+/// and the error names it, through sub-models.
+#[test]
+fn moving_a_model_with_an_f64_field_to_the_gpu_is_refused() {
+    let src = r#"
+model Inner:
+    acc: Tensor<[2], f64> = zeros([2])
+
+model Outer:
+    w: Tensor<[2], f32> = zeros([2])
+    inner: Inner = Inner()
+
+fn main():
+    let m = Outer()
+    m.to(cuda)
+"#;
+    let errs = error_messages(src);
+    assert!(
+        errs.iter().any(|m| m.contains("model field `inner.acc` is f64")),
+        "{errs:?}"
+    );
+    let ok = r#"
+model Plain:
+    w: Tensor<[2], f32> = zeros([2])
+
+fn main():
+    let m = Plain()
+    m.to(cuda)
+"#;
+    assert!(error_messages(ok).is_empty(), "{:?}", error_messages(ok));
+}
+
+/// Shape and device are independent questions too: an unknown or rank-0
+/// shape no longer skips the device comparison (it rode that bypass until
+/// C5 step 5).
+#[test]
+fn unknown_shape_does_not_skip_the_device_check() {
+    use crate::types::{is_assignable, DType, Device, Dim, Shape, Type};
+    let t = |shape: Shape, device| Type::Tensor { shape, dtype: DType::F32, device };
+    let known = || Shape { dims: vec![Dim::Concrete(3)] };
+    assert!(!is_assignable(&t(Shape::unknown(), Device::Cpu), &t(known(), Device::Cuda(None))));
+    assert!(!is_assignable(&t(known(), Device::Cuda(None)), &t(Shape::scalar(), Device::Cpu)));
+    assert!(is_assignable(&t(Shape::unknown(), Device::Unknown), &t(known(), Device::Cuda(None))));
+    assert!(is_assignable(&t(known(), Device::Cuda(None)), &t(Shape::unknown(), Device::Unknown)));
+}
+
+/// A builtin's result is on its operand's device, so it is typed with an
+/// open device: a `cpu` there made a GPU argument or a GPU-annotated
+/// binding a false mismatch once the device check stopped riding the shape
+/// bypass.
+#[test]
+fn a_builtin_on_a_gpu_tensor_is_not_a_device_mismatch() {
+    let src = r#"
+fn f(x: Tensor<[3], f32, cuda>) -> Tensor<[3], f32, cuda>:
+    let y: Tensor<[3], f32, cuda> = relu(x)
+    return gelu(y)
+"#;
+    assert!(error_messages(src).is_empty(), "{:?}", error_messages(src));
+    // A creation builtin makes a HOST tensor, so that one is honest.
+    let host = r#"
+fn f() -> int:
+    let n = 3
+    let y: Tensor<[3], f32, cuda> = zeros([n])
+    return 0
+"#;
+    assert!(!error_messages(host).is_empty(), "zeros() makes a cpu tensor");
+}
+
+/// A model field is checked like any other binding: a creation builtin
+/// makes a host tensor, so a field annotated `cuda` would hold a cpu one.
+#[test]
+fn a_field_annotated_on_the_gpu_cannot_be_initialised_on_the_host() {
+    let src = r#"
+model M:
+    w: Tensor<[2], f32, cuda> = zeros([2])
+"#;
+    let errs = error_messages(src);
+    assert!(
+        errs.iter().any(|m| m.contains("field `w` is annotated on cuda, but its initializer makes a cpu tensor")),
+        "{errs:?}"
+    );
+    let ok = "model M:\n    w: Tensor<[2], f32> = zeros([2])\n    h: Tensor<[2], f32, cpu> = zeros([2])\n";
+    assert!(error_messages(ok).is_empty(), "{:?}", error_messages(ok));
+}
+
+/// A function's annotations are resolved at pre-declaration and again for
+/// the body; the refusal is still reported once.
+#[test]
+fn a_refused_parameter_type_is_reported_once() {
+    let errs = error_messages("fn f(x: Tensor<[4], f64, cuda>) -> int:\n    return 0\n");
+    let n = errs.iter().filter(|m| m.contains("f64 tensors cannot be on cuda")).count();
+    assert_eq!(n, 1, "{errs:?}");
+}
