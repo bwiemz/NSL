@@ -570,10 +570,25 @@ fn certs() -> Vec<Cert> {
         Cert { name: "layernorm_3d", inputs: vec![inp("x", &[2, 3, 4]), inp("w", &[4]), inp("b", &[4])],
             expr: "layernorm(x, w, b, 0.00001)", wrt: &["x", "w", "b"], out_shape: &[2, 3, 4],
             oracle: oracle!(|e| layernorm_rows(get(e, "x"), get(e, "w"), Some(get(e, "b")), 0.00001, false)), known: &[], prelude: "" },
+        // A model-field eps (the stdlib norms' `self.eps`) is read at run time
+        // by source AD; 0.5 is far from the 1e-5 it used to bake.
         Cert { name: "layernorm_field_eps", inputs: vec![inp("x", &[3, 4]), inp("w", &[4]), inp("b", &[4])],
-            expr: "layernorm(x, w, b, cfg.eps)", wrt: &["x"], out_shape: &[3, 4],
+            expr: "layernorm(x, w, b, cfg.eps)", wrt: &["x", "w", "b"], out_shape: &[3, 4],
             oracle: oracle!(|e| layernorm_rows(get(e, "x"), get(e, "w"), Some(get(e, "b")), 0.5, false)),
-            known: &[(Mode::Source, "a model-field eps cannot be read at compile time; the extractor bakes 1e-5")],
+            known: &[],
+            prelude: "model EpsCfg(d: int):\n    eps: float = 0.5\nlet cfg = EpsCfg(1)" },
+        Cert { name: "rmsnorm_field_eps", inputs: vec![inp("x", &[3, 4]), inp("w", &[4])],
+            expr: "rmsnorm(x, w, cfg.eps)", wrt: &["x", "w"], out_shape: &[3, 4],
+            oracle: oracle!(|e| layernorm_rows(get(e, "x"), get(e, "w"), None, 0.5, true)),
+            known: &[],
+            prelude: "model EpsCfg(d: int):\n    eps: float = 0.5\nlet cfg = EpsCfg(1)" },
+        // The eps field read twice: the scalar operand must stay a scalar for
+        // its second consumer too (it used to be re-typed a tensor after the
+        // first).
+        Cert { name: "rmsnorm_field_eps_reused", inputs: vec![inp("x", &[3, 4]), inp("w", &[4])],
+            expr: "rmsnorm(x, w, cfg.eps) * cfg.eps", wrt: &["x", "w"], out_shape: &[3, 4],
+            oracle: oracle!(|e| binary(&layernorm_rows(get(e, "x"), get(e, "w"), None, 0.5, true), &scalar(0.5), |a, b| a * b)),
+            known: &[],
             prelude: "model EpsCfg(d: int):\n    eps: float = 0.5\nlet cfg = EpsCfg(1)" },
         // --- indexing / joining ------------------------------------------
         Cert { name: "embedding", inputs: vec![inp("w", &[4, 3]), idx("i", &[6], "abs(arange(-2.0, 4.0))")],
@@ -976,7 +991,7 @@ cert_tests! {
     rotate_half,
     sum_all, mean_all, sum_dim, mean_dim, sum_dim_neg, sum_dim_keepdim, sum_dim_last, mean_dim_last,
     softmax_last, softmax_dim0, softmax_mid, log_softmax_last, log_softmax_dim0, log_softmax_mid,
-    layernorm, layernorm_eps, rmsnorm, rmsnorm_eps, layernorm_3d, layernorm_field_eps,
+    layernorm, layernorm_eps, rmsnorm, rmsnorm_eps, layernorm_3d, layernorm_field_eps, rmsnorm_field_eps, rmsnorm_field_eps_reused,
     embedding, gather, gather_neg, gather_dim0, gather_mid, cat_dim0, cat_dim1, cat_three, cat_neg,
     cross_entropy, mse_loss, l1_loss,
     conv2d, sdpa, sdpa_causal, sdpa_scale,

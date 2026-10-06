@@ -1805,6 +1805,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **Source AD trains with the norm epsilon the program set.** The stdlib
+  `LayerNorm` / `RMSNorm` pass their `eps` field to the kernel; source AD
+  could not read a float field at compile time and baked 1e-5, so after
+  `m.ln.eps = 0.5` the tape trained with 0.5 and `--source-ad` with 1e-5 --
+  silently, since 1e-5 is also the field's default (external review
+  2026-10-06). A norm's eps is now `NormEps`: a compile-time constant
+  (literal, or a value the extractor proves) or the op's scalar operand read
+  at run time (a model field), honoured in the forward, every backward
+  expansion, the fused RMSNorm-backward passthroughs and the residual fold.
+  An eps computed by an expression source AD cannot pass at run time
+  declines the block to the tape, and a scalar field that cannot be loaded
+  is a compile error -- never a default. The CSHA fused launches now pass the
+  norm's own eps (they used the CSHA config's 1e-5 whatever the program
+  said); the backward reuses the forward's value. Calibration binaries bind
+  an eps field to its declared literal (they run no program statements).
+  Gates: certificates `layernorm_field_eps` (was a recorded known failure),
+  `rmsnorm_field_eps` and `rmsnorm_field_eps_reused`;
+  `source_ad_norm_field_eps_gate` trains a model with reassigned stdlib norm
+  eps under SGD -- tape, source AD and the fused RMSNorm backward agree, and a
+  control at the default eps does not; a calibration build test.
+
 - **C5 step 3: one default float dtype, f32, and an `f64` annotation stores
   f64.** The checker typed every `zeros`/`ones`/`full`/`rand`/`randn`/
   `arange` f64 while the runtime made f32, and an annotation changed the

@@ -606,6 +606,14 @@ pub fn compile_wengert_ops_range(
                     .copied()
                     .unwrap_or(type_for_op(&op.op))
             }
+            // A scalar leaf (a norm's run-time eps, `NormEps::Var`) stays
+            // Scalar: re-typing it Tensor here would hand its f64 to a later
+            // consumer as a tensor pointer.
+            PrimalOp::Param(_) | PrimalOp::Input(_)
+                if var_types.get(&op.result) == Some(&WengertType::Scalar) =>
+            {
+                WengertType::Scalar
+            }
             _ => type_for_op(&op.op),
         };
         if should_cleanup_result(&op.op, result_type) {
@@ -685,6 +693,12 @@ pub fn infer_primal_owned(
                 .get(&op.result)
                 .copied()
                 .unwrap_or(type_for_op(&op.op)),
+            // As in `compile_wengert_ops_range`: a scalar leaf stays Scalar.
+            PrimalOp::Param(_) | PrimalOp::Input(_)
+                if var_types.get(&op.result) == Some(&WengertType::Scalar) =>
+            {
+                WengertType::Scalar
+            }
             _ => type_for_op(&op.op),
         };
         resolved.insert(op.result);
@@ -1242,7 +1256,27 @@ fn emit_fused_forward_under_claim(
     let block_kv_val = builder.ins().iconst(cl_types::I64, block_kv_i64);
     let shmem_val = builder.ins().iconst(cl_types::I64, shmem_bytes_i64);
     let causal_val = builder.ins().iconst(cl_types::I64, if is_causal { 1 } else { 0 });
-    let eps_bits_val = builder.ins().iconst(cl_types::I64, eps_bits_i64);
+    // The norm's own eps (`CshaChainVarIds::rmsnorm_eps`) rather than the
+    // config's default, which was 1e-5 whatever the program said: a constant
+    // as f32 bits, or a model field read at run time.
+    let chain_eps = compiler
+        .bus
+        .csha_backward_claims()
+        .and_then(|claims| claims.op_to_chain.get(&op.id).and_then(|&i| claims.chain_marks.get(i)))
+        .and_then(|mark| mark.chain_varids.as_ref())
+        .and_then(|chain| chain.rmsnorm_eps);
+    let eps_bits_val = match chain_eps {
+        Some(crate::wengert::NormEps::Const(v)) => {
+            builder.ins().iconst(cl_types::I64, i64::from((v as f32).to_bits()))
+        }
+        Some(eps @ crate::wengert::NormEps::Var(_)) => {
+            let e = norm_eps_value(builder, var_map, eps, "the CSHA RMSNorm prologue")?;
+            let f = builder.ins().fdemote(cl_types::F32, e);
+            let bits = builder.ins().bitcast(cl_types::I32, cranelift_codegen::ir::MemFlagsData::new(), f);
+            builder.ins().uextend(cl_types::I64, bits)
+        }
+        None => builder.ins().iconst(cl_types::I64, eps_bits_i64),
+    };
     let active_heads_val = builder.ins().iconst(cl_types::I64, active_heads_i64);
     let d_model_val = builder.ins().iconst(cl_types::I64, d_model_i64);
 
@@ -1418,6 +1452,7 @@ fn emit_fused_forward_under_claim(
             // self-consistent rope-effectively-off).
             cos: rope_cos_v,
             sin: rope_sin_v,
+            eps_bits: eps_bits_val,
             backward_ptx_data_id: bwd_ptx_id,
             backward_name_data_id: bwd_name_id,
             backward_tier_b_on_ptx_data_id: bwd_tier_b_ptx_id,
@@ -1426,6 +1461,61 @@ fn emit_fused_forward_under_claim(
     );
 
     Ok(out_val)
+}
+
+/// A norm's eps as an f64 Value: the constant, or the run-time scalar the
+/// caller bound for `NormEps::Var` (a model field load). A missing or
+/// non-f64 binding is an error -- the eps the program supplied must be the
+/// one used, never a default.
+fn norm_eps_value(
+    builder: &mut FunctionBuilder,
+    var_map: &VarMap,
+    eps: crate::wengert::NormEps,
+    op_name: &str,
+) -> Result<Value, CodegenError> {
+    match eps {
+        crate::wengert::NormEps::Const(v) => Ok(builder.ins().f64const(v)),
+        crate::wengert::NormEps::Var(var) => {
+            let val = *var_map.get(&var).ok_or_else(|| {
+                CodegenError::new(format!(
+                    "[source-ad] the eps of {op_name}() (VarId {var}) has no run-time value"
+                ))
+            })?;
+            scalar_eps_f64(builder, val, op_name)
+        }
+    }
+}
+
+/// The run-time eps Value, checked to be an f64.
+fn scalar_eps_f64(builder: &FunctionBuilder, val: Value, what: &str) -> Result<Value, CodegenError> {
+    if builder.func.dfg.value_type(val) != cl_types::F64 {
+        return Err(CodegenError::new(format!(
+            "[source-ad] the eps of {what} is not a float scalar at run time"
+        )));
+    }
+    Ok(val)
+}
+
+/// The eps of a fused RMSNorm-backward passthrough `<base>:<suffix>`: the
+/// bit-encoded constant, or for `:var` the last of `n_fixed + 1` inputs.
+fn passthrough_norm_eps(
+    builder: &mut FunctionBuilder,
+    name: &str,
+    base: &str,
+    inputs: &[Value],
+    n_fixed: usize,
+) -> Result<Value, CodegenError> {
+    let suffix = &name[base.len()..];
+    if suffix == "var" {
+        let val = *inputs.get(n_fixed).ok_or_else(|| {
+            CodegenError::new(format!("{name}: the run-time eps input is missing"))
+        })?;
+        return scalar_eps_f64(builder, val, name);
+    }
+    let bits: u64 = suffix
+        .parse()
+        .map_err(|_| CodegenError::new(format!("{name}: malformed eps suffix")))?;
+    Ok(builder.ins().f64const(f64::from_bits(bits)))
 }
 
 /// Lower one WengertOp to Cranelift IR.
@@ -1456,6 +1546,15 @@ fn lower_single_op(
         PrimalOp::Param(name) => {
             if let Some(&val) = var_map.get(&op.result) {
                 return Ok(val);
+            }
+            // A Scalar param is read by value (a norm's run-time eps): a null
+            // placeholder would be a wrong number, not an unused pointer.
+            if var_types.get(&op.result) == Some(&WengertType::Scalar) {
+                return Err(CodegenError::new(format!(
+                    "[source-ad] the scalar field '{name}' (VarId {}) could not be loaded \
+                     at run time; source AD cannot honour it",
+                    op.result
+                )));
             }
             // Unresolved Param — may be a scalar config field (eps, _d_model)
             // used only in non-differentiable contexts. Safe to use null for
@@ -1943,7 +2042,7 @@ fn lower_single_op(
 
         // === Normalization (2 ops) ===
         PrimalOp::LayerNorm { eps } => {
-            let e = builder.ins().f64const(*eps);
+            let e = norm_eps_value(builder, var_map, *eps, "layernorm")?;
             call(
                 compiler,
                 builder,
@@ -1952,10 +2051,9 @@ fn lower_single_op(
             )
         }
         PrimalOp::RMSNorm { eps } => {
-            // RMSNorm takes (input, weight, eps) — the eps argument from the Wengert
-            // inputs is a float field loaded from the model struct. Use the hardcoded
-            // eps from the PrimalOp to avoid type mismatches (input eps may be f64).
-            let e = builder.ins().f64const(*eps);
+            // RMSNorm takes (input, weight, eps): a constant, or the run-time
+            // scalar operand (`NormEps::Var`, a model field's f64).
+            let e = norm_eps_value(builder, var_map, *eps, "rmsnorm")?;
             call(
                 compiler,
                 builder,
@@ -3054,7 +3152,7 @@ fn lower_single_op(
             // eligibility decision while the config is in scope. The runtime
             // `seq_len == block_q` check happens below using the Cranelift
             // `seq_len` Value already extracted via `nsl_tensor_shape_dim`.
-            let (block_q, block_kv, head_dim, is_causal, d_model, eps_bits, shmem_bytes,
+            let (block_q, block_kv, head_dim, is_causal, d_model, shmem_bytes,
                  tier_b2_compile_time_eligible) =
                 match training_cfg {
                     Some(cfg) => {
@@ -3071,14 +3169,9 @@ fn lower_single_op(
                             crate::flash_attention_v2::shared_mem_bytes_v2_backward(&cfg)
                                 as i64;
                         let dm = cfg.csha.as_ref().map(|c| c.d_model as i64).unwrap_or(0);
-                        let eps = cfg
-                            .csha
-                            .as_ref()
-                            .map(|c| c.rmsnorm_eps.to_bits() as i64)
-                            .unwrap_or(1e-5f32.to_bits() as i64);
                         let b2_ct =
                             crate::flash_attention_v2::tier_b2::dispatch::tier_b2_hybrid_backward_compile_time_eligible(&cfg);
-                        (cfg.block_q, cfg.block_kv, cfg.head_dim, cfg.causal, dm, eps, bytes, b2_ct)
+                        (cfg.block_q, cfg.block_kv, cfg.head_dim, cfg.causal, dm, bytes, b2_ct)
                     }
                     None => {
                         // No training config — the backward launch cannot
@@ -3128,7 +3221,8 @@ fn lower_single_op(
                 .ins()
                 .iconst(cl_types::I64, if is_causal { 1 } else { 0 });
             let d_model_val = builder.ins().iconst(cl_types::I64, d_model);
-            let eps_bits_val = builder.ins().iconst(cl_types::I64, eps_bits);
+            // The forward launch's eps (the norm's own; see the forward).
+            let eps_bits_val = saves.eps_bits;
 
             // scale_bits = 1/sqrt(head_dim) reinterpreted as f32 bits.
             let hd_f64 = builder.ins().fcvt_from_sint(cl_types::F64, hd_val);
@@ -3856,11 +3950,8 @@ fn lower_single_op(
                 }
                 _ if name.starts_with("rmsnorm_dgamma_backward:") => {
                     // P5 item 20 slice A: fused RMSNorm gamma gradient.
-                    // inputs = [dy, x, gamma]; eps bit-encoded in the name.
-                    let bits: u64 = name["rmsnorm_dgamma_backward:".len()..]
-                        .parse()
-                        .unwrap_or(0);
-                    let e = builder.ins().f64const(f64::from_bits(bits));
+                    // inputs = [dy, x, gamma(, eps)]; `passthrough_norm_eps`.
+                    let e = passthrough_norm_eps(builder, name, "rmsnorm_dgamma_backward:", &inputs, 3)?;
                     call(
                         compiler,
                         builder,
@@ -3870,11 +3961,8 @@ fn lower_single_op(
                 }
                 _ if name.starts_with("rmsnorm_dx_backward_add:") => {
                     // P5 slice C: fused dx + residual fold.
-                    // inputs = [dy, x, gamma, res]; eps bit-encoded.
-                    let bits: u64 = name["rmsnorm_dx_backward_add:".len()..]
-                        .parse()
-                        .unwrap_or(0);
-                    let e = builder.ins().f64const(f64::from_bits(bits));
+                    // inputs = [dy, x, gamma, res(, eps)]; `passthrough_norm_eps`.
+                    let e = passthrough_norm_eps(builder, name, "rmsnorm_dx_backward_add:", &inputs, 4)?;
                     call(
                         compiler,
                         builder,
@@ -3883,12 +3971,9 @@ fn lower_single_op(
                     )
                 }
                 _ if name.starts_with("rmsnorm_dx_backward:") => {
-                    // Item 9 fused RMSNorm input gradient. inputs = [dy, x, gamma];
-                    // eps is bit-encoded in the name suffix (exact round-trip).
-                    let bits: u64 = name["rmsnorm_dx_backward:".len()..]
-                        .parse()
-                        .unwrap_or(0);
-                    let e = builder.ins().f64const(f64::from_bits(bits));
+                    // Item 9 fused RMSNorm input gradient. inputs = [dy, x,
+                    // gamma(, eps)]; `passthrough_norm_eps`.
+                    let e = passthrough_norm_eps(builder, name, "rmsnorm_dx_backward:", &inputs, 3)?;
                     call(
                         compiler,
                         builder,
@@ -5864,8 +5949,8 @@ mod tests {
             PrimalOp::Gather { dim: 0 },
             PrimalOp::ScatterAdd { dim: 0 },
             PrimalOp::Embedding,
-            PrimalOp::LayerNorm { eps: 1e-5 },
-            PrimalOp::RMSNorm { eps: 1e-5 },
+            PrimalOp::LayerNorm { eps: crate::wengert::NormEps::Const(1e-5) },
+            PrimalOp::RMSNorm { eps: crate::wengert::NormEps::Const(1e-5) },
             PrimalOp::BatchNorm {
                 eps: 1e-5,
                 training: true,

@@ -145,6 +145,7 @@ fn clear_csha_per_function_caches_empties_both_maps() {
             // Sprint 1 cycle-2: RoPE cos/sin Values stashed alongside `out`.
             cos:     Value::from_u32(407),
             sin:     Value::from_u32(408),
+            eps_bits: Value::from_u32(499),
             backward_ptx_data_id: None,
             backward_name_data_id: None,
             // PCA Tier B planner spec §5. This test asserts only that

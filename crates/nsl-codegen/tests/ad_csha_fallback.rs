@@ -59,7 +59,7 @@ fn claimed_chain_ops() -> Vec<WengertOp> {
             inputs: vec![], saved_for_backward: true, checkpointed: false,
         },
         WengertOp {
-            id: 1, result: 1, op: PrimalOp::RMSNorm { eps: 1e-5 },
+            id: 1, result: 1, op: PrimalOp::RMSNorm { eps: nsl_codegen::wengert::NormEps::Const(1e-5) },
             inputs: vec![0], saved_for_backward: true, checkpointed: false,
         },
         WengertOp {
