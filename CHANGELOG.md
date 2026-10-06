@@ -1805,6 +1805,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **Numerical gates refuse NaN instead of scoring it a perfect match**
+  (external review 2026-10-06, finding 2).
+  - **How NaN was dropped.** Error metrics folded with `f32::max` (which
+    drops a NaN operand), `if d > max` loops, or `if diff > tol` tests. An
+    all-NaN kernel output therefore scored 0 error and passed. Seen in the
+    packed-attention forward gate and about 70 more GPU/CPU gates, oracle
+    validators and two-arm "bit-exact" comparisons (both arms NaN compare
+    equal).
+  - **The fix.** Both operands of every comparison are now asserted finite
+    first, including the reference side. Loss-stream parsers refuse a NaN
+    token instead of dropping it.
+  - **Production fixes.**
+    - The in-program `assert_close` used `diff > tol`, so it passed on NaN.
+      It now fails on any NaN, and treats an infinity as close only to the
+      same infinity.
+    - The training health monitor labelled a NaN gradient norm "(healthy)".
+  - Weakened checks: none (audited).
+
 - **Source AD trains with the norm epsilon the program set.** The stdlib
   `LayerNorm` / `RMSNorm` pass their `eps` field to the kernel; source AD
   could not read a float field at compile time and baked 1e-5, so after
