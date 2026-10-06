@@ -117,6 +117,17 @@ fn det_seq(seed: u32, n: usize) -> Vec<f32> {
 /// one tolerance covers K=16 and K=256 products alike.
 fn rel_err(got: &[f32], want: &[f64]) -> f64 {
     assert_eq!(got.len(), want.len());
+    // `f64::max` returns the non-NaN operand, so the fold below drops a NaN
+    // error and scores an all-NaN GPU result 0.0 — inside every tolerance.
+    // Refuse it first.
+    if let Some(i) = got.iter().position(|v| !v.is_finite()) {
+        panic!("rel_err: non-finite entry in got at index {i} ({})", got[i]);
+    }
+    // The reference too: an all-NaN `want` makes `rms` NaN, `rms.max(1e-12)`
+    // then returns 1e-12, and the fold above returns 0.0 — a pass.
+    if let Some(i) = want.iter().position(|v| !v.is_finite()) {
+        panic!("rel_err: non-finite entry in want at index {i} ({})", want[i]);
+    }
     let rms = (want.iter().map(|v| v * v).sum::<f64>() / want.len() as f64).sqrt();
     let max = got
         .iter()

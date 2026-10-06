@@ -70,3 +70,54 @@ fn e4m3_matmul_128x128x128() {
 fn e4m3_matmul_non_square() {
     run_e4m3_at_shape(64, 32, 16);
 }
+
+// The shared comparators' own guard. Not FP8 tests — they pin the property
+// every tolerance assertion over `common::fp8_reference` depends on: an
+// all-NaN result must fail, not score 0.0 (`f32::max` returns the non-NaN
+// operand, so a bare fold drops it). They live here because this binary
+// needs no device.
+
+#[test]
+#[should_panic(expected = "non-finite")]
+fn rel_err_comparator_rejects_nan_instead_of_scoring_it_perfect() {
+    let reference = vec![1.0f32, -2.0, 3.0, 4.0];
+    assert_rel_err_le(&[f32::NAN; 4], &reference, 1e-6, "all-NaN test");
+}
+
+#[test]
+#[should_panic(expected = "non-finite")]
+fn rel_err_comparator_rejects_nan_in_the_reference() {
+    let test = vec![1.0f32, -2.0, 3.0, 4.0];
+    let mut reference = test.clone();
+    reference[1] = f32::NAN;
+    assert_rel_err_le(&test, &reference, 1e-6, "NaN reference");
+}
+
+#[test]
+#[should_panic(expected = "non-finite")]
+fn abs_err_comparator_rejects_nan_instead_of_scoring_it_perfect() {
+    let reference = vec![1.0f32, -2.0, 3.0, 4.0];
+    let mut test = reference.clone();
+    test[2] = f32::NAN;
+    assert_abs_err_le(&test, &reference, 1e-6, "one-NaN test");
+}
+
+#[test]
+#[should_panic(expected = "finite disagreement: max rel err")]
+fn rel_err_comparator_still_reports_finite_disagreement() {
+    let reference = vec![1.0f32, -2.0, 3.0, 4.0];
+    let mut test = reference.clone();
+    test[2] = 3.5;
+    assert_rel_err_le(&reference, &reference, 0.0, "identical");
+    assert_rel_err_le(&test, &reference, 1e-3, "finite disagreement");
+}
+
+#[test]
+#[should_panic(expected = "finite disagreement: max abs err")]
+fn abs_err_comparator_still_reports_finite_disagreement() {
+    let reference = vec![1.0f32, -2.0, 3.0, 4.0];
+    let mut test = reference.clone();
+    test[0] = 1.5;
+    assert_abs_err_le(&reference, &reference, 0.0, "identical");
+    assert_abs_err_le(&test, &reference, 1e-3, "finite disagreement");
+}

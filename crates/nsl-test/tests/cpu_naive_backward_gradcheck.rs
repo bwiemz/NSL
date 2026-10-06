@@ -73,6 +73,11 @@ fn attention_loss(q: &[f64], k: &[f64], v: &[f64], d_o: &[f64], bh: usize, s: us
 /// Worst |analytic - fd| over `base`'s entries, relative to max|analytic|.
 fn check(name: &str, tol: f64, analytic: &[f32], base: &[f64], loss: impl Fn(&[f64]) -> f64) {
     let eps = 1e-4;
+    // `m.max(nan)` keeps `m` and `err > worst` is false for a NaN `err`, so a
+    // NaN analytic gradient or FD probe would drop out below. Refuse it.
+    if let Some(i) = analytic.iter().position(|g| !g.is_finite()) {
+        panic!("{name}: non-finite analytic gradient at index {i} ({})", analytic[i]);
+    }
     let scale = analytic.iter().fold(0.0f64, |m, &g| m.max(g.abs() as f64));
     assert!(scale > 1e-3, "{name}: gradient too small to check (max |g| = {scale})");
     let mut worst = 0.0f64;
@@ -83,7 +88,9 @@ fn check(name: &str, tol: f64, analytic: &[f32], base: &[f64], loss: impl Fn(&[f
         let lp = loss(&p);
         p[i] = base[i] - eps;
         let lm = loss(&p);
-        let err = ((lp - lm) / (2.0 * eps) - analytic[i] as f64).abs();
+        let fd = (lp - lm) / (2.0 * eps);
+        assert!(fd.is_finite(), "{name}[{i}]: non-finite central difference ({fd})");
+        let err = (fd - analytic[i] as f64).abs();
         if err > worst {
             worst = err;
             at = i;

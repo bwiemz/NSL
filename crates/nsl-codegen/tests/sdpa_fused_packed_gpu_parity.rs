@@ -160,16 +160,63 @@ fn oracle(q: &[f32], k: &[f32], v: &[f32], dout: &[f32], seg: &[u16], staged: bo
     (out, lse, Grads { dq: f(dq), dk: f(dk), dv: f(dv) })
 }
 
+/// Panics on a NaN or an infinity in `xs`, naming `what` and the first index.
+///
+/// The comparators below call it on both operands BEFORE folding: `f32::max`
+/// returns the non-NaN operand, so `.fold(0f32, f32::max)` drops a NaN
+/// difference and an all-NaN GPU result scores 0.0 — inside every tolerance.
+fn assert_finite(what: &str, xs: &[f32]) {
+    if let Some(i) = xs.iter().position(|v| !v.is_finite()) {
+        panic!("{what}: non-finite entry at index {i} ({})", xs[i]);
+    }
+}
+
 /// max |got − want| over max |want|.
 fn rel(got: &[f32], want: &[f32]) -> f32 {
     assert_eq!(got.len(), want.len());
+    assert_finite("got", got);
+    assert_finite("want", want);
     let scale = want.iter().fold(0f32, |m, x| m.max(x.abs()));
     assert!(scale > 0.0, "an all-zero reference");
     got.iter().zip(want).map(|(g, w)| (g - w).abs()).fold(0f32, f32::max) / scale
 }
 
 fn max_abs(got: &[f32], want: &[f32]) -> f32 {
+    assert_eq!(got.len(), want.len());
+    assert_finite("got", got);
+    assert_finite("want", want);
     got.iter().zip(want).map(|(g, w)| (g - w).abs()).fold(0f32, f32::max)
+}
+
+/// The comparators' own guard. Not GPU tests: they pin the property every
+/// tolerance below depends on, which `rel`/`max_abs` did not have when this
+/// file was written — an all-NaN result scored 0.0 and passed.
+#[test]
+#[should_panic(expected = "non-finite")]
+fn rel_rejects_nan_instead_of_scoring_it_perfect() {
+    let want = vec![1.0f32, -2.0, 3.0, 4.0];
+    let _ = rel(&[f32::NAN; 4], &want);
+}
+
+#[test]
+#[should_panic(expected = "non-finite")]
+fn max_abs_rejects_nan_instead_of_scoring_it_perfect() {
+    let want = vec![1.0f32, -2.0, 3.0, 4.0];
+    let mut got = want.clone();
+    got[3] = f32::NAN;
+    let _ = max_abs(&got, &want);
+}
+
+/// ...and both still report a finite disagreement as one.
+#[test]
+fn the_comparators_still_report_finite_disagreement() {
+    let want = vec![1.0f32, -2.0, 3.0, 4.0];
+    let mut got = want.clone();
+    got[2] = 3.5;
+    assert_eq!(rel(&want, &want), 0.0);
+    assert_eq!(max_abs(&want, &want), 0.0);
+    assert!(rel(&got, &want) > 0.1);
+    assert!(max_abs(&got, &want) > 0.4);
 }
 
 fn gpu_tensor(shape: &[i64], vals: &[f32]) -> i64 {
@@ -415,15 +462,17 @@ fn fused_backward(x: &Inputs, out: &[f32], lse: &[f32]) -> Grads {
 }
 
 fn report(name: &str, got: &Grads, exact: &Grads, staged: &Grads) -> ([f32; 3], [f32; 3]) {
+    // Before `rel`, so the failure names the gradient (`rel` refuses a
+    // non-finite operand too, but only as "got").
+    for (t, g) in [("dq", &got.dq), ("dk", &got.dk), ("dv", &got.dv)] {
+        assert_finite(&format!("{name}: {t}"), g);
+    }
     let e = [rel(&got.dq, &exact.dq), rel(&got.dk, &exact.dk), rel(&got.dv, &exact.dv)];
     let s = [rel(&got.dq, &staged.dq), rel(&got.dk, &staged.dk), rel(&got.dv, &staged.dv)];
     eprintln!(
         "{name}: vs exact dq {:.2e} dk {:.2e} dv {:.2e}; vs f16-operand dq {:.2e} dk {:.2e} dv {:.2e}",
         e[0], e[1], e[2], s[0], s[1], s[2]
     );
-    for (t, g) in [("dq", &got.dq), ("dk", &got.dk), ("dv", &got.dv)] {
-        assert!(g.iter().all(|v| v.is_finite()), "{name}: {t} has a non-finite entry");
-    }
     (e, s)
 }
 
@@ -435,6 +484,8 @@ fn packed_forward_matches_the_oracle_across_kv_tiles() {
     let (want_out, want_lse, _) = oracle(&x.q, &x.k, &x.v, &x.dout, &x.seg, false);
     for tier_b in [false, true] {
         let (out, lse) = fused_forward(&x, tier_b);
+        assert_finite(&format!("forward (tier_b={tier_b}) out"), &out);
+        assert_finite(&format!("forward (tier_b={tier_b}) lse"), &lse);
         let (out_err, lse_err) = (rel(&out, &want_out), max_abs(&lse, &want_lse));
         eprintln!("forward (tier_b={tier_b}): out {out_err:.2e} of max |out|, lse {lse_err:.2e} absolute");
         // The forward stores O in f16, so O is the f16 rounding of the
@@ -480,6 +531,11 @@ fn packed_forward_then_backward_is_the_attention_gradient() {
     let (_, _, exact) = oracle(&x.q, &x.k, &x.v, &x.dout, &x.seg, false);
     let (_, _, staged) = oracle(&x.q, &x.k, &x.v, &x.dout, &x.seg, true);
     let (out, lse) = fused_forward(&x, true);
+    // The forward's own outputs feed the backward without being compared to
+    // anything here, so a NaN in them would otherwise surface only as NaN
+    // gradients, and only if the backward propagates it.
+    assert_finite("forward out", &out);
+    assert_finite("forward lse", &lse);
     let got = fused_backward(&x, &out, &lse);
     let (e, _) = report("forward then backward", &got, &exact, &staged);
     let e_max = e[0].max(e[1]).max(e[2]);

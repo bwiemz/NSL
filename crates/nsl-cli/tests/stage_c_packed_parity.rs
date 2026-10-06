@@ -199,7 +199,13 @@ fn checkpoint_max_diff(a: &Path, b: &Path) -> (f64, String) {
             .get(name)
             .unwrap_or_else(|| panic!("param {name} missing from second checkpoint"));
         assert_eq!(va.len(), vb.len(), "param {name} length mismatch");
-        for (x, y) in va.iter().zip(vb) {
+        for (i, (x, y)) in va.iter().zip(vb).enumerate() {
+            // `d > max_diff` is false for a NaN `d`, so two diverged-to-NaN
+            // checkpoints would score 0.0. Refuse a non-finite value first.
+            assert!(
+                x.is_finite() && y.is_finite(),
+                "param {name}: non-finite entry at index {i} (first checkpoint {x}, second {y})"
+            );
             let d = (*x as f64 - *y as f64).abs();
             if d > max_diff {
                 max_diff = d;

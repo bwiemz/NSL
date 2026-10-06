@@ -215,6 +215,15 @@ fn run_nsl_with_env(
             "LOSS_STREAM_BEGIN" => in_stream = true,
             "LOSS_STREAM_END" => in_stream = false,
             l if in_stream => {
+                // A NaN / infinite loss (`NaN`, `inf`) is a failure: the gates
+                // compare streams as text (and models as bytes), and two runs
+                // that both went NaN match exactly. `parse_losses` would also
+                // keep a NaN, so every run is checked here.
+                let lower = l.to_ascii_lowercase();
+                assert!(
+                    !lower.contains("nan") && !lower.contains("inf"),
+                    "non-finite loss in the loss stream (tag={tag}): {l:?}"
+                );
                 loss_stream.push_str(l);
                 loss_stream.push('\n');
             }

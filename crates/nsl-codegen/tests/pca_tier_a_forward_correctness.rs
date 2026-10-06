@@ -399,8 +399,20 @@ fn launch_pca(
 // Max-abs-diff diagnostic helper
 // ---------------------------------------------------------------------------
 
+fn assert_all_finite(xs: &[f32], which: &str) {
+    if let Some(i) = xs.iter().position(|v| !v.is_finite()) {
+        panic!("non-finite entry in {which} at index {i} ({})", xs[i]);
+    }
+}
+
 fn max_abs_diff(a: &[f32], b: &[f32]) -> (f32, usize) {
     assert_eq!(a.len(), b.len());
+    // `d > max_abs` is false for a NaN `d`, so the loop below scores an
+    // all-NaN operand 0.0 — and the bit-exact gates (`== 0.0`) pass on two
+    // NaN outputs. Refuse it first, on both operands: several call sites
+    // compare two GPU launches, and not every caller checks finiteness itself.
+    assert_all_finite(a, "max_abs_diff operand a");
+    assert_all_finite(b, "max_abs_diff operand b");
     let mut max_abs = 0f32;
     let mut max_idx = 0usize;
     for (i, (&ai, &bi)) in a.iter().zip(b.iter()).enumerate() {
@@ -1332,11 +1344,9 @@ fn rope_q_forward_per_doc_reset_is_deterministic_in_suite() {
     // BIT-EXACT match between the two runs — this is the cross-test-leak guard.
     // If any per-launch state (alloc reuse, SMEM residuals, etc.) influences
     // the output, the two outputs will differ.
-    let mut max_abs = 0f32; let mut idx = 0usize;
-    for (i, (a, b)) in run1.iter().zip(run2.iter()).enumerate() {
-        let d = (a - b).abs();
-        if d > max_abs { max_abs = d; idx = i; }
-    }
+    // `max_abs_diff` refuses a non-finite entry in either run: two NaN
+    // outputs would otherwise score 0.0 and pass the bit-exact gate.
+    let (max_abs, idx) = max_abs_diff(&run1, &run2);
     eprintln!("Test D [fwd run1 vs run2]: max_abs={max_abs:.3e}@[{idx}]");
     assert_eq!(max_abs, 0.0f32,
         "Test D FAILED: identical inputs produced different outputs (max_abs={max_abs:.3e}@[{idx}]) — \
@@ -1369,6 +1379,11 @@ fn rope_q_forward_per_doc_reset_invariants() {
         &q, &k, &v, batch, heads, seq_len, head_dim, block, block,
         true, true, &seg_ids, Some((&cos, &sin)), Some(&doc_zero),
     ).expect("Test BC reset-inactive baseline failed");
+
+    // The row-range loops below skip a NaN diff (`diff > max` is false), so
+    // Test B's bit-exact gate would pass on two NaN outputs. Refuse it first.
+    assert_all_finite(&with_reset, "Test BC with_reset output");
+    assert_all_finite(&no_reset, "Test BC no_reset output");
 
     // Test B: for doc 0 positions (rows 0..32), effective_pos = pos - 0 = pos in
     // both runs, so the cos/sin lookup is identical → outputs match within f16 jitter.

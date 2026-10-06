@@ -249,10 +249,18 @@ fn cuda_available() -> bool {
     true
 }
 
+/// Max |a - b| over the first `active_elems` entries. `a` is the GPU side.
 fn max_abs_diff_active(a: &[f32], b: &[f32], active_elems: usize) -> (f32, usize) {
+    let n = active_elems.min(a.len()).min(b.len());
+    // `d > max_abs` is false for a NaN `d`, so the loop below scores an
+    // all-NaN GPU gradient 0.0 — inside every tolerance. Refuse it first,
+    // over the same active range the comparison covers.
+    if let Some(i) = a[..n].iter().position(|v| !v.is_finite()) {
+        panic!("max_abs_diff_active: non-finite entry in gpu at index {i} ({})", a[i]);
+    }
     let mut max_abs = 0f32;
     let mut max_idx = 0usize;
-    for i in 0..active_elems.min(a.len()).min(b.len()) {
+    for i in 0..n {
         let d = (a[i] - b[i]).abs();
         if d > max_abs { max_abs = d; max_idx = i; }
     }

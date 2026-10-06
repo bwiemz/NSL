@@ -625,6 +625,12 @@ fn adamw_deferred_vt_is_exact_windowed_not_option_b() {
          step body; discrimination is vacuous"
     );
 
+    // `x.max(nan)` keeps `x`, so one NaN element of the compiled θ would drop
+    // out of both distances below and the other element alone would decide
+    // the gate. Refuse it first.
+    if let Some(i) = w_compiled.iter().position(|v| !v.is_finite()) {
+        panic!("non-finite entry in compiled θ at index {i} ({})", w_compiled[i]);
+    }
     let d_std = (w_compiled[0] - w_std[0]).abs().max((w_compiled[1] - w_std[1]).abs());
     let d_ob = (w_compiled[0] - w_ob[0]).abs().max((w_compiled[1] - w_ob[1]).abs());
     assert!(

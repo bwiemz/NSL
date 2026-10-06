@@ -60,7 +60,7 @@ fn run_fixture(fixture: &str, tag: &str, rewrites: &[(&str, &str)], extra: &[&st
     // CPU runs print bare floats; GPU runs print `tensor([v])` and
     // interleave [gpu-mem] diagnostics — normalize both to the numeric
     // string so stream comparisons and parses are format-independent.
-    let losses = stdout
+    let losses: Vec<String> = stdout
         .split_once("LOSS_STREAM_BEGIN")
         .and_then(|(_, r)| r.split_once("LOSS_STREAM_END"))
         .map(|(v, _)| {
@@ -81,6 +81,16 @@ fn run_fixture(fixture: &str, tag: &str, rewrites: &[(&str, &str)], extra: &[&st
                 .collect()
         })
         .unwrap_or_default();
+    // A NaN / infinite loss (`NaN`, `inf`) is a failure: the gates compare
+    // these streams (and saved models) exactly, and two runs that both went
+    // NaN match exactly.
+    for l in &losses {
+        let lower = l.to_ascii_lowercase();
+        assert!(
+            !lower.contains("nan") && !lower.contains("inf"),
+            "non-finite loss in the loss stream (tag={tag}): {l:?}"
+        );
+    }
     RunOut {
         success: out.status.success(),
         stdout,

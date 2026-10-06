@@ -143,6 +143,15 @@ fn losses(stdout: &str) -> Vec<f64> {
         .unwrap_or_default()
 }
 
+/// Every parsed loss must be finite before a bit-identity check on
+/// [`loss_text`]: two streams that both went NaN compare equal as text.
+fn assert_finite_losses(label: &str, stdout: &str) {
+    let l = losses(stdout);
+    if let Some(i) = l.iter().position(|v| !v.is_finite()) {
+        panic!("{label}: non-finite loss at index {i} ({}): {l:?}", l[i]);
+    }
+}
+
 /// Raw loss-stream text (for bit-identity assertions).
 fn loss_text(stdout: &str) -> String {
     stdout
@@ -327,6 +336,8 @@ fn srbf16_batched_step_matches_per_param_gpu() {
 
     let lb = losses(&batched.stdout);
     assert!(lb.len() >= 10, "loss stream too short: {lb:?}");
+    assert_finite_losses("batched", &batched.stdout);
+    assert_finite_losses("per-param", &per_param.stdout);
     assert_eq!(
         loss_text(&batched.stdout),
         loss_text(&per_param.stdout),

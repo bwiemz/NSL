@@ -150,6 +150,15 @@ fn loss_text(stdout: &str) -> Vec<String> {
     seg.lines()
         .map(str::trim)
         .filter(|l| l.starts_with("tensor(["))
+        // A NaN / infinite loss (`NaN`, `inf`) is a failure: replicates that
+        // all went NaN print identical text and would read as bit-identical.
+        .inspect(|l| {
+            let lower = l.to_ascii_lowercase();
+            assert!(
+                !lower.contains("nan") && !lower.contains("inf"),
+                "non-finite loss in the loss stream: {l:?}"
+            );
+        })
         .map(str::to_string)
         .collect()
 }

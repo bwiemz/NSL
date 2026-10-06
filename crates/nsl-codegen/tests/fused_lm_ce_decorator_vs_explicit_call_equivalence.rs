@@ -575,6 +575,14 @@ mod gpu {
         // Path B — "explicit-call pre-cast" outcome.  Same bytes in.
         let loss_b = run_forward_once(&cfg, &x_h16, &w_h16, &bias_h16, &targets, rows);
 
+        // `to_bits` equality passes two identical NaNs, so a kernel that
+        // writes the same garbage twice would read as deterministic.
+        for (path, loss) in [("A", &loss_a), ("B", &loss_b)] {
+            if let Some(i) = loss.iter().position(|v| !v.is_finite()) {
+                panic!("path {path}: non-finite loss at row {i} ({})", loss[i]);
+            }
+        }
+
         // Byte-for-byte assertion via `to_bits()`.
         let mut mismatches = 0usize;
         for i in 0..rows {

@@ -342,6 +342,14 @@ fn save_config(head_dim: i64) -> FlashAttentionConfig {
 }
 
 fn max_abs(a: &[f32], b: &[f32]) -> (f32, usize) {
+    // `d > m` is false for a NaN `d`, so the loop below scores an all-NaN
+    // operand 0.0 — inside every tolerance. Refuse it first. The GPU side
+    // is the first operand at every call site.
+    for (which, xs) in [("gpu", a), ("cpu", b)] {
+        if let Some(i) = xs.iter().position(|v| !v.is_finite()) {
+            panic!("max_abs: non-finite entry in {which} at index {i} ({})", xs[i]);
+        }
+    }
     let mut m = 0f32;
     let mut idx = 0usize;
     for (i, (&x, &y)) in a.iter().zip(b.iter()).enumerate() {
@@ -635,11 +643,25 @@ fn run_save_validation(head_dim: i64) {
     let kproj_gpu: Vec<f32> = kproj_f16.iter().map(|&b| f16_to_f32(b)).collect();
     let vproj_gpu: Vec<f32> = vproj_f16.iter().map(|&b| f16_to_f32(b)).collect();
 
-    // NaN guard.
-    let n_nan = qproj_gpu.iter().chain(&kproj_gpu).chain(&vproj_gpu)
-        .chain(&rmax_gpu).chain(&rsum_gpu)
-        .filter(|v| !v.is_finite())
-        .count();
+    // NaN guard. Asserted HERE, before the comparisons: `max_abs` and the
+    // row_sum / LSE loops below keep their running max with `d > m`, which
+    // is false for a NaN `d`, so a NaN entry would otherwise score as a
+    // perfect match. The LSE is included: it is compared only through the
+    // row_max + ln(row_sum) cross-check loop, which has the same hole.
+    let gpu_arrays = [
+        ("q_proj", &qproj_gpu), ("k_proj", &kproj_gpu), ("v_proj", &vproj_gpu),
+        ("row_max", &rmax_gpu), ("row_sum", &rsum_gpu), ("lse", &lse_gpu),
+    ];
+    let n_nan: usize = gpu_arrays
+        .iter()
+        .map(|(_, xs)| xs.iter().filter(|v| !v.is_finite()).count())
+        .sum();
+    if n_nan > 0 {
+        let first = gpu_arrays.iter().find_map(|(name, xs)| {
+            xs.iter().position(|v| !v.is_finite()).map(|i| format!("{name}[{i}]={}", xs[i]))
+        });
+        panic!("[B1-save] FAIL: {n_nan} non-finite saved/LSE elements (first: {first:?})");
+    }
 
     // ---- Compare ----------------------------------------------------------
     let tol_proj = tol_for_head_dim(hd as u32); // 5e-3 for hd=32
@@ -735,8 +757,6 @@ fn run_save_validation(head_dim: i64) {
         &qproj_gpu[..4.min(qproj_gpu.len())], &cpu.q_proj[..4.min(cpu.q_proj.len())]);
     eprintln!("[B1-save] v_proj[0..4] gpu={:?} cpu={:?}",
         &vproj_gpu[..4.min(vproj_gpu.len())], &cpu.v_proj[..4.min(cpu.v_proj.len())]);
-
-    assert_eq!(n_nan, 0, "[B1-save] FAIL: {n_nan} non-finite saved elements");
 
     // DO NOT relax these tolerances to make this pass. A failure here
     // localizes a real retrofit bug (see the module/diagnosis notes in the

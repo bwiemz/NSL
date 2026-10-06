@@ -55,13 +55,26 @@ fn parse_g(stdout: &str) -> Vec<f64> {
     parse_between(stdout, "G_BEGIN", "G_END")
 }
 
+/// A NaN or infinite value is a FAILURE, not a token to skip. It prints as
+/// `NaN` / `inf` / `-inf`, which the digit split below drops, so an all-NaN
+/// arm used to parse as an empty list and compare nothing.
 fn parse_between(stdout: &str, begin: &str, end: &str) -> Vec<f64> {
     let after = stdout.split_once(begin).map(|(_, r)| r).unwrap_or("");
     let inner = after.split_once(end).map(|(l, _)| l).unwrap_or("");
+    if let Some(t) = inner
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+'))
+        .find(|t| {
+            let word = t.trim_start_matches(['-', '+']).to_ascii_lowercase();
+            matches!(word.as_str(), "nan" | "inf" | "infinity")
+        })
+    {
+        panic!("non-finite value {t:?} printed between {begin} and {end}");
+    }
     inner
         .split(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-' || c == 'e'))
         .filter(|t| !t.is_empty() && t.chars().any(|c| c.is_ascii_digit()))
         .filter_map(|t| t.parse::<f64>().ok())
+        .inspect(|v| assert!(v.is_finite(), "non-finite value {v} printed between {begin} and {end}"))
         .collect()
 }
 

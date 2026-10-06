@@ -115,7 +115,14 @@ fn run(fixture: &std::path::Path, interpreted: bool) -> (String, bool, String) {
                     .strip_prefix("tensor([")
                     .and_then(|r| r.strip_suffix("])"))
                     .unwrap_or(n);
-                if num.parse::<f64>().is_ok() {
+                if let Ok(v) = num.parse::<f64>() {
+                    // `parse` accepts `NaN` / `inf`, and the gate compares
+                    // these strings bit-exactly: two arms that both went NaN
+                    // would match. Refuse a non-finite sum.
+                    assert!(
+                        v.is_finite(),
+                        "AFTER_{name}: non-finite trained-param sum {num:?} (interpreted={interpreted})"
+                    );
                     block.push_str(name);
                     block.push('=');
                     block.push_str(num);

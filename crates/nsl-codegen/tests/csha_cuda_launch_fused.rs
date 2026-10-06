@@ -570,6 +570,22 @@ fn run_fused_config_dmodel(
         eprintln!("  [C3] head {h}: max_abs_diff = {mx:.4e}");
     }
 
+    // `abs > max_abs` is false for a NaN `abs`, so the loop below scores an
+    // all-NaN GPU output 0.0 and every tolerance passes. Refuse it first.
+    if let Some(i) = out_gpu.iter().position(|v| !v.is_finite()) {
+        panic!(
+            "[C3] bq={block_q} bkv={block_kv} hd={head_dim} h={heads} c={causal}: \
+             non-finite entry in out_gpu at idx={i} ({})",
+            out_gpu[i]
+        );
+    }
+    if let Some(i) = cpu_out.iter().position(|v| !v.is_finite()) {
+        panic!(
+            "[C3] bq={block_q} bkv={block_kv} hd={head_dim} h={heads} c={causal}: \
+             non-finite entry in the CPU reference cpu_out at idx={i} ({})",
+            cpu_out[i]
+        );
+    }
     let mut max_abs = 0f32;
     let mut max_idx = 0usize;
     for (i, (&g, &c)) in out_gpu.iter().zip(cpu_out.iter()).enumerate() {

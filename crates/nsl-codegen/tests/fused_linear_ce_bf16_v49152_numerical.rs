@@ -337,6 +337,13 @@ fn bf16_forward_backward_at_v49152_production_scale() {
         nsl_test_cuda_d2h(lse_gpu.as_mut_ptr() as i64, lse_dev, lse_bytes);
     }
 
+    // `d > max_lse_abs` is false for a NaN `d`, so the loop below scores a
+    // NaN lse 0.0 — inside the tolerance. Refuse non-finite outputs first.
+    for (name, xs) in [("loss_gpu", &loss_gpu), ("lse_gpu", &lse_gpu)] {
+        if let Some(i) = xs.iter().position(|v| !v.is_finite()) {
+            panic!("non-finite entry in {name} at row {i} ({})", xs[i]);
+        }
+    }
     let mut gpu_loss_sum = 0f64;
     let mut gpu_nv = 0usize;
     let mut max_lse_abs = 0f64;
@@ -428,6 +435,15 @@ fn bf16_forward_backward_at_v49152_production_scale() {
         &cpu_fwd.lse_per_row, 1.0, rows, V, H,
     );
     eprintln!("CPU backward took {:.1}s", t1.elapsed().as_secs_f64());
+
+    // Finiteness first: every max-error loop below keeps its running max with
+    // `d > max`, which is false for a NaN `d`, so a NaN gradient entry would
+    // otherwise score 0.0 — inside every tolerance.
+    for (name, xs) in [("dx_gpu", &dx_gpu), ("dw_gpu", &dw_gpu), ("dbias_gpu", &dbias_gpu)] {
+        if let Some(i) = xs.iter().position(|v| !v.is_finite()) {
+            panic!("non-finite entry in {name} at index {i} ({})", xs[i]);
+        }
+    }
 
     let mut dx_max_abs = 0f64;
     for row in 0..rows {

@@ -399,6 +399,23 @@ fn run_fused_backward_config_seq(
             raw.iter().map(|&b| f16_to_f32(b)).collect()
         };
         let cpu_out = csha_reference(&inputs, &shape);
+        // `m.max(nan)` keeps `m`, so the per-block fold below scores a NaN
+        // forward output 0.0 and LAST_FWD_PARITY_MAX_ABS reads as a pass.
+        // Refused here rather than returned as an Err: some callers treat
+        // an Err as a skipped launch.
+        if let Some(i) = gpu_out.iter().position(|v| !v.is_finite()) {
+            panic!(
+                "[fwd-parity] seq={seq} bq={block_q}: non-finite entry in gpu_out at index {i} ({})",
+                gpu_out[i]
+            );
+        }
+        if let Some(i) = cpu_out.iter().position(|v| !v.is_finite()) {
+            panic!(
+                "[fwd-parity] seq={seq} bq={block_q}: non-finite entry in the CPU reference \
+                 cpu_out at index {i} ({})",
+                cpu_out[i]
+            );
+        }
         let bq = block_q as usize;
         let mut per_block: Vec<f32> = Vec::new();
         for qb in 0..seq.div_ceil(bq) {
@@ -536,6 +553,7 @@ fn run_fused_backward_config_seq(
 /// top excursions scatter across unrelated cells, all at max-magnitude
 /// values, rel err <= 2.6e-3).
 fn worst_allclose_excess(gpu: &[f32], cpu: &[f32], rtol: f32) -> f32 {
+    assert_finite_operands("worst_allclose_excess", gpu, cpu);
     gpu.iter()
         .zip(cpu.iter())
         .map(|(&g, &c)| (g - c).abs() - rtol * c.abs())
@@ -543,9 +561,23 @@ fn worst_allclose_excess(gpu: &[f32], cpu: &[f32], rtol: f32) -> f32 {
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+    assert_finite_operands("max_abs_diff", a, b);
     a.iter().zip(b.iter())
         .map(|(&x, &y)| (x - y).abs())
         .fold(0f32, f32::max)
+}
+
+/// Refuses a NaN or an infinity in either operand of the two comparators
+/// above. Their folds use `f32::max`, which returns the non-NaN operand, so
+/// a NaN difference drops out: an all-NaN gradient scored 0.0 (and
+/// `worst_allclose_excess` scored -inf) and passed every tolerance. The
+/// first operand is the GPU side at every call site.
+fn assert_finite_operands(comparator: &str, gpu: &[f32], cpu: &[f32]) {
+    for (which, xs) in [("gpu", gpu), ("cpu", cpu)] {
+        if let Some(i) = xs.iter().position(|v| !v.is_finite()) {
+            panic!("{comparator}: non-finite entry in {which} at index {i} ({})", xs[i]);
+        }
+    }
 }
 
 fn tol_for_head_dim(hd: u32) -> f32 {
@@ -656,9 +688,10 @@ fn t6_3_smoke_single_config() {
 /// hd=64 backward at block=32. head_dim=64 with block_q=block_kv=64 exceeds
 /// the 99 KB sm_120 SMEM opt-in cap (181 KB), but block=32 tiles fit (~83 KB).
 /// This is the smallest config that reaches the bug's d-range (d up to 56).
-/// Logs dV/dK/dQ max_abs + worst dV cell; no gate (diagnostic).
+/// Logs dV/dK/dQ max_abs + worst dV cell. No tolerance gate (diagnostic), but
+/// a non-finite GPU or CPU gradient fails it: `max_abs_diff` refuses one.
 #[test]
-#[ignore = "diagnostic: logs dV/dK/dQ max_abs at hd=64 block=32, no gate"]
+#[ignore = "diagnostic: logs dV/dK/dQ max_abs at hd=64 block=32, no tolerance gate; fails on a non-finite gradient"]
 fn t6_3_hd64_block32_dv_probe() {
     if !cuda_available() {
         eprintln!("[hd64] skipping — no CUDA");
@@ -746,6 +779,7 @@ fn t6_3_multitile_seq128() {
                         ));
                     }
                     // Finiteness + shape.
+                    let mut non_finite = false;
                     for (name, g, c) in [
                         ("dq", &gpu.dq, &cpu.dq), ("dk", &gpu.dk, &cpu.dk),
                         ("dv", &gpu.dv, &cpu.dv), ("dwq", &gpu.dwq, &cpu.dwq),
@@ -759,7 +793,19 @@ fn t6_3_multitile_seq128() {
                         }
                         if let Some((i, v)) = g.iter().enumerate().find(|(_, v)| !v.is_finite()) {
                             failures.push(format!("hd={hd} causal={causal} {name}[{i}]={v} not finite"));
+                            non_finite = true;
                         }
+                        if let Some((i, v)) = c.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+                            failures.push(format!(
+                                "hd={hd} causal={causal} CPU reference {name}[{i}]={v} not finite"
+                            ));
+                            non_finite = true;
+                        }
+                    }
+                    // Already a failure. The comparators below would panic
+                    // on it, losing the other configs' report.
+                    if non_finite {
+                        continue;
                     }
                     // dq/dk/dv: absolute gate (seq-scaled).
                     let d_dq = max_abs_diff(&gpu.dq, &cpu.dq);
@@ -837,6 +883,7 @@ fn t6_3_multitile_seq128_rope() {
                             "hd={hd} causal={causal} rope: forward parity {fwd_max_abs:.3e} > {fwd_tol:.0e}"
                         ));
                     }
+                    let mut non_finite = false;
                     for (name, g, c) in [
                         ("dq", &gpu.dq, &cpu.dq), ("dk", &gpu.dk, &cpu.dk),
                         ("dv", &gpu.dv, &cpu.dv), ("dwq", &gpu.dwq, &cpu.dwq),
@@ -848,7 +895,19 @@ fn t6_3_multitile_seq128_rope() {
                         }
                         if let Some((i, v)) = g.iter().enumerate().find(|(_, v)| !v.is_finite()) {
                             failures.push(format!("hd={hd} causal={causal} rope {name}[{i}]={v} not finite"));
+                            non_finite = true;
                         }
+                        if let Some((i, v)) = c.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+                            failures.push(format!(
+                                "hd={hd} causal={causal} rope CPU reference {name}[{i}]={v} not finite"
+                            ));
+                            non_finite = true;
+                        }
+                    }
+                    // Already a failure. The comparators below would panic
+                    // on it, losing the other configs' report.
+                    if non_finite {
+                        continue;
                     }
                     let d_dq = max_abs_diff(&gpu.dq, &cpu.dq);
                     let d_dk = max_abs_diff(&gpu.dk, &cpu.dk);
@@ -965,6 +1024,37 @@ fn t6_3_matrix_sweep_numerical() {
                     }
                 };
 
+                // Finiteness before the reductions, on both the GPU gradient
+                // and the CPU reference. `>= tol` is false for a NaN, and the
+                // comparators panic on one, so a non-finite value on either
+                // side is recorded as a FAIL row here and the rest of the
+                // sweep still reports.
+                let non_finite: Vec<String> = [
+                    ("dq", &gpu.dq, &cpu.dq), ("dk", &gpu.dk, &cpu.dk),
+                    ("dv", &gpu.dv, &cpu.dv), ("dwq", &gpu.dwq, &cpu.dwq),
+                    ("dwk", &gpu.dwk, &cpu.dwk), ("dwv", &gpu.dwv, &cpu.dwv),
+                    ("dx", &gpu.dx, &cpu.dx),
+                ]
+                .into_iter()
+                .flat_map(|(name, g, c)| [("", name, g), ("cpu ", name, c)])
+                .filter_map(|(side, name, xs)| {
+                    xs.iter().position(|v| !v.is_finite())
+                        .map(|i| format!("{side}{name}[{i}]={} non-finite", xs[i]))
+                })
+                .collect();
+                if !non_finite.is_empty() {
+                    eprintln!(
+                        "[sweep] hd={hd} causal={} rope={}: [FAIL] ({})",
+                        causal as u8, rope_q as u8, non_finite.join(",")
+                    );
+                    tally.fail += 1;
+                    tally.fail_detail.push(format!(
+                        "hd={hd} causal={} rope={}: {}",
+                        causal as u8, rope_q as u8, non_finite.join(",")
+                    ));
+                    continue;
+                }
+
                 let dq = max_abs_diff(&gpu.dq, &cpu.dq);
                 let dk = max_abs_diff(&gpu.dk, &cpu.dk);
                 let dv = max_abs_diff(&gpu.dv, &cpu.dv);
@@ -1052,11 +1142,20 @@ fn t6_3_matrix_sweep_structural() {
     for &(bq, bkv, hd, h, dm, causal, rope) in configs {
         match run_fused_backward_config(bq, bkv, hd, h, dm, causal, rope) {
             Ok((gpu, cpu)) => {
+                // `max_abs_diff` panics on a non-finite operand; this
+                // diagnostic logs non-finite gradients instead (below).
+                let diag = |g: &[f32], c: &[f32]| {
+                    if g.iter().chain(c).all(|v| v.is_finite()) {
+                        format!("{:.3e}", max_abs_diff(g, c))
+                    } else {
+                        "non-finite".to_string()
+                    }
+                };
                 eprintln!(
                     "[T6.3 sweep] bq={bq} bkv={bkv} hd={hd} h={h} dm={dm} \
-                     causal={causal} rope={rope}: dq_max_abs={:.3e} dx_max_abs={:.3e}",
-                    max_abs_diff(&gpu.dq, &cpu.dq),
-                    max_abs_diff(&gpu.dx, &cpu.dx),
+                     causal={causal} rope={rope}: dq_max_abs={} dx_max_abs={}",
+                    diag(&gpu.dq, &cpu.dq),
+                    diag(&gpu.dx, &cpu.dx),
                 );
                 // Finiteness check skipped: the Phase 3 inner-loop
                 // placeholder constants can produce NaN/Inf in edge

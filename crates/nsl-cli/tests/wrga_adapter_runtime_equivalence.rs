@@ -392,6 +392,8 @@ fn build_4_fused() {
     for row in &tensor {
         assert_eq!(row.len(), 8);
         for v in row {
+            // `max_diff.max(nan)` keeps `max_diff`: refuse NaN before folding.
+            assert!(v.is_finite(), "non-finite entry in output tensor: {v} in {tensor:?}");
             max_diff = max_diff.max((v - 16.0).abs());
         }
     }
@@ -612,6 +614,8 @@ fn build_4_fused_real_launch() {
     for row in &tensor {
         assert_eq!(row.len(), 8, "expected 8 cols");
         for v in row {
+            // `max_diff.max(nan)` keeps `max_diff`: refuse NaN before folding.
+            assert!(v.is_finite(), "non-finite entry in output tensor: {v} in {tensor:?}");
             max_diff = max_diff.max((v - 16.0).abs());
         }
     }
@@ -729,6 +733,11 @@ fn run_ia3_fixture(src: &str, expected: f32, fixture_name: &str) {
     let mut max_diff: f32 = 0.0;
     for row in &tensor {
         for v in row {
+            // `max_diff.max(nan)` keeps `max_diff`: refuse NaN before folding.
+            assert!(
+                v.is_finite(),
+                "{fixture_name}: non-finite entry in output tensor: {v} in {tensor:?}"
+            );
             max_diff = max_diff.max((v - expected).abs());
         }
     }
@@ -830,6 +839,11 @@ fn run_gatedlora_fixture(src: &str, expected: f32, tolerance: f32, fixture_name:
     for row in &tensor {
         assert_eq!(row.len(), 8, "{fixture_name}: expected 8 cols");
         for v in row {
+            // `max_diff.max(nan)` keeps `max_diff`: refuse NaN before folding.
+            assert!(
+                v.is_finite(),
+                "{fixture_name}: non-finite entry in output tensor: {v} in {tensor:?}"
+            );
             max_diff = max_diff.max((v - expected).abs());
         }
     }
@@ -1425,7 +1439,12 @@ print(w_out)
     let uv = parse(tensors_unfused[0]);
     assert_eq!(fv.len(), uv.len(), "w: shape differs between fused/unfused");
     let mut max_diff = 0.0_f32;
-    for (a, b) in fv.iter().zip(uv.iter()) {
+    for (i, (a, b)) in fv.iter().zip(uv.iter()).enumerate() {
+        // `max_diff.max(nan)` keeps `max_diff`: refuse NaN before folding.
+        assert!(
+            a.is_finite() && b.is_finite(),
+            "w post-step: non-finite entry at index {i} (fused {a}, unfused {b})"
+        );
         max_diff = max_diff.max((a - b).abs());
     }
     assert!(

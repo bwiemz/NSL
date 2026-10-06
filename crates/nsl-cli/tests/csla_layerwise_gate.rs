@@ -67,6 +67,18 @@ struct RunOutput {
     success: bool,
 }
 
+/// A NaN or infinite loss (printed `NaN` / `inf` / `-inf`) is a FAILURE. Every
+/// gate in this file compares loss streams as text (and saved models as
+/// bytes), and two arms that both went NaN match exactly — so every run is
+/// checked here, as its stream is collected, rather than at each comparison.
+fn assert_finite_loss_line(tag: &str, line: &str) {
+    let lower = line.to_ascii_lowercase();
+    assert!(
+        !lower.contains("nan") && !lower.contains("inf"),
+        "non-finite loss in the loss stream (tag={tag}): {line:?}"
+    );
+}
+
 fn run_program(source: &str, tag: &str, cuda: bool, deterministic: bool, extra_args: &[&str]) -> RunOutput {
     run_program_env(source, tag, cuda, deterministic, extra_args, &[])
 }
@@ -128,6 +140,7 @@ fn run_program_env(
             "LOSS_STREAM_BEGIN" => in_stream = true,
             "LOSS_STREAM_END" => in_stream = false,
             l if in_stream => {
+                assert_finite_loss_line(tag, l);
                 loss_stream.push_str(l);
                 loss_stream.push('\n');
             }

@@ -185,8 +185,24 @@ pub fn compute_pertensor_scale(a: &[f32], b: &[f32], fmt: Fp8Format) -> f32 {
     compute_scale(&combined, fmt.dtype_code()) as f32
 }
 
+/// Refuses a NaN or an infinity in `values`, naming the first one.
+///
+/// Both comparators below call it on BOTH operands before folding. Their
+/// reductions use `f32::max`, which returns the non-NaN operand, so a NaN
+/// difference folds away and an all-NaN result scores 0.0 — a perfect match.
+/// Both operands, because several callers compare two runtime paths (the MMA
+/// arm against the fallback, an auto scale against an explicit one) and
+/// either side can be the one that broke.
+pub fn assert_all_finite(values: &[f32], which: &str, label: &str) {
+    if let Some(i) = values.iter().position(|v| !v.is_finite()) {
+        panic!("{label}: non-finite entry in {which} at index {i} ({})", values[i]);
+    }
+}
+
 pub fn assert_rel_err_le(test: &[f32], reference: &[f32], tol: f32, label: &str) {
     assert_eq!(test.len(), reference.len(), "{label}: length mismatch");
+    assert_all_finite(test, "test", label);
+    assert_all_finite(reference, "reference", label);
     let max_ref_abs = reference.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
     if max_ref_abs < 1e-12 {
         let max_abs_err = test.iter().zip(reference).map(|(t, r)| (t - r).abs()).fold(0.0_f32, f32::max);
@@ -199,6 +215,8 @@ pub fn assert_rel_err_le(test: &[f32], reference: &[f32], tol: f32, label: &str)
 
 pub fn assert_abs_err_le(test: &[f32], reference: &[f32], tol: f32, label: &str) {
     assert_eq!(test.len(), reference.len(), "{label}: length mismatch");
+    assert_all_finite(test, "test", label);
+    assert_all_finite(reference, "reference", label);
     let max_abs_err = test.iter().zip(reference).map(|(t, r)| (t - r).abs()).fold(0.0_f32, f32::max);
     assert!(max_abs_err <= tol, "{label}: max abs err {max_abs_err} > tol {tol}");
 }

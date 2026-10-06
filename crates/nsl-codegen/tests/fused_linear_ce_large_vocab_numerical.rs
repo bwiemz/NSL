@@ -242,6 +242,16 @@ fn run_scale(scale: &ScaleParams) {
             assert_eq!(lse_gpu[row], 0.0f32, "skip-identity: lse row={row}");
             continue;
         }
+        // `x > max` is false for a NaN `x`, so the folds below would skip a
+        // NaN row on either side. Refuse it first.
+        for (which, val) in [
+            ("loss_gpu", loss_gpu[row] as f64),
+            ("lse_gpu", lse_gpu[row] as f64),
+            ("ref_losses", ref_losses[row]),
+            ("ref_lses", ref_lses[row]),
+        ] {
+            assert!(val.is_finite(), "{name}: non-finite {which} at row {row} ({val})");
+        }
         let loss_diff = (loss_gpu[row] as f64 - ref_losses[row]).abs();
         let denom = ref_losses[row].abs().max(1.0);
         let loss_rel = loss_diff / denom;

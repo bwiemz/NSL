@@ -65,6 +65,8 @@ fn run_muon_mlp(tag: &str, extra: &[&str]) -> RunOut {
     }
 }
 
+/// A NaN or infinite loss is a FAILURE: the gates below compare losses bit-
+/// for-bit (`to_bits`), and two runs that both went NaN match exactly.
 fn losses(stdout: &str) -> Vec<f64> {
     stdout
         .split("LOSS_STREAM_BEGIN")
@@ -79,6 +81,7 @@ fn losses(stdout: &str) -> Vec<f64> {
                 .parse::<f64>()
                 .ok()
         })
+        .inspect(|v| assert!(v.is_finite(), "non-finite loss in the loss stream: {v}"))
         .collect()
 }
 

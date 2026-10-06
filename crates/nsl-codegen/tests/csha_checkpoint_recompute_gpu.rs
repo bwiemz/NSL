@@ -99,9 +99,23 @@ fn g14_e_cuda_available_honors_skip_env() {
     unsafe { std::env::remove_var("NSL_SKIP_CUDA_TESTS") };
 }
 
+/// Refuses a NaN or an infinity in either operand of the two comparators
+/// below. Their folds use `f32::max`, which returns the non-NaN operand, so a
+/// NaN difference drops out and an all-NaN gradient scores 0.0 — a PASS.
+/// Both operands: `diff_summary` also compares path B against path A, two
+/// GPU results.
+fn assert_finite_operands(comparator: &str, a: &[f32], b: &[f32]) {
+    for (which, xs) in [("a", a), ("b", b)] {
+        if let Some(i) = xs.iter().position(|v| !v.is_finite()) {
+            panic!("{comparator}: non-finite entry in {which} at index {i} ({})", xs[i]);
+        }
+    }
+}
+
 /// max(|a[i] - b[i]|).
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len(), "shape mismatch in max_abs_diff");
+    assert_finite_operands("max_abs_diff", a, b);
     a.iter()
         .zip(b.iter())
         .map(|(&x, &y)| (x - y).abs())
@@ -111,6 +125,7 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 /// max(|a[i] - b[i]| / max(|b[i]|, eps)). Relative diff.
 fn max_rel_diff(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len(), "shape mismatch in max_rel_diff");
+    assert_finite_operands("max_rel_diff", a, b);
     a.iter()
         .zip(b.iter())
         .map(|(&x, &y)| (x - y).abs() / y.abs().max(1e-6))
@@ -906,6 +921,12 @@ fn diff_summary(
     let atol_dx  = 1e-2f32; let rtol_dx  = 2e-2f32;
 
     let check = |name: &str, x: &[f32], y: &[f32], atol: f32, rtol: f32| -> bool {
+        // Named here; the comparators refuse it too, but anonymously.
+        for (which, v) in [("lhs", x), ("rhs", y)] {
+            if let Some(i) = v.iter().position(|e| !e.is_finite()) {
+                panic!("[{label}] {name}: non-finite entry in {which} at index {i} ({})", v[i]);
+            }
+        }
         let atol = atol_f16_aware(atol, y);
         let abs = max_abs_diff(x, y);
         let rel = max_rel_diff(x, y);
@@ -944,6 +965,12 @@ fn assert_grads_within_tolerance(
     let rtol_dx  = 2e-2f32;
 
     let check = |name: &str, x: &[f32], y: &[f32], atol: f32, rtol: f32| -> (f32, f32, bool) {
+        // Named here; the comparators refuse it too, but anonymously.
+        for (which, v) in [("lhs", x), ("rhs", y)] {
+            if let Some(i) = v.iter().position(|e| !e.is_finite()) {
+                panic!("[{label}] {name}: non-finite entry in {which} at index {i} ({})", v[i]);
+            }
+        }
         let atol = atol_f16_aware(atol, y);
         let abs = max_abs_diff(x, y);
         let rel = max_rel_diff(x, y);

@@ -85,13 +85,26 @@ fn run_gpu_fixture_profiled(tag: &str, fuse: bool) -> (String, String) {
     (stderr, json)
 }
 
+/// A NaN or infinite value is a FAILURE, not a token to skip. It prints as
+/// `NaN` / `inf` / `-inf`, which the digit split below drops, so an all-NaN
+/// arm used to parse as an empty list and compare nothing.
 fn parse_between(stdout: &str, begin: &str, end: &str) -> Vec<f64> {
     let after = stdout.split_once(begin).map(|(_, r)| r).unwrap_or("");
     let inner = after.split_once(end).map(|(l, _)| l).unwrap_or("");
+    if let Some(t) = inner
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+'))
+        .find(|t| {
+            let word = t.trim_start_matches(['-', '+']).to_ascii_lowercase();
+            matches!(word.as_str(), "nan" | "inf" | "infinity")
+        })
+    {
+        panic!("non-finite value {t:?} printed between {begin} and {end}");
+    }
     inner
         .split(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-' || c == 'e'))
         .filter(|t| !t.is_empty() && t.chars().any(|c| c.is_ascii_digit()))
         .filter_map(|t| t.parse::<f64>().ok())
+        .inspect(|v| assert!(v.is_finite(), "non-finite value {v} printed between {begin} and {end}"))
         .collect()
 }
 
@@ -137,6 +150,7 @@ fn swiglu_fused_backward_gpu_deterministic_and_matches_reference() {
         let f = parse_between(&a, bg, en);
         let t = parse_between(&tape, bg, en);
         assert_eq!(f.len(), 32, "{name}: GPU produced {} values", f.len());
+        assert_eq!(t.len(), 32, "{name}: CPU tape reference produced {} values", t.len());
         for (i, (x, y)) in f.iter().zip(&t).enumerate() {
             assert!(
                 (x - y).abs() < 2e-3,
@@ -214,6 +228,11 @@ fn swiglu_peephole_fires_and_is_bit_exact_cpu() {
         let section = |s: &str| s.split_once(b).and_then(|(_, r)| r.split_once(e)).map(|(v, _)| v.to_string());
         let (f, p) = (section(&fused_out), section(&plain_out));
         assert!(f.is_some(), "{b} missing from fused output:\n{fused_out}");
+        // A text compare passes two identical NaN sections; `parse_between`
+        // refuses a non-finite value.
+        for out in [&fused_out, &plain_out] {
+            parse_between(out, b, e);
+        }
         assert_eq!(f, p, "{b}: fused and unfused weights differ");
     }
 }

@@ -156,6 +156,16 @@ fn run_case(case: &Case) {
             );
             continue;
         }
+        // `m.max(nan)` keeps `m`, so the running maxima below would drop a
+        // NaN row and score it 0.0. Refuse it first.
+        for (name, xs) in [("loss_gpu", &loss_gpu), ("lse_gpu", &lse_gpu)] {
+            assert!(
+                xs[r].is_finite(),
+                "non-finite entry in {name} at row {r} ({}) (has_bias={})",
+                xs[r],
+                case.has_bias
+            );
+        }
         let le = (loss_gpu[r] as f64 - fwd_ref.loss_per_row[r]).abs()
             / fwd_ref.loss_per_row[r].abs().max(1.0);
         let se = (lse_gpu[r] as f64 - fwd_ref.lse_per_row[r]).abs()
@@ -200,6 +210,14 @@ fn run_case(case: &Case) {
     let dw_gpu = download_f32(dw_d, V * H);
 
     let check = |name: &str, got: &[f32], want: &[f64], bound: f64| {
+        // `m.max(nan)` keeps `m`, so the fold below drops a NaN error and
+        // scores an all-NaN gradient 0.0. Refuse it first.
+        if let Some(i) = got.iter().position(|v| !v.is_finite()) {
+            panic!(
+                "{name}: non-finite entry in gpu at index {i} ({}) (has_bias={})",
+                got[i], case.has_bias
+            );
+        }
         let ref_mag = want.iter().fold(0f64, |m, &v| m.max(v.abs()));
         assert!(
             ref_mag >= bound * 10.0,

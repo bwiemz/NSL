@@ -190,6 +190,20 @@ fn validate_dkdv_for_source(cfg: &FlashAttentionConfig, source: FSource, seq: us
 
     let rel_tol = rel_tol_for_head_dim(hd as u32);
 
+    // Finiteness first. Every gate below reduces with `.fold(0.0, f32::max)`,
+    // which returns the non-NaN operand: a NaN difference drops out of
+    // `max_abs`, and NaN entries drop out of `max|gpu|`, so a partly-NaN
+    // output with finite large entries passes both the zero-output guard and
+    // the relative gate.
+    for (name, xs) in [("dv_gpu", &dv_gpu), ("dk_gpu", &dk_gpu)] {
+        if let Some(i) = xs.iter().position(|v| !v.is_finite()) {
+            panic!(
+                "FSource={:?} hd={} seq={}: non-finite entry in {name} at index {i} ({})",
+                source, hd, seq, xs[i]
+            );
+        }
+    }
+
     // --- dV gate ---
     let dv_max_abs = dv_gpu.iter().zip(dv_ref.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
     let dv_max_ref = dv_ref.iter().map(|a| a.abs()).fold(0.0f32, f32::max);

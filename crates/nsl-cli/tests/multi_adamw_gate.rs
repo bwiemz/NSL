@@ -93,6 +93,16 @@ fn loss_stream(stdout: &str) -> Vec<String> {
         .map(str::trim)
         // GPU losses print as `tensor([..])`, CPU losses as bare scalars.
         .filter(|l| l.starts_with("tensor([") || l.parse::<f64>().is_ok())
+        // A NaN / infinite loss (`NaN`, `inf`) is a failure: every gate here
+        // compares the streams bit-for-bit, and two arms that both went NaN
+        // print identical streams (and save identical models).
+        .inspect(|l| {
+            let lower = l.to_ascii_lowercase();
+            assert!(
+                !lower.contains("nan") && !lower.contains("inf"),
+                "non-finite loss in the loss stream: {l:?}"
+            );
+        })
         .map(str::to_string)
         .collect()
 }

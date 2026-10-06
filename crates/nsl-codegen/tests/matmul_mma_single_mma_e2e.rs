@@ -413,6 +413,27 @@ fn single_mma_matches_cpu_reference() {
     }
 
     // -- Compare.
+    // `gpu_d` starts as NaN so an unwritten slot shows up — but
+    // `diff > max_abs` is false for a NaN `diff`, so the loop below would
+    // score that slot (or a NaN the MMA produced) 0.0 and pass. Refuse it.
+    if let Some(i) = gpu_d.iter().position(|v| !v.is_finite()) {
+        panic!(
+            "[mma-probe] non-finite entry in gpu_d at (row={}, col={}) ({}) — \
+             an unwritten D-fragment slot or a NaN from the MMA",
+            i as u32 / N,
+            i as u32 % N,
+            gpu_d[i]
+        );
+    }
+    if let Some(i) = cpu_d.iter().position(|v| !v.is_finite()) {
+        panic!(
+            "[mma-probe] non-finite entry in cpu_d at (row={}, col={}) ({}) — \
+             the CPU reference itself is broken",
+            i as u32 / N,
+            i as u32 % N,
+            cpu_d[i]
+        );
+    }
     let mut max_abs = 0f32;
     let mut max_row = 0u32;
     let mut max_col = 0u32;

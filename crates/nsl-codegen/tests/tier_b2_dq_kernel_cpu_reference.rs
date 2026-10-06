@@ -95,6 +95,18 @@ fn tol_for_head_dim(hd: u32) -> f32 {
     }
 }
 
+/// Panics on a NaN or an infinity in a GPU output, naming the array and the
+/// first offending index. Called before every `.fold(0.0, f32::max)`
+/// reduction below: `f32::max` returns the non-NaN operand, so a NaN
+/// difference drops out and an all-NaN output scores 0.0 — inside the
+/// tolerance. The zero-output guard has the same hole: `max|gpu|` skips NaN
+/// entries, so a partly-NaN dQ with finite large entries passes it.
+fn assert_all_finite(what: &str, xs: &[f32]) {
+    if let Some(i) = xs.iter().position(|v| !v.is_finite()) {
+        panic!("{what}: non-finite entry at index {i} ({})", xs[i]);
+    }
+}
+
 /// Tiered RELATIVE tolerance for the dQ parity gate (Phase 2.7 non-vacuous gate).
 ///
 /// Scales with f16 MMA accumulation depth (~head_dim). Used as
@@ -213,6 +225,7 @@ fn tier_b2_d_prepass_vs_cpu_reduction() {
     let d_gpu = run_d_prepass_on_gpu(&ptx, &d_o_host, &o_host, batch, heads, seq, hd);
 
     // Compare.
+    assert_all_finite("D pre-pass d_gpu", &d_gpu);
     let tol = tol_for_head_dim(hd as u32);
     let max_abs = d_ref
         .iter()
@@ -305,6 +318,7 @@ fn tier_b2_d_prepass_grid_dispatch_and_hd_sweep() {
             &ptx, &d_o_host, &o_host, case.batch, case.heads, case.seq, hd,
         );
 
+        assert_all_finite("D pre-pass sweep d_gpu", &d_gpu);
         let tol = tol_for_head_dim(hd as u32);
         let max_abs = d_ref
             .iter()
@@ -424,6 +438,7 @@ fn validate_dq_for_source(cfg: &FlashAttentionConfig, source: FSource, seq: usiz
         &fwd.q_saved, &fwd.k_saved, &fwd.v_saved, &fwd.o, &d_o, batch, heads, seq, cfg,
     );
 
+    assert_all_finite(&format!("FSource={source:?} hd={hd} seq={seq}: dq_gpu"), &dq_gpu);
     let max_abs = dq_gpu
         .iter()
         .zip(dq_ref.iter())

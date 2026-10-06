@@ -454,6 +454,13 @@ fn fused_linear_ce_gpu_forward_and_backward() {
         &x_f64, &w_f64, &bias_f64, &targets_i32, &ref_lse, 1.0, rows, V, H,
     );
 
+    // The cross-check below and the dx loop fold with `d > max`, which skips
+    // a NaN. `cpu_lce_backward_f64` refuses a non-finite output itself; the
+    // local f32 reference does not.
+    if let Some(i) = dx_ref.iter().position(|v| !v.is_finite()) {
+        panic!("non-finite entry in dx_ref at index {i} ({})", dx_ref[i]);
+    }
+
     // Cross-check the two references against each other on dx before either
     // is used as ground truth. They are independent implementations, so
     // agreement here is what licenses trusting the helper's dW/dbias — which
@@ -476,6 +483,15 @@ fn fused_linear_ce_gpu_forward_and_backward() {
          {ref_disagreement:.3e} — one of them is wrong, so neither can be \
          trusted for the dW/dbias comparison below"
     );
+
+    // Finiteness first. Every max-error loop below keeps its running max with
+    // `err > max`, which is false for a NaN `err`, so a NaN gradient entry
+    // would otherwise score 0.0 — inside every tolerance.
+    for (name, xs) in [("dx_gpu", &dx_gpu), ("dw_gpu", &dw_gpu), ("dbias_gpu", &dbias_gpu)] {
+        if let Some(i) = xs.iter().position(|v| !v.is_finite()) {
+            panic!("non-finite entry in {name} at index {i} ({})", xs[i]);
+        }
+    }
 
     // ── 7. Compare dx ─────────────────────────────────────────────────────
 

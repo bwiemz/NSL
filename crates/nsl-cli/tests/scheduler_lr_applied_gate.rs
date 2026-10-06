@@ -139,6 +139,20 @@ fn losses(stdout: &str) -> Vec<String> {
         .collect()
 }
 
+/// Every loss of a freeze-check arm must be finite. The freeze checks compare
+/// loss strings byte-for-byte, and a run that went NaN prints the same `NaN`
+/// every step — a perfect "freeze". (`losses` keeps NaN lines on purpose: the
+/// diverge test counts one as a blow-up.)
+fn assert_finite_losses(label: &str, l: &[String]) {
+    if let Some((i, v)) = l
+        .iter()
+        .enumerate()
+        .find(|(_, v)| !v.parse::<f64>().is_ok_and(f64::is_finite))
+    {
+        panic!("{label}: non-finite loss at index {i} ({v:?}):\n{l:?}");
+    }
+}
+
 const FREEZE: &str = "    scheduler: warmup_cosine(warmup_steps = 0, total_steps = 1, min_lr = 0.0)\n";
 const EXPLODE: &str =
     "    scheduler: warmup_cosine(warmup_steps = 0, total_steps = 1, min_lr = 100.0)\n";
@@ -150,6 +164,7 @@ fn a_schedule_that_drives_lr_to_zero_freezes_training() {
     let (ok, ctl) = run("control", &fixture(""));
     assert!(ok, "unscheduled control failed to run:\n{ctl}");
     let ctl_losses = losses(&ctl);
+    assert_finite_losses("control", &ctl_losses);
     assert!(
         ctl_losses.len() >= 6,
         "control produced too few losses to judge:\n{ctl}"
@@ -163,6 +178,7 @@ fn a_schedule_that_drives_lr_to_zero_freezes_training() {
     let (ok, out) = run("freeze", &fixture(FREEZE));
     assert!(ok, "freeze arm failed to run:\n{out}");
     let l = losses(&out);
+    assert_finite_losses("freeze", &l);
     assert_eq!(l.len(), ctl_losses.len(), "arms must be the same length");
 
     // lr hits 0 at the first scheduled step, so from that point the weights
@@ -300,6 +316,7 @@ fn assert_route_freeze_differential(r: &Route) {
     let (ok, ctl, ctl_err) = run_route(r, "control", &route_fixture(r, ""));
     assert!(ok, "[{}] unscheduled control failed:\n{ctl}\n{ctl_err}", r.tag);
     let ctl_losses = losses(&ctl);
+    assert_finite_losses(&format!("[{}] control", r.tag), &ctl_losses);
     assert!(
         ctl_losses.len() >= 6,
         "[{}] control produced too few losses:\n{ctl}",
@@ -331,6 +348,7 @@ fn assert_route_freeze_differential(r: &Route) {
         );
     }
     let l = losses(&out);
+    assert_finite_losses(&format!("[{}] freeze", r.tag), &l);
     assert_eq!(
         l.len(),
         ctl_losses.len(),
@@ -556,6 +574,7 @@ fn assert_csla_freeze(tag: &str, envs: &[(&str, &str)]) {
          CSLA window path:\n{ctl_err}"
     );
     let ctl_losses = losses(&ctl);
+    assert_finite_losses(&format!("[csla {tag}] control"), &ctl_losses);
     assert!(ctl_losses.len() >= 6, "[csla {tag}] too few losses:\n{ctl}");
     assert!(
         ctl_losses.last() != ctl_losses.first(),
@@ -570,6 +589,7 @@ fn assert_csla_freeze(tag: &str, envs: &[(&str, &str)]) {
         "[csla {tag}] freeze arm lost the route witness:\n{err}"
     );
     let l = losses(&out);
+    assert_finite_losses(&format!("[csla {tag}] freeze"), &l);
     assert_eq!(l.len(), ctl_losses.len(), "[csla {tag}] arms must match in length");
     // EPOCH ECHO. The schedule zeroes lr from micro-step 1 on, so after the
     // first window's base-lr update the params never move again — epoch 2

@@ -50,6 +50,24 @@ pub extern "C" fn nsl_assert_eq_float(a: f64, b: f64, msg_ptr: i64, msg_len: i64
     }
 }
 
+/// `|a - b| <= atol + rtol * |b|`, refusing what that formula lets through
+/// as written with `>`: a NaN on either side makes `diff` (or `tol`) NaN, and
+/// `NaN > tol` is false, so a NaN compared as close to anything. An infinity
+/// is close only to the same infinity — the formula alone would accept
+/// `1.0` against `+inf` (`tol` is `inf` too) and `+inf` against `-inf`.
+/// NaN is never close, not even to NaN (numpy / torch `equal_nan=False`).
+fn is_close(a: f64, b: f64, rtol: f64, atol: f64) -> bool {
+    if a.is_nan() || b.is_nan() {
+        return false;
+    }
+    if a.is_infinite() || b.is_infinite() {
+        return a == b;
+    }
+    let diff = (a - b).abs();
+    // `<=`, not `!(diff > tol)`: a NaN tolerance (a NaN rtol/atol) fails too.
+    diff <= atol + rtol * b.abs()
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_assert_close(
     a_ptr: i64,
@@ -95,9 +113,9 @@ pub extern "C" fn nsl_assert_close(
     for i in 0..a.len as usize {
         let va = a.read_scalar_as_f64(i);
         let vb = b.read_scalar_as_f64(i);
-        let diff = (va - vb).abs();
-        let tol = atol + rtol * vb.abs();
-        if diff > tol {
+        if !is_close(va, vb, rtol, atol) {
+            let diff = (va - vb).abs();
+            let tol = atol + rtol * vb.abs();
             crate::nsl_log!(ERROR, "assert", 
                 "ASSERTION FAILED: {} (element {} not close: {} vs {}, diff={}, tol={})",
                 msg, i, va, vb, diff, tol
@@ -110,4 +128,35 @@ pub extern "C" fn nsl_assert_close(
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_exit(code: i64) {
     std::process::exit(code as i32);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_close;
+
+    #[test]
+    fn a_nan_is_never_close() {
+        // The `diff > tol` form this replaced passed every one of these.
+        assert!(!is_close(f64::NAN, 1.0, 1e-5, 1e-8));
+        assert!(!is_close(1.0, f64::NAN, 1e-5, 1e-8));
+        assert!(!is_close(f64::NAN, f64::NAN, 1e-5, 1e-8));
+        assert!(!is_close(1.0, 1.0, f64::NAN, 1e-8));
+    }
+
+    #[test]
+    fn an_infinity_is_close_only_to_the_same_infinity() {
+        assert!(is_close(f64::INFINITY, f64::INFINITY, 1e-5, 1e-8));
+        assert!(is_close(f64::NEG_INFINITY, f64::NEG_INFINITY, 1e-5, 1e-8));
+        assert!(!is_close(f64::INFINITY, f64::NEG_INFINITY, 1e-5, 1e-8));
+        assert!(!is_close(1.0, f64::INFINITY, 1e-5, 1e-8));
+        assert!(!is_close(f64::INFINITY, 1.0, 1e-5, 1e-8));
+    }
+
+    #[test]
+    fn finite_values_keep_the_atol_rtol_contract() {
+        assert!(is_close(1.0, 1.0, 0.0, 0.0));
+        assert!(is_close(1.0 + 1e-9, 1.0, 0.0, 1e-8));
+        assert!(is_close(100.5, 100.0, 1e-2, 0.0));
+        assert!(!is_close(1.1, 1.0, 1e-5, 1e-8));
+    }
 }

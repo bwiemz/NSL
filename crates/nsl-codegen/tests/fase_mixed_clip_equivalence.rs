@@ -115,6 +115,14 @@ fn tensor<'t>(tensors: &'t HashMap<String, Vec<f32>>, bare: &str) -> &'t Vec<f32
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len(), "tensor length mismatch");
+    // `f32::max` returns the non-NaN operand, so the fold below drops a NaN
+    // difference and two diverged-to-NaN checkpoints score 0.0. Refuse it
+    // first, on both operands: both are training runs under test.
+    for (which, xs) in [("a", a), ("b", b)] {
+        if let Some(i) = xs.iter().position(|v| !v.is_finite()) {
+            panic!("max_abs_diff: non-finite entry in {which} at index {i} ({})", xs[i]);
+        }
+    }
     a.iter()
         .zip(b)
         .map(|(x, y)| (x - y).abs())

@@ -133,6 +133,15 @@ fn cpu_reference(
 }
 
 fn max_abs(a: &[f64], b: &[f64]) -> f64 {
+    // `f64::max` returns the non-NaN operand, so the fold below drops a NaN
+    // difference and scores an all-NaN result 0.0 — inside every tolerance.
+    // Refuse it first, on both operands: two of the call sites compare two
+    // runtime paths (fused vs decomposed).
+    for (which, xs) in [("a", a), ("b", b)] {
+        if let Some(i) = xs.iter().position(|v| !v.is_finite()) {
+            panic!("max_abs: non-finite entry in {which} at index {i} ({})", xs[i]);
+        }
+    }
     a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max)
 }
 

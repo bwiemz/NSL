@@ -420,6 +420,17 @@ fn assert_gradient(
         gpu.len(),
         reference.len()
     );
+    // (0) finiteness. Every reduction below folds with `f32::max`, which
+    // returns the non-NaN operand: a NaN difference drops out of `max_abs`,
+    // and NaN entries drop out of `max|gpu|`, so a partly-NaN gradient with
+    // finite large entries passes both the zero-output guard and the
+    // relative gate.
+    if let Some(i) = gpu.iter().position(|v| !v.is_finite()) {
+        panic!(
+            "FSource={:?} hd={} seq={} {}: non-finite entry in gpu at index {i} ({})",
+            source, hd, seq, name, gpu[i]
+        );
+    }
     let max_abs = gpu
         .iter()
         .zip(reference.iter())

@@ -273,6 +273,14 @@ fn run_variant(
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> (f32, usize) {
+    // `d > max_abs` is false for a NaN `d`, so the loop below scores an
+    // all-NaN operand 0.0 — inside the tolerance. Refuse it first, on both
+    // operands: both are GPU results (base kernel vs Tier-B).
+    for (which, xs) in [("a", a), ("b", b)] {
+        if let Some(i) = xs.iter().position(|v| !v.is_finite()) {
+            panic!("max_abs_diff: non-finite entry in {which} at index {i} ({})", xs[i]);
+        }
+    }
     let mut max_abs = 0f32;
     let mut max_idx = 0usize;
     for (i, (&ai, &bi)) in a.iter().zip(b.iter()).enumerate() {
@@ -320,6 +328,15 @@ fn assert_tier_b_matches_base(name: &str, b: usize, h: usize, s: usize, seg: &[u
         "{name}: the Tier-B variant was NOT launched (counter {tb_launches_before} -> \
          {tb_launches_after}) — runtime gate declined or dispatch fell back to base"
     );
+    // Named here; `max_abs_diff` refuses them too, but anonymously.
+    for (which, xs) in [
+        ("base out", &base.out), ("base lse", &base.lse),
+        ("tier-b out", &tb.out), ("tier-b lse", &tb.lse),
+    ] {
+        if let Some(i) = xs.iter().position(|v| !v.is_finite()) {
+            panic!("{name}: non-finite entry in {which} at index {i} ({})", xs[i]);
+        }
+    }
     let (out_err, out_idx) = max_abs_diff(&base.out, &tb.out);
     let (lse_err, lse_idx) = max_abs_diff(&base.lse, &tb.lse);
     eprintln!(

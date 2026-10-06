@@ -910,6 +910,15 @@ fn run_cert(c: &Cert, mode: Mode) -> Result<(), String> {
     }
 
     let base_loss = oracle_loss(c, &env);
+    // The oracle is mode-independent, so a broken one panics rather than
+    // returning an Err (which a `known` entry would absorb). A NaN oracle
+    // would also pass the loss check below: `x > NaN` is false.
+    assert!(
+        base_loss.is_finite(),
+        "{}: the f64 oracle loss is non-finite ({base_loss}) — the oracle or its \
+         inputs are broken, not the AD rule",
+        c.name
+    );
     let mut failures = Vec::new();
     for &w in c.wrt {
         let loss = parse_between(
@@ -919,7 +928,8 @@ fn run_cert(c: &Cert, mode: Mode) -> Result<(), String> {
         )
         .and_then(|v| v.first().copied())
         .ok_or_else(|| format!("loss for {w} not printed"))?;
-        if (loss - base_loss).abs() > 1e-4 * base_loss.abs().max(1.0) {
+        // `!is_finite` first: `NaN > tol` is false, so a NaN loss would pass.
+        if !loss.is_finite() || (loss - base_loss).abs() > 1e-4 * base_loss.abs().max(1.0) {
             failures.push(format!("forward: loss {loss} vs oracle {base_loss}"));
         }
         let got = parse_between(
@@ -946,6 +956,23 @@ fn run_cert(c: &Cert, mode: Mode) -> Result<(), String> {
                 (oracle_loss(c, &up) - oracle_loss(c, &down)) / (2.0 * h)
             })
             .collect();
+        // `m.max(nan)` keeps `m` and `d > acc.1` is false for a NaN `d`, so a
+        // NaN oracle gradient would drop out of `scale` and of the worst-error
+        // fold below. Mode-independent, so it panics (see `base_loss`).
+        if let Some(k) = want.iter().position(|v| !v.is_finite()) {
+            panic!(
+                "{}: the f64 finite-difference oracle d{w}[{k}] is non-finite ({})",
+                c.name, want[k]
+            );
+        }
+        // `d > acc.1` is false for a NaN `d`, so the fold below would skip a
+        // NaN gradient entry. `parse_between` drops non-numeric tokens today
+        // (the length check above then fails), but the comparator must not
+        // depend on that.
+        if let Some(k) = got.iter().position(|v| !v.is_finite()) {
+            failures.push(format!("d{w}[{k}] = {} is non-finite", got[k]));
+            continue;
+        }
         let scale = want.iter().fold(1.0f64, |m, v| m.max(v.abs()));
         let (worst_k, worst) = got
             .iter()

@@ -90,6 +90,18 @@ fn read_cpu(t: i64, len: usize) -> Vec<f32> {
     (0..len).map(|i| unsafe { *src.add(i) }).collect()
 }
 
+/// Panics on a NaN or an infinity, naming the array and the first index.
+///
+/// The max-diff gates below reduce with `f32::max`, which returns the non-NaN
+/// operand: a NaN difference drops out and an all-NaN result scores 0.0,
+/// inside the tolerance. Called on BOTH runs before each reduction — the CPU
+/// run is runtime code too, not an independent oracle.
+fn assert_all_finite(what: &str, xs: &[f32]) {
+    if let Some(i) = xs.iter().position(|v| !v.is_finite()) {
+        panic!("{what}: non-finite entry at index {i} ({})", xs[i]);
+    }
+}
+
 /// Deterministic pseudo-random values (LCG), same generator as the flash GPU tests.
 fn det_seq(seed: u32, n: usize) -> Vec<f32> {
     let mut s = seed;
@@ -194,6 +206,8 @@ fn fp8_e5m2_backward_with_gpu_view_operands_matches_the_cpu_run() {
 
     let got = read_gpu(out_gpu, m * k);
     let expect = read_cpu(out_cpu, m * k);
+    assert_all_finite("E5M2 backward, GPU run", &got);
+    assert_all_finite("E5M2 backward, CPU run", &expect);
     let max_diff = got
         .iter()
         .zip(expect.iter())
@@ -272,6 +286,8 @@ fn tape_fp8_training_backward_on_gpu_matches_the_cpu_run() {
     let (ga_gpu, gb_gpu) = run(true);
 
     for (name, gpu, cpu) in [("grad_A", &ga_gpu, &ga_cpu), ("grad_B", &gb_gpu, &gb_cpu)] {
+        assert_all_finite(&format!("{name}, GPU tape run"), gpu);
+        assert_all_finite(&format!("{name}, CPU tape run"), cpu);
         let max_diff = gpu
             .iter()
             .zip(cpu.iter())

@@ -138,6 +138,14 @@ fn oracle(g: &Geom, q: &[f32], k: &[f32], v: &[f32]) -> (Vec<f32>, Vec<f32>) {
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> (f32, usize) {
+    // `df > max_abs` is false for a NaN `df`, so the loop below scores an
+    // all-NaN operand 0.0 — inside the tolerance. Refuse it first. Both
+    // operands: the call sites pass the GPU result second.
+    for (which, xs) in [("a", a), ("b", b)] {
+        if let Some(i) = xs.iter().position(|v| !v.is_finite()) {
+            panic!("max_abs_diff: non-finite entry in {which} at index {i} ({})", xs[i]);
+        }
+    }
     let mut max_abs = 0f32;
     let mut max_idx = 0usize;
     for (i, (&ai, &bi)) in a.iter().zip(b.iter()).enumerate() {
@@ -239,6 +247,11 @@ fn run_case(name: &str, g: Geom) {
     assert!(
         gpu_out.iter().all(|x| x.is_finite()),
         "{name}: non-finite output"
+    );
+    assert!(
+        gpu_lse.iter().all(|x| x.is_finite()),
+        "{name}: non-finite entry in lse (first at index {:?})",
+        gpu_lse.iter().position(|x| !x.is_finite())
     );
     let norm: f32 = gpu_out.iter().map(|x| x * x).sum();
     assert!(norm > 1e-6, "{name}: output near-all-zero (norm={norm})");

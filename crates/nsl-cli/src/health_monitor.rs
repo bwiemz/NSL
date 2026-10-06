@@ -52,11 +52,21 @@ impl HealthRenderer {
             out.push_str("Per-layer gradient norms:\n");
             let mut layers: Vec<_> = snap.per_layer_grad_norm.iter().collect();
             layers.sort_by_key(|(idx, _)| **idx);
+            // Finite norms only: an infinite one would zero every other bar.
             let max_norm = snap.per_layer_grad_norm.values().cloned()
+                .filter(|v| v.is_finite())
                 .fold(0.0_f64, f64::max).max(1e-9);
             for (idx, norm) in &layers {
                 let bar = render_bar(**norm, max_norm);
-                let tag = if **norm > GRAD_NORM_HEALTHY_MAX { "⚠ elevated" } else { "(healthy)" };
+                // Non-finite FIRST: `NaN > max` is false, so a NaN norm would
+                // otherwise be labelled healthy.
+                let tag = if !norm.is_finite() {
+                    "⚠ non-finite"
+                } else if **norm > GRAD_NORM_HEALTHY_MAX {
+                    "⚠ elevated"
+                } else {
+                    "(healthy)"
+                };
                 out.push_str(&format!(" L{}: {} {:>6.1} {}\n", idx, bar, norm, tag));
             }
             out.push('\n');
@@ -67,7 +77,7 @@ impl HealthRenderer {
             for (label, entries) in group_by_layer_prefix(&snap.per_tensor_weight_pct_delta) {
                 out.push_str(&format!(" {}: ", label));
                 let parts: Vec<String> = entries.iter().map(|(leaf, pct)| {
-                    let mark = if pct.abs() > WEIGHT_DELTA_WARN_PCT { " ⚠" } else { "" };
+                    let mark = if !pct.is_finite() || pct.abs() > WEIGHT_DELTA_WARN_PCT { " ⚠" } else { "" };
                     format!("{}: {:+.1}%{}", leaf, pct, mark)
                 }).collect();
                 out.push_str(&parts.join(" "));
@@ -86,7 +96,8 @@ impl HealthRenderer {
 
         match snap.loss_ema_slope {
             Some(slope) => {
-                let trend = if slope < -0.001 { "decreasing" }
+                let trend = if !slope.is_finite() { "non-finite ⚠" }
+                            else if slope < -0.001 { "decreasing" }
                             else if slope > 0.001 { "increasing ⚠" }
                             else { "flat" };
                 out.push_str(&format!("Loss trend: {} (EMA slope: {:+.3}/step)\n", trend, slope));
@@ -265,6 +276,28 @@ mod tests {
         // Runtime rewrote the file after the seed was taken.
         bump_mtime(&path, Duration::from_secs(2));
         assert!(health_file_changed_since(&path, stale_seed));
+    }
+
+    #[test]
+    fn a_non_finite_gradient_norm_is_not_labelled_healthy() {
+        let snap = HealthSnapshot {
+            per_layer_grad_norm: HashMap::from([(0, f64::NAN), (1, 1.0), (2, f64::INFINITY)]),
+            per_tensor_weight_pct_delta: HashMap::from([("layers.0.w".to_string(), f64::NAN)]),
+            loss_ema_slope: Some(f64::NAN),
+            ..Default::default()
+        };
+        let body = HealthRenderer::new().format_block(&snap);
+        let line = |prefix: &str| {
+            body.lines()
+                .find(|l| l.starts_with(prefix))
+                .unwrap_or_else(|| panic!("no {prefix:?} line in:\n{body}"))
+                .to_string()
+        };
+        assert!(line(" L0:").ends_with("⚠ non-finite"), "{body}");
+        assert!(line(" L1:").ends_with("(healthy)"), "{body}");
+        assert!(line(" L2:").ends_with("⚠ non-finite"), "{body}");
+        assert!(line(" L0: w:").ends_with(" ⚠"), "{body}");
+        assert!(line("Loss trend:").contains("non-finite ⚠"), "{body}");
     }
 
     #[test]

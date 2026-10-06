@@ -79,6 +79,17 @@ fn read_gpu(t: i64, len: usize) -> Vec<f32> {
     out
 }
 
+/// Panics on a NaN or an infinity in a GPU result, naming the first index.
+///
+/// Every gate below reduces with `f32::max`, which returns the non-NaN
+/// operand: a NaN difference drops out and an all-NaN result scores 0.0,
+/// inside the tolerance. Called on the GPU result before each reduction.
+fn assert_all_finite(what: &str, xs: &[f32]) {
+    if let Some(i) = xs.iter().position(|v| !v.is_finite()) {
+        panic!("{what}: non-finite entry at index {i} ({})", xs[i]);
+    }
+}
+
 /// Deterministic pseudo-random values (LCG), same generator as the flash GPU tests.
 fn det_seq(seed: u32, n: usize) -> Vec<f32> {
     let mut s = seed;
@@ -121,6 +132,7 @@ fn gpu_matmul_with_transposed_view_matches_reference() {
     let b_view = nsl_tensor_transpose(b_t, 0, 1); // zero-copy [k, n] view
     let out = nsl_tensor_matmul(a_t, b_view, 0);
     let got = read_gpu(out, m * n);
+    assert_all_finite("matmul(A, transposed-view B)", &got);
 
     let max_diff = got
         .iter()
@@ -162,6 +174,7 @@ fn gpu_matmul_with_transposed_view_left_matches_reference() {
     let a_view = nsl_tensor_transpose(a_t, 0, 1);
     let out = nsl_tensor_matmul(a_view, b_t, 0);
     let got = read_gpu(out, k * n);
+    assert_all_finite("matmul(transposed-view A, B)", &got);
 
     let max_diff = got
         .iter()
@@ -196,6 +209,7 @@ fn gpu_unary_on_transposed_view_matches_reference() {
     let view = nsl_tensor_transpose(t, 0, 1); // [c, r] view
     let out = nsl_tensor_exp(view);
     let got = read_gpu(out, r * c);
+    assert_all_finite("exp(transposed view)", &got);
     // expected[j][i] = exp(vals[i][j]) in [c, r] row-major
     let mut max_diff = 0.0f32;
     for j in 0..c {
@@ -224,6 +238,7 @@ fn gpu_scalar_op_on_transposed_view_matches_reference() {
     let view = nsl_tensor_transpose(t, 0, 1);
     let out = nsl_tensor_mul_scalar(view, 3.0, 0);
     let got = read_gpu(out, r * c);
+    assert_all_finite("mul_scalar(transposed view)", &got);
     let mut max_diff = 0.0f32;
     for j in 0..c {
         for i in 0..r {

@@ -89,6 +89,34 @@ fn run(tag: &str, checkpoint: bool) -> RunOutput {
     RunOutput { loss_stream, gpu_mem, stderr, success: out.status.success() }
 }
 
+/// One loss per LOSS_STREAM line.
+///
+/// A NaN or infinite loss (printed `NaN` / `inf` / `-inf`) is a FAILURE, not a
+/// line to skip. The digit scanner below finds no number in such a line, so it
+/// used to drop it and the per-step comparison ran over the finite remainder.
+fn parse_losses(name: &str, stream: &str) -> Vec<f64> {
+    stream
+        .lines()
+        .enumerate()
+        .filter_map(|(i, l)| {
+            let lower = l.to_ascii_lowercase();
+            assert!(
+                !lower.contains("nan") && !lower.contains("inf"),
+                "{name}: non-finite loss at loss-stream line {i}: {l:?}"
+            );
+            let v: f64 = l
+                .chars()
+                .skip_while(|c| !c.is_ascii_digit() && *c != '-')
+                .take_while(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | 'e' | 'E' | '+'))
+                .collect::<String>()
+                .parse()
+                .ok()?;
+            assert!(v.is_finite(), "{name}: non-finite loss at loss-stream line {i}: {l:?}");
+            Some(v)
+        })
+        .collect()
+}
+
 #[test]
 #[ignore = "requires CUDA GPU (~5 min: 3 x 48-step runs)"]
 fn long_run_ccr_bit_exact_and_no_allocator_drift() {
@@ -107,6 +135,14 @@ fn long_run_ccr_bit_exact_and_no_allocator_drift() {
     let n_steps = base_a.loss_stream.lines().count();
     assert!(n_steps >= 90, "expected ~96 micro-batch losses, got {n_steps}");
 
+    // Every loss must be finite, for BOTH branches below: the bit-exact branch
+    // compares the streams as text, and two NaN streams compare equal.
+    let (la, lb, lc) = (
+        parse_losses("baseline A", &base_a.loss_stream),
+        parse_losses("baseline B", &base_b.loss_stream),
+        parse_losses("checkpointed", &ckpt.loss_stream),
+    );
+
     // (1) CCR faithfulness over the whole run. --deterministic makes the GPU
     // path bit-reproducible (deterministic embedding kernel, A2), so the
     // strongest honest gate applies: bit-exact at every step. If the
@@ -123,19 +159,6 @@ fn long_run_ccr_bit_exact_and_no_allocator_drift() {
             "[long-run] WARNING: --deterministic run was not bit-reproducible here; \
              falling back to per-step tolerance"
         );
-        let parse = |s: &str| -> Vec<f64> {
-            s.lines()
-                .filter_map(|l| {
-                    l.chars()
-                        .skip_while(|c| !c.is_ascii_digit() && *c != '-')
-                        .take_while(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | 'e' | 'E' | '+'))
-                        .collect::<String>()
-                        .parse()
-                        .ok()
-                })
-                .collect()
-        };
-        let (la, lb, lc) = (parse(&base_a.loss_stream), parse(&base_b.loss_stream), parse(&ckpt.loss_stream));
         let m = la.len().min(lb.len()).min(lc.len());
         let mut noise = 0.0f64;
         let mut dev = 0.0f64;

@@ -105,6 +105,16 @@ fn run_and_read(fixture: &str, ckpt: &str, extra: &[&str]) -> std::collections::
     read_nslm(&p).expect("read nslm")
 }
 
+/// Panics on a NaN or an infinity in a trained weight, naming the run, the
+/// weight and the first index. The comparisons below fold with `f32::max`,
+/// which returns the non-NaN operand: a NaN difference drops out, and two
+/// diverged-to-NaN runs score 0.0.
+fn assert_finite_weights(run: &str, name: &str, xs: &[f32]) {
+    if let Some(i) = xs.iter().position(|v| !v.is_finite()) {
+        panic!("{run} {name}: non-finite entry at index {i} ({})", xs[i]);
+    }
+}
+
 /// Source-AD path: decomposed masked backward vs fused-op flash-extract
 /// backward, identical zero-mask math. Weights must agree tightly (f64
 /// op-order differences only).
@@ -125,6 +135,8 @@ fn zero_mask_train_matches_plain_sdpa_source_ad() {
             .unwrap_or_else(|| panic!("{name} missing: {:?}", masked.keys()));
         let b = plain.get(name).or_else(|| plain.get(&format!("m.{name}")))
             .unwrap_or_else(|| panic!("{name} missing: {:?}", plain.keys()));
+        assert_finite_weights("masked", name, a);
+        assert_finite_weights("plain", name, b);
         let d = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
         assert!(
             d <= 1e-6,
@@ -164,6 +176,8 @@ fn zero_mask_train_matches_plain_sdpa_tape() {
             .unwrap_or_else(|| panic!("{name} missing: {:?}", masked.keys()));
         let b = plain.get(name).or_else(|| plain.get(&format!("m.{name}")))
             .unwrap_or_else(|| panic!("{name} missing: {:?}", plain.keys()));
+        assert_finite_weights("masked", name, a);
+        assert_finite_weights("plain", name, b);
         let d = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
         assert!(
             d <= 1e-6,

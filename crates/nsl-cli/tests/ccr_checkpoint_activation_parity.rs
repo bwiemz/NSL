@@ -108,6 +108,18 @@ fn ccr_activation_parity_on_cpu() {
         "CCR declined on the activation fixture — segmentation regressed:\n{stderr_ckpt}"
     );
 
+    // A NaN or infinite loss (printed `NaN` / `inf` / `-inf`) is a FAILURE:
+    // the comparisons below are bit-exact, and two runs that both went NaN
+    // print the same text and save the same bytes.
+    for (name, stdout) in [("baseline", &stdout_base), ("checkpointed", &stdout_ckpt)] {
+        for l in loss_stream(stdout).lines() {
+            let lower = l.to_ascii_lowercase();
+            assert!(
+                !lower.contains("nan") && !lower.contains("inf"),
+                "{name}: non-finite loss in the loss stream: {l:?}"
+            );
+        }
+    }
     assert_eq!(
         loss_stream(&stdout_base),
         loss_stream(&stdout_ckpt),
