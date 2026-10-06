@@ -141,13 +141,17 @@ impl Compiler<'_> {
             // is: an absent call is indistinguishable from a build predating
             // the feature, so a default build must still say so explicitly.
             {
-                use crate::{Bf16Rounding, MatmulMode};
+                use crate::{Bf16Rounding, MatmulMode, MATMUL_MODE_EXPLICIT};
                 let mm = self.compile_options.matmul.clamped();
                 let mode = match mm.mode {
                     MatmulMode::Tf32 => 0i64,
                     MatmulMode::Bf16 => 1,
                     MatmulMode::F32 => 2,
                 };
+                // An explicit `--matmul-mode` is the program's arithmetic: the
+                // flag bit tells the runtime not to apply its environment
+                // overrides. A default build emits the same constant as before.
+                let mode = if mm.mode_explicit { mode | MATMUL_MODE_EXPLICIT } else { mode };
                 let round = match mm.bf16_rounding {
                     Bf16Rounding::Rne => 0i64,
                     Bf16Rounding::Sr => 1,

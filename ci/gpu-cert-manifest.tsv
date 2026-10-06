@@ -53,6 +53,7 @@ crates/nsl-cli/tests/dropout_backward_parity_gate.rs	gpu_source_backward_matches
 crates/nsl-cli/tests/elementwise_chain_fusion_gate.rs	chain_fusion_bit_exact_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/elementwise_chain_fusion_gate.rs	chain_fusion_replay_fallback_bit_exact_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/events_stream_gate.rs	gpu_mem_events_agree_with_stderr_and_outlive_the_throttle	gpu	requires CUDA GPU
+crates/nsl-cli/tests/exec_fingerprint_resume_gate.rs	an_explicit_mode_beats_the_runtime_tf32_variable	gpu	requires CUDA GPU (a cuda-feature build of nsl; resolves the cuBLAS math mode)
 crates/nsl-cli/tests/fase_fused_step_gpu_gate.rs	fused_step_matches_interpreted_bit_exact	gpu	requires a CUDA GPU (2 FASE training runs)
 crates/nsl-cli/tests/fase_fused_step_gpu_gate.rs	csla_block_tables_build_once_per_shape_list_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/feature_composition_gate.rs	registered_refusals_actually_fire_on_gpu_only_configurations	gpu	requires a CUDA GPU (--weight-stream needs device-resident params)
