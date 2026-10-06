@@ -59,7 +59,7 @@ pub(crate) struct MatmulArgs {
     /// Minimum arithmetic intensity mnk/(a+b elements) for a GEMM to take the
     /// bf16 path. Replaces NSL_MATMUL_BF16_MIN_RATIO. ARITHMETIC: it decides
     /// WHICH matmuls are reduced precision. Default 512.
-    #[arg(long, value_name = "RATIO")]
+    #[arg(long, value_name = "RATIO", value_parser = parse_min_ratio)]
     pub(crate) bf16_min_ratio: Option<f64>,
 
     /// Do NOT cache the weight operand's bf16 cast across GEMMs. The cache is
@@ -90,6 +90,17 @@ pub(crate) struct MatmulArgs {
     /// across processes.
     #[arg(long)]
     pub(crate) no_bf16_lt_tune: bool,
+}
+
+/// `--bf16-min-ratio`: a finite, non-negative intensity. `MatmulConfig::
+/// clamped` resets anything else to 512, which would quietly run the default
+/// while the flag counted as explicit and shadowed the environment.
+fn parse_min_ratio(s: &str) -> Result<f64, String> {
+    match s.parse::<f64>() {
+        Ok(v) if v.is_finite() && v >= 0.0 => Ok(v),
+        Ok(v) => Err(format!("{v} is not a finite, non-negative intensity")),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 impl MatmulArgs {
@@ -274,7 +285,14 @@ mod tests {
         assert!(Harness::try_parse_from(argv.clone()).is_err(), "--matmul-mode tf23");
         argv[1] = "--bf16-rounding";
         argv[2] = "nearest";
-        assert!(Harness::try_parse_from(argv).is_err(), "--bf16-rounding nearest");
+        assert!(Harness::try_parse_from(argv.clone()).is_err(), "--bf16-rounding nearest");
+        argv[1] = "--bf16-min-ratio";
+        for bad in ["nan", "inf", "-1"] {
+            argv[2] = bad;
+            assert!(Harness::try_parse_from(argv.clone()).is_err(), "--bf16-min-ratio {bad}");
+        }
+        argv[2] = "0";
+        assert!(Harness::try_parse_from(argv).is_ok(), "--bf16-min-ratio 0 routes every GEMM");
     }
 
     /// The affirmative flags still work in the direction they read.
