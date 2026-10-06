@@ -150,10 +150,30 @@ fn test_borrow_in_return_type_error() {
 
 // --- Task 2: Type system integration ---
 
+/// C5 step 3: creation builtins are f32 by default, and an annotated
+/// declaration chooses f32 or f64 without a type error -- the annotation is
+/// the creation's dtype, not a mismatch against an f64 default.
+#[test]
+fn creation_builtins_default_to_f32_and_take_an_annotated_dtype() {
+    let src = r#"
+fn main():
+    let a = zeros([4])
+    let b: Tensor<[4], f64> = zeros([4])
+    let c: Tensor<[4], f32> = full([4], 0.5)
+    let d: Tensor<[2, 3], f64> = randn([2, 3])
+"#;
+    let diags = check_source(src);
+    let errs: Vec<_> = diags
+        .iter()
+        .filter(|d| format!("{:?}", d).contains("type mismatch"))
+        .collect();
+    assert!(errs.is_empty(), "annotated creation must type-check: {errs:?}");
+}
+
 #[test]
 fn test_borrow_tensor_read_compatible() {
     // Passing an owned Tensor to a function expecting &Tensor should work (auto-borrow)
-    // Note: zeros() returns Tensor<[], f64, cpu>, so match that dtype
+    // Note: zeros() returns Tensor<[4], f32, cpu> (f32 is the default float dtype)
     let src = r#"
 fn read_tensor(x: &Tensor) -> float:
     return 0.0

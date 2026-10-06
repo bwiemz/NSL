@@ -380,7 +380,7 @@ impl<'a> TypeResolver<'a> {
         match name {
             "f64" | "fp64" => DType::F64,
             "f32" | "fp32" => DType::F32,
-            "fp16" => DType::Fp16,
+            "fp16" | "f16" => DType::Fp16,
             "bf16" => DType::Bf16,
             "fp8_e4m3" => DType::Fp8E4m3,
             "fp8_e5m2" => DType::Fp8E5m2,

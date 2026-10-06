@@ -102,6 +102,13 @@ fn build_table() -> HashMap<&'static str, FfiOwnershipKind> {
     m.insert("nsl_tensor_rand", OwnedNewResult);
     m.insert("nsl_tensor_randn", OwnedNewResult);
     m.insert("nsl_tensor_arange", OwnedNewResult);
+    // ... and their dtype-taking variants (C5 step 3), same storage contract.
+    m.insert("nsl_tensor_zeros_dtype", OwnedNewResult);
+    m.insert("nsl_tensor_ones_dtype", OwnedNewResult);
+    m.insert("nsl_tensor_full_dtype", OwnedNewResult);
+    m.insert("nsl_tensor_rand_dtype", OwnedNewResult);
+    m.insert("nsl_tensor_randn_dtype", OwnedNewResult);
+    m.insert("nsl_tensor_arange_dtype", OwnedNewResult);
     // The remaining Ident-allowlist family (`expr_result_is_owned_
     // temporary`), each per-runtime verified in that allowlist's own
     // comment blocks across PRs #423/#424/#426: fresh output on every

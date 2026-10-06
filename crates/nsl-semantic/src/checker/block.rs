@@ -155,7 +155,7 @@ impl<'a> TypeChecker<'a> {
                                     "step" | "epoch" => Type::Int,
                                     "loss" => Type::Tensor {
                                         shape: Shape::unknown(),
-                                        dtype: DType::F64,
+                                        dtype: DType::F32,
                                         device: Device::Cpu,
                                     },
                                     _ => Type::Unknown,
@@ -550,7 +550,7 @@ impl<'a> TypeChecker<'a> {
                                     "step" | "epoch" => Type::Int,
                                     "loss" => Type::Tensor {
                                         shape: crate::types::Shape::unknown(),
-                                        dtype: crate::types::DType::F64,
+                                        dtype: crate::types::DType::F32,
                                         device: crate::types::Device::Cpu,
                                     },
                                     _ => Type::Unknown,

@@ -824,6 +824,7 @@ fn plan_train_block(
             .with_checkpoint_policies(compiler.compile_options.checkpoint.policies.clone())
             .with_fused_ce_config(fused_ce_cfg);
         extractor.set_model_method_bodies(compiler.models.model_method_bodies.clone());
+        extractor.set_type_map(compiler.type_map);
         extractor.set_model_field_types(compiler.models.model_field_types.clone());
         extractor.set_model_field_ranks(compiler.models.model_field_ranks.clone());
         // Item 4: the prepass must see the SAME fusion decision the real

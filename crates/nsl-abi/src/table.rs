@@ -234,6 +234,13 @@ macro_rules! for_each_runtime_fn {
             [tensor] nsl_tensor_ones(i64) -> i64 = tensor::creation::nsl_tensor_ones;
             [tensor] nsl_tensor_rand(i64) -> i64 = tensor::creation::nsl_tensor_rand;
             [tensor] nsl_tensor_randn(i64) -> i64 = tensor::creation::nsl_tensor_randn;
+            // C5 step 3: creation in a chosen dtype (f64 when an annotation picks it)
+            [tensor] nsl_tensor_zeros_dtype(i64, i64) -> i64 = tensor::creation::nsl_tensor_zeros_dtype;
+            [tensor] nsl_tensor_ones_dtype(i64, i64) -> i64 = tensor::creation::nsl_tensor_ones_dtype;
+            [tensor] nsl_tensor_rand_dtype(i64, i64) -> i64 = tensor::creation::nsl_tensor_rand_dtype;
+            [tensor] nsl_tensor_randn_dtype(i64, i64) -> i64 = tensor::creation::nsl_tensor_randn_dtype;
+            [tensor] nsl_tensor_full_dtype(i64, f64, i64) -> i64 = tensor::creation::nsl_tensor_full_dtype;
+            [tensor] nsl_tensor_arange_dtype(f64, f64, f64, i64) -> i64 = tensor::creation::nsl_tensor_arange_dtype;
             // Tensor element access
             [tensor] nsl_tensor_get(i64, i64) -> f64 = tensor::nsl_tensor_get;
             [tensor] nsl_tensor_set(i64, i64, f64) -> () = tensor::nsl_tensor_set;
@@ -1358,6 +1365,6 @@ mod tests {
     fn table_is_the_recorded_size() {
         // The count is pinned so a row dropped by a bad merge is noticed; move
         // it with a row that is deliberately added or removed.
-        assert_eq!(RUNTIME_ABI.len(), 685);
+        assert_eq!(RUNTIME_ABI.len(), 691);
     }
 }

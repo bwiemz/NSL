@@ -846,6 +846,11 @@ impl Compiler<'_> {
                 )));
             }
             let shape_val = self.compile_nested_expr(builder, state, &args[0].value)?;
+            if self.creation_is_f64(call_expr) {
+                let f64_tag = builder.ins().iconst(cl_types::I64, 0);
+                let rt_name = format!("nsl_tensor_{func_name}_dtype");
+                return self.compile_call_by_name(builder, &rt_name, &[shape_val, f64_tag]);
+            }
             let rt_name = format!("nsl_tensor_{func_name}");
             return self.compile_call_by_name(builder, &rt_name, &[shape_val]);
         }
@@ -863,6 +868,14 @@ impl Compiler<'_> {
             } else {
                 builder.ins().fcvt_from_sint(cl_types::F64, fill_val)
             };
+            if self.creation_is_f64(call_expr) {
+                let f64_tag = builder.ins().iconst(cl_types::I64, 0);
+                return self.compile_call_by_name(
+                    builder,
+                    "nsl_tensor_full_dtype",
+                    &[shape_val, float_val, f64_tag],
+                );
+            }
             return self.compile_call_by_name(builder, "nsl_tensor_full", &[shape_val, float_val]);
         }
         if func_name == "arange" {
@@ -928,6 +941,14 @@ impl Compiler<'_> {
                 }
                 _ => unreachable!(),
             };
+            if self.creation_is_f64(call_expr) {
+                let f64_tag = builder.ins().iconst(cl_types::I64, 0);
+                return self.compile_call_by_name(
+                    builder,
+                    "nsl_tensor_arange_dtype",
+                    &[start, stop, step, f64_tag],
+                );
+            }
             return self.compile_call_by_name(builder, "nsl_tensor_arange", &[start, stop, step]);
         }
 
@@ -3892,5 +3913,17 @@ impl Compiler<'_> {
         }
 
         Ok(launch_result)
+    }
+}
+
+impl Compiler<'_> {
+    /// Whether the checker typed a creation builtin call f64 -- which it does
+    /// only when an annotation on the declaration chose f64 (C5 step 3);
+    /// the default, f32, keeps the plain creation FFIs.
+    fn creation_is_f64(&self, call_expr: &Expr) -> bool {
+        matches!(
+            self.node_type(call_expr.id).as_tensor_parts(),
+            Some((_, nsl_semantic::types::DType::F64, _))
+        )
     }
 }

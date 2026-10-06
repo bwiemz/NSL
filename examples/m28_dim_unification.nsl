@@ -1,6 +1,6 @@
 # M28: Symbolic dim unification — same symbol must match across params
 
-fn add_tensors(a: Tensor<[N, 4], f64>, b: Tensor<[N, 4], f64>) -> Tensor:
+fn add_tensors(a: Tensor<[N, 4], f32>, b: Tensor<[N, 4], f32>) -> Tensor:
     return a + b
 
 let x = randn([3, 4])
