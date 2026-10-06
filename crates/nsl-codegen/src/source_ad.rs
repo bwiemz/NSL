@@ -1351,9 +1351,13 @@ impl AdjointGenerator {
             ),
 
             // --- Gather backward: scatter_add(grad, indices, dim) ---
-            AdjointExpr::GatherBackward(y_bar, indices, dim) => {
-                self.emit_op(PrimalOp::ScatterAdd { dim }, vec![y_bar, indices])
-            }
+            // It used to emit `ScatterAdd(grad, indices)`, which lowers to the
+            // EMBEDDING scatter (rows into a table sized by the largest index)
+            // and never saw the input's shape.
+            AdjointExpr::GatherBackward(y_bar, input, indices, dim) => self.emit_op(
+                PrimalOp::Passthrough(format!("{GATHER_BACKWARD_PREFIX}{dim}")),
+                vec![y_bar, input, indices],
+            ),
 
             // --- ScatterAdd src backward: gather(grad, indices, dim) ---
             AdjointExpr::ScatterAddSrcBackward(y_bar, indices, dim) => {
@@ -1361,15 +1365,16 @@ impl AdjointGenerator {
             }
 
             // --- Shape backward ops ---
-            AdjointExpr::ConcatSplit(y_bar, dim, offset, size) => self.emit_op(
-                PrimalOp::Slice {
-                    dim,
-                    start: offset as i64,
-                    end: (offset + size) as i64,
-                    orig_dim_size: 0,
-                },
-                vec![y_bar],
-            ),
+            // The slice used to be the static [index, index + 1): right only
+            // when every operand was one wide along `dim`.
+            AdjointExpr::ConcatSplit(y_bar, dim, index, parts) => {
+                let mut inputs = vec![y_bar];
+                inputs.extend(parts);
+                self.emit_op(
+                    PrimalOp::Passthrough(format!("{CONCAT_GRAD_SLICE_PREFIX}{dim}:{index}")),
+                    inputs,
+                )
+            }
             AdjointExpr::SplitConcat(y_bar, _dim) => {
                 // Split backward = concat the gradient pieces (handled by accumulate_adjoint)
                 self.emit_op(PrimalOp::Reshape { target_ndim: 0 }, vec![y_bar])
@@ -1495,26 +1500,26 @@ impl AdjointGenerator {
             // --- Attention backward: per-component extraction from fused kernel ---
             // Each component (dQ=0, dK=1, dV=2) is extracted via a dedicated op
             // that carries the causal flag so the runtime can apply the correct mask.
-            AdjointExpr::AttentionBackwardQ(y_bar, q, k, v, fwd_out, causal) => self.emit_op(
+            AdjointExpr::AttentionBackwardQ(y_bar, q, k, v, fwd_out, causal, scale) => self.emit_op(
                 PrimalOp::FlashAttentionBackwardExtract {
                     causal,
                     component: 0,
                 },
-                vec![y_bar, q, k, v, fwd_out],
+                [y_bar, q, k, v, fwd_out].into_iter().chain(scale).collect(),
             ),
-            AdjointExpr::AttentionBackwardK(y_bar, q, k, v, fwd_out, causal) => self.emit_op(
+            AdjointExpr::AttentionBackwardK(y_bar, q, k, v, fwd_out, causal, scale) => self.emit_op(
                 PrimalOp::FlashAttentionBackwardExtract {
                     causal,
                     component: 1,
                 },
-                vec![y_bar, q, k, v, fwd_out],
+                [y_bar, q, k, v, fwd_out].into_iter().chain(scale).collect(),
             ),
-            AdjointExpr::AttentionBackwardV(y_bar, q, k, v, fwd_out, causal) => self.emit_op(
+            AdjointExpr::AttentionBackwardV(y_bar, q, k, v, fwd_out, causal, scale) => self.emit_op(
                 PrimalOp::FlashAttentionBackwardExtract {
                     causal,
                     component: 2,
                 },
-                vec![y_bar, q, k, v, fwd_out],
+                [y_bar, q, k, v, fwd_out].into_iter().chain(scale).collect(),
             ),
 
             // PCA Stage C: packed (segment-masked) attention backward — same
@@ -1980,6 +1985,13 @@ pub fn reachable_result_vars(
 /// `input` over dim `d`, keepdim off) with that dim re-inserted. A negative
 /// `d` counts from the end of `input`'s rank. Lowered in `wengert_lower`.
 pub(crate) const UNSQUEEZE_AT_PREFIX: &str = "unsqueeze_at:";
+/// `gather_backward:<d>` -- inputs `[grad, input, indices]`: `grad` scattered
+/// into zeros shaped like `input` along `d` (`nsl_tensor_gather_backward`).
+pub(crate) const GATHER_BACKWARD_PREFIX: &str = "gather_backward:";
+/// `concat_grad_slice:<d>:<i>` -- inputs `[grad, part_0, ..]`: the slice of
+/// `grad` along `d` that concat operand `i` occupied, at the offset given by
+/// the preceding parts' sizes. Lowered in `wengert_lower`.
+pub(crate) const CONCAT_GRAD_SLICE_PREFIX: &str = "concat_grad_slice:";
 /// `sum_keepdim_at:<d>` -- input `[x]`: `x` summed along `d`, keepdim on; a
 /// negative `d` counts from the end of `x`'s rank. Lowered in `wengert_lower`.
 pub(crate) const SUM_KEEPDIM_AT_PREFIX: &str = "sum_keepdim_at:";
@@ -5378,23 +5390,30 @@ impl<'a> WengertExtractor<'a> {
                     }
                     // Indexing
                     "embedding" | "embedding_lookup" => PrimalOp::Embedding,
+                    // gather(tensor, dim, indices): the dim is baked into the
+                    // op and only the two tensors are its operands. All three
+                    // arguments used to become operands, so the lowering and
+                    // the backward read the dim CONSTANT as the index tensor.
                     "gather" => {
-                        // gather(tensor, dim, indices) — extract dim from second arg
-                        let dim = args
-                            .get(1)
-                            .and_then(|a| match &a.value.kind {
-                                ExprKind::IntLiteral(v) => Some(*v),
-                                ExprKind::UnaryOp {
-                                    op: AstUnaryOp::Neg,
-                                    operand,
-                                } => match &operand.kind {
-                                    ExprKind::IntLiteral(v) => Some(-*v),
-                                    _ => None,
-                                },
-                                _ => None,
-                            })
-                            .unwrap_or(0);
-                        PrimalOp::Gather { dim }
+                        let dim = (args.len() == 3)
+                            .then(|| Self::extract_int_literal(&args[1].value))
+                            .flatten();
+                        let Some(dim) = dim else {
+                            nsl_log::nsl_log!(WARN, "source-ad",
+                                "[source-ad] gather() needs a literal dim; \
+                                 falling back to tape-based AD for this grad block"
+                            );
+                            return None;
+                        };
+                        self.push_op(WengertOp {
+                            id: self.list.ops.len() as u32,
+                            result,
+                            op: PrimalOp::Gather { dim },
+                            inputs: vec![input_vars[0], input_vars[2]],
+                            saved_for_backward: false,
+                            checkpointed: false,
+                        });
+                        return Some(result);
                     }
                     // Conv2d: conv2d(input, weight, bias, stride_h, stride_w, pad_h, pad_w).
                     // Extract square stride/padding as compile-time constants and
@@ -5604,23 +5623,37 @@ impl<'a> WengertExtractor<'a> {
                         PrimalOp::Passthrough(func_name.clone())
                     }
                     // Concatenation
+                    // tensor_cat([a, b, ..], dim): the operands are the list
+                    // literal's ELEMENTS, so each gets its own slice of the
+                    // gradient. With the list itself as the operand (as it
+                    // was), no element got any gradient. A list held in a
+                    // variable, or a non-literal dim, stays on the tape.
                     "tensor_cat" | "cat" => {
-                        // tensor_cat(tensors, dim) — extract dim from last arg
-                        let dim = args
-                            .last()
-                            .and_then(|a| match &a.value.kind {
-                                ExprKind::IntLiteral(v) => Some(*v),
-                                ExprKind::UnaryOp {
-                                    op: AstUnaryOp::Neg,
-                                    operand,
-                                } => match &operand.kind {
-                                    ExprKind::IntLiteral(v) => Some(-*v),
-                                    _ => None,
-                                },
-                                _ => None,
-                            })
-                            .unwrap_or(-1);
-                        PrimalOp::Concat { dim }
+                        let dim = (args.len() == 2)
+                            .then(|| Self::extract_int_literal(&args[1].value))
+                            .flatten();
+                        let parts = input_vars.first().and_then(|&list| {
+                            let op = self.list.ops.iter().rev().find(|o| o.result == list)?;
+                            matches!(&op.op, PrimalOp::Passthrough(n) if n == "list")
+                                .then(|| op.inputs.clone())
+                        });
+                        let (Some(dim), Some(parts)) = (dim, parts) else {
+                            nsl_log::nsl_log!(WARN, "source-ad",
+                                "[source-ad] {}() needs a list literal and a literal dim; \
+                                 falling back to tape-based AD for this grad block",
+                                func_name
+                            );
+                            return None;
+                        };
+                        self.push_op(WengertOp {
+                            id: self.list.ops.len() as u32,
+                            result,
+                            op: PrimalOp::Concat { dim },
+                            inputs: parts,
+                            saved_for_backward: false,
+                            checkpointed: false,
+                        });
+                        return Some(result);
                     }
                     // Negative
                     "neg" => PrimalOp::Neg,

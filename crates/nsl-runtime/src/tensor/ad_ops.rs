@@ -419,6 +419,26 @@ pub extern "C" fn nsl_tensor_pad_zero(
     publish_cpu_result_to_device(result, source_device, "ad_pad_zero")
 }
 
+/// Gather's backward: `grad` summed into zeros shaped like `input`, at
+/// `indices` along `dim` -- the tape's gather backward (`scatter_gather_grad`),
+/// for source AD. Not `nsl_tensor_scatter_add`: that is the EMBEDDING
+/// scatter, rows into a table sized by the largest index, and it refuses the
+/// 1-D gradient of a gather like `gather(t, 1, idx)`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nsl_tensor_gather_backward(
+    grad_ptr: i64,
+    input_ptr: i64,
+    indices_ptr: i64,
+    dim: i64,
+) -> i64 {
+    let input = NslTensor::from_ptr_ref(input_ptr);
+    let shape: Vec<i64> = (0..input.ndim as usize)
+        .map(|i| unsafe { *input.shape.add(i) })
+        .collect();
+    let d = if dim < 0 { dim + input.ndim } else { dim } as usize;
+    crate::autodiff::grad_utils::scatter_gather_grad(grad_ptr, &shape, d, indices_ptr)
+}
+
 // ---------------------------------------------------------------------------
 // 5. nsl_tensor_scatter_add — scatter-add for embedding backward
 // ---------------------------------------------------------------------------

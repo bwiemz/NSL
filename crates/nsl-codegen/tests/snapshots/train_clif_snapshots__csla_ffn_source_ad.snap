@@ -412,7 +412,7 @@ function <main>(i32, i64) -> i32 <callconv> {
     sig110 = (i64, i64) -> i64 <callconv>
     sig111 = (i64) -> i64 <callconv>
     sig112 = (i64) -> i64 <callconv>
-    sig113 = (i64, i64, i64) -> i64 <callconv>
+    sig113 = (i64, i64, i64, i64) -> i64 <callconv>
     sig114 = (i64) -> i64 <callconv>
     sig115 = (i64, i64, i64) -> i64 <callconv>
     sig116 = (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 <callconv>
@@ -804,7 +804,7 @@ function <main>(i32, i64) -> i32 <callconv> {
     fn110 = nsl_tensor_expand sig110
     fn111 = nsl_tensor_contiguous sig111
     fn112 = nsl_tensor_neg sig112
-    fn113 = nsl_tensor_scatter_add sig113
+    fn113 = nsl_tensor_gather_backward sig113
     fn114 = nsl_tensor_exp sig114
     fn115 = nsl_tensor_sum_dim sig115
     fn116 = nsl_fused_ew_chain sig116
@@ -1437,7 +1437,7 @@ block16:
     v250 = call fn100(v237, v249)  ; v249 = 1
     v251 = iconst.i64 1
     v252 = iconst.i64 1
-    v253 = call fn101(v250, v252, v251)  ; v252 = 1, v251 = 1
+    v253 = call fn101(v250, v252, v247)  ; v252 = 1
     v254 = call fn102(v253)
     v255 = iconst.i64 -1
     v256 = iconst.i64 0
@@ -1460,7 +1460,7 @@ block16:
     v272 = call fn111(v271)
     v273 = call fn112(v272)
     v274 = iconst.i64 1
-    v275 = call fn113(v273, v251, v274)  ; v251 = 1, v274 = 1
+    v275 = call fn113(v273, v250, v247, v274)  ; v274 = 1
     v276 = call fn114(v250)
     v277 = iconst.i64 1
     v278 = iconst.i64 1

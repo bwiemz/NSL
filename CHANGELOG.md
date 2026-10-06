@@ -1933,6 +1933,45 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
     reassigned `m.eps` that the tape honours. Certificate
     `layernorm_field_eps` pins it as a known source-AD failure.
 
+- **`gather` and `tensor_cat` under source AD; negative dims on the tape**
+  (`gather`, `cat_dim0`, `cat_dim1` delisted; `gather_neg`, `cat_three`,
+  `cat_neg` added):
+  - **`gather(t, d, idx)` crashed** ("invalid tensor handle 0x1"): every
+    call argument became an operand, so the lowering passed the dim
+    CONSTANT as the index tensor. The op now has `[t, idx]` and a literal
+    dim (else the tape). Its backward emitted `ScatterAdd`, which lowers to
+    the EMBEDDING scatter (rows into a table sized by the largest index) and
+    never saw the input's shape; new `nsl_tensor_gather_backward` (ABI row
+    684) scatters into zeros shaped like the input, as the tape does. The
+    `csla_ffn` fixtures use this spelling; their snapshots (compile-only)
+    had encoded the crash.
+  - **`tensor_cat([a, b], d)` gave its operands no gradient**: the list was
+    the op's operand. The list literal's elements are now the operands
+    (a list held in a variable stays on the tape), and each gets the slice
+    of the gradient it occupied, at an offset read from the preceding
+    operands' sizes. The backward used to slice `[i, i + 1)`, right only
+    when every operand was one wide.
+  - **Tape: `gather`, slice and `cat` with a negative dim** recorded it raw
+    and cast it to `usize` in the backward; `tensor_cat([a, b], -1)`
+    aborted. They now resolve it, like the reductions.
+  - **Both modes: a gather along a non-trailing dim lost its gradient.**
+    `gather(t, d, idx)` selects whole `prod(shape[d+1..])`-wide slices, but
+    the shared backward (`scatter_gather_grad`) added back ONE element per
+    index; it now mirrors the forward's loop (`gather_dim0`, `gather_mid`).
+- **Source AD: a grad block over SDPA crashed the compiler, and the
+  attention backward ignored a non-default scale** (`sdpa`, `sdpa_causal`,
+  `sdpa_scale` delisted):
+  - "FunctionBuilder finalized, but block block3 is not filled". The fused
+    SDPA dispatch ends in its join block, but callers track where to keep
+    emitting through `state.current_block`, which nothing updated: `main`
+    read the entry block, saw its `brif`, and skipped its `return`.
+    `compile_wengert_ops` now leaves `state.current_block` at the builder's
+    actual block, for every lowering that switches blocks.
+  - The backward computed with `1/sqrt(head_dim)` whatever scale the
+    forward was given. It now reads the forward's scale operand (one
+    `nsl_tensor_item` per SDPA backward; the `attention_source_ad`
+    snapshot gains two).
+
 - **`@freeze` froze nothing.** The decorator was validated and handed to
   WRGA's analysis, and nothing in the train block read it. A frozen weight
   stayed in the optimizer's parameter list and trained exactly as if
