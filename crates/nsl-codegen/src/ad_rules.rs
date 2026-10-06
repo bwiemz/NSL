@@ -1216,9 +1216,12 @@ pub fn ad_cert_status(op: &PrimalOp) -> AdCertStatus {
             Certified(&["sdpa", "sdpa_causal", "sdpa_scale"])
         }
         PrimalOp::FlashAttentionBackwardExtract { .. } => AdjointOnly("the SDPA adjoint"),
-        PrimalOp::ScaledDotProductAttentionPacked => Uncertified(
-            "the kernels are held to an f64 oracle (nsl-codegen/tests/sdpa_fused_packed_gpu_parity.rs); the source-AD wiring is not",
-        ),
+        PrimalOp::ScaledDotProductAttentionPacked => Certified(&[
+            "sdpa_packed",
+            "sdpa_packed_docs",
+            "sdpa_packed_batch",
+            "sdpa_packed_scale",
+        ]),
         PrimalOp::FlashAttentionBackwardExtractPacked { .. } => {
             AdjointOnly("the packed SDPA adjoint")
         }

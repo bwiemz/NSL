@@ -1805,6 +1805,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **Packed attention's source-AD wiring is certified** (external review
+  2026-10-06, finding 6). `ScaledDotProductAttentionPacked` was the one
+  attention primitive marked `Uncertified`: its kernels had an f64 oracle,
+  the compiled program did not.
+  - Four certificates in `source_ad_rule_cert.rs` take `grad` of the packed
+    builtin and compare loss and raw q/k/v gradients, under both AD modes,
+    to an f64 segment-causal oracle.
+  - The cases are: two documents; three uneven documents, one of length 1;
+    a batch whose rows pack differently; and a 0.9 scale, which settles
+    whether the CPU paths honour a non-default scale (they do).
+  - An oracle that ignores document boundaries fails all four.
+  - On the CPU these cover the decomposed forward and the segment-aware
+    flash backward reference, not the GPU kernels.
+
 - **Source AD trains with the norm epsilon the program set.** The stdlib
   `LayerNorm` / `RMSNorm` pass their `eps` field to the kernel; source AD
   could not read a float field at compile time and baked 1e-5, so after
