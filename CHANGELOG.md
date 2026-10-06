@@ -1825,6 +1825,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   `source_ad_norm_field_eps_gate` trains a model with reassigned stdlib norm
   eps under SGD -- tape, source AD and the fused RMSNorm backward agree, and a
   control at the default eps does not; a calibration build test.
+- **Checkpoints survive a crash during the save, and the sidecar pairs with
+  the whole model file** (external review 2026-10-06).
+  - `model_save` wrote the `.nslm` in place, so a crash mid-write destroyed
+    the previous checkpoint. It now writes `<path>.tmp`, fsyncs it, and
+    renames it into place.
+  - `train_checkpoint_save` already used temporaries but renamed them
+    without an fsync and with nothing to undo a half-finished commit: a
+    crash between the two renames left the new model beside the old
+    sidecar, which the next load refused while the previous model was
+    already gone. Both temporaries are now fsynced, the renames run model
+    then sidecar with a directory fsync after each, and the load completes
+    the commit when `<path>.optim.tmp` pairs with the model and the current
+    sidecar does not.
+  - The pairing signature sampled the model's first and last MiB, so a
+    same-size change in between went unnoticed and the resume applied
+    moments saved for different weights. The sidecar now records
+    `model_sha256`, a SHA-256 of the whole `.nslm`, and the load checks it
+    in preference to the old `model_sig` (still read for older sidecars).
+  - The bf16 operand-cast stochastic-rounding counter
+    (`NSL_MATMUL_BF16_ROUND=sr`) was not saved, so a resume restarted it at
+    zero and reused the first steps' dither. It is now `bf16_sr_ctr` in the
+    sidecar (0 when an older sidecar has none).
+  - Gates: `train_checkpoint_gate.rs` builds the interrupted state exactly
+    (step-4 model, step-2 sidecar, step-4 sidecar as the temporary) and
+    requires a bit-exact continuation, plus refusal without the temporary;
+    a 3.2 MB model with one byte flipped in the middle must be refused by
+    the hash. Removing the recovery call or the hash check fails them.
 
 - **C5 step 3: one default float dtype, f32, and an `f64` annotation stores
   f64.** The checker typed every `zeros`/`ones`/`full`/`rand`/`randn`/

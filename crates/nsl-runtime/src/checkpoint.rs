@@ -94,10 +94,15 @@ pub extern "C" fn nsl_model_save(
     let header = format!(r#"{{"params":[{}]}}"#, params_json.join(","));
     let header_bytes = header.as_bytes();
 
-    let mut file = match std::fs::File::create(path) {
+    // Written to a temporary and committed by rename, so an interrupted save
+    // leaves the previous file intact: `File::create` on the final path used
+    // to truncate it before the first byte was written (external review
+    // 2026-10-06).
+    let tmp = format!("{path}.tmp");
+    let mut file = match std::fs::File::create(&tmp) {
         Ok(f) => f,
         Err(e) => {
-            crate::nsl_log!(ERROR, "nsl", "nsl: model_save: cannot create file '{}': {}", path, e);
+            crate::nsl_log!(ERROR, "nsl", "nsl: model_save: cannot create file '{}': {}", tmp, e);
             std::process::abort();
         }
     };
@@ -185,6 +190,62 @@ pub extern "C" fn nsl_model_save(
     for &ptr in &materialized {
         crate::weight_stream::nsl_weight_stream_evict(ptr, 0);
     }
+    sync_or_abort(&file, &tmp);
+    drop(file);
+    commit_rename(&tmp, path, "model_save");
+}
+
+/// fsync `file`: its bytes are on the device before a rename publishes it.
+/// Without this a crash can leave a renamed but empty or partial file -- the
+/// hazard `awq.rs::write_atomic` documents.
+fn sync_or_abort(file: &std::fs::File, path: &str) {
+    if let Err(e) = file.sync_all() {
+        crate::nsl_log!(ERROR, "nsl", "nsl: checkpoint: fsync '{path}': {e}");
+        std::process::abort();
+    }
+}
+
+/// Atomically replace `to` with `from`, then fsync the directory so the
+/// rename itself survives a crash.
+fn commit_rename(from: &str, to: &str, what: &str) {
+    if let Err(e) = std::fs::rename(from, to) {
+        crate::nsl_log!(ERROR, "nsl", "nsl: {what}: rename '{from}' -> '{to}': {e}");
+        std::process::abort();
+    }
+    sync_parent_dir(to);
+}
+
+/// fsync the directory holding `path` (a rename is a directory update). A
+/// platform that cannot open a directory for syncing (Windows) skips it.
+fn sync_parent_dir(path: &str) {
+    let dir = std::path::Path::new(path)
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    #[cfg(unix)]
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+}
+
+/// SHA-256 of a whole file, as lowercase hex: the `.optim` sidecar's
+/// `model_sha256`, which ties it to the exact `.nslm` it was saved with.
+pub(crate) fn file_sha256_hex(path: &str) -> std::io::Result<String> {
+    use sha2::Digest;
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = vec![0u8; 8 << 20];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Load model parameters from .nslm binary format into existing tensors.
@@ -449,6 +510,89 @@ fn model_file_sig(path: &str) -> u64 {
     h
 }
 
+/// Whether a sidecar header names `model_path` as the model it was saved with.
+pub(crate) enum Pairing {
+    Paired,
+    Mismatch(String),
+    /// Neither `model_sha256` nor `model_sig`: not a sidecar this runtime wrote.
+    NoRecord,
+}
+
+/// The pairing check: the whole-file SHA-256 when the sidecar has one
+/// (`model_sha256`, written since 2026-10-06), else the legacy sampled
+/// `model_sig`, which cannot see a same-size change in the middle of θ.
+pub(crate) fn sidecar_pairs_with(header: &[u8], model_path: &str) -> Pairing {
+    if let Some(saved) = scan_header_string(header, b"\"model_sha256\":") {
+        let saved = String::from_utf8_lossy(&saved).into_owned();
+        return match file_sha256_hex(model_path) {
+            Ok(live) if live == saved => Pairing::Paired,
+            Ok(live) => Pairing::Mismatch(format!("model sha256 {live} vs sidecar {saved}")),
+            Err(e) => Pairing::Mismatch(format!("cannot hash the model: {e}")),
+        };
+    }
+    match scan_header_numbers(header, b"\"model_sig\":").first() {
+        Some(&saved) => {
+            let live = model_file_sig(model_path);
+            if live == saved {
+                Pairing::Paired
+            } else {
+                Pairing::Mismatch(format!("model_sig {live} vs sidecar {saved}"))
+            }
+        }
+        None => Pairing::NoRecord,
+    }
+}
+
+/// The JSON header of a sidecar file, if `path` is a readable NSLO sidecar
+/// whose declared header fits the file.
+fn read_sidecar_header(path: &str) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut fixed = [0u8; 16];
+    f.read_exact(&mut fixed).ok()?;
+    if &fixed[..4] != OPTIM_MAGIC {
+        return None;
+    }
+    let header_size = u64::from_le_bytes(fixed[8..16].try_into().ok()?);
+    let file_len = f.metadata().ok()?.len();
+    if header_size > file_len.saturating_sub(16) {
+        return None;
+    }
+    let mut header = vec![0u8; header_size as usize];
+    f.read_exact(&mut header).ok()?;
+    Some(header)
+}
+
+/// Finish a save that was interrupted between its two commit renames.
+///
+/// `nsl_train_checkpoint_save` writes and fsyncs both temporaries, then
+/// renames the model and the sidecar in that order, so a crash between them
+/// leaves the NEW model beside the OLD sidecar, with the new sidecar complete
+/// as `<path>.optim.tmp`. If the current pair does not match and the
+/// temporary does, the commit is completed here and the resume continues from
+/// the new generation. A temporary that does not pair is left alone, and a
+/// stale one beside a matching pair is ignored.
+fn recover_interrupted_commit(path: &str, optim_path: &str) {
+    let optim_tmp = format!("{optim_path}.tmp");
+    if !std::path::Path::new(&optim_tmp).exists() {
+        return;
+    }
+    if let Some(h) = read_sidecar_header(optim_path)
+        && matches!(sidecar_pairs_with(&h, path), Pairing::Paired)
+    {
+        return;
+    }
+    if let Some(h) = read_sidecar_header(&optim_tmp)
+        && matches!(sidecar_pairs_with(&h, path), Pairing::Paired)
+    {
+        crate::nsl_log!(WARN, "checkpoint",
+            "[checkpoint] completing an interrupted save: '{optim_tmp}' pairs with \
+             '{path}' and '{optim_path}' does not -- renaming it into place"
+        );
+        commit_rename(&optim_tmp, optim_path, "train_checkpoint_load");
+    }
+}
+
 /// In-order needle scan of the sidecar header for one numeric field — the
 /// same no-JSON-parser style as `nsl_model_load`'s dtype guard. Returns the
 /// raw digit strings in header order.
@@ -634,7 +778,17 @@ pub extern "C" fn nsl_train_checkpoint_save(
         param_names_ptr,
         param_tensors_ptr,
     );
+    // The legacy sampled signature (first/last MiB) stays for older readers;
+    // the pairing check uses the whole-file hash, which also sees a same-size
+    // change in the middle of θ.
     let sig = model_file_sig(&model_tmp);
+    let model_sha = match file_sha256_hex(&model_tmp) {
+        Ok(h) => h,
+        Err(e) => {
+            crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_save: hashing '{model_tmp}': {e}");
+            std::process::abort();
+        }
+    };
 
     // Sidecar: header first (metadata reads need no residency), then data.
     let mut params_json = Vec::new();
@@ -700,7 +854,7 @@ pub extern "C" fn nsl_train_checkpoint_save(
         }
     }
     let resume = format!(
-        r#""resume":{{"train_epoch":{train_epoch},"has_loader":{hl},"loader_epoch":{loader_epoch},"loader_slot":{loader_slot},"loader_id":{loader_id},"rng_seed":"{seed_hex}","rng_pos_hi":{hi},"rng_pos_lo":{lo},"gpu_dropout_ctr":{ctr},"global_seed":{gseed},"global_seed_set":{gset},"exec":"{exec_fp}","train_cfg":"{train_cfg}","env":"{env_rec}"}}"#,
+        r#""resume":{{"train_epoch":{train_epoch},"has_loader":{hl},"loader_epoch":{loader_epoch},"loader_slot":{loader_slot},"loader_id":{loader_id},"rng_seed":"{seed_hex}","rng_pos_hi":{hi},"rng_pos_lo":{lo},"gpu_dropout_ctr":{ctr},"bf16_sr_ctr":{srctr},"global_seed":{gseed},"global_seed_set":{gset},"exec":"{exec_fp}","train_cfg":"{train_cfg}","env":"{env_rec}"}}"#,
         hl = (dl_ptr != 0) as u64,
         // The compile-flag record installed by main(). Empty for a program
         // built before the fingerprint existed; the loader treats empty as
@@ -719,6 +873,11 @@ pub extern "C" fn nsl_train_checkpoint_save(
         hi = (rng.sampling_pos >> 64) as u64,
         lo = rng.sampling_pos as u64,
         ctr = rng.gpu_dropout_ctr,
+        // The bf16 operand-cast stochastic-rounding stream
+        // (`--bf16-rounding sr`): a resume used to restart it at 0 and reuse
+        // the dither windows of the run's first steps (external review
+        // 2026-10-06).
+        srctr = rng.bf16_sr_ctr,
         // The `--seed` SCALAR, which is a live training-RNG input in its own
         // right: SR-BF16's dither is `mix64(seed ^ step*SALT, ...)` and the
         // composed ZeRO-3 slice update reads the same global. Recording only
@@ -729,7 +888,7 @@ pub extern "C" fn nsl_train_checkpoint_save(
         gset = crate::deterministic_ops::explicit_rng_seed().is_some() as u64,
     );
     let header = format!(
-        r#"{{"step_count":{step_count},"model_sig":{sig},{resume},"params":[{}]}}"#,
+        r#"{{"step_count":{step_count},"model_sig":{sig},"model_sha256":"{model_sha}",{resume},"params":[{}]}}"#,
         params_json.join(",")
     );
     let header_bytes = header.as_bytes();
@@ -766,16 +925,17 @@ pub extern "C" fn nsl_train_checkpoint_save(
             write_or_abort(&mut file, &buf, "write moment data");
         }
     }
+    sync_or_abort(&file, &optim_tmp);
     drop(file);
-    // Both tmps are complete — commit the pair back-to-back.
-    if let Err(e) = std::fs::rename(&model_tmp, path) {
-        crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_save: rename '{model_tmp}' -> '{path}': {e}");
-        std::process::abort();
-    }
-    if let Err(e) = std::fs::rename(&optim_tmp, &optim_path) {
-        crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_save: rename '{optim_tmp}' -> '{optim_path}': {e}");
-        std::process::abort();
-    }
+    // Both tmps are complete and durable — commit the pair, model first,
+    // syncing the directory after EACH rename so they reach the disk in this
+    // order. The only mixed state a crash can then leave is the new model
+    // beside the old sidecar, with the new sidecar complete as `.optim.tmp`;
+    // `recover_interrupted_commit` finishes that commit at the next load
+    // (external review 2026-10-06: the mixed state used to be unrecoverable,
+    // and the previous model was already gone).
+    commit_rename(&model_tmp, path, "train_checkpoint_save");
+    commit_rename(&optim_tmp, &optim_path, "train_checkpoint_save");
     if dl_ptr != 0 {
         crate::nsl_log!(INFO, "checkpoint", 
             "[checkpoint] saved: {path} (+.optim) at micro-batch step \
@@ -842,6 +1002,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
     // is touched, so a refused resume leaves the freshly-initialized train
     // state fully intact (same doctrine as nsl_model_load's dtype pre-pass).
     let optim_path = format!("{path}.optim");
+    recover_interrupted_commit(path, &optim_path);
     let data = match std::fs::read(&optim_path) {
         Ok(d) => d,
         Err(e) => {
@@ -910,20 +1071,17 @@ pub extern "C" fn nsl_train_checkpoint_load(
     // mixed directory) leaves θ@N beside moments@N−k — same architecture,
     // same counts, silently divergent training. θ changes every optimizer
     // step, so the signature separates the pair reliably.
-    match scan_header_numbers(header_bytes, b"\"model_sig\":").first() {
-        Some(&saved_sig) => {
-            let live_sig = model_file_sig(path);
-            if saved_sig != live_sig {
-                crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: '{optim_path}' was not saved \
-                     with '{path}' (model_sig {live_sig} vs sidecar \
-                     {saved_sig}) — the pair is from different checkpoints \
-                     (crash between commits, or mixed files). Refusing the \
-                     mixed-state resume."
-                );
-                std::process::abort();
-            }
+    match sidecar_pairs_with(header_bytes, path) {
+        Pairing::Paired => {}
+        Pairing::Mismatch(detail) => {
+            crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: '{optim_path}' was not saved \
+                 with '{path}' ({detail}) — the pair is from different \
+                 checkpoints (crash between commits, or mixed files). Refusing \
+                 the mixed-state resume."
+            );
+            std::process::abort();
         }
-        None => {
+        Pairing::NoRecord => {
             crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: sidecar header has no model_sig \
                  — not a checkpoint this runtime wrote"
             );
@@ -1038,6 +1196,12 @@ pub extern "C" fn nsl_train_checkpoint_load(
                 sampling_seed,
                 sampling_pos: ((hi as u128) << 64) | (lo as u128),
                 gpu_dropout_ctr: num(b"\"gpu_dropout_ctr\":", "gpu_dropout_ctr"),
+                // Absent in a sidecar written before it was recorded: the
+                // stream then restarts at 0, as every resume used to.
+                bf16_sr_ctr: scan_header_numbers(header_bytes, b"\"bf16_sr_ctr\":")
+                    .first()
+                    .copied()
+                    .unwrap_or(0),
             },
         })
     };
@@ -1416,5 +1580,106 @@ fn check_tensor_contiguous(tensor: &NslTensor, idx: usize) {
             std::process::abort();
         }
         expected_stride *= unsafe { *tensor.shape.add(d) };
+    }
+}
+
+#[cfg(test)]
+mod pairing_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("nsl_ckpt_pairing_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// An NSLO file: magic, 4 reserved bytes, the header length, the header.
+    fn sidecar(header: &str) -> Vec<u8> {
+        let mut v = OPTIM_MAGIC.to_vec();
+        v.extend_from_slice(&[0u8; 4]);
+        v.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        v.extend_from_slice(header.as_bytes());
+        v
+    }
+
+    fn sha_header(model: &std::path::Path) -> String {
+        format!("{{\"model_sha256\":\"{}\"}}", file_sha256_hex(model.to_str().unwrap()).unwrap())
+    }
+
+    #[test]
+    fn file_sha256_matches_the_standard_vector() {
+        let d = scratch("vector");
+        let p = d.join("abc");
+        std::fs::write(&p, b"abc").unwrap();
+        assert_eq!(
+            file_sha256_hex(p.to_str().unwrap()).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn pairing_prefers_the_hash_and_falls_back_to_the_sampled_sig() {
+        let d = scratch("pairs");
+        let (m, other) = (d.join("m.nslm"), d.join("o.nslm"));
+        std::fs::write(&m, b"model bytes").unwrap();
+        std::fs::write(&other, b"model bytez").unwrap();
+        let ms = m.to_str().unwrap();
+        let h = sha_header(&m);
+        assert!(matches!(sidecar_pairs_with(h.as_bytes(), ms), Pairing::Paired));
+        assert!(matches!(sidecar_pairs_with(h.as_bytes(), other.to_str().unwrap()), Pairing::Mismatch(_)));
+        // A hash that disagrees wins over a sampled sig that agrees: the sig
+        // is only consulted for sidecars written before the hash existed.
+        let both = format!("{{\"model_sig\":{},\"model_sha256\":\"{}\"}}", model_file_sig(ms), "0".repeat(64));
+        assert!(matches!(sidecar_pairs_with(both.as_bytes(), ms), Pairing::Mismatch(_)));
+        let legacy = format!("{{\"model_sig\":{}}}", model_file_sig(ms));
+        assert!(matches!(sidecar_pairs_with(legacy.as_bytes(), ms), Pairing::Paired));
+        assert!(matches!(sidecar_pairs_with(b"{}", ms), Pairing::NoRecord));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_sidecar_header_longer_than_the_file_is_not_read() {
+        let d = scratch("short");
+        let p = d.join("x.optim");
+        let mut bytes = sidecar("{}");
+        bytes[8..16].copy_from_slice(&(1u64 << 40).to_le_bytes());
+        std::fs::write(&p, &bytes).unwrap();
+        assert!(read_sidecar_header(p.to_str().unwrap()).is_none());
+        std::fs::write(&p, sidecar("{\"k\":1}")).unwrap();
+        assert_eq!(read_sidecar_header(p.to_str().unwrap()).as_deref(), Some(&b"{\"k\":1}"[..]));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// The three states a `.optim.tmp` can be found in at load time.
+    #[test]
+    fn an_interrupted_commit_is_completed_only_when_the_temporary_pairs() {
+        let d = scratch("recover");
+        let (m, opt, tmp) = (d.join("m.nslm"), d.join("m.nslm.optim"), d.join("m.nslm.optim.tmp"));
+        let (ms, os) = (m.to_str().unwrap().to_owned(), opt.to_str().unwrap().to_owned());
+        std::fs::write(&m, b"generation 2").unwrap();
+        let stale = sidecar("{\"model_sha256\":\"00\"}");
+        let fresh = sidecar(&sha_header(&m));
+
+        // New model, old sidecar, new sidecar as the temporary: completed.
+        std::fs::write(&opt, &stale).unwrap();
+        std::fs::write(&tmp, &fresh).unwrap();
+        recover_interrupted_commit(&ms, &os);
+        assert_eq!(std::fs::read(&opt).unwrap(), fresh);
+        assert!(!tmp.exists());
+
+        // A leftover temporary beside a pair that already matches: ignored.
+        std::fs::write(&tmp, &stale).unwrap();
+        recover_interrupted_commit(&ms, &os);
+        assert_eq!(std::fs::read(&opt).unwrap(), fresh);
+        assert_eq!(std::fs::read(&tmp).unwrap(), stale);
+
+        // Neither pairs: nothing is moved, and the load's own check refuses.
+        std::fs::write(&opt, &stale).unwrap();
+        recover_interrupted_commit(&ms, &os);
+        assert_eq!(std::fs::read(&opt).unwrap(), stale);
+        assert!(tmp.exists());
+        let _ = std::fs::remove_dir_all(d);
     }
 }
