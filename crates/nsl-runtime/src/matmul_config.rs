@@ -44,6 +44,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 pub const MODE_TF32: i64 = 0;
 pub const MODE_BF16: i64 = 1;
 pub const MODE_F32: i64 = 2;
+/// Or'ed into `nsl_set_matmul_config`'s mode when the user chose the mode
+/// explicitly (`--matmul-mode`); equals `nsl_codegen::MATMUL_MODE_EXPLICIT`.
+/// `resolve_math_mode` then applies no environment override to it.
+pub const MODE_EXPLICIT: i64 = 0x10;
 
 /// 0 = RNE, 1 = SR. Matches `nsl_codegen::Bf16Rounding`.
 pub const ROUND_RNE: i64 = 0;
@@ -58,6 +62,9 @@ pub struct MatmulConfig {
     pub lt: bool,
     pub lt_workspace_mib: u32,
     pub lt_tune: bool,
+    /// `mode` was given explicitly (`MODE_EXPLICIT`): an inherited
+    /// `NSL_MATMUL_TF32` / `NSL_MATMUL_PEDANTIC` does not override it.
+    pub mode_explicit: bool,
 }
 
 impl Default for MatmulConfig {
@@ -72,6 +79,7 @@ impl Default for MatmulConfig {
             lt: false,
             lt_workspace_mib: 64,
             lt_tune: true,
+            mode_explicit: false,
         }
     }
 }
@@ -84,6 +92,7 @@ static CAST_CACHE: AtomicBool = AtomicBool::new(false);
 static LT: AtomicBool = AtomicBool::new(false);
 static LT_WS: AtomicU32 = AtomicU32::new(64);
 static LT_TUNE: AtomicBool = AtomicBool::new(true);
+static MODE_EXPLICIT_SET: AtomicBool = AtomicBool::new(false);
 
 /// Called by codegen before any user statement runs.
 ///
@@ -104,7 +113,9 @@ pub extern "C" fn nsl_set_matmul_config(
     lt_workspace_mib: i64,
     lt_tune: i64,
 ) -> i64 {
+    let (mode, explicit) = split_mode(mode);
     MODE.store(mode as u64, Ordering::SeqCst);
+    MODE_EXPLICIT_SET.store(explicit, Ordering::SeqCst);
     ROUNDING.store(rounding as u64, Ordering::SeqCst);
     MIN_RATIO.store(min_ratio.to_bits(), Ordering::SeqCst);
     CAST_CACHE.store(cast_cache != 0, Ordering::SeqCst);
@@ -113,6 +124,11 @@ pub extern "C" fn nsl_set_matmul_config(
     LT_TUNE.store(lt_tune != 0, Ordering::SeqCst);
     SET.store(true, Ordering::SeqCst);
     0
+}
+
+/// `nsl_set_matmul_config`'s mode argument as (mode, given explicitly).
+pub(crate) fn split_mode(mode: i64) -> (i64, bool) {
+    (mode & !MODE_EXPLICIT, mode & MODE_EXPLICIT != 0)
 }
 
 /// The effective configuration.
@@ -147,6 +163,7 @@ pub fn config() -> MatmulConfig {
             lt: LT.load(Ordering::SeqCst),
             lt_workspace_mib: LT_WS.load(Ordering::SeqCst),
             lt_tune: LT_TUNE.load(Ordering::SeqCst),
+            mode_explicit: MODE_EXPLICIT_SET.load(Ordering::SeqCst),
         };
     }
     // NOT configured: no compiled NSL program is running. Codegen emits
@@ -267,6 +284,15 @@ mod tests {
         assert_eq!(config().lt_workspace_mib, 4096);
         nsl_set_matmul_config(MODE_BF16, ROUND_RNE, 512.0, 0, 1, -5, 1);
         assert_eq!(config().lt_workspace_mib, 0);
+    }
+
+    /// The explicit-mode bit rides on the mode argument and is masked off.
+    #[test]
+    fn the_explicit_bit_is_split_from_the_mode() {
+        assert_eq!(split_mode(MODE_TF32), (MODE_TF32, false));
+        assert_eq!(split_mode(MODE_TF32 | MODE_EXPLICIT), (MODE_TF32, true));
+        assert_eq!(split_mode(MODE_BF16 | MODE_EXPLICIT), (MODE_BF16, true));
+        assert_eq!(split_mode(MODE_F32), (MODE_F32, false));
     }
 
     #[test]

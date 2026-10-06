@@ -113,6 +113,33 @@ pub fn exec_fingerprint() -> String {
     EXEC_FINGERPRINT.lock().map(|g| g.clone()).unwrap_or_default()
 }
 
+/// The fingerprint a checkpoint records and a resume compares: the installed
+/// one with `mm=` naming the matmul mode this process DISPATCHES. The compiled
+/// `mm` alone could say tf32 while an inherited `NSL_MATMUL_TF32=0` ran f32
+/// cores (external review 2026-10-06). Save and resume resolve it the same
+/// way -- `resolve_math_mode`, a pure function of the compiled config and the
+/// environment -- so equal settings compare equal whether or not a GEMM has
+/// run yet. A build without CUDA has no runtime override: the compiled value
+/// stands.
+pub fn effective_exec_fingerprint() -> String {
+    let fp = exec_fingerprint();
+    #[cfg(feature = "cuda")]
+    let fp = with_mm(&fp, crate::cuda::cublas_inner::fingerprint_math_mode_name());
+    fp
+}
+
+/// `fp` with the `mm` key's value replaced by `mm` (unchanged when absent).
+#[cfg(any(feature = "cuda", test))]
+pub(crate) fn with_mm(fp: &str, mm: &str) -> String {
+    fp.split(',')
+        .map(|seg| match seg.split_once('=') {
+            Some(("mm", _)) => format!("mm={mm}"),
+            _ => seg.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Split a `k=v,k=v` fingerprint into pairs. Unparseable segments are dropped
 /// rather than guessed at: a malformed fingerprint must not manufacture a
 /// mismatch on a key that does not exist.
@@ -175,6 +202,14 @@ pub fn render(diffs: &[FieldDiff]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The checkpoint's `mm` names the dispatched mode; other keys stand.
+    #[test]
+    fn with_mm_replaces_only_the_matmul_mode() {
+        let fp = "ad=source,mm=tf32,mmround=rne,dtype=bf16";
+        assert_eq!(with_mm(fp, "f32"), "ad=source,mm=f32,mmround=rne,dtype=bf16");
+        assert_eq!(with_mm("ad=source", "f32"), "ad=source", "absent stays absent");
+    }
+
     /// The WGGO layer-prune keys refuse a resume across a prune change, and
     /// cost nothing to an unpruned resume of an older checkpoint: both lack
     /// them, which `diff` treats as agreement.

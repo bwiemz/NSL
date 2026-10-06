@@ -292,3 +292,77 @@ fn changing_the_layer_prune_on_resume_is_refused() {
     assert!(!dropped.stdout.contains("FIXTURE_DONE"), "the refusal must land before training resumes");
 }
 
+
+fn run_in_env(
+    dir: &std::path::Path,
+    name: &str,
+    flags: &[&str],
+    src: &str,
+    env: &[(&str, &str)],
+) -> RunOut {
+    let root = repo_root();
+    let prog = dir.join(name);
+    std::fs::write(&prog, src).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_nsl"))
+        .arg("run")
+        .args(flags)
+        .arg(&prog)
+        .current_dir(dir)
+        .env("NSL_STDLIB_PATH", root.join("stdlib"))
+        .envs(env.iter().copied())
+        .output()
+        .expect("spawn nsl run");
+    RunOut {
+        ok: out.status.success(),
+        stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+    }
+}
+
+/// External review 2026-10-06: `--matmul-mode tf32` EQUALS the default, and
+/// the old "still equals the default" rule could not tell it from an omitted
+/// flag -- an inherited `NSL_MATMUL_BF16=1` replaced it, and the checkpoint
+/// recorded (as the run used) bf16. The anti-vacuity half: without the flag
+/// the variable still applies and is recorded.
+#[test]
+fn an_explicit_default_matmul_mode_beats_an_inherited_variable() {
+    let bf16_env = [("NSL_MATMUL_BF16", "1")];
+    let dir = fresh_dir("explicit_tf32");
+    let r = run_in_env(&dir, "s.nsl", &["--matmul-mode", "tf32"], &save_cfg(), &bf16_env);
+    assert!(r.ok && r.stdout.contains("FIXTURE_DONE"), "save run failed:\n{}", r.stderr);
+    let sidecar = sidecar_text(&dir);
+    assert!(sidecar.contains("mm=tf32"), "the explicit tf32 must be what ran and what is recorded: {sidecar}");
+
+    let dir2 = fresh_dir("env_bf16");
+    let r = run_in_env(&dir2, "s.nsl", &[], &save_cfg(), &bf16_env);
+    assert!(r.ok, "save run failed:\n{}", r.stderr);
+    let sidecar = sidecar_text(&dir2);
+    assert!(sidecar.contains("mm=bf16"), "without the flag the variable still applies: {sidecar}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir2);
+}
+
+/// The runtime half, in a CUDA build: an explicit `--matmul-mode tf32` also
+/// beats an inherited `NSL_MATMUL_TF32=0` at run time (it used to run f32
+/// cores and fingerprint tf32), and says so. Without the flag the variable
+/// still applies -- and the checkpoint now records the f32 the runtime ran,
+/// not the compiled tf32.
+#[test]
+#[ignore = "requires CUDA GPU (a cuda-feature build of nsl; resolves the cuBLAS math mode)"]
+fn an_explicit_mode_beats_the_runtime_tf32_variable() {
+    let off = [("NSL_MATMUL_TF32", "0")];
+    let dir = fresh_dir("rt_explicit_tf32");
+    let r = run_in_env(&dir, "s.nsl", &["--matmul-mode", "tf32"], &save_cfg(), &off);
+    assert!(r.ok, "save run failed:\n{}", r.stderr);
+    assert!(sidecar_text(&dir).contains("mm=tf32"), "{}", sidecar_text(&dir));
+    assert!(r.stderr.contains("NSL_MATMUL_TF32=0 is set but ignored"), "{}", r.stderr);
+
+    let dir2 = fresh_dir("rt_env_f32");
+    let r = run_in_env(&dir2, "s.nsl", &[], &save_cfg(), &off);
+    assert!(r.ok, "save run failed:\n{}", r.stderr);
+    assert!(sidecar_text(&dir2).contains("mm=f32"), "the record names what ran: {}", sidecar_text(&dir2));
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir2);
+}

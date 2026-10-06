@@ -210,16 +210,16 @@ pub static REGISTRY: &[EnvVar] = &[
         "unset",
         Test,
         Test,
-        "Test harness only: the checkpoint the model_load dtype-refusal child loads."
+        "Test harness only: the checkpoint the model_load refusal child loads."
     ),
     var!(
         "NSL_CKPT_DTYPE_SCENARIO",
         Str,
-        "load_into_bf16",
+        "load_into_bf16 | count | truncated | header | reordered",
         "unset (child returns)",
         Test,
         Test,
-        "Test harness only: names the model_load dtype-mismatch scenario the re-exec'd child runs (expected to abort)."
+        "Test harness only: names the model_load refusal scenario the re-exec'd child runs (expected to abort)."
     ),
     var!(
         "NSL_COLLECTIVES",
@@ -903,7 +903,7 @@ pub static REGISTRY: &[EnvVar] = &[
         "off",
         Behavior,
         Runtime,
-        "Set to 1 to force cuBLAS pedantic full-FP32 math for every matmul, overriding the TF32 default and NSL_MATMUL_BF16."
+        "1 forces cuBLAS pedantic full-FP32 matmul math over the TF32 default and NSL_MATMUL_BF16; an explicit --matmul-mode wins (warns)."
     ),
     var!(
         "NSL_MATMUL_TF32",
@@ -912,7 +912,7 @@ pub static REGISTRY: &[EnvVar] = &[
         "TF32 on (pedantic under the strict-matmul build feature)",
         Behavior,
         Runtime,
-        "1 enables / 0 disables TF32 tensor-core math for cuBLAS f32 matmuls; other values ignored. NSL_MATMUL_PEDANTIC/BF16=1 take precedence."
+        "1 enables / 0 disables TF32 tensor-core math for cuBLAS f32 matmuls; PEDANTIC/BF16=1 and an explicit --matmul-mode win."
     ),
     var!(
         "NSL_MATMUL_TRANSPOSE_VIEWS",
