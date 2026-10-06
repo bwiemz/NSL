@@ -8,6 +8,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **The 1B-posture certificate** (`posture_certificate_gpu.rs`, roadmap item
+  4). Before this, every GPU training gate compared two GPU arms with each
+  other, mostly under AdamW, so a shared or scale-only bug cancelled. None
+  held the 1B flag line to an independent reference.
+  - **Setup.**
+    - `fixtures/posture_lm.nsl` is NSL-Coder-1B's module structure at toy
+      scale: GQA with RoPE, SwiGLU, RMSNorm and a tied head.
+    - It trains with SGD, four micro-batches of distinct data per step, and
+      a clip threshold calibrated to fire on some steps and not others.
+    - It runs under both production postures, canonical
+      (`--layerwise-accum --weight-stream`) and chain (`--checkpoint-selective
+      --fuse-wgrad-accum`), against a CPU `--training-reference` run on the
+      tape.
+  - **Exact-attention tier.** The f16-operand flash kernels are swapped for
+    exact ones, and every other production transformation must match the
+    reference to about 1e-5 (bound 3e-4). A flag bisection found that the
+    fused LM head, fused RMSNorm backward, fused wgrad accumulation,
+    checkpointing and selective recompute each add no measurable error.
+  - **Fused-attention tier.** The production kernels must stay within the
+    f16-operand bound (measured about 2e-3, bound 5e-3).
+  - **Accumulation identity.** A step over 4×2 sequences must equal one
+    over 2×4. The reference shares the FASE recipe with the GPU arm, so only
+    an identity can see a wrong 1/N.
+  - **Trainable set.** Every trainable field updates in both arms (the #806
+    class), and no configuration field moves.
+  - **Mutation-checked.** A GPU clip norm that sums one partial per tensor
+    fails the exact tier (3.8e-3 against a 1e-5 bound). Dropping the 1/N
+    fails the identity.
+
 - **Source-AD rule certification (`source_ad_rule_cert.rs`) and a coverage
   gate.** Each of 60 certificates spells one primitive as NSL source, takes
   `grad` of `sum(EXPR * r)` for a random `r`, and holds the forward loss and

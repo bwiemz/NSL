@@ -1,0 +1,91 @@
+# The 1B-posture certificate fixture (roadmap item 4).
+#
+# NSL-Coder-1B (models/coder1b/model.nsl) at toy scale: the SAME module
+# structure -- stdlib RMSNorm and GroupedQueryAttention (GQA 2:1, RoPE),
+# SwiGLU FFN, pre-norm blocks, weight-tied embedding / LM head -- with
+# d_model 64, head_dim 32 (a fused-flash size), d_ff 128, 2 layers and a
+# 128-token vocabulary (the fused LM-head kernel's minimum).
+#
+# The harness (posture_certificate_gpu.rs) runs it twice from the same
+# initial parameters (the same --seed; initialisation runs on the host
+# before the move): on the GPU under the production flag line, and on the
+# CPU under `--training-reference` with the tape (independent kernels AND an
+# independent AD implementation), and compares the loss stream and the
+# parameters after the last step. SGD, not AdamW: the update is lr * grad,
+# so a wrong gradient scale is visible instead of normalised away.
+#
+# Marker rewrites (exact, by the harness):
+#   # GPU_PLACEMENT     -> m.to(cuda) for the GPU arm
+#   POSTURE_TOKENS_PATH -> the u16 token file the harness writes
+#   POSTURE_INIT_PATH   -> where the initial parameters go
+#   POSTURE_SAVE_PATH   -> where the trained parameters go
+#   POSTURE_BATCH / POSTURE_ACCUM / POSTURE_ROWS -> micro-batch size,
+#                          grad_accumulation, and batch * seq_len
+#   POSTURE_CLIP_ARG    -> `, grad_clip=<t>`, or nothing (the canonical
+#                          posture's --layerwise-accum refuses grad_clip)
+
+from nsl.nn.norms import RMSNorm
+from nsl.nn.gqa import GroupedQueryAttention
+from nsl.nn.losses import cross_entropy
+
+model SwiGLUFFN(d_model: int, d_ff: int):
+    w_gate: Tensor = randn([d_model, d_ff]) * 0.15
+    w_up: Tensor = randn([d_model, d_ff]) * 0.15
+    w_down: Tensor = randn([d_ff, d_model]) * 0.1
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let gate = silu(x @ self.w_gate)
+        let up = x @ self.w_up
+        return (gate * up) @ self.w_down
+
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, d_ff: int, max_seq_len: int, rope_theta: float, n_layers: int):
+    attn_norm: RMSNorm = RMSNorm(d_model)
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, head_dim, 0.0, max_seq_len, rope_theta, n_layers)
+    ffn_norm: RMSNorm = RMSNorm(d_model)
+    ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff)
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = x + self.attn.forward(self.attn_norm.forward(x), false)
+        return h + self.ffn.forward(self.ffn_norm.forward(h))
+
+model PostureLM:
+    embed: Tensor = randn([128, 64]) * 0.1
+    blocks: [TransformerBlock; 2] = TransformerBlock(64, 2, 1, 32, 128, 1024, 500000.0, 2)
+    norm: RMSNorm = RMSNorm(64)
+
+    fn forward_train(self, input_ids: Tensor) -> Tensor:
+        let ids_shape = input_ids.shape
+        let batch_size = ids_shape[0]
+        let seq_len = ids_shape[1]
+        let flat_ids = input_ids.reshape([batch_size * seq_len])
+        let emb = embedding_lookup(self.embed, flat_ids)
+        let x = emb.reshape([batch_size, seq_len, 64])
+        for block in self.blocks:
+            x = block.forward(x)
+        let xn = self.norm.forward(x)
+        # Flat [rows, V] logits through the tied head: the shape the fused
+        # LM-head substitution matches.
+        let flat = xn.reshape([batch_size * seq_len, 64])
+        return flat @ self.embed.transpose(0, 1)
+
+let m = PostureLM()
+# GPU_PLACEMENT
+
+let tokens = load_mmap("POSTURE_TOKENS_PATH", 3)
+let loader = DataLoader(tokens, batch_size=POSTURE_BATCH, seq_len=64, shuffle=false, drop_last=true)
+model_save(m, "POSTURE_INIT_PATH")
+
+print("LOSS_STREAM_BEGIN")
+
+train(model=m, epochs=1, grad_accumulation=POSTURE_ACCUMPOSTURE_CLIP_ARG):
+    optimizer: SGD(lr=0.5)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids)
+        let labels = batch.labels.reshape([POSTURE_ROWS])
+        let loss = cross_entropy(logits, labels)
+    callbacks:
+        on_step(step, loss):
+            print(loss)
+
+print("LOSS_STREAM_END")
+model_save(m, "POSTURE_SAVE_PATH")
