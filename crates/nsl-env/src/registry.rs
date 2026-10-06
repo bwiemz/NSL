@@ -210,16 +210,16 @@ pub static REGISTRY: &[EnvVar] = &[
         "unset",
         Test,
         Test,
-        "Test harness only: the checkpoint the model_load dtype-refusal child loads."
+        "Test harness only: the checkpoint the model_load refusal child loads."
     ),
     var!(
         "NSL_CKPT_DTYPE_SCENARIO",
         Str,
-        "load_into_bf16",
+        "load_into_bf16 | count | truncated | header | reordered",
         "unset (child returns)",
         Test,
         Test,
-        "Test harness only: names the model_load dtype-mismatch scenario the re-exec'd child runs (expected to abort)."
+        "Test harness only: names the model_load refusal scenario the re-exec'd child runs (expected to abort)."
     ),
     var!(
         "NSL_COLLECTIVES",

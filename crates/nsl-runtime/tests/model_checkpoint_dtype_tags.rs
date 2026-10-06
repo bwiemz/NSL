@@ -12,6 +12,13 @@
 //! The refusal is `std::process::abort()`, which a test cannot catch, so the
 //! refusal gate re-execs this binary with `NSL_CKPT_DTYPE_SCENARIO` set and
 //! checks the child's exit status and stderr.
+//!
+//! The same harness pins the structural refusals added after the external
+//! review of 2026-10-06: a count mismatch (it only warned, then loaded
+//! positionally), a truncated data section (found mid-copy, after earlier
+//! tensors were overwritten), a header size past the end of the file (an
+//! unchecked slice), and a reorder of same-shaped parameters, which only
+//! the named load can see.
 
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
@@ -19,7 +26,7 @@ use std::path::{Path, PathBuf};
 use nsl_abi::wire::dtype::{DTYPE_BF16, DTYPE_F32, DTYPE_FP16};
 // Naming the entry points through the crate is what links the runtime in; an
 // `extern "C"` block alone leaves every symbol undefined.
-use nsl_runtime::checkpoint::{nsl_model_load, nsl_model_save};
+use nsl_runtime::checkpoint::{nsl_model_load, nsl_model_load_named, nsl_model_save};
 
 unsafe extern "C" {
     fn nsl_tensor_from_static(data_ptr: i64, shape_list: i64, dtype: i64) -> i64;
@@ -157,5 +164,120 @@ fn zz_load_into_bf16_child() {
     let path = PathBuf::from(std::env::var(CKPT_PATH).expect("parent sets the path"));
     let (dst, _) = cpu_tensor(&[0u8; 8], &[4], DTYPE_BF16);
     load(&path, dst);
+    eprintln!("CHILD_LOADED");
+}
+
+/// `n` f32 values starting at `base`, as bytes.
+fn f32_bytes(base: f32, n: usize) -> Vec<u8> {
+    (0..n).flat_map(|i| (base + i as f32).to_le_bytes()).collect()
+}
+
+fn save_many(path: &Path, named: &[(&str, i64)]) {
+    let p = path.to_str().expect("utf-8 path");
+    let names: Vec<i64> = named.iter().map(|(n, _)| CString::new(*n).unwrap().into_raw() as i64).collect();
+    let tensors: Vec<i64> = named.iter().map(|&(_, t)| t).collect();
+    nsl_model_save(p.as_ptr() as i64, p.len() as i64, list_of(&names), list_of(&tensors));
+}
+
+fn load_named(path: &Path, named: &[(&str, i64)]) {
+    let p = path.to_str().expect("utf-8 path");
+    let names: Vec<i64> = named.iter().map(|(n, _)| CString::new(*n).unwrap().into_raw() as i64).collect();
+    let tensors: Vec<i64> = named.iter().map(|&(_, t)| t).collect();
+    nsl_model_load_named(p.as_ptr() as i64, p.len() as i64, list_of(&names), list_of(&tensors));
+}
+
+/// Two f32 [2, 2] tensors named `a` and `b`, saved to a fresh file.
+fn two_tensor_checkpoint(file: &str) -> PathBuf {
+    let path = scratch(file);
+    let (a, _) = cpu_tensor(&f32_bytes(1.0, 4), &[2, 2], DTYPE_F32);
+    let (b, _) = cpu_tensor(&f32_bytes(10.0, 4), &[2, 2], DTYPE_F32);
+    save_many(&path, &[("a", a), ("b", b)]);
+    path
+}
+
+/// Re-exec the child for `scenario` against `path`; returns its stderr after
+/// asserting it aborted before reaching the end of the load.
+fn refused(scenario: &str, path: &Path) -> String {
+    let exe = std::env::current_exe().expect("test binary path");
+    let out = std::process::Command::new(exe)
+        .args(["zz_structural_child", "--exact", "--nocapture"])
+        .env(SCENARIO, scenario)
+        .env(CKPT_PATH, path)
+        .output()
+        .expect("re-exec test binary");
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(!out.status.success(), "{scenario}: the load must abort; stderr:\n{stderr}");
+    assert!(!stderr.contains("CHILD_LOADED"), "{scenario}: the child got past the load:\n{stderr}");
+    stderr
+}
+
+#[test]
+fn a_checkpoint_with_more_tensors_than_the_model_is_refused() {
+    let path = two_tensor_checkpoint("count.nslm");
+    let stderr = refused("count", &path);
+    assert!(stderr.contains("the file has 2 tensors and the model has 1"), "{stderr}");
+}
+
+#[test]
+fn a_truncated_checkpoint_is_refused_before_any_tensor_is_copied() {
+    let path = two_tensor_checkpoint("truncated.nslm");
+    let bytes = std::fs::read(&path).unwrap();
+    std::fs::write(&path, &bytes[..bytes.len() - 4]).unwrap();
+    let stderr = refused("truncated", &path);
+    // The whole layout is checked up front; the old loader found the short
+    // file at tensor #1, after tensor #0 was already overwritten.
+    assert!(stderr.contains("the header describes 32 data bytes but the file holds 28"), "{stderr}");
+}
+
+#[test]
+fn a_header_size_past_the_end_of_the_file_is_refused() {
+    let path = two_tensor_checkpoint("header.nslm");
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+    std::fs::write(&path, &bytes).unwrap();
+    let stderr = refused("header", &path);
+    assert!(stderr.contains(&format!("the header claims {} bytes", u64::MAX)), "{stderr}");
+}
+
+#[test]
+fn a_reordered_checkpoint_is_refused_by_the_named_load() {
+    let path = two_tensor_checkpoint("reordered.nslm");
+    let stderr = refused("reordered", &path);
+    assert!(stderr.contains("tensor #0 is 'a' in the file but 'b' in the model"), "{stderr}");
+}
+
+/// A train-block checkpoint names entries through the model variable with
+/// dotted indices (`m.blocks.0.w`); `model_load` names fields with brackets
+/// (`blocks[0].w`). Loading one into the other is the documented warm start.
+#[test]
+fn a_train_checkpoint_name_matches_the_model_field_path() {
+    let path = scratch("warm.nslm");
+    let bytes = f32_bytes(3.0, 4);
+    let (src, _) = cpu_tensor(&bytes, &[2, 2], DTYPE_F32);
+    save_many(&path, &[("m.blocks.0.w", src)]);
+    let (dst, dst_data) = cpu_tensor(&[0u8; 16], &[2, 2], DTYPE_F32);
+    load_named(&path, &[("blocks[0].w", dst)]);
+    assert_eq!(unsafe { std::slice::from_raw_parts(dst_data, 16) }, bytes.as_slice());
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+/// Child half of the structural refusals above. A no-op unless the parent
+/// set the scenario variable.
+#[test]
+fn zz_structural_child() {
+    let Ok(scenario) = std::env::var(SCENARIO) else { return };
+    let path = PathBuf::from(std::env::var(CKPT_PATH).expect("parent sets the path"));
+    let (a, _) = cpu_tensor(&[0u8; 16], &[2, 2], DTYPE_F32);
+    let (b, _) = cpu_tensor(&[0u8; 16], &[2, 2], DTYPE_F32);
+    match scenario.as_str() {
+        "count" => load(&path, a),
+        "truncated" | "header" => {
+            let p = path.to_str().unwrap();
+            nsl_model_load(p.as_ptr() as i64, p.len() as i64, list_of(&[a, b]));
+        }
+        "reordered" => load_named(&path, &[("b", b), ("a", a)]),
+        _ => return,
+    }
     eprintln!("CHILD_LOADED");
 }

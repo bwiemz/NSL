@@ -396,3 +396,92 @@ print("FIXTURE_DONE")
     assert!(r.stderr.contains("model sha256"), "refused by the whole-file hash:\n{}", r.stderr);
     let _ = std::fs::remove_dir_all(tmp);
 }
+
+/// Two same-shaped fields, declared in `order`. Swapping the declaration
+/// order swaps the parameters' positions in every list the checkpoint walks.
+fn two_field_fixture(order: [&str; 2], tail: &str) -> String {
+    let field = |n: &str| match n {
+        "a" => "    a: Tensor = ones([2, 2])\n",
+        _ => "    b: Tensor = full([2, 2], 0.5)\n",
+    };
+    format!(
+        r#"from nsl.nn.losses import mse_loss
+
+model Two:
+{}{}
+    fn forward(self, x: Tensor) -> Tensor:
+        return (x @ self.a) @ self.b
+
+let m = Two()
+let x = full([2, 2], 2.0)
+let y = zeros([2, 2])
+{tail}
+print("FIXTURE_DONE")
+"#,
+        field(order[0]),
+        field(order[1]),
+    )
+}
+
+/// Same shapes, same dtypes, same count: before the load checked names, a
+/// reordered model passed every check and resumed with `a`'s weights and
+/// moments in `b` (external review 2026-10-06). Both the train resume and a
+/// plain `model_load` must refuse it before copying anything.
+#[test]
+fn a_model_whose_parameters_were_reordered_is_refused() {
+    let tmp = fresh_dir("reorder");
+    let train = |cfg: &str| {
+        format!(
+            "train(model = m{cfg}):\n    optimizer: AdamW(lr = 0.01)\n    step(batch):\n        let loss = mse_loss(m.forward(x), y)\nmodel_save(m, \"w.nslm\")\n"
+        )
+    };
+    let a = run_in(
+        &tmp,
+        "a.nsl",
+        &two_field_fixture(["a", "b"], &train(r#", epochs = 2, checkpoint_save = "ck.nslm", checkpoint_every = 2"#)),
+    );
+    assert!(a.ok, "save failed:\n{}", a.stderr);
+
+    // Unchanged order: both loads work.
+    let same = run_in(
+        &tmp,
+        "same.nsl",
+        &two_field_fixture(["a", "b"], "model_load(m, \"w.nslm\")\nmodel_load(m, \"ck.nslm\")\n"),
+    );
+    assert!(same.ok && same.stdout.contains("FIXTURE_DONE"), "an unchanged model must load both files:\n{}", same.stderr);
+
+    let r = run_in(
+        &tmp,
+        "r.nsl",
+        &two_field_fixture(["b", "a"], &train(r#", epochs = 4, checkpoint_load = "ck.nslm""#)),
+    );
+    assert!(!r.ok, "a reordered model must not resume:\n{}", r.stderr);
+    assert!(r.stderr.contains("in the file but") && r.stderr.contains("in the model"), "{}", r.stderr);
+    assert!(!r.stderr.contains("[checkpoint] resumed:"), "{}", r.stderr);
+
+    let l = run_in(&tmp, "l.nsl", &two_field_fixture(["b", "a"], "model_load(m, \"w.nslm\")\n"));
+    assert!(!l.ok && !l.stdout.contains("FIXTURE_DONE"), "a reordered model_load must refuse:\n{}", l.stderr);
+    assert!(l.stderr.contains("tensor #0 is 'a' in the file but 'b' in the model"), "{}", l.stderr);
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+/// A sidecar cut short used to be found while the moments were being
+/// copied, after θ had already been overwritten. The whole layout is now
+/// checked first, and the refusal says what is wrong with the file.
+#[test]
+fn a_truncated_sidecar_is_refused_before_anything_is_restored() {
+    let tmp = fresh_dir("trunc_optim");
+    let a = run_in(
+        &tmp,
+        "a.nsl",
+        &fixture(r#", epochs = 2, checkpoint_save = "ck.nslm", checkpoint_every = 2"#, "AdamW(lr = 0.01)"),
+    );
+    assert!(a.ok, "save failed:\n{}", a.stderr);
+    let optim = tmp.join("ck.nslm.optim");
+    let bytes = std::fs::read(&optim).unwrap();
+    std::fs::write(&optim, &bytes[..bytes.len() - 4]).unwrap();
+    let r = run_in(&tmp, "r.nsl", &fixture(r#", epochs = 4, checkpoint_load = "ck.nslm""#, "AdamW(lr = 0.01)"));
+    assert!(!r.ok, "a truncated sidecar must not resume:\n{}", r.stderr);
+    assert!(r.stderr.contains("truncated or padded sidecar"), "{}", r.stderr);
+    let _ = std::fs::remove_dir_all(tmp);
+}
