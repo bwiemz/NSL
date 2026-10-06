@@ -705,7 +705,7 @@ pub extern "C" fn nsl_train_checkpoint_save(
         // The compile-flag record installed by main(). Empty for a program
         // built before the fingerprint existed; the loader treats empty as
         // "unknown" and skips the comparison rather than refusing.
-        exec_fp = crate::exec_fingerprint::exec_fingerprint(),
+        exec_fp = crate::exec_fingerprint::effective_exec_fingerprint(),
         // The resolved train/optimizer/scheduler record installed at
         // train-block entry (item 4). Same tolerance as `exec`: empty for
         // a build predating it; the loader says the check is skipped.
@@ -1083,7 +1083,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
         // Refusing then would make every pre-existing checkpoint unresumable
         // to enforce a property those builds never claimed, so it warns once
         // and continues.
-        let live_exec = crate::exec_fingerprint::exec_fingerprint();
+        let live_exec = crate::exec_fingerprint::effective_exec_fingerprint();
         if r.exec.is_empty() || live_exec.is_empty() {
             let which = if r.exec.is_empty() { "checkpoint" } else { "this run" };
             crate::nsl_log!(WARN, "nsl", "nsl: train_checkpoint_load: no execution fingerprint in {which} \

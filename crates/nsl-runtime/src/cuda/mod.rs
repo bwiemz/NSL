@@ -2417,38 +2417,72 @@ pub(crate) mod cublas_inner {
     /// existed before this change (as `NSL_MATMUL_TF32=1`) but was opt-in;
     /// it is now the default, so `matmul_batch_collapse`'s two-arm parity
     /// gate carries the wider tolerance explicitly rather than by accident.
-    pub(crate) fn resolve_math_mode() -> CublasMathMode {
-        if std::env::var("NSL_MATMUL_PEDANTIC").ok().as_deref() == Some("1") {
-            return CublasMathMode::Pedantic;
-        }
-        // Same tri-state discipline as NSL_MATMUL_TF32: only the literal "1"
-        // engages, only the literal "0" is an (explicit, defensive) opt-out,
-        // and anything else falls through so a typo cannot change arithmetic.
-        // Item 4: the compiled --matmul-mode wins; the environment variable is
-        // a deprecated fallback inside `matmul_config::config()`. Reading the
-        // env directly here would let a program whose FINGERPRINT says tf32 run
-        // bf16 anyway, which is the exact divergence this work removes.
-        match crate::matmul_config::config().mode {
-            crate::matmul_config::MODE_BF16 => return CublasMathMode::Bf16,
+    /// The math mode and where it came from (the banner and the checkpoint
+    /// fingerprint name the source).
+    ///
+    /// External review 2026-10-06: an EXPLICIT `--matmul-mode` is the program's
+    /// arithmetic, so no inherited variable overrides it -- `NSL_MATMUL_TF32` and
+    /// `NSL_MATMUL_PEDANTIC` are ignored (and said to be) for such a program.
+    /// Without the flag, the variables keep their meaning: harnesses build once
+    /// and choose an arm per run with them.
+    pub(crate) fn resolve_math_mode() -> (CublasMathMode, &'static str) {
+        resolve_math_mode_from(
+            crate::matmul_config::config(),
+            std::env::var("NSL_MATMUL_PEDANTIC").ok(),
+            std::env::var("NSL_MATMUL_TF32").ok(),
+            cfg!(feature = "strict-matmul"),
+        )
+    }
+
+    /// `resolve_math_mode` over explicit inputs, so the precedence is testable
+    /// without process-global state.
+    pub(crate) fn resolve_math_mode_from(
+        cfg: crate::matmul_config::MatmulConfig,
+        pedantic: Option<String>,
+        tf32: Option<String>,
+        strict_matmul: bool,
+    ) -> (CublasMathMode, &'static str) {
+        let compiled = match cfg.mode {
+            crate::matmul_config::MODE_BF16 => Some(CublasMathMode::Bf16),
             // `--matmul-mode f32` means f32 throughout on FP32 CUDA cores,
             // which this enum spells Fp32Cores (NOT a variant named F32 -- see
             // its doc comment on why the old `Default` name was a lie).
-            crate::matmul_config::MODE_F32 => return CublasMathMode::Fp32Cores,
+            crate::matmul_config::MODE_F32 => Some(CublasMathMode::Fp32Cores),
+            _ => None,
+        };
+        if cfg.mode_explicit {
+            for (name, value) in [("NSL_MATMUL_PEDANTIC", &pedantic), ("NSL_MATMUL_TF32", &tf32)] {
+                if let Some(v) = value {
+                    crate::nsl_log!(WARN, "nsl-matmul",
+                        "[nsl-matmul] {name}={v} is set but ignored: --matmul-mode was given \
+                         explicitly, and an explicit flag beats an inherited variable"
+                    );
+                }
+            }
+            return (compiled.unwrap_or(CublasMathMode::Tf32), "--matmul-mode");
+        }
+        if pedantic.as_deref() == Some("1") {
+            return (CublasMathMode::Pedantic, "NSL_MATMUL_PEDANTIC=1");
+        }
+        // Item 4: the compiled mode (a default build's env fallback included,
+        // see `nsl_codegen::MatmulConfig::with_env_fallback`) wins over the
+        // runtime read below. Reading NSL_MATMUL_BF16 here would let a program
+        // whose FINGERPRINT says tf32 run bf16 anyway.
+        if let Some(mode) = compiled {
+            return (mode, "the compiled matmul mode");
+        }
+        // Same tri-state discipline as before: only the literal "1" engages,
+        // only the literal "0" opts out, and anything else falls through so a
+        // typo'd `NSL_MATMUL_TF32=true` cannot quietly change the arithmetic.
+        match tf32.as_deref() {
+            Some("1") => return (CublasMathMode::Tf32, "NSL_MATMUL_TF32=1"),
+            Some("0") => return (CublasMathMode::Fp32Cores, "NSL_MATMUL_TF32=0"),
             _ => {}
         }
-        match std::env::var("NSL_MATMUL_TF32").ok().as_deref() {
-            Some("1") => return CublasMathMode::Tf32,
-            // Explicit opt-out. Anything else (unset, or a value we do not
-            // recognise) falls through to the default rather than silently
-            // meaning "off" — a typo'd `NSL_MATMUL_TF32=true` must not
-            // quietly change the arithmetic.
-            Some("0") => return CublasMathMode::Fp32Cores,
-            _ => {}
-        }
-        if cfg!(feature = "strict-matmul") {
-            CublasMathMode::Pedantic
+        if strict_matmul {
+            (CublasMathMode::Pedantic, "the strict-matmul build")
         } else {
-            CublasMathMode::Tf32
+            (CublasMathMode::Tf32, "default")
         }
     }
 
@@ -2463,10 +2497,29 @@ pub(crate) mod cublas_inner {
     /// dispatch, the configuration measured 1.12x slower — with no signal
     /// (dispatch choice has no numeric signature; review finding on the
     /// coupling commit). First reader wins; both consumers agree forever.
-    static RESOLVED_MATH_MODE: std::sync::OnceLock<CublasMathMode> = std::sync::OnceLock::new();
+    static RESOLVED_MATH_MODE: std::sync::OnceLock<(CublasMathMode, &'static str)> =
+        std::sync::OnceLock::new();
 
     pub(crate) fn resolved_math_mode() -> CublasMathMode {
-        *RESOLVED_MATH_MODE.get_or_init(resolve_math_mode)
+        RESOLVED_MATH_MODE.get_or_init(resolve_math_mode).0
+    }
+
+    /// Where `resolved_math_mode` came from (`--matmul-mode`, an environment
+    /// variable, the compiled mode, the default), for the banner.
+    pub(crate) fn resolved_math_mode_source() -> &'static str {
+        RESOLVED_MATH_MODE.get_or_init(resolve_math_mode).1
+    }
+
+    /// The process's math mode as the fingerprint's `mm` key spells it
+    /// (`exec_fingerprint::effective_exec_fingerprint`). Resolves it if no GEMM
+    /// has yet: the first reader wins, and the cuBLAS handle reads the same.
+    pub(crate) fn fingerprint_math_mode_name() -> &'static str {
+        match resolved_math_mode() {
+            CublasMathMode::Tf32 => "tf32",
+            CublasMathMode::Bf16 => "bf16",
+            CublasMathMode::Fp32Cores => "f32",
+            CublasMathMode::Pedantic => "pedantic",
+        }
     }
 
     /// Return a reference to the process-global cuBLAS handle, creating it on
@@ -2519,25 +2572,28 @@ pub(crate) mod cublas_inner {
 
                 match mode {
                     CublasMathMode::Fp32Cores => crate::nsl_log!(INFO, "nsl-matmul", 
-                        "[nsl-matmul] cuBLAS math mode: f32 on FP32 CUDA cores \
-                         (NSL_MATMUL_TF32=0)"
+                        "[nsl-matmul] cuBLAS math mode: f32 on FP32 CUDA cores ({})",
+                        resolved_math_mode_source()
                     ),
                     CublasMathMode::Pedantic => crate::nsl_log!(INFO, "nsl-matmul", 
                         "[nsl-matmul] cuBLAS math mode: pedantic (strict f32; same arithmetic \
-                         units as FP32 cores, fewer internal shortcuts)"
+                         units as FP32 cores, fewer internal shortcuts) ({})",
+                        resolved_math_mode_source()
                     ),
                     CublasMathMode::Tf32 => crate::nsl_log!(INFO, "nsl-matmul", 
-                        "[nsl-matmul] cuBLAS math mode: TF32 tensor cores (default) — 1.55x on \
+                        "[nsl-matmul] cuBLAS math mode: TF32 tensor cores ({}) — 1.55x on \
                          gemms, 1.18x on total kernel time at Coder-50M, at ~13 bits less \
-                         mantissa per product. Set NSL_MATMUL_TF32=0 for full f32."
+                         mantissa per product. `--matmul-mode f32` for full f32.",
+                        resolved_math_mode_source()
                     ),
                     CublasMathMode::Bf16 => crate::nsl_log!(INFO, "nsl-matmul", 
                         "[nsl-matmul] cuBLAS math mode: BF16 tensor-core GEMMs \
-                         (NSL_MATMUL_BF16=1) — high-intensity products cast operands to \
+                         ({}) — high-intensity products cast operands to \
                          bf16 storage (measured 71.3 vs TF32's 36.4 TFLOPS at N=4096, \
                          ~7x TF32's numeric drift), low-intensity ones stay f32 at \
                          FAST_TF32. Accumulation and outputs remain f32. Handle stays \
-                         in DEFAULT_MATH so per-call compute types are authoritative."
+                         in DEFAULT_MATH so per-call compute types are authoritative.",
+                        resolved_math_mode_source()
                     ),
                 }
 
@@ -11303,5 +11359,47 @@ mod oom_contention_tests {
         let total = 32 * GB;
         assert!(oom_contention_line(GB, total, 40 * GB).is_none());
         assert!(oom_contention_line(0, 0, 0).is_none());
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod math_mode_precedence_tests {
+    use super::cublas_inner::{resolve_math_mode_from, CublasMathMode};
+    use crate::matmul_config::{MatmulConfig, MODE_BF16, MODE_F32, MODE_TF32};
+
+    fn cfg(mode: i64, explicit: bool) -> MatmulConfig {
+        MatmulConfig { mode, mode_explicit: explicit, ..MatmulConfig::default() }
+    }
+    fn s(v: &str) -> Option<String> {
+        Some(v.to_string())
+    }
+
+    /// External review 2026-10-06: an explicit `--matmul-mode` beats an
+    /// inherited variable -- including the explicit DEFAULT, tf32.
+    #[test]
+    fn an_explicit_mode_ignores_the_runtime_variables() {
+        for (mode, want) in [
+            (MODE_TF32, CublasMathMode::Tf32),
+            (MODE_BF16, CublasMathMode::Bf16),
+            (MODE_F32, CublasMathMode::Fp32Cores),
+        ] {
+            let got = resolve_math_mode_from(cfg(mode, true), s("1"), s("0"), true);
+            assert_eq!(got, (want, "--matmul-mode"), "mode {mode}");
+        }
+    }
+
+    /// Without the flag the variables keep their meaning (harnesses build once
+    /// and pick an arm per run with them), in their old order.
+    #[test]
+    fn an_unspecified_mode_keeps_the_variables() {
+        let d = || cfg(MODE_TF32, false);
+        assert_eq!(resolve_math_mode_from(d(), s("1"), None, false).0, CublasMathMode::Pedantic);
+        assert_eq!(resolve_math_mode_from(d(), None, s("0"), false).0, CublasMathMode::Fp32Cores);
+        assert_eq!(resolve_math_mode_from(d(), None, s("true"), false), (CublasMathMode::Tf32, "default"));
+        assert_eq!(resolve_math_mode_from(d(), None, None, true).0, CublasMathMode::Pedantic);
+        // A compiled (env-fallback) bf16 beats NSL_MATMUL_TF32 but not PEDANTIC.
+        let bf16 = || cfg(MODE_BF16, false);
+        assert_eq!(resolve_math_mode_from(bf16(), None, s("0"), false).0, CublasMathMode::Bf16);
+        assert_eq!(resolve_math_mode_from(bf16(), s("1"), None, false).0, CublasMathMode::Pedantic);
     }
 }
