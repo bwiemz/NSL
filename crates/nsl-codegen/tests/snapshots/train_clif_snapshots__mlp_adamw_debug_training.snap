@@ -258,7 +258,7 @@ function <main>(i32, i64) -> i32 <callconv> {
     fn58 = nsl_debug_grad_checksum sig58
     fn59 = nsl_list_get sig59
     fn60 = nsl_list_get sig60
-    fn61 = nsl_tensor_to_device_like sig61
+    fn61 = nsl_grad_migrate_like sig61
     fn62 = nsl_tensor_scalar_mul_add_inplace sig62
     fn63 = nsl_tensor_free sig63
     fn64 = nsl_tensor_free sig64
@@ -267,7 +267,7 @@ function <main>(i32, i64) -> i32 <callconv> {
     fn67 = nsl_bias_correction_inv sig67
     fn68 = nsl_list_get sig68
     fn69 = nsl_list_get sig69
-    fn70 = nsl_tensor_to_device_like sig70
+    fn70 = nsl_grad_migrate_like sig70
     fn71 = nsl_tensor_scalar_mul_add_inplace sig71
     fn72 = nsl_tensor_free sig72
     fn73 = nsl_tensor_free sig73

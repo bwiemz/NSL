@@ -6816,11 +6816,10 @@ pub(crate) fn gpu_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
         bias_ptr
     };
     let bias_gpu = NslTensor::from_ptr_ref(bias_on_gpu);
-    // Guarded AFTER the transfer, not before: a host-resident bias is
-    // legitimately f64 (CPU model params are f64) and
-    // `nsl_tensor_to_device` converts f64 -> f32 on the way to the
-    // device. It is the buffer the kernel actually reads that must be
-    // f32, and a 16-bit dtype survives that transfer verbatim.
+    // Guarded AFTER the transfer, not before: the transfer is a byte copy
+    // (C5 step 2b: a host f64 bias is refused there, naming `.to(f32)`), so
+    // the buffer the kernel actually reads is what must be f32, and a 16-bit
+    // dtype survives that transfer verbatim.
     assert_gpu_f32(bias_gpu, "bias_add", "bias");
 
     let out_shape = crate::memory::checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
@@ -8834,9 +8833,9 @@ pub(crate) fn gpu_conv2d_f32(
     };
     let weight_gpu = NslTensor::from_ptr_ref(weight_on_gpu);
     // weight/bias are guarded AFTER their transfer for the same reason as
-    // `gpu_bias_add`: a host-resident parameter is legitimately f64 and
-    // `nsl_tensor_to_device` narrows it to f32 in flight, while a 16-bit
-    // dtype survives verbatim and is what would be misread.
+    // `gpu_bias_add`: the transfer is a byte copy (a host f64 parameter is
+    // refused there, C5 step 2b), and a 16-bit dtype survives it verbatim
+    // and is what would be misread.
     assert_gpu_f32(weight_gpu, "conv2d_f32", "weight");
 
     // Bias pointer (0 if no bias)

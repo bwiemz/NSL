@@ -500,13 +500,12 @@ pub extern "C" fn nsl_tensor_lt_scalar(tensor_ptr: i64, scalar: f64) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     if tensor.device != 0 {
         // The CPU f32 arm below compares in f32 against the ROUNDED
-        // threshold (`scalar as f32`), but the staging download promotes the
-        // data f32→f64 and would take the f64 arm against the UNROUNDED
-        // threshold — at an f32-representability boundary the masks differ
-        // (measured: `lt_scalar(x, 0.9)` on x == 0.9f32 flips per device,
-        // review M1 on 1070c53b). Pre-rounding the threshold through f32
-        // makes the f64 comparison of exact f32 promotions bit-identical to
-        // the f32 comparison the CPU input would take.
+        // threshold (`scalar as f32`). When the staging download promoted the
+        // data f32→f64 (before C5 step 2a it did) the f64 arm compared against
+        // the UNROUNDED threshold, and at an f32-representability boundary the
+        // masks differed (measured: `lt_scalar(x, 0.9)` on x == 0.9f32 flipped
+        // per device, review M1 on 1070c53b). The download now keeps f32;
+        // pre-rounding the threshold keeps the two arms identical regardless.
         let s = if tensor.dtype == 1 {
             (scalar as f32) as f64
         } else {

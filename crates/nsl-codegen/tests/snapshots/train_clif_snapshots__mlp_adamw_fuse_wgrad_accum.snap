@@ -294,7 +294,7 @@ function <main>(i32, i64) -> i32 <callconv> {
     fn69 = nsl_tensor_reduce_to_shape sig69
     fn70 = nsl_tensor_reduce_to_shape sig70
     fn71 = nsl_list_get sig71
-    fn72 = nsl_tensor_to_device_like sig72
+    fn72 = nsl_grad_migrate_like sig72
     fn73 = nsl_tensor_scalar_mul_add_inplace sig73
     fn74 = nsl_tensor_free sig74
     fn75 = nsl_tensor_free sig75

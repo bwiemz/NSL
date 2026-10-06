@@ -4354,7 +4354,7 @@ pub extern "C" fn nsl_grad_migrate_like(grad_ptr: i64, acc_ptr: i64) -> i64 {
 /// Item 2 (2026-08-25). Binary ops reconcile devices by moving the RIGHT
 /// operand to the LEFT operand's device, so a host-resident `full(...)`
 /// input as the left operand of the first op DOWNLOADS every GPU weight
-/// (f32→f64 by ABI) on every op of every step and runs the whole graph
+/// on every op of every step and runs the whole graph
 /// single-threaded on the host — observed as `reduce_to_shape: migrating a
 /// host-resident gradient`, a silent ~1000x slowdown at wrong precision.
 /// A warning that does not gate is not a guard: refuse with the fix named.

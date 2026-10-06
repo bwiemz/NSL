@@ -836,7 +836,7 @@ function <main>(i32, i64) -> i32 <callconv> {
     fn142 = nsl_fused_ew_chain sig142
     fn143 = nsl_tensor_reduce_to_shape sig143
     fn144 = nsl_list_get sig144
-    fn145 = nsl_tensor_to_device_like sig145
+    fn145 = nsl_grad_migrate_like sig145
     fn146 = nsl_tensor_scalar_mul_add_inplace sig146
     fn147 = nsl_tensor_free sig147
     fn148 = nsl_tensor_free sig148
@@ -850,7 +850,7 @@ function <main>(i32, i64) -> i32 <callconv> {
     fn156 = nsl_tensor_matmul sig156
     fn157 = nsl_tensor_reduce_to_shape sig157
     fn158 = nsl_list_get sig158
-    fn159 = nsl_tensor_to_device_like sig159
+    fn159 = nsl_grad_migrate_like sig159
     fn160 = nsl_tensor_scalar_mul_add_inplace sig160
     fn161 = nsl_tensor_free sig161
     fn162 = nsl_tensor_free sig162
@@ -862,7 +862,7 @@ function <main>(i32, i64) -> i32 <callconv> {
     fn168 = nsl_tensor_matmul sig168
     fn169 = nsl_tensor_reduce_to_shape sig169
     fn170 = nsl_list_get sig170
-    fn171 = nsl_tensor_to_device_like sig171
+    fn171 = nsl_grad_migrate_like sig171
     fn172 = nsl_tensor_scalar_mul_add_inplace sig172
     fn173 = nsl_tensor_free sig173
     fn174 = nsl_tensor_free sig174
@@ -886,7 +886,7 @@ function <main>(i32, i64) -> i32 <callconv> {
     fn192 = nsl_fused_ew_chain sig192
     fn193 = nsl_tensor_reduce_to_shape sig193
     fn194 = nsl_list_get sig194
-    fn195 = nsl_tensor_to_device_like sig195
+    fn195 = nsl_grad_migrate_like sig195
     fn196 = nsl_tensor_scalar_mul_add_inplace sig196
     fn197 = nsl_tensor_free sig197
     fn198 = nsl_tensor_free sig198
@@ -900,7 +900,7 @@ function <main>(i32, i64) -> i32 <callconv> {
     fn206 = nsl_tensor_matmul sig206
     fn207 = nsl_tensor_reduce_to_shape sig207
     fn208 = nsl_list_get sig208
-    fn209 = nsl_tensor_to_device_like sig209
+    fn209 = nsl_grad_migrate_like sig209
     fn210 = nsl_tensor_scalar_mul_add_inplace sig210
     fn211 = nsl_tensor_free sig211
     fn212 = nsl_tensor_free sig212
@@ -912,7 +912,7 @@ function <main>(i32, i64) -> i32 <callconv> {
     fn218 = nsl_tensor_matmul sig218
     fn219 = nsl_tensor_reduce_to_shape sig219
     fn220 = nsl_list_get sig220
-    fn221 = nsl_tensor_to_device_like sig221
+    fn221 = nsl_grad_migrate_like sig221
     fn222 = nsl_tensor_scalar_mul_add_inplace sig222
     fn223 = nsl_tensor_free sig223
     fn224 = nsl_tensor_free sig224
@@ -936,7 +936,7 @@ function <main>(i32, i64) -> i32 <callconv> {
     fn242 = nsl_fused_ew_chain sig242
     fn243 = nsl_tensor_reduce_to_shape sig243
     fn244 = nsl_list_get sig244
-    fn245 = nsl_tensor_to_device_like sig245
+    fn245 = nsl_grad_migrate_like sig245
     fn246 = nsl_tensor_scalar_mul_add_inplace sig246
     fn247 = nsl_tensor_free sig247
     fn248 = nsl_tensor_free sig248
@@ -946,7 +946,7 @@ function <main>(i32, i64) -> i32 <callconv> {
     fn252 = nsl_embedding_backward sig252
     fn253 = nsl_tensor_add sig253
     fn254 = nsl_list_get sig254
-    fn255 = nsl_tensor_to_device_like sig255
+    fn255 = nsl_grad_migrate_like sig255
     fn256 = nsl_tensor_scalar_mul_add_inplace sig256
     fn257 = nsl_tensor_free sig257
     fn258 = nsl_tensor_free sig258

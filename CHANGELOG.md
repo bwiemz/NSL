@@ -1825,8 +1825,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   - **Token ids** from `tokenizer.encode`/`encode_batch`, the CFIE bridge,
     speculative and disaggregated decoding are f32 (they were f64);
     `nsl_cfie_tensor_to_tokens` accepts f32 and f64.
-  - **The sparse SpMM/SpMV GPU fallbacks** convert their CPU result to the
-    dense operand's dtype before handing it back.
+  - **Sparse results** take their operand's dtype: SpMM/SpMV the dense
+    operand's, `to_dense` the dtype its source had (`from_dense` now records
+    it). They were f64 whatever the operand, which the GPU fallbacks then
+    uploaded.
+  - **The deterministic scatter-add** read its index, source and output
+    tensors as raw f64, misreading the f32 tensors the runtime makes (and
+    walking past an f32 index tensor); it now reads each in its own dtype.
   - **Gradient accumulation into a GPU buffer** (`nsl_grad_accumulate_add`,
     FASE's grad migration) converts a host gradient to the accumulator's
     dtype on the host -- explicitly, through the new
