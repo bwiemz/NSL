@@ -47,8 +47,9 @@ Repository documentation and research artifacts are organized under `spec/`, `do
 - Element-wise: `exp`, `log`, `sqrt`, `abs`, `sign`, `clamp`, `neg`
 - Shape ops: `reshape`, `transpose`, `squeeze`, `unsqueeze`, `contiguous`, `expand`
 - Comparison: element-wise `>`, `<`, `>=`, `<=`, `==`
-- Device: `.to(cuda)`, `.to(cpu)` for transparent GPU transfer
-- Data format: f64 (CPU default), f32 (GPU/training default), FP8/INT8/INT4 (quantized)
+- Device: `.to(cuda)`, `.to(cpu)` move a tensor between devices and keep its dtype
+- Data format: f32 by default on every device; f64 by annotation, CPU only; fp16/bf16 storage; FP8/INT8/INT4 (quantized)
+- Mixed dtypes are refused, not promoted: convert explicitly with `.to(f32 | f64 | fp16 | bf16)`
 
 ---
 
@@ -127,7 +128,7 @@ kernel matmul_naive(A, B, C, M, K, N):
 - `kernel` keyword compiles to PTX via Cranelift
 - 15 built-in PTX kernels (add, sub, mul, div, neg, relu, exp, log, sqrt, abs, sign, sigmoid, tanh, scalar ops, matmul)
 - CUDA Unified Memory for zero-copy host/device access
-- Automatic f64/f32 dtype conversion on device transfer
+- Device transfer keeps the dtype: an f64 tensor must be converted with `.to(f32)` before it can move to the GPU
 - GPU intrinsics: `thread_id()`, `block_id()`, `block_dim()`, `sync_threads()`
 - `@autotune` decorator for build-time kernel parameter tuning
 

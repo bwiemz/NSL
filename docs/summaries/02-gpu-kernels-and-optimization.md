@@ -25,7 +25,7 @@ Kernel blocks compile to PTX at build time via the `KernelCompiler` in `nsl-code
 - **Context**: `cuDevicePrimaryCtxRetain` + `cuCtxSetCurrent` (CUDA 13.x removed cuCtxCreate)
 - **Memory**: Unified memory via `cuMemAllocManaged` for zero-copy host/device access
 - **Thread safety**: Thread-local CUDA contexts (must call `cuCtxSetCurrent` per-thread)
-- **Dtype handling**: GPU tensors are f32 (dtype=1); an upload narrows f64 to f32, and a download keeps the device tag (C5 step 2a)
+- **Dtype handling**: GPU kernels compute f32 (dtype=1) and store fp16/bf16/i32; upload and download keep the tag, and an f64 upload is refused (`.to(f32)` first) (C5 steps 2a/2b)
 - **PTX ISA 7.0**: Uses `mul.lo.u32` + `add.u32` (not `mad.lo.u32` which causes INVALID_PTX)
 
 ### Built-in GPU Kernels (15)

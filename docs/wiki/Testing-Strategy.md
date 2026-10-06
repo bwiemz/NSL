@@ -10,7 +10,7 @@ NSL has four layers of tests. Every PR that touches non-trivial code should add 
       ┌──────────────┐
       │     e2e      │   real .nsl programs, full pipeline
       ├──────────────┤
-      │ differential │   CPU vs GPU numerical equivalence
+      │ differential │   fused vs unfused, held to an f64 ref
       ├──────────────┤
       │   snapshot   │   AST / IR / PTX stability (insta)
       ├──────────────┤
@@ -67,17 +67,17 @@ First run creates `.snap.new`. Review with `cargo insta review` and accept.
 
 Verifies numerical equivalence between fused and unfused code paths — runs the same `.nsl` script twice via the CLI (once with default fusion, once with `--disable-fusion`) and asserts max-abs-diff within tolerance. Catches precision regressions introduced by fusion passes.
 
-Representative example: [`crates/nsl-cli/tests/differential.rs`](../../crates/nsl-cli/tests/differential.rs) — runs the same `.nsl` script twice via the CLI with and without `--disable-fusion`, captures stdout from both runs, and asserts max-abs-diff is within tolerance. The test gracefully skips if either run fails to compile (detected via `nsl_run()` returning `None`).
+Representative example: [`crates/nsl-cli/tests/differential.rs`](../../crates/nsl-cli/tests/differential.rs) — runs the same `.nsl` script twice via the CLI with and without `--disable-fusion`, parses the numbers each run prints, and holds both runs to each other and to a reference the test computes in f64. Without that reference, two identical runs would agree on any wrong answer when no fusion fires. A run that fails to compile or run fails the test; it is not skipped.
 
-Typical tolerance: tight bounds like `1e-5` or `1e-6` (relative error on f64 stdout, both runs use same dtype and device — no CPU-vs-GPU comparison happens here).
+Typical tolerance: tight bounds like `1e-5` or `1e-6`, relative to the larger of the reference's magnitude and 1. Both runs compute in f32 on the CPU, so the bound covers f32 rounding against the f64 reference; no CPU-vs-GPU comparison happens here.
 
 ### Adding one
 
-- Compile the same `.nsl` function for CPU and GPU
-- Run both with identical inputs
-- Assert max-abs-diff below the appropriate tolerance tier
+- Add a script under `crates/nsl-cli/tests/differential_scripts/` that prints its result
+- Compute the same expression in f64 in the test as the reference
+- Call `differential_test(script, epsilon, &reference)`
 
-Skipped by default when no GPU is available (see GPU-gated tests below).
+These run on the CPU and need no GPU; CPU-vs-GPU kernel comparisons belong in the GPU-gated tests below.
 
 ### Exact differentials — the tokenizer encode path
 
@@ -397,7 +397,7 @@ See [Adding-a-Language-Feature](Adding-a-Language-Feature.md) for the end-to-end
 
 - **Snapshot churn** — accepting stale snapshots without reading them. Always `cargo insta review`, never `cargo insta accept` blind.
 - **Flaky GPU tests** — CUDA context leaks across tests. If a test passes in isolation but fails in a batch, suspect context. See [Runtime-Internals § GPU path](Runtime-Internals.md#gpu-path) for the `ensure_context()` rule.
-- **f64/f32 tolerance** — don't use exact equality between CPU (f64) and GPU (f32) results. Use the tiered tolerance (5e-3 / 2e-2 / 4e-2) described in the Differential tests section.
+- **CPU-vs-GPU tolerance** — both sides are f32 now (the CPU is no longer an f64 reference), but don't expect exact equality. The gap comes from the kernel's reduction order, TF32 GEMMs (the default `--matmul-mode`), and fp16/bf16 operands on the paths that use them, so size the bound from those, using the tiered tolerances (5e-3 / 2e-2 / 4e-2) in the GPU-gated tests section. A test that needs ground truth computes its own reference in f64, inside the test, as an independent oracle; a CPU run of the same program shares its lowering, so it is not one.
 - **Missing `--ignored` flag** — GPU tests silently skip (not fail) without `--ignored`. If you're not seeing a GPU test run at all, add `-- --ignored`.
 
 ---

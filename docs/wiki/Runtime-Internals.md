@@ -12,14 +12,14 @@ Source: [`crates/nsl-runtime/src/tensor/mod.rs:154`](../../crates/nsl-runtime/sr
 #[repr(C)]
 pub struct NslTensor {
     pub(crate) magic: u32,          // MUST be first — 0x4E534C54 ("NSLT") when live, 0x0000DEAD after free
-    pub(crate) data: *mut c_void,   // Opaque: CPU f64 or GPU f32
+    pub(crate) data: *mut c_void,   // Elements of the type `dtype` names, on any device
     pub(crate) shape: *mut i64,
     pub(crate) strides: *mut i64,
     pub(crate) ndim: i64,
     pub(crate) len: i64,
     pub(crate) refcount: AtomicI64,
     pub(crate) device: u8,          // 0 = CPU, 1+ = CUDA device ID
-    pub(crate) dtype: u16,          // 0 = f64, 1 = f32; 256+ = custom user-defined dtypes
+    pub(crate) dtype: u16,          // DTYPE_* storage tag (0 = f64, 1 = f32, ...; full list below)
     pub(crate) owns_data: u8,       // 1 = heap-owned (free on drop), 0 = borrowed/mmap
     pub(crate) data_owner: i64,     // 0 = owns data; non-zero = pointer to owning NslTensor (view)
     pub(crate) slab_managed: u8,    // 1 = data is offset into GPU slab (do NOT free individually)
@@ -30,12 +30,12 @@ pub struct NslTensor {
 Each field serves a specific role:
 
 - **`magic`** — sentinel that spells `"NSLT"` when the struct is live and `0x0000DEAD` after free. Because `#[repr(C)]` places it first, a freed-tensor dereference produces a recognizable poison value rather than silent data corruption.
-- **`data`** — opaque pointer to element storage. Interpretation depends on `device` and `dtype` (see below).
+- **`data`** — pointer to element storage. `dtype` says how to decode it and `device` says where it lives (see below).
 - **`shape`** / **`strides`** — heap-allocated `i64` arrays of length `ndim`, row-major byte strides.
 - **`ndim`** / **`len`** — rank and total element count.
 - **`refcount`** — atomic reference counter. When it reaches zero the allocator frees `data` (if `owns_data == 1` and `slab_managed == 0`) and the struct itself.
 - **`device`** — `0` means CPU; values `1+` are CUDA device IDs (matching the ordinals returned by `cuDeviceGet`).
-- **`dtype`** — built-in codes are `0`=f64, `1`=f32, `2`=fp16, `3`=bf16, `4`=int8, `5`=fp8e4m3, `6`=fp8e5m2, `7`=u16 token, `8`=u16 segment, `9`=i32 (DataLoader token IDs). Custom dtypes from `datatype` blocks start at `256`. The C API (`NslTensorDesc.dtype`) uses this same canonical tag space verbatim — the historical inverted 0=f32/1=f64 C-API convention and the tag-4 i32/int8 overload were both removed in the P4 item-16 dtype/ABI migration (pinned by the `dtype_abi_lock` test).
+- **`dtype`** — built-in codes are `0`=f64, `1`=f32, `2`=fp16, `3`=bf16, `4`=int8, `5`=fp8e4m3, `6`=fp8e5m2, `7`=u16 token, `8`=u16 segment, `9`=i32 (DataLoader token IDs), `10`=blockwise int8 (internal: padded values plus per-block scales, never a C API tag). Custom dtypes from `datatype` blocks start at `256`. The C API (`NslTensorDesc.dtype`) uses this same canonical tag space verbatim — the historical inverted 0=f32/1=f64 C-API convention and the tag-4 i32/int8 overload were both removed in the P4 item-16 dtype/ABI migration (pinned by the `dtype_abi_lock` test).
 - **`owns_data`** — `1` means the struct is responsible for freeing `data`; `0` means the memory is borrowed (e.g. from a view, mmap, or external allocation).
 - **`data_owner`** — non-zero means this tensor is a view; the value is a raw `i64` pointer to the NslTensor that actually allocated the buffer. When a view is freed, the owner's refcount is decremented.
 - **`slab_managed`** — when `1`, `data` is an interior pointer into a persistent GPU slab. The free path skips `cuMemFree_v2` for this block; the slab is released once at program exit via `nsl_slab_destroy`.
@@ -43,10 +43,14 @@ Each field serves a specific role:
 
 ### dtype convention
 
-- **CPU path** — elements are `f64` (`dtype = 0`, `DTYPE_F64`). The `data` pointer is safe to cast to `*mut f64` from CPU code.
-- **GPU path** — elements are `f32` (`dtype = 1`, `DTYPE_F32`). The `data` pointer is a CUDA device pointer; see the `data` pointer rules below.
+The tag names the storage type on every device: decode `data` by `dtype`, never by `device`.
 
-The asymmetry is load-bearing: `.to(cuda)` converts element values from `f64` to `f32` as it copies to device memory. CPU code that casts a GPU tensor's `data` pointer and reads it will mis-decode the values because `f32` and `f64` have different bit widths and layouts.
+- **Default** — f32 on the CPU and the GPU. Every creation builtin (`zeros`, `ones`, `full`, `rand`, `randn`, `arange`, `empty`) makes `DTYPE_F32`, and so do model parameters, stdlib layers and optimizer moments. An annotation chooses f64: `let x: Tensor<[4], f64> = zeros([4])` stores f64, and so does a model field annotated `f64`.
+- **Transfer keeps the tag** — `.to(cuda)` and `.to(cpu)` are byte copies of the same dtype (`nsl_tensor_to_device`). An f64 tensor cannot move to the GPU. Where the dtype is known, the checker refuses it: a `Tensor<[..], f64, cuda>` type, `x.to(cuda)` on a known-f64 tensor, or `m.to(cuda)` on a model with an f64 field, which the error names. Otherwise the runtime refuses the upload with a fatal naming `.to(f32)`. The one deliberate widening is a u16 token tensor, which becomes i32 on upload because tokens are indices.
+- **Device legality** (`nsl_semantic::types::device_support`) — the GPU computes f32 and stores fp16/bf16 (casts, optimizer paths) and i32 (index operands); f64 is refused. The CPU computes f32 and f64 and stores fp16/bf16: elementwise add/sub/mul/div widen, compute and narrow them, while matmul, conv and reductions refuse them. The CPU also holds i32 and u16 tokens as index data.
+- **No implicit promotion** — an op on two different stored dtypes (arithmetic, matmul, compare, `where`, `cat`, …) is a compile error when both dtypes are known, and a `mixed_dtypes` fatal (`UnsupportedDtype`, exit 17) at run time when one is not. Convert explicitly with `.to(dtype)`. On the CPU it converts among f64, f32, fp16 and bf16, rounding to nearest even; on the GPU it converts f32 ↔ fp16/bf16.
+
+Typed accessors (`data_f32`, `data_f64`, …) assert the tag before handing out a pointer, so reading a buffer at the wrong width fails an assertion instead of mis-decoding values.
 
 ### `data` pointer rules
 

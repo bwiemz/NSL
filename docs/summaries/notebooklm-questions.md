@@ -11,7 +11,7 @@ and save each answer as a NotebookLM note.
 How does NeuralScript's compilation pipeline work end-to-end? Walk through the 8 Rust crates (nsl-errors, nsl-lexer, nsl-ast, nsl-parser, nsl-semantic, nsl-codegen, nsl-runtime, nsl-cli) and explain how source code flows from .nsl file to native executable. What role does Cranelift play? How does the C ABI runtime get linked in?
 
 ### Q2: Tensor Runtime Representation
-What is the NslTensor struct layout in memory? How does NSL handle the CPU (f64) vs GPU (f32) dtype split? How does device dispatch work — when a tensor operation is called, how does the runtime decide whether to use the CPU path or launch a CUDA kernel?
+What is the NslTensor struct layout in memory? How does the dtype tag relate to the device, and what happens to a tensor's dtype on a device transfer? How does device dispatch work — when a tensor operation is called, how does the runtime decide whether to use the CPU path or launch a CUDA kernel?
 
 ### Q3: Module System & Multi-File Compilation
 How does NSL resolve imports and compile multi-file programs? What is the dependency resolution strategy? How does two-pass function compilation work (declaring signatures first, then compiling bodies)?

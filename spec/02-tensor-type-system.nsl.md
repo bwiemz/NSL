@@ -19,7 +19,7 @@ symbolic_dim    ::= IDENT                            # e.g., batch (resolved at 
 named_dim       ::= IDENT '=' (STRING | INTEGER)     # e.g., heads="H" or seq=2048
 wildcard_dim    ::= '_'                              # any dimension (unchecked)
 
-dtype_spec      ::= 'fp64' | 'fp32' | 'fp16' | 'bf16'
+dtype_spec      ::= 'f64' | 'fp64' | 'f32' | 'fp32' | 'f16' | 'fp16' | 'bf16'
                   | 'fp8_e4m3' | 'fp8_e5m2'
                   | 'int64' | 'int32' | 'int16' | 'int8' | 'int4'
                   | 'uint8' | 'bool'
@@ -155,21 +155,33 @@ fn bad_matmul(a: Tensor<[32, 64], fp32>, b: Tensor<[128, 64], fp32>):
 ## Type Coercion Rules
 
 ```nsl
-# Implicit promotion (safe widening only):
-# int4 -> int8 -> int16 -> int32 -> int64
-# fp8 -> fp16 -> fp32 -> fp64
-# bf16 -> fp32 -> fp64
+# The default float dtype is f32 on every device; an annotation can choose f64:
+let x = rand([10])                             # Tensor<[10], f32>
+let w: Tensor<[10], f64> = zeros([10])         # stores f64
 
-# Narrowing requires explicit cast:
-let x: Tensor<[10], fp32> = rand([10])
-let y: Tensor<[10], fp16> = x.to(fp16)        # explicit cast required
-# let z: Tensor<[10], fp16> = x               # COMPILE ERROR: narrowing without cast
+# Tensor dtypes never convert implicitly, in either direction. An op on two
+# different dtypes is refused, not promoted; the fix is an explicit `.to()`:
+# let s = x + w                                # COMPILE ERROR: `+` on tensors of different dtypes
+let s = x.to(f64) + w                          # explicit cast (round-to-nearest-even)
+let y: Tensor<[10], fp16> = x.to(fp16)         # explicit cast
+# let z: Tensor<[10], fp16> = x                # COMPILE ERROR: dtype mismatch
+# (When a dtype is only known at run time, the same op is a runtime refusal.
+#  Scalar numerics still widen within a family, e.g. f32 -> f64; tensors do not.)
 
-# Device transfer is always explicit:
-let cpu_tensor: Tensor<[10], fp32, cpu> = rand([10])
-let gpu_tensor = cpu_tensor.to(cuda)           # explicit device transfer
+# Device transfer keeps the dtype:
+let cpu_tensor: Tensor<[10], f32, cpu> = rand([10])
+let gpu_tensor: Tensor<[10], f32, cuda> = cpu_tensor.to(cuda)   # still f32
 # let bad = cpu_tensor + gpu_tensor            # COMPILE ERROR: device mismatch
+#                                              # (both devices known; `.to(cuda)`
+#                                              # alone types the device unknown)
+# let g = w.to(cuda)                           # COMPILE ERROR: the GPU stores and computes
+#                                              # f32, not f64; use w.to(f32).to(cuda)
 ```
+
+Device legality is checked too. The GPU computes in f32 and stores fp16, bf16
+and int32; f64 cannot live there. The CPU computes in f32 and f64 and stores
+fp16, bf16 and int32. On the CPU, elementwise arithmetic on fp16/bf16 widens,
+computes and narrows; matmul, convolution and reductions refuse them.
 
 ## Design Tensions & Tradeoffs
 

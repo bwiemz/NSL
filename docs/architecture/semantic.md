@@ -317,7 +317,9 @@ carry the callee's declared return shape.
 shape: rank 0 skips all checks and produces rank 0. `transpose` with
 non-literal axes, `expand`/`unsqueeze`/`select`/`slice` (`view_result_type`
 returns the receiver's dtype/device with unknown shape), `.sum()`/`.mean()`
-(unknown shape), `.to(...)`, `Dim::Computed` (unifies as `Wildcard`, i.e.
+(unknown shape), `.to(...)` with an unrecognised target (a dtype target,
+`f64`/`f32`/`fp16`/`bf16`, or `cpu`/`cuda` keeps the receiver's shape),
+`Dim::Computed` (unifies as `Wildcard`, i.e.
 runtime-checked), and reshape targets that cannot be proven (a *warning*,
 because the runtime still checks element counts). Train-block `step(batch)`
 parameters are typed `Dict<Str, Tensor<unknown>>`, so most training-loop
@@ -333,8 +335,12 @@ tensors are runtime-shaped by construction.
   `Bounded` with a concrete within the bound; two same-name `Bounded` take
   the tighter bound), then `Concrete(1)` against anything. Different
   symbolic names are *incompatible* by design (catches `[B, T] + [T, B]`).
-  Result dtype is `wider_dtype(l, r)`; device mismatch (both known,
-  different) is a separate error in `check_arithmetic`.
+  Two different dtypes that both have a runtime tag are an error first
+  (`check_same_dtype`: tensors are never promoted, and the label offers
+  `.to(dtype)` where a conversion exists). The result dtype is
+  `wider_dtype(l, r)`, which by then only fills in an `Unknown` side or one
+  with no runtime tag. Device mismatch (both known, different) is a
+  separate error in `check_arithmetic`.
 - Matmul (`@`) → `shapes::check_matmul`: both rank >= 2, `lhs[-1]` unifies
   with `rhs[-2]`, batch dims unify pairwise from the right over the shorter
   batch prefix; result is `lhs[..-1] ++ [rhs[-1]]`.

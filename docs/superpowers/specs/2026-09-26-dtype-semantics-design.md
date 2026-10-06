@@ -1,5 +1,20 @@
 # Tensor dtype semantics before 1.0 — one meaning on every device
 
+> **Status (2026-10-06).** Steps 0-6 are implemented: 0, 1 and 2a in
+> #741/#742/#797, 2b #818, 3 #819, 4a #820, 4b #821, 5 #826, 6 #827.
+> Decisions 1-3 went as recommended. Decision 4 went partly the other way:
+> on the CPU, fp16/bf16 elementwise add/sub/mul/div widen, compute and
+> narrow, while matmul, conv and reductions refuse them. Step 7's docs half
+> is the change that adds this note. It rewrites `runtime.md`,
+> `SPECIFICATION.md`, `spec/02`, the Runtime-Internals and Testing-Strategy
+> wiki pages, the semantic architecture doc and the summaries.
+> **Remaining:** step 7's tolerance retunes. That means finding the
+> CPU-vs-GPU parity tests whose bounds assumed an f64 CPU reference, then
+> retuning each to its kernel's reduction-order (and TF32/fp16-operand)
+> bound with a named mutant that the new bound catches. The body below is
+> the design as written on 2026-09-25 and is not updated; "Where it stands"
+> describes the tree before step 0.
+
 **Roadmap criterion:** *Do the CPU/GPU dtype semantic redesign before 1.0.*
 
 This is a design spec, not a plan. It covers four things:
