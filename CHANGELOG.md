@@ -1805,6 +1805,58 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **Packed attention's source-AD wiring is certified** (external review
+  2026-10-06, finding 6). `ScaledDotProductAttentionPacked` was the one
+  attention primitive marked `Uncertified`: its kernels had an f64 oracle,
+  the compiled program did not.
+  - Four certificates in `source_ad_rule_cert.rs` take `grad` of the packed
+    builtin and compare loss and raw q/k/v gradients, under both AD modes,
+    to an f64 segment-causal oracle.
+  - The cases are: two documents; three uneven documents, one of length 1;
+    a batch whose rows pack differently; and a 0.9 scale, which settles
+    whether the CPU paths honour a non-default scale (they do).
+  - An oracle that ignores document boundaries fails all four.
+  - On the CPU these cover the decomposed forward and the segment-aware
+    flash backward reference, not the GPU kernels.
+
+- **The fused loss kernels' source-AD wiring is certified on silicon**
+  (finding 6). `FusedLinearCe` and `FusedKlCe` were `Uncertified`: their
+  kernels had f64 references, but a compiled program's gradients through
+  them did not. They exist only inside a GPU `train`/`distill` block, so a
+  CPU `grad` certificate cannot reach them.
+  - `fused_loss_gradient_cert_gpu.rs` certifies each with ONE compiled
+    `SGD` step.
+    - Every loss operand is a model field.
+    - SGD has no momentum or decay, so the update is exactly `lr * grad`.
+    - The loss is scaled by 0.37, so the backward must honour the upstream
+      gradient.
+    - Two of the eight targets are the ignore index.
+  - `(before - after) / lr` is compared to an f64 central difference of the
+    composite loss over every parameter entry. The distill certificate also
+    asserts the teacher did not move.
+  - Measured on the RTX PRO 4500 (worst absolute error):
+
+    | Loss | dx | dW | db |
+    |---|---|---|---|
+    | LCE | 1.6e-8 | 1.5e-8 | 6e-9 |
+    | KL-CE | 1.4e-8 | 8e-9 | 6e-9 |
+
+    Tolerance is 1e-4 of the largest gradient.
+  - A mismatched loss scale fails the LCE certificate, and a wrong KL
+    weight fails the KL-CE one.
+  - `ad_cert_status` now names these certificates. The coverage gate reads
+    them from a `GPU_CERTS` list, each entry checked to be a GPU-ignored
+    test of that name.
+  - Packed attention also gets a GPU twin, `sdpa_packed_step`. It is one
+    compiled step through the FUSED kernels, with the forward's launch
+    counter and the GPU backward's dispatch line asserted.
+    - Shape: 1×2×64×32, three uneven documents.
+    - Reference: exact f64 gradients, the analytic attention backward,
+      itself spot-checked against central differences.
+    - Measured: dq/dk/dv at 7.3e-4 / 8.8e-4 / 5.8e-4 of scale, inside the
+      packed parity gate's f16-operand bound of 1e-2.
+    - An oracle that ignores document boundaries fails it.
+
 - **An explicit `--matmul-mode` (and `--bf16-rounding`, `--bf16-min-ratio`,
   `--bf16-lt-workspace-mib`) beats an inherited environment variable, even
   when its value equals the default** (external review 2026-10-06). The
