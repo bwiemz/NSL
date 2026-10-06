@@ -170,6 +170,200 @@ fn main():
     assert!(errs.is_empty(), "annotated creation must type-check: {errs:?}");
 }
 
+/// The `error`-severity messages of a snippet, for the C5 step 4 tests.
+fn error_messages(src: &str) -> Vec<String> {
+    check_source(src)
+        .iter()
+        .filter(|d| d.level == nsl_errors::Level::Error)
+        .map(|d| format!("{d:?}"))
+        .collect()
+}
+
+/// C5 step 4: an op on tensors of two known dtypes is a compile error naming
+/// both dtypes and the conversion; the runtime refuses the same op.
+#[test]
+fn mixed_dtype_tensor_ops_are_refused() {
+    for (expr, op) in [
+        ("a + b", "`+`"),
+        ("b - a", "`-`"),
+        ("a * b", "`*`"),
+        ("b / a", "`/`"),
+        ("a @ m", "`@`"),
+        ("a > b", "`>`"),
+    ] {
+        let src = format!(
+            "fn main():\n    let a = zeros([3, 3])\n    let b: Tensor<[3, 3], f64> = zeros([3, 3])\n    \
+             let m: Tensor<[3, 3], f64> = ones([3, 3])\n    let c = {expr}\n"
+        );
+        let errs = error_messages(&src);
+        assert_eq!(errs.len(), 1, "{expr}: exactly the dtype error expected, got {errs:?}");
+        assert!(errs[0].contains(&format!("{op} on tensors of different dtypes")), "{expr}: {errs:?}");
+        assert!(errs[0].contains("`.to(f32)`") && errs[0].contains("`.to(f64)`"), "{expr}: {errs:?}");
+    }
+}
+
+#[test]
+fn mixed_dtype_compound_assignment_is_refused() {
+    let src = r#"
+fn main():
+    let a = zeros([3])
+    let b: Tensor<[3], f64> = zeros([3])
+    a += b
+"#;
+    let errs = error_messages(src);
+    assert!(
+        errs.len() == 1 && errs[0].contains("`+` on tensors of different dtypes, f32 and f64"),
+        "{errs:?}"
+    );
+}
+
+/// `.to(dtype)` is the fix the message names, so the checker must see its
+/// result's dtype -- it typed every `.to()` result Unknown. `f16` is an
+/// alias of `fp16` there too.
+#[test]
+fn to_dtype_converts_in_the_checker() {
+    let src = r#"
+fn main():
+    let a = zeros([3])
+    let b: Tensor<[3], f64> = zeros([3])
+    let c = a.to(f64) + b
+    let d: Tensor<[3], f64> = a.to(f64)
+    let e: Tensor<[3], f32> = b.to(f32)
+    let h: Tensor<[3], fp16> = a.to(f16)
+"#;
+    assert!(error_messages(src).is_empty(), "{:?}", error_messages(src));
+    let wrong = r#"
+fn main():
+    let a = zeros([3])
+    let d: Tensor<[3], f32> = a.to(f64)
+"#;
+    let errs = error_messages(wrong);
+    assert!(errs.len() == 1 && errs[0].contains("type mismatch"), "{errs:?}");
+}
+
+/// Builtins take and return any dtype: an f64 program through relu, softmax
+/// and layernorm type-checks (with a fixed f32 result type, `relu(b) + b`
+/// was f32 + f64 and would now be refused).
+#[test]
+fn builtins_keep_their_operand_dtype_open() {
+    let src = r#"
+fn main():
+    let b: Tensor<[2, 3], f64> = ones([2, 3])
+    let w: Tensor<[3], f64> = ones([3])
+    let c = relu(b) + b
+    let d = softmax(b, 1) * b
+    let e = layernorm(b, w, w, 0.00001) - b
+"#;
+    assert!(error_messages(src).is_empty(), "{:?}", error_messages(src));
+}
+
+/// A model field's annotation is its dtype, as a `let`'s is: an f64 field
+/// built by a creation call stores f64 (so `x_f64 * self.w` is consistent and
+/// `x_f32 * self.w` a real mix), and an annotation the initializer cannot
+/// honour is an error at the field rather than a false type everywhere it is
+/// used. Before, the field was typed f64 over an f32 tensor.
+#[test]
+fn model_field_annotations_are_the_fields_dtype() {
+    let ok = r#"
+model M(n: int):
+    w: Tensor<[4], f64> = ones([4])
+    fn forward(self, x: Tensor<[4], f64>) -> Tensor:
+        return x * self.w
+"#;
+    assert!(error_messages(ok).is_empty(), "{:?}", error_messages(ok));
+    let mixed = r#"
+model M(n: int):
+    w: Tensor<[4], f64> = ones([4])
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor:
+        return x * self.w
+"#;
+    let errs = error_messages(mixed);
+    assert!(errs.len() == 1 && errs[0].contains("`*` on tensors of different dtypes, f32 and f64"), "{errs:?}");
+    let unhonoured = r#"
+model M(n: int):
+    w: Tensor<[4], bf16> = ones([4])
+"#;
+    let errs = error_messages(unhonoured);
+    assert!(
+        errs.len() == 1
+            && errs[0].contains("field `w` is annotated bf16, but its initializer makes f32")
+            && errs[0].contains("`.to(bf16)`"),
+        "{errs:?}"
+    );
+}
+
+/// Only dtypes the runtime stores can prove a mismatch: `bool`, `int64` and
+/// the like have no runtime tag, so `x * mask` is not refused. Between
+/// stored dtypes the label names only conversions that exist.
+#[test]
+fn only_stored_dtypes_are_refused_and_only_real_conversions_are_named() {
+    let src = r#"
+fn masked(x: Tensor<[4], f32>, m: Tensor<[4], bool>, k: Tensor<[4], int64>) -> Tensor:
+    let a = x * m
+    return a + k
+"#;
+    assert!(error_messages(src).is_empty(), "{:?}", error_messages(src));
+    let int8 = r#"
+fn f(x: Tensor<[4], f32>, q: Tensor<[4], int8>) -> Tensor:
+    return x + q
+"#;
+    let errs = error_messages(int8);
+    assert!(
+        errs.len() == 1 && errs[0].contains("convert the other operand: `.to(f32)`") && !errs[0].contains(".to(int8)"),
+        "{errs:?}"
+    );
+}
+
+/// `|`/`&` take the same dtype check; an open (Unknown) dtype meets any known
+/// one in either order; `.to()` of a nested expression is typed too.
+#[test]
+fn bitwise_open_dtypes_and_nested_conversions() {
+    let src = r#"
+fn main():
+    let a = zeros([3])
+    let b: Tensor<[3], f64> = zeros([3])
+    let c = relu(a) + b
+    let d = b + relu(a)
+    let e = (a + a).to(f64) + b
+"#;
+    assert!(error_messages(src).is_empty(), "{:?}", error_messages(src));
+    let bit = r#"
+fn main():
+    let a = zeros([3])
+    let b: Tensor<[3], f64> = zeros([3])
+    let c = a | b
+"#;
+    let errs = error_messages(bit);
+    assert!(errs.len() == 1 && errs[0].contains("`|` on tensors of different dtypes"), "{errs:?}");
+}
+
+/// The training callback's `loss` has the model's dtype -- f32 by default,
+/// f64 in an f64 program -- so it is open to the checker, not fixed f32.
+#[test]
+fn the_callback_loss_has_an_open_dtype() {
+    let errs = section_contract_errors(concat!(
+        "    callbacks:\n",
+        "        on_step(step, loss):\n",
+        "            let acc: Tensor<[1], f64> = zeros([1])\n",
+        "            let t = loss + acc\n",
+    ));
+    assert!(!errs.iter().any(|m| m.contains("different dtypes")), "{errs:?}");
+}
+
+/// Shape and dtype are independent questions: an unknown or rank-0 shape no
+/// longer skips the dtype comparison in assignability.
+#[test]
+fn unknown_shape_does_not_skip_the_dtype_check() {
+    use crate::types::{is_assignable, DType, Device, Dim, Shape, Type};
+    let t = |shape: Shape, dtype| Type::Tensor { shape, dtype, device: Device::Cpu };
+    let known = || Shape { dims: vec![Dim::Concrete(3)] };
+    assert!(!is_assignable(&t(Shape::unknown(), DType::F64), &t(known(), DType::F32)));
+    assert!(!is_assignable(&t(known(), DType::F32), &t(Shape::scalar(), DType::F64)));
+    assert!(is_assignable(&t(Shape::unknown(), DType::F32), &t(known(), DType::F32)));
+    assert!(is_assignable(&t(known(), DType::F64), &t(Shape::unknown(), DType::Unknown)));
+    assert!(is_assignable(&t(known(), DType::Unknown), &t(known(), DType::F32)));
+}
+
 #[test]
 fn test_borrow_tensor_read_compatible() {
     // Passing an owned Tensor to a function expecting &Tensor should work (auto-borrow)

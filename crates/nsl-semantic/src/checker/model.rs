@@ -39,9 +39,16 @@ impl<'a> TypeChecker<'a> {
                 } => {
                     let ty = self.resolve_type(type_ann);
                     self.declare_symbol(*name, ty.clone(), *span, false, false);
-                    fields.push((*name, ty));
+                    fields.push((*name, ty.clone()));
                     if let Some(init_expr) = init {
-                        self.check_expr(init_expr);
+                        // C5: an annotated field's creation initializer stores
+                        // the annotation's f32/f64 dtype, as a `let` does (step
+                        // 3); any other dtype the initializer is known to make
+                        // differs from what the field claims to hold (step 5's
+                        // field check, on the dtype only).
+                        let init_ty = self.check_expr(init_expr);
+                        let init_ty = self.creation_dtype_from_annotation(init_expr, init_ty, Some(&ty));
+                        self.check_field_init_dtype(*name, &ty, &init_ty, init_expr.span);
                     }
                     for deco in decorators {
                         if deco.name.len() == 1 {

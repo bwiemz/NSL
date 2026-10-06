@@ -116,3 +116,26 @@ print("END_d")
     assert!(err.contains("falling back to tape-based AD"), "{err}");
     assert_eq!(between(&out, "d"), "tensor([4.0, 4.0, 4.0])");
 }
+
+/// A model field's annotation chooses its dtype too (C5 step 4b): an
+/// f64-annotated field built by a creation call holds f64 -- it held f32
+/// while the checker typed it f64, so every use of it was mistyped.
+#[test]
+fn an_f64_annotated_model_field_stores_f64() {
+    let src = r#"
+model M(n: int):
+    w: Tensor<[3], f64> = full([3], 0.1)
+    b: Tensor<[3], f32> = full([3], 0.1)
+
+let m = M(3)
+print("BEGIN_w")
+print(m.w)
+print("END_w")
+print("BEGIN_b")
+print(m.b)
+print("END_b")
+"#;
+    let out = run(src);
+    assert_eq!(between(&out, "w"), "tensor([0.1, 0.1, 0.1])", "the f64 field must hold f64 0.1");
+    assert!(between(&out, "b").contains(F32_TENTH), "the f32 field is f32");
+}

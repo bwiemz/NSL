@@ -174,6 +174,9 @@ fn dtype_bytes(dtype: &nsl_semantic::types::DType) -> u64 {
         DType::F32 | DType::Int32 => 4,
         DType::Fp16 | DType::Bf16 | DType::Int16 => 2,
         DType::Fp8E4m3 | DType::Fp8E5m2 | DType::Int8 | DType::Uint8 | DType::Bool => 1,
+        // An open dtype (most builtin results since C5 step 4b) is the f32
+        // default at run time, as the memory planner bills it.
+        DType::Unknown => 4,
         // Sub-byte / packed storage types: bill one byte per element — an
         // over-estimate is safer than a silent zero for a memory timeline.
         _ => 1,

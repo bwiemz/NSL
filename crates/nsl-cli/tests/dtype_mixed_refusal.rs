@@ -1,6 +1,7 @@
 //! C5 step 4 end to end: an f64 program runs in f64 under both AD modes,
 //! and a program that mixes f32 with f64 is refused instead of computing in
-//! whichever dtype the runtime used to pick ("f32 wins").
+//! whichever dtype the runtime used to pick ("f32 wins") -- by the checker
+//! when it sees both dtypes, by the runtime when it does not.
 //!
 //! The runtime half of the refusal is gated op by op in
 //! `nsl-runtime/tests/mixed_dtype_refusal.rs`; this file pins that compiled
@@ -86,14 +87,51 @@ print("END_g")
     }
 }
 
-/// `a + b` with `a` f32 and `b` f64 used to print an f32 result. Now it
-/// stops with the unsupported-dtype exit code and names the conversion.
+/// `a + b` with `a` f32 and `b` f64 used to print an f32 result. The checker
+/// sees both dtypes, so it is a compile error naming the conversion.
 #[test]
-fn a_mixed_f32_f64_program_is_refused() {
+fn a_visible_mixed_f32_f64_op_is_a_compile_error() {
     let src = r#"
 let a = full([3], 1.0)
 let b: Tensor<[3], f64> = full([3], 2.0)
 print(a + b)
+"#;
+    let out = run(src, &[]);
+    let (stdout, stderr) = text(&out);
+    assert!(!out.status.success(), "a mixed-dtype add must not compile:\n{stdout}\n{stderr}");
+    assert!(stderr.contains("`+` on tensors of different dtypes, f32 and f64"), "{stderr}");
+    assert!(stderr.contains("`.to(f64)`"), "{stderr}");
+}
+
+/// The conversion the message names works: `a.to(f64) + b` is f64.
+#[test]
+fn the_named_conversion_fixes_it() {
+    let src = r#"
+let a = full([3], 0.1)
+let b: Tensor<[3], f64> = full([3], 0.2)
+print("BEGIN_c")
+print(a.to(f64) + b)
+print("END_c")
+"#;
+    let out = run(src, &[]);
+    let (stdout, stderr) = text(&out);
+    assert!(out.status.success(), "{stdout}\n{stderr}");
+    // f32 0.1 widened, plus f64 0.2: neither f32 0.3 nor f64 0.1 + 0.2.
+    let want = f64::from(0.1f32) + 0.2;
+    for v in numbers(&stdout, "c") {
+        assert_eq!(v, want, "{stdout}");
+    }
+}
+
+/// Where the checker cannot see a dtype -- a builtin's result is typed with
+/// an open dtype -- the runtime refuses the same op, with the unsupported-
+/// dtype exit code and the conversion named.
+#[test]
+fn a_mixed_op_the_checker_cannot_see_is_refused_at_run_time() {
+    let src = r#"
+let a = full([3], 1.0)
+let b: Tensor<[3], f64> = full([3], 2.0)
+print(relu(a) + b)
 "#;
     let out = run(src, &[]);
     let (stdout, stderr) = text(&out);

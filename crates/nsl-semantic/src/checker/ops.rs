@@ -19,21 +19,55 @@ impl<'a> TypeChecker<'a> {
             }
             BinOp::MatMul => self.check_matmul_op(&lty, &rty, span),
             BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => {
+                if let (Some((_, ld, _)), Some((_, rd, _))) = (lty.as_tensor_parts(), rty.as_tensor_parts())
+                    && !self.check_same_dtype(op, *ld, *rd, span)
+                {
+                    return Type::Error;
+                }
                 Type::Bool
             }
             BinOp::And | BinOp::Or => Type::Bool,
             BinOp::Is | BinOp::In => Type::Bool,
-            BinOp::BitOr | BinOp::BitAnd => self.check_bitwise(&lty, &rty, span),
+            BinOp::BitOr | BinOp::BitAnd => self.check_bitwise(&lty, &rty, op, span),
         }
+    }
+
+    /// C5 step 4: an op on two tensors whose dtypes are both known and differ
+    /// is an error -- NSL converts only by an explicit `.to()`, and the
+    /// runtime refuses the same op. Only dtypes the runtime stores take part:
+    /// `Unknown` matches anything (the runtime refuses what the checker cannot
+    /// see); ternary and custom (BYOD) dtypes are formats with kernels of
+    /// their own; and `bool`, `int64`, `int16`, `uint8`, `int4` have no runtime
+    /// tag -- such an annotation does not describe storage, so it cannot
+    /// prove a mismatch. Returns whether the dtypes agree.
+    pub(crate) fn check_same_dtype(&mut self, op: BinOp, ld: DType, rd: DType, span: Span) -> bool {
+        if ld == rd || !stored_at_run_time(ld) || !stored_at_run_time(rd) {
+            return true;
+        }
+        let (l, r) = (display_dtype(&ld), display_dtype(&rd));
+        self.diagnostics.push(
+            Diagnostic::error(format!(
+                "`{}` on tensors of different dtypes, {l} and {r}",
+                binop_symbol(op)
+            ))
+            .with_label(span, conversion_hint(ld, rd)),
+        );
+        false
     }
 
     /// `|` / `&` on tensors are elementwise (used for boolean masks) and
     /// must be shape/device-checked exactly like arithmetic ops; on scalars
     /// they fall back to the left operand's type as before.
-    pub(crate) fn check_bitwise(&mut self, lty: &Type, rty: &Type, span: Span) -> Type {
+    pub(crate) fn check_bitwise(&mut self, lty: &Type, rty: &Type, op: BinOp, span: Span) -> Type {
         if lty.is_tensor() && rty.is_tensor() {
-            let (ls, ld, ldev) = lty.as_tensor_parts().unwrap();
-            let (rs, _rd, rdev) = rty.as_tensor_parts().unwrap();
+            // A sparse operand has no dense parts; it is not typed here.
+            let (Some((ls, ld, ldev)), Some((rs, rd, rdev))) = (lty.as_tensor_parts(), rty.as_tensor_parts())
+            else {
+                return Type::Unknown;
+            };
+            if !self.check_same_dtype(op, *ld, *rd, span) {
+                return Type::Error;
+            }
             if ldev != rdev && !matches!(ldev, Device::Unknown) && !matches!(rdev, Device::Unknown) {
                 self.diagnostics.push(
                     Diagnostic::error("cannot operate on tensors on different devices")
@@ -69,8 +103,15 @@ impl<'a> TypeChecker<'a> {
             | (Type::Float, Type::Int) => Type::Float,
             // Tensor element-wise ops (includes Param/Buffer)
             (l, r) if l.is_tensor() && r.is_tensor() => {
-                let (ls, ld, ldev) = l.as_tensor_parts().unwrap();
-                let (rs, rd, rdev) = r.as_tensor_parts().unwrap();
+                // A sparse operand has no dense parts; it is not typed here
+                // (`as_tensor_parts` is None for it, and this unwrapped).
+                let (Some((ls, ld, ldev)), Some((rs, rd, rdev))) = (l.as_tensor_parts(), r.as_tensor_parts())
+                else {
+                    return Type::Unknown;
+                };
+                if !self.check_same_dtype(op, *ld, *rd, span) {
+                    return Type::Error;
+                }
                 if ldev != rdev
                     && !matches!(ldev, Device::Unknown)
                     && !matches!(rdev, Device::Unknown)
@@ -129,6 +170,9 @@ impl<'a> TypeChecker<'a> {
         // Normalize Param/Buffer to Tensor for type-checking
         match (lty.as_tensor_parts(), rty.as_tensor_parts()) {
             (Some((ls, ld, ldev)), Some((rs, rd, rdev))) => {
+                if !self.check_same_dtype(BinOp::MatMul, *ld, *rd, span) {
+                    return Type::Error;
+                }
                 if ldev != rdev
                     && !matches!(ldev, Device::Unknown)
                     && !matches!(rdev, Device::Unknown)
@@ -178,6 +222,35 @@ impl<'a> TypeChecker<'a> {
 
         // Check each argument
         let arg_types: Vec<Type> = args.iter().map(|a| self.check_expr(&a.value)).collect();
+
+        // `t.to(dtype)` / `t.to(device)`: the converted tensor's dtype, so
+        // the conversion a dtype-mismatch error asks for is one the checker
+        // sees (C5 step 4). The names are the ones codegen converts by; anything
+        // else (a custom dtype, a device expression) keeps the method's
+        // Unknown-typed result.
+        if let ExprKind::MemberAccess { object, member } = &callee.kind
+            && self.resolve_name(*member) == "to"
+            && let [arg] = args
+            && let ExprKind::Ident(target) = &arg.value.kind
+            && let Some((shape, dtype, device)) =
+                self.type_map.get(&object.id).and_then(|t| t.as_tensor_parts())
+        {
+            let converted = match self.resolve_name(*target).as_str() {
+                "f64" => Some((DType::F64, device)),
+                "f32" | "float" => Some((DType::F32, device)),
+                "fp16" | "f16" => Some((DType::Fp16, device)),
+                "bf16" => Some((DType::Bf16, device)),
+                // A transfer keeps the dtype (C5 step 2). The device stays
+                // Unknown, as before: parameters are typed cpu even when a
+                // model is moved to the GPU, so a precise device would
+                // raise false device mismatches.
+                "cpu" | "cuda" => Some((*dtype, Device::Unknown)),
+                _ => None,
+            };
+            if let Some((dtype, device)) = converted {
+                return Type::Tensor { shape: shape.clone(), dtype, device };
+            }
+        }
 
         // M51: Track callee names for effect call graph construction
         if let ExprKind::Ident(sym) = &callee.kind {
@@ -731,5 +804,64 @@ impl<'a> TypeChecker<'a> {
             Type::Unknown => Type::Unknown,
             _ => Type::Unknown,
         }
+    }
+}
+
+/// The source spelling of a binary operator, for diagnostics.
+pub(crate) fn binop_symbol(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Add => "+",
+        BinOp::Sub => "-",
+        BinOp::Mul => "*",
+        BinOp::Div => "/",
+        BinOp::FloorDiv => "//",
+        BinOp::Mod => "%",
+        BinOp::Pow => "**",
+        BinOp::MatMul => "@",
+        BinOp::Eq => "==",
+        BinOp::NotEq => "!=",
+        BinOp::Lt => "<",
+        BinOp::Gt => ">",
+        BinOp::LtEq => "<=",
+        BinOp::GtEq => ">=",
+        BinOp::And => "and",
+        BinOp::Or => "or",
+        BinOp::Is => "is",
+        BinOp::In => "in",
+        BinOp::BitOr => "|",
+        BinOp::BitAnd => "&",
+    }
+}
+
+/// Whether a tensor annotated `d` has that dtype in memory: the runtime has a
+/// tag for it (`nsl_abi::wire::dtype`).
+pub(crate) fn stored_at_run_time(d: DType) -> bool {
+    matches!(
+        d,
+        DType::F64
+            | DType::F32
+            | DType::Fp16
+            | DType::Bf16
+            | DType::Fp8E4m3
+            | DType::Fp8E5m2
+            | DType::Int8
+            | DType::Int32
+    )
+}
+
+/// The label of a dtype-mismatch error: the `.to()` conversions that exist
+/// between `a` and `b` (codegen converts to f64, f32, fp16 and bf16 only).
+pub(crate) fn conversion_hint(a: DType, b: DType) -> String {
+    let convertible = |d: DType| matches!(d, DType::F64 | DType::F32 | DType::Fp16 | DType::Bf16);
+    let to: Vec<String> = [a, b]
+        .into_iter()
+        .filter(|d| convertible(*d))
+        .map(|d| format!("`.to({})`", display_dtype(&d)))
+        .collect();
+    match to.as_slice() {
+        [] => format!("NSL has no conversion between {} and {}", display_dtype(&a), display_dtype(&b)),
+        [one] => format!("convert the other operand: {one}"),
+        [x, y] => format!("convert one operand: {x} or {y}"),
+        _ => unreachable!("two dtypes give at most two conversions"),
     }
 }

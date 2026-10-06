@@ -206,7 +206,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
     // Tensor creation functions. f32 is the default float dtype (C5 step 3):
     // it is what the runtime makes, every GPU kernel computes and checkpoints
     // hold. A declaration's annotation can choose f64 (`check_var_decl`).
-    let tensor_ret = Type::Tensor {
+    let creation_ret = Type::Tensor {
         shape: Shape::unknown(),
         dtype: DType::F32,
         device: Device::Cpu,
@@ -216,7 +216,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
             name,
             Type::Function {
                 params: vec![Type::List(Box::new(Type::Int))],
-                ret: Box::new(tensor_ret.clone()),
+                ret: Box::new(creation_ret.clone()),
                 effect: Effect::Inferred,
             },
         );
@@ -226,7 +226,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         "full",
         Type::Function {
             params: vec![Type::List(Box::new(Type::Int)), Type::Float],
-            ret: Box::new(tensor_ret.clone()),
+            ret: Box::new(creation_ret.clone()),
             effect: Effect::Inferred,
         },
     );
@@ -235,10 +235,22 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         "arange",
         Type::Function {
             params: vec![Type::Unknown],
-            ret: Box::new(tensor_ret.clone()),
+            ret: Box::new(creation_ret.clone()),
             effect: Effect::Inferred,
         },
     );
+
+    // Every other builtin takes and returns tensors of any dtype. The runtime
+    // keeps its operand's dtype, so a fixed f32 here typed `relu(x)` f32 for
+    // an f64 `x` -- harmless while the checker ignored dtype mismatches, a
+    // false refusal of a correct f64 program once it does (C5 step 4) -- and
+    // an f32 parameter would refuse an f64 argument. Unknown matches any
+    // dtype; the runtime refuses a mismatch the checker cannot see.
+    let tensor_ret = Type::Tensor {
+        shape: Shape::unknown(),
+        dtype: DType::Unknown,
+        device: Device::Cpu,
+    };
 
     // Activation functions, tensor trig, and rotate_half (take tensor, return tensor)
     for name in &["relu", "gelu", "silu", "sigmoid", "tanh", "tensor_sin", "tensor_cos", "rotate_half"] {
@@ -839,6 +851,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
     def("f32", Type::Int);
     def("f64", Type::Int);
     def("fp16", Type::Int);
+    def("f16", Type::Int);
     def("bf16", Type::Int);
 
     // Higher-order functions

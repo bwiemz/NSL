@@ -85,6 +85,28 @@ impl<'a> TypeChecker<'a> {
         retyped
     }
 
+    /// C5: a model field whose initializer's dtype is known and differs from
+    /// the field's annotation (both stored at run time) is an error -- the
+    /// field would claim one dtype and hold another. Dtype only: a symbolic
+    /// shape built from the model's parameters is not compared here.
+    pub(crate) fn check_field_init_dtype(&mut self, field: Symbol, ann: &Type, init: &Type, span: Span) {
+        let (Some((_, ad, _)), Some((_, vd, _))) = (ann.as_tensor_parts(), init.as_tensor_parts()) else {
+            return;
+        };
+        if ad == vd || !super::ops::stored_at_run_time(*ad) || !super::ops::stored_at_run_time(*vd) {
+            return;
+        }
+        let name = self.resolve_name(field);
+        self.diagnostics.push(
+            Diagnostic::error(format!(
+                "field `{name}` is annotated {}, but its initializer makes {}",
+                display_dtype(ad),
+                display_dtype(vd)
+            ))
+            .with_label(span, super::ops::conversion_hint(*vd, *ad)),
+        );
+    }
+
     pub(crate) fn check_fn_def(&mut self, fn_def: &FnDef) {
         let fn_ty = self.build_fn_type(fn_def);
 
