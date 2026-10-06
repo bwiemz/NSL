@@ -180,17 +180,17 @@ pub fn emit_c_abi_wrapper(
 
         for param in wrapper.export_info.params.iter() {
             match &param.ty {
-                ExportTypeInfo::Tensor { .. } => {
+                ExportTypeInfo::Tensor { dtype, device, .. } => {
                     let arg_val = params[param_cursor];
                     param_cursor += 1;
-                    let tensor =
-                        call_desc_to_tensor(&mut builder, &mut compiler.module, arg_val)?;
-                    let msg = format!(
-                        "parameter '{}' of '{}' has an unrecognized NslTensorDesc dtype tag \
-                         (valid: 0=f64, 1=f32, 2=f16, 3=bf16, 4=int8, 5=fp8e4m3, 6=fp8e5m2, \
-                         7=u16-token, 8=u16-segment, 9=int32)",
-                        param.name, wrapper.raw_name
-                    );
+                    let tensor = call_desc_to_tensor_expect(
+                        &mut builder,
+                        &mut compiler.module,
+                        arg_val,
+                        *dtype,
+                        *device,
+                    )?;
+                    let msg = format!("parameter '{}' of '{}'", param.name, wrapper.raw_name);
                     emit_null_tensor_guard(
                         &mut builder,
                         &mut compiler.module,
@@ -251,20 +251,25 @@ pub fn emit_c_abi_wrapper(
                     // Unpack each desc into a tensor and collect them into the
                     // NslList that IS the tuple's runtime representation.
                     let list = call_nsl_list_new(&mut builder, &mut compiler.module)?;
-                    for k in 0..elems.len() {
+                    for (k, elem) in elems.iter().enumerate() {
                         let off = (k as i64) * NSL_TENSOR_DESC_SIZE;
                         let desc_ptr = if off == 0 {
                             items_ptr
                         } else {
                             builder.ins().iadd_imm_s(items_ptr, off)
                         };
-                        let tensor =
-                            call_desc_to_tensor(&mut builder, &mut compiler.module, desc_ptr)?;
+                        let ExportTypeInfo::Tensor { dtype, device, .. } = elem else {
+                            unreachable!("checked above: every tuple element is a tensor");
+                        };
+                        let tensor = call_desc_to_tensor_expect(
+                            &mut builder,
+                            &mut compiler.module,
+                            desc_ptr,
+                            *dtype,
+                            *device,
+                        )?;
                         let msg = format!(
-                            "tuple parameter '{}' element {} of '{}' has an unrecognized \
-                             NslTensorDesc dtype tag (valid: 0=f64, 1=f32, 2=f16, 3=bf16, \
-                             4=int8, 5=fp8e4m3, 6=fp8e5m2, 7=u16-token, 8=u16-segment, \
-                             9=int32)",
+                            "tuple parameter '{}' element {} of '{}'",
                             param.name, k, wrapper.raw_name
                         );
                         // `list` is live but not yet in `lists_to_free`; pass it
@@ -301,9 +306,20 @@ pub fn emit_c_abi_wrapper(
         // NslTensor struct leaks (~80 bytes/call). Same pattern as nsl_model_forward.
         // A proper fix (memcpy + free, or caller-side nsl_desc_free_data) is deferred.
         match &wrapper.export_info.return_type {
-            ExportTypeInfo::Tensor { .. } => {
+            ExportTypeInfo::Tensor { dtype, device, .. } => {
                 let ret_desc_ptr = params[param_cursor];
                 let result_tensor = impl_rets[0];
+                let ctx = format!("the result of '{}'", wrapper.raw_name);
+                emit_result_check(
+                    &mut builder,
+                    &mut compiler.module,
+                    result_tensor,
+                    *dtype,
+                    *device,
+                    &ctx,
+                    &tensor_inputs_to_free,
+                    &lists_to_free,
+                )?;
                 call_tensor_to_desc_ffi(
                     &mut builder,
                     &mut compiler.module,
@@ -357,10 +373,30 @@ pub fn emit_c_abi_wrapper(
                 builder.switch_to_block(len_ok);
                 builder.seal_block(len_ok);
 
-                for k in 0..elems.len() {
+                // Every element is checked before any is written, so a refused
+                // result leaves the caller's __rets untouched.
+                let mut elems_out = Vec::with_capacity(elems.len());
+                for (k, decl) in elems.iter().enumerate() {
                     let idx = builder.ins().iconst(cw_types::I64, k as i64);
                     let elem =
                         call_nsl_list_get(&mut builder, &mut compiler.module, list, idx)?;
+                    let ExportTypeInfo::Tensor { dtype, device, .. } = decl else {
+                        unreachable!("checked above: every tuple element is a tensor");
+                    };
+                    let ctx = format!("element {k} of the result of '{}'", wrapper.raw_name);
+                    emit_result_check(
+                        &mut builder,
+                        &mut compiler.module,
+                        elem,
+                        *dtype,
+                        *device,
+                        &ctx,
+                        &tensor_inputs_to_free,
+                        &lists_to_free,
+                    )?;
+                    elems_out.push(elem);
+                }
+                for (k, elem) in elems_out.into_iter().enumerate() {
                     let off = (k as i64) * NSL_TENSOR_DESC_SIZE;
                     let dst = if off == 0 {
                         rets_ptr
@@ -737,15 +773,25 @@ fn declare_runtime_fn<M: Module + ?Sized>(
         .map_err(|e| CodegenError::new(format!("declare {name}: {e:?}")))
 }
 
-/// Call `nsl_desc_to_tensor(desc_ptr: i64) -> i64` — C-ABI export in nsl-runtime.
-fn call_desc_to_tensor<M: Module + ?Sized>(
+/// Call `nsl_desc_to_tensor_expect(desc_ptr, tag, device) -> i64` — the
+/// import, held to the declared dtype tag (`-1` = none) and device (`-1` = any).
+fn call_desc_to_tensor_expect<M: Module + ?Sized>(
     builder: &mut FunctionBuilder,
     module: &mut M,
     desc_ptr: cranelift_codegen::ir::Value,
+    dtype: crate::c_header::ExportDtype,
+    device: crate::c_header::ExportDevice,
 ) -> Result<cranelift_codegen::ir::Value, CodegenError> {
-    let fid = declare_runtime_fn(module, "nsl_desc_to_tensor", &[cw_types::I64], &[cw_types::I64])?;
+    let fid = declare_runtime_fn(
+        module,
+        "nsl_desc_to_tensor_expect",
+        &[cw_types::I64, cw_types::I64, cw_types::I64],
+        &[cw_types::I64],
+    )?;
     let fref = module.declare_func_in_func(fid, builder.func);
-    let call = builder.ins().call(fref, &[desc_ptr]);
+    let tag = builder.ins().iconst(cw_types::I64, dtype.capi_tag().unwrap_or(-1));
+    let dev = builder.ins().iconst(cw_types::I64, device.capi_device());
+    let call = builder.ins().call(fref, &[desc_ptr, tag, dev]);
     Ok(builder.inst_results(call)[0])
 }
 
@@ -883,6 +929,25 @@ fn emit_set_error<M: Module + ?Sized>(
     module: &mut M,
     msg: &str,
 ) -> Result<(), CodegenError> {
+    emit_cstr_error_call(builder, module, msg, "nsl_set_error_cstr")
+}
+
+/// Put `ctx` in front of the error the runtime just set
+/// (`nsl_error_add_context_cstr`), keeping the runtime's reason.
+fn emit_error_context<M: Module + ?Sized>(
+    builder: &mut FunctionBuilder,
+    module: &mut M,
+    ctx: &str,
+) -> Result<(), CodegenError> {
+    emit_cstr_error_call(builder, module, ctx, "nsl_error_add_context_cstr")
+}
+
+fn emit_cstr_error_call<M: Module + ?Sized>(
+    builder: &mut FunctionBuilder,
+    module: &mut M,
+    msg: &str,
+    runtime_fn: &str,
+) -> Result<(), CodegenError> {
     let mut bytes = msg.as_bytes().to_vec();
     bytes.push(0u8); // null terminator
 
@@ -899,19 +964,21 @@ fn emit_set_error<M: Module + ?Sized>(
     let gv = module.declare_data_in_func(data_id, builder.func);
     let str_ptr = builder.ins().symbol_value(cw_types::I64, gv);
 
-    let fid = declare_runtime_fn(module, "nsl_set_error_cstr", &[cw_types::I64], &[])?;
+    let fid = declare_runtime_fn(module, runtime_fn, &[cw_types::I64], &[])?;
     let fref = module.declare_func_in_func(fid, builder.func);
     builder.ins().call(fref, &[str_ptr]);
     Ok(())
 }
 
-/// Emit `if tensor == 0 { free what we already imported; set_error(msg); return -1 }`.
+/// Emit `if tensor == 0 { free what we already imported; add msg to the
+/// error; return -1 }`.
 ///
-/// Required by `nsl_desc_to_tensor`'s contract change: it now returns 0 on an
-/// unrecognized `NslTensorDesc::dtype` tag instead of `abort()`ing the process,
-/// so every emitted call site is a null site. Without this guard the wrapper
+/// The import (`nsl_desc_to_tensor_expect`) returns 0 with the reason set
+/// when the descriptor is malformed or differs from the declaration, so
+/// every emitted call site is a null site. Without this guard the wrapper
 /// would hand the 0 to the impl function, which dereferences it — trading a
-/// loud abort for a segfault, which is strictly worse.
+/// loud abort for a segfault, which is strictly worse. `msg` names the
+/// parameter; the runtime's reason follows it.
 ///
 /// Leaves the builder positioned in a fresh, sealed continuation block.
 fn emit_null_tensor_guard<M: Module + ?Sized>(
@@ -938,12 +1005,60 @@ fn emit_null_tensor_guard<M: Module + ?Sized>(
     for l in lists_to_free {
         call_nsl_list_free(builder, module, *l)?;
     }
-    emit_set_error(builder, module, msg)?;
+    // The runtime set the reason; `msg` names the parameter in front of it.
+    emit_error_context(builder, module, msg)?;
     let neg_one = builder.ins().iconst(cw_types::I32, -1);
     builder.ins().return_(&[neg_one]);
 
     builder.switch_to_block(cont_block);
     builder.seal_block(cont_block);
+    Ok(())
+}
+
+/// Refuse an implementation result whose tag or device differs from the
+/// declaration (`nsl_export_check_result`), before the desc reaches the
+/// caller. On refusal the imported inputs are freed and the wrapper returns
+/// -1 with `ctx` in front of the runtime's reason. The result itself is not
+/// freed: it may be one of the inputs (`return x`), and results leak by
+/// design on the success path too (see the note at the call site).
+#[allow(clippy::too_many_arguments)]
+fn emit_result_check<M: Module + ?Sized>(
+    builder: &mut FunctionBuilder,
+    module: &mut M,
+    result: cranelift_codegen::ir::Value,
+    dtype: crate::c_header::ExportDtype,
+    device: crate::c_header::ExportDevice,
+    ctx: &str,
+    tensors_to_free: &[cranelift_codegen::ir::Value],
+    lists_to_free: &[cranelift_codegen::ir::Value],
+) -> Result<(), CodegenError> {
+    let fid = declare_runtime_fn(
+        module,
+        "nsl_export_check_result",
+        &[cw_types::I64, cw_types::I64, cw_types::I64],
+        &[cw_types::I64],
+    )?;
+    let fref = module.declare_func_in_func(fid, builder.func);
+    let tag = builder.ins().iconst(cw_types::I64, dtype.capi_tag().unwrap_or(-1));
+    let dev = builder.ins().iconst(cw_types::I64, device.capi_device());
+    let call = builder.ins().call(fref, &[result, tag, dev]);
+    let rc = builder.inst_results(call)[0];
+    let bad_block = builder.create_block();
+    let ok_block = builder.create_block();
+    builder.ins().brif(rc, bad_block, &[], ok_block, &[]);
+    builder.switch_to_block(bad_block);
+    builder.seal_block(bad_block);
+    for t in tensors_to_free {
+        call_nsl_tensor_free(builder, module, *t)?;
+    }
+    for l in lists_to_free {
+        call_nsl_list_free(builder, module, *l)?;
+    }
+    emit_error_context(builder, module, ctx)?;
+    let neg_one = builder.ins().iconst(cw_types::I32, -1);
+    builder.ins().return_(&[neg_one]);
+    builder.switch_to_block(ok_block);
+    builder.seal_block(ok_block);
     Ok(())
 }
 

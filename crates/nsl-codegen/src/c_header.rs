@@ -57,6 +57,24 @@ pub enum ExportDtype {
     Bool,
 }
 
+impl ExportDtype {
+    /// The C API tag (`NslTensorDesc::dtype`) a tensor of this dtype carries,
+    /// or `None` for one the boundary has no tag for. The `@export` wrapper
+    /// holds every descriptor and result to it (C5 step 6); the checker
+    /// refuses a tensor dtype without one (`C_ABI_TENSOR_DTYPES`).
+    pub fn capi_tag(self) -> Option<i64> {
+        match self {
+            ExportDtype::F64 => Some(0),
+            ExportDtype::F32 => Some(1),
+            ExportDtype::F16 => Some(2),
+            ExportDtype::BF16 => Some(3),
+            ExportDtype::I8 => Some(4),
+            ExportDtype::I32 => Some(9),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExportDevice {
     Cpu,
@@ -64,6 +82,18 @@ pub enum ExportDevice {
     /// Compiler chooses at call time (default for `@export` inputs that
     /// don't explicitly pin a device).
     Any,
+}
+
+impl ExportDevice {
+    /// What the wrapper passes to the runtime's declared-device check:
+    /// `0` CPU, `1` CUDA, `-1` any.
+    pub fn capi_device(self) -> i64 {
+        match self {
+            ExportDevice::Cpu => 0,
+            ExportDevice::Cuda => 1,
+            ExportDevice::Any => -1,
+        }
+    }
 }
 
 /// Map an NSL dtype name (as it appears in `Tensor<[...], dtype, ...>`
