@@ -903,7 +903,7 @@ pub static REGISTRY: &[EnvVar] = &[
         "off",
         Behavior,
         Runtime,
-        "Set to 1 to force cuBLAS pedantic full-FP32 math for every matmul, overriding the TF32 default and NSL_MATMUL_BF16."
+        "1 forces cuBLAS pedantic full-FP32 matmul math over the TF32 default and NSL_MATMUL_BF16; an explicit --matmul-mode wins (warns)."
     ),
     var!(
         "NSL_MATMUL_TF32",
@@ -912,7 +912,7 @@ pub static REGISTRY: &[EnvVar] = &[
         "TF32 on (pedantic under the strict-matmul build feature)",
         Behavior,
         Runtime,
-        "1 enables / 0 disables TF32 tensor-core math for cuBLAS f32 matmuls; other values ignored. NSL_MATMUL_PEDANTIC/BF16=1 take precedence."
+        "1 enables / 0 disables TF32 tensor-core math for cuBLAS f32 matmuls; PEDANTIC/BF16=1 and an explicit --matmul-mode win."
     ),
     var!(
         "NSL_MATMUL_TRANSPOSE_VIEWS",

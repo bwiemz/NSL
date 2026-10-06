@@ -1857,6 +1857,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
       packed parity gate's f16-operand bound of 1e-2.
     - An oracle that ignores document boundaries fails it.
 
+- **An explicit `--matmul-mode` (and `--bf16-rounding`, `--bf16-min-ratio`,
+  `--bf16-lt-workspace-mib`) beats an inherited environment variable, even
+  when its value equals the default** (external review 2026-10-06). The
+  matmul flags decided "the user omitted this" by "still equals the default",
+  so `--matmul-mode tf32` with `NSL_MATMUL_BF16=1` in the environment ran --
+  and fingerprinted -- bf16. The valued flags are now `Option`s and
+  `MatmulExplicit` records which fields were set; only the others take an
+  environment fallback. `--matmul-mode` / `--bf16-rounding` refuse a
+  misspelled value (`tf23` silently meant tf32).
+  - **The runtime honours an explicit mode too.** Codegen marks an explicit
+    `--matmul-mode` (a flag bit in `nsl_set_matmul_config`'s mode; a default
+    build emits the same constant), and `resolve_math_mode` then ignores
+    `NSL_MATMUL_TF32` / `NSL_MATMUL_PEDANTIC`, with a warning. Without the
+    flag they keep their meaning -- harnesses build once and pick an arm per
+    run with them.
+  - **One arithmetic identity.** The cuBLAS banner names where the mode came
+    from (the flag, a variable, the compiled mode, the default) instead of
+    always crediting an environment variable, and a checkpoint's `mm=` records
+    the mode the runtime dispatches (`effective_exec_fingerprint`, used by save
+    and resume alike), so a runtime override can no longer hide behind a
+    compiled `tf32`.
+  - **Compatibility:** a checkpoint saved by a run whose runtime override
+    changed the mode (`NSL_MATMUL_TF32=0`, `NSL_MATMUL_PEDANTIC=1`, or a
+    `strict-matmul` build) recorded the compiled `mm=tf32` while computing
+    something else; resuming it now compares against the mode that runs and
+    refuses, as it should have. Runs without overrides are unaffected. The
+    on/off flags (`--no-bf16-cast-cache`, `--bf16-lt`, `--no-bf16-lt-tune`)
+    are explicit only when passed, so their variables still apply otherwise.
+  - Gates: CLI unit tests (explicit default beats each variable; typos
+    refused), the codegen env test (explicit tf32 vs `NSL_MATMUL_BF16=1`),
+    `resolve_math_mode_from` precedence tests (CUDA builds), `with_mm`, and
+    `exec_fingerprint_resume_gate::an_explicit_default_matmul_mode_beats_an_inherited_variable`
+    (fails under the old rule: the checkpoint records `mm=bf16`).
+
 - **Source AD trains with the norm epsilon the program set.** The stdlib
   `LayerNorm` / `RMSNorm` pass their `eps` field to the kernel; source AD
   could not read a float field at compile time and baked 1e-5, so after
