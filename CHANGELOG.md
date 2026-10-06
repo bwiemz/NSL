@@ -1805,6 +1805,92 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **Packed attention's source-AD wiring is certified** (external review
+  2026-10-06, finding 6). `ScaledDotProductAttentionPacked` was the one
+  attention primitive marked `Uncertified`: its kernels had an f64 oracle,
+  the compiled program did not.
+  - Four certificates in `source_ad_rule_cert.rs` take `grad` of the packed
+    builtin and compare loss and raw q/k/v gradients, under both AD modes,
+    to an f64 segment-causal oracle.
+  - The cases are: two documents; three uneven documents, one of length 1;
+    a batch whose rows pack differently; and a 0.9 scale, which settles
+    whether the CPU paths honour a non-default scale (they do).
+  - An oracle that ignores document boundaries fails all four.
+  - On the CPU these cover the decomposed forward and the segment-aware
+    flash backward reference, not the GPU kernels.
+
+- **The fused loss kernels' source-AD wiring is certified on silicon**
+  (finding 6). `FusedLinearCe` and `FusedKlCe` were `Uncertified`: their
+  kernels had f64 references, but a compiled program's gradients through
+  them did not. They exist only inside a GPU `train`/`distill` block, so a
+  CPU `grad` certificate cannot reach them.
+  - `fused_loss_gradient_cert_gpu.rs` certifies each with ONE compiled
+    `SGD` step.
+    - Every loss operand is a model field.
+    - SGD has no momentum or decay, so the update is exactly `lr * grad`.
+    - The loss is scaled by 0.37, so the backward must honour the upstream
+      gradient.
+    - Two of the eight targets are the ignore index.
+  - `(before - after) / lr` is compared to an f64 central difference of the
+    composite loss over every parameter entry. The distill certificate also
+    asserts the teacher did not move.
+  - Measured on the RTX PRO 4500 (worst absolute error):
+
+    | Loss | dx | dW | db |
+    |---|---|---|---|
+    | LCE | 1.6e-8 | 1.5e-8 | 6e-9 |
+    | KL-CE | 1.4e-8 | 8e-9 | 6e-9 |
+
+    Tolerance is 1e-4 of the largest gradient.
+  - A mismatched loss scale fails the LCE certificate, and a wrong KL
+    weight fails the KL-CE one.
+  - `ad_cert_status` now names these certificates. The coverage gate reads
+    them from a `GPU_CERTS` list, each entry checked to be a GPU-ignored
+    test of that name.
+  - Packed attention also gets a GPU twin, `sdpa_packed_step`. It is one
+    compiled step through the FUSED kernels, with the forward's launch
+    counter and the GPU backward's dispatch line asserted.
+    - Shape: 1×2×64×32, three uneven documents.
+    - Reference: exact f64 gradients, the analytic attention backward,
+      itself spot-checked against central differences.
+    - Measured: dq/dk/dv at 7.3e-4 / 8.8e-4 / 5.8e-4 of scale, inside the
+      packed parity gate's f16-operand bound of 1e-2.
+    - An oracle that ignores document boundaries fails it.
+
+- **An explicit `--matmul-mode` (and `--bf16-rounding`, `--bf16-min-ratio`,
+  `--bf16-lt-workspace-mib`) beats an inherited environment variable, even
+  when its value equals the default** (external review 2026-10-06). The
+  matmul flags decided "the user omitted this" by "still equals the default",
+  so `--matmul-mode tf32` with `NSL_MATMUL_BF16=1` in the environment ran --
+  and fingerprinted -- bf16. The valued flags are now `Option`s and
+  `MatmulExplicit` records which fields were set; only the others take an
+  environment fallback. `--matmul-mode` / `--bf16-rounding` refuse a
+  misspelled value (`tf23` silently meant tf32).
+  - **The runtime honours an explicit mode too.** Codegen marks an explicit
+    `--matmul-mode` (a flag bit in `nsl_set_matmul_config`'s mode; a default
+    build emits the same constant), and `resolve_math_mode` then ignores
+    `NSL_MATMUL_TF32` / `NSL_MATMUL_PEDANTIC`, with a warning. Without the
+    flag they keep their meaning -- harnesses build once and pick an arm per
+    run with them.
+  - **One arithmetic identity.** The cuBLAS banner names where the mode came
+    from (the flag, a variable, the compiled mode, the default) instead of
+    always crediting an environment variable, and a checkpoint's `mm=` records
+    the mode the runtime dispatches (`effective_exec_fingerprint`, used by save
+    and resume alike), so a runtime override can no longer hide behind a
+    compiled `tf32`.
+  - **Compatibility:** a checkpoint saved by a run whose runtime override
+    changed the mode (`NSL_MATMUL_TF32=0`, `NSL_MATMUL_PEDANTIC=1`, or a
+    `strict-matmul` build) recorded the compiled `mm=tf32` while computing
+    something else; resuming it now compares against the mode that runs and
+    refuses, as it should have. Runs without overrides are unaffected. The
+    on/off flags (`--no-bf16-cast-cache`, `--bf16-lt`, `--no-bf16-lt-tune`)
+    are explicit only when passed, so their variables still apply otherwise.
+  - Gates: CLI unit tests (explicit default beats each variable; typos
+    refused), the codegen env test (explicit tf32 vs `NSL_MATMUL_BF16=1`),
+    `resolve_math_mode_from` precedence tests (CUDA builds), `with_mm`, and
+    `exec_fingerprint_resume_gate::an_explicit_default_matmul_mode_beats_an_inherited_variable`
+    (fails under the old rule: the checkpoint records `mm=bf16`).
+
 - **Source AD trains with the norm epsilon the program set.** The stdlib
   `LayerNorm` / `RMSNorm` pass their `eps` field to the kernel; source AD
   could not read a float field at compile time and baked 1e-5, so after
@@ -1851,6 +1937,65 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   - `@target` is not a placement (it is validated and then unused), so
     there is nothing to check there.
   - `nsl check` over the 328-file corpus baseline: no file changed.
+- **Checkpoints survive a crash during the save, and the sidecar pairs with
+  the whole model file** (external review 2026-10-06).
+  - `model_save` wrote the `.nslm` in place, so a crash mid-write destroyed
+    the previous checkpoint. It now writes a temporary unique to the process
+    and call (`<path>.tmp.<pid>.<n>`, so two processes saving one path
+    cannot take each other's file away), fsyncs it, and renames it into
+    place.
+  - `train_checkpoint_save` already used temporaries but renamed them
+    without an fsync and with nothing to undo a half-finished commit: a
+    crash between the two renames left the new model beside the old
+    sidecar, which the next load refused while the previous model was
+    already gone. Both temporaries are now fsynced, the renames run model
+    then sidecar with a directory fsync after each, and the load completes
+    the commit when `<path>.optim.tmp` pairs with the model and the current
+    sidecar does not.
+  - The pairing signature sampled the model's first and last MiB, so a
+    same-size change in between went unnoticed and the resume applied
+    moments saved for different weights. The sidecar now records
+    `model_sha256`, a SHA-256 of the whole `.nslm`, and the load checks it
+    in preference to the old `model_sig` (still read for older sidecars).
+  - The bf16 operand-cast stochastic-rounding counter
+    (`NSL_MATMUL_BF16_ROUND=sr`) was not saved, so a resume restarted it at
+    zero and reused the first steps' dither. It is now `bf16_sr_ctr` in the
+    sidecar (0 when an older sidecar has none).
+  - Gates: `train_checkpoint_gate.rs` builds the interrupted state exactly
+    (step-4 model, step-2 sidecar, step-4 sidecar as the temporary) and
+    requires a bit-exact continuation, plus refusal without the temporary;
+    a 3.2 MB model with one byte flipped in the middle must be refused by
+    the hash. Removing the recovery call or the hash check fails them.
+
+- **Checkpoint loads validate the whole file before changing anything.**
+  (External review 2026-10-06.)
+  - `model_load` counted entries by substring and only WARNED on a count
+    mismatch, then copied positionally. It ignored offsets and sizes, sliced
+    an unchecked header length, and found a short file mid-copy, after
+    earlier tensors were overwritten.
+  - It now parses the header as JSON and requires the entries to tile the
+    data section exactly. Every entry must match the live parameter at its
+    position in count, dtype, shape and size, and all of this is checked
+    before the first byte is copied.
+  - `model_load` now also passes the parameter names (new ABI row
+    `nsl_model_load_named`), so a model whose same-shaped parameters were
+    reordered is refused instead of loaded swapped. Names match across the
+    train checkpoint's `m.blocks.0.w` and `model_save`'s `blocks[0].w`, so
+    loading a checkpoint for a weights-only warm start still works.
+  - The train resume (`nsl_train_checkpoint_load`, which now takes the names
+    list) validates the model file the same way. It also checks every
+    sidecar entry's name, dtype, shape, size and offset, and the sidecar's
+    total length, before restoring θ or the moments. A truncated sidecar
+    used to be found after θ was overwritten.
+  - **Behaviour change:** a count mismatch is now an error, not a warning.
+    A train-block checkpoint holds only the trained parameters, so loading
+    one into a model with buffers needs `tools/nslm_splice.py`. That was
+    always the case; the loader used to proceed and misload.
+  - Gates:
+    - `model_checkpoint_dtype_tags.rs`: count, truncation, oversized header,
+      reorder, and the cross-scheme name match.
+    - `train_checkpoint_gate.rs`: a reordered model refused by both the
+      resume and `model_load`, and a truncated sidecar.
 
 - **C5 step 3: one default float dtype, f32, and an `f64` annotation stores
   f64.** The checker typed every `zeros`/`ones`/`full`/`rand`/`randn`/

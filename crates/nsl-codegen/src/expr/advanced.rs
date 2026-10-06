@@ -2662,8 +2662,9 @@ impl Compiler<'_> {
     /// Compile `model_load(model, "path.nslm")` — load model parameters from disk.
     ///
     /// Codegen emits:
-    ///   1. Build NslList of parameter tensor pointers (from struct fields)
-    ///   2. Call nsl_model_load(path_ptr, path_len, tensors_list)
+    ///   1. Build NslLists of parameter names and tensor pointers (from struct
+    ///      fields, the same lists `model_save` writes)
+    ///   2. Call nsl_model_load_named(path_ptr, path_len, names_list, tensors_list)
     pub(crate) fn compile_model_load(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -2720,6 +2721,16 @@ impl Compiler<'_> {
             })?;
 
         let param_metadata = self.generate_param_metadata(&model_name, "", 0);
+        // The names let the runtime refuse a file whose parameters were
+        // reordered since the save: same-shaped tensors swapped positionally
+        // pass every size check.
+        let names_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+        for (field_name, _field_offset, _needs_transpose) in &param_metadata {
+            let name_data_id = self.intern_string(field_name)?;
+            let gv = self.module.declare_data_in_func(name_data_id, builder.func);
+            let name_ptr = builder.ins().symbol_value(cl_types::I64, gv);
+            self.compile_call_by_name(builder, "nsl_list_push", &[names_list, name_ptr])?;
+        }
         let tensors_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
         for (field_name, _field_offset, _needs_transpose) in &param_metadata {
             let nested_path = format!("$model.{}", field_name.replace('[', ".").replace(']', ""));
@@ -2734,11 +2745,10 @@ impl Compiler<'_> {
             self.compile_call_by_name(builder, "nsl_list_push", &[tensors_list, tensor_ptr])?;
         }
 
-        // Call nsl_model_load(path_ptr, path_len, tensors_list)
         self.compile_call_by_name(
             builder,
-            "nsl_model_load",
-            &[path_val, path_len, tensors_list],
+            "nsl_model_load_named",
+            &[path_val, path_len, names_list, tensors_list],
         )
     }
 

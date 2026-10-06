@@ -302,6 +302,9 @@ fn sidecar_v2_header_carries_the_whole_resume_block() {
     for key in [
         "\"step_count\":",
         "\"model_sig\":",
+        // The whole-file pairing hash (2026-10-06); the sampled sig above
+        // stays for older readers.
+        "\"model_sha256\":\"",
         "\"resume\":{",
         "\"train_epoch\":",
         "\"has_loader\":1",
@@ -312,6 +315,7 @@ fn sidecar_v2_header_carries_the_whole_resume_block() {
         "\"rng_pos_hi\":",
         "\"rng_pos_lo\":",
         "\"gpu_dropout_ctr\":",
+        "\"bf16_sr_ctr\":",
         // The --seed SCALAR, separate from the sampling stream's ChaCha key:
         // it keys the SR-BF16 and ZeRO dither directly.
         "\"global_seed\":",

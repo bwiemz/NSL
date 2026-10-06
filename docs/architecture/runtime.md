@@ -435,14 +435,22 @@ reproducible.
 
 **`.nslm` and the `.optim` sidecar** (`src/checkpoint.rs`). `nsl_model_save`
 writes magic `NSLM`, version 1, a JSON header of `{name, shape, dtype,
-offset, nbytes}` entries, and 64-byte-aligned raw data; `nsl_model_load`
-hard-aborts on an unknown version. `nsl_train_checkpoint_save` writes θ
-through `nsl_model_save` plus `<path>.optim` with magic `OPTIM_MAGIC` =
-`NSLO`: a header `{"step_count", "model_sig", "resume": {...}, "params":
-[...]}` followed by all `m` entries then all `v` entries. Both files go to
-`<path>.tmp` and are `rename`d, and the sidecar carries a signature of the
-`.nslm` it was written beside so a crash between the two renames is detected
-at load. The `resume` block is what makes a resume a continuation rather than
+offset, nbytes}` entries, and 64-byte-aligned raw data, to `<path>.tmp`,
+fsynced and renamed into place. A load (`model_load` emits
+`nsl_model_load_named`) validates the whole file before copying a byte: the
+header fits the file and parses, the entries tile the data section exactly,
+and each entry matches the live parameter at its position in count, name,
+dtype, shape and size. Names match across the two schemes in use: a
+train-block checkpoint writes `m.blocks.0.w`, `model_save` writes
+`blocks[0].w`. `nsl_train_checkpoint_save` writes θ through `nsl_model_save`
+plus `<path>.optim` with magic `OPTIM_MAGIC` = `NSLO`: a header
+`{"step_count", "model_sig", "model_sha256", "resume": {...}, "params":
+[...]}` followed by all `m` entries then all `v` entries. Both temporaries
+are fsynced, then renamed model first with a directory fsync after each. The
+sidecar's `model_sha256` (a hash of the whole `.nslm`) pairs it with its
+model, so a crash between the renames leaves the new model, the old sidecar
+and a complete `<path>.optim.tmp`, which the next load renames into place.
+The resume validates θ and every sidecar entry before restoring either. The `resume` block is what makes a resume a continuation rather than
 a warm start:
 
 - loader position (`loader_epoch`, `loader_slot`) and `loader_id`, the corpus

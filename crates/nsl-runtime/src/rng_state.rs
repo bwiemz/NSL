@@ -79,13 +79,9 @@ pub fn bf16_sr_counter() -> u64 {
     BF16_SR_COUNTER.load(Ordering::SeqCst)
 }
 
-/// Restore the BF16-SR dither counter.
-///
-/// NOT yet carried in the checkpoint sidecar: unlike the dropout counter,
-/// this one selects a ROUNDING, not a mask, so a resume that restarts it at
-/// zero computes a statistically equivalent trajectory rather than a wrong
-/// one. Persisting it is a follow-up, and until then a resumed SR run is
-/// reproducible only from its own start.
+/// Restore the BF16-SR dither counter (checkpoint resume: `RngSnapshot`
+/// carries it, as `bf16_sr_ctr` in the sidecar). A resume used to restart it
+/// at zero and reuse the dither windows of the run's first steps.
 pub fn set_bf16_sr_counter(v: u64) {
     BF16_SR_COUNTER.store(v, Ordering::SeqCst);
 }
@@ -113,6 +109,9 @@ pub struct RngSnapshot {
     /// a `u128` here and as a hi/lo pair in the checkpoint header.
     pub sampling_pos: u128,
     pub gpu_dropout_ctr: u64,
+    /// The bf16 operand-cast stochastic-rounding counter
+    /// (`bf16_sr_next_counter`).
+    pub bf16_sr_ctr: u64,
 }
 
 impl RngSnapshot {
@@ -125,6 +124,7 @@ impl RngSnapshot {
             sampling_seed,
             sampling_pos,
             gpu_dropout_ctr: gpu_dropout_counter(),
+            bf16_sr_ctr: bf16_sr_counter(),
         }
     }
 
@@ -132,6 +132,7 @@ impl RngSnapshot {
     pub fn restore(&self) {
         crate::sampling::rng_restore(self.sampling_seed, self.sampling_pos);
         set_gpu_dropout_counter(self.gpu_dropout_ctr);
+        set_bf16_sr_counter(self.bf16_sr_ctr);
     }
 
     /// Lowercase hex of the ChaCha seed, for the checkpoint header.
@@ -172,6 +173,7 @@ mod tests {
             sampling_seed: seed,
             sampling_pos: 0,
             gpu_dropout_ctr: 0,
+            bf16_sr_ctr: 0,
         };
         let hex = snap.seed_hex();
         assert_eq!(hex.len(), 64);
@@ -238,6 +240,22 @@ mod tests {
             crate::sampling::rng_f64(),
             "if these matched, the stream would not be advancing at all"
         );
+    }
+
+    /// The bf16 operand-SR stream is part of the snapshot: a resume used to
+    /// restart it at 0 and replay the first steps' dither windows.
+    #[test]
+    fn rng_snapshot_carries_the_bf16_sr_counter() {
+        let _guard = GLOBAL_RNG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_bf16_sr_counter(0);
+        let _ = bf16_sr_next_counter(4096);
+        let snap = RngSnapshot::capture();
+        assert_eq!(snap.bf16_sr_ctr, 4096);
+        let _ = bf16_sr_next_counter(512);
+        set_bf16_sr_counter(0);
+        snap.restore();
+        assert_eq!(bf16_sr_next_counter(1), 4096, "the next cast continues the saved stream");
+        set_bf16_sr_counter(0);
     }
 
     #[test]

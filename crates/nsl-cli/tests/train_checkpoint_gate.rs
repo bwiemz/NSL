@@ -289,3 +289,199 @@ fn non_literal_checkpoint_args_are_compile_errors() {
     );
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// External review 2026-10-06: the save renamed the model and then the
+/// sidecar, so a crash between the two left the NEW model beside the OLD
+/// sidecar -- refused at the next load, with the previous model already
+/// overwritten. Both temporaries are now fsynced before the renames and the
+/// renames are ordered, so that state always comes with the new sidecar
+/// complete as `<path>.optim.tmp`, and the load completes the commit.
+///
+/// The state is built exactly: a step-2 sidecar (the "old" one) next to the
+/// step-4 model, with the step-4 sidecar as the temporary. The resume must
+/// finish the commit, continue from step 4, and match an uninterrupted run
+/// byte for byte. Without the temporary it must refuse.
+#[test]
+fn a_save_interrupted_between_its_renames_resumes_from_the_new_generation() {
+    let old = fresh_dir("interrupted_old");
+    let a = run_in(
+        &old,
+        "a.nsl",
+        &fixture(r#", epochs = 2, checkpoint_save = "ck.nslm", checkpoint_every = 2"#, "AdamW(lr = 0.01)"),
+    );
+    assert!(a.ok, "step-2 save failed:\n{}", a.stderr);
+
+    let tmp = fresh_dir("interrupted");
+    let b = run_in(
+        &tmp,
+        "b.nsl",
+        &fixture(r#", epochs = 4, checkpoint_save = "ck.nslm", checkpoint_every = 2"#, "AdamW(lr = 0.01)"),
+    );
+    assert!(b.ok, "step-4 save failed:\n{}", b.stderr);
+    assert!(!tmp.join("ck.nslm.tmp").exists() && !tmp.join("ck.nslm.optim.tmp").exists(), "a completed save leaves no temporaries");
+
+    // The crash: the model was renamed, the sidecar was not.
+    std::fs::rename(tmp.join("ck.nslm.optim"), tmp.join("ck.nslm.optim.tmp")).unwrap();
+    std::fs::copy(old.join("ck.nslm.optim"), tmp.join("ck.nslm.optim")).unwrap();
+
+    // Without the temporary there is nothing to finish: refused.
+    let bare = fresh_dir("interrupted_bare");
+    for f in ["ck.nslm", "ck.nslm.optim"] {
+        std::fs::copy(tmp.join(f), bare.join(f)).unwrap();
+    }
+    let r = run_in(&bare, "r.nsl", &fixture(r#", epochs = 6, checkpoint_load = "ck.nslm""#, "AdamW(lr = 0.01)"));
+    assert!(!r.ok && r.stderr.contains("was not saved with"), "a mismatched pair must be refused:\n{}", r.stderr);
+
+    let r = run_in(&tmp, "r.nsl", &fixture(r#", epochs = 6, checkpoint_load = "ck.nslm""#, "AdamW(lr = 0.01)"));
+    assert!(r.ok, "the resume must complete the commit:\n{}", r.stderr);
+    assert!(r.stderr.contains("completing an interrupted save"), "{}", r.stderr);
+    assert!(r.stderr.contains("[checkpoint] resumed:") && r.stderr.contains("step 4"), "{}", r.stderr);
+    assert!(!tmp.join("ck.nslm.optim.tmp").exists(), "the temporary was renamed into place");
+
+    let ctl = fresh_dir("interrupted_ctl");
+    let c = run_in(&ctl, "c.nsl", &fixture(", epochs = 6", "AdamW(lr = 0.01)"));
+    assert!(c.ok, "control failed:\n{}", c.stderr);
+    let (resumed, control) = (loss_lines(&r.stdout), loss_lines(&c.stdout));
+    assert!(!resumed.is_empty(), "the resumed run printed no losses:\n{}", r.stdout);
+    for (step, loss) in &resumed {
+        let want = control.iter().find(|(s, _)| s == step).map(|(_, l)| l);
+        assert_eq!(Some(loss), want, "step {step}: the resumed run must continue the step-4 generation exactly");
+    }
+    for d in [old, tmp, bare, ctl] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+/// The pairing signature sampled the model's first and last MiB, so a
+/// same-size change in between was invisible and the resume went ahead with
+/// moments from another model (external review 2026-10-06). The sidecar now
+/// records a SHA-256 of the whole file. The model here is > 2 MiB and the
+/// flipped byte sits in its middle, outside both sampled windows.
+#[test]
+fn a_same_size_change_in_the_middle_of_the_model_is_refused() {
+    let src = |cfg: &str| {
+        format!(
+            r#"from nsl.nn.losses import mse_loss
+
+model Wide:
+    w: Tensor = ones([2, 400000]) * 0.001
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+let m = Wide()
+let x = full([2, 2], 0.5)
+let y = zeros([2, 400000])
+train(model = m{cfg}):
+    optimizer: AdamW(lr = 0.01)
+    step(batch):
+        let loss = mse_loss(m.forward(x), y)
+
+print("FIXTURE_DONE")
+"#
+        )
+    };
+    let tmp = fresh_dir("midchange");
+    let a = run_in(&tmp, "a.nsl", &src(r#", epochs = 1, checkpoint_save = "ck.nslm", checkpoint_every = 1"#));
+    assert!(a.ok, "save failed:\n{}", a.stderr);
+    let model = tmp.join("ck.nslm");
+    let mut bytes = std::fs::read(&model).unwrap();
+    assert!(bytes.len() > 3 << 20, "the model must exceed the two sampled MiB: {} bytes", bytes.len());
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0x40;
+    std::fs::write(&model, &bytes).unwrap();
+
+    let r = run_in(&tmp, "r.nsl", &src(r#", epochs = 2, checkpoint_load = "ck.nslm""#));
+    assert!(!r.ok, "a changed model must not resume:\n{}", r.stderr);
+    assert!(r.stderr.contains("model sha256"), "refused by the whole-file hash:\n{}", r.stderr);
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+/// Two same-shaped fields, declared in `order`. Swapping the declaration
+/// order swaps the parameters' positions in every list the checkpoint walks.
+fn two_field_fixture(order: [&str; 2], tail: &str) -> String {
+    let field = |n: &str| match n {
+        "a" => "    a: Tensor = ones([2, 2])\n",
+        _ => "    b: Tensor = full([2, 2], 0.5)\n",
+    };
+    format!(
+        r#"from nsl.nn.losses import mse_loss
+
+model Two:
+{}{}
+    fn forward(self, x: Tensor) -> Tensor:
+        return (x @ self.a) @ self.b
+
+let m = Two()
+let x = full([2, 2], 2.0)
+let y = zeros([2, 2])
+{tail}
+print("FIXTURE_DONE")
+"#,
+        field(order[0]),
+        field(order[1]),
+    )
+}
+
+/// Same shapes, same dtypes, same count: before the load checked names, a
+/// reordered model passed every check and resumed with `a`'s weights and
+/// moments in `b` (external review 2026-10-06). Both the train resume and a
+/// plain `model_load` must refuse it before copying anything.
+#[test]
+fn a_model_whose_parameters_were_reordered_is_refused() {
+    let tmp = fresh_dir("reorder");
+    let train = |cfg: &str| {
+        format!(
+            "train(model = m{cfg}):\n    optimizer: AdamW(lr = 0.01)\n    step(batch):\n        let loss = mse_loss(m.forward(x), y)\nmodel_save(m, \"w.nslm\")\n"
+        )
+    };
+    let a = run_in(
+        &tmp,
+        "a.nsl",
+        &two_field_fixture(["a", "b"], &train(r#", epochs = 2, checkpoint_save = "ck.nslm", checkpoint_every = 2"#)),
+    );
+    assert!(a.ok, "save failed:\n{}", a.stderr);
+
+    // Unchanged order: both loads work.
+    let same = run_in(
+        &tmp,
+        "same.nsl",
+        &two_field_fixture(["a", "b"], "model_load(m, \"w.nslm\")\nmodel_load(m, \"ck.nslm\")\n"),
+    );
+    assert!(same.ok && same.stdout.contains("FIXTURE_DONE"), "an unchanged model must load both files:\n{}", same.stderr);
+
+    let r = run_in(
+        &tmp,
+        "r.nsl",
+        &two_field_fixture(["b", "a"], &train(r#", epochs = 4, checkpoint_load = "ck.nslm""#)),
+    );
+    assert!(!r.ok, "a reordered model must not resume:\n{}", r.stderr);
+    assert!(r.stderr.contains("in the file but") && r.stderr.contains("in the model"), "{}", r.stderr);
+    assert!(!r.stderr.contains("[checkpoint] resumed:"), "{}", r.stderr);
+
+    let l = run_in(&tmp, "l.nsl", &two_field_fixture(["b", "a"], "model_load(m, \"w.nslm\")\n"));
+    assert!(!l.ok && !l.stdout.contains("FIXTURE_DONE"), "a reordered model_load must refuse:\n{}", l.stderr);
+    assert!(l.stderr.contains("tensor #0 is 'a' in the file but 'b' in the model"), "{}", l.stderr);
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+/// A sidecar cut short used to be found while the moments were being
+/// copied, after θ had already been overwritten. The whole layout is now
+/// checked first, and the refusal says what is wrong with the file.
+#[test]
+fn a_truncated_sidecar_is_refused_before_anything_is_restored() {
+    let tmp = fresh_dir("trunc_optim");
+    let a = run_in(
+        &tmp,
+        "a.nsl",
+        &fixture(r#", epochs = 2, checkpoint_save = "ck.nslm", checkpoint_every = 2"#, "AdamW(lr = 0.01)"),
+    );
+    assert!(a.ok, "save failed:\n{}", a.stderr);
+    let optim = tmp.join("ck.nslm.optim");
+    let bytes = std::fs::read(&optim).unwrap();
+    std::fs::write(&optim, &bytes[..bytes.len() - 4]).unwrap();
+    let r = run_in(&tmp, "r.nsl", &fixture(r#", epochs = 4, checkpoint_load = "ck.nslm""#, "AdamW(lr = 0.01)"));
+    assert!(!r.ok, "a truncated sidecar must not resume:\n{}", r.stderr);
+    assert!(r.stderr.contains("truncated or padded sidecar"), "{}", r.stderr);
+    let _ = std::fs::remove_dir_all(tmp);
+}
