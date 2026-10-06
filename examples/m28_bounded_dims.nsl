@@ -1,6 +1,6 @@
 # M28: Bounded dimensions — compile-time upper bound, runtime checked
 
-fn attend(Q: Tensor<[Batch, SeqLen < 4096, 64], f64>, K: Tensor<[Batch, SeqLen < 4096, 64], f64>) -> Tensor:
+fn attend(Q: Tensor<[Batch, SeqLen < 4096, 64], f32>, K: Tensor<[Batch, SeqLen < 4096, 64], f32>) -> Tensor:
     return Q
 
 # Call within bounds

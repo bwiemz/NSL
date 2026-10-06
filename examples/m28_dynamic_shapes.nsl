@@ -1,6 +1,6 @@
 # M28: Dynamic shapes — symbolic dimensions resolve at runtime
 
-fn process(x: Tensor<[Batch, 4], f64>) -> Tensor:
+fn process(x: Tensor<[Batch, 4], f32>) -> Tensor:
     return x
 
 # Call with different batch sizes

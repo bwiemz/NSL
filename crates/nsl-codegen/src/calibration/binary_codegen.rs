@@ -1330,6 +1330,7 @@ fn emit_model_backward_bridge(
     let mut extractor = crate::source_ad::WengertExtractor::new(compiler.interner)
         .with_checkpoint_policies(compiler.compile_options.checkpoint.policies.clone());
     extractor.set_model_method_bodies(compiler.models.model_method_bodies.clone());
+    extractor.set_type_map(compiler.type_map);
     extractor.set_model_field_types(compiler.models.model_field_types.clone());
 
     // Register the model's `self` symbol as the model instance.

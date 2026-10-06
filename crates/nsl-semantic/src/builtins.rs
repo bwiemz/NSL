@@ -203,10 +203,12 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         },
     );
 
-    // Tensor creation functions
+    // Tensor creation functions. f32 is the default float dtype (C5 step 3):
+    // it is what the runtime makes, every GPU kernel computes and checkpoints
+    // hold. A declaration's annotation can choose f64 (`check_var_decl`).
     let tensor_ret = Type::Tensor {
         shape: Shape::unknown(),
-        dtype: DType::F64,
+        dtype: DType::F32,
         device: Device::Cpu,
     };
     for name in &["zeros", "ones", "rand", "randn", "empty"] {

@@ -10,7 +10,10 @@ impl<'a> TypeChecker<'a> {
         _span: Span,
     ) {
         let ann_ty = type_ann.map(|t| self.resolve_type(t));
-        let val_ty = value.map(|v| self.check_expr(v));
+        let val_ty = value.map(|v| {
+            let ty = self.check_expr(v);
+            self.creation_dtype_from_annotation(v, ty, ann_ty.as_ref())
+        });
 
         let ty = match (&ann_ty, &val_ty) {
             (Some(ann), Some(val)) => {
@@ -34,6 +37,52 @@ impl<'a> TypeChecker<'a> {
         };
 
         self.declare_pattern_with_const(pattern, &ty, is_const);
+    }
+
+    /// C5 step 3: a creation builtin (`zeros`, `ones`, `rand`, `randn`,
+    /// `empty`, `full`, `arange`) bound by an annotated declaration takes the
+    /// annotation's float dtype -- f32 (the default) or f64 -- so
+    /// `let x: Tensor<[4], f64> = zeros([4])` stores f64. The call's recorded
+    /// type is updated too; codegen reads it to choose the creation FFI. Any
+    /// other value, annotation or dtype keeps the type `check_expr` gave it.
+    pub(crate) fn creation_dtype_from_annotation(
+        &mut self,
+        value: &Expr,
+        val_ty: Type,
+        ann_ty: Option<&Type>,
+    ) -> Type {
+        let Some(Type::Tensor { dtype: ann_dtype, .. }) = ann_ty else {
+            return val_ty;
+        };
+        if !matches!(ann_dtype, DType::F32 | DType::F64) {
+            return val_ty;
+        }
+        let ExprKind::Call { callee, .. } = &value.kind else {
+            return val_ty;
+        };
+        let ExprKind::Ident(sym) = &callee.kind else {
+            return val_ty;
+        };
+        let builtin = self
+            .scopes
+            .lookup(self.current_scope, *sym)
+            .is_none_or(|(_, info)| info.is_builtin);
+        let name = self.interner.resolve(sym.0).unwrap_or("");
+        let creation =
+            matches!(name, "zeros" | "ones" | "rand" | "randn" | "empty" | "full" | "arange");
+        let Type::Tensor { shape, device, .. } = &val_ty else {
+            return val_ty;
+        };
+        if !(builtin && creation) {
+            return val_ty;
+        }
+        let retyped = Type::Tensor {
+            shape: shape.clone(),
+            dtype: *ann_dtype,
+            device: device.clone(),
+        };
+        self.type_map.insert(value.id, retyped.clone());
+        retyped
     }
 
     pub(crate) fn check_fn_def(&mut self, fn_def: &FnDef) {

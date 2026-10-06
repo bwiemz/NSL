@@ -956,6 +956,7 @@ impl Compiler<'_> {
 
             // Wire model method bodies and field types for inline expansion
             extractor.set_model_method_bodies(self.models.model_method_bodies.clone());
+            extractor.set_type_map(self.type_map);
             extractor.set_model_field_types(self.models.model_field_types.clone());
             // CFTP v10 (item 5): thread per-model-field rank info so the
             // source-AD extractor can populate `known_ranks` when it

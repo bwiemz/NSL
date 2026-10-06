@@ -2409,12 +2409,19 @@ pub extern "C" fn nsl_tensor_zeros_like(tensor_ptr: i64) -> i64 {
             nsl_list_push(shape_list, *tensor.shape.add(i));
         }
     }
-    let result = nsl_tensor_zeros_on(shape_list, tensor.device as i64);
+    // An f64 template (CPU only: no device holds f64) gets f64 zeros -- its
+    // operand's dtype (C5 step 3); every other template keeps f32 zeros.
+    let result = if tensor.dtype == 0 && tensor.device == 0 {
+        creation::nsl_tensor_zeros_dtype(shape_list, 0)
+    } else {
+        nsl_tensor_zeros_on(shape_list, tensor.device as i64)
+    };
     crate::list::nsl_list_free(shape_list);
     result
 }
 
-/// Create a ones tensor with the same shape and device as the input tensor.
+/// Create a ones tensor with the same shape and device as the input tensor
+/// (and f64 for an f64 template, as `nsl_tensor_zeros_like`).
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_ones_like(tensor_ptr: i64) -> i64 {
     let t = NslTensor::from_ptr(tensor_ptr);
@@ -2423,7 +2430,11 @@ pub extern "C" fn nsl_tensor_ones_like(tensor_ptr: i64) -> i64 {
         for i in 0..t.ndim as usize {
             unsafe { nsl_list_push(shape_list, *t.shape.add(i)); }
         }
-        let result = nsl_tensor_ones(shape_list);
+        let result = if t.dtype == 0 {
+            creation::nsl_tensor_ones_dtype(shape_list, 0)
+        } else {
+            nsl_tensor_ones(shape_list)
+        };
         crate::list::nsl_list_free(shape_list);
         return result;
     }

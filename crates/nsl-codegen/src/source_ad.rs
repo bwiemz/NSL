@@ -2262,6 +2262,10 @@ pub fn analyze_saved_tensors(primal: &WengertList, adjoint: &WengertList) -> Vec
 /// is detected, signaling fallback to tape-based AD.
 pub struct WengertExtractor<'a> {
     interner: &'a Interner,
+    /// The checker's types, when the caller installs them (`set_type_map`).
+    /// Read to refuse what the Wengert lowering cannot honour -- an
+    /// f64-annotated creation (C5 step 3).
+    type_map: Option<&'a nsl_semantic::checker::TypeMap>,
     list: WengertList,
     /// Maps AST symbol -> WengertList VarId.
     symbol_to_var: HashMap<nsl_ast::Symbol, VarId>,
@@ -2782,6 +2786,7 @@ impl<'a> WengertExtractor<'a> {
     pub fn new(interner: &'a Interner) -> Self {
         WengertExtractor {
             interner,
+            type_map: None,
             list: WengertList {
                 ops: Vec::new(),
                 output: 0,
@@ -3735,6 +3740,20 @@ impl<'a> WengertExtractor<'a> {
 
     /// Set model method bodies for inline expansion during extraction.
     /// Maps model_type_name -> method_name -> FnDef.
+    /// Install the checker's types (see the `type_map` field).
+    pub fn set_type_map(&mut self, type_map: &'a nsl_semantic::checker::TypeMap) {
+        self.type_map = Some(type_map);
+    }
+
+    /// Whether the checker typed `expr` an f64 tensor (C5 step 3: only an
+    /// annotation makes a creation f64).
+    fn typed_f64_tensor(&self, expr: &nsl_ast::expr::Expr) -> bool {
+        self.type_map
+            .and_then(|tm| tm.get(&expr.id))
+            .and_then(|ty| ty.as_tensor_parts())
+            .is_some_and(|(_, dtype, _)| matches!(dtype, nsl_semantic::types::DType::F64))
+    }
+
     pub fn set_model_method_bodies(
         &mut self,
         bodies: HashMap<String, HashMap<String, nsl_ast::decl::FnDef>>,
@@ -5599,8 +5618,21 @@ impl<'a> WengertExtractor<'a> {
                     "tensor_cos" | "cos" => PrimalOp::Passthrough("cos".into()),
                     "tensor_sin" | "sin" => PrimalOp::Passthrough("sin".into()),
                     "rotate_half" => PrimalOp::Passthrough("rotate_half".into()),
-                    // Tensor construction (non-differentiable)
+                    // Tensor construction (non-differentiable). An annotation
+                    // can make a creation f64 (C5 step 3), which the
+                    // passthrough lowering -- the f32 creation FFIs -- would
+                    // not honour; such a block stays on the tape, whose
+                    // codegen does. `zeros_like`/`ones_like` follow their
+                    // template at run time, so they need no check.
                     "arange" | "zeros" | "ones" | "full" | "randn" | "zeros_like" | "ones_like" => {
+                        if !func_name.ends_with("_like") && self.typed_f64_tensor(expr) {
+                            nsl_log::nsl_log!(WARN, "source-ad",
+                                "[source-ad] an f64-annotated {}() is not lowered by source AD; \
+                                 falling back to tape-based AD for this grad block",
+                                func_name
+                            );
+                            return None;
+                        }
                         PrimalOp::Passthrough(func_name.clone())
                     }
                     // Concatenation

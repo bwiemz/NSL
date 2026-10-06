@@ -226,12 +226,14 @@ impl<'a> TypeChecker<'a> {
                 return Type::List(Box::new(Type::Tuple(vec![a, b])));
             }
 
-            // Tensor creation shape inference
+            // Tensor creation shape inference. f32 is the default float dtype
+            // (C5 step 3), what the runtime makes; an annotation on the
+            // declaration can choose f64 (`check_var_decl`).
             if matches!(name.as_str(), "zeros" | "ones" | "rand" | "randn" | "empty") {
                 let shape = self.extract_shape_from_args(args);
                 return Type::Tensor {
                     shape,
-                    dtype: DType::F64,
+                    dtype: DType::F32,
                     device: Device::Cpu,
                 };
             }
@@ -239,14 +241,14 @@ impl<'a> TypeChecker<'a> {
                 let shape = self.extract_shape_from_args(args);
                 return Type::Tensor {
                     shape,
-                    dtype: DType::F64,
+                    dtype: DType::F32,
                     device: Device::Cpu,
                 };
             }
             if name == "arange" {
                 return Type::Tensor {
                     shape: Shape::unknown(),
-                    dtype: DType::F64,
+                    dtype: DType::F32,
                     device: Device::Cpu,
                 };
             }

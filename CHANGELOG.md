@@ -1805,6 +1805,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **C5 step 3: one default float dtype, f32, and an `f64` annotation stores
+  f64.** The checker typed every `zeros`/`ones`/`full`/`rand`/`randn`/
+  `arange` f64 while the runtime made f32, and an annotation changed the
+  checker's type and nothing else: `let x: Tensor<[3], f64> = full([3], 0.1)`
+  held f32 0.1 (`0.10000000149011612`). Now the default is f32 on both
+  sides, and an annotated declaration's dtype -- f32 or f64 -- is the
+  creation's dtype: the checker records it on the call, and codegen calls
+  new `_dtype` creation FFIs for the f64 case, which compute in f64 (the
+  random ones draw the same stream, unrounded). An unannotated creation
+  emits exactly the call it always did. `zeros_like`/`ones_like` of an f64
+  tensor are f64; `f16` is accepted as an alias of `fp16`; the training
+  callback's `loss` is typed f32. Gate: `dtype_creation_follows_checker`.
+  **Visible to programs:** a function parameter annotated `f64` no longer
+  accepts an unannotated creation (it is f32, as it always was at run time);
+  the `examples/m28_*`, `m10_symbolic_dims` and `m10_fn_shape_errors`
+  programs now annotate the f32 they pass. Source AD lowers creation calls
+  to the f32 FFIs, so a grad or train block holding an f64-annotated
+  creation falls back to the tape, whose codegen honours it.
+
 - **C5 step 2b: moving a tensor to the GPU no longer changes its dtype.**
   An upload is now a byte copy of the same dtype, like the download since
   step 2a. The GPU stores and computes f32, so an f64 tensor is refused --
