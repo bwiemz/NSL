@@ -573,6 +573,7 @@ macro_rules! for_each_runtime_fn {
             [abi_tensor] nsl_tensor_scalar(f64, i64) -> i64 = tensor::ad_ops::nsl_tensor_scalar;
             [abi_tensor] nsl_tensor_pad_zero(i64, i64, i64, i64) -> i64 = tensor::ad_ops::nsl_tensor_pad_zero;
             [abi_tensor] nsl_tensor_scatter_add(i64, i64, i64) -> i64 = tensor::ad_ops::nsl_tensor_scatter_add;
+            [abi_tensor] nsl_tensor_gather_backward(i64, i64, i64, i64) -> i64 = tensor::ad_ops::nsl_tensor_gather_backward;
             [abi_tensor] nsl_embedding_backward(i64, i64, i64) -> i64 = tensor::ad_ops::nsl_embedding_backward;
             [abi_tensor] nsl_cross_entropy_backward(i64, i64, i64) -> i64 = tensor::ad_ops::nsl_cross_entropy_backward;
             [abi_tensor] nsl_mse_backward(i64, i64, i64) -> i64 = tensor::ad_ops::nsl_mse_backward;
@@ -1364,6 +1365,6 @@ mod tests {
     fn table_is_the_recorded_size() {
         // The count is pinned so a row dropped by a bad merge is noticed; move
         // it with a row that is deliberately added or removed.
-        assert_eq!(RUNTIME_ABI.len(), 690);
+        assert_eq!(RUNTIME_ABI.len(), 691);
     }
 }

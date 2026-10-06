@@ -422,7 +422,7 @@ function <main>(i32, i64) -> i32 <callconv> {
     sig120 = (i64) <callconv>
     sig121 = (i64) -> i64 <callconv>
     sig122 = (i64) <callconv>
-    sig123 = (i64, i64, i64) -> i64 <callconv>
+    sig123 = (i64, i64, i64, i64) -> i64 <callconv>
     sig124 = (i64) <callconv>
     sig125 = (i64) -> i64 <callconv>
     sig126 = (i64, i64, i64) -> i64 <callconv>
@@ -835,7 +835,7 @@ function <main>(i32, i64) -> i32 <callconv> {
     fn120 = nsl_tensor_free sig120
     fn121 = nsl_tensor_neg sig121
     fn122 = nsl_tensor_free sig122
-    fn123 = nsl_tensor_scatter_add sig123
+    fn123 = nsl_tensor_gather_backward sig123
     fn124 = nsl_tensor_free sig124
     fn125 = nsl_tensor_exp sig125
     fn126 = nsl_tensor_sum_dim sig126
@@ -1497,7 +1497,7 @@ block16:
     v262 = call fn106(v249, v261)  ; v261 = 1
     v263 = iconst.i64 1
     v264 = iconst.i64 1
-    v265 = call fn107(v262, v264, v263)  ; v264 = 1, v263 = 1
+    v265 = call fn107(v262, v264, v259)  ; v264 = 1
     v266 = call fn108(v265)
     v267 = iconst.i64 -1
     v268 = iconst.i64 0
@@ -1532,7 +1532,7 @@ block16:
     v292 = iconst.i64 0
     v293 = iconst.i64 0
     v294 = iconst.i64 1
-    v295 = call fn123(v291, v263, v294)  ; v263 = 1, v294 = 1
+    v295 = call fn123(v291, v262, v259, v294)  ; v294 = 1
     call fn124(v291)
     v296 = iconst.i64 0
     v297 = iconst.i64 0
