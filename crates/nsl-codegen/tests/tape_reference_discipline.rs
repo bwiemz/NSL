@@ -51,7 +51,7 @@ fn op(id: OpId, result: VarId, op: PrimalOp, inputs: Vec<VarId>) -> WengertOp {
 fn skewed_attn_wengert(skew: u32, with_sdpa: bool) -> WengertList {
     let mut ops = vec![
         op(skew, 0, PrimalOp::Input("x".into()), vec![]),
-        op(skew + 1, 1, PrimalOp::RMSNorm { eps: 1e-5 }, vec![0]),
+        op(skew + 1, 1, PrimalOp::RMSNorm { eps: nsl_codegen::wengert::NormEps::Const(1e-5) }, vec![0]),
         op(skew + 2, 2, PrimalOp::Param("blocks.0.attn.wq".into()), vec![]),
         op(skew + 3, 3, PrimalOp::Matmul, vec![1, 2]),
         op(skew + 4, 4, PrimalOp::RoPE { dim: 64 }, vec![3]),

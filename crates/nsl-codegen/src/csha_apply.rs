@@ -326,11 +326,13 @@ pub struct CshaChainVarIds {
     /// when the RMSNorm op can't be resolved — in both cases the gamma
     /// gradient path is skipped.
     pub x_raw_var: Option<u32>,
-    /// Gap I step K: RMSNorm epsilon, captured from `PrimalOp::RMSNorm
+    /// Gap I step K: the norm's epsilon, captured from `PrimalOp::RMSNorm
     /// { eps }` so the `NormGammaBackward` lowering can recompute
-    /// `1/sqrt(var + eps)` without re-consulting the primal op. Zero
-    /// when `x_raw_var` is `None` (the gamma path is skipped anyway).
-    pub rmsnorm_eps: f64,
+    /// `1/sqrt(var + eps)` without re-consulting the primal op, and so the
+    /// fused launches pass the model's eps -- they used the CSHA config's
+    /// 1e-5 whatever the program said. A model field is `NormEps::Var`, read
+    /// at run time. `None` when the norm op cannot be resolved.
+    pub rmsnorm_eps: Option<crate::wengert::NormEps>,
 }
 
 /// Why CSHA is claiming a node.
@@ -397,6 +399,9 @@ pub struct CshaSavePointers {
     /// site, backward picks them up automatically with no additional edits.
     pub cos: cranelift_codegen::ir::Value,
     pub sin: cranelift_codegen::ir::Value,
+    /// The norm eps the forward launch passed (f32 bits widened to i64): the
+    /// backward launch passes the same Value, so the two can never disagree.
+    pub eps_bits: cranelift_codegen::ir::Value,
     /// Gap B: data-section IDs for the CSHA fused backward PTX + name.
     /// Mirror of `FlashAttentionCompileContext.csha_backward_{ptx,name}_data_id`
     /// — copied here so Gap C/D's adjoint emitter has everything it needs
@@ -722,20 +727,19 @@ pub fn collect_chain_dispatch_map_with_wengert(
             // Gap I step K: to emit `NormGammaBackward` we need the
             // RMSNorm input (pre-norm `x`) as a primal VarId plus the
             // eps. Both come from the same `norm_op` entry that
-            // `x_norm_var` points at. Skip entirely when the RMSNorm
-            // has no trainable gamma — dgamma is pointless for
-            // constants.
-            let (x_raw_var, rmsnorm_eps): (Option<u32>, f64) = if norm_weight_var.is_some() {
-                let norm_entry = w.ops.get(norm_op as usize);
-                let x_input = norm_entry.and_then(|o| o.inputs.first().copied());
-                let eps = norm_entry.and_then(|o| match &o.op {
-                    crate::wengert::PrimalOp::RMSNorm { eps } => Some(*eps),
-                    crate::wengert::PrimalOp::LayerNorm { eps } => Some(*eps),
-                    _ => None,
-                });
-                (x_input, eps.unwrap_or(0.0))
+            // `x_norm_var` points at. The dgamma path is skipped when the
+            // RMSNorm has no trainable gamma; the eps is captured either way,
+            // because the fused launches pass it to the kernels.
+            let norm_entry = w.ops.get(norm_op as usize);
+            let rmsnorm_eps = norm_entry.and_then(|o| match &o.op {
+                crate::wengert::PrimalOp::RMSNorm { eps }
+                | crate::wengert::PrimalOp::LayerNorm { eps } => Some(*eps),
+                _ => None,
+            });
+            let x_raw_var: Option<u32> = if norm_weight_var.is_some() {
+                norm_entry.and_then(|o| o.inputs.first().copied())
             } else {
-                (None, 0.0)
+                None
             };
 
             let chain_varids = match (
@@ -1106,7 +1110,7 @@ mod tests {
     fn attn_wengert() -> WengertList {
         let ops = vec![
             op(0, 0, PrimalOp::Input("x".into()), vec![]),
-            op(1, 1, PrimalOp::RMSNorm { eps: 1e-5 }, vec![0]),
+            op(1, 1, PrimalOp::RMSNorm { eps: crate::wengert::NormEps::Const(1e-5) }, vec![0]),
             op(2, 2, PrimalOp::Param("blocks.0.attn.wq".into()), vec![]),
             op(3, 3, PrimalOp::Matmul, vec![1, 2]),
             op(4, 4, PrimalOp::RoPE { dim: 64 }, vec![3]),
@@ -1131,7 +1135,7 @@ mod tests {
     fn flat_attn_wengert() -> WengertList {
         let ops = vec![
             op(0, 0, PrimalOp::Input("x".into()), vec![]),
-            op(1, 1, PrimalOp::RMSNorm { eps: 1e-5 }, vec![0]),
+            op(1, 1, PrimalOp::RMSNorm { eps: crate::wengert::NormEps::Const(1e-5) }, vec![0]),
             op(2, 2, PrimalOp::Param("TransformerBlock.wq".into()), vec![]),
             op(3, 3, PrimalOp::Matmul, vec![1, 2]),
             op(4, 4, PrimalOp::RoPE { dim: 64 }, vec![3]),

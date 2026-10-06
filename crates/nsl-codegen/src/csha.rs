@@ -802,7 +802,7 @@ mod tests {
     fn attn_block() -> WengertList {
         let ops = vec![
             op(0, 0, PrimalOp::Input("x".into()), vec![]),
-            op(1, 1, PrimalOp::RMSNorm { eps: 1e-5 }, vec![0]),
+            op(1, 1, PrimalOp::RMSNorm { eps: crate::wengert::NormEps::Const(1e-5) }, vec![0]),
             op(2, 2, PrimalOp::Param("blocks.0.attn.wq".into()), vec![]),
             op(3, 3, PrimalOp::Matmul, vec![1, 2]),
             op(4, 4, PrimalOp::RoPE { dim: 64 }, vec![3]),
@@ -1141,7 +1141,7 @@ mod override_tests {
         };
         let ops = vec![
             op(0, 0, PrimalOp::Input("x".into()), vec![]),
-            op(1, 1, PrimalOp::RMSNorm { eps: 1e-5 }, vec![0]),
+            op(1, 1, PrimalOp::RMSNorm { eps: crate::wengert::NormEps::Const(1e-5) }, vec![0]),
             op(2, 2, PrimalOp::Param("blocks.0.attn.wq".into()), vec![]),
             op(3, 3, PrimalOp::Matmul, vec![1, 2]),
             op(4, 4, PrimalOp::RoPE { dim: 64 }, vec![3]),
