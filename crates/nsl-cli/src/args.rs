@@ -34,6 +34,16 @@ impl From<CliWggoImportance> for nsl_codegen::WggoImportance {
     }
 }
 
+/// `--target` value parser for `nsl build` / `nsl run`.
+///
+/// The compiler maps any target string it does not recognise to CUDA
+/// (`GpuTarget::from_target_string`). Without this parser, a misspelt target
+/// or a removed backend (`--target rocm`) would compile CUDA kernels without
+/// any error. `validate_cli_target` documents the accepted spellings.
+pub(crate) fn parse_target_arg(s: &str) -> Result<String, String> {
+    nsl_codegen::gpu_target::validate_cli_target(s).map(|()| s.to_string())
+}
+
 // The clap command enum carries many subcommand-specific flags, so keeping it
 // as a single enum is clearer than splitting every large variant into boxes.
 #[allow(clippy::large_enum_variant)]
@@ -662,8 +672,10 @@ pub(crate) struct BuildArgs {
         #[arg(long)]
         pub(crate) linear_types: bool,
 
-        /// M47: GPU target backend (cuda, rocm, metal, webgpu)
-        #[arg(long, default_value = "cuda")]
+        /// Compile target: cuda (default), sm_<N> (e.g. sm_120; also sm<N>,
+        /// cuda_sm<N>), cpu, or fpga. The ROCm, Metal and WebGPU backends were
+        /// removed (tag attic/scope-freeze-2026-10); naming one is an error
+        #[arg(long, default_value = "cuda", value_parser = parse_target_arg)]
         pub(crate) target: String,
 
         /// Disable all fusion optimizations (for differential testing)
@@ -1301,8 +1313,10 @@ pub(crate) struct RunArgs {
         #[arg(long, default_value = "1")]
         pub(crate) decode_workers: u32,
 
-        /// M47: GPU target backend (cuda, rocm, metal, webgpu)
-        #[arg(long, default_value = "cuda")]
+        /// Compile target: cuda (default), sm_<N> (e.g. sm_120; also sm<N>,
+        /// cuda_sm<N>), cpu, or fpga. The ROCm, Metal and WebGPU backends were
+        /// removed (tag attic/scope-freeze-2026-10); naming one is an error
+        #[arg(long, default_value = "cuda", value_parser = parse_target_arg)]
         pub(crate) target: String,
 
         /// Disable all fusion optimizations (for differential testing)
@@ -1898,5 +1912,64 @@ mod source_ad_mode_tests {
             parses(&["nsl", "run", "--tape-ad", "--pretrain-optimized", "m.nsl"]).is_err(),
             "--pretrain-optimized still conflicts with --tape-ad"
         );
+    }
+}
+
+#[cfg(test)]
+mod target_flag_tests {
+    use super::Cli;
+    use clap::Parser as _;
+
+    fn parse(args: &[&str]) -> Result<(), String> {
+        Cli::try_parse_from(args).map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    /// Before the scope freeze, an unknown `--target` compiled CUDA kernels
+    /// without any error (`GpuTarget::from_target_string` falls back to CUDA).
+    /// After the ROCm/Metal/WebGPU removal, `--target rocm` would have done
+    /// the same. Both subcommands must refuse it at parse time and name the
+    /// tag that preserves the removed code.
+    #[test]
+    fn a_removed_backend_is_refused_on_build_and_run() {
+        for sub in ["build", "run"] {
+            for removed in ["rocm", "metal", "webgpu", "hip", "wgsl"] {
+                let err = parse(&["nsl", sub, "--target", removed, "m.nsl"])
+                    .expect_err("a removed backend must not parse");
+                assert!(err.contains("removed"), "{sub} --target {removed}: {err}");
+                assert!(
+                    err.contains("attic/scope-freeze-2026-10"),
+                    "{sub} --target {removed}: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_unknown_target_is_refused_on_build_and_run() {
+        for sub in ["build", "run"] {
+            for bad in ["vulkan", "h100", "sm_90a", "CUDA"] {
+                assert!(
+                    parse(&["nsl", sub, "--target", bad, "m.nsl"]).is_err(),
+                    "{sub} --target {bad} must be refused"
+                );
+            }
+        }
+    }
+
+    /// The spellings the tree already passes: the default, the SM forms the
+    /// GPU gates use (`sm_89`, `cuda_sm80`, `cuda_sm70`), `cpu` (the CSLA
+    /// packed-GQA CPU parity gate), and `fpga`.
+    #[test]
+    fn the_accepted_targets_parse_on_build_and_run() {
+        for sub in ["build", "run"] {
+            assert!(parse(&["nsl", sub, "m.nsl"]).is_ok(), "{sub} default target");
+            for ok in ["cuda", "sm_120", "sm_89", "sm80", "cuda_sm80", "cuda_sm70", "cpu", "fpga"] {
+                assert!(
+                    parse(&["nsl", sub, "--target", ok, "m.nsl"]).is_ok(),
+                    "{sub} --target {ok}: {:?}",
+                    parse(&["nsl", sub, "--target", ok, "m.nsl"]).unwrap_err()
+                );
+            }
+        }
     }
 }

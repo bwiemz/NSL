@@ -334,7 +334,7 @@ Key entry points for contributors:
 ## Known Limitations
 
 - No REPL
-- CUDA required for GPU features (ROCm/Metal/WebGPU KIR built, untested on real hardware)
+- CUDA is the only GPU backend (the ROCm/Metal/WebGPU printers were removed; preserved at tag `attic/scope-freeze-2026-10`)
 - Windows requires Visual Studio Build Tools for linking
 - Fusion fires on elementwise chains; matmul+epilogue fusion (fused bias+relu inside matmul) is analysis-only
 

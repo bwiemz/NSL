@@ -110,7 +110,7 @@ nsl run [OPTIONS] <FILE> [-- <ARGS>...]
 | `--collectives` | `<COLLECTIVES>` | `sim` | P4 item 14: collective backend for multi-rank runs — "sim" (CPU-shm reference, default), "sim-gpu" (CUDA-aware TEST backend — device-pointer API staged through the CPU-shm reduce; validates the GPU plumbing on one GPU), or "nccl" (real CUDA-aware collectives; requires an nccl-featured build with libnccl) |
 | `--prefill-workers` | `<PREFILL_WORKERS>` | `1` | M41: Number of prefill workers for disaggregated inference |
 | `--decode-workers` | `<DECODE_WORKERS>` | `1` | M41: Number of decode workers for disaggregated inference |
-| `--target` | `<TARGET>` | `cuda` | M47: GPU target backend (cuda, rocm, metal, webgpu) |
+| `--target` | `<TARGET>` | `cuda` | Compile target: cuda (default), sm_&lt;N&gt; (e.g. sm_120; also sm&lt;N&gt;, cuda_sm&lt;N&gt;), cpu, or fpga. The ROCm, Metal and WebGPU backends were removed (tag attic/scope-freeze-2026-10); naming one is an error |
 | `--disable-fusion` |  |  | Disable all fusion optimizations (for differential testing) |
 | `--tape-ad` |  |  | Force tape-based AD (disable source-to-source AD) |
 | `--source-ad` |  |  | Use compile-time source-to-source AD instead of runtime tape AD |
@@ -215,7 +215,7 @@ nsl build [OPTIONS] <FILE>
 | `--vram-budget` | `<VRAM_BUDGET>` |  | M36: VRAM budget (e.g., "8GB", "512MB") — fail if plan exceeds |
 | `--memory-report` |  |  | M36: Print memory plan report |
 | `--linear-types` |  |  | M38a: Enable linear types ownership checking |
-| `--target` | `<TARGET>` | `cuda` | M47: GPU target backend (cuda, rocm, metal, webgpu) |
+| `--target` | `<TARGET>` | `cuda` | Compile target: cuda (default), sm_&lt;N&gt; (e.g. sm_120; also sm&lt;N&gt;, cuda_sm&lt;N&gt;), cpu, or fpga. The ROCm, Metal and WebGPU backends were removed (tag attic/scope-freeze-2026-10); naming one is an error |
 | `--disable-fusion` |  |  | Disable all fusion optimizations (for differential testing) |
 | `--tape-ad` |  |  | Force tape-based AD (disable source-to-source AD) |
 | `--source-ad` |  |  | Use compile-time source-to-source AD instead of runtime tape AD |

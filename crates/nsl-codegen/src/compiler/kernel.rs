@@ -192,46 +192,8 @@ impl Compiler<'_> {
             )));
         }
 
-        // The AMDGPU / Metal / WGSL printers have no control flow yet: an
-        // edge that passes block arguments (a loop-carried or
-        // branch-assigned local) would be printed as a comment and the
-        // kernel silently corrupted. Refuse instead (deferral must refuse).
-        if target != GpuTarget::Cuda
-            && kir
-                .blocks
-                .iter()
-                .any(|b| b.terminator.as_ref().is_some_and(|t| t.has_args()))
-        {
-            return Err(CodegenError::new(format!(
-                "kernel '{}': loops and locals reassigned inside `if` / loop bodies are                  not supported on {} yet (its printer has no control flow); use the                  default CUDA target for this kernel",
-                kernel_name,
-                target.name()
-            )));
-        }
-
         let code = match target {
             GpuTarget::Cuda => crate::backend_ptx::lower_kir_to_ptx(&kir),
-            GpuTarget::Rocm => {
-                nsl_log::nsl_log!(WARN, "nsl", 
-                    "[nsl] Generated AMDGPU ISA for kernel '{}' (runtime execution requires M47c)",
-                    kernel_name
-                );
-                crate::backend_amdgpu::lower_kir_to_amdgpu(&kir)
-            }
-            GpuTarget::Metal => {
-                nsl_log::nsl_log!(WARN, "nsl", 
-                    "[nsl] Generated MSL for kernel '{}' (runtime execution requires M47c)",
-                    kernel_name
-                );
-                crate::backend_metal::lower_kir_to_msl(&kir)
-            }
-            GpuTarget::WebGpu => {
-                nsl_log::nsl_log!(WARN, "nsl", 
-                    "[nsl] Generated WGSL for kernel '{}' (runtime execution requires M47c)",
-                    kernel_name
-                );
-                crate::backend_wgsl::lower_kir_to_wgsl(&kir)
-            }
             GpuTarget::Fpga => unreachable!(),
         };
 
@@ -2167,9 +2129,9 @@ impl Compiler<'_> {
         // PANICS on anything but "cuda"/"sm_<N>". The decorated path only
         // reaches it behind an @flash_attention decorator, but this lazy path
         // fires for EVERY decorator-free SDPA train compile — including
-        // `--target rocm|metal|webgpu|fpga`, which compiled fine before the
+        // `--target cpu|fpga|cuda_sm<N>`, which compiled fine before the
         // variant table existed (null pointers → CPU backward). Keep exactly
-        // that behavior for non-CUDA targets: an empty table lowers to null
+        // that behavior for those targets: an empty table lowers to null
         // pointers, no panic.
         let target = self.compile_options.target.as_str();
         if target != "cuda" && !target.starts_with("sm_") {

@@ -590,22 +590,24 @@ and the PTX backend declares the `.reg .b32 %v<N>` class for them.
 `crates/nsl-codegen/tests/kir_mma_ptxas.rs` assemble those lowerings with
 `ptxas` where the toolkit is present (CI's cuda-feature lane).
 `crates/nsl-kir/src/backend_ptx.rs::lower_kir_to_ptx` prints PTX
-(ISA 7.0, `sm_70`) from it; `src/backend_amdgpu.rs::lower_kir_to_amdgpu`,
-`src/backend_metal.rs::lower_kir_to_msl`, `src/backend_wgsl.rs::lower_kir_to_wgsl`
-are the other printers. `src/kernel_lower.rs::lower_kernel_to_ir` is the one
-front door for a user `kernel` block on every target (roadmap A2 step 3
+(ISA 7.0, `sm_70`) from it. It is the only printer: the AMDGPU, Metal and
+WGSL printers were removed in the Phase 0.6 scope freeze (preserved at tag
+`attic/scope-freeze-2026-10`). `src/kernel_lower.rs::lower_kernel_to_ir` is the one
+front door for a user `kernel` block (roadmap A2 step 3
 retired the AST→PTX `KernelCompiler` the CUDA target used until then): it
 lowers `let`, assignment to a declared local, element loads and stores,
 `if`/`elif`/`else`, `for ... in range(...)`, `while`, `break`/`continue`, a
 bare `return` and the index builtins to verified KIR — a local reassigned in
 a branch or a loop body is a block parameter at the join or the header — and
 refuses everything else with the innermost node's span.
-`src/gpu_target.rs` (`GpuTarget::{Cuda, Rocm, Metal, WebGpu, Fpga}`,
-re-exporting `FeatureSet`) selects the backend; `Compiler::compile_kernels`
-(`src/compiler/kernel.rs`) dispatches: every target lowers to KIR, CUDA
-prints it with `backend_ptx`, ROCm/Metal/WebGPU with their printers (which
-have no control flow yet, so a kernel whose KIR passes block arguments is
-refused there), and `Fpga` returns `FPGA_TARGET_REDIRECT_MSG` (use
+`src/gpu_target.rs` (`GpuTarget::{Cuda, Fpga}`, re-exporting `FeatureSet`)
+selects the backend, and its `validate_cli_target` is the `--target` value
+parser for `nsl build` / `nsl run`. It accepts `cuda`, `sm_<N>`, `sm<N>`,
+`cuda_sm<N>`, `cpu` and `fpga`, and it refuses the removed backend names
+with the attic tag. That check exists because `GpuTarget::from_target_string`
+maps any unknown string to CUDA. `Compiler::compile_kernels`
+(`src/compiler/kernel.rs`) dispatches: CUDA lowers to KIR and prints it with
+`backend_ptx`, and `Fpga` returns `FPGA_TARGET_REDIRECT_MSG` (use
 `nsl fpga-compile`). `@autotune` substitutes its constants into the AST
 (`kernel_lower::substitute_constants`) before lowering. PTX bytes are
 embedded via `declare_data` / `define_data` in the same file;
@@ -1172,9 +1174,8 @@ review. See `docs/wiki/GPU-Test-Harness.md` and `docs/wiki/Testing-Strategy.md`.
 1. Build it with `KirBuilder` (`crates/nsl-kir/src/kernel_ir.rs`): `add_param` for each
    argument with its `AddressSpace`, `new_typed_var`/`emit(KirOp::…)` for the
    body, `terminate`, `finalize()`. Missing operations are added as `KirOp`
-   variants with lowering in **every** printer (`backend_ptx.rs`,
-   `backend_amdgpu.rs`, `backend_metal.rs`, `backend_wgsl.rs`) and, if
-   needed, `FeatureSet` bits in `src/gpu_target.rs`. Float arithmetic
+   variants with lowering in the PTX printer (`backend_ptx.rs`, the only
+   one) and, if needed, `FeatureSet` bits in `src/gpu_target.rs`. Float arithmetic
    that must round each operation on its own (a result that has to match
    a decomposed, multi-kernel computation bit for bit) uses
    `KirOp::{AddRn, SubRn, MulRn}`. These print `.rn`, which ptxas never
@@ -1186,8 +1187,7 @@ review. See `docs/wiki/GPU-Test-Harness.md` and `docs/wiki/Testing-Strategy.md`.
    converts the value. `KirType::U16` holds raw 16-bit storage bits (bf16
    and the like) in a 32-bit register: `.u16` loads and stores, and
    `cvt.u32.u16` / `cvt.u16.u32` to widen and narrow. `KirType::U8` is the
-   same for a byte (`.u8`, `cvt.u32.u8`). The Metal, WGSL and
-   AMDGPU printers lower neither `Cast` nor `Bitcast` yet.
+   same for a byte (`.u8`, `cvt.u32.u8`).
 2. Lower with `backend_ptx::lower_kir_to_ptx` at the launch site and embed
    the bytes the way `Compiler::compile_kernels` does (`declare_data` /
    `define_data`, `src/compiler/kernel.rs`); launch through the existing

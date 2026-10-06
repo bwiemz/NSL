@@ -632,7 +632,7 @@ const NOT_A_PASS: &[(&str, &str)] = &[
     ("ad_rules", "adjoint rules table consumed by source-AD, not a pass"),
     ("agent", "M56 agent-memory feature"),
     ("autotune", "kernel autotuner, invoked BY passes rather than being one"),
-    ("backend_", "target backends (ptx/amdgpu/metal/wgsl/verilog)"),
+    ("backend_", "target backends (verilog; the PTX printer lives in nsl-kir)"),
     ("bin", "binaries, not library modules"),
     ("bitnet", "M35 BitNet quantized-model support"),
     ("builtins", "FFI symbol registration (language-facing half of the registry)"),

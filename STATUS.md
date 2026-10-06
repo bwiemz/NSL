@@ -174,8 +174,10 @@ tests that are *not* part of the green-build contract (see README → Benchmarks
   tag `attic/scope-freeze-2026-10`.
 - **Distributed** — tensor / pipeline / context parallelism, MoE serving.
 - **Inference serving** — speculative decoding, paged KV, disaggregated serving.
-- **Non-CUDA GPU backends** — AMDGPU/ROCm, Metal, WGSL/WebGPU KIR are built but
-  **untested on real hardware**.
+- **Non-CUDA GPU backends** (M47: AMDGPU/ROCm, Metal, WGSL/WebGPU KIR printers)
+  — **Removed** in the Phase 0.6 scope freeze; preserved at tag
+  `attic/scope-freeze-2026-10`. `--target` accepts only CUDA spellings (plus `cpu`/`fpga`)
+  and refuses the removed names.
 - **SR-BF16 parameter storage** — `--param-dtype bf16-sr` (stochastic
   rounding). Mechanism + refusals complete; a real-corpus differential found
   no quality delta, and f32 remains the default.

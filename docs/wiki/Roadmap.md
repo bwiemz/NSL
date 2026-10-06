@@ -136,8 +136,8 @@ Trace recording with NaN analysis; trace diffing across runs; Chrome tracing JSO
 ### M46 -- Reproducibility (Shipped v0.8, 2026-03-18)
 Determinism checker; kernel variant selection for bitwise reproducibility; RNG state tracking.
 
-### M47 -- Multi-backend KIR (Shipped v0.6, 2026-03-18)
-Kernel IR (KIR) intermediate representation; PTX backend; `GpuTarget`/`GpuBackend` trait -- dense inference only (FlashAttention/MoE stay CUDA-only).
+### M47 -- Multi-backend KIR (Shipped v0.6, 2026-03-18; non-CUDA backends removed 2026-10)
+Kernel IR (KIR) intermediate representation; PTX backend; `GpuTarget`/`GpuBackend` trait -- dense inference only (FlashAttention/MoE stay CUDA-only). The AMDGPU/Metal/WGSL printers and the unused runtime `GpuBackend` trait were removed in the Phase 0.6 scope freeze (never tested on hardware); preserved at tag `attic/scope-freeze-2026-10`. KIR and the PTX backend stay.
 
 ### M48 -- Multimodal (Shipped v0.8, 2026-03-18)
 `PatchEmbed` (vision), `MelSpectrogram` (audio), `cross_attention` (cross-modal fusion), modality classification.
@@ -355,7 +355,7 @@ The M32-M51 phase ordering was revised once (2026-03-15 design doc). Phase 4 re-
 What is load-bearing and won't move:
 
 - **M38a (linear types semantics) ships before any stdlib rewrite** because the stdlib must be ownership-correct from day one.
-- **CUDA-first** -- M47 multi-backend only covers dense inference; FlashAttention / Ring Attention / FP8 / MoE stay CUDA-only until there is demonstrated demand.
+- **CUDA-first** -- M47's non-CUDA backends only ever covered dense inference, and the 2026-10 scope freeze removed them; FlashAttention / Ring Attention / FP8 / MoE stay CUDA-only until there is demonstrated demand.
 - **Inference-first identity** -- debugging, determinism, constrained decoding, and KV compression land before training niceties like source AD and pipeline parallelism.
 
 ## References

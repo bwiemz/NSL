@@ -250,8 +250,8 @@ block_kv with fused projections) are rejected at compile time.
 
 ### Multi-Backend (M47)
 - Kernel IR with 40+ ops
-- PTX backend (production)
-- AMDGPU, Metal (MSL), WGSL backends (code generation, untested on hardware)
+- PTX backend (production; the only GPU backend)
+- AMDGPU, Metal (MSL) and WGSL backends: removed in the Phase 0.6 scope freeze (never tested on hardware); preserved at tag `attic/scope-freeze-2026-10`
 
 ### Pipeline Parallelism (M43)
 - 1F1B and GPipe scheduling

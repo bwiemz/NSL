@@ -3659,6 +3659,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   `--listen` a serve-mode selector. Both flags belonged only to the unikernel.
   They are removed with it. MemoryPlanner keeps `--memory-report`, and `nsl
   profile --memory` is a different flag that is unaffected.
+- **AMDGPU/ROCm, Metal and WGSL/WebGPU kernel backends (M47)**, in the Phase
+  0.6 scope freeze. The code is preserved at tag `attic/scope-freeze-2026-10`.
+  None of the three printers was ever run on hardware. They had no
+  control-flow support, and nothing could load what they printed, because the
+  runtime loads only PTX. Removed: `backend_amdgpu.rs`, `backend_metal.rs`,
+  `backend_wgsl.rs`, the `GpuTarget::{Rocm, Metal, WebGpu}` variants, the
+  non-CUDA dispatch and control-flow refusal in `compiler/kernel.rs`, and the
+  runtime `gpu_backend.rs` trait (no implementor, no user) with its `gpu`
+  facade. KIR, the PTX printer, `FeatureSet` and the language-level
+  `metal`/`rocm` device annotations stay. `--target` is now checked at parse
+  time on `nsl build` and `nsl run`. Before, `GpuTarget::from_target_string`
+  mapped any unknown string to CUDA, so after this removal `--target rocm`
+  would have compiled CUDA kernels without an error. Accepted values are
+  `cuda`, `sm_<N>`, `sm<N>`, `cuda_sm<N>`, `cpu` and `fpga`. The removed names
+  (`rocm`/`amd`/`hip`, `metal`/`apple`/`mps`, `webgpu`/`wgsl`) are refused
+  with the attic tag, and anything else is refused as unknown. `@target(...)`
+  now accepts only `cuda`, and it names the tag when given a removed backend.
 
 _v0.10.0 below is the whole of the 0.9 line's unreleased work
 (2026-03-19 → 2026-09-06); from here releases are cut monthly (roadmap D5),

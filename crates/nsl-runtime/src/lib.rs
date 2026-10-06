@@ -285,7 +285,6 @@ pub mod elastic;
 pub mod kv_compress;
 pub mod grammar;
 pub mod token_alignment;
-pub mod gpu_backend;
 pub mod grad_context;
 pub mod vmap_runtime;
 pub mod backward_context;
@@ -345,12 +344,6 @@ pub mod builtins {
         args, assert, dict, file_io, hof, io, list, math, memory, power, print,
         range, slab, string, string_ops, tensor,
     };
-}
-
-/// GPU device backend selection (the concrete `cpu`/`cuda` drivers stay
-/// crate-private).
-pub mod gpu {
-    pub use crate::gpu_backend;
 }
 
 /// Automatic differentiation and training-time runtime support.

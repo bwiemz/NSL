@@ -38,7 +38,6 @@ colliding with the real `autodiff`/`data`/`serving`/`peft` modules and with the
 | Facade | Responsibility | Representative modules |
 |--------|----------------|------------------------|
 | `builtins` | Language builtins / base runtime | `tensor`, `string`, `list`, `dict`, `math`, `memory`, `io`, `slab` |
-| `gpu` | Device backend selection | `gpu_backend` (the `cpu`/`cuda` drivers stay `pub(crate)`) |
 | `training` | Autodiff & training support | `autodiff`, `grad_context`, `backward_context`, `checkpoint`, `zero`, `vmap_runtime` |
 | `quantization` | Reduced precision | `awq`, `gptq`, `fp8`, `quantize`, `packing`, `fase_bc` |
 | `attention` | Attention kernels | `flash_attention`, `pca_rope_runtime`, `pca_tier_b_runtime` |

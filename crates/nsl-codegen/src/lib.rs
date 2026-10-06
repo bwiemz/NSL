@@ -16,7 +16,7 @@
 //!
 //! - [`core`] — the compilation pipeline itself (compiler driver, statement /
 //!   expression lowering, linker, C-export/header emission, ownership).
-//! - [`gpu`] — GPU backends (PTX, AMDGPU, Metal, WGSL) and kernel lowering.
+//! - [`gpu`] — the CUDA/PTX backend and kernel lowering.
 //! - [`training`] — autodiff (tape + source-to-source), Wengert lists, `vmap`.
 //! - [`quantization`] — FP8, BitNet, AWQ/PCA precision tiering, weight analysis.
 //! - [`distributed`] — tensor / context / pipeline parallelism, MoE, CPDT.
@@ -111,9 +111,6 @@ pub mod types;
 pub mod use_count;
 
 // --- GPU backends & kernel lowering --------------------------------------
-pub mod backend_amdgpu;
-pub mod backend_metal;
-pub mod backend_wgsl;
 pub mod gpu_specs;
 pub mod gpu_target;
 // `KernelIR`, its verifier and the PTX printer live in the leaf crate
@@ -311,11 +308,10 @@ pub mod core {
     };
 }
 
-/// GPU code generation: device backends and kernel lowering.
+/// GPU code generation: the CUDA/PTX backend and kernel lowering.
 pub mod gpu {
     pub use crate::{
-        backend_amdgpu, backend_metal, backend_ptx, backend_wgsl, gpu_specs,
-        gpu_target, kernel_ir, kernel_lower, kernel_skeleton,
+        backend_ptx, gpu_specs, gpu_target, kernel_ir, kernel_lower, kernel_skeleton,
         matmul_mma, ptx_metadata, ptxas_validation,
     };
 }

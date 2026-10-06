@@ -10,7 +10,9 @@
 > and the `nsl-vscode` extension below do not exist.** Where this sketch
 > and the shipped CLI disagree, the CLI is the specification. Also: NSL
 > compiles via **Cranelift**, not LLVM — banners below predate that
-> decision.
+> decision. There is no global `--device` option. GPU code is selected
+> with `nsl build/run --target`, which is CUDA-only since the ROCm, Metal
+> and WebGPU backends were removed (tag `attic/scope-freeze-2026-10`).
 
 ## Design Rationale
 
@@ -44,7 +46,7 @@ COMMANDS:
     lsp         Start the LSP server (for IDE integration)
 
 GLOBAL OPTIONS:
-    --device <DEVICE>     Target device: cpu, cuda, metal, rocm, npu
+    --device <DEVICE>     Target device: cpu, cuda, npu
     --precision <DTYPE>   Default precision: fp32, fp16, bf16, fp8
     --verbose             Verbose output
     --quiet               Suppress non-error output
