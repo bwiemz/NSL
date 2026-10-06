@@ -636,15 +636,19 @@ macro_rules! for_each_runtime_fn {
             // Checkpoint I/O (M14)
             [training] nsl_model_save(i64, i64, i64, i64) -> () = checkpoint::nsl_model_save;
             [training] nsl_model_load(i64, i64, i64) -> () = checkpoint::nsl_model_load;
+            // `model_load`: also checks each entry's name against the live parameter
+            // at its position (path_ptr, path_len, names_list, param_list).
+            [training] nsl_model_load_named(i64, i64, i64, i64) -> () = checkpoint::nsl_model_load_named;
             // Milestone B + item 8: full training-state checkpoint (θ .nslm + .optim
             // sidecar with m/v moments, micro-batch step counter, data position and
             // RNG state). Save: (path_ptr, path_len, names_list, param_list,
             // state_list_1, state_list_2, step_count, dataloader_handle_or_0,
-            // train_epoch). Load: (path_ptr, path_len, param_list, state_list_1,
-            // state_list_2, dataloader_handle_or_0) -> saved step counter; the
+            // train_epoch). Load: (path_ptr, path_len, names_list, param_list,
+            // state_list_1, state_list_2, dataloader_handle_or_0, epochs) -> saved
+            // step counter; the
             // restored training epoch comes back through nsl_train_resume_epoch.
             [training] nsl_train_checkpoint_save(i64, i64, i64, i64, i64, i64, i64, i64, i64) -> () = checkpoint::nsl_train_checkpoint_save;
-            [training] nsl_train_checkpoint_load(i64, i64, i64, i64, i64, i64, i64) -> i64 = checkpoint::nsl_train_checkpoint_load;
+            [training] nsl_train_checkpoint_load(i64, i64, i64, i64, i64, i64, i64, i64) -> i64 = checkpoint::nsl_train_checkpoint_load;
             [training] nsl_train_resume_epoch() -> i64 = checkpoint::nsl_train_resume_epoch;
             // Data sources (M19)
             [training] nsl_load_jsonl(i64, i64, i64, i64) -> i64 = data_source::nsl_load_jsonl;
@@ -1365,6 +1369,6 @@ mod tests {
     fn table_is_the_recorded_size() {
         // The count is pinned so a row dropped by a bad merge is noticed; move
         // it with a row that is deliberately added or removed.
-        assert_eq!(RUNTIME_ABI.len(), 691);
+        assert_eq!(RUNTIME_ABI.len(), 692);
     }
 }

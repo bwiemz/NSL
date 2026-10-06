@@ -94,10 +94,20 @@ pub extern "C" fn nsl_model_save(
     let header = format!(r#"{{"params":[{}]}}"#, params_json.join(","));
     let header_bytes = header.as_bytes();
 
-    let mut file = match std::fs::File::create(path) {
+    // Written to a temporary and committed by rename, so an interrupted save
+    // leaves the previous file intact: `File::create` on the final path used
+    // to truncate it before the first byte was written (external review
+    // 2026-10-06). The temporary is unique to this process and call: two
+    // processes saving the same path (a test running one fixture twice in
+    // parallel) would otherwise share it, and one's rename would take the
+    // other's file away mid-commit. A crash leaves the temporary behind.
+    static SAVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SAVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = format!("{path}.tmp.{}.{seq}", std::process::id());
+    let mut file = match std::fs::File::create(&tmp) {
         Ok(f) => f,
         Err(e) => {
-            crate::nsl_log!(ERROR, "nsl", "nsl: model_save: cannot create file '{}': {}", path, e);
+            crate::nsl_log!(ERROR, "nsl", "nsl: model_save: cannot create file '{}': {}", tmp, e);
             std::process::abort();
         }
     };
@@ -185,202 +195,342 @@ pub extern "C" fn nsl_model_save(
     for &ptr in &materialized {
         crate::weight_stream::nsl_weight_stream_evict(ptr, 0);
     }
+    sync_or_abort(&file, &tmp);
+    drop(file);
+    commit_rename(&tmp, path, "model_save");
 }
 
-/// Load model parameters from .nslm binary format into existing tensors.
+/// fsync `file`: its bytes are on the device before a rename publishes it.
+/// Without this a crash can leave a renamed but empty or partial file -- the
+/// hazard `awq.rs::write_atomic` documents.
+fn sync_or_abort(file: &std::fs::File, path: &str) {
+    if let Err(e) = file.sync_all() {
+        crate::nsl_log!(ERROR, "nsl", "nsl: checkpoint: fsync '{path}': {e}");
+        std::process::abort();
+    }
+}
+
+/// Atomically replace `to` with `from`, then fsync the directory so the
+/// rename itself survives a crash.
+fn commit_rename(from: &str, to: &str, what: &str) {
+    if let Err(e) = std::fs::rename(from, to) {
+        crate::nsl_log!(ERROR, "nsl", "nsl: {what}: rename '{from}' -> '{to}': {e}");
+        std::process::abort();
+    }
+    sync_parent_dir(to);
+}
+
+/// fsync the directory holding `path` (a rename is a directory update).
+///
+/// A failure aborts: the train save relies on the model's rename being
+/// durable before the sidecar's, and losing that order silently could leave
+/// a new sidecar beside an old model after a power cut. A filesystem that
+/// does not support syncing a directory (EINVAL / ENOTSUP) is tolerated, and
+/// Windows, which cannot open a directory as a file, skips it.
+fn sync_parent_dir(path: &str) {
+    let dir = std::path::Path::new(path)
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    #[cfg(unix)]
+    {
+        use std::io::ErrorKind;
+        let r = std::fs::File::open(dir).and_then(|d| d.sync_all());
+        if let Err(e) = r
+            && !matches!(e.kind(), ErrorKind::InvalidInput | ErrorKind::Unsupported)
+        {
+            crate::nsl_log!(ERROR, "nsl", "nsl: checkpoint: fsync of directory '{}': {e}", dir.display());
+            std::process::abort();
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+}
+
+/// SHA-256 of a whole file, as lowercase hex: the `.optim` sidecar's
+/// `model_sha256`, which ties it to the exact `.nslm` it was saved with.
+pub(crate) fn file_sha256_hex(path: &str) -> std::io::Result<String> {
+    use sha2::Digest;
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = vec![0u8; 8 << 20];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// One `params` entry of an `.nslm` header.
+#[derive(Debug, serde::Deserialize)]
+struct NslmEntry {
+    name: String,
+    shape: Vec<i64>,
+    dtype: String,
+    offset: u64,
+    nbytes: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct NslmHeader {
+    params: Vec<NslmEntry>,
+}
+
+/// A parsed `.nslm` file: its entries, and where the data section starts.
+#[derive(Debug)]
+struct NslmLayout {
+    entries: Vec<NslmEntry>,
+    data_start: usize,
+}
+
+/// Parse and structurally validate an `.nslm` file before anything reads its
+/// data: the declared header fits the file, the header is the JSON table the
+/// writer emits, and the entries tile the data section exactly, in order,
+/// with no gap, overlap or trailing bytes (external review 2026-10-06; the
+/// loader used to slice an unbounded `header_size`, count entries by
+/// substring, and ignore offsets).
+fn parse_nslm(data: &[u8]) -> Result<NslmLayout, String> {
+    if data.len() < 16 {
+        return Err(format!("file too small ({} bytes, need at least 16)", data.len()));
+    }
+    if &data[0..4] != MAGIC {
+        return Err("invalid .nslm file (bad magic)".into());
+    }
+    let version = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+    if version != VERSION {
+        return Err(format!("unsupported version {version} (expected {VERSION})"));
+    }
+    let mut size = [0u8; 8];
+    size.copy_from_slice(&data[8..16]);
+    let header_size = u64::from_le_bytes(size);
+    let header_end = 16u64
+        .checked_add(header_size)
+        .filter(|&end| end <= data.len() as u64)
+        .ok_or_else(|| {
+            format!("the header claims {header_size} bytes but the file is {} bytes", data.len())
+        })? as usize;
+    let header: NslmHeader = serde_json::from_slice(&data[16..header_end])
+        .map_err(|e| format!("the header is not a valid parameter table: {e}"))?;
+    let data_start = header_end + (64 - header_end % 64) % 64;
+    let mut next = 0u64;
+    for (i, e) in header.params.iter().enumerate() {
+        if e.offset != next {
+            return Err(format!(
+                "entry #{i} '{}' starts at data offset {} but the previous entry ends at {next}",
+                e.name, e.offset
+            ));
+        }
+        next = next
+            .checked_add(e.nbytes)
+            .ok_or_else(|| format!("entry #{i} '{}' has an impossible size {}", e.name, e.nbytes))?;
+    }
+    let have = (data.len() as u64).checked_sub(data_start as u64);
+    if have != Some(next) {
+        return Err(format!(
+            "the header describes {next} data bytes but the file holds {} after the header",
+            have.map_or_else(|| "none".to_string(), |h| h.to_string())
+        ));
+    }
+    Ok(NslmLayout { entries: header.params, data_start })
+}
+
+/// `blocks.0.attn.wq` and `blocks[0].attn.wq` are the same path: the train
+/// block names checkpoint entries with dotted indices, `model_save` with
+/// brackets.
+fn canonical_param_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 4);
+    for (i, seg) in name.split('.').enumerate() {
+        if i > 0 && !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_digit()) {
+            out.push('[');
+            out.push_str(seg);
+            out.push(']');
+        } else {
+            if i > 0 {
+                out.push('.');
+            }
+            out.push_str(seg);
+        }
+    }
+    out
+}
+
+/// Whether a file entry names the live parameter at the same position. A
+/// train-block checkpoint prefixes the model VARIABLE (`m.blocks.0.w`) where
+/// `model_save` writes the field path (`blocks[0].w`), and
+/// `model_load` of a checkpoint is the documented weights-only warm start,
+/// so that one leading segment is allowed to differ.
+fn param_names_match(file: &str, live: &str) -> bool {
+    let (file, live) = (canonical_param_name(file), canonical_param_name(live));
+    file == live || file.split_once('.').is_some_and(|(_, rest)| rest == live)
+}
+
+fn live_param_name(names: &NslList, i: usize) -> String {
+    let ptr = unsafe { *names.data.add(i) };
+    if ptr == 0 {
+        return "?".into();
+    }
+    unsafe { std::ffi::CStr::from_ptr(ptr as *const std::os::raw::c_char) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn live_shape(tensor: &NslTensor) -> Vec<i64> {
+    (0..tensor.ndim as usize).map(|d| unsafe { *tensor.shape.add(d) }).collect()
+}
+
+/// Check every entry against the live parameter at its position — count,
+/// name (when the caller has names), dtype, shape and byte size — so a
+/// refused load leaves the model untouched. The copy is positional; this is
+/// what makes a reordered, resized or transposed parameter a refusal instead
+/// of bytes read from the wrong place.
+fn check_nslm_against_live(
+    layout: &NslmLayout,
+    tensors: &NslList,
+    names: Option<&NslList>,
+) -> Result<(), String> {
+    let live = tensors.len as usize;
+    if layout.entries.len() != live {
+        return Err(format!(
+            "the file has {} tensors and the model has {live}. A train-block checkpoint holds \
+             only the trained parameters; tools/nslm_splice.py merges one into a full model \
+             file by name.",
+            layout.entries.len()
+        ));
+    }
+    if let Some(n) = names
+        && n.len as usize != live
+    {
+        return Err(format!("{} names for {live} tensors", n.len));
+    }
+    for (i, e) in layout.entries.iter().enumerate() {
+        let tensor = NslTensor::from_ptr(unsafe { *tensors.data.add(i) });
+        if let Some(n) = names {
+            let live_name = live_param_name(n, i);
+            if !param_names_match(&e.name, &live_name) {
+                return Err(format!(
+                    "tensor #{i} is '{}' in the file but '{live_name}' in the model -- the \
+                     parameters were added, removed or reordered since the save",
+                    e.name
+                ));
+            }
+        }
+        let live_dtype = checkpoint_dtype_name(tensor.dtype);
+        if e.dtype != live_dtype {
+            return Err(format!(
+                "dtype mismatch for tensor #{i}: file has {}, model expects {live_dtype} \
+                 (entry '{}') -- a raw byte copy would corrupt it. Convert the model's \
+                 parameters with `.to(dtype)` or re-save the checkpoint from a model with \
+                 the same dtypes.",
+                e.dtype, e.name
+            ));
+        }
+        let shape = live_shape(tensor);
+        let bytes = (tensor.len as u64) * (tensor.element_size() as u64);
+        if e.shape != shape || e.nbytes != bytes {
+            return Err(format!(
+                "tensor #{i} '{}' is {:?} ({} bytes) in the file but {shape:?} ({bytes} bytes) \
+                 in the model",
+                e.name, e.shape, e.nbytes
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Read and fully validate `path` for loading into `tensors`. Nothing is
+/// mutated; an `Err` names what is wrong.
+fn read_validated_nslm(
+    path: &str,
+    tensors: &NslList,
+    names: Option<&NslList>,
+) -> Result<(Vec<u8>, NslmLayout), String> {
+    let data = std::fs::read(path).map_err(|e| format!("cannot read file '{path}': {e}"))?;
+    let layout = parse_nslm(&data).map_err(|e| format!("'{path}': {e}"))?;
+    check_nslm_against_live(&layout, tensors, names).map_err(|e| format!("'{path}': {e}"))?;
+    Ok((data, layout))
+}
+
+/// Copy a validated file's tensors into the model. Every check has run
+/// already ([`read_validated_nslm`]).
+fn copy_nslm_into(data: &[u8], layout: &NslmLayout, tensors: &NslList) {
+    for (i, e) in layout.entries.iter().enumerate() {
+        let tensor = NslTensor::from_ptr(unsafe { *tensors.data.add(i) });
+        let start = layout.data_start + e.offset as usize;
+        let src = &data[start..start + e.nbytes as usize];
+        if tensor.device > 0 {
+            #[cfg(feature = "cuda")]
+            {
+                crate::cuda::inner::memcpy_htod(
+                    tensor.data,
+                    src.as_ptr() as *const std::ffi::c_void,
+                    src.len(),
+                );
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                crate::nsl_log!(ERROR, "nsl", "nsl: checkpoint load: tensor {i} is on GPU but CUDA not compiled");
+                std::process::abort();
+            }
+        } else {
+            // `model_save` writes the tensors' bytes as they are in memory,
+            // so the copy back is byte for byte.
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.as_ptr(), tensor.data as *mut u8, src.len());
+            }
+        }
+    }
+}
+
+fn model_load_impl(path: &str, tensors: &NslList, names: Option<&NslList>) {
+    match read_validated_nslm(path, tensors, names) {
+        Ok((data, layout)) => copy_nslm_into(&data, &layout, tensors),
+        Err(e) => {
+            crate::nsl_log!(ERROR, "nsl", "nsl: model_load: {e}");
+            std::process::abort();
+        }
+    }
+}
+
+/// Load model parameters from .nslm binary format into existing tensors,
+/// positionally. Checks count, dtype, shape and size of every entry before
+/// copying any; without names it cannot see a reorder of same-shaped
+/// parameters ([`nsl_model_load_named`] can, and is what `model_load` emits).
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_model_load(path_ptr: i64, path_len: i64, param_tensors_ptr: i64) {
     let tensors = NslList::from_ptr(param_tensors_ptr);
     if crate::weight_provider::try_load_from_provider(tensors) {
         return;
     }
-
     let path = unsafe {
         let slice = std::slice::from_raw_parts(path_ptr as *const u8, path_len as usize);
         std::str::from_utf8_unchecked(slice)
     };
-    let data = match std::fs::read(path) {
-        Ok(d) => d,
-        Err(e) => {
-            crate::nsl_log!(ERROR, "nsl", "nsl: model_load: cannot read file '{}': {}", path, e);
-            std::process::abort();
-        }
+    model_load_impl(path, tensors, None);
+}
+
+/// [`nsl_model_load`] that also requires each file entry to name the live
+/// parameter at its position (`param_names_ptr`: NslList of C strings, the
+/// same list `model_save` writes).
+#[unsafe(no_mangle)]
+pub extern "C" fn nsl_model_load_named(
+    path_ptr: i64,
+    path_len: i64,
+    param_names_ptr: i64,
+    param_tensors_ptr: i64,
+) {
+    let tensors = NslList::from_ptr(param_tensors_ptr);
+    if crate::weight_provider::try_load_from_provider(tensors) {
+        return;
+    }
+    let path = unsafe {
+        let slice = std::slice::from_raw_parts(path_ptr as *const u8, path_len as usize);
+        std::str::from_utf8_unchecked(slice)
     };
-
-    if data.len() < 16 {
-        crate::nsl_log!(ERROR, "nsl", "nsl: model_load: file too small ({} bytes, need at least 16)",
-            data.len()
-        );
-        std::process::abort();
-    }
-    if &data[0..4] != MAGIC {
-        crate::nsl_log!(ERROR, "nsl", "nsl: model_load: invalid .nslm file (bad magic)");
-        std::process::abort();
-    }
-    let version = u32::from_le_bytes(
-        data[4..8]
-            .try_into()
-            .unwrap_or_else(|_| std::process::abort()),
-    );
-    if version != VERSION {
-        crate::nsl_log!(ERROR, "nsl", "nsl: model_load: unsupported version {} (expected {})",
-            version, VERSION
-        );
-        std::process::abort();
-    }
-    let header_size = u64::from_le_bytes(
-        data[8..16]
-            .try_into()
-            .unwrap_or_else(|_| std::process::abort()),
-    ) as usize;
-
-    let total_header = 16 + header_size;
-    let padding = (64 - (total_header % 64)) % 64;
-    let data_start = total_header + padding;
-
-    // Count saved params by counting "name": occurrences in the JSON header.
-    // This is a lightweight check that avoids pulling in a full JSON parser.
-    {
-        let header_bytes = &data[16..16 + header_size];
-        let needle = b"\"name\":";
-        let saved_param_count = header_bytes
-            .windows(needle.len())
-            .filter(|w| *w == needle)
-            .count();
-        if saved_param_count != tensors.len as usize {
-            crate::nsl_log!(WARN, "nsl", 
-                "[nsl] WARNING: checkpoint has {} params but model expects {} params; \
-                 weights may be mismatched",
-                saved_param_count, tensors.len
-            );
-        }
-    }
-
-    // In-order dtype guard (same lightweight no-JSON-parser style as the
-    // count check above): this loader walks the data section by the LIVE
-    // tensor's element size and raw-copies bytes, so a dtype mismatch
-    // between a file entry and the destination tensor (e.g. an f64
-    // checkpoint loaded into an f32 model, or vice versa) would silently
-    // reinterpret bytes AND misalign every subsequent
-    // tensor. Refuse loudly instead — found while fixing the model_save
-    // GPU-staging dtype bug (f64 staging serialized under an f32 header).
-    let file_dtypes: Vec<&[u8]> = {
-        let header_bytes = &data[16..16 + header_size];
-        let needle: &[u8] = b"\"dtype\":\"";
-        let mut out = Vec::new();
-        let mut pos = 0;
-        while pos + needle.len() <= header_bytes.len() {
-            if &header_bytes[pos..pos + needle.len()] == needle {
-                let start = pos + needle.len();
-                if let Some(end) = header_bytes[start..].iter().position(|&b| b == b'"') {
-                    out.push(&header_bytes[start..start + end]);
-                    pos = start + end;
-                    continue;
-                }
-            }
-            pos += 1;
-        }
-        out
-    };
-
-    // Pre-pass: validate EVERY entry's dtype before copying ANY bytes, so a
-    // mismatch can never leave the model partially overwritten (tensors
-    // 0..i-1 already mutated when the guard fires at i).
-    for i in 0..tensors.len as usize {
-        let tensor_ptr = unsafe { *tensors.data.add(i) };
-        let tensor = NslTensor::from_ptr(tensor_ptr);
-        if let Some(file_dtype) = file_dtypes.get(i) {
-            let live_dtype = checkpoint_dtype_name(tensor.dtype);
-            if *file_dtype != live_dtype.as_bytes() {
-                crate::nsl_log!(ERROR, "nsl", "nsl: model_load: dtype mismatch for tensor #{}: file has {}, \
-                     model expects {} — raw byte copy would corrupt this tensor and \
-                     misalign all subsequent ones. Re-save the checkpoint from a \
-                     model whose parameters have the same dtype, or convert the \
-                     model's parameters with `.to(dtype)` before loading.",
-                    i,
-                    String::from_utf8_lossy(file_dtype),
-                    live_dtype,
-                );
-                std::process::abort();
-            }
-        }
-    }
-
-    let mut offset = data_start;
-    for i in 0..tensors.len as usize {
-        let tensor_ptr = unsafe { *tensors.data.add(i) };
-        let tensor = NslTensor::from_ptr(tensor_ptr);
-        let byte_count = (tensor.len as usize) * tensor.element_size();
-        if offset + byte_count > data.len() {
-            crate::nsl_log!(ERROR, "nsl", "nsl: model_load: unexpected end of file at offset {} (tensor {}, need {} bytes, have {})",
-                offset, i, byte_count, data.len() - offset
-            );
-            std::process::abort();
-        }
-
-        if tensor.device > 0 {
-            // GPU tensor: load data into CPU staging buffer, then memcpy to device
-            #[cfg(feature = "cuda")]
-            {
-                let staging = crate::memory::checked_alloc(byte_count);
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        data[offset..].as_ptr(),
-                        staging,
-                        byte_count,
-                    );
-                }
-                crate::cuda::inner::memcpy_htod(
-                    tensor.data,
-                    staging as *const std::ffi::c_void,
-                    byte_count,
-                );
-                unsafe { crate::memory::checked_free(staging, byte_count); }
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                crate::nsl_log!(ERROR, "nsl", "nsl: model_load: tensor {} is on GPU but CUDA not compiled", i);
-                std::process::abort();
-            }
-        } else {
-            #[cfg(target_endian = "little")]
-            {
-                // Fast path: bulk copy on little-endian hardware (x86, ARM, etc.)
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        data[offset..].as_ptr(),
-                        tensor.data as *mut u8,
-                        byte_count,
-                    );
-                }
-            }
-
-            #[cfg(not(target_endian = "little"))]
-            {
-                let elem_size = tensor.element_size();
-                for j in 0..tensor.len as usize {
-                    let start = offset + j * elem_size;
-                    if tensor.dtype == 1 {
-                        let val = f32::from_le_bytes(
-                            data[start..start + 4]
-                                .try_into()
-                                .unwrap_or_else(|_| std::process::abort()),
-                        );
-                        unsafe { *tensor.data_f32().add(j) = val; }
-                    } else {
-                        let val = f64::from_le_bytes(
-                            data[start..start + 8]
-                                .try_into()
-                                .unwrap_or_else(|_| std::process::abort()),
-                        );
-                        unsafe { *tensor.data_f64().add(j) = val; }
-                    }
-                }
-            }
-        }
-
-        offset += byte_count;
-    }
+    model_load_impl(path, tensors, Some(NslList::from_ptr(param_names_ptr)));
 }
 
 // ---------------------------------------------------------------------------
@@ -449,6 +599,89 @@ fn model_file_sig(path: &str) -> u64 {
     h
 }
 
+/// Whether a sidecar header names `model_path` as the model it was saved with.
+pub(crate) enum Pairing {
+    Paired,
+    Mismatch(String),
+    /// Neither `model_sha256` nor `model_sig`: not a sidecar this runtime wrote.
+    NoRecord,
+}
+
+/// The pairing check: the whole-file SHA-256 when the sidecar has one
+/// (`model_sha256`, written since 2026-10-06), else the legacy sampled
+/// `model_sig`, which cannot see a same-size change in the middle of θ.
+pub(crate) fn sidecar_pairs_with(header: &[u8], model_path: &str) -> Pairing {
+    if let Some(saved) = scan_header_string(header, b"\"model_sha256\":") {
+        let saved = String::from_utf8_lossy(&saved).into_owned();
+        return match file_sha256_hex(model_path) {
+            Ok(live) if live == saved => Pairing::Paired,
+            Ok(live) => Pairing::Mismatch(format!("model sha256 {live} vs sidecar {saved}")),
+            Err(e) => Pairing::Mismatch(format!("cannot hash the model: {e}")),
+        };
+    }
+    match scan_header_numbers(header, b"\"model_sig\":").first() {
+        Some(&saved) => {
+            let live = model_file_sig(model_path);
+            if live == saved {
+                Pairing::Paired
+            } else {
+                Pairing::Mismatch(format!("model_sig {live} vs sidecar {saved}"))
+            }
+        }
+        None => Pairing::NoRecord,
+    }
+}
+
+/// The JSON header of a sidecar file, if `path` is a readable NSLO sidecar
+/// whose declared header fits the file.
+fn read_sidecar_header(path: &str) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut fixed = [0u8; 16];
+    f.read_exact(&mut fixed).ok()?;
+    if &fixed[..4] != OPTIM_MAGIC {
+        return None;
+    }
+    let header_size = u64::from_le_bytes(fixed[8..16].try_into().ok()?);
+    let file_len = f.metadata().ok()?.len();
+    if header_size > file_len.saturating_sub(16) {
+        return None;
+    }
+    let mut header = vec![0u8; header_size as usize];
+    f.read_exact(&mut header).ok()?;
+    Some(header)
+}
+
+/// Finish a save that was interrupted between its two commit renames.
+///
+/// `nsl_train_checkpoint_save` writes and fsyncs both temporaries, then
+/// renames the model and the sidecar in that order, so a crash between them
+/// leaves the NEW model beside the OLD sidecar, with the new sidecar complete
+/// as `<path>.optim.tmp`. If the current pair does not match and the
+/// temporary does, the commit is completed here and the resume continues from
+/// the new generation. A temporary that does not pair is left alone, and a
+/// stale one beside a matching pair is ignored.
+fn recover_interrupted_commit(path: &str, optim_path: &str) {
+    let optim_tmp = format!("{optim_path}.tmp");
+    if !std::path::Path::new(&optim_tmp).exists() {
+        return;
+    }
+    if let Some(h) = read_sidecar_header(optim_path)
+        && matches!(sidecar_pairs_with(&h, path), Pairing::Paired)
+    {
+        return;
+    }
+    if let Some(h) = read_sidecar_header(&optim_tmp)
+        && matches!(sidecar_pairs_with(&h, path), Pairing::Paired)
+    {
+        crate::nsl_log!(WARN, "checkpoint",
+            "[checkpoint] completing an interrupted save: '{optim_tmp}' pairs with \
+             '{path}' and '{optim_path}' does not -- renaming it into place"
+        );
+        commit_rename(&optim_tmp, optim_path, "train_checkpoint_load");
+    }
+}
+
 /// In-order needle scan of the sidecar header for one numeric field — the
 /// same no-JSON-parser style as `nsl_model_load`'s dtype guard. Returns the
 /// raw digit strings in header order.
@@ -494,23 +727,20 @@ fn scan_header_string(header: &[u8], needle: &[u8]) -> Option<Vec<u8>> {
     Some(body[..end].to_vec())
 }
 
-/// In-order scan of `"shape":[...]` bodies (the bracketed text, verbatim).
-fn scan_header_shapes(header: &[u8]) -> Vec<String> {
-    let needle: &[u8] = b"\"shape\":[";
-    let mut out = Vec::new();
-    let mut pos = 0;
-    while pos + needle.len() <= header.len() {
-        if &header[pos..pos + needle.len()] == needle {
-            let start = pos + needle.len();
-            if let Some(end) = header[start..].iter().position(|&b| b == b']') {
-                out.push(String::from_utf8_lossy(&header[start..start + end]).to_string());
-                pos = start + end;
-                continue;
-            }
-        }
-        pos += 1;
-    }
-    out
+/// The sidecar's `params` table. The header as a whole is not parsed as
+/// JSON (its `env`/`exec` records are written verbatim), so this reads only
+/// the array after the last `"params":`, which the save writes last.
+fn sidecar_param_entries(header: &[u8]) -> Result<Vec<NslmEntry>, String> {
+    let needle: &[u8] = b"\"params\":";
+    let pos = header
+        .windows(needle.len())
+        .rposition(|w| w == needle)
+        .ok_or("the sidecar header has no params table")?;
+    serde_json::Deserializer::from_slice(&header[pos + needle.len()..])
+        .into_iter::<Vec<NslmEntry>>()
+        .next()
+        .ok_or("the sidecar's params table is empty")?
+        .map_err(|e| format!("the sidecar's params table is malformed: {e}"))
 }
 
 /// Read one moment tensor's raw f32 bytes into `buf` (device tensors are
@@ -567,9 +797,11 @@ fn read_moment_bytes(tensor_ptr: i64, which: &str, idx: usize, buf: &mut Vec<u8>
 /// Save the FULL training state: θ as a normal `.nslm` (via
 /// [`nsl_model_save`], so the streamed/bf16-sr materialization logic is
 /// shared) plus a `<path>.optim` sidecar holding the AdamW moments and the
-/// micro-batch step counter. Both files are written to a `.tmp` and renamed,
-/// so a crash mid-save leaves the previous checkpoint intact — "clean
-/// checkpoint" means the on-disk state is never half-written.
+/// micro-batch step counter. Both files are written to a `.tmp`, fsynced, and
+/// renamed model first: a crash before the first rename leaves the previous
+/// pair intact, and one between the renames leaves the new pair complete,
+/// which `recover_interrupted_commit` finishes at the next load. No crash
+/// leaves a half-written file or a mixed pair that loads.
 ///
 /// The sidecar extends the checkpoint WITHOUT touching `.nslm` version 1:
 /// `nsl_model_load` hard-aborts on any unknown version, so a v2 container
@@ -578,7 +810,9 @@ fn read_moment_bytes(tensor_ptr: i64, which: &str, idx: usize, buf: &mut Vec<u8>
 ///
 /// Sidecar format (mirrors `.nslm` deliberately): magic `NSLO`, u32 LE
 /// version, u64 LE header size, JSON header
-/// `{"step_count":N,"model_sig":S,"resume":{…},"params":[{name,shape,dtype,offset,nbytes}...]}`
+/// `{"step_count":N,"model_sig":S,"model_sha256":"<hex>","resume":{…},"params":[{name,shape,dtype,offset,nbytes}...]}`
+/// (`model_sha256` pairs the sidecar with the exact model file; `model_sig`,
+/// the older sampled signature, is still written for older readers)
 /// (all m entries in param order, then all v entries), zero-pad to 64, raw
 /// little-endian f32 data back to back.
 ///
@@ -634,7 +868,17 @@ pub extern "C" fn nsl_train_checkpoint_save(
         param_names_ptr,
         param_tensors_ptr,
     );
+    // The legacy sampled signature (first/last MiB) stays for older readers;
+    // the pairing check uses the whole-file hash, which also sees a same-size
+    // change in the middle of θ.
     let sig = model_file_sig(&model_tmp);
+    let model_sha = match file_sha256_hex(&model_tmp) {
+        Ok(h) => h,
+        Err(e) => {
+            crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_save: hashing '{model_tmp}': {e}");
+            std::process::abort();
+        }
+    };
 
     // Sidecar: header first (metadata reads need no residency), then data.
     let mut params_json = Vec::new();
@@ -700,12 +944,12 @@ pub extern "C" fn nsl_train_checkpoint_save(
         }
     }
     let resume = format!(
-        r#""resume":{{"train_epoch":{train_epoch},"has_loader":{hl},"loader_epoch":{loader_epoch},"loader_slot":{loader_slot},"loader_id":{loader_id},"rng_seed":"{seed_hex}","rng_pos_hi":{hi},"rng_pos_lo":{lo},"gpu_dropout_ctr":{ctr},"global_seed":{gseed},"global_seed_set":{gset},"exec":"{exec_fp}","train_cfg":"{train_cfg}","env":"{env_rec}"}}"#,
+        r#""resume":{{"train_epoch":{train_epoch},"has_loader":{hl},"loader_epoch":{loader_epoch},"loader_slot":{loader_slot},"loader_id":{loader_id},"rng_seed":"{seed_hex}","rng_pos_hi":{hi},"rng_pos_lo":{lo},"gpu_dropout_ctr":{ctr},"bf16_sr_ctr":{srctr},"global_seed":{gseed},"global_seed_set":{gset},"exec":"{exec_fp}","train_cfg":"{train_cfg}","env":"{env_rec}"}}"#,
         hl = (dl_ptr != 0) as u64,
         // The compile-flag record installed by main(). Empty for a program
         // built before the fingerprint existed; the loader treats empty as
         // "unknown" and skips the comparison rather than refusing.
-        exec_fp = crate::exec_fingerprint::exec_fingerprint(),
+        exec_fp = crate::exec_fingerprint::effective_exec_fingerprint(),
         // The resolved train/optimizer/scheduler record installed at
         // train-block entry (item 4). Same tolerance as `exec`: empty for
         // a build predating it; the loader says the check is skipped.
@@ -719,6 +963,11 @@ pub extern "C" fn nsl_train_checkpoint_save(
         hi = (rng.sampling_pos >> 64) as u64,
         lo = rng.sampling_pos as u64,
         ctr = rng.gpu_dropout_ctr,
+        // The bf16 operand-cast stochastic-rounding stream
+        // (`--bf16-rounding sr`): a resume used to restart it at 0 and reuse
+        // the dither windows of the run's first steps (external review
+        // 2026-10-06).
+        srctr = rng.bf16_sr_ctr,
         // The `--seed` SCALAR, which is a live training-RNG input in its own
         // right: SR-BF16's dither is `mix64(seed ^ step*SALT, ...)` and the
         // composed ZeRO-3 slice update reads the same global. Recording only
@@ -729,7 +978,7 @@ pub extern "C" fn nsl_train_checkpoint_save(
         gset = crate::deterministic_ops::explicit_rng_seed().is_some() as u64,
     );
     let header = format!(
-        r#"{{"step_count":{step_count},"model_sig":{sig},{resume},"params":[{}]}}"#,
+        r#"{{"step_count":{step_count},"model_sig":{sig},"model_sha256":"{model_sha}",{resume},"params":[{}]}}"#,
         params_json.join(",")
     );
     let header_bytes = header.as_bytes();
@@ -766,16 +1015,17 @@ pub extern "C" fn nsl_train_checkpoint_save(
             write_or_abort(&mut file, &buf, "write moment data");
         }
     }
+    sync_or_abort(&file, &optim_tmp);
     drop(file);
-    // Both tmps are complete — commit the pair back-to-back.
-    if let Err(e) = std::fs::rename(&model_tmp, path) {
-        crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_save: rename '{model_tmp}' -> '{path}': {e}");
-        std::process::abort();
-    }
-    if let Err(e) = std::fs::rename(&optim_tmp, &optim_path) {
-        crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_save: rename '{optim_tmp}' -> '{optim_path}': {e}");
-        std::process::abort();
-    }
+    // Both tmps are complete and durable — commit the pair, model first,
+    // syncing the directory after EACH rename so they reach the disk in this
+    // order. The only mixed state a crash can then leave is the new model
+    // beside the old sidecar, with the new sidecar complete as `.optim.tmp`;
+    // `recover_interrupted_commit` finishes that commit at the next load
+    // (external review 2026-10-06: the mixed state used to be unrecoverable,
+    // and the previous model was already gone).
+    commit_rename(&model_tmp, path, "train_checkpoint_save");
+    commit_rename(&optim_tmp, &optim_path, "train_checkpoint_save");
     if dl_ptr != 0 {
         crate::nsl_log!(INFO, "checkpoint", 
             "[checkpoint] saved: {path} (+.optim) at micro-batch step \
@@ -812,6 +1062,7 @@ pub extern "C" fn nsl_train_checkpoint_save(
 pub extern "C" fn nsl_train_checkpoint_load(
     path_ptr: i64,
     path_len: i64,
+    param_names_ptr: i64,
     param_tensors_ptr: i64,
     state1_ptr: i64,
     state2_ptr: i64,
@@ -842,6 +1093,14 @@ pub extern "C" fn nsl_train_checkpoint_load(
     // is touched, so a refused resume leaves the freshly-initialized train
     // state fully intact (same doctrine as nsl_model_load's dtype pre-pass).
     let optim_path = format!("{path}.optim");
+    recover_interrupted_commit(path, &optim_path);
+    let param_tensors = NslList::from_ptr(param_tensors_ptr);
+    let param_names = NslList::from_ptr(param_names_ptr);
+    let (model_data, model_layout) = read_validated_nslm(path, param_tensors, Some(param_names))
+        .unwrap_or_else(|e| {
+            crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: {e}");
+            std::process::abort();
+        });
     let data = match std::fs::read(&optim_path) {
         Ok(d) => d,
         Err(e) => {
@@ -874,7 +1133,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
     let header_size = u64::from_le_bytes(
         data[8..16].try_into().unwrap_or_else(|_| std::process::abort()),
     ) as usize;
-    if 16 + header_size > data.len() {
+    if header_size > data.len() - 16 {
         crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: sidecar header overruns the file");
         std::process::abort();
     }
@@ -910,22 +1169,19 @@ pub extern "C" fn nsl_train_checkpoint_load(
     // mixed directory) leaves θ@N beside moments@N−k — same architecture,
     // same counts, silently divergent training. θ changes every optimizer
     // step, so the signature separates the pair reliably.
-    match scan_header_numbers(header_bytes, b"\"model_sig\":").first() {
-        Some(&saved_sig) => {
-            let live_sig = model_file_sig(path);
-            if saved_sig != live_sig {
-                crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: '{optim_path}' was not saved \
-                     with '{path}' (model_sig {live_sig} vs sidecar \
-                     {saved_sig}) — the pair is from different checkpoints \
-                     (crash between commits, or mixed files). Refusing the \
-                     mixed-state resume."
-                );
-                std::process::abort();
-            }
+    match sidecar_pairs_with(header_bytes, path) {
+        Pairing::Paired => {}
+        Pairing::Mismatch(detail) => {
+            crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: '{optim_path}' was not saved \
+                 with '{path}' ({detail}) — the pair is from different \
+                 checkpoints (crash between commits, or mixed files). Refusing \
+                 the mixed-state resume."
+            );
+            std::process::abort();
         }
-        None => {
-            crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: sidecar header has no model_sig \
-                 — not a checkpoint this runtime wrote"
+        Pairing::NoRecord => {
+            crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: sidecar header has neither \
+                 model_sha256 nor model_sig — not a checkpoint this runtime wrote"
             );
             std::process::abort();
         }
@@ -1038,6 +1294,12 @@ pub extern "C" fn nsl_train_checkpoint_load(
                 sampling_seed,
                 sampling_pos: ((hi as u128) << 64) | (lo as u128),
                 gpu_dropout_ctr: num(b"\"gpu_dropout_ctr\":", "gpu_dropout_ctr"),
+                // Absent in a sidecar written before it was recorded: the
+                // stream then restarts at 0, as every resume used to.
+                bf16_sr_ctr: scan_header_numbers(header_bytes, b"\"bf16_sr_ctr\":")
+                    .first()
+                    .copied()
+                    .unwrap_or(0),
             },
         })
     };
@@ -1083,7 +1345,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
         // Refusing then would make every pre-existing checkpoint unresumable
         // to enforce a property those builds never claimed, so it warns once
         // and continues.
-        let live_exec = crate::exec_fingerprint::exec_fingerprint();
+        let live_exec = crate::exec_fingerprint::effective_exec_fingerprint();
         if r.exec.is_empty() || live_exec.is_empty() {
             let which = if r.exec.is_empty() { "checkpoint" } else { "this run" };
             crate::nsl_log!(WARN, "nsl", "nsl: train_checkpoint_load: no execution fingerprint in {which} \
@@ -1183,42 +1445,38 @@ pub extern "C" fn nsl_train_checkpoint_load(
     let m_list = NslList::from_ptr(state1_ptr);
     let v_list = NslList::from_ptr(state2_ptr);
     let expected = (m_list.len + v_list.len) as usize;
-    let saved = {
-        let needle = b"\"name\":";
-        header_bytes
-            .windows(needle.len())
-            .filter(|w| *w == needle)
-            .count()
-    };
-    if saved != expected {
-        // A hard abort, not the model loader's warning: mismatched moments
-        // positionally restored into the wrong buffers is a silent training
-        // corruption, and the caller explicitly asked for a full resume.
-        crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: sidecar has {saved} moment tensors, \
+    let saved = sidecar_param_entries(header_bytes).unwrap_or_else(|e| {
+        crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: '{optim_path}': {e}");
+        std::process::abort();
+    });
+    if saved.len() != expected {
+        // A hard abort, not a warning: mismatched moments positionally
+        // restored into the wrong buffers is a silent training corruption,
+        // and the caller explicitly asked for a full resume.
+        crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: sidecar has {} moment tensors, \
              live train state expects {expected} — model/optimizer shape drift \
-             between save and resume"
+             between save and resume",
+            saved.len()
         );
         std::process::abort();
     }
 
-    // Per-entry validation: the count check alone admits every same-count
-    // drift (hidden-size change, transposed layer), which the walk below
-    // would restore as garbage read from wrong offsets. Compare each saved
-    // entry's nbytes AND shape against the live tensor, in order, before a
-    // single byte moves.
-    let saved_nbytes = scan_header_numbers(header_bytes, b"\"nbytes\":");
-    let saved_shapes = scan_header_shapes(header_bytes);
-    if saved_nbytes.len() != expected || saved_shapes.len() != expected {
-        crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: sidecar header lists {} nbytes / {} \
-             shape entries for {expected} tensors — malformed header",
-            saved_nbytes.len(),
-            saved_shapes.len()
-        );
-        std::process::abort();
-    }
+    // Per-entry validation, in order, before a single byte moves: each saved
+    // entry names the live parameter its moment belongs to, is f32 like the
+    // live moment, has its shape and size, and the entries tile the data
+    // section exactly. The count check alone admits every same-count drift
+    // (hidden-size change, transposed or reordered layer), which the copy
+    // below would restore as garbage read from wrong offsets; and a
+    // truncated sidecar used to be found mid-copy, after θ was overwritten.
+    let data_start = {
+        let total_header = 16 + header_size;
+        total_header + (64 - total_header % 64) % 64
+    };
+    let mut next = 0u64;
     let mut entry = 0usize;
     for (which, list) in [("m", &m_list), ("v", &v_list)] {
         for i in 0..list.len as usize {
+            let e = &saved[entry];
             let tensor_ptr = unsafe { *list.data.add(i) };
             if tensor_ptr == 0 {
                 crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: {which}[{i}] is a null \
@@ -1227,107 +1485,85 @@ pub extern "C" fn nsl_train_checkpoint_load(
                 std::process::abort();
             }
             let tensor = NslTensor::from_ptr(tensor_ptr);
-            let live_bytes = (tensor.len as u64) * (tensor.element_size() as u64);
-            let live_shape = {
-                let s: Vec<i64> = (0..tensor.ndim as usize)
-                    .map(|d| unsafe { *tensor.shape.add(d) })
-                    .collect();
-                let rendered = format!("{s:?}");
-                rendered[1..rendered.len() - 1].to_string()
-            };
-            if saved_nbytes[entry] != live_bytes || saved_shapes[entry] != live_shape {
-                crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: {which}[{i}] drifted between \
-                     save and resume: sidecar has shape [{}] ({} bytes), live \
-                     tensor is [{}] ({} bytes) — a positional restore would \
-                     read from the wrong offsets. Re-save from the current \
-                     model configuration.",
-                    saved_shapes[entry], saved_nbytes[entry], live_shape, live_bytes
+            let live_name = live_param_name(param_names, i);
+            let saved_name = e.name.strip_prefix(which).and_then(|n| n.strip_prefix(':'));
+            if !saved_name.is_some_and(|n| param_names_match(n, &live_name)) {
+                crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: sidecar entry #{entry} is '{}' \
+                     but the live train state has '{which}:{live_name}' there — the \
+                     parameters were added, removed or reordered since the save",
+                    e.name
                 );
                 std::process::abort();
             }
+            if tensor.dtype != DTYPE_F32 || e.dtype != "f32" {
+                crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: {which}[{i}] is {} in the \
+                     sidecar and {} live — only plain f32 moments are restorable",
+                    e.dtype,
+                    checkpoint_dtype_name(tensor.dtype)
+                );
+                std::process::abort();
+            }
+            let shape = live_shape(tensor);
+            let live_bytes = (tensor.len as u64) * (tensor.element_size() as u64);
+            if e.nbytes != live_bytes || e.shape != shape {
+                crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: {which}[{i}] drifted between \
+                     save and resume: sidecar has shape {:?} ({} bytes), live \
+                     tensor is {shape:?} ({live_bytes} bytes) — a positional restore would \
+                     read from the wrong offsets. Re-save from the current \
+                     model configuration.",
+                    e.shape, e.nbytes
+                );
+                std::process::abort();
+            }
+            if e.offset != next {
+                crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: sidecar entry #{entry} starts at \
+                     data offset {} but the previous one ends at {next} — malformed header",
+                    e.offset
+                );
+                std::process::abort();
+            }
+            next += e.nbytes;
             entry += 1;
         }
     }
-
-    // All checks passed — NOW mutate: θ first, then moments.
-    nsl_model_load(path_ptr, path_len, param_tensors_ptr);
-
-    let total_header = 16 + header_size;
-    let padding = (64 - (total_header % 64)) % 64;
-    let mut offset = total_header + padding;
-    for (which, list) in [("m", &m_list), ("v", &v_list)] {
-        for i in 0..list.len as usize {
-            let tensor_ptr = unsafe { *list.data.add(i) };
-            if tensor_ptr == 0 {
-                crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: {which}[{i}] is a null moment \
-                     slot — refused composition"
-                );
-                std::process::abort();
-            }
-            let tensor = NslTensor::from_ptr(tensor_ptr);
-            if tensor.dtype != 1 {
-                crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: {which}[{i}] has dtype {} — \
-                     only plain f32 moments are restorable",
-                    tensor.dtype
-                );
-                std::process::abort();
-            }
-            let byte_count = (tensor.len as usize) * tensor.element_size();
-            if offset + byte_count > data.len() {
-                crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: sidecar ended early at {which}[{i}] \
-                     (need {byte_count} bytes at offset {offset}, have {})",
-                    data.len().saturating_sub(offset)
-                );
-                std::process::abort();
-            }
-            if tensor.device > 0 {
-                #[cfg(feature = "cuda")]
-                {
-                    let staging = crate::memory::checked_alloc(byte_count);
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            data[offset..].as_ptr(),
-                            staging,
-                            byte_count,
-                        );
-                    }
-                    crate::cuda::inner::memcpy_htod(
-                        tensor.data,
-                        staging as *const std::ffi::c_void,
-                        byte_count,
-                    );
-                    unsafe {
-                        crate::memory::checked_free(staging, byte_count);
-                    }
-                }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: {which}[{i}] is on GPU but \
-                         CUDA not compiled"
-                    );
-                    std::process::abort();
-                }
-            } else {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        data[offset..].as_ptr(),
-                        tensor.data as *mut u8,
-                        byte_count,
-                    );
-                }
-            }
-            offset += byte_count;
-        }
-    }
-    // Full-consumption check: the per-entry validation above makes this
-    // unreachable in practice, but a walk that ends short of the data
-    // section would mean the header lied — refuse rather than trust it.
-    if offset != data.len() {
-        crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: sidecar has {} unconsumed trailing \
-             bytes after the last moment — header/data drift",
-            data.len().saturating_sub(offset)
+    if (data.len() as u64).checked_sub(data_start as u64) != Some(next) {
+        crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: '{optim_path}' holds {} data bytes but \
+             its header describes {next} — truncated or padded sidecar",
+            data.len().saturating_sub(data_start)
         );
         std::process::abort();
+    }
+
+    // All checks passed — NOW mutate: θ first, then moments.
+    copy_nslm_into(&model_data, &model_layout, param_tensors);
+    for (k, e) in saved.iter().enumerate() {
+        let (list, i) = if k < m_list.len as usize {
+            (&m_list, k)
+        } else {
+            (&v_list, k - m_list.len as usize)
+        };
+        let tensor = NslTensor::from_ptr(unsafe { *list.data.add(i) });
+        let start = data_start + e.offset as usize;
+        let src = &data[start..start + e.nbytes as usize];
+        if tensor.device > 0 {
+            #[cfg(feature = "cuda")]
+            crate::cuda::inner::memcpy_htod(
+                tensor.data,
+                src.as_ptr() as *const std::ffi::c_void,
+                src.len(),
+            );
+            #[cfg(not(feature = "cuda"))]
+            {
+                crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: moment #{k} is on GPU but \
+                     CUDA not compiled"
+                );
+                std::process::abort();
+            }
+        } else {
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.as_ptr(), tensor.data as *mut u8, src.len());
+            }
+        }
     }
     // Item 8: apply the resume block LAST — after every byte of θ and m/v is
     // in place, so an abort in the walk above cannot leave the loader armed
@@ -1416,5 +1652,173 @@ fn check_tensor_contiguous(tensor: &NslTensor, idx: usize) {
             std::process::abort();
         }
         expected_stride *= unsafe { *tensor.shape.add(d) };
+    }
+}
+
+#[cfg(test)]
+mod pairing_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("nsl_ckpt_pairing_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// An NSLO file: magic, 4 reserved bytes, the header length, the header.
+    fn sidecar(header: &str) -> Vec<u8> {
+        let mut v = OPTIM_MAGIC.to_vec();
+        v.extend_from_slice(&[0u8; 4]);
+        v.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        v.extend_from_slice(header.as_bytes());
+        v
+    }
+
+    fn sha_header(model: &std::path::Path) -> String {
+        format!("{{\"model_sha256\":\"{}\"}}", file_sha256_hex(model.to_str().unwrap()).unwrap())
+    }
+
+    #[test]
+    fn file_sha256_matches_the_standard_vector() {
+        let d = scratch("vector");
+        let p = d.join("abc");
+        std::fs::write(&p, b"abc").unwrap();
+        assert_eq!(
+            file_sha256_hex(p.to_str().unwrap()).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn pairing_prefers_the_hash_and_falls_back_to_the_sampled_sig() {
+        let d = scratch("pairs");
+        let (m, other) = (d.join("m.nslm"), d.join("o.nslm"));
+        std::fs::write(&m, b"model bytes").unwrap();
+        std::fs::write(&other, b"model bytez").unwrap();
+        let ms = m.to_str().unwrap();
+        let h = sha_header(&m);
+        assert!(matches!(sidecar_pairs_with(h.as_bytes(), ms), Pairing::Paired));
+        assert!(matches!(sidecar_pairs_with(h.as_bytes(), other.to_str().unwrap()), Pairing::Mismatch(_)));
+        // A hash that disagrees wins over a sampled sig that agrees: the sig
+        // is only consulted for sidecars written before the hash existed.
+        let both = format!("{{\"model_sig\":{},\"model_sha256\":\"{}\"}}", model_file_sig(ms), "0".repeat(64));
+        assert!(matches!(sidecar_pairs_with(both.as_bytes(), ms), Pairing::Mismatch(_)));
+        let legacy = format!("{{\"model_sig\":{}}}", model_file_sig(ms));
+        assert!(matches!(sidecar_pairs_with(legacy.as_bytes(), ms), Pairing::Paired));
+        assert!(matches!(sidecar_pairs_with(b"{}", ms), Pairing::NoRecord));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_sidecar_header_longer_than_the_file_is_not_read() {
+        let d = scratch("short");
+        let p = d.join("x.optim");
+        let mut bytes = sidecar("{}");
+        bytes[8..16].copy_from_slice(&(1u64 << 40).to_le_bytes());
+        std::fs::write(&p, &bytes).unwrap();
+        assert!(read_sidecar_header(p.to_str().unwrap()).is_none());
+        std::fs::write(&p, sidecar("{\"k\":1}")).unwrap();
+        assert_eq!(read_sidecar_header(p.to_str().unwrap()).as_deref(), Some(&b"{\"k\":1}"[..]));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// The three states a `.optim.tmp` can be found in at load time.
+    #[test]
+    fn an_interrupted_commit_is_completed_only_when_the_temporary_pairs() {
+        let d = scratch("recover");
+        let (m, opt, tmp) = (d.join("m.nslm"), d.join("m.nslm.optim"), d.join("m.nslm.optim.tmp"));
+        let (ms, os) = (m.to_str().unwrap().to_owned(), opt.to_str().unwrap().to_owned());
+        std::fs::write(&m, b"generation 2").unwrap();
+        let stale = sidecar("{\"model_sha256\":\"00\"}");
+        let fresh = sidecar(&sha_header(&m));
+
+        // New model, old sidecar, new sidecar as the temporary: completed.
+        std::fs::write(&opt, &stale).unwrap();
+        std::fs::write(&tmp, &fresh).unwrap();
+        recover_interrupted_commit(&ms, &os);
+        assert_eq!(std::fs::read(&opt).unwrap(), fresh);
+        assert!(!tmp.exists());
+
+        // A leftover temporary beside a pair that already matches: ignored.
+        std::fs::write(&tmp, &stale).unwrap();
+        recover_interrupted_commit(&ms, &os);
+        assert_eq!(std::fs::read(&opt).unwrap(), fresh);
+        assert_eq!(std::fs::read(&tmp).unwrap(), stale);
+
+        // Neither pairs: nothing is moved, and the load's own check refuses.
+        std::fs::write(&opt, &stale).unwrap();
+        recover_interrupted_commit(&ms, &os);
+        assert_eq!(std::fs::read(&opt).unwrap(), stale);
+        assert!(tmp.exists());
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    /// An `.nslm` image with `header` and `data_len` data bytes.
+    fn nslm(header: &str, data_len: usize) -> Vec<u8> {
+        let mut v = MAGIC.to_vec();
+        v.extend_from_slice(&VERSION.to_le_bytes());
+        v.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        v.extend_from_slice(header.as_bytes());
+        v.resize(v.len() + (64 - v.len() % 64) % 64, 0);
+        v.resize(v.len() + data_len, 7);
+        v
+    }
+
+    fn entry(name: &str, offset: u64, nbytes: u64) -> String {
+        format!(r#"{{"name":"{name}","shape":[{}],"dtype":"f32","offset":{offset},"nbytes":{nbytes}}}"#, nbytes / 4)
+    }
+
+    #[test]
+    fn a_tiled_data_section_parses() {
+        let h = format!(r#"{{"params":[{},{}]}}"#, entry("a", 0, 8), entry("b", 8, 4));
+        let layout = parse_nslm(&nslm(&h, 12)).unwrap();
+        assert_eq!(layout.entries.len(), 2);
+        assert_eq!(layout.data_start % 64, 0);
+    }
+
+    #[test]
+    fn gaps_overlaps_and_trailing_bytes_are_refused() {
+        let gap = format!(r#"{{"params":[{},{}]}}"#, entry("a", 0, 8), entry("b", 12, 4));
+        assert!(parse_nslm(&nslm(&gap, 16)).unwrap_err().contains("starts at data offset 12"));
+        let overlap = format!(r#"{{"params":[{},{}]}}"#, entry("a", 0, 8), entry("b", 4, 4));
+        assert!(parse_nslm(&nslm(&overlap, 12)).unwrap_err().contains("starts at data offset 4"));
+        let one = format!(r#"{{"params":[{}]}}"#, entry("a", 0, 8));
+        assert!(parse_nslm(&nslm(&one, 12)).unwrap_err().contains("describes 8 data bytes"));
+        assert!(parse_nslm(&nslm(&one, 4)).unwrap_err().contains("describes 8 data bytes"));
+        let huge = format!(r#"{{"params":[{}]}}"#, entry("a", 0, u64::MAX));
+        assert!(parse_nslm(&nslm(&huge, 4)).is_err());
+        assert!(parse_nslm(&nslm(r#"{"params":[{"name":"a"}]}"#, 0)).unwrap_err().contains("not a valid parameter table"));
+    }
+
+    #[test]
+    fn param_names_match_across_the_two_naming_schemes() {
+        assert_eq!(canonical_param_name("m.blocks.0.attn.wq"), "m.blocks[0].attn.wq");
+        assert_eq!(canonical_param_name("layers.12"), "layers[12]");
+        assert!(param_names_match("blocks[0].w", "blocks[0].w"));
+        assert!(param_names_match("blocks.0.w", "blocks[0].w"));
+        assert!(param_names_match("m.blocks.0.w", "blocks[0].w"));
+        assert!(!param_names_match("m.blocks.1.w", "blocks[0].w"));
+        assert!(!param_names_match("a", "b"));
+        // Only the FILE side may carry the extra variable segment.
+        assert!(!param_names_match("w", "m.w"));
+    }
+
+    #[test]
+    fn the_sidecar_params_table_is_read_past_verbatim_records() {
+        let h = format!(
+            r#"{{"step_count":3,"resume":{{"env":"A=b c"}},"params":[{},{}]}}"#,
+            entry("m:w", 0, 4),
+            entry("v:w", 4, 4)
+        );
+        let e = sidecar_param_entries(h.as_bytes()).unwrap();
+        assert_eq!(e.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["m:w", "v:w"]);
+        assert!(sidecar_param_entries(br#"{"step_count":3}"#).is_err());
     }
 }

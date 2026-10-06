@@ -22,6 +22,10 @@ nsl-abi.workspace = true
 # The NSL_* registry: the runtime-read behavior tier is checkpoint identity
 # (`env_record.rs`, roadmap A5). Dependency-free, like nsl-abi.
 nsl-env.workspace = true
+# Checkpoint pairing: the `.optim` sidecar records a SHA-256 of the whole
+# `.nslm` it was saved with (it sampled the first and last MiB). Already in
+# the lockfile via nsl-cli / nsl-codegen.
+sha2 = "0.11"
 # The logging front door (`nsl_log!`, the byte-identical stderr
 # subscriber); this crate adds the `NSL_EVENTS` mirror on top (`log.rs`,
 # roadmap A3). tracing-only.

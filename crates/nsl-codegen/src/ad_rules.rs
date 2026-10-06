@@ -1128,7 +1128,10 @@ pub fn saved_for_backward(op: &PrimalOp) -> SavedRequirement {
 pub enum AdCertStatus {
     /// Certified by these certificates in `source_ad_rule_cert.rs`: raw
     /// gradients of a source-level grad block against an f64
-    /// central-difference oracle, under both source AD and the tape.
+    /// central-difference oracle, under both source AD and the tape. An op
+    /// that exists only in a GPU `train` block is certified instead by a
+    /// compiled SGD step in `fused_loss_gradient_cert_gpu.rs` (that file's
+    /// `GPU_CERTS` list).
     Certified(&'static [&'static str]),
     /// No gradient flows through it (leaves, comparisons, markers).
     NotDifferentiable(&'static str),
@@ -1216,9 +1219,13 @@ pub fn ad_cert_status(op: &PrimalOp) -> AdCertStatus {
             Certified(&["sdpa", "sdpa_causal", "sdpa_scale"])
         }
         PrimalOp::FlashAttentionBackwardExtract { .. } => AdjointOnly("the SDPA adjoint"),
-        PrimalOp::ScaledDotProductAttentionPacked => Uncertified(
-            "the kernels are held to an f64 oracle (nsl-codegen/tests/sdpa_fused_packed_gpu_parity.rs); the source-AD wiring is not",
-        ),
+        PrimalOp::ScaledDotProductAttentionPacked => Certified(&[
+            "sdpa_packed",
+            "sdpa_packed_docs",
+            "sdpa_packed_batch",
+            "sdpa_packed_scale",
+            "sdpa_packed_step",
+        ]),
         PrimalOp::FlashAttentionBackwardExtractPacked { .. } => {
             AdjointOnly("the packed SDPA adjoint")
         }
@@ -1237,13 +1244,9 @@ pub fn ad_cert_status(op: &PrimalOp) -> AdCertStatus {
             "sm>=80 only; the unfused LoRA path is held to an f64 reference by lora_adapter_training_gate.rs",
         ),
         PrimalOp::FusedIa3Matmul { .. } => Uncertified("forward fixtures only"),
-        PrimalOp::FusedLinearCe { .. } => Uncertified(
-            "the kernels are held to an f64 reference (nsl-codegen/tests/common/fused_lce_cpu_f64.rs); the source-AD wiring is not",
-        ),
+        PrimalOp::FusedLinearCe { .. } => Certified(&["fused_linear_ce_step"]),
         PrimalOp::FusedLinearCeBackwardExtract { .. } => AdjointOnly("the FusedLinearCe adjoint"),
-        PrimalOp::FusedKlCe { .. } => Uncertified(
-            "the kernels are held to an f64 reference (nsl-codegen/tests/cpkd_fused_kl_ce_numerical.rs); the source-AD wiring is not",
-        ),
+        PrimalOp::FusedKlCe { .. } => Certified(&["fused_kl_ce_step"]),
         PrimalOp::FusedKlCeBackwardExtract { .. } => AdjointOnly("the FusedKlCe adjoint"),
         PrimalOp::Dropout { .. } => Uncertified(
             "held to tape parity (dropout_backward_parity_gate.rs); a random mask has no finite-difference oracle",

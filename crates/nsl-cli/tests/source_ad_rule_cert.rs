@@ -419,6 +419,42 @@ fn sdpa_ref(q: &Arr, k: &Arr, v: &Arr, scale: f64, causal: bool) -> Arr {
     }
 }
 
+/// Packed attention over [B, H, S, D]: causal within each document, where
+/// `seg` [B, S] names the document of every position (PCA Stage C). Row i
+/// attends to j <= i with seg[b][j] == seg[b][i].
+fn sdpa_packed_ref(q: &Arr, k: &Arr, v: &Arr, scale: f64, seg: &Arr) -> Arr {
+    let (bsz, h, s, d) = (q.shape[0], q.shape[1], q.shape[2], q.shape[3]);
+    let mut out = vec![0.0; q.data.len()];
+    for b in 0..bsz {
+        let doc = |i: usize| seg.data[b * s + i];
+        for hh in 0..h {
+            let base = (b * h + hh) * s * d;
+            for i in 0..s {
+                let scores: Vec<f64> = (0..s)
+                    .map(|j| {
+                        if j > i || doc(j) != doc(i) {
+                            f64::NEG_INFINITY
+                        } else {
+                            (0..d)
+                                .map(|t| q.data[base + i * d + t] * k.data[base + j * d + t])
+                                .sum::<f64>()
+                                * scale
+                        }
+                    })
+                    .collect();
+                let p = softmax_vec(&scores);
+                for t in 0..d {
+                    out[base + i * d + t] = (0..s).map(|j| p[j] * v.data[base + j * d + t]).sum();
+                }
+            }
+        }
+    }
+    Arr {
+        shape: q.shape.clone(),
+        data: out,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The certificates
 // ---------------------------------------------------------------------------
@@ -672,6 +708,37 @@ fn certs() -> Vec<Cert> {
         Cert { name: "sdpa_scale", inputs: vec![inp("q", &[1, 2, 4, 8]), inp("k", &[1, 2, 4, 8]), inp("v", &[1, 2, 4, 8])],
             expr: "scaled_dot_product_attention(q, k, v, 0.9, false)", wrt: &["q", "k", "v"], out_shape: &[1, 2, 4, 8],
             oracle: oracle!(|e| sdpa_ref(get(e, "q"), get(e, "k"), get(e, "v"), 0.9, false)), known: &[], prelude: "" },
+        // Packed (segment-masked) attention: causal within each document.
+        // On the CPU the forward is the decomposed chain under the mask
+        // derived from `seg` and the backward is the segment-aware flash
+        // reference, so these certify the source-AD wiring and those CPU
+        // paths, not the GPU kernels (held to an f64 oracle by
+        // nsl-codegen/tests/sdpa_fused_packed_gpu_parity.rs).
+        Cert { name: "sdpa_packed",
+            inputs: vec![inp("q", &[1, 2, 6, 8]), inp("k", &[1, 2, 6, 8]), inp("v", &[1, 2, 6, 8]),
+                idx("seg", &[1, 6], "tensor_cat([zeros([1, 3]), ones([1, 3])], 1)")],
+            expr: "scaled_dot_product_attention_packed(q, k, v, 0.35355339059327373, seg)", wrt: &["q", "k", "v"], out_shape: &[1, 2, 6, 8],
+            oracle: oracle!(|e| sdpa_packed_ref(get(e, "q"), get(e, "k"), get(e, "v"), 0.35355339059327373, get(e, "seg"))), known: &[], prelude: "" },
+        // Three uneven documents, one of length 1 (a row that sees only itself).
+        Cert { name: "sdpa_packed_docs",
+            inputs: vec![inp("q", &[1, 2, 6, 8]), inp("k", &[1, 2, 6, 8]), inp("v", &[1, 2, 6, 8]),
+                idx("seg", &[1, 6], "tensor_cat([zeros([1, 2]), ones([1, 3]), full([1, 1], 2.0)], 1)")],
+            expr: "scaled_dot_product_attention_packed(q, k, v, 0.35355339059327373, seg)", wrt: &["q", "k", "v"], out_shape: &[1, 2, 6, 8],
+            oracle: oracle!(|e| sdpa_packed_ref(get(e, "q"), get(e, "k"), get(e, "v"), 0.35355339059327373, get(e, "seg"))), known: &[], prelude: "" },
+        // Two batch rows packed differently: the mask is per row.
+        Cert { name: "sdpa_packed_batch",
+            inputs: vec![inp("q", &[2, 2, 6, 8]), inp("k", &[2, 2, 6, 8]), inp("v", &[2, 2, 6, 8]),
+                idx("seg", &[2, 6], "tensor_cat([tensor_cat([zeros([1, 3]), ones([1, 3])], 1), tensor_cat([zeros([1, 5]), ones([1, 1])], 1)], 0)")],
+            expr: "scaled_dot_product_attention_packed(q, k, v, 0.35355339059327373, seg)", wrt: &["q", "k", "v"], out_shape: &[2, 2, 6, 8],
+            oracle: oracle!(|e| sdpa_packed_ref(get(e, "q"), get(e, "k"), get(e, "v"), 0.35355339059327373, get(e, "seg"))), known: &[], prelude: "" },
+        // A scale other than 1/sqrt(head_dim). The builtin's doc says the
+        // fused backward re-derives the scale from Q's shape; the CPU paths
+        // take the argument.
+        Cert { name: "sdpa_packed_scale",
+            inputs: vec![inp("q", &[1, 2, 6, 8]), inp("k", &[1, 2, 6, 8]), inp("v", &[1, 2, 6, 8]),
+                idx("seg", &[1, 6], "tensor_cat([zeros([1, 3]), ones([1, 3])], 1)")],
+            expr: "scaled_dot_product_attention_packed(q, k, v, 0.9, seg)", wrt: &["q", "k", "v"], out_shape: &[1, 2, 6, 8],
+            oracle: oracle!(|e| sdpa_packed_ref(get(e, "q"), get(e, "k"), get(e, "v"), 0.9, get(e, "seg"))), known: &[], prelude: "" },
     ]
 }
 
@@ -962,8 +1029,14 @@ fn certificate_names_are_unique() {
     assert_eq!(before, names.len(), "duplicate certificate names");
 }
 
-/// The coverage gate: every certificate a `PrimalOp` status names exists here,
-/// and every certificate here is named by some status.
+/// Certificates for ops that exist only in a GPU `train` block (no CPU
+/// `grad` spelling reaches them): one compiled SGD step whose update is the
+/// raw gradient, against f64 central differences. They live in
+/// `fused_loss_gradient_cert_gpu.rs` and run in the GPU cert lane.
+const GPU_CERTS: &[&str] = &["fused_linear_ce_step", "fused_kl_ce_step", "sdpa_packed_step"];
+
+/// The coverage gate: every certificate a `PrimalOp` status names exists here
+/// (or in `GPU_CERTS`), and every certificate here is named by some status.
 #[test]
 fn certificates_match_the_codegen_inventory() {
     let all = certs();
@@ -973,12 +1046,29 @@ fn certificates_match_the_codegen_inventory() {
         if let AdCertStatus::Certified(named) = status {
             for n in named {
                 assert!(
-                    names.contains(n),
-                    "{op} names certificate `{n}`, which is not in certs()"
+                    names.contains(n) || GPU_CERTS.contains(n),
+                    "{op} names certificate `{n}`, which is not in certs() or GPU_CERTS"
                 );
                 claimed.push(n);
             }
         }
+    }
+    // A GPU certificate is a GPU-ignored test fn of that exact name in
+    // fused_loss_gradient_cert_gpu.rs, run by the cert lane.
+    let gpu_src = include_str!("fused_loss_gradient_cert_gpu.rs");
+    // Assembled, not written out: scripts/gpu-gate-inventory.awk reads the
+    // attribute text line by line and would take a literal for a gate.
+    let gpu_attr = concat!("#[", "ignore = \"requires CUDA GPU\"]");
+    for n in GPU_CERTS {
+        let at = gpu_src
+            .find(&format!("\nfn {n}() {{"))
+            .unwrap_or_else(|| panic!("GPU certificate `{n}` has no test fn in fused_loss_gradient_cert_gpu.rs"));
+        let attrs = gpu_src[..at].trim_end();
+        assert!(
+            attrs.ends_with(gpu_attr) && attrs[..attrs.len() - gpu_attr.len()].trim_end().ends_with("#[test]"),
+            "GPU certificate `{n}` must be a #[test] carrying {gpu_attr}, so the cert lane runs it"
+        );
+        assert!(claimed.contains(n), "GPU certificate `{n}` is not named by any PrimalOp status");
     }
     for n in &names {
         assert!(
@@ -1022,4 +1112,5 @@ cert_tests! {
     embedding, gather, gather_neg, gather_dim0, gather_mid, cat_dim0, cat_dim1, cat_three, cat_neg,
     cross_entropy, mse_loss, l1_loss,
     conv2d, sdpa, sdpa_causal, sdpa_scale,
+    sdpa_packed, sdpa_packed_docs, sdpa_packed_batch, sdpa_packed_scale,
 }
