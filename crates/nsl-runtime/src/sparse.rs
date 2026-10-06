@@ -358,10 +358,6 @@ pub extern "C" fn nsl_sparse_density(sparse_ptr: i64) -> i64 {
     f64::to_bits(density) as i64
 }
 
-/// Sparse-dense matrix multiply: sparse(M×K) × dense(K×N) → dense(M×N).
-/// sparse_ptr: NslSparseTensor (COO or CSR)
-/// dense_ptr: NslTensor (2D, f64)
-/// Returns pointer to new NslTensor, or 0 on error.
 /// A sparse result (computed in f64, the values' storage type) in its
 /// operand's dtype: f64 only for an f64 operand, f32 otherwise (C5: helpers
 /// mint their operand's dtype). Every result goes through here, so the GPU
@@ -377,11 +373,18 @@ fn result_in_dtype(result: i64, operand_dtype: u16) -> i64 {
     converted
 }
 
+/// Sparse-dense matrix multiply: sparse(M×K) × dense(K×N) → dense(M×N).
+/// sparse_ptr: NslSparseTensor (COO or CSR)
+/// dense_ptr: NslTensor (2D, the sparse tensor's dtype)
+/// Returns pointer to new NslTensor, or 0 on error.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_sparse_spmm(sparse_ptr: i64, dense_ptr: i64) -> i64 {
     if sparse_ptr == 0 || dense_ptr == 0 { return 0; }
     let sparse = unsafe { &*(sparse_ptr as *const NslSparseTensor) };
     let dense = crate::tensor::NslTensor::from_ptr_ref(dense_ptr);
+    if sparse.dtype != dense.dtype {
+        crate::fatal::mixed_dtypes("nsl_sparse_spmm", sparse.dtype, dense.dtype);
+    }
 
     if dense.ndim != 2 { return 0; }
     let d_shape = unsafe { std::slice::from_raw_parts(dense.shape, 2) };
@@ -897,6 +900,9 @@ pub extern "C" fn nsl_sparse_spmv(sparse_ptr: i64, vec_ptr: i64) -> i64 {
     if sparse_ptr == 0 || vec_ptr == 0 { return 0; }
     let sparse = unsafe { &*(sparse_ptr as *const NslSparseTensor) };
     let vec_t = crate::tensor::NslTensor::from_ptr_ref(vec_ptr);
+    if sparse.dtype != vec_t.dtype {
+        crate::fatal::mixed_dtypes("nsl_sparse_spmv", sparse.dtype, vec_t.dtype);
+    }
 
     let m = sparse.rows as usize;
     let k = sparse.cols as usize;
@@ -1001,6 +1007,11 @@ pub extern "C" fn nsl_sparse_add(a_ptr: i64, b_ptr: i64) -> i64 {
     if a_ptr == 0 || b_ptr == 0 { return 0; }
     let a = unsafe { &*(a_ptr as *const NslSparseTensor) };
     let b = unsafe { &*(b_ptr as *const NslSparseTensor) };
+    // The result carries the operands' dtype; it used to be tagged f64 always,
+    // so an f32 sum densified to f64 beside f32 tensors (C5 step 4).
+    if a.dtype != b.dtype {
+        crate::fatal::mixed_dtypes("nsl_sparse_add", a.dtype, b.dtype);
+    }
     if a.rows != b.rows || a.cols != b.cols { return 0; }
 
     let rows = a.rows;
@@ -1055,7 +1066,7 @@ pub extern "C" fn nsl_sparse_add(a_ptr: i64, b_ptr: i64) -> i64 {
         }
     }
 
-    build_coo_from_triples(rows, cols, &out_rows, &out_cols, &out_vals)
+    build_coo_from_triples(rows, cols, &out_rows, &out_cols, &out_vals, a.dtype)
 }
 
 /// Element-wise sparse mul: sparse [M,N] * sparse [M,N] → sparse [M,N] (COO output).
@@ -1065,6 +1076,11 @@ pub extern "C" fn nsl_sparse_mul(a_ptr: i64, b_ptr: i64) -> i64 {
     if a_ptr == 0 || b_ptr == 0 { return 0; }
     let a = unsafe { &*(a_ptr as *const NslSparseTensor) };
     let b = unsafe { &*(b_ptr as *const NslSparseTensor) };
+    // The result carries the operands' dtype; it used to be tagged f64 always,
+    // so an f32 sum densified to f64 beside f32 tensors (C5 step 4).
+    if a.dtype != b.dtype {
+        crate::fatal::mixed_dtypes("nsl_sparse_mul", a.dtype, b.dtype);
+    }
     if a.rows != b.rows || a.cols != b.cols { return 0; }
 
     let rows = a.rows;
@@ -1121,7 +1137,7 @@ pub extern "C" fn nsl_sparse_mul(a_ptr: i64, b_ptr: i64) -> i64 {
         }
     }
 
-    build_coo_from_triples(rows, cols, &out_rows, &out_cols, &out_vals)
+    build_coo_from_triples(rows, cols, &out_rows, &out_cols, &out_vals, a.dtype)
 }
 
 // ---------------------------------------------------------------------------
@@ -1158,13 +1174,14 @@ fn sparse_to_triples(s: &NslSparseTensor) -> Vec<(i64, i64, f64)> {
     }
 }
 
-/// Build a COO NslSparseTensor from triples.
-fn build_coo_from_triples(rows: i64, cols: i64, r: &[i64], c: &[i64], v: &[f64]) -> i64 {
+/// Build a COO NslSparseTensor from triples. `dtype` is the tag results take
+/// (`result_in_dtype`); the values are stored f64 whatever it is.
+fn build_coo_from_triples(rows: i64, cols: i64, r: &[i64], c: &[i64], v: &[f64], dtype: u16) -> i64 {
     let nnz = v.len();
     let val_bytes: Vec<f64> = v.to_vec();
     let sparse = Box::new(NslSparseTensor {
         format: SparseFmtId::Coo as u8,
-        device: 0, dtype: 0, ndim: 2,
+        device: 0, dtype, ndim: 2,
         nnz: nnz as i64, rows, cols,
         data: if nnz > 0 { Box::into_raw(val_bytes.into_boxed_slice()) as *mut u8 } else { std::ptr::null_mut() },
         indices_0: if nnz > 0 { Box::into_raw(r.to_vec().into_boxed_slice()) as *mut i64 } else { std::ptr::null_mut() },
@@ -1437,15 +1454,13 @@ mod tests {
 
     #[test]
     fn spmm_and_spmv_read_an_f32_dense_operand_by_its_tag() {
-        // A = [[1, 0, 2], [0, 3, 0]].
-        let rows = [0i64, 0, 1];
-        let cols = [0i64, 2, 1];
-        let vals = [1.0f64, 2.0, 3.0];
-        let coo = nsl_sparse_coo(
-            rows.as_ptr() as i64, cols.as_ptr() as i64, vals.as_ptr() as i64,
-            2, 3, 3,
-        );
-        let csr = nsl_sparse_coo_to_csr(coo);
+        // A = [[1, 0, 2], [0, 3, 0]], an f32 sparse matrix the way NSL makes
+        // one: from an f32 dense tensor (format 1 = CSR). `nsl_sparse_coo`
+        // takes raw f64 values and tags them f64, and an f64 sparse operand
+        // beside f32 dense ones is refused (C5 step 4).
+        let a = f32_tensor(&[2, 3], &[1.0, 0.0, 2.0, 0.0, 3.0, 0.0]);
+        let csr = nsl_sparse_from_dense(a, 1, 0.5f64.to_bits() as i64);
+        assert_ne!(csr, 0);
 
         // B = [[1, 2], [3, 4], [5, 6]] -> A @ B = [[11, 14], [9, 12]].
         let b = f32_tensor(&[3, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
@@ -1465,11 +1480,32 @@ mod tests {
         assert_eq!(got, [7.0, 6.0], "SpMV with an f32 dense vector");
         assert_eq!(yt.dtype, 1, "the SpMV result takes the f32 vector's dtype (C5)");
 
-        for t in [c, b, y, x] {
+        for t in [c, b, y, x, a] {
             crate::tensor::nsl_tensor_free(t);
         }
         nsl_sparse_free(csr);
-        nsl_sparse_free(coo);
+    }
+
+    /// Sparse add/mul results keep their operands' dtype: an f32 sum
+    /// densifies to f32. They were tagged f64 always.
+    #[test]
+    fn sparse_add_and_mul_keep_their_operands_dtype() {
+        let d = f32_tensor(&[2, 2], &[1.0, 0.0, 0.0, 2.0]);
+        let s1 = nsl_sparse_from_dense(d, 0, 0.5f64.to_bits() as i64);
+        let s2 = nsl_sparse_from_dense(d, 0, 0.5f64.to_bits() as i64);
+        for (sum, want) in [(nsl_sparse_add(s1, s2), [2.0, 0.0, 0.0, 4.0]), (nsl_sparse_mul(s1, s2), [1.0, 0.0, 0.0, 4.0])] {
+            assert_ne!(sum, 0);
+            let dense = nsl_sparse_to_dense(sum);
+            let t = crate::tensor::NslTensor::from_ptr_ref(dense);
+            assert_eq!(t.dtype, 1, "an f32 sparse result densifies to f32");
+            let got: Vec<f64> = (0..4).map(|i| t.read_scalar_as_f64(i)).collect();
+            assert_eq!(got, want);
+            crate::tensor::nsl_tensor_free(dense);
+            nsl_sparse_free(sum);
+        }
+        nsl_sparse_free(s1);
+        nsl_sparse_free(s2);
+        crate::tensor::nsl_tensor_free(d);
     }
 
     #[test]

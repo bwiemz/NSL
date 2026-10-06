@@ -3828,9 +3828,9 @@ fn lower_single_op(
                     // tensors take the dedicated scalar kernels (same single
                     // f64->f32 narrowing as the baseline's
                     // nsl_tensor_scalar(v, 1)); any other dtype replays the
-                    // literal baseline ops — the mixed-dtype "f32 wins" rule
-                    // is NOT what the dedicated f64 arms compute (review
-                    // finding F1). Opcodes are descriptor-v1 byte values.
+                    // literal baseline ops, whose mixed-dtype refusal (C5
+                    // step 4) the dedicated f64 arms would not reproduce
+                    // (review finding F1). Opcodes are descriptor-v1 bytes.
                     let (opcode, prefix) = if name.starts_with("mul_scalar_rhs:") {
                         (crate::ew_chain_fusion::EwOpcode::Mul as i64, "mul_scalar_rhs:")
                     } else if name.starts_with("add_scalar_rhs:") {

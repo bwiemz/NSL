@@ -155,6 +155,21 @@ pub fn unsupported_dtype(op: &str, dtype: impl std::fmt::Display) -> ! {
     die(Fatal::UnsupportedDtype, &format!("{op}: unsupported dtype {dtype}"))
 }
 
+/// A binary op whose operands have different dtypes (C5 step 4). NSL does not
+/// convert between dtypes implicitly -- the CPU used to narrow to f32 whenever
+/// either side was f32 ("f32 wins") -- so the op refuses and names the fix.
+pub fn mixed_dtypes(op: &str, a: u16, b: u16) -> ! {
+    let a = crate::checkpoint::checkpoint_dtype_name(a);
+    let b = crate::checkpoint::checkpoint_dtype_name(b);
+    die(
+        Fatal::UnsupportedDtype,
+        &format!(
+            "{op}: operands have different dtypes, {a} and {b}; NSL does not convert \
+             between dtypes implicitly -- convert one operand with `.to({a})` or `.to({b})`"
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

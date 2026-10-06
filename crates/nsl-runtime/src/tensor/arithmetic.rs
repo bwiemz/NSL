@@ -27,6 +27,7 @@ fn reconcile_device(a: i64, b: i64) -> (i64, bool) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_add(a: i64, b: i64, flags: u8) -> i64 {
+    super::require_same_dtype("nsl_tensor_add", a, b);
     use crate::tensor::fbip_flags::{relinquish_a, relinquish_b};
     let relinq_a = relinquish_a(flags);
     let relinq_b = relinquish_b(flags);
@@ -171,6 +172,7 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64, flags: u8) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_sub(a: i64, b: i64, flags: u8) -> i64 {
+    super::require_same_dtype("nsl_tensor_sub", a, b);
     use crate::tensor::fbip_flags::{relinquish_a, relinquish_b};
     let relinq_a = relinquish_a(flags);
     let relinq_b = relinquish_b(flags);
@@ -272,6 +274,7 @@ pub extern "C" fn nsl_tensor_sub(a: i64, b: i64, flags: u8) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_mul(a: i64, b: i64, flags: u8) -> i64 {
+    super::require_same_dtype("nsl_tensor_mul", a, b);
     use crate::tensor::fbip_flags::{relinquish_a, relinquish_b};
     let relinq_a = relinquish_a(flags);
     let relinq_b = relinquish_b(flags);
@@ -388,6 +391,7 @@ pub extern "C" fn nsl_tensor_mul(a: i64, b: i64, flags: u8) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_div(a: i64, b: i64, flags: u8) -> i64 {
+    super::require_same_dtype("nsl_tensor_div", a, b);
     use crate::tensor::fbip_flags::{relinquish_a, relinquish_b};
     let relinq_a = relinquish_a(flags);
     let relinq_b = relinquish_b(flags);
@@ -1144,16 +1148,17 @@ pub extern "C" fn nsl_tensor_sub_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
 /// rounding (two roundings, deliberately NON-FMA), removing one kernel launch
 /// and one parameter-sized temporary per accumulate (~217/step at 500M,
 /// grad_accum=8). Fast paths cover the operands the FASE path actually produces
-/// after its `to_device_like` pre-migration — GPU f32, CPU f32, CPU f64;
-/// anything else (dtype/device/shape mismatch, or half precision, whose
+/// after its `nsl_grad_migrate_like` pre-migration — GPU f32, CPU f32, CPU
+/// f64; anything else (device/shape mismatch, or half precision, whose
 /// materialized-intermediate rounding a single kernel could not reproduce)
-/// falls back to the exact decomposed two-op path.
+/// falls back to the exact decomposed two-op path. A dtype mismatch is
+/// refused (C5 step 4).
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_scalar_mul_add_inplace(m_ptr: i64, g_ptr: i64, s: f64) {
+    super::require_same_dtype("nsl_tensor_scalar_mul_add_inplace", m_ptr, g_ptr);
     let m = NslTensor::from_ptr_ref(m_ptr);
     let g = NslTensor::from_ptr_ref(g_ptr);
     if m.device == g.device
-        && m.dtype == g.dtype
         && m.len == g.len
         && m.is_contiguous()
         && g.is_contiguous()
@@ -1340,11 +1345,11 @@ pub extern "C" fn nsl_tensor_wgrad_accum(m_ptr: i64, x_ptr: i64, g_ptr: i64, s: 
     // Migrate to the accumulator's (device, dtype) exactly as
     // `fase_emit_accumulate` does. This matters whenever the activations are
     // CPU while `m_partial` is GPU — the common mixed case that also sends us
-    // down this fallback in the first place. `scalar_mul_add_inplace` would
-    // survive the mismatch via its own mul_scalar/add_inplace fallback, but
-    // depending on that is depending on an unstated contract two layers down;
-    // `to_device_like` is a refcount bump when the placements already match.
-    let dw_migrated = crate::tensor::nsl_tensor_to_device_like(dw, m_ptr);
+    // down this fallback in the first place. `scalar_mul_add_inplace` refuses
+    // a dtype mismatch (C5 step 4) and only reconciles the device in its
+    // fallback; `nsl_grad_migrate_like` is a refcount bump when the
+    // placements already match.
+    let dw_migrated = crate::tensor::nsl_grad_migrate_like(dw, m_ptr);
     nsl_tensor_scalar_mul_add_inplace(m_ptr, dw_migrated, s);
     nsl_tensor_free(dw_migrated);
     nsl_tensor_free(dw);
@@ -1434,6 +1439,7 @@ pub extern "C" fn nsl_sparse_matmul(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64, flags: u8) -> i64 {
+    super::require_same_dtype("nsl_tensor_matmul", a_ptr, b_ptr);
     use crate::tensor::fbip_flags::{relinquish_a, relinquish_b};
     let relinq_a = relinquish_a(flags);
     let relinq_b = relinquish_b(flags);
@@ -1610,8 +1616,11 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64, flags: u8) -> i64 {
         }
     }
 
-    // Dispatch based on dtype (use f32 if either input is f32)
-    let out_dtype: u16 = if a.dtype == 1 || b.dtype == 1 { 1 } else { 0 };
+    // The operands share a dtype (checked at entry): f32 or f64.
+    let out_dtype: u16 = match a.dtype {
+        0 | 1 => a.dtype,
+        other => crate::fatal::unsupported_dtype("nsl_tensor_matmul", other),
+    };
     let elem_size = if out_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
     let raw_data = checked_alloc_zeroed((len as usize) * elem_size);
 
@@ -1645,29 +1654,9 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64, flags: u8) -> i64 {
         // 2D matmul for this batch element — dispatch to cache-tiled kernel
         if out_dtype == 1 {
             let c_ptr = unsafe { (raw_data as *mut f32).add(out_base) };
-            if a.dtype == 1 && b.dtype == 1 {
-                // Both f32 — call tiled kernel directly
-                let a_ptr = unsafe { a.data_f32().add(a_base) };
-                let b_ptr = unsafe { b.data_f32().add(b_base) };
-                crate::cpu::tiled_matmul_f32(a_ptr, b_ptr, c_ptr, m as usize, k as usize, n as usize);
-            } else {
-                // Mixed dtype — fall back to element-wise conversion (rare path)
-                let read_a = |idx: usize| -> f32 {
-                    if a.dtype == 1 { unsafe { *a.data_f32().add(idx) } } else { unsafe { *a.data_f64().add(idx) as f32 } }
-                };
-                let read_b = |idx: usize| -> f32 {
-                    if b.dtype == 1 { unsafe { *b.data_f32().add(idx) } } else { unsafe { *b.data_f64().add(idx) as f32 } }
-                };
-                for i in 0..m as usize {
-                    for j in 0..k as usize {
-                        let a_val = read_a(a_base + i * k as usize + j);
-                        for l in 0..n as usize {
-                            let b_val = read_b(b_base + j * n as usize + l);
-                            unsafe { *c_ptr.add(i * n as usize + l) += a_val * b_val; }
-                        }
-                    }
-                }
-            }
+            let a_ptr = unsafe { a.data_f32().add(a_base) };
+            let b_ptr = unsafe { b.data_f32().add(b_base) };
+            crate::cpu::tiled_matmul_f32(a_ptr, b_ptr, c_ptr, m as usize, k as usize, n as usize);
         } else {
             // Both f64 — call tiled kernel
             let c_ptr = unsafe { (raw_data as *mut f64).add(out_base) };

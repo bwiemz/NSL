@@ -26,11 +26,11 @@ pub static REGISTRY: &[EnvVar] = &[
     var!(
         "NSL_ALIGN_DEBUG",
         Bool,
-        "any value (presence via is_ok; all 3 sites)",
+        "any value (presence via is_ok; both sites)",
         "off",
         Diagnostic,
         Runtime,
-        "Print packed-batch device-alignment moves and add_inplace dtype-mismatch details to stderr as [align-debug] lines."
+        "Print packed-batch device-alignment moves to stderr as [align-debug] lines."
     ),
     var!(
         "NSL_ALLOW_UNKNOWN_DECORATORS",
@@ -931,6 +931,15 @@ pub static REGISTRY: &[EnvVar] = &[
         Diagnostic,
         Runtime,
         "Set to 1 to print a GPU caching-allocator memory summary (peaks, top allocation contexts) to stderr at process exit."
+    ),
+    var!(
+        "NSL_MIXED_DTYPE_SCENARIO",
+        Str,
+        "scenario name",
+        "unset (child returns)",
+        Test,
+        Test,
+        "Test harness only: names the mixed-dtype tensor op the re-exec'd child makes (expected to exit with the unsupported-dtype code)."
     ),
     var!(
         "NSL_MUON_BATCH_MB",

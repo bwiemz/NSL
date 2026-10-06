@@ -335,7 +335,8 @@ fn replay_decomposed(steps: &[ChainStep], inputs: &[i64]) -> i64 {
         // Materialize an Imm exactly as baseline Constant lowering does:
         // `nsl_tensor_scalar(v as f64, 1)` — the f64 the compiler saw was
         // already narrowed to these f32 bits once, and `(bits as f64) as f32`
-        // round-trips them, so the scalar tensor holds identical bytes.
+        // round-trips them, so the scalar tensor holds identical bytes. A
+        // non-f32 chain is refused by the binary op, as in the baseline.
         let mut imm_temp: i64 = 0;
         let mut resolve = |kind: u8, idx: u8| -> i64 {
             match kind {
@@ -492,12 +493,14 @@ pub extern "C" fn nsl_fused_ew_chain(
 /// against the broadcast baseline (the constant was narrowed to f32 once at
 /// `nsl_tensor_scalar(v, 1)` creation, and the single-op kernels use the
 /// identical arithmetic instruction). For ANY other dtype the dedicated FFIs
-/// would diverge: the baseline's mixed-dtype CPU rule is "either input f32
-/// -> f32 path" (x narrowed per element, f32 OUTPUT), while e.g.
-/// `nsl_tensor_div_scalar`'s f64 arm computes full-precision f64 with an f64
-/// output — different bits AND a flipped result dtype. So the non-f32 arm
-/// REPLAYS the literal baseline ops instead: an f32 scalar tensor fed to the
-/// ordinary binary FFI, bit-exact by construction.
+/// would diverge from the baseline, which pairs `x` with an f32 scalar
+/// tensor: that used to compute in f32 ("f32 wins" -- x narrowed per element,
+/// f32 OUTPUT) and is now refused as mixed dtypes (C5 step 4), while e.g.
+/// `nsl_tensor_div_scalar`'s f64 arm computes full-precision f64. So the
+/// non-f32 arm REPLAYS the literal baseline ops instead: an f32 scalar tensor
+/// fed to the ordinary binary FFI, identical to the baseline by construction,
+/// refusal included. (Source AD lowers f32 graphs only; an f64 grad block
+/// stays on the tape.)
 ///
 /// `opcode` uses the descriptor v1 byte values (Add=0, Sub=1, Mul=2, Div=3).
 #[unsafe(no_mangle)]

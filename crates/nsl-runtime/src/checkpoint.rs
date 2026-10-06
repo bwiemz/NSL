@@ -23,8 +23,9 @@ fn write_or_abort(file: &mut std::fs::File, buf: &[u8], context: &str) {
 /// own name. Until C5 step 2a every tag other than f32 was written as "f64":
 /// an fp16 checkpoint then loaded into a bf16 model without complaint and its
 /// bytes were reinterpreted. "f32" and "f64" keep their spelling so files
-/// saved before the change still load into f32/f64 models.
-fn checkpoint_dtype_name(dtype: u16) -> String {
+/// saved before the change still load into f32/f64 models. The dtype-refusal
+/// messages (`fatal::mixed_dtypes`) name tags with it too.
+pub(crate) fn checkpoint_dtype_name(dtype: u16) -> String {
     let name = match dtype {
         DTYPE_F64 => "f64",
         DTYPE_F32 => "f32",

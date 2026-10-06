@@ -272,7 +272,7 @@ macro_rules! for_each_runtime_fn {
             [tensor] nsl_tensor_sub_scalar(i64, f64, i8) -> i64 = tensor::arithmetic::nsl_tensor_sub_scalar;
             // Dispatching scalar-immediate entry (review fix): f32 -> the dedicated
             // scalar kernel; any other dtype -> the literal decomposed baseline
-            // (preserves the mixed-dtype "f32 wins" narrowing AND output dtype).
+            // (identical to it, including its mixed-dtype refusal, C5 step 4).
             // (tensor, f64 scalar, descriptor-v1 opcode) -> result handle.
             [tensor] nsl_tensor_scalar_rhs(i64, f64, i64) -> i64 = tensor::fused_chain::nsl_tensor_scalar_rhs;
             // Tensor matmul

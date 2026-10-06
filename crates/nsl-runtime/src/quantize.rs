@@ -272,7 +272,7 @@ fn dequantize_val(q: u8, scale: f32, zp: u8) -> f64 {
 /// Quantize an NslTensor into a QuantizedTensor.
 ///
 /// Arguments (all as i64 for FFI):
-///   tensor_ptr  - pointer to source NslTensor (f64 data)
+///   tensor_ptr  - pointer to source NslTensor (f32 or f64 data)
 ///   dtype       - 0 = INT8, 1 = INT4
 ///   granularity - 0 = PerTensor, 1 = PerChannel, 2 = PerGroup
 ///   gran_axis   - axis for per-channel/per-group
@@ -301,7 +301,8 @@ pub extern "C" fn nsl_qtensor_quantize(
     };
 
     // Read all source data into a Vec for easier slicing
-    let src: Vec<f64> = (0..total).map(|i| unsafe { *tensor.data_f64().add(i) }).collect();
+    // f32 or f64 (it read f64 only, so a default f32 tensor aborted).
+    let src: Vec<f64> = (0..total).map(|i| tensor.read_scalar_as_f64(i)).collect();
 
     match granularity {
         GRAN_PER_TENSOR => {
@@ -429,17 +430,32 @@ pub extern "C" fn nsl_qtensor_quantize(
 // nsl_qtensor_dequantize — reconstruct full NslTensor
 // ---------------------------------------------------------------------------
 
-/// Dequantize a QuantizedTensor back to a full-precision NslTensor (f64).
+/// Dequantize a QuantizedTensor back to a full-precision NslTensor, in f32 --
+/// the default float dtype (C5). It used to be f64, which made every
+/// dequantized weight an f64 operand beside f32 activations.
 ///
 /// Returns: pointer to NslTensor as i64
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_qtensor_dequantize(qtensor_ptr: i64) -> i64 {
+    dequantize_as(qtensor_ptr, crate::tensor::DTYPE_F32)
+}
+
+/// Dequantize into `out_dtype`, f32 or f64. Each value is computed in f64
+/// (an exact product of a small integer and an f32 scale) and rounded once.
+fn dequantize_as(qtensor_ptr: i64, out_dtype: u16) -> i64 {
     let qt = QuantizedTensor::from_ptr(qtensor_ptr);
     let ndim = qt.ndim;
     let total = total_elements(qt.shape, ndim) as usize;
 
     // Allocate output NslTensor
-    let data = checked_alloc(total * std::mem::size_of::<f64>()) as *mut f64;
+    let raw = checked_alloc(total * crate::tensor::dtype_element_size(out_dtype));
+    let store = |i: usize, v: f64| unsafe {
+        match out_dtype {
+            crate::tensor::DTYPE_F64 => *(raw as *mut f64).add(i) = v,
+            crate::tensor::DTYPE_F32 => *(raw as *mut f32).add(i) = v as f32,
+            other => crate::fatal::unsupported_dtype("dequantize_as", other),
+        }
+    };
     let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
     unsafe { std::ptr::copy_nonoverlapping(qt.shape, shape, ndim as usize) };
     let strides = NslTensor::compute_strides(shape, ndim);
@@ -454,7 +470,7 @@ pub extern "C" fn nsl_qtensor_dequantize(qtensor_ptr: i64) -> i64 {
                     DTYPE_INT8 => unsafe { *qt.data.add(i) },
                     _ => unreachable!(),
                 };
-                unsafe { *data.add(i) = dequantize_val(q, scale, zp) };
+                store(i, dequantize_val(q, scale, zp));
             }
         }
         GRAN_PER_CHANNEL => {
@@ -477,7 +493,7 @@ pub extern "C" fn nsl_qtensor_dequantize(qtensor_ptr: i64) -> i64 {
                             DTYPE_INT8 => unsafe { *qt.data.add(idx) },
                             _ => unreachable!(),
                         };
-                        unsafe { *data.add(idx) = dequantize_val(q, scale, zp) };
+                        store(idx, dequantize_val(q, scale, zp));
                     }
                 }
             }
@@ -509,7 +525,7 @@ pub extern "C" fn nsl_qtensor_dequantize(qtensor_ptr: i64) -> i64 {
                                 DTYPE_INT8 => unsafe { *qt.data.add(idx) },
                             _ => unreachable!(),
                             };
-                            unsafe { *data.add(idx) = dequantize_val(q, scale, zp) };
+                            store(idx, dequantize_val(q, scale, zp));
                         }
                     }
                     scale_idx += 1;
@@ -523,13 +539,13 @@ pub extern "C" fn nsl_qtensor_dequantize(qtensor_ptr: i64) -> i64 {
     }
 
     let out = Box::new(NslTensor::new(
-        data as *mut c_void,
+        raw as *mut c_void,
         shape,
         strides,
         ndim,
         total as i64,
         0,
-        0,
+        out_dtype,
         1,
         0,
     ));
@@ -540,8 +556,10 @@ pub extern "C" fn nsl_qtensor_dequantize(qtensor_ptr: i64) -> i64 {
 // Mixed-precision matmul
 // ---------------------------------------------------------------------------
 
-/// Mixed-precision matmul: NslTensor (f64) @ QuantizedTensor -> NslTensor (f64).
-/// Dequantizes the quantized weight on-the-fly during matmul.
+/// Mixed-precision matmul: NslTensor (f32 or f64) @ QuantizedTensor ->
+/// NslTensor in x's dtype. Dequantizes the quantized weight on the fly, in
+/// x's dtype -- the weight takes the activation's precision explicitly here,
+/// so the matmul itself sees one dtype (C5 step 4).
 /// qw must be 2D [K, N]. x must have last dim = K.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_qtensor_matmul_mixed(x_ptr: i64, qw_ptr: i64) -> i64 {
@@ -571,7 +589,11 @@ pub extern "C" fn nsl_qtensor_matmul_mixed(x_ptr: i64, qw_ptr: i64) -> i64 {
     }
 
     // Dequantize the quantized weight to a temporary NslTensor
-    let deq_ptr = nsl_qtensor_dequantize(qw_ptr);
+    let deq_dtype = match x.dtype {
+        crate::tensor::DTYPE_F32 | crate::tensor::DTYPE_F64 => x.dtype,
+        other => crate::fatal::unsupported_dtype("nsl_qtensor_matmul_mixed", other),
+    };
+    let deq_ptr = dequantize_as(qw_ptr, deq_dtype);
 
     // Perform matmul: x @ deq
     let result_ptr = crate::tensor::nsl_tensor_matmul(x_ptr, deq_ptr, 0);
