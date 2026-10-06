@@ -33,20 +33,16 @@
 //! "refused with our message" from "died on a signal" — an in-process
 //! `#[should_panic]` cannot observe either a SIGSEGV or a SIGABRT.
 //!
-//! ## NOT closed here: a bad dtype that IS mapped still aborts the host
+//! ## Closed by C5 step 6: a mapped tag that is not the declared one
 //!
-//! The list above is not the complete set of host-controlled dtype deaths, and
-//! must not be read as one. `dl_dtype_to_nsl` maps DLPack int8 to tag 4 and
-//! int32 to tag 9, both INSIDE `capi_dtype_to_nsl`'s accepted `0..=9`. So
-//! `torch.int8`/`torch.int32` inputs — and desc tags 4/7/9 on the
-//! `nsl_model_call` ABI — clear every boundary guard above, reach the compiled
-//! impl, and die on `NslTensor::data_f64`'s PLAIN `assert_eq!`
-//! (`tensor/mod.rs:531`) inside a `pub extern "C"` fn: a non-unwinding panic,
-//! i.e. SIGABRT / exit 134. Closing that means `emit_c_abi_wrapper` must check
-//! the declared dtype it currently discards at `c_wrapper.rs:178`, which also
-//! changes what tags 0 and 3 do (today they are accepted and silently compute
-//! wrong values), so it is a behaviour change needing its own gate and is
-//! deferred. This is pre-existing on both sides of the change.
+//! `dl_dtype_to_nsl` maps DLPack int8 to tag 4 and int32 to tag 9, both
+//! valid C API tags, so `torch.int8`/`torch.int32` inputs -- and desc tags
+//! 4/7/9 on the `nsl_model_call` ABI -- cleared every guard above, reached
+//! the compiled impl and died on `NslTensor::data_f64`'s plain `assert_eq!`
+//! inside a `pub extern "C"` fn (SIGABRT), while tags 0 and 3 computed wrong
+//! values. The wrapper now holds every descriptor and every result to the
+//! declared dtype (`nsl_desc_to_tensor_expect`, `nsl_export_check_result`);
+//! `exports_hold_descriptors_and_results_to_their_declared_dtype` gates it.
 //!
 //! ## Harness: the child has TWO error thread-locals
 //!
@@ -164,6 +160,16 @@ const EXPORT_SRC: &str = concat!(
     "\n@export\nfn gamma(x: Tensor<[4], f32>) -> f64:\n    return 7.5\n",
     "\n@export\nfn delta(x: Tensor<[65536], f32>) -> Tensor<[65536], f32>:\n    return x * 2.0\n",
     "\n@export\nfn ident(x: Tensor<[4], f32>) -> Tensor<[4], f32>:\n    return x\n",
+    // C5 step 6: one identity export per dtype the C API has a tag for, and
+    // one whose result is f32 under an f64 declaration (`relu` is typed with
+    // an open dtype, so the checker cannot see the mislabel; the wrapper's
+    // result check must).
+    "\n@export\nfn id_f64(x: Tensor<[4], f64>) -> Tensor<[4], f64>:\n    return x\n",
+    "\n@export\nfn id_f16(x: Tensor<[4], f16>) -> Tensor<[4], f16>:\n    return x\n",
+    "\n@export\nfn id_bf16(x: Tensor<[4], bf16>) -> Tensor<[4], bf16>:\n    return x\n",
+    "\n@export\nfn id_i8(x: Tensor<[4], int8>) -> Tensor<[4], int8>:\n    return x\n",
+    "\n@export\nfn id_i32(x: Tensor<[4], int32>) -> Tensor<[4], int32>:\n    return x\n",
+    "\n@export\nfn mislabel(x: Tensor<[4], f32>) -> Tensor<[4], f64>:\n    return relu(x)\n",
 );
 
 // ---------------------------------------------------------------------------
@@ -873,6 +879,119 @@ fn run_model_scenario(scenario: &str) {
             if ctx != 0 {
                 nsl_runtime::grad_context::nsl_grad_context_destroy(ctx);
             }
+        }
+        // C5 step 6: every C API dtype through an identity export, bytes and
+        // tag both ways. Before step 6 the wrapper ignored the declaration, so
+        // this passed only because each call happened to send the right tag;
+        // the mismatch scenarios below are what it anchors.
+        "dtype_round_trip" => {
+            let cases: [(&str, i32, usize); 6] = [
+                ("ident", 1, 4),
+                ("id_f64", 0, 8),
+                ("id_f16", 2, 2),
+                ("id_bf16", 3, 2),
+                ("id_i8", 4, 1),
+                ("id_i32", 9, 4),
+            ];
+            let mut all_ok = true;
+            for (export, tag, elem) in cases {
+                let n = CString::new(export).unwrap();
+                // Distinct, non-zero bytes, so a copy that did nothing shows.
+                let mut src: Vec<u8> = (0..4 * elem).map(|i| (i as u8).wrapping_mul(29).wrapping_add(7) | 1).collect();
+                let mut ish: Vec<i64> = vec![4];
+                let mut inp = desc(src.as_mut_ptr() as *mut c_void, ish.as_mut_ptr(), tag);
+                let mut ob: Vec<u8> = vec![0; 4 * elem];
+                let mut osh: Vec<i64> = vec![0; 8];
+                let mut ost: Vec<i64> = vec![0; 8];
+                let mut out = NslTensorDesc {
+                    data: ob.as_mut_ptr() as *mut c_void,
+                    shape: osh.as_mut_ptr(),
+                    strides: ost.as_mut_ptr(),
+                    ndim: 8,
+                    dtype: tag,
+                    device_type: 0,
+                    device_id: 0,
+                    tape_id: 0,
+                };
+                let caps: Vec<u64> = vec![(4 * elem) as u64];
+                nsl_runtime::c_api::nsl_clear_error();
+                let rc = nsl_runtime::c_api::nsl_model_call_into(
+                    model,
+                    n.as_ptr() as i64,
+                    &mut inp as *mut _ as i64,
+                    1,
+                    &mut out as *mut _ as i64,
+                    1,
+                    caps.as_ptr() as i64,
+                );
+                let same = ob == src;
+                println!("RT {export} rc={rc} tag={} bytes_equal={same} liberr={}", out.dtype, lib_last_error(&lib_path));
+                all_ok &= rc == 0 && out.dtype == tag && same;
+            }
+            println!("CHILD-RESULT rc=0 all_ok={all_ok} err=");
+        }
+        // A well-formed descriptor whose tag is not the declared one, and
+        // descriptors whose layout is malformed: each must come back as -1
+        // with the reason, not compute or abort.
+        "declared_mismatch" => {
+            let call = |d: &mut NslTensorDesc, export: &str| -> (i64, String) {
+                let n = CString::new(export).unwrap();
+                let mut ob: Vec<u8> = vec![0; 64];
+                let mut osh: Vec<i64> = vec![0; 8];
+                let mut ost: Vec<i64> = vec![0; 8];
+                let mut out = NslTensorDesc {
+                    data: ob.as_mut_ptr() as *mut c_void,
+                    shape: osh.as_mut_ptr(),
+                    strides: ost.as_mut_ptr(),
+                    ndim: 8,
+                    dtype: 1,
+                    device_type: 0,
+                    device_id: 0,
+                    tape_id: 0,
+                };
+                let caps: Vec<u64> = vec![64];
+                nsl_runtime::c_api::nsl_clear_error();
+                let rc = nsl_runtime::c_api::nsl_model_call_into(
+                    model,
+                    n.as_ptr() as i64,
+                    d as *mut _ as i64,
+                    1,
+                    &mut out as *mut _ as i64,
+                    1,
+                    caps.as_ptr() as i64,
+                );
+                (rc, lib_last_error(&lib_path))
+            };
+            let mut f64s: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0];
+            let mut i32s: Vec<i32> = vec![1, 2, 3, 4];
+            let mut sh: Vec<i64> = vec![4];
+            let mut d = desc(f64s.as_mut_ptr() as *mut c_void, sh.as_mut_ptr(), 0);
+            let (rc, e) = call(&mut d, "alpha");
+            println!("MM f64_into_f32 rc={rc} liberr={e}");
+            let mut d = desc(i32s.as_mut_ptr() as *mut c_void, sh.as_mut_ptr(), 9);
+            let (rc, e) = call(&mut d, "alpha");
+            println!("MM i32_into_f32 rc={rc} liberr={e}");
+            let mut d = desc(fdata.as_mut_ptr() as *mut c_void, sh.as_mut_ptr(), 1);
+            let (rc, e) = call(&mut d, "mislabel");
+            println!("MM result_f32_as_f64 rc={rc} liberr={e}");
+            let mut d = desc(fdata.as_mut_ptr() as *mut c_void, sh.as_mut_ptr(), 1);
+            d.ndim = -1;
+            let (rc, e) = call(&mut d, "alpha");
+            println!("MM negative_ndim rc={rc} liberr={e}");
+            let mut huge: Vec<i64> = vec![i64::MAX, 4];
+            let mut d = desc(fdata.as_mut_ptr() as *mut c_void, huge.as_mut_ptr(), 1);
+            d.ndim = 2;
+            let (rc, e) = call(&mut d, "alpha");
+            println!("MM overflowing_shape rc={rc} liberr={e}");
+            let mut d = desc(fdata.as_mut_ptr() as *mut c_void, sh.as_mut_ptr(), 1);
+            d.device_type = 1;
+            d.device_id = 255;
+            let (rc, e) = call(&mut d, "alpha");
+            println!("MM wrapping_device_id rc={rc} liberr={e}");
+            let mut d = desc(fdata.as_mut_ptr() as *mut c_void, sh.as_mut_ptr(), 10);
+            let (rc, e) = call(&mut d, "alpha");
+            println!("MM internal_tag_10 rc={rc} liberr={e}");
+            println!("CHILD-RESULT rc=0 err=");
         }
         other => panic!("unknown scenario '{other}'"),
     }
@@ -1590,4 +1709,57 @@ fn nsl_bin() -> std::path::PathBuf {
         dir.pop();
     }
     dir.join(format!("nsl{}", std::env::consts::EXE_SUFFIX))
+}
+
+/// C5 step 6: an `@export` honours its declaration both ways. Every dtype
+/// the C API has a tag for survives a round trip byte for byte with its tag;
+/// a descriptor whose tag is not the declared one, a result whose tag is not
+/// the declared one, and a malformed descriptor are each refused with -1 and
+/// a reason naming the parameter -- where they used to compute garbage
+/// (f64 under f32), abort the host (int32 under f32: `assert_eq!` in
+/// `extern "C"`; a negative ndim; an overflowing shape), wrap a CUDA device
+/// id to the CPU, or hand out mislabelled memory.
+#[test]
+fn exports_hold_descriptors_and_results_to_their_declared_dtype() {
+    let tmp = scratch_dir().with_extension("step6");
+    let (lib, weights) = build_lib(&tmp);
+    let ctx = Some((lib.to_string_lossy().into_owned(), weights.to_string_lossy().into_owned()));
+
+    let rt = run_child("dtype_round_trip", &ctx, false);
+    rt.assert_survived("dtype_round_trip");
+    assert!(
+        rt.stdout.contains("all_ok=true"),
+        "every dtype must round-trip bytes and tag:\n{}\n{}",
+        rt.stdout,
+        rt.stderr
+    );
+
+    let mm = run_child("declared_mismatch", &ctx, false);
+    mm.assert_survived("declared_mismatch");
+    let line = |case: &str| -> String {
+        mm.stdout
+            .lines()
+            // libtest prints its `test ... ` prefix on the first line.
+            .find(|l| l.contains(&format!("MM {case} ")))
+            .unwrap_or_else(|| panic!("no MM {case} line:\n{}\n{}", mm.stdout, mm.stderr))
+            .to_string()
+    };
+    for (case, reason) in [
+        ("f64_into_f32", "dtype tag 0 (f64) where the export declares 1 (f32)"),
+        ("i32_into_f32", "dtype tag 9 (int32) where the export declares 1 (f32)"),
+        ("result_f32_as_f64", "dtype tag 1 (f32) where the export declares 0 (f64)"),
+        ("negative_ndim", "ndim -1 is outside"),
+        ("overflowing_shape", "element count overflows"),
+        ("wrapping_device_id", "CUDA device id 255"),
+        ("internal_tag_10", "unrecognized dtype tag 10"),
+    ] {
+        let l = line(case);
+        assert!(l.contains("rc=-1"), "{case} must be refused with -1: {l}");
+        if cfg!(unix) {
+            assert!(l.contains(reason), "{case} must say why ({reason}): {l}");
+            let named = if case == "result_f32_as_f64" { "the result of 'mislabel'" } else { "parameter 'x' of" };
+            assert!(l.contains(named), "{case} must name what was refused: {l}");
+        }
+    }
+    cleanup_scratch(&tmp);
 }

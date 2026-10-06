@@ -573,6 +573,14 @@ fn validate_fn_signature(
     }
 
     if let Some(ref ret_ty) = fn_def.return_type
+        && let Some(dtype) = tensor_dtype_without_c_tag(ret_ty, interner)
+    {
+        diagnostics.push(
+            Diagnostic::error(no_c_tag_message("the return value", &dtype))
+                .with_label(ret_ty.span, "no C API dtype tag"),
+        );
+    }
+    if let Some(ref ret_ty) = fn_def.return_type
         && !is_c_abi_compatible(ret_ty, interner)
     {
         diagnostics.push(
@@ -615,6 +623,12 @@ fn validate_param(param: &Param, interner: &Interner, diagnostics: &mut Vec<Diag
                     .to_string(),
             )
             .with_label(type_ann.span, "closure type"),
+        );
+    } else if let Some(dtype) = tensor_dtype_without_c_tag(type_ann, interner) {
+        let what = format!("parameter '{}'", interner.resolve(param.name.0).unwrap_or("<unknown>"));
+        diagnostics.push(
+            Diagnostic::error(no_c_tag_message(&what, &dtype))
+                .with_label(type_ann.span, "no C API dtype tag"),
         );
     } else if !is_c_abi_compatible(type_ann, interner) {
         diagnostics.push(
@@ -986,6 +1000,38 @@ const C_ABI_SCALARS: &[&str] = &[
     "f32", "f64", "i32", "int32", "i64", "int64", "long", "u8", "u16", "u32", "u64",
 ];
 
+/// Tensor dtype spellings an `@export` signature may use: those whose
+/// header lowering (`c_header::lower_dtype_name`) names a dtype the C API
+/// has a tag for (0=f64, 1=f32, 2=f16, 3=bf16, 4=int8, 9=int32). The wrapper
+/// holds every descriptor to that tag (C5 step 6), so a spelling without one
+/// -- int64, uint8, bool, fp8, ternary, or a misspelling the header used to
+/// lower to f32 -- declares a tensor no caller can pass.
+const C_ABI_TENSOR_DTYPES: &[&str] = &[
+    "f32", "fp32", "float", "float32", "f64", "fp64", "double", "float64", "f16", "fp16", "half",
+    "float16", "bf16", "bfloat16", "i8", "int8", "i32", "int32",
+];
+
+/// The first tensor dtype in `ty` (through tuples) with no C API tag.
+fn tensor_dtype_without_c_tag(ty: &TypeExpr, interner: &Interner) -> Option<String> {
+    match &ty.kind {
+        TypeExprKind::Tensor { dtype, .. }
+        | TypeExprKind::Param { dtype, .. }
+        | TypeExprKind::Buffer { dtype, .. } => {
+            let name = interner.resolve(dtype.0).unwrap_or("");
+            (!C_ABI_TENSOR_DTYPES.contains(&name)).then(|| name.to_string())
+        }
+        TypeExprKind::Tuple(elems) => elems.iter().find_map(|e| tensor_dtype_without_c_tag(e, interner)),
+        _ => None,
+    }
+}
+
+fn no_c_tag_message(what: &str, dtype: &str) -> String {
+    format!(
+        "@export: {what} is a `{dtype}` tensor, which has no C API dtype tag; an exported \
+         tensor must be f64, f32, f16, bf16, int8 or int32"
+    )
+}
+
 fn is_c_abi_compatible(ty: &TypeExpr, interner: &Interner) -> bool {
     match &ty.kind {
         TypeExprKind::Tensor { .. }
@@ -1055,6 +1101,21 @@ fn forward(x: Tensor<[4], f32>) -> Tensor<[4], f32>:
 ";
         let errs = parse_and_validate(src);
         assert!(errs.is_empty(), "expected no errors, got: {:?}", errs);
+    }
+
+    /// C5 step 6: the wrapper holds a tensor to its declared dtype's C API
+    /// tag, so a dtype without one is refused here, naming it.
+    #[test]
+    fn export_tensor_dtype_without_a_c_tag_errors() {
+        for (dtype, ok) in [("f32", true), ("f64", true), ("bf16", true), ("int32", true), ("int64", false), ("bool", false), ("fp8_e4m3", false), ("f8", false)] {
+            let src = format!("@export\nfn f(x: Tensor<[4], {dtype}>) -> Tensor<[4], f32>:\n    return relu(x)\n");
+            let diags = parse_and_validate(&src);
+            let refused = diags.iter().any(|d| d.message.contains("has no C API dtype tag") && d.message.contains(dtype));
+            assert_eq!(refused, !ok, "{dtype}: {diags:?}");
+        }
+        let ret = "@export\nfn f(x: Tensor<[4], f32>) -> (Tensor<[4], f32>, Tensor<[4], uint8>):\n    return (x, x)\n";
+        let diags = parse_and_validate(ret);
+        assert!(diags.iter().any(|d| d.message.contains("the return value is a `uint8` tensor")), "{diags:?}");
     }
 
     #[test]
