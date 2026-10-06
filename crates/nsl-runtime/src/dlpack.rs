@@ -428,7 +428,7 @@ fn validate_dl_tensor(dl: &DLTensor) -> Result<(u16, u8, i64), String> {
     if numel > 0 && dl.data.is_null() {
         return Err(format!("{numel} elements but the data pointer is null"));
     }
-    if dl.byte_offset > isize::MAX as u64 || dl.byte_offset % elem != 0 {
+    if dl.byte_offset > isize::MAX as u64 || !dl.byte_offset.is_multiple_of(elem) {
         return Err(format!(
             "byte_offset {} is not a multiple of the {elem}-byte element",
             dl.byte_offset

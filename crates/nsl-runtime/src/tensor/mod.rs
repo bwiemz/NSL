@@ -5270,14 +5270,17 @@ mod tests {
         assert_eq!(dtype_element_size(DTYPE_INT8_BLOCKWISE), 1);
         assert_eq!(dtype_element_size(DTYPE_I32), 4);
 
-        // The C API uses the canonical tag space verbatim: the conversion
-        // chokepoints are validating IDENTITY functions. Any reintroduced
-        // inversion fails here.
+        // The C API uses the canonical tag space verbatim up to int32: the
+        // conversion chokepoints are validating IDENTITY functions. Any
+        // reintroduced inversion fails here. `DTYPE_INT8_BLOCKWISE` is
+        // internal -- its buffer is not `len` bytes -- so a host descriptor
+        // carrying it is refused (C5 step 6).
         use crate::c_api::{capi_dtype_to_nsl, nsl_dtype_to_capi};
+        assert_eq!(capi_dtype_to_nsl(DTYPE_INT8_BLOCKWISE as i32), None);
         for tag in [
             DTYPE_F64, DTYPE_F32, DTYPE_FP16, DTYPE_BF16, DTYPE_INT8,
             DTYPE_FP8E4M3, DTYPE_FP8E5M2, DTYPE_U16_TOKEN, DTYPE_U16_SEGMENT,
-            DTYPE_I32, DTYPE_INT8_BLOCKWISE,
+            DTYPE_I32,
         ] {
             assert_eq!(nsl_dtype_to_capi(tag), tag as i32, "C-API tag must equal canonical tag {tag}");
             assert_eq!(
