@@ -311,6 +311,18 @@ pub use nsl_abi::wire::dtype::{
     DTYPE_U16_TOKEN,
 };
 
+/// Refuse a binary op on two tensors of different dtypes (C5 step 4). Called
+/// at the entry of each op, before any device reconciliation, so the message
+/// names the op and both dtypes whichever arm would have run. Gated per op by
+/// `nsl-runtime/tests/mixed_dtype_refusal.rs`.
+#[inline]
+pub(crate) fn require_same_dtype(op: &str, a: i64, b: i64) {
+    let (da, db) = (NslTensor::from_ptr_ref(a).dtype, NslTensor::from_ptr_ref(b).dtype);
+    if da != db {
+        crate::fatal::mixed_dtypes(op, da, db);
+    }
+}
+
 #[inline]
 pub(crate) fn assert_elementwise_byte_copy(dtype: u16, op: &str) {
     if dtype < DTYPE_CUSTOM_START {
@@ -873,8 +885,8 @@ impl NslTensor {
     /// Sound in-place mutation remains available through the codegen-proven
     /// channels, which are unaffected: the `nsl_tensor_*_inplace` variants
     /// (selected only for single-use bindings / ownership-lowering-proven
-    /// linear values) and the binary `*_inplace_fbip` / relinquish-flag
-    /// paths (explicit compile-time transfer of ownership). If a
+    /// linear values) and the binary relinquish-flag paths (explicit
+    /// compile-time transfer of ownership). If a
     /// refcount-based fast path is ever wanted again, borrows must first be
     /// made to retain — the counts cannot carry this decision today.
     #[inline]
@@ -1965,21 +1977,22 @@ pub extern "C" fn nsl_tensor_zeros_like_host_f32(template_ptr: i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
+    // A dtype mismatch is refused (C5 step 4). It used to be cast into dst's
+    // dtype here, for CPU-f64 gradient chains on a GPU run -- which stopped
+    // existing when a download began keeping the f32 tag (step 2a).
+    require_same_dtype("nsl_tensor_add_inplace", dst_ptr, src_ptr);
     let dst = NslTensor::from_ptr_ref(dst_ptr);
     evict_bf16_cast_image(dst);
     {
         // PCA Stage C hardening: reconcile a mismatched src instead of
         // aborting. Legitimate gradients can arrive as transpose VIEWS
-        // (non-contiguous) or as CPU-f64 chains on a GPU run (any adjoint
-        // op that only has a CPU lowering) — the non-inplace binary ops
-        // already reconcile exactly like this. The warn-once keeps the
-        // perf smell visible: a converted src on every step means some
-        // producer op should grow a device kernel.
+        // (non-contiguous) or on the other device (any adjoint op that only
+        // has a CPU lowering) — the non-inplace binary ops already reconcile
+        // the device exactly like this. The warn-once keeps the perf smell
+        // visible: a migrated src on every step means some producer op
+        // should grow a device kernel.
         let src_probe = NslTensor::from_ptr_ref(src_ptr);
-        if src_probe.device != dst.device
-            || src_probe.dtype != dst.dtype
-            || !src_probe.is_contiguous()
-        {
+        if src_probe.device != dst.device || !src_probe.is_contiguous() {
             static WARNED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             // NSL_RECONCILE_DEBUG=1 narrates EVERY reconciliation with the
@@ -1994,11 +2007,10 @@ pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
                     .map(|i| unsafe { *src_probe.shape.add(i) })
                     .collect();
                 crate::nsl_log!(INFO, "nsl", 
-                    "[nsl] add_inplace: reconciling src (device {} -> {}, dtype {} -> {}, \
+                    "[nsl] add_inplace: reconciling src (device {} -> {}, \
                      contiguous={}, shape={dims:?}) — repeated reconciliation is a perf \
                      smell (CPU-lowered producer on a GPU run?)",
-                    src_probe.device, dst.device, src_probe.dtype, dst.dtype,
-                    src_probe.is_contiguous()
+                    src_probe.device, dst.device, src_probe.is_contiguous()
                 );
             }
             let contig = if src_probe.is_contiguous() {
@@ -2006,75 +2018,26 @@ pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
             } else {
                 nsl_tensor_contiguous(src_ptr)
             };
-            // Dtype first: `to_device_like` converts dtype only as part of a
-            // CPU<->GPU transfer; a same-device dtype gap (CPU f64 grad into
-            // a CPU f32 buffer read back from the GPU) needs an explicit
-            // cast. nsl_tensor_cast is CPU-only, which is exactly the only
-            // case where a dtype gap can exist (GPU tensors are always f32).
-            let contig_probe = NslTensor::from_ptr_ref(contig);
-            let casted = if contig_probe.dtype == 0 && dst.dtype == 1 && contig_probe.device == 0 {
-                // f64 host grad into an f32 buffer: plain downcast copy.
-                // (nsl_tensor_cast is the CPDT F32/FP16/BF16 tool and
-                // rejects f64 sources.)
-                let shape: Vec<i64> = (0..contig_probe.ndim as usize)
-                    .map(|i| unsafe { *contig_probe.shape.add(i) })
-                    .collect();
-                let out_ptr = crate::cpu::create_tensor_with_shape_rs_dtype(&shape, 1);
-                if out_ptr != 0 {
-                    let out_t = NslTensor::from_ptr(out_ptr);
-                    let n = contig_probe.len as usize;
-                    let src_f64 = contig_probe.data as *const f64;
-                    let dst_f32 = out_t.data as *mut f32;
-                    for i in 0..n {
-                        unsafe { *dst_f32.add(i) = *src_f64.add(i) as f32 };
-                    }
-                }
-                out_ptr
-            } else if contig_probe.dtype == 1 && dst.dtype == 0 && contig_probe.device == 0 {
-                // f32 host src into an f64 buffer: plain upcast copy
-                // (nsl_tensor_cast has no f64 TARGET either).
-                let shape: Vec<i64> = (0..contig_probe.ndim as usize)
-                    .map(|i| unsafe { *contig_probe.shape.add(i) })
-                    .collect();
-                let out_ptr = crate::cpu::create_tensor_with_shape_rs_dtype(&shape, 0);
-                if out_ptr != 0 {
-                    let out_t = NslTensor::from_ptr(out_ptr);
-                    let n = contig_probe.len as usize;
-                    let src_f32 = contig_probe.data as *const f32;
-                    let dst_f64 = out_t.data as *mut f64;
-                    for i in 0..n {
-                        unsafe { *dst_f64.add(i) = f64::from(*src_f32.add(i)) };
-                    }
-                }
-                out_ptr
-            } else if contig_probe.dtype != dst.dtype && contig_probe.device == 0 {
-                crate::tensor::precision_cast::nsl_tensor_cast(contig, dst.dtype as i64)
-            } else {
-                contig
-            };
-            if casted != contig && contig != src_ptr {
-                nsl_tensor_free(contig);
-            }
-            let migrated = nsl_tensor_to_device_like(casted, dst_ptr);
+            let migrated = nsl_tensor_to_device_like(contig, dst_ptr);
             if migrated != 0 && migrated != src_ptr {
                 nsl_tensor_add_inplace(dst_ptr, migrated);
                 // Refcount balance (review finding): when `to_device_like`
-                // is a same-placement no-op it returns `casted` itself with
-                // an EXTRA refcount — so freeing `migrated` and `casted`
+                // is a same-placement no-op it returns `contig` itself with
+                // an EXTRA refcount — so freeing `migrated` and `contig`
                 // independently is correct in BOTH cases: distinct pointers
                 // get one free each; an aliased pointer gets its rc dropped
                 // twice (bump + original ownership).
                 nsl_tensor_free(migrated);
-                if casted != src_ptr {
-                    nsl_tensor_free(casted);
+                if contig != src_ptr {
+                    nsl_tensor_free(contig);
                 }
                 return;
             }
             // Migration failed (returned 0 or the raw src): drop the temp
             // and fall through to the strict asserts, which will report the
             // residual mismatch loudly.
-            if casted != src_ptr {
-                nsl_tensor_free(casted);
+            if contig != src_ptr {
+                nsl_tensor_free(contig);
             }
         }
     }
@@ -2089,21 +2052,6 @@ pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
         dst.len, src.len,
         "nsl_tensor_add_inplace: dst len {} != src len {}",
         dst.len, src.len
-    );
-    if dst.dtype != src.dtype && std::env::var("NSL_ALIGN_DEBUG").is_ok() {
-        let shp = |t: &NslTensor| (0..t.ndim as usize)
-            .map(|i| unsafe { *t.shape.add(i) }.to_string())
-            .collect::<Vec<_>>()
-            .join("x");
-        crate::nsl_log!(WARN, "align-debug", 
-            "[align-debug] add_inplace mismatch: dst dev={} dtype={} shape={} | src dev={} dtype={} shape={} contig={}",
-            dst.device, dst.dtype, shp(dst), src.device, src.dtype, shp(src), src.is_contiguous()
-        );
-    }
-    assert_eq!(
-        dst.dtype, src.dtype,
-        "nsl_tensor_add_inplace: dtype mismatch (dst={}, src={})",
-        dst.dtype, src.dtype
     );
     // Device memory: co-resident f32 operands take the elementwise add
     // kernel with the output aliased to dst — zero PCIe traffic, and
@@ -2142,11 +2090,10 @@ pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
                 unsafe { *dc.data_f64().add(i) += *sc.data_f64().add(i); }
             }
         }
-        // Copy result back to GPU. The GPU buffer is f32 (canonical GPU dtype).
-        // The CPU result `dc` may be f32 or f64 depending on the migration path
-        // (`nsl_tensor_to_device` upcasts GPU f32 → CPU f64). HtoD with a
-        // f64-sized src would overrun the f32 dst buffer, so down-convert when
-        // needed before the copy.
+        // Copy result back to GPU. Since C5 step 2a a download keeps the tag,
+        // so `dc` has dst's dtype and the f64 staging arm below is unreachable
+        // (no device tensor is f64); it predates that, when the download
+        // upcast f32 to f64 and an f64-sized HtoD would have overrun dst.
         let len = dc.len as usize;
         let f32_bytes = len * std::mem::size_of::<f32>();
         if dc.dtype == 1 {
@@ -2910,6 +2857,8 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
 pub extern "C" fn nsl_tensor_layernorm(
     input_ptr: i64, weight_ptr: i64, bias_ptr: i64, eps: f64,
 ) -> i64 {
+    require_same_dtype("nsl_tensor_layernorm", input_ptr, weight_ptr);
+    require_same_dtype("nsl_tensor_layernorm", input_ptr, bias_ptr);
     // GPU path: native fused LayerNorm kernel.
     {
         let input_ref = NslTensor::from_ptr(input_ptr);
@@ -3116,6 +3065,7 @@ pub extern "C" fn nsl_tensor_layernorm(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_rmsnorm(input_ptr: i64, weight_ptr: i64, eps: f64) -> i64 {
+    require_same_dtype("nsl_tensor_rmsnorm", input_ptr, weight_ptr);
     // GPU path: native fused RMSNorm kernel.
     {
         let input_ref = NslTensor::from_ptr(input_ptr);
@@ -3740,6 +3690,10 @@ pub extern "C" fn nsl_tensor_conv2d(
     input_ptr: i64, weight_ptr: i64, bias_ptr: i64,
     stride_h: i64, stride_w: i64, pad_h: i64, pad_w: i64,
 ) -> i64 {
+    require_same_dtype("nsl_tensor_conv2d", input_ptr, weight_ptr);
+    if bias_ptr != 0 {
+        require_same_dtype("nsl_tensor_conv2d", input_ptr, bias_ptr);
+    }
     let input = NslTensor::from_ptr(input_ptr);
 
     // GPU dispatch: native conv2d kernel
@@ -3793,7 +3747,10 @@ pub extern "C" fn nsl_tensor_conv2d(
     let w_out = (w + 2 * pw - kw) / sw + 1;
 
     let in_dtype = input.dtype;
-    let out_dtype: u16 = if in_dtype == 1 || weight.dtype == 1 { 1 } else { 0 };
+    let out_dtype: u16 = match in_dtype {
+        0 | 1 => in_dtype,
+        other => crate::fatal::unsupported_dtype("nsl_tensor_conv2d", other),
+    };
 
     let out_len = n * c_out * h_out * w_out;
     let out_shape = checked_alloc(4 * std::mem::size_of::<i64>()) as *mut i64;
@@ -4008,6 +3965,7 @@ pub extern "C" fn nsl_tensor_maxpool2d(
 /// Add 1D bias to 2D tensor.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
+    require_same_dtype("nsl_tensor_bias_add", tensor_ptr, bias_ptr);
     let tensor = NslTensor::from_ptr(tensor_ptr);
     let bias = NslTensor::from_ptr(bias_ptr);
 
@@ -4044,7 +4002,10 @@ pub extern "C" fn nsl_tensor_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
     }
 
     let in_dtype = tensor.dtype;
-    let out_dtype: u16 = if in_dtype == 1 || bias.dtype == 1 { 1 } else { 0 };
+    let out_dtype: u16 = match in_dtype {
+        0 | 1 => in_dtype,
+        other => crate::fatal::unsupported_dtype("nsl_tensor_bias_add", other),
+    };
 
     let out_ndim: i64 = 2;
     let out_len = (rows * cols) as i64;
@@ -4340,7 +4301,8 @@ pub extern "C" fn nsl_tensor_to_device_like(src_ptr: i64, ref_ptr: i64) -> i64 {
 /// in-place accumulation into `acc_ptr`. A host gradient in another float
 /// dtype (an f64 grad for an f32 device accumulator) is converted on the host
 /// first, explicitly -- the accumulator's dtype is the one the sum is kept in,
-/// as `nsl_tensor_add_inplace` already does -- and only then copied, because
+/// and `nsl_tensor_add_inplace` refuses a mismatch (C5 step 4) -- and only
+/// then copied, because
 /// an upload is a byte copy that refuses f64 (C5 step 2b). Returns an OWNED
 /// reference, like [`nsl_tensor_to_device_like`].
 #[unsafe(no_mangle)]

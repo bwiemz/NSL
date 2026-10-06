@@ -2723,6 +2723,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- **A tensor op on two different dtypes is refused** (C5 step 4,
+  `docs/superpowers/specs/2026-09-26-dtype-semantics-design.md`). The CPU
+  used to convert silently: if either operand was f32 the result was f32 and
+  the other operand was narrowed per element ("f32 wins"), in `+ - * /`,
+  matmul, conv2d and bias_add; compare and where read each operand at its
+  own width; `tensor_cat` converted later inputs into the first one's dtype;
+  and `add_inplace` cast its source into the destination's dtype. Each now
+  stops with `Fatal::UnsupportedDtype` (exit 17), naming the op, both dtypes
+  and the conversion: `nsl_tensor_add: operands have different dtypes, f32
+  and f64; ... convert one operand with .to(f32) or .to(f64)`. The same
+  check covers layernorm/rmsnorm weights, `scalar_mul_add_inplace` and
+  sparse SpMM/SpMV.
+  - **Nothing the compiler emits mixes dtypes on its own.** Source AD makes
+    its constants f32 rank-0 tensors, so a grad block the checker typed f64
+    is now left to the tape (which keeps f64) instead of lowering to a mix;
+    `nsl_qtensor_dequantize` returns f32 (it returned f64, beside f32
+    activations), and `nsl_qtensor_matmul_mixed` dequantizes in the
+    activation's dtype. `nsl_qtensor_quantize` accepts an f32 tensor -- it
+    read f64 only, so quantizing any default tensor aborted.
+  - **Removed:** `nsl_tensor_{add,sub,mul,div}_inplace_fbip`. Nothing called
+    them, and for any pair but f32/f32 they read and wrote both buffers as
+    f64 -- an out-of-bounds write on an f32 destination.
+  - **Gates:** `nsl-runtime/tests/mixed_dtype_refusal.rs` (one subprocess
+    per op; asserts the exit code, the op name and both dtypes, so deleting
+    an op's check fails it) and `nsl-cli/tests/dtype_mixed_refusal.rs` (an
+    f64 program trains f64-exact under both AD modes; a mixed program is
+    refused). The checker's compile-time refusal is the next step.
+
 - **A GPU → CPU transfer keeps the dtype tag** (C5 step 2a,
   `docs/superpowers/specs/2026-09-26-dtype-semantics-design.md`). The
   download arm of `nsl_tensor_to_device` used to widen f32 to f64, so an f32

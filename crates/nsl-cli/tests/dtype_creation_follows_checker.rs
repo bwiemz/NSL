@@ -93,13 +93,14 @@ print("END_f")
     assert!(f.contains("0.09999999999999998"), "f64-annotated ones() - 0.9 stays f64: {f}");
 }
 
-/// Source AD lowers creation calls to the f32 FFIs, so a grad block holding
-/// an f64-annotated creation is left to the tape -- whose codegen creates
-/// f64 -- instead of silently computing it in f32.
+/// Source AD lowers creation calls to the f32 FFIs and makes its constants f32
+/// rank-0 tensors, so a grad block over f64 tensors is left to the tape --
+/// whose codegen keeps f64 -- instead of mixing dtypes (refused since C5 step
+/// 4) or silently computing in f32.
 #[test]
-fn source_ad_leaves_an_f64_creation_to_the_tape() {
+fn source_ad_leaves_an_f64_grad_block_to_the_tape() {
     let src = r#"
-let x = full([3], 2.0)
+let x: Tensor<[3], f64> = full([3], 2.0)
 let (l, d) = grad(x):
     let c: Tensor<[3], f64> = full([3], 0.1)
     sum(x * x) + sum(c)
@@ -109,8 +110,8 @@ print("END_d")
 "#;
     let (out, err) = run_with(src, &["--source-ad"]);
     assert!(
-        err.contains("f64-annotated full() is not lowered by source AD"),
-        "source AD must refuse the f64 creation:\n{err}"
+        err.contains("this grad block computes on f64 tensors, which source AD does not lower"),
+        "source AD must refuse the f64 grad block:\n{err}"
     );
     assert!(err.contains("falling back to tape-based AD"), "{err}");
     assert_eq!(between(&out, "d"), "tensor([4.0, 4.0, 4.0])");

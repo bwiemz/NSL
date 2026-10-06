@@ -974,8 +974,8 @@ pub extern "C" fn nsl_tensor_silu_backward(grad_ptr: i64, x_ptr: i64) -> i64 {
     // share `x`'s shape/device/dtype — e.g. a scalar sum/mean seed [1]
     // broadcasting against x[n], as in `sum(silu(x))` — reproduce the six-op
     // sequence the compiler emitted before fusion (whose final `nsl_tensor_mul`
-    // broadcasts grad and whose sub/mul/add promote across dtype), numerically
-    // equivalent to the pre-fusion path. The common mid-network case (grad
+    // broadcasts grad, and refuses a grad of another dtype -- C5 step 4),
+    // numerically equivalent to the pre-fusion path. The common mid-network case (grad
     // shape/device/dtype == x) takes the single fused launch below. Mirrors the
     // sigmoid/tanh backward fallbacks (p4 slice 3).
     if !gt.shape_eq(xt) || gt.device != xt.device || gt.dtype != xt.dtype {
@@ -1199,9 +1199,10 @@ pub extern "C" fn nsl_tensor_sigmoid_backward(grad_ptr: i64, y_ptr: i64) -> i64 
     // Broadcast/mismatched-grad fallback (scalar sum/mean seed vs y[n],
     // cross-device, or mixed dtype): reproduce the three-op sequence the compiler
     // emitted pre-fusion (dtype-matched `1.0` constant), whose final `nsl_tensor_mul`
-    // broadcasts grad and whose sub/mul promote across dtype — numerically
-    // equivalent to the pre-fusion path. The dtype guard also keeps the fast
-    // path's flat, single-dtype CPU loop from reading `grad` with `y`'s accessor.
+    // broadcasts grad and refuses a grad of another dtype (C5 step 4) —
+    // numerically equivalent to the pre-fusion path. The dtype guard also keeps
+    // the fast path's flat, single-dtype CPU loop from reading `grad` with `y`'s
+    // accessor.
     if !gt.shape_eq(yt) || gt.device != yt.device || gt.dtype != yt.dtype {
         let one = crate::tensor::nsl_tensor_scalar(1.0, if yt.dtype == 0 { 0 } else { 1 });
         let t1 = crate::tensor::nsl_tensor_sub(one, y_ptr, 0); // 1 - y
@@ -1288,9 +1289,10 @@ pub extern "C" fn nsl_tensor_tanh_backward(grad_ptr: i64, y_ptr: i64) -> i64 {
     // Broadcast/mismatched-grad fallback (scalar sum/mean seed vs y[n],
     // cross-device, or mixed dtype): reproduce the three-op sequence the compiler
     // emitted pre-fusion (dtype-matched `1.0` constant), whose final `nsl_tensor_mul`
-    // broadcasts grad and whose sub/mul promote across dtype — numerically
-    // equivalent to the pre-fusion path. The dtype guard also keeps the fast
-    // path's flat, single-dtype CPU loop from reading `grad` with `y`'s accessor.
+    // broadcasts grad and refuses a grad of another dtype (C5 step 4) —
+    // numerically equivalent to the pre-fusion path. The dtype guard also keeps
+    // the fast path's flat, single-dtype CPU loop from reading `grad` with `y`'s
+    // accessor.
     if !gt.shape_eq(yt) || gt.device != yt.device || gt.dtype != yt.dtype {
         let one = crate::tensor::nsl_tensor_scalar(1.0, if yt.dtype == 0 { 0 } else { 1 });
         let y_sq = crate::tensor::nsl_tensor_mul(y_ptr, y_ptr, 0); // y*y
@@ -1433,7 +1435,7 @@ pub extern "C" fn nsl_tensor_gelu_backward(grad_ptr: i64, x_ptr: i64) -> i64 {
     // cross-device, mixed dtype): materialize `deriv = gelu'(x)` as a fresh
     // tensor, then `grad * deriv` via the broadcasting `nsl_tensor_mul` (grad
     // first, matching the pre-fusion final-op order so the output follows
-    // grad's placement).
+    // grad's placement; a grad of another dtype is refused there, C5 step 4).
     if !gt.shape_eq(xt) || gt.device != xt.device || gt.dtype != xt.dtype {
         let deriv = if xt.device > 0 {
             #[cfg(feature = "cuda")]
@@ -1840,91 +1842,6 @@ pub extern "C" fn nsl_tensor_silu_inplace(ptr: i64) -> i64 {
     }
     super::fbip_record_reuse();
     ptr
-}
-
-// ---------------------------------------------------------------------------
-// Static reuse: unconditional in-place binary variants (Phase 2, Item 3)
-//
-// The 11 unary inplace variants were added in Phase 1 (lines 921-1008 above).
-// These binary variants are new — they skip all runtime checks and operate
-// directly on the left operand's buffer. Only safe when M38a proves left is
-// uniquely owned and shapes match.
-// ---------------------------------------------------------------------------
-
-/// Unconditional in-place add: left += right.
-#[unsafe(no_mangle)]
-pub extern "C" fn nsl_tensor_add_inplace_fbip(left_ptr: i64, right_ptr: i64) -> i64 {
-    let left = NslTensor::from_ptr_ref(left_ptr);
-    let right = NslTensor::from_ptr_ref(right_ptr);
-    let len = left.len.min(right.len) as usize;
-    if left.dtype == 1 && right.dtype == 1 {
-        let ld = left.data as *mut f32;
-        let rd = right.data as *const f32;
-        for i in 0..len { unsafe { *ld.add(i) += *rd.add(i) }; }
-    } else {
-        let ld = left.data as *mut f64;
-        let rd = right.data as *const f64;
-        for i in 0..len { unsafe { *ld.add(i) += *rd.add(i) }; }
-    }
-    super::fbip_record_reuse();
-    left_ptr
-}
-
-/// Unconditional in-place sub: left -= right.
-#[unsafe(no_mangle)]
-pub extern "C" fn nsl_tensor_sub_inplace_fbip(left_ptr: i64, right_ptr: i64) -> i64 {
-    let left = NslTensor::from_ptr_ref(left_ptr);
-    let right = NslTensor::from_ptr_ref(right_ptr);
-    let len = left.len.min(right.len) as usize;
-    if left.dtype == 1 && right.dtype == 1 {
-        let ld = left.data as *mut f32;
-        let rd = right.data as *const f32;
-        for i in 0..len { unsafe { *ld.add(i) -= *rd.add(i) }; }
-    } else {
-        let ld = left.data as *mut f64;
-        let rd = right.data as *const f64;
-        for i in 0..len { unsafe { *ld.add(i) -= *rd.add(i) }; }
-    }
-    super::fbip_record_reuse();
-    left_ptr
-}
-
-/// Unconditional in-place mul: left *= right.
-#[unsafe(no_mangle)]
-pub extern "C" fn nsl_tensor_mul_inplace_fbip(left_ptr: i64, right_ptr: i64) -> i64 {
-    let left = NslTensor::from_ptr_ref(left_ptr);
-    let right = NslTensor::from_ptr_ref(right_ptr);
-    let len = left.len.min(right.len) as usize;
-    if left.dtype == 1 && right.dtype == 1 {
-        let ld = left.data as *mut f32;
-        let rd = right.data as *const f32;
-        for i in 0..len { unsafe { *ld.add(i) *= *rd.add(i) }; }
-    } else {
-        let ld = left.data as *mut f64;
-        let rd = right.data as *const f64;
-        for i in 0..len { unsafe { *ld.add(i) *= *rd.add(i) }; }
-    }
-    super::fbip_record_reuse();
-    left_ptr
-}
-
-/// Unconditional in-place div: left /= right.
-#[unsafe(no_mangle)]
-pub extern "C" fn nsl_tensor_div_inplace_fbip(left_ptr: i64, right_ptr: i64) -> i64 {
-    let left = NslTensor::from_ptr_ref(left_ptr);
-    let right = NslTensor::from_ptr_ref(right_ptr);
-    let len = left.len.min(right.len) as usize;
-    if left.dtype == 1 && right.dtype == 1 {
-        let ld = left.data as *mut f32;
-        let rd = right.data as *const f32;
-        for i in 0..len { unsafe { *ld.add(i) /= *rd.add(i) }; }
-    } else {
-        let ld = left.data as *mut f64;
-        let rd = right.data as *const f64;
-        for i in 0..len { unsafe { *ld.add(i) /= *rd.add(i) }; }
-    }
-    super::fbip_record_reuse();
-    left_ptr
 }
 
 #[cfg(test)]

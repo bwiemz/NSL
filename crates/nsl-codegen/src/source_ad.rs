@@ -2275,9 +2275,17 @@ pub fn analyze_saved_tensors(primal: &WengertList, adjoint: &WengertList) -> Vec
 pub struct WengertExtractor<'a> {
     interner: &'a Interner,
     /// The checker's types, when the caller installs them (`set_type_map`).
-    /// Read to refuse what the Wengert lowering cannot honour -- an
-    /// f64-annotated creation (C5 step 3).
+    /// Read to refuse what the Wengert lowering cannot honour: an f64 tensor
+    /// (`refused_f64`).
     type_map: Option<&'a nsl_semantic::checker::TypeMap>,
+    /// Set when an expression the checker typed an f64 tensor was reached.
+    /// The Wengert lowering makes its constants f32 rank-0 tensors and lowers
+    /// creation calls to the f32 FFIs, which an f64 graph would mix with its
+    /// f64 operands -- refused at run time since C5 step 4 -- so such a grad
+    /// block stays on the tape, whose codegen keeps every dtype. Checked by
+    /// `extract_stmts` as well as propagated as `None`, so no caller that
+    /// tolerates a failed sub-extraction can carry on past it.
+    refused_f64: bool,
     list: WengertList,
     /// Maps AST symbol -> WengertList VarId.
     symbol_to_var: HashMap<nsl_ast::Symbol, VarId>,
@@ -2805,6 +2813,7 @@ impl<'a> WengertExtractor<'a> {
                 var_names: HashMap::new(),
                 var_types: HashMap::new(),
             },
+            refused_f64: false,
             symbol_to_var: HashMap::new(),
             next_var: 0,
             is_static: true,
@@ -3757,8 +3766,7 @@ impl<'a> WengertExtractor<'a> {
         self.type_map = Some(type_map);
     }
 
-    /// Whether the checker typed `expr` an f64 tensor (C5 step 3: only an
-    /// annotation makes a creation f64).
+    /// Whether the checker typed `expr` an f64 tensor.
     fn typed_f64_tensor(&self, expr: &nsl_ast::expr::Expr) -> bool {
         self.type_map
             .and_then(|tm| tm.get(&expr.id))
@@ -3983,7 +3991,7 @@ impl<'a> WengertExtractor<'a> {
     /// Returns false if dynamic control flow is detected.
     pub fn extract_stmts(&mut self, stmts: &[nsl_ast::stmt::Stmt]) -> bool {
         for stmt in stmts {
-            if !self.extract_stmt(stmt) {
+            if !self.extract_stmt(stmt) || self.refused_f64 {
                 self.is_static = false;
                 nsl_log::nsl_log!(ERROR, "source-ad", 
                     "[source-ad] extraction failed at {:?} (line {:?})",
@@ -4093,6 +4101,17 @@ impl<'a> WengertExtractor<'a> {
     /// extraction calls go through this wrapper, so every subexpression is
     /// attributed.
     fn extract_expr(&mut self, expr: &nsl_ast::expr::Expr) -> Option<VarId> {
+        if self.typed_f64_tensor(expr) {
+            if !self.refused_f64 {
+                nsl_log::nsl_log!(WARN, "source-ad",
+                    "[source-ad] this grad block computes on f64 tensors, which source AD \
+                     does not lower (its constants are f32); falling back to tape-based AD \
+                     for this grad block"
+                );
+            }
+            self.refused_f64 = true;
+            return None;
+        }
         let result = self.extract_expr_inner(expr);
         if let Some(var) = result {
             self.var_nodes.entry(var).or_insert(expr.id);
@@ -5637,21 +5656,10 @@ impl<'a> WengertExtractor<'a> {
                     "tensor_cos" | "cos" => PrimalOp::Passthrough("cos".into()),
                     "tensor_sin" | "sin" => PrimalOp::Passthrough("sin".into()),
                     "rotate_half" => PrimalOp::Passthrough("rotate_half".into()),
-                    // Tensor construction (non-differentiable). An annotation
-                    // can make a creation f64 (C5 step 3), which the
-                    // passthrough lowering -- the f32 creation FFIs -- would
-                    // not honour; such a block stays on the tape, whose
-                    // codegen does. `zeros_like`/`ones_like` follow their
-                    // template at run time, so they need no check.
+                    // Tensor construction (non-differentiable). An f64-annotated
+                    // creation (C5 step 3) never gets here: `extract_expr`
+                    // refuses every f64-typed expression.
                     "arange" | "zeros" | "ones" | "full" | "randn" | "zeros_like" | "ones_like" => {
-                        if !func_name.ends_with("_like") && self.typed_f64_tensor(expr) {
-                            nsl_log::nsl_log!(WARN, "source-ad",
-                                "[source-ad] an f64-annotated {}() is not lowered by source AD; \
-                                 falling back to tape-based AD for this grad block",
-                                func_name
-                            );
-                            return None;
-                        }
                         PrimalOp::Passthrough(func_name.clone())
                     }
                     // Concatenation
