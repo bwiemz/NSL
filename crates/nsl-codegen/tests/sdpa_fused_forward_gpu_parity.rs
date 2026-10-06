@@ -183,6 +183,14 @@ fn oracle_attention_f64(
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> (f32, usize) {
     assert_eq!(a.len(), b.len());
+    // `d > max_abs` is false for a NaN `d`, so the loop below scores an
+    // all-NaN operand 0.0 — inside the tolerance. Refuse it first. Both
+    // operands: the call sites pass the GPU result second.
+    for (which, xs) in [("a", a), ("b", b)] {
+        if let Some(i) = xs.iter().position(|v| !v.is_finite()) {
+            panic!("max_abs_diff: non-finite entry in {which} at index {i} ({})", xs[i]);
+        }
+    }
     let mut max_abs = 0f32;
     let mut max_idx = 0usize;
     for (i, (&ai, &bi)) in a.iter().zip(b.iter()).enumerate() {
@@ -308,6 +316,11 @@ fn assert_matches_oracle(name: &str, seg: Option<&[u16]>, segment_masked: bool) 
     assert!(
         gpu_out.iter().all(|x| x.is_finite()),
         "{name}: GPU out contains non-finite values"
+    );
+    assert!(
+        gpu_lse.iter().all(|x| x.is_finite()),
+        "{name}: GPU lse contains non-finite values (first at index {:?})",
+        gpu_lse.iter().position(|x| !x.is_finite())
     );
     let out_norm: f32 = gpu_out.iter().map(|x| x * x).sum();
     assert!(

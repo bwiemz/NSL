@@ -285,15 +285,20 @@ fn fused_kl_ce_gpu_forward_and_backward_match_reference() {
     d2h(dws_dev, gpu_dws.as_mut_ptr() as *mut u8, V * HS * 4);
     d2h(dbs_dev, gpu_dbs.as_mut_ptr() as *mut u8, V * 4);
 
-    let max_err = |gpu: &[f32], r: &[f64]| {
+    let max_err = |name: &str, gpu: &[f32], r: &[f64]| {
+        // `f64::max` returns the non-NaN operand, so the fold below drops a
+        // NaN error and scores an all-NaN gradient 0.0. Refuse it first.
+        if let Some(i) = gpu.iter().position(|v| !v.is_finite()) {
+            panic!("{name}: non-finite entry in gpu at index {i} ({})", gpu[i]);
+        }
         gpu.iter()
             .zip(r.iter())
             .map(|(&g, &rr)| ((g as f64) - rr).abs())
             .fold(0f64, f64::max)
     };
-    let dxs_err = max_err(&gpu_dxs, &ref_dxs);
-    let dws_err = max_err(&gpu_dws, &ref_dws);
-    let dbs_err = max_err(&gpu_dbs, &ref_dbs);
+    let dxs_err = max_err("dx_s", &gpu_dxs, &ref_dxs);
+    let dws_err = max_err("dW_s", &gpu_dws, &ref_dws);
+    let dbs_err = max_err("dbias_s", &gpu_dbs, &ref_dbs);
     eprintln!("backward max abs err: dx_s={dxs_err:.2e} dW_s={dws_err:.2e} dbias_s={dbs_err:.2e}");
     assert!(dxs_err < 5e-3, "dx_s max err {dxs_err}");
     assert!(dws_err < 5e-3, "dW_s max err {dws_err}");

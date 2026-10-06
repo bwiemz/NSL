@@ -268,6 +268,14 @@ fn gradients_for_step(step: usize) -> Vec<f32> {
 // ---------------------------------------------------------------------------
 
 fn max_rel_err(a: &[f32], b: &[f32]) -> f32 {
+    // `f32::max` returns the non-NaN operand, so the fold below drops a NaN
+    // error and scores an all-NaN theta 0.0 — inside every `<` gate. Refuse
+    // it first, on both operands: every run here is a mechanism under test.
+    for (which, xs) in [("a", a), ("b", b)] {
+        if let Some(i) = xs.iter().position(|v| !v.is_finite()) {
+            panic!("max_rel_err: non-finite entry in {which} at index {i} ({})", xs[i]);
+        }
+    }
     a.iter()
         .zip(b.iter())
         .map(|(&x, &y)| {

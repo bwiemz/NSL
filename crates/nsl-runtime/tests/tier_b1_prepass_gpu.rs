@@ -176,6 +176,14 @@ fn x_prepass_matches_cpu_reference() {
     // Compare bit-exact (CPU uses the same RMSNorm formula + f16 narrowing;
     // GPU uses rsqrt.approx which is ~24-bit, slightly diff from libm sqrt;
     // allow a small ULP-level tolerance).
+    // `d > max_abs` (and `d > 1e-2`) is false for a NaN `d`, so the loop below
+    // scores a NaN output 0.0 and counts no mismatch. Refuse it first.
+    if let Some(i) = got.iter().position(|&g| !f16_to_f32(g).is_finite()) {
+        panic!(
+            "[x-prepass] non-finite entry in got at index {i} ({})",
+            f16_to_f32(got[i])
+        );
+    }
     let mut max_abs = 0f32;
     let mut mismatches = 0;
     for (i, (&e, &g)) in expected_chunked.iter().zip(got.iter()).enumerate() {

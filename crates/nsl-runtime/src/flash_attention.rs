@@ -7893,6 +7893,16 @@ mod tests {
     }
 
     fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        // `f32::max` returns the non-NaN operand, so the fold below drops a
+        // NaN difference and scores an all-NaN operand 0.0 — inside every
+        // tolerance, and equal to the 0.0 the bit-exact gates demand. Refuse
+        // it first, on both operands: every call site compares two runtime
+        // paths (naive vs flash, masked vs per-segment, strided vs contiguous).
+        for (which, xs) in [("a", a), ("b", b)] {
+            if let Some(i) = xs.iter().position(|v| !v.is_finite()) {
+                panic!("max_abs_diff: non-finite entry in {which} at index {i} ({})", xs[i]);
+            }
+        }
         a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
     }
 

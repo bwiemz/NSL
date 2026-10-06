@@ -110,6 +110,14 @@ fn dispatch_forward_kernel(
 
 #[allow(dead_code)]
 fn max_rel_err(a: &[f32], b: &[f32]) -> f32 {
+    // `f32::max` returns the non-NaN operand, so the fold below would drop a
+    // NaN error and score an all-NaN GPU output 0.0. Refuse it first. `a` is
+    // the GPU side at both call sites.
+    for (which, xs) in [("gpu", a), ("cpu", b)] {
+        if let Some(i) = xs.iter().position(|v| !v.is_finite()) {
+            panic!("max_rel_err: non-finite entry in {which} at index {i} ({})", xs[i]);
+        }
+    }
     a.iter()
         .zip(b.iter())
         .map(|(&x, &y)| {

@@ -809,6 +809,13 @@ mod tests {
             sl,
         );
         assert_eq!(out.len(), base.len());
+        // `max_err.max(nan)` keeps `max_err`, so the loop below would drop a
+        // NaN error and still see the finite entries' nonzero error. Refuse it.
+        for (which, xs) in [("int8 out", &out), ("f32 base", &base)] {
+            if let Some(i) = xs.iter().position(|v| !v.is_finite()) {
+                panic!("non-finite entry in {which} at index {i} ({})", xs[i]);
+            }
+        }
         let mut max_err = 0.0f32;
         for (a, b) in out.iter().zip(&base) {
             max_err = max_err.max((a - b).abs());

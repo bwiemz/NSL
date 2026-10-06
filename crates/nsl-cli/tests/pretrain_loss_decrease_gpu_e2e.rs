@@ -304,6 +304,13 @@ fn fase_deferred_matches_plain_adamw_checkpoint() {
     for (name, va) in &a {
         let vb = &b[name];
         assert_eq!(va.len(), vb.len(), "shape mismatch in {name}");
+        // `f64::max` returns the non-NaN operand, so the fold below drops a
+        // NaN difference and two diverged-to-NaN checkpoints score 0.0.
+        for (run, v) in [("FASE", va), ("plain", vb)] {
+            if let Some(i) = v.iter().position(|x| !x.is_finite()) {
+                panic!("{name}: non-finite entry in the {run} checkpoint at index {i} ({})", v[i]);
+            }
+        }
         let max_diff = va
             .iter()
             .zip(vb.iter())

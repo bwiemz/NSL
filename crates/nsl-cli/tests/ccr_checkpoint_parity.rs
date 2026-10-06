@@ -126,10 +126,20 @@ fn run_program(source: &str, tag: &str, cuda: bool, det: Det, extra_args: &[&str
 }
 
 /// Extract the first float from each loss line (e.g. `tensor([5.3214])` -> 5.3214).
+///
+/// A NaN or infinite loss (printed `NaN` / `inf` / `-inf`) is a FAILURE, not a
+/// line to skip. The digit scanner below finds no number in such a line, so it
+/// used to drop it and the comparison ran over the finite remainder.
 fn parse_losses(stream: &str) -> Vec<f64> {
     stream
         .lines()
-        .filter_map(|l| {
+        .enumerate()
+        .filter_map(|(i, l)| {
+            let lower = l.to_ascii_lowercase();
+            assert!(
+                !lower.contains("nan") && !lower.contains("inf"),
+                "non-finite loss at loss-stream line {i}: {l:?}"
+            );
             let mut num = String::new();
             let mut seen_digit = false;
             for c in l.chars() {
@@ -145,7 +155,9 @@ fn parse_losses(stream: &str) -> Vec<f64> {
                     break;
                 }
             }
-            num.parse::<f64>().ok()
+            let v = num.parse::<f64>().ok()?;
+            assert!(v.is_finite(), "non-finite loss at loss-stream line {i}: {l:?}");
+            Some(v)
         })
         .collect()
 }
@@ -183,6 +195,12 @@ fn parity_case(cuda: bool, det: Det, tag: &str) {
         ckpt.stderr
     );
     let bytes_c = std::fs::read(&save_c).expect("checkpointed model_save missing");
+
+    // Every loss must be finite: the gates below compare the streams as
+    // text, and two NaN streams compare equal. `parse_losses` refuses one.
+    for stream in [&base_a.loss_stream, &base_b.loss_stream, &ckpt.loss_stream] {
+        parse_losses(stream);
+    }
 
     if env_deterministic {
         assert_eq!(

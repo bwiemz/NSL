@@ -477,6 +477,15 @@ fn fused_linear_ce_gpu_forward_and_backward() {
          trusted for the dW/dbias comparison below"
     );
 
+    // Finiteness first. Every max-error loop below keeps its running max with
+    // `err > max`, which is false for a NaN `err`, so a NaN gradient entry
+    // would otherwise score 0.0 — inside every tolerance.
+    for (name, xs) in [("dx_gpu", &dx_gpu), ("dw_gpu", &dw_gpu), ("dbias_gpu", &dbias_gpu)] {
+        if let Some(i) = xs.iter().position(|v| !v.is_finite()) {
+            panic!("non-finite entry in {name} at index {i} ({})", xs[i]);
+        }
+    }
+
     // ── 7. Compare dx ─────────────────────────────────────────────────────
 
     let mut max_abs_err = 0f32;

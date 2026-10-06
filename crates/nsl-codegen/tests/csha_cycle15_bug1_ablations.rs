@@ -208,13 +208,27 @@ fn free_all(ptrs: &[i64]) {
     for &p in ptrs { if p != 0 { unsafe { nsl_test_cuda_free(p); } } }
 }
 
+/// Refuses a NaN or an infinity in either operand of the comparators below.
+/// Their folds use `f32::max`, which returns the non-NaN operand, so a NaN
+/// difference drops out and an all-NaN gradient scores 0.0 — a PASS. The
+/// first operand is the GPU side at every call site.
+fn assert_finite_operands(comparator: &str, gpu: &[f32], reference: &[f32]) {
+    for (which, xs) in [("gpu", gpu), ("reference", reference)] {
+        if let Some(i) = xs.iter().position(|v| !v.is_finite()) {
+            panic!("{comparator}: non-finite entry in {which} at index {i} ({})", xs[i]);
+        }
+    }
+}
+
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
+    assert_finite_operands("max_abs_diff", a, b);
     a.iter().zip(b.iter()).map(|(&x, &y)| (x - y).abs()).fold(0f32, f32::max)
 }
 
 fn max_rel_diff(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
+    assert_finite_operands("max_rel_diff", a, b);
     a.iter().zip(b.iter())
         .map(|(&x, &y)| (x - y).abs() / y.abs().max(1e-6))
         .fold(0f32, f32::max)
@@ -618,6 +632,10 @@ fn run_ablation(
     const F16_ACCUM_AMP: f32 = 16.0;
 
     let check = |name: &str, x: &[f32], y: &[f32], atol: f32, rtol: f32| -> bool {
+        // Named here; the comparators refuse it too, but anonymously.
+        if let Some(i) = x.iter().position(|v| !v.is_finite()) {
+            panic!("[{ablation_label}] {name}: non-finite entry in gpu at index {i} ({})", x[i]);
+        }
         let abs = max_abs_diff(x, y);
         let rel = max_rel_diff(x, y);
         // A tolerance below the storage floor is unsatisfiable by construction,

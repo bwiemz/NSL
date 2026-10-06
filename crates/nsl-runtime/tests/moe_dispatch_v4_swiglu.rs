@@ -64,6 +64,16 @@ fn make_f32_tensor(shape: &[i64], vals: &[f32]) -> i64 {
     ptr
 }
 
+/// Panics on a NaN or an infinity in a dispatch output, naming the array and
+/// the first index. Every max-error loop below keeps its running max with
+/// `d > max`, which is false for a NaN `d`, so a NaN output entry would
+/// otherwise score 0.0 — inside the 1e-6 gates.
+fn assert_all_finite(what: &str, xs: &[f32]) {
+    if let Some(i) = xs.iter().position(|v| !v.is_finite()) {
+        panic!("{what}: non-finite entry at index {i} ({})", xs[i]);
+    }
+}
+
 fn read_f32(ptr: i64, len: usize) -> Vec<f32> {
     let data = nsl_tensor_data_ptr(ptr) as *const f32;
     (0..len).map(|i| unsafe { *data.add(i) }).collect()
@@ -203,6 +213,7 @@ fn dispatch_v4_top_k_one_distinct_experts_matches_reference() {
     assert_ne!(out_ptr, 0, "v4 returned null for valid SwiGLU inputs");
     let got = read_f32(out_ptr, total_tokens * hidden);
 
+    assert_all_finite("got", &got);
     let mut max_abs = 0.0_f32;
     for (g, w) in got.iter().zip(expected.iter()) {
         let d = (g - w).abs();
@@ -294,6 +305,7 @@ fn dispatch_v4_top_k_two_symmetric_closed_form() {
     assert_ne!(out_ptr, 0);
     let got = read_f32(out_ptr, 4);
 
+    assert_all_finite("got", &got);
     let mut max_abs = 0.0_f32;
     for (g, w) in got.iter().zip(expected.iter()) {
         let d = (g - w).abs();
@@ -414,6 +426,7 @@ fn dispatch_v4_swiglu_differs_from_silu_when_gate_equals_up() {
         silu(1.5_f32) * 1.5_f32,
         silu(2.5_f32) * 2.5_f32,
     ];
+    assert_all_finite("got", &got);
     let mut max_abs = 0.0_f32;
     for (g, w) in got.iter().zip(expected.iter()) {
         let d = (g - w).abs();
@@ -662,6 +675,7 @@ fn dispatch_v4_geglu_matches_hand_reference() {
         expected[t * 2..(t + 1) * 2].copy_from_slice(&row);
     }
 
+    assert_all_finite("got", &got);
     let mut max_abs = 0.0_f32;
     for (g, w) in got.iter().zip(expected.iter()) {
         let d = (g - w).abs();
@@ -683,6 +697,8 @@ fn dispatch_v4_geglu_matches_hand_reference() {
         )
     };
     let swiglu_out = read_f32(swiglu_out_ptr, 4);
+    assert_all_finite("got", &got);
+    assert_all_finite("swiglu_out", &swiglu_out);
     let mut max_diff = 0.0_f32;
     for (g, s) in got.iter().zip(swiglu_out.iter()) {
         let d = (g - s).abs();
@@ -741,6 +757,7 @@ fn dispatch_v4_reglu_matches_hand_reference() {
         expected[t * 2..(t + 1) * 2].copy_from_slice(&row);
     }
 
+    assert_all_finite("got", &got);
     let mut max_abs = 0.0_f32;
     for (g, w) in got.iter().zip(expected.iter()) {
         let d = (g - w).abs();
@@ -760,6 +777,8 @@ fn dispatch_v4_reglu_matches_hand_reference() {
         )
     };
     let swiglu_out = read_f32(swiglu_out_ptr, 4);
+    assert_all_finite("got", &got);
+    assert_all_finite("swiglu_out", &swiglu_out);
     let mut max_diff = 0.0_f32;
     for (g, s) in got.iter().zip(swiglu_out.iter()) {
         let d = (g - s).abs();

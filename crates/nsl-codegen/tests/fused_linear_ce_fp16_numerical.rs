@@ -350,6 +350,11 @@ fn run_fp16_numerical(b: usize, s: usize, v: usize, h: usize, vocab_tile: u32) {
         b, s, v, h, &x_ref, &w_ref, &bias_ref, &targets, &ref_lse, 1.0,
     );
 
+    // `err > max_abs` is false for a NaN `err`, so the loop below scores a
+    // NaN dx entry 0.0 — inside the tolerance. Refuse it first.
+    if let Some(i) = dx_gpu.iter().position(|v| !v.is_finite()) {
+        panic!("non-finite entry in dx_gpu at index {i} ({})", dx_gpu[i]);
+    }
     let mut max_abs = 0f32;
     let mut n_checked = 0usize;
     for row in 0..rows {

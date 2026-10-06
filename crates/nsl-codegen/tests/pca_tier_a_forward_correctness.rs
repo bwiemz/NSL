@@ -401,6 +401,15 @@ fn launch_pca(
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> (f32, usize) {
     assert_eq!(a.len(), b.len());
+    // `d > max_abs` is false for a NaN `d`, so the loop below scores an
+    // all-NaN operand 0.0 — and the bit-exact gates (`== 0.0`) pass on two
+    // NaN outputs. Refuse it first, on both operands: several call sites
+    // compare two GPU launches, and not every caller checks finiteness itself.
+    for (which, xs) in [("a", a), ("b", b)] {
+        if let Some(i) = xs.iter().position(|v| !v.is_finite()) {
+            panic!("max_abs_diff: non-finite entry in {which} at index {i} ({})", xs[i]);
+        }
+    }
     let mut max_abs = 0f32;
     let mut max_idx = 0usize;
     for (i, (&ai, &bi)) in a.iter().zip(b.iter()).enumerate() {
