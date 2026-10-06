@@ -1825,6 +1825,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   `source_ad_norm_field_eps_gate` trains a model with reassigned stdlib norm
   eps under SGD -- tape, source AD and the fused RMSNorm backward agree, and a
   control at the default eps does not; a calibration build test.
+- **The checker refuses a tensor on a device that cannot hold its dtype
+  (C5 step 5).**
+  - `types::device_support` is the (device, dtype) table:
+    - The GPU computes f32 and stores fp16, bf16 and i32.
+    - The CPU computes f32 and f64 and stores fp16, bf16 and i32.
+    - f64 on any GPU device is refused.
+  - Until now the only enforcement was the runtime fatal at upload. Three
+    places are now compile errors naming `.to(f32)`:
+    - a type such as `Tensor<[n], f64, cuda>`;
+    - `x.to(cuda)` of a known-f64 tensor;
+    - `m.to(cuda)` of a model with an f64 field, which names the field
+      through sub-models and model arrays.
+  - Assignability compares devices before the unknown/rank-0 shape bypass,
+    which used to skip that comparison as it did dtype (fixed in step 4).
+  - That needed the device types to be honest. Builtins like `relu` and the
+    train callback's `loss` were typed `cpu` whatever their operand. They
+    now have an open device, which only creation builtins (host tensors)
+    and annotations set.
+  - A model field annotated with a device is checked against its
+    initialiser like any binding.
+  - `.to(cuda)` still types its result's device as open. The runtime moves
+    a binary op's second operand to the first one's device, so programs mix
+    moved and host tensors, and a precise device would refuse them.
+  - `@target` is not a placement (it is validated and then unused), so
+    there is nothing to check there.
+  - `nsl check` over the 328-file corpus baseline: no file changed.
 
 - **C5 step 3: one default float dtype, f32, and an `f64` annotation stores
   f64.** The checker typed every `zeros`/`ones`/`full`/`rand`/`randn`/

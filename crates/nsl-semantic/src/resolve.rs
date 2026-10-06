@@ -27,11 +27,18 @@ impl<'a> TypeResolver<'a> {
                 shape,
                 dtype,
                 device,
-            } => Type::Tensor {
-                shape: self.resolve_shape(shape),
-                dtype: self.resolve_dtype(*dtype),
-                device: self.resolve_device(device),
-            },
+            } => {
+                let dtype = self.resolve_dtype(*dtype);
+                let device = self.resolve_device(device);
+                // C5 step 5: a type naming a (device, dtype) pair the device
+                // cannot hold describes no tensor that can exist.
+                if let Some(msg) = device_refusal(&device, dtype) {
+                    self.diagnostics.push(
+                        Diagnostic::error(msg).with_label(type_expr.span, "not a tensor the device can hold"),
+                    );
+                }
+                Type::Tensor { shape: self.resolve_shape(shape), dtype, device }
+            }
             TypeExprKind::Param { shape, dtype } => Type::Param {
                 shape: self.resolve_shape(shape),
                 dtype: self.resolve_dtype(*dtype),

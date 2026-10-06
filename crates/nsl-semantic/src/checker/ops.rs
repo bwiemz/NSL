@@ -217,11 +217,108 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// The device a `.to(...)` argument names: `cuda`, `cuda(n)` or `cpu`.
+    fn device_operand(&self, arg: &Expr) -> Option<Device> {
+        match &arg.kind {
+            ExprKind::Ident(sym) => match self.resolve_name(*sym).as_str() {
+                "cuda" => Some(Device::Cuda(None)),
+                "cpu" => Some(Device::Cpu),
+                _ => None,
+            },
+            ExprKind::Call { callee, .. } => match &callee.kind {
+                ExprKind::Ident(sym) if self.resolve_name(*sym) == "cuda" => Some(Device::Cuda(None)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Refuse `x.to(device)` when the (device, dtype) table refuses x's
+    /// dtype there. For a model, every tensor field, through sub-models and
+    /// model arrays, is what moves.
+    fn check_device_move(&mut self, object: &Expr, device: &Device, span: Span) {
+        let Some(ty) = self.type_map.get(&object.id).cloned() else { return };
+        if let Some((_, dtype, _)) = ty.as_tensor_parts() {
+            if let Some(msg) = device_refusal(device, *dtype) {
+                self.diagnostics.push(Diagnostic::error(msg).with_label(span, "moved here"));
+            }
+            return;
+        }
+        let mut refused = Vec::new();
+        self.collect_refused_fields(&ty, device, "", &mut refused, 0);
+        if let Some((field, dtype)) = refused.first() {
+            let more = match refused.len() {
+                1 => String::new(),
+                n => format!(" (and {} more)", n - 1),
+            };
+            self.diagnostics.push(
+                Diagnostic::error(format!(
+                    "model field `{field}`{more} is {}: {}",
+                    display_dtype(dtype),
+                    device_refusal(device, *dtype).unwrap_or_default()
+                ))
+                .with_label(span, "the model is moved here"),
+            );
+        }
+    }
+
+    fn collect_refused_fields(
+        &self,
+        ty: &Type,
+        device: &Device,
+        prefix: &str,
+        out: &mut Vec<(String, DType)>,
+        depth: usize,
+    ) {
+        // Models nest a handful of levels; the bound only guards a cycle
+        // through a malformed registry.
+        if depth > 32 {
+            return;
+        }
+        let fields = match ty {
+            Type::Model { fields, .. } => fields.clone(),
+            Type::FixedModelArray { element_model, .. } => match self
+                .scopes
+                .lookup(self.current_scope, *element_model)
+                .map(|(_, info)| info.ty.clone())
+            {
+                Some(Type::Model { fields, .. }) => fields,
+                _ => return,
+            },
+            _ => return,
+        };
+        for (name, field_ty) in &fields {
+            let path = match prefix {
+                "" => self.resolve_name(*name),
+                p => format!("{p}.{}", self.resolve_name(*name)),
+            };
+            match field_ty.as_tensor_parts() {
+                Some((_, dtype, _)) => {
+                    if device_refusal(device, *dtype).is_some() {
+                        out.push((path, *dtype));
+                    }
+                }
+                None => self.collect_refused_fields(field_ty, device, &path, out, depth + 1),
+            }
+        }
+    }
+
     pub(crate) fn check_call(&mut self, callee: &Expr, args: &[Arg], span: Span) -> Type {
         let callee_ty = self.check_expr(callee);
 
         // Check each argument
         let arg_types: Vec<Type> = args.iter().map(|a| self.check_expr(&a.value)).collect();
+
+        // C5 step 5: moving a tensor, or a model holding one, to a device
+        // that cannot hold its dtype is a compile error, not the runtime
+        // fatal at the upload.
+        if let ExprKind::MemberAccess { object, member } = &callee.kind
+            && self.resolve_name(*member) == "to"
+            && let [arg] = args
+            && let Some(device) = self.device_operand(&arg.value)
+        {
+            self.check_device_move(object, &device, span);
+        }
 
         // `t.to(dtype)` / `t.to(device)`: the converted tensor's dtype, so
         // the conversion a dtype-mismatch error asks for is one the checker
@@ -241,9 +338,10 @@ impl<'a> TypeChecker<'a> {
                 "fp16" | "f16" => Some((DType::Fp16, device)),
                 "bf16" => Some((DType::Bf16, device)),
                 // A transfer keeps the dtype (C5 step 2). The device stays
-                // Unknown, as before: parameters are typed cpu even when a
-                // model is moved to the GPU, so a precise device would
-                // raise false device mismatches.
+                // Unknown: the runtime moves a binary op's second operand to
+                // the first one's device (`reconcile_device`), so programs
+                // mix a moved tensor with host ones and run, and a precise
+                // device here would refuse them.
                 "cpu" | "cuda" => Some((*dtype, Device::Unknown)),
                 _ => None,
             };

@@ -245,11 +245,14 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
     // an f64 `x` -- harmless while the checker ignored dtype mismatches, a
     // false refusal of a correct f64 program once it does (C5 step 4) -- and
     // an f32 parameter would refuse an f64 argument. Unknown matches any
-    // dtype; the runtime refuses a mismatch the checker cannot see.
+    // dtype; the runtime refuses a mismatch the checker cannot see. The
+    // device is open for the same reason: the result is on the operand's
+    // device, and a cpu here made a GPU argument a false device mismatch once
+    // an unknown shape stopped skipping the device check (C5 step 5).
     let tensor_ret = Type::Tensor {
         shape: Shape::unknown(),
         dtype: DType::Unknown,
-        device: Device::Cpu,
+        device: Device::Unknown,
     };
 
     // Activation functions, tensor trig, and rotate_half (take tensor, return tensor)

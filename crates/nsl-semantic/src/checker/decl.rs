@@ -87,12 +87,26 @@ impl<'a> TypeChecker<'a> {
 
     /// C5: a model field whose initializer's dtype is known and differs from
     /// the field's annotation (both stored at run time) is an error -- the
-    /// field would claim one dtype and hold another. Dtype only: a symbolic
-    /// shape built from the model's parameters is not compared here.
+    /// field would claim one dtype and hold another. The same for a known
+    /// device (step 5): a creation builtin makes a host tensor, so a field
+    /// annotated `cuda` would hold a cpu tensor until the model is moved. A
+    /// symbolic shape built from the model's parameters is not compared here.
     pub(crate) fn check_field_init_dtype(&mut self, field: Symbol, ann: &Type, init: &Type, span: Span) {
-        let (Some((_, ad, _)), Some((_, vd, _))) = (ann.as_tensor_parts(), init.as_tensor_parts()) else {
+        let (Some((_, ad, adev)), Some((_, vd, vdev))) = (ann.as_tensor_parts(), init.as_tensor_parts()) else {
             return;
         };
+        if !matches!(adev, Device::Unknown) && !matches!(vdev, Device::Unknown) && adev != vdev {
+            let name = self.resolve_name(field);
+            self.diagnostics.push(
+                Diagnostic::error(format!(
+                    "field `{name}` is annotated on {}, but its initializer makes a {} tensor",
+                    display_device(&adev),
+                    display_device(&vdev)
+                ))
+                .with_label(span, "drop the device from the annotation and move the model with `.to(...)`"),
+            );
+            return;
+        }
         if ad == vd || !super::ops::stored_at_run_time(*ad) || !super::ops::stored_at_run_time(*vd) {
             return;
         }
