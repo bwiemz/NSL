@@ -80,6 +80,11 @@ fn run(save_path: &std::path::Path, checkpoint_blocks: bool, tag: &str) -> Out {
     }
 }
 
+/// The losses between the LOSS_STREAM markers.
+///
+/// A NaN or infinite loss (printed `NaN` / `inf` / `-inf`) is a FAILURE, not a
+/// line to skip: the deterministic branch of the gate compares model BYTES,
+/// and two runs that both went NaN match byte for byte.
 fn loss_stream(stdout: &str) -> Vec<f64> {
     let mut v = Vec::new();
     let mut in_stream = false;
@@ -88,7 +93,13 @@ fn loss_stream(stdout: &str) -> Vec<f64> {
             "LOSS_STREAM_BEGIN" => in_stream = true,
             "LOSS_STREAM_END" => in_stream = false,
             l if in_stream => {
+                let lower = l.to_ascii_lowercase();
+                assert!(
+                    !lower.contains("nan") && !lower.contains("inf"),
+                    "non-finite loss in the loss stream: {l:?}"
+                );
                 if let Ok(x) = l.parse::<f64>() {
+                    assert!(x.is_finite(), "non-finite loss in the loss stream: {l:?}");
                     v.push(x);
                 }
             }
@@ -124,6 +135,12 @@ fn ccr_activation_parity_on_gpu() {
     let bytes_base_a = std::fs::read(&save_base_a).expect("baseline A model missing");
     let bytes_base_b = std::fs::read(&save_base_b).expect("baseline B model missing");
     let bytes_ckpt = std::fs::read(&save_ckpt).expect("checkpointed model missing");
+
+    // Every loss must be finite, for BOTH branches below. `loss_stream`
+    // refuses a non-finite one.
+    for run in [&base_a, &base_b, &ckpt] {
+        loss_stream(&run.stdout);
+    }
 
     if bytes_base_a == bytes_base_b {
         // GPU baseline is run-to-run deterministic → CCR recompute must be

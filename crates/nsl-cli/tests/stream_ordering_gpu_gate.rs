@@ -82,6 +82,34 @@ fn run(eager: bool) -> (String, std::time::Duration, bool, String) {
     )
 }
 
+/// One loss per LOSS_STREAM line.
+///
+/// A NaN or infinite loss (printed `NaN` / `inf` / `-inf`) is a FAILURE, not a
+/// line to skip: the gate below compares the streams as text, and two runs
+/// that both went NaN print the same text.
+fn parse_losses(name: &str, stream: &str) -> Vec<f64> {
+    stream
+        .lines()
+        .enumerate()
+        .filter_map(|(i, l)| {
+            let lower = l.to_ascii_lowercase();
+            assert!(
+                !lower.contains("nan") && !lower.contains("inf"),
+                "{name}: non-finite loss at loss-stream line {i}: {l:?}"
+            );
+            let v: f64 = l
+                .chars()
+                .skip_while(|c| !c.is_ascii_digit() && *c != '-')
+                .take_while(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | 'e' | 'E' | '+'))
+                .collect::<String>()
+                .parse()
+                .ok()?;
+            assert!(v.is_finite(), "{name}: non-finite loss at loss-stream line {i}: {l:?}");
+            Some(v)
+        })
+        .collect()
+}
+
 #[test]
 #[ignore = "requires CUDA GPU (2 training runs)"]
 fn stream_ordered_matches_eager_bit_exact() {
@@ -93,6 +121,8 @@ fn stream_ordered_matches_eager_bit_exact() {
 
     let n = loss_eager.lines().filter(|l| l.contains("tensor(")).count();
     assert!(n >= 90, "expected ~96 losses, got {n}");
+    parse_losses("eager", &loss_eager);
+    parse_losses("stream-ordered", &loss_async);
 
     assert_eq!(
         loss_eager, loss_async,

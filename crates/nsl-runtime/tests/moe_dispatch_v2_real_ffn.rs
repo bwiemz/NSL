@@ -49,10 +49,10 @@ fn make_f32_tensor(shape: &[i64], vals: &[f32]) -> i64 {
     ptr
 }
 
-/// Panics on a NaN or an infinity in a dispatch output, naming the array and
-/// the first index. Every max-error loop below keeps its running max with
-/// `d > max`, which is false for a NaN `d`, so a NaN output entry would
-/// otherwise score 0.0 — inside the 1e-6 gates.
+/// Panics on a NaN or an infinity in a dispatch output (or its reference),
+/// naming the array and the first index. Every max-error loop below keeps
+/// its running max with `d > max`, which is false for a NaN `d`, so a NaN
+/// entry would otherwise score 0.0 — inside the 1e-6 gates.
 fn assert_all_finite(what: &str, xs: &[f32]) {
     if let Some(i) = xs.iter().position(|v| !v.is_finite()) {
         panic!("{what}: non-finite entry at index {i} ({})", xs[i]);
@@ -183,6 +183,7 @@ fn dispatch_v2_matches_granular_reference() {
     );
 
     assert_all_finite("got", &got);
+    assert_all_finite("want", &want);
     let mut max_abs_diff = 0.0_f32;
     for (g, w) in got.iter().zip(want.iter()) {
         let d = (g - w).abs();

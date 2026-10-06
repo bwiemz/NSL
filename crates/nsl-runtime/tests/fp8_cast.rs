@@ -163,6 +163,9 @@ fn e5m2_relative_error_is_two_mantissa_bits() {
     let input = make_tensor_2d_f32(1, data.len(), &data);
     let out = nsl_fp8_cast(input, FP8_FORMAT_E5M2, scale as f64);
     let deq = read_tensor_f32(out);
+    // `f32::max` returns the non-NaN operand, so a NaN `q` would fold away
+    // below and leave `worst` judged on the finite remainder.
+    assert_all_finite(&deq, "dequantized output", "e5m2 round trip");
     let mut worst = 0.0f32;
     for (&x, &q) in data.iter().zip(&deq) {
         if x.abs() / scale > 2f32.powi(-14) {

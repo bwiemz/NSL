@@ -287,9 +287,13 @@ fn fused_kl_ce_gpu_forward_and_backward_match_reference() {
 
     let max_err = |name: &str, gpu: &[f32], r: &[f64]| {
         // `f64::max` returns the non-NaN operand, so the fold below drops a
-        // NaN error and scores an all-NaN gradient 0.0. Refuse it first.
+        // NaN error and scores an all-NaN gradient 0.0. Refuse it first, on
+        // both sides.
         if let Some(i) = gpu.iter().position(|v| !v.is_finite()) {
             panic!("{name}: non-finite entry in gpu at index {i} ({})", gpu[i]);
+        }
+        if let Some(i) = r.iter().position(|v| !v.is_finite()) {
+            panic!("{name}: non-finite entry in reference at index {i} ({})", r[i]);
         }
         gpu.iter()
             .zip(r.iter())

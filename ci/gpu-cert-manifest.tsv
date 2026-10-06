@@ -220,7 +220,7 @@ crates/nsl-codegen/tests/csha_checkpoint_recompute_gpu.rs	t_segmask_recompute_hd
 crates/nsl-codegen/tests/csha_checkpoint_recompute_gpu.rs	t_segmask_recompute_hd32_s32_two_docs_halfsplit	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/csha_checkpoint_recompute_gpu.rs	t_segmask_recompute_hd32_s32_four_docs	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/csha_cuda_backward.rs	t6_3_smoke_single_config	gpu	requires CUDA GPU
-crates/nsl-codegen/tests/csha_cuda_backward.rs	t6_3_hd64_block32_dv_probe	diagnostic	diagnostic: logs dV/dK/dQ max_abs at hd=64 block=32, no gate
+crates/nsl-codegen/tests/csha_cuda_backward.rs	t6_3_hd64_block32_dv_probe	diagnostic	diagnostic: logs dV/dK/dQ max_abs at hd=64 block=32, no tolerance gate; fails on a non-finite gradient
 crates/nsl-codegen/tests/csha_cuda_backward.rs	t6_3_multitile_seq128	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/csha_cuda_backward.rs	t6_3_multitile_seq128_rope	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/csha_cuda_backward.rs	t6_3_matrix_sweep_numerical	gpu	requires CUDA GPU; (head_dim, causal, rope_q) sweep, panics on any FAIL row

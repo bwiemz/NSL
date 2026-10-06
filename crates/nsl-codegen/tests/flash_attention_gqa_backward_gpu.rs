@@ -316,6 +316,9 @@ fn assert_parity(tag: &str, gpu: &Grads, cpu: &Grads, tol: f32) {
         ("dv", &gpu.dv, &cpu.dv),
     ] {
         assert!(all_finite(g), "{tag}: GPU {name} non-finite");
+        // `max_abs_diff` folds with `f32::max`, which drops a NaN difference,
+        // so a NaN reference gradient would score 0.0. Refuse it too.
+        assert!(all_finite(c), "{tag}: CPU reference {name} non-finite");
         assert_eq!(g.len(), c.len(), "{tag}: {name} length mismatch (dK/dV must be reduced to kv_h)");
         let m = max_abs_diff(g, c);
         let ref_mag = max_abs(c);

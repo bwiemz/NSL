@@ -515,6 +515,9 @@ fn assert_parity(tag: &str, gpu: &Grads, cpu: &Grads, tol: f32) {
         ("dv", &gpu.dv, &cpu.dv),
     ] {
         assert!(all_finite(g), "{tag}: GPU {name} has non-finite values");
+        // The reference too: `max_abs_diff` folds with `f32::max`, which drops
+        // a NaN difference, so a NaN CPU-fallback gradient would score 0.0.
+        assert!(all_finite(c), "{tag}: CPU reference {name} has non-finite values");
         let m = max_abs_diff(g, c);
         let ref_mag = max_abs(c);
         let gpu_mag = max_abs(g);

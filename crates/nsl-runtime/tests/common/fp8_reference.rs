@@ -193,7 +193,7 @@ pub fn compute_pertensor_scale(a: &[f32], b: &[f32], fmt: Fp8Format) -> f32 {
 /// Both operands, because several callers compare two runtime paths (the MMA
 /// arm against the fallback, an auto scale against an explicit one) and
 /// either side can be the one that broke.
-fn assert_all_finite(values: &[f32], which: &str, label: &str) {
+pub fn assert_all_finite(values: &[f32], which: &str, label: &str) {
     if let Some(i) = values.iter().position(|v| !v.is_finite()) {
         panic!("{label}: non-finite entry in {which} at index {i} ({})", values[i]);
     }

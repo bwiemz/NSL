@@ -30,6 +30,18 @@
 
 pub const IGNORE_INDEX: i32 = -100;
 
+/// Refuses a NaN or an infinity in a reference output, naming the first one.
+///
+/// Both reference functions below call it on everything they return, so the
+/// gates that use them as ground truth need not re-check the reference side.
+/// Those gates fold their errors with `f64::max` / `if d > max`, which drop a
+/// NaN difference — a NaN reference would score as a perfect match.
+pub fn assert_all_finite_f64(xs: &[f64], which: &str) {
+    if let Some(i) = xs.iter().position(|v| !v.is_finite()) {
+        panic!("CPU LCE reference: non-finite entry in {which} at index {i} ({})", xs[i]);
+    }
+}
+
 /// Result of the forward pass.
 pub struct CpuLceForward {
     /// Per-row NLL loss (`-log_softmax(logits)[target]`). Zero for ignored rows.
@@ -112,6 +124,9 @@ pub fn cpu_lce_forward_f64(
     }
 
     let mean_loss = total_loss / num_valid.max(1) as f64;
+    assert_all_finite_f64(&loss_per_row, "loss_per_row");
+    assert_all_finite_f64(&lse_per_row, "lse_per_row");
+    assert_all_finite_f64(&[mean_loss], "mean_loss");
     CpuLceForward { loss_per_row, lse_per_row, mean_loss }
 }
 
@@ -207,6 +222,9 @@ pub fn cpu_lce_backward_f64(
         }
     }
 
+    assert_all_finite_f64(&dx, "dx");
+    assert_all_finite_f64(&dw, "dw");
+    assert_all_finite_f64(&dbias, "dbias");
     CpuLceBackward { dx, dw, dbias }
 }
 

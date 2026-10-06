@@ -409,6 +409,13 @@ fn run_fused_backward_config_seq(
                 gpu_out[i]
             );
         }
+        if let Some(i) = cpu_out.iter().position(|v| !v.is_finite()) {
+            panic!(
+                "[fwd-parity] seq={seq} bq={block_q}: non-finite entry in the CPU reference \
+                 cpu_out at index {i} ({})",
+                cpu_out[i]
+            );
+        }
         let bq = block_q as usize;
         let mut per_block: Vec<f32> = Vec::new();
         for qb in 0..seq.div_ceil(bq) {
@@ -681,9 +688,10 @@ fn t6_3_smoke_single_config() {
 /// hd=64 backward at block=32. head_dim=64 with block_q=block_kv=64 exceeds
 /// the 99 KB sm_120 SMEM opt-in cap (181 KB), but block=32 tiles fit (~83 KB).
 /// This is the smallest config that reaches the bug's d-range (d up to 56).
-/// Logs dV/dK/dQ max_abs + worst dV cell; no gate (diagnostic).
+/// Logs dV/dK/dQ max_abs + worst dV cell. No tolerance gate (diagnostic), but
+/// a non-finite GPU or CPU gradient fails it: `max_abs_diff` refuses one.
 #[test]
-#[ignore = "diagnostic: logs dV/dK/dQ max_abs at hd=64 block=32, no gate"]
+#[ignore = "diagnostic: logs dV/dK/dQ max_abs at hd=64 block=32, no tolerance gate; fails on a non-finite gradient"]
 fn t6_3_hd64_block32_dv_probe() {
     if !cuda_available() {
         eprintln!("[hd64] skipping — no CUDA");
@@ -787,6 +795,12 @@ fn t6_3_multitile_seq128() {
                             failures.push(format!("hd={hd} causal={causal} {name}[{i}]={v} not finite"));
                             non_finite = true;
                         }
+                        if let Some((i, v)) = c.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+                            failures.push(format!(
+                                "hd={hd} causal={causal} CPU reference {name}[{i}]={v} not finite"
+                            ));
+                            non_finite = true;
+                        }
                     }
                     // Already a failure. The comparators below would panic
                     // on it, losing the other configs' report.
@@ -881,6 +895,12 @@ fn t6_3_multitile_seq128_rope() {
                         }
                         if let Some((i, v)) = g.iter().enumerate().find(|(_, v)| !v.is_finite()) {
                             failures.push(format!("hd={hd} causal={causal} rope {name}[{i}]={v} not finite"));
+                            non_finite = true;
+                        }
+                        if let Some((i, v)) = c.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+                            failures.push(format!(
+                                "hd={hd} causal={causal} rope CPU reference {name}[{i}]={v} not finite"
+                            ));
                             non_finite = true;
                         }
                     }
@@ -1004,19 +1024,22 @@ fn t6_3_matrix_sweep_numerical() {
                     }
                 };
 
-                // Finiteness before the reductions. `>= tol` is false for a
-                // NaN, and the comparators panic on one, so a non-finite
-                // gradient is recorded as a FAIL row here and the rest of
-                // the sweep still reports.
+                // Finiteness before the reductions, on both the GPU gradient
+                // and the CPU reference. `>= tol` is false for a NaN, and the
+                // comparators panic on one, so a non-finite value on either
+                // side is recorded as a FAIL row here and the rest of the
+                // sweep still reports.
                 let non_finite: Vec<String> = [
-                    ("dq", &gpu.dq), ("dk", &gpu.dk), ("dv", &gpu.dv),
-                    ("dwq", &gpu.dwq), ("dwk", &gpu.dwk), ("dwv", &gpu.dwv),
-                    ("dx", &gpu.dx),
+                    ("dq", &gpu.dq, &cpu.dq), ("dk", &gpu.dk, &cpu.dk),
+                    ("dv", &gpu.dv, &cpu.dv), ("dwq", &gpu.dwq, &cpu.dwq),
+                    ("dwk", &gpu.dwk, &cpu.dwk), ("dwv", &gpu.dwv, &cpu.dwv),
+                    ("dx", &gpu.dx, &cpu.dx),
                 ]
                 .into_iter()
-                .filter_map(|(name, g)| {
-                    g.iter().position(|v| !v.is_finite())
-                        .map(|i| format!("{name}[{i}]={} non-finite", g[i]))
+                .flat_map(|(name, g, c)| [("", name, g), ("cpu ", name, c)])
+                .filter_map(|(side, name, xs)| {
+                    xs.iter().position(|v| !v.is_finite())
+                        .map(|i| format!("{side}{name}[{i}]={} non-finite", xs[i]))
                 })
                 .collect();
                 if !non_finite.is_empty() {

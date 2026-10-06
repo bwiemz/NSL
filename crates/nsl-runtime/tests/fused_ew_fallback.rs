@@ -118,6 +118,13 @@ fn assert_byte_equal(chain: i64, reference: i64, what: &str) {
     let cv = read_all(chain);
     let rv = read_all(reference);
     assert_eq!(cv.len(), rv.len(), "{what}: element count differs");
+    // A bit-exact compare passes two identical NaN results (same payload), so
+    // a chain and a reference that both computed garbage would agree.
+    for (side, xs) in [("chain", &cv), ("reference", &rv)] {
+        if let Some(i) = xs.iter().position(|v| !v.is_finite()) {
+            panic!("{what}: non-finite {side} value at flat index {i} ({})", xs[i]);
+        }
+    }
     for (i, (c, r)) in cv.iter().zip(rv.iter()).enumerate() {
         assert_eq!(
             c.to_bits(),

@@ -111,11 +111,35 @@ fn run_bench_capture_output_tensor(fixture: &str, tier_b: &str, seed: u64) -> Ve
     })
 }
 
+/// Refuses a non-finite element in a little-endian dump of `elem_bytes`-wide
+/// floats (2 = f16, 4 = f32). The parity gates here compare BYTES, and two
+/// arms that both produced the same NaN (or the same garbage) match exactly.
+#[cfg(all(feature = "cuda", feature = "debug_kernel_instrumentation"))]
+fn assert_all_finite_bytes(bytes: &[u8], elem_bytes: usize, what: &str) {
+    let bad = match elem_bytes {
+        // f16: exponent all ones is Inf or NaN.
+        2 => bytes
+            .chunks_exact(2)
+            .position(|c| u16::from_le_bytes([c[0], c[1]]) & 0x7C00 == 0x7C00),
+        4 => bytes
+            .chunks_exact(4)
+            .position(|c| !f32::from_le_bytes([c[0], c[1], c[2], c[3]]).is_finite()),
+        _ => unreachable!("unsupported element width {elem_bytes}"),
+    };
+    if let Some(i) = bad {
+        let raw = &bytes[i * elem_bytes..(i + 1) * elem_bytes];
+        panic!("{what}: non-finite element at index {i} (raw bytes {raw:02x?})");
+    }
+}
+
 #[cfg(all(feature = "cuda", feature = "debug_kernel_instrumentation"))]
 fn assert_parity_for_fixture(fixture: &str) {
     let seed: u64 = 42;
     let on = run_bench_capture_output_tensor(fixture, "on", seed);
     let off = run_bench_capture_output_tensor(fixture, "off", seed);
+    // The forward `O` dump is f16.
+    assert_all_finite_bytes(&on, 2, &format!("Tier-B-on O, fixture={fixture}"));
+    assert_all_finite_bytes(&off, 2, &format!("Tier-B-off O, fixture={fixture}"));
     assert_eq!(
         on.len(),
         off.len(),
@@ -270,7 +294,9 @@ fn assert_backward_parity_for_fixture(fixture: &str) {
     let seed: u64 = 42;
     let (on_dq, on_dk, on_dv) = run_bench_capture_backward_outputs(fixture, "on", seed);
     let (off_dq, off_dk, off_dv) = run_bench_capture_backward_outputs(fixture, "off", seed);
-    let cmp = |name: &str, on: &[u8], off: &[u8]| {
+    let cmp = |name: &str, elem_bytes: usize, on: &[u8], off: &[u8]| {
+        assert_all_finite_bytes(on, elem_bytes, &format!("Tier-B-on {name}, fixture={fixture}"));
+        assert_all_finite_bytes(off, elem_bytes, &format!("Tier-B-off {name}, fixture={fixture}"));
         assert_eq!(
             on.len(),
             off.len(),
@@ -303,9 +329,10 @@ fn assert_backward_parity_for_fixture(fixture: &str) {
     // production grid_x=1 sequential per-q-block launch loop (eliminating
     // the parallel-CTA race on the f32 dK/dV scratch RMW), all three
     // gradients are symmetric-zero correctness witnesses per spec §7.1.
-    cmp("dQ", &on_dq, &off_dq);
-    cmp("dK", &on_dk, &off_dk);
-    cmp("dV", &on_dv, &off_dv);
+    // Blob layout: dQ f16, dK / dV f32 scratch.
+    cmp("dQ", 2, &on_dq, &off_dq);
+    cmp("dK", 4, &on_dk, &off_dk);
+    cmp("dV", 4, &on_dv, &off_dv);
 }
 
 // Backward parity uses dedicated `parity_bwd_N` fixtures (32×32×32 dims)

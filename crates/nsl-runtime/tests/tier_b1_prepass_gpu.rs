@@ -184,6 +184,12 @@ fn x_prepass_matches_cpu_reference() {
             f16_to_f32(got[i])
         );
     }
+    if let Some(i) = expected_chunked.iter().position(|&e| !f16_to_f32(e).is_finite()) {
+        panic!(
+            "[x-prepass] non-finite entry in expected_chunked at index {i} ({})",
+            f16_to_f32(expected_chunked[i])
+        );
+    }
     let mut max_abs = 0f32;
     let mut mismatches = 0;
     for (i, (&e, &g)) in expected_chunked.iter().zip(got.iter()).enumerate() {

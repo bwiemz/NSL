@@ -425,6 +425,15 @@ fn single_mma_matches_cpu_reference() {
             gpu_d[i]
         );
     }
+    if let Some(i) = cpu_d.iter().position(|v| !v.is_finite()) {
+        panic!(
+            "[mma-probe] non-finite entry in cpu_d at (row={}, col={}) ({}) — \
+             the CPU reference itself is broken",
+            i as u32 / N,
+            i as u32 % N,
+            cpu_d[i]
+        );
+    }
     let mut max_abs = 0f32;
     let mut max_row = 0u32;
     let mut max_col = 0u32;

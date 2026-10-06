@@ -818,6 +818,12 @@ mod tests {
         let names = ["dx", "dwq", "dwk", "dwv"];
         let mut out = Vec::new();
         for t in 0..4 {
+            // `m.max(nan)` keeps `m`, so the `scale` and `worst` folds below
+            // drop a NaN — an all-NaN gradient (or FD probe) would read as
+            // agreement. Refuse it on both sides.
+            if let Some(i) = analytic[t].iter().position(|v| !v.is_finite()) {
+                panic!("{}: non-finite analytic {}[{i}] ({})", case.name, names[t], analytic[t][i]);
+            }
             let mut worst = 0.0f64;
             let scale = analytic[t].iter().fold(0.0f64, |m, &v| m.max(v.abs() as f64));
             for i in 0..base[t].len() {
@@ -827,6 +833,7 @@ mod tests {
                 probe[t][i] = base[t][i] - eps;
                 let lm = loss(&[&probe[0], &probe[1], &probe[2], &probe[3]]);
                 let fd = (lp - lm) / (2.0 * eps as f64);
+                assert!(fd.is_finite(), "{}: non-finite central difference for {}[{i}] ({fd})", case.name, names[t]);
                 worst = worst.max((fd - analytic[t][i] as f64).abs());
             }
             out.push((names[t], worst / scale, scale));

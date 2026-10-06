@@ -579,6 +579,13 @@ fn run_fused_config_dmodel(
             out_gpu[i]
         );
     }
+    if let Some(i) = cpu_out.iter().position(|v| !v.is_finite()) {
+        panic!(
+            "[C3] bq={block_q} bkv={block_kv} hd={head_dim} h={heads} c={causal}: \
+             non-finite entry in the CPU reference cpu_out at idx={i} ({})",
+            cpu_out[i]
+        );
+    }
     let mut max_abs = 0f32;
     let mut max_idx = 0usize;
     for (i, (&g, &c)) in out_gpu.iter().zip(cpu_out.iter()).enumerate() {

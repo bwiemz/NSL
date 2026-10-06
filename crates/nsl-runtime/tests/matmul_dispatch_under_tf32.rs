@@ -123,6 +123,11 @@ fn rel_err(got: &[f32], want: &[f64]) -> f64 {
     if let Some(i) = got.iter().position(|v| !v.is_finite()) {
         panic!("rel_err: non-finite entry in got at index {i} ({})", got[i]);
     }
+    // The reference too: an all-NaN `want` makes `rms` NaN, `rms.max(1e-12)`
+    // then returns 1e-12, and the fold above returns 0.0 — a pass.
+    if let Some(i) = want.iter().position(|v| !v.is_finite()) {
+        panic!("rel_err: non-finite entry in want at index {i} ({})", want[i]);
+    }
     let rms = (want.iter().map(|v| v * v).sum::<f64>() / want.len() as f64).sqrt();
     let max = got
         .iter()
