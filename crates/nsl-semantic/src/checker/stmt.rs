@@ -195,6 +195,19 @@ impl<'a> TypeChecker<'a> {
                                 .with_label(value.span, "invalid type for compound assignment"),
                             );
                     }
+                    // A tensor `+=` is the tensor op: one dtype (C5 step 4).
+                    if let (Some((_, td, _)), Some((_, vd, _))) =
+                        (target_ty.as_tensor_parts(), value_ty.as_tensor_parts())
+                    {
+                        let bin = match op {
+                            AssignOp::AddAssign => BinOp::Add,
+                            AssignOp::SubAssign => BinOp::Sub,
+                            AssignOp::MulAssign => BinOp::Mul,
+                            // `Assign` took the branch above.
+                            AssignOp::DivAssign | AssignOp::Assign => BinOp::Div,
+                        };
+                        self.check_same_dtype(bin, *td, *vd, value.span);
+                    }
                 }
             }
             StmtKind::Import(_) | StmtKind::FromImport(_) => {

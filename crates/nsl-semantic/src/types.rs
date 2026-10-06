@@ -447,7 +447,7 @@ pub fn is_assignable(source: &Type, target: &Type) -> bool {
     if let (Type::Param { shape: s1, dtype: d1 }, Type::Tensor { shape: s2, dtype: d2, .. }) =
         (source, target)
     {
-        return s1 == s2 && d1 == d2;
+        return s1 == s2 && (d1 == d2 || matches!(d2, DType::Unknown));
     }
     // Tensor-to-Tensor assignability with shape checking
     if let (
@@ -455,6 +455,13 @@ pub fn is_assignable(source: &Type, target: &Type) -> bool {
         Type::Tensor { shape: as_, dtype: ad, device: adev },
     ) = (source, target)
     {
+        // Dtype: must match, Unknown matching anything (dtype widening for
+        // tensors is not a feature: C5 converts only by an explicit `.to()`).
+        // Checked before the shape: shape and dtype are independent
+        // questions, and an unknown or rank-0 shape used to skip this too.
+        if *vd != *ad && !matches!(vd, DType::Unknown) && !matches!(ad, DType::Unknown) {
+            return false;
+        }
         // Unknown shape is always compatible
         if vs.rank() == 0 || as_.rank() == 0 {
             return true;
@@ -468,11 +475,7 @@ pub fn is_assignable(source: &Type, target: &Type) -> bool {
             }
         }
         // Device: unknown matches anything
-        if !matches!(vdev, Device::Unknown) && !matches!(adev, Device::Unknown) && vdev != adev {
-            return false;
-        }
-        // Dtype: must match (dtype widening for tensors is a later feature)
-        return vd == ad;
+        return matches!(vdev, Device::Unknown) || matches!(adev, Device::Unknown) || vdev == adev;
     }
     // Numeric widening: only within same family (int->int or float->float)
     let (src_family, src_rank) = dtype_rank(source);
@@ -629,7 +632,7 @@ pub fn display_type(ty: &Type) -> String {
     }
 }
 
-fn display_dtype(dtype: &DType) -> String {
+pub fn display_dtype(dtype: &DType) -> String {
     match dtype {
         DType::F64 => "f64".into(),
         DType::F32 => "f32".into(),

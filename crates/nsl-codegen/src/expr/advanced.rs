@@ -1323,7 +1323,7 @@ impl Compiler<'_> {
                     let tag = match arg_name.as_str() {
                         "f64" => Some(nsl_abi::wire::dtype::DTYPE_F64),
                         "f32" | "float" => Some(nsl_abi::wire::dtype::DTYPE_F32),
-                        "fp16" => Some(nsl_abi::wire::dtype::DTYPE_FP16),
+                        "fp16" | "f16" => Some(nsl_abi::wire::dtype::DTYPE_FP16),
                         "bf16" => Some(nsl_abi::wire::dtype::DTYPE_BF16),
                         _ => None,
                     };

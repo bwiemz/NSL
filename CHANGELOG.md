@@ -2723,6 +2723,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- **The checker refuses an op on tensors of two known dtypes** (C5 step 4b).
+  `+ - * / // % **`, `@`, comparisons, `|`/`&` and tensor `+=`-style
+  assignment on, say, an f32 and an f64 tensor are a compile error --
+  ``"`+` on tensors of different dtypes, f32 and f64"``, labelled with the
+  conversion -- where the checker used to type the result with the wider
+  dtype while the runtime computed in f32. An open (Unknown) dtype matches
+  anything, and the runtime refuses what the checker cannot see (step 4a);
+  ternary and custom (BYOD) dtypes are left to the ops that consume them.
+  - **Assignability compares dtypes whatever the shape.** An unknown or
+    rank-0 shape used to skip the dtype comparison along with the shape one,
+    so `zeros(s)` with a non-literal `s` was assignable to a `bf16` binding.
+  - **Builtins other than the creation functions take and return any
+    dtype.** Their tensors were typed f32, so `relu(x)` of an f64 `x` was
+    f32 to the checker -- invisible while it ignored mismatches, a false
+    refusal of a correct f64 program now.
+  - **Only dtypes the runtime stores can prove a mismatch.** `bool`, `int64`,
+    `int16`, `uint8` and `int4` have no runtime tag, so an annotation of one
+    does not describe storage and is not refused against f32 (`x * mask`).
+    The error's label names only conversions that exist (`.to(f64|f32|fp16|
+    bf16)`); between, say, int8 and f32 it says which side to convert.
+  - **A model field's annotation is its dtype.** An f64-annotated field built
+    by a creation call now holds f64, as a `let` does (it held f32 while the
+    checker typed it f64, so every use was mistyped); an annotation the
+    initializer cannot honour -- a bf16 field built with `ones` -- is an error
+    at the field. The training callback's `loss` is typed with an open dtype
+    (it was f32, wrong in an f64 program).
+  - **`.to(dtype)` is typed**: `x.to(f64)` is an f64 tensor of `x`'s shape
+    (it was a tensor of unknown dtype, shape and device), so the conversion
+    a refusal names is one the checker sees. `.to(f16)` converts like
+    `.to(fp16)`; it fell through to a device transfer. A sparse operand no
+    longer panics the checker's arithmetic typing.
+
 - **A tensor op on two different dtypes is refused** (C5 step 4,
   `docs/superpowers/specs/2026-09-26-dtype-semantics-design.md`). The CPU
   used to convert silently: if either operand was f32 the result was f32 and
