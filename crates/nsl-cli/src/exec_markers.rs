@@ -406,8 +406,9 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
          at micro-batch step N` after each boundary save (θ .nslm + AdamW \
          m/v + step counter, tmp-and-rename atomic), `resumed: ...` after \
          checkpoint_load restored all three and seeded the step counter. \
-         train_checkpoint_gate.rs asserts both; endurance_1b.py asserts the \
-         resume witness at 1B",
+         train_checkpoint_gate.rs asserts both, train_checkpoint_resume_gpu.rs \
+         asserts both on the GPU; endurance_1b.py asserts the resume witness \
+         at 1B",
     ),
     m(
         "[pass-manager]",

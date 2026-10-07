@@ -279,6 +279,15 @@ Sidecars written before this (version 1) still load, with a warning: they
 carry θ/moments/step but no data position or RNG state, so such a resume is
 not a continuation.
 
+Two gates hold the restore to "indistinguishable from a run that never
+stopped". `train_checkpoint_gate.rs` checks it byte for byte on the CPU.
+`train_checkpoint_resume_gpu.rs` checks it on the GPU, where the moments are
+restored into device tensors: a toy model with the 1B structure, AdamW and
+four distinct micro-batches per step, under the 1B postures. Under
+`--deterministic` the resumed run must match an uninterrupted one bit for
+bit. With the production kernels it must stay within ten times the measured
+run-to-run noise.
+
 ---
 
 ## Tensor Operations (Runtime)
