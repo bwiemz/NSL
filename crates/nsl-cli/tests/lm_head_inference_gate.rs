@@ -219,6 +219,43 @@ fn training_reference_suppresses_inference() {
 // Refusal, and its `auto` counterpart
 // ---------------------------------------------------------------------------
 
+/// A step body source AD cannot extract would run on the tape, which has no
+/// fused LM head, so `require` must refuse rather than fall back. (A `print`
+/// in the step body is one such body.) The refusal string once lacked its
+/// `\` line continuations and carried runs of spaces into the message.
+#[test]
+fn an_unextractable_step_body_refuses_under_require_and_falls_back_under_auto() {
+    let src = house_style("", GOOD_LOADER).replace(
+        "        let ls = logits.shape\n",
+        "        let ls = logits.shape\n        print(ls)\n",
+    );
+    assert!(src.contains("print(ls)"), "fixture rewrite did not apply");
+
+    let (ok_req, err_req) = build(&src, "req_unextractable", &["--source-ad", "--fuse-lm-head", "require"]);
+    assert!(!ok_req, "require must refuse an unextractable step body:\n{err_req}");
+    assert!(
+        err_req.contains(
+            "--fuse-lm-head require: source-AD extraction failed, and the tape fallback \
+             cannot fuse an LM head. Restrict the step body to source-AD-supported \
+             operations or drop `require`"
+        ),
+        "the refusal must be the extraction one, worded on one line:\n{err_req}"
+    );
+
+    let (ok_auto, err_auto) = build(&src, "auto_unextractable", &["--source-ad", "--fuse-lm-head", "auto"]);
+    assert!(ok_auto, "auto must fall back to the tape, not refuse:\n{err_auto}");
+    assert!(
+        err_auto.contains("source AD extraction failed, falling back to tape-based AD"),
+        "the fallback must be announced:\n{err_auto}"
+    );
+
+    // Control: the same body without the `print` extracts, so the print is
+    // what made the difference.
+    let (ok_ctl, err_ctl) = build(&house_style("", GOOD_LOADER), "req_extractable", &["--source-ad", "--fuse-lm-head", "require"]);
+    assert!(ok_ctl, "{err_ctl}");
+    assert!(!err_ctl.contains("falling back to tape-based AD"), "{err_ctl}");
+}
+
 /// Without a DataLoader the token-row count is not a compile-time fact, so
 /// there is nothing to bake into the op.
 #[test]
