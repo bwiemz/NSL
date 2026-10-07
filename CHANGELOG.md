@@ -34,6 +34,45 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
     The gates that build the pinned production recipes pass
     `--ignore-toolchain-pin`.
 
+- **The parameter-coverage gate** (`param_coverage_gate.rs`, NSL V2 plan
+  item 0.4). CI now fails when training leaves any trainable tensor of a
+  model untouched, or moves one it must not, in either AD mode. Until now
+  every check took its expected set from the enumeration that builds the
+  optimizer's parameter list, so a tensor missing from the list was
+  invisible. That is how #806's LoRA adapters went untrained:
+  `--grad-integrity` counts the list, and source AD zero-fills a missing
+  gradient and reports it only in a WARN line. The 1B posture certificate
+  checks the right thing, but on the GPU only, and it cannot see adapters.
+  - **Expected set.** It comes from the fixture's declarations as the
+    semantic analysis records them (`nsl_cli::loader`), walked by the test:
+    - model fields, sub-models and `[Model; N]` arrays;
+    - one set of adapter tensors per instance of each `@adapter` target;
+    - `@freeze` on a model definition and on the binding.
+  - **Non-trainable state.** `Buffer<...>` fields (spec/02), plus the
+    `_`-prefix and `inv_freq` convention.
+  - **Observations.** `model_save` before and after training gives the
+    struct fields, and the fixture's printed side-table tensors give the
+    adapters (`print` writes an f32 exactly). Both must match the expected
+    names exactly.
+  - **Fixture.** `fixtures/param_coverage.nsl` holds a tied field, a nested
+    sub-model and a `[Blk; 2]` array. It has a frozen model and a frozen
+    field, and three kinds of non-trainable state. It carries LoRA, IA3 and
+    GatedLoRA adapters, including LoRA on an array layer and on a frozen
+    weight.
+  - **Checks.** It trains three plain-SGD steps under the tape and under
+    `--source-ad`. Every element of every trainable tensor must move, and
+    every frozen and non-trainable tensor must stay bit-identical. The two
+    modes must also agree on the trained values; they are bit-identical
+    today.
+  - **Mutation-checked.** Each of these fails the gate: adapters dropped
+    from the enumeration (the #806 mechanism), source AD discarding adapter
+    gradients, the last `[Blk; N]` element dropped, sub-model fields
+    dropped from the parameter list, `@freeze` made ineffective, and source
+    AD's freeze filter reaching a frozen model's adapters.
+  - **Ratchet.** A `Buffer<...>` field TRAINS in both modes today, because
+    the parameter enumeration selects by leaf name only. The gate lists it
+    as a known defect that must keep reproducing, so a fix has to delist it.
+
 - **The 1B-posture certificate** (`posture_certificate_gpu.rs`, roadmap item
   4). Before this, every GPU training gate compared two GPU arms with each
   other, mostly under AdamW, so a shared or scale-only bug cancelled. None
@@ -1859,6 +1898,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   every diagnostic line the toolchain prints is a `tracing` event.
 
 ### Fixed
+
+- **`nsl build --emit-obj -o X` writes the object to X.**
+  - **Before.** On a single-module program, `-o` was ignored: the object
+    always went to `<stem>.o` beside the source.
+  - **Linked builds.** A linked build also wrote its intermediate object
+    beside the source. A failed link left it there, and two builds of the
+    same file raced on that path. The intermediate now lives in the build's
+    scratch directory, as the multi-module path's objects already did.
+  - **Programs that import modules.** These emit one object per module, so
+    `-o` cannot hold them. The build now says so instead of ignoring `-o`
+    silently.
 
 - **Every accepted `--target` spelling now compiles `@flash_attention`
   instead of panicking.**

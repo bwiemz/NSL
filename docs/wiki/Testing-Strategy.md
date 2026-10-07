@@ -346,6 +346,10 @@ Each test compiles and runs a `.nsl` file through the full pipeline (parse → s
 
 The `tests/` directory contains the full range of integration fixtures: GPU broadcast/matmul/rope shapes, source-AD training programs, checkpoint round-trips, sampling, and transformer block tests. These are the same programs exercised by the reading order in [Examples-Guide](Examples-Guide.md).
 
+### Parameter coverage
+
+[`param_coverage_gate.rs`](../../crates/nsl-cli/tests/param_coverage_gate.rs) checks that training reaches every parameter, and nothing else, in both AD modes. Its fixture holds a parameter in every construct a model can hold one in: plain and tied fields, sub-models, `[Blk; N]` arrays, `@freeze`, non-trainable state, and LoRA, IA3 and GatedLoRA adapters. The expected set comes from the declarations as the semantic analysis records them (`nsl_cli::loader`), never from the enumeration that builds the optimizer's parameter list. A check that counts that list cannot see a tensor missing from it, which is how #806's adapters went untrained. After three plain-SGD steps, every element of every trainable tensor must have moved. Every frozen or non-trainable tensor must be bit-identical, and the tape and `--source-ad` runs must agree. A new parameter-holding construct belongs in that fixture.
+
 ## Benchmarks — criterion (not a test layer)
 
 Six `criterion` benches, one per compiler stage plus the runtime's host-side
