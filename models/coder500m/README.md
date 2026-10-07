@@ -33,6 +33,15 @@ test for the FASE roadmap shipped in items #1-#6 of
 
 ## Production pretraining
 
+**Toolchain.** This directory is pinned to the `0.10-lts` toolchain channel
+(`nsl-toolchain.toml`, NSL V2 plan 0.1): production runs stay on the LTS
+toolchain while the V2 redesign lands on `main`. `nsl run` / `nsl build` on a
+file here hands the invocation over to `~/.nsl/toolchains/0.10-lts/bin/nsl`
+(install it once with `scripts/install-toolchain.sh 0.10-lts <git-ref>`); a
+toolchain of another channel refuses when that is not installed.
+`--ignore-toolchain-pin` runs on the invoked toolchain instead — for gates
+and experiments, not production runs.
+
 ```bash
 python models/benchmarks/make_prod_split.py          # once, from the repo root
 cd models/coder500m

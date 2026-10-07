@@ -36,7 +36,8 @@ pub(crate) fn render_markdown(root: &Command) -> String {
          declarations). Flags are listed with the value they take (a flag with no value is a \
          switch; `(optional)` means the flag may be given bare), the default that applies when \
          the flag is absent, and — for an enumerated flag — the accepted values. `nsl --version` \
-         prints the toolchain version; `nsl <command> --help` prints one command's page.",
+         prints the toolchain version and channel; `nsl <command> --help` prints one command's \
+         page.",
         visible.len().saturating_sub(1)
     );
     let _ = writeln!(out);

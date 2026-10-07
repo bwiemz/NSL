@@ -48,7 +48,13 @@ pub(crate) fn parse_target_arg(s: &str) -> Result<String, String> {
 // as a single enum is clearer than splitting every large variant into boxes.
 #[allow(clippy::large_enum_variant)]
 #[derive(ClapParser)]
-#[command(name = "nsl", about = "NeuralScript Language Toolchain", version)]
+// `nsl --version` names the toolchain channel too (`nsl 0.10.0 (toolchain
+// channel dev)`): a pinned model's run says which toolchain it ran on.
+#[command(
+    name = "nsl",
+    about = "NeuralScript Language Toolchain",
+    version = nsl_cli::toolchain::VERSION
+)]
 pub(crate) enum Cli {
     /// Parse and type-check an NSL file
     Check(CheckArgs),
@@ -1148,6 +1154,15 @@ pub(crate) struct BuildArgs {
         /// flag's namespace close exists to end.
         #[arg(long)]
         pub(crate) allow_unknown_decorators: bool,
+
+        /// Run on this toolchain even when the input's `nsl-toolchain.toml`
+        /// pins another toolchain channel. Without it, a pinned model hands
+        /// over to the installed toolchain for its channel
+        /// (`~/.nsl/toolchains/<channel>/bin/nsl`), or is refused when none is
+        /// installed. The nearest pin file in the input's directory or above
+        /// it applies; a malformed pin file is refused even with this flag.
+        #[arg(long)]
+        pub(crate) ignore_toolchain_pin: bool,
 }
 
 #[derive(clap::Args)]
@@ -1670,6 +1685,15 @@ pub(crate) struct RunArgs {
         /// flag's namespace close exists to end.
         #[arg(long)]
         pub(crate) allow_unknown_decorators: bool,
+
+        /// Run on this toolchain even when the input's `nsl-toolchain.toml`
+        /// pins another toolchain channel. Without it, a pinned model hands
+        /// over to the installed toolchain for its channel
+        /// (`~/.nsl/toolchains/<channel>/bin/nsl`), or is refused when none is
+        /// installed. The nearest pin file in the input's directory or above
+        /// it applies; a malformed pin file is refused even with this flag.
+        #[arg(long)]
+        pub(crate) ignore_toolchain_pin: bool,
 
         /// Arguments to pass to the compiled program
         #[arg(last = true)]

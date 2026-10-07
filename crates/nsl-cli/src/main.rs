@@ -73,8 +73,18 @@ fn main_inner() {
         Cli::Autotune { file, elements, freeze } => {
             commands::autotune::run_autotune(&file, elements, freeze.as_deref())
         }
-        Cli::Build(args) => commands::build::dispatch(args),
-        Cli::Run(args) => commands::run::dispatch(args),
+        // Toolchain pin (NSL V2 plan 0.1): a model directory's
+        // `nsl-toolchain.toml` decides which toolchain builds and runs it.
+        // Honoured before anything is compiled; on a channel mismatch this
+        // either hands the whole invocation to the pinned toolchain or exits.
+        Cli::Build(args) => {
+            nsl_cli::toolchain::enforce_pin(&args.file, args.ignore_toolchain_pin);
+            commands::build::dispatch(args)
+        }
+        Cli::Run(args) => {
+            nsl_cli::toolchain::enforce_pin(&args.file, args.ignore_toolchain_pin);
+            commands::run::dispatch(args)
+        }
         Cli::Test { file, filter } => {
             commands::test::run_test(&file, filter.as_deref());
         }
