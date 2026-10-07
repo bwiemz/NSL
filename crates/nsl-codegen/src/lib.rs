@@ -20,7 +20,7 @@
 //! - [`training`] — autodiff (tape + source-to-source), Wengert lists, `vmap`.
 //! - [`quantization`] — FP8, BitNet, AWQ/PCA precision tiering, weight analysis.
 //! - [`distributed`] — tensor / context / pipeline parallelism, MoE, CPDT.
-//! - [`analysis`] — cost model, autotuning, fusion, memory planning, WCET,
+//! - [`analysis`] — cost model, autotuning, fusion, memory planning,
 //!   FlashAttention codegen, calibration.
 //! - [`experimental`] — research subsystems (CEP, CFIE, CSHA, WGGO, WRGA,
 //!   FASE, FPGA, sparse, speculative, multimodal). These APIs
@@ -198,7 +198,6 @@ pub mod pass_registry;
 pub mod pass_trace;
 pub mod profiling;
 pub mod serve;
-pub mod wcet;
 
 // --- Experimental research subsystems ------------------------------------
 // These are NOT part of the stable API. See the `experimental` facade.
@@ -343,7 +342,6 @@ pub mod analysis {
         autotune, calibration, cost_model, flash_attention,
         flash_attention_selector, flash_attention_v2, fused_linear_ce, fusion,
         fusion_report, inspect, memory_planner, profiling, serve,
-        wcet,
     };
 }
 
@@ -980,45 +978,6 @@ pub struct CfieOptions {
     /// Write the CFIE build report to this path in addition to stderr
     /// (`--cfie-report <path>`).
     pub report_path: Option<std::path::PathBuf>,
-}
-
-/// M53: Worst-case-execution-time (WCET) analysis and certification options.
-///
-/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
-/// struct into cohesive sub-structs (architecture-hardening review).
-#[derive(Clone, Debug, PartialEq)]
-pub struct WcetOptions {
-    /// Enable WCET analysis for `@real_time` functions.
-    pub enabled: bool,
-    /// GPU target name for WCET analysis (e.g., "Orin", "H100").
-    pub gpu: Option<String>,
-    /// CPU target name for WCET analysis (e.g., "cortex-a78").
-    pub cpu: Option<String>,
-    /// Path to write the WCET certificate JSON.
-    pub report_path: Option<std::path::PathBuf>,
-    /// Safety-margin multiplier for WCET (default: 1.05 = 5%).
-    pub safety_margin: f64,
-    /// Path to write a DO-178C compliance report.
-    pub do178c_report: Option<std::path::PathBuf>,
-    /// WCET target type: "gpu" (statistical), "fpga" (certified), "groq" (blocked).
-    pub target: String,
-    /// FPGA device name for certified WCET (e.g., "xcvu440", "xczu9eg").
-    pub fpga_device: Option<String>,
-}
-
-impl Default for WcetOptions {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            gpu: None,
-            cpu: None,
-            report_path: None,
-            safety_margin: 1.05,
-            do178c_report: None,
-            target: "gpu".to_string(),
-            fpga_device: None,
-        }
-    }
 }
 
 /// CSHA (compiler-specialized hardware attention) codegen options.
@@ -2009,8 +1968,6 @@ pub struct CompileOptions {
     /// Weight-aware compilation (`--weights`, the M52 config, the analysis
     /// report) and the `@export` weight-index map; see [`WeightsOptions`].
     pub weights: WeightsOptions,
-    /// M53: Worst-case-execution-time analysis / certification options.
-    pub wcet: WcetOptions,
     /// M38a: Enable linear types ownership checking.
     pub linear_types_enabled: bool,
     /// Facts forwarded from semantic analysis (ownership metadata, the
@@ -2290,7 +2247,6 @@ impl Default for CompileOptions {
             source_ad: false,
             determinism: DeterminismOptions::default(),
             weights: WeightsOptions::default(),
-            wcet: WcetOptions::default(),
             linear_types_enabled: false,
             analysis: AnalysisOptions::default(),
             zero: ZeroOptions::default(),

@@ -127,13 +127,7 @@ nsl run [OPTIONS] <FILE> [-- <ARGS>...]
 | `--distribute` | `<DISTRIBUTE>` |  | M43: 3D parallelism config (e.g., "dp=2, tp=4, pp=4") |
 | `--zero-stage` | `<ZERO_STAGE>` |  | M43: ZeRO optimizer sharding stage (1, 2, or 3) |
 | `--zero-elementwise` |  |  | Item 11: elementwise 1/ws parameter sharding under --zero-stage 3 (see `nsl build --help` for the full description) |
-| `--wcet` |  |  | M53: Enable WCET analysis for @real_time functions |
-| `--wcet-cert` | `<WCET_CERT>` |  | M53: Write WCET certificate JSON to file |
-| `--gpu` | `<GPU>` |  | M53: GPU target for WCET analysis (e.g., "A100-SXM", "Orin") |
-| `--cpu` | `<CPU>` |  | M53: CPU target for WCET analysis (e.g., "cortex-a78") |
-| `--do178c-report` | `<DO178C_REPORT>` |  | M53: Write DO-178C compliance report to file (FPGA only) |
-| `--wcet-target` | `<WCET_TARGET>` | `gpu` | M53: WCET target: "gpu" (statistical advisory), "fpga" (certified DO-178C), "groq" (blocked) |
-| `--fpga-device` | `<FPGA_DEVICE>` |  | M53: FPGA device for certified WCET (e.g., "xcvu440", "xczu9eg", "ve2302") |
+| `--gpu` | `<GPU>` |  | GPU model for the `--monitor` predicted-vs-actual profile when the program has no train block (e.g., "A100-SXM", "Orin"; default "h100") |
 | `--cuda-sync` |  |  | Synchronize after every CUDA kernel launch (debug: surfaces async GPU errors) |
 | `--gpu-mem-report` |  |  | ELTLS instrumentation: print a GPU memory report at end of run. Prints epilog_frees_total plus (with --features cuda) the live caching-allocator block summary and driver/allocator stats |
 | `--monitor` |  |  | Render predicted-vs-actual kernel timings instead of running the program |
@@ -238,12 +232,6 @@ nsl build [OPTIONS] <FILE>
 | `--no-dead-weight` |  |  | M52: Disable dead weight elimination |
 | `--no-sparse-codegen` |  |  | M52: Disable sparsity-aware codegen annotations |
 | `--shared-lib` |  |  | M62: Build as shared library (.so/.dylib/.dll) with stable C API |
-| `--wcet` |  |  | M53: Enable WCET analysis for @real_time functions |
-| `--wcet-cert` | `<WCET_CERT>` |  | M53: Write WCET certificate JSON to file |
-| `--cpu` | `<CPU>` |  | M53: CPU target for WCET analysis (e.g., "cortex-a78") |
-| `--do178c-report` | `<DO178C_REPORT>` |  | M53: Write DO-178C compliance report to file (FPGA only) |
-| `--wcet-target` | `<WCET_TARGET>` | `gpu` | M53: WCET target: "gpu" (statistical advisory), "fpga" (certified DO-178C), "groq" (blocked) |
-| `--fpga-device` | `<FPGA_DEVICE>` |  | M53: FPGA device for certified WCET (e.g., "xcvu440", "xczu9eg", "ve2302") |
 | `--wrga-report` | `<PATH>` (optional) |  | WRGA Milestone B.1: Emit the WRGA compilation report. With no value, prints to stdout.  With a path, writes to that file |
 | `--wrga-fold-allocations` |  |  | WRGA Milestone B.2 Task 3: fold WRGA memory hints into real allocations.  Default off — observational mode ships per B.1 |
 | `--wggo` | `<MODE>` (optional) |  | WGGO: global-optimization mode ("full", "greedy", or "off"). Passing `--wggo` without a value enables full mode |

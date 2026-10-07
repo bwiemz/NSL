@@ -103,7 +103,7 @@ Positional encoding scheme (Su et al.) that applies a complex rotation to Q and 
 Hopper-generation (sm_90) hardware unit that performs bulk async copies between global and shared memory using `cp.async.bulk.tensor` instructions. NSL's Hopper path in `flash_attention.rs` has TMA plumbing; the wgmma instruction family targets sm_90 and is distinct from sm_80 `mma.sync`.
 
 ### <a id="wcet"></a>WCET — Worst-Case Execution Time
-Compile-time upper bound on kernel execution time, required for hard real-time / robotics workloads (M53). NSL's `nsl check --wcet` pass in `crates/nsl-codegen/src/wcet.rs` models loop trip counts and memory latencies to produce a provable bound.
+Compile-time upper bound on kernel execution time, required for hard real-time / robotics workloads (M53). NSL had a `--wcet` analysis on `nsl build`/`nsl run` for `@real_time` functions, with certificate and DO-178C report output. It never analysed the function body: every function was priced as the same fixed matmul-plus-relu estimate. Removed in the Phase 0.6 scope freeze; preserved at tag `attic/scope-freeze-2026-10`.
 
 ### <a id="zk"></a>ZK — Zero-Knowledge (inference)
 Zero-knowledge proof system for ML inference (M55): the prover runs the model and produces a proof that the output was computed correctly without revealing weights. NSL had a `nsl build --zk-circuit` path that compiled `@zk_proof` functions to an arithmetic circuit, plus `nsl zk` proof tooling. Removed in the Phase 0.6 scope freeze; preserved at tag `attic/scope-freeze-2026-10`.

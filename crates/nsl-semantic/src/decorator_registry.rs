@@ -44,7 +44,7 @@ const fn k(name: &'static str, read_by: &'static str) -> KnownDecorator {
 
 /// Every decorator name the toolchain reads anywhere, from the 2026-08-15
 /// empirical inventory (updated as consumers move): 35 validated in `checker/stmt.rs`, 13 in
-/// `checker/model.rs`, 3 in other semantic modules, and 6 read only by
+/// `checker/model.rs`, 3 in other semantic modules, and 4 read only by
 /// codegen. Names consumed by the parser before a `Decorator` node exists
 /// (`pack`, `unpack`, `backward`, `*_ptx` in datatype blocks; `endpoint` in
 /// serve blocks) are deliberately absent — their namespaces were already
@@ -109,9 +109,7 @@ pub static KNOWN_DECORATORS: &[KnownDecorator] = &[
     k("fp4_compute", "crates/nsl-codegen/src/fp8.rs"),
     k("no_grad", "crates/nsl-codegen/src/compiler/declaration.rs"),
     k("param_role", "crates/nsl-codegen/src/compiler/collection.rs"),
-    k("real_time", "crates/nsl-codegen/src/wcet.rs"),
     k("search", "crates/nsl-codegen/src/cep_extract.rs"),
-    k("wcet_budget", "crates/nsl-codegen/src/wcet.rs"),
 ];
 
 /// Documentation-advertised names with NO implementation anywhere in the
@@ -179,6 +177,18 @@ pub static UNIMPLEMENTED_DECORATORS: &[(&str, &str)] = &[
         "zk_lookup",
         "@zk_lookup was removed with the ZK circuit subsystem (M55) in the \
          Phase 0.6 scope freeze; the code is preserved at tag \
+         `attic/scope-freeze-2026-10`. Remove the decorator",
+    ),
+    (
+        "real_time",
+        "@real_time was removed with WCET analysis (M53) in the Phase 0.6 \
+         scope freeze; the code is preserved at tag \
+         `attic/scope-freeze-2026-10`. Remove the decorator",
+    ),
+    (
+        "wcet_budget",
+        "@wcet_budget was removed with WCET analysis (M53) in the Phase 0.6 \
+         scope freeze; the code is preserved at tag \
          `attic/scope-freeze-2026-10`. Remove the decorator",
     ),
 ];
@@ -250,7 +260,7 @@ mod tests {
 
     #[test]
     fn removed_names_refuse_with_the_attic_tag() {
-        for name in ["zk_proof", "zk_lookup"] {
+        for name in ["zk_proof", "zk_lookup", "real_time", "wcet_budget"] {
             assert!(find(name).is_none(), "@{name} was removed");
             let msg = unimplemented_refusal(name)
                 .unwrap_or_else(|| panic!("@{name} must get a typed refusal"));

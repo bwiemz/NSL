@@ -751,7 +751,6 @@ const NOT_A_PASS: &[(&str, &str)] = &[
     ("types", "type machinery"),
     ("use_count", "dead use-count analysis (zero readers since 5e2740bc)"),
     ("vmap", "M39 vmap"),
-    ("wcet", "M53 worst-case execution time"),
     ("weight_aware", "M52 weight-aware invariants"),
     ("wengert", "the IR itself, and its Cranelift lowering"),
     (

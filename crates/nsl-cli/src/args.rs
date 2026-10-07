@@ -750,30 +750,6 @@ pub(crate) struct BuildArgs {
         #[arg(long)]
         pub(crate) shared_lib: bool,
 
-        /// M53: Enable WCET analysis for @real_time functions
-        #[arg(long)]
-        pub(crate) wcet: bool,
-
-        /// M53: Write WCET certificate JSON to file
-        #[arg(long)]
-        pub(crate) wcet_cert: Option<PathBuf>,
-
-        /// M53: CPU target for WCET analysis (e.g., "cortex-a78")
-        #[arg(long)]
-        pub(crate) cpu: Option<String>,
-
-        /// M53: Write DO-178C compliance report to file (FPGA only)
-        #[arg(long)]
-        pub(crate) do178c_report: Option<PathBuf>,
-
-        /// M53: WCET target: "gpu" (statistical advisory), "fpga" (certified DO-178C), "groq" (blocked)
-        #[arg(long, default_value = "gpu")]
-        pub(crate) wcet_target: String,
-
-        /// M53: FPGA device for certified WCET (e.g., "xcvu440", "xczu9eg", "ve2302")
-        #[arg(long)]
-        pub(crate) fpga_device: Option<String>,
-
         /// WRGA Milestone B.1: Emit the WRGA compilation report.
         /// With no value, prints to stdout.  With a path, writes to that file.
         #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "-")]
@@ -1343,33 +1319,10 @@ pub(crate) struct RunArgs {
         #[arg(long, requires = "zero_stage")]
         pub(crate) zero_elementwise: bool,
 
-        /// M53: Enable WCET analysis for @real_time functions
-        #[arg(long)]
-        pub(crate) wcet: bool,
-
-        /// M53: Write WCET certificate JSON to file
-        #[arg(long)]
-        pub(crate) wcet_cert: Option<PathBuf>,
-
-        /// M53: GPU target for WCET analysis (e.g., "A100-SXM", "Orin")
+        /// GPU model for the `--monitor` predicted-vs-actual profile when the
+        /// program has no train block (e.g., "A100-SXM", "Orin"; default "h100")
         #[arg(long)]
         pub(crate) gpu: Option<String>,
-
-        /// M53: CPU target for WCET analysis (e.g., "cortex-a78")
-        #[arg(long)]
-        pub(crate) cpu: Option<String>,
-
-        /// M53: Write DO-178C compliance report to file (FPGA only)
-        #[arg(long)]
-        pub(crate) do178c_report: Option<PathBuf>,
-
-        /// M53: WCET target: "gpu" (statistical advisory), "fpga" (certified DO-178C), "groq" (blocked)
-        #[arg(long, default_value = "gpu")]
-        pub(crate) wcet_target: String,
-
-        /// M53: FPGA device for certified WCET (e.g., "xcvu440", "xczu9eg", "ve2302")
-        #[arg(long)]
-        pub(crate) fpga_device: Option<String>,
 
         /// Synchronize after every CUDA kernel launch (debug: surfaces async GPU errors)
         #[arg(long)]

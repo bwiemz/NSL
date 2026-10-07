@@ -302,10 +302,8 @@ block_kv with fused projections) are rejected at compile time.
 ### ZK Inference (M55) — removed
 - Removed in the Phase 0.6 scope freeze (`nsl zk`, `nsl build --zk-circuit`/`--zk-backend`/`--zk-field`/`--zk-solidity`/`--zk-weights`, and the `@zk_proof`/`@zk_lookup` decorators are gone; the two decorators now get a refusal that names the tag); preserved at tag `attic/scope-freeze-2026-10`
 
-### WCET Analysis (M53)
-- Real-time execution time bounds for safety-critical deployment
-- Op-by-op worst-case classification
-- DO-178C reporting format
+### WCET Analysis (M53) — removed
+- Removed in the Phase 0.6 scope freeze (`--wcet`, `--wcet-cert`, `--wcet-target`, `--cpu`, `--do178c-report`, `--fpga-device` on `nsl build`/`nsl run`, and the `@real_time`/`@wcet_budget` decorators are gone; the two decorators now get a refusal that names the tag); preserved at tag `attic/scope-freeze-2026-10`
 
 ---
 
@@ -315,7 +313,6 @@ block_kv with fused projections) are rejected at compile time.
 nsl check --perf file.nsl                               # Roofline analysis
 nsl check --nan-analysis file.nsl                        # NaN/Inf risk detection
 nsl check --deterministic file.nsl                       # Non-determinism detection
-nsl check --wcet file.nsl                                # Worst-case execution time
 nsl check --weight-analysis file.nsl --weights model.st  # Weight sparsity analysis
 nsl run file.nsl --disable-fusion                        # Differential testing
 nsl run file.nsl --trace-ops                             # Tensor operation tracing

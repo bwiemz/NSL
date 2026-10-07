@@ -42,13 +42,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             distribute: _distribute,
             zero_stage,
             zero_elementwise,
-            wcet,
-            wcet_cert,
             gpu,
-            cpu,
-            do178c_report,
-            wcet_target,
-            fpga_device,
             cuda_sync,
             gpu_mem_report,
             monitor,
@@ -474,16 +468,6 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     // `index_map` is populated from the semantic analysis in
                     // run_build_single (where analysis is in scope).
                     ..Default::default()
-                },
-                wcet: nsl_codegen::WcetOptions {
-                    enabled: wcet,
-                    gpu,
-                    cpu,
-                    report_path: wcet_cert,
-                    safety_margin: 1.05,
-                    do178c_report,
-                    target: wcet_target,
-                    fpga_device,
                 },
                 linear_types_enabled: linear_types, // Task 20: nsl run now exposes --linear-types
                 // Semantic-analysis facts: all empty here. `run_build_inner` /

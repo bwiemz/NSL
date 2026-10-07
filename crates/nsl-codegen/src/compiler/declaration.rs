@@ -187,17 +187,6 @@ impl Compiler<'_> {
                         );
                     }
                 }
-                // M53: Extract @real_time and @wcet_budget constraints
-                if let Some(rt) =
-                    crate::wcet::extract_real_time_decorator(decos, &|sym| self.resolve_sym(sym))
-                {
-                    self.features.real_time_fns.insert(raw_name.clone(), rt);
-                }
-                if let Some(wb) =
-                    crate::wcet::extract_wcet_budget_decorator(decos, &|sym| self.resolve_sym(sym))
-                {
-                    self.features.wcet_budget_fns.insert(raw_name.clone(), wb);
-                }
                 // M39: Extract @vmap from function decorators
                 if let Some(vmap_config) =
                     crate::vmap::extract_vmap_decorator(decos, &|sym| self.resolve_sym(sym))
@@ -335,21 +324,7 @@ impl Compiler<'_> {
                         .functions
                         .insert(mangled.clone(), (method_id, method_sig));
 
-                    // M53: Extract @real_time and @wcet_budget from model method decorators
                     if !decos.is_empty() {
-                        if let Some(rt) = crate::wcet::extract_real_time_decorator(decos, &|sym| {
-                            self.resolve_sym(sym)
-                        }) {
-                            self.features.real_time_fns.insert(mangled.clone(), rt);
-                        }
-                        if let Some(wb) =
-                            crate::wcet::extract_wcet_budget_decorator(decos, &|sym| {
-                                self.resolve_sym(sym)
-                            })
-                        {
-                            self.features.wcet_budget_fns.insert(mangled.clone(), wb);
-                        }
-
                         // M62 Task 5: If the method is decorated with @export, declare:
                         //   1. An internal impl `__nsl_export_impl_<Model>_<method>` with
                         //      `(weight_ptrs: i64, num_weights: i64, ...tensor_inputs) -> i64`

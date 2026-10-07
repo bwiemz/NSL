@@ -78,7 +78,7 @@ later emission consults.
    │  MemoryPlanner (whole-program slab plan, scheduled through PassManager)
    │  compile_main                    ← src/compiler/main_entry.rs, phase TrainBlock
    │      └─ top-level stmts → compile_stmt → compile_train_block (see below)
-   │  compile_pending_lambdas · run_wcet_analysis · fusion report
+   │  compile_pending_lambdas · fusion report
    │  embed_weight_hash · emit_export_wrappers (c_wrapper.rs) · write profile manifest
    └── FINALIZE ────────────────────────┼─────────────────────
       Compiler::finalize → ObjectModule::finish → object bytes (Vec<u8>)
@@ -350,11 +350,10 @@ it into `compile_options` at `Compiler::new`. Where it comes from:
   (`run_pre_scan_phase` in `entry_points.rs`) that fills still-`None`
   calibration/WGGO fields from the AST.
 
-The struct has 30 `pub` fields today. The decomposition into cohesive
+The struct has 29 `pub` fields today. The decomposition into cohesive
 sub-structs that already exists (grep `Options {` in `src/lib.rs`):
-`WggoOptions` (`opts.wggo`), `CfieOptions` (`opts.cfie`), `WcetOptions`
-(`opts.wcet`), `CshaOptions` (`opts.csha`),
-`CpdtOptions` (`opts.cpdt`), `CalibrationOptions` (`opts.calibration`:
+`WggoOptions` (`opts.wggo`), `CfieOptions` (`opts.cfie`), `CshaOptions`
+(`opts.csha`), `CpdtOptions` (`opts.cpdt`), `CalibrationOptions` (`opts.calibration`:
 data path, mode, sample/batch/timeout budgets, the AWQ `retention` and
 WGGO `grad_retention` plans, `batch_seq`, the subprocess `compile_bundle`
 and the `sidecar` the harness writes back), `DevToolsOptions`
@@ -755,7 +754,7 @@ spec `docs/superpowers/specs/2026-09-09-a2-kir-v2-design.md`.
 TFLOPs, bandwidth, VRAM, L2, crossover points, launch overhead),
 `GPU_DATABASE`, `find_gpu`, `default_gpu`, `resolve_local_gpu`
 (via `nsl_abi::wire::device_identity::CudaDeviceIdentity`, probed by
-`nsl_runtime::cuda_device_identity`), plus `FPGA_DATABASE` / `CPU_DATABASE`.
+`nsl_runtime::cuda_device_identity`).
 `src/ptxas_validation.rs::validate_ptx` assembles PTX through `cudarc`
 `cuModuleLoadData` when a context is current, else `nvcc --cubin`; it is the
 basis of every `*_ptxas*.rs` test. `src/ptx_metadata.rs` extracts static
@@ -832,8 +831,7 @@ fixtures `tests/train_clif/*.nsl`.
 - **Cost model** — `src/cost_model.rs` (M37 roofline: `OpCost`,
   `BoundClassification`, `matmul_cost`, `softmax_cost`, …), consumed by
   autotune's cost-model selection, WRGA's roofline (`src/wrga_roofline.rs`),
-  WGGO's cost (`src/wggo_cost.rs`), CFIE's (`src/cfie_cost.rs`) and
-  `src/wcet.rs`.
+  WGGO's cost (`src/wggo_cost.rs`) and CFIE's (`src/cfie_cost.rs`).
 - **Memory planner** — `src/memory_planner.rs`: `analyze_ast_liveness`
   → `TensorAlloc`s, `InterferenceGraph::build`, `plan_slab` → `SlabPlan`,
   `format_memory_report` (`--memory-report`), `check_vram_budget`
@@ -856,8 +854,7 @@ fixtures `tests/train_clif/*.nsl`.
   from `--weights`), `src/ctor_fold.rs`, `src/lm_head_inference.rs`
   (`--fuse-lm-head`), `src/param_roles.rs`, `src/parameter_plan.rs`.
 - **Profiling / inspection** — `src/profiling/` (`captures.rs`,
-  `instrument.rs`, `walker.rs`, `memory_timeline.rs`), `src/inspect/`,
-  `src/wcet.rs`.
+  `instrument.rs`, `walker.rs`, `memory_timeline.rs`), `src/inspect/`.
 
 **Pass registry drift gate.** `crates/nsl-codegen/tests/pass_registry_drift.rs` checks
 `PASSES` against the tree in both directions: every `source_files` entry
@@ -937,8 +934,7 @@ Cargo feature at its `stmt.rs` entry), **CEP** `src/cep.rs`, **CFIE**
 **PCA** `src/pca_detect.rs` (+ `pca_tier_b.rs`, `pca_per_doc.rs`, …),
 **FASE** `src/fase.rs`, **FPGA/HIR** `src/hir/` + `src/backend_verilog/` +
 `src/kernel_lower_fpga.rs` + `src/fpga_error.rs` (`nsl fpga-compile`),
-**WCET** `src/wcet.rs`, **sparse**
-`src/sparse.rs`, **speculative** `src/speculative.rs`, **multimodal**
+**sparse** `src/sparse.rs`, **speculative** `src/speculative.rs`, **multimodal**
 `src/multimodal.rs`, **BitNet** `src/bitnet/`. Their APIs, flags and on-disk
 formats are not stable; see `STATUS.md` ("Experimental" and "Opting out of
 experimental subsystems") for the tier contract and `docs/wiki/Optimization-Passes.md`
@@ -1117,7 +1113,7 @@ review. See `docs/wiki/GPU-Test-Harness.md` and `docs/wiki/Testing-Strategy.md`.
 ### A new compile option or flag
 
 1. Add the field to `CompileOptions` in `src/lib.rs` — inside the matching
-   sub-struct (`WggoOptions`, `CfieOptions`, `WcetOptions`,
+   sub-struct (`WggoOptions`, `CfieOptions`,
    `CshaOptions`, `CpdtOptions`, `CalibrationOptions`, `DevToolsOptions`, `CheckpointOptions`,
    `WeightStreamOptions`, `MuonOptions`, `ImportedModelOptions`, `ZeroOptions`,
    `AutotuneOptions`, `WeightsOptions`, `FusionOptions`, `DiagnosticsOptions`,

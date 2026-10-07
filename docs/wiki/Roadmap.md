@@ -20,7 +20,7 @@ NSL's development is organized into milestones (M9-M62) grouped into phases (1-1
 | 8 | v0.8 | M45 (tensor debugger), M46 (reproducibility), M48 (multimodal) | Shipped 2026-03-18 |
 | 9 | v0.8 | M49 (shape algebra), M50 (sparse tensors), M51 (effect system) | Shipped 2026-03-18 |
 | 10 | v0.9 | M52 (weight-aware compilation), M62 (PyTorch FFI), M54 (unikernels) | M52/M62 shipped; M54 removed in the Phase 0.6 scope freeze (preserved at tag `attic/scope-freeze-2026-10`) |
-| 11 | v1.0 | M53 (WCET proofs), M55 (ZK circuits), M56 (agent shared memory) | M55 removed in the Phase 0.6 scope freeze (preserved at tag `attic/scope-freeze-2026-10`); M53/M56 planned |
+| 11 | v1.0 | M53 (WCET proofs), M55 (ZK circuits), M56 (agent shared memory) | M53/M55 removed in the Phase 0.6 scope freeze (preserved at tag `attic/scope-freeze-2026-10`); M56 planned |
 | 12 | v1.1 | M58 (elastic FT), M59 (topology routing), M61 (cluster debug) | Planned |
 | 13 | v1.2 | M57 (FPGA/neuromorphic), M60 (exabyte streaming) | Planned |
 
@@ -154,8 +154,8 @@ Effect annotations on functions; pure/stateful/io effect tracking; required by M
 ### M52 -- Weight-aware compilation (In flight, Phase 10)
 Compiles model weights into the binary as compile-time constants; constant folding over weight tensors; CPDT Phase 1 shipped 2026-04-21, Phase 2 measurement-triggered. Design: [`2026-03-19-m52-m62-roadmap-design.md`](../plans/2026-03-19-m52-m62-roadmap-design.md).
 
-### M53 -- WCET proofs (Planned, Phase 11)
-Worst-case execution time analysis for robotics/safety-critical deployments; requires M52 weight constants. Design: [`2026-03-19-m52-m62-roadmap-design.md`](../plans/2026-03-19-m52-m62-roadmap-design.md).
+### M53 -- WCET proofs (Removed, 2026-10)
+Worst-case execution time analysis for robotics/safety-critical deployments; requires M52 weight constants. A partial implementation shipped (`--wcet`, certificate and DO-178C report output for `@real_time` functions), but it priced every function as the same fixed matmul-plus-relu estimate instead of analysing its body. Removed in the Phase 0.6 scope freeze, together with its flags, the `@real_time`/`@wcet_budget` decorators and the FPGA/CPU spec databases it alone read; preserved at tag `attic/scope-freeze-2026-10`. Design: [`2026-03-19-m52-m62-roadmap-design.md`](../plans/2026-03-19-m52-m62-roadmap-design.md).
 
 ### M54 -- Bare-metal unikernels (Removed, 2026-10)
 x86_64 boot stub + unikernel runtime + GPU init (M54b, 2026-03-26, never released); single-binary AI inference with no OS. Removed in the Phase 0.6 scope freeze — the build configuration was parsed and printed but never consumed; preserved at tag `attic/scope-freeze-2026-10`. Design: [`2026-03-19-m52-m62-roadmap-design.md`](../plans/2026-03-19-m52-m62-roadmap-design.md).

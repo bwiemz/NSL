@@ -49,12 +49,6 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
             no_dead_weight,
             no_sparse_codegen,
             shared_lib,
-            wcet,
-            wcet_cert,
-            cpu,
-            do178c_report,
-            wcet_target,
-            fpga_device,
             wrga_report,
             wrga_fold_allocations,
             wggo,
@@ -468,16 +462,6 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                     // Populated from the semantic analysis in the build paths
                     // that have it in scope.
                     index_map: std::collections::HashMap::new(),
-                },
-                wcet: nsl_codegen::WcetOptions {
-                    enabled: wcet,
-                    gpu: None, // reuse --gpu from Check variant; Build uses target for backend
-                    cpu,
-                    report_path: wcet_cert,
-                    safety_margin: 1.05,
-                    do178c_report,
-                    target: wcet_target,
-                    fpga_device,
                 },
                 linear_types_enabled: linear_types,
                 // Semantic-analysis facts: all empty here. The loader fills

@@ -254,16 +254,6 @@ pub static MANUAL_CONTRACTS: &[Contract] = &[
     flag("embed-threshold", B_ONLY, "standalone", Witness::Config("crates/nsl-cli/src/commands/build/standalone.rs")),
     flag("embed-weights", B_ONLY, "standalone", Witness::Config("crates/nsl-cli/src/commands/build/standalone.rs")),
     flag("vram-budget", B_ONLY, "memory-planner", Witness::Config("crates/nsl-codegen/src/memory_planner.rs")),
-    // WCET family: build/run only. The six were declared-and-dropped on
-    // CheckArgs for a long time; review chose deletion over a bespoke
-    // refusal block — clap's own unknown-argument error IS the refusal, and
-    // the entry-set gate now enforces the BR scope automatically.
-    flag("wcet", BR, "wcet", Witness::Config("crates/nsl-codegen/src/compiler/mod.rs")),
-    flag("wcet-cert", BR, "wcet", Witness::Report("crates/nsl-codegen/src/compiler/mod.rs")),
-    flag("wcet-target", BR, "wcet", Witness::Config("crates/nsl-codegen/src/compiler/mod.rs")),
-    flag("cpu", BR, "wcet", Witness::Config("crates/nsl-codegen/src/compiler/mod.rs")),
-    flag("do178c-report", BR, "wcet", Witness::Report("crates/nsl-codegen/src/compiler/mod.rs")),
-    flag("fpga-device", BR, "wcet", Witness::Config("crates/nsl-codegen/src/compiler/mod.rs")),
     // Report-only surfaces: the artifact/report is the witness.
     flag("fusion-report", B_ONLY, "fusion", Witness::Report("crates/nsl-codegen/src/fusion_report.rs")),
     flag("nan-analysis", CB, "nan-analysis", Witness::Report("crates/nsl-cli/src/commands/build/normal.rs")),

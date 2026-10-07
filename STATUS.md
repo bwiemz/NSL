@@ -164,6 +164,11 @@ tests that are *not* part of the green-build contract (see README → Benchmarks
 - **CPKD** — compiler-planned knowledge distillation (distill block, frozen
   teacher, fused KL-CE GPU kernel).
 - **FASE** — quantization-aware optimizer/codegen.
+- **WCET** (M53: worst-case execution time, `--wcet`, `--wcet-cert`,
+  `--wcet-target`, `--cpu`, `--do178c-report`, `--fpga-device`) —
+  **Removed** in the Phase 0.6 scope freeze; preserved at tag
+  `attic/scope-freeze-2026-10`. `@real_time`/`@wcet_budget` are refused with
+  the tag.
 - **ZK** (M55: zero-knowledge inference circuits, `nsl zk`, `--zk-*`) —
   **Removed** in the Phase 0.6 scope freeze; preserved at tag
   `attic/scope-freeze-2026-10`. `@zk_proof`/`@zk_lookup` are refused with the
@@ -206,7 +211,7 @@ for the compiler-state model (and the thread-local audit + migration plan that
 the same hardening pass produced).
 
 The `CompileOptions` "god-config" is being decomposed into cohesive sub-structs
-(`WcetOptions`, `WggoOptions`, `CshaOptions`, `CpdtOptions`,
+(`WggoOptions`, `CshaOptions`, `CpdtOptions`,
 `CalibrationOptions`, `DevToolsOptions`, `CheckpointOptions`, `WeightStreamOptions`,
 `MuonOptions`, `ImportedModelOptions`, `ZeroOptions`, `AutotuneOptions`,
 `WeightsOptions`, `FusionOptions`, `DiagnosticsOptions`, `MemoryOptions`,

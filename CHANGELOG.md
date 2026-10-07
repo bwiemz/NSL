@@ -3689,6 +3689,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   rows. Both decorators now get a typed refusal that names the tag. It stays
   an error under `--allow-unknown-decorators`, so a program that still
   carries one cannot build without its circuit unnoticed.
+- **WCET analysis (M53)**, in the Phase 0.6 scope freeze. The code is
+  preserved at tag `attic/scope-freeze-2026-10`. The analysis never read the
+  function it certified. Every `@real_time` function was priced as the same
+  fixed 1×512×512 matmul plus a 512-element ReLU. The certificate and the
+  DO-178C report were built from that estimate. `--cpu` only printed an
+  advisory line, and under the default `--wcet-target gpu`, `nsl build`
+  always priced an A100, because it had no `--gpu`. A bound that does not
+  describe the program is worse than no bound, and no model on the coder
+  roadmap needs one. Removed: `nsl-codegen`'s `wcet` module,
+  `Compiler::run_wcet_analysis` and its three call sites, `WcetOptions` and
+  `CompileOptions::wcet`, the `--wcet`/`--wcet-cert`/`--wcet-target`/`--cpu`/
+  `--do178c-report`/`--fpga-device` flags on `nsl build` and `nsl run`, the
+  FPGA and CPU spec databases (`FpgaSpec`/`FPGA_DATABASE`/`find_fpga`,
+  `CpuSpec`/`CPU_DATABASE`/`find_cpu`), and the `GpuSpec` fields only WCET
+  read (`base_clock_mhz`, `sync_overhead_ns`, `occupancy_worst_case`,
+  `empirical_p95_ratio`). `kernel_launch_overhead_ns` and
+  `pcie_bandwidth_gbps` stay, because CFIE, CSLA and CCR read them. Also
+  removed: `tests/test_wcet_{pass,fail}.nsl` and
+  `examples/m53_safety_controller.nsl`. `@real_time` and `@wcet_budget` get
+  the same typed refusal as the ZK decorators. `nsl run --gpu` stays: it
+  picks the GPU for `--monitor`'s predicted-vs-actual profile, and its help
+  text now says that. CEP's `wcet_us` roofline bound is unrelated and stays.
 
 _v0.10.0 below is the whole of the 0.9 line's unreleased work
 (2026-03-19 → 2026-09-06); from here releases are cut monthly (roadmap D5),

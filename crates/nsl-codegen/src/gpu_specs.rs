@@ -23,16 +23,10 @@ pub struct GpuSpec {
     pub crossover_fp8: f64,
     /// Crossover for FP32.
     pub crossover_fp32: f64,
-    /// Base clock in MHz (worst case — no boost).
-    pub base_clock_mhz: u32,
     /// Kernel launch overhead in nanoseconds (worst case).
     pub kernel_launch_overhead_ns: u64,
-    /// cuCtxSynchronize overhead in nanoseconds (worst case).
-    pub sync_overhead_ns: u64,
     /// PCIe bandwidth for host-device transfers in GB/s.
     pub pcie_bandwidth_gbps: f64,
-    /// Worst-case SM occupancy factor (0.0-1.0).
-    pub occupancy_worst_case: f64,
     /// L2 cache size in bytes.
     pub l2_cache_bytes: u64,
     // --- Multi-level memory hierarchy (for cost model) ---
@@ -48,11 +42,6 @@ pub struct GpuSpec {
     pub registers_per_sm: u32,
     /// Number of SMs.
     pub num_sms: u32,
-    /// Empirical p95 variance ratio for WCET statistical bounds.
-    /// GPU execution times vary due to non-deterministic warp scheduling,
-    /// memory coalescing patterns, and L2 contention. This factor converts
-    /// optimistic roofline estimates to p95 bounds. Typical: 1.2-1.4.
-    pub empirical_p95_ratio: f64,
 }
 
 impl GpuSpec {
@@ -216,11 +205,8 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         crossover_fp16: 153.0,
         crossover_fp8: 0.0,
         crossover_fp32: 9.6,
-        base_clock_mhz: 765,
         kernel_launch_overhead_ns: 6000,
-        sync_overhead_ns: 3000,
         pcie_bandwidth_gbps: 32.0,
-        occupancy_worst_case: 0.5,
         l2_cache_bytes: 40 * 1024 * 1024,
         l1_cache_kb: 192,
         l1_bandwidth_gbs: 14400.0,
@@ -228,7 +214,6 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         max_warps_per_sm: 64,
         registers_per_sm: 65536,
         num_sms: 108,
-        empirical_p95_ratio: 1.30,
     },
     GpuSpec {
         name: "A100-PCIe",
@@ -242,11 +227,8 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         crossover_fp16: 200.6,
         crossover_fp8: 0.0,
         crossover_fp32: 12.5,
-        base_clock_mhz: 765,
         kernel_launch_overhead_ns: 6000,
-        sync_overhead_ns: 3000,
         pcie_bandwidth_gbps: 32.0,
-        occupancy_worst_case: 0.5,
         l2_cache_bytes: 40 * 1024 * 1024,
         l1_cache_kb: 192,
         l1_bandwidth_gbs: 14400.0,
@@ -254,7 +236,6 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         max_warps_per_sm: 64,
         registers_per_sm: 65536,
         num_sms: 108,
-        empirical_p95_ratio: 1.30,
     },
     GpuSpec {
         name: "H100-SXM",
@@ -268,11 +249,8 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         crossover_fp16: 295.2,
         crossover_fp8: 590.7,
         crossover_fp32: 20.0,
-        base_clock_mhz: 1095,
         kernel_launch_overhead_ns: 5000,
-        sync_overhead_ns: 2000,
         pcie_bandwidth_gbps: 64.0,
-        occupancy_worst_case: 0.5,
         l2_cache_bytes: 50 * 1024 * 1024,
         l1_cache_kb: 256,
         l1_bandwidth_gbs: 19200.0,
@@ -280,7 +258,6 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         max_warps_per_sm: 64,
         registers_per_sm: 65536,
         num_sms: 132,
-        empirical_p95_ratio: 1.25,
     },
     GpuSpec {
         name: "H100-PCIe",
@@ -294,11 +271,8 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         crossover_fp16: 370.8,
         crossover_fp8: 741.9,
         crossover_fp32: 25.0,
-        base_clock_mhz: 1095,
         kernel_launch_overhead_ns: 5000,
-        sync_overhead_ns: 2000,
         pcie_bandwidth_gbps: 32.0,
-        occupancy_worst_case: 0.5,
         l2_cache_bytes: 50 * 1024 * 1024,
         l1_cache_kb: 256,
         l1_bandwidth_gbs: 19200.0,
@@ -306,7 +280,6 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         max_warps_per_sm: 64,
         registers_per_sm: 65536,
         num_sms: 114,
-        empirical_p95_ratio: 1.25,
     },
     GpuSpec {
         // Blackwell consumer (GB203-350). Added 2026-07-14: CSHA's smem
@@ -326,11 +299,8 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         crossover_fp16: 196.2,
         crossover_fp8: 392.3,
         crossover_fp32: 49.0,
-        base_clock_mhz: 2300,
         kernel_launch_overhead_ns: 4000,
-        sync_overhead_ns: 1500,
         pcie_bandwidth_gbps: 64.0,
-        occupancy_worst_case: 0.5,
         l2_cache_bytes: 48 * 1024 * 1024,
         l1_cache_kb: 128,
         l1_bandwidth_gbs: 7000.0,
@@ -338,7 +308,6 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         max_warps_per_sm: 48,
         registers_per_sm: 65536,
         num_sms: 70,
-        empirical_p95_ratio: 1.35,
     },
     GpuSpec {
         name: "RTX-4090",
@@ -352,11 +321,8 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         crossover_fp16: 327.4,
         crossover_fp8: 655.8,
         crossover_fp32: 81.9,
-        base_clock_mhz: 2235,
         kernel_launch_overhead_ns: 4000,
-        sync_overhead_ns: 1500,
         pcie_bandwidth_gbps: 32.0,
-        occupancy_worst_case: 0.5,
         l2_cache_bytes: 72 * 1024 * 1024,
         l1_cache_kb: 128,
         l1_bandwidth_gbs: 12800.0,
@@ -364,7 +330,6 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         max_warps_per_sm: 48,
         registers_per_sm: 65536,
         num_sms: 128,
-        empirical_p95_ratio: 1.35,
     },
     GpuSpec {
         name: "RTX-3090",
@@ -378,11 +343,8 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         crossover_fp16: 151.7,
         crossover_fp8: 0.0,
         crossover_fp32: 38.0,
-        base_clock_mhz: 1395,
         kernel_launch_overhead_ns: 5000,
-        sync_overhead_ns: 2000,
         pcie_bandwidth_gbps: 32.0,
-        occupancy_worst_case: 0.5,
         l2_cache_bytes: 6 * 1024 * 1024,
         l1_cache_kb: 128,
         l1_bandwidth_gbs: 9600.0,
@@ -390,7 +352,6 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         max_warps_per_sm: 48,
         registers_per_sm: 65536,
         num_sms: 82,
-        empirical_p95_ratio: 1.35,
     },
     GpuSpec {
         name: "L40S",
@@ -404,11 +365,8 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         crossover_fp16: 419.0,
         crossover_fp8: 848.4,
         crossover_fp32: 106.0,
-        base_clock_mhz: 1110,
         kernel_launch_overhead_ns: 5000,
-        sync_overhead_ns: 2000,
         pcie_bandwidth_gbps: 32.0,
-        occupancy_worst_case: 0.5,
         l2_cache_bytes: 48 * 1024 * 1024,
         l1_cache_kb: 128,
         l1_bandwidth_gbs: 12800.0,
@@ -416,7 +374,6 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         max_warps_per_sm: 48,
         registers_per_sm: 65536,
         num_sms: 142,
-        empirical_p95_ratio: 1.30,
     },
     // NVIDIA Jetson AGX Orin
     GpuSpec {
@@ -431,11 +388,8 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         crossover_fp16: 830.0,
         crossover_fp8: 830.0,
         crossover_fp32: 25.9,
-        base_clock_mhz: 624,
         kernel_launch_overhead_ns: 8000,
-        sync_overhead_ns: 4000,
         pcie_bandwidth_gbps: 0.0,
-        occupancy_worst_case: 0.4,
         l2_cache_bytes: 4 * 1024 * 1024,
         l1_cache_kb: 128,
         l1_bandwidth_gbs: 3200.0,
@@ -443,7 +397,6 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         max_warps_per_sm: 48,
         registers_per_sm: 65536,
         num_sms: 16,
-        empirical_p95_ratio: 1.40,
     },
     // NVIDIA Jetson Orin NX (smaller edge)
     GpuSpec {
@@ -458,11 +411,8 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         crossover_fp16: 976.0,
         crossover_fp8: 976.0,
         crossover_fp32: 30.3,
-        base_clock_mhz: 624,
         kernel_launch_overhead_ns: 8000,
-        sync_overhead_ns: 4000,
         pcie_bandwidth_gbps: 0.0,
-        occupancy_worst_case: 0.35,
         l2_cache_bytes: 2 * 1024 * 1024,
         l1_cache_kb: 128,
         l1_bandwidth_gbs: 1600.0,
@@ -470,7 +420,6 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         max_warps_per_sm: 48,
         registers_per_sm: 65536,
         num_sms: 8,
-        empirical_p95_ratio: 1.40,
     },
     // NVIDIA B200 (Blackwell, sm_100) — MXFP8 per-block scaling + NVFP4
     GpuSpec {
@@ -485,11 +434,8 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         crossover_fp16: 281.3,
         crossover_fp8: 562.5,
         crossover_fp32: 8.75,
-        base_clock_mhz: 1800,
         kernel_launch_overhead_ns: 3000,
-        sync_overhead_ns: 1200,
         pcie_bandwidth_gbps: 64.0,
-        occupancy_worst_case: 0.6,
         l2_cache_bytes: 128 * 1024 * 1024,
         l1_cache_kb: 256,
         l1_bandwidth_gbs: 25600.0,
@@ -497,7 +443,6 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         max_warps_per_sm: 64,
         registers_per_sm: 65536,
         num_sms: 160,
-        empirical_p95_ratio: 1.20,
     },
     // NVIDIA B100 (Blackwell, sm_100) — MXFP8 + NVFP4 (PCIe variant)
     GpuSpec {
@@ -512,11 +457,8 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         crossover_fp16: 273.4,
         crossover_fp8: 546.9,
         crossover_fp32: 8.75,
-        base_clock_mhz: 1600,
         kernel_launch_overhead_ns: 3500,
-        sync_overhead_ns: 1500,
         pcie_bandwidth_gbps: 64.0,
-        occupancy_worst_case: 0.55,
         l2_cache_bytes: 96 * 1024 * 1024,
         l1_cache_kb: 256,
         l1_bandwidth_gbs: 20000.0,
@@ -524,7 +466,6 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         max_warps_per_sm: 64,
         registers_per_sm: 65536,
         num_sms: 128,
-        empirical_p95_ratio: 1.20,
     },
     // NVIDIA T4 (Turing, sm_75) — tight-SMEM target used by CSHA override tests.
     // Turing's L1/SMEM is split; a CTA can claim up to 96 KB of combined
@@ -547,11 +488,8 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         crossover_fp16: 216.7,
         crossover_fp8: 0.0,
         crossover_fp32: 27.0,
-        base_clock_mhz: 585,
         kernel_launch_overhead_ns: 8000,
-        sync_overhead_ns: 4000,
         pcie_bandwidth_gbps: 16.0,
-        occupancy_worst_case: 0.5,
         l2_cache_bytes: 4 * 1024 * 1024,
         l1_cache_kb: 96,
         l1_bandwidth_gbs: 4000.0,
@@ -559,7 +497,6 @@ pub const GPU_DATABASE: &[GpuSpec] = &[
         max_warps_per_sm: 32,
         registers_per_sm: 65536,
         num_sms: 40,
-        empirical_p95_ratio: 1.40,
     },
 ];
 
@@ -636,122 +573,6 @@ pub fn resolve_local_gpu() -> Option<&'static GpuSpec> {
     let name = &local_device_identity()?.name;
     let normalized = name.to_uppercase().replace(' ', "-");
     find_gpu(name).filter(|s| s.name.to_uppercase() == normalized)
-}
-
-/// Hardware specifications for an FPGA device (used for certified WCET analysis).
-///
-/// FPGA WCET is deterministic: fixed clock, no speculative execution, no cache hierarchy
-/// variability. When all data fits in OCM (on-chip memory), execution time is a pure
-/// function of the computation graph and PE array dimensions.
-#[derive(Debug, Clone)]
-pub struct FpgaSpec {
-    pub device_name: &'static str,
-    pub vendor: &'static str,
-    /// Fixed clock frequency in MHz (no boost, no throttling).
-    pub clock_mhz: u32,
-    /// On-chip memory (OCM/BRAM) size in KB.
-    pub ocm_size_kb: u32,
-    /// Processing element array dimensions (rows, cols).
-    pub pe_array_dims: (u32, u32),
-    /// OCM read/write latency in cycles (deterministic).
-    pub ocm_latency_cycles: u32,
-    /// DDR read/write latency in cycles (best case — but certified path avoids DDR).
-    pub ddr_latency_cycles: u32,
-    /// DSP slices available (for MAC operations).
-    pub dsp_slices: u32,
-}
-
-/// Built-in FPGA specification database for certified WCET analysis.
-pub const FPGA_DATABASE: &[FpgaSpec] = &[
-    // Xilinx VU440 — large FPGA for inference
-    FpgaSpec {
-        device_name: "xcvu440",
-        vendor: "xilinx",
-        clock_mhz: 300,
-        ocm_size_kb: 52_920, // ~51.7 MB BRAM
-        pe_array_dims: (16, 16),
-        ocm_latency_cycles: 2,
-        ddr_latency_cycles: 80,
-        dsp_slices: 2880,
-    },
-    // Xilinx ZU9EG (Zynq UltraScale+ for edge robotics)
-    FpgaSpec {
-        device_name: "xczu9eg",
-        vendor: "xilinx",
-        clock_mhz: 300,
-        ocm_size_kb: 1_824, // ~1.8 MB BRAM
-        pe_array_dims: (8, 8),
-        ocm_latency_cycles: 2,
-        ddr_latency_cycles: 100,
-        dsp_slices: 2520,
-    },
-    // Xilinx Versal AI Edge VE2302 (for automotive/robotics)
-    FpgaSpec {
-        device_name: "ve2302",
-        vendor: "xilinx",
-        clock_mhz: 400,
-        ocm_size_kb: 4_096, // 4 MB BRAM+URAM
-        pe_array_dims: (12, 12),
-        ocm_latency_cycles: 1,
-        ddr_latency_cycles: 60,
-        dsp_slices: 1968,
-    },
-];
-
-/// Find an FPGA by device name. Case-insensitive exact match.
-pub fn find_fpga(name: &str) -> Option<&'static FpgaSpec> {
-    let name_lower = name.to_lowercase();
-    FPGA_DATABASE
-        .iter()
-        .find(|f| f.device_name.to_lowercase() == name_lower)
-}
-
-/// Hardware specifications for a CPU model (used for WCET analysis on CPU targets).
-#[derive(Debug, Clone)]
-pub struct CpuSpec {
-    pub name: &'static str,
-    pub base_clock_mhz: u32,
-    pub fp32_flops_per_cycle: u32,
-    pub fp16_flops_per_cycle: Option<u32>,
-    pub l1d_cache_bytes: u32,
-    pub l2_cache_bytes: u64,
-    pub l3_cache_bytes: Option<u64>,
-    pub memory_bandwidth_gbps: f64,
-    pub cache_line_bytes: u32,
-    pub num_cores: u32,
-}
-
-/// Built-in CPU specification database for WCET analysis.
-pub const CPU_DATABASE: &[CpuSpec] = &[
-    CpuSpec {
-        name: "cortex-a78",
-        base_clock_mhz: 2000,
-        fp32_flops_per_cycle: 8,
-        fp16_flops_per_cycle: Some(16),
-        l1d_cache_bytes: 64 * 1024,
-        l2_cache_bytes: 512 * 1024,
-        l3_cache_bytes: Some(4 * 1024 * 1024),
-        memory_bandwidth_gbps: 51.2,
-        cache_line_bytes: 64,
-        num_cores: 4,
-    },
-    CpuSpec {
-        name: "x86-64-v4",
-        base_clock_mhz: 2100,
-        fp32_flops_per_cycle: 32,
-        fp16_flops_per_cycle: Some(64),
-        l1d_cache_bytes: 48 * 1024,
-        l2_cache_bytes: 2 * 1024 * 1024,
-        l3_cache_bytes: Some(36 * 1024 * 1024),
-        memory_bandwidth_gbps: 102.4,
-        cache_line_bytes: 64,
-        num_cores: 16,
-    },
-];
-
-/// Find a CPU by name. Exact match only.
-pub fn find_cpu(name: &str) -> Option<&'static CpuSpec> {
-    CPU_DATABASE.iter().find(|c| c.name == name)
 }
 
 #[cfg(test)]
@@ -842,14 +663,13 @@ mod tests {
         assert!(h100.supports_wgmma());
     }
 
+    /// Launch overhead and PCIe bandwidth are read by the CFIE persistent
+    /// kernel model, the CSLA window planner and the CCR cost model.
     #[test]
-    fn test_wcet_fields_present() {
+    fn test_launch_and_transfer_fields_present() {
         let h100 = find_gpu("H100-SXM").unwrap();
-        assert_eq!(h100.base_clock_mhz, 1095);
         assert_eq!(h100.kernel_launch_overhead_ns, 5000);
-        assert_eq!(h100.sync_overhead_ns, 2000);
         assert!((h100.pcie_bandwidth_gbps - 64.0).abs() < 0.1);
-        assert!((h100.occupancy_worst_case - 0.5).abs() < 0.01);
         assert_eq!(h100.l2_cache_bytes, 50 * 1024 * 1024);
     }
 
@@ -858,30 +678,7 @@ mod tests {
         let orin = find_gpu("Orin").unwrap();
         assert_eq!(orin.name, "Orin");
         assert_eq!(orin.sm_version, 87);
-        assert_eq!(orin.base_clock_mhz, 624);
         assert!((orin.pcie_bandwidth_gbps).abs() < 0.01); // unified memory, no PCIe
-        assert!((orin.occupancy_worst_case - 0.4).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_find_cpu() {
-        let arm = find_cpu("cortex-a78").unwrap();
-        assert_eq!(arm.base_clock_mhz, 2000);
-        assert_eq!(arm.fp32_flops_per_cycle, 8);
-        assert_eq!(arm.fp16_flops_per_cycle, Some(16));
-        assert_eq!(arm.num_cores, 4);
-
-        let x86 = find_cpu("x86-64-v4").unwrap();
-        assert_eq!(x86.base_clock_mhz, 2100);
-        assert_eq!(x86.fp32_flops_per_cycle, 32);
-        assert_eq!(x86.num_cores, 16);
-
-        assert!(find_cpu("nonexistent").is_none());
-    }
-
-    #[test]
-    fn test_cpu_database_size() {
-        assert_eq!(CPU_DATABASE.len(), 2);
     }
 
     #[test]
@@ -971,44 +768,6 @@ mod tests {
         assert_eq!(a100.warp_group_size(), 32, "Ampere uses 32-thread warps");
     }
 
-    // ---- FPGA database tests ----
-
-    #[test]
-    fn test_find_fpga_exact() {
-        let fpga = find_fpga("xcvu440").unwrap();
-        assert_eq!(fpga.device_name, "xcvu440");
-        assert_eq!(fpga.vendor, "xilinx");
-        assert_eq!(fpga.clock_mhz, 300);
-    }
-
-    #[test]
-    fn test_find_fpga_case_insensitive() {
-        let fpga = find_fpga("XCVU440").unwrap();
-        assert_eq!(fpga.device_name, "xcvu440");
-    }
-
-    #[test]
-    fn test_find_fpga_not_found() {
-        assert!(find_fpga("nonexistent").is_none());
-    }
-
-    #[test]
-    fn test_fpga_database_size() {
-        assert_eq!(FPGA_DATABASE.len(), 3);
-    }
-
-    #[test]
-    fn test_fpga_specs_valid() {
-        for fpga in FPGA_DATABASE {
-            assert!(fpga.clock_mhz > 0);
-            assert!(fpga.ocm_size_kb > 0);
-            assert!(fpga.pe_array_dims.0 > 0);
-            assert!(fpga.pe_array_dims.1 > 0);
-            assert!(fpga.ocm_latency_cycles > 0);
-            assert!(fpga.dsp_slices > 0);
-        }
-    }
-
     /// Roadmap A2 step 9 found the CFIE emitters naming `.target sm_89`
     /// under `.version 7.0`. The ISA each architecture first appears in,
     /// from the PTX ISA release notes; `ptx_isa_for_sm` must be at least
@@ -1052,18 +811,6 @@ mod tests {
         assert_eq!(ptx_isa_for_sm(80), "7.0");
         assert_eq!(ptx_isa_for_sm(90), "8.4");
         assert_eq!(ptx_isa_for_sm(100), "8.6");
-    }
-
-    #[test]
-    fn test_empirical_p95_ratio_valid() {
-        for gpu in GPU_DATABASE {
-            assert!(
-                gpu.empirical_p95_ratio >= 1.0,
-                "{} has p95 ratio < 1.0: {}",
-                gpu.name,
-                gpu.empirical_p95_ratio
-            );
-        }
     }
 
     #[test]
