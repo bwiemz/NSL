@@ -308,6 +308,9 @@ block_kv with fused projections) are rejected at compile time.
 ### FPGA / Verilog (M57) — removed
 - Removed in the Phase 0.6 scope freeze (`nsl fpga-compile`, the HIR, the Verilog emitter and the KIR→HIR lowering are gone; `--target fpga` now gets a refusal that names the tag); preserved at tag `attic/scope-freeze-2026-10`
 
+### Agents (M56) — removed
+- Removed in the Phase 0.6 scope freeze (`agent` blocks, the action-port-graph checks, agent codegen, the agent runtime and its `nsl_agent_*` ABI rows, and the `@pipeline_agent`/`@auto_device_transfer` decorators are gone; `agent` stays a reserved word, and an `agent` block and both decorators now get a refusal that names the tag); preserved at tag `attic/scope-freeze-2026-10`. `--linear-types` (M38) is unaffected
+
 ---
 
 ## Compile-Time Analysis Tools
@@ -387,7 +390,7 @@ Milestone work from M9-M55 is present in the repo, with maturity ranging from pr
 ### Future (M56-M71)
 | Phase | Milestones | Theme |
 |-------|-----------|-------|
-| v1.0 | M56-M62 | Multi-agent, elastic fault tolerance, cluster debugging (the M57 FPGA backend was removed in the Phase 0.6 scope freeze) |
+| v1.0 | M56-M62 | Elastic fault tolerance, cluster debugging (the M56 agents subsystem and the M57 FPGA backend were removed in the Phase 0.6 scope freeze) |
 | v1.1 | M63-M64 | Compiled MCTS tree search, online DPO alignment |
 | v1.2 | M65-M67 | Ternary 1.58-bit types, format-agnostic sparsity, neuromorphic |
 | v1.3 | M68-M71 | Refinement types (Z3 SMT), phase-split inference |

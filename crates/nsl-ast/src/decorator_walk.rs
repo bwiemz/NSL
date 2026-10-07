@@ -11,11 +11,11 @@
 //!
 //! The generic [`crate::visitor`] walk deliberately skips the member-level
 //! decorator vectors (`ModelMember::Method(_, decos)`,
-//! `AgentMember::Method(_, decos)`, `LayerDecl/FieldDecl.decorators`,
-//! `KernelDef.decorators`) — it visits bodies, not annotations. This visitor
-//! overrides `visit_stmt` to pick those up and then delegates to the generic
-//! walk for recursion, so any host reachable by the generic walk is reachable
-//! here (train-section bodies, fn bodies, nested blocks).
+//! `LayerDecl.decorators`, `KernelDef.decorators`) — it visits bodies, not
+//! annotations. This visitor overrides `visit_stmt` to pick those up and then
+//! delegates to the generic walk for recursion, so any host reachable by the
+//! generic walk is reachable here (train-section bodies, fn bodies, nested
+//! blocks).
 
 use crate::decl::{Decorator, ModelMember};
 use crate::stmt::{Stmt, StmtKind};
@@ -37,16 +37,10 @@ pub enum DecoratorHost {
     /// `@x` above a `kernel` definition (the `KernelDef.decorators` field —
     /// distinct from a `Decorated` stmt wrapping the kernel).
     Kernel,
-    /// `@x` above an `agent` declaration.
-    Agent,
     /// `@x` on a `layer`/field declaration inside a `model`.
     ModelLayer,
     /// `@x` on a method inside a `model`.
     ModelMethod,
-    /// `@x` on a field inside an `agent`.
-    AgentField,
-    /// `@x` on a method inside an `agent`.
-    AgentMethod,
     /// `@x` above any other statement (a `let`, an expression, a `grad`
     /// block, ...). The checker's per-name position contracts decide which of
     /// these are legal; the walk only reports where the decorator sat.
@@ -62,11 +56,8 @@ impl DecoratorHost {
             DecoratorHost::TrainBlock => "a train block",
             DecoratorHost::DistillBlock => "a distill block",
             DecoratorHost::Kernel => "a kernel",
-            DecoratorHost::Agent => "an agent",
             DecoratorHost::ModelLayer => "a model layer/field",
             DecoratorHost::ModelMethod => "a model method",
-            DecoratorHost::AgentField => "an agent field",
-            DecoratorHost::AgentMethod => "an agent method",
             DecoratorHost::OtherStmt => "a statement",
         }
     }
@@ -91,7 +82,6 @@ fn host_of_inner(inner: &Stmt) -> DecoratorHost {
         StmtKind::TrainBlock(_) => DecoratorHost::TrainBlock,
         StmtKind::DistillBlock(_) => DecoratorHost::DistillBlock,
         StmtKind::KernelDef(_) => DecoratorHost::Kernel,
-        StmtKind::AgentDef(_) => DecoratorHost::Agent,
         // A doubly-decorated statement: `@a\n@b\nfn ...` parses as nested
         // Decorated in some forms — classify by the innermost non-decorated
         // statement so `@a` and `@b` report the same host.
@@ -127,23 +117,6 @@ impl<'a> Collector<'a> {
                         ModelMember::LayerDecl { decorators, .. } => {
                             for d in decorators {
                                 self.out.push(DecoratorUse { deco: d, host: DecoratorHost::ModelLayer });
-                            }
-                        }
-                    }
-                }
-            }
-            StmtKind::AgentDef(a) => {
-                for member in &a.members {
-                    match member {
-                        crate::agent::AgentMember::Method(f, decos) => {
-                            for d in decos {
-                                self.out.push(DecoratorUse { deco: d, host: DecoratorHost::AgentMethod });
-                            }
-                            self.collect_block(&f.body);
-                        }
-                        crate::agent::AgentMember::FieldDecl { decorators, .. } => {
-                            for d in decorators {
-                                self.out.push(DecoratorUse { deco: d, host: DecoratorHost::AgentField });
                             }
                         }
                     }

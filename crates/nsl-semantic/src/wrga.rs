@@ -503,7 +503,7 @@ pub fn validate_adapter_decorator(
 ///
 /// That trust only extends to symbols this file genuinely can't see the
 /// definition of.  A same-file declaration of the wrong kind (`struct`,
-/// `fn`, `enum`, `trait`, `agent`) is not a cross-module import — this pass
+/// `fn`, `enum`, `trait`) is not a cross-module import — this pass
 /// has full access to its shape and must reject it outright, since only a
 /// `model` can satisfy the adapter contract (`struct` in particular can
 /// never declare a `forward` method at all).
@@ -539,7 +539,6 @@ pub fn validate_wrga_custom_adapters(
                 StmtKind::FnDef(d) if d.name == adapter_sym => Some("fn"),
                 StmtKind::EnumDef(d) if d.name == adapter_sym => Some("enum"),
                 StmtKind::TraitDef(d) if d.name == adapter_sym => Some("trait"),
-                StmtKind::AgentDef(d) if d.name == adapter_sym => Some("agent"),
                 _ => None,
             });
             if let Some(kind) = wrong_kind {

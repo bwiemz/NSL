@@ -630,7 +630,6 @@ const NOT_A_PASS: &[(&str, &str)] = &[
          (joining requests to dispositions), transforms nothing itself",
     ),
     ("ad_rules", "adjoint rules table consumed by source-AD, not a pass"),
-    ("agent", "M56 agent-memory feature"),
     ("autotune", "kernel autotuner, invoked BY passes rather than being one"),
     ("bin", "binaries, not library modules"),
     ("bitnet", "M35 BitNet quantized-model support"),
@@ -1095,7 +1094,7 @@ fn every_phase_owning_function_establishes_its_scope() {
          "pub fn build_report", "Analysis"),
         // Milestone C: the train-block wrapper scopes ITSELF, so every
         // caller — compile_user_functions (nested train in any fn),
-        // lambdas, model/agent methods, module compiles — is covered by
+        // lambdas, model methods, module compiles — is covered by
         // construction, not just the two top-level drivers above. This is
         // what closes the scheduler's phase=None production gap, and it is
         // the LOAD-BEARING TrainBlock install: the compile_main /

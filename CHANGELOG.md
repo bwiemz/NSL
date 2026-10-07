@@ -3731,6 +3731,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   `--target fpga` is now refused with the attic tag, like the other removed
   backends. The `I8`/`I16` KIR types stay; the int8 KV-cache and
   dequantization kernels use `I8`. The name HIR is free for NSL V2.
+- **Agents (M56)**, in the Phase 0.6 scope freeze. The code is preserved at
+  tag `attic/scope-freeze-2026-10`. No model on the coder roadmap is a
+  multi-agent pipeline, and the subsystem was a language change carried
+  through every layer: a keyword, an AST node every exhaustive `StmtKind`
+  match had to name, a parser, about 1,800 lines of action-port-graph checks
+  that ran on every module, three agent-compile calls in each of seven
+  codegen entry points, and a mailbox/scheduler/pool runtime whose seven
+  `nsl_agent_*` FFI rows the codegen never called. Removed: `nsl-ast`'s and
+  `nsl-parser`'s `agent` modules, `StmtKind::AgentDef` and the agent
+  decorator hosts, `nsl-semantic`'s `agent` module (E0601-E0603,
+  E0607-E0610), `Type::Agent` and `AgentFieldOwnership`, `nsl-codegen`'s
+  `agent` module with `@pipeline_agent` lowering and the agent dispatch and
+  field-access arms, `nsl-runtime`'s `agent` module, the seven ABI rows (the
+  pinned count goes from 684 to 677), the `NOT_A_PASS` row, the eight
+  `examples/m56_*.nsl` programs and the tests that covered them. `agent`
+  stays a reserved word: an `agent` block is now one parse error that names
+  the removal and the tag, and its body is skipped, rather than reparsing as
+  an expression statement. `@pipeline_agent` and `@auto_device_transfer` get
+  the same typed refusal as the other removed decorators, an error even
+  under `--allow-unknown-decorators`. `--linear-types` (M38a), `@shared` and
+  `nsl_tensor_to_device` stay; `nsl run --linear-types`, which M56 added,
+  still turns on the ownership walker.
 
 _v0.10.0 below is the whole of the 0.9 line's unreleased work
 (2026-03-19 → 2026-09-06); from here releases are cut monthly (roadmap D5),

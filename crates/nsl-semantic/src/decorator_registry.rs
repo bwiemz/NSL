@@ -44,7 +44,7 @@ const fn k(name: &'static str, read_by: &'static str) -> KnownDecorator {
 
 /// Every decorator name the toolchain reads anywhere, from the 2026-08-15
 /// empirical inventory (updated as consumers move): 35 validated in `checker/stmt.rs`, 13 in
-/// `checker/model.rs`, 3 in other semantic modules, and 4 read only by
+/// `checker/model.rs`, 1 in another semantic module, and 4 read only by
 /// codegen. Names consumed by the parser before a `Decorator` node exists
 /// (`pack`, `unpack`, `backward`, `*_ptx` in datatype blocks; `endpoint` in
 /// serve blocks) are deliberately absent — their namespaces were already
@@ -102,9 +102,7 @@ pub static KNOWN_DECORATORS: &[KnownDecorator] = &[
     k("speculative", "crates/nsl-semantic/src/checker/model.rs"),
     k("target", "crates/nsl-semantic/src/checker/model.rs"),
     // --- validated elsewhere in nsl-semantic ---
-    k("auto_device_transfer", "crates/nsl-semantic/src/agent.rs"),
     k("export", "crates/nsl-semantic/src/export.rs"),
-    k("pipeline_agent", "crates/nsl-semantic/src/agent.rs"),
     // --- read only by nsl-codegen ---
     k("fp4_compute", "crates/nsl-codegen/src/fp8.rs"),
     k("no_grad", "crates/nsl-codegen/src/compiler/declaration.rs"),
@@ -191,6 +189,18 @@ pub static UNIMPLEMENTED_DECORATORS: &[(&str, &str)] = &[
          scope freeze; the code is preserved at tag \
          `attic/scope-freeze-2026-10`. Remove the decorator",
     ),
+    (
+        "pipeline_agent",
+        "@pipeline_agent was removed with the agents subsystem (M56) in the \
+         Phase 0.6 scope freeze; the code is preserved at tag \
+         `attic/scope-freeze-2026-10`. Remove the decorator",
+    ),
+    (
+        "auto_device_transfer",
+        "@auto_device_transfer was removed with the agents subsystem (M56) \
+         in the Phase 0.6 scope freeze; the code is preserved at tag \
+         `attic/scope-freeze-2026-10`. Remove the decorator",
+    ),
 ];
 
 /// Is `name` in the closed namespace?
@@ -260,7 +270,14 @@ mod tests {
 
     #[test]
     fn removed_names_refuse_with_the_attic_tag() {
-        for name in ["zk_proof", "zk_lookup", "real_time", "wcet_budget"] {
+        for name in [
+            "zk_proof",
+            "zk_lookup",
+            "real_time",
+            "wcet_budget",
+            "pipeline_agent",
+            "auto_device_transfer",
+        ] {
             assert!(find(name).is_none(), "@{name} was removed");
             let msg = unimplemented_refusal(name)
                 .unwrap_or_else(|| panic!("@{name} must get a typed refusal"));

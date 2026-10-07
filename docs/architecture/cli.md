@@ -59,13 +59,13 @@ both — which is the drift the flag contract below exists to police.
 
 **`pipeline.rs`: frontend → semantic → codegen.** `frontend_with_source_map`
 reads the file, `nsl_lexer::tokenize`s it, `nsl_parser::parse`s the tokens,
-runs `nsl_semantic::analyze_with_imports` (threading `linear_types` so E0610
-fires), emits every diagnostic through the `SourceMap`, and `exit(1)`s if any
-is an error — so by the time a command holds the `AnalysisResult` the
-frontend is known-clean. `exit_on_codegen_error` renders a `CodegenError`
-through the same source map when it carries a span. The rest of the file is
-bridges from semantic decorator configs into codegen newtypes
-(`module_data_to_wrga_inputs`, `module_data_to_fused_ce_configs`, ...); the
+runs `nsl_semantic::analyze_with_imports` (threading `linear_types` so the
+M38a ownership walker runs), emits every diagnostic through the `SourceMap`,
+and `exit(1)`s if any is an error — so by the time a command holds the
+`AnalysisResult` the frontend is known-clean. `exit_on_codegen_error` renders
+a `CodegenError` through the same source map when it carries a span. The
+rest of the file is bridges from semantic decorator configs into codegen
+newtypes (`module_data_to_wrga_inputs`, `module_data_to_fused_ce_configs`, ...); the
 single-file twins live in `src/analysis_bridges.rs` so `profile` can reuse
 them. Multi-file programs go through `src/loader.rs` (`ModuleData`) and the
 import resolver in `src/resolver.rs`.
@@ -190,7 +190,7 @@ them is written by hand:
 
 ## The gate suite
 
-`crates/nsl-cli/tests/` is 172 test files (~51K lines) plus `crates/nsl-cli/tests/fixtures/` and `crates/nsl-cli/tests/differential_scripts/`;
+`crates/nsl-cli/tests/` is 182 test files (~56K lines) plus `crates/nsl-cli/tests/fixtures/` and `crates/nsl-cli/tests/differential_scripts/`;
 the e2e stdout baselines live at the workspace root in `tests/expected/`. The dominant shape is a **gate**: build or run a small
 `.nsl` program through the real binary and assert on exit status and stderr
 markers. By filename suffix: 78 `*_gate.rs`, 18 `*_e2e.rs`, 7
@@ -207,8 +207,7 @@ markers. By filename suffix: 78 `*_gate.rs`, 18 `*_e2e.rs`, 7
   `exec_fingerprint_resume_gate.rs`, `ccr_checkpoint_parity.rs`,
   `model_config_drift.rs`.
 - **End-to-end examples** — `e2e.rs` compiles and runs the workspace's
-  `examples/*.nsl` and diffs stdout against the root `tests/expected/*.txt`; `m56_e2e_examples.rs` runs
-  `nsl check --linear-types` over the M56 examples; the `*_e2e.rs` files
+  `examples/*.nsl` and diffs stdout against the root `tests/expected/*.txt`; the `*_e2e.rs` files
   (`csha_checkpoint_decorator_cli_e2e.rs`, `fused_lm_ce_e2e_nsl_source.rs`,
   `pretrain_loss_decrease_gpu_e2e.rs`, ...) run one feature through the CLI.
 - **GPU-certified gates** — the `*_gpu_gate.rs` files

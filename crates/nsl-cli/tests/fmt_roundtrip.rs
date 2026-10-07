@@ -46,10 +46,6 @@ const EXPECTED_SKIPS: &[(&str, &str)] = &[
         "`quant(scheme = int8, ...)` where the grammar expects `static`",
     ),
     (
-        "examples/m56_device_transfer_opt_in.nsl",
-        "uses `tokenizer` (a keyword) as a name",
-    ),
-    (
         "models/coder1b/pretrain_1b2048.nsl",
         "a template with a placeholder line",
     ),
@@ -62,6 +58,7 @@ const EXPECTED_SKIPS: &[(&str, &str)] = &[
     ("crates/nsl-lexer/tests/lex/keywords.nsl", "lexer golden: bare keywords"),
     ("crates/nsl-lexer/tests/lex/operators.nsl", "lexer golden: bare operators"),
     // Parser error-recovery goldens: each is a deliberate error.
+    ("crates/nsl-parser/tests/parse/err_agent_removed.nsl", "error-recovery golden"),
     ("crates/nsl-parser/tests/parse/err_cascades.nsl", "error-recovery golden"),
     ("crates/nsl-parser/tests/parse/err_indentation.nsl", "error-recovery golden"),
     ("crates/nsl-parser/tests/parse/err_let_mut.nsl", "error-recovery golden"),

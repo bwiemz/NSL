@@ -72,7 +72,6 @@
 // ===========================================================================
 
 // --- Core compilation pipeline -------------------------------------------
-pub mod agent;
 pub mod builtins;
 pub(crate) mod c_export_table;
 pub mod c_header;
@@ -293,7 +292,7 @@ pub mod wrga_spectral;
 /// lowering, linking, C-export/header emission, and ownership analysis.
 pub mod core {
     pub use crate::{
-        agent, builtins, c_header, c_wrapper, compiler, context, dynamic_shapes,
+        builtins, c_header, c_wrapper, compiler, context, dynamic_shapes,
         error, expr, ffi_ownership, func, grammar_compiler, linker, ownership,
         ownership_expr, schema_convert, standalone, stdlib_loader, stmt, stmt_csla,
         stmt_fase, stmt_train, types, use_count,
@@ -2354,16 +2353,12 @@ pub fn compile_and_calibrate(
         compiler.collect_enums(&parsed.module.stmts)?;
         compiler.collect_structs(&parsed.module.stmts)?;
         compiler.collect_models(&parsed.module.stmts)?;
-        // M56 Task 17: compute agent struct layouts.
-        compiler.collect_agents(&parsed.module.stmts)?;
         compiler.declare_runtime_functions()?;
         compiler.declare_imported_functions(&imported_fns)?;
         compiler.declare_user_functions_with_linkage(
             &parsed.module.stmts,
             cranelift_module::Linkage::Export,
         )?;
-        // M56 Task 17: declare agent method FuncIds.
-        compiler.declare_agent_methods(&parsed.module.stmts, cranelift_module::Linkage::Export)?;
         let vmap_results = compiler.apply_vmap_transforms(&parsed.module);
         compiler.register_batched_functions(&vmap_results);
         compiler.compile_datatype_defs(&parsed.module.stmts)?;
@@ -2481,8 +2476,6 @@ pub fn compile_and_calibrate(
         }
         compiler.compile_flash_attention_kernels(&parsed.module.stmts)?;
         compiler.compile_user_functions(&parsed.module.stmts)?;
-        // M56 Task 17: compile agent method bodies.
-        compiler.compile_agent_methods(&parsed.module.stmts)?;
         compiler.compile_batched_functions(&vmap_results)?;
         compiler.compile_main(&parsed.module.stmts)?;
         compiler.compile_pending_lambdas()?;

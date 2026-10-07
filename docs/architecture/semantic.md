@@ -45,7 +45,6 @@ builtins::register_builtins(&mut ScopeMap, interner)         builtins.rs
         ▼
 TypeChecker::new(...).check_module(module)                   checker/mod.rs
         │   collect_top_level_decls   (imports first, then fn/model/struct/… pre-declared)
-        │   agent::check_linear_types_flag        (E0610 if `agent` without --linear-types)
         │   check_stmt for every top-level stmt   checker/stmt.rs → decl.rs, model.rs,
         │                                          block.rs, expr.rs, ops.rs
         │     ├─ TypeResolver::resolve (resolve.rs) turns TypeExpr → Type
@@ -66,11 +65,6 @@ wrga::validate_wrga_custom_adapters(...)                     wrga.rs
         ▼
 if linear_types: ownership_walker::analyze_ownership(...)    ownership_walker.rs / ownership.rs
         │   use-after-move, borrow rules; FunctionOwnershipInfo per fn
-        ▼
-agent pipeline (always runs)                                 agent.rs
-        │   AgentRegistry::register_module → extract_apgs → detect_cycles,
-        │   check_device_compatibility, check_fan_out,
-        │   check_cross_agent_field_access, check_cross_agent_mutation
         ▼
 AnalysisResult { diagnostics, type_map, scopes, ownership_info, *_configs, … }
 ```
@@ -111,7 +105,6 @@ Line counts are `wc -l` at the time of writing.
 | `ownership_walker.rs` | 392 | `analyze_ownership`: AST walk that drives `OwnershipChecker` per fn body; emits `FunctionOwnershipInfo`. |
 | `ownership_autodiff.rs` | 253 | `classify_backward_access`: which tape ops need inputs/outputs alive for backward. |
 | `export.rs` | 1318 | `@export` validation (C-ABI subset), `WeightIndexMap`. |
-| `agent.rs` | 1826 | M56 agents: `AgentRegistry`, `ActionPortGraph`, E0601/E0602/E0603/E0607/E0608/E0610 checks. |
 | `determinism.rs` | 344 | `DeterminismChecker`: non-deterministic op classification, RNG state tracking (CLI-driven). |
 | `nan_analysis.rs` | 594 | `NanAnalyzer`: `log`/`sqrt`/division risk walk (CLI-driven). |
 | `cftp.rs` | 510 | `@fase`, `@pca`, `@fused_lm_ce` validators and their config structs. |
@@ -144,7 +137,6 @@ is syntactic and never escapes `resolve.rs`. Variants worth knowing:
   `QuantizedTensor`. `Type::is_tensor` and `as_tensor_parts` see through
   `Borrow` and normalise `Param`/`Buffer` to (shape, dtype, `Device::Unknown`).
 - Nominal: `Struct`, `Enum`, `Trait`, `Model { fields, methods, .. }`,
-  `Agent { fields: (name, Type, AgentFieldOwnership), methods }`,
   `FixedModelArray { element_model, size }`.
 - `Function { params, ret, effect: Effect }` — a param of `Type::Unknown`
   marks the function variadic for arity purposes (`check_call`).
@@ -196,7 +188,7 @@ carry `Span::DUMMY` too).
 
 The checker is two-pass at the top level (`collect_top_level_decls`:
 imports first, then every fn/model/struct/enum/trait/tokenizer/dataset/
-datatype/agent pre-declared, recursing through `StmtKind::Decorated`) so
+datatype pre-declared, recursing through `StmtKind::Decorated`) so
 forward references work, and two-pass again inside `check_model_def` so
 method bodies see a complete `self`.
 
@@ -463,17 +455,14 @@ used by codegen's tape planner to know which tensors the backward of each
 op reads; it lives here so the classification sits next to the ownership
 rules.
 
-### Agents (`agent.rs`, M56)
+### Agents (M56) — removed
 
-`agent Foo:` declarations are gated behind `--linear-types` (E0610, emitted
-once after `collect_top_level_decls`). The rest of the pipeline runs
-regardless so all agent errors show in one pass: `AgentRegistry`,
-`extract_apgs` (action-port graphs), `detect_cycles` (E0603),
-`check_device_compatibility` (E0607 cross-GPU, E0608 cross-device without
-`@auto_device_transfer`), `check_fan_out`,
-`check_cross_agent_field_access` (E0601 exclusive field) and
-`check_cross_agent_mutation` (E0602). Error codes are embedded in the
-message text; `nsl_errors::Diagnostic` has no code field.
+The agents subsystem (`agent.rs`: the action-port-graph checks E0601-E0603
+and E0607-E0610) was removed in the Phase 0.6 scope freeze; the code is
+preserved at tag `attic/scope-freeze-2026-10`. The parser refuses an `agent`
+block before semantic analysis runs, and `@pipeline_agent` /
+`@auto_device_transfer` are `UNIMPLEMENTED_DECORATORS` rows that name the
+tag. `--linear-types` still runs the ownership walker above.
 
 ### Determinism and NaN analysis (`determinism.rs`, `nan_analysis.rs`)
 
@@ -550,8 +539,8 @@ There are ~500 `#[test]` functions in the crate (497 by grep at time of
 writing): 130 in `crates/nsl-semantic/src/checker/tests.rs`, the rest as
 `#[cfg(test)] mod tests` blocks inside individual modules (`shapes.rs`,
 `shape_algebra.rs`, `scope.rs`, `train_config.rs`, `optim_config.rs`,
-`decorator_registry.rs`, `effects.rs`, `ownership.rs`, `agent.rs`, each
-feature validator) and 76 across the 14 files in
+`decorator_registry.rs`, `effects.rs`, `ownership.rs`, each
+feature validator) and 78 across the 14 files in
 `crates/nsl-semantic/tests/`.
 
 The dominant style is *snippet tests*: `checker/tests.rs::check_source(src)
@@ -583,8 +572,9 @@ pin semantic behaviour are:
   check` and on the run path, valid header still builds — sets
   `NSL_STDLIB_PATH`), `train_config_resume_gate.rs`,
   `train_checkpoint_gate.rs`, `shape_debug.rs` (`--shapes` trace format),
-  `m56_linear_types_run.rs` (`nsl run --linear-types` accepts agents
-  without E0610), `cpdt_decorator_activation_gate.rs`,
+  `agents_removed.rs` (an `agent` block and the two agent decorators are
+  refused with the attic tag; `nsl run --linear-types` still runs),
+  `cpdt_decorator_activation_gate.rs`,
   `fase_decorator_activation_gate.rs`, `train_sections_e2e.rs`.
 
 Run them with:
@@ -728,8 +718,8 @@ Scheduler:
 2. Push it on `self.diagnostics` (checker) or the pass's own vector, then
    return `Type::Error` from a typing path so the poison suppresses
    follow-on errors. Do not report on `is_indeterminate()` inputs.
-3. There is no error-code field; the agent pass embeds `E06xx:` in the
-   message text. Follow that only within `agent.rs`.
+3. There is no error-code field. The removed agent pass embedded `E06xx:`
+   in its message text; do not copy that elsewhere.
 4. Warnings versus errors: an error means codegen would produce a program
    that differs from the source; a warning means the runtime still checks.
    Demotions via environment variables exist only for

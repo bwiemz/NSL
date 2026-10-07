@@ -317,9 +317,6 @@ pub mod fused_kl_ce;
 pub mod dlpack;
 pub mod c_api;
 
-// M56: Agent runtime — mailboxes, scheduler, pool, FFI.
-pub mod agent;
-
 #[cfg(test)]
 mod fuzz;
 
@@ -415,5 +412,5 @@ pub mod interop {
 /// Experimental research subsystems. **APIs here are unstable** and may change
 /// or be removed between releases.
 pub mod experimental {
-    pub use crate::{agent, cfie, cpdt, multimodal, sparse};
+    pub use crate::{cfie, cpdt, multimodal, sparse};
 }

@@ -1,0 +1,40 @@
+---
+source: crates/nsl-parser/tests/goldens.rs
+input_file: crates/nsl-parser/tests/parse/err_agent_removed.nsl
+---
+diagnostics: 1
+  parse error: `agent` blocks were removed with the agents subsystem (M56) in the Phase 0.6 scope freeze; the code is preserved at tag `attic/scope-freeze-2026-10`. Remove the block
+    --> 4:1-4:6 `agent` is reserved but no longer declares anything
+
+ast:
+Module {
+    stmts: [
+        Stmt {
+            kind: Expr(
+                Expr {
+                    kind: Error,
+                    span: 4:1-15:1,
+                },
+            ),
+            span: 4:1-15:1,
+        },
+        Stmt {
+            kind: VarDecl {
+                is_const: false,
+                pattern: Pattern {
+                    kind: Ident(`after`),
+                    span: 15:5-15:10,
+                },
+                type_ann: None,
+                value: Some(
+                    Expr {
+                        kind: IntLiteral(0),
+                        span: 15:13-15:14,
+                    },
+                ),
+            },
+            span: 15:1-15:14,
+        },
+    ],
+    span: 4:1-15:14,
+}

@@ -27,8 +27,7 @@
 //! ## The fix
 //!
 //! Prefer `self.current_method_model_name` (already populated in
-//! `compile_model_methods.rs:579,735` for model methods, including
-//! the agent.rs:424 reuse). Filter by `"{model_name}."` (trailing dot
+//! `compile_model_methods.rs:579,735` for model methods). Filter by `"{model_name}."` (trailing dot
 //! avoids prefix shadowing between `Block` and `Block0`). When
 //! multiple `moe_configs` start with that prefix (multi-MoE-per-
 //! model case), the existing match arm refuses with `None`, which

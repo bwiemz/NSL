@@ -48,7 +48,7 @@ colliding with the real `autodiff`/`data`/`serving`/`peft` modules and with the
 | `observability` | Profiling / tracing / health | `profiler`, `profiling`, `kernel_profiler`, `tensor_trace`, `trace_diff`, `health`, `inspect`, `deterministic_ops` |
 | `ffi` | Always-on interop | `c_api`, `dlpack`, `weight_provider` |
 | `interop` (`feature = "interop"`) | Optional framework bridges | `safetensors_io`, `huggingface`, `onnx`, `onnx_proto`, `weight_map`, `trace` |
-| `experimental` | Research subsystems (**unstable**) | `cfie`, `cpdt`, `sparse`, `multimodal`, `agent` |
+| `experimental` | Research subsystems (**unstable**) | `cfie`, `cpdt`, `sparse`, `multimodal` |
 
 ## Feature flags
 

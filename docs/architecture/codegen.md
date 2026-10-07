@@ -60,13 +60,13 @@ later emission consults.
                                         │
    ┌── COLLECT ─────────────────────────┼──────────────────── src/compiler/collection.rs
    │  intern_string · collect_strings · collect_enums · collect_structs
-   │  collect_models · collect_agents
+   │  collect_models
    │  cpdt_decorator / cpdt_expert_prune / cpdt_moe_capacity (metadata-only passes)
    │  populate_calibration_retention_from_ast_if_unset (AWQ + WGGO pre-scan)
    │  emit_retention_arena · emit_grad_retention_arena
    ├── DECLARE ─────────────────────────┼──────────────────── src/compiler/declaration.rs
    │  declare_runtime_functions   ← the nsl-abi table (nsl_abi::for_each_runtime_fn!)
-   │  declare_user_functions · declare_agent_methods
+   │  declare_user_functions
    │  apply_vmap_transforms / register_batched_functions   (src/vmap.rs)
    ├── COMPILE ─────────────────────────┼─────────────────────
    │  compile_datatype_defs
@@ -74,7 +74,7 @@ later emission consults.
    │  wrga_prescan (adapter sites)
    │  compile_flash_attention_kernels ← phase KernelPrepass: WGGO prepass, PCA detection
    │  compile_user_functions          ← src/compiler/functions.rs → func.rs → stmt.rs / expr/
-   │  compile_agent_methods · compile_batched_functions
+   │  compile_batched_functions
    │  MemoryPlanner (whole-program slab plan, scheduled through PassManager)
    │  compile_main                    ← src/compiler/main_entry.rs, phase TrainBlock
    │      └─ top-level stmts → compile_stmt → compile_train_block (see below)
@@ -442,7 +442,7 @@ the CLIF snapshot suite.
 
 Every runtime call the codegen can emit is declared once, in the typed
 ABI table `crates/nsl-abi/src/table.rs` (roadmap A3): one row
-`[group] name(params) -> ret = runtime::path;` per function, 684 of them,
+`[group] name(params) -> ret = runtime::path;` per function, 677 of them,
 exposed as the X-macro `nsl_abi::for_each_runtime_fn!` and as data
 (`nsl_abi::RUNTIME_ABI`). The groups are the split PR #600 made along
 "what the language exposes vs what the runtime implements": `memory`,

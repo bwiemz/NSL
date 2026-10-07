@@ -20,7 +20,7 @@ NSL's development is organized into milestones (M9-M62) grouped into phases (1-1
 | 8 | v0.8 | M45 (tensor debugger), M46 (reproducibility), M48 (multimodal) | Shipped 2026-03-18 |
 | 9 | v0.8 | M49 (shape algebra), M50 (sparse tensors), M51 (effect system) | Shipped 2026-03-18 |
 | 10 | v0.9 | M52 (weight-aware compilation), M62 (PyTorch FFI), M54 (unikernels) | M52/M62 shipped; M54 removed in the Phase 0.6 scope freeze (preserved at tag `attic/scope-freeze-2026-10`) |
-| 11 | v1.0 | M53 (WCET proofs), M55 (ZK circuits), M56 (agent shared memory) | M53/M55 removed in the Phase 0.6 scope freeze (preserved at tag `attic/scope-freeze-2026-10`); M56 planned |
+| 11 | v1.0 | M53 (WCET proofs), M55 (ZK circuits), M56 (agent shared memory) | M53/M55/M56 removed in the Phase 0.6 scope freeze (preserved at tag `attic/scope-freeze-2026-10`) |
 | 12 | v1.1 | M58 (elastic FT), M59 (topology routing), M61 (cluster debug) | Planned |
 | 13 | v1.2 | M57 (FPGA/neuromorphic), M60 (exabyte streaming) | M57 removed in the Phase 0.6 scope freeze (preserved at tag `attic/scope-freeze-2026-10`); M60 planned |
 
@@ -163,8 +163,8 @@ x86_64 boot stub + unikernel runtime + GPU init (M54b, 2026-03-26, never release
 ### M55 -- ZK inference circuits (Removed, 2026-10)
 Zero-knowledge proofs over model inference; verifiable computation for privacy-sensitive deployments. The folding backend was wired end-to-end (`nsl build --zk-backend folding` proves + `nsl zk verify`); `halo2` and `plonky3` were refused at compile time. Removed in the Phase 0.6 scope freeze, together with `nsl zk`, the `--zk-*` build flags and the `@zk_proof`/`@zk_lookup` decorators; preserved at tag `attic/scope-freeze-2026-10`. Design: [`2026-03-19-m52-m62-roadmap-design.md`](../plans/2026-03-19-m52-m62-roadmap-design.md).
 
-### M56 -- Multi-agent shared memory (Planned, Phase 11)
-Safe shared-memory protocol for multi-agent systems; ownership enforced by M38 linear types. Design: [`2026-03-19-m56-multi-agent-design.md`](../superpowers/specs/2026-03-19-m56-multi-agent-design.md).
+### M56 -- Multi-agent shared memory (Removed, 2026-10)
+Safe shared-memory protocol for multi-agent systems; ownership enforced by M38 linear types. A v1 landed: `agent` blocks gated behind `--linear-types`, the action-port-graph checks (cycles, device compatibility, fan-out, cross-agent access and mutation), `@pipeline_agent` lowering with direct method dispatch, `@auto_device_transfer`, and a mailbox/scheduler/pool runtime whose `nsl_agent_*` FFI the codegen never called. Removed in the Phase 0.6 scope freeze; `agent` stays a reserved word, and an `agent` block and both decorators are refused with the tag. Preserved at tag `attic/scope-freeze-2026-10`. Design: [`2026-03-19-m56-multi-agent-design.md`](../superpowers/specs/2026-03-19-m56-multi-agent-design.md).
 
 ### M57 -- FPGA/neuromorphic backend (Removed, 2026-10)
 Emit to FPGA HLS or neuromorphic hardware targets via the M47 KIR; dense inference only. A v1 shipped: a KIR→HIR lowering, a Verilog emitter with a sequential clocked-FSM mode for a fixed int8 MLP (PR #211), `nsl fpga-compile`, and Verilator/Yosys simulation and synthesis gates; nothing ran on an FPGA. Removed in the Phase 0.6 scope freeze, together with `nsl fpga-compile`, `--target fpga` (now refused with the tag) and the CI `fpga` job; preserved at tag `attic/scope-freeze-2026-10`. The name "HIR" is free again. Design: [`2026-03-19-m57-fpga-neuromorphic-design.md`](../superpowers/specs/2026-03-19-m57-fpga-neuromorphic-design.md).

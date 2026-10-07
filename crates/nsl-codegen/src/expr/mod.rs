@@ -636,8 +636,8 @@ impl Compiler<'_> {
                 // actually run. The dispatcher in `compile_call` defaults an
                 // Unknown-typed receiver to tensor dispatch (the "defaulting
                 // to tensor dispatch" warning path in expr/calls.rs) EXCEPT
-                // for Idents registered as model-array or agent variables,
-                // which it routes to compiled model/agent methods FIRST —
+                // for Idents registered as model-array variables, which it
+                // routes to compiled model methods FIRST —
                 // `indeterminate_receiver_takes_tensor_dispatch` mirrors that
                 // precedence. Requiring a proven Tensor type here while the
                 // dispatcher does not was the second half of the item-1 chain
@@ -695,8 +695,7 @@ impl Compiler<'_> {
     /// method receiver (`compile_call`, expr/calls.rs): an Unknown/Error-typed
     /// IDENT that is a registered model-array loop variable
     /// (`models.model_var_types`, populated at the `for blk in self.blocks`
-    /// lowering) or an agent variable (`models.agent_var_types`) dispatches to
-    /// `compile_model_method_call` / the mangled agent call — a compiled NSL
+    /// lowering) dispatches to `compile_model_method_call` — a compiled NSL
     /// function, NOT an `nsl_tensor_*` FFI — so the tensor ownership table
     /// must not classify it. A model method that happens to share a table
     /// name (`fn mean(self) -> int`) returns an I64 that is not a tensor
@@ -706,8 +705,7 @@ impl Compiler<'_> {
     /// tensor dispatch.
     fn indeterminate_receiver_takes_tensor_dispatch(&self, object: &Expr) -> bool {
         if let ExprKind::Ident(sym) = &object.kind
-            && (self.models.model_var_types.contains_key(sym)
-                || self.models.agent_var_types.contains_key(sym))
+            && self.models.model_var_types.contains_key(sym)
         {
             return false;
         }

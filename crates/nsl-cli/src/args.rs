@@ -1324,8 +1324,7 @@ pub(crate) struct RunArgs {
         #[arg(long)]
         pub(crate) csha_report: bool,
 
-        /// M38a/M56: Enable linear types ownership checking. Required for
-        /// agent declarations (M56). Closes Task 20 of the M56 plan.
+        /// M38a: Enable linear types ownership checking
         #[arg(long)]
         pub(crate) linear_types: bool,
 

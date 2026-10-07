@@ -28,6 +28,9 @@ pub fn lookup_keyword(s: &str) -> Option<TokenKind> {
 
         // ML blocks
         "model" => Some(TokenKind::Model),
+        // Reserved only: the agents subsystem (M56) was removed in the
+        // Phase 0.6 scope freeze, and the parser refuses an `agent` block
+        // with the attic tag rather than reading `agent` as a name.
         "agent" => Some(TokenKind::Agent),
         "train" => Some(TokenKind::Train),
         "grad" => Some(TokenKind::Grad),

@@ -134,7 +134,7 @@ nsl run [OPTIONS] <FILE> [-- <ARGS>...]
 | `--inspect` |  |  | Activate @inspect hooks: dump tensor stats/contents to .nsl-inspect/ |
 | `--csha` | `<MODE>` (optional) |  | CSHA: attention-fusion mode ("auto", "boundary", "pipeline", "block", or "off").  Passing `--csha` without a value enables auto mode.  Mirrors `nsl build --csha` |
 | `--csha-report` |  |  | CSHA: print the attention-fusion report to stderr |
-| `--linear-types` |  |  | M38a/M56: Enable linear types ownership checking. Required for agent declarations (M56). Closes Task 20 of the M56 plan |
+| `--linear-types` |  |  | M38a: Enable linear types ownership checking |
 | `--cpdt` | `<MODE>` (optional) |  | CPDT: planner mode ("full", "zero_only", or "off"). Passing `--cpdt` without a value enables full mode. Mirrors `nsl build --cpdt` so precision-adaptive training executes end-to-end via `nsl run` |
 | `--cpdt-num-gpus` | `<N>` |  | CPDT: number of GPUs in the target cluster. Required when `--cpdt` is set |
 | `--cpdt-intra-bw` | `<BPS>` | `900000000000` | CPDT: intra-node bandwidth in bytes/sec (default 9e11 = 900 GB/s) |

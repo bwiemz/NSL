@@ -53,7 +53,7 @@ pub(crate) fn frontend_with_source_map(
         source_map.emit_diagnostic(diag);
     }
 
-    // Semantic analysis — thread linear_types so E0610 fires correctly.
+    // Semantic analysis — thread linear_types so the M38a ownership walker runs.
     let analysis = nsl_semantic::analyze_with_imports(
         &parse_result.module,
         &mut interner,

@@ -50,6 +50,7 @@ pub enum TokenKind {
 
     // === Keywords: ML blocks ===
     Model,
+    /// Reserved: `agent` blocks (M56) were removed and the parser refuses them.
     Agent,
     Train,
     Grad,

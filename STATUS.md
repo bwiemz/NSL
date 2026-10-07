@@ -178,6 +178,11 @@ tests that are *not* part of the green-build contract (see README → Benchmarks
   tag `attic/scope-freeze-2026-10`. `--target fpga` is refused with the tag.
 - **Unikernel** (M54) — **Removed** in the Phase 0.6 scope freeze; preserved at
   tag `attic/scope-freeze-2026-10`.
+- **Agents** (M56: `agent` blocks, the action-port-graph checks, the agent
+  runtime and its `nsl_agent_*` ABI rows) — **Removed** in the Phase 0.6 scope
+  freeze; preserved at tag `attic/scope-freeze-2026-10`. `agent` stays a
+  reserved word and an `agent` block is refused with the tag, as are
+  `@pipeline_agent`/`@auto_device_transfer`. `--linear-types` (M38a) stays.
 - **Distributed** — tensor / pipeline / context parallelism, MoE serving.
 - **Inference serving** — speculative decoding, paged KV, disaggregated serving.
 - **Non-CUDA GPU backends** (M47: AMDGPU/ROCm, Metal, WGSL/WebGPU KIR printers)

@@ -60,7 +60,6 @@ pub(crate) fn stmt_kind_name(kind: &StmtKind) -> &'static str {
         StmtKind::VarDecl { .. } => "let/const declaration",
         StmtKind::FnDef(_) => "nested fn definition",
         StmtKind::ModelDef(_) => "model definition",
-        StmtKind::AgentDef(_) => "agent definition",
         StmtKind::StructDef(_) => "struct definition",
         StmtKind::EnumDef(_) => "enum definition",
         StmtKind::TraitDef(_) => "trait definition",
