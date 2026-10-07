@@ -34,7 +34,6 @@ pub use entry_points::{
     compile_entry_capturing_ir, compile_entry_returning_plan, compile_returning_plan,
     compile_returning_splice_count_for_tests, compile_standalone,
     compile_standalone_returning_plan, compile_test, compile_with_profile_captures,
-    compile_with_zk_info, compile_with_zk_info_returning_plan,
 };
 
 // §5.7 debug helper seam: exposed so lib.rs can forward it as a public
@@ -589,19 +588,13 @@ pub struct FeatureConfigs {
     /// M52: Weight integrity hash for embedding in .rodata
     pub weight_integrity: Option<crate::weight_aware::WeightIntegrity>,
 
-    // ── Safety & Verification (M53, M55) ─────────────────────────────
+    // ── Safety & Verification (M53) ──────────────────────────────────
     /// M53: Functions decorated with @real_time — name -> constraint
     pub real_time_fns: HashMap<String, crate::wcet::RealTimeConstraint>,
     /// M53: Functions decorated with @wcet_budget — name -> constraint
     pub wcet_budget_fns: HashMap<String, crate::wcet::WcetBudgetConstraint>,
     /// M53: Collected WCET analysis results for @real_time functions
     pub wcet_results: Vec<crate::wcet::FunctionWcet>,
-    /// M55: Functions (and model methods) decorated with @zk_proof — name -> ZkMode
-    pub zk_proof_fns: HashMap<String, crate::zk::backend::ZkMode>,
-    /// M55: Functions decorated with @zk_lookup — name -> (input_bits, output_bits)
-    pub zk_lookup_fns: HashMap<String, (u32, u32)>,
-    /// M55: ASTs of @zk_proof functions — stored during declaration for ZK compilation
-    pub zk_fn_defs: HashMap<String, nsl_ast::decl::FnDef>,
 }
 
 impl FeatureConfigs {
@@ -642,9 +635,6 @@ impl FeatureConfigs {
             real_time_fns: HashMap::new(),
             wcet_budget_fns: HashMap::new(),
             wcet_results: Vec::new(),
-            zk_proof_fns: HashMap::new(),
-            zk_lookup_fns: HashMap::new(),
-            zk_fn_defs: HashMap::new(),
         }
     }
 }

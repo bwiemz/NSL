@@ -49,7 +49,7 @@ belongs in the emission caches; configuration belongs on `CompileOptions`.
 
 `CompileOptions` (in `crates/nsl-codegen/src/lib.rs`) is the configuration
 half of the session. It is being decomposed from a flat "god-config" into
-cohesive sub-structs (`WcetOptions`, `ZkOptions`, `WggoOptions`, `CshaOptions`,
+cohesive sub-structs (`WcetOptions`, `WggoOptions`, `CshaOptions`,
 `CpdtOptions`, `CalibrationOptions`, `DevToolsOptions`, `CheckpointOptions`,
 `WeightStreamOptions`, `MuonOptions`, `ImportedModelOptions`, `ZeroOptions`,
 `AutotuneOptions`, `WeightsOptions`, `FusionOptions`, `DiagnosticsOptions`,

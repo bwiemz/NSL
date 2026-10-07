@@ -3676,6 +3676,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   (`rocm`/`amd`/`hip`, `metal`/`apple`/`mps`, `webgpu`/`wgsl`) are refused
   with the attic tag, and anything else is refused as unknown. `@target(...)`
   now accepts only `cuda`, and it names the tag when given a removed backend.
+- **ZK inference circuits (M55)**, in the Phase 0.6 scope freeze. The code is
+  preserved at tag `attic/scope-freeze-2026-10`. No model on the coder
+  roadmap consumes a proof, and the `--zk-circuit` build ran a hand-copied
+  compile pipeline (`compile_with_zk_info*`) that had already drifted from the
+  normal one: it logged `--vram-budget` as "planner integration in progress"
+  instead of running the planner or refusing. Removed: `nsl-codegen`'s `zk`
+  module (circuit IR, lowering, witness generation, the folding and plonky3
+  backends, about 9,600 lines), that pipeline, `ZkOptions` and
+  `CompileOptions::zk`, the `nsl zk` subcommand (`stats`/`prove`/`verify`),
+  the five `--zk-*` build flags, and the `@zk_proof`/`@zk_lookup` registry
+  rows. Both decorators now get a typed refusal that names the tag. It stays
+  an error under `--allow-unknown-decorators`, so a program that still
+  carries one cannot build without its circuit unnoticed.
 
 _v0.10.0 below is the whole of the 0.9 line's unreleased work
 (2026-03-19 → 2026-09-06); from here releases are cut monthly (roadmap D5),

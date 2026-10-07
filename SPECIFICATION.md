@@ -299,12 +299,8 @@ block_kv with fused projections) are rejected at compile time.
 ### Unikernel (M54) — removed
 - Removed in the Phase 0.6 scope freeze (`nsl build --unikernel`, `--listen`, `--memory` are gone); preserved at tag `attic/scope-freeze-2026-10`
 
-### ZK Inference (M55)
-- `@zk_proof(mode="weight_private")` decorator
-- 4 privacy modes: weight_private, input_private, full_private, architecture_attestation
-- Circuit IR, witness generation; the **folding backend** is the shipped end-to-end path (`nsl build --zk-backend folding` + `nsl zk verify`) — halo2 and plonky3 are refused at compile time
-- Lookup-native arithmetization (Jolt-style)
-- Mersenne-31 field support
+### ZK Inference (M55) — removed
+- Removed in the Phase 0.6 scope freeze (`nsl zk`, `nsl build --zk-circuit`/`--zk-backend`/`--zk-field`/`--zk-solidity`/`--zk-weights`, and the `@zk_proof`/`@zk_lookup` decorators are gone; the two decorators now get a refusal that names the tag); preserved at tag `attic/scope-freeze-2026-10`
 
 ### WCET Analysis (M53)
 - Real-time execution time bounds for safety-critical deployment
@@ -394,7 +390,7 @@ Milestone work from M9-M55 is present in the repo, with maturity ranging from pr
 | v1.0 | M56-M62 | Multi-agent, FPGA, elastic fault tolerance, cluster debugging |
 | v1.1 | M63-M64 | Compiled MCTS tree search, online DPO alignment |
 | v1.2 | M65-M67 | Ternary 1.58-bit types, format-agnostic sparsity, neuromorphic |
-| v1.3 | M68-M71 | Refinement types (Z3 SMT), phase-split inference, universal ZKML |
+| v1.3 | M68-M71 | Refinement types (Z3 SMT), phase-split inference |
 
 See [docs/plans/](docs/plans/) for detailed designs and [docs/research/](docs/research/) for the supporting research set.
 

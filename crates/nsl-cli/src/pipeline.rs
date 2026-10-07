@@ -184,7 +184,7 @@ pub(crate) fn module_data_to_wrga_inputs(
 // the lib-side `analysis_bridges` module so `profile::try_capture_real` can
 // enrich its capture options from the same AnalysisResult it compiles.
 // Re-exported here so the existing `crate::pipeline::analysis_to_*` bin call
-// sites (standalone / shared_lib / zk / check) keep resolving unchanged.
+// sites (standalone / shared_lib / check) keep resolving unchanged.
 pub(crate) use nsl_cli::analysis_bridges::{
     analysis_to_checkpoint_policies, analysis_to_csha_configs, analysis_to_fused_ce_configs,
     analysis_to_fused_kl_ce_configs, analysis_to_pca_user_strategies, analysis_to_wrga_inputs,

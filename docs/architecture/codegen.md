@@ -297,7 +297,7 @@ The gates that make these declarations true: `crates/nsl-codegen/tests/pass_regi
   `link_shared_with_exports`, `default_output_path`,
   `default_shared_lib_path`; finds `libnsl_runtime*.a` in the toolchain dir
   (`find_runtime_lib`) and drives the system C compiler (`find_c_compiler`).
-  Called from `crates/nsl-cli/src/commands/build/{normal,shared_lib,standalone,zk}.rs`
+  Called from `crates/nsl-cli/src/commands/build/{normal,shared_lib,standalone}.rs`
   and `commands/test.rs`, never from inside codegen. Before a shared-library
   link, `refuse_runtime_symbol_shadowing` refuses `@export` names that the
   runtime archive or the program's objects import (`memcpy`, `log`, …). A
@@ -328,8 +328,8 @@ The curated public surface is re-exported at the crate root from
 `compile_entry`, `compile_entry_returning_plan`, `compile_entry_capturing_ir`,
 `compile_module`, `compile_module_with_imports` (+ `_returning_plan`,
 `_best_effort_plan(s)`), `compile_test`, `compile_standalone`
-(+ `_returning_plan`), `compile_with_profile_captures`, `compile_with_zk_info`
-(+ `_returning_plan`), and `compile_returning_splice_count_for_tests`. The
+(+ `_returning_plan`), `compile_with_profile_captures`, and
+`compile_returning_splice_count_for_tests`. The
 `_returning_plan` variants also hand back the `WrgaPlan` the train block
 published (for `nsl build --wrga-report`). `compile_with_options` and
 `compile_and_calibrate` live in `src/lib.rs`; the former is the one-call
@@ -350,10 +350,10 @@ it into `compile_options` at `Compiler::new`. Where it comes from:
   (`run_pre_scan_phase` in `entry_points.rs`) that fills still-`None`
   calibration/WGGO fields from the AST.
 
-The struct has 29 `pub` fields today. The decomposition into cohesive
+The struct has 30 `pub` fields today. The decomposition into cohesive
 sub-structs that already exists (grep `Options {` in `src/lib.rs`):
 `WggoOptions` (`opts.wggo`), `CfieOptions` (`opts.cfie`), `WcetOptions`
-(`opts.wcet`), `ZkOptions` (`opts.zk`), `CshaOptions` (`opts.csha`),
+(`opts.wcet`), `CshaOptions` (`opts.csha`),
 `CpdtOptions` (`opts.cpdt`), `CalibrationOptions` (`opts.calibration`:
 data path, mode, sample/batch/timeout budgets, the AWQ `retention` and
 WGGO `grad_retention` plans, `batch_seq`, the subprocess `compile_bundle`
@@ -935,8 +935,7 @@ Cargo feature at its `stmt.rs` entry), **CEP** `src/cep.rs`, **CFIE**
 **CPKD** `src/cpkd.rs`, **CCR** `src/ccr.rs`, **CSLA** `src/layerwise.rs` +
 `src/stmt_csla.rs` (`docs/research/CSLA-compiler-scheduled-layerwise-accumulation.md`),
 **PCA** `src/pca_detect.rs` (+ `pca_tier_b.rs`, `pca_per_doc.rs`, …),
-**FASE** `src/fase.rs`, **ZK** `src/zk/` (`nsl zk`, Plonky3 and folding
-backends), **FPGA/HIR** `src/hir/` + `src/backend_verilog/` +
+**FASE** `src/fase.rs`, **FPGA/HIR** `src/hir/` + `src/backend_verilog/` +
 `src/kernel_lower_fpga.rs` + `src/fpga_error.rs` (`nsl fpga-compile`),
 **WCET** `src/wcet.rs`, **sparse**
 `src/sparse.rs`, **speculative** `src/speculative.rs`, **multimodal**
@@ -1118,7 +1117,7 @@ review. See `docs/wiki/GPU-Test-Harness.md` and `docs/wiki/Testing-Strategy.md`.
 ### A new compile option or flag
 
 1. Add the field to `CompileOptions` in `src/lib.rs` — inside the matching
-   sub-struct (`WggoOptions`, `CfieOptions`, `WcetOptions`, `ZkOptions`,
+   sub-struct (`WggoOptions`, `CfieOptions`, `WcetOptions`,
    `CshaOptions`, `CpdtOptions`, `CalibrationOptions`, `DevToolsOptions`, `CheckpointOptions`,
    `WeightStreamOptions`, `MuonOptions`, `ImportedModelOptions`, `ZeroOptions`,
    `AutotuneOptions`, `WeightsOptions`, `FusionOptions`, `DiagnosticsOptions`,

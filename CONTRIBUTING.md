@@ -59,7 +59,7 @@ failure on your machine is a local-environment gap, not a relaxed gate.
 - the macOS matrix + its e2e step (`continue-on-error`),
 - real-CUDA-device tests (CI runners have no GPU) and `#[ignore]`'d research
   tests in the `experimental::*` subsystems (CEP, CFIE, CSHA, WGGO, WRGA, CPDT,
-  ZK, FPGA, …), plus performance-baseline comparisons.
+  FPGA, …), plus performance-baseline comparisons.
 
 ## Pull Request Process
 

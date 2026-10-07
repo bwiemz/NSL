@@ -767,7 +767,6 @@ const NOT_A_PASS: &[(&str, &str)] = &[
          excluded on identical grounds — on the wrong side of a considered \
          line, by accident",
     ),
-    ("zk", "M55 zero-knowledge proofs"),
 ];
 
 #[test]

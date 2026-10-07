@@ -125,12 +125,6 @@ pub(crate) enum Cli {
         export_chrome: Option<PathBuf>,
     },
 
-    /// M55: ZK inference circuit operations (stats, prove, verify)
-    Zk {
-        #[command(subcommand)]
-        cmd: ZkCmd,
-    },
-
     /// Predictive performance profile for a target GPU
     Profile {
         /// Path to the .nsl file
@@ -357,47 +351,6 @@ pub(crate) enum EnvCmd {
     },
 }
 
-/// M55: ZK subcommands.
-#[derive(clap::Subcommand)]
-pub(crate) enum ZkCmd {
-    /// Show circuit statistics for a compiled .zkir file
-    Stats {
-        /// Path to the .zkir file
-        file: PathBuf,
-    },
-
-    /// Generate a ZK proof from a compiled circuit
-    Prove {
-        /// Path to the .zkir file
-        file: PathBuf,
-
-        /// Path to the proving key file
-        #[arg(long)]
-        pk: PathBuf,
-
-        /// Path to JSON file containing circuit inputs
-        #[arg(long)]
-        input: PathBuf,
-
-        /// Output path for the generated proof (default: <file>.proof)
-        #[arg(short, long)]
-        output: Option<PathBuf>,
-    },
-
-    /// Verify a ZK proof against public inputs
-    Verify {
-        /// Path to the verification key file
-        vk: PathBuf,
-
-        /// Path to the proof file to verify
-        #[arg(long)]
-        proof: PathBuf,
-
-        /// Path to JSON file containing public inputs
-        #[arg(long)]
-        public: PathBuf,
-    },
-}
 
 #[derive(clap::Args)]
 pub(crate) struct CheckArgs {
@@ -820,28 +773,6 @@ pub(crate) struct BuildArgs {
         /// M53: FPGA device for certified WCET (e.g., "xcvu440", "xczu9eg", "ve2302")
         #[arg(long)]
         pub(crate) fpga_device: Option<String>,
-
-        /// M55: Compile @zk_proof functions to ZK inference circuits
-        #[arg(long)]
-        pub(crate) zk_circuit: bool,
-
-        /// M55: ZK proving backend. Only "folding" (default) is implemented;
-        /// "halo2" (deprecated, circuit lowering removed) and "plonky3"
-        /// (prover not yet wired into compilation) are refused at build time.
-        #[arg(long, default_value = "folding")]
-        pub(crate) zk_backend: String,
-
-        /// M55: ZK field: m31 (default, ~10x faster) or bn254 (EVM-compatible)
-        #[arg(long, default_value = "m31")]
-        pub(crate) zk_field: String,
-
-        /// M55: Emit a Solidity verifier contract alongside the ZK circuit
-        #[arg(long)]
-        pub(crate) zk_solidity: bool,
-
-        /// M55: Path to .safetensors weights file used as ZK witness
-        #[arg(long)]
-        pub(crate) zk_weights: Option<PathBuf>,
 
         /// WRGA Milestone B.1: Emit the WRGA compilation report.
         /// With no value, prints to stdout.  With a path, writes to that file.

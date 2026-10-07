@@ -23,7 +23,7 @@
 //! - [`analysis`] — cost model, autotuning, fusion, memory planning, WCET,
 //!   FlashAttention codegen, calibration.
 //! - [`experimental`] — research subsystems (CEP, CFIE, CSHA, WGGO, WRGA,
-//!   FASE, ZK, FPGA, sparse, speculative, multimodal). These APIs
+//!   FASE, FPGA, sparse, speculative, multimodal). These APIs
 //!   are **not stable** and may change or be removed between releases.
 //!
 //! These facades re-export the same modules that remain available at the crate
@@ -281,7 +281,6 @@ pub mod wrga_prescan;
 pub mod wrga_prune;
 pub mod wrga_roofline;
 pub mod wrga_spectral;
-pub mod zk;
 
 // FPGA / hardware-synthesis path (experimental).
 pub mod backend_verilog;
@@ -363,7 +362,7 @@ pub mod experimental {
         wggo_weight_analysis_cache, wggo_weight_analysis_nslweights, wrga,
         wrga_adapter_init, wrga_adapter_inject, wrga_adapter_rewrite,
         wrga_fused_ptx, wrga_fusion, wrga_kernel_helpers, wrga_memory,
-        wrga_prescan, wrga_prune, wrga_roofline, wrga_spectral, zk,
+        wrga_prescan, wrga_prune, wrga_roofline, wrga_spectral,
     };
 
     /// FPGA / hardware-synthesis path (Verilog emission, HIR lowering).
@@ -411,8 +410,7 @@ pub use compiler::{
     compile_module_with_imports_returning_plan,
     compile_returning_plan, compile_returning_splice_count_for_tests,
     compile_standalone, compile_standalone_returning_plan,
-    compile_test, compile_with_profile_captures, compile_with_zk_info,
-    compile_with_zk_info_returning_plan,
+    compile_test, compile_with_profile_captures,
     StandaloneConfig,
 };
 
@@ -1019,36 +1017,6 @@ impl Default for WcetOptions {
             do178c_report: None,
             target: "gpu".to_string(),
             fpga_device: None,
-        }
-    }
-}
-
-/// M55: Zero-knowledge proof-circuit emission options.
-///
-/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
-/// struct into cohesive sub-structs (architecture-hardening review).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ZkOptions {
-    /// Emit a ZK inference circuit alongside compiled output.
-    pub circuit: bool,
-    /// ZK backend to use ("folding", "halo2", or "plonky3").
-    pub backend: String,
-    /// ZK field to use ("m31" or "bn254").
-    pub field: String,
-    /// Also emit a Solidity verifier contract.
-    pub solidity: bool,
-    /// Path to safetensors weight file used as ZK witness.
-    pub weights_path: Option<std::path::PathBuf>,
-}
-
-impl Default for ZkOptions {
-    fn default() -> Self {
-        Self {
-            circuit: false,
-            backend: "folding".to_string(),
-            field: "m31".to_string(),
-            solidity: false,
-            weights_path: None,
         }
     }
 }
@@ -2049,8 +2017,6 @@ pub struct CompileOptions {
     /// `@csha` / `@fused_lm_ce` / `@fused_kl_ce` / `@pca` decorator configs);
     /// see [`AnalysisOptions`].
     pub analysis: AnalysisOptions,
-    /// M55: Zero-knowledge proof-circuit emission options.
-    pub zk: ZkOptions,
     /// ZeRO sharding (`--zero-stage` / `--zero-elementwise`); see
     /// [`ZeroOptions`].
     pub zero: ZeroOptions,
@@ -2327,7 +2293,6 @@ impl Default for CompileOptions {
             wcet: WcetOptions::default(),
             linear_types_enabled: false,
             analysis: AnalysisOptions::default(),
-            zk: ZkOptions::default(),
             zero: ZeroOptions::default(),
             muon: MuonOptions::default(),
             lm_head_fusion: crate::lm_head_inference::LmHeadFusion::Off,

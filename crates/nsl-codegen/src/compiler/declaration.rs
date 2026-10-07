@@ -198,24 +198,6 @@ impl Compiler<'_> {
                 {
                     self.features.wcet_budget_fns.insert(raw_name.clone(), wb);
                 }
-                // M55: Extract @zk_proof from bare function decorators
-                if let Some(mode) =
-                    crate::zk::extract_zk_proof_decorator(decos, &|sym| self.resolve_sym(sym))
-                {
-                    self.features.zk_proof_fns.insert(raw_name.clone(), mode);
-                    // Store the FnDef AST for ZK compilation after normal codegen
-                    self.features
-                        .zk_fn_defs
-                        .insert(raw_name.clone(), fn_def.clone());
-                }
-                // M55: Extract @zk_lookup from function decorators
-                if let Some((ib, ob)) =
-                    crate::zk::extract_zk_lookup_decorator(decos, &|sym| self.resolve_sym(sym))
-                {
-                    self.features
-                        .zk_lookup_fns
-                        .insert(raw_name.clone(), (ib, ob));
-                }
                 // M39: Extract @vmap from function decorators
                 if let Some(vmap_config) =
                     crate::vmap::extract_vmap_decorator(decos, &|sym| self.resolve_sym(sym))
@@ -366,12 +348,6 @@ impl Compiler<'_> {
                             })
                         {
                             self.features.wcet_budget_fns.insert(mangled.clone(), wb);
-                        }
-                        // M55: Extract @zk_proof from model method decorators
-                        if let Some(mode) = crate::zk::extract_zk_proof_decorator(decos, &|sym| {
-                            self.resolve_sym(sym)
-                        }) {
-                            self.features.zk_proof_fns.insert(mangled.clone(), mode);
                         }
 
                         // M62 Task 5: If the method is decorated with @export, declare:
@@ -536,30 +512,6 @@ impl Compiler<'_> {
             }
             if !body_map.is_empty() {
                 self.models.model_method_bodies.insert(model_name, body_map);
-            }
-        }
-
-        // M55: Handle @zk_proof on whole model blocks.
-        // When a `model` statement is wrapped in `@zk_proof(...)`, register all
-        // its methods in `zk_proof_fns` using the same mangled names used above.
-        for stmt in stmts {
-            if let StmtKind::Decorated {
-                decorators,
-                stmt: inner,
-            } = &stmt.kind
-                && let StmtKind::ModelDef(md) = &inner.kind
-                && let Some(mode) = crate::zk::extract_zk_proof_decorator(decorators, &|sym| {
-                    self.resolve_sym(sym)
-                })
-            {
-                let model_name = self.resolve_sym(md.name).to_string();
-                for member in &md.members {
-                    if let ModelMember::Method(fn_def, _) = member {
-                        let method_name = self.resolve_sym(fn_def.name).to_string();
-                        let mangled = format!("__nsl_model_{model_name}_{method_name}");
-                        self.features.zk_proof_fns.insert(mangled, mode);
-                    }
-                }
             }
         }
 

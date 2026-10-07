@@ -29,8 +29,7 @@ reports "no stdlib directory found (looked at $NSL_STDLIB_PATH, ...)".
 
 **`args.rs`** is the clap tree, ~1,900 lines, all `pub(crate)`. `enum Cli`
 has the variants `Check(CheckArgs)`, `Run(RunArgs)`, `Build(BuildArgs)`,
-`Test`, `Export`, `Convert`, `Init`, `Fmt`, `Debug`, `Zk { cmd: ZkCmd }`
-(`Stats`, `Prove`, `Verify`), `Profile`, `Autotune`, `Tokenize`,
+`Test`, `Export`, `Convert`, `Init`, `Fmt`, `Debug`, `Profile`, `Autotune`, `Tokenize`,
 `FpgaCompile`, `PtxMetadata`, `Env { cmd: EnvCmd }` (`List`, `Current`),
 and `Doc { cmd: DocCmd }` (`Cli`, `Stdlib`). `BuildArgs` and `RunArgs`
 declare every shared compile flag **twice** — a `--source-ad` field exists in
@@ -41,7 +40,7 @@ both — which is the drift the flag contract below exists to police.
 | File | Command |
 |---|---|
 | `check.rs` | `nsl check` — lex/parse/semantic without codegen; `--linear-types`, `--cpkd-design-student` (via `cpkd_design.rs`) |
-| `build/` | `nsl build`, `nsl run`'s build half, `nsl zk`, WRGA analysis: `mod.rs`, `normal.rs` (single/multi-file object emit + link), `run.rs` (`build_to_temp` / `execute_temp_build`), `shared_lib.rs` (`--shared-lib`, C header emission), `standalone.rs`, `zk.rs`, `wrga_check.rs`, `reports.rs`, `options.rs` (`CompileOptions` assembly) |
+| `build/` | `nsl build`, `nsl run`'s build half, WRGA analysis: `mod.rs`, `normal.rs` (single/multi-file object emit + link), `run.rs` (`build_to_temp` / `execute_temp_build`), `shared_lib.rs` (`--shared-lib`, C header emission), `standalone.rs`, `wrga_check.rs`, `reports.rs`, `options.rs` (`CompileOptions` assembly) |
 | `run.rs` | `nsl run` dispatcher — wraps the build with the monitor/profiler/multi-process spawners |
 | `test.rs` | `nsl test` — compile-and-run NSL test files with an optional filter |
 | `export.rs` | `nsl export` — ONNX / safetensors export |

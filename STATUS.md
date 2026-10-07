@@ -60,9 +60,8 @@ The boring, must-always-work core.
 - **DataLoader** — zero-copy mmap tokenized-data loading (M19).
 - **CLI** — `nsl check`, `nsl run`, `nsl build`, `nsl fmt`, `nsl test` carry
   the stability promise. The full shipped surface is larger (`export, convert,
-  init, debug, zk, profile, autotune, tokenize, fpga-compile, ptx-metadata`;
-  proof tooling under `nsl zk`) — those ride their subsystem's tier, not this
-  one.
+  init, debug, profile, autotune, tokenize, fpga-compile, ptx-metadata`) —
+  those ride their subsystem's tier, not this one.
 
 **Compatibility contract:** only the Stable tier above carries a cross-version
 "won't break" promise. That promise is *narrower* than the **CI merge gate** —
@@ -165,9 +164,10 @@ tests that are *not* part of the green-build contract (see README → Benchmarks
 - **CPKD** — compiler-planned knowledge distillation (distill block, frozen
   teacher, fused KL-CE GPU kernel).
 - **FASE** — quantization-aware optimizer/codegen.
-- **ZK** — zero-knowledge proofs: the folding backend is end-to-end
-  (`nsl build --zk-backend folding` + `nsl zk verify`); halo2/plonky3 are
-  refused at compile time.
+- **ZK** (M55: zero-knowledge inference circuits, `nsl zk`, `--zk-*`) —
+  **Removed** in the Phase 0.6 scope freeze; preserved at tag
+  `attic/scope-freeze-2026-10`. `@zk_proof`/`@zk_lookup` are refused with the
+  tag.
 - **FPGA / Verilog** — HDL backend (Yosys/Verilator nightly job). See
   [`docs/hardware/fpga_status.md`](docs/hardware/fpga_status.md).
 - **Unikernel** (M54) — **Removed** in the Phase 0.6 scope freeze; preserved at
@@ -199,14 +199,14 @@ cargo build -p nsl-codegen --no-default-features --features "<keep these>"
 ```
 
 Currently gated at their entry point: `experimental-wrga`, `experimental-cpdt`
-(in `crates/nsl-codegen/Cargo.toml`, both in `default`). WGGO/CSHA/ZK/FPGA
+(in `crates/nsl-codegen/Cargo.toml`, both in `default`). WGGO/CSHA/FPGA
 follow the same pattern as gating is extended. See
 [`docs/architecture/compiler-state.md`](docs/architecture/compiler-state.md)
 for the compiler-state model (and the thread-local audit + migration plan that
 the same hardening pass produced).
 
 The `CompileOptions` "god-config" is being decomposed into cohesive sub-structs
-(`WcetOptions`, `ZkOptions`, `WggoOptions`, `CshaOptions`, `CpdtOptions`,
+(`WcetOptions`, `WggoOptions`, `CshaOptions`, `CpdtOptions`,
 `CalibrationOptions`, `DevToolsOptions`, `CheckpointOptions`, `WeightStreamOptions`,
 `MuonOptions`, `ImportedModelOptions`, `ZeroOptions`, `AutotuneOptions`,
 `WeightsOptions`, `FusionOptions`, `DiagnosticsOptions`, `MemoryOptions`,

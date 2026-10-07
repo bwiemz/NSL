@@ -1,9 +1,8 @@
-//! `nsl build` / `nsl run` / `nsl zk` and the WRGA analysis commands.
+//! `nsl build` / `nsl run` and the WRGA analysis commands.
 //!
 //! This is the tightly-coupled build cluster: the build paths (single/multi,
-//! shared-lib, standalone, ZK), the `nsl run` execution path, the `nsl zk`
-//! verify/stats subcommands, and the WRGA report/analysis helpers (which the
-//! build paths invoke). They share enough state that they live together in one
+//! shared-lib, standalone), the `nsl run` execution path, and the WRGA
+//! report/analysis helpers (which the build paths invoke). They share enough state that they live together in one
 //! module. Shared frontend/config helpers remain in `main.rs` and are reached
 //! via `crate::`.
 //!
@@ -22,7 +21,6 @@ mod run;
 mod shared_lib;
 mod standalone;
 mod wrga_check;
-mod zk;
 
 /// Remove a compile-scratch directory and everything in it.
 ///
@@ -52,16 +50,15 @@ pub(crate) use run::{build_to_temp, execute_temp_build, run_run};
 pub(crate) use shared_lib::run_build_shared;
 pub(crate) use standalone::run_build_standalone;
 pub(crate) use wrga_check::{run_check_wrga_analyze, run_check_wrga_compare};
-pub(crate) use zk::{run_build_zk, run_zk_cmd};
 
 /// Item 2: print the pass execution trace, once, at a point where compilation
 /// has finished.
 ///
 /// Idempotent — the first call prints, later ones are silent — so it can be
 /// placed at EVERY terminal point without a build that passes through two of
-/// them reporting twice. That matters: there are **14 call sites across 7
+/// them reporting twice. That matters: there are **13 call sites across 6
 /// files** (`check.rs` x3, `test.rs`, `build/normal.rs` x4,
-/// `build/options.rs` x2, `build/shared_lib.rs` x2, `build/zk.rs`,
+/// `build/options.rs` x2, `build/shared_lib.rs` x2,
 /// `build/standalone.rs`), because "compilation finished" is not one place —
 /// the link flavours, `--emit-obj` (which returns before any link), and
 /// `check`/`test` (which never link at all) are all separate exits. An

@@ -68,7 +68,7 @@ static REQUESTED_DECORATORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Record the entry module's decorator names for reconciliation. Called at
 /// the top of each codegen entry point that receives the entry AST, so every
-/// CLI path (normal, shared-lib, standalone, zk) feeds the same log without
+/// CLI path (normal, shared-lib, standalone) feeds the same log without
 /// threading ASTs into the drivers.
 pub fn note_entry_module_decorators(module: &nsl_ast::Module, interner: &nsl_lexer::Interner) {
     let mut log = REQUESTED_DECORATORS.lock().unwrap_or_else(|e| e.into_inner());
@@ -325,11 +325,6 @@ pub static UNCONTRACTED_FLAGS: &[(&str, &str)] = &[
         "REFUSED at dispatch: M43's 3D-parallelism config has no consumer \
          anywhere in the tree — an inert value is an error, not a contract",
     ),
-    ("zk-circuit", "build-flavor selector (dispatches to run_build_zk)"),
-    ("zk-backend", "zk emission parameter, consumed by the zk build flavor"),
-    ("zk-field", "zk emission parameter, consumed by the zk build flavor"),
-    ("zk-solidity", "zk emission parameter, consumed by the zk build flavor"),
-    ("zk-weights", "zk emission parameter, consumed by the zk build flavor"),
     ("activation-report", "the activation mechanism's own reporting switch"),
     ("allow-inert-requests", "the activation mechanism's own escape hatch"),
     ("allow-unknown-decorators", "the namespace close's own escape hatch"),

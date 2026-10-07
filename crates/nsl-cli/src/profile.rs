@@ -216,7 +216,7 @@ pub fn run_profile(args: &ProfileArgs) -> Result<String, String> {
 /// or the pipeline errored before extraction.
 ///
 /// The CompileOptions are enriched with the SAME decorator bridges the real
-/// build paths apply (standalone.rs / shared_lib.rs / zk.rs): without them a
+/// build paths apply (standalone.rs / shared_lib.rs): without them a
 /// `@checkpoint`/`@lora`/`@wrga`/`@csha` program would extract a list the
 /// production compile never lowers (unpruned, non-checkpoint-aware), and we
 /// would then label an inaccurate timeline "real". Populating `wrga_inputs`

@@ -130,22 +130,6 @@ fn wrga_report_without_source_ad_errors_when_decorators_present() {
         .stderr(predicate::str::contains("--wrga-report requires --source-ad"));
 }
 
-/// Task 4 (B.2): `--wrga-report` must emit the report header on the `--zk-circuit`
-/// build path (or at least produce a plan via the `_returning_plan` variant).
-#[test]
-fn wrga_report_works_on_zk_build_path() {
-    let tmp = TempDir::new().unwrap();
-    let src_path = tmp.path().join("t.nsl");
-    fs::write(&src_path, SRC).unwrap();
-
-    let mut cmd = Command::cargo_bin("nsl").unwrap();
-    cmd.env("NSL_STDLIB_PATH", stdlib_path())
-        .arg("build").arg(&src_path)
-        .arg("--zk-circuit").arg("--source-ad").arg("--wrga-report");
-    cmd.assert()
-        .stdout(predicate::str::contains("=== WRGA Compilation Report ==="));
-}
-
 /// Write a minimal .safetensors file containing a single f32 tensor "w" of
 /// shape [2, 1] with zero values — enough to satisfy
 /// `--standalone`'s `-w/--weights` requirement for the WRGA-report smoke test.

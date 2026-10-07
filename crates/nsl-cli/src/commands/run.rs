@@ -485,8 +485,6 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     target: wcet_target,
                     fpga_device,
                 },
-                // M55: ZK flags not exposed on `run`; use defaults.
-                zk: nsl_codegen::ZkOptions::default(),
                 linear_types_enabled: linear_types, // Task 20: nsl run now exposes --linear-types
                 // Semantic-analysis facts: all empty here. `run_build_inner` /
                 // `run_run` route through `run_build_single` (build.rs) which

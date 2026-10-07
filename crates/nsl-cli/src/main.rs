@@ -107,9 +107,6 @@ fn main_inner() {
                 export_chrome.as_deref(),
             );
         }
-        Cli::Zk { cmd } => {
-            commands::build::run_zk_cmd(cmd);
-        }
         Cli::Profile {
             file,
             target,

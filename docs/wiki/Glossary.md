@@ -106,7 +106,7 @@ Hopper-generation (sm_90) hardware unit that performs bulk async copies between 
 Compile-time upper bound on kernel execution time, required for hard real-time / robotics workloads (M53). NSL's `nsl check --wcet` pass in `crates/nsl-codegen/src/wcet.rs` models loop trip counts and memory latencies to produce a provable bound.
 
 ### <a id="zk"></a>ZK — Zero-Knowledge (inference)
-Zero-knowledge proof system for ML inference (M55): the prover runs the model and produces a proof that the output was computed correctly without revealing weights. NSL supports a `nsl build --zk` path that compiles an arithmetic-circuit representation alongside the native binary. Implementation scaffolded in `crates/nsl-codegen/src/zk/`.
+Zero-knowledge proof system for ML inference (M55): the prover runs the model and produces a proof that the output was computed correctly without revealing weights. NSL had a `nsl build --zk-circuit` path that compiled `@zk_proof` functions to an arithmetic circuit, plus `nsl zk` proof tooling. Removed in the Phase 0.6 scope freeze; preserved at tag `attic/scope-freeze-2026-10`.
 
 ---
 

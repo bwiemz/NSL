@@ -1,5 +1,5 @@
 //! `nsl build` argument handling: validate flags, build the `CompileOptions`,
-//! and dispatch to the standalone / shared-lib / ZK / normal build path.
+//! and dispatch to the standalone / shared-lib / normal build path.
 //!
 //! Extracted verbatim from the former monolithic `build.rs`; behavior is
 //! unchanged.
@@ -55,11 +55,6 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
             do178c_report,
             wcet_target,
             fpga_device,
-            zk_circuit,
-            zk_backend,
-            zk_field,
-            zk_solidity,
-            zk_weights,
             wrga_report,
             wrga_fold_allocations,
             wggo,
@@ -484,18 +479,11 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                     target: wcet_target,
                     fpga_device,
                 },
-                zk: nsl_codegen::ZkOptions {
-                    circuit: zk_circuit,
-                    backend: zk_backend,
-                    field: zk_field,
-                    solidity: zk_solidity,
-                    weights_path: zk_weights.clone(),
-                },
                 linear_types_enabled: linear_types,
                 // Semantic-analysis facts: all empty here. The loader fills
-                // `ownership_info`; the six build-path entry points
+                // `ownership_info`; the five build-path entry points
                 // (run_build_shared_single, run_build_shared_multi,
-                // run_build_zk, run_build_standalone, run_build_single,
+                // run_build_standalone, run_build_single,
                 // run_build_multi) overwrite the decorator configs from
                 // semantic analysis via pipeline::{analysis,module_data}_to_*.
                 analysis: nsl_codegen::AnalysisOptions::default(),
@@ -721,16 +709,6 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 );
             } else if shared_lib {
                 crate::commands::build::run_build_shared(&file, output, dump_ir, &compile_opts, wrga_report.as_deref());
-            } else if zk_circuit {
-                crate::commands::build::run_build_zk(
-                    &file,
-                    output,
-                    emit_obj,
-                    dump_ir,
-                    zk_weights.as_deref(),
-                    &compile_opts,
-                    wrga_report.as_deref(),
-                );
             } else {
                 crate::commands::build::run_build(&file, output, emit_obj, dump_ir, &compile_opts, wrga_report.as_deref());
             }

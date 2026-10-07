@@ -167,12 +167,6 @@ nsl check --deterministic file.nsl  # Determinism verification
 
 # GPU (the toolchain itself must be built with `cargo build --features cuda`)
 nsl run file.nsl --target cuda      # Run with the CUDA backend (the default --target)
-
-# ZK proofs
-nsl build --zk-circuit file.nsl                                # Compile @zk_proof functions to a circuit
-nsl zk stats model.zkir                                        # Circuit statistics
-nsl zk prove model.zkir --pk key.pk --input inputs.json        # Generate a proof
-nsl zk verify key.vk --proof model.proof --public public.json  # Verify a proof
 ```
 
 ## Project Structure
@@ -277,7 +271,7 @@ The **compatibility contract** — what is promised not to break across
 versions — is narrower than the CI gate: it is the **Stable** tier in
 [`STATUS.md`](STATUS.md) (frontend, semantic analysis, CPU codegen/runtime,
 fusion, DataLoader, core CLI). Beta and Experimental subsystems (`experimental::*`
-in `nsl-codegen`/`nsl-runtime` — CEP, CFIE, CSHA, WGGO, WRGA, ZK, FPGA, …) are
+in `nsl-codegen`/`nsl-runtime` — CEP, CFIE, CSHA, WGGO, WRGA, FPGA, …) are
 exercised by CI but may change shape between releases. See each crate's
 `ARCHITECTURE.md` for the stable-vs-experimental module boundary.
 

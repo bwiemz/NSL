@@ -66,7 +66,7 @@ rand = { version = "0.10", optional = true }
 # a no-op at its entry point. This is phase-1 *behavioral* gating: it disables
 # the pass but does not yet strip the subsystem's modules from the binary
 # (module-level cfg cascade is staged — see STATUS.md and
-# docs/architecture/compiler-state.md). Additional subsystems (WGGO, CSHA, ZK,
+# docs/architecture/compiler-state.md). Additional subsystems (WGGO, CSHA,
 # FPGA) follow the same entry-point pattern as the gating is extended.
 default = ["experimental-wrga", "experimental-cpdt"]
 cuda = ["dep:nsl-runtime", "nsl-runtime/cuda", "dep:cudarc"]
