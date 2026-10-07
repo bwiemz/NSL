@@ -91,7 +91,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
     tensors. 82 variants transpose the op's output before the loss
     (`_vgrad`: the backward receives a strided gradient view) or feed
     strided inputs (`_vin`). They found 32 tape failures across 20 ops,
-    now ratcheted, for a separate fix:
+    ratcheted at first and since fixed (see Fixed, "CPU ops honour
+    strides"):
     - CPU backward helpers that read the upstream gradient's storage
       linearly: ReLU, GELU, SiLU, Clamp, Sigmoid, Tanh, Softmax,
       LogSoftmax, LayerNorm, RMSNorm, Embedding (dW), Conv2d, keepdim
@@ -2006,6 +2007,53 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   - **Programs that import modules.** These emit one object per module, so
     `-o` cannot hold them. The build now says so instead of ignoring `-o`
     silently.
+- **CPU ops honour strides: a transposed view no longer gets wrong
+  gradients or a wrong forward.** The layout certificates added with the
+  tape inventory (see Added) failed 32 tape runs across 20 ops, plus 3 source
+  runs through shared kernels; all now pass, and every `TapeOp` is
+  `Certified` (none `Defective`).
+  - **The bug class.** CPU loops read tensor storage linearly
+    (`data.add(i)`, a `memcpy` of the buffer), which is the logical order
+    only for a row-major tensor. A `.transpose` after an op hands its tape
+    backward a strided gradient view; a transposed input is read by the
+    forward and saved for the backward as one. Those pairs were in storage
+    order:
+    - upstream gradient: ReLU, GELU, SiLU, Clamp, Sigmoid, Tanh, Softmax,
+      LogSoftmax, LayerNorm, RMSNorm, Embedding dW, Conv2d, keepdim
+      Sum/Mean/ReduceMax, Slice, BiasAdd db, MaxPool2d, Dropout, Unsqueeze;
+    - saved input: ReLU, GELU, SiLU, Clamp, LayerNorm, RMSNorm;
+    - forward: `bias_add`, dropout, `maxpool2d`, `conv2d` and
+      `embedding_lookup` (the last two in both AD modes; source AD's conv2d
+      backward wraps the same `conv2d_backward`).
+  - **The fix.** One helper, `tensor::with_row_major`, runs a CPU loop on
+    row-major versions of its operands: a row-major tensor is handed through
+    as itself with one more ref, a strided view as a row-major copy, and
+    every ref is released when the loop returns (copies are made with the
+    tape paused). Each affected CPU path now takes its operands through it;
+    GPU paths are unchanged.
+  - **A contiguous bug in the same code.** `reduce_max(x, d, keepdim=1)` over
+    a non-last dim sent the whole gradient to the last dim's first slot:
+    `scatter_grad_to_argmax` did not step its gradient-index counter past
+    the kept size-1 dim. It now does, as `broadcast_grad_along_dim` already
+    did.
+  - **A leak in the same code.** The CPU `maxpool2d` record site bumped its
+    input's refcount, but `TapeOp::MaxPool2d` saves no tensor, so nothing
+    released it: one stranded input per recorded call. The bump is gone
+    (pinned by a unit test). The GPU record site has the same bump and is
+    not changed here.
+  - **Contiguous programs are bit-identical.** The CPU `--training-reference`
+    run of `fixtures/posture_lm.nsl` (the GPU posture certificate's oracle)
+    gives the same loss stream and trained parameters, byte for byte, as a
+    build linked against the pre-fix runtime archive. So does a grad-block
+    program over every touched op with contiguous operands, except where it
+    uses `reduce_max(.., keepdim=1)` over a non-last dim; there the fixed
+    gradient now equals the non-keepdim spelling's.
+  - **Mutation-checked.** Removing the keepdim index step fails
+    `reduce_max_keepdim_mid`; reading LayerNorm's backward operands without
+    `with_row_major` fails `layernorm_vgrad` and `layernorm_vin`.
+  - **Still open.** The GPU `reduce_max` record site saves an all-zero
+    argmax, so its tape gradient goes to index 0 of the reduced dim (CPU
+    only is certified).
 
 - **Every accepted `--target` spelling now compiles `@flash_attention`
   instead of panicking.**

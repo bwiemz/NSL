@@ -1084,6 +1084,42 @@ impl NslTensor {
 // Internal helpers used across sub-modules
 // ---------------------------------------------------------------------------
 
+/// Run `f` on ROW-MAJOR versions of the HOST tensors `ptrs`.
+///
+/// For the CPU loops that read a tensor's storage linearly (`data.add(i)` for
+/// logical element `i`, or a `memcpy` of the buffer): right for a row-major
+/// tensor, wrong for a strided view -- a transpose, a stepped slice, an
+/// expand -- which those loops used to read in storage order. A `.transpose`
+/// after an op hands its tape backward such a gradient, and a transposed
+/// input reaches its forward and is saved for its backward as one.
+///
+/// Each handle `f` receives is an OWNED ref from `nsl_tensor_contiguous`:
+/// the same tensor with one more ref when it is already row-major (so a
+/// contiguous caller reads exactly the bytes it read before), otherwise a
+/// fresh row-major copy. All are released when `f` returns, so `f` must not
+/// free them and must not return one of them (its result must own its own
+/// data). A 0 handle -- an absent optional operand such as conv2d's bias --
+/// passes through as 0. The copies are made with the tape paused: they are
+/// private scratch, and a materializing `nsl_tensor_contiguous` records a
+/// Reshape edge for its copy when the tape is live.
+///
+/// Host tensors only: on a device tensor `nsl_tensor_contiguous` launches a
+/// device copy, and the callers' loops read through host pointers.
+pub(crate) fn with_row_major<const N: usize, R>(
+    ptrs: [i64; N],
+    f: impl FnOnce([i64; N]) -> R,
+) -> R {
+    let row_major = {
+        let _untaped = autodiff::TapePause::new();
+        ptrs.map(|p| if p == 0 { 0 } else { nsl_tensor_contiguous(p) })
+    };
+    let out = f(row_major);
+    for p in row_major {
+        nsl_tensor_free(p);
+    }
+    out
+}
+
 /// Helper: get the shape of a tensor as a Vec<i64>.
 pub(crate) fn get_shape_vec(tensor: &NslTensor) -> Vec<i64> {
     crate::cpu::get_shape_vec(tensor)
@@ -2746,16 +2782,21 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
     if indices.device == 0 && weight.ndim == 2 {
         let rows = unsafe { *weight.shape.add(0) };
         let n = unsafe { *indices.shape.add(0) } as usize;
-        for i in 0..n {
-            let raw_idx = indices.read_index(i);
-            if raw_idx < 0 || raw_idx >= rows {
-                crate::nsl_log!(ERROR, "nsl", "nsl: embedding_lookup index {} at position {} is out of bounds \
-                     for a table with {} rows",
-                    raw_idx, i, rows
-                );
-                std::process::abort();
+        // `read_index(i)` reads storage linearly: check the indices in their
+        // logical order, which a strided (or expanded) view's storage is not.
+        with_row_major([indices_ptr], |[idx_rm]| {
+            let indices = NslTensor::from_ptr_ref(idx_rm);
+            for i in 0..n {
+                let raw_idx = indices.read_index(i);
+                if raw_idx < 0 || raw_idx >= rows {
+                    crate::nsl_log!(ERROR, "nsl", "nsl: embedding_lookup index {} at position {} is out of bounds \
+                         for a table with {} rows",
+                        raw_idx, i, rows
+                    );
+                    std::process::abort();
+                }
             }
-        }
+        });
     }
 
     // GPU path: launch fused embedding kernel when weight is on GPU.
@@ -2798,26 +2839,34 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
     let elem_size = if out_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
     let out_data_raw = checked_alloc((out_len as usize) * elem_size);
 
-    for i in 0..seq_len {
-        // Already validated above for host-resident indices, which is every
-        // index reaching this CPU path. Kept as a defensive re-check because
-        // the copy below is an unchecked raw pointer add.
-        let raw_idx = indices.read_index(i);
-        if raw_idx < 0 || raw_idx >= vocab_size as i64 {
-            crate::nsl_log!(ERROR, "nsl", "nsl: embedding_lookup index {} out of bounds for vocab_size {}",
-                raw_idx, vocab_size
-            );
-            std::process::abort();
+    // The copy below takes row `idx` as the `embed_dim` elements at storage
+    // offset `idx * embed_dim`, and reads index i linearly: both need
+    // row-major operands (a transposed weight is a strided view). The tape
+    // record below still names the caller's tensors.
+    with_row_major([weight_ptr, indices_ptr], |[w_rm, idx_rm]| {
+        let weight = NslTensor::from_ptr_ref(w_rm);
+        let indices = NslTensor::from_ptr_ref(idx_rm);
+        for i in 0..seq_len {
+            // Already validated above for host-resident indices, which is every
+            // index reaching this CPU path. Kept as a defensive re-check because
+            // the copy below is an unchecked raw pointer add.
+            let raw_idx = indices.read_index(i);
+            if raw_idx < 0 || raw_idx >= vocab_size as i64 {
+                crate::nsl_log!(ERROR, "nsl", "nsl: embedding_lookup index {} out of bounds for vocab_size {}",
+                    raw_idx, vocab_size
+                );
+                std::process::abort();
+            }
+            let idx = raw_idx as usize;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    (weight.data as *const u8).add((idx * embed_dim) * elem_size),
+                    out_data_raw.add(i * embed_dim * elem_size),
+                    embed_dim * elem_size,
+                );
+            }
         }
-        let idx = raw_idx as usize;
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                (weight.data as *const u8).add((idx * embed_dim) * elem_size),
-                out_data_raw.add(i * embed_dim * elem_size),
-                embed_dim * elem_size,
-            );
-        }
-    }
+    });
 
     // Output data was allocated via checked_alloc (CPU heap), so device must be 0.
     // Even though the weight is on GPU, the embedding lookup runs on CPU
@@ -3492,27 +3541,33 @@ pub extern "C" fn nsl_tensor_dropout(tensor_ptr: i64, p: f64, training: i8) -> i
 
     let scale = 1.0 / (1.0 - p);
 
-    if in_dtype == 1 {
-        let out_data = out_data_raw as *mut f32;
-        for i in 0..len {
-            let rand_val = crate::sampling::rng_f64();
-            let keep = if rand_val >= p { 1.0_f64 } else { 0.0_f64 };
-            unsafe {
-                *mask_data.add(i) = keep;
-                *out_data.add(i) = (*a.data_f32().add(i) as f64 * keep * scale) as f32;
+    // The loops read the input linearly while stamping row-major strides on
+    // out and mask: read a row-major view (`nsl_tensor_dropout_fwd_mask`'s
+    // CPU arm does the same). The tape record below names the caller's tensor.
+    with_row_major([tensor_ptr], |[a_rm]| {
+        let a = NslTensor::from_ptr(a_rm);
+        if in_dtype == 1 {
+            let out_data = out_data_raw as *mut f32;
+            for i in 0..len {
+                let rand_val = crate::sampling::rng_f64();
+                let keep = if rand_val >= p { 1.0_f64 } else { 0.0_f64 };
+                unsafe {
+                    *mask_data.add(i) = keep;
+                    *out_data.add(i) = (*a.data_f32().add(i) as f64 * keep * scale) as f32;
+                }
+            }
+        } else {
+            let out_data = out_data_raw as *mut f64;
+            for i in 0..len {
+                let rand_val = crate::sampling::rng_f64();
+                let keep = if rand_val >= p { 1.0 } else { 0.0 };
+                unsafe {
+                    *mask_data.add(i) = keep;
+                    *out_data.add(i) = *a.data_f64().add(i) * keep * scale;
+                }
             }
         }
-    } else {
-        let out_data = out_data_raw as *mut f64;
-        for i in 0..len {
-            let rand_val = crate::sampling::rng_f64();
-            let keep = if rand_val >= p { 1.0 } else { 0.0 };
-            unsafe {
-                *mask_data.add(i) = keep;
-                *out_data.add(i) = *a.data_f64().add(i) * keep * scale;
-            }
-        }
-    }
+    });
 
     let result = Box::new(NslTensor::new(
         out_data_raw as *mut c_void,
@@ -3762,56 +3817,64 @@ pub extern "C" fn nsl_tensor_conv2d(
     }
     let out_strides = NslTensor::compute_strides(out_shape, 4);
 
-    let read_input = |idx: usize| -> f64 {
-        if in_dtype == 1 { unsafe { *input.data_f32().add(idx) as f64 } }
-        else { unsafe { *input.data_f64().add(idx) } }
-    };
-    let read_weight = |idx: usize| -> f64 {
-        if weight.dtype == 1 { unsafe { *weight.data_f32().add(idx) as f64 } }
-        else { unsafe { *weight.data_f64().add(idx) } }
-    };
-
     let elem_size = if out_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
     let out_data_raw = checked_alloc_zeroed(out_len * elem_size);
 
-    // Resolved once, not once per output pixel: the handle cannot change
-    // inside the loop nest, and `from_ptr` is a real check now rather than
-    // the release no-op a `debug_assert!` compiled to.
-    let bias_ref = if bias_ptr != 0 { Some(NslTensor::from_ptr_ref(bias_ptr)) } else { None };
+    // The loop nest indexes the input and weight as row-major NCHW / OIHW
+    // buffers (and the bias linearly): a transposed input or weight is a
+    // strided view, so read row-major ones. Both AD modes run this forward;
+    // the tape record below names the caller's tensors.
+    with_row_major([input_ptr, weight_ptr, bias_ptr], |[x_rm, w_rm, b_rm]| {
+        let input = NslTensor::from_ptr_ref(x_rm);
+        let weight = NslTensor::from_ptr_ref(w_rm);
+        let read_input = |idx: usize| -> f64 {
+            if in_dtype == 1 { unsafe { *input.data_f32().add(idx) as f64 } }
+            else { unsafe { *input.data_f64().add(idx) } }
+        };
+        let read_weight = |idx: usize| -> f64 {
+            if weight.dtype == 1 { unsafe { *weight.data_f32().add(idx) as f64 } }
+            else { unsafe { *weight.data_f64().add(idx) } }
+        };
 
-    for ni in 0..n {
-        for co in 0..c_out {
-            for oh in 0..h_out {
-                for ow in 0..w_out {
-                    let mut val = 0.0_f64;
-                    for ci in 0..c_in {
-                        for ky in 0..kh {
-                            for kx in 0..kw {
-                                let ih = oh * sh + ky;
-                                let iw = ow * sw + kx;
-                                if ih >= ph && iw >= pw && ih - ph < h && iw - pw < w {
-                                    let input_idx = ni * (c_in * h * w) + ci * (h * w) + (ih - ph) * w + (iw - pw);
-                                    let weight_idx = co * (c_in * kh * kw) + ci * (kh * kw) + ky * kw + kx;
-                                    val += read_input(input_idx) * read_weight(weight_idx);
+        // Resolved once, not once per output pixel: the handle cannot change
+        // inside the loop nest, and `from_ptr` is a real check now rather than
+        // the release no-op a `debug_assert!` compiled to.
+        let bias_ref = if b_rm != 0 { Some(NslTensor::from_ptr_ref(b_rm)) } else { None };
+
+        for ni in 0..n {
+            for co in 0..c_out {
+                for oh in 0..h_out {
+                    for ow in 0..w_out {
+                        let mut val = 0.0_f64;
+                        for ci in 0..c_in {
+                            for ky in 0..kh {
+                                for kx in 0..kw {
+                                    let ih = oh * sh + ky;
+                                    let iw = ow * sw + kx;
+                                    if ih >= ph && iw >= pw && ih - ph < h && iw - pw < w {
+                                        let input_idx = ni * (c_in * h * w) + ci * (h * w) + (ih - ph) * w + (iw - pw);
+                                        let weight_idx = co * (c_in * kh * kw) + ci * (kh * kw) + ky * kw + kx;
+                                        val += read_input(input_idx) * read_weight(weight_idx);
+                                    }
                                 }
                             }
                         }
-                    }
-                    if let Some(bias) = bias_ref {
-                        let bv = if bias.dtype == 1 { unsafe { *bias.data_f32().add(co) as f64 } }
-                                 else { unsafe { *bias.data_f64().add(co) } };
-                        val += bv;
-                    }
-                    let out_idx = ni * (c_out * h_out * w_out) + co * (h_out * w_out) + oh * w_out + ow;
-                    if out_dtype == 1 {
-                        unsafe { *(out_data_raw as *mut f32).add(out_idx) = val as f32 };
-                    } else {
-                        unsafe { *(out_data_raw as *mut f64).add(out_idx) = val };
+                        if let Some(bias) = bias_ref {
+                            let bv = if bias.dtype == 1 { unsafe { *bias.data_f32().add(co) as f64 } }
+                                     else { unsafe { *bias.data_f64().add(co) } };
+                            val += bv;
+                        }
+                        let out_idx = ni * (c_out * h_out * w_out) + co * (h_out * w_out) + oh * w_out + ow;
+                        if out_dtype == 1 {
+                            unsafe { *(out_data_raw as *mut f32).add(out_idx) = val as f32 };
+                        } else {
+                            unsafe { *(out_data_raw as *mut f64).add(out_idx) = val };
+                        }
                     }
                 }
             }
         }
-    }
+    });
 
     let result = Box::new(NslTensor::new(
         out_data_raw as *mut c_void,
@@ -3904,39 +3967,47 @@ pub extern "C" fn nsl_tensor_maxpool2d(
 
     let mut argmax_indices: Vec<usize> = vec![0; out_len];
 
-    let read_input = |idx: usize| -> f64 {
-        if in_dtype == 1 { unsafe { *input.data_f32().add(idx) as f64 } }
-        else { unsafe { *input.data_f64().add(idx) } }
-    };
+    // The loop nest pools the input as a row-major NCHW buffer and saves each
+    // window's argmax as a row-major (logical) input offset, which the
+    // backward scatters into a fresh row-major gradient: read a row-major
+    // view of a strided input, or both the output and the argmax slots are
+    // in storage order.
+    with_row_major([input_ptr], |[x_rm]| {
+        let input = NslTensor::from_ptr_ref(x_rm);
+        let read_input = |idx: usize| -> f64 {
+            if in_dtype == 1 { unsafe { *input.data_f32().add(idx) as f64 } }
+            else { unsafe { *input.data_f64().add(idx) } }
+        };
 
-    for ni in 0..n {
-        for ci in 0..c {
-            for oh in 0..h_out {
-                for ow in 0..w_out {
-                    let mut max_val = f64::NEG_INFINITY;
-                    let mut max_idx: usize = 0;
-                    for ky in 0..kh {
-                        for kx in 0..kw {
-                            let ih = oh * s + ky;
-                            let iw = ow * s + kx;
-                            if ih >= pad && iw >= pad && ih - pad < h && iw - pad < w {
-                                let input_idx = ni * (c * h * w) + ci * (h * w) + (ih - pad) * w + (iw - pad);
-                                let val = read_input(input_idx);
-                                if val > max_val { max_val = val; max_idx = input_idx; }
+        for ni in 0..n {
+            for ci in 0..c {
+                for oh in 0..h_out {
+                    for ow in 0..w_out {
+                        let mut max_val = f64::NEG_INFINITY;
+                        let mut max_idx: usize = 0;
+                        for ky in 0..kh {
+                            for kx in 0..kw {
+                                let ih = oh * s + ky;
+                                let iw = ow * s + kx;
+                                if ih >= pad && iw >= pad && ih - pad < h && iw - pad < w {
+                                    let input_idx = ni * (c * h * w) + ci * (h * w) + (ih - pad) * w + (iw - pad);
+                                    let val = read_input(input_idx);
+                                    if val > max_val { max_val = val; max_idx = input_idx; }
+                                }
                             }
                         }
+                        let out_idx = ni * (c * h_out * w_out) + ci * (h_out * w_out) + oh * w_out + ow;
+                        if in_dtype == 1 {
+                            unsafe { *(out_data_raw as *mut f32).add(out_idx) = max_val as f32 };
+                        } else {
+                            unsafe { *(out_data_raw as *mut f64).add(out_idx) = max_val };
+                        }
+                        argmax_indices[out_idx] = max_idx;
                     }
-                    let out_idx = ni * (c * h_out * w_out) + ci * (h_out * w_out) + oh * w_out + ow;
-                    if in_dtype == 1 {
-                        unsafe { *(out_data_raw as *mut f32).add(out_idx) = max_val as f32 };
-                    } else {
-                        unsafe { *(out_data_raw as *mut f64).add(out_idx) = max_val };
-                    }
-                    argmax_indices[out_idx] = max_idx;
                 }
             }
         }
-    }
+    });
 
     let result = Box::new(NslTensor::new(
         out_data_raw as *mut c_void,
@@ -3952,7 +4023,10 @@ pub extern "C" fn nsl_tensor_maxpool2d(
     let result_ptr = NslTensor::publish(result);
 
     if autodiff::is_recording() {
-        NslTensor::from_ptr(input_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+        // No refcount bump on the input: `a` is identity-only (a tape_id
+        // after assign_ids) and the op saves no tensor, so nothing would
+        // release a bump (`release_tape_op_refs` has no MaxPool2d arm) --
+        // it used to strand one input ref per recorded call.
         autodiff::maybe_record(autodiff::TapeOp::MaxPool2d {
             a: input_ptr, out: result_ptr, saved_argmax: argmax_indices,
             input_shape: autodiff::TapeShape::from_slice(&[n as i64, c as i64, h as i64, w as i64]),
@@ -4015,25 +4089,32 @@ pub extern "C" fn nsl_tensor_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
     let elem_size = if out_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
     let out_data_raw = checked_alloc((out_len as usize) * elem_size);
 
-    let read_t = |idx: usize| -> f64 {
-        if in_dtype == 1 { unsafe { *tensor.data_f32().add(idx) as f64 } }
-        else { unsafe { *tensor.data_f64().add(idx) } }
-    };
-    let read_b = |idx: usize| -> f64 {
-        if bias.dtype == 1 { unsafe { *bias.data_f32().add(idx) as f64 } }
-        else { unsafe { *bias.data_f64().add(idx) } }
-    };
+    // Element (i, j) is read at `i * cols + j` and the bias linearly, which
+    // is wrong for a strided view (a transposed tensor): read row-major
+    // ones. The tape record below names the caller's tensors.
+    with_row_major([tensor_ptr, bias_ptr], |[t_rm, b_rm]| {
+        let tensor = NslTensor::from_ptr(t_rm);
+        let bias = NslTensor::from_ptr(b_rm);
+        let read_t = |idx: usize| -> f64 {
+            if in_dtype == 1 { unsafe { *tensor.data_f32().add(idx) as f64 } }
+            else { unsafe { *tensor.data_f64().add(idx) } }
+        };
+        let read_b = |idx: usize| -> f64 {
+            if bias.dtype == 1 { unsafe { *bias.data_f32().add(idx) as f64 } }
+            else { unsafe { *bias.data_f64().add(idx) } }
+        };
 
-    for i in 0..rows {
-        for j in 0..cols {
-            let val = read_t(i * cols + j) + read_b(j);
-            if out_dtype == 1 {
-                unsafe { *(out_data_raw as *mut f32).add(i * cols + j) = val as f32 };
-            } else {
-                unsafe { *(out_data_raw as *mut f64).add(i * cols + j) = val };
+        for i in 0..rows {
+            for j in 0..cols {
+                let val = read_t(i * cols + j) + read_b(j);
+                if out_dtype == 1 {
+                    unsafe { *(out_data_raw as *mut f32).add(i * cols + j) = val as f32 };
+                } else {
+                    unsafe { *(out_data_raw as *mut f64).add(i * cols + j) = val };
+                }
             }
         }
-    }
+    });
 
     let out = Box::new(NslTensor::new(
         out_data_raw as *mut c_void,
@@ -5015,6 +5096,86 @@ mod tests {
              training-mode dropout call); rc=0 means the tape's reference \
              was released early and backward would read a freed mask."
         );
+    }
+
+    /// The CPU `nsl_tensor_maxpool2d` record site bumped the input's refcount,
+    /// but `TapeOp::MaxPool2d` saves no tensor (`a` is identity-only, and
+    /// `release_tape_op_refs` has no arm for it), so nothing ever released
+    /// the bump: one stranded input per recorded call. The input's refcount
+    /// must be untouched by recording, and still be the caller's alone after
+    /// the tape is torn down.
+    #[test]
+    fn cpu_tape_mode_maxpool2d_keeps_no_input_ref() {
+        let x = create_tensor_with_shape_rs(&[1, 1, 4, 4]);
+        crate::autodiff::TAPE.with(|t| {
+            let mut tape = t.borrow_mut();
+            crate::autodiff::release_tape_op_refs(&tape.ops);
+            tape.ops.clear();
+            tape.recording = true;
+            tape.pause_depth = 0;
+        });
+        let out = nsl_tensor_maxpool2d(x, 2, 2, 2, 0);
+        let recorded = crate::autodiff::TAPE.with(|t| {
+            t.borrow()
+                .ops
+                .iter()
+                .any(|op| matches!(op, crate::autodiff::TapeOp::MaxPool2d { .. }))
+        });
+        let rc_recorded = NslTensor::from_ptr(x).refcount.load(Ordering::SeqCst);
+        crate::autodiff::nsl_tape_stop();
+        let rc_stopped = NslTensor::from_ptr(x).refcount.load(Ordering::SeqCst);
+        nsl_tensor_free(out);
+        nsl_tensor_free(x);
+        assert!(recorded, "maxpool2d under recording must record a MaxPool2d op");
+        assert_eq!(rc_recorded, 1, "recording maxpool2d must not take a ref on its input");
+        assert_eq!(rc_stopped, 1, "tape teardown left the input's refcount at {rc_stopped}");
+    }
+
+    /// `with_row_major` hands a row-major tensor through as itself (so a
+    /// contiguous caller reads the same bytes as before), copies a strided
+    /// view into logical order, passes a 0 handle through, releases every
+    /// handle it acquired, and records nothing on a live tape (its copies are
+    /// private scratch).
+    #[test]
+    fn with_row_major_identity_copy_and_release() {
+        let shape_list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape_list, 2);
+        crate::list::nsl_list_push(shape_list, 3);
+        let t = creation::tensor_from_shape_list_f64(shape_list, 0.0);
+        crate::list::nsl_list_free(shape_list);
+        for i in 0..6 {
+            unsafe { *NslTensor::from_ptr(t).data_f64().add(i) = i as f64 };
+        }
+        let tr = nsl_tensor_transpose(t, 0, 1); // [3, 2], strides [1, 3]
+        let rc = |p: i64| NslTensor::from_ptr(p).refcount.load(Ordering::SeqCst);
+        let (rc_t, rc_tr) = (rc(t), rc(tr));
+
+        crate::autodiff::TAPE.with(|tape| {
+            let mut tape = tape.borrow_mut();
+            crate::autodiff::release_tape_op_refs(&tape.ops);
+            tape.ops.clear();
+            tape.recording = true;
+            tape.pause_depth = 0;
+        });
+        let (same, copy_vals, copy_was_new, zero, rc_t_inside) =
+            with_row_major([t, tr, 0], |[a, b, z]| {
+                let bv = NslTensor::from_ptr(b);
+                let vals: Vec<f64> = (0..6).map(|i| unsafe { *bv.data_f64().add(i) }).collect();
+                (a == t, vals, b != tr && bv.strides_are_row_major(), z, rc(t))
+            });
+        let ops_recorded = crate::autodiff::TAPE.with(|tape| tape.borrow().ops.len());
+        crate::autodiff::nsl_tape_stop();
+        let (rc_t_after, rc_tr_after) = (rc(t), rc(tr));
+        nsl_tensor_free(tr);
+        nsl_tensor_free(t);
+
+        assert!(same, "a row-major tensor must be handed through as itself");
+        assert!(rc_t_inside > rc_t, "the row-major hand-through holds its own ref inside f");
+        assert!(copy_was_new, "a strided view must be materialized into a new row-major tensor");
+        assert_eq!(copy_vals, vec![0.0, 3.0, 1.0, 4.0, 2.0, 5.0], "the copy is in logical order");
+        assert_eq!(zero, 0, "a 0 handle passes through");
+        assert_eq!(ops_recorded, 0, "with_row_major recorded {ops_recorded} tape op(s)");
+        assert_eq!((rc_t_after, rc_tr_after), (rc_t, rc_tr), "every acquired ref is released");
     }
 
     /// The source-AD dropout forward hands BOTH tensors to the caller as an
