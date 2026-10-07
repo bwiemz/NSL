@@ -97,11 +97,11 @@ pub(crate) fn run_check_wrga_analyze(
     };
 
     // We pass our temp_obj as `output`. emit_obj=true so the linker is
-    // skipped. The single-file build path ignores `output` and drops the .o
-    // next to the source file (see `run_build_single` line ~4479); the
-    // multi-file build path uses its own internal temp dir. To make `nsl
-    // check` side-effect-free across BOTH dispatches, we explicitly clean
-    // the source-adjacent .o path too, after the build returns.
+    // skipped. The single-file build path writes the object there; the
+    // multi-file build path keeps its per-module objects in its own temp
+    // dir. The source-adjacent .o cleanup below dates from when the
+    // single-file path ignored `output` and wrote beside the source; it is
+    // kept as a guard so `nsl check` stays side-effect-free.
     let source_adjacent_obj = file.with_file_name(format!("{stem}.o"));
     let source_adjacent_pre_existed = source_adjacent_obj.exists();
 

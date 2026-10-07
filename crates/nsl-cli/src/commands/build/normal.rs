@@ -196,11 +196,27 @@ fn run_build_single(
             nsl_log::nsl_log!(ERROR, "cli", "error: invalid input filename '{}'", file.display());
             process::exit(1);
         });
-    let obj_path = file.with_file_name(format!("{stem}.o"));
+    // Where the object goes. With `--emit-obj` it IS the artifact: `-o` when
+    // given (this used to be ignored), else `<stem>.o` beside the source.
+    // Otherwise it is an intermediate of the link and goes in this process's
+    // scratch directory, as the multi-file path's objects do: it used to be
+    // written beside the source too, so a failed link left it in the source
+    // tree and two builds of the same file wrote the same path.
+    let (obj_path, scratch_dir) = if emit_obj {
+        let path = output.clone().unwrap_or_else(|| file.with_file_name(format!("{stem}.o")));
+        (path, None)
+    } else {
+        let dir = std::env::temp_dir().join(format!("nsl_build_{}", std::process::id()));
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            nsl_log::nsl_log!(ERROR, "cli", "error: could not create temp dir: {e}");
+            process::exit(1);
+        }
+        (dir.join(format!("{stem}.o")), Some(dir))
+    };
 
     // Write object file
     if let Err(e) = std::fs::write(&obj_path, &obj_bytes) {
-        nsl_log::nsl_log!(ERROR, "cli", "error: could not write object file: {e}");
+        nsl_log::nsl_log!(ERROR, "cli", "error: could not write object file '{}': {e}", obj_path.display());
         process::exit(1);
     }
 
@@ -220,8 +236,11 @@ fn run_build_single(
     crate::commands::build::emit_pass_trace();
     match nsl_codegen::linker::link(&obj_path, &exe_path) {
         Ok(()) => {
-            // Clean up .o file after successful link
-            let _ = std::fs::remove_file(&obj_path);
+            // Same policy as the multi-file path: a failed link leaves the
+            // scratch directory behind for debugging.
+            if let Some(dir) = &scratch_dir {
+                super::cleanup_temp_dir(dir);
+            }
             if !quiet { println!("Built {}", exe_path.display()); }
         }
         Err(e) => {
@@ -661,6 +680,20 @@ fn run_build_multi(
     crate::activation_enforce::enforce_from_argv(entry);
 
     if emit_obj {
+        // A program that imports other modules compiles to one object per
+        // module; `-o` names a single file, so it cannot hold them. Say so
+        // rather than ignoring it silently (the objects stay where the
+        // `Wrote` lines put them). Quiet callers (`nsl check --wrga-*`) pass
+        // `-o` as a scratch path and never read the object back.
+        if let Some(out) = output.as_ref().filter(|_| !quiet) {
+            nsl_log::nsl_log!(WARN, "cli",
+                "warning: `-o {}` is not applied with --emit-obj: this program compiles \
+                 to {} per-module objects in {}",
+                out.display(),
+                obj_files.len(),
+                temp_dir.display(),
+            );
+        }
         if !quiet {
             for obj in &obj_files {
                 println!("Wrote {}", obj.display());
