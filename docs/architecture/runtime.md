@@ -314,6 +314,20 @@ alone was a real silent failure. The elementwise alloc budget
 exactly four heap allocations whether or not the tape records — the C4
 number, down from thirteen.
 
+**Certification.** `src/autodiff/cert_status.rs` is the tape twin of
+codegen's `ad_rules::ad_cert_status`: `tape_cert_status(&TapeOp)` gives every
+variant a `TapeCertStatus` (`Certified`, `Defective`, `Uncertified`,
+`GpuOnly`, `Unreachable`) through an exhaustive match, so a new variant does
+not compile without one, and a unit test holds `tape_cert_inventory()` to the
+enum's text. The certificates are rows of
+`crates/nsl-cli/tests/source_ad_rule_cert.rs` — raw gradients of a grad block
+held to f64 central differences — and that file verifies each claim: a named
+certificate exists, passes in tape mode, and its traced run
+(`NSL_DEBUG_MEM_TRACE=1` logs `[tape-trace] record <Variant>`) records the
+op. Layout is an axis there: each base certificate has `_vgrad` (strided
+output gradient) and `_vin` (strided input) variants, and `Defective` lists
+the ops whose arm, or CPU forward, indexes storage linearly and fails them.
+
 **Per-call contexts.** For the host-facing C API the tape is not left in the
 thread-local: `nsl_model_forward_grad` (`src/grad_context.rs`) records, then
 moves the ops out into a heap `GradContext` (magic `NSL_GRAD_CONTEXT_MAGIC`
