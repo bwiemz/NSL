@@ -12,9 +12,21 @@
 //!
 //! Every test writes its own temp dir. The ones that must not find a real
 //! install point HOME (USERPROFILE on Windows) at an empty directory.
+//!
+//! Nothing here names a channel literally: "this toolchain" is
+//! [`CHANNEL`] and a mismatch pins [`other_channel`], so the same tests pass
+//! on main (`dev`) and on `release/0.10-lts`, where the channel literal is
+//! the only change.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+
+use nsl_cli::toolchain::CHANNEL;
+
+/// A channel this build is not: what a mismatched pin names.
+fn other_channel() -> &'static str {
+    if CHANNEL == "0.10-lts" { "dev" } else { "0.10-lts" }
+}
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -63,7 +75,8 @@ fn text(bytes: &[u8]) -> String {
 
 #[test]
 fn a_mismatched_pin_with_nothing_installed_is_refused_with_the_fix() {
-    let (dir, prog) = model_dir(Some(&pin_text("0.10-lts")));
+    let other = other_channel();
+    let (dir, prog) = model_dir(Some(&pin_text(other)));
     let home = tempfile::tempdir().unwrap();
     for sub in ["run", "build"] {
         let out = nsl(&[sub], &prog, dir.path(), Some(home.path()));
@@ -75,11 +88,14 @@ fn a_mismatched_pin_with_nothing_installed_is_refused_with_the_fix() {
             stderr.contains(&canon_dir.display().to_string()),
             "names the pin file's directory:\n{stderr}"
         );
-        assert!(stderr.contains("toolchain channel `0.10-lts`"), "names the channel:\n{stderr}");
-        assert!(stderr.contains("(toolchain channel dev)"), "names this toolchain:\n{stderr}");
+        assert!(stderr.contains(&format!("toolchain channel `{other}`")), "names the channel:\n{stderr}");
+        assert!(
+            stderr.contains(&format!("(toolchain channel {CHANNEL})")),
+            "names this toolchain:\n{stderr}"
+        );
         assert!(stderr.contains("--ignore-toolchain-pin"), "names the override:\n{stderr}");
         assert!(
-            stderr.contains("scripts/install-toolchain.sh 0.10-lts <git-ref>"),
+            stderr.contains(&format!("scripts/install-toolchain.sh {other} <git-ref>")),
             "names the install command:\n{stderr}"
         );
         assert!(
@@ -91,7 +107,7 @@ fn a_mismatched_pin_with_nothing_installed_is_refused_with_the_fix() {
 
 #[test]
 fn the_override_runs_a_mismatched_pin_on_this_toolchain() {
-    let (dir, prog) = model_dir(Some(&pin_text("0.10-lts")));
+    let (dir, prog) = model_dir(Some(&pin_text(other_channel())));
     let out = nsl(&["run", "--ignore-toolchain-pin"], &prog, dir.path(), None);
     let stderr = text(&out.stderr);
     assert!(out.status.success(), "nsl run --ignore-toolchain-pin:\n{stderr}");
@@ -104,13 +120,13 @@ fn the_override_runs_a_mismatched_pin_on_this_toolchain() {
 
 #[test]
 fn a_pin_naming_this_channel_runs() {
-    let (dir, prog) = model_dir(Some(&pin_text("dev")));
+    let (dir, prog) = model_dir(Some(&pin_text(CHANNEL)));
     let out = nsl(&["run"], &prog, dir.path(), None);
     let stderr = text(&out.stderr);
-    assert!(out.status.success(), "nsl run under a `dev` pin:\n{stderr}");
+    assert!(out.status.success(), "nsl run under a `{CHANNEL}` pin:\n{stderr}");
     assert_eq!(text(&out.stdout).trim(), PROGRAM_OUTPUT, "stderr:\n{stderr}");
     assert!(
-        stderr.contains("note: toolchain channel `dev` (pinned by"),
+        stderr.contains(&format!("note: toolchain channel `{CHANNEL}` (pinned by")),
         "a matching pin is reported once, as a note:\n{stderr}"
     );
     // Not `!contains("warning:")`: the system linker prints its own
@@ -150,7 +166,7 @@ fn version_names_the_toolchain_channel() {
     let stdout = text(&out.stdout);
     assert_eq!(
         stdout.trim(),
-        format!("nsl {} (toolchain channel dev)", env!("CARGO_PKG_VERSION")),
+        format!("nsl {} (toolchain channel {CHANNEL})", env!("CARGO_PKG_VERSION")),
     );
 }
 
@@ -163,9 +179,10 @@ fn version_names_the_toolchain_channel() {
 fn an_installed_pinned_toolchain_receives_the_same_argv() {
     use std::os::unix::fs::PermissionsExt as _;
 
-    let (dir, prog) = model_dir(Some(&pin_text("0.10-lts")));
+    let other = other_channel();
+    let (dir, prog) = model_dir(Some(&pin_text(other)));
     let home = tempfile::tempdir().unwrap();
-    let bin = home.path().join(".nsl/toolchains/0.10-lts/bin");
+    let bin = home.path().join(format!(".nsl/toolchains/{other}/bin"));
     std::fs::create_dir_all(&bin).unwrap();
     let fake = bin.join("nsl");
     std::fs::write(
@@ -227,14 +244,15 @@ fn an_installed_pinned_toolchain_receives_the_same_argv() {
 }
 
 /// The exec-loop guard, end to end: a toolchain installed under the pinned
-/// channel that is really this (dev) binary must be refused, not handed
+/// channel that is really this binary must be refused, not handed
 /// over to (it would hand over to itself forever).
 #[cfg(unix)]
 #[test]
 fn an_install_that_is_this_binary_is_refused_not_looped() {
-    let (dir, prog) = model_dir(Some(&pin_text("0.10-lts")));
+    let other = other_channel();
+    let (dir, prog) = model_dir(Some(&pin_text(other)));
     let home = tempfile::tempdir().unwrap();
-    let bin = home.path().join(".nsl/toolchains/0.10-lts/bin");
+    let bin = home.path().join(format!(".nsl/toolchains/{other}/bin"));
     std::fs::create_dir_all(&bin).unwrap();
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_nsl"), bin.join("nsl")).unwrap();
 
