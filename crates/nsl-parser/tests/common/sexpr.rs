@@ -512,7 +512,6 @@ impl Printer<'_> {
                 }
                 node("model", &parts)
             }
-            StmtKind::AgentDef(_) => "(agent)".to_string(),
             StmtKind::StructDef(d) => {
                 let mut parts = vec![format!(
                     "{}{}",

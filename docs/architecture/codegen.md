@@ -35,7 +35,7 @@ Scale, for orientation: `src/lib.rs` is ~2.5k lines, `src/stmt.rs` ~3.2k
 `src/stmt_grad.rs`, `src/stmt_quant.rs`, `src/stmt_inspect.rs` and
 `src/stmt_distill.rs`, 0.2–0.4k each),
 `src/compiler/` ~32k across eight files, `src/source_ad.rs` ~8.7k,
-`src/flash_attention.rs` ~8.5k. There are 301 integration-test files under
+`src/flash_attention.rs` ~8.5k. There are 359 integration-test files under
 `tests/` and ~200 modules at the crate root.
 
 ## Overview: the pipeline as code
@@ -60,13 +60,13 @@ later emission consults.
                                         │
    ┌── COLLECT ─────────────────────────┼──────────────────── src/compiler/collection.rs
    │  intern_string · collect_strings · collect_enums · collect_structs
-   │  collect_models · collect_agents
+   │  collect_models
    │  cpdt_decorator / cpdt_expert_prune / cpdt_moe_capacity (metadata-only passes)
    │  populate_calibration_retention_from_ast_if_unset (AWQ + WGGO pre-scan)
    │  emit_retention_arena · emit_grad_retention_arena
    ├── DECLARE ─────────────────────────┼──────────────────── src/compiler/declaration.rs
    │  declare_runtime_functions   ← the nsl-abi table (nsl_abi::for_each_runtime_fn!)
-   │  declare_user_functions · declare_agent_methods
+   │  declare_user_functions
    │  apply_vmap_transforms / register_batched_functions   (src/vmap.rs)
    ├── COMPILE ─────────────────────────┼─────────────────────
    │  compile_datatype_defs
@@ -74,11 +74,11 @@ later emission consults.
    │  wrga_prescan (adapter sites)
    │  compile_flash_attention_kernels ← phase KernelPrepass: WGGO prepass, PCA detection
    │  compile_user_functions          ← src/compiler/functions.rs → func.rs → stmt.rs / expr/
-   │  compile_agent_methods · compile_batched_functions
+   │  compile_batched_functions
    │  MemoryPlanner (whole-program slab plan, scheduled through PassManager)
    │  compile_main                    ← src/compiler/main_entry.rs, phase TrainBlock
    │      └─ top-level stmts → compile_stmt → compile_train_block (see below)
-   │  compile_pending_lambdas · run_wcet_analysis · fusion report
+   │  compile_pending_lambdas · fusion report
    │  embed_weight_hash · emit_export_wrappers (c_wrapper.rs) · write profile manifest
    └── FINALIZE ────────────────────────┼─────────────────────
       Compiler::finalize → ObjectModule::finish → object bytes (Vec<u8>)
@@ -86,7 +86,7 @@ later emission consults.
                      nsl-cli: linker::link / link_multi / link_shared_with_exports
                               c_header::emit for --shared-lib     src/linker.rs, src/c_header.rs
                                         ▼
-                     executable · shared library (+ .h) · standalone · unikernel image
+                     executable · shared library (+ .h) · standalone
 ```
 
 The phases are literal method calls in `compile_returning_plan_impl`
@@ -297,7 +297,7 @@ The gates that make these declarations true: `crates/nsl-codegen/tests/pass_regi
   `link_shared_with_exports`, `default_output_path`,
   `default_shared_lib_path`; finds `libnsl_runtime*.a` in the toolchain dir
   (`find_runtime_lib`) and drives the system C compiler (`find_c_compiler`).
-  Called from `crates/nsl-cli/src/commands/build/{normal,shared_lib,standalone,zk}.rs`
+  Called from `crates/nsl-cli/src/commands/build/{normal,shared_lib,standalone}.rs`
   and `commands/test.rs`, never from inside codegen. Before a shared-library
   link, `refuse_runtime_symbol_shadowing` refuses `@export` names that the
   runtime archive or the program's objects import (`memcpy`, `log`, …). A
@@ -319,8 +319,7 @@ The gates that make these declarations true: `crates/nsl-codegen/tests/pass_regi
   `crates/nsl-codegen/tests/exported_symbols_are_dlsym_findable.rs`,
   `crates/nsl-codegen/tests/export_table_runtime_ffis.rs`.
 - `src/standalone.rs` (`create_weight_object`) and `StandaloneConfig`
-  (`src/compiler/mod.rs`) back `nsl build --standalone`; `src/unikernel.rs` /
-  `src/unikernel_boot.rs` back `--unikernel`.
+  (`src/compiler/mod.rs`) back `nsl build --standalone`.
 
 ## Entry points and CompileOptions
 
@@ -329,8 +328,8 @@ The curated public surface is re-exported at the crate root from
 `compile_entry`, `compile_entry_returning_plan`, `compile_entry_capturing_ir`,
 `compile_module`, `compile_module_with_imports` (+ `_returning_plan`,
 `_best_effort_plan(s)`), `compile_test`, `compile_standalone`
-(+ `_returning_plan`), `compile_with_profile_captures`, `compile_with_zk_info`
-(+ `_returning_plan`), and `compile_returning_splice_count_for_tests`. The
+(+ `_returning_plan`), `compile_with_profile_captures`, and
+`compile_returning_splice_count_for_tests`. The
 `_returning_plan` variants also hand back the `WrgaPlan` the train block
 published (for `nsl build --wrga-report`). `compile_with_options` and
 `compile_and_calibrate` live in `src/lib.rs`; the former is the one-call
@@ -353,9 +352,8 @@ it into `compile_options` at `Compiler::new`. Where it comes from:
 
 The struct has 29 `pub` fields today. The decomposition into cohesive
 sub-structs that already exists (grep `Options {` in `src/lib.rs`):
-`WggoOptions` (`opts.wggo`), `CfieOptions` (`opts.cfie`), `WcetOptions`
-(`opts.wcet`), `ZkOptions` (`opts.zk`), `CshaOptions` (`opts.csha`),
-`CpdtOptions` (`opts.cpdt`), `CalibrationOptions` (`opts.calibration`:
+`WggoOptions` (`opts.wggo`), `CfieOptions` (`opts.cfie`), `CshaOptions`
+(`opts.csha`), `CpdtOptions` (`opts.cpdt`), `CalibrationOptions` (`opts.calibration`:
 data path, mode, sample/batch/timeout budgets, the AWQ `retention` and
 WGGO `grad_retention` plans, `batch_seq`, the subprocess `compile_bundle`
 and the `sidecar` the harness writes back), `DevToolsOptions`
@@ -444,7 +442,7 @@ the CLIF snapshot suite.
 
 Every runtime call the codegen can emit is declared once, in the typed
 ABI table `crates/nsl-abi/src/table.rs` (roadmap A3): one row
-`[group] name(params) -> ret = runtime::path;` per function, 684 of them,
+`[group] name(params) -> ret = runtime::path;` per function, 677 of them,
 exposed as the X-macro `nsl_abi::for_each_runtime_fn!` and as data
 (`nsl_abi::RUNTIME_ABI`). The groups are the split PR #600 made along
 "what the language exposes vs what the runtime implements": `memory`,
@@ -591,28 +589,33 @@ and the PTX backend declares the `.reg .b32 %v<N>` class for them.
 `crates/nsl-codegen/tests/kir_mma_ptxas.rs` assemble those lowerings with
 `ptxas` where the toolkit is present (CI's cuda-feature lane).
 `crates/nsl-kir/src/backend_ptx.rs::lower_kir_to_ptx` prints PTX
-(ISA 7.0, `sm_70`) from it; `src/backend_amdgpu.rs::lower_kir_to_amdgpu`,
-`src/backend_metal.rs::lower_kir_to_msl`, `src/backend_wgsl.rs::lower_kir_to_wgsl`
-are the other printers. `src/kernel_lower.rs::lower_kernel_to_ir` is the one
-front door for a user `kernel` block on every target (roadmap A2 step 3
+(ISA 7.0, `sm_70`) from it. It is the only printer: the AMDGPU, Metal and
+WGSL printers were removed in the Phase 0.6 scope freeze (preserved at tag
+`attic/scope-freeze-2026-10`). `src/kernel_lower.rs::lower_kernel_to_ir` is the one
+front door for a user `kernel` block (roadmap A2 step 3
 retired the AST→PTX `KernelCompiler` the CUDA target used until then): it
 lowers `let`, assignment to a declared local, element loads and stores,
 `if`/`elif`/`else`, `for ... in range(...)`, `while`, `break`/`continue`, a
 bare `return` and the index builtins to verified KIR — a local reassigned in
 a branch or a loop body is a block parameter at the join or the header — and
 refuses everything else with the innermost node's span.
-`src/gpu_target.rs` (`GpuTarget::{Cuda, Rocm, Metal, WebGpu, Fpga}`,
-re-exporting `FeatureSet`) selects the backend; `Compiler::compile_kernels`
-(`src/compiler/kernel.rs`) dispatches: every target lowers to KIR, CUDA
-prints it with `backend_ptx`, ROCm/Metal/WebGPU with their printers (which
-have no control flow yet, so a kernel whose KIR passes block arguments is
-refused there), and `Fpga` returns `FPGA_TARGET_REDIRECT_MSG` (use
-`nsl fpga-compile`). `@autotune` substitutes its constants into the AST
+`src/gpu_target.rs` (`GpuTarget::Cuda`, re-exporting `FeatureSet`)
+selects the backend, and its `validate_cli_target` is the `--target` value
+parser for `nsl build` / `nsl run`. It accepts exactly what
+`CompileTarget::resolve` resolves -- `cuda`, `sm_<N>`, `sm<N>`, `cuda_sm<N>`
+and `cpu` -- and it refuses the removed backend names (ROCm, Metal, WebGPU,
+FPGA) with the attic tag. That check exists because
+`GpuTarget::from_target_string` maps any unknown string to CUDA. Code that
+branches on the target asks `CompileTarget` (via `Compiler::cuda_sm` /
+`Compiler::target_sm`) rather than comparing strings: the three SM spellings
+mean the same thing, plain `cuda` generates for sm_80, and a host-only `cpu`
+compile refuses `@flash_attention`.
+`Compiler::compile_kernels` (`src/compiler/kernel.rs`) lowers to KIR and
+prints it with `backend_ptx`. `@autotune` substitutes its constants into the AST
 (`kernel_lower::substitute_constants`) before lowering. PTX bytes are
 embedded via `declare_data` / `define_data` in the same file;
 `tests/snapshot_tests.rs` (`kernel_block_*`) pins the PTX of every shape the
 lowering accepts and `tests/kernel_block_ptxas.rs` assembles it.
-`crates/nsl-codegen/tests/common/kir_builder.rs` is the shared test helper for building KIR;
 `crates/nsl-codegen/tests/snapshot_tests.rs` pins KIR-generated PTX.
 `src/cfie_decode_attention.rs::build` is the first CFIE kernel built as KIR
 (roadmap A2 step 9): block parameters for the tile loop and its three inner
@@ -754,7 +757,7 @@ spec `docs/superpowers/specs/2026-09-09-a2-kir-v2-design.md`.
 TFLOPs, bandwidth, VRAM, L2, crossover points, launch overhead),
 `GPU_DATABASE`, `find_gpu`, `default_gpu`, `resolve_local_gpu`
 (via `nsl_abi::wire::device_identity::CudaDeviceIdentity`, probed by
-`nsl_runtime::cuda_device_identity`), plus `FPGA_DATABASE` / `CPU_DATABASE`.
+`nsl_runtime::cuda_device_identity`).
 `src/ptxas_validation.rs::validate_ptx` assembles PTX through `cudarc`
 `cuModuleLoadData` when a context is current, else `nvcc --cubin`; it is the
 basis of every `*_ptxas*.rs` test. `src/ptx_metadata.rs` extracts static
@@ -831,8 +834,7 @@ fixtures `tests/train_clif/*.nsl`.
 - **Cost model** — `src/cost_model.rs` (M37 roofline: `OpCost`,
   `BoundClassification`, `matmul_cost`, `softmax_cost`, …), consumed by
   autotune's cost-model selection, WRGA's roofline (`src/wrga_roofline.rs`),
-  WGGO's cost (`src/wggo_cost.rs`), CFIE's (`src/cfie_cost.rs`) and
-  `src/wcet.rs`.
+  WGGO's cost (`src/wggo_cost.rs`) and CFIE's (`src/cfie_cost.rs`).
 - **Memory planner** — `src/memory_planner.rs`: `analyze_ast_liveness`
   → `TensorAlloc`s, `InterferenceGraph::build`, `plan_slab` → `SlabPlan`,
   `format_memory_report` (`--memory-report`), `check_vram_budget`
@@ -855,8 +857,7 @@ fixtures `tests/train_clif/*.nsl`.
   from `--weights`), `src/ctor_fold.rs`, `src/lm_head_inference.rs`
   (`--fuse-lm-head`), `src/param_roles.rs`, `src/parameter_plan.rs`.
 - **Profiling / inspection** — `src/profiling/` (`captures.rs`,
-  `instrument.rs`, `walker.rs`, `memory_timeline.rs`), `src/inspect/`,
-  `src/wcet.rs`.
+  `instrument.rs`, `walker.rs`, `memory_timeline.rs`), `src/inspect/`.
 
 **Pass registry drift gate.** `crates/nsl-codegen/tests/pass_registry_drift.rs` checks
 `PASSES` against the tree in both directions: every `source_files` entry
@@ -934,11 +935,7 @@ Cargo feature at its `stmt.rs` entry), **CEP** `src/cep.rs`, **CFIE**
 **CPKD** `src/cpkd.rs`, **CCR** `src/ccr.rs`, **CSLA** `src/layerwise.rs` +
 `src/stmt_csla.rs` (`docs/research/CSLA-compiler-scheduled-layerwise-accumulation.md`),
 **PCA** `src/pca_detect.rs` (+ `pca_tier_b.rs`, `pca_per_doc.rs`, …),
-**FASE** `src/fase.rs`, **ZK** `src/zk/` (`nsl zk`, Plonky3 and folding
-backends), **FPGA/HIR** `src/hir/` + `src/backend_verilog/` +
-`src/kernel_lower_fpga.rs` + `src/fpga_error.rs` (`nsl fpga-compile`),
-**WCET** `src/wcet.rs`, **unikernel** `src/unikernel.rs`, **sparse**
-`src/sparse.rs`, **speculative** `src/speculative.rs`, **multimodal**
+**FASE** `src/fase.rs`, **sparse** `src/sparse.rs`, **speculative** `src/speculative.rs`, **multimodal**
 `src/multimodal.rs`, **BitNet** `src/bitnet/`. Their APIs, flags and on-disk
 formats are not stable; see `STATUS.md` ("Experimental" and "Opting out of
 experimental subsystems") for the tier contract and `docs/wiki/Optimization-Passes.md`
@@ -1020,24 +1017,23 @@ should fail before review.
 
 ## Tests and gates
 
-`crates/nsl-codegen/tests/` holds 301 `.rs` integration-test files (plus
+`crates/nsl-codegen/tests/` holds 359 `.rs` integration-test files (plus
 `common/`, `data/`, `fixtures/`, `snapshots/`, `train_clif/`). By filename
 prefix the largest families are `tier_*` (45, FA-v2 Tier B1/B2 kernels),
 `csha_*` (34), `pca_*` (29), `fused_*` (25, fused linear-CE and LM head),
 `wggo_*` (14), `cpdt_*` (13), `bitnet_*` (11), `wrga_*` (10), `cfie_*` (10),
 `pass_*` (8), `fase_*` (8), `fa_*` (6), `sinks_*` (5), `awq_*` (5),
-`profiling_*`/`profile_*` (8), `bench_*` (4), plus the ABI/export, HIR/Verilog,
+`profiling_*`/`profile_*` (8), `bench_*` (4), plus the ABI/export,
 calibration, autotune and drift-gate singles. Functionally they fall into:
 
 - **Snapshot suites** (`insta`, `cargo insta review -p nsl-codegen`):
   `train_clif_snapshots.rs` (CLIF, 26 snapshots), `fa_v2_snapshots.rs`
-  (per-phase FA-v2 PTX, 25 tests), `verilog_emission_snapshots.rs` (8),
-  `hir_pass_snapshots.rs` (7), `snapshot_tests.rs` (KIR-generated PTX/KIR,
+  (per-phase FA-v2 PTX, 25 tests), `snapshot_tests.rs` (KIR-generated PTX/KIR,
   12), `bitnet_ptx_snapshots.rs`, `pca_*_kernel_snapshot.rs`,
   `tier_b1_*_snapshot.rs`, `csha_pipeline_cost_model_snapshot.rs`,
   `cpdt_sensitivity_snapshot.rs`, `c_header_snapshot.rs`, and the byte-identity
   pins (`fused_linear_ce_v1_byte_identity.rs`, `sinks_v1a_byte_identity.rs`,
-  `pca_sass_byte_identity.rs`). 102 snapshot files under `crates/nsl-codegen/tests/snapshots/`.
+  `pca_sass_byte_identity.rs`). 100 snapshot files under `crates/nsl-codegen/tests/snapshots/`.
 - **Static drift gates** (read the tree, no compile): `pass_registry_drift`,
   `pass_bus_drift`, `pass_manager_drift`, `tape_access_drift`,
   `pass_scheduler_coverage`, `ffi_ownership_drift`,
@@ -1052,8 +1048,7 @@ calibration, autotune and drift-gate singles. Functionally they fall into:
   reason): `*_gpu_parity.rs`, `*_numerical.rs`, `*_gpu_e2e.rs`,
   `*_sass_*.rs`, `flash_attention_*_gpu.rs`. 72 files carry `#[ignore]`
   (251 attributes); `scripts/gpu-cert.sh --check-reasons` refuses a bare one.
-- **Hardware-adjacent toolchains**: `yosys_gate.rs` (FPGA, skipped without
-  `yosys`), `c_header_compiles.rs` (a C compiler),
+- **Hardware-adjacent toolchains**: `c_header_compiles.rs` (a C compiler),
   `awq_real_subprocess_link.rs` / `exported_symbols_are_dlsym_findable.rs`
   (the system linker).
 
@@ -1070,10 +1065,9 @@ different thing.
 | Gate | Where |
 |------|-------|
 | `cargo test --workspace -- --skip e2e_` (all non-ignored codegen tests, unit tests, the static drift gates, `nsl-abi`'s table tests) | `ci.yml` `build-and-test` |
-| `verilog_emission_snapshots`, `hir_pass_snapshots`, `yosys_gate` | `ci.yml` `fpga` |
 | `csha_ptx_ptxas_validation`, `fused_linear_ce_{bf16,fp16,large_vocab}_ptxas`, `bitnet_gpu_correctness` under `--features cuda` against cudart stubs (assembles PTX, executes nothing) | `ci.yml` `cuda-feature` |
 | `scripts/hand-ptx-freeze.sh --self-test` / `--check` | `ci.yml` `hand-ptx-freeze` |
-| `scripts/gpu-cert.sh --check-inventory` / `--check-reasons` / `--check-long-arms` (manifest `ci/gpu-cert-manifest.tsv`: 470 gates, 198 in this crate) | `ci.yml` `gpu-gate-inventory` |
+| `scripts/gpu-cert.sh --check-inventory` / `--check-reasons` / `--check-long-arms` (manifest `ci/gpu-cert-manifest.tsv`: 495 gates, 201 in this crate) | `ci.yml` `gpu-gate-inventory` |
 | `scripts/check-doc-agreement.sh`, version agreement | `ci.yml` `doc-agreement`, `version-agreement` |
 | `scripts/gpu-cert.sh --run [--tier gpu\|toolchain\|multiproc\|isolate\|all]` — every `#[ignore]`d device test, under `scripts/gpu-guard.sh`; known-red list `ci/gpu-cert-known-red.txt` | `.github/workflows/gpu-cert.yml`, nightly + `workflow_dispatch` on the self-hosted sm_120 box; or locally |
 | `scripts/gpu-tier.sh smoke\|certify\|endurance` | local only |
@@ -1117,7 +1111,7 @@ review. See `docs/wiki/GPU-Test-Harness.md` and `docs/wiki/Testing-Strategy.md`.
 ### A new compile option or flag
 
 1. Add the field to `CompileOptions` in `src/lib.rs` — inside the matching
-   sub-struct (`WggoOptions`, `CfieOptions`, `WcetOptions`, `ZkOptions`,
+   sub-struct (`WggoOptions`, `CfieOptions`,
    `CshaOptions`, `CpdtOptions`, `CalibrationOptions`, `DevToolsOptions`, `CheckpointOptions`,
    `WeightStreamOptions`, `MuonOptions`, `ImportedModelOptions`, `ZeroOptions`,
    `AutotuneOptions`, `WeightsOptions`, `FusionOptions`, `DiagnosticsOptions`,
@@ -1173,9 +1167,8 @@ review. See `docs/wiki/GPU-Test-Harness.md` and `docs/wiki/Testing-Strategy.md`.
 1. Build it with `KirBuilder` (`crates/nsl-kir/src/kernel_ir.rs`): `add_param` for each
    argument with its `AddressSpace`, `new_typed_var`/`emit(KirOp::…)` for the
    body, `terminate`, `finalize()`. Missing operations are added as `KirOp`
-   variants with lowering in **every** printer (`backend_ptx.rs`,
-   `backend_amdgpu.rs`, `backend_metal.rs`, `backend_wgsl.rs`) and, if
-   needed, `FeatureSet` bits in `src/gpu_target.rs`. Float arithmetic
+   variants with lowering in the PTX printer (`backend_ptx.rs`, the only
+   one) and, if needed, `FeatureSet` bits in `src/gpu_target.rs`. Float arithmetic
    that must round each operation on its own (a result that has to match
    a decomposed, multi-kernel computation bit for bit) uses
    `KirOp::{AddRn, SubRn, MulRn}`. These print `.rn`, which ptxas never
@@ -1187,16 +1180,15 @@ review. See `docs/wiki/GPU-Test-Harness.md` and `docs/wiki/Testing-Strategy.md`.
    converts the value. `KirType::U16` holds raw 16-bit storage bits (bf16
    and the like) in a 32-bit register: `.u16` loads and stores, and
    `cvt.u32.u16` / `cvt.u16.u32` to widen and narrow. `KirType::U8` is the
-   same for a byte (`.u8`, `cvt.u32.u8`). The Metal, WGSL and
-   AMDGPU printers lower neither `Cast` nor `Bitcast` yet.
+   same for a byte (`.u8`, `cvt.u32.u8`).
 2. Lower with `backend_ptx::lower_kir_to_ptx` at the launch site and embed
    the bytes the way `Compiler::compile_kernels` does (`declare_data` /
    `define_data`, `src/compiler/kernel.rs`); launch through the existing
    runtime FFIs. Do **not** add a module that formats PTX text —
    `scripts/hand-ptx-freeze.sh --check` refuses it; if you must touch a
    frozen emitter, edit the existing member file.
-3. Pin the PTX with a snapshot in `crates/nsl-codegen/tests/snapshot_tests.rs` (using
-   `crates/nsl-codegen/tests/common/kir_builder.rs`) and assemble it in a `*_ptxas.rs` test
+3. Pin the PTX with a snapshot in `crates/nsl-codegen/tests/snapshot_tests.rs` (build
+   the KIR with `KirBuilder`, as its kernels do) and assemble it in a `*_ptxas.rs` test
    through `ptxas_validation::validate_ptx`.
 4. Add the device test (`#[ignore = "<reason>"]`, GPU parity against a CPU
    reference) and refresh `ci/gpu-cert-manifest.tsv` with

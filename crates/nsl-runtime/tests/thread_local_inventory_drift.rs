@@ -17,10 +17,11 @@
 //!  2. every name the table lists still exists in the file its row names
 //!     (renames and deletions must update the doc in the same PR).
 //!
-//! Macro-declared statics (hir/ids.rs' `define_id!`) are invisible to the
-//! block scan (the macro body declares `$counter`), so direction 1 finds
-//! nothing there and direction 2 carries the check: the names must appear
-//! at the macro's instantiation site.
+//! Macro-declared statics (a `macro_rules!` body that declares `$counter`)
+//! are invisible to the block scan, so direction 1 finds nothing there and
+//! direction 2 carries the check: the names must appear at the macro's
+//! instantiation site. None exist today; the FPGA HIR's `define_id!`
+//! counters were the last, removed in the Phase 0.6 scope freeze.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -73,9 +74,9 @@ fn scan_thread_local_statics(src: &str) -> Vec<String> {
     let mut search_from = 0;
     while let Some(pos) = src[search_from..].find("thread_local!") {
         let start = search_from + pos;
-        // A doc-comment MENTION of thread_local! (hir/ids.rs's module doc)
-        // must not anchor a pseudo-block over whatever braces follow —
-        // skip matches on comment lines (review finding).
+        // A doc-comment MENTION of thread_local! (a module doc, say) must
+        // not anchor a pseudo-block over whatever braces follow — skip
+        // matches on comment lines (review finding).
         let line_start = src[..start].rfind('\n').map(|i| i + 1).unwrap_or(0);
         let line_head = src[line_start..start].trim_start();
         if line_head.starts_with("//") {

@@ -301,8 +301,7 @@ impl Compiler<'_> {
                         // channel to the fused segment-masked
                         // family (decline path = Stage B chain).
                         _ if self.features.packed_sdpa_in_module
-                            && (self.compile_options.target == "cuda"
-                                || self.compile_options.target.starts_with("sm_")) =>
+                            && self.cuda_sm().is_some() =>
                         {
                             PackingKernelState::FusedSegmentMasked
                         }

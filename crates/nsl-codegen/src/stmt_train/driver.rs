@@ -71,7 +71,7 @@ impl Compiler<'_> {
         // the drivers. compile_main/-standalone_main already install
         // TrainBlock (same-value RAII nest, harmless), but a train block
         // also arrives through paths that install nothing — user fns
-        // (nested train, @test fns), lambdas, model/agent methods, module
+        // (nested train, @test fns), lambdas, model methods, module
         // compiles. Scoping here covers all of them by construction, which
         // is what closes the "production scheduled pass sees phase=None"
         // gap the scheduler's None arm used to document as live.

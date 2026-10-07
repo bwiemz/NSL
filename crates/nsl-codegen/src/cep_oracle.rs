@@ -253,8 +253,9 @@ fn latency_us(flops: u64, bytes: u64, gpu: &GpuSpec, dtype_bytes: usize) -> f64 
 /// Roofline worst-case execution time (microseconds): assumes compute and memory
 /// traffic do NOT overlap (sum instead of max).  This is an upper bound on the
 /// canonical roofline latency — not a true hardware WCET; there is no
-/// kernel-launch overhead, occupancy term, or p95 statistical inflation.  For
-/// DO-178C-style certified WCET use the wcet.rs module's FPGA-targeted helpers.
+/// kernel-launch overhead, occupancy term, or p95 statistical inflation.  The
+/// tree has no certified WCET analysis (M53 was removed in the Phase 0.6 scope
+/// freeze; tag `attic/scope-freeze-2026-10`).
 fn worst_case_latency_us(flops: u64, bytes: u64, gpu: &GpuSpec, dtype_bytes: usize) -> f64 {
     let peak_flops = gpu.peak_tflops(dtype_bytes) * 1e12;
     let peak_bw = gpu.peak_bandwidth_gbs * 1e9;

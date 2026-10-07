@@ -983,7 +983,7 @@ fn walk_for_wggo_instantiations(
             }
             // Remaining variants are leaves for instantiation-discovery
             // purposes (Break/Continue/Return/Yield/Assign/Expr/Import/
-            // FromImport, type/struct/enum/trait/agent defs, KernelDef/
+            // FromImport, type/struct/enum/trait defs, KernelDef/
             // TokenizerDef/DatasetDef/DatatypeDef/QuantBlock/ServeBlock).
             // None can contain a `let x = Class(...)` that binds in the
             // enclosing scope.

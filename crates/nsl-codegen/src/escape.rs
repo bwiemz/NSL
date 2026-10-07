@@ -515,7 +515,6 @@ impl<R: Fn(Symbol) -> String> Walker<'_, R> {
             // an enclosing parameter, so there is genuinely nothing to taint.
             StmtKind::FnDef(_)
             | StmtKind::ModelDef(_)
-            | StmtKind::AgentDef(_)
             | StmtKind::StructDef(_)
             | StmtKind::EnumDef(_)
             | StmtKind::TraitDef(_)

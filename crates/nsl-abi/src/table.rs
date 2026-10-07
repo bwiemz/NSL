@@ -1311,24 +1311,6 @@ macro_rules! for_each_runtime_fn {
             [interop] nsl_model_get_version() -> i64 = c_api::nsl_model_get_version;
             [interop] nsl_get_last_error() -> i64 = c_api::nsl_get_last_error;
             [interop] nsl_clear_error() -> i64 = c_api::nsl_clear_error;
-            // --- M54b: Unikernel runtime ---
-            [interop] nsl_unikernel_init(i64, i64) -> i64 = unikernel::nsl_unikernel_init;
-            [interop] nsl_unikernel_model_alloc(i64, i64) -> i64 = unikernel::nsl_unikernel_model_alloc;
-            [interop] nsl_unikernel_kv_alloc(i64, i64) -> i64 = unikernel::nsl_unikernel_kv_alloc;
-            [interop] nsl_unikernel_model_pool_stats() -> i64 = unikernel::nsl_unikernel_model_pool_stats;
-            [interop] nsl_unikernel_shutdown() -> i64 = unikernel::nsl_unikernel_shutdown;
-            [interop] nsl_unikernel_gpu_init(i64) -> i64 = unikernel::gpu_init::nsl_unikernel_gpu_init;
-            [interop] nsl_unikernel_gpu_ready() -> i64 = unikernel::gpu_init::nsl_unikernel_gpu_ready;
-            [interop] nsl_unikernel_gpu_device_id() -> i64 = unikernel::gpu_init::nsl_unikernel_gpu_device_id;
-            // --- M56 v1 agent runtime FFI (Task 16). Signatures from spec §3.4. ---
-            // All raw pointers are I64 per the workspace convention; time: u64 is also I64.
-            [interop] nsl_agent_pool_new(i64, i64) -> i64 = agent::ffi::nsl_agent_pool_new;
-            [interop] nsl_agent_pool_destroy(i64) -> () = agent::ffi::nsl_agent_pool_destroy;
-            [interop] nsl_agent_pool_acquire(i64, i64) -> i64 = agent::ffi::nsl_agent_pool_acquire;
-            [interop] nsl_agent_pool_release(i64, i64) -> () = agent::ffi::nsl_agent_pool_release;
-            [interop] nsl_agent_scheduler_step(i64) -> i32 = agent::ffi::nsl_agent_scheduler_step;
-            [interop] nsl_agent_mailbox_write(i64, i64, i64) -> i32 = agent::ffi::nsl_agent_mailbox_write;
-            [interop] nsl_agent_mailbox_read(i64) -> i64 = agent::ffi::nsl_agent_mailbox_read;
 
         }
     };
@@ -1369,6 +1351,6 @@ mod tests {
     fn table_is_the_recorded_size() {
         // The count is pinned so a row dropped by a bad merge is noticed; move
         // it with a row that is deliberately added or removed.
-        assert_eq!(RUNTIME_ABI.len(), 692);
+        assert_eq!(RUNTIME_ABI.len(), 677);
     }
 }

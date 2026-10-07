@@ -1845,6 +1845,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
     `-o` cannot hold them. The build now says so instead of ignoring `-o`
     silently.
 
+- **Every accepted `--target` spelling now compiles `@flash_attention`
+  instead of panicking.**
+  - **The bug.** The CLI accepted `cuda`, `sm_<N>`, `sm<N>`, `cuda_sm<N>` and
+    `cpu`, but `parse_gpu_sm_from_target` parsed only `cuda` and `sm_<N>`. On
+    the other three, an `@flash_attention` compile panicked.
+  - **A related inconsistency.** The fused-SDPA variant tables and the
+    packed-attention planner treated `sm80` and `cuda_sm80` as host-only:
+    null kernels and the CPU backward. `sm_80` got the GPU kernels.
+  - **The fix.** `gpu_target::CompileTarget::resolve` maps every accepted
+    spelling to `Cpu` or `Cuda { pinned_sm }`, and every consumer asks it.
+    - The three SM spellings now mean the same thing.
+    - Plain `cuda` generates for sm_80, as before.
+    - `--target cpu` refuses `@flash_attention` with a typed error.
+    - `validate_cli_target` accepts exactly what the resolver resolves.
+    - The looser `GpuTarget::parse_sm_version`, which accepted uppercase and
+      `sm_90a`, is gone.
+
 - **Numerical gates refuse NaN instead of scoring it a perfect match**
   (external review 2026-10-06, finding 2).
   - **How NaN was dropped.** Error metrics folded with `f32::max` (which
@@ -3655,6 +3672,129 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   `WengertExtractor` keep their own `checkpoint_policies`; the CLI's
   training-reference override macro now takes a field path. 72 → 67 flat
   fields.
+
+### Removed
+
+- **The `@rope` decorator is refused.** It asked `@flash_attention` for
+  in-kernel RoPE, but the feature was never wired.
+  - **No tables.** Every launch site passed the kernel null cos/sin tables.
+  - **Q only.** The non-CSHA kernel it selected rotates Q only, and it has
+    no null guard.
+  - **The effect.** A decorated function compiled, and its first launch would
+    have read from address ~0. Nothing called one: the only user,
+    `examples/m27_rope_gqa.nsl`, was a decorator-validation stub.
+  - **Now.** `@rope` gets a typed refusal that stays an error under
+    `--allow-unknown-decorators`. Codegen refuses it too, for a caller that
+    skips the checker. The example is now `examples/m27_gqa.nsl`.
+  - **What to do instead.** Apply RoPE to Q and K before the attention call,
+    as `nsl.nn.gqa` does.
+
+- **Unikernel deployment (M54)**, in the Phase 0.6 scope freeze. The code is
+  preserved at tag `attic/scope-freeze-2026-10`. `nsl build --unikernel`
+  parsed `--listen` and `--memory` into a configuration that was printed and
+  never read: no build path emitted the boot stub, the linker script or an
+  image. Removed: `nsl-codegen`'s `unikernel`/`unikernel_boot` modules,
+  `nsl-runtime`'s `unikernel` module, the eight `nsl_unikernel_*` runtime ABI
+  rows (692 → 684), `CompileOptions::unikernel_config`, and the three flags.
+  Two registry entries had been misattributed: the pass registry listed
+  `--memory` as a MemoryPlanner flag, and the activation allowlist called
+  `--listen` a serve-mode selector. Both flags belonged only to the unikernel.
+  They are removed with it. MemoryPlanner keeps `--memory-report`, and `nsl
+  profile --memory` is a different flag that is unaffected.
+- **AMDGPU/ROCm, Metal and WGSL/WebGPU kernel backends (M47)**, in the Phase
+  0.6 scope freeze. The code is preserved at tag `attic/scope-freeze-2026-10`.
+  None of the three printers was ever run on hardware. They had no
+  control-flow support, and nothing could load what they printed, because the
+  runtime loads only PTX. Removed: `backend_amdgpu.rs`, `backend_metal.rs`,
+  `backend_wgsl.rs`, the `GpuTarget::{Rocm, Metal, WebGpu}` variants, the
+  non-CUDA dispatch and control-flow refusal in `compiler/kernel.rs`, and the
+  runtime `gpu_backend.rs` trait (no implementor, no user) with its `gpu`
+  facade. KIR, the PTX printer, `FeatureSet` and the language-level
+  `metal`/`rocm` device annotations stay. `--target` is now checked at parse
+  time on `nsl build` and `nsl run`. Before, `GpuTarget::from_target_string`
+  mapped any unknown string to CUDA, so after this removal `--target rocm`
+  would have compiled CUDA kernels without an error. Accepted values are
+  `cuda`, `sm_<N>`, `sm<N>`, `cuda_sm<N>`, `cpu` and `fpga`. The removed names
+  (`rocm`/`amd`/`hip`, `metal`/`apple`/`mps`, `webgpu`/`wgsl`) are refused
+  with the attic tag, and anything else is refused as unknown. `@target(...)`
+  now accepts only `cuda`, and it names the tag when given a removed backend.
+- **ZK inference circuits (M55)**, in the Phase 0.6 scope freeze. The code is
+  preserved at tag `attic/scope-freeze-2026-10`. No model on the coder
+  roadmap consumes a proof, and the `--zk-circuit` build ran a hand-copied
+  compile pipeline (`compile_with_zk_info*`) that had already drifted from the
+  normal one: it logged `--vram-budget` as "planner integration in progress"
+  instead of running the planner or refusing. Removed: `nsl-codegen`'s `zk`
+  module (circuit IR, lowering, witness generation, the folding and plonky3
+  backends, about 9,600 lines), that pipeline, `ZkOptions` and
+  `CompileOptions::zk`, the `nsl zk` subcommand (`stats`/`prove`/`verify`),
+  the five `--zk-*` build flags, and the `@zk_proof`/`@zk_lookup` registry
+  rows. Both decorators now get a typed refusal that names the tag. It stays
+  an error under `--allow-unknown-decorators`, so a program that still
+  carries one cannot build without its circuit unnoticed.
+- **WCET analysis (M53)**, in the Phase 0.6 scope freeze. The code is
+  preserved at tag `attic/scope-freeze-2026-10`. The analysis never read the
+  function it certified. Every `@real_time` function was priced as the same
+  fixed 1×512×512 matmul plus a 512-element ReLU. The certificate and the
+  DO-178C report were built from that estimate. `--cpu` only printed an
+  advisory line, and under the default `--wcet-target gpu`, `nsl build`
+  always priced an A100, because it had no `--gpu`. A bound that does not
+  describe the program is worse than no bound, and no model on the coder
+  roadmap needs one. Removed: `nsl-codegen`'s `wcet` module,
+  `Compiler::run_wcet_analysis` and its three call sites, `WcetOptions` and
+  `CompileOptions::wcet`, the `--wcet`/`--wcet-cert`/`--wcet-target`/`--cpu`/
+  `--do178c-report`/`--fpga-device` flags on `nsl build` and `nsl run`, the
+  FPGA and CPU spec databases (`FpgaSpec`/`FPGA_DATABASE`/`find_fpga`,
+  `CpuSpec`/`CPU_DATABASE`/`find_cpu`), and the `GpuSpec` fields only WCET
+  read (`base_clock_mhz`, `sync_overhead_ns`, `occupancy_worst_case`,
+  `empirical_p95_ratio`). `kernel_launch_overhead_ns` and
+  `pcie_bandwidth_gbps` stay, because CFIE, CSLA and CCR read them. Also
+  removed: `tests/test_wcet_{pass,fail}.nsl` and
+  `examples/m53_safety_controller.nsl`. `@real_time` and `@wcet_budget` get
+  the same typed refusal as the ZK decorators. `nsl run --gpu` stays: it
+  picks the GPU for `--monitor`'s predicted-vs-actual profile, and its help
+  text now says that. CEP's `wcet_us` roofline bound is unrelated and stays.
+- **FPGA / Verilog backend (M57)**, in the Phase 0.6 scope freeze. The code is
+  preserved at tag `attic/scope-freeze-2026-10`. Nothing it emitted ever ran
+  on an FPGA: the gates stopped at Verilator simulation and Yosys synthesis of
+  one fixed int8 MLP, and `nsl build --target fpga` only refused `kernel`
+  blocks with a pointer to `nsl fpga-compile`. Removed: `nsl-codegen`'s `hir`
+  module (the hardware IR), `backend_verilog`, `kernel_lower_fpga` and
+  `fpga_error`, the `experimental::fpga` facade, `GpuTarget::Fpga`,
+  `FPGA_TARGET_REDIRECT_MSG`, the `nsl fpga-compile` subcommand, the
+  FPGA-only KIR ops (`KirOp::{Matmul, ElementwiseAdd, Relu}`, which only that
+  lowering emitted; the PTX printer declared them unreachable), their codegen
+  tests and 15 snapshots, and `nsl-test`'s FPGA harness (`fpga_harness`,
+  `fixture`, `cpu_reference`, `stimuli`, the Verilator testbenches, the int8
+  MLP fixtures and their generator binary, and four `fpga_mlp_*` tests). CI
+  loses the `fpga` job and the `fpga-nightly` workflow. Dependency edges
+  removed: `nsl-cli` → `nsl-test` (only `fpga-compile` read the fixture
+  parser), `nsl-codegen` → `thiserror`, and `nsl-test` → `toml`, `thiserror`,
+  `sha2`, `rand`, `rand_chacha` plus its `insta`/`tempfile` dev-dependencies.
+  `--target fpga` is now refused with the attic tag, like the other removed
+  backends. The `I8`/`I16` KIR types stay; the int8 KV-cache and
+  dequantization kernels use `I8`. The name HIR is free for NSL V2.
+- **Agents (M56)**, in the Phase 0.6 scope freeze. The code is preserved at
+  tag `attic/scope-freeze-2026-10`. No model on the coder roadmap is a
+  multi-agent pipeline, and the subsystem was a language change carried
+  through every layer: a keyword, an AST node every exhaustive `StmtKind`
+  match had to name, a parser, about 1,800 lines of action-port-graph checks
+  that ran on every module, three agent-compile calls in each of seven
+  codegen entry points, and a mailbox/scheduler/pool runtime whose seven
+  `nsl_agent_*` FFI rows the codegen never called. Removed: `nsl-ast`'s and
+  `nsl-parser`'s `agent` modules, `StmtKind::AgentDef` and the agent
+  decorator hosts, `nsl-semantic`'s `agent` module (E0601-E0603,
+  E0607-E0610), `Type::Agent` and `AgentFieldOwnership`, `nsl-codegen`'s
+  `agent` module with `@pipeline_agent` lowering and the agent dispatch and
+  field-access arms, `nsl-runtime`'s `agent` module, the seven ABI rows (the
+  pinned count goes from 684 to 677), the `NOT_A_PASS` row, the eight
+  `examples/m56_*.nsl` programs and the tests that covered them. `agent`
+  stays a reserved word: an `agent` block is now one parse error that names
+  the removal and the tag, and its body is skipped, rather than reparsing as
+  an expression statement. `@pipeline_agent` and `@auto_device_transfer` get
+  the same typed refusal as the other removed decorators, an error even
+  under `--allow-unknown-decorators`. `--linear-types` (M38a), `@shared` and
+  `nsl_tensor_to_device` stay; `nsl run --linear-types`, which M56 added,
+  still turns on the ownership walker.
 
 _v0.10.0 below is the whole of the 0.9 line's unreleased work
 (2026-03-19 → 2026-09-06); from here releases are cut monthly (roadmap D5),

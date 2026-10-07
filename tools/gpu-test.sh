@@ -130,7 +130,10 @@ for line in "${entries[@]}"; do
   # Feature set is per-package. `nsl-test/cuda` only exists for packages that
   # depend on nsl-test; passing it to nsl-runtime is a hard cargo error
   # ("the package 'nsl-runtime' does not contain this feature"), which is how
-  # the first version of this runner reported two false FAILs.
+  # the first version of this runner reported two false FAILs. nsl-cli lost
+  # its nsl-test dependency with the FPGA backend (it was there only for
+  # `nsl fpga-compile`'s fixture reader); its `cuda` reaches nsl-runtime's
+  # through nsl-codegen.
   # `test-hooks` is needed too: nsl-runtime's integration tests reach the
   # tensor builders/readers (`test_build_tensor_2d_f32`, `test_read_tensor_f64`)
   # through it, so a `--features cuda` run compiles those files to nothing and
@@ -138,6 +141,7 @@ for line in "${entries[@]}"; do
   # green only because of the summary-line parse below.
   case "${pkg}" in
     nsl-runtime) feats="cuda,test-hooks" ;;
+    nsl-cli)     feats="cuda" ;;
     *)           feats="cuda,nsl-test/cuda" ;;
   esac
 

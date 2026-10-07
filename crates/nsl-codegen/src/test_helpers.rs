@@ -177,17 +177,24 @@ pub struct PrePassResult {
 /// `compile_options.target` is set to `target`, and return the `gpu_sm` stored
 /// in the resulting `FlashAttentionCompileContext`.
 ///
-/// This exercises the **non-autotune call-site at ~line 756** in
-/// `compiler/kernel.rs` (the path where
-/// `parse_gpu_sm_from_target(&self.compile_options.target)` is called).
-/// If that call-site were reverted to `gpu_sm: 80`, the return value would
-/// always be `80` regardless of `target`, causing the regression test to fail
-/// for every SM other than `sm_80`.
+/// This exercises the **non-autotune call-site** in `compiler/kernel.rs`
+/// (the path where `parse_gpu_sm_from_target(&self.compile_options.target)`
+/// is called). If that call-site were reverted to `gpu_sm: 80`, the return
+/// value would always be `80` regardless of `target`, causing the regression
+/// test to fail for every SM other than `sm_80`.
 ///
 /// # Panics
-/// Panics when `target` is not a recognised `sm_<N>` string, or when
-/// `Compiler::new` fails.
+/// Panics when the compile refuses the target (see
+/// [`try_flash_sm_for_compile_target`]), or when `Compiler::new` fails.
 pub fn flash_sm_for_compile_target(target: &str) -> u32 {
+    try_flash_sm_for_compile_target(target)
+        .unwrap_or_else(|e| panic!("compile_flash_attention_kernels refused `{target}`: {e}"))
+}
+
+/// [`flash_sm_for_compile_target`], returning the compile error instead of
+/// panicking: a host-only `cpu` target refuses the `@flash_attention`
+/// kernel.
+pub fn try_flash_sm_for_compile_target(target: &str) -> Result<u32, String> {
     use nsl_errors::FileId;
 
     // Parse a minimal NSL snippet that contains @flash_attention but NO
@@ -215,14 +222,14 @@ pub fn flash_sm_for_compile_target(target: &str) -> u32 {
 
     compiler
         .compile_flash_attention_kernels(&stmts)
-        .expect("compile_flash_attention_kernels failed in flash_sm_for_compile_target");
+        .map_err(|e| e.to_string())?;
 
-    compiler
+    Ok(compiler
         .kernels
         .flash_attention_context
         .expect("flash_attention_context not set after compile_flash_attention_kernels")
         .config
-        .gpu_sm
+        .gpu_sm)
 }
 
 /// Gap B observation helper: what `compile_flash_attention_kernels`
@@ -243,9 +250,7 @@ pub fn flash_gap_b_context_for_source(src: &str) -> (bool, bool, Option<u8>) {
     let parsed = nsl_parser::parse(&tokens, &mut interner);
     let stmts = parsed.module.stmts.clone();
     let type_map: TypeMap = TypeMap::new();
-    // `parse_gpu_sm_from_target` panics on anything that isn't `sm_<N>`;
-    // the default is `"cuda"` (valid at link time, not PTX time), so we
-    // override to `sm_80` which matches the other test harnesses.
+    // Pin `sm_80`, matching the other test harnesses.
     let opts = crate::CompileOptions {
         target: "sm_80".to_string(),
         ..Default::default()

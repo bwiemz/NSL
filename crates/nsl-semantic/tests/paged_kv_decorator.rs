@@ -6,7 +6,7 @@
 //! by `checker/model.rs` which validates a wider set of args):
 //!
 //!   1. `@paged_kv` requires `@flash_attention` on the same function
-//!      (mirrors @tree_mask / @gqa / @rope companion-required rule).
+//!      (mirrors @tree_mask / @gqa companion-required rule).
 //!   2. Unknown args at function scope error (only `block_size` is
 //!      recognised by `compiler/kernel.rs:1005-1022`; others would be
 //!      silently ignored, so we surface them).
@@ -68,7 +68,7 @@ fn forward():
 }
 
 /// Negative: `@paged_kv` without `@flash_attention` companion errors.
-/// Mirrors the @tree_mask / @gqa / @rope validation pattern — paged_kv
+/// Mirrors the @tree_mask / @gqa validation pattern — paged_kv
 /// is a flash-attention-only modifier at function scope and has no
 /// meaning standalone (the function-level extraction site at
 /// `compiler/kernel.rs:1005-1022` would silently no-op).

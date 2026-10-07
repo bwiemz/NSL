@@ -496,4 +496,3 @@ crates/nsl-runtime/tests/zero_grad_gpu.rs	gpu_dst_cpu_f64_src_accumulate	gpu	req
 crates/nsl-runtime/tests/zero_grad_gpu.rs	cpu_f64_dst_gpu_f32_src_accumulate	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/zero_grad_gpu.rs	grad_zero_gpu_clears_buffer	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/zero_grad_gpu.rs	zero_reduce_grads_refuses_gpu_tensor_without_cuda_aware_backend	gpu	requires CUDA GPU
-crates/nsl-test/tests/fpga_mlp_v1_parity.rs	fpga_mlp_v1_parity_full_diagnostic	broken	M57.1 v1 closure prerequisite: AST->KIR dispatch, HIR port/wire generation, end-to-end CLI wiring (nsl fpga-compile), and Verilog synthesizability. See spec §1.5 deferred-roadmap / crates/nsl-test/tests/fpga_mlp_v1_parity.rs header.

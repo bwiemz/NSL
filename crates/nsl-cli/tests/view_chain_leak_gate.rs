@@ -407,26 +407,26 @@ fn free_function_chain_links_do_not_strand_per_call() {
 /// Regression gate for the review finding on 734c548e: the indeterminate-
 /// receiver ownership arms must mirror the DISPATCHER's precedence. An
 /// indeterminate-typed Ident that is a registered model-array loop variable
-/// or agent variable dispatches to a compiled model/agent method
-/// (`models.model_var_types` / `agent_var_types` lookups in expr/calls.rs),
-/// NOT to tensor dispatch — so a method that happens to share a tensor-table
-/// name (`fn mean(self) -> int`) returns a plain I64, and classifying it by
-/// the tensor table would make statement cleanup call `nsl_tensor_free(5)`:
-/// `from_ptr` dereferences the value as an `NslTensor` box — segfault or
-/// silent heap corruption, not a leak.
+/// dispatches to a compiled model method (the `models.model_var_types`
+/// lookup in expr/calls.rs), NOT to tensor dispatch — so a method that
+/// happens to share a tensor-table name (`fn mean(self) -> int`) returns a
+/// plain I64, and classifying it by the tensor table would make statement
+/// cleanup call `nsl_tensor_free(5)`: `from_ptr` dereferences the value as
+/// an `NslTensor` box — segfault or silent heap corruption, not a leak.
 ///
 /// REACHABILITY (verified by mutation, 2026-07-28): with the guard removed,
 /// this fixture does NOT currently crash, because today's checker types
 /// model-array loop vars concretely (the ownership arms additionally require
 /// an indeterminate SEMANTIC type, and `for blk in ...` receivers here are
-/// Model-typed). The live exposure of the unguarded arm is the M56
-/// @pipeline_agent path, whose synthesised agent vars are Error-typed BY
-/// DESIGN (see the `Type::Error` handling in expr/calls.rs), plus any future
-/// inference change that de-types model vars. This gate therefore pins two
-/// things that must BOTH hold for the hazard to stay closed: the value-level
-/// behaviour of model-array method calls with table-colliding names, and —
-/// should inference ever regress those receivers to Unknown — it becomes the
-/// live crash reproducer for the unguarded classifier. CPU-only.
+/// Model-typed). The arm's one live exposure was the M56 @pipeline_agent
+/// path, whose synthesised agent vars were Error-typed by design; it went
+/// with the agents subsystem in the Phase 0.6 scope freeze. What remains is
+/// any future inference change that de-types model vars. This gate
+/// therefore pins two things that must BOTH hold for the hazard to stay
+/// closed: the value-level behaviour of model-array method calls with
+/// table-colliding names, and — should inference ever regress those
+/// receivers to Unknown — it becomes the live crash reproducer for the
+/// unguarded classifier. CPU-only.
 #[test]
 fn model_array_methods_with_tensor_table_names_are_not_freed_as_tensors() {
     let src = r#"
