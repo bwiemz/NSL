@@ -302,11 +302,16 @@ fn csha_l2_rope_ptx_assembles_on_sm120() {
 #[test]
 fn a1_gpu_sm_matches_compile_target() {
     // (compile target string, expected gpu_sm value)
+    // Every CUDA spelling the CLI accepts must resolve to the same SM;
+    // `sm<N>` and `cuda_sm<N>` used to panic here.
     let cases: &[(&str, u32)] = &[
         ("sm_75",  75),
         ("sm_80",  80),
         ("sm_90",  90),
         ("sm_120", 120),
+        ("sm90",   90),
+        ("cuda_sm90", 90),
+        ("cuda",   80),
     ];
 
     for &(sm, expected_gpu_sm) in cases {
@@ -316,9 +321,20 @@ fn a1_gpu_sm_matches_compile_target() {
             expected_gpu_sm,
             "a1 [{sm}]: compile_options.target should flow into gpu_sm={expected_gpu_sm}, \
              got gpu_sm={gpu_sm} — check the three parse_gpu_sm_from_target call-sites \
-             in compiler/kernel.rs (~line 638, ~690, ~756)"
+             in compiler/kernel.rs"
         );
     }
+}
+
+/// A host-only `--target cpu` compile refuses an `@flash_attention` kernel
+/// with a typed error; it used to panic in `parse_gpu_sm_from_target`.
+#[cfg(feature = "test-helpers")]
+#[test]
+fn a1_flash_attention_on_a_cpu_target_is_refused_not_panicked() {
+    let err = nsl_codegen::test_helpers::try_flash_sm_for_compile_target("cpu")
+        .expect_err("a host-only compile must refuse a CUDA kernel");
+    assert!(err.contains("host-only"), "{err}");
+    assert!(err.contains("--target cuda"), "{err}");
 }
 
 /// A3: The v2 scalar emitter with `fused_projections = true` must produce

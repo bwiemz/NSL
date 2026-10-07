@@ -152,11 +152,8 @@ fn compile_training_to_object(src: &str) -> Option<Vec<u8>> {
         // `AdjointGenerator` entirely — so no `FusedCshaBackward`
         // launch op and no fused-backward FFI relocation.
         source_ad: true,
-        // `CompileOptions::default()` sets target="cuda", but
-        // `compile_flash_attention_kernels` calls
-        // `parse_gpu_sm_from_target` which panics on anything but
-        // `sm_*`.  Pick sm_75 (Turing) to match the Gap D.1 unit
-        // test's `gpu_sm: 75`.
+        // Pin sm_75 (Turing) to match the Gap D.1 unit test's
+        // `gpu_sm: 75`; `CompileOptions::default()` would give sm_80.
         target: "sm_75".to_string(),
         ..Default::default()
     };

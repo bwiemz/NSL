@@ -1482,12 +1482,21 @@ impl<'a> Compiler<'a> {
         self.fusion_plan_for_profile.as_mut()
     }
 
-    /// WRGA B.3 Task 4: extract the CUDA sm version from `--target`
-    /// (e.g. `cuda_sm80` → `Some(80)`).  Returns `None` for non-CUDA
-    /// targets or plain `cuda` (where no sm is pinned).  The fused-adapter
-    /// AST rewrite requires sm >= 80 before emitting the single-FFI path.
+    /// WRGA B.3 Task 4: the CUDA SM `--target` pins (e.g. `cuda_sm80` →
+    /// `Some(80)`).  Returns `None` for `cpu` and for plain `cuda`, where no
+    /// SM is pinned.  The fused-adapter AST rewrite requires sm >= 80 before
+    /// emitting the single-FFI path.
     pub fn target_sm(&self) -> Option<u32> {
-        crate::gpu_target::GpuTarget::parse_sm_version(&self.compile_options.target)
+        crate::gpu_target::CompileTarget::resolve(&self.compile_options.target)
+            .and_then(crate::gpu_target::CompileTarget::pinned_sm)
+    }
+
+    /// The SM CUDA kernels are generated for: the pinned one, or
+    /// `CompileTarget::DEFAULT_CUDA_SM` for plain `cuda`.  `None` on a
+    /// host-only (`cpu`) or unrecognised target.
+    pub(crate) fn cuda_sm(&self) -> Option<u32> {
+        crate::gpu_target::CompileTarget::resolve(&self.compile_options.target)
+            .and_then(crate::gpu_target::CompileTarget::cuda_sm)
     }
 
     /// M42: Look up the first KV compression policy for a specific model layer.

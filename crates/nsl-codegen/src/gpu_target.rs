@@ -28,21 +28,6 @@ impl GpuTarget {
         }
     }
 
-    /// WRGA B.3 Task 4: extract a CUDA sm version from the raw target string,
-    /// if present.  Accepts `cuda_sm80`, `sm_80`, `sm80`.  Returns `None`
-    /// when the target is non-CUDA or carries no sm qualifier.
-    pub fn parse_sm_version(s: &str) -> Option<u32> {
-        let lower = s.to_lowercase();
-        let tail = if let Some(rest) = lower.strip_prefix("cuda_sm") {
-            rest
-        } else if let Some(rest) = lower.strip_prefix("sm_") {
-            rest
-        } else { lower.strip_prefix("sm")? };
-        // Trim any trailing non-digit (e.g. `sm_80a`).
-        let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
-        digits.parse().ok()
-    }
-
     /// Parse from a target string, defaulting to Cuda when empty or
     /// unrecognized.
     ///
@@ -103,10 +88,64 @@ const REMOVED_BACKEND_TARGETS: &[(&str, &str)] = &[
     ("fpga", "FPGA/Verilog"),
 ];
 
-/// `true` for `<prefix><digits>` with at least one digit and nothing after.
-fn is_sm_spelling(s: &str, prefix: &str) -> bool {
-    s.strip_prefix(prefix)
-        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+/// The SM in `<prefix><digits>`: at least one digit, nothing after.
+fn sm_digits(s: &str, prefix: &str) -> Option<u32> {
+    let n = s.strip_prefix(prefix)?;
+    if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    n.parse().ok()
+}
+
+/// What a `--target` string asks the compiler for.
+///
+/// Every spelling [`validate_cli_target`] accepts resolves here, and nothing
+/// else does. Code that branches on the target asks this type rather than
+/// comparing strings: `parse_gpu_sm_from_target` used to accept only `cuda`
+/// and `sm_<N>` and panic on the `sm<N>`, `cuda_sm<N>` and `cpu` the CLI
+/// accepts, and the fused-SDPA tables treated `sm80` as host-only while
+/// `sm_80` got GPU kernels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompileTarget {
+    /// `cpu`: a host-only compile. Nothing that needs a CUDA kernel is
+    /// generated.
+    Cpu,
+    /// `cuda` (no SM pinned), or `sm_<N>` / `sm<N>` / `cuda_sm<N>`.
+    Cuda { pinned_sm: Option<u32> },
+}
+
+impl CompileTarget {
+    /// The SM CUDA kernels are generated for when plain `cuda` pins none.
+    pub const DEFAULT_CUDA_SM: u32 = 80;
+
+    /// Resolve an exact, lowercase `--target` spelling; `None` for anything
+    /// [`validate_cli_target`] refuses.
+    pub fn resolve(s: &str) -> Option<Self> {
+        match s {
+            "cpu" => Some(Self::Cpu),
+            "cuda" => Some(Self::Cuda { pinned_sm: None }),
+            _ => ["sm_", "cuda_sm", "sm"]
+                .iter()
+                .find_map(|prefix| sm_digits(s, prefix))
+                .map(|sm| Self::Cuda { pinned_sm: Some(sm) }),
+        }
+    }
+
+    /// The SM to generate CUDA kernels for; `None` on a host-only compile.
+    pub fn cuda_sm(self) -> Option<u32> {
+        match self {
+            Self::Cpu => None,
+            Self::Cuda { pinned_sm } => Some(pinned_sm.unwrap_or(Self::DEFAULT_CUDA_SM)),
+        }
+    }
+
+    /// The SM the target names explicitly; `None` for `cuda` and `cpu`.
+    pub fn pinned_sm(self) -> Option<u32> {
+        match self {
+            Self::Cpu => None,
+            Self::Cuda { pinned_sm } => pinned_sm,
+        }
+    }
 }
 
 /// Check a user-supplied `--target` value (`nsl build` / `nsl run`).
@@ -115,30 +154,20 @@ fn is_sm_spelling(s: &str, prefix: &str) -> bool {
 /// so the CLI checks the value here before the compiler sees it. Accepted
 /// spellings, all lowercase:
 ///
-/// - `cuda`: the default. Fused-attention PTX is generated for sm_80.
-/// - `sm_<N>` (e.g. `sm_120`): CUDA pinned to an SM. This is the form the
-///   fused-attention tables and the packed-attention planner read.
-/// - `sm<N>` / `cuda_sm<N>`: CUDA, with the SM read by
-///   [`GpuTarget::parse_sm_version`] (the WRGA fused-adapter gate). The
-///   fused SDPA tables are not generated for these spellings.
+/// - `cuda`: the default. CUDA kernels are generated for
+///   [`CompileTarget::DEFAULT_CUDA_SM`].
+/// - `sm_<N>` (e.g. `sm_120`), `sm<N>`, `cuda_sm<N>`: CUDA pinned to an SM.
+///   The three spellings mean the same thing.
 /// - `cpu`: a host-only compile. The CUDA-only fused SDPA variant tables
-///   are not embedded.
+///   are not embedded, and an `@flash_attention` kernel is refused.
 ///
-/// `parse_gpu_sm_from_target` (`compiler/kernel.rs`) parses only `cuda` and
-/// `sm_<N>`, and it panics on any other spelling. So an `@flash_attention`
-/// model compiled with `sm<N>`, `cuda_sm<N>` or `cpu` fails there.
-/// That defect predates this check, and this check does not fix it.
-///
-/// `<N>` must be all digits. A suffix such as `sm_90a` is refused, because
-/// the fused-attention path parses `sm_<N>` strictly and would panic on it.
+/// The accepted set is exactly what [`CompileTarget::resolve`] resolves.
+/// `<N>` must be all digits: a suffix such as `sm_90a` names an
+/// architecture-specific feature set the code generators do not model.
 pub fn validate_cli_target(s: &str) -> Result<(), String> {
     const ACCEPTED: &str = "`cuda`, `sm_<N>` (e.g. `sm_120`; also `sm<N>` and \
                             `cuda_sm<N>`) or `cpu`";
-    if matches!(s, "cuda" | "cpu")
-        || is_sm_spelling(s, "sm_")
-        || is_sm_spelling(s, "sm")
-        || is_sm_spelling(s, "cuda_sm")
-    {
+    if CompileTarget::resolve(s).is_some() {
         return Ok(());
     }
     let lower = s.to_lowercase();
@@ -227,6 +256,27 @@ mod tests {
         assert!(err.contains("`cuda`"), "{err}");
         let err = validate_cli_target("SM_120").expect_err("SM_120");
         assert!(err.contains("`sm_120`"), "{err}");
+    }
+
+    #[test]
+    fn every_accepted_target_resolves_and_the_cuda_spellings_agree() {
+        for ok in ["cuda", "sm_120", "sm80", "cuda_sm80", "cpu"] {
+            assert!(CompileTarget::resolve(ok).is_some(), "{ok}");
+        }
+        for sm_spelling in ["sm_80", "sm80", "cuda_sm80"] {
+            let t = CompileTarget::resolve(sm_spelling).unwrap();
+            assert_eq!(t, CompileTarget::Cuda { pinned_sm: Some(80) }, "{sm_spelling}");
+            assert_eq!(t.cuda_sm(), Some(80), "{sm_spelling}");
+        }
+        let cuda = CompileTarget::resolve("cuda").unwrap();
+        assert_eq!(cuda.cuda_sm(), Some(CompileTarget::DEFAULT_CUDA_SM));
+        assert_eq!(cuda.pinned_sm(), None, "plain cuda pins no SM");
+        let cpu = CompileTarget::resolve("cpu").unwrap();
+        assert_eq!((cpu.cuda_sm(), cpu.pinned_sm()), (None, None));
+        for bad in ["", "CUDA", "sm_90a", "sm_", "cuda_sm", "sm_99999999999", "fpga"] {
+            assert_eq!(CompileTarget::resolve(bad), None, "{bad:?}");
+            assert!(validate_cli_target(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

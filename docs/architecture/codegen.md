@@ -601,10 +601,15 @@ a branch or a loop body is a block parameter at the join or the header — and
 refuses everything else with the innermost node's span.
 `src/gpu_target.rs` (`GpuTarget::Cuda`, re-exporting `FeatureSet`)
 selects the backend, and its `validate_cli_target` is the `--target` value
-parser for `nsl build` / `nsl run`. It accepts `cuda`, `sm_<N>`, `sm<N>`,
-`cuda_sm<N>` and `cpu`, and it refuses the removed backend names (ROCm,
-Metal, WebGPU, FPGA) with the attic tag. That check exists because
-`GpuTarget::from_target_string` maps any unknown string to CUDA.
+parser for `nsl build` / `nsl run`. It accepts exactly what
+`CompileTarget::resolve` resolves -- `cuda`, `sm_<N>`, `sm<N>`, `cuda_sm<N>`
+and `cpu` -- and it refuses the removed backend names (ROCm, Metal, WebGPU,
+FPGA) with the attic tag. That check exists because
+`GpuTarget::from_target_string` maps any unknown string to CUDA. Code that
+branches on the target asks `CompileTarget` (via `Compiler::cuda_sm` /
+`Compiler::target_sm`) rather than comparing strings: the three SM spellings
+mean the same thing, plain `cuda` generates for sm_80, and a host-only `cpu`
+compile refuses `@flash_attention`.
 `Compiler::compile_kernels` (`src/compiler/kernel.rs`) lowers to KIR and
 prints it with `backend_ptx`. `@autotune` substitutes its constants into the AST
 (`kernel_lower::substitute_constants`) before lowering. PTX bytes are

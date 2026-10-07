@@ -260,12 +260,10 @@ train(model = m, epochs = 1):
             ..Default::default()
         },
         // Post-Gap-F, `compile_flash_attention_kernels` descends into
-        // `ModelMember::Method` decorators (the fix for DOC-GAP A).
-        // That path feeds through `parse_gpu_sm_from_target`, which
-        // panics on the default `"cuda"` target string (it expects
-        // `sm_<N>`).  Pick `sm_75` to match the Gap D.1 test's
-        // `gpu_sm: 75`; any valid `sm_<N>` would do since this test
-        // only inspects relocations, not PTX contents.
+        // `ModelMember::Method` decorators (the fix for DOC-GAP A), so the
+        // target's SM reaches the kernel config.  Pin `sm_75` to match
+        // the Gap D.1 test's `gpu_sm: 75`; any CUDA target would do since
+        // this test only inspects relocations, not PTX contents.
         target: "sm_75".to_string(),
         ..Default::default()
     };

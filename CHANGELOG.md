@@ -1834,6 +1834,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **Every accepted `--target` spelling now compiles `@flash_attention`
+  instead of panicking.**
+  - **The bug.** The CLI accepted `cuda`, `sm_<N>`, `sm<N>`, `cuda_sm<N>` and
+    `cpu`, but `parse_gpu_sm_from_target` parsed only `cuda` and `sm_<N>`. On
+    the other three, an `@flash_attention` compile panicked.
+  - **A related inconsistency.** The fused-SDPA variant tables and the
+    packed-attention planner treated `sm80` and `cuda_sm80` as host-only:
+    null kernels and the CPU backward. `sm_80` got the GPU kernels.
+  - **The fix.** `gpu_target::CompileTarget::resolve` maps every accepted
+    spelling to `Cpu` or `Cuda { pinned_sm }`, and every consumer asks it.
+    - The three SM spellings now mean the same thing.
+    - Plain `cuda` generates for sm_80, as before.
+    - `--target cpu` refuses `@flash_attention` with a typed error.
+    - `validate_cli_target` accepts exactly what the resolver resolves.
+    - The looser `GpuTarget::parse_sm_version`, which accepted uppercase and
+      `sm_90a`, is gone.
+
 - **Numerical gates refuse NaN instead of scoring it a perfect match**
   (external review 2026-10-06, finding 2).
   - **How NaN was dropped.** Error metrics folded with `f32::max` (which

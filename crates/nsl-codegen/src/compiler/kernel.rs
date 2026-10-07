@@ -8,25 +8,31 @@ use nsl_ast::stmt::{Stmt, StmtKind};
 
 use super::{Compiler, FlashAttentionCompileContext, SdpaBwdVariant};
 use crate::error::CodegenError;
+use crate::gpu_target::CompileTarget;
 
-/// Parse the numeric SM version from a target string like `"sm_90"` → `90`.
+/// The SM to generate an `@flash_attention` kernel for.
 ///
-/// Accepts the generic `"cuda"` alias (used as `CompileOptions::default()`)
-/// and maps it to sm_80 (Ampere, the earliest SM that has every feature
-/// the current PTX emitters need). Concrete targets like `sm_75` always
-/// take precedence when the user passes one explicitly.
-///
-/// Panics with a clear message on an unrecognised format so that a
-/// misconfigured compile target is caught at compile time rather than
-/// silently routing to the wrong PTX path.
-pub(crate) fn parse_gpu_sm_from_target(target: &str) -> u32 {
-    if target == "cuda" {
-        return 80;
+/// Every `--target` spelling the CLI accepts resolves
+/// ([`CompileTarget::resolve`]): plain `cuda` maps to
+/// [`CompileTarget::DEFAULT_CUDA_SM`] (sm_80, the earliest SM with every
+/// feature the PTX emitters need), and `sm_<N>`, `sm<N>` and `cuda_sm<N>`
+/// all pin `N`. A host-only `cpu` compile has no SM, so the kernel is
+/// refused rather than generated for a device that is not there. This
+/// panicked on every spelling but `cuda` and `sm_<N>` until the resolver
+/// existed.
+pub(crate) fn parse_gpu_sm_from_target(target: &str) -> Result<u32, CodegenError> {
+    match CompileTarget::resolve(target) {
+        Some(resolved) => resolved.cuda_sm().ok_or_else(|| {
+            CodegenError::new(
+                "@flash_attention generates a CUDA kernel, but `--target cpu` is a \
+                 host-only compile; use `--target cuda` or `--target sm_<N>`",
+            )
+        }),
+        None => Err(CodegenError::new(format!(
+            "unrecognised compile target `{target}`: expected `cuda`, `sm_<N>`, \
+             `sm<N>`, `cuda_sm<N>` or `cpu`"
+        ))),
     }
-    target
-        .strip_prefix("sm_")
-        .and_then(|n| n.parse().ok())
-        .unwrap_or_else(|| panic!("invalid compile target: {target}"))
 }
 
 /// Gap B: does the top-level statement list contain at least one
@@ -1718,7 +1724,7 @@ impl Compiler<'_> {
                     gqa_group_size,
                     tree_mask,
                     num_sink_tokens,
-                    gpu_sm: parse_gpu_sm_from_target(&self.compile_options.target),
+                    gpu_sm: parse_gpu_sm_from_target(&self.compile_options.target)?,
                     segment_masked: false,
                     csha: None,
                     checkpoint: None,
@@ -1802,7 +1808,7 @@ impl Compiler<'_> {
                 gqa_group_size,
                 tree_mask,
                 num_sink_tokens,
-                gpu_sm: parse_gpu_sm_from_target(&self.compile_options.target),
+                gpu_sm: parse_gpu_sm_from_target(&self.compile_options.target)?,
                 segment_masked: false,
                 csha: None,
                 checkpoint: None,
@@ -1920,7 +1926,7 @@ impl Compiler<'_> {
                 gqa_group_size,
                 tree_mask,
                 num_sink_tokens,
-                gpu_sm: parse_gpu_sm_from_target(&self.compile_options.target),
+                gpu_sm: parse_gpu_sm_from_target(&self.compile_options.target)?,
                 segment_masked: false,
                 csha: None,
                 checkpoint: None,
@@ -2109,22 +2115,18 @@ impl Compiler<'_> {
         if let Some(table) = self.kernels.sdpa_bwd_variants.get(&(causal, segment_masked)) {
             return Ok(table.clone());
         }
-        // The classic backward PTX is CUDA-only, and `parse_gpu_sm_from_target`
-        // PANICS on anything but "cuda"/"sm_<N>". The decorated path only
-        // reaches it behind an @flash_attention decorator, but this lazy path
-        // fires for EVERY decorator-free SDPA train compile — including
-        // `--target cpu|cuda_sm<N>`, which compiled fine before the
-        // variant table existed (null pointers → CPU backward). Keep exactly
-        // that behavior for those targets: an empty table lowers to null
-        // pointers, no panic.
-        let target = self.compile_options.target.as_str();
-        if target != "cuda" && !target.starts_with("sm_") {
+        // The classic backward PTX is CUDA-only. This lazy path fires for
+        // EVERY decorator-free SDPA train compile, so a host-only (`cpu`) or
+        // unrecognised target gets an empty table, which lowers to null
+        // pointers and the CPU backward. Every CUDA spelling gets the table:
+        // `sm<N>` and `cuda_sm<N>` used to fall to the CPU path here while
+        // `sm_<N>` got GPU kernels.
+        let Some(gpu_sm) = self.cuda_sm() else {
             self.kernels
                 .sdpa_bwd_variants
                 .insert((causal, segment_masked), Vec::new());
             return Ok(Vec::new());
-        }
-        let gpu_sm = parse_gpu_sm_from_target(&self.compile_options.target);
+        };
         let c = i64::from(causal);
         let sm = i64::from(segment_masked);
         let mut table = Vec::with_capacity(SDPA_BWD_VARIANT_HEAD_DIMS.len());
@@ -2207,14 +2209,12 @@ impl Compiler<'_> {
         if let Some(table) = self.kernels.sdpa_fwd_variants.get(&(causal, segment_masked)) {
             return Ok(table.clone());
         }
-        let target = self.compile_options.target.as_str();
-        if target != "cuda" && !target.starts_with("sm_") {
+        let Some(gpu_sm) = self.cuda_sm() else {
             self.kernels
                 .sdpa_fwd_variants
                 .insert((causal, segment_masked), Vec::new());
             return Ok(Vec::new());
-        }
-        let gpu_sm = parse_gpu_sm_from_target(&self.compile_options.target);
+        };
         let c = i64::from(causal);
         let sm = i64::from(segment_masked);
         let mut table = Vec::with_capacity(SDPA_FWD_VARIANT_HEAD_DIMS.len());
