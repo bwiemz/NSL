@@ -6,8 +6,7 @@ is that a hardware engineer can tell exactly which GPU/accelerator claims are
 trustworthy today.
 
 See also: [`STATUS.md`](../../STATUS.md) for the overall stable/beta/experimental
-tiering, and [`cuda_status.md`](cuda_status.md) / [`fpga_status.md`](fpga_status.md)
-for per-backend detail.
+tiering, and [`cuda_status.md`](cuda_status.md) for per-backend detail.
 
 ## Validation vocabulary
 
@@ -28,7 +27,7 @@ for per-backend detail.
 | AMDGPU / ROCm    | —                                 | Removed       | Never hardware-validated; removed in the Phase 0.6 scope freeze (tag `attic/scope-freeze-2026-10`). |
 | Metal            | —                                 | Removed       | Never hardware-validated; removed in the Phase 0.6 scope freeze (tag `attic/scope-freeze-2026-10`). |
 | WGSL / WebGPU    | —                                 | Removed       | Never hardware-validated; removed in the Phase 0.6 scope freeze (tag `attic/scope-freeze-2026-10`). |
-| FPGA / Verilog   | (lint/sim/synth only)             | Experimental  | Verilator + Yosys nightly job; see [`fpga_status.md`](fpga_status.md) |
+| FPGA / Verilog   | —                                 | Removed       | Never run on an FPGA (lint/sim/synth only, no vendor flow); removed in the Phase 0.6 scope freeze (tag `attic/scope-freeze-2026-10`). |
 
 > The single concrete GPU validation point today is **RTX 5070 Ti (sm_120)**,
 > where the FlashAttention-v2 D pre-pass matched the CPU reference bit-exactly

@@ -632,7 +632,6 @@ const NOT_A_PASS: &[(&str, &str)] = &[
     ("ad_rules", "adjoint rules table consumed by source-AD, not a pass"),
     ("agent", "M56 agent-memory feature"),
     ("autotune", "kernel autotuner, invoked BY passes rather than being one"),
-    ("backend_", "target backends (verilog; the PTX printer lives in nsl-kir)"),
     ("bin", "binaries, not library modules"),
     ("bitnet", "M35 BitNet quantized-model support"),
     ("builtins", "FFI symbol registration (language-facing half of the registry)"),
@@ -652,7 +651,6 @@ const NOT_A_PASS: &[(&str, &str)] = &[
     ("ffi_ownership", "FFI ownership annotations"),
     ("flash_attention", "attention kernel emitter + selector"),
     ("fp8", "FP8 dtype support"),
-    ("fpga_error", "FPGA backend errors"),
     ("func", "function lowering"),
     ("fused_linear_ce", "fused loss kernel emitter"),
     (
@@ -674,7 +672,6 @@ const NOT_A_PASS: &[(&str, &str)] = &[
     ("gpu_spec", "GPU capability tables"),
     ("gpu_target", "GPU target selection"),
     ("grammar_compiler", "CFIE grammar compilation"),
-    ("hir", "high-level IR"),
     (
         "ctor_fold",
         "item 5: constant-folds constructor arguments into model-field dims \

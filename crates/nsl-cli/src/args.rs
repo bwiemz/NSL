@@ -233,38 +233,6 @@ pub(crate) enum Cli {
         max_token_bytes: usize,
     },
 
-    /// M57: Compile an NSL file to synthesizable Verilog for FPGA targets.
-    ///
-    /// NOTE: --target fpga is not yet end-to-end functional.
-    /// PRs 1-4 shipped the HIR + KIR->HIR + HIR->Verilog + Yosys-gate +
-    /// fixture infrastructure (M57 milestone).  AST -> structured KIR dispatch,
-    /// HIR port/wire generation, and CLI dispatch wiring are deferred to
-    /// M57.1 (v1 closure follow-on).
-    FpgaCompile {
-        /// Path to the .nsl file to compile
-        file: PathBuf,
-
-        /// Output directory for the emitted .v file
-        #[arg(short, long)]
-        output_dir: Option<PathBuf>,
-
-        /// Path to the weight fixture binary (.bin) for the v1 MLP.
-        /// Defaults to <input_dir>/<source_basename>_weights.bin (sidecar convention).
-        /// See spec §6.1 for the sidecar lookup rules.
-        #[arg(long)]
-        fixture: Option<PathBuf>,
-
-        /// Emit test-tap ports on all intermediate signals (Layer 2 + Layer 3 gates).
-        /// Only valid with --target fpga.
-        #[arg(long)]
-        test_taps: bool,
-
-        /// M57.2: emit the clocked sequential FSM instead of the combinational netlist.
-        /// Prints `total_cycles=<N>` to stdout after writing the .v file.
-        #[arg(long)]
-        seq: bool,
-    },
-
     /// Report static per-kernel PTX metadata (declared registers, shared
     /// memory, target SM) parsed from a synthesized `.ptx` file. Pure text
     /// analysis — no GPU or CUDA toolkit required.
@@ -626,7 +594,7 @@ pub(crate) struct BuildArgs {
         pub(crate) linear_types: bool,
 
         /// Compile target: cuda (default), sm_<N> (e.g. sm_120; also sm<N>,
-        /// cuda_sm<N>), cpu, or fpga. The ROCm, Metal and WebGPU backends were
+        /// cuda_sm<N>), or cpu. The ROCm, Metal, WebGPU and FPGA backends were
         /// removed (tag attic/scope-freeze-2026-10); naming one is an error
         #[arg(long, default_value = "cuda", value_parser = parse_target_arg)]
         pub(crate) target: String,
@@ -1221,7 +1189,7 @@ pub(crate) struct RunArgs {
         pub(crate) decode_workers: u32,
 
         /// Compile target: cuda (default), sm_<N> (e.g. sm_120; also sm<N>,
-        /// cuda_sm<N>), cpu, or fpga. The ROCm, Metal and WebGPU backends were
+        /// cuda_sm<N>), or cpu. The ROCm, Metal, WebGPU and FPGA backends were
         /// removed (tag attic/scope-freeze-2026-10); naming one is an error
         #[arg(long, default_value = "cuda", value_parser = parse_target_arg)]
         pub(crate) target: String,
@@ -1810,13 +1778,13 @@ mod target_flag_tests {
 
     /// Before the scope freeze, an unknown `--target` compiled CUDA kernels
     /// without any error (`GpuTarget::from_target_string` falls back to CUDA).
-    /// After the ROCm/Metal/WebGPU removal, `--target rocm` would have done
-    /// the same. Both subcommands must refuse it at parse time and name the
-    /// tag that preserves the removed code.
+    /// After the ROCm/Metal/WebGPU and FPGA removals, `--target rocm` or
+    /// `--target fpga` would have done the same. Both subcommands must refuse
+    /// it at parse time and name the tag that preserves the removed code.
     #[test]
     fn a_removed_backend_is_refused_on_build_and_run() {
         for sub in ["build", "run"] {
-            for removed in ["rocm", "metal", "webgpu", "hip", "wgsl"] {
+            for removed in ["rocm", "metal", "webgpu", "hip", "wgsl", "fpga"] {
                 let err = parse(&["nsl", sub, "--target", removed, "m.nsl"])
                     .expect_err("a removed backend must not parse");
                 assert!(err.contains("removed"), "{sub} --target {removed}: {err}");
@@ -1841,13 +1809,13 @@ mod target_flag_tests {
     }
 
     /// The spellings the tree already passes: the default, the SM forms the
-    /// GPU gates use (`sm_89`, `cuda_sm80`, `cuda_sm70`), `cpu` (the CSLA
-    /// packed-GQA CPU parity gate), and `fpga`.
+    /// GPU gates use (`sm_89`, `cuda_sm80`, `cuda_sm70`), and `cpu` (the CSLA
+    /// packed-GQA CPU parity gate).
     #[test]
     fn the_accepted_targets_parse_on_build_and_run() {
         for sub in ["build", "run"] {
             assert!(parse(&["nsl", sub, "m.nsl"]).is_ok(), "{sub} default target");
-            for ok in ["cuda", "sm_120", "sm_89", "sm80", "cuda_sm80", "cuda_sm70", "cpu", "fpga"] {
+            for ok in ["cuda", "sm_120", "sm_89", "sm80", "cuda_sm80", "cuda_sm70", "cpu"] {
                 assert!(
                     parse(&["nsl", sub, "--target", ok, "m.nsl"]).is_ok(),
                     "{sub} --target {ok}: {:?}",

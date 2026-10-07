@@ -27,15 +27,15 @@ because several commands need them: `has_train_block` (a module contains a
 `TrainBlock` or `DistillBlock`) and the `nsl doc stdlib` root lookup that
 reports "no stdlib directory found (looked at $NSL_STDLIB_PATH, ...)".
 
-**`args.rs`** is the clap tree, ~1,900 lines, all `pub(crate)`. `enum Cli`
+**`args.rs`** is the clap tree, ~1,800 lines, all `pub(crate)`. `enum Cli`
 has the variants `Check(CheckArgs)`, `Run(RunArgs)`, `Build(BuildArgs)`,
 `Test`, `Export`, `Convert`, `Init`, `Fmt`, `Debug`, `Profile`, `Autotune`, `Tokenize`,
-`FpgaCompile`, `PtxMetadata`, `Env { cmd: EnvCmd }` (`List`, `Current`),
+`PtxMetadata`, `Env { cmd: EnvCmd }` (`List`, `Current`),
 and `Doc { cmd: DocCmd }` (`Cli`, `Stdlib`). `BuildArgs` and `RunArgs`
 declare every shared compile flag **twice** — a `--source-ad` field exists in
 both — which is the drift the flag contract below exists to police.
 
-**`commands/`** holds one file per subcommand (25 files):
+**`commands/`** holds one file per subcommand (23 files):
 
 | File | Command |
 |---|---|
@@ -49,7 +49,6 @@ both — which is the drift the flag contract below exists to police.
 | `init.rs` | `nsl init` — project scaffolding |
 | `autotune.rs` | `nsl autotune` — measure `@autotune` kernel variants on this GPU |
 | `tokenize.rs` | `nsl tokenize` — train a BPE tokenizer over source directories |
-| `fpga.rs` | `nsl fpga-compile` — NSL → KIR → HIR → Verilog (experimental) |
 | `ptx_metadata.rs` | `nsl ptx-metadata` — static per-kernel resource report for a `.ptx` |
 | `env.rs` | `nsl env list` / `nsl env current` |
 | `cep.rs`, `cpkd_design.rs`, `profile_merge.rs`, `mod.rs` | CEP pruning frontend, CPKD design-student check, trace merging for `nsl run --profile`, shared helpers |
@@ -244,7 +243,7 @@ GPU gates above); CI runs the e2e suite and `zero_spmd_gate` that way.
 | `doc-agreement` | `scripts/check-doc-agreement.sh` (roadmap item 21): claims in docs about the tree (paths, counts, names) still hold |
 | `gpu-gate-inventory` | `scripts/gpu-cert.sh --check-inventory` / `--check-reasons` / `--check-long-arms` against `ci/gpu-cert-manifest.tsv`, with anti-vacuity steps that delete gates and expect the check to fail |
 | `hand-ptx-freeze` | `scripts/hand-ptx-freeze.sh`: no new hand-written PTX kernels |
-| `test-onnx-rt`, `python-interop`, `fpga` | The ORT custom-op build and Python E2E; `python/tests` against a CPU torch; the Verilator/Yosys FPGA layers |
+| `test-onnx-rt`, `python-interop` | The ORT custom-op build and Python E2E; `python/tests` against a CPU torch |
 
 The design-only enforcement gate is a **separate workflow**,
 `.github/workflows/design_only_enforcement.yml` (M35.2): it checks that

@@ -23,7 +23,7 @@
 //! - [`analysis`] — cost model, autotuning, fusion, memory planning,
 //!   FlashAttention codegen, calibration.
 //! - [`experimental`] — research subsystems (CEP, CFIE, CSHA, WGGO, WRGA,
-//!   FASE, FPGA, sparse, speculative, multimodal). These APIs
+//!   FASE, sparse, speculative, multimodal). These APIs
 //!   are **not stable** and may change or be removed between releases.
 //!
 //! These facades re-export the same modules that remain available at the crate
@@ -281,12 +281,6 @@ pub mod wrga_prune;
 pub mod wrga_roofline;
 pub mod wrga_spectral;
 
-// FPGA / hardware-synthesis path (experimental).
-pub mod backend_verilog;
-pub mod fpga_error;
-pub mod hir;
-pub mod kernel_lower_fpga;  // M57.1 §3.3
-
 // ===========================================================================
 // Subsystem facade namespaces
 //
@@ -362,11 +356,6 @@ pub mod experimental {
         wrga_fused_ptx, wrga_fusion, wrga_kernel_helpers, wrga_memory,
         wrga_prescan, wrga_prune, wrga_roofline, wrga_spectral,
     };
-
-    /// FPGA / hardware-synthesis path (Verilog emission, HIR lowering).
-    pub mod fpga {
-        pub use crate::{backend_verilog, fpga_error, hir, kernel_lower_fpga};
-    }
 }
 
 /// Binary-internal modules re-exposed at the library level so integration
@@ -411,11 +400,6 @@ pub use compiler::{
     compile_test, compile_with_profile_captures,
     StandaloneConfig,
 };
-
-/// M57.1 §3.2: re-exported from the (private) `compiler::kernel` module so that
-/// integration tests can pin the production redirect message without copying
-/// the literal. See `tests/fpga_target_redirect.rs`.
-pub use crate::compiler::kernel::FPGA_TARGET_REDIRECT_MSG;
 
 /// Task 4 test helper: compile a module and return any `WrgaPlan` produced
 /// during `@train` block lowering.  The plan is returned even when codegen

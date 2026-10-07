@@ -254,8 +254,7 @@ source of truth. Read local results against the tier a command belongs to.
 - `cargo test --workspace --no-fail-fast -- --skip e2e_`
 - `cargo clippy --workspace -- -D warnings`
 - `cargo test -p nsl-cli --test e2e -- --test-threads=1` (CLI smoke/e2e)
-- the ONNX Runtime integration job (`test-onnx-rt`) and the FPGA
-  Verilator/Yosys job (`fpga`)
+- the ONNX Runtime integration job (`test-onnx-rt`)
 
 Locally, the test and e2e steps can surface *environment-specific* failures
 (missing C linker, OpenSSL, or CUDA) that do not occur on CI's pinned
@@ -271,7 +270,7 @@ The **compatibility contract** — what is promised not to break across
 versions — is narrower than the CI gate: it is the **Stable** tier in
 [`STATUS.md`](STATUS.md) (frontend, semantic analysis, CPU codegen/runtime,
 fusion, DataLoader, core CLI). Beta and Experimental subsystems (`experimental::*`
-in `nsl-codegen`/`nsl-runtime` — CEP, CFIE, CSHA, WGGO, WRGA, FPGA, …) are
+in `nsl-codegen`/`nsl-runtime` — CEP, CFIE, CSHA, WGGO, WRGA, …) are
 exercised by CI but may change shape between releases. See each crate's
 `ARCHITECTURE.md` for the stable-vs-experimental module boundary.
 

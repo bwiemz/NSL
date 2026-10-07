@@ -60,14 +60,14 @@ The boring, must-always-work core.
 - **DataLoader** — zero-copy mmap tokenized-data loading (M19).
 - **CLI** — `nsl check`, `nsl run`, `nsl build`, `nsl fmt`, `nsl test` carry
   the stability promise. The full shipped surface is larger (`export, convert,
-  init, debug, profile, autotune, tokenize, fpga-compile, ptx-metadata`) —
+  init, debug, profile, autotune, tokenize, ptx-metadata`) —
   those ride their subsystem's tier, not this one.
 
 **Compatibility contract:** only the Stable tier above carries a cross-version
 "won't break" promise. That promise is *narrower* than the **CI merge gate** —
 CI blocks every PR on more than just the Stable tier (build, workspace unit
-tests, clippy, the CLI e2e suite on Linux/Windows, and the ONNX-RT and FPGA
-jobs). `.github/workflows/ci.yml` is the source of truth; the table at the
+tests, clippy, the CLI e2e suite on Linux/Windows, and the ONNX-RT job).
+`.github/workflows/ci.yml` is the source of truth; the table at the
 bottom of this file maps each tier to what CI runs.
 
 ```bash
@@ -173,15 +173,16 @@ tests that are *not* part of the green-build contract (see README → Benchmarks
   **Removed** in the Phase 0.6 scope freeze; preserved at tag
   `attic/scope-freeze-2026-10`. `@zk_proof`/`@zk_lookup` are refused with the
   tag.
-- **FPGA / Verilog** — HDL backend (Yosys/Verilator nightly job). See
-  [`docs/hardware/fpga_status.md`](docs/hardware/fpga_status.md).
+- **FPGA / Verilog** (M57: HIR, Verilog emission, `nsl fpga-compile`,
+  `--target fpga`) — **Removed** in the Phase 0.6 scope freeze; preserved at
+  tag `attic/scope-freeze-2026-10`. `--target fpga` is refused with the tag.
 - **Unikernel** (M54) — **Removed** in the Phase 0.6 scope freeze; preserved at
   tag `attic/scope-freeze-2026-10`.
 - **Distributed** — tensor / pipeline / context parallelism, MoE serving.
 - **Inference serving** — speculative decoding, paged KV, disaggregated serving.
 - **Non-CUDA GPU backends** (M47: AMDGPU/ROCm, Metal, WGSL/WebGPU KIR printers)
   — **Removed** in the Phase 0.6 scope freeze; preserved at tag
-  `attic/scope-freeze-2026-10`. `--target` accepts only CUDA spellings (plus `cpu`/`fpga`)
+  `attic/scope-freeze-2026-10`. `--target` accepts only CUDA spellings (plus `cpu`)
   and refuses the removed names.
 - **SR-BF16 parameter storage** — `--param-dtype bf16-sr` (stochastic
   rounding). Mechanism + refusals complete; a real-corpus differential found
@@ -204,7 +205,7 @@ cargo build -p nsl-codegen --no-default-features --features "<keep these>"
 ```
 
 Currently gated at their entry point: `experimental-wrga`, `experimental-cpdt`
-(in `crates/nsl-codegen/Cargo.toml`, both in `default`). WGGO/CSHA/FPGA
+(in `crates/nsl-codegen/Cargo.toml`, both in `default`). WGGO/CSHA
 follow the same pattern as gating is extended. See
 [`docs/architecture/compiler-state.md`](docs/architecture/compiler-state.md)
 for the compiler-state model (and the thread-local audit + migration plan that
@@ -264,10 +265,10 @@ they collide with identically-named fields on other structs.
 |--------------|------------------------------------------------------|-------------------------------------------|
 | Stable       | build, clippy, workspace unit tests (`--skip e2e_`)  | Miri on the CPU tensor tests (`scripts/miri-cpu-tensor.sh`, nightly toolchain, by hand) |
 | Beta         | CLI e2e (Linux/Windows), ONNX-RT integration job     | real-CUDA-device tests, perf baselines    |
-| Experimental | `fpga` job (build + Yosys gate)                      | full Verilator/Yosys diagnostic (**nightly** workflow), `#[ignore]`'d research tests, macOS e2e |
+| Experimental | no job of its own (its tests run in the Stable row's workspace suite) | `#[ignore]`'d research tests, macOS e2e |
 
-CI jobs are cumulative — the Beta/Experimental rows run *in addition to* the
-Stable row on every PR (they are separate, blocking CI jobs, not nightly).
+CI jobs are cumulative — the Beta row runs *in addition to* the Stable row on
+every PR (its jobs are separate, blocking CI jobs, not nightly).
 Six drift gates also block every PR outside the tier table: `version-agreement`
 (Cargo == spec/README/CLI/C API/python), `doc-agreement` (docs == tree),
 `gpu-gate-inventory` (cert-lane manifest == tree), `hand-ptx-freeze` (no file

@@ -87,7 +87,6 @@ including the autodiff `TAPE` itself.)
 | Location | State | Class | Notes |
 |----------|-------|-------|-------|
 | `nsl-codegen/src/lib.rs` | `ADJOINT_OPS_DROPPED`, `ALLOC_SLOTS_PRE_HINT`, `ALLOC_SLOTS_POST_HINT`, `CONSUME_HINTS_CALLS` | TEST | Source-AD / allocator instrumentation counters, read via `debug_*` accessors by tests only. |
-| `nsl-codegen/src/hir/ids.rs` | `WIRE_ID_COUNTER`, `REGISTER_ID_COUNTER`, `GENVAR_ID_COUNTER` | TEST | FPGA HIR id generation (macro-declared), reset by `KirToHirPass::lower`. Per-thread BY DESIGN: a process-global atomic would break snapshot tests under parallel sharding. Note: these do shape emitted HIR id values, so they are the one TEST entry with artifact influence — a lowering-context field is the eventual home. |
 | `nsl-codegen/src/pass_trace.rs` | `CURRENT_PHASE` | FFI/RUNTIME-OK | Active driver phase for trace attribution — written during every production compile and read by `NSL_PASS_TRACE` reporting, so not test-only; diagnostic-only either way. |
 | `nsl-codegen/src/pass_trace.rs` | `CURRENT_EPOCH` | MIGRATE (compile) | Per-compile attribution scope, added with the pass manager's ordering decision. Thread-local strictly BEATS the process-global counter it replaced (a compile never spans threads, and a process-global let one thread's compile claim another's pass invocations) — but unlike `CURRENT_PHASE` it is not diagnostic-only: `per_compile_view` is what the manager ENFORCES ordering from, so a wrong epoch is a wrong refusal. The only compile-side MIGRATE row; last in priority, not first, because its explicit home (an epoch owned by `PassManager` and handed to `record`) means threading a parameter through 32 ambient call sites in unrelated passes. |
 | `nsl-codegen/src/pass_manager.rs` | `SCANNED_TAPES` | TEST | The scheduler's before/after tape digests, keyed `(epoch, pass)`. Written only when a pass is scheduled WITH a tape and read only by `assert_tape_unchanged_since`, whose sole caller is the WRGA arm — so it steers a refusal, not an artifact, and the digest is never consulted on a passing compile. Retired in `PassManager::drop`, so it cannot outlive its epoch. Thread-local for the same reason as `CURRENT_EPOCH`: a compile never spans threads, and a process-global map would let one thread's compile match another's digest. Added by #499 and MISSING from this table until the drift gate said so — the gate works. |
@@ -152,9 +151,8 @@ clusters — do NOT build one mega-context:
    half is the model-method readers (`expr/advanced.rs`), a DIFFERENT
    Cranelift function: reaching them means either a hidden parameter in
    emitted method signatures or an opaque handle — an ABI change
-   (`declaration.rs` signature build, `c_wrapper.rs`, FPGA lowering's
-   params[0] assertion), which is why 3b needs its own design rather than
-   a mechanical sweep.
+   (`declaration.rs` signature build, `c_wrapper.rs`), which is why 3b
+   needs its own design rather than a mechanical sweep.
 2. **Autodiff/execution session**: `TAPE`, `TRAINING_MODE`, `TENSOR_SCOPE`,
    `INPLACE_SUPPRESS_DEPTH` (decide the last one's fate first — its
    production reader is dead).

@@ -15,7 +15,7 @@ name: fuzz-nightly
 
 on:
   schedule:
-    - cron: '30 6 * * *'  # daily at 06:30 UTC, after fpga-nightly
+    - cron: '30 6 * * *'  # daily at 06:30 UTC
   pull_request:
     paths:
       - '.github/workflows/fuzz-nightly.yml'

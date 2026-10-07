@@ -305,6 +305,9 @@ block_kv with fused projections) are rejected at compile time.
 ### WCET Analysis (M53) — removed
 - Removed in the Phase 0.6 scope freeze (`--wcet`, `--wcet-cert`, `--wcet-target`, `--cpu`, `--do178c-report`, `--fpga-device` on `nsl build`/`nsl run`, and the `@real_time`/`@wcet_budget` decorators are gone; the two decorators now get a refusal that names the tag); preserved at tag `attic/scope-freeze-2026-10`
 
+### FPGA / Verilog (M57) — removed
+- Removed in the Phase 0.6 scope freeze (`nsl fpga-compile`, the HIR, the Verilog emitter and the KIR→HIR lowering are gone; `--target fpga` now gets a refusal that names the tag); preserved at tag `attic/scope-freeze-2026-10`
+
 ---
 
 ## Compile-Time Analysis Tools
@@ -384,7 +387,7 @@ Milestone work from M9-M55 is present in the repo, with maturity ranging from pr
 ### Future (M56-M71)
 | Phase | Milestones | Theme |
 |-------|-----------|-------|
-| v1.0 | M56-M62 | Multi-agent, FPGA, elastic fault tolerance, cluster debugging |
+| v1.0 | M56-M62 | Multi-agent, elastic fault tolerance, cluster debugging (the M57 FPGA backend was removed in the Phase 0.6 scope freeze) |
 | v1.1 | M63-M64 | Compiled MCTS tree search, online DPO alignment |
 | v1.2 | M65-M67 | Ternary 1.58-bit types, format-agnostic sparsity, neuromorphic |
 | v1.3 | M68-M71 | Refinement types (Z3 SMT), phase-split inference |

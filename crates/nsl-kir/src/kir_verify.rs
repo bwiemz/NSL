@@ -56,9 +56,7 @@
 //!      has no parameters (`EntryBlockHasParams`). Roadmap A2 step 2: this
 //!      is how a loop-carried value is written without phi nodes.
 //!
-//! Untyped variables (`KirBuilder::new_var`) are exempt from rule 4 only;
-//! the FPGA-only structured ops (`Matmul`, `ElementwiseAdd`, `Relu`) carry
-//! their dtypes inline and are checked for rules 1–3 only.
+//! Untyped variables (`KirBuilder::new_var`) are exempt from rule 4 only.
 //!
 //! `kernel_lower::lower_kernel_to_ir` — the AST → KIR front door — runs
 //! the verifier and refuses a kernel that fails it with a `CodegenError`
@@ -763,9 +761,6 @@ pub fn op_dst(op: &KirOp) -> Option<VarId> {
         | KirOp::LoadVec { .. }
         | KirOp::StoreVec { .. }
         | KirOp::Predicated { .. } => None,
-        KirOp::Matmul { out, .. } | KirOp::ElementwiseAdd { out, .. } | KirOp::Relu { out, .. } => {
-            Some(*out)
-        }
     }
 }
 
@@ -845,8 +840,6 @@ pub fn op_uses(op: &KirOp) -> Vec<VarId> {
         | KirOp::Const(_, _)
         | KirOp::Barrier
         | KirOp::SharedMemFence => vec![],
-        KirOp::Matmul { a, b, .. } | KirOp::ElementwiseAdd { a, b, .. } => vec![*a, *b],
-        KirOp::Relu { a, .. } => vec![*a],
     }
 }
 
@@ -1273,10 +1266,7 @@ fn check_types(
         KirOp::CpAsyncCommit
         | KirOp::CpAsyncWait { .. }
         | KirOp::Barrier
-        | KirOp::SharedMemFence
-        | KirOp::Matmul { .. }
-        | KirOp::ElementwiseAdd { .. }
-        | KirOp::Relu { .. } => {}
+        | KirOp::SharedMemFence => {}
     }
     if let KirOp::AddRn(d, ..) | KirOp::SubRn(d, ..) | KirOp::MulRn(d, ..) = op
         && let Some(found) = ir.var_types.get(d)

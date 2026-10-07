@@ -2,18 +2,17 @@
 //! M47: GPU target selection and feature capability detection.
 //!
 //! CUDA is the only GPU backend. The ROCm/AMDGPU, Metal and WebGPU/WGSL
-//! printers were removed in the Phase 0.6 scope freeze; the code is preserved
-//! at tag [`REMOVED_BACKENDS_ATTIC_TAG`].
+//! printers and the FPGA/Verilog backend were removed in the Phase 0.6 scope
+//! freeze; the code is preserved at tag [`REMOVED_BACKENDS_ATTIC_TAG`].
 
-/// The tag that preserves the removed ROCm/AMDGPU, Metal and WebGPU/WGSL
-/// backends. Named in every refusal of those targets.
+/// The tag that preserves the removed ROCm/AMDGPU, Metal, WebGPU/WGSL and
+/// FPGA/Verilog backends. Named in every refusal of those targets.
 pub const REMOVED_BACKENDS_ATTIC_TAG: &str = "attic/scope-freeze-2026-10";
 
 /// GPU compilation target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GpuTarget {
     Cuda,
-    Fpga,  // M57 v1: FPGA Verilog backend
 }
 
 impl GpuTarget {
@@ -22,7 +21,6 @@ impl GpuTarget {
         let lower = s.to_lowercase();
         match lower.as_str() {
             "cuda" => Some(GpuTarget::Cuda),
-            "fpga" => Some(GpuTarget::Fpga),  // M57.1 §3.2
 
             // WRGA B.3 Task 4: accept `cuda_sm<N>` / `sm<N>` variants.
             s if s.starts_with("cuda_sm") || s.starts_with("sm") => Some(GpuTarget::Cuda),
@@ -51,7 +49,7 @@ impl GpuTarget {
     /// The fallback serves library callers that build `CompileOptions` by
     /// hand. It is also why the CLI checks `--target` with
     /// [`validate_cli_target`] first: without that check a misspelt or
-    /// removed target (`rocm`, `metal`, `webgpu`) would compile CUDA
+    /// removed target (`rocm`, `metal`, `webgpu`, `fpga`) would compile CUDA
     /// kernels without any error.
     pub fn from_target_string(s: &str) -> Self {
         if s.is_empty() {
@@ -64,7 +62,6 @@ impl GpuTarget {
     pub fn name(&self) -> &'static str {
         match self {
             GpuTarget::Cuda => "cuda",
-            GpuTarget::Fpga => "fpga",
         }
     }
 
@@ -80,12 +77,6 @@ impl GpuTarget {
                     | FeatureSet::BF16_ARITHMETIC
                     | FeatureSet::ASYNC_COPY
             }
-            GpuTarget::Fpga => {
-                // FPGA target uses the HIR pipeline (kernel_ir → hir::lower →
-                // backend_verilog), not the SIMT FeatureSet model — return NONE
-                // because no SIMT feature flags apply to dataflow hardware.
-                FeatureSet::NONE
-            }
         }
     }
 
@@ -93,7 +84,6 @@ impl GpuTarget {
     pub fn warp_size(&self) -> u32 {
         match self {
             GpuTarget::Cuda => 32,
-            GpuTarget::Fpga => 1, // dataflow — no warp concept; 1 is a benign sentinel
         }
     }
 }
@@ -110,6 +100,7 @@ const REMOVED_BACKEND_TARGETS: &[(&str, &str)] = &[
     ("mps", "Metal"),
     ("webgpu", "WebGPU/WGSL"),
     ("wgsl", "WebGPU/WGSL"),
+    ("fpga", "FPGA/Verilog"),
 ];
 
 /// `true` for `<prefix><digits>` with at least one digit and nothing after.
@@ -132,20 +123,18 @@ fn is_sm_spelling(s: &str, prefix: &str) -> bool {
 ///   fused SDPA tables are not generated for these spellings.
 /// - `cpu`: a host-only compile. The CUDA-only fused SDPA variant tables
 ///   are not embedded.
-/// - `fpga`: `kernel` blocks are refused with a pointer to
-///   `nsl fpga-compile`.
 ///
 /// `parse_gpu_sm_from_target` (`compiler/kernel.rs`) parses only `cuda` and
 /// `sm_<N>`, and it panics on any other spelling. So an `@flash_attention`
-/// model compiled with `sm<N>`, `cuda_sm<N>`, `cpu` or `fpga` fails there.
+/// model compiled with `sm<N>`, `cuda_sm<N>` or `cpu` fails there.
 /// That defect predates this check, and this check does not fix it.
 ///
 /// `<N>` must be all digits. A suffix such as `sm_90a` is refused, because
 /// the fused-attention path parses `sm_<N>` strictly and would panic on it.
 pub fn validate_cli_target(s: &str) -> Result<(), String> {
     const ACCEPTED: &str = "`cuda`, `sm_<N>` (e.g. `sm_120`; also `sm<N>` and \
-                            `cuda_sm<N>`), `cpu` or `fpga`";
-    if matches!(s, "cuda" | "cpu" | "fpga")
+                            `cuda_sm<N>`) or `cpu`";
+    if matches!(s, "cuda" | "cpu")
         || is_sm_spelling(s, "sm_")
         || is_sm_spelling(s, "sm")
         || is_sm_spelling(s, "cuda_sm")
@@ -164,8 +153,9 @@ pub fn validate_cli_target(s: &str) -> Result<(), String> {
         return Err(format!("target names are lowercase: use `{lower}`"));
     }
     Err(format!(
-        "unknown target; expected {ACCEPTED}. The ROCm/AMDGPU, Metal and WebGPU/WGSL \
-         backends were removed (preserved at tag `{REMOVED_BACKENDS_ATTIC_TAG}`)"
+        "unknown target; expected {ACCEPTED}. The ROCm/AMDGPU, Metal, WebGPU/WGSL and \
+         FPGA/Verilog backends were removed (preserved at tag \
+         `{REMOVED_BACKENDS_ATTIC_TAG}`)"
     ))
 }
 
@@ -186,17 +176,9 @@ mod tests {
         assert_eq!(GpuTarget::parse_target("cuda_sm80"), Some(GpuTarget::Cuda));
         assert_eq!(GpuTarget::parse_target("vulkan"), None);
         // The removed backends no longer parse to a target of their own.
-        for removed in ["rocm", "hip", "metal", "mps", "webgpu", "wgsl"] {
+        for removed in ["rocm", "hip", "metal", "mps", "webgpu", "wgsl", "fpga", "FPGA"] {
             assert_eq!(GpuTarget::parse_target(removed), None, "{removed}");
         }
-    }
-
-    #[test]
-    fn parse_target_recognizes_fpga() {
-        // M57.1 §3.2: parse_target returns GpuTarget::Fpga for "fpga"/"FPGA".
-        // This activates the previously-runtime-unreachable compiler/kernel.rs:170 arm.
-        assert_eq!(GpuTarget::parse_target("fpga"), Some(GpuTarget::Fpga));
-        assert_eq!(GpuTarget::parse_target("FPGA"), Some(GpuTarget::Fpga));
     }
 
     #[test]
@@ -206,8 +188,8 @@ mod tests {
     }
 
     #[test]
-    fn cli_target_accepts_the_cuda_spellings_cpu_and_fpga() {
-        for ok in ["cuda", "sm_120", "sm_89", "sm_75", "sm80", "cuda_sm80", "cuda_sm70", "cpu", "fpga"] {
+    fn cli_target_accepts_the_cuda_spellings_and_cpu() {
+        for ok in ["cuda", "sm_120", "sm_89", "sm_75", "sm80", "cuda_sm80", "cuda_sm70", "cpu"] {
             assert_eq!(validate_cli_target(ok), Ok(()), "{ok} must be accepted");
         }
     }

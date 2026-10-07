@@ -9,13 +9,6 @@ use nsl_ast::stmt::{Stmt, StmtKind};
 use super::{Compiler, FlashAttentionCompileContext, SdpaBwdVariant};
 use crate::error::CodegenError;
 
-/// M57.1 §3.2: v1-permanent redirect error message for `nsl build --target fpga`
-/// invocations on non-model kernels. The test `tests/fpga_target_redirect.rs`
-/// pins this exact text — keep them in sync.
-pub const FPGA_TARGET_REDIRECT_MSG: &str =
-    "`--target fpga` for general kernels is not supported in v1. \
-     Use `nsl fpga-compile <source>` for model-block FPGA compilation.";
-
 /// Parse the numeric SM version from a target string like `"sm_90"` → `90`.
 ///
 /// Accepts the generic `"cuda"` alias (used as `CompileOptions::default()`)
@@ -171,14 +164,6 @@ impl Compiler<'_> {
             .unwrap_or("__kernel")
             .to_string();
 
-        if target == GpuTarget::Fpga {
-            // M57.1 §3.2: `nsl build --target fpga` parses successfully (parse_target
-            // recognizes "fpga"), but general-kernel FPGA compilation is not in v1's
-            // scope. Model-block compilation routes through `nsl fpga-compile`; this
-            // arm rejects non-model invocations with a redirecting error.
-            return Err(crate::error::CodegenError::new(FPGA_TARGET_REDIRECT_MSG));
-        }
-
         let kir = crate::kernel_lower::lower_kernel_to_ir(kernel, self.interner, target)?;
 
         // Validate that the kernel's required features are supported by the target
@@ -194,7 +179,6 @@ impl Compiler<'_> {
 
         let code = match target {
             GpuTarget::Cuda => crate::backend_ptx::lower_kir_to_ptx(&kir),
-            GpuTarget::Fpga => unreachable!(),
         };
 
         // Null-terminate for consistency (the PTX printer already does)
@@ -2129,7 +2113,7 @@ impl Compiler<'_> {
         // PANICS on anything but "cuda"/"sm_<N>". The decorated path only
         // reaches it behind an @flash_attention decorator, but this lazy path
         // fires for EVERY decorator-free SDPA train compile — including
-        // `--target cpu|fpga|cuda_sm<N>`, which compiled fine before the
+        // `--target cpu|cuda_sm<N>`, which compiled fine before the
         // variant table existed (null pointers → CPU backward). Keep exactly
         // that behavior for those targets: an empty table lowers to null
         // pointers, no panic.

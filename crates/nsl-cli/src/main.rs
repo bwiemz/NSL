@@ -149,14 +149,6 @@ fn main_inner() {
             );
         }
 
-        Cli::FpgaCompile { file, output_dir, fixture, test_taps, seq } => {
-            if let Err(e) =
-                commands::fpga::run_fpga_compile(&file, fixture.as_ref(), output_dir.as_ref(), test_taps, seq)
-            {
-                nsl_log::nsl_log!(ERROR, "cli", "error: {e}");
-                process::exit(1);
-            }
-        }
         Cli::PtxMetadata { file } => {
             commands::ptx_metadata::run(&file);
         }

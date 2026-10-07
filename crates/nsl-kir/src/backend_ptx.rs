@@ -1008,10 +1008,6 @@ fn emit_op(ptx: &mut String, op: &KirOp, ir: &KernelIR) {
             )
             .unwrap();
         }
-        KirOp::Matmul { .. } | KirOp::ElementwiseAdd { .. } | KirOp::Relu { .. } => {
-            unreachable!("M57 v1 structured KIR ops are only emitted for Target::Fpga; \
-                          this codegen path is GPU/CPU PTX")
-        }
     }
 }
 

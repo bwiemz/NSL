@@ -3711,6 +3711,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   the same typed refusal as the ZK decorators. `nsl run --gpu` stays: it
   picks the GPU for `--monitor`'s predicted-vs-actual profile, and its help
   text now says that. CEP's `wcet_us` roofline bound is unrelated and stays.
+- **FPGA / Verilog backend (M57)**, in the Phase 0.6 scope freeze. The code is
+  preserved at tag `attic/scope-freeze-2026-10`. Nothing it emitted ever ran
+  on an FPGA: the gates stopped at Verilator simulation and Yosys synthesis of
+  one fixed int8 MLP, and `nsl build --target fpga` only refused `kernel`
+  blocks with a pointer to `nsl fpga-compile`. Removed: `nsl-codegen`'s `hir`
+  module (the hardware IR), `backend_verilog`, `kernel_lower_fpga` and
+  `fpga_error`, the `experimental::fpga` facade, `GpuTarget::Fpga`,
+  `FPGA_TARGET_REDIRECT_MSG`, the `nsl fpga-compile` subcommand, the
+  FPGA-only KIR ops (`KirOp::{Matmul, ElementwiseAdd, Relu}`, which only that
+  lowering emitted; the PTX printer declared them unreachable), their codegen
+  tests and 15 snapshots, and `nsl-test`'s FPGA harness (`fpga_harness`,
+  `fixture`, `cpu_reference`, `stimuli`, the Verilator testbenches, the int8
+  MLP fixtures and their generator binary, and four `fpga_mlp_*` tests). CI
+  loses the `fpga` job and the `fpga-nightly` workflow. Dependency edges
+  removed: `nsl-cli` → `nsl-test` (only `fpga-compile` read the fixture
+  parser), `nsl-codegen` → `thiserror`, and `nsl-test` → `toml`, `thiserror`,
+  `sha2`, `rand`, `rand_chacha` plus its `insta`/`tempfile` dev-dependencies.
+  `--target fpga` is now refused with the attic tag, like the other removed
+  backends. The `I8`/`I16` KIR types stay; the int8 KV-cache and
+  dequantization kernels use `I8`. The name HIR is free for NSL V2.
 
 _v0.10.0 below is the whole of the 0.9 line's unreleased work
 (2026-03-19 → 2026-09-06); from here releases are cut monthly (roadmap D5),

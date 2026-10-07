@@ -41,12 +41,12 @@ cargo test --workspace --no-fail-fast -- --skip e2e_ # workspace unit/integratio
 cargo test -p nsl-cli --test e2e -- --test-threads=1 # CLI smoke/e2e (Linux + Windows)
 ```
 
-The ONNX Runtime (`test-onnx-rt`) and FPGA Verilator/Yosys (`fpga`) CI jobs
-**also block every PR** — they run in dedicated jobs rather than the command
-list above, but a red one blocks merge just the same. The e2e step is
-non-blocking only on macOS (that matrix is `continue-on-error`); locally it
-needs a full toolchain (C linker, optional OpenSSL/CUDA), so a missing-toolchain
-failure on your machine is a local-environment gap, not a relaxed gate.
+The ONNX Runtime (`test-onnx-rt`) CI job **also blocks every PR** — it runs
+in a dedicated job rather than the command list above, but a red one blocks
+merge just the same. The e2e step is non-blocking only on macOS (that matrix
+is `continue-on-error`); locally it needs a full toolchain (C linker, optional
+OpenSSL/CUDA), so a missing-toolchain failure on your machine is a
+local-environment gap, not a relaxed gate.
 
 **Required for the area you touch:**
 
@@ -59,7 +59,7 @@ failure on your machine is a local-environment gap, not a relaxed gate.
 - the macOS matrix + its e2e step (`continue-on-error`),
 - real-CUDA-device tests (CI runners have no GPU) and `#[ignore]`'d research
   tests in the `experimental::*` subsystems (CEP, CFIE, CSHA, WGGO, WRGA, CPDT,
-  FPGA, …), plus performance-baseline comparisons.
+  …), plus performance-baseline comparisons.
 
 ## Pull Request Process
 

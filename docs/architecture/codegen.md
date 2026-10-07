@@ -35,7 +35,7 @@ Scale, for orientation: `src/lib.rs` is ~2.5k lines, `src/stmt.rs` ~3.2k
 `src/stmt_grad.rs`, `src/stmt_quant.rs`, `src/stmt_inspect.rs` and
 `src/stmt_distill.rs`, 0.2–0.4k each),
 `src/compiler/` ~32k across eight files, `src/source_ad.rs` ~8.7k,
-`src/flash_attention.rs` ~8.5k. There are 301 integration-test files under
+`src/flash_attention.rs` ~8.5k. There are 359 integration-test files under
 `tests/` and ~200 modules at the crate root.
 
 ## Overview: the pipeline as code
@@ -599,20 +599,18 @@ lowers `let`, assignment to a declared local, element loads and stores,
 bare `return` and the index builtins to verified KIR — a local reassigned in
 a branch or a loop body is a block parameter at the join or the header — and
 refuses everything else with the innermost node's span.
-`src/gpu_target.rs` (`GpuTarget::{Cuda, Fpga}`, re-exporting `FeatureSet`)
+`src/gpu_target.rs` (`GpuTarget::Cuda`, re-exporting `FeatureSet`)
 selects the backend, and its `validate_cli_target` is the `--target` value
 parser for `nsl build` / `nsl run`. It accepts `cuda`, `sm_<N>`, `sm<N>`,
-`cuda_sm<N>`, `cpu` and `fpga`, and it refuses the removed backend names
-with the attic tag. That check exists because `GpuTarget::from_target_string`
-maps any unknown string to CUDA. `Compiler::compile_kernels`
-(`src/compiler/kernel.rs`) dispatches: CUDA lowers to KIR and prints it with
-`backend_ptx`, and `Fpga` returns `FPGA_TARGET_REDIRECT_MSG` (use
-`nsl fpga-compile`). `@autotune` substitutes its constants into the AST
+`cuda_sm<N>` and `cpu`, and it refuses the removed backend names (ROCm,
+Metal, WebGPU, FPGA) with the attic tag. That check exists because
+`GpuTarget::from_target_string` maps any unknown string to CUDA.
+`Compiler::compile_kernels` (`src/compiler/kernel.rs`) lowers to KIR and
+prints it with `backend_ptx`. `@autotune` substitutes its constants into the AST
 (`kernel_lower::substitute_constants`) before lowering. PTX bytes are
 embedded via `declare_data` / `define_data` in the same file;
 `tests/snapshot_tests.rs` (`kernel_block_*`) pins the PTX of every shape the
 lowering accepts and `tests/kernel_block_ptxas.rs` assembles it.
-`crates/nsl-codegen/tests/common/kir_builder.rs` is the shared test helper for building KIR;
 `crates/nsl-codegen/tests/snapshot_tests.rs` pins KIR-generated PTX.
 `src/cfie_decode_attention.rs::build` is the first CFIE kernel built as KIR
 (roadmap A2 step 9): block parameters for the tile loop and its three inner
@@ -932,9 +930,7 @@ Cargo feature at its `stmt.rs` entry), **CEP** `src/cep.rs`, **CFIE**
 **CPKD** `src/cpkd.rs`, **CCR** `src/ccr.rs`, **CSLA** `src/layerwise.rs` +
 `src/stmt_csla.rs` (`docs/research/CSLA-compiler-scheduled-layerwise-accumulation.md`),
 **PCA** `src/pca_detect.rs` (+ `pca_tier_b.rs`, `pca_per_doc.rs`, …),
-**FASE** `src/fase.rs`, **FPGA/HIR** `src/hir/` + `src/backend_verilog/` +
-`src/kernel_lower_fpga.rs` + `src/fpga_error.rs` (`nsl fpga-compile`),
-**sparse** `src/sparse.rs`, **speculative** `src/speculative.rs`, **multimodal**
+**FASE** `src/fase.rs`, **sparse** `src/sparse.rs`, **speculative** `src/speculative.rs`, **multimodal**
 `src/multimodal.rs`, **BitNet** `src/bitnet/`. Their APIs, flags and on-disk
 formats are not stable; see `STATUS.md` ("Experimental" and "Opting out of
 experimental subsystems") for the tier contract and `docs/wiki/Optimization-Passes.md`
@@ -1016,24 +1012,23 @@ should fail before review.
 
 ## Tests and gates
 
-`crates/nsl-codegen/tests/` holds 301 `.rs` integration-test files (plus
+`crates/nsl-codegen/tests/` holds 359 `.rs` integration-test files (plus
 `common/`, `data/`, `fixtures/`, `snapshots/`, `train_clif/`). By filename
 prefix the largest families are `tier_*` (45, FA-v2 Tier B1/B2 kernels),
 `csha_*` (34), `pca_*` (29), `fused_*` (25, fused linear-CE and LM head),
 `wggo_*` (14), `cpdt_*` (13), `bitnet_*` (11), `wrga_*` (10), `cfie_*` (10),
 `pass_*` (8), `fase_*` (8), `fa_*` (6), `sinks_*` (5), `awq_*` (5),
-`profiling_*`/`profile_*` (8), `bench_*` (4), plus the ABI/export, HIR/Verilog,
+`profiling_*`/`profile_*` (8), `bench_*` (4), plus the ABI/export,
 calibration, autotune and drift-gate singles. Functionally they fall into:
 
 - **Snapshot suites** (`insta`, `cargo insta review -p nsl-codegen`):
   `train_clif_snapshots.rs` (CLIF, 26 snapshots), `fa_v2_snapshots.rs`
-  (per-phase FA-v2 PTX, 25 tests), `verilog_emission_snapshots.rs` (8),
-  `hir_pass_snapshots.rs` (7), `snapshot_tests.rs` (KIR-generated PTX/KIR,
+  (per-phase FA-v2 PTX, 25 tests), `snapshot_tests.rs` (KIR-generated PTX/KIR,
   12), `bitnet_ptx_snapshots.rs`, `pca_*_kernel_snapshot.rs`,
   `tier_b1_*_snapshot.rs`, `csha_pipeline_cost_model_snapshot.rs`,
   `cpdt_sensitivity_snapshot.rs`, `c_header_snapshot.rs`, and the byte-identity
   pins (`fused_linear_ce_v1_byte_identity.rs`, `sinks_v1a_byte_identity.rs`,
-  `pca_sass_byte_identity.rs`). 102 snapshot files under `crates/nsl-codegen/tests/snapshots/`.
+  `pca_sass_byte_identity.rs`). 100 snapshot files under `crates/nsl-codegen/tests/snapshots/`.
 - **Static drift gates** (read the tree, no compile): `pass_registry_drift`,
   `pass_bus_drift`, `pass_manager_drift`, `tape_access_drift`,
   `pass_scheduler_coverage`, `ffi_ownership_drift`,
@@ -1048,8 +1043,7 @@ calibration, autotune and drift-gate singles. Functionally they fall into:
   reason): `*_gpu_parity.rs`, `*_numerical.rs`, `*_gpu_e2e.rs`,
   `*_sass_*.rs`, `flash_attention_*_gpu.rs`. 72 files carry `#[ignore]`
   (251 attributes); `scripts/gpu-cert.sh --check-reasons` refuses a bare one.
-- **Hardware-adjacent toolchains**: `yosys_gate.rs` (FPGA, skipped without
-  `yosys`), `c_header_compiles.rs` (a C compiler),
+- **Hardware-adjacent toolchains**: `c_header_compiles.rs` (a C compiler),
   `awq_real_subprocess_link.rs` / `exported_symbols_are_dlsym_findable.rs`
   (the system linker).
 
@@ -1066,10 +1060,9 @@ different thing.
 | Gate | Where |
 |------|-------|
 | `cargo test --workspace -- --skip e2e_` (all non-ignored codegen tests, unit tests, the static drift gates, `nsl-abi`'s table tests) | `ci.yml` `build-and-test` |
-| `verilog_emission_snapshots`, `hir_pass_snapshots`, `yosys_gate` | `ci.yml` `fpga` |
 | `csha_ptx_ptxas_validation`, `fused_linear_ce_{bf16,fp16,large_vocab}_ptxas`, `bitnet_gpu_correctness` under `--features cuda` against cudart stubs (assembles PTX, executes nothing) | `ci.yml` `cuda-feature` |
 | `scripts/hand-ptx-freeze.sh --self-test` / `--check` | `ci.yml` `hand-ptx-freeze` |
-| `scripts/gpu-cert.sh --check-inventory` / `--check-reasons` / `--check-long-arms` (manifest `ci/gpu-cert-manifest.tsv`: 470 gates, 198 in this crate) | `ci.yml` `gpu-gate-inventory` |
+| `scripts/gpu-cert.sh --check-inventory` / `--check-reasons` / `--check-long-arms` (manifest `ci/gpu-cert-manifest.tsv`: 495 gates, 201 in this crate) | `ci.yml` `gpu-gate-inventory` |
 | `scripts/check-doc-agreement.sh`, version agreement | `ci.yml` `doc-agreement`, `version-agreement` |
 | `scripts/gpu-cert.sh --run [--tier gpu\|toolchain\|multiproc\|isolate\|all]` — every `#[ignore]`d device test, under `scripts/gpu-guard.sh`; known-red list `ci/gpu-cert-known-red.txt` | `.github/workflows/gpu-cert.yml`, nightly + `workflow_dispatch` on the self-hosted sm_120 box; or locally |
 | `scripts/gpu-tier.sh smoke\|certify\|endurance` | local only |
@@ -1189,8 +1182,8 @@ review. See `docs/wiki/GPU-Test-Harness.md` and `docs/wiki/Testing-Strategy.md`.
    runtime FFIs. Do **not** add a module that formats PTX text —
    `scripts/hand-ptx-freeze.sh --check` refuses it; if you must touch a
    frozen emitter, edit the existing member file.
-3. Pin the PTX with a snapshot in `crates/nsl-codegen/tests/snapshot_tests.rs` (using
-   `crates/nsl-codegen/tests/common/kir_builder.rs`) and assemble it in a `*_ptxas.rs` test
+3. Pin the PTX with a snapshot in `crates/nsl-codegen/tests/snapshot_tests.rs` (build
+   the KIR with `KirBuilder`, as its kernels do) and assemble it in a `*_ptxas.rs` test
    through `ptxas_validation::validate_ptx`.
 4. Add the device test (`#[ignore = "<reason>"]`, GPU parity against a CPU
    reference) and refresh `ci/gpu-cert-manifest.tsv` with

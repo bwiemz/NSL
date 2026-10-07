@@ -37,7 +37,7 @@ Each module is declared once at the crate root (keeping `crate::foo` and
 | `quantization` | Reduced-precision execution | `fp8`, `bitnet`, `weight_aware`, `pca_*` |
 | `distributed` | Parallelism strategies | `tensor_parallel`, `context_parallel`, `pipeline`, `moe*`, `cpdt*` |
 | `analysis` | Cost model, fusion, planning | `cost_model`, `autotune`, `fusion*`, `ew_chain_fusion`, `memory_planner`, `profiling`, `inspect`, `flash_attention*`, `calibration` |
-| `experimental` | Research subsystems (**unstable**) | `cep*`, `cfie*`, `csha*`, `wggo*`, `wrga*`, `fase*`, `sparse`, `speculative`, `multimodal`, `experimental::fpga` (`hir`, `backend_verilog`, `kernel_lower_fpga`, `fpga_error`) |
+| `experimental` | Research subsystems (**unstable**) | `cep*`, `cfie*`, `csha*`, `wggo*`, `wrga*`, `fase*`, `sparse`, `speculative`, `multimodal` |
 
 ## Experimental vs. supported
 
@@ -58,7 +58,7 @@ AST (nsl-ast) + TypeMap (nsl-semantic)
   analysis passes              analysis / training / quantization / distributed
         │  fusion, AD, cost model, memory planning, calibration, …
         ▼
-  kernel lowering              gpu  (+ experimental::fpga for synthesis)
+  kernel lowering              gpu
         │
         ▼
   object emission + linking    core::linker

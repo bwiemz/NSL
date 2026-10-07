@@ -85,7 +85,6 @@ const CORPUS_DIRS: &[&str] = &[
     "crates/nsl-codegen/tests/fixtures",
     "crates/nsl-lexer/tests/lex",
     "crates/nsl-parser/tests/parse",
-    "crates/nsl-test/fixtures",
 ];
 
 /// Below this many inputs of a spelling changed by `fmt`, the AST check is
