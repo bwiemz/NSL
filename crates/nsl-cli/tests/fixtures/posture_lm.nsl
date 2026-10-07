@@ -23,6 +23,12 @@
 #                          grad_accumulation, and batch * seq_len
 #   POSTURE_CLIP_ARG    -> `, grad_clip=<t>`, or nothing (the canonical
 #                          posture's --layerwise-accum refuses grad_clip)
+#
+# train_checkpoint_resume_gpu.rs reuses this model for the GPU resume gate.
+# It applies the same rewrites, splices the checkpoint arguments into
+# POSTURE_CLIP_ARG, and rewrites three lines by exact match: the optimizer
+# line (AdamW for SGD), the loss print (the step is printed first), and the
+# GPU placement. It refuses to run if any of the three lines changes.
 
 from nsl.nn.norms import RMSNorm
 from nsl.nn.gqa import GroupedQueryAttention

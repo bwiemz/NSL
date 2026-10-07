@@ -8,6 +8,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **A GPU checkpoint-resume gate** (`train_checkpoint_resume_gpu.rs`,
+  roadmap item 4 audit). No gate had resumed a GPU training run before.
+  The branch of `checkpoint_load` that copies the AdamW moments into device
+  tensors never ran in one. The CPU gate's fixtures have a single parameter.
+  - **Setup.**
+    - It trains the posture-certificate model (the 1B structure at toy
+      scale) with the 1B recipe's AdamW, four distinct micro-batches per
+      step, and a DataLoader.
+    - A control trains 5 steps. A second run trains the same 5 steps and
+      saves at step 3, which is its only save.
+    - A new process resumes from that save. It must print the
+      `[checkpoint] resumed:` witness and continue the step labels from 13.
+    - Its losses for micro-batches 13 to 20, and its final parameters, are
+      compared with the control's.
+  - **Bit-exact tier.** This tier runs under `--deterministic`, where two
+    uninterrupted runs measured bit-identical. Every loss byte and every
+    parameter bit must match. It covers the canonical posture, the chain
+    posture, and the exact canonical 1B recipe with `--param-dtype bf16-sr`.
+  - **Production-kernel tier.** Without `--deterministic`, two
+    uninterrupted runs differ by up to 1.0e-4 in loss and 2.9e-4 in
+    parameters, relative to the run's update. The bounds are ten times
+    that.
+  - **Mutation-checked on the GPU.** Each of these mutants fails all five
+    gates:
+    - Skipping the device-moment restore: parameter gap 0.355.
+    - Restoring the step counter one optimizer step late: 2.2e-2. Only
+      AdamW's bias correction changes.
+    - Restoring the step counter one micro-batch late, or re-zeroing it.
+    - A `checkpoint_load` that does not arm the resume. Its final
+      parameters equal the control's, so only the witness and the loss
+      stream catch it.
+  - **No resume bug found.** The resume was exact on every posture.
+
 - **Toolchain pinning** (NSL V2 plan, Phase 0 item 0.1). Production coder
   runs stay on a long-term-support toolchain while the V2 redesign lands on
   `main`.

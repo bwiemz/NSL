@@ -952,7 +952,9 @@ in `src/deterministic_ops.rs` if it uses atomics, make it graph-capture-safe
 4. Add a gate in `crates/nsl-cli/tests/` alongside
    `train_checkpoint_gate.rs`, `train_config_resume_gate.rs`,
    `exec_fingerprint_resume_gate.rs`, and update
-   `docs/summaries/04-training-and-autodiff.md`'s restore table.
+   `docs/summaries/04-training-and-autodiff.md`'s restore table. State that
+   lives on the device is restored by a separate branch, which only
+   `train_checkpoint_resume_gpu.rs` runs.
 
 **A new stderr marker or event kind.** Emit the tag from the runtime, register
 it in `EXEC_MARKERS` (token, `emitted_by` files, meaning) and, if it has a

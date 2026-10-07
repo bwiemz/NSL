@@ -20,7 +20,9 @@
 //! endurance harness (models/benchmarks/endurance_1b.py), not here — at 1B
 //! bit-identity is not an environment guarantee (TF32 GEMMs, fused-CE
 //! backward atomics; see long_run_drift_gpu_gate's control-vs-control
-//! doctrine).
+//! doctrine). The GPU restore path itself (moments copied into device
+//! tensors, the 1B postures) is gated at toy scale by
+//! train_checkpoint_resume_gpu.rs.
 
 use std::process::Command;
 

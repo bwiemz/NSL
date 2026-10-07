@@ -298,7 +298,8 @@ markers. By filename suffix: 78 `*_gate.rs`, 18 `*_e2e.rs`, 7
 - **Checkpoint and resume** — `train_checkpoint_gate.rs`,
   `train_config_resume_gate.rs`, `train_resume_dataloader_gate.rs`,
   `exec_fingerprint_resume_gate.rs`, `ccr_checkpoint_parity.rs`,
-  `model_config_drift.rs`.
+  `model_config_drift.rs`, and on the GPU `train_checkpoint_resume_gpu.rs`
+  (a resumed run against an uninterrupted one under the 1B postures).
 - **End-to-end examples** — `e2e.rs` compiles and runs the workspace's
   `examples/*.nsl` and diffs stdout against the root `tests/expected/*.txt`; the `*_e2e.rs` files
   (`csha_checkpoint_decorator_cli_e2e.rs`, `fused_lm_ce_e2e_nsl_source.rs`,
