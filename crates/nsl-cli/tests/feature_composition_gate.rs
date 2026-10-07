@@ -1284,6 +1284,12 @@ fn every_marker_asserted_in_the_test_suite_is_registered() {
     // allowlist of no-ops reads as considered exclusions and is not.
     const NOT_SUBSYSTEM_MARKERS: &[&str] = &[
         "[nsl]", // generic CLI prefix, not a subsystem engagement marker
+        // NSL_DEBUG_MEM_TRACE debug lines: source_ad_rule_cert.rs parses
+        // `[tape-trace] record <Variant>` to bind certificates to TapeOps
+        // and filters both prefixes out of program output. They say what
+        // the tape did, not that a subsystem engaged.
+        "[tape-trace]",
+        "[tensor-trace]",
     ];
 
     let mut unknown: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
