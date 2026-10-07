@@ -125,8 +125,7 @@ fn weight_prefix_kwarg_plus_auto_pack_resolves_hf_mixtral_checkpoint() {
     fs::write(&src, MOE_SWIGLU_WEIGHT_PREFIX_SRC).unwrap();
     let weights = tmp.path().join("hf_mixtral.safetensors");
     write_hf_mixtral_safetensors(&weights, "hf.layer");
-    // `--emit-obj` ALWAYS writes alongside the source file (the `-o`
-    // flag only renames the final executable on a regular build).
+    // Without `-o`, `--emit-obj` writes `<stem>.o` beside the source.
     let expected_obj = tmp.path().join("hf_mixtral.o");
 
     let mut cmd = Command::cargo_bin("nsl").unwrap();

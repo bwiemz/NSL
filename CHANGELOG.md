@@ -1834,6 +1834,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **`nsl build --emit-obj -o X` writes the object to X.**
+  - **Before.** On a single-module program, `-o` was ignored: the object
+    always went to `<stem>.o` beside the source.
+  - **Linked builds.** A linked build also wrote its intermediate object
+    beside the source. A failed link left it there, and two builds of the
+    same file raced on that path. The intermediate now lives in the build's
+    scratch directory, as the multi-module path's objects already did.
+  - **Programs that import modules.** These emit one object per module, so
+    `-o` cannot hold them. The build now says so instead of ignoring `-o`
+    silently.
+
 - **Every accepted `--target` spelling now compiles `@flash_attention`
   instead of panicking.**
   - **The bug.** The CLI accepted `cuda`, `sm_<N>`, `sm<N>`, `cuda_sm<N>` and

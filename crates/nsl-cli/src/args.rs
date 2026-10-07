@@ -530,7 +530,10 @@ pub(crate) struct BuildArgs {
         #[arg(short, long)]
         pub(crate) output: Option<PathBuf>,
 
-        /// Emit only the object file (skip linking)
+        /// Emit only the object file (skip linking). It goes to -o when given,
+        /// else <stem>.o beside the source. A program that imports other
+        /// modules emits one object per module into a scratch directory
+        /// instead (each path is printed), and -o does not apply
         #[arg(long)]
         pub(crate) emit_obj: bool,
 
