@@ -199,32 +199,6 @@ fn fixture_config(segment_masked: bool) -> FlashAttentionConfig {
 }
 
 // ---------------------------------------------------------------------------
-// f32 → f16 bit conversion helper (mirrors pca_tier_a_backward_correctness.rs).
-// Needed for converting cos/sin tables to f16 before device upload.
-// ---------------------------------------------------------------------------
-
-fn f32_to_f16_bits(x: f32) -> u16 {
-    if x.is_nan() { return 0x7E00; }
-    let b = x.to_bits();
-    let sign = (b >> 31) & 1;
-    let exp  = ((b >> 23) & 0xFF) as i32;
-    let mant = b & 0x7FFFFF;
-    if exp == 255 { return ((sign << 15) | 0x7C00 | if mant != 0 { 0x200 } else { 0 }) as u16; }
-    let exp_f16 = exp - 127 + 15;
-    if exp_f16 <= 0 {
-        let shift = (1 - exp_f16).min(24) as u32;
-        let shifted = (mant | 0x800000) >> shift;
-        let rounded = (shifted + 0x1000) >> 13;
-        return ((sign << 15) | rounded) as u16;
-    }
-    if exp_f16 >= 31 { return ((sign << 15) | 0x7C00) as u16; }
-    let mant16 = (mant + 0x1000) >> 13;
-    let overflow = (mant16 >> 10) & 1;
-    let exp16 = (exp_f16 as u32 + overflow) & 0x1F;
-    ((sign << 15) | (exp16 << 10) | (mant16 & 0x3FF)) as u16
-}
-
-// ---------------------------------------------------------------------------
 // Parameterized config builder — lets callers force the extern-SMEM regime
 // (total_bytes > 16 KB, e.g. head_dim=128, block_q=block_kv=128) and
 // exercise RoPE by passing rope_q=true.
@@ -243,36 +217,51 @@ fn fixture_config_sized(
 }
 
 // ---------------------------------------------------------------------------
-// RoPE cos/sin table generator.
+// RoPE cos/sin tables for the NON-CSHA inline path (q_load.rs).
 //
-// Generates standard RoPE tables in the layout the CSHA kernel's
-// `emit_rope_pair_sweep` reads:
+// That path reads one f32 per head-dim element:
 //
-//   cos/sin: [seq_len, half_dim] where half_dim = head_dim / 2
-//   element dtype: f16 (the kernel does `ld.global.b16` + `cvt.f32.f16`)
-//   address formula: (pos * half_dim + i) * 2  (bytes, 2 = sizeof(f16))
+//   cos/sin: [seq_len, head_dim] f32, element (pos, d) at (pos*head_dim + d)*4
 //
-// Theta formula (matches cpu_reference_rope_single_doc / pca_rope_numerical):
-//   theta = pos / 10000^(2*i / head_dim)
-// which equals pos * 10000^(-(2*i / head_dim)).
+// holding the angle of the PAIR d belongs to, so both partners read the same
+// value: pair i = d % (head_dim/2) for HalfSplit, d / 2 for Adjacent. The
+// layout therefore depends on the style, which is why the tables carry it.
 //
-// The returned Vec<u16> contains f16 bits, ready for nsl_test_cuda_h2d
-// (pass `cos_f16.as_ptr() as i64` and byte size = seq_len * half_dim * 2).
+// The CSHA path (`emit_rope_pair_sweep`) reads a DIFFERENT layout --
+// [seq_len, head_dim/2] f16 -- from the same `cos_ptr`. These tests drive the
+// inline path; handing it the CSHA layout made every row past seq_len/4 read
+// beyond the allocation (NaN at row 16 of a 64-row fixture, and different
+// garbage run to run).
+//
+// theta = pos / 10000^(2*i / head_dim), the formula cpu_rope_q also uses.
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)] // used by Task 3/5/7 GPU tests
-fn rope_cos_sin_tables_f16(seq_len: usize, head_dim: usize) -> (Vec<u16>, Vec<u16>) {
+struct RopeTables {
+    cos: Vec<f32>,
+    sin: Vec<f32>,
+    style: RopeStyle,
+}
+
+fn rope_angle(pos: usize, pair: usize, head_dim: usize) -> f64 {
+    (pos as f64) * 10_000f64.powf(-(2.0 * pair as f64) / head_dim as f64)
+}
+
+fn rope_tables_inline(seq_len: usize, head_dim: usize, style: RopeStyle) -> RopeTables {
     let half = head_dim / 2;
-    let mut cos_f16 = vec![0u16; seq_len * half];
-    let mut sin_f16 = vec![0u16; seq_len * half];
+    let mut cos = vec![0f32; seq_len * head_dim];
+    let mut sin = vec![0f32; seq_len * head_dim];
     for pos in 0..seq_len {
-        for i in 0..half {
-            let theta = (pos as f64) * 10_000f64.powf(-(2.0 * i as f64) / head_dim as f64);
-            cos_f16[pos * half + i] = f32_to_f16_bits(theta.cos() as f32);
-            sin_f16[pos * half + i] = f32_to_f16_bits(theta.sin() as f32);
+        for d in 0..head_dim {
+            let pair = match style {
+                RopeStyle::HalfSplit => d % half,
+                RopeStyle::Adjacent => d / 2,
+            };
+            let (s, c) = rope_angle(pos, pair, head_dim).sin_cos();
+            cos[pos * head_dim + d] = c as f32;
+            sin[pos * head_dim + d] = s as f32;
         }
     }
-    (cos_f16, sin_f16)
+    RopeTables { cos, sin, style }
 }
 
 // ---------------------------------------------------------------------------
@@ -889,7 +878,7 @@ fn masked_extern_config_equals_unmasked_forward() {
 
     let baseline = launch_pca_ex(
         &q, &k, &v, batch, heads, seq_len, head_dim, block, block,
-        /*rope_q=*/false, /*segment_masked=*/false, &[], /*cos_sin=*/None, /*doc_starts=*/None,
+        /*rope_q=*/false, /*segment_masked=*/false, &[], /*rope=*/None, /*doc_starts=*/None,
     );
     let masked_null = launch_pca_ex(
         &q, &k, &v, batch, heads, seq_len, head_dim, block, block,
@@ -943,10 +932,9 @@ fn interleave_unpacked_outputs(
 // Extended forward launch helper — supports caller-chosen dims, rope_q=true,
 // and optional cos/sin / doc_starts uploads.
 //
-// - cos_sin = Some((cos_f16, sin_f16)): upload both, pass real cos_ptr/sin_ptr.
-//   Slices must be [seq_len * (head_dim/2)] f16 bits each.
-//   Use rope_cos_sin_tables_f16() to generate them.
-// - cos_sin = None: pass 0i64 for cos_ptr and sin_ptr.
+// - rope = Some(tables): upload cos/sin (rope_tables_inline), pass real
+//   cos_ptr/sin_ptr, and synthesize the kernel for the tables' style.
+// - rope = None: pass 0i64 for cos_ptr and sin_ptr.
 // - doc_starts = Some(ds): upload [max_docs_per_row+1] i32 entries and
 //   pass real doc_starts_ptr.
 // - doc_starts = None: pass 0i64.
@@ -965,7 +953,7 @@ fn launch_pca_ex(
     batch: usize, heads: usize, seq_len: usize, head_dim: usize,
     block_q: i64, block_kv: i64,
     rope_q: bool, segment_masked: bool, seg_ids: &[u16],
-    cos_sin: Option<(&[u16], &[u16])>,
+    rope: Option<&RopeTables>,
     doc_starts: Option<&[i32]>,
 ) -> Option<Vec<f32>> {
     let total    = batch * heads * seq_len * head_dim;
@@ -973,7 +961,8 @@ fn launch_pca_ex(
     let f16_bytes = (total * std::mem::size_of::<u16>()) as i64;
     let lse_bytes = (batch * heads * seq_len * std::mem::size_of::<f32>()) as i64;
 
-    let config = fixture_config_sized(head_dim as i64, block_q, block_kv, rope_q, segment_masked);
+    let mut config = fixture_config_sized(head_dim as i64, block_q, block_kv, rope_q, segment_masked);
+    if let Some(tables) = rope { config.rope_style = tables.style; }
     let scale  = 1.0f32 / (head_dim as f32).sqrt();
 
     let q_dev   = nsl_test_cuda_alloc(f32_bytes);
@@ -1000,14 +989,15 @@ fn launch_pca_ex(
         0i64
     };
 
-    // Upload cos/sin tables (f16) if rope_q is active.
-    let (cos_dev, sin_dev): (i64, i64) = if let Some((cos_f16, sin_f16)) = cos_sin {
-        let cs_bytes = std::mem::size_of_val(cos_f16) as i64;
+    // Upload the inline-path cos/sin tables.
+    let (cos_dev, sin_dev): (i64, i64) = if let Some(tables) = rope {
+        assert_eq!(tables.cos.len(), seq_len * head_dim, "RoPE tables sized for another shape");
+        let cs_bytes = std::mem::size_of_val(tables.cos.as_slice()) as i64;
         let c_ptr = nsl_test_cuda_alloc(cs_bytes);
         let s_ptr = nsl_test_cuda_alloc(cs_bytes);
         assert!(c_ptr != 0 && s_ptr != 0, "cos/sin device alloc returned null");
-        nsl_test_cuda_h2d(c_ptr, cos_f16.as_ptr() as i64, cs_bytes);
-        nsl_test_cuda_h2d(s_ptr, sin_f16.as_ptr() as i64, std::mem::size_of_val(sin_f16) as i64);
+        nsl_test_cuda_h2d(c_ptr, tables.cos.as_ptr() as i64, cs_bytes);
+        nsl_test_cuda_h2d(s_ptr, tables.sin.as_ptr() as i64, cs_bytes);
         (c_ptr, s_ptr)
     } else {
         (0i64, 0i64)
@@ -1029,9 +1019,9 @@ fn launch_pca_ex(
     while ptx.last() == Some(&0) { ptx.pop(); }
     if ptx.last() != Some(&b'\n') { ptx.push(b'\n'); }
     let dump = std::env::temp_dir().join(format!(
-        "pca_ex_seg{}_hd{}_bq{}_rope{}.ptx",
+        "pca_ex_seg{}_hd{}_bq{}_rope{}_{:?}.ptx",
         if segment_masked { "masked" } else { "plain" },
-        head_dim, block_q, if rope_q { "true" } else { "false" },
+        head_dim, block_q, if rope_q { "true" } else { "false" }, config.rope_style,
     ));
     std::fs::write(&dump, &ptx).ok();
     eprintln!("PTX dumped to: {}", dump.display());
@@ -1103,137 +1093,145 @@ fn launch_pca_ex(
 }
 
 // ===========================================================================
-// rope_q=true, segment_masked=false: pure standard RoPE forward (no PCA SMEM).
-//
-// Validates the sin-address-aliasing fix (#2) — before the fix, rope_q=true
-// forward faulted with CUDA_ERROR_ILLEGAL_ADDRESS (the sin address register
-// was overwritten by the cos load before use).  After the fix the kernel
-// launches cleanly.
+// rope_q=true, segment_masked=false: the inline Q rotation against a CPU
+// reference, at every slice count the emitter specialises on (head_dim 32 =
+// one slice per lane, 64 = two, 128 = four) and in both styles.
 //
 // Uses segment_masked=false so NO PCA SMEM state (seg_smem / doc_starts) is
-// involved — pure standard RoPE, zero cross-test GPU-state leakage surface.
+// involved.
 //
-// CPU reference: standard adjacent-pair RoPE applied to Q (position = row
-// index, step_by(2) pairs), K unrotated (rope_q rotates Q only), then
-// causal unmasked attention.  Tolerance 4e-2 (f16 + warp-shuffle approximation
-// budget matching the Tier A forward suite).
-//
-// If the GPU output is all-finite and the launch succeeds, the primary goal
-// (no crash) is met regardless of the CPU comparison result.
+// Tolerance, measured (RTX PRO 4500, sm_120): the kernel sits 1.7e-4..1.9e-4
+// from the reference at every head_dim and style (f16 staging of Q/K/V),
+// while a kernel that skips the rotation lands 5.4e-3 away (head_dim 32) and
+// the pre-fix HalfSplit pairing (d with d +/- 16 at head_dim 64) 3.9e-3.
+// ROPE_Q_TOL = 1e-3 sits 5x above the first and 3.9x below the closest
+// regression; `assert_tol_discriminates`
+// re-checks the second half on every run, so a fixture change that shrank
+// the rotation's effect below the tolerance fails instead of going vacuous.
+// (The previous gate compared against Adjacent pairs at tolerance 4e-2 --
+// five times the distance to no rotation at all -- and passed on tables the
+// kernel was reading out of bounds.)
 // ===========================================================================
 
-/// CPU adjacent-pair RoPE for a single [seq_len, head_dim] Q matrix.
-// Kept as the readable statement of the theta formula the GPU kernel has to
-// match; the assertions in this file compare against
-// `pca_rope_numerical::cpu_reference_rope_single_doc` instead.
-#[allow(dead_code)]
-/// Mirrors the theta formula in pca_rope_numerical::cpu_reference_rope_single_doc.
-fn cpu_rope_adjacent_pairs(q: &[f32], seq_len: usize, head_dim: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; q.len()];
-    for pos in 0..seq_len {
-        for d in (0..head_dim).step_by(2) {
-            let theta = pos as f32 / 10_000f32.powf(d as f32 / head_dim as f32);
-            let (c, s) = (theta.cos(), theta.sin());
-            let x0 = q[pos * head_dim + d];
-            let x1 = q[pos * head_dim + d + 1];
-            out[pos * head_dim + d]     = x0 * c - x1 * s;
-            out[pos * head_dim + d + 1] = x0 * s + x1 * c;
+const ROPE_Q_TOL: f32 = 1e-3;
+
+/// Rotate Q the way the inline q_load.rs path does: row r at `positions[r]`,
+/// pairs (i, i + head_dim/2) for HalfSplit and (2i, 2i + 1) for Adjacent,
+/// each at angle `rope_angle(pos, i)`.
+///
+/// K is NOT rotated. The inline path rotates Q only (the KNOWN-LIMITATION in
+/// q_load.rs), so a reference that rotated K would fail on that documented
+/// gap instead of pinning the rotation. This is an oracle for that branch
+/// only: the CSHA fused-projections path rotates both and must be checked
+/// against a reference that does too.
+fn cpu_rope_q(q: &[f32], positions: &[usize], head_dim: usize, style: RopeStyle) -> Vec<f32> {
+    assert_eq!(q.len(), positions.len() * head_dim, "one position per Q row");
+    let half = head_dim / 2;
+    let mut out = q.to_vec();
+    for (row, &pos) in positions.iter().enumerate() {
+        let base = row * head_dim;
+        for i in 0..half {
+            let (i0, i1) = match style {
+                RopeStyle::HalfSplit => (i, i + half),
+                RopeStyle::Adjacent => (2 * i, 2 * i + 1),
+            };
+            let (s, c) = rope_angle(pos, i, head_dim).sin_cos();
+            let (x0, x1) = (q[base + i0] as f64, q[base + i1] as f64);
+            out[base + i0] = (x0 * c - x1 * s) as f32;
+            out[base + i1] = (x0 * s + x1 * c) as f32;
         }
     }
     out
 }
 
-/// CPU reference: apply standard RoPE to Q (adjacent-pair convention),
-/// leave K unchanged, then run causal unmasked attention.
-///
-/// IMPORTANT — STRUCTURAL GAP PINNED BY DESIGN:
-///
-/// Canonical RoPE rotates BOTH Q and K (the dot-product `Q_rot . K_rot` is
-/// what gives positional invariance). This CPU reference INTENTIONALLY does
-/// NOT rotate K, because the kernel branch under test —
-/// `non-CSHA inline path with rope_q=true` — only rotates Q (see the
-/// KNOWN-LIMITATION comment in
-/// `crates/nsl-codegen/src/flash_attention_v2/phases/forward/q_load.rs`).
-/// Without matching the kernel's missing-K-rotation, the reference would
-/// diverge from the GPU output by more than the 4e-2 tolerance and the test
-/// would fail on the structural gap rather than the per-doc RoPE reset
-/// semantics it is intended to pin.
-///
-/// PRODUCTION uses the CSHA-fused-projections path
-/// (csha_hooks.rs::emit_rope_pair_sweep) which rotates BOTH Q and K
-/// correctly. This CPU reference must NOT be reused as a correctness oracle
-/// for the production path — it is purpose-built to mirror the test-only
-/// non-CSHA inline fallback. When the K-side rotation gap is closed in a
-/// follow-on PR, the corresponding CPU reference (likely in a new file)
-/// must rotate K as well.
-fn cpu_reference_rope_then_attention(
-    q: &[f32], k: &[f32], v: &[f32],
-    batch: usize, heads: usize, seq_len: usize, head_dim: usize,
-) -> Vec<f32> {
-    // Rotate Q per-row; K/V pass through unchanged — see docstring above.
-    let mut q_rot = q.to_vec();
-    for bi in 0..batch {
-        for hi in 0..heads {
-            for pos in 0..seq_len {
-                let base = ((bi * heads + hi) * seq_len + pos) * head_dim;
-                for d in (0..head_dim).step_by(2) {
-                    let theta = pos as f32 / 10_000f32.powf(d as f32 / head_dim as f32);
-                    let (c, s) = (theta.cos(), theta.sin());
-                    let x0 = q[base + d];
-                    let x1 = q[base + d + 1];
-                    q_rot[base + d]     = x0 * c - x1 * s;
-                    q_rot[base + d + 1] = x0 * s + x1 * c;
-                }
-            }
+/// The pre-fix HalfSplit rotation: `shfl.bfly 16` paired d with the element
+/// 16 lanes away inside its 32-wide slice, each at its OWN pair's angle --
+/// right only when head_dim == 32. Kept as the regression the tolerance
+/// must reject at head_dim >= 64.
+fn cpu_rope_q_lane16_pairing(q: &[f32], seq_len: usize, head_dim: usize) -> Vec<f32> {
+    let half = head_dim / 2;
+    let mut out = q.to_vec();
+    for pos in 0..seq_len {
+        let base = pos * head_dim;
+        for d in 0..head_dim {
+            let lane = d % 32;
+            let partner = d - lane + (lane ^ 16);
+            let (s, c) = rope_angle(pos, d % half, head_dim).sin_cos();
+            let (x, p) = (q[base + d] as f64, q[base + partner] as f64);
+            out[base + d] = if lane < 16 { (x * c - p * s) as f32 } else { (x * c + p * s) as f32 };
         }
     }
-    let scale = 1.0f32 / (head_dim as f32).sqrt();
-    let mut out = vec![0f32; batch * heads * seq_len * head_dim];
-    naive_attention_segmented(&q_rot, k, v, &mut out, batch, heads, seq_len, head_dim, scale, true, &[]);
     out
+}
+
+/// Causal attention (batch = heads = 1) over an already-rotated Q; `seg_ids`
+/// empty means no segment mask.
+fn cpu_attention_rotated_q(
+    q_rot: &[f32], k: &[f32], v: &[f32], seq_len: usize, head_dim: usize, seg_ids: &[u16],
+) -> Vec<f32> {
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let mut out = vec![0f32; seq_len * head_dim];
+    naive_attention_segmented(q_rot, k, v, &mut out, 1, 1, seq_len, head_dim, scale, true, seg_ids);
+    out
+}
+
+/// The tolerance must sit below the distance from the reference to each
+/// regression it exists to catch, with 2x margin -- checked here, on the
+/// CPU, every run.
+fn assert_tol_discriminates(reference: &[f32], regressions: &[(&str, Vec<f32>)], what: &str) {
+    for (name, wrong) in regressions {
+        let (dist, idx) = max_abs_diff(reference, wrong);
+        assert!(
+            dist > 2.0 * ROPE_Q_TOL,
+            "{what}: the {name} regression moves the output only {dist:.3e}@[{idx}], under \
+             2 x ROPE_Q_TOL = {:.1e} -- this fixture cannot tell a correct kernel from that bug",
+            2.0 * ROPE_Q_TOL,
+        );
+    }
 }
 
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn rope_q_forward_matches_cpu_standard_rope() {
     if !cuda_available() { eprintln!("skipped: no CUDA device"); return; }
-    let head_dim = 64usize; let block = 32i64;
-    let batch = 1usize; let heads = 1usize; let seq_len = 64usize;
-    let total = batch * heads * seq_len * head_dim;
-    let mut q = vec![0f32; total]; let mut k = vec![0f32; total]; let mut v = vec![0f32; total];
-    fill_seeded(&mut q, 0x9001); fill_seeded(&mut k, 0x9002); fill_seeded(&mut v, 0x9003);
-    let (cos, sin) = rope_cos_sin_tables_f16(seq_len, head_dim);
+    let seq_len = 64usize; let block = 32i64;
+    for style in [RopeStyle::HalfSplit, RopeStyle::Adjacent] {
+        for head_dim in [32usize, 64, 128] {
+            let what = format!("rope_q forward {style:?} hd={head_dim}");
+            let total = seq_len * head_dim;
+            let mut q = vec![0f32; total]; let mut k = vec![0f32; total]; let mut v = vec![0f32; total];
+            fill_seeded(&mut q, 0x9001); fill_seeded(&mut k, 0x9002); fill_seeded(&mut v, 0x9003);
+            let rope = rope_tables_inline(seq_len, head_dim, style);
+            let positions: Vec<usize> = (0..seq_len).collect();
 
-    let gpu = launch_pca_ex(
-        &q, &k, &v, batch, heads, seq_len, head_dim, block, block,
-        /*rope_q=*/true, /*segment_masked=*/false, &[], Some((&cos, &sin)), None,
-    ).expect("rope_q=true forward launch FAILED (must not crash -- validates the sin-aliasing fix)");
+            let reference = cpu_attention_rotated_q(
+                &cpu_rope_q(&q, &positions, head_dim, style), &k, &v, seq_len, head_dim, &[],
+            );
+            let mut regressions = vec![("no-rotation", cpu_attention_rotated_q(&q, &k, &v, seq_len, head_dim, &[]))];
+            if style == RopeStyle::HalfSplit && head_dim > 32 {
+                regressions.push((
+                    "lane^16-pairing",
+                    cpu_attention_rotated_q(
+                        &cpu_rope_q_lane16_pairing(&q, seq_len, head_dim), &k, &v, seq_len, head_dim, &[],
+                    ),
+                ));
+            }
+            assert_tol_discriminates(&reference, &regressions, &what);
 
-    let all_finite = gpu.iter().all(|x| x.is_finite());
-    assert!(all_finite, "rope_q=true forward: output contains non-finite values after sin-aliasing fix");
-    eprintln!("rope_q=true forward: kernel launched + output all-finite (sin-aliasing fix confirmed)");
-
-    // Secondary: compare against CPU standard-RoPE reference.
-    // rope_cos_sin_tables_f16 uses [seq_len, half_dim] f16 layout; the kernel's
-    // HalfSplit inline rotation reads cos/sin from that table.  The CPU reference
-    // uses the canonical adjacent-pair RoPE (same theta formula, f32 precision).
-    // If the GPU HalfSplit convention differs from adjacent-pair within 4e-2,
-    // the test passes.  If not, it is a real finding about the RoPE convention.
-    let cpu = cpu_reference_rope_then_attention(&q, &k, &v, batch, heads, seq_len, head_dim);
-    let (max_abs, idx) = max_abs_diff(&gpu, &cpu);
-    eprintln!(
-        "rope_q forward vs CPU standard-RoPE: max_abs={max_abs:.2e} at idx={idx} \
-         gpu[idx]={:.4} cpu[idx]={:.4}",
-        gpu[idx], cpu[idx],
-    );
-    eprintln!("  first 4 gpu: {:?}", &gpu[..4.min(gpu.len())]);
-    eprintln!("  first 4 cpu: {:?}", &cpu[..4.min(cpu.len())]);
-    assert!(
-        max_abs < 4e-2,
-        "rope_q forward != CPU standard-RoPE ref: max_abs={max_abs:.2e} at idx={idx} \
-         (threshold 4e-2; if exceeded this is a real RoPE convention finding, not a tolerance issue)"
-    );
-    eprintln!("rope_q forward PASSED vs CPU standard-RoPE: max_abs={max_abs:.2e}");
+            let gpu = launch_pca_ex(
+                &q, &k, &v, 1, 1, seq_len, head_dim, block, block,
+                /*rope_q=*/true, /*segment_masked=*/false, &[], Some(&rope), None,
+            ).unwrap_or_else(|| panic!("{what}: launch failed"));
+            let (max_abs, idx) = max_abs_diff(&gpu, &reference);
+            eprintln!("{what}: max_abs={max_abs:.3e}@[{idx}] (tol {ROPE_Q_TOL:.0e})");
+            assert!(
+                max_abs < ROPE_Q_TOL,
+                "{what}: GPU != CPU reference, max_abs={max_abs:.3e}@[{idx}] \
+                 gpu={:.5} cpu={:.5} (tol {ROPE_Q_TOL:.0e})",
+                gpu[idx], reference[idx],
+            );
+        }
+    }
 }
 
 // ===========================================================================
@@ -1241,17 +1239,16 @@ fn rope_q_forward_matches_cpu_standard_rope() {
 //
 // These tests target the inline q_load.rs effective_pos path (non-CSHA),
 // which was previously reverted (commit 6eb1a1bc) due to in-suite flakiness.
-// This reimplementation pairs the kernel work with a differential design that
-// avoids the absolute RoPE convention question and pins the failure mode
-// directly:
+// This reimplementation pairs the kernel work with tests that pin the failure
+// mode directly:
 //
 //   Test A (null-guard equivalence) — doc_starts=NULL ≡ doc_starts=[0,...,0]
 //   Test B (doc-0 invariance)       — reset-active output for positions in
 //                                     doc 0 == reset-inactive output for
 //                                     those positions (effective_pos = 0+i)
-//   Test C (doc-1 differential)     — reset-active output for positions in
-//                                     doc 1 differs measurably from
-//                                     reset-inactive (proves reset fires)
+//   Test C (reference)              — reset-active output matches the CPU
+//                                     reference at doc-relative positions,
+//                                     reset-inactive at absolute ones
 //   Test D (run-to-run determinism) — bit-identical output across two
 //                                     consecutive launches with identical
 //                                     inputs (catches the original flake)
@@ -1284,7 +1281,7 @@ fn rope_q_forward_doc_starts_null_equals_doc_zero_baseline() {
     let total = batch * heads * seq_len * head_dim;
     let mut q = vec![0f32; total]; let mut k = vec![0f32; total]; let mut v = vec![0f32; total];
     fill_seeded(&mut q, 0xA101); fill_seeded(&mut k, 0xA102); fill_seeded(&mut v, 0xA103);
-    let (cos, sin) = rope_cos_sin_tables_f16(seq_len, head_dim);
+    let rope = rope_tables_inline(seq_len, head_dim, RopeStyle::HalfSplit);
 
     let (seg_ids, _) = two_doc_fixture_32_32();
     let doc_zero = vec![0i32; 257]; // doc_starts=[0,0,...,0] → reset is identity (pos-0=pos).
@@ -1293,14 +1290,14 @@ fn rope_q_forward_doc_starts_null_equals_doc_zero_baseline() {
     let with_zero = launch_pca_ex(
         &q, &k, &v, batch, heads, seq_len, head_dim, block, block,
         /*rope_q=*/true, /*segment_masked=*/true, &seg_ids,
-        Some((&cos, &sin)), Some(&doc_zero),
+        Some(&rope), Some(&doc_zero),
     ).expect("Test A: doc_starts=[0,...,0] launch failed (rope_q=true, hd=32)");
 
     eprintln!("Test A2 (fwd) — doc_starts=NULL (null-guard)");
     let with_null = launch_pca_ex(
         &q, &k, &v, batch, heads, seq_len, head_dim, block, block,
         true, true, &seg_ids,
-        Some((&cos, &sin)), None, // None → doc_starts_ptr=0; null-guard fires.
+        Some(&rope), None, // None → doc_starts_ptr=0; null-guard fires.
     ).expect("Test A: doc_starts=NULL forward launch failed (null-guard must not crash)");
 
     let (diff, idx) = max_abs_diff(&with_null, &with_zero);
@@ -1326,19 +1323,19 @@ fn rope_q_forward_per_doc_reset_is_deterministic_in_suite() {
     let total = batch * heads * seq_len * head_dim;
     let mut q = vec![0f32; total]; let mut k = vec![0f32; total]; let mut v = vec![0f32; total];
     fill_seeded(&mut q, 0xA201); fill_seeded(&mut k, 0xA202); fill_seeded(&mut v, 0xA203);
-    let (cos, sin) = rope_cos_sin_tables_f16(seq_len, head_dim);
+    let rope = rope_tables_inline(seq_len, head_dim, RopeStyle::HalfSplit);
     let (seg_ids, doc_starts) = two_doc_fixture_32_32();
 
     eprintln!("Test D (fwd) — run #1 with per-doc reset");
     let run1 = launch_pca_ex(
         &q, &k, &v, batch, heads, seq_len, head_dim, block, block,
-        true, true, &seg_ids, Some((&cos, &sin)), Some(&doc_starts),
+        true, true, &seg_ids, Some(&rope), Some(&doc_starts),
     ).expect("Test D run #1 failed");
 
     eprintln!("Test D (fwd) — run #2 with identical inputs");
     let run2 = launch_pca_ex(
         &q, &k, &v, batch, heads, seq_len, head_dim, block, block,
-        true, true, &seg_ids, Some((&cos, &sin)), Some(&doc_starts),
+        true, true, &seg_ids, Some(&rope), Some(&doc_starts),
     ).expect("Test D run #2 failed");
 
     // BIT-EXACT match between the two runs — this is the cross-test-leak guard.
@@ -1364,20 +1361,20 @@ fn rope_q_forward_per_doc_reset_invariants() {
     let total = batch * heads * seq_len * head_dim;
     let mut q = vec![0f32; total]; let mut k = vec![0f32; total]; let mut v = vec![0f32; total];
     fill_seeded(&mut q, 0xA301); fill_seeded(&mut k, 0xA302); fill_seeded(&mut v, 0xA303);
-    let (cos, sin) = rope_cos_sin_tables_f16(seq_len, head_dim);
+    let rope = rope_tables_inline(seq_len, head_dim, RopeStyle::HalfSplit);
     let (seg_ids, doc_starts) = two_doc_fixture_32_32();
     let doc_zero = vec![0i32; 257]; // reset identity (everything in "doc 0", no reset effect).
 
     eprintln!("Test BC (fwd) — reset-active (doc_starts=[0,32,64,-1,...])");
     let with_reset = launch_pca_ex(
         &q, &k, &v, batch, heads, seq_len, head_dim, block, block,
-        true, true, &seg_ids, Some((&cos, &sin)), Some(&doc_starts),
+        true, true, &seg_ids, Some(&rope), Some(&doc_starts),
     ).expect("Test BC reset-active launch failed");
 
     eprintln!("Test BC (fwd) — reset-inactive (doc_starts=[0,0,...,0])");
     let no_reset = launch_pca_ex(
         &q, &k, &v, batch, heads, seq_len, head_dim, block, block,
-        true, true, &seg_ids, Some((&cos, &sin)), Some(&doc_zero),
+        true, true, &seg_ids, Some(&rope), Some(&doc_zero),
     ).expect("Test BC reset-inactive baseline failed");
 
     // The row-range loops below skip a NaN diff (`diff > max` is false), so
@@ -1407,46 +1404,35 @@ fn rope_q_forward_per_doc_reset_invariants() {
          got max_abs={max_abs_doc0:.3e}@[{idx_doc0}] — stale smem_doc_starts[0]?");
     eprintln!("Test B PASSED: doc-0 output is bit-exact under reset (max_abs=0)");
 
-    // Test C: for doc 1 positions (rows 32..64), reset-active uses pos = pos - 32
-    // (so cos/sin from rows 0..32 of the table), while reset-inactive uses pos =
-    // pos (cos/sin from rows 32..64). The RoPE rotation applied to Q differs, so
-    // the attention output should differ measurably (well above f16 jitter).
-    let mut max_abs_doc1 = 0f32; let mut idx_doc1 = 0usize;
-    for row in 32..64 {
-        for d in 0..head_d {
-            let i = row * head_d + d;
-            let diff = (with_reset[i] - no_reset[i]).abs();
-            if diff > max_abs_doc1 { max_abs_doc1 = diff; idx_doc1 = i; }
-        }
-    }
-    eprintln!("Test C [fwd doc-1 reset vs no-reset]: max_abs={max_abs_doc1:.3e}@[{idx_doc1}]");
-    // The reset firing for doc-1 rows MUST produce SOME differential vs no-reset
-    // (otherwise smem_doc_starts[1] is being read as 0 — i.e. reset is a no-op).
-    //
-    // Empirically (RTX 5070 Ti / CUDA 13.2): differential is ~2.4e-4, which is
-    // ~3 orders of magnitude smaller than the naive prediction (~1e-1 from
-    // "high-freq RoPE pair differs by 32 radians"). The reason is a pre-existing
-    // cos/sin layout quirk on the non-CSHA inline RoPE path: the test fixture's
-    // `rope_cos_sin_tables_f16` produces [seq_len, half_dim] f16 (2 bytes/entry,
-    // 2 KB total at seq=64/hd=32), but the kernel's `ld.global.f32 [cos_base +
-    // d*4]` reads f32 with head_dim*4-byte row stride (8 KB expected). Reset-
-    // active doc-1 reads at bytes [0..4 KB] (partially in-bounds garbage);
-    // reset-inactive reads at [4 KB..8 KB] (entirely OOB, typically zero-init
-    // device memory). Both yield ~0 cos/sin, so the rotated Q is ~0 in both
-    // cases — and the differential collapses to the f16 quantization noise
-    // floor of the surviving FMA path.
-    //
-    // This cos/sin layout mismatch is a known pre-existing infrastructure
-    // limitation of the non-CSHA inline RoPE path (the CSHA-fused-projections
-    // production path uses f16 cos/sin correctly). Fixing it is tracked as a
-    // separate gap from PCA paper-completion Item 3.
-    //
-    // The 1e-5 floor is well above the bit-exact case (Test B = 0.0 confirms
-    // reset semantics for doc-0) but tight enough to catch a "smem_doc_starts[1]
-    // returns 0" no-op-reset bug (which would also produce bit-exact 0.0 here).
-    let reset_evidence_floor = 1e-5f32;
-    assert!(max_abs_doc1 >= reset_evidence_floor,
-        "Test C FAILED: doc-1 reset-active should differ from reset-inactive by >= {reset_evidence_floor:.0e}; \
-         got max_abs={max_abs_doc1:.3e} — reset is a no-op (smem_doc_starts[1] read as 0?)");
-    eprintln!("Test C PASSED: doc-1 reset semantics observed ({max_abs_doc1:.3e} >= {reset_evidence_floor:.0e})");
+    // Test C: both arms against the CPU reference. Reset-active rotates doc 1
+    // at doc-relative positions (pos - 32); reset-inactive (doc_starts all
+    // 0) at absolute ones. Each arm must match its own reference, and the
+    // two references must be far enough apart that matching the right one
+    // is evidence: a reset that silently read doc_start = 0 would put the
+    // reset-active output on the absolute-position reference instead.
+    let abs_pos: Vec<usize> = (0..seq_len).collect();
+    let doc_pos: Vec<usize> = (0..seq_len).map(|p| if p < 32 { p } else { p - 32 }).collect();
+    let attend = |positions: &[usize]| cpu_attention_rotated_q(
+        &cpu_rope_q(&q, positions, head_d, RopeStyle::HalfSplit), &k, &v, seq_len, head_d, &seg_ids,
+    );
+    let cpu_reset = attend(&doc_pos);
+    let cpu_abs = attend(&abs_pos);
+    assert_tol_discriminates(
+        &cpu_reset,
+        &[("no-reset", cpu_abs.clone()), ("no-rotation", attend(&vec![0; seq_len]))],
+        "Test C reset reference",
+    );
+    let (err_reset, i_reset) = max_abs_diff(&with_reset, &cpu_reset);
+    let (err_abs, i_abs) = max_abs_diff(&no_reset, &cpu_abs);
+    eprintln!(
+        "Test C [fwd vs CPU]: reset-active max_abs={err_reset:.3e}@[{i_reset}], \
+         reset-inactive max_abs={err_abs:.3e}@[{i_abs}] (tol {ROPE_Q_TOL:.0e})"
+    );
+    assert!(err_reset < ROPE_Q_TOL,
+        "Test C FAILED: reset-active output != CPU reference at doc-relative positions, \
+         max_abs={err_reset:.3e}@[{i_reset}] (tol {ROPE_Q_TOL:.0e})");
+    assert!(err_abs < ROPE_Q_TOL,
+        "Test C FAILED: reset-inactive output != CPU reference at absolute positions, \
+         max_abs={err_abs:.3e}@[{i_abs}] (tol {ROPE_Q_TOL:.0e})");
+    eprintln!("Test C PASSED: both arms match their CPU reference");
 }

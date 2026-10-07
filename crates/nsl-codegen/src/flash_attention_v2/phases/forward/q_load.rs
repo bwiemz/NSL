@@ -10,9 +10,9 @@
 //! +head_dim] as f16, so later phases that need the full row can read
 //! from shmem instead of reconstructing via shfl.
 //!
-//! rope_q: if configured, rotation is applied on the fly before the
-//! shmem store. See the TODO below — current sign logic is a known gap
-//! tracked for the rope_q test expansion.
+//! rope_q: if configured (and CSHA has not already rotated Q), the
+//! rotation is applied on the fly before the shmem store -- to Q only; see
+//! the KNOWN-LIMITATION below.
 
 use crate::flash_attention::{FlashAttentionConfig, RopeStyle};
 use crate::flash_attention_v2::smem_layout::q_offset;
@@ -117,20 +117,22 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
         // RoPE rotation site). Attention scores Q_rot * K_unrot^T are therefore
         // semantically WRONG on this branch regardless of PCA reset.
         //
-        // PRODUCTION IS UNAFFECTED. The CSHA-fused-projections path
-        // (csha_hooks.rs::emit_rope_pair_sweep) is the production PCA RoPE path
-        // and rotates both Q AND K correctly under the same effective_pos. The
-        // production CSHA training-PTX synthesis site
-        // (maybe_synthesize_csha_training_ptx) ALWAYS sets
-        // csha=Some(CshaExtras{level=1, ...}), and the @flash_attention
-        // decorator's inference path uses the same CSHA-fused PTX when RoPE is
-        // active. The non-CSHA + rope_q=true branch is reachable only from
-        // direct PTX synthesis tests that exercise the fallback emitters
-        // (pca_tier_a_forward_correctness::rope_q_forward_*), and those tests
-        // pin only no-crash + per-doc reset semantics, NOT full RoPE
-        // correctness — see the comment on cpu_reference_rope_then_attention,
-        // which explicitly does NOT rotate K so the CPU side matches the
-        // kernel side's structural gap byte-for-byte under this branch.
+        // NO LAUNCH SUPPLIES TABLES TO THIS BRANCH. The CSHA-fused-projections
+        // path (csha_hooks.rs::emit_rope_pair_sweep) is the PCA RoPE path and
+        // rotates both Q AND K under the same effective_pos; the CSHA
+        // training-PTX synthesis (maybe_synthesize_csha_training_ptx) sets
+        // rope_q=false. The `@flash_attention` + `@rope` decorator path
+        // (compiler/kernel.rs) DOES build csha=None + rope_q=true configs, but
+        // every launch site passes null cos/sin (expr/advanced.rs WIRE-HERE,
+        // wengert_lower.rs) and this branch has no null guard. The only callers that pass real
+        // tables are the direct PTX synthesis tests
+        // (pca_tier_a_forward_correctness::rope_q_forward_*), which check the
+        // Q rotation and the per-doc reset against a CPU reference that, like
+        // this branch, leaves K unrotated (`cpu_rope_q`).
+        //
+        // Table layout read here: [seq_len, head_dim] f32, each element
+        // holding its PAIR's angle -- not the [seq_len, head_dim/2] f16 the
+        // CSHA path reads from the same cos_ptr.
         //
         // Closing this gap requires K-side rotation in emit_k_tile_load: a
         // partner-shuffle of K halves after the cooperative HBM->SMEM load
@@ -204,7 +206,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
             // Inline RoPE rotation: only when rope_q=true AND CSHA has not
             // already rotated Q via emit_rope_epilogue (prevents double-rotation).
             if config.rope_q && !csha_rope_active {
-                emit_rope_rotation_inline(ptx, Q_BASE + i, i, config.rope_style);
+                emit_rope_rotation_inline(ptx, Q_BASE + i, i, head_dim, config.rope_style);
             }
 
             // Store into shmem as f16.
@@ -223,13 +225,15 @@ fn emit_rope_rotation_inline(
     ptx: &mut String,
     reg: u32,
     slice_idx: u32,
+    head_dim: u32,
     style: RopeStyle,
 ) {
     match style {
         RopeStyle::HalfSplit => {
+            let half = head_dim / 2;
             ptx.push_str(&format!(
-                "    // rope halfsplit slice {}: pair across (lane ^ 16)\n",
-                slice_idx
+                "    // rope halfsplit slice {}: pair d with d +/- {} (head_dim/2)\n",
+                slice_idx, half
             ));
             // %rd28 = d (lane + slice_idx*32), set by the caller before this call.
             // Compute d*4 once for cos, then recompute for sin (%rd31 was
@@ -239,16 +243,28 @@ fn emit_rope_rotation_inline(
             // Recompute d*4 from %rd28 (still valid) so sin addr = sin_base + d*4.
             ptx.push_str("    shl.b64 %rd31, %rd28, 2;  // d*4 for sin row (recompute)\n");
             ptx.push_str("    add.u64 %rd31, %rd26, %rd31;  ld.global.f32 %f1, [%rd31];  // sin\n");
+            // The partner is x[d +/- head_dim/2]. A `lane ^ 16` shuffle finds
+            // it only at head_dim 32; at head_dim 64 it paired d with d +/- 16
+            // (wrong pairs, mismatched angles). Load the partner from the
+            // UNROTATED HBM row instead (%rd22 = q_base): right at every
+            // head_dim, and pre-rotation by construction, whichever slice
+            // rotates first.
             ptx.push_str(&format!(
-                "    shfl.sync.bfly.b32 %f2, %f{}, 16, 31, 0xFFFFFFFF;  // partner Q\n",
-                reg
+                "    setp.lt.u64 %p0, %rd28, {half};  // d < head_dim/2: self is x0\n"
             ));
-            ptx.push_str("    setp.lt.u32 %p0, %lane, 16;\n");
+            ptx.push_str(&format!(
+                "    @%p0  add.u64 %rd31, %rd28, {half};  // partner = d + head_dim/2\n"
+            ));
+            ptx.push_str(&format!(
+                "    @!%p0 sub.u64 %rd31, %rd28, {half};  // partner = d - head_dim/2\n"
+            ));
+            ptx.push_str("    shl.b64 %rd31, %rd31, 2;\n");
+            ptx.push_str("    add.u64 %rd31, %rd22, %rd31;  ld.global.f32 %f2, [%rd31];  // partner Q\n");
             // Reference math (csha_hooks.rs:1584-1595):
             //   new_x0 = x0*cos - x1*sin
             //   new_x1 = x0*sin + x1*cos
-            // HalfSplit: lanes  <16 hold x0 (self=x0, partner=x1);
-            //            lanes >=16 hold x1 (self=x1, partner=x0).
+            // HalfSplit: d <  head_dim/2 holds x0 (self=x0, partner=x1);
+            //            d >= head_dim/2 holds x1 (self=x1, partner=x0).
             // -- @%p0  branch: new_x0 = self*cos - partner*sin
             //      encode as: t = self*cos + 0 ; new = (-partner)*sin + t
             ptx.push_str("    @%p0  neg.f32 %f3, %f2;                          // -partner (x1)\n");
