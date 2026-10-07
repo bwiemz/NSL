@@ -1,6 +1,6 @@
 //! Decorator bridges: pure `AnalysisResult -> CompileOptions field`
-//! transforms shared by every build path (standalone / shared_lib / zk /
-//! check) AND the `nsl profile` real-capture path.
+//! transforms shared by every build path (standalone / shared_lib / check)
+//! AND the `nsl profile` real-capture path.
 //!
 //! These moved out of the bin-only `pipeline.rs` so the lib-side
 //! `profile::try_capture_real` can enrich its capture `CompileOptions` from

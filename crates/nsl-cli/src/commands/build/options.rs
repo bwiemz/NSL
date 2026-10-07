@@ -1,5 +1,5 @@
 //! `nsl build` argument handling: validate flags, build the `CompileOptions`,
-//! and dispatch to the standalone / shared-lib / ZK / normal build path.
+//! and dispatch to the standalone / shared-lib / normal build path.
 //!
 //! Extracted verbatim from the former monolithic `build.rs`; behavior is
 //! unchanged.
@@ -49,20 +49,6 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
             no_dead_weight,
             no_sparse_codegen,
             shared_lib,
-            unikernel,
-            listen,
-            memory,
-            wcet,
-            wcet_cert,
-            cpu,
-            do178c_report,
-            wcet_target,
-            fpga_device,
-            zk_circuit,
-            zk_backend,
-            zk_field,
-            zk_solidity,
-            zk_weights,
             wrga_report,
             wrga_fold_allocations,
             wggo,
@@ -291,36 +277,6 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 return;
             }
 
-            // M54: Parse unikernel configuration if --unikernel is set.
-            let unikernel_config = if unikernel {
-                let listen_addr = match nsl_codegen::unikernel::parse_listen_addr(&listen) {
-                    Ok(addr) => addr,
-                    Err(e) => {
-                        nsl_log::nsl_log!(ERROR, "cli", "error: invalid --listen value: {e}");
-                        process::exit(1);
-                    }
-                };
-                let memory_bytes = match memory.as_deref() {
-                    Some(s) => match nsl_codegen::unikernel::parse_memory_size(s) {
-                        Ok(n) => n,
-                        Err(e) => {
-                            nsl_log::nsl_log!(ERROR, "cli", "error: invalid --memory value: {e}");
-                            process::exit(1);
-                        }
-                    },
-                    None => 0, // auto-detect at boot
-                };
-                let cfg = nsl_codegen::unikernel::UnikernelConfig {
-                    listen_addr,
-                    memory_bytes,
-                    ..Default::default()
-                };
-                cfg.print_summary();
-                Some(cfg)
-            } else {
-                None
-            };
-
             // Calibration is refused, not validated-and-ignored. The harness
             // (hook registry, run_harness_*, the sidecar writer) lives in
             // `nsl_codegen::compile_and_calibrate`, which e3ab23ad moved it
@@ -507,29 +463,11 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                     // that have it in scope.
                     index_map: std::collections::HashMap::new(),
                 },
-                unikernel_config,
-                wcet: nsl_codegen::WcetOptions {
-                    enabled: wcet,
-                    gpu: None, // reuse --gpu from Check variant; Build uses target for backend
-                    cpu,
-                    report_path: wcet_cert,
-                    safety_margin: 1.05,
-                    do178c_report,
-                    target: wcet_target,
-                    fpga_device,
-                },
-                zk: nsl_codegen::ZkOptions {
-                    circuit: zk_circuit,
-                    backend: zk_backend,
-                    field: zk_field,
-                    solidity: zk_solidity,
-                    weights_path: zk_weights.clone(),
-                },
                 linear_types_enabled: linear_types,
                 // Semantic-analysis facts: all empty here. The loader fills
-                // `ownership_info`; the six build-path entry points
+                // `ownership_info`; the five build-path entry points
                 // (run_build_shared_single, run_build_shared_multi,
-                // run_build_zk, run_build_standalone, run_build_single,
+                // run_build_standalone, run_build_single,
                 // run_build_multi) overwrite the decorator configs from
                 // semantic analysis via pipeline::{analysis,module_data}_to_*.
                 analysis: nsl_codegen::AnalysisOptions::default(),
@@ -755,16 +693,6 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 );
             } else if shared_lib {
                 crate::commands::build::run_build_shared(&file, output, dump_ir, &compile_opts, wrga_report.as_deref());
-            } else if zk_circuit {
-                crate::commands::build::run_build_zk(
-                    &file,
-                    output,
-                    emit_obj,
-                    dump_ir,
-                    zk_weights.as_deref(),
-                    &compile_opts,
-                    wrga_report.as_deref(),
-                );
             } else {
                 crate::commands::build::run_build(&file, output, emit_obj, dump_ir, &compile_opts, wrga_report.as_deref());
             }

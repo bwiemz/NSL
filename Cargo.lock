@@ -1319,7 +1319,6 @@ dependencies = [
  "nsl-parser",
  "nsl-runtime",
  "nsl-semantic",
- "nsl-test",
  "predicates",
  "regex",
  "safetensors",
@@ -1365,7 +1364,6 @@ dependencies = [
  "sha2",
  "string-interner",
  "tempfile",
- "thiserror",
 ]
 
 [[package]]
@@ -1464,15 +1462,8 @@ name = "nsl-test"
 version = "0.10.0"
 dependencies = [
  "half",
- "insta",
  "nsl-codegen",
  "nsl-runtime",
- "rand 0.10.3",
- "rand_chacha 0.10.0",
- "sha2",
- "tempfile",
- "thiserror",
- "toml",
 ]
 
 [[package]]

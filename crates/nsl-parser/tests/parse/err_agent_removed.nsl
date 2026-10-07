@@ -1,0 +1,15 @@
+# `agent` blocks were removed in the Phase 0.6 scope freeze. The keyword
+# stays reserved, so the block is refused once, naming the attic tag; its
+# body reports nothing of its own, and the statement after it parses.
+agent Drafter:
+    kv_cache: KvCache = empty()
+    steps: int = 0
+
+    fn draft(self, p: Tensor) -> Tensor:
+        self.steps += 1
+        return p
+
+    async fn verify(self, p: Tensor) -> bool:
+        return true
+
+let after = 0

@@ -116,7 +116,7 @@ pub fn parse_model_def_stmt(p: &mut Parser) -> Stmt {
         }
 
         if p.at(&TokenKind::Fn) || p.at(&TokenKind::Async) {
-            // Method — decorators are now preserved in the AST (M53: @real_time support)
+            // Method — decorators are preserved in the AST (`@export`, `@fp8_compute`, ...)
             let method_start = p.current_span();
             let is_async = p.eat(&TokenKind::Async);
             p.expect(&TokenKind::Fn);

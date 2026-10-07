@@ -374,7 +374,7 @@ impl PassScheduler {
             // `compile_train_block` installs the scope at its own entry
             // (Milestone C), so the nested-in-`fn main():` path that used to
             // arrive phase-less via `compile_user_functions` is covered by
-            // construction, as are lambdas, model/agent methods, `@test`
+            // construction, as are lambdas, model methods, `@test`
             // fns and module compiles. What still legitimately arrives as
             // `None`: unit tests driving pass entries or the compiler
             // directly, and out-of-band CLI drivers (`nsl profile`,

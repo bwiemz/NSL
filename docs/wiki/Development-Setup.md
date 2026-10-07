@@ -79,7 +79,6 @@ The following subcommands are verified from `crates/nsl-cli/src/main.rs`:
 - **`nsl export main.nsl`** — export a model to ONNX or checkpoint to safetensors
 - **`nsl convert`** — convert between checkpoint formats (`.nslm` ↔ `.safetensors`)
 - **`nsl init <name>`** — scaffold a new NSL project
-- **`nsl zk <subcommand>`** — M55 ZK inference circuit operations. Canonical forms: `nsl zk stats`, `nsl zk prove`, `nsl zk verify`. (Top-level `nsl stats`/`nsl prove`/`nsl verify` also exist as aliases — prefer the `zk` prefix for clarity.)
 - **`nsl tokenize`** — train a BPE tokenizer from source files
 
 ## IDE

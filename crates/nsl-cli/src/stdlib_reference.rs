@@ -427,8 +427,7 @@ fn document_file(root: &Path, file: &Path) -> Result<ModuleDoc, String> {
             // into a failure rather than a hole. None of these appear in
             // `stdlib/` today; the first one to be added must teach the
             // renderer about it.
-            StmtKind::AgentDef(_)
-            | StmtKind::StructDef(_)
+            StmtKind::StructDef(_)
             | StmtKind::EnumDef(_)
             | StmtKind::TraitDef(_)
             | StmtKind::KernelDef(_)
@@ -456,7 +455,6 @@ fn document_file(root: &Path, file: &Path) -> Result<ModuleDoc, String> {
 /// The spelling of a statement kind, for the refusal message above.
 fn stmt_kind_name(kind: &StmtKind) -> &'static str {
     match kind {
-        StmtKind::AgentDef(_) => "`agent`",
         StmtKind::StructDef(_) => "`struct`",
         StmtKind::EnumDef(_) => "`enum`",
         StmtKind::TraitDef(_) => "`trait`",

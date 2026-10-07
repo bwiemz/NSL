@@ -211,7 +211,7 @@ fi
 #
 # Roadmap item 21 asked for this; check 4 above covers COMMANDS, which is a
 # different surface. The docs name jobs directly too — CONTRIBUTING.md calls
-# out `test-onnx-rt` and `fpga` as blocking, Testing-Strategy.md names
+# out `test-onnx-rt` as blocking, Testing-Strategy.md names
 # `doc-agreement` and `gpu-gate-inventory`. A renamed or deleted job leaves
 # those references pointing at nothing, which is exactly how the
 # `merge-gate-preview` reference outlived the job it described.
@@ -221,7 +221,7 @@ fi
 # the same shape as a job id and are what a first cut of this check flagged.
 #
 # KNOWN GAP, stated rather than papered over: only KEBAB-CASE tokens (>=1
-# hyphen) are validated. A single-word job id such as `fpga` is
+# hyphen) are validated. A single-word job id such as `bench` is
 # indistinguishable from ordinary backticked prose, so renaming THAT job would
 # not be caught here. Widening the pattern flags every inline code span in the
 # docs, which is worse than the gap.

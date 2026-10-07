@@ -1,6 +1,6 @@
 [package]
 name = "nsl-test"
-description = "Test utilities for NeuralScript kernel verification + M57 FPGA test infrastructure"
+description = "Test utilities for NeuralScript kernel verification"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -14,30 +14,14 @@ workspace = true
 [dependencies]
 # CSHA backward-kernel diagnostic mode (origin/main)
 half = { version = "2.4", features = ["std"] }
-# M57 FPGA test infrastructure (this branch)
+# FlashAttention configs the CPU-naive references and the B1 adapter take.
 nsl-codegen.workspace = true
 # Phase 2.6 B1Forward GPU launcher (cuda-gated): FFIs nsl_cuda_init /
 # nsl_test_cuda_* + nsl_kernel_launch. nsl-runtime is not in
 # [workspace.dependencies], so reference it by path. Optional + cuda-gated so
 # the default build stays CUDA-free.
 nsl-runtime = { path = "../nsl-runtime", optional = true }
-rand.workspace = true
-rand_chacha.workspace = true
-sha2 = "0.11"
-toml.workspace = true
-thiserror = "2"
-# nsl-ast, nsl-parser, bytemuck, regex — reserved for M57.1 (end-to-end NSL
-# source compilation + Verilog port packing). Not added now to keep nsl-test
-# compile time minimal during the deferred-scope window.
 
 [features]
 default = []
 cuda = ["dep:nsl-runtime", "nsl-runtime/cuda"]
-
-[[bin]]
-name = "generate_mlp_int8_weights_v1"
-path = "fixtures/generate_mlp_int8_weights_v1.rs"
-
-[dev-dependencies]
-insta = "1"
-tempfile = "3"

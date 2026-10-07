@@ -43,8 +43,8 @@ const fn k(name: &'static str, read_by: &'static str) -> KnownDecorator {
 }
 
 /// Every decorator name the toolchain reads anywhere, from the 2026-08-15
-/// empirical inventory (updated as consumers move): 35 validated in `checker/stmt.rs`, 13 in
-/// `checker/model.rs`, 3 in other semantic modules, and 8 read only by
+/// empirical inventory (updated as consumers move): 34 validated in `checker/stmt.rs`, 13 in
+/// `checker/model.rs`, 1 in another semantic module, and 4 read only by
 /// codegen. Names consumed by the parser before a `Decorator` node exists
 /// (`pack`, `unpack`, `backward`, `*_ptx` in datatype blocks; `endpoint` in
 /// serve blocks) are deliberately absent — their namespaces were already
@@ -76,7 +76,6 @@ pub static KNOWN_DECORATORS: &[KnownDecorator] = &[
     k("paged_kv", "crates/nsl-semantic/src/checker/stmt.rs"),
     k("pca", "crates/nsl-semantic/src/checker/stmt.rs"),
     k("pure", "crates/nsl-semantic/src/checker/stmt.rs"),
-    k("rope", "crates/nsl-semantic/src/checker/stmt.rs"),
     k("shape_assert", "crates/nsl-semantic/src/checker/stmt.rs"),
     k("shared", "crates/nsl-semantic/src/checker/stmt.rs"),
     k("test", "crates/nsl-semantic/src/checker/stmt.rs"),
@@ -102,24 +101,22 @@ pub static KNOWN_DECORATORS: &[KnownDecorator] = &[
     k("speculative", "crates/nsl-semantic/src/checker/model.rs"),
     k("target", "crates/nsl-semantic/src/checker/model.rs"),
     // --- validated elsewhere in nsl-semantic ---
-    k("auto_device_transfer", "crates/nsl-semantic/src/agent.rs"),
     k("export", "crates/nsl-semantic/src/export.rs"),
-    k("pipeline_agent", "crates/nsl-semantic/src/agent.rs"),
     // --- read only by nsl-codegen ---
     k("fp4_compute", "crates/nsl-codegen/src/fp8.rs"),
     k("no_grad", "crates/nsl-codegen/src/compiler/declaration.rs"),
     k("param_role", "crates/nsl-codegen/src/compiler/collection.rs"),
-    k("real_time", "crates/nsl-codegen/src/wcet.rs"),
     k("search", "crates/nsl-codegen/src/cep_extract.rs"),
-    k("wcet_budget", "crates/nsl-codegen/src/wcet.rs"),
-    k("zk_lookup", "crates/nsl-codegen/src/zk/mod.rs"),
-    k("zk_proof", "crates/nsl-codegen/src/zk/mod.rs"),
 ];
 
 /// Documentation-advertised names with NO implementation anywhere in the
 /// tree. Each gets a typed refusal that says so — being told a documented
 /// name is "unknown" reads like a typo accusation; being told it is
-/// unimplemented is actionable.
+/// unimplemented is actionable. Names whose subsystem was removed in the
+/// Phase 0.6 scope freeze are here too: the refusal names the attic tag, and
+/// unlike an unknown name it stays an error under
+/// `--allow-unknown-decorators`, so a removed feature cannot be silently
+/// ignored.
 pub static UNIMPLEMENTED_DECORATORS: &[(&str, &str)] = &[
     (
         // Found by this registry's own drift gate: `validate_layout_decorator`
@@ -165,6 +162,55 @@ pub static UNIMPLEMENTED_DECORATORS: &[(&str, &str)] = &[
         "torch",
         "@torch is documentation prose (spec/11-interoperability), not an \
          implemented decorator",
+    ),
+    (
+        // Validated by the checker and threaded into the kernel config, but
+        // every launch site passes null cos/sin tables (expr/advanced.rs
+        // WIRE-HERE, wengert_lower.rs), and the non-CSHA kernel it selects
+        // rotates Q only and has no null guard. Refused rather than left to
+        // read from address ~0 on the first launch.
+        "rope",
+        "@rope asks @flash_attention for in-kernel RoPE, which was never wired: \
+         no launch passes the kernel its cos/sin tables, and that kernel \
+         rotates Q only. Apply RoPE to Q and K before the attention call (as \
+         nsl.nn.gqa does) and remove the decorator",
+    ),
+    // ---- removed in the Phase 0.6 scope freeze -----------------------
+    (
+        "zk_proof",
+        "@zk_proof was removed with the ZK circuit subsystem (M55) in the \
+         Phase 0.6 scope freeze; the code is preserved at tag \
+         `attic/scope-freeze-2026-10`. Remove the decorator",
+    ),
+    (
+        "zk_lookup",
+        "@zk_lookup was removed with the ZK circuit subsystem (M55) in the \
+         Phase 0.6 scope freeze; the code is preserved at tag \
+         `attic/scope-freeze-2026-10`. Remove the decorator",
+    ),
+    (
+        "real_time",
+        "@real_time was removed with WCET analysis (M53) in the Phase 0.6 \
+         scope freeze; the code is preserved at tag \
+         `attic/scope-freeze-2026-10`. Remove the decorator",
+    ),
+    (
+        "wcet_budget",
+        "@wcet_budget was removed with WCET analysis (M53) in the Phase 0.6 \
+         scope freeze; the code is preserved at tag \
+         `attic/scope-freeze-2026-10`. Remove the decorator",
+    ),
+    (
+        "pipeline_agent",
+        "@pipeline_agent was removed with the agents subsystem (M56) in the \
+         Phase 0.6 scope freeze; the code is preserved at tag \
+         `attic/scope-freeze-2026-10`. Remove the decorator",
+    ),
+    (
+        "auto_device_transfer",
+        "@auto_device_transfer was removed with the agents subsystem (M56) \
+         in the Phase 0.6 scope freeze; the code is preserved at tag \
+         `attic/scope-freeze-2026-10`. Remove the decorator",
     ),
 ];
 
@@ -231,6 +277,31 @@ mod tests {
         assert!(find("tie_weights").is_none(), "ghosts are not KNOWN");
         assert!(unimplemented_refusal("tie_weights").is_some());
         assert!(unimplemented_refusal("cpdt").is_none());
+    }
+
+    #[test]
+    fn rope_is_refused_because_no_launch_supplies_its_tables() {
+        assert!(find("rope").is_none(), "@rope is no longer a known decorator");
+        let msg = unimplemented_refusal("rope").expect("@rope must get a typed refusal");
+        assert!(msg.contains("never wired"), "{msg}");
+        assert!(msg.contains("nsl.nn.gqa"), "{msg}");
+    }
+
+    #[test]
+    fn removed_names_refuse_with_the_attic_tag() {
+        for name in [
+            "zk_proof",
+            "zk_lookup",
+            "real_time",
+            "wcet_budget",
+            "pipeline_agent",
+            "auto_device_transfer",
+        ] {
+            assert!(find(name).is_none(), "@{name} was removed");
+            let msg = unimplemented_refusal(name)
+                .unwrap_or_else(|| panic!("@{name} must get a typed refusal"));
+            assert!(msg.contains("attic/scope-freeze-2026-10"), "{msg}");
+        }
     }
 
     #[test]

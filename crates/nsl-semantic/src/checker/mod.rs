@@ -97,12 +97,6 @@ pub struct TypeChecker<'a> {
     /// Replaces the pre-Item-4 behaviour where `validate_pca_decorator`
     /// returned a value that was immediately dropped.
     pub pca_configs: Vec<crate::cftp::PcaConfig>,
-    /// M56: Whether `--linear-types` was passed on the command line.
-    /// Agent declarations are gated behind this flag (E0610).
-    pub linear_types_enabled: bool,
-    /// M56: Spans of all `agent Foo:` declarations collected during the
-    /// top-level decl pass. Used to emit E0610 at the end of that pass.
-    pub agent_decl_spans: Vec<Span>,
 }
 
 impl<'a> TypeChecker<'a> {
@@ -126,8 +120,6 @@ impl<'a> TypeChecker<'a> {
             fused_ce_configs: Vec::new(),
             fused_kl_ce_configs: Vec::new(),
             pca_configs: Vec::new(),
-            linear_types_enabled: false,
-            agent_decl_spans: Vec::new(),
         }
     }
 
@@ -139,17 +131,6 @@ impl<'a> TypeChecker<'a> {
     pub fn check_module(&mut self, module: &Module) {
         // Two-pass: first collect top-level declarations, then check bodies
         self.collect_top_level_decls(&module.stmts);
-
-        // M56: Emit E0610 once after all decls are collected (not inside
-        // collect_top_level_decls, which recurses for Decorated stmts and
-        // would fire the check on every recursive call, causing duplicate
-        // diagnostics for decorated agent declarations).
-        let agent_spans = self.agent_decl_spans.clone();
-        crate::agent::check_linear_types_flag(
-            &agent_spans,
-            self.linear_types_enabled,
-            &mut self.diagnostics,
-        );
 
         for stmt in &module.stmts {
             self.check_stmt(stmt);
@@ -214,11 +195,6 @@ impl<'a> TypeChecker<'a> {
                 }
                 StmtKind::ServeBlock(_) => {
                     // No top-level pre-declaration needed for serve blocks
-                }
-                StmtKind::AgentDef(agent_def) => {
-                    // M56: collect the span for E0610 flag-gate check.
-                    self.agent_decl_spans.push(agent_def.span);
-                    self.declare_symbol(agent_def.name, Type::Unknown, stmt.span, true, false);
                 }
                 StmtKind::Decorated { stmt, .. } => {
                     // Recurse into the inner stmt for pre-declaration

@@ -3,10 +3,11 @@
 //! blocks on every GPU target (roadmap A2 step 3).
 //!
 //! Until step 3 the default CUDA target compiled a `kernel` block straight
-//! from the AST to PTX text (`kernel.rs`, `KernelCompiler`) and only
-//! `--target rocm|metal|webgpu` came through here, for a straight-line
-//! subset. Now every target lowers to `KernelIR`, the verifier checks the
-//! result, and the target's printer (`backend_ptx` for CUDA) renders it.
+//! from the AST to PTX text (`kernel.rs`, `KernelCompiler`) and only the
+//! non-CUDA targets (ROCm, Metal, WebGPU — since removed in the Phase 0.6
+//! scope freeze) came through here, for a straight-line subset. Now every
+//! kernel lowers to `KernelIR`, the verifier checks the result, and
+//! `backend_ptx` renders it.
 //! Stores, `if`/`elif`/`else`, `for ... in range(...)`, `while`, `break`,
 //! `continue`, a bare `return` and assignment to a `let`-declared local are
 //! lowered here; a local that is reassigned inside a branch or a loop body
@@ -59,7 +60,6 @@ pub(crate) fn stmt_kind_name(kind: &StmtKind) -> &'static str {
         StmtKind::VarDecl { .. } => "let/const declaration",
         StmtKind::FnDef(_) => "nested fn definition",
         StmtKind::ModelDef(_) => "model definition",
-        StmtKind::AgentDef(_) => "agent definition",
         StmtKind::StructDef(_) => "struct definition",
         StmtKind::EnumDef(_) => "enum definition",
         StmtKind::TraitDef(_) => "trait definition",

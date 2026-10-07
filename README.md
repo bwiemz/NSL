@@ -167,15 +167,6 @@ nsl check --deterministic file.nsl  # Determinism verification
 
 # GPU (the toolchain itself must be built with `cargo build --features cuda`)
 nsl run file.nsl --target cuda      # Run with the CUDA backend (the default --target)
-
-# Unikernel deployment
-nsl build file.nsl --unikernel --listen 0.0.0.0:8080 --memory 16G
-
-# ZK proofs
-nsl build --zk-circuit file.nsl                                # Compile @zk_proof functions to a circuit
-nsl zk stats model.zkir                                        # Circuit statistics
-nsl zk prove model.zkir --pk key.pk --input inputs.json        # Generate a proof
-nsl zk verify key.vk --proof model.proof --public public.json  # Verify a proof
 ```
 
 ## Project Structure
@@ -263,8 +254,7 @@ source of truth. Read local results against the tier a command belongs to.
 - `cargo test --workspace --no-fail-fast -- --skip e2e_`
 - `cargo clippy --workspace -- -D warnings`
 - `cargo test -p nsl-cli --test e2e -- --test-threads=1` (CLI smoke/e2e)
-- the ONNX Runtime integration job (`test-onnx-rt`) and the FPGA
-  Verilator/Yosys job (`fpga`)
+- the ONNX Runtime integration job (`test-onnx-rt`)
 
 Locally, the test and e2e steps can surface *environment-specific* failures
 (missing C linker, OpenSSL, or CUDA) that do not occur on CI's pinned
@@ -280,7 +270,7 @@ The **compatibility contract** — what is promised not to break across
 versions — is narrower than the CI gate: it is the **Stable** tier in
 [`STATUS.md`](STATUS.md) (frontend, semantic analysis, CPU codegen/runtime,
 fusion, DataLoader, core CLI). Beta and Experimental subsystems (`experimental::*`
-in `nsl-codegen`/`nsl-runtime` — CEP, CFIE, CSHA, WGGO, WRGA, ZK, FPGA, …) are
+in `nsl-codegen`/`nsl-runtime` — CEP, CFIE, CSHA, WGGO, WRGA, …) are
 exercised by CI but may change shape between releases. See each crate's
 `ARCHITECTURE.md` for the stable-vs-experimental module boundary.
 
@@ -337,7 +327,7 @@ Key entry points for contributors:
 ## Known Limitations
 
 - No REPL
-- CUDA required for GPU features (ROCm/Metal/WebGPU KIR built, untested on real hardware)
+- CUDA is the only GPU backend (the ROCm/Metal/WebGPU printers were removed; preserved at tag `attic/scope-freeze-2026-10`)
 - Windows requires Visual Studio Build Tools for linking
 - Fusion fires on elementwise chains; matmul+epilogue fusion (fused bias+relu inside matmul) is analysis-only
 

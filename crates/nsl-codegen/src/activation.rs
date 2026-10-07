@@ -68,7 +68,7 @@ static REQUESTED_DECORATORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Record the entry module's decorator names for reconciliation. Called at
 /// the top of each codegen entry point that receives the entry AST, so every
-/// CLI path (normal, shared-lib, standalone, zk) feeds the same log without
+/// CLI path (normal, shared-lib, standalone) feeds the same log without
 /// threading ASTs into the drivers.
 pub fn note_entry_module_decorators(module: &nsl_ast::Module, interner: &nsl_lexer::Interner) {
     let mut log = REQUESTED_DECORATORS.lock().unwrap_or_else(|e| e.into_inner());
@@ -254,16 +254,6 @@ pub static MANUAL_CONTRACTS: &[Contract] = &[
     flag("embed-threshold", B_ONLY, "standalone", Witness::Config("crates/nsl-cli/src/commands/build/standalone.rs")),
     flag("embed-weights", B_ONLY, "standalone", Witness::Config("crates/nsl-cli/src/commands/build/standalone.rs")),
     flag("vram-budget", B_ONLY, "memory-planner", Witness::Config("crates/nsl-codegen/src/memory_planner.rs")),
-    // WCET family: build/run only. The six were declared-and-dropped on
-    // CheckArgs for a long time; review chose deletion over a bespoke
-    // refusal block — clap's own unknown-argument error IS the refusal, and
-    // the entry-set gate now enforces the BR scope automatically.
-    flag("wcet", BR, "wcet", Witness::Config("crates/nsl-codegen/src/compiler/mod.rs")),
-    flag("wcet-cert", BR, "wcet", Witness::Report("crates/nsl-codegen/src/compiler/mod.rs")),
-    flag("wcet-target", BR, "wcet", Witness::Config("crates/nsl-codegen/src/compiler/mod.rs")),
-    flag("cpu", BR, "wcet", Witness::Config("crates/nsl-codegen/src/compiler/mod.rs")),
-    flag("do178c-report", BR, "wcet", Witness::Report("crates/nsl-codegen/src/compiler/mod.rs")),
-    flag("fpga-device", BR, "wcet", Witness::Config("crates/nsl-codegen/src/compiler/mod.rs")),
     // Report-only surfaces: the artifact/report is the witness.
     flag("fusion-report", B_ONLY, "fusion", Witness::Report("crates/nsl-codegen/src/fusion_report.rs")),
     flag("nan-analysis", CB, "nan-analysis", Witness::Report("crates/nsl-cli/src/commands/build/normal.rs")),
@@ -319,19 +309,12 @@ pub static UNCONTRACTED_FLAGS: &[(&str, &str)] = &[
     ("dump-types", "debug dump plumbing"),
     ("shared-lib", "build-flavor selector (dispatches to run_build_shared)"),
     ("standalone", "build-flavor selector (dispatches to run_build_standalone)"),
-    ("unikernel", "build-flavor selector (M54)"),
-    ("listen", "serve-mode selector"),
     ("trace", "refused on nsl check (see commands/check.rs); nsl debug owns traces"),
     (
         "distribute",
         "REFUSED at dispatch: M43's 3D-parallelism config has no consumer \
          anywhere in the tree — an inert value is an error, not a contract",
     ),
-    ("zk-circuit", "build-flavor selector (dispatches to run_build_zk)"),
-    ("zk-backend", "zk emission parameter, consumed by the zk build flavor"),
-    ("zk-field", "zk emission parameter, consumed by the zk build flavor"),
-    ("zk-solidity", "zk emission parameter, consumed by the zk build flavor"),
-    ("zk-weights", "zk emission parameter, consumed by the zk build flavor"),
     ("activation-report", "the activation mechanism's own reporting switch"),
     ("allow-inert-requests", "the activation mechanism's own escape hatch"),
     ("allow-unknown-decorators", "the namespace close's own escape hatch"),

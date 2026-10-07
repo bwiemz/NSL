@@ -304,13 +304,12 @@ declaration structs (`FnDef`, `ModelDef`, `StructDef`, `Decorator`, `Param`,
 
 | File | Types | Notes |
 |------|-------|-------|
-| `stmt.rs` | `Stmt`, `Block`, `StmtKind` | `StmtKind` has 30 variants: `VarDecl`, the declaration wrappers (`FnDef`, `ModelDef`, `AgentDef`, `StructDef`, `EnumDef`, `TraitDef`), control flow (`If` with `elif_clauses: Vec<(Expr, Block)>`, `For`, `While`, `WhileLet`, `Match`, `Break`, `Continue`, `Return`, `Yield`), `Assign { target, op: AssignOp, value }`, `Import`/`FromImport`, the ML blocks (`TrainBlock`, `DistillBlock`, `GradBlock`, `QuantBlock`, `KernelDef`, `TokenizerDef`, `DatasetDef`, `DatatypeDef`, `ServeBlock`), `Decorated { decorators, stmt: Box<Stmt> }`, and `Expr`. |
+| `stmt.rs` | `Stmt`, `Block`, `StmtKind` | `StmtKind` has 29 variants: `VarDecl`, the declaration wrappers (`FnDef`, `ModelDef`, `StructDef`, `EnumDef`, `TraitDef`), control flow (`If` with `elif_clauses: Vec<(Expr, Block)>`, `For`, `While`, `WhileLet`, `Match`, `Break`, `Continue`, `Return`, `Yield`), `Assign { target, op: AssignOp, value }`, `Import`/`FromImport`, the ML blocks (`TrainBlock`, `DistillBlock`, `GradBlock`, `QuantBlock`, `KernelDef`, `TokenizerDef`, `DatasetDef`, `DatatypeDef`, `ServeBlock`), `Decorated { decorators, stmt: Box<Stmt> }`, and `Expr`. |
 | `expr.rs` | `Expr`, `ExprKind`, `FStringPart`, `SubscriptKind`, `Arg`, `LambdaParam`, `CompGenerator`, `MatchArm` | `ExprKind` has literals, `Ident`/`SelfRef`, `BinaryOp`/`UnaryOp`/`Pipe`, `MemberAccess`/`Subscript`/`Call`, `Lambda`, `BlockExpr`, `ListComp`, `IfExpr`, `MatchExpr`, `Range`, `Paren`, `Await`, and `Error`. `Arg { name: Option<Symbol>, value, span }` is both call arguments and decorator/config kwargs. |
 | `operator.rs` | `BinOp` (20 variants incl. `MatMul`, `FloorDiv`, `Is`, `In`, `BitOr`, `BitAnd`), `UnaryOp { Neg, Not }`, `AssignOp` | The parser's `pratt::token_to_binop` maps tokens onto `BinOp`. |
 | `types.rs` | `TypeExpr`, `TypeExprKind`, `DimExpr`, `DimValue`, `DeviceExpr` | Tensor-shaped types: `Tensor { shape: Vec<DimExpr>, dtype, device }`, `Param`, `Buffer`, `Sparse`; plus `Named`, `Generic`, `Function` (with optional `EffectExpr`), `Union`, `Tuple`, `Wildcard`, `FixedArray`, `Borrow`. `DimExpr` covers concrete, symbolic, named, bounded and wildcard dims. |
 | `pattern.rs` | `Pattern`, `PatternKind`, `FieldPattern` | `Ident`, `Wildcard`, `Literal(Box<Expr>)`, `Tuple`, `List`, `Struct { fields, rest }`, `Constructor { path, args }`, `Or`, `Guarded`, `Rest`, `Typed`. |
 | `decl.rs` | `FnDef`, `Param`, `TypeParam`, `EffectExpr`, `ModelDef`, `ModelMember`, `StructDef`, `StructField`, `EnumDef`, `EnumVariant`, `TraitDef`, `Decorator`, `ImportStmt`, `FromImportStmt`, `ImportItems`, `ImportItem` | `ModelMember::{LayerDecl { decorators, .. }, Method(FnDef, Vec<Decorator>)}` carry member-level decorators. |
-| `agent.rs` | `AgentDef`, `AgentMember` | Mirrors `ModelDef`/`ModelMember` (`FieldDecl`, `Method`). |
 | `block.rs` | `TrainBlock`, `TrainSection`, `CallbackDef`, `DistillBlock`, `GradBlock`, `QuantBlock` (+ `QuantKind`, `QuantDtype`, `QuantGranularity`, `CalibrationConfig`), `KernelDef`, `KeyValueEntry`, `TokenizerDef`/`TokenizerStmt`, `DatasetDef`, `DatatypeDef`/`DatatypeMethod`/`DatatypePtxBlock`, `ServeBlock`/`ServeConfigEntry`/`ServeSubBlock`/`EndpointDef`, `WrgaBlock`/`WrgaMode` | The ML-specific statement payloads. |
 
 Some things worth knowing about `block.rs`:
@@ -340,10 +339,9 @@ Some things worth knowing about `block.rs`:
 
 `Decorator { name: Vec<Symbol>, args: Option<Vec<Arg>>, span }`. `name` is a
 dotted path (`@nsl.export`, `@a.b.c`), one `Symbol` per segment. `args` is
-`None` for `@x` and `Some(vec![])` for `@x()`. Decorators sit in five
+`None` for `@x` and `Some(vec![])` for `@x()`. Decorators sit in four
 carrier positions: `StmtKind::Decorated`, `ModelMember::LayerDecl.decorators`,
-`ModelMember::Method(_, decos)`, `AgentMember::{FieldDecl.decorators,
-Method(_, decos)}`, and `KernelDef.decorators`.
+`ModelMember::Method(_, decos)`, and `KernelDef.decorators`.
 
 ### Walks: `visitor.rs` and `decorator_walk.rs`
 
@@ -357,8 +355,7 @@ walk (types are leaves to the visitor), and `walk_stmt` visits bodies but
 `decorator_walk::collect_decorators(&Module) -> Vec<DecoratorUse<'_>>`
 exists for exactly that gap: it finds every decorator in source order with
 its `DecoratorHost` (`Function`, `Model`, `TrainBlock`, `DistillBlock`,
-`Kernel`, `Agent`, `ModelLayer`, `ModelMethod`, `AgentField`, `AgentMethod`,
-`OtherStmt`). It hand-recurses rather than implementing `Visitor` because
+`Kernel`, `ModelLayer`, `ModelMethod`, `OtherStmt`). It hand-recurses rather than implementing `Visitor` because
 the trait's `&Stmt` has an anonymous lifetime and the collector needs to
 keep `&'a Decorator`. `nsl_semantic` (`crates/nsl-semantic/src/lib.rs`)
 runs it to enforce the closed decorator namespace against
@@ -405,7 +402,7 @@ symbol but matches any identifier), `at_any(&[..])`, `current_span()`,
 
 The grammar itself is free functions taking `&mut Parser`, one file per
 family (`stmt.rs`, `expr.rs`, `types.rs`, `pattern.rs`, `decl.rs`,
-`block.rs`, `agent.rs`), plus `Parser::parse_block` in `parser.rs` because
+`block.rs`), plus `Parser::parse_block` in `parser.rs` because
 every family needs it.
 
 `advance()` never steps past the `Eof` token: consuming `Eof` returns it
@@ -452,10 +449,18 @@ best-effort tree (`nsl fmt`, `nsl check --dump-tokens`) keep going.
 train/distill bodies, datatype methods, after `pub`/`priv` all route through
 it). It wraps `parse_stmt_nested`, a `match p.peek()` dispatch: `@` goes to
 `parse_decorated_stmt`; each statement keyword to its `parse_*_stmt` in
-`stmt.rs`, `decl.rs`, `block.rs` or `agent.rs`; `Pub`/`Priv` to
+`stmt.rs`, `decl.rs` or `block.rs`; `Pub`/`Priv` to
 `parse_visibility_prefixed` (which currently **drops** the visibility and
 returns the inner statement); anything else to `parse_expr_or_assign`,
 which parses an expression and then checks for an assignment operator.
+
+`agent` is still a keyword but no longer starts a declaration: the agents
+subsystem (M56) was removed in the Phase 0.6 scope freeze. Its dispatch arm,
+`refuse_removed_agent_block`, reports one error naming the removal and the
+attic tag `attic/scope-freeze-2026-10`, then skips the header line and its
+indented body (`skip_to_next_line`), so an old program fails with the reason
+instead of reparsing `agent Name:` as an expression statement
+(`err_agent_removed.nsl`, `refusal_table.rs`).
 
 Statement parsers follow one pattern: record `start = p.current_span()`,
 consume the keyword, parse the pieces, and for a line statement call
@@ -581,8 +586,8 @@ newlines, parses the next statement with `parse_stmt`, and wraps it in
 `parse_visibility_prefixed` and yields the same shape.
 
 Member-level decorators are parsed by **inline copies** of the same loop in
-`decl.rs::parse_model_def_stmt` (into `ModelMember`), `agent.rs::parse_agent_def_stmt`
-(into `AgentMember`), and `block.rs::parse_kernel_def_stmt` (into
+`decl.rs::parse_model_def_stmt` (into `ModelMember`) and
+`block.rs::parse_kernel_def_stmt` (into
 `KernelDef.decorators`). `block.rs::parse_datatype_def_stmt` is different:
 `@pack`, `@unpack`, `@backward @pack`, `@pack_ptx`, `@unpack_ptx` and
 `@arithmetic_ptx` are *structural* there and become `DatatypeMethod` / `DatatypePtxBlock`
@@ -665,7 +670,7 @@ Run `cargo test -p nsl-lexer --test goldens`. To add one: drop the `.nsl` in
 review`.
 
 **Parser goldens** — `crates/nsl-parser/tests/goldens.rs` over
-`crates/nsl-parser/tests/parse/*.nsl` (21 fixtures, six of them `err_*`)
+`crates/nsl-parser/tests/parse/*.nsl` (21 fixtures, seven of them `err_*`)
 with `<stem>.ast.snap`: lexer then parser diagnostics, then the `Debug`
 module with `NodeId`s dropped, symbols resolved, and spans as
 `line:col-line:col`. Same `err_` contract and workflow;
@@ -678,7 +683,7 @@ known swallow cases), `body_recovery.rs` (one diagnostic per bad line in
 tokenizer/dataset/key-value bodies, under a 10 s deadline so a non-progress
 regression fails instead of OOM-killing the test process),
 `nesting_limit.rs` (every nesting shape parses at `MAX_NESTING`, one past it
-is refused with one diagnostic, the cascade is dropped), `agent_parse.rs`.
+is refused with one diagnostic, the cascade is dropped).
 Unit tests inside `src/block.rs` (serve/tokenizer/dataset) and
 `src/types.rs` (borrow types). `cargo test -p nsl-parser`.
 

@@ -5,7 +5,7 @@
 //! enforces:
 //!
 //!   1. `@attention_sink` requires `@flash_attention` on the same function
-//!      (mirrors @tree_mask / @gqa / @rope / @paged_kv companion-required
+//!      (mirrors @tree_mask / @gqa / @paged_kv companion-required
 //!      rule).
 //!   2. Unknown args at function scope error (only `tokens` is recognised
 //!      by `compiler/kernel.rs::attention_sink` arm; others would be
@@ -81,7 +81,7 @@ fn forward():
 }
 
 /// Negative (Rule 1): `@attention_sink` without `@flash_attention`
-/// companion errors. Mirrors the @paged_kv / @tree_mask / @gqa / @rope
+/// companion errors. Mirrors the @paged_kv / @tree_mask / @gqa
 /// validation pattern — attention_sink is a flash-attention-only
 /// modifier at function scope and has no meaning standalone.
 #[test]
