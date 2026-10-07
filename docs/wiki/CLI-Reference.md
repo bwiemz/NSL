@@ -200,7 +200,7 @@ nsl build [OPTIONS] <FILE>
 | Flag | Value | Default | Description |
 |---|---|---|---|
 | `-o`, `--output` | `<OUTPUT>` |  | Output file path (default: input stem + .exe on Windows) |
-| `--emit-obj` |  |  | Emit only the object file (skip linking) |
+| `--emit-obj` |  |  | Emit only the object file (skip linking). It goes to -o when given, else &lt;stem&gt;.o beside the source. A program that imports other modules emits one object per module into a scratch directory instead (each path is printed), and -o does not apply |
 | `--dump-ir` |  |  | Print the Cranelift IR for each function |
 | `--standalone` |  |  | Produce a zero-dependency standalone bundle (requires -w/--weights) |
 | `-w`, `--weights` | `<WEIGHTS>` |  | Path to the model weights file to bundle with the standalone executable |
