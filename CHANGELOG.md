@@ -1860,6 +1860,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **`nsl build --emit-obj -o X` writes the object to X.**
+  - **Before.** On a single-module program, `-o` was ignored: the object
+    always went to `<stem>.o` beside the source.
+  - **Linked builds.** A linked build also wrote its intermediate object
+    beside the source. A failed link left it there, and two builds of the
+    same file raced on that path. The intermediate now lives in the build's
+    scratch directory, as the multi-module path's objects already did.
+  - **Programs that import modules.** These emit one object per module, so
+    `-o` cannot hold them. The build now says so instead of ignoring `-o`
+    silently.
+
 - **Numerical gates refuse NaN instead of scoring it a perfect match**
   (external review 2026-10-06, finding 2).
   - **How NaN was dropped.** Error metrics folded with `f32::max` (which
