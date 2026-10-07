@@ -1,0 +1,122 @@
+# The parameter-coverage gate's fixture (param_coverage_gate.rs, NSL V2
+# plan item 0.4). One model that holds a tensor in every construct a model
+# can hold one in:
+#   - plain tensor fields (`tied`, `proj`, `head`, `Blk.b`);
+#   - a nested sub-model (`inner: Inner`);
+#   - a `[Blk; 2]` model array;
+#   - a field used in two places (`tied`: the input projection, and its
+#     transpose before the head -- weight tying as NSL spells it);
+#   - `@freeze` on a model definition (`Frozen`: every instance) and on the
+#     binding (`pinned`) -- both must come out of training unchanged;
+#   - non-trainable state: `_`-prefixed (`Inner._gain`), `inv_freq`, and a
+#     `Buffer<...>` field (`buf`);
+#   - adapters: LoRA on a `[Blk; 2]` layer, on a top-level field, and on the
+#     frozen sub-model's weight (an adapter is never frozen); IA3 on the
+#     nested sub-model; GatedLoRA on a top-level field.
+# Every tensor feeds the loss, so each one gets a nonzero gradient.
+#
+# The harness reads the struct fields from `model_save` before and after
+# training, and the adapters' side-table tensors, which `model_save` does not
+# write, from `snapshot`: each `ADAPTER <path>` line is followed by that
+# tensor, `*` standing for the array index in iteration order. `snapshot`
+# must print every adapter the declarations below create -- the harness
+# derives that set from them and fails on one that is missing.
+
+model Blk:
+    w: Tensor = randn([4, 4]) * 0.5
+    b: Tensor = randn([4]) * 0.2
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w + self.b
+
+model Inner:
+    u: Tensor = randn([4, 4]) * 0.5
+    _gain: Tensor = full([4], 1.5)
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return (x @ self.u) * self._gain
+
+@freeze
+model Frozen:
+    v: Tensor = randn([4, 4]) * 0.5
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.v
+
+model Net:
+    tied: Tensor = randn([4, 4]) * 0.5
+    blocks: [Blk; 2] = Blk()
+    inner: Inner = Inner()
+    fz: Frozen = Frozen()
+    pinned: Tensor = randn([4, 4]) * 0.5
+    proj: Tensor = randn([4, 4]) * 0.5
+    head: Tensor = randn([4, 4]) * 0.5
+    inv_freq: Tensor = full([4], 1.25)
+    buf: Buffer<[4], f32> = full([4], 0.75)
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = x @ self.tied
+        for block in self.blocks:
+            h = block.forward(h)
+        h = self.fz.forward(self.inner.forward(h))
+        h = ((h @ self.pinned) @ self.proj) * self.inv_freq * self.buf
+        return (h @ self.tied.transpose(0, 1)) @ self.head
+
+fn snapshot(net: Net):
+    print("ADAPTERS_BEGIN")
+    for block in net.blocks:
+        let a: Tensor = block.lora_A_Blk_w__lora
+        print("ADAPTER blocks.*.lora_A_Blk_w__lora")
+        print(a)
+        let b: Tensor = block.lora_B_Blk_w__lora
+        print("ADAPTER blocks.*.lora_B_Blk_w__lora")
+        print(b)
+    let head_a: Tensor = net.lora_A_Net_head__lora
+    print("ADAPTER lora_A_Net_head__lora")
+    print(head_a)
+    let head_b: Tensor = net.lora_B_Net_head__lora
+    print("ADAPTER lora_B_Net_head__lora")
+    print(head_b)
+    let fz_a: Tensor = net.fz.lora_A_Frozen_v__lora
+    print("ADAPTER fz.lora_A_Frozen_v__lora")
+    print(fz_a)
+    let fz_b: Tensor = net.fz.lora_B_Frozen_v__lora
+    print("ADAPTER fz.lora_B_Frozen_v__lora")
+    print(fz_b)
+    let ia3: Tensor = net.inner.ia3_scale_Inner_u__ia3
+    print("ADAPTER inner.ia3_scale_Inner_u__ia3")
+    print(ia3)
+    let proj_a: Tensor = net.lora_A_Net_proj__gatedlora
+    print("ADAPTER lora_A_Net_proj__gatedlora")
+    print(proj_a)
+    let proj_b: Tensor = net.lora_B_Net_proj__gatedlora
+    print("ADAPTER lora_B_Net_proj__gatedlora")
+    print(proj_b)
+    let proj_gate: Tensor = net.gate_Net_proj__gatedlora
+    print("ADAPTER gate_Net_proj__gatedlora")
+    print(proj_gate)
+    print("ADAPTERS_END")
+
+@freeze(include=["pinned"])
+@adapter(type=lora, target=["Blk.w", "Net.head", "Frozen.v"], rank=2, alpha=4)
+@adapter(type=ia3, target=["Inner.u"])
+@adapter(type=gatedlora, target=["Net.proj"], rank=2)
+let m = Net()
+
+let x = (arange(12).reshape([3, 4])) * 0.1 + full([3, 4], 0.1)
+let y = (arange(12).reshape([3, 4])) * 0.2 - full([3, 4], 1.0)
+
+model_save(m, "init.nslm")
+snapshot(m)
+
+# Three SGD steps (no momentum, no weight decay: a parameter moves iff its
+# gradient is nonzero). Three, not one: a LoRA A's gradient flows through
+# its B, which starts at zero, so A first moves on step 2.
+train(model = m, epochs = 3):
+    optimizer: SGD(lr = 0.1, momentum = 0.0, weight_decay = 0.0)
+    step(batch):
+        let d = m.forward(x) - y
+        let loss = mean(d * d)
+
+model_save(m, "end.nslm")
+snapshot(m)
