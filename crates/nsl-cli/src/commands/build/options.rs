@@ -107,6 +107,8 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
             activation_report: _activation_report,
             allow_inert_requests: _allow_inert_requests,
             allow_unknown_decorators,
+            // Consumed by `toolchain::enforce_pin` in main_inner, before dispatch.
+            ignore_toolchain_pin: _ignore_toolchain_pin,
     } = args;
 
     crate::activation_enforce::apply_allow_unknown_decorators(allow_unknown_decorators);

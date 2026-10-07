@@ -9,6 +9,9 @@ pub mod monitor;
 pub mod profile;
 pub mod profile_render;
 pub mod shape_debug;
+// Toolchain pinning (NSL V2 plan 0.1): `nsl run`/`nsl build` honour a model
+// directory's `nsl-toolchain.toml`; `args.rs` takes `nsl --version` from here.
+pub mod toolchain;
 pub mod wggo_explain;
 
 // The multi-module frontend: `loader::load_all_modules` (lex, parse, resolve

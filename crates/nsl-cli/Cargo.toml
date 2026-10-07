@@ -36,6 +36,8 @@ nsl-runtime = { path = "../nsl-runtime", features = ["interop"] }
 # Diagnostics (`nsl_log!`, roadmap C3): the tracing-only front door.
 nsl-log.workspace = true
 clap.workspace = true
+# `nsl-toolchain.toml` (toolchain.rs): `deny_unknown_fields` on both levels.
+serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 safetensors = "0.8"

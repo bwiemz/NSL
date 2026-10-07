@@ -41,6 +41,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
       stream catch it.
   - **No resume bug found.** The resume was exact on every posture.
 
+- **Toolchain pinning** (NSL V2 plan, Phase 0 item 0.1). Production coder
+  runs stay on a long-term-support toolchain while the V2 redesign lands on
+  `main`.
+  - **Channels.** Every build belongs to a toolchain channel: `dev` on
+    `main`, `0.10-lts` on `release/0.10-lts`. `nsl --version` prints it, as
+    in `nsl 0.10.0 (toolchain channel dev)`.
+  - **Pins.** A model directory's `nsl-toolchain.toml` (`[toolchain]
+    channel = "0.10-lts"`) pins every `nsl run` / `nsl build` of a file in
+    or below it. `models/coder500m`, `coder1b`, `coder7b` and `coder-rl` are
+    pinned. `coder50m` is not, because the V2 parity gate runs it on the dev
+    toolchain.
+  - **Mismatches.** A toolchain of another channel hands the invocation over,
+    with the same arguments, to `~/.nsl/toolchains/<channel>/bin/nsl`. If
+    that is not installed, it refuses and says how to install it.
+    `--ignore-toolchain-pin` runs on the invoked toolchain anyway. A
+    malformed pin file is an error, with or without the flag.
+  - **Installing.** `scripts/install-toolchain.sh <channel> <git-ref>` builds
+    a ref (`--profile dist`, default features `cuda`) in a temporary worktree.
+    It installs the release layout only if the build reports the requested
+    channel and can compile a program against its own stdlib and runtime.
+  - **Gates.** `toolchain::tests` and `tests/toolchain_pin.rs`. The latter
+    drives the binary through refusal, override, malformed pins and
+    `--version`, and on unix through a real handover to a stub toolchain.
+    The gates that build the pinned production recipes pass
+    `--ignore-toolchain-pin`.
+
 - **Tape-AD backward certification inventory (NSL V2 item 0.4) and 103 new
   certificates.** `nsl_runtime::autodiff::tape_cert_status` gives every
   `TapeOp` a status with no wildcard arm: 22 `Certified`, 20 `Defective`

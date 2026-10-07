@@ -16,6 +16,8 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             activation_report: _activation_report,
             allow_inert_requests: _allow_inert_requests,
             allow_unknown_decorators,
+            // Consumed by `toolchain::enforce_pin` in main_inner, before dispatch.
+            ignore_toolchain_pin: _ignore_toolchain_pin,
             profile_memory,
             profile_kernels,
             profile,

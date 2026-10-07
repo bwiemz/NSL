@@ -39,6 +39,9 @@ fn prod_500m_recipe_fuses_above_the_observed_floor() {
 
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_nsl"))
         .args(["build", "--source-ad", "--checkpoint-blocks", "--fuse-rmsnorm-backward"])
+        // models/coder500m/ is pinned to the LTS toolchain
+        // (nsl-toolchain.toml); this gate measures the dev toolchain.
+        .arg("--ignore-toolchain-pin")
         .arg(root.join("models/coder500m/pretrain_prod.nsl"))
         .args(["--emit-obj", "-o"])
         .arg(tmp.join("prod500m.o"))
