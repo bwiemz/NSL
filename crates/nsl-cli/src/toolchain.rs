@@ -59,7 +59,7 @@ use serde::Deserialize;
 /// and `nsl --version` says which channel a binary is.
 macro_rules! nsl_channel {
     () => {
-        "dev"
+        "0.10-lts"
     };
 }
 
