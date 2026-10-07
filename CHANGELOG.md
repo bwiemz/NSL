@@ -1834,6 +1834,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **The source-AD fallback is documented as it behaves.**
+  - **What the docs said.** README and SPECIFICATION said a failed source-AD
+    extraction always falls back to tape AD.
+  - **What happens.** It falls back, with a warning, only when the tape can
+    honour the request. It is a compile error for features only source AD
+    implements: `--layerwise-accum`, `--fuse-lm-head require`, a WGGO layer
+    prune, and `distill` blocks. It is also a compile error for a value the
+    tape would have to guess, such as an unresolvable dropout probability.
+  - **The `--fuse-lm-head require` refusal.** Its message was missing its
+    `\` line continuations and carried runs of spaces. It is now pinned by
+    `lm_head_inference_gate::an_unextractable_step_body_refuses_under_require_and_falls_back_under_auto`,
+    the first test of that refusal.
+
 - **Every accepted `--target` spelling now compiles `@flash_attention`
   instead of panicking.**
   - **The bug.** The CLI accepted `cuda`, `sm_<N>`, `sm<N>`, `cuda_sm<N>` and

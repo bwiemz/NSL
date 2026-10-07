@@ -234,7 +234,7 @@ block_kv with fused projections) are rejected at compile time.
 - Reverse-mode adjoint generation
 - Enabled for `train(...)` and standalone `grad(...)` under `--source-ad`
 - If/else branch support with condition saving
-- Unsupported extraction, unresolved grad targets, or lowering failures emit a diagnostic and fall back to tape AD instead of changing gradient semantics
+- Unsupported extraction, unresolved grad targets, or lowering failures emit a diagnostic and fall back to tape AD instead of changing gradient semantics — except where the tape cannot honour the request, which is a compile error: source-AD-only features (`--layerwise-accum`, `--fuse-lm-head require`, a WGGO layer prune, `distill` blocks) and values the tape would have to guess (an unresolvable dropout probability)
 - Dead gradient elimination
 
 ---

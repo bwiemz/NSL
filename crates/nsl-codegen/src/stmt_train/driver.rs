@@ -1217,7 +1217,10 @@ impl Compiler<'_> {
                     == crate::lm_head_inference::LmHeadFusion::Require
                 {
                     return Err(CodegenError::new(
-                        "--fuse-lm-head require: source-AD extraction failed,                          and the tape fallback cannot fuse an LM head.                          Restrict the step body to source-AD-supported                          operations or drop `require`",
+                        "--fuse-lm-head require: source-AD extraction failed, \
+                         and the tape fallback cannot fuse an LM head. \
+                         Restrict the step body to source-AD-supported \
+                         operations or drop `require`",
                     ));
                 }
                 // A WGGO layer prune rewrites the extracted forward; the

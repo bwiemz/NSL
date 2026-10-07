@@ -143,7 +143,7 @@ for batch in loader:
 
 NSL uses tape-based reverse-mode AD by default for `train(...)` and standalone `grad(...)` blocks. Pass `--source-ad` to ask the compiler to lower supported static graphs at compile time instead.
 
-If source AD cannot extract or resolve a supported gradient graph, NSL emits a diagnostic and falls back to tape AD rather than changing program behavior.
+If source AD cannot extract or resolve a supported gradient graph, NSL prints a warning (`source AD extraction failed, falling back to tape-based AD`) and runs that block on tape AD, with the same gradient semantics. It refuses instead, with a compile error, when the tape cannot honour what was asked: a feature only source AD implements (`--layerwise-accum`, `--fuse-lm-head require`, a WGGO layer prune, `distill` blocks), or a value the tape would have to guess (an unresolvable dropout probability).
 
 ## CLI Reference
 
