@@ -134,41 +134,36 @@ pub fn tape_cert_status(op: &TapeOp) -> TapeCertStatus {
             "transpose_3d_vgrad",
             "transpose_3d_vin",
         ]),
-        TapeOp::SumReduce { .. } => Defective {
-            certified: &[
-                "sum_all",
-                "sum_dim",
-                "sum_dim_neg",
-                "sum_dim_keepdim",
-                "sum_dim_last",
-                "sum_dim_keepdim_mid",
-                "sum_dim_vin",
-            ],
-            defects: &["sum_dim_keepdim_mid_vgrad"],
-        },
-        TapeOp::MeanReduce { .. } => Defective {
-            certified: &[
-                "mean_all",
-                "mean_dim",
-                "mean_dim_last",
-                "mean_dim_keepdim_mid",
-                "mean_dim_vin",
-            ],
-            defects: &["mean_dim_keepdim_mid_vgrad"],
-        },
+        TapeOp::SumReduce { .. } => Certified(&[
+            "sum_all",
+            "sum_dim",
+            "sum_dim_neg",
+            "sum_dim_keepdim",
+            "sum_dim_last",
+            "sum_dim_keepdim_mid",
+            "sum_dim_keepdim_mid_vgrad",
+            "sum_dim_vin",
+        ]),
+        TapeOp::MeanReduce { .. } => Certified(&[
+            "mean_all",
+            "mean_dim",
+            "mean_dim_last",
+            "mean_dim_keepdim_mid",
+            "mean_dim_keepdim_mid_vgrad",
+            "mean_dim_vin",
+        ]),
         // CPU only. The GPU record site (`nsl_tensor_reduce_max`, cuda arm)
         // saves an all-zero argmax, so on the GPU this arm routes every
         // output's gradient to index 0 of the reduced dim.
-        TapeOp::ReduceMax { .. } => Defective {
-            certified: &[
-                "reduce_max_dim1",
-                "reduce_max_dim0",
-                "reduce_max_keepdim_last",
-                "reduce_max_mid",
-                "reduce_max_dim1_vin",
-            ],
-            defects: &["reduce_max_keepdim_mid", "reduce_max_keepdim_last_vgrad"],
-        },
+        TapeOp::ReduceMax { .. } => Certified(&[
+            "reduce_max_dim1",
+            "reduce_max_dim0",
+            "reduce_max_keepdim_last",
+            "reduce_max_keepdim_mid",
+            "reduce_max_mid",
+            "reduce_max_keepdim_last_vgrad",
+            "reduce_max_dim1_vin",
+        ]),
         TapeOp::Gather { .. } => Certified(&[
             "gather",
             "gather_neg",
@@ -180,60 +175,36 @@ pub fn tape_cert_status(op: &TapeOp) -> TapeCertStatus {
         TapeOp::Log { .. } => Certified(&["log", "log_vgrad", "log_vin"]),
         TapeOp::Sqrt { .. } => Certified(&["sqrt", "sqrt_vgrad", "sqrt_vin"]),
         TapeOp::Abs { .. } => Certified(&["abs", "abs_vgrad", "abs_vin"]),
-        TapeOp::Clamp { .. } => Defective {
-            certified: &["clamp"],
-            defects: &["clamp_vgrad", "clamp_vin"],
-        },
-        TapeOp::ReLU { .. } => Defective {
-            certified: &["relu"],
-            defects: &["relu_vgrad", "relu_vin"],
-        },
-        TapeOp::GELU { .. } => Defective {
-            certified: &["gelu"],
-            defects: &["gelu_vgrad", "gelu_vin"],
-        },
-        TapeOp::SiLU { .. } => Defective {
-            certified: &["silu"],
-            defects: &["silu_vgrad", "silu_vin"],
-        },
+        TapeOp::Clamp { .. } => Certified(&["clamp", "clamp_vgrad", "clamp_vin"]),
+        TapeOp::ReLU { .. } => Certified(&["relu", "relu_vgrad", "relu_vin"]),
+        TapeOp::GELU { .. } => Certified(&["gelu", "gelu_vgrad", "gelu_vin"]),
+        TapeOp::SiLU { .. } => Certified(&["silu", "silu_vgrad", "silu_vin"]),
         TapeOp::Sin { .. } => Certified(&["sin", "sin_vgrad", "sin_vin"]),
         TapeOp::Cos { .. } => Certified(&["cos", "cos_vgrad", "cos_vin"]),
-        TapeOp::Sigmoid { .. } => Defective {
-            certified: &["sigmoid", "sigmoid_vin"],
-            defects: &["sigmoid_vgrad"],
-        },
-        TapeOp::Tanh { .. } => Defective {
-            certified: &["tanh", "tanh_vin"],
-            defects: &["tanh_vgrad"],
-        },
-        TapeOp::Softmax { .. } => Defective {
-            certified: &[
-                "softmax_last",
-                "softmax_dim0",
-                "softmax_mid",
-                "softmax_last_vin",
-            ],
-            defects: &["softmax_last_vgrad"],
-        },
-        TapeOp::LogSoftmax { .. } => Defective {
-            certified: &[
-                "log_softmax_last",
-                "log_softmax_dim0",
-                "log_softmax_mid",
-                "log_softmax_last_vin",
-            ],
-            defects: &["log_softmax_last_vgrad"],
-        },
-        TapeOp::Slice { .. } => Defective {
-            certified: &[
-                "slice_dim1",
-                "slice_dim0",
-                "slice_neg",
-                "slice_mid",
-                "slice_dim1_vin",
-            ],
-            defects: &["slice_dim1_vgrad"],
-        },
+        TapeOp::Sigmoid { .. } => Certified(&["sigmoid", "sigmoid_vgrad", "sigmoid_vin"]),
+        TapeOp::Tanh { .. } => Certified(&["tanh", "tanh_vgrad", "tanh_vin"]),
+        TapeOp::Softmax { .. } => Certified(&[
+            "softmax_last",
+            "softmax_dim0",
+            "softmax_mid",
+            "softmax_last_vgrad",
+            "softmax_last_vin",
+        ]),
+        TapeOp::LogSoftmax { .. } => Certified(&[
+            "log_softmax_last",
+            "log_softmax_dim0",
+            "log_softmax_mid",
+            "log_softmax_last_vgrad",
+            "log_softmax_last_vin",
+        ]),
+        TapeOp::Slice { .. } => Certified(&[
+            "slice_dim1",
+            "slice_dim0",
+            "slice_neg",
+            "slice_mid",
+            "slice_dim1_vgrad",
+            "slice_dim1_vin",
+        ]),
         TapeOp::Reshape { .. } => Certified(&["reshape", "reshape_vgrad", "reshape_vin"]),
         TapeOp::Cat { .. } => Certified(&[
             "cat_dim0",
@@ -243,51 +214,43 @@ pub fn tape_cert_status(op: &TapeOp) -> TapeCertStatus {
             "cat_dim1_vgrad",
             "cat_dim1_vin",
         ]),
-        TapeOp::EmbeddingLookup { .. } => Defective {
-            certified: &["embedding"],
-            defects: &["embedding_vgrad", "embedding_vin"],
-        },
-        TapeOp::LayerNorm { .. } => Defective {
-            certified: &[
-                "layernorm",
-                "layernorm_eps",
-                "layernorm_3d",
-                "layernorm_field_eps",
-            ],
-            defects: &["layernorm_vgrad", "layernorm_vin"],
-        },
-        TapeOp::RMSNorm { .. } => Defective {
-            certified: &[
-                "rmsnorm",
-                "rmsnorm_eps",
-                "rmsnorm_field_eps",
-                "rmsnorm_field_eps_reused",
-            ],
-            defects: &["rmsnorm_vgrad", "rmsnorm_vin"],
-        },
-        TapeOp::Dropout { .. } => Defective {
-            certified: &["dropout_seeded"],
-            defects: &["dropout_seeded_vgrad", "dropout_seeded_vin"],
-        },
-        TapeOp::Conv2d { .. } => Defective {
-            certified: &["conv2d"],
-            defects: &["conv2d_vgrad", "conv2d_vin"],
-        },
-        TapeOp::MaxPool2d { .. } => Defective {
-            certified: &["maxpool2d", "maxpool2d_overlap", "maxpool2d_pad"],
-            defects: &["maxpool2d_vgrad", "maxpool2d_vin"],
-        },
+        TapeOp::EmbeddingLookup { .. } => {
+            Certified(&["embedding", "embedding_vgrad", "embedding_vin"])
+        }
+        TapeOp::LayerNorm { .. } => Certified(&[
+            "layernorm",
+            "layernorm_eps",
+            "layernorm_3d",
+            "layernorm_field_eps",
+            "layernorm_vgrad",
+            "layernorm_vin",
+        ]),
+        TapeOp::RMSNorm { .. } => Certified(&[
+            "rmsnorm",
+            "rmsnorm_eps",
+            "rmsnorm_field_eps",
+            "rmsnorm_field_eps_reused",
+            "rmsnorm_vgrad",
+            "rmsnorm_vin",
+        ]),
+        TapeOp::Dropout { .. } => Certified(&[
+            "dropout_seeded",
+            "dropout_seeded_vgrad",
+            "dropout_seeded_vin",
+        ]),
+        TapeOp::Conv2d { .. } => Certified(&["conv2d", "conv2d_vgrad", "conv2d_vin"]),
+        TapeOp::MaxPool2d { .. } => Certified(&[
+            "maxpool2d",
+            "maxpool2d_overlap",
+            "maxpool2d_pad",
+            "maxpool2d_vgrad",
+            "maxpool2d_vin",
+        ]),
         TapeOp::RotateHalf { .. } => {
             Certified(&["rotate_half", "rotate_half_vgrad", "rotate_half_vin"])
         }
-        TapeOp::BiasAdd { .. } => Defective {
-            certified: &["bias_add"],
-            defects: &["bias_add_vgrad", "bias_add_vin"],
-        },
-        TapeOp::Unsqueeze { .. } => Defective {
-            certified: &["unsqueeze", "unsqueeze_vin"],
-            defects: &["unsqueeze_vgrad"],
-        },
+        TapeOp::BiasAdd { .. } => Certified(&["bias_add", "bias_add_vgrad", "bias_add_vin"]),
+        TapeOp::Unsqueeze { .. } => Certified(&["unsqueeze", "unsqueeze_vgrad", "unsqueeze_vin"]),
         TapeOp::Expand { .. } => Certified(&["expand", "expand_vgrad"]),
         TapeOp::Stack { .. } => Certified(&[
             "stack_dim0",

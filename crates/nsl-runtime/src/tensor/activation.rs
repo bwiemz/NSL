@@ -589,11 +589,25 @@ pub(crate) fn nsl_tensor_clamp_backward(
     min_val: f64,
     max_val: f64,
 ) -> i64 {
+    // Read only by the cuda device-dispatch below.
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
     let grad = NslTensor::from_ptr(grad_ptr);
     #[cfg(feature = "cuda")]
     if grad.device > 0 {
         return crate::cuda::gpu_clamp_backward(grad_ptr, input_ptr, min_val as f32, max_val as f32);
     }
+    // The host loop reads both operands linearly: the gradient (a strided view
+    // when a `.transpose` follows the op) and the saved input (a strided view
+    // when the forward was handed one) must be row-major.
+    super::with_row_major([grad_ptr, input_ptr], |[g, x]| {
+        clamp_backward_host(g, x, min_val, max_val)
+    })
+}
+
+/// `nsl_tensor_clamp_backward`'s host loop; both operands row-major
+/// (`with_row_major`).
+fn clamp_backward_host(grad_ptr: i64, input_ptr: i64, min_val: f64, max_val: f64) -> i64 {
+    let grad = NslTensor::from_ptr(grad_ptr);
     let input = NslTensor::from_ptr(input_ptr);
     let len = input.len;
     let ndim = input.ndim;

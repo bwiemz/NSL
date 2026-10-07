@@ -325,8 +325,13 @@ held to f64 central differences — and that file verifies each claim: a named
 certificate exists, passes in tape mode, and its traced run
 (`NSL_DEBUG_MEM_TRACE=1` logs `[tape-trace] record <Variant>`) records the
 op. Layout is an axis there: each base certificate has `_vgrad` (strided
-output gradient) and `_vin` (strided input) variants, and `Defective` lists
-the ops whose arm, or CPU forward, indexes storage linearly and fails them.
+output gradient) and `_vin` (strided input) variants. `Defective` names the
+certificates an op fails, ratcheted as known failures; none is listed today.
+The 20 ops it first listed read a strided gradient, saved input or forward
+input in storage order; their CPU loops now take their operands through
+`tensor::with_row_major`, which hands a row-major tensor through as itself
+(one more ref, so contiguous programs are unchanged) and a strided view as a
+row-major copy, released when the loop returns.
 
 **Per-call contexts.** For the host-facing C API the tape is not left in the
 thread-local: `nsl_model_forward_grad` (`src/grad_context.rs`) records, then

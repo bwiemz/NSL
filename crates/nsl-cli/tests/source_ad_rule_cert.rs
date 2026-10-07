@@ -924,16 +924,13 @@ fn base_certs() -> Vec<Cert> {
         Cert { name: "reduce_max_keepdim_last", inputs: X_234.to_vec(), expr: "reduce_max(x, -1, 1)", wrt: &["x"], out_shape: &[2, 3, 1],
             oracle: oracle!(|e| Arr { shape: vec![2, 3, 1], data: reduce_dim(get(e, "x"), 2, max_of).data }),
             known: tape_only!("source AD does not extract `reduce_max`"), prelude: "" },
-        // DEFECT PROBE. Over a non-last dim, keepdim misroutes the gradient.
+        // keepdim over a non-last dim: every dim after the kept size-1 one
+        // must read its own index (`scatter_grad_to_argmax` once read the
+        // kept dim's 0 for all of them, routing the whole gradient to the
+        // last dim's first slot).
         Cert { name: "reduce_max_keepdim_mid", inputs: X_234.to_vec(), expr: "reduce_max(x, -2, 1)", wrt: &["x"], out_shape: &[2, 1, 4],
             oracle: oracle!(|e| Arr { shape: vec![2, 1, 4], data: reduce_dim(get(e, "x"), 1, max_of).data }),
-            known: &[
-                (Mode::Tape, "keepdim over a non-last dim: `scatter_grad_to_argmax` walks the keepdim \
-                    gradient's index with a counter that skips only the reduced dim, so every dim after \
-                    it reads the kept size-1 dim's index 0 and the whole gradient lands in the last \
-                    dim's first slot"),
-                (Mode::Source, "source AD does not extract `reduce_max`: the grad block falls back to the tape"),
-            ], prelude: "" },
+            known: tape_only!("source AD does not extract `reduce_max`"), prelude: "" },
         Cert { name: "reduce_max_mid", inputs: X_234.to_vec(), expr: "reduce_max(x, 1, 0).reshape([2, 4])", wrt: &["x"], out_shape: &[2, 4],
             oracle: oracle!(|e| reduce_dim(get(e, "x"), 1, max_of)), known: tape_only!("source AD does not extract `reduce_max`"), prelude: "" },
         Cert { name: "slice_dim1", inputs: X_34.to_vec(), expr: "x.slice(1, 1, 3)", wrt: &["x"], out_shape: &[3, 2],
@@ -998,19 +995,20 @@ enum Layout {
     ViewIn,
 }
 
-/// Why a strided output gradient breaks a tape arm (`_vgrad`), or a strided
-/// input an op (`_vin`): CPU code that indexes a tensor's storage linearly,
-/// as if every tensor were row-major contiguous.
-const GRAD_LINEAR: &str = "the tape backward reads the output gradient's storage linearly \
-     (`data.add(i)`), ignoring the strides of the view the `.transpose` after the op hands it";
-const SAVED_LINEAR: &str = "the tape backward reads the saved (strided) input's storage \
-     linearly, pairing each gradient element with the wrong input element";
-
 /// The layout variants, one row per (base, layout) with the known failures
 /// the variant adds to its base's (a tape-only base's fall back carries
 /// over). Chosen so the transpose meets the op's output directly: a base
 /// whose output passes through a `.reshape` first (`sum_dim`, `gather_mid`)
 /// would hand the op a materialized gradient and certify nothing new.
+///
+/// What these catch: CPU code that indexes a tensor's storage linearly
+/// (`data.add(i)`, a `memcpy` of the buffer), as if every tensor were
+/// row-major. A strided gradient view (`_vgrad`) or a strided input -- read by
+/// the forward and saved for the backward (`_vin`) -- then pairs elements in
+/// storage order. When they were added, 31 of these failed for that reason
+/// in tape mode (and conv2d / embedding in source mode too, through the
+/// shared CPU kernels); every CPU kernel involved now reads its operands
+/// through `nsl_runtime::tensor::with_row_major`, and none is listed.
 #[rustfmt::skip]
 const LAYOUT_VARIANTS: &[(&str, Layout, Known)] = &[
     ("add_row", Layout::ViewGrad(0, 1), &[]),
@@ -1023,38 +1021,35 @@ const LAYOUT_VARIANTS: &[(&str, Layout, Known)] = &[
     ("mul_literal", Layout::ViewGrad(0, 1), &[]),
     ("add_literal", Layout::ViewGrad(0, 1), &[]),
     ("transpose_3d", Layout::ViewGrad(0, 2), &[]),
-    ("sum_dim_keepdim_mid", Layout::ViewGrad(0, 2), &[(Mode::Tape, "`broadcast_grad_along_dim` reads the strided keepdim gradient's storage linearly")]),
-    ("mean_dim_keepdim_mid", Layout::ViewGrad(0, 2), &[(Mode::Tape, "`broadcast_grad_along_dim` reads the strided keepdim gradient's storage linearly")]),
-    ("reduce_max_keepdim_last", Layout::ViewGrad(0, 1), &[(Mode::Tape, "`scatter_grad_to_argmax` reads the strided gradient's storage linearly")]),
+    ("sum_dim_keepdim_mid", Layout::ViewGrad(0, 2), &[]),
+    ("mean_dim_keepdim_mid", Layout::ViewGrad(0, 2), &[]),
+    ("reduce_max_keepdim_last", Layout::ViewGrad(0, 1), &[]),
     ("exp", Layout::ViewGrad(0, 1), &[]),
     ("log", Layout::ViewGrad(0, 1), &[]),
     ("sqrt", Layout::ViewGrad(0, 1), &[]),
     ("abs", Layout::ViewGrad(0, 1), &[]),
-    ("clamp", Layout::ViewGrad(0, 1), &[(Mode::Tape, GRAD_LINEAR)]),
-    ("relu", Layout::ViewGrad(0, 1), &[(Mode::Tape, GRAD_LINEAR)]),
-    ("gelu", Layout::ViewGrad(0, 1), &[(Mode::Tape, GRAD_LINEAR)]),
-    ("silu", Layout::ViewGrad(0, 1), &[(Mode::Tape, GRAD_LINEAR)]),
+    ("clamp", Layout::ViewGrad(0, 1), &[]),
+    ("relu", Layout::ViewGrad(0, 1), &[]),
+    ("gelu", Layout::ViewGrad(0, 1), &[]),
+    ("silu", Layout::ViewGrad(0, 1), &[]),
     ("sin", Layout::ViewGrad(0, 1), &[]),
     ("cos", Layout::ViewGrad(0, 1), &[]),
-    ("sigmoid", Layout::ViewGrad(0, 1), &[(Mode::Tape, GRAD_LINEAR)]),
-    ("tanh", Layout::ViewGrad(0, 1), &[(Mode::Tape, GRAD_LINEAR)]),
-    ("softmax_last", Layout::ViewGrad(0, 1), &[(Mode::Tape, GRAD_LINEAR)]),
-    ("log_softmax_last", Layout::ViewGrad(0, 1), &[(Mode::Tape, GRAD_LINEAR)]),
-    ("slice_dim1", Layout::ViewGrad(0, 1), &[(Mode::Tape, "`slice_backward` splits each flat index by the strided gradient's own strides as if they were contiguous ones, and reads its storage linearly")]),
+    ("sigmoid", Layout::ViewGrad(0, 1), &[]),
+    ("tanh", Layout::ViewGrad(0, 1), &[]),
+    ("softmax_last", Layout::ViewGrad(0, 1), &[]),
+    ("log_softmax_last", Layout::ViewGrad(0, 1), &[]),
+    ("slice_dim1", Layout::ViewGrad(0, 1), &[]),
     ("reshape", Layout::ViewGrad(0, 1), &[]),
     ("cat_dim1", Layout::ViewGrad(0, 1), &[]),
-    ("embedding", Layout::ViewGrad(0, 1), &[(Mode::Tape, "the EmbeddingLookup arm accumulates dW from the gradient's storage read linearly")]),
-    ("layernorm", Layout::ViewGrad(0, 1), &[(Mode::Tape, "`layernorm_backward` reads dy's storage linearly: dx, dw and db are all wrong")]),
-    ("rmsnorm", Layout::ViewGrad(0, 1), &[(Mode::Tape, "`rmsnorm_backward` reads dy's storage linearly: dx and dw are wrong")]),
-    ("dropout_seeded", Layout::ViewGrad(0, 1), &[(Mode::Tape, "`dropout_backward` pairs gradient storage element i with mask element i")]),
-    ("conv2d", Layout::ViewGrad(2, 3), &[
-        (Mode::Tape, "`conv2d_backward` reads dy's storage linearly: dx and dw are wrong"),
-        (Mode::Source, "source AD lowers Conv2dBackward to `nsl_conv2d_{input,weight}_backward`, which wrap the same `conv2d_backward` and read dy's storage linearly"),
-    ]),
-    ("maxpool2d", Layout::ViewGrad(2, 3), &[(Mode::Tape, "`maxpool2d_backward` reads the gradient's storage linearly against argmax slots in logical order")]),
+    ("embedding", Layout::ViewGrad(0, 1), &[]),
+    ("layernorm", Layout::ViewGrad(0, 1), &[]),
+    ("rmsnorm", Layout::ViewGrad(0, 1), &[]),
+    ("dropout_seeded", Layout::ViewGrad(0, 1), &[]),
+    ("conv2d", Layout::ViewGrad(2, 3), &[]),
+    ("maxpool2d", Layout::ViewGrad(2, 3), &[]),
     ("rotate_half", Layout::ViewGrad(0, 1), &[]),
-    ("bias_add", Layout::ViewGrad(0, 1), &[(Mode::Tape, "the BiasAdd arm sums db over the gradient read at storage offset i*cols + j")]),
-    ("unsqueeze", Layout::ViewGrad(1, 2), &[(Mode::Tape, "the Unsqueeze arm's `reshape_to_shape` memcpys the strided gradient's raw storage under contiguous strides")]),
+    ("bias_add", Layout::ViewGrad(0, 1), &[]),
+    ("unsqueeze", Layout::ViewGrad(1, 2), &[]),
     ("expand", Layout::ViewGrad(0, 1), &[]),
     ("stack_dim0", Layout::ViewGrad(0, 2), &[]),
     ("add_row", Layout::ViewIn, &[]),
@@ -1075,10 +1070,10 @@ const LAYOUT_VARIANTS: &[(&str, Layout, Known)] = &[
     ("log", Layout::ViewIn, &[]),
     ("sqrt", Layout::ViewIn, &[]),
     ("abs", Layout::ViewIn, &[]),
-    ("clamp", Layout::ViewIn, &[(Mode::Tape, SAVED_LINEAR)]),
-    ("relu", Layout::ViewIn, &[(Mode::Tape, SAVED_LINEAR)]),
-    ("gelu", Layout::ViewIn, &[(Mode::Tape, SAVED_LINEAR)]),
-    ("silu", Layout::ViewIn, &[(Mode::Tape, SAVED_LINEAR)]),
+    ("clamp", Layout::ViewIn, &[]),
+    ("relu", Layout::ViewIn, &[]),
+    ("gelu", Layout::ViewIn, &[]),
+    ("silu", Layout::ViewIn, &[]),
     ("sin", Layout::ViewIn, &[]),
     ("cos", Layout::ViewIn, &[]),
     ("sigmoid", Layout::ViewIn, &[]),
@@ -1088,20 +1083,14 @@ const LAYOUT_VARIANTS: &[(&str, Layout, Known)] = &[
     ("slice_dim1", Layout::ViewIn, &[]),
     ("reshape", Layout::ViewIn, &[]),
     ("cat_dim1", Layout::ViewIn, &[]),
-    ("embedding", Layout::ViewIn, &[
-        (Mode::Tape, "the CPU `nsl_tensor_embedding_lookup` forward reads the strided weight's storage linearly: the output is wrong"),
-        (Mode::Source, "the CPU `nsl_tensor_embedding_lookup` forward (shared by both modes) reads the strided weight's storage linearly: the output is wrong"),
-    ]),
-    ("layernorm", Layout::ViewIn, &[(Mode::Tape, "`layernorm_backward` reads the saved strided input's storage linearly: dx and dw are wrong")]),
-    ("rmsnorm", Layout::ViewIn, &[(Mode::Tape, "`rmsnorm_backward` reads the saved strided input's storage linearly: dx and dw are wrong")]),
-    ("dropout_seeded", Layout::ViewIn, &[(Mode::Tape, "the CPU `nsl_tensor_dropout` forward reads the input's storage linearly: the output is wrong")]),
-    ("conv2d", Layout::ViewIn, &[
-        (Mode::Tape, "the CPU `nsl_tensor_conv2d` forward reads the strided input and weight storage linearly: the output, dx and dw are wrong"),
-        (Mode::Source, "the CPU `nsl_tensor_conv2d` forward (shared by both modes) reads the strided input and weight storage linearly: the output, dx and dw are wrong"),
-    ]),
-    ("maxpool2d", Layout::ViewIn, &[(Mode::Tape, "the CPU `nsl_tensor_maxpool2d` forward pools the input's storage order and saves argmax slots in it: the output and dx are wrong")]),
+    ("embedding", Layout::ViewIn, &[]),
+    ("layernorm", Layout::ViewIn, &[]),
+    ("rmsnorm", Layout::ViewIn, &[]),
+    ("dropout_seeded", Layout::ViewIn, &[]),
+    ("conv2d", Layout::ViewIn, &[]),
+    ("maxpool2d", Layout::ViewIn, &[]),
     ("rotate_half", Layout::ViewIn, &[]),
-    ("bias_add", Layout::ViewIn, &[(Mode::Tape, "the CPU `nsl_tensor_bias_add` forward reads the input at storage offset i*cols + j: the output is wrong")]),
+    ("bias_add", Layout::ViewIn, &[]),
     ("unsqueeze", Layout::ViewIn, &[]),
     ("stack_dim0", Layout::ViewIn, &[]),
 ];

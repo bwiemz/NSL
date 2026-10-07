@@ -88,6 +88,13 @@ fn relu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
     if grad.device > 0 {
         return crate::cuda::gpu_relu_backward(grad_ptr, input_ptr);
     }
+    // The host loop indexes storage linearly: hand it row-major operands.
+    crate::tensor::with_row_major([grad_ptr, input_ptr], |[g, x]| relu_backward_host(g, x))
+}
+
+/// `relu_backward`'s host loop; both operands row-major (`with_row_major`).
+fn relu_backward_host(grad_ptr: i64, input_ptr: i64) -> i64 {
+    let grad = NslTensor::from_ptr(grad_ptr);
     let input = NslTensor::from_ptr(input_ptr);
     let len = input.len as usize;
     let ndim = input.ndim;
@@ -144,6 +151,13 @@ fn gelu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
     if grad.device > 0 {
         return crate::cuda::gpu_gelu_backward(grad_ptr, input_ptr);
     }
+    // The host loop indexes storage linearly: hand it row-major operands.
+    crate::tensor::with_row_major([grad_ptr, input_ptr], |[g, x]| gelu_backward_host(g, x))
+}
+
+/// `gelu_backward`'s host loop; both operands row-major (`with_row_major`).
+fn gelu_backward_host(grad_ptr: i64, input_ptr: i64) -> i64 {
+    let grad = NslTensor::from_ptr(grad_ptr);
     let input = NslTensor::from_ptr(input_ptr);
     let len = input.len as usize;
     let ndim = input.ndim;
@@ -211,6 +225,13 @@ fn silu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
     if grad.device > 0 {
         return crate::cuda::gpu_silu_backward(grad_ptr, input_ptr);
     }
+    // The host loop indexes storage linearly: hand it row-major operands.
+    crate::tensor::with_row_major([grad_ptr, input_ptr], |[g, x]| silu_backward_host(g, x))
+}
+
+/// `silu_backward`'s host loop; both operands row-major (`with_row_major`).
+fn silu_backward_host(grad_ptr: i64, input_ptr: i64) -> i64 {
+    let grad = NslTensor::from_ptr(grad_ptr);
     let input = NslTensor::from_ptr(input_ptr);
     let len = input.len as usize;
     let ndim = input.ndim;
@@ -271,6 +292,13 @@ fn sigmoid_backward(grad_ptr: i64, out_ptr: i64) -> i64 {
     if grad.device > 0 {
         return crate::cuda::gpu_sigmoid_backward(grad_ptr, out_ptr);
     }
+    // The host loop indexes storage linearly: hand it row-major operands.
+    crate::tensor::with_row_major([grad_ptr, out_ptr], |[g, o]| sigmoid_backward_host(g, o))
+}
+
+/// `sigmoid_backward`'s host loop; both operands row-major (`with_row_major`).
+fn sigmoid_backward_host(grad_ptr: i64, out_ptr: i64) -> i64 {
+    let grad = NslTensor::from_ptr(grad_ptr);
     let out = NslTensor::from_ptr(out_ptr);
     let len = out.len as usize;
     let ndim = out.ndim;
@@ -327,6 +355,13 @@ fn tanh_backward(grad_ptr: i64, out_ptr: i64) -> i64 {
     if grad.device > 0 {
         return crate::cuda::gpu_tanh_backward(grad_ptr, out_ptr);
     }
+    // The host loop indexes storage linearly: hand it row-major operands.
+    crate::tensor::with_row_major([grad_ptr, out_ptr], |[g, o]| tanh_backward_host(g, o))
+}
+
+/// `tanh_backward`'s host loop; both operands row-major (`with_row_major`).
+fn tanh_backward_host(grad_ptr: i64, out_ptr: i64) -> i64 {
+    let grad = NslTensor::from_ptr(grad_ptr);
     let out = NslTensor::from_ptr(out_ptr);
     let len = out.len as usize;
     let ndim = out.ndim;
@@ -366,8 +401,9 @@ fn tanh_backward(grad_ptr: i64, out_ptr: i64) -> i64 {
 
 /// Softmax backward: grad_input_i = output_i * (grad_i - sum(grad * output)) along dim
 fn softmax_backward(grad_ptr: i64, out_ptr: i64, dim: i64) -> i64 {
+    // Read only by the cuda device-dispatch below.
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
     let grad = NslTensor::from_ptr(grad_ptr);
-    let out = NslTensor::from_ptr(out_ptr);
     // Device memory: transfer to CPU, compute backward, transfer result back
     #[cfg(feature = "cuda")]
     if grad.device > 0 {
@@ -380,7 +416,15 @@ fn softmax_backward(grad_ptr: i64, out_ptr: i64, dim: i64) -> i64 {
         tensor_free(result_cpu);
         return result_gpu;
     }
+    // The host loop walks both operands by `out`'s strides: a strided
+    // gradient view has its own. Hand it row-major operands.
+    crate::tensor::with_row_major([grad_ptr, out_ptr], |[g, o]| softmax_backward_host(g, o, dim))
+}
 
+/// `softmax_backward`'s host loop; both operands row-major (`with_row_major`).
+fn softmax_backward_host(grad_ptr: i64, out_ptr: i64, dim: i64) -> i64 {
+    let grad = NslTensor::from_ptr(grad_ptr);
+    let out = NslTensor::from_ptr(out_ptr);
     let len = out.len as usize;
     let ndim = out.ndim;
     let out_dtype = out.dtype;
@@ -443,8 +487,9 @@ fn softmax_backward(grad_ptr: i64, out_ptr: i64, dim: i64) -> i64 {
 
 /// Log-softmax backward: grad_input[i] = grad[i] - exp(log_softmax_output[i]) * sum(grad, dim)
 fn log_softmax_backward(grad_ptr: i64, out_ptr: i64, dim: i64) -> i64 {
+    // Read only by the cuda device-dispatch below.
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
     let grad = NslTensor::from_ptr(grad_ptr);
-    let out = NslTensor::from_ptr(out_ptr);
     // Device memory: transfer to CPU, compute backward, transfer result back
     #[cfg(feature = "cuda")]
     if grad.device > 0 {
@@ -457,7 +502,18 @@ fn log_softmax_backward(grad_ptr: i64, out_ptr: i64, dim: i64) -> i64 {
         tensor_free(result_cpu);
         return result_gpu;
     }
+    // The host loop walks both operands by `out`'s strides: a strided
+    // gradient view has its own. Hand it row-major operands.
+    crate::tensor::with_row_major([grad_ptr, out_ptr], |[g, o]| {
+        log_softmax_backward_host(g, o, dim)
+    })
+}
 
+/// `log_softmax_backward`'s host loop; both operands row-major
+/// (`with_row_major`).
+fn log_softmax_backward_host(grad_ptr: i64, out_ptr: i64, dim: i64) -> i64 {
+    let grad = NslTensor::from_ptr(grad_ptr);
+    let out = NslTensor::from_ptr(out_ptr);
     let len = out.len as usize;
     let ndim = out.ndim;
     let out_dtype = out.dtype;
@@ -521,6 +577,8 @@ fn log_softmax_backward(grad_ptr: i64, out_ptr: i64, dim: i64) -> i64 {
 
 /// Slice backward: create zeros with input_shape, copy grad into the [start, start+slice_len) region along dim.
 fn slice_backward(grad_ptr: i64, input_shape: &[i64], dim: usize, start: usize) -> i64 {
+    // Read only by the cuda device-dispatch below.
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
     let grad = NslTensor::from_ptr(grad_ptr);
 
     // Device memory: transfer to CPU, compute, transfer back
@@ -533,7 +591,14 @@ fn slice_backward(grad_ptr: i64, input_shape: &[i64], dim: usize, start: usize) 
         tensor_free(result_cpu);
         return result_gpu;
     }
+    // The host loop splits a flat index by the gradient's strides as if they
+    // were row-major ones, and reads its storage at that flat index.
+    crate::tensor::with_row_major([grad_ptr], |[g]| slice_backward_host(g, input_shape, dim, start))
+}
 
+/// `slice_backward`'s host loop; the gradient row-major (`with_row_major`).
+fn slice_backward_host(grad_ptr: i64, input_shape: &[i64], dim: usize, start: usize) -> i64 {
+    let grad = NslTensor::from_ptr(grad_ptr);
     let ndim = input_shape.len();
 
     let grad_dtype = grad.dtype;
@@ -647,13 +712,9 @@ fn cat_backward(grad_ptr: i64, dim: usize, split_sizes: &[i64]) -> Vec<i64> {
 ///   d_weight = sum(d_out * normalized, across batch)
 ///   d_bias = sum(d_out, across batch)
 fn layernorm_backward(grad_ptr: i64, input_ptr: i64, mean_ptr: i64, inv_std_ptr: i64, weight_ptr: i64) -> (i64, i64, i64) {
-    let grad = NslTensor::from_ptr(grad_ptr);
-    let input = NslTensor::from_ptr(input_ptr);
-    let mean_t = NslTensor::from_ptr(mean_ptr);   // always f64
-    let inv_std_t = NslTensor::from_ptr(inv_std_ptr); // always f64
-    let weight = NslTensor::from_ptr(weight_ptr);
-
-    let out_device = grad.device;
+    // Read only by the cuda device-dispatch below.
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+    let out_device = NslTensor::from_ptr(grad_ptr).device;
     #[cfg(feature = "cuda")]
     if out_device > 0 {
         // Device memory: transfer all tensors to CPU, compute, transfer results back
@@ -676,6 +737,29 @@ fn layernorm_backward(grad_ptr: i64, input_ptr: i64, mean_ptr: i64, inv_std_ptr:
         tensor_free(db_cpu);
         return (dx_gpu, dw_gpu, db_gpu);
     }
+    // The host loop reads dy, the saved input (a strided view when the
+    // forward was handed one) and the weight linearly: make them row-major.
+    // mean / inv_std are the forward's own fresh row-major buffers.
+    crate::tensor::with_row_major([grad_ptr, input_ptr, weight_ptr], |[g, x, w]| {
+        layernorm_backward_host(g, x, mean_ptr, inv_std_ptr, w)
+    })
+}
+
+/// `layernorm_backward`'s host loop; `grad_ptr`, `input_ptr` and
+/// `weight_ptr` row-major (`with_row_major`).
+fn layernorm_backward_host(
+    grad_ptr: i64,
+    input_ptr: i64,
+    mean_ptr: i64,
+    inv_std_ptr: i64,
+    weight_ptr: i64,
+) -> (i64, i64, i64) {
+    let grad = NslTensor::from_ptr(grad_ptr);
+    let input = NslTensor::from_ptr(input_ptr);
+    let mean_t = NslTensor::from_ptr(mean_ptr);   // always f64
+    let inv_std_t = NslTensor::from_ptr(inv_std_ptr); // always f64
+    let weight = NslTensor::from_ptr(weight_ptr);
+    let out_device = grad.device;
 
     let in_dtype = input.dtype;
     let total = input.len as usize;
@@ -760,12 +844,9 @@ fn layernorm_backward(grad_ptr: i64, input_ptr: i64, mean_ptr: i64, inv_std_ptr:
 ///   d_x = weight * (d_out / rms - x * sum(d_out * x) / (N * rms^3))
 ///   d_weight = sum(d_out * (x / rms), across batch)
 fn rmsnorm_backward(grad_ptr: i64, input_ptr: i64, rms_ptr: i64, weight_ptr: i64) -> (i64, i64) {
-    let grad = NslTensor::from_ptr(grad_ptr);
-    let input = NslTensor::from_ptr(input_ptr);
-    let rms_t = NslTensor::from_ptr(rms_ptr); // always f64
-    let weight = NslTensor::from_ptr(weight_ptr);
-
-    let out_device = grad.device;
+    // Read only by the cuda device-dispatch below.
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+    let out_device = NslTensor::from_ptr(grad_ptr).device;
     #[cfg(feature = "cuda")]
     if out_device > 0 {
         // Device memory: transfer all tensors to CPU, compute, transfer results back
@@ -784,6 +865,27 @@ fn rmsnorm_backward(grad_ptr: i64, input_ptr: i64, rms_ptr: i64, weight_ptr: i64
         tensor_free(dw_cpu);
         return (dx_gpu, dw_gpu);
     }
+    // The host loop reads dy, the saved input (a strided view when the
+    // forward was handed one) and the weight linearly: make them row-major.
+    // rms is the forward's own fresh row-major buffer.
+    crate::tensor::with_row_major([grad_ptr, input_ptr, weight_ptr], |[g, x, w]| {
+        rmsnorm_backward_host(g, x, rms_ptr, w)
+    })
+}
+
+/// `rmsnorm_backward`'s host loop; `grad_ptr`, `input_ptr` and `weight_ptr`
+/// row-major (`with_row_major`).
+fn rmsnorm_backward_host(
+    grad_ptr: i64,
+    input_ptr: i64,
+    rms_ptr: i64,
+    weight_ptr: i64,
+) -> (i64, i64) {
+    let grad = NslTensor::from_ptr(grad_ptr);
+    let input = NslTensor::from_ptr(input_ptr);
+    let rms_t = NslTensor::from_ptr(rms_ptr); // always f64
+    let weight = NslTensor::from_ptr(weight_ptr);
+    let out_device = grad.device;
 
     let in_dtype = input.dtype;
     let total = input.len as usize;
@@ -853,8 +955,9 @@ fn rmsnorm_backward(grad_ptr: i64, input_ptr: i64, rms_ptr: i64, weight_ptr: i64
 
 /// Dropout backward: grad_input = grad_output * mask * scale
 fn dropout_backward(grad_ptr: i64, mask_ptr: i64, scale: f64) -> i64 {
+    // Read only by the cuda device-dispatch below.
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
     let grad = NslTensor::from_ptr(grad_ptr);
-    let mask = NslTensor::from_ptr(mask_ptr); // read by tag below: f64 on CPU, f32 after a download
 
     // Device memory: transfer to CPU, compute, transfer back
     #[cfg(feature = "cuda")]
@@ -868,7 +971,16 @@ fn dropout_backward(grad_ptr: i64, mask_ptr: i64, scale: f64) -> i64 {
         tensor_free(result_cpu);
         return result_gpu;
     }
+    // The host loop pairs gradient element i with mask element i, both read
+    // linearly: hand it row-major operands (the mask, the forward's own
+    // fresh buffer, already is one).
+    crate::tensor::with_row_major([grad_ptr, mask_ptr], |[g, m]| dropout_backward_host(g, m, scale))
+}
 
+/// `dropout_backward`'s host loop; both operands row-major (`with_row_major`).
+fn dropout_backward_host(grad_ptr: i64, mask_ptr: i64, scale: f64) -> i64 {
+    let grad = NslTensor::from_ptr(grad_ptr);
+    let mask = NslTensor::from_ptr(mask_ptr); // read by tag below: f64 on CPU, f32 after a download
     let len = grad.len as usize;
     let ndim = grad.ndim;
     let grad_dtype = grad.dtype;
@@ -919,9 +1031,9 @@ fn conv2d_backward(
     pad_h: usize,
     pad_w: usize,
 ) -> (i64, i64, i64) {
+    // Read only by the cuda device-dispatch below.
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
     let grad = NslTensor::from_ptr(grad_ptr);
-    let input = NslTensor::from_ptr(input_ptr);
-    let weight = NslTensor::from_ptr(weight_ptr);
 
     // Device memory: transfer to CPU, compute, transfer back
     #[cfg(feature = "cuda")]
@@ -942,6 +1054,27 @@ fn conv2d_backward(
         tensor_free(db_cpu);
         return (dx_gpu, dw_gpu, db_gpu);
     }
+    // The host loop indexes dy, the input and the weight as row-major NCHW /
+    // OIHW buffers: make them so. Both AD modes run this (the source-AD
+    // `nsl_conv2d_*_backward` FFIs wrap it).
+    crate::tensor::with_row_major([grad_ptr, input_ptr, weight_ptr], |[g, x, w]| {
+        conv2d_backward_host(g, x, w, stride_h, stride_w, pad_h, pad_w)
+    })
+}
+
+/// `conv2d_backward`'s host loop; every operand row-major (`with_row_major`).
+fn conv2d_backward_host(
+    grad_ptr: i64,
+    input_ptr: i64,
+    weight_ptr: i64,
+    stride_h: usize,
+    stride_w: usize,
+    pad_h: usize,
+    pad_w: usize,
+) -> (i64, i64, i64) {
+    let grad = NslTensor::from_ptr(grad_ptr);
+    let input = NslTensor::from_ptr(input_ptr);
+    let weight = NslTensor::from_ptr(weight_ptr);
 
     let n = unsafe { *input.shape.add(0) } as usize;
     let c_in = unsafe { *input.shape.add(1) } as usize;
@@ -1116,13 +1249,17 @@ fn materialize_conv_output_grad(
         return create_tensor_with_shape_dtype(&shape, grad.read_scalar_as_f64(0), grad.dtype);
     }
     if glen == expected {
-        // Right element count, wrong layout (e.g. flattened): copy in order.
-        let out_ptr = create_tensor_with_shape_dtype(&shape, 0.0, grad.dtype);
-        let out = NslTensor::from_ptr(out_ptr);
-        for i in 0..expected {
-            out.write_scalar_from_f64(i, grad.read_scalar_as_f64(i));
-        }
-        return out_ptr;
+        // Right element count, wrong shape (e.g. flattened): copy in logical
+        // order, which a strided view's storage order is not.
+        return crate::tensor::with_row_major([grad_ptr], |[g]| {
+            let grad = NslTensor::from_ptr(g);
+            let out_ptr = create_tensor_with_shape_dtype(&shape, 0.0, grad.dtype);
+            let out = NslTensor::from_ptr(out_ptr);
+            for i in 0..expected {
+                out.write_scalar_from_f64(i, grad.read_scalar_as_f64(i));
+            }
+            out_ptr
+        });
     }
 
     crate::nsl_log!(ERROR, "nsl", "nsl: conv2d backward received a gradient with {glen} elements, but the \
@@ -1252,6 +1389,8 @@ pub extern "C" fn nsl_conv2d_bias_backward(
 
 /// MaxPool2d backward: scatter gradient to argmax positions
 fn maxpool2d_backward(grad_ptr: i64, input_shape: &[i64], argmax: &[usize]) -> i64 {
+    // Read only by the cuda device-dispatch below.
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
     let grad = NslTensor::from_ptr(grad_ptr);
 
     // Device memory: transfer to CPU, compute, transfer back
@@ -1264,7 +1403,15 @@ fn maxpool2d_backward(grad_ptr: i64, input_shape: &[i64], argmax: &[usize]) -> i
         tensor_free(result_cpu);
         return result_gpu;
     }
+    // `argmax` is indexed by the output's LOGICAL (row-major) position; the
+    // host loop reads gradient element i linearly against it.
+    crate::tensor::with_row_major([grad_ptr], |[g]| maxpool2d_backward_host(g, input_shape, argmax))
+}
 
+/// `maxpool2d_backward`'s host loop; the gradient row-major
+/// (`with_row_major`).
+fn maxpool2d_backward_host(grad_ptr: i64, input_shape: &[i64], argmax: &[usize]) -> i64 {
+    let grad = NslTensor::from_ptr(grad_ptr);
     let grad_dtype = grad.dtype;
     let out_ptr = create_tensor_with_shape_dtype(input_shape, 0.0, grad_dtype);
     let out = NslTensor::from_ptr(out_ptr);
@@ -1738,41 +1885,46 @@ pub(crate) fn run_backward_core_strict(
                     } else { (*saved_indices, false) };
 
                     let w = crate::tensor::NslTensor::from_ptr(*saved_weight);
-                    let idx_t = crate::tensor::NslTensor::from_ptr(idx_cpu);
                     let vocab_size = unsafe { *w.shape.add(0) } as usize;
                     let embed_dim = unsafe { *w.shape.add(1) } as usize;
-                    let total_indices = idx_t.len as usize;
 
                     let w_shape_list = tensor_shape(*saved_weight);
                     let grad_w = tensor_zeros(w_shape_list);
                     crate::list::nsl_list_free(w_shape_list);
 
                     let grad_w_t = crate::tensor::NslTensor::from_ptr(grad_w);
-                    let g_t = crate::tensor::NslTensor::from_ptr(g_cpu);
                     let grad_w_dtype = grad_w_t.dtype;
 
-                    for i in 0..total_indices {
-                        let idx = idx_t.read_index(i) as usize;
-                        if idx < vocab_size {
-                            for j in 0..embed_dim {
-                                if grad_w_dtype == 1 {
-                                    // Read g by its own tag. A GPU f32 grad used to
-                                    // DOWNLOAD as f64 while grad_w is the runtime's
-                                    // f32 zeros, and reading g as f32 unconditionally
-                                    // was the first GPU tape backward's abort site.
-                                    // The download keeps f32 since C5 step 2a; a CPU
-                                    // tape can still hand over an f64 grad.
-                                    let g_val = if g_t.dtype == 1 { unsafe { *g_t.data_f32().add(i * embed_dim + j) } }
-                                                else { unsafe { *g_t.data_f64().add(i * embed_dim + j) as f32 } };
-                                    unsafe { *grad_w_t.data_f32().add(idx * embed_dim + j) += g_val };
-                                } else {
-                                    let g_val = if g_t.dtype == 1 { unsafe { *g_t.data_f32().add(i * embed_dim + j) as f64 } }
-                                                else { unsafe { *g_t.data_f64().add(i * embed_dim + j) } };
-                                    unsafe { *grad_w_t.data_f64().add(idx * embed_dim + j) += g_val };
+                    // Row i of the gradient and index i are read linearly
+                    // (`i * embed_dim + j`, `read_index(i)`): a `.transpose`
+                    // after the lookup hands over a strided gradient view.
+                    crate::tensor::with_row_major([g_cpu, idx_cpu], |[g_rm, idx_rm]| {
+                        let g_t = crate::tensor::NslTensor::from_ptr(g_rm);
+                        let idx_t = crate::tensor::NslTensor::from_ptr(idx_rm);
+                        let total_indices = idx_t.len as usize;
+                        for i in 0..total_indices {
+                            let idx = idx_t.read_index(i) as usize;
+                            if idx < vocab_size {
+                                for j in 0..embed_dim {
+                                    if grad_w_dtype == 1 {
+                                        // Read g by its own tag. A GPU f32 grad used to
+                                        // DOWNLOAD as f64 while grad_w is the runtime's
+                                        // f32 zeros, and reading g as f32 unconditionally
+                                        // was the first GPU tape backward's abort site.
+                                        // The download keeps f32 since C5 step 2a; a CPU
+                                        // tape can still hand over an f64 grad.
+                                        let g_val = if g_t.dtype == 1 { unsafe { *g_t.data_f32().add(i * embed_dim + j) } }
+                                                    else { unsafe { *g_t.data_f64().add(i * embed_dim + j) as f32 } };
+                                        unsafe { *grad_w_t.data_f32().add(idx * embed_dim + j) += g_val };
+                                    } else {
+                                        let g_val = if g_t.dtype == 1 { unsafe { *g_t.data_f32().add(i * embed_dim + j) as f64 } }
+                                                    else { unsafe { *g_t.data_f64().add(i * embed_dim + j) } };
+                                        unsafe { *grad_w_t.data_f64().add(idx * embed_dim + j) += g_val };
+                                    }
                                 }
                             }
                         }
-                    }
+                    });
 
                     if g_needs_free { tensor_free(g_cpu); }
                     if idx_needs_free { tensor_free(idx_cpu); }
@@ -1984,17 +2136,23 @@ pub(crate) fn run_backward_core_strict(
                     let g_dtype = g_t.dtype;
                     let grad_bias = crate::cpu::create_tensor_with_shape_rs_dtype(&[cols as i64], g_dtype);
                     let grad_bias_t = crate::tensor::NslTensor::from_ptr(grad_bias);
-                    for i in 0..rows {
-                        for j in 0..cols {
-                            if g_dtype == 1 {
-                                let gv = unsafe { *g_t.data_f32().add(i * cols + j) };
-                                unsafe { *grad_bias_t.data_f32().add(j) += gv };
-                            } else {
-                                let gv = unsafe { *g_t.data_f64().add(i * cols + j) };
-                                unsafe { *grad_bias_t.data_f64().add(j) += gv };
+                    // Element (i, j) is read at `i * cols + j`: a strided
+                    // gradient view (a `.transpose` after the op) must be
+                    // made row-major first.
+                    crate::tensor::with_row_major([g_bias_cpu], |[g_rm]| {
+                        let g_t = crate::tensor::NslTensor::from_ptr(g_rm);
+                        for i in 0..rows {
+                            for j in 0..cols {
+                                if g_dtype == 1 {
+                                    let gv = unsafe { *g_t.data_f32().add(i * cols + j) };
+                                    unsafe { *grad_bias_t.data_f32().add(j) += gv };
+                                } else {
+                                    let gv = unsafe { *g_t.data_f64().add(i * cols + j) };
+                                    unsafe { *grad_bias_t.data_f64().add(j) += gv };
+                                }
                             }
                         }
-                    }
+                    });
                     if g_bias_free { tensor_free(g_bias_cpu); }
 
                     // Transfer bias grad to GPU if needed

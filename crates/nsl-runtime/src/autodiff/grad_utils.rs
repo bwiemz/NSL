@@ -196,9 +196,15 @@ pub(crate) fn reshape_to_shape(tensor_ptr: i64, shape: &[i64]) -> i64 {
     }
     let strides = NslTensor::compute_strides(shape_ptr, ndim);
 
+    // The memcpy below copies the buffer in storage order under fresh
+    // row-major strides: right only for a row-major source. The Unsqueeze arm
+    // hands this a strided gradient view when a `.transpose` follows the op.
     let data_size = (total as usize) * tensor.element_size();
     let data = crate::memory::checked_alloc(data_size);
-    unsafe { std::ptr::copy_nonoverlapping(tensor.data as *const u8, data, data_size); }
+    crate::tensor::with_row_major([tensor_ptr], |[src]| {
+        let src = NslTensor::from_ptr(src);
+        unsafe { std::ptr::copy_nonoverlapping(src.data as *const u8, data, data_size); }
+    });
 
     let new_tensor = Box::new(NslTensor::new(
         data as *mut std::ffi::c_void,
@@ -321,6 +327,18 @@ pub(crate) fn broadcast_grad_along_dim(grad_ptr: i64, input_shape: &[i64], dim: 
         tensor_free(cpu_out);
         return gpu_out;
     }
+    // The loop indexes the gradient by row-major strides computed from its
+    // shape, which a strided view (a keepdim output transposed before the
+    // loss) does not have.
+    crate::tensor::with_row_major([grad_ptr], |[g]| {
+        broadcast_grad_along_dim_host(g, input_shape, dim)
+    })
+}
+
+/// `broadcast_grad_along_dim`'s host loop; the gradient row-major
+/// (`with_row_major`).
+fn broadcast_grad_along_dim_host(grad_ptr: i64, input_shape: &[i64], dim: usize) -> i64 {
+    let grad = NslTensor::from_ptr(grad_ptr);
     let ndim = input_shape.len();
     let grad_dtype = grad.dtype;
 
@@ -328,7 +346,7 @@ pub(crate) fn broadcast_grad_along_dim(grad_ptr: i64, input_shape: &[i64], dim: 
     let out_ptr = create_tensor_with_shape_dtype(input_shape, 0.0, grad_dtype);
     let out = NslTensor::from_ptr(out_ptr);
 
-    // Compute contiguous strides from shapes (safe for non-contiguous tensors)
+    // Row-major strides from the shapes (the gradient is row-major here)
     let out_strides: Vec<usize> = {
         let mut s = vec![1usize; ndim];
         for d in (0..ndim.saturating_sub(1)).rev() {
@@ -401,13 +419,30 @@ pub(crate) fn scatter_grad_to_argmax(
         tensor_free(cpu_out);
         return gpu_out;
     }
+    // The loop reads gradient element i linearly against `argmax[i]` (indexed
+    // by the output's LOGICAL position); a strided gradient view (the output
+    // transposed before the loss) is not in that order.
+    crate::tensor::with_row_major([grad_ptr], |[g]| {
+        scatter_grad_to_argmax_host(g, input_shape, dim, argmax)
+    })
+}
+
+/// `scatter_grad_to_argmax`'s host loop; the gradient row-major
+/// (`with_row_major`).
+fn scatter_grad_to_argmax_host(
+    grad_ptr: i64,
+    input_shape: &[i64],
+    dim: usize,
+    argmax: &[usize],
+) -> i64 {
+    let grad = NslTensor::from_ptr(grad_ptr);
     let ndim = input_shape.len();
     let grad_dtype = grad.dtype;
     // Create zero output with input_shape, matching grad dtype
     let out_ptr = create_tensor_with_shape_dtype(input_shape, 0.0, grad_dtype);
     let out = NslTensor::from_ptr(out_ptr);
 
-    // Compute contiguous strides from shapes (safe for non-contiguous tensors)
+    // Row-major strides from the shapes (the gradient is row-major here)
     let out_strides: Vec<usize> = {
         let mut s = vec![1usize; ndim];
         for d in (0..ndim.saturating_sub(1)).rev() {
@@ -442,6 +477,14 @@ pub(crate) fn scatter_grad_to_argmax(
         for (d, &os) in out_strides.iter().enumerate().take(ndim) {
             if d == dim {
                 out_offset += max_idx * os;
+                // A keepdim grad still has this (size-1) dim: step past its
+                // index, or every later dim reads the wrong one (they all
+                // read the kept dim's 0, and over a non-last dim the whole
+                // gradient landed in the last dim's first slot). Mirrors
+                // broadcast_grad_along_dim.
+                if grad_ndim == ndim {
+                    gi += 1;
+                }
             } else {
                 out_offset += grad_indices[gi] * os;
                 gi += 1;
