@@ -207,6 +207,15 @@ fn compare(before: &[Vec<f64>], after: &[Vec<f64>], names: &[&str], oracle: impl
     for (k, name) in names.iter().enumerate() {
         let want = &wants[k];
         let got: Vec<f64> = before[k].iter().zip(&after[k]).map(|(b, a)| (b - a) / LR).collect();
+        // `m.max(nan)` keeps `m` and `x.0 > acc.0` is false for a NaN `x.0`,
+        // so a NaN entry would drop out of `scale` and of the worst-error
+        // fold below: refuse non-finite entries before folding.
+        if let Some(i) = want.iter().position(|v| !v.is_finite()) {
+            panic!("{name}: the f64 oracle gradient is non-finite at {i} ({})", want[i]);
+        }
+        if let Some(i) = got.iter().position(|v| !v.is_finite()) {
+            panic!("{name}: the kernel's gradient is non-finite at {i} ({})", got[i]);
+        }
         let scale = want.iter().fold(0.0f64, |m, v| m.max(v.abs()));
         assert!(scale > 1e-4, "{name}: the oracle gradient is ~0 ({scale:e}), so the check would be vacuous");
         let (worst, at) = got
@@ -577,6 +586,14 @@ fn sdpa_packed_step() {
     let mut report = Vec::new();
     for (k, name) in ["dq", "dk", "dv"].into_iter().enumerate() {
         let got: Vec<f64> = before[k].iter().zip(&after[k]).map(|(b, a)| (b - a) / LR).collect();
+        // `m.max(nan)` keeps `m`, so a NaN entry would drop out of `scale`
+        // and `worst`: refuse non-finite entries before folding.
+        if let Some(i) = exact[k].iter().position(|v| !v.is_finite()) {
+            panic!("{name}: the exact gradient is non-finite at {i} ({})", exact[k][i]);
+        }
+        if let Some(i) = got.iter().position(|v| !v.is_finite()) {
+            panic!("{name}: the kernel's gradient is non-finite at {i} ({})", got[i]);
+        }
         let scale = exact[k].iter().fold(0.0f64, |m, v| m.max(v.abs()));
         let worst = got.iter().zip(&exact[k]).fold(0.0f64, |m, (g, w)| m.max((g - w).abs()));
         report.push(format!("{name}: max |got - exact| = {worst:.3e}, scale {scale:.3e}, rel {:.3e}", worst / scale));

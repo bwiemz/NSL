@@ -944,6 +944,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   - **SASS** on sm_80/90/120: the same memory, conversion and atomic
     instructions as the hand kernels. Registers are 14 against 12 for the
     atomic pair, and within ±4 either way for the deterministic pair.
+
 - **The batched Muon Newton-Schulz kernels are built by
   `nsl_kir::kernels::muon_batch`** in place of their hand-written constants
   (new-roadmap item 5): `nsl_muon_batch_{mom,sumsq,pack,poly,update}_f32`.
@@ -1033,6 +1034,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
       the product.
   - **SASS** on sm_80/90/120: the same instruction mix. Registers are
     12/16/14 against 12/13/12, with no occupancy effect at 256 threads.
+
 - **The 2-D-block row lookups are built by `nsl_kir::kernels::lookup`** in
   place of their hand-written constants (new-roadmap item 5):
   `nsl_embedding_f32`, `nsl_embedding_i32idx`, `nsl_gather_f32` and
@@ -1071,6 +1073,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
     - The KIR address arithmetic (`mul.lo.u64 ·, 4`) becomes `IMAD.WIDE`
       where the hand kernels' `shl` became `LEA`.
     - There is no occupancy effect at 256 threads.
+
 - **The int8 and int4 KV dequantization kernels are built by
   `nsl_kir::kernels::dequant`** in place of their hand-written constants
   (new-roadmap item 5): `nsl_dequant_int8_per_head_f32`,
@@ -1097,6 +1100,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
       and every part of the nibble unpack.
   - **SASS** on sm_80/90/120: the same registers and floating-point
     instructions as the hand kernels.
+
 - **The multi-tensor SR-BF16 AdamW step, `nsl_fase_fused_adamw_multi_bf16sr`,
   is built by `nsl_kir::kernels::optim::build_fase_adamw_multi_bf16sr`** in
   place of its hand-written constant (new-roadmap item 5). With it, every
@@ -1157,6 +1161,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   - **SASS** on sm_80/90/120: registers are equal or fewer (bias 16/18/20,
     gather 18/20/20, copy 26/26/26, slice 26/28/28). The instruction
     count is within 16, mostly in the emulated 64-bit divisions.
+
 - **KIR gains a `U16` type and a `Bitcast` op. With them, the SR-BF16
   rounding probe and the single-parameter bf16 FASE AdamW step are built
   by `nsl_kir::kernels::optim` in place of their hand-written constants**
@@ -1233,6 +1238,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
     mutant; swapped operands and a neighbour's operation caught.
   - **SASS** on sm_80/90/120: the same instruction count and
     floating-point multiset; registers within two of the hand kernels'.
+
 - **`nsl_fase_fused_adamw_multi_f32` is built by
   `nsl_kir::kernels::optim` in place of its hand-written constant**
   (new-roadmap item 5, after the single-parameter step). It is the
@@ -1256,6 +1262,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   - **SASS** on sm_80/90/120: the same floating-point instructions,
     identically ordered on sm_80. Registers are 20/20/20 against the hand
     kernel's 24/24/21.
+
 - **`nsl_fase_fused_adamw_step_f32` is built by
   `nsl_kir::kernels::optim` in place of its hand-written constant**
   (new-roadmap item 5). This is the fused FASE-Deferred AdamW/Adam step,
