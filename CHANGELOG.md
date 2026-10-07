@@ -146,9 +146,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
     gradients, the last `[Blk; N]` element dropped, sub-model fields
     dropped from the parameter list, `@freeze` made ineffective, and source
     AD's freeze filter reaching a frozen model's adapters.
-  - **Ratchet.** A `Buffer<...>` field TRAINS in both modes today, because
-    the parameter enumeration selects by leaf name only. The gate lists it
-    as a known defect that must keep reproducing, so a fix has to delist it.
+  - **Ratchet.** It first listed a `Buffer<...>` field as a known defect
+    (it trained in both modes); the field-kind fix under **Fixed** delisted
+    it, and it must now stay bit-identical.
 
 - **The 1B-posture certificate** (`posture_certificate_gpu.rs`, roadmap item
   4). Before this, every GPU training gate compared two GPU arms with each
@@ -2023,6 +2023,55 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
     - `validate_cli_target` accepts exactly what the resolver resolves.
     - The looser `GpuTarget::parse_sm_version`, which accepted uppercase and
       `sm_90a`, is gone.
+- **`Buffer<...>` model fields no longer train, and an `int` or `str` field
+  no longer aborts training and `model_save`** (found by the
+  parameter-coverage gate).
+  - **Cause.** Every walk over a model's tensors took a struct slot's `I64`
+    type to mean "tensor", and judged trainability by leaf name alone (the
+    `_` prefix and `inv_freq`). So a `Buffer<...>` field, non-trainable
+    state per spec/02, went into the optimizer's parameter list under both
+    AD modes. An `int` or `str` field is an `I64` slot too, so its value
+    reached the runtime as a tensor handle: `n: int = 3` aborted every train
+    block and `model_save` with "invalid tensor handle 0x3", and source AD
+    counted it as a trainable parameter. A bare `Param` or `Buffer`
+    annotation was taken for an unknown sub-model, so that field was never
+    trained or saved.
+  - **Fix.** Each field in a model or struct layout records its declared
+    kind (`FieldKind`: tensor, buffer, nested, scalar), from the annotation,
+    when the models are collected. Everything that picks a model's tensors
+    reads it:
+    - the parameter walk (`enumerate_*model_tensor_paths`), so the train
+      block's parameter list and its checkpoint names;
+    - `is_trainable_param_name`, which source AD's consumers use: the
+      dead-gradient pass, gradient alignment and its `N/M trainable`
+      summary, CCR, CSLA and the FASE hook;
+    - `@freeze`'s pattern check;
+    - the field list `model_save`, `model_load` and `from_hf` share.
+  - **Buffers are saved.** `model_save` and `model_load` carry a Buffer the
+    way they carry a `_`-prefixed tensor, from one shared field list, so the
+    two stay symmetric. A train-block checkpoint holds the trained
+    parameters only, so it no longer includes one. Scalar fields are written
+    by neither. A train-block checkpoint written before this fix, for a
+    model with a Buffer, lists the Buffer among its parameters, so resuming
+    from it now refuses on the count/name check.
+  - **Nothing else moves.** A model with no Buffer and no `int`/`str` field
+    gets the same parameter list and the same files. These are
+    byte-identical before and after, under both AD modes:
+    - coder50m's `model_save` (199 MB);
+    - the posture fixture's initial and trained `model_save`, its
+      train-block checkpoint and `.optim` sidecar, and its loss stream;
+    - the nested round-trip fixture.
+  - **The gate.** `buf` is delisted from `KNOWN_DEFECTS` and must stay
+    bit-identical in both modes. The fixture gains an `int` (in each
+    `[Blk; 2]` element), a `float` (in the sub-model) and a `str` field. It
+    prints them before and after training, and none may be saved or
+    change. A fresh instance loaded from the trained file must save it back
+    exactly, Buffer included.
+  - **Mutation-checked.** With the Buffer handling reverted, `buf` moves in
+    both modes. With only the name-based check reverted, source AD aborts
+    aligning `m.buf` with the parameter list. With the scalar handling
+    reverted in the walk, in `model_save`, or in both, both modes abort on
+    "invalid tensor handle 0x3".
 
 - **Numerical gates refuse NaN instead of scoring it a perfect match**
   (external review 2026-10-06, finding 2).

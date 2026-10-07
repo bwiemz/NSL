@@ -10,6 +10,10 @@
 #     binding (`pinned`) -- both must come out of training unchanged;
 #   - non-trainable state: `_`-prefixed (`Inner._gain`), `inv_freq`, and a
 #     `Buffer<...>` field (`buf`);
+#   - fields that are no tensor at all: an `int` in each `[Blk; 2]` element
+#     (`steps`), a `float` in the sub-model (`Inner.scale`), a `str` on the
+#     root (`tag`). An `int` or `str` occupies a tensor-sized slot; no walk
+#     may take it for one, and nothing may change it;
 #   - adapters: LoRA on a `[Blk; 2]` layer, on a top-level field, and on the
 #     frozen sub-model's weight (an adapter is never frozen); IA3 on the
 #     nested sub-model; GatedLoRA on a top-level field.
@@ -20,10 +24,13 @@
 # write, from `snapshot`: each `ADAPTER <path>` line is followed by that
 # tensor, `*` standing for the array index in iteration order. `snapshot`
 # must print every adapter the declarations below create -- the harness
-# derives that set from them and fails on one that is missing.
+# derives that set from them and fails on one that is missing. The scalar
+# fields come the same way, as `SCALAR <path>` lines each followed by the
+# value.
 
 model Blk:
     w: Tensor = randn([4, 4]) * 0.5
+    steps: int = 3
     b: Tensor = randn([4]) * 0.2
 
     fn forward(self, x: Tensor) -> Tensor:
@@ -31,6 +38,7 @@ model Blk:
 
 model Inner:
     u: Tensor = randn([4, 4]) * 0.5
+    scale: float = 0.5
     _gain: Tensor = full([4], 1.5)
 
     fn forward(self, x: Tensor) -> Tensor:
@@ -52,7 +60,8 @@ model Net:
     proj: Tensor = randn([4, 4]) * 0.5
     head: Tensor = randn([4, 4]) * 0.5
     inv_freq: Tensor = full([4], 1.25)
-    buf: Buffer<[4], f32> = full([4], 0.75)
+    tag: str = "net"
+    buf: Buffer<[4], f32> = randn([4]) * 0.1 + full([4], 0.75)
 
     fn forward(self, x: Tensor) -> Tensor:
         let h = x @ self.tied
@@ -96,6 +105,15 @@ fn snapshot(net: Net):
     print("ADAPTER gate_Net_proj__gatedlora")
     print(proj_gate)
     print("ADAPTERS_END")
+    print("SCALARS_BEGIN")
+    for block in net.blocks:
+        print("SCALAR blocks.*.steps")
+        print(block.steps)
+    print("SCALAR inner.scale")
+    print(net.inner.scale)
+    print("SCALAR tag")
+    print(net.tag)
+    print("SCALARS_END")
 
 @freeze(include=["pinned"])
 @adapter(type=lora, target=["Blk.w", "Net.head", "Frozen.v"], rank=2, alpha=4)
@@ -120,3 +138,11 @@ train(model = m, epochs = 3):
 
 model_save(m, "end.nslm")
 snapshot(m)
+
+# The round trip. `model_load` must restore every tensor `model_save` wrote,
+# the Buffer included: a fresh instance (whose random `buf` differs from
+# `m`'s) is saved, loaded from `end.nslm`, and saved again.
+let r = Net()
+model_save(r, "fresh.nslm")
+model_load(r, "end.nslm")
+model_save(r, "reloaded.nslm")

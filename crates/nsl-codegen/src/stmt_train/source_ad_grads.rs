@@ -172,7 +172,11 @@ impl Compiler<'_> {
                 grad_frozen += 1;
                 continue;
             }
-            match classify_source_ad_param_name(param_name, &tensor_param_paths) {
+            match classify_source_ad_param_name(
+                param_name,
+                &tensor_param_paths,
+                &trainable_tensor_param_paths,
+            ) {
                 SourceAdParamDiagnosticKind::Trainable => {
                     seen_trainable_tensor_params.insert(param_name.clone());
                 }
