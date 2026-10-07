@@ -596,7 +596,7 @@ pub const PASSES: &[PassDescriptor] = &[
         source_files: &["crates/nsl-codegen/src/memory_planner.rs"],
         // Build-only today. `nsl run` cannot request slab planning; whether
         // that is deliberate or an oversight is recorded, not asserted.
-        cli_flags: &[f("memory", B_ONLY), f("memory-report", B_ONLY)],
+        cli_flags: &[f("memory-report", B_ONLY)],
         stage: PipelineStage::Lowering,
         // TrainBlock is GATE-VERIFIED (`nsl build --memory-report` observes
         // MemoryPlanner there, via the transient arena). Lowering is scoped in

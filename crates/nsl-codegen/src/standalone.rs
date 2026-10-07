@@ -106,7 +106,6 @@ impl Compiler<'_> {
                     StmtKind::FnDef(_)
                         | StmtKind::StructDef(_)
                         | StmtKind::ModelDef(_)
-                        | StmtKind::AgentDef(_)
                         | StmtKind::EnumDef(_)
                         | StmtKind::TraitDef(_)
                         | StmtKind::Import(_)

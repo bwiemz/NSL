@@ -556,6 +556,8 @@ impl<'a> Lexer<'a> {
 #[cfg(test)]
 mod tests {
 
+    /// `agent` stays a keyword after the agents subsystem (M56) was removed,
+    /// so the parser can refuse an old `agent` block by name.
     #[test]
     fn lexer_recognises_agent_keyword() {
         let mut interner = crate::Interner::new();

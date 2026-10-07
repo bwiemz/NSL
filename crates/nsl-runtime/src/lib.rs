@@ -285,7 +285,6 @@ pub mod elastic;
 pub mod kv_compress;
 pub mod grammar;
 pub mod token_alignment;
-pub mod gpu_backend;
 pub mod grad_context;
 pub mod vmap_runtime;
 pub mod backward_context;
@@ -314,15 +313,9 @@ pub mod fused_linear_ce;
 // CPKD: fused KL-CE distillation loss (teacher+student LM heads + KL + CE in one kernel)
 pub mod fused_kl_ce;
 
-// M54: Unikernel runtime (bare-metal deployment)
-pub mod unikernel;
-
 // M62: Legacy Interop — DLPack bridge + C API
 pub mod dlpack;
 pub mod c_api;
-
-// M56: Agent runtime — mailboxes, scheduler, pool, FFI.
-pub mod agent;
 
 #[cfg(test)]
 mod fuzz;
@@ -339,7 +332,7 @@ mod fuzz;
 
 // Facade names are chosen to avoid colliding with real crate-root modules
 // (`autodiff`, `data`, `serving`, `peft`) and with the `core` extern-prelude
-// crate (`unikernel` uses bare `core::arch` paths).
+// crate.
 
 /// Language builtins and the base runtime: scalars, strings, containers,
 /// tensors, memory, and process I/O.
@@ -348,12 +341,6 @@ pub mod builtins {
         args, assert, dict, file_io, hof, io, list, math, memory, power, print,
         range, slab, string, string_ops, tensor,
     };
-}
-
-/// GPU device backend selection (the concrete `cpu`/`cuda` drivers stay
-/// crate-private).
-pub mod gpu {
-    pub use crate::gpu_backend;
 }
 
 /// Automatic differentiation and training-time runtime support.
@@ -425,5 +412,5 @@ pub mod interop {
 /// Experimental research subsystems. **APIs here are unstable** and may change
 /// or be removed between releases.
 pub mod experimental {
-    pub use crate::{agent, cfie, cpdt, multimodal, sparse, unikernel};
+    pub use crate::{cfie, cpdt, multimodal, sparse};
 }

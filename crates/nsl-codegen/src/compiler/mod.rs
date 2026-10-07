@@ -34,7 +34,6 @@ pub use entry_points::{
     compile_entry_capturing_ir, compile_entry_returning_plan, compile_returning_plan,
     compile_returning_splice_count_for_tests, compile_standalone,
     compile_standalone_returning_plan, compile_test, compile_with_profile_captures,
-    compile_with_zk_info, compile_with_zk_info_returning_plan,
 };
 
 // §5.7 debug helper seam: exposed so lib.rs can forward it as a public
@@ -235,29 +234,6 @@ pub struct ModelMetadata {
     /// Key: (model_name, method_name). Consumed by Task 6 when compiling
     /// the impl body so it can reference the declared FuncId.
     pub export_method_impls: std::collections::HashMap<(String, String), (cranelift_module::FuncId, cranelift_codegen::ir::Signature)>,
-    /// M56 Task 18: maps lowercase agent binding symbol (e.g. `drafter`) to
-    /// the title-case agent type name (e.g. `"Drafter"`) for variables
-    /// synthesised at `@pipeline_agent` fn entry.  Consulted by the
-    /// Unknown-type dispatch path in `calls.rs` to route `drafter.draft(...)`
-    /// to `__nsl_agent_Drafter_draft` without full type-checker support.
-    /// Spec §5.2, Option A (direct dispatch, no scheduler call).
-    pub agent_var_types: HashMap<Symbol, String>,
-    /// M56 Task 19: maps `(agent_name, method_name)` to a vec of
-    /// `(call_arg_index, target_device_i64)` pairs for parameters that require
-    /// an automatic device transfer when `@auto_device_transfer` is present.
-    ///
-    /// `call_arg_index` is the 0-based index into the *user-visible* argument
-    /// list (i.e. excluding the implicit `state_ptr` first param), matching the
-    /// order in which args are compiled in the dispatch path in `calls.rs`.
-    ///
-    /// `target_device_i64`: 0 = CPU, 1 = CUDA (matches NslTensor.device field).
-    ///
-    /// Populated by `collect_agents` for every `@auto_device_transfer` method
-    /// whose non-self params carry explicit `Tensor<..., cpu|cuda>` type
-    /// annotations.  The runtime `nsl_tensor_to_device` is a no-op when the
-    /// tensor is already on the target device, so it is safe to insert
-    /// unconditionally without a static source-device check.
-    pub agent_auto_device_params: HashMap<(String, String), Vec<(usize, i64)>>,
 }
 
 impl ModelMetadata {
@@ -276,8 +252,6 @@ impl ModelMetadata {
             model_field_scalar_values: HashMap::new(),
             model_field_roles: HashMap::new(),
             export_method_impls: std::collections::HashMap::new(),
-            agent_var_types: HashMap::new(),
-            agent_auto_device_params: HashMap::new(),
         }
     }
 
@@ -588,20 +562,6 @@ pub struct FeatureConfigs {
     pub sparsity_hints: HashMap<NodeId, crate::weight_aware::SparsityHint>,
     /// M52: Weight integrity hash for embedding in .rodata
     pub weight_integrity: Option<crate::weight_aware::WeightIntegrity>,
-
-    // ── Safety & Verification (M53, M55) ─────────────────────────────
-    /// M53: Functions decorated with @real_time — name -> constraint
-    pub real_time_fns: HashMap<String, crate::wcet::RealTimeConstraint>,
-    /// M53: Functions decorated with @wcet_budget — name -> constraint
-    pub wcet_budget_fns: HashMap<String, crate::wcet::WcetBudgetConstraint>,
-    /// M53: Collected WCET analysis results for @real_time functions
-    pub wcet_results: Vec<crate::wcet::FunctionWcet>,
-    /// M55: Functions (and model methods) decorated with @zk_proof — name -> ZkMode
-    pub zk_proof_fns: HashMap<String, crate::zk::backend::ZkMode>,
-    /// M55: Functions decorated with @zk_lookup — name -> (input_bits, output_bits)
-    pub zk_lookup_fns: HashMap<String, (u32, u32)>,
-    /// M55: ASTs of @zk_proof functions — stored during declaration for ZK compilation
-    pub zk_fn_defs: HashMap<String, nsl_ast::decl::FnDef>,
 }
 
 impl FeatureConfigs {
@@ -639,12 +599,6 @@ impl FeatureConfigs {
             weight_map: None,
             sparsity_hints: HashMap::new(),
             weight_integrity: None,
-            real_time_fns: HashMap::new(),
-            wcet_budget_fns: HashMap::new(),
-            wcet_results: Vec::new(),
-            zk_proof_fns: HashMap::new(),
-            zk_lookup_fns: HashMap::new(),
-            zk_fn_defs: HashMap::new(),
         }
     }
 }
@@ -1528,12 +1482,21 @@ impl<'a> Compiler<'a> {
         self.fusion_plan_for_profile.as_mut()
     }
 
-    /// WRGA B.3 Task 4: extract the CUDA sm version from `--target`
-    /// (e.g. `cuda_sm80` → `Some(80)`).  Returns `None` for non-CUDA
-    /// targets or plain `cuda` (where no sm is pinned).  The fused-adapter
-    /// AST rewrite requires sm >= 80 before emitting the single-FFI path.
+    /// WRGA B.3 Task 4: the CUDA SM `--target` pins (e.g. `cuda_sm80` →
+    /// `Some(80)`).  Returns `None` for `cpu` and for plain `cuda`, where no
+    /// SM is pinned.  The fused-adapter AST rewrite requires sm >= 80 before
+    /// emitting the single-FFI path.
     pub fn target_sm(&self) -> Option<u32> {
-        crate::gpu_target::GpuTarget::parse_sm_version(&self.compile_options.target)
+        crate::gpu_target::CompileTarget::resolve(&self.compile_options.target)
+            .and_then(crate::gpu_target::CompileTarget::pinned_sm)
+    }
+
+    /// The SM CUDA kernels are generated for: the pinned one, or
+    /// `CompileTarget::DEFAULT_CUDA_SM` for plain `cuda`.  `None` on a
+    /// host-only (`cpu`) or unrecognised target.
+    pub(crate) fn cuda_sm(&self) -> Option<u32> {
+        crate::gpu_target::CompileTarget::resolve(&self.compile_options.target)
+            .and_then(crate::gpu_target::CompileTarget::cuda_sm)
     }
 
     /// M42: Look up the first KV compression policy for a specific model layer.
@@ -1686,178 +1649,6 @@ impl<'a> Compiler<'a> {
 
         self.string_pool.insert(s.to_string(), data_id);
         Ok(data_id)
-    }
-
-    /// M53: Run WCET analysis for all `@real_time` functions.
-    ///
-    /// For each function with a `@real_time(max_latency_ms=N)` decorator, this creates
-    /// placeholder operation estimates, runs no-heap and static control-flow proofs,
-    /// checks the computed WCET against the declared bound, and optionally emits
-    /// certificate JSON and/or DO-178C compliance reports.
-    pub fn run_wcet_analysis(&mut self) -> Result<(), CodegenError> {
-        use crate::gpu_specs::{find_fpga, find_gpu};
-        use crate::wcet::*;
-
-        if self.features.real_time_fns.is_empty() {
-            return Ok(());
-        }
-
-        let safety_margin = self.compile_options.wcet.safety_margin;
-        let target_kind = self.compile_options.wcet.target.as_str();
-
-        // Build the WcetTarget based on CLI flags
-        let target = match target_kind {
-            "fpga" => {
-                let fpga_name = self
-                    .compile_options
-                    .wcet.fpga_device
-                    .as_deref()
-                    .unwrap_or("xcvu440");
-                let fpga = find_fpga(fpga_name).ok_or_else(|| {
-                    CodegenError::new(format!(
-                        "WCET: unknown FPGA '{}'. Available: xcvu440, xczu9eg, ve2302",
-                        fpga_name
-                    ))
-                })?;
-                WcetTarget::Fpga {
-                    device_name: fpga.device_name.to_string(),
-                    ocm_size_kb: fpga.ocm_size_kb,
-                }
-            }
-            "groq" => {
-                return Err(CodegenError::new(
-                    "Groq LPU WCET not yet supported (ISA not public). \
-                     Use --wcet-target gpu or --wcet-target fpga."
-                        .to_string(),
-                ));
-            }
-            _ => {
-                // Default: GPU statistical
-                let gpu_name = self
-                    .compile_options
-                    .wcet.gpu
-                    .as_deref()
-                    .unwrap_or("A100-SXM");
-                let _ = find_gpu(gpu_name).ok_or_else(|| {
-                    CodegenError::new(format!(
-                        "WCET: unknown GPU '{}'. Use --gpu to specify.",
-                        gpu_name
-                    ))
-                })?;
-                WcetTarget::Gpu {
-                    device_name: gpu_name.to_string(),
-                }
-            }
-        };
-
-        // M53: If --wcet-cpu is specified, validate the CPU model and emit an advisory note.
-        // CPU WCET estimates are advisory — they use the CpuSpec database in gpu_specs.rs.
-        if let Some(ref cpu_name) = self.compile_options.wcet.cpu
-            && !cpu_name.is_empty()
-        {
-            match crate::gpu_specs::find_cpu(cpu_name) {
-                Some(cpu) => {
-                    nsl_log::nsl_log!(INFO, "nsl", 
-                        "[nsl] WCET CPU target: {} @ {} MHz, {:.0} GFLOPS/core (fp32), {} cores",
-                        cpu.name,
-                        cpu.base_clock_mhz,
-                        (cpu.fp32_flops_per_cycle as f64 * cpu.base_clock_mhz as f64) / 1000.0,
-                        cpu.num_cores,
-                    );
-                }
-                None => {
-                    nsl_log::nsl_log!(WARN, "nsl", 
-                        "[nsl] warning: unknown --cpu '{}'. Known models: cortex-a78, x86-64-v4. \
-                             CPU WCET will use GPU/FPGA estimates only.",
-                        cpu_name
-                    );
-                }
-            }
-        }
-
-        // Clone to avoid borrowing self.features.real_time_fns while mutating self.features.wcet_results
-        for (fn_name, constraint) in self.features.real_time_fns.clone() {
-            let ops = match &target {
-                WcetTarget::Gpu { device_name } => {
-                    let gpu = find_gpu(device_name).unwrap();
-                    nsl_log::nsl_log!(INFO, "codegen", 
-                        "note: GPU WCET is a statistical p95 estimate (not a certified proof). \
-                         For safety-critical applications, use --wcet-target fpga."
-                    );
-                    vec![
-                        estimate_matmul_gpu_statistical(1, 512, 512, "fp32", gpu),
-                        estimate_elementwise_gpu_statistical(512, "fp32", "relu", gpu),
-                    ]
-                }
-                WcetTarget::Fpga { device_name, .. } => {
-                    let fpga = find_fpga(device_name).unwrap();
-                    vec![
-                        wcet_matmul_fpga_certified(1, 512, 512, "fp32", fpga),
-                        wcet_elementwise_fpga_certified(512, "fp32", "relu", fpga),
-                    ]
-                }
-                WcetTarget::GroqLpu => unreachable!(),
-            };
-
-            let total_ns: u64 = ops.iter().map(|o| o.worst_case_ns).sum();
-            let total_ms = total_ns as f64 / 1_000_000.0;
-            let final_ms = total_ms * safety_margin;
-            let bound_satisfied = final_ms <= constraint.max_latency_ms;
-
-            let no_heap = prove_no_heap(self.memory.slab_plan.as_ref(), &fn_name);
-            let static_cf = prove_static_cf(&target, &ops);
-
-            let func_wcet = FunctionWcet {
-                name: fn_name.clone(),
-                ops: ops.clone(),
-                total_wcet_ns: total_ns,
-                total_wcet_ms: total_ms,
-                safety_margin,
-                final_wcet_ms: final_ms,
-                constraint: Some(constraint.clone()),
-                bound_satisfied,
-                no_heap_proven: no_heap.proven,
-                static_cf_proven: static_cf.proven,
-            };
-
-            if !bound_satisfied {
-                let suggestions = generate_suggestions(&ops, constraint.max_latency_ms, final_ms);
-                let violation = WcetViolation {
-                    function: fn_name.clone(),
-                    declared_bound_ms: constraint.max_latency_ms,
-                    computed_wcet_ms: final_ms,
-                    ops,
-                    suggestions,
-                };
-                nsl_log::nsl_log!(INFO, "codegen", "{}", format_wcet_violation(&violation));
-                return Err(CodegenError::new(format!(
-                    "WCET bound exceeded for '{}': {:.3} ms > {:.3} ms",
-                    fn_name, final_ms, constraint.max_latency_ms
-                )));
-            }
-
-            // Emit certificate if requested
-            if let Some(ref cert_path) = self.compile_options.wcet.report_path {
-                let cert =
-                    build_certificate(&func_wcet, &no_heap, &static_cf, "source.nsl", &target);
-                emit_certificate(&cert, cert_path).map_err(|e| {
-                    CodegenError::new(format!("WCET certificate write failed: {}", e))
-                })?;
-                nsl_log::nsl_log!(INFO, "codegen", "WCET certificate: {}", cert_path.display());
-            }
-
-            // Emit DO-178C report if requested (guarded: FPGA only)
-            if let Some(ref do178c_path) = self.compile_options.wcet.do178c_report {
-                let cert =
-                    build_certificate(&func_wcet, &no_heap, &static_cf, "source.nsl", &target);
-                emit_do178c_report(&cert, do178c_path)
-                    .map_err(|e| CodegenError::new(format!("DO-178C report: {}", e)))?;
-            }
-
-            self.features.wcet_results.push(func_wcet);
-        }
-
-        Ok(())
     }
 
     /// Task 4: Declare and define the `__nsl_calib_retention_arena` zeroinit

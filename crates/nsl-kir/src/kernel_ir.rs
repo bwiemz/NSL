@@ -118,10 +118,10 @@ pub enum KirType {
     I32,
     U64,
     I64,
-    // M57 v1: narrow signed integer types for FPGA INT8 quantized inference.
-    // I8  → layer-1 weight/activation dtype (i8×i8→i32, spec §4.6 layer 1)
-    // I16 → intermediate headroom dtype (spec §4.6 headroom math)
+    /// A signed byte in a 32-bit `%r` register (`.s8`): the int8 KV-cache
+    /// and dequantization kernels load their quantized values through it.
     I8,
+    /// A signed 16-bit integer in a 32-bit `%r` register (`.s16`).
     I16,
     /// An unsigned byte in a 32-bit `%r` register, as [`KirType::U16`] is a
     /// 16-bit one: a `.u8` load zero-extends into the register, a `.u8`
@@ -574,23 +574,6 @@ pub enum KirOp {
         b: Vec<VarId>,
         c: Vec<VarId>,
     },
-
-    // M57 v1: structured ops for FPGA target. GPU/CPU codegen ignores these
-    // (existing AST → templated PTX path for GPU; Cranelift for CPU);
-    // FPGA codegen consumes them in the KIR → HIR pass.
-    Matmul {
-        a: VarId, b: VarId, out: VarId,
-        a_dtype: KirType, b_dtype: KirType, out_dtype: KirType,
-        a_shape: [usize; 2], b_shape: [usize; 2],   // rank-2 hardcoded for v1
-    },
-    ElementwiseAdd {
-        a: VarId, b: VarId, out: VarId,
-        dtype: KirType, shape: [usize; 1],          // rank-1 hardcoded for v1
-    },
-    Relu {
-        a: VarId, out: VarId,
-        dtype: KirType, shape: [usize; 1],          // rank-1 hardcoded for v1
-    },
 }
 
 #[derive(Debug, Clone)]
@@ -891,13 +874,6 @@ impl KernelIR {
         self.blocks.iter().map(|b| b.ops.len()).sum()
     }
 
-    /// Iterate all ops across all blocks in order.
-    /// M57: consumed by the KIR → HIR pass (v1 assumes single-block KIR;
-    /// multi-block KIR is out of scope until a future milestone).
-    pub fn ops(&self) -> impl Iterator<Item = &KirOp> {
-        self.blocks.iter().flat_map(|b| b.ops.iter())
-    }
-
     /// Run the KIR verifier (`crate::kir_verify`): shape, SSA,
     /// def-before-use under dominance, and operand typing. `Ok(())` or
     /// every violation found.
@@ -1088,48 +1064,8 @@ mod tests {
 }
 
 #[cfg(test)]
-mod m57_v1_tests {
+mod narrow_int_type_tests {
     use super::*;
-
-    #[test]
-    fn matmul_variant_carries_shape_and_dtype() {
-        let op = KirOp::Matmul {
-            a: 1, b: 2, out: 3,
-            a_dtype: KirType::I8, b_dtype: KirType::I8, out_dtype: KirType::I32,
-            a_shape: [1, 784], b_shape: [784, 128],
-        };
-        match op {
-            KirOp::Matmul { a_shape, b_shape, .. } => {
-                assert_eq!(a_shape[1], 784);
-                assert_eq!(b_shape[1], 128);
-            }
-            _ => panic!("expected Matmul variant"),
-        }
-    }
-
-    #[test]
-    fn elementwise_add_variant_is_rank_1() {
-        let op = KirOp::ElementwiseAdd {
-            a: 1, b: 2, out: 3,
-            dtype: KirType::I32, shape: [128],
-        };
-        match op {
-            KirOp::ElementwiseAdd { shape, .. } => assert_eq!(shape[0], 128),
-            _ => panic!("expected ElementwiseAdd"),
-        }
-    }
-
-    #[test]
-    fn relu_variant_is_rank_1() {
-        let op = KirOp::Relu {
-            a: 1, out: 2,
-            dtype: KirType::I32, shape: [128],
-        };
-        match op {
-            KirOp::Relu { shape, .. } => assert_eq!(shape[0], 128),
-            _ => panic!("expected Relu"),
-        }
-    }
 
     #[test]
     fn i8_type_has_correct_size_and_ptx() {

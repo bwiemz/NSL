@@ -1,5 +1,5 @@
 //! Codegen latency: `nsl_codegen::compile` — the entry `nsl build` takes for
-//! a single-file program (user functions, agent and batched bodies, the
+//! a single-file program (user functions and batched bodies, the
 //! memory planner, then `main` from the script's top-level statements, and
 //! Cranelift emission to an object file) — over the import-free examples,
 //! with the frontend run once at setup so only codegen is inside the

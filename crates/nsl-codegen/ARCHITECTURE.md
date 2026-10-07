@@ -32,12 +32,12 @@ Each module is declared once at the crate root (keeping `crate::foo` and
 | Facade | Responsibility | Representative modules |
 |--------|----------------|------------------------|
 | `core` | The compilation pipeline itself | `compiler`, `stmt`, `expr`, `func`, `context`, `linker`, `c_header`, `c_wrapper`, `ownership`, `standalone` |
-| `gpu` | Device backends & kernel lowering | `backend_ptx`, `kernel_ir`, `kir_verify` (re-exported from the `nsl-kir` leaf crate), `backend_amdgpu`, `backend_metal`, `backend_wgsl`, `gpu_specs`, `gpu_target`, `kernel*`, `matmul_mma`, `ptxas_validation` |
+| `gpu` | The CUDA/PTX backend & kernel lowering | `backend_ptx`, `kernel_ir`, `kir_verify` (re-exported from the `nsl-kir` leaf crate), `gpu_specs`, `gpu_target`, `kernel*`, `matmul_mma`, `ptxas_validation` |
 | `training` | Autodiff & training-time codegen | `ad_rules`, `source_ad`, `wengert`, `wengert_lower`, `vmap`, `training_report` |
 | `quantization` | Reduced-precision execution | `fp8`, `bitnet`, `weight_aware`, `pca_*` |
 | `distributed` | Parallelism strategies | `tensor_parallel`, `context_parallel`, `pipeline`, `moe*`, `cpdt*` |
-| `analysis` | Cost model, fusion, planning | `cost_model`, `autotune`, `fusion*`, `ew_chain_fusion`, `memory_planner`, `wcet`, `profiling`, `inspect`, `flash_attention*`, `calibration` |
-| `experimental` | Research subsystems (**unstable**) | `cep*`, `cfie*`, `csha*`, `wggo*`, `wrga*`, `fase*`, `zk`, `sparse`, `speculative`, `multimodal`, `unikernel*`, `experimental::fpga` (`hir`, `backend_verilog`, `kernel_lower_fpga`, `fpga_error`) |
+| `analysis` | Cost model, fusion, planning | `cost_model`, `autotune`, `fusion*`, `ew_chain_fusion`, `memory_planner`, `profiling`, `inspect`, `flash_attention*`, `calibration` |
+| `experimental` | Research subsystems (**unstable**) | `cep*`, `cfie*`, `csha*`, `wggo*`, `wrga*`, `fase*`, `sparse`, `speculative`, `multimodal` |
 
 ## Experimental vs. supported
 
@@ -58,13 +58,13 @@ AST (nsl-ast) + TypeMap (nsl-semantic)
   analysis passes              analysis / training / quantization / distributed
         │  fusion, AD, cost model, memory planning, calibration, …
         ▼
-  kernel lowering              gpu  (+ experimental::fpga for synthesis)
+  kernel lowering              gpu
         │
         ▼
   object emission + linking    core::linker
         │
         ▼
-  native object / shared lib / unikernel image
+  native object / shared lib
 ```
 
 ## Why modules stay at the crate root

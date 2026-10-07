@@ -27,21 +27,20 @@ because several commands need them: `has_train_block` (a module contains a
 `TrainBlock` or `DistillBlock`) and the `nsl doc stdlib` root lookup that
 reports "no stdlib directory found (looked at $NSL_STDLIB_PATH, ...)".
 
-**`args.rs`** is the clap tree, ~1,900 lines, all `pub(crate)`. `enum Cli`
+**`args.rs`** is the clap tree, ~1,800 lines, all `pub(crate)`. `enum Cli`
 has the variants `Check(CheckArgs)`, `Run(RunArgs)`, `Build(BuildArgs)`,
-`Test`, `Export`, `Convert`, `Init`, `Fmt`, `Debug`, `Zk { cmd: ZkCmd }`
-(`Stats`, `Prove`, `Verify`), `Profile`, `Autotune`, `Tokenize`,
-`FpgaCompile`, `PtxMetadata`, `Env { cmd: EnvCmd }` (`List`, `Current`),
+`Test`, `Export`, `Convert`, `Init`, `Fmt`, `Debug`, `Profile`, `Autotune`, `Tokenize`,
+`PtxMetadata`, `Env { cmd: EnvCmd }` (`List`, `Current`),
 and `Doc { cmd: DocCmd }` (`Cli`, `Stdlib`). `BuildArgs` and `RunArgs`
 declare every shared compile flag **twice** — a `--source-ad` field exists in
 both — which is the drift the flag contract below exists to police.
 
-**`commands/`** holds one file per subcommand (25 files):
+**`commands/`** holds one file per subcommand (23 files):
 
 | File | Command |
 |---|---|
 | `check.rs` | `nsl check` — lex/parse/semantic without codegen; `--linear-types`, `--cpkd-design-student` (via `cpkd_design.rs`) |
-| `build/` | `nsl build`, `nsl run`'s build half, `nsl zk`, WRGA analysis: `mod.rs`, `normal.rs` (single/multi-file object emit + link), `run.rs` (`build_to_temp` / `execute_temp_build`), `shared_lib.rs` (`--shared-lib`, C header emission), `standalone.rs`, `zk.rs`, `wrga_check.rs`, `reports.rs`, `options.rs` (`CompileOptions` assembly) |
+| `build/` | `nsl build`, `nsl run`'s build half, WRGA analysis: `mod.rs`, `normal.rs` (single/multi-file object emit + link), `run.rs` (`build_to_temp` / `execute_temp_build`), `shared_lib.rs` (`--shared-lib`, C header emission), `standalone.rs`, `wrga_check.rs`, `reports.rs`, `options.rs` (`CompileOptions` assembly) |
 | `run.rs` | `nsl run` dispatcher — wraps the build with the monitor/profiler/multi-process spawners |
 | `test.rs` | `nsl test` — compile-and-run NSL test files with an optional filter |
 | `export.rs` | `nsl export` — ONNX / safetensors export |
@@ -50,7 +49,6 @@ both — which is the drift the flag contract below exists to police.
 | `init.rs` | `nsl init` — project scaffolding |
 | `autotune.rs` | `nsl autotune` — measure `@autotune` kernel variants on this GPU |
 | `tokenize.rs` | `nsl tokenize` — train a BPE tokenizer over source directories |
-| `fpga.rs` | `nsl fpga-compile` — NSL → KIR → HIR → Verilog (experimental) |
 | `ptx_metadata.rs` | `nsl ptx-metadata` — static per-kernel resource report for a `.ptx` |
 | `env.rs` | `nsl env list` / `nsl env current` |
 | `cep.rs`, `cpkd_design.rs`, `profile_merge.rs`, `mod.rs` | CEP pruning frontend, CPKD design-student check, trace merging for `nsl run --profile`, shared helpers |
@@ -61,13 +59,13 @@ both — which is the drift the flag contract below exists to police.
 
 **`pipeline.rs`: frontend → semantic → codegen.** `frontend_with_source_map`
 reads the file, `nsl_lexer::tokenize`s it, `nsl_parser::parse`s the tokens,
-runs `nsl_semantic::analyze_with_imports` (threading `linear_types` so E0610
-fires), emits every diagnostic through the `SourceMap`, and `exit(1)`s if any
-is an error — so by the time a command holds the `AnalysisResult` the
-frontend is known-clean. `exit_on_codegen_error` renders a `CodegenError`
-through the same source map when it carries a span. The rest of the file is
-bridges from semantic decorator configs into codegen newtypes
-(`module_data_to_wrga_inputs`, `module_data_to_fused_ce_configs`, ...); the
+runs `nsl_semantic::analyze_with_imports` (threading `linear_types` so the
+M38a ownership walker runs), emits every diagnostic through the `SourceMap`,
+and `exit(1)`s if any is an error — so by the time a command holds the
+`AnalysisResult` the frontend is known-clean. `exit_on_codegen_error` renders
+a `CodegenError` through the same source map when it carries a span. The
+rest of the file is bridges from semantic decorator configs into codegen
+newtypes (`module_data_to_wrga_inputs`, `module_data_to_fused_ce_configs`, ...); the
 single-file twins live in `src/analysis_bridges.rs` so `profile` can reuse
 them. Multi-file programs go through `src/loader.rs` (`ModuleData`) and the
 import resolver in `src/resolver.rs`.
@@ -192,7 +190,7 @@ them is written by hand:
 
 ## The gate suite
 
-`crates/nsl-cli/tests/` is 172 test files (~51K lines) plus `crates/nsl-cli/tests/fixtures/` and `crates/nsl-cli/tests/differential_scripts/`;
+`crates/nsl-cli/tests/` is 182 test files (~56K lines) plus `crates/nsl-cli/tests/fixtures/` and `crates/nsl-cli/tests/differential_scripts/`;
 the e2e stdout baselines live at the workspace root in `tests/expected/`. The dominant shape is a **gate**: build or run a small
 `.nsl` program through the real binary and assert on exit status and stderr
 markers. By filename suffix: 78 `*_gate.rs`, 18 `*_e2e.rs`, 7
@@ -215,8 +213,7 @@ markers. By filename suffix: 78 `*_gate.rs`, 18 `*_e2e.rs`, 7
   `exec_fingerprint_resume_gate.rs`, `ccr_checkpoint_parity.rs`,
   `model_config_drift.rs`.
 - **End-to-end examples** — `e2e.rs` compiles and runs the workspace's
-  `examples/*.nsl` and diffs stdout against the root `tests/expected/*.txt`; `m56_e2e_examples.rs` runs
-  `nsl check --linear-types` over the M56 examples; the `*_e2e.rs` files
+  `examples/*.nsl` and diffs stdout against the root `tests/expected/*.txt`; the `*_e2e.rs` files
   (`csha_checkpoint_decorator_cli_e2e.rs`, `fused_lm_ce_e2e_nsl_source.rs`,
   `pretrain_loss_decrease_gpu_e2e.rs`, ...) run one feature through the CLI.
 - **GPU-certified gates** — the `*_gpu_gate.rs` files
@@ -251,7 +248,7 @@ GPU gates above); CI runs the e2e suite and `zero_spmd_gate` that way.
 | `doc-agreement` | `scripts/check-doc-agreement.sh` (roadmap item 21): claims in docs about the tree (paths, counts, names) still hold |
 | `gpu-gate-inventory` | `scripts/gpu-cert.sh --check-inventory` / `--check-reasons` / `--check-long-arms` against `ci/gpu-cert-manifest.tsv`, with anti-vacuity steps that delete gates and expect the check to fail |
 | `hand-ptx-freeze` | `scripts/hand-ptx-freeze.sh`: no new hand-written PTX kernels |
-| `test-onnx-rt`, `python-interop`, `fpga` | The ORT custom-op build and Python E2E; `python/tests` against a CPU torch; the Verilator/Yosys FPGA layers |
+| `test-onnx-rt`, `python-interop` | The ORT custom-op build and Python E2E; `python/tests` against a CPU torch |
 
 The design-only enforcement gate is a **separate workflow**,
 `.github/workflows/design_only_enforcement.yml` (M35.2): it checks that

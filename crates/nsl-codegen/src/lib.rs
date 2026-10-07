@@ -16,14 +16,14 @@
 //!
 //! - [`core`] — the compilation pipeline itself (compiler driver, statement /
 //!   expression lowering, linker, C-export/header emission, ownership).
-//! - [`gpu`] — GPU backends (PTX, AMDGPU, Metal, WGSL) and kernel lowering.
+//! - [`gpu`] — the CUDA/PTX backend and kernel lowering.
 //! - [`training`] — autodiff (tape + source-to-source), Wengert lists, `vmap`.
 //! - [`quantization`] — FP8, BitNet, AWQ/PCA precision tiering, weight analysis.
 //! - [`distributed`] — tensor / context / pipeline parallelism, MoE, CPDT.
-//! - [`analysis`] — cost model, autotuning, fusion, memory planning, WCET,
+//! - [`analysis`] — cost model, autotuning, fusion, memory planning,
 //!   FlashAttention codegen, calibration.
 //! - [`experimental`] — research subsystems (CEP, CFIE, CSHA, WGGO, WRGA,
-//!   FASE, ZK, FPGA, unikernel, sparse, speculative, multimodal). These APIs
+//!   FASE, sparse, speculative, multimodal). These APIs
 //!   are **not stable** and may change or be removed between releases.
 //!
 //! These facades re-export the same modules that remain available at the crate
@@ -72,7 +72,6 @@
 // ===========================================================================
 
 // --- Core compilation pipeline -------------------------------------------
-pub mod agent;
 pub mod builtins;
 pub(crate) mod c_export_table;
 pub mod c_header;
@@ -111,9 +110,6 @@ pub mod types;
 pub mod use_count;
 
 // --- GPU backends & kernel lowering --------------------------------------
-pub mod backend_amdgpu;
-pub mod backend_metal;
-pub mod backend_wgsl;
 pub mod gpu_specs;
 pub mod gpu_target;
 // `KernelIR`, its verifier and the PTX printer live in the leaf crate
@@ -201,7 +197,6 @@ pub mod pass_registry;
 pub mod pass_trace;
 pub mod profiling;
 pub mod serve;
-pub mod wcet;
 
 // --- Experimental research subsystems ------------------------------------
 // These are NOT part of the stable API. See the `experimental` facade.
@@ -247,8 +242,6 @@ pub mod fase_optimizer;
 pub mod multimodal;
 pub mod sparse;
 pub mod speculative;
-pub mod unikernel;
-pub mod unikernel_boot;
 pub mod wggo;
 pub mod wggo_apply;
 pub mod wggo_cfie;
@@ -286,13 +279,6 @@ pub mod wrga_prescan;
 pub mod wrga_prune;
 pub mod wrga_roofline;
 pub mod wrga_spectral;
-pub mod zk;
-
-// FPGA / hardware-synthesis path (experimental).
-pub mod backend_verilog;
-pub mod fpga_error;
-pub mod hir;
-pub mod kernel_lower_fpga;  // M57.1 §3.3
 
 // ===========================================================================
 // Subsystem facade namespaces
@@ -306,18 +292,17 @@ pub mod kernel_lower_fpga;  // M57.1 §3.3
 /// lowering, linking, C-export/header emission, and ownership analysis.
 pub mod core {
     pub use crate::{
-        agent, builtins, c_header, c_wrapper, compiler, context, dynamic_shapes,
+        builtins, c_header, c_wrapper, compiler, context, dynamic_shapes,
         error, expr, ffi_ownership, func, grammar_compiler, linker, ownership,
         ownership_expr, schema_convert, standalone, stdlib_loader, stmt, stmt_csla,
         stmt_fase, stmt_train, types, use_count,
     };
 }
 
-/// GPU code generation: device backends and kernel lowering.
+/// GPU code generation: the CUDA/PTX backend and kernel lowering.
 pub mod gpu {
     pub use crate::{
-        backend_amdgpu, backend_metal, backend_ptx, backend_wgsl, gpu_specs,
-        gpu_target, kernel_ir, kernel_lower, kernel_skeleton,
+        backend_ptx, gpu_specs, gpu_target, kernel_ir, kernel_lower, kernel_skeleton,
         matmul_mma, ptx_metadata, ptxas_validation,
     };
 }
@@ -350,7 +335,6 @@ pub mod analysis {
         autotune, calibration, cost_model, flash_attention,
         flash_attention_selector, flash_attention_v2, fused_linear_ce, fusion,
         fusion_report, inspect, memory_planner, profiling, serve,
-        wcet,
     };
 }
 
@@ -363,19 +347,14 @@ pub mod experimental {
         cfie_kv_quant, cfie_persistent, cfie_speculative, csha, csha_apply,
         csha_boundary, csha_patterns, csha_pipeline, csha_specialize, fase,
         fase_clip, fase_codegen_table, fase_memory, fase_optimizer, multimodal,
-        sparse, speculative, unikernel, unikernel_boot, wggo, wggo_apply,
+        sparse, speculative, wggo, wggo_apply,
         wggo_conflicts, wggo_cost, wggo_dp, wggo_gradient_scorer, wggo_graph,
         wggo_ilp, wggo_overrides, wggo_prune, wggo_schedule, wggo_weight_analysis,
         wggo_weight_analysis_cache, wggo_weight_analysis_nslweights, wrga,
         wrga_adapter_init, wrga_adapter_inject, wrga_adapter_rewrite,
         wrga_fused_ptx, wrga_fusion, wrga_kernel_helpers, wrga_memory,
-        wrga_prescan, wrga_prune, wrga_roofline, wrga_spectral, zk,
+        wrga_prescan, wrga_prune, wrga_roofline, wrga_spectral,
     };
-
-    /// FPGA / hardware-synthesis path (Verilog emission, HIR lowering).
-    pub mod fpga {
-        pub use crate::{backend_verilog, fpga_error, hir, kernel_lower_fpga};
-    }
 }
 
 /// Binary-internal modules re-exposed at the library level so integration
@@ -417,15 +396,9 @@ pub use compiler::{
     compile_module_with_imports_returning_plan,
     compile_returning_plan, compile_returning_splice_count_for_tests,
     compile_standalone, compile_standalone_returning_plan,
-    compile_test, compile_with_profile_captures, compile_with_zk_info,
-    compile_with_zk_info_returning_plan,
+    compile_test, compile_with_profile_captures,
     StandaloneConfig,
 };
-
-/// M57.1 §3.2: re-exported from the (private) `compiler::kernel` module so that
-/// integration tests can pin the production redirect message without copying
-/// the literal. See `tests/fpga_target_redirect.rs`.
-pub use crate::compiler::kernel::FPGA_TARGET_REDIRECT_MSG;
 
 /// Task 4 test helper: compile a module and return any `WrgaPlan` produced
 /// during `@train` block lowering.  The plan is returned even when codegen
@@ -988,75 +961,6 @@ pub struct CfieOptions {
     /// Write the CFIE build report to this path in addition to stderr
     /// (`--cfie-report <path>`).
     pub report_path: Option<std::path::PathBuf>,
-}
-
-/// M53: Worst-case-execution-time (WCET) analysis and certification options.
-///
-/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
-/// struct into cohesive sub-structs (architecture-hardening review).
-#[derive(Clone, Debug, PartialEq)]
-pub struct WcetOptions {
-    /// Enable WCET analysis for `@real_time` functions.
-    pub enabled: bool,
-    /// GPU target name for WCET analysis (e.g., "Orin", "H100").
-    pub gpu: Option<String>,
-    /// CPU target name for WCET analysis (e.g., "cortex-a78").
-    pub cpu: Option<String>,
-    /// Path to write the WCET certificate JSON.
-    pub report_path: Option<std::path::PathBuf>,
-    /// Safety-margin multiplier for WCET (default: 1.05 = 5%).
-    pub safety_margin: f64,
-    /// Path to write a DO-178C compliance report.
-    pub do178c_report: Option<std::path::PathBuf>,
-    /// WCET target type: "gpu" (statistical), "fpga" (certified), "groq" (blocked).
-    pub target: String,
-    /// FPGA device name for certified WCET (e.g., "xcvu440", "xczu9eg").
-    pub fpga_device: Option<String>,
-}
-
-impl Default for WcetOptions {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            gpu: None,
-            cpu: None,
-            report_path: None,
-            safety_margin: 1.05,
-            do178c_report: None,
-            target: "gpu".to_string(),
-            fpga_device: None,
-        }
-    }
-}
-
-/// M55: Zero-knowledge proof-circuit emission options.
-///
-/// Grouped out of [`CompileOptions`] as part of decomposing that god-config
-/// struct into cohesive sub-structs (architecture-hardening review).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ZkOptions {
-    /// Emit a ZK inference circuit alongside compiled output.
-    pub circuit: bool,
-    /// ZK backend to use ("folding", "halo2", or "plonky3").
-    pub backend: String,
-    /// ZK field to use ("m31" or "bn254").
-    pub field: String,
-    /// Also emit a Solidity verifier contract.
-    pub solidity: bool,
-    /// Path to safetensors weight file used as ZK witness.
-    pub weights_path: Option<std::path::PathBuf>,
-}
-
-impl Default for ZkOptions {
-    fn default() -> Self {
-        Self {
-            circuit: false,
-            backend: "folding".to_string(),
-            field: "m31".to_string(),
-            solidity: false,
-            weights_path: None,
-        }
-    }
 }
 
 /// CSHA (compiler-specialized hardware attention) codegen options.
@@ -2047,18 +1951,12 @@ pub struct CompileOptions {
     /// Weight-aware compilation (`--weights`, the M52 config, the analysis
     /// report) and the `@export` weight-index map; see [`WeightsOptions`].
     pub weights: WeightsOptions,
-    /// M54: Unikernel build configuration (None = normal build)
-    pub unikernel_config: Option<crate::unikernel::UnikernelConfig>,
-    /// M53: Worst-case-execution-time analysis / certification options.
-    pub wcet: WcetOptions,
     /// M38a: Enable linear types ownership checking.
     pub linear_types_enabled: bool,
     /// Facts forwarded from semantic analysis (ownership metadata, the
     /// `@csha` / `@fused_lm_ce` / `@fused_kl_ce` / `@pca` decorator configs);
     /// see [`AnalysisOptions`].
     pub analysis: AnalysisOptions,
-    /// M55: Zero-knowledge proof-circuit emission options.
-    pub zk: ZkOptions,
     /// ZeRO sharding (`--zero-stage` / `--zero-elementwise`); see
     /// [`ZeroOptions`].
     pub zero: ZeroOptions,
@@ -2332,11 +2230,8 @@ impl Default for CompileOptions {
             source_ad: false,
             determinism: DeterminismOptions::default(),
             weights: WeightsOptions::default(),
-            unikernel_config: None,
-            wcet: WcetOptions::default(),
             linear_types_enabled: false,
             analysis: AnalysisOptions::default(),
-            zk: ZkOptions::default(),
             zero: ZeroOptions::default(),
             muon: MuonOptions::default(),
             lm_head_fusion: crate::lm_head_inference::LmHeadFusion::Off,
@@ -2458,16 +2353,12 @@ pub fn compile_and_calibrate(
         compiler.collect_enums(&parsed.module.stmts)?;
         compiler.collect_structs(&parsed.module.stmts)?;
         compiler.collect_models(&parsed.module.stmts)?;
-        // M56 Task 17: compute agent struct layouts.
-        compiler.collect_agents(&parsed.module.stmts)?;
         compiler.declare_runtime_functions()?;
         compiler.declare_imported_functions(&imported_fns)?;
         compiler.declare_user_functions_with_linkage(
             &parsed.module.stmts,
             cranelift_module::Linkage::Export,
         )?;
-        // M56 Task 17: declare agent method FuncIds.
-        compiler.declare_agent_methods(&parsed.module.stmts, cranelift_module::Linkage::Export)?;
         let vmap_results = compiler.apply_vmap_transforms(&parsed.module);
         compiler.register_batched_functions(&vmap_results);
         compiler.compile_datatype_defs(&parsed.module.stmts)?;
@@ -2585,8 +2476,6 @@ pub fn compile_and_calibrate(
         }
         compiler.compile_flash_attention_kernels(&parsed.module.stmts)?;
         compiler.compile_user_functions(&parsed.module.stmts)?;
-        // M56 Task 17: compile agent method bodies.
-        compiler.compile_agent_methods(&parsed.module.stmts)?;
         compiler.compile_batched_functions(&vmap_results)?;
         compiler.compile_main(&parsed.module.stmts)?;
         compiler.compile_pending_lambdas()?;

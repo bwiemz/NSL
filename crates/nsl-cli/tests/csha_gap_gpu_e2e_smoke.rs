@@ -200,8 +200,8 @@ fn run_toy(extra_args: &[&str]) -> (bool, String, String) {
         // (adjoint-generator path).  Tape-AD bypasses the Gap A..I.5
         // pipeline entirely.
         .arg("--source-ad")
-        // `parse_gpu_sm_from_target` expects `sm_<N>`.  The default
-        // `cuda` string panics inside `compile_flash_attention_kernels`.
+        // Pin the SM the fused kernels are generated for (plain `cuda`
+        // would give sm_80).
         .arg("--target")
         .arg("sm_89");
     for a in extra_args {

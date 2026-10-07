@@ -19,10 +19,10 @@ NSL's development is organized into milestones (M9-M62) grouped into phases (1-1
 | 7 | v0.6-v0.7 | M38b (linear types codegen), M40b (source AD extraction), M43 (pipeline parallel) | Shipped 2026-03-18 |
 | 8 | v0.8 | M45 (tensor debugger), M46 (reproducibility), M48 (multimodal) | Shipped 2026-03-18 |
 | 9 | v0.8 | M49 (shape algebra), M50 (sparse tensors), M51 (effect system) | Shipped 2026-03-18 |
-| 10 | v0.9 | M52 (weight-aware compilation), M62 (PyTorch FFI), M54 (unikernels) | M52/M62 shipped; M54 partial (M54b: boot stub + unikernel runtime + GPU-init framework) |
-| 11 | v1.0 | M53 (WCET proofs), M55 (ZK circuits), M56 (agent shared memory) | Planned |
+| 10 | v0.9 | M52 (weight-aware compilation), M62 (PyTorch FFI), M54 (unikernels) | M52/M62 shipped; M54 removed in the Phase 0.6 scope freeze (preserved at tag `attic/scope-freeze-2026-10`) |
+| 11 | v1.0 | M53 (WCET proofs), M55 (ZK circuits), M56 (agent shared memory) | M53/M55/M56 removed in the Phase 0.6 scope freeze (preserved at tag `attic/scope-freeze-2026-10`) |
 | 12 | v1.1 | M58 (elastic FT), M59 (topology routing), M61 (cluster debug) | Planned |
-| 13 | v1.2 | M57 (FPGA/neuromorphic), M60 (exabyte streaming) | Planned |
+| 13 | v1.2 | M57 (FPGA/neuromorphic), M60 (exabyte streaming) | M57 removed in the Phase 0.6 scope freeze (preserved at tag `attic/scope-freeze-2026-10`); M60 planned |
 
 > **Note on phases 4-9:** v0.3.0 through v0.8.0 shipped within a week (2026-03-17 to 2026-03-18) as a rapid catch-up release train. The phase boundaries above reflect the logical groupings from the roadmap design, not a multi-week development cycle.
 
@@ -74,7 +74,7 @@ Paged KV-cache with BlockAllocator and PageTable; `@paged_kv` decorator; `--prof
 Build-time Cartesian-product tuner; `@fuse` elementwise chain detection; fused PTX synthesis; `--profile-kernels`.
 
 ### M27 -- FlashAttention-2 (Shipped v0.2, 2026-03-15)
-Tiled FA-2 PTX with 5 kernel variants; RoPE/GQA fusion; `@flash_attention`, `@rope`, `@gqa` decorators.
+Tiled FA-2 PTX with 5 kernel variants; RoPE/GQA fusion; `@flash_attention`, `@rope`, `@gqa` decorators. (`@rope` is refused since 2026-10: no launch ever passed it cos/sin tables.)
 
 ### M28 -- Dynamic shapes + ragged tensors (Shipped v0.2, 2026-03-15)
 Symbolic dimension tracking; bounded syntax (`SeqLen < 4096`); runtime dimension assertions.
@@ -136,8 +136,8 @@ Trace recording with NaN analysis; trace diffing across runs; Chrome tracing JSO
 ### M46 -- Reproducibility (Shipped v0.8, 2026-03-18)
 Determinism checker; kernel variant selection for bitwise reproducibility; RNG state tracking.
 
-### M47 -- Multi-backend KIR (Shipped v0.6, 2026-03-18)
-Kernel IR (KIR) intermediate representation; PTX backend; `GpuTarget`/`GpuBackend` trait -- dense inference only (FlashAttention/MoE stay CUDA-only).
+### M47 -- Multi-backend KIR (Shipped v0.6, 2026-03-18; non-CUDA backends removed 2026-10)
+Kernel IR (KIR) intermediate representation; PTX backend; `GpuTarget`/`GpuBackend` trait -- dense inference only (FlashAttention/MoE stay CUDA-only). The AMDGPU/Metal/WGSL printers and the unused runtime `GpuBackend` trait were removed in the Phase 0.6 scope freeze (never tested on hardware); preserved at tag `attic/scope-freeze-2026-10`. KIR and the PTX backend stay.
 
 ### M48 -- Multimodal (Shipped v0.8, 2026-03-18)
 `PatchEmbed` (vision), `MelSpectrogram` (audio), `cross_attention` (cross-modal fusion), modality classification.
@@ -154,20 +154,20 @@ Effect annotations on functions; pure/stateful/io effect tracking; required by M
 ### M52 -- Weight-aware compilation (In flight, Phase 10)
 Compiles model weights into the binary as compile-time constants; constant folding over weight tensors; CPDT Phase 1 shipped 2026-04-21, Phase 2 measurement-triggered. Design: [`2026-03-19-m52-m62-roadmap-design.md`](../plans/2026-03-19-m52-m62-roadmap-design.md).
 
-### M53 -- WCET proofs (Planned, Phase 11)
-Worst-case execution time analysis for robotics/safety-critical deployments; requires M52 weight constants. Design: [`2026-03-19-m52-m62-roadmap-design.md`](../plans/2026-03-19-m52-m62-roadmap-design.md).
+### M53 -- WCET proofs (Removed, 2026-10)
+Worst-case execution time analysis for robotics/safety-critical deployments; requires M52 weight constants. A partial implementation shipped (`--wcet`, certificate and DO-178C report output for `@real_time` functions), but it priced every function as the same fixed matmul-plus-relu estimate instead of analysing its body. Removed in the Phase 0.6 scope freeze, together with its flags, the `@real_time`/`@wcet_budget` decorators and the FPGA/CPU spec databases it alone read; preserved at tag `attic/scope-freeze-2026-10`. Design: [`2026-03-19-m52-m62-roadmap-design.md`](../plans/2026-03-19-m52-m62-roadmap-design.md).
 
-### M54 -- Bare-metal unikernels (In flight, Phase 10)
-x86_64 boot stub + unikernel runtime + GPU init (M54b, 2026-03-26, unreleased); single-binary AI inference with no OS. Design: [`2026-03-19-m52-m62-roadmap-design.md`](../plans/2026-03-19-m52-m62-roadmap-design.md).
+### M54 -- Bare-metal unikernels (Removed, 2026-10)
+x86_64 boot stub + unikernel runtime + GPU init (M54b, 2026-03-26, never released); single-binary AI inference with no OS. Removed in the Phase 0.6 scope freeze — the build configuration was parsed and printed but never consumed; preserved at tag `attic/scope-freeze-2026-10`. Design: [`2026-03-19-m52-m62-roadmap-design.md`](../plans/2026-03-19-m52-m62-roadmap-design.md).
 
-### M55 -- ZK inference circuits (v1 shipped: folding backend)
-Zero-knowledge proofs over model inference; verifiable computation for privacy-sensitive deployments. The folding backend is shipped and wired end-to-end (`nsl build --zk-backend folding` proves + `nsl zk verify`); the `halo2` and `plonky3` backends are refused at compile time (halo2 deprecated/removed, plonky3 prover not yet wired) rather than silently falling back to folding. Design: [`2026-03-19-m52-m62-roadmap-design.md`](../plans/2026-03-19-m52-m62-roadmap-design.md).
+### M55 -- ZK inference circuits (Removed, 2026-10)
+Zero-knowledge proofs over model inference; verifiable computation for privacy-sensitive deployments. The folding backend was wired end-to-end (`nsl build --zk-backend folding` proves + `nsl zk verify`); `halo2` and `plonky3` were refused at compile time. Removed in the Phase 0.6 scope freeze, together with `nsl zk`, the `--zk-*` build flags and the `@zk_proof`/`@zk_lookup` decorators; preserved at tag `attic/scope-freeze-2026-10`. Design: [`2026-03-19-m52-m62-roadmap-design.md`](../plans/2026-03-19-m52-m62-roadmap-design.md).
 
-### M56 -- Multi-agent shared memory (Planned, Phase 11)
-Safe shared-memory protocol for multi-agent systems; ownership enforced by M38 linear types. Design: [`2026-03-19-m56-multi-agent-design.md`](../superpowers/specs/2026-03-19-m56-multi-agent-design.md).
+### M56 -- Multi-agent shared memory (Removed, 2026-10)
+Safe shared-memory protocol for multi-agent systems; ownership enforced by M38 linear types. A v1 landed: `agent` blocks gated behind `--linear-types`, the action-port-graph checks (cycles, device compatibility, fan-out, cross-agent access and mutation), `@pipeline_agent` lowering with direct method dispatch, `@auto_device_transfer`, and a mailbox/scheduler/pool runtime whose `nsl_agent_*` FFI the codegen never called. Removed in the Phase 0.6 scope freeze; `agent` stays a reserved word, and an `agent` block and both decorators are refused with the tag. Preserved at tag `attic/scope-freeze-2026-10`. Design: [`2026-03-19-m56-multi-agent-design.md`](../superpowers/specs/2026-03-19-m56-multi-agent-design.md).
 
-### M57 -- FPGA/neuromorphic backend (v1 shipped: clocked-FSM MLP; parity gated on external tools)
-Emit to FPGA HLS or neuromorphic hardware targets via the M47 KIR; dense inference only. The v1 sequential clocked-FSM emitter for MLPs is shipped (PR #211); Verilator/Yosys synthesis-parity validation is gated on those external tools (not available in the default CI/dev environment). Further scope is paused pending re-scoping. Design: [`2026-03-19-m57-fpga-neuromorphic-design.md`](../superpowers/specs/2026-03-19-m57-fpga-neuromorphic-design.md).
+### M57 -- FPGA/neuromorphic backend (Removed, 2026-10)
+Emit to FPGA HLS or neuromorphic hardware targets via the M47 KIR; dense inference only. A v1 shipped: a KIR→HIR lowering, a Verilog emitter with a sequential clocked-FSM mode for a fixed int8 MLP (PR #211), `nsl fpga-compile`, and Verilator/Yosys simulation and synthesis gates; nothing ran on an FPGA. Removed in the Phase 0.6 scope freeze, together with `nsl fpga-compile`, `--target fpga` (now refused with the tag) and the CI `fpga` job; preserved at tag `attic/scope-freeze-2026-10`. The name "HIR" is free again. Design: [`2026-03-19-m57-fpga-neuromorphic-design.md`](../superpowers/specs/2026-03-19-m57-fpga-neuromorphic-design.md).
 
 ### M58 -- Elastic fault tolerance (Planned, Phase 12)
 Checkpoint/restore with worker elasticity; re-route around failed nodes mid-training. Design: [`2026-03-19-m58-fault-tolerance-design.md`](../superpowers/specs/2026-03-19-m58-fault-tolerance-design.md).
@@ -355,7 +355,7 @@ The M32-M51 phase ordering was revised once (2026-03-15 design doc). Phase 4 re-
 What is load-bearing and won't move:
 
 - **M38a (linear types semantics) ships before any stdlib rewrite** because the stdlib must be ownership-correct from day one.
-- **CUDA-first** -- M47 multi-backend only covers dense inference; FlashAttention / Ring Attention / FP8 / MoE stay CUDA-only until there is demonstrated demand.
+- **CUDA-first** -- M47's non-CUDA backends only ever covered dense inference, and the 2026-10 scope freeze removed them; FlashAttention / Ring Attention / FP8 / MoE stay CUDA-only until there is demonstrated demand.
 - **Inference-first identity** -- debugging, determinism, constrained decoding, and KV compression land before training niceties like source AD and pipeline parallelism.
 
 ## References

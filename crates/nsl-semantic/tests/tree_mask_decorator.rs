@@ -62,7 +62,7 @@ fn forward():
 }
 
 /// Negative: `@tree_mask` without `@flash_attention` companion errors.
-/// Mirrors the @rope and @gqa validation patterns — tree_mask is a
+/// Mirrors the @gqa validation pattern — tree_mask is a
 /// flash-attention-only modifier and has no meaning standalone.
 #[test]
 fn tree_mask_without_flash_attention_errors() {

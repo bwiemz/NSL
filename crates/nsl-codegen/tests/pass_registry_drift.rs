@@ -454,7 +454,7 @@ fn every_pass_prefixed_cli_flag_is_registered() {
         "cep_", "cfie_", "checkpoint_",
     ];
     // Exactly-named flags that are a pass's own switch rather than prefixed.
-    const PASS_EXACT: &[&str] = &["wggo", "csha", "cpdt", "cfie", "memory"];
+    const PASS_EXACT: &[&str] = &["wggo", "csha", "cpdt", "cfie"];
 
     let mut unregistered: Vec<&String> = all
         .iter()
@@ -630,9 +630,7 @@ const NOT_A_PASS: &[(&str, &str)] = &[
          (joining requests to dispositions), transforms nothing itself",
     ),
     ("ad_rules", "adjoint rules table consumed by source-AD, not a pass"),
-    ("agent", "M56 agent-memory feature"),
     ("autotune", "kernel autotuner, invoked BY passes rather than being one"),
-    ("backend_", "target backends (ptx/amdgpu/metal/wgsl/verilog)"),
     ("bin", "binaries, not library modules"),
     ("bitnet", "M35 BitNet quantized-model support"),
     ("builtins", "FFI symbol registration (language-facing half of the registry)"),
@@ -652,7 +650,6 @@ const NOT_A_PASS: &[(&str, &str)] = &[
     ("ffi_ownership", "FFI ownership annotations"),
     ("flash_attention", "attention kernel emitter + selector"),
     ("fp8", "FP8 dtype support"),
-    ("fpga_error", "FPGA backend errors"),
     ("func", "function lowering"),
     ("fused_linear_ce", "fused loss kernel emitter"),
     (
@@ -674,7 +671,6 @@ const NOT_A_PASS: &[(&str, &str)] = &[
     ("gpu_spec", "GPU capability tables"),
     ("gpu_target", "GPU target selection"),
     ("grammar_compiler", "CFIE grammar compilation"),
-    ("hir", "high-level IR"),
     (
         "ctor_fold",
         "item 5: constant-folds constructor arguments into model-field dims \
@@ -749,10 +745,8 @@ const NOT_A_PASS: &[(&str, &str)] = &[
     ("training_report", "training report emission"),
     ("transient_arena", "transient-memory arena (roadmap item 4)"),
     ("types", "type machinery"),
-    ("unikernel", "M54 unikernel targets"),
     ("use_count", "dead use-count analysis (zero readers since 5e2740bc)"),
     ("vmap", "M39 vmap"),
-    ("wcet", "M53 worst-case execution time"),
     ("weight_aware", "M52 weight-aware invariants"),
     ("wengert", "the IR itself, and its Cranelift lowering"),
     (
@@ -768,7 +762,6 @@ const NOT_A_PASS: &[(&str, &str)] = &[
          excluded on identical grounds — on the wrong side of a considered \
          line, by accident",
     ),
-    ("zk", "M55 zero-knowledge proofs"),
 ];
 
 #[test]
@@ -1101,7 +1094,7 @@ fn every_phase_owning_function_establishes_its_scope() {
          "pub fn build_report", "Analysis"),
         // Milestone C: the train-block wrapper scopes ITSELF, so every
         // caller — compile_user_functions (nested train in any fn),
-        // lambdas, model/agent methods, module compiles — is covered by
+        // lambdas, model methods, module compiles — is covered by
         // construction, not just the two top-level drivers above. This is
         // what closes the scheduler's phase=None production gap, and it is
         // the LOAD-BEARING TrainBlock install: the compile_main /

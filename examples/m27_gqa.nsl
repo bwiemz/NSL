@@ -1,0 +1,13 @@
+# M27: GQA variant — decorator validation test
+#
+# (This example used to stack @rope here too. @rope is refused: no launch
+# ever passed the kernel its cos/sin tables. Apply RoPE before attention,
+# as nsl.nn.gqa does.)
+
+@flash_attention(causal=true)
+@gqa(groups=4)
+fn gqa_attention(Q: Tensor, K: Tensor, V: Tensor) -> Tensor:
+    let scale = 1.0 / sqrt(16.0)
+    return Q
+
+print("GQA compiled OK")

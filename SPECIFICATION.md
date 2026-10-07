@@ -250,8 +250,8 @@ block_kv with fused projections) are rejected at compile time.
 
 ### Multi-Backend (M47)
 - Kernel IR with 40+ ops
-- PTX backend (production)
-- AMDGPU, Metal (MSL), WGSL backends (code generation, untested on hardware)
+- PTX backend (production; the only GPU backend)
+- AMDGPU, Metal (MSL) and WGSL backends: removed in the Phase 0.6 scope freeze (never tested on hardware); preserved at tag `attic/scope-freeze-2026-10`
 
 ### Pipeline Parallelism (M43)
 - 1F1B and GPipe scheduling
@@ -296,22 +296,20 @@ block_kv with fused projections) are rejected at compile time.
 - C API: `nsl build --shared-lib` for model lifecycle management
 - Safetensors import/export
 
-### Unikernel (M54)
-- `nsl build --unikernel` for bare-metal deployment
-- Memory layout computation and linker script generation
-- Hypervisor targets: KVM, Firecracker
+### Unikernel (M54) — removed
+- Removed in the Phase 0.6 scope freeze (`nsl build --unikernel`, `--listen`, `--memory` are gone); preserved at tag `attic/scope-freeze-2026-10`
 
-### ZK Inference (M55)
-- `@zk_proof(mode="weight_private")` decorator
-- 4 privacy modes: weight_private, input_private, full_private, architecture_attestation
-- Circuit IR, witness generation; the **folding backend** is the shipped end-to-end path (`nsl build --zk-backend folding` + `nsl zk verify`) — halo2 and plonky3 are refused at compile time
-- Lookup-native arithmetization (Jolt-style)
-- Mersenne-31 field support
+### ZK Inference (M55) — removed
+- Removed in the Phase 0.6 scope freeze (`nsl zk`, `nsl build --zk-circuit`/`--zk-backend`/`--zk-field`/`--zk-solidity`/`--zk-weights`, and the `@zk_proof`/`@zk_lookup` decorators are gone; the two decorators now get a refusal that names the tag); preserved at tag `attic/scope-freeze-2026-10`
 
-### WCET Analysis (M53)
-- Real-time execution time bounds for safety-critical deployment
-- Op-by-op worst-case classification
-- DO-178C reporting format
+### WCET Analysis (M53) — removed
+- Removed in the Phase 0.6 scope freeze (`--wcet`, `--wcet-cert`, `--wcet-target`, `--cpu`, `--do178c-report`, `--fpga-device` on `nsl build`/`nsl run`, and the `@real_time`/`@wcet_budget` decorators are gone; the two decorators now get a refusal that names the tag); preserved at tag `attic/scope-freeze-2026-10`
+
+### FPGA / Verilog (M57) — removed
+- Removed in the Phase 0.6 scope freeze (`nsl fpga-compile`, the HIR, the Verilog emitter and the KIR→HIR lowering are gone; `--target fpga` now gets a refusal that names the tag); preserved at tag `attic/scope-freeze-2026-10`
+
+### Agents (M56) — removed
+- Removed in the Phase 0.6 scope freeze (`agent` blocks, the action-port-graph checks, agent codegen, the agent runtime and its `nsl_agent_*` ABI rows, and the `@pipeline_agent`/`@auto_device_transfer` decorators are gone; `agent` stays a reserved word, and an `agent` block and both decorators now get a refusal that names the tag); preserved at tag `attic/scope-freeze-2026-10`. `--linear-types` (M38) is unaffected
 
 ---
 
@@ -321,7 +319,6 @@ block_kv with fused projections) are rejected at compile time.
 nsl check --perf file.nsl                               # Roofline analysis
 nsl check --nan-analysis file.nsl                        # NaN/Inf risk detection
 nsl check --deterministic file.nsl                       # Non-determinism detection
-nsl check --wcet file.nsl                                # Worst-case execution time
 nsl check --weight-analysis file.nsl --weights model.st  # Weight sparsity analysis
 nsl run file.nsl --disable-fusion                        # Differential testing
 nsl run file.nsl --trace-ops                             # Tensor operation tracing
@@ -393,10 +390,10 @@ Milestone work from M9-M55 is present in the repo, with maturity ranging from pr
 ### Future (M56-M71)
 | Phase | Milestones | Theme |
 |-------|-----------|-------|
-| v1.0 | M56-M62 | Multi-agent, FPGA, elastic fault tolerance, cluster debugging |
+| v1.0 | M56-M62 | Elastic fault tolerance, cluster debugging (the M56 agents subsystem and the M57 FPGA backend were removed in the Phase 0.6 scope freeze) |
 | v1.1 | M63-M64 | Compiled MCTS tree search, online DPO alignment |
 | v1.2 | M65-M67 | Ternary 1.58-bit types, format-agnostic sparsity, neuromorphic |
-| v1.3 | M68-M71 | Refinement types (Z3 SMT), phase-split inference, unikernels, universal ZKML |
+| v1.3 | M68-M71 | Refinement types (Z3 SMT), phase-split inference |
 
 See [docs/plans/](docs/plans/) for detailed designs and [docs/research/](docs/research/) for the supporting research set.
 
