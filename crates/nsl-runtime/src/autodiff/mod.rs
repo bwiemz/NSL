@@ -9,9 +9,11 @@ use crate::tensor::{
 };
 
 pub mod backward;
+pub mod cert_status;
 pub mod grad_utils;
 
 pub use backward::*;
+pub use cert_status::{TapeCertStatus, tape_cert_inventory, tape_cert_status};
 
 /// Create a ones tensor from a shape slice with a given dtype.
 /// Avoids dereferencing a raw tensor pointer (safe for freed inputs).
@@ -163,6 +165,60 @@ impl Tape {
 }
 
 impl TapeOp {
+    /// The variant's name as declared. Exhaustive with no wildcard, so a new
+    /// variant does not compile without one; the record trace prints it, the
+    /// certification inventory ([`cert_status`]) keys on it, and its unit test
+    /// holds the names to the enum's text.
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            TapeOp::Add { .. } => "Add",
+            TapeOp::Sub { .. } => "Sub",
+            TapeOp::Mul { .. } => "Mul",
+            TapeOp::Div { .. } => "Div",
+            TapeOp::MatMul { .. } => "MatMul",
+            TapeOp::Fp8MatMul { .. } => "Fp8MatMul",
+            TapeOp::Neg { .. } => "Neg",
+            TapeOp::Cast { .. } => "Cast",
+            TapeOp::MulScalar { .. } => "MulScalar",
+            TapeOp::AddScalar { .. } => "AddScalar",
+            TapeOp::Transpose { .. } => "Transpose",
+            TapeOp::SumReduce { .. } => "SumReduce",
+            TapeOp::MeanReduce { .. } => "MeanReduce",
+            TapeOp::ReduceMax { .. } => "ReduceMax",
+            TapeOp::Gather { .. } => "Gather",
+            TapeOp::Exp { .. } => "Exp",
+            TapeOp::Log { .. } => "Log",
+            TapeOp::Sqrt { .. } => "Sqrt",
+            TapeOp::Abs { .. } => "Abs",
+            TapeOp::Clamp { .. } => "Clamp",
+            TapeOp::ReLU { .. } => "ReLU",
+            TapeOp::GELU { .. } => "GELU",
+            TapeOp::SiLU { .. } => "SiLU",
+            TapeOp::Sin { .. } => "Sin",
+            TapeOp::Cos { .. } => "Cos",
+            TapeOp::Sigmoid { .. } => "Sigmoid",
+            TapeOp::Tanh { .. } => "Tanh",
+            TapeOp::Softmax { .. } => "Softmax",
+            TapeOp::LogSoftmax { .. } => "LogSoftmax",
+            TapeOp::Slice { .. } => "Slice",
+            TapeOp::Reshape { .. } => "Reshape",
+            TapeOp::Cat { .. } => "Cat",
+            TapeOp::EmbeddingLookup { .. } => "EmbeddingLookup",
+            TapeOp::LayerNorm { .. } => "LayerNorm",
+            TapeOp::RMSNorm { .. } => "RMSNorm",
+            TapeOp::Dropout { .. } => "Dropout",
+            TapeOp::Conv2d { .. } => "Conv2d",
+            TapeOp::MaxPool2d { .. } => "MaxPool2d",
+            TapeOp::RotateHalf { .. } => "RotateHalf",
+            TapeOp::BiasAdd { .. } => "BiasAdd",
+            TapeOp::Unsqueeze { .. } => "Unsqueeze",
+            TapeOp::Expand { .. } => "Expand",
+            TapeOp::Stack { .. } => "Stack",
+            TapeOp::FlashAttention { .. } => "FlashAttention",
+            TapeOp::Checkpoint { .. } => "Checkpoint",
+        }
+    }
+
     fn assign_ids(&mut self, tape: &mut Tape) {
         match self {
             TapeOp::Add { a, b, out, .. } | TapeOp::Sub { a, b, out, .. }
@@ -363,7 +419,10 @@ pub fn pop_last_op() {
 }
 
 /// Leak-hunt trace (`NSL_DEBUG_MEM_TRACE=1`): one-line summary of a tape op's
-/// identity ids and saved (refcount-bumped) pointers.
+/// identity ids and saved (refcount-bumped) pointers. Every line starts with
+/// the op's [`TapeOp::variant_name`] (a unit test pins it):
+/// `crates/nsl-cli/tests/source_ad_rule_cert.rs` reads
+/// `[tape-trace] record <Variant>` to learn which ops a certificate recorded.
 fn tape_op_trace(op: &TapeOp) -> String {
     match op {
         TapeOp::Add { a, b, out, .. } => format!("Add a={a} b={b} out={out}"),
@@ -386,7 +445,7 @@ fn tape_op_trace(op: &TapeOp) -> String {
         TapeOp::MeanReduce { a, out, dim, .. } => format!("MeanReduce a={a} out={out} dim={dim}"),
         TapeOp::Transpose { a, out, .. } => format!("Transpose a={a} out={out}"),
         TapeOp::Reshape { a, out, .. } => format!("Reshape a={a} out={out}"),
-        _ => format!("(other op discriminant {:?})", std::mem::discriminant(op)),
+        _ => op.variant_name().to_string(),
     }
 }
 

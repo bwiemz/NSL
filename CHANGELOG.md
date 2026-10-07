@@ -41,6 +41,50 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
       stream catch it.
   - **No resume bug found.** The resume was exact on every posture.
 
+- **Tape-AD backward certification inventory (NSL V2 item 0.4) and 103 new
+  certificates.** `nsl_runtime::autodiff::tape_cert_status` gives every
+  `TapeOp` a status with no wildcard arm: 22 `Certified`, 20 `Defective`
+  (certified, plus ratcheted known failures), `Uncertified` (`Fp8MatMul`:
+  its backward rounds to E5M2 by design, so no finite difference over random
+  operands applies; an E5M2-exact analytic gate in `fp8.rs` holds its
+  wiring),
+  `GpuOnly` (`FlashAttention`) and `Unreachable` (`Checkpoint`: nothing
+  calls `nsl_checkpoint_record`, and its backward arm is a no-op). The
+  certificates are rows of `source_ad_rule_cert.rs`, and every claim is
+  checked there: a named certificate exists, passes in tape mode, and its
+  tape run RECORDS the op, read from the tape's own record trace
+  (`NSL_DEBUG_MEM_TRACE=1` now prints every variant's name).
+  - **Tape-only ops get finite-difference certificates** (source AD has no
+    extraction for them, so their source runs are a ratcheted fall back that
+    must stay a fall back): `.to(f64)` casts, `reduce_max`, `.slice` /
+    `tensor_slice`, `stack`, `bias_add` (the stdlib `Linear`'s bias),
+    `maxpool2d` (overlapping and padded windows) and dropout, whose mask is
+    fixed by `manual_seed` and supplied by a same-seed draw the oracle
+    checks (0 or 1/(1-p), both present).
+  - **Layout is an axis.** Every base certificate hands its op contiguous
+    tensors. 82 variants transpose the op's output before the loss
+    (`_vgrad`: the backward receives a strided gradient view) or feed
+    strided inputs (`_vin`). They found 32 tape failures across 20 ops,
+    now ratcheted, for a separate fix:
+    - CPU backward helpers that read the upstream gradient's storage
+      linearly: ReLU, GELU, SiLU, Clamp, Sigmoid, Tanh, Softmax,
+      LogSoftmax, LayerNorm, RMSNorm, Embedding (dW), Conv2d, keepdim
+      Sum/Mean/ReduceMax, Slice, BiasAdd (db), MaxPool2d, Dropout, and
+      Unsqueeze (`reshape_to_shape` memcpys a view's raw storage).
+    - Backward helpers that read a strided SAVED input linearly: ReLU,
+      GELU, SiLU, Clamp, LayerNorm, RMSNorm.
+    - CPU forwards that ignore input strides (wrong outputs in both AD
+      modes where shared): `bias_add`, dropout, `maxpool2d`, `conv2d`,
+      `embedding_lookup`. Source AD's conv2d backward also fails `_vgrad`:
+      it wraps the same `conv2d_backward`.
+  - **A contiguous-layout bug too:** `reduce_max(x, dim, keepdim=1)` over a
+    non-last dim sends the whole gradient to the last dim's first slot
+    (`scatter_grad_to_argmax` misaligns its index counter).
+  - The ratchet now holds a known fall back to being a fall back, so a
+    source-AD rule added later cannot hide a wrong gradient behind it. A
+    certificate that fails in every mode is a defect probe: only a
+    `Defective` status may name it, and a fix flips it into `certified`.
+
 - **The parameter-coverage gate** (`param_coverage_gate.rs`, NSL V2 plan
   item 0.4). CI now fails when training leaves any trainable tensor of a
   model untouched, or moves one it must not, in either AD mode. Until now
