@@ -40,6 +40,8 @@ nsl-log.workspace = true
 # `fixture` is a runtime-callable parser, not a test-only utility.
 nsl-test = { path = "../nsl-test" }
 clap.workspace = true
+# `nsl-toolchain.toml` (toolchain.rs): `deny_unknown_fields` on both levels.
+serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 safetensors = "0.8"

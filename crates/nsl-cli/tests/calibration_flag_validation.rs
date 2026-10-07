@@ -30,6 +30,9 @@ fn run(args: &[&str]) -> (String, String, i32) {
     let out = Command::new(env!("CARGO_BIN_EXE_nsl"))
         .arg("build")
         .arg(&model)
+        // models/coder-rl/ is pinned to the LTS toolchain
+        // (nsl-toolchain.toml); this gate is about the dev toolchain's flags.
+        .arg("--ignore-toolchain-pin")
         .args(args)
         .output()
         .expect("run nsl");

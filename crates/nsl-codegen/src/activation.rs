@@ -335,6 +335,11 @@ pub static UNCONTRACTED_FLAGS: &[(&str, &str)] = &[
     ("activation-report", "the activation mechanism's own reporting switch"),
     ("allow-inert-requests", "the activation mechanism's own escape hatch"),
     ("allow-unknown-decorators", "the namespace close's own escape hatch"),
+    (
+        "ignore-toolchain-pin",
+        "toolchain selection, not a compiler feature: honoured by nsl-cli's \
+         toolchain::enforce_pin before any compile (NSL V2 plan 0.1)",
+    ),
 ];
 
 /// Owners MEASURED to record a [`PassDisposition`] on every compile where
