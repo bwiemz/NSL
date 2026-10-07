@@ -77,6 +77,15 @@ Confirms the FASE plan scales identically from 500M to 7B — same
 
 ## Running at scale (when you have the hardware)
 
+**Toolchain.** This directory is pinned to the `0.10-lts` toolchain channel
+(`nsl-toolchain.toml`, NSL V2 plan 0.1): production runs stay on the LTS
+toolchain while the V2 redesign lands on `main`. `nsl run` / `nsl build` on a
+file here hands the invocation over to `~/.nsl/toolchains/0.10-lts/bin/nsl`
+(install it once with `scripts/install-toolchain.sh 0.10-lts <git-ref>`); a
+toolchain of another channel refuses when that is not installed.
+`--ignore-toolchain-pin` runs on the invoked toolchain instead — for gates
+and experiments, not production runs.
+
 ```bash
 cargo build --release --bin nsl --features cuda
 

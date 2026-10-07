@@ -1,0 +1,12 @@
+# Toolchain pin (NSL V2 plan, Phase 0 item 0.1).
+#
+# Production runs of this model stay on the long-term-support toolchain
+# (`release/0.10-lts`, correctness-only backports) while the V2 redesign
+# lands on main. `nsl run` / `nsl build` on any file in or below this
+# directory reads this pin. A toolchain of another channel hands the whole
+# invocation over to ~/.nsl/toolchains/0.10-lts/bin/nsl (install it with
+# `scripts/install-toolchain.sh 0.10-lts <git-ref>`), or refuses when that is
+# not installed. `--ignore-toolchain-pin` runs on the invoked toolchain
+# anyway. `nsl --version` prints which channel a binary is.
+[toolchain]
+channel = "0.10-lts"

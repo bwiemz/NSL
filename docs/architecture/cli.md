@@ -14,8 +14,8 @@ compile-time state in `docs/architecture/compiler-state.md`.
 `nsl_cli` lib (`src/lib.rs`). The split exists because tests and the profiler
 need pieces of the CLI as a library: `lib.rs` exports `analysis_bridges`,
 `exec_markers`, `feature_rules`, `health_monitor`, `monitor`, `profile`,
-`profile_render`, `shape_debug`, `wggo_explain`, `loader`, `mangling`,
-`resolver`, and `formatter`. Everything else is `mod`-declared in `main.rs`
+`profile_render`, `shape_debug`, `toolchain`, `wggo_explain`, `loader`,
+`mangling`, `resolver`, and `formatter`. Everything else is `mod`-declared in `main.rs`
 and `pub(crate)`. The crate depends on the runtime with `features =
 ["interop"]`, and its own features (`cuda`, `nccl`, `test-hooks`,
 `onnx-rt-op`, `csha_cycle19_probe`) forward to `nsl-codegen` / `nsl-runtime`.
@@ -87,6 +87,93 @@ health poller between the build and the child. Multi-device runs
 in order: `$NSL_STDLIB_PATH`, `<exe_dir>/stdlib/`, `<exe_dir>/../lib/stdlib/`
 (the distribution layout), then `./stdlib/` for `cargo run` from the
 workspace root. `nsl.math` maps to `<root>/nsl/math.nsl`.
+
+## Toolchain pinning
+
+NSL V2 plan, Phase 0 item 0.1: production coder runs stay on a
+long-term-support toolchain (`release/0.10-lts`, correctness-only backports)
+while the redesign lands on `main`. All of it lives in `src/toolchain.rs`.
+
+**Channels.** Every build belongs to one channel, `toolchain::CHANNEL`, which
+comes from the `nsl_channel!` macro. It is `"dev"` on `main`, and the LTS
+branch changes that one literal to `"0.10-lts"`. `toolchain::VERSION` is what
+clap prints for `nsl --version` (`args.rs` passes it as the command's
+`version`): `nsl 0.10.0 (toolchain channel dev)`.
+
+**Pins.** A model directory carries `nsl-toolchain.toml`:
+
+```toml
+[toolchain]
+channel = "0.10-lts"
+```
+
+Unknown keys are refused at both levels. The channel must match
+`[A-Za-z0-9][A-Za-z0-9._-]*`, because it becomes a directory name.
+`models/coder500m`, `coder1b`, `coder7b` and `coder-rl` are pinned to
+`0.10-lts`. `coder50m` is not, because V2's parity gate runs it on the dev
+toolchain.
+
+**Lookup.** `main_inner` calls `toolchain::enforce_pin(&args.file,
+args.ignore_toolchain_pin)` for `nsl run` and `nsl build` before dispatching,
+so nothing has been compiled yet. Other subcommands are not pinned.
+`find_pin` canonicalizes the input, then looks in its directory and each one
+above it; the nearest pin wins. A pin that cannot be read or parsed is an
+error naming the file, even under `--ignore-toolchain-pin`: the flag
+overrides a channel mismatch, not a broken pin. Only the entry file's real
+location counts. A symlink in a pinned directory that points outside it
+follows its target's directory, and an unpinned entry file that imports a
+pinned model's modules is not pinned, so a production entry point belongs in
+its model's directory.
+
+**Decision.** `decide` is pure, so the unit tests can cover every branch.
+
+| Situation | Outcome |
+|---|---|
+| No pin, or the pin names this build's channel | Proceed. A matching pin prints one `note:` line. |
+| Mismatch, `--ignore-toolchain-pin` passed | Proceed, with a `warning:` line. |
+| Mismatch, `~/.nsl/toolchains/<channel>/bin/nsl` installed (`%USERPROFILE%`, `nsl.exe` on Windows) | Hand over. |
+| Mismatch, nothing installed | Refuse with exit 1. The message names the pin file, the channel, this build's version, the install command and the flag. |
+| Mismatch, the installed binary canonicalizes to the running executable | Refuse. A wrong-channel build installed under the channel's directory would otherwise exec itself forever. |
+
+**Handover.** The pinned binary gets the same argv (`args_os().skip(1)`). On
+unix the process `exec`s it, so the run's exit status is the pinned
+toolchain's. Elsewhere `nsl` spawns it, waits, and exits with its code.
+`NSL_STDLIB_PATH` and `NSL_RUNTIME_LIB_PATH_OVERRIDE` are removed from the
+pinned toolchain's environment, with a `warning:` line. They point the
+*invoking* toolchain at a stdlib or runtime archive; passed on, they would
+make the LTS toolchain compile against the dev stdlib or link the dev runtime.
+The pinned toolchain finds its own under `lib/`.
+
+**Installing.** `scripts/install-toolchain.sh <channel> <git-ref> [--prefix
+DIR] [--features LIST] [--target-dir DIR]` produces the release.yml layout
+(`bin/nsl`, `lib/libnsl_runtime.a`, `lib/stdlib/`) at
+`<prefix>/<channel>/`. The default prefix is `~/.nsl/toolchains`.
+
+1. It reads the ref's `nsl_channel!` literal and refuses a mismatch before
+   building.
+2. It checks the ref out into a temporary detached worktree, removed on exit.
+3. It builds `-p nsl-cli -p nsl-runtime --profile dist --locked` in one cargo
+   invocation, with bare `--features` names prefixed `nsl-cli/` (default
+   `cuda`). Cargo then unifies the runtime's features, so the static archive
+   has exactly what the CLI's own runtime dependency has (`cuda`, `interop`).
+   The build uses its own target dir, `~/.nsl/build-cache/<channel>` by
+   default.
+4. Before installing, it refuses if `bin/nsl --version` does not report the
+   requested channel, if cuda was requested and the archive lacks the CUDA
+   marker symbol, or if the staged toolchain cannot run `nsl doc stdlib` and
+   `nsl build` a one-line program from an empty directory with the two
+   override variables unset.
+5. It moves the stage into place: an existing install is moved aside first
+   and deleted after.
+
+**Gates.** `toolchain::tests` covers parsing, the directory walk and every
+`decide` branch. `tests/toolchain_pin.rs` drives the binary through the
+refusal text, the override, a matching pin, malformed pins and `--version`.
+On unix it also runs a real handover to a stub toolchain that echoes its argv
+and environment, and checks the self-exec guard. Gates that build the pinned
+production recipes on the toolchain under test pass `--ignore-toolchain-pin`:
+`pretrain_prod_agreement_gate.rs`, `fused_ew_prod_recipe_gate.rs` and
+`calibration_flag_validation.rs`.
 
 ## The flag contract
 
@@ -293,6 +380,10 @@ has not drifted.
   with the runtime's mirror registered (`nsl_runtime::log::ensure_installed`).
 - **Version strings and doc claims agree with the tree** (the two
   `scripts/check-*-agreement.sh` gates).
+- **`nsl run` / `nsl build` honour the input's toolchain pin before
+  compiling anything**, and only `--ignore-toolchain-pin` gets past a channel
+  mismatch (`tests/toolchain_pin.rs`). A gate that compiles a file in a
+  pinned model directory passes the flag explicitly.
 
 ## Where to add a new X
 

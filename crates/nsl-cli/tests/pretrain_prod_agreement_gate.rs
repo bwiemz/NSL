@@ -40,6 +40,12 @@
 
 use std::path::PathBuf;
 
+/// models/coder500m/ and models/coder1b/ are pinned to the LTS toolchain
+/// (`nsl-toolchain.toml`, NSL V2 plan 0.1). These gates hold the recipes to
+/// the toolchain under test, so every `nsl build` here runs on it anyway
+/// (a no-op for the unpinned coder50m).
+const IGNORE_PIN: &str = "--ignore-toolchain-pin";
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -752,6 +758,7 @@ fn pretrain_prod_builds_under_both_ad_modes() {
             let out = std::process::Command::new(env!("CARGO_BIN_EXE_nsl"))
                 .arg("build")
                 .args(&extra)
+                .arg(IGNORE_PIN)
                 .arg(root.join(format!("models/{}/pretrain_prod.nsl", pair.dir)))
                 .arg("-o")
                 .arg(tmp.join(format!("{}_{}.o", pair.dir, label.trim_start_matches('-'))))
@@ -1220,6 +1227,7 @@ fn the_flag_set_each_header_documents_is_the_one_that_builds() {
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_nsl"))
             .arg("build")
             .args(&args)
+            .arg(IGNORE_PIN)
             .arg(root.join(format!("models/{}/pretrain_prod.nsl", pair.dir)))
             .arg("-o")
             .arg(tmp.join(format!("{}_flags.o", pair.dir)))
@@ -1317,6 +1325,7 @@ fn grad_clip_is_planned_and_the_incompatible_flag_still_refuses() {
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_nsl"))
             .arg("build")
             .args(&args)
+            .arg(IGNORE_PIN)
             .arg(&src)
             .arg("-o")
             .arg(tmp.join(format!("{}_lw.o", pair.dir)))
