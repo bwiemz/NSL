@@ -121,11 +121,12 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
         // path (csha_hooks.rs::emit_rope_pair_sweep) is the PCA RoPE path and
         // rotates both Q AND K under the same effective_pos; the CSHA
         // training-PTX synthesis (maybe_synthesize_csha_training_ptx) sets
-        // rope_q=false. The `@flash_attention` + `@rope` decorator path
-        // (compiler/kernel.rs) DOES build csha=None + rope_q=true configs, but
-        // every launch site passes null cos/sin (expr/advanced.rs WIRE-HERE,
-        // wengert_lower.rs) and this branch has no null guard. The only callers that pass real
-        // tables are the direct PTX synthesis tests
+        // rope_q=false. `@rope`, which used to request this branch from the
+        // `@flash_attention` decorator path, is refused (its
+        // UNIMPLEMENTED_DECORATORS row): every launch site passes null cos/sin
+        // (expr/advanced.rs WIRE-HERE, wengert_lower.rs) and this branch has
+        // no null guard. The only callers that pass real tables are the
+        // direct PTX synthesis tests
         // (pca_tier_a_forward_correctness::rope_q_forward_*), which check the
         // Q rotation and the per-doc reset against a CPU reference that, like
         // this branch, leaves K unrotated (`cpu_rope_q`).

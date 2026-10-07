@@ -118,7 +118,7 @@ impl<'a> TypeResolver<'a> {
             "int32" => Type::Int32,
             "int64" => Type::Int64,
             // M57.1 §3.1: short-form aliases. Codebase consistency with
-            // agent.rs/export.rs (which already emit the short form).
+            // export.rs (which already emits the short form).
             "i8" => Type::Int8,
             "i16" => Type::Int16,
             "i32" => Type::Int32,
@@ -709,8 +709,8 @@ mod tests {
     // ---------------------------------------------------------------------
     // M57.1 §3.1 — short-form dtype aliases (i8/i16/i32/i64).
     //
-    // Codebase consistency: crates/nsl-codegen/src/agent.rs and export.rs
-    // already use the short form; the resolver previously only accepted
+    // Codebase consistency: crates/nsl-semantic/src/export.rs already uses
+    // the short form; the resolver previously only accepted
     // long-form (int8/int16/...). These aliases are purely additive — Q4
     // decision: long-form entries remain.
     // ---------------------------------------------------------------------
@@ -744,7 +744,7 @@ mod tests {
     #[test]
     fn resolve_dtype_shorthand_i8_to_type_int8() {
         // i8 is the canonical short form used by the M57 spec/plan/fixture.
-        // The codebase already uses `i8` in agent.rs and export.rs (M57.1 §3.1).
+        // The codebase already uses `i8` in export.rs (M57.1 §3.1).
         assert_eq!(resolve_named_fresh("i8"), Type::Int8);
         assert_eq!(resolve_named_fresh("i16"), Type::Int16);
         assert_eq!(resolve_named_fresh("i32"), Type::Int32);

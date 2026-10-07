@@ -108,3 +108,47 @@ fn every_bad_line_in_a_file_is_reported_and_the_good_ones_survive() {
         .count();
     assert_eq!(expected_pattern, 2, "{:#?}", parsed.diagnostics);
 }
+
+/// `agent` blocks (M56) were removed in the Phase 0.6 scope freeze. `agent`
+/// stays reserved, so an old program gets one error that names the removal
+/// and the attic tag — at top level, under a decorator, behind `pub`, with no
+/// body, inside a function body, as the last statement of a function (its
+/// body then closes two blocks at once) and at end of input — and the body's
+/// fields and methods do not each add an error.
+#[test]
+fn an_agent_block_is_refused_by_name_and_its_body_is_skipped() {
+    let body = "agent Drafter:\n    steps: int = 0\n    fn draft(self, p: Tensor) -> Tensor:\n        return p\n";
+    let nested = "fn host():\n    agent Inner:\n        steps: int = 0\n    let inside = 1\n";
+    let nested_last = "fn host():\n    let a = 1\n    agent Inner:\n        steps: int = 0\n";
+    for source in [
+        body.to_string(),
+        format!("@pipeline_agent\n{body}"),
+        format!("pub {body}"),
+        "agent Bare\n".to_string(),
+        nested.to_string(),
+        nested_last.to_string(),
+    ] {
+        let parsed = sexpr::parse_errors(&format!("{source}let after = 0"));
+        assert_eq!(parsed.diagnostics.len(), 1, "{source:?}: {:#?}", parsed.diagnostics);
+        let message = &parsed.diagnostics[0];
+        assert!(
+            message.contains("agents subsystem (M56)")
+                && message.contains("attic/scope-freeze-2026-10"),
+            "{message}"
+        );
+        assert_eq!(
+            parsed.stmts.last().map(String::as_str),
+            Some("(let after 0)"),
+            "{source:?}: {:#?}",
+            parsed.stmts
+        );
+    }
+    let nested = sexpr::parse_errors(&format!("{nested}let after = 0"));
+    assert!(
+        nested.stmts[0].contains("(let inside 1)"),
+        "the statement after a nested agent block survives: {:#?}",
+        nested.stmts
+    );
+    let at_eof = sexpr::parse_errors("agent Drafter:\n    steps: int = 0");
+    assert_eq!(at_eof.diagnostics.len(), 1, "{:#?}", at_eof.diagnostics);
+}

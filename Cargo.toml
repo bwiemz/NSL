@@ -93,7 +93,7 @@ unsafe_op_in_unsafe_fn = "deny"
 # of them module-wide `#![allow]` — made the two indistinguishable: a helper
 # whose last caller was deleted looked exactly like one held for a named
 # future task. Every remaining allow now says which configuration the item is
-# dead in (`not(test)`, `not(feature = "cuda")`, `not(target_os = "none")`) or
+# dead in (`not(test)`, `not(feature = "cuda")`) or
 # why it is kept, and a new one is a reviewable line rather than the default.
 dead_code = "deny"
 

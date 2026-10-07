@@ -355,8 +355,7 @@ tests prove which path a run took.
 ## CUDA backend
 
 All of it lives under `src/cuda/` behind `feature = "cuda"`; `src/cpu.rs`
-is the host fallback and `src/gpu_backend.rs` is the (compile-time) backend
-trait.
+is the host fallback.
 
 **The driver state is a per-device value.** `cuda::context::CudaContext`
 holds the `CUdevice`, the primary `CUcontext`, a `ModuleCache` (PTX modules

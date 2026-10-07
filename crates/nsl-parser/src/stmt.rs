@@ -43,7 +43,7 @@ fn parse_stmt_nested(p: &mut Parser) -> Stmt {
         TokenKind::Let | TokenKind::Const => parse_var_decl(p),
         TokenKind::Fn | TokenKind::Async => crate::decl::parse_fn_def_stmt(p),
         TokenKind::Model => crate::decl::parse_model_def_stmt(p),
-        TokenKind::Agent => crate::agent::parse_agent_def_stmt(p),
+        TokenKind::Agent => refuse_removed_agent_block(p),
         TokenKind::Struct => crate::decl::parse_struct_def_stmt(p),
         TokenKind::Enum => crate::decl::parse_enum_def_stmt(p),
         TokenKind::Trait => crate::decl::parse_trait_def_stmt(p),
@@ -68,6 +68,37 @@ fn parse_stmt_nested(p: &mut Parser) -> Stmt {
         TokenKind::Serve => crate::block::parse_serve_block_stmt(p),
         TokenKind::Pub | TokenKind::Priv => parse_visibility_prefixed(p),
         _ => parse_expr_or_assign(p),
+    }
+}
+
+/// The refusal an `agent` block gets. The agents subsystem (M56) was removed
+/// in the Phase 0.6 scope freeze, but `agent` stays a reserved keyword: an old
+/// program that still declares an agent fails here, with a message that says
+/// why, instead of reparsing `agent Name:` as an identifier expression and
+/// getting a syntax error that does not.
+const AGENT_REMOVED: &str = "`agent` blocks were removed with the agents subsystem (M56) in the \
+     Phase 0.6 scope freeze; the code is preserved at tag \
+     `attic/scope-freeze-2026-10`. Remove the block";
+
+fn refuse_removed_agent_block(p: &mut Parser) -> Stmt {
+    let keyword = p.current_span();
+    p.diagnostics.push(
+        nsl_errors::Diagnostic::error(AGENT_REMOVED)
+            .with_label(keyword, "`agent` is reserved but no longer declares anything"),
+    );
+    // The header and its indented body are one refused construct. Dropping
+    // both keeps every field and method in the body from reporting an error
+    // of its own, and leaves the parser on the statement after the block.
+    p.skip_to_next_line();
+    let span = keyword.merge(p.prev_span());
+    Stmt {
+        kind: StmtKind::Expr(nsl_ast::expr::Expr {
+            kind: nsl_ast::expr::ExprKind::Error,
+            span,
+            id: p.next_node_id(),
+        }),
+        span,
+        id: p.next_node_id(),
     }
 }
 

@@ -60,15 +60,14 @@ The boring, must-always-work core.
 - **DataLoader** — zero-copy mmap tokenized-data loading (M19).
 - **CLI** — `nsl check`, `nsl run`, `nsl build`, `nsl fmt`, `nsl test` carry
   the stability promise. The full shipped surface is larger (`export, convert,
-  init, debug, zk, profile, autotune, tokenize, fpga-compile, ptx-metadata`;
-  proof tooling under `nsl zk`) — those ride their subsystem's tier, not this
-  one.
+  init, debug, profile, autotune, tokenize, ptx-metadata`) —
+  those ride their subsystem's tier, not this one.
 
 **Compatibility contract:** only the Stable tier above carries a cross-version
 "won't break" promise. That promise is *narrower* than the **CI merge gate** —
 CI blocks every PR on more than just the Stable tier (build, workspace unit
-tests, clippy, the CLI e2e suite on Linux/Windows, and the ONNX-RT and FPGA
-jobs). `.github/workflows/ci.yml` is the source of truth; the table at the
+tests, clippy, the CLI e2e suite on Linux/Windows, and the ONNX-RT job).
+`.github/workflows/ci.yml` is the source of truth; the table at the
 bottom of this file maps each tier to what CI runs.
 
 ```bash
@@ -165,16 +164,31 @@ tests that are *not* part of the green-build contract (see README → Benchmarks
 - **CPKD** — compiler-planned knowledge distillation (distill block, frozen
   teacher, fused KL-CE GPU kernel).
 - **FASE** — quantization-aware optimizer/codegen.
-- **ZK** — zero-knowledge proofs: the folding backend is end-to-end
-  (`nsl build --zk-backend folding` + `nsl zk verify`); halo2/plonky3 are
-  refused at compile time.
-- **FPGA / Verilog** — HDL backend (Yosys/Verilator nightly job). See
-  [`docs/hardware/fpga_status.md`](docs/hardware/fpga_status.md).
-- **Unikernel** — `nsl build --unikernel` deployment target.
+- **WCET** (M53: worst-case execution time, `--wcet`, `--wcet-cert`,
+  `--wcet-target`, `--cpu`, `--do178c-report`, `--fpga-device`) —
+  **Removed** in the Phase 0.6 scope freeze; preserved at tag
+  `attic/scope-freeze-2026-10`. `@real_time`/`@wcet_budget` are refused with
+  the tag.
+- **ZK** (M55: zero-knowledge inference circuits, `nsl zk`, `--zk-*`) —
+  **Removed** in the Phase 0.6 scope freeze; preserved at tag
+  `attic/scope-freeze-2026-10`. `@zk_proof`/`@zk_lookup` are refused with the
+  tag.
+- **FPGA / Verilog** (M57: HIR, Verilog emission, `nsl fpga-compile`,
+  `--target fpga`) — **Removed** in the Phase 0.6 scope freeze; preserved at
+  tag `attic/scope-freeze-2026-10`. `--target fpga` is refused with the tag.
+- **Unikernel** (M54) — **Removed** in the Phase 0.6 scope freeze; preserved at
+  tag `attic/scope-freeze-2026-10`.
+- **Agents** (M56: `agent` blocks, the action-port-graph checks, the agent
+  runtime and its `nsl_agent_*` ABI rows) — **Removed** in the Phase 0.6 scope
+  freeze; preserved at tag `attic/scope-freeze-2026-10`. `agent` stays a
+  reserved word and an `agent` block is refused with the tag, as are
+  `@pipeline_agent`/`@auto_device_transfer`. `--linear-types` (M38a) stays.
 - **Distributed** — tensor / pipeline / context parallelism, MoE serving.
 - **Inference serving** — speculative decoding, paged KV, disaggregated serving.
-- **Non-CUDA GPU backends** — AMDGPU/ROCm, Metal, WGSL/WebGPU KIR are built but
-  **untested on real hardware**.
+- **Non-CUDA GPU backends** (M47: AMDGPU/ROCm, Metal, WGSL/WebGPU KIR printers)
+  — **Removed** in the Phase 0.6 scope freeze; preserved at tag
+  `attic/scope-freeze-2026-10`. `--target` accepts only CUDA spellings (plus `cpu`)
+  and refuses the removed names.
 - **SR-BF16 parameter storage** — `--param-dtype bf16-sr` (stochastic
   rounding). Mechanism + refusals complete; a real-corpus differential found
   no quality delta, and f32 remains the default.
@@ -196,14 +210,14 @@ cargo build -p nsl-codegen --no-default-features --features "<keep these>"
 ```
 
 Currently gated at their entry point: `experimental-wrga`, `experimental-cpdt`
-(in `crates/nsl-codegen/Cargo.toml`, both in `default`). WGGO/CSHA/ZK/FPGA
+(in `crates/nsl-codegen/Cargo.toml`, both in `default`). WGGO/CSHA
 follow the same pattern as gating is extended. See
 [`docs/architecture/compiler-state.md`](docs/architecture/compiler-state.md)
 for the compiler-state model (and the thread-local audit + migration plan that
 the same hardening pass produced).
 
 The `CompileOptions` "god-config" is being decomposed into cohesive sub-structs
-(`WcetOptions`, `ZkOptions`, `WggoOptions`, `CshaOptions`, `CpdtOptions`,
+(`WggoOptions`, `CshaOptions`, `CpdtOptions`,
 `CalibrationOptions`, `DevToolsOptions`, `CheckpointOptions`, `WeightStreamOptions`,
 `MuonOptions`, `ImportedModelOptions`, `ZeroOptions`, `AutotuneOptions`,
 `WeightsOptions`, `FusionOptions`, `DiagnosticsOptions`, `MemoryOptions`,
@@ -256,10 +270,10 @@ they collide with identically-named fields on other structs.
 |--------------|------------------------------------------------------|-------------------------------------------|
 | Stable       | build, clippy, workspace unit tests (`--skip e2e_`)  | Miri on the CPU tensor tests (`scripts/miri-cpu-tensor.sh`, nightly toolchain, by hand) |
 | Beta         | CLI e2e (Linux/Windows), ONNX-RT integration job     | real-CUDA-device tests, perf baselines    |
-| Experimental | `fpga` job (build + Yosys gate)                      | full Verilator/Yosys diagnostic (**nightly** workflow), `#[ignore]`'d research tests, macOS e2e |
+| Experimental | no job of its own (its tests run in the Stable row's workspace suite) | `#[ignore]`'d research tests, macOS e2e |
 
-CI jobs are cumulative — the Beta/Experimental rows run *in addition to* the
-Stable row on every PR (they are separate, blocking CI jobs, not nightly).
+CI jobs are cumulative — the Beta row runs *in addition to* the Stable row on
+every PR (its jobs are separate, blocking CI jobs, not nightly).
 Six drift gates also block every PR outside the tier table: `version-agreement`
 (Cargo == spec/README/CLI/C API/python), `doc-agreement` (docs == tree),
 `gpu-gate-inventory` (cert-lane manifest == tree), `hand-ptx-freeze` (no file

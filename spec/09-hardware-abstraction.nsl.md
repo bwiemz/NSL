@@ -1,5 +1,11 @@
 # Section 9 — Hardware Abstraction Layer (HAL)
 
+> **Status (2026-10, Phase 0.6 scope freeze).** `kernel` blocks compile for
+> CUDA (PTX) only. The ROCm/AMDGPU, Metal and WebGPU/WGSL kernel backends
+> were removed (preserved at tag `attic/scope-freeze-2026-10`), and
+> `nsl build/run --target` refuses those names. The `Metal` and `ROCm`
+> device annotations below are still part of the type system.
+
 ## Design Rationale
 
 ML workloads run on wildly diverse hardware: NVIDIA GPUs (CUDA), AMD GPUs (ROCm), Apple
