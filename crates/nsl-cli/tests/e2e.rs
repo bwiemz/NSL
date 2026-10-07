@@ -1043,8 +1043,8 @@ fn e2e_m27_paged_attention() {
 }
 
 #[test]
-fn e2e_m27_rope_gqa() {
-    assert_output_matches("m27_rope_gqa");
+fn e2e_m27_gqa() {
+    assert_output_matches("m27_gqa");
 }
 
 // ---------------------------------------------------------------------------

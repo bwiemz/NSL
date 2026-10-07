@@ -323,9 +323,10 @@ fn ptx_emits_sink_bypass_or_pred_when_causal_and_sinks() {
 }
 
 #[test]
-fn rope_q_with_sinks_refused_naming_sprint4() {
-    // Build the fixture inline so the test does not depend on a separate
-    // .nsl file — pure substring assertion on the error message.
+fn rope_with_sinks_is_refused_by_the_rope_refusal() {
+    // `@rope` itself is refused (no launch supplies its cos/sin tables), so
+    // the sinks check's rope_q=true arm is no longer reachable from source.
+    // Codegen refuses it too, for a caller that skips the semantic checker.
     let src = "\
 @flash_attention(causal=false)
 @rope
@@ -333,25 +334,12 @@ fn rope_q_with_sinks_refused_naming_sprint4() {
 fn forward():
     pass
 ";
-    let result = try_flash_attention_sink_context_for_source(src);
-    let err = match result {
+    let err = match try_flash_attention_sink_context_for_source(src) {
         Err(e) => e,
-        Ok(out) => panic!(
-            "rope_q=true + sinks MUST refuse. Got {:?}",
-            out
-        ),
+        Ok(out) => panic!("@rope MUST refuse. Got {:?}", out),
     };
-    assert!(
-        err.contains("rope_q=true"),
-        "refusal must name rope_q=true: {:?}",
-        err
-    );
-    assert!(
-        err.contains("Sprint 4"),
-        "refusal must cite Sprint 4 (StreamingLLM no-rotation-for-sinks \
-         policy): {:?}",
-        err
-    );
+    assert!(err.contains("@rope"), "refusal must name @rope: {:?}", err);
+    assert!(err.contains("never wired"), "refusal must say why: {:?}", err);
 }
 
 #[test]

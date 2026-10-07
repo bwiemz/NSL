@@ -540,7 +540,7 @@ writing): 130 in `crates/nsl-semantic/src/checker/tests.rs`, the rest as
 `#[cfg(test)] mod tests` blocks inside individual modules (`shapes.rs`,
 `shape_algebra.rs`, `scope.rs`, `train_config.rs`, `optim_config.rs`,
 `decorator_registry.rs`, `effects.rs`, `ownership.rs`, each
-feature validator) and 78 across the 14 files in
+feature validator) and 80 across the 15 files in
 `crates/nsl-semantic/tests/`.
 
 The dominant style is *snippet tests*: `checker/tests.rs::check_source(src)

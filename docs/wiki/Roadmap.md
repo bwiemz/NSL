@@ -74,7 +74,7 @@ Paged KV-cache with BlockAllocator and PageTable; `@paged_kv` decorator; `--prof
 Build-time Cartesian-product tuner; `@fuse` elementwise chain detection; fused PTX synthesis; `--profile-kernels`.
 
 ### M27 -- FlashAttention-2 (Shipped v0.2, 2026-03-15)
-Tiled FA-2 PTX with 5 kernel variants; RoPE/GQA fusion; `@flash_attention`, `@rope`, `@gqa` decorators.
+Tiled FA-2 PTX with 5 kernel variants; RoPE/GQA fusion; `@flash_attention`, `@rope`, `@gqa` decorators. (`@rope` is refused since 2026-10: no launch ever passed it cos/sin tables.)
 
 ### M28 -- Dynamic shapes + ragged tensors (Shipped v0.2, 2026-03-15)
 Symbolic dimension tracking; bounded syntax (`SeqLen < 4096`); runtime dimension assertions.

@@ -1423,8 +1423,11 @@ impl Compiler<'_> {
         let mut causal = true; // default
         let mut paged = false;
         let mut paged_block_size: i64 = 16; // default @paged_kv block_size
-        let mut rope_q = false;
-        let mut rope_style = crate::flash_attention::RopeStyle::HalfSplit;
+        // In-kernel RoPE is never requested from here: `@rope` is refused
+        // (see its UNIMPLEMENTED_DECORATORS row) because no launch passes
+        // the kernel cos/sin tables.
+        let rope_q = false;
+        let rope_style = crate::flash_attention::RopeStyle::HalfSplit;
         let mut gqa_group_size: u32 = 1;
         // Paper §4 tree-mask: bare `@tree_mask` decorator flips `config.tree_mask`,
         // which in turn (a) gates the PTX-side DFS-enter/DFS-exit ancestor check
@@ -1516,23 +1519,13 @@ impl Compiler<'_> {
                         }
                     }
                 }
+                // The checker refuses @rope first; this keeps a library caller
+                // that skips the checker from getting attention without RoPE.
                 "rope" => {
-                    rope_q = true;
-                    if let Some(ref args) = deco.args {
-                        for arg in args {
-                            let aname = arg
-                                .name
-                                .as_ref()
-                                .and_then(|s| self.interner.resolve(s.0))
-                                .unwrap_or("");
-                            if aname == "style"
-                                && let ExprKind::StringLiteral(ref s) = arg.value.kind
-                                && s == "adjacent"
-                            {
-                                rope_style = crate::flash_attention::RopeStyle::Adjacent;
-                            }
-                        }
-                    }
+                    return Err(CodegenError::new(
+                        nsl_semantic::decorator_registry::unimplemented_refusal("rope")
+                            .expect("@rope has an UNIMPLEMENTED_DECORATORS row"),
+                    ));
                 }
                 "gqa" => {
                     if let Some(ref args) = deco.args {

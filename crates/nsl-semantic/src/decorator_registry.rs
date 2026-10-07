@@ -43,7 +43,7 @@ const fn k(name: &'static str, read_by: &'static str) -> KnownDecorator {
 }
 
 /// Every decorator name the toolchain reads anywhere, from the 2026-08-15
-/// empirical inventory (updated as consumers move): 35 validated in `checker/stmt.rs`, 13 in
+/// empirical inventory (updated as consumers move): 34 validated in `checker/stmt.rs`, 13 in
 /// `checker/model.rs`, 1 in another semantic module, and 4 read only by
 /// codegen. Names consumed by the parser before a `Decorator` node exists
 /// (`pack`, `unpack`, `backward`, `*_ptx` in datatype blocks; `endpoint` in
@@ -76,7 +76,6 @@ pub static KNOWN_DECORATORS: &[KnownDecorator] = &[
     k("paged_kv", "crates/nsl-semantic/src/checker/stmt.rs"),
     k("pca", "crates/nsl-semantic/src/checker/stmt.rs"),
     k("pure", "crates/nsl-semantic/src/checker/stmt.rs"),
-    k("rope", "crates/nsl-semantic/src/checker/stmt.rs"),
     k("shape_assert", "crates/nsl-semantic/src/checker/stmt.rs"),
     k("shared", "crates/nsl-semantic/src/checker/stmt.rs"),
     k("test", "crates/nsl-semantic/src/checker/stmt.rs"),
@@ -163,6 +162,18 @@ pub static UNIMPLEMENTED_DECORATORS: &[(&str, &str)] = &[
         "torch",
         "@torch is documentation prose (spec/11-interoperability), not an \
          implemented decorator",
+    ),
+    (
+        // Validated by the checker and threaded into the kernel config, but
+        // every launch site passes null cos/sin tables (expr/advanced.rs
+        // WIRE-HERE, wengert_lower.rs), and the non-CSHA kernel it selects
+        // rotates Q only and has no null guard. Refused rather than left to
+        // read from address ~0 on the first launch.
+        "rope",
+        "@rope asks @flash_attention for in-kernel RoPE, which was never wired: \
+         no launch passes the kernel its cos/sin tables, and that kernel \
+         rotates Q only. Apply RoPE to Q and K before the attention call (as \
+         nsl.nn.gqa does) and remove the decorator",
     ),
     // ---- removed in the Phase 0.6 scope freeze -----------------------
     (
@@ -266,6 +277,14 @@ mod tests {
         assert!(find("tie_weights").is_none(), "ghosts are not KNOWN");
         assert!(unimplemented_refusal("tie_weights").is_some());
         assert!(unimplemented_refusal("cpdt").is_none());
+    }
+
+    #[test]
+    fn rope_is_refused_because_no_launch_supplies_its_tables() {
+        assert!(find("rope").is_none(), "@rope is no longer a known decorator");
+        let msg = unimplemented_refusal("rope").expect("@rope must get a typed refusal");
+        assert!(msg.contains("never wired"), "{msg}");
+        assert!(msg.contains("nsl.nn.gqa"), "{msg}");
     }
 
     #[test]

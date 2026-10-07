@@ -1039,47 +1039,6 @@ impl<'a> TypeChecker<'a> {
                             }
                         }
 
-                        if dname == "rope" {
-                            // @rope requires @flash_attention on the same function
-                            let has_flash = decorators.iter().any(|d| {
-                                d.name.len() == 1 && self.interner.resolve(d.name[0].0).unwrap_or("") == "flash_attention"
-                            });
-                            if !has_flash {
-                                self.diagnostics.push(
-                                    Diagnostic::error("@rope requires @flash_attention on the same function")
-                                        .with_label(deco.span, "missing @flash_attention")
-                                );
-                            }
-                            // Validate optional args
-                            if let Some(ref args) = deco.args {
-                                for arg in args {
-                                    if let Some(ref name_sym) = arg.name {
-                                        let aname = self.interner.resolve(name_sym.0).unwrap_or("").to_string();
-                                        if aname == "style" {
-                                            if let ExprKind::StringLiteral(s) = &arg.value.kind {
-                                                if s != "half_split" && s != "adjacent" {
-                                                    self.diagnostics.push(
-                                                        Diagnostic::error("@rope 'style' must be \"half_split\" or \"adjacent\"")
-                                                            .with_label(arg.span, "invalid style")
-                                                    );
-                                                }
-                                            } else {
-                                                self.diagnostics.push(
-                                                    Diagnostic::error("@rope 'style' argument must be a string literal")
-                                                        .with_label(arg.span, "expected string")
-                                                );
-                                            }
-                                        } else {
-                                            self.diagnostics.push(
-                                                Diagnostic::error(format!("@rope unknown argument '{}'", aname))
-                                                    .with_label(arg.span, "unknown argument")
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
                         if dname == "gqa" {
                             // @gqa requires @flash_attention on the same function
                             let has_flash = decorators.iter().any(|d| {

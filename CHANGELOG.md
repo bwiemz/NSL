@@ -3664,6 +3664,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Removed
 
+- **The `@rope` decorator is refused.** It asked `@flash_attention` for
+  in-kernel RoPE, but the feature was never wired.
+  - **No tables.** Every launch site passed the kernel null cos/sin tables.
+  - **Q only.** The non-CSHA kernel it selected rotates Q only, and it has
+    no null guard.
+  - **The effect.** A decorated function compiled, and its first launch would
+    have read from address ~0. Nothing called one: the only user,
+    `examples/m27_rope_gqa.nsl`, was a decorator-validation stub.
+  - **Now.** `@rope` gets a typed refusal that stays an error under
+    `--allow-unknown-decorators`. Codegen refuses it too, for a caller that
+    skips the checker. The example is now `examples/m27_gqa.nsl`.
+  - **What to do instead.** Apply RoPE to Q and K before the attention call,
+    as `nsl.nn.gqa` does.
+
 - **Unikernel deployment (M54)**, in the Phase 0.6 scope freeze. The code is
   preserved at tag `attic/scope-freeze-2026-10`. `nsl build --unikernel`
   parsed `--listen` and `--memory` into a configuration that was printed and
