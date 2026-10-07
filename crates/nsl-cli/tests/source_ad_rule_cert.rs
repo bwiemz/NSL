@@ -29,12 +29,33 @@
 //! one, and its unit tests tie the statuses to the rules that exist.
 //! `certificates_match_the_codegen_inventory` below holds the certificate
 //! names on both sides to each other.
+//!
+//! The tape has its own inventory: `nsl_runtime::autodiff::tape_cert_status`
+//! gives every `TapeOp` (the tape's backward arms) a status the same way.
+//! `certificates_match_the_tape_inventory` holds those names to this table,
+//! and every tape run here is traced (`NSL_DEBUG_MEM_TRACE=1` makes the tape
+//! log `[tape-trace] record <Variant>` per recorded op), so a certificate a
+//! `TapeOp` status names must actually record that op. Some ops exist only on
+//! the tape (no source-AD extraction): their certificates list the source run
+//! as a known failure that must be a fall back to the tape, so the day source
+//! AD extracts the op the ratchet flips.
+//!
+//! Layout is an axis: each base certificate hands its op contiguous tensors,
+//! and its `_vgrad` / `_vin` variants (`LAYOUT_VARIANTS`) hand it a strided
+//! output gradient / strided inputs. A `TapeOp` whose variants fail is
+//! `Defective`: it names the failing certificates as defects, ratcheted here.
+//!
+//! A certificate that fails in every mode certifies nothing; it is a DEFECT
+//! PROBE, and only a `Defective` status may name it (as a defect). The
+//! defect's fix flips the ratchet, and the checks then move it to certified.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 use nsl_codegen::ad_rules::{AdCertStatus, ad_cert_inventory};
+use nsl_runtime::autodiff::{TapeCertStatus, tape_cert_inventory};
 
 // ---------------------------------------------------------------------------
 // Certificate table
@@ -52,7 +73,8 @@ enum Init {
     Randn,
     /// `abs(randn(shape)) + 0.5`, for operands a primitive needs positive.
     Positive,
-    /// An NSL expression yielding the tensor (index tensors).
+    /// An NSL expression yielding the tensor (index tensors, the seeded
+    /// dropout mask).
     Expr(&'static str),
 }
 
@@ -61,6 +83,10 @@ struct Input {
     name: &'static str,
     shape: &'static [usize],
     init: Init,
+    /// Drawn transposed in its last two dims and transposed back: a strided
+    /// (non-contiguous) view of `shape` with the same logical values. Set
+    /// only by a `Layout::ViewIn` variant.
+    view: bool,
 }
 
 /// Row-major data and its shape.
@@ -72,15 +98,35 @@ struct Arr {
 
 type Env = HashMap<&'static str, Arr>;
 
+/// A certificate's known failures: (mode, why).
+type Known = &'static [(Mode, &'static str)];
+
+/// The f64 forward a certificate is held to.
+#[derive(Clone, Copy)]
+enum Oracle {
+    Fn(fn(&Env) -> Arr),
+    /// `Fn`'s output transposed in two dims (a `Layout::ViewGrad` variant).
+    Transposed(fn(&Env) -> Arr, usize, usize),
+}
+
+impl Oracle {
+    fn eval(self, env: &Env) -> Arr {
+        match self {
+            Oracle::Fn(f) => f(env),
+            Oracle::Transposed(f, d0, d1) => transpose2(&f(env), d0, d1),
+        }
+    }
+}
+
 struct Cert {
     name: &'static str,
     inputs: Vec<Input>,
     expr: &'static str,
     wrt: &'static [&'static str],
     out_shape: &'static [usize],
-    oracle: fn(&Env) -> Arr,
+    oracle: Oracle,
     /// Known failures: (mode, why). Empty = must pass in both modes.
-    known: &'static [(Mode, &'static str)],
+    known: Known,
     /// Lines before the inputs (imports).
     prelude: &'static str,
 }
@@ -90,6 +136,7 @@ const fn inp(name: &'static str, shape: &'static [usize]) -> Input {
         name,
         shape,
         init: Init::Randn,
+        view: false,
     }
 }
 const fn pos(name: &'static str, shape: &'static [usize]) -> Input {
@@ -97,6 +144,7 @@ const fn pos(name: &'static str, shape: &'static [usize]) -> Input {
         name,
         shape,
         init: Init::Positive,
+        view: false,
     }
 }
 const fn idx(name: &'static str, shape: &'static [usize], expr: &'static str) -> Input {
@@ -104,6 +152,7 @@ const fn idx(name: &'static str, shape: &'static [usize], expr: &'static str) ->
         name,
         shape,
         init: Init::Expr(expr),
+        view: false,
     }
 }
 
@@ -455,6 +504,92 @@ fn sdpa_packed_ref(q: &Arr, k: &Arr, v: &Arr, scale: f64, seg: &Arr) -> Arr {
     }
 }
 
+fn max_of(v: &[f64]) -> f64 {
+    v.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+}
+
+/// Elements `[start, end)` of `a` along `dim`.
+fn slice_ref(a: &Arr, dim: usize, start: usize, end: usize) -> Arr {
+    let mut shape = a.shape.clone();
+    shape[dim] = end - start;
+    let st = strides(&a.shape);
+    let data = (0..numel(&shape))
+        .map(|k| {
+            let mut ix = unravel(k, &shape);
+            ix[dim] += start;
+            a.data[ix.iter().zip(&st).map(|(i, s)| i * s).sum::<usize>()]
+        })
+        .collect();
+    Arr { shape, data }
+}
+
+/// Equal-shape `parts` stacked along a new output axis `dim`.
+fn stack_ref(parts: &[&Arr], dim: usize) -> Arr {
+    let inner = &parts[0].shape;
+    let mut shape = inner.clone();
+    shape.insert(dim, parts.len());
+    let st = strides(inner);
+    let data = (0..numel(&shape))
+        .map(|k| {
+            let mut ix = unravel(k, &shape);
+            let p = ix.remove(dim);
+            parts[p].data[ix.iter().zip(&st).map(|(i, s)| i * s).sum::<usize>()]
+        })
+        .collect();
+    Arr { shape, data }
+}
+
+/// NCHW max pooling over a `k` x `k` window. Padding cells are skipped, not
+/// read as zeros (the runtime never lets a pad cell win).
+fn maxpool2d_ref(x: &Arr, k: usize, stride: usize, pad: usize) -> Arr {
+    let (n, c, h, w) = (x.shape[0], x.shape[1], x.shape[2], x.shape[3]);
+    let oh = (h + 2 * pad - k) / stride + 1;
+    let ow = (w + 2 * pad - k) / stride + 1;
+    let mut data = Vec::with_capacity(n * c * oh * ow);
+    for nc in 0..n * c {
+        for oy in 0..oh {
+            for ox in 0..ow {
+                let mut m = f64::NEG_INFINITY;
+                for ky in 0..k {
+                    for kx in 0..k {
+                        let iy = (oy * stride + ky) as isize - pad as isize;
+                        let ix = (ox * stride + kx) as isize - pad as isize;
+                        if iy >= 0 && ix >= 0 && (iy as usize) < h && (ix as usize) < w {
+                            m = m.max(x.data[(nc * h + iy as usize) * w + ix as usize]);
+                        }
+                    }
+                }
+                data.push(m);
+            }
+        }
+    }
+    Arr {
+        shape: vec![n, c, oh, ow],
+        data,
+    }
+}
+
+/// The seeded dropout's forward, `x * m`. The mask is the one quantity the
+/// oracle cannot draw, so the program supplies it: `m` is a same-seed
+/// `dropout(ones)`, i.e. mask / (1 - p). It is checked instead of trusted --
+/// every element exactly 0 or 1/(1-p), both present -- so the scale is held
+/// to the oracle's p, and a trivial mask (all kept: only a scale; all
+/// dropped: nothing) cannot pass for a certificate.
+fn seeded_dropout_ref(x: &Arr, m: &Arr, p: f64) -> Arr {
+    let keep = 1.0 / (1.0 - p);
+    assert!(
+        m.data.iter().all(|&v| v == 0.0 || v == keep),
+        "dropout mask {:?} is not 0 / {keep}: the forward's scale is wrong",
+        m.data
+    );
+    assert!(
+        m.data.contains(&0.0) && m.data.contains(&keep),
+        "dropout mask {:?} is trivial: pick another seed",
+        m.data
+    );
+    binary(x, m, |a, b| a * b)
+}
+
 // ---------------------------------------------------------------------------
 // The certificates
 // ---------------------------------------------------------------------------
@@ -464,7 +599,7 @@ macro_rules! oracle {
         fn f($env: &Env) -> Arr {
             $body
         }
-        f
+        Oracle::Fn(f)
     }};
 }
 
@@ -474,10 +609,31 @@ const XY_SAME: &[Input] = &[inp("x", &[3, 4]), inp("y", &[3, 4])];
 const XY_ONE: &[Input] = &[inp("x", &[3, 4]), inp("y", &[1])];
 const X_34: &[Input] = &[inp("x", &[3, 4])];
 const X_POS: &[Input] = &[pos("x", &[3, 4])];
+const X_234: &[Input] = &[inp("x", &[2, 3, 4])];
+const AB_34: &[Input] = &[inp("a", &[3, 4]), inp("b", &[3, 4])];
+const X_POOL: &[Input] = &[inp("x", &[1, 2, 4, 4])];
+
+/// The source-run entry of a tape-only certificate: source AD has no
+/// extraction for the op, so the grad block falls back to the tape. `check`
+/// holds such an entry to a FALL BACK (`FALLS_BACK`), not to any failure.
+macro_rules! tape_only {
+    ($what:literal) => {
+        &[(
+            Mode::Source,
+            concat!($what, ": the grad block falls back to the tape"),
+        )]
+    };
+}
+
+/// A fixed mask: `manual_seed` before each draw makes the program's mask
+/// input and the grad block's dropout the same draw.
+const DROPOUT_PRELUDE: &str = "fn cert_dropout_mask() -> Tensor:\n    manual_seed(7)\n    \
+     return dropout(ones([3, 4]), 0.5, true)\nfn cert_seeded_dropout(t: Tensor) -> Tensor:\n    \
+     manual_seed(7)\n    return dropout(t, 0.5, true)";
 
 /// One row per certificate; kept one-per-line so the table reads as a table.
 #[rustfmt::skip]
-fn certs() -> Vec<Cert> {
+fn base_certs() -> Vec<Cert> {
     vec![
         // --- binary elementwise, broadcast variants ---------------------
         Cert { name: "add_same", inputs: XY_SAME.to_vec(), expr: "x + y", wrt: &["x", "y"], out_shape: &[3, 4],
@@ -578,6 +734,14 @@ fn certs() -> Vec<Cert> {
             oracle: oracle!(|e| reduce_dim(get(e, "x"), 1, |v| v.iter().sum())), known: &[], prelude: "" },
         Cert { name: "mean_dim_last", inputs: X_34.to_vec(), expr: "mean(x, -1, 0).reshape([3])", wrt: &["x"], out_shape: &[3],
             oracle: oracle!(|e| reduce_dim(get(e, "x"), 1, |v| v.iter().sum::<f64>() / v.len() as f64)), known: &[], prelude: "" },
+        // keepdim over a middle dim with no reshape after it (the tape's
+        // SumReduce/MeanReduce arms see the output's gradient directly).
+        Cert { name: "sum_dim_keepdim_mid", inputs: X_234.to_vec(), expr: "sum(x, 1, 1)", wrt: &["x"], out_shape: &[2, 1, 4],
+            oracle: oracle!(|e| Arr { shape: vec![2, 1, 4], data: reduce_dim(get(e, "x"), 1, |v| v.iter().sum()).data }),
+            known: &[(Mode::Source, "a keepdim sum is not extracted: the grad block falls back to the tape")], prelude: "" },
+        Cert { name: "mean_dim_keepdim_mid", inputs: X_234.to_vec(), expr: "mean(x, 1, 1)", wrt: &["x"], out_shape: &[2, 1, 4],
+            oracle: oracle!(|e| Arr { shape: vec![2, 1, 4], data: reduce_dim(get(e, "x"), 1, |v| v.iter().sum::<f64>() / v.len() as f64).data }),
+            known: &[(Mode::Source, "a keepdim mean is not extracted: the grad block falls back to the tape")], prelude: "" },
         Cert { name: "softmax_last", inputs: X_34.to_vec(), expr: "softmax(x, -1)", wrt: &["x"], out_shape: &[3, 4],
             oracle: oracle!(|e| along_dim(get(e, "x"), 1, softmax_vec)), known: &[], prelude: "" },
         Cert { name: "softmax_dim0", inputs: X_34.to_vec(), expr: "softmax(x, 0)", wrt: &["x"], out_shape: &[3, 4],
@@ -739,7 +903,305 @@ fn certs() -> Vec<Cert> {
                 idx("seg", &[1, 6], "tensor_cat([zeros([1, 3]), ones([1, 3])], 1)")],
             expr: "scaled_dot_product_attention_packed(q, k, v, 0.9, seg)", wrt: &["q", "k", "v"], out_shape: &[1, 2, 6, 8],
             oracle: oracle!(|e| sdpa_packed_ref(get(e, "q"), get(e, "k"), get(e, "v"), 0.9, get(e, "seg"))), known: &[], prelude: "" },
+        // --- tape-only ops (no source-AD extraction; named by tape_cert_status) ---
+        // A lossless cast round trip: both Cast directions (f32 -> f64 and back)
+        // and, in the square, f64 arithmetic between them with two Cast grads
+        // accumulating into one f32 input. A lossy cast (fp16/bf16) is
+        // piecewise constant, so no finite difference can hold its
+        // straight-through gradient.
+        Cert { name: "cast_f64_round_trip", inputs: X_34.to_vec(), expr: "x.to(f64).to(f32)", wrt: &["x"], out_shape: &[3, 4],
+            oracle: oracle!(|e| unary(get(e, "x"), |a| a)), known: tape_only!("source AD does not extract `.to(dtype)`"), prelude: "" },
+        Cert { name: "cast_f64_square", inputs: X_34.to_vec(), expr: "(x.to(f64) * x.to(f64)).to(f32)", wrt: &["x"], out_shape: &[3, 4],
+            oracle: oracle!(|e| unary(get(e, "x"), |a| a * a)), known: tape_only!("source AD does not extract `.to(dtype)`"), prelude: "" },
+        // randn inputs: a tie for the max (where the gradient is undefined)
+        // has probability zero, and the draw is seeded, so none occurs.
+        Cert { name: "reduce_max_dim1", inputs: X_34.to_vec(), expr: "reduce_max(x, 1, 0).reshape([3])", wrt: &["x"], out_shape: &[3],
+            oracle: oracle!(|e| reduce_dim(get(e, "x"), 1, max_of)), known: tape_only!("source AD does not extract `reduce_max`"), prelude: "" },
+        Cert { name: "reduce_max_dim0", inputs: X_34.to_vec(), expr: "reduce_max(x, 0, 0).reshape([4])", wrt: &["x"], out_shape: &[4],
+            oracle: oracle!(|e| reduce_dim(get(e, "x"), 0, max_of)), known: tape_only!("source AD does not extract `reduce_max`"), prelude: "" },
+        // keepdim, with no reshape after it: the output feeds the loss (or a
+        // layout variant's transpose) directly.
+        Cert { name: "reduce_max_keepdim_last", inputs: X_234.to_vec(), expr: "reduce_max(x, -1, 1)", wrt: &["x"], out_shape: &[2, 3, 1],
+            oracle: oracle!(|e| Arr { shape: vec![2, 3, 1], data: reduce_dim(get(e, "x"), 2, max_of).data }),
+            known: tape_only!("source AD does not extract `reduce_max`"), prelude: "" },
+        // DEFECT PROBE. Over a non-last dim, keepdim misroutes the gradient.
+        Cert { name: "reduce_max_keepdim_mid", inputs: X_234.to_vec(), expr: "reduce_max(x, -2, 1)", wrt: &["x"], out_shape: &[2, 1, 4],
+            oracle: oracle!(|e| Arr { shape: vec![2, 1, 4], data: reduce_dim(get(e, "x"), 1, max_of).data }),
+            known: &[
+                (Mode::Tape, "keepdim over a non-last dim: `scatter_grad_to_argmax` walks the keepdim \
+                    gradient's index with a counter that skips only the reduced dim, so every dim after \
+                    it reads the kept size-1 dim's index 0 and the whole gradient lands in the last \
+                    dim's first slot"),
+                (Mode::Source, "source AD does not extract `reduce_max`: the grad block falls back to the tape"),
+            ], prelude: "" },
+        Cert { name: "reduce_max_mid", inputs: X_234.to_vec(), expr: "reduce_max(x, 1, 0).reshape([2, 4])", wrt: &["x"], out_shape: &[2, 4],
+            oracle: oracle!(|e| reduce_dim(get(e, "x"), 1, max_of)), known: tape_only!("source AD does not extract `reduce_max`"), prelude: "" },
+        Cert { name: "slice_dim1", inputs: X_34.to_vec(), expr: "x.slice(1, 1, 3)", wrt: &["x"], out_shape: &[3, 2],
+            oracle: oracle!(|e| slice_ref(get(e, "x"), 1, 1, 3)), known: tape_only!("source AD does not extract `.slice`"), prelude: "" },
+        Cert { name: "slice_dim0", inputs: X_34.to_vec(), expr: "tensor_slice(x, 0, 1, 3)", wrt: &["x"], out_shape: &[2, 4],
+            oracle: oracle!(|e| slice_ref(get(e, "x"), 0, 1, 3)), known: tape_only!("source AD does not extract `tensor_slice`"), prelude: "" },
+        Cert { name: "slice_neg", inputs: X_34.to_vec(), expr: "x.slice(-1, -3, 4)", wrt: &["x"], out_shape: &[3, 3],
+            oracle: oracle!(|e| slice_ref(get(e, "x"), 1, 1, 4)), known: tape_only!("source AD does not extract `.slice`"), prelude: "" },
+        Cert { name: "slice_mid", inputs: X_234.to_vec(), expr: "x.slice(1, 1, 3)", wrt: &["x"], out_shape: &[2, 2, 4],
+            oracle: oracle!(|e| slice_ref(get(e, "x"), 1, 1, 3)), known: tape_only!("source AD does not extract `.slice`"), prelude: "" },
+        Cert { name: "stack_dim0", inputs: AB_34.to_vec(), expr: "stack([a, b], 0)", wrt: &["a", "b"], out_shape: &[2, 3, 4],
+            oracle: oracle!(|e| stack_ref(&[get(e, "a"), get(e, "b")], 0)), known: tape_only!("source AD does not extract `stack`"), prelude: "" },
+        Cert { name: "stack_dim1", inputs: AB_34.to_vec(), expr: "stack([a, b], 1)", wrt: &["a", "b"], out_shape: &[3, 2, 4],
+            oracle: oracle!(|e| stack_ref(&[get(e, "a"), get(e, "b")], 1)), known: tape_only!("source AD does not extract `stack`"), prelude: "" },
+        Cert { name: "stack_neg", inputs: vec![inp("a", &[3, 4]), inp("b", &[3, 4]), inp("c", &[3, 4])],
+            expr: "stack([a, b, c], -1)", wrt: &["a", "b", "c"], out_shape: &[3, 4, 3],
+            oracle: oracle!(|e| stack_ref(&[get(e, "a"), get(e, "b"), get(e, "c")], 2)), known: tape_only!("source AD does not extract `stack`"), prelude: "" },
+        // The stdlib Linear's bias: `bias_add(x @ w.transpose(0, 1), b)`.
+        Cert { name: "bias_add", inputs: XY_ROW.to_vec(), expr: "bias_add(x, y)", wrt: &["x", "y"], out_shape: &[3, 4],
+            oracle: oracle!(|e| binary(get(e, "x"), get(e, "y"), |a, b| a + b)), known: tape_only!("source AD does not extract `bias_add`"), prelude: "" },
+        // Non-overlapping, overlapping (an input can win several windows, so
+        // its gradient accumulates) and padded windows.
+        Cert { name: "maxpool2d", inputs: X_POOL.to_vec(), expr: "maxpool2d(x, 2, 2, 2, 0)", wrt: &["x"], out_shape: &[1, 2, 2, 2],
+            oracle: oracle!(|e| maxpool2d_ref(get(e, "x"), 2, 2, 0)), known: tape_only!("source AD does not extract `maxpool2d`"), prelude: "" },
+        Cert { name: "maxpool2d_overlap", inputs: X_POOL.to_vec(), expr: "maxpool2d(x, 2, 2, 1, 0)", wrt: &["x"], out_shape: &[1, 2, 3, 3],
+            oracle: oracle!(|e| maxpool2d_ref(get(e, "x"), 2, 1, 0)), known: tape_only!("source AD does not extract `maxpool2d`"), prelude: "" },
+        Cert { name: "maxpool2d_pad", inputs: vec![inp("x", &[1, 1, 5, 5])], expr: "maxpool2d(x, 3, 3, 2, 1)", wrt: &["x"], out_shape: &[1, 1, 3, 3],
+            oracle: oracle!(|e| maxpool2d_ref(get(e, "x"), 3, 2, 1)), known: tape_only!("source AD does not extract `maxpool2d`"), prelude: "" },
+        // p = 0.5 with a fixed seed: the mask input `m` is the program's own
+        // same-seed draw (seeded_dropout_ref checks it), so the forward and
+        // the backward are held to one known mask. p = 0 cannot certify this
+        // op: it records a Reshape, not a Dropout.
+        Cert { name: "dropout_seeded", inputs: vec![inp("x", &[3, 4]), idx("m", &[3, 4], "cert_dropout_mask()")],
+            expr: "cert_seeded_dropout(x)", wrt: &["x"], out_shape: &[3, 4],
+            oracle: oracle!(|e| seeded_dropout_ref(get(e, "x"), get(e, "m"), 0.5)),
+            known: tape_only!("source AD does not extract the seeding fn (nor `manual_seed` inside a method)"),
+            prelude: DROPOUT_PRELUDE },
     ]
+}
+
+// ---------------------------------------------------------------------------
+// Layout variants
+// ---------------------------------------------------------------------------
+//
+// Every base certificate hands each op contiguous tensors: fresh `randn`
+// inputs, and an output gradient that is the loss's own contiguous `r`. Real
+// programs hand the backward strided views as well -- a `.transpose` after
+// the op makes its output gradient one (the transpose's backward is a view),
+// and a transposed input is one. A backward that reads storage linearly is
+// right on every base certificate and wrong on these, so the layout is an
+// axis of its own.
+
+#[derive(Clone, Copy)]
+enum Layout {
+    /// `<base>_vgrad`: the op's output is transposed in dims (d0, d1)
+    /// before the loss, so the gradient its backward receives is a strided
+    /// view. Both dims must exceed 1 (or the view's storage order is the
+    /// logical order and the variant is vacuous).
+    ViewGrad(usize, usize),
+    /// `<base>_vin`: every differentiated input of rank >= 2 is a strided
+    /// view (`Input::view`), so the forward reads and the tape saves one.
+    ViewIn,
+}
+
+/// Why a strided output gradient breaks a tape arm (`_vgrad`), or a strided
+/// input an op (`_vin`): CPU code that indexes a tensor's storage linearly,
+/// as if every tensor were row-major contiguous.
+const GRAD_LINEAR: &str = "the tape backward reads the output gradient's storage linearly \
+     (`data.add(i)`), ignoring the strides of the view the `.transpose` after the op hands it";
+const SAVED_LINEAR: &str = "the tape backward reads the saved (strided) input's storage \
+     linearly, pairing each gradient element with the wrong input element";
+
+/// The layout variants, one row per (base, layout) with the known failures
+/// the variant adds to its base's (a tape-only base's fall back carries
+/// over). Chosen so the transpose meets the op's output directly: a base
+/// whose output passes through a `.reshape` first (`sum_dim`, `gather_mid`)
+/// would hand the op a materialized gradient and certify nothing new.
+#[rustfmt::skip]
+const LAYOUT_VARIANTS: &[(&str, Layout, Known)] = &[
+    ("add_row", Layout::ViewGrad(0, 1), &[]),
+    ("sub_row", Layout::ViewGrad(0, 1), &[]),
+    ("mul_col", Layout::ViewGrad(0, 1), &[]),
+    ("div_row", Layout::ViewGrad(0, 1), &[]),
+    ("matmul_2d", Layout::ViewGrad(0, 1), &[]),
+    ("neg", Layout::ViewGrad(0, 1), &[]),
+    ("cast_f64_round_trip", Layout::ViewGrad(0, 1), &[]),
+    ("mul_literal", Layout::ViewGrad(0, 1), &[]),
+    ("add_literal", Layout::ViewGrad(0, 1), &[]),
+    ("transpose_3d", Layout::ViewGrad(0, 2), &[]),
+    ("sum_dim_keepdim_mid", Layout::ViewGrad(0, 2), &[(Mode::Tape, "`broadcast_grad_along_dim` reads the strided keepdim gradient's storage linearly")]),
+    ("mean_dim_keepdim_mid", Layout::ViewGrad(0, 2), &[(Mode::Tape, "`broadcast_grad_along_dim` reads the strided keepdim gradient's storage linearly")]),
+    ("reduce_max_keepdim_last", Layout::ViewGrad(0, 1), &[(Mode::Tape, "`scatter_grad_to_argmax` reads the strided gradient's storage linearly")]),
+    ("exp", Layout::ViewGrad(0, 1), &[]),
+    ("log", Layout::ViewGrad(0, 1), &[]),
+    ("sqrt", Layout::ViewGrad(0, 1), &[]),
+    ("abs", Layout::ViewGrad(0, 1), &[]),
+    ("clamp", Layout::ViewGrad(0, 1), &[(Mode::Tape, GRAD_LINEAR)]),
+    ("relu", Layout::ViewGrad(0, 1), &[(Mode::Tape, GRAD_LINEAR)]),
+    ("gelu", Layout::ViewGrad(0, 1), &[(Mode::Tape, GRAD_LINEAR)]),
+    ("silu", Layout::ViewGrad(0, 1), &[(Mode::Tape, GRAD_LINEAR)]),
+    ("sin", Layout::ViewGrad(0, 1), &[]),
+    ("cos", Layout::ViewGrad(0, 1), &[]),
+    ("sigmoid", Layout::ViewGrad(0, 1), &[(Mode::Tape, GRAD_LINEAR)]),
+    ("tanh", Layout::ViewGrad(0, 1), &[(Mode::Tape, GRAD_LINEAR)]),
+    ("softmax_last", Layout::ViewGrad(0, 1), &[(Mode::Tape, GRAD_LINEAR)]),
+    ("log_softmax_last", Layout::ViewGrad(0, 1), &[(Mode::Tape, GRAD_LINEAR)]),
+    ("slice_dim1", Layout::ViewGrad(0, 1), &[(Mode::Tape, "`slice_backward` splits each flat index by the strided gradient's own strides as if they were contiguous ones, and reads its storage linearly")]),
+    ("reshape", Layout::ViewGrad(0, 1), &[]),
+    ("cat_dim1", Layout::ViewGrad(0, 1), &[]),
+    ("embedding", Layout::ViewGrad(0, 1), &[(Mode::Tape, "the EmbeddingLookup arm accumulates dW from the gradient's storage read linearly")]),
+    ("layernorm", Layout::ViewGrad(0, 1), &[(Mode::Tape, "`layernorm_backward` reads dy's storage linearly: dx, dw and db are all wrong")]),
+    ("rmsnorm", Layout::ViewGrad(0, 1), &[(Mode::Tape, "`rmsnorm_backward` reads dy's storage linearly: dx and dw are wrong")]),
+    ("dropout_seeded", Layout::ViewGrad(0, 1), &[(Mode::Tape, "`dropout_backward` pairs gradient storage element i with mask element i")]),
+    ("conv2d", Layout::ViewGrad(2, 3), &[
+        (Mode::Tape, "`conv2d_backward` reads dy's storage linearly: dx and dw are wrong"),
+        (Mode::Source, "source AD lowers Conv2dBackward to `nsl_conv2d_{input,weight}_backward`, which wrap the same `conv2d_backward` and read dy's storage linearly"),
+    ]),
+    ("maxpool2d", Layout::ViewGrad(2, 3), &[(Mode::Tape, "`maxpool2d_backward` reads the gradient's storage linearly against argmax slots in logical order")]),
+    ("rotate_half", Layout::ViewGrad(0, 1), &[]),
+    ("bias_add", Layout::ViewGrad(0, 1), &[(Mode::Tape, "the BiasAdd arm sums db over the gradient read at storage offset i*cols + j")]),
+    ("unsqueeze", Layout::ViewGrad(1, 2), &[(Mode::Tape, "the Unsqueeze arm's `reshape_to_shape` memcpys the strided gradient's raw storage under contiguous strides")]),
+    ("expand", Layout::ViewGrad(0, 1), &[]),
+    ("stack_dim0", Layout::ViewGrad(0, 2), &[]),
+    ("add_row", Layout::ViewIn, &[]),
+    ("sub_row", Layout::ViewIn, &[]),
+    ("mul_col", Layout::ViewIn, &[]),
+    ("div_row", Layout::ViewIn, &[]),
+    ("matmul_2d", Layout::ViewIn, &[]),
+    ("neg", Layout::ViewIn, &[]),
+    ("cast_f64_round_trip", Layout::ViewIn, &[]),
+    ("mul_literal", Layout::ViewIn, &[]),
+    ("add_literal", Layout::ViewIn, &[]),
+    ("transpose_3d", Layout::ViewIn, &[]),
+    ("sum_dim", Layout::ViewIn, &[]),
+    ("mean_dim", Layout::ViewIn, &[]),
+    ("reduce_max_dim1", Layout::ViewIn, &[]),
+    ("gather", Layout::ViewIn, &[]),
+    ("exp", Layout::ViewIn, &[]),
+    ("log", Layout::ViewIn, &[]),
+    ("sqrt", Layout::ViewIn, &[]),
+    ("abs", Layout::ViewIn, &[]),
+    ("clamp", Layout::ViewIn, &[(Mode::Tape, SAVED_LINEAR)]),
+    ("relu", Layout::ViewIn, &[(Mode::Tape, SAVED_LINEAR)]),
+    ("gelu", Layout::ViewIn, &[(Mode::Tape, SAVED_LINEAR)]),
+    ("silu", Layout::ViewIn, &[(Mode::Tape, SAVED_LINEAR)]),
+    ("sin", Layout::ViewIn, &[]),
+    ("cos", Layout::ViewIn, &[]),
+    ("sigmoid", Layout::ViewIn, &[]),
+    ("tanh", Layout::ViewIn, &[]),
+    ("softmax_last", Layout::ViewIn, &[]),
+    ("log_softmax_last", Layout::ViewIn, &[]),
+    ("slice_dim1", Layout::ViewIn, &[]),
+    ("reshape", Layout::ViewIn, &[]),
+    ("cat_dim1", Layout::ViewIn, &[]),
+    ("embedding", Layout::ViewIn, &[
+        (Mode::Tape, "the CPU `nsl_tensor_embedding_lookup` forward reads the strided weight's storage linearly: the output is wrong"),
+        (Mode::Source, "the CPU `nsl_tensor_embedding_lookup` forward (shared by both modes) reads the strided weight's storage linearly: the output is wrong"),
+    ]),
+    ("layernorm", Layout::ViewIn, &[(Mode::Tape, "`layernorm_backward` reads the saved strided input's storage linearly: dx and dw are wrong")]),
+    ("rmsnorm", Layout::ViewIn, &[(Mode::Tape, "`rmsnorm_backward` reads the saved strided input's storage linearly: dx and dw are wrong")]),
+    ("dropout_seeded", Layout::ViewIn, &[(Mode::Tape, "the CPU `nsl_tensor_dropout` forward reads the input's storage linearly: the output is wrong")]),
+    ("conv2d", Layout::ViewIn, &[
+        (Mode::Tape, "the CPU `nsl_tensor_conv2d` forward reads the strided input and weight storage linearly: the output, dx and dw are wrong"),
+        (Mode::Source, "the CPU `nsl_tensor_conv2d` forward (shared by both modes) reads the strided input and weight storage linearly: the output, dx and dw are wrong"),
+    ]),
+    ("maxpool2d", Layout::ViewIn, &[(Mode::Tape, "the CPU `nsl_tensor_maxpool2d` forward pools the input's storage order and saves argmax slots in it: the output and dx are wrong")]),
+    ("rotate_half", Layout::ViewIn, &[]),
+    ("bias_add", Layout::ViewIn, &[(Mode::Tape, "the CPU `nsl_tensor_bias_add` forward reads the input at storage offset i*cols + j: the output is wrong")]),
+    ("unsqueeze", Layout::ViewIn, &[]),
+    ("stack_dim0", Layout::ViewIn, &[]),
+];
+
+/// Leak a runtime string into the `'static` table (once per process:
+/// `certs()` builds the table once).
+fn leak(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
+}
+
+/// The `layout` variant of `base`, failing as `base` does plus `known`.
+fn layout_variant(base: &Cert, layout: Layout, known: Known) -> Cert {
+    let Oracle::Fn(f) = base.oracle else {
+        panic!(
+            "{}: a layout variant's base must be a base certificate",
+            base.name
+        )
+    };
+    let mut all_known: Vec<(Mode, &'static str)> = base.known.to_vec();
+    for k in known {
+        assert!(
+            all_known.iter().all(|(m, _)| *m != k.0),
+            "{}: a layout variant re-lists its base's {:?} known failure",
+            base.name,
+            k.0
+        );
+        all_known.push(*k);
+    }
+    let known: Known = Box::leak(all_known.into_boxed_slice());
+    match layout {
+        Layout::ViewGrad(d0, d1) => {
+            let mut shape = base.out_shape.to_vec();
+            assert!(
+                shape.len() > d0.max(d1) && shape[d0] > 1 && shape[d1] > 1,
+                "{}: transposing dims {d0},{d1} of {shape:?} does not stride the gradient",
+                base.name
+            );
+            shape.swap(d0, d1);
+            Cert {
+                name: leak(format!("{}_vgrad", base.name)),
+                inputs: base.inputs.clone(),
+                expr: leak(format!("({}).transpose({d0}, {d1})", base.expr)),
+                wrt: base.wrt,
+                out_shape: Box::leak(shape.into_boxed_slice()),
+                oracle: Oracle::Transposed(f, d0, d1),
+                known,
+                prelude: base.prelude,
+            }
+        }
+        Layout::ViewIn => {
+            let inputs: Vec<Input> = base
+                .inputs
+                .iter()
+                .map(|i| Input {
+                    view: base.wrt.contains(&i.name)
+                        && i.shape.len() >= 2
+                        && !matches!(i.init, Init::Expr(_)),
+                    ..*i
+                })
+                .collect();
+            assert!(
+                inputs.iter().any(|i| {
+                    let r = i.shape.len();
+                    i.view && i.shape[r - 1] > 1 && i.shape[r - 2] > 1
+                }),
+                "{}: no differentiated input whose view is strided",
+                base.name
+            );
+            Cert {
+                name: leak(format!("{}_vin", base.name)),
+                inputs,
+                expr: base.expr,
+                wrt: base.wrt,
+                out_shape: base.out_shape,
+                oracle: base.oracle,
+                known,
+                prelude: base.prelude,
+            }
+        }
+    }
+}
+
+/// Every certificate: the base table, then its layout variants.
+fn certs() -> &'static [Cert] {
+    static ALL: OnceLock<Vec<Cert>> = OnceLock::new();
+    ALL.get_or_init(|| {
+        let mut all = base_certs();
+        let variants: Vec<Cert> = LAYOUT_VARIANTS
+            .iter()
+            .map(|&(base, layout, known)| {
+                let b = all
+                    .iter()
+                    .find(|c| c.name == base)
+                    .unwrap_or_else(|| panic!("layout variant of unknown certificate `{base}`"));
+                layout_variant(b, layout, known)
+            })
+            .collect();
+        all.extend(variants);
+        all
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -767,10 +1229,21 @@ fn program(c: &Cert) -> String {
         s += "\n";
     }
     for i in &c.inputs {
+        // A view is drawn in the transposed shape and transposed back.
+        let mut drawn = i.shape.to_vec();
+        let r = drawn.len();
+        if i.view {
+            drawn.swap(r - 2, r - 1);
+        }
         let init = match i.init {
-            Init::Randn => format!("randn({})", shape_list(i.shape)),
-            Init::Positive => format!("abs(randn({})) + 0.5", shape_list(i.shape)),
+            Init::Randn => format!("randn({})", shape_list(&drawn)),
+            Init::Positive => format!("abs(randn({})) + 0.5", shape_list(&drawn)),
             Init::Expr(e) => e.to_string(),
+        };
+        let init = if i.view {
+            format!("({init}).transpose({}, {})", r - 2, r - 1)
+        } else {
+            init
         };
         s += &format!("let {} = {init}\n", i.name);
     }
@@ -810,7 +1283,7 @@ fn parse_between(stdout: &str, begin: &str, end: &str) -> Option<Vec<f64>> {
 
 /// The oracle's loss: `sum(out * r)`, `r` broadcast for a scalar output.
 fn oracle_loss(c: &Cert, env: &Env) -> f64 {
-    let out = (c.oracle)(env);
+    let out = c.oracle.eval(env);
     assert_eq!(
         numel(&out.shape).max(1),
         numel(c.out_shape).max(1),
@@ -834,8 +1307,26 @@ const FALLBACK_MARKERS: &[&str] = &[
     "extraction failed",
 ];
 
-/// Run one certificate in one mode; `Err` describes how it failed.
-fn run_cert(c: &Cert, mode: Mode) -> Result<(), String> {
+/// The prefix of a source run's `Err` when the grad block fell back to the
+/// tape, and the phrase a `known` entry uses to claim exactly that.
+const FELL_BACK: &str = "source AD fell back";
+const FALLS_BACK: &str = "falls back to the tape";
+
+/// The ops a tape run recorded, by `TapeOp` variant name: the run sets
+/// `NSL_DEBUG_MEM_TRACE=1`, under which `maybe_record` logs
+/// `[tape-trace] record <Variant> ...` for every op it pushes.
+fn recorded_tape_ops(stderr: &str) -> BTreeSet<String> {
+    stderr
+        .lines()
+        .filter_map(|l| l.split_once("[tape-trace] record ").map(|(_, rest)| rest))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Run one certificate in one mode; `Err` describes how it failed. A tape
+/// run also returns the ops it recorded (empty for a source run).
+fn run_cert(c: &Cert, mode: Mode, recorded: &mut BTreeSet<String>) -> Result<(), String> {
     let root = repo_root();
     let tmp = tempfile::TempDir::new().unwrap();
     let path = tmp.path().join(format!("{}.nsl", c.name));
@@ -844,6 +1335,8 @@ fn run_cert(c: &Cert, mode: Mode) -> Result<(), String> {
     cmd.arg("run");
     if mode == Mode::Source {
         cmd.arg("--source-ad");
+    } else {
+        cmd.env("NSL_DEBUG_MEM_TRACE", "1");
     }
     let out = cmd
         .arg(&path)
@@ -853,10 +1346,17 @@ fn run_cert(c: &Cert, mode: Mode) -> Result<(), String> {
         .expect("spawn nsl run");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    if mode == Mode::Tape {
+        *recorded = recorded_tape_ops(&stderr);
+    }
     let tail = || {
         stderr
             .lines()
-            .filter(|l| !l.trim().is_empty())
+            .filter(|l| {
+                !l.trim().is_empty()
+                    && !l.starts_with("[tape-trace]")
+                    && !l.starts_with("[tensor-trace]")
+            })
             .rev()
             .take(6)
             .collect::<Vec<_>>()
@@ -876,7 +1376,7 @@ fn run_cert(c: &Cert, mode: Mode) -> Result<(), String> {
             ));
         }
         if let Some(m) = FALLBACK_MARKERS.iter().find(|m| stderr.contains(*m)) {
-            return Err(format!("source AD fell back ({m})"));
+            return Err(format!("{FELL_BACK} ({m})"));
         }
     }
 
@@ -1005,10 +1505,22 @@ fn check(name: &str) {
         .unwrap_or_else(|| panic!("no certificate {name}"));
     let mut problems = Vec::new();
     for mode in [Mode::Tape, Mode::Source] {
-        let result = run_cert(c, mode);
+        let mut recorded = BTreeSet::new();
+        let result = run_cert(c, mode, &mut recorded);
+        if mode == Mode::Tape {
+            eprintln!("{name} [Tape]: recorded {recorded:?}");
+            problems.extend(tape_claim_problems(name, &recorded));
+        }
         let known = c.known.iter().find(|(m, _)| *m == mode);
         match (result, known) {
             (Ok(()), None) => eprintln!("{name} [{mode:?}]: certified"),
+            // A listed fall back must BE a fall back: once source AD extracts
+            // the op, a wrong gradient must not hide behind the entry.
+            (Err(e), Some((_, why))) if why.contains(FALLS_BACK) && !e.starts_with(FELL_BACK) => {
+                problems.push(format!(
+                    "{mode:?}: listed as a fall back ({why}), but it failed otherwise: {e}"
+                ))
+            }
             (Err(e), Some((_, why))) => eprintln!("{name} [{mode:?}]: known failure ({why}): {e}"),
             (Err(e), None) => problems.push(format!("{mode:?}: {e}")),
             (Ok(()), Some((_, why))) => problems.push(format!(
@@ -1017,6 +1529,33 @@ fn check(name: &str) {
         }
     }
     assert!(problems.is_empty(), "{name}:\n  {}", problems.join("\n  "));
+}
+
+/// The tape inventory's claims about one certificate, held to what its tape
+/// run recorded: every `TapeOp` whose status names it (as a certificate or a
+/// defect) was recorded, and nothing it recorded is an op the inventory calls
+/// GPU-only or unreachable.
+fn tape_claim_problems(name: &str, recorded: &BTreeSet<String>) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (op, status) in tape_cert_inventory() {
+        let named = status.certified().contains(&name) || status.defects().contains(&name);
+        if named && !recorded.contains(op) {
+            problems.push(format!(
+                "Tape: tape_cert_status names `{name}` for {op}, but its tape run recorded \
+                 no {op} (it recorded {recorded:?})"
+            ));
+        }
+        if matches!(
+            status,
+            TapeCertStatus::GpuOnly(_) | TapeCertStatus::Unreachable(_)
+        ) && recorded.contains(op)
+        {
+            problems.push(format!(
+                "Tape: the tape run recorded {op}, which tape_cert_status calls {status:?}"
+            ));
+        }
+    }
+    problems
 }
 
 #[test]
@@ -1036,7 +1575,8 @@ fn certificate_names_are_unique() {
 const GPU_CERTS: &[&str] = &["fused_linear_ce_step", "fused_kl_ce_step", "sdpa_packed_step"];
 
 /// The coverage gate: every certificate a `PrimalOp` status names exists here
-/// (or in `GPU_CERTS`), and every certificate here is named by some status.
+/// (or in `GPU_CERTS`). `every_certificate_is_named_by_a_status` holds the
+/// other direction.
 #[test]
 fn certificates_match_the_codegen_inventory() {
     let all = certs();
@@ -1070,11 +1610,76 @@ fn certificates_match_the_codegen_inventory() {
         );
         assert!(claimed.contains(n), "GPU certificate `{n}` is not named by any PrimalOp status");
     }
-    for n in &names {
-        assert!(
-            claimed.contains(n),
-            "certificate `{n}` is not named by any PrimalOp status in ad_cert_status"
-        );
+}
+
+/// The tape coverage gate: every certificate a `TapeOp` status names exists
+/// here; one it names as CERTIFYING the op is not a known failure in tape
+/// mode (a failing run certifies nothing), and one it names as a DEFECT is
+/// (so a fix that flips the ratchet must move it to `certified`). `check`
+/// holds each named certificate's tape run to recording the op.
+#[test]
+fn certificates_match_the_tape_inventory() {
+    let all = certs();
+    let find = |op: &str, n: &str| {
+        all.iter()
+            .find(|c| c.name == n)
+            .unwrap_or_else(|| panic!("{op} names certificate `{n}`, which is not in certs()"))
+    };
+    let tape_fails = |c: &Cert| c.known.iter().any(|(m, _)| *m == Mode::Tape);
+    for (op, status) in tape_cert_inventory() {
+        for n in status.certified() {
+            assert!(
+                !tape_fails(find(op, n)),
+                "{op} is certified by `{n}`, whose tape run is a known failure: a failing run \
+                 certifies nothing (list it as a defect)"
+            );
+        }
+        for n in status.defects() {
+            assert!(
+                tape_fails(find(op, n)),
+                "{op} lists `{n}` as a defect, but its tape run is not a known failure: \
+                 move it to `certified`"
+            );
+        }
+    }
+}
+
+/// Every certificate is named by some status: as certifying a `PrimalOp` or
+/// a `TapeOp`, or as a `TapeOp` defect. A DEFECT PROBE -- a known failure in
+/// every mode -- certifies nothing, so it may only be named as a defect; its
+/// fix flips the ratchet, and then the checks above move it.
+#[test]
+fn every_certificate_is_named_by_a_status() {
+    let mut certifying: Vec<&str> = Vec::new();
+    let mut defects: Vec<&str> = Vec::new();
+    for (_, status) in ad_cert_inventory() {
+        if let AdCertStatus::Certified(n) = status {
+            certifying.extend_from_slice(n);
+        }
+    }
+    for (_, status) in tape_cert_inventory() {
+        certifying.extend_from_slice(status.certified());
+        defects.extend_from_slice(status.defects());
+    }
+    for c in certs() {
+        let probe = [Mode::Tape, Mode::Source]
+            .iter()
+            .all(|m| c.known.iter().any(|(k, _)| k == m));
+        if probe {
+            assert!(
+                !certifying.contains(&c.name) && defects.contains(&c.name),
+                "`{}` fails in every mode (a defect probe): name it as a TapeOp defect, and \
+                 nowhere as a certificate",
+                c.name
+            );
+        } else {
+            assert!(
+                certifying.contains(&c.name) || defects.contains(&c.name),
+                "certificate `{}` is named by no PrimalOp status (ad_cert_status) and no \
+                 TapeOp status (tape_cert_status)",
+                c.name
+            );
+        }
     }
 }
 
@@ -1091,7 +1696,7 @@ macro_rules! cert_tests {
         fn every_certificate_has_a_test() {
             let tests: Vec<&str> = vec![$(stringify!($name)),*];
             let all = certs();
-            for c in &all {
+            for c in all {
                 assert!(tests.contains(&c.name), "certificate {} has no test in cert_tests!", c.name);
             }
             assert_eq!(tests.len(), all.len(), "cert_tests! names a certificate the table lacks");
@@ -1113,4 +1718,25 @@ cert_tests! {
     cross_entropy, mse_loss, l1_loss,
     conv2d, sdpa, sdpa_causal, sdpa_scale,
     sdpa_packed, sdpa_packed_docs, sdpa_packed_batch, sdpa_packed_scale,
+    cast_f64_round_trip, cast_f64_square,
+    reduce_max_dim1, reduce_max_dim0, reduce_max_keepdim_last, reduce_max_keepdim_mid, reduce_max_mid,
+    slice_dim1, slice_dim0, slice_neg, slice_mid,
+    stack_dim0, stack_dim1, stack_neg,
+    bias_add, maxpool2d, maxpool2d_overlap, maxpool2d_pad, dropout_seeded,
+    sum_dim_keepdim_mid, mean_dim_keepdim_mid,
+    add_row_vgrad, sub_row_vgrad, mul_col_vgrad, div_row_vgrad, matmul_2d_vgrad, neg_vgrad,
+    cast_f64_round_trip_vgrad, mul_literal_vgrad, add_literal_vgrad, transpose_3d_vgrad,
+    sum_dim_keepdim_mid_vgrad, mean_dim_keepdim_mid_vgrad, reduce_max_keepdim_last_vgrad, exp_vgrad,
+    log_vgrad, sqrt_vgrad, abs_vgrad, clamp_vgrad, relu_vgrad, gelu_vgrad, silu_vgrad, sin_vgrad,
+    cos_vgrad, sigmoid_vgrad, tanh_vgrad, softmax_last_vgrad, log_softmax_last_vgrad,
+    slice_dim1_vgrad, reshape_vgrad, cat_dim1_vgrad, embedding_vgrad, layernorm_vgrad,
+    rmsnorm_vgrad, dropout_seeded_vgrad, conv2d_vgrad, maxpool2d_vgrad, rotate_half_vgrad,
+    bias_add_vgrad, unsqueeze_vgrad, expand_vgrad, stack_dim0_vgrad,
+    add_row_vin, sub_row_vin, mul_col_vin, div_row_vin, matmul_2d_vin, neg_vin,
+    cast_f64_round_trip_vin, mul_literal_vin, add_literal_vin, transpose_3d_vin, sum_dim_vin,
+    mean_dim_vin, reduce_max_dim1_vin, gather_vin, exp_vin, log_vin, sqrt_vin, abs_vin, clamp_vin,
+    relu_vin, gelu_vin, silu_vin, sin_vin, cos_vin, sigmoid_vin, tanh_vin, softmax_last_vin,
+    log_softmax_last_vin, slice_dim1_vin, reshape_vin, cat_dim1_vin, embedding_vin, layernorm_vin,
+    rmsnorm_vin, dropout_seeded_vin, conv2d_vin, maxpool2d_vin, rotate_half_vin, bias_add_vin,
+    unsqueeze_vin, stack_dim0_vin,
 }
