@@ -852,7 +852,9 @@ pub struct Compiler<'a> {
     pub wrga_inputs: Option<crate::WrgaInputs>,
     /// The model the train block being compiled trains, recorded by
     /// `emit_model_params` and cleared when the block ends: what a scoped
-    /// `@freeze` is checked against (`Compiler::is_frozen_param_path`).
+    /// `@freeze` is checked against (`Compiler::is_frozen_param_path`), and
+    /// the root a parameter path's field kind is resolved from
+    /// (`Compiler::is_buffer_param_path`).
     pub(crate) freeze_ctx: Option<crate::stmt::TrainedModel>,
 
     // ── CFIE side-channel (Tier-A wiring) ────────────────────────────

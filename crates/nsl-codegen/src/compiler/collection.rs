@@ -9,10 +9,90 @@ use nsl_ast::types::TypeExprKind;
 use nsl_semantic::types::Type;
 
 use super::Compiler;
+use crate::context::FieldKind;
 use crate::context::StructField;
 use crate::context::StructLayout;
 use crate::error::CodegenError;
 use crate::types::nsl_type_to_cl;
+
+/// The kind of a field declared with the annotation `ty`, by the meaning the
+/// semantic resolver (`nsl_semantic::resolve::TypeResolver::resolve`) gives
+/// it: the tensor family by its type constructor or bare builtin name
+/// (`Tensor`/`Param`/`Buffer`), the scalar builtins by name, and any other
+/// name (a model, struct or enum) as something to descend into.
+///
+/// A declaration that can hold a tensor without saying which kind
+/// (`_`, `Optional<Tensor>`, `Tensor | int`) stays a tensor: that is what
+/// every `I64` slot was taken for before kinds existed, so it changes nothing.
+pub(crate) fn field_kind_of_annotation(
+    ty: &nsl_ast::types::TypeExpr,
+    resolve: &dyn Fn(nsl_ast::Symbol) -> String,
+) -> FieldKind {
+    match &ty.kind {
+        TypeExprKind::Tensor { .. } | TypeExprKind::Param { .. } | TypeExprKind::Sparse { .. } => {
+            FieldKind::Tensor
+        }
+        TypeExprKind::Buffer { .. } => FieldKind::Buffer,
+        TypeExprKind::FixedArray { .. } => FieldKind::Nested,
+        TypeExprKind::Borrow(inner) => field_kind_of_annotation(inner, resolve),
+        TypeExprKind::Named(sym) => match resolve(*sym).as_str() {
+            "Tensor" | "Param" => FieldKind::Tensor,
+            "Buffer" => FieldKind::Buffer,
+            name if is_scalar_builtin_type_name(name) => FieldKind::Scalar,
+            _ => FieldKind::Nested,
+        },
+        TypeExprKind::Wildcard => FieldKind::Tensor,
+        // `resolve_generic`'s builtins; any other name is a user generic
+        // struct or model (`Foo<T>`).
+        TypeExprKind::Generic { name, args } => match resolve(*name).as_str() {
+            "Optional" => args
+                .first()
+                .map_or(FieldKind::Scalar, |inner| field_kind_of_annotation(inner, resolve)),
+            "list" | "List" | "dict" | "Dict" => FieldKind::Scalar,
+            _ => FieldKind::Nested,
+        },
+        TypeExprKind::Union(members) => most_tensor_like(
+            members.iter().map(|m| field_kind_of_annotation(m, resolve)),
+        ),
+        TypeExprKind::Tuple(_) | TypeExprKind::Function { .. } => FieldKind::Scalar,
+    }
+}
+
+/// [`field_kind_of_annotation`] for a type the checker already resolved.
+pub(crate) fn field_kind_of_type(ty: &Type) -> FieldKind {
+    match ty {
+        Type::Tensor { .. } | Type::Param { .. } | Type::Sparse { .. } | Type::QuantizedTensor => {
+            FieldKind::Tensor
+        }
+        Type::Buffer { .. } => FieldKind::Buffer,
+        Type::Model { .. } | Type::Struct { .. } | Type::FixedModelArray { .. } => FieldKind::Nested,
+        Type::Borrow(inner) | Type::Optional(inner) => field_kind_of_type(inner),
+        Type::Union(members) => most_tensor_like(members.iter().map(field_kind_of_type)),
+        // Undetermined: as before kinds, a pointer-sized slot is a tensor.
+        Type::Unknown | Type::Error | Type::TypeVar(_) => FieldKind::Tensor,
+        _ => FieldKind::Scalar,
+    }
+}
+
+/// A union's kind: a tensor if any member can be one.
+fn most_tensor_like(kinds: impl Iterator<Item = FieldKind>) -> FieldKind {
+    let kinds: Vec<FieldKind> = kinds.collect();
+    [FieldKind::Tensor, FieldKind::Buffer, FieldKind::Nested]
+        .into_iter()
+        .find(|k| kinds.contains(k))
+        .unwrap_or(FieldKind::Scalar)
+}
+
+/// The scalar type names `nsl_semantic::resolve` resolves without a scope
+/// lookup (`resolve_named`): never a tensor, never something to descend into.
+fn is_scalar_builtin_type_name(name: &str) -> bool {
+    matches!(
+        name,
+        "int" | "float" | "bool" | "str" | "void" | "f32" | "f64" | "fp16" | "bf16" | "fp8_e4m3"
+            | "fp8_e5m2" | "int8" | "int16" | "int32" | "int64" | "i8" | "i16" | "i32" | "i64"
+            | "int4" | "uint8" | "ternary" | "ternary_unpacked"
+    )
+}
 
 impl Compiler<'_> {
     // ── Pass 0: Collect string literals ─────────────────────────────
@@ -307,6 +387,7 @@ impl Compiler<'_> {
                             name: field_name,
                             cl_type,
                             offset,
+                            kind: field_kind_of_type(field_type),
                         });
                         offset += size;
                     }
@@ -320,10 +401,14 @@ impl Compiler<'_> {
                         let size = cl_type.bytes() as usize;
                         let align = size.max(1);
                         offset = (offset + align - 1) & !(align - 1);
+                        let kind = field_kind_of_annotation(&field.type_ann, &|s| {
+                            self.resolve_sym(s).to_string()
+                        });
                         fields.push(StructField {
                             name: field_name,
                             cl_type,
                             offset,
+                            kind,
                         });
                         offset += size;
                     }
@@ -526,6 +611,7 @@ impl Compiler<'_> {
                                 name: field_name.clone(),
                                 cl_type: cl_types::I64,
                                 offset,
+                                kind: FieldKind::Nested,
                             });
                             offset += (*size as usize) * 8;
 
@@ -549,21 +635,30 @@ impl Compiler<'_> {
                         let size = cl_type.bytes() as usize;
                         let align = size.max(1);
                         offset = (offset + align - 1) & !(align - 1);
+                        // The declared kind, not `cl_type`, says whether this
+                        // slot holds a tensor: `n: int` and `buf: Buffer<..>`
+                        // are `I64` slots like any weight.
+                        let kind = field_kind_of_annotation(type_ann, &|s| {
+                            self.resolve_sym(s).to_string()
+                        });
                         fields.push(StructField {
                             name: field_name.clone(),
                             cl_type,
                             offset,
+                            kind,
                         });
                         offset += size;
 
                         // Record named non-builtin field types so nested model
                         // traversal still works for forward references where the
                         // referenced layout may not have been collected yet.
+                        // A bare `Param` / `Buffer` is the builtin tensor
+                        // type, not a sub-model to descend into.
                         if let nsl_ast::types::TypeExprKind::Named(type_sym) = &type_ann.kind {
                             let type_name = self.resolve_sym(*type_sym).to_string();
                             let is_builtin_named = matches!(
                                 type_name.as_str(),
-                                "Tensor" | "int" | "float" | "bool" | "str"
+                                "Tensor" | "Param" | "Buffer" | "int" | "float" | "bool" | "str"
                             );
                             if !is_builtin_named {
                                 field_type_map.insert(field_name, type_name);

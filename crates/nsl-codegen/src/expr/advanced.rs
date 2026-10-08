@@ -12,7 +12,7 @@ use nsl_ast::Symbol;
 use nsl_semantic::types::Type;
 
 use crate::compiler::Compiler;
-use crate::context::FuncState;
+use crate::context::{FieldKind, FuncState};
 use crate::error::CodegenError;
 use crate::ownership_expr::Ownership;
 use crate::types::{is_block_filled, nsl_type_to_cl, pointer_type};
@@ -2436,8 +2436,11 @@ impl Compiler<'_> {
                     entries.extend(sub);
                 }
             } else {
-                // Leaf tensor field -- determine transpose flag
-                if field.cl_type == cl_types::I64 {
+                // Leaf tensor field -- determine transpose flag. A parameter
+                // and a `Buffer<...>` both round-trip (state, like a
+                // `_`-prefixed tensor); a scalar field is no tensor at all,
+                // though an `int` or `str` occupies the same `I64` slot.
+                if matches!(field.kind, FieldKind::Tensor | FieldKind::Buffer) {
                     let is_linear_like = {
                         let names: Vec<&str> =
                             layout.fields.iter().map(|f| f.name.as_str()).collect();

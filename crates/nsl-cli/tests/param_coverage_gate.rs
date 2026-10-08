@@ -17,16 +17,20 @@
 //! configs (one set of synthesized tensors per target-model instance) and
 //! the `@freeze` configs, walked by this file. Non-trainable state is the
 //! language's: a `Buffer<...>` field (spec/02), and the `_`-prefix /
-//! `inv_freq` convention the stdlib's configuration tensors use. The
-//! OBSERVATIONS are `model_save` before and after training (struct fields,
-//! exact f32) and the fixture's printed adapter tensors (`print` writes an
-//! f32 exactly). Both sets must be exactly the expected names.
+//! `inv_freq` convention the stdlib's configuration tensors use. A scalar
+//! field (`int`, `float`, `str`, ...) is no tensor at all: it must not be
+//! saved, trained or changed. The OBSERVATIONS are `model_save` before and
+//! after training (struct fields, exact f32), the fixture's printed adapter
+//! tensors (`print` writes an f32 exactly) and its printed scalar fields.
+//! Each set must be exactly the expected names.
 //!
 //! The fixture trains three plain-SGD steps from a fixed seed, under the
 //! tape and under `--source-ad`. Each mode must move every element of every
 //! trainable tensor and leave every frozen and non-trainable tensor
 //! bit-identical; the two modes -- independent AD implementations -- must
-//! agree on the trained values.
+//! agree on the trained values. A fresh instance loaded from the trained
+//! file must then save exactly what the trained one did: `model_load` reads
+//! the fields `model_save` writes, Buffers included.
 //!
 //! Mutation-checked (2026-10-06); each of these fails the gate:
 //! - adapters left out of the parameter enumeration (#806's mechanism);
@@ -34,7 +38,11 @@
 //! - the `[Model; N]` walk skipping its last element;
 //! - the parameter list skipping direct sub-model fields;
 //! - `@freeze` made ineffective;
-//! - source AD's freeze filter reaching a frozen model's adapters.
+//! - source AD's freeze filter reaching a frozen model's adapters;
+//! - the parameter walk ignoring a field's declared kind for `Buffer<...>`
+//!   (2026-10-07: `buf` trains in both modes, the defect this gate used to
+//!   ratchet), or for scalars (an `int`'s value reaches the runtime as a
+//!   tensor handle and the run aborts).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -53,11 +61,11 @@ const SEED: &str = "7";
 /// Known defects the gate observes and tolerates, as a RATCHET: each listed
 /// tensor must still show its defect, so fixing one fails this gate until
 /// it is delisted. (path, what is wrong)
-const KNOWN_DEFECTS: &[(&str, &str)] = &[(
-    "buf",
-    "a `Buffer<...>` field is non-trainable per spec/02, but the parameter \
-     enumeration selects by leaf name only, so both AD modes train it",
-)];
+///
+/// Empty since the field-kind fix (2026-10-07) delisted `buf`: a
+/// `Buffer<...>` field trained in both AD modes, because the parameter walk
+/// chose by leaf name only. It must now stay bit-identical.
+const KNOWN_DEFECTS: &[(&str, &str)] = &[];
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap().to_path_buf()
@@ -87,6 +95,8 @@ enum Role {
 enum Field {
     Tensor,
     Buffer,
+    /// `int`, `float`, `bool`, `str`: no tensor.
+    Scalar,
     Model(String),
     Array(String, usize),
 }
@@ -105,6 +115,8 @@ struct Expected {
     fields: BTreeMap<String, Role>,
     /// Adapter side-table tensors (always trainable).
     adapters: BTreeSet<String>,
+    /// Scalar fields, by dotted path: never saved, never changed.
+    scalars: BTreeSet<String>,
 }
 
 fn join(prefix: &str, name: &str) -> String {
@@ -142,14 +154,13 @@ fn expected_from_declarations() -> Expected {
                 let field = match t {
                     Type::Tensor { .. } | Type::Param { .. } => Field::Tensor,
                     Type::Buffer { .. } => Field::Buffer,
+                    Type::Int | Type::Float | Type::Bool | Type::Str => Field::Scalar,
                     Type::Model { name, .. } => Field::Model(name_of(*name)),
                     Type::FixedModelArray { element_model, size } => {
                         Field::Array(name_of(*element_model), usize::try_from(*size).expect("array size"))
                     }
-                    // A method's type, or a scalar: not a parameter.
-                    Type::Function { .. } | Type::Int | Type::Float | Type::Bool | Type::Str => {
-                        return None;
-                    }
+                    // A method's type: not a field.
+                    Type::Function { .. } => return None,
                     other => panic!("{model}.{}: field type {other:?} -- teach the walk", name_of(*f)),
                 };
                 Some((name_of(*f), field))
@@ -185,13 +196,19 @@ fn expected_from_declarations() -> Expected {
         }
         models.insert(model, fields);
     }
-    // Walk the tree: every tensor leaf, with the model instances above it.
+    // Walk the tree: every tensor and scalar leaf, with the model instances
+    // above it.
     let mut leaves: Vec<(String, Field, Vec<Instance>)> = Vec::new();
     let mut instances: Vec<Instance> = Vec::new();
     walk(&models, &root, "", &mut vec![], &mut leaves, &mut instances);
 
     let mut fields = BTreeMap::new();
+    let mut scalars = BTreeSet::new();
     for (path, kind, chain) in leaves {
+        if matches!(kind, Field::Scalar) {
+            scalars.insert(path);
+            continue;
+        }
         let leaf = path.rsplit('.').next().unwrap();
         let role = if leaf.starts_with('_') || leaf == "inv_freq" {
             Role::Config
@@ -231,7 +248,7 @@ fn expected_from_declarations() -> Expected {
             }
         }
     }
-    Expected { fields, adapters }
+    Expected { fields, adapters, scalars }
 }
 
 fn walk(
@@ -250,7 +267,7 @@ fn walk(
     for (name, field) in fields {
         let here = join(path, name);
         match field {
-            Field::Tensor | Field::Buffer => leaves.push((here, field.clone(), chain.clone())),
+            Field::Tensor | Field::Buffer | Field::Scalar => leaves.push((here, field.clone(), chain.clone())),
             Field::Model(sub) => walk(models, sub, &here, chain, leaves, instances),
             Field::Array(elem, n) => {
                 for i in 0..*n {
@@ -315,10 +332,17 @@ fn glob(p: &[u8], t: &[u8]) -> bool {
 // The observations.
 // ---------------------------------------------------------------------------
 
-/// One training run: every observed tensor before and after.
+/// One training run: every observed tensor before and after, and every
+/// printed scalar field.
 struct Run {
     before: BTreeMap<String, Vec<f32>>,
     after: BTreeMap<String, Vec<f32>>,
+    scalars_before: BTreeMap<String, String>,
+    scalars_after: BTreeMap<String, String>,
+    /// The round trip: a fresh instance's `model_save`, and the same
+    /// instance's after `model_load` of the trained file.
+    fresh: BTreeMap<String, Vec<f32>>,
+    reloaded: BTreeMap<String, Vec<f32>>,
 }
 
 /// Train the fixture in one AD mode. A run that fails, or is not the AD it
@@ -359,31 +383,43 @@ fn train(source_ad: bool) -> Result<Run, String> {
     assert_eq!(snapshots.len(), 2, "{mode}: expected an adapter snapshot before and after training:\n{stdout}");
     let mut before = read_nslm(&tmp.path().join("init.nslm"));
     let mut after = read_nslm(&tmp.path().join("end.nslm"));
+    let fresh = read_nslm(&tmp.path().join("fresh.nslm"));
+    let reloaded = read_nslm(&tmp.path().join("reloaded.nslm"));
     for (map, snap) in [(&mut before, snapshots[0]), (&mut after, snapshots[1])] {
-        for (name, values) in adapter_snapshot(snap) {
+        for (name, line) in snapshot_pairs(snap, "ADAPTERS_END", "ADAPTER ") {
+            let values = parse_printed_tensor(line);
             assert!(map.insert(name.clone(), values).is_none(), "{mode}: {name} observed twice");
         }
     }
-    Ok(Run { before, after })
+    let scalar_sections: Vec<&str> = stdout.split("SCALARS_BEGIN").skip(1).collect();
+    assert_eq!(scalar_sections.len(), 2, "{mode}: expected a scalar snapshot before and after training:\n{stdout}");
+    let [scalars_before, scalars_after] = [scalar_sections[0], scalar_sections[1]].map(|section| {
+        let mut map = BTreeMap::new();
+        for (name, line) in snapshot_pairs(section, "SCALARS_END", "SCALAR ") {
+            assert!(map.insert(name.clone(), line.to_string()).is_none(), "{mode}: scalar {name} printed twice");
+        }
+        map
+    });
+    Ok(Run { before, after, scalars_before, scalars_after, fresh, reloaded })
 }
 
-/// The `ADAPTER <path>` / tensor line pairs of one snapshot, `*` replaced by
-/// how many times that path has been seen (the array index, in iteration
-/// order).
-fn adapter_snapshot(snap: &str) -> Vec<(String, Vec<f32>)> {
-    let body = snap.split_once("ADAPTERS_END").expect("ADAPTERS_END").0;
+/// The `<prefix><path>` / value line pairs of one snapshot section (up to
+/// `end`), `*` in a path replaced by how many times that path has been seen
+/// (the array index, in iteration order).
+fn snapshot_pairs<'a>(section: &'a str, end: &str, prefix: &str) -> Vec<(String, &'a str)> {
+    let body = section.split_once(end).unwrap_or_else(|| panic!("no {end}")).0;
     let lines: Vec<&str> = body.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
-    assert!(lines.len().is_multiple_of(2), "unpaired adapter snapshot lines:\n{body}");
+    assert!(lines.len().is_multiple_of(2), "unpaired snapshot lines before {end}:\n{body}");
     let mut seen: HashMap<&str, usize> = HashMap::new();
     lines
         .chunks(2)
         .map(|pair| {
             let pattern =
-                pair[0].strip_prefix("ADAPTER ").unwrap_or_else(|| panic!("not an ADAPTER line: {:?}", pair[0]));
+                pair[0].strip_prefix(prefix).unwrap_or_else(|| panic!("not a {prefix:?} line: {:?}", pair[0]));
             let k = seen.entry(pattern).or_default();
             let name = pattern.replace('*', &k.to_string());
             *k += 1;
-            (name, parse_printed_tensor(pair[1]))
+            (name, pair[1])
         })
         .collect()
 }
@@ -446,6 +482,11 @@ const COVERS: &[(&str, &str, Role)] = &[
     ("inv_freq", "an `inv_freq` table", Role::Config),
     ("buf", "a `Buffer<...>` field", Role::Buffer),
 ];
+const COVERS_SCALARS: &[(&str, &str)] = &[
+    ("blocks.1.steps", "an `int` field of the last [Blk; 2] element"),
+    ("inner.scale", "a `float` field of a nested sub-model"),
+    ("tag", "a `str` field (a pointer-sized slot, like a tensor's)"),
+];
 const COVERS_ADAPTERS: &[(&str, &str)] = &[
     ("blocks.1.lora_A_Blk_w__lora", "LoRA on the last [Blk; 2] element"),
     ("blocks.0.lora_B_Blk_w__lora", "LoRA B (starts at zero) on a [Blk; 2] element"),
@@ -463,6 +504,9 @@ fn every_parameter_trains_and_nothing_else_does() {
     }
     for (path, what) in COVERS_ADAPTERS {
         assert!(expected.adapters.contains(*path), "{FIXTURE} must cover {what} ({path})");
+    }
+    for (path, what) in COVERS_SCALARS {
+        assert!(expected.scalars.contains(*path), "{FIXTURE} must cover {what} ({path})");
     }
     let expected_names: BTreeSet<String> = expected.fields.keys().chain(&expected.adapters).cloned().collect();
 
@@ -482,7 +526,54 @@ fn every_parameter_trains_and_nothing_else_does() {
                 failures.push(format!("{mode}: {missing} is declared but never observed {when} training"));
             }
             for extra in names.difference(&expected_names) {
-                failures.push(format!("{mode}: {extra} is observed {when} training but not declared"));
+                if expected.scalars.contains(extra) {
+                    failures.push(format!("{mode}: scalar field {extra} was saved as a tensor {when} training"));
+                } else {
+                    failures.push(format!("{mode}: {extra} is observed {when} training but not declared"));
+                }
+            }
+        }
+        // Scalar fields: each printed before and after, and unchanged.
+        for (when, printed) in [("before", &run.scalars_before), ("after", &run.scalars_after)] {
+            let names: BTreeSet<String> = printed.keys().cloned().collect();
+            for missing in expected.scalars.difference(&names) {
+                failures.push(format!("{mode}: scalar field {missing} is declared but never printed {when} training"));
+            }
+            for extra in names.difference(&expected.scalars) {
+                failures.push(format!("{mode}: {extra} is printed as a scalar {when} training but not declared one"));
+            }
+        }
+        for name in &expected.scalars {
+            let (Some(v0), Some(v1)) = (run.scalars_before.get(name), run.scalars_after.get(name)) else {
+                continue;
+            };
+            report.push(format!("{mode:>9} {name:<30} Scalar    {v0} -> {v1}"));
+            if v0 != v1 {
+                failures.push(format!("{mode}: scalar field {name} changed in training: {v0} -> {v1}"));
+            }
+        }
+        // `model_load` restores exactly what `model_save` wrote (the two use
+        // one field list). Each Buffer must start out different in the fresh
+        // instance, or the round trip could not see a load that skips it.
+        let saved: BTreeMap<&String, &Vec<f32>> = run.after.iter().filter(|(n, _)| expected.fields.contains_key(*n)).collect();
+        let reloaded: BTreeMap<&String, &Vec<f32>> = run.reloaded.iter().collect();
+        if saved != reloaded {
+            let names = |m: &BTreeMap<&String, &Vec<f32>>| m.keys().map(|n| n.as_str()).collect::<Vec<_>>().join(", ");
+            let differ: Vec<&str> =
+                saved.iter().filter(|(n, v)| reloaded.get(*n) != Some(*v)).map(|(n, _)| n.as_str()).collect();
+            failures.push(format!(
+                "{mode}: model_load did not restore what model_save wrote: saved [{}], reloaded [{}], differing: {}",
+                names(&saved),
+                names(&reloaded),
+                differ.join(", ")
+            ));
+        }
+        for (name, role) in &expected.fields {
+            if *role == Role::Buffer && run.fresh.get(name) == run.after.get(name) {
+                failures.push(format!(
+                    "{mode}: Buffer {name} is the same in a fresh instance as in the trained one, so the \
+                     round trip cannot show model_load restores it (give it a random initializer)"
+                ));
             }
         }
         for name in &expected_names {

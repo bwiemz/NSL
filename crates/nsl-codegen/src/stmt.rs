@@ -11,7 +11,7 @@ use nsl_ast::stmt::{Stmt, StmtKind};
 use nsl_semantic::types::Type;
 
 use crate::compiler::Compiler;
-use crate::context::FuncState;
+use crate::context::{FieldKind, FuncState};
 use crate::error::CodegenError;
 
 use crate::types::{is_block_filled, nsl_type_to_cl};
@@ -206,16 +206,21 @@ pub(crate) struct TrainedModel {
     pub(crate) binding: Option<nsl_ast::NodeId>,
 }
 
+/// Sort a source-AD parameter leaf by the train block's own sets:
+/// `tensor_param_paths` is every tensor field of the model (parameters and
+/// non-trainable state), `trainable_tensor_param_paths` the ones the
+/// optimizer updates. A tensor outside the trainable set (`_`-prefixed,
+/// `inv_freq`, or a `Buffer<...>` field) is configuration; anything that is
+/// not a tensor field at all (`eps: float`) is non-tensor noise.
 pub(crate) fn classify_source_ad_param_name(
     param_name: &str,
     tensor_param_paths: &std::collections::HashSet<String>,
+    trainable_tensor_param_paths: &std::collections::HashSet<String>,
 ) -> SourceAdParamDiagnosticKind {
-    if tensor_param_paths.contains(param_name) {
-        if is_trainable_param_leaf_name(param_name) {
-            SourceAdParamDiagnosticKind::Trainable
-        } else {
-            SourceAdParamDiagnosticKind::IgnoredConfig
-        }
+    if trainable_tensor_param_paths.contains(param_name) {
+        SourceAdParamDiagnosticKind::Trainable
+    } else if tensor_param_paths.contains(param_name) {
+        SourceAdParamDiagnosticKind::IgnoredConfig
     } else {
         SourceAdParamDiagnosticKind::IgnoredNonTensor
     }
@@ -2575,7 +2580,39 @@ impl Compiler<'_> {
     ///      and `nsl_pipeline_destroy()`.
     ///
     pub(crate) fn is_trainable_param_name(&self, param_name: &str) -> bool {
-        is_trainable_param_leaf_name(param_name) && !self.is_frozen_param_path(param_name)
+        is_trainable_param_leaf_name(param_name)
+            && !self.is_buffer_param_path(param_name)
+            && !self.is_frozen_param_path(param_name)
+    }
+
+    /// Whether `path` (`m.blocks.0.buf`) names a `Buffer<...>` field of the
+    /// model the current train block trains: non-trainable state, whatever
+    /// its leaf name. The walk that builds the parameter list sees the field
+    /// kind directly; this is for the callers that only hold a source-AD
+    /// parameter name. Outside a train block there is no model to resolve
+    /// against, and nothing asks.
+    pub(crate) fn is_buffer_param_path(&self, path: &str) -> bool {
+        let Some(trained) = self.freeze_ctx.as_ref() else {
+            return false;
+        };
+        if path.split('.').next() != Some(trained.var.as_str()) {
+            return false;
+        }
+        self.model_field_kind(&trained.model, path) == Some(FieldKind::Buffer)
+    }
+
+    /// The declared kind of the field a parameter path ends at, walking from
+    /// `root_model` (the type of the path's first component). `None` when the
+    /// path does not end at a struct field (an adapter's side-table tensor,
+    /// or a path the layouts cannot resolve).
+    pub(crate) fn model_field_kind(
+        &self,
+        root_model: &str,
+        path: &str,
+    ) -> Option<FieldKind> {
+        let (owner, leaf) = self.resolve_param_owner(root_model, path)?;
+        let layout = self.types.struct_layouts.get(&owner)?;
+        layout.fields.iter().find(|f| f.name == leaf).map(|f| f.kind)
     }
 
     /// Refuse an `@freeze` pattern that matches no parameter it reaches (a
@@ -2602,6 +2639,7 @@ impl Compiler<'_> {
             .filter(|p| {
                 let leaf = p.rsplit('.').next().unwrap_or(p);
                 is_trainable_param_leaf_name(p)
+                    && !self.is_buffer_param_path(p)
                     && !crate::expr::access::is_synthesized_adapter_field_name(leaf)
             })
             .collect();
@@ -2827,9 +2865,17 @@ impl Compiler<'_> {
                 continue;
             }
 
-            if field.cl_type == cl_types::I64
-                && (include_nontrainable || self.is_trainable_param_name(&field_path))
-            {
+            // The declared kind decides, not the slot's `I64`: an `int` or
+            // `str` field is no tensor, and a `Buffer<...>` is state the
+            // optimizer must never see.
+            let wanted = match field.kind {
+                FieldKind::Tensor => {
+                    include_nontrainable || self.is_trainable_param_name(&field_path)
+                }
+                FieldKind::Buffer => include_nontrainable,
+                FieldKind::Nested | FieldKind::Scalar => false,
+            };
+            if wanted {
                 paths.push(field_path);
             }
         }
@@ -3324,36 +3370,39 @@ mod tests {
 
     #[test]
     fn source_ad_param_classification_separates_tensor_and_non_tensor_noise() {
+        // `m.blocks.0.pos_cache` stands for a `Buffer<...>` field: a tensor
+        // the walk reports, with a trainable-looking leaf name, that the
+        // trainable set leaves out by its declared kind.
         let tensor_paths: HashSet<String> = [
             "m.blocks.0.attn.wq".to_string(),
             "m.blocks.0.attn._dropout_p".to_string(),
             "m.blocks.0.attn.rope.inv_freq".to_string(),
+            "m.blocks.0.pos_cache".to_string(),
         ]
         .into_iter()
         .collect();
+        let trainable: HashSet<String> = tensor_paths
+            .iter()
+            .filter(|p| is_trainable_param_leaf_name(p) && p.as_str() != "m.blocks.0.pos_cache")
+            .cloned()
+            .collect();
 
         assert!(is_trainable_param_leaf_name("m.blocks.0.attn.wq"));
         assert!(!is_trainable_param_leaf_name("m.blocks.0.attn._dropout_p"));
         assert!(!is_trainable_param_leaf_name(
             "m.blocks.0.attn.rope.inv_freq"
         ));
+        assert!(is_trainable_param_leaf_name("m.blocks.0.pos_cache"));
 
+        let classify = |name: &str| classify_source_ad_param_name(name, &tensor_paths, &trainable);
+        assert_eq!(classify("m.blocks.0.attn.wq"), SourceAdParamDiagnosticKind::Trainable);
+        assert_eq!(classify("m.blocks.0.attn._dropout_p"), SourceAdParamDiagnosticKind::IgnoredConfig);
         assert_eq!(
-            classify_source_ad_param_name("m.blocks.0.attn.wq", &tensor_paths),
-            SourceAdParamDiagnosticKind::Trainable,
-        );
-        assert_eq!(
-            classify_source_ad_param_name("m.blocks.0.attn._dropout_p", &tensor_paths),
+            classify("m.blocks.0.attn.rope.inv_freq"),
             SourceAdParamDiagnosticKind::IgnoredConfig,
         );
-        assert_eq!(
-            classify_source_ad_param_name("m.blocks.0.attn.rope.inv_freq", &tensor_paths),
-            SourceAdParamDiagnosticKind::IgnoredConfig,
-        );
-        assert_eq!(
-            classify_source_ad_param_name("m.blocks.0.attn_norm.eps", &tensor_paths),
-            SourceAdParamDiagnosticKind::IgnoredNonTensor,
-        );
+        assert_eq!(classify("m.blocks.0.pos_cache"), SourceAdParamDiagnosticKind::IgnoredConfig);
+        assert_eq!(classify("m.blocks.0.attn_norm.eps"), SourceAdParamDiagnosticKind::IgnoredNonTensor);
     }
 
     // ── Task 2: adamw_from_train_block helper ───────────────────────────

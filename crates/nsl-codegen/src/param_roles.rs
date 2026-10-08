@@ -142,7 +142,7 @@ impl Compiler<'_> {
     /// walking `model_field_types` from the root model type. Numeric
     /// components consume one `[T; N]` fixed-array element hop. Returns
     /// None when the walk dead-ends (path format the type maps can't see).
-    fn resolve_param_owner(&self, root_type: &str, path: &str) -> Option<(String, String)> {
+    pub(crate) fn resolve_param_owner(&self, root_type: &str, path: &str) -> Option<(String, String)> {
         let comps: Vec<&str> = path.split('.').collect();
         if comps.len() < 2 {
             return None;

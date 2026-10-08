@@ -21,6 +21,31 @@ pub struct StructField {
     pub name: String,
     pub cl_type: cl_types::Type,
     pub offset: usize,
+    /// What the field holds, from its declared type.
+    pub kind: FieldKind,
+}
+
+/// What a model (or struct) field holds, decided from its DECLARED type when
+/// the layout is collected (`compiler/collection.rs`). `cl_type` cannot say:
+/// a tensor, a `Buffer`, a sub-model, a `str` and an `int` are all `I64`
+/// slots. Every walk over a model's tensors used to take `I64` to mean
+/// "tensor", so an `int` field's value reached the runtime as a tensor handle
+/// ("invalid tensor handle 0x3"), and a `Buffer` trained like a parameter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldKind {
+    /// `Tensor`, `Param<...>`, `Sparse<...>`, or a declaration that does not
+    /// pin the kind down (`_`, a union with a tensor member): a parameter. It
+    /// trains unless `_`-prefixed, `inv_freq`, or `@freeze`-frozen.
+    Tensor,
+    /// `Buffer<...>` (spec/02): non-trainable tensor state. `model_save` and
+    /// `model_load` carry it like a `_`-prefixed tensor; it is never in the
+    /// optimizer's parameter list, so neither AD mode trains it.
+    Buffer,
+    /// A sub-model, a struct or a `[Model; N]` array: the walks descend into
+    /// it through `model_field_types`.
+    Nested,
+    /// Not a tensor: `int`, `float`, `bool`, `str`, a list, a tuple, ...
+    Scalar,
 }
 
 /// Struct memory layout.

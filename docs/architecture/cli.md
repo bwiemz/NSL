@@ -291,10 +291,12 @@ markers. By filename suffix: 78 `*_gate.rs`, 18 `*_e2e.rs`, 7
   `run_pca_per_doc_gate.rs`.
 - **Training coverage** — `param_coverage_gate.rs`: every trainable tensor
   (struct fields from `model_save`, adapter side-table tensors as printed)
-  moves under SGD in both AD modes, and frozen or non-trainable ones stay
-  bit-identical. The expected set comes from the semantic analysis of the
-  fixture's declarations, not from the parameter-list enumeration. Per
-  feature: `lora_adapter_training_gate.rs`, `freeze_decorator_gate.rs`.
+  moves under SGD in both AD modes, and frozen or non-trainable ones
+  (`Buffer<...>` fields included) stay bit-identical. Scalar fields are
+  neither saved nor changed, and `model_load` restores what `model_save`
+  wrote. The expected set comes from the semantic analysis of the fixture's
+  declarations, not from the parameter-list enumeration. Per feature:
+  `lora_adapter_training_gate.rs`, `freeze_decorator_gate.rs`.
 - **Checkpoint and resume** — `train_checkpoint_gate.rs`,
   `train_config_resume_gate.rs`, `train_resume_dataloader_gate.rs`,
   `exec_fingerprint_resume_gate.rs`, `ccr_checkpoint_parity.rs`,
