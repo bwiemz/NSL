@@ -361,7 +361,9 @@ jobs:
   # driver, and the PTX gate only shells out to ptxas.
   cuda-feature:
     name: CUDA feature — compile + GPU-free tests
-    runs-on: ubuntu-latest
+    # ubuntu-latest is now 26.04, whose NVIDIA apt repo has no CUDA 13.2
+    # packages, so the toolkit install fails before any test runs.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
