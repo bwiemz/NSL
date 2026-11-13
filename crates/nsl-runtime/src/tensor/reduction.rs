@@ -70,13 +70,17 @@ pub extern "C" fn nsl_tensor_sum_dim(tensor_ptr: i64, dim: i64, keepdim: i64) ->
     let keepdim_bool = keepdim != 0;
 
     if dim == -1 {
-        // Global reduction
+        // Global reduction. f32 data is accumulated in f64: a running f32
+        // sum stops absorbing unit-sized terms at 2^24 (sum(ones([2e7])) was
+        // 16777216) and is already percent-level wrong on a few million
+        // ordinary values — sum(w*w) over a [49152, 512] embedding read 5.7%
+        // low.
         let total = if tensor.dtype == 1 {
-            let mut s = 0.0_f32;
+            let mut s = 0.0_f64;
             for i in 0..tensor.len as usize {
-                s += unsafe { *tensor.data_f32().add(i) };
+                s += unsafe { *tensor.data_f32().add(i) } as f64;
             }
-            s as f64
+            s
         } else {
             let mut s = 0.0_f64;
             for i in 0..tensor.len as usize {
@@ -123,7 +127,11 @@ pub extern "C" fn nsl_tensor_sum_dim(tensor_ptr: i64, dim: i64, keepdim: i64) ->
     let result = NslTensor::from_ptr(result_ptr);
     let out_strides = get_strides_vec(result);
 
-    // Iterate all elements of input, accumulate into output
+    // Iterate all elements of input, accumulate into output. f32 cells are
+    // accumulated in f64 and narrowed once at the end, for the reason the
+    // global arm gives: a long reduced dimension is the same running sum.
+    let mut acc_f32_as_f64: Vec<f64> =
+        if tensor.dtype == 1 { vec![0.0; result.len as usize] } else { Vec::new() };
     let total_in = tensor.len as usize;
     for flat_in in 0..total_in {
         // Decompose flat_in into multi-index using input strides
@@ -154,12 +162,14 @@ pub extern "C" fn nsl_tensor_sum_dim(tensor_ptr: i64, dim: i64, keepdim: i64) ->
         }
 
         if tensor.dtype == 1 {
-            let val = unsafe { *tensor.data_f32().add(flat_in) };
-            unsafe { *result.data_f32().add(out_flat) += val };
+            acc_f32_as_f64[out_flat] += unsafe { *tensor.data_f32().add(flat_in) } as f64;
         } else {
             let val = unsafe { *tensor.data_f64().add(flat_in) };
             unsafe { *result.data_f64().add(out_flat) += val };
         }
+    }
+    for (i, v) in acc_f32_as_f64.iter().enumerate() {
+        unsafe { *result.data_f32().add(i) = *v as f32 };
     }
 
     nsl_tensor_free(t_c);
@@ -244,12 +254,13 @@ pub extern "C" fn nsl_tensor_mean_dim(tensor_ptr: i64, dim: i64, keepdim: i64) -
             return create_scalar_tensor_dtype(0.0, tensor.dtype);
         }
         let num_elements = tensor.len;
+        // f64 accumulation for f32 data — see the global sum above.
         let total = if tensor.dtype == 1 {
-            let mut s = 0.0_f32;
+            let mut s = 0.0_f64;
             for i in 0..num_elements as usize {
-                s += unsafe { *tensor.data_f32().add(i) };
+                s += unsafe { *tensor.data_f32().add(i) } as f64;
             }
-            (s / num_elements as f32) as f64
+            s / num_elements as f64
         } else {
             let mut s = 0.0_f64;
             for i in 0..num_elements as usize {
@@ -330,21 +341,44 @@ pub extern "C" fn nsl_tensor_reduce_max(tensor_ptr: i64, dim: i64, keepdim: i64)
                 let input_shape = autodiff::tape_shape(tensor);
                 let c_ptr = super::nsl_tensor_contiguous(tensor_ptr);
                 let result = crate::cuda::gpu_max_dim_f32(c_ptr, d, keepdim_bool);
-                super::nsl_tensor_free(c_ptr);
-                // Note: argmax is not computed on GPU — autodiff backward for
-                // reduce_max on GPU tensors will use zeros (no gradient flows through max indices).
+                // The kernel returns the maxima only, and the backward needs
+                // WHERE they were. This used to record `vec![0; out_len]`, so
+                // the whole gradient of a GPU max went to index 0 of the
+                // reduced dim whatever the data: for `[[1, 5, 2]]` the
+                // gradient came back `[[1, 0, 0]]` where it is `[[0, 1, 0]]`.
+                // Recompute the argmax on a host copy — only when recording.
                 if autodiff::is_recording() {
-                    let ct = NslTensor::from_ptr(result);
-                    let out_len = ct.len as usize;
+                    let host_ptr = super::nsl_tensor_to_device(c_ptr, 0);
+                    let host = NslTensor::from_ptr(host_ptr);
+                    assert!(host.dtype == 1, "reduce_max: GPU tensors are f32 (got dtype {})", host.dtype);
+                    let dim_size = input_shape[d] as usize;
+                    let inner: usize = input_shape[d + 1..].iter().map(|&s| s as usize).product();
+                    let outer: usize = input_shape[..d].iter().map(|&s| s as usize).product();
+                    let mut saved_argmax = vec![0usize; outer * inner];
+                    for o in 0..outer {
+                        for k in 0..inner {
+                            // First maximum wins, as on the CPU arm (strict `>`).
+                            let mut best = f32::NEG_INFINITY;
+                            for j in 0..dim_size {
+                                let v = unsafe { *host.data_f32().add((o * dim_size + j) * inner + k) };
+                                if v > best {
+                                    best = v;
+                                    saved_argmax[o * inner + k] = j;
+                                }
+                            }
+                        }
+                    }
+                    super::nsl_tensor_free(host_ptr);
                     autodiff::maybe_record(autodiff::TapeOp::ReduceMax {
                         a: tensor_ptr,
                         out: result,
                         dim,
                         keepdim: keepdim_bool,
-                        saved_argmax: vec![0usize; out_len],
+                        saved_argmax,
                         input_shape,
                     });
                 }
+                super::nsl_tensor_free(c_ptr);
                 return result;
             }
             #[cfg(not(feature = "cuda"))]

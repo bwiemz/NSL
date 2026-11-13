@@ -291,6 +291,9 @@ pub(crate) enum Op {
     RedAddF32 { space: Space, addr: Addr, v: Src },
     /// `atom.<space>.add.f32 d, [addr], v`: `red`, and `d` = the old value.
     AtomAddF32 { space: Space, d: usize, addr: Addr, v: Src },
+    /// `atom.<space>.max.u32 d, [addr], v`: `*addr = max(*addr, v)` unsigned,
+    /// as one step of the thread, and `d` = the old value.
+    AtomMaxU32 { space: Space, d: usize, addr: Addr, v: Src },
     /// `mad.lo.<ty> d, a, b, c`: `a * b + c`, the low bits, at the width.
     MadLo { w: W, d: usize, a: Src, b: Src, c: Src },
     /// `mov.b32 d, {lo, hi}`: two 16-bit registers packed, `lo` in bits 0-15.
@@ -865,6 +868,11 @@ pub(crate) fn parse(ptx: &str) -> Program {
                 let space = if *space == "global" { Space::Global } else { Space::Shared };
                 Op::AtomAddF32 { space, d: p.dst(ops[0]), addr: p.addr(ops[1]), v: p.src(ops[2]) }
             }
+            ["atom", space @ ("global" | "shared"), "max", "u32"] => {
+                want(3);
+                let space = if *space == "global" { Space::Global } else { Space::Shared };
+                Op::AtomMaxU32 { space, d: p.dst(ops[0]), addr: p.addr(ops[1]), v: p.src(ops[2]) }
+            }
             ["shfl", "sync", "bfly", "b32"] => {
                 want(5);
                 Op::ShflBfly {
@@ -1395,6 +1403,17 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
                 let old = f32::from_le_bytes([mem[0], mem[1], mem[2], mem[3]]);
                 mem.copy_from_slice(&(old + add).to_le_bytes());
                 write(t, *d, fb(old));
+            }
+            Op::AtomMaxU32 { space, d, addr, v } => {
+                let at = rd(t, launch, addr.base).wrapping_add(addr.offset);
+                let new = rd(t, launch, *v) as u32;
+                let mem = match space {
+                    Space::Global => launch.global(at, 4),
+                    Space::Shared => launch.shared(at, 4),
+                };
+                let old = u32::from_le_bytes([mem[0], mem[1], mem[2], mem[3]]);
+                mem.copy_from_slice(&old.max(new).to_le_bytes());
+                write(t, *d, old as u64);
             }
             Op::MadLo { w, d, a, b, c } => {
                 let (a, b, c) = (rd(t, launch, *a), rd(t, launch, *b), rd(t, launch, *c));

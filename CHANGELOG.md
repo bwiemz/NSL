@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **`tools/refcheck`: NSL against PyTorch.** A PyTorch twin of `NSLCoder`
+  that loads an `.nslm`, and three checks built on it: per-parameter
+  gradients (`grad_check.py`), AdamW updates and the learning rate applied
+  per micro-batch (`optimizer_check.py`), and a reference training run
+  (`train_ref.py`). Each passes its trailing flags to `nsl run`, so a
+  recipe's flag set is checked as it is run. Every other training gate
+  compares NSL with NSL; this is what found the attention-gradient and
+  schedule defects listed under Fixed.
 - **A GPU checkpoint-resume gate** (`train_checkpoint_resume_gpu.rs`,
   roadmap item 4 audit). No gate had resumed a GPU training run before.
   The branch of `checkpoint_load` that copies the AdamW moments into device
@@ -1984,6 +1992,71 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **Pretraining did not learn at 500M and 1B: the attention backward
+  underflowed its gradients.** The flash-attention backward runs its
+  matmuls on f16 tensor-core operands and converted `dO` and `dS` to f16
+  unscaled. Gradients of realistic size (1e-6 to 1e-8) sit below f16's
+  normal range, so they kept a few bits or became zero.
+  - **Measured against PyTorch** on the same weights and batch
+    (`tools/refcheck`): at Coder-1B with the production flags the
+    query/key projection gradients were 80% wrong in the top block and
+    every other parameter 6-12% wrong in the lower blocks. After the fix:
+    0.2% and 0.1%.
+  - **Effect on training.** One epoch of an 8.2M-token corpus, same
+    initial weights and batch order, held-out loss (the corpus's unigram
+    entropy is 8.18):
+
+    | | before | after | PyTorch twin |
+    | --- | --- | --- | --- |
+    | Coder-500M, lr 3e-4 | 8.27 | 6.64 | 6.63 |
+    | Coder-1B, lr 1e-4 | 8.21 | 6.85 | not run |
+
+    Throughput is unchanged: 400 steps at Coder-50M took 46-51 s before
+    and 40-46 s after on a loaded machine.
+  - **The fix is exact.** The backward is linear in `dO`. Phase 1 records
+    `max|dO|` per (batch-head, q-tile); phase 2 scales that tile's `dO` and
+    `D` by a power of two before the f16 conversion and unscales its
+    dQ/dK/dV contributions.
+  - **Recipes.** The learning rates in `models/coder500m` and
+    `models/coder1b` were measured against the broken gradients and are
+    not re-derived here.
+- **The learning-rate schedule was applied one step late.** The scheduler
+  ran after the optimizer step, so `schedule(k)` was first used at step
+  `k + 1` and the first optimizer step of a run trained at the optimizer's
+  constructor rate: a warmup run took its first AdamW step at the peak
+  rate. Without accumulation the same happened on the first step after a
+  resume. The rate is now computed at the top of each micro-step.
+- **GPU elementwise ops skipped broadcasting for operands of equal length.**
+  `[3, 1] - [1, 3]` on GPU returned a `[3, 1]` tensor of three differences
+  where the CPU returns the 3x3 result. The broadcast path was keyed on
+  length; it is keyed on shape.
+- **Wrong gradients on the GPU tape path**, each silent:
+  - activation backward (relu, gelu, silu, sigmoid, tanh, clamp) read a
+    strided gradient or input in storage order;
+  - the GELU backward was the adjoint of the tanh form while the GPU
+    forward is the sigmoid form;
+  - `reduce_max` sent its whole gradient to index 0 of the reduced dim;
+  - `gather` along dim 0 scattered only the first gradient row;
+  - under `--deterministic`, `sum` / `mean` over a dim were not recorded,
+    so no gradient flowed through them.
+- **`t += e` on a tensor was compiled as integer arithmetic on the two
+  pointers**; the program exited 1 with no message. It is lowered as
+  `t = t + e` (likewise `-=`, `*=`, `/=`).
+- **Source AD computed the wrong thing without a diagnostic** in four
+  cases: a compound assignment was dropped from the graph;
+  `.transpose(i, j)` with dims in variables had zero gradient;
+  `softmax(x, d)` / `log_softmax(x, d)` with a non-literal `d` used the
+  last dim; `abs'(0)` was -1. The first is now differentiated, the second
+  and third decline to tape AD, and `abs'(0)` is 0.
+- **CPU `sum` and `mean` accumulated f32 data in f32.**
+  `sum(ones([20000000]))` returned 16777216. They accumulate in f64.
+- **Three CPU ops read strided views in storage order** (`lt_scalar`,
+  `multinomial`, the fused RMSNorm dx backward); `dropout(x, 1.0, true)`
+  returned NaN; `rand` could return exactly 1.0.
+- **The stdlib's generic layers were initialised at unit variance.**
+  `Linear`, `MLP`, `Attention`, `Embedding` and `PositionalEmbedding` used
+  a bare `randn`; four stacked `Linear(256, 256)` gave a mean square of
+  4.4e9. Weights are now `N(0, 1/fan_in)`, embeddings `N(0, 0.02^2)`.
 - **The source-AD fallback is documented as it behaves.**
   - **What the docs said.** README and SPECIFICATION said a failed source-AD
     extraction always falls back to tape AD.
@@ -3291,6 +3364,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- **Three requests that were silently not honoured are now compile
+  errors.**
+  - `DataLoader(...)` with an unknown keyword argument or a literal of the
+    wrong type. These used to fall back to the default: `seq_len = 2048.0`
+    trained at seq_len 128.
+  - `SGD(momentum | weight_decay | dampening | nesterov)` with
+    `grad_accumulation > 1`. The accumulated SGD step applies plain
+    `theta -= lr * mean(g)` and ignored all four.
+  - A named call argument that is not in its parameter's position, for
+    functions, model constructors and methods declared in the same module.
+    Calls bind by position, so `f(b = 1.0, a = 10.0)` ran as
+    `f(a = 1.0, b = 10.0)`.
 - **The checker refuses an op on tensors of two known dtypes** (C5 step 4b).
   `+ - * / // % **`, `@`, comparisons, `|`/`&` and tensor `+=`-style
   assignment on, say, an f32 and an f64 tensor are a compile error --

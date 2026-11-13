@@ -1130,7 +1130,14 @@ impl AdjointGenerator {
                 let pos_cond = self.emit_op(PrimalOp::Condition(CompareKind::Gt), vec![x, zero]);
                 let one = self.emit_constant(1.0);
                 let neg_one = self.emit_constant(-1.0);
-                let sign = self.emit_op(PrimalOp::Select, vec![pos_cond, one, neg_one]);
+                // sign(0) = 0, as the tape has it: a two-way select gave
+                // d|x|/dx = -1 at exactly zero, so an L1 penalty pushed every
+                // zero parameter up by lr * lambda per step.
+                let zero_again = self.emit_constant(0.0);
+                let neg_cond = self.emit_op(PrimalOp::Condition(CompareKind::Lt), vec![x, zero_again]);
+                let zero_val = self.emit_constant(0.0);
+                let neg_or_zero = self.emit_op(PrimalOp::Select, vec![neg_cond, neg_one, zero_val]);
+                let sign = self.emit_op(PrimalOp::Select, vec![pos_cond, one, neg_or_zero]);
                 self.emit_op(PrimalOp::Mul, vec![y_bar, sign])
             }
 
@@ -4131,15 +4138,47 @@ impl<'a> WengertExtractor<'a> {
 
             // Assignment: x = expr (rebind variable to new value)
             StmtKind::Assign { target, op, value } => {
-                if let nsl_ast::operator::AssignOp::Assign = op
-                    && let nsl_ast::expr::ExprKind::Ident(sym) = &target.kind
-                {
-                    if let Some(var) = self.extract_expr(value) {
-                        self.symbol_to_var.insert(*sym, var);
-                        return true;
-                    }
+                use nsl_ast::operator::AssignOp;
+                let nsl_ast::expr::ExprKind::Ident(sym) = &target.kind else {
+                    return true;
+                };
+                // `y op= e` is `y = y op e`. A compound assignment used to
+                // fall through to `true` here: the statement vanished from
+                // the forward graph AND the adjoint, so `y += sum(w * 10.0)`
+                // after `let y = sum(w * w)` reported a loss of 16 and a
+                // gradient of 2w where the program computes 96 and 2w + 10.
+                let primal = match op {
+                    AssignOp::Assign => None,
+                    AssignOp::AddAssign => Some(PrimalOp::Add),
+                    AssignOp::SubAssign => Some(PrimalOp::Sub),
+                    AssignOp::MulAssign => Some(PrimalOp::Mul),
+                    AssignOp::DivAssign => Some(PrimalOp::Div),
+                };
+                let Some(primal) = primal else {
+                    let Some(var) = self.extract_expr(value) else {
+                        return false;
+                    };
+                    self.symbol_to_var.insert(*sym, var);
+                    return true;
+                };
+                // A name the graph never bound (a host-side counter) is not
+                // part of the differentiated program; leave it to codegen.
+                let Some(&current) = self.symbol_to_var.get(sym) else {
+                    return true;
+                };
+                let Some(rhs) = self.extract_expr(value) else {
                     return false;
-                }
+                };
+                let result = self.alloc_var();
+                self.push_op(WengertOp {
+                    id: self.list.ops.len() as u32,
+                    result,
+                    op: primal,
+                    inputs: vec![current, rhs],
+                    saved_for_backward: false,
+                    checkpointed: false,
+                });
+                self.symbol_to_var.insert(*sym, result);
                 true
             }
 
@@ -4761,20 +4800,16 @@ impl<'a> WengertExtractor<'a> {
                                 return Some(result);
                             }
 
-                            let mut inputs = vec![obj];
-                            for arg in args {
-                                inputs.push(self.extract_expr(&arg.value)?);
-                            }
-                            let result = self.alloc_var();
-                            self.push_op(WengertOp {
-                                id: self.list.ops.len() as u32,
-                                result,
-                                op: PrimalOp::Passthrough(method_name),
-                                inputs,
-                                saved_for_backward: false,
-                                checkpointed: false,
-                            });
-                            return Some(result);
+                            // Dims that are not integer literals cannot be
+                            // baked into `PrimalOp::Transpose`. This used to
+                            // emit `Passthrough("transpose")`, which has no AD
+                            // rule: the forward was right and the gradient
+                            // through it was silently ZERO
+                            // (`x.transpose(i, j)` with `let i = 0`). Decline
+                            // the extraction instead, so the block runs on
+                            // tape AD, which reads the dims at run time.
+                            let _ = obj;
+                            return None;
                         }
                         "reshape" | "contiguous" | "item" | "expand" | "squeeze" | "unsqueeze" => {
                             let obj = self.extract_expr(object)?;
@@ -4933,37 +4968,47 @@ impl<'a> WengertExtractor<'a> {
                     "matmul" => PrimalOp::Matmul,
                     // Reductions — extract dim from second arg if present
                     "softmax" => {
-                        let dim = args
-                            .get(1)
-                            .and_then(|a| match &a.value.kind {
-                                ExprKind::IntLiteral(v) => Some(*v),
+                        // No dim argument means the last dim. A dim that is
+                        // present but not an integer literal is NOT the last
+                        // dim: it used to be taken as -1 here, so forward and
+                        // adjoint agreed with each other and both computed
+                        // the wrong function. Decline, as the reductions do.
+                        let dim = match args.get(1) {
+                            None => -1,
+                            Some(a) => match &a.value.kind {
+                                ExprKind::IntLiteral(v) => *v,
                                 ExprKind::UnaryOp {
                                     op: AstUnaryOp::Neg,
                                     operand,
                                 } => match &operand.kind {
-                                    ExprKind::IntLiteral(v) => Some(-*v),
-                                    _ => None,
+                                    ExprKind::IntLiteral(v) => -*v,
+                                    _ => return None,
                                 },
-                                _ => None,
-                            })
-                            .unwrap_or(-1);
+                                _ => return None,
+                            },
+                        };
                         PrimalOp::Softmax { dim }
                     }
                     "log_softmax" => {
-                        let dim = args
-                            .get(1)
-                            .and_then(|a| match &a.value.kind {
-                                ExprKind::IntLiteral(v) => Some(*v),
+                        // No dim argument means the last dim. A dim that is
+                        // present but not an integer literal is NOT the last
+                        // dim: it used to be taken as -1 here, so forward and
+                        // adjoint agreed with each other and both computed
+                        // the wrong function. Decline, as the reductions do.
+                        let dim = match args.get(1) {
+                            None => -1,
+                            Some(a) => match &a.value.kind {
+                                ExprKind::IntLiteral(v) => *v,
                                 ExprKind::UnaryOp {
                                     op: AstUnaryOp::Neg,
                                     operand,
                                 } => match &operand.kind {
-                                    ExprKind::IntLiteral(v) => Some(-*v),
-                                    _ => None,
+                                    ExprKind::IntLiteral(v) => -*v,
+                                    _ => return None,
                                 },
-                                _ => None,
-                            })
-                            .unwrap_or(-1);
+                                _ => return None,
+                            },
+                        };
                         PrimalOp::LogSoftmax { dim }
                     }
                     // Normalization. eps: a constant is baked into the op; a

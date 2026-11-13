@@ -308,10 +308,12 @@ fn run_route(r: &Route, tag2: &str, src: &str) -> (bool, String, String) {
 
 /// The freeze/control differential, per route. Same proof as the original
 /// tests: the control must LEARN (anti-vacuity), the freeze arm must stop
-/// byte-identically from `FREEZE_FROM` on and differ from the control.
-/// Index 2 is the one-micro-step lag: the optimizer step at micro k applies
-/// the schedule value computed after micro k-1, so the first update still
-/// runs at base lr in every route.
+/// byte-identically from index 2 on and differ from the control. Index 2 is
+/// a bound every route meets, not the exact freeze point: the schedule is
+/// base lr at step 0 and 0.0 from step 1, so a route that steps every
+/// micro-batch moves once (frozen from index 1) and one that accumulates
+/// never moves at all. `each_step_trains_at_its_own_scheduled_rate` pins
+/// the exact step each rate is applied at.
 fn assert_route_freeze_differential(r: &Route) {
     let (ok, ctl, ctl_err) = run_route(r, "control", &route_fixture(r, ""));
     assert!(ok, "[{}] unscheduled control failed:\n{ctl}\n{ctl_err}", r.tag);
@@ -591,10 +593,11 @@ fn assert_csla_freeze(tag: &str, envs: &[(&str, &str)]) {
     let l = losses(&out);
     assert_finite_losses(&format!("[csla {tag}] freeze"), &l);
     assert_eq!(l.len(), ctl_losses.len(), "[csla {tag}] arms must match in length");
-    // EPOCH ECHO. The schedule zeroes lr from micro-step 1 on, so after the
-    // first window's base-lr update the params never move again — epoch 2
-    // must replay epoch 1's per-batch losses BYTE-identically from index 2
-    // (the one-step lag) onward. The unscheduled control must NOT echo.
+    // EPOCH ECHO. The schedule zeroes lr from micro-step 1 on, and every
+    // window update is taken at a micro-step >= 1, so the params never move
+    // — epoch 2 must replay epoch 1's per-batch losses BYTE-identically
+    // (checked from index 2, the bound the route tests share). The
+    // unscheduled control must NOT echo.
     let per_epoch = l.len() / 2;
     assert!(per_epoch >= 6, "[csla {tag}] too few losses per epoch: {l:?}");
     for i in 2..per_epoch {
@@ -626,4 +629,98 @@ fn csla_multi_idx_route_applies_the_schedule() {
 #[test]
 fn csla_perparam_fallback_route_applies_the_schedule() {
     assert_csla_freeze("fallback", &[("NSL_FASE_MULTI_STEP", "0")]);
+}
+
+// ---------------------------------------------------------------------------
+// The step each rate is applied at
+// ---------------------------------------------------------------------------
+
+/// The optimizer update taken at micro-step `k` (0-based) must use
+/// `schedule(k)`.
+///
+/// It used `schedule(k - 1)`, and the constructor's rate at the first step:
+/// the scheduler ran AFTER the optimizer step, so each value it computed was
+/// consumed one step late. A `warmup_cosine` run therefore took its first
+/// AdamW step — the one where bias correction makes every parameter move by
+/// a full `lr` — at the peak rate the warmup exists to defer, then one step
+/// at 0.0, then the warmup. Measured on Coder-50M by fitting the applied
+/// rate per micro-batch against reference gradients (`warmup_steps = 8`,
+/// base 1e-3): `1.0e-3, 0, 1.25e-4, 2.5e-4, ...` where the schedule says
+/// `0, 1.25e-4, 2.5e-4, 3.75e-4, ...`. The freeze differentials above cannot
+/// see a one-step shift (they check "frozen from index 2"), which is how
+/// the lag came to be documented in this file as a property rather than
+/// fixed.
+///
+/// The fixture's input is constant, so the loss changes exactly when the
+/// weights do and each arm reads the applied rate off the loss stream:
+///
+///   * LATE WARMUP (`schedule(0) = 0`): the first update must not move the
+///     weights. The old lowering moved them at the full base rate.
+///   * ONE-STEP (`schedule(0) = base`, `schedule(k >= 1) = 0`), stepping
+///     every micro-batch: exactly ONE update moves the weights. The old
+///     lowering moved them twice (constructor rate, then `schedule(0)`).
+///   * ONE-STEP under `grad_accumulation = 2`: the first update is taken at
+///     micro-step 1, where the rate is already 0 — the weights never move.
+///     The old lowering applied `schedule(0)` there and moved them once.
+#[test]
+fn each_step_trains_at_its_own_scheduled_rate() {
+    const LATE_WARMUP: &str =
+        "    scheduler: warmup_cosine(warmup_steps = 1000000000, total_steps = 2000000000, min_lr = 0.0)\n";
+    let standard = Route {
+        tag: "applied_standard",
+        train_cfg: "epochs = 1",
+        optimizer: "AdamW(lr = 0.01)",
+        extra_flags: &[],
+        env: &[],
+        stderr_witness: None,
+        stderr_absent: None,
+    };
+    let accum = Route {
+        tag: "applied_accum2",
+        train_cfg: "epochs = 1, grad_accumulation = 2",
+        optimizer: "AdamW(lr = 0.01)",
+        extra_flags: &[],
+        env: &[],
+        stderr_witness: None,
+        stderr_absent: None,
+    };
+    let arm = |r: &Route, tag: &str, sched: &str| -> Vec<String> {
+        let (ok, out, err) = run_route(r, tag, &route_fixture(r, sched));
+        assert!(ok, "[{} {tag}] failed to run:\n{out}\n{err}", r.tag);
+        let l = losses(&out);
+        assert_finite_losses(&format!("[{} {tag}]", r.tag), &l);
+        assert!(l.len() >= 6, "[{} {tag}] too few losses to judge:\n{out}", r.tag);
+        l
+    };
+
+    // Anti-vacuity: without a schedule the fixture moves on every update, so
+    // "did not move" below is the schedule's doing.
+    let ctl = arm(&standard, "control", "");
+    assert!(
+        ctl[0] != ctl[1] && ctl[1] != ctl[2],
+        "the unscheduled control must move on its first two updates:\n{ctl:?}"
+    );
+
+    // LATE WARMUP: schedule(0) = 0, and schedule(1) = base * 1e-9 is far
+    // below one f32 ulp of these weights, so the first two updates are no-ops.
+    let late = arm(&standard, "late_warmup", LATE_WARMUP);
+    assert_eq!(
+        late[1], late[0],
+        "schedule(0) is 0.0 but the first update moved the weights — it ran          at the optimizer's constructor rate instead of the scheduled one:\n{late:?}"
+    );
+
+    // ONE-STEP, every micro-batch: update 0 at base lr, every later one at 0.
+    let one = arm(&standard, "one_step", FREEZE);
+    assert_ne!(one[1], one[0], "schedule(0) is the base rate — the first update must move:\n{one:?}");
+    assert!(
+        one[1..].iter().all(|v| v == &one[1]),
+        "schedule(k >= 1) is 0.0 but a later update moved the weights — the          rate is being applied one step late:\n{one:?}"
+    );
+
+    // ONE-STEP under accumulation: the first update is at micro-step 1.
+    let acc = arm(&accum, "one_step", FREEZE);
+    assert!(
+        acc.iter().all(|v| v == &acc[0]),
+        "every accumulated update is taken at a micro-step >= 1, where the          rate is 0.0, yet the weights moved — the window applied          schedule(k - 1):\n{acc:?}"
+    );
 }

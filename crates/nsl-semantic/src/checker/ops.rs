@@ -310,11 +310,60 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// Arguments are bound by POSITION: codegen ignores an argument's name.
+    /// `f(b = 1.0, a = 10.0)` therefore ran as `f(a = 1.0, b = 10.0)`, with
+    /// no diagnostic, for functions, methods and model constructors alike.
+    /// Until calls bind by name, a named argument must sit in the position
+    /// of the parameter it names; anything else is refused here, where the
+    /// declaration's parameter names are known: a function or model declared
+    /// in this module, or a method called on a value whose type is a model
+    /// declared in this module. Every other call (imported callables,
+    /// builtins, receivers of unknown type) is left alone — its parameter
+    /// names are not visible here.
+    fn check_named_argument_order(&mut self, callee: &Expr, args: &[Arg]) {
+        if args.iter().all(|a| a.name.is_none()) {
+            return;
+        }
+        let key = match &callee.kind {
+            ExprKind::Ident(sym) => (None, *sym),
+            ExprKind::MemberAccess { object, member } => match self.type_map.get(&object.id) {
+                Some(Type::Model { name, .. }) => (Some(*name), *member),
+                _ => return,
+            },
+            _ => return,
+        };
+        let Some(names) = self.call_param_names.get(&key).cloned() else {
+            return;
+        };
+        let Some((index, arg)) =
+            args.iter().enumerate().find(|(i, a)| a.name.is_some_and(|n| names.get(*i) != Some(&n)))
+        else {
+            return;
+        };
+        let given = self.resolve_name(arg.name.expect("found by is_some_and"));
+        let binds = match names.get(index) {
+            Some(n) => format!("parameter `{}`", self.resolve_name(*n)),
+            None => "no parameter".to_string(),
+        };
+        let callable = self.resolve_name(key.1);
+        self.diagnostics.push(
+            Diagnostic::error(format!(
+                "argument `{given}` of `{callable}` is passed in position {}, which binds {binds}",
+                index + 1
+            ))
+            .with_label(
+                arg.span,
+                "arguments are bound by position, not by name: pass them in declaration order",
+            ),
+        );
+    }
+
     pub(crate) fn check_call(&mut self, callee: &Expr, args: &[Arg], span: Span) -> Type {
         let callee_ty = self.check_expr(callee);
 
         // Check each argument
         let arg_types: Vec<Type> = args.iter().map(|a| self.check_expr(&a.value)).collect();
+        self.check_named_argument_order(callee, args);
 
         // C5 step 5: moving a tensor, or a model holding one, to a device
         // that cannot hold its dtype is a compile error, not the runtime

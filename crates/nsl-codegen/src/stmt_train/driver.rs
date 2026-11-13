@@ -880,6 +880,14 @@ impl Compiler<'_> {
             self.compile_call_by_name(builder, "nsl_debug_gpu_mem", &[step_val])?;
         }
 
+        // ── 7a2. This micro-step's learning rate ─────────────────────
+        // Before the forward, so every consumer of `lr_var` in this step —
+        // the optimizer step at 7f, the CSLA window schedule that updates
+        // parameters inside the backward, the first step after a resume —
+        // reads `schedule(step)` for the step it is taking. See
+        // `stmt_train/scheduler_step.rs`.
+        self.emit_scheduler_lr(builder, SchedulerStepInputs { plan: &plan, emit: &emit })?;
+
         // ── 7b. Forward pass + backward pass ─────────────────────────
         // When source AD is enabled, attempt compile-time backward graph
         // generation. If extraction fails (dynamic control flow), fall back
@@ -2453,9 +2461,9 @@ impl Compiler<'_> {
             },
         )?;
 
-        // 7g2–7h. Scheduler, step-count increment and the periodic
-        // full-train-state checkpoint.
-        // Moved to `stmt_train/scheduler_step.rs` byte-for-byte (roadmap A1).
+        // 7h. Step-count increment and the periodic full-train-state
+        // checkpoint (`stmt_train/scheduler_step.rs`; the scheduler call
+        // itself is at 7a2, before the forward).
         self.emit_scheduler_step(
             builder,
             state,

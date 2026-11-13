@@ -255,6 +255,15 @@ pub extern "C" fn nsl_tensor_multinomial(tensor_ptr: i64, num_samples: i64) -> i
             nsl_tensor_multinomial(cpu, num_samples)
         });
     }
+    // The loops below index storage linearly; a strided view (the result of
+    // `transpose` / `expand` / `slice`) has to be materialized first, or the
+    // elements read are not the ones the shape names.
+    if !tensor.is_contiguous() {
+        let row_major = crate::tensor::nsl_tensor_contiguous(tensor_ptr);
+        let out = nsl_tensor_multinomial(row_major, num_samples);
+        crate::tensor::nsl_tensor_free(row_major);
+        return out;
+    }
     let shape = get_shape_vec(tensor);
     let in_dtype = tensor.dtype;
     let ndim = shape.len();
@@ -512,6 +521,15 @@ pub extern "C" fn nsl_tensor_lt_scalar(tensor_ptr: i64, scalar: f64) -> i64 {
             scalar
         };
         return redirect_gpu_input_to_host(tensor_ptr, |cpu| nsl_tensor_lt_scalar(cpu, s));
+    }
+    // The loops below index storage linearly; a strided view (the result of
+    // `transpose` / `expand` / `slice`) has to be materialized first, or the
+    // elements read are not the ones the shape names.
+    if !tensor.is_contiguous() {
+        let row_major = crate::tensor::nsl_tensor_contiguous(tensor_ptr);
+        let out = nsl_tensor_lt_scalar(row_major, scalar);
+        crate::tensor::nsl_tensor_free(row_major);
+        return out;
     }
     let shape = get_shape_vec(tensor);
     let in_dtype = tensor.dtype;

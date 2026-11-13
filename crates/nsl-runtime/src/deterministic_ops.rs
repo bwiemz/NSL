@@ -123,7 +123,22 @@ pub extern "C" fn nsl_tensor_reduce_sum_deterministic(input: i64, dim: i64, keep
                 // Per-dim deterministic sum: one thread per output, sequential inner loop
                 crate::cuda::gpu_det_sum_dim_f32(c_ptr, d, keepdim_bool)
             };
-            if c_ptr != input { crate::tensor::nsl_tensor_free(c_ptr); }
+            // `nsl_tensor_contiguous` returns an owned ref even when it hands
+            // back the same pointer, so the free is unconditional.
+            crate::tensor::nsl_tensor_free(c_ptr);
+            // The same tape record `nsl_tensor_sum_dim` writes. Without it the
+            // deterministic arm was invisible to tape AD: under
+            // `--deterministic` no gradient flowed through `sum(x, dim, ..)`
+            // on GPU.
+            if crate::autodiff::is_recording() {
+                crate::autodiff::maybe_record(crate::autodiff::TapeOp::SumReduce {
+                    a: input,
+                    out: result,
+                    dim,
+                    keepdim: keepdim_bool,
+                    input_shape: crate::autodiff::tape_shape(tensor),
+                });
+            }
             return result;
         }
         #[cfg(not(feature = "cuda"))]
@@ -161,12 +176,19 @@ pub extern "C" fn nsl_tensor_reduce_mean_deterministic(input: i64, dim: i64, kee
                 // Global deterministic mean: det_sum / total_elements
                 let num_elements = tensor.len;
                 let sum_ptr = crate::cuda::gpu_det_global_sum_f32(c_ptr);
-                if c_ptr != input { crate::tensor::nsl_tensor_free(c_ptr); }
+                crate::tensor::nsl_tensor_free(c_ptr);
                 let inv = 1.0_f32 / num_elements as f32;
                 crate::cuda::gpu_scalar_op_inplace(
                     sum_ptr, inv,
                     crate::cuda::kernels::mul_scalar_f32_ptx(), "nsl_mul_scalar_f32\0",
                 );
+                // The tape records `nsl_tensor_mean_dim` writes (see the sum above).
+                if crate::autodiff::is_recording() {
+                    crate::autodiff::maybe_record(crate::autodiff::TapeOp::MeanReduce {
+                        a: input, out: sum_ptr, dim: -1, keepdim: false,
+                        num_elements, input_shape: crate::autodiff::tape_shape(tensor),
+                    });
+                }
                 return sum_ptr;
             }
 
@@ -175,12 +197,18 @@ pub extern "C" fn nsl_tensor_reduce_mean_deterministic(input: i64, dim: i64, kee
             let shape_slice = unsafe { std::slice::from_raw_parts(tensor.shape, ndim) };
             let dim_size = shape_slice[d];
             let sum_ptr = crate::cuda::gpu_det_sum_dim_f32(c_ptr, d, keepdim_bool);
-            if c_ptr != input { crate::tensor::nsl_tensor_free(c_ptr); }
+            crate::tensor::nsl_tensor_free(c_ptr);
             let inv = 1.0_f32 / dim_size as f32;
             crate::cuda::gpu_scalar_op_inplace(
                 sum_ptr, inv,
                 crate::cuda::kernels::mul_scalar_f32_ptx(), "nsl_mul_scalar_f32\0",
             );
+            if crate::autodiff::is_recording() {
+                crate::autodiff::maybe_record(crate::autodiff::TapeOp::MeanReduce {
+                    a: input, out: sum_ptr, dim, keepdim: keepdim_bool,
+                    num_elements: dim_size, input_shape: crate::autodiff::tape_shape(tensor),
+                });
+            }
             return sum_ptr;
         }
         #[cfg(not(feature = "cuda"))]

@@ -171,6 +171,98 @@ fn backward_uses_mma(config: &FlashAttentionBackwardConfig) -> bool {
         && config.head_dim % MMA_K as i64 == 0
 }
 
+/// Biased-exponent target for the backward's gradient prescale.
+///
+/// The MMA backward feeds `dO` and `dS` to `mma.sync ... f16.f16` as f16
+/// operands. A gradient is not an activation: its magnitude is set by the
+/// loss normalisation and the depth, and in a real pretraining step `dO`
+/// elements sit around 1e-6..1e-8 — below f16's smallest NORMAL (6.1e-5) and
+/// largely below its smallest subnormal (6.0e-8). Rounded to f16 as they
+/// are, they keep a handful of mantissa bits or flush to zero, and `dS`
+/// (`P * (dP - D)`, smaller again by the attention weight) is worse. Measured
+/// against an f64 reference at Coder-1B, batch 1 x seq 2048: dQ/dK lost half
+/// their norm in the top block (cosine 0.63), and the error that left behind
+/// in the residual stream put 6-12% on every other parameter's gradient.
+///
+/// The backward is LINEAR in `dO`, so the fix is exact: phase 1 records each
+/// (batch-head, q-tile)'s `max|dO|`, and phase 2 multiplies that tile's `dO`
+/// and `D` by the power of two `gs` that puts the maximum in
+/// `[2^BWD_GRAD_SCALE_EXP, 2^(BWD_GRAD_SCALE_EXP+1))` before any f16
+/// conversion, then multiplies the tile's dQ / dK / dV contributions by
+/// `1/gs` as they leave the f32 accumulators. A power-of-two multiply only
+/// moves the exponent, so nothing is rounded by the scaling itself; what
+/// remains is f16's 11-bit significand on each operand, the same operand
+/// precision the forward has always had.
+///
+/// 2^6: the largest `dO` element of a tile becomes 64..128, leaving 20
+/// binades of normal f16 range below it for the tile's smaller elements and
+/// for `dS`, and 9 above it before `dS` could reach f16's maximum (it is
+/// clamped there rather than left to become infinity — see
+/// `emit_bwd_clamp_ds`).
+pub const BWD_GRAD_SCALE_EXP: u32 = 6;
+
+/// Smallest biased f32 exponent the prescale derives a scale from. Keeps both
+/// `gs = 2^(127 + BWD_GRAD_SCALE_EXP - (e - 127))` and its reciprocal NORMAL
+/// f32 values (a subnormal reciprocal would round the unscale). A tile whose
+/// maximum is below 2^(MIN-127) — including an all-zero tile — is scaled as
+/// if its maximum were exactly that.
+const BWD_GRAD_EXP_MIN: u32 = BWD_GRAD_SCALE_EXP + 1;
+
+/// Largest biased exponent of a finite f32. An infinite tile maximum (biased
+/// exponent 255) is clamped to it so the derived scale stays a valid float;
+/// the infinity itself still propagates to the outputs.
+const BWD_GRAD_EXP_MAX: u32 = 254;
+
+/// Derive this q-tile's gradient prescale from the phase-1 `max|dO|` word.
+///
+/// Reads `gmax[(bh_seq_offset + q_start) / block_q]` — `seq_len` is a
+/// multiple of `block_q` (the launcher refuses ragged shapes), so that is
+/// `bh * num_q_tiles + i_block` — and leaves, on every thread:
+///   * `%bwd_gs`     the power-of-two scale applied to `dO` and `D`;
+///   * `%bwd_ginv`   its exact reciprocal, applied to the dV contribution;
+///   * `%bwd_kscale` `%scale * %bwd_ginv`, applied to the dQ / dK contributions
+///     (which the unscaled kernel multiplied by `%scale` alone).
+fn emit_bwd_load_grad_scale(ptx: &mut String, config: &FlashAttentionBackwardConfig) {
+    ptx.push_str("    // === Gradient prescale for this q-tile (see BWD_GRAD_SCALE_EXP) ===\n");
+    ptx.push_str("    add.u64 %rd_gidx, %rd16, %rd25;  // bh_seq_offset + q_start\n");
+    ptx.push_str(&format!(
+        "    div.u64 %rd_gidx, %rd_gidx, {};  // / block_q = bh*num_q_tiles + i_block\n",
+        config.block_q
+    ));
+    ptx.push_str("    shl.b64 %rd_gidx, %rd_gidx, 2;\n");
+    ptx.push_str("    add.u64 %rd_gidx, %rd_gmax, %rd_gidx;\n");
+    ptx.push_str("    ld.global.u32 %r_gexp, [%rd_gidx];  // bits of max|dO| over the tile\n");
+    ptx.push_str("    shr.u32 %r_gexp, %r_gexp, 23;      // biased exponent (sign bit is 0)\n");
+    ptx.push_str(&format!("    max.u32 %r_gexp, %r_gexp, {BWD_GRAD_EXP_MIN};\n"));
+    ptx.push_str(&format!("    min.u32 %r_gexp, %r_gexp, {BWD_GRAD_EXP_MAX};\n"));
+    ptx.push_str(&format!(
+        "    sub.u32 %r_gbits, {}, %r_gexp;     // 127 + target - (e - 127)\n",
+        254 + BWD_GRAD_SCALE_EXP
+    ));
+    ptx.push_str("    shl.b32 %r_gbits, %r_gbits, 23;\n");
+    ptx.push_str("    mov.b32 %bwd_gs, %r_gbits;         // gs = 2^(target - (e - 127))\n");
+    ptx.push_str(&format!(
+        "    sub.u32 %r_gbits, %r_gexp, {BWD_GRAD_SCALE_EXP};\n"
+    ));
+    ptx.push_str("    shl.b32 %r_gbits, %r_gbits, 23;\n");
+    ptx.push_str("    mov.b32 %bwd_ginv, %r_gbits;       // 1/gs, exact\n");
+    ptx.push_str("    mul.f32 %bwd_kscale, %scale, %bwd_ginv;\n\n");
+}
+
+/// Saturate `%f_ds` at f16's largest finite magnitude before it is stored for
+/// the dQ / dK MMAs. `dS` is bounded by `|dO_row| * |V_row|` in the prescaled
+/// units, which a pathological tile (a value vector hundreds of times its
+/// usual norm, aligned with a gradient row that is all maximum) could push
+/// past 65504; `cvt.rn.f16.f32` would turn that into infinity and the whole
+/// step's gradient into NaN, where saturating costs one element its tail.
+/// Ordered compares, so a NaN `dS` stays NaN and is still visible downstream.
+fn emit_bwd_clamp_ds(ptx: &mut String) {
+    ptx.push_str("    setp.gt.f32 %p_gclamp, %f_ds, 0f477FE000;  // > 65504 (f16 max)\n");
+    ptx.push_str("    @%p_gclamp mov.f32 %f_ds, 0f477FE000;\n");
+    ptx.push_str("    setp.lt.f32 %p_gclamp, %f_ds, 0fC77FE000;  // < -65504\n");
+    ptx.push_str("    @%p_gclamp mov.f32 %f_ds, 0fC77FE000;\n");
+}
+
 /// Compile-time kill switch for the multi-warp backward launch
 /// (`NSL_FA_BWD_MULTIWARP=0` -> single-warp emission, DEFAULT ON). Mirrors
 /// the `NSL_FA_FWD_MMA` pattern: bit-for-bit A/B needs per-arm builds.
@@ -3694,14 +3786,15 @@ fn emit_flash_attention_bwd_d(ptx: &mut String, config: &FlashAttentionBackwardC
     ptx.push_str("    .param .u64 out_ptr,\n");
     ptx.push_str("    .param .u64 d_ptr,\n");
     ptx.push_str("    .param .u64 seq_len,\n");
-    ptx.push_str("    .param .u64 head_dim\n");
+    ptx.push_str("    .param .u64 head_dim,\n");
+    ptx.push_str("    .param .u64 gmax_ptr\n");
     ptx.push_str(")\n");
     ptx.push_str("{\n");
 
     // Register declarations
     ptx.push_str("    .reg .u32 %r<10>;\n");
     ptx.push_str("    .reg .u64 %rd<20>;\n");
-    ptx.push_str("    .reg .f32 %f<4>;\n");
+    ptx.push_str("    .reg .f32 %f<6>;\n");
     ptx.push_str("    .reg .pred %p<3>;\n\n");
 
     // Load parameters
@@ -3745,6 +3838,7 @@ fn emit_flash_attention_bwd_d(ptx: &mut String, config: &FlashAttentionBackwardC
     // Dot product loop: sum = sum_d(dO[base+d] * O[base+d])
     ptx.push_str("    // Dot product across head_dim\n");
     ptx.push_str("    mov.f32 %f1, 0f00000000;\n");        // sum = 0.0
+    ptx.push_str("    mov.f32 %f4, 0f00000000;\n");        // row max|dO| = 0.0
     ptx.push_str("    mov.u64 %rd11, 0;\n");               // d = 0
     ptx.push_str(&format!("{}_LOOP:\n", kernel_name));
     ptx.push_str("    setp.ge.u64 %p2, %rd11, %rd5;\n");
@@ -3755,6 +3849,8 @@ fn emit_flash_attention_bwd_d(ptx: &mut String, config: &FlashAttentionBackwardC
     ptx.push_str("    ld.global.f32 %f2, [%rd13];\n");
     ptx.push_str("    ld.global.f32 %f3, [%rd14];\n");
     ptx.push_str("    fma.rn.f32 %f1, %f2, %f3, %f1;\n"); // sum += dout * out
+    ptx.push_str("    abs.f32 %f5, %f2;\n");
+    ptx.push_str("    max.f32 %f4, %f4, %f5;\n");          // a NaN operand is ignored
     ptx.push_str("    add.u64 %rd11, %rd11, 1;\n");
     ptx.push_str(&format!("    bra {}_LOOP;\n\n", kernel_name));
 
@@ -3766,6 +3862,22 @@ fn emit_flash_attention_bwd_d(ptx: &mut String, config: &FlashAttentionBackwardC
     ptx.push_str("    shl.b64 %rd15, %rd15, 2;\n");        // * 4
     ptx.push_str("    add.u64 %rd15, %rd3, %rd15;\n");
     ptx.push_str("    st.global.f32 [%rd15], %f1;\n\n");
+
+    // gmax[bh * num_q_tiles + q_tile] = max(.., row max|dO|). The bit pattern
+    // of a non-negative float orders like the float, so an unsigned atomic max
+    // over the bits is the float max; the launcher zeroes the buffer. Phase 2
+    // turns each word into that tile's power-of-two gradient prescale
+    // (BWD_GRAD_SCALE_EXP).
+    ptx.push_str("    // gmax[bh * nctaid.y + ctaid.y] = max(.., max_d |dO|)\n");
+    ptx.push_str("    ld.param.u64 %rd16, [gmax_ptr];\n");
+    ptx.push_str("    mov.u32 %r6, %nctaid.y;\n");
+    ptx.push_str("    mul.lo.u32 %r7, %r1, %r6;\n");      // bh * num_q_tiles
+    ptx.push_str("    add.u32 %r7, %r7, %r2;\n");         // + q_tile
+    ptx.push_str("    cvt.u64.u32 %rd17, %r7;\n");
+    ptx.push_str("    shl.b64 %rd17, %rd17, 2;\n");
+    ptx.push_str("    add.u64 %rd17, %rd16, %rd17;\n");
+    ptx.push_str("    mov.b32 %r8, %f4;\n");
+    ptx.push_str("    atom.global.max.u32 %r9, [%rd17], %r8;\n\n");
 
     ptx.push_str(&format!("{}_DONE:\n", kernel_name));
     ptx.push_str("    ret;\n");
@@ -3840,17 +3952,22 @@ fn emit_flash_attention_bwd_main(
         // the plain param list never carried.
         ptx.push_str("    .param .u64 param_head_dim,\n");
         ptx.push_str("    .param .u64 param_segment_ids,\n");
-        ptx.push_str("    .param .u64 param_heads\n");
+        ptx.push_str("    .param .u64 param_heads,\n");
     } else if gqa {
         // P4: grouped entry appends the head counts at the END (same
         // stay-byte-identical rule as the segmask params above). Runtime
         // values so the per-head_dim variant table needs no per-ratio rows.
         ptx.push_str("    .param .u64 param_head_dim,\n");
         ptx.push_str("    .param .u64 param_heads,\n");
-        ptx.push_str("    .param .u64 param_kv_heads\n");
+        ptx.push_str("    .param .u64 param_kv_heads,\n");
     } else {
-        ptx.push_str("    .param .u64 param_head_dim\n");
+        ptx.push_str("    .param .u64 param_head_dim,\n");
     }
+    // Per-(batch-head, q-tile) max|dO| words written by phase 1, LAST in every
+    // variant's list. The scalar body does not read it (it has no f16
+    // operands); it is declared there too because the launcher cannot tell
+    // which body it was handed.
+    ptx.push_str("    .param .u64 param_gmax\n");
     ptx.push_str(")\n");
     ptx.push_str("{\n");
 
@@ -3975,6 +4092,12 @@ fn emit_bwd_main_registers(ptx: &mut String, config: &FlashAttentionBackwardConf
     // tile's global base).
     ptx.push_str("    .reg .u64 %rd_cp<6>;\n");
     ptx.push_str("    .reg .f32 %f_cp;\n");
+    // Gradient prescale (emit_bwd_load_grad_scale): the phase-1 max|dO|
+    // buffer, the index/exponent scratch, and the per-q-tile scale triple.
+    ptx.push_str("    .reg .u64 %rd_gmax, %rd_gidx;\n");
+    ptx.push_str("    .reg .u32 %r_gexp, %r_gbits;\n");
+    ptx.push_str("    .reg .f32 %bwd_gs, %bwd_ginv, %bwd_kscale;\n");
+    ptx.push_str("    .reg .pred %p_gclamp;\n");
     // SMEM addressing prolog — the emit_smem_store / emit_smem_load / emit_smem_atom
     // helpers (used throughout both the scalar and MMA q-tile loops) address shared
     // memory as `add.s64 %smem_addr, %shmem_base, <offset>` + `st/ld/atom.shared
@@ -4001,7 +4124,8 @@ fn emit_bwd_main_param_loads(ptx: &mut String, config: &FlashAttentionBackwardCo
     ptx.push_str("    ld.param.u64 %rd8, [param_lse];\n");
     ptx.push_str("    ld.param.f32 %scale, [param_scale];\n");
     ptx.push_str("    ld.param.u64 %rd9, [param_seq_len];\n");
-    ptx.push_str("    ld.param.u64 %rd10, [param_head_dim];\n\n");
+    ptx.push_str("    ld.param.u64 %rd10, [param_head_dim];\n");
+    ptx.push_str("    ld.param.u64 %rd_gmax, [param_gmax];\n\n");
     if config.segment_masked {
         // PCA Stage C: base pointer of the [B, S] u16 segment-id buffer and
         // the head count (to recover batch_idx from the fused bh block index).
@@ -4150,7 +4274,11 @@ fn emit_bwd_coalesced_tile_copy(
     global_base_reg: &str,
     smem_byte_off: i64,
     to_smem: bool,
+    // Multiply each element by this f32 register on its way into SMEM (the
+    // gradient prescale of the dO tile); `None` copies verbatim.
+    scale_reg: Option<&str>,
 ) {
+    assert!(scale_reg.is_none() || to_smem, "a scaled copy is a load into SMEM");
     let hd_bytes = head_dim * 4;
     let hdp_bytes = hd_padded * 4;
     if nthreads % 32 != 0 {
@@ -4175,7 +4303,7 @@ fn emit_bwd_coalesced_tile_copy(
         ptx.push_str(&format!("{label}_C:\n"));
         ptx.push_str(&format!("    setp.ge.u64 %p2, %rd_cp4, {hd_bytes};\n"));
         ptx.push_str(&format!("    @%p2 bra {label}_C_DONE;\n"));
-        emit_bwd_tile_copy_element(ptx, to_smem);
+        emit_bwd_tile_copy_element(ptx, to_smem, scale_reg);
         ptx.push_str("    add.u64 %rd_cp4, %rd_cp4, 4;\n");
         ptx.push_str(&format!("    bra {label}_C;\n"));
         ptx.push_str(&format!("{label}_C_DONE:\n"));
@@ -4210,7 +4338,7 @@ fn emit_bwd_coalesced_tile_copy(
     ptx.push_str(&format!("{label}_C:\n"));
     ptx.push_str(&format!("    setp.ge.u64 %p2, %rd_cp4, {hd_bytes};\n"));
     ptx.push_str(&format!("    @%p2 bra {label}_C_DONE;\n"));
-    emit_bwd_tile_copy_element(ptx, to_smem);
+    emit_bwd_tile_copy_element(ptx, to_smem, scale_reg);
     ptx.push_str("    add.u64 %rd_cp4, %rd_cp4, 128;  // += 32 lanes * 4B\n");
     ptx.push_str(&format!("    bra {label}_C;\n"));
     ptx.push_str(&format!("{label}_C_DONE:\n"));
@@ -4221,10 +4349,13 @@ fn emit_bwd_coalesced_tile_copy(
 
 /// One element move for emit_bwd_coalesced_tile_copy: %rd_cp2 = global row
 /// base, %rd_cp3 = smem row byte offset, %rd_cp4 = column byte offset.
-fn emit_bwd_tile_copy_element(ptx: &mut String, to_smem: bool) {
+fn emit_bwd_tile_copy_element(ptx: &mut String, to_smem: bool, scale_reg: Option<&str>) {
     if to_smem {
         ptx.push_str("    add.u64 %rd_cp5, %rd_cp2, %rd_cp4;\n");
         ptx.push_str("    ld.global.f32 %f_cp, [%rd_cp5];\n");
+        if let Some(scale) = scale_reg {
+            ptx.push_str(&format!("    mul.f32 %f_cp, %f_cp, {scale};\n"));
+        }
         ptx.push_str("    add.u64 %rd_cp5, %rd_cp3, %rd_cp4;\n");
         emit_smem_store(ptx, "f32", "%rd_cp5", "%f_cp");
     } else {
@@ -4276,6 +4407,7 @@ fn emit_bwd_main_load_kv_tiles(
         "%rd18",
         0,
         true,
+        None,
     );
 
     // Load V tile: shmem offset = v_offset
@@ -4293,6 +4425,7 @@ fn emit_bwd_main_load_kv_tiles(
         "%rd19",
         v_offset,
         true,
+        None,
     );
 
     ptx.push_str("    bar.sync 0;  // K and V tiles loaded\n\n");
@@ -4410,6 +4543,7 @@ fn emit_bwd_main_q_tile_loop_scalar(ptx: &mut String, config: &FlashAttentionBac
         "%rd26",
         q_shmem_offset,
         true,
+        None,
     );
 
     // Load dO[i_block] into shmem[do_shmem_offset..]
@@ -4432,6 +4566,7 @@ fn emit_bwd_main_q_tile_loop_scalar(ptx: &mut String, config: &FlashAttentionBac
         "%rd26",
         do_shmem_offset,
         true,
+        None,
     );
 
     // Load D[i_block] and L[i_block] vectors into shmem
@@ -4960,6 +5095,7 @@ fn emit_bwd_main_q_tile_loop_mma(
         config.block_q
     ));
     emit_bwd_segment_qtile_break(ptx, config);
+    emit_bwd_load_grad_scale(ptx, config);
 
     // Load Q[i_block] into shmem[q_shmem_offset..]
     ptx.push_str(&format!(
@@ -4981,6 +5117,7 @@ fn emit_bwd_main_q_tile_loop_mma(
         "%rd26",
         q_shmem_offset,
         true,
+        None,
     );
 
     // Load dO[i_block] into shmem[do_shmem_offset..]
@@ -5003,6 +5140,7 @@ fn emit_bwd_main_q_tile_loop_mma(
         "%rd26",
         do_shmem_offset,
         true,
+        Some("%bwd_gs"),
     );
 
     // Load D[i_block] and L[i_block] vectors into shmem
@@ -5017,6 +5155,7 @@ fn emit_bwd_main_q_tile_loop_mma(
     ptx.push_str("    shl.b64 %rd26, %rd26, 2;\n");
     ptx.push_str("    add.u64 %rd27, %rd7, %rd26;   // d_ptr + offset\n");
     ptx.push_str("    ld.global.f32 %f0, [%rd27];\n");
+    ptx.push_str("    mul.f32 %f0, %f0, %bwd_gs;    // D in the tile's prescaled units\n");
     ptx.push_str("    shl.b64 %rd28, %rd11, 2;\n");
     ptx.push_str(&format!(
         "    add.u64 %rd28, %rd28, {};  // + D_vec shmem offset\n",
@@ -5440,7 +5579,10 @@ fn emit_bwd_main_q_tile_loop_mma(
             for nt in nts {
                 for r in 0..4 {
                     ptx.push_str(&format!(
-                        "    add.f32 %bwd_dvp_{nt}_{r}, %bwd_dvp_{nt}_{r}, %bwd_acc_g_{nt}_{r};\n"
+                        "    mul.f32 %bwd_mma_f32_lo, %bwd_acc_g_{nt}_{r}, %bwd_ginv;\n"
+                    ));
+                    ptx.push_str(&format!(
+                        "    add.f32 %bwd_dvp_{nt}_{r}, %bwd_dvp_{nt}_{r}, %bwd_mma_f32_lo;\n"
                     ));
                 }
             }
@@ -5506,6 +5648,7 @@ fn emit_bwd_main_q_tile_loop_mma(
         emit_smem_load(ptx, "f32", "%f_dp", "%rd37");
         ptx.push_str("    sub.f32 %f_tmp, %f_dp, %f_d_val;\n");
         ptx.push_str("    mul.f32 %f_ds, %f_p, %f_tmp;\n");
+        emit_bwd_clamp_ds(ptx);
         emit_smem_store(ptx, "f32", "%rd36", "%f_ds");
         ptx.push_str(&format!("    add.u64 %rd32, %rd32, {nthreads};\n"));
         ptx.push_str("    bra BWD_MAIN_MMA_DS_ELEM;\n");
@@ -5561,6 +5704,7 @@ fn emit_bwd_main_q_tile_loop_mma(
         // dS = P * (dP - D)
         ptx.push_str("    sub.f32 %f_tmp, %f_dp, %f_d_val;\n");
         ptx.push_str("    mul.f32 %f_ds, %f_p, %f_tmp;\n");
+        emit_bwd_clamp_ds(ptx);
 
         // Overwrite S_tile with dS (reuse same location)
         emit_smem_store(ptx, "f32", "%rd36", "%f_ds");
@@ -5753,7 +5897,7 @@ fn emit_bwd_main_q_tile_loop_mma(
             for nt in nts {
                 for r in 0..4 {
                     ptx.push_str(&format!(
-                        "    mul.f32 %bwd_mma_f32_lo, %bwd_acc_g_{nt}_{r}, %scale;\n"
+                        "    mul.f32 %bwd_mma_f32_lo, %bwd_acc_g_{nt}_{r}, %bwd_kscale;\n"
                     ));
                     ptx.push_str(&format!(
                         "    add.f32 %bwd_dkp_{nt}_{r}, %bwd_dkp_{nt}_{r}, %bwd_mma_f32_lo;\n"
@@ -6189,10 +6333,13 @@ fn emit_accumulate_mma_to_shmem(
     shmem_base: usize,
     row_stride_elems: usize, // hd_padded
 ) {
-    ptx.push_str("    // Accumulate MMA results to shmem via atomicAdd\n");
+    ptx.push_str("    // Accumulate MMA results to shmem via atomicAdd (undoing the gradient prescale)\n");
 
     for nt in nts {
         for r in 0..4 {
+            ptx.push_str(&format!(
+                "    mul.f32 {acc_prefix}_{nt}_{r}, {acc_prefix}_{nt}_{r}, %bwd_ginv;\n"
+            ));
             // hw C layout: reg r → row = m_tile*16 + g + 8*(r>=2), col = nt*8 + 2t + (r&1)
             let row_add = if r >= 2 { 8 } else { 0 };
             let col_add = r & 1;
@@ -6245,9 +6392,9 @@ fn emit_accumulate_mma_to_shmem_scaled(
 
     for nt in nts {
         for r in 0..4 {
-            // Scale first
+            // Scale first (attention scale and the gradient-prescale reciprocal)
             ptx.push_str(&format!(
-                "    mul.f32 {acc_prefix}_{nt}_{r}, {acc_prefix}_{nt}_{r}, %scale;\n"
+                "    mul.f32 {acc_prefix}_{nt}_{r}, {acc_prefix}_{nt}_{r}, %bwd_kscale;\n"
             ));
             // hw C layout: reg r → row = m_tile*16 + g + 8*(r>=2), col = nt*8 + 2t + (r&1)
             let row_add = if r >= 2 { 8 } else { 0 };
@@ -6300,9 +6447,9 @@ fn emit_atomicadd_mma_to_global_dq(
 
     for nt in nts {
         for r in 0..4 {
-            // Scale
+            // Scale (attention scale and the gradient-prescale reciprocal)
             ptx.push_str(&format!(
-                "    mul.f32 {acc_prefix}_{nt}_{r}, {acc_prefix}_{nt}_{r}, %scale;\n"
+                "    mul.f32 {acc_prefix}_{nt}_{r}, {acc_prefix}_{nt}_{r}, %bwd_kscale;\n"
             ));
             // hw C layout: reg r → q_row_local = m_tile*16 + g + 8*(r>=2),
             //              d (col) = nt*8 + 2t + (r&1)
@@ -6414,6 +6561,7 @@ fn emit_bwd_main_store_dk_dv(
         "%rd20",
         dk_shmem_offset,
         false,
+        None,
     );
 
     // Store dV
@@ -6427,6 +6575,7 @@ fn emit_bwd_main_store_dk_dv(
         "%rd21",
         dv_shmem_offset,
         false,
+        None,
     );
 }
 
