@@ -39,7 +39,16 @@
 //!   * **exact** — the gradients of causal (and same-document) softmax
 //!     attention on the f32 inputs;
 //!   * **f16-operand** — the same, with each MMA operand rounded to f16
-//!     where the kernel rounds it (Q, K, V, dO, P and dS).
+//!     where the kernel rounds it (Q, K, V, dO, P and dS). The two
+//!     gradient-carrying operands, dO and dS, are rounded in the kernel's
+//!     PRESCALED units: each (batch-head, q-tile)'s dO is first multiplied
+//!     by the power of two that puts the tile's `max|dO|` in
+//!     `[2^BWD_GRAD_SCALE_EXP, 2^(BWD_GRAD_SCALE_EXP+1))`, and the tile's
+//!     contributions are divided by it on the way out. Without that, a
+//!     gradient of realistic magnitude (1e-6 and below) sits under f16's
+//!     normal range and the "f16-sized error" becomes most of the value —
+//!     `small_gradients_*` below pin both the fix and that the unscaled
+//!     kernel fails them.
 //!
 //! The scalar path must match the exact oracle to f32 accuracy; the MMA
 //! path must match the f16-operand oracle to f32 accumulation noise, and
@@ -62,7 +71,7 @@ use half::f16;
 use cta_ptx_interp::{parse, run_cta, Launch, Order, Program, Segment, SHARED_BASE};
 use nsl_codegen::flash_attention::{
     backward_select_blocks, flash_attention_bwd_main_kernel_name, synthesize_flash_attention_backward_ptx,
-    FlashAttentionBackwardConfig,
+    FlashAttentionBackwardConfig, BWD_GRAD_SCALE_EXP,
 };
 
 /// Every schedule the interpreter offers: thread-interleaved both ways, and
@@ -107,12 +116,33 @@ struct Grads {
     dv: Vec<f32>,
 }
 
+/// The power of two the kernel multiplies one (batch-head, q-tile)'s dO by
+/// before its f16 conversions: `2^(BWD_GRAD_SCALE_EXP - (e - 127))` for the
+/// biased exponent `e` of the tile's `max|dO|`, clamped as the kernel clamps
+/// it (`emit_bwd_load_grad_scale`).
+fn grad_scale(dout: &[f32], base: usize, tile: usize, block_q: usize) -> f64 {
+    let rows = &dout[base + tile * block_q * D..base + (tile + 1) * block_q * D];
+    let max = rows.iter().fold(0f32, |m, x| m.max(x.abs()));
+    let e = ((max.to_bits() >> 23) as i32).clamp(BWD_GRAD_SCALE_EXP as i32 + 1, 254);
+    2f64.powi(BWD_GRAD_SCALE_EXP as i32 - (e - 127))
+}
+
 /// The forward (O, natural logsumexp) and the gradients, in f64. With
 /// `staged`, every operand of the kernel's five MMA products is rounded to
 /// f16 first: Q and K in S, dO and V in dP, P and dO in dV, dS and K in dQ,
-/// dS and Q in dK. O, D and the logsumexp stay exact — the kernel reads
-/// them in f32.
-fn oracle(q: &[f32], k: &[f32], v: &[f32], dout: &[f32], seg: &[u16], staged: bool) -> (Vec<f32>, Vec<f32>, Grads) {
+/// dS and Q in dK — dO and dS in their q-tile's prescaled units
+/// (`grad_scale`), with dS saturated at f16's largest finite value as the
+/// kernel saturates it. O, D and the logsumexp stay exact — the kernel
+/// reads them in f32.
+fn oracle(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    dout: &[f32],
+    seg: &[u16],
+    staged: bool,
+    block_q: usize,
+) -> (Vec<f32>, Vec<f32>, Grads) {
     let r = |x: f64| if staged { f16_round(x) } else { x };
     let scale = 1.0 / (D as f64).sqrt();
     let n = B * H * S * D;
@@ -139,15 +169,21 @@ fn oracle(q: &[f32], k: &[f32], v: &[f32], dout: &[f32], seg: &[u16], staged: bo
                 // The backward, from the f32 O and lse the kernel reads.
                 let (o32, l32): (Vec<f64>, f64) = (o.iter().map(|&x| x as f32 as f64).collect(), l as f32 as f64);
                 let dd: f64 = (0..D).map(|d| at(dout, i, d) * o32[d]).sum();
+                // The q-tile's prescale: 1 for the exact oracle, so the two
+                // differ only in what the kernel's f16 operands lose.
+                let gs = if staged { grad_scale(dout, base, i / block_q, block_q) } else { 1.0 };
                 for &j in &vis {
                     let s = (0..D).map(|d| r(at(q, i, d)) * r(at(k, j, d))).sum::<f64>() * scale;
                     let p = (s - l32).exp();
-                    let dp: f64 = (0..D).map(|d| r(at(dout, i, d)) * r(at(v, j, d))).sum();
-                    let ds = p * (dp - dd);
+                    let dp: f64 = (0..D).map(|d| r(at(dout, i, d) * gs) * r(at(v, j, d))).sum();
+                    let mut ds = p * (dp - dd * gs);
+                    if staged {
+                        ds = ds.clamp(-65504.0, 65504.0);
+                    }
                     for d in 0..D {
-                        dv[base + j * D + d] += r(p) * r(at(dout, i, d));
-                        dq[base + i * D + d] += r(ds) * r(at(k, j, d)) * scale;
-                        dk[base + j * D + d] += r(ds) * r(at(q, i, d)) * scale;
+                        dv[base + j * D + d] += r(p) * r(at(dout, i, d) * gs) / gs;
+                        dq[base + i * D + d] += r(ds) * r(at(k, j, d)) * scale / gs;
+                        dk[base + j * D + d] += r(ds) * r(at(q, i, d)) * scale / gs;
                     }
                 }
             }
@@ -168,6 +204,8 @@ const DVEC_BASE: u64 = 0x4800_0000;
 const LSE_BASE: u64 = 0x5000_0000;
 const SEG_BASE: u64 = 0x5800_0000;
 const OUT_BASE: u64 = 0x6000_0000;
+/// The phase-1 `max|dO|` words, one u32 per (batch-head, q-tile).
+const GMAX_BASE: u64 = 0x6800_0000;
 
 fn f32_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
@@ -213,12 +251,16 @@ struct Inputs {
     seg: Vec<u16>,
 }
 
-fn inputs(segment_masked: bool) -> (Inputs, Grads, Grads) {
+/// The gate's inputs and both oracles' gradients. `dout_scale` multiplies
+/// the upstream gradient — what the loss normalisation and the depth do to
+/// it in a real training step; 1.0 is the historical O(1) fixture.
+fn inputs_scaled(segment_masked: bool, block_q: usize, dout_scale: f32) -> (Inputs, Grads, Grads) {
     let n = B * H * S * D;
-    let (q, k, v, dout) = (values(1, n), values(2, n), values(3, n), values(4, n));
+    let (q, k, v) = (values(1, n), values(2, n), values(3, n));
+    let dout: Vec<f32> = values(4, n).into_iter().map(|x| x * dout_scale).collect();
     let seg = segments(segment_masked);
-    let (out, lse, exact) = oracle(&q, &k, &v, &dout, &seg, false);
-    let (_, _, staged) = oracle(&q, &k, &v, &dout, &seg, true);
+    let (out, lse, exact) = oracle(&q, &k, &v, &dout, &seg, false, block_q);
+    let (_, _, staged) = oracle(&q, &k, &v, &dout, &seg, true, block_q);
     (Inputs { q, k, v, dout, out, lse, seg }, exact, staged)
 }
 
@@ -240,6 +282,8 @@ fn run(config: &FlashAttentionBackwardConfig, p1: &Program, p2: &Program, x: &In
         Segment { base: LSE_BASE, bytes: f32_bytes(&x.lse) },
         Segment { base: SEG_BASE, bytes: x.seg.iter().flat_map(|s| s.to_le_bytes()).collect() },
         Segment { base: OUT_BASE, bytes: f32_bytes(&x.out) },
+        // Zeroed, as the runtime zeroes it: phase 1 fills it with an atomic max.
+        Segment { base: GMAX_BASE, bytes: vec![0; B * H * (S / config.block_q as usize) * 4] },
     ];
     let (bq, bkv) = (config.block_q as u32, config.block_kv as u32);
     let bind = |prog: &Program, set: &[(&str, u64)]| -> HashMap<String, u64> {
@@ -273,7 +317,14 @@ fn run(config: &FlashAttentionBackwardConfig, p1: &Program, p2: &Program, x: &In
 
     let a1 = bind(
         p1,
-        &[("dout_ptr", DOUT_BASE), ("out_ptr", OUT_BASE), ("d_ptr", DVEC_BASE), ("seq_len", S as u64), ("head_dim", D as u64)],
+        &[
+            ("dout_ptr", DOUT_BASE),
+            ("out_ptr", OUT_BASE),
+            ("d_ptr", DVEC_BASE),
+            ("seq_len", S as u64),
+            ("head_dim", D as u64),
+            ("gmax_ptr", GMAX_BASE),
+        ],
     );
     launch(p1, &a1, p1.shared_bytes, S as u32 / bq, bq);
 
@@ -292,6 +343,7 @@ fn run(config: &FlashAttentionBackwardConfig, p1: &Program, p2: &Program, x: &In
             ("scale", (1.0f32 / (D as f32).sqrt()).to_bits() as u64),
             ("seq_len", S as u64),
             ("head_dim", D as u64),
+            ("gmax", GMAX_BASE),
         ]
         .into_iter()
         .chain(config.segment_masked.then_some([("segment_ids", SEG_BASE), ("heads", H as u64)]).into_iter().flatten())
@@ -342,8 +394,17 @@ impl Report {
 }
 
 fn check(config: &FlashAttentionBackwardConfig, p2: &Program, order: Order) -> (Report, Report) {
+    check_scaled(config, p2, order, 1.0)
+}
+
+fn check_scaled(
+    config: &FlashAttentionBackwardConfig,
+    p2: &Program,
+    order: Order,
+    dout_scale: f32,
+) -> (Report, Report) {
     let (p1, _, _) = programs(config);
-    let (x, exact, staged) = inputs(config.segment_masked);
+    let (x, exact, staged) = inputs_scaled(config.segment_masked, config.block_q as usize, dout_scale);
     let got = run(config, &p1, p2, &x, order);
     let all = got.dq.iter().chain(&got.dk).chain(&got.dv);
     assert!(all.clone().all(|v| v.is_finite()), "an unwritten or non-finite gradient");
@@ -407,6 +468,77 @@ fn unmasked_multiwarp_backward_is_the_f16_operand_gradient() {
         let (exact, staged) = measure(90, false, order);
         assert_is_f16_operand_gradient("unmasked sm_90", &exact, &staged);
     }
+}
+
+/// A gradient is not an activation: after the loss's mean over the batch and
+/// a few layers of backward, dO sits around 1e-6..1e-8, below f16's smallest
+/// normal (6.1e-5). The MMA path must be as accurate there as at O(1) —
+/// nothing in the attention gradient depends on the SCALE of dO. Measured at
+/// Coder-1B before the prescale: dQ/dK at 80% error in the top block, 6-12%
+/// on every other parameter downstream of it.
+const SMALL_GRADIENT_SCALES: [f32; 3] = [1e-5, 3e-7, 1e-9];
+
+#[test]
+fn small_gradients_keep_f16_operand_accuracy() {
+    for (sm, masked, name) in [(90, true, "packed sm_90"), (90, false, "unmasked sm_90")] {
+        let config = config(sm, masked);
+        let (_, p2, _) = programs(&config);
+        for scale in SMALL_GRADIENT_SCALES {
+            for order in [Order::Ascending, Order::WarpsDescending] {
+                let (exact, staged) = check_scaled(&config, &p2, order, scale);
+                eprintln!("{name}, dO x {scale:e} ({order:?}): {:.2e} from exact, {:.2e} from f16-operand", exact.max(), staged.max());
+                assert_is_f16_operand_gradient(&format!("{name}, dO x {scale:e}"), &exact, &staged);
+            }
+        }
+    }
+}
+
+/// The prescale is a power of two per (batch-head, q-tile), so multiplying
+/// dO by a power of two changes no rounding anywhere in the kernel: the
+/// gradients come out multiplied by exactly that power of two, bit for bit.
+#[test]
+fn power_of_two_gradient_scale_is_exact() {
+    for masked in [true, false] {
+        let config = config(90, masked);
+        let (p1, p2, _) = programs(&config);
+        let block_q = config.block_q as usize;
+        let (x1, _, _) = inputs_scaled(masked, block_q, 1.0);
+        let unit = run(&config, &p1, &p2, &x1, Order::Ascending);
+        for exp in [-12, -24, -40] {
+            let k = 2f32.powi(exp);
+            let (xk, _, _) = inputs_scaled(masked, block_q, k);
+            let got = run(&config, &p1, &p2, &xk, Order::Ascending);
+            for (what, g, u) in [("dQ", &got.dq, &unit.dq), ("dK", &got.dk, &unit.dk), ("dV", &got.dv, &unit.dv)] {
+                let differing = g.iter().zip(u.iter()).filter(|(g, u)| g.to_bits() != (**u * k).to_bits()).count();
+                assert_eq!(differing, 0, "{what} (segment_masked={masked}): {differing} elements are not 2^{exp} times the unit-scale gradient");
+            }
+        }
+    }
+}
+
+/// The two tests above are not vacuous: with the prescale forced to 1 (the
+/// kernel as it was), a realistic gradient magnitude is far from the exact
+/// gradient.
+#[test]
+fn small_gradients_fail_without_the_prescale() {
+    let config = config(90, false);
+    let (_, _, text) = programs(&config);
+    let mut unscaled = text.clone();
+    for (from, to) in [
+        ("mov.b32 %bwd_gs, %r_gbits;", "mov.f32 %bwd_gs, 0f3F800000;"),
+        ("mov.b32 %bwd_ginv, %r_gbits;", "mov.f32 %bwd_ginv, 0f3F800000;"),
+    ] {
+        assert!(unscaled.contains(from), "`{from}` is not in the kernel — resync the gate");
+        unscaled = unscaled.replace(from, to);
+    }
+    let prog = parse(&unscaled);
+    // At O(1) the unscaled kernel is the f16-operand gradient too: that is
+    // why the gates above never saw this.
+    let (unit, _) = check_scaled(&config, &prog, Order::Ascending, 1.0);
+    assert!(unit.max() < 5e-3, "unscaled kernel at O(1): {:.2e}", unit.max());
+    let (small, _) = check_scaled(&config, &prog, Order::Ascending, 3e-7);
+    eprintln!("unscaled kernel, dO x 3e-7: {:.2e} from the exact gradients", small.max());
+    assert!(small.max() > 5e-2, "the unscaled kernel is within {:.2e} at dO x 3e-7 — the small-gradient gate proves nothing", small.max());
 }
 
 /// The agreement above is not vacuous: each named break in the packed MMA
