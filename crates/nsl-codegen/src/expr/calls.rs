@@ -3124,20 +3124,57 @@ impl Compiler<'_> {
                         labels_arg = Some(&arg.value);
                         continue;
                     }
+                    // The key set is CLOSED and each key has one literal
+                    // type. The runtime reads the config with
+                    // `as_u64()`/`as_bool()` and a default, so before this
+                    // check a misspelt key or a literal of the wrong type
+                    // was not an error — it was the default: `seq_len =
+                    // 2048.0` trained at seq_len 128, `shuffle = 1` did not
+                    // shuffle, `seqlen = 2048` was ignored.
+                    const INT_KEYS: [&str; 7] = [
+                        "batch_size", "seq_len", "num_workers", "prefetch",
+                        "pack_separator", "world_size", "seed",
+                    ];
+                    const BOOL_KEYS: [&str; 6] = [
+                        "shuffle", "drop_last", "packing", "pin_memory",
+                        "emit_attention_mask", "shard_by_rank",
+                    ];
+                    if config.contains_key(&key) {
+                        return Err(CodegenError::new(format!(
+                            "DataLoader(): keyword argument '{key}' given more than once"
+                        )));
+                    }
+                    let wants_int = INT_KEYS.contains(&key.as_str());
+                    let wants_bool = BOOL_KEYS.contains(&key.as_str());
+                    if !wants_int && !wants_bool {
+                        return Err(CodegenError::new(format!(
+                            "DataLoader(): unknown keyword argument '{key}' (known: labels, {}, {})",
+                            INT_KEYS.join(", "),
+                            BOOL_KEYS.join(", ")
+                        )));
+                    }
                     match &arg.value.kind {
-                        ExprKind::IntLiteral(v) => {
+                        ExprKind::IntLiteral(v) if wants_int => {
+                            if *v < 0 {
+                                return Err(CodegenError::new(format!(
+                                    "DataLoader(): '{key}' must not be negative, got {v}"
+                                )));
+                            }
                             config.insert(
                                 key,
                                 serde_json::Value::Number(serde_json::Number::from(*v)),
                             );
                         }
-                        ExprKind::BoolLiteral(v) => {
+                        ExprKind::BoolLiteral(v) if wants_bool => {
                             config.insert(key, serde_json::Value::Bool(*v));
                         }
-                        ExprKind::FloatLiteral(v) => {
-                            if let Some(n) = serde_json::Number::from_f64(*v) {
-                                config.insert(key, serde_json::Value::Number(n));
-                            }
+                        ExprKind::IntLiteral(_)
+                        | ExprKind::BoolLiteral(_)
+                        | ExprKind::FloatLiteral(_) => {
+                            return Err(CodegenError::new(format!(
+                                "DataLoader(): keyword argument '{key}' takes {} literal",
+                                if wants_int { "an integer" } else { "a `true`/`false`" }
+                            )));
                         }
                         _ => {
                             return Err(CodegenError::new(format!(
