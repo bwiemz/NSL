@@ -6234,7 +6234,22 @@ fn flash_attention_backward_gpu(
     let dkdv_elems = if native_gqa { total_kv } else { total_qkv };
 
     // ── Allocate D correction vector [b*h*s] on GPU ──
-    let d_buf = inner::alloc_managed(b * h * s * 4);
+    // D ([b*h, s] f32) and, in the same allocation right behind it, the
+    // gradient-prescale words: one u32 per (batch-head, q-tile) holding the
+    // bits of that tile's max|dO|. Phase 1 fills them with an atomic max, so
+    // they must start at zero; phase 2 turns each into the power of two that
+    // lifts the tile's dO into f16's normal range before the tensor-core
+    // matmuls (nsl-codegen `BWD_GRAD_SCALE_EXP` has the measurements). One
+    // allocation so every early-exit below that frees `d_buf` frees both.
+    // `s % block_q == 0` was established by the ragged-seq guard above.
+    let d_elems = b * h * s;
+    let gmax_elems = b * h * (s / (block_q.max(1) as usize));
+    let d_buf = inner::alloc_managed((d_elems + gmax_elems) * 4);
+    let gmax_buf = unsafe { (d_buf as *mut u8).add(d_elems * 4) } as *mut c_void;
+    // Zeroed from the allocation's base: the transport hooks behind
+    // `memset_d8` key on allocation addresses, and D is overwritten by
+    // phase 1 anyway.
+    inner::memset_d8(d_buf, (d_elems + gmax_elems) * 4);
 
     // ── Allocate dQ on GPU (zero-initialized) ──
     let dq_data = inner::alloc_managed(total_qkv * 4);
@@ -6256,13 +6271,15 @@ fn flash_attention_backward_gpu(
         let mut d_data = d_buf as u64;
         let mut sl = s as u64;
         let mut hd = d as u64;
+        let mut gmax_data = gmax_buf as u64;
 
-        let args: [*mut c_void; 5] = [
+        let args: [*mut c_void; 6] = [
             &mut dout_data as *mut _ as *mut c_void,
             &mut out_data as *mut _ as *mut c_void,
             &mut d_data as *mut _ as *mut c_void,
             &mut sl as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
+            &mut gmax_data as *mut _ as *mut c_void,
         ];
 
         let grid = [(b * h) as i64, (s as i64 + block_q - 1) / block_q, 1];
@@ -6488,6 +6505,11 @@ fn flash_attention_backward_gpu(
             args.push(&mut heads_p2 as *mut _ as *mut c_void);
             args.push(&mut kv_heads_p2 as *mut _ as *mut c_void);
         }
+        // `param_gmax` is LAST in every variant's list (plain, `_segmask`,
+        // `_gqa`): the phase-1 max|dO| words the kernel derives each
+        // q-tile's gradient prescale from.
+        let mut gmax_p2 = gmax_buf as u64;
+        args.push(&mut gmax_p2 as *mut _ as *mut c_void);
 
         // Native GQA: one CTA per (batch, kv_head) that loops the group's
         // q-heads internally, so grid.x is `b*kv_h` (not `b*h`). The `_gqa`
