@@ -43,15 +43,19 @@ impl Compiler<'_> {
             wrga_plan,
         } = inputs;
 
-        // 6a. Task 4: WRGA backward-live filter — drop adjoint ops
-        // that the WRGA prune pass proved to be on frozen branches.
-        if let Some(plan) = &wrga_plan {
-            adjoint.ops = crate::source_ad::eliminate_by_backward_live(
-                &adjoint.ops,
-                &plan.prune.backward_live,
-                generator.adjoint_vars_map(),
-            );
-        }
+        // 6a. (removed) The WRGA backward-live filter used to run here and
+        // drop every adjoint op outside the WRGA prune pass's live set.
+        // That set is built by matching `@wrga` patterns against parameter
+        // names, and for `mode = manual` and `mode = hybrid` the patterns
+        // (`Class.field`, a bare layer prefix) never match an instance path
+        // (`m.b1.wq`): the set came out empty, every adjoint op was
+        // dropped, and the train block ran to completion having trained
+        // nothing, under source AD only -- tape AD ignored the mode and
+        // trained everything. Where the set was right the filter was
+        // redundant with step 6b, which prunes to the parameters `@freeze`
+        // leaves trainable. So 6b alone decides, in both AD modes; the WRGA
+        // plan's live set remains in its report.
+        let _ = wrga_plan;
 
         // 6b. Dead gradient elimination: prune adjoint ops not needed
         // by any parameter gradient. This removes ghost VarId chains
