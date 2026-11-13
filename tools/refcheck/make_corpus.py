@@ -11,9 +11,9 @@ shipped v1 tokenizer (`models/tokenizers/nsl_code_v1_t40960_v49152.json`).
 
 from __future__ import annotations
 
+import argparse
 import random
 import subprocess
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -26,7 +26,13 @@ MAX_FILE_BYTES = 2_000_000
 
 
 def main() -> None:
-    out_dir = Path(sys.argv[1])
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "out_dir", type=Path, help="directory to write train.bin and val.bin into"
+    )
+    out_dir: Path = parser.parse_args().out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     listed = subprocess.run(
         ["git", "-C", str(REPO), "ls-files"], capture_output=True, text=True, check=True

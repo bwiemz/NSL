@@ -118,3 +118,7 @@ models/benchmarks/srbf16_logs/
 # the source fixture rather than into target/, which does not exist under
 # CARGO_TARGET_DIR.
 crates/nsl-cli/tests/fixtures/*.generated.nsl
+
+# tools/refcheck: the Python environment and working directory its README sets up.
+/.venv
+/refcheck-work/
