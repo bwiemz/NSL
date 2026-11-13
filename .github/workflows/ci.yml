@@ -361,7 +361,13 @@ jobs:
   # driver, and the PTX gate only shells out to ptxas.
   cuda-feature:
     name: CUDA feature — compile + GPU-free tests
-    runs-on: ubuntu-latest
+    # Pinned, not `ubuntu-latest`: the CUDA 13.2 packages this job installs
+    # (`cuda-nvcc-13-2`, `libcublas-13-2`, ...) exist in NVIDIA's ubuntu2404
+    # apt repository and not in its ubuntu2604 one. When `ubuntu-latest` moved
+    # to 26.04 the install step began failing with "Unable to locate package"
+    # on every PR, whatever the PR changed. Move this pin together with the
+    # `cuda:` version below.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 

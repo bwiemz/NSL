@@ -52,7 +52,9 @@ sha2 = "0.11"
 safetensors = "0.8"
 half = { version = "2.4", features = ["std"] }
 base64 = "0.23"
-object = { version = "0.39", features = ["write"] }
+# Default features minus `compression`: nothing here reads compressed
+# sections, and that feature pulls in `ruzstd` (RUSTSEC-2026-0344).
+object = { version = "0.39", default-features = false, features = ["read", "write"] }
 cudarc = { version = "0.19.4", default-features = false, features = ["driver", "cublas", "cuda-version-from-build-system", "dynamic-linking"], optional = true }
 rand = { version = "0.10", optional = true }
 
