@@ -1,5 +1,27 @@
 # NSL-Coder-1B — FASE load-bearing scale
 
+> **Read this first (2026-11-12).** Every measurement in this file and in the
+> `models/benchmarks/` records it cites was taken before the attention
+> backward's gradient underflow was fixed (see `CHANGELOG.md`, Unreleased →
+> Fixed). That defect made the query/key projection gradients 12% wrong at
+> Coder-50M and 80% wrong at Coder-1B with the production flags, so the
+> learning-rate conclusions here — including the shipped `PRETRAIN_LR` —
+> describe the broken toolchain, not the model.
+>
+> Measured after the fix, same weights, corpus and batch order
+> (`tools/refcheck/README.md` has the method):
+>
+> | Coder-1B, lr 1e-4, batch 2 x 2048 x accum 4, one epoch of 8.2M tokens | held-out loss |
+> | --- | --- |
+> | toolchain before the fix | 8.21 (the corpus's unigram entropy is 8.18) |
+> | toolchain after the fix | 6.85 |
+>
+> and at Coder-500M with lr 3e-4: 8.27 before the fix, 6.64 after, 6.63 for
+> the PyTorch twin.
+>
+> The recipe's numbers are unchanged; they need re-deriving with a pilot run
+> on the fixed toolchain before a long run is committed to them.
+
 Llama-3.2-1B-ish architecture scaled from `coder500m`. ~1.07B params.
 This is the scale where **FASE Deferred is the difference between fit
 and OOM** on a 16 GB GPU.

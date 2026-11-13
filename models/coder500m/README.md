@@ -1,5 +1,25 @@
 # NSL-Coder-500M — FASE peak-memory demo
 
+> **Read this first (2026-11-12).** Every measurement in this file and in the
+> `models/benchmarks/` records it cites was taken before the attention
+> backward's gradient underflow was fixed (see `CHANGELOG.md`, Unreleased →
+> Fixed). That defect made the query/key projection gradients 12% wrong at
+> Coder-50M and 80% wrong at Coder-1B with the production flags, so the
+> learning-rate conclusions here — including the shipped `PRETRAIN_LR` —
+> describe the broken toolchain, not the model.
+>
+> Measured after the fix, same weights, corpus and batch order
+> (`tools/refcheck/README.md` has the method):
+>
+> | Coder-500M, lr 3e-4, one epoch of 8.2M tokens | held-out loss |
+> | --- | --- |
+> | toolchain before the fix | 8.27 (the corpus's unigram entropy is 8.18) |
+> | toolchain after the fix | 6.64 |
+> | PyTorch twin | 6.63 |
+>
+> The recipe's numbers are unchanged; they need re-deriving with a pilot run
+> on the fixed toolchain before a long run is committed to them.
+
 Scaled-up sibling of `coder50m`. Same GQA + SwiGLU + RoPE transformer
 architecture, ~10× the parameter count, designed as a realistic stress
 test for the FASE roadmap shipped in items #1-#6 of
