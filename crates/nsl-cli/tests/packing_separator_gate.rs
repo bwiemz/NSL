@@ -102,14 +102,14 @@ fn labels_with_packing_are_refused() {
     );
 }
 
-/// `labels = None` is the spelled-out default, not a labels tensor.
+/// `labels = none` is the spelled-out default, not a labels tensor.
 #[test]
 fn an_explicit_none_for_labels_is_accepted_with_packing() {
     let dir = tempfile::tempdir().unwrap();
     let out = nsl(
         dir.path(),
         &loader_program(
-            "labels=None, batch_size=1, seq_len=8, shuffle=false, packing=true, pack_separator=0",
+            "labels=none, batch_size=1, seq_len=8, shuffle=false, packing=true, pack_separator=0",
         ),
     )
     .output()
