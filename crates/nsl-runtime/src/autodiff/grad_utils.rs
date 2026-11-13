@@ -514,6 +514,11 @@ pub(crate) fn scatter_gather_grad(
         if grad_base + inner > grad.len as usize {
             break;
         }
+        // An index past the gathered dim has no row to receive a gradient
+        // (the CPU forward aborts on one; the GPU index-select does not check).
+        if idx >= gather_dim_size {
+            continue;
+        }
         for k in 0..inner {
             if grad_dtype == 1 {
                 let g = unsafe { *grad.data_f32().add(grad_base + k) };
