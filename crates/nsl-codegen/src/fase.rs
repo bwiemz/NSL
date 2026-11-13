@@ -248,15 +248,20 @@ pub fn plan(cfg: &FaseConfig) -> FasePlan {
         (FaseOptimizer::AdamW, true) | (FaseOptimizer::Adam, true) => (
             FaseMode::Deferred,
             true,
+            // The second moment is formed from the square of the window
+            // MEAN gradient, which is what an optimizer stepped on the whole
+            // window computes: no approximation, despite the flag's name.
             format!(
-                "{} supports deferred first-moment accumulation with batch-variance v approximation",
+                "{} accumulates the window-mean gradient and steps once on it (exact)",
                 optimizer_name(cfg.optimizer)
             ),
         ),
         (FaseOptimizer::AdamW, false) | (FaseOptimizer::Adam, false) => (
             FaseMode::FullBuffer,
             false,
-            "v_t approximation disabled by config — fall back to full gradient buffer".to_string(),
+            "@fase(allow_v_approx = false) — full gradient buffer; same update as the deferred \
+             step, which is already exact"
+                .to_string(),
         ),
         (FaseOptimizer::Sgd, _) | (FaseOptimizer::SgdMomentum, _) => (
             // SGD with momentum is trivially deferred — momentum is a linear

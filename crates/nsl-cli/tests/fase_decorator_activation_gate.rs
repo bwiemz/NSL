@@ -103,7 +103,7 @@ fn v_approx_false_reaches_the_planner() {
     assert!(r.ok, "build failed:\n{}", r.stderr);
     assert!(
         r.stderr.contains("mode=FullBuffer v_approx=false")
-            && r.stderr.contains("v_t approximation disabled by config"),
+            && r.stderr.contains("@fase(allow_v_approx = false)"),
         "v_approx=false must flow into FaseConfig.allow_v_approx:\n{}",
         r.stderr
     );
