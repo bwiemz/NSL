@@ -17,11 +17,11 @@ Block-granular activation checkpointing on the source-AD path: a transformer blo
 ### <a id="cep"></a>CEP — Compilation-Evaluated Pruning
 Compile-time head-pruning pass: the oracle, importance scorer, model rewriter, and greedy search are all applied before the binary is emitted — pruned heads generate no code at all. Implementation: `crates/nsl-codegen/src/cep.rs`; decisions surfaced via `nsl profile --explain-wggo`.
 
-### <a id="cesh"></a>CESH — Compiler-Evaluated Speculative Hypothesis
-Research paper describing NSL's speculative decoding approach: hypothesis generation and verification are modeled as a single compiler-evaluated IR transformation. See [CESH.pdf](../research/CESH.pdf).
+### <a id="cesh"></a>CESH — Compiler-Exempt Sensitivity Handling (proposal only)
+Research proposal for a role-aware quantization policy: the embedding and LM-head layers are quantized differently from the transformer blocks. None of it has been built; the `quant` block quantizes every field alike. See [CESH.pdf](../research/CESH.pdf) and its [errata](../research/CESH-errata.md).
 
-### <a id="cfa"></a>CFA — Compiler-Fused Attention (research)
-Research document covering the compiler's strategy for fusing multi-head attention with adjacent elementwise and normalization ops. See [NSL-CFA-Research.md.pdf](../research/NSL-CFA-Research.md.pdf).
+### <a id="cfa"></a>CFA — Compile-Fused Alignment (proposal only)
+Research proposal for compiling post-training alignment (DPO, SimPO, KTO, GRPO) into the training binary. It is not about attention fusion, and none of it has been built. See [NSL-CFA-Research.md.pdf](../research/NSL-CFA-Research.md.pdf) and its [errata](../research/NSL-CFA-Research-errata.md). For attention fusion see [CSHA](#csha).
 
 ### <a id="cfie"></a>CFIE — Compiler-Fused Inference Engine
 NSL's inference-serving orchestration layer: KV plan, fused sampling, speculative decode, persistent KV cache, and grammar-constrained generation compose into one codegen pass. Shipped today: compile-time planning + real PTX emission for all five kernel families, plus (on the monolithic serve path) kernel registration with the runtime engine at serve init and a host-side decode loop (`nsl_cfie_decode_step`). Still pending: endpoint-driven generation needs serve-block model binding, so the compiled decode loop is exercised by tests/host callers until that lands. See [CFIE.pdf](../research/CFIE.pdf); implementation in `crates/nsl-codegen/src/cfie.rs` (driver + report) and `crates/nsl-codegen/src/serve.rs` (`run_cfie_for_serve`).
@@ -29,14 +29,14 @@ NSL's inference-serving orchestration layer: KV plan, fused sampling, speculativ
 ### <a id="cftp"></a>CFTP — Compiler-Fused Training Pipeline
 Research framework covering NSL's full training pipeline as a compile-time transformation: batching, packing, gradient accumulation, and optimizer dispatch fused into a single low-level loop. See [CFTP.pdf](../research/CFTP.pdf); PCA (§2) and FASE (§1) are the shipped sub-systems.
 
-### <a id="cgac"></a>CGAC — Compiler-Guided Activation Checkpointing
-Research document describing NSL's compile-time strategy for inserting `@checkpoint` recomputation points to trade compute for memory, guided by the memory planner's interference graph. See [CGAC.pdf](../research/CGAC.pdf).
+### <a id="cgac"></a>CGAC — Compiler-Generated All-Reduce Compression (proposal only)
+Research proposal for per-layer gradient compression (PowerSGD, QSGD, signSGD) in the distributed all-reduce. It is not about activation checkpointing (that is [CCR](#ccr)), and none of it has been built. See [CGAC.pdf](../research/CGAC.pdf) and its [errata](../research/CGAC-errata.md).
 
-### <a id="cidp"></a>CIDP — Compiler-Integrated Data Pipeline
-Research document covering NSL's data-loading and tokenization pipeline as a compiler-visible IR construct, enabling fusion with the training loop. See [NSL-CIDP-Research.md.pdf](../research/NSL-CIDP-Research.md.pdf).
+### <a id="cidp"></a>CIDP — Compile-Integrated Data Pipeline (proposal only)
+Research proposal for compiling data-quality weighting, deduplication, curriculum scheduling and source mixing into the training binary. None of it has been built: data preparation is the offline tooling under `tools/hfcorpus/`, and the `dataset` block is planner metadata only. See [NSL-CIDP-Research.md.pdf](../research/NSL-CIDP-Research.md.pdf) and its [errata](../research/NSL-CIDP-Research-errata.md).
 
-### <a id="ckvq"></a>CKVQ — Compiler-aware KV-cache Quantization
-Research paper on compile-time KV-cache quantization: the compiler annotates KV tensors with dtype/precision decisions at build time rather than selecting them at runtime. See [CKVQ.pdf](../research/CKVQ.pdf).
+### <a id="ckvq"></a>CKVQ — Compiler-Known Value Quantization (proposal only)
+Research proposal for compile-time planning of KV-cache quantization (pre-RoPE keys, per-page scales, outlier lists). None of it has been built; the nearest code is CFIE's INT8 KV read kernels, which have no writer. See [CKVQ.pdf](../research/CKVQ.pdf) and its [errata](../research/CKVQ-errata.md).
 
 ### <a id="cpdt"></a>CPDT — Compile-time Parallelism & Distributed Training
 Pass that plans ZeRO-style tensor sharding, collective-comm scheduling, mixed precision, and expert placement across a `ClusterSpec` before binary emission. See [CPDT Research.pdf](<../research/CPDT Research.pdf>); design specs in [`docs/superpowers/specs/`](../superpowers/specs/) (search `cpdt`); implementation in `crates/nsl-codegen/src/cpdt.rs`.
@@ -47,8 +47,8 @@ Research document covering compile-time wiring of teacher and student models so 
 ### <a id="csha"></a>CSHA — Compiler-Synthesized Holistic Attention
 Compile-time pass that fuses RMSNorm + Q/K/V projection (via m16n8k16 MMA) + RoPE rotation + FlashAttention-2 into a single PTX kernel, eliminating intermediate HBM traffic. See [NSL-CSHA-Research.PDF](../research/NSL-CSHA-Research.PDF); design specs in [`docs/superpowers/specs/`](../superpowers/specs/) (search `csha`); implementation in `crates/nsl-codegen/src/csha.rs`.
 
-### <a id="css"></a>CSS — Compiler-Scheduled Sparsity
-Research document on compile-time sparsity scheduling: the compiler decides where to insert and exploit structured sparsity patterns (block-sparse, N:M) at build time. See [CSS.pdf](../research/CSS.pdf).
+### <a id="css"></a>CSS — Compiler-Scheduled Sparsity (proposal only)
+Research proposal for 2:4 and 4:8 structured sparsity as a first-class tensor type. None of it has been built: `Sparse<...>` types parse but cannot be constructed from NSL source, and `@sparse(pattern=...)` has no effect. See [CSS.pdf](../research/CSS.pdf) and its [errata](../research/CSS-errata.md).
 
 ### <a id="fase"></a>FASE — Fused Accumulation-Step Elimination
 Training optimization pass that defers gradient accumulation into a fused per-parameter loop (Deferred mode) or buffers it explicitly (FullBuffer mode), eliminating redundant optimizer-step dispatch. See [`docs/superpowers/specs/`](../superpowers/specs/) (search `fase`); implementation in `crates/nsl-codegen/src/fase.rs`.
@@ -73,7 +73,7 @@ NVIDIA's CUDA BLAS library. NSL does not link cuBLAS — it emits its own MMA-ba
 Rust crate (version 0.19) providing safe wrappers around the CUDA driver API. NSL uses it for device-memory allocation, PTX module loading, and kernel launch. See `Cargo.toml` feature flags `dynamic-linking` + `cuda-version-from-build-system`.
 
 ### <a id="fa"></a>FA / FA-2 — FlashAttention / FlashAttention-2
-Tiled online-softmax attention algorithm (Dao et al.) that keeps Q, K, V tiles in SRAM to avoid full HBM materialisation of the N×N attention matrix. NSL's FA-2 scalar v2 emitter lives in `crates/nsl-codegen/src/flash_attention_v2/`; activated via the `@flash_attention` decorator or the `@csha` decorator chain. See [NSL-CFA-Research.md.pdf](../research/NSL-CFA-Research.md.pdf) for the NSL-specific fusion research.
+Tiled online-softmax attention algorithm (Dao et al.) that keeps Q, K, V tiles in SRAM to avoid full HBM materialisation of the N×N attention matrix. NSL's FA-2 scalar v2 emitter lives in `crates/nsl-codegen/src/flash_attention_v2/`; activated via the `@flash_attention` decorator or the `@csha` decorator chain. See [NSL-CSHA-Research.PDF](../research/NSL-CSHA-Research.PDF) and its [errata](../research/NSL-CSHA-Research-errata.md) for the NSL-specific fusion research.
 
 ### <a id="fp8"></a>FP8
 8-bit floating-point format (E4M3 or E5M2) supported on H100/Hopper and RTX 4090+. NSL uses FP8 for V tensors in CSHA Tier D (per-head mixed precision); E4M3 for Q/K (range-critical) and E5M2 for V (gradient-safe). See [`spec/06-quantization.nsl.md`](../../spec/06-quantization.nsl.md).
