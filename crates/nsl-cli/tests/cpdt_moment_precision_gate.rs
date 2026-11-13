@@ -30,8 +30,10 @@
 //!
 //! The fixture's tier split is designed (see `cpdt_precision_fp16.nsl`):
 //! High tier = embed, final_norm, blocks.0.w, blocks.7.w (FP32/FP32 moments);
-//! Medium tier = blocks.1..6 (FP16 m, FP32 v). So exactly SIX buffers go to
-//! FP16 storage. Pinning the count is deliberate: a join regression reports
+//! Medium tier = blocks.1..6 (reduced m, FP32 v). So exactly SIX buffers go
+//! to reduced storage, which for a first moment is BF16 (see
+//! `nsl_codegen::cpdt_precision_exec` for why not FP16, and why the second
+//! moment is never narrowed). Pinning the count is deliberate: a join regression reports
 //! "0 buffer(s)" while still printing "active", which is precisely the shape
 //! defect 2 had.
 
@@ -77,7 +79,7 @@ fn cmd_with_full_stack() -> Command {
 }
 
 /// The full stack activates CPDT-sourced moment precision, with the designed
-/// effect: six FP16 moment buffers, a healthy bus channel, and a run that
+/// effect: six reduced first-moment buffers, a healthy bus channel, and a run that
 /// trains to completion.
 #[test]
 fn cpdt_moment_precision_activates_through_the_driver() {
@@ -87,7 +89,7 @@ fn cpdt_moment_precision_activates_through_the_driver() {
         .success()
         .stderr(predicate::str::contains(
             "[cpdt] optimizer-moment precision active (CPDT per-param plan): \
-             6 moment buffer(s) in FP16 storage",
+             6 first-moment buffer(s) in BF16 storage",
         ))
         // The channel the defect lived on: published once (the pre-plan
         // offer; the in-place site skips when the offer was accepted), read
@@ -146,7 +148,7 @@ fn cpdt_without_wggo_activates_weights_only() {
         ))
         .stderr(predicate::str::contains(
             "[cpdt] optimizer-moment precision active (CPDT per-param plan): \
-             6 moment buffer(s) in FP16 storage",
+             6 first-moment buffer(s) in BF16 storage",
         ))
         // One publish (the wrapper's weights-only offer), read full by the
         // consult AND the weights-only staleness re-check; never empty.
@@ -269,7 +271,7 @@ fn a_loop_bound_train_block_activates_weights_only() {
         ))
         .stderr(predicate::str::contains(
             "[cpdt] optimizer-moment precision active (CPDT per-param plan): \
-             6 moment buffer(s) in FP16 storage",
+             6 first-moment buffer(s) in BF16 storage",
         ))
         // Wrapper weights-only publish + post-body full-model re-publish;
         // consult read + re-arbitration read. A refusal here would mean the
@@ -341,7 +343,7 @@ fn a_distill_block_activates_weights_only_under_the_accumulation_window() {
         ))
         .stderr(predicate::str::contains(
             "[cpdt] optimizer-moment precision active (CPDT per-param plan): \
-             6 moment buffer(s) in FP16 storage",
+             6 first-moment buffer(s) in BF16 storage",
         ))
         // Same channel health as the train-block weights-only arm: one
         // publish (the wrapper's offer), read full by the consult and the
@@ -414,67 +416,9 @@ fn the_report_caveats_the_zero_model_zero_halves() {
     );
 }
 
-/// The FP16 moments must CHANGE training — activation without effect is
-/// theater, and the "active: N buffer(s)" line alone cannot rule it out
-/// (the count comes from the same lists whose consumption it claims).
-///
-/// Instrument calibration, learned the hard way while building this gate: at
-/// the shipped fixture's 2 epochs x lr=0.001 the FP16-m perturbation sits
-/// BELOW the f32 ulp of theta~1.0 and the saved models come out
-/// byte-identical with the mechanism fully working — an identity check there
-/// "confirms theater" on correct code. 60 epochs at lr=0.05 puts the
-/// perturbation orders of magnitude above ulp, so: models must DIFFER with
-/// the plan active, and a divergent/NaN blowup would fail the success
-/// asserts — differing-but-finite is exactly the dequant->step->quant
-/// signature.
-#[test]
-fn fp16_moments_change_training_rather_than_being_theater() {
-    let tmp = tempfile::tempdir().unwrap();
-    let src = std::fs::read_to_string(fixture()).unwrap();
-    let hot = src
-        .replace("epochs = 2", "epochs = 60")
-        .replace("lr = 0.001", "lr = 0.05");
-    assert_ne!(src, hot, "the rewrite matched nothing — fixture drifted");
-    let hot_path = tmp.path().join("hot.nsl");
-    std::fs::write(&hot_path, hot).unwrap();
-
-    let run = |dir: &std::path::Path, cpdt: bool| {
-        std::fs::create_dir_all(dir).unwrap();
-        let mut cmd = Command::cargo_bin("nsl").unwrap();
-        cmd.env("NSL_STDLIB_PATH", workspace_root().join("stdlib"));
-        cmd.current_dir(dir);
-        cmd.arg("run")
-            .arg(&hot_path)
-            .arg("--source-ad")
-            .arg("--wggo")
-            .arg("full")
-            .arg("--weights")
-            .arg(weights());
-        if cpdt {
-            cmd.arg("--cpdt").arg("full").arg("--cpdt-num-gpus").arg("2");
-        }
-        cmd.assert().success();
-        std::fs::read(dir.join("cpdt_precision_out.nslm")).unwrap()
-    };
-    let with_plan = run(&tmp.path().join("on"), true);
-    let without_plan = run(&tmp.path().join("off"), false);
-    assert_eq!(
-        with_plan.len(),
-        without_plan.len(),
-        "same model, same format — a size change means something else moved"
-    );
-    assert_ne!(
-        with_plan, without_plan,
-        "the CPDT FP16-moment run saved a model byte-identical to the F32 \
-         run at a step count where FP16-m noise must exceed f32 ulp — the \
-         precision plan is being reported active without reaching the \
-         emitted arithmetic"
-    );
-}
-
 /// The gate's own premise: the fixture and its weights exist, and the tier
 /// split documented in the fixture header still yields a MEDIUM tier — six
-/// FP16 buffers is a designed number, not an incidental one.
+/// reduced buffers is a designed number, not an incidental one.
 #[test]
 fn the_fixture_these_gates_use_exists() {
     assert!(fixture().exists(), "missing {:?}", fixture());
@@ -497,4 +441,162 @@ fn the_fixture_these_gates_use_exists() {
         "the loop fixture's binding shape changed — verify the param-path \
          prefix still strips to the safetensors keys"
     );
+}
+
+/// Writes a safetensors file of f32 tensors, each filled with one value.
+fn write_filled_safetensors(path: &std::path::Path, tensors: &[(&str, &[usize], f32)]) {
+    let mut header = serde_json::Map::new();
+    let mut data: Vec<u8> = Vec::new();
+    for (name, shape, value) in tensors {
+        let count: usize = shape.iter().product();
+        let start = data.len();
+        for _ in 0..count {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        header.insert(
+            (*name).to_string(),
+            serde_json::json!({
+                "dtype": "F32",
+                "shape": shape,
+                "data_offsets": [start, data.len()],
+            }),
+        );
+    }
+    let mut json = serde_json::Value::Object(header).to_string().into_bytes();
+    while json.len() % 8 != 0 {
+        json.push(b' ');
+    }
+    let mut out = (json.len() as u64).to_le_bytes().to_vec();
+    out.extend_from_slice(&json);
+    out.extend_from_slice(&data);
+    std::fs::write(path, out).unwrap();
+}
+
+/// Reduced-precision moments must leave training where full-precision
+/// moments leave it, for gradients of realistic size.
+///
+/// Every block weight here receives a gradient of exactly 1e-3 per element
+/// (`x = ones[2, 8]`, `embed = ones`, loss = `sum(pred) * 6.25e-5`), so the
+/// AdamW trajectory is known: the weight falls from 1.0 at close to `lr`
+/// per step. The weights file puts blocks 1..6 in the plan's LOW tier,
+/// which asks for an 8-bit `m` and a 16-bit `v`.
+///
+/// Stored as f16, `v` could not hold `(1 - beta2) * g^2 = 1e-9` at all: it
+/// stayed zero, the step became `m_hat / eps`, and after 200 steps those
+/// blocks sat at -0.85 where the f32 run reaches +0.82 (ten times the
+/// displacement). The existing numerical test drives gradients of 0.1 to
+/// 1, where that cannot show.
+#[test]
+fn reduced_moments_track_full_precision_at_a_realistic_gradient_size() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = r#"
+model Block:
+    w: Tensor = ones([64, 64])
+
+    fn forward(self, h: Tensor) -> Tensor:
+        return h @ self.w
+
+    fn mean_w(self) -> Tensor:
+        return mean(self.w)
+
+model TinyNet:
+    embed: Tensor = ones([8, 64])
+    blocks: [Block; 8] = Block()
+    final_norm: Tensor = ones([64])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let e = x @ self.embed
+        let h = e * 0.0
+        for block in self.blocks:
+            h = h + block.forward(e)
+        return h * self.final_norm
+
+    fn probe(self) -> Tensor:
+        for block in self.blocks:
+            let t: Tensor = block.mean_w()
+            print(t)
+        return zeros([1])
+
+let m = TinyNet()
+let x = ones([2, 8])
+
+train(model = m, epochs = 400, grad_accumulation = 2):
+    optimizer: AdamW(lr = 0.001, beta1 = 0.9, beta2 = 0.999, eps = 1e-8, weight_decay = 0.0)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = sum(pred) * 0.0000625
+
+m.probe()
+"#;
+    let program = tmp.path().join("const_grad.nsl");
+    std::fs::write(&program, src).unwrap();
+
+    let block_names: Vec<String> = (0..8).map(|i| format!("blocks.{i}.w")).collect();
+    let mut tensors: Vec<(&str, &[usize], f32)> =
+        vec![("embed", &[8, 64], 1.0), ("final_norm", &[64], 1.0)];
+    for (i, name) in block_names.iter().enumerate() {
+        // Small-magnitude interior blocks score into the LOW tier; the
+        // first and last blocks are pinned HIGH by position.
+        let fill = if i == 0 || i == 7 { 1.0 } else { 2e-5 };
+        tensors.push((name.as_str(), &[64, 64], fill));
+    }
+    let weights_path = tmp.path().join("low_tier.safetensors");
+    write_filled_safetensors(&weights_path, &tensors);
+
+    let run = |reduced: bool| -> (Vec<f64>, String) {
+        let mut cmd = Command::cargo_bin("nsl").unwrap();
+        cmd.env("NSL_STDLIB_PATH", workspace_root().join("stdlib"));
+        cmd.current_dir(tmp.path());
+        cmd.arg("run").arg(&program).arg("--target").arg("cpu").arg("--source-ad");
+        if reduced {
+            cmd.arg("--cpdt")
+                .arg("full")
+                .arg("--cpdt-num-gpus")
+                .arg("1")
+                .arg("--weights")
+                .arg(&weights_path);
+        }
+        let out = cmd.output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "run failed:\n{stderr}");
+        let means: Vec<f64> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.trim().parse::<f64>().ok())
+            .collect();
+        assert_eq!(means.len(), 8, "expected one mean per block");
+        (means, stderr)
+    };
+
+    let (full, _) = run(false);
+    let (reduced, stderr) = run(true);
+    assert!(
+        stderr.contains("6 first-moment buffer(s) in BF16 storage"),
+        "the reduced run did not put the six LOW-tier blocks in reduced \
+         storage, so it proves nothing:\n{stderr}"
+    );
+    // 200 optimizer steps at lr 1e-3 on a constant gradient: about 0.18.
+    for (i, &w) in full.iter().enumerate() {
+        assert!((0.80..0.83).contains(&w), "f32 reference drifted: block {i} = {w}");
+    }
+    for (i, (&r, &f)) in reduced.iter().zip(&full).enumerate() {
+        let (moved_reduced, moved_full) = (1.0 - r, 1.0 - f);
+        assert!(
+            (moved_reduced / moved_full - 1.0).abs() < 0.02,
+            "block {i}: reduced-precision moments moved the weight by \
+             {moved_reduced}, full precision by {moved_full}"
+        );
+    }
+    // And the plan must reach the arithmetic: a BF16 first moment rounds,
+    // so the six reduced blocks cannot land on the f32 run's exact value.
+    // (An earlier form of this check trained the shared fixture at a loss
+    // of 5e30, where `v` overflows to infinity and the Adam step is zero in
+    // both runs; it told the two apart only because an f16 `m` overflowed
+    // too.)
+    for i in 1..7 {
+        assert_ne!(
+            reduced[i], full[i],
+            "block {i} is reported in reduced storage but trained to the \
+             bit-identical value of the f32 run"
+        );
+    }
 }

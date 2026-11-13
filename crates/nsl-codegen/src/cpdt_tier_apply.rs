@@ -25,6 +25,9 @@ pub enum OptimPrecision {
 }
 
 impl OptimPrecision {
+    /// Bytes per element of the format the tier NAMES. Not what is stored:
+    /// see `cpdt_precision_exec::stored_moment_bytes`, which the plan's
+    /// byte totals use.
     pub fn bytes(self) -> u32 {
         match self {
             OptimPrecision::Fp32 => 4,
@@ -143,7 +146,8 @@ pub fn classify_param(entry: &WeightEntry, cfg: &PrecisionConfig) -> ParamPrecis
     let (tier, score, layer, kind) = scorer.score_entry(entry);
     let (m, v) = tier.precision();
     let param_bytes = (entry.num_elements as u64) * (entry.dtype.byte_width() as u64);
-    let optim_bytes = (entry.num_elements as u64) * (m.bytes() as u64 + v.bytes() as u64);
+    let optim_bytes = (entry.num_elements as u64)
+        * crate::cpdt_precision_exec::stored_moment_bytes(m, v);
     let stochastic = cfg.embedding_stochastic_rounding && matches!(kind, LayerKind::Embedding);
     ParamPrecision {
         name: entry.name.clone(),
@@ -190,7 +194,8 @@ pub fn plan_map_noweights(wm: &WeightMap, cfg: &PrecisionConfig) -> PrecisionPla
         let (tier, score, layer, kind) = scorer.score_optional(name, entry.num_elements, None);
         let (m, v) = tier.precision();
         let param_bytes = (entry.num_elements as u64) * (entry.dtype.byte_width() as u64);
-        let optim_bytes = (entry.num_elements as u64) * (m.bytes() as u64 + v.bytes() as u64);
+        let optim_bytes = (entry.num_elements as u64)
+        * crate::cpdt_precision_exec::stored_moment_bytes(m, v);
         let stochastic = cfg.embedding_stochastic_rounding && matches!(kind, LayerKind::Embedding);
         params.push(ParamPrecision {
             name: name.clone(),

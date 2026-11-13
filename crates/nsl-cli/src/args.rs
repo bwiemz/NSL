@@ -790,12 +790,14 @@ pub(crate) struct BuildArgs {
 
         /// WGGO: per-device resident training-memory budget in MiB. When
         /// set, the planner enforces the cap at both optimization levels
-        /// (inter-layer DP + per-layer ILP) and, under budget pressure,
-        /// organically lowers Adam-moment precision to fit — implies
-        /// --wggo-moment-precision (fp16 moments via the #369 GPU cast
-        /// envelope are the shipped mechanism). Rejected if 0 or
-        /// unparseable. A plan that cannot fit even with 16-bit moments is
-        /// a hard compile error.
+        /// (inter-layer DP + per-layer ILP) and, for a layer that does not
+        /// fit with full-precision Adam moments, stores its first moment in
+        /// BF16 — implies --wggo-moment-precision. The second moment is
+        /// never narrowed, so the saving is 2 of the 8 moment bytes per
+        /// parameter. Rejected if 0 or unparseable. A plan that cannot fit
+        /// even then is a hard compile error. The planner sizes layers from
+        /// a nominal shape, not this model's: treat the figures in its
+        /// messages as model units.
         #[arg(long, value_name = "MIB")]
         pub(crate) wggo_memory_budget: Option<u64>,
 
@@ -1424,12 +1426,14 @@ pub(crate) struct RunArgs {
 
         /// WGGO: per-device resident training-memory budget in MiB. When
         /// set, the planner enforces the cap at both optimization levels
-        /// (inter-layer DP + per-layer ILP) and, under budget pressure,
-        /// organically lowers Adam-moment precision to fit — implies
-        /// --wggo-moment-precision (fp16 moments via the #369 GPU cast
-        /// envelope are the shipped mechanism). Rejected if 0 or
-        /// unparseable. A plan that cannot fit even with 16-bit moments is
-        /// a hard compile error.
+        /// (inter-layer DP + per-layer ILP) and, for a layer that does not
+        /// fit with full-precision Adam moments, stores its first moment in
+        /// BF16 — implies --wggo-moment-precision. The second moment is
+        /// never narrowed, so the saving is 2 of the 8 moment bytes per
+        /// parameter. Rejected if 0 or unparseable. A plan that cannot fit
+        /// even then is a hard compile error. The planner sizes layers from
+        /// a nominal shape, not this model's: treat the figures in its
+        /// messages as model units.
         #[arg(long, value_name = "MIB")]
         pub(crate) wggo_memory_budget: Option<u64>,
 

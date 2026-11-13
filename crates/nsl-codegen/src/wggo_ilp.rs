@@ -463,12 +463,20 @@ pub fn solve_layer_cpkd(
     // byte-identical to a solver without the axis.
     let cpkd_domain = crate::wggo_cpkd::enumerate_choices(constraints.cpkd.as_ref());
 
+    // `precision_domain` is ordered high to low, so under a bare memory
+    // budget the first `m_bits` with a feasible candidate is the highest
+    // precision that fits, and the walk stops there (see
+    // `budget_alone_decides_precision`).
+    let stop_at_first_fit = budget_alone_decides_precision(constraints);
     for &m_bits in precision_domain {
         if !prec_allowed(m_bits, constraints) {
             continue;
         }
+        if stop_at_first_fit && state.best_decision.is_some() {
+            break;
+        }
         for &v_bits in precision_domain {
-            if !prec_allowed(v_bits, constraints) {
+            if !second_moment_bits_allowed(v_bits) {
                 continue;
             }
             for &fase in fase_domain {
@@ -1085,9 +1093,11 @@ pub fn solve_layer_greedy_cpkd(
         })
         .unwrap_or(0);
 
-    // Precision: lowest precision allowed by sensitivity (cheapest).
-    let m_bits = pick_precision_low(constraints);
-    let v_bits = pick_precision_low(constraints);
+    // First moment: the lowest precision the sensitivity evidence allows
+    // (cheapest) -- raised back to 32 bits below when a memory budget is the
+    // only reason it was lowered and 32 bits fits. Second moment: 32 bits.
+    let mut m_bits = pick_precision_low(constraints);
+    let v_bits = 32u8;
 
     // FASE + PCA: pick the local-best at this layer.
     let fase_fused = constraints.allow_fase;
@@ -1114,6 +1124,13 @@ pub fn solve_layer_greedy_cpkd(
         &constraints.packing_savings,
         constraints.packing_scales_quadratic_only,
     );
+    if budget_alone_decides_precision(constraints)
+        && m_bits < 32
+        && ilp_resident_bytes(&entry, lut, 32, v_bits, fase_fused, constraints.budget_informed)
+            <= constraints.memory_budget
+    {
+        m_bits = 32;
+    }
     let memory_bytes = ilp_resident_bytes(
         &entry,
         lut,
@@ -1308,11 +1325,33 @@ fn pick_precision_low(c: &LayerIlpConstraints) -> u8 {
     32
 }
 
+/// Whether the SECOND moment may be stored in `bits`. Only 32: a 16-bit
+/// `v` either underflows (f16: the per-step increment for a gradient of
+/// 1e-3 is below half the smallest subnormal, so `v` stays zero and the
+/// step becomes `m_hat / eps`) or stalls (BF16: its spacing is coarser than
+/// `1 - beta2`). `cpdt_precision_exec` stores `v` f32 whatever the plan
+/// says; keeping the solver's domain to match is what keeps its byte
+/// accounting equal to what is allocated.
+pub(crate) fn second_moment_bits_allowed(bits: u8) -> bool {
+    bits == 32
+}
+
+/// True when `--wggo-memory-budget` is the ONLY thing permitting a 16-bit
+/// first moment (no sensitivity evidence). The objective is time-only and
+/// lower precision is always cheaper in it, so left to the objective the
+/// solver took 16 bits at any budget, including one a hundred times the
+/// model. A budget is a reason to lower precision only when the higher one
+/// does not fit; both solvers use this to take the highest that does.
+fn budget_alone_decides_precision(c: &LayerIlpConstraints) -> bool {
+    c.budget_informed && !c.sensitivity_informed
+}
+
+/// Whether the FIRST moment may be stored in `bits`.
 fn prec_allowed(bits: u8, c: &LayerIlpConstraints) -> bool {
-    // Storage-tier reality gate (review fix): codegen v1 has NO distinct
-    // sub-16 moment storage — `build_dtype_lists_from_overrides` clamps ANY
-    // sub-32 moment bits to DTYPE_FP16 (2 bytes). So an 8-bit decision would
-    // be STORED as fp16 but ACCOUNTED at 1 byte in `moment_state_bytes`,
+    // Storage-tier reality gate (review fix): codegen has NO distinct
+    // sub-16 moment storage — `build_dtype_lists_from_overrides` stores ANY
+    // sub-32 first moment as BF16 (2 bytes). So an 8-bit decision would
+    // be STORED in 2 bytes but ACCOUNTED at 1 byte in `moment_state_bytes`,
     // letting a budget-pressured solve pick 8-bit, pass the budget check at
     // half the true size, and OOM at runtime. Until an actual int8-moment
     // storage tier exists, the moment decision space is {32, 16}: reject any
@@ -1328,13 +1367,15 @@ fn prec_allowed(bits: u8, c: &LayerIlpConstraints) -> bool {
     //
     // `budget_informed` (the user passed `--wggo-memory-budget`) EXEMPTS this
     // evidence gate: the user explicitly traded moment precision for capacity,
-    // and fp16 moments via the #369 GPU cast envelope is the shipped mechanism.
+    // and a BF16 first moment via the #369 cast envelope is the shipped
+    // mechanism. Both solvers then take 16 bits only where 32 does not fit
+    // (`budget_alone_decides_precision`).
     // The exemption is scoped to this evidence gate ONLY — the sensitivity
     // CEILINGS below are unchanged, so when sensitivity data IS present the
     // role floors still pin fragile layers (embeddings / LM-head) to
     // high-precision moments even under budget pressure. `prec_allowed` governs
-    // only `optim_m_bits`/`optim_v_bits`; no other precision axis routes through
-    // it, so nothing else is loosened.
+    // only `optim_m_bits`; no other precision axis routes through it, so
+    // nothing else is loosened.
     if !c.sensitivity_informed && !c.budget_informed && bits < 32 {
         return false;
     }
@@ -1885,11 +1926,12 @@ mod tests {
         assert!(!prec_allowed(8, &critical));
     }
 
+    /// A memory budget lowers the first moment to 16 bits exactly when 32
+    /// bits does not fit, and never touches the second moment. Checked for
+    /// both solvers at a budget one byte under the 32-bit footprint, and at
+    /// a budget far above it.
     #[test]
-    fn budget_informed_flips_moments_32_to_16_under_memory_pressure() {
-        // LutEntry scenario: 32-bit moments exceed the budget, 16-bit fit. The
-        // sensitivity ceiling forbids 8-bit, so the feasible+cheapest choice is
-        // exactly 16-bit — a clean 32→16 flip driven by the budget flag.
+    fn a_memory_budget_lowers_the_first_moment_only_when_32_bits_does_not_fit() {
         let lut = build_lut(&shape(), h100(), &LutAxes::default());
         // Pin the structural axes so param/activation bytes are fixed: keep-all
         // heads + max FFN (importance_informed=false), no FASE surcharge
@@ -1905,46 +1947,65 @@ mod tests {
                 1,
             )
         };
-        let r16 = resident(16, 16);
+        let r16 = resident(16, 32);
         let r32 = resident(32, 32);
-        assert!(r16 < r32, "fp16 moments must be smaller than fp32");
-        // Budget just below the 32-bit footprint: 16 fits, 32 does not.
-        let budget = r32 - 1;
+        assert!(r16 < r32, "a 16-bit first moment must be smaller");
 
         let base = LayerIlpConstraints {
             num_heads: 8,
             gqa_group: 1,
-            sensitivity: 0.6, // forbids 8-bit via the high ceiling
+            sensitivity: 0.6,
             importance_informed: false,
             allow_fase: false,
             packing_modes_mask: 0b0001,
-            memory_budget: budget,
             ..Default::default()
         };
+        type Solver = fn(&LayerCostLut, &LayerIlpConstraints) -> LayerIlpSolution;
+        let solvers: [(&str, Solver); 2] =
+            [("full", solve_layer), ("greedy", solve_layer_greedy)];
+        for (name, solve) in solvers {
+            // One byte short of the 32-bit footprint: 16 fits, 32 does not.
+            let tight = LayerIlpConstraints {
+                budget_informed: true,
+                memory_budget: r32 - 1,
+                ..base.clone()
+            };
+            let sol = solve(&lut, &tight);
+            assert!(sol.feasible, "{name}: a 16-bit first moment fits");
+            assert_eq!(sol.decision.optim_m_bits, 16, "{name}: m drops to 16 under pressure");
+            assert_eq!(sol.decision.optim_v_bits, 32, "{name}: v is never narrowed");
+            assert!(sol.memory_bytes <= r32 - 1);
 
-        // Budget ON: the solver quantizes moments to 16-bit and fits.
-        let with_budget = LayerIlpConstraints {
-            budget_informed: true,
-            ..base.clone()
-        };
-        let sol = solve_layer(&lut, &with_budget);
-        assert!(sol.feasible, "16-bit moments must fit the budget");
-        assert_eq!(sol.decision.optim_m_bits, 16, "m flips 32→16 under budget");
-        assert_eq!(sol.decision.optim_v_bits, 16, "v flips 32→16 under budget");
-        assert!(sol.memory_bytes <= budget);
-        assert!(r16 <= budget);
+            // The same request with room to spare keeps full precision. This
+            // is the case that used to drop to 16 bits at any budget.
+            let roomy = LayerIlpConstraints {
+                budget_informed: true,
+                memory_budget: r32 * 100,
+                ..base.clone()
+            };
+            let sol = solve(&lut, &roomy);
+            assert!(sol.feasible);
+            assert_eq!(sol.decision.optim_m_bits, 32, "{name}: 32 bits fits, so it is kept");
+            assert_eq!(sol.decision.optim_v_bits, 32);
 
-        // Budget OFF (same tight cap, but no exemption): 16-bit is forbidden by
-        // the evidence gate and 32-bit is over budget ⇒ no feasible candidate.
+            // Too small even with a 16-bit first moment: infeasible, where a
+            // 16-bit second moment would once have made it "fit".
+            let too_small = LayerIlpConstraints {
+                budget_informed: true,
+                memory_budget: r16 - 1,
+                ..base.clone()
+            };
+            assert!(!solve(&lut, &too_small).feasible, "{name}: nothing fits below r16");
+        }
+
+        // Without the budget flag 16 bits is gated off (no evidence) and 32
+        // bits is over the cap: no feasible candidate.
         let without_budget = LayerIlpConstraints {
             budget_informed: false,
+            memory_budget: r32 - 1,
             ..base
         };
-        let sol_off = solve_layer(&lut, &without_budget);
-        assert!(
-            !sol_off.feasible,
-            "without the flag, fp16 is gated off and fp32 is over budget"
-        );
+        assert!(!solve_layer(&lut, &without_budget).feasible);
     }
 
     #[test]
@@ -2124,11 +2185,10 @@ mod tests {
         // Gap #2: with the optimizer-cost term in the objective, a layer with
         // no numerical-sensitivity floor prefers the cheapest STORABLE moments
         // — but only when the sensitivity value is backed by a real signal
-        // (weight analysis / calibration). The cheapest storable moment tier
-        // is 16-bit: codegen clamps any sub-32 moment to fp16, so the
-        // decision space is {32, 16} and `prec_allowed` rejects 8-bit (review
-        // fix — an 8-bit decision would be stored as fp16 but accounted at
-        // 1 byte, over-fitting a memory budget and OOMing at runtime).
+        // (weight analysis / calibration). The cheapest storable first
+        // moment is 16-bit (stored BF16), so its decision space is {32, 16}
+        // and `prec_allowed` rejects 8-bit. The second moment has no sound
+        // 16-bit store and stays at 32 (`second_moment_bits_allowed`).
         let lut = build_lut(&shape(), h100(), &LutAxes::default());
         let constraints = LayerIlpConstraints {
             sensitivity_informed: true, // evidence present, sensitivity = 0
@@ -2137,7 +2197,7 @@ mod tests {
         let sol = solve_layer(&lut, &constraints);
         assert!(sol.feasible);
         assert_eq!(sol.decision.optim_m_bits, 16);
-        assert_eq!(sol.decision.optim_v_bits, 16);
+        assert_eq!(sol.decision.optim_v_bits, 32);
     }
 
     #[test]

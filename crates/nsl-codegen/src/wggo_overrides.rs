@@ -131,12 +131,15 @@ pub struct PerLayerOverride {
     /// `0` is the uninitialized sentinel — meaning "no recommendation."
     pub shard_factor: u32,
     /// CPDT/FASE: optimizer first-moment storage precision in bits
-    /// (32 / 16 / 8). Consumed by the train-block dtype-list builder in
-    /// stmt.rs; 8 clamps to FP16 storage in v1 (the same ladder step as
-    /// `cpdt_precision_exec::clamp_int8_to_fp16`). Solver-side, sub-32
-    /// bits require an informed sensitivity signal (`prec_allowed`).
+    /// (32 or 16). Consumed by the train-block dtype-list builder
+    /// (`cpdt_precision_exec::build_dtype_lists_from_overrides`), which
+    /// stores a 16-bit decision as BF16. Solver-side, 16 bits needs either
+    /// a sensitivity signal or a memory budget that 32 bits does not fit
+    /// (`wggo_ilp::prec_allowed`).
     pub optim_m_bits: u8,
     /// CPDT/FASE: optimizer second-moment storage precision in bits.
+    /// Always 32: no 16-bit encoding of the second moment is sound yet
+    /// (`wggo_ilp::second_moment_bits_allowed`).
     pub optim_v_bits: u8,
 }
 
