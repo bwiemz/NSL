@@ -103,6 +103,13 @@ pub struct TypeChecker<'a> {
     /// M56: Spans of all `agent Foo:` declarations collected during the
     /// top-level decl pass. Used to emit E0610 at the end of that pass.
     pub agent_decl_spans: Vec<Span>,
+    /// Declared parameter names (without `self`) of this module's callables,
+    /// keyed by the name a call site spells: a free function's name, a
+    /// model's name (its constructor parameters) or a method's name. One
+    /// entry per declaration, since two models may share a method name.
+    /// `check_call` uses it to refuse a named argument that is not in its
+    /// parameter's position — see `check_named_argument_order`.
+    pub(crate) call_param_names: HashMap<Symbol, Vec<Vec<Symbol>>>,
 }
 
 impl<'a> TypeChecker<'a> {
@@ -128,7 +135,37 @@ impl<'a> TypeChecker<'a> {
             pca_configs: Vec::new(),
             linear_types_enabled: false,
             agent_decl_spans: Vec::new(),
+            call_param_names: HashMap::new(),
         }
+    }
+
+    /// Record the parameter names of every function, model constructor and
+    /// method declared in `stmts` (decorated declarations included).
+    fn collect_call_param_names(&mut self, stmts: &[Stmt]) {
+        for stmt in stmts {
+            let mut inner = stmt;
+            while let StmtKind::Decorated { stmt: wrapped, .. } = &inner.kind {
+                inner = wrapped;
+            }
+            match &inner.kind {
+                StmtKind::FnDef(fn_def) => self.record_param_names(fn_def.name, &fn_def.params),
+                StmtKind::ModelDef(model_def) => {
+                    self.record_param_names(model_def.name, &model_def.params);
+                    for member in &model_def.members {
+                        if let nsl_ast::decl::ModelMember::Method(method, _) = member {
+                            self.record_param_names(method.name, &method.params);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn record_param_names(&mut self, callable: Symbol, params: &[nsl_ast::decl::Param]) {
+        let names: Vec<Symbol> =
+            params.iter().map(|p| p.name).filter(|n| self.resolve_name(*n) != "self").collect();
+        self.call_param_names.entry(callable).or_default().push(names);
     }
 
     /// Set pre-resolved import types from other modules.
@@ -139,6 +176,7 @@ impl<'a> TypeChecker<'a> {
     pub fn check_module(&mut self, module: &Module) {
         // Two-pass: first collect top-level declarations, then check bodies
         self.collect_top_level_decls(&module.stmts);
+        self.collect_call_param_names(&module.stmts);
 
         // M56: Emit E0610 once after all decls are collected (not inside
         // collect_top_level_decls, which recurses for Decorated stmts and
