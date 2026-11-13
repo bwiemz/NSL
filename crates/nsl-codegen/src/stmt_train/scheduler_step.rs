@@ -1,19 +1,37 @@
-//! The tail of the train block's step, after the optimizer step (sections
-//! 7g2–7h of the driver): the scheduler call that redefines the learning
-//! rate (emitted BEFORE the step-count increment so step 0 produces the
-//! step-0 rate; the resolved scheduler's constants are passed in the
-//! stdlib signature order after the auto-injected base rate and step),
-//! the step-count increment, and the Milestone B periodic full-train-state
-//! checkpoint, which fires when the post-increment step count is a
-//! multiple of `checkpoint_every` optimizer steps — an optimizer-step
-//! boundary, where the accumulation buffers were just zeroed and the
-//! offload drain has completed — and records the loader handle and the
-//! epoch to resume at.
+//! The learning-rate schedule and the tail of the train block's step.
 //!
-//! Moved out of `compile_train_block_inner` (roadmap A1): 132 lines,
-//! 14 inputs ([`SchedulerStepInputs`]). The train-block CLIF snapshots
-//! (`tests/train_clif_snapshots.rs`) pin the scheduler call and the
-//! increment on every fixture.
+//! Two emitters, at two points of the step:
+//!
+//! * [`Compiler::emit_scheduler_lr`] runs at the TOP of every micro-step,
+//!   before the forward: it calls the resolved scheduler with the current
+//!   (0-based, micro-batch) step count and redefines the learning rate, so
+//!   the optimizer update taken at step `k` uses `schedule(k)` — on the
+//!   standard step, on the CSLA window schedule that updates parameters
+//!   inside the backward, and on the first step after a checkpoint resume.
+//!   The resolved scheduler's constants are passed in the stdlib signature
+//!   order after the auto-injected base rate and step.
+//!
+//!   It used to run AFTER the optimizer step. The rate computed at step
+//!   `k` was therefore first consumed at step `k + 1`, and the first
+//!   optimizer step of a run (and of every resume without accumulation)
+//!   ran at the optimizer's constructor rate — a `warmup_cosine` run took
+//!   its first AdamW step, the one where every parameter moves by a full
+//!   `lr`, at the peak rate the warmup exists to defer. Measured by fitting
+//!   the applied rate per micro-batch against reference gradients:
+//!   `1.0e-3, 0, 1.25e-4, 2.5e-4, ...` for `warmup_steps=8` at base 1e-3.
+//!
+//! * [`Compiler::emit_scheduler_step`] is the tail after the optimizer step
+//!   (sections 7h onward of the driver): the step-count increment, and the
+//!   Milestone B periodic full-train-state checkpoint, which fires when the
+//!   post-increment step count is a multiple of `checkpoint_every`
+//!   optimizer steps — an optimizer-step boundary, where the accumulation
+//!   buffers were just zeroed and the offload drain has completed — and
+//!   records the loader handle and the epoch to resume at.
+//!
+//! Moved out of `compile_train_block_inner` (roadmap A1). The train-block
+//! CLIF snapshots (`tests/train_clif_snapshots.rs`) pin the scheduler call
+//! and the increment on every fixture; `tests/scheduler_applied_lr_gate.rs`
+//! (nsl-cli) pins the rate each step actually trains at.
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types as cl_types;
@@ -36,46 +54,24 @@ pub(crate) struct SchedulerStepInputs<'a> {
 }
 
 impl Compiler<'_> {
-    /// Emit the scheduler call, the step-count increment and the periodic
-    /// checkpoint (see the module header).
-    pub(crate) fn emit_scheduler_step(
+    /// Emit the scheduler call that sets this micro-step's learning rate
+    /// (see the module header). A no-op without a `scheduler:` section: the
+    /// rate stays the optimizer's constructor value.
+    pub(crate) fn emit_scheduler_lr(
         &mut self,
         builder: &mut FunctionBuilder,
-        state: &mut FuncState,
         inputs: SchedulerStepInputs<'_>,
     ) -> Result<(), CodegenError> {
-        let SchedulerStepInputs {
-            plan,
-            emit,
-        } = inputs;
-        let EmitState {
-            checkpoint_dl_handle,
-            checkpoint_names_list,
-            epoch_counter_var,
-            has_dataloader,
-            lr_var,
-            param_list,
-            state_list_1,
-            state_list_2,
-            step_count_var,
-            ..
-        } = *emit;
-        // TrainPlan step 1 (roadmap A1): the facts this phase used to receive
-        // as copied fields, read from the carrier under their old names so
-        // the body below is unchanged.
-        let checkpoint_every = plan.schedule.checkpoint_every;
-        let checkpoint_save_path = &plan.schedule.checkpoint_save_path;
-        let grad_accumulation_steps = plan.schedule.grad_accumulation_steps;
+        let SchedulerStepInputs { plan, emit } = inputs;
+        let EmitState { lr_var, step_count_var, .. } = *emit;
         let lr_value = plan.spec.lr_value;
         let scheduler = &plan.spec.scheduler;
 
-
-        // 7g2. Scheduler: update learning rate if a scheduler is configured.
-        // NOTE: step_count is incremented AFTER the scheduler call so that
-        // step 0 produces the step-0 learning rate (e.g. warmup starts
-        // correctly). All names/kwargs/defaults were resolved by
-        // resolve_optim_config — this just emits the constants in the
-        // stdlib signature order after the auto-injected (base_lr, step).
+        // Scheduler: this step's learning rate, from the pre-increment step
+        // count — step 0 trains at the step-0 rate. All names/kwargs/defaults
+        // were resolved by resolve_optim_config — this just emits the
+        // constants in the stdlib signature order after the auto-injected
+        // (base_lr, step).
         if let Some(sched) = scheduler {
             use nsl_semantic::optim_config::ResolvedScheduler;
 
@@ -132,7 +128,40 @@ impl Compiler<'_> {
             builder.def_var(lr_var, new_lr);
         }
 
-        // 7h. Increment step count (after scheduler so step 0 uses the initial LR)
+        Ok(())
+    }
+
+    /// Emit the step-count increment and the periodic checkpoint (see the
+    /// module header).
+    pub(crate) fn emit_scheduler_step(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        inputs: SchedulerStepInputs<'_>,
+    ) -> Result<(), CodegenError> {
+        let SchedulerStepInputs {
+            plan,
+            emit,
+        } = inputs;
+        let EmitState {
+            checkpoint_dl_handle,
+            checkpoint_names_list,
+            epoch_counter_var,
+            has_dataloader,
+            param_list,
+            state_list_1,
+            state_list_2,
+            step_count_var,
+            ..
+        } = *emit;
+        // TrainPlan step 1 (roadmap A1): the facts this phase used to receive
+        // as copied fields, read from the carrier under their old names so
+        // the body below is unchanged.
+        let checkpoint_every = plan.schedule.checkpoint_every;
+        let checkpoint_save_path = &plan.schedule.checkpoint_save_path;
+        let grad_accumulation_steps = plan.schedule.grad_accumulation_steps;
+
+        // 7h. Increment step count
         let sc = builder.use_var(step_count_var);
         let one_i64 = builder.ins().iadd_imm_s(sc, 1);
         builder.def_var(step_count_var, one_i64);

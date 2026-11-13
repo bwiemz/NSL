@@ -588,6 +588,37 @@ impl Compiler<'_> {
                 "cannot assign a DataLoader batch handle directly; access batch fields instead",
             ));
         }
+        // `t op= e` on a tensor is `t = t op e`, through the same binary-op
+        // lowering every other tensor expression takes (broadcasting, device
+        // reconciliation, the tape record, ownership of the result). The
+        // identifier arm below is scalar arithmetic: it emitted `iadd` on the
+        // two TENSOR POINTERS, so `loss += aux` stored the sum of two
+        // addresses and the program died at the next use with no message.
+        if !matches!(op, AssignOp::Assign)
+            && matches!(target.kind, ExprKind::Ident(_))
+            && (self.node_type(target.id).is_tensor() || self.node_type(value.id).is_tensor())
+        {
+            use nsl_ast::operator::BinOp;
+            let bin_op = match op {
+                AssignOp::AddAssign => BinOp::Add,
+                AssignOp::SubAssign => BinOp::Sub,
+                AssignOp::MulAssign => BinOp::Mul,
+                AssignOp::DivAssign => BinOp::Div,
+                AssignOp::Assign => unreachable!("guarded above"),
+            };
+            // The node id is the target's: the checker typed the target as
+            // the tensor this expression produces.
+            let desugared = nsl_ast::expr::Expr {
+                kind: ExprKind::BinaryOp {
+                    left: Box::new(target.clone()),
+                    op: bin_op,
+                    right: Box::new(value.clone()),
+                },
+                span: target.span,
+                id: target.id,
+            };
+            return self.compile_assign(builder, state, target, AssignOp::Assign, &desugared);
+        }
         let new_val = self.compile_expr(builder, state, value)?;
         match &target.kind {
             nsl_ast::expr::ExprKind::Ident(sym) => {

@@ -265,6 +265,12 @@ pub(crate) fn backward_module(op: BackwardOp) -> &'static str {
 /// derivative is its limit, 1 above and 0 below; the hand kernel returned
 /// garbage and then NaN there (`div.approx.f32`'s flush range).
 /// NUL-terminated.
+///
+/// Nothing launches it now: the GPU forward is the sigmoid form, and the
+/// tape pairs it with `BackwardOp::GeluSrcad` (`gpu_gelu_backward`). It stays
+/// in the assembler gate's kernel list — hence `cfg(test)` — as the adjoint
+/// the GPU forward needs the day it moves to the tanh form the CPU runs.
+#[cfg(test)]
 pub(crate) fn gelu_backward_f32_ptx() -> &'static str {
     static MODULE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     MODULE.get_or_init(|| {

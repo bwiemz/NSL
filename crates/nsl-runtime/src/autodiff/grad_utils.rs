@@ -501,11 +501,24 @@ pub(crate) fn scatter_gather_grad(
     let gather_dim_size = input_shape[dim] as usize;
     let outer: usize = input_shape[..dim].iter().map(|&s| s as usize).product::<usize>().max(1);
     let inner: usize = input_shape[dim + 1..].iter().map(|&s| s as usize).product::<usize>().max(1);
-    let n = (indices.len as usize).min(outer);
+    // Along dim 0 there is one outer row, and the GPU forward is an
+    // index-select returning one row PER INDEX (`out[i, ..] = x[idx[i], ..]`).
+    // Bounding the loop by `outer` scattered only the first gradient row, to
+    // `idx[0]`; every index scatters its own row. (The CPU forward admits a
+    // single index along dim 0, for which the two are the same loop.)
+    let n = if dim == 0 { indices.len as usize } else { (indices.len as usize).min(outer) };
     for o in 0..n {
         let idx = indices.read_index(o) as usize;
-        let out_base = o * gather_dim_size * inner + idx * inner;
+        let out_base = if dim == 0 { idx * inner } else { o * gather_dim_size * inner + idx * inner };
         let grad_base = o * inner;
+        if grad_base + inner > grad.len as usize {
+            break;
+        }
+        // An index past the gathered dim has no row to receive a gradient
+        // (the CPU forward aborts on one; the GPU index-select does not check).
+        if idx >= gather_dim_size {
+            continue;
+        }
         for k in 0..inner {
             if grad_dtype == 1 {
                 let g = unsafe { *grad.data_f32().add(grad_base + k) };

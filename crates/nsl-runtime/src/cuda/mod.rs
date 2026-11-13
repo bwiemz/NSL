@@ -3674,7 +3674,14 @@ pub(crate) fn gpu_elementwise_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_n
     let b = NslTensor::from_ptr_ref(b_ptr);
     assert_gpu_f32(a, kernel_name, "lhs");
     assert_gpu_f32(b, kernel_name, "rhs");
-    if a.len != b.len || !a.is_contiguous() || !b.is_contiguous() {
+    // Operands must be broadcast whenever their SHAPES differ, not only when
+    // their lengths do. Keyed on length alone, `[3, 1] - [1, 3]` (3 elements
+    // each) skipped the broadcast, ran the flat kernel and returned a `[3, 1]`
+    // tensor of the three "diagonal" differences where the CPU returns the
+    // 3x3 outer difference; `[3] + [3, 1]` likewise. Measured on an RTX PRO
+    // 4500: `[[1],[2],[3]] - [[10,20,30]]` gave `[[-9],[-18],[-27]]`.
+    let same_shape = tensor_shape_slice(a) == tensor_shape_slice(b);
+    if !same_shape || !a.is_contiguous() || !b.is_contiguous() {
         if let Some((prepared_a, prepared_b, free_a, free_b)) = gpu_prepare_binary_operands(a_ptr, b_ptr)
             && (prepared_a != a_ptr || prepared_b != b_ptr)
         {
@@ -3687,8 +3694,10 @@ pub(crate) fn gpu_elementwise_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_n
             }
             return result;
         }
-        // Fall back to CPU only when GPU broadcast materialization is impossible.
-        if a.len != b.len {
+        // Shapes that do not broadcast go to the CPU implementation, which
+        // owns the refusal: the flat kernel below is only correct for two
+        // operands of one shape.
+        if !same_shape {
             return cpu_fallback_binary(a_ptr, b_ptr, kernel_name);
         }
     }
@@ -6074,6 +6083,21 @@ pub(crate) fn gpu_backward_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_name
     assert_gpu_f32(a, kernel_name, "grad");
     assert_gpu_f32(b, kernel_name, "saved tensor");
     assert_eq!(a.len, b.len, "GPU backward: length mismatch between grad and saved tensors");
+    // The kernel walks both buffers flat and the result is stamped row-major,
+    // so a strided operand has to be materialized first. The tape hands these
+    // arms strided tensors in ordinary programs: the Transpose adjoint returns
+    // a view, and an activation applied to a transposed view saves that view.
+    // Without this, relu/gelu/silu/sigmoid/tanh backward on a transposed
+    // gradient multiplied g[i] by f'(x[j]) for the wrong pairs (i, j) — the
+    // CPU arms wrap the same loop in `with_row_major` for this reason.
+    if !a.is_contiguous() || !b.is_contiguous() {
+        let a_c = crate::tensor::nsl_tensor_contiguous(a_ptr);
+        let b_c = crate::tensor::nsl_tensor_contiguous(b_ptr);
+        let out = gpu_backward_binary(a_c, b_c, ptx, kernel_name);
+        crate::tensor::nsl_tensor_free(a_c);
+        crate::tensor::nsl_tensor_free(b_c);
+        return out;
+    }
 
     let n = a.len as usize;
     let out_data = inner::alloc_managed(n * 4); // f32 = 4 bytes
@@ -6144,10 +6168,16 @@ pub(crate) fn gpu_tanh_backward(grad: i64, saved_out: i64) -> i64 {
 
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_gelu_backward(grad: i64, input: i64) -> i64 {
+    // The derivative of the forward THIS DEVICE ran. The GPU forward is the
+    // sigmoid form `x·σ(1.702x)` (`nsl_gelu_f32`), so its adjoint is
+    // `nsl_gelu_backward_srcad_f32`, the one source AD already uses. The tape
+    // used `nsl_gelu_backward_f32`, the adjoint of the TANH approximation the
+    // CPU forward runs — the gradient of a different function: 1.4% off at
+    // x = 1, 22% at x = -1, 53% at x = -3.
     gpu_backward_binary(
         grad, input,
-        kernels::gelu_backward_f32_ptx(),
-        "nsl_gelu_backward_f32\0",
+        kernels::backward_module(nsl_kir::kernels::elementwise::BackwardOp::GeluSrcad),
+        "nsl_gelu_backward_srcad_f32\0",
     )
 }
 
@@ -6167,6 +6197,13 @@ pub(crate) fn gpu_clamp_f32(a_ptr: i64, lo: f32, hi: f32) -> i64 {
     inner::set_oom_context("clamp_f32");
     let a = NslTensor::from_ptr_ref(a_ptr);
     assert_gpu_f32(a, "clamp_f32", "input");
+    // Flat kernel, row-major result: materialize a strided view first.
+    if !a.is_contiguous() {
+        let a_c = crate::tensor::nsl_tensor_contiguous(a_ptr);
+        let out = gpu_clamp_f32(a_c, lo, hi);
+        crate::tensor::nsl_tensor_free(a_c);
+        return out;
+    }
     let n = a.len as usize;
     let out_data = inner::alloc_managed(n * 4);
     let shape = NslTensor::copy_shape(a.shape, a.ndim);
@@ -6248,6 +6285,15 @@ pub(crate) fn gpu_clamp_backward(grad: i64, input: i64, min_val: f32, max_val: f
     assert_gpu_f32(a, "clamp_backward_f32", "grad");
     assert_gpu_f32(b, "clamp_backward_f32", "input");
     assert_eq!(a.len, b.len, "GPU clamp_backward: length mismatch");
+    // Flat kernel, row-major result (see `gpu_backward_binary`).
+    if !a.is_contiguous() || !b.is_contiguous() {
+        let a_c = crate::tensor::nsl_tensor_contiguous(grad);
+        let b_c = crate::tensor::nsl_tensor_contiguous(input);
+        let out = gpu_clamp_backward(a_c, b_c, min_val, max_val);
+        crate::tensor::nsl_tensor_free(a_c);
+        crate::tensor::nsl_tensor_free(b_c);
+        return out;
+    }
 
     let n = a.len as usize;
     let out_data = inner::alloc_managed(n * 4);

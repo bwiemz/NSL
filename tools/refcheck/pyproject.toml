@@ -1,0 +1,15 @@
+# Tool configuration for the refcheck scripts. Not a package: nothing here is
+# installed or imported from elsewhere.
+
+[tool.ruff.lint.isort]
+# The scripts import their shared module as a sibling (`from ref import ...`).
+# Without this, ruff classifies `ref` as first-party or third-party depending
+# on the directory it is run from, and the two answers want different layouts.
+known-first-party = ["ref"]
+
+[tool.basedpyright]
+# torch, numpy and tokenizers come from the environment the checks are run in
+# (README, "Setup": a `.venv` at the repository root), not from the repository.
+# Point the checker at it so the imports resolve to real stubs.
+venvPath = "../.."
+venv = ".venv"

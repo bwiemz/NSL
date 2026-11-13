@@ -6,11 +6,17 @@
 ## split into `num_heads` heads, scaled dot-product with a causal mask,
 ## then recombine and project out. `nsl.nn.gqa` is the production form —
 ## grouped-query, rotary, and fusible to a flash-attention kernel.
+##
+## The four projections are initialised `N(0, 1/dim)`. At unit variance
+## (what they used to be) the attention logits of a unit-variance input
+## have a standard deviation of about `dim`, the softmax is one-hot from
+## the first step, and almost no gradient reaches the query and key
+## projections.
 model Attention(dim: int, num_heads: int):
-    q_proj: Tensor = randn([dim, dim])
-    k_proj: Tensor = randn([dim, dim])
-    v_proj: Tensor = randn([dim, dim])
-    out_proj: Tensor = randn([dim, dim])
+    q_proj: Tensor = randn([dim, dim]) * sqrt(full([1], 1.0 / float(dim)))
+    k_proj: Tensor = randn([dim, dim]) * sqrt(full([1], 1.0 / float(dim)))
+    v_proj: Tensor = randn([dim, dim]) * sqrt(full([1], 1.0 / float(dim)))
+    out_proj: Tensor = randn([dim, dim]) * sqrt(full([1], 1.0 / float(dim)))
     _num_heads: Tensor = full([1], float(num_heads))
     _head_dim: Tensor = full([1], float(dim) / float(num_heads))
     _dim: Tensor = full([1], float(dim))

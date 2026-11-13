@@ -203,6 +203,12 @@ split into `num_heads` heads, scaled dot-product with a causal mask,
 then recombine and project out. `nsl.nn.gqa` is the production form —
 grouped-query, rotary, and fusible to a flash-attention kernel.
 
+The four projections are initialised `N(0, 1/dim)`. At unit variance
+(what they used to be) the attention logits of a unit-variance input
+have a standard deviation of about `dim`, the softmax is one-hot from
+the first step, and almost no gradient reaches the query and key
+projections.
+
 #### `q_proj: Tensor`
 
 #### `k_proj: Tensor`
@@ -295,7 +301,10 @@ position-wise MLP.
 An affine projection: `y = x W^T + b`.
 
 `w` is `[out_features, in_features]` and transposed at use, matching
-the row-major LM-head convention used throughout the stdlib.
+the row-major LM-head convention used throughout the stdlib. It is
+initialised `N(0, 1/in_features)`, so a unit-variance input gives a
+unit-variance output and a stack of these neither explodes nor
+vanishes at depth; the bias starts at zero.
 
 #### `w: Tensor`
 
@@ -306,7 +315,8 @@ the row-major LM-head convention used throughout the stdlib.
 ### `model Embedding(vocab_size: int, embed_dim: int)`
 
 A lookup table of `vocab_size` rows of width `embed_dim`, indexed by
-integer token ids.
+integer token ids. Rows are initialised `N(0, 0.02^2)`, the usual
+scale for token embeddings.
 
 #### `weight: Tensor`
 
@@ -316,7 +326,7 @@ integer token ids.
 
 Two-layer feed-forward block with a GELU between them — the
 transformer position-wise MLP. `hidden` is conventionally 4x
-`in_features`.
+`in_features`. Each weight is initialised `N(0, 1/fan_in)`.
 
 #### `w1: Tensor`
 
@@ -453,6 +463,10 @@ Learned absolute position embeddings.
 Learned absolute position embeddings, added to the token embeddings.
 For rotary positions — what the GQA attention here uses — see
 `nsl.nn.rope`.
+
+The table is initialised `N(0, 0.02^2)`, the same scale as
+`nsl.nn.layers.Embedding`, so positions do not swamp the tokens they
+are added to.
 
 #### `pe: Tensor`
 
