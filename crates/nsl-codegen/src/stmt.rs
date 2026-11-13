@@ -371,25 +371,20 @@ impl Compiler<'_> {
                         self.update_non_owning_binding(state, sym, value.as_ref());
 
                         // M50: Track sparse tensor variables for end-to-end dispatch.
-                        // Check if the RHS is a call to a sparse function or has Type::Sparse.
-                        if let Some(expr) = value {
-                            let is_sparse_type = matches!(
+                        // The TYPE decides. This also used to treat the result
+                        // of any call whose callee's name contained "sparse"
+                        // (or was `from_dense`) as a sparse tensor, so a dense
+                        // tensor returned by a user function called
+                        // `make_sparse_like` was handed to
+                        // `nsl_sparse_to_dense` at its first `+` and the
+                        // program aborted in the allocator.
+                        if let Some(expr) = value
+                            && matches!(
                                 self.node_type(expr.id),
                                 nsl_semantic::types::Type::Sparse { .. }
-                            );
-                            let is_sparse_call = if let ExprKind::Call { callee, .. } = &expr.kind {
-                                if let ExprKind::Ident(fn_sym) = &callee.kind {
-                                    let fn_name = self.resolve_sym(*fn_sym);
-                                    fn_name.contains("sparse") || fn_name == "from_dense"
-                                } else {
-                                    false
-                                }
-                            } else {
-                                false
-                            };
-                            if is_sparse_type || is_sparse_call {
-                                state.ownership.sparse_vars.insert(sym);
-                            }
+                            )
+                        {
+                            state.ownership.sparse_vars.insert(sym);
                         }
 
                         // Free intermediate tensor temporaries (keep init_val which is now owned by the variable)

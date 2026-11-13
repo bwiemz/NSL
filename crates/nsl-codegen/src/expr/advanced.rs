@@ -3105,6 +3105,22 @@ impl Compiler<'_> {
         if !self.compile_options.weights.config.sparse_codegen {
             return Ok(None);
         }
+        // Withheld until the path is rebuilt. Sparse codegen is on by
+        // default, so any `-w` run whose model held a matrix at least half
+        // zeros reached the code below, and it does not work:
+        //   - on CPU the runtime's fallback passes the `.rodata` VALUES
+        //     pointer to `nsl_tensor_matmul` as if it were a tensor handle,
+        //     and the program aborts ("invalid tensor handle");
+        //   - for the GPU the call site is `x @ W` but the kernel is
+        //     `A_sparse @ B_dense` with A = W, the CSR arrays are host
+        //     `.rodata` addresses passed as device pointers, and the values
+        //     are embedded in the weight's stored dtype while the kernel
+        //     reads f32.
+        // No test exercised it. The dense matmul is always correct. Set
+        // `NSL_M52C_SPARSE_MATMUL=1` to reach the old path while fixing it.
+        if std::env::var("NSL_M52C_SPARSE_MATMUL").ok().as_deref() != Some("1") {
+            return Ok(None);
+        }
 
         // Check if RHS is a known sparse weight
         let rhs_key = match state.weight_values.get(&rhs) {

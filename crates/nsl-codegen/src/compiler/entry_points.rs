@@ -459,16 +459,32 @@ fn apply_auto_mode_fallback_note(
     };
 
     if let Some(reason) = trigger_reason {
-        nsl_log::nsl_log!(INFO, "codegen", 
-            "note: --wggo-importance=auto fell back to magnitude scoring.\n  \
-             reason: {reason}\n  \
-             effect: WGGO ILP runs against magnitude (||W||₂)-based importance scores.\n  \
-             to silence: add @wggo_target AND supply a calibration SIDECAR --\n             \
-             only `nsl_codegen::compile_and_calibrate` produces one, and\n             \
-             `nsl build --calibration-data` does not call it, so that flag\n             \
-             alone will not lift this note. OR set\n             \
-             --wggo-importance=magnitude to opt out of grad scoring entirely."
-        );
+        // The note is for someone who asked for WGGO, once. It used to print
+        // on every compile of every program -- three to five times each,
+        // since each module's options pass through here -- including builds
+        // that never mention WGGO, and it said the solver "runs against
+        // magnitude-based importance scores" when, without `--wggo-weights`,
+        // there are no scores at all: every head and layer scores the same
+        // and nothing is pruned on importance.
+        static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let wggo_requested = opts.wggo.mode.as_deref().is_some_and(|m| m != "off");
+        if wggo_requested && !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            let effect = if opts.wggo.weights.is_some() {
+                "importance scores are weight magnitudes read from --wggo-weights"
+            } else {
+                "no --wggo-weights was given, so every head and layer scores the \
+                 same and nothing is pruned on importance"
+            };
+            nsl_log::nsl_log!(INFO, "codegen",
+                "note: --wggo-importance=auto fell back to magnitude scoring.\n  \
+                 reason: {reason}\n  \
+                 effect: {effect}.\n  \
+                 to silence: pass --wggo-importance=magnitude. Gradient scoring \
+                 needs @wggo_target and a calibration sidecar, which only \
+                 `nsl_codegen::compile_and_calibrate` produces; `nsl build \
+                 --calibration-data` does not call it."
+            );
+        }
         opts.wggo.importance = WggoImportance::Magnitude;
     }
 }

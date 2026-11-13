@@ -491,7 +491,14 @@ pub extern "C" fn nsl_tape_start(param_list: i64) {
         use cudarc::driver::sys::{cuCtxSynchronize, CUresult};
         unsafe {
             let result = cuCtxSynchronize();
-            if result != CUresult::CUDA_SUCCESS {
+            // "No context" is not a deferred error: it is a program that
+            // has not touched the GPU. A runtime built with `cuda` printed
+            // the warning below at every `grad` block of every CPU run.
+            let no_context = matches!(
+                result,
+                CUresult::CUDA_ERROR_NOT_INITIALIZED | CUresult::CUDA_ERROR_INVALID_CONTEXT
+            );
+            if result != CUresult::CUDA_SUCCESS && !no_context {
                 crate::nsl_log!(WARN, "nsl", 
                     "[nsl] WARNING: CUDA deferred error detected at tape_start: {:?}\n\
                      A prior GPU operation failed. Re-run with --cuda-sync to identify it.",
