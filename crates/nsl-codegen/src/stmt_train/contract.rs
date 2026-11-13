@@ -300,6 +300,25 @@ impl Compiler<'_> {
             allow_v_approx: fase_decorator.as_ref().map(|d| d.allow_v_approx).unwrap_or(true),
             forced_mode: fase_forced_mode,
         };
+        // SGD under accumulation is lowered as the bare `theta -= lr *
+        // mean(g)` (`fase_optimizer::emit_sgd`): the plan carries no
+        // momentum, the velocity buffer is allocated and never read, and
+        // weight decay, dampening and Nesterov are not applied at all. With
+        // `grad_accumulation = 1` the same optimizer line runs the stdlib
+        // `sgd_step`, which honours all four — so the same source trained
+        // two different models. Refuse until the accumulated step implements
+        // them, as `Adam(weight_decay=..)` is refused for the same reason.
+        if grad_accumulation_steps > 1
+            && matches!(
+                fase_cfg.optimizer,
+                crate::fase::FaseOptimizer::Sgd | crate::fase::FaseOptimizer::SgdMomentum
+            )
+            && (momentum_value != 0.0 || weight_decay_value != 0.0 || dampening_value != 0.0 || nesterov_value)
+        {
+            return Err(CodegenError::new(format!(
+                "SGD(momentum={momentum_value}, dampening={dampening_value}, weight_decay={weight_decay_value},                  nesterov={nesterov_value}) with grad_accumulation={grad_accumulation_steps} is not supported:                  the accumulated SGD step applies plain `theta -= lr * mean(g)` and would silently ignore                  momentum, dampening, weight decay and Nesterov. Use grad_accumulation=1, plain SGD(lr=..),                  or AdamW"
+            )));
+        }
         // Milestone C: SCHEDULED, with the body widened through the driver's
         // muon x --layerwise-accum rewrite and the disposition re-record —
         // the scheduler prints `<- FASE disposition=` right after the body
