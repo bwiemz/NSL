@@ -587,7 +587,38 @@ pub(crate) fn invoke_csha_if_enabled(
             8,    // default head count; weight-informed path refines this
             compiler.bus.wggo_overrides(),
         ) {
-            if compiler.compile_options.csha.report {
+            // CSHA's kernels are emitted only for attention inside an
+            // `@flash_attention` method. A model without one (every stock
+            // model: `stdlib/nsl/nn/gqa.nsl` calls
+            // `scaled_dot_product_attention` directly) gets the fused flash
+            // forward and backward whatever `--csha` says, and the object is
+            // byte-identical with and without the flag. The planner still
+            // ran above on a nominal layer shape, and its report used to be
+            // printed as if it described this build: "L2-pipeline, 6.00x
+            // speedup, Backward: Tier B.2" for kernels that are never
+            // emitted, and `CSHA disposition=Applied` in the pass trace. Say
+            // what happened instead.
+            let lowered = compiler.kernels.flash_attention_context.is_some();
+            if !lowered {
+                let chains = plan.boundary.num_chains();
+                nsl_log::nsl_log!(INFO, "csha",
+                    "[csha] not applied: {chains} attention projection chain(s) found, but this \
+                     train block's attention is not inside an `@flash_attention` method, and \
+                     CSHA rewrites only those. The fused flash-attention forward and backward \
+                     run as they do without `--csha`; no CSHA kernel is emitted and the \
+                     compiled program is unchanged by this flag."
+                );
+                if !plan.kernels.is_empty() {
+                    crate::pass_trace::record_disposition(
+                        "CSHA",
+                        crate::pass_trace::PassDisposition::Declined {
+                            reason: crate::pass_trace::DeclineReason::NoCandidates(
+                                "attention is not inside an @flash_attention method",
+                            ),
+                        },
+                    );
+                }
+            } else if compiler.compile_options.csha.report {
                 nsl_log::nsl_log!(INFO, "codegen", "{}", plan.render_report());
             } else {
                 nsl_log::nsl_log!(INFO, "csha", "[csha] {}", plan.summary());
@@ -667,8 +698,16 @@ pub(crate) fn invoke_csha_if_enabled(
             // fields, which let the read and the write overlap;
             // they are one struct now, so the sequence has to be
             // written out. Same values, same order.
-            let backward_claims = if let Some(bridge) =
-                compiler.bus.csha_bridge()
+            // No claims without an `@flash_attention` forward: the fused
+            // backward reads activations only that forward saves, so on the
+            // decorator-free path every claim was planned, rejected by the
+            // shared-memory validator on the nominal geometry, and announced
+            // as "CSHA fused backward rejected ... falling back" four times
+            // per layer — for a kernel that could never have run.
+            let backward_claims = if let Some(bridge) = compiler
+                .bus
+                .csha_bridge()
+                .filter(|_| lowered)
             {
                 // Gap I.1: pass the TRAINING config (clamped, no
                 // fusion flags) so the dispatcher's backward SMEM
