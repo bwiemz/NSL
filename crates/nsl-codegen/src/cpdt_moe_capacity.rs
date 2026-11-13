@@ -51,7 +51,14 @@ pub fn apply_capacity_overrides(
     for key in keys {
         let info = moe_configs.get_mut(&key).expect("key from same map");
         let prev = info.capacity_factor;
-        let new = roofline_capacity(roofline_slack, info.top_k as u32, info.num_experts as u32) as f32;
+        // The roofline value may only RAISE a layer's factor. The slack the
+        // CLI passes is a constant 0.0, which makes the formula 1.0 for
+        // every layer; assigning that outright replaced whatever the source
+        // asked for (`@moe(capacity_factor = 2.0)` ran at 1.0 under
+        // `--cpdt full`) and so dropped tokens the user had made room for.
+        let roofline =
+            roofline_capacity(roofline_slack, info.top_k as u32, info.num_experts as u32) as f32;
+        let new = prev.max(roofline);
         if (prev - new).abs() < f32::EPSILON {
             outcomes.push(MoeCapacityOutcome::Unchanged { layer: key, value: new });
         } else {
@@ -139,6 +146,18 @@ mod tests {
         let outcomes = apply_capacity_overrides(CpdtMode::Full, &mut cfgs, 1.0);
         assert!(matches!(outcomes.as_slice(), [MoeCapacityOutcome::Unchanged { value, .. }] if (*value - 1.0).abs() < 1e-6));
         assert_eq!(cfgs["m"].capacity_factor, 1.0);
+    }
+
+    /// The pass may raise a layer's factor and never lower it. With the
+    /// slack the CLI passes today (0.0) the formula is 1.0 for every layer,
+    /// and assigning that outright turned a user's 2.0 into 1.0.
+    #[test]
+    fn a_larger_user_factor_is_kept() {
+        let mut cfgs = HashMap::new();
+        cfgs.insert("m".into(), info(8, 2, 2.0));
+        let outcomes = apply_capacity_overrides(CpdtMode::Full, &mut cfgs, 0.0);
+        assert!(matches!(outcomes.as_slice(), [MoeCapacityOutcome::Unchanged { .. }]));
+        assert_eq!(cfgs["m"].capacity_factor, 2.0);
     }
 
     #[test]
