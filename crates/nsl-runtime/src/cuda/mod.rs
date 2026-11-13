@@ -3674,7 +3674,14 @@ pub(crate) fn gpu_elementwise_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_n
     let b = NslTensor::from_ptr_ref(b_ptr);
     assert_gpu_f32(a, kernel_name, "lhs");
     assert_gpu_f32(b, kernel_name, "rhs");
-    if a.len != b.len || !a.is_contiguous() || !b.is_contiguous() {
+    // Operands must be broadcast whenever their SHAPES differ, not only when
+    // their lengths do. Keyed on length alone, `[3, 1] - [1, 3]` (3 elements
+    // each) skipped the broadcast, ran the flat kernel and returned a `[3, 1]`
+    // tensor of the three "diagonal" differences where the CPU returns the
+    // 3x3 outer difference; `[3] + [3, 1]` likewise. Measured on an RTX PRO
+    // 4500: `[[1],[2],[3]] - [[10,20,30]]` gave `[[-9],[-18],[-27]]`.
+    let same_shape = tensor_shape_slice(a) == tensor_shape_slice(b);
+    if !same_shape || !a.is_contiguous() || !b.is_contiguous() {
         if let Some((prepared_a, prepared_b, free_a, free_b)) = gpu_prepare_binary_operands(a_ptr, b_ptr)
             && (prepared_a != a_ptr || prepared_b != b_ptr)
         {
@@ -3687,8 +3694,10 @@ pub(crate) fn gpu_elementwise_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_n
             }
             return result;
         }
-        // Fall back to CPU only when GPU broadcast materialization is impossible.
-        if a.len != b.len {
+        // Shapes that do not broadcast go to the CPU implementation, which
+        // owns the refusal: the flat kernel below is only correct for two
+        // operands of one shape.
+        if !same_shape {
             return cpu_fallback_binary(a_ptr, b_ptr, kernel_name);
         }
     }
