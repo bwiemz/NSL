@@ -12,9 +12,10 @@ Usage (from the repo root):
 
 from __future__ import annotations
 
+import hashlib
 import json
-import subprocess
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 import numpy as np
@@ -39,6 +40,63 @@ def check(ok: bool, label: str, detail: str = "") -> None:
     print(f"  {'PASS' if ok else 'FAIL'}  {label}{('  — ' + detail) if detail else ''}")
     if not ok:
         failures.append(label)
+
+
+# Documents shorter than this are left out of the train/val comparison. A
+# two-token document ("\n", a lone heading) recurs in any corpus without
+# anything having leaked, and counting those would make the check fail on
+# every real corpus and so be ignored.
+MIN_DOC_TOKENS = 32
+
+
+def iter_documents(stream: np.ndarray, eos: int, chunk: int = 1 << 24) -> Iterator[tuple[int, int]]:
+    """Yield `(start, end)` for every document of a token stream.
+
+    A document is the run of tokens up to, and not including, its separator
+    `eos`. A final run with no separator after it is a document too. The
+    stream is scanned in chunks so a memory-mapped corpus is never loaded
+    whole.
+    """
+    start = 0
+    size = int(stream.size)
+    for base in range(0, size, chunk):
+        block = np.asarray(stream[base:base + chunk])
+        for rel in np.flatnonzero(block == eos):
+            end = base + int(rel)
+            yield start, end
+            start = end + 1
+    if start < size:
+        yield start, size
+
+
+def _digest(stream: np.ndarray, start: int, end: int) -> bytes:
+    tokens = np.ascontiguousarray(stream[start:end], dtype="<u2")
+    return hashlib.blake2b(tokens.tobytes(), digest_size=16).digest()
+
+
+def shared_documents(train: np.ndarray, val: np.ndarray, eos: int,
+                     min_tokens: int = MIN_DOC_TOKENS) -> tuple[int, int]:
+    """Count validation documents that also occur, whole, in the training stream.
+
+    Returns `(val_documents, shared)`: the number of distinct validation
+    documents of at least `min_tokens` tokens, and how many of those are
+    also a training document. Every validation document is hashed and every
+    training document is tested against the set, so a validation set copied
+    from anywhere in the training stream is found, not only one that shares
+    its first or last tokens.
+    """
+    val_docs: set[bytes] = set()
+    for start, end in iter_documents(val, eos):
+        if end - start >= min_tokens:
+            val_docs.add(_digest(val, start, end))
+    shared: set[bytes] = set()
+    if val_docs:
+        for start, end in iter_documents(train, eos):
+            if end - start >= min_tokens:
+                digest = _digest(train, start, end)
+                if digest in val_docs:
+                    shared.add(digest)
+    return len(val_docs), len(shared)
 
 
 def main() -> int:
@@ -94,7 +152,8 @@ def main() -> int:
 
     print("\n== train/val disjointness ==")
     # Every (train, val) pair, not a hardcoded web-only check (item 5): the
-    # sft pair silently had NO disjointness coverage before.
+    # sft pair silently had NO disjointness coverage before. This reads both
+    # streams in full, so it takes minutes on the large pairs.
     for stem in ("web", "sft", "stack"):
         train = mix / f"{stem}_train.bin"
         val = mix / f"{stem}_val.bin"
@@ -118,6 +177,22 @@ def main() -> int:
         # check would pass on real contamination.
         check(not np.array_equal(np.asarray(a[-n:]), np.asarray(b[-n:])),
               f"{stem} val is not a suffix of the train stream")
+        # The two checks above look at 2^20 tokens at each end and nothing
+        # else: a validation set copied whole from the middle of the
+        # training stream passes both. This one reads every document.
+        if eos is None:
+            check(False, f"{stem} train/val documents could not be compared",
+                  "no <|endoftext|> id recorded, so documents cannot be told apart")
+            continue
+        val_docs, shared = shared_documents(a, b, eos)
+        # A validation stream with no document long enough to compare would
+        # pass 'shares none' without having compared anything.
+        check(val_docs > 0, f"{stem} val has documents to compare",
+              f"{val_docs:,} of at least {MIN_DOC_TOKENS} tokens")
+        check(shared == 0,
+              f"{stem} val shares no document with train",
+              f"{shared:,} of {val_docs:,} validation documents "
+              f"(>= {MIN_DOC_TOKENS} tokens) also occur in train")
 
     print("\n== stack repo-id disjointness ==")
     # The val shard sits off the training stride, but partitioning is an
