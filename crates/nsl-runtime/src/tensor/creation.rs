@@ -196,7 +196,9 @@ pub extern "C" fn nsl_tensor_rand(shape_list: i64) -> i64 {
     let ptr = tensor_from_shape_list(shape_list, 0.0);
     let tensor = NslTensor::from_ptr(ptr);
     for i in 0..tensor.len as usize {
-        let val = crate::sampling::rng_f64() as f32;
+        // [0, 1): an f64 draw within 2^-25 of 1 rounds UP to 1.0f32 (about
+        // 3e-8 of draws), and `log(1 - u)` downstream is then -inf.
+        let val = (crate::sampling::rng_f64() as f32).min(1.0 - f32::EPSILON / 2.0);
         unsafe { *tensor.data_f32().add(i) = val };
     }
     ptr

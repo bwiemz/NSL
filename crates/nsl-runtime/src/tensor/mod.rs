@@ -3436,6 +3436,23 @@ pub extern "C" fn nsl_rmsnorm_dx_backward(
         return dx;
     }
 
+    // The CPU loop reads `dy` and `x` linearly. A strided adjoint (the
+    // Transpose adjoint returns a view) or a strided input was read in storage
+    // order — `sum(rmsnorm(x).transpose(0, 1) * w)` came back up to 0.99 off
+    // in an element. `nsl_rmsnorm_dgamma_backward` and the GPU arm above
+    // already materialize both.
+    {
+        let dy_probe = NslTensor::from_ptr(dy_ptr);
+        if !x.is_contiguous() || !dy_probe.is_contiguous() {
+            let dy_c = nsl_tensor_contiguous(dy_ptr);
+            let x_c = nsl_tensor_contiguous(x_ptr);
+            let dx = nsl_rmsnorm_dx_backward(dy_c, x_c, gamma_ptr, eps);
+            nsl_tensor_free(dy_c);
+            nsl_tensor_free(x_c);
+            return dx;
+        }
+    }
+
     // CPU reference (f64 accumulation).
     let dy = NslTensor::from_ptr(dy_ptr);
     let gamma = NslTensor::from_ptr(gamma_ptr);
@@ -3539,7 +3556,10 @@ pub extern "C" fn nsl_tensor_dropout(tensor_ptr: i64, p: f64, training: i8) -> i
     let mask_strides = NslTensor::compute_strides(mask_shape, ndim);
     let mask_data = checked_alloc(len * std::mem::size_of::<f64>()) as *mut f64;
 
-    let scale = 1.0 / (1.0 - p);
+    // p = 1 drops every element. `1 / (1 - p)` is then infinite and the
+    // output was `x * 0 * inf` = NaN in every element; the survivors' scale
+    // is moot when there are none, so use 0.
+    let scale = if p >= 1.0 { 0.0 } else { 1.0 / (1.0 - p) };
 
     // The loops read the input linearly while stamping row-major strides on
     // out and mask: read a row-major view (`nsl_tensor_dropout_fwd_mask`'s
