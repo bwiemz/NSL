@@ -341,21 +341,44 @@ pub extern "C" fn nsl_tensor_reduce_max(tensor_ptr: i64, dim: i64, keepdim: i64)
                 let input_shape = autodiff::tape_shape(tensor);
                 let c_ptr = super::nsl_tensor_contiguous(tensor_ptr);
                 let result = crate::cuda::gpu_max_dim_f32(c_ptr, d, keepdim_bool);
-                super::nsl_tensor_free(c_ptr);
-                // Note: argmax is not computed on GPU — autodiff backward for
-                // reduce_max on GPU tensors will use zeros (no gradient flows through max indices).
+                // The kernel returns the maxima only, and the backward needs
+                // WHERE they were. This used to record `vec![0; out_len]`, so
+                // the whole gradient of a GPU max went to index 0 of the
+                // reduced dim whatever the data: for `[[1, 5, 2]]` the
+                // gradient came back `[[1, 0, 0]]` where it is `[[0, 1, 0]]`.
+                // Recompute the argmax on a host copy — only when recording.
                 if autodiff::is_recording() {
-                    let ct = NslTensor::from_ptr(result);
-                    let out_len = ct.len as usize;
+                    let host_ptr = super::nsl_tensor_to_device(c_ptr, 0);
+                    let host = NslTensor::from_ptr(host_ptr);
+                    assert!(host.dtype == 1, "reduce_max: GPU tensors are f32 (got dtype {})", host.dtype);
+                    let dim_size = input_shape[d] as usize;
+                    let inner: usize = input_shape[d + 1..].iter().map(|&s| s as usize).product();
+                    let outer: usize = input_shape[..d].iter().map(|&s| s as usize).product();
+                    let mut saved_argmax = vec![0usize; outer * inner];
+                    for o in 0..outer {
+                        for k in 0..inner {
+                            // First maximum wins, as on the CPU arm (strict `>`).
+                            let mut best = f32::NEG_INFINITY;
+                            for j in 0..dim_size {
+                                let v = unsafe { *host.data_f32().add((o * dim_size + j) * inner + k) };
+                                if v > best {
+                                    best = v;
+                                    saved_argmax[o * inner + k] = j;
+                                }
+                            }
+                        }
+                    }
+                    super::nsl_tensor_free(host_ptr);
                     autodiff::maybe_record(autodiff::TapeOp::ReduceMax {
                         a: tensor_ptr,
                         out: result,
                         dim,
                         keepdim: keepdim_bool,
-                        saved_argmax: vec![0usize; out_len],
+                        saved_argmax,
                         input_shape,
                     });
                 }
+                super::nsl_tensor_free(c_ptr);
                 return result;
             }
             #[cfg(not(feature = "cuda"))]
