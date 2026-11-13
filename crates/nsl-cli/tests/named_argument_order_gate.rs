@@ -21,6 +21,12 @@ const DECLS: &str = "fn sub2(a: float, b: float) -> float:\n\
                      \n\
                      \x20   fn f(self, a: float, b: float) -> float:\n\
                      \x20       return a - b\n\
+                     \n\
+                     model Other(k: float):\n\
+                     \x20   w: Tensor = full([1], k)\n\
+                     \n\
+                     \x20   fn f(self, x: float, mask: float) -> float:\n\
+                     \x20       return x - mask\n\
                      \n";
 
 fn check(tag: &str, body: &str) -> (bool, String) {
@@ -49,8 +55,13 @@ fn named_arguments_in_declaration_order_are_accepted() {
          print(sub2(a = 10.0, b = 1.0))\n\
          print(sub2(10.0, b = 1.0))\n\
          let m = M(scale = 3.0, shift = 1.0)\n\
-         print(m.f(a = 10.0, b = 1.0))\n",
+         print(m.f(a = 10.0, b = 1.0))\n\
+         let o = Other(1.0)\n\
+         print(o.f(2.0, mask = 1.0))\n\
+         print(o.f(x = 2.0, mask = 1.0))\n",
     );
+    // `Other.f(x, mask)` and `M.f(a, b)` share a name: each call is judged
+    // against the model its receiver is, never against the other's list.
     assert!(ok, "in-order named arguments must check clean:\n{text}");
 }
 
@@ -61,6 +72,7 @@ fn a_named_argument_out_of_position_is_refused() {
         ("method", "let m = M(3.0, 1.0)\nprint(m.f(b = 1.0, a = 10.0))\n", "argument `b` of `f` is passed in position 1, which binds parameter `a`"),
         ("constructor", "let m = M(shift = 1.0, scale = 3.0)\n", "argument `shift` of `M` is passed in position 1, which binds parameter `scale`"),
         ("skipped", "print(sub2(b = 1.0))\n", "argument `b` of `sub2` is passed in position 1, which binds parameter `a`"),
+        ("other_model", "let o = Other(1.0)\nprint(o.f(mask = 1.0, x = 2.0))\n", "argument `mask` of `f` is passed in position 1, which binds parameter `x`"),
     ] {
         let (ok, text) = check(tag, call);
         assert!(!ok, "[{tag}] the call checked clean and would have bound by position:\n{text}");

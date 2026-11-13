@@ -94,6 +94,7 @@ fn fused_rmsnorm_backward_handles_a_strided_gradient() {
     let tape = run("rms_tape", &["--tape-ad"], src);
     let fused = run("rms_fused", &["--source-ad", "--fuse-rmsnorm-backward"], src);
     assert_eq!(tape.len(), 6, "{tape:?}");
+    assert_eq!(fused.len(), 6, "{fused:?}");
     assert!(tape.iter().any(|v| v.abs() > 1e-3), "the reference gradient is not trivially zero: {tape:?}");
     for (f, t) in fused.iter().zip(&tape) {
         assert!((f - t).abs() < 1e-5, "fused {fused:?}\n tape {tape:?}");

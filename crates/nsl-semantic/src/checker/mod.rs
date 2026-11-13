@@ -97,13 +97,14 @@ pub struct TypeChecker<'a> {
     /// Replaces the pre-Item-4 behaviour where `validate_pca_decorator`
     /// returned a value that was immediately dropped.
     pub pca_configs: Vec<crate::cftp::PcaConfig>,
-    /// Declared parameter names (without `self`) of this module's callables,
-    /// keyed by the name a call site spells: a free function's name, a
-    /// model's name (its constructor parameters) or a method's name. One
-    /// entry per declaration, since two models may share a method name.
-    /// `check_call` uses it to refuse a named argument that is not in its
-    /// parameter's position — see `check_named_argument_order`.
-    pub(crate) call_param_names: HashMap<Symbol, Vec<Vec<Symbol>>>,
+    /// Declared parameter names (without `self`) of this module's callables.
+    /// A free function or a model constructor is keyed `(None, name)`; a
+    /// method is keyed `(Some(model), method)`, so a call is only ever judged
+    /// against the declaration it resolves to — never against a same-named
+    /// method of another (possibly imported) model. `check_call` uses it to
+    /// refuse a named argument that is not in its parameter's position — see
+    /// `check_named_argument_order`.
+    pub(crate) call_param_names: HashMap<(Option<Symbol>, Symbol), Vec<Symbol>>,
 }
 
 impl<'a> TypeChecker<'a> {
@@ -140,12 +141,12 @@ impl<'a> TypeChecker<'a> {
                 inner = wrapped;
             }
             match &inner.kind {
-                StmtKind::FnDef(fn_def) => self.record_param_names(fn_def.name, &fn_def.params),
+                StmtKind::FnDef(fn_def) => self.record_param_names(None, fn_def.name, &fn_def.params),
                 StmtKind::ModelDef(model_def) => {
-                    self.record_param_names(model_def.name, &model_def.params);
+                    self.record_param_names(None, model_def.name, &model_def.params);
                     for member in &model_def.members {
                         if let nsl_ast::decl::ModelMember::Method(method, _) = member {
-                            self.record_param_names(method.name, &method.params);
+                            self.record_param_names(Some(model_def.name), method.name, &method.params);
                         }
                     }
                 }
@@ -154,10 +155,10 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    fn record_param_names(&mut self, callable: Symbol, params: &[nsl_ast::decl::Param]) {
+    fn record_param_names(&mut self, owner: Option<Symbol>, callable: Symbol, params: &[nsl_ast::decl::Param]) {
         let names: Vec<Symbol> =
             params.iter().map(|p| p.name).filter(|n| self.resolve_name(*n) != "self").collect();
-        self.call_param_names.entry(callable).or_default().push(names);
+        self.call_param_names.insert((owner, callable), names);
     }
 
     /// Set pre-resolved import types from other modules.

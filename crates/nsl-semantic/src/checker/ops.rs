@@ -315,29 +315,26 @@ impl<'a> TypeChecker<'a> {
     /// no diagnostic, for functions, methods and model constructors alike.
     /// Until calls bind by name, a named argument must sit in the position
     /// of the parameter it names; anything else is refused here, where the
-    /// declaration's parameter names are known (this module's own
-    /// callables — an imported function's names are not visible yet).
+    /// declaration's parameter names are known: a function or model declared
+    /// in this module, or a method called on a value whose type is a model
+    /// declared in this module. Every other call (imported callables,
+    /// builtins, receivers of unknown type) is left alone — its parameter
+    /// names are not visible here.
     fn check_named_argument_order(&mut self, callee: &Expr, args: &[Arg]) {
         if args.iter().all(|a| a.name.is_none()) {
             return;
         }
         let key = match &callee.kind {
-            ExprKind::Ident(sym) => *sym,
-            ExprKind::MemberAccess { member, .. } => *member,
+            ExprKind::Ident(sym) => (None, *sym),
+            ExprKind::MemberAccess { object, member } => match self.type_map.get(&object.id) {
+                Some(Type::Model { name, .. }) => (Some(*name), *member),
+                _ => return,
+            },
             _ => return,
         };
-        let Some(candidates) = self.call_param_names.get(&key) else {
+        let Some(names) = self.call_param_names.get(&key).cloned() else {
             return;
         };
-        let in_position = |names: &Vec<Symbol>| {
-            args.iter().enumerate().all(|(i, a)| a.name.is_none_or(|n| names.get(i) == Some(&n)))
-        };
-        if candidates.is_empty() || candidates.iter().any(in_position) {
-            return;
-        }
-        // Report against the first declaration: name the first argument out
-        // of place and the parameter that position binds.
-        let names = candidates[0].clone();
         let Some((index, arg)) =
             args.iter().enumerate().find(|(i, a)| a.name.is_some_and(|n| names.get(*i) != Some(&n)))
         else {
@@ -348,7 +345,7 @@ impl<'a> TypeChecker<'a> {
             Some(n) => format!("parameter `{}`", self.resolve_name(*n)),
             None => "no parameter".to_string(),
         };
-        let callable = self.resolve_name(key);
+        let callable = self.resolve_name(key.1);
         self.diagnostics.push(
             Diagnostic::error(format!(
                 "argument `{given}` of `{callable}` is passed in position {}, which binds {binds}",
