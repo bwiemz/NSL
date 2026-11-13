@@ -10,8 +10,10 @@ stream, not taken from the code under test.
 
 from __future__ import annotations
 
+import json
 import random
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -19,6 +21,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import decontaminate
 import make_mix
 import verify
 
@@ -150,6 +153,127 @@ class MixPlacement(unittest.TestCase):
     def test_an_unknown_placement_is_refused(self) -> None:
         with self.assertRaises(ValueError):
             make_mix.injection_key(random.Random(0), self.base_docs, self.base_tokens, "bytes")
+
+
+LONG_A = "    result = sorted(numbers, key=lambda value: (value % 7, -value))"
+LONG_B = "    return [left + right for left, right in zip(first_values, second_values)]"
+MID_A = "    total = sum(x * x for x in xs)"
+MID_B = "    best = max(scores, default=None)"
+
+
+class DecontaminationCoverage(unittest.TestCase):
+    def lines_of(self, *texts: str) -> set[str]:
+        out: set[str] = set()
+        for text in texts:
+            for raw in text.splitlines():
+                norm = decontaminate.normalize(raw)
+                if len(norm) >= decontaminate.MIN_LINE_CHARS:
+                    out.add(norm)
+        return out
+
+    def test_the_fixture_lines_are_on_the_intended_side_of_each_threshold(self) -> None:
+        n = decontaminate.normalize
+        self.assertGreaterEqual(len(n(LONG_A)), decontaminate.STRONG_LINE_CHARS)
+        self.assertGreaterEqual(len(n(LONG_B)), decontaminate.STRONG_LINE_CHARS)
+        for mid in (MID_A, MID_B):
+            self.assertGreaterEqual(len(n(mid)), decontaminate.MIN_LINE_CHARS)
+            self.assertLess(len(n(mid)), decontaminate.STRONG_LINE_CHARS)
+
+    def test_problems_made_of_short_lines_are_counted_as_undetectable(self) -> None:
+        short_solution = "    if n < 2:\n        return n\n    return f(n - 1) + f(n - 2)"
+        problems = [
+            # One long line: detectable whole and by its solution.
+            ("bench", "def a(numbers):\n" + LONG_A, LONG_A),
+            # Two mid lines in the solution: detectable (two distinct lines).
+            ("bench", "def b(xs, scores):\n" + MID_A + "\n" + MID_B, MID_A + "\n" + MID_B),
+            # One mid line only: below the two-line rule, undetectable.
+            ("bench", "def c(xs):\n" + MID_A, MID_A),
+            # All lines short: nothing enters the line set at all.
+            ("bench", "def f(n):\n" + short_solution, short_solution),
+            # A long line in the prompt, a short solution: the whole problem
+            # is detectable, the solution on its own is not.
+            ("other", LONG_B + "\n    return 0", "    return 0"),
+        ]
+        lines = self.lines_of(*(whole for _, whole, _ in problems))
+        got = decontaminate.coverage(problems, lines)
+        self.assertEqual(got, {
+            "bench": {"problems": 4, "undetectable_problems": 2, "undetectable_solutions": 2},
+            "other": {"problems": 1, "undetectable_problems": 0, "undetectable_solutions": 1},
+        })
+
+    def test_the_count_agrees_with_what_the_scan_does_to_a_verbatim_copy(self) -> None:
+        # A corpus document that IS the short-line solution passes the scan.
+        short_solution = "    if n < 2:\n        return n\n    return f(n - 1) + f(n - 2)"
+        lines = self.lines_of("def f(n):\n" + short_solution, LONG_A)
+        self.assertFalse(decontaminate.doc_is_contaminated(short_solution, lines)[0])
+        self.assertTrue(decontaminate.doc_is_contaminated("x = 1\n" + LONG_A, lines)[0])
+
+    def test_benchmark_problems_reads_the_same_files_as_benchmark_lines(self) -> None:
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+        except ImportError:
+            self.skipTest("pyarrow is not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            he = root / "data/hf/humaneval/openai_humaneval"
+            he.mkdir(parents=True)
+            pq.write_table(pa.table({
+                "task_id": ["HumanEval/0", "HumanEval/1"],
+                "prompt": ["def a(numbers):", "def f(n):"],
+                "canonical_solution": [LONG_A, "    return n"],
+                "test": ["assert a([3, 1]) == [1, 3]", "assert f(1) == 1"],
+            }), he / "test-00000-of-00001.parquet")
+            full = root / "data/hf/mbpp/full"
+            full.mkdir(parents=True)
+            pq.write_table(pa.table({
+                "task_id": [1, 2],
+                "text": ["Write a function to add two lists element by element.", "Add."],
+                "code": [LONG_B, "    return a + b"],
+                "test_list": [["assert add([1], [2]) == [3]"], ["assert add(1, 2) == 3"]],
+            }), full / "train-00000-of-00001.parquet")
+            sanitized = root / "data/hf/mbpp/sanitized"
+            sanitized.mkdir(parents=True)
+            pq.write_table(pa.table({
+                "task_id": [2],
+                "prompt": ["Add."],
+                "code": ["    return a + b"],
+                "test_list": [["assert add(1, 2) == 3"]],
+            }), sanitized / "test-00000-of-00001.parquet")
+
+            saved = decontaminate.REPO
+            decontaminate.REPO = root
+            try:
+                counts, lines = decontaminate.benchmark_lines()
+                problems = list(decontaminate.benchmark_problems())
+            finally:
+                decontaminate.REPO = saved
+
+        self.assertEqual([p[0] for p in problems],
+                         ["humaneval", "humaneval", "mbpp", "mbpp", "mbpp"])
+        self.assertEqual(problems[0][2], LONG_A)
+        self.assertIn("assert a([3, 1]) == [1, 3]", problems[0][1])
+        self.assertEqual(problems[2][2], LONG_B)
+        self.assertIn("assert add([1], [2]) == [3]", problems[2][1])
+        # Every line benchmark_lines kept comes from some problem's text.
+        for line in lines:
+            self.assertTrue(
+                any(line in {decontaminate.normalize(r) for r in whole.splitlines()}
+                    for _, whole, _ in problems),
+                line,
+            )
+        self.assertEqual(sum(counts.values()), len(lines))
+        got = decontaminate.coverage(problems, lines)
+        # HumanEval/0 and MBPP task 1 carry a line of 60+ characters;
+        # HumanEval/1 and MBPP task 2 (twice, full and sanitized) have only
+        # short lines.
+        self.assertEqual(got, {
+            "humaneval": {"problems": 2, "undetectable_problems": 1,
+                          "undetectable_solutions": 1},
+            "mbpp": {"problems": 3, "undetectable_problems": 2,
+                     "undetectable_solutions": 2},
+        })
+        json.dumps(got)  # the report is written as JSON
 
 
 if __name__ == "__main__":
