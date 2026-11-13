@@ -181,9 +181,10 @@ pub fn pack_batch(
                 // overflow this row's constant-size SMEM load on the kernel side.
                 assert!(
                     current_row_doc_idx <= MAX_NUM_DOCS,
-                    "num_docs > MAX_NUM_DOCS {} in batch row {}: too many EOS-delimited documents",
-                    MAX_NUM_DOCS,
-                    b
+                    "packed row {b} holds more than {MAX_NUM_DOCS} documents: the separator \
+                     token {eos_token} occurs that often in one row of {seq_len} tokens. \
+                     Check that `pack_separator` is the tokenizer's end-of-document id \
+                     and not a token that appears in ordinary text."
                 );
                 doc_starts[row_base + current_row_doc_idx] = i as i32;
                 current_row_doc_idx += 1;

@@ -3131,6 +3131,33 @@ impl Compiler<'_> {
                 }
             }
 
+            // Packing needs to be told which token ends a document. The
+            // runtime's default was 0, and id 0 is an ordinary token: in the
+            // shipped tokenizers it is "!". A packed loader built without
+            // `pack_separator` therefore cut attention, reset positions and
+            // dropped the next-token target after every "!" in the corpus,
+            // with nothing printed.
+            let packing_on = config.get("packing").and_then(|v| v.as_bool()) == Some(true);
+            if packing_on && !config.contains_key("pack_separator") {
+                return Err(CodegenError::new(
+                    "DataLoader(): `packing = true` needs `pack_separator = <token id>`, \
+                     the id of the token that ends a document (for example the \
+                     tokenizer's <|endoftext|>). There is no default: id 0 is an \
+                     ordinary token in most vocabularies, and packing on it splits \
+                     documents at every occurrence",
+                ));
+            }
+            // A packed batch derives its labels from the token stream (the
+            // next token, with -100 across a document boundary), so a
+            // `labels` tensor would be read by nothing.
+            if packing_on && labels_arg.is_some() {
+                return Err(CodegenError::new(
+                    "DataLoader(): `labels` cannot be combined with `packing = true`: \
+                     a packed batch computes its own next-token labels from the data \
+                     stream and would ignore the tensor given",
+                ));
+            }
+
             // pin_memory is accepted but currently a no-op (actual memory
             // pinning deferred to tensor allocator integration).
 
