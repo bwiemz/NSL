@@ -288,6 +288,7 @@ macro_rules! for_each_runtime_fn {
             // Tensor memory
             [tensor] nsl_tensor_clone(i64) -> i64 = tensor::nsl_tensor_clone;
             [tensor] nsl_tensor_clone_if_valid(i64) -> i64 = tensor::nsl_tensor_clone_if_valid;
+            [tensor] nsl_tensor_clone_traced(i64) -> i64 = tensor::nsl_tensor_clone_traced;
             [tensor] nsl_tensor_free(i64) -> () = tensor::nsl_tensor_free;
             [tensor] nsl_tensor_free_if_valid(i64) -> () = tensor::nsl_tensor_free_if_valid;
             [tensor] nsl_tensor_free_transient(i64) -> () = tensor::nsl_tensor_free_transient;
@@ -1351,6 +1352,6 @@ mod tests {
     fn table_is_the_recorded_size() {
         // The count is pinned so a row dropped by a bad merge is noticed; move
         // it with a row that is deliberately added or removed.
-        assert_eq!(RUNTIME_ABI.len(), 677);
+        assert_eq!(RUNTIME_ABI.len(), 678);
     }
 }

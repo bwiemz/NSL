@@ -341,6 +341,45 @@ impl Compiler<'_> {
                         }
                         Ok(value)
                     }
+                    Type::FixedModelArray { size, .. } => {
+                        // `blocks[i]` on a `[Block; N]` field. The array is
+                        // N inline element pointers (the layout the
+                        // `for block in self.blocks` loop walks), not an
+                        // NslList, and the list path below read its first
+                        // words as a list header: `m.blocks[0].w` yielded a
+                        // garbage handle and aborted on first use.
+                        let size = *size;
+                        if let ExprKind::IntLiteral(i) = &idx_expr.kind
+                            && !(0..size).contains(i)
+                        {
+                            return Err(CodegenError::new(format!(
+                                "index {i} is out of range for a model array of {size} element(s)"
+                            )));
+                        }
+                        let zero = builder.ins().iconst(cl_types::I64, 0);
+                        let limit = builder.ins().iconst(cl_types::I64, size);
+                        let non_negative = builder.ins().icmp(
+                            IntCC::SignedGreaterThanOrEqual,
+                            idx_val,
+                            zero,
+                        );
+                        let below_limit = builder.ins().icmp(
+                            IntCC::SignedLessThan,
+                            idx_val,
+                            limit,
+                        );
+                        let in_range = builder.ins().band(non_negative, below_limit);
+                        let message = "nsl: model array index out of range";
+                        self.intern_string(message)?;
+                        let message_ptr = self.compile_string_literal(builder, message)?;
+                        self.compile_call_by_name(builder, "nsl_assert", &[in_range, message_ptr])?;
+                        let eight = builder.ins().iconst(cl_types::I64, 8);
+                        let offset = builder.ins().imul(idx_val, eight);
+                        let addr = builder.ins().iadd(obj_val, offset);
+                        Ok(builder
+                            .ins()
+                            .load(cl_types::I64, MemFlagsData::trusted(), addr, 0))
+                    }
                     _ => {
                         // Default: list subscript. Warn if the type is Unknown.
                         if matches!(obj_type, Type::Unknown) {

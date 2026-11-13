@@ -90,7 +90,7 @@ The non-obvious compiler sophistication lives in optimization passes — they're
 - [CPDT](Glossary.md#cpdt) — weight-aware compilation / tensor parallelism
 - [FASE](Glossary.md#fase) — training-loop fusion
 - [WGGO](Glossary.md#wggo) — graph optimization at the weight-gradient level
-- [CCR](Glossary.md#ccr) — common-kernel combination rewriting
+- [CCR](Glossary.md#ccr) — compiler-chosen recomputation (block activation checkpointing)
 
 ---
 

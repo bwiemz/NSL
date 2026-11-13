@@ -2039,42 +2039,6 @@ pub(crate) const CONCAT_GRAD_SLICE_PREFIX: &str = "concat_grad_slice:";
 /// negative `d` counts from the end of `x`'s rank. Lowered in `wengert_lower`.
 pub(crate) const SUM_KEEPDIM_AT_PREFIX: &str = "sum_keepdim_at:";
 
-/// Task 4: WRGA backward-live filter.
-///
-/// Drop adjoint ops whose **primal** dependency is not in `backward_live`.
-/// `backward_live` is the set of *primal* VarIds whose adjoint must be
-/// materialised, as computed by `wrga_prune::prune`.  Each adjoint op's
-/// `inputs[0]` (the op's seeded adjoint input or primal it differentiates
-/// against) must lie on that set, otherwise the adjoint is dead by pruning.
-///
-/// For ops whose `inputs` are empty (e.g. adjoint constant seeds), keep them;
-/// the downstream `eliminate_dead_gradients` pass is the authority on true
-/// dead-code elimination.  This pass is coarser: it only removes ops the
-/// WRGA prune pass has already proved to be on frozen branches.
-pub fn eliminate_by_backward_live(
-    ops: &[WengertOp],
-    backward_live: &std::collections::BTreeSet<VarId>,
-    adjoint_vars: &HashMap<VarId, VarId>,
-) -> Vec<WengertOp> {
-    let adj_to_primal: HashMap<VarId, VarId> = adjoint_vars
-        .iter()
-        .map(|(&p, &a)| (a, p))
-        .collect();
-
-    let mut kept = Vec::with_capacity(ops.len());
-    let mut dropped = 0usize;
-    for op in ops {
-        match adj_to_primal.get(&op.result) {
-            Some(primal) if !backward_live.contains(primal) => {
-                dropped += 1;
-            }
-            _ => kept.push(op.clone()),
-        }
-    }
-    crate::debug_set_adjoint_ops_dropped(dropped);
-    kept
-}
-
 #[cfg(test)]
 mod const_config_field_tests {
     /// The soundness rule for folding a config `.item()` into emitted code:
@@ -2139,39 +2103,6 @@ mod backward_live_tests {
             saved_for_backward: false,
             checkpointed: false,
         }
-    }
-
-    #[test]
-    fn retains_only_live_ops() {
-        // Three adjoint ops with results 10, 11, 12 corresponding to primals
-        // 1, 2, 3 respectively. live = {2}. Adjoint of primal 1 and 3 should
-        // be dropped; adjoint of primal 2 kept.
-        let ops = vec![
-            mk(0, 10, PrimalOp::Neg, vec![1]),
-            mk(1, 11, PrimalOp::Neg, vec![2]),
-            mk(2, 12, PrimalOp::Neg, vec![3]),
-        ];
-        let mut live = BTreeSet::new();
-        live.insert(2u32);
-        let mut adjoint_vars = HashMap::new();
-        adjoint_vars.insert(1u32, 10u32);
-        adjoint_vars.insert(2u32, 11u32);
-        adjoint_vars.insert(3u32, 12u32);
-        let kept = eliminate_by_backward_live(&ops, &live, &adjoint_vars);
-        assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].result, 11);
-    }
-
-    #[test]
-    fn keeps_input_less_seed_ops() {
-        // Seed ops (result not mapped in adjoint_vars) are always kept — only
-        // ops whose result IS mapped to a primal and that primal is not live
-        // get dropped.
-        let ops = vec![mk(0, 5, PrimalOp::Constant(1.0), vec![])];
-        let live: BTreeSet<VarId> = BTreeSet::new();
-        let adjoint_vars: HashMap<VarId, VarId> = HashMap::new();
-        let kept = eliminate_by_backward_live(&ops, &live, &adjoint_vars);
-        assert_eq!(kept.len(), 1);
     }
 
     #[test]

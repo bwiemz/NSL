@@ -29,7 +29,14 @@ pub fn route_topk(
     assert!(top_k == 1 || top_k == 2, "top_k must be 1 or 2");
     assert_eq!(logits.len(), total_tokens * num_experts);
 
-    let capacity = ((total_tokens as f64 / num_experts as f64) * capacity_factor).ceil() as usize;
+    // Each token makes `top_k` assignments, so an expert's fair share is
+    // `total_tokens * top_k / num_experts`; `capacity_factor` is the slack
+    // on top of that. Without the `top_k` term a perfectly balanced top-2
+    // router at factor 1.0 had room for half its assignments: every token
+    // past the midpoint was dropped by both of its experts and came out
+    // of the layer as zeros.
+    let capacity = ((total_tokens as f64 * top_k as f64 / num_experts as f64) * capacity_factor)
+        .ceil() as usize;
 
     let mut expert_indices = Vec::with_capacity(total_tokens * top_k);
     let mut expert_weights = Vec::with_capacity(total_tokens * top_k);
@@ -260,5 +267,26 @@ mod tests {
         let exp0_count = result.expert_boundaries[1] - result.expert_boundaries[0];
         assert_eq!(exp0_count, 3, "expert 0 should have capacity-limited 3 tokens, got {}", exp0_count);
         assert_eq!(result.total_assigned, 3, "total_assigned should be 3 (dropped 3)");
+    }
+
+    /// Two experts, top-2: every token is assigned to both, so each expert
+    /// receives `total_tokens` assignments -- its exact fair share. At
+    /// factor 1.0 nothing may be dropped. The capacity used to be
+    /// `tokens / experts` regardless of `top_k`, i.e. 2 of the 4 here, and
+    /// tokens 2 and 3 lost both of their assignments.
+    #[test]
+    fn balanced_top2_routing_drops_nothing_at_factor_one() {
+        let logits: Vec<f32> = vec![0.3, 0.1, 0.2, 0.4, 0.5, 0.5, 0.1, 0.9];
+        let result = route_topk(&logits, 4, 2, 2, 1.0);
+        assert_eq!(result.total_assigned, 8, "4 tokens x top-2 = 8 assignments");
+        for expert in 0..2 {
+            let count = result.expert_boundaries[expert + 1] - result.expert_boundaries[expert];
+            assert_eq!(count, 4, "expert {expert} holds every token");
+        }
+        let mut seen = [0usize; 4];
+        for &token in &result.sorted_token_indices {
+            seen[token as usize] += 1;
+        }
+        assert_eq!(seen, [2, 2, 2, 2], "each token keeps both assignments");
     }
 }

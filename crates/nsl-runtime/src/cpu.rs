@@ -390,9 +390,16 @@ fn fused_op_unfused(op: i64, acc: i64, rhs: i64) -> i64 {
 /// every other op sees a right operand of zero (so a binary code after the
 /// first is `acc op 0`, exactly as `apply_fused_op_f32(op, acc, 0.0)`).
 /// Intermediates are freed; the result is owned by the caller.
+///
+/// The first op is applied to `a_ptr` ITSELF, not to a copy. This path is
+/// what runs while the autodiff tape is recording, and each op records its
+/// operands by handle: starting from `nsl_tensor_clone(a_ptr)` (a clone is
+/// not a taped op) would record the chain against a tensor the tape has
+/// never seen, cutting the gradient off from `a`.
 fn fused_chain_unfused(a_ptr: i64, b_ptr: Option<i64>, ops: &[i64]) -> i64 {
     use crate::tensor::*;
-    let mut acc = nsl_tensor_clone(a_ptr);
+    let mut acc = a_ptr;
+    let mut acc_is_ours = false;
     for (i, &op) in ops.iter().enumerate() {
         let next = match (i, b_ptr) {
             (0, Some(b)) if is_fused_binary(op) => fused_op_unfused(op, acc, b),
@@ -404,10 +411,35 @@ fn fused_chain_unfused(a_ptr: i64, b_ptr: Option<i64>, ops: &[i64]) -> i64 {
                 _ => fused_op_unfused(op, acc, 0),
             },
         };
-        crate::tensor::nsl_tensor_free(acc);
+        if acc_is_ours {
+            crate::tensor::nsl_tensor_free(acc);
+        }
         acc = next;
+        acc_is_ours = true;
     }
-    acc
+    if acc_is_ours {
+        acc
+    } else {
+        // An empty chain: the caller still owns what it gets back.
+        nsl_tensor_clone(a_ptr)
+    }
+}
+
+/// Whether a fused chain must run as its separate ops because the autodiff
+/// tape is recording.
+///
+/// The fused loops compute `f(g(x))` in one pass and record nothing, so a
+/// chain fused inside a `grad` or `train` block would be a hole in the
+/// tape. The compiler does not fuse inside such a block's own body -- but
+/// the tape is global runtime state, live across every function and model
+/// method the block calls, and those are compiled on their own with no
+/// knowledge of who calls them. A model method returning
+/// `sum(tanh(sigmoid(u)))` fused the two activations, and under tape AD the
+/// gradient of every parameter behind them was exactly zero, with the loss
+/// itself correct. Only the runtime knows whether a tape is live, so the
+/// decision is made here.
+fn fused_chain_needs_tape() -> bool {
+    crate::autodiff::is_recording()
 }
 
 /// Fused elementwise binary op: applies op_chain to `a op[0] b`, then unary ops.
@@ -436,6 +468,9 @@ pub extern "C" fn nsl_fused_elementwise_2(
     // op the chain would reach, so the message names this entry point. (An
     // f32 `a` with an f64 `b` once read `b`'s 8-byte elements as f32.)
     crate::tensor::require_same_dtype("nsl_fused_elementwise_2", a_ptr, b_ptr);
+    if fused_chain_needs_tape() {
+        return fused_chain_unfused(a_ptr, Some(b_ptr), &ops);
+    }
     // The fused loop reads both buffers flat, in `a`'s dtype and shape. Any
     // other case (broadcasting shapes, a device or strided tensor, a 16-bit
     // or integer tensor) runs through the unfused ops. Neither codegen call
@@ -525,7 +560,7 @@ pub extern "C" fn nsl_fused_elementwise_1(
 
     // See `nsl_fused_elementwise_2`: only a contiguous host f32/f64 buffer
     // may be read flat; everything else runs through the unfused ops.
-    if !fused_cpu_readable(a) {
+    if fused_chain_needs_tape() || !fused_cpu_readable(a) {
         return fused_chain_unfused(a_ptr, None, &ops);
     }
 

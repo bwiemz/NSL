@@ -50,6 +50,19 @@ pub enum CcrPolicy {
     Selective,
 }
 
+/// True for an op whose result is a fresh draw from the random generator.
+/// Recomputing one in the backward replays the op, not the draw: the clone
+/// is a second, different sample, and the gradient is then taken through
+/// values the forward never produced. Such results are always saved.
+///
+/// `Dropout` / `DropoutMask` are handled where this is called, alongside
+/// their cached-output constraint. `randn` is the one creation op the
+/// extractor lowers as a `Passthrough`; a block that adds noise to its
+/// activations (`x + sigma * randn(shape)`) reaches here through it.
+fn draws_random_numbers(op: &PrimalOp) -> bool {
+    matches!(op, PrimalOp::Passthrough(name) if name == "randn")
+}
+
 /// Matmul-class ops whose outputs are SAVED under `CcrPolicy::Selective`.
 fn selective_saves(op: &PrimalOp) -> bool {
     matches!(
@@ -796,6 +809,9 @@ fn plan_impl(
                 | PrimalOp::PrologueRecompute { .. } => continue,
                 PrimalOp::FreeTensor => continue,
                 _ => {}
+            }
+            if draws_random_numbers(&op.op) {
+                continue;
             }
             if policy == CcrPolicy::Selective && selective_saves(&op.op) {
                 if compress_saves {
@@ -2253,6 +2269,32 @@ mod tests {
             !plan.recompute.contains(&9),
             "the dropout RNG mask must not be replayed"
         );
+    }
+
+    #[test]
+    fn a_random_draw_is_force_saved() {
+        // Same placement as the dropout-mask test above: the draw sits in
+        // block 0's interior with a downstream consumer.
+        //   v3 = Matmul(x, w0); v9 = randn(); v4 = Add(v9, x)
+        let mut primal = toy_primal();
+        primal.ops.insert(4, op(9, 9, PrimalOp::Passthrough("randn".into()), vec![]));
+        primal.ops[5] = op(4, 4, PrimalOp::Add, vec![9, 0]);
+        let plan = plan(&primal, None, CcrPolicy::Block, false, 1).unwrap();
+        assert!(
+            plan.recompute.contains(&3),
+            "control: the matmul interior must be recomputable"
+        );
+        assert!(
+            !plan.recompute.contains(&9),
+            "randn must not be re-drawn in the backward"
+        );
+        // A deterministic creation op in the same position stays
+        // recomputable: the rule is about randomness, not about creation.
+        let mut primal = toy_primal();
+        primal.ops.insert(4, op(9, 9, PrimalOp::Passthrough("ones_like".into()), vec![3]));
+        primal.ops[5] = op(4, 4, PrimalOp::Add, vec![9, 0]);
+        let deterministic = super::plan(&primal, None, CcrPolicy::Block, false, 1).unwrap();
+        assert!(deterministic.recompute.contains(&9), "ones_like is replayable");
     }
 
     #[test]

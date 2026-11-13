@@ -89,13 +89,16 @@ Token sampling strategies for generation.
 
 Sample one token from the `k` highest-probability logits, after
 dividing by `temperature`. Lower temperature concentrates the
-distribution; `k = 1` is greedy.
+distribution; `k = 1` is greedy, and so is `temperature = 0` (the limit
+of the division, taken directly: dividing by zero gave NaN probabilities
+and the draw aborted).
 
 ### `fn sample_top_p(logits: Tensor, p: float, temperature: float) -> Tensor`
 
 Nucleus sampling: sample from the smallest set of tokens whose
 probabilities sum to at least `p`, after dividing by `temperature`.
 Unlike top-k the candidate set resizes with the model's confidence.
+`temperature = 0` is greedy.
 
 ### `fn sample_greedy(logits: Tensor) -> Tensor`
 

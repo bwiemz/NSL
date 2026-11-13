@@ -230,6 +230,19 @@ impl Compiler<'_> {
             self.compile_call_by_name(builder, "nsl_assert", &[ok, mp])?;
         }
 
+        // Global-norm clip of an accumulated window that the two-phase clip
+        // does not own (a FullBuffer plan). The buffers hold the window
+        // mean, which is the gradient `clip_grad_norm` is defined on; the
+        // per-micro-batch clip in the driver is skipped for these plans.
+        if grad_accumulation_steps > 1
+            && !fase_plan.two_phase_clip
+            && grad_clip < f64::MAX
+            && let Some(accum) = accum_list
+        {
+            let max_norm_val = builder.ins().f64const(grad_clip);
+            self.compile_call_by_name(builder, "nsl_clip_grad_norm", &[accum, max_norm_val])?;
+        }
+
         if let Some(mtb) = mode_table_base {
             // D3 v1: the unified mode-table dispatch has its own per-param
             // update kernel selection — owner-gating inside it is untested
@@ -577,19 +590,32 @@ impl Compiler<'_> {
                         pb_m
                     };
                     let wrap_precision = cpdt_precision_dtypes.is_some();
-                    self.fase_emit_final_step(
+                    // Through the grouped step, as the non-clip arm below
+                    // does: this site called `fase_emit_final_step` with the
+                    // plan's recipe directly, so `no_decay = [...]` was
+                    // honoured by the fused launch and ignored by this
+                    // per-parameter fallback (`--training-reference`,
+                    // `NSL_FASE_MULTI_STEP=0`, offload, reduced-precision
+                    // moments) whenever `grad_clip` was set.
+                    let pb_wd_join = self.emit_deferred_step_with_groups(
                         builder,
+                        decay_exempt_list.map(|l| (l, no_decay_scope.exempt_non_rank2)),
+                        pb_i,
                         pb_theta,
                         pb_m,
                         pb_mpart,
                         pb_v,
                         &fase_plan.recipe,
                         lr,
-                        Some((bc1_inv, bc2_inv)),
+                        (bc1_inv, bc2_inv),
                         wrap_precision,
-                        self.compile_options.train.optim_state_offload,
                         Some(opt_step),
                     )?;
+                    if let Some(join) = pb_wd_join {
+                        builder.ins().jump(join, &[]);
+                        builder.switch_to_block(join);
+                        builder.seal_block(join);
+                    }
                     if let Some(pb_join) = pb_zero_blocks {
                         builder.ins().jump(pb_join, &[]);
                         builder.switch_to_block(pb_join);
@@ -834,6 +860,24 @@ impl Compiler<'_> {
                 )?;
             }
 
+            // Bias-correction step for Adam / SOAP / Muon's AdamW route:
+            // the number of OPTIMIZER steps taken, `(step_count + 1) / N`.
+            // `step_count` counts micro-batches, and passing it through made
+            // the corrections decay N times too fast: at the default eps the
+            // first updates of an accumulated run were about a third too
+            // small. With N == 1 the two counts agree and the stdlib call
+            // derives it itself.
+            let window_t = if grad_accumulation_steps > 1 {
+                let sc = builder.use_var(step_count_var);
+                let one = builder.ins().iconst(cl_types::I64, 1);
+                let sc_plus_one = builder.ins().iadd(sc, one);
+                let n = builder.ins().iconst(cl_types::I64, grad_accumulation_steps);
+                let opt_step = builder.ins().sdiv(sc_plus_one, n);
+                Some(builder.ins().fcvt_from_sint(cl_types::F64, opt_step))
+            } else {
+                None
+            };
+
             let opt_i_var = builder.declare_var(cl_types::I64);
             let opt_zero = builder.ins().iconst(cl_types::I64, 0);
             builder.def_var(opt_i_var, opt_zero);
@@ -954,7 +998,7 @@ impl Compiler<'_> {
                 eps_const,
                 step_count_var,
                 false,
-                None,
+                window_t,
                 self.compile_options.train.optim_state_offload,
                 muon_extra,
             )?;

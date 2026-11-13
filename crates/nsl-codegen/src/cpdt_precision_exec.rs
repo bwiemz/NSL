@@ -1,39 +1,63 @@
-//! CPDT precision-adaptive optimizer EXECUTION bridge (v1: FP16).
+//! CPDT precision-adaptive optimizer EXECUTION bridge.
 //!
 //! Turns the per-parameter `PrecisionPlan` into ordered dtype codes aligned
 //! with `param_paths` (the same ordered name list the codegen uses to build
-//! `param_list`). v1 clamps INT8 tiers to FP16 — `clamp_int8_to_fp16` is the
-//! SINGLE removal point for the INT8 ladder step (design doc §10).
+//! `param_list`).
+//!
+//! # What a reduced-precision moment is stored as
+//!
+//! The plan's tiers name FP16 and INT8 (`OptimPrecision`). Neither is what
+//! gets stored, because neither can hold Adam state for gradients of
+//! realistic size:
+//!
+//! - **Second moment `v`: always f32.** `v` accumulates `(1-beta2) * g^2`.
+//!   For `g = 1e-3` that increment is 1e-9, below half of f16's smallest
+//!   subnormal (2.98e-8), so it stores as zero and stays zero for any
+//!   element whose `|g|` never exceeds 5.5e-3 -- which is nearly every
+//!   element of a model with a global gradient norm near 1. With `v = 0`
+//!   the update is `m_hat / eps`: a constant gradient of 1e-3 moved a
+//!   weight 10x further in 200 steps than f32 moments did. BF16 has the
+//!   range but not the resolution: its relative spacing (2^-8) is coarser
+//!   than `1 - beta2` (2^-10), so round-to-nearest stalls the average. A
+//!   sound 16-bit `v` needs stochastic rounding or a transformed encoding;
+//!   until one exists `v` is not narrowed.
+//! - **First moment `m`: BF16.** `m` is of the size of the gradient itself,
+//!   so in f16 it is subnormal below 6.1e-5 and zero below 3e-8. BF16 keeps
+//!   f32's exponent range. Its spacing (2^-8 relative) is fine against
+//!   `1 - beta1` (0.1): round-to-nearest holds `m` within a few percent of
+//!   the f32 average for a constant gradient, and without bias for a noisy
+//!   one.
+//!
+//! So a reduced tier saves 2 of the 8 moment bytes per element (25%), not
+//! the 4 to 6 the tier table implies. [`stored_moment_bytes`] is the single
+//! statement of that, used by the plan's byte accounting.
 
 use crate::cpdt_tier_apply::{OptimPrecision, ParamPrecision, PrecisionPlan};
 
 /// Runtime dtype codes. Not a mirror any more: the emitted optimizer-state
 /// storage dtype IS the ABI's tag (`nsl_abi::wire::dtype`, roadmap A3),
 /// which the runtime re-exports as its canonical `DTYPE_*`.
-pub use nsl_abi::wire::dtype::{DTYPE_F32, DTYPE_FP16, DTYPE_INT8};
+pub use nsl_abi::wire::dtype::{DTYPE_BF16, DTYPE_F32};
 
-/// v1 clamp: map an optimizer-state precision to FP16 storage (Part II's FASE
-/// wrapping handles only F32/FP16). This is the Part II FP16 PATH — the runtime
-/// has INT8 blockwise ops now (§3.2 / Sprint 4), and the FASE-side cast wrapping
-/// to consume them is a separate follow-on.
-pub fn clamp_int8_to_fp16(p: OptimPrecision) -> u16 {
+/// Storage dtype of a first moment whose plan asks for `p`: f32 when the
+/// plan keeps it at full precision, BF16 for any reduced tier.
+pub fn first_moment_storage(p: OptimPrecision) -> u16 {
     match p {
         OptimPrecision::Fp32 => DTYPE_F32,
-        OptimPrecision::Fp16 => DTYPE_FP16,
-        OptimPrecision::Int8 => DTYPE_FP16,
+        OptimPrecision::Fp16 | OptimPrecision::Int8 => DTYPE_BF16,
     }
 }
 
-/// Paper-faithful dtype mapping for `OptimPrecision`. FP32 → DTYPE_F32, FP16 →
-/// DTYPE_FP16, INT8 → DTYPE_INT8 (blockwise — runtime support shipped in §3.2).
-/// Use this when the consumer (cast wrapper / FASE step) actually handles INT8
-/// storage. `clamp_int8_to_fp16` remains the safe Part II default.
-pub fn dtype_for_precision_full(p: OptimPrecision) -> u16 {
-    match p {
-        OptimPrecision::Fp32 => DTYPE_F32,
-        OptimPrecision::Fp16 => DTYPE_FP16,
-        OptimPrecision::Int8 => DTYPE_INT8,
-    }
+/// Storage dtype of a second moment: f32 whatever the plan asks for (see
+/// the module doc).
+pub fn second_moment_storage(_p: OptimPrecision) -> u16 {
+    DTYPE_F32
+}
+
+/// Bytes per element the pair `(m, v)` occupies as stored.
+pub fn stored_moment_bytes(m: OptimPrecision, v: OptimPrecision) -> u64 {
+    let width = |code: u16| if code == DTYPE_F32 { 4 } else { 2 };
+    width(first_moment_storage(m)) + width(second_moment_storage(v))
 }
 
 /// Find the precision for a param path. Matches CPDT plan names against the
@@ -74,8 +98,6 @@ fn precision_for_path<'a>(plan: &'a PrecisionPlan, path: &str) -> Option<&'a Par
     plan.params.iter().find(|p| name_matches_path(&p.name, stripped))
 }
 
-/// Build (m_dtype_codes, v_dtype_codes) in `param_paths` order. Each code is
-/// `DTYPE_F32` or `DTYPE_FP16`. Unmatched paths -> (F32, F32) (safe fallback).
 /// How many of this block's parameters the precision plan's names actually
 /// join (exact match or the one-segment strip). The weights-only path has
 /// no `cpdt_sensitivity::validate` (there is no AppliedPlan to check the
@@ -92,14 +114,17 @@ pub fn joined_param_count(plan: &PrecisionPlan, param_paths: &[String]) -> usize
         .count()
 }
 
+/// Build (m_dtype_codes, v_dtype_codes) in `param_paths` order. Each code is
+/// a storage dtype from [`first_moment_storage`] / [`second_moment_storage`].
+/// Unmatched paths -> (F32, F32).
 pub fn build_dtype_lists(plan: &PrecisionPlan, param_paths: &[String]) -> (Vec<u16>, Vec<u16>) {
     let mut m = Vec::with_capacity(param_paths.len());
     let mut v = Vec::with_capacity(param_paths.len());
     for path in param_paths {
         match precision_for_path(plan, path) {
             Some(pp) => {
-                m.push(clamp_int8_to_fp16(pp.m_precision));
-                v.push(clamp_int8_to_fp16(pp.v_precision));
+                m.push(first_moment_storage(pp.m_precision));
+                v.push(second_moment_storage(pp.v_precision));
             }
             None => {
                 m.push(DTYPE_F32);
@@ -118,26 +143,16 @@ pub fn build_dtype_lists(plan: &PrecisionPlan, param_paths: &[String]) -> (Vec<u
 /// Params are joined to layers with the SAME `wggo_graph::layer_prefix`
 /// the graph builder used to bucket them (handles the model-variable
 /// prefix and arbitrary container nesting); unmatched params stay F32.
-/// Sub-32 bits map to FP16 storage in v1 — the same ladder step as
-/// [`clamp_int8_to_fp16`].
+/// A sub-32-bit first moment is stored BF16; the second moment is stored
+/// f32 whatever the plan carries (see the module doc).
 pub fn build_dtype_lists_from_overrides(
     overrides: &crate::wggo_overrides::WggoOverrides,
     param_paths: &[String],
 ) -> Option<(Vec<u16>, Vec<u16>)> {
-    let any_sub32 = overrides
-        .per_layer
-        .iter()
-        .any(|l| l.optim_m_bits < 32 || l.optim_v_bits < 32);
-    if !any_sub32 {
+    if !overrides.per_layer.iter().any(|l| l.optim_m_bits < 32) {
         return None;
     }
-    let map_bits = |b: u8| -> u16 {
-        if b < 32 {
-            DTYPE_FP16
-        } else {
-            DTYPE_F32
-        }
-    };
+    let m_storage = |bits: u8| if bits < 32 { DTYPE_BF16 } else { DTYPE_F32 };
     let mut m = Vec::with_capacity(param_paths.len());
     let mut v = Vec::with_capacity(param_paths.len());
     for path in param_paths {
@@ -145,8 +160,8 @@ pub fn build_dtype_lists_from_overrides(
             .and_then(|lp| overrides.per_layer.iter().find(|l| l.layer_name == lp));
         match layer {
             Some(l) => {
-                m.push(map_bits(l.optim_m_bits));
-                v.push(map_bits(l.optim_v_bits));
+                m.push(m_storage(l.optim_m_bits));
+                v.push(DTYPE_F32);
             }
             None => {
                 m.push(DTYPE_F32);
@@ -159,7 +174,7 @@ pub fn build_dtype_lists_from_overrides(
     // 'other' bucket, whose params have no layer_prefix) must NOT claim
     // activation — returning Some(all-F32) here would both lie in the
     // activation diagnostic and preempt an active per-param CPDT plan.
-    if m.iter().all(|&c| c == DTYPE_F32) && v.iter().all(|&c| c == DTYPE_F32) {
+    if m.iter().all(|&c| c == DTYPE_F32) {
         return None;
     }
     Some((m, v))
@@ -295,30 +310,38 @@ mod tests {
     }
 
     #[test]
-    fn clamp_maps_int8_to_fp16() {
-        assert_eq!(clamp_int8_to_fp16(OptimPrecision::Fp32), DTYPE_F32);
-        assert_eq!(clamp_int8_to_fp16(OptimPrecision::Fp16), DTYPE_FP16);
-        assert_eq!(clamp_int8_to_fp16(OptimPrecision::Int8), DTYPE_FP16);
-    }
-
-    #[test]
-    fn full_maps_int8_to_dtype_int8() {
-        // CPDT §3.2: runtime now supports INT8 blockwise storage (Sprint 4),
-        // so the paper-faithful dtype mapping returns DTYPE_INT8.
-        assert_eq!(dtype_for_precision_full(OptimPrecision::Fp32), DTYPE_F32);
-        assert_eq!(dtype_for_precision_full(OptimPrecision::Fp16), DTYPE_FP16);
-        assert_eq!(dtype_for_precision_full(OptimPrecision::Int8), DTYPE_INT8);
-    }
-
-    #[test]
-    fn full_and_clamp_differ_only_on_int8() {
-        for p in [OptimPrecision::Fp32, OptimPrecision::Fp16] {
-            assert_eq!(dtype_for_precision_full(p), clamp_int8_to_fp16(p));
+    fn reduced_first_moment_is_bf16_and_second_moment_is_never_narrowed() {
+        assert_eq!(first_moment_storage(OptimPrecision::Fp32), DTYPE_F32);
+        assert_eq!(first_moment_storage(OptimPrecision::Fp16), DTYPE_BF16);
+        assert_eq!(first_moment_storage(OptimPrecision::Int8), DTYPE_BF16);
+        for p in [OptimPrecision::Fp32, OptimPrecision::Fp16, OptimPrecision::Int8] {
+            assert_eq!(second_moment_storage(p), DTYPE_F32);
         }
-        assert_ne!(
-            dtype_for_precision_full(OptimPrecision::Int8),
-            clamp_int8_to_fp16(OptimPrecision::Int8),
-        );
+    }
+
+    #[test]
+    fn stored_bytes_match_the_storage_dtypes() {
+        // 4 + 4 at full precision; a reduced tier saves the first moment's
+        // two bytes and nothing else.
+        assert_eq!(stored_moment_bytes(OptimPrecision::Fp32, OptimPrecision::Fp32), 8);
+        for (m, v) in [
+            (OptimPrecision::Fp16, OptimPrecision::Fp32),
+            (OptimPrecision::Int8, OptimPrecision::Fp16),
+            (OptimPrecision::Int8, OptimPrecision::Int8),
+        ] {
+            assert_eq!(stored_moment_bytes(m, v), 6);
+        }
+    }
+
+    /// The reason `v` is never narrowed, as arithmetic: the per-step
+    /// increment of the second moment for a gradient of 1e-3 is below half
+    /// of f16's smallest subnormal, so an f16 `v` stores it as zero.
+    #[test]
+    fn an_f16_second_moment_cannot_hold_a_realistic_increment() {
+        let g = 1e-3_f64;
+        let increment = (1.0 - 0.999) * g * g;
+        let smallest_f16_subnormal = 2f64.powi(-24);
+        assert!(increment < smallest_f16_subnormal / 2.0);
     }
 
     #[test]
@@ -334,11 +357,11 @@ mod tests {
         let paths = vec![
             "norm".to_string(),                // matches "norm.weight" via suffix strip
             "embed".to_string(),               // unmatched -> F32,F32
-            "blocks.0.ffn.w_gate".to_string(), // exact -> FP16,FP16 (INT8 clamped)
+            "blocks.0.ffn.w_gate".to_string(), // exact -> BF16 m, F32 v
         ];
         let (m, v) = build_dtype_lists(&plan, &paths);
-        assert_eq!(m, vec![DTYPE_F32, DTYPE_F32, DTYPE_FP16]);
-        assert_eq!(v, vec![DTYPE_F32, DTYPE_F32, DTYPE_FP16]);
+        assert_eq!(m, vec![DTYPE_F32, DTYPE_F32, DTYPE_BF16]);
+        assert_eq!(v, vec![DTYPE_F32, DTYPE_F32, DTYPE_F32]);
     }
 
     #[test]
@@ -377,8 +400,8 @@ mod tests {
 
     #[test]
     fn overrides_sub32_bits_map_params_by_layer_prefix() {
-        // blocks.0 keeps FP32 moments; blocks.1 gets FP16 (8-bit clamps to
-        // FP16 in v1). Nested container ("m.encoder.blocks.1.w") and
+        // blocks.0 keeps FP32 moments; blocks.1 gets a BF16 first moment and
+        // an f32 second moment. Nested container ("m.encoder.blocks.1.w") and
         // model-var-prefixed paths both join; the unmatched embedding
         // param stays F32.
         let o = crate::wggo_overrides::WggoOverrides {
@@ -393,19 +416,18 @@ mod tests {
             "m.embed".into(),
         ];
         let (m, v) = build_dtype_lists_from_overrides(&o, &paths).unwrap();
-        assert_eq!(m, vec![DTYPE_F32, DTYPE_FP16, DTYPE_F32]);
-        assert_eq!(v, vec![DTYPE_F32, DTYPE_FP16, DTYPE_F32]);
+        assert_eq!(m, vec![DTYPE_F32, DTYPE_BF16, DTYPE_F32]);
+        assert_eq!(v, vec![DTYPE_F32, DTYPE_F32, DTYPE_F32]);
     }
 
     #[test]
-    fn overrides_mixed_m_v_bits_are_independent() {
+    fn overrides_asking_only_for_a_narrow_second_moment_change_nothing() {
+        // A plan that keeps `m` at 32 bits and asks for a 16-bit `v` has
+        // nothing left to lower: `v` is stored f32 regardless.
         let o = crate::wggo_overrides::WggoOverrides {
             per_layer: vec![override_layer(0, "blocks.0", 32, 16)],
         };
-        let (m, v) =
-            build_dtype_lists_from_overrides(&o, &["m.blocks.0.w".into()]).unwrap();
-        assert_eq!(m, vec![DTYPE_F32]);
-        assert_eq!(v, vec![DTYPE_FP16]);
+        assert!(build_dtype_lists_from_overrides(&o, &["m.blocks.0.w".into()]).is_none());
     }
 
     fn dl(codes: &[u16]) -> Vec<u16> {
@@ -420,12 +442,12 @@ mod tests {
         // independent CPDT PrecisionPlan must still apply, regardless of
         // the --wggo-moment-precision opt-in, exactly as it did before
         // WGGO plans existed.
-        let cpdt = Some((dl(&[DTYPE_FP16, DTYPE_F32]), dl(&[DTYPE_FP16, DTYPE_F32])));
+        let cpdt = Some((dl(&[DTYPE_BF16, DTYPE_F32]), dl(&[DTYPE_BF16, DTYPE_F32])));
         for opt_in in [false, true] {
             match arbitrate_moment_precision(None, cpdt.clone(), opt_in) {
                 MomentPrecisionArbitration::CpdtOnly(m, v) => {
-                    assert_eq!(m, vec![DTYPE_FP16, DTYPE_F32]);
-                    assert_eq!(v, vec![DTYPE_FP16, DTYPE_F32]);
+                    assert_eq!(m, vec![DTYPE_BF16, DTYPE_F32]);
+                    assert_eq!(v, vec![DTYPE_BF16, DTYPE_F32]);
                 }
                 _ => panic!(
                     "expected CpdtOnly regardless of opt_in={opt_in}, got a different variant (discriminant only, no Debug)"
@@ -436,8 +458,8 @@ mod tests {
 
     #[test]
     fn arbitration_wggo_decision_without_opt_in_drops_both_sources() {
-        let wggo = Some((dl(&[DTYPE_FP16]), dl(&[DTYPE_FP16])));
-        let cpdt = Some((dl(&[DTYPE_FP16]), dl(&[DTYPE_FP16])));
+        let wggo = Some((dl(&[DTYPE_BF16]), dl(&[DTYPE_BF16])));
+        let cpdt = Some((dl(&[DTYPE_BF16]), dl(&[DTYPE_BF16])));
         assert!(matches!(
             arbitrate_moment_precision(wggo, cpdt, false),
             MomentPrecisionArbitration::NotLoweredNoOptIn
@@ -446,14 +468,14 @@ mod tests {
 
     #[test]
     fn arbitration_wggo_only_requires_opt_in() {
-        let wggo = Some((dl(&[DTYPE_FP16]), dl(&[DTYPE_F32])));
+        let wggo = Some((dl(&[DTYPE_BF16]), dl(&[DTYPE_F32])));
         assert!(matches!(
             arbitrate_moment_precision(wggo.clone(), None, false),
             MomentPrecisionArbitration::NotLoweredNoOptIn
         ));
         match arbitrate_moment_precision(wggo, None, true) {
             MomentPrecisionArbitration::WggoOnly(m, v) => {
-                assert_eq!(m, vec![DTYPE_FP16]);
+                assert_eq!(m, vec![DTYPE_BF16]);
                 assert_eq!(v, vec![DTYPE_F32]);
             }
             _ => panic!("expected WggoOnly when opted in"),
@@ -464,12 +486,12 @@ mod tests {
     fn arbitration_merge_prefers_f32_conservatively() {
         // param 0: WGGO says FP16, CPDT says F32 -> merged F32 (conservative).
         // param 1: both say FP16 -> merged FP16.
-        let wggo = Some((dl(&[DTYPE_FP16, DTYPE_FP16]), dl(&[DTYPE_FP16, DTYPE_FP16])));
-        let cpdt = Some((dl(&[DTYPE_F32, DTYPE_FP16]), dl(&[DTYPE_F32, DTYPE_FP16])));
+        let wggo = Some((dl(&[DTYPE_BF16, DTYPE_BF16]), dl(&[DTYPE_BF16, DTYPE_BF16])));
+        let cpdt = Some((dl(&[DTYPE_F32, DTYPE_BF16]), dl(&[DTYPE_F32, DTYPE_BF16])));
         match arbitrate_moment_precision(wggo, cpdt, true) {
             MomentPrecisionArbitration::Merged(m, v) => {
-                assert_eq!(m, vec![DTYPE_F32, DTYPE_FP16]);
-                assert_eq!(v, vec![DTYPE_F32, DTYPE_FP16]);
+                assert_eq!(m, vec![DTYPE_F32, DTYPE_BF16]);
+                assert_eq!(v, vec![DTYPE_F32, DTYPE_BF16]);
             }
             _ => panic!("expected Merged"),
         }

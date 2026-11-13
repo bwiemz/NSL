@@ -8,6 +8,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **Errata for the fifteen research proposals in `docs/research/`.** Each
+  proposal PDF (CCR, CEP, CESH, CFA, CFIE, CFTP, CGAC, CIDP, CKVQ, CPDT,
+  CPKD, CSHA, CSS, WGGO, WRGA) now has an `-errata.md` beside it, from a
+  November 2026 review of the proposal against its own arithmetic, the
+  literature and the code. Each file lists the proposal's errors with what
+  is true instead, what later work supersedes, what the code actually
+  implements, and the implementation defects the review found, split into
+  fixed and still open. The WGGO errata that already existed keeps its
+  entries E1 to E3 and gains the rest. Five of the proposals (CESH, CFA,
+  CGAC, CIDP, CSS) and CKVQ have no implementation; the Glossary described
+  several of them as existing machinery, and three under the wrong title,
+  and now says what they are.
+
 - **`tools/refcheck`: NSL against PyTorch.** A PyTorch twin of `NSLCoder`
   that loads an `.nslm`, and three checks built on it: per-parameter
   gradients (`grad_check.py`), AdamW updates and the learning rate applied
@@ -1992,6 +2005,75 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **Tape AD returned a zero gradient through a fused elementwise chain or
+  a `clone`.** Two holes in the autodiff tape, both silent, both in the
+  default AD mode of `nsl run`:
+  - A chain of elementwise ops inside a function or model method
+    (`tanh(sigmoid(u))`, `relu(a + b)`, `neg(log(u))`) is fused into one
+    runtime call that records nothing on the tape. The compiler avoids
+    this inside a `grad`/`train` block's own body, but functions are
+    compiled without knowing a tape may be live. Every parameter behind
+    such a chain in a model's `forward` got a gradient of exactly zero,
+    with the loss correct; the run stopped only if every parameter was cut
+    off. The fused call now runs as its separate recorded ops whenever a
+    tape is recording.
+  - `x.clone()` was invisible to the tape, so `let c = w.clone()` followed
+    by a loss on `c` gave `w` a zero gradient. A clone written in the
+    program is now recorded as an identity.
+- **Reduced-precision optimizer moments destroyed training.**
+  `--wggo-memory-budget`, `--wggo-moment-precision` and `--cpdt full
+  --weights` stored Adam's second moment as f16. Its per-step increment
+  for a gradient of 1e-3 is 1e-9, below half of f16's smallest subnormal,
+  so it stayed zero and the step became `m_hat / eps`: a constant gradient
+  of 1e-3 moved a weight from 1.0 to -0.85 in 200 steps where f32 moments
+  reach +0.82. `--wggo-memory-budget` alone triggered it, at any budget.
+  The second moment is now always f32 and a reduced first moment is BF16,
+  which cannot underflow; the same run ends at 0.8158. The saving is
+  therefore 2 of the 8 moment bytes per parameter, and the planner's byte
+  accounting says so. With a budget and no other evidence the planner now
+  keeps full precision wherever it fits.
+- **Gradient accumulation computed a different optimizer for Lion, SOAP,
+  Muon and `@fase(mode = off | full_buffer)`.** That path accumulated the
+  sum of the micro-batch gradients instead of their mean, counted
+  micro-batches instead of optimizer steps in Adam's bias correction, and
+  applied `grad_clip` to each micro-batch before summing. `@fase(allow_v_approx
+  = false)`, which reads as "be exact", selected it. All paths now match
+  standard accumulation, and AdamW matches PyTorch to the last digit on
+  every one. Muon under `--layerwise-accum` had copied the same sum and
+  micro-batch count so as to stay bit-identical to that path; it follows
+  the correction and is still bit-identical to it. Under `grad_clip`,
+  `no_decay = [...]` was also ignored by the per-parameter step that
+  `--training-reference` forces.
+- **`--checkpoint-blocks` re-drew `randn` when it recomputed a block**, so
+  the gradient was taken through activations the forward never produced.
+  Random draws are now always saved.
+- **`@wrga(mode = manual | hybrid)` trained nothing under `--source-ad`**
+  and exited 0; tape AD ignored the mode and trained everything. Both AD
+  modes now train what `@freeze` leaves trainable.
+- **An `@adapter` on a `[batch, seq, d]` activation aborted at the first
+  optimizer step when the build pinned a target** (`--target sm_80`).
+- **MoE expert capacity ignored `top_k`**: balanced top-2 routing at
+  capacity factor 1.0 dropped half its assignments, and later tokens left
+  the layer as zeros. `--cpdt full` also replaced a user's
+  `@moe(capacity_factor)` with 1.0.
+- **A `DataLoader` worker that panicked ended the epoch early with exit
+  status 0, or hung the run.** It now aborts the process.
+- **`m.blocks[i]` on a `[Block; N]` model field read garbage** and aborted
+  on first use; only `for block in self.blocks` could reach the elements.
+- **`quant` blocks destroyed any tensor whose values excluded zero**: a
+  normalisation gain of [0.90 .. 1.04] came back as 0.14 in every element.
+- **`sample_top_k` / `sample_top_p` aborted at `temperature = 0`**; zero is
+  now greedy.
+- **Any `-w` run whose model held a matrix at least half zeros aborted**
+  in the weight-aware sparse matmul. A dense tensor returned by a function
+  with "sparse" in its name aborted at its first `+`.
+- **Misleading output.** `--csha` on a model it does not apply to printed
+  a fusion plan and a "6.00x speedup" while compiling an identical object;
+  it now says it was not applied. The WGGO importance note printed several
+  times on every compile, including builds that never mention WGGO. A
+  CUDA-enabled runtime warned "A prior GPU operation failed" at every
+  `grad` block of a CPU run.
+
 - **Pretraining did not learn at 500M and 1B: the attention backward
   underflowed its gradients.** The flash-attention backward runs its
   matmuls on f16 tensor-core operands and converted `dO` and `dS` to f16
@@ -3363,6 +3445,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   restored to their pre-700bfaa8 structural assertions now that R7 is retired.
 
 ### Changed
+
+- **A packed `DataLoader` must name its separator.**
+  `DataLoader(..., packing = true)` without `pack_separator = <token id>`
+  is a compile error. The default was id 0, which is the token "!" in the
+  shipped tokenizers, so documents were split at every "!". Passing
+  `labels` with `packing = true` is also an error: a packed batch derives
+  its labels from the stream and ignored the tensor.
+- **The fused adapter kernel is opt-in at compile time.** A pinned target
+  of sm_80 or later no longer selects it by itself; set
+  `NSL_WRGA_FUSED_CUDA=1` as well. It handles 2-D activations only and
+  measured slower than the GEMMs it replaces.
+- **The weight-aware sparse matmul is withheld** unless
+  `NSL_M52C_SPARSE_MATMUL=1`; `-w` runs use the dense matmul.
 
 - **Three requests that were silently not honoured are now compile
   errors.**

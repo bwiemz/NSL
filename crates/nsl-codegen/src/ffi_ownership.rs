@@ -62,6 +62,7 @@ fn build_table() -> HashMap<&'static str, FfiOwnershipKind> {
     m.insert("nsl_tensor_cos", OwnedNewResult);
     // Creation / conversion
     m.insert("nsl_tensor_clone", OwnedNewResult);
+    m.insert("nsl_tensor_clone_traced", OwnedNewResult);
     m.insert("nsl_tensor_contiguous", OwnedNewResult);
     m.insert("nsl_tensor_to_device", OwnedNewResult);
     m.insert("nsl_tensor_cast", OwnedNewResult);

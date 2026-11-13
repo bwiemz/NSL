@@ -242,6 +242,20 @@ impl CshaPlan {
         writeln!(s, "=== CSHA Compilation Report ===").unwrap();
         writeln!(s, "Mode: {}", self.mode.as_str()).unwrap();
         writeln!(s, "Target GPU: {}", self.target_gpu).unwrap();
+        // What the numbers below are, so they are not read as measurements
+        // of this model: the traffic figures come from a byte-count model on
+        // a nominal layer shape (`run_on_wengert`'s default, not the model's
+        // dimensions), and each time is that byte count divided by the
+        // GPU's peak bandwidth — so every "speedup" equals its traffic ratio
+        // by construction. Training builds emit the Level-1 configuration
+        // (`compiler/kernel.rs`): a level above it is planned, not emitted.
+        writeln!(
+            s,
+            "Note: traffic and time figures are a bandwidth model on a nominal layer \
+             shape, not measurements of this model; training builds emit the Level-1 \
+             kernel configuration whatever level is planned below."
+        )
+        .unwrap();
         writeln!(s).unwrap();
 
         writeln!(

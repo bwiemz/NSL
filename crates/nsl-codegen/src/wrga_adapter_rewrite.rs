@@ -334,11 +334,28 @@ fn make_float(v: f64, span: nsl_errors::Span) -> Expr {
     }
 }
 
+/// Whether an adapter site may be rewritten to the fused single-FFI call.
+///
+/// Needs a pinned target of sm_80 or later AND `NSL_WRGA_FUSED_CUDA=1` in
+/// the compiler's environment -- the same variable the runtime reads before
+/// launching the synthesized kernel. A pinned target alone used to be
+/// enough, which put every `--target sm_80`-style build on the fused call
+/// and its adjoints with no opt-in. Those adjoints assume 2-D activations
+/// (`dW = x^T @ dy` with no sum over leading dimensions), so any adapter on
+/// a `[batch, seq, d]` activation produced gradients of the wrong shape and
+/// aborted at the first optimizer step; and the kernel itself measured 15
+/// to 67 times slower than the ordinary GEMMs (Appendix B, section B.6).
+/// The unfused triple is correct for every rank.
+fn fused_path_selected(target_sm: Option<u32>) -> bool {
+    target_sm.is_some_and(|sm| sm >= 80)
+        && std::env::var("NSL_WRGA_FUSED_CUDA").ok().as_deref() == Some("1")
+}
+
 /// B.3 Task 4: dispatch between the fused single-FFI path and the B.2.1
 /// unfused triple based on the site's `fusion_decision` and target sm.
 ///
 /// * Fused path: `site.fusion_decision == Some(EpilogueFusedLora)` AND
-///   `ctx.target_sm >= 80` → emit one Call to `nsl_adapter_fused_lora_matmul`.
+///   [`fused_path_selected`] → emit one Call to `nsl_adapter_fused_lora_matmul`.
 /// * Unfused path (B.2.1): any other condition → emit the three-FFI
 ///   triple `x @ W + ((x @ A) @ B) * scale`.
 ///
@@ -354,7 +371,7 @@ pub fn synthesize_lora_adapted(
         site.fusion_decision,
         Some(crate::wrga_fusion::FusionTarget::EpilogueFusedLora { .. })
     );
-    let sm_ok = ctx.target_sm.map(|sm| sm >= 80).unwrap_or(false);
+    let sm_ok = fused_path_selected(ctx.target_sm);
     if is_fused && sm_ok {
         return synthesize_lora_fused_call(original, lhs, site, ctx);
     }
@@ -526,7 +543,7 @@ pub fn synthesize_ia3_adapted(
         site.fusion_decision,
         Some(crate::wrga_fusion::FusionTarget::ActivationFusedIa3)
     );
-    let sm_ok = ctx.target_sm.map(|sm| sm >= 80).unwrap_or(false);
+    let sm_ok = fused_path_selected(ctx.target_sm);
     if is_fused && sm_ok {
         return synthesize_ia3_fused_call(original, site, ctx);
     }
@@ -761,7 +778,7 @@ pub fn synthesize_gatedlora_adapted(
         site.fusion_decision,
         Some(crate::wrga_fusion::FusionTarget::EpilogueFusedGatedLora { .. })
     );
-    let sm_ok = ctx.target_sm.map(|sm| sm >= 80).unwrap_or(false);
+    let sm_ok = fused_path_selected(ctx.target_sm);
     if is_fused && sm_ok {
         return synthesize_gatedlora_fused_call(original, lhs, site, ctx);
     }

@@ -221,6 +221,20 @@ fn all_f32(operands: &[&crate::tensor::NslTensor]) -> bool {
         .all(|t| t.dtype == crate::tensor::DTYPE_F32)
 }
 
+/// Whether the synthesized kernels can read `x` and `w` as they are.
+///
+/// The kernels index both operands as flat row-major `[m, k]` and `[k, n]`
+/// matrices and write an `[m, n]` output. Any other rank must decline: an
+/// `x` of shape `[2, 3, 8]` used to be launched with `m = 3`, returning a
+/// `[3, 8]` result that held batch 0 only, with no error. A strided view
+/// would be read in storage order. Declining sends the caller to the
+/// ordinary-ops path, which handles both.
+#[cfg(feature = "cuda")]
+#[inline]
+fn kernel_can_read(x: &crate::tensor::NslTensor, w: &crate::tensor::NslTensor) -> bool {
+    x.ndim == 2 && w.ndim == 2 && x.is_contiguous() && w.is_contiguous()
+}
+
 /// Attempt a real cudarc-based launch for the LoRA kernel identified by
 /// `handle`.  Returns `Some(out_ptr)` on success, `None` on any failure
 /// (missing PTX, non-GPU tensors, launch error, etc.) — the caller then
@@ -283,7 +297,7 @@ fn try_cuda_launch_fused_lora(
     }
 
     // 3. Derive shape-dependent grid/block from x=[m,k], w=[k,n].
-    if xt.ndim < 2 || wt.ndim < 2 {
+    if !kernel_can_read(xt, wt) {
         return None;
     }
     let m = unsafe { *xt.shape.add(xt.ndim as usize - 2) } as i64;
@@ -430,7 +444,7 @@ fn try_cuda_launch_fused_ia3(
         );
         return None;
     }
-    if xt.ndim < 2 || wt.ndim < 2 {
+    if !kernel_can_read(xt, wt) {
         return None;
     }
     let m = unsafe { *xt.shape.add(xt.ndim as usize - 2) } as i64;
@@ -721,7 +735,7 @@ fn try_cuda_launch_fused_gatedlora(
     }
 
     // 3. Derive shape-dependent grid/block from x=[m,k], w=[k,n].
-    if xt.ndim < 2 || wt.ndim < 2 {
+    if !kernel_can_read(xt, wt) {
         return None;
     }
     let m = unsafe { *xt.shape.add(xt.ndim as usize - 2) } as i64;

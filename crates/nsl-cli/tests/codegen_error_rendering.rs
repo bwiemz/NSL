@@ -113,7 +113,7 @@ fn an_infeasible_wggo_budget_is_a_rendered_refusal_that_writes_nothing() {
         .stderr(predicate::str::contains(
             "error: --wggo-memory-budget of 1048576 bytes (1 MiB) is infeasible",
         ))
-        .stderr(predicate::str::contains("even at the fp16-moment floor"))
+        .stderr(predicate::str::contains("even at the moment-precision floor"))
         .stderr(predicate::str::contains("Raise the budget or shrink the model"))
         // Points at the header's `model = m` (line 10, column 7), which is
         // what the budget was checked against — not the whole train block.

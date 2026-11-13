@@ -233,6 +233,16 @@ fn compute_scale_zp(values: &[f64], qmin: f64, qmax: f64) -> (f32, u8) {
         if v > max_val { max_val = v; }
     }
 
+    // The representable range must contain zero. The zero point is the
+    // code that decodes to exactly 0.0, and it is clamped into
+    // [qmin, qmax]: for a group whose values are all positive (or all
+    // negative) the unclamped zero point lies outside that interval, the
+    // clamp moved it, and every value then decoded against the wrong
+    // offset. A normalisation gain of [0.90 .. 1.04] came back as 0.14 in
+    // every element, at int8 and int4 alike.
+    let min_val = min_val.min(0.0);
+    let max_val = max_val.max(0.0);
+
     // Handle zero-variance case: all values identical or nearly so
     let raw_range = max_val - min_val;
     if raw_range < 1e-7 {
@@ -643,4 +653,57 @@ pub extern "C" fn nsl_qtensor_shape(qtensor_ptr: i64) -> i64 {
         0,
     ));
     Box::into_raw(out) as i64
+}
+
+#[cfg(test)]
+mod scale_zero_point_tests {
+    use super::{compute_scale_zp, dequantize_val, quantize_val};
+
+    /// Largest round-trip error of `values` at the given code range.
+    fn worst_error(values: &[f64], qmin: f64, qmax: f64) -> (f64, f64) {
+        let (scale, zp) = compute_scale_zp(values, qmin, qmax);
+        let worst = values
+            .iter()
+            .map(|&x| (dequantize_val(quantize_val(x, scale, zp, qmin, qmax), scale, zp) - x).abs())
+            .fold(0.0, f64::max);
+        (worst, f64::from(scale))
+    }
+
+    /// Rounding to the nearest code can be off by half a step and no more.
+    /// A group that does not straddle zero used to be off by most of its
+    /// own magnitude: [0.90 .. 1.04] decoded to 0.14 in every element.
+    #[test]
+    fn a_group_that_excludes_zero_round_trips_within_half_a_step() {
+        let gains: Vec<f64> = (0..15).map(|i| 0.90 + 0.01 * f64::from(i)).collect();
+        let negatives: Vec<f64> = gains.iter().map(|g| -g).collect();
+        let mixed: Vec<f64> = (0..15).map(|i| -0.7 + 0.1 * f64::from(i)).collect();
+        for (name, values) in [("positive", &gains), ("negative", &negatives), ("mixed", &mixed)] {
+            for (bits, qmax) in [(8, 255.0), (4, 15.0)] {
+                let (worst, scale) = worst_error(values, 0.0, qmax);
+                assert!(
+                    worst <= 0.5 * scale * 1.0001,
+                    "{name}, int{bits}: worst error {worst} exceeds half a step ({})",
+                    0.5 * scale
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zero_always_decodes_to_exactly_zero() {
+        for values in [vec![0.9, 1.04], vec![-3.0, -0.5], vec![-1.0, 2.0], vec![0.0, 0.0]] {
+            let (scale, zp) = compute_scale_zp(&values, 0.0, 255.0);
+            let decoded = dequantize_val(quantize_val(0.0, scale, zp, 0.0, 255.0), scale, zp);
+            assert_eq!(decoded, 0.0, "values {values:?}");
+        }
+    }
+
+    #[test]
+    fn a_constant_group_round_trips() {
+        for constant in [1.0, -2.5, 0.0, 1e-3] {
+            let values = [constant; 8];
+            let (worst, scale) = worst_error(&values, 0.0, 255.0);
+            assert!(worst <= 0.5 * scale * 1.0001 + 1e-9, "constant {constant}: error {worst}");
+        }
+    }
 }

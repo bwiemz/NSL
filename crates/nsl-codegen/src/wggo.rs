@@ -887,7 +887,9 @@ pub fn run(mut input: WggoInput) -> WggoPlan {
                     (Some(lut), Some(c)) => {
                         let floor_bits: u8 =
                             if c.sensitivity >= c.critical_prec_threshold { 32 } else { 16 };
-                        crate::wggo_ilp::moment_floor_bytes(lut, floor_bits, floor_bits)
+                        // The second moment is always 32-bit
+                        // (`second_moment_bits_allowed`).
+                        crate::wggo_ilp::moment_floor_bytes(lut, floor_bits, 32)
                     }
                     _ => 0,
                 }
@@ -1509,14 +1511,15 @@ pub fn run_on_wengert_with_weights(
         return Err(CodegenError::new(format!(
             "--wggo-memory-budget of {budget} bytes ({budget_mib} MiB) is \
              infeasible: the model needs at least {required} bytes ({required_mib} MiB) \
-             even at the fp16-moment floor (16-bit Adam m/v, no structural relief){layers}. \
+             even at the moment-precision floor (16-bit first moment, 32-bit second \
+             moment, no structural relief){layers}. \
              Raise the budget or shrink the model.",
             budget = bi.budget_bytes,
             budget_mib = bi.budget_bytes / (1024 * 1024),
             required = bi.required_fp16_floor_bytes,
             required_mib = bi.required_fp16_floor_bytes / (1024 * 1024),
             layers = if bi.infeasible_layers > 0 {
-                format!(" ({} layer(s) infeasible at fp16)", bi.infeasible_layers)
+                format!(" ({} layer(s) infeasible at that floor)", bi.infeasible_layers)
             } else {
                 String::new()
             },

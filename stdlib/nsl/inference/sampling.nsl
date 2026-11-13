@@ -5,8 +5,14 @@
 
 ## Sample one token from the `k` highest-probability logits, after
 ## dividing by `temperature`. Lower temperature concentrates the
-## distribution; `k = 1` is greedy.
+## distribution; `k = 1` is greedy, and so is `temperature = 0` (the limit
+## of the division, taken directly: dividing by zero gave NaN probabilities
+## and the draw aborted).
 fn sample_top_k(logits: Tensor, k: int, temperature: float) -> Tensor:
+    if temperature <= 0.0:
+        # One candidate at temperature 1: the same code path, and so the
+        # same result shape, as a sampled draw.
+        return sample_top_k(logits, 1, 1.0)
     let scaled = logits / temperature
     let result = topk(scaled, k)
     let values = result["values"]
@@ -18,7 +24,12 @@ fn sample_top_k(logits: Tensor, k: int, temperature: float) -> Tensor:
 ## Nucleus sampling: sample from the smallest set of tokens whose
 ## probabilities sum to at least `p`, after dividing by `temperature`.
 ## Unlike top-k the candidate set resizes with the model's confidence.
+## `temperature = 0` is greedy.
 fn sample_top_p(logits: Tensor, p: float, temperature: float) -> Tensor:
+    if temperature <= 0.0:
+        # One candidate at temperature 1: the same code path, and so the
+        # same result shape, as a sampled draw.
+        return sample_top_k(logits, 1, 1.0)
     let scaled = logits / temperature
     let probs = softmax(scaled, -1)
     let n = probs.shape[-1]

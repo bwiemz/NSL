@@ -322,8 +322,8 @@ impl Compiler<'_> {
                 // with the same `layer_prefix` the graph builder used;
                 // unmatched params stay F32. Requires the Deferred plan
                 // (both dispatch arms wrap m/v in the dequant→step→quant
-                // envelope). 8-bit clamps to FP16 storage in v1, the same
-                // ladder step as `clamp_int8_to_fp16`.
+                // envelope). A sub-32-bit first moment is stored BF16 and
+                // the second moment stays f32 (`cpdt_precision_exec`).
                 let wggo_bits: Option<(Vec<u16>, Vec<u16>)> = if fase_deferred {
                     self.bus.wggo_overrides().and_then(|o| {
                         crate::cpdt_precision_exec::build_dtype_lists_from_overrides(
@@ -398,7 +398,7 @@ impl Compiler<'_> {
                 //   param: F32 wins. CPDT's PrecisionPlan carries per-param
                 //   tiers (calibrated critical params pinned to F32) that a
                 //   layer-uniform WGGO decision must not override; and a
-                //   CPDT FP16 tier the WGGO layer kept at 32 bits is
+                //   CPDT reduced tier the WGGO layer kept at 32 bits is
                 //   likewise deferred to the more conservative choice.
                 // - When WGGO made NO moment-bit decision for this block at
                 //   all (it may still be active for unrelated reasons —
@@ -428,10 +428,10 @@ impl Compiler<'_> {
                         nsl_log::nsl_log!(INFO, "cpdt", 
                             "[cpdt] WGGO optimizer-moment precision active \
                              (merged with the CPDT per-param plan, F32 wins): \
-                             {sub32} moment buffer(s) in FP16 storage \
-                             (device-resident; GPU runs use the CFTP-v7 PTX \
-                             cast kernels for the dequant->step->quant \
-                             envelope)."
+                             {sub32} first-moment buffer(s) in BF16 storage; \
+                             second moments stay FP32 (device-resident; GPU \
+                             runs use the CFTP-v7 PTX cast kernels for the \
+                             dequant->step->quant envelope)."
                         );
                         Some((m, v))
                     }
@@ -439,9 +439,10 @@ impl Compiler<'_> {
                         let sub32 = m.iter().chain(v.iter()).filter(|&&c| c != DTYPE_F32).count();
                         nsl_log::nsl_log!(INFO, "cpdt", 
                             "[cpdt] WGGO optimizer-moment precision active: {sub32} \
-                             moment buffer(s) in FP16 storage (8-bit clamps to FP16 \
-                             in v1; device-resident — GPU runs use the CFTP-v7 PTX \
-                             cast kernels for the dequant->step->quant envelope)."
+                             first-moment buffer(s) in BF16 storage; second \
+                             moments stay FP32 (device-resident — GPU runs use the \
+                             CFTP-v7 PTX cast kernels for the dequant->step->quant \
+                             envelope)."
                         );
                         Some((m, v))
                     }
@@ -452,10 +453,11 @@ impl Compiler<'_> {
                         let sub32 = m.iter().chain(v.iter()).filter(|&&c| c != DTYPE_F32).count();
                         nsl_log::nsl_log!(INFO, "cpdt", 
                             "[cpdt] optimizer-moment precision active (CPDT \
-                             per-param plan): {sub32} moment buffer(s) in FP16 \
-                             storage (device-resident; GPU runs use the \
-                             CFTP-v7 PTX cast kernels for the \
-                             dequant->step->quant envelope)."
+                             per-param plan): {sub32} first-moment buffer(s) in \
+                             BF16 storage; second moments stay FP32 \
+                             (device-resident; GPU runs use the CFTP-v7 PTX \
+                             cast kernels for the dequant->step->quant \
+                             envelope)."
                         );
                         Some((m, v))
                     }
@@ -465,7 +467,7 @@ impl Compiler<'_> {
             cpdt_moment_lists_consumed = dtype_data.clone();
             // P1 Muon item 11: muon's group update runs the stdlib muon_step
             // (no dequant->step->quant envelope), so reduced-precision
-            // moments would feed FP16 buffers to an unwrapped update —
+            // moments would feed BF16 buffers to an unwrapped update —
             // refuse instead of corrupting. (Reachable only via muon x
             // --layerwise-accum, where the plan is Deferred-shaped; off
             // CSLA, muon's FullBuffer plan already suppressed this.)
@@ -479,7 +481,7 @@ impl Compiler<'_> {
                 ));
             }
             // P3 ZeRO-3: the owner-gated group updates don't thread the
-            // precision envelope — refuse rather than feed FP16 moments to
+            // precision envelope — refuse rather than feed BF16 moments to
             // an unwrapped update (deferral-must-refuse).
             if dtype_data.is_some() && self.features.zero_stage == Some(3) {
                 return Err(CodegenError::new(

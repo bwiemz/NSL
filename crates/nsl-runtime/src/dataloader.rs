@@ -385,6 +385,27 @@ impl DataLoader {
             let batch_order = Arc::clone(&batch_order);
 
             let handle = thread::spawn(move || {
+                // A panic in a worker must end the run. Left to unwind, it
+                // killed only this thread: with one worker the consumer saw
+                // "all workers finished" and the epoch ended early with exit
+                // status 0; with several, the batch this worker had claimed
+                // was never delivered and the consumer waited for it
+                // forever. The default panic hook has already printed the
+                // message and location when the guard's `drop` runs.
+                struct AbortOnPanic;
+                impl Drop for AbortOnPanic {
+                    fn drop(&mut self) {
+                        if std::thread::panicking() {
+                            eprintln!(
+                                "nsl: a DataLoader worker thread panicked (message above); \
+                                 aborting, because the batch it was building would never arrive"
+                            );
+                            std::process::abort();
+                        }
+                    }
+                }
+                let _abort_on_panic = AbortOnPanic;
+
                 let data_ptr = data_usize as *const c_void;
                 let labels_ptr = labels_usize as *const c_void;
 

@@ -2262,7 +2262,7 @@ block20:
     v350 = f64const 0x1.e666666666666p-1
     v351 = call fn151(v349, v348)  ; v349 = 0x1.ccccccccccccdp-1
     v352 = call fn152(v350, v348)  ; v350 = 0x1.e666666666666p-1
-    v353 = fcvt_from_sint.f64 v346
+    v353 = fcvt_from_sint.f64 v348
     v356 = f64const 0x1.0000000000000p0
     v357 = fmul.f64 v355, v356  ; v355 = 0x1.0624dd2f1a9fcp-9, v356 = 0x1.0000000000000p0
     v358 = f64const 0x1.e666666666666p-1
@@ -2560,8 +2560,8 @@ block27:
     v588 = iconst.i64 7
     v589 = call fn271(v119, v588)  ; v588 = 7
     v590 = call fn272(v587, v589)
-    v591 = f64const 0x1.0000000000000p0
-    call fn273(v589, v590, v591)  ; v591 = 0x1.0000000000000p0
+    v591 = f64const 0x1.0000000000000p-1
+    call fn273(v589, v590, v591)  ; v591 = 0x1.0000000000000p-1
     v592 = iconst.i64 0
     call fn274(v590)
     v593 = iconst.i64 0
@@ -2741,8 +2741,8 @@ block35:
     v723 = iconst.i64 6
     v724 = call fn344(v119, v723)  ; v723 = 6
     v725 = call fn345(v722, v724)
-    v726 = f64const 0x1.0000000000000p0
-    call fn346(v724, v725, v726)  ; v726 = 0x1.0000000000000p0
+    v726 = f64const 0x1.0000000000000p-1
+    call fn346(v724, v725, v726)  ; v726 = 0x1.0000000000000p-1
     v727 = iconst.i64 0
     call fn347(v725)
     v728 = iconst.i64 0
@@ -2786,8 +2786,8 @@ block35:
     v757 = iconst.i64 5
     v758 = call fn363(v119, v757)  ; v757 = 5
     v759 = call fn364(v756, v758)
-    v760 = f64const 0x1.0000000000000p0
-    call fn365(v758, v759, v760)  ; v760 = 0x1.0000000000000p0
+    v760 = f64const 0x1.0000000000000p-1
+    call fn365(v758, v759, v760)  ; v760 = 0x1.0000000000000p-1
     v761 = iconst.i64 0
     call fn366(v759)
     v762 = iconst.i64 0
@@ -2918,8 +2918,8 @@ block35:
     v863 = iconst.i64 4
     v864 = call fn417(v119, v863)  ; v863 = 4
     v865 = call fn418(v862, v864)
-    v866 = f64const 0x1.0000000000000p0
-    call fn419(v864, v865, v866)  ; v866 = 0x1.0000000000000p0
+    v866 = f64const 0x1.0000000000000p-1
+    call fn419(v864, v865, v866)  ; v866 = 0x1.0000000000000p-1
     v867 = iconst.i64 0
     call fn420(v865)
     v868 = iconst.i64 0
@@ -3106,8 +3106,8 @@ block41:
     v1008 = iconst.i64 3
     v1009 = call fn499(v119, v1008)  ; v1008 = 3
     v1010 = call fn500(v1007, v1009)
-    v1011 = f64const 0x1.0000000000000p0
-    call fn501(v1009, v1010, v1011)  ; v1011 = 0x1.0000000000000p0
+    v1011 = f64const 0x1.0000000000000p-1
+    call fn501(v1009, v1010, v1011)  ; v1011 = 0x1.0000000000000p-1
     v1012 = iconst.i64 0
     call fn502(v1010)
     v1013 = iconst.i64 0
@@ -3151,8 +3151,8 @@ block41:
     v1042 = iconst.i64 2
     v1043 = call fn518(v119, v1042)  ; v1042 = 2
     v1044 = call fn519(v1041, v1043)
-    v1045 = f64const 0x1.0000000000000p0
-    call fn520(v1043, v1044, v1045)  ; v1045 = 0x1.0000000000000p0
+    v1045 = f64const 0x1.0000000000000p-1
+    call fn520(v1043, v1044, v1045)  ; v1045 = 0x1.0000000000000p-1
     v1046 = iconst.i64 0
     call fn521(v1044)
     v1047 = iconst.i64 0
@@ -3283,8 +3283,8 @@ block41:
     v1148 = iconst.i64 1
     v1149 = call fn572(v119, v1148)  ; v1148 = 1
     v1150 = call fn573(v1147, v1149)
-    v1151 = f64const 0x1.0000000000000p0
-    call fn574(v1149, v1150, v1151)  ; v1151 = 0x1.0000000000000p0
+    v1151 = f64const 0x1.0000000000000p-1
+    call fn574(v1149, v1150, v1151)  ; v1151 = 0x1.0000000000000p-1
     v1152 = iconst.i64 0
     call fn575(v1150)
     v1153 = iconst.i64 0
@@ -3306,8 +3306,8 @@ block41:
     v1165 = iconst.i64 0
     v1166 = call fn584(v119, v1165)  ; v1165 = 0
     v1167 = call fn585(v1164, v1166)
-    v1168 = f64const 0x1.0000000000000p0
-    call fn586(v1166, v1167, v1168)  ; v1168 = 0x1.0000000000000p0
+    v1168 = f64const 0x1.0000000000000p-1
+    call fn586(v1166, v1167, v1168)  ; v1168 = 0x1.0000000000000p-1
     v1169 = iconst.i64 0
     call fn587(v1167)
     v1170 = iconst.i64 0

@@ -2265,7 +2265,18 @@ impl Compiler<'_> {
         // averaged, so the window mean, and the Phase-A norm, were not the
         // ones the global-norm clip is defined on. With the hook active
         // there is no grads_list to clip either.
-        if !fase_hook_active && !fase_plan.two_phase_clip && grad_clip < f64::MAX {
+        //
+        // Under accumulation with no two-phase clip (a FullBuffer plan:
+        // Lion, SOAP, Muon, `@fase(mode = off | full_buffer)`) the clip is
+        // likewise applied once, to the window mean, at the top of the
+        // optimizer block. This site used to clip each micro-batch there
+        // too, so the accumulated norm could reach N times the threshold.
+        // What remains here is the unaccumulated step.
+        if !fase_hook_active
+            && !fase_plan.two_phase_clip
+            && grad_accumulation_steps == 1
+            && grad_clip < f64::MAX
+        {
             let max_norm_val = builder.ins().f64const(grad_clip);
             self.compile_call_by_name(builder, "nsl_clip_grad_norm", &[grads_list, max_norm_val])?;
         }
@@ -2359,23 +2370,18 @@ impl Compiler<'_> {
                 )?;
                 builder.ins().jump(ga_join, &[]);
 
-                // FullBuffer path: historical raw-sum convention. Note the
-                // two-phase-clip case never reaches this loop: two_phase_clip
-                // implies a Deferred-global plan, which under source AD (the
-                // only path where a mode table exists) activates the FASE
-                // hook — and the hook skips this whole loop, accumulating
-                // every param (both modes) with the scaled window-mean
-                // convention in fase_cb. That uniform convention is what
-                // makes the dispatch's Phase A norm valid for mixed tables;
-                // the dispatch refuses two_phase_clip without the hook.
+                // FullBuffer path: the same window-mean convention as the
+                // Deferred arm and the FASE hook (`fase_cb`). It used to be
+                // a raw sum that nothing divided, so a FullBuffer step saw
+                // N times the gradient.
                 builder.switch_to_block(ga_fullbuf);
                 builder.seal_block(ga_fullbuf);
-                let n_elems =
-                    self.compile_call_by_name(builder, "nsl_tensor_len", &[accum_buf])?;
-                self.compile_call_by_name(
+                self.fase_emit_accumulate(
                     builder,
-                    "nsl_grad_accumulate_add",
-                    &[accum_buf, grad, n_elems],
+                    accum_buf,
+                    grad,
+                    fase_plan.recipe.accum_scale,
+                    false,
                 )?;
                 builder.ins().jump(ga_join, &[]);
 
@@ -2394,13 +2400,18 @@ impl Compiler<'_> {
                     off,
                 )?;
             } else {
-                // Pre-Phase-2 monolithic FullBuffer path (byte-identical).
-                // Existing path: raw gradient sum (divided / zeroed after optimizer step)
-                let n_elems = self.compile_call_by_name(builder, "nsl_tensor_len", &[accum_buf])?;
-                self.compile_call_by_name(
+                // Monolithic FullBuffer path: accum += (1/N) * grad, so the
+                // buffer holds the window MEAN when the optimizer steps --
+                // the gradient an optimizer run on the whole window at once
+                // would see. This was a raw sum whose comment promised a
+                // later division that did not exist: SGD stepped N times
+                // too far, and Adam/SOAP saw eps shrunk by N.
+                self.fase_emit_accumulate(
                     builder,
-                    "nsl_grad_accumulate_add",
-                    &[accum_buf, grad, n_elems],
+                    accum_buf,
+                    grad,
+                    fase_plan.recipe.accum_scale,
+                    false,
                 )?;
             }
             self.compile_call_by_name(builder, "nsl_tensor_free", &[grad])?;

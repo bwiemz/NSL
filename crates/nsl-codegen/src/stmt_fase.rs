@@ -1497,17 +1497,10 @@ impl Compiler<'_> {
         let opt_step = builder.ins().sdiv(sc_plus_one, grad_accum_const);
         // Window-step index as f64 for the FullBuffer arm's stdlib
         // Adam/AdamW/SOAP bias correction — the same counter the Deferred
-        // arm feeds nsl_bias_correction_inv, so a MIXED table's two arms
-        // advance their bias corrections in lockstep. Only meaningful when
-        // a Deferred arm exists to stay in lockstep WITH: for a
-        // FullBuffer-GLOBAL plan (Lion/Unknown/SOAP) the historical
-        // micro-batch-t semantic is preserved (t_override = None), matching
-        // the monolithic no-mode-table path bit-for-bit.
-        let fullbuf_t_override = if fase_plan.mode == crate::fase::FaseMode::Deferred {
-            Some(builder.ins().fcvt_from_sint(cl_types::F64, opt_step))
-        } else {
-            None
-        };
+        // arm feeds nsl_bias_correction_inv, and the one the monolithic
+        // FullBuffer path uses: optimizer steps, never micro-batches.
+        let fullbuf_t_override =
+            Some(builder.ins().fcvt_from_sint(cl_types::F64, opt_step));
         let beta1_for_bc = builder.ins().f64const(fase_plan.recipe.beta1);
         let beta2_for_bc = builder.ins().f64const(fase_plan.recipe.beta2);
         let bc1_inv = self.compile_call_by_name(
