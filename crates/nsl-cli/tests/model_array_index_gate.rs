@@ -52,6 +52,50 @@ model Net:
 let m = Net()
 "#;
 
+/// Three elements that differ, so that an index which is ignored (or
+/// scaled wrongly) reads the wrong one: each block's weight is its own
+/// random draw. The loop is the reference; it reached the elements
+/// correctly before subscripting did. (The loop binds its sum to a typed
+/// `let` before printing: a field of a loop variable has no static type,
+/// and `print` of an untyped value prints the handle as an integer. That
+/// is a separate, open defect.)
+#[test]
+fn each_index_reaches_its_own_element() {
+    let source = r#"model Block:
+    w: Tensor = randn([2, 2])
+
+model Net:
+    blocks: [Block; 3] = Block()
+
+    fn sums_in_order(self) -> Tensor:
+        for block in self.blocks:
+            let s: Tensor = block.w.sum()
+            print(s)
+        return zeros([1])
+
+let m = Net()
+m.sums_in_order()
+print(m.blocks[0].w.sum())
+print(m.blocks[1].w.sum())
+let i = 2
+print(m.blocks[i].w.sum())
+"#;
+    let out = run(source);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "run failed:\n{stderr}");
+    let printed: Vec<f64> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse().ok())
+        .collect();
+    assert_eq!(printed.len(), 6, "stdout did not hold six sums: {printed:?}");
+    let (by_loop, by_index) = printed.split_at(3);
+    assert_eq!(by_loop, by_index, "indexing and iteration disagree");
+    assert!(
+        by_loop[0] != by_loop[1] && by_loop[1] != by_loop[2] && by_loop[0] != by_loop[2],
+        "the three blocks are not distinguishable, so this proves nothing: {by_loop:?}"
+    );
+}
+
 #[test]
 fn a_literal_or_variable_index_reaches_the_element() {
     let source = format!(

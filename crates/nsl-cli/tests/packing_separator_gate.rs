@@ -102,6 +102,22 @@ fn labels_with_packing_are_refused() {
     );
 }
 
+/// `labels = None` is the spelled-out default, not a labels tensor.
+#[test]
+fn an_explicit_none_for_labels_is_accepted_with_packing() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = nsl(
+        dir.path(),
+        &loader_program(
+            "labels=None, batch_size=1, seq_len=8, shuffle=false, packing=true, pack_separator=0",
+        ),
+    )
+    .output()
+    .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+}
+
 /// More than 256 documents in one row, with one worker and with two. Both
 /// must stop the process with a failure status; neither may run on to the
 /// statement after the loop, and neither may hang.

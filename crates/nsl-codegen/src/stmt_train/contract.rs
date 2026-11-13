@@ -425,8 +425,12 @@ impl Compiler<'_> {
         // P1 Muon item 11: under the layerwise schedule, muon runs a
         // Deferred-SHAPED "separate-accumulator" plan — the window backward
         // accumulates RAW gradient sums into m_partial (accum_scale forced
-        // to 1.0, the FullBuffer convention, so the boundary muon_step
-        // consumes bit-identical input to the non-CSLA path) and the
+        // to 1.0). That was once also the non-CSLA FullBuffer convention;
+        // FullBuffer now accumulates the window MEAN, so the two paths
+        // hand muon_step gradients that differ by the factor N. Muon's
+        // orthogonalised update is invariant to that scale; its AdamW
+        // route is not (eps is relative), which is an open difference
+        // between `--layerwise-accum` and the default path. The
         // per-layer group updates dispatch the stdlib muon_step instead of
         // a fused elementwise recipe (see emit_csla_group_update's muon
         // arm). Off the layerwise path muon keeps its FullBuffer plan —

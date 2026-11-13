@@ -3149,8 +3149,12 @@ impl Compiler<'_> {
             }
             // A packed batch derives its labels from the token stream (the
             // next token, with -100 across a document boundary), so a
-            // `labels` tensor would be read by nothing.
-            if packing_on && labels_arg.is_some() {
+            // `labels` tensor would be read by nothing. An explicit `None`
+            // is not a tensor and is dropped further down.
+            let labels_is_none = labels_arg.is_some_and(|e| {
+                matches!(self.node_type(e.id).strip_borrow(), Type::NoneType)
+            });
+            if packing_on && labels_arg.is_some() && !labels_is_none {
                 return Err(CodegenError::new(
                     "DataLoader(): `labels` cannot be combined with `packing = true`: \
                      a packed batch computes its own next-token labels from the data \
