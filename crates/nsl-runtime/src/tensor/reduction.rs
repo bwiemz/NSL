@@ -70,13 +70,17 @@ pub extern "C" fn nsl_tensor_sum_dim(tensor_ptr: i64, dim: i64, keepdim: i64) ->
     let keepdim_bool = keepdim != 0;
 
     if dim == -1 {
-        // Global reduction
+        // Global reduction. f32 data is accumulated in f64: a running f32
+        // sum stops absorbing unit-sized terms at 2^24 (sum(ones([2e7])) was
+        // 16777216) and is already percent-level wrong on a few million
+        // ordinary values — sum(w*w) over a [49152, 512] embedding read 5.7%
+        // low.
         let total = if tensor.dtype == 1 {
-            let mut s = 0.0_f32;
+            let mut s = 0.0_f64;
             for i in 0..tensor.len as usize {
-                s += unsafe { *tensor.data_f32().add(i) };
+                s += unsafe { *tensor.data_f32().add(i) } as f64;
             }
-            s as f64
+            s
         } else {
             let mut s = 0.0_f64;
             for i in 0..tensor.len as usize {
@@ -123,7 +127,11 @@ pub extern "C" fn nsl_tensor_sum_dim(tensor_ptr: i64, dim: i64, keepdim: i64) ->
     let result = NslTensor::from_ptr(result_ptr);
     let out_strides = get_strides_vec(result);
 
-    // Iterate all elements of input, accumulate into output
+    // Iterate all elements of input, accumulate into output. f32 cells are
+    // accumulated in f64 and narrowed once at the end, for the reason the
+    // global arm gives: a long reduced dimension is the same running sum.
+    let mut acc_f32_as_f64: Vec<f64> =
+        if tensor.dtype == 1 { vec![0.0; result.len as usize] } else { Vec::new() };
     let total_in = tensor.len as usize;
     for flat_in in 0..total_in {
         // Decompose flat_in into multi-index using input strides
@@ -154,12 +162,14 @@ pub extern "C" fn nsl_tensor_sum_dim(tensor_ptr: i64, dim: i64, keepdim: i64) ->
         }
 
         if tensor.dtype == 1 {
-            let val = unsafe { *tensor.data_f32().add(flat_in) };
-            unsafe { *result.data_f32().add(out_flat) += val };
+            acc_f32_as_f64[out_flat] += unsafe { *tensor.data_f32().add(flat_in) } as f64;
         } else {
             let val = unsafe { *tensor.data_f64().add(flat_in) };
             unsafe { *result.data_f64().add(out_flat) += val };
         }
+    }
+    for (i, v) in acc_f32_as_f64.iter().enumerate() {
+        unsafe { *result.data_f32().add(i) = *v as f32 };
     }
 
     nsl_tensor_free(t_c);
@@ -244,12 +254,13 @@ pub extern "C" fn nsl_tensor_mean_dim(tensor_ptr: i64, dim: i64, keepdim: i64) -
             return create_scalar_tensor_dtype(0.0, tensor.dtype);
         }
         let num_elements = tensor.len;
+        // f64 accumulation for f32 data — see the global sum above.
         let total = if tensor.dtype == 1 {
-            let mut s = 0.0_f32;
+            let mut s = 0.0_f64;
             for i in 0..num_elements as usize {
-                s += unsafe { *tensor.data_f32().add(i) };
+                s += unsafe { *tensor.data_f32().add(i) } as f64;
             }
-            (s / num_elements as f32) as f64
+            s / num_elements as f64
         } else {
             let mut s = 0.0_f64;
             for i in 0..num_elements as usize {
