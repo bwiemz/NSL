@@ -288,6 +288,7 @@ macro_rules! for_each_runtime_fn {
             // Tensor memory
             [tensor] nsl_tensor_clone(i64) -> i64 = tensor::nsl_tensor_clone;
             [tensor] nsl_tensor_clone_if_valid(i64) -> i64 = tensor::nsl_tensor_clone_if_valid;
+            [tensor] nsl_tensor_clone_traced(i64) -> i64 = tensor::nsl_tensor_clone_traced;
             [tensor] nsl_tensor_free(i64) -> () = tensor::nsl_tensor_free;
             [tensor] nsl_tensor_free_if_valid(i64) -> () = tensor::nsl_tensor_free_if_valid;
             [tensor] nsl_tensor_free_transient(i64) -> () = tensor::nsl_tensor_free_transient;

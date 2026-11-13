@@ -1648,6 +1648,30 @@ pub extern "C" fn nsl_debug_epilog_free_reset() {
     NSL_DEBUG_EPILOG_FREE_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// `x.clone()` as written in NSL source: a copy the autodiff tape can see.
+///
+/// [`nsl_tensor_clone`] is the runtime's own copy primitive and records
+/// nothing -- it is called from hundreds of places that must not grow the
+/// tape. But a clone the PROGRAM asked for is a differentiable identity,
+/// and its result carries a fresh tape id: left unrecorded, the graph
+/// stopped at it, and `let c = w.clone()` followed by any loss on `c` gave
+/// `w` a gradient of exactly zero. A same-shape `Reshape` node is the
+/// established metadata-only relabel (see the identity arm of
+/// `nsl_tensor_dropout`): backward passes the gradient through unchanged.
+#[unsafe(no_mangle)]
+pub extern "C" fn nsl_tensor_clone_traced(tensor_ptr: i64) -> i64 {
+    let out = nsl_tensor_clone(tensor_ptr);
+    if autodiff::is_recording() {
+        let input_shape = autodiff::tape_shape(NslTensor::from_ptr(tensor_ptr));
+        autodiff::maybe_record(autodiff::TapeOp::Reshape {
+            a: tensor_ptr,
+            out,
+            input_shape,
+        });
+    }
+    out
+}
+
 /// Safe version of nsl_tensor_clone that returns the original i64 when the input
 /// is not a valid tensor pointer.
 #[unsafe(no_mangle)]

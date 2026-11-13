@@ -1293,7 +1293,12 @@ impl Compiler<'_> {
                 // clone; only the ownership-lowering (`--linear-types`) path above
                 // is sound here, because it actually proves no borrows/sharing
                 // exist rather than counting textual references.
-                self.compile_call_by_name(builder, "nsl_tensor_clone", &[obj_val])
+                //
+                // The TRACED clone: a clone written in the program is a
+                // differentiable identity, and the plain runtime clone is
+                // invisible to the autodiff tape (see
+                // `nsl_tensor_clone_traced`).
+                self.compile_call_by_name(builder, "nsl_tensor_clone_traced", &[obj_val])
             }
             "item" => self.compile_call_by_name(builder, "nsl_tensor_item", &[obj_val]),
             "to" => {
