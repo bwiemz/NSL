@@ -175,7 +175,8 @@ impl DraftModelRunner {
         best_idx
     }
 
-    /// Stochastic sampling with temperature.
+    /// Stochastic sampling with temperature: one draw from
+    /// `softmax(logits / temperature)`.
     fn stochastic_sample(&self, logits_data: *const f64, step: usize, vocab: usize) -> i64 {
         let temp = self.temperature as f64;
         // Find max for numerical stability
@@ -197,9 +198,13 @@ impl DraftModelRunner {
             probs.fill(1.0 / vocab as f64);
         }
 
-        // Sample via cumulative distribution
-        let seed = (step as u64).wrapping_mul(0x517cc1b727220a95) ^ 0x6c62272e07bb0142;
-        let r = (seed % 10000) as f64 / 10000.0;
+        // Sample via cumulative distribution, with a draw from the
+        // runtime's seeded generator (`manual_seed`). The quantile used to
+        // be a fixed function of the step index — 0.6322, 0.9495, 0.2376
+        // for steps 0, 1, 2 of every request — so the "sampled" draft was
+        // one deterministic token per step, while verification divided by
+        // the probability of a sample that was never drawn.
+        let r = crate::sampling::rng_f64();
         let mut cum = 0.0;
         for (i, &p) in probs.iter().enumerate() {
             cum += p;
