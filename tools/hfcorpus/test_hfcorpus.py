@@ -19,6 +19,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import make_mix
 import verify
 
 EOS = 7
@@ -107,6 +108,48 @@ class TrainValDisjointness(unittest.TestCase):
         val_docs, shared = verify.shared_documents(train, val, EOS)
         self.assertEqual(shared, 4)
         self.assertEqual(val_docs, 5 if len(first) - 5 >= verify.MIN_DOC_TOKENS else 4)
+
+
+class MixPlacement(unittest.TestCase):
+    """Base corpus: 2000 documents of 2 tokens, then 2000 of 200 tokens (each
+    counting its separator). The first half of the documents holds
+    2000 * 2 / (2000 * 2 + 2000 * 200) = 1/101 of the tokens."""
+
+    def setUp(self) -> None:
+        lengths = [2] * 2000 + [200] * 2000
+        ends = np.cumsum(lengths)
+        starts = ends - np.asarray(lengths)
+        self.base_docs = np.stack([starts, ends], axis=1)
+        self.base_tokens = int(ends[-1])
+
+    def share_in_short_half(self, placement: str) -> float:
+        rng = random.Random(1337)
+        keys = [make_mix.injection_key(rng, self.base_docs, self.base_tokens, placement)
+                for _ in range(20000)]
+        self.assertTrue(all(0 <= k < len(self.base_docs) for k in keys))
+        return sum(k < 2000 for k in keys) / len(keys)
+
+    def test_document_placement_follows_the_document_index(self) -> None:
+        # Half of the documents, so half of the injections: 50 times the
+        # share of tokens those documents hold.
+        self.assertAlmostEqual(self.share_in_short_half("document"), 0.5, delta=0.02)
+
+    def test_token_placement_follows_the_token_share(self) -> None:
+        self.assertAlmostEqual(self.share_in_short_half("token"), 1 / 101, delta=0.004)
+
+    def test_document_placement_is_one_uniform_draw(self) -> None:
+        # The draw sequence of the default must not change: the hash of a
+        # mixture built before the option existed is pinned in a manifest.
+        a, b = random.Random(5), random.Random(5)
+        for _ in range(100):
+            self.assertEqual(
+                make_mix.injection_key(a, self.base_docs, self.base_tokens, "document"),
+                b.uniform(0, len(self.base_docs)),
+            )
+
+    def test_an_unknown_placement_is_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            make_mix.injection_key(random.Random(0), self.base_docs, self.base_tokens, "bytes")
 
 
 if __name__ == "__main__":
