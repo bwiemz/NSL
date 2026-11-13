@@ -102,9 +102,6 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 class RefModel(torch.nn.Module):
     """NSLCoder. With `weights`, every parameter is taken from an `.nslm` read."""
 
-    cos: torch.Tensor
-    sin: torch.Tensor
-
     def __init__(
         self,
         cfg: Cfg,
@@ -164,8 +161,10 @@ class RefModel(torch.nn.Module):
             torch.arange(c.max_seq, dtype=torch.float32)[:, None] * inv_freq[None, :]
         )
         table = torch.cat([freqs, freqs], dim=1)
-        self.register_buffer("cos", table.cos().to(device))
-        self.register_buffer("sin", table.sin().to(device))
+        # Plain attributes rather than buffers: the model is built on its device
+        # and never moved, and a checker can see the type of an assignment.
+        self.cos: torch.Tensor = table.cos().to(device)
+        self.sin: torch.Tensor = table.sin().to(device)
 
     def p(self, name: str) -> torch.Tensor:
         return self.params[name.replace(".", "/")]
