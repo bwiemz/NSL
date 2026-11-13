@@ -80,7 +80,16 @@ fn dropout_at_p_one_is_zero_not_nan() {
     assert_eq!(got, [0.0, 0.0, 0.0, 0.0]);
 }
 
-/// d/dx sum(rmsnorm(x)^T * w) under the fused dx backward equals the tape's.
+/// d/dx sum(rmsnorm(x)^T * w) under the fused dx backward.
+///
+/// The reference is PyTorch autograd on the same program
+/// (`x / sqrt(mean(x^2, -1) + eps) * g`, then `(y.T * w).sum()`), written
+/// out as literals. On `main` this test compares the fused backward with
+/// tape AD instead; on this branch tape AD is itself wrong for a strided
+/// upstream gradient (it reads the transposed gradient in storage order,
+/// giving [1.70, 4.26, 6.81, 0.77, 0.16, -0.46]). `main` fixed that in
+/// "Make CPU tensor ops honour strides in forwards and tape backwards",
+/// which this release branch does not carry.
 #[test]
 fn fused_rmsnorm_backward_handles_a_strided_gradient() {
     let src = "let x = arange(1.0, 7.0).reshape([2, 3]) * 0.5 - 1.2\n\
@@ -91,12 +100,17 @@ fn fused_rmsnorm_backward_handles_a_strided_gradient() {
                \x20   let z = sum(y.transpose(0, 1) * w)\n\
                \x20   z\n\
                print(grads)\n";
-    let tape = run("rms_tape", &["--tape-ad"], src);
+    let reference = [
+        2.696_324_6,
+        6.740_865_7,
+        10.785_409,
+        -0.387_357_83,
+        -0.079_037_905,
+        0.229_281_9,
+    ];
     let fused = run("rms_fused", &["--source-ad", "--fuse-rmsnorm-backward"], src);
-    assert_eq!(tape.len(), 6, "{tape:?}");
     assert_eq!(fused.len(), 6, "{fused:?}");
-    assert!(tape.iter().any(|v| v.abs() > 1e-3), "the reference gradient is not trivially zero: {tape:?}");
-    for (f, t) in fused.iter().zip(&tape) {
-        assert!((f - t).abs() < 1e-5, "fused {fused:?}\n tape {tape:?}");
+    for (f, r) in fused.iter().zip(&reference) {
+        assert!((f - r).abs() < 1e-5, "fused {fused:?}\n reference {reference:?}");
     }
 }
