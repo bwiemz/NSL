@@ -240,8 +240,23 @@ mod tests {
 
         // Initialize serving engine
         assert_eq!(nsl_serve_init(8, 4096, 256, 512), 0);
-        // Initialize grammar FSM (3 states, 4 vocab, start=0)
-        assert_eq!(crate::grammar::nsl_grammar_init(3, 4, 0), 0);
+        // Install a grammar (3 states, 4 vocab, start=0): state 0 goes to
+        // state 1 on token 0.
+        let table = crate::token_alignment::TokenAlignmentTable {
+            num_states: 3,
+            state_transitions: vec![
+                vec![crate::token_alignment::TokenTransition { token_id: 0, next_state: 1 }],
+                vec![],
+                vec![],
+            ],
+            state_masks: vec![vec![0b0001], vec![0], vec![0]],
+            vocab_size: 4,
+        };
+        assert!(crate::grammar::install_grammar(crate::grammar::GrammarFSM::from_alignment(
+            &table,
+            0,
+            vec![1]
+        )));
 
         // Enqueue a request
         let req_id = nsl_serve_enqueue(0, 0, 10, 0.7, 0.9);
