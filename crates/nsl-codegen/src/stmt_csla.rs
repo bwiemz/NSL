@@ -378,7 +378,7 @@ pub(crate) fn emit_csla_group_update(
             c.compile_call_by_name(builder, "nsl_assert", &[ok, mp])?;
         } else if let Some(mc) = muon {
             // Muon separate-accumulator mode: m_partial holds the
-            // RAW window gradient sum (accum_scale forced to 1.0),
+            // window-MEAN gradient (accum_scale 1/N),
             // exactly what the non-CSLA FullBuffer path hands
             // muon_step as `gradient` — the stdlib step then does
             // its own momentum/orthogonalize (Muon route) or

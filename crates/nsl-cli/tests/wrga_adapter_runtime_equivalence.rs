@@ -69,6 +69,11 @@ fn run_nsl(src_path: &Path, extra_args: &[&str]) -> (bool, String, String) {
         .arg("run")
         .args(extra_args)
         .arg(src_path);
+    // A build for a pinned sm target is how these tests reach the fused
+    // adapter call, and that call is opt-in at compile time.
+    if extra_args.iter().any(|a| a.contains("sm80") || a.contains("sm_80")) {
+        cmd.env("NSL_WRGA_FUSED_CUDA", "1");
+    }
     let output = cmd.output().expect("nsl run failed to spawn");
     (
         output.status.success(),
@@ -427,8 +432,13 @@ fn build_5_fused_launches_one_kernel_per_site() {
     let root = workspace_root();
     let stdlib = root.join("stdlib");
     let mut cmd = Command::cargo_bin("nsl").unwrap();
+    // NSL_WRGA_FUSED_CUDA=1: the fused adapter call is opt-in at compile
+    // time (a pinned target alone no longer selects it). The tensors here
+    // are host tensors, so the runtime still takes its CPU math; the
+    // counter counts the fused calls either way.
     cmd.env("NSL_STDLIB_PATH", &stdlib)
         .env("NSL_KERNEL_LAUNCH_COUNTER", "1")
+        .env("NSL_WRGA_FUSED_CUDA", "1")
         .arg("run")
         .args(["--source-ad", "--target", "cuda_sm80"])
         .arg(&src_path);

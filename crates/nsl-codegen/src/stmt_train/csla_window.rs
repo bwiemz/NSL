@@ -832,7 +832,11 @@ impl Compiler<'_> {
                 } else {
                     mangled.to_string()
                 };
-                let t_f = builder.ins().fcvt_from_sint(cl_types::F64, sc_plus_one);
+                // Bias-correction step for muon_step's AdamW route: the
+                // number of OPTIMIZER steps, as on the default path. This
+                // passed the micro-batch count, which was also what the
+                // default path did before it was corrected.
+                let t_f = builder.ins().fcvt_from_sint(cl_types::F64, opt_step);
                 let lr_now = builder.use_var(lr_var);
                 let ratio = adamw_lr_value.map(|a| a / lr_value).unwrap_or(1.0);
                 let ratio_const = builder.ins().f64const(ratio);

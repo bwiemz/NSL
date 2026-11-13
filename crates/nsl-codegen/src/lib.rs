@@ -562,7 +562,6 @@ pub fn debug_compile_and_return_plan(
 pub mod debug_channels {
     use std::cell::Cell;
     thread_local! {
-        pub static ADJOINT_OPS_DROPPED: Cell<Option<usize>> = const { Cell::new(None) };
         pub static ALLOC_SLOTS_PRE_HINT: Cell<Option<usize>> = const { Cell::new(None) };
         pub static ALLOC_SLOTS_POST_HINT: Cell<Option<usize>> = const { Cell::new(None) };
         pub static CONSUME_HINTS_CALLS: Cell<usize> = const { Cell::new(0) };
@@ -583,16 +582,6 @@ pub fn debug_last_consume_hints_calls() -> Option<usize> {
 #[doc(hidden)]
 pub fn debug_reset_consume_hints_calls() {
     debug_channels::CONSUME_HINTS_CALLS.with(|c| c.set(0));
-}
-
-#[doc(hidden)]
-pub fn debug_set_adjoint_ops_dropped(n: usize) {
-    debug_channels::ADJOINT_OPS_DROPPED.with(|c| c.set(Some(n)));
-}
-
-#[doc(hidden)]
-pub fn debug_last_adjoint_ops_dropped() -> Option<usize> {
-    debug_channels::ADJOINT_OPS_DROPPED.with(|c| c.get())
 }
 
 #[doc(hidden)]

@@ -816,6 +816,15 @@ pub static REGISTRY: &[EnvVar] = &[
         "This process's distributed rank; the SPMD spawner sets it per child (its presence stops re-spawning) and the runtime reads it."
     ),
     var!(
+        "NSL_M52C_SPARSE_MATMUL",
+        Bool,
+        "1 only (exact match)",
+        "off (dense matmul)",
+        Behavior,
+        Compile,
+        "Set to 1 to re-enable the weight-aware CSR sparse matmul in `-w` builds; withheld because it aborts on CPU and miscomputes on GPU."
+    ),
+    var!(
         "NSL_MATMUL_BF16",
         Bool,
         "1 only engages; 0 or anything else is a no-op (falls through to TF32/pedantic resolution)",
@@ -1494,10 +1503,10 @@ pub static REGISTRY: &[EnvVar] = &[
         "NSL_WRGA_FUSED_CUDA",
         Bool,
         "1 only (read per call, not cached)",
-        "off (CPU fallback math)",
+        "off (unfused adapter ops)",
         Behavior,
-        Runtime,
-        "Set to 1 to let WRGA fused adapter ops (LoRA/IA3/GatedLoRA) launch the synthesized CUDA kernel instead of the CPU fallback math."
+        Both,
+        "Set to 1 to compile @adapter sites to the fused call on a pinned sm_80+ target (2-D activations only) and to launch its CUDA kernel at run time."
     ),
     var!(
         "NSL_WRGA_GPU_LAUNCH_COUNTER",

@@ -2039,8 +2039,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   applied `grad_clip` to each micro-batch before summing. `@fase(allow_v_approx
   = false)`, which reads as "be exact", selected it. All paths now match
   standard accumulation, and AdamW matches PyTorch to the last digit on
-  every one. Under `grad_clip`, `no_decay = [...]` was also ignored by the
-  per-parameter step that `--training-reference` forces.
+  every one. Muon under `--layerwise-accum` had copied the same sum and
+  micro-batch count so as to stay bit-identical to that path; it follows
+  the correction and is still bit-identical to it. Under `grad_clip`,
+  `no_decay = [...]` was also ignored by the per-parameter step that
+  `--training-reference` forces.
 - **`--checkpoint-blocks` re-drew `randn` when it recomputed a block**, so
   the gradient was taken through activations the forward never produced.
   Random draws are now always saved.

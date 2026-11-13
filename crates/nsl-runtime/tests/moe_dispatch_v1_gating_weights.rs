@@ -170,8 +170,11 @@ fn dispatch_v1_top_k_one_is_bit_exact_pass_through() {
 
 #[test]
 fn dispatch_v1_capacity_drop_yields_partial_weight_sum() {
-    // 2 tokens, 3 experts, top_k=2, capacity_factor=1.0 =>
-    // capacity = ceil((2/3)*1.0) = 1 slot per expert.
+    // 2 tokens, 3 experts, top_k=2, capacity_factor=0.75 =>
+    // capacity = ceil((2*2/3)*0.75) = 1 slot per expert. (A factor of 1.0
+    // gives each expert its fair share of the 4 assignments, ceil(4/3) = 2,
+    // and nothing is dropped; the capacity once ignored top_k, which is how
+    // this fixture got a drop at 1.0.)
     //
     // token 0 logits [2, 1, -5]  => top-2 = experts {0, 1}
     // token 1 logits [2, 0, 1]   => top-2 = experts {0, 2}
@@ -217,7 +220,7 @@ fn dispatch_v1_capacity_drop_yields_partial_weight_sum() {
             logits_ptr,
             num_experts as i64,
             2, // top_k
-            (1.0_f32).to_bits() as i64,
+            (0.75_f32).to_bits() as i64,
         )
     };
     assert_ne!(out_ptr, 0, "v1 returned null for valid capacity-drop inputs");

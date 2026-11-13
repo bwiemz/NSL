@@ -296,6 +296,7 @@ function <main>(i32, i64) -> i32 <callconv> {
     gv21 = symbol colocated .str.8
     gv22 = symbol colocated .str.9
     gv23 = symbol colocated .str.10
+    gv24 = symbol colocated .str.11
     sig0 = (i32, i64) <callconv>
     sig1 = (i64, i64) -> i64 <callconv>
     sig2 = (i64, i64, f64, i64, i64, i64, i64) -> i64 <callconv>
@@ -660,7 +661,7 @@ function <main>(i32, i64) -> i32 <callconv> {
     sig361 = (i64) <callconv>
     sig362 = (i64) <callconv>
     sig363 = (i64) <callconv>
-    sig364 = (i64, i64) -> i64 <callconv>
+    sig364 = (i8, i64) <callconv>
     sig365 = (i64) -> i64 <callconv>
     sig366 = (i64) <callconv>
     sig367 = (i64) <callconv>
@@ -1030,7 +1031,7 @@ function <main>(i32, i64) -> i32 <callconv> {
     fn361 = nsl_tensor_free sig361
     fn362 = nsl_list_free sig362
     fn363 = nsl_list_free sig363
-    fn364 = nsl_list_get sig364
+    fn364 = nsl_assert sig364
     fn365 = nsl_tensor_sum sig365
     fn366 = nsl_tensor_print sig366
     fn367 = nsl_tensor_free sig367
@@ -1081,7 +1082,7 @@ block0(v0: i32, v1: i64):
     v17 = call fn6(v14)
     v106 -> v17
     v867 -> v17
-    v930 -> v17
+    v940 -> v17
     v868 -> v106
     v869 -> v106
     v870 -> v106
@@ -1109,7 +1110,7 @@ block0(v0: i32, v1: i64):
     v21 = call fn9(v18)
     v107 -> v21
     v887 -> v21
-    v932 -> v21
+    v942 -> v21
     v888 -> v107
     v889 -> v107
     v890 -> v107
@@ -2315,17 +2316,28 @@ block66:
     v922 = iconst.i64 0
     v923 = iadd.i64 v13, v922  ; v922 = 0
     v924 = iconst.i64 0
-    v925 = call fn364(v923, v924)  ; v924 = 0
-    v926 = load.i64 notrap aligned v925+8
-    v927 = call fn365(v926)
-    call fn366(v927)
-    v928 = iconst.i64 0
-    call fn367(v927)
-    v929 = iconst.i64 0
-    call fn368(v17)
+    v925 = iconst.i64 0
+    v926 = iconst.i64 2
+    v927 = icmp sge v924, v925  ; v924 = 0, v925 = 0
+    v928 = icmp slt v924, v926  ; v924 = 0, v926 = 2
+    v929 = band v927, v928
+    v930 = symbol_value.i64 gv24
+    call fn364(v929, v930)
     v931 = iconst.i64 0
+    v932 = iconst.i64 8
+    v933 = imul v924, v932  ; v924 = 0, v932 = 8
+    v934 = iadd v923, v933
+    v935 = load.i64 notrap aligned v934
+    v936 = load.i64 notrap aligned v935+8
+    v937 = call fn365(v936)
+    call fn366(v937)
+    v938 = iconst.i64 0
+    call fn367(v937)
+    v939 = iconst.i64 0
+    call fn368(v17)
+    v941 = iconst.i64 0
     call fn369(v21)
-    v933 = iconst.i64 0
-    v934 = iconst.i32 0
-    return v934  ; v934 = 0
+    v943 = iconst.i64 0
+    v944 = iconst.i32 0
+    return v944  ; v944 = 0
 }
