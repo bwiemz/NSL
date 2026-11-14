@@ -457,10 +457,8 @@ pub fn moment_state_bytes(param_bytes: u64, dtype_bytes: u64, m_bits: u8, v_bits
 }
 
 /// Extra resident bytes from the FASE **Deferred** fused optimizer step that
-/// [`resident_training_bytes`] does not count. `crate::fase_memory` models
-/// these correctly (`params + accumulator + one-layer-grad + opt_state + peak
-/// activation`) but is disconnected from the cost model, so a budget compared
-/// against the bare `param + m + v + activation` charge under-counts.
+/// [`resident_training_bytes`] does not count, so a budget compared against
+/// the bare `param + m + v + activation` charge under-counts.
 ///
 /// Two surfaces are added:
 ///   * **`m_partial`** — the windowed gradient-mean accumulator materialised
@@ -475,7 +473,7 @@ pub fn moment_state_bytes(param_bytes: u64, dtype_bytes: u64, m_bits: u8, v_bits
 /// **two** surfaces (making 4 live surfaces total with the base
 /// `param + m + v + activation` — NOT 5). Sized per-layer against the layer's
 /// own `param_bytes`, which is a conservative over-estimate of the true
-/// single-tensor `one-live-param` grad (`fase_memory` uses `max_param_bytes`);
+/// single-tensor `one-live-param` grad (the largest single parameter);
 /// over-estimating is the safe direction for a hard budget gate.
 pub fn fase_deferred_extra_bytes(param_bytes: u64, dtype_bytes: u64) -> u64 {
     let elements = param_bytes / dtype_bytes.max(1);

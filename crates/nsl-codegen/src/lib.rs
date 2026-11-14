@@ -235,9 +235,7 @@ pub mod csha_patterns;
 pub mod csha_pipeline;
 pub mod csha_specialize;
 pub mod fase;
-pub mod fase_clip;
 pub mod fase_codegen_table;
-pub mod fase_memory;
 pub mod fase_optimizer;
 pub mod multimodal;
 pub mod sparse;
@@ -346,7 +344,7 @@ pub mod experimental {
         cep_emit_source, cep_slice, cfie, cfie_fused_sample, cfie_grammar, cfie_kv_plan,
         cfie_kv_quant, cfie_persistent, cfie_speculative, csha, csha_apply,
         csha_boundary, csha_patterns, csha_pipeline, csha_specialize, fase,
-        fase_clip, fase_codegen_table, fase_memory, fase_optimizer, multimodal,
+        fase_codegen_table, fase_optimizer, multimodal,
         sparse, speculative, wggo, wggo_apply,
         wggo_conflicts, wggo_cost, wggo_dp, wggo_gradient_scorer, wggo_graph,
         wggo_ilp, wggo_overrides, wggo_prune, wggo_schedule, wggo_weight_analysis,

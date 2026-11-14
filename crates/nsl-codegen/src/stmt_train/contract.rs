@@ -309,10 +309,7 @@ impl Compiler<'_> {
         // two different models. Refuse until the accumulated step implements
         // them, as `Adam(weight_decay=..)` is refused for the same reason.
         if grad_accumulation_steps > 1
-            && matches!(
-                fase_cfg.optimizer,
-                crate::fase::FaseOptimizer::Sgd | crate::fase::FaseOptimizer::SgdMomentum
-            )
+            && fase_cfg.optimizer == crate::fase::FaseOptimizer::Sgd
             && (momentum_value != 0.0 || weight_decay_value != 0.0 || dampening_value != 0.0 || nesterov_value)
         {
             return Err(CodegenError::new(format!(
