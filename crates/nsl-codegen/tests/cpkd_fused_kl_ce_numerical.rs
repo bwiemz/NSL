@@ -1,20 +1,33 @@
-//! CPKD fused KL-CE — GPU numerical validation against the f64 reference.
+//! CPKD fused KL-CE — GPU numerical validation against an f64 reference.
 //!
 //! Drives the SAME FFIs the compiled distill step dispatches
 //! (`nsl_fused_kl_ce_forward` / `nsl_fused_kl_ce_backward`) with
 //! deterministic seeded buffers and compares per-row losses, saved LSEs,
-//! and all three student gradients against
-//! `cpkd_fused_loss::reference_{forward,backward}_f64` (which is itself
-//! pinned by finite differences in the module's unit tests).
+//! and all three student gradients against a reference written out in f64
+//! in this file, from the definition of the loss:
+//!
+//! ```text
+//! loss_row = alpha * CE(s, target) + (1 - alpha) * T^2 * KL(softmax(t/T) || softmax(s/T))
+//! d loss / d s = [alpha * (softmax(s) - onehot) + (1 - alpha) * T * (softmax(s/T) - softmax(t/T))] / num_valid
+//! ```
 //!
 //! ## Fixture
 //! rows = 2*16 = 32, V=512, HS=64, HT=96 (asymmetric on purpose),
 //! vocab_tile=128, alpha=0.4, T=2.5, ignore_index -100 at every 8th row.
+//! Hidden states and head weights are U(-1, 1), so the logits have a
+//! standard deviation near 2 and neither distribution is close to uniform.
 //!
 //! ## Tolerances
-//! * forward per-row loss + LSEs: |gpu - ref| / max(|ref|, 1.0) < 1e-3
-//! * backward dx_s/dW_s/dbias_s: max abs err < 5e-3
+//! * forward per-row loss + LSEs: |gpu - ref| / max(|ref|, 1) < 2e-5
+//! * backward dx_s/dW_s/dbias_s: max abs err < 1e-4 * max|ref|, per tensor
 //! * skip identity: loss/lse rows and dx_s rows exactly 0 for -100 rows
+//!
+//! The gradient tolerance is relative to the tensor's own scale. It used to
+//! be an absolute 5e-3 over inputs drawn from U(-0.3, 0.3): the reference
+//! maxima of dx_s and dW_s were 2.3e-3 and 4.2e-3, so an all-zero gradient
+//! passed, and swapping the KL direction moved the loss by less than the
+//! forward tolerance. `the_reference_tells_the_kl_terms_apart` holds this
+//! fixture to being able to see both.
 //!
 //! ## Running
 //! ```bash
@@ -25,8 +38,7 @@
 #![cfg(feature = "cuda")]
 
 use nsl_codegen::cpkd_fused_loss::{
-    FusedKlCeConfig, reference_backward_f64, reference_forward_f64,
-    synthesize_fused_kl_ce_backward_ptx, synthesize_fused_kl_ce_ptx,
+    FusedKlCeConfig, synthesize_fused_kl_ce_backward_ptx, synthesize_fused_kl_ce_ptx,
 };
 use nsl_runtime::{
     nsl_cuda_init, nsl_fused_kl_ce_backward, nsl_fused_kl_ce_forward, nsl_test_cuda_alloc,
@@ -51,26 +63,203 @@ fn fill_seeded(dst: &mut [f32], seed: u64) {
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
         let u = (s >> 33) as u32;
-        *x = ((u as f32) / (u32::MAX as f32)) * 0.6 - 0.3;
+        *x = ((u as f32) / (u32::MAX as f32)) * 2.0 - 1.0;
     }
 }
 
-fn cuda_available() -> bool {
-    if std::env::var("NSL_SKIP_CUDA_TESTS").is_ok() {
-        eprintln!("skipping: NSL_SKIP_CUDA_TESTS set");
-        return false;
+/// The KL term of the reference. The loss is `Forward`; the other two exist
+/// so the fixture can be shown to tell a wrong kernel from a right one.
+#[derive(Clone, Copy, PartialEq)]
+enum KlTerm {
+    /// `KL(teacher || student)`.
+    Forward,
+    /// `KL(student || teacher)`. Only the loss is computed.
+    Reverse,
+    /// No KL term at all: the loss and gradients of `alpha * CE` alone.
+    Absent,
+}
+
+/// The f64 reference: per-row loss, the three saved log-sum-exps, and the
+/// gradients of the mean-over-valid-rows loss with respect to `x_s`, `W_s`
+/// and `bias_s`.
+struct Reference {
+    loss: Vec<f64>,
+    lse_s1: Vec<f64>,
+    lse_st: Vec<f64>,
+    lse_tt: Vec<f64>,
+    dxs: Vec<f64>,
+    dws: Vec<f64>,
+    dbs: Vec<f64>,
+}
+
+struct Inputs<'a> {
+    xs: &'a [f32],
+    ws: &'a [f32],
+    bs: &'a [f32],
+    xt: &'a [f32],
+    wt: &'a [f32],
+    bt: &'a [f32],
+    targets: &'a [i64],
+}
+
+fn log_sum_exp(v: &[f64]) -> f64 {
+    let m = v.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    m + v.iter().map(|&x| (x - m).exp()).sum::<f64>().ln()
+}
+
+fn logits(x: &[f32], w: &[f32], b: &[f32], row: usize, hidden: usize) -> Vec<f64> {
+    (0..V)
+        .map(|v| {
+            (0..hidden).fold(b[v] as f64, |acc, h| acc + x[row * hidden + h] as f64 * w[v * hidden + h] as f64)
+        })
+        .collect()
+}
+
+fn reference(input: &Inputs, kl_term: KlTerm) -> Reference {
+    let num_valid = input.targets.iter().filter(|&&t| t != IGNORE_INDEX).count() as f64;
+    let mut r = Reference {
+        loss: vec![0.0; ROWS],
+        lse_s1: vec![0.0; ROWS],
+        lse_st: vec![0.0; ROWS],
+        lse_tt: vec![0.0; ROWS],
+        dxs: vec![0.0; ROWS * HS],
+        dws: vec![0.0; V * HS],
+        dbs: vec![0.0; V],
+    };
+    for row in 0..ROWS {
+        let target = input.targets[row];
+        if target == IGNORE_INDEX {
+            continue;
+        }
+        let s = logits(input.xs, input.ws, input.bs, row, HS);
+        let t = logits(input.xt, input.wt, input.bt, row, HT);
+        let s_scaled: Vec<f64> = s.iter().map(|v| v / TEMP).collect();
+        let t_scaled: Vec<f64> = t.iter().map(|v| v / TEMP).collect();
+        let (lse_s1, lse_st, lse_tt) = (log_sum_exp(&s), log_sum_exp(&s_scaled), log_sum_exp(&t_scaled));
+        let ce = lse_s1 - s[target as usize];
+        let kl: f64 = (0..V)
+            .map(|v| {
+                let (log_ps, log_pt) = (s_scaled[v] - lse_st, t_scaled[v] - lse_tt);
+                match kl_term {
+                    KlTerm::Forward => log_pt.exp() * (log_pt - log_ps),
+                    KlTerm::Reverse => log_ps.exp() * (log_ps - log_pt),
+                    KlTerm::Absent => 0.0,
+                }
+            })
+            .sum();
+        r.loss[row] = ALPHA * ce + (1.0 - ALPHA) * TEMP * TEMP * kl;
+        (r.lse_s1[row], r.lse_st[row], r.lse_tt[row]) = (lse_s1, lse_st, lse_tt);
+        if kl_term == KlTerm::Reverse {
+            continue; // only the loss is compared for the reversed term
+        }
+        for v in 0..V {
+            let onehot = if v == target as usize { 1.0 } else { 0.0 };
+            let ce_grad = (s[v] - lse_s1).exp() - onehot;
+            let kl_grad = match kl_term {
+                KlTerm::Absent => 0.0,
+                _ => (s_scaled[v] - lse_st).exp() - (t_scaled[v] - lse_tt).exp(),
+            };
+            let g = (ALPHA * ce_grad + (1.0 - ALPHA) * TEMP * kl_grad) / num_valid;
+            r.dbs[v] += g;
+            for h in 0..HS {
+                r.dxs[row * HS + h] += g * input.ws[v * HS + h] as f64;
+                r.dws[v * HS + h] += g * input.xs[row * HS + h] as f64;
+            }
+        }
     }
-    let rc = nsl_cuda_init();
-    if rc != 0 {
-        eprintln!("skipping: nsl_cuda_init returned {rc}");
-        false
-    } else {
-        true
+    r
+}
+
+fn max_abs(v: &[f64]) -> f64 {
+    v.iter().fold(0f64, |m, x| m.max(x.abs()))
+}
+
+struct Fixture {
+    xs: Vec<f32>,
+    ws: Vec<f32>,
+    bs: Vec<f32>,
+    xt: Vec<f32>,
+    wt: Vec<f32>,
+    bt: Vec<f32>,
+    targets: Vec<i64>,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        // Targets: -100 at every 8th row.
+        let targets = (0..ROWS)
+            .map(|i| if i % 8 == 0 { IGNORE_INDEX } else { ((i * 37 + 13) % V) as i64 })
+            .collect();
+        let seeded = |len: usize, seed: u64| {
+            let mut v = vec![0f32; len];
+            fill_seeded(&mut v, seed);
+            v
+        };
+        Fixture {
+            xs: seeded(ROWS * HS, 42),
+            ws: seeded(V * HS, 137),
+            bs: seeded(V, 7),
+            xt: seeded(ROWS * HT, 1042),
+            wt: seeded(V * HT, 1137),
+            bt: seeded(V, 1007),
+            targets,
+        }
+    }
+
+    fn inputs(&self) -> Inputs<'_> {
+        Inputs {
+            xs: &self.xs,
+            ws: &self.ws,
+            bs: &self.bs,
+            xt: &self.xt,
+            wt: &self.wt,
+            bt: &self.bt,
+            targets: &self.targets,
+        }
     }
 }
 
-fn f32_bits(v: f64) -> i64 {
-    (v as f32).to_bits() as i64
+/// Relative tolerance of the per-row loss and LSE comparison.
+const FORWARD_TOL: f64 = 2e-5;
+/// Tolerance of each gradient tensor, as a fraction of its largest entry.
+const GRADIENT_TOL: f64 = 1e-4;
+
+/// The fixture can see what the device test claims to check. It launches
+/// nothing, so it runs wherever this file is built.
+///
+/// * Reversing the KL direction moves the per-row loss by hundreds of times
+///   the forward tolerance.
+/// * Dropping the KL term moves every gradient tensor by hundreds of times
+///   its tolerance, so a kernel without the KL term does not pass. (An
+///   all-zero gradient cannot pass either: each tolerance is a fraction of
+///   the reference tensor's largest entry.)
+#[test]
+fn the_reference_tells_the_kl_terms_apart() {
+    let fixture = Fixture::new();
+    let forward = reference(&fixture.inputs(), KlTerm::Forward);
+    let reverse = reference(&fixture.inputs(), KlTerm::Reverse);
+    let absent = reference(&fixture.inputs(), KlTerm::Absent);
+
+    let worst_row = (0..ROWS)
+        .map(|r| (forward.loss[r] - reverse.loss[r]).abs() / forward.loss[r].abs().max(1.0))
+        .fold(0f64, f64::max);
+    assert!(
+        worst_row > 100.0 * FORWARD_TOL,
+        "reversing the KL direction moves the loss by only {worst_row:e} (tolerance {FORWARD_TOL:e})"
+    );
+
+    for (name, with, without) in [
+        ("dx_s", &forward.dxs, &absent.dxs),
+        ("dW_s", &forward.dws, &absent.dws),
+        ("dbias_s", &forward.dbs, &absent.dbs),
+    ] {
+        let tolerance = GRADIENT_TOL * max_abs(with);
+        let kl_share = with.iter().zip(without.iter()).map(|(a, b)| (a - b).abs()).fold(0f64, f64::max);
+        assert!(
+            kl_share > 100.0 * tolerance,
+            "{name}: the KL term moves the gradient by {kl_share:e}, tolerance {tolerance:e}"
+        );
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -93,44 +282,14 @@ fn fused_kl_ce_gpu_forward_and_backward_match_reference() {
     };
     cfg.validate().expect("config must be valid");
 
-    // Targets: -100 at every 8th row.
-    let mut targets = vec![0i64; ROWS];
-    for (i, t) in targets.iter_mut().enumerate() {
-        *t = if i % 8 == 0 {
-            IGNORE_INDEX
-        } else {
-            ((i * 37 + 13) % V) as i64
-        };
-    }
+    let fixture = Fixture::new();
+    let Fixture { xs, ws, bs, xt, wt, bt, targets } = &fixture;
     let num_valid = targets.iter().filter(|&&t| t != IGNORE_INDEX).count() as i64;
 
-    // Host buffers.
-    let mut xs = vec![0f32; ROWS * HS];
-    let mut ws = vec![0f32; V * HS];
-    let mut bs = vec![0f32; V];
-    let mut xt = vec![0f32; ROWS * HT];
-    let mut wt = vec![0f32; V * HT];
-    let mut bt = vec![0f32; V];
-    fill_seeded(&mut xs, 42);
-    fill_seeded(&mut ws, 137);
-    fill_seeded(&mut bs, 7);
-    fill_seeded(&mut xt, 1042);
-    fill_seeded(&mut wt, 1137);
-    fill_seeded(&mut bt, 1007);
-
-    // f64 reference.
-    let to64 = |v: &[f32]| v.iter().map(|&x| x as f64).collect::<Vec<f64>>();
-    let (xs64, ws64, bs64) = (to64(&xs), to64(&ws), to64(&bs));
-    let (xt64, wt64, bt64) = (to64(&xt), to64(&wt), to64(&bt));
-    let (ref_loss, ref_lse_s1, ref_lse_st, ref_lse_tt, ref_nv) = reference_forward_f64(
-        &xs64, &ws64, &bs64, &xt64, &wt64, &bt64, &targets, ROWS, V, HS, HT, ALPHA, TEMP,
-        IGNORE_INDEX,
-    );
-    assert_eq!(ref_nv as i64, num_valid);
-    let (ref_dxs, ref_dws, ref_dbs) = reference_backward_f64(
-        &xs64, &ws64, &bs64, &xt64, &wt64, &bt64, &targets, ROWS, V, HS, HT, ALPHA, TEMP,
-        IGNORE_INDEX, 1.0,
-    );
+    // f64 reference, written out in this file.
+    let want = reference(&fixture.inputs(), KlTerm::Forward);
+    let (ref_loss, ref_lse_s1, ref_lse_st, ref_lse_tt) = (&want.loss, &want.lse_s1, &want.lse_st, &want.lse_tt);
+    let (ref_dxs, ref_dws, ref_dbs) = (&want.dxs, &want.dws, &want.dbs);
 
     // PTX.
     let fwd_ptx = synthesize_fused_kl_ce_ptx(&cfg);
@@ -224,31 +383,31 @@ fn fused_kl_ce_gpu_forward_and_backward_match_reference() {
             continue;
         }
         assert!(
-            rel(gpu_loss[row], ref_loss[row]) < 1e-3,
+            rel(gpu_loss[row], ref_loss[row]) < FORWARD_TOL,
             "row {row}: loss gpu={} ref={}",
             gpu_loss[row],
             ref_loss[row]
         );
         assert!(
-            rel(gpu_lse_s1[row], ref_lse_s1[row]) < 1e-3,
+            rel(gpu_lse_s1[row], ref_lse_s1[row]) < FORWARD_TOL,
             "row {row}: lse_s1 gpu={} ref={}",
             gpu_lse_s1[row],
             ref_lse_s1[row]
         );
         assert!(
-            rel(gpu_lse_st[row], ref_lse_st[row]) < 1e-3,
+            rel(gpu_lse_st[row], ref_lse_st[row]) < FORWARD_TOL,
             "row {row}: lse_sT gpu={} ref={}",
             gpu_lse_st[row],
             ref_lse_st[row]
         );
         assert!(
-            rel(gpu_lse_tt[row], ref_lse_tt[row]) < 1e-3,
+            rel(gpu_lse_tt[row], ref_lse_tt[row]) < FORWARD_TOL,
             "row {row}: lse_tT gpu={} ref={}",
             gpu_lse_tt[row],
             ref_lse_tt[row]
         );
     }
-    eprintln!("forward: {ROWS} rows match reference (rel < 1e-3)");
+    eprintln!("forward: {ROWS} rows match reference (rel < {FORWARD_TOL:e})");
 
     // ── Backward ─────────────────────────────────────────────────────────
     let rc = nsl_fused_kl_ce_backward(
@@ -300,13 +459,16 @@ fn fused_kl_ce_gpu_forward_and_backward_match_reference() {
             .map(|(&g, &rr)| ((g as f64) - rr).abs())
             .fold(0f64, f64::max)
     };
-    let dxs_err = max_err("dx_s", &gpu_dxs, &ref_dxs);
-    let dws_err = max_err("dW_s", &gpu_dws, &ref_dws);
-    let dbs_err = max_err("dbias_s", &gpu_dbs, &ref_dbs);
-    eprintln!("backward max abs err: dx_s={dxs_err:.2e} dW_s={dws_err:.2e} dbias_s={dbs_err:.2e}");
-    assert!(dxs_err < 5e-3, "dx_s max err {dxs_err}");
-    assert!(dws_err < 5e-3, "dW_s max err {dws_err}");
-    assert!(dbs_err < 5e-3, "dbias_s max err {dbs_err}");
+    for (name, gpu, expected) in [
+        ("dx_s", &gpu_dxs, ref_dxs),
+        ("dW_s", &gpu_dws, ref_dws),
+        ("dbias_s", &gpu_dbs, ref_dbs),
+    ] {
+        let err = max_err(name, gpu, expected);
+        let scale = max_abs(expected);
+        eprintln!("backward {name}: max abs err {err:.2e}, largest reference entry {scale:.2e}");
+        assert!(err < GRADIENT_TOL * scale, "{name}: max err {err:e} against a largest entry of {scale:e}");
+    }
 
     // Skip identity: -100 rows have exactly-zero dx_s.
     for row in 0..ROWS {
