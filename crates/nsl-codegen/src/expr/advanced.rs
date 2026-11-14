@@ -2792,8 +2792,7 @@ impl Compiler<'_> {
             }
             BinOp::Add => {
                 if left_is_sparse && right_is_sparse {
-                    // Sparse + Sparse → Sparse (union merge)
-                    self.compile_call_by_name(builder, "nsl_sparse_add", &[lhs, rhs])?
+                    return Err(Self::sparse_sparse_refusal("+"));
                 } else {
                     // Mixed: convert sparse to dense, then dense add
                     let (dense_lhs, free_lhs) = if left_is_sparse {
@@ -2830,8 +2829,7 @@ impl Compiler<'_> {
             }
             BinOp::Mul => {
                 if left_is_sparse && right_is_sparse {
-                    // Sparse * Sparse → Sparse (intersection merge)
-                    self.compile_call_by_name(builder, "nsl_sparse_mul", &[lhs, rhs])?
+                    return Err(Self::sparse_sparse_refusal("*"));
                 } else {
                     // Mixed: convert sparse to dense, then dense mul
                     let (dense_lhs, free_lhs) = if left_is_sparse {
@@ -2904,11 +2902,23 @@ impl Compiler<'_> {
             }
         };
         state.cleanup.tensor_temporaries.push(result);
-        // ELTLS: compile_sparse_binary_op always produces a fresh owned
-        // tensor result (either from an nsl_sparse_* op or an
-        // nsl_tensor_* op on converted-dense inputs).
+        // ELTLS: every arm above produces a fresh owned DENSE tensor
+        // (`nsl_sparse_spmm`, or an `nsl_tensor_*` op on converted-dense
+        // inputs). The two arms whose runtime call returns a sparse handle
+        // (`nsl_sparse_add`, `nsl_sparse_mul`) used to reach this line too
+        // and are refused instead.
         self.set_ownership(builder, state, result, Ownership::Owned);
         Ok(result)
+    }
+
+    /// `Sparse + Sparse` / `Sparse * Sparse`: the checker refuses these
+    /// (`nsl_semantic::checker::ops`); a caller that skipped it gets the same
+    /// answer here, not a sparse handle registered as a dense tensor.
+    fn sparse_sparse_refusal(op: &str) -> CodegenError {
+        CodegenError::new(format!(
+            "`{op}` on two Sparse tensors is not supported: its result is a sparse value, and code \
+             generation has no sparse result type or cleanup for one"
+        ))
     }
 
     // ── M52b: Weight constant folding ────────────────────────────────

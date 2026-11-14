@@ -13,6 +13,25 @@ impl<'a> TypeChecker<'a> {
             };
         }
 
+        // `Sparse + Sparse` and `Sparse * Sparse` are the two operations
+        // whose result is itself sparse. Nothing downstream knows that: this
+        // function types the result as a tensor, and code generation handed
+        // the sparse handle the runtime returns on as an owned DENSE tensor,
+        // to be read and freed as one. No program can reach that today (no
+        // sparse value can be constructed), so it could not be fixed and
+        // tested by running; it is refused so that it cannot go live
+        // unnoticed the day a constructor is added.
+        if matches!(op, BinOp::Add | BinOp::Mul) && is_sparse(&lty) && is_sparse(&rty) {
+            self.diagnostics.push(
+                Diagnostic::error(format!(
+                    "`{}` on two Sparse tensors is not supported",
+                    binop_symbol(op)
+                ))
+                .with_label(span, SPARSE_SPARSE_REFUSAL),
+            );
+            return Type::Error;
+        }
+
         match op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::FloorDiv | BinOp::Mod | BinOp::Pow => {
                 self.check_arithmetic(&lty, &rty, op, span)
@@ -962,6 +981,19 @@ impl<'a> TypeChecker<'a> {
 }
 
 /// The source spelling of a binary operator, for diagnostics.
+/// Why `Sparse + Sparse` and `Sparse * Sparse` are refused.
+pub const SPARSE_SPARSE_REFUSAL: &str = "the result of this operation is a sparse value, and the compiler has \
+     no sparse result type: it treated the result as a dense tensor. Sparse-with-dense arithmetic is unaffected";
+
+/// A `Sparse<...>` type, possibly behind a borrow.
+fn is_sparse(ty: &Type) -> bool {
+    match ty {
+        Type::Sparse { .. } => true,
+        Type::Borrow(inner) => is_sparse(inner),
+        _ => false,
+    }
+}
+
 pub(crate) fn binop_symbol(op: BinOp) -> &'static str {
     match op {
         BinOp::Add => "+",
