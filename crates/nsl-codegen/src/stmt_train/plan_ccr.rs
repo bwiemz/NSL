@@ -132,15 +132,10 @@ impl Compiler<'_> {
         // (the generator `take()`s it later) so claimed segments
         // can be exempted — the claim table is keyed by primal
         // OpId, which a recompute clone cannot satisfy.
-        // P1.7 --training-reference: ignore @checkpoint decorators so a
-        // decorated program still runs the un-checkpointed reference
-        // path (the --checkpoint-blocks flag is already forced off).
-        let ccr_selective_decorated = !self.compile_options.diagnostics.training_reference
-            && self
-                .compile_options
-                .checkpoint.policies
-                .values()
-                .any(|p| matches!(p, nsl_semantic::effects::CheckpointPolicy::Selective));
+        // Switched on by --checkpoint-blocks only. A
+        // `@checkpoint(policy="selective")` decorator used to switch it on
+        // too, for the whole train block and whether or not the step called
+        // the decorated function; the checker now refuses that policy.
         let mut effective_primal = effective_primal;
         let mut ccr_compress_map: std::collections::HashMap<
             crate::wengert::VarId,
@@ -151,9 +146,7 @@ impl Compiler<'_> {
         // with adjoint-generator ids (the generator start is bumped
         // to this watermark below).
         let mut ccr_fresh: crate::wengert::VarId = extractor.next_var_id();
-        let ccr_plan = if self.compile_options.checkpoint.blocks
-            || ccr_selective_decorated
-        {
+        let ccr_plan = if self.compile_options.checkpoint.blocks {
             // Milestone C: SCHEDULED as ONE region — the whole
             // search (DP partition, stride candidates, final plan)
             // is one CCR invocation; recording stays at the callee
@@ -172,9 +165,7 @@ impl Compiler<'_> {
                 self.bus.csha_backward_claims().map(|claims| {
                     claims.op_to_chain.keys().copied().collect()
                 });
-            let policy = if self.compile_options.checkpoint.selective
-                || ccr_selective_decorated
-            {
+            let policy = if self.compile_options.checkpoint.selective {
                 crate::ccr::CcrPolicy::Selective
             } else {
                 crate::ccr::CcrPolicy::Block

@@ -15,8 +15,10 @@ use nsl_errors::{Diagnostic, FileId};
 // effect record via `EffectChecker::checkpoint_policies()` and translates.
 //
 // v1 ships a single variant (`Full`) per cycle-10 Refuter 3 invariant
-// inversion: `Selective`, `SelectivePostnorm`, `Custom` are reserved for
-// v2/v3 and are refused at the kwarg parser. See
+// inversion: `SelectivePostnorm` and `Custom` are reserved for v2/v3 and
+// are refused at the kwarg parser. `policy="selective"` is refused there
+// too: the selective recompute policy of block checkpointing belongs to a
+// train block and is chosen with `--checkpoint-selective`. See
 // `docs/superpowers/specs/2026-06-24-csha-checkpointing-aware-backward-design.md`.
 
 /// Paper §5.3 checkpointing-aware backward policy (semantic-layer copy).
@@ -25,14 +27,6 @@ pub enum CheckpointPolicy {
     /// Full prologue recompute during backward (the cycle-10 CSHA
     /// attention-prologue machinery).
     Full,
-    /// CCR P1.b — SELECTIVE block-granular recompute on the source-AD
-    /// path: matmul-class outputs stay saved; only cheap bandwidth-bound
-    /// ops (norms, RoPE, elementwise, softmax) are replayed during the
-    /// backward. Consumed by stmt.rs's train-block CCR gate (equivalent
-    /// to `--checkpoint-blocks --checkpoint-selective`); deliberately NOT
-    /// consumed by the CSHA prologue-stamping pass. `selective_postnorm`
-    /// and `custom` remain reserved/refused.
-    Selective,
 }
 
 // ---------------------------------------------------------------------------
