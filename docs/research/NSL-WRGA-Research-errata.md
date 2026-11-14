@@ -342,9 +342,11 @@ weights, and the standard library's `Linear`.
   `crates/nsl-runtime/src/fused_adapter.rs`. They need a pinned target
   (`--target sm_80` or later) and `NSL_WRGA_FUSED_CUDA=1`, for a weight
   whose shape is a literal in the model definition. The kernels compute in
-  half precision, handle contiguous 2-D operands only (anything else runs
-  the ordinary operations), and measured 15–67× slower than cuBLAS (E5).
-  The implementation's default, unfused, is the right side.
+  half precision and are right for one output tile only: contiguous 2-D
+  operands with at most 16 rows of activation, 8 output columns and rank
+  8. Anything else runs the ordinary operations, with a notice. They
+  measured 15–67× slower than cuBLAS (E5). The implementation's default,
+  unfused, is the right side.
 - **Memory-planned activation sharing (Innovation 5): report-only.**
   `crates/nsl-codegen/src/wrga_memory.rs` produces a slot count that is
   printed in the report. Every saved activation is live until the backward
@@ -585,6 +587,29 @@ under "Unreleased". The open list is as of 2026-11-13.
   `crates/nsl-cli/tests/wrga_mode_and_rank_gate.rs`), with references
   computed in the tests in f64.
 
+- With the fused path opted in, the synthesized IA³ kernel could never
+  launch: the call was always emitted with kernel handle −1, no IA³ kernel
+  was registered, and the launcher passed four of the kernel's six
+  arguments. The kernel is now synthesized, registered and launched with
+  all six (`synthesize_ia3_adapted` in
+  `crates/nsl-codegen/src/wrga_adapter_rewrite.rs`,
+  `try_cuda_launch_fused_ia3` in `crates/nsl-runtime/src/fused_adapter.rs`),
+  and agrees with an f64 reference on the GPU to half precision.
+- The GPU tests of the fused kernels could not detect a wrong kernel: the
+  LoRA fixture had `w = zeros` and `x`, A and B all ones, and the IA³ and
+  gated fixtures were constant fills as well. They are replaced by
+  fixtures with non-constant operands and a reference computed in the test
+  in f64 (`run_fused_kernel_fixture` in
+  `crates/nsl-cli/tests/wrga_adapter_runtime_equivalence.rs`). On their
+  first run they failed for all three kernels on every shape larger than
+  one output tile: rows from 16 on, columns from 8 on, and every element
+  at a rank above 8 were off by 60 to 600 times the half-precision bound.
+  The launcher now declines such calls and anything else the kernel does
+  not index as given, says so once, and the ordinary operations run
+  (`kernel_can_read` and `lora_pair_fits` in
+  `crates/nsl-runtime/src/fused_adapter.rs`); the tests cover both sides
+  of the limit.
+
 ### Open
 
 - There is no operation that merges an adapter into its base weight, or
@@ -593,19 +618,20 @@ under "Unreleased". The open list is as of 2026-11-13.
   B set to zero), which a test exercises, but nothing does it for every
   adapted weight of a model, or for IA³ and gated LoRA. Where it would go:
   beside `compile_model_save` in `crates/nsl-codegen/src/expr/advanced.rs`.
-- With the fused path opted in, the synthesized IA³ kernel could never
-  launch: the call was always emitted with kernel handle −1, no IA³ kernel
-  was registered, and the launcher passed four of the kernel's six
-  arguments. The kernel is now synthesized, registered and launched with
-  all six (`synthesize_ia3_adapted` in
-  `crates/nsl-codegen/src/wrga_adapter_rewrite.rs`, `try_cuda_launch_fused_ia3`
-  in `crates/nsl-runtime/src/fused_adapter.rs`), but it has not yet been run
-  on a GPU, so whether it computes the right result is not known.
-- The GPU tests of the fused kernels could not detect a wrong kernel: the
-  LoRA fixture had `w = zeros` and `x`, A and B all ones, and the IA³ and
-  gated fixtures were constant fills as well. They are replaced by fixtures
-  with non-constant operands, shapes off the kernel's tile grid and a
-  reference computed in the test in f64
-  (`run_fused_kernel_fixture` in
-  `crates/nsl-cli/tests/wrga_adapter_runtime_equivalence.rs`). The new
-  tests have not yet been run on a GPU.
+- The synthesized kernels compute one output tile. Each thread block
+  stages rows 0–15 of the activation and columns 0–7 of W and B whatever
+  its block index, so with more than 16 rows or 8 output columns every
+  block returns the first block's values, and the epilogue holds only 8
+  columns of `x @ A`, so a rank above 8 is wrong in every element. The
+  launcher now declines such calls (see Fixed), which leaves the opted-in
+  fused path serving only weights of at most 8 output columns. Where:
+  `emit_lora_stage_x_tile`, `emit_lora_stage_w_tile` and
+  `emit_lora_stage_b_tile` in
+  `crates/nsl-codegen/src/wrga_kernel_helpers.rs`. Measured on the GPU.
+  Right: add the block's row and column offsets to the staging, or remove
+  the kernels.
+- `@adapter(rank=N)` is refused above 16 with the reason "the WRGA
+  single-pass fused-epilogue limit". The kernel's limit is 8, and the
+  default path, which does not use the kernel, has none. Where:
+  `validate_adapter_decorator` in `crates/nsl-semantic/src/wrga.rs`. By
+  reading the code, and the measurement above.
