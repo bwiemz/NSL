@@ -703,6 +703,9 @@ pub const CHANNELS: &[ChannelDescriptor] = &[
             "crates/nsl-codegen/src/wrga_adapter_init.rs",
             // The train-block WRGA run keeps a pre-scan list it finds.
             "crates/nsl-codegen/src/stmt_pass_bridges.rs",
+            // model_save / model_load write and read each adapter's tensors
+            // after the model's parameters, in site order.
+            "crates/nsl-codegen/src/expr/advanced.rs",
         ],
         empty_means: "no adapter decorators resolved, so field access finds no \
                       synthesized adapter members and nothing is injected",

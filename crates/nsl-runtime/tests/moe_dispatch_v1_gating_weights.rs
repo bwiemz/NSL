@@ -169,7 +169,7 @@ fn dispatch_v1_top_k_one_is_bit_exact_pass_through() {
 }
 
 #[test]
-fn dispatch_v1_capacity_drop_yields_partial_weight_sum() {
+fn dispatch_v1_capacity_drop_renormalises_the_surviving_weight() {
     // 2 tokens, 3 experts, top_k=2, capacity_factor=0.75 =>
     // capacity = ceil((2*2/3)*0.75) = 1 slot per expert. (A factor of 1.0
     // gives each expert its fair share of the 4 assignments, ceil(4/3) = 2,
@@ -179,14 +179,18 @@ fn dispatch_v1_capacity_drop_yields_partial_weight_sum() {
     // token 0 logits [2, 1, -5]  => top-2 = experts {0, 1}
     // token 1 logits [2, 0, 1]   => top-2 = experts {0, 2}
     //
-    // Assignment order (token-major): (t0,e0) fills expert 0, (t0,e1) fills
-    // expert 1, (t1,e0) is DROPPED (expert 0 full), (t1,e2) fills expert 2.
+    // Expert 0 has one slot and two claimants, (t0,e0) and (t1,e0). The
+    // router keeps the more confident; both weigh e^2 / (e^2 + e^1) here, and
+    // a tie goes to the earlier token, so (t1,e0) is DROPPED.
     //
-    //   token 0 out = (w00 + w01) * input0 = 1.0 * input0   (full weight)
-    //   token 1 out = w12 * input1, w12 = p2 / (p0 + p2) < 1  (partial sum)
+    //   token 0 out = (w00 + w01) * input0 = 1.0 * input0
+    //   token 1 out = 1.0 * input1: its surviving weight w12 = p2 / (p0 + p2)
+    //                 is renormalised over the experts it kept (only e2)
     //
-    // consistent with v2/v3/v4 drop semantics (dropped assignments
-    // contribute 0; no re-scaling of survivors).
+    // The router used to leave the survivor at w12 < 1, so a token that lost
+    // an expert to capacity was silently scaled down. Renormalising over the
+    // surviving experts is what DeepSpeed-MoE's top-2 gating does (the gate
+    // denominator is taken after the capacity mask).
     let hidden_dim = 2_usize;
     let num_experts = 3_usize;
 
@@ -237,23 +241,19 @@ fn dispatch_v1_capacity_drop_yields_partial_weight_sum() {
             tokens[d],
         );
     }
-    // Token 1: expert-0 assignment dropped => partial sum w12 * input.
+    // Token 1: expert-0 assignment dropped => the surviving expert-2 weight
+    // is renormalised to 1.0, so the output is the input, not w12 * input.
     for d in 0..hidden_dim {
-        let want = w12 * tokens[hidden_dim + d];
+        let want = tokens[hidden_dim + d];
         assert!(
             (got[hidden_dim + d] - want).abs() <= 1e-6 * want.abs().max(1.0),
-            "token 1 (dropped assignment) output[{}] = {} != w12*input = {} \
-             (w12 = {}); full-weight output would be {}",
+            "token 1 (dropped assignment) output[{}] = {} != input {}; the \
+             unrenormalised survivor would give w12*input = {} (w12 = {})",
             d,
             got[hidden_dim + d],
             want,
+            w12 * want,
             w12,
-            tokens[hidden_dim + d],
-        );
-        assert!(
-            got[hidden_dim + d].abs() < tokens[hidden_dim + d].abs(),
-            "token 1 output must be strictly smaller in magnitude than the \
-             input (partial weight after capacity drop)",
         );
     }
 

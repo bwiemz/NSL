@@ -747,6 +747,11 @@ const NOT_A_PASS: &[(&str, &str)] = &[
     ("use_count", "dead use-count analysis (zero readers since 5e2740bc)"),
     ("vmap", "M39 vmap"),
     ("weight_aware", "M52 weight-aware invariants"),
+    (
+        "weight_bind",
+        "-w code generation: loads the weights file into the model, gates M52 value \
+         rewrites on parameters the program never writes, checks the file's hash at startup",
+    ),
     ("wengert", "the IR itself, and its Cranelift lowering"),
     (
         "wgrad_fusion",
