@@ -517,9 +517,7 @@ fn cpu_model(m: &ToyModel) -> CpuModel {
     }
 }
 
-/// One sequence's per-layer KV chains, with by-position rollback
-/// (truncation mirrors the engine's overwrite-by-position semantics:
-/// positions are always re-fed in order after a rollback).
+/// One sequence's per-layer KV chains, fed in order.
 struct CpuSeq {
     kv: Vec<(Vec<f32>, Vec<f32>)>,
 }
@@ -555,12 +553,6 @@ impl CpuSeq {
             );
         }
         x
-    }
-    fn rollback_to(&mut self, new_len: usize) {
-        for (k, v) in self.kv.iter_mut() {
-            k.truncate(new_len * N_KV_HEADS * HEAD_DIM);
-            v.truncate(new_len * N_KV_HEADS * HEAD_DIM);
-        }
     }
 }
 
