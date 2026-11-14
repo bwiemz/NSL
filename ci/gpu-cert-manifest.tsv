@@ -8,14 +8,13 @@ crates/nsl-cli/tests/ccr_checkpoint_parity.rs	ccr_blocks_parity_on_gpu_determini
 crates/nsl-cli/tests/ccr_checkpoint_parity.rs	ccr_production_gpu_tolerance	gpu	requires CUDA GPU
 crates/nsl-cli/tests/ccr_periodic_stride_gate.rs	dp_stride_activation_peak_not_worse_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/ccr_periodic_stride_gate.rs	periodic_stride_reduces_activation_peak_gpu	gpu	requires CUDA GPU
+crates/nsl-cli/tests/ccr_reference_gradient_gate.rs	checkpointed_training_matches_pytorch_gpu	gpu	requires CUDA GPU
+crates/nsl-cli/tests/ccr_reference_gradient_gate.rs	compressed_saves_stay_within_bf16_rounding_of_pytorch_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/ccr_segment_early_free_gate.rs	gpu_forward_activation_peak_drops_with_per_segment_free	gpu	requires CUDA GPU (two training runs, kill-switch A/B)
 crates/nsl-cli/tests/ccr_segment_early_free_gate.rs	gpu_allocation_is_flat_across_steps	gpu	requires CUDA GPU (one training run)
 crates/nsl-cli/tests/ccr_segment_early_free_gate.rs	gpu_train_refuses_a_host_resident_float_input	gpu	requires CUDA GPU (one refused run)
-crates/nsl-cli/tests/csha_fused_dgamma_runtime.rs	compile_time_emits_fused_dgamma_for_csha_chain	toolchain	requires `nsl` binary built + CUDA toolchain available for the build link step
-crates/nsl-cli/tests/csha_fused_dgamma_runtime.rs	runtime_executes_fused_dgamma	gpu	requires CUDA toolchain + GPU; runs the full CSHA fused-backward pipeline end-to-end including SGD writeback on f16 grads.
 crates/nsl-cli/tests/csha_gap_gpu_e2e_smoke.rs	csha_gap_gpu_e2e_weights_change_after_one_step	gpu	requires a CUDA-capable GPU
-crates/nsl-cli/tests/csha_gap_gpu_e2e_smoke.rs	csha_gap_gpu_e2e_csha_fused_path	gpu	requires a CUDA-capable GPU; runs the full CSHA fused-backward pipeline end-to-end including SGD writeback on f16 grads.
-crates/nsl-cli/tests/csha_gap_gpu_e2e_smoke.rs	csha_gap_gpu_e2e_fused_vs_baseline_parity	gpu	requires a CUDA-capable GPU; runs the toy train twice (baseline + --csha auto) and compares per-param movements.
+crates/nsl-cli/tests/csha_toy_pretrain_gate.rs	the_example_without_csha_matches_pytorch	gpu	requires CUDA GPU
 crates/nsl-cli/tests/csla_layerwise_gate.rs	csla_parity_ffn_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/csla_layerwise_gate.rs	csla_parity_packed_gqa_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/csla_layerwise_gate.rs	csla_parity_packed_mha_gpu_fused	gpu	requires CUDA GPU
@@ -58,12 +57,18 @@ crates/nsl-cli/tests/exec_fingerprint_resume_gate.rs	an_explicit_mode_beats_the_
 crates/nsl-cli/tests/fase_fused_step_gpu_gate.rs	fused_step_matches_interpreted_bit_exact	gpu	requires a CUDA GPU (2 FASE training runs)
 crates/nsl-cli/tests/fase_fused_step_gpu_gate.rs	csla_block_tables_build_once_per_shape_list_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/feature_composition_gate.rs	registered_refusals_actually_fire_on_gpu_only_configurations	gpu	requires a CUDA GPU (--weight-stream needs device-resident params)
+crates/nsl-cli/tests/flash_attention_ragged_seq_gate.rs	a_sequence_shorter_than_the_tile_is_refused	gpu	requires CUDA GPU
+crates/nsl-cli/tests/flash_attention_ragged_seq_gate.rs	whole_tiles_match_attention_written_out	gpu	requires CUDA GPU
 crates/nsl-cli/tests/fn_lifetime_leak_gate.rs	loop_carried_borrow_seed_does_not_strand_per_iteration	gpu	requires CUDA GPU
 crates/nsl-cli/tests/fn_lifetime_leak_gate.rs	naive_sdpa_chain_transients_are_released	gpu	requires CUDA GPU
 crates/nsl-cli/tests/fn_lifetime_leak_gate.rs	scalar_returning_fn_sweeps_its_tensor_locals	gpu	requires CUDA GPU
 crates/nsl-cli/tests/fn_lifetime_leak_gate.rs	no_grad_inference_is_iteration_independent	gpu	requires CUDA GPU
 crates/nsl-cli/tests/fn_lifetime_leak_gate.rs	owning_call_result_argument_is_released	gpu	requires CUDA GPU
 crates/nsl-cli/tests/fn_lifetime_leak_gate.rs	disabling_escape_analysis_restores_the_strand	gpu	requires CUDA GPU
+crates/nsl-cli/tests/fused_kl_ce_gpu_gate.rs	the_fused_kernel_matches_pytorch_over_four_steps	gpu	requires CUDA GPU
+crates/nsl-cli/tests/fused_kl_ce_gpu_gate.rs	a_target_of_minus_one_is_an_ignored_row	gpu	requires CUDA GPU
+crates/nsl-cli/tests/fused_kl_ce_gpu_gate.rs	a_target_at_the_vocabulary_size_aborts_before_any_step	gpu	requires CUDA GPU
+crates/nsl-cli/tests/fused_kl_ce_gpu_gate.rs	a_wrong_row_count_is_reported_against_the_decorator_in_the_program	gpu	requires CUDA GPU
 crates/nsl-cli/tests/fused_kl_ce_hint_pin_gate.rs	student_hidden_size_disagreeing_is_refused_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/fused_kl_ce_hint_pin_gate.rs	teacher_hidden_disagreeing_is_refused_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/fused_kl_ce_hint_pin_gate.rs	vocab_size_disagreeing_is_refused_gpu	gpu	requires CUDA GPU
@@ -75,10 +80,12 @@ crates/nsl-cli/tests/fused_lm_ce_hint_pin_gate.rs	transposed_batch_and_seq_is_re
 crates/nsl-cli/tests/fused_lm_ce_hint_pin_gate.rs	the_rank3_biasless_fixture_still_trains_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/fused_lm_ce_hint_pin_gate.rs	the_unmodified_fixture_still_trains_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/fused_loss_gradient_cert_gpu.rs	fused_linear_ce_step	gpu	requires CUDA GPU
+crates/nsl-cli/tests/fused_loss_gradient_cert_gpu.rs	fused_linear_ce_step_bf16	gpu	requires CUDA GPU
 crates/nsl-cli/tests/fused_loss_gradient_cert_gpu.rs	fused_kl_ce_step	gpu	requires CUDA GPU
 crates/nsl-cli/tests/fused_loss_gradient_cert_gpu.rs	sdpa_packed_step	gpu	requires CUDA GPU
+crates/nsl-cli/tests/gelu_definition_gate.rs	gpu_gelu_is_the_same_function_in_both_ad_modes	gpu	requires CUDA GPU
 crates/nsl-cli/tests/gpu_tape_activation_backward_gate.rs	gpu_gradient_through_a_transposed_activation_matches_cpu	gpu	requires CUDA GPU
-crates/nsl-cli/tests/gpu_tape_activation_backward_gate.rs	gpu_gelu_gradient_is_the_derivative_of_the_gpu_forward	gpu	requires CUDA GPU
+crates/nsl-cli/tests/gpu_tape_activation_backward_gate.rs	gpu_gelu_gradient_is_the_tanh_approximations	gpu	requires CUDA GPU
 crates/nsl-cli/tests/gpu_tape_max_gather_backward_gate.rs	gpu_reduce_max_gradient_goes_to_the_argmax	gpu	requires CUDA GPU
 crates/nsl-cli/tests/gpu_tape_max_gather_backward_gate.rs	gpu_gather_dim0_gradient_scatters_every_index	gpu	requires CUDA GPU
 crates/nsl-cli/tests/inference_loop_leak_gate.rs	inference_loop_method_call_live_blocks_iteration_independent	gpu	requires CUDA GPU
@@ -122,6 +129,7 @@ crates/nsl-cli/tests/posture_certificate_gpu.rs	posture_flag_bisection	diagnosti
 crates/nsl-cli/tests/posture_certificate_gpu.rs	posture_accumulation_identity	gpu	requires CUDA GPU
 crates/nsl-cli/tests/pretrain_loss_decrease_gpu_e2e.rs	pretrain_loss_decreases_on_gpu	gpu	requires CUDA GPU (runs a real training loop)
 crates/nsl-cli/tests/pretrain_loss_decrease_gpu_e2e.rs	fase_deferred_matches_plain_adamw_checkpoint	gpu	requires CUDA GPU (runs two real training loops)
+crates/nsl-cli/tests/quant_block_gate.rs	a_model_on_the_gpu_goes_through_a_quant_block	gpu	requires a CUDA-capable GPU and --features cuda
 crates/nsl-cli/tests/rmsnorm_dx_parity_gate.rs	fused_rmsnorm_gamma_backward_gpu_matches_reference	gpu	requires CUDA GPU
 crates/nsl-cli/tests/rmsnorm_residual_fold_gate.rs	residual_fold_bit_exact_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/rope_neg_fold_gate.rs	rope_fold_bit_exact_gpu	gpu	requires CUDA GPU
@@ -157,6 +165,7 @@ crates/nsl-cli/tests/view_chain_leak_gate.rs	free_function_chain_links_do_not_st
 crates/nsl-cli/tests/view_chain_leak_gate.rs	unknown_typed_receiver_chains_do_not_strand_per_call	gpu	requires CUDA GPU
 crates/nsl-cli/tests/view_chain_leak_gate.rs	view_chain_results_are_numerically_unchanged	gpu	requires CUDA GPU
 crates/nsl-cli/tests/weight_decay_groups_gate.rs	fused_multi_launch_partitions_on_weight_decay_gpu	gpu	requires a CUDA GPU
+crates/nsl-cli/tests/weights_flag_binds_model_gate.rs	on_a_gpu_the_moved_model_holds_the_file_s_values	gpu	needs a CUDA device: cargo test -p nsl-cli --features cuda --test weights_flag_binds_model_gate -- --include-ignored
 crates/nsl-cli/tests/wgrad_accum_fusion_gate.rs	gpu_identity_reduce_chain_uses_the_fused_gemm	gpu	requires a CUDA GPU
 crates/nsl-cli/tests/wgrad_accum_fusion_gate.rs	gpu_fused_wgrad_matches_the_unfused_chain_within_f32_tolerance	gpu	requires a CUDA GPU (2 FASE training runs)
 crates/nsl-cli/tests/wrga_adapter_runtime_equivalence.rs	cranelift_and_source_ad_see_same_rewritten_ast	gpu	requires CUDA GPU (anti-drift: Cranelift and source-AD see the same rewritten AST). Parked as broken until the adapter side-table moved into the model constructor; passes on sm_120 since then.
@@ -220,6 +229,8 @@ crates/nsl-codegen/tests/cfie_weight_binding_gpu_parity.rs	ffi_uploaded_weights_
 crates/nsl-codegen/tests/cfie_weight_binding_gpu_parity.rs	upload_zero_elems_refuses_minus1	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/cpdt_precision_fp16_weights_gen.rs	gen_cpdt_precision_fp16_weights	generator	generator: rewrites tests/fixtures/cpdt_precision_fp16_weights.safetensors; manual invocation only
 crates/nsl-codegen/tests/cpkd_fused_kl_ce_numerical.rs	fused_kl_ce_gpu_forward_and_backward_match_reference	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/cpkd_fused_kl_ce_numerical.rs	the_device_comparison_catches_wrong_results	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/cpkd_fused_kl_ce_numerical.rs	a_failed_launch_exits_instead_of_returning	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/csha_checkpoint_recompute_gpu.rs	t_recompute_hd64_s512_bq32	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/csha_checkpoint_recompute_gpu.rs	t_recompute_hd64_s2048_bq32	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/csha_checkpoint_recompute_gpu.rs	t_recompute_hd128_s512_bq32	gpu	requires CUDA GPU
@@ -230,13 +241,12 @@ crates/nsl-codegen/tests/csha_checkpoint_recompute_gpu.rs	t_recompute_hd64_s32_b
 crates/nsl-codegen/tests/csha_checkpoint_recompute_gpu.rs	t_segmask_recompute_hd32_s32_two_docs	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/csha_checkpoint_recompute_gpu.rs	t_segmask_recompute_hd32_s32_two_docs_halfsplit	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/csha_checkpoint_recompute_gpu.rs	t_segmask_recompute_hd32_s32_four_docs	gpu	requires CUDA GPU
-crates/nsl-codegen/tests/csha_cuda_backward.rs	t6_3_smoke_single_config	gpu	requires CUDA GPU
-crates/nsl-codegen/tests/csha_cuda_backward.rs	t6_3_hd64_block32_dv_probe	diagnostic	diagnostic: logs dV/dK/dQ max_abs at hd=64 block=32, no tolerance gate; fails on a non-finite gradient
-crates/nsl-codegen/tests/csha_cuda_backward.rs	t6_3_multitile_seq128	gpu	requires CUDA GPU
-crates/nsl-codegen/tests/csha_cuda_backward.rs	t6_3_multitile_seq128_rope	gpu	requires CUDA GPU
-crates/nsl-codegen/tests/csha_cuda_backward.rs	t6_3_matrix_sweep_numerical	gpu	requires CUDA GPU; (head_dim, causal, rope_q) sweep, panics on any FAIL row
-crates/nsl-codegen/tests/csha_cuda_backward.rs	t6_3_matrix_sweep_structural	diagnostic	diagnostic: structural sweep that logs rc and finiteness per config and asserts nothing
-crates/nsl-codegen/tests/csha_cuda_backward.rs	t6_3_element_dump_diag	diagnostic	diagnostic: element dump for SMEM-tile divergence triage, no tolerance gate
+crates/nsl-codegen/tests/csha_cuda_backward.rs	fused_backward_matches_reference_at_realistic_gradient_magnitudes	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/csha_cuda_backward.rs	fused_backward_is_bit_exact_under_a_power_of_two_rescale_of_do	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/csha_cuda_backward.rs	fused_backward_matches_reference_over_four_tiles	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/csha_cuda_backward.rs	fused_backward_matches_reference_across_head_dim_causal_and_rope	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/csha_cuda_backward.rs	fused_kernels_refuse_a_d_model_above_head_dim	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/csha_cuda_backward.rs	backward_refuses_a_null_projection_weight	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/csha_cuda_launch_classic.rs	classic_4x32x32_nocausal	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/csha_cuda_launch_classic.rs	classic_32x32x32_nocausal	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/csha_cuda_launch_classic.rs	classic_32x32x32_causal	gpu	requires CUDA GPU
@@ -249,6 +259,9 @@ crates/nsl-codegen/tests/csha_cuda_launch_fused.rs	t1_forward_output_invariant_u
 crates/nsl-codegen/tests/csha_cuda_launch_fused.rs	t1_forward_output_invariant_under_save_activations_flag_multitile_segmented_two_equal	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/csha_cuda_launch_fused.rs	t1_forward_output_invariant_under_save_activations_flag_multitile_segmented_three_unequal	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/csha_cuda_launch_fused.rs	t4_csha_backward_ffi_smoke	gpu	requires CUDA GPU; launch smoke (rc=0), numerics are t6_3's job
+crates/nsl-codegen/tests/csha_cuda_training_config.rs	training_kernels_match_reference_over_batch_and_heads	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/csha_cuda_training_config.rs	pruned_heads_do_not_drop_batch_elements	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/csha_cuda_training_config.rs	pruned_heads_do_not_drop_batch_elements_in_the_inference_forward	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/csha_cycle15_bug1_ablations.rs	a0_base_config_control_causal_rope_q_fused_proj_hd64	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/csha_cycle15_bug1_ablations.rs	a1_rope_q_off_causal_true_fused_proj_true_hd64	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/csha_cycle15_bug1_ablations.rs	a2_causal_off_rope_q_true_fused_proj_true_hd64	gpu	requires CUDA GPU
@@ -335,6 +348,7 @@ crates/nsl-codegen/tests/pca_tier_b_sass_baselines.rs	regenerate_baseline_64_64_
 crates/nsl-codegen/tests/sdpa_fused_forward_gpu_parity.rs	sdpa_fused_forward_unmasked_matches_oracle	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/sdpa_fused_forward_gpu_parity.rs	sdpa_fused_forward_segment_masked_matches_oracle	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/sdpa_fused_packed_gpu_parity.rs	packed_forward_matches_the_oracle_across_kv_tiles	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/sdpa_fused_packed_gpu_parity.rs	the_packed_forward_declines_a_sequence_longer_than_its_segment_buffer	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/sdpa_fused_packed_gpu_parity.rs	packed_backward_is_the_f16_operand_gradient_across_kv_tiles	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/sdpa_fused_packed_gpu_parity.rs	packed_forward_then_backward_is_the_attention_gradient	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/sdpa_mma_forward_gpu_parity.rs	mma_multitile_hd64_causal	gpu	requires CUDA GPU
@@ -344,6 +358,8 @@ crates/nsl-codegen/tests/sdpa_mma_forward_gpu_parity.rs	mma_multitile_hd128_caus
 crates/nsl-codegen/tests/sdpa_mma_forward_gpu_parity.rs	mma_multitile_hd32_causal	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/sdpa_mma_forward_gpu_parity.rs	mma_multitile_bq32_redundant_warps_causal	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/tier_b1_csha_ffi_e2e.rs	tier_b1_through_csha_ffi_matches_cpu_reference	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/tier_b1_csha_ffi_e2e.rs	tier_b1_rereads_weights_updated_in_place	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/tier_b1_csha_ffi_e2e.rs	tier_b1_refuses_batch_or_heads_above_one	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/tier_b1_full_kernel_e2e.rs	tier_b1_full_kernel_e2e_matches_cpu_reference	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/tier_b1_kernel_ptxas_validation.rs	tier_b1_full_kernel_assembles_on_sm_80	toolchain	requires ptxas on PATH; lift in CI with CUDA toolchain
 crates/nsl-codegen/tests/tier_b1_kernel_ptxas_validation.rs	tier_b1_full_kernel_assembles_on_sm_120	toolchain	requires ptxas on PATH; lift in CI with CUDA toolchain
@@ -359,6 +375,9 @@ crates/nsl-codegen/tests/tier_b1_q_projection_ptxas.rs	tier_b1_q_projection_ptxa
 crates/nsl-codegen/tests/tier_b1_save_activations_gpu.rs	tier_b1_save_activations_match_cpu_reference_hd32	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/tier_b1_save_activations_gpu.rs	tier_b1_save_activations_match_cpu_reference_hd64	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/tier_b1_save_activations_gpu.rs	tier_b1_save_activations_match_cpu_reference_hd128	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/tier_b2_backward_f64_gate.rs	tier_b2_backward_matches_reference_at_realistic_gradient_magnitudes	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/tier_b2_backward_f64_gate.rs	tier_b2_backward_is_bit_exact_under_a_power_of_two_rescale_of_do	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/tier_b2_backward_f64_gate.rs	tier_b2_backward_refuses_a_sequence_that_does_not_fill_whole_tiles	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/tier_b2_backward_ffi_e2e.rs	tier_b2_backward_ffi_numerical_band_pins_to_full_reference	diagnostic	diagnostic: documentation stub that prints a pointer; the GPU band is tier_b2_full_backward_cpu_reference
 crates/nsl-codegen/tests/tier_b2_dkdv_kernel_cpu_reference.rs	tier_b2_dkdv_sweep_cpu_naive	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/tier_b2_dkdv_kernel_cpu_reference.rs	tier_b2_dkdv_sweep_b1_forward	gpu	requires CUDA GPU + nsl-test/cuda (FSource::B1Forward)
@@ -437,6 +456,7 @@ crates/nsl-runtime/tests/gpu_strided_view_ops.rs	gpu_scalar_op_on_transposed_vie
 crates/nsl-runtime/tests/hwcert_kir_numerics_gpu.rs	softmax_kir_kernel_matches_an_independent_f64_softmax_on_silicon	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/hwcert_kir_numerics_gpu.rs	layernorm_kir_kernel_is_correct_and_race_free_on_silicon	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/hwcert_kir_numerics_gpu.rs	rmsnorm_forward_kir_kernel_matches_an_independent_f64_rmsnorm_on_silicon	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/hwcert_kir_numerics_gpu.rs	max_and_min_order_negative_zero_below_positive_zero_on_silicon	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/hwcert_kir_numerics_gpu.rs	dropout_kir_kernel_is_bit_exact_against_its_documented_hash_on_silicon	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/inspect_ffi.rs	gpu_stats_parity_with_cpu	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/kernel_launch_tensors_gpu.rs	kernel_launch_tensors_vec_add_writes_correct_output	gpu	requires CUDA GPU
@@ -482,6 +502,8 @@ crates/nsl-runtime/tests/precision_cast_gpu_dispatch.rs	gpu_to_fp16_round_trip_w
 crates/nsl-runtime/tests/precision_cast_gpu_dispatch.rs	gpu_to_bf16_size_sweep	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/precision_cast_gpu_dispatch.rs	gpu_to_f32_same_dtype_is_copy	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/precision_cast_gpu_dispatch.rs	gpu_moment_envelope_fp16_round_trip	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/quantize_gpu_device.rs	qtensor_quantize_stages_a_gpu_tensor_and_reads_a_gpu_view_through_its_strides	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/quantize_gpu_device.rs	the_4bit_packers_stage_a_gpu_view	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/rmsnorm_dx_backward_gpu.rs	rmsnorm_dx_gpu_matches_cpu_reference	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/sr_bf16_parity.rs	sr_bf16_gpu_tail_is_bit_identical_to_cpu_reference	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/sr_bf16_parity.rs	sr_bf16_gpu_streams_vary_with_counters	gpu	requires CUDA GPU
