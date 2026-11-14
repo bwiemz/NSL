@@ -50,6 +50,11 @@ const ALLOW_LIST: &[&str] = &[
     "crates/nsl-codegen/tests/csha_cycle15_bug1_ablations.rs",
     "crates/nsl-codegen/tests/csha_checkpoint_recompute_gpu.rs",
     "crates/nsl-codegen/tests/csha_cuda_backward.rs",
+    // GPU gates against the f64 reference: the emitted training pair over
+    // batch and heads, and the tensor-core backward at realistic gradient
+    // magnitudes. Neither takes probe pointers.
+    "crates/nsl-codegen/tests/csha_cuda_training_config.rs",
+    "crates/nsl-codegen/tests/tier_b2_backward_f64_gate.rs",
     "crates/nsl-codegen/tests/csha_cuda_launch_fused.rs",
     "crates/nsl-codegen/tests/csha_dx_norm_readback_diag.rs",
     "crates/nsl-codegen/tests/pca_tier_a_backward_correctness.rs",

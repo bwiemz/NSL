@@ -4246,8 +4246,9 @@ impl Drop for DeviceScratch {
 ///   1. `tier_b2_d_prepass`    reads dO, O          -> writes D (scratch)
 ///
 /// `do_ptr` is a device pointer to **f32** dO (resolved by the caller); the
-/// kernels read an f16 narrowing of it made here. Every gradient output is
-/// f32.
+/// kernels read an f16 narrowing of it made here, prescaled per
+/// (batch, head) slice by a power of two (see the "Gradient prescale" block
+/// in the body). Every gradient output is f32.
 ///
 ///   2. `tier_b2_dq_kernel`    reads q/k/v_saved, dO, row_max, row_sum, D -> dQ
 ///   3. `tier_b2_dkdv_kernel`  reads q/k/v_saved, dO, row_max, row_sum, D -> dK, dV
@@ -4409,21 +4410,45 @@ fn csha_tier_b2_backward_launch(
     let dk_scratch = dk_scratch_raw as u64;
     let dv_scratch = dv_scratch_raw as u64;
 
-    // The dq / dkdv kernels and the D pre-pass read dO as f16 (it is an
-    // operand of `mma.sync ... f16.f16`): narrow the f32 gradient into a
-    // transient buffer, released when this function returns.
-    let d_o_staging = DeviceScratch(if qkv_elems > 0 && d_o_f32 != 0 {
+    // Gradient prescale. The dq / dkdv kernels and the D pre-pass take dO as
+    // an f16 operand of `mma.sync ... f16.f16`, and the dq / dkdv kernels
+    // narrow dS = P * (dP - D) to f16 as well. A gradient at training
+    // magnitude (1e-6..1e-8) does not survive that unscaled: f16 is exactly
+    // zero below 2.98e-8. The backward is linear in dO, so each
+    // (batch, head) slice of dO is multiplied by the power of two that puts
+    // its largest element in [2^6, 2^7) before it is narrowed
+    // (`CSHA_BWD_GRAD_SCALE_EXP`, the stock flash-attention backward's
+    // choice), D, dS, dQ, dK and dV all come out multiplied by it, and
+    // dQ/dK/dV are multiplied by the exact reciprocal before the projection
+    // kernel reads them. A power-of-two multiply only moves the exponent.
+    //
+    // `gmax` holds max|dO| per (batch, head) slice; both scale kernels derive
+    // the scale from its exponent, so nothing is read back to the host.
+    let slices = (batch * heads) as usize;
+    let slice_elems = (seq_len * head_dim) as u64;
+    let scaled = qkv_elems > 0 && d_o_f32 != 0;
+    let d_o_staging = DeviceScratch(if scaled {
         crate::cuda::inner::alloc_device(qkv_elems * 2)
     } else {
         std::ptr::null_mut()
     });
-    if qkv_elems > 0 && d_o_f32 != 0 {
-        if d_o_staging.0.is_null() {
+    let gmax = DeviceScratch(if scaled {
+        crate::cuda::inner::alloc_device(slices * 4)
+    } else {
+        std::ptr::null_mut()
+    });
+    if scaled {
+        if d_o_staging.0.is_null() || gmax.0.is_null() {
             crate::nsl_log!(ERROR, "nsl", "[nsl] CSHA Tier B.2 backward: dO staging alloc failed");
             free_scratches(dq_scratch_raw, dk_scratch_raw, dv_scratch_raw, d_scratch_raw);
             return CUresult::CUDA_ERROR_OUT_OF_MEMORY as i64;
         }
-        let c_rc = csha_bwd_convert_f32_to_f16(d_o_f32 as *mut c_void, d_o_staging.0, qkv_elems);
+        let mut c_rc = csha_bwd_slice_abs_max(d_o_f32, gmax.0 as u64, slices, slice_elems);
+        if c_rc == success {
+            c_rc = csha_bwd_prescale_narrow(
+                d_o_f32, d_o_staging.0 as u64, gmax.0 as u64, qkv_elems, slice_elems,
+            );
+        }
         if c_rc != success {
             free_scratches(dq_scratch_raw, dk_scratch_raw, dv_scratch_raw, d_scratch_raw);
             return c_rc as i64;
@@ -4554,6 +4579,18 @@ fn csha_tier_b2_backward_launch(
         if rc != success {
             free_scratches(dq_scratch_raw, dk_scratch_raw, dv_scratch_raw, d_scratch_raw);
             return rc as i64;
+        }
+    }
+
+    // Undo the gradient prescale on dQ/dK/dV, in place and exactly, so the
+    // projection kernel and the outputs see true magnitudes in f32.
+    if scaled {
+        for scratch in [dq_scratch, dk_scratch, dv_scratch] {
+            let c_rc = csha_bwd_unscale(scratch, gmax.0 as u64, qkv_elems, slice_elems);
+            if c_rc != success {
+                free_scratches(dq_scratch_raw, dk_scratch_raw, dv_scratch_raw, d_scratch_raw);
+                return c_rc as i64;
+            }
         }
     }
 
@@ -4800,6 +4837,280 @@ fn csha_tier_b2_backward_launch(
 
     free_scratches(dq_scratch_raw, dk_scratch_raw, dv_scratch_raw, d_scratch_raw);
     success as i64
+}
+
+/// Biased-exponent target of the Tier B.2 gradient prescale: the largest
+/// |dO| of a (batch, head) slice lands in `[2^6, 2^7)`. The stock
+/// flash-attention backward uses the same target (`BWD_GRAD_SCALE_EXP` in
+/// nsl-codegen's `flash_attention.rs`): 20 binades of normal f16 range
+/// below it for the slice's smaller elements and for dS, 9 above it before
+/// dS could reach f16's maximum (where the kernels saturate it).
+///
+/// The scale kernels below hard-code what follows from it: with `e` the
+/// biased f32 exponent of the slice maximum, clamped to `[7, 254]` so that
+/// both scales stay normal f32 values (an all-zero slice scales as if its
+/// maximum were 2^-120; an infinite one keeps a finite scale and the
+/// infinity itself still propagates),
+///
+/// ```text
+/// gs   = 2^(6 - (e - 127))   bits = (260 - e) << 23
+/// ginv = 2^((e - 127) - 6)   bits = (e - 6) << 23
+/// ```
+#[cfg(feature = "cuda")]
+pub const CSHA_BWD_GRAD_SCALE_EXP: u32 = 6;
+
+/// `gmax[c] = max_i |src[c * chunk + i]|` over `i < chunk`, one thread per
+/// slice (grid `n_chunks`, block 1). A slice is `seq * head_dim` elements,
+/// a few thousand at the single-tile shapes Tier B.2 is dispatched for.
+/// `max.f32` returns the other operand for a NaN, so a NaN in dO does not
+/// decide the scale; it still reaches the outputs through the multiply.
+#[cfg(feature = "cuda")]
+const CSHA_BWD_SLICE_ABS_MAX_PTX: &str = concat!(
+    ".version 8.7\n",
+    ".target sm_75\n",
+    ".address_size 64\n",
+    ".visible .entry nsl_csha_bwd_slice_abs_max(\n",
+    "    .param .u64 src_ptr,\n",
+    "    .param .u64 gmax_ptr,\n",
+    "    .param .u64 chunk\n",
+    ")\n",
+    "{\n",
+    "    .reg .u32 %bi;\n",
+    "    .reg .u64 %c, %n, %i, %src, %dst, %a;\n",
+    "    .reg .f32 %m, %v;\n",
+    "    .reg .pred %p;\n",
+    "    mov.u32 %bi, %ctaid.x;\n",
+    "    cvt.u64.u32 %c, %bi;\n",
+    "    ld.param.u64 %src, [src_ptr];\n",
+    "    ld.param.u64 %dst, [gmax_ptr];\n",
+    "    ld.param.u64 %n, [chunk];\n",
+    "    mul.lo.u64 %a, %c, %n;\n",
+    "    shl.b64 %a, %a, 2;\n",
+    "    add.u64 %a, %src, %a;\n",
+    "    mov.f32 %m, 0f00000000;\n",
+    "    mov.u64 %i, 0;\n",
+    "GMAX_LOOP:\n",
+    "    setp.ge.u64 %p, %i, %n;\n",
+    "    @%p bra GMAX_DONE;\n",
+    "    ld.global.f32 %v, [%a];\n",
+    "    abs.f32 %v, %v;\n",
+    "    max.f32 %m, %m, %v;\n",
+    "    add.u64 %a, %a, 4;\n",
+    "    add.u64 %i, %i, 1;\n",
+    "    bra GMAX_LOOP;\n",
+    "GMAX_DONE:\n",
+    "    shl.b64 %c, %c, 2;\n",
+    "    add.u64 %dst, %dst, %c;\n",
+    "    st.global.f32 [%dst], %m;\n",
+    "    ret;\n",
+    "}\n",
+    "\0",
+);
+
+#[cfg(feature = "cuda")]
+const CSHA_BWD_SLICE_ABS_MAX_NAME: &str = "nsl_csha_bwd_slice_abs_max\0";
+
+/// `dst[i] = f16(src[i] * gs(gmax[i / chunk]))`: the prescaled narrowing of
+/// dO. See [`CSHA_BWD_GRAD_SCALE_EXP`] for `gs`.
+#[cfg(feature = "cuda")]
+const CSHA_BWD_PRESCALE_NARROW_PTX: &str = concat!(
+    ".version 8.7\n",
+    ".target sm_75\n",
+    ".address_size 64\n",
+    ".visible .entry nsl_csha_bwd_prescale_narrow(\n",
+    "    .param .u64 src_ptr,\n",
+    "    .param .u64 dst_ptr,\n",
+    "    .param .u64 gmax_ptr,\n",
+    "    .param .u64 n_elems,\n",
+    "    .param .u64 chunk\n",
+    ")\n",
+    "{\n",
+    "    .reg .u32 %th, %bd, %bi, %gid, %tmp, %e, %b;\n",
+    "    .reg .u64 %idx, %n, %ch, %c, %src, %dst, %gm, %a;\n",
+    "    .reg .f32 %f, %gs;\n",
+    "    .reg .b16 %h;\n",
+    "    .reg .pred %p;\n",
+    "    mov.u32 %th, %tid.x;\n",
+    "    mov.u32 %bd, %ntid.x;\n",
+    "    mov.u32 %bi, %ctaid.x;\n",
+    "    mul.lo.u32 %tmp, %bi, %bd;\n",
+    "    add.u32 %gid, %tmp, %th;\n",
+    "    cvt.u64.u32 %idx, %gid;\n",
+    "    ld.param.u64 %src, [src_ptr];\n",
+    "    ld.param.u64 %dst, [dst_ptr];\n",
+    "    ld.param.u64 %gm, [gmax_ptr];\n",
+    "    ld.param.u64 %n, [n_elems];\n",
+    "    ld.param.u64 %ch, [chunk];\n",
+    "    setp.ge.u64 %p, %idx, %n;\n",
+    "    @%p bra PRESCALE_END;\n",
+    "    div.u64 %c, %idx, %ch;\n",
+    "    shl.b64 %c, %c, 2;\n",
+    "    add.u64 %a, %gm, %c;\n",
+    "    ld.global.u32 %e, [%a];\n",
+    "    shr.u32 %e, %e, 23;\n",
+    "    max.u32 %e, %e, 7;\n",
+    "    min.u32 %e, %e, 254;\n",
+    "    sub.u32 %b, 260, %e;\n",
+    "    shl.b32 %b, %b, 23;\n",
+    "    mov.b32 %gs, %b;\n",
+    "    shl.b64 %a, %idx, 2;\n",
+    "    add.u64 %a, %src, %a;\n",
+    "    ld.global.f32 %f, [%a];\n",
+    "    mul.f32 %f, %f, %gs;\n",
+    "    cvt.rn.f16.f32 %h, %f;\n",
+    "    shl.b64 %a, %idx, 1;\n",
+    "    add.u64 %a, %dst, %a;\n",
+    "    st.global.b16 [%a], %h;\n",
+    "PRESCALE_END:\n",
+    "    ret;\n",
+    "}\n",
+    "\0",
+);
+
+#[cfg(feature = "cuda")]
+const CSHA_BWD_PRESCALE_NARROW_NAME: &str = "nsl_csha_bwd_prescale_narrow\0";
+
+/// `buf[i] *= ginv(gmax[i / chunk])`, in place: the exact inverse of the
+/// prescale, applied to the f32 dQ/dK/dV the kernels produced.
+#[cfg(feature = "cuda")]
+const CSHA_BWD_UNSCALE_PTX: &str = concat!(
+    ".version 8.7\n",
+    ".target sm_75\n",
+    ".address_size 64\n",
+    ".visible .entry nsl_csha_bwd_unscale(\n",
+    "    .param .u64 buf_ptr,\n",
+    "    .param .u64 gmax_ptr,\n",
+    "    .param .u64 n_elems,\n",
+    "    .param .u64 chunk\n",
+    ")\n",
+    "{\n",
+    "    .reg .u32 %th, %bd, %bi, %gid, %tmp, %e, %b;\n",
+    "    .reg .u64 %idx, %n, %ch, %c, %buf, %gm, %a;\n",
+    "    .reg .f32 %f, %ginv;\n",
+    "    .reg .pred %p;\n",
+    "    mov.u32 %th, %tid.x;\n",
+    "    mov.u32 %bd, %ntid.x;\n",
+    "    mov.u32 %bi, %ctaid.x;\n",
+    "    mul.lo.u32 %tmp, %bi, %bd;\n",
+    "    add.u32 %gid, %tmp, %th;\n",
+    "    cvt.u64.u32 %idx, %gid;\n",
+    "    ld.param.u64 %buf, [buf_ptr];\n",
+    "    ld.param.u64 %gm, [gmax_ptr];\n",
+    "    ld.param.u64 %n, [n_elems];\n",
+    "    ld.param.u64 %ch, [chunk];\n",
+    "    setp.ge.u64 %p, %idx, %n;\n",
+    "    @%p bra UNSCALE_END;\n",
+    "    div.u64 %c, %idx, %ch;\n",
+    "    shl.b64 %c, %c, 2;\n",
+    "    add.u64 %a, %gm, %c;\n",
+    "    ld.global.u32 %e, [%a];\n",
+    "    shr.u32 %e, %e, 23;\n",
+    "    max.u32 %e, %e, 7;\n",
+    "    min.u32 %e, %e, 254;\n",
+    "    sub.u32 %b, %e, 6;\n",
+    "    shl.b32 %b, %b, 23;\n",
+    "    mov.b32 %ginv, %b;\n",
+    "    shl.b64 %a, %idx, 2;\n",
+    "    add.u64 %a, %buf, %a;\n",
+    "    ld.global.f32 %f, [%a];\n",
+    "    mul.f32 %f, %f, %ginv;\n",
+    "    st.global.f32 [%a], %f;\n",
+    "UNSCALE_END:\n",
+    "    ret;\n",
+    "}\n",
+    "\0",
+);
+
+#[cfg(feature = "cuda")]
+const CSHA_BWD_UNSCALE_NAME: &str = "nsl_csha_bwd_unscale\0";
+
+/// Launch [`CSHA_BWD_SLICE_ABS_MAX_PTX`]: `gmax[c]` for `n_chunks` slices of
+/// `chunk` f32 elements each.
+#[cfg(feature = "cuda")]
+fn csha_bwd_slice_abs_max(
+    src: u64,
+    gmax: u64,
+    n_chunks: usize,
+    chunk: u64,
+) -> cudarc::driver::sys::CUresult {
+    if n_chunks == 0 {
+        return cudarc::driver::sys::CUresult::CUDA_SUCCESS;
+    }
+    let (mut a_src, mut a_gmax, mut a_chunk) = (src, gmax, chunk);
+    let args: [*mut c_void; 3] = [
+        &mut a_src as *mut _ as *mut c_void,
+        &mut a_gmax as *mut _ as *mut c_void,
+        &mut a_chunk as *mut _ as *mut c_void,
+    ];
+    crate::cuda::inner::kernel_launch(
+        CSHA_BWD_SLICE_ABS_MAX_PTX.as_ptr(),
+        CSHA_BWD_SLICE_ABS_MAX_NAME.as_ptr(),
+        [n_chunks as i64, 1, 1],
+        [1, 1, 1],
+        &args,
+        0,
+    )
+}
+
+/// Launch [`CSHA_BWD_PRESCALE_NARROW_PTX`] over `n_elems` elements.
+#[cfg(feature = "cuda")]
+fn csha_bwd_prescale_narrow(
+    src: u64,
+    dst: u64,
+    gmax: u64,
+    n_elems: usize,
+    chunk: u64,
+) -> cudarc::driver::sys::CUresult {
+    if n_elems == 0 {
+        return cudarc::driver::sys::CUresult::CUDA_SUCCESS;
+    }
+    let (mut a_src, mut a_dst, mut a_gmax, mut a_n, mut a_chunk) =
+        (src, dst, gmax, n_elems as u64, chunk);
+    let args: [*mut c_void; 5] = [
+        &mut a_src as *mut _ as *mut c_void,
+        &mut a_dst as *mut _ as *mut c_void,
+        &mut a_gmax as *mut _ as *mut c_void,
+        &mut a_n as *mut _ as *mut c_void,
+        &mut a_chunk as *mut _ as *mut c_void,
+    ];
+    let block: i64 = 128;
+    crate::cuda::inner::kernel_launch(
+        CSHA_BWD_PRESCALE_NARROW_PTX.as_ptr(),
+        CSHA_BWD_PRESCALE_NARROW_NAME.as_ptr(),
+        [((n_elems as i64) + block - 1) / block, 1, 1],
+        [block, 1, 1],
+        &args,
+        0,
+    )
+}
+
+/// Launch [`CSHA_BWD_UNSCALE_PTX`] over `n_elems` f32 elements, in place.
+#[cfg(feature = "cuda")]
+fn csha_bwd_unscale(
+    buf: u64,
+    gmax: u64,
+    n_elems: usize,
+    chunk: u64,
+) -> cudarc::driver::sys::CUresult {
+    if n_elems == 0 {
+        return cudarc::driver::sys::CUresult::CUDA_SUCCESS;
+    }
+    let (mut a_buf, mut a_gmax, mut a_n, mut a_chunk) = (buf, gmax, n_elems as u64, chunk);
+    let args: [*mut c_void; 4] = [
+        &mut a_buf as *mut _ as *mut c_void,
+        &mut a_gmax as *mut _ as *mut c_void,
+        &mut a_n as *mut _ as *mut c_void,
+        &mut a_chunk as *mut _ as *mut c_void,
+    ];
+    let block: i64 = 128;
+    crate::cuda::inner::kernel_launch(
+        CSHA_BWD_UNSCALE_PTX.as_ptr(),
+        CSHA_BWD_UNSCALE_NAME.as_ptr(),
+        [((n_elems as i64) + block - 1) / block, 1, 1],
+        [block, 1, 1],
+        &args,
+        0,
+    )
 }
 
 /// f32 scratch → f16 output conversion kernel used by the CSHA backward
