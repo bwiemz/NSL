@@ -75,10 +75,8 @@ impl WeightDType {
             WeightDType::F64 => f64::from_le_bytes(bytes[..8].try_into().unwrap()),
             WeightDType::I8 => bytes[0] as i8 as f64,
             WeightDType::I32 => i32::from_le_bytes(bytes[..4].try_into().unwrap()) as f64,
-            WeightDType::F8E4M3 | WeightDType::F8E5M2 => {
-                // FP8: interpret as u8 scaled; approximation sufficient for analysis
-                (bytes[0] as f64) / 127.0
-            }
+            WeightDType::F8E4M3 => decode_fp8(bytes[0], 4, 3),
+            WeightDType::F8E5M2 => decode_fp8(bytes[0], 5, 2),
         }
     }
 
@@ -95,6 +93,39 @@ impl WeightDType {
             other => Err(WeightLoadError::UnsupportedDType(other.to_string())),
         }
     }
+}
+
+/// Decode one 8-bit float: a sign bit, `exp_bits` of biased exponent and
+/// `mant_bits` of mantissa, with subnormals at exponent zero.
+///
+/// - E4M3 (`exp_bits = 4`, bias 7) has no infinities. Its top exponent is an
+///   ordinary one, except that the all-ones mantissa there is NaN, so its
+///   largest value is 1.75 × 2⁸ = 448.
+/// - E5M2 (`exp_bits = 5`, bias 15) is IEEE-like: the top exponent holds the
+///   infinities and NaNs, and its largest value is 1.75 × 2¹⁵ = 57344.
+///
+/// The byte used to be read as `byte / 127.0`, which is not a float decode
+/// at all: 0x80, which is −0.0, came out as 1.008, and every negative value
+/// as a positive one above 1.
+fn decode_fp8(byte: u8, exp_bits: u32, mant_bits: u32) -> f64 {
+    let sign = if byte & 0x80 != 0 { -1.0 } else { 1.0 };
+    let exp = i32::from((byte >> mant_bits) & ((1 << exp_bits) - 1));
+    let mant = f64::from(byte & ((1 << mant_bits) - 1)) / f64::from(1u32 << mant_bits);
+    let max_exp = (1 << exp_bits) - 1;
+    let bias = (1 << (exp_bits - 1)) - 1;
+    let ieee_like = exp_bits == 5;
+    if exp == max_exp {
+        if ieee_like {
+            return if mant == 0.0 { sign * f64::INFINITY } else { f64::NAN };
+        }
+        if byte & ((1 << mant_bits) - 1) == (1 << mant_bits) - 1 {
+            return f64::NAN;
+        }
+    }
+    if exp == 0 {
+        return sign * mant * 2f64.powi(1 - bias);
+    }
+    sign * (1.0 + mant) * 2f64.powi(exp - bias)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1090,6 +1121,39 @@ mod tests {
     use super::*;
     use std::collections::HashMap as StdHashMap;
     use std::io::Write;
+
+    /// 8-bit floats decode as floats. The values are worked out from the
+    /// formats' definitions: sign, biased exponent (bias 7 for E4M3, 15 for
+    /// E5M2), mantissa. The old decode was `byte / 127`.
+    #[test]
+    fn fp8_bytes_decode_as_floating_point() {
+        let e4m3 = |b: u8| WeightDType::F8E4M3.to_f64(&[b]);
+        assert_eq!(e4m3(0x00), 0.0);
+        // 0x80 is negative zero; it used to read as 128 / 127 = 1.008.
+        assert_eq!(e4m3(0x80), 0.0);
+        assert!(e4m3(0x80).is_sign_negative());
+        assert_eq!(e4m3(0x38), 1.0); // 0 0111 000
+        assert_eq!(e4m3(0xB8), -1.0);
+        assert_eq!(e4m3(0x3C), 1.5); // 0 0111 100
+        assert_eq!(e4m3(0xC4), -3.0); // 1 1000 100 = -(1.5 × 2)
+        assert_eq!(e4m3(0x08), 0.015625); // smallest normal, 2⁻⁶
+        assert_eq!(e4m3(0x01), 0.001953125); // smallest subnormal, 2⁻⁹
+        assert_eq!(e4m3(0x7E), 448.0); // largest: 1.75 × 2⁸
+        assert!(e4m3(0x7F).is_nan() && e4m3(0xFF).is_nan());
+
+        let e5m2 = |b: u8| WeightDType::F8E5M2.to_f64(&[b]);
+        assert_eq!(e5m2(0x00), 0.0);
+        assert!(e5m2(0x80) == 0.0 && e5m2(0x80).is_sign_negative());
+        assert_eq!(e5m2(0x3C), 1.0); // 0 01111 00
+        assert_eq!(e5m2(0xC0), -2.0); // 1 10000 00
+        assert_eq!(e5m2(0x3E), 1.5); // 0 01111 10
+        assert_eq!(e5m2(0x04), 0.00006103515625); // smallest normal, 2⁻¹⁴
+        assert_eq!(e5m2(0x01), 0.0000152587890625); // smallest subnormal, 2⁻¹⁶
+        assert_eq!(e5m2(0x7B), 57344.0); // largest: 1.75 × 2¹⁵
+        assert_eq!(e5m2(0x7C), f64::INFINITY);
+        assert_eq!(e5m2(0xFC), f64::NEG_INFINITY);
+        assert!(e5m2(0x7D).is_nan());
+    }
 
     /// Helper: write a minimal safetensors file with one f32 tensor.
     fn write_temp_safetensors(name: &str, shape: &[usize], data_f32: &[f32]) -> tempfile::TempPath {
