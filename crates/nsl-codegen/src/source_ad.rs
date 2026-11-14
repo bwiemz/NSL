@@ -656,6 +656,14 @@ impl AdjointGenerator {
             //   dW  += x.T @ dy
             //   dA  += x.T @ dy_sc @ B.T
             //   dB  += (x @ A).T @ dy_sc
+            //
+            // `x` may carry leading dimensions (`[batch, seq, k]`), which the
+            // 2-D W, A and B were broadcast across: each of their gradients
+            // is then a batched product with those dimensions still on it,
+            // and is summed over them (`reduce_to`), as the plain matmul rule
+            // does. Without the sum an adapter on a 3-D activation produced a
+            // weight gradient of `[batch, k, n]` and the optimizer step
+            // aborted on the length.
             if let PrimalOp::FusedLoraMatmul { scale, .. } = op.op {
                 let x = op.inputs[0];
                 let w = op.inputs[1];
@@ -674,13 +682,16 @@ impl AdjointGenerator {
                 let xa_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![xa]);
 
                 let dw = self.emit_op(PrimalOp::Matmul, vec![x_t, dy]);
+                let dw = self.reduce_to(dw, w);
                 self.accumulate_adjoint(w, dw);
 
                 let xt_dysc = self.emit_op(PrimalOp::Matmul, vec![x_t, dy_sc]);
                 let da = self.emit_op(PrimalOp::Matmul, vec![xt_dysc, b_t]);
+                let da = self.reduce_to(da, a);
                 self.accumulate_adjoint(a, da);
 
                 let db = self.emit_op(PrimalOp::Matmul, vec![xa_t, dy_sc]);
+                let db = self.reduce_to(db, b_in);
                 self.accumulate_adjoint(b_in, db);
 
                 let dx_base = self.emit_op(PrimalOp::Matmul, vec![dy, w_t]);
@@ -698,7 +709,10 @@ impl AdjointGenerator {
             //   dxw = dy * gamma
             //   dx  += dxw @ W.T
             //   dW  += x.T @ dxw
-            //   dgamma += ReduceSum(dy * (x @ W), axis=0)
+            //   dgamma += dy * (x @ W), summed over every dimension but the last
+            //
+            // W and gamma are summed over x's leading dimensions, as in the
+            // LoRA rule above (the gamma sum used to be over axis 0 only).
             if let PrimalOp::FusedIa3Matmul { .. } = op.op {
                 let x = op.inputs[0];
                 let w = op.inputs[1];
@@ -712,13 +726,14 @@ impl AdjointGenerator {
                 let w_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![w]);
 
                 let dw = self.emit_op(PrimalOp::Matmul, vec![x_t, dxw]);
+                let dw = self.reduce_to(dw, w);
                 self.accumulate_adjoint(w, dw);
 
                 let dx = self.emit_op(PrimalOp::Matmul, vec![dxw, w_t]);
                 self.accumulate_adjoint(x, dx);
 
                 let dy_xw = self.emit_op(PrimalOp::Mul, vec![dy, xw]);
-                let dgamma = self.emit_op(PrimalOp::Sum { dim: Some(0) }, vec![dy_xw]);
+                let dgamma = self.reduce_to(dy_xw, gamma);
                 self.accumulate_adjoint(gamma, dgamma);
                 continue;
             }
@@ -742,11 +757,13 @@ impl AdjointGenerator {
             //   dW  += Matmul(x.T, dy)
             //   dA  += Matmul(Matmul(x.T, dy_sig_sc), B.T)
             //   dB  += Matmul(xa.T, dy_sig_sc)
-            //   dgate += ReduceSum(dy * xab * sig_prime, axis=0) * scale
+            //   dgate += (dy * xab * sig_prime, summed over every dimension
+            //            but the last) * scale
             //
             // Load-bearing:
             //   - dy_sig is elementwise Mul with broadcast, NOT Matmul.
-            //   - dgate reduces over axis=0 (batch); shape drops [B,N] -> [N].
+            //   - dgate, dW, dA and dB are summed over x's leading
+            //     dimensions (`reduce_to`), as in the LoRA rule above.
             //   - scale is applied once (into dy_sig_sc) and reused.
             if let PrimalOp::FusedGatedLoraMatmul { scale, .. } = op.op {
                 let x = op.inputs[0];
@@ -769,15 +786,18 @@ impl AdjointGenerator {
 
                 let x_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![x]);
                 let dw = self.emit_op(PrimalOp::Matmul, vec![x_t, dy]);
+                let dw = self.reduce_to(dw, w);
                 self.accumulate_adjoint(w, dw);
 
                 let b_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![b_in]);
                 let xt_dysigsc = self.emit_op(PrimalOp::Matmul, vec![x_t, dy_sig_sc]);
                 let da = self.emit_op(PrimalOp::Matmul, vec![xt_dysigsc, b_t]);
+                let da = self.reduce_to(da, a);
                 self.accumulate_adjoint(a, da);
 
                 let xa_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![xa]);
                 let db = self.emit_op(PrimalOp::Matmul, vec![xa_t, dy_sig_sc]);
+                let db = self.reduce_to(db, b_in);
                 self.accumulate_adjoint(b_in, db);
 
                 let w_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![w]);
@@ -790,7 +810,7 @@ impl AdjointGenerator {
 
                 let dy_xab = self.emit_op(PrimalOp::Mul, vec![dy, xab]);
                 let dy_xab_sp = self.emit_op(PrimalOp::Mul, vec![dy_xab, sig_prime]);
-                let reduced = self.emit_op(PrimalOp::Sum { dim: Some(0) }, vec![dy_xab_sp]);
+                let reduced = self.reduce_to(dy_xab_sp, gate);
                 let dgate = self.emit_op(PrimalOp::Mul, vec![reduced, scale_c]);
                 self.accumulate_adjoint(gate, dgate);
                 continue;
