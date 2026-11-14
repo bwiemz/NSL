@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **`train(..., schedule_unit = "micro_batch" | "optimizer_step")`**, and
+  the same key on `distill(...)`. What one step of the `scheduler:`
+  section counts under `grad_accumulation`.
+  The default on this channel is unchanged (micro-batches). Later
+  toolchains default to optimizer steps, so the key is here to let one
+  script state its unit and mean the same thing on both; the recipes
+  pinned to this channel state it. A block that combines a stepped
+  schedule with accumulation and leaves the unit out gets a compile-time
+  warning. A checkpoint is refused on resume when the unit changed.
 - **`tools/refcheck`: NSL against PyTorch.** A PyTorch twin of `NSLCoder`
   that loads an `.nslm`, and three checks built on it: per-parameter
   gradients (`grad_check.py`), AdamW updates and the learning rate applied

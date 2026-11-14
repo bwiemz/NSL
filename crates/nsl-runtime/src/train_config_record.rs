@@ -25,7 +25,7 @@
 //!    A resume under different values is not a continuation and nothing
 //!    downstream can tell. ABORT, no escape; `model_load(...)` is the
 //!    documented weights-only warm start.
-//!  * **trajectory** (`lr, sched, sp1, sp2, sp3, clip`): these change the
+//!  * **trajectory** (`lr, sched, sp1, sp2, sp3, clip, sched_unit`): these change the
 //!    FUTURE trajectory, not the meaning of restored state — and the
 //!    repo's own history is full of deliberate mid-resume lr experiments.
 //!    ABORT by default naming `NSL_RESUME_ALLOW_TRAJECTORY_DRIFT=1`, which
@@ -158,8 +158,24 @@ mod tests {
         );
         assert_eq!(
             TRAJECTORY_KEYS,
-            &["lr", "sched", "sp1", "sp2", "sp3", "sp4", "sp5", "sp6", "clip"],
+            &["lr", "sched", "sp1", "sp2", "sp3", "sp4", "sp5", "sp6", "clip", "sched_unit"],
         );
+    }
+
+    /// A checkpoint saved with the schedule counting micro-batches (no
+    /// `sched_unit` in the record) and resumed counting optimizer steps is
+    /// a trajectory change, not a silent one.
+    #[test]
+    fn a_changed_schedule_unit_is_a_trajectory_difference() {
+        let saved = "opt=adamw,lr=0.0001,accum=4,sched=step_lr,sp1=10,sp2=0.5";
+        let live = "opt=adamw,lr=0.0001,accum=4,sched=step_lr,sp1=10,sp2=0.5,sched_unit=optimizer_step";
+        let t = trajectory_diff(saved, live);
+        assert_eq!(t.len(), 1, "{t:?}");
+        assert_eq!(t[0].key, "sched_unit");
+        assert_eq!(t[0].saved, "<absent>");
+        assert_eq!(t[0].live, "optimizer_step");
+        assert!(moment_diff(saved, live).is_empty());
+        assert!(trajectory_diff(saved, saved).is_empty());
     }
 
     #[test]

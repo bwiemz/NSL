@@ -2914,6 +2914,66 @@ fn distill_epochs_zero_is_refused_like_train() {
     );
 }
 
+/// A distill block runs the train loop, so the unit of its schedule under
+/// accumulation is the same question: it can be stated, a bad value is
+/// refused by name, and leaving it out beside a stepped schedule warns.
+#[test]
+fn distill_takes_and_checks_schedule_unit_like_train() {
+    let with_schedule = |header: &str| {
+        distill_fixture(header).replace(
+            "    optimizer: SGD(lr = 0.01)\n",
+            "    optimizer: SGD(lr = 0.01)\n    scheduler: step_lr(step_size = 2, gamma = 0.5)\n",
+        )
+    };
+    let diags = |src: &str| -> (Vec<String>, Vec<String>) {
+        let all = check_source(src);
+        let pick = |level_is_error: bool| {
+            all.iter()
+                .filter(|d| matches!(d.level, nsl_errors::Level::Error) == level_is_error)
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+        };
+        (pick(true), pick(false))
+    };
+
+    let (errs, other) = diags(&with_schedule(
+        "distill(teacher = t, student = s, epochs = 1, grad_accumulation = 2):",
+    ));
+    assert!(errs.is_empty(), "{errs:?}");
+    assert!(
+        other.iter().any(|m| m.contains("the learning-rate schedule counts micro-batches, not optimizer steps")),
+        "no warning about the unit: {other:?}"
+    );
+
+    for unit in ["micro_batch", "optimizer_step"] {
+        let (errs, other) = diags(&with_schedule(&format!(
+            "distill(teacher = t, student = s, epochs = 1, grad_accumulation = 2, \
+             schedule_unit = \"{unit}\"):"
+        )));
+        assert!(errs.is_empty(), "{unit}: {errs:?}");
+        assert!(
+            !other.iter().any(|m| m.contains("the learning-rate schedule counts")),
+            "{unit}: warned although the unit is stated: {other:?}"
+        );
+    }
+
+    let (errs, _) = diags(&with_schedule(
+        "distill(teacher = t, student = s, epochs = 1, grad_accumulation = 2, \
+         schedule_unit = \"steps\"):",
+    ));
+    assert!(
+        errs.iter().any(|m| m.contains("distill 'schedule_unit' must be")),
+        "{errs:?}"
+    );
+
+    // No schedule that reads the step: nothing to state.
+    let (errs, other) = diags(&distill_fixture(
+        "distill(teacher = t, student = s, epochs = 1, grad_accumulation = 2):",
+    ));
+    assert!(errs.is_empty(), "{errs:?}");
+    assert!(!other.iter().any(|m| m.contains("the learning-rate schedule counts")), "{other:?}");
+}
+
 #[test]
 fn distill_duplicate_config_key_is_refused_at_check_time() {
     // Without this, a duplicated key passed `nsl check` and refused only at
