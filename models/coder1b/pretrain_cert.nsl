@@ -10,9 +10,11 @@
 #   B  A + --stream-arena
 #   C  B + --stream-prefetch
 #   D  C + --stream-async-writeback
-#   E  D + --checkpoint-stride auto
-#   F  E + --fuse-rmsnorm-backward
+#   F  D + --fuse-rmsnorm-backward
 #   G  all (== F)
+# (There is no arm E: it added --checkpoint-stride auto, which on this model
+# resolved to stride 1 without saying so and is now refused, because the RoPE
+# tables inside the blocks have no static size.)
 #
 # Harness markers: CERT_TOKENS_PATH.
 

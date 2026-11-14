@@ -3657,12 +3657,11 @@ fn lower_single_op(
         PrimalOp::Passthrough(name) => {
             match name.as_str() {
                 // CCR compressed saves (paper phases 5-6): spliced by
-                // ccr::append_compressed_saves / apply_to_adjoint AFTER
+                // ccr::insert_compressed_saves / apply_to_adjoint AFTER
                 // adjoint generation — never differentiated (the ad_rules
                 // default arm yields no adjoint, which is correct: these
                 // wrap saved-for-backward-only tensors).
-                "ccr_cast_fp16" => call(compiler, builder, "nsl_tensor_to_fp16", &[inputs[0]]),
-                "ccr_cast_bf16" => call(compiler, builder, "nsl_tensor_to_bf16", &[inputs[0]]),
+                "ccr_cast_bf16" => call(compiler, builder, "nsl_ccr_compress_bf16", &[inputs[0]]),
                 "ccr_cast_f32" => call(compiler, builder, "nsl_tensor_to_f32", &[inputs[0]]),
                 // CCR recompute-clone bracket: a recompute clone replays an
                 // original FORWARD op (e.g. `silu(x)`) but is spliced into
@@ -3677,6 +3676,11 @@ fn lower_single_op(
                     let v = builder.ins().iconst(cl_types::I64, i64::from(on));
                     call(compiler, builder, "nsl_set_inplace_suppressed", &[v])
                 }
+                // CCR: the shape and device of a block interior, captured
+                // just before it is freed, for a backward that reads the
+                // interior only as the target of a `reduce_to_shape`
+                // (see ccr::apply_to_adjoint).
+                "ccr_shape_stub" => call(compiler, builder, "nsl_tensor_shape_stub", &[inputs[0]]),
                 "shape" => call(compiler, builder, "nsl_tensor_shape", &[inputs[0]]),
                 // Item 4: a `.shape` read whose answer the compiler proved,
                 // rewritten by the fused-LM-head inference so the tensor it

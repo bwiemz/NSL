@@ -766,7 +766,7 @@ const TIER_C: &[FireCase] = &[
             "--layerwise-accum",
             "--checkpoint-selective",
             "--checkpoint-compress",
-            "fp16",
+            "bf16",
         ],
         fragment: "--layerwise-accum is incompatible with --checkpoint-compress",
         control: TIER_C_BASE,

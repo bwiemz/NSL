@@ -47,6 +47,20 @@
 /// `requires = "checkpoint_blocks"`; this is the value-domain check. Invalid or
 /// zero values fall back to `Fixed(1)` (per-block) with a stderr note rather
 /// than aborting the build.
+/// clap value parser for `--checkpoint-stride`: `auto`, `dp` or an integer
+/// >= 1. Anything else used to be accepted with a note and run at stride 1.
+pub(crate) fn checkpoint_stride_arg(s: &str) -> Result<String, String> {
+    let t = s.trim();
+    if t.eq_ignore_ascii_case("auto")
+        || t.eq_ignore_ascii_case("dp")
+        || t.parse::<usize>().is_ok_and(|n| n >= 1)
+    {
+        Ok(s.to_string())
+    } else {
+        Err("expected `auto`, `dp` or an integer of at least 1".to_string())
+    }
+}
+
 pub(crate) fn parse_checkpoint_stride(s: &str) -> nsl_codegen::CheckpointStride {
     use nsl_codegen::CheckpointStride;
     let t = s.trim();
@@ -72,6 +86,19 @@ pub(crate) fn parse_checkpoint_stride(s: &str) -> nsl_codegen::CheckpointStride 
 mod stride_tests {
     use super::parse_checkpoint_stride;
     use nsl_codegen::CheckpointStride;
+
+    /// What clap accepts for `--checkpoint-stride`. `0` and anything that
+    /// is not a stride used to be accepted with a note and run at stride 1.
+    #[test]
+    fn the_flag_rejects_what_is_not_a_stride() {
+        use super::checkpoint_stride_arg;
+        for ok in ["auto", "AUTO", "dp", "1", "4", " 8 "] {
+            assert_eq!(checkpoint_stride_arg(ok), Ok(ok.to_string()), "{ok:?}");
+        }
+        for bad in ["0", "-2", "nope", "2.5", ""] {
+            assert!(checkpoint_stride_arg(bad).is_err(), "{bad:?} was accepted");
+        }
+    }
 
     #[test]
     fn parses_auto_and_integers_and_falls_back() {

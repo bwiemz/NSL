@@ -1392,21 +1392,27 @@ pub struct CheckpointOptions {
     /// block are freed after the forward and recomputed just before that
     /// block's adjoint runs — activation residency drops from
     /// O(layers x interiors) to O(layers x boundaries + one block).
-    /// Bit-exact (same kernels, same order, same inputs); Dropout results
-    /// and CSHA-claimed chains are force-saved. No-ops with a loud stderr
-    /// note when the tape has no `blocks.N` structure.
+    /// Bit-exact (same kernels, same order, same inputs); Dropout results,
+    /// random draws and CSHA-claimed chains are force-saved.
     pub blocks: bool,
     /// CCR P1.b: with `blocks`, use the SELECTIVE policy —
     /// matmul-class outputs stay saved, only cheap bandwidth-bound ops
     /// (norms, RoPE, elementwise, softmax, reshapes) are replayed. Less
     /// memory reduction than the block policy at near-zero recompute cost.
     pub selective: bool,
-    /// CCR P1.c (`--checkpoint-budget-mib`): allowed SAVED-interior bytes.
-    /// The per-tensor SAVE/RECOMPUTE knapsack (ccr::apply_budget) flips the
-    /// highest-value tensors back to SAVE within this budget, minimizing
-    /// recompute cost. Under FASE Deferred the C-01 credit (the gradient
-    /// buffer Deferred never materializes) is added when parameter sizes
-    /// are statically known. None = pure policy decision, no arbitration.
+    /// CCR P1.c (`--checkpoint-budget-mib`). Its meaning depends on
+    /// `stride`, and it is used once:
+    ///
+    ///   - at a fixed stride it is the allowed SAVED-interior bytes: the
+    ///     per-tensor SAVE/RECOMPUTE knapsack (`ccr::apply_budget`) flips
+    ///     the tensors that cost most to recompute back to SAVE within it;
+    ///   - under `Auto` and `Dp` it is the cap on the projected
+    ///     block-activation peak the search honours, and the knapsack does
+    ///     not run.
+    ///
+    /// It is the number given, in MiB; nothing is added to it. Both uses
+    /// need static tensor sizes and the build fails without them.
+    /// None = pure policy decision, no arbitration.
     pub budget_mib: Option<u64>,
     /// Item 8 (`--checkpoint-stride N|auto`): periodic checkpointing. With
     /// `Fixed(k)`, CCR coalesces every `k` transformer-block anchors into one
@@ -1414,22 +1420,24 @@ pub struct CheckpointOptions {
     /// the k-block span. Trades recompute for a k× smaller saved-boundary
     /// surface (the activation surface CSLA buffers across the accumulation
     /// window). `Auto` searches strides with `ccr::project_activation_peak`
-    /// and picks the smallest projected peak within `budget_mib`
-    /// (or the min-peak stride if none fits). `Fixed(1)` = classic per-block.
+    /// and picks the smallest stride whose projected peak is within
+    /// `budget_mib` (the min-peak stride if none fits, or if no budget was
+    /// given). `Fixed(1)` = classic per-block.
     /// Bit-exact regardless of stride (recompute replays the same kernels).
     ///
-    /// NOTE: under `Auto`, `budget_mib` is consulted twice with two
-    /// meanings — first as a peak-concurrent-activation budget to pick the
-    /// stride (`select_stride`), then as a saved-interior-bytes budget by the
-    /// per-tensor knapsack (`ccr::apply_budget`). Both keep the plan valid (the
-    /// number is a soft target, not a hard cap), so the dual use is safe but
-    /// deliberate; unifying them is future work (the full DP scheduler).
+    /// The projected peak is of the tensors computed inside the blocks
+    /// only: tensors outside them and the temporaries of the backward are
+    /// not in it, so it is a figure for ranking strides, not the step's
+    /// peak memory. `Auto` and `Dp` need a static size for every block
+    /// tensor; the build fails when one is missing.
     pub stride: CheckpointStride,
-    /// CCR phases 5-6 (`--checkpoint-compress fp16|bf16`): compress the
-    /// Selective policy's saved matmul-class interiors to half precision
-    /// between forward and backward (cast-on-save, dequant-on-load via the
-    /// CFTP-v7 GPU cast kernels). NOT bit-exact — backward reads rounded
-    /// activations; gated by the repo's 3-4 dp loss-parity standard.
+    /// CCR phases 5-6 (`--checkpoint-compress bf16`): compress the
+    /// Selective policy's saved matmul-class interiors to bf16, each at the
+    /// end of its block segment, and widen it back to f32 before its first
+    /// reader in the backward (the CFTP-v7 GPU cast kernels). NOT bit-exact —
+    /// backward reads rounded activations; gated by the repo's 3-4 dp
+    /// loss-parity standard. `Some("bf16")` is the only accepted value
+    /// (`ccr::COMPRESS_DTYPE`); anything else fails the build.
     pub compress: Option<String>,
     /// Cycle-10 §5.3 paper checkpointing-aware backward (Task 6):
     /// per-function `@checkpoint(policy=...)` policies collected by

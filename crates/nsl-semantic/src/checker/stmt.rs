@@ -804,11 +804,31 @@ impl<'a> TypeChecker<'a> {
                         //                                   fallback marker.
                         // - `policy="none"`               → tape fallback
                         //                                   marker only.
-                        // - `policy="selective"`          → ERROR (reserved
-                        //   `policy="selective_postnorm"`   for §5.3 v2/v3).
-                        //   `policy="custom"`
+                        // - `policy="selective"`          → ERROR (the
+                        //                                   recompute policy
+                        //                                   of a train block
+                        //                                   is chosen with
+                        //                                   --checkpoint-
+                        //                                   selective).
+                        // - `policy="selective_postnorm"` → ERROR (reserved
+                        //   `policy="custom"`               for §5.3 v2/v3).
                         // - any other value               → ERROR (valid-list
                         //                                   diagnostic).
+                        //
+                        // Only a top-level function is a target. On a model
+                        // the decorator used to be accepted with any
+                        // arguments and do nothing (model methods are
+                        // refused in `checker/model.rs`).
+                        if dname == "checkpoint"
+                            && matches!(&stmt.kind, StmtKind::ModelDef(_))
+                        {
+                            self.diagnostics.push(
+                                Diagnostic::error(
+                                    "@checkpoint is not supported on a model: it applies to a top-level function. For block checkpointing of a train block use --checkpoint-blocks and the other --checkpoint-* flags".to_string(),
+                                )
+                                .with_label(deco.span, "unsupported @checkpoint target"),
+                            );
+                        }
                         if dname == "checkpoint"
                             && let StmtKind::FnDef(fn_def) = &stmt.kind
                         {
@@ -886,16 +906,19 @@ impl<'a> TypeChecker<'a> {
                                     self.effect_checker.mark_checkpointed(&fn_name);
                                 }
                                 Some("selective") => {
-                                    // CCR P1.b: publish the Selective
-                                    // policy; the train-block CCR gate
-                                    // (stmt.rs) enables selective
-                                    // block-granular recompute. The
-                                    // CSHA prologue-stamping pass
-                                    // ignores this variant.
-                                    self.effect_checker.mark_checkpointed(&fn_name);
-                                    self.effect_checker.mark_checkpointed_with_policy(
-                                        &fn_name,
-                                        crate::effects::CheckpointPolicy::Selective,
+                                    // Refused. The selective recompute
+                                    // policy belongs to a whole train
+                                    // block, and a decorator on one
+                                    // function cannot scope it: accepted
+                                    // here, it switched the policy on for
+                                    // every train block of the program,
+                                    // including when the step never called
+                                    // the decorated function.
+                                    self.diagnostics.push(
+                                        Diagnostic::error(
+                                            "@checkpoint(policy=\"selective\") is not supported: the selective recompute policy applies to a whole train block and cannot be chosen per function. Pass --checkpoint-blocks --checkpoint-selective instead".to_string(),
+                                        )
+                                        .with_label(policy_arg_span.unwrap_or(deco.span), "unsupported policy")
                                     );
                                 }
                                 Some("selective_postnorm") => {

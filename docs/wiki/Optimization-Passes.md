@@ -72,7 +72,7 @@ The optimization passes that operate on the `WengertList` run inside `compile_tr
 6. **WRGA** — `invoke_wrga_if_enabled`; consumes the `WengertList`; runs dead-gradient elimination (`wrga_prune`), rank allocation (`wrga_roofline`), memory planning (`wrga_memory`), and fusion decisions (`wrga_fusion`).
 7. **CPDT** — `invoke_cpdt_if_enabled`; consumes the `AppliedPlan` from WGGO **when one exists**. It does NOT require one: with no `AppliedPlan` it plans weights-only, which is the path a `distill` block and a loop-bound `train` block take. See the CPDT section below.
 8. **Source-AD adjoint generation + lowering** — `AdjointGenerator` rewrites the pruned `WengertList` into an adjoint program; `wengert_lower` lowers it to Cranelift IR.
-9. **CCR (Compiler-Chosen Recomputation)** — straddles step 8. Its *planning* half (`ccr::plan`, `select_partition_dp`, `apply_budget`) runs on the PRIMAL tape before `AdjointGenerator`, segmenting per transformer block and classifying each result as escaping or interior; its *rewriting* half (`apply_to_adjoint`, `splice_decompress`, `insert_adjoint_last_use_frees`) then early-frees the interiors and splices recompute clones into the generated adjoint. Driven by `--checkpoint-blocks` / `--checkpoint-stride`; see the per-pass description below.
+9. **CCR (Compiler-Chosen Recomputation)** — straddles step 8. Its *planning* half (`ccr::plan`, `select_partition_dp`) runs on the PRIMAL tape before `AdjointGenerator`, segmenting per transformer block and classifying each result as escaping or interior; its *rewriting* half (`apply_budget`, `apply_to_adjoint`, `splice_decompress`, `insert_adjoint_last_use_frees`) reads the generated adjoint to see which interiors the backward needs, then early-frees the interiors and splices recompute clones into it. Driven by `--checkpoint-blocks` / `--checkpoint-stride`; see the per-pass description below.
 10. **Memory planner (M36)** — runs after all user-function bodies are compiled, before `compile_main`. See above.
 
 **Pass ordering is load-bearing.** FASE planning reads `wggo_overrides` from the compiler state, which is set by a prior WGGO run — on a fresh first-pass compile, FASE falls back to `fase::plan` (no overrides). CSHA receives WGGO's `AppliedPlan` (via `WggoOverrides`) so per-layer fusion-level decisions from WGGO are honoured — or rejected with a diagnostic — by CSHA. CPDT does NOT hard-depend on WGGO — `invoke_cpdt_if_enabled` gates on `cpdt_mode` and a configured cluster, and publishes `cpdt_plan` on the weights-only path with `--wggo` absent (pinned by `cpdt_moment_precision_gate::cpdt_without_wggo_activates_weights_only`). What IS ordering-sensitive is that the moment-precision consult must read the channel AFTER it is published; publishing it late is the defect that made CPDT-sourced precision structurally dead until #462/#466 made it visible. The memory planner (M36) must run after `compile_user_functions` and before `compile_main`; reversing this order means the slab-initialization call is emitted before the plan is computed.
@@ -350,15 +350,22 @@ Block-granular activation checkpointing on the decorator-free source-AD path. Th
 
 1. **Segments** the flat inlined primal tape into per-transformer-block ranges using the same `blocks.N` parameter-name prefixes WGGO uses (`wggo_graph::layer_prefix`).
 2. **Classifies** each in-segment result: *escaping* (consumed by a later primal op — the residual stream and anything else crossing the block boundary) stays SAVED; *interior* (consumed only inside the segment and/or by the adjoint) becomes RECOMPUTE.
-3. **Early-frees** the original interiors right after the forward.
-4. **Splices** clones of the interior-producing ops into the adjoint immediately before the first adjoint op that consumes them, remapping those consumers.
+3. **Early-frees** the original interiors, each at the end of its own segment during the forward (after the whole forward under `--layerwise-accum`).
+4. **Splices** clones of the interior-producing ops into the adjoint immediately before the first adjoint op that consumes them, remapping those consumers. Only an interior whose *value* the backward reads is cloned (`backward_reads`). One it reads for shape only — the operand of a residual add, read as the target of a `reduce_to_shape` — is not recomputed: a one-element shape stub captured just before the free stands in for it. One it does not read at all is simply freed.
 5. **Frees** each recomputed tensor right after the last adjoint op that consumes it.
 
-Recompute clones run the same kernels in the same order on the same inputs, so the transform is **bit-exact**. Ops with non-replayable semantics (Dropout — RNG) are force-saved, and segments owned by a CSHA backward claim are exempted (the claim table is keyed by primal `OpId`, which a clone cannot satisfy).
+Recompute clones run the same kernels in the same order on the same inputs, so the transform is **bit-exact**. Ops with non-replayable semantics (Dropout and `randn` — RNG) are force-saved, and segments owned by a CSHA backward claim are exempted (the claim table is keyed by primal `OpId`, which a clone cannot satisfy).
 
-Driven by `--checkpoint-blocks`, with `--checkpoint-selective` (never recompute matmul-class ops), `--checkpoint-budget-mib` (knapsack flips the most expensive-to-recompute tensors back to SAVE within budget), and `--checkpoint-stride` (coalesce every N block anchors into one super-segment; `auto` searches strides against the budget). Codegen integration lives in `stmt.rs` (`CcrPolicy`, `DpCostModel`, `select_partition_dp`, `plan_with_kept_anchors`, `project_activation_peak`).
+Driven by `--checkpoint-blocks`, with:
 
-Fires: **source-AD backward only**, and only on models with `blocks.N`-style structure — otherwise it is a no-op with a stderr note.
+- `--checkpoint-selective`: never recompute matmul-class ops. A plain matrix product the backward reads for shape only is still released at the end of its segment.
+- `--checkpoint-stride N|auto|dp`: coalesce block anchors into super-segments. `N` is a fixed stride; `auto` searches uniform strides and `dp` non-uniform partitions against the projected block-activation peak (`project_activation_peak`), which counts the tensors computed inside the blocks and nothing else.
+- `--checkpoint-budget-mib`: used once. At a fixed stride a knapsack flips the tensors that cost most to recompute (an operation count from their shapes, `recompute_ops`) back to SAVE within the budget; under `auto` and `dp` the number caps the projected peak instead.
+- `--checkpoint-compress bf16` (with `--checkpoint-selective`): store the saved matmul-class activations as bf16, each cast at the end of its segment. Not bit-exact.
+
+`auto`, `dp` and the budget need static tensor sizes. They come from literal shapes and from a DataLoader with literal `batch_size` and `seq_len` and `drop_last=true`, propagated through the forward (`ccr_static_sizes`); the build fails when they do not reach the block tensors. Codegen integration lives in `stmt_train/plan_ccr.rs` and `stmt_train/driver.rs`.
+
+Fires: **source-AD backward only**, and only on models with `blocks.N`-style structure. On any other model, or without `--source-ad`, the build fails: a requested feature may not be silently inert.
 
 ---
 

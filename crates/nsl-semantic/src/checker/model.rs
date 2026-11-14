@@ -390,6 +390,17 @@ impl<'a> TypeChecker<'a> {
                             .resolve(deco.name[0].0)
                             .unwrap_or("")
                             .to_string();
+                        // `@checkpoint` is read on top-level functions
+                        // only (`checker/stmt.rs`). On a method it used to
+                        // be accepted with any arguments and do nothing.
+                        if dname == "checkpoint" {
+                            self.diagnostics.push(
+                                Diagnostic::error(
+                                    "@checkpoint is not supported on a model method: it applies to a top-level function. For block checkpointing of a train block use --checkpoint-blocks and the other --checkpoint-* flags".to_string(),
+                                )
+                                .with_label(deco.span, "unsupported @checkpoint target"),
+                            );
+                        }
                         // `@fp8_compute` on a method is what codegen reads
                         // (compiler/functions.rs); validate it here too.
                         if dname == "fp8_compute" {

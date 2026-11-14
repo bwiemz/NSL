@@ -198,7 +198,7 @@ fn the_uniqueness_belts_and_the_minting_rule_hold() {
     for (file, needle) in [
         (
             "crates/nsl-codegen/src/ccr.rs",
-            "assert_unique_op_ids(\"ccr::append_compressed_saves\")",
+            "assert_unique_op_ids(\"ccr::insert_compressed_saves\")",
         ),
         (
             "crates/nsl-codegen/src/wggo_prune.rs",
@@ -218,7 +218,7 @@ fn the_uniqueness_belts_and_the_minting_rule_hold() {
     let ccr = read("crates/nsl-codegen/src/ccr.rs");
     assert!(
         ccr.contains("primal.fresh_op_id()"),
-        "ccr::append_compressed_saves no longer mints via fresh_op_id"
+        "ccr::insert_compressed_saves no longer mints via fresh_op_id"
     );
     assert!(
         !ccr.contains("letid=primal.ops.len()asu32"),
