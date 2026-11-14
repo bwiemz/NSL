@@ -1506,7 +1506,7 @@ pub static REGISTRY: &[EnvVar] = &[
         "off (unfused adapter ops)",
         Behavior,
         Both,
-        "Set to 1 to compile @adapter sites to the fused call on a pinned sm_80+ target (2-D activations only) and to launch its CUDA kernel at run time."
+        "Set to 1 to compile @adapter sites to the fused call on a pinned sm_80+ target and launch its kernel at run time. Half precision, base product included."
     ),
     var!(
         "NSL_WRGA_GPU_LAUNCH_COUNTER",

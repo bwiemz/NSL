@@ -322,3 +322,40 @@ fn an_adapter_on_a_rank_3_activation_trains_when_the_target_is_pinned() {
         "pinned and unpinned builds trained to different weights"
     );
 }
+
+/// Opting in to the fused adapter kernels says what the opt-in costs: on
+/// the GPU they compute an adapted matmul in half precision, the base
+/// product `x @ W` included. Nothing used to say so.
+#[test]
+fn opting_in_to_the_fused_kernels_warns_about_half_precision() {
+    let source = lora_program(
+        "@adapter(type=lora, target=[\"Toy.w\"], rank=2, alpha=4)",
+        "[3, 4]",
+        12,
+    );
+    let build = |opt_in: bool| -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prog.nsl");
+        std::fs::write(&path, &source).unwrap();
+        let mut cmd = Command::cargo_bin("nsl").unwrap();
+        cmd.env("NSL_STDLIB_PATH", workspace_root().join("stdlib"))
+            .env_remove("NSL_WRGA_FUSED_CUDA")
+            .current_dir(dir.path())
+            .arg("run")
+            .arg(&path)
+            .args(["--source-ad", "--target", "cuda_sm80"]);
+        if opt_in {
+            cmd.env("NSL_WRGA_FUSED_CUDA", "1");
+        }
+        let out = cmd.output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "opt_in={opt_in}:\n{stderr}");
+        stderr
+    };
+    let warned = build(true);
+    assert!(
+        warned.contains("NSL_WRGA_FUSED_CUDA=1") && warned.contains("half precision"),
+        "the opted-in build should warn:\n{warned}"
+    );
+    assert!(!build(false).contains("half precision"), "the default build has nothing to warn about");
+}

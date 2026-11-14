@@ -38,7 +38,7 @@ Every `NSL_*` variable the toolchain reads (173 of them), from the registry in `
 | `NSL_SUM_DIM_SHORT_MAX` | int | integer &gt;= 0 (u64; unparsable → 1); 0 disables both fast routes | 1 | runtime | Max reduce length (elements) routed to the one-thread-per-output sum_dim kernel; 1 is bit-exact, &gt;1 reassociates, 0 disables both. |
 | `NSL_SUM_SQ_BLOCKS` | int | integer &gt;= 1 (i64; else 256) | 256 | runtime | Grid-block cap per tensor for the f64-accumulated gradient sum-of-squares kernel; changes partial-sum order, 1 = single block. |
 | `NSL_SUM_SQ_CPU` | bool | 1 only | off (GPU kernel) | runtime | Set to 1 to compute a GPU tensor's sum of squares with the exact f64 CPU reduction instead of the f32-accumulating kernel. |
-| `NSL_WRGA_FUSED_CUDA` | bool | 1 only (read per call, not cached) | off (unfused adapter ops) | both | Set to 1 to compile @adapter sites to the fused call on a pinned sm_80+ target (2-D activations only) and to launch its CUDA kernel at run time. |
+| `NSL_WRGA_FUSED_CUDA` | bool | 1 only (read per call, not cached) | off (unfused adapter ops) | both | Set to 1 to compile @adapter sites to the fused call on a pinned sm_80+ target and launch its kernel at run time. Half precision, base product included. |
 
 ## perf (29)
 
