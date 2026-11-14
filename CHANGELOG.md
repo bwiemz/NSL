@@ -2082,6 +2082,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   - The false warning that `alpha` is ignored for gated LoRA.
   - `-w`/`--weights` on `nsl run` and `nsl build` now loads the file's tensors into the model (`Model.field`, `field`, or the parameter's path such as `blocks[0].w` / `blocks.0.w`). Previously the compiler specialised code to the file's values while the model kept its initializer: a weight initialised to twos, compiled against an identity file, printed `x` for `x @ self.w`.
   - the M52b weight constant fold freed its constant twice (abort with "invalid tensor handle") and emitted it unaligned.
+  - Under `-w`, `from_hf(repo, m)` counts as overwriting parameters. A program that called it could have its matmul specialised away while running with the HF weights.
+  - The M52b weight fold of BF16/F16 weights produced garbage (2-byte data labelled f32). Folds are computed in f64 and converted to the operands' dtype and device at run time. A broadcast sum of two weights no longer panics the compiler.
+  - Two `@adapter` targets naming the same `Class.field` are a compile error. Previously only the first applied and both saved under the same tensor names.
 - **CCR checkpointing.**
   - `--checkpoint-blocks` no longer recomputes interiors the backward reads only for shape (the product feeding each residual add) or not at all.
   - `--checkpoint-budget-mib` is used once and is the number given: no second application under `--checkpoint-stride auto|dp`, no FASE Deferred credit. The knapsack weighs by operation count instead of 25/4/1 per byte.
@@ -2093,6 +2096,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   - GPTQ (`nsl-runtime` `gptq.rs`, not reachable from NSL): group parameters are taken from the original weights and errors are spread with the Cholesky factor of H⁻¹. Output error is now about a fifth of round-to-nearest (was above it) and matches a NumPy reference.
   - `nsl_nvfp4_quantize` with the Hadamard flag returned transform coefficients; it now returns the reconstruction.
   - KV block quantizers: oversized blocks return an error instead of panicking; `nsl_kv_quantize_and_store` honours its token offset; `nsl_kv_compress_ratio` counts per-block metadata (1.60× / 2.66× for a 4×16×64 block, not 2× / 4×).
+  - A per-channel or per-group `quant` request on a 0-D tensor read past its empty shape; it is refused like an out-of-range axis.
 - **Accumulation (FASE), packing (PCA) and data loading.**
   - Gradient accumulation: a run whose micro-batch count is not a multiple of `grad_accumulation` steps once more at the end on the mean of the micro-batches its last window holds, instead of discarding them. `--layerwise-accum` cannot and prints a warning.
   - `DataLoader(shuffle = true)` permutes sequence windows instead of whole batches, on the plain and the packed path. The order of data in every shuffled run changes; a shuffled checkpoint from before is refused on resume.
@@ -2113,6 +2117,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   - `print` of a tensor the checker could not type prints the tensor; `for block in self.blocks` types the loop variable's fields.
   - `nsl check --cpkd-design-student`: the layer map is spread over the teacher's depth, last to last.
   - `models/coder-rl/train_grpo.nsl` schedule sized to its 210-step run; coder-rl comments corrected.
+  - Source AD resolves a call inside an inlined function or method in the module it was written in (its own functions, then builtins, then imports); an imported body no longer calls the importing module's same-named function, and an imported module's own function named like a builtin is no longer replaced by the builtin.
+  - Inside an inlined free function, names are its parameters and locals only; a parameter named like a model no longer resolves to that model; a model argument sends the function to the tape.
+  - A write through a subscript or a field (`y[i, j] = v`, `obj.field = v`) is no longer silently skipped by source AD. A function containing one is not inlined, and in a block body the block falls back to the tape (a distill block refuses).
 - **CSHA attention kernels.**
   - CSHA fused backward: gradients are f32 from end to end. dO was narrowed to f16 unscaled and dQ, dK, dV, dWq, dWk, dWv were stored as f16, which is zero below 2.98e-8; at dO around 1e-7 dQ was 82–89% wrong.
   - CSHA tensor-core backward (Tier B.2): dO is prescaled by a power of two per (batch, head) slice before its f16 conversion and dQ, dK, dV are unscaled exactly; dS saturates instead of overflowing.
@@ -2123,6 +2130,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   - training through @flash_attention with --csha is now a compile error; the CSHA fused backward's gradients do not match a reference (wrong beyond one tile, fails beyond one head). Compile without --csha to train on the unfused attention.
   - @flash_attention kernels launched at a sequence length that is not a multiple of their tile (64 by default) wrote past the end of their output into a neighbouring tensor; such launches are now refused.
   - the CSHA backward launcher refuses a null projection weight instead of faulting the GPU.
+  - The Tier B.2 CSHA backward also refuses a sequence that is not a multiple of its tiles.
 
 - **Tape AD returned a zero gradient through a fused elementwise chain or
   a `clone`.** Two holes in the autodiff tape, both silent, both in the
@@ -3604,6 +3612,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   - Building with `NSL_WRGA_FUSED_CUDA=1` warns that adapted matmuls run in half precision, base product included.
   - weight-aware rewrites that depend on values (M52b constant fold, near-identity matmul elimination) are made only for parameters the program never writes after loading; refused rewrites are reported. M52d scaling-constant fusion is no longer applied.
   - a binary built with `-w` reads its weights file at run time, from the absolute path given at build time.
+  - Under `-w`, rewrites that depend on weight values use the file's exact values. The `--dead-weight-threshold` approximations (zeroed small values, near-identity treated as identity) apply only when the threshold is passed explicitly.
 - **CCR checkpointing.**
   - `--checkpoint-budget-mib` and `--checkpoint-stride auto|dp` fail the build when the tensors they need have no static size (previously a note and exit 0).
   - `--checkpoint-compress` with nothing to compress fails the build.
@@ -3626,6 +3635,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   - A distill `loss:` section must agree with the block's `fused_kl_ce(...)` call and is an error when nothing consumes it; `feature_weight` and `feature_layers` are refused; call-site alpha/temperature are range-checked by `nsl check`.
   - `--target cpu` distill compiles never lower the fused KL-CE kernel.
   - `nsl_fused_lce_targets_i64_alloc` takes `vocab_size` and a site code.
+  - Inside the `fused_kl_ce` composite, `cross_entropy` is the standard library's NSL body rather than the builtin op.
 - **CSHA attention kernels.**
   - Fused-projection CSHA launches with `d_model > head_dim` are refused; they read across rows and past the save buffer.
   - Tier B.1 launches with batch or heads above 1 are refused.
