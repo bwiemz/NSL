@@ -304,6 +304,17 @@ fn dp_stride_keeps_the_minimum_peak_partition_and_is_bit_exact() {
         "dp fell back to the uniform search:\n{}",
         dp.stderr
     );
+    // The cost model must say whose constants it used. This run is on the
+    // CPU build, where no device can be probed: it used to price every
+    // partition with H100 constants and say nothing.
+    assert!(
+        dp.stderr.contains("the local GPU is not identified")
+            || dp
+                .stderr
+                .contains("cost model uses the local GPU's constants ("),
+        "dp did not say which GPU's constants its cost model used:\n{}",
+        dp.stderr
+    );
     assert_eq!(
         loss_stream(&dp.stdout),
         stride_one_reference(),

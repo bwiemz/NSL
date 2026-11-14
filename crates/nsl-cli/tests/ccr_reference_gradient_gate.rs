@@ -193,7 +193,12 @@ fn section(stdout: &str, name: &str) -> Vec<f64> {
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .map(|l| {
-            let v: f64 = l
+            // A CPU scalar prints bare; a device scalar prints `tensor([x])`.
+            let number = l
+                .strip_prefix("tensor([")
+                .and_then(|rest| rest.strip_suffix("])"))
+                .unwrap_or(l);
+            let v: f64 = number
                 .parse()
                 .unwrap_or_else(|_| panic!("`{l}` in section {name} is not a number"));
             assert!(v.is_finite(), "non-finite value `{l}` in section {name}");
@@ -330,18 +335,106 @@ fn compressed_saves_stay_within_bf16_rounding_of_pytorch() {
     );
 }
 
+/// `--checkpoint-compress fp16` was withdrawn: half precision overflows above
+/// 65504 and the cast did not check the range, so the loss became NaN. The
+/// flag must reject the value, not accept it and compress as before.
+#[test]
+fn fp16_is_not_an_accepted_compression_format() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ccr_reference.nsl");
+    std::fs::write(&path, program(false)).unwrap();
+    let out = Command::cargo_bin("nsl")
+        .unwrap()
+        .env("NSL_STDLIB_PATH", workspace_root().join("stdlib"))
+        .current_dir(dir.path())
+        .arg("run")
+        .arg(&path)
+        .args(["--target", "cpu", "--source-ad", "--checkpoint-blocks"])
+        .args(["--checkpoint-selective", "--checkpoint-compress", "fp16"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "fp16 was accepted:\n{stderr}");
+    assert!(
+        stderr.contains("invalid value 'fp16'") && stderr.contains("--checkpoint-compress"),
+        "expected the flag to reject the value:\n{stderr}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+        "nothing may have run"
+    );
+}
+
+/// The largest absolute difference between a run and the PyTorch literals,
+/// over the losses and every weight probe.
+fn deviation_from_reference(run: &Run) -> f64 {
+    assert_eq!(run.losses.len(), LOSSES.len());
+    assert_eq!(run.weights.len(), 2 * WEIGHTS.len());
+    let losses = run
+        .losses
+        .iter()
+        .zip(LOSSES)
+        .map(|(got, want)| (got - want).abs());
+    let weights = WEIGHTS
+        .into_iter()
+        .enumerate()
+        .flat_map(|(i, (_, sum, probe))| {
+            [
+                (run.weights[2 * i] - sum).abs(),
+                (run.weights[2 * i + 1] - probe).abs(),
+            ]
+        });
+    losses.chain(weights).fold(0.0, f64::max)
+}
+
+/// The largest absolute difference between two runs of the same program.
+fn deviation_between(a: &Run, b: &Run) -> f64 {
+    assert_eq!(a.losses.len(), b.losses.len());
+    assert_eq!(a.weights.len(), b.weights.len());
+    a.losses
+        .iter()
+        .chain(&a.weights)
+        .zip(b.losses.iter().chain(&b.weights))
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f64::max)
+}
+
+/// What the device's own arithmetic costs against the float64 reference, for
+/// the run WITHOUT checkpointing: measured at 6.6e-4 on an RTX PRO 4500
+/// Blackwell (1.0e-4 already on the first loss, a pure forward), against
+/// 1.6e-5 on the CPU. That distance belongs to the device kernels, not to checkpointing,
+/// and this bound only keeps it from growing unnoticed.
+const GPU_REFERENCE_TOLERANCE: f64 = 1e-3;
+
+/// How far a checkpointed device run may be from the plain device run. They
+/// execute the same kernels on the same inputs and were measured identical
+/// to the last printed digit; the allowance is for the device embedding
+/// backward, whose scatter order is not guaranteed to be reproducible.
+const GPU_PARITY_TOLERANCE: f64 = 1e-5;
+
 /// The same comparison with the model on the GPU: the device kernels, the
-/// device shape stubs and the device bf16 casts against the same PyTorch
-/// values. Only the tolerance is asserted, not bit-equality with the plain
-/// run: the device embedding backward is not reproducible run to run.
+/// device shape stubs and the device bf16 casts.
 ///
-/// `cargo test -p nsl-cli --release --features cuda --test
-/// ccr_reference_gradient_gate -- --ignored`
+/// Two things are asserted. The plain device run must match PyTorch within
+/// `GPU_REFERENCE_TOLERANCE`, which is looser than the CPU bound because the
+/// device forward itself differs more from float64.
+/// And every checkpointed device run must match the plain device run within
+/// `GPU_PARITY_TOLERANCE`, which is the property checkpointing owes: it is
+/// far tighter than the reference bound, so a recompute that changed the
+/// gradients cannot hide inside the device's distance from PyTorch.
+///
+/// `cargo test -p nsl-cli --features cuda --test ccr_reference_gradient_gate
+/// -- --ignored --test-threads=1`
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn checkpointed_training_matches_pytorch_gpu() {
-    let none: [&str; 0] = [];
-    assert_matches_reference(&train_on(true, &none), &none, EXACT_TOLERANCE);
+    let plain = train_on(true, &[]);
+    let plain_dev = deviation_from_reference(&plain);
+    eprintln!("[ccr-reference] gpu, no checkpointing: {plain_dev:.3e} from PyTorch");
+    assert!(
+        plain_dev <= GPU_REFERENCE_TOLERANCE,
+        "the plain GPU run is {plain_dev:.3e} from PyTorch"
+    );
     let configurations: [&[&str]; 4] = [
         &["--checkpoint-blocks"],
         &["--checkpoint-blocks", "--checkpoint-selective"],
@@ -355,7 +448,22 @@ fn checkpointed_training_matches_pytorch_gpu() {
             "{flags:?}: the planner printed nothing, so checkpointing did not run:\n{}",
             run.stderr
         );
-        assert_matches_reference(&run, flags, EXACT_TOLERANCE);
+        let (from_reference, from_plain) = (
+            deviation_from_reference(&run),
+            deviation_between(&run, &plain),
+        );
+        eprintln!(
+            "[ccr-reference] gpu, {flags:?}: {from_reference:.3e} from PyTorch, \
+             {from_plain:.3e} from the plain GPU run"
+        );
+        assert!(
+            from_plain <= GPU_PARITY_TOLERANCE,
+            "{flags:?}: the checkpointed GPU run is {from_plain:.3e} from the plain GPU run"
+        );
+        assert!(
+            from_reference <= GPU_REFERENCE_TOLERANCE,
+            "{flags:?}: the checkpointed GPU run is {from_reference:.3e} from PyTorch"
+        );
     }
 }
 
@@ -375,6 +483,12 @@ fn compressed_saves_stay_within_bf16_rounding_of_pytorch_gpu() {
         "the two matrix products of each of the 3 blocks must be compressed:\n{}",
         run.stderr
     );
-    assert_matches_reference(&run, &flags, COMPRESSED_TOLERANCE);
-    assert!((run.losses[0] - LOSSES[0]).abs() <= EXACT_TOLERANCE);
+    let from_reference = deviation_from_reference(&run);
+    eprintln!("[ccr-reference] gpu, bf16 compressed saves: {from_reference:.3e} from PyTorch");
+    assert!(
+        from_reference <= COMPRESSED_TOLERANCE,
+        "the compressed GPU run is {from_reference:.3e} from PyTorch"
+    );
+    // The first loss is a pure forward and is untouched by compression.
+    assert!((run.losses[0] - LOSSES[0]).abs() <= GPU_REFERENCE_TOLERANCE);
 }

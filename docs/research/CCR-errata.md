@@ -358,13 +358,20 @@ a different mechanism not covered here. The planner is
   shape (the operand of a residual add) or not at all is not recomputed.
 
 Recomputation was checked to be bit-identical to the baseline on CPU for
-stride 1, 2 and 3, the selective policy, the budget, `dp` and dropout. GPU
-behaviour was not checked. The CPU end-to-end parity tests are
+stride 1, 2 and 3, the selective policy, the budget, `dp` and dropout. On
+one GPU (an RTX PRO 4500 Blackwell) the block and selective policies,
+stride 2 and `dp` printed the same losses and trained weights as the run
+without
+checkpointing, and the existing GPU parity cases pass; no larger model and
+no other card was run. The CPU end-to-end parity tests are
 `crates/nsl-cli/tests/ccr_checkpoint_parity.rs` and
 `crates/nsl-cli/tests/ccr_checkpoint_activation_parity.rs`. These compare
 NSL with NSL; `crates/nsl-cli/tests/ccr_reference_gradient_gate.rs` compares
 the losses and trained weights of a small model, under each checkpointing
-configuration, with values computed by PyTorch.
+configuration, with values computed by PyTorch. On the CPU the two agree
+to 2e-5; on the GPU the run without checkpointing is itself 7e-4 from
+PyTorch after three steps, which is a property of the device kernels and
+not of checkpointing.
 
 In the shipped recipes, `models/coder500m/pretrain_prod.nsl` uses
 `--checkpoint-blocks` and `models/coder1b/pretrain_prod.nsl` adds

@@ -87,6 +87,19 @@ mod stride_tests {
     use super::parse_checkpoint_stride;
     use nsl_codegen::CheckpointStride;
 
+    /// What clap accepts for `--checkpoint-stride`. `0` and anything that
+    /// is not a stride used to be accepted with a note and run at stride 1.
+    #[test]
+    fn the_flag_rejects_what_is_not_a_stride() {
+        use super::checkpoint_stride_arg;
+        for ok in ["auto", "AUTO", "dp", "1", "4", " 8 "] {
+            assert_eq!(checkpoint_stride_arg(ok), Ok(ok.to_string()), "{ok:?}");
+        }
+        for bad in ["0", "-2", "nope", "2.5", ""] {
+            assert!(checkpoint_stride_arg(bad).is_err(), "{bad:?} was accepted");
+        }
+    }
+
     #[test]
     fn parses_auto_and_integers_and_falls_back() {
         assert_eq!(parse_checkpoint_stride("auto"), CheckpointStride::Auto);
