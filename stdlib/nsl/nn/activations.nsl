@@ -10,7 +10,10 @@ fn relu_act(x: Tensor) -> Tensor:
     return relu(x)
 
 ## Gaussian Error Linear Unit, the activation used by the transformer MLP
-## in `nsl.nn.layers`.
+## in `nsl.nn.layers`. `gelu` is the tanh approximation
+## `0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))` on every
+## device (PyTorch's `gelu(approximate="tanh")`); it is within 4.8e-4 of
+## the exact `x * Phi(x)`.
 fn gelu_act(x: Tensor) -> Tensor:
     return gelu(x)
 

@@ -1097,8 +1097,8 @@ impl AdjointGenerator {
             // --- GELU backward: grad * gelu'(x) ---
             // Fused (Milestone C · p4 GELU fix): a single
             // `nsl_tensor_gelu_backward(grad, x)` launch computing the derivative
-            // of the forward each device actually ran (GPU: sigmoid approx
-            // σ(1.702x)·(1+1.702x·(1−σ)); CPU: tanh-approx, same as tape-AD).
+            // of the forward: the tanh approximation, on every device, the
+            // same derivative tape AD uses.
             //
             // The previous 7-op expansion here was numerically WRONG: its
             // internal temp `kx = Mul(1.702, x)` had refcount 1, and the

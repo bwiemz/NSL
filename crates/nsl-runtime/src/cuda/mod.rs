@@ -6168,17 +6168,11 @@ pub(crate) fn gpu_tanh_backward(grad: i64, saved_out: i64) -> i64 {
 
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_gelu_backward(grad: i64, input: i64) -> i64 {
-    // The derivative of the forward THIS DEVICE ran. The GPU forward is the
-    // sigmoid form `x·σ(1.702x)` (`nsl_gelu_f32`), so its adjoint is
-    // `nsl_gelu_backward_srcad_f32`, the one source AD already uses. The tape
-    // used `nsl_gelu_backward_f32`, the adjoint of the TANH approximation the
-    // CPU forward runs — the gradient of a different function: 1.4% off at
-    // x = 1, 22% at x = -1, 53% at x = -3.
-    gpu_backward_binary(
-        grad, input,
-        kernels::backward_module(nsl_kir::kernels::elementwise::BackwardOp::GeluSrcad),
-        "nsl_gelu_backward_srcad_f32\0",
-    )
+    // The adjoint of `nsl_gelu_f32`, the tanh approximation, which is also
+    // what the CPU computes: GELU is one function on every device, and this
+    // is its one derivative. (The GPU forward used to be the sigmoid form
+    // `x·σ(1.702x)`, with an adjoint of its own.)
+    gpu_backward_binary(grad, input, kernels::gelu_backward_f32_ptx(), "nsl_gelu_backward_f32\0")
 }
 
 #[cfg(feature = "cuda")]
@@ -10412,54 +10406,6 @@ mod dtype_guard_drift {
     }
 }
 
-/// Static drift gate: the GPU forward GELU and its source-AD backward use one
-/// slope.
-///
-/// `nsl_gelu_f32` computes `x·σ(k·x)` and `nsl_gelu_backward_srcad_f32`
-/// computes that function's derivative for a `k` of its own. They did drift
-/// once, while the backward was hand-written: the forward multiplied by
-/// `0f3FD9999A` (1.7) while the backward, every description of the kernel and
-/// the host references used `0f3FD9DB23` (1.702). The GPU finite-difference
-/// test did not notice; its tolerance is wider than the gap. Both are now
-/// built from KIR with `nsl_kir::kernels::elementwise::GELU_SLOPE`; this gate
-/// reads the built modules, so it runs in the CPU lane and still catches a
-/// builder that stops using the shared constant.
-#[cfg(test)]
-mod gelu_slope_drift {
-    use nsl_kir::kernels::elementwise::{backward_ptx, unary_ptx, BackwardOp, UnaryOp, GELU_SLOPE};
-
-    /// The f32 immediates in the module's one `mul` by a baked constant that
-    /// is not `log2(e)`: the slope.
-    fn slope(module: &str, mul: &str) -> u32 {
-        let log2e = "0f3FB8AA3B";
-        let imms: Vec<&str> = module
-            .lines()
-            .map(str::trim)
-            .filter(|l| l.starts_with("mov.f32 ") || l.starts_with(mul))
-            .filter_map(|l| l.split("0f").nth(1))
-            .map(|imm| &imm[..8])
-            .filter(|imm| format!("0f{imm}") != log2e && *imm != "3F800000")
-            .collect();
-        assert_eq!(imms.len(), 1, "exactly one slope immediate: {imms:?}\n{module}");
-        u32::from_str_radix(imms[0], 16).expect("8 hex digits")
-    }
-
-    #[test]
-    fn the_forward_and_its_backward_scale_by_1_702() {
-        let backward = String::from_utf8(backward_ptx(BackwardOp::GeluSrcad)).expect("ASCII");
-        let forward = String::from_utf8(unary_ptx(UnaryOp::Gelu)).expect("ASCII");
-        let want = 1.702_f32.to_bits();
-        assert_eq!(GELU_SLOPE, want, "GELU_SLOPE is 0f{GELU_SLOPE:08X}, not 1.702f (0f{want:08X})");
-        for (name, module, mul) in [("backward", &backward, "mul.rn.f32 "), ("forward", &forward, "mul.f32 ")] {
-            let k = slope(module, mul);
-            assert!(k == want, "the {name}'s slope is 0f{k:08X}, not 1.702f (0f{want:08X})");
-            // The built module carries the constant, once: the slope is not
-            // folded or respelled on the way to PTX.
-            assert_eq!(module.matches(&format!("0f{GELU_SLOPE:08X}")).count(), 1, "{name}: {module}");
-        }
-    }
-}
-
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
@@ -10555,6 +10501,7 @@ mod tests {
         }
         all.push((nsl_kir::kernels::elementwise::CLAMP_BACKWARD_NAME, super::kernels::clamp_backward_f32_ptx(), true));
         all.push((nsl_kir::kernels::elementwise::TANH_NAME, super::kernels::tanh_f32_ptx(), true));
+        all.push((nsl_kir::kernels::elementwise::GELU_NAME, super::kernels::gelu_f32_ptx(), true));
         all.push((nsl_kir::kernels::elementwise::GELU_BACKWARD_NAME, super::kernels::gelu_backward_f32_ptx(), true));
         for op in nsl_kir::kernels::elementwise::RotateHalfOp::ALL {
             all.push((op.kernel_name(), super::kernels::rotate_half_module(op), true));

@@ -1423,12 +1423,11 @@ fn gelu_deriv_cpu(x_ptr: i64) -> i64 {
 }
 
 /// Source-AD GELU backward, fused (Milestone C · p4 GELU fix): one call computing
-/// `grad * gelu'(x)`, where `gelu'` is the derivative of the forward THIS DEVICE
-/// actually ran:
-/// - **GPU**: sigmoid approximation `x·σ(1.702x)` (`nsl_gelu_f32`) →
-///   `nsl_gelu_backward_srcad_f32` computes `σ(1.702x)·(1+1.702x·(1−σ(1.702x)))`.
-/// - **CPU**: tanh approximation (the `nsl_tensor_gelu` CPU loop) →
-///   `gelu_tanh_deriv_*` above (same formula as the tape backward).
+/// `grad * gelu'(x)`, where `gelu'` is the derivative of the tanh
+/// approximation `0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))` -- the function
+/// `nsl_tensor_gelu` computes on every device:
+/// - **GPU**: `nsl_gelu_backward_f32`, the kernel the tape backward launches.
+/// - **CPU**: `gelu_tanh_deriv_*` above (same formula as the tape backward).
 ///
 /// Replaces the source-AD 7-op expansion of `AdjointExpr::GeluBackward`, which
 /// was numerically WRONG: its internal temp `kx = 1.702·x` (refcount 1) was
@@ -1461,8 +1460,8 @@ pub extern "C" fn nsl_tensor_gelu_backward(grad_ptr: i64, x_ptr: i64) -> i64 {
                 let d = crate::cuda::gpu_backward_binary(
                     ones,
                     x_c,
-                    crate::cuda::kernels::backward_module(nsl_kir::kernels::elementwise::BackwardOp::GeluSrcad),
-                    "nsl_gelu_backward_srcad_f32\0",
+                    crate::cuda::kernels::gelu_backward_f32_ptx(),
+                    "nsl_gelu_backward_f32\0",
                 );
                 nsl_tensor_free(ones);
                 nsl_tensor_free(x_c);
@@ -1485,8 +1484,8 @@ pub extern "C" fn nsl_tensor_gelu_backward(grad_ptr: i64, x_ptr: i64) -> i64 {
             let out = crate::cuda::gpu_backward_binary(
                 grad_c,
                 x_c,
-                crate::cuda::kernels::backward_module(nsl_kir::kernels::elementwise::BackwardOp::GeluSrcad),
-                "nsl_gelu_backward_srcad_f32\0",
+                crate::cuda::kernels::gelu_backward_f32_ptx(),
+                "nsl_gelu_backward_f32\0",
             );
             nsl_tensor_free(grad_c);
             nsl_tensor_free(x_c);
@@ -2382,12 +2381,25 @@ mod gelu_backward_tests {
         for p in [x, grad, out] { nsl_tensor_free(p); }
     }
 
-    /// GPU f32: fused kernel vs the host-computed sigmoid-approx derivative
-    /// σ(1.702x)·(1+1.702x·(1−σ)) — the derivative of nsl_gelu_f32's forward.
-    /// Tolerance covers ex2.approx/rcp.approx (~1-2 ulp each).
+    /// The GELU tanh approximation and its derivative, written out in f64
+    /// from the definition (PyTorch's `gelu(approximate="tanh")`), not taken
+    /// from the code under test: `0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))`.
+    #[cfg(feature = "cuda")]
+    fn gelu_tanh_reference(x: f64) -> (f64, f64) {
+        let c = (2.0 / std::f64::consts::PI).sqrt();
+        let k = c * (x + 0.044715 * x * x * x);
+        let t = k.tanh();
+        let value = 0.5 * x * (1.0 + t);
+        let deriv = 0.5 * (1.0 + t) + 0.5 * x * (1.0 - t * t) * c * (1.0 + 3.0 * 0.044715 * x * x);
+        (value, deriv)
+    }
+
+    /// GPU f32: the fused backward kernel vs the derivative of the tanh
+    /// approximation, the function the GPU forward computes (and the CPU).
+    /// Tolerance covers ex2.approx/div.approx (~1-2 ulp each).
     #[test]
     #[cfg(feature = "cuda")]
-    fn gelu_backward_gpu_f32_matches_sigmoid_deriv() {
+    fn gelu_backward_gpu_f32_matches_tanh_deriv() {
         let n = 257usize; // 256-block tail guard
         let xs: Vec<f32> = (0..n).map(|i| (i as f32) * 0.05 - 6.0).collect();
         let gs: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.013).sin() * 2.0).collect();
@@ -2398,9 +2410,7 @@ mod gelu_backward_tests {
         let ot = NslTensor::from_ptr(cpu);
         for i in 0..n {
             let (xv, gv) = (xs[i] as f64, gs[i] as f64);
-            let kx = 1.702_f32 as f64 * xv;
-            let s = 1.0 / (1.0 + (-kx).exp());
-            let expected = gv * (s * (1.0 + kx * (1.0 - s)));
+            let expected = gv * gelu_tanh_reference(xv).1;
             let got = ot.read_scalar_as_f64(i);
             assert!(
                 (got - expected).abs() < 1e-5 * (1.0 + expected.abs()),
@@ -2410,14 +2420,14 @@ mod gelu_backward_tests {
         for p in [x, g, out, cpu] { nsl_tensor_free(p); }
     }
 
-    /// GPU f32 forward (nsl_gelu_f32) vs the host x·σ(1.702x) — the function
-    /// the backward above differentiates. The finite-difference test below
-    /// cannot see the slope: a forward at 1.7 moves its central difference by
-    /// less than that test's tolerance, and one did ship. Here it is ~2.6e-4 at
-    /// x = 1, far outside the ex2.approx/rcp.approx noise this allows.
+    /// GPU f32 forward (nsl_gelu_f32) vs the tanh approximation. The GPU
+    /// forward used to be the sigmoid form `x·σ(1.702x)`, a different
+    /// function from the CPU's: it is about 2e-2 away near x = -2.3, far outside
+    /// the ex2.approx/div.approx noise this allows. The finite-difference
+    /// test below cannot see which function the forward is; this can.
     #[test]
     #[cfg(feature = "cuda")]
-    fn gelu_forward_gpu_f32_matches_sigmoid_form() {
+    fn gelu_forward_gpu_f32_matches_tanh_form() {
         let n = 257usize; // 256-block tail guard
         let xs: Vec<f32> = (0..n).map(|i| (i as f32) * 0.05 - 6.0).collect();
         let x = crate::tensor::nsl_tensor_to_device(make_f32(&xs), 1);
@@ -2429,11 +2439,11 @@ mod gelu_backward_tests {
         let yt = NslTensor::from_ptr(cpu);
         for (i, &xv) in xs.iter().enumerate() {
             let xv = xv as f64;
-            let expected = xv / (1.0 + (-(1.702_f32 as f64) * xv).exp());
+            let expected = gelu_tanh_reference(xv).0;
             let got = yt.read_scalar_as_f64(i);
             assert!(
                 (got - expected).abs() < 1e-5 * (1.0 + expected.abs()),
-                "at {i} (x={xv}): gpu {got} vs x*sigmoid(1.702x) {expected}"
+                "at {i} (x={xv}): gpu {got} vs the tanh approximation {expected}"
             );
         }
         for p in [x, y, cpu] { nsl_tensor_free(p); }
@@ -2487,9 +2497,7 @@ mod gelu_backward_tests {
         let cpu = crate::tensor::nsl_tensor_to_device(out, 0);
         let ot = NslTensor::from_ptr(cpu);
         for (i, &xv) in xs.iter().enumerate() {
-            let kx = 1.702_f32 as f64 * xv as f64;
-            let s = 1.0 / (1.0 + (-kx).exp());
-            let expected = c as f64 * (s * (1.0 + kx * (1.0 - s)));
+            let expected = c as f64 * gelu_tanh_reference(xv as f64).1;
             let got = ot.read_scalar_as_f64(i);
             assert!(
                 (got - expected).abs() < 1e-5 * (1.0 + expected.abs()),
@@ -2500,7 +2508,7 @@ mod gelu_backward_tests {
     }
 }
 
-/// The GPU tanh and the tape-AD GELU adjoint saturate on the device. Both
+/// The GPU tanh and the GELU adjoint saturate on the device. Both
 /// divide with `div.approx.f32`, which returns 0 for a divisor in
 /// `(2^126, 2^128)`. The hand kernels reached that range: tanh returned 0
 /// from about 43.67 up (NaN too), and the adjoint went wrong past `x ≈ 10`.
@@ -2563,15 +2571,17 @@ mod tanh_saturation_gpu_tests {
         let (x, g) = (to_gpu(&xs), to_gpu(&gs));
         let out = crate::cuda::gpu_gelu_backward(g, x);
         let got = to_host(out);
-        let c = |w: u32| f32::from_bits(w) as f64;
+        // The derivative from the definition, not from the kernel's
+        // constants (two of which the hand kernel had wrong).
+        let c = (2.0f64 / std::f64::consts::PI).sqrt();
         for i in 0..xs.len() {
             let (xv, gv) = (xs[i] as f64, gs[i] as f64);
             let deriv = if xv.is_infinite() || xv.abs() > 1e3 {
                 if xv > 0.0 { 1.0 } else { 0.0 }
             } else {
-                let k = c(0x3D12_4925) * xv * xv * xv + c(0x3F4C_422A) * xv;
+                let k = c * (xv + 0.044715 * xv * xv * xv);
                 let t = k.tanh();
-                0.5 * (1.0 + t + xv * (1.0 - t * t) * (c(0x3DD8_ECA1) * xv * xv + c(0x3F4C_422A)))
+                0.5 * (1.0 + t) + 0.5 * xv * (1.0 - t * t) * c * (1.0 + 3.0 * 0.044715 * xv * xv)
             };
             let want = gv * deriv;
             assert!(got[i].is_finite(), "x={xv:e}: {}", got[i]);

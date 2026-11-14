@@ -37,11 +37,30 @@
 //!    old clamp, each select, the quotient's operands and the constants are
 //!    each caught. `div.approx` → `div.rn` is a named equivalent mutant: the
 //!    saturation keeps the divisor out of the flush range.
+//!
+//! The hand adjoint had one more defect, which the saturation work carried
+//! over unseen: two of its three constants were not the tanh
+//! approximation's. Its cubic coefficient was `0f3D124925` (0.0357143,
+//! which is 1/28) where `√(2/π)·0.044715` is 0.0356774, and its squared
+//! slope `0f3DD8ECA1` (0.105920) where three times that is 0.107032. The
+//! reference this gate held it to was built from the same two words, so it
+//! agreed. The KIR adjoint now carries the right constants and is held to
+//! the f64 derivative written from the definition; with the hand kernel's
+//! two words put back it is the hand kernel bit for bit, which is what
+//! "agreement" means below.
+//!
+//! The GELU forward, `nsl_gelu_f32`, is built beside them (`build_gelu`) and
+//! is the function the adjoint differentiates: the tanh approximation
+//! `0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))`. It has no hand-written
+//! predecessor to agree with (the runtime's hand kernel was a different
+//! function, the sigmoid form `x·σ(1.702·x)`), so it is held to the f64
+//! definition over the whole range, and to the same mutations.
 
 use std::collections::HashMap;
 
 use nsl_kir::kernels::elementwise::{
-    gelu_backward_ptx, tanh_ptx, ELEMENTWISE_BLOCK, GELU_BACKWARD_NAME, TANH_NAME, TANH_SATURATION,
+    gelu_backward_ptx, gelu_ptx, tanh_ptx, ELEMENTWISE_BLOCK, GELU_BACKWARD_NAME, GELU_NAME, TANH_NAME,
+    TANH_SATURATION,
 };
 
 #[allow(dead_code)]
@@ -73,12 +92,15 @@ fn trim(s: &str) -> String {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Kernel {
     Tanh,
+    /// The GELU forward. It has the tanh kernel's signature, `(a, c, n)`.
+    Gelu,
     GeluBackward,
 }
 
 fn kir_ptx(k: Kernel) -> String {
     trim(&String::from_utf8(match k {
         Kernel::Tanh => tanh_ptx(),
+        Kernel::Gelu => gelu_ptx(),
         Kernel::GeluBackward => gelu_backward_ptx(),
     })
     .expect("ASCII"))
@@ -87,6 +109,7 @@ fn kir_ptx(k: Kernel) -> String {
 fn hand_ptx(k: Kernel) -> String {
     trim(match k {
         Kernel::Tanh => hand::TANH_F32_PTX,
+        Kernel::Gelu => unreachable!("the GELU forward has no hand-written predecessor"),
         Kernel::GeluBackward => hand::GELU_BACKWARD_F32_PTX,
     })
 }
@@ -105,14 +128,15 @@ fn with_tail(v: &[u32]) -> Vec<u8> {
     b
 }
 
-/// Run `ptx` over `ceil(n / 256) + 1` blocks. Tanh reads `x` and ignores
-/// `g`, and its memory is `[a, c]`. The adjoint's is `[grad, input, out]`.
+/// Run `ptx` over `ceil(n / 256) + 1` blocks. Tanh and the GELU forward
+/// read `x` and ignore `g`, and their memory is `[a, c]`. The adjoint's is
+/// `[grad, input, out]`.
 /// Returns all of global memory.
 fn run(k: Kernel, ptx: &str, g: &[u32], x: &[u32], order: Order) -> Vec<Vec<u8>> {
     let prog = parse(ptx);
     let n = x.len();
     let (mut global, args): (Vec<Segment>, Vec<(&str, u64)>) = match k {
-        Kernel::Tanh => (
+        Kernel::Tanh | Kernel::Gelu => (
             vec![
                 Segment { base: IN0, bytes: with_tail(x) },
                 Segment { base: OUT, bytes: le32(&vec![POISON; n + TAIL]) },
@@ -180,8 +204,26 @@ fn values(n: usize, seed: u64, corners: &[u32], bound: f32) -> Vec<u32> {
         .collect()
 }
 
+/// The cubic coefficient and the squared slope of the tanh's argument, as
+/// the KIR kernels carry them and as the hand adjoint did:
+/// `√(2/π)·0.044715 = 0.0356774` and three times it, against the hand
+/// kernel's 0.0357143 and 0.105920.
+const CUBIC: &str = "0f3D122279";
+const SLOPE_SQUARE: &str = "0f3DDB33B6";
+const HAND_CUBIC: &str = "0f3D124925";
+const HAND_SLOPE_SQUARE: &str = "0f3DD8ECA1";
+
+/// The KIR adjoint with the hand kernel's two wrong constants put back:
+/// the kernel the hand one is compared with, instruction for instruction.
+fn kir_adjoint_with_hand_constants() -> String {
+    let kir = kir_ptx(Kernel::GeluBackward);
+    assert_eq!((kir.matches(CUBIC).count(), kir.matches(SLOPE_SQUARE).count()), (1, 1));
+    kir.replace(CUBIC, HAND_CUBIC).replace(SLOPE_SQUARE, HAND_SLOPE_SQUARE)
+}
+
 /// `k(x)` in the adjoint's operation order, uncontracted, as the
-/// interpreter runs it.
+/// interpreter runs it. With the hand kernel's cubic coefficient, the
+/// larger of the two, so the bound below holds for both kernels.
 fn k_of(x: f32) -> f32 {
     x * x * x * f32::from_bits(0x3D12_4925) + x * f32::from_bits(0x3F4C_422A)
 }
@@ -233,7 +275,7 @@ fn grads(n: usize, seed: u64) -> Vec<u32> {
 fn beyond(k: Kernel) -> Vec<f32> {
     let mut v = match k {
         Kernel::Tanh => vec![43.51, 43.67, 44.0, 50.0, 1e3, 1e30],
-        Kernel::GeluBackward => vec![10.0, 10.1, 10.5, 12.0, 20.0, 100.0, 1e6, 1e19, 1e30],
+        Kernel::Gelu | Kernel::GeluBackward => vec![10.0, 10.1, 10.5, 12.0, 20.0, 100.0, 1e6, 1e19, 1e30],
     };
     v.extend(v.clone().into_iter().map(|x| -x));
     v.extend([f32::MAX, -f32::MAX, f32::INFINITY, f32::NEG_INFINITY]);
@@ -291,7 +333,7 @@ fn the_adjoint_agrees_with_the_hand_kernel_bit_for_bit_inside_the_saturation_poi
         let g = grads(n, j as u64 + 50);
         for order in ORDERS {
             let hand = run(Kernel::GeluBackward, &hand_ptx(Kernel::GeluBackward), &g, &x, order);
-            let kir = run(Kernel::GeluBackward, &kir_ptx(Kernel::GeluBackward), &g, &x, order);
+            let kir = run(Kernel::GeluBackward, &kir_adjoint_with_hand_constants(), &g, &x, order);
             assert!(hand == kir, "n={n} {order:?}: global memory differs");
         }
     }
@@ -355,12 +397,95 @@ fn tanh_tracks_the_f64_function_everywhere() {
     assert_eq!(words(&mem[0])[..xs.len()], xs[..], "the input is untouched");
 }
 
-/// The f64 tanh-approximation GELU derivative, in the kernel's form.
+/// The GELU tanh approximation in f64, from its definition (PyTorch's
+/// `gelu(approximate="tanh")`), not from the kernel's constants.
+fn gelu_tanh(x: f64) -> f64 {
+    0.5 * x * (1.0 + ((2.0 / std::f64::consts::PI).sqrt() * (x + 0.044715 * x * x * x)).tanh())
+}
+
+/// The forward over the whole range: the transition, the saturated tails
+/// (where it is `x` above and `0.5·x·0` below), the infinities and NaN.
+/// What is left against f64 is the tanh's absolute error (2e-7, scaled by
+/// `0.5·|x|` where the tanh is not saturated, `|x|` under 6) and f32
+/// rounding of `k`.
+#[test]
+fn gelu_tracks_the_f64_function_everywhere() {
+    let mut xs: Vec<u32> = values(1000, 7, &GELU_CORNERS, 15.0);
+    xs.extend(beyond(Kernel::Gelu).iter().map(|x| x.to_bits()));
+    xs.extend([0x7FC0_0001, 0xFFC0_0001]);
+    for order in ORDERS {
+        let mem = run(Kernel::Gelu, &kir_ptx(Kernel::Gelu), &[], &xs, order);
+        let y = words(&mem[1]);
+        for (x, y) in xs.iter().zip(&y) {
+            let (x, got) = (f32::from_bits(*x) as f64, f32::from_bits(*y) as f64);
+            let want = gelu_tanh(x);
+            if want.is_nan() {
+                // NaN in, and -inf (`-inf * 0`), as in f64.
+                assert!(got.is_nan(), "gelu({x:e}) = {got:e}, want NaN");
+                continue;
+            }
+            if want.is_infinite() {
+                assert_eq!(got, want, "gelu({x:e})");
+                continue;
+            }
+            assert!(
+                (got - want).abs() <= 4e-6 * (1.0 + want.abs()),
+                "gelu({x:e}) = {got:e}, want {want:e}"
+            );
+        }
+        assert!(y[xs.len()..].iter().all(|&w| w == POISON), "wrote past n");
+        assert_eq!(words(&mem[0])[..xs.len()], xs[..], "the input is untouched");
+    }
+}
+
+/// The sigmoid form the GPU forward used to be, `x·σ(1.702·x)`, is a
+/// different function, and this gate tells them apart: the two are about
+/// 2e-2 apart near x = -2.3, five thousand times the tolerance above.
+#[test]
+fn the_forward_is_not_the_sigmoid_form() {
+    let xs: Vec<u32> = [-3.0f32, -2.3, -1.0, 1.0, 2.0].iter().map(|x| x.to_bits()).collect();
+    let y = out(Kernel::Gelu, &kir_ptx(Kernel::Gelu), &[], &xs);
+    let sigmoid_form = |x: f64| x / (1.0 + (-1.702 * x).exp());
+    let mut worst = 0.0f64;
+    for (x, y) in xs.iter().zip(&y) {
+        let (x, got) = (f32::from_bits(*x) as f64, f32::from_bits(*y) as f64);
+        assert!((got - gelu_tanh(x)).abs() <= 4e-6, "gelu({x}) = {got}");
+        worst = worst.max((got - sigmoid_form(x)).abs());
+    }
+    assert!(worst > 1e-2, "the forward is within {worst:e} of x*sigmoid(1.702x) everywhere tested");
+}
+
+/// The derivative of the GELU tanh approximation in f64, from the
+/// definition: `0.5·(1 + tanh k) + 0.5·x·sech²(k)·k'`, with
+/// `k = √(2/π)·(x + 0.044715·x³)`. Not from the kernel's constants: the
+/// reference used to be built from the hand kernel's own words, two of
+/// which were wrong.
 fn gelu_tanh_deriv(x: f64) -> f64 {
-    let c = |w: u32| f32::from_bits(w) as f64;
-    let k = c(0x3D12_4925) * x * x * x + c(0x3F4C_422A) * x;
+    let c = (2.0 / std::f64::consts::PI).sqrt();
+    let k = c * (x + 0.044715 * x * x * x);
     let t = k.tanh();
-    0.5 * (1.0 + t + x * (1.0 - t * t) * (c(0x3DD8_ECA1) * x * x + c(0x3F4C_422A)))
+    0.5 * (1.0 + t) + 0.5 * x * (1.0 - t * t) * c * (1.0 + 3.0 * 0.044715 * x * x)
+}
+
+/// The hand adjoint's constants were not the function's. Around `|x| = 2`
+/// to `3`, where the cubic term matters and the tanh has not saturated, the
+/// hand kernel is off by parts in a thousand of the derivative's scale; the
+/// KIR kernel is within f32 rounding of it.
+#[test]
+fn the_hand_adjoints_constants_were_not_the_tanh_approximations() {
+    let xs: Vec<f32> = vec![-3.0, -2.5, -2.0, -1.5, 1.5, 2.0, 2.5, 3.0];
+    let bits: Vec<u32> = xs.iter().map(|x| x.to_bits()).collect();
+    let ones = vec![1.0f32.to_bits(); xs.len()];
+    let worst = |ptx: &str| {
+        out(Kernel::GeluBackward, ptx, &ones, &bits)
+            .iter()
+            .zip(&xs)
+            .map(|(y, x)| (f32::from_bits(*y) as f64 - gelu_tanh_deriv(*x as f64)).abs())
+            .fold(0.0, f64::max)
+    };
+    let (hand, kir) = (worst(&hand_ptx(Kernel::GeluBackward)), worst(&kir_ptx(Kernel::GeluBackward)));
+    assert!(kir < 2e-6, "the KIR adjoint is {kir:e} from the derivative");
+    assert!(hand > 1e-4, "the hand adjoint is only {hand:e} from the derivative");
 }
 
 #[test]
@@ -430,9 +555,30 @@ fn the_arithmetic_is_spelled_as_in_the_hand_kernels() {
     let g = kir_ptx(Kernel::GeluBackward);
     assert_eq!((g.matches("setp.gt.f32 ").count(), g.matches("setp.lt.f32 ").count(), g.matches("selp.f32 ").count()), (1, 1, 2));
     assert!(!g.contains("min.f32") && !g.contains("max.f32"), "the adjoint selects, it does not clamp");
-    for c in ["0f3D124925", "0f3F4C422A", "0f3DD8ECA1", "0f3F000000", "0f3FB8AA3B"] {
+    for c in ["0f3F4C422A", "0f3F000000", "0f3FB8AA3B"] {
         assert!(g.contains(c) && hand_ptx(Kernel::GeluBackward).contains(c), "{c}");
     }
+    // The two constants the hand kernel had wrong.
+    for (right, wrong) in [(CUBIC, HAND_CUBIC), (SLOPE_SQUARE, HAND_SLOPE_SQUARE)] {
+        assert!(g.contains(right) && !g.contains(wrong), "{right}");
+        assert!(hand_ptx(Kernel::GeluBackward).contains(wrong), "{wrong}");
+    }
+}
+
+/// The forward keeps the entry name and parameter list the runtime launches
+/// it by, and shares the adjoint's constants: one function, two kernels.
+#[test]
+fn the_forward_keeps_its_entry_name_and_the_adjoints_constants() {
+    let (f, g) = (kir_ptx(Kernel::Gelu), kir_ptx(Kernel::GeluBackward));
+    assert!(f.contains(&format!(".visible .entry {GELU_NAME}(")));
+    let names: Vec<String> = parse_signature(&f).into_iter().map(|(_, n)| n).collect();
+    assert_eq!(names, ["a", "c", "n"]);
+    for c in [CUBIC, "0f3F4C422A"] {
+        assert!(f.contains(c) && g.contains(c), "{c}");
+    }
+    assert_eq!((f.matches("min.f32 ").count(), f.matches("max.f32 ").count()), (1, 1), "k is clamped");
+    assert!(f.contains("0f422E0000") && f.contains("0fC22E0000"), "at the tanh's saturation point");
+    assert_eq!(f.matches("div.approx.f32 ").count(), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -444,6 +590,7 @@ fn the_arithmetic_is_spelled_as_in_the_hand_kernels() {
 fn caught(k: Kernel, mutate: impl Fn(&str) -> String) -> bool {
     let (corners, bound): (&[u32], f32) = match k {
         Kernel::Tanh => (&TANH_CORNERS, sat()),
+        Kernel::Gelu => (&GELU_CORNERS, 15.0),
         Kernel::GeluBackward => (&GELU_CORNERS, GELU_BOUND),
     };
     let mut x = values(257, 3, corners, bound);
@@ -489,12 +636,13 @@ fn keep_arm(ptx: &str, i: usize, arm: usize) -> String {
 #[test]
 fn the_unmutated_kernels_are_not_caught() {
     assert!(!caught(Kernel::Tanh, |p| p.to_string()));
+    assert!(!caught(Kernel::Gelu, |p| p.to_string()));
     assert!(!caught(Kernel::GeluBackward, |p| p.to_string()));
 }
 
 #[test]
 fn relaxing_the_bound_or_ignoring_the_block_index_is_caught() {
-    for k in [Kernel::Tanh, Kernel::GeluBackward] {
+    for k in [Kernel::Tanh, Kernel::Gelu, Kernel::GeluBackward] {
         let p = kir_ptx(k);
         assert_eq!((p.matches("setp.ge.u64 ").count(), p.matches("%ctaid.x;").count()), (1, 1), "{k:?}");
         assert!(caught(k, |p| p.replacen("setp.ge.u64 ", "setp.gt.u64 ", 1)), "{k:?} bound");
@@ -504,7 +652,7 @@ fn relaxing_the_bound_or_ignoring_the_block_index_is_caught() {
 
 #[test]
 fn nudging_an_element_size_is_caught() {
-    for (k, addresses) in [(Kernel::Tanh, 2), (Kernel::GeluBackward, 3)] {
+    for (k, addresses) in [(Kernel::Tanh, 2), (Kernel::Gelu, 2), (Kernel::GeluBackward, 3)] {
         assert_eq!(kir_ptx(k).matches(", 4;").count(), addresses, "{k:?}");
         for i in 0..addresses {
             assert!(caught(k, |p| nudge(p, ", 4;", ", 8;", i)), "{k:?} address {i}");
@@ -533,16 +681,25 @@ fn dropping_either_arm_of_a_select_is_caught() {
 
 #[test]
 fn swapping_the_quotient_or_nudging_a_constant_is_caught() {
-    for k in [Kernel::Tanh, Kernel::GeluBackward] {
+    for k in [Kernel::Tanh, Kernel::Gelu, Kernel::GeluBackward] {
         let swapped = |p: &str| rewrite(p, "div.approx.f32 ", 0, |m, o| format!("{m}{}, {}, {};", o[0], o[2], o[1]));
         assert!(caught(k, swapped), "{k:?} quotient swapped");
         assert!(caught(k, |p| p.replacen("0f3FB8AA3B", "0f3FB8AA3C", 1)), "{k:?} log2(e)");
     }
-    for c in ["0f3D124925", "0f3F4C422A", "0f3DD8ECA1", "0f3F000000"] {
+    for c in [CUBIC, "0f3F4C422A", SLOPE_SQUARE, "0f3F000000"] {
         // Bit 12 of the word: a relative change of 2^-11. A one-ulp nudge
         // of the cubic term's constant moves no output at these magnitudes.
         let bumped = format!("{}{:X}{}", &c[..6], u8::from_str_radix(&c[6..7], 16).unwrap() ^ 1, &c[7..]);
         assert!(caught(Kernel::GeluBackward, |p| p.replacen(c, &bumped, 1)), "{c}");
+    }
+    // The forward: the two constants of the tanh's argument and the half.
+    // (Its saturation constants only matter past |k| = 43.5, where tanh is
+    // already +-1 in f32, so moving them is not observable.)
+    let forward = kir_ptx(Kernel::Gelu);
+    for c in [CUBIC, "0f3F4C422A", "0f3F000000"] {
+        assert_eq!(forward.matches(c).count(), 1, "{c}");
+        let bumped = format!("{}{:X}{}", &c[..6], u8::from_str_radix(&c[6..7], 16).unwrap() ^ 1, &c[7..]);
+        assert!(caught(Kernel::Gelu, |p| p.replacen(c, &bumped, 1)), "forward {c}");
     }
 }
 
@@ -551,7 +708,7 @@ fn swapping_the_quotient_or_nudging_a_constant_is_caught() {
 /// is not.
 #[test]
 fn div_rn_in_place_of_div_approx_is_a_named_equivalent_mutant() {
-    for k in [Kernel::Tanh, Kernel::GeluBackward] {
+    for k in [Kernel::Tanh, Kernel::Gelu, Kernel::GeluBackward] {
         assert!(!caught(k, |p| p.replacen("div.approx.f32 ", "div.rn.f32 ", 1)), "{k:?}");
     }
     let hand = hand_ptx(Kernel::Tanh).replacen("div.approx.f32 ", "div.rn.f32 ", 1);
