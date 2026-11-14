@@ -4799,11 +4799,15 @@ fn lower_fused_linear_ce_forward(
     // shapes, CUDA_ERROR_ILLEGAL_ADDRESS at v49152 (first real e2e
     // engagement of the fused path).
     let expected_rows_v = builder.ins().iconst(cl_types::I64, rows);
+    // The bridge also brings the labels to the kernel's convention: every
+    // negative target becomes the ignore index, a target >= vocab aborts.
+    let tgt_vocab_v = builder.ins().iconst(cl_types::I64, vocab_size as i64);
+    let tgt_site_v = builder.ins().iconst(cl_types::I64, FUSED_TARGETS_SITE_LM_CE);
     let tgt_ptr = call(
         compiler,
         builder,
         "nsl_fused_lce_targets_i64_alloc",
-        &[targets_t, expected_rows_v],
+        &[targets_t, expected_rows_v, tgt_vocab_v, tgt_site_v],
     )?;
     emit_fused_lce_hint_pin(
         compiler,
@@ -5213,11 +5217,13 @@ fn lower_fused_linear_ce_backward_extract(
         // Targets dtype bridge — same s64-vs-f32 contract fix as the
         // forward (see the forward-side comment); freed after the FFI.
         let expected_rows_v = builder.ins().iconst(cl_types::I64, rows);
+        let tgt_vocab_v = builder.ins().iconst(cl_types::I64, vocab_size as i64);
+        let tgt_site_v = builder.ins().iconst(cl_types::I64, FUSED_TARGETS_SITE_LM_CE);
         let tgt_ptr = call(
             compiler,
             builder,
             "nsl_fused_lce_targets_i64_alloc",
-            &[targets_t, expected_rows_v],
+            &[targets_t, expected_rows_v, tgt_vocab_v, tgt_site_v],
         )?;
         emit_fused_lce_hint_pin(
             compiler,
@@ -5381,6 +5387,12 @@ fn lower_fused_linear_ce_backward_extract(
     Ok(result)
 }
 
+/// `site` codes of `nsl_fused_lce_targets_i64_alloc`: which decorator the
+/// call was lowered for, so its refusals name the one the program contains.
+/// Must match `fused_targets_decorator` in the runtime's `fused_linear_ce.rs`.
+const FUSED_TARGETS_SITE_LM_CE: i64 = 0;
+const FUSED_TARGETS_SITE_KL_CE: i64 = 1;
+
 // ─── CPKD fused KL-CE lowering ──────────────────────────────────────────────
 
 /// Shape + loss-constant bundle threaded from the `FusedKlCe` /
@@ -5473,11 +5485,18 @@ fn lower_fused_kl_ce_forward(
     // same 2× overread class fixed on the linear-CE sites. Freed after
     // the FFI below.
     let expected_rows_v = builder.ins().iconst(cl_types::I64, rows);
+    // The bridge also brings the labels to the kernel's convention: every
+    // negative target becomes the ignore index (which is what the masked
+    // mean below treats it as), and a target >= vocab aborts. Before this
+    // a target of -1 gave a NaN loss and a target of `vocab` an infinite
+    // one, and the step updated the student all the same.
+    let tgt_vocab_v = builder.ins().iconst(cl_types::I64, p.vocab_size as i64);
+    let tgt_site_v = builder.ins().iconst(cl_types::I64, FUSED_TARGETS_SITE_KL_CE);
     let tgt_ptr = call(
         compiler,
         builder,
         "nsl_fused_lce_targets_i64_alloc",
-        &[targets_t, expected_rows_v],
+        &[targets_t, expected_rows_v, tgt_vocab_v, tgt_site_v],
     )?;
     emit_fused_lce_hint_pin(
         compiler,
@@ -5668,11 +5687,13 @@ fn lower_fused_kl_ce_backward_extract(
         let bt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[bt_t])?;
         // Targets dtype bridge (review D2c-2) — see the forward site.
         let expected_rows_v = builder.ins().iconst(cl_types::I64, rows);
+        let tgt_vocab_v = builder.ins().iconst(cl_types::I64, p.vocab_size as i64);
+        let tgt_site_v = builder.ins().iconst(cl_types::I64, FUSED_TARGETS_SITE_KL_CE);
         let tgt_ptr = call(
             compiler,
             builder,
             "nsl_fused_lce_targets_i64_alloc",
-            &[targets_t, expected_rows_v],
+            &[targets_t, expected_rows_v, tgt_vocab_v, tgt_site_v],
         )?;
         emit_fused_lce_hint_pin(
             compiler,
