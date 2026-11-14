@@ -1,29 +1,47 @@
-# Gap F — minimal end-to-end CSHA fused-backward smoke with
-# `@flash_attention(head_dim=32)` on a model method.
+# The one program that reaches the CSHA fused attention kernels from NSL
+# source: an `@flash_attention(head_dim=32)` method whose RMSNorm and three
+# projections feed `scaled_dot_product_attention` directly, trained for one
+# SGD step.
 #
-# Pre-Gap-F, this file could not reach the fused CSHA backward from
-# real source:
-#   - DOC-GAP A: `@flash_attention` on `ModelMember::Method` was
-#     silently dropped by the compile_flash_attention_kernels scanner
-#     (only `LayerDecl` decorators were matched).
-#   - DOC-GAP B: `@flash_attention` baked head_dim=64; the Tier C
-#     backward SMEM validator rejected every block_q/block_kv tuple at
-#     that head_dim (~713 KB > 99 KB cap).
-# Gap F fixes both: the scanner now descends into methods AND the
-# decorator accepts `head_dim=N` for N in {32, 64, 128, 256}.  At
-# hd=32 the fused backward fits the SMEM budget and the emitted
-# object contains `nsl_flash_attention_csha_backward` and
-# `nsl_csha_alloc_backward_activations_into`.
+#   nsl run --target cuda --source-ad --csha auto examples/csha_toy_pretrain_hd32.nsl
 #
-# Weight names follow the CSHA boundary-scan convention (wq/wk/wv) so
-# `ProjKind::from_param_name` classifies the chain correctly and the
-# dispatcher can claim the shared SDPA op (Gap D.1).
+# With those flags the train step's attention runs as the fused forward that
+# saves Q, K, V and the softmax statistics (`nsl_flash_attention_csha_with_saves`)
+# and its gradient as the fused backward (`nsl_flash_attention_csha_backward`).
+# Without `--csha` the same program lowers to matmul, softmax, matmul.
+#
+# What makes the chain match:
+#   - `@flash_attention` on the method, with `head_dim=32`: at the default
+#     64 the fused backward does not fit the shared-memory budget.
+#   - The weights are named wq / wk / wv, which is how the boundary scan
+#     tells the projections apart.
+#   - Nothing sits between RMSNorm, the projections and the attention. `x`
+#     is [batch, heads, seq, head_dim]; a reshape into heads would break the
+#     chain, so every head here shares one set of weights.
+#
+# The model and every tensor are placed on the GPU: the fused kernels write
+# on the device and refuse a CPU-resident output.
+#
+# It prints the loss twice (a direct call of the method, then the train
+# step's forward) and two statistics of the update the step applies to each
+# weight. `crates/nsl-cli/tests/csha_toy_pretrain_gate.rs` compares them
+# with PyTorch (`tools/refcheck/csha_toy_literals.py` prints the reference).
+# The inputs are deliberately non-uniform: with `x` and the weights all ones
+# and a loss of `sum(out)` the gradients of Wq and Wk are exactly zero, and
+# a broken backward prints the same thing as a working one. The loss is
+# scaled so that the gradient reaching the attention output is of order
+# 1e-6, the magnitude of a real pretraining step.
+#
+# Not every number is right yet. The loss and the updates of Wk, Wv and the
+# RMSNorm weight along the probe agree with PyTorch; the update of Wq does
+# not, and the squared norms of the Wk and Wv updates are about 12% high.
+# The gate asserts the former and prints the latter.
 
 model TinyAttn:
-    w_norm: Tensor = ones([32])
-    wq: Tensor = ones([32, 32])
-    wk: Tensor = ones([32, 32])
-    wv: Tensor = ones([32, 32])
+    w_norm: Tensor = 1.0 + 0.25 * tensor_sin(arange(0.0, 32.0) * 0.9)
+    wq: Tensor = 0.3 * tensor_sin(arange(0.0, 1024.0) * 0.37).reshape([32, 32])
+    wk: Tensor = 0.3 * tensor_sin(arange(0.0, 1024.0) * 0.53 + 1.0).reshape([32, 32])
+    wv: Tensor = 0.3 * tensor_sin(arange(0.0, 1024.0) * 0.71 + 2.0).reshape([32, 32])
 
     @flash_attention(head_dim=32)
     fn forward(self, x: Tensor) -> Tensor:
@@ -32,17 +50,41 @@ model TinyAttn:
         let k = x_norm @ self.wk
         let v = x_norm @ self.wv
         let scale = 1.0 / sqrt(32.0)
-        # Causal by default; explicit because this is a pretraining toy
-        # and the flag decides whether it can see its own future tokens.
         return scaled_dot_product_attention(q, k, v, scale, causal=true)
 
 let m = TinyAttn()
-let x = ones([32, 32])
+m.to(cuda)
+let x = tensor_sin(arange(0.0, 1024.0) * 0.11).reshape([1, 1, 32, 32]).to(cuda)
+let t = 1.0 + 0.5 * tensor_sin(arange(0.0, 1024.0) * 0.23 + 0.5).reshape([1, 1, 32, 32]).to(cuda)
+let wq0: Tensor = 0.3 * tensor_sin(arange(0.0, 1024.0) * 0.37).reshape([32, 32]).to(cuda)
+let wk0: Tensor = 0.3 * tensor_sin(arange(0.0, 1024.0) * 0.53 + 1.0).reshape([32, 32]).to(cuda)
+let wv0: Tensor = 0.3 * tensor_sin(arange(0.0, 1024.0) * 0.71 + 2.0).reshape([32, 32]).to(cuda)
+let g0: Tensor = 1.0 + 0.25 * tensor_sin(arange(0.0, 32.0) * 0.9).to(cuda)
+let probe: Tensor = tensor_sin(arange(0.0, 1024.0) * 0.19 + 0.3).reshape([32, 32]).to(cuda)
+let gprobe: Tensor = tensor_sin(arange(0.0, 32.0) * 0.19 + 0.3).to(cuda)
+
+let y0: Tensor = m.forward(x)
+print(sum(y0 * y0 * t) * 0.000001)
 
 train(model = m, epochs = 1):
-    optimizer: SGD(lr = 0.001)
+    optimizer: SGD(lr = 100000.0)
     step(batch):
         let out = m.forward(x)
-        let loss = sum(out)
+        let loss = sum(out * out * t) * 0.000001
+    callbacks:
+        on_step(step, loss):
+            print(loss)
 
+let dq: Tensor = m.wq - wq0
+let dk: Tensor = m.wk - wk0
+let dv: Tensor = m.wv - wv0
+let dg: Tensor = m.w_norm - g0
+print(sum(dq * dq))
+print(sum(dq * probe))
+print(sum(dk * dk))
+print(sum(dk * probe))
+print(sum(dv * dv))
+print(sum(dv * probe))
+print(sum(dg * dg))
+print(sum(dg * gprobe))
 print("csha_toy_pretrain_hd32: PASS")
