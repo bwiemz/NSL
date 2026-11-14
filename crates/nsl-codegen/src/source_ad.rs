@@ -6110,10 +6110,9 @@ impl<'a> WengertExtractor<'a> {
                             return self.inline_user_fn(&func_name, &fn_def, args, &input_vars);
                         }
                         nsl_log::nsl_log!(WARN, "source-ad",
-                            "[source-ad] warning: call to '{}' cannot be differentiated at \
-                             compile time: it is neither an operation source AD knows nor a \
-                             function whose body it can inline. This block falls back to \
-                             tape-based AD.",
+                            "[source-ad] warning: unrecognized FFI callee '{}': source AD has \
+                             no rule for it, and it is not a function whose body can be \
+                             inlined. This block falls back to tape-based AD.",
                             func_name
                         );
                         return None;
