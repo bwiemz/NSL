@@ -395,6 +395,77 @@ fn the_shared_answer_is_the_decode_block() {
     }
 }
 
+/// The rotary convention, against values NumPy computed from
+/// `stdlib/nsl/nn/rope.nsl` written out — `x * cos(emb) + rotate_half(x) *
+/// sin(emb)` with `emb = cat(pos * inv_freq, pos * inv_freq)` and
+/// `rotate_half(x) = cat(-x[d/2:], x[:d/2])` — not against this crate's own
+/// `cpu_reference`, which shares the kernel's pairing by construction.
+///
+/// `W_k` is the identity and the norm weight is 1, so the K record the
+/// kernel appends at `pos` is `rope(x / rms(x))`. The kernel used to pair
+/// adjacent elements; the last block shows that convention's answer for
+/// the same input and that the kernel no longer gives it.
+#[test]
+fn the_k_record_is_rotated_as_nsl_models_rotate_it() {
+    let identity = |n: usize| -> Vec<f16> {
+        (0..n * n).map(|i| f16::from_f32(if i / n == i % n { 1.0 } else { 0.0 })).collect()
+    };
+    let x = vec![0.5f32, -1.25, 2.0, 0.75, -0.5, 1.5, -2.0, 0.25];
+    // numpy: xn = x / sqrt(mean(x^2) + 1e-5); then the stdlib formula.
+    // One head of dim 8:
+    let one_head: [(u32, [f32; 8]); 3] = [
+        (0, [0.393177334, -0.982943335, 1.572709337, 0.589766001, -0.393177334, 1.179532002, -1.572709337, 0.196588667]),
+        (3, [-0.333757422, -1.287617176, 1.619175874, 0.589173582, 0.444727799, 0.836370344, -1.524827467, 0.198357078]),
+        (7, [0.554729518, -1.511671909, 1.678857541, 0.588375443, -0.038105039, 0.268926355, -1.458858003, 0.200712179]),
+    ];
+    // Two KV heads of dim 4, each rotated on its own:
+    let two_heads: [(u32, [f32; 8]); 1] =
+        [(3, [-0.611183365, -1.00019137, -1.501485254, 0.560016749, 0.611183365, 1.173104477, 1.501485254, 0.231880861])];
+    // The adjacent-pair convention at pos 3, one head of dim 8:
+    let adjacent_3: [f32; 8] =
+        [-0.250529639, 1.028591715, 1.328178845, 1.028192369, -0.42838107, 1.167207702, -1.573292024, 0.191869661];
+
+    let k_record = |head_dim: u32, heads: u32, pos: u32| -> Vec<f32> {
+        let g = Geometry {
+            d_model: 8,
+            head_dim,
+            n_heads: heads,
+            n_kv_heads: heads,
+            d_ff: 8,
+            per_slot: 8,
+            slots: 1,
+            n_layers: 1,
+            rope_theta: 10000.0,
+            eps: 1e-5,
+        };
+        let mut input = inputs(&g, 1);
+        input.x = x.clone();
+        input.wk = identity(8);
+        input.norm1 = vec![1.0; 8];
+        let mem = run(&kir_ptx(&g), &g, &input, Call { layer: 0, slot: 0, pos }, Order::Ascending);
+        let start = g.record(0, 0, pos as usize) * 2;
+        mem[KV][start..start + 16]
+            .chunks_exact(2)
+            .map(|c| f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+            .collect()
+    };
+    // The record is stored in f16: half an ulp is 2^-11 relative.
+    let close = |got: &[f32], want: &[f32]| got.iter().zip(want).all(|(a, b)| (a - b).abs() <= 6e-4 * (1.0 + b.abs()));
+
+    for (pos, want) in one_head {
+        let got = k_record(8, 1, pos);
+        assert!(close(&got, &want), "one head of 8 at pos {pos}: {got:?}, numpy {want:?}");
+    }
+    for (pos, want) in two_heads {
+        let got = k_record(4, 2, pos);
+        assert!(close(&got, &want), "two heads of 4 at pos {pos}: {got:?}, numpy {want:?}");
+    }
+    let got = k_record(8, 1, 3);
+    assert!(!close(&got, &adjacent_3), "the kernel still pairs adjacent elements: {got:?}");
+    let far: f32 = got.iter().zip(&adjacent_3).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+    assert!(far > 1.0, "the two conventions differ by {far} on this input, far past any rounding");
+}
+
 #[test]
 fn only_the_output_row_and_one_pool_record_are_written() {
     let (g, calls) = cases().remove(0);
