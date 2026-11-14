@@ -282,9 +282,9 @@ CCR is implemented as block-granular recomputation on the source-AD
 `--checkpoint-blocks`, which requires `--source-ad`; without `--source-ad`
 the build fails rather than ignoring the request. The modifiers are
 `--checkpoint-selective`, `--checkpoint-budget-mib`,
-`--checkpoint-stride N|auto|dp` and `--checkpoint-compress fp16|bf16`. A
-`@checkpoint(policy="selective")` decorator is also recognised, on top-level
-functions only; the shipped recipes use the flags.
+`--checkpoint-stride N|auto|dp` and `--checkpoint-compress bf16`. There is
+no decorator form: `@checkpoint(policy="selective")` is refused, as is
+`@checkpoint` on a model or a model method.
 `@checkpoint(policy="full")` belongs to CSHA's attention-prologue recompute,
 a different mechanism not covered here. The planner is
 `crates/nsl-codegen/src/ccr.rs`, driven from
@@ -297,21 +297,27 @@ a different mechanism not covered here. The planner is
   interior to a block are recomputed and tensors escaping it are saved. The
   implementation is right: the MILP was mis-specified (E1) and is
   unnecessary.
-- Memory budget: partial. `--checkpoint-budget-mib` runs a 0/1 knapsack
-  (`apply_budget`) that flips the costliest recompute tensors back to save.
-  The budget is an absolute number of MiB of saved interior bytes, not the
-  proposal's fraction of default, and it acts only where tensor sizes are
-  statically known.
+- Memory budget: partial. At a fixed stride `--checkpoint-budget-mib` runs
+  a 0/1 knapsack (`apply_budget`) that flips the recompute tensors that
+  cost most to recompute back to save. The budget is an absolute number of
+  MiB of saved interior bytes, not the proposal's fraction of default.
+  Under `--checkpoint-stride auto|dp` the same number is instead the cap on
+  the projected peak, and the knapsack does not run. The budget needs
+  statically known tensor sizes and the build fails without them.
 - Choosing how much to recompute: implemented, and not in the proposal.
   `--checkpoint-stride N` saves every N-th block boundary; `auto` searches
   uniform strides (`select_stride`); `dp` runs a Pareto dynamic program over
-  block boundaries (`select_partition_dp`). `auto` and `dp` also need static
-  tensor sizes.
+  block boundaries (`select_partition_dp`). `auto` and `dp` need a static
+  size for every tensor computed inside the blocks and fail the build
+  otherwise. Static sizes come from literal shapes and from a DataLoader
+  with literal batch size and sequence length, carried through the forward
+  (`ccr_static_sizes` in `stmt_train/plan_ccr.rs`).
 - Decisions SAVE_FP, SAVE_CFIP (IF4, IL2, IM3, FP8) and RECOMPUTE: partial.
   Only save and recompute exist per tensor. The flag
-  `--checkpoint-compress fp16|bf16`, which requires `--checkpoint-selective`,
-  casts all of the selective policy's saved matmul outputs to half precision
-  (`append_compressed_saves`); it is all-or-nothing and, as documented, not
+  `--checkpoint-compress bf16`, which requires `--checkpoint-selective`,
+  casts all of the selective policy's saved matmul outputs to bf16, each at
+  the end of its block segment (`insert_compressed_saves`); it is
+  all-or-nothing, accepts f32 activations only and, as documented, is not
   bit-exact. CFIP formats, outlier separation and per-tensor format choice
   are absent.
 - Selective policy: implemented, and not in the proposal.
@@ -320,12 +326,12 @@ a different mechanism not covered here. The planner is
   remainder. This is the PyTorch blog's "Policy 2". It is not Megatron's
   selective recomputation, which recomputes the attention core and saves the
   linear layers.
-- Profile pass measuring costs on the target GPU: absent. Recompute cost is
-  a constant weight of 25, 4 or 1 per output byte by operation class
-  (`recompute_cost_weight`), and the knapsack is exact only relative to
-  those weights; the `dp` mode uses a launch count times a fixed H100
-  specification. Neither side is right: a FLOP estimate, as PyTorch uses, is
-  the reasonable middle.
+- Profile pass measuring costs on the target GPU: absent. For the knapsack
+  the cost of recomputing a tensor is an operation count from its static
+  shapes (`recompute_ops`), the same kind of estimate as PyTorch's `flops`
+  estimator; the `dp` mode uses a launch count times the launch overhead
+  the GPU database records for the local device (H100 constants, with a
+  warning, when the device is not identified). Nothing is measured.
 - `@checkpoint(budget=0.5 | "auto", strategy=…)` on the model: absent.
 - Compile error when the budget is infeasible: absent. The budget is soft;
   when no stride fits, the planner says so and uses the minimum-peak plan.
@@ -333,10 +339,10 @@ a different mechanism not covered here. The planner is
 - CSHA tiers as CCR decision points: the opposite is implemented. Chains
   claimed by CSHA are force-saved and exempt from recomputation (`plan`,
   argument `csha_claimed_ops`).
-- FASE Deferred credit to the budget: implemented in `driver.rs`. The
-  proposal adds the freed gradient-buffer memory to a planner-derived
-  budget; the code adds the parameter bytes to an absolute budget typed by
-  the user, which is questionable.
+- FASE Deferred credit to the budget: absent. The proposal adds the freed
+  gradient-buffer memory to a planner-derived budget. The code used to add
+  the parameter bytes to the absolute budget typed by the user; that was
+  removed, and the budget is the number given.
 - CPFT pruning, CTQS re-solve, M36 planner integration and outlier analysis:
   absent.
 - Stochastic operations (missing from the proposal, E12): dropout masks and
@@ -346,12 +352,19 @@ a different mechanism not covered here. The planner is
   last use in the backward; the project's notes call this the decisive
   memory win. These, with the stride and partition search, are the parts
   that deliver.
+- Recomputing only what the backward reads: implemented for block
+  interiors, and not in the proposal. `backward_reads` classifies each
+  freed interior by how the final adjoint uses it; one read only for its
+  shape (the operand of a residual add) or not at all is not recomputed.
 
 Recomputation was checked to be bit-identical to the baseline on CPU for
 stride 1, 2 and 3, the selective policy, the budget, `dp` and dropout. GPU
 behaviour was not checked. The CPU end-to-end parity tests are
 `crates/nsl-cli/tests/ccr_checkpoint_parity.rs` and
-`crates/nsl-cli/tests/ccr_checkpoint_activation_parity.rs`.
+`crates/nsl-cli/tests/ccr_checkpoint_activation_parity.rs`. These compare
+NSL with NSL; `crates/nsl-cli/tests/ccr_reference_gradient_gate.rs` compares
+the losses and trained weights of a small model, under each checkpointing
+configuration, with values computed by PyTorch.
 
 In the shipped recipes, `models/coder500m/pretrain_prod.nsl` uses
 `--checkpoint-blocks` and `models/coder1b/pretrain_prod.nsl` adds
@@ -389,7 +402,7 @@ Defects found in this code are listed in Part 5.
 The review also ran the code, on CPU only. This part lists what it found
 wrong in the implementation, as distinct from the proposal's own errors in
 Part 1. Fixed items are described in `CHANGELOG.md` under "Unreleased". The
-open list is as of 2026-11-13.
+open list is as of 2026-11-14.
 
 ### Fixed
 
@@ -402,103 +415,116 @@ open list is as of 2026-11-13.
   `crates/nsl-cli/tests/ccr_random_draw_gate.rs`.
 - The wiki's Architecture Overview expanded CCR as "common-kernel
   combination rewriting". It now reads "compiler-chosen recomputation".
+- `--checkpoint-compress fp16` cast the saved activations with no range
+  check: with pre-activations above 65504 the loss was NaN from the second
+  step, while the baseline, the selective policy and `bf16` stayed finite,
+  and `fp16` saved no more bytes than `bf16`. `fp16` was withdrawn; the flag
+  accepts `bf16` only, and bf16 has the exponent range of f32.
+- A compressed save was restored by a cast to f32 whatever dtype the tensor
+  had before it was compressed, so an f64 or half-precision activation would
+  have come back with a different dtype. The compressing cast
+  (`nsl_ccr_compress_bf16`) now accepts f32 only and exits with a message
+  naming the flag for anything else; the test is
+  `crates/nsl-runtime/tests/ccr_compress_dtype_refusal.rs`. No model that
+  reaches the cast with another dtype was found: an f64 model does not take
+  the source-AD path at all.
+- `--checkpoint-budget-mib` and `--checkpoint-stride auto|dp` did nothing
+  unless every tensor shape was literal: the build noted that it had no
+  static sizes, kept stride 1 and full recompute, and exited 0. Even on a
+  fully annotated model a quarter of the block tensors had no size (the
+  result of `rmsnorm` or `silu` has an open shape whatever the `let`
+  binding it says) and counted as zero bytes. Sizes are now carried through
+  the forward from the literal shapes, the model fields and a DataLoader
+  with literal `batch_size` and `seq_len` and `drop_last=true`
+  (`ccr_static_sizes` in `crates/nsl-codegen/src/stmt_train/plan_ccr.rs`),
+  so an unannotated model with such a loader is sized. Where a block tensor
+  still has no size, `auto` and `dp` fail the build, and so does the budget
+  when no recomputed tensor has one. The 1B recipe is such a model: 96 of
+  its 800 block tensors, the rotary-embedding tables, have no static size,
+  so `--checkpoint-stride auto` is refused there, where it used to resolve
+  to stride 1 without saying so.
+- `@checkpoint` on a model or a model method was accepted with any
+  arguments and had no effect. Both are now errors.
+- `@checkpoint(policy="selective")` on a top-level function turned on
+  selective recomputation for the whole train block, whether or not the
+  step called the function, and a step that did call it fell back to tape
+  AD. The policy is refused on a decorator, with a pointer to
+  `--checkpoint-blocks --checkpoint-selective`; the planner no longer reads
+  decorators. The invalid-policy diagnostic, which already listed
+  `"selective"` as refused, is thereby true.
+- Under `--checkpoint-stride auto|dp` the budget was spent twice: it capped
+  the projected peak, then the knapsack flipped up to the same number of
+  bytes back to save. The knapsack now runs at a fixed stride only.
+- Under FASE Deferred all parameter bytes were added to the budget the user
+  typed. The budget is now the number given.
+- `--checkpoint-compress` could not lower the peak at the end of the
+  forward, because the casts were appended after the whole forward and
+  every full-precision save was still live there. Each save is now cast,
+  and its full-precision original freed, at the end of its own block
+  segment (`insert_compressed_saves`). The memory effect was not
+  re-measured.
+- The `dp` cost model used H100 constants on every machine. It now uses the
+  GPU-database entry of the local device when the driver names one; when it
+  does not (no device, a build without CUDA, an unlisted card) it says so
+  and names the constants it falls back to.
+- The `dp` search counted every result of a block as a launch, including
+  saved results that are never recomputed, so where launches dominated
+  every partition cost the same and ties fell to search order. It now
+  counts the results a partition actually recomputes; with a budget every
+  partition fits, it keeps every anchor.
+- `--checkpoint-blocks` recomputed the matrix product feeding each residual
+  add, which the backward reads only for its shape, and recomputed
+  interiors the backward does not read at all. Only an interior whose value
+  the backward reads is recomputed now (`backward_reads` in
+  `crates/nsl-codegen/src/ccr.rs`); one read for shape only is replaced by
+  a one-element stub captured before it is freed. Under
+  `--layerwise-accum` the shape-only case is still recomputed.
+- The knapsack's costs were placeholders: 25, 4 or 1 per output byte, so a
+  score matmul and a d→4d projection weighed the same, and every tensor was
+  charged at least one 256 KiB quantum. The value of keeping a tensor is
+  now an operation count from its static shapes (`recompute_ops`), a tensor
+  the backward would not recompute is never kept, and the budget axis is
+  divided finely enough that a small tensor is charged its own size. It
+  remains an estimate, not a measurement.
+- Under the selective policy the outputs that feed each residual add stayed
+  resident although the backward never reads their values. A plain matrix
+  product the backward reads for shape only is now freed at the end of its
+  segment. This does not apply with `--checkpoint-compress` or
+  `--layerwise-accum`.
+- The `dp` decision line printed "kept 2 of 2 block anchors" when it kept 2
+  of 4. The denominator is now the number of anchors there were to choose
+  from, and the sizes on the `auto` and `dp` lines are printed to two
+  decimals instead of whole MiB.
+- The `dp` and `auto` stride tests could not fail: their fixture had
+  symbolic shapes, so the search never ran. The fixture now has literal
+  shapes and the tests assert the stride and the anchors worked out by hand
+  from them (`crates/nsl-cli/tests/ccr_periodic_stride_gate.rs`).
+- When the baseline was not deterministic from run to run, the GPU parity
+  cases compared only the first loss, a pure forward that recomputation
+  cannot affect. They now compare the whole loss curve within the
+  baseline's own noise band, and a nondeterministic CPU baseline is a
+  failure (`parity_case` in `crates/nsl-cli/tests/ccr_checkpoint_parity.rs`).
+
+The gradients under every checkpointing configuration are now also checked
+against values computed by PyTorch for the same model, in
+`crates/nsl-cli/tests/ccr_reference_gradient_gate.rs`.
 
 ### Open
 
-- `--checkpoint-compress fp16` casts the saved activations with no range
-  check. With pre-activations above 65504 (contrived weights) the loss is
-  NaN from the second step, while the baseline, the selective policy and
-  `bf16` stay finite; `fp16` saves no more bytes than `bf16`. Where:
-  `append_compressed_saves` in `crates/nsl-codegen/src/ccr.rs`. Reproduced
-  by running. Right: check the range on the cast, or remove `fp16`.
-- A compressed save is always restored by a cast to f32, whatever dtype the
-  tensor had before it was compressed. This is suspected to be wrong for a
-  model whose tensors are bf16; no such model was run. Where:
-  `splice_decompress` in `crates/nsl-codegen/src/ccr.rs`. By reading the
-  code only.
-- `--checkpoint-budget-mib` and `--checkpoint-stride auto|dp` do nothing
-  unless every tensor shape is literal: the build notes that it has no
-  static sizes, keeps stride 1 and full recompute, and exits 0; the 1B
-  benchmark notes record this for the stride. Where: `apply_budget` in
-  `crates/nsl-codegen/src/ccr.rs`, `fork_wrga_and_plan_ccr` in
-  `stmt_train/plan_ccr.rs` beside it. Reproduced by running. Right: an error.
-- `@checkpoint` on a model or a model method is accepted with any
-  arguments, for example `policy="bogus_value"` or `budget=0.5`, with no
-  diagnostic and no effect; only top-level functions are examined. Where:
-  `check_stmt` in `crates/nsl-semantic/src/checker/stmt.rs`. Reproduced by
-  running. Right: reject the decorator there until it is supported.
-- `@checkpoint(policy="selective")` on a top-level function that the
-  training step never calls turns on selective recomputation for the whole
-  train block. On a function the step does call, the step cannot be
-  extracted for source AD and falls back to tape AD. Where:
-  `fork_wrga_and_plan_ccr` in
-  `crates/nsl-codegen/src/stmt_train/plan_ccr.rs`. Reproduced by running.
-- Under `--checkpoint-stride auto|dp` the budget is spent twice: it caps
-  the projected peak, then the knapsack flips up to the same number of bytes
-  back to save, so the plan can sit near twice the budget. With 2 MiB, `dp`
-  chose a 1 MiB partition and four tensors were then flipped back. Where:
-  `compile_train_block_inner`, `crates/nsl-codegen/src/stmt_train/driver.rs`.
-  Reproduced by running. Right: skip the knapsack after `auto` or `dp`.
-- Under FASE Deferred all parameter bytes are added to the absolute budget
-  the user typed. A budget derived from free memory measured with FASE
-  Deferred already on is then counted twice; the practical effect was not
-  established. Where: `compile_train_block_inner` in
-  `crates/nsl-codegen/src/stmt_train/driver.rs`. By reading the code only.
-- `--checkpoint-compress` cannot lower the peak at the end of the forward,
-  which is where the project places the peak: the casts are appended after
-  the whole forward, so every full-precision save is still live there. The
-  repository's own table shows 4090 → 4018 MiB at 867 → 4189 ms per
-  micro-batch. Where: `append_compressed_saves` in
-  `crates/nsl-codegen/src/ccr.rs`. By reading the code only.
-- The peak that `auto` and `dp` test against the budget is an under-count:
-  it omits adjoint temporaries, the logits and everything outside the block
-  segments, and counts a tensor of unknown size as zero. "Fits the budget"
-  is a verdict against that figure. Where: `project_activation_peak` in
-  `crates/nsl-codegen/src/ccr.rs`. By reading the code only.
-- The `dp` cost model uses H100 constants on every machine: the target GPU
-  is the fixed string "h100". Where: `dispatch` in
-  `crates/nsl-cli/src/commands/run.rs` and in
-  `crates/nsl-cli/src/commands/build/options.rs`. By reading the code only.
-  Right: use the probed local GPU.
-- The `dp` search counts every result of a block as a launch, including
-  saved results that are never recomputed, so where launches dominate every
-  partition costs the same and ties fall to search order. With a 2 MiB
-  budget it kept anchors `[0, 2]` of four although keeping all four also
-  fits and recomputes less. Where: `select_partition_dp` in
-  `crates/nsl-codegen/src/ccr.rs`. Reproduced by running.
-- `--checkpoint-blocks` recomputes the matrix product feeding each residual
-  add, which the backward reads only for its shape. A four-block
-  feed-forward model ran 35 matmuls per step against 27; one of the two
-  extra per block is needless. Where: `apply_to_adjoint` in
-  `crates/nsl-codegen/src/ccr.rs`. Reproduced by running; the shape-only
-  read is by reading the code only. Right: do not clone such a victim.
-- The knapsack's costs are placeholders: 25, 4 or 1 per output byte, so a
-  score matmul and a d→4d projection weigh the same and the "exact" optimum
-  is a fill by class. Every tensor is also charged at least one 256 KiB
-  quantum. Where: `recompute_cost_weight` and `apply_budget` in
-  `crates/nsl-codegen/src/ccr.rs`. By reading the code only. Right: weigh
-  by FLOPs where shapes are known.
+- The peak that `auto` and `dp` test against the budget counts the tensors
+  computed inside the block segments and nothing else: it omits adjoint
+  temporaries, the logits and everything outside the segments. The decision
+  lines and the help text now say so, and a tensor of unknown size is an
+  error instead of zero bytes, but "fits the budget" is still a verdict
+  against that figure and not against the step's peak memory. Where:
+  `project_activation_peak` in `crates/nsl-codegen/src/ccr.rs`. Right:
+  project the backward's temporaries as well, or rename the budget.
 - The selective policy saves the s×s score matrix of a decomposed attention
-  and recomputes only its softmax. It also keeps resident the outputs that
-  feed each residual add, whose values the backward never reads. Where:
-  `selective_saves` in `crates/nsl-codegen/src/ccr.rs`. By reading the code
-  only.
-- The `dp` decision line prints "kept 2 of 2 block anchors" when it kept 2
-  of 4: the denominator is the coalesced plan's segment count. Where:
-  `fork_wrga_and_plan_ccr` in
-  `crates/nsl-codegen/src/stmt_train/plan_ccr.rs`. Reproduced by running.
-- The diagnostic for an invalid `@checkpoint` policy lists `"selective"` as
-  "(refused)", and the comment above the handler says it is an error; the
-  code accepts it. Where: `check_stmt` in
-  `crates/nsl-semantic/src/checker/stmt.rs`. By reading the code only.
-- The `dp` and `auto` stride tests cannot fail. Their fixture has symbolic
-  shapes, so the search never runs: the tests match text that the fallback
-  warning also prints, and "bit-exact against stride 1" compares stride 1
-  with itself, as does the GPU peak test. Where:
-  `crates/nsl-cli/tests/ccr_periodic_stride_gate.rs`. Reproduced by
-  running. Right: literal shapes; assert the "kept N of M" line.
-- When the baseline is not deterministic from run to run, the GPU parity
-  cases compare only the first loss, a pure forward that recomputation
-  cannot affect. Where: `parity_case` in
-  `crates/nsl-cli/tests/ccr_checkpoint_parity.rs`. By reading the code
-  only. Right: fail or skip explicitly.
+  and recomputes only its softmax. Where: `selective_saves` in
+  `crates/nsl-codegen/src/ccr.rs`. By reading the code only. Which
+  products the policy keeps is a design choice; the budget's knapsack does
+  now weigh a score product by its own cost.
+- The `dp` time estimate is a launch count times a database constant, with
+  a bandwidth floor. It still counts a tensor that is read for shape only
+  as a launch. Where: `select_partition_dp` in
+  `crates/nsl-codegen/src/ccr.rs`.
