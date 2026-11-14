@@ -22,6 +22,10 @@
 //! * backward dx_s/dW_s/dbias_s: max abs err < 1e-4 * max|ref|, per tensor
 //! * skip identity: loss/lse rows and dx_s rows exactly 0 for -100 rows
 //!
+//! `the_device_comparison_catches_wrong_results` runs the same comparison
+//! on results that are wrong (no backward; another temperature; no KL
+//! term) and requires it to report them.
+//!
 //! The gradient tolerance is relative to the tensor's own scale. It used to
 //! be an absolute 5e-3 over inputs drawn from U(-0.3, 0.3): the reference
 //! maxima of dx_s and dW_s were 2.3e-3 and 4.2e-3, so an all-zero gradient
@@ -262,14 +266,25 @@ fn the_reference_tells_the_kl_terms_apart() {
     }
 }
 
-#[allow(clippy::too_many_lines)]
-#[test]
-#[ignore = "requires CUDA GPU"]
-fn fused_kl_ce_gpu_forward_and_backward_match_reference() {
-    if !cuda_available() {
-        return;
+fn cuda_available() -> bool {
+    if std::env::var("NSL_SKIP_CUDA_TESTS").is_ok() {
+        eprintln!("skipping: NSL_SKIP_CUDA_TESTS set");
+        return false;
     }
+    let rc = nsl_cuda_init();
+    if rc != 0 {
+        eprintln!("skipping: nsl_cuda_init returned {rc}");
+        false
+    } else {
+        true
+    }
+}
 
+fn f32_bits(v: f64) -> i64 {
+    (v as f32).to_bits() as i64
+}
+
+fn config() -> FusedKlCeConfig {
     let cfg = FusedKlCeConfig {
         vocab_size: V as u32,
         student_hidden: HS as u32,
@@ -281,213 +296,212 @@ fn fused_kl_ce_gpu_forward_and_backward_match_reference() {
         ignore_index: IGNORE_INDEX,
     };
     cfg.validate().expect("config must be valid");
+    cfg
+}
 
-    let fixture = Fixture::new();
-    let Fixture { xs, ws, bs, xt, wt, bt, targets } = &fixture;
-    let num_valid = targets.iter().filter(|&&t| t != IGNORE_INDEX).count() as i64;
+/// What the device produced for one forward (and, optionally, backward).
+struct Device {
+    loss: Vec<f32>,
+    lse_s1: Vec<f32>,
+    lse_st: Vec<f32>,
+    lse_tt: Vec<f32>,
+    dxs: Vec<f32>,
+    dws: Vec<f32>,
+    dbs: Vec<f32>,
+}
 
-    // f64 reference, written out in this file.
-    let want = reference(&fixture.inputs(), KlTerm::Forward);
-    let (ref_loss, ref_lse_s1, ref_lse_st, ref_lse_tt) = (&want.loss, &want.lse_s1, &want.lse_st, &want.lse_tt);
-    let (ref_dxs, ref_dws, ref_dbs) = (&want.dxs, &want.dws, &want.dbs);
+fn upload<T>(host: &[T]) -> i64 {
+    let bytes = std::mem::size_of_val(host) as i64;
+    let dev = nsl_test_cuda_alloc(bytes);
+    assert_ne!(dev, 0, "device alloc failed");
+    nsl_test_cuda_h2d(dev, host.as_ptr() as i64, bytes);
+    dev
+}
 
-    // PTX.
+fn download(dev: i64, len: usize) -> Vec<f32> {
+    let mut host = vec![0f32; len];
+    nsl_test_cuda_d2h(host.as_mut_ptr() as i64, dev, (len * 4) as i64);
+    host
+}
+
+/// Launch the forward, then the backward unless `run_backward` is false
+/// (the gradient buffers then stay as the caller zero-filled them), with
+/// the given loss constants, and read everything back.
+fn launch(fixture: &Fixture, alpha: f64, temperature: f64, run_backward: bool) -> Device {
+    let cfg = config();
+    let num_valid = fixture.targets.iter().filter(|&&t| t != IGNORE_INDEX).count() as i64;
     let fwd_ptx = synthesize_fused_kl_ce_ptx(&cfg);
     let bwd_ptx = synthesize_fused_kl_ce_backward_ptx(&cfg);
     let fwd_name = format!("{}\0", cfg.kernel_name());
     let bwd_name = format!("{}\0", cfg.bwd_kernel_name());
 
-    // Device buffers.
-    let alloc = |bytes: usize| nsl_test_cuda_alloc(bytes as i64);
-    let xs_dev = alloc(ROWS * HS * 4);
-    let ws_dev = alloc(V * HS * 4);
-    let bs_dev = alloc(V * 4);
-    let xt_dev = alloc(ROWS * HT * 4);
-    let wt_dev = alloc(V * HT * 4);
-    let bt_dev = alloc(V * 4);
-    let tgt_dev = alloc(ROWS * 8);
-    let loss_dev = alloc(ROWS * 4);
-    let lse_s1_dev = alloc(ROWS * 4);
-    let lse_st_dev = alloc(ROWS * 4);
-    let lse_tt_dev = alloc(ROWS * 4);
-    let dxs_dev = alloc(ROWS * HS * 4);
-    let dws_dev = alloc(V * HS * 4);
-    let dbs_dev = alloc(V * 4);
-    for d in [
-        xs_dev, ws_dev, bs_dev, xt_dev, wt_dev, bt_dev, tgt_dev, loss_dev, lse_s1_dev,
-        lse_st_dev, lse_tt_dev, dxs_dev, dws_dev, dbs_dev,
-    ] {
-        assert_ne!(d, 0, "device alloc failed");
-    }
+    let (xs, ws, bs) = (upload(&fixture.xs), upload(&fixture.ws), upload(&fixture.bs));
+    let (xt, wt, bt) = (upload(&fixture.xt), upload(&fixture.wt), upload(&fixture.bt));
+    let targets = upload(&fixture.targets);
+    // Outputs. The gradient buffers must be zero-filled: the kernel
+    // accumulates into them (`red.global.add`).
+    let rows = vec![0f32; ROWS];
+    let (loss, lse_s1, lse_st, lse_tt) = (upload(&rows), upload(&rows), upload(&rows), upload(&rows));
+    let (dxs, dws, dbs) = (upload(&vec![0f32; ROWS * HS]), upload(&vec![0f32; V * HS]), upload(&vec![0f32; V]));
 
-    let h2d = |dev: i64, host: *const u8, bytes: usize| {
-        nsl_test_cuda_h2d(dev, host as i64, bytes as i64);
-    };
-    h2d(xs_dev, xs.as_ptr() as *const u8, ROWS * HS * 4);
-    h2d(ws_dev, ws.as_ptr() as *const u8, V * HS * 4);
-    h2d(bs_dev, bs.as_ptr() as *const u8, V * 4);
-    h2d(xt_dev, xt.as_ptr() as *const u8, ROWS * HT * 4);
-    h2d(wt_dev, wt.as_ptr() as *const u8, V * HT * 4);
-    h2d(bt_dev, bt.as_ptr() as *const u8, V * 4);
-    h2d(tgt_dev, targets.as_ptr() as *const u8, ROWS * 8);
-    // Gradient outputs must be zero-filled (red.global.add accumulation).
-    let zeros_dxs = vec![0f32; ROWS * HS];
-    let zeros_dws = vec![0f32; V * HS];
-    let zeros_dbs = vec![0f32; V];
-    h2d(dxs_dev, zeros_dxs.as_ptr() as *const u8, ROWS * HS * 4);
-    h2d(dws_dev, zeros_dws.as_ptr() as *const u8, V * HS * 4);
-    h2d(dbs_dev, zeros_dbs.as_ptr() as *const u8, V * 4);
-
-    // ── Forward ──────────────────────────────────────────────────────────
     let rc = nsl_fused_kl_ce_forward(
         fwd_ptx.as_ptr() as i64,
         fwd_name.as_ptr() as i64,
-        xs_dev,
-        ws_dev,
-        bs_dev,
-        xt_dev,
-        wt_dev,
-        bt_dev,
-        tgt_dev,
-        loss_dev,
-        lse_s1_dev,
-        lse_st_dev,
-        lse_tt_dev,
+        xs,
+        ws,
+        bs,
+        xt,
+        wt,
+        bt,
+        targets,
+        loss,
+        lse_s1,
+        lse_st,
+        lse_tt,
         ROWS as i64,
         V as i64,
         HS as i64,
         HT as i64,
-        f32_bits(ALPHA),
-        f32_bits(TEMP),
+        f32_bits(alpha),
+        f32_bits(temperature),
         cfg.shared_mem_bytes() as i64,
     );
     assert_eq!(rc, 0, "forward launch failed rc={rc}");
-
-    let d2h = |dev: i64, host: *mut u8, bytes: usize| {
-        nsl_test_cuda_d2h(host as i64, dev, bytes as i64);
-    };
-    let mut gpu_loss = vec![0f32; ROWS];
-    let mut gpu_lse_s1 = vec![0f32; ROWS];
-    let mut gpu_lse_st = vec![0f32; ROWS];
-    let mut gpu_lse_tt = vec![0f32; ROWS];
-    d2h(loss_dev, gpu_loss.as_mut_ptr() as *mut u8, ROWS * 4);
-    d2h(lse_s1_dev, gpu_lse_s1.as_mut_ptr() as *mut u8, ROWS * 4);
-    d2h(lse_st_dev, gpu_lse_st.as_mut_ptr() as *mut u8, ROWS * 4);
-    d2h(lse_tt_dev, gpu_lse_tt.as_mut_ptr() as *mut u8, ROWS * 4);
-
-    let rel = |gpu: f32, r: f64| ((gpu as f64) - r).abs() / r.abs().max(1.0);
-    for row in 0..ROWS {
-        if targets[row] == IGNORE_INDEX {
-            assert_eq!(gpu_loss[row], 0.0, "row {row}: skip row loss must be 0");
-            assert_eq!(gpu_lse_s1[row], 0.0, "row {row}: skip row lse_s1 must be 0");
-            continue;
-        }
-        assert!(
-            rel(gpu_loss[row], ref_loss[row]) < FORWARD_TOL,
-            "row {row}: loss gpu={} ref={}",
-            gpu_loss[row],
-            ref_loss[row]
+    if run_backward {
+        let rc = nsl_fused_kl_ce_backward(
+            bwd_ptx.as_ptr() as i64,
+            bwd_name.as_ptr() as i64,
+            f32_bits(1.0),
+            xs,
+            ws,
+            bs,
+            xt,
+            wt,
+            bt,
+            targets,
+            lse_s1,
+            lse_st,
+            lse_tt,
+            dxs,
+            dws,
+            dbs,
+            ROWS as i64,
+            V as i64,
+            HS as i64,
+            HT as i64,
+            f32_bits(alpha),
+            f32_bits(temperature),
+            num_valid,
         );
-        assert!(
-            rel(gpu_lse_s1[row], ref_lse_s1[row]) < FORWARD_TOL,
-            "row {row}: lse_s1 gpu={} ref={}",
-            gpu_lse_s1[row],
-            ref_lse_s1[row]
-        );
-        assert!(
-            rel(gpu_lse_st[row], ref_lse_st[row]) < FORWARD_TOL,
-            "row {row}: lse_sT gpu={} ref={}",
-            gpu_lse_st[row],
-            ref_lse_st[row]
-        );
-        assert!(
-            rel(gpu_lse_tt[row], ref_lse_tt[row]) < FORWARD_TOL,
-            "row {row}: lse_tT gpu={} ref={}",
-            gpu_lse_tt[row],
-            ref_lse_tt[row]
-        );
+        assert_eq!(rc, 0, "backward launch failed rc={rc}");
     }
-    eprintln!("forward: {ROWS} rows match reference (rel < {FORWARD_TOL:e})");
 
-    // ── Backward ─────────────────────────────────────────────────────────
-    let rc = nsl_fused_kl_ce_backward(
-        bwd_ptx.as_ptr() as i64,
-        bwd_name.as_ptr() as i64,
-        f32_bits(1.0),
-        xs_dev,
-        ws_dev,
-        bs_dev,
-        xt_dev,
-        wt_dev,
-        bt_dev,
-        tgt_dev,
-        lse_s1_dev,
-        lse_st_dev,
-        lse_tt_dev,
-        dxs_dev,
-        dws_dev,
-        dbs_dev,
-        ROWS as i64,
-        V as i64,
-        HS as i64,
-        HT as i64,
-        f32_bits(ALPHA),
-        f32_bits(TEMP),
-        num_valid,
-    );
-    assert_eq!(rc, 0, "backward launch failed rc={rc}");
-
-    let mut gpu_dxs = vec![0f32; ROWS * HS];
-    let mut gpu_dws = vec![0f32; V * HS];
-    let mut gpu_dbs = vec![0f32; V];
-    d2h(dxs_dev, gpu_dxs.as_mut_ptr() as *mut u8, ROWS * HS * 4);
-    d2h(dws_dev, gpu_dws.as_mut_ptr() as *mut u8, V * HS * 4);
-    d2h(dbs_dev, gpu_dbs.as_mut_ptr() as *mut u8, V * 4);
-
-    let max_err = |name: &str, gpu: &[f32], r: &[f64]| {
-        // `f64::max` returns the non-NaN operand, so the fold below drops a
-        // NaN error and scores an all-NaN gradient 0.0. Refuse it first, on
-        // both sides.
-        if let Some(i) = gpu.iter().position(|v| !v.is_finite()) {
-            panic!("{name}: non-finite entry in gpu at index {i} ({})", gpu[i]);
-        }
-        if let Some(i) = r.iter().position(|v| !v.is_finite()) {
-            panic!("{name}: non-finite entry in reference at index {i} ({})", r[i]);
-        }
-        gpu.iter()
-            .zip(r.iter())
-            .map(|(&g, &rr)| ((g as f64) - rr).abs())
-            .fold(0f64, f64::max)
+    let out = Device {
+        loss: download(loss, ROWS),
+        lse_s1: download(lse_s1, ROWS),
+        lse_st: download(lse_st, ROWS),
+        lse_tt: download(lse_tt, ROWS),
+        dxs: download(dxs, ROWS * HS),
+        dws: download(dws, V * HS),
+        dbs: download(dbs, V),
     };
+    for dev in [xs, ws, bs, xt, wt, bt, targets, loss, lse_s1, lse_st, lse_tt, dxs, dws, dbs] {
+        nsl_test_cuda_free(dev);
+    }
+    out
+}
+
+/// Every way `got` departs from `want`, by name. Empty means the device
+/// result is the reference within the tolerances at the top of this file.
+fn mismatches(fixture: &Fixture, want: &Reference, got: &Device) -> Vec<String> {
+    let mut found = Vec::new();
     for (name, gpu, expected) in [
-        ("dx_s", &gpu_dxs, ref_dxs),
-        ("dW_s", &gpu_dws, ref_dws),
-        ("dbias_s", &gpu_dbs, ref_dbs),
+        ("loss", &got.loss, &want.loss),
+        ("lse_s1", &got.lse_s1, &want.lse_s1),
+        ("lse_sT", &got.lse_st, &want.lse_st),
+        ("lse_tT", &got.lse_tt, &want.lse_tt),
     ] {
-        let err = max_err(name, gpu, expected);
-        let scale = max_abs(expected);
-        eprintln!("backward {name}: max abs err {err:.2e}, largest reference entry {scale:.2e}");
-        assert!(err < GRADIENT_TOL * scale, "{name}: max err {err:e} against a largest entry of {scale:e}");
-    }
-
-    // Skip identity: -100 rows have exactly-zero dx_s.
-    for row in 0..ROWS {
-        if targets[row] == IGNORE_INDEX {
-            for h in 0..HS {
-                assert_eq!(
-                    gpu_dxs[row * HS + h],
-                    0.0,
-                    "row {row} h {h}: skip row dx_s must be exactly 0"
-                );
+        for row in 0..ROWS {
+            let (g, w) = (gpu[row] as f64, expected[row]);
+            let bad = if fixture.targets[row] == IGNORE_INDEX {
+                // A skipped row is exactly zero.
+                g != 0.0
+            } else {
+                !g.is_finite() || (g - w).abs() / w.abs().max(1.0) >= FORWARD_TOL
+            };
+            if bad {
+                found.push(format!("{name}: row {row} is {g}, expected {w}"));
+                break;
             }
         }
     }
+    for (name, gpu, expected) in
+        [("dx_s", &got.dxs, &want.dxs), ("dW_s", &got.dws, &want.dws), ("dbias_s", &got.dbs, &want.dbs)]
+    {
+        // `f64::max` returns the non-NaN operand, so a NaN error would
+        // drop out of the fold below: refuse non-finite entries first.
+        if let Some(i) = gpu.iter().position(|v| !v.is_finite()) {
+            found.push(format!("{name}: non-finite entry at {i} ({})", gpu[i]));
+            continue;
+        }
+        let err = gpu.iter().zip(expected.iter()).map(|(&g, &w)| (g as f64 - w).abs()).fold(0f64, f64::max);
+        let scale = max_abs(expected);
+        eprintln!("{name}: max abs err {err:.2e}, largest reference entry {scale:.2e}");
+        if err >= GRADIENT_TOL * scale {
+            found.push(format!("{name}: max err {err:e} against a largest entry of {scale:e}"));
+        }
+    }
+    // Skip identity: an ignored row's dx_s is exactly zero.
+    for row in (0..ROWS).filter(|&r| fixture.targets[r] == IGNORE_INDEX) {
+        if got.dxs[row * HS..(row + 1) * HS].iter().any(|&g| g != 0.0) {
+            found.push(format!("dx_s: ignored row {row} is not exactly zero"));
+            break;
+        }
+    }
+    found
+}
 
-    for d in [
-        xs_dev, ws_dev, bs_dev, xt_dev, wt_dev, bt_dev, tgt_dev, loss_dev, lse_s1_dev,
-        lse_st_dev, lse_tt_dev, dxs_dev, dws_dev, dbs_dev,
-    ] {
-        nsl_test_cuda_free(d);
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn fused_kl_ce_gpu_forward_and_backward_match_reference() {
+    if !cuda_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let want = reference(&fixture.inputs(), KlTerm::Forward);
+    let got = launch(&fixture, ALPHA, TEMP, true);
+    let found = mismatches(&fixture, &want, &got);
+    assert!(found.is_empty(), "the device result is not the reference:\n{}", found.join("\n"));
+}
+
+/// The comparison above can fail, shown on the device with wrong results
+/// obtained without touching the kernels:
+///
+/// * a backward that never ran (all-zero gradients) is reported for every
+///   gradient tensor. This is the case the old absolute tolerance passed;
+/// * kernels launched with temperature 1 instead of 2.5 compute a different
+///   KL term, and are reported for the loss and for every gradient tensor;
+/// * kernels launched with alpha 1 compute no KL term at all, likewise.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn the_device_comparison_catches_wrong_results() {
+    if !cuda_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let want = reference(&fixture.inputs(), KlTerm::Forward);
+    let reported = |got: &Device, name: &str| mismatches(&fixture, &want, got).iter().any(|m| m.starts_with(name));
+
+    let no_backward = launch(&fixture, ALPHA, TEMP, false);
+    assert!(!reported(&no_backward, "loss"), "the forward is unchanged and must still match");
+    for name in ["dx_s", "dW_s", "dbias_s"] {
+        assert!(reported(&no_backward, name), "an all-zero {name} went unnoticed");
+    }
+    for (what, alpha, temperature) in [("temperature 1", ALPHA, 1.0), ("alpha 1 (no KL term)", 1.0, TEMP)] {
+        let wrong = launch(&fixture, alpha, temperature, true);
+        for name in ["loss", "dx_s", "dW_s", "dbias_s"] {
+            assert!(reported(&wrong, name), "{what}: a wrong {name} went unnoticed");
+        }
     }
 }
 
@@ -524,16 +538,7 @@ fn a_failed_launch_exits_instead_of_returning() {
     if !cuda_available() {
         return;
     }
-    let cfg = FusedKlCeConfig {
-        vocab_size: V as u32,
-        student_hidden: HS as u32,
-        teacher_hidden: HT as u32,
-        batch_size: B as u32,
-        seq_len: S as u32,
-        vocab_tile: VOCAB_TILE,
-        gpu_sm: 80,
-        ignore_index: IGNORE_INDEX,
-    };
+    let cfg = config();
     let ptx = synthesize_fused_kl_ce_ptx(&cfg);
     let alloc = |bytes: usize| nsl_test_cuda_alloc(bytes as i64);
     let (xs, ws, bs) = (alloc(ROWS * HS * 4), alloc(V * HS * 4), alloc(V * 4));
