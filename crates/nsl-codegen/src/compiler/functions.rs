@@ -386,6 +386,31 @@ impl Compiler<'_> {
                                 field_info.iter().find(|(n, _, _)| *n == field_name)
                             {
                                 let field_offset = *field_offset;
+                                // `= [M(a), M(b)]`: element i is item i. The
+                                // loop below would store the LIST in every
+                                // slot, read back later as an `M`.
+                                if let Some(init_expr) = init
+                                    && let nsl_ast::expr::ExprKind::ListLiteral(items) =
+                                        &init_expr.kind
+                                {
+                                    if items.len() as i64 != arr_size {
+                                        return Err(CodegenError::new(format!(
+                                            "the list initialising `{field_name}` has {} \
+                                             elements; the field holds {arr_size}",
+                                            items.len()
+                                        )));
+                                    }
+                                    for (i, item) in items.iter().enumerate() {
+                                        let val = self.compile_expr(&mut builder, &mut state, item)?;
+                                        builder.ins().store(
+                                            MemFlagsData::trusted(),
+                                            val,
+                                            ptr,
+                                            (field_offset + i * 8) as i32,
+                                        );
+                                    }
+                                    continue;
+                                }
                                 if let Some(init_expr) = init {
                                     let init_expr_clone = init_expr.clone();
                                     // Generate loop: for i in 0..arr_size, compile init, store at ptr+field_offset+i*8

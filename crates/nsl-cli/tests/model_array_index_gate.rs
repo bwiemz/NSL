@@ -144,3 +144,91 @@ fn a_runtime_index_out_of_range_stops_the_program() {
     assert!(stderr.contains("model array index out of range"), "{stderr}");
     assert!(!String::from_utf8_lossy(&out.stdout).contains("unreachable"));
 }
+
+// ---------------------------------------------------------------------------
+// A list initialiser: `blocks: [Block; 2] = [Block(1.0), Block(3.0)]`
+// ---------------------------------------------------------------------------
+
+/// Element i is list item i. The list form compiled and stored the LIST
+/// pointer in every slot, so reading `block.w` aborted on "invalid tensor
+/// handle". Built here with different constructor arguments, so the
+/// elements differ and their order shows: x = [1, 1] through
+/// `full(2x2, 1)` then `full(2x2, 3)` is [2, 2] then [12, 12].
+#[test]
+fn a_list_initialiser_gives_each_element_its_item() {
+    let out = run(r#"model Block(k: float):
+    w: Tensor = full([2, 2], k)
+
+    fn forward(self, h: Tensor) -> Tensor:
+        return h @ self.w
+
+model Net:
+    blocks: [Block; 2] = [Block(1.0), Block(3.0)]
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = x
+        for block in self.blocks:
+            h = block.forward(h)
+        return h
+
+let m = Net()
+let y: Tensor = m.forward(ones([1, 2]))
+print(y.sum())
+let w0: Tensor = m.blocks[0].w
+print(w0.sum())
+let w1: Tensor = m.blocks[1].w
+print(w1.sum())
+"#);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "run failed:\n{stderr}");
+    let printed: Vec<f64> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse().ok())
+        .collect();
+    assert_eq!(printed, vec![24.0, 4.0, 12.0], "stderr:\n{stderr}");
+}
+
+#[test]
+fn a_list_initialiser_of_the_wrong_length_is_a_compile_error() {
+    let out = run(r#"model Block:
+    w: Tensor = ones([2, 2])
+
+model Net:
+    blocks: [Block; 3] = [Block(), Block()]
+
+let m = Net()
+"#);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(
+        stderr.contains("a `[Block; 3]` field initialised with a list needs 3 elements")
+            && stderr.contains("this list has 2"),
+        "{stderr}"
+    );
+}
+
+/// Each element must be the array's model, in either form.
+#[test]
+fn an_element_of_another_type_is_a_compile_error() {
+    for init in ["[Block(), Other()]", "Other()", "[Block(), 2]"] {
+        let out = run(&format!(
+            r#"model Block:
+    w: Tensor = ones([2, 2])
+
+model Other:
+    v: Tensor = ones([2, 2])
+
+model Net:
+    blocks: [Block; 2] = {init}
+
+let m = Net()
+"#
+        ));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "`= {init}` compiled and ran");
+        assert!(
+            stderr.contains("an element of a `[Block; 2]` field must be a `Block`"),
+            "`= {init}`:\n{stderr}"
+        );
+    }
+}
