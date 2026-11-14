@@ -241,7 +241,9 @@ could not be verified.
 
 ## Part 3 — What the code implements
 
-No shipped model runs a CSHA kernel. Paths are relative to the repository
+No shipped model runs a CSHA kernel, and since the second pass of fixes no
+NSL program can train through one: a train or grad step on CSHA-claimed
+attention is a compile error (Part 5). Paths are relative to the repository
 root.
 
 **What a stock model gets.** `GroupedQueryAttention`
@@ -266,16 +268,23 @@ not applied.
 - Decorators: `@flash_attention(causal=, head_dim=)`,
   `@csha(level=, target=, disable=)`, `@checkpoint`,
   `@pca(strategy=per_document)`.
-- The fused path needs all of: `@flash_attention` on a method, a train
-  block, source AD, `--csha`, and an operation chain RMSNorm →
-  Matmul(wq|wk|wv) → [RoPE] → SDPA with nothing in between (`scan` in
-  `crates/nsl-codegen/src/csha_boundary.rs`). A reshape or transpose into
-  heads breaks the chain, so only single-head toy programs match.
-  `examples/csha_toy_pretrain_hd32.nsl` is the only program in `models/` or
-  `examples/` that reaches the CSHA launchers
+- The fused training path is claimed when all of these hold:
+  `@flash_attention` on a method, a train block, source AD, `--csha`, and
+  an operation chain RMSNorm → Matmul(wq|wk|wv) → [RoPE] → SDPA with nothing
+  in between (`scan` in `crates/nsl-codegen/src/csha_boundary.rs`). A
+  reshape or transpose into heads breaks the chain, so only single-head toy
+  programs match. A program that does match no longer compiles: the fused
+  backward gives wrong gradients (Part 5), and `lower_single_op` in
+  `crates/nsl-codegen/src/wengert_lower.rs` refuses to emit the pair
+  (`CSHA_FUSED_TRAINING_WITHHELD`). `examples/csha_toy_pretrain_hd32.nsl`
+  is such a program; it trains without `--csha`. The launchers
   `nsl_flash_attention_csha_with_saves` and
-  `nsl_flash_attention_csha_backward`. `examples/m27_gqa.nsl` carries
-  `@flash_attention` but has no fused chain.
+  `nsl_flash_attention_csha_backward` are therefore reached only from tests
+  and direct FFI calls. `examples/m27_gqa.nsl` carries `@flash_attention`
+  but has no fused chain. Calling an `@flash_attention` method outside a
+  train block is not affected by that refusal. Such a call runs the v2
+  kernel, whose launchers refuse a sequence length that is not a multiple
+  of the kernel's tiles (Part 5).
 - With the decorator but without `--csha`, a train block's attention lowers
   to plain matmul, softmax, matmul (`lower_single_op` in
   `crates/nsl-codegen/src/wengert_lower.rs`).
@@ -318,8 +327,8 @@ not applied.
 - **§4.3 attention sinks — partial.** A narrow first version: single-tile,
   non-causal, not in training (`attention_sinks_v1_eligible` in
   `crates/nsl-codegen/src/flash_attention_v2/sinks.rs`).
-- **§5.1 fused backward — partial.** The kernel that runs is scalar ("Tier
-  C") and uses no tensor cores. With fused projections, more than one tile
+- **§5.1 fused backward — partial, and withheld from training.** The
+  kernel is scalar ("Tier C") and uses no tensor cores. With fused projections, more than one tile
   is refused unless batch and head count are both 1. The tensor-core
   variant ("Tier B.2") requires a single active head and
   `d_model == head_dim` (`tier_b2_hybrid_backward_compile_time_eligible` in
@@ -435,15 +444,13 @@ that saves activations and the scalar fused backward.
   nominal 8-head layer while the backward passed 0, and so did the launches
   in a method body, so a model with more than 8 heads would have had heads
   8 and up left at zero. Every launch now passes the count of the
-  configuration its kernel was synthesized from, which is 0 (every head)
-  for a training build (`emit_fused_forward_under_claim` and
-  `lower_single_op` in `crates/nsl-codegen/src/wengert_lower.rs`,
+  configuration its kernel was synthesized from (`emit_fused_forward_under_claim`
+  and `lower_single_op` in `crates/nsl-codegen/src/wengert_lower.rs`,
   `compile_flash_attention_call` in
-  `crates/nsl-codegen/src/expr/advanced.rs`). The test,
-  `every_csha_launch_passes_the_same_active_head_count` in
-  `crates/nsl-codegen/tests/train_clif_snapshots.rs`, reads the emitted IR.
-  The defect was not reproduced from an NSL program: a program with more
-  than one head stops earlier, for the reason in the open list below.
+  `crates/nsl-codegen/src/expr/advanced.rs`). For the training launches
+  this is no longer reachable, because the fused pair is withheld from
+  train steps (below); what the launchers do with a count below the head
+  count is covered by `crates/nsl-codegen/tests/csha_cuda_training_config.rs`.
 - The result of the forward launch was discarded for
   `nsl_flash_attention_csha` and `nsl_flash_attention`, so a refused launch
   let the zero-initialised output flow on. All three forward launches in a
@@ -477,59 +484,118 @@ that saves activations and the scalar fused backward.
   above 1 for a Tier B.1 kernel, and refuses instead of launching the
   kernel on buffers the pre-pass did not prepare. The test is
   `tier_b1_refuses_batch_or_heads_above_one` in the same file.
+- A train step could go through the fused pair although its gradients do
+  not match a reference on the one configuration a training build emits
+  (level 1, no fusion flag): at two tiles the forward output is right and
+  dQ, dK and dV are 130%, 45% and 43% off; with more than one head the
+  train step stopped on a tensor shape mismatch; and one head with one tile
+  was never shown right. A train or grad step on CSHA-claimed attention is
+  now a compile error that names `@flash_attention` and `--csha`, says the
+  fused backward is withheld because its gradients do not match the
+  reference, and says to compile without `--csha`
+  (`CSHA_FUSED_TRAINING_WITHHELD` in
+  `crates/nsl-codegen/src/wengert_lower.rs`). Without `--csha` the same
+  program trains on the unfused attention; run on a GPU, every statistic
+  it prints agrees with PyTorch to 2e-6. The tests are
+  `crates/nsl-codegen/tests/csha_training_withheld.rs` (the refusal fires
+  for a train block and not for a forward-only use) and
+  `crates/nsl-cli/tests/csha_toy_pretrain_gate.rs`. The defects behind the
+  refusal are still in the kernels and are the open items below.
 - `examples/csha_toy_pretrain_hd32.nsl` could not run (its `x` was
   two-dimensional, which the fused forward aborts on) and was degenerate:
   `x` and every weight were ones and the loss was `sum(out)`, so dQ, dK,
-  dWq and dWk were exactly zero. It is replaced by a program with
-  non-uniform inputs, a gradient of order 1e-6 at the attention output and
-  printed statistics of each weight's update, and
-  `crates/nsl-cli/tests/csha_toy_pretrain_gate.rs` runs it on a GPU and
-  compares with PyTorch. The gate asserts the loss and the statistics that
-  agree; the ones that do not are the first open item below.
+  dWq and dWk were exactly zero. Its only test compiled it and looked at
+  relocation symbols, and two GPU tests in `nsl-cli` compared the fused
+  path with the unfused one under a loose tolerance. The example is
+  replaced by a program with non-uniform inputs, a gradient of order 1e-6
+  at the attention output and printed statistics of each weight's update;
+  `crates/nsl-cli/tests/csha_toy_pretrain_gate.rs` runs it on a GPU without
+  `--csha` and asserts every statistic against PyTorch.
+- The scalar backward reads Wq, Wk and Wv without a null check whenever its
+  configuration has a nonzero `d_model`, so a launch with a null weight was
+  a GPU fault (CUDA_ERROR_ILLEGAL_ADDRESS, seen in a run) surfacing at a
+  later driver call. The launcher now refuses such a launch
+  (`csha_backward_impl` in `crates/nsl-runtime/src/flash_attention.rs`).
+  The test is `backward_refuses_a_null_projection_weight` in
+  `crates/nsl-codegen/tests/csha_cuda_backward.rs`.
+- The v2 attention kernels have no tail guard on the sequence: a CTA
+  stores all `block_q` of its query rows. An `@flash_attention` method
+  called at a sequence of 32 under the default 64-row tile wrote 32 rows
+  past the end of its output, into the 2 KB that followed, on every call.
+  In `examples/csha_toy_pretrain_hd32.nsl` with a call of the method before
+  the train block, the tensor overwritten was the program's copy of Wq,
+  and the Wq update it printed had a squared norm of 17.2 against
+  PyTorch's 0.0061 while the loss and every other statistic agreed. The
+  weight and its gradient were right; dumping Wq around the call showed it
+  unchanged, and a run with a learning rate of 0 reported exactly the
+  squared norm of the first half of the copy. The same happened without
+  `--csha` and in tape AD, where the train step itself runs the kernel. The
+  plain, CSHA and CSHA-with-saves forward launchers and the CSHA backward
+  launcher now refuse a sequence that is not a multiple of `block_q` and
+  `block_kv` (`fa_refuses_ragged_seq` in
+  `crates/nsl-runtime/src/flash_attention.rs`; the per-document kernels,
+  which bound rows by the document, are not checked), and the generated
+  code stops on the refusal. The packed source-AD channel already declined
+  such shapes. The tests are
+  `a_sequence_that_does_not_fill_whole_tiles_is_ragged` in that file and
+  `crates/nsl-cli/tests/flash_attention_ragged_seq_gate.rs`, which checks
+  the refusal at a sequence of 32 and the output against attention written
+  out by hand at 64 and 128. The same example at a sequence of 64, one
+  whole tile, trained in tape AD through the decorated kernel agrees with
+  PyTorch to 1e-4 of each statistic, the f16 rounding of the kernel's
+  output, and prints the same numbers with and without `--csha`: tape AD
+  does not use the CSHA kernels.
 
 ### Open
 
-- The one NSL program that reaches the fused pair gets a wrong gradient for
-  Wq, and Wk and Wv gradients that are too large. Run on a GPU against
-  PyTorch (`examples/csha_toy_pretrain_hd32.nsl`, one head, one tile): the
-  loss agrees to 0.1%, and so do the RMSNorm weight's update and the
-  projections of the Wk and Wv updates on a probe; but the squared norm of
-  the Wq update is 17.2 against 0.0061, and those of Wk and Wv are 12%
-  high. The same model without the decorator, on the CPU, agrees with
-  PyTorch to 1e-6. The kernel-level gates pass for the fused-projection
-  configuration, so the fault is specific to the configuration a training
-  build emits (level 1, no fusion flag), where the kernel is nonetheless
-  handed `x` and the weights. The cause was not found. Suspected, by
-  reading: `emit_dproj` and `emit_drmsnorm` in
-  `crates/nsl-codegen/src/flash_attention_v2/phases/backward/csha_hooks_backward.rs`,
-  and the forward's RMSNorm prologue, which that configuration also runs
-  on an `x` that is already normalised.
-  `crates/nsl-cli/tests/csha_toy_pretrain_gate.rs` prints the affected
-  statistics without asserting them. Right: every statistic it prints
-  agrees with PyTorch.
-- The backward of the kernel pair a training build emits is wrong at more
-  than one tile. Run with the training configuration (level 1, no fusion
-  flag) at two tiles, the forward output is right (3e-4) and dQ, dK and dV
-  are 130%, 45% and 43% off, at batch 1 with one head as at batch 2 with
-  four; at one tile the same shapes are right (4e-4). With fused
-  projections more than one tile is right at batch 1 with one head and
-  refused otherwise. Where: the per-query-tile launch loop of
-  `csha_backward_impl` in `crates/nsl-runtime/src/flash_attention.rs` and
-  the kernel it launches.
-- A program whose attention has more than one head cannot train through
-  the fused pair. With `x` of shape `[2, 16, 32, 32]` the train step stops
-  with "tensor shape mismatch in elementwise op" (`[1, 2, 32, 32]` against
-  `[2, 16, 32, 32]`), and a direct call of the method returns NaN. Run on a
-  GPU; the same before and after the fixes above. Suspected, by reading:
-  the gradient with respect to `x` that the fused backward returns is
-  allocated as `[batch, seq, d_model]`, with no head dimension
-  (`PrimalOp::FusedCshaBackward` in
-  `crates/nsl-codegen/src/wengert_lower.rs`).
-- The scalar backward reads Wq, Wk and Wv without a null check whenever its
-  configuration has a nonzero `d_model`, so a launch with null weights is a
-  GPU fault instead of a skipped phase. Where: `emit_drmsnorm` in
-  `crates/nsl-codegen/src/flash_attention_v2/phases/backward/csha_hooks_backward.rs`.
-  Seen in a run (CUDA_ERROR_ILLEGAL_ADDRESS).
+The next three are the reasons the fused pair is withheld from train steps.
+They can no longer be reached from an NSL program, only from tests and
+direct FFI calls, and all three have to be fixed and gated from NSL source
+before `CSHA_FUSED_TRAINING_WITHHELD` is lifted.
+
+- On the configuration a training build emits (level 1, no fusion flag),
+  the fused backward is wrong at more than one tile. At two tiles the
+  forward output is right (3e-4) and dQ, dK and dV are 130%, 45% and 43%
+  off, at batch 1 with one head as at batch 2 with four; at one tile the
+  same shapes are right (4e-4) for dQ, dK and dV. With fused projections
+  more than one tile is right at batch 1 with one head and refused
+  otherwise. Where: the per-query-tile launch loop of `csha_backward_impl`
+  in `crates/nsl-runtime/src/flash_attention.rs` and the kernel it
+  launches.
+- The fused pair does not handle more than one head from NSL source. With
+  `x` of shape `[2, 16, 32, 32]` the train step stopped with "tensor shape
+  mismatch in elementwise op" (`[1, 2, 32, 32]` against `[2, 16, 32, 32]`).
+  Suspected, by reading: the gradient with respect to `x` that the fused
+  backward returns is allocated as `[batch, seq, d_model]`, with no head
+  dimension (`PrimalOp::FusedCshaBackward` in
+  `crates/nsl-codegen/src/wengert_lower.rs`). In the same program a direct
+  call of the method returned NaN; not investigated.
+- The weight gradients of that configuration (dWq, dWk, dWv and the
+  gradient with respect to `x`) have never been compared with a reference.
+  The FFI-level gates cover dQ, dK and dV for it, and all eight gradients
+  only for the fused-projection configuration. The one end-to-end run, at
+  one head and one tile, had the squared norms of the Wk and Wv updates
+  12% high against PyTorch, but that program also called the method at a
+  sequence of 32 under a 64-row tile, which wrote past the attention
+  output (Fixed above), so the figure cannot be attributed. By reading, that
+  configuration is handed `x` and the weights although no fusion flag is
+  set, runs the forward's RMSNorm prologue on an `x` that is already
+  normalised, and runs `emit_dproj` and `emit_drmsnorm`
+  (`crates/nsl-codegen/src/flash_attention_v2/phases/backward/csha_hooks_backward.rs`)
+  in the backward. Next step: launch that configuration at the FFI level
+  as the lowering does and compare each of the eight outputs with the f64
+  reference.
+- `@flash_attention` applies to the whole module, not to the function it
+  decorates. The first decorated function or method found sets one
+  kernel context for the module (`compile_flash_attention_kernels` in
+  `crates/nsl-codegen/src/compiler/kernel.rs`), and every
+  `scaled_dot_product_attention` compiled outside source AD then checks
+  only that the context exists (`crates/nsl-codegen/src/expr/calls.rs`,
+  whose comment says it checks the enclosing function), so an undecorated
+  function's attention runs the decorated kernel, with the decorator's
+  head size and tiles. By reading the code only. Right: keep the context
+  per decorated function, and lower other attention as if there were no
+  decorator.
 - For decorated attention the plan is still made on a nominal layer shape
   (batch 1, sequence 1024, `d_model` 512, 8 heads, 4 KV heads), the level-1
   saving is the constant 0.58, and the kernel named in the report is not
