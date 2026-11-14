@@ -316,9 +316,10 @@ pub const PASSES: &[PassDescriptor] = &[
         tape: TapeAccess::MutatesInPlace {
             refs: &[TapeRef::PositionalIndex, TapeRef::VarId],
             via: &["crates/nsl-codegen/src/ccr.rs"],
-            what: "appends the compressed-save tail to the primal (fresh \
-                   ids above the max — a len-minted id collides after any \
-                   deletion); its OnAdjoint half splices recompute clones \
+            what: "inserts the compressed saves into the primal at each \
+                   segment's end and moves its own segment bounds with them \
+                   (fresh ids above the max — a len-minted id collides after \
+                   any deletion); its OnAdjoint half splices recompute clones \
                    and decompress ops into the adjoint and renumbers that \
                    list to ADJOINT_ID_BASE + index, keeping adjoint ids \
                    positional within the adjoint half of the id space",

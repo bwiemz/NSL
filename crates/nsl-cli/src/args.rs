@@ -901,11 +901,14 @@ pub(crate) struct BuildArgs {
         )]
         pub(crate) fuse_wgrad_accum: bool,
 
-        /// With --checkpoint-selective: compress the saved matmul-class
-        /// activations to half precision between forward and backward
-        /// (fp16 or bf16). Not bit-exact — backward reads rounded
-        /// activations; validate loss parity at the 3-4 dp standard.
-        #[arg(long, requires = "checkpoint_selective", value_parser = ["fp16", "bf16"])]
+        /// With --checkpoint-selective: store the saved matmul-class
+        /// activations as bf16, each cast at the end of its block segment
+        /// and widened back before the backward reads it. Not bit-exact —
+        /// backward reads rounded activations; validate loss parity at the
+        /// 3-4 dp standard. `bf16` is the only format: IEEE half precision
+        /// (fp16) was withdrawn because it overflows above 65504 with no
+        /// range check and turned the loss into NaN.
+        #[arg(long, requires = "checkpoint_selective", value_parser = ["bf16"])]
         pub(crate) checkpoint_compress: Option<String>,
 
         /// CSLA Stage-2 (docs/research/CSLA paper §7): window-buffered
@@ -1537,11 +1540,14 @@ pub(crate) struct RunArgs {
         )]
         pub(crate) fuse_wgrad_accum: bool,
 
-        /// With --checkpoint-selective: compress the saved matmul-class
-        /// activations to half precision between forward and backward
-        /// (fp16 or bf16). Not bit-exact — backward reads rounded
-        /// activations; validate loss parity at the 3-4 dp standard.
-        #[arg(long, requires = "checkpoint_selective", value_parser = ["fp16", "bf16"])]
+        /// With --checkpoint-selective: store the saved matmul-class
+        /// activations as bf16, each cast at the end of its block segment
+        /// and widened back before the backward reads it. Not bit-exact —
+        /// backward reads rounded activations; validate loss parity at the
+        /// 3-4 dp standard. `bf16` is the only format: IEEE half precision
+        /// (fp16) was withdrawn because it overflows above 65504 with no
+        /// range check and turned the loss into NaN.
+        #[arg(long, requires = "checkpoint_selective", value_parser = ["bf16"])]
         pub(crate) checkpoint_compress: Option<String>,
 
         /// CSLA Stage-2 (docs/research/CSLA paper §7): window-buffered

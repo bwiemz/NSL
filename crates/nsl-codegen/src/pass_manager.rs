@@ -543,8 +543,8 @@ impl<R> Scheduled<R> {
     /// Replace the retained tape digest with the CURRENT state of `tape`.
     ///
     /// For a `TapeAccess::MutatesInPlace` pass whose scheduled body mutates
-    /// the very list it scanned (CCR's `append_compressed_saves` appends the
-    /// compressed-save tail inside the planning region), the digest
+    /// the very list it scanned (CCR's `insert_compressed_saves` inserts the
+    /// compressed saves inside the planning region), the digest
     /// [`PassScheduler::schedule`] captured at entry describes a state the
     /// pass itself has already superseded — an
     /// [`PassScheduler::assert_tape_unchanged_since`] at the consumption fork

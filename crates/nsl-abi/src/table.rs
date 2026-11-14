@@ -442,6 +442,8 @@ macro_rules! for_each_runtime_fn {
             [abi_tensor] nsl_tensor_cast_from_host(i64, i64) -> i64 = tensor::precision_cast::nsl_tensor_cast_from_host;
             // CFTP v6 forward inline-cast wrappers: src_ptr -> new tensor (scope-tracked).
             [abi_tensor] nsl_tensor_to_bf16(i64) -> i64 = tensor::precision_cast::nsl_tensor_to_bf16;
+            // CCR compressed saves: f32 -> bf16, refusing any other source dtype.
+            [abi_tensor] nsl_ccr_compress_bf16(i64) -> i64 = tensor::precision_cast::nsl_ccr_compress_bf16;
             [abi_tensor] nsl_tensor_to_fp16(i64) -> i64 = tensor::precision_cast::nsl_tensor_to_fp16;
             [abi_tensor] nsl_tensor_to_f32(i64) -> i64 = tensor::precision_cast::nsl_tensor_to_f32;
             [abi_tensor] nsl_tensor_to_dtype(i64, i64) -> i64 = tensor::precision_cast::nsl_tensor_to_dtype;
@@ -1352,6 +1354,6 @@ mod tests {
     fn table_is_the_recorded_size() {
         // The count is pinned so a row dropped by a bad merge is noticed; move
         // it with a row that is deliberately added or removed.
-        assert_eq!(RUNTIME_ABI.len(), 678);
+        assert_eq!(RUNTIME_ABI.len(), 679);
     }
 }

@@ -96,7 +96,7 @@ pub struct BlockSegment {
 }
 
 /// The whole-tape checkpointing decision.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct CcrPlan {
     pub segments: Vec<BlockSegment>,
     /// Final RECOMPUTE set (union over segments of interior minus
@@ -813,6 +813,12 @@ fn plan_impl(
             if draws_random_numbers(&op.op) {
                 continue;
             }
+            // A compressed save (present only when a caller plans again
+            // over a tape that already carries them): it IS the saved
+            // value, and its source is freed right after it.
+            if matches!(&op.op, PrimalOp::Passthrough(n) if n.starts_with("ccr_cast_")) {
+                continue;
+            }
             if policy == CcrPolicy::Selective && selective_saves(&op.op) {
                 if compress_saves {
                     compress.push(op.result);
@@ -1405,72 +1411,120 @@ pub fn build_early_free_list(plan: &CcrPlan) -> WengertList {
     }
 }
 
-/// CCR phases 5-6: append the compressed-save tail to the PRIMAL list.
+/// The only storage format `--checkpoint-compress` offers.
+///
+/// IEEE half precision (`fp16`) was offered as well and has been withdrawn:
+/// the cast has no range check, half precision overflows to infinity above
+/// 65504, and one such activation turned the loss into NaN from the next
+/// step on. bf16 has the exponent range of f32, so it cannot overflow, and
+/// it is the same two bytes per element.
+pub const COMPRESS_DTYPE: &str = "bf16";
+
+/// CCR phases 5-6: insert the compressed saves into the PRIMAL list.
 ///
 /// For each compress victim v (a Selective-policy saved matmul-class
-/// interior consumed only by the adjoint), append:
-///     half = Passthrough("ccr_cast_fp16"|"ccr_cast_bf16")(v)
+/// interior consumed only inside its segment and by the adjoint), insert at
+/// the END OF ITS SEGMENT:
+///     half = Passthrough("ccr_cast_bf16")(v)
 ///     FreeTensor(v)
-/// The tail lowers with the main primal call, so the half tensors land in
-/// `full_vars` and are resolvable by the adjoint. The adjoint generator's
-/// reverse walk sees these tail ops FIRST and produces no adjoints (the
-/// ad_rules default arm), which is correct: they wrap saved-for-backward
-/// values.
+/// and move the plan's segment bounds to match (a segment now ends after its
+/// own casts). The inserted ops lower with the forward, so the half tensors
+/// land in `full_vars` and are resolvable by the adjoint. The adjoint
+/// generator's reverse walk produces no adjoints for them (the ad_rules
+/// default arm), which is correct: they wrap saved-for-backward values.
 ///
-/// Returns v -> half VarId. `dtype` must be "fp16" or "bf16".
-pub fn append_compressed_saves(
+/// The casts were appended after the whole forward before. Every
+/// full-precision save was then still live at the end of the forward, which
+/// is where the step's peak sits, so compressing could not lower it. At the
+/// segment end, the forward holds one segment's saves at full precision and
+/// every earlier segment's at half.
+///
+/// This MOVES primal ops: every position at or after the first insertion
+/// shifts. The plan's segments are the positional references the CCR pass
+/// itself holds, and they are rewritten here; the caller re-digests the
+/// tape for the scheduler afterwards.
+///
+/// Returns v -> half VarId.
+pub fn insert_compressed_saves(
     primal: &mut WengertList,
-    plan: &CcrPlan,
-    dtype: &str,
+    plan: &mut CcrPlan,
     fresh: &mut VarId,
 ) -> HashMap<VarId, VarId> {
-    let cast_name = match dtype {
-        "fp16" => "ccr_cast_fp16",
-        "bf16" => "ccr_cast_bf16",
-        other => panic!("[ccr] unsupported compress dtype '{other}' (fp16|bf16)"),
-    };
+    let cast_name = format!("ccr_cast_{COMPRESS_DTYPE}");
     let mut map = HashMap::new();
+    // The victims of each segment, in primal order.
+    let victims: HashSet<VarId> = plan.compress.iter().copied().collect();
+    let per_segment: Vec<Vec<VarId>> = plan
+        .segments
+        .iter()
+        .map(|seg| {
+            primal.ops[seg.start..seg.end]
+                .iter()
+                .map(|op| op.result)
+                .filter(|v| victims.contains(v))
+                .collect()
+        })
+        .collect();
     // fresh_op_id, NOT ops.len(): the primal reaching this point has been
     // through deletions (the fused-LCE prune, WGGO's sub-block prune) that
     // do not renumber, so len sits BELOW the surviving max id and a
     // len-minted id collides with a live op — at which point the id-keyed
     // claim tables (CSHA's dispatch map, CCR's own exemption set) can
-    // match the appended cast instead of the op they claimed. Hoisted to a
+    // match the inserted cast instead of the op they claimed. Hoisted to a
     // running counter (one max-scan, not one per push); uniqueness is
     // re-asserted at the end of this function.
     let mut next_id = primal.fresh_op_id();
-    for &v in &plan.compress {
-        let half = *fresh;
-        *fresh += 1;
-        let id = next_id;
-        next_id += 1;
-        primal.ops.push(WengertOp {
-            id,
-            result: half,
-            op: PrimalOp::Passthrough(cast_name.to_string()),
-            inputs: vec![v],
-            saved_for_backward: false,
-            checkpointed: false,
-        });
-        primal.var_types.insert(half, WengertType::Tensor);
-        if let Some(name) = primal.var_names.get(&v).cloned() {
-            primal.var_names.insert(half, format!("{name}.ccr_half"));
+    // Build each segment's ops first (ids and VarIds in primal order), then
+    // insert from the last segment back so earlier positions stay valid.
+    let mut inserts: Vec<Vec<WengertOp>> = Vec::with_capacity(per_segment.len());
+    for seg_victims in &per_segment {
+        let mut ops = Vec::with_capacity(seg_victims.len() * 2);
+        for &v in seg_victims {
+            let half = *fresh;
+            *fresh += 1;
+            let id = next_id;
+            next_id += 1;
+            ops.push(WengertOp {
+                id,
+                result: half,
+                op: PrimalOp::Passthrough(cast_name.clone()),
+                inputs: vec![v],
+                saved_for_backward: false,
+                checkpointed: false,
+            });
+            primal.var_types.insert(half, WengertType::Tensor);
+            if let Some(name) = primal.var_names.get(&v).cloned() {
+                primal.var_names.insert(half, format!("{name}.ccr_half"));
+            }
+            let free_result = *fresh;
+            *fresh += 1;
+            let id = next_id;
+            next_id += 1;
+            ops.push(WengertOp {
+                id,
+                result: free_result,
+                op: PrimalOp::FreeTensor,
+                inputs: vec![v],
+                saved_for_backward: false,
+                checkpointed: false,
+            });
+            map.insert(v, half);
         }
-        let free_result = *fresh;
-        *fresh += 1;
-        let id = next_id;
-        next_id += 1;
-        primal.ops.push(WengertOp {
-            id,
-            result: free_result,
-            op: PrimalOp::FreeTensor,
-            inputs: vec![v],
-            saved_for_backward: false,
-            checkpointed: false,
-        });
-        map.insert(v, half);
+        inserts.push(ops);
     }
-    primal.assert_unique_op_ids("ccr::append_compressed_saves");
+    for (si, ops) in inserts.iter().enumerate().rev() {
+        let at = plan.segments[si].end;
+        primal.ops.splice(at..at, ops.iter().cloned());
+    }
+    // Segment i moves right by everything inserted before it and grows by
+    // its own casts.
+    let mut shift = 0usize;
+    for (seg, ops) in plan.segments.iter_mut().zip(&inserts) {
+        seg.start += shift;
+        shift += ops.len();
+        seg.end += shift;
+    }
+    primal.assert_unique_op_ids("ccr::insert_compressed_saves");
     map
 }
 
@@ -2362,33 +2416,50 @@ mod tests {
         let mut primal = toy_primal();
         primal.ops[4] = op(4, 4, PrimalOp::Add, vec![9, 0]);
         primal.ops.insert(4, op(9, 9, PrimalOp::Relu, vec![3]));
-        let plan = plan(&primal, None, CcrPolicy::Selective, true, 1).unwrap();
+        let mut plan = plan(&primal, None, CcrPolicy::Selective, true, 1).unwrap();
         assert!(
             plan.compress.contains(&3) && plan.compress.contains(&5),
             "both blocks' matmul outputs compressible: {:?}",
             plan.compress
         );
+        // The tape, by position: 0 x, 1-2 block params, 3 Matmul v3,
+        // 4 Relu v9, 5 Add v4 | 6 Matmul v5, 7 Add v6, 8 head param |
+        // 9 head Matmul. Block 0 is [3, 6), block 1 is [6, 9).
+        assert_eq!((plan.segments[0].start, plan.segments[0].end), (3, 6));
+        assert_eq!((plan.segments[1].start, plan.segments[1].end), (6, 9));
 
         let mut fresh = 300;
-        let map = append_compressed_saves(&mut primal, &plan, "bf16", &mut fresh);
+        let map = insert_compressed_saves(&mut primal, &mut plan, &mut fresh);
         let half = map[&3];
-        // Tail = cast + free per compressed original.
-        let casts = primal
-            .ops
-            .iter()
-            .filter(|o| matches!(&o.op, PrimalOp::Passthrough(p) if p == "ccr_cast_bf16"))
-            .count();
-        let frees = primal
-            .ops
-            .iter()
-            .filter(|o| matches!(o.op, PrimalOp::FreeTensor))
-            .count();
-        assert_eq!(casts, 2);
-        assert_eq!(frees, 2);
-        assert!(primal
-            .ops
-            .iter()
-            .any(|o| matches!(o.op, PrimalOp::FreeTensor) && o.inputs == vec![3]));
+        let is_cast_of = |o: &WengertOp, v: VarId| {
+            matches!(&o.op, PrimalOp::Passthrough(p) if p == "ccr_cast_bf16") && o.inputs == vec![v]
+        };
+        let is_free_of =
+            |o: &WengertOp, v: VarId| matches!(o.op, PrimalOp::FreeTensor) && o.inputs == vec![v];
+        // Each block's cast and free sit at the END OF THAT BLOCK, after its
+        // last reader of the full-precision value (the Relu at 4) and before
+        // the next block's first op: v3 is released while block 1 runs, not
+        // after the whole forward.
+        assert!(is_cast_of(&primal.ops[6], 3), "{:?}", primal.ops[6]);
+        assert!(is_free_of(&primal.ops[7], 3), "{:?}", primal.ops[7]);
+        assert!(
+            matches!(primal.ops[8].op, PrimalOp::Matmul) && primal.ops[8].result == 5,
+            "block 1 starts right after block 0's casts: {:?}",
+            primal.ops[8]
+        );
+        assert!(is_cast_of(&primal.ops[11], 5), "{:?}", primal.ops[11]);
+        assert!(is_free_of(&primal.ops[12], 5), "{:?}", primal.ops[12]);
+        assert_eq!(primal.ops[13].result, 8, "the head follows block 1's casts");
+        assert_eq!(primal.ops.len(), 14);
+        // The segments moved with the ops they describe.
+        assert_eq!((plan.segments[0].start, plan.segments[0].end), (3, 8));
+        assert_eq!((plan.segments[1].start, plan.segments[1].end), (8, 13));
+        // Planning again over the rewritten tape changes nothing: a cast
+        // result is a save, not something to recompute.
+        let again = super::plan(&primal, None, CcrPolicy::Selective, true, 1).unwrap();
+        assert!(!again.recompute.contains(&half));
+        assert_eq!((again.segments[0].start, again.segments[0].end), (3, 8));
+        assert_eq!((again.segments[1].start, again.segments[1].end), (8, 13));
 
         // Adjoint consuming the original v3 gets a restore.
         let mut adjoint = WengertList {

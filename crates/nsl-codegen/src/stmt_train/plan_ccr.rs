@@ -146,6 +146,11 @@ impl Compiler<'_> {
         // with adjoint-generator ids (the generator start is bumped
         // to this watermark below).
         let mut ccr_fresh: crate::wengert::VarId = extractor.next_var_id();
+        // A request the planning below cannot honour (a stride search with
+        // no static sizes, a compression with nothing to compress). Set
+        // inside the scheduled region and raised after it, so the pass
+        // scheduler sees the region close either way.
+        let mut request_refused: Option<String> = None;
         let ccr_plan = if self.compile_options.checkpoint.blocks {
             // Milestone C: SCHEDULED as ONE region — the whole
             // search (DP partition, stride candidates, final plan)
@@ -153,8 +158,8 @@ impl Compiler<'_> {
             // (plan_impl) and last-wins dispositions already model
             // the candidate sweep. tape=None at schedule time
             // because the body itself mutates the scanned list
-            // (append_compressed_saves appends the compressed-save
-            // tail), so the entry digest would be stale by the
+            // (insert_compressed_saves inserts the compressed saves
+            // at each segment's end), so the entry digest would be stale by the
             // pass's own declared mutation — rescan_tape below
             // captures the state the pass LEFT, which is what the
             // consumption forks must see intact.
@@ -435,40 +440,57 @@ impl Compiler<'_> {
                     p.segments.len()
                 );
             }
+            let mut plan = plan;
             if let (Some(p), Some(dtype)) =
-                (&plan, self.compile_options.checkpoint.compress.as_deref())
+                (&mut plan, self.compile_options.checkpoint.compress.as_deref())
             {
-                if !p.compress.is_empty() {
-                    ccr_compress_map = crate::ccr::append_compressed_saves(
-                        &mut effective_primal,
-                        p,
-                        dtype,
-                        &mut ccr_fresh,
-                    );
-                    nsl_log::nsl_log!(INFO, "ccr", 
-                        "[ccr] compressed saves: {} matmul-class tensors -> {dtype}",
-                        ccr_compress_map.len()
-                    );
-                } else if compress_requested {
-                    nsl_log::nsl_log!(WARN, "ccr", 
-                        "[ccr] --checkpoint-compress requested but no \
-                         compressible saves exist (policy must be selective \
-                         with matmul-class interiors); continuing without"
-                    );
+                if dtype != crate::ccr::COMPRESS_DTYPE {
+                    request_refused = Some(format!(
+                        "--checkpoint-compress {dtype} is not supported: the only format \
+                         is {}. IEEE half precision (fp16) was withdrawn because it \
+                         overflows to infinity above 65504 and the cast does not check \
+                         the range, which turned the loss into NaN; bf16 has the range \
+                         of f32 and the same size.",
+                        crate::ccr::COMPRESS_DTYPE
+                    ));
+                    return None;
                 }
+                if p.compress.is_empty() {
+                    // Used to be a warning and a build that ran uncompressed.
+                    request_refused = Some(
+                        "--checkpoint-compress cannot be honoured: the selective policy \
+                         saves no matmul-, convolution- or attention-class tensor inside \
+                         this model's blocks, so there is nothing to compress. Drop the \
+                         flag."
+                            .to_string(),
+                    );
+                    return None;
+                }
+                ccr_compress_map =
+                    crate::ccr::insert_compressed_saves(&mut effective_primal, p, &mut ccr_fresh);
+                nsl_log::nsl_log!(INFO, "ccr", 
+                    "[ccr] compressed saves: {} matmul-class tensors -> {dtype}, each cast \
+                     at the end of its segment",
+                    ccr_compress_map.len()
+                );
             }
             plan
                 })
                 .map_err(CodegenError::new)?;
-            // The body appended the compressed-save tail to
-            // `effective_primal` (append-only: existing positions
-            // stay valid, but an exact-equality digest from entry
-            // would now refuse every --checkpoint-compress build).
+            // The body inserted the compressed saves into
+            // `effective_primal` at each segment's end and moved the
+            // plan's segment bounds with them (an exact-equality
+            // digest from entry would now refuse every
+            // --checkpoint-compress build).
             // Re-digest the state the pass left; the
             // apply_to_adjoint / CSLA seg_bounds forks below assert
             // against THIS.
             scheduled.rescan_tape(&effective_primal);
-            scheduled.finish(&self.bus).map_err(CodegenError::new)?
+            let plan = scheduled.finish(&self.bus).map_err(CodegenError::new)?;
+            if let Some(why) = request_refused {
+                return Err(CodegenError::new(why));
+            }
+            plan
         } else {
             None
         };

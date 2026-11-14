@@ -3657,12 +3657,11 @@ fn lower_single_op(
         PrimalOp::Passthrough(name) => {
             match name.as_str() {
                 // CCR compressed saves (paper phases 5-6): spliced by
-                // ccr::append_compressed_saves / apply_to_adjoint AFTER
+                // ccr::insert_compressed_saves / apply_to_adjoint AFTER
                 // adjoint generation — never differentiated (the ad_rules
                 // default arm yields no adjoint, which is correct: these
                 // wrap saved-for-backward-only tensors).
-                "ccr_cast_fp16" => call(compiler, builder, "nsl_tensor_to_fp16", &[inputs[0]]),
-                "ccr_cast_bf16" => call(compiler, builder, "nsl_tensor_to_bf16", &[inputs[0]]),
+                "ccr_cast_bf16" => call(compiler, builder, "nsl_ccr_compress_bf16", &[inputs[0]]),
                 "ccr_cast_f32" => call(compiler, builder, "nsl_tensor_to_f32", &[inputs[0]]),
                 // CCR recompute-clone bracket: a recompute clone replays an
                 // original FORWARD op (e.g. `silu(x)`) but is spliced into

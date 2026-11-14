@@ -1425,11 +1425,13 @@ pub struct CheckpointOptions {
     /// number is a soft target, not a hard cap), so the dual use is safe but
     /// deliberate; unifying them is future work (the full DP scheduler).
     pub stride: CheckpointStride,
-    /// CCR phases 5-6 (`--checkpoint-compress fp16|bf16`): compress the
-    /// Selective policy's saved matmul-class interiors to half precision
-    /// between forward and backward (cast-on-save, dequant-on-load via the
-    /// CFTP-v7 GPU cast kernels). NOT bit-exact — backward reads rounded
-    /// activations; gated by the repo's 3-4 dp loss-parity standard.
+    /// CCR phases 5-6 (`--checkpoint-compress bf16`): compress the
+    /// Selective policy's saved matmul-class interiors to bf16, each at the
+    /// end of its block segment, and widen it back to f32 before its first
+    /// reader in the backward (the CFTP-v7 GPU cast kernels). NOT bit-exact —
+    /// backward reads rounded activations; gated by the repo's 3-4 dp
+    /// loss-parity standard. `Some("bf16")` is the only accepted value
+    /// (`ccr::COMPRESS_DTYPE`); anything else fails the build.
     pub compress: Option<String>,
     /// Cycle-10 §5.3 paper checkpointing-aware backward (Task 6):
     /// per-function `@checkpoint(policy=...)` policies collected by
