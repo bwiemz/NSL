@@ -1,65 +1,39 @@
-//! CFIE Cycle 13 (G15 draft-model-in-binary): the two draft-side
-//! sampler-family kernels.
+//! The draft model's sampler kernel, and the builder sections it shares
+//! with the fused sampler (`cfie_sample_ptx`).
 //!
-//!   * `nsl_cfie_draft_sample` (registration kind 7) - greedy argmax +
-//!     p(chosen) over the DRAFT model's LM head.  The paper drafts K
-//!     tokens at temperature 0.0, recording `draft_probs[k] =
-//!     softmax(draft_logits)[chosen]`; greedy means chosen == argmax,
-//!     so p(argmax) falls out of ONE streaming flash-softmax pass for
-//!     free: `exp(x_argmax - max) == 1`, hence `p = 1 / sum_final`.
-//!     The pass keeps a running max + argmax + online sum of
-//!     `exp(x - max)` with rescale - the same trick the fused sampler
-//!     (`cfie_sample_ptx`) already uses.  `rng_seed` is ACCEPTED for
-//!     ABI symmetry with the fused sampler but UNUSED - v1 drafting is
-//!     greedy per the paper.
+//! `nsl_cfie_draft_sample` (registration kind 7) is a greedy argmax over
+//! the DRAFT model's LM head: one streaming pass over the vocabulary
+//! tiles keeps a running max and argmax. It also writes the argmax's
+//! softmax probability (`1 / sum_final`, from an online sum of
+//! `exp(x - max)` kept in the same pass). That number is a diagnostic:
+//! the speculative driver does not read it, because a greedy draft
+//! proposes its token with probability 1, and it is that 1, not the
+//! softmax value, that the acceptance rule divides by. `rng_seed` is
+//! accepted and unused.
 //!
-//!   * `nsl_cfie_verify_probs` (registration kind 8) - full softmaxed
-//!     prob-ROW writer for the TARGET model.  The fused sampler never
-//!     materializes probs by design (its whole point is that the
-//!     `[1, vocab]` logits row never touches HBM), but the rejection
-//!     kernel (`cfie_speculative_ptx::REJECT_KERNEL_NAME`, kind 4)
-//!     consumes softmaxed f32 rows `target_probs[k][vocab]`.  This
-//!     kernel EXISTS to materialize that row: pass 1 computes max +
-//!     sum online (recomputing the matvec per tile), pass 2 recomputes
-//!     the matvec per tile and stores `p_i = exp(x_i - max) / sum`.
-//!     The 2x matvec is the price of never staging the logits row and
-//!     is bounded by K <= 32 verify positions per round.
+//! The kernel is sampler-family: NO KV access, grid = 1 CTA, block = 128,
+//! static `.shared`. RMSNorm(hidden) with the final-norm gamma runs once
+//! into SMEM (strided partial sums, SMEM tree reduction, rsqrt.approx,
+//! gamma scale in place), the same section the fused sampler starts with.
 //!
-//! Both kernels are sampler-family: NO KV access, grid = 1 CTA,
-//! block = 128, static `.shared`.  RMSNorm(hidden) with the final-norm
-//! gamma runs once into SMEM - the section is identical to
-//! `cfie_sample_ptx` (strided partial sums, SMEM tree reduction,
-//! rsqrt.approx, gamma scale in place).
+//! This module used to hold a second kernel, `nsl_cfie_verify_probs`
+//! (kind 8), which wrote the target's softmax row for a rejection kernel.
+//! Both are gone: that row was a temperature-1 softmax with no top-k or
+//! top-p, so verification sampled a different distribution from the
+//! configured sampler. Verification now runs the fused sampler itself
+//! (`nsl_runtime::cfie::engine`, `speculative_rounds`).
 //!
-//! Lossless self-speculation anchor (the engine's determinism proof):
-//! with draft == target weights both kernels compute bit-identical
-//! (max, sum) - same fma dot order, same online-merge order - so
-//! `p_draft = div(1, sum)` from kind 7 equals
-//! `p_target[tok] = div(ex2(0), sum)` from kind 8 bit-for-bit
-//! (`ex2(+-0) == 1.0` exactly per the PTX ISA).  The reject kernel's
-//! ratio is then exactly 1.0 and every drafted token accepts
-//! regardless of seed.  Both kernels are built from the same builder
-//! sections below, so the shared order is one piece of code, not two
-//! copies kept in step.
-//!
-//! `cpu_reference_*` mirror the kernels' arithmetic order exactly
-//! (same strided partial sums + tree reduction, same fma dot order,
-//! same online max/sum merge, same division).  The kernels use
-//! `rsqrt.approx` / `ex2.approx` where the CPU uses exact libm - token
-//! parity is expected-exact modulo rsqrt.approx rounding on knife-edge
-//! argmax ties (the rstd delta perturbs the normalized hidden by <1
-//! ulp-scale, so only dots equal to within that delta could flip), and
-//! prob parity is tight-float.  The determinism contract does NOT rest
-//! on CPU-vs-GPU parity - it rests on GPU-side kind-7 vs kind-8 BIT
-//! identity (above), proven by the engine's self-speculation contract
-//! (spec generate == plain generate).
+//! `cpu_reference_draft_sample` mirrors the kernel's arithmetic order
+//! (same strided partial sums + tree reduction, same fma dot order, same
+//! online max/sum merge, same division). The kernel uses `rsqrt.approx` /
+//! `ex2.approx` where the CPU uses exact libm.
 //!
 //! ## KIR (roadmap A2 step 9)
 //!
-//! Both kernels were hand-assembled PTX text until A2 step 9; they are now
+//! The kernel was hand-assembled PTX text until A2 step 9; it is now
 //! [`KernelIR`] that the verifier checks before `nsl_kir`'s printer lowers
 //! it. The algorithm, and the order of every floating-point operation in
-//! it, is the hand kernels' — `tests/cfie_spec_sampler_kir_equivalence.rs`
+//! it, is the hand kernel's — `tests/cfie_spec_sampler_kir_equivalence.rs`
 //! runs the frozen hand emitter and this one side by side on a PTX
 //! interpreter and requires the same output bits. As for
 //! `cfie_decode_attention`: addresses are element indices through
@@ -85,31 +59,24 @@ use crate::kernel_ir::{
 const TILE: u32 = 128;
 const BLOCK_DIM: u32 = TILE;
 
-/// Baked RMSNorm epsilon - same value as `cfie_sample_ptx` (paper
-/// stage 1); the draft and target final norms share it.
-const RMS_EPS: f32 = 1e-5;
-
 pub const DRAFT_SAMPLE_KERNEL_NAME: &str = "nsl_cfie_draft_sample";
-pub const VERIFY_PROBS_KERNEL_NAME: &str = "nsl_cfie_verify_probs";
 
 /// Registration kind the serve wiring passes to
 /// `nsl_cfie_register_kernel` for the draft sampler (Cycle-13 frozen
 /// ABI; kinds 0-5 are the Cycle-6 ABI in `cfie.rs`, kind 6 is the
 /// draft decode_block emitted by `cfie_persistent_ptx`).
 pub const DRAFT_SAMPLE_KERNEL_KIND: u8 = 7;
-/// Registration kind for the verify prob-row writer (Cycle-13 ABI).
-pub const VERIFY_PROBS_KERNEL_KIND: u8 = 8;
-
-/// Compile-time configuration shared by both kernels - mirrors
-/// `cfie_sample_ptx::FusedSampleKernelConfig` minus the sampling
-/// params (the draft is fixed-function greedy; the verify writer has
-/// no sampling at all) and minus `sm_version`: the modules target the
-/// KIR floor and the driver JIT-compiles them forward.
+/// Compile-time configuration of the draft sampler - mirrors
+/// `cfie_sample_ptx::FusedSampleKernelConfig` minus the sampling params
+/// (the draft is fixed-function greedy) and minus `sm_version`: the
+/// module targets the KIR floor and the driver JIT-compiles it forward.
 #[derive(Debug, Clone)]
 pub struct SpecSamplerConfig {
     pub d_model: u32,
     pub vocab_size: u32,
     pub vocab_tile: u32,
+    /// The final RMSNorm's epsilon (the model's `norm_eps`).
+    pub norm_eps: f32,
 }
 
 /// Host-readable launch metadata emitted alongside the PTX.
@@ -144,29 +111,21 @@ fn validate_config(cfg: &SpecSamplerConfig) {
 const R_HIDDEN: u32 = 0;
 const R_SCORES: u32 = 1;
 const R_RSTD: u32 = 2;
-/// Verify only: pass 1's (max, sum), published by thread 0.
-const R_MAX: u32 = 3;
-const R_SUM: u32 = 4;
 
-/// `[hidden: d_model][scores: TILE][rstd: 1]`, plus `[max: 1][sum: 1]` for
-/// the verify writer; all f32, 4-aligned and a multiple of 4 long, so the
-/// offsets are the hand kernels' packed ones.
-fn smem_layout(d_model: u32, verify: bool) -> SmemLayout {
+/// `[hidden: d_model][scores: TILE][rstd: 1]`; all f32, 4-aligned and a
+/// multiple of 4 long, so the offsets are the hand kernel's packed ones.
+fn smem_layout(d_model: u32) -> SmemLayout {
     let f32_region = |name: &str, elems: u32| SmemRegion {
         name: name.to_string(),
         bytes: elems * 4,
         align: 4,
         elem: KirType::F32,
     };
-    let mut regions = vec![
+    let regions = vec![
         f32_region("hidden", d_model),
         f32_region("scores", TILE),
         f32_region("rstd", 1),
     ];
-    if verify {
-        regions.push(f32_region("max", 1));
-        regions.push(f32_region("sum", 1));
-    }
     SmemLayout { regions, dynamic: false }
 }
 
@@ -191,6 +150,8 @@ pub(crate) struct Common {
     /// The same value as `d_model`, for the `1 / d_model` immediate.
     pub(crate) d_model_value: u32,
     pub(crate) d_model_wide: VarId,
+    /// The final RMSNorm's epsilon.
+    pub(crate) norm_eps: f32,
     pub(crate) vocab: VarId,
     pub(crate) f_zero: VarId,
     pub(crate) f_neg_inf: VarId,
@@ -275,7 +236,7 @@ pub(crate) fn rmsnorm_in_place(b: &mut KirBuilder, c: &Common) {
     let total = load(b, F32, c.scores, Shared);
     let inv_dm = konst(b, ConstValue::F32(1.0 / c.d_model_value as f32));
     let mean = op2(b, F32, KirOp::Mul, total, inv_dm);
-    let eps = konst(b, ConstValue::F32(RMS_EPS));
+    let eps = konst(b, ConstValue::F32(c.norm_eps));
     let shifted = op2(b, F32, KirOp::Add, mean, eps);
     let rstd = b.new_typed_var(F32);
     b.emit(KirOp::Rsqrt(rstd, shifted));
@@ -412,13 +373,11 @@ pub(crate) fn build_row_dot(b: &mut KirBuilder, c: &Common, tok: VarId) -> VarId
 
 /// The running state of the streaming pass once every tile is merged.
 struct PassResult {
-    max: VarId,
     sum: VarId,
-    /// Draft only.
     argmax: Option<VarId>,
 }
 
-/// Step 3 (both kernels) / pass 1 (verify): per tile every thread scores
+/// Step 3: per tile every thread scores
 /// its row into SMEM, then thread 0 merges the tile's `cnt` scores into
 /// the running (max, sum[, argmax]) serially — per element
 ///   if s > m: sum *= exp(m - s); m = s; [sel = token;]
@@ -547,13 +506,13 @@ fn streaming_pass(b: &mut KirBuilder, c: &Common, track_argmax: bool) -> PassRes
     b.terminate(KirTerminator::Branch(KirEdge::with(tile_head, with_state(vec![tile_next], merged_state))));
 
     b.set_block(tiles_done);
-    let (max, sum, argmax) = tile_state;
-    PassResult { max, sum, argmax }
+    let (_max, sum, argmax) = tile_state;
+    PassResult { sum, argmax }
 }
 
 /// The builder, the params both kernels share (hidden, norm_w, lm_head)
 /// already added in FFI order, and the entry block started.
-fn begin(name: &str, cfg: &SpecSamplerConfig, verify: bool) -> (KirBuilder, VarId, VarId, VarId) {
+fn begin(name: &str, cfg: &SpecSamplerConfig) -> (KirBuilder, VarId, VarId, VarId) {
     use AddressSpace::Global;
     use KirType::{F16, F32};
 
@@ -561,7 +520,7 @@ fn begin(name: &str, cfg: &SpecSamplerConfig, verify: bool) -> (KirBuilder, VarI
     let hidden = b.add_param("hidden_ptr", ptr(F32, Global), Global);
     let norm_w = b.add_param("norm_w_ptr", ptr(F32, Global), Global);
     let lm_head = b.add_param("lm_head_ptr", ptr(F16, Global), Global);
-    b.set_smem_layout(smem_layout(cfg.d_model, verify));
+    b.set_smem_layout(smem_layout(cfg.d_model));
     b.set_workgroup_size([BLOCK_DIM, 1, 1]);
     (b, hidden, norm_w, lm_head)
 }
@@ -569,7 +528,7 @@ fn begin(name: &str, cfg: &SpecSamplerConfig, verify: bool) -> (KirBuilder, VarI
 /// The entry block's shared values. Call with the builder in the entry
 /// block, after every param is added.
 fn common(b: &mut KirBuilder, cfg: &SpecSamplerConfig, hidden: VarId, norm_w: VarId, lm_head: VarId) -> Common {
-    common_at(b, cfg.d_model, cfg.vocab_size, [hidden, norm_w, lm_head], R_RSTD)
+    common_at(b, cfg.d_model, cfg.vocab_size, cfg.norm_eps, [hidden, norm_w, lm_head], R_RSTD)
 }
 
 /// [`common`] for any kernel whose shared layout starts `[hidden][scores]`
@@ -579,6 +538,7 @@ pub(crate) fn common_at(
     b: &mut KirBuilder,
     d_model: u32,
     vocab_size: u32,
+    norm_eps: f32,
     pointers: [VarId; 3],
     rstd_region: u32,
 ) -> Common {
@@ -599,6 +559,7 @@ pub(crate) fn common_at(
         d_model: konst(b, ConstValue::U32(d_model)),
         d_model_value: d_model,
         d_model_wide: konst(b, ConstValue::U64(d_model as u64)),
+        norm_eps,
         vocab: konst(b, ConstValue::U32(vocab_size)),
         f_zero: konst(b, ConstValue::F32(0.0)),
         f_neg_inf: konst(b, ConstValue::F32(f32::NEG_INFINITY)),
@@ -615,7 +576,7 @@ pub fn build_draft_sample(cfg: &SpecSamplerConfig) -> KernelIR {
     use KirType::{F32, U32, U64};
 
     validate_config(cfg);
-    let (mut b, hidden, norm_w, lm_head) = begin(DRAFT_SAMPLE_KERNEL_NAME, cfg, false);
+    let (mut b, hidden, norm_w, lm_head) = begin(DRAFT_SAMPLE_KERNEL_NAME, cfg);
     let out_token = b.add_param("out_token_ptr", ptr(U32, Global), Global);
     let out_prob = b.add_param("out_prob_ptr", ptr(F32, Global), Global);
     // ACCEPTED for ABI symmetry with the fused sampler; UNUSED - v1
@@ -650,120 +611,28 @@ pub fn build_draft_sample(cfg: &SpecSamplerConfig) -> KernelIR {
 }
 
 // ---------------------------------------------------------------------------
-// Kind 8: nsl_cfie_verify_probs
-// ---------------------------------------------------------------------------
-
-/// The target prob-row writer for `cfg`, as KIR.
-pub fn build_verify_probs(cfg: &SpecSamplerConfig) -> KernelIR {
-    use AddressSpace::{Global, Shared};
-    use KirType::{F32, U32};
-
-    validate_config(cfg);
-    let (mut b, hidden, norm_w, lm_head) = begin(VERIFY_PROBS_KERNEL_NAME, cfg, true);
-    let out = b.add_param("out_probs_ptr", ptr(F32, Global), Global);
-
-    let entry = b.new_block();
-    b.set_block(entry);
-    let c = common(&mut b, cfg, hidden, norm_w, lm_head);
-    let max_smem = shared_region(&mut b, R_MAX);
-    let sum_smem = shared_region(&mut b, R_SUM);
-
-    hidden_load_and_rmsnorm(&mut b, &c);
-    // Pass 1: identical merge order to nsl_cfie_draft_sample — the
-    // self-speculation anchor relies on bit-identical (max, sum).
-    let pass = streaming_pass(&mut b, &c, false);
-
-    // Thread 0 publishes (max, sum); every thread reloads them.
-    let publish = b.new_block();
-    let published = b.new_block();
-    let is_zero = cmp(&mut b, c.tid, c.zero, CmpOp::Eq);
-    b.terminate(KirTerminator::CondBranch(is_zero, KirEdge::to(publish), KirEdge::to(published)));
-
-    b.set_block(publish);
-    b.emit(KirOp::Store(max_smem, pass.max, Shared));
-    b.emit(KirOp::Store(sum_smem, pass.sum, Shared));
-    b.terminate(KirTerminator::Branch(KirEdge::to(published)));
-
-    b.set_block(published);
-    b.emit(KirOp::Barrier);
-    let m = load(&mut b, F32, max_smem, Shared);
-    let sum = load(&mut b, F32, sum_smem, Shared);
-
-    // Pass 2: recompute the matvec per tile and store the row. No SMEM
-    // writes, so no barriers inside the loop.
-    let tile_head = b.new_block();
-    let tile_body = b.new_block();
-    let dot_start = b.new_block();
-    let next = b.new_block();
-    let exit = b.new_block();
-    let tile = b.add_block_param(tile_head, U32);
-    b.terminate(KirTerminator::Branch(KirEdge::with(tile_head, vec![c.zero])));
-
-    b.set_block(tile_head);
-    let finished = cmp(&mut b, tile, c.vocab, CmpOp::Ge);
-    b.terminate(KirTerminator::CondBranch(finished, KirEdge::to(exit), KirEdge::to(tile_body)));
-
-    // Tail-tile guard: lanes past vocab store nothing.
-    b.set_block(tile_body);
-    let tok = op2(&mut b, U32, KirOp::Add, tile, c.tid);
-    let past = cmp(&mut b, tok, c.vocab, CmpOp::Ge);
-    b.terminate(KirTerminator::CondBranch(past, KirEdge::to(next), KirEdge::to(dot_start)));
-
-    // p = exp(x - max) / sum; div.rn matches the CPU '/'.
-    b.set_block(dot_start);
-    let dot = build_row_dot(&mut b, &c, tok);
-    let shifted = op2(&mut b, F32, KirOp::Sub, dot, m);
-    let e = b.new_typed_var(F32);
-    b.emit(KirOp::Exp(e, shifted));
-    let p = op2(&mut b, F32, KirOp::Div, e, sum);
-    let dst = at(&mut b, F32, Global, out, tok);
-    b.emit(KirOp::Store(dst, p, Global));
-    b.terminate(KirTerminator::Branch(KirEdge::to(next)));
-
-    b.set_block(next);
-    let tile_next = op2(&mut b, U32, KirOp::Add, tile, c.tile_width);
-    b.terminate(KirTerminator::Branch(KirEdge::with(tile_head, vec![tile_next])));
-
-    b.set_block(exit);
-    b.terminate(KirTerminator::Return);
-    b.finalize()
-}
-
-// ---------------------------------------------------------------------------
 // Emission
 // ---------------------------------------------------------------------------
 
-/// The `//` header the hand kernels carried, line for line.
-fn header_comment(cfg: &SpecSamplerConfig, verify: bool) -> String {
-    let eps = f32_imm(RMS_EPS);
+/// The `//` header the hand kernel carried, line for line.
+fn header_comment(cfg: &SpecSamplerConfig) -> String {
+    let eps = f32_imm(cfg.norm_eps);
     let mut w = String::new();
     writeln!(w, "//").unwrap();
-    if verify {
-        writeln!(w, "// {} - CFIE target prob-row writer (Cycle 13, G15).", VERIFY_PROBS_KERNEL_NAME).unwrap();
-        writeln!(w, "// One CTA, {} threads; TWO passes over the vocab tiles:", BLOCK_DIM).unwrap();
-        writeln!(w, "//   pass 1: online max + exp-sum (recomputing the matvec per tile),").unwrap();
-        writeln!(w, "//   pass 2: recompute the matvec, store p_i = exp(x_i - max)/sum.").unwrap();
-        writeln!(w, "// This kernel EXISTS to materialize softmaxed f32 rows for the").unwrap();
-        writeln!(w, "// rejection kernel (nsl_cfie_spec_reject) - the fused sampler never").unwrap();
-        writeln!(w, "// writes probs by design.  The 2x matvec is the price and is").unwrap();
-        writeln!(w, "// bounded by K <= 32 verify positions per round.").unwrap();
-        writeln!(w, "// LM-head layout: f16 [vocab, d_model], ROW-major per vocab row.").unwrap();
-    } else {
-        writeln!(w, "// {} - CFIE draft-model greedy sampler (Cycle 13, G15).", DRAFT_SAMPLE_KERNEL_NAME).unwrap();
-        writeln!(w, "// One CTA, {} threads; ONE streaming pass over the vocab tiles keeps", BLOCK_DIM).unwrap();
-        writeln!(w, "// a running max + argmax + online sum of exp(x - max) with rescale").unwrap();
-        writeln!(w, "// (flash softmax).  p(argmax) = 1/sum_final because").unwrap();
-        writeln!(w, "// exp(x_argmax - max) == 1 when the argmax attains the max.").unwrap();
-        writeln!(w, "// Outputs: token id (u32) + p(argmax) (f32) - 8 bytes to HBM.").unwrap();
-        writeln!(w, "// LM-head layout: f16 [vocab, d_model], ROW-major per vocab row.").unwrap();
-        writeln!(w, "// rng_seed is ACCEPTED for ABI symmetry with the fused sampler but").unwrap();
-        writeln!(w, "// UNUSED: v1 drafting is greedy (the paper's temperature 0.0).").unwrap();
-    }
+    writeln!(w, "// {} - CFIE draft-model greedy sampler (Cycle 13, G15).", DRAFT_SAMPLE_KERNEL_NAME).unwrap();
+    writeln!(w, "// One CTA, {} threads; ONE streaming pass over the vocab tiles keeps", BLOCK_DIM).unwrap();
+    writeln!(w, "// a running max + argmax + online sum of exp(x - max) with rescale").unwrap();
+    writeln!(w, "// (flash softmax).  p(argmax) = 1/sum_final because").unwrap();
+    writeln!(w, "// exp(x_argmax - max) == 1 when the argmax attains the max.").unwrap();
+    writeln!(w, "// Outputs: token id (u32) + p(argmax) (f32) - 8 bytes to HBM.").unwrap();
+    writeln!(w, "// LM-head layout: f16 [vocab, d_model], ROW-major per vocab row.").unwrap();
+    writeln!(w, "// rng_seed is ACCEPTED for ABI symmetry with the fused sampler but").unwrap();
+    writeln!(w, "// UNUSED: v1 drafting is greedy (the paper's temperature 0.0).").unwrap();
     writeln!(w, "// Baked constants:").unwrap();
     writeln!(w, "//   d_model    = {}", cfg.d_model).unwrap();
     writeln!(w, "//   vocab_size = {}", cfg.vocab_size).unwrap();
     writeln!(w, "//   vocab_tile = {}", TILE).unwrap();
-    writeln!(w, "//   rms_eps    = {} ({})", RMS_EPS, eps).unwrap();
+    writeln!(w, "//   rms_eps    = {} ({})", cfg.norm_eps, eps).unwrap();
     writeln!(w, "//").unwrap();
     w
 }
@@ -771,7 +640,7 @@ fn header_comment(cfg: &SpecSamplerConfig, verify: bool) -> String {
 /// Verify, lower and prefix the header. The returned text carries no NUL:
 /// the serve path appends the one the driver wants when it embeds the
 /// module.
-fn emit(ir: &KernelIR, cfg: &SpecSamplerConfig, verify: bool) -> (String, SpecSamplerMeta) {
+fn emit(ir: &KernelIR, cfg: &SpecSamplerConfig) -> (String, SpecSamplerMeta) {
     if let Err(errors) = crate::kir_verify::verify(ir) {
         panic!("{} failed KIR verification: {errors:?}", ir.name);
     }
@@ -780,7 +649,7 @@ fn emit(ir: &KernelIR, cfg: &SpecSamplerConfig, verify: bool) -> (String, SpecSa
     let module = module.strip_suffix(&[0]).unwrap_or(&module);
     let module = std::str::from_utf8(module).expect("the KIR printer emits ASCII");
 
-    let mut p = header_comment(cfg, verify);
+    let mut p = header_comment(cfg);
     p.push_str(module);
     let meta = SpecSamplerMeta { kernel_name: ir.name.clone(), smem_bytes, block_dim: BLOCK_DIM };
     (p, meta)
@@ -788,22 +657,12 @@ fn emit(ir: &KernelIR, cfg: &SpecSamplerConfig, verify: bool) -> (String, SpecSa
 
 /// Emit the draft greedy sampler kernel for `cfg`.
 pub fn emit_draft_sample(cfg: &SpecSamplerConfig) -> (String, SpecSamplerMeta) {
-    emit(&build_draft_sample(cfg), cfg, false)
+    emit(&build_draft_sample(cfg), cfg)
 }
 
 /// PTX-only convenience wrapper around [`emit_draft_sample`].
 pub fn emit_draft_sample_ptx(cfg: &SpecSamplerConfig) -> String {
     emit_draft_sample(cfg).0
-}
-
-/// Emit the target prob-row writer kernel for `cfg`.
-pub fn emit_verify_probs(cfg: &SpecSamplerConfig) -> (String, SpecSamplerMeta) {
-    emit(&build_verify_probs(cfg), cfg, true)
-}
-
-/// PTX-only convenience wrapper around [`emit_verify_probs`].
-pub fn emit_verify_probs_ptx(cfg: &SpecSamplerConfig) -> String {
-    emit_verify_probs(cfg).0
 }
 
 
@@ -816,7 +675,7 @@ pub fn emit_verify_probs_ptx(cfg: &SpecSamplerConfig) -> String {
 /// (and to `cfie_sample_ptx::cpu_reference`).  The kernel's
 /// `rsqrt.approx` is exact libm here; token parity is unaffected (the
 /// argmax compares dots computed from the same scaled hidden).
-fn rms_norm_kernel_order(hidden: &[f32], norm_w: &[f32]) -> Vec<f32> {
+fn rms_norm_kernel_order(hidden: &[f32], norm_w: &[f32], norm_eps: f32) -> Vec<f32> {
     let dm = hidden.len();
     let mut partials = [0f32; TILE as usize];
     for (t, part) in partials.iter_mut().enumerate() {
@@ -834,7 +693,7 @@ fn rms_norm_kernel_order(hidden: &[f32], norm_w: &[f32]) -> Vec<f32> {
         }
     }
     let mean = partials[0] * (1.0 / dm as f32);
-    let rstd = 1.0 / (mean + RMS_EPS).sqrt();
+    let rstd = 1.0 / (mean + norm_eps).sqrt();
     hidden
         .iter()
         .zip(norm_w)
@@ -923,31 +782,9 @@ pub fn cpu_reference_draft_sample(
     lm_head_f32: &[f32],
 ) -> (u32, f32) {
     let (_, vocab) = validate_cpu_inputs(cfg, hidden, norm_w, lm_head_f32);
-    let h = rms_norm_kernel_order(hidden, norm_w);
+    let h = rms_norm_kernel_order(hidden, norm_w, cfg.norm_eps);
     let st = online_pass(&h, lm_head_f32, vocab);
     (st.sel, 1.0 / st.sum)
-}
-
-/// CPU mirror of `nsl_cfie_verify_probs`: returns the softmaxed prob
-/// row `[vocab]` the rejection kernel consumes.  Pass 2 recomputes
-/// the matvec per token exactly like the kernel does (the price of
-/// never staging the logits row).
-pub fn cpu_reference_verify_probs(
-    cfg: &SpecSamplerConfig,
-    hidden: &[f32],
-    norm_w: &[f32],
-    lm_head_f32: &[f32],
-) -> Vec<f32> {
-    let (_, vocab) = validate_cpu_inputs(cfg, hidden, norm_w, lm_head_f32);
-    let log2e = std::f32::consts::LOG2_E;
-    let h = rms_norm_kernel_order(hidden, norm_w);
-    let st = online_pass(&h, lm_head_f32, vocab);
-    (0..vocab)
-        .map(|tok| {
-            let dot = row_dot(&h, lm_head_f32, tok);
-            ((dot - st.m) * log2e).exp2() / st.sum
-        })
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -958,15 +795,19 @@ pub fn cpu_reference_verify_probs(
 mod tests {
     use super::*;
     use crate::cfie_fused_sample::{emit_program, LmHeadShape, SamplingParams, SamplingStrategy};
-    use crate::cfie_speculative_ptx::{cpu_reference_reject, RejectionConfig};
 
     fn cfg(d_model: u32, vocab_size: u32) -> SpecSamplerConfig {
         SpecSamplerConfig {
             d_model,
             vocab_size,
             vocab_tile: 128,
+            norm_eps: RMS_EPS,
         }
     }
+
+    /// The epsilon the tests bake; `norm_eps_reaches_the_kernel` checks
+    /// that another value is honoured.
+    const RMS_EPS: f32 = 1e-5;
 
     /// Reference config from the CFIE paper's NSL-Coder example (the
     /// draft model shares the target's vocab per the spec sub-block).
@@ -1034,16 +875,6 @@ mod tests {
     }
 
     #[test]
-    fn verify_param_list_is_exactly_the_four_params() {
-        let ir = build_verify_probs(&paper_cfg());
-        assert_eq!(param_names(&ir), ["hidden_ptr", "norm_w_ptr", "lm_head_ptr", "out_probs_ptr"]);
-        let ptx = emit_verify_probs_ptx(&paper_cfg());
-        for name in param_names(&ir) {
-            assert!(ptx.contains(&format!(".param .u64 param_{name}")), "{name}");
-        }
-    }
-
-    #[test]
     fn draft_stores_exactly_token_and_prob() {
         // The draft sampler's whole output is 8 bytes: token + prob,
         // stored straight through the two output params.
@@ -1060,25 +891,8 @@ mod tests {
     }
 
     #[test]
-    fn verify_single_global_store_is_the_prob_row() {
-        // One global store in the pass-2 loop body - executed once per
-        // vocab entry, the row the reject kernel consumes.
-        let ir = build_verify_probs(&paper_cfg());
-        let stores = global_stores(&ir);
-        assert_eq!(stores.len(), 1);
-        assert_eq!(ir.var_types[&stores[0].1], KirType::F32);
-        // Normalization is an f32 Div (div.rn) so the CPU '/' mirrors it
-        // exactly.
-        assert_eq!(count(&ir, |op| matches!(op, KirOp::Div(..))), 1);
-        assert!(emit_verify_probs_ptx(&paper_cfg()).contains("div.rn.f32"));
-    }
-
-    #[test]
-    fn no_mad_lo_ascii_only_and_line_width_both_kernels() {
-        for ptx in [
-            emit_draft_sample_ptx(&paper_cfg()),
-            emit_verify_probs_ptx(&paper_cfg()),
-        ] {
+    fn no_mad_lo_ascii_only_and_line_width() {
+        for ptx in [emit_draft_sample_ptx(&paper_cfg())] {
             assert!(!ptx.contains("mad."), "mad.lo.u32 is invalid at PTX ISA 7.0");
             assert!(
                 ptx.bytes().all(|b| b < 128),
@@ -1114,12 +928,10 @@ mod tests {
     }
 
     #[test]
-    fn rmsnorm_and_flash_softmax_sections_present_in_both() {
+    fn rmsnorm_and_flash_softmax_sections_present() {
         for (ir, exps) in [
             // Rescale + accumulate in the merge.
             (build_draft_sample(&paper_cfg()), 2),
-            // The same two in pass 1, plus pass 2's p = exp(x - max).
-            (build_verify_probs(&paper_cfg()), 3),
         ] {
             assert_eq!(count(&ir, |op| matches!(op, KirOp::Rsqrt(..))), 1, "{}", ir.name);
             assert_eq!(count(&ir, |op| matches!(op, KirOp::Exp(..))), exps, "{}", ir.name);
@@ -1128,10 +940,7 @@ mod tests {
             let barriers = count(&ir, |op| matches!(op, KirOp::Barrier));
             assert!(barriers >= 13, "{}: {barriers} barriers", ir.name);
         }
-        for ptx in [
-            emit_draft_sample_ptx(&paper_cfg()),
-            emit_verify_probs_ptx(&paper_cfg()),
-        ] {
+        for ptx in [emit_draft_sample_ptx(&paper_cfg())] {
             assert!(ptx.contains("rsqrt.approx.f32"));
             assert!(ptx.contains(&f32_imm(RMS_EPS)));
             assert!(ptx.contains("ex2.approx.f32"));
@@ -1143,10 +952,7 @@ mod tests {
         // No sm_version: the modules target the KIR floor and the driver
         // JIT-compiles them forward (tests/cfie_ptx_headers_ptxas.rs
         // assembles them for every serving architecture).
-        for ptx in [
-            emit_draft_sample_ptx(&paper_cfg()),
-            emit_verify_probs_ptx(&paper_cfg()),
-        ] {
+        for ptx in [emit_draft_sample_ptx(&paper_cfg())] {
             assert!(ptx.starts_with("//"));
             assert!(ptx.contains(".version 7.0\n.target sm_70\n.address_size 64"));
         }
@@ -1160,19 +966,35 @@ mod tests {
         // hidden(512 f32) + scores(128 f32) + rstd.
         assert_eq!(meta.smem_bytes, 512 * 4 + 128 * 4 + 4);
         assert!(ptx.contains(&format!(".shared .align 4 .b8 shared_mem[{}];", meta.smem_bytes)));
-
-        let (ptx, meta) = emit_verify_probs(&paper_cfg());
-        assert_eq!(meta.kernel_name, VERIFY_PROBS_KERNEL_NAME);
-        assert_eq!(meta.block_dim, 128);
-        // hidden + scores + rstd + max + sum.
-        assert_eq!(meta.smem_bytes, 512 * 4 + 128 * 4 + 12);
-        assert!(ptx.contains(&format!(".shared .align 4 .b8 shared_mem[{}];", meta.smem_bytes)));
     }
 
     #[test]
-    fn registration_kinds_match_the_cycle13_abi() {
+    fn registration_kind_matches_the_runtime() {
         assert_eq!(DRAFT_SAMPLE_KERNEL_KIND, 7);
-        assert_eq!(VERIFY_PROBS_KERNEL_KIND, 8);
+    }
+
+    /// The configured epsilon is the one in the module: the kernel used to
+    /// bake 1e-5 whatever the model's `norm_eps` was.
+    #[test]
+    fn norm_eps_reaches_the_kernel() {
+        let mut c = paper_cfg();
+        c.norm_eps = 1e-6;
+        let ptx = emit_draft_sample_ptx(&c);
+        assert!(ptx.contains(&f32_imm(1e-6)), "the configured epsilon is baked");
+        assert!(!ptx.contains(&f32_imm(1e-5)), "the old constant is not");
+        // And it changes the answer where it should: a hidden row whose
+        // mean square is comparable to the epsilon.
+        let (dm, vocab) = (8usize, 16usize);
+        let hidden = vec![1e-3f32; dm];
+        let gamma = vec![1.0f32; dm];
+        let w = lm_head(vocab, dm);
+        let a = SpecSamplerConfig { d_model: dm as u32, vocab_size: vocab as u32, vocab_tile: 128, norm_eps: 1e-5 };
+        let b = SpecSamplerConfig { norm_eps: 1e-6, ..a.clone() };
+        let (_, pa) = cpu_reference_draft_sample(&a, &hidden, &gamma, &w);
+        let (_, pb) = cpu_reference_draft_sample(&b, &hidden, &gamma, &w);
+        // rstd = 1/sqrt(1e-6 + eps): 301.5 against 707.1, so the logits
+        // differ by a factor 2.35 and the softmax peak with them.
+        assert!((pa - pb).abs() > 1e-3, "{pa} vs {pb}");
     }
 
     // -- refusals ---------------------------------------------------------
@@ -1183,14 +1005,6 @@ mod tests {
         let mut c = paper_cfg();
         c.vocab_tile = 256;
         let _ = emit_draft_sample(&c);
-    }
-
-    #[test]
-    #[should_panic(expected = "d_model")]
-    fn verify_d_model_over_8192_panics() {
-        let mut c = paper_cfg();
-        c.d_model = 8193;
-        let _ = emit_verify_probs(&c);
     }
 
     #[test]
@@ -1354,166 +1168,6 @@ mod tests {
             (prob as f64 - p64).abs() < 1e-4,
             "planted-maxima prob {prob} vs f64 softmax {p64}"
         );
-
-        // The verify row agrees on the same fixture (same online pass).
-        let row = cpu_reference_verify_probs(&c, &hidden, &gamma, &w);
-        assert!((row[tok as usize] as f64 - p64).abs() < 1e-4);
-        let total: f32 = row.iter().sum();
-        assert!((total - 1.0).abs() < 1e-4, "row must sum to ~1, got {total}");
-    }
-
-    #[test]
-    fn cpu_verify_probs_row_matches_f64_softmax_and_normalizes() {
-        let (dm, vocab) = (32usize, 300usize);
-        let c = cfg(dm as u32, vocab as u32);
-        let hidden = hidden_pattern(dm);
-        let gamma = gamma_pattern(dm);
-        let w = lm_head(vocab, dm);
-        let row = cpu_reference_verify_probs(&c, &hidden, &gamma, &w);
-        assert_eq!(row.len(), vocab);
-        assert!(row.iter().all(|&p| p >= 0.0));
-        let total: f32 = row.iter().sum();
-        assert!((total - 1.0).abs() < 1e-4, "row must sum to ~1, got {total}");
-
-        // Row argmax == the draft sampler's token (same weights).
-        let (tok, _) = cpu_reference_draft_sample(&c, &hidden, &gamma, &w);
-        let row_argmax = row
-            .iter()
-            .enumerate()
-            .fold((0usize, f32::NEG_INFINITY), |acc, (i, &p)| {
-                if p > acc.1 {
-                    (i, p)
-                } else {
-                    acc
-                }
-            })
-            .0;
-        assert_eq!(row_argmax, tok as usize);
-
-        // Per-element agreement with the independent f64 softmax.
-        let mut ss = 0f64;
-        for &h in &hidden {
-            ss += h as f64 * h as f64;
-        }
-        let rstd = 1.0 / (ss / dm as f64 + RMS_EPS as f64).sqrt();
-        let h64: Vec<f64> = hidden
-            .iter()
-            .zip(&gamma)
-            .map(|(h, g)| *h as f64 * rstd * *g as f64)
-            .collect();
-        let logits: Vec<f64> = (0..vocab)
-            .map(|t| (0..dm).map(|d| w[t * dm + d] as f64 * h64[d]).sum())
-            .collect();
-        let max = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let sum: f64 = logits.iter().map(|x| (x - max).exp()).sum();
-        for (i, &p) in row.iter().enumerate() {
-            let p64 = (logits[i] - max).exp() / sum;
-            assert!(
-                (p as f64 - p64).abs() < 1e-5,
-                "row[{i}] = {p} vs f64 {p64}"
-            );
-        }
-    }
-
-    #[test]
-    fn cpu_draft_prob_bitwise_equals_verify_row_at_token() {
-        // The lossless self-speculation anchor: with draft == target
-        // weights, p_draft == p_target[tok] BIT-FOR-BIT, so the reject
-        // ratio is exactly 1.0 and every draft token accepts.
-        let (dm, vocab) = (16usize, 200usize);
-        let c = cfg(dm as u32, vocab as u32);
-        let hidden = hidden_pattern(dm);
-        let gamma = gamma_pattern(dm);
-        let w = lm_head(vocab, dm);
-        let (tok, prob) = cpu_reference_draft_sample(&c, &hidden, &gamma, &w);
-        let row = cpu_reference_verify_probs(&c, &hidden, &gamma, &w);
-        assert_eq!(
-            prob.to_bits(),
-            row[tok as usize].to_bits(),
-            "p_draft must equal p_target[argmax] bitwise (draft == target)"
-        );
-    }
-
-    #[test]
-    fn verify_rows_feed_cpu_reference_reject_all_accept_self_speculation() {
-        // Frozen-ABI cross-check: the rows this module's reference
-        // produces are exactly what cfie_speculative_ptx's reject
-        // reference consumes.  Self-speculation (draft == target)
-        // must accept all K for EVERY seed.
-        let (dm, vocab) = (8usize, 32usize);
-        let c = cfg(dm as u32, vocab as u32);
-        let gamma = gamma_pattern(dm);
-        let w = lm_head(vocab, dm);
-        let hiddens = [hidden_pattern(dm), (0..dm).map(|i| (i as f32 * 0.61).cos()).collect()];
-
-        let mut target_probs = Vec::new();
-        let mut draft_probs = Vec::new();
-        let mut draft_tokens = Vec::new();
-        for h in &hiddens {
-            let (tok, p) = cpu_reference_draft_sample(&c, h, &gamma, &w);
-            let row = cpu_reference_verify_probs(&c, h, &gamma, &w);
-            assert_eq!(p.to_bits(), row[tok as usize].to_bits());
-            target_probs.extend_from_slice(&row);
-            draft_probs.push(p);
-            draft_tokens.push(tok);
-        }
-
-        let rcfg = RejectionConfig {
-            k_tokens: 2,
-            vocab_size: vocab as u32,
-        };
-        for seed in [0u64, 1, 42, 0xDEAD_BEEF] {
-            let (acc, corr) =
-                cpu_reference_reject(&rcfg, &target_probs, &draft_probs, &draft_tokens, seed);
-            assert_eq!(acc, 2, "seed {seed}: self-speculation must accept all K");
-            assert_eq!(corr, u32::MAX, "seed {seed}: all-accept sentinel expected");
-        }
-    }
-
-    #[test]
-    fn verify_rows_feed_cpu_reference_reject_rejection_path() {
-        // Inflated draft probs force ratio < 1: the reject walk must
-        // consume this module's rows without tripping its layout
-        // asserts, and the Leviathan residual (p_target - p_draft on
-        // the drafted token, clamped) must never resample that token.
-        let (dm, vocab) = (8usize, 32usize);
-        let c = cfg(dm as u32, vocab as u32);
-        let gamma = gamma_pattern(dm);
-        let w = lm_head(vocab, dm);
-        let hiddens = [hidden_pattern(dm), (0..dm).map(|i| (i as f32 * 0.61).cos()).collect()];
-
-        let mut target_probs = Vec::new();
-        let mut draft_tokens = Vec::new();
-        for h in &hiddens {
-            let (tok, _) = cpu_reference_draft_sample(&c, h, &gamma, &w);
-            target_probs.extend_from_slice(&cpu_reference_verify_probs(&c, h, &gamma, &w));
-            draft_tokens.push(tok);
-        }
-        let draft_probs = [1.0f32, 1.0];
-        assert!(
-            target_probs[draft_tokens[0] as usize] < 1.0,
-            "test premise: ratio at position 0 must be < 1"
-        );
-
-        let rcfg = RejectionConfig {
-            k_tokens: 2,
-            vocab_size: vocab as u32,
-        };
-        let mut saw_rejection = false;
-        for seed in 0..64u64 {
-            let (acc, corr) =
-                cpu_reference_reject(&rcfg, &target_probs, &draft_probs, &draft_tokens, seed);
-            assert!((0..=2).contains(&acc), "seed {seed}");
-            if acc < 2 {
-                saw_rejection = true;
-                assert!(corr < vocab as u32, "seed {seed}: correction in vocab");
-                assert_ne!(
-                    corr, draft_tokens[acc as usize],
-                    "seed {seed}: residual zeroes the drafted token"
-                );
-            }
-        }
-        assert!(saw_rejection, "ratio < 1 must reject for some seed");
     }
 
     #[test]
@@ -1530,8 +1184,7 @@ mod tests {
         }
         let (tok, prob) = cpu_reference_draft_sample(&c, &hidden, &gamma, &w);
         assert_eq!(tok, 129);
-        let row = cpu_reference_verify_probs(&c, &hidden, &gamma, &w);
-        assert_eq!(prob.to_bits(), row[129].to_bits());
+        assert!(prob > 0.0 && prob <= 1.0);
     }
 
     #[test]
@@ -1546,9 +1199,6 @@ mod tests {
         let (tok, prob) = cpu_reference_draft_sample(&c, &hidden, &gamma, &w);
         assert_eq!(tok, 0);
         assert_eq!(prob.to_bits(), 1.0f32.to_bits());
-        let row = cpu_reference_verify_probs(&c, &hidden, &gamma, &w);
-        assert_eq!(row.len(), 1);
-        assert_eq!(row[0].to_bits(), 1.0f32.to_bits());
     }
 
     // -- ptxas validation (skips silently when no validator present) --
@@ -1567,17 +1217,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ptxas_validates_verify_probs_paper_config() {
-        let ptx = emit_verify_probs_ptx(&paper_cfg());
-        match crate::ptxas_validation::validate_ptx(&ptx) {
-            Ok(()) => {}
-            Err(msg) if msg.contains("nvcc not available") => {
-                nsl_log::nsl_log!(INFO, "skip", "[skip] cfie verify-probs ptxas validation - no validator: {msg}");
-            }
-            Err(msg) => panic!(
-                "cfie verify-probs PTX rejected for paper config:\n{msg}\n\nEmitted PTX:\n{ptx}"
-            ),
-        }
-    }
 }

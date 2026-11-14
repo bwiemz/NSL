@@ -340,7 +340,7 @@ fn the_kir_kernel_keeps_the_ffi_signature_and_entry_name() {
 #[test]
 fn the_kir_kernel_keeps_the_hand_kernels_baked_header_lines() {
     // Sibling CFIE kernels compare these lines with the decode kernel's
-    // byte for byte (see cfie_persistent_ptx / cfie_speculative_ptx).
+    // byte for byte (see cfie_persistent_ptx).
     for (g, _) in cases() {
         let header = |ptx: &str| -> Vec<String> {
             ptx.lines().take_while(|l| l.starts_with("//")).map(str::to_string).collect()

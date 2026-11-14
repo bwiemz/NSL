@@ -40,17 +40,20 @@
 //! # Cost model (per decoded token, per layer, microseconds)
 //!
 //! Batch-1 autoregressive decode is memory-bandwidth-bound plus CPU launch
-//! overhead — the same two-term roofline `crate::cfie_cost` uses for the
-//! serve report, evaluated per layer:
+//! overhead — a two-term roofline, evaluated per layer. (The serve build
+//! report used the same model and no longer prints it: it divides by the
+//! whole GPU's bandwidth, and the decode kernels run on one thread block.
+//! The numbers here rank choices against each other; they are not
+//! predictions of latency.)
 //!
 //! ```text
 //! bw          = peak_bandwidth_gbs * 1000            (bytes per us)
 //! kv_seq      = max(max_seq / 2, 1)                  (representative half-full
-//!                                                     cache, as cfie_cost::estimate)
+//!                                                     cache)
 //! weight_us   = param_bytes / bw                     (matvec decode touches every
 //!                                                     weight element once)
 //! kv_us       = kv_bytes_per_stored_token * kv_seq / bw
-//! launch_us   = launches_per_layer(fusion) * PER_LAUNCH_US   (5 us, cfie_cost)
+//! launch_us   = launches_per_layer(fusion) * PER_LAUNCH_US   (5 us)
 //! paged_us    = paged_overhead_us     if kv_layout == Paged  (block-table +
 //!                                                     host sync share; default
 //!                                                     reuses the 5 us constant)
@@ -61,9 +64,11 @@
 //! speculative off: cost = base
 //! ```
 //!
-//! The speculative denominator is the classical expected tokens/step from
-//! Leviathan et al. 2023 — the same `1 + K*p/(1+K)` formula
-//! `crate::cfie_speculative::emit_program` records as `expected_speedup`.
+//! The speculative denominator is the expected tokens/step this model
+//! attributes to Leviathan et al. 2023, `1 + K*p/(1+K)`. It assumes the
+//! target scores the K drafted positions in one pass, which the CFIE
+//! engine does not do: there, speculation costs time (see the serve build
+//! report).
 //! The numerator charges the draft model `draft_frac` of a target-model
 //! token per drafted token (K per step).
 //!
@@ -80,7 +85,10 @@ pub use crate::cfie_kv_plan::LayoutKind;
 pub use crate::cfie_kv_quant::KvPrecision;
 pub use crate::cfie_persistent::FusionLevel;
 
-use crate::cfie_cost::PER_LAUNCH_US;
+
+/// CPU-side cost of a single kernel launch, in microseconds: the CFIE
+/// proposal's assumed figure (its §2.4), not a measurement.
+pub const PER_LAUNCH_US: f64 = 5.0;
 use crate::wggo_dp::{CoarseDecision, InterLayerPlan};
 
 /// Default in-register INT8 dequantization surcharge (us per token per
@@ -100,8 +108,8 @@ pub struct CfieInferConfig {
     /// KV-cache geometry: per-head dimension.
     pub head_dim: u32,
     /// Maximum sequence length the serve envelope must handle.  The KV
-    /// read cost is evaluated at `max_seq / 2` (the same representative
-    /// operating point `cfie_cost::estimate` uses); a static layout
+    /// read cost is evaluated at `max_seq / 2` (a representative
+    /// operating point); a static layout
     /// reserves the full `max_seq` pool.
     pub max_seq: u32,
     /// Deepest fusion level the candidate domain may offer.  The serve
@@ -111,7 +119,7 @@ pub struct CfieInferConfig {
     /// Extra latency charged to a `Paged` KV layout (us per token per
     /// layer): the block-table indirection + host synchronization share the
     /// static direct-index layout eliminates.  Default reuses the 5 us
-    /// launch constant (`cfie_cost::PER_LAUNCH_US`) so the penalty is the
+    /// launch constant ([`PER_LAUNCH_US`]) so the penalty is the
     /// same, documented order of magnitude as one kernel launch.
     pub paged_overhead_us: f64,
     /// Extra latency charged to an `Int8` KV precision (us per token per
@@ -174,9 +182,7 @@ pub struct CfieInferenceChoice {
     /// level3} per the audit list (Level1 is a CSHA-side stepping stone the
     /// audit's inference axis does not enumerate).
     pub fusion_level: FusionLevel,
-    /// KV-cache layout.  G20 axis domain: {paged, static}
-    /// (`StaticWithBump` is the serve planner's fragmentation hybrid, not
-    /// an ILP-level axis).
+    /// KV-cache layout.  G20 axis domain: {paged, static}.
     pub kv_layout: LayoutKind,
     /// Per-layer KV precision.  G20 axis domain: {fp16, int8} — the
     /// vocabulary is `cfie_kv_quant::KvPrecision` (re-exported here);
@@ -245,8 +251,7 @@ pub fn launches_per_layer(level: FusionLevel) -> u32 {
     }
 }
 
-/// Representative KV operating point: a half-full cache, exactly as
-/// `cfie_cost::estimate` evaluates the serve report's KV term.
+/// Representative KV operating point: a half-full cache.
 pub fn representative_kv_seq(cfg: &CfieInferConfig) -> u32 {
     (cfg.max_seq / 2).max(1)
 }
@@ -261,15 +266,15 @@ pub fn kv_stored_bytes_per_token(cfg: &CfieInferConfig, precision: KvPrecision) 
 }
 
 /// HBM bytes the KV cache reserves for one sequence on this layer under a
-/// layout choice.  `Static` (and the bump hybrid, if it ever enters the
-/// domain) must pre-allocate the full `max_seq` envelope — that is the
+/// layout choice.  `Static` must pre-allocate the full `max_seq`
+/// envelope — that is the
 /// price of direct indexing; `Paged` is charged its representative
 /// working set (`kv_seq` tokens).  Added to the ILP's per-layer
 /// resident-memory check when the gate is on.
 pub fn kv_pool_bytes(choice: CfieInferenceChoice, cfg: &CfieInferConfig) -> u64 {
     let per_token = kv_stored_bytes_per_token(cfg, choice.kv_precision);
     match choice.kv_layout {
-        LayoutKind::Static | LayoutKind::StaticWithBump => {
+        LayoutKind::Static => {
             per_token.saturating_mul(cfg.max_seq.max(1) as u64)
         }
         LayoutKind::Paged => per_token.saturating_mul(representative_kv_seq(cfg) as u64),
@@ -283,9 +288,9 @@ pub fn kv_pool_bytes(choice: CfieInferenceChoice, cfg: &CfieInferConfig) -> u64 
 /// (1 + draft_frac * K) / (1 + K * p / (1 + K))
 /// ```
 ///
-/// Denominator = expected tokens per verification step (Leviathan et al.
-/// 2023; identical to `cfie_speculative::emit_program`'s
-/// `expected_speedup`).  Numerator = one target step plus K drafted tokens
+/// Denominator = expected tokens per verification step (attributed to
+/// Leviathan et al. 2023; see the module documentation for what it
+/// assumes).  Numerator = one target step plus K drafted tokens
 /// at `draft_frac` of a target token each.  Factor < 1 means speculative
 /// decoding pays for itself.
 pub fn spec_cost_factor(cfg: &CfieInferConfig) -> f64 {
@@ -301,8 +306,7 @@ pub fn spec_cost_factor(cfg: &CfieInferConfig) -> f64 {
 /// Decode latency (us per token) this layer contributes under a CFIE
 /// inference choice.  See the module docs for the formula; `param_bytes`
 /// is the candidate LUT entry's parameter footprint (matvec decode touches
-/// every weight element once per token — the same "weights read once"
-/// argument as `cfie_cost::weight_bytes_per_token`), and
+/// every weight element once per token), and
 /// `peak_bandwidth_gbs` is the LUT's HBM bandwidth so the term is
 /// commensurate, in us, with the forward/backward/optimizer terms the ILP
 /// already sums.
@@ -312,7 +316,7 @@ pub fn decode_us_per_token(
     param_bytes: u64,
     peak_bandwidth_gbs: f64,
 ) -> f64 {
-    // GB/s = 1e9 bytes / 1e6 us => bytes/us = GB/s * 1000 (as cfie_cost).
+    // GB/s = 1e9 bytes / 1e6 us => bytes/us = GB/s * 1000.
     let bw = peak_bandwidth_gbs.max(1.0) * 1000.0;
     let kv_seq = representative_kv_seq(cfg) as u64;
     let weight_us = param_bytes as f64 / bw;

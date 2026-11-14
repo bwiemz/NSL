@@ -6,19 +6,19 @@
 //! attention kernel addresses by direct arithmetic — no block-table
 //! lookup, no CPU-GPU synchronization per decode step.
 //!
-//! Gemini's review flagged fragmentation as the key risk with an AOT
-//! KV plan: unpredictable request lengths can waste pre-allocated
-//! slots.  We address that with a **GPU-side bump allocator** — a
-//! lightweight free-list of fixed-size blocks that the persistent
-//! decode kernel itself manages, without waking the CPU.
+//! The planner emits a [`KvLayoutPlan`]: the static contiguous layout
+//! when the whole envelope (`max_batch` sequences of `max_seq` tokens)
+//! fits the GPU's memory after the weights and the runtime reserve, and
+//! the paged fallback when it does not.
 //!
-//! The planner emits a [`KvLayoutPlan`] with two sub-plans:
-//!
-//!   * `direct`   — the static contiguous layout for the "everything
-//!                  bounded" common case.
-//!   * `bump`     — an optional bump-allocator descriptor used when
-//!                  the compiler cannot guarantee all sequences fit
-//!                  within the max-length envelope.
+//! There is no third kind. A "static with bump allocator" hybrid used to
+//! be planned for an envelope that did not fit: its report said a
+//! GPU-side allocator would handle fragmentation, no such allocator
+//! existed, and the kernels were emitted for the full envelope the
+//! planner had just found too big (a 137 GB pool on an 80 GB card in one
+//! build). An envelope that does not fit is now a paged plan, and
+//! `kv_layout: "static"` with such an envelope is a compile error
+//! (`serve.rs`).
 
 use serde::Serialize;
 
@@ -30,10 +30,6 @@ pub enum LayoutKind {
     /// Block-based (paged) layout — falls back to `PagedAttention`
     /// semantics when static layout can't hold the workload envelope.
     Paged,
-    /// Bump-allocated blocks inside the static buffer — uses the fast
-    /// direct-indexing path until fragmentation forces a fallback
-    /// (measured by the GPU-side allocator).
-    StaticWithBump,
 }
 
 impl LayoutKind {
@@ -41,7 +37,6 @@ impl LayoutKind {
         match self {
             LayoutKind::Static => "static",
             LayoutKind::Paged => "paged",
-            LayoutKind::StaticWithBump => "static_with_bump",
         }
     }
 }
@@ -109,20 +104,6 @@ impl Default for KvBudget {
     }
 }
 
-/// GPU-side bump allocator descriptor.  The persistent decode kernel
-/// reads/writes this structure (stored in pinned memory + a GPU
-/// mirror) to manage KV block assignments without CPU intervention.
-#[derive(Debug, Clone, Serialize)]
-pub struct BumpAllocator {
-    /// Total number of fixed-size KV blocks.
-    pub num_blocks: u32,
-    /// Size of each block in tokens.
-    pub block_size: u32,
-    /// Ring-buffer capacity used by the free-list.  Must be a power of
-    /// two (the GPU-side scheduler relies on mask-based wraparound).
-    pub freelist_capacity: u32,
-}
-
 /// Direct-indexing descriptor.
 #[derive(Debug, Clone, Serialize)]
 pub struct DirectLayout {
@@ -147,18 +128,24 @@ pub struct DirectLayout {
 pub struct KvLayoutPlan {
     pub kind: LayoutKind,
     pub direct: Option<DirectLayout>,
-    pub bump: Option<BumpAllocator>,
     pub available_bytes: u64,
     pub rationale: String,
 }
 
 impl KvLayoutPlan {
     pub fn uses_direct_indexing(&self) -> bool {
-        matches!(self.kind, LayoutKind::Static | LayoutKind::StaticWithBump)
+        matches!(self.kind, LayoutKind::Static)
     }
 
-    pub fn has_bump_allocator(&self) -> bool {
-        self.bump.is_some()
+    /// The paged plan, for a reason the caller states (a requested
+    /// `kv_layout: "paged"`).
+    pub fn paged(available_bytes: u64, rationale: impl Into<String>) -> Self {
+        Self {
+            kind: LayoutKind::Paged,
+            direct: None,
+            available_bytes,
+            rationale: rationale.into(),
+        }
     }
 }
 
@@ -217,7 +204,6 @@ pub fn plan(shape: &KvShape, budget: &KvBudget) -> KvLayoutPlan {
         return KvLayoutPlan {
             kind: LayoutKind::Paged,
             direct: None,
-            bump: None,
             available_bytes: available,
             rationale: "KV shape has zero bytes per token — falling back to dynamic layout"
                 .to_string(),
@@ -246,7 +232,6 @@ pub fn plan(shape: &KvShape, budget: &KvBudget) -> KvLayoutPlan {
         return KvLayoutPlan {
             kind: LayoutKind::Static,
             direct: Some(direct),
-            bump: None,
             available_bytes: available,
             rationale: format!(
                 "static layout fits: {} blocks × {} tokens = {} > needed {}",
@@ -255,47 +240,18 @@ pub fn plan(shape: &KvShape, budget: &KvBudget) -> KvLayoutPlan {
         };
     }
 
-    // Otherwise try the static-with-bump hybrid: use every available
-    // byte, let the GPU scheduler manage fragmentation.  Bump allocator
-    // needs a free-list sized to the block count.
-    if max_blocks >= budget.max_batch as u64 {
-        let bump = BumpAllocator {
-            num_blocks: max_blocks as u32,
-            block_size,
-            freelist_capacity: next_pow2(max_blocks as u32).max(64),
-        };
-        let per_seq_blocks = budget.max_seq.div_ceil(block_size);
-        let direct = DirectLayout {
-            max_tokens,
-            per_sequence_max_tokens: budget.max_seq,
-            bytes_per_block,
-            blocks_per_sequence: per_seq_blocks,
-            block_size,
-            total_kv_bytes: bytes_per_block * max_blocks,
-        };
-        return KvLayoutPlan {
-            kind: LayoutKind::StaticWithBump,
-            direct: Some(direct),
-            bump: Some(bump),
-            available_bytes: available,
-            rationale: format!(
-                "static+bump: {} blocks total < {} required (batch × seq), GPU-side bump allocator handles fragmentation",
-                max_blocks, needed_tokens / block_size as u64
-            ),
-        };
-    }
-
-    // Not enough even for one block per batch slot — fall back to paged.
-    KvLayoutPlan {
-        kind: LayoutKind::Paged,
-        direct: None,
-        bump: None,
-        available_bytes: available,
-        rationale: format!(
-            "only {} blocks fit — less than max_batch ({}); fall back to PagedAttention",
-            max_blocks, budget.max_batch
+    // The envelope does not fit. Nothing in this engine can serve a
+    // static pool smaller than max_batch x max_seq, so the plan is paged.
+    let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+    KvLayoutPlan::paged(
+        available,
+        format!(
+            "max_batch x max_seq = {} tokens need {:.1} GiB of KV; {:.1} GiB is available after the weights and the runtime reserve",
+            needed_tokens,
+            gib(needed_tokens.saturating_mul(bytes_per_token)),
+            gib(available)
         ),
-    }
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -342,26 +298,6 @@ mod tests {
     }
 
     #[test]
-    fn bump_allocator_kicks_in_when_budget_cannot_hold_full_envelope() {
-        let budget = KvBudget {
-            hbm_bytes: 512 * 1024 * 1024,
-            weights_bytes: 32 * 1024 * 1024,
-            runtime_overhead_bytes: 32 * 1024 * 1024,
-            max_seq: 4096,
-            max_batch: 128,
-            block_size: 256,
-            snap_granularity: 128,
-        };
-        let plan = plan(&nslcoder_shape(), &budget);
-        // Too tight for everyone to hold full seq, but enough blocks for
-        // the bump allocator to schedule between requests.
-        assert!(matches!(
-            plan.kind,
-            LayoutKind::StaticWithBump | LayoutKind::Paged
-        ));
-    }
-
-    #[test]
     fn paged_fallback_when_nothing_fits() {
         let budget = KvBudget {
             hbm_bytes: 128 * 1024 * 1024,
@@ -375,7 +311,6 @@ mod tests {
         let plan = plan(&nslcoder_shape(), &budget);
         assert_eq!(plan.kind, LayoutKind::Paged);
         assert!(plan.direct.is_none());
-        assert!(plan.bump.is_none());
     }
 
     #[test]
@@ -419,29 +354,10 @@ mod tests {
     }
 
     #[test]
-    fn bump_freelist_capacity_is_power_of_two() {
-        let budget = KvBudget {
-            hbm_bytes: 2 * 1024 * 1024 * 1024,
-            weights_bytes: 100 * 1024 * 1024,
-            runtime_overhead_bytes: 100 * 1024 * 1024,
-            max_seq: 8192,
-            max_batch: 512, // deliberately over-subscribed
-            block_size: 256,
-            snap_granularity: 128,
-        };
-        let plan = plan(&nslcoder_shape(), &budget);
-        if let Some(bump) = plan.bump.as_ref() {
-            assert!(bump.freelist_capacity.is_power_of_two());
-            assert!(bump.freelist_capacity >= 64);
-        }
-    }
-
-    #[test]
     fn direct_layout_exposes_direct_indexing() {
         let plan = plan(&nslcoder_shape(), &KvBudget::default());
         if plan.kind == LayoutKind::Static {
             assert!(plan.uses_direct_indexing());
-            assert!(!plan.has_bump_allocator());
         }
     }
 
@@ -449,5 +365,37 @@ mod tests {
     fn rationale_never_empty() {
         let plan = plan(&nslcoder_shape(), &KvBudget::default());
         assert!(!plan.rationale.is_empty());
+    }
+
+    /// An envelope that does not fit is a paged plan that says how far it
+    /// is from fitting. It used to be a "static_with_bump" plan whose
+    /// kernels were built for the envelope that did not fit.
+    #[test]
+    fn an_envelope_that_does_not_fit_is_paged_and_says_by_how_much() {
+        // 16 KiB per token (4 KV heads x 128 x 2 x 8 layers x 2 bytes);
+        // 256 sequences of 32,768 tokens need 128 GiB. An H100 has 80.
+        let shape = KvShape { n_layers: 8, n_kv_heads: 4, head_dim: 128, dtype_bytes: 2 };
+        assert_eq!(shape.bytes_per_token(), 16_384);
+        let budget = KvBudget {
+            hbm_bytes: 80 * (1 << 30),
+            weights_bytes: 0,
+            runtime_overhead_bytes: 800 * 1024 * 1024,
+            max_seq: 32_768,
+            max_batch: 256,
+            block_size: 256,
+            snap_granularity: 128,
+        };
+        let plan = plan(&shape, &budget);
+        assert_eq!(plan.kind, LayoutKind::Paged);
+        assert!(plan.direct.is_none());
+        assert!(!plan.uses_direct_indexing());
+        assert!(
+            plan.rationale.contains("8388608 tokens need 128.0 GiB of KV; 79.2 GiB is available"),
+            "{}",
+            plan.rationale
+        );
+        // The same model with an envelope that fits stays static.
+        let fits = KvBudget { max_seq: 2048, max_batch: 64, ..budget };
+        assert_eq!(super::plan(&shape, &fits).kind, LayoutKind::Static);
     }
 }

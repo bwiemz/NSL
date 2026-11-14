@@ -10,11 +10,14 @@
 //! and 40 series, Jetson Orin, and the RTX 50 series. The driver's JIT
 //! makes the same check when it loads the module.
 //!
-//! This gate builds every kernel of the five emitters at every `sm_version`
-//! in `gpu_specs::GPU_DATABASE` that CUDA 13 still assembles for, and
-//! assembles each with `ptxas --gpu-name sm_{N}`.
+//! This gate builds every kernel a CFIE serve binary registers — the
+//! decode block, the fused sampler and the draft sampler — and assembles
+//! each with `ptxas --gpu-name sm_{N}` for every `sm_version` in
+//! `gpu_specs::GPU_DATABASE` that CUDA 13 still assembles for. (The
+//! standalone decode-attention kernel has its own gate,
+//! `cfie_decode_attn_ptxas.rs`.)
 //!
-//! All five have since moved onto KIR (roadmap A2 step 9, finished with
+//! All of them are KIR (roadmap A2 step 9, finished with
 //! `cfie_persistent_ptx`): their kernels target the KIR floor (`sm_70`)
 //! whatever GPU serves them and take no `sm_version`, so each module is
 //! built once, and the gate still assembles it for every architecture —
@@ -29,12 +32,8 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use nsl_codegen::cfie_fused_sample::{emit_program, LmHeadShape, SamplingParams};
-use nsl_codegen::cfie_kv_quant::KvPrecision;
 use nsl_codegen::gpu_specs::GPU_DATABASE;
-use nsl_codegen::{
-    cfie_kv_quant_ptx, cfie_persistent_ptx, cfie_sample_ptx, cfie_spec_sampler_ptx,
-    cfie_speculative_ptx,
-};
+use nsl_codegen::{cfie_persistent_ptx, cfie_sample_ptx, cfie_spec_sampler_ptx};
 
 fn find_ptxas() -> Option<String> {
     for name in ["ptxas", "ptxas.exe"] {
@@ -104,23 +103,10 @@ fn serving_arches() -> Vec<u32> {
     sms
 }
 
-/// `(kernel, PTX)` for every kernel the five emitters build, over the
+/// `(kernel, PTX)` for every kernel a serve binary registers, over the
 /// paper-shaped configurations their own tests use.
 fn modules() -> Vec<(String, String)> {
     let mut out = Vec::new();
-
-    let kv = cfie_kv_quant_ptx::QuantDecodeAttentionConfig {
-        n_layers: 2,
-        n_heads: 8,
-        n_kv_heads: 4,
-        head_dim: 64,
-        per_slot_max_tokens: 256,
-        max_slots: 4,
-        layer_precisions: vec![(KvPrecision::Fp16, KvPrecision::Int8), (KvPrecision::Int8, KvPrecision::Int8)],
-    };
-    for (ptx, meta) in cfie_kv_quant_ptx::emit_all(&kv) {
-        out.push((meta.kernel_name, ptx));
-    }
 
     let shape = LmHeadShape { d_model: 512, vocab_size: 49_152, vocab_tile: 128, dtype_bytes: 2 };
     let sample = cfie_sample_ptx::FusedSampleKernelConfig {
@@ -129,6 +115,7 @@ fn modules() -> Vec<(String, String)> {
         vocab_tile: 128,
         top_k: 50,
         grammar_states: 0,
+        norm_eps: 1e-5,
     };
     let (ptx, meta) = cfie_sample_ptx::emit(&emit_program(SamplingParams::default(), shape), &sample);
     out.push((meta.kernel_name, ptx));
@@ -152,26 +139,9 @@ fn modules() -> Vec<(String, String)> {
         d_model: 512,
         vocab_size: 49_152,
         vocab_tile: 128,
+        norm_eps: 1e-5,
     };
     let (ptx, meta) = cfie_spec_sampler_ptx::emit_draft_sample(&spec);
-    out.push((meta.kernel_name, ptx));
-    let (ptx, meta) = cfie_spec_sampler_ptx::emit_verify_probs(&spec);
-    out.push((meta.kernel_name, ptx));
-
-    let verify = cfie_speculative_ptx::VerifyAttentionConfig {
-        n_heads: 8,
-        n_kv_heads: 4,
-        head_dim: 128,
-        per_slot_max_tokens: 2048,
-        max_slots: 64,
-        num_nodes: 6,
-        // A chain: node r attends itself and every earlier node.
-        mask_bits: (0..6).map(|r| (1u64 << (r + 1)) - 1).collect(),
-    };
-    let (ptx, meta) = cfie_speculative_ptx::emit_verify_attention(&verify);
-    out.push((meta.kernel_name, ptx));
-    let reject = cfie_speculative_ptx::RejectionConfig { k_tokens: 5, vocab_size: 49_152 };
-    let (ptx, meta) = cfie_speculative_ptx::emit_rejection_kernel(&reject);
     out.push((meta.kernel_name, ptx));
 
     out
