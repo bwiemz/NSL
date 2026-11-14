@@ -1143,7 +1143,7 @@ macro_rules! for_each_runtime_fn {
             [quantization] nsl_gptq_hessian_add_batch(i64) -> i64 = gptq::nsl_gptq_hessian_add_batch;
             [quantization] nsl_gptq_hessian_finalize() -> i64 = gptq::nsl_gptq_hessian_finalize;
             // --- M42: KV-cache compression ---
-            [quantization] nsl_kv_quantize_and_store(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 = kv_compress::ffi::nsl_kv_quantize_and_store;
+            [quantization] nsl_kv_quantize_and_store(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 = kv_compress::ffi::nsl_kv_quantize_and_store;
             [quantization] nsl_kv_sliding_window_init(i64, i64, i64) -> i64 = kv_compress::ffi::nsl_kv_sliding_window_init;
             [quantization] nsl_kv_sliding_window_check(i64, i64, i64, i64) -> i64 = kv_compress::ffi::nsl_kv_sliding_window_check;
             [quantization] nsl_kv_sliding_window_destroy() -> i64 = kv_compress::ffi::nsl_kv_sliding_window_destroy;
@@ -1152,7 +1152,7 @@ macro_rules! for_each_runtime_fn {
             [quantization] nsl_kv_h2o_check(i64, i64, i64, i64) -> i64 = kv_compress::ffi::nsl_kv_h2o_check;
             [quantization] nsl_kv_h2o_remove_sequence(i64) -> i64 = kv_compress::ffi::nsl_kv_h2o_remove_sequence;
             [quantization] nsl_kv_h2o_destroy() -> i64 = kv_compress::ffi::nsl_kv_h2o_destroy;
-            [quantization] nsl_kv_compress_ratio(i64) -> i64 = kv_compress::ffi::nsl_kv_compress_ratio;
+            [quantization] nsl_kv_compress_ratio(i64, i64, i64, i64) -> i64 = kv_compress::ffi::nsl_kv_compress_ratio;
 
             // ── diagnostics (was runtime_abi/diagnostics.rs) ──
             // Training diagnostics (temporary)

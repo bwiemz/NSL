@@ -287,14 +287,13 @@ Two existing pieces are the nearest, and cover almost none of it:
   Keys are stored after RoPE. There is no quantize-on-store kernel, nothing
   launches the read kernels outside tests, and the scheme is not
   per-channel, per-token or per-page.
-- **`@kv_compress`** — `crates/nsl-runtime/src/kv_compress/`. CPU routines
-  for INT8 per head or per token, INT4 per 64-element group, and an FP8
-  cast, plus sliding-window and H2O eviction managers. The decorator's
-  scheme is recorded on the paged-KV manager
-  (`crates/nsl-runtime/src/paged_kv/manager.rs`) "for use by future
-  compression-aware eviction logic" and is never read, and
-  `nsl_kv_quantize_and_store` has no caller, so the cache stays
-  uncompressed.
+- **KV compression routines** — `crates/nsl-runtime/src/kv_compress/`. CPU
+  routines for INT8 per head or per token, INT4 per 64-element group, and an
+  FP8 cast, plus sliding-window and H2O eviction managers. Nothing calls
+  them: the paged KV cache
+  (`crates/nsl-runtime/src/paged_kv/manager.rs`) stores keys and values as
+  written, `nsl_kv_quantize_and_store` has no caller, and the `@kv_compress`
+  decorator that once named them is refused by the checker.
 
 At the one point where code and proposal meet, the code is the better guide:
 CFIE's middle precision band keeps keys in FP16 and values in INT8, giving
@@ -330,48 +329,62 @@ reproduced by running, numeric check, or by reading the code only.
 
 ### Fixed
 
-None of the defects below has been fixed.
+- **`@kv_compress` was accepted and did nothing.** Its validator took
+  `method = ...` and refused `scheme = ...`, while code generation read only
+  `scheme`, so every spelling that passed the checker reached the cache as
+  "no compression"; and the cache had no compressed storage in any case, the
+  scheme being recorded on the manager and read by nothing. The decorator is
+  now refused by name (`UNIMPLEMENTED_DECORATORS` in
+  `crates/nsl-semantic/src/decorator_registry.rs`), and the three
+  compression arguments of `nsl_kv_cache_init` and `nsl_kv_cache_init_gpu`,
+  with their "KV cache compression" log lines, are gone.
+- **With two differing `@kv_compress` decorators the policy used was
+  arbitrary.** It was the first value of a hash map. The lookup was removed
+  with the decorator.
+- **INT4 and per-token INT8 quantization indexed past a 128-entry scale
+  array and panicked.** INT4 on a block of 8 heads × 16 tokens × 128 dims
+  needs 256 groups; per-token INT8 fails for a block above 128 tokens. The
+  quantizers in `crates/nsl-runtime/src/kv_compress/quantize.rs` now return
+  an error (`KvQuantError::TooManyScales`) for a block that needs more
+  scales than its metadata holds, and `nsl_kv_quantize_and_store` returns a
+  status for it. Such blocks are refused, not supported: the metadata still
+  holds 128 entries. The unit tests now include blocks of those sizes.
+- **`nsl_kv_quantize_and_store` could not append to a block.** Its token
+  offset was ignored: scales were computed over the new tokens only and
+  written from index 0, replacing the block's earlier scales. It now takes
+  the block's capacity as an argument and writes new tokens at their offset.
+  With per-token INT8 each token's scale is kept at its absolute position
+  and earlier tokens are untouched; with no compression or FP8 any token
+  range is written in place. INT8 per head and INT4 per group, whose scales
+  span tokens, accept only a whole block and return a status otherwise. It
+  still has no caller.
+- **The reported compression ratio ignored per-block metadata.**
+  `nsl_kv_compress_ratio` took the scheme alone and returned 2× for INT8 and
+  4× for INT4. `KvBlockQuantMeta` is 1,032 bytes per K or V block, so for
+  4 heads × 16 tokens × 64 dims, against FP16, INT8 is 8192/5128 = 1.60×
+  and INT4 is 8192/3080 = 2.66×. The function now takes the block's
+  dimensions and returns that figure; `bytes_per_element` in
+  `crates/nsl-runtime/src/kv_compress/mod.rs` is documented as the payload
+  figure it is.
 
 ### Open, in the adjacent code
 
-- **`nsl_kv_quantize_and_store` cannot append to a block.** Its token offset
-  is ignored: scales are computed over the new tokens only and written from
-  index 0, replacing the block's earlier scales, so earlier tokens would be
-  dequantized with a scale they were not stored with. Scales should be kept
-  per absolute token, or fixed in advance. It has no caller today.
-  `crates/nsl-runtime/src/kv_compress/ffi.rs`. By reading the code only.
 - **The CFIE INT8 read kernels take one scale per layer and per K or V, and
   nothing says when it is fixed.** A scale chosen from early tokens clips
   later ones; a scale updated later invalidates stored codes. On synthetic
   keys with outlier channels, one scale gives 13.6% mean relative error on
   ordinary channels against 1.1% on outlier channels. Nothing writes INT8
   KV. `crates/nsl-codegen/src/cfie_kv_quant_ptx.rs`. Numeric check.
-- **`@kv_compress(method="quantize", ...)` is accepted, reported as active,
-  and does nothing.** Compile time and run time both log "KV cache
-  compression"; the cache stays uncompressed. It should be refused or wired.
-  `compile_call` in `crates/nsl-codegen/src/expr/calls.rs`;
-  `nsl_kv_cache_init` and `set_compression` in
-  `crates/nsl-runtime/src/paged_kv/manager.rs`. By reading the code only.
-- **With two differing `@kv_compress` decorators the policy used is
-  arbitrary.** It is taken as the first value of a hash map. `compile_call`
-  in `crates/nsl-codegen/src/expr/calls.rs`. By reading the code only.
-- **INT4 and per-token INT8 quantization index past a 128-entry scale
-  array and panic.** INT4 on a block of 8 heads × 16 tokens × 128 dims needs
-  256 groups; per-token INT8 fails for a block above 128 tokens (CFIE's
-  default block is 256). The unit tests use 16 elements.
-  `quantize_int4_per_group`, `quantize_int8_per_token` in
-  `crates/nsl-runtime/src/kv_compress/quantize.rs`. By reading the code only.
-- **The reported compression ratio ignores per-block metadata.**
-  `KvBlockQuantMeta` is 1,028 bytes per K or V block. For 4 heads × 16
-  tokens × 64 dims, against FP16, INT8 is 8192/5124 = 1.60× (not 2×) and
-  INT4 is 8192/3076 = 2.66× (not 4×). `bytes_per_element` in
-  `crates/nsl-runtime/src/kv_compress/mod.rs`. Numeric check.
 - **The INT8 read-kernel GPU test cannot see a wrong scale.** It compares
   the kernel with a CPU dequantization that uses the same scale.
   `crates/nsl-codegen/tests/cfie_kv_quant_gpu_parity.rs`. By reading the
   code only.
-- **The H2O and sliding-window managers have no callers.** H2O also evicts
-  a block only when every token in it is in the lowest-score set, which
-  scattered scores almost never produce, and it does not track blocks it
-  has already evicted. `check_eviction` in
-  `crates/nsl-runtime/src/kv_compress/h2o.rs`. By reading the code only.
+- **The H2O and sliding-window managers have no callers, and H2O rarely
+  evicts.** H2O marks the lowest-scoring tokens for eviction and then evicts
+  a block only when every token in it is marked, which scattered scores
+  almost never produce; it also does not track blocks it has already
+  evicted, so a caller would be told to evict the same block again. H2O is
+  defined per token and the paged cache frees whole blocks, so the rule
+  that maps one onto the other is a design decision that has not been made.
+  `check_eviction` in `crates/nsl-runtime/src/kv_compress/h2o.rs`. By
+  reading the code only.
