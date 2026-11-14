@@ -1613,6 +1613,22 @@ let m = MyModel()
     assert_eq!(cfg.alpha, Some(8), "alpha must be captured from decorator");
 }
 
+/// Gated LoRA scales its update by alpha / rank exactly as LoRA does, so an
+/// alpha on it draws no warning; IA3 has no such factor and says so. (The
+/// warning used to claim alpha was ignored for gated LoRA as well.)
+#[test]
+fn adapter_alpha_warns_for_ia3_only() {
+    let warns = |kind: &str| -> bool {
+        let src = format!(
+            "\n@adapter(type={kind}, target=[\"m.w\"], rank=4, alpha=8)\nlet m = MyModel()\n"
+        );
+        analyze_source(&src).diagnostics.iter().any(|d| d.message.contains("alpha"))
+    };
+    assert!(!warns("lora"));
+    assert!(!warns("gatedlora"));
+    assert!(warns("ia3"));
+}
+
 #[test]
 fn adapter_alpha_defaults_to_rank_when_absent() {
     let src = r#"
