@@ -18,7 +18,7 @@
 //! membership alone is meaningless because `declare_runtime_functions`
 //! declares every runtime symbol unconditionally; only a relocation
 //! proves the compile emitted a call (pattern from
-//! `csha_gap_f_toy_pretrain_smoke.rs`).
+//! `csha_training_withheld.rs`).
 //!
 //! The refusal predicate was `cpdt_precision_dtypes.is_some()` — tier
 //! CONTENT was irrelevant — so an active plan of any tier mix reproduces

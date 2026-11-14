@@ -86,9 +86,9 @@ Reference examples for specific subsystems. Read the corresponding wiki page fir
 
 Read [Optimization-Passes § CSHA](Optimization-Passes.md#csha) first.
 
-**Start here:** read [`csha_toy_pretrain_hd32.nsl`](../../examples/csha_toy_pretrain_hd32.nsl). It needs a CUDA GPU: `nsl run --target cuda --source-ad --csha auto examples/csha_toy_pretrain_hd32.nsl`.
+**Start here:** read [`csha_toy_pretrain_hd32.nsl`](../../examples/csha_toy_pretrain_hd32.nsl). It needs a CUDA GPU: `nsl run --target cuda --source-ad examples/csha_toy_pretrain_hd32.nsl`.
 
-**What to look at:** The `model TinyAttn` block shows the minimal `@flash_attention(head_dim=32)` method pattern that the CSHA boundary scan matches: RMSNorm, three projections and `scaled_dot_product_attention` with nothing in between. Weight names `wq`/`wk`/`wv` are intentional — `ProjKind::from_param_name` depends on them. The program trains one SGD step and prints its loss and statistics of each weight's update; `crates/nsl-cli/tests/csha_toy_pretrain_gate.rs` compares them with PyTorch. The file's header says which of those numbers are not right yet.
+**What to look at:** The `model TinyAttn` block shows the minimal `@flash_attention(head_dim=32)` method pattern that the CSHA boundary scan matches: RMSNorm, three projections and `scaled_dot_product_attention` with nothing in between. Weight names `wq`/`wk`/`wv` are intentional — `ProjKind::from_param_name` depends on them. The program trains one SGD step and prints its loss and statistics of each weight's update; `crates/nsl-cli/tests/csha_toy_pretrain_gate.rs` compares them with PyTorch. Adding `--csha` is a compile error for this program: the fused backward it would train through is withheld until its gradients match a reference.
 
 [`examples/csha_toy_pretrain_hd32.nsl`](../../examples/csha_toy_pretrain_hd32.nsl)
 

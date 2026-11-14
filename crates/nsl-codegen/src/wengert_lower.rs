@@ -1466,6 +1466,49 @@ fn emit_fused_forward_under_claim(
     Ok(out_val)
 }
 
+/// Whether the CSHA fused forward-with-saves and fused backward are withheld
+/// from train and grad blocks.
+///
+/// They are, because the gradients they produce do not match a reference,
+/// on the one configuration a training build emits (level 1, no fusion
+/// flag). Measured on a GPU:
+///
+/// * two tiles, at the FFI level against the f64 reference: the forward
+///   output is right and dQ, dK and dV are 130%, 45% and 43% off, at batch 1
+///   with one head as at batch 2 with four;
+/// * more than one head, from NSL source: the train step stops on a tensor
+///   shape mismatch;
+/// * one head and one tile, from NSL source: not shown right. The only run
+///   had the squared norms of the Wk and Wv updates 12% high, in a program
+///   whose direct method call is now known to disturb the next step's Wq
+///   gradient even without CSHA, so that figure may not be the pair's.
+///
+/// A loss that looks right over gradients that are wrong is how a
+/// pretraining run fails without saying so, so the lowering refuses instead
+/// of emitting the pair.
+///
+/// The kernels themselves are still built and are gated at the FFI level
+/// (`crates/nsl-codegen/tests/csha_cuda_*.rs`). Set this to `false` only
+/// together with a gate that runs a train step through them from NSL
+/// source and compares every weight's gradient with a reference, at one
+/// tile and at several, with one head and with several.
+const CSHA_FUSED_TRAINING_WITHHELD: bool = true;
+
+/// The compile error for a train or grad step whose attention was claimed
+/// for the CSHA fused pair. See [`CSHA_FUSED_TRAINING_WITHHELD`].
+fn csha_fused_training_withheld(layer: &str) -> CodegenError {
+    CodegenError::new(format!(
+        "`@flash_attention` with `--csha`: the attention of layer '{layer}' was claimed for \
+         the CSHA fused forward and backward, and the fused backward is withheld from train \
+         and grad blocks because its gradients do not match the reference (it is wrong \
+         beyond one tile, fails beyond one head, and has not been shown right at one). \
+         Compile without `--csha`, \
+         or with `--csha off` if a flag bundle turns it on: the train step then \
+         differentiates the unfused attention, which does match. Inference through an \
+         `@flash_attention` method is not affected."
+    ))
+}
+
 /// The active-head count a CSHA training launch passes to its kernel, forward
 /// and backward alike: the one in the configuration the kernels were
 /// synthesized from (0 means every head).
@@ -2504,6 +2547,9 @@ fn lower_single_op(
                     .map(|e| e.save_activations_for_backward)
                     .unwrap_or(false);
                 if needs_saves {
+                    if CSHA_FUSED_TRAINING_WITHHELD {
+                        return Err(csha_fused_training_withheld(&layer));
+                    }
                     let result = emit_fused_forward_under_claim(
                         compiler, builder, op, &inputs, var_map, &layer,
                     )?;

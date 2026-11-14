@@ -40,7 +40,7 @@
 //!     arg threading + the optimizer-symbol-mangling fix to land
 //!     before `nsl_flash_attention_csha_with_saves` is reachable from
 //!     source.  Those are out of Gap G's "fix only the type mismatch"
-//!     scope; see `csha_gap_f_toy_pretrain_smoke.rs`.
+//!     scope; see `csha_training_withheld.rs`.
 
 #![cfg(feature = "test-helpers")]
 

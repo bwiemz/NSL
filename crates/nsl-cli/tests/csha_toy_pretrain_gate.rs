@@ -1,84 +1,97 @@
-//! `examples/csha_toy_pretrain_hd32.nsl` on a GPU, against PyTorch.
+//! `examples/csha_toy_pretrain_hd32.nsl`: refused with `--csha`, and right
+//! without it.
 //!
-//! The example is the one program that reaches the CSHA launchers from NSL
-//! source: an `@flash_attention` method whose RMSNorm and three projections
-//! feed `scaled_dot_product_attention` directly, trained for one SGD step
-//! with `--source-ad --csha auto`. This gate runs it and compares what it
-//! prints with literals from PyTorch's float64 autograd on the same program
-//! (`tools/refcheck/csha_toy_literals.py`):
+//! The example is an `@flash_attention` method whose RMSNorm and three
+//! projections feed `scaled_dot_product_attention` directly, trained for one
+//! SGD step: the chain the CSHA boundary scan claims.
 //!
-//! * the loss, computed twice: by a direct call of the method and by the
-//!   train step's forward;
-//! * for each of Wq, Wk, Wv and the RMSNorm weight, two statistics of the
-//!   update `d` the step applied: `sum(d * d)` and `sum(d * probe)`.
+//! **With `--csha`** the train step would go through the CSHA fused forward
+//! and backward. That pair is wrong beyond one tile (dQ, dK and dV 43% to
+//! 130% off the f64 reference at two), stops on a shape mismatch beyond one
+//! head, and has not been shown right at one head and one tile, so the
+//! compiler refuses the program. The first test checks the refusal. It
+//! compiles only, and needs no GPU.
 //!
-//! The example it replaces could not tell a working backward from a broken
-//! one, and could not run: `x` was two-dimensional, which the fused forward
-//! aborts on, every weight was ones and the loss was `sum(out)`, which makes
-//! dQ, dK, dWq and dWk exactly zero. Its only test compiled it and looked at
-//! relocation symbols. Here the inputs are non-uniform, every gradient is
-//! nonzero, and the gradient reaching the attention output is of order 1e-6.
+//! **Without `--csha`** the train step differentiates the unfused attention.
+//! The second test runs that on a GPU and compares everything the example
+//! prints with literals from PyTorch's float64 autograd
+//! (`tools/refcheck/csha_toy_literals.py`): the loss of the train step, and
+//! for each of Wq, Wk, Wv and the RMSNorm weight two statistics of the
+//! update `d` the step applied, `sum(d * d)` and `sum(d * probe)`. Every
+//! statistic is asserted. The run uses `--matmul-mode f32`: the true Wq
+//! gradient of this program is a small difference of large terms, and the
+//! gate is about the attention's gradient, not about TF32 operand rounding.
 //!
-//! # What is asserted, and what is not
+//! The example does not call its method outside the train block, and that
+//! is deliberate. With a direct call of the `@flash_attention` method before
+//! the train block, the Wq update of the following step is wrong (squared
+//! norm 17.2 against 0.0061) while every other statistic stays right; it
+//! happens without `--csha`, in either matmul mode, and not when the
+//! decorator is removed. That defect is open and is recorded in the CSHA
+//! errata.
 //!
-//! Asserted: the two losses, the projections of the Wk and Wv updates on the
-//! probe, and both statistics of the RMSNorm weight's update. These agree
-//! with PyTorch to 1e-3 of their scale or better.
-//!
-//! Printed and NOT asserted, because they are wrong today ([`KNOWN_WRONG`]):
-//! both statistics of the Wq update (its squared norm is 17.2 against
-//! PyTorch's 0.0061) and the squared norms of the Wk and Wv updates (about
-//! 12% high). The kernel-level gates in
-//! `crates/nsl-codegen/tests/csha_cuda_backward.rs` pass for the fused
-//! configuration; what is wrong is the weight gradient on the configuration
-//! a training build emits. When that is fixed, empty the list.
+//! The program this example replaced could not run (its `x` was
+//! two-dimensional) and could not tell a working backward from a broken one
+//! (all-ones inputs and a loss of `sum(out)` make dQ, dK, dWq and dWk
+//! exactly zero); its only test looked at relocation symbols.
 //!
 //! ```text
+//! cargo test -p nsl-cli --test csha_toy_pretrain_gate
 //! cargo test -p nsl-cli --release --features cuda \
 //!     --test csha_toy_pretrain_gate -- --ignored
 //! ```
 
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Output};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap().to_path_buf()
 }
 
-/// Run the example with the CSHA path on and return the numbers it printed,
-/// in order.
-fn run_example() -> Vec<f64> {
-    let root = repo_root();
-    let dir = std::env::temp_dir().join(format!("nsl_csha_toy_{}", std::process::id()));
+fn scratch_dir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("nsl_csha_toy_{}_{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_nsl"))
-        .args(["run", "--target", "cuda", "--source-ad", "--csha", "auto"])
-        .arg(root.join("examples/csha_toy_pretrain_hd32.nsl"))
-        .current_dir(&dir)
+    dir
+}
+
+/// Run `nsl <args>` on a copy of the example placed in `dir`, so that
+/// nothing the compiler writes beside its input lands in the repository.
+fn nsl(dir: &std::path::Path, args: &[&str]) -> Output {
+    let root = repo_root();
+    let prog = dir.join("csha_toy_pretrain_hd32.nsl");
+    std::fs::copy(root.join("examples/csha_toy_pretrain_hd32.nsl"), &prog).expect("copy the example");
+    Command::new(env!("CARGO_BIN_EXE_nsl"))
+        .args(args)
+        .arg(&prog)
+        .current_dir(dir)
         .env("NSL_STDLIB_PATH", root.join("stdlib"))
         .output()
-        .expect("spawn nsl run");
-    let _ = std::fs::remove_dir_all(&dir);
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        .expect("spawn nsl")
+}
+
+#[test]
+fn training_the_example_with_csha_is_a_compile_error() {
+    let dir = scratch_dir("refusal");
+    let out = nsl(&dir, &["build", "--emit-obj", "--target", "cuda", "--source-ad", "--csha", "auto"]);
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-    assert!(
-        out.status.success() && stdout.contains("csha_toy_pretrain_hd32: PASS"),
-        "the example failed ({}):\n{stdout}\n{stderr}",
-        out.status
-    );
-    // The fused pair must be what ran, not a fallback to per-op adjoints.
-    assert!(
-        stderr.contains("CSHA fused backward: emitting fused launch")
-            && !stderr.contains("CSHA fused backward rejected")
-            && !stderr.contains("[csha] not applied"),
-        "the build did not use the CSHA kernels:\n{stderr}"
-    );
-    // A scalar prints as `tensor([<value>])`.
-    stdout
-        .lines()
-        .filter_map(|l| l.trim().strip_prefix("tensor([")?.strip_suffix("])")?.parse::<f64>().ok())
-        .collect()
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(!out.status.success(), "the example compiled with --csha:\n{stderr}");
+    for needle in ["@flash_attention", "--csha", "withheld", "do not match the reference"] {
+        assert!(stderr.contains(needle), "the error does not say {needle:?}:\n{stderr}");
+    }
+}
+
+/// The same compile without `--csha` succeeds: the refusal is about the
+/// fused pair, not about the program.
+#[test]
+fn the_example_compiles_without_csha() {
+    let dir = scratch_dir("plain");
+    let out = nsl(&dir, &["build", "--emit-obj", "--target", "cuda", "--source-ad"]);
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(out.status.success(), "the example does not compile without --csha:\n{stderr}");
+    assert!(!stderr.contains("withheld"), "the refusal fired without --csha:\n{stderr}");
 }
 
 /// (name, PyTorch value, scale the error is judged against).
@@ -97,39 +110,35 @@ const EXPECTED: &Expected = &[
     ("sum(dgamma * gprobe)", 0.0008943720509240194, 1.966806917220385),
 ];
 
-/// Statistics that are printed and not asserted; see the file header.
-const KNOWN_WRONG: [&str; 4] =
-    ["sum(dWq * dWq)", "sum(dWq * probe)", "sum(dWk * dWk)", "sum(dWv * dWv)"];
-
-/// Allowed error as a fraction of each statistic's scale. The gradients are
-/// f32, the fused kernels take Q, K and V as f16 operands and store the
-/// attention output as f16, and the statistics are f32 sums. Measured on an
-/// RTX PRO 4500: 1.0e-3 on the loss, 8e-4 or less on the asserted gradient
-/// statistics.
-const REL_TOL: f64 = 5e-3;
+/// Allowed error as a fraction of each statistic's scale. Everything on
+/// this path is f32; measured on an RTX PRO 4500 the worst statistic is
+/// 2e-6 of its scale.
+const REL_TOL: f64 = 1e-4;
 
 #[test]
 #[ignore = "requires CUDA GPU"]
-fn csha_toy_pretrain_matches_pytorch() {
-    let got = run_example();
-    assert_eq!(got.len(), EXPECTED.len() + 1, "expected {} printed numbers, got {got:?}", EXPECTED.len() + 1);
-    // The first two numbers are the same loss: once from a direct call of
-    // the method, once from the train step's forward.
-    let (_, loss, loss_scale) = EXPECTED[0];
-    let direct = (got[0] - loss).abs() / loss_scale;
-    eprintln!("{:<22} nsl={:<13.6e} pytorch={loss:<13.6e} err/scale={direct:.2e}", "loss, direct call", got[0]);
+fn the_example_without_csha_matches_pytorch() {
+    let dir = scratch_dir("run");
+    let out = nsl(&dir, &["run", "--target", "cuda", "--source-ad", "--matmul-mode", "f32"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        out.status.success() && stdout.contains("csha_toy_pretrain_hd32: PASS"),
+        "the example failed ({}):\n{stdout}\n{stderr}",
+        out.status
+    );
+    // A scalar prints as `tensor([<value>])`.
+    let got: Vec<f64> = stdout
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("tensor([")?.strip_suffix("])")?.parse::<f64>().ok())
+        .collect();
+    assert_eq!(got.len(), EXPECTED.len(), "expected {} printed numbers, got {got:?}", EXPECTED.len());
     let mut failures = Vec::new();
-    if !(direct < REL_TOL) {
-        failures.push(format!("loss by a direct call of the method: {:e} vs PyTorch {loss:e}", got[0]));
-    }
-    for (&g, &(name, want, scale)) in got[1..].iter().zip(EXPECTED) {
+    for (&g, &(name, want, scale)) in got.iter().zip(EXPECTED) {
         let err = (g - want).abs() / scale;
-        let known_wrong = KNOWN_WRONG.contains(&name);
-        eprintln!(
-            "{name:<22} nsl={g:<13.6e} pytorch={want:<13.6e} err/scale={err:.2e}{}",
-            if known_wrong { "  (known wrong, not asserted)" } else { "" }
-        );
-        if !known_wrong && !(err < REL_TOL) {
+        eprintln!("{name:<22} nsl={g:<13.6e} pytorch={want:<13.6e} err/scale={err:.2e}");
+        if !(err < REL_TOL) {
             failures.push(format!("{name}: {g:e} vs PyTorch {want:e} ({err:.3e} of its scale, tolerance {REL_TOL:.0e})"));
         }
     }

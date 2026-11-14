@@ -1,41 +1,44 @@
-# The one program that reaches the CSHA fused attention kernels from NSL
-# source: an `@flash_attention(head_dim=32)` method whose RMSNorm and three
+# An `@flash_attention(head_dim=32)` method whose RMSNorm and three
 # projections feed `scaled_dot_product_attention` directly, trained for one
-# SGD step.
+# SGD step. It is the shape of program the CSHA boundary scan claims:
 #
-#   nsl run --target cuda --source-ad --csha auto examples/csha_toy_pretrain_hd32.nsl
+#   - `@flash_attention` on the method;
+#   - weights named wq / wk / wv, which is how the scan tells the
+#     projections apart;
+#   - nothing between RMSNorm, the projections and the attention. `x` is
+#     [batch, heads, seq, head_dim]; a reshape into heads would break the
+#     chain.
 #
-# With those flags the train step's attention runs as the fused forward that
-# saves Q, K, V and the softmax statistics (`nsl_flash_attention_csha_with_saves`)
-# and its gradient as the fused backward (`nsl_flash_attention_csha_backward`).
-# Without `--csha` the same program lowers to matmul, softmax, matmul.
+# Run it without `--csha`:
 #
-# What makes the chain match:
-#   - `@flash_attention` on the method, with `head_dim=32`: at the default
-#     64 the fused backward does not fit the shared-memory budget.
-#   - The weights are named wq / wk / wv, which is how the boundary scan
-#     tells the projections apart.
-#   - Nothing sits between RMSNorm, the projections and the attention. `x`
-#     is [batch, heads, seq, head_dim]; a reshape into heads would break the
-#     chain, so every head here shares one set of weights.
+#   nsl run --target cuda --source-ad examples/csha_toy_pretrain_hd32.nsl
 #
-# The model and every tensor are placed on the GPU: the fused kernels write
-# on the device and refuse a CPU-resident output.
+# The train step then differentiates the unfused attention (matmul, softmax,
+# matmul). With `--csha` the compiler refuses the program: the claimed
+# attention would train through the CSHA fused forward and backward, and the
+# fused backward is withheld from train and grad blocks because its
+# gradients do not match a reference (the errata for the CSHA proposal has
+# the numbers). Calling the method outside a train block still works with
+# `--csha`.
 #
-# It prints the loss twice (a direct call of the method, then the train
-# step's forward) and two statistics of the update the step applies to each
-# weight. `crates/nsl-cli/tests/csha_toy_pretrain_gate.rs` compares them
-# with PyTorch (`tools/refcheck/csha_toy_literals.py` prints the reference).
-# The inputs are deliberately non-uniform: with `x` and the weights all ones
-# and a loss of `sum(out)` the gradients of Wq and Wk are exactly zero, and
-# a broken backward prints the same thing as a working one. The loss is
-# scaled so that the gradient reaching the attention output is of order
-# 1e-6, the magnitude of a real pretraining step.
+# The model and every tensor are placed on the GPU, which is where the
+# decorated method's kernels write.
 #
-# Not every number is right yet. The loss and the updates of Wk, Wv and the
-# RMSNorm weight along the probe agree with PyTorch; the update of Wq does
-# not, and the squared norms of the Wk and Wv updates are about 12% high.
-# The gate asserts the former and prints the latter.
+# It prints the loss of the train step and two statistics of the update
+# the step applies to each weight. `crates/nsl-cli/tests/csha_toy_pretrain_gate.rs` compares all of
+# them with PyTorch (`tools/refcheck/csha_toy_literals.py` prints the
+# reference) and checks the refusal. The inputs are deliberately
+# non-uniform: with `x` and the weights all ones and a loss of `sum(out)`
+# the gradients of Wq and Wk are exactly zero, and a broken backward prints
+# the same thing as a working one. The loss is scaled so that the gradient
+# reaching the attention output is of order 1e-6, the magnitude of a real
+# pretraining step.
+#
+# The method is deliberately not called outside the train block. A direct
+# call of an `@flash_attention` method before the train block changes the
+# Wq update of the following step (its squared norm becomes 17.2 where
+# PyTorch gives 0.0061), with or without `--csha`; that defect is recorded
+# in the CSHA errata and is not something this example should rely on.
 
 model TinyAttn:
     w_norm: Tensor = 1.0 + 0.25 * tensor_sin(arange(0.0, 32.0) * 0.9)
@@ -62,9 +65,6 @@ let wv0: Tensor = 0.3 * tensor_sin(arange(0.0, 1024.0) * 0.71 + 2.0).reshape([32
 let g0: Tensor = 1.0 + 0.25 * tensor_sin(arange(0.0, 32.0) * 0.9).to(cuda)
 let probe: Tensor = tensor_sin(arange(0.0, 1024.0) * 0.19 + 0.3).reshape([32, 32]).to(cuda)
 let gprobe: Tensor = tensor_sin(arange(0.0, 32.0) * 0.19 + 0.3).to(cuda)
-
-let y0: Tensor = m.forward(x)
-print(sum(y0 * y0 * t) * 0.000001)
 
 train(model = m, epochs = 1):
     optimizer: SGD(lr = 100000.0)
