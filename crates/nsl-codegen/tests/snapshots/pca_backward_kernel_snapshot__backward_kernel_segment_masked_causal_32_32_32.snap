@@ -500,15 +500,16 @@ V2_BWD_Q_LOAD_SKIP_7:
     mul.lo.u64 %rd30, %rd30, %rd6;
     add.u64 %rd30, %rd30, %rd39;
     mul.lo.u64 %rd30, %rd30, %rd7;
-    shl.b64 %rd30, %rd30, 1;  // * 2 bytes (f16)
-    add.u64 %rd31, %rd_bwd_do, %rd30;  // &dO[row, 0]
+    shl.b64 %rd31, %rd30, 2;  // * 4 bytes (f32 dO)
+    add.u64 %rd31, %rd_bwd_do, %rd31;  // &dO[row, 0]
+    shl.b64 %rd30, %rd30, 1;  // * 2 bytes (f16 O)
     add.u64 %rd32, %rd3, %rd30;         // &O[row, 0]
     mov.f32 %f_rowsum_dP_P, 0f00000000;
     cvt.u64.u32 %rd33, %lane;
+    shl.b64 %rd34, %rd33, 2;  // d * 4 bytes
+    add.u64 %rd34, %rd31, %rd34;
+    ld.global.f32 %f0, [%rd34];
     shl.b64 %rd33, %rd33, 1;  // d * 2 bytes
-    add.u64 %rd34, %rd31, %rd33;
-    ld.global.b16 %h0, [%rd34];
-    cvt.f32.f16 %f0, %h0;
     add.u64 %rd34, %rd32, %rd33;
     ld.global.b16 %h0, [%rd34];
     cvt.f32.f16 %f1, %h0;
@@ -548,15 +549,16 @@ V2_BWD_D_DONE_0:
     mul.lo.u64 %rd30, %rd30, %rd6;
     add.u64 %rd30, %rd30, %rd39;
     mul.lo.u64 %rd30, %rd30, %rd7;
-    shl.b64 %rd30, %rd30, 1;  // * 2 bytes (f16)
-    add.u64 %rd31, %rd_bwd_do, %rd30;  // &dO[row, 0]
+    shl.b64 %rd31, %rd30, 2;  // * 4 bytes (f32 dO)
+    add.u64 %rd31, %rd_bwd_do, %rd31;  // &dO[row, 0]
+    shl.b64 %rd30, %rd30, 1;  // * 2 bytes (f16 O)
     add.u64 %rd32, %rd3, %rd30;         // &O[row, 0]
     mov.f32 %f_rowsum_dP_P, 0f00000000;
     cvt.u64.u32 %rd33, %lane;
+    shl.b64 %rd34, %rd33, 2;  // d * 4 bytes
+    add.u64 %rd34, %rd31, %rd34;
+    ld.global.f32 %f0, [%rd34];
     shl.b64 %rd33, %rd33, 1;  // d * 2 bytes
-    add.u64 %rd34, %rd31, %rd33;
-    ld.global.b16 %h0, [%rd34];
-    cvt.f32.f16 %f0, %h0;
     add.u64 %rd34, %rd32, %rd33;
     ld.global.b16 %h0, [%rd34];
     cvt.f32.f16 %f1, %h0;
@@ -596,15 +598,16 @@ V2_BWD_D_DONE_1:
     mul.lo.u64 %rd30, %rd30, %rd6;
     add.u64 %rd30, %rd30, %rd39;
     mul.lo.u64 %rd30, %rd30, %rd7;
-    shl.b64 %rd30, %rd30, 1;  // * 2 bytes (f16)
-    add.u64 %rd31, %rd_bwd_do, %rd30;  // &dO[row, 0]
+    shl.b64 %rd31, %rd30, 2;  // * 4 bytes (f32 dO)
+    add.u64 %rd31, %rd_bwd_do, %rd31;  // &dO[row, 0]
+    shl.b64 %rd30, %rd30, 1;  // * 2 bytes (f16 O)
     add.u64 %rd32, %rd3, %rd30;         // &O[row, 0]
     mov.f32 %f_rowsum_dP_P, 0f00000000;
     cvt.u64.u32 %rd33, %lane;
+    shl.b64 %rd34, %rd33, 2;  // d * 4 bytes
+    add.u64 %rd34, %rd31, %rd34;
+    ld.global.f32 %f0, [%rd34];
     shl.b64 %rd33, %rd33, 1;  // d * 2 bytes
-    add.u64 %rd34, %rd31, %rd33;
-    ld.global.b16 %h0, [%rd34];
-    cvt.f32.f16 %f0, %h0;
     add.u64 %rd34, %rd32, %rd33;
     ld.global.b16 %h0, [%rd34];
     cvt.f32.f16 %f1, %h0;
@@ -644,15 +647,16 @@ V2_BWD_D_DONE_2:
     mul.lo.u64 %rd30, %rd30, %rd6;
     add.u64 %rd30, %rd30, %rd39;
     mul.lo.u64 %rd30, %rd30, %rd7;
-    shl.b64 %rd30, %rd30, 1;  // * 2 bytes (f16)
-    add.u64 %rd31, %rd_bwd_do, %rd30;  // &dO[row, 0]
+    shl.b64 %rd31, %rd30, 2;  // * 4 bytes (f32 dO)
+    add.u64 %rd31, %rd_bwd_do, %rd31;  // &dO[row, 0]
+    shl.b64 %rd30, %rd30, 1;  // * 2 bytes (f16 O)
     add.u64 %rd32, %rd3, %rd30;         // &O[row, 0]
     mov.f32 %f_rowsum_dP_P, 0f00000000;
     cvt.u64.u32 %rd33, %lane;
+    shl.b64 %rd34, %rd33, 2;  // d * 4 bytes
+    add.u64 %rd34, %rd31, %rd34;
+    ld.global.f32 %f0, [%rd34];
     shl.b64 %rd33, %rd33, 1;  // d * 2 bytes
-    add.u64 %rd34, %rd31, %rd33;
-    ld.global.b16 %h0, [%rd34];
-    cvt.f32.f16 %f0, %h0;
     add.u64 %rd34, %rd32, %rd33;
     ld.global.b16 %h0, [%rd34];
     cvt.f32.f16 %f1, %h0;
@@ -692,15 +696,16 @@ V2_BWD_D_DONE_3:
     mul.lo.u64 %rd30, %rd30, %rd6;
     add.u64 %rd30, %rd30, %rd39;
     mul.lo.u64 %rd30, %rd30, %rd7;
-    shl.b64 %rd30, %rd30, 1;  // * 2 bytes (f16)
-    add.u64 %rd31, %rd_bwd_do, %rd30;  // &dO[row, 0]
+    shl.b64 %rd31, %rd30, 2;  // * 4 bytes (f32 dO)
+    add.u64 %rd31, %rd_bwd_do, %rd31;  // &dO[row, 0]
+    shl.b64 %rd30, %rd30, 1;  // * 2 bytes (f16 O)
     add.u64 %rd32, %rd3, %rd30;         // &O[row, 0]
     mov.f32 %f_rowsum_dP_P, 0f00000000;
     cvt.u64.u32 %rd33, %lane;
+    shl.b64 %rd34, %rd33, 2;  // d * 4 bytes
+    add.u64 %rd34, %rd31, %rd34;
+    ld.global.f32 %f0, [%rd34];
     shl.b64 %rd33, %rd33, 1;  // d * 2 bytes
-    add.u64 %rd34, %rd31, %rd33;
-    ld.global.b16 %h0, [%rd34];
-    cvt.f32.f16 %f0, %h0;
     add.u64 %rd34, %rd32, %rd33;
     ld.global.b16 %h0, [%rd34];
     cvt.f32.f16 %f1, %h0;
@@ -740,15 +745,16 @@ V2_BWD_D_DONE_4:
     mul.lo.u64 %rd30, %rd30, %rd6;
     add.u64 %rd30, %rd30, %rd39;
     mul.lo.u64 %rd30, %rd30, %rd7;
-    shl.b64 %rd30, %rd30, 1;  // * 2 bytes (f16)
-    add.u64 %rd31, %rd_bwd_do, %rd30;  // &dO[row, 0]
+    shl.b64 %rd31, %rd30, 2;  // * 4 bytes (f32 dO)
+    add.u64 %rd31, %rd_bwd_do, %rd31;  // &dO[row, 0]
+    shl.b64 %rd30, %rd30, 1;  // * 2 bytes (f16 O)
     add.u64 %rd32, %rd3, %rd30;         // &O[row, 0]
     mov.f32 %f_rowsum_dP_P, 0f00000000;
     cvt.u64.u32 %rd33, %lane;
+    shl.b64 %rd34, %rd33, 2;  // d * 4 bytes
+    add.u64 %rd34, %rd31, %rd34;
+    ld.global.f32 %f0, [%rd34];
     shl.b64 %rd33, %rd33, 1;  // d * 2 bytes
-    add.u64 %rd34, %rd31, %rd33;
-    ld.global.b16 %h0, [%rd34];
-    cvt.f32.f16 %f0, %h0;
     add.u64 %rd34, %rd32, %rd33;
     ld.global.b16 %h0, [%rd34];
     cvt.f32.f16 %f1, %h0;
@@ -788,15 +794,16 @@ V2_BWD_D_DONE_5:
     mul.lo.u64 %rd30, %rd30, %rd6;
     add.u64 %rd30, %rd30, %rd39;
     mul.lo.u64 %rd30, %rd30, %rd7;
-    shl.b64 %rd30, %rd30, 1;  // * 2 bytes (f16)
-    add.u64 %rd31, %rd_bwd_do, %rd30;  // &dO[row, 0]
+    shl.b64 %rd31, %rd30, 2;  // * 4 bytes (f32 dO)
+    add.u64 %rd31, %rd_bwd_do, %rd31;  // &dO[row, 0]
+    shl.b64 %rd30, %rd30, 1;  // * 2 bytes (f16 O)
     add.u64 %rd32, %rd3, %rd30;         // &O[row, 0]
     mov.f32 %f_rowsum_dP_P, 0f00000000;
     cvt.u64.u32 %rd33, %lane;
+    shl.b64 %rd34, %rd33, 2;  // d * 4 bytes
+    add.u64 %rd34, %rd31, %rd34;
+    ld.global.f32 %f0, [%rd34];
     shl.b64 %rd33, %rd33, 1;  // d * 2 bytes
-    add.u64 %rd34, %rd31, %rd33;
-    ld.global.b16 %h0, [%rd34];
-    cvt.f32.f16 %f0, %h0;
     add.u64 %rd34, %rd32, %rd33;
     ld.global.b16 %h0, [%rd34];
     cvt.f32.f16 %f1, %h0;
@@ -836,15 +843,16 @@ V2_BWD_D_DONE_6:
     mul.lo.u64 %rd30, %rd30, %rd6;
     add.u64 %rd30, %rd30, %rd39;
     mul.lo.u64 %rd30, %rd30, %rd7;
-    shl.b64 %rd30, %rd30, 1;  // * 2 bytes (f16)
-    add.u64 %rd31, %rd_bwd_do, %rd30;  // &dO[row, 0]
+    shl.b64 %rd31, %rd30, 2;  // * 4 bytes (f32 dO)
+    add.u64 %rd31, %rd_bwd_do, %rd31;  // &dO[row, 0]
+    shl.b64 %rd30, %rd30, 1;  // * 2 bytes (f16 O)
     add.u64 %rd32, %rd3, %rd30;         // &O[row, 0]
     mov.f32 %f_rowsum_dP_P, 0f00000000;
     cvt.u64.u32 %rd33, %lane;
+    shl.b64 %rd34, %rd33, 2;  // d * 4 bytes
+    add.u64 %rd34, %rd31, %rd34;
+    ld.global.f32 %f0, [%rd34];
     shl.b64 %rd33, %rd33, 1;  // d * 2 bytes
-    add.u64 %rd34, %rd31, %rd33;
-    ld.global.b16 %h0, [%rd34];
-    cvt.f32.f16 %f0, %h0;
     add.u64 %rd34, %rd32, %rd33;
     ld.global.b16 %h0, [%rd34];
     cvt.f32.f16 %f1, %h0;
@@ -1433,7 +1441,7 @@ V2_BWD_S_INNER_0:
     add.u64 %rd46, %rd46, %q_start;
     add.u64 %rd46, %rd46, %warp_row;
     mul.lo.u64 %rd46, %rd46, %rd7;
-    shl.b64 %rd46, %rd46, 1;  // * 2 (f16)
+    shl.b64 %rd46, %rd46, 2;  // * 4 (f32)
     add.u64 %rd46, %rd_bwd_do, %rd46;  // &dO[warp_row, 0]
     cvt.u64.u32 %rd47, %lane;
     mul.lo.u64 %rd47, %rd47, 64;
@@ -1441,10 +1449,10 @@ V2_BWD_S_INNER_0:
     mov.u32 %r0, 0;
 V2_BWD_DP_INNER_0:
     cvt.u64.u32 %rd42, %r0;
+    shl.b64 %rd43, %rd42, 2;
+    add.u64 %rd43, %rd46, %rd43;
+    ld.global.f32 %f0, [%rd43];
     shl.b64 %rd42, %rd42, 1;
-    add.u64 %rd43, %rd46, %rd42;
-    ld.global.b16 %h0, [%rd43];
-    cvt.f32.f16 %f0, %h0;
     add.u64 %rd43, %rd47, %rd42;
     ld.shared.b16 %h0, [%rd43];
     cvt.f32.f16 %f1, %h0;
@@ -1496,7 +1504,7 @@ V2_BWD_DV_INNER_0:
     add.u64 %rd33, %rd33, %q_start;
     add.u64 %rd33, %rd33, %rd32;
     mul.lo.u64 %rd33, %rd33, %rd7;
-    shl.b64 %rd33, %rd33, 1;
+    shl.b64 %rd33, %rd33, 2;  // * 4 bytes (f32)
     add.u64 %rd33, %rd_bwd_do, %rd33;  // &dO[row_global, 0]
     cvt.u64.u32 %rd34, %lane;
     mul.lo.u64 %rd34, %rd34, 128;  // lane * head_dim * 4
@@ -1505,75 +1513,67 @@ V2_BWD_DV_INNER_0:
     cvt.u64.u32 %rd35, %warp_id;
     mul.lo.u64 %rd35, %rd35, 32;  // warp d-base * 4
     cvt.u64.u32 %rd36, %warp_id;
-    mul.lo.u64 %rd36, %rd36, 16;
+    mul.lo.u64 %rd36, %rd36, 32;
     add.u64 %rd37, %rd34, %rd35;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 4;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 2;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 4;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 8;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 4;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 8;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 12;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 6;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 12;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 16;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 8;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 16;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 20;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 10;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 20;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 24;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 12;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 24;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 28;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 14;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 28;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u32 %r1, %r1, 1;
@@ -1814,7 +1814,7 @@ V2_BWD_S_INNER_1:
     add.u64 %rd46, %rd46, %q_start;
     add.u64 %rd46, %rd46, %warp_row;
     mul.lo.u64 %rd46, %rd46, %rd7;
-    shl.b64 %rd46, %rd46, 1;  // * 2 (f16)
+    shl.b64 %rd46, %rd46, 2;  // * 4 (f32)
     add.u64 %rd46, %rd_bwd_do, %rd46;  // &dO[warp_row, 0]
     cvt.u64.u32 %rd47, %lane;
     mul.lo.u64 %rd47, %rd47, 64;
@@ -1822,10 +1822,10 @@ V2_BWD_S_INNER_1:
     mov.u32 %r0, 0;
 V2_BWD_DP_INNER_1:
     cvt.u64.u32 %rd42, %r0;
+    shl.b64 %rd43, %rd42, 2;
+    add.u64 %rd43, %rd46, %rd43;
+    ld.global.f32 %f0, [%rd43];
     shl.b64 %rd42, %rd42, 1;
-    add.u64 %rd43, %rd46, %rd42;
-    ld.global.b16 %h0, [%rd43];
-    cvt.f32.f16 %f0, %h0;
     add.u64 %rd43, %rd47, %rd42;
     ld.shared.b16 %h0, [%rd43];
     cvt.f32.f16 %f1, %h0;
@@ -1877,7 +1877,7 @@ V2_BWD_DV_INNER_1:
     add.u64 %rd33, %rd33, %q_start;
     add.u64 %rd33, %rd33, %rd32;
     mul.lo.u64 %rd33, %rd33, %rd7;
-    shl.b64 %rd33, %rd33, 1;
+    shl.b64 %rd33, %rd33, 2;  // * 4 bytes (f32)
     add.u64 %rd33, %rd_bwd_do, %rd33;  // &dO[row_global, 0]
     cvt.u64.u32 %rd34, %lane;
     mul.lo.u64 %rd34, %rd34, 128;  // lane * head_dim * 4
@@ -1886,75 +1886,67 @@ V2_BWD_DV_INNER_1:
     cvt.u64.u32 %rd35, %warp_id;
     mul.lo.u64 %rd35, %rd35, 32;  // warp d-base * 4
     cvt.u64.u32 %rd36, %warp_id;
-    mul.lo.u64 %rd36, %rd36, 16;
+    mul.lo.u64 %rd36, %rd36, 32;
     add.u64 %rd37, %rd34, %rd35;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 4;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 2;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 4;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 8;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 4;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 8;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 12;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 6;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 12;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 16;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 8;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 16;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 20;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 10;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 20;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 24;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 12;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 24;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 28;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 14;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 28;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u32 %r1, %r1, 1;
@@ -2195,7 +2187,7 @@ V2_BWD_S_INNER_2:
     add.u64 %rd46, %rd46, %q_start;
     add.u64 %rd46, %rd46, %warp_row;
     mul.lo.u64 %rd46, %rd46, %rd7;
-    shl.b64 %rd46, %rd46, 1;  // * 2 (f16)
+    shl.b64 %rd46, %rd46, 2;  // * 4 (f32)
     add.u64 %rd46, %rd_bwd_do, %rd46;  // &dO[warp_row, 0]
     cvt.u64.u32 %rd47, %lane;
     mul.lo.u64 %rd47, %rd47, 64;
@@ -2203,10 +2195,10 @@ V2_BWD_S_INNER_2:
     mov.u32 %r0, 0;
 V2_BWD_DP_INNER_2:
     cvt.u64.u32 %rd42, %r0;
+    shl.b64 %rd43, %rd42, 2;
+    add.u64 %rd43, %rd46, %rd43;
+    ld.global.f32 %f0, [%rd43];
     shl.b64 %rd42, %rd42, 1;
-    add.u64 %rd43, %rd46, %rd42;
-    ld.global.b16 %h0, [%rd43];
-    cvt.f32.f16 %f0, %h0;
     add.u64 %rd43, %rd47, %rd42;
     ld.shared.b16 %h0, [%rd43];
     cvt.f32.f16 %f1, %h0;
@@ -2258,7 +2250,7 @@ V2_BWD_DV_INNER_2:
     add.u64 %rd33, %rd33, %q_start;
     add.u64 %rd33, %rd33, %rd32;
     mul.lo.u64 %rd33, %rd33, %rd7;
-    shl.b64 %rd33, %rd33, 1;
+    shl.b64 %rd33, %rd33, 2;  // * 4 bytes (f32)
     add.u64 %rd33, %rd_bwd_do, %rd33;  // &dO[row_global, 0]
     cvt.u64.u32 %rd34, %lane;
     mul.lo.u64 %rd34, %rd34, 128;  // lane * head_dim * 4
@@ -2267,75 +2259,67 @@ V2_BWD_DV_INNER_2:
     cvt.u64.u32 %rd35, %warp_id;
     mul.lo.u64 %rd35, %rd35, 32;  // warp d-base * 4
     cvt.u64.u32 %rd36, %warp_id;
-    mul.lo.u64 %rd36, %rd36, 16;
+    mul.lo.u64 %rd36, %rd36, 32;
     add.u64 %rd37, %rd34, %rd35;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 4;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 2;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 4;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 8;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 4;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 8;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 12;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 6;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 12;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 16;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 8;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 16;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 20;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 10;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 20;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 24;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 12;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 24;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 28;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 14;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 28;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u32 %r1, %r1, 1;
@@ -2576,7 +2560,7 @@ V2_BWD_S_INNER_3:
     add.u64 %rd46, %rd46, %q_start;
     add.u64 %rd46, %rd46, %warp_row;
     mul.lo.u64 %rd46, %rd46, %rd7;
-    shl.b64 %rd46, %rd46, 1;  // * 2 (f16)
+    shl.b64 %rd46, %rd46, 2;  // * 4 (f32)
     add.u64 %rd46, %rd_bwd_do, %rd46;  // &dO[warp_row, 0]
     cvt.u64.u32 %rd47, %lane;
     mul.lo.u64 %rd47, %rd47, 64;
@@ -2584,10 +2568,10 @@ V2_BWD_S_INNER_3:
     mov.u32 %r0, 0;
 V2_BWD_DP_INNER_3:
     cvt.u64.u32 %rd42, %r0;
+    shl.b64 %rd43, %rd42, 2;
+    add.u64 %rd43, %rd46, %rd43;
+    ld.global.f32 %f0, [%rd43];
     shl.b64 %rd42, %rd42, 1;
-    add.u64 %rd43, %rd46, %rd42;
-    ld.global.b16 %h0, [%rd43];
-    cvt.f32.f16 %f0, %h0;
     add.u64 %rd43, %rd47, %rd42;
     ld.shared.b16 %h0, [%rd43];
     cvt.f32.f16 %f1, %h0;
@@ -2639,7 +2623,7 @@ V2_BWD_DV_INNER_3:
     add.u64 %rd33, %rd33, %q_start;
     add.u64 %rd33, %rd33, %rd32;
     mul.lo.u64 %rd33, %rd33, %rd7;
-    shl.b64 %rd33, %rd33, 1;
+    shl.b64 %rd33, %rd33, 2;  // * 4 bytes (f32)
     add.u64 %rd33, %rd_bwd_do, %rd33;  // &dO[row_global, 0]
     cvt.u64.u32 %rd34, %lane;
     mul.lo.u64 %rd34, %rd34, 128;  // lane * head_dim * 4
@@ -2648,75 +2632,67 @@ V2_BWD_DV_INNER_3:
     cvt.u64.u32 %rd35, %warp_id;
     mul.lo.u64 %rd35, %rd35, 32;  // warp d-base * 4
     cvt.u64.u32 %rd36, %warp_id;
-    mul.lo.u64 %rd36, %rd36, 16;
+    mul.lo.u64 %rd36, %rd36, 32;
     add.u64 %rd37, %rd34, %rd35;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 4;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 2;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 4;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 8;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 4;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 8;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 12;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 6;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 12;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 16;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 8;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 16;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 20;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 10;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 20;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 24;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 12;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 24;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 28;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 14;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 28;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u32 %r1, %r1, 1;
@@ -2957,7 +2933,7 @@ V2_BWD_S_INNER_4:
     add.u64 %rd46, %rd46, %q_start;
     add.u64 %rd46, %rd46, %warp_row;
     mul.lo.u64 %rd46, %rd46, %rd7;
-    shl.b64 %rd46, %rd46, 1;  // * 2 (f16)
+    shl.b64 %rd46, %rd46, 2;  // * 4 (f32)
     add.u64 %rd46, %rd_bwd_do, %rd46;  // &dO[warp_row, 0]
     cvt.u64.u32 %rd47, %lane;
     mul.lo.u64 %rd47, %rd47, 64;
@@ -2965,10 +2941,10 @@ V2_BWD_S_INNER_4:
     mov.u32 %r0, 0;
 V2_BWD_DP_INNER_4:
     cvt.u64.u32 %rd42, %r0;
+    shl.b64 %rd43, %rd42, 2;
+    add.u64 %rd43, %rd46, %rd43;
+    ld.global.f32 %f0, [%rd43];
     shl.b64 %rd42, %rd42, 1;
-    add.u64 %rd43, %rd46, %rd42;
-    ld.global.b16 %h0, [%rd43];
-    cvt.f32.f16 %f0, %h0;
     add.u64 %rd43, %rd47, %rd42;
     ld.shared.b16 %h0, [%rd43];
     cvt.f32.f16 %f1, %h0;
@@ -3020,7 +2996,7 @@ V2_BWD_DV_INNER_4:
     add.u64 %rd33, %rd33, %q_start;
     add.u64 %rd33, %rd33, %rd32;
     mul.lo.u64 %rd33, %rd33, %rd7;
-    shl.b64 %rd33, %rd33, 1;
+    shl.b64 %rd33, %rd33, 2;  // * 4 bytes (f32)
     add.u64 %rd33, %rd_bwd_do, %rd33;  // &dO[row_global, 0]
     cvt.u64.u32 %rd34, %lane;
     mul.lo.u64 %rd34, %rd34, 128;  // lane * head_dim * 4
@@ -3029,75 +3005,67 @@ V2_BWD_DV_INNER_4:
     cvt.u64.u32 %rd35, %warp_id;
     mul.lo.u64 %rd35, %rd35, 32;  // warp d-base * 4
     cvt.u64.u32 %rd36, %warp_id;
-    mul.lo.u64 %rd36, %rd36, 16;
+    mul.lo.u64 %rd36, %rd36, 32;
     add.u64 %rd37, %rd34, %rd35;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 4;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 2;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 4;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 8;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 4;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 8;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 12;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 6;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 12;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 16;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 8;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 16;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 20;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 10;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 20;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 24;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 12;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 24;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 28;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 14;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 28;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u32 %r1, %r1, 1;
@@ -3338,7 +3306,7 @@ V2_BWD_S_INNER_5:
     add.u64 %rd46, %rd46, %q_start;
     add.u64 %rd46, %rd46, %warp_row;
     mul.lo.u64 %rd46, %rd46, %rd7;
-    shl.b64 %rd46, %rd46, 1;  // * 2 (f16)
+    shl.b64 %rd46, %rd46, 2;  // * 4 (f32)
     add.u64 %rd46, %rd_bwd_do, %rd46;  // &dO[warp_row, 0]
     cvt.u64.u32 %rd47, %lane;
     mul.lo.u64 %rd47, %rd47, 64;
@@ -3346,10 +3314,10 @@ V2_BWD_S_INNER_5:
     mov.u32 %r0, 0;
 V2_BWD_DP_INNER_5:
     cvt.u64.u32 %rd42, %r0;
+    shl.b64 %rd43, %rd42, 2;
+    add.u64 %rd43, %rd46, %rd43;
+    ld.global.f32 %f0, [%rd43];
     shl.b64 %rd42, %rd42, 1;
-    add.u64 %rd43, %rd46, %rd42;
-    ld.global.b16 %h0, [%rd43];
-    cvt.f32.f16 %f0, %h0;
     add.u64 %rd43, %rd47, %rd42;
     ld.shared.b16 %h0, [%rd43];
     cvt.f32.f16 %f1, %h0;
@@ -3401,7 +3369,7 @@ V2_BWD_DV_INNER_5:
     add.u64 %rd33, %rd33, %q_start;
     add.u64 %rd33, %rd33, %rd32;
     mul.lo.u64 %rd33, %rd33, %rd7;
-    shl.b64 %rd33, %rd33, 1;
+    shl.b64 %rd33, %rd33, 2;  // * 4 bytes (f32)
     add.u64 %rd33, %rd_bwd_do, %rd33;  // &dO[row_global, 0]
     cvt.u64.u32 %rd34, %lane;
     mul.lo.u64 %rd34, %rd34, 128;  // lane * head_dim * 4
@@ -3410,75 +3378,67 @@ V2_BWD_DV_INNER_5:
     cvt.u64.u32 %rd35, %warp_id;
     mul.lo.u64 %rd35, %rd35, 32;  // warp d-base * 4
     cvt.u64.u32 %rd36, %warp_id;
-    mul.lo.u64 %rd36, %rd36, 16;
+    mul.lo.u64 %rd36, %rd36, 32;
     add.u64 %rd37, %rd34, %rd35;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 4;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 2;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 4;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 8;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 4;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 8;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 12;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 6;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 12;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 16;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 8;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 16;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 20;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 10;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 20;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 24;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 12;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 24;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 28;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 14;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 28;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u32 %r1, %r1, 1;
@@ -3719,7 +3679,7 @@ V2_BWD_S_INNER_6:
     add.u64 %rd46, %rd46, %q_start;
     add.u64 %rd46, %rd46, %warp_row;
     mul.lo.u64 %rd46, %rd46, %rd7;
-    shl.b64 %rd46, %rd46, 1;  // * 2 (f16)
+    shl.b64 %rd46, %rd46, 2;  // * 4 (f32)
     add.u64 %rd46, %rd_bwd_do, %rd46;  // &dO[warp_row, 0]
     cvt.u64.u32 %rd47, %lane;
     mul.lo.u64 %rd47, %rd47, 64;
@@ -3727,10 +3687,10 @@ V2_BWD_S_INNER_6:
     mov.u32 %r0, 0;
 V2_BWD_DP_INNER_6:
     cvt.u64.u32 %rd42, %r0;
+    shl.b64 %rd43, %rd42, 2;
+    add.u64 %rd43, %rd46, %rd43;
+    ld.global.f32 %f0, [%rd43];
     shl.b64 %rd42, %rd42, 1;
-    add.u64 %rd43, %rd46, %rd42;
-    ld.global.b16 %h0, [%rd43];
-    cvt.f32.f16 %f0, %h0;
     add.u64 %rd43, %rd47, %rd42;
     ld.shared.b16 %h0, [%rd43];
     cvt.f32.f16 %f1, %h0;
@@ -3782,7 +3742,7 @@ V2_BWD_DV_INNER_6:
     add.u64 %rd33, %rd33, %q_start;
     add.u64 %rd33, %rd33, %rd32;
     mul.lo.u64 %rd33, %rd33, %rd7;
-    shl.b64 %rd33, %rd33, 1;
+    shl.b64 %rd33, %rd33, 2;  // * 4 bytes (f32)
     add.u64 %rd33, %rd_bwd_do, %rd33;  // &dO[row_global, 0]
     cvt.u64.u32 %rd34, %lane;
     mul.lo.u64 %rd34, %rd34, 128;  // lane * head_dim * 4
@@ -3791,75 +3751,67 @@ V2_BWD_DV_INNER_6:
     cvt.u64.u32 %rd35, %warp_id;
     mul.lo.u64 %rd35, %rd35, 32;  // warp d-base * 4
     cvt.u64.u32 %rd36, %warp_id;
-    mul.lo.u64 %rd36, %rd36, 16;
+    mul.lo.u64 %rd36, %rd36, 32;
     add.u64 %rd37, %rd34, %rd35;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 4;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 2;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 4;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 8;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 4;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 8;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 12;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 6;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 12;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 16;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 8;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 16;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 20;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 10;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 20;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 24;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 12;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 24;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 28;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 14;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 28;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u32 %r1, %r1, 1;
@@ -4100,7 +4052,7 @@ V2_BWD_S_INNER_7:
     add.u64 %rd46, %rd46, %q_start;
     add.u64 %rd46, %rd46, %warp_row;
     mul.lo.u64 %rd46, %rd46, %rd7;
-    shl.b64 %rd46, %rd46, 1;  // * 2 (f16)
+    shl.b64 %rd46, %rd46, 2;  // * 4 (f32)
     add.u64 %rd46, %rd_bwd_do, %rd46;  // &dO[warp_row, 0]
     cvt.u64.u32 %rd47, %lane;
     mul.lo.u64 %rd47, %rd47, 64;
@@ -4108,10 +4060,10 @@ V2_BWD_S_INNER_7:
     mov.u32 %r0, 0;
 V2_BWD_DP_INNER_7:
     cvt.u64.u32 %rd42, %r0;
+    shl.b64 %rd43, %rd42, 2;
+    add.u64 %rd43, %rd46, %rd43;
+    ld.global.f32 %f0, [%rd43];
     shl.b64 %rd42, %rd42, 1;
-    add.u64 %rd43, %rd46, %rd42;
-    ld.global.b16 %h0, [%rd43];
-    cvt.f32.f16 %f0, %h0;
     add.u64 %rd43, %rd47, %rd42;
     ld.shared.b16 %h0, [%rd43];
     cvt.f32.f16 %f1, %h0;
@@ -4163,7 +4115,7 @@ V2_BWD_DV_INNER_7:
     add.u64 %rd33, %rd33, %q_start;
     add.u64 %rd33, %rd33, %rd32;
     mul.lo.u64 %rd33, %rd33, %rd7;
-    shl.b64 %rd33, %rd33, 1;
+    shl.b64 %rd33, %rd33, 2;  // * 4 bytes (f32)
     add.u64 %rd33, %rd_bwd_do, %rd33;  // &dO[row_global, 0]
     cvt.u64.u32 %rd34, %lane;
     mul.lo.u64 %rd34, %rd34, 128;  // lane * head_dim * 4
@@ -4172,75 +4124,67 @@ V2_BWD_DV_INNER_7:
     cvt.u64.u32 %rd35, %warp_id;
     mul.lo.u64 %rd35, %rd35, 32;  // warp d-base * 4
     cvt.u64.u32 %rd36, %warp_id;
-    mul.lo.u64 %rd36, %rd36, 16;
+    mul.lo.u64 %rd36, %rd36, 32;
     add.u64 %rd37, %rd34, %rd35;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 4;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 2;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 4;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 8;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 4;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 8;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 12;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 6;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 12;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 16;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 8;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 16;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 20;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 10;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 20;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 24;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 12;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 24;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u64 %rd37, %rd34, %rd35;
     add.u64 %rd37, %rd37, 28;
     ld.shared.f32 %f0, [%rd37];
     add.u64 %rd38, %rd33, %rd36;
-    add.u64 %rd38, %rd38, 14;
-    ld.global.b16 %h0, [%rd38];
-    cvt.f32.f16 %f1, %h0;
+    add.u64 %rd38, %rd38, 28;
+    ld.global.f32 %f1, [%rd38];
     fma.rn.f32 %f0, %f_P, %f1, %f0;
     st.shared.f32 [%rd37], %f0;
     add.u32 %r1, %r1, 1;
@@ -19157,7 +19101,7 @@ V2_BWD_DRMSNORM_PHASE2_DONE:
     mul.lo.u64 %rd_dq_base, %rd_dq_base, %rd6;
     add.u64 %rd_dq_base, %rd_dq_base, %q_start;
     mul.lo.u64 %rd_dq_base, %rd_dq_base, %rd7;
-    shl.b64 %rd_dq_base, %rd_dq_base, 1;  // * 2 bytes (f16)
+    shl.b64 %rd_dq_base, %rd_dq_base, 2;  // * 4 bytes (f32)
     add.u64 %rd_dq_base, %rd_bwd_dq, %rd_dq_base;
     cvt.u64.u32 %rd_dq_idx, %tid_x;
     setp.lt.u64 %p_dq_g, %rd_dq_idx, 1024;
@@ -19169,10 +19113,9 @@ V2_BWD_DRMSNORM_PHASE2_DONE:
     add.u64 %rd_dq_smem, %rd_dq_smem, 22784;
     add.u64 %rd_dq_smem, %shmem_base, %rd_dq_smem;
     @%p_dq_g ld.shared.f32 %f_dq_tmp, [%rd_dq_smem];
-    shl.b64 %rd_dq_hbm, %rd_dq_idx, 1;
+    shl.b64 %rd_dq_hbm, %rd_dq_idx, 2;
     add.u64 %rd_dq_hbm, %rd_dq_base, %rd_dq_hbm;
-    @%p_dq_g cvt.rn.f16.f32 %h0, %f_dq_tmp;
-    @%p_dq_g st.global.b16 [%rd_dq_hbm], %h0;
+    @%p_dq_g st.global.f32 [%rd_dq_hbm], %f_dq_tmp;
     cvt.u64.u32 %rd_dq_idx, %tid_x;
     add.u64 %rd_dq_idx, %rd_dq_idx, 128;
     setp.lt.u64 %p_dq_g, %rd_dq_idx, 1024;
@@ -19184,10 +19127,9 @@ V2_BWD_DRMSNORM_PHASE2_DONE:
     add.u64 %rd_dq_smem, %rd_dq_smem, 22784;
     add.u64 %rd_dq_smem, %shmem_base, %rd_dq_smem;
     @%p_dq_g ld.shared.f32 %f_dq_tmp, [%rd_dq_smem];
-    shl.b64 %rd_dq_hbm, %rd_dq_idx, 1;
+    shl.b64 %rd_dq_hbm, %rd_dq_idx, 2;
     add.u64 %rd_dq_hbm, %rd_dq_base, %rd_dq_hbm;
-    @%p_dq_g cvt.rn.f16.f32 %h0, %f_dq_tmp;
-    @%p_dq_g st.global.b16 [%rd_dq_hbm], %h0;
+    @%p_dq_g st.global.f32 [%rd_dq_hbm], %f_dq_tmp;
     cvt.u64.u32 %rd_dq_idx, %tid_x;
     add.u64 %rd_dq_idx, %rd_dq_idx, 256;
     setp.lt.u64 %p_dq_g, %rd_dq_idx, 1024;
@@ -19199,10 +19141,9 @@ V2_BWD_DRMSNORM_PHASE2_DONE:
     add.u64 %rd_dq_smem, %rd_dq_smem, 22784;
     add.u64 %rd_dq_smem, %shmem_base, %rd_dq_smem;
     @%p_dq_g ld.shared.f32 %f_dq_tmp, [%rd_dq_smem];
-    shl.b64 %rd_dq_hbm, %rd_dq_idx, 1;
+    shl.b64 %rd_dq_hbm, %rd_dq_idx, 2;
     add.u64 %rd_dq_hbm, %rd_dq_base, %rd_dq_hbm;
-    @%p_dq_g cvt.rn.f16.f32 %h0, %f_dq_tmp;
-    @%p_dq_g st.global.b16 [%rd_dq_hbm], %h0;
+    @%p_dq_g st.global.f32 [%rd_dq_hbm], %f_dq_tmp;
     cvt.u64.u32 %rd_dq_idx, %tid_x;
     add.u64 %rd_dq_idx, %rd_dq_idx, 384;
     setp.lt.u64 %p_dq_g, %rd_dq_idx, 1024;
@@ -19214,10 +19155,9 @@ V2_BWD_DRMSNORM_PHASE2_DONE:
     add.u64 %rd_dq_smem, %rd_dq_smem, 22784;
     add.u64 %rd_dq_smem, %shmem_base, %rd_dq_smem;
     @%p_dq_g ld.shared.f32 %f_dq_tmp, [%rd_dq_smem];
-    shl.b64 %rd_dq_hbm, %rd_dq_idx, 1;
+    shl.b64 %rd_dq_hbm, %rd_dq_idx, 2;
     add.u64 %rd_dq_hbm, %rd_dq_base, %rd_dq_hbm;
-    @%p_dq_g cvt.rn.f16.f32 %h0, %f_dq_tmp;
-    @%p_dq_g st.global.b16 [%rd_dq_hbm], %h0;
+    @%p_dq_g st.global.f32 [%rd_dq_hbm], %f_dq_tmp;
     cvt.u64.u32 %rd_dq_idx, %tid_x;
     add.u64 %rd_dq_idx, %rd_dq_idx, 512;
     setp.lt.u64 %p_dq_g, %rd_dq_idx, 1024;
@@ -19229,10 +19169,9 @@ V2_BWD_DRMSNORM_PHASE2_DONE:
     add.u64 %rd_dq_smem, %rd_dq_smem, 22784;
     add.u64 %rd_dq_smem, %shmem_base, %rd_dq_smem;
     @%p_dq_g ld.shared.f32 %f_dq_tmp, [%rd_dq_smem];
-    shl.b64 %rd_dq_hbm, %rd_dq_idx, 1;
+    shl.b64 %rd_dq_hbm, %rd_dq_idx, 2;
     add.u64 %rd_dq_hbm, %rd_dq_base, %rd_dq_hbm;
-    @%p_dq_g cvt.rn.f16.f32 %h0, %f_dq_tmp;
-    @%p_dq_g st.global.b16 [%rd_dq_hbm], %h0;
+    @%p_dq_g st.global.f32 [%rd_dq_hbm], %f_dq_tmp;
     cvt.u64.u32 %rd_dq_idx, %tid_x;
     add.u64 %rd_dq_idx, %rd_dq_idx, 640;
     setp.lt.u64 %p_dq_g, %rd_dq_idx, 1024;
@@ -19244,10 +19183,9 @@ V2_BWD_DRMSNORM_PHASE2_DONE:
     add.u64 %rd_dq_smem, %rd_dq_smem, 22784;
     add.u64 %rd_dq_smem, %shmem_base, %rd_dq_smem;
     @%p_dq_g ld.shared.f32 %f_dq_tmp, [%rd_dq_smem];
-    shl.b64 %rd_dq_hbm, %rd_dq_idx, 1;
+    shl.b64 %rd_dq_hbm, %rd_dq_idx, 2;
     add.u64 %rd_dq_hbm, %rd_dq_base, %rd_dq_hbm;
-    @%p_dq_g cvt.rn.f16.f32 %h0, %f_dq_tmp;
-    @%p_dq_g st.global.b16 [%rd_dq_hbm], %h0;
+    @%p_dq_g st.global.f32 [%rd_dq_hbm], %f_dq_tmp;
     cvt.u64.u32 %rd_dq_idx, %tid_x;
     add.u64 %rd_dq_idx, %rd_dq_idx, 768;
     setp.lt.u64 %p_dq_g, %rd_dq_idx, 1024;
@@ -19259,10 +19197,9 @@ V2_BWD_DRMSNORM_PHASE2_DONE:
     add.u64 %rd_dq_smem, %rd_dq_smem, 22784;
     add.u64 %rd_dq_smem, %shmem_base, %rd_dq_smem;
     @%p_dq_g ld.shared.f32 %f_dq_tmp, [%rd_dq_smem];
-    shl.b64 %rd_dq_hbm, %rd_dq_idx, 1;
+    shl.b64 %rd_dq_hbm, %rd_dq_idx, 2;
     add.u64 %rd_dq_hbm, %rd_dq_base, %rd_dq_hbm;
-    @%p_dq_g cvt.rn.f16.f32 %h0, %f_dq_tmp;
-    @%p_dq_g st.global.b16 [%rd_dq_hbm], %h0;
+    @%p_dq_g st.global.f32 [%rd_dq_hbm], %f_dq_tmp;
     cvt.u64.u32 %rd_dq_idx, %tid_x;
     add.u64 %rd_dq_idx, %rd_dq_idx, 896;
     setp.lt.u64 %p_dq_g, %rd_dq_idx, 1024;
@@ -19274,10 +19211,9 @@ V2_BWD_DRMSNORM_PHASE2_DONE:
     add.u64 %rd_dq_smem, %rd_dq_smem, 22784;
     add.u64 %rd_dq_smem, %shmem_base, %rd_dq_smem;
     @%p_dq_g ld.shared.f32 %f_dq_tmp, [%rd_dq_smem];
-    shl.b64 %rd_dq_hbm, %rd_dq_idx, 1;
+    shl.b64 %rd_dq_hbm, %rd_dq_idx, 2;
     add.u64 %rd_dq_hbm, %rd_dq_base, %rd_dq_hbm;
-    @%p_dq_g cvt.rn.f16.f32 %h0, %f_dq_tmp;
-    @%p_dq_g st.global.b16 [%rd_dq_hbm], %h0;
+    @%p_dq_g st.global.f32 [%rd_dq_hbm], %f_dq_tmp;
 V2_BWD_STORE_DQ_SKIP_0:
     ret;
 }

@@ -402,7 +402,7 @@ fn backward_kernel_name(cfg: &FlashAttentionConfig) -> String {
 // seg_ids_host: length seq_len; empty slice → unpacked path (seg_ids_dev = 0).
 // segment_masked: controls which PTX variant is synthesised.
 //
-// Returns (dq_f32, dk_f32, dv_f32) read back from device (f16→f32), or None
+// Returns (dq_f32, dk_f32, dv_f32) read back from device (f32), or None
 // on any kernel launch failure (graceful skip).
 // ---------------------------------------------------------------------------
 
@@ -453,13 +453,18 @@ fn launch_pca_backward(
     let wq_dev  = unsafe { nsl_test_cuda_alloc(w_bytes) };
     let wk_dev  = unsafe { nsl_test_cuda_alloc(w_bytes) };
     let wv_dev  = unsafe { nsl_test_cuda_alloc(w_bytes) };
-    let do_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
-    let dq_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
-    let dk_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
-    let dv_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
-    let dwq_dev = unsafe { nsl_test_cuda_alloc(dw_bytes) };
-    let dwk_dev = unsafe { nsl_test_cuda_alloc(dw_bytes) };
-    let dwv_dev = unsafe { nsl_test_cuda_alloc(dw_bytes) };
+    // dO and every gradient are f32 on the device (the backward reads dO
+    // with `ld.global.f32` and stores gradients with `st.global.f32`):
+    // twice the bytes of the matching f16 operand buffers. The host dO is
+    // kept as f16 bits by the callers, so widen it for the upload.
+    let do_host_f32: Vec<f32> = do_host_f16.iter().map(|&b| f16_to_f32(b)).collect();
+    let do_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes * 2) };
+    let dq_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes * 2) };
+    let dk_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes * 2) };
+    let dv_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes * 2) };
+    let dwq_dev = unsafe { nsl_test_cuda_alloc(dw_bytes * 2) };
+    let dwk_dev = unsafe { nsl_test_cuda_alloc(dw_bytes * 2) };
+    let dwv_dev = unsafe { nsl_test_cuda_alloc(dw_bytes * 2) };
     let dx_dev  = unsafe { nsl_test_cuda_alloc(dx_bytes) };
     let dxn_dev = unsafe { nsl_test_cuda_alloc(dxn_bytes) };
 
@@ -537,7 +542,7 @@ fn launch_pca_backward(
         nsl_test_cuda_h2d(wq_dev,  wq_f16.as_ptr()    as i64, w_bytes);
         nsl_test_cuda_h2d(wk_dev,  wk_f16.as_ptr()    as i64, w_bytes);
         nsl_test_cuda_h2d(wv_dev,  wv_f16.as_ptr()    as i64, w_bytes);
-        nsl_test_cuda_h2d(do_dev,  do_host_f16.as_ptr() as i64, qkv_f16_bytes);
+        nsl_test_cuda_h2d(do_dev,  do_host_f32.as_ptr() as i64, qkv_f16_bytes * 2);
         nsl_test_cuda_h2d(saves.q_proj, q_host_f16.as_ptr() as i64, qkv_f16_bytes);
         nsl_test_cuda_h2d(saves.k_proj, k_host_f16.as_ptr() as i64, qkv_f16_bytes);
         nsl_test_cuda_h2d(saves.v_proj, v_host_f16.as_ptr() as i64, qkv_f16_bytes);
@@ -728,19 +733,16 @@ fn launch_pca_backward(
         return None;
     }
 
-    // ── Readback dQ, dK, dV (f16 on device → f32 on host) ───────────────────
+    // ── Readback dQ, dK, dV (f32 on device) ─────────────────────────────────
     let qkv_elems = batch * heads * seq_len * head_dim;
-    let mut dq_raw = vec![0u16; qkv_elems];
-    let mut dk_raw = vec![0u16; qkv_elems];
-    let mut dv_raw = vec![0u16; qkv_elems];
+    let mut dq = vec![0f32; qkv_elems];
+    let mut dk = vec![0f32; qkv_elems];
+    let mut dv = vec![0f32; qkv_elems];
     unsafe {
-        nsl_test_cuda_d2h(dq_raw.as_mut_ptr() as i64, dq_dev, (qkv_elems * 2) as i64);
-        nsl_test_cuda_d2h(dk_raw.as_mut_ptr() as i64, dk_dev, (qkv_elems * 2) as i64);
-        nsl_test_cuda_d2h(dv_raw.as_mut_ptr() as i64, dv_dev, (qkv_elems * 2) as i64);
+        nsl_test_cuda_d2h(dq.as_mut_ptr() as i64, dq_dev, (qkv_elems * 4) as i64);
+        nsl_test_cuda_d2h(dk.as_mut_ptr() as i64, dk_dev, (qkv_elems * 4) as i64);
+        nsl_test_cuda_d2h(dv.as_mut_ptr() as i64, dv_dev, (qkv_elems * 4) as i64);
     }
-    let dq: Vec<f32> = dq_raw.iter().map(|&b| f16_to_f32(b)).collect();
-    let dk: Vec<f32> = dk_raw.iter().map(|&b| f16_to_f32(b)).collect();
-    let dv: Vec<f32> = dv_raw.iter().map(|&b| f16_to_f32(b)).collect();
 
 
     for (name, arr) in [("dq", &dq), ("dk", &dk), ("dv", &dv)] {
@@ -1520,13 +1522,18 @@ fn launch_pca_backward_ex(
     let wq_dev  = unsafe { nsl_test_cuda_alloc(w_bytes) };
     let wk_dev  = unsafe { nsl_test_cuda_alloc(w_bytes) };
     let wv_dev  = unsafe { nsl_test_cuda_alloc(w_bytes) };
-    let do_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
-    let dq_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
-    let dk_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
-    let dv_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
-    let dwq_dev = unsafe { nsl_test_cuda_alloc(dw_bytes) };
-    let dwk_dev = unsafe { nsl_test_cuda_alloc(dw_bytes) };
-    let dwv_dev = unsafe { nsl_test_cuda_alloc(dw_bytes) };
+    // dO and every gradient are f32 on the device (the backward reads dO
+    // with `ld.global.f32` and stores gradients with `st.global.f32`):
+    // twice the bytes of the matching f16 operand buffers. The host dO is
+    // kept as f16 bits by the callers, so widen it for the upload.
+    let do_host_f32: Vec<f32> = do_host_f16.iter().map(|&b| f16_to_f32(b)).collect();
+    let do_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes * 2) };
+    let dq_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes * 2) };
+    let dk_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes * 2) };
+    let dv_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes * 2) };
+    let dwq_dev = unsafe { nsl_test_cuda_alloc(dw_bytes * 2) };
+    let dwk_dev = unsafe { nsl_test_cuda_alloc(dw_bytes * 2) };
+    let dwv_dev = unsafe { nsl_test_cuda_alloc(dw_bytes * 2) };
     let dx_dev  = unsafe { nsl_test_cuda_alloc(dx_bytes) };
     let dxn_dev = unsafe { nsl_test_cuda_alloc(dxn_bytes) };
 
@@ -1585,7 +1592,7 @@ fn launch_pca_backward_ex(
         nsl_test_cuda_h2d(wq_dev,  wq_f16.as_ptr()    as i64, w_bytes);
         nsl_test_cuda_h2d(wk_dev,  wk_f16.as_ptr()    as i64, w_bytes);
         nsl_test_cuda_h2d(wv_dev,  wv_f16.as_ptr()    as i64, w_bytes);
-        nsl_test_cuda_h2d(do_dev,  do_host_f16.as_ptr() as i64, qkv_f16_bytes);
+        nsl_test_cuda_h2d(do_dev,  do_host_f32.as_ptr() as i64, qkv_f16_bytes * 2);
         nsl_test_cuda_h2d(saves.q_proj, q_host_f16.as_ptr() as i64, qkv_f16_bytes);
         nsl_test_cuda_h2d(saves.k_proj, k_host_f16.as_ptr() as i64, qkv_f16_bytes);
         nsl_test_cuda_h2d(saves.v_proj, v_host_f16.as_ptr() as i64, qkv_f16_bytes);
@@ -1752,15 +1759,12 @@ fn launch_pca_backward_ex(
 
     // ── Readback dQ, dK, dV ──────────────────────────────────────────────────
     let qkv_elems = batch * heads * seq_len * head_dim;
-    let mut dq_raw = vec![0u16; qkv_elems];
-    let mut dk_raw = vec![0u16; qkv_elems];
-    let mut dv_raw = vec![0u16; qkv_elems];
-    nsl_test_cuda_d2h(dq_raw.as_mut_ptr() as i64, dq_dev, (qkv_elems * 2) as i64);
-    nsl_test_cuda_d2h(dk_raw.as_mut_ptr() as i64, dk_dev, (qkv_elems * 2) as i64);
-    nsl_test_cuda_d2h(dv_raw.as_mut_ptr() as i64, dv_dev, (qkv_elems * 2) as i64);
-    let dq: Vec<f32> = dq_raw.iter().map(|&b| f16_to_f32(b)).collect();
-    let dk: Vec<f32> = dk_raw.iter().map(|&b| f16_to_f32(b)).collect();
-    let dv: Vec<f32> = dv_raw.iter().map(|&b| f16_to_f32(b)).collect();
+    let mut dq = vec![0f32; qkv_elems];
+    let mut dk = vec![0f32; qkv_elems];
+    let mut dv = vec![0f32; qkv_elems];
+    nsl_test_cuda_d2h(dq.as_mut_ptr() as i64, dq_dev, (qkv_elems * 4) as i64);
+    nsl_test_cuda_d2h(dk.as_mut_ptr() as i64, dk_dev, (qkv_elems * 4) as i64);
+    nsl_test_cuda_d2h(dv.as_mut_ptr() as i64, dv_dev, (qkv_elems * 4) as i64);
 
     unsafe { nsl_csha_free_backward_activations(saves); }
     free_all(&all_dev);
@@ -2046,13 +2050,18 @@ fn launch_pca_backward_batched(
     let wq_dev  = unsafe { nsl_test_cuda_alloc(w_bytes) };
     let wk_dev  = unsafe { nsl_test_cuda_alloc(w_bytes) };
     let wv_dev  = unsafe { nsl_test_cuda_alloc(w_bytes) };
-    let do_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
-    let dq_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
-    let dk_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
-    let dv_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
-    let dwq_dev = unsafe { nsl_test_cuda_alloc(dw_bytes) };
-    let dwk_dev = unsafe { nsl_test_cuda_alloc(dw_bytes) };
-    let dwv_dev = unsafe { nsl_test_cuda_alloc(dw_bytes) };
+    // dO and every gradient are f32 on the device (the backward reads dO
+    // with `ld.global.f32` and stores gradients with `st.global.f32`):
+    // twice the bytes of the matching f16 operand buffers. The host dO is
+    // kept as f16 bits by the callers, so widen it for the upload.
+    let do_host_f32: Vec<f32> = do_host_f16.iter().map(|&b| f16_to_f32(b)).collect();
+    let do_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes * 2) };
+    let dq_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes * 2) };
+    let dk_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes * 2) };
+    let dv_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes * 2) };
+    let dwq_dev = unsafe { nsl_test_cuda_alloc(dw_bytes * 2) };
+    let dwk_dev = unsafe { nsl_test_cuda_alloc(dw_bytes * 2) };
+    let dwv_dev = unsafe { nsl_test_cuda_alloc(dw_bytes * 2) };
     let dx_dev  = unsafe { nsl_test_cuda_alloc(dx_bytes) };
     let dxn_dev = unsafe { nsl_test_cuda_alloc(dxn_bytes) };
 
@@ -2109,7 +2118,7 @@ fn launch_pca_backward_batched(
         nsl_test_cuda_h2d(wq_dev,  wq_f16.as_ptr()    as i64, w_bytes);
         nsl_test_cuda_h2d(wk_dev,  wk_f16.as_ptr()    as i64, w_bytes);
         nsl_test_cuda_h2d(wv_dev,  wv_f16.as_ptr()    as i64, w_bytes);
-        nsl_test_cuda_h2d(do_dev,  do_host_f16.as_ptr() as i64, qkv_f16_bytes);
+        nsl_test_cuda_h2d(do_dev,  do_host_f32.as_ptr() as i64, qkv_f16_bytes * 2);
         nsl_test_cuda_h2d(saves.q_proj,  q_host_f16.as_ptr() as i64, qkv_f16_bytes);
         nsl_test_cuda_h2d(saves.k_proj,  k_host_f16.as_ptr() as i64, qkv_f16_bytes);
         nsl_test_cuda_h2d(saves.v_proj,  v_host_f16.as_ptr() as i64, qkv_f16_bytes);
@@ -2216,19 +2225,16 @@ fn launch_pca_backward_batched(
         return None;
     }
 
-    // ── Readback dQ, dK, dV (f16 on device → f32 on host) ───────────────────
+    // ── Readback dQ, dK, dV (f32 on device) ─────────────────────────────────
     let qkv_elems = batch * heads * seq_len * head_dim;
-    let mut dq_raw = vec![0u16; qkv_elems];
-    let mut dk_raw = vec![0u16; qkv_elems];
-    let mut dv_raw = vec![0u16; qkv_elems];
+    let mut dq = vec![0f32; qkv_elems];
+    let mut dk = vec![0f32; qkv_elems];
+    let mut dv = vec![0f32; qkv_elems];
     unsafe {
-        nsl_test_cuda_d2h(dq_raw.as_mut_ptr() as i64, dq_dev, (qkv_elems * 2) as i64);
-        nsl_test_cuda_d2h(dk_raw.as_mut_ptr() as i64, dk_dev, (qkv_elems * 2) as i64);
-        nsl_test_cuda_d2h(dv_raw.as_mut_ptr() as i64, dv_dev, (qkv_elems * 2) as i64);
+        nsl_test_cuda_d2h(dq.as_mut_ptr() as i64, dq_dev, (qkv_elems * 4) as i64);
+        nsl_test_cuda_d2h(dk.as_mut_ptr() as i64, dk_dev, (qkv_elems * 4) as i64);
+        nsl_test_cuda_d2h(dv.as_mut_ptr() as i64, dv_dev, (qkv_elems * 4) as i64);
     }
-    let dq: Vec<f32> = dq_raw.iter().map(|&b| f16_to_f32(b)).collect();
-    let dk: Vec<f32> = dk_raw.iter().map(|&b| f16_to_f32(b)).collect();
-    let dv: Vec<f32> = dv_raw.iter().map(|&b| f16_to_f32(b)).collect();
 
     unsafe { nsl_csha_free_backward_activations(saves); }
     free_all(&all_dev);

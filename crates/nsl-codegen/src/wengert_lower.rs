@@ -1062,14 +1062,17 @@ fn emit_fused_forward_under_claim(
         }
         bytes
     };
-    // active_heads from the bridge (same source as
-    // `compile_flash_attention_call`'s non-source-AD branch).
-    let active_heads_i64 = compiler
-        .bus
-        .csha_bridge()
-        .and_then(|b| b.extras_for_layer(layer))
-        .map(|e| e.active_heads as i64)
-        .unwrap_or(0);
+    // active_heads from the training config: the kernels this launch and
+    // its backward run were synthesized from it, and the backward lowering
+    // (`PrimalOp::FusedCshaBackward`) passes the same value. Today that is
+    // always 0, "every head" (`maybe_synthesize_csha_training_ptx`).
+    //
+    // It used to come from the planner's per-layer extras, which are made on
+    // a nominal 8-head layer whatever the model is. The kernel compares its
+    // head index with this run-time value, so a model with more than 8 heads
+    // had heads 8 and up left at zero by the forward while the backward
+    // (passing 0) differentiated all of them.
+    let active_heads_i64 = csha_training_active_heads(&training_cfg);
 
     // --- 2. SDPA inputs: [q, k, v, scale, ...].  The scale slot is an
     //        f64 literal (NSL float literals lower to F64); the FFI
@@ -1461,6 +1464,57 @@ fn emit_fused_forward_under_claim(
     );
 
     Ok(out_val)
+}
+
+/// Whether the CSHA fused forward-with-saves and fused backward are withheld
+/// from train and grad blocks.
+///
+/// They are, because the gradients they produce do not match a reference,
+/// on the one configuration a training build emits (level 1, no fusion
+/// flag). Measured on a GPU:
+///
+/// * two tiles, at the FFI level against the f64 reference: the forward
+///   output is right and dQ, dK and dV are 130%, 45% and 43% off, at batch 1
+///   with one head as at batch 2 with four;
+/// * more than one head, from NSL source: the train step stops on a tensor
+///   shape mismatch;
+/// * one head and one tile, from NSL source: not shown right. The only run
+///   had the squared norms of the Wk and Wv updates 12% high, in a program
+///   whose direct method call wrote past the end of the attention output (a
+///   sequence of 32 under a 64-row tile, since refused by the launchers), so
+///   that figure may not be the pair's.
+///
+/// A loss that looks right over gradients that are wrong is how a
+/// pretraining run fails without saying so, so the lowering refuses instead
+/// of emitting the pair.
+///
+/// The kernels themselves are still built and are gated at the FFI level
+/// (`crates/nsl-codegen/tests/csha_cuda_*.rs`). Set this to `false` only
+/// together with a gate that runs a train step through them from NSL
+/// source and compares every weight's gradient with a reference, at one
+/// tile and at several, with one head and with several.
+const CSHA_FUSED_TRAINING_WITHHELD: bool = true;
+
+/// The compile error for a train or grad step whose attention was claimed
+/// for the CSHA fused pair. See [`CSHA_FUSED_TRAINING_WITHHELD`].
+fn csha_fused_training_withheld(layer: &str) -> CodegenError {
+    CodegenError::new(format!(
+        "`@flash_attention` with `--csha`: the attention of layer '{layer}' was claimed for \
+         the CSHA fused forward and backward, and the fused backward is withheld from train \
+         and grad blocks because its gradients do not match the reference (it is wrong \
+         beyond one tile, fails beyond one head, and has not been shown right at one). \
+         Compile without `--csha`, \
+         or with `--csha off` if a flag bundle turns it on: the train step then \
+         differentiates the unfused attention, which does match. Inference through an \
+         `@flash_attention` method is not affected."
+    ))
+}
+
+/// The active-head count a CSHA training launch passes to its kernel, forward
+/// and backward alike: the one in the configuration the kernels were
+/// synthesized from (0 means every head).
+fn csha_training_active_heads(cfg: &crate::flash_attention::FlashAttentionConfig) -> i64 {
+    cfg.csha.as_ref().map_or(0, |c| i64::from(c.active_heads))
 }
 
 /// A norm's eps as an f64 Value: the constant, or the run-time scalar the
@@ -2494,6 +2548,9 @@ fn lower_single_op(
                     .map(|e| e.save_activations_for_backward)
                     .unwrap_or(false);
                 if needs_saves {
+                    if CSHA_FUSED_TRAINING_WITHHELD {
+                        return Err(csha_fused_training_withheld(&layer));
+                    }
                     let result = emit_fused_forward_under_claim(
                         compiler, builder, op, &inputs, var_map, &layer,
                     )?;
@@ -3153,7 +3210,7 @@ fn lower_single_op(
             // `seq_len == block_q` check happens below using the Cranelift
             // `seq_len` Value already extracted via `nsl_tensor_shape_dim`.
             let (block_q, block_kv, head_dim, is_causal, d_model, shmem_bytes,
-                 tier_b2_compile_time_eligible) =
+                 tier_b2_compile_time_eligible, active_heads) =
                 match training_cfg {
                     Some(cfg) => {
                         // Backward kernel sizes shmem differently than forward:
@@ -3171,7 +3228,8 @@ fn lower_single_op(
                         let dm = cfg.csha.as_ref().map(|c| c.d_model as i64).unwrap_or(0);
                         let b2_ct =
                             crate::flash_attention_v2::tier_b2::dispatch::tier_b2_hybrid_backward_compile_time_eligible(&cfg);
-                        (cfg.block_q, cfg.block_kv, cfg.head_dim, cfg.causal, dm, bytes, b2_ct)
+                        let ah = csha_training_active_heads(&cfg);
+                        (cfg.block_q, cfg.block_kv, cfg.head_dim, cfg.causal, dm, bytes, b2_ct, ah)
                     }
                     None => {
                         // No training config — the backward launch cannot
@@ -3255,21 +3313,15 @@ fn lower_single_op(
             let norm_weight_ptr = if inputs.len() > 9 { inputs[9] } else { null };
             let do_ptr = if inputs.len() > 1 { inputs[1] } else { null };
 
-            // Allocate 7 output gradient tensors DIRECTLY on device with
-            // the right dtypes (Gap I.3 — A+F).
+            // Allocate the 8 output gradient tensors DIRECTLY on device,
+            // all f32.
             //
-            // Tier C backward writes:
-            //   - dq/dk/dv/dwq/dwk/dwv as f16 (st.global.u16 → 2 B/elem)
-            //   - dx as f32 (RMSNorm-input gradient stays f32)
-            //
-            // Pre-A+F we zero-allocated all seven via `nsl_tensor_zeros`
-            // (CPU, f32) then `nsl_tensor_to_device`.  That left the f16
-            // buffers at 2× their intended byte size with every second
-            // byte uninitialised; f32-interpreting reads on the host
-            // produced garbage which the optimiser then stirred into the
-            // next step's weights.  This block replaces that with a
-            // single direct-on-device alloc per tensor at the correct
-            // element size + dtype.
+            // The fused backward stores every gradient as f32 and reads dO
+            // as f32 (`nsl_flash_attention_csha_backward`, "Dtypes"). The
+            // six projection-side outputs used to be f16 tensors that were
+            // widened afterwards; an f16 store is exactly zero below
+            // 2.98e-8, which is most of dQ at the gradient magnitudes of a
+            // real pretraining step, so there is no f16 stage any more.
             //
             // Shapes:
             //   dq/dk/dv:      [batch, heads, seq_len, head_dim]
@@ -3291,33 +3343,32 @@ fn lower_single_op(
                 call(compiler, builder, ffi, &[shape, device])
             };
 
-            // f16 outputs — the 6 kernel-side st.global.u16 sinks.
+            // f32 outputs: `nsl_tensor_zeros_on` allocates f32 on device.
             let dq_dev = alloc_shape_on(
-                compiler, builder, "nsl_tensor_zeros_f16_on",
+                compiler, builder, "nsl_tensor_zeros_on",
                 &[batch, heads, seq_len, hd_val], cuda_device,
             )?;
             let dk_dev = alloc_shape_on(
-                compiler, builder, "nsl_tensor_zeros_f16_on",
+                compiler, builder, "nsl_tensor_zeros_on",
                 &[batch, heads, seq_len, hd_val], cuda_device,
             )?;
             let dv_dev = alloc_shape_on(
-                compiler, builder, "nsl_tensor_zeros_f16_on",
+                compiler, builder, "nsl_tensor_zeros_on",
                 &[batch, heads, seq_len, hd_val], cuda_device,
             )?;
             let dwq_dev = alloc_shape_on(
-                compiler, builder, "nsl_tensor_zeros_f16_on",
+                compiler, builder, "nsl_tensor_zeros_on",
                 &[d_model_val, heads_hd], cuda_device,
             )?;
             let dwk_dev = alloc_shape_on(
-                compiler, builder, "nsl_tensor_zeros_f16_on",
+                compiler, builder, "nsl_tensor_zeros_on",
                 &[d_model_val, heads_hd], cuda_device,
             )?;
             let dwv_dev = alloc_shape_on(
-                compiler, builder, "nsl_tensor_zeros_f16_on",
+                compiler, builder, "nsl_tensor_zeros_on",
                 &[d_model_val, heads_hd], cuda_device,
             )?;
 
-            // dx stays on the f32 allocator — the kernel writes it as f32.
             let dx_dev = alloc_shape_on(
                 compiler, builder, "nsl_tensor_zeros_on",
                 &[batch, seq_len, d_model_val], cuda_device,
@@ -3333,11 +3384,10 @@ fn lower_single_op(
                 &[batch, seq_len, d_model_val], cuda_device,
             )?;
 
-            // Launch the 44-arg backward kernel.
-            // Forward-side `active_heads` — take from the training config
-            // (stored on the FA context via Gap B).  When the ctx is gone,
-            // pass 0 (kernel interprets as "all heads live").
-            let active_heads_val = builder.ins().iconst(cl_types::I64, 0);
+            // The same `active_heads` the forward launch was given
+            // (`emit_fused_forward_under_claim`): both read it from the
+            // training config the kernels were synthesized from.
+            let active_heads_val = builder.ins().iconst(cl_types::I64, active_heads);
 
             // CFTP §4.3 / Tier A activation (spec 2026-05-17): the same
             // packing metadata the forward consumed. Item 17 phase 3a:
@@ -3501,28 +3551,14 @@ fn lower_single_op(
                 ],
             )?;
 
-            // The kernel writes dq..dwv as f16 (`st.global.u16`), but every
-            // downstream consumer — adjoint chains, grad-integrity, the
-            // optimizer's SGD/AdamW update — reads gradient tensors as f32.
-            // Handing the f16 tensors through directly made the optimizer
-            // reinterpret f16 bit pairs as f32: weight updates collapsed to
-            // ~1e-39 denormals (wq/wk "frozen") with exit 0.  Widen on-device
-            // here; `nsl_tensor_to_f32` publishes the copies into the step's
-            // scope sweep and the f16 originals are already published by
-            // `nsl_tensor_zeros_f16_on`, so lifecycles are unchanged.
-            // dx/dxn are f32-written by the kernel — no widen.
-            let dq_f32 = call(compiler, builder, "nsl_tensor_to_f32", &[dq_dev])?;
-            let dk_f32 = call(compiler, builder, "nsl_tensor_to_f32", &[dk_dev])?;
-            let dv_f32 = call(compiler, builder, "nsl_tensor_to_f32", &[dv_dev])?;
-            let dwq_f32 = call(compiler, builder, "nsl_tensor_to_f32", &[dwq_dev])?;
-            let dwk_f32 = call(compiler, builder, "nsl_tensor_to_f32", &[dwk_dev])?;
-            let dwv_f32 = call(compiler, builder, "nsl_tensor_to_f32", &[dwv_dev])?;
-
-            // Populate Gap C cache so extract ops can read outputs.
+            // Populate Gap C cache so extract ops can read outputs. All
+            // eight are the f32 tensors the kernel wrote: every downstream
+            // consumer — adjoint chains, grad-integrity, the optimizer's
+            // update — reads gradient tensors as f32.
             // Slot 7 (dxn_dev) added by the Gap I.5 Option-A fix.
             compiler
                 .csha_fused_bwd_cache
-                .insert(key_val, [dq_f32, dk_f32, dv_f32, dwq_f32, dwk_f32, dwv_f32, dx_dev, dxn_dev]);
+                .insert(key_val, [dq_dev, dk_dev, dv_dev, dwq_dev, dwk_dev, dwv_dev, dx_dev, dxn_dev]);
 
             // Gap A cleanup: now that the backward has consumed the save
             // pointers, free them.  (Moved here from the forward site in

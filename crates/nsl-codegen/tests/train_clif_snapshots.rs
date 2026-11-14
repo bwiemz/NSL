@@ -451,7 +451,9 @@ fn main():
 // Engaged: every optimizer, both lowerings, the dataloader, CCR checkpointing,
 // CSLA layerwise accumulation, the transient arena, wgrad fusion, CUDA graphs,
 // optimizer-state offload, Muon's resident momentum -- and, since TrainPlan
-// step 5 needed them, CSHA (`attention_csha`) and WRGA (`wrga_lora_*`).
+// step 5 needed it, WRGA (`wrga_lora_*`). CSHA is not: a train step on a
+// CSHA-claimed attention is a compile error (the fused backward is withheld,
+// see `csha_training_withheld.rs`), so there is no CLIF to pin.
 //
 // NOT engaged, so a change confined to these passes is UNPINNED here:
 //  * CPKD (`@fused_kl_ce` on a `distill` block). This harness calls
@@ -467,7 +469,6 @@ snapshots! {
     // Both lowerings of each program.
     sgd_tape: "sgd", tape();
     attention_source_ad: "attention", source_ad();
-    attention_csha: "attention", CompileOptions { csha: nsl_codegen::CshaOptions { mode: Some("auto".to_string()), ..Default::default() }, ..source_ad() };
     wrga_base_source_ad: "wrga_base", source_ad();
     wrga_lora_source_ad: "wrga_lora", with_lora_adapter(source_ad());
     wrga_lora_frozen_source_ad: "wrga_lora_frozen", with_lora_adapter_frozen(source_ad());
@@ -531,4 +532,48 @@ snapshots! {
         muon: nsl_codegen::MuonOptions { state_bf16: true, ..Default::default() },
         ..source_ad()
     };
+}
+
+/// The forward attention launchers return non-zero when they refuse a launch
+/// (a kernel that cannot serve the shape, a module that fails to load), and
+/// the output tensor they were to fill is allocated zeroed. The call sites in
+/// a method body bound the return code to `_err` and dropped it, so a refused
+/// launch handed zeros to the rest of the program as the attention output.
+/// Every direct call of a forward launcher must have its result compared
+/// with zero and a trap behind the comparison.
+#[test]
+fn a_refused_attention_launch_traps() {
+    const LAUNCHERS: [&str; 3] =
+        ["nsl_flash_attention", "nsl_flash_attention_csha", "nsl_flash_attention_csha_with_saves"];
+    for (name, options) in [("attention_source_ad", source_ad())] {
+        let text = render(&compile_capturing_ir(name, &fixture("attention.nsl"), &options));
+        let mut launches = 0;
+        for function in text.split("--- IR: ").skip(1) {
+            let label = function.lines().next().unwrap_or("");
+            for line in function.lines() {
+                // `fnN = <symbol> sigM` declares a callee in this function.
+                let Some((func_ref, rest)) = line.trim().split_once(" = ") else { continue };
+                let Some(symbol) = rest.split_whitespace().next() else { continue };
+                if !func_ref.starts_with("fn") || !LAUNCHERS.contains(&symbol) {
+                    continue;
+                }
+                for call in function.lines().filter(|l| l.contains(&format!("call {func_ref}("))) {
+                    launches += 1;
+                    let result = call.trim().split(" = ").next().unwrap_or("");
+                    assert!(
+                        result.starts_with('v') && !result.contains(' '),
+                        "{name}, {label}: the return code of {symbol} is dropped: `{}`",
+                        call.trim()
+                    );
+                    let after = &function[function.find(call).unwrap() + call.len()..];
+                    let compared = after.lines().find(|l| l.contains(&format!("icmp ne {result},")));
+                    assert!(
+                        compared.is_some() && after.contains("trap user3"),
+                        "{name}, {label}: the return code {result} of {symbol} is never checked"
+                    );
+                }
+            }
+        }
+        assert!(launches > 0, "{name}: the program launched no forward attention kernel");
+    }
 }

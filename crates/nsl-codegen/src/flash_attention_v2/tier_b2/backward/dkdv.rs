@@ -151,6 +151,8 @@ fn emit_register_decls(ptx: &mut String, config: &FlashAttentionConfig) {
     // NOTE: user register named %r_tid (not %tid) to avoid shadowing the PTX special register
     // %tid (a vector); ptxas rejects %tid.x when %tid is declared as a user u32.
     ptx.push_str("    .reg .u32 %r_tid, %lane_id, %warp_id;\n");
+    // Scratch predicate of `emit_ds_clamp`.
+    ptx.push_str("    .reg .pred %p_ds_clamp;\n");
     // Sprint 3 cycle-2 (paper sec 3.2): axis-specific warp-band bases. The
     // pre-cycle-2 single %band_row_base was dual-purposed as both a q-row
     // and a kv-row base, which silently corrupted dK/dV on bq != bkv tiles.
@@ -1425,6 +1427,26 @@ fn emit_pcol_scatter(ptx: &mut String, config: &FlashAttentionConfig) {
     // NOTE: no bar.sync here -- Task 8's barrier before the dV/dK MMAs orders these scatters.
 }
 
+/// Saturate the four dS values a lane holds at f16's largest finite
+/// magnitude before they are narrowed for the tensor-core matmul.
+///
+/// The launcher prescales dO so that its largest element is in [64, 128)
+/// (`CSHA_BWD_GRAD_SCALE_EXP` in nsl-runtime's `flash_attention.rs`), and
+/// dS = P * (dP - D) is bounded by `|dO_row| * |V_row|` in those units. A
+/// value row hundreds of times its usual norm, aligned with a gradient row
+/// that is all maximum, could push it past 65504; `cvt.rn.f16.f32` would
+/// turn that into infinity and the whole step's gradient into NaN, where
+/// saturating costs one element its tail. Ordered compares, so a NaN dS
+/// stays NaN and is still visible downstream.
+fn emit_ds_clamp(ptx: &mut String) {
+    for i in 0..4 {
+        ptx.push_str(&format!("    setp.gt.f32 %p_ds_clamp, %ds_{i}, 0f477FE000;  // > 65504 (f16 max)\n"));
+        ptx.push_str(&format!("    @%p_ds_clamp mov.f32 %ds_{i}, 0f477FE000;\n"));
+        ptx.push_str(&format!("    setp.lt.f32 %p_ds_clamp, %ds_{i}, 0fC77FE000;  // < -65504\n"));
+        ptx.push_str(&format!("    @%p_ds_clamp mov.f32 %ds_{i}, 0fC77FE000;\n"));
+    }
+}
+
 /// Task 7 (b): Scatter dS C-fragment values to col-major `[kv, bq]` f16 SMEM band.
 ///
 /// Structurally identical to `emit_pcol_scatter`; targets the dS col-major band
@@ -1484,6 +1506,7 @@ fn emit_dscol_scatter(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    add.u32 %bs_addr3, %bs_addr3, %bs_q_hi_b;\n");
 
     // Convert f32 dS values to f16 and scatter to col-major SMEM.
+    emit_ds_clamp(ptx);
     ptx.push_str("    cvt.rn.f16.f32 %bs_h0, %ds_0;\n");
     ptx.push_str("    st.shared.b16 [%bs_addr0], %bs_h0;\n");
     ptx.push_str("    cvt.rn.f16.f32 %bs_h1, %ds_1;\n");

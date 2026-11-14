@@ -60,15 +60,19 @@ pub fn emit_d_correction(ptx: &mut String, config: &FlashAttentionConfig, q_tile
     ptx.push_str("    setp.ge.u64 %p0, %rd39, %rd6;\n");
     ptx.push_str(&format!("    @%p0 bra V2_BWD_D_ZERO_{q_tile_iter};\n"));
 
-    // Base HBM row offset (shared by dO and O, both [B, H, S, D] f16):
-    //   (batch_idx*rd5 + head_idx) * seq_len + q_global, * head_dim, * 2 bytes
+    // Element offset of the row, shared by dO and O (both [B, H, S, D]):
+    //   ((batch_idx*rd5 + head_idx) * seq_len + q_global) * head_dim
+    // dO is a gradient and is read as f32 (4 bytes per element): its
+    // magnitude follows the loss, 1e-6..1e-8 in training, where an f16 read
+    // keeps a few mantissa bits or none. O is an activation and is f16.
     ptx.push_str("    mul.lo.u64 %rd30, %batch_idx, %rd5;\n");
     ptx.push_str("    add.u64 %rd30, %rd30, %head_idx;\n");
     ptx.push_str("    mul.lo.u64 %rd30, %rd30, %rd6;\n");
     ptx.push_str("    add.u64 %rd30, %rd30, %rd39;\n");
     ptx.push_str("    mul.lo.u64 %rd30, %rd30, %rd7;\n");
-    ptx.push_str("    shl.b64 %rd30, %rd30, 1;  // * 2 bytes (f16)\n");
-    ptx.push_str("    add.u64 %rd31, %rd_bwd_do, %rd30;  // &dO[row, 0]\n");
+    ptx.push_str("    shl.b64 %rd31, %rd30, 2;  // * 4 bytes (f32 dO)\n");
+    ptx.push_str("    add.u64 %rd31, %rd_bwd_do, %rd31;  // &dO[row, 0]\n");
+    ptx.push_str("    shl.b64 %rd30, %rd30, 1;  // * 2 bytes (f16 O)\n");
     ptx.push_str("    add.u64 %rd32, %rd3, %rd30;         // &O[row, 0]\n");
 
     // Each lane owns d_per_lane contiguous d values starting at lane*d_per_lane.
@@ -81,12 +85,12 @@ pub fn emit_d_correction(ptx: &mut String, config: &FlashAttentionConfig, q_tile
         if slice > 0 {
             ptx.push_str(&format!("    add.u64 %rd33, %rd33, {slice};\n"));
         }
+        // dO[row, d], f32
+        ptx.push_str("    shl.b64 %rd34, %rd33, 2;  // d * 4 bytes\n");
+        ptx.push_str("    add.u64 %rd34, %rd31, %rd34;\n");
+        ptx.push_str("    ld.global.f32 %f0, [%rd34];\n");
+        // O[row, d], f16
         ptx.push_str("    shl.b64 %rd33, %rd33, 1;  // d * 2 bytes\n");
-        // dO[row, d]
-        ptx.push_str("    add.u64 %rd34, %rd31, %rd33;\n");
-        ptx.push_str("    ld.global.b16 %h0, [%rd34];\n");
-        ptx.push_str("    cvt.f32.f16 %f0, %h0;\n");
-        // O[row, d]
         ptx.push_str("    add.u64 %rd34, %rd32, %rd33;\n");
         ptx.push_str("    ld.global.b16 %h0, [%rd34];\n");
         ptx.push_str("    cvt.f32.f16 %f1, %h0;\n");
@@ -271,14 +275,15 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     ptx.push_str("    mov.f32 %f_dP, 0f00000000;\n");
     // dO[warp_row, d] base in HBM:
     //   row_idx_bytes (computed into %rd46) =
-    //     ((batch_idx*heads + head_idx)*seq + q_start + warp_row) * head_dim * 2
+    //     ((batch_idx*heads + head_idx)*seq + q_start + warp_row) * head_dim * 4
+    // (dO is f32; see `emit_d_correction`.)
     ptx.push_str("    mul.lo.u64 %rd46, %batch_idx, %rd5;\n");
     ptx.push_str("    add.u64 %rd46, %rd46, %head_idx;\n");
     ptx.push_str("    mul.lo.u64 %rd46, %rd46, %rd6;\n");
     ptx.push_str("    add.u64 %rd46, %rd46, %q_start;\n");
     ptx.push_str("    add.u64 %rd46, %rd46, %warp_row;\n");
     ptx.push_str("    mul.lo.u64 %rd46, %rd46, %rd7;\n");
-    ptx.push_str("    shl.b64 %rd46, %rd46, 1;  // * 2 (f16)\n");
+    ptx.push_str("    shl.b64 %rd46, %rd46, 2;  // * 4 (f32)\n");
     ptx.push_str("    add.u64 %rd46, %rd_bwd_do, %rd46;  // &dO[warp_row, 0]\n");
     // V[lane, d] base in SMEM: %v_smem_base + lane * row_stride_bytes
     ptx.push_str("    cvt.u64.u32 %rd47, %lane;\n");
@@ -290,12 +295,12 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     ptx.push_str("    mov.u32 %r0, 0;\n");
     ptx.push_str(&format!("V2_BWD_DP_INNER_{q_tile_iter}:\n"));
     ptx.push_str("    cvt.u64.u32 %rd42, %r0;\n");
+    // dO[warp_row, d], f32 in HBM
+    ptx.push_str("    shl.b64 %rd43, %rd42, 2;\n");
+    ptx.push_str("    add.u64 %rd43, %rd46, %rd43;\n");
+    ptx.push_str("    ld.global.f32 %f0, [%rd43];\n");
+    // V[lane, d], f16 in SMEM
     ptx.push_str("    shl.b64 %rd42, %rd42, 1;\n");
-    // dO[warp_row, d]
-    ptx.push_str("    add.u64 %rd43, %rd46, %rd42;\n");
-    ptx.push_str("    ld.global.b16 %h0, [%rd43];\n");
-    ptx.push_str("    cvt.f32.f16 %f0, %h0;\n");
-    // V[lane, d]
     ptx.push_str("    add.u64 %rd43, %rd47, %rd42;\n");
     ptx.push_str("    ld.shared.b16 %h0, [%rd43];\n");
     ptx.push_str("    cvt.f32.f16 %f1, %h0;\n");

@@ -1,11 +1,12 @@
 //! Tier C backward finalize: cooperative global stores of the seven
 //! gradient SMEM tiles to their HBM output pointers.
 //!
-//! Storage widths:
-//!   dq, dk, dv, dwq, dwk, dwv — f16 (matches forward's Q/K/V f16
-//!     tensor layout; symmetric storage width).
-//!   dx                       — f32 (user-visible input gradient;
-//!     preserves RMSNorm backward precision for training).
+//! Storage width: f32 for every gradient. dq is stored directly to
+//! `dq_ptr`; dk and dv are accumulated into the f32 buffers at
+//! `dk_scratch_ptr` / `dv_scratch_ptr` (and dwq/dwk/dwv into theirs by
+//! `emit_dproj`), which the launcher copies to the f32 outputs. Gradients
+//! are never narrowed to f16: at training magnitudes (1e-6..1e-8) f16
+//! keeps a few mantissa bits or none.
 //!
 //! One write per lane per tensor — the orchestrator has already
 //! reduced/scaled the accumulators into their SMEM slots; this phase
@@ -35,7 +36,7 @@ pub fn emit_store_dq_only(ptx: &mut String, config: &FlashAttentionConfig, q_til
     ptx.push_str("    mul.lo.u64 %rd_dq_base, %rd_dq_base, %rd6;\n");
     ptx.push_str("    add.u64 %rd_dq_base, %rd_dq_base, %q_start;\n");
     ptx.push_str("    mul.lo.u64 %rd_dq_base, %rd_dq_base, %rd7;\n");
-    ptx.push_str("    shl.b64 %rd_dq_base, %rd_dq_base, 1;  // * 2 bytes (f16)\n");
+    ptx.push_str("    shl.b64 %rd_dq_base, %rd_dq_base, 2;  // * 4 bytes (f32)\n");
     ptx.push_str("    add.u64 %rd_dq_base, %rd_bwd_dq, %rd_dq_base;\n");
     for k in 0..dq_cells_per_thread {
         let thread_cell = k * 128;
@@ -58,10 +59,12 @@ pub fn emit_store_dq_only(ptx: &mut String, config: &FlashAttentionConfig, q_til
         ));
         ptx.push_str("    add.u64 %rd_dq_smem, %shmem_base, %rd_dq_smem;\n");
         ptx.push_str("    @%p_dq_g ld.shared.f32 %f_dq_tmp, [%rd_dq_smem];\n");
-        ptx.push_str("    shl.b64 %rd_dq_hbm, %rd_dq_idx, 1;\n");
+        // dQ is stored as f32. An f16 store is exactly zero below 2.98e-8
+        // and has a step of 5.96e-8 below 6.1e-5, which is where dQ sits
+        // in training (one to two decades under dO).
+        ptx.push_str("    shl.b64 %rd_dq_hbm, %rd_dq_idx, 2;\n");
         ptx.push_str("    add.u64 %rd_dq_hbm, %rd_dq_base, %rd_dq_hbm;\n");
-        ptx.push_str("    @%p_dq_g cvt.rn.f16.f32 %h0, %f_dq_tmp;\n");
-        ptx.push_str("    @%p_dq_g st.global.b16 [%rd_dq_hbm], %h0;\n");
+        ptx.push_str("    @%p_dq_g st.global.f32 [%rd_dq_hbm], %f_dq_tmp;\n");
     }
     ptx.push_str(&format!("V2_BWD_STORE_DQ_SKIP_{q_tile_iter}:\n"));
 }
@@ -71,13 +74,14 @@ pub fn emit_store_dq_only(ptx: &mut String, config: &FlashAttentionConfig, q_til
 /// Called AFTER emit_drope (which rotates the dK SMEM tile in-place) and
 /// after all KV tiles have been processed (so SMEM holds the fully accumulated
 /// dK, not just the last tile's contribution). Mirrors emit_store_dq_only but
-/// uses block_kv rows and k_start for the HBM address, writing f16 dK directly.
+/// uses block_kv rows and k_start for the HBM address, accumulating into the
+/// f32 buffer at `dk_scratch_ptr`.
 ///
 /// Cycle-16 G16-1 defect-1+3 fix: the prior approach wrote dK to f32 scratch
 /// inside the KV outer loop (emit_store_kv_only), so Phase 3 saw only the
 /// last-tile dK (staleness = defect-1) and the scratch was never de-rotated
 /// by inverse RoPE before host-side conversion (defect-3). This function reads
-/// the fully-accumulated, post-dRoPE SMEM tile and writes f16 HBM directly.
+/// the fully-accumulated, post-dRoPE SMEM tile.
 pub fn emit_store_dk_only(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     let head_dim = config.head_dim as u32;
     let block_kv = config.block_kv as u32;
@@ -95,10 +99,9 @@ pub fn emit_store_dk_only(ptx: &mut String, config: &FlashAttentionConfig, q_til
     // attends a k-row writes that k-row's dK, and an overwrite keeps only the
     // last-attending q-block's contribution. The f32-scratch RMW accumulates
     // across q-block launches (deterministic, grid_x=1 serial launches → no
-    // atomics), and a host-side drain writes scratch -> f16 dk after the loop.
-    // This runs AFTER emit_drope_branch(K) (post-inverse-RoPE, defect-3 safe)
-    // and stays byte-identical at single-tile (zero-init scratch, one RMW,
-    // then cvt.rn.f16.f32 == the old direct cvt.rn.f16.f32 overwrite).
+    // atomics), and the launcher copies scratch -> the f32 dk output after the
+    // loop. This runs AFTER emit_drope_branch(K) (post-inverse-RoPE, defect-3
+    // safe).
     ptx.push_str("    // -- DK f32-scratch RMW via [dk_scratch_ptr] (coop SMEM->HBM) --\n");
     ptx.push_str("    setp.eq.u64 %p0, %rd_bwd_dk_scratch, 0;\n");
     ptx.push_str(&format!(
@@ -158,14 +161,13 @@ pub fn emit_store_kv_only(ptx: &mut String, config: &FlashAttentionConfig, q_til
     ptx.push_str(&format!(
         "    // Tier C backward finalize -- DV f32-scratch accumulate (V only; q_tile_iter={q_tile_iter})\n"
     ));
-    // Option A: write dV to f32 scratch pointer instead of the f16 dv
-    // output tensor. Each q-block launch's kernel does
-    // `ld.global.f32 / add.f32 / st.global.f32` RMW into scratch; a
-    // host-side conversion kernel writes scratch -> f16 after all
-    // q-blocks complete. Avoids the f16 saturation-to-inf path.
+    // dV accumulates in the f32 buffer at dv_scratch_ptr. Each q-block
+    // launch's kernel does `ld.global.f32 / add.f32 / st.global.f32` RMW
+    // into it; the launcher copies it to the f32 dv output after all
+    // q-blocks complete.
     //
-    // HBM byte-stride is * 4 (f32), not * 2 (f16) -- index math below
-    // uses `shl.b64 ..., 2` to align with the scratch f32 layout.
+    // HBM byte-stride is * 4 (f32) -- index math below uses
+    // `shl.b64 ..., 2`.
     for (label, ptr_reg, ptr_name, smem_off) in [
         ("DV", "%rd_bwd_dv_scratch", "dv_scratch_ptr", dv_smem_off),
     ] {
@@ -253,7 +255,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     ptx.push_str("    cvt.u64.u32 %warp_row, %r0;\n");
 
     // row_idx = batch_idx*(heads*seq) + head_idx*seq + (q_start + warp_row)
-    //   * head_dim * 2 (f16 byte stride)
+    //   * head_dim * 2 (legacy byte stride; %rd30 is not read below)
     ptx.push_str("    mul.lo.u64 %rd30, %batch_idx, %rd5;\n");
     ptx.push_str("    add.u64 %rd30, %rd30, %head_idx;\n");
     ptx.push_str("    mul.lo.u64 %rd30, %rd30, %rd6;\n");
@@ -338,13 +340,17 @@ mod tests {
         let mut ptx = String::new();
         emit(&mut ptx, &cfg, 0);
 
-        // dq still stores f16 directly to dq_ptr (no scratch path for dQ --
-        // each q-block writes a disjoint slice so f16 overwrite is safe).
-        assert!(ptx.contains("dq_ptr") && ptx.contains("st.global.b16"));
-        // Cycle-16 G16-1: dV still RMW into f32 scratch (Option A).
-        // dK now stored as f16 via emit_store_dk_only (mod.rs Phase 4),
-        // NOT called from emit(). So emit() output has dv_scratch_ptr but
-        // not dk_scratch_ptr.
+        // dq is stored f32 directly to dq_ptr (no scratch path for dQ --
+        // each q-block writes a disjoint slice, so an overwrite is safe).
+        assert!(ptx.contains("dq_ptr") && ptx.contains("st.global.f32"));
+        assert!(
+            !ptx.contains("st.global.b16") && !ptx.contains("cvt.rn.f16.f32"),
+            "no gradient may be narrowed to f16 on its way out"
+        );
+        // Cycle-16 G16-1: dV RMWs into the f32 buffer at dv_scratch_ptr.
+        // dK goes through emit_store_dk_only (mod.rs Phase 4), NOT called
+        // from emit(). So emit() output has dv_scratch_ptr but not
+        // dk_scratch_ptr.
         assert!(!ptx.contains("dk_scratch_ptr"),
             "emit() must not reference dk_scratch_ptr (dK now via emit_store_dk_only)");
         assert!(ptx.contains("dv_scratch_ptr"));
@@ -358,17 +364,20 @@ mod tests {
     }
 
     #[test]
-    fn backward_finalize_dx_is_f32_others_are_f16() {
-        // Cycle-16 G16-1: dV still accumulates in f32 scratch (Option A).
-        // dK now stored as f16 directly via emit_store_dk_only (mod.rs).
-        // emit() calls emit_store_kv_only (V only), no dk_scratch_ptr.
+    fn backward_finalize_stores_every_gradient_as_f32() {
+        // dQ straight to dq_ptr, dV into the f32 buffer at dv_scratch_ptr,
+        // and dK likewise through emit_store_dk_only. The dQ store used to
+        // be `cvt.rn.f16.f32` + `st.global.b16`, which is exactly zero below
+        // 2.98e-8 -- most of dQ at training magnitudes.
         let cfg = base_cfg_fused_backward(32, 32, 32, 4, 32);
         let mut ptx = String::new();
         emit(&mut ptx, &cfg, 0);
-        assert!(ptx.contains("st.global.b16"),
-            "dQ is still written as f16 in finalize");
-        assert!(ptx.contains("st.global.f32"),
-            "dK/dV accumulate in f32 scratch (saturation fix)");
+        emit_store_dk_only(&mut ptx, &cfg, 0);
+        assert!(ptx.contains("st.global.f32"));
+        assert!(!ptx.contains("st.global.b16"), "a gradient is stored as f16");
+        assert!(!ptx.contains("cvt.rn.f16.f32"), "a gradient is narrowed to f16");
+        // dQ's HBM stride is 4 bytes per element.
+        assert!(ptx.contains("shl.b64 %rd_dq_hbm, %rd_dq_idx, 2;"));
     }
 
     #[test]

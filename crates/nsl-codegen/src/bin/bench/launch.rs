@@ -780,7 +780,8 @@ pub unsafe fn run_fixture(
 /// [0..8]   u64 dq_len_bytes (little-endian)
 /// [8..16]  u64 dk_len_bytes
 /// [16..24] u64 dv_len_bytes
-/// [24..]   dq bytes (f16 [B,H,S,D])  then dk bytes (f32) then dv bytes (f32)
+/// [24..]   dq bytes, then dk bytes, then dv bytes: each f16 [B,H,S,D],
+///          rounded on the host from the kernel's f32 outputs
 /// ```
 ///
 /// The B2-3 parity tests invoke this once per `--tier-b {on,off}` and
@@ -981,7 +982,10 @@ pub unsafe fn run_fixture_backward(
     // and produces non-zero NaN bit-pattern divergence).
     let qkv_bytes_per = total_elems * std::mem::size_of::<u16>(); // f16 storage
     let out_bytes = total_elems * std::mem::size_of::<u16>();     // f16 forward O
-    let dq_bytes  = total_elems * std::mem::size_of::<u16>();     // f16 dQ
+    // dO in and dQ out are f32: the backward kernel reads the gradient with
+    // `ld.global.f32` and stores dQ with `st.global.f32`.
+    let do_bytes  = total_elems * std::mem::size_of::<f32>();     // f32 dO
+    let dq_bytes  = total_elems * std::mem::size_of::<f32>();     // f32 dQ
     let dkv_scratch_bytes = total_elems * std::mem::size_of::<f32>(); // f32 dK/dV scratch
     let lse_elems = (fixture.batch as usize) * (heads as usize) * (fixture.seq_len as usize);
     let lse_bytes = lse_elems * std::mem::size_of::<f32>();
@@ -1025,7 +1029,7 @@ pub unsafe fn run_fixture_backward(
     // Backward-specific buffers.
     let row_max_dev = alloc(row_stats_bytes, &mut allocations).map_err(|e| cleanup_and(&allocations, e))?;
     let row_sum_dev = alloc(row_stats_bytes, &mut allocations).map_err(|e| cleanup_and(&allocations, e))?;
-    let do_dev = alloc(out_bytes, &mut allocations).map_err(|e| cleanup_and(&allocations, e))?; // dO, f16
+    let do_dev = alloc(do_bytes, &mut allocations).map_err(|e| cleanup_and(&allocations, e))?; // dO, f32
     let dq_dev = alloc(dq_bytes, &mut allocations).map_err(|e| cleanup_and(&allocations, e))?;
     let dk_scratch_dev = alloc(dkv_scratch_bytes, &mut allocations).map_err(|e| cleanup_and(&allocations, e))?;
     let dv_scratch_dev = alloc(dkv_scratch_bytes, &mut allocations).map_err(|e| cleanup_and(&allocations, e))?;
@@ -1038,11 +1042,10 @@ pub unsafe fn run_fixture_backward(
     let k_host_f16 = f32_slice_to_f16_bits(&fill_seeded(total_elems, seed.wrapping_mul(5)));
     let v_host_f16 = f32_slice_to_f16_bits(&fill_seeded(total_elems, seed.wrapping_mul(7)));
     let seg_host = generate_segment_mask(fixture.seq_len, fixture.target_sparsity, seed);
-    // dO: f16 host buffer derived from a different seed mix so it's not
+    // dO: f32 host buffer derived from a different seed mix so it's not
     // correlated to Q/K/V (the value distribution doesn't matter for
     // parity, only that on/off pairs see the exact same bytes).
     let do_f32 = fill_seeded(total_elems, seed.wrapping_mul(11));
-    let do_f16 = f32_slice_to_f16_bits(&do_f32);
     // row_max / row_sum: numerically-stable constants — `row_max=0`,
     // `row_sum=1`. When csha=None forward doesn't save these, but backward
     // reads them in `ds_compute`. Random seeded values produce NaN cascades
@@ -1081,7 +1084,7 @@ pub unsafe fn run_fixture_backward(
         .map_err(|e| cleanup_and(&allocations, e))?;
     h2d(seg_dev, seg_host.as_ptr() as *const c_void, seg_bytes_per_batch)
         .map_err(|e| cleanup_and(&allocations, e))?;
-    h2d(do_dev, do_f16.as_ptr() as *const c_void, out_bytes)
+    h2d(do_dev, do_f32.as_ptr() as *const c_void, do_bytes)
         .map_err(|e| cleanup_and(&allocations, e))?;
     h2d(row_max_dev, row_max_host.as_ptr() as *const c_void, row_stats_bytes)
         .map_err(|e| cleanup_and(&allocations, e))?;
@@ -1089,7 +1092,7 @@ pub unsafe fn run_fixture_backward(
         .map_err(|e| cleanup_and(&allocations, e))?;
 
     // Zero the dQ/dK/dV outputs before the backward launch (matches the
-    // runtime's `memset_d8(d_q, qkv_elems * 2)` pre-launch).
+    // runtime's `memset_d8(d_q, qkv_elems * 4)` pre-launch).
     let _ = unsafe { sys::cuMemsetD8_v2(out_dev, 0, out_bytes) };
     let _ = unsafe { sys::cuMemsetD8_v2(lse_dev, 0, lse_bytes) };
     let _ = unsafe { sys::cuMemsetD8_v2(dq_dev, 0, dq_bytes) };
@@ -1511,19 +1514,19 @@ pub unsafe fn run_fixture_backward(
     };
 
     // -- Step B13: Read back dQ + dK_scratch + dV_scratch + write blob. --
-    // dK/dV are converted f32→f16 on the host before the blob to match
-    // the production write path (the runtime's host-side conversion
-    // kernel writes the f32 scratch to f16 dK/dV outputs after all
-    // q-block launches complete). Comparing at the f16 level is also
-    // what makes the bit-identical assertion *tractable*: the f32
-    // scratch retains sub-f16-ULP leakage from masked-lane ex2.approx
+    // All three are f32 on the device (as in the runtime, which no longer
+    // narrows gradients) and are rounded to f16 on the host for the blob.
+    // That rounding is a property of this parity dump only: comparing at
+    // the f16 level is what makes the bit-identical assertion *tractable*,
+    // because the f32 values retain sub-f16-ULP leakage from masked-lane
+    // ex2.approx
     // imprecision, which exists in BOTH `--tier-b on` (kept tiles only)
     // and `--tier-b off` (kept + masked-out tiles), but those leakage
     // values aren't byte-equal at f32 — they ARE byte-equal at f16
     // because the leaked sub-ULP contributions round to zero (matching
     // the forward parity assertion which compares f16 `out` directly).
-    let mut host_dq = vec![0u8; dq_bytes];
-    let rc = unsafe { sys::cuMemcpyDtoH_v2(host_dq.as_mut_ptr() as *mut c_void, dq_dev, dq_bytes) };
+    let mut host_dq_f32_bytes = vec![0u8; dq_bytes];
+    let rc = unsafe { sys::cuMemcpyDtoH_v2(host_dq_f32_bytes.as_mut_ptr() as *mut c_void, dq_dev, dq_bytes) };
     if rc != sys::CUresult::CUDA_SUCCESS {
         return Err(cleanup_and(
             &allocations,
@@ -1546,7 +1549,8 @@ pub unsafe fn run_fixture_backward(
             format!("cuMemcpyDtoH(dv_scratch) rc={:?}: {}", rc, cu_error_string(rc)),
         ));
     }
-    // f32→f16 host conversion (mirrors runtime's post-kernel conversion).
+    // f32→f16 host rounding for the parity blob (see Step B13).
+    let host_dq = f32_bytes_to_f16_bits(&host_dq_f32_bytes);
     let host_dk = f32_bytes_to_f16_bits(&host_dk_f32_bytes);
     let host_dv = f32_bytes_to_f16_bits(&host_dv_f32_bytes);
 
@@ -1610,9 +1614,8 @@ fn f32_bytes_to_f16_bits(src_bytes: &[u8]) -> Vec<u8> {
 }
 
 /// Convert an f32 slice to little-endian f16-bit bytes (u16 per element).
-/// Used by the backward bench harness to populate the `dO` device buffer
-/// from a host f32 PRNG stream — backward expects f16 dO (matches forward's
-/// f16 O output).
+/// Used by the backward bench harness to populate the saved Q/K/V device
+/// buffers from a host f32 PRNG stream (the backward reads them as f16).
 fn f32_slice_to_f16_bits(src: &[f32]) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::with_capacity(src.len() * 2);
     for &x in src {

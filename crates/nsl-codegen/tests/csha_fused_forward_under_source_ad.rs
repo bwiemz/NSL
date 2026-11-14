@@ -41,7 +41,7 @@ use object::{Object, ObjectSection, ObjectSymbol};
 use std::collections::{HashMap, HashSet};
 
 /// Tiny training program matching the Gap F toy pretrain — this is the
-/// SAME structural shape as `csha_gap_f_toy_pretrain_smoke.rs` and the
+/// SAME structural shape as `csha_training_withheld.rs` and the
 /// `csha_gap_gpu_e2e_smoke` e2e harness.  Picking the same source keeps
 /// the three tests aligned: if this pinned forward-claim test turns red
 /// while Gap F stays green, the divergence is in the forward-side

@@ -27,6 +27,8 @@
 
 #![cfg(feature = "cuda")]
 
+#[path = "csha_f64_reference.rs"]
+mod csha_f64_reference;
 #[path = "csha_reference.rs"]
 mod csha_reference;
 use csha_reference::{csha_reference, CshaInputs, CshaShape};
@@ -337,4 +339,224 @@ fn tier_b1_through_csha_ffi_matches_cpu_reference() {
         "[csha-ffi] PASS (max_abs={:.4e} ≤ {:.4e}; mean_abs={:.4e} ≤ {:.4e})",
         max_abs, MAX_ABS_TOL, mean_abs, MEAN_ABS_TOL
     );
+}
+
+// ── Launcher contract: weights are re-read on every launch, and shapes the
+//    pre-passes cannot serve are refused ────────────────────────────────────
+
+/// Device buffers for one Tier B.1 launch at the canonical config, in the
+/// raw f32 layout the production FFI takes.
+struct B1Devices {
+    x: i64,
+    nw: i64,
+    wq: i64,
+    wk: i64,
+    wv: i64,
+    qkv: [i64; 3],
+    out: i64,
+    lse: i64,
+    seq: usize,
+    head_dim: usize,
+    d_model: usize,
+}
+
+impl B1Devices {
+    fn new(config: &FlashAttentionConfig) -> Self {
+        let seq = config.block_q as usize;
+        let head_dim = config.head_dim as usize;
+        let d_model = config.csha.as_ref().expect("csha").d_model as usize;
+        let alloc = |bytes: usize| {
+            let p = nsl_test_cuda_alloc(bytes as i64);
+            assert_ne!(p, 0, "device alloc returned null");
+            p
+        };
+        let qkv = seq * head_dim;
+        B1Devices {
+            x: alloc(seq * d_model * 4),
+            nw: alloc(d_model * 4),
+            wq: alloc(d_model * head_dim * 4),
+            wk: alloc(d_model * head_dim * 4),
+            wv: alloc(d_model * head_dim * 4),
+            qkv: [alloc(qkv * 4), alloc(qkv * 4), alloc(qkv * 4)],
+            out: alloc(qkv * 2),
+            lse: alloc(seq * 4),
+            seq,
+            head_dim,
+            d_model,
+        }
+    }
+
+    fn upload(dev: i64, host: &[f32]) {
+        nsl_test_cuda_h2d(dev, host.as_ptr() as i64, (host.len() * 4) as i64);
+    }
+
+    /// Launch through the production FFI with the given batch and head
+    /// counts; returns the launcher's return code.
+    fn launch(&self, config: &FlashAttentionConfig, batch: i64, heads: i64) -> i64 {
+        let mut ptx = synthesize_flash_attention_ptx_v2(config);
+        while ptx.last() == Some(&0) {
+            ptx.pop();
+        }
+        ptx.push(b'\n');
+        ptx.push(0);
+        let name = CString::new(flash_attention_kernel_name_v2(config)).unwrap();
+        assert!(name.to_string_lossy().contains("_tier_b1_chunk"), "not a Tier B.1 kernel: {name:?}");
+        let scale = 1.0f32 / (self.head_dim as f32).sqrt();
+        nsl_flash_attention_csha(
+            self.qkv[0], self.qkv[1], self.qkv[2], self.out, self.lse,
+            scale.to_bits() as i64,
+            batch, heads, self.seq as i64, self.head_dim as i64,
+            0, 0, 0, 0,
+            0, 0, 0, 0,
+            0,
+            ptx.as_ptr() as i64,
+            name.as_ptr() as i64,
+            config.block_q, config.block_kv,
+            i64::from(config.causal),
+            self.x, self.nw, self.wq, self.wk, self.wv, 0,
+            1e-5f32.to_bits() as i64,
+            0, self.d_model as i64,
+            0, 0, 0, 0, 0,
+        )
+    }
+
+    fn read_out(&self) -> Vec<f32> {
+        let n = self.seq * self.head_dim;
+        let mut raw = vec![0u16; n];
+        nsl_test_cuda_d2h(raw.as_mut_ptr() as i64, self.out, (n * 2) as i64);
+        raw.iter().map(|&b| f16_to_f32(b)).collect()
+    }
+}
+
+impl Drop for B1Devices {
+    fn drop(&mut self) {
+        for p in [self.x, self.nw, self.wq, self.wk, self.wv, self.out, self.lse]
+            .into_iter()
+            .chain(self.qkv)
+        {
+            nsl_test_cuda_free(p);
+        }
+    }
+}
+
+/// Host inputs at the canonical config. `variant` selects a second, unrelated
+/// set of projection weights.
+struct B1Inputs {
+    x: Vec<f32>,
+    gamma: Vec<f32>,
+    wq: Vec<f32>,
+    wk: Vec<f32>,
+    wv: Vec<f32>,
+}
+
+impl B1Inputs {
+    fn new(seq: usize, head_dim: usize, d_model: usize, variant: u32) -> Self {
+        use csha_f64_reference::{det_seq, gamma_seq};
+        // Weights scaled so the 2048-wide projections stay of order 1.
+        let w = |seed: u32| -> Vec<f32> {
+            det_seq(seed + 100 * variant, d_model * head_dim).into_iter().map(|u| 0.1 * u).collect()
+        };
+        B1Inputs {
+            x: det_seq(42, seq * d_model),
+            gamma: gamma_seq(d_model),
+            wq: w(43),
+            wk: w(44),
+            wv: w(45),
+        }
+    }
+
+    /// The attention output, in f64 from the unrounded inputs.
+    fn reference(&self, seq: usize, head_dim: usize, d_model: usize) -> Vec<f64> {
+        let d_o = vec![0.0f32; seq * head_dim];
+        csha_f64_reference::fused_backward_f64(&csha_f64_reference::FusedCase {
+            batch: 1,
+            seq,
+            head_dim,
+            d_model,
+            causal: true,
+            eps: 1e-5,
+            x: &self.x,
+            wq: &self.wq,
+            wk: &self.wk,
+            wv: &self.wv,
+            gamma: &self.gamma,
+            d_o: &d_o,
+            rope: None,
+        })
+        .o
+    }
+
+    fn upload(&self, dev: &B1Devices) {
+        // The pre-pass leaves `x` alone (it writes a re-laid-out copy), but
+        // upload it each time so a launch never depends on the previous one.
+        B1Devices::upload(dev.x, &self.x);
+        B1Devices::upload(dev.nw, &self.gamma);
+        B1Devices::upload(dev.wq, &self.wq);
+        B1Devices::upload(dev.wk, &self.wk);
+        B1Devices::upload(dev.wv, &self.wv);
+    }
+}
+
+/// Relative L2 error allowed on the Tier B.1 output against the f64
+/// reference. Every operand is f16 on tensor cores here and the output is
+/// stored as f16; measured on an RTX PRO 4500 the error is 6e-4 to 7e-4.
+const B1_REL_TOL: f64 = 5e-3;
+
+/// Two launches with different weights at the SAME device addresses: the
+/// second must use the second weights. The launcher used to keep its
+/// re-laid-out copy of each weight in a cache keyed on the device address
+/// and never invalidated it, so an in-place weight update (an optimizer
+/// step, a checkpoint load) left the kernel on the old weights.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn tier_b1_rereads_weights_updated_in_place() {
+    if !cuda_available() {
+        return;
+    }
+    let config = canonical_config();
+    let dev = B1Devices::new(&config);
+    let (seq, hd, dm) = (dev.seq, dev.head_dim, dev.d_model);
+
+    let first = B1Inputs::new(seq, hd, dm, 0);
+    first.upload(&dev);
+    assert_eq!(dev.launch(&config, 1, 1), 0, "first launch");
+    let out_first = dev.read_out();
+    let err_first = csha_f64_reference::rel_l2("first", &out_first, &first.reference(seq, hd, dm));
+
+    let second = B1Inputs::new(seq, hd, dm, 1);
+    second.upload(&dev);
+    assert_eq!(dev.launch(&config, 1, 1), 0, "second launch");
+    let out_second = dev.read_out();
+    let want_second = second.reference(seq, hd, dm);
+    let err_second = csha_f64_reference::rel_l2("second", &out_second, &want_second);
+    // What a stale cache produces: the first launch's output again.
+    let err_if_stale = csha_f64_reference::rel_l2("stale", &out_first, &want_second);
+
+    eprintln!(
+        "[tier-b1 reread] first={err_first:.3e} second={err_second:.3e} \
+         (first output against second reference: {err_if_stale:.3e})"
+    );
+    assert!(err_if_stale > 0.5, "the two weight sets must give different outputs");
+    assert!(err_first < B1_REL_TOL, "first launch off by {err_first:.3e}");
+    assert!(
+        err_second < B1_REL_TOL,
+        "second launch off by {err_second:.3e}: it did not use the weights now at those addresses"
+    );
+}
+
+/// The pre-passes handle one batch element and one head. A larger batch or
+/// head count must be refused, not launched: the `x` pre-pass has no batch
+/// dimension and would leave every batch element after the first unread.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn tier_b1_refuses_batch_or_heads_above_one() {
+    if !cuda_available() {
+        return;
+    }
+    let config = canonical_config();
+    let dev = B1Devices::new(&config);
+    B1Inputs::new(dev.seq, dev.head_dim, dev.d_model, 0).upload(&dev);
+    assert_eq!(dev.launch(&config, 2, 1), -1, "batch 2 must be refused");
+    assert_eq!(dev.launch(&config, 1, 2), -1, "2 heads must be refused");
+    assert_eq!(dev.launch(&config, 1, 1), 0, "batch 1, 1 head is the supported shape");
 }

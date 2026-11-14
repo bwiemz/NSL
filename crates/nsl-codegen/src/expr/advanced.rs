@@ -1490,6 +1490,26 @@ impl Compiler<'_> {
         None
     }
 
+    /// Trap when a fused-attention launcher returned non-zero.
+    ///
+    /// Every launcher logs the reason before it returns. The output tensor is
+    /// allocated zeroed before the launch, so carrying on after a refusal
+    /// hands zeros to the rest of the program as the attention output (and,
+    /// on the path that saves activations, zeroed saves to the backward).
+    /// `TrapCode::unwrap_user(3)` is the code for "attention launch failed".
+    fn trap_on_attention_launch_failure(builder: &mut FunctionBuilder, launch_rc: Value) {
+        use cranelift_codegen::ir::{condcodes::IntCC, TrapCode};
+        let ok_block = builder.create_block();
+        let trap_block = builder.create_block();
+        let is_err = builder.ins().icmp_imm_s(IntCC::NotEqual, launch_rc, 0);
+        builder.ins().brif(is_err, trap_block, &[], ok_block, &[]);
+        builder.switch_to_block(trap_block);
+        builder.seal_block(trap_block);
+        builder.ins().trap(TrapCode::unwrap_user(3));
+        builder.switch_to_block(ok_block);
+        builder.seal_block(ok_block);
+    }
+
     pub(crate) fn compile_flash_attention_call(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -1541,6 +1561,23 @@ impl Compiler<'_> {
         // `nsl-runtime/src/pca_tier_b_runtime.rs`) can pick the variant.
         let csha_with_saves_tier_b_on_ptx_id = ctx.csha_with_saves_tier_b_on_ptx_id;
         let csha_with_saves_tier_b_on_name_id = ctx.csha_with_saves_tier_b_on_name_id;
+        // The active-head count each launch below passes is the one in the
+        // configuration its kernel was synthesized from (0 = every head): the
+        // kernel compares its head index with the run-time value, so the two
+        // must describe the same pruning. It used to be the planner's
+        // per-layer count, which is made on a nominal 8-head layer whatever
+        // the model is, so a 16-head model had heads 8 to 15 left at zero.
+        let kernel_active_heads = |c: &crate::flash_attention::FlashAttentionConfig| -> i64 {
+            c.csha.as_ref().map_or(0, |x| i64::from(x.active_heads))
+        };
+        let inference_active_heads = kernel_active_heads(&ctx.config);
+        // The with-saves launch runs the training kernel when one was
+        // synthesized, and the inference kernel otherwise.
+        let with_saves_active_heads =
+            match (csha_with_saves_ptx_id, csha_with_saves_name_id, ctx.csha_training_config.as_ref()) {
+                (Some(_), Some(_), Some(c)) => kernel_active_heads(c),
+                _ => inference_active_heads,
+            };
         let csha_training_shmem_bytes = ctx
             .csha_training_config
             .as_ref()
@@ -1690,9 +1727,10 @@ impl Compiler<'_> {
             let eps_bits = builder
                 .ins()
                 .iconst(cl_types::I64, extras.rmsnorm_eps.to_bits() as i64);
-            let active_heads_val = builder
-                .ins()
-                .iconst(cl_types::I64, extras.active_heads as i64);
+            let with_saves_active_heads_val =
+                builder.ins().iconst(cl_types::I64, with_saves_active_heads);
+            let inference_active_heads_val =
+                builder.ins().iconst(cl_types::I64, inference_active_heads);
             let d_model_val = builder
                 .ins()
                 .iconst(cl_types::I64, extras.d_model as i64);
@@ -1915,7 +1953,7 @@ impl Compiler<'_> {
                         x_v, norm_w_v,
                         wq_v, wk_v, wv_v, wo_v,
                         eps_bits,
-                        active_heads_val,
+                        with_saves_active_heads_val,
                         d_model_val,
                         // Tier C activation-save pointers.
                         q_proj_v, k_proj_v, v_proj_v,
@@ -1945,21 +1983,7 @@ impl Compiler<'_> {
                         null,
                     ],
                 )?;
-                {
-                    use cranelift_codegen::ir::{condcodes::IntCC, TrapCode};
-                    let ok_block   = builder.create_block();
-                    let trap_block = builder.create_block();
-                    let is_err = builder
-                        .ins()
-                        .icmp_imm_s(IntCC::NotEqual, launch_rc, 0);
-                    builder.ins().brif(is_err, trap_block, &[], ok_block, &[]);
-                    builder.switch_to_block(trap_block);
-                    builder.seal_block(trap_block);
-                    // TrapCode user(3) = CSHA forward launch rc != 0.
-                    builder.ins().trap(TrapCode::unwrap_user(3));
-                    builder.switch_to_block(ok_block);
-                    builder.seal_block(ok_block);
-                }
+                Self::trap_on_attention_launch_failure(builder, launch_rc);
 
                 // Scope-immediate free (save-buffer-leak fix, 2026-07-02).
                 //
@@ -2014,7 +2038,11 @@ impl Compiler<'_> {
                 // for call-site uniformity; the runtime-side
                 // `assert_tier_b_sentinels` panic enforces (0,0) agreement.
                 let tier_b_inference = crate::pca_tier_b::tier_b_disabled_sentinel(builder);
-                let _err = self.compile_call_by_name(
+                // The launcher can refuse (it returns non-zero and logs why:
+                // a kernel that cannot serve the shape, a failed module load
+                // or launch). `out_val` is zero-initialised, so a discarded
+                // return code let zeros flow on as the attention output.
+                let launch_rc = self.compile_call_by_name(
                     builder,
                     "nsl_flash_attention_csha",
                     &[
@@ -2052,7 +2080,7 @@ impl Compiler<'_> {
                         norm_w_v,                  // resolved via conventional-name probe
                         wq_v, wk_v, wv_v, wo_v,    // resolved via bridge marks
                         eps_bits,
-                        active_heads_val,
+                        inference_active_heads_val,
                         d_model_val,
                         // PCA Tier A: segment_ids_ptr — read from the
                         // thread-local packing registry.
@@ -2074,6 +2102,7 @@ impl Compiler<'_> {
                         null,
                     ],
                 )?;
+                Self::trap_on_attention_launch_failure(builder, launch_rc);
             }
         } else {
             // PCA Tier B planner spec §4: the non-CSHA path has no Tier-B-on
@@ -2083,7 +2112,9 @@ impl Compiler<'_> {
             // nsl_flash_attention entry sees a valid (0, 0) pair instead of
             // reading stack garbage.
             let tier_b_non_csha = crate::pca_tier_b::tier_b_disabled_sentinel(builder);
-            let _err = self.compile_call_by_name(
+            // As for the CSHA launches above: a refused launch must not let
+            // the zero-initialised `out_val` flow on.
+            let launch_rc = self.compile_call_by_name(
                 builder,
                 "nsl_flash_attention",
                 &[
@@ -2117,6 +2148,7 @@ impl Compiler<'_> {
                     tier_b_non_csha[1],
                 ],
             )?;
+            Self::trap_on_attention_launch_failure(builder, launch_rc);
         }
 
         // Logsumexp is consumed by the runtime's tape recording in nsl_flash_attention.

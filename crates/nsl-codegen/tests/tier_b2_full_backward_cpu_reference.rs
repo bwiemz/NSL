@@ -39,19 +39,17 @@
 //! - The proj-stage CPU reference (`cpu_naive_backward_proj`) is fed the *GPU*
 //!   dQ/dK/dV read back from the hybrid, so dWq/dWk/dWv/dx parity isolates the
 //!   proj kernel rather than compounding the (already-gated) dQ/dK/dV error.
-//! - dtype reconciliation: the dq/dkdv kernels write dQ/dK/dV as f32 INTO
-//!   PRIVATE F32 SCRATCH BUFFERS inside `csha_tier_b2_backward_launch` (Sprint
-//!   1 T1.2); the proj kernel reads those same f32 scratches and writes
-//!   dWq/dWk/dWv as f16, dx as f32. After proj_backward, the launch converts
-//!   each f32 scratch into the production f16 destination buffers via
-//!   `csha_bwd_convert_f32_to_f16`. This matches the wengert lowering's f16
-//!   allocations (`nsl_tensor_zeros_f16_on`). The proj kernel reads
-//!   x_raw/norm_weight as f32 (`ld.global.f32`) and Wq/Wk/Wv as f16
-//!   (`ld.global.b16`). We therefore upload x_raw/norm_weight as f32 and W as
-//!   f16, allocate the dQ/dK/dV test destinations as f16 (mirroring production
-//!   wengert), and read them back as f16 → widen to f32 for the rel-error
-//!   comparison. The CPU reference takes the same values as f16 (round-trip
-//!   exact via `f16::to_f32`), so both paths see bit-identical numbers.
+//! - dtypes: dO goes in as f32 and all gradients come out as f32 (the FFI's
+//!   gradient contract; the launcher narrows dO for the tensor-core kernels
+//!   itself). The dq/dkdv kernels write dQ/dK/dV as f32 into scratch buffers
+//!   inside `csha_tier_b2_backward_launch`, the proj kernel reads those and
+//!   accumulates dWq/dWk/dWv in f32, and the launch copies everything to the
+//!   f32 destinations. The proj kernel reads x_raw/norm_weight as f32
+//!   (`ld.global.f32`) and Wq/Wk/Wv as f16 (`ld.global.b16`), so those are
+//!   uploaded as f32 and f16. This gate's inputs are f16-representable and
+//!   its CPU reference takes the same values, so it measures the kernels at
+//!   O(1) gradients only; `tier_b2_backward_f64_gate.rs` is the gate at
+//!   realistic gradient magnitudes against an independent reference.
 //!
 //! Spec: docs/superpowers/specs/2026-05-19-csha-tier-b2-phase2-design.md §8
 
@@ -549,7 +547,7 @@ fn validate_full_backward_for_source(cfg: &FlashAttentionConfig, source: FSource
 /// Construct the full FFI call (`tier_b2_active = 1`) for the 4-kernel hybrid
 /// backward, returning all 7 gradients read back to host:
 ///   (dQ, dK, dV) — f32 [batch,heads,seq,hd]
-///   (dWq, dWk, dWv) — f32 [d_model, kv_dim] (read back from f16 device buffers)
+///   (dWq, dWk, dWv) — f32 [d_model, kv_dim]
 ///   dx — f32 [batch,heads,seq,d_model]
 #[allow(clippy::too_many_arguments)]
 fn run_hybrid_backward_on_gpu(
@@ -587,7 +585,11 @@ fn run_hybrid_backward_on_gpu(
     let o_dev = nsl_test_cuda_alloc(qkv_f16_bytes);
     let rmax_dev = nsl_test_cuda_alloc(stat_bytes);
     let rsum_dev = nsl_test_cuda_alloc(stat_bytes);
-    let do_dev = nsl_test_cuda_alloc(qkv_f16_bytes);
+    // dO is f32 on the device (the FFI's gradient contract); the launcher
+    // narrows it for the tensor-core kernels itself.
+    let qkv_f32_bytes = (qkv_elems * 4) as i64;
+    let w_f32_bytes = (w_elems * 4) as i64;
+    let do_dev = nsl_test_cuda_alloc(qkv_f32_bytes);
 
     // --- Projection inputs (device) ---
     let xraw_dev = nsl_test_cuda_alloc(xm_f32_bytes); // f32 (kernel reads ld.global.f32)
@@ -597,16 +599,14 @@ fn run_hybrid_backward_on_gpu(
     let wv_dev = nsl_test_cuda_alloc(w_f16_bytes);
 
     // --- Gradient outputs (device) ---
-    // Sprint 1 T1.2: dq/dk/dv are allocated f16 to mirror the production
-    // wengert lowering (`nsl_tensor_zeros_f16_on`). The launch internally uses
-    // f32 scratches for the dq/dkdv/proj kernels and converts to f16 here via
-    // `csha_bwd_convert_f32_to_f16` before returning.
-    let dq_dev = nsl_test_cuda_alloc(qkv_f16_bytes); // f16 (production wengert contract)
-    let dk_dev = nsl_test_cuda_alloc(qkv_f16_bytes);
-    let dv_dev = nsl_test_cuda_alloc(qkv_f16_bytes);
-    let dwq_dev = nsl_test_cuda_alloc(w_f16_bytes); // f16 (emit_dproj writes f16)
-    let dwk_dev = nsl_test_cuda_alloc(w_f16_bytes);
-    let dwv_dev = nsl_test_cuda_alloc(w_f16_bytes);
+    // Every gradient is f32, as the production lowering allocates them
+    // (`nsl_tensor_zeros_on`).
+    let dq_dev = nsl_test_cuda_alloc(qkv_f32_bytes);
+    let dk_dev = nsl_test_cuda_alloc(qkv_f32_bytes);
+    let dv_dev = nsl_test_cuda_alloc(qkv_f32_bytes);
+    let dwq_dev = nsl_test_cuda_alloc(w_f32_bytes);
+    let dwk_dev = nsl_test_cuda_alloc(w_f32_bytes);
+    let dwv_dev = nsl_test_cuda_alloc(w_f32_bytes);
     let dx_dev = nsl_test_cuda_alloc(dx_bytes); // f32
 
     assert!(
@@ -624,7 +624,8 @@ fn run_hybrid_backward_on_gpu(
     nsl_test_cuda_h2d(o_dev, fwd.o.as_ptr() as i64, qkv_f16_bytes);
     nsl_test_cuda_h2d(rmax_dev, fwd.row_max.as_ptr() as i64, stat_bytes);
     nsl_test_cuda_h2d(rsum_dev, fwd.row_sum.as_ptr() as i64, stat_bytes);
-    nsl_test_cuda_h2d(do_dev, d_o.as_ptr() as i64, qkv_f16_bytes);
+    let d_o_f32: Vec<f32> = d_o.iter().map(|h| h.to_f32()).collect();
+    nsl_test_cuda_h2d(do_dev, d_o_f32.as_ptr() as i64, qkv_f32_bytes);
 
     // Upload projection inputs (x_raw / norm_weight as f32; W as f16).
     let x_raw_f32: Vec<f32> = x_raw_f16.iter().map(|h| h.to_f32()).collect();
@@ -702,28 +703,20 @@ fn run_hybrid_backward_on_gpu(
         panic!("hybrid backward FFI failed rc={rc} (hd={hd} seq={seq})");
     }
 
-    // Read back gradients.
-    // Sprint 1 T1.2: dq/dk/dv are f16 on device — read back as f16, widen to f32.
-    let mut dq_f16 = vec![half::f16::ZERO; qkv_elems];
-    let mut dk_f16 = vec![half::f16::ZERO; qkv_elems];
-    let mut dv_f16 = vec![half::f16::ZERO; qkv_elems];
-    nsl_test_cuda_d2h(dq_f16.as_mut_ptr() as i64, dq_dev, qkv_f16_bytes);
-    nsl_test_cuda_d2h(dk_f16.as_mut_ptr() as i64, dk_dev, qkv_f16_bytes);
-    nsl_test_cuda_d2h(dv_f16.as_mut_ptr() as i64, dv_dev, qkv_f16_bytes);
-    let dq_host: Vec<f32> = dq_f16.iter().map(|h| h.to_f32()).collect();
-    let dk_host: Vec<f32> = dk_f16.iter().map(|h| h.to_f32()).collect();
-    let dv_host: Vec<f32> = dv_f16.iter().map(|h| h.to_f32()).collect();
+    // Read back gradients: all f32 on device.
+    let mut dq_host = vec![0.0f32; qkv_elems];
+    let mut dk_host = vec![0.0f32; qkv_elems];
+    let mut dv_host = vec![0.0f32; qkv_elems];
+    nsl_test_cuda_d2h(dq_host.as_mut_ptr() as i64, dq_dev, qkv_f32_bytes);
+    nsl_test_cuda_d2h(dk_host.as_mut_ptr() as i64, dk_dev, qkv_f32_bytes);
+    nsl_test_cuda_d2h(dv_host.as_mut_ptr() as i64, dv_dev, qkv_f32_bytes);
 
-    // dWq/dWk/dWv are f16 on device — read back as f16, widen to f32.
-    let mut dwq_f16 = vec![half::f16::ZERO; w_elems];
-    let mut dwk_f16 = vec![half::f16::ZERO; w_elems];
-    let mut dwv_f16 = vec![half::f16::ZERO; w_elems];
-    nsl_test_cuda_d2h(dwq_f16.as_mut_ptr() as i64, dwq_dev, w_f16_bytes);
-    nsl_test_cuda_d2h(dwk_f16.as_mut_ptr() as i64, dwk_dev, w_f16_bytes);
-    nsl_test_cuda_d2h(dwv_f16.as_mut_ptr() as i64, dwv_dev, w_f16_bytes);
-    let dwq_host: Vec<f32> = dwq_f16.iter().map(|h| h.to_f32()).collect();
-    let dwk_host: Vec<f32> = dwk_f16.iter().map(|h| h.to_f32()).collect();
-    let dwv_host: Vec<f32> = dwv_f16.iter().map(|h| h.to_f32()).collect();
+    let mut dwq_host = vec![0.0f32; w_elems];
+    let mut dwk_host = vec![0.0f32; w_elems];
+    let mut dwv_host = vec![0.0f32; w_elems];
+    nsl_test_cuda_d2h(dwq_host.as_mut_ptr() as i64, dwq_dev, w_f32_bytes);
+    nsl_test_cuda_d2h(dwk_host.as_mut_ptr() as i64, dwk_dev, w_f32_bytes);
+    nsl_test_cuda_d2h(dwv_host.as_mut_ptr() as i64, dwv_dev, w_f32_bytes);
 
     let mut dx_host = vec![0.0f32; xm_elems];
     nsl_test_cuda_d2h(dx_host.as_mut_ptr() as i64, dx_dev, dx_bytes);
