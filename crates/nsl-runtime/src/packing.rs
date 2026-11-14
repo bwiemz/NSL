@@ -111,13 +111,43 @@ pub fn pack_batch(
     if *cursor + total > data_len {
         return None;
     }
-
-    // Read tokens from stream
-    let mut input_ids = Vec::with_capacity(total);
-    for i in 0..total {
-        input_ids.push(read_flat_value(data, data_dtype, *cursor + i));
-    }
+    let row_starts: Vec<usize> = (0..batch_size).map(|b| *cursor + b * seq_len).collect();
     *cursor += total;
+    pack_rows(data, data_len, data_dtype, &row_starts, seq_len, eos_token, emit_attention_mask)
+}
+
+/// Pack one batch whose rows are the `seq_len`-token windows starting at
+/// `row_starts` (token offsets into the stream, in batch-row order).
+///
+/// This is `pack_batch` without the assumption that the rows of a batch are
+/// adjacent in the stream: a shuffling loader gathers windows from all
+/// over the corpus. Every per-row quantity (segment ids, positions, labels,
+/// document starts) is computed from that row's tokens alone, so a row
+/// packs the same wherever its neighbours come from.
+///
+/// Returns `None` when any row would run past the end of the stream.
+pub fn pack_rows(
+    data: *const c_void,
+    data_len: usize,
+    data_dtype: u16,
+    row_starts: &[usize],
+    seq_len: usize,
+    eos_token: i64,
+    emit_attention_mask: bool,
+) -> Option<PackedBatch> {
+    let batch_size = row_starts.len();
+    let total = batch_size * seq_len;
+    if row_starts.iter().any(|&start| start + seq_len > data_len) {
+        return None;
+    }
+
+    // Read tokens from stream, row by row
+    let mut input_ids = Vec::with_capacity(total);
+    for &start in row_starts {
+        for i in 0..seq_len {
+            input_ids.push(read_flat_value(data, data_dtype, start + i));
+        }
+    }
 
     // Build labels (and, opt-in, the dense mask) per sequence in the batch
     let mut labels = vec![0i64; total];
