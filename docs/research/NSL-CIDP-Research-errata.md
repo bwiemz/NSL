@@ -278,8 +278,8 @@ Older, adjacent code that a reader might mistake for it:
   (`decontaminate.py`), reporting how many benchmark problems that match
   cannot see; mixes at document granularity and reports repetition
   (`make_mix.py`); and runs checks on the output (`verify.py`), among them
-  a comparison of every validation document with the training stream. The project
-  adds no deduplication or quality filter of its own.
+  a comparison of every validation document with the training stream. The
+  project adds no deduplication or quality filter of its own.
 
 The offline tools are where the code and the proposal differ by design, and
 the code has the better of it: for a 50M to 1B parameter model on about 20B
