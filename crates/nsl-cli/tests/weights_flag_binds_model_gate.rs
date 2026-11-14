@@ -1012,8 +1012,14 @@ fn on_a_gpu_the_moved_model_holds_the_file_s_values() {
         write_safetensors(&weights, &[("w", &[4, 4], values)]);
         let file = dir.path().join("prog.nsl");
         std::fs::write(&file, source).unwrap();
+        // cuBLAS runs f32 matmuls on TF32 tensor cores by default (10-bit
+        // mantissa), which moves the train step's result by about 1.5e-5,
+        // more than the 1e-5 this gate allows. The gate is about which values
+        // the model holds, not about matmul precision, so it asks for strict
+        // f32 and keeps the tolerance of the host tests.
         let out = nsl()
             .current_dir(dir.path())
+            .env("NSL_MATMUL_TF32", "0")
             .arg("run")
             .args(extra)
             .arg(&file)
