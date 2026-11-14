@@ -51,22 +51,19 @@ use std::sync::{Mutex, OnceLock};
 static WARNED_UNMATERIALIZED_ADAPTER: AtomicBool = AtomicBool::new(false);
 
 /// Emit a one-time stderr warning when a fused-adapter FFI is called with
-/// null adapter tensors. This happens when `@adapter` is used in a
-/// forward-only / inference-only program: the side-table is materialized
-/// only inside a `train` block (`emit_adapter_init_sidetable`), so a
-/// forward-only program leaves the slots null. `expr/access.rs`'s null-base
-/// guard yields 0 for those fields, and the FFIs below fall back to the base
-/// `x @ W` forward rather than dereferencing null adapter tensors (which used
-/// to segfault). See
-/// docs/plans/2026-05-23-wrga-b4-fused-forward-staging-scope.md.
+/// null adapter tensors. The side-table is built by the model's constructor
+/// (`emit_adapter_init_sidetable`), in a forward-only program as much as in
+/// a training one, so a null tensor means an instance no constructor built.
+/// `expr/access.rs`'s null-base guard yields 0 for those fields, and the FFIs
+/// below fall back to the base `x @ W` forward rather than dereferencing
+/// null adapter tensors.
 fn warn_unmaterialized_adapter_once() {
     if !WARNED_UNMATERIALIZED_ADAPTER.swap(true, Ordering::Relaxed) {
         crate::nsl_log!(WARN, "nsl-wrga", 
-            "[nsl-wrga] @adapter field accessed before materialization (adapter \
-             tensors are null) - running base `x @ W` forward WITHOUT the adapter. \
-             Adapters materialize only inside a `train` block; there is no \
-             inference-only materialization path today. See \
-             docs/plans/2026-05-23-wrga-b4-fused-forward-staging-scope.md."
+            "[nsl-wrga] a fused adapter call received a null adapter tensor - running the \
+             base `x @ W` forward WITHOUT the adapter. Every constructor of an adapted \
+             model builds its adapter tensors, so this is a model instance that was not \
+             built by its constructor."
         );
     }
 }
@@ -221,18 +218,103 @@ fn all_f32(operands: &[&crate::tensor::NslTensor]) -> bool {
         .all(|t| t.dtype == crate::tensor::DTYPE_F32)
 }
 
-/// Whether the synthesized kernels can read `x` and `w` as they are.
+/// The output the synthesized kernels compute correctly: one tensor-core
+/// output tile, 16 rows by 8 columns, with an adapter of rank at most 8.
+///
+/// Each thread block stages rows 0..16 of `x` and columns 0..8 of `W` (and
+/// of B) whatever its block index, so a block other than the first computes
+/// the first block's tile and stores it at its own position: for `m > 16`
+/// rows 16 and up are wrong, and for `n > 8` columns 8 and up are. The
+/// epilogue product holds 8 columns of `x @ A`, so a rank above 8 is wrong
+/// everywhere. Measured against an f64 reference on the GPU: every shape
+/// inside these limits agreed to half precision (k of 4 to 32, with and
+/// without a tail), and every shape outside them was off by 60 to 600
+/// times the half-precision bound.
+#[cfg(feature = "cuda")]
+const KERNEL_MAX_ROWS: i64 = 16;
+#[cfg(feature = "cuda")]
+const KERNEL_MAX_COLS: i64 = 8;
+#[cfg(feature = "cuda")]
+const KERNEL_MAX_RANK: i64 = 8;
+
+/// One-time warning latch for a fused call the kernel cannot serve.
+#[cfg(feature = "cuda")]
+static WARNED_KERNEL_DECLINED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(feature = "cuda")]
+fn dims(t: &crate::tensor::NslTensor) -> Vec<i64> {
+    (0..t.ndim as usize).map(|d| unsafe { *t.shape.add(d) }).collect()
+}
+
+/// Whether the synthesized kernels can compute `x @ w` as the operands are.
 ///
 /// The kernels index both operands as flat row-major `[m, k]` and `[k, n]`
-/// matrices and write an `[m, n]` output. Any other rank must decline: an
-/// `x` of shape `[2, 3, 8]` used to be launched with `m = 3`, returning a
-/// `[3, 8]` result that held batch 0 only, with no error. A strided view
-/// would be read in storage order. Declining sends the caller to the
-/// ordinary-ops path, which handles both.
+/// matrices and write an `[m, n]` output, for one output tile only (see
+/// [`KERNEL_MAX_ROWS`]). Anything else must decline: an `x` of shape
+/// `[2, 3, 8]` used to be launched with `m = 3`, returning a `[3, 8]` result
+/// that held batch 0 only, with no error; a strided view would be read in
+/// storage order; and an output of more than one tile used to be launched
+/// and came back wrong outside its first tile. Declining sends the caller
+/// to the ordinary-ops path, which handles all of them, and says so once.
 #[cfg(feature = "cuda")]
-#[inline]
 fn kernel_can_read(x: &crate::tensor::NslTensor, w: &crate::tensor::NslTensor) -> bool {
-    x.ndim == 2 && w.ndim == 2 && x.is_contiguous() && w.is_contiguous()
+    if !(x.ndim == 2 && w.ndim == 2 && x.is_contiguous() && w.is_contiguous()) {
+        return false;
+    }
+    let (m, n) = (dims(x)[0], dims(w)[1]);
+    if dims(x)[1] != dims(w)[0] {
+        return false;
+    }
+    if m > KERNEL_MAX_ROWS || n > KERNEL_MAX_COLS {
+        warn_kernel_declined_once(&format!("an output of {m} rows by {n} columns"));
+        return false;
+    }
+    true
+}
+
+/// Whether a LoRA pair is what the kernel indexes: contiguous `[k, rank]`
+/// and `[rank, n]` for the `[k, n]` weight, with a rank the epilogue holds.
+/// (An adapter tensor can be assigned from NSL source, so it need not be
+/// the tensor the constructor built.)
+#[cfg(feature = "cuda")]
+fn lora_pair_fits(
+    w: &crate::tensor::NslTensor,
+    a: &crate::tensor::NslTensor,
+    b: &crate::tensor::NslTensor,
+) -> bool {
+    if !(a.ndim == 2 && b.ndim == 2 && a.is_contiguous() && b.is_contiguous()) {
+        return false;
+    }
+    let (wd, ad, bd) = (dims(w), dims(a), dims(b));
+    if ad[0] != wd[0] || bd[1] != wd[1] || ad[1] != bd[0] {
+        return false;
+    }
+    if ad[1] > KERNEL_MAX_RANK {
+        warn_kernel_declined_once(&format!("an adapter of rank {}", ad[1]));
+        return false;
+    }
+    true
+}
+
+/// Whether a per-column vector (the IA3 scale, the gate) is a contiguous
+/// `[n]` for the `[k, n]` weight.
+#[cfg(feature = "cuda")]
+fn column_vector_fits(w: &crate::tensor::NslTensor, v: &crate::tensor::NslTensor) -> bool {
+    v.ndim == 1 && v.is_contiguous() && dims(v)[0] == dims(w)[1]
+}
+
+#[cfg(feature = "cuda")]
+fn warn_kernel_declined_once(what: &str) {
+    if !WARNED_KERNEL_DECLINED.swap(true, Ordering::Relaxed) {
+        crate::nsl_log!(
+            WARN,
+            "nsl-wrga",
+            "[nsl-wrga] NSL_WRGA_FUSED_CUDA=1: the fused adapter kernel computes one output \
+             tile ({KERNEL_MAX_ROWS} rows by {KERNEL_MAX_COLS} columns, rank up to \
+             {KERNEL_MAX_RANK}) and this call has {what}; running the ordinary operations \
+             instead (said once)"
+        );
+    }
 }
 
 /// Attempt a real cudarc-based launch for the LoRA kernel identified by
@@ -297,7 +379,7 @@ fn try_cuda_launch_fused_lora(
     }
 
     // 3. Derive shape-dependent grid/block from x=[m,k], w=[k,n].
-    if !kernel_can_read(xt, wt) {
+    if !kernel_can_read(xt, wt) || !lora_pair_fits(wt, at, bt) {
         return None;
     }
     let m = unsafe { *xt.shape.add(xt.ndim as usize - 2) } as i64;
@@ -444,7 +526,7 @@ fn try_cuda_launch_fused_ia3(
         );
         return None;
     }
-    if !kernel_can_read(xt, wt) {
+    if !kernel_can_read(xt, wt) || !column_vector_fits(wt, gt) {
         return None;
     }
     let m = unsafe { *xt.shape.add(xt.ndim as usize - 2) } as i64;
@@ -463,15 +545,23 @@ fn try_cuda_launch_fused_ia3(
     ));
     let out_ptr = Box::into_raw(out_box);
 
+    // The kernel's six parameters: x, W, gamma, y, then the runtime row and
+    // column counts it predicates its tail tiles on. Only the first four
+    // were passed, so a launch would have read the two counts from past the
+    // argument list.
     let mut x_data = xt.data as u64;
     let mut w_data = wt.data as u64;
     let mut g_data = gt.data as u64;
     let mut y_data = out_data as u64;
-    let args: [*mut c_void; 4] = [
+    let mut m_rows_u32: u32 = m as u32;
+    let mut n_cols_u32: u32 = n as u32;
+    let args: [*mut c_void; 6] = [
         &mut x_data as *mut _ as *mut c_void,
         &mut w_data as *mut _ as *mut c_void,
         &mut g_data as *mut _ as *mut c_void,
         &mut y_data as *mut _ as *mut c_void,
+        &mut m_rows_u32 as *mut _ as *mut c_void,
+        &mut n_cols_u32 as *mut _ as *mut c_void,
     ];
 
     let grid = [(m + 15) / 16, (n + 7) / 8, 1];
@@ -735,7 +825,7 @@ fn try_cuda_launch_fused_gatedlora(
     }
 
     // 3. Derive shape-dependent grid/block from x=[m,k], w=[k,n].
-    if !kernel_can_read(xt, wt) {
+    if !kernel_can_read(xt, wt) || !lora_pair_fits(wt, at, bt) || !column_vector_fits(wt, gat) {
         return None;
     }
     let m = unsafe { *xt.shape.add(xt.ndim as usize - 2) } as i64;

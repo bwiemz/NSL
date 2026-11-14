@@ -193,9 +193,9 @@ fn wrga_ablate_combines_with_wrga_compare() {
 }
 
 /// `--wrga-compare --wrga-ablate=spectral` emits a warning explaining that
-/// the SVD-disabled run cannot recover per-site weight shapes, so the PEFT
-/// table's LoRA/AdaLoRA/ReFT rows will be zero. Pins the warning so a
-/// future refactor that loses it produces a silently-wrong table.
+/// the ablated stage is the one that sizes the adapters, so the table's
+/// WRGA row shows no parameters. Pins the warning so a future refactor that
+/// loses it produces a table that reads as "WRGA needs 0 parameters".
 #[test]
 fn wrga_ablate_spectral_with_compare_emits_warning() {
     let tmp = TempDir::new().unwrap();
@@ -211,7 +211,7 @@ fn wrga_ablate_spectral_with_compare_emits_warning() {
     cmd.assert()
         .success()
         .stderr(predicate::str::contains(
-            "--wrga-ablate=spectral disables the SVD",
+            "--wrga-ablate=spectral skips the stage that sizes the adapters",
         ));
 }
 
@@ -232,7 +232,7 @@ fn wrga_ablate_spectral_with_analyze_does_not_emit_compare_warning() {
         .arg("--wrga-ablate=spectral");
     cmd.assert()
         .success()
-        .stderr(predicate::str::contains("--wrga-ablate=spectral disables the SVD").not());
+        .stderr(predicate::str::contains("--wrga-ablate=spectral skips the stage").not());
 }
 
 /// Side-effect-free contract is preserved under ablation — same as for

@@ -115,14 +115,23 @@ pub(crate) struct SaveRequirements {
 /// Summary of the pruning pass, suitable for `nsl build --wrga-report`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PruneStats {
-    /// Total ops in the input (full forward) Wengert list.
+    /// Total ops in the input (full forward) Wengert list, inputs and
+    /// constants included.
     pub forward_ops_total: usize,
-    /// Ops that survived the pruning (i.e. still needed for the backward pass
-    /// of the specified trainable parameters).
+    /// Ops a backward pass differentiates when EVERY parameter is trainable:
+    /// what `backward_ops_retained` is compared with. It is not
+    /// `forward_ops_total`: inputs, constants and whatever hangs off them
+    /// alone carry no adjoint in any backward pass, so counting them as
+    /// "eliminated" reported 29.6% pruned for a model with nothing frozen.
+    pub full_backward_ops: usize,
+    /// Ops the backward pass differentiates for the given trainable
+    /// parameters.
     pub backward_ops_retained: usize,
-    /// Number of activations that would have been saved in the *full* backward.
+    /// Distinct tensors a backward pass saves when every parameter is
+    /// trainable. (This used to count OPS with a save requirement, against
+    /// tensors on the other side: "15 tensors → 18 tensors".)
     pub full_backward_saved_activations: usize,
-    /// Activations actually saved in the pruned backward.
+    /// Distinct tensors the pruned backward saves.
     pub pruned_saved_activations: usize,
     /// Trainable parameter count (VarIds marked as gradient targets).
     pub gradient_targets: usize,
@@ -133,13 +142,13 @@ pub struct PruneStats {
 
 impl PruneStats {
     pub fn backward_elimination_ratio(&self) -> f64 {
-        if self.forward_ops_total == 0 {
+        if self.full_backward_ops == 0 {
             return 0.0;
         }
         let eliminated = self
-            .forward_ops_total
+            .full_backward_ops
             .saturating_sub(self.backward_ops_retained);
-        eliminated as f64 / self.forward_ops_total as f64
+        eliminated as f64 / self.full_backward_ops as f64
     }
 
     pub fn activation_elimination_ratio(&self) -> f64 {
@@ -220,6 +229,54 @@ pub fn prune(
     trainable: &BTreeSet<VarId>,
     loss_output: VarId,
 ) -> PruneResult {
+    let (backward_live, activation_live) = live_sets(list, trainable, loss_output);
+
+    // The baseline: the same two sets with every parameter trainable.
+    let all_params: BTreeSet<VarId> = list
+        .ops
+        .iter()
+        .filter(|op| matches!(op.op, PrimalOp::Param(_)))
+        .map(|op| op.result)
+        .collect();
+    let (full_backward_live, full_activation_live) = live_sets(list, &all_params, loss_output);
+
+    // Build the pruned list.  Ops whose result is not in backward_live *and*
+    // whose result is not on the output path are unreachable in both the
+    // pruned forward (for the loss) and the pruned backward — but we keep
+    // the forward pass intact because the user still needs the loss value.
+    // What we *do* update is the `saved_for_backward` bit: only activations
+    // that the pruned backward will read should be saved.
+    let mut pruned = list.clone();
+    for op in pruned.ops.iter_mut() {
+        op.saved_for_backward = activation_live.contains(&op.result);
+    }
+
+    let stats = PruneStats {
+        forward_ops_total: list.len(),
+        full_backward_ops: full_backward_live.len(),
+        backward_ops_retained: backward_live.len(),
+        full_backward_saved_activations: full_activation_live.len(),
+        pruned_saved_activations: activation_live.len(),
+        gradient_targets: trainable.len(),
+        // Anything tagged `Param(...)` but not in trainable.
+        frozen_params: all_params.difference(trainable).count(),
+    };
+
+    PruneResult {
+        pruned,
+        backward_live,
+        activation_live,
+        stats,
+    }
+}
+
+/// The two live sets of a backward pass for `trainable`: the VarIds whose
+/// adjoint is computed, and the VarIds whose primal value it reads.
+fn live_sets(
+    list: &WengertList,
+    trainable: &BTreeSet<VarId>,
+    loss_output: VarId,
+) -> (BTreeSet<VarId>, BTreeSet<VarId>) {
     // 1. Backward cone: which VarIds contribute to the loss?
     //    Anything not on this set has no adjoint.  (This is the "output-cone".)
     let to_loss = reverse_reachable_from(list, loss_output);
@@ -227,10 +284,7 @@ pub fn prune(
     // 2. Forward cone from trainable params: which VarIds depend on a
     //    trainable?  Only ops on *this* cone can have a nonzero gradient with
     //    respect to any trainable.
-    let mut trainable_hs: HashSet<VarId> = HashSet::new();
-    for &v in trainable {
-        trainable_hs.insert(v);
-    }
+    let trainable_hs: HashSet<VarId> = trainable.iter().copied().collect();
     let from_trainable = forward_reachable_from(list, &trainable_hs);
 
     // 3. Backward-live: intersection of the two cones plus the trainable
@@ -256,19 +310,11 @@ pub fn prune(
     //    rule requires its output, or (b) it's the input to a live op whose
     //    rule requires its inputs.
     let mut activation_live: BTreeSet<VarId> = BTreeSet::new();
-    let mut total_full_saves: usize = 0;
-
     for op in &list.ops {
-        let req = save_requirements(&op.op);
-        // Full-backward save budget — a reasonable proxy for the "what
-        // PyTorch would save" baseline.
-        if req.needs_output || req.needs_inputs {
-            total_full_saves += 1;
-        }
-
         if !backward_live.contains(&op.result) {
             continue; // adjoint of this node is never computed, so no saves
         }
+        let req = save_requirements(&op.op);
         if req.needs_output {
             activation_live.insert(op.result);
         }
@@ -278,41 +324,7 @@ pub fn prune(
             }
         }
     }
-
-    // 5. Build the pruned list.  Ops whose result is not in backward_live *and*
-    //    whose result is not on the output path are unreachable in both the
-    //    pruned forward (for the loss) and the pruned backward — but we keep
-    //    the forward pass intact because the user still needs the loss value.
-    //    What we *do* update is the `saved_for_backward` bit: only activations
-    //    that the pruned backward will read should be saved.
-    let mut pruned = list.clone();
-    for op in pruned.ops.iter_mut() {
-        op.saved_for_backward = activation_live.contains(&op.result);
-    }
-
-    // 6. Count frozen params: anything tagged `Param(...)` but not in trainable.
-    let mut frozen_params = 0usize;
-    for op in &list.ops {
-        if matches!(op.op, PrimalOp::Param(_)) && !trainable.contains(&op.result) {
-            frozen_params += 1;
-        }
-    }
-
-    let stats = PruneStats {
-        forward_ops_total: list.len(),
-        backward_ops_retained: backward_live.len(),
-        full_backward_saved_activations: total_full_saves,
-        pruned_saved_activations: activation_live.len(),
-        gradient_targets: trainable.len(),
-        frozen_params,
-    };
-
-    PruneResult {
-        pruned,
-        backward_live,
-        activation_live,
-        stats,
-    }
+    (backward_live, activation_live)
 }
 
 /// Convenience: walk a Wengert list and return the set of `Param(name)` VarIds
@@ -479,7 +491,8 @@ mod tests {
     #[test]
     fn stats_ratios_are_sane() {
         let s = PruneStats {
-            forward_ops_total: 100,
+            forward_ops_total: 120,
+            full_backward_ops: 100,
             backward_ops_retained: 15,
             full_backward_saved_activations: 60,
             pruned_saved_activations: 10,

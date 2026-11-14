@@ -9,7 +9,7 @@
 //! `--grad-integrity` counts the list, and source AD zero-fills a missing
 //! gradient and reports it only in a WARN summary whose denominator is that
 //! enumeration. The 1B posture certificate checks every saved field moves,
-//! but on the GPU only, and `model_save` cannot see adapters.
+//! but on the GPU only.
 //!
 //! Here the EXPECTED set comes from the fixture's declarations as the
 //! semantic analysis records them (`nsl_cli::loader`): the model types'
@@ -20,9 +20,10 @@
 //! `inv_freq` convention the stdlib's configuration tensors use. A scalar
 //! field (`int`, `float`, `str`, ...) is no tensor at all: it must not be
 //! saved, trained or changed. The OBSERVATIONS are `model_save` before and
-//! after training (struct fields, exact f32), the fixture's printed adapter
-//! tensors (`print` writes an f32 exactly) and its printed scalar fields.
-//! Each set must be exactly the expected names.
+//! after training (struct fields and adapter tensors, exact f32), the
+//! fixture's printed adapter tensors (`print` writes an f32 exactly), which
+//! must equal the saved ones, and its printed scalar fields. Each set must
+//! be exactly the expected names.
 //!
 //! The fixture trains three plain-SGD steps from a fixed seed, under the
 //! tape and under `--source-ad`. Each mode must move every element of every
@@ -30,7 +31,7 @@
 //! bit-identical; the two modes -- independent AD implementations -- must
 //! agree on the trained values. A fresh instance loaded from the trained
 //! file must then save exactly what the trained one did: `model_load` reads
-//! the fields `model_save` writes, Buffers included.
+//! the tensors `model_save` writes, Buffers and adapters included.
 //!
 //! Mutation-checked (2026-10-06); each of these fails the gate:
 //! - adapters left out of the parameter enumeration (#806's mechanism);
@@ -385,10 +386,19 @@ fn train(source_ad: bool) -> Result<Run, String> {
     let mut after = read_nslm(&tmp.path().join("end.nslm"));
     let fresh = read_nslm(&tmp.path().join("fresh.nslm"));
     let reloaded = read_nslm(&tmp.path().join("reloaded.nslm"));
+    // An adapter tensor is observed twice, in `model_save`'s file and in the
+    // printed snapshot, and the two must be the same tensor.
     for (map, snap) in [(&mut before, snapshots[0]), (&mut after, snapshots[1])] {
         for (name, line) in snapshot_pairs(snap, "ADAPTERS_END", "ADAPTER ") {
-            let values = parse_printed_tensor(line);
-            assert!(map.insert(name.clone(), values).is_none(), "{mode}: {name} observed twice");
+            let printed = parse_printed_tensor(line);
+            match map.get(&name) {
+                Some(saved) => assert_eq!(
+                    saved.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    printed.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "{mode}: model_save wrote a different {name} than the model holds"
+                ),
+                None => return Err(format!("{mode}: adapter tensor {name} is not in model_save's file")),
+            }
         }
     }
     let scalar_sections: Vec<&str> = stdout.split("SCALARS_BEGIN").skip(1).collect();
@@ -555,7 +565,7 @@ fn every_parameter_trains_and_nothing_else_does() {
         // `model_load` restores exactly what `model_save` wrote (the two use
         // one field list). Each Buffer must start out different in the fresh
         // instance, or the round trip could not see a load that skips it.
-        let saved: BTreeMap<&String, &Vec<f32>> = run.after.iter().filter(|(n, _)| expected.fields.contains_key(*n)).collect();
+        let saved: BTreeMap<&String, &Vec<f32>> = run.after.iter().filter(|(n, _)| expected_names.contains(*n)).collect();
         let reloaded: BTreeMap<&String, &Vec<f32>> = run.reloaded.iter().collect();
         if saved != reloaded {
             let names = |m: &BTreeMap<&String, &Vec<f32>>| m.keys().map(|n| n.as_str()).collect::<Vec<_>>().join(", ");

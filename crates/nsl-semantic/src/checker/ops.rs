@@ -873,6 +873,19 @@ impl<'a> TypeChecker<'a> {
                 if let Some((_, method_ty)) = methods.iter().find(|(name, _)| *name == member) {
                     return method_ty.clone();
                 }
+                // The tensors an `@adapter` adds to a model (`lora_A_<site>`,
+                // `lora_B_<site>`, `ia3_scale_<site>`, `gate_<site>`) are not
+                // declared fields, so they have no entry above; they are
+                // tensors all the same. Left untyped, `m.lora_A_... .sum()`
+                // was an expression of unknown type and `print` wrote its
+                // handle as an integer.
+                if crate::wrga::is_adapter_tensor_name(&self.resolve_name(member)) {
+                    return Type::Tensor {
+                        shape: crate::types::Shape::unknown(),
+                        dtype: crate::types::DType::Unknown,
+                        device: crate::types::Device::Unknown,
+                    };
+                }
                 // Models have many dynamic attributes, be lenient
                 Type::Unknown
             }

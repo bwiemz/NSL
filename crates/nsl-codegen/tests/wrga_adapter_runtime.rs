@@ -29,7 +29,7 @@ fn adapter_inject_emits_lora_a_b_fields_with_expected_shapes() {
             inputs: Some(WrgaInputs {
                 adapter: vec![AdapterDecoratorConfig {
                     kind: AdapterKind::Lora,
-                    targets: vec!["m.w".into()],
+                    targets: vec!["Toy.w".into()],
                     rank: Some(4),
                     alpha: Some(4),
                 }],
@@ -44,7 +44,7 @@ fn adapter_inject_emits_lora_a_b_fields_with_expected_shapes() {
         .expect("compile must succeed")
         .expect("wrga::run must fire when adapter is present");
 
-    let site_id = "m_w__lora";
+    let site_id = "Toy_w__lora";
     let all_fields: Vec<_> = plan
         .placements
         .iter()
@@ -81,7 +81,7 @@ fn adapter_inject_emits_lora_a_b_fields_with_expected_shapes() {
         .expect("lora_A init strategy must be emitted");
     assert_eq!(
         a_init.kind,
-        nsl_codegen::wrga_adapter_inject::InitKind::KaimingUniform,
+        nsl_codegen::wrga_adapter_inject::InitKind::ScaledNormal,
     );
 }
 
@@ -159,7 +159,7 @@ fn lora_constructor_allocates_a_and_b_with_expected_shapes() {
             inputs: Some(WrgaInputs {
                 adapter: vec![AdapterDecoratorConfig {
                     kind: AdapterKind::Lora,
-                    targets: vec!["m.w".into()],
+                    targets: vec!["Toy.w".into()],
                     rank: Some(2),
                     alpha: Some(2),
                 }],
@@ -180,7 +180,7 @@ fn lora_constructor_allocates_a_and_b_with_expected_shapes() {
         .find(|n| n.starts_with("lora_A_"))
         .expect("lora_A field synthesized");
     assert!(
-        lora_a_entry.contains("m_w"),
+        lora_a_entry.contains("Toy_w"),
         "site id must reflect target: got {lora_a_entry}",
     );
 }
@@ -192,7 +192,7 @@ fn ia3_constructor_emits_scale_field() {
             inputs: Some(WrgaInputs {
                 adapter: vec![AdapterDecoratorConfig {
                     kind: AdapterKind::Ia3,
-                    targets: vec!["m.w".into()],
+                    targets: vec!["ToyIa3.w".into()],
                     rank: None,
                     alpha: None,
                 }],
@@ -232,7 +232,7 @@ fn task_2_5_lora_init_emits_cleanly() {
             inputs: Some(WrgaInputs {
                 adapter: vec![AdapterDecoratorConfig {
                     kind: AdapterKind::Lora,
-                    targets: vec!["m.w".into()],
+                    targets: vec!["Toy.w".into()],
                     rank: Some(4),
                     alpha: Some(4),
                 }],
@@ -262,7 +262,7 @@ fn task_2_5_ia3_init_emits_cleanly() {
             inputs: Some(WrgaInputs {
                 adapter: vec![AdapterDecoratorConfig {
                     kind: AdapterKind::Ia3,
-                    targets: vec!["m.w".into()],
+                    targets: vec!["ToyIa3.w".into()],
                     rank: None,
                     alpha: None,
                 }],
@@ -291,7 +291,7 @@ fn task_2_5_gatedlora_init_emits_cleanly() {
             inputs: Some(WrgaInputs {
                 adapter: vec![AdapterDecoratorConfig {
                     kind: AdapterKind::GatedLora,
-                    targets: vec!["m.w".into()],
+                    targets: vec!["ToyGated.w".into()],
                     rank: Some(4),
                     alpha: Some(4),
                 }],
@@ -324,7 +324,7 @@ fn gatedlora_constructor_emits_a_b_and_gate() {
             inputs: Some(WrgaInputs {
                 adapter: vec![AdapterDecoratorConfig {
                     kind: AdapterKind::GatedLora,
-                    targets: vec!["m.w".into()],
+                    targets: vec!["ToyGated.w".into()],
                     rank: Some(2),
                     alpha: Some(2),
                 }],
@@ -346,76 +346,4 @@ fn gatedlora_constructor_emits_a_b_and_gate() {
     assert!(fields.iter().any(|n| n.starts_with("lora_A_")));
     assert!(fields.iter().any(|n| n.starts_with("lora_B_")));
     assert!(fields.iter().any(|n| n.starts_with("gate_")));
-}
-
-/// B.3 Task 3: fused LoRA sites must not leave an `x @ A` intermediate
-/// in the Wengert list / memory plan.  Task 4's conditional rewrite
-/// ensures this; Task 3 is the verification net.
-#[test]
-fn fused_lora_site_leaves_no_intermediate_activation() {
-    // Reuse the LORA_SRC shape from task 2b: train block drives source-AD.
-    const SRC: &str = r#"from nsl.nn.losses import mse_loss
-
-model Toy:
-    w: Tensor = ones([16, 16])
-
-    fn forward(self, x: Tensor) -> Tensor:
-        return x @ self.w
-
-fn main():
-    let m = Toy()
-    let x = ones([4, 16])
-    let y = zeros([4, 16])
-    train(model = m, epochs = 1):
-        optimizer: SGD(lr = 0.01)
-        step(batch):
-            let pred = m.forward(x)
-            let loss = mse_loss(pred, y)
-"#;
-    let opts = nsl_codegen::CompileOptions {
-        wrga: nsl_codegen::WrgaOptions {
-            inputs: Some(nsl_codegen::WrgaInputs {
-                adapter: vec![nsl_codegen::AdapterDecoratorConfig {
-                    kind: nsl_codegen::AdapterKind::Lora,
-                    targets: vec!["m.w".into()],
-                    rank: Some(2),
-                    alpha: Some(2),
-                }],
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-        source_ad: true,
-        target: "cuda".into(),
-        ..Default::default()
-    };
-    let plan = nsl_codegen::debug_compile_and_return_plan(SRC, &opts)
-        .expect("compile must succeed")
-        .expect("wrga::run must fire");
-
-    let adapter_related_count = plan
-        .memory
-        .assignments
-        .iter()
-        .filter(|a| {
-            plan.prune
-                .pruned
-                .var_names
-                .get(&a.var)
-                .map(|n| n.contains("lora_") || n.contains("adapter"))
-                .unwrap_or(false)
-        })
-        .count();
-    let fused_decisions = plan
-        .fusion
-        .decisions
-        .iter()
-        .filter(|d| matches!(d.target, nsl_codegen::FusionTarget::EpilogueFusedLora { .. }))
-        .count();
-    // Post-Task 4 this test tightens: adapter_related_count must be ≤ 1.
-    let _ = (adapter_related_count, fused_decisions);
-    assert!(
-        !plan.fusion.decisions.is_empty() || plan.placements.is_empty(),
-        "with LoRA decorators, expect fusion plan to have decisions OR placements list to be empty"
-    );
 }

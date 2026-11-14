@@ -78,7 +78,7 @@ impl Compiler<'_> {
                 crate::stmt_pass_bridges::invoke_wrga_if_enabled(self, extractor.wengert_list())
             })
             .map_err(CodegenError::new)?;
-        let wrga_plan = scheduled.finish(&self.bus).map_err(CodegenError::new)?;
+        let wrga_plan = scheduled.finish(&self.bus).map_err(CodegenError::new)??;
         // CPDT planning site. On the pre-plan path the wrapper
         // already planned before the moment consult (a plan
         // published only HERE arrives ~2.2k lines after that consult

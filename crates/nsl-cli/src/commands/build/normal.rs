@@ -307,6 +307,16 @@ fn run_build_multi(
 
     let mut obj_files: Vec<PathBuf> = Vec::new();
 
+    // What the modules the entry imports are compiled with, and what their
+    // model layouts are collected with: the entry's `@adapter` decorators go
+    // with them (see `options_for_imported_module`).
+    let entry_data = &graph.modules[&graph.entry];
+    let imported_options = crate::pipeline::options_for_imported_module(options, entry_data);
+    let layout_options = crate::pipeline::options_for_imported_module(
+        &nsl_codegen::CompileOptions::default(),
+        entry_data,
+    );
+
     // Compile each module in dependency order
     for path in &graph.dep_order {
         let mod_data = &graph.modules[path];
@@ -338,7 +348,7 @@ fn run_build_multi(
                 let dep_data = &graph.modules[dep_path];
 
                 // Build function signatures and struct layouts using a temporary compiler
-                let mut temp_compiler = match nsl_codegen::compiler::Compiler::new(&interner, &dep_data.type_map, &nsl_codegen::CompileOptions::default()) {
+                let mut temp_compiler = match nsl_codegen::compiler::Compiler::new(&interner, &dep_data.type_map, &layout_options) {
                     Ok(c) => c,
                     Err(e) => crate::pipeline::exit_on_codegen_error_in(&source_map, &e, dep_path),
                 };
@@ -536,7 +546,7 @@ fn run_build_multi(
                     }
 
                     let dep_data = &graph.modules[dep_path];
-                    let mut temp_compiler = match nsl_codegen::compiler::Compiler::new(&interner, &dep_data.type_map, &nsl_codegen::CompileOptions::default()) {
+                    let mut temp_compiler = match nsl_codegen::compiler::Compiler::new(&interner, &dep_data.type_map, &layout_options) {
                         Ok(c) => c,
                         Err(e) => crate::pipeline::exit_on_codegen_error_in(&source_map, &e, dep_path),
                     };
@@ -632,7 +642,7 @@ fn run_build_multi(
                 lib_model_names,
                 lib_model_method_bodies,
                 dump_ir,
-                options,
+                &imported_options,
             ) {
                 Ok(bytes) => bytes,
                 Err(e) => crate::pipeline::exit_on_codegen_error_in(&source_map, &e, path),

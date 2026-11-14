@@ -241,6 +241,7 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
                     report_path,
                     wrga_target.as_deref(),
                     parsed_ablation,
+                    weights.as_deref(),
                 ));
             }
             // WRGA paper §8.3: `--wrga-compare` — same dispatch shape as
@@ -251,6 +252,7 @@ pub(crate) fn dispatch(args: crate::args::CheckArgs) {
                     report_path,
                     wrga_target.as_deref(),
                     parsed_ablation,
+                    weights.as_deref(),
                 ));
             }
 

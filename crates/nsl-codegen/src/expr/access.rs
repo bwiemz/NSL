@@ -565,9 +565,9 @@ impl Compiler<'_> {
     /// The insertion order is: outer loop over `plan.placements` in the
     /// order produced by WRGA; inner loop over each placement's
     /// `synthesized_fields` vec. Only placements whose target field is
-    /// declared on `model_name` participate. Sites whose dims failed to
-    /// resolve (input_dim == 0 || output_dim == 0) are EXCLUDED from both
-    /// the init pass and this index computation to keep them in sync.
+    /// declared on `model_name` participate. Every site in the bus resolved
+    /// (an unresolved target is a compile error), so there is nothing to
+    /// skip here or in the init pass.
     pub(crate) fn adapter_field_index(
         &self,
         model_name: &str,
@@ -581,11 +581,6 @@ impl Compiler<'_> {
         let mut idx: usize = 0;
         for site in self.bus.adapter_sites() {
             if site.target_model != model_name {
-                continue;
-            }
-            // Skip sites whose dims failed to resolve (the init pass also
-            // skips these, so the indices stay in sync).
-            if site.input_dim == 0 || site.output_dim == 0 {
                 continue;
             }
             for synth in &site.synthesized_fields {

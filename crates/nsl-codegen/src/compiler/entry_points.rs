@@ -643,7 +643,7 @@ pub fn compile_returning_splice_count_for_tests(
     compiler.register_batched_functions(&vmap_results);
     compiler.compile_datatype_defs(&ast.stmts)?;
     compiler.compile_kernels(&ast.stmts)?;
-    crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler);
+    crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler)?;
     crate::wrga_prescan::rewrite_model_method_bodies_with_adapter_sites(&mut compiler);
     compiler.compile_flash_attention_kernels(&ast.stmts)?;
     // Swallow the result intentionally.  The splice runs BEFORE
@@ -771,7 +771,7 @@ fn compile_returning_plan_impl(
     // are compiled. Without this, the Task 3 LoRA AST rewrite never fires
     // because adapter_sites is empty at that point (train-block WRGA
     // invocation happens later, inside compile_main).
-    crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler);
+    crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler)?;
     // B.3.2 Option 3 phase 3e: re-apply the adapter rewrite to
     // `model_method_bodies` (the source-AD-walked copy) so the fused FFI
     // call is visible in the code path source-AD traverses during train
@@ -947,7 +947,7 @@ fn compile_standalone_best_effort_plan(
         compiler.register_batched_functions(&vmap_results);
         compiler.compile_datatype_defs(&ast.stmts)?;
         compiler.compile_kernels(&ast.stmts)?;
-        crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler);
+        crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler)?;
         // B.3.2 Option 3 phase 3e: re-apply rewrite to model_method_bodies
         // so source-AD's inline expansion sees the fused FFI call.
         crate::wrga_prescan::rewrite_model_method_bodies_with_adapter_sites(&mut compiler);
@@ -1231,7 +1231,7 @@ pub fn compile_module_with_imports_best_effort_plans(
         compiler.register_batched_functions(&vmap_results);
         compiler.compile_datatype_defs(&ast.stmts)?;
         compiler.compile_kernels(&ast.stmts)?;
-        crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler);
+        crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler)?;
         // B.3.2 Option 3 phase 3e: re-apply rewrite to model_method_bodies
         // so source-AD's inline expansion sees the fused FFI call.
         crate::wrga_prescan::rewrite_model_method_bodies_with_adapter_sites(&mut compiler);
@@ -1540,7 +1540,7 @@ fn compile_entry_impl(
     compiler.register_batched_functions(&vmap_results);
     compiler.compile_datatype_defs(&ast.stmts)?;
     compiler.compile_kernels(&ast.stmts)?;
-    crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler);
+    crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler)?;
     // B.3.2 Option 3 phase 3e: re-apply rewrite to model_method_bodies
     // so source-AD's inline expansion sees the fused FFI call.
     crate::wrga_prescan::rewrite_model_method_bodies_with_adapter_sites(&mut compiler);

@@ -446,14 +446,15 @@ pub(crate) struct CheckArgs {
         pub(crate) wrga_analyze: Option<PathBuf>,
 
         /// WRGA paper §8.3: target GPU for the WRGA roofline analysis (e.g.
-        /// "H100-SXM", "A100-PCIe", "RTX-4090"). Overrides any `target=` set
+        /// "H100-SXM", "A100-PCIe", "rtx4090"). Overrides any `target=` set
         /// on `@wrga(...)` decorators. Looked up in the codegen GPU spec
-        /// database; empty / unknown falls back to the database default.
+        /// database; a name it does not have is an error.
         #[arg(long)]
         pub(crate) wrga_target: Option<String>,
 
-        /// WRGA paper §8.3: emit a structural PEFT comparison report (WRGA vs.
-        /// LoRA / AdaLoRA / GaLore / ReFT) without running codegen output.
+        /// WRGA paper §8.3: emit a comparison of adapter parameter counts (this
+        /// plan vs. LoRA at rank 16, GaLore and ReFT on the same sites) without
+        /// running codegen output.
         /// Pass without value (or `-`) for stdout; provide a path to write to
         /// a file. Mutually exclusive with `--wrga-analyze`. Requires `@wrga`
         /// decorators in the source.

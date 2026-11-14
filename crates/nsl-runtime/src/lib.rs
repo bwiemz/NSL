@@ -302,7 +302,6 @@ pub mod multimodal;
 pub mod cfie;
 pub mod cpdt;
 pub mod sparse;
-pub mod peft;
 
 // WRGA B.3 Task 4: fused LoRA/IA³ adapter FFIs
 pub mod fused_adapter;
@@ -331,7 +330,7 @@ mod fuzz;
 // ===========================================================================
 
 // Facade names are chosen to avoid colliding with real crate-root modules
-// (`autodiff`, `data`, `serving`, `peft`) and with the `core` extern-prelude
+// (`autodiff`, `data`, `serving`) and with the `core` extern-prelude
 // crate.
 
 /// Language builtins and the base runtime: scalars, strings, containers,
@@ -384,7 +383,7 @@ pub mod distributed {
 
 /// Parameter-efficient fine-tuning adapters (LoRA / IA³ / gated-LoRA).
 pub mod finetune {
-    pub use crate::{fused_adapter, peft};
+    pub use crate::fused_adapter;
 }
 
 /// Observability: profiling, tensor tracing, health monitoring, and

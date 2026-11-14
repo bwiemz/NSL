@@ -640,6 +640,10 @@ macro_rules! for_each_runtime_fn {
             // `model_load`: also checks each entry's name against the live parameter
             // at its position (path_ptr, path_len, names_list, param_list).
             [training] nsl_model_load_named(i64, i64, i64, i64) -> () = checkpoint::nsl_model_load_named;
+            // `model_load` of a model with adapters: the tensors past `base_count` are
+            // adapter tensors, which the file may hold or leave out
+            // (path_ptr, path_len, names_list, param_list, base_count).
+            [training] nsl_model_load_with_adapters(i64, i64, i64, i64, i64) -> () = checkpoint::nsl_model_load_with_adapters;
             // Milestone B + item 8: full training-state checkpoint (θ .nslm + .optim
             // sidecar with m/v moments, micro-batch step counter, data position and
             // RNG state). Save: (path_ptr, path_len, names_list, param_list,

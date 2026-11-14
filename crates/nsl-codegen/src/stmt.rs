@@ -2973,9 +2973,6 @@ impl Compiler<'_> {
             if site.target_model != type_name {
                 continue;
             }
-            if site.input_dim == 0 || site.output_dim == 0 {
-                continue;
-            }
             for synth in &site.synthesized_fields {
                 paths.push(format!("{}.{}", prefix, synth));
             }

@@ -184,12 +184,14 @@ pub struct ModelMetadata {
     pub paged_kv_configs: HashMap<String, (i64, i64, i64, i64, i64)>,
     /// Model method AST bodies for source AD inlining: model_type_name -> method_name -> FnDef
     pub model_method_bodies: HashMap<String, HashMap<String, nsl_ast::decl::FnDef>>,
-    /// B.2.1 Task 5.5: shape strings (`Tensor<[out, in], dtype>`) for
-    /// Tensor-typed model fields whose initializer carries a literal
-    /// shape (e.g. `w: Tensor = zeros([8, 8])`). Stored separately from
-    /// `model_field_types` so source-AD's sub-model traversal does not
-    /// accidentally treat tensor shapes as nested model types. Consumed
-    /// by `wrga_adapter_inject::resolve_dims_for_target`.
+    /// B.2.1 Task 5.5: shape strings (`Tensor<[d0, d1], dtype>`, the two
+    /// dims in declaration order) for Tensor-typed model fields whose
+    /// initializer carries a literal shape (e.g. `w: Tensor = zeros([8,
+    /// 8])`). Stored separately from `model_field_types` so source-AD's
+    /// sub-model traversal does not accidentally treat tensor shapes as
+    /// nested model types. Consumed by
+    /// `wrga_adapter_inject::resolve_sites`, which decides which dim is the
+    /// input width from how the model's matmul uses the weight.
     pub model_tensor_field_shapes: HashMap<String, HashMap<String, String>>,
     /// CFTP v10 (item 5): declared tensor rank of `model.field` weight
     /// declarations, keyed as `model_name -> field_name -> rank`.
@@ -1058,6 +1060,10 @@ pub struct Compiler<'a> {
     /// baked into each GatedLoRA call site's `kernel_handle` arg.
     pub fused_gatedlora_ptx_kernels:
         std::collections::HashMap<crate::wrga_fused_ptx::LoraKernelKey, String>,
+    /// Deduplicated fused-IA³ PTX kernel cache, keyed like the two above
+    /// with `rank = 0`. Its registration handles follow the gated-LoRA ones.
+    pub fused_ia3_ptx_kernels:
+        std::collections::HashMap<crate::wrga_fused_ptx::LoraKernelKey, String>,
     pub synth_call_names: std::collections::HashMap<nsl_ast::NodeId, String>,
 
     // ── Calibration retention pass (Task 4) ─────────────────────
@@ -1292,6 +1298,7 @@ impl<'a> Compiler<'a> {
             csha_forward_saves: std::collections::HashMap::new(),
             fused_ptx_kernels: std::collections::HashMap::new(),
             fused_gatedlora_ptx_kernels: std::collections::HashMap::new(),
+            fused_ia3_ptx_kernels: std::collections::HashMap::new(),
             synth_call_names: std::collections::HashMap::new(),
             retention_arena_data_id: None,
             retention_offsets: std::collections::HashMap::new(),
