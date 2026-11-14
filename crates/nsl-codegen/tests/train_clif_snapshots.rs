@@ -531,3 +531,51 @@ snapshots! {
         ..source_ad()
     };
 }
+
+/// The forward attention launchers return non-zero when they refuse a launch
+/// (a kernel that cannot serve the shape, a module that fails to load), and
+/// the output tensor they were to fill is allocated zeroed. The call sites in
+/// a method body bound the return code to `_err` and dropped it, so a refused
+/// launch handed zeros to the rest of the program as the attention output.
+/// Every direct call of a forward launcher must have its result compared
+/// with zero and a trap behind the comparison.
+#[test]
+fn a_refused_attention_launch_traps() {
+    const LAUNCHERS: [&str; 3] =
+        ["nsl_flash_attention", "nsl_flash_attention_csha", "nsl_flash_attention_csha_with_saves"];
+    let csha = CompileOptions {
+        csha: nsl_codegen::CshaOptions { mode: Some("auto".to_string()), ..Default::default() },
+        ..source_ad()
+    };
+    for (name, options) in [("attention_source_ad", source_ad()), ("attention_csha", csha)] {
+        let text = render(&compile_capturing_ir(name, &fixture("attention.nsl"), &options));
+        let mut launches = 0;
+        for function in text.split("--- IR: ").skip(1) {
+            let label = function.lines().next().unwrap_or("");
+            for line in function.lines() {
+                // `fnN = <symbol> sigM` declares a callee in this function.
+                let Some((func_ref, rest)) = line.trim().split_once(" = ") else { continue };
+                let Some(symbol) = rest.split_whitespace().next() else { continue };
+                if !func_ref.starts_with("fn") || !LAUNCHERS.contains(&symbol) {
+                    continue;
+                }
+                for call in function.lines().filter(|l| l.contains(&format!("call {func_ref}("))) {
+                    launches += 1;
+                    let result = call.trim().split(" = ").next().unwrap_or("");
+                    assert!(
+                        result.starts_with('v') && !result.contains(' '),
+                        "{name}, {label}: the return code of {symbol} is dropped: `{}`",
+                        call.trim()
+                    );
+                    let after = &function[function.find(call).unwrap() + call.len()..];
+                    let compared = after.lines().find(|l| l.contains(&format!("icmp ne {result},")));
+                    assert!(
+                        compared.is_some() && after.contains("trap user3"),
+                        "{name}, {label}: the return code {result} of {symbol} is never checked"
+                    );
+                }
+            }
+        }
+        assert!(launches > 0, "{name}: the program launched no forward attention kernel");
+    }
+}
