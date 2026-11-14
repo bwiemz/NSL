@@ -359,11 +359,8 @@ pub extern "C" fn nsl_qtensor_quantize(
 
     // The axis indexes the shape below; an axis outside the tensor's rank
     // read whatever followed the shape array.
-    if granularity != GRAN_PER_TENSOR && ndim > 0 && (gran_axis < 0 || gran_axis >= ndim) {
-        crate::fatal::die(
-            crate::fatal::Fatal::ShapeMismatch,
-            &format!("quantize: axis {gran_axis} is out of range for a {ndim}-D tensor"),
-        );
+    if let Some(msg) = granularity_axis_error(granularity, ndim, gran_axis) {
+        crate::fatal::die(crate::fatal::Fatal::ShapeMismatch, &msg);
     }
     if granularity == GRAN_PER_GROUP && group_size <= 0 {
         crate::fatal::die(
@@ -725,6 +722,38 @@ pub extern "C" fn nsl_qtensor_shape(qtensor_ptr: i64) -> i64 {
         0,
     ));
     Box::into_raw(out) as i64
+}
+
+/// The refusal for a per-channel or per-group request whose axis the tensor
+/// does not have. A 0-D tensor has no axis at all: its shape array is empty,
+/// so any axis would read past it.
+fn granularity_axis_error(granularity: i64, ndim: i64, axis: i64) -> Option<String> {
+    if granularity == GRAN_PER_TENSOR || (axis >= 0 && axis < ndim) {
+        return None;
+    }
+    Some(format!("quantize: axis {axis} is out of range for a {ndim}-D tensor"))
+}
+
+#[cfg(test)]
+mod granularity_axis_tests {
+    use super::*;
+
+    #[test]
+    fn a_scalar_has_no_axis_to_quantize_along() {
+        for gran in [GRAN_PER_CHANNEL, GRAN_PER_GROUP] {
+            let msg = granularity_axis_error(gran, 0, 0).expect("a 0-D tensor has no axis 0");
+            assert!(msg.contains("axis 0 is out of range for a 0-D tensor"), "{msg}");
+        }
+        assert_eq!(granularity_axis_error(GRAN_PER_TENSOR, 0, 0), None);
+    }
+
+    #[test]
+    fn the_axis_must_lie_inside_the_rank() {
+        assert_eq!(granularity_axis_error(GRAN_PER_CHANNEL, 2, 0), None);
+        assert_eq!(granularity_axis_error(GRAN_PER_CHANNEL, 2, 1), None);
+        assert!(granularity_axis_error(GRAN_PER_CHANNEL, 2, 2).is_some());
+        assert!(granularity_axis_error(GRAN_PER_GROUP, 2, -1).is_some());
+    }
 }
 
 #[cfg(test)]

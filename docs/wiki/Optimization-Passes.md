@@ -446,9 +446,9 @@ the executable) and does no weight-aware compilation.
 Limits. A folded constant is the f64 product rounded once to the
 parameters' dtype, which can differ in the last bit from the product the
 program would have computed. A one-element weight is no longer embedded as an
-immediate (only tensor fields are loaded; the note says so). The
-`NSL_M52C_SPARSE_MATMUL=1` path is withheld and is not covered by the rules
-above.
+immediate (only tensor fields are loaded; the note says so). The weight-aware
+sparse matmul that `NSL_M52C_SPARSE_MATMUL=1` used to enable has been removed;
+a weight above the sparse threshold is only reported, and its matmul is dense.
 
 Gates: `crates/nsl-cli/tests/weights_flag_binds_model_gate.rs` (loaded
 values, refused rewrites, the startup check on a built program),

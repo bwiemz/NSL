@@ -865,18 +865,8 @@ fn ilp_resident_bytes(
     }
 }
 
-/// Smallest resident footprint the moment-precision axis can give a layer
-/// without dropping below fp16 — the identity structural decision (max heads,
-/// max FFN, no adapter, no CSHA, no packing, FASE off) charged at 16-bit m and
-/// v. This is the "fp16-moment floor": if the budget cannot fit even this, no
-/// moment-precision decision the solver can make will help, so the budget path
-/// hard-fails with a required-vs-budget diagnostic (see `wggo::run`).
-pub fn fp16_moment_floor_bytes(lut: &LayerCostLut) -> u64 {
-    moment_floor_bytes(lut, 16, 16)
-}
-
 /// The identity-structural resident footprint of a layer at an EXPLICIT moment
-/// precision — the generalization of [`fp16_moment_floor_bytes`]. Used by the
+/// precision. Used by the
 /// budget refusal to size each layer at its OWN role-permitted precision floor
 /// (32-bit for a critical-sensitivity layer such as the embedding / LM-head,
 /// 16-bit for a quantizable transformer block) instead of assuming every layer

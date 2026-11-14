@@ -709,8 +709,21 @@ with `crates/` are relative to `crates/nsl-codegen/src/`.
 
 ### Open
 
-None of the defects listed in this part remains open. Limits of the design
-that the fixes do not change are stated in Part 3: the cost coefficients are
+None of the defects listed above remains open. Limits of the design that the
+fixes do not change are stated in Part 3: the cost coefficients are
 constants, FFN thinning is not a decision, the head keep-mask reaches
 generated code as a count only, and gradient scoring cannot be reached from
-the command line.
+the command line. An independent review of the fixes found two smaller
+points, recorded here:
+
+- Under `zero_stage_search` (off by default), the applied plan shards every
+  non-activation byte of a layer by the parameter shard factor, while
+  moments shard by the optimizer-state factor and gradients by the gradient
+  factor; a stage-1 or stage-2 layer is then reported at its unsharded size.
+  An over-report, not reachable with the default settings. `apply` in
+  `crates/nsl-codegen/src/wggo_apply.rs`. By reading the code only.
+- Suspected: a trained parameter that the step never reads is not on the
+  forward tape, so the shapes WGGO derives leave it out, although it still
+  gets optimizer moments; the reported memory and the budget check would be
+  low by its size. `derive_for` in `crates/nsl-codegen/src/wggo_model_shape.rs`.
+  By reading the code only; not reproduced.
