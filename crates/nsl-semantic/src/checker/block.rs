@@ -23,26 +23,62 @@ impl<'a> TypeChecker<'a> {
         // cannot disagree (the pre-contract asymmetry — `nsl check` green
         // on headers `nsl build` refused, and vice versa — was the bug;
         // see crate::train_config's module doc).
-        if let Err(diags) = crate::train_config::resolve_train_config(
+        let train_cfg = match crate::train_config::resolve_train_config(
             train,
             &|sym| self.resolve_name(sym),
             crate::train_config::TrainConfigPurpose::UserTrainBlock,
         ) {
-            self.diagnostics.extend(diags);
-        }
+            Ok(cfg) => Some(cfg),
+            Err(diags) => {
+                self.diagnostics.extend(diags);
+                None
+            }
+        };
 
         // Same contract for the optimizer:/scheduler:/callbacks: sections
         // (crate::optim_config's module doc records the pre-contract holes:
         // typo'd kwargs silently defaulted, unknown scheduler names
         // silently trained at constant lr, unknown callback names were
         // never emitted).
-        if let Err(diags) = crate::optim_config::resolve_optim_config(
+        let optim_cfg = match crate::optim_config::resolve_optim_config(
             &train.sections,
             train.span,
             &|sym| self.resolve_name(sym),
             crate::train_config::TrainConfigPurpose::UserTrainBlock,
         ) {
-            self.diagnostics.extend(diags);
+            Ok(cfg) => Some(cfg),
+            Err(diags) => {
+                self.diagnostics.extend(diags);
+                None
+            }
+        };
+
+        // Under accumulation the schedule's step arguments are counted in
+        // micro-batches unless the header says otherwise. That is a unit
+        // nobody can read off the source, so say it once, at compile time.
+        if let (Some(train_cfg), Some(optim_cfg)) = (&train_cfg, &optim_cfg) {
+            let stepped = optim_cfg.scheduler.as_ref().is_some_and(|s| {
+                !matches!(s, crate::optim_config::ResolvedScheduler::ConstantLr)
+            });
+            if let Some(message) = crate::train_config::schedule_unit_warning(
+                train_cfg.grad_accumulation,
+                train_cfg.schedule_unit,
+                stepped,
+            ) {
+                // On the `grad_accumulation` argument: the block's own span
+                // runs to its last line and would quote all of it.
+                let at = train
+                    .config
+                    .iter()
+                    .find(|arg| {
+                        arg.name.is_some_and(|n| self.resolve_name(n) == "grad_accumulation")
+                    })
+                    .map_or(train.span, |arg| arg.span);
+                self.diagnostics.push(
+                    Diagnostic::warning(message)
+                        .with_label(at, "a scheduler: section is combined with this"),
+                );
+            }
         }
 
         let mut has_step = false;

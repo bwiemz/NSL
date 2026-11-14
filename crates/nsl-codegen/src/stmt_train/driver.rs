@@ -420,6 +420,7 @@ impl Compiler<'_> {
             checkpoint_save_path,
             checkpoint_every,
             checkpoint_load_path,
+            schedule_in_optimizer_steps,
         } = self.extract_train_config(builder, train)?;
 
         // ── 2. Resolve the optimizer/scheduler/callbacks contract ───────
@@ -580,6 +581,7 @@ impl Compiler<'_> {
             },
             schedule: TrainSchedule {
                 grad_accumulation_steps,
+                schedule_in_optimizer_steps,
                 checkpoint_save_path: checkpoint_save_path.clone(),
                 checkpoint_every,
             },
