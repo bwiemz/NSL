@@ -17,7 +17,6 @@
 from nsl.nn.losses import mse_loss
 
 dataset PretrainCorpus("/data/pile"):
-    source = "/data/pile.bin"
     packing = true
     max_sequence_length = 2048
     mean_doc_length = 400
