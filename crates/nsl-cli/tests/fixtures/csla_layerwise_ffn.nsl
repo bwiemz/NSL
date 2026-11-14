@@ -9,8 +9,9 @@
 #   - 1664 tokens / (batch 2 x seq 64) = 13 micro-batches per epoch;
 #   - grad_accumulation=2 -> epochs=1 gives 6 optimizer steps + ONE trailing
 #     partial window (exercises the teardown sweep: buffered saves + batch
-#     dict of the tail must be swept, and the tail must not step — exactly
-#     like the baseline's discarded m_partial);
+#     dict of the tail must be swept, and the tail does not step. The
+#     interleaved baseline steps on such a tail unless it is compiled with
+#     NSL_FASE_FLUSH_TAIL=0, which the parity harnesses set);
 #   - the harness rewrites "epochs=1" -> "epochs=2" for the straddle case:
 #     window 7 then spans the epoch boundary (micro-batches 13 + 14), which
 #     the global step counter's modulo handles identically to the baseline.

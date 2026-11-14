@@ -166,9 +166,10 @@ pub(crate) fn emit_train_teardown(
 
     // CSLA: sweep the trailing partial window. A window that never
     // reached the modulo boundary left its buffered saves + batch dicts
-    // alive (the baseline discards the same tail's m_partial content —
-    // its gradients never influence θ either way, so parity holds; this
-    // sweep is purely against leaks). Every entry here is stale: its
+    // alive, and this schedule cannot step on them (the interleaved
+    // schedule does: `emit_trailing_window_flush`, which has already
+    // printed the dropped-window warning for this one). The sweep is
+    // purely against leaks. Every entry here is stale: its
     // iteration's callbacks are long done, so loss slots free
     // unconditionally too.
     if let (Some((saves_outer_var, dicts_var)), Some(sweep)) =

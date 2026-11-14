@@ -30,7 +30,7 @@ const KNOWN_DYNAMIC_READS: &[(&str, &str)] = &[
     // (roadmap A5). The names are this crate's, so nothing unregistered can
     // be read there.
     ("crates/nsl-runtime/src/env_record.rs", "name"),
-    // `CompileOptions::exec_fingerprint` reads its five compile-time
+    // `CompileOptions::exec_fingerprint` reads its compile-time
     // behavior-tier variables through an injected `env(name)` closure so
     // the unit test can drive it without touching the process environment;
     // the closure's one `env::var(name)` is this read. The names are

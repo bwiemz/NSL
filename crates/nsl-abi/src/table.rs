@@ -815,6 +815,9 @@ macro_rules! for_each_runtime_fn {
             [optimizer] nsl_fase_sum_sq_list(i64) -> f64 = fase_step::nsl_fase_sum_sq_list;
             // FASE Deferred bias correction: 1/(1 - base^step).  Scalar, no tensor args.
             [optimizer] nsl_bias_correction_inv(f64, i64) -> f64 = fase_bc::nsl_bias_correction_inv;
+            // A trailing partial accumulation window that was not stepped on:
+            // (pending micro-batches, window, reason code) -> stderr warning.
+            [optimizer] nsl_train_partial_window_dropped(i64, i64, i64) -> () = fase_bc::nsl_train_partial_window_dropped;
             // AdamW parameter groups: resolve ONE param's weight decay from its
             // compile-time role flag + its runtime rank.
             // (param, static_exempt, exempt_non_rank2, wd) -> wd_for_this_param
@@ -1352,6 +1355,6 @@ mod tests {
     fn table_is_the_recorded_size() {
         // The count is pinned so a row dropped by a bad merge is noticed; move
         // it with a row that is deliberately added or removed.
-        assert_eq!(RUNTIME_ABI.len(), 678);
+        assert_eq!(RUNTIME_ABI.len(), 679);
     }
 }

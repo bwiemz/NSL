@@ -2701,6 +2701,10 @@ impl Compiler<'_> {
             },
         )?;
 
+        // A run that ends inside an accumulation window steps once more on
+        // the micro-batches that window holds (stmt_train/optimizer_step.rs).
+        self.emit_trailing_window_flush(builder, state, &plan, &emit)?;
+
         // Free the block's lists, sweep the trailing CSLA window, restore
         // streamed weights, print the graphs banner (stmt_train/teardown.rs).
         emit_train_teardown(

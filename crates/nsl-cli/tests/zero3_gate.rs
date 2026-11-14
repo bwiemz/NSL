@@ -68,6 +68,15 @@ fn run_nsl_with_env(
         .arg(&prog)
         .current_dir(&tmp)
         .env("NSL_STDLIB_PATH", root.join("stdlib"))
+        // A run that ends inside an accumulation window: the interleaved
+        // schedule steps once more on what the window holds, and the
+        // layer-major schedule (`--layerwise-accum`, which `--zero-stage 3`
+        // requires) cannot. The fixtures
+        // here end one micro-batch into a window, and the comparisons are
+        // of the windows both schedules run, so every arm is compiled with
+        // that last step off. (It has its own gate,
+        // `accumulation_full_buffer_gate.rs`.)
+        .env("NSL_FASE_FLUSH_TAIL", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for (k, v) in envs {

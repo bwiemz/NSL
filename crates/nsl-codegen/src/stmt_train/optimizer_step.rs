@@ -1125,4 +1125,151 @@ impl Compiler<'_> {
 
         Ok(())
     }
+
+    /// Step once more, after the epoch loop, on a trailing partial
+    /// accumulation window.
+    ///
+    /// The step fires when `(step_count + 1) % N == 0`, so a run whose
+    /// micro-batch count is not a multiple of `N` used to end with up to
+    /// `N - 1` gradients computed, accumulated and then freed with the
+    /// buffers: 10 micro-batches at `grad_accumulation = 4` ended with the
+    /// weights of 8, with no message.
+    ///
+    /// The buffers hold `sum(g_i) / N` over the `k` pending micro-batches
+    /// (every accumulation site scales by the recipe's `1/N`), so one
+    /// in-place multiply by `N / k` makes them the mean over what the window
+    /// actually holds. The ordinary optimizer step is then emitted a second
+    /// time on that mean: same clip of the mean, same parameter groups, and
+    /// a bias-correction count one past the last full window. The learning
+    /// rate is the one the last micro-batch ran at.
+    ///
+    /// Under `--zero-stage` 1 or 2 the step is the same on every rank: the
+    /// ranks run the same number of micro-batches, so each reaches this
+    /// point with the same remainder and enters the step's collectives
+    /// together, as it does for a step inside the loop.
+    ///
+    /// The layer-major window schedule (`--layerwise-accum`, and with it
+    /// `--zero-stage 3`) cannot do this: it keeps saved activations, not
+    /// gradients, between micro-batches, and its window backward is built
+    /// for exactly `N` of them. It prints a warning at run time instead
+    /// and its pending micro-batches are not applied. So a run that ends
+    /// inside a window is the one case where `--layerwise-accum` is not
+    /// bit-identical to the interleaved schedule. `NSL_FASE_FLUSH_TAIL=0`
+    /// (read at compile time) makes the interleaved schedule drop the tail
+    /// too, with the same warning, which is what a comparison of the two
+    /// schedules on such a run needs.
+    ///
+    /// Runs with the epoch loop's exit block current; must precede the
+    /// teardown, which frees the lists the step reads.
+    pub(crate) fn emit_trailing_window_flush(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        plan: &TrainPlan,
+        emit: &EmitState,
+    ) -> Result<(), CodegenError> {
+        let window = plan.schedule.grad_accumulation_steps;
+        if window <= 1 {
+            return Ok(());
+        }
+        let EmitState { accum_list, num_params_val, step_count_var, .. } = *emit;
+
+        let sc = builder.use_var(step_count_var);
+        let window_c = builder.ins().iconst(cl_types::I64, window);
+        let pending = builder.ins().srem(sc, window_c);
+        let has_pending = builder.ins().icmp_imm_s(IntCC::SignedGreaterThan, pending, 0);
+        let flush_block = builder.create_block();
+        let join_block = builder.create_block();
+        builder.ins().brif(has_pending, flush_block, &[], join_block, &[]);
+        builder.switch_to_block(flush_block);
+        builder.seal_block(flush_block);
+        state.current_block = Some(flush_block);
+
+        // Why the window is dropped, when it is: the runtime's message
+        // names the cause (`partial_window_dropped_message`, `fase_bc.rs`).
+        let dropped_because = if plan.spec.csla_active {
+            Some(0)
+        } else if std::env::var("NSL_FASE_FLUSH_TAIL").ok().as_deref() == Some("0") {
+            Some(1)
+        } else {
+            None
+        };
+        match accum_list.filter(|_| dropped_because.is_none()) {
+            None => {
+                let reason = builder.ins().iconst(cl_types::I64, dropped_because.unwrap_or(0));
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_train_partial_window_dropped",
+                    &[pending, window_c, reason],
+                )?;
+            }
+            Some(accum) => {
+                // sum(g)/N  ->  sum(g)/k.
+                let window_f = builder.ins().f64const(window as f64);
+                let pending_f = builder.ins().fcvt_from_sint(cl_types::F64, pending);
+                let rescale = builder.ins().fdiv(window_f, pending_f);
+                let i_var = builder.declare_var(cl_types::I64);
+                let zero = builder.ins().iconst(cl_types::I64, 0);
+                builder.def_var(i_var, zero);
+                let hdr = builder.create_block();
+                let body = builder.create_block();
+                let exit = builder.create_block();
+                builder.ins().jump(hdr, &[]);
+                builder.switch_to_block(hdr);
+                let i = builder.use_var(i_var);
+                let more = builder.ins().icmp(IntCC::SignedLessThan, i, num_params_val);
+                builder.ins().brif(more, body, &[], exit, &[]);
+                builder.switch_to_block(body);
+                builder.seal_block(body);
+                let buf = self.compile_call_by_name(builder, "nsl_list_get", &[accum, i])?;
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_tensor_mul_scalar_inplace",
+                    &[buf, rescale],
+                )?;
+                let next = builder.ins().iadd_imm_s(i, 1);
+                builder.def_var(i_var, next);
+                builder.ins().jump(hdr, &[]);
+                builder.seal_block(hdr);
+                builder.switch_to_block(exit);
+                builder.seal_block(exit);
+                state.current_block = Some(exit);
+
+                // The step derives its optimizer-step count as
+                // `(step_count + 1) / N`. Hand it the count of the micro-batch
+                // that would have closed this window, so the flush is step
+                // `full windows + 1`; the block's own counter is not touched.
+                let closing = builder.ins().isub(sc, pending);
+                let closing = builder.ins().iadd_imm_s(closing, window - 1);
+                let flush_step_var = builder.declare_var(cl_types::I64);
+                builder.def_var(flush_step_var, closing);
+                let always_var = builder.declare_var(cl_types::I8);
+                let always = builder.ins().iconst(cl_types::I8, 1);
+                builder.def_var(always_var, always);
+                let flush_emit = EmitState { step_count_var: flush_step_var, ..*emit };
+                // Every pending gradient is already in the buffers (the
+                // per-micro-batch accumulation ran for each of them), which
+                // is the state the step expects when the source-AD hook has
+                // accumulated: no gradient list to fold in or free.
+                let no_grads = builder.ins().iconst(cl_types::I64, 0);
+                self.emit_optimizer_step(
+                    builder,
+                    state,
+                    OptimizerStepInputs {
+                        plan,
+                        emit: &flush_emit,
+                        fase_hook_active: true,
+                        grads_list: no_grads,
+                        should_step_var: always_var,
+                    },
+                )?;
+            }
+        }
+
+        builder.ins().jump(join_block, &[]);
+        builder.switch_to_block(join_block);
+        builder.seal_block(join_block);
+        state.current_block = Some(join_block);
+        Ok(())
+    }
 }

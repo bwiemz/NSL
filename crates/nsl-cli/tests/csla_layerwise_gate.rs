@@ -112,6 +112,14 @@ fn run_program_env(
         .arg(&prog)
         .current_dir(&tmp)
         .env("NSL_STDLIB_PATH", root.join("stdlib"))
+        // A run that ends inside an accumulation window: the interleaved
+        // schedule steps once more on what the window holds, and the
+        // layer-major schedule (`--layerwise-accum`) cannot. The fixtures
+        // here end one micro-batch into a window, and the comparisons are
+        // of the windows both schedules run, so every arm is compiled with
+        // that last step off. (It has its own gate,
+        // `accumulation_full_buffer_gate.rs`.)
+        .env("NSL_FASE_FLUSH_TAIL", "0")
         // Anti-vacuity counter report on every arm; deterministic embedding
         // scatter for the CPU cases (harmless there, load-bearing on GPU
         // EmbedCpu-style runs).
@@ -335,8 +343,9 @@ fn parity_case_with_schedule(
         csla.stderr
     );
     // Anti-vacuity: the window backward fired exactly once per complete
-    // accumulation window (trailing partial windows never fire, matching the
-    // baseline's discarded m_partial tail).
+    // accumulation window (trailing partial windows never fire; the
+    // baseline arm drops the same tail because the harness compiles it
+    // with NSL_FASE_FLUSH_TAIL=0).
     assert_eq!(
         window_phase_count(&csla.stderr),
         Some(expected_windows),

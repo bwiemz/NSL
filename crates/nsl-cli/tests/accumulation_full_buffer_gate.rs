@@ -52,17 +52,31 @@ const MICRO_BATCHES: usize = 8;
 /// Standard accumulation: mean gradient over the window, one global-norm
 /// clip of that mean, AdamW with `t` counting optimizer steps.
 fn reference(clip: Option<f64>) -> f64 {
+    reference_run(MICRO_BATCHES, clip)
+}
+
+/// The same, for a run of `micro_batches`. When that is not a multiple of
+/// the window, the run ends with one more step on the mean of the
+/// micro-batches the last window holds: the gradients are summed and
+/// divided by their own count, not by `WINDOW`.
+fn reference_run(micro_batches: usize, clip: Option<f64>) -> f64 {
     let mut w = [1.0_f64; 2];
     let (mut m, mut v) = ([0.0_f64; 2], [0.0_f64; 2]);
     let mut acc = [0.0_f64; 2];
+    let mut held = 0_usize;
     let mut scale = 1.0_f64;
     let mut t = 0_i32;
-    for micro in 0..MICRO_BATCHES {
+    for micro in 0..micro_batches {
         let g = 2.0 * scale * scale * (w[0] + w[1]);
         for a in &mut acc {
-            *a += g / WINDOW as f64;
+            *a += g;
         }
-        if (micro + 1) % WINDOW == 0 {
+        held += 1;
+        if held == WINDOW || micro + 1 == micro_batches {
+            for a in &mut acc {
+                *a /= held as f64;
+            }
+            held = 0;
             t += 1;
             if let Some(max_norm) = clip {
                 let norm = (acc[0] * acc[0] + acc[1] * acc[1]).sqrt();
@@ -86,6 +100,10 @@ fn reference(clip: Option<f64>) -> f64 {
 }
 
 fn program(decorator: &str, train_args: &str) -> String {
+    program_for(MICRO_BATCHES, decorator, train_args)
+}
+
+fn program_for(micro_batches: usize, decorator: &str, train_args: &str) -> String {
     format!(
         r#"from nsl.nn.losses import mse_loss
 
@@ -101,7 +119,7 @@ let x = ones([4, 2])
 let y = zeros([4, 1])
 
 {decorator}
-train(model = m, epochs = {MICRO_BATCHES}, grad_accumulation = {WINDOW}{train_args}):
+train(model = m, epochs = {micro_batches}, grad_accumulation = {WINDOW}{train_args}):
     optimizer: AdamW(lr = {LR}, beta1 = {BETA1}, beta2 = {BETA2}, eps = {EPS}, weight_decay = {WEIGHT_DECAY})
     step(batch):
         let pred = m.forward(x)
@@ -200,6 +218,153 @@ fn the_clip_bounds_the_window_mean_on_every_path() {
             trained_weight(&source, &["--source-ad"]),
             want,
             &format!("{what}, source AD"),
+        );
+    }
+}
+
+/// The f64 reference above against `torch.optim.AdamW` (torch 2.x, float64)
+/// run on the same fixture: `backward()` per micro-batch, `w.grad /= held`
+/// at each step, `clip_grad_norm_`, `step()`, with a final step on a
+/// trailing partial window.
+#[test]
+fn the_reference_is_pytorch_adamw() {
+    for (micro_batches, clip, torch) in [
+        (8, None, 0.998_079_008_032_501_3),
+        (8, Some(0.5), 0.999_277_628_394_509_6),
+        (10, None, 0.997_189_820_979_887_6),
+        (10, Some(0.5), 0.998_916_496_762_292_2),
+        (3, None, 0.999_030_346_232_179_2),
+        (11, None, 0.997_218_076_737_901_9),
+    ] {
+        let ours = reference_run(micro_batches, clip);
+        assert!(
+            (ours - torch).abs() < 1e-12,
+            "{micro_batches} micro-batches, clip {clip:?}: reference {ours}, PyTorch {torch}"
+        );
+    }
+}
+
+/// A run of 10 micro-batches at a window of 4 used to end with the weights
+/// of a run of 8: the last two gradients were computed, accumulated and
+/// freed with the buffers. The fixture's gradient grows by 1.5625 per
+/// micro-batch, so the third step is the largest of the three and its
+/// absence is far outside the tolerance.
+#[test]
+fn the_fixture_separates_a_dropped_or_unscaled_trailing_window() {
+    for clip in [None, Some(0.5)] {
+        let flushed = reference_run(10, clip);
+        let dropped = reference_run(8, clip);
+        assert!(
+            (flushed - dropped).abs() > 2e-4,
+            "clip {clip:?}: flushed {flushed}, dropped {dropped}"
+        );
+    }
+    // Dividing the two pending gradients by the window (4) instead of by
+    // their count (2) halves the gradient of the last step. With eps = 1.0
+    // that is a different update.
+    let mut w = [1.0_f64; 2];
+    let (mut m, mut v, mut acc) = ([0.0_f64; 2], [0.0_f64; 2], [0.0_f64; 2]);
+    let (mut scale, mut t) = (1.0_f64, 0_i32);
+    for micro in 0..10 {
+        let g = 2.0 * scale * scale * (w[0] + w[1]);
+        for a in &mut acc {
+            *a += g / WINDOW as f64;
+        }
+        if (micro + 1) % WINDOW == 0 || micro == 9 {
+            t += 1;
+            for j in 0..2 {
+                m[j] = BETA1 * m[j] + (1.0 - BETA1) * acc[j];
+                v[j] = BETA2 * v[j] + (1.0 - BETA2) * acc[j] * acc[j];
+                let m_hat = m[j] / (1.0 - BETA1.powi(t));
+                let v_hat = v[j] / (1.0 - BETA2.powi(t));
+                w[j] -= LR * (m_hat / (v_hat.sqrt() + EPS) + WEIGHT_DECAY * w[j]);
+                acc[j] = 0.0;
+            }
+        }
+        scale *= 1.25;
+    }
+    let unscaled = w[0];
+    assert!(
+        (reference_run(10, None) - unscaled).abs() > 2e-5,
+        "mean over the window size would not be told apart: {unscaled}"
+    );
+}
+
+#[test]
+fn a_trailing_partial_window_is_stepped_on_its_own_mean() {
+    for (clip, train_args) in [(None, ""), (Some(0.5), ", grad_clip = 0.5")] {
+        let want = reference_run(10, clip);
+        for (decorator, what) in [
+            ("", "default (deferred)"),
+            ("@fase(mode = full_buffer)", "@fase(mode = full_buffer)"),
+            ("@fase(mode = off)", "@fase(mode = off)"),
+        ] {
+            let source = program_for(10, decorator, train_args);
+            for args in [&[][..], &["--source-ad"][..], &["--training-reference"][..]] {
+                assert_close(
+                    trained_weight(&source, args),
+                    want,
+                    &format!("10 micro-batches, {what}, clip {clip:?}, flags {args:?}"),
+                );
+            }
+        }
+    }
+}
+
+/// The same when the micro-batches come from a `DataLoader`: ten batches in
+/// one epoch, so the loop that ends inside a window is the loader's. The
+/// step ignores the batch's contents, so the reference is unchanged.
+#[test]
+fn a_trailing_partial_window_is_flushed_after_a_dataloader_epoch() {
+    let source = format!(
+        r#"from nsl.nn.losses import mse_loss
+
+model Linear:
+    w: Tensor = ones([2, 1])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+let m = Linear()
+
+let x = ones([4, 2])
+let y = zeros([4, 1])
+let corpus = arange(80)
+let loader = DataLoader(corpus, batch_size = 2, seq_len = 4, shuffle = false, drop_last = true)
+
+train(model = m, epochs = 1, grad_accumulation = {WINDOW}):
+    optimizer: AdamW(lr = {LR}, beta1 = {BETA1}, beta2 = {BETA2}, eps = {EPS}, weight_decay = {WEIGHT_DECAY})
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y)
+    callbacks:
+        on_step(step, loss):
+            x = x * 1.25
+
+print(m.w.sum())
+"#
+    );
+    let want = reference_run(10, None);
+    assert_close(trained_weight(&source, &[]), want, "10 loader batches, tape AD");
+    assert_close(trained_weight(&source, &["--source-ad"]), want, "10 loader batches, source AD");
+}
+
+/// One and three pending micro-batches, and a run shorter than one window
+/// (whose only step is the flush, at `t = 1`).
+#[test]
+fn every_remainder_of_the_window_is_flushed() {
+    for micro_batches in [3, 5, 7, 9, 11] {
+        let want = reference_run(micro_batches, None);
+        let source = program_for(micro_batches, "", "");
+        assert_close(
+            trained_weight(&source, &[]),
+            want,
+            &format!("{micro_batches} micro-batches, tape AD"),
+        );
+        assert_close(
+            trained_weight(&source, &["--source-ad"]),
+            want,
+            &format!("{micro_batches} micro-batches, source AD"),
         );
     }
 }

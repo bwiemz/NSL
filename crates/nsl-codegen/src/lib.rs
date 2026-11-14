@@ -2155,6 +2155,14 @@ impl CompileOptions {
                 file_digest(self.wggo.weights.as_deref())
             ));
         }
+        // The final step on a trailing partial accumulation window, turned
+        // off at compile time. Emitted only when it is off, for the reason
+        // the prune keys are: every checkpoint written before the switch
+        // existed came from a build with no such key, and a key on every
+        // build would refuse them all.
+        if env("NSL_FASE_FLUSH_TAIL").as_deref() == Some("0") {
+            fields.push("fase_flush=0".to_string());
+        }
         fields.join(",")
     }
 }
@@ -2773,6 +2781,13 @@ mod exec_fingerprint_tests {
         // Only the values changed, never the key set or order.
         let keys = |fp: &str| fp.split(',').map(|f| f.split('=').next().unwrap().to_string()).collect::<Vec<_>>();
         assert_eq!(keys(&set), keys(&unset));
+
+        // The flush switch is recorded when it is off and absent otherwise.
+        assert!(!unset.contains("fase_flush"), "{unset}");
+        let off = o.exec_fingerprint_with_env(|name| (name == "NSL_FASE_FLUSH_TAIL").then(|| "0".into()));
+        assert_eq!(off, format!("{unset},fase_flush=0"));
+        let on = o.exec_fingerprint_with_env(|name| (name == "NSL_FASE_FLUSH_TAIL").then(|| "1".into()));
+        assert_eq!(on, unset);
     }
 
     #[test]
