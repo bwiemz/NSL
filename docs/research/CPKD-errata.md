@@ -298,9 +298,8 @@ Defects found in this code are listed in Part 5.
 The review also ran the code. This part lists what it found wrong in the
 implementation, as distinct from the proposal's own errors in Part 1. Fixed
 items are described in `CHANGELOG.md` under "Unreleased"; the open list is as
-of 2026-11-13. Each item ends with how it was established: reproduced by
-running, numeric check, or by reading the code only. File names given without
-a directory are under `crates/nsl-codegen/src/`.
+of 2026-11-13. File names given without a directory are under
+`crates/nsl-codegen/src/`.
 
 ### Fixed
 
@@ -363,28 +362,48 @@ a directory are under `crates/nsl-codegen/src/`.
   each segment (the deepest on a tie or with no scores), and always pairs
   the last student layer with the last teacher layer. A layer without a
   score is reported as having none. Unit tests in `cpkd_student.rs`.
+- A target the fused kernels could not use gave a NaN or infinite loss and
+  the step still updated: the kernels skip only target -100 while the
+  lowering's mask ignores every negative target, so -1 printed `NaN`, and a
+  target equal to the vocabulary size printed `inf`. The host-side copy of
+  the targets that both fused losses make before a launch now rewrites
+  every negative target to -100 and aborts, naming the row, on a target at
+  or above `vocab_size` (`normalize_fused_targets` in
+  `crates/nsl-runtime/src/fused_linear_ce.rs`), for `@fused_lm_ce` as well
+  as `@fused_kl_ce`. With -1 in place of -100 the fused loss and updates
+  match PyTorch; tests `crates/nsl-cli/tests/fused_kl_ce_gpu_gate.rs` (GPU)
+  and the unit tests beside `normalize_fused_targets`.
+- A fused KL-CE kernel launch that failed returned a code the compiled step
+  discarded, leaving a zero-filled loss buffer: loss 0, zero gradients, and
+  training continued. `nsl_fused_kl_ce_forward` and
+  `nsl_fused_kl_ce_backward` now report the CUDA error and exit with the
+  runtime's CUDA-driver code (13); a runtime built without CUDA exits the
+  same way instead of returning -1. Triggered on the GPU by asking a valid
+  module for an entry it does not have
+  (`a_failed_launch_exits_instead_of_returning` in
+  `crates/nsl-codegen/tests/cpkd_fused_kl_ce_numerical.rs`).
+- A wrong `batch_size` or `seq_len` on `@fused_kl_ce` aborted with a
+  message about "the @fused_lm_ce decorator", which the program does not
+  contain. `nsl_fused_lce_targets_i64_alloc` is now told which decorator
+  it is checking and names it. Test `fused_kl_ce_gpu_gate.rs` (GPU).
+- The on-device numerical test could not fail for dx_s, dW_s or the KL
+  term: its inputs were U(-0.3, 0.3), the reference gradient maxima were
+  below its absolute 5e-3 tolerance, and swapping the KL direction moved
+  the loss by less than its forward tolerance.
+  `crates/nsl-codegen/tests/cpkd_fused_kl_ce_numerical.rs` now draws from
+  U(-1, 1), compares against an f64 reference written out in the test,
+  holds the loss to 2e-5 and each gradient tensor to 1e-4 of its own
+  largest entry. Two further tests show it can fail: on the device, a
+  backward that never ran, another temperature and a missing KL term are
+  each reported; and reversing or dropping the KL term moves the reference
+  by more than a hundred times those tolerances.
 
 ### Open
 
-- **A bad target gives a NaN or infinite fused loss and the step still
-  updates.** The kernel skips only target −100; the host-side mask treats
-  every negative as ignored. Target −1 prints `NaN` and target = V prints
-  `inf`; the composite gives the −100 loss for −1 and aborts for V.
-  `build_forward`, `build_backward` (`cpkd_fused_loss.rs`);
-  `lower_fused_kl_ce_forward` (`wengert_lower.rs`). Reproduced by running.
-- **A failed kernel launch would train on a zero loss.** The return codes of
-  `nsl_fused_kl_ce_forward` and `nsl_fused_kl_ce_backward` are discarded; on
-  failure the zero-filled buffers give loss 0 and zero gradients and
-  training continues. It should abort. `lower_fused_kl_ce_forward`,
-  `lower_fused_kl_ce_backward_extract` (`wengert_lower.rs`). By reading the
-  code only; not triggered.
-- **A wrong `batch_size` or `seq_len` on `@fused_kl_ce` is blamed on another
-  decorator.** The abort message says "the @fused_lm_ce decorator pins
-  batch_size * seq_len", which the program does not contain.
-  `nsl_fused_lce_targets_i64_alloc` in
-  `crates/nsl-runtime/src/fused_linear_ce.rs`. Reproduced by running.
-- **The on-device numerical test cannot fail for dx_s, dW_s or the KL
-  term.** Inputs are U(−0.3, 0.3); the reference gradient maxima, 2.3e-3 and
-  4.2e-3, are below the 5e-3 absolute tolerance, so all-zero gradients pass.
-  Swapping the KL direction moves the loss 5.4e-5 against a 1e-3 tolerance.
-  `crates/nsl-codegen/tests/cpkd_fused_kl_ce_numerical.rs`. Numeric check.
+Nothing from this review is open. Two limits of the fixes above are worth
+knowing. The fused kernel is still capped at `vocab_size <= 8192` (Part 3);
+above it a distill block runs the composite, which materialises both logit
+tensors. And a student, unlike the teacher, is extracted in training mode
+only where its dropout is written with a literal training argument: a
+student built on the stdlib `Dropout` module, whose forward asks
+`is_training()`, still fails extraction inside a distill block.
