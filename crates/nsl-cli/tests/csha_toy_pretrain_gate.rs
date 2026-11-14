@@ -22,13 +22,12 @@
 //! gradient of this program is a small difference of large terms, and the
 //! gate is about the attention's gradient, not about TF32 operand rounding.
 //!
-//! The example does not call its method outside the train block, and that
-//! is deliberate. With a direct call of the `@flash_attention` method before
-//! the train block, the Wq update of the following step is wrong (squared
-//! norm 17.2 against 0.0061) while every other statistic stays right; it
-//! happens without `--csha`, in either matmul mode, and not when the
-//! decorator is removed. That defect is open and is recorded in the CSHA
-//! errata.
+//! The example does not call its method outside the train block. Such a
+//! call runs the decorated kernel, whose 64-row query tile does not divide
+//! the example's sequence of 32; the kernel used to write the missing rows
+//! past its output and overwrote the program's copy of Wq, so the Wq update
+//! read 17.2 against 0.0061. That launch is now refused
+//! (`flash_attention_ragged_seq_gate.rs`).
 //!
 //! The program this example replaced could not run (its `x` was
 //! two-dimensional) and could not tell a working backward from a broken one

@@ -18,8 +18,9 @@
 # attention would train through the CSHA fused forward and backward, and the
 # fused backward is withheld from train and grad blocks because its
 # gradients do not match a reference (the errata for the CSHA proposal has
-# the numbers). Calling the method outside a train block still works with
-# `--csha`.
+# the numbers). Without `--source-ad` the train step runs the decorated
+# kernel itself, which refuses this sequence length (see the end of this
+# comment).
 #
 # The model and every tensor are placed on the GPU, which is where the
 # decorated method's kernels write.
@@ -34,11 +35,14 @@
 # reaching the attention output is of order 1e-6, the magnitude of a real
 # pretraining step.
 #
-# The method is deliberately not called outside the train block. A direct
-# call of an `@flash_attention` method before the train block changes the
-# Wq update of the following step (its squared norm becomes 17.2 where
-# PyTorch gives 0.0061), with or without `--csha`; that defect is recorded
-# in the CSHA errata and is not something this example should rely on.
+# The method is not called outside the train block. A call runs the
+# decorated kernel, whose 64-row query tile does not divide this example's
+# sequence of 32, and the kernel has no tail guard: it used to write the
+# missing 32 rows past the end of its output, into whatever tensor came
+# next. In an earlier version of this example that was the copy of Wq the
+# update is measured against, and the Wq update read 17.2 where PyTorch
+# gives 0.0061. Such a call now stops the program with an error. With
+# `--source-ad` the train step does not run the decorated kernel.
 
 model TinyAttn:
     w_norm: Tensor = 1.0 + 0.25 * tensor_sin(arange(0.0, 32.0) * 0.9)

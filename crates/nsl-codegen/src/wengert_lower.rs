@@ -1480,8 +1480,9 @@ fn emit_fused_forward_under_claim(
 ///   shape mismatch;
 /// * one head and one tile, from NSL source: not shown right. The only run
 ///   had the squared norms of the Wk and Wv updates 12% high, in a program
-///   whose direct method call is now known to disturb the next step's Wq
-///   gradient even without CSHA, so that figure may not be the pair's.
+///   whose direct method call wrote past the end of the attention output (a
+///   sequence of 32 under a 64-row tile, since refused by the launchers), so
+///   that figure may not be the pair's.
 ///
 /// A loss that looks right over gradients that are wrong is how a
 /// pretraining run fails without saying so, so the lowering refuses instead

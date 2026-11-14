@@ -582,6 +582,11 @@ pub extern "C" fn nsl_flash_attention(
     {
         let _scale = f32::from_bits(scale_bits as u32);
 
+        // Before anything is allocated or recorded on the tape.
+        if fa_refuses_ragged_seq("nsl_flash_attention", seq_len, block_q, _block_kv) {
+            return -1;
+        }
+
         // Grid: (ceil(seq_len / block_q), batch * heads, 1)
         let grid_x = (seq_len + block_q - 1) / block_q;
         let grid_y = batch * heads;
@@ -1809,6 +1814,43 @@ fn csha_is_fused_projection_kernel(name_ptr: i64) -> bool {
     name_bytes[pos..].windows(3).any(|w| w == b"_p1")
 }
 
+/// True when a sequence of `seq_len` rows does not fill whole query and key
+/// tiles, which the v2 attention kernels cannot serve. A block size that is
+/// not positive counts as not fitting.
+///
+/// The v2 forward and backward kernels have no tail guards on the sequence:
+/// a CTA computes `block_q` query rows and stores every one of them, and
+/// reads `block_kv` key rows per tile. When `seq_len` is not a multiple of
+/// both, the last CTA writes its extra rows past the end of the output and
+/// logsumexp buffers (and of the save and gradient buffers, where there are
+/// any), into whatever allocation follows. Measured: an `@flash_attention`
+/// method at `seq_len` 32 with the default 64-row tile overwrote the 2 KB
+/// after its output on every call, which was another live tensor.
+// Only the CUDA launchers call it; it is a pure function so that its unit
+// test runs on every build.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn fa_seq_is_ragged(seq_len: i64, block_q: i64, block_kv: i64) -> bool {
+    block_q <= 0 || block_kv <= 0 || seq_len % block_q != 0 || seq_len % block_kv != 0
+}
+
+/// True, after logging why, when [`fa_seq_is_ragged`]: the launch is refused.
+/// The per-document kernels bound their rows by the document and are not
+/// checked with this.
+#[cfg(feature = "cuda")]
+fn fa_refuses_ragged_seq(entry: &str, seq_len: i64, block_q: i64, block_kv: i64) -> bool {
+    if !fa_seq_is_ragged(seq_len, block_q, block_kv) {
+        return false;
+    }
+    crate::nsl_log!(ERROR, "flash-attention",
+        "[nsl::flash_attention] {entry}: seq_len={seq_len} is not a multiple of the kernel's \
+         block_q={block_q} and block_kv={block_kv}; the kernel has no tail guard and would \
+         write the missing rows past the end of its output buffers — refusing. Use a \
+         sequence length that is a multiple of the tile, or drop `@flash_attention` from \
+         the method"
+    );
+    true
+}
+
 /// True, after logging why, when a fused-projection kernel is asked for a
 /// `d_model` wider than `head_dim`.
 ///
@@ -2138,6 +2180,12 @@ pub extern "C" fn nsl_flash_attention_csha(
                 num_docs_or_zero,
                 csha_kernel_name_for_diag(effective_name_ptr),
             );
+            return -1;
+        }
+
+        if !per_doc_cta
+            && fa_refuses_ragged_seq("nsl_flash_attention_csha", seq_len, block_q, _block_kv)
+        {
             return -1;
         }
 
@@ -2597,6 +2645,16 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
             };
             nb.windows(14).any(|w| w == b"_tier_b1_chunk")
         };
+        if !per_doc_cta
+            && fa_refuses_ragged_seq(
+                "nsl_flash_attention_csha_with_saves",
+                seq_len,
+                block_q,
+                _block_kv,
+            )
+        {
+            return -1;
+        }
         let multi_tile_fused = !per_doc_cta
             && csha_is_fused_projection_kernel(effective_name_ptr)
             && (seq_len > block_q || seq_len > _block_kv);
@@ -3488,6 +3546,16 @@ fn csha_backward_impl(
         // are refused. NSL_CSHA_MULTITILE_DW_VALIDATION=1 forces the launch
         // through for isolated heads>1/batch>1 experimentation (gradients not
         // guaranteed correct in that mode). The forward path is unaffected.
+        if !per_doc_cta
+            && fa_refuses_ragged_seq(
+                "nsl_flash_attention_csha_backward",
+                seq_len,
+                block_q,
+                _block_kv,
+            )
+        {
+            return -1;
+        }
         if !per_doc_cta
             && csha_is_fused_projection_kernel(effective_name_ptr)
             && (seq_len > block_q || seq_len > _block_kv)
@@ -8041,6 +8109,26 @@ pub unsafe extern "C" fn nsl_csha_free_backward_activations_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The launchers refuse a sequence that does not fill whole query and
+    /// key tiles: the kernels would write the missing rows out of bounds.
+    #[test]
+    fn a_sequence_that_does_not_fill_whole_tiles_is_ragged() {
+        // Whole tiles, one or several.
+        assert!(!fa_seq_is_ragged(64, 64, 64));
+        assert!(!fa_seq_is_ragged(128, 64, 64));
+        assert!(!fa_seq_is_ragged(32, 32, 32));
+        assert!(!fa_seq_is_ragged(128, 64, 32));
+        // Shorter than one query tile: the case that overwrote another tensor.
+        assert!(fa_seq_is_ragged(32, 64, 64));
+        // A partial last tile.
+        assert!(fa_seq_is_ragged(96, 64, 64));
+        // Whole query tiles but a partial key tile.
+        assert!(fa_seq_is_ragged(64, 32, 48));
+        // Block sizes that are not positive.
+        assert!(fa_seq_is_ragged(64, 0, 64));
+        assert!(fa_seq_is_ragged(64, 64, -1));
+    }
 
     #[test]
     #[cfg(feature = "cuda")]
