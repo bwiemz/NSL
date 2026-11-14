@@ -2281,6 +2281,53 @@ mod tests {
         }
     }
 
+    /// A shape stub must stand in for the tensor it was taken from in every
+    /// case of `reduce_to_shape`, after that tensor is freed: same result
+    /// shape, same values (the expected sums are worked by hand from the
+    /// 3x4 grad 0..11, as in the test above).
+    #[test]
+    fn a_shape_stub_reduces_like_the_tensor_it_replaces() {
+        let vals: Vec<f64> = (0..12).map(f64::from).collect();
+        let cases: [(&[i64], Vec<f64>); 6] = [
+            (&[3, 4], vals.clone()),
+            (&[4], vec![12.0, 15.0, 18.0, 21.0]),
+            (&[1], vec![66.0]),
+            (&[], vec![66.0]),
+            (&[3, 1], vec![6.0, 22.0, 38.0]),
+            (&[1, 4], vec![12.0, 15.0, 18.0, 21.0]),
+        ];
+        for (shape, want) in cases {
+            let g = cpu_tensor(&[3, 4], 0, &vals);
+            let n: i64 = shape.iter().product();
+            // Non-zero contents: the stub must not carry them.
+            let target = cpu_tensor(shape, 0, &vec![7.0; n as usize]);
+            let stub = nsl_tensor_shape_stub(target);
+            nsl_tensor_free(target);
+            assert_eq!(shape_of(stub), shape, "stub of {shape:?}: shape");
+            let r = nsl_tensor_reduce_to_shape(g, stub);
+            assert_eq!(shape_of(r), shape, "stub of {shape:?}: result shape");
+            assert_eq!(read_all(r), want, "stub of {shape:?}: result values");
+            nsl_tensor_free(r);
+            nsl_tensor_free(stub);
+            nsl_tensor_free(g);
+        }
+    }
+
+    /// A stub of a large tensor owns one element, not a copy.
+    #[test]
+    fn a_shape_stub_does_not_copy_the_storage() {
+        let big = cpu_tensor(&[64, 128], 0, &vec![1.0; 64 * 128]);
+        let stub = nsl_tensor_shape_stub(big);
+        let t = NslTensor::from_ptr_ref(stub);
+        assert_eq!(shape_of(stub), [64, 128]);
+        assert_ne!(t.data_owner, 0, "the stub is a view");
+        let owner = NslTensor::from_ptr_ref(t.data_owner);
+        assert_eq!(owner.len, 1, "over a single element");
+        assert_ne!(owner.data, NslTensor::from_ptr_ref(big).data);
+        nsl_tensor_free(stub);
+        nsl_tensor_free(big);
+    }
+
     /// A 0-d seed meeting a one-element `[1]` operand has fewer dims than
     /// its target; there is nothing to reduce, and it passes through.
     #[test]
@@ -2375,6 +2422,46 @@ mod tests {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// nsl_tensor_shape_stub — a tensor's shape and device without its storage
+// ---------------------------------------------------------------------------
+
+/// A stand-in for `src` that has its shape and device and none of its
+/// storage: a broadcast view of a single zero.
+///
+/// Block checkpointing frees a block's interior tensors after the forward.
+/// The backward of a broadcasting op (`a + b`) reads its operands only for
+/// their SHAPE, through `nsl_tensor_reduce_to_shape(grad, operand)`. The
+/// stub gives that call something to read once the operand itself is gone,
+/// so the operand is not recomputed only to be measured. Its VALUES are
+/// zeros and mean nothing; it is not a copy.
+///
+/// A tensor of at most one element is returned as zeros of the same shape
+/// (there is nothing to save by broadcasting, and `expand` cannot produce a
+/// 0-d result from a one-element source). `src` is not consumed.
+#[unsafe(no_mangle)]
+pub extern "C" fn nsl_tensor_shape_stub(src_ptr: i64) -> i64 {
+    let (device, len) = {
+        let src = NslTensor::from_ptr_ref(src_ptr);
+        (src.device as i64, src.len)
+    };
+    let shape_list = super::nsl_tensor_shape(src_ptr);
+    if len <= 1 {
+        let out = super::nsl_tensor_zeros_on(shape_list, device);
+        crate::list::nsl_list_free(shape_list);
+        return out;
+    }
+    let one_shape = crate::list::nsl_list_new();
+    crate::list::nsl_list_push(one_shape, 1);
+    let one = super::nsl_tensor_zeros_on(one_shape, device);
+    let stub = super::nsl_tensor_expand(one, shape_list);
+    // The view holds its own reference to the one-element buffer.
+    nsl_tensor_free(one);
+    crate::list::nsl_list_free(one_shape);
+    crate::list::nsl_list_free(shape_list);
+    stub
 }
 
 // ---------------------------------------------------------------------------

@@ -460,6 +460,9 @@ macro_rules! for_each_runtime_fn {
             [abi_tensor] nsl_rmsnorm_dgamma_backward(i64, i64, i64, f64) -> i64 = tensor::nsl_rmsnorm_dgamma_backward;
             // Source AD: reduce gradient to match parameter shape (matmul broadcast backward)
             [abi_tensor] nsl_tensor_reduce_to_shape(i64, i64) -> i64 = tensor::ad_ops::nsl_tensor_reduce_to_shape;
+            // CCR: a one-element broadcast view with the operand's shape and device, read by
+            // `nsl_tensor_reduce_to_shape` in place of a block interior freed after the forward.
+            [abi_tensor] nsl_tensor_shape_stub(i64) -> i64 = tensor::ad_ops::nsl_tensor_shape_stub;
             // Source-AD dropout forward: returns an NslList [out, mask] so the
             // compiled backward can consume the exact RNG mask (two-op split,
             // wengert.rs DropoutMask).
@@ -1354,6 +1357,6 @@ mod tests {
     fn table_is_the_recorded_size() {
         // The count is pinned so a row dropped by a bad merge is noticed; move
         // it with a row that is deliberately added or removed.
-        assert_eq!(RUNTIME_ABI.len(), 679);
+        assert_eq!(RUNTIME_ABI.len(), 680);
     }
 }

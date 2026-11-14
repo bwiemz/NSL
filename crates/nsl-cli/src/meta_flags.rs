@@ -47,6 +47,20 @@
 /// `requires = "checkpoint_blocks"`; this is the value-domain check. Invalid or
 /// zero values fall back to `Fixed(1)` (per-block) with a stderr note rather
 /// than aborting the build.
+/// clap value parser for `--checkpoint-stride`: `auto`, `dp` or an integer
+/// >= 1. Anything else used to be accepted with a note and run at stride 1.
+pub(crate) fn checkpoint_stride_arg(s: &str) -> Result<String, String> {
+    let t = s.trim();
+    if t.eq_ignore_ascii_case("auto")
+        || t.eq_ignore_ascii_case("dp")
+        || t.parse::<usize>().is_ok_and(|n| n >= 1)
+    {
+        Ok(s.to_string())
+    } else {
+        Err("expected `auto`, `dp` or an integer of at least 1".to_string())
+    }
+}
+
 pub(crate) fn parse_checkpoint_stride(s: &str) -> nsl_codegen::CheckpointStride {
     use nsl_codegen::CheckpointStride;
     let t = s.trim();

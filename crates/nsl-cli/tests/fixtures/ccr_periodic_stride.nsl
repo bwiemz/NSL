@@ -1,34 +1,41 @@
 # Item 8 periodic-checkpointing fixture: an 8-block residual-FFN LM (rmsnorm +
 # tied LM head, attention-free so the gate isolates the checkpoint stride from
 # flash/packing). Runs under --checkpoint-blocks [+ --layerwise-accum]; the
-# harness / gate varies --checkpoint-stride 1|2|4 and asserts bit-exact loss
-# (recompute is deterministic) plus a measured drop in the GPU Activations
+# harness / gate varies --checkpoint-stride 1|2|4|auto|dp and asserts bit-exact
+# loss (recompute is deterministic) plus a measured drop in the GPU Activations
 # surface as the stride coalesces block boundaries.
+#
+# Every tensor computed inside a block has a LITERAL shape. `--checkpoint-stride
+# auto|dp` and `--checkpoint-budget-mib` project byte sizes from static shapes
+# and refuse a model without them, so with symbolic shapes the searches this
+# fixture exists to exercise would never run. The gate's expected strides are
+# worked out by hand from these shapes (batch 2, seq 64, width 32, hidden 64):
+# per block, the three recomputed interiors are 16 + 32 + 16 KiB and the one
+# saved boundary is 16 KiB.
 #
 # Markers (exact-string harness rewrites): "# GPU_PLACEMENT" -> "m.to(cuda)".
 from nsl.nn.losses import cross_entropy
 
 model Blk:
-    norm_f: Tensor = ones([32])
-    w_up: Tensor = randn([32, 64]) * 0.15
-    w_down: Tensor = randn([64, 32]) * 0.15
+    norm_f: Tensor<[32], f32> = ones([32])
+    w_up: Tensor<[32, 64], f32> = randn([32, 64]) * 0.15
+    w_down: Tensor<[64, 32], f32> = randn([64, 32]) * 0.15
 
-    fn forward(self, h: Tensor) -> Tensor:
-        let f = (rmsnorm(h, self.norm_f, 0.00001) @ self.w_up) @ self.w_down
+    fn forward(self, h: Tensor<[2, 64, 32], f32>) -> Tensor<[2, 64, 32], f32>:
+        let n: Tensor<[2, 64, 32], f32> = rmsnorm(h, self.norm_f, 0.00001)
+        let u: Tensor<[2, 64, 64], f32> = n @ self.w_up
+        let f: Tensor<[2, 64, 32], f32> = u @ self.w_down
         return h + f
 
 model TinyLM:
-    embed: Tensor = randn([48, 32]) * 0.1
+    embed: Tensor<[48, 32], f32> = randn([48, 32]) * 0.1
     blocks: [Blk; 8] = Blk()
-    norm_out: Tensor = ones([32])
+    norm_out: Tensor<[32], f32> = ones([32])
 
     fn forward_train(self, input_ids: Tensor) -> Tensor:
-        let ids_shape = input_ids.shape
-        let batch_size = ids_shape[0]
-        let seq_len = ids_shape[1]
-        let flat_ids = input_ids.reshape([batch_size * seq_len])
+        let flat_ids = input_ids.reshape([128])
         let emb = embedding_lookup(self.embed, flat_ids)
-        let h = emb.reshape([batch_size, seq_len, 32])
+        let h: Tensor<[2, 64, 32], f32> = emb.reshape([2, 64, 32])
         for block in self.blocks:
             h = block.forward(h)
         let hn = rmsnorm(h, self.norm_out, 0.00001)

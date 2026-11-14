@@ -1465,6 +1465,7 @@ impl Compiler<'_> {
                     csla_active,
                     extractor: &extractor,
                     grad_accumulation_steps,
+                    planned_primal_keys: &planned_primal_keys,
                     sched,
                     wrga_plan: &wrga_plan,
                 })?;
@@ -1521,42 +1522,6 @@ impl Compiler<'_> {
                             },
                         );
                         ccr_plan = None;
-                    } else if let Some(budget_mib) = self.compile_options.checkpoint.budget_mib {
-                        // P1.c: knapsack arbitration under the byte budget,
-                        // with the C-01 FASE-Deferred credit (the gradient
-                        // buffer Deferred never allocates) when parameter
-                        // sizes are statically known.
-                        let sizes = crate::profiling::captures::size_hints_from_var_nodes(
-                            extractor.var_nodes(),
-                            self.type_map,
-                        );
-                        let mut budget_bytes = budget_mib.saturating_mul(1024 * 1024);
-                        if fase_deferred {
-                            let credit: u64 = effective_primal
-                                .ops
-                                .iter()
-                                .filter(|op| matches!(op.op, crate::wengert::PrimalOp::Param(_)))
-                                .filter_map(|op| sizes.get(&op.result))
-                                .sum();
-                            if credit > 0 {
-                                budget_bytes = budget_bytes.saturating_add(credit);
-                                nsl_log::nsl_log!(INFO, "ccr", 
-                                    "[ccr] C-01 credit: FASE Deferred frees the gradient \
-                                     buffer — activation budget grows by {} MiB",
-                                    credit / (1024 * 1024)
-                                );
-                            }
-                        }
-                        let flipped = crate::ccr::apply_budget(
-                            plan,
-                            &effective_primal,
-                            &crate::ccr::CcrBudget { sizes, budget_bytes },
-                        );
-                        nsl_log::nsl_log!(INFO, "ccr", 
-                            "[ccr] budget {} MiB: {} tensors flipped back to SAVE",
-                            budget_bytes / (1024 * 1024),
-                            flipped
-                        );
                     }
                 }
 
@@ -1644,7 +1609,7 @@ impl Compiler<'_> {
                 // Runs AFTER the eliminate passes so the splice positions
                 // and last-use frees are computed against exactly the op
                 // list that will be lowered.
-                if let Some(plan) = &ccr_plan {
+                if let Some(plan) = &mut ccr_plan {
                     // Milestone C: THE positional fork — apply_to_adjoint
                     // iterates `seg.start..seg.end` indexing
                     // effective_primal.ops. The plan's segment bounds are
@@ -1668,12 +1633,86 @@ impl Compiler<'_> {
                             .unwrap_or(0)
                             + 1,
                     );
-                    crate::ccr::apply_to_adjoint(
+                    // Whether the forward frees each segment's interiors at
+                    // the segment's end. Only then can a tensor the backward
+                    // merely measures be replaced by a shape stub.
+                    let release_at_segment_end = self.ccr_frees_per_segment();
+                    if let Some(budget_mib) = self.compile_options.checkpoint.budget_mib
+                        && matches!(
+                            self.compile_options.checkpoint.stride,
+                            crate::CheckpointStride::Fixed(_)
+                        )
+                    {
+                        // P1.c: knapsack arbitration under the byte budget.
+                        //
+                        // Here, with the final adjoint in hand, so that the
+                        // knapsack can tell which victims the backward
+                        // would recompute: one it only measures, or does not
+                        // read, costs nothing to leave freed.
+                        //
+                        // Only at a fixed stride. Under `auto` and `dp` the
+                        // budget has already been spent once, as the cap on
+                        // the projected peak the stride search honoured;
+                        // running the knapsack as well let it flip up to the
+                        // same number of bytes back to SAVE on top of that
+                        // plan, which could then sit near twice the budget.
+                        //
+                        // The budget is the number the user typed. The
+                        // parameter bytes used to be added to it under FASE
+                        // Deferred (the gradient buffer Deferred never
+                        // allocates): a budget someone derived from memory
+                        // measured with Deferred already on was then counted
+                        // twice, and in every case the build saved more than
+                        // the flag said.
+                        let crate::stmt_train::plan_ccr::StaticSizes { bytes: sizes, shapes } =
+                            self.ccr_static_sizes(&extractor, &effective_primal);
+                        if crate::ccr::budget_candidates(plan, &sizes) == 0 {
+                            return Err(CodegenError::new(
+                                "--checkpoint-budget-mib cannot be honoured: no recomputed \
+                                 tensor of this model has a static size, so there is nothing \
+                                 the budget can be spent on. Sizes come from literal shapes \
+                                 (for example `Tensor<[2, 64, 256], f32>`) and from a \
+                                 DataLoader with literal batch_size and seq_len and \
+                                 drop_last=true; without them, drop the flag or choose the \
+                                 policy with --checkpoint-selective / --checkpoint-stride N \
+                                 instead.",
+                            ));
+                        }
+                        let budget_bytes = budget_mib.saturating_mul(1024 * 1024);
+                        let reads = crate::ccr::backward_reads(
+                            &effective_primal,
+                            &adjoint,
+                            plan,
+                            release_at_segment_end,
+                        );
+                        let flipped = crate::ccr::apply_budget(
+                            plan,
+                            &effective_primal,
+                            &crate::ccr::CcrBudget { sizes, shapes, budget_bytes },
+                            Some(&reads),
+                        );
+                        nsl_log::nsl_log!(INFO, "ccr", 
+                            "[ccr] budget {} MiB: {} tensors flipped back to SAVE",
+                            budget_bytes / (1024 * 1024),
+                            flipped
+                        );
+                    }
+                    let spliced = crate::ccr::apply_to_adjoint(
                         &effective_primal,
                         &mut adjoint,
                         plan,
                         &mut ccr_fresh,
+                        release_at_segment_end,
                     )?;
+                    nsl_log::nsl_log!(INFO, "ccr", 
+                        "[ccr] backward: {} freed interior(s) recomputed, {} read for shape \
+                         only and {} not read (neither is recomputed); {} saved tensor(s) \
+                         released early",
+                        spliced.recomputed,
+                        spliced.shape_only,
+                        spliced.unread,
+                        spliced.released,
+                    );
                     if !ccr_compress_map.is_empty() {
                         crate::ccr::splice_decompress(
                             &mut adjoint,
@@ -1895,6 +1934,10 @@ impl Compiler<'_> {
                 // diverged: fail the compile loudly rather than run with a
                 // mis-restricted recompute set. (u32::MAX entries are
                 // compiler-side sdpa extras, not tape results.)
+                let ccr_stub_ids: std::collections::HashSet<crate::wengert::VarId> = ccr_plan
+                    .as_ref()
+                    .map(|p| p.shape_stubs.iter().map(|(_, stub)| *stub).collect())
+                    .unwrap_or_default();
                 if let Some(inferred) = &inferred_owned {
                     let actual: std::collections::HashMap<
                         crate::wengert::VarId,
@@ -1902,7 +1945,9 @@ impl Compiler<'_> {
                     > = full_lowered
                         .owned_values
                         .iter()
-                        .filter(|(vid, _, _)| *vid != u32::MAX)
+                        // Shape stubs are results of the per-segment free
+                        // lists, not of the primal the prediction covers.
+                        .filter(|(vid, _, _)| *vid != u32::MAX && !ccr_stub_ids.contains(vid))
                         .map(|(vid, _, ty)| (*vid, *ty))
                         .collect();
                     if &actual != inferred {

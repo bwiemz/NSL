@@ -3676,6 +3676,11 @@ fn lower_single_op(
                     let v = builder.ins().iconst(cl_types::I64, i64::from(on));
                     call(compiler, builder, "nsl_set_inplace_suppressed", &[v])
                 }
+                // CCR: the shape and device of a block interior, captured
+                // just before it is freed, for a backward that reads the
+                // interior only as the target of a `reduce_to_shape`
+                // (see ccr::apply_to_adjoint).
+                "ccr_shape_stub" => call(compiler, builder, "nsl_tensor_shape_stub", &[inputs[0]]),
                 "shape" => call(compiler, builder, "nsl_tensor_shape", &[inputs[0]]),
                 // Item 4: a `.shape` read whose answer the compiler proved,
                 // rewritten by the fused-LM-head inference so the tensor it

@@ -98,12 +98,7 @@ impl Compiler<'_> {
         //     binary (the runtime-archive lesson: never A/B by
         //     swapping binaries).
         let ccr_segment_free: Option<CcrSegmentFree> = match ccr_plan {
-            Some(plan)
-                if ws_fwd_plan.is_none()
-                    && !self.compile_options.train.layerwise_accum
-                    && std::env::var("NSL_CCR_SEGMENT_FREE").as_deref()
-                        != Ok("0") =>
-            {
+            Some(plan) if ws_fwd_plan.is_none() && self.ccr_frees_per_segment() => {
                 let seg_bounds: Vec<(usize, usize)> = plan
                     .segments
                     .iter()
@@ -128,6 +123,19 @@ impl Compiler<'_> {
             }
             _ => None,
         };
+        // The adjoint was rewritten to read shape stubs, and saved tensors
+        // were marked for release, on the promise that the per-segment free
+        // lists run (`ccr_frees_per_segment`). Nothing else makes a stub.
+        if ccr_segment_free.is_none()
+            && let Some(plan) = ccr_plan
+            && (!plan.shape_stubs.is_empty()
+                || plan.per_segment_released.iter().any(|seg| !seg.is_empty()))
+        {
+            return Err(CodegenError::new(
+                "internal compiler error (CCR): the backward was planned around shape \
+                 stubs but the forward is not freeing per segment; please report this",
+            ));
+        }
         self.emit_inplace_suppress(builder, true)?;
         let full_lowered = if let Some(wsplan) = ws_fwd_plan {
             // Segment-streamed forward: lower the primal per CCR
@@ -359,6 +367,17 @@ impl Compiler<'_> {
         self.emit_inplace_suppress(builder, false)?;
 
         Ok((ccr_segment_free, full_lowered))
+    }
+
+    /// Whether the forward frees each CCR segment's interiors at that
+    /// segment's end (the per-segment free lists) and not once after the
+    /// whole forward. False under CSLA, whose window buffers the adjoint's
+    /// primal imports (weight streaming needs CSLA, so it is covered), and
+    /// under the `NSL_CCR_SEGMENT_FREE=0` kill switch. `apply_to_adjoint` is
+    /// told this before the forward is lowered, so both sites read it here.
+    pub(crate) fn ccr_frees_per_segment(&self) -> bool {
+        !self.compile_options.train.layerwise_accum
+            && std::env::var("NSL_CCR_SEGMENT_FREE").as_deref() != Ok("0")
     }
 
     /// Close the tape region before the forward is lowered: free the
