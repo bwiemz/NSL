@@ -65,12 +65,29 @@ pub fn check_quant_block_requests(quant: &QuantBlock, diagnostics: &mut Vec<Diag
 /// The one `@quantize(dtype = ...)` value codegen acts on.
 pub const QUANTIZE_DTYPES: &[&str] = &["awq4"];
 
+/// What `@quantize` does, said to everyone who writes it. The decorator
+/// reads as "quantize this model" and does not: no weight changes. With
+/// `--calibration-data` it selects the model's linear projections for a
+/// calibration pass that records the largest |activation| per input
+/// channel into the sidecar file, and nothing reads those numbers back (the
+/// one reader sat behind the refused `default: awq4` quant block and
+/// applied a scale whose inverse was applied nowhere). It stays accepted
+/// because the calibration harness, its sidecar and their tests are built
+/// around it; whether that pipeline goes or gains a consumer is undecided.
+pub const QUANTIZE_DOES_NOT_QUANTIZE: &str = "@quantize does not quantize the model: it only marks the model's \
+     linear projections for the `--calibration-data` pass, which records per-channel activation maxima that \
+     no quantizer reads. To quantize weights, use a `quant` block";
+
 /// Validate `@quantize(...)` on a model: at most `dtype = "awq4"`, named.
 pub fn validate_quantize_decorator(
     deco: &Decorator,
     resolve_sym: &dyn Fn(Symbol) -> String,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    diagnostics.push(
+        Diagnostic::warning("@quantize does not quantize the model".to_string())
+            .with_label(deco.span, QUANTIZE_DOES_NOT_QUANTIZE),
+    );
     let Some(ref args) = deco.args else { return };
     for arg in args {
         let Some(name_sym) = arg.name else {
@@ -167,12 +184,39 @@ mod tests {
         format!("@quantize{args}\n{MODEL}")
     }
 
+    fn warnings(src: &str) -> Vec<String> {
+        let mut interner = nsl_lexer::Interner::new();
+        let (tokens, _) = nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
+        let parsed = nsl_parser::parse(&tokens, &mut interner);
+        crate::analyze(&parsed.module, &mut interner)
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d.level, Level::Warning))
+            .map(|d| format!("{} | {}", d.message, d.labels.iter().map(|l| l.message.as_str()).collect::<Vec<_>>().join(" / ")))
+            .collect()
+    }
+
     #[test]
     fn quantize_accepts_awq4_and_no_arguments() {
         for args in ["", "(dtype=\"awq4\")"] {
             let e = errors(&decorated(args));
             assert!(e.is_empty(), "{args}: {e:?}");
         }
+    }
+
+    /// The decorator is accepted, and says what it does not do. It used to
+    /// be silent, and codegen logged "compiling 'forward' with quantization".
+    #[test]
+    fn quantize_warns_that_it_does_not_quantize() {
+        for args in ["", "(dtype=\"awq4\")"] {
+            let w = warnings(&decorated(args));
+            let ours: Vec<&String> = w.iter().filter(|m| m.contains("@quantize")).collect();
+            assert_eq!(ours.len(), 1, "{args}: {w:?}");
+            assert!(ours[0].contains("does not quantize the model"), "{ours:?}");
+            assert!(ours[0].contains("no quantizer reads") && ours[0].contains("`quant` block"), "{ours:?}");
+        }
+        let undecorated = warnings(MODEL);
+        assert!(undecorated.iter().all(|m| !m.contains("@quantize")), "{undecorated:?}");
     }
 
     #[test]

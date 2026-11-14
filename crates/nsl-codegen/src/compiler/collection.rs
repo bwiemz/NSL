@@ -469,9 +469,11 @@ impl Compiler<'_> {
                                 }
                             }
                         }
-                        nsl_log::nsl_log!(INFO, "nsl", 
-                            "[nsl] M35: @quantize on model '{}' — dtype={}, group_size={}",
-                            model_name, dtype, group_size
+                        // Say what the decorator does, which is not what its
+                        // name says: no weight of the model is quantized.
+                        nsl_log::nsl_log!(INFO, "nsl",
+                            "[nsl] @quantize(dtype=\"{}\") on model '{}': marked for calibration statistics only; the model is not quantized",
+                            dtype, model_name
                         );
                         self.features.quant_configs.insert(
                             model_name.clone(),
