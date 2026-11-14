@@ -2003,27 +2003,21 @@ pub extern "C" fn nsl_flash_attention_csha(
 
     #[cfg(feature = "cuda")]
     {
-        // Grid / block identical to `nsl_flash_attention` — CSHA doesn't
-        // change the outer tiling, except for A.4 weight-informed
-        // specialisation: when `active_heads` is non-zero and smaller
-        // than the full head count, the kernel variant was compiled
-        // with a matching early-exit guard; shrink grid_y so each CTA
-        // lands inside the active range. active_heads == 0 means "no
-        // pruning — run the full head count".
+        // Grid / block identical to `nsl_flash_attention`: `batch * heads`
+        // blocks along y, whatever `active_heads` says. The kernel decodes
+        // `batch = block_y / heads` and `head = block_y % heads` from the
+        // FULL head count, and a block whose head is pruned
+        // (`head >= active_heads > 0`) returns at once
+        // (`emit_active_heads_guard` in nsl-codegen's
+        // flash_attention_v2/phases/forward/csha_hooks.rs).
         //
-        // CSHA paper §5.2 v1 (cycle-2 audit): this is the PRIMARY tier
-        // of dead-head elimination — blocks for pruned heads never
-        // launch. The defense-in-depth in-kernel guard lives in
-        // `crates/nsl-codegen/src/flash_attention_v2/phases/forward/
-        // csha_hooks.rs::emit_active_heads_guard`; the same formula
-        // appears at the scalar+fused backward launch sites further
-        // down this file. Formula pinned by `a4_grid_y_*` unit tests
-        // in the `#[cfg(test)] mod` below.
-        let effective_heads = if active_heads > 0 && active_heads < heads {
-            active_heads
-        } else {
-            heads
-        };
+        // The grid used to be shrunk to `batch * active_heads`. Those blocks
+        // decode to the first `active_heads / heads` of the batch: with a
+        // batch of 2, 8 heads and 4 active, all 8 blocks were batch element
+        // 0, half of them returned early, and batch element 1 kept its
+        // zero-initialised output under a success return code. The same
+        // holds at the with-saves forward and both backward launch sites
+        // further down this file.
 
         // PCA per-doc CTA (Strategy 3 v1) topology detection.
         // The kernel name carries `_per_doc_cta` when codegen emitted the
@@ -2094,7 +2088,8 @@ pub extern "C" fn nsl_flash_attention_csha(
         } else {
             (seq_len + block_q - 1) / block_q
         };
-        let grid_y = batch * effective_heads;
+        // Full grid: see `nsl_flash_attention_csha`.
+        let grid_y = batch * heads;
         let grid_z = 1i64;
         // Tier B.1 launch geometry: the pipelined-MMA codegen emits a
         // `global_t = warp_id + local_t * 8` warp distribution
@@ -2457,12 +2452,6 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
 
     #[cfg(feature = "cuda")]
     {
-        let effective_heads = if active_heads > 0 && active_heads < heads {
-            active_heads
-        } else {
-            heads
-        };
-
         // PCA per-doc CTA (Strategy 3 v1) topology — see the matching
         // block in `nsl_flash_attention_csha` for the full contract +
         // alternative-design discussion.
@@ -2548,7 +2537,8 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
         } else {
             (seq_len + block_q - 1) / block_q
         };
-        let grid_y = batch * effective_heads;
+        // Full grid: see `nsl_flash_attention_csha`.
+        let grid_y = batch * heads;
         let grid_z = 1i64;
         // Tier B.1 launch geometry signal via kernel name suffix; see
         // `csha_block_x_for_kernel` and the matching comment in
@@ -3328,11 +3318,6 @@ fn csha_backward_impl(
 
     #[cfg(feature = "cuda")]
     {
-        let effective_heads = if active_heads > 0 && active_heads < heads {
-            active_heads
-        } else {
-            heads
-        };
         // PCA per-doc CTA (Sprint 5) topology detection. Mirrors the
         // forward `nsl_flash_attention_csha` dispatch: when the kernel
         // name carries `_per_doc_cta`, the backward launches with
@@ -3411,7 +3396,8 @@ fn csha_backward_impl(
         }
         let q_blocks = (seq_len + block_q - 1) / block_q;
         let grid_x = if per_doc_cta { num_docs_or_zero } else { 1i64 };
-        let grid_y = batch * effective_heads;
+        // Full grid: see `nsl_flash_attention_csha`.
+        let grid_y = batch * heads;
         let grid_z = 1i64;
         let block_x = 128i64;
         let block_y = 1i64;
@@ -4261,7 +4247,7 @@ impl Drop for DeviceScratch {
 /// Per-kernel grid/block are ported from the validated Layer-1 GPU reference
 /// launchers (`tier_b2_dq_kernel_cpu_reference.rs`,
 /// `tier_b2_dkdv_kernel_cpu_reference.rs`); kernel 4 mirrors the scalar
-/// backward launch (grid `(1, batch*effective_heads, 1)`, block `(128,1,1)`,
+/// backward launch (grid `(1, batch*heads, 1)`, block `(128,1,1)`,
 /// threading the per-q-block base through the `seq_lens` slot).
 ///
 /// Launches are same-stream and therefore implicitly ordered; `NSL_CUDA_SYNC`
@@ -4599,15 +4585,10 @@ fn csha_tier_b2_backward_launch(
     // else-branch builds). dQ/dK/dV are INPUTS (read from HBM into SMEM); only
     // dWq/dWk/dWv/dx/dx_norm are written. The dk_scratch/dv_scratch slots are
     // unused by proj_backward (no dK/dV finalize store) — pass null. Launch
-    // dims mirror the scalar backward: grid (1, batch*effective_heads, 1),
+    // dims mirror the scalar backward: grid (1, batch*heads, 1),
     // block (128,1,1), incoming `shared_mem_bytes`, threading the per-q-block
     // base through the `seq_lens` slot.
     {
-        let effective_heads = if active_heads > 0 && active_heads < heads {
-            active_heads
-        } else {
-            heads
-        };
 
         // q_ptr/k_ptr/v_ptr are unused by proj_backward (it reads the forward
         // saves, not the raw inputs). Pass 0 for all three.
@@ -4770,7 +4751,8 @@ fn csha_tier_b2_backward_launch(
             &mut a_docs as *mut _ as *mut c_void,
         ];
 
-        let grid_y = batch * effective_heads;
+        // Full grid: see `nsl_flash_attention_csha`.
+        let grid_y = batch * heads;
         let q_blocks = if block_q > 0 { (seq_len + block_q - 1) / block_q } else { 1 };
         // T8 fix: the proj kernel rebases %shmem_base to a COMPACTED layout
         // (see `synthesize_proj_backward` + `tier_b2_proj_backward_smem_bytes`),
@@ -9300,76 +9282,6 @@ mod tests {
             0,
         );
         assert_eq!(r, -1, "non-CUDA build must return -1 for the CSHA FFI");
-    }
-
-    /// A.4 grid-sizing logic, extracted as a pure function so it can be
-    /// exercised without a GPU. Mirrors the `effective_heads` computation
-    /// inside `nsl_flash_attention_csha`'s cuda branch — keep the two
-    /// in sync.
-    fn a4_effective_heads(heads: i64, active_heads: i64) -> i64 {
-        if active_heads > 0 && active_heads < heads {
-            active_heads
-        } else {
-            heads
-        }
-    }
-
-    #[test]
-    fn a4_grid_y_uses_full_heads_when_active_heads_zero() {
-        // active_heads == 0 is the "no pruning" signal — grid_y must
-        // use the full head count.
-        assert_eq!(a4_effective_heads(8, 0), 8);
-    }
-
-    #[test]
-    fn a4_grid_y_shrinks_when_active_heads_prunes() {
-        // Common weight-informed specialisation: 3 of 8 heads pruned,
-        // kernel launches with grid_y = batch * 5.
-        assert_eq!(a4_effective_heads(8, 5), 5);
-    }
-
-    #[test]
-    fn a4_grid_y_falls_back_to_heads_when_active_exceeds() {
-        // Defensive: if the plan somehow reports active_heads > heads
-        // (shouldn't happen but could during bring-up), use the full
-        // count — the kernel's A.4 PTX guard would otherwise eject
-        // every block.
-        assert_eq!(a4_effective_heads(8, 16), 8);
-    }
-
-    #[test]
-    fn a4_grid_y_full_heads_when_active_equals_heads() {
-        // active_heads == heads is semantically "no pruning expressed
-        // differently"; fall back to the full count so we don't emit
-        // the guard branch unnecessarily.
-        assert_eq!(a4_effective_heads(8, 8), 8);
-    }
-
-    /// CSHA paper §5.2 v1 (Sprint 2 cycle-2 audit pin): the canonical
-    /// "half the heads pruned" case used by `csha_cuda_launch_fused`'s
-    /// h=8/active=4 fixture. Co-pinned alongside the in-source doc on
-    /// `crates/nsl-codegen/src/flash_attention_v2/phases/forward/csha_hooks.rs
-    /// ::emit_active_heads_guard` so the launcher and kernel guard
-    /// cannot silently disagree.
-    #[test]
-    fn a4_grid_y_half_pruned_canonical_case() {
-        assert_eq!(a4_effective_heads(8, 4), 4);
-        // Also pin the table of paper §5.2 v1 inputs we ship today.
-        for (heads, active, expected) in [
-            (4i64, 0i64, 4i64),  // sentinel zero -> full
-            (4,    1,    1),      // single live head (paper §5.2 extreme)
-            (4,    2,    2),
-            (4,    4,    4),      // active == heads -> full
-            (8,    0,    8),
-            (8,    4,    4),      // canonical half-pruned (this test fixture)
-            (8,    8,    8),
-        ] {
-            assert_eq!(
-                a4_effective_heads(heads, active),
-                expected,
-                "effective_heads({heads}, {active}) must be {expected}"
-            );
-        }
     }
 
     /// Smoke test: the CSHA FFI symbol resolves and the parameter signature
