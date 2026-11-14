@@ -8,6 +8,41 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+<!-- open-defects (2026-11-13/14): the Part 5 open lists of the fifteen research errata, worked through per subsystem. Each entry below is grouped by area. -->
+- **CEP.**
+  - CEP reads `.nslm` checkpoints and both layer-name spellings (`blocks[0].x`, `blocks.0.x`), and `--cep-emit-weights` writes `.nslm` that `model_load` accepts in the emitted source.
+  - `--cep-joint` honours `--cep-emit-source`, shortening the block array for dropped layers.
+- **CFIE.**
+  - Tests: `cfie_sampling_distribution.rs`, `sampling_distribution_gate.rs`, GPU distribution and plain-equality tests in `cfie_speculative_generate_gpu_e2e.rs`.
+- **WGGO, CPDT and the CSHA planner.**
+  - `--cpdt-memory-budget <GiB>` sets the per-GPU budget CPDT's ZeRO search plans against (default 80); `--cpdt-report` prints it.
+  - `--cpdt-prune-experts` opts in to slicing low-norm MoE experts under `--cpdt full --weights`.
+  - The WGGO report prints the layer shapes it planned on, read from the model.
+- **WRGA adapters and `-w`.**
+  - `@adapter` works on a weight of any 2-D shape, on `x @ self.w.transpose(0, 1)` (the stdlib `Linear`), and on a model imported from another module.
+  - `model_save` writes a model's adapter tensors after its parameters and `model_load` reads them back; a base-only file loads into a model with adapters and leaves the adapters as constructed.
+  - `@wrga(budget=N)` is a compile-time cap on the parameters held by the declared adapters.
+  - `@wrga(target=…)` accepts a string or identifier and selects the GPU of the WRGA report; names match without regard to punctuation (`rtx5070ti`).
+  - `nsl check --wrga-analyze|--wrga-compare` honour `--weights`; the report gains a "Spectral analysis" line when a checkpoint weight matches a site.
+  - The synthesized IA³ kernel is registered and launched when the fused path is opted in.
+  - a program built with `-w` checks at startup the SHA-256 of every weights-file tensor its code was specialised on, and refuses to run if one changed, naming the file and the parameter. New execution-fingerprint key `wspec`.
+- **CCR checkpointing.**
+  - `crates/nsl-cli/tests/ccr_reference_gradient_gate.rs`: checkpointed training compared with PyTorch float64 values on CPU and GPU.
+  - `ccr_budget_gate.rs` and `nsl-runtime/tests/ccr_compress_dtype_refusal.rs`.
+  - Static tensor sizes for the CCR planner are propagated from shape annotations, model fields and a DataLoader with literal `batch_size`/`seq_len` and `drop_last=true`.
+- **Accumulation (FASE), packing (PCA) and data loading.**
+  - `NSL_FASE_FLUSH_TAIL=0` (compile time, recorded in the execution fingerprint when off): a run that ends inside an accumulation window drops its pending micro-batches, with a warning, instead of stepping on them. For comparing the interleaved schedule with `--layerwise-accum`.
+  - `tools/hfcorpus/make_mix.py --placement token`; the placement is recorded in the mixture's manifest.
+  - `tools/hfcorpus/decontaminate.py` reports, per benchmark, how many problems and reference solutions its line rule cannot detect (`coverage`).
+  - `tools/hfcorpus/test_hfcorpus.py`.
+- **Distillation and source AD.**
+  - Source AD inlines undecorated free functions (module-local and imported, including the standard library) into `grad`, `train` and `distill` blocks; functions it cannot inline are named with the reason before the tape fallback.
+  - `fused_kl_ce(...)` runs as the standard-library composite in a distill block wherever the fused kernel does not apply (no enabled decorator, `--target cpu`, `--training-reference`).
+  - Distillation teachers are evaluated: `dropout` is the identity and `is_training()` is false inside methods called on the teacher.
+- **CSHA attention kernels.**
+  - `crates/nsl-codegen/tests/csha_f64_reference.rs`: f64 reference for the fused attention backward, pinned to PyTorch; `tools/refcheck/csha_backward_literals.py` and `tools/refcheck/csha_toy_literals.py` print the literals.
+  - GPU gates: `csha_cuda_training_config.rs`, `tier_b2_backward_f64_gate.rs`, `crates/nsl-cli/tests/csha_toy_pretrain_gate.rs`.
+
 - **Errata for the fifteen research proposals in `docs/research/`.** Each
   proposal PDF (CCR, CEP, CESH, CFA, CFIE, CFTP, CGAC, CIDP, CKVQ, CPDT,
   CPKD, CSHA, CSS, WGGO, WRGA) now has an `-errata.md` beside it, from a
@@ -2005,6 +2040,90 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **CEP.**
+  - CEP head importance read `wq` along its input axis, cut `wk`/`wv` by query head and ignored `wo`; it pruned live heads and kept dead ones.
+  - CEP ranked FFN neurons by `w_gate` alone and never found NSL's FFN weights when scoring layers.
+  - CEP counted a tied output head twice (73.9M reported for the 48.8M model) and measured sparsity against that.
+  - CEP's cost estimate omitted the attention matmuls and launch overhead and charged a stored score matrix beside a FlashAttention credit.
+  - CEP memory and latency constraints could not steer the search; a missed sparsity target was reported as success.
+  - CEP sliced weights kept stale stored head counts and lost tensor order; a dropped layer left its norms behind.
+  - `--cep-profile` labelled a whole-forward time as "us/token".
+- **CFIE.**
+  - CFIE: each generated token has its own random draw (it was one quantile per request); new serve key `sampling: seed:`.
+  - CFIE speculative decoding emits exactly the tokens plain decoding emits, under the configured temperature / top-k / top-p.
+  - CFIE decode block applies RoPE in the half-split (Llama / `RotaryEmbedding`) convention.
+  - CFIE samplers honour `norm_eps`; a sampler with no candidate reports an out-of-vocabulary id instead of token 0; prefill no longer runs the sampler on every prompt token.
+  - CFIE weight binding checks tensor shapes, not element counts.
+  - CFIE build report prints the launches the build makes and no estimated speed.
+  - JSON-schema grammars accept only JSON (numbers, escapes, UTF-8, `required`, bounded whitespace).
+  - `@speculative`: draft sampling and verification draw from the seeded generator.
+  - `nsl_grammar_*` functions return -1 with no grammar installed instead of aborting.
+- **WGGO, CPDT and the CSHA planner.**
+  - WGGO planned every model as one built-in layer (d_model 512, 8 heads, FFN 2048). Plans, budgets, costs and memory now come from the model's own shapes; when a shape cannot be determined WGGO declines to plan, and flags that act only through the plan become compile errors.
+  - `--wggo-memory-budget` refused budgets far larger than a small model, and its "Peak memory" was sized at the cheapest configuration and not the plan's.
+  - `--wggo-weights` scored every tensor as 512 wide with 8 heads; missed its own retention threshold through f32 rounding; reused a cache across prune fractions and models; and ranked layers for `--wggo-layer-prune-fraction` by normalisation gains.
+  - WGGO chose pruned heads together with a CSHA level that needs every head, planned CSHA level 3 where CSHA rejects it, always targeted A100-SXM, refused feasible budgets through bucket rounding, printed an infinite step time for an infeasible layer, and planned packing for unpacked grouped-query attention.
+  - The 32-bit moment pin for embedding and LM-head parameters now applies.
+  - CPDT assumed 8 blocks, so on a deeper model the wrong block was treated as last; weights-file names with a leading prefix now join their parameter.
+  - CPDT's ZeRO cost model charged data-parallel training no communication and tied every configuration; it now follows the ZeRO paper's volumes per micro-batch.
+  - `--cpdt-report` printed a built-in layer's size, and an inference-only MoE program under `--cpdt full` was refused as inert.
+  - MoE routing dropped over-capacity assignments in token order without renormalising the survivors.
+  - INT8 blockwise stochastic rounding reseeded identically on every call; the caller now supplies the seed.
+  - The CSHA planner planned decorated attention on a nominal shape, used a constant level-1 saving, named a kernel the build does not emit, and passed the nominal 8 as the forward launch's head count.
+- **WRGA adapters and `-w`.**
+  - An adapter on a non-square weight aborted with a matmul dimension mismatch.
+  - The class in an `@adapter` target was ignored.
+  - With `NSL_WRGA_FUSED_CUDA=1`, an adapter on a 3-D activation aborted under `--source-ad`.
+  - With `NSL_WRGA_FUSED_CUDA=1`, the fused kernels returned wrong values for outputs larger than 16 × 8 or ranks above 8; such calls now run the ordinary operations.
+  - `print(m.lora_A_<site>.sum())` printed a tensor handle.
+  - The WRGA randomized SVD was biased on low-rank weights (σ₁ = 1.333 for a true 1.0).
+  - 8-bit-float checkpoints (`F8_E4M3`, `F8_E5M2`) were decoded as `byte / 127`.
+  - WRGA report: mismatched units on the pruning and activation lines; adapter parameter count of `rank × 1024` per site; "Fused: n/n" for programs with no adapters; a memory plan that shared slots between activations the backward pass reads.
+  - The false warning that `alpha` is ignored for gated LoRA.
+  - `-w`/`--weights` on `nsl run` and `nsl build` now loads the file's tensors into the model (`Model.field`, `field`, or the parameter's path such as `blocks[0].w` / `blocks.0.w`). Previously the compiler specialised code to the file's values while the model kept its initializer: a weight initialised to twos, compiled against an identity file, printed `x` for `x @ self.w`.
+  - the M52b weight constant fold freed its constant twice (abort with "invalid tensor handle") and emitted it unaligned.
+- **CCR checkpointing.**
+  - `--checkpoint-blocks` no longer recomputes interiors the backward reads only for shape (the product feeding each residual add) or not at all.
+  - `--checkpoint-budget-mib` is used once and is the number given: no second application under `--checkpoint-stride auto|dp`, no FASE Deferred credit. The knapsack weighs by operation count instead of 25/4/1 per byte.
+  - `--checkpoint-stride dp` counts only what a partition recomputes, reports "kept N of M" against the real anchor count, and uses the local GPU's constants (or says it could not).
+  - `--checkpoint-compress` casts each save at the end of its segment instead of after the whole forward.
+  - The CCR stride gates and the nondeterministic-baseline parity fallback could not fail; they now can.
+- **Quantization, KV compression and sparse tensors.**
+  - `quant` blocks: a strided (e.g. transposed) field was quantized in storage order; a model with a sub-model aborted or ran the wrong layout, differently from run to run. Blocks now read tensors in logical order, stage GPU tensors to the host, copy sub-models and `[Model; N]` arrays recursively, and match `exclude:` against dotted paths.
+  - GPTQ (`nsl-runtime` `gptq.rs`, not reachable from NSL): group parameters are taken from the original weights and errors are spread with the Cholesky factor of H⁻¹. Output error is now about a fifth of round-to-nearest (was above it) and matches a NumPy reference.
+  - `nsl_nvfp4_quantize` with the Hadamard flag returned transform coefficients; it now returns the reconstruction.
+  - KV block quantizers: oversized blocks return an error instead of panicking; `nsl_kv_quantize_and_store` honours its token offset; `nsl_kv_compress_ratio` counts per-block metadata (1.60× / 2.66× for a 4×16×64 block, not 2× / 4×).
+- **Accumulation (FASE), packing (PCA) and data loading.**
+  - Gradient accumulation: a run whose micro-batch count is not a multiple of `grad_accumulation` steps once more at the end on the mean of the micro-batches its last window holds, instead of discarding them. `--layerwise-accum` cannot and prints a warning.
+  - `DataLoader(shuffle = true)` permutes sequence windows instead of whole batches, on the plain and the packed path. The order of data in every shuffled run changes; a shuffled checkpoint from before is refused on resume.
+  - GPU dropout: the mask stream no longer repeats every 2^32 elements.
+  - A packed `DataLoader` row with more than 256 documents no longer aborts the run.
+  - The fused packed-attention forward declines a sequence longer than 16384 positions instead of writing past its segment-id buffer.
+  - A module with a `packing = true` dataset, `@flash_attention` and a train block reading any `DataLoader` no longer fails to compile with an internal verifier error.
+  - `tools/hfcorpus/verify.py` compares every validation document with the training stream.
+  - Event stream: `bf16_lt_counters` and `bf16_cast_cache_counters` are registered with their stderr markers.
+  - Two kernel equivalence tests no longer depend on the unspecified sign of `max(-0, +0)` or of a produced NaN, and pass in release builds.
+- **Distillation and source AD.**
+  - Source-AD `mse_loss` / `l1_loss` gradients when prediction and target broadcast.
+  - `gelu` is the tanh approximation on every device; the GPU computed `x·σ(1.702x)`. The GPU GELU adjoint's two wrong constants (0.0357143 and 0.105920 for 0.0356774 and 0.107032) are corrected.
+  - `@fused_lm_ce(dtype = "fp16" | "bf16")`: the backward and the large-vocab finalize now use the logits the forward rounded, so the gradient is that of the computed loss.
+  - Fused loss kernels: negative targets other than −100 no longer give a NaN loss; a target ≥ `vocab_size` aborts naming the row; a wrong row count names the decorator the program contains.
+  - A failed fused KL-CE kernel launch exits (code 13) instead of training on a zero loss.
+  - `let t = t0` of a tensor takes its own reference (double free at exit; in-place aliasing).
+  - `print` of a tensor the checker could not type prints the tensor; `for block in self.blocks` types the loop variable's fields.
+  - `nsl check --cpkd-design-student`: the layer map is spread over the teacher's depth, last to last.
+  - `models/coder-rl/train_grpo.nsl` schedule sized to its 210-step run; coder-rl comments corrected.
+- **CSHA attention kernels.**
+  - CSHA fused backward: gradients are f32 from end to end. dO was narrowed to f16 unscaled and dQ, dK, dV, dWq, dWk, dWv were stored as f16, which is zero below 2.98e-8; at dO around 1e-7 dQ was 82–89% wrong.
+  - CSHA tensor-core backward (Tier B.2): dO is prescaled by a power of two per (batch, head) slice before its f16 conversion and dQ, dK, dV are unscaled exactly; dS saturates instead of overflowing.
+  - CSHA launchers launch `batch × heads` blocks under head pruning; with batch above 1 later batch elements were left zero.
+  - CSHA launches pass the active-head count of the kernel's own configuration, not the planner's nominal 8.
+  - A refused `@flash_attention` forward launch traps instead of returning a zero output.
+  - Tier B.1: the address-keyed weight cache is removed; weights are re-read on every launch.
+  - training through @flash_attention with --csha is now a compile error; the CSHA fused backward's gradients do not match a reference (wrong beyond one tile, fails beyond one head). Compile without --csha to train on the unfused attention.
+  - @flash_attention kernels launched at a sequence length that is not a multiple of their tile (64 by default) wrote past the end of their output into a neighbouring tensor; such launches are now refused.
+  - the CSHA backward launcher refuses a null projection weight instead of faulting the GPU.
+
 - **Tape AD returned a zero gradient through a fused elementwise chain or
   a `clone`.** Two holes in the autodiff tape, both silent, both in the
   default AD mode of `nsl run`:
@@ -3446,6 +3565,72 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- **Learning-rate schedules count optimizer steps under accumulation.**
+  With `grad_accumulation = N`, `warmup_steps`, `total_steps`, `step_size`
+  and `t_max` now count optimizer steps, the unit other frameworks'
+  schedulers use; they counted micro-batches, so a schedule copied from
+  elsewhere warmed up and decayed N times too fast. `train(...)` and
+  `distill(...)` take `schedule_unit = "optimizer_step" | "micro_batch"`;
+  a block that combines a stepped schedule with accumulation and states
+  neither gets a compile-time warning, because a schedule written for the
+  old unit now runs N times slower, and a checkpoint saved under the old
+  unit is refused on resume as a trajectory change. The production
+  recipes are converted and state the unit (50M 163/3269, 500M 50/512,
+  1B 2048/1379146); the 1B experiment arms, benchmark generators and test
+  fixtures state `"micro_batch"` and reproduce their recorded results.
+  The 0.10-lts toolchain accepts the key from #853 on, with micro-batches
+  still its default.
+- **CEP.**
+  - `--cep-prune`, `--cep-joint` and `--cep-search` exit 1 and write nothing when they miss their target; outputs are written all-or-nothing.
+  - `@cep_search` requires an `objective`.
+  - The CEP search takes the least important head group, FFN step or layer per parameter saved at each step, instead of three fixed phases.
+  - CEP refuses weights with missing, transposed or non-finite tensors, a sparsity outside 0..1, and output paths that overwrite an input.
+- **CFIE.**
+  - Serve blocks: `grammar:`, INT8 `kv_quant`, non-greedy sampling without `top_k`, `top_k` > 64, tree/medusa/lookahead speculation, a non-fitting `kv_layout: "static"`, non-positive shape keys, and `generate()` without a decode path are compile errors.
+  - `kv_quant: "auto"` is advisory; the CFIE KV cache is FP16.
+  - `nsl_grammar_init` refuses; `nsl_speculative_verify_tree` refuses a non-zero temperature.
+- **WGGO, CPDT and the CSHA planner.**
+  - `--wggo-prune-fraction` defaults to 0.0 (was 0.25); head pruning is opt-in.
+  - A `--wggo-weights` tensor of the wrong shape is a compile error (was skipped).
+  - Low-norm MoE experts are reported, and sliced only with `--cpdt-prune-experts`.
+  - The ZeRO section of `--cpdt-report` is labelled a recommendation and states the stage the program runs.
+  - WGGO report wording: "kept/total heads", "FP32 m" or "BF16 m".
+- **WRGA adapters and `-w`.**
+  - `@adapter` targets that attach nowhere are compile errors.
+  - `@wrga(mode=hybrid)` and `@wrga(layers=[…])` are compile errors.
+  - An unknown WRGA target GPU is a compile error; a report made without a target says the GPU shown is the default.
+  - `.nslm` files saved from a model with adapters hold the adapter tensors.
+  - `nsl check --wrga-compare` prints adapter parameter counts only (WRGA, LoRA r=16, GaLore, ReFT).
+  - Building with `NSL_WRGA_FUSED_CUDA=1` warns that adapted matmuls run in half precision, base product included.
+  - weight-aware rewrites that depend on values (M52b constant fold, near-identity matmul elimination) are made only for parameters the program never writes after loading; refused rewrites are reported. M52d scaling-constant fusion is no longer applied.
+  - a binary built with `-w` reads its weights file at run time, from the absolute path given at build time.
+- **CCR checkpointing.**
+  - `--checkpoint-budget-mib` and `--checkpoint-stride auto|dp` fail the build when the tensors they need have no static size (previously a note and exit 0).
+  - `--checkpoint-compress` with nothing to compress fails the build.
+  - `--checkpoint-stride` rejects values that are not `auto`, `dp` or an integer ≥ 1.
+  - A compressed save is only made from an f32 activation; any other dtype exits with a message.
+- **Quantization, KV compression and sparse tensors.**
+  - `@kv_compress`, `@sparse`, `@fp4_compute` are compile errors (they were accepted and ignored).
+  - GPTQ refuses a bit width other than 4 and a Hessian of the wrong size; the NVFP4 Hadamard rotation refuses a length that is not a power of two.
+  - `nsl_kv_cache_init{,_gpu}`, `nsl_kv_quantize_and_store`, `nsl_kv_compress_ratio` signatures (see ABI table).
+  - `docs/summaries/06-implementation-status.md`, `SPECIFICATION.md`, `STATUS.md` no longer list AWQ, GPTQ, KV compression or sparse tensors as available from NSL.
+  - `@quantize` is a compile error in every form. `dtype="awq4"` says AWQ calibration is not implemented and points at the `quant` block and `@fp8_compute`.
+  - `Sparse<…>` types and `@layout` are refused, naming `attic/sparse-tensors-2026-11`.
+- **Accumulation (FASE), packing (PCA) and data loading.**
+  - A `dataset` block accepts only `packing`, `max_sequence_length` (`max_seq_len`), `mean_doc_length` and `doc_length_stddev`, as literals; every other former field is a compile-time error; `source` is no longer required.
+  - `@pca(strategy = per_document)` and `@pca(strategy = off)` are compile-time errors.
+  - `DataLoader(..., packing = true)` in a module with segment-masked `@flash_attention` kernels is a compile-time error.
+  - `@flash_attention(causal = false)` with a `packing = true` dataset is a compile-time error.
+- **Distillation and source AD.**
+  - A named argument out of position on an imported function, constructor or method is a compile error.
+  - A distill `loss:` section must agree with the block's `fused_kl_ce(...)` call and is an error when nothing consumes it; `feature_weight` and `feature_layers` are refused; call-site alpha/temperature are range-checked by `nsl check`.
+  - `--target cpu` distill compiles never lower the fused KL-CE kernel.
+  - `nsl_fused_lce_targets_i64_alloc` takes `vocab_size` and a site code.
+- **CSHA attention kernels.**
+  - Fused-projection CSHA launches with `d_model > head_dim` are refused; they read across rows and past the save buffer.
+  - Tier B.1 launches with batch or heads above 1 are refused.
+  - `examples/csha_toy_pretrain_hd32.nsl` is replaced by a runnable, non-degenerate program.
+
 - **A packed `DataLoader` must name its separator.**
   `DataLoader(..., packing = true)` without `pack_separator = <token id>`
   is a compile error. The default was id 0, which is the token "!" in the
@@ -4113,6 +4298,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   fields.
 
 ### Removed
+
+- **CEP.**
+  - `cep_importance::{head_frobenius, weight_l1, score_head, score_ffn}`, `cep_slice::ffn_survivors_by_magnitude`, and the test `cep_g18_e2e_binary_claim`.
+- **CFIE.**
+  - CFIE rejection, prob-row, tree-mask verify and INT8/FP16 read kernels; the request ring; the `static_with_bump` layout; the cost model (`cfie_cost.rs`); nine `nsl_cfie_*` FFI functions.
+  - `tests/m19_topk_test.nsl`, `tests/test_sampling.nsl` (replaced by `sampling_distribution_gate.rs`).
+- **WGGO, CPDT and the CSHA planner.**
+  - The `@wggo` decorator (was accepted and ignored); it is now a compile error pointing to `--wggo`.
+  - Non-zero `@moe(aux_loss_coeff=…)` (was accepted and ignored); now a compile error.
+- **WRGA adapters and `-w`.**
+  - `crates/nsl-runtime/src/peft/` (`nsl_wrga_epilogue_fused_lora`, `nsl_wrga_epilogue_fused_ia3`, `nsl_wrga_result_free`): no caller.
+  - The fused-site "no `x @ A` intermediate" check, which could not fire, and its test.
+- **CCR checkpointing.**
+  - `--checkpoint-compress fp16`.
+  - `@checkpoint(policy="selective")`, and `@checkpoint` on models and model methods (now errors).
+  - Arm E (`--checkpoint-stride auto`) of the 1B pipeline benchmark.
+- **Quantization, KV compression and sparse tensors.**
+  - The weight-aware CSR sparse matmul (`try_sparse_matmul`, `nsl_sparse_matmul`) and `NSL_M52C_SPARSE_MATMUL`.
+  - `nsl_awq_pre_scale_weight`, `awq_quantize_with_scales`, the `awq4` quant-block lowering, `CodegenError::missing_scales`.
+  - The `@kv_compress`/`@sparse` validators and the `@fp4_compute` extractor.
+  - general sparse tensors (M50): the type, sparse codegen and planning, the COO/CSR/CSC/BSR runtime library, the SpMM/SpMV kernels and the `nsl_sparse_*` ABI rows. Preserved at tag `attic/sparse-tensors-2026-11`.
+  - the AWQ calibration hook, `@quantize` model discovery, the AWQ snapshot test and its CI workflow, and `nsl_awq_write_sidecar`.
+  - the H2O and sliding-window KV eviction managers and their FFI.
+- **Accumulation (FASE), packing (PCA) and data loading.**
+  - `nsl-codegen`: `fase_clip.rs`, `fase_memory.rs`, `pca_tileskip.rs`, `pca_segment::plan_kernel`, `pca_rope::plan`, `stmt_fase::emit_deferred_accumulate` / `emit_deferred_final_step`, the `SgdMomentum` plan variant, `UpdateRecipe::v_uses_approx`, and the training report's `memory` field.
+- **Distillation and source AD.**
+  - `crates/nsl-codegen/src/cpkd_spectral.rs` (no callers) and the build-report line that pointed at it.
+  - The sigmoid-form GPU GELU kernels (`nsl_gelu_f32` as `x·σ(1.702x)`, `nsl_gelu_backward_srcad_f32`).
+- **CSHA attention kernels.**
+  - The `a4_grid_y_*` unit tests in `nsl-runtime`, which pinned the defective grid formula against a copy of itself.
 
 - **The `@rope` decorator is refused.** It asked `@flash_attention` for
   in-kernel RoPE, but the feature was never wired.
