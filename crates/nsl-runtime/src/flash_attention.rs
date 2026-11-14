@@ -1809,29 +1809,34 @@ fn csha_is_fused_projection_kernel(name_ptr: i64) -> bool {
     name_bytes[pos..].windows(3).any(|w| w == b"_p1")
 }
 
-/// Tier B.1 per-call x-scratch RAII holder. Drop queues the GPU scratch
-/// buffer for a stream-ordered deferred free (p3-remainder): a NULL-stream
-/// event is recorded after the main kernel that reads the scratch, and the
-/// raw `cuMemFree` runs once that event completes — no host stall on the
-/// inference hot path. `NSL_CUDA_SYNC=1` restores the eager sync-then-free.
+/// Tier B.1 per-call scratch RAII holder: the re-laid-out copy of `x` and
+/// of the three projection weights. Drop queues the buffers for a
+/// stream-ordered deferred free (p3-remainder): a NULL-stream event is
+/// recorded after the main kernel that reads them, and the raw `cuMemFree`s
+/// run once that event completes — no host stall on the inference hot path.
+/// `NSL_CUDA_SYNC=1` restores the eager sync-then-free.
 ///
-/// **W is NOT held here.** Chunkified Wq/Wk/Wv buffers are owned by
-/// the process-global cache in `cuda::tier_b1_prepass::w_cache` —
-/// weights are static across inference calls, so caching them avoids
-/// re-running `launch_w_prepass` on every call.
+/// The weights are converted on every call. They used to be kept in a
+/// process-wide cache keyed on the weight tensor's device address, which
+/// was never invalidated or freed: after an in-place weight update, or
+/// when a freed address was reused by another tensor of the same shape,
+/// the kernel ran on the old weights.
 #[cfg(feature = "cuda")]
 struct PrepassScratch {
-    x_scratch: *mut std::ffi::c_void,
+    /// x, then Wq, Wk, Wv. Null slots are skipped.
+    buffers: [*mut std::ffi::c_void; 4],
 }
 
 #[cfg(feature = "cuda")]
 impl Drop for PrepassScratch {
     fn drop(&mut self) {
-        // Stream-ordered deferred free — see the struct doc. `defer_free_device`
-        // ignores a null pointer and records the completion event on the same
-        // NULL stream the main kernel launched on, so the free cannot run
-        // before that kernel finishes reading the scratch.
-        crate::cuda::inner::defer_free_device(self.x_scratch);
+        // Stream-ordered deferred free — see the struct doc. Each completion
+        // event is recorded on the same NULL stream the main kernel launched
+        // on, so no free can run before that kernel finishes reading the
+        // buffer. `defer_free_device` ignores a null pointer.
+        for buffer in self.buffers {
+            crate::cuda::inner::defer_free_device(buffer);
+        }
     }
 }
 
@@ -1845,45 +1850,90 @@ impl Drop for PrepassScratch {
 /// keep the handle alive until after the main kernel launch, so the event
 /// is recorded after the consuming kernel.
 ///
-/// Returns `None` when the kernel is not Tier B.1 (caller uses original
-/// pointers unchanged).
+/// Returns `Ok(None)` when the kernel is not Tier B.1 (caller uses the
+/// original pointers unchanged), and `Err(())` when it is Tier B.1 and the
+/// pre-pass cannot serve the call: the caller must then refuse the launch,
+/// because the kernel was compiled to read the re-laid-out buffers and
+/// would read the originals as garbage.
+///
+/// The pre-passes handle ONE batch element and ONE head: the `x` pre-pass
+/// has no batch dimension (grid `[seq, 1, 1]` over a `[seq, d_model]`
+/// input) and the weight pre-pass converts `head_dim` columns. A larger
+/// batch or head count is refused here.
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments, clippy::result_unit_err)]
 fn csha_tier_b1_prepass_substitute(
     name_ptr: i64,
     x_data: u64, nw_data: u64,
     wq_data: u64, wk_data: u64, wv_data: u64,
+    batch: i64, heads: i64,
     seq_len: i64, head_dim: i64, d_model: i64,
     rmsnorm_eps_bits: i64,
-) -> Option<(u64, u64, u64, u64, PrepassScratch)> {
-    let chunk = csha_tier_b1_chunk_for_kernel(name_ptr)? as u64;
+) -> Result<Option<(u64, u64, u64, u64, PrepassScratch)>, ()> {
+    let Some(chunk) = csha_tier_b1_chunk_for_kernel(name_ptr) else {
+        return Ok(None);
+    };
+    let chunk = chunk as u64;
+    if batch != 1 || heads != 1 {
+        crate::nsl_log!(ERROR, "csha-tier-b1",
+            "[csha-tier-b1] kernel {:?} was launched with batch={batch}, heads={heads}; the \
+             Tier B.1 pre-passes handle one batch element and one head only — refusing",
+            csha_kernel_name_for_diag(name_ptr),
+        );
+        return Err(());
+    }
     if x_data == 0 || nw_data == 0 || wq_data == 0 || wk_data == 0 || wv_data == 0 {
-        return None;
+        crate::nsl_log!(ERROR, "csha-tier-b1",
+            "[csha-tier-b1] kernel {:?} needs x, the norm weight and Wq/Wk/Wv; a null one \
+             was passed — refusing",
+            csha_kernel_name_for_diag(name_ptr),
+        );
+        return Err(());
     }
     let seq = seq_len as u64;
     let dm = d_model as u64;
     let hd = head_dim as u64;
-    debug_assert_eq!(dm % chunk, 0, "d_model ({}) must be divisible by chunk ({})", dm, chunk);
-    let n_chunks = dm / chunk;
-    // X scratch is per-call (x changes every step). W is cached
-    // process-globally (weights are static across inference calls).
-    let x_bytes = (n_chunks * seq * chunk * 2) as usize;
-    let x_scratch = crate::cuda::inner::alloc_device(x_bytes);
-    if x_scratch.is_null() {
-        return None;
+    if chunk == 0 || !dm.is_multiple_of(chunk) || !hd.is_power_of_two() || !chunk.is_power_of_two() {
+        crate::nsl_log!(ERROR, "csha-tier-b1",
+            "[csha-tier-b1] kernel {:?}: d_model={dm} must be a multiple of chunk={chunk}, and \
+             chunk and head_dim={hd} powers of two — refusing",
+            csha_kernel_name_for_diag(name_ptr),
+        );
+        return Err(());
     }
-    let scratch = PrepassScratch { x_scratch };
+    let n_chunks = dm / chunk;
+    // All four scratch buffers are per-call and owned by `scratch`, whose
+    // drop frees whatever was allocated on every exit path below.
+    let x_bytes = (n_chunks * seq * chunk * 2) as usize;
+    let w_bytes = (n_chunks * hd * chunk * 2) as usize;
+    let mut scratch = PrepassScratch { buffers: [std::ptr::null_mut(); 4] };
+    scratch.buffers[0] = crate::cuda::inner::alloc_device(x_bytes);
+    if scratch.buffers[0].is_null() {
+        return Err(());
+    }
     let eps = f32::from_bits(rmsnorm_eps_bits as u32);
     let rc_x = crate::cuda::tier_b1_prepass::launch_x_prepass(
-        x_data, nw_data, scratch.x_scratch as u64, seq, dm, chunk, eps,
+        x_data, nw_data, scratch.buffers[0] as u64, seq, dm, chunk, eps,
     );
     if rc_x as u32 != 0 {
         crate::nsl_log!(ERROR, "csha-tier-b1", "[csha-tier-b1] x prepass launch failed rc={:?}", rc_x);
-        return None;
+        return Err(());
     }
-    let wq_cached = crate::cuda::tier_b1_prepass::w_chunkified_cached(wq_data, dm, hd, chunk)?;
-    let wk_cached = crate::cuda::tier_b1_prepass::w_chunkified_cached(wk_data, dm, hd, chunk)?;
-    let wv_cached = crate::cuda::tier_b1_prepass::w_chunkified_cached(wv_data, dm, hd, chunk)?;
-    Some((scratch.x_scratch as u64, wq_cached, wk_cached, wv_cached, scratch))
+    for (slot, w_data) in [(1usize, wq_data), (2, wk_data), (3, wv_data)] {
+        scratch.buffers[slot] = crate::cuda::inner::alloc_device(w_bytes);
+        if scratch.buffers[slot].is_null() {
+            return Err(());
+        }
+        let rc_w = crate::cuda::tier_b1_prepass::launch_w_prepass(
+            w_data, scratch.buffers[slot] as u64, dm, hd, chunk,
+        );
+        if rc_w as u32 != 0 {
+            crate::nsl_log!(ERROR, "csha-tier-b1", "[csha-tier-b1] W prepass launch failed rc={:?}", rc_w);
+            return Err(());
+        }
+    }
+    let [x_s, wq_s, wk_s, wv_s] = scratch.buffers.map(|b| b as u64);
+    Ok(Some((x_s, wq_s, wk_s, wv_s, scratch)))
 }
 
 /// A.2.5: this replaces the pre-A.2.5 forwarder (which invoked
@@ -2193,21 +2243,29 @@ pub extern "C" fn nsl_flash_attention_csha(
         // completion event, then frees once it fires). It MUST live until
         // after `kernel_launch` returns — dropping earlier would record the
         // event before the consuming kernel, allowing the free to race.
-        let _prepass_handle = if let Some((nx, nwq, nwk, nwv, handle)) =
-            csha_tier_b1_prepass_substitute(
-                effective_name_ptr,
-                x, nw, wq, wk, wv,
-                seq_len, head_dim, d_model,
-                rmsnorm_eps_bits,
-            )
-        {
-            x = nx;
-            wq = nwq;
-            wk = nwk;
-            wv = nwv;
-            Some(handle)
-        } else {
-            None
+        let _prepass_handle = match csha_tier_b1_prepass_substitute(
+            effective_name_ptr,
+            x, nw, wq, wk, wv,
+            batch, heads,
+            seq_len, head_dim, d_model,
+            rmsnorm_eps_bits,
+        ) {
+            Ok(Some((nx, nwq, nwk, nwv, handle))) => {
+                x = nx;
+                wq = nwq;
+                wk = nwk;
+                wv = nwv;
+                Some(handle)
+            }
+            Ok(None) => None,
+            Err(()) => {
+                // A Tier B.1 kernel the pre-pass cannot serve (logged
+                // there). Nothing was launched; release the output staging.
+                if out_needs_widen {
+                    crate::cuda::inner::free_managed(out_f16);
+                }
+                return -1;
+            }
         };
         // Tier C activation-save pointers — always null for this FFI; the
         // `nsl_flash_attention_csha_with_saves` FFI passes real pointers.
@@ -2618,26 +2676,34 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
         // compiled with `skip_rmsnorm_prologue=true` so it reads the
         // pre-pass'd x directly.
         //
-        // `_prepass_handle` is RAII: its Drop queues the per-call x-scratch
+        // `_prepass_handle` is RAII: its Drop queues the per-call scratch
         // for a stream-ordered deferred free (records a NULL-stream event,
         // frees once it fires). It MUST live until after `kernel_launch`
         // returns — dropping earlier would record the event before the
         // consuming kernel, allowing the free to race.
-        let _prepass_handle = if let Some((nx, nwq, nwk, nwv, handle)) =
-            csha_tier_b1_prepass_substitute(
-                effective_name_ptr,
-                x, nw, wq, wk, wv,
-                seq_len, head_dim, d_model,
-                rmsnorm_eps_bits,
-            )
-        {
-            x = nx;
-            wq = nwq;
-            wk = nwk;
-            wv = nwv;
-            Some(handle)
-        } else {
-            None
+        let _prepass_handle = match csha_tier_b1_prepass_substitute(
+            effective_name_ptr,
+            x, nw, wq, wk, wv,
+            batch, heads,
+            seq_len, head_dim, d_model,
+            rmsnorm_eps_bits,
+        ) {
+            Ok(Some((nx, nwq, nwk, nwv, handle))) => {
+                x = nx;
+                wq = nwq;
+                wk = nwk;
+                wv = nwv;
+                Some(handle)
+            }
+            Ok(None) => None,
+            Err(()) => {
+                // A Tier B.1 kernel the pre-pass cannot serve (logged
+                // there). Nothing was launched; release the output staging.
+                if out_needs_widen {
+                    crate::cuda::inner::free_managed(out_f16);
+                }
+                return -1;
+            }
         };
 
         // Activation-save pointers: raw device buffers — pass through.
