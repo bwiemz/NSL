@@ -135,7 +135,7 @@ pub(crate) fn module_data_to_wrga_inputs(
             .map(|c| WrgaDecoratorConfig {
                 mode: c.block.mode,
                 budget: c.block.budget,
-                target: None,
+                target: c.target_name.clone(),
                 layers: c.block.layers.clone(),
                 custom_adapter: c.adapter_name.clone(),
             })
@@ -171,9 +171,38 @@ pub(crate) fn module_data_to_wrga_inputs(
             })
             .collect(),
         ablation: Default::default(),
+        adapters_inherited: false,
     };
     nsl_cli::analysis_bridges::apply_wrga_check_overrides(&mut inputs, ctx);
     inputs
+}
+
+/// `base` with the entry module's `@adapter` decorators handed down, for
+/// compiling (or laying out the models of) a module the entry imports.
+///
+/// A model's constructor and methods are compiled with the module that
+/// defines it, so an adapter on an imported model (the standard library's
+/// `Linear`, or a model kept in its own file) has to be built there: that
+/// compile reserves the adapter slot in the model's layout, fills it in the
+/// constructor and rewrites the forward pass. Without the decorators it did
+/// none of that, and the entry module's `@adapter` found no model to attach
+/// to. Every compile of the build must agree on the layout, including the
+/// throw-away ones that only collect an imported module's layouts.
+pub(crate) fn options_for_imported_module(
+    base: &nsl_codegen::CompileOptions,
+    entry: &crate::loader::ModuleData,
+) -> nsl_codegen::CompileOptions {
+    let mut options = base.clone();
+    if !entry.adapter_configs.is_empty() {
+        let adapter =
+            module_data_to_wrga_inputs(entry, &nsl_codegen::WrgaCheckContext::default()).adapter;
+        options.wrga.inputs = Some(nsl_codegen::WrgaInputs {
+            adapter,
+            adapters_inherited: true,
+            ..Default::default()
+        });
+    }
+    options
 }
 
 /// CFTP §4.4 G3 (Sprint 2): bridge `@fused_lm_ce(...)` configs from

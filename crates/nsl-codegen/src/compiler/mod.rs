@@ -1052,6 +1052,10 @@ pub struct Compiler<'a> {
     /// baked into each GatedLoRA call site's `kernel_handle` arg.
     pub fused_gatedlora_ptx_kernels:
         std::collections::HashMap<crate::wrga_fused_ptx::LoraKernelKey, String>,
+    /// Deduplicated fused-IA³ PTX kernel cache, keyed like the two above
+    /// with `rank = 0`. Its registration handles follow the gated-LoRA ones.
+    pub fused_ia3_ptx_kernels:
+        std::collections::HashMap<crate::wrga_fused_ptx::LoraKernelKey, String>,
     pub synth_call_names: std::collections::HashMap<nsl_ast::NodeId, String>,
 
     // ── Calibration retention pass (Task 4) ─────────────────────
@@ -1285,6 +1289,7 @@ impl<'a> Compiler<'a> {
             csha_forward_saves: std::collections::HashMap::new(),
             fused_ptx_kernels: std::collections::HashMap::new(),
             fused_gatedlora_ptx_kernels: std::collections::HashMap::new(),
+            fused_ia3_ptx_kernels: std::collections::HashMap::new(),
             synth_call_names: std::collections::HashMap::new(),
             retention_arena_data_id: None,
             retention_offsets: std::collections::HashMap::new(),

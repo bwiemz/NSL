@@ -273,6 +273,15 @@ fn run_build_shared_multi(
 
     let mut obj_files: Vec<PathBuf> = Vec::new();
 
+    // The entry's `@adapter` decorators go with the modules it imports (see
+    // `options_for_imported_module`).
+    let entry_data = &graph.modules[&graph.entry];
+    let imported_options = crate::pipeline::options_for_imported_module(options, entry_data);
+    let layout_options = crate::pipeline::options_for_imported_module(
+        &nsl_codegen::CompileOptions::default(),
+        entry_data,
+    );
+
     // Compile each module in dependency order (same as run_build_multi but with shared_lib options)
     for path in &graph.dep_order {
         let mod_data = &graph.modules[path];
@@ -304,7 +313,7 @@ fn run_build_shared_multi(
                 let mut temp_compiler = match nsl_codegen::compiler::Compiler::new(
                     &interner,
                     &dep_data.type_map,
-                    &nsl_codegen::CompileOptions::default(),
+                    &layout_options,
                 ) {
                     Ok(c) => c,
                     Err(e) => crate::pipeline::exit_on_codegen_error_in(&source_map, &e, dep_path),
@@ -476,7 +485,7 @@ fn run_build_shared_multi(
             // linked into the same shared library. See
             // `ExportOptions::emit_table` for why the two are
             // separate flags.
-            let mut import_options = options.clone();
+            let mut import_options = imported_options.clone();
             import_options.export.emit_table = false;
             match nsl_codegen::compile_module(
                 &mod_data.ast,

@@ -51,22 +51,19 @@ use std::sync::{Mutex, OnceLock};
 static WARNED_UNMATERIALIZED_ADAPTER: AtomicBool = AtomicBool::new(false);
 
 /// Emit a one-time stderr warning when a fused-adapter FFI is called with
-/// null adapter tensors. This happens when `@adapter` is used in a
-/// forward-only / inference-only program: the side-table is materialized
-/// only inside a `train` block (`emit_adapter_init_sidetable`), so a
-/// forward-only program leaves the slots null. `expr/access.rs`'s null-base
-/// guard yields 0 for those fields, and the FFIs below fall back to the base
-/// `x @ W` forward rather than dereferencing null adapter tensors (which used
-/// to segfault). See
-/// docs/plans/2026-05-23-wrga-b4-fused-forward-staging-scope.md.
+/// null adapter tensors. The side-table is built by the model's constructor
+/// (`emit_adapter_init_sidetable`), in a forward-only program as much as in
+/// a training one, so a null tensor means an instance no constructor built.
+/// `expr/access.rs`'s null-base guard yields 0 for those fields, and the FFIs
+/// below fall back to the base `x @ W` forward rather than dereferencing
+/// null adapter tensors.
 fn warn_unmaterialized_adapter_once() {
     if !WARNED_UNMATERIALIZED_ADAPTER.swap(true, Ordering::Relaxed) {
         crate::nsl_log!(WARN, "nsl-wrga", 
-            "[nsl-wrga] @adapter field accessed before materialization (adapter \
-             tensors are null) - running base `x @ W` forward WITHOUT the adapter. \
-             Adapters materialize only inside a `train` block; there is no \
-             inference-only materialization path today. See \
-             docs/plans/2026-05-23-wrga-b4-fused-forward-staging-scope.md."
+            "[nsl-wrga] a fused adapter call received a null adapter tensor - running the \
+             base `x @ W` forward WITHOUT the adapter. Every constructor of an adapted \
+             model builds its adapter tensors, so this is a model instance that was not \
+             built by its constructor."
         );
     }
 }
@@ -463,15 +460,23 @@ fn try_cuda_launch_fused_ia3(
     ));
     let out_ptr = Box::into_raw(out_box);
 
+    // The kernel's six parameters: x, W, gamma, y, then the runtime row and
+    // column counts it predicates its tail tiles on. Only the first four
+    // were passed, so a launch would have read the two counts from past the
+    // argument list.
     let mut x_data = xt.data as u64;
     let mut w_data = wt.data as u64;
     let mut g_data = gt.data as u64;
     let mut y_data = out_data as u64;
-    let args: [*mut c_void; 4] = [
+    let mut m_rows_u32: u32 = m as u32;
+    let mut n_cols_u32: u32 = n as u32;
+    let args: [*mut c_void; 6] = [
         &mut x_data as *mut _ as *mut c_void,
         &mut w_data as *mut _ as *mut c_void,
         &mut g_data as *mut _ as *mut c_void,
         &mut y_data as *mut _ as *mut c_void,
+        &mut m_rows_u32 as *mut _ as *mut c_void,
+        &mut n_cols_u32 as *mut _ as *mut c_void,
     ];
 
     let grid = [(m + 15) / 16, (n + 7) / 8, 1];

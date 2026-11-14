@@ -23,13 +23,14 @@
 use std::collections::BTreeSet;
 
 use crate::compiler::Compiler;
+use crate::error::CodegenError;
 use crate::cost_model::BoundClassification;
 use crate::wengert::{VarId, WengertList};
 use crate::wrga::WrgaPlan;
 use crate::wrga_adapter_inject;
 use crate::wrga_fused_ptx::{
-    synthesize_fused_gatedlora_ptx, synthesize_fused_lora_ptx, FusedGatedLoraConfig,
-    FusedLoraConfig,
+    synthesize_fused_gatedlora_ptx, synthesize_fused_ia3_ptx, synthesize_fused_lora_ptx,
+    FusedGatedLoraConfig, FusedIa3Config, FusedLoraConfig, LoraKernelKey,
 };
 use crate::wrga_fusion::{build_fusion_plan, FusionPlan, FusionTarget};
 use crate::wrga_memory::MemoryPlan;
@@ -44,13 +45,23 @@ use crate::wrga_roofline::{AdapterKind as RooflineAdapterKind, AdapterPlacement,
 /// Must be called AFTER `collect_models` (so `model_field_types` is
 /// populated) and BEFORE `compile_user_functions` (so model-method
 /// compilation sees the sites).
-pub(crate) fn prescan_adapter_sites_from_decorators(compiler: &mut Compiler<'_>) {
+///
+/// An `@adapter` target that does not resolve is an error (see
+/// [`wrga_adapter_inject::resolve_sites`]).
+pub(crate) fn prescan_adapter_sites_from_decorators(
+    compiler: &mut Compiler<'_>,
+) -> Result<(), CodegenError> {
     let Some(inputs) = compiler.wrga_inputs.as_ref() else {
-        return;
+        return Ok(());
     };
     if inputs.adapter.is_empty() {
-        return;
+        return Ok(());
     }
+    let scope = if inputs.adapters_inherited {
+        wrga_adapter_inject::TargetScope::OwnModelsOnly
+    } else {
+        wrga_adapter_inject::TargetScope::AllTargets
+    };
 
     let mut placements: Vec<AdapterPlacement> = Vec::new();
     for cfg in &inputs.adapter {
@@ -93,7 +104,7 @@ pub(crate) fn prescan_adapter_sites_from_decorators(compiler: &mut Compiler<'_>)
     }
 
     if placements.is_empty() {
-        return;
+        return Ok(());
     }
 
     let empty_wengert = WengertList {
@@ -119,9 +130,13 @@ pub(crate) fn prescan_adapter_sites_from_decorators(compiler: &mut Compiler<'_>)
         override_diagnostics: Vec::new(),
         ablation: Default::default(),
         custom_adapter: None,
+        adapters_declared: true,
+        unsized_sites: 0,
+        rank_site_mn: Vec::new(),
+        fused_kernels_active: false,
     };
 
-    let inject = wrga_adapter_inject::run_with_compiler(&mut plan, compiler);
+    let inject = wrga_adapter_inject::resolve_sites(&mut plan, compiler, scope)?;
     // B.3 Task 4: run the fusion decision pass and wire the resulting
     // `FusionTarget` onto each `AdapterSite`, then synthesise + dedup
     // the PTX kernel per unique `(m, n, k, rank, target_sm)` key.  For
@@ -143,11 +158,16 @@ pub(crate) fn prescan_adapter_sites_from_decorators(compiler: &mut Compiler<'_>)
     }
 
     // PTX synthesis + dedup.  Only runs for EpilogueFusedLora /
-    // EpilogueFusedGatedLora sites whose site record has resolved dimensions
-    // (input_dim/output_dim non-zero).  Target sm is read from the compile
-    // target; defaults to 80 when absent (the PTX asserts sm >= 80 anyway).
+    // EpilogueFusedGatedLora sites whose weight shape is a literal
+    // (input_dim/output_dim non-zero): a kernel is synthesized per shape.
+    // Target sm is read from the compile target; defaults to 80 when absent
+    // (the PTX asserts sm >= 80 anyway).
+    //
+    // Only the module that carries the decorators registers kernels with the
+    // runtime (`main_entry`), so only it synthesizes them: a handle minted by
+    // an imported module would index a registry that module never fills.
     let target_sm = compiler.target_sm().unwrap_or(80);
-    if target_sm >= 80 {
+    if target_sm >= 80 && scope == wrga_adapter_inject::TargetScope::AllTargets {
         for site in &sites {
             match site.fusion_decision.as_ref() {
                 Some(FusionTarget::EpilogueFusedLora { rank }) => {
@@ -191,13 +211,145 @@ pub(crate) fn prescan_adapter_sites_from_decorators(compiler: &mut Compiler<'_>)
                         .entry(key)
                         .or_insert_with(|| synthesize_fused_gatedlora_ptx(&cfg));
                 }
+                Some(FusionTarget::ActivationFusedIa3) => {
+                    // The IA³ kernel was synthesized by nothing: every IA³
+                    // call carried handle -1, so the "fused" IA³ site could
+                    // only ever run the ordinary operations.
+                    if site.input_dim == 0 || site.output_dim == 0 {
+                        continue;
+                    }
+                    let cfg = FusedIa3Config {
+                        site_id: site.site_id.clone(),
+                        m: 1,
+                        n: site.output_dim,
+                        k: site.input_dim,
+                        target_sm,
+                    };
+                    let key = LoraKernelKey {
+                        m: cfg.m,
+                        n: cfg.n,
+                        k: cfg.k,
+                        rank: 0,
+                        target_sm,
+                    };
+                    compiler
+                        .fused_ia3_ptx_kernels
+                        .entry(key)
+                        .or_insert_with(|| synthesize_fused_ia3_ptx(&cfg));
+                }
                 _ => continue,
             }
         }
     }
 
+    // The fused kernels are an opt-in whose cost is not visible in the
+    // program: say what was opted into. They take 16-bit float fragments, so
+    // the whole site, the base product `x @ W` included, is computed in half
+    // precision (a result off by 1e-3 where the ordinary operations are good
+    // to 1e-6), and they measured slower than the ordinary GEMMs.
+    let fused_kernels = compiler.fused_ptx_kernels.len()
+        + compiler.fused_gatedlora_ptx_kernels.len()
+        + compiler.fused_ia3_ptx_kernels.len();
+    if fused_kernels > 0 && crate::wrga_adapter_rewrite::fused_path_selected(compiler.target_sm()) {
+        nsl_log::nsl_log!(
+            WARN,
+            "wrga",
+            "[wrga] NSL_WRGA_FUSED_CUDA=1: {fused_kernels} adapter kernel(s) synthesized. On \
+             the GPU an adapted matmul then runs in half precision (16-bit floats), the base \
+             product `x @ W` included: expect about three significant digits where the \
+             ordinary operations give seven. Unset NSL_WRGA_FUSED_CUDA to use the ordinary \
+             operations."
+        );
+    }
+
     compiler.bus.publish_adapter_sites(sites);
     compiler.bus.publish_wrga_plan(plan);
+    Ok(())
+}
+
+impl Compiler<'_> {
+    /// Hold a train block's model to what its `@wrga(...)` decorators ask
+    /// for, in both AD modes: a `target=` that names a GPU the analysis
+    /// knows, and a `budget=` the declared adapters fit in.
+    ///
+    /// `param_paths` is the train block's parameter list; the adapters'
+    /// tensors are in it, one set per instance of an adapted model.
+    ///
+    /// `budget=N` used to reach only the rank suggestions of
+    /// `--wrga-report`, and there as a number of ranks: it bounded nothing.
+    /// The ranks that exist are the ones `@adapter` declares, so the budget
+    /// is checked against them: a model whose adapters hold more than `N`
+    /// parameters does not compile.
+    pub(crate) fn check_wrga_decorators(
+        &self,
+        model_var_name: &str,
+        model_type_name: &str,
+        param_paths: &[String],
+    ) -> Result<(), CodegenError> {
+        let Some(inputs) = self.wrga_inputs.as_ref() else {
+            return Ok(());
+        };
+        for cfg in &inputs.wrga {
+            if let Some(name) = cfg.target.as_deref().filter(|n| !n.is_empty())
+                && crate::wrga::resolve_gpu(name).is_none()
+            {
+                return Err(CodegenError::new(format!(
+                    "WRGA target '{name}' (from @wrga(target=...) or --wrga-target) is not a \
+                     GPU the analysis knows; known targets: {}",
+                    crate::wrga::known_gpu_names().join(", ")
+                )));
+            }
+        }
+        let Some(budget) = inputs.wrga.iter().find_map(|c| c.budget).filter(|b| *b > 0) else {
+            return Ok(());
+        };
+        let budget = budget as usize;
+        let mut total = 0usize;
+        for path in param_paths {
+            let leaf = path.rsplit('.').next().unwrap_or(path);
+            if !crate::expr::access::is_synthesized_adapter_field_name(leaf) {
+                continue;
+            }
+            let Some((class, _)) = self.resolve_param_owner(model_type_name, path) else {
+                continue;
+            };
+            let Some(site) = self
+                .bus
+                .adapter_sites()
+                .iter()
+                .find(|s| s.target_model == class && s.synthesized_fields.iter().any(|f| f == leaf))
+            else {
+                continue;
+            };
+            if site.input_dim == 0 || site.output_dim == 0 {
+                return Err(CodegenError::new(format!(
+                    "@wrga(budget={budget}) cannot be checked: the shape of '{}.{}' is not a \
+                     literal in the model definition, so the size of its adapter is not known \
+                     at compile time. Remove the budget, or give the weight a literal shape",
+                    site.target_model, site.target_field
+                )));
+            }
+            let (n_in, n_out) = (site.input_dim as usize, site.output_dim as usize);
+            let rank = site.rank.max(1) as usize;
+            total += if leaf.starts_with("lora_A_") {
+                n_in * rank
+            } else if leaf.starts_with("lora_B_") {
+                rank * n_out
+            } else {
+                // `ia3_scale_*` and `gate_*`: one value per output channel.
+                n_out
+            };
+        }
+        if total > budget {
+            return Err(CodegenError::new(format!(
+                "@wrga(budget={budget}): the adapters on '{model_var_name}' hold {total} \
+                 parameters, {} over the budget. Lower a rank, adapt fewer weights, or raise \
+                 the budget",
+                total - budget
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// WRGA B.3.2 Option 3 phase 3e: apply the adapter rewrite to

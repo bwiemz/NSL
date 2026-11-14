@@ -651,6 +651,12 @@ pub struct WrgaInputs {
     pub freeze: Vec<FreezeDecoratorConfig>,
     /// Validated `@adapter(...)` configs.
     pub adapter: Vec<AdapterDecoratorConfig>,
+    /// Whether `adapter` holds the decorators of the module that imports this
+    /// one, handed down so that this module builds the adapters of the models
+    /// it defines (a model's constructor and methods are compiled with the
+    /// module that defines it). Such a compile resolves only the targets that
+    /// name its own models; the importing module checks them all.
+    pub adapters_inherited: bool,
     /// Paper §9.3 ablation harness — per-Innovation skip flags forwarded to
     /// `wrga::run`. Default `WrgaAblation::default()` (= all false = no
     /// ablation, standard WRGA). Set via `nsl check --wrga-ablate=<name>`.
@@ -2352,7 +2358,7 @@ pub fn compile_and_calibrate(
         compiler.register_batched_functions(&vmap_results);
         compiler.compile_datatype_defs(&parsed.module.stmts)?;
         compiler.compile_kernels(&parsed.module.stmts)?;
-        crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler);
+        crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler)?;
         // #134 (c-i) wrapper-level firing — spec §4.1 + §8.1 commit 3.
         // Previously: compile_train_block fired the calibration harness as a
         // side-effect inside compile_main, coupling calibration to the

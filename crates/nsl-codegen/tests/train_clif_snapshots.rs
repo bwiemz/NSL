@@ -311,6 +311,7 @@ fn with_lora_adapter(options: CompileOptions) -> CompileOptions {
             alpha: Some(2),
         }],
         ablation: Default::default(),
+        adapters_inherited: false,
     };
     CompileOptions {
         wrga: nsl_codegen::WrgaOptions { inputs: Some(inputs), ..Default::default() },

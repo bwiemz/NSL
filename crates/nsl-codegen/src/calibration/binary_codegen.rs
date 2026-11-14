@@ -2170,7 +2170,10 @@ pub fn emit_calibration_model_object(
         "compile flash-attention kernels",
         compiler.compile_flash_attention_kernels(&bundle.ast.stmts),
     )?;
-    crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler);
+    map_codegen_error(
+        "resolve @adapter targets",
+        crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler),
+    )?;
     crate::wrga_prescan::rewrite_model_method_bodies_with_adapter_sites(&mut compiler);
     map_codegen_error(
         "compile user functions",

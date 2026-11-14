@@ -1,14 +1,16 @@
-//! WRGA Milestone B.2 Task 2b: codegen pass that materialises `@adapter`
-//! decorators as synthesized model fields + strict initialisers + forward
-//! rewrite.
+//! WRGA: decide, for each `@adapter(...)` target, which model weight it
+//! adapts, how that weight is used, and which tensors to synthesize for it.
 //!
-//! Runs once per compile, after `wrga::run` produces the `WrgaPlan` (and the
-//! plan has been published to `compiler.bus`), and before the model
-//! struct / forward pass are lowered.  This is the B.2 observation surface:
-//! it only decides synthesized field names and init strategies.  B.3 will
-//! collapse the unfused update `y = x @ W + ((x @ A) @ B) * (alpha / rank)`
-//! into a single MMA epilogue.
+//! A target is written `Class.field`. [`resolve_sites`] finds the class,
+//! checks that the field is a weight tensor, and looks through the class's
+//! methods for the matmul the adapter attaches to. Anything it cannot
+//! resolve is a compile error: an adapter that silently attaches nowhere (or
+//! to another class) trains nothing, or the wrong thing.
+//!
+//! The update itself is `y = x @ W + ((x @ A) @ B) * (alpha / rank)` for
+//! LoRA, written by `wrga_adapter_rewrite`.
 
+use crate::error::CodegenError;
 use crate::wrga::WrgaPlan;
 use crate::AdapterKind;
 
@@ -20,9 +22,9 @@ pub enum InitKind {
     Zeros,
     /// `nsl_tensor_ones` — IA³'s identity-preserving initialiser.
     Ones,
-    /// Kaiming-uniform init — used for LoRA-A (breaks symmetry) and the
-    /// random half of GatedLoRA.
-    KaimingUniform,
+    /// A standard-normal draw scaled by `1 / sqrt(fan_in)` — used for LoRA-A
+    /// (breaks symmetry) and the random half of GatedLoRA.
+    ScaledNormal,
 }
 
 /// Per-field initialisation directive.
@@ -32,48 +34,82 @@ pub struct InitStrategy {
     pub kind: InitKind,
 }
 
+/// How a model's methods use an adapted weight. It decides which axis of the
+/// weight is the input width and which the output width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightUse {
+    /// `x @ self.w`: the weight is `[in, out]`.
+    Direct,
+    /// `x @ self.w.transpose(0, 1)`, the form of the standard library's
+    /// `Linear`: the weight is `[out, in]`.
+    Transposed,
+}
+
+impl WeightUse {
+    /// The weight's axis that holds the input width.
+    pub fn in_axis(self) -> i64 {
+        match self {
+            WeightUse::Direct => 0,
+            WeightUse::Transposed => 1,
+        }
+    }
+
+    /// The weight's axis that holds the output width.
+    pub fn out_axis(self) -> i64 {
+        1 - self.in_axis()
+    }
+}
+
 /// Per-site adapter materialisation decision produced by this pass.
 #[derive(Debug, Clone)]
 pub struct AdapterSite {
-    /// Stable site identifier, e.g. `m_w__lora`. Derived from the target
-    /// parameter name with dots replaced by underscores plus an adapter-kind
-    /// suffix.
+    /// Stable site identifier, e.g. `Toy_w__lora`. Derived from the target
+    /// with dots replaced by underscores plus an adapter-kind suffix.
     pub site_id: String,
     pub kind: AdapterKind,
     pub target_param: String,
     pub rank: i64,
     pub alpha: i64,
     pub synthesized_fields: Vec<String>,
-    /// Input dimension (k_in) of the target weight. Zero when resolution
-    /// failed — callers MUST treat zero as "skip materialisation" and a
-    /// diagnostic will already have been emitted.
+    /// Input width of the adapted matmul when the weight's shape is a
+    /// literal in the model definition, 0 otherwise. The adapter tensors are
+    /// sized from the weight itself when the model is constructed
+    /// (`wrga_adapter_init`), so 0 does not mean "no adapter"; only the
+    /// fused kernel, which is synthesized per shape, needs the static value.
     pub input_dim: u32,
-    /// Output dimension (d_out) of the target weight. Zero when resolution
-    /// failed (see `input_dim`).
+    /// Output width, under the same rule as `input_dim`.
     pub output_dim: u32,
-    /// Resolved model-class name that owns the target field (e.g. `"Toy"`).
-    /// Empty when the target could not be resolved to a known model.
+    /// The model class that owns the target field (e.g. `"Toy"`).
     pub target_model: String,
-    /// Target field name on the model struct (e.g. `"w"` for `"m.w"`).
-    /// Empty on resolution failure.
+    /// Target field name on the model struct (e.g. `"w"`).
     pub target_field: String,
-    /// B.3 Task 4: fusion decision for this site, populated after the
-    /// fusion pass runs.  `None` when no fusion analysis has been run
-    /// (e.g. the prescan path skipped fusion because the target did not
-    /// match).
-    ///
-    /// Variant handling in the AST rewrite (`wrga_adapter_rewrite`):
-    /// - `Some(EpilogueFusedLora)` / `Some(EpilogueFusedGatedLora)` AND
-    ///   target sm >= 80 → single-FFI fused matmul call.
-    /// - `Some(ActivationFusedIa3)` AND target sm >= 80 → single-FFI
-    ///   activation-fused IA³ call.
-    /// - `Some(ReductionFusedAdapter)` (WRGA paper §2.4 pattern 3) → set
-    ///   for IA³ on Sum/Mean/pool sites by the fusion pass; the
-    ///   PTX/FFI emitter for the reduction-fused kernel is deferred,
-    ///   so the rewrite path falls through to the unfused IA³ mul,
-    ///   which is functionally equivalent.
-    /// - Any other variant or `None` → unfused fallback (always correct).
+    /// Which matmul form the model's methods use the weight in.
+    pub weight_use: WeightUse,
+    /// Fusion decision for this site, populated after the fusion pass runs.
+    /// The rewrite emits the single-call fused form only for
+    /// `EpilogueFusedLora` / `EpilogueFusedGatedLora` / `ActivationFusedIa3`
+    /// and only when the fused path is opted in and a kernel was synthesized
+    /// for the site's shape; everything else is the ordinary operations.
     pub fusion_decision: Option<crate::wrga_fusion::FusionTarget>,
+}
+
+impl AdapterSite {
+    /// The number of parameters the adapter adds to ONE instance of its
+    /// model, when the adapted weight's shape is known at compile time:
+    /// `rank · (in + out)` for LoRA, the same plus an `[out]` gate for gated
+    /// LoRA, and `out` for IA³.
+    pub fn param_count(&self) -> Option<usize> {
+        if self.input_dim == 0 || self.output_dim == 0 {
+            return None;
+        }
+        let (n_in, n_out) = (self.input_dim as usize, self.output_dim as usize);
+        let rank = self.rank.max(1) as usize;
+        Some(match self.kind {
+            AdapterKind::Lora => rank * (n_in + n_out),
+            AdapterKind::GatedLora => rank * (n_in + n_out) + n_out,
+            AdapterKind::Ia3 => n_out,
+        })
+    }
 }
 
 /// Result of the inject pass.
@@ -102,57 +138,7 @@ pub fn run(plan: &mut WrgaPlan) -> AdapterInjectResult {
         let alpha = placement.alpha.unwrap_or(rank).max(1);
         let site_id = site_id_for(&placement.name, kind);
 
-        let (fields, inits) = match kind {
-            AdapterKind::Lora => {
-                let a = format!("lora_A_{site_id}");
-                let b = format!("lora_B_{site_id}");
-                (
-                    vec![a.clone(), b.clone()],
-                    vec![
-                        InitStrategy {
-                            field_name: a,
-                            kind: InitKind::KaimingUniform,
-                        },
-                        InitStrategy {
-                            field_name: b,
-                            kind: InitKind::Zeros,
-                        },
-                    ],
-                )
-            }
-            AdapterKind::Ia3 => {
-                let s = format!("ia3_scale_{site_id}");
-                (
-                    vec![s.clone()],
-                    vec![InitStrategy {
-                        field_name: s,
-                        kind: InitKind::Ones,
-                    }],
-                )
-            }
-            AdapterKind::GatedLora => {
-                let a = format!("lora_A_{site_id}");
-                let b = format!("lora_B_{site_id}");
-                let g = format!("gate_{site_id}");
-                (
-                    vec![a.clone(), b.clone(), g.clone()],
-                    vec![
-                        InitStrategy {
-                            field_name: a,
-                            kind: InitKind::KaimingUniform,
-                        },
-                        InitStrategy {
-                            field_name: b,
-                            kind: InitKind::Zeros,
-                        },
-                        InitStrategy {
-                            field_name: g,
-                            kind: InitKind::Zeros,
-                        },
-                    ],
-                )
-            }
-        };
+        let (fields, inits) = synthesized_for(kind, &site_id);
 
         placement.synthesized_fields = fields.clone();
         placement.init_strategies = inits;
@@ -168,18 +154,213 @@ pub fn run(plan: &mut WrgaPlan) -> AdapterInjectResult {
             output_dim: 0,
             target_model: String::new(),
             target_field: String::new(),
+            weight_use: WeightUse::Direct,
             fusion_decision: None,
         });
     }
     AdapterInjectResult { sites }
 }
 
-/// Parse a tensor type string like `"Tensor<[32, 16], f32>"` into its
-/// `(output_dim, input_dim)` shape pair.  Returns None if the string is
-/// not a 2-D tensor type annotation.
+/// The tensors an adapter of `kind` adds for the site `site_id`, with the
+/// initialiser of each, in side-table slot order.
+pub(crate) fn synthesized_for(kind: AdapterKind, site_id: &str) -> (Vec<String>, Vec<InitStrategy>) {
+    let named = |prefix: &str, kind: InitKind| InitStrategy {
+        field_name: format!("{prefix}_{site_id}"),
+        kind,
+    };
+    let inits = match kind {
+        AdapterKind::Lora => vec![
+            named("lora_A", InitKind::ScaledNormal),
+            named("lora_B", InitKind::Zeros),
+        ],
+        AdapterKind::Ia3 => vec![named("ia3_scale", InitKind::Ones)],
+        AdapterKind::GatedLora => vec![
+            named("lora_A", InitKind::ScaledNormal),
+            named("lora_B", InitKind::Zeros),
+            named("gate", InitKind::Zeros),
+        ],
+    };
+    (inits.iter().map(|i| i.field_name.clone()).collect(), inits)
+}
+
+/// The model classes this compile knows that declare a field `field`, sorted.
+fn models_with_field(compiler: &crate::compiler::Compiler<'_>, field: &str) -> Vec<String> {
+    let mut out: Vec<String> = compiler
+        .models
+        .model_method_bodies
+        .keys()
+        .filter(|m| {
+            compiler
+                .types
+                .struct_layouts
+                .get(*m)
+                .is_some_and(|l| l.fields.iter().any(|f| f.name == field))
+        })
+        .cloned()
+        .collect();
+    out.sort();
+    out
+}
+
+/// Which targets a compile is responsible for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetScope {
+    /// The module that carries the `@adapter` decorators: every target must
+    /// resolve, to a model defined here or imported.
+    AllTargets,
+    /// A module the decorated module imports. It materialises the adapters
+    /// of the models it defines, and leaves every other target to the module
+    /// that defines that model; the decorated module reports a target that
+    /// resolves nowhere.
+    OwnModelsOnly,
+}
+
+/// Resolve every `@adapter` target of `plan` against the compiler's models.
 ///
-/// Convention: NSL weights are declared as `Tensor<[out, in], dtype>` so
-/// the first dim is the output channel count and the second is the input.
+/// A target is `Class.field`. The class is taken as written: with models
+/// `Aaa` and `Zzz` both owning a field `w`, `Zzz.w` used to attach the
+/// adapter to `Aaa` (the first class, alphabetically, with such a field) and
+/// say so only at INFO level. A target that names no model, no field, a
+/// field that is not a 2-D weight, or a weight no matmul of the model uses,
+/// is an error: each of those used to leave the adapter tensors allocated
+/// and handed to the optimizer while the forward pass never read them.
+pub fn resolve_sites(
+    plan: &mut WrgaPlan,
+    compiler: &crate::compiler::Compiler<'_>,
+    scope: TargetScope,
+) -> Result<AdapterInjectResult, CodegenError> {
+    use crate::context::FieldKind;
+
+    let mut result = run(plan);
+    let mut resolved: Vec<AdapterSite> = Vec::with_capacity(result.sites.len());
+    for mut site in result.sites.drain(..) {
+        let target = site.target_param.clone();
+        let fail = |why: String| -> CodegenError {
+            CodegenError::new(format!("@adapter target '{target}': {why}"))
+        };
+        let Some((class, field)) = target.split_once('.') else {
+            return Err(fail(
+                "a target is written `Class.field`, the model class and the weight field \
+                 to adapt (for example \"Linear.w\")"
+                    .to_string(),
+            ));
+        };
+        if field.contains('.') {
+            return Err(fail(format!(
+                "a target is written `Class.field` and applies to every instance of the \
+                 class; a path to one instance is not supported. Name the class that \
+                 declares '{}'",
+                field.rsplit('.').next().unwrap_or(field)
+            )));
+        }
+        let defined_here = compiler.types.struct_layouts.contains_key(class)
+            && !compiler.models.imported_model_names.contains(class);
+        if scope == TargetScope::OwnModelsOnly && !defined_here {
+            continue;
+        }
+        let Some(layout) = compiler.types.struct_layouts.get(class) else {
+            let owners = models_with_field(compiler, field);
+            let hint = if owners.is_empty() {
+                format!("and no model has a field '{field}'")
+            } else {
+                format!("models with a field '{field}': {}", owners.join(", "))
+            };
+            return Err(fail(format!(
+                "there is no model named '{class}' (the part before the dot is the model \
+                 class, not a variable); {hint}"
+            )));
+        };
+        let Some(struct_field) = layout.fields.iter().find(|f| f.name == field) else {
+            let tensors: Vec<&str> = layout
+                .fields
+                .iter()
+                .filter(|f| f.kind == FieldKind::Tensor)
+                .map(|f| f.name.as_str())
+                .collect();
+            return Err(fail(format!(
+                "model '{class}' has no field '{field}'; its tensor fields are: {}",
+                if tensors.is_empty() { "(none)".to_string() } else { tensors.join(", ") }
+            )));
+        };
+        match struct_field.kind {
+            FieldKind::Tensor => {}
+            FieldKind::Nested => {
+                let inner = compiler
+                    .models
+                    .model_field_types
+                    .get(class)
+                    .and_then(|m| m.get(field))
+                    .cloned()
+                    .unwrap_or_default();
+                return Err(CodegenError::new(submodel_target_hint(&target, &inner)));
+            }
+            FieldKind::Buffer | FieldKind::Scalar => {
+                return Err(fail(format!(
+                    "'{class}.{field}' is not a weight tensor; an adapter attaches to a \
+                     2-D `Tensor` field used as the right operand of a matmul"
+                )));
+            }
+        }
+        if let Some(rank) = compiler
+            .models
+            .model_field_ranks
+            .get(class)
+            .and_then(|m| m.get(field))
+            && *rank != 2
+        {
+            return Err(fail(format!(
+                "'{class}.{field}' is a {rank}-D tensor; an adapter attaches to a 2-D weight"
+            )));
+        }
+
+        let uses = crate::wrga_adapter_rewrite::count_weight_uses(compiler, class, field);
+        let weight_use = match (uses.direct, uses.transposed) {
+            (0, 0) => {
+                return Err(fail(format!(
+                    "no method of '{class}' computes `x @ self.{field}` or \
+                     `x @ self.{field}.transpose(0, 1)`, the two forms an adapter attaches \
+                     to, so the adapter would be allocated and trained without ever \
+                     entering the forward pass"
+                )));
+            }
+            (_, 0) => WeightUse::Direct,
+            (0, _) => WeightUse::Transposed,
+            _ => {
+                return Err(fail(format!(
+                    "'{class}' uses `self.{field}` both as `x @ self.{field}` and as \
+                     `x @ self.{field}.transpose(0, 1)`; one adapter cannot serve both, \
+                     because its input and output widths would swap between them"
+                )));
+            }
+        };
+
+        // Static widths, when the weight's shape is a literal in a model this
+        // module defines. `model_tensor_field_shapes` holds `Tensor<[d0, d1],
+        // f32>` for exactly those fields.
+        if let Some((d0, d1)) = compiler
+            .models
+            .model_tensor_field_shapes
+            .get(class)
+            .and_then(|m| m.get(field))
+            .and_then(|t| parse_tensor_2d_shape(t))
+        {
+            (site.input_dim, site.output_dim) = match weight_use {
+                WeightUse::Direct => (d0, d1),
+                WeightUse::Transposed => (d1, d0),
+            };
+        }
+        site.target_model = class.to_string();
+        site.target_field = field.to_string();
+        site.weight_use = weight_use;
+        resolved.push(site);
+    }
+    result.sites = resolved;
+    Ok(result)
+}
+
+/// Parse a tensor type string like `"Tensor<[32, 16], f32>"` into its two
+/// dimensions, in declaration order. Returns None if the string is not a
+/// 2-D tensor type annotation.
 pub(crate) fn parse_tensor_2d_shape(type_str: &str) -> Option<(u32, u32)> {
     let open = type_str.find('[')?;
     let close = type_str.find(']')?;
@@ -191,69 +372,17 @@ pub(crate) fn parse_tensor_2d_shape(type_str: &str) -> Option<(u32, u32)> {
     if parts.len() != 2 {
         return None;
     }
-    let out: u32 = parts[0].parse().ok()?;
-    let inp: u32 = parts[1].parse().ok()?;
-    Some((out, inp))
-}
-
-/// Resolve `(input_dim, output_dim)` for an adapter target weight.
-///
-/// Returns `Some((input_dim, output_dim))` when resolution succeeds;
-/// `None` when the model/field is absent or the type isn't a 2-D tensor.
-/// On `None`, the caller must emit a diagnostic — never ship `(0, 0)`
-/// silently onto an `AdapterSite`.
-pub(crate) fn resolve_dims_for_target(
-    model_name: &str,
-    field_name: &str,
-    field_types: &std::collections::HashMap<String, std::collections::HashMap<String, String>>,
-) -> Option<(u32, u32)> {
-    let field_map = field_types.get(model_name)?;
-    let type_str = field_map.get(field_name)?;
-    let (out, inp) = parse_tensor_2d_shape(type_str)?;
-    Some((inp, out))
-}
-
-/// Collect the model classes that declare a field named `field_name`,
-/// consulting `model_tensor_field_shapes` first (the shape-bearing map
-/// populated by `collect_models` for Tensor fields) and falling back to
-/// `model_field_types` only when the shape map has no match (B.2.1
-/// Task 5.5 priority order — do not widen or reorder these sources).
-///
-/// The returned candidates are sorted lexicographically so that "use the
-/// first candidate" tie-breaking is deterministic across runs and
-/// platforms; raw `HashMap` iteration order is randomised per process and
-/// previously made ambiguous-target injection nondeterministic.
-pub(crate) fn candidate_models_for_field<'a>(
-    tensor_shapes: &'a std::collections::HashMap<String, std::collections::HashMap<String, String>>,
-    field_types: &'a std::collections::HashMap<String, std::collections::HashMap<String, String>>,
-    field_name: &str,
-) -> Vec<&'a String> {
-    let mut candidates: Vec<&String> = tensor_shapes
-        .iter()
-        .filter(|(_, fields)| fields.contains_key(field_name))
-        .map(|(name, _)| name)
-        .collect();
-    if candidates.is_empty() {
-        candidates = field_types
-            .iter()
-            .filter(|(_, fields)| fields.contains_key(field_name))
-            .map(|(name, _)| name)
-            .collect();
-    }
-    candidates.sort();
-    candidates
+    let d0: u32 = parts[0].parse().ok()?;
+    let d1: u32 = parts[1].parse().ok()?;
+    Some((d0, d1))
 }
 
 /// Build the diagnostic for an `@adapter` target that names a submodel
 /// field instead of a weight tensor.
 ///
-/// The target resolver (`run_with_compiler`) splits the target string
-/// exactly once on `'.'` and looks the second segment up as a field name
-/// across all known model classes — so only 2-segment `<model>.<field>`
-/// targets can ever resolve.  A 3-segment path such as `"m.sub.weight"`
-/// can NEVER work (the resolver would search for a field literally named
-/// `"sub.weight"`), so the hint must steer users to the 2-segment
-/// `<InnerClass>.<field>` form naming the inner model's weight field.
+/// Only 2-segment `<Class>.<field>` targets resolve, so the hint must steer
+/// users to that form, naming the inner model's weight field; a 3-segment
+/// path such as `"m.sub.weight"` can never work.
 pub(crate) fn submodel_target_hint(target: &str, inner_class: &str) -> String {
     let class = if inner_class.trim().is_empty() {
         "<InnerClass>"
@@ -261,116 +390,12 @@ pub(crate) fn submodel_target_hint(target: &str, inner_class: &str) -> String {
         inner_class.trim()
     };
     format!(
-        "[wrga] @adapter target '{target}': targets a submodel, not a weight tensor; \
+        "@adapter target '{target}': targets a submodel, not a weight tensor; \
          the target resolver only supports 2-segment `<model>.<field>` paths, so \
          adapt the inner model's weight with the 2-segment form \"<InnerClass>.<field>\" \
          (e.g., \"{class}.<weight_field>\"); \
          submodel-level decorators are not yet supported"
     )
-}
-
-/// Wrapper over [`run`] that additionally resolves real `input_dim` /
-/// `output_dim` values on each produced `AdapterSite` by consulting the
-/// compiler's `model_field_types` registry.  On any resolution failure an
-/// `eprintln!` diagnostic is emitted and the site's dims remain zero so
-/// downstream stages skip materialisation.
-pub fn run_with_compiler(
-    plan: &mut WrgaPlan,
-    compiler: &crate::compiler::Compiler,
-) -> AdapterInjectResult {
-    let mut result = run(plan);
-    for site in result.sites.iter_mut() {
-        let target = site.target_param.clone();
-        let (var_name, field_name) = match target.split_once('.') {
-            Some(p) => p,
-            None => {
-                nsl_log::nsl_log!(WARN, "wrga", 
-                    "[wrga] @adapter target '{}' is not a `model.field` form; skipping",
-                    target
-                );
-                continue;
-            }
-        };
-
-        // B.2.1 Task 5.5: search `model_tensor_field_shapes` (the
-        // shape-bearing map populated by `collect_models` for Tensor
-        // fields) before falling back to `model_field_types`.  Candidates
-        // come back lexicographically sorted so "using first" below is
-        // deterministic across runs/platforms.
-        let tensor_shapes = &compiler.models.model_tensor_field_shapes;
-        let field_types = &compiler.models.model_field_types;
-        let mut candidates =
-            candidate_models_for_field(tensor_shapes, field_types, field_name);
-        if candidates.is_empty() {
-            nsl_log::nsl_log!(WARN, "wrga", 
-                "[wrga] @adapter target '{}': field '{}' not found in any known model; \
-                 skipping adapter materialisation (dims remain 0)",
-                target, field_name
-            );
-            continue;
-        }
-        if candidates.len() > 1 {
-            nsl_log::nsl_log!(INFO, "wrga", 
-                "[wrga] @adapter target '{}': field '{}' ambiguous across models {:?}; \
-                 using lexicographically-first; follow-up: thread let-binding type map",
-                target, field_name, candidates
-            );
-        }
-        let model_name = candidates.remove(0).clone();
-        // B.2.1 Task 3: submodel-target detection. If the target field's type
-        // string does not start with `"Tensor<"`, it's a submodel reference
-        // (e.g. a nested model), which is out of scope for B.2.1.
-        // Look up the type string from the shape map first (for Tensor
-        // fields populated by collect_models from the init expr), then
-        // fall back to model_field_types (for sub-model references).
-        let type_str = tensor_shapes
-            .get(&model_name)
-            .and_then(|m| m.get(field_name))
-            .cloned()
-            .or_else(|| {
-                field_types
-                    .get(&model_name)
-                    .and_then(|m| m.get(field_name))
-                    .cloned()
-            })
-            .unwrap_or_default();
-        if !type_str.trim_start().starts_with("Tensor<") {
-            nsl_log::nsl_log!(INFO, "wrga", "{}", submodel_target_hint(&target, &type_str));
-            continue;
-        }
-        match resolve_dims_for_target(&model_name, field_name, tensor_shapes)
-            .or_else(|| resolve_dims_for_target(&model_name, field_name, field_types))
-        {
-            Some((inp, out)) => {
-                site.input_dim = inp;
-                site.output_dim = out;
-                site.target_model = model_name.clone();
-                site.target_field = field_name.to_string();
-            }
-            None => {
-                nsl_log::nsl_log!(WARN, "wrga", 
-                    "[wrga] @adapter target '{}': type string for '{}.{}' \
-                     isn't a 2-D tensor; skipping",
-                    target, model_name, field_name
-                );
-            }
-        }
-        let _ = var_name; // reserved for later let-binding-type-map resolution
-        // B.3: single-pass epilogue requires rank <= 16. Multi-pass is a
-        // follow-up milestone.
-        if site.rank > 16
-            && matches!(site.kind, AdapterKind::Lora | AdapterKind::GatedLora)
-        {
-            nsl_log::nsl_log!(INFO, "wrga", 
-                "[wrga] @adapter(target='{}'): rank={} > 16; B.3 single-pass epilogue \
-                 does not support rank > 16.  Use rank <= 16 or await multi-pass support.",
-                site.target_param, site.rank,
-            );
-            site.input_dim = 0;
-            site.output_dim = 0;
-        }
-    }
-    result
 }
 
 /// Build a stable site identifier from the target parameter path + kind.
@@ -389,39 +414,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dims_for_resolves_from_field_types_registry() {
-        use std::collections::HashMap;
-        let mut inner = HashMap::new();
-        inner.insert("w".to_string(), "Tensor<[32, 16], f32>".to_string());
-        let mut outer = HashMap::new();
-        outer.insert("Toy".to_string(), inner);
-        let (input_dim, output_dim) =
-            resolve_dims_for_target("Toy", "w", &outer).expect("dims must resolve");
-        assert_eq!(input_dim, 16, "input_dim = k_in (second dim of Tensor<[out, in]>)");
-        assert_eq!(output_dim, 32, "output_dim = d_out (first dim)");
+    fn a_2d_shape_string_parses_in_declaration_order() {
+        assert_eq!(parse_tensor_2d_shape("Tensor<[32, 16], f32>"), Some((32, 16)));
+        assert_eq!(parse_tensor_2d_shape("Tensor<[4, 6, 8], f32>"), None);
+        assert_eq!(parse_tensor_2d_shape("Linear"), None);
     }
 
     #[test]
-    fn dims_for_returns_none_on_missing_model() {
-        use std::collections::HashMap;
-        let mut inner = HashMap::new();
-        inner.insert("w".to_string(), "Tensor<[32, 16], f32>".to_string());
-        let mut outer = HashMap::new();
-        outer.insert("Toy".to_string(), inner);
-        assert!(
-            resolve_dims_for_target("Unknown", "w", &outer).is_none(),
-            "unknown model must return None (caller emits diagnostic)",
-        );
-    }
-
-    #[test]
-    fn dims_for_returns_none_on_missing_field() {
-        use std::collections::HashMap;
-        let mut inner = HashMap::new();
-        inner.insert("w".to_string(), "Tensor<[32, 16], f32>".to_string());
-        let mut outer = HashMap::new();
-        outer.insert("Toy".to_string(), inner);
-        assert!(resolve_dims_for_target("Toy", "nonexistent", &outer).is_none());
+    fn the_input_axis_follows_the_matmul_form() {
+        // `x @ w` contracts x's last axis with w's first; `x @ w.transpose(0,
+        // 1)` with w's second.
+        assert_eq!((WeightUse::Direct.in_axis(), WeightUse::Direct.out_axis()), (0, 1));
+        assert_eq!((WeightUse::Transposed.in_axis(), WeightUse::Transposed.out_axis()), (1, 0));
     }
 
     #[test]
@@ -472,66 +476,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn candidate_selection_is_deterministic_across_insertion_orders() {
-        use std::collections::HashMap;
-        let tensor_type = "Tensor<[32, 16], f32>".to_string();
-        // Two insertion orders (and 32 fresh HashMaps, whose SipHash seeds
-        // differ) must always agree: lexicographically-first wins.
-        for i in 0..32 {
-            let mut shapes: HashMap<String, HashMap<String, String>> = HashMap::new();
-            let mut fields = HashMap::new();
-            fields.insert("w".to_string(), tensor_type.clone());
-            if i % 2 == 0 {
-                shapes.insert("Zeta".to_string(), fields.clone());
-                shapes.insert("Alpha".to_string(), fields.clone());
-            } else {
-                shapes.insert("Alpha".to_string(), fields.clone());
-                shapes.insert("Zeta".to_string(), fields.clone());
-            }
-            let empty: HashMap<String, HashMap<String, String>> = HashMap::new();
-            let candidates = candidate_models_for_field(&shapes, &empty, "w");
-            assert_eq!(
-                candidates,
-                vec![&"Alpha".to_string(), &"Zeta".to_string()],
-                "candidates must be sorted so 'use first' is stable (iteration {i})",
-            );
-        }
-    }
-
-    #[test]
-    fn candidate_selection_falls_back_to_field_types_sorted() {
-        use std::collections::HashMap;
-        let shapes: HashMap<String, HashMap<String, String>> = HashMap::new();
-        let mut field_types: HashMap<String, HashMap<String, String>> = HashMap::new();
-        let mut fields = HashMap::new();
-        fields.insert("sub".to_string(), "Inner".to_string());
-        field_types.insert("Outer2".to_string(), fields.clone());
-        field_types.insert("Outer1".to_string(), fields);
-        let candidates = candidate_models_for_field(&shapes, &field_types, "sub");
-        assert_eq!(
-            candidates,
-            vec![&"Outer1".to_string(), &"Outer2".to_string()],
-            "field_types fallback candidates must also be sorted",
-        );
-    }
-
-    #[test]
-    fn candidate_selection_prefers_shape_map_over_field_types() {
-        use std::collections::HashMap;
-        let mut shapes: HashMap<String, HashMap<String, String>> = HashMap::new();
-        let mut shape_fields = HashMap::new();
-        shape_fields.insert("w".to_string(), "Tensor<[32, 16], f32>".to_string());
-        shapes.insert("ShapeModel".to_string(), shape_fields);
-        let mut field_types: HashMap<String, HashMap<String, String>> = HashMap::new();
-        let mut type_fields = HashMap::new();
-        type_fields.insert("w".to_string(), "Inner".to_string());
-        field_types.insert("AaaTypeModel".to_string(), type_fields);
-        let candidates = candidate_models_for_field(&shapes, &field_types, "w");
-        assert_eq!(
-            candidates,
-            vec![&"ShapeModel".to_string()],
-            "shape-map hits must exclude field_types candidates (B.2.1 Task 5.5 order)",
-        );
-    }
 }
