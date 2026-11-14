@@ -250,7 +250,7 @@ pub static MANUAL_CONTRACTS: &[Contract] = &[
     flag("sparse-threshold", CB, "weight-aware", Witness::Config("crates/nsl-codegen/src/weight_aware.rs")),
     flag("no-constant-fold", B_ONLY, "weight-aware", Witness::Config("crates/nsl-codegen/src/expr/advanced.rs")),
     flag("no-dead-weight", B_ONLY, "weight-aware", Witness::Config("crates/nsl-codegen/src/weight_aware.rs")),
-    flag("no-sparse-codegen", B_ONLY, "weight-aware", Witness::Config("crates/nsl-codegen/src/expr/advanced.rs")),
+    flag("no-sparse-codegen", B_ONLY, "weight-aware", Witness::Config("crates/nsl-codegen/src/compiler/entry_points.rs")),
     flag("embed-threshold", B_ONLY, "standalone", Witness::Config("crates/nsl-cli/src/commands/build/standalone.rs")),
     flag("embed-weights", B_ONLY, "standalone", Witness::Config("crates/nsl-cli/src/commands/build/standalone.rs")),
     flag("vram-budget", B_ONLY, "memory-planner", Witness::Config("crates/nsl-codegen/src/memory_planner.rs")),

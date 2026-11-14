@@ -875,21 +875,6 @@ impl Compiler<'_> {
                 return Ok(pass_through);
             }
 
-            // M52c: Try sparse matmul if RHS weight is >50% sparse
-            if op == BinOp::MatMul && !state.flags.is_fp8_compute
-                && let Some(sparse_result) = self.try_sparse_matmul(builder, state, lhs, rhs)?
-            {
-                state.cleanup.tensor_temporaries.push(sparse_result);
-                // ELTLS: nsl_sparse_matmul returns a fresh owned tensor.
-                self.set_ownership(
-                    builder,
-                    state,
-                    sparse_result,
-                    Ownership::Owned,
-                );
-                return Ok(sparse_result);
-            }
-
             // Tensor-tensor ops (normal runtime path)
             let rt_name = match op {
                 BinOp::Add => "nsl_tensor_add",
@@ -3091,145 +3076,16 @@ impl Compiler<'_> {
         None
     }
 
-    /// M52c: Try to emit a CSR sparse matmul when the RHS weight is >50% sparse.
-    /// Embeds CSR (row_ptrs, col_indices, values) in .rodata and emits nsl_sparse_matmul.
-    fn try_sparse_matmul(
-        &mut self,
-        builder: &mut FunctionBuilder,
-        state: &mut FuncState,
-        lhs: Value, // dense input (x)
-        rhs: Value, // potentially sparse weight (W)
-    ) -> Result<Option<Value>, CodegenError> {
-        use cranelift_module::{DataDescription, Linkage, Module};
-
-        let wmap = match self.features.weight_map {
-            Some(ref w) => w,
-            None => return Ok(None),
-        };
-
-        if !self.compile_options.weights.config.sparse_codegen {
-            return Ok(None);
-        }
-        // Withheld until the path is rebuilt. Sparse codegen is on by
-        // default, so any `-w` run whose model held a matrix at least half
-        // zeros reached the code below, and it does not work:
-        //   - on CPU the runtime's fallback passes the `.rodata` VALUES
-        //     pointer to `nsl_tensor_matmul` as if it were a tensor handle,
-        //     and the program aborts ("invalid tensor handle");
-        //   - for the GPU the call site is `x @ W` but the kernel is
-        //     `A_sparse @ B_dense` with A = W, the CSR arrays are host
-        //     `.rodata` addresses passed as device pointers, and the values
-        //     are embedded in the weight's stored dtype while the kernel
-        //     reads f32.
-        // No test exercised it. The dense matmul is always correct. Set
-        // `NSL_M52C_SPARSE_MATMUL=1` to reach the old path while fixing it.
-        if std::env::var("NSL_M52C_SPARSE_MATMUL").ok().as_deref() != Some("1") {
-            return Ok(None);
-        }
-
-        // Check if RHS is a known sparse weight
-        let rhs_key = match state.weight_values.get(&rhs) {
-            Some(k) => k.clone(),
-            None => return Ok(None),
-        };
-
-        let entry = match wmap.get(&rhs_key) {
-            Some(e) => e,
-            None => return Ok(None),
-        };
-
-        let sparsity = match entry.sparsity() {
-            Some(s) => s,
-            None => return Ok(None),
-        };
-
-        if !sparsity.use_sparse_kernel {
-            return Ok(None);
-        }
-
-        let csr = match &sparsity.csr {
-            Some(c) => c,
-            None => return Ok(None),
-        };
-
-        nsl_log::nsl_log!(INFO, "nsl", 
-            "[nsl] M52c: emitting CSR sparse matmul for weight '{}' ({:.1}% sparse, {} nnz / {} total)",
-            rhs_key, sparsity.near_zero_fraction * 100.0, csr.nnz, entry.num_elements
-        );
-
-        // Embed CSR arrays in .rodata
-        let sym_prefix = format!("__nsl_csr_{}", rhs_key.replace('.', "_"));
-
-        // row_ptrs: Vec<u32>
-        let rp_name = format!("{}_row_ptrs", sym_prefix);
-        let rp_bytes: Vec<u8> = csr.row_ptrs.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let rp_data_id = self
-            .module
-            .declare_data(&rp_name, Linkage::Local, false, false)
-            .map_err(|e| CodegenError::new(format!("CSR row_ptrs declare: {e}")))?;
-        let mut rp_desc = DataDescription::new();
-        rp_desc.define(rp_bytes.into_boxed_slice());
-        self.module
-            .define_data(rp_data_id, &rp_desc)
-            .map_err(|e| CodegenError::new(format!("CSR row_ptrs define: {e}")))?;
-
-        // col_indices: Vec<u32>
-        let ci_name = format!("{}_col_indices", sym_prefix);
-        let ci_bytes: Vec<u8> = csr
-            .col_indices
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
-        let ci_data_id = self
-            .module
-            .declare_data(&ci_name, Linkage::Local, false, false)
-            .map_err(|e| CodegenError::new(format!("CSR col_indices declare: {e}")))?;
-        let mut ci_desc = DataDescription::new();
-        ci_desc.define(ci_bytes.into_boxed_slice());
-        self.module
-            .define_data(ci_data_id, &ci_desc)
-            .map_err(|e| CodegenError::new(format!("CSR col_indices define: {e}")))?;
-
-        // values: raw bytes (f32)
-        let val_name = format!("{}_values", sym_prefix);
-        let val_data_id = self
-            .module
-            .declare_data(&val_name, Linkage::Local, false, false)
-            .map_err(|e| CodegenError::new(format!("CSR values declare: {e}")))?;
-        let mut val_desc = DataDescription::new();
-        val_desc.define(csr.values.clone().into_boxed_slice());
-        self.module
-            .define_data(val_data_id, &val_desc)
-            .map_err(|e| CodegenError::new(format!("CSR values define: {e}")))?;
-
-        // Get .rodata pointers as Cranelift Values
-        let rp_ref = self.module.declare_data_in_func(rp_data_id, builder.func);
-        let rp_ptr = builder.ins().symbol_value(cl_types::I64, rp_ref);
-
-        let ci_ref = self.module.declare_data_in_func(ci_data_id, builder.func);
-        let ci_ptr = builder.ins().symbol_value(cl_types::I64, ci_ref);
-
-        let val_ref = self.module.declare_data_in_func(val_data_id, builder.func);
-        let val_ptr = builder.ins().symbol_value(cl_types::I64, val_ref);
-
-        // Emit constants for dimensions
-        let nrows_val = builder.ins().iconst(cl_types::I64, csr.nrows as i64);
-        let ncols_val = builder.ins().iconst(cl_types::I64, csr.ncols as i64);
-        let nnz_val = builder.ins().iconst(cl_types::I64, csr.nnz as i64);
-
-        // Call nsl_sparse_matmul(row_ptrs, col_indices, values, B, nrows, ncols, nnz)
-        let result = self.compile_call_by_name(
-            builder,
-            "nsl_sparse_matmul",
-            &[rp_ptr, ci_ptr, val_ptr, lhs, nrows_val, ncols_val, nnz_val],
-        )?;
-
-        Ok(Some(result))
-    }
-
     /// Annotate sparsity hints when one operand is a known sparse weight.
     /// Stores a `SparsityHint` keyed by the Cranelift Value's u32 index (cast to NodeId)
     /// so that downstream passes can inspect per-matmul sparsity decisions.
+    ///
+    /// The hint is a record and nothing more: the matmul is the dense one
+    /// whatever it says. A CSR matmul used to be emitted here for a 2-D
+    /// weight at or above the sparse threshold (`try_sparse_matmul`,
+    /// `nsl_sparse_matmul`); it aborted on the CPU and computed `W @ x` from
+    /// host pointers on the GPU, was withheld behind an environment variable,
+    /// and has been removed.
     fn annotate_sparsity_hints(&mut self, state: &FuncState, lhs: Value, rhs: Value, op: BinOp) {
         use crate::weight_aware::SparsityHint;
         use nsl_ast::NodeId;
@@ -3250,7 +3106,7 @@ impl Compiler<'_> {
                 if info.use_sparse_kernel {
                     if let Some(ref csr) = info.csr {
                         nsl_log::nsl_log!(INFO, "nsl", 
-                            "[nsl] M52b: weight '{}' is {:.1}% sparse ({} nnz / {} total) — sparse kernel eligible",
+                            "[nsl] M52b: weight '{}' is {:.1}% sparse ({} nnz / {} total), at or above the sparse threshold; its matmul is dense",
                             key, info.near_zero_fraction * 100.0, csr.nnz, entry.num_elements
                         );
                         SparsityHint::Sparse {
@@ -3284,7 +3140,7 @@ impl Compiler<'_> {
                 if info.use_sparse_kernel {
                     if let Some(ref csr) = info.csr {
                         nsl_log::nsl_log!(INFO, "nsl", 
-                            "[nsl] M52b: weight '{}' is {:.1}% sparse ({} nnz / {} total) — sparse kernel eligible",
+                            "[nsl] M52b: weight '{}' is {:.1}% sparse ({} nnz / {} total), at or above the sparse threshold; its matmul is dense",
                             key, info.near_zero_fraction * 100.0, csr.nnz, entry.num_elements
                         );
                         SparsityHint::Sparse {
