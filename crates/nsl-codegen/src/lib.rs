@@ -145,7 +145,6 @@ pub mod pca_segment;
 pub mod pca_tier_b;
 pub mod pca_tile_config;
 pub mod pca_tilerange;
-pub mod pca_tileskip;
 pub mod weight_aware;
 
 // --- Distributed & parallelism -------------------------------------------
@@ -314,7 +313,7 @@ pub mod training {
 pub mod quantization {
     pub use crate::{
         bitnet, fp8, pca_activation, pca_detect, pca_per_doc, pca_rope, pca_segment, pca_tier_b,
-        pca_tile_config, pca_tilerange, pca_tileskip, weight_aware,
+        pca_tile_config, pca_tilerange, weight_aware,
     };
 }
 

@@ -1546,7 +1546,7 @@ fn emit_rope_pair_sweep(
     //   sid           = segment_ids[abs_row]   (read from seg_smem; u16)
     //   doc_start     = smem_doc_starts[sid]   (read from smem_doc_starts; s32)
     //   effective_pos = abs_row - doc_start    (s32 result; non-negative
-    //                   under the packing invariants from pca_rope::plan)
+    //                   under the packer's invariant doc_start <= abs_row)
     //
     // %r_rope_row is left unchanged so the SMEM offset computation below
     // (mul.lo.u32 %r_rope_smem_row_off, %r_rope_row, head_dim*2) still
