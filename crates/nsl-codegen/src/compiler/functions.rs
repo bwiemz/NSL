@@ -91,6 +91,19 @@ impl Compiler<'_> {
             self.build_escape_analysis(stmts);
         }
 
+        // The bodies source AD may inline (see the field doc). Recorded
+        // here because this runs before any statement of the module body
+        // -- and so before any train/distill/grad block -- is lowered.
+        self.free_fn_bodies = stmts
+            .iter()
+            .filter_map(|s| match &s.kind {
+                StmtKind::FnDef(fn_def) => {
+                    Some((self.resolve_sym(fn_def.name).to_string(), fn_def.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+
         let fn_defs: Vec<_> = stmts
             .iter()
             .filter_map(|s| match &s.kind {

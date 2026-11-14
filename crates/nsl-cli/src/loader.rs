@@ -86,6 +86,39 @@ pub struct ModuleGraph {
     pub dep_order: Vec<PathBuf>,
 }
 
+impl ModuleGraph {
+    /// The undecorated free functions of every module but the entry, by
+    /// name, for source AD to inline (`ImportedModelOptions::fn_bodies`).
+    ///
+    /// Imported functions are registered with codegen under their bare
+    /// name, whichever module they come from, so a name two modules both
+    /// declare cannot be attributed to one body; such names are left out.
+    pub fn imported_fn_bodies(
+        &self,
+        interner: &Interner,
+    ) -> HashMap<String, nsl_ast::decl::FnDef> {
+        let mut bodies: HashMap<String, nsl_ast::decl::FnDef> = HashMap::new();
+        let mut ambiguous: HashSet<String> = HashSet::new();
+        for path in &self.dep_order {
+            if *path == self.entry {
+                continue;
+            }
+            for stmt in &self.modules[path].ast.stmts {
+                if let StmtKind::FnDef(fn_def) = &stmt.kind {
+                    let name = interner.resolve(fn_def.name.0).unwrap_or("<unknown>").to_string();
+                    if bodies.insert(name.clone(), fn_def.clone()).is_some() {
+                        ambiguous.insert(name);
+                    }
+                }
+            }
+        }
+        for name in &ambiguous {
+            bodies.remove(name);
+        }
+        bodies
+    }
+}
+
 /// Represents a discovered import — either `from X import Y` or `import X as alias`.
 #[derive(Clone)]
 enum ImportInfo {

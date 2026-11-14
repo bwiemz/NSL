@@ -1553,6 +1553,13 @@ pub struct ImportedModelOptions {
     /// `int(self._n_heads.item())` reads these back, so the arena's shape
     /// propagation needs them to fold attention reshape targets.
     pub field_values: std::collections::HashMap<String, std::collections::HashMap<String, f64>>,
+    /// The undecorated free functions declared in imported modules (the
+    /// standard library included), by name. Source AD inlines a call to one
+    /// that it has no built-in rule for, instead of sending the whole block
+    /// to the tape; `fused_kl_ce` reaches its composite this way. A name
+    /// declared by more than one imported module is left out: the call
+    /// cannot be attributed.
+    pub fn_bodies: std::collections::HashMap<String, nsl_ast::decl::FnDef>,
 }
 
 /// ZeRO optimizer-sharding options (`--zero-stage`, `--zero-elementwise`).

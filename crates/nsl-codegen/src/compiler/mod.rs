@@ -685,6 +685,12 @@ pub struct Compiler<'a> {
     /// parameter escapes = the historical blanket refusal) until
     /// `build_escape_analysis` runs.
     pub escape: crate::escape::EscapeAnalysis,
+    /// The undecorated free functions of the module being compiled, by
+    /// name: the bodies source AD inlines when a `train`, `distill` or
+    /// `grad` block calls one (see `WengertExtractor::set_user_fn_bodies`).
+    /// Decorated functions are left out on purpose: inlining one would drop
+    /// whatever its decorator does. Filled by `compile_user_functions`.
+    pub free_fn_bodies: HashMap<String, nsl_ast::decl::FnDef>,
 
     // ── Type system ──────────────────────────────────────────────────
     pub types: TypeRegistry,
@@ -1225,6 +1231,7 @@ impl<'a> Compiler<'a> {
             passes: crate::pass_manager::PassManager::begin(),
             registry: FunctionRegistry::new(),
             escape: crate::escape::EscapeAnalysis::disabled(),
+            free_fn_bodies: HashMap::new(),
             types: TypeRegistry::new(),
             models: ModelMetadata::new(),
             module_prefix: String::new(),

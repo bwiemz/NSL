@@ -285,12 +285,13 @@ holds:
   its claim of fitting in 16 GB.
 
 §2.6's promise that a user writes the loss as an NSL function and source AD
-does the rest does not hold today. Under `--source-ad` a user-defined loss
-function is not extracted, in a `grad` block or a `train` block, and the
-compiler falls back to tape AD. Under tape AD a loss written as a function
-now gets its gradient; it used to get all zeros (Part 5, "Fixed"). The same
-mathematics written inline in a train-block step body trains correctly in
-both modes.
+does the rest now holds for a loss written as an ordinary function: under
+`--source-ad` the function is inlined into the block that calls it and
+differentiated at compile time, in a `grad`, `train` or `distill` block
+(Part 5, "Fixed"). Under tape AD a loss written as a function gets its
+gradient too; it used to get all zeros. What still falls back to the tape
+is a function source AD cannot inline (recursive, variadic, decorated, or
+with an early return), and the compiler says so.
 
 `docs/wiki/Glossary.md` used to define CFA as "Compiler-Fused Attention" and
 to send FlashAttention readers to this PDF, which is about alignment. It now
@@ -352,14 +353,21 @@ check, or by reading the code only.
   per epoch and `warmup_steps=40`. The comments now state what the code
   does.
 
+- Under `--source-ad` a call to a function the user wrote was not
+  extracted: a `grad` or `train` block warned of an "unrecognized FFI
+  callee" and fell back to tape AD, and a `distill` block, which refuses
+  the tape, failed to build. Source AD now inlines the body of an
+  undecorated free function, of the module or of one it imports, into the
+  graph of the block that calls it (`inline_user_fn` in
+  `crates/nsl-codegen/src/source_ad.rs`), and a function of the module
+  takes precedence over a builtin of the same name. A function it cannot
+  inline (recursive, variadic, decorated, returning from anywhere but the
+  end of its body) is named with the reason, and the block falls back to
+  the tape as before. Test
+  `crates/nsl-cli/tests/source_ad_user_fn_inline_gate.rs`.
+
 ### Open, in the adjacent code
 
-- **Source AD does not extract a user-defined loss function.** Under
-  `--source-ad`, in a `grad` block or a `train` block, the compiler warns of
-  an "unrecognized FFI callee" and falls back to tape AD; a `distill` block
-  refuses the tape instead. It should inline the function or refuse loudly.
-  `extract_expr_inner` in `crates/nsl-codegen/src/source_ad.rs`. Reproduced
-  by running.
 - **The reward ladder in `reward.nsl` can be gamed.** A valid program that
   ignores the prompt earns 0.85 with no test, or 0.8 with a failing one,
   while an attempt that fails to compile earns at most 0.6; partial credit
