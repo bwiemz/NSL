@@ -71,6 +71,22 @@ impl BridgeResult {
         self.extras.get(layer)
     }
 
+    /// Drop the head count of a plan that was not made on the model's shape.
+    ///
+    /// The forward launch passes each layer's `active_heads` to the kernel,
+    /// which computes only that many heads when the count is below the
+    /// tensor's own. A plan made on a nominal layer carries the nominal
+    /// count, so a model with more heads would have the rest left at zero.
+    /// Zero is the launcher's "every head" value. A count below
+    /// `nominal_heads` is a pruning decision and is kept.
+    pub fn forget_nominal_head_count(&mut self, nominal_heads: u32) {
+        for extras in self.extras.values_mut() {
+            if extras.active_heads >= nominal_heads {
+                extras.active_heads = 0;
+            }
+        }
+    }
+
     /// A.2.0: positional lookup — returns the extras for the Nth layer
     /// in sorted-key order. Used by the FA call-site as a stopgap when
     /// a proper layer name isn't derivable from context, under the
@@ -1044,6 +1060,40 @@ mod tests {
     use crate::wengert::{PrimalOp, WengertList, WengertOp};
     use crate::wggo_cost::LayerShape;
     use std::collections::HashMap;
+
+    /// The head count the forward launcher computes, as
+    /// `nsl_flash_attention_csha` derives it from the tensor's head count
+    /// and the `active_heads` argument.
+    fn heads_computed(tensor_heads: u32, active_heads: u32) -> u32 {
+        if active_heads > 0 && active_heads < tensor_heads {
+            active_heads
+        } else {
+            tensor_heads
+        }
+    }
+
+    #[test]
+    fn a_nominal_plan_does_not_limit_the_heads_of_a_larger_model() {
+        let mut bridge = BridgeResult::default();
+        let mut nominal = CshaExtras::level1(1e-5);
+        nominal.active_heads = 8;
+        let mut pruned = CshaExtras::level1(1e-5);
+        pruned.active_heads = 4;
+        bridge.extras.insert("blocks.0".into(), nominal);
+        bridge.extras.insert("blocks.1".into(), pruned);
+
+        // The defect: a 12-head model launched with the nominal 8 computes
+        // 8 heads and leaves 4 at zero.
+        assert_eq!(heads_computed(12, bridge.extras["blocks.0"].active_heads), 8);
+
+        bridge.forget_nominal_head_count(8);
+
+        assert_eq!(bridge.extras["blocks.0"].active_heads, 0);
+        assert_eq!(heads_computed(12, bridge.extras["blocks.0"].active_heads), 12);
+        // A count below the nominal one is a pruning decision and stays.
+        assert_eq!(bridge.extras["blocks.1"].active_heads, 4);
+        assert_eq!(heads_computed(8, bridge.extras["blocks.1"].active_heads), 4);
+    }
 
     // T5.1: FusionMark carries the dispatcher state the AD pipeline needs to
     // route claimed chains into the Tier C fused backward kernel.

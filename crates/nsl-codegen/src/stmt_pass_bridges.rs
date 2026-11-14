@@ -592,6 +592,10 @@ pub(crate) fn invoke_wrga_if_enabled(
     Some(plan)
 }
 
+/// Head count of the nominal layer CSHA plans on when the model's attention
+/// shape is unknown.
+const NOMINAL_CSHA_HEADS: u32 = 8;
+
 /// CSHA driver bridge — mirrors `invoke_wrga_if_enabled` (Milestone C).
 ///
 /// Hoisted out of `compile_train_block_inner` so the scheduler has a body to
@@ -714,7 +718,7 @@ pub(crate) fn invoke_csha_if_enabled(
                         .unwrap_or(crate::wggo::NOMINAL_LAYER_SHAPE.head_dim),
                     ..crate::wggo::NOMINAL_LAYER_SHAPE
                 },
-                8,
+                NOMINAL_CSHA_HEADS,
             ),
         };
         if let Some(mut plan) = crate::csha::run_on_wengert(
@@ -831,6 +835,11 @@ pub(crate) fn invoke_csha_if_enabled(
             // and with-saves FFI variants.
             for extras in bridge_out.extras.values_mut() {
                 extras.save_activations_for_backward = true;
+            }
+            // A plan made on the nominal layer knows no head count of this
+            // model; its 8 must not reach the forward launch as a limit.
+            if attention.is_none() {
+                bridge_out.forget_nominal_head_count(NOMINAL_CSHA_HEADS);
             }
             compiler.bus.publish_csha_bridge(bridge_out);
             for d in diags { nsl_log::nsl_log!(WARN, "codegen", "warning: {d}"); }
