@@ -240,9 +240,10 @@ const NAMES: [&str; 8] = ["dq", "dk", "dv", "dwq", "dwk", "dwv", "dx", "dx_norm"
 /// dO, dS, P, Q, K and V are all f16 operands of the tensor-core matmuls
 /// here (11 significant bits each once the gradient operands are prescaled),
 /// so the floor is a few 1e-4 per operand; measured on an RTX PRO 4500 the
-/// worst gradient is below 2e-3. Without the prescale dQ is 60% off at
-/// dO = 1e-6 and entirely zero at 1e-7.
-const REL_TOL: f64 = 5e-3;
+/// worst gradient is 5.7e-4, the same at every magnitude of dO. Without the
+/// prescale dQ was 92% off at dO = 1e-6 (93% of it exactly zero) and
+/// entirely zero at 1e-7.
+const REL_TOL: f64 = 2e-3;
 
 fn check(label: &str, got: &[Vec<f32>; 8], want: &Grads64) -> Vec<String> {
     let wants: [&[f64]; 8] =

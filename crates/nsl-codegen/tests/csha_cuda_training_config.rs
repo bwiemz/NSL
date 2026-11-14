@@ -359,10 +359,11 @@ fn compare(shape: &Shape, qkv: &Qkv, d_o: &[f32], run: &Run, active_heads: usize
 /// The emitted training pair over a batch of two and four heads at the
 /// gradient magnitudes of a real pretraining step.
 ///
-/// One tile (`seq == BLOCK`). With more than one tile and a batch or head
-/// count above one this pair's backward is wrong: at batch 2, 4 heads and
-/// two tiles the forward output is right (3e-4) and dQ, dK and dV are 130%,
-/// 45% and 43% off. That is a separate defect and is not gated here.
+/// One tile (`seq == BLOCK`). At more than one tile this pair's backward is
+/// wrong, whatever the batch and head counts: at two tiles the forward
+/// output is right (3e-4) and dQ, dK and dV are 130%, 45% and 43% off, at
+/// batch 1 with one head as at batch 2 with four. That is a separate defect
+/// and is not gated here.
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn training_kernels_match_reference_over_batch_and_heads() {
