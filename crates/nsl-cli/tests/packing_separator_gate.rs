@@ -142,6 +142,18 @@ print("LOOP FINISHED")
             .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap();
+        // Drain both pipes while polling: on Windows a pipe holds ~4 KB, and
+        // `nsl run` relays enough linker output to fill it, so an undrained
+        // pipe blocks the child and reads as a hang.
+        let drain = |mut pipe: Box<dyn std::io::Read + Send>| {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                std::io::Read::read_to_end(&mut pipe, &mut buf).ok();
+                buf
+            })
+        };
+        let stdout_reader = drain(Box::new(child.stdout.take().unwrap()));
+        let stderr_reader = drain(Box::new(child.stderr.take().unwrap()));
         let deadline = std::time::Instant::now() + Duration::from_secs(120);
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
@@ -153,9 +165,10 @@ print("LOOP FINISHED")
             }
             std::thread::sleep(Duration::from_millis(100));
         };
-        let out = child.wait_with_output().unwrap();
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout_bytes = stdout_reader.join().unwrap();
+        let stderr_bytes = stderr_reader.join().unwrap();
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
         assert!(
             !status.success(),
             "{workers} worker(s): exit status 0 after a loader worker died\n{stderr}"
