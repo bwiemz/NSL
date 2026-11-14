@@ -325,19 +325,22 @@ fn fa_widen_out_staging(
     conv_rc
 }
 
-/// Resolve an operand the fused BACKWARD kernel reads as **f16**
-/// (`dO` and `O` in the D = rowsum(dO . O) preprocess — `ld.global.b16`
-/// + `cvt.f32.f16` in phases/backward/ds_compute.rs) to a device
-/// pointer of actual f16 data.
+/// Resolve an ACTIVATION operand the fused BACKWARD kernel reads as
+/// **f16** — the forward output `O` in the D = rowsum(dO . O) preprocess
+/// (`ld.global.b16` + `cvt.f32.f16` in phases/backward/ds_compute.rs) and
+/// the projection weights Wq/Wk/Wv — to a device pointer of actual f16
+/// data.
+///
+/// Not for gradients. `dO` is read by the kernel as f32
+/// ([`csha_bwd_f32_read_ptr`]): an activation is of order 1, where f16
+/// costs its usual 2^-11 relative rounding, but a gradient's magnitude is
+/// set by the loss and sits at 1e-6..1e-8 in training, below f16's
+/// smallest normal (6.1e-5) and largely below its smallest subnormal.
 ///
 /// The Cranelift training path hands NslTensor boxes holding **f32**
-/// data: the loss gradient dO is a plain f32 wengert tensor, and O is
-/// the forward's out tensor — genuinely f32 since the forward FFIs
-/// gained their f16 staging+widen (2026-07-24). Before that fix the
-/// forward left raw f16 bits in the "f32" out buffer, so the backward's
-/// f16 read of O was accidentally correct while every f32 consumer
-/// (the loss!) got garbage — the two consumers could never both be
-/// right until the dtype is normalised at this boundary.
+/// data: O is the forward's out tensor — genuinely f32 since the forward
+/// FFIs gained their f16 staging+widen (2026-07-24), and exactly
+/// f16-representable, so narrowing it back loses nothing.
 ///
 /// Resolution:
 ///   * raw device pointer (kernel-harness path) — passthrough, the
@@ -411,6 +414,94 @@ fn csha_bwd_f16_read_ptr(
             std::process::abort();
         }
     }
+}
+
+/// True when `ptr` is a raw device allocation (the kernel-harness path),
+/// as opposed to a host pointer to an `NslTensor` box.
+#[cfg(feature = "cuda")]
+fn csha_is_raw_device_ptr(ptr: i64) -> bool {
+    use cudarc::driver::sys::{
+        cuPointerGetAttribute, CUmemorytype, CUpointer_attribute, CUresult,
+    };
+    let mut mem_type: u32 = 0;
+    let rc = unsafe {
+        cuPointerGetAttribute(
+            &mut mem_type as *mut u32 as *mut std::ffi::c_void,
+            CUpointer_attribute::CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
+            ptr as cudarc::driver::sys::CUdeviceptr,
+        )
+    };
+    rc == CUresult::CUDA_SUCCESS && mem_type == CUmemorytype::CU_MEMORYTYPE_DEVICE as u32
+}
+
+/// Resolve the incoming gradient `dO` of the fused BACKWARD to a device
+/// pointer of **f32** data. The kernel reads it with `ld.global.f32`.
+///
+///   * raw device pointer (kernel-harness path) — passthrough; the buffer
+///     must hold f32;
+///   * f32 NslTensor box — `.data` (a CPU box is promoted for the read);
+///   * any other dtype — loud abort. The fused backward used to accept an
+///     f16 dO and narrow an f32 one; a gradient narrowed to f16 is mostly
+///     zero at training magnitudes, so there is no f16 form of this operand
+///     any more.
+#[cfg(feature = "cuda")]
+fn csha_bwd_f32_read_ptr(entry: &str, name: &str, ptr: i64) -> u64 {
+    if ptr == 0 {
+        return 0;
+    }
+    if csha_is_raw_device_ptr(ptr) {
+        return ptr as u64;
+    }
+    let t = NslTensor::from_ptr(ptr);
+    if t.dtype != crate::tensor::DTYPE_F32 {
+        crate::nsl_log!(ERROR, "flash-attention",
+            "[{entry}] FATAL: gradient operand '{name}' has dtype {}, but the fused \
+             backward kernel reads it as f32. Gradients are f32 from end to end in \
+             this path; pass an f32 tensor.",
+            t.dtype
+        );
+        std::process::abort();
+    }
+    csha_tensor_data_ptr(ptr)
+}
+
+/// Resolve a gradient OUTPUT of the fused BACKWARD (dq, dk, dv, dwq, dwk,
+/// dwv, dx, dx_norm) to a device pointer the kernels store **f32** into.
+///
+///   * raw device pointer (kernel-harness path) — passthrough; the buffer
+///     must have room for 4 bytes per element;
+///   * f32 GPU NslTensor box — `.data`;
+///   * a CPU box — loud abort: promoting a write target would strand the
+///     gradient in a hidden copy (same policy as `fa_write_target_data_ptr`);
+///   * any other dtype — loud abort: an f16 box has half the bytes the
+///     kernel writes, and the six projection-side outputs were f16 before
+///     the gradients became f32 from end to end.
+#[cfg(feature = "cuda")]
+fn csha_bwd_f32_write_ptr(entry: &str, name: &str, ptr: i64) -> u64 {
+    if ptr == 0 {
+        return 0;
+    }
+    if csha_is_raw_device_ptr(ptr) {
+        return ptr as u64;
+    }
+    let t = NslTensor::from_ptr(ptr);
+    if t.device == 0 {
+        crate::nsl_log!(ERROR, "flash-attention",
+            "[{entry}] FATAL: gradient output '{name}' is a CPU-resident tensor — the \
+             fused backward writes on the GPU, and promoting a write target would \
+             strand the gradient in a hidden copy."
+        );
+        std::process::abort();
+    }
+    if t.dtype != crate::tensor::DTYPE_F32 {
+        crate::nsl_log!(ERROR, "flash-attention",
+            "[{entry}] FATAL: gradient output '{name}' has dtype {}, but the fused \
+             backward stores f32 (4 bytes per element). Allocate it as f32.",
+            t.dtype
+        );
+        std::process::abort();
+    }
+    t.data as u64
 }
 
 /// FlashAttention-2 kernel launch wrapper.
@@ -2903,6 +2994,22 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
 /// from them here. Null pointers on the gradient outputs let callers
 /// skip stores they don't need (e.g. freezing a weight).
 ///
+/// # Dtypes
+///
+/// Gradients are f32 from end to end: `dO_ptr` must hold f32, and all
+/// eight outputs (`dq`, `dk`, `dv`, `dwq`, `dwk`, `dwv`, `dx`, `dx_norm`)
+/// are written as f32, 4 bytes per element. An `NslTensor` of another
+/// dtype in one of those slots aborts with a message; a raw device
+/// pointer is taken at its word. The forward output `out_ptr` and the
+/// weights `wq`/`wk`/`wv` are activation operands the kernels read as f16:
+/// an f32 `NslTensor` is narrowed for the launch, a raw device pointer
+/// must already hold f16.
+///
+/// Before this contract dO was narrowed to f16 unscaled and dq, dk, dv,
+/// dwq, dwk and dwv were stored as f16. f16 is exactly zero below 2.98e-8,
+/// and at the gradient magnitudes of a real pretraining step (rms 1e-6 to
+/// 1e-7) most of dQ was zero.
+///
 /// # Tier B extension (planner spec §4)
 ///
 /// The trailing `tier_b_ptx_ptr, tier_b_name_ptr` parameters carry the Tier-B-on
@@ -3149,21 +3256,23 @@ fn csha_backward_impl(
     #[cfg(feature = "cuda")]
     {
         if tier_b2_active != 0 {
-            // Review 2026-07-24 (finding 3): Tier B.2's d_prepass reads dO
-            // and O as f16 (`ld.global.b16` in tier_b2/backward/
-            // d_prepass.rs), and kernel 4 (proj_backward, scalar ABI)
-            // reads Wq/Wk/Wv as f16 — same contracts as the scalar path
-            // below, which this branch early-returns AROUND. Narrow f32
-            // boxes here and hand the launcher raw f16 device pointers
-            // (its own csha_tensor_data_ptr resolution passes raw device
-            // pointers through untouched). Raw-device callers (harnesses)
-            // pass through unchanged.
+            // Review 2026-07-24 (finding 3): Tier B.2's d_prepass reads O
+            // as f16 (`ld.global.b16` in tier_b2/backward/d_prepass.rs),
+            // and kernel 4 (proj_backward, scalar ABI) reads Wq/Wk/Wv as
+            // f16 — same contracts as the scalar path below, which this
+            // branch early-returns AROUND. Narrow f32 boxes here and hand
+            // the launcher raw f16 device pointers. Raw-device callers
+            // (harnesses) pass these three through unchanged.
+            //
+            // dO is different: it arrives as f32 from every caller, as in
+            // the scalar path, and the Tier B.2 kernels need it as an f16
+            // tensor-core operand. The launcher narrows it itself.
             let mut tb2_staging: Vec<*mut c_void> = Vec::new();
             let n_qkv = (batch * heads * seq_len * head_dim) as usize;
             let n_w = (d_model * heads * head_dim) as usize;
-            let tb2_do = csha_bwd_f16_read_ptr(
+            let tb2_do = csha_bwd_f32_read_ptr(
                 "nsl_flash_attention_csha_backward[tier_b2]",
-                "dO", do_ptr, n_qkv, &mut tb2_staging,
+                "dO", do_ptr,
             );
             let tb2_out = csha_bwd_f16_read_ptr(
                 "nsl_flash_attention_csha_backward[tier_b2]",
@@ -3322,19 +3431,21 @@ fn csha_backward_impl(
         // Resolved via `csha_tensor_data_ptr`:
         //   * Primary forward inputs (q, k, v, out, logsumexp, cos,
         //     sin, x, norm_weight, wq, wk, wv, wo).
-        //   * Backward seed `dO` plus the 7 gradient outputs
-        //     (dq, dk, dv, dwq, dwk, dwv, dx): these are allocated by
-        //     Cranelift via `nsl_tensor_zeros_f16_on` / `nsl_tensor_zeros_on`
-        //     (see `wengert_lower.rs::FusedCshaBackward`), which return
-        //     `NslTensor*` with device=1. The kernel needs the raw
-        //     device data pointer to write gradients into.
+        //   * Backward seed `dO` plus the 8 gradient outputs
+        //     (dq, dk, dv, dwq, dwk, dwv, dx, dx_norm): f32 tensors, the
+        //     outputs allocated by Cranelift via `nsl_tensor_zeros_on`
+        //     (see `wengert_lower.rs::FusedCshaBackward`), which returns
+        //     `NslTensor*` with device=1. Resolved by
+        //     `csha_bwd_f32_read_ptr` / `csha_bwd_f32_write_ptr`, which
+        //     refuse any other dtype.
         let mut q = csha_tensor_data_ptr(q_ptr);
         let mut k = csha_tensor_data_ptr(k_ptr);
         let mut v = csha_tensor_data_ptr(v_ptr);
-        // dO and O are read by the kernel as f16 (D = rowsum(dO . O)
-        // preprocess) but arrive from the Cranelift training path as f32
-        // tensors — narrow into transient f16 staging (freed after the
-        // launch loop below). See `csha_bwd_f16_read_ptr`.
+        // O is read by the kernel as f16 (D = rowsum(dO . O) preprocess)
+        // but arrives from the Cranelift training path as an f32 tensor —
+        // narrow into transient f16 staging (freed after the launch loop
+        // below). See `csha_bwd_f16_read_ptr`. dO is read as f32 and is
+        // resolved further down without staging.
         let mut bwd_f16_staging: Vec<*mut c_void> = Vec::new();
         let f16_in_elems = (batch * heads * seq_len * head_dim) as usize;
         let mut out = csha_bwd_f16_read_ptr(
@@ -3402,24 +3513,21 @@ fn csha_backward_impl(
         let mut rsum = row_sum_ptr as u64;
         let mut xraw = x_raw_ptr as u64;
         // Backward seed + 8 gradient outputs (dq/dk/dv/dwq/dwk/dwv/dx/dx_norm):
-        // NslTensor handles — resolve to device pointers via csha_tensor_data_ptr.
-        // PR #74 added dx_norm as the 8th extract so dgamma can be computed
-        // from the post-RMSNorm gradient directly.
-        let mut d_o = csha_bwd_f16_read_ptr(
-            "nsl_flash_attention_csha_backward",
-            "dO",
-            do_ptr,
-            f16_in_elems,
-            &mut bwd_f16_staging,
-        );
-        let mut d_q = csha_tensor_data_ptr(dq_ptr);
-        let mut d_k = csha_tensor_data_ptr(dk_ptr);
-        let mut d_v = csha_tensor_data_ptr(dv_ptr);
-        let mut d_wq = csha_tensor_data_ptr(dwq_ptr);
-        let mut d_wk = csha_tensor_data_ptr(dwk_ptr);
-        let mut d_wv = csha_tensor_data_ptr(dwv_ptr);
-        let mut d_x = csha_tensor_data_ptr(dx_ptr);
-        let mut d_xn = csha_tensor_data_ptr(dx_norm_ptr);
+        // NslTensor handles or raw device buffers, ALL f32. The seed dO is
+        // read by the kernel with `ld.global.f32`, and every gradient is
+        // stored as f32; nothing on the gradient path is f16 (see
+        // `csha_bwd_f32_read_ptr`). PR #74 added dx_norm as the 8th extract
+        // so dgamma can be computed from the post-RMSNorm gradient directly.
+        const BWD_ENTRY: &str = "nsl_flash_attention_csha_backward";
+        let mut d_o = csha_bwd_f32_read_ptr(BWD_ENTRY, "dO", do_ptr);
+        let mut d_q = csha_bwd_f32_write_ptr(BWD_ENTRY, "dq", dq_ptr);
+        let mut d_k = csha_bwd_f32_write_ptr(BWD_ENTRY, "dk", dk_ptr);
+        let mut d_v = csha_bwd_f32_write_ptr(BWD_ENTRY, "dv", dv_ptr);
+        let mut d_wq = csha_bwd_f32_write_ptr(BWD_ENTRY, "dwq", dwq_ptr);
+        let mut d_wk = csha_bwd_f32_write_ptr(BWD_ENTRY, "dwk", dwk_ptr);
+        let mut d_wv = csha_bwd_f32_write_ptr(BWD_ENTRY, "dwv", dwv_ptr);
+        let mut d_x = csha_bwd_f32_write_ptr(BWD_ENTRY, "dx", dx_ptr);
+        let mut d_xn = csha_bwd_f32_write_ptr(BWD_ENTRY, "dx_norm", dx_norm_ptr);
         // PCA Tier A Task 4B: segment_ids device pointer — raw pass-through
         // (not an NslTensor handle). Null on unpacked launches; the
         // segment_masked kernel variant reads it only when set.
@@ -3428,11 +3536,10 @@ fn csha_backward_impl(
         // Sentinel 0 = identity positions (RoPE reset disabled).
         let mut doc_starts = doc_starts_ptr as u64;
 
-        // Option A f32 scratch for dK/dV: accumulate in f32 to avoid the
-        // f16-HBM saturation-to-inf that plagued the naive ld-add-store
-        // finalize. Scratch is zeroed, each q-block kernel does serialized
-        // ld.f32/add.f32/st.f32 RMW (deterministic — no atomics), and a
-        // final conversion kernel writes f32 scratch → f16 dK/dV outputs.
+        // f32 scratch for dK/dV: the kernel accumulates across q-block
+        // launches here. Scratch is zeroed, each q-block kernel does
+        // serialized ld.f32/add.f32/st.f32 RMW (deterministic — no atomics),
+        // and the totals are copied to the f32 dK/dV outputs afterwards.
         let qkv_elems = (batch * heads * seq_len * head_dim) as usize;
         let scratch_bytes = qkv_elems * 4; // f32
         let dk_scratch_raw = if d_k != 0 {
@@ -3455,13 +3562,12 @@ fn csha_backward_impl(
         let mut dv_scratch = dv_scratch_raw as u64;
 
         // Phase 1.1 (pretraining): f32 scratch for dW (dwq/dwk/dwv), same
-        // serialized-RMW pattern as dK/dV above. emit_dproj now accumulates
+        // serialized-RMW pattern as dK/dV above. emit_dproj accumulates
         // each q-block's partial into these f32 buffers (grid_x=1, serial
-        // launches → no atomics), and the conversion below writes f32 scratch →
-        // f16 dwq/dwk/dwv. Shape is [d_model, kv_dim] with
+        // launches → no atomics), and they are copied to the f32
+        // dwq/dwk/dwv outputs below. Shape is [d_model, kv_dim] with
         // kv_dim = max(active_heads,1)*head_dim, matching emit_dproj's cell
-        // layout. Single-tile (one launch, zero-init scratch) stays identical to
-        // the old f16 overwrite.
+        // layout.
         let dw_kv_dim = active_heads.max(1) * head_dim;
         let dw_elems = (d_model * dw_kv_dim) as usize;
         let dw_scratch_bytes = dw_elems * 4; // f32
@@ -3653,9 +3759,10 @@ fn csha_backward_impl(
         // Each launch does serialized f32 RMW on dk_scratch / dv_scratch,
         // so the final scratch values accumulate correctly across all
         // q-blocks without atomics. dQ is written per-launch to disjoint
-        // slices so `d_q` still needs a zero init before the first launch.
+        // slices so `d_q` still needs a zero init before the first launch
+        // (f32: 4 bytes per element).
         if d_q != 0 {
-            crate::cuda::inner::memset_d8(d_q as *mut c_void, qkv_elems * 2);
+            crate::cuda::inner::memset_d8(d_q as *mut c_void, qkv_elems * 4);
         }
 
         let mut rc = cudarc::driver::sys::CUresult::CUDA_SUCCESS;
@@ -3724,33 +3831,22 @@ fn csha_backward_impl(
             dump_first_nonfinite_scratch("dv_scratch", dv_scratch_raw);
         }
 
-        // Drain dV f32 scratch -> f16 d_v.
+        // Copy the dV total, f32 scratch -> f32 d_v. Same stream as the
+        // launches, so it is ordered after them.
         if rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS
             && !dv_scratch_raw.is_null() && d_v != 0
         {
-            let c_rc = csha_bwd_convert_f32_to_f16(
-                dv_scratch_raw, d_v as *mut c_void, qkv_elems,
-            );
-            if c_rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                rc = c_rc;
-            }
+            crate::cuda::inner::memcpy_dtod(d_v as *mut c_void, dv_scratch_raw, scratch_bytes);
         }
 
-        // Phase 1.1 (PR2b): drain dK f32 scratch -> f16 d_k. dK now accumulates
-        // in f32 scratch via emit_store_dk_only's in-loop RMW (was an f16
-        // overwrite that was correct only at single-tile). Byte-identical at
-        // single-tile (zero-init scratch, one RMW, one cvt.rn.f16.f32); correct
-        // across q-block launches at multi-tile. Done BEFORE the post-pass reads
-        // dk_scratch (drain does not mutate the f32 scratch).
+        // Phase 1.1 (PR2b): copy the dK total, f32 scratch -> f32 d_k. dK
+        // accumulates in f32 scratch via emit_store_dk_only's in-loop RMW, so
+        // it is correct across q-block launches at multi-tile. The post-pass
+        // below reads dk_scratch, which the copy leaves untouched.
         if rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS
             && !dk_scratch_raw.is_null() && d_k != 0
         {
-            let c_rc = csha_bwd_convert_f32_to_f16(
-                dk_scratch_raw, d_k as *mut c_void, qkv_elems,
-            );
-            if c_rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                rc = c_rc;
-            }
+            crate::cuda::inner::memcpy_dtod(d_k as *mut c_void, dk_scratch_raw, scratch_bytes);
         }
 
         // Phase 1.1 (PR2b): multi-tile post-pass. Recompute dWk/dWv/dx/dx_norm
@@ -3820,11 +3916,12 @@ fn csha_backward_impl(
             crate::cuda::inner::free_device(dv_scratch_raw);
         }
 
-        // Phase 1.1: drain dW f32 scratch -> f16. dWq is correct at both single-
-        // and multi-tile (dQ_proj is complete per q-block launch). dWk/dWv are
-        // correct ONLY at single-tile; at multi-tile they hold per-q-block
-        // PARTIALS and the post-pass above already wrote the correct d_wk/d_wv,
-        // so we must NOT overwrite them with the scratch drain — drain dWq only.
+        // Phase 1.1: copy dW, f32 scratch -> f32 outputs. dWq is correct at both
+        // single- and multi-tile (dQ_proj is complete per q-block launch).
+        // dWk/dWv are correct ONLY at single-tile; at multi-tile they hold
+        // per-q-block PARTIALS and the post-pass above already wrote the correct
+        // d_wk/d_wv, so we must NOT overwrite them with the scratch — copy dWq
+        // only.
         let dw_drain: &[(*mut c_void, u64)] = if run_postpass {
             &[(dwq_scratch_raw, d_wq)]
         } else {
@@ -3835,11 +3932,11 @@ fn csha_backward_impl(
             ]
         };
         for &(scratch_raw, out) in dw_drain {
-            if rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS && !scratch_raw.is_null() {
-                let c_rc = csha_bwd_convert_f32_to_f16(scratch_raw, out as *mut c_void, dw_elems);
-                if c_rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                    rc = c_rc;
-                }
+            if rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS
+                && !scratch_raw.is_null()
+                && out != 0
+            {
+                crate::cuda::inner::memcpy_dtod(out as *mut c_void, scratch_raw, dw_scratch_bytes);
             }
         }
         for scratch_raw in [dwq_scratch_raw, dwk_scratch_raw, dwv_scratch_raw] {
@@ -3888,7 +3985,7 @@ fn csha_backward_impl(
             );
         }
 
-        // The transient f16 narrows of dO / O / Wq/Wk/Wv are dead once the
+        // The transient f16 narrows of O / Wq/Wk/Wv are dead once the
         // launch loop, post-pass, and dump readback above are done.
         // free_managed returns the block to the caching allocator's free
         // list immediately (no completion event) — safe here because every
@@ -4127,11 +4224,31 @@ fn tier_b2_proj_backward_smem_bytes(block_q: i64, block_kv: i64, head_dim: i64, 
     dq + dv + dk + v_in + x_norm + dx_norm + rms_strip
 }
 
+/// A raw device allocation released on drop (`inner::alloc_device` /
+/// `inner::free_device`), for transient launcher buffers on paths with
+/// several early returns. Null is allowed and is not freed.
+#[cfg(feature = "cuda")]
+struct DeviceScratch(*mut c_void);
+
+#[cfg(feature = "cuda")]
+impl Drop for DeviceScratch {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            crate::cuda::inner::free_device(self.0);
+        }
+    }
+}
+
 /// CSHA Tier B.2 (Phase 3 T6): launch the 4-kernel hybrid backward sequence.
 ///
 /// `ptx_ptr` is a single (null-terminated) PTX module containing all four
 /// concatenated entries:
 ///   1. `tier_b2_d_prepass`    reads dO, O          -> writes D (scratch)
+///
+/// `do_ptr` is a device pointer to **f32** dO (resolved by the caller); the
+/// kernels read an f16 narrowing of it made here. Every gradient output is
+/// f32.
+///
 ///   2. `tier_b2_dq_kernel`    reads q/k/v_saved, dO, row_max, row_sum, D -> dQ
 ///   3. `tier_b2_dkdv_kernel`  reads q/k/v_saved, dO, row_max, row_sum, D -> dK, dV
 ///   4. `tier_b2_proj_backward` reads dQ/dK/dV (HBM, read-only) + x_raw/Wq/Wk/Wv
@@ -4191,10 +4308,13 @@ fn csha_tier_b2_backward_launch(
     // The forward-saved activations (q/k/v_proj, row_max, row_sum, x_raw) are
     // raw device buffers from `nsl_csha_alloc_backward_activations_into` and
     // pass through unchanged.
-    let d_o = csha_tensor_data_ptr(do_ptr);
-    let d_q = csha_tensor_data_ptr(dq_ptr);
-    let d_k = csha_tensor_data_ptr(dk_ptr);
-    let d_v = csha_tensor_data_ptr(dv_ptr);
+    const ENTRY: &str = "nsl_flash_attention_csha_backward[tier_b2]";
+    // dO arrives as f32 (already resolved to a device pointer by the caller);
+    // every gradient output is f32.
+    let d_o_f32 = do_ptr as u64;
+    let d_q = csha_bwd_f32_write_ptr(ENTRY, "dq", dq_ptr);
+    let d_k = csha_bwd_f32_write_ptr(ENTRY, "dk", dk_ptr);
+    let d_v = csha_bwd_f32_write_ptr(ENTRY, "dv", dv_ptr);
     let qp = q_proj_ptr as u64;
     let kpj = k_proj_ptr as u64;
     let vpj = v_proj_ptr as u64;
@@ -4232,19 +4352,11 @@ fn csha_tier_b2_backward_launch(
     crate::cuda::inner::memset_d8(d_scratch_raw, d_elems * 4);
     let d_scratch = d_scratch_raw as u64;
 
-    // Sprint 1 T1.2 — DTYPE RECONCILIATION (production f16 dq/dk/dv vs kernel f32).
-    //
-    // Wengert allocates dq/dk/dv as f16 NslTensors (`nsl_tensor_zeros_f16_on` —
-    // see `crates/nsl-codegen/src/wengert_lower.rs:1834-1846`). The downstream
-    // optimizer / extract ops expect f16 — this is the production contract.
-    //
-    // The Tier B.2 dq and dkdv kernels write `st.global.f32` (4 bytes/elem) into
-    // dq/dk/dv; the proj_backward kernel reads them back as `ld.global.f32`. Wiring
-    // the kernels' f32 writes directly against the f16 production buffers would be
-    // a 2x buffer overflow (the f16 allocation is half the size of the f32 write
-    // footprint). The scalar Tier C dK/dV path solves the same mismatch with f32
-    // scratch + `csha_bwd_convert_f32_to_f16` (see `flash_attention.rs:1521-1681`);
-    // we apply the identical pattern to dq + dk + dv here.
+    // dQ/dK/dV scratch. The Tier B.2 dq and dkdv kernels write
+    // `st.global.f32` into these, the proj_backward kernel reads them back
+    // as `ld.global.f32`, and they are copied to the f32 outputs at the end.
+    // The scratch exists because proj_backward needs dQ/dK/dV as inputs even
+    // when the caller passed a null output for one of them.
     //
     // Layout per scratch: f32 [batch, heads, seq_len, head_dim].
     let qkv_elems = (batch * heads * seq_len * head_dim) as usize;
@@ -4297,6 +4409,28 @@ fn csha_tier_b2_backward_launch(
     let dk_scratch = dk_scratch_raw as u64;
     let dv_scratch = dv_scratch_raw as u64;
 
+    // The dq / dkdv kernels and the D pre-pass read dO as f16 (it is an
+    // operand of `mma.sync ... f16.f16`): narrow the f32 gradient into a
+    // transient buffer, released when this function returns.
+    let d_o_staging = DeviceScratch(if qkv_elems > 0 && d_o_f32 != 0 {
+        crate::cuda::inner::alloc_device(qkv_elems * 2)
+    } else {
+        std::ptr::null_mut()
+    });
+    if qkv_elems > 0 && d_o_f32 != 0 {
+        if d_o_staging.0.is_null() {
+            crate::nsl_log!(ERROR, "nsl", "[nsl] CSHA Tier B.2 backward: dO staging alloc failed");
+            free_scratches(dq_scratch_raw, dk_scratch_raw, dv_scratch_raw, d_scratch_raw);
+            return CUresult::CUDA_ERROR_OUT_OF_MEMORY as i64;
+        }
+        let c_rc = csha_bwd_convert_f32_to_f16(d_o_f32 as *mut c_void, d_o_staging.0, qkv_elems);
+        if c_rc != success {
+            free_scratches(dq_scratch_raw, dk_scratch_raw, dv_scratch_raw, d_scratch_raw);
+            return c_rc as i64;
+        }
+    }
+    let d_o = d_o_staging.0 as u64;
+
     // Null-terminated PTX + kernel-name C strings.
     let ptx = ptx_ptr as *const u8;
     let name_d_prepass = b"tier_b2_d_prepass\0";
@@ -4346,7 +4480,7 @@ fn csha_tier_b2_backward_launch(
         let mut a_rsum = rsum;
         let mut a_d = d_scratch;
         let mut a_seg = segment_ids_ptr as u64;
-        // Sprint 1 T1.2: dq kernel writes f32 → dq_scratch (not the production f16 buffer).
+        // The dq kernel writes f32 into dq_scratch.
         let mut a_dq = dq_scratch;
         let mut a_seq = seq_len as u32;
         let mut a_heads = heads as u32;
@@ -4485,18 +4619,18 @@ fn csha_tier_b2_backward_launch(
         let mut a_xraw = xraw;
         let mut a_do = d_o as u64;
         // dQ/dK/dV: read-only inputs to proj_backward (from HBM).
-        // Sprint 1 T1.2: proj_backward reads f32 dQ/dK/dV from the same scratches
-        // the dq + dkdv kernels wrote to. The production f16 destinations are
-        // populated AFTER proj_backward via `csha_bwd_convert_f32_to_f16`.
+        // proj_backward reads f32 dQ/dK/dV from the same scratches the dq +
+        // dkdv kernels wrote to. The f32 outputs are populated AFTER
+        // proj_backward by a device-to-device copy.
         let mut a_dq = dq_scratch;
         let mut a_dk = dk_scratch;
         let mut a_dv = dv_scratch;
         // Gradient outputs written by proj_backward.
-        let mut a_dwq = csha_tensor_data_ptr(dwq_ptr) as u64;
-        let mut a_dwk = csha_tensor_data_ptr(dwk_ptr) as u64;
-        let mut a_dwv = csha_tensor_data_ptr(dwv_ptr) as u64;
-        let mut a_dx = csha_tensor_data_ptr(dx_ptr) as u64;
-        let mut a_dxn = csha_tensor_data_ptr(dx_norm_ptr) as u64;
+        let mut a_dwq = csha_bwd_f32_write_ptr(ENTRY, "dwq", dwq_ptr);
+        let mut a_dwk = csha_bwd_f32_write_ptr(ENTRY, "dwk", dwk_ptr);
+        let mut a_dwv = csha_bwd_f32_write_ptr(ENTRY, "dwv", dwv_ptr);
+        let mut a_dx = csha_bwd_f32_write_ptr(ENTRY, "dx", dx_ptr);
+        let mut a_dxn = csha_bwd_f32_write_ptr(ENTRY, "dx_norm", dx_norm_ptr);
         // proj_backward does not write dK/dV — no f32 scratch needed.
         let mut a_dk_scratch = 0u64;
         let mut a_dv_scratch = 0u64;
@@ -4625,7 +4759,7 @@ fn csha_tier_b2_backward_launch(
             }
         }
 
-        // Drain the dW f32 scratch into the f16 destinations, then free it.
+        // Copy the dW f32 scratch into the f32 outputs, then free it.
         // emit_dproj accumulates read-modify-write across the q_block launches
         // above, and dW = sum over ALL q positions of x_norm^T . dY, so the
         // post-loop scratch already holds the complete gradient — unlike the
@@ -4637,11 +4771,7 @@ fn csha_tier_b2_backward_launch(
             (dwv_scratch_raw, a_dwv),
         ] {
             if rc == success && !scratch_raw.is_null() && out != 0 {
-                let c_rc =
-                    csha_bwd_convert_f32_to_f16(scratch_raw, out as *mut c_void, dw_elems);
-                if c_rc != success {
-                    rc = c_rc;
-                }
+                crate::cuda::inner::memcpy_dtod(out as *mut c_void, scratch_raw, dw_scratch_bytes);
             }
         }
         for scratch_raw in [dwq_scratch_raw, dwk_scratch_raw, dwv_scratch_raw] {
@@ -4656,37 +4786,14 @@ fn csha_tier_b2_backward_launch(
         }
     }
 
-    // Sprint 1 T1.2: Convert f32 scratches → f16 production destinations. Each
-    // call reads `qkv_elems` f32 elements from a scratch and writes the same
-    // count of f16 elements to the destination (the production wengert-allocated
-    // f16 buffer). `csha_bwd_convert_f32_to_f16` is the same helper the scalar
-    // dK/dV path uses (see `flash_attention.rs:1654-1674`).
+    // Copy the f32 scratches to the f32 outputs (same stream as the launches,
+    // so ordered after them).
     if qkv_elems > 0 {
-        if d_q != 0 && !dq_scratch_raw.is_null() {
-            let c_rc = csha_bwd_convert_f32_to_f16(
-                dq_scratch_raw, d_q as *mut c_void, qkv_elems,
-            );
-            if c_rc != success {
-                free_scratches(dq_scratch_raw, dk_scratch_raw, dv_scratch_raw, d_scratch_raw);
-                return c_rc as i64;
-            }
-        }
-        if d_k != 0 && !dk_scratch_raw.is_null() {
-            let c_rc = csha_bwd_convert_f32_to_f16(
-                dk_scratch_raw, d_k as *mut c_void, qkv_elems,
-            );
-            if c_rc != success {
-                free_scratches(dq_scratch_raw, dk_scratch_raw, dv_scratch_raw, d_scratch_raw);
-                return c_rc as i64;
-            }
-        }
-        if d_v != 0 && !dv_scratch_raw.is_null() {
-            let c_rc = csha_bwd_convert_f32_to_f16(
-                dv_scratch_raw, d_v as *mut c_void, qkv_elems,
-            );
-            if c_rc != success {
-                free_scratches(dq_scratch_raw, dk_scratch_raw, dv_scratch_raw, d_scratch_raw);
-                return c_rc as i64;
+        for (out, scratch_raw) in
+            [(d_q, dq_scratch_raw), (d_k, dk_scratch_raw), (d_v, dv_scratch_raw)]
+        {
+            if out != 0 && !scratch_raw.is_null() {
+                crate::cuda::inner::memcpy_dtod(out as *mut c_void, scratch_raw, scratch_bytes);
             }
         }
     }
@@ -4870,7 +4977,7 @@ fn csha_bwd_convert_f32_to_f16(
 // PARTIAL dK/dV SMEM tiles, which are wrong: those gradients need the
 // cross-launch dK/dV TOTALS. After the host q-block loop, the totals ARE
 // available: dk_scratch / dv_scratch (f32, accumulated by the in-loop RMW
-// stores) hold dK_proj_total / dV_proj_total, and d_q (f16, disjoint
+// stores) hold dK_proj_total / dV_proj_total, and d_q (f32, disjoint
 // per-launch writes) holds dQ_proj_total. This post-pass recomputes the four
 // affected gradients from those totals and OVERWRITES the partial in-kernel
 // results.
@@ -4894,8 +5001,8 @@ fn csha_bwd_convert_f32_to_f16(
 // (pp_smem[16384] = 4096 f32 rows → seq_len <= 4096; the launcher refuses
 // larger). All buffer layouts match the in-kernel emitters byte-for-byte at
 // batch=1/heads=1: x_raw/dx/dx_norm [seq, d_model] f32; dQ/dK/dV [seq,
-// head_dim] (dQ f16, dK/dV f32 scratch); Wq/Wk/Wv/dWk/dWv [d_model, head_dim]
-// f16; norm_weight [d_model] f32.
+// head_dim] f32 (dK/dV from the scratch); Wq/Wk/Wv [d_model, head_dim] f16
+// (operands); dWk/dWv [d_model, head_dim] f32; norm_weight [d_model] f32.
 #[cfg(feature = "cuda")]
 const CSHA_BWD_MULTITILE_POSTPASS_PTX: &str = concat!(
 r#".version 8.7
@@ -5028,18 +5135,16 @@ PP_A_S_DONE:
     mul.lo.u32 %widx, %pcol, %hd;
     add.u32 %widx, %widx, %jj;
     cvt.u64.u32 %off, %widx;
-    shl.b64 %off, %off, 1;
+    shl.b64 %off, %off, 2;
     setp.eq.u64 %pg, %dwkp, 0;
     @%pg bra PP_A_SKIP_WK;
     add.u64 %a, %dwkp, %off;
-    cvt.rn.f16.f32 %h, %acck;
-    st.global.b16 [%a], %h;
+    st.global.f32 [%a], %acck;
 PP_A_SKIP_WK:
     setp.eq.u64 %pg, %dwvp, 0;
     @%pg bra PP_A_SKIP_WV;
     add.u64 %a, %dwvp, %off;
-    cvt.rn.f16.f32 %h, %accv;
-    st.global.b16 [%a], %h;
+    st.global.f32 [%a], %accv;
 PP_A_SKIP_WV:
     add.u32 %cell, %cell, 128;
     bra PP_A;
@@ -5063,10 +5168,8 @@ PP_B:
     add.u64 %dxrow, %dxp, %off;
     mul.lo.u32 %tmp2, %s, %hd;
     cvt.u64.u32 %off2, %tmp2;
-    shl.b64 %off2, %off2, 1;
-    add.u64 %qrow, %dqp, %off2;
-    cvt.u64.u32 %off2, %tmp2;
     shl.b64 %off2, %off2, 2;
+    add.u64 %qrow, %dqp, %off2;
     add.u64 %krow, %dkp, %off2;
     add.u64 %vrow, %dvp, %off2;
     mov.f32 %sgrad, 0f00000000;
@@ -5081,12 +5184,9 @@ PP_B_J:
     setp.ge.u32 %p, %jj, %hd;
     @%p bra PP_B_J_DONE;
     cvt.u64.u32 %off, %jj;
-    shl.b64 %off, %off, 1;
-    add.u64 %a, %qrow, %off;
-    ld.global.b16 %h, [%a];
-    cvt.f32.f16 %dqv, %h;
-    cvt.u64.u32 %off, %jj;
     shl.b64 %off, %off, 2;
+    add.u64 %a, %qrow, %off;
+    ld.global.f32 %dqv, [%a];
     add.u64 %a, %krow, %off;
     ld.global.f32 %dkv, [%a];
     add.u64 %a, %vrow, %off;
@@ -5258,7 +5358,7 @@ fn csha_dump_backward_buffers(
         launch_rc, batch, heads, seq_len, head_dim, d_model
     );
 
-    // qkv-shaped: f16 [batch, heads, seq, head_dim]
+    // qkv-shaped: [batch, heads, seq, head_dim] (f16 saves, f32 gradients)
     let qkv_elems = (batch * heads * seq_len * head_dim) as usize;
     // stats: f32 [batch, heads, seq]
     let stats_elems = (batch * heads * seq_len) as usize;
@@ -5266,7 +5366,7 @@ fn csha_dump_backward_buffers(
     // (x_raw is B*H*S*D = 1024; dx / dx_norm are B*S*M = 1024 here since M=H*D=32).
     let x_elems = (batch * heads * seq_len * head_dim) as usize;
     let dx_elems = (batch * seq_len * d_model) as usize;
-    // dwq/dwk/dwv: f16 [d_model, heads * head_dim]
+    // dwq/dwk/dwv: f32 [d_model, heads * head_dim]
     let dw_elems = (d_model * heads * head_dim) as usize;
 
     fn dump_f16(name: &str, dev_ptr: u64, n: usize) {
@@ -5337,16 +5437,16 @@ fn csha_dump_backward_buffers(
     dump_f32("x_raw",    x_raw_dev,   x_elems);
 
     // Backward seed.
-    // dO is f16 (attention output gradient), shape [batch, heads, seq, head_dim].
-    dump_f16("dO",       d_o_dev,  qkv_elems);
+    // dO is f32 (attention output gradient), shape [batch, heads, seq, head_dim].
+    dump_f32("dO",       d_o_dev,  qkv_elems);
 
-    // Gradient outputs.
-    dump_f16("dq",       d_q_dev,  qkv_elems);
-    dump_f16("dk",       d_k_dev,  qkv_elems);
-    dump_f16("dv",       d_v_dev,  qkv_elems);
-    dump_f16("dwq",      d_wq_dev, dw_elems);
-    dump_f16("dwk",      d_wk_dev, dw_elems);
-    dump_f16("dwv",      d_wv_dev, dw_elems);
+    // Gradient outputs, all f32.
+    dump_f32("dq",       d_q_dev,  qkv_elems);
+    dump_f32("dk",       d_k_dev,  qkv_elems);
+    dump_f32("dv",       d_v_dev,  qkv_elems);
+    dump_f32("dwq",      d_wq_dev, dw_elems);
+    dump_f32("dwk",      d_wk_dev, dw_elems);
+    dump_f32("dwv",      d_wv_dev, dw_elems);
     dump_f32("dx",       d_x_dev,  dx_elems);
     dump_f32("dx_norm",  d_xn_dev, dx_elems);
 }

@@ -567,7 +567,9 @@ fn forward_launch_and_saves(
     let wv_dev = unsafe { nsl_test_cuda_alloc(w_bytes) };
     let cos_dev = unsafe { nsl_test_cuda_alloc(rope_bytes) };
     let sin_dev = unsafe { nsl_test_cuda_alloc(rope_bytes) };
-    let do_dev = unsafe { nsl_test_cuda_alloc(qkv_bytes) };
+    // dO is f32 on the device: the backward reads the incoming gradient
+    // with `ld.global.f32` (twice the bytes of the f16 Q/K/V buffers).
+    let do_dev = unsafe { nsl_test_cuda_alloc(qkv_bytes * 2) };
 
     let saves = unsafe {
         nsl_csha_alloc_backward_activations(
@@ -584,7 +586,7 @@ fn forward_launch_and_saves(
         nsl_test_cuda_h2d(nw_dev, nw_host.as_ptr() as i64, nw_bytes);
         nsl_test_cuda_h2d(cos_dev, cos_f16.as_ptr() as i64, rope_bytes);
         nsl_test_cuda_h2d(sin_dev, sin_f16.as_ptr() as i64, rope_bytes);
-        nsl_test_cuda_h2d(do_dev, do_f16.as_ptr() as i64, qkv_bytes);
+        nsl_test_cuda_h2d(do_dev, do_f32.as_ptr() as i64, qkv_bytes * 2);
     }
 
     // ── Forward PTX synth + launch ─────────────────────────────────────────
@@ -765,12 +767,14 @@ fn launch_backward_path(
     let causal = bwd_cfg.causal;
 
     // ── Allocate gradient output buffers + dxn scratch ─────────────────────
-    let dq_dev = unsafe { nsl_test_cuda_alloc(forward.qkv_bytes) };
-    let dk_dev = unsafe { nsl_test_cuda_alloc(forward.qkv_bytes) };
-    let dv_dev = unsafe { nsl_test_cuda_alloc(forward.qkv_bytes) };
-    let dwq_dev = unsafe { nsl_test_cuda_alloc(forward.dw_bytes) };
-    let dwk_dev = unsafe { nsl_test_cuda_alloc(forward.dw_bytes) };
-    let dwv_dev = unsafe { nsl_test_cuda_alloc(forward.dw_bytes) };
+    // Every gradient is stored as f32. `qkv_bytes` / `dw_bytes` are the f16
+    // sizes of the matching operand buffers, so the outputs need twice that.
+    let dq_dev = unsafe { nsl_test_cuda_alloc(forward.qkv_bytes * 2) };
+    let dk_dev = unsafe { nsl_test_cuda_alloc(forward.qkv_bytes * 2) };
+    let dv_dev = unsafe { nsl_test_cuda_alloc(forward.qkv_bytes * 2) };
+    let dwq_dev = unsafe { nsl_test_cuda_alloc(forward.dw_bytes * 2) };
+    let dwk_dev = unsafe { nsl_test_cuda_alloc(forward.dw_bytes * 2) };
+    let dwv_dev = unsafe { nsl_test_cuda_alloc(forward.dw_bytes * 2) };
     let dx_dev = unsafe { nsl_test_cuda_alloc(forward.dx_bytes) };
     // R-C14-2 mitigation: allocate the dx_norm scratch buffer per sister
     // line 281. No readback — kernel internal staging only; undersizing
@@ -873,11 +877,6 @@ fn launch_backward_path(
     }
 
     // ── Readback ───────────────────────────────────────────────────────────
-    let read_f16 = |dev: i64, elems: usize| -> Vec<f32> {
-        let mut raw = vec![0u16; elems];
-        unsafe { nsl_test_cuda_d2h(raw.as_mut_ptr() as i64, dev, (elems * 2) as i64); }
-        raw.iter().map(|&b| f16_to_f32(b)).collect()
-    };
     let read_f32 = |dev: i64, elems: usize| -> Vec<f32> {
         let mut out = vec![0f32; elems];
         unsafe { nsl_test_cuda_d2h(out.as_mut_ptr() as i64, dev, (elems * 4) as i64); }
@@ -887,12 +886,12 @@ fn launch_backward_path(
     let dw_elems = dm * kv_dim;
     let dx_elems = heads * seq * hd;
     let grads = CshaGradients {
-        dq: read_f16(dq_dev, qkv_elems),
-        dk: read_f16(dk_dev, qkv_elems),
-        dv: read_f16(dv_dev, qkv_elems),
-        dwq: read_f16(dwq_dev, dw_elems),
-        dwk: read_f16(dwk_dev, dw_elems),
-        dwv: read_f16(dwv_dev, dw_elems),
+        dq: read_f32(dq_dev, qkv_elems),
+        dk: read_f32(dk_dev, qkv_elems),
+        dv: read_f32(dv_dev, qkv_elems),
+        dwq: read_f32(dwq_dev, dw_elems),
+        dwk: read_f32(dwk_dev, dw_elems),
+        dwv: read_f32(dwv_dev, dw_elems),
         dx: read_f32(dx_dev, dx_elems),
     };
 

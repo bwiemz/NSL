@@ -40,10 +40,14 @@
 //!
 //! ## What it does NOT cover
 //!
-//!   - Real GPU execution. The object file is inspected at the
-//!     relocation level; actually launching the kernel requires CUDA
-//!     init, an input tensor, and the train step to execute. That's
-//!     what a separate GPU smoke test covers.
+//!   - Real GPU execution, and therefore any number. The object file is
+//!     inspected at the relocation level only, and the program below is
+//!     degenerate, which is enough for a compile check: `x` and every
+//!     weight are ones and the loss is `sum(out)`, which makes the
+//!     gradients of Wq and Wk exactly zero. What the kernels compute is
+//!     gated by `crates/nsl-cli/tests/csha_toy_pretrain_gate.rs`, which
+//!     runs `examples/csha_toy_pretrain_hd32.nsl` on a GPU and compares
+//!     its loss and weight updates with PyTorch.
 
 #![cfg(feature = "test-helpers")]
 
@@ -387,10 +391,15 @@ fn toy_pretrain_hd32_compile_emits_fused_backward_ffi() {
         "[gap-f] save-buffer free FFI is absent — Gap A free-move \
          in wengert_lower regressed."
     );
+    // The fused backward's gradient outputs are f32 tensors. They used to
+    // be allocated f16 and widened afterwards, and this test asserted that
+    // allocation; an f16 gradient is exactly zero below 2.98e-8, which is
+    // most of dQ at training magnitudes. No f16 tensor may be allocated on
+    // this path any more.
     assert!(
-        called.contains("nsl_tensor_zeros_f16_on"),
-        "[gap-f] f16 zero-init FFI is absent — Gap I.3 A+F dtype \
-         fix for gradient output allocation regressed."
+        !called.contains("nsl_tensor_zeros_f16_on"),
+        "[gap-f] an f16 tensor is allocated in the train step: the fused \
+         backward's gradient outputs must be f32 from end to end."
     );
 
     // ── Gap I step K: RMSNorm gamma gradient ───────────────────────

@@ -333,10 +333,10 @@ fn launch_per_doc_cta_backward(
     let q_proj_dev = nsl_test_cuda_alloc(f16_bytes);
     let k_proj_dev = nsl_test_cuda_alloc(f16_bytes);
     let v_proj_dev = nsl_test_cuda_alloc(f16_bytes);
-    // dO is read by ds_compute / d_correction as `ld.global.b16` (f16).
-    // Allocate f16 byte size and upload `do_host` converted to f16.
-    let do_dev  = nsl_test_cuda_alloc(f16_bytes);
-    let dq_dev  = nsl_test_cuda_alloc(f16_bytes);  // dQ f16 output
+    // dO is read by ds_compute / d_correction / dv_accum as `ld.global.f32`
+    // and dQ is stored as f32: gradients are f32 from end to end.
+    let do_dev  = nsl_test_cuda_alloc(f32_bytes);
+    let dq_dev  = nsl_test_cuda_alloc(f32_bytes);  // dQ f32 output
     let dk_f16_dev = nsl_test_cuda_alloc(f16_bytes); // dK f16 (used to gate scratch path)
     let dv_f16_dev = nsl_test_cuda_alloc(f16_bytes); // dV f16 (used to gate scratch path)
     let lse_dev = nsl_test_cuda_alloc(lse_bytes);
@@ -364,8 +364,7 @@ fn launch_per_doc_cta_backward(
     nsl_test_cuda_h2d(q_proj_dev, q_f16.as_ptr() as i64, f16_bytes);
     nsl_test_cuda_h2d(k_proj_dev, k_f16.as_ptr() as i64, f16_bytes);
     nsl_test_cuda_h2d(v_proj_dev, v_f16.as_ptr() as i64, f16_bytes);
-    let do_f16: Vec<u16> = do_host.iter().map(|&x| f32_to_f16(x)).collect();
-    nsl_test_cuda_h2d(do_dev,  do_f16.as_ptr() as i64, f16_bytes);
+    nsl_test_cuda_h2d(do_dev,  do_host.as_ptr() as i64, f32_bytes);
     nsl_test_cuda_h2d(doc_starts_dev, doc_starts_host.as_ptr() as i64, ds_bytes);
     nsl_test_cuda_h2d(lse_dev, lse_host.as_ptr() as i64, lse_bytes);
     // Upload forward O (f16-encoded) to out_dev — d_correction reads this.
@@ -379,9 +378,8 @@ fn launch_per_doc_cta_backward(
     // being null/zero is fine when both pointers null-guard (they do).
     // Zero-init dQ + dK/dV f32 scratch via h2d with a zero host buffer.
     {
-        let zero_f16 = vec![0u16; total];
-        nsl_test_cuda_h2d(dq_dev, zero_f16.as_ptr() as i64, f16_bytes);
         let zero_f32 = vec![0f32; total];
+        nsl_test_cuda_h2d(dq_dev, zero_f32.as_ptr() as i64, f32_bytes);
         nsl_test_cuda_h2d(dk_scratch_dev, zero_f32.as_ptr() as i64, f32_bytes);
         nsl_test_cuda_h2d(dv_scratch_dev, zero_f32.as_ptr() as i64, f32_bytes);
         // ds_compute reads row_max and row_sum from HBM to recompute
@@ -558,9 +556,8 @@ fn launch_per_doc_cta_backward(
     // Sync and read back.
     unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
 
-    let mut dq_f16 = vec![0u16; total];
-    nsl_test_cuda_d2h(dq_f16.as_mut_ptr() as i64, dq_dev, f16_bytes);
-    let dq_out: Vec<f32> = dq_f16.iter().map(|&b| f16_to_f32(b)).collect();
+    let mut dq_out = vec![0f32; total];
+    nsl_test_cuda_d2h(dq_out.as_mut_ptr() as i64, dq_dev, f32_bytes);
 
     let mut dk_out = vec![0f32; total];
     nsl_test_cuda_d2h(dk_out.as_mut_ptr() as i64, dk_scratch_dev, f32_bytes);

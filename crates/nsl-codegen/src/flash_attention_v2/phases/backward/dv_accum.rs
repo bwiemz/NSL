@@ -88,7 +88,9 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     ptx.push_str("    ld.shared.f32 %f_P, [%rd30];\n");
 
     // dO[row_global, :] base in HBM:
-    //   ((batch_idx*heads + head_idx)*seq + q_start + row_global) * head_dim * 2
+    //   ((batch_idx*heads + head_idx)*seq + q_start + row_global) * head_dim * 4
+    // dO is read as f32: a gradient at training magnitude (1e-6..1e-8)
+    // does not survive an f16 read.
     ptx.push_str("    cvt.u64.u32 %rd32, %r2;\n");
     ptx.push_str("    mul.lo.u64 %rd33, %batch_idx, %rd5;\n");
     ptx.push_str("    add.u64 %rd33, %rd33, %head_idx;\n");
@@ -96,7 +98,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     ptx.push_str("    add.u64 %rd33, %rd33, %q_start;\n");
     ptx.push_str("    add.u64 %rd33, %rd33, %rd32;\n");
     ptx.push_str("    mul.lo.u64 %rd33, %rd33, %rd7;\n");
-    ptx.push_str("    shl.b64 %rd33, %rd33, 1;\n");
+    ptx.push_str("    shl.b64 %rd33, %rd33, 2;  // * 4 bytes (f32)\n");
     ptx.push_str("    add.u64 %rd33, %rd_bwd_do, %rd33;  // &dO[row_global, 0]\n");
 
     // dV_tile base for this lane's col: dv_offset + lane * head_dim * 4
@@ -119,10 +121,10 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
         "    mul.lo.u64 %rd35, %rd35, {};  // warp d-base * 4\n",
         d_per_warp * 4
     ));
-    // dO byte offset for this warp's d-base = warp_id * d_per_warp * 2 (f16).
+    // dO byte offset for this warp's d-base = warp_id * d_per_warp * 4 (f32).
     ptx.push_str("    cvt.u64.u32 %rd36, %warp_id;\n");
     ptx.push_str(&format!(
-        "    mul.lo.u64 %rd36, %rd36, {};\n", d_per_warp * 2
+        "    mul.lo.u64 %rd36, %rd36, {};\n", d_per_warp * 4
     ));
 
     for k in 0..d_per_warp {
@@ -136,10 +138,9 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
         // dO[row, d=warp_id*d_per_warp + k]
         ptx.push_str("    add.u64 %rd38, %rd33, %rd36;\n");
         if k > 0 {
-            ptx.push_str(&format!("    add.u64 %rd38, %rd38, {};\n", k * 2));
+            ptx.push_str(&format!("    add.u64 %rd38, %rd38, {};\n", k * 4));
         }
-        ptx.push_str("    ld.global.b16 %h0, [%rd38];\n");
-        ptx.push_str("    cvt.f32.f16 %f1, %h0;\n");
+        ptx.push_str("    ld.global.f32 %f1, [%rd38];\n");
 
         // CSHA cycle 20 T2 — dV probe stores at k=0 (one representative
         // sample per (row, col) pair). The runtime gate composed inside
@@ -150,7 +151,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
         //
         //   Slot 0 (dV_P):         %f_P — P value read for this FMA
         //   Slot 1 (dV_accum_pre): %f0  — SMEM cell PRE-FMA
-        //   Slot 2 (dV_dO_f32):    %f1  — dO cvt.f32.f16 result
+        //   Slot 2 (dV_dO_f32):    %f1  — dO as loaded (f32)
         //
         // Feature OFF → these are compile-time no-ops (byte-identical
         // PTX to the pre-T2 baseline).

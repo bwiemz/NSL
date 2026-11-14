@@ -1263,13 +1263,14 @@ fn t4_csha_backward_ffi_smoke() {
     };
     assert_ne!(saves.q_proj, 0, "activation alloc failed");
 
-    let do_dev = unsafe { nsl_test_cuda_alloc(qkv_bytes) };
-    let dq_dev = unsafe { nsl_test_cuda_alloc(qkv_bytes) };
-    let dk_dev = unsafe { nsl_test_cuda_alloc(qkv_bytes) };
-    let dv_dev = unsafe { nsl_test_cuda_alloc(qkv_bytes) };
-    let dwq_dev = unsafe { nsl_test_cuda_alloc(dw_bytes) };
-    let dwk_dev = unsafe { nsl_test_cuda_alloc(dw_bytes) };
-    let dwv_dev = unsafe { nsl_test_cuda_alloc(dw_bytes) };
+    // dO and every gradient are f32 on the device: twice the f16 sizes.
+    let do_dev = unsafe { nsl_test_cuda_alloc(qkv_bytes * 2) };
+    let dq_dev = unsafe { nsl_test_cuda_alloc(qkv_bytes * 2) };
+    let dk_dev = unsafe { nsl_test_cuda_alloc(qkv_bytes * 2) };
+    let dv_dev = unsafe { nsl_test_cuda_alloc(qkv_bytes * 2) };
+    let dwq_dev = unsafe { nsl_test_cuda_alloc(dw_bytes * 2) };
+    let dwk_dev = unsafe { nsl_test_cuda_alloc(dw_bytes * 2) };
+    let dwv_dev = unsafe { nsl_test_cuda_alloc(dw_bytes * 2) };
     let dx_dev = unsafe { nsl_test_cuda_alloc(dx_bytes) };
     // Gap I.5 Option A: 8th gradient output buffer (dx_norm — gradient
     // w.r.t. the RMSNorm output). f32, [batch, seq, d_model].

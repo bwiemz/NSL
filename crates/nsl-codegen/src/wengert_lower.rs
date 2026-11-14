@@ -3255,21 +3255,15 @@ fn lower_single_op(
             let norm_weight_ptr = if inputs.len() > 9 { inputs[9] } else { null };
             let do_ptr = if inputs.len() > 1 { inputs[1] } else { null };
 
-            // Allocate 7 output gradient tensors DIRECTLY on device with
-            // the right dtypes (Gap I.3 — A+F).
+            // Allocate the 8 output gradient tensors DIRECTLY on device,
+            // all f32.
             //
-            // Tier C backward writes:
-            //   - dq/dk/dv/dwq/dwk/dwv as f16 (st.global.u16 → 2 B/elem)
-            //   - dx as f32 (RMSNorm-input gradient stays f32)
-            //
-            // Pre-A+F we zero-allocated all seven via `nsl_tensor_zeros`
-            // (CPU, f32) then `nsl_tensor_to_device`.  That left the f16
-            // buffers at 2× their intended byte size with every second
-            // byte uninitialised; f32-interpreting reads on the host
-            // produced garbage which the optimiser then stirred into the
-            // next step's weights.  This block replaces that with a
-            // single direct-on-device alloc per tensor at the correct
-            // element size + dtype.
+            // The fused backward stores every gradient as f32 and reads dO
+            // as f32 (`nsl_flash_attention_csha_backward`, "Dtypes"). The
+            // six projection-side outputs used to be f16 tensors that were
+            // widened afterwards; an f16 store is exactly zero below
+            // 2.98e-8, which is most of dQ at the gradient magnitudes of a
+            // real pretraining step, so there is no f16 stage any more.
             //
             // Shapes:
             //   dq/dk/dv:      [batch, heads, seq_len, head_dim]
@@ -3291,33 +3285,32 @@ fn lower_single_op(
                 call(compiler, builder, ffi, &[shape, device])
             };
 
-            // f16 outputs — the 6 kernel-side st.global.u16 sinks.
+            // f32 outputs: `nsl_tensor_zeros_on` allocates f32 on device.
             let dq_dev = alloc_shape_on(
-                compiler, builder, "nsl_tensor_zeros_f16_on",
+                compiler, builder, "nsl_tensor_zeros_on",
                 &[batch, heads, seq_len, hd_val], cuda_device,
             )?;
             let dk_dev = alloc_shape_on(
-                compiler, builder, "nsl_tensor_zeros_f16_on",
+                compiler, builder, "nsl_tensor_zeros_on",
                 &[batch, heads, seq_len, hd_val], cuda_device,
             )?;
             let dv_dev = alloc_shape_on(
-                compiler, builder, "nsl_tensor_zeros_f16_on",
+                compiler, builder, "nsl_tensor_zeros_on",
                 &[batch, heads, seq_len, hd_val], cuda_device,
             )?;
             let dwq_dev = alloc_shape_on(
-                compiler, builder, "nsl_tensor_zeros_f16_on",
+                compiler, builder, "nsl_tensor_zeros_on",
                 &[d_model_val, heads_hd], cuda_device,
             )?;
             let dwk_dev = alloc_shape_on(
-                compiler, builder, "nsl_tensor_zeros_f16_on",
+                compiler, builder, "nsl_tensor_zeros_on",
                 &[d_model_val, heads_hd], cuda_device,
             )?;
             let dwv_dev = alloc_shape_on(
-                compiler, builder, "nsl_tensor_zeros_f16_on",
+                compiler, builder, "nsl_tensor_zeros_on",
                 &[d_model_val, heads_hd], cuda_device,
             )?;
 
-            // dx stays on the f32 allocator — the kernel writes it as f32.
             let dx_dev = alloc_shape_on(
                 compiler, builder, "nsl_tensor_zeros_on",
                 &[batch, seq_len, d_model_val], cuda_device,
@@ -3501,28 +3494,14 @@ fn lower_single_op(
                 ],
             )?;
 
-            // The kernel writes dq..dwv as f16 (`st.global.u16`), but every
-            // downstream consumer — adjoint chains, grad-integrity, the
-            // optimizer's SGD/AdamW update — reads gradient tensors as f32.
-            // Handing the f16 tensors through directly made the optimizer
-            // reinterpret f16 bit pairs as f32: weight updates collapsed to
-            // ~1e-39 denormals (wq/wk "frozen") with exit 0.  Widen on-device
-            // here; `nsl_tensor_to_f32` publishes the copies into the step's
-            // scope sweep and the f16 originals are already published by
-            // `nsl_tensor_zeros_f16_on`, so lifecycles are unchanged.
-            // dx/dxn are f32-written by the kernel — no widen.
-            let dq_f32 = call(compiler, builder, "nsl_tensor_to_f32", &[dq_dev])?;
-            let dk_f32 = call(compiler, builder, "nsl_tensor_to_f32", &[dk_dev])?;
-            let dv_f32 = call(compiler, builder, "nsl_tensor_to_f32", &[dv_dev])?;
-            let dwq_f32 = call(compiler, builder, "nsl_tensor_to_f32", &[dwq_dev])?;
-            let dwk_f32 = call(compiler, builder, "nsl_tensor_to_f32", &[dwk_dev])?;
-            let dwv_f32 = call(compiler, builder, "nsl_tensor_to_f32", &[dwv_dev])?;
-
-            // Populate Gap C cache so extract ops can read outputs.
+            // Populate Gap C cache so extract ops can read outputs. All
+            // eight are the f32 tensors the kernel wrote: every downstream
+            // consumer — adjoint chains, grad-integrity, the optimizer's
+            // update — reads gradient tensors as f32.
             // Slot 7 (dxn_dev) added by the Gap I.5 Option-A fix.
             compiler
                 .csha_fused_bwd_cache
-                .insert(key_val, [dq_f32, dk_f32, dv_f32, dwq_f32, dwk_f32, dwv_f32, dx_dev, dxn_dev]);
+                .insert(key_val, [dq_dev, dk_dev, dv_dev, dwq_dev, dwk_dev, dwv_dev, dx_dev, dxn_dev]);
 
             // Gap A cleanup: now that the backward has consumed the save
             // pointers, free them.  (Moved here from the forward site in
