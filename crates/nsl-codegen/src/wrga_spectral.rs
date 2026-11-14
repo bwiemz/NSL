@@ -102,33 +102,52 @@ fn transpose(a: &[f64], m: usize, n: usize) -> Vec<f64> {
 }
 
 /// Thin QR decomposition via modified Gram–Schmidt.  Returns `Q` (m × k)
-/// column-orthonormal (same shape as input).
+/// in place of the input: its columns are orthonormal, except that a column
+/// linearly dependent on the ones before it becomes zero.
+///
+/// "Dependent" is judged against the column's own length before projection:
+/// what is left after removing its components along the earlier columns is
+/// rounding error when it is some 10⁻¹⁰ of the original. Such a column used
+/// to be normalised whenever its residual exceeded 10⁻³⁰ in absolute terms,
+/// which every rounding residual does, and a normalised rounding residual
+/// points in no particular direction: on a rank-5 matrix sketched with ten
+/// columns, five columns of `Q` were noise, `QᵀQ` was off the identity by
+/// 0.70, and the largest singular value came out 1.333 instead of 1.
+///
+/// Each column is projected twice; one pass of Gram–Schmidt loses
+/// orthogonality in proportion to how much of the column it removes.
 fn qr_orthonormalize(mat: &mut [f64], m: usize, k: usize) {
+    const DEPENDENT: f64 = 1e-10;
+    let col_norm = |mat: &[f64], j: usize| -> f64 {
+        (0..m).map(|r| mat[r * k + j] * mat[r * k + j]).sum::<f64>().sqrt()
+    };
     // Columns are stored row-major across rows — treat as k column vectors.
     for j in 0..k {
-        // Subtract projections onto previous columns.
-        for i in 0..j {
-            let mut dot = 0.0;
-            for r in 0..m {
-                dot += mat[r * k + i] * mat[r * k + j];
-            }
-            for r in 0..m {
-                mat[r * k + j] -= dot * mat[r * k + i];
+        let original = col_norm(mat, j);
+        for _pass in 0..2 {
+            // Subtract projections onto previous columns.
+            for i in 0..j {
+                let mut dot = 0.0;
+                for r in 0..m {
+                    dot += mat[r * k + i] * mat[r * k + j];
+                }
+                for r in 0..m {
+                    mat[r * k + j] -= dot * mat[r * k + i];
+                }
             }
         }
-        // Normalize column j.
-        let mut norm_sq = 0.0;
-        for r in 0..m {
-            let v = mat[r * k + j];
-            norm_sq += v * v;
-        }
-        let norm = norm_sq.sqrt();
-        if norm > 1e-30 {
+        // Normalize column j, or drop it.
+        let norm = col_norm(mat, j);
+        if original > 0.0 && norm > DEPENDENT * original {
             let inv = 1.0 / norm;
             for r in 0..m {
                 mat[r * k + j] *= inv;
             }
-        } // else leave as zeros — column is linearly dependent
+        } else {
+            for r in 0..m {
+                mat[r * k + j] = 0.0;
+            }
+        }
     }
 }
 
@@ -349,7 +368,11 @@ pub fn analyse_weight_map(
     seed: u64,
 ) -> Vec<SpectralAnalysis> {
     let mut out = Vec::new();
-    for (name, entry) in wm.entries() {
+    // In name order: the map iterates in a hash order that differs from run
+    // to run, and everything downstream keeps this order.
+    let mut entries: Vec<_> = wm.entries().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, entry) in entries {
         if entry.shape.len() < 2 {
             continue;
         }
@@ -440,7 +463,7 @@ fn priority_for_alloc(
     alloc.effective_rank * slack.max(0.0)
 }
 
-/// Allocate per-layer ranks under a total adapter parameter budget.
+/// Allocate per-layer ranks.
 ///
 /// Uses the formula from Section 2.3 of the WRGA proposal:
 ///
@@ -448,20 +471,28 @@ fn priority_for_alloc(
 ///   rᵢ = clip(⌊R_total · r_eff(Wᵢ) / Σ_j r_eff(Wⱼ)⌋, r_min, r_max)
 /// ```
 ///
+/// `r_total` is that formula's pool of RANKS. `param_budget` is a cap on the
+/// total PARAMETER count, `Σ rᵢ · (mᵢ + nᵢ)`, enforced afterwards by
+/// [`enforce_param_budget`]; `None` means no cap. The two are different
+/// units: one argument used to serve as both, so a parameter budget was
+/// handed out as that many ranks and bounded nothing, while with WGGO
+/// overrides the rank pool was compared against a parameter count.
+///
 /// `per_site_slack` is the optional per-weight roofline multiplier (Innovation
 /// 2 × Innovation 3); pass `None` for uniform weighting.
 ///
 /// `overrides` is the optional WGGO override map.  When `Some`, per-layer
-/// adapter ranks are honored subject to `[r_min, r_max]` clamp and
-/// `r_total` budget downgrade.  When `None` (or when a layer has no override
-/// entry), the spectral formula above is used unchanged — byte-identical
-/// behavior to the previous signature.
+/// adapter ranks are honored subject to the `[r_min, r_max]` clamp and the
+/// parameter budget.  When `None` (or when a layer has no override entry),
+/// the spectral formula above is used.
 ///
 /// Returns `(allocations, diagnostics)`.  `diagnostics` is empty when
 /// `overrides` is `None`.
+#[allow(clippy::too_many_arguments)]
 pub fn allocate_ranks(
     spectral: &[SpectralAnalysis],
     r_total: usize,
+    param_budget: Option<usize>,
     r_min: usize,
     r_max: usize,
     per_site_slack: Option<&HashMap<String, f64>>,
@@ -469,7 +500,6 @@ pub fn allocate_ranks(
     snap_to_grid: bool,
 ) -> (Vec<RankAllocation>, Vec<crate::wggo_overrides::OverrideDiagnostic>) {
     use crate::wggo_overrides::{OverrideDiagnostic, OverrideRejectReason};
-    use std::cmp::Ordering;
 
     if spectral.is_empty() {
         return (Vec::new(), Vec::new());
@@ -573,92 +603,106 @@ pub fn allocate_ranks(
         });
     }
 
-    // ── Step 2: Budget enforcement — unified downgrade queue ───────────────
-    // Only applies when WGGO overrides are present; the spectral formula
-    // already distributes within the rank budget, so no downgrade pass is
-    // needed (or correct) for the pure-spectral path.
-    //
+    // ── Step 2: Parameter budget ───────────────────────────────────────────
     // Lowest `priority_for_alloc` (effective_rank × slack) loses rank first.
-    // We only emit diagnostics for layers that have a WGGO override entry;
-    // spectral-fallback layers that get downgraded are silent.
-    if overrides.is_some() { loop {
-        let total: usize = allocations.iter().map(|a| a.adapter_params).sum();
-        if total <= r_total {
-            break;
-        }
-
-        // Find victim: lowest priority among those still above r_min.
-        let victim_idx = allocations
-            .iter()
-            .enumerate()
-            .filter(|(_, a)| a.rank > r_min)
-            .min_by(|(_, aa), (_, bb)| {
-                let pa = priority_for_alloc(aa, per_site_slack);
-                let pb = priority_for_alloc(bb, per_site_slack);
-                pa.partial_cmp(&pb).unwrap_or(Ordering::Equal)
-            })
-            .map(|(i, _)| i);
-
-        let Some(victim_idx) = victim_idx else {
-            break; // everyone is at r_min; can't shrink further
-        };
-
-        let name = allocations[victim_idx].name.clone();
-        let m_plus_n = {
-            // Look up shape from spectral — find by name.
+    // A diagnostic is emitted only for a layer that has a WGGO override
+    // entry; a layer on the spectral formula is downgraded silently.
+    if let Some(budget) = param_budget {
+        let m_plus_n = |name: &str| -> usize {
             spectral
                 .iter()
                 .find(|s| s.name == name)
-                .map(|s| s.shape[0] + s.shape[1])
-                .unwrap_or(1)
+                .map_or(0, |s| s.shape[0] + s.shape[1])
         };
-
-        {
-            let v = &mut allocations[victim_idx];
-            v.rank -= 1;
-            v.adapter_params = v.rank * m_plus_n;
-        }
-
-        // Emit / update diagnostic only for WGGO-overridden layers.
-        if let Some(ov) = overrides.and_then(|o| o.find_by_layer_containing(&name)) {
-            let final_rank = allocations[victim_idx].rank as u32;
-            let existing = diags.iter_mut().find(|d| {
-                d.layer_name == name
-                    && matches!(d.reason, OverrideRejectReason::BudgetExceededDowngraded { .. })
+        let changed =
+            enforce_param_budget(&mut allocations, budget, r_min, &m_plus_n, per_site_slack);
+        for idx in changed {
+            let name = &allocations[idx].name;
+            let Some(ov) = overrides.and_then(|o| o.find_by_layer_containing(name)) else {
+                continue;
+            };
+            let final_rank = allocations[idx].rank as u32;
+            diags.push(OverrideDiagnostic {
+                layer_index: ov.layer_index,
+                layer_name: name.clone(),
+                reason: OverrideRejectReason::BudgetExceededDowngraded {
+                    original_rank: ov.adapter_rank as u32,
+                    final_rank,
+                },
+                requested: ov.adapter_rank.to_string(),
+                applied: final_rank.to_string(),
             });
-            if let Some(d) = existing {
-                if let OverrideRejectReason::BudgetExceededDowngraded {
-                    final_rank: ref mut fr,
-                    ..
-                } = d.reason
-                {
-                    *fr = final_rank;
-                }
-                d.applied = final_rank.to_string();
-            } else {
-                diags.push(OverrideDiagnostic {
-                    layer_index: ov.layer_index,
-                    layer_name: name.clone(),
-                    reason: OverrideRejectReason::BudgetExceededDowngraded {
-                        original_rank: ov.adapter_rank as u32,
-                        final_rank,
-                    },
-                    requested: ov.adapter_rank.to_string(),
-                    applied: final_rank.to_string(),
-                });
-            }
         }
-    } } // end `if overrides.is_some() { loop { ... } }`
+    }
 
     // ── Step 3: Paper-grid snap (audit gap #5, opt-in) ─────────────────────
     // Floor every realized rank onto the paper's declared domain {0,2,4,8,16}
-    // (§2.2).  Snapping only *lowers* ranks, so the `r_total` budget enforced by
-    // Step 2 stays satisfied — no second downgrade pass is needed.
+    // (§2.2).  Snapping only *lowers* ranks, so the parameter budget enforced
+    // by Step 2 stays satisfied — no second downgrade pass is needed.
     if snap_to_grid {
         snap_allocations_to_grid(&mut allocations, spectral);
     }
 
     (allocations, diags)
+}
+
+/// Lower ranks until the allocations hold at most `budget` parameters.
+///
+/// `m_plus_n(name)` is `m + n` of the weight an allocation sits on, so that a
+/// rank `r` there costs `r · (m + n)` parameters; 0 means the shape is
+/// unknown, and such an allocation is left alone (it is not in the count).
+///
+/// One rank is taken at a time from the allocation with the lowest priority
+/// (`effective_rank × slack`) among those above `r_min`; on equal priority,
+/// from the one with the highest rank, so equal sites stay level. When every
+/// allocation is at `r_min` and the total is still over, the lowest-priority
+/// ones lose their adapter altogether (rank 0), which is the only way left
+/// to meet the budget.
+///
+/// Returns the indices of the allocations whose rank changed.
+pub fn enforce_param_budget(
+    allocations: &mut [RankAllocation],
+    budget: usize,
+    r_min: usize,
+    m_plus_n: &dyn Fn(&str) -> usize,
+    per_site_slack: Option<&HashMap<String, f64>>,
+) -> Vec<usize> {
+    use std::cmp::Ordering;
+    let mut changed: Vec<usize> = Vec::new();
+    let total = |allocations: &[RankAllocation]| -> usize {
+        allocations.iter().map(|a| a.adapter_params).sum()
+    };
+    while total(allocations) > budget {
+        // The victim: lowest priority, then highest rank, then first.
+        let pick = |floor: usize| -> Option<usize> {
+            allocations
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| a.rank > floor && m_plus_n(&a.name) > 0)
+                .min_by(|(_, aa), (_, bb)| {
+                    let pa = priority_for_alloc(aa, per_site_slack);
+                    let pb = priority_for_alloc(bb, per_site_slack);
+                    pa.partial_cmp(&pb)
+                        .unwrap_or(Ordering::Equal)
+                        .then(bb.rank.cmp(&aa.rank))
+                })
+                .map(|(i, _)| i)
+        };
+        let (idx, new_rank) = match pick(r_min) {
+            Some(idx) => (idx, allocations[idx].rank - 1),
+            None => match pick(0) {
+                Some(idx) => (idx, 0),
+                None => break, // nothing left to take
+            },
+        };
+        let a = &mut allocations[idx];
+        a.rank = new_rank;
+        a.adapter_params = new_rank * m_plus_n(&a.name);
+        if !changed.contains(&idx) {
+            changed.push(idx);
+        }
+    }
+    changed
 }
 
 /// Floor every allocation's rank onto [`RANK_GRID`] (audit gap #5) and keep
@@ -731,36 +775,47 @@ mod tests {
         (a, sigma)
     }
 
+    /// A 40×30 matrix of rank exactly 5, built as U Σ Vᵀ with Σ = (1, ½, ¼,
+    /// ⅛, 1⁄16): the sketch returns those five values. Its ten columns span
+    /// only five directions, so five of them are linearly dependent; they
+    /// used to be normalised into noise, which put σ₁ at 1.333.
     #[test]
-    fn randomized_svd_recovers_top_singular_values() {
+    fn randomized_svd_recovers_the_singular_values_of_a_low_rank_matrix() {
         let (a, true_sigma) = rank_r_matrix(40, 30, 5, 0.5);
+        assert_eq!(true_sigma, [1.0, 0.5, 0.25, 0.125, 0.0625]);
         let sv = randomized_svd(&a, 40, 30, 5, 5, 0xC0FFEE);
         assert_eq!(sv.len(), 5);
-        // What matters for the rank allocator is that:
-        //  (1) the singular values are in descending order,
-        //  (2) the *ratio* σ₁/σ₅ is at least within 2× of truth (decay
-        //      recovery), and
-        //  (3) the smallest singular values are recovered accurately (which
-        //      they are — the randomized SVD bias is concentrated at σ₁).
-        //
-        // Absolute recovery of σ₁ on a 40×30 rank-5 matrix with sketch width
-        // l=10 has a known bias — but because spectral entropy is scale-
-        // invariant it doesn't affect the allocator's behaviour.
-        for w in sv.windows(2) {
-            assert!(w[0] >= w[1] - 1e-9, "not descending: {sv:?}");
+        for (i, (got, want)) in sv.iter().zip(&true_sigma).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-9,
+                "σ{}: sketch {got}, constructed {want} (all: {sv:?})",
+                i + 1
+            );
         }
-        let true_ratio = true_sigma[0] / true_sigma[4];
-        let rec_ratio = sv[0] / sv[4].max(1e-30);
-        assert!(
-            rec_ratio / true_ratio < 2.0 && rec_ratio / true_ratio > 0.5,
-            "ratio mismatch: true {true_ratio}, recovered {rec_ratio}"
-        );
-        // Check a few of the smaller sv values match more exactly.
-        let small_rel_err = (sv[4] - true_sigma[4]).abs() / true_sigma[4];
-        assert!(
-            small_rel_err < 0.05,
-            "σ₅ err {small_rel_err}: sv={sv:?} true={true_sigma:?}"
-        );
+    }
+
+    /// Gram–Schmidt on columns (e₀, e₁, e₀ + e₁, e₂) of a 4×4 matrix: the
+    /// third is dependent on the first two and comes out zero; the others
+    /// are orthonormal.
+    #[test]
+    fn a_linearly_dependent_column_is_dropped_not_normalised() {
+        let mut q = vec![
+            1.0, 0.0, 1.0, 0.0, //
+            0.0, 1.0, 1.0, 0.0, //
+            0.0, 0.0, 0.0, 1.0, //
+            0.0, 0.0, 0.0, 0.0,
+        ];
+        qr_orthonormalize(&mut q, 4, 4);
+        let col = |j: usize| -> Vec<f64> { (0..4).map(|r| q[r * 4 + j]).collect() };
+        let dot = |a: &[f64], b: &[f64]| -> f64 { a.iter().zip(b).map(|(x, y)| x * y).sum() };
+        let expect_norm = [1.0, 1.0, 0.0, 1.0];
+        for i in 0..4 {
+            for j in 0..4 {
+                let want = if i == j { expect_norm[i] } else { 0.0 };
+                let got = dot(&col(i), &col(j));
+                assert!((got - want).abs() < 1e-12, "QᵀQ[{i}][{j}] = {got}, want {want}");
+            }
+        }
     }
 
     #[test]
@@ -797,7 +852,7 @@ mod tests {
                 truncated_rank: 4,
             },
         ];
-        let (plan, diags) = allocate_ranks(&spectral, 16, 1, 16, None, None, false);
+        let (plan, diags) = allocate_ranks(&spectral, 16, None, 1, 16, None, None, false);
         assert!(diags.is_empty());
         assert_eq!(plan.len(), 2);
         // "a" has 8× the effective rank of "b" → gets most of the budget.
@@ -817,7 +872,7 @@ mod tests {
             effective_rank: 0.0,
             truncated_rank: 4,
         }];
-        let (plan, _diags) = allocate_ranks(&spectral, 8, 2, 16, None, None, false);
+        let (plan, _diags) = allocate_ranks(&spectral, 8, None, 2, 16, None, None, false);
         assert_eq!(plan[0].rank, 2);
     }
 
@@ -842,11 +897,70 @@ mod tests {
         let mut slack = HashMap::new();
         slack.insert("memory_bound".to_string(), 2.0);
         slack.insert("compute_bound".to_string(), 0.25);
-        let (plan, _diags) = allocate_ranks(&spectral, 16, 1, 16, Some(&slack), None, false);
+        let (plan, _diags) = allocate_ranks(&spectral, 16, None, 1, 16, Some(&slack), None, false);
         // Memory-bound site should get more rank because of its larger slack.
         let mem = plan.iter().find(|r| r.name == "memory_bound").unwrap();
         let com = plan.iter().find(|r| r.name == "compute_bound").unwrap();
         assert!(mem.rank > com.rank);
+    }
+
+    fn six_equal_sites() -> Vec<SpectralAnalysis> {
+        (0..6)
+            .map(|i| SpectralAnalysis {
+                name: format!("w{i}"),
+                shape: [32, 32],
+                singular_values: vec![1.0; 8],
+                effective_rank: 8.0,
+                truncated_rank: 8,
+            })
+            .collect()
+    }
+
+    /// Six equal 32×32 sites and a pool of 96 ranks: 16 each, 6,144
+    /// parameters. A parameter budget above that changes nothing; 1,000
+    /// leaves 15 ranks (960 parameters, each rank being 64). The budget used
+    /// to be passed as the rank pool, where 1,000 and 100,000 both gave
+    /// 6,144.
+    #[test]
+    fn a_parameter_budget_caps_the_parameter_count() {
+        let spectral = six_equal_sites();
+        let total = |budget: Option<usize>| -> (usize, Vec<usize>) {
+            let (plan, _) = allocate_ranks(&spectral, 96, budget, 2, 16, None, None, false);
+            (total_adapter_params(&plan), plan.iter().map(|r| r.rank).collect())
+        };
+        assert_eq!(total(None), (6_144, vec![16; 6]));
+        assert_eq!(total(Some(100_000)), (6_144, vec![16; 6]));
+        let (params, ranks) = total(Some(1_000));
+        assert_eq!(params, 960);
+        assert_eq!(ranks.iter().sum::<usize>(), 15);
+        // Equal sites stay level: no rank differs from another by more than 1.
+        assert!(ranks.iter().max().unwrap() - ranks.iter().min().unwrap() <= 1, "{ranks:?}");
+    }
+
+    /// When even `r_min` everywhere is over the budget, sites lose their
+    /// adapter: 500 parameters pay for 7 ranks, three sites at rank 2.
+    #[test]
+    fn a_budget_below_the_minimum_ranks_drops_sites() {
+        let spectral = six_equal_sites();
+        let (plan, _) = allocate_ranks(&spectral, 96, Some(500), 2, 16, None, None, false);
+        let mut ranks: Vec<usize> = plan.iter().map(|r| r.rank).collect();
+        ranks.sort_unstable();
+        assert_eq!(ranks, [0, 0, 0, 2, 2, 2]);
+        assert_eq!(total_adapter_params(&plan), 384);
+    }
+
+    /// The lower-priority site gives up its ranks first.
+    #[test]
+    fn the_budget_takes_from_the_lowest_priority_site_first() {
+        let mut spectral = six_equal_sites();
+        spectral.truncate(2);
+        spectral[0].effective_rank = 2.0;
+        // Pool of 16 ranks: shares 3.2 and 12.8, floored to 3 and 12.
+        let (free, _) = allocate_ranks(&spectral, 16, None, 2, 16, None, None, false);
+        assert_eq!(free.iter().map(|r| r.rank).collect::<Vec<_>>(), [3, 12]);
+        // One rank less than that fits: 14 × 64 = 896. Site 0 pays.
+        let (capped, _) = allocate_ranks(&spectral, 16, Some(896), 2, 16, None, None, false);
+        assert_eq!(capped.iter().map(|r| r.rank).collect::<Vec<_>>(), [2, 12]);
     }
 }
 
@@ -929,7 +1043,7 @@ mod override_tests {
     #[test]
     fn allocate_ranks_no_overrides_preserves_spectral_behavior() {
         let spectral = spectral_fixture_4_layers();
-        let (alloc, diags) = allocate_ranks(&spectral, 256, 2, 16, None, None, false);
+        let (alloc, diags) = allocate_ranks(&spectral, 256, None, 2, 16, None, None, false);
         assert!(diags.is_empty(), "no overrides → no diagnostics");
         assert_eq!(alloc.len(), 4);
         for a in &alloc {
@@ -949,7 +1063,7 @@ mod override_tests {
             ("blocks.3", 4),
         ]);
         // Budget large enough that no downgrade fires.
-        let (alloc, diags) = allocate_ranks(&spectral, 100_000, 2, 16, None, Some(&over), false);
+        let (alloc, diags) = allocate_ranks(&spectral, 100_000, None, 2, 16, None, Some(&over), false);
         assert!(diags.is_empty(), "all requests fit; no diagnostics, got: {diags:?}");
         let ranks: Vec<usize> = alloc.iter().map(|a| a.rank).collect();
         assert_eq!(ranks, vec![8, 8, 4, 4]);
@@ -966,7 +1080,7 @@ mod override_tests {
             ("blocks.2", 4),
             ("blocks.3", 4),
         ]);
-        let (alloc, diags) = allocate_ranks(&spectral, 100_000, 2, 16, None, Some(&over), false);
+        let (alloc, diags) = allocate_ranks(&spectral, 100_000, None, 2, 16, None, Some(&over), false);
         assert_eq!(alloc[0].rank, 16, "clamped to r_max");
         let clamp_diag = diags
             .iter()
@@ -993,7 +1107,7 @@ mod override_tests {
             ("blocks.2", 4),
             ("blocks.3", 4),
         ]);
-        let (alloc, diags) = allocate_ranks(&spectral, 100_000, 2, 16, None, Some(&over), false);
+        let (alloc, diags) = allocate_ranks(&spectral, 100_000, None, 2, 16, None, Some(&over), false);
         assert_eq!(alloc[0].rank, 2, "clamped to r_min");
         assert!(
             diags.iter().any(|d| {
@@ -1018,7 +1132,7 @@ mod override_tests {
             ("blocks.2", 4),
             ("blocks.3", 4),
         ]);
-        let (alloc, diags) = allocate_ranks(&spectral, 100_000, 2, 16, None, Some(&over), false);
+        let (alloc, diags) = allocate_ranks(&spectral, 100_000, None, 2, 16, None, Some(&over), false);
         assert!(
             alloc.iter().all(|a| a.name != "blocks.0.attn.wq"),
             "blocks.0 projection must be excluded from allocation"
@@ -1049,7 +1163,7 @@ mod override_tests {
             ("blocks.3", 4),
         ]);
         // r_total large enough that non-degenerate layers aren't clamped.
-        let (alloc, diags) = allocate_ranks(&spectral, 100_000, 2, 16, None, Some(&over), false);
+        let (alloc, diags) = allocate_ranks(&spectral, 100_000, None, 2, 16, None, Some(&over), false);
         assert!(
             alloc.iter().all(|a| a.name != "blocks.0.attn.wq"),
             "blocks.0 excluded"
@@ -1079,7 +1193,7 @@ mod override_tests {
             ("blocks.3", 16),
         ]);
         let tight_budget = 4 * 16 * 64 / 2; // = 2048
-        let (alloc, diags) = allocate_ranks(&spectral, tight_budget, 2, 16, None, Some(&over), false);
+        let (alloc, diags) = allocate_ranks(&spectral, 64, Some(tight_budget), 2, 16, None, Some(&over), false);
         assert!(
             total_params(&alloc) <= tight_budget,
             "final total {} must fit budget {}",
@@ -1137,7 +1251,7 @@ mod override_tests {
         let over = overrides_with_ranks(&[("blocks.0", 8), ("blocks.1", 8)]);
         let total_at_8 = 2 * 8 * 64_usize;  // 1024
         let tight = total_at_8 - 64;        // 960 — exactly 1 rank step under
-        let (alloc, _diags) = allocate_ranks(&spectral, tight, 2, 16, None, Some(&over), false);
+        let (alloc, _diags) = allocate_ranks(&spectral, 32, Some(tight), 2, 16, None, Some(&over), false);
         let b0 = alloc.iter().find(|a| a.name == "blocks.0.attn.wq").unwrap();
         let b1 = alloc.iter().find(|a| a.name == "blocks.1.attn.wq").unwrap();
         assert_eq!(b0.rank, 7, "lower-priority layer loses 1 rank");
@@ -1195,7 +1309,7 @@ mod override_tests {
         let tight = 2 * 8 * 64_usize - 64; // 960 — forces blocks.0 down to 7
 
         // Opt-in is off by default: the off-grid rank 7 survives.
-        let (off, _) = allocate_ranks(&spectral, tight, 2, 16, None, Some(&over), false);
+        let (off, _) = allocate_ranks(&spectral, 32, Some(tight), 2, 16, None, Some(&over), false);
         assert_eq!(
             off.iter().find(|a| a.name == "blocks.0.attn.wq").unwrap().rank,
             7,
@@ -1203,7 +1317,7 @@ mod override_tests {
         );
 
         // Opt-in on: 7 floors to 4; the on-grid 8 is unchanged.
-        let (on, _) = allocate_ranks(&spectral, tight, 2, 16, None, Some(&over), true);
+        let (on, _) = allocate_ranks(&spectral, 32, Some(tight), 2, 16, None, Some(&over), true);
         let b0 = on.iter().find(|a| a.name == "blocks.0.attn.wq").unwrap();
         let b1 = on.iter().find(|a| a.name == "blocks.1.attn.wq").unwrap();
         assert_eq!(b0.rank, 4, "off-grid 7 floors to grid value 4");
