@@ -171,7 +171,10 @@ Rectified linear unit: `max(x, 0)`, elementwise.
 ### `fn gelu_act(x: Tensor) -> Tensor`
 
 Gaussian Error Linear Unit, the activation used by the transformer MLP
-in `nsl.nn.layers`.
+in `nsl.nn.layers`. `gelu` is the tanh approximation
+`0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))` on every
+device (PyTorch's `gelu(approximate="tanh")`); it is within 4.8e-4 of
+the exact `x * Phi(x)`.
 
 ### `fn silu_act(x: Tensor) -> Tensor`
 
@@ -349,30 +352,34 @@ Loss functions for training and distillation.
 
 `mse_loss` / `l1_loss` / `bce_loss` are elementwise regressions;
 `cross_entropy` is the classification loss the language-modeling head
-uses, and honours -100 as an ignore index. `fused_linear_ce` and
-`fused_kl_ce` are the fusible forms — written as ordinary composites
-so they run anywhere, and recognised by codegen inside a decorated
-`train`/`distill` block so the logits are never materialised.
+uses; a negative target (by convention -100, the ignore index) is left
+out of the mean. `fused_linear_ce` and `fused_kl_ce` are the fusible
+forms — written as ordinary composites so they run anywhere, and
+recognised by codegen inside a decorated `train`/`distill` block so the
+logits are never materialised.
 
 ### `fn mse_loss(pred: Tensor, target: Tensor) -> Tensor`
 
 Mean squared error between `pred` and `target`, averaged over every
-element. Both tensors must broadcast to a common shape.
+element of their common (broadcast) shape. Both tensors must broadcast
+to a common shape.
 
 ### `fn l1_loss(pred: Tensor, target: Tensor) -> Tensor`
 
 Mean absolute error between `pred` and `target`, averaged over every
-element. Less sensitive to outliers than `mse_loss`.
+element of their common (broadcast) shape. Less sensitive to outliers
+than `mse_loss`.
 
 ### `fn cross_entropy(logits: Tensor, targets: Tensor) -> Tensor`
 
 Softmax cross-entropy over `logits` `[N, C]` against integer class
 `targets` `[N]`, averaged over the valid positions.
 
-Targets of -100 are the ignore index: they are masked out of both the
-numerator and the count, so padded positions in a packed batch do not
-dilute the loss. Computed through `log_softmax`, so it is stable for
-logits far from zero.
+A negative target is ignored (-100 is the conventional ignore index):
+it is masked out of both the numerator and the count, so padded
+positions in a packed batch do not dilute the loss. A target at or
+above the number of classes is an error. Computed through
+`log_softmax`, so it is stable for logits far from zero.
 
 ### `fn bce_loss(pred: Tensor, target: Tensor) -> Tensor`
 
@@ -415,15 +422,17 @@ Shapes, matching the fused kernel's FFI:
     x_t:     [rows, HT]  f32   teacher hidden states (frozen)
     W_t:     [V,    HT]  f32   teacher LM head (frozen)
     bias_t:  [V]         f32
-    targets: [rows]      i64   -100 = ignore index
+    targets: [rows]      i64   negative (-100) = ignored row
 
 Returns a scalar loss, the mean over valid rows. The `T^2` factor keeps
-the soft-target gradient scale independent of the temperature. Inside a
-`distill` block decorated with `@fused_kl_ce(enabled = true, ...)`,
+the soft-target gradient scale independent of the temperature. `alpha`
+must be in `[0, 1]` and `temperature` positive. Inside a `distill` block
+decorated with `@fused_kl_ce(enabled = true, ...)` on a CUDA target,
 source-AD substitutes a kernel that materialises neither `[rows, V]`
 logit tensor; `alpha` and `temperature` must then be numeric literals
 at the call site, because the kernel takes them as compile-time
-constants.
+constants. Everywhere else this composite is what runs, and it computes
+the same loss.
 
 ## `nsl.nn.norms`
 
