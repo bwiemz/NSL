@@ -11,39 +11,12 @@
 //!   LOAD-BEARING PROOF.  If the rewrite produced `y = y_base + x @ A^T @ B^T
 //!   * scale`, every output element = 0 + 8*2*1 = 16.0.  Tolerance: 1e-5 f32.
 //!
-//! ### Architectural blockers discovered during Task 5 implementation
-//!
-//! Two interlocking constraints prevent Build 3 and Build 4 from seeding
-//! the side-table from ordinary NSL source today:
-//!
-//!   (a) **Direct field assignment** (`m.lora_B_... = ones(...)`) errors with
-//!       `no field 'lora_B_...'` — assignment wiring for synthesized adapter
-//!       field names is not implemented (only read-through is, via
-//!       `expr/access.rs::is_synthesized_adapter_field_name`).
-//!
-//!   (b) **In-place seeding via `copy_data(m.lora_B_..., ones(...))` inside a
-//!       `train` step** compiles only on the source-AD path, because that is
-//!       where `invoke_wrga_if_enabled` runs and populates `adapter_sites` +
-//!       `last_wrga_plan`.  But the Wengert extractor rejects `copy_data` as
-//!       an "unsupported function", falling back to tape-AD — which does NOT
-//!       invoke WRGA.  Net: the access `m.lora_B_...` emits the codegen error
-//!       `synthesized adapter field 'lora_B_...' not found for model 'Toy'
-//!       in current WRGA plan`.
-//!
-//! A third deeper concern: `compile_user_functions` (which is where model
-//! methods including `forward` are compiled) runs BEFORE `compile_main`
-//! (which is where the train block runs WRGA and populates
-//! `compiler.adapter_sites`).  At the time the rewrite pass consults
-//! `self.adapter_sites` in `compiler/functions.rs` line 532, the vector is
-//! empty, so the LoRA AST rewrite is skipped for every model method.  This
-//! is the exact wiring gap the plan warned about; it will manifest as
-//! Build 4 output = `y_base = zeros`, i.e. a failure by exactly 16.0 per
-//! element.
-//!
-//! Per Task 5 guardrails: "don't modify rewrite logic".  Build 4 below is
-//! written to fire the full pipeline and assert the expected value; if it
-//! fails by exactly 16.0 per element, that is precisely the diagnostic the
-//! plan wanted from this task.  A subsequent task owns the wiring fix.
+//! The CPU builds above seed the adapter tensors by assignment
+//! (`m.lora_A_<site> = ...`) and use constant operands, which is enough to
+//! show the rewrite fires and the fused call is reached. They cannot tell a
+//! right kernel from a wrong one; the tests of the synthesized kernels on
+//! the GPU (`run_fused_kernel_fixture`, built with the `cuda` feature) use
+//! non-constant operands and a reference computed in f64.
 
 use assert_cmd::prelude::*;
 use std::fs;
@@ -570,478 +543,258 @@ fn build_4_lora_rewrite_load_bearing_proof() {
     }
 }
 
-// ─── Task D1: build_4_fused_real_launch — integration numerical gate ─
+// ─── The synthesized kernels on the GPU ─────────────────────────────────
 //
-// Runs BUILD4_SRC_GPU with NSL_WRGA_FUSED_CUDA=1 forced on, asserts:
-//   1. Output is 16.0 ± 1e-4 elementwise (numerical correctness via
-//      real cudarc launch, NOT CPU fallback — the 1e-4 tolerance is
-//      the milestone's numerical gate from spec §5).
-//   2. [nsl-gpu-launch-count] ≥ 1 (proves the fused PTX actually
-//      executed on GPU; count=0 would mean numerical result was
-//      produced by CPU fallback even though NSL_WRGA_FUSED_CUDA=1
-//      was set).
+// Each test launches one synthesized kernel on non-constant operands and
+// holds every element of its result to a reference computed here in f64
+// from the same formulas the NSL source uses to fill the tensors.
 //
-// Complementary to build_4_fused_cuda_actually_fires (which only
-// asserts count ≥ 1 without checking numerics).  This test catches
-// semantic bugs in the rewritten kernel that passed ptxas validation
-// but silently compute the wrong thing.
+// The fixtures these replace filled every operand with a constant (x, A and
+// B all ones, W zeros or ones): their expected value, 16.0, is also what a
+// kernel returns that drops the base product, swaps A's or B's axes, or
+// reads any operand at the wrong index.
 //
-// Known C4 precision concern: the final (x@A)@B MMA requires packed-f16
-// A-operand; C4 emits cvt.rn.f16x2.f32 between the two epilogue MMAs.
-// For BUILD4 shape (x=ones, A=ones, B=ones, rank=2) epi_interm=8.0
-// fits f16 exactly so no loss; larger test shapes may need >1e-4
-// tolerance — raise this flag here if the assertion fails.
-#[cfg(feature = "cuda")]
-#[test]
-fn build_4_fused_real_launch() {
-    let tmp = TempDir::new().unwrap();
-    let src_path = tmp.path().join("build4_real_launch.nsl");
-    fs::write(&src_path, BUILD4_SRC_GPU).unwrap();
+// Tolerance. The kernels compute in half precision: each operand is rounded
+// to a 16-bit float (relative error up to 2⁻¹¹ ≈ 4.9e-4) before the tensor-
+// core product, the `x @ A` intermediate is rounded again, and sums are
+// kept in 32-bit. A product of two rounded operands is off by at most about
+// 1e-3 of its magnitude, so an element is allowed 1.5e-3 of the sum of the
+// magnitudes of its terms. That is a bound a correct half-precision kernel
+// meets and a wrong one does not: dropping a term, or misreading an
+// operand, moves an element by the size of the terms themselves.
 
-    let root = workspace_root();
-    let stdlib = root.join("stdlib");
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum FusedKind {
+    Lora,
+    GatedLora,
+    Ia3,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug)]
+struct FusedShape {
+    /// Rows of x.
+    m: usize,
+    /// Input width: x is `[m, k]`, W is `[k, n]`.
+    k: usize,
+    /// Output width.
+    n: usize,
+    rank: usize,
+    alpha: usize,
+}
+
+/// `arange(rows * cols).reshape([rows, cols]) * step - offset`, row-major.
+#[cfg(feature = "cuda")]
+fn ramp(len: usize, step: f64, offset: f64) -> Vec<f64> {
+    (0..len).map(|i| i as f64 * step - offset).collect()
+}
+
+/// The NSL expression for the same tensor, on the GPU.
+#[cfg(feature = "cuda")]
+fn ramp_src(shape: &[usize], step: f64, offset: f64) -> String {
+    let len: usize = shape.iter().product();
+    let dims = shape.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", ");
+    format!("((arange({len}).reshape([{dims}])) * {step} - full([{dims}], {offset})).to(cuda)")
+}
+
+/// Run one adapted matmul on the GPU with the fused path opted in and check
+/// every element. `kernel_serves_it` says whether the shape is one the
+/// kernel computes (one output tile, rank up to 8): then exactly one kernel
+/// launch must produce the result. Otherwise the launcher must decline, say
+/// so, and the ordinary operations must produce it.
+#[cfg(feature = "cuda")]
+fn run_fused_kernel_fixture(kind: FusedKind, s: FusedShape, kernel_serves_it: bool) {
+    let FusedShape { m, k, n, rank, alpha } = s;
+    // Steps chosen so that no tensor is symmetric, constant along an axis,
+    // or a multiple of another.
+    let (x_step, x_off) = (0.07, 0.9);
+    let (w_step, w_off) = (0.013, 0.4);
+    let (a_step, a_off) = (0.021, 0.3);
+    let (b_step, b_off) = (0.017, 0.2);
+    let (v_step, v_off) = (0.31, 1.2); // gate, or the IA³ scale
+
+    let (decorator, seeds) = match kind {
+        FusedKind::Lora => (
+            format!("@adapter(type=lora, target=[\"Toy.w\"], rank={rank}, alpha={alpha})"),
+            format!(
+                "m.lora_A_Toy_w__lora = {}\nm.lora_B_Toy_w__lora = {}\n",
+                ramp_src(&[k, rank], a_step, a_off),
+                ramp_src(&[rank, n], b_step, b_off)
+            ),
+        ),
+        FusedKind::GatedLora => (
+            format!("@adapter(type=gatedlora, target=[\"Toy.w\"], rank={rank}, alpha={alpha})"),
+            format!(
+                "m.lora_A_Toy_w__gatedlora = {}\nm.lora_B_Toy_w__gatedlora = {}\nm.gate_Toy_w__gatedlora = {}\n",
+                ramp_src(&[k, rank], a_step, a_off),
+                ramp_src(&[rank, n], b_step, b_off),
+                ramp_src(&[n], v_step, v_off)
+            ),
+        ),
+        FusedKind::Ia3 => (
+            "@adapter(type=ia3, target=[\"Toy.w\"])".to_string(),
+            format!("m.ia3_scale_Toy_w__ia3 = {}\n", ramp_src(&[n], v_step, v_off)),
+        ),
+    };
+    let src = format!(
+        r#"model Toy:
+    w: Tensor = zeros([{k}, {n}])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+{decorator}
+let m = Toy()
+m.to(cuda)
+m.w = {w}
+{seeds}let x = {x}
+let y: Tensor = m.forward(x)
+print(y)
+"#,
+        w = ramp_src(&[k, n], w_step, w_off),
+        x = ramp_src(&[m, k], x_step, x_off),
+    );
+
+    let label = format!("{kind:?} {s:?}");
+    let tmp = TempDir::new().unwrap();
+    let src_path = tmp.path().join("fused_kernel.nsl");
+    fs::write(&src_path, &src).unwrap();
     let mut cmd = Command::cargo_bin("nsl").unwrap();
-    cmd.env("NSL_STDLIB_PATH", &stdlib)
+    cmd.env("NSL_STDLIB_PATH", workspace_root().join("stdlib"))
         .env("NSL_WRGA_FUSED_CUDA", "1")
         .env("NSL_WRGA_GPU_LAUNCH_COUNTER", "1")
         .arg("run")
-        .args(["--source-ad", "--target", "cuda_sm80"])
+        .args(["--target", "cuda_sm80"])
         .arg(&src_path);
     let output = cmd.output().expect("nsl run failed to spawn");
-    let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    assert!(
-        output.status.success(),
-        "nsl run failed.\nstdout:\n{stdout}\nstderr:\n{stderr}",
-    );
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(output.status.success(), "{label}: nsl run failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
 
-    // Parse output tensor.
-    let tensor = parse_tensor_2d(&stdout);
-    assert_eq!(tensor.len(), 4, "expected 4 rows, got {tensor:?}");
-
-    // Assert 16.0 ± 1e-4 per element.
-    let mut max_diff: f32 = 0.0;
-    for row in &tensor {
-        assert_eq!(row.len(), 8, "expected 8 cols");
-        for v in row {
-            // `max_diff.max(nan)` keeps `max_diff`: refuse NaN before folding.
-            assert!(v.is_finite(), "non-finite entry in output tensor: {v} in {tensor:?}");
-            max_diff = max_diff.max((v - 16.0).abs());
-        }
-    }
-    assert!(
-        max_diff < 1e-4,
-        "build_4_fused_real_launch: max |y - 16.0| = {max_diff:.3e}, want < 1e-4.\n\
-         Diagnostic hints:\n\
-         - ~1e-3: f16 precision (cvt.rn.f16x2.f32 between epilogue MMAs)\n\
-         - exactly 16.0 diff (y=0): base matmul fired but adapter delta dropped\n\
-         - exactly 0: test never exercised the fused path\n\
-         stderr:\n{stderr}"
-    );
-
-    // Assert the REAL cudarc launch fired (not CPU fallback).
-    let gpu_count_line = stderr.lines().find(|l| l.contains("[nsl-gpu-launch-count]"));
-    let count: u64 = gpu_count_line
+    // Where the result must come from. For a shape the kernel serves, from
+    // the kernel: the ordinary operations would meet the tolerance below
+    // whatever the kernel does.
+    let launches: u64 = stderr
+        .lines()
+        .find(|l| l.contains("[nsl-gpu-launch-count]"))
         .and_then(|l| l.split_whitespace().next_back())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("{label}: no [nsl-gpu-launch-count] line.\nstderr:\n{stderr}"));
+    if kernel_serves_it {
+        assert_eq!(launches, 1, "{label}: expected exactly one kernel launch.\nstderr:\n{stderr}");
+    } else {
+        assert_eq!(launches, 0, "{label}: the kernel cannot compute this shape.\nstderr:\n{stderr}");
+        assert!(
+            stderr.contains("the fused adapter kernel computes one output tile"),
+            "{label}: declining the kernel should be said.\nstderr:\n{stderr}"
+        );
+    }
+    // Opting in says what was opted into.
     assert!(
-        count >= 1,
-        "build_4_fused_real_launch: expected ≥1 real cudarc launch with \
-         NSL_WRGA_FUSED_CUDA=1, got {count}. Numerical output was correct \
-         but came from CPU fallback — the fused PTX path didn't fire. \
-         Check for fallback warnings in stderr above."
+        stderr.contains("half precision"),
+        "{label}: the build should say the fused kernels compute in half precision.\nstderr:\n{stderr}"
     );
-}
 
-// ─── Task E4: IA³ integration fixtures ─────────────────────────────────────
-//
-// Fixture A — full compute path baseline:
-//   x = ones([4,8]), W = ones([8,8]), γ = ones([8])
-//   y[i,j] = (x@W)[i,j] * γ[j] = 8 * 1 = 8 elementwise
-// Proves the IA³ matmul pipeline runs end-to-end (γ=1 is a passthrough
-// so a failure here means the x@W path itself is broken).
-//
-// Fixture B — γ actually multiplies:
-//   x = ones([4,8]), W = ones([8,8]), γ = [2, 2, ..., 2]
-//   y[i,j] = 8 * 2 = 16 elementwise
-// Proves γ is read from HBM and applied via broadcast-multiply.  If
-// Fixture A passes but B fails (y still = 8), γ is being ignored.
-
-// driven by the `#[cfg(feature = "cuda")]` GPU-equivalence tests below
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-const IA3_FIXTURE_A_SRC: &str = r#"from nsl.nn.losses import mse_loss
-
-model Toy:
-    w: Tensor = ones([8, 8])
-
-    fn forward(self, x: Tensor) -> Tensor:
-        return x @ self.w
-
-@adapter(type=ia3, target=["Toy.w"])
-let m = Toy()
-m.to(cuda)
-let x = ones([4, 8]).to(cuda)
-let y_target = zeros([4, 8]).to(cuda)
-train(model = m, epochs = 1):
-    optimizer: SGD(lr = 0.0)
-    step(batch):
-        let pred = m.forward(x)
-        let loss = mse_loss(pred, y_target)
-m.ia3_scale_Toy_w__ia3 = ones([8]).to(cuda)
-let y = m.forward(x)
-print(y)
-"#;
-
-// driven by the `#[cfg(feature = "cuda")]` GPU-equivalence tests below
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-const IA3_FIXTURE_B_SRC: &str = r#"from nsl.nn.losses import mse_loss
-
-model Toy:
-    w: Tensor = ones([8, 8])
-
-    fn forward(self, x: Tensor) -> Tensor:
-        return x @ self.w
-
-@adapter(type=ia3, target=["Toy.w"])
-let m = Toy()
-m.to(cuda)
-let x = ones([4, 8]).to(cuda)
-let y_target = zeros([4, 8]).to(cuda)
-train(model = m, epochs = 1):
-    optimizer: SGD(lr = 0.0)
-    step(batch):
-        let pred = m.forward(x)
-        let loss = mse_loss(pred, y_target)
-m.ia3_scale_Toy_w__ia3 = full([8], 2.0).to(cuda)
-let y = m.forward(x)
-print(y)
-"#;
-
-#[cfg(feature = "cuda")]
-fn run_ia3_fixture(src: &str, expected: f32, fixture_name: &str) {
-    let tmp = TempDir::new().unwrap();
-    let src_path = tmp.path().join(format!("{}.nsl", fixture_name));
-    fs::write(&src_path, src).unwrap();
-    let root = workspace_root();
-    let stdlib = root.join("stdlib");
-    let mut cmd = Command::cargo_bin("nsl").unwrap();
-    cmd.env("NSL_STDLIB_PATH", &stdlib)
-        .env("NSL_WRGA_FUSED_CUDA", "1")
-        .arg("run")
-        .args(["--source-ad", "--target", "cuda_sm80"])
-        .arg(&src_path);
-    let output = cmd.output().expect("nsl run failed to spawn");
-    assert!(
-        output.status.success(),
-        "{fixture_name} nsl run failed.\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let tensor = parse_tensor_2d(&stdout);
-    let mut max_diff: f32 = 0.0;
-    for row in &tensor {
-        for v in row {
-            // `max_diff.max(nan)` keeps `max_diff`: refuse NaN before folding.
+    // The reference, in f64.
+    let x = ramp(m * k, x_step, x_off);
+    let w = ramp(k * n, w_step, w_off);
+    let a = ramp(k * rank, a_step, a_off);
+    let b = ramp(rank * n, b_step, b_off);
+    let v = ramp(n, v_step, v_off);
+    let scale = alpha as f64 / rank as f64;
+    let got = parse_tensor_2d(&stdout);
+    assert_eq!(got.len(), m, "{label}: expected {m} rows, got {got:?}");
+    let (mut worst, mut worst_allowed) = (0.0_f64, 0.0_f64);
+    for i in 0..m {
+        assert_eq!(got[i].len(), n, "{label}: row {i} has {} columns", got[i].len());
+        for j in 0..n {
+            let base: f64 = (0..k).map(|c| x[k * i + c] * w[n * c + j]).sum();
+            let base_mag: f64 = (0..k).map(|c| (x[k * i + c] * w[n * c + j]).abs()).sum();
+            let delta: f64 = (0..rank)
+                .map(|q| (0..k).map(|c| x[k * i + c] * a[rank * c + q]).sum::<f64>() * b[n * q + j])
+                .sum();
+            let delta_mag: f64 = (0..rank)
+                .map(|q| {
+                    (0..k).map(|c| (x[k * i + c] * a[rank * c + q]).abs()).sum::<f64>() * b[n * q + j].abs()
+                })
+                .sum();
+            let (want, magnitude) = match kind {
+                FusedKind::Lora => (base + scale * delta, base_mag + scale * delta_mag),
+                FusedKind::GatedLora => {
+                    let gate = 1.0 / (1.0 + (-v[j]).exp());
+                    (base + gate * scale * delta, base_mag + gate * scale * delta_mag)
+                }
+                FusedKind::Ia3 => (base * v[j], base_mag * v[j].abs()),
+            };
+            let value = f64::from(got[i][j]);
+            assert!(value.is_finite(), "{label}: [{i}][{j}] is {value}");
+            let (err, allowed) = ((value - want).abs(), 1.5e-3 * magnitude + 1e-6);
+            if err / allowed > worst / worst_allowed.max(f64::MIN_POSITIVE) {
+                (worst, worst_allowed) = (err, allowed);
+            }
             assert!(
-                v.is_finite(),
-                "{fixture_name}: non-finite entry in output tensor: {v} in {tensor:?}"
+                err <= allowed,
+                "{label}: y[{i}][{j}] = {value}, f64 reference {want} (|Δ| = {err:.3e}, allowed \
+                 {allowed:.3e} for half precision)"
             );
-            max_diff = max_diff.max((v - expected).abs());
         }
     }
-    assert!(
-        max_diff < 1e-4,
-        "{fixture_name}: max |y - {expected}| = {max_diff:.3e}, want < 1e-4. \
-         Tensor: {tensor:?}"
-    );
+    eprintln!("{label}: worst |Δ| {worst:.3e} against {worst_allowed:.3e} allowed");
+}
+
+/// One output tile exactly: 16 rows, 8 columns, one 16-wide step of k.
+#[cfg(feature = "cuda")]
+const WHOLE_TILE: FusedShape = FusedShape { m: 16, k: 16, n: 8, rank: 2, alpha: 4 };
+/// One tile with every dimension short of it or off its grid: tail rows,
+/// tail columns, a k that is not a multiple of 16, an odd rank.
+#[cfg(feature = "cuda")]
+const PARTIAL_TILE: FusedShape = FusedShape { m: 13, k: 20, n: 6, rank: 3, alpha: 6 };
+/// The largest rank the kernel's epilogue holds, over two steps of k.
+#[cfg(feature = "cuda")]
+const RANK_8: FusedShape = FusedShape { m: 16, k: 32, n: 8, rank: 8, alpha: 16 };
+/// More than one tile each way. The kernel used to be launched on such
+/// shapes and returned the first tile's values in the others: rows 16 and
+/// up and columns 8 and up were wrong by hundreds of times the tolerance.
+#[cfg(feature = "cuda")]
+const SEVERAL_TILES: FusedShape = FusedShape { m: 21, k: 20, n: 11, rank: 3, alpha: 6 };
+/// A rank the epilogue does not hold; the kernel was wrong in every element.
+#[cfg(feature = "cuda")]
+const RANK_9: FusedShape = FusedShape { m: 16, k: 16, n: 8, rank: 9, alpha: 18 };
+
+#[cfg(feature = "cuda")]
+#[test]
+fn the_fused_lora_kernel_matches_the_reference() {
+    run_fused_kernel_fixture(FusedKind::Lora, WHOLE_TILE, true);
+    run_fused_kernel_fixture(FusedKind::Lora, PARTIAL_TILE, true);
+    run_fused_kernel_fixture(FusedKind::Lora, RANK_8, true);
 }
 
 #[cfg(feature = "cuda")]
 #[test]
-fn ia3_fixture_a_baseline() {
-    run_ia3_fixture(IA3_FIXTURE_A_SRC, 8.0, "ia3_a");
+fn the_fused_gated_lora_kernel_matches_the_reference() {
+    run_fused_kernel_fixture(FusedKind::GatedLora, WHOLE_TILE, true);
+    run_fused_kernel_fixture(FusedKind::GatedLora, PARTIAL_TILE, true);
+    run_fused_kernel_fixture(FusedKind::GatedLora, RANK_8, true);
 }
 
 #[cfg(feature = "cuda")]
 #[test]
-fn ia3_fixture_b_gamma_scaling() {
-    run_ia3_fixture(IA3_FIXTURE_B_SRC, 16.0, "ia3_b");
+fn the_fused_ia3_kernel_matches_the_reference() {
+    run_fused_kernel_fixture(FusedKind::Ia3, WHOLE_TILE, true);
+    run_fused_kernel_fixture(FusedKind::Ia3, PARTIAL_TILE, true);
 }
 
-// ─── Task Group 5: GatedLoRA integration fixtures ──────────────────────────
-//
-// Fixture A — baseline (gate = 0 per column):
-//   x = ones([4,8]), W = ones([8,8]), A = ones([8,2]), B = ones([2,8])
-//   alpha = rank = 2, scale = alpha/rank = 1.0
-//   gate[j] = 0 for all j  ⟹  sigmoid(gate[j]) = 0.5
-//
-//   y[i,j] = (x@W)[i,j] + sigmoid(gate[j]) * ((x@A)@B)[i,j] * scale
-//          = 8            + 0.5              * 16              * 1.0
-//          = 16.0 per element.
-//
-// Proves the GatedLoRA fused kernel runs end-to-end: base matmul (8),
-// adapter delta (x@A@B = 16), sigmoid gate folded at the correct value (0.5),
-// and scale=1.0 applied.  Tolerance 1e-4.
-
-// driven by the `#[cfg(feature = "cuda")]` GPU-equivalence tests below
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-const GATEDLORA_FIXTURE_A_SRC: &str = r#"from nsl.nn.losses import mse_loss
-
-model Toy:
-    w: Tensor = ones([8, 8])
-
-    fn forward(self, x: Tensor) -> Tensor:
-        return x @ self.w
-
-@adapter(type=gatedlora, target=["Toy.w"], rank=2, alpha=2)
-let m = Toy()
-m.to(cuda)
-let x = ones([4, 8]).to(cuda)
-let y_target = zeros([4, 8]).to(cuda)
-train(model = m, epochs = 1):
-    optimizer: SGD(lr = 0.0)
-    step(batch):
-        let pred = m.forward(x)
-        let loss = mse_loss(pred, y_target)
-m.lora_A_Toy_w__gatedlora = ones([8, 2]).to(cuda)
-m.lora_B_Toy_w__gatedlora = ones([2, 8]).to(cuda)
-m.gate_Toy_w__gatedlora = zeros([8]).to(cuda)
-let y = m.forward(x)
-print(y)
-"#;
-
-/// Shared helper for GatedLoRA integration fixtures (Tasks 5.1-5.4).
-///
-/// Runs `src` through `nsl run --source-ad --target cuda_sm80` with
-/// `NSL_WRGA_FUSED_CUDA=1` and `NSL_WRGA_GPU_LAUNCH_COUNTER=1`, then asserts:
-///   1. Process exits successfully.
-///   2. Every output element is within `tolerance` of `expected`.
-///   3. `[nsl-gpu-launch-count] >= 1` — the real cudarc PTX path fired, NOT
-///      the CPU fallback.
+/// A shape the kernel cannot compute runs the ordinary operations, with a
+/// notice, and is right.
 #[cfg(feature = "cuda")]
-fn run_gatedlora_fixture(src: &str, expected: f32, tolerance: f32, fixture_name: &str) {
-    let tmp = TempDir::new().unwrap();
-    let src_path = tmp.path().join(format!("{}.nsl", fixture_name));
-    fs::write(&src_path, src).unwrap();
-    let root = workspace_root();
-    let stdlib = root.join("stdlib");
-    let mut cmd = Command::cargo_bin("nsl").unwrap();
-    cmd.env("NSL_STDLIB_PATH", &stdlib)
-        .env("NSL_WRGA_FUSED_CUDA", "1")
-        .env("NSL_WRGA_GPU_LAUNCH_COUNTER", "1")
-        .arg("run")
-        .args(["--source-ad", "--target", "cuda_sm80"])
-        .arg(&src_path);
-    let output = cmd.output().expect("nsl run failed to spawn");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    assert!(
-        output.status.success(),
-        "{fixture_name} nsl run failed.\nstdout:\n{stdout}\nstderr:\n{stderr}",
-    );
-
-    let tensor = parse_tensor_2d(&stdout);
-    assert_eq!(tensor.len(), 4, "{fixture_name}: expected 4 rows");
-
-    let mut max_diff: f32 = 0.0;
-    for row in &tensor {
-        assert_eq!(row.len(), 8, "{fixture_name}: expected 8 cols");
-        for v in row {
-            // `max_diff.max(nan)` keeps `max_diff`: refuse NaN before folding.
-            assert!(
-                v.is_finite(),
-                "{fixture_name}: non-finite entry in output tensor: {v} in {tensor:?}"
-            );
-            max_diff = max_diff.max((v - expected).abs());
-        }
+#[test]
+fn a_shape_beyond_one_tile_is_not_given_to_the_fused_kernel() {
+    for kind in [FusedKind::Lora, FusedKind::GatedLora, FusedKind::Ia3] {
+        run_fused_kernel_fixture(kind, SEVERAL_TILES, false);
     }
-    assert!(
-        max_diff < tolerance,
-        "{fixture_name}: max |y - {expected}| = {max_diff:.3e}, want < {tolerance:.0e}.\n\
-         Diagnostic:\n\
-         - diff ~ 8.0 (y=8 or y=24): sigmoid gate not applied or applied twice\n\
-         - diff ~ 16.0 (y=0): adapter delta dropped entirely\n\
-         - diff ~ 0.5*16=8 (y~8): gate=0.5 correct but base matmul dropped\n\
-         - diff > 1e-3: precision concern (f16 cvt between epilogue MMAs)\n\
-         Tensor: {tensor:?}\nstderr:\n{stderr}",
-    );
-
-    // Assert fused PTX actually fired (not CPU fallback).
-    let gpu_count_line = stderr.lines().find(|l| l.contains("[nsl-gpu-launch-count]"));
-    let count: u64 = gpu_count_line
-        .and_then(|l| l.split_whitespace().next_back())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    assert!(
-        count >= 1,
-        "{fixture_name}: expected >=1 fused CUDA launch, got {count}.\n\
-         0 means all fused FFI calls hit the CPU fallback — check:\n\
-         - GatedLoRA kernel registered in fused_adapter.rs kernel registry\n\
-         - wrga_adapter_rewrite.rs emits GatedLoRA fused Call (not unfused triple)\n\
-         - GPU tensor placement gates satisfied (all tensors on CUDA)\n\
-         stderr:\n{stderr}",
-    );
-}
-
-#[cfg(feature = "cuda")]
-#[test]
-fn gatedlora_fixture_a_baseline() {
-    run_gatedlora_fixture(GATEDLORA_FIXTURE_A_SRC, 16.0, 1e-4, "gatedlora_fixture_a");
-}
-
-// driven by the `#[cfg(feature = "cuda")]` GPU-equivalence tests below
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-/// Fixture B — positive saturation. alpha=2, rank=2, scale=1.0.
-/// Same model/x as Fixture A; gate = full([8], 30.0).  sigmoid(30) ≈ 1.0
-/// exactly in fp32 (ex2.approx(-30 * log2e) = ex2.approx(-43.3) → 2^-43
-/// underflows to 0 in fp32, yielding 1/(1+0) = 1.0 exactly).
-/// y[i,j] = 8 + 1.0 * 16 * 1.0 = 24.0 per element.
-const GATEDLORA_FIXTURE_B_SRC: &str = r#"from nsl.nn.losses import mse_loss
-
-model Toy:
-    w: Tensor = ones([8, 8])
-
-    fn forward(self, x: Tensor) -> Tensor:
-        return x @ self.w
-
-@adapter(type=gatedlora, target=["Toy.w"], rank=2, alpha=2)
-let m = Toy()
-m.to(cuda)
-let x = ones([4, 8]).to(cuda)
-let y_target = zeros([4, 8]).to(cuda)
-train(model = m, epochs = 1):
-    optimizer: SGD(lr = 0.0)
-    step(batch):
-        let pred = m.forward(x)
-        let loss = mse_loss(pred, y_target)
-m.lora_A_Toy_w__gatedlora = ones([8, 2]).to(cuda)
-m.lora_B_Toy_w__gatedlora = ones([2, 8]).to(cuda)
-m.gate_Toy_w__gatedlora = full([8], 30.0).to(cuda)
-let y = m.forward(x)
-print(y)
-"#;
-
-#[cfg(feature = "cuda")]
-#[test]
-fn gatedlora_fixture_b_positive_saturation() {
-    run_gatedlora_fixture(GATEDLORA_FIXTURE_B_SRC, 24.0, 1e-4, "fixture_b");
-}
-
-// driven by the `#[cfg(feature = "cuda")]` GPU-equivalence tests below
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-/// Fixture C — negative saturation. alpha=2, rank=2, scale=1.0.
-/// gate = full([8], -30.0).  sigmoid(-30) ≈ 0.0 exactly (ex2.approx(+43)
-/// overflows in the denominator; 1/huge ≈ 0.0 in fp32).
-/// y[i,j] = 8 + 0.0 * 16 * 1.0 = 8.0 per element.
-///
-/// DIAGNOSTIC: the base-only value (8.0) specifically tests that
-/// the fold predicate path doesn't leak junk into main_accum when
-/// sigmoid(gate) ≈ 0.  A broken kernel that adds the adapter delta
-/// unconditionally (ignoring the sigmoid multiply) would produce y=24
-/// here instead of y=8.
-const GATEDLORA_FIXTURE_C_SRC: &str = r#"from nsl.nn.losses import mse_loss
-
-model Toy:
-    w: Tensor = ones([8, 8])
-
-    fn forward(self, x: Tensor) -> Tensor:
-        return x @ self.w
-
-@adapter(type=gatedlora, target=["Toy.w"], rank=2, alpha=2)
-let m = Toy()
-m.to(cuda)
-let x = ones([4, 8]).to(cuda)
-let y_target = zeros([4, 8]).to(cuda)
-train(model = m, epochs = 1):
-    optimizer: SGD(lr = 0.0)
-    step(batch):
-        let pred = m.forward(x)
-        let loss = mse_loss(pred, y_target)
-m.lora_A_Toy_w__gatedlora = ones([8, 2]).to(cuda)
-m.lora_B_Toy_w__gatedlora = ones([2, 8]).to(cuda)
-m.gate_Toy_w__gatedlora = full([8], -30.0).to(cuda)
-let y = m.forward(x)
-print(y)
-"#;
-
-#[cfg(feature = "cuda")]
-#[test]
-fn gatedlora_fixture_c_negative_saturation() {
-    run_gatedlora_fixture(GATEDLORA_FIXTURE_C_SRC, 8.0, 1e-4, "fixture_c");
-}
-
-// driven by the `#[cfg(feature = "cuda")]` GPU-equivalence tests below
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-/// Fixture D — mid-range sigmoid curve validation.
-/// alpha=2, rank=2, scale=1.0.  gate = full([8], 1.0f) exact f32.
-/// sigmoid(1.0) ≈ 0.7310586.  y[i,j] = 8 + 0.7310586 * 16 * 1.0 ≈ 19.697 per element.
-///
-/// Tolerance 1e-3 (vs 1e-4 on A/B/C): gate=1.0f exercises the actual
-/// ex2.approx + rcp.approx sigmoid curve shape between saturation points,
-/// not exact values.
-///
-/// Error propagation at rank=2 accumulator magnitudes:
-///   ex2.approx worst-case ULP:      ~2 ULP (~5e-8 at input -1.4427)
-///   rcp.approx worst-case ULP:      ~1 ULP (~6e-8 at input ≈1.368)
-///   Combined via 1/(1+e) derivative: ~9e-8 on sigmoid output
-///   Through fold at rank=2:          ~5e-6 per element
-///   Main-path MMA noise floor:       ~2e-4 (dominates)
-///   1e-3 tolerance:                  ~5x over main MMA, ~200x over sigmoid
-///
-/// Bug class this fixture catches: a sign-based-stub kernel emitting
-/// `select(x > 0, 1.0, select(x < 0, 0.0, 0.5))` passes every saturation
-/// fixture (A/B/C) but returns 0.5 here — wrong by |0.5 - 0.7310586| ≈ 0.2311
-/// on the sigmoid value.
-///
-///   Correct y:   (x@W = 8) + 0.7310586 · 16 · 1.0 ≈ 19.697
-///   Stub   y:   (x@W = 8) + 0.5       · 16 · 1.0 = 16.0
-///                                                   ^^^^
-///   The (x@W = 8) base contribution is identical in both paths and cancels.
-///   y-level error = |19.697 − 16.0| = 3.697, driven entirely by the
-///   adapter-path factor 16 · (0.7311 − 0.5) ≈ 3.697. This is ~3700× the
-///   1e-3 tolerance — fixture fails loudly.
-///
-/// This is the ONLY fixture in the B.3.1 matrix that discriminates
-/// "emitted rcp.approx(1 + ex2.approx(-x * log2e))" from "silently stubbed."
-const GATEDLORA_FIXTURE_D_SRC: &str = r#"from nsl.nn.losses import mse_loss
-
-model Toy:
-    w: Tensor = ones([8, 8])
-
-    fn forward(self, x: Tensor) -> Tensor:
-        return x @ self.w
-
-@adapter(type=gatedlora, target=["Toy.w"], rank=2, alpha=2)
-let m = Toy()
-m.to(cuda)
-let x = ones([4, 8]).to(cuda)
-let y_target = zeros([4, 8]).to(cuda)
-train(model = m, epochs = 1):
-    optimizer: SGD(lr = 0.0)
-    step(batch):
-        let pred = m.forward(x)
-        let loss = mse_loss(pred, y_target)
-m.lora_A_Toy_w__gatedlora = ones([8, 2]).to(cuda)
-m.lora_B_Toy_w__gatedlora = ones([2, 8]).to(cuda)
-m.gate_Toy_w__gatedlora = full([8], 1.0).to(cuda)
-let y = m.forward(x)
-print(y)
-"#;
-
-// reference activation for the `#[cfg(feature = "cuda")]` gated-LoRA checks
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-fn sigmoid_f64(x: f64) -> f64 {
-    1.0 / (1.0 + (-x).exp())
-}
-
-#[cfg(feature = "cuda")]
-#[test]
-fn gatedlora_fixture_d_mid_range_curve() {
-    // Expected computed from CPU reference: 8 + sigmoid(1.0) * 16.
-    let expected = 8.0_f32 + sigmoid_f64(1.0) as f32 * 16.0;
-    run_gatedlora_fixture(GATEDLORA_FIXTURE_D_SRC, expected, 1e-3, "fixture_d");
+    run_fused_kernel_fixture(FusedKind::Lora, RANK_9, false);
+    run_fused_kernel_fixture(FusedKind::GatedLora, RANK_9, false);
 }
 
 // ===== WRGA B.3.2 Option 3 (revised) phase 3e tests =====
@@ -1325,7 +1078,7 @@ print(y)
 ///   Fused-forward output differs from unfused-forward by ≤ 2e-4 per
 ///   element (fused sigmoid ex2.approx + rcp.approx ULP ~9e-8, MMA
 ///   f16-accumulator noise floor ~2e-4; see B.3.1 Fixture D derivation
-///   near GATEDLORA_FIXTURE_D_SRC in this file).
+///   of `run_fused_kernel_fixture` in this file).
 ///
 ///   That per-element output difference ε_y ~ 2e-4 propagates into dy
 ///   with comparable magnitude, then into weight updates
@@ -1345,13 +1098,10 @@ fn gatedlora_fused_backward_matches_unfused_reference() {
     // w / lora_A / lora_B / gate and compare fused (sm80) vs unfused (sm70)
     // element-wise.
     //
-    // Shape rationale: w=[8,8] matches the GATEDLORA_FIXTURE_{A..D} shapes
-    // which are known to exercise the fused kernel without hitting the
-    // rectangular-weight shape bug in the fused adapter path (tracked
-    // separately; orthogonal to this test's AD-rule coverage).
+    // Shape rationale: w=[8,8] fits one output tile of the fused kernel.
     //
     // Initial adapter values: side-table init uses the thread-local seeded
-    // RNG (seed=0) for lora_A's KaimingUniform, and deterministic ones/zeros
+    // RNG (seed=0) for lora_A's scaled normal draw, and deterministic ones/zeros
     // for everything else. Both sm80 and sm70 runs therefore see identical
     // adapter init, so weight-diffs at test time isolate the AD rule, not
     // initial-state drift.
@@ -1466,20 +1216,4 @@ print(w_out)
         tensors_fused[0],
         tensors_unfused[0],
     );
-}
-
-/// Test 5 — inference unchanged regression (4 B.3.1 fixtures).
-///
-/// Programmatic re-run of the four `gatedlora_fixture_*_baseline` helpers
-/// to guarantee their expected values haven't moved. The individual
-/// `#[test]` functions for each fixture are already registered; this
-/// wrapper provides a single quick signal that the B.3.1 inference
-/// surface is intact after the Commit B changes.
-#[cfg(feature = "cuda")]
-#[test]
-fn gatedlora_fused_unchanged_inference_behavior() {
-    // Each of the 4 fixtures is itself a #[test]; they'd run in parallel
-    // anyway. This test just runs the helper directly on fixture A to
-    // catch mass regressions in a single fast signal.
-    run_gatedlora_fixture(GATEDLORA_FIXTURE_A_SRC, 16.0, 1e-4, "regression_gatedlora_a");
 }

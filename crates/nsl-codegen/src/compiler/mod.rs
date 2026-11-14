@@ -184,12 +184,14 @@ pub struct ModelMetadata {
     pub paged_kv_configs: HashMap<String, (i64, i64, i64, i64, i64)>,
     /// Model method AST bodies for source AD inlining: model_type_name -> method_name -> FnDef
     pub model_method_bodies: HashMap<String, HashMap<String, nsl_ast::decl::FnDef>>,
-    /// B.2.1 Task 5.5: shape strings (`Tensor<[out, in], dtype>`) for
-    /// Tensor-typed model fields whose initializer carries a literal
-    /// shape (e.g. `w: Tensor = zeros([8, 8])`). Stored separately from
-    /// `model_field_types` so source-AD's sub-model traversal does not
-    /// accidentally treat tensor shapes as nested model types. Consumed
-    /// by `wrga_adapter_inject::resolve_dims_for_target`.
+    /// B.2.1 Task 5.5: shape strings (`Tensor<[d0, d1], dtype>`, the two
+    /// dims in declaration order) for Tensor-typed model fields whose
+    /// initializer carries a literal shape (e.g. `w: Tensor = zeros([8,
+    /// 8])`). Stored separately from `model_field_types` so source-AD's
+    /// sub-model traversal does not accidentally treat tensor shapes as
+    /// nested model types. Consumed by
+    /// `wrga_adapter_inject::resolve_sites`, which decides which dim is the
+    /// input width from how the model's matmul uses the weight.
     pub model_tensor_field_shapes: HashMap<String, HashMap<String, String>>,
     /// CFTP v10 (item 5): declared tensor rank of `model.field` weight
     /// declarations, keyed as `model_name -> field_name -> rank`.

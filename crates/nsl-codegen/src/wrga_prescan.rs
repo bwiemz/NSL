@@ -16,9 +16,10 @@
 //!   * `adapter_field_index` can resolve synthesized field names to
 //!     side-table slots.
 //!
-//! `invoke_wrga_if_enabled` still runs later inside the train block; it will
-//! overwrite `bus.wrga_plan` / `adapter_sites` with the real plan. The
-//! pre-scan is transparent to that path.
+//! `invoke_wrga_if_enabled` still runs later inside the train block and
+//! replaces `bus.wrga_plan` with the plan of that block. It leaves
+//! `adapter_sites` alone: every model constructor built its side-table from
+//! the sites published here, and the methods were rewritten against them.
 
 use std::collections::BTreeSet;
 

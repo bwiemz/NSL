@@ -508,10 +508,10 @@ impl Compiler<'_> {
                         let field_name = self.resolve_sym(*field_sym).to_string();
                         // B.2.1 Task 5.5: for Tensor fields with a shape-bearing
                         // init like `zeros([8, 8])`, record a structured
-                        // `Tensor<[out, in], f32>` string in a SEPARATE
-                        // map so downstream passes (notably
-                        // wrga_adapter_inject::resolve_dims_for_target) can
-                        // recover the weight shape. Stored separately from
+                        // `Tensor<[d0, d1], f32>` string (the two dims in
+                        // declaration order) in a SEPARATE map so downstream
+                        // passes (notably wrga_adapter_inject::resolve_sites)
+                        // can recover the weight shape. Stored separately from
                         // `model_field_types` because that map drives
                         // sub-model traversal in source-AD; polluting it
                         // with Tensor type strings would make source-AD
