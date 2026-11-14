@@ -18,9 +18,12 @@
 //!   * the dead neurons have gate columns ten times larger than the live
 //!     ones, so ranking by `w_gate` alone keeps them and drops live neurons;
 //!   * layer 0's first four residual features are scaled by 1e-3 in `wq`,
-//!     `wk` and `wv`, so reading heads along the input axis sees a weak
-//!     "head 0" that is not a head at all;
-//!   * the dead heads are a different group in each layer.
+//!     `wk` and `wv`, so a scorer that cuts those three along their input
+//!     axis and never reads `wo` (what CEP used to do) sees a weak "head 0"
+//!     that is not a head at all, and removes live heads;
+//!   * the dead heads are a different group in each layer;
+//!   * the attention reshapes by head counts stored in the checkpoint, so
+//!     weights sliced without rewriting them do not run at all.
 //!
 //! The reference output is not NSL's. The three checksums below come from a
 //! float64 NumPy implementation of the same model (RMSNorm, grouped-query
