@@ -556,8 +556,10 @@ impl CpuSeq {
     }
 }
 
-/// How many emitted tokens the DRAFT model, fed the true sequence, would
-/// have predicted wrongly (greedy).  The first such position is one the
+/// How many emitted tokens after the first the DRAFT model, fed the true
+/// sequence, would have predicted wrongly (greedy).  (The first emitted
+/// token comes from the target's prefill; the draft never predicts it.)
+/// The first such position is one the
 /// driver's draft really mispredicted — within a round the draft is
 /// conditioned on the true prefix until its first wrong guess — so a
 /// non-zero count means a round ended early in the run under test.  This
@@ -570,7 +572,7 @@ fn draft_mispredictions(draft: &CpuModel, cfg: &DecodeBlockConfig, prompt: &[i64
     let all: Vec<i64> = prompt.iter().copied().chain(emitted.iter().map(|&t| t as i64)).collect();
     for (pos, &tok) in all.iter().enumerate().take(all.len() - 1) {
         let x = seq.feed(draft, cfg, tok, pos);
-        if pos + 1 >= prompt.len() {
+        if pos >= prompt.len() {
             let (guess, _) = cpu_reference_draft_sample(&scfg, &x, &draft.final_norm, &draft.lm_rounded);
             if guess as i64 != all[pos + 1] {
                 wrong += 1;
