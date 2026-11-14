@@ -267,6 +267,16 @@ pub fn tape_cert_status(op: &TapeOp) -> TapeCertStatus {
              flash_attention_backward_gpu.rs holds that function's kernels to the reference, \
              but no finite-difference certificate drives this arm",
         ),
+        TapeOp::IndexWrite { .. } => Uncertified(
+            "recorded by an element write in a grad or train block (`y[i, j] = v` and its \
+             compound forms; `nsl_tensor_slice_assign` from the runtime API). A write is a \
+             statement, not an expression, so the `sum(EXPR * r)` certificate form cannot \
+             spell it. The arm is held instead by tape_element_write_gate.rs: gradients through \
+             `=`, `+=`, `*=`, `/=`, repeated writes and a written parameter against PyTorch \
+             2.15 autograd literals, and the refusals of a write over a saved value and of a \
+             stale view; and by nsl-runtime's `slice_assign_routes_the_source_gradient` for \
+             the tensor-valued write",
+        ),
         TapeOp::Checkpoint { .. } => Unreachable(
             "its only record site, `nsl_checkpoint_record`, is exported in the ABI table but no \
              codegen path calls it: `@checkpoint` on a grad-block `let` records the callee's own \
@@ -566,6 +576,16 @@ fn tape_cert_samples() -> Vec<TapeOp> {
             saved_q: 0,
             saved_k: 0,
             saved_v: 0,
+        },
+        TapeOp::IndexWrite {
+            a: 0,
+            out: 0,
+            region: Vec::new(),
+            keep: 0.0,
+            src: 0,
+            src_shape: Vec::new(),
+            src_dtype: 0,
+            src_device: 0,
         },
         TapeOp::Checkpoint {
             fn_ptr: 0,

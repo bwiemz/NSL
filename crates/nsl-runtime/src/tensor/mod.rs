@@ -1175,9 +1175,26 @@ pub extern "C" fn nsl_tensor_get(tensor_ptr: i64, indices_list: i64) -> f64 {
     tensor.read_scalar_as_f64(offset)
 }
 
+/// `t[i, j, ...] = value`. Inside a grad or train block the write is
+/// recorded on the tape (`TapeOp::IndexWrite`): the written element passes
+/// no gradient back to the value it replaced.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_set(tensor_ptr: i64, indices_list: i64, value: f64) {
-    let tensor = NslTensor::from_ptr(tensor_ptr);
+    tensor_set_impl(tensor_ptr, indices_list, value, 0.0);
+}
+
+/// `t[i, j, ...] op= v` for `op` in `+ - * /`: stores `value` (the compound
+/// result, computed by the caller from the element it read) and records
+/// `keep`, the derivative of `value` with respect to the element it
+/// replaces -- 1 for `+=` and `-=`, `v` for `*=`, `1/v` for `/=` -- so the
+/// gradient through the element survives the write as it should.
+#[unsafe(no_mangle)]
+pub extern "C" fn nsl_tensor_set_compound(tensor_ptr: i64, indices_list: i64, value: f64, keep: f64) {
+    tensor_set_impl(tensor_ptr, indices_list, value, keep);
+}
+
+fn tensor_set_impl(tensor_ptr: i64, indices_list: i64, value: f64, keep: f64) {
+    let tensor = NslTensor::from_ptr_ref(tensor_ptr);
     let indices = NslList::from_ptr(indices_list);
 
     if tensor.device > 0 {
@@ -1195,6 +1212,7 @@ pub extern "C" fn nsl_tensor_set(tensor_ptr: i64, indices_list: i64, value: f64)
     }
 
     let mut offset: usize = 0;
+    let mut region = Vec::with_capacity(tensor.ndim as usize);
     for i in 0..tensor.ndim as usize {
         let idx = unsafe { *indices.data.add(i) };
         let dim_size = unsafe { *tensor.shape.add(i) };
@@ -1205,9 +1223,11 @@ pub extern "C" fn nsl_tensor_set(tensor_ptr: i64, indices_list: i64, value: f64)
             std::process::abort();
         }
         offset += (idx as usize) * (unsafe { *tensor.strides.add(i) } as usize);
+        region.push((idx as usize, idx as usize + 1));
     }
 
-    tensor.write_scalar_from_f64(offset, value);
+    autodiff::record_index_write(tensor_ptr, &region, keep, 0);
+    NslTensor::from_ptr_ref(tensor_ptr).write_scalar_from_f64(offset, value);
 }
 
 // === Scalar extraction ===
@@ -4745,6 +4765,7 @@ pub extern "C" fn nsl_tensor_set_element(
 
     let strides = crate::cpu::get_strides_vec(tensor);
     let mut offset: usize = 0;
+    let mut region = Vec::with_capacity(ndim);
     for (d, &stride) in strides.iter().enumerate().take(ndim) {
         let idx = unsafe { *(indices_ptr as *const i64).add(d) } as usize;
         let dim_size = unsafe { *tensor.shape.add(d) } as usize;
@@ -4753,8 +4774,11 @@ pub extern "C" fn nsl_tensor_set_element(
             std::process::abort();
         }
         offset += idx * stride;
+        region.push((idx, idx + 1));
     }
 
+    autodiff::record_index_write(tensor_ptr, &region, 0.0, 0);
+    let tensor = NslTensor::from_ptr(tensor_ptr);
     evict_bf16_cast_image(tensor);
     tensor.write_scalar_from_f64(offset, value);
 }
@@ -4825,6 +4849,12 @@ pub extern "C" fn nsl_tensor_slice_assign(
         );
         std::process::abort();
     }
+
+    // The source is identified by the caller's handle: the CPU and
+    // row-major copies above are private scratch.
+    autodiff::record_index_write(target_ptr, &ranges, 0.0, src_ptr);
+    let target = NslTensor::from_ptr(target_ptr);
+    let src = NslTensor::from_ptr(src_work_ptr);
 
     let mut src_flat = 0usize;
 
@@ -5590,6 +5620,61 @@ mod tests {
         assert_eq!(unsafe { *t.data_f32().add(2) }, 30.0_f32);
         assert_eq!(unsafe { *t.data_f32().add(3) }, 0.0_f32);
         assert_eq!(unsafe { *t.data_f32().add(4) }, 0.0_f32);
+    }
+
+    /// A slice write is on the tape. With `x = [[1, 2, 3], [4, 5, 6]]` and
+    /// `v = [0.5, -1]`: `t = x * 2`, `t[1, 0:2] = v * 3`,
+    /// `loss = sum(t * c)` for `c = x`'s values. PyTorch 2.15 (the same
+    /// program, `loss.backward()`): loss 91, dx = [[2, 4, 6], [0, 0, 12]]
+    /// (the overwritten elements get nothing), dv = [12, 15] (3 * c[1, 0:2]).
+    /// Unrecorded, dx was 2c everywhere and dv zero.
+    #[test]
+    fn slice_assign_routes_the_source_gradient() {
+        let mk = |rows: i64, cols: i64, vals: &[f64]| {
+            let shape = crate::list::nsl_list_new();
+            crate::list::nsl_list_push(shape, rows);
+            crate::list::nsl_list_push(shape, cols);
+            let p = creation::tensor_from_shape_list_f64(shape, 0.0);
+            crate::list::nsl_list_free(shape);
+            let t = NslTensor::from_ptr_ref(p);
+            for (i, v) in vals.iter().enumerate() {
+                t.write_scalar_from_f64(i, *v);
+            }
+            p
+        };
+        let values = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let x = mk(2, 3, &values);
+        let c = mk(2, 3, &values);
+        let v = make_f64_tensor(&[0.5, -1.0]);
+        let params = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(params, x);
+        crate::list::nsl_list_push(params, v);
+        crate::autodiff::nsl_tape_start(params);
+        let t = nsl_tensor_mul_scalar(x, 2.0, 0);
+        let s = nsl_tensor_mul_scalar(v, 3.0, 0);
+        let dims = [
+            NslSliceDim { is_scalar: 1, start: 1, end: 0 },
+            NslSliceDim { is_scalar: 0, start: 0, end: 2 },
+        ];
+        nsl_tensor_slice_assign(t, s, dims.as_ptr() as i64, 2);
+        let tc = nsl_tensor_mul(t, c, 0);
+        let loss = nsl_tensor_sum(tc);
+        assert_eq!(nsl_tensor_item(loss), 91.0);
+        let grads = crate::autodiff::nsl_tape_backward(loss, params);
+        crate::autodiff::nsl_tape_stop();
+        let read = |p: i64| {
+            let t = NslTensor::from_ptr_ref(p);
+            (0..t.len as usize).map(|i| t.read_scalar_as_f64(i)).collect::<Vec<f64>>()
+        };
+        let gx = crate::list::nsl_list_get(grads, 0);
+        let gv = crate::list::nsl_list_get(grads, 1);
+        assert_eq!(read(gx), vec![2.0, 4.0, 6.0, 0.0, 0.0, 12.0], "dloss/dx");
+        assert_eq!(read(gv), vec![12.0, 15.0], "dloss/dv");
+        for p in [gx, gv, loss, tc, s, t, v, c, x] {
+            nsl_tensor_free(p);
+        }
+        crate::list::nsl_list_free(grads);
+        crate::list::nsl_list_free(params);
     }
 
     #[test]

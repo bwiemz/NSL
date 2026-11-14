@@ -244,6 +244,7 @@ macro_rules! for_each_runtime_fn {
             // Tensor element access
             [tensor] nsl_tensor_get(i64, i64) -> f64 = tensor::nsl_tensor_get;
             [tensor] nsl_tensor_set(i64, i64, f64) -> () = tensor::nsl_tensor_set;
+            [tensor] nsl_tensor_set_compound(i64, i64, f64, f64) -> () = tensor::nsl_tensor_set_compound;
             // Tensor shape ops
             [tensor] nsl_tensor_shape(i64) -> i64 = tensor::shape_ops::nsl_tensor_shape;
             [tensor] nsl_tensor_shape_dim(i64, i64) -> i64 = tensor::shape_ops::nsl_tensor_shape_dim;
@@ -1336,6 +1337,6 @@ mod tests {
     fn table_is_the_recorded_size() {
         // The count is pinned so a row dropped by a bad merge is noticed; move
         // it with a row that is deliberately added or removed.
-        assert_eq!(RUNTIME_ABI.len(), 650);
+        assert_eq!(RUNTIME_ABI.len(), 651);
     }
 }

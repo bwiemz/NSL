@@ -575,6 +575,76 @@ impl Compiler<'_> {
         self.free_linear_consumes(builder, state, Some(stored_val));
     }
 
+    /// Tensor element write `t[i, j, ...] op= v` (`new_val` is `v`,
+    /// compiled). The runtime validates arity and bounds and applies the
+    /// strides. `=` stores through `nsl_tensor_set`; a compound form reads
+    /// the element, computes in f64, and stores through
+    /// `nsl_tensor_set_compound` with the derivative of the stored value
+    /// with respect to the element it replaces (1 for `+=`/`-=`, `v` for
+    /// `*=`, `1/v` for `/=`), which the tape needs: a plain store would
+    /// tell it the element's old value no longer matters.
+    #[allow(clippy::too_many_arguments)]
+    fn compile_tensor_element_store(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        obj_val: Value,
+        idx_exprs: &[&nsl_ast::expr::Expr],
+        op: AssignOp,
+        value: &nsl_ast::expr::Expr,
+        new_val: Value,
+    ) -> Result<(), CodegenError> {
+        let indices_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+        for idx_expr in idx_exprs {
+            let idx_raw = self.compile_expr(builder, state, idx_expr)?;
+            let idx_val = if matches!(self.node_type(idx_expr.id), nsl_semantic::types::Type::Float) {
+                builder.ins().fcvt_to_sint(cl_types::I64, idx_raw)
+            } else {
+                idx_raw
+            };
+            self.compile_call_by_name(builder, "nsl_list_push", &[indices_list, idx_val])?;
+        }
+        // The element store takes the value as F64; coerce ints.
+        let rhs_f64 = if matches!(
+            self.node_type(value.id),
+            nsl_semantic::types::Type::Int | nsl_semantic::types::Type::Bool
+        ) {
+            builder.ins().fcvt_from_sint(cl_types::F64, new_val)
+        } else {
+            new_val
+        };
+        let final_val = if matches!(op, AssignOp::Assign) {
+            self.compile_call_by_name(builder, "nsl_tensor_set", &[obj_val, indices_list, rhs_f64])?;
+            rhs_f64
+        } else {
+            // Read-modify-write on the element in f64.
+            let old_val =
+                self.compile_call_by_name(builder, "nsl_tensor_get", &[obj_val, indices_list])?;
+            let one = builder.ins().f64const(1.0);
+            let (stored, keep) = match op {
+                AssignOp::AddAssign => (builder.ins().fadd(old_val, rhs_f64), one),
+                AssignOp::SubAssign => (builder.ins().fsub(old_val, rhs_f64), one),
+                AssignOp::MulAssign => (builder.ins().fmul(old_val, rhs_f64), rhs_f64),
+                AssignOp::DivAssign => {
+                    let inv = builder.ins().fdiv(one, rhs_f64);
+                    (builder.ins().fdiv(old_val, rhs_f64), inv)
+                }
+                AssignOp::Assign => unreachable!("handled above"),
+            };
+            self.compile_call_by_name(
+                builder,
+                "nsl_tensor_set_compound",
+                &[obj_val, indices_list, stored, keep],
+            )?;
+            stored
+        };
+        self.compile_call_by_name(builder, "nsl_list_free", &[indices_list])?;
+        // Stored value is a scalar; the drain covers index-expression and
+        // RHS temporaries.
+        self.assign_container_store_tail(builder, state, final_val);
+        Ok(())
+    }
+
     pub(crate) fn compile_assign(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -773,6 +843,22 @@ impl Compiler<'_> {
                 let obj_val = self.compile_expr(builder, state, object)?;
                 let obj_type = self.node_type(object.id).clone();
                 match index.as_ref() {
+                    // `t[i] = v` on a tensor is the one-index element write.
+                    // It fell through to `nsl_list_set` below, whose value
+                    // operand is an integer: a float value failed Cranelift's
+                    // verifier, and an integer one read the tensor header as
+                    // a list (a misaligned-pointer panic in `list.rs`).
+                    SubscriptKind::Index(idx_expr) if obj_type.is_tensor() => {
+                        self.compile_tensor_element_store(
+                            builder,
+                            state,
+                            obj_val,
+                            &[idx_expr],
+                            op,
+                            value,
+                            new_val,
+                        )?;
+                    }
                     SubscriptKind::Index(idx_expr) => {
                         let idx_val = self.compile_expr(builder, state, idx_expr)?;
                         let is_dict = matches!(obj_type, nsl_semantic::types::Type::Dict { .. });
@@ -814,16 +900,12 @@ impl Compiler<'_> {
                         self.assign_container_store_tail(builder, state, final_val);
                     }
                     SubscriptKind::MultiDim(dims) => {
-                        // Tensor element write: t[i, j, ...] = v (and compound
-                        // forms) → nsl_tensor_set(t, [i, j, ...], v as f64).
-                        // The runtime validates arity/bounds and applies strides.
                         if !obj_type.is_tensor() && !obj_type.is_indeterminate() {
                             return Err(CodegenError::new(format!(
                                 "multi-dim subscript assignment requires a tensor, got {obj_type:?}"
                             )));
                         }
-                        let indices_list =
-                            self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+                        let mut idx_exprs = Vec::with_capacity(dims.len());
                         for dim in dims {
                             let SubscriptKind::Index(idx_expr) = dim else {
                                 return Err(CodegenError::new(
@@ -831,56 +913,11 @@ impl Compiler<'_> {
                                      assignment is not supported",
                                 ));
                             };
-                            let idx_raw = self.compile_expr(builder, state, idx_expr)?;
-                            let idx_val = if matches!(
-                                self.node_type(idx_expr.id),
-                                nsl_semantic::types::Type::Float
-                            ) {
-                                builder.ins().fcvt_to_sint(cl_types::I64, idx_raw)
-                            } else {
-                                idx_raw
-                            };
-                            self.compile_call_by_name(
-                                builder,
-                                "nsl_list_push",
-                                &[indices_list, idx_val],
-                            )?;
+                            idx_exprs.push(idx_expr);
                         }
-                        // nsl_tensor_set takes the value as F64; coerce ints.
-                        let rhs_f64 = if matches!(
-                            self.node_type(value.id),
-                            nsl_semantic::types::Type::Int | nsl_semantic::types::Type::Bool
-                        ) {
-                            builder.ins().fcvt_from_sint(cl_types::F64, new_val)
-                        } else {
-                            new_val
-                        };
-                        let final_val = if matches!(op, AssignOp::Assign) {
-                            rhs_f64
-                        } else {
-                            // Read-modify-write on the element in f64.
-                            let old_val = self.compile_call_by_name(
-                                builder,
-                                "nsl_tensor_get",
-                                &[obj_val, indices_list],
-                            )?;
-                            match op {
-                                AssignOp::AddAssign => builder.ins().fadd(old_val, rhs_f64),
-                                AssignOp::SubAssign => builder.ins().fsub(old_val, rhs_f64),
-                                AssignOp::MulAssign => builder.ins().fmul(old_val, rhs_f64),
-                                AssignOp::DivAssign => builder.ins().fdiv(old_val, rhs_f64),
-                                _ => unreachable!(),
-                            }
-                        };
-                        self.compile_call_by_name(
-                            builder,
-                            "nsl_tensor_set",
-                            &[obj_val, indices_list, final_val],
+                        self.compile_tensor_element_store(
+                            builder, state, obj_val, &idx_exprs, op, value, new_val,
                         )?;
-                        self.compile_call_by_name(builder, "nsl_list_free", &[indices_list])?;
-                        // Stored value is a scalar; the drain covers
-                        // index-expression and RHS temporaries.
-                        self.assign_container_store_tail(builder, state, final_val);
                     }
                     _ => return Err(CodegenError::new("only simple index assignment supported")),
                 }
