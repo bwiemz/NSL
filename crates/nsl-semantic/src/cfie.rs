@@ -189,6 +189,11 @@ const KNOWN_SECTIONS: &[&str] = &["sampling", "speculative"];
 /// The fused sampler's candidate-list capacity (`cfie_sample_ptx`).
 const MAX_TOP_K: i64 = 64;
 
+/// The largest model-shape value a serve block may state (2^24): far past
+/// any real layer count, width or vocabulary, and small enough that the
+/// product of two fits 64 bits with room to spare.
+const MAX_SHAPE_VALUE: i64 = 1 << 24;
+
 fn expr_as_name(
     value: &nsl_ast::expr::Expr,
     resolve_sym: &dyn Fn(Symbol) -> String,
@@ -280,6 +285,33 @@ pub fn validate_serve_config(
                 diagnostics.push(
                     Diagnostic::error("max_seq must be a positive integer".to_string())
                         .with_label(entry.value.span, "invalid max_seq"),
+                );
+            }
+            // The model-shape keys size kernels and pools: a positive
+            // integer literal, small enough that products of two of them
+            // cannot wrap. Anything else used to fall back to a default
+            // without a word (a negative value is not a literal) or was
+            // truncated to 32 bits.
+            "n_layers" | "n_kv_heads" | "kv_heads" | "n_heads" | "head_dim" | "d_model"
+            | "d_ff" | "vocab_size" | "max_new_tokens"
+                if !matches!(expr_as_i64(&entry.value), Some(v) if (1..=MAX_SHAPE_VALUE).contains(&v)) =>
+            {
+                diagnostics.push(
+                    Diagnostic::error(format!(
+                        "{key} must be an integer in [1, {MAX_SHAPE_VALUE}]"
+                    ))
+                    .with_label(entry.value.span, "invalid value"),
+                );
+            }
+            // Baked into the kernels: a RoPE base of 0 puts NaN in every
+            // rotation, and a norm epsilon of 0 divides by zero on an
+            // all-zero row.
+            "rope_theta" | "norm_eps"
+                if !matches!(expr_as_f64(&entry.value), Some(v) if v > 0.0 && v.is_finite()) =>
+            {
+                diagnostics.push(
+                    Diagnostic::error(format!("{key} must be a positive number"))
+                        .with_label(entry.value.span, "invalid value"),
                 );
             }
             "target_gpu" if expr_as_name(&entry.value, resolve_sym).is_none() => {
@@ -504,10 +536,10 @@ fn validate_speculative_section(
             }
             "draft_n_layers" | "draft_d_model" | "draft_n_heads" | "draft_n_kv_heads"
             | "draft_head_dim" | "draft_d_ff" => {
-                if !matches!(expr_as_i64(&entry.value), Some(v) if v >= 1) {
+                if !matches!(expr_as_i64(&entry.value), Some(v) if (1..=MAX_SHAPE_VALUE).contains(&v)) {
                     diagnostics.push(
                         Diagnostic::error(format!(
-                            "speculative {key} must be a positive integer"
+                            "speculative {key} must be a positive integer (at most {MAX_SHAPE_VALUE})"
                         ))
                         .with_label(entry.value.span, "invalid draft shape key"),
                     );

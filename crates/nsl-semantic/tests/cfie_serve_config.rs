@@ -283,6 +283,30 @@ fn a_negative_seed_is_rejected() {
     expect_error(&analyze_errs(&src), "seed must be a non-negative integer");
 }
 
+/// A shape key that is not a positive integer literal used to fall back to
+/// a default without a word, and `rope_theta: 0` baked NaN into the
+/// decode kernel's rotation.
+#[test]
+fn shape_keys_and_baked_constants_must_be_positive() {
+    let with = |line: &str| VALID_CFIE_SERVE.replace("    target_gpu: \"h100\"\n", &format!("    target_gpu: \"h100\"\n    {line}\n"));
+    assert!(analyze_errs(&with("n_layers: 8")).is_empty());
+    assert!(analyze_errs(&with("rope_theta: 500000.0")).is_empty());
+    assert!(analyze_errs(&with("norm_eps: 0.000001")).is_empty());
+    for (line, needle) in [
+        ("n_layers: 0", "n_layers must be an integer in [1, 16777216]"),
+        ("n_layers: -2", "n_layers must be an integer"),
+        ("d_model: 4294967297", "d_model must be an integer"),
+        ("head_dim: \"wide\"", "head_dim must be an integer"),
+        ("vocab_size: 0", "vocab_size must be an integer"),
+        ("max_new_tokens: 0", "max_new_tokens must be an integer"),
+        ("rope_theta: 0", "rope_theta must be a positive number"),
+        ("rope_theta: -10000.0", "rope_theta must be a positive number"),
+        ("norm_eps: 0.0", "norm_eps must be a positive number"),
+    ] {
+        expect_error(&analyze_errs(&with(line)), needle);
+    }
+}
+
 /// Each of these was accepted, stored and never read.
 #[test]
 fn speculative_settings_with_no_driver_are_refused() {

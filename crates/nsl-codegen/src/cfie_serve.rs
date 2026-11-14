@@ -645,6 +645,15 @@ pub fn prepare<'a>(
     }
     let speculative = match cfg.speculative.as_ref() {
         None => None,
+        // Only full mode plans speculation. In `sampling` mode the section
+        // would be dropped and generate() would run plain decoding.
+        Some(_) if mode != CfieMode::Full => {
+            return Err(CodegenError::new(format!(
+                "CFIE speculative: the section needs CFIE mode `full`; mode `{}` does not \
+                 plan speculative decoding. Remove the section or the mode override.",
+                mode.as_str()
+            )));
+        }
         Some(sp) => Some(speculative_config(sp)?),
     };
 
@@ -899,6 +908,22 @@ mod tests {
         // `temperature: 0.0` says what the draft does anyway.
         cfg.speculative = Some(SpeculativeSection { temperature: Some(0.0), ..draft_section() });
         assert!(prepare(&cfg, CfieMode::Full, gpu, None).is_ok());
+    }
+
+    /// `--cfie sampling` (or `@cfie(mode=sampling)`) plans no speculation;
+    /// a `speculative:` section must not be dropped without a word.
+    #[test]
+    fn a_speculative_section_outside_full_mode_is_refused() {
+        let mut cfg = cfg_with(Some("static"));
+        cfg.speculative = Some(draft_section());
+        let gpu = find_gpu("H100").unwrap();
+        let err = match prepare(&cfg, CfieMode::Sampling, gpu, None) {
+            Err(e) => e.message,
+            Ok(_) => panic!("must be refused"),
+        };
+        assert!(err.contains("needs CFIE mode `full`; mode `sampling`"), "{err}");
+        cfg.speculative = None;
+        assert!(prepare(&cfg, CfieMode::Sampling, gpu, None).is_ok());
     }
 
     #[test]

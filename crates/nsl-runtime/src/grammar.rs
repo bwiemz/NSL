@@ -183,11 +183,17 @@ pub extern "C" fn nsl_grammar_init(num_states: i64, vocab_size: i64, start_state
 }
 
 /// Step the FSM: advance from current state with the given token.
-/// Returns the next state, or -1 if the token is invalid.
+/// Returns the next state, or -1 if the token is invalid, the state is
+/// out of range, or no grammar is installed.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_grammar_step(state: i64, token_id: i64) -> i64 {
     let guard = GRAMMAR_CTX.lock().unwrap();
-    let ctx = guard.as_ref().expect("nsl_grammar_init not called");
+    let Some(ctx) = guard.as_ref() else {
+        return -1;
+    };
+    if state < 0 || state as usize >= ctx.fsm.num_states || token_id < 0 {
+        return -1;
+    }
     ctx.fsm
         .step(state as u32, token_id as u32)
         .map(|s| s as i64)
@@ -199,11 +205,14 @@ pub extern "C" fn nsl_grammar_step(state: i64, token_id: i64) -> i64 {
 /// `logits_ptr`: pointer to f32 array of length vocab_size.
 /// `state`: current FSM state.
 ///
-/// Returns 0 on success, -1 on error.
+/// Returns 0 on success, -1 on error (null pointer, or no grammar
+/// installed).
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_grammar_apply_mask(logits_ptr: i64, state: i64) -> i64 {
     let guard = GRAMMAR_CTX.lock().unwrap();
-    let ctx = guard.as_ref().expect("nsl_grammar_init not called");
+    let Some(ctx) = guard.as_ref() else {
+        return -1;
+    };
 
     if logits_ptr == 0 {
         return -1;
@@ -217,11 +226,13 @@ pub extern "C" fn nsl_grammar_apply_mask(logits_ptr: i64, state: i64) -> i64 {
 }
 
 /// Check if the current state is an accepting state.
-/// Returns 1 if accepting, 0 if not.
+/// Returns 1 if accepting, 0 if not, -1 if no grammar is installed.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_grammar_is_accept(state: i64) -> i64 {
     let guard = GRAMMAR_CTX.lock().unwrap();
-    let ctx = guard.as_ref().expect("nsl_grammar_init not called");
+    let Some(ctx) = guard.as_ref() else {
+        return -1;
+    };
     if ctx.fsm.is_accept(state as u32) {
         1
     } else {
@@ -229,12 +240,14 @@ pub extern "C" fn nsl_grammar_is_accept(state: i64) -> i64 {
     }
 }
 
-/// Get the start state of the FSM.
+/// Get the start state of the FSM, or -1 if no grammar is installed.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_grammar_start_state() -> i64 {
     let guard = GRAMMAR_CTX.lock().unwrap();
-    let ctx = guard.as_ref().expect("nsl_grammar_init not called");
-    ctx.fsm.start_state as i64
+    match guard.as_ref() {
+        Some(ctx) => ctx.fsm.start_state as i64,
+        None => -1,
+    }
 }
 
 /// Destroy the grammar context.
@@ -336,6 +349,8 @@ mod tests {
         assert_eq!(nsl_grammar_start_state(), 0);
         assert_eq!(nsl_grammar_step(0, 1), 2);
         assert_eq!(nsl_grammar_step(0, 2), -1);
+        assert_eq!(nsl_grammar_step(99, 0), -1, "a state past the table");
+        assert_eq!(nsl_grammar_step(-1, 0), -1);
         assert_eq!(nsl_grammar_is_accept(1), 1);
         assert_eq!(nsl_grammar_destroy(), 0);
     }
@@ -356,6 +371,15 @@ mod tests {
         let _lock = setup();
         assert_eq!(nsl_grammar_init(3, 4, 0), -1);
         assert!(GRAMMAR_CTX.lock().unwrap().is_none(), "no context was installed");
+        // With no grammar the other calls report an error; they used to
+        // panic across the FFI boundary with a message that named
+        // nsl_grammar_init.
+        let mut untouched = [1.0f32, 2.0];
+        assert_eq!(nsl_grammar_step(0, 0), -1);
+        assert_eq!(nsl_grammar_apply_mask(untouched.as_mut_ptr() as i64, 0), -1);
+        assert_eq!(untouched, [1.0, 2.0]);
+        assert_eq!(nsl_grammar_is_accept(0), -1);
+        assert_eq!(nsl_grammar_start_state(), -1);
         // With a real grammar the mask keeps the tokens the state allows.
         assert!(install_grammar(make_test_fsm()));
         let mut logits = [1.0f32, 2.0, 3.0, 4.0];

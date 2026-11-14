@@ -1222,7 +1222,11 @@ pub extern "C" fn nsl_cfie_generate(
 
         let mut last = match target_prefill(&mut target, prompt) {
             Ok(Some(t)) => t,
-            Ok(None) => return 0, // the prompt alone filled the slot
+            Ok(None) => {
+                // The prompt alone filled the slot: nothing was generated.
+                crate::nsl_log!(WARN, "cfie", "CFIE: the prompt ({prompt_len} tokens) fills the KV slot; no token was generated (raise max_seq)");
+                return 0;
+            }
             Err(e) => {
                 crate::nsl_log!(ERROR, "cfie", "CFIE: generate — {e}");
                 return -1;
@@ -2671,7 +2675,11 @@ pub extern "C" fn nsl_cfie_speculative_generate(
         // the first new token is the same.
         let first = match target_prefill(&mut models.target, prompt) {
             Ok(Some(t)) => t,
-            Ok(None) => return 0, // the prompt alone filled the slot
+            Ok(None) => {
+                // The prompt alone filled the slot: nothing was generated.
+                crate::nsl_log!(WARN, "cfie", "CFIE: the prompt ({prompt_len} tokens) fills the KV slot; no token was generated (raise max_seq)");
+                return 0;
+            }
             Err(e) => {
                 crate::nsl_log!(ERROR, "cfie", "CFIE: speculative_generate — {e}");
                 return -1;

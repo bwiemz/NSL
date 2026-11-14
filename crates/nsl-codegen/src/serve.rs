@@ -908,7 +908,7 @@ impl Compiler<'_> {
                 && s.d_ff >= 1
                 && s.d_ff <= 32768
                 && s.n_heads % s.n_kv_heads.max(1) == 0
-                && s.n_heads * s.head_dim <= 8192
+                && (s.n_heads as u64) * (s.head_dim as u64) <= 8192
                 && per_slot >= 1
                 && max_slots >= 1
                 && (max_slots as u64) * (per_slot as u64) <= u32::MAX as u64;
@@ -1053,7 +1053,7 @@ impl Compiler<'_> {
                 && (1..=8192).contains(&dd_model)
                 && (1..=32768).contains(&dd_ff)
                 && dn_heads % dn_kv.max(1) == 0
-                && dn_heads * dhead <= 8192
+                && (dn_heads as u64) * (dhead as u64) <= 8192
                 && per_slot >= 1;
             if !draft_ok {
                 return refuse(
