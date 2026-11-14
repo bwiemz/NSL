@@ -334,6 +334,39 @@ pub unsafe extern "C" fn nsl_weights_load_field(
     }
 }
 
+/// A constant the compiler folded from two weights (an f64 host tensor),
+/// as the operation it replaced would have produced it: in the dtype of
+/// `like` (one of that operation's operands) and on its device. Returns an
+/// owned reference; `constant` is left to its owner.
+///
+/// The compiler cannot know either at compile time: the parameters' dtype is
+/// the model's (a BF16 file loads into f32 fields), and the model may have
+/// been moved to a GPU.
+#[unsafe(no_mangle)]
+pub extern "C" fn nsl_weights_const_like(constant: i64, like: i64) -> i64 {
+    use crate::tensor::{DTYPE_BF16, DTYPE_F32, DTYPE_F64, DTYPE_FP16};
+    let target = NslTensor::from_ptr_ref(like).dtype;
+    let source = NslTensor::from_ptr_ref(constant).dtype;
+    if !matches!(target, DTYPE_F64 | DTYPE_F32 | DTYPE_FP16 | DTYPE_BF16) {
+        refuse(&format!(
+            "a constant folded from the weights file cannot be given the dtype (tag {target}) \
+             of the parameters it replaces; recompile with --no-constant-fold"
+        ));
+    }
+    let converted = if source == target {
+        constant
+    } else {
+        // Not taped: the fold is made only when no parameter is
+        // differentiated or written.
+        crate::tensor::precision_cast::convert_untaped(constant, target)
+    };
+    let placed = crate::tensor::nsl_tensor_to_device_like(converted, like);
+    if converted != constant {
+        crate::tensor::nsl_tensor_free(converted);
+    }
+    placed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,6 +507,42 @@ mod tests {
             ]
         );
         assert!(decode_expectations(&table[..table.len() - 1]).is_err());
+    }
+
+    /// The folded constant takes the operand's dtype: an f64 [1.5, -2.25]
+    /// against an f32 operand comes back f32 with the same values, and
+    /// against an f64 operand comes back as the constant itself.
+    #[test]
+    fn a_folded_constant_takes_the_operand_s_dtype() {
+        let shape = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape, 2);
+        let constant = crate::tensor::creation::nsl_tensor_zeros_dtype(
+            shape,
+            i64::from(crate::tensor::DTYPE_F64),
+        );
+        let like32 = crate::tensor::creation::nsl_tensor_zeros_dtype(
+            shape,
+            i64::from(crate::tensor::DTYPE_F32),
+        );
+        let like64 = crate::tensor::creation::nsl_tensor_zeros_dtype(
+            shape,
+            i64::from(crate::tensor::DTYPE_F64),
+        );
+        let c = NslTensor::from_ptr(constant);
+        unsafe {
+            *(c.data as *mut f64) = 1.5;
+            *(c.data as *mut f64).add(1) = -2.25;
+        }
+        let out = nsl_weights_const_like(constant, like32);
+        let o = NslTensor::from_ptr(out);
+        assert_eq!(o.dtype, crate::tensor::DTYPE_F32);
+        let got = unsafe { [*(o.data as *const f32), *(o.data as *const f32).add(1)] };
+        assert_eq!(got, [1.5f32, -2.25]);
+        assert_eq!(nsl_weights_const_like(constant, like64), constant);
+        for t in [out, constant, constant, like32, like64] {
+            crate::tensor::nsl_tensor_free(t);
+        }
+        crate::list::nsl_list_free(shape);
     }
 
     #[test]

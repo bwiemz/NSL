@@ -226,7 +226,7 @@ nsl build [OPTIONS] <FILE>
 | `--bf16-lt-workspace-mib` | `<MIB>` |  | Workspace cap in MiB for the cuBLASLt heuristic (clamped to 4096). Replaces NSL_MATMUL_BF16_LT_WORKSPACE_MIB. ARITHMETIC: the cap FILTERS candidate kernels, so a smaller value excludes split-k and wide-tile algorithms and changes the reduction order. Default 64 |
 | `--no-bf16-lt-tune` |  |  | Disable cuBLASLt timed first-use plan selection. Replaces NSL_MATMUL_BF16_LT_TUNE=0. With tuning ON (the default) the winner depends on live machine state, so plan choice is NOT reproducible across processes |
 | `--seed` | `<SEED>` |  | P0 certification: RNG seed for randn/rand/stochastic ops (see `run --seed`) |
-| `--dead-weight-threshold` | `<DEAD_WEIGHT_THRESHOLD>` | `0.000001` | M52: Dead weight threshold (default: 1e-6). Weights with \|value\| &lt; threshold are zeroed |
+| `--dead-weight-threshold` | `<DEAD_WEIGHT_THRESHOLD>` |  | M52: Dead weight threshold (default: 1e-6). Weights with \|value\| &lt; threshold are zeroed in the compiler's copy, and a weight within it of the identity counts as the identity. With -w, rewrites that depend on weight values use the file's exact values unless this is given |
 | `--sparse-threshold` | `<SPARSE_THRESHOLD>` | `0.5` | M52: Sparsity threshold (default: 0.5). Matrices with near-zero fraction &gt;= threshold get sparse annotation |
 | `--no-constant-fold` |  |  | M52: Disable constant folding of weight expressions |
 | `--no-dead-weight` |  |  | M52: Disable dead weight elimination |

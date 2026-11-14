@@ -454,7 +454,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 weights: nsl_codegen::WeightsOptions {
                     file: if standalone { None } else { resolved_weight_file.clone() },
                     config: nsl_codegen::weight_aware::WeightAwareConfig {
-                        dead_weight_threshold,
+                        dead_weight_threshold: dead_weight_threshold.unwrap_or(1e-6),
                         sparse_threshold,
                         constant_fold: !no_constant_fold,
                         dead_weight_elim: !no_dead_weight,
@@ -469,6 +469,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                     // (`pipeline::bind_weights_file`).
                     from_flag: weights.is_some() && !standalone,
                     bind: None,
+                    threshold_given: dead_weight_threshold.is_some(),
                 },
                 linear_types_enabled: linear_types,
                 // Semantic-analysis facts: all empty here. The loader fills

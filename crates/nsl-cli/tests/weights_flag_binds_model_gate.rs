@@ -34,14 +34,30 @@ fn repo_root() -> PathBuf {
 /// A safetensors file of f32 tensors: an 8-byte little-endian header length,
 /// a JSON header padded with spaces to a multiple of 8, then the raw values.
 fn write_safetensors(path: &Path, tensors: &[(&str, &[usize], &[f64])]) {
+    write_safetensors_as(path, "F32", tensors);
+}
+
+/// The same in another dtype: F32, or BF16 (the top half of the f32, so
+/// exact for the small integers and halves these tests use).
+fn write_safetensors_as(path: &Path, dtype: &str, tensors: &[(&str, &[usize], &[f64])]) {
     let mut entries = Vec::new();
     let mut data: Vec<u8> = Vec::new();
     for (name, shape, values) in tensors {
         assert_eq!(shape.iter().product::<usize>(), values.len(), "{name}");
         let begin = data.len();
-        data.extend(values.iter().flat_map(|v| (*v as f32).to_le_bytes()));
+        for v in *values {
+            let bits = (*v as f32).to_bits();
+            match dtype {
+                "F32" => data.extend_from_slice(&bits.to_le_bytes()),
+                "BF16" => {
+                    assert_eq!(bits & 0xFFFF, 0, "{v} is not exact in bf16");
+                    data.extend_from_slice(&((bits >> 16) as u16).to_le_bytes());
+                }
+                other => panic!("no writer for {other}"),
+            }
+        }
         entries.push(format!(
-            "\"{name}\":{{\"dtype\":\"F32\",\"shape\":[{}],\"data_offsets\":[{begin},{}]}}",
+            "\"{name}\":{{\"dtype\":\"{dtype}\",\"shape\":[{}],\"data_offsets\":[{begin},{}]}}",
             shape
                 .iter()
                 .map(|d| d.to_string())
@@ -379,7 +395,11 @@ fn a_product_of_two_loaded_weights_is_folded() {
     assert_close(&section(&stdout, "Y"), &X_V_HEAD, "y");
     assert_close(&section(&stdout, "A"), &V, "a");
     assert_close(&section(&stdout, "B"), &HEAD, "b");
-    assert!(stderr.contains("constant-folded"), "{stderr}");
+    let line = stderr
+        .lines()
+        .find(|l| l.contains("constant-folded a @ b"))
+        .unwrap_or_else(|| panic!("{stderr}"));
+    assert!(line.contains("from the file's exact values"), "{line}");
 }
 
 /// The same program with one of the two weights assigned afterwards: the
@@ -519,6 +539,12 @@ fn an_assigned_parameter_is_not_specialized_on() {
 
 /// `nsl build prog.nsl -w weights -o exe`; returns the executable.
 fn build_in(dir: &Path, source: &str, weights: &Path) -> PathBuf {
+    build_with(dir, source, weights, &[]).0
+}
+
+/// `nsl build prog.nsl -w weights [extra...] -o exe`; the executable and the
+/// build's report (stderr).
+fn build_with(dir: &Path, source: &str, weights: &Path, extra: &[&str]) -> (PathBuf, String) {
     let file = dir.join("prog.nsl");
     std::fs::write(&file, source).unwrap();
     let exe = dir.join(if cfg!(windows) { "prog.exe" } else { "prog" });
@@ -527,6 +553,7 @@ fn build_in(dir: &Path, source: &str, weights: &Path) -> PathBuf {
         .arg("build")
         .arg(&file)
         .args(["--target", "cpu"])
+        .args(extra)
         .arg("-w")
         .arg(weights)
         .arg("-o")
@@ -539,7 +566,7 @@ fn build_in(dir: &Path, source: &str, weights: &Path) -> PathBuf {
         text(&out.stdout),
         text(&out.stderr)
     );
-    exe
+    (exe, text(&out.stderr))
 }
 
 /// The `wspec=<16 hex digits>` key of the execution fingerprint compiled
@@ -741,6 +768,206 @@ fn the_decision_is_made_over_every_module() {
         .find(|l| l.contains("not specialized on 'w' (near-identity matmul elimination skipped)"))
         .unwrap_or_else(|| panic!("{stderr}"));
     assert!(line.contains("copy_data"), "{line}");
+}
+
+// ── Writes the review found missing, and the fold's dtype ─────────────────────
+
+/// `from_hf(repo, m)` stores a checkpoint into the model's parameter slots,
+/// like `model_load`, so nothing may be specialized on the `-w` file's
+/// values. It used to be missed: with an identity `w` in the file the matmul
+/// was dropped and the program printed `x` while the model held the HF
+/// weights. The "hub" is a local hf-hub cache holding V, so no network is
+/// used.
+#[test]
+fn a_parameter_overwritten_by_from_hf_is_not_specialized_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let weights = dir.path().join("weights.safetensors");
+    write_safetensors(&weights, &[("w", &[4, 4], &IDENTITY)]);
+    let repo = dir.path().join("hf/hub/models--org--x");
+    std::fs::create_dir_all(repo.join("refs")).unwrap();
+    std::fs::create_dir_all(repo.join("snapshots/0123abcd")).unwrap();
+    std::fs::write(repo.join("refs/main"), "0123abcd").unwrap();
+    write_safetensors(
+        &repo.join("snapshots/0123abcd/model.safetensors"),
+        &[("w", &[4, 4], &V)],
+    );
+    let program = format!(
+        "model Toy:\n    w: Tensor = ones([4, 4]) * 2.0\n\n    fn forward(self, x: Tensor) -> Tensor:\n        return x @ self.w\n\n\
+         let m = Toy()\nfrom_hf(\"org/x\", m)\nlet x = arange(1.0, 9.0).reshape([2, 4])\n{}{}",
+        show("Y", "m.forward(x)"),
+        show("W", "m.w")
+    );
+    let file = dir.path().join("prog.nsl");
+    std::fs::write(&file, program).unwrap();
+    let out = nsl()
+        .current_dir(dir.path())
+        .env("HF_HOME", dir.path().join("hf"))
+        .env("HF_HUB_OFFLINE", "1")
+        .arg("run")
+        .arg(&file)
+        .args(["--target", "cpu", "-w"])
+        .arg(&weights)
+        .output()
+        .expect("spawn nsl run");
+    let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+    assert!(out.status.success(), "{stderr}");
+    assert_close(&section(&stdout, "W"), &V, "w after from_hf");
+    assert_close(&section(&stdout, "Y"), &X_V, "y after from_hf");
+    assert!(!stderr.contains("eliminated"), "{stderr}");
+    let line = stderr
+        .lines()
+        .find(|l| l.contains("not specialized on 'w' (near-identity matmul elimination skipped)"))
+        .unwrap_or_else(|| panic!("{stderr}"));
+    assert!(line.contains("from_hf"), "{line}");
+}
+
+/// A fold of two BF16 weights. The fold used to keep the file's dtype (2
+/// bytes per element) and label the constant f32: the product printed as
+/// 4.7e32 and the program read past the constant. Now it is computed in f64
+/// and given the operands' dtype when the program runs; the result is
+/// x @ V @ HEAD, worked out by hand at `X_V_HEAD`.
+#[test]
+fn a_fold_of_bf16_weights_has_the_right_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let weights = dir.path().join("weights.safetensors");
+    write_safetensors_as(
+        &weights,
+        "BF16",
+        &[("a", &[4, 4], &V), ("b", &[4, 3], &HEAD)],
+    );
+    let out = run_in(dir.path(), &product_program(""), Some(&weights), &[]);
+    let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+    assert!(out.status.success(), "{stderr}");
+    assert_close(&section(&stdout, "Y"), &X_V_HEAD, "y");
+    assert_close(&section(&stdout, "A"), &V, "a");
+    assert_close(&section(&stdout, "B"), &HEAD, "b");
+    assert!(stderr.contains("constant-folded a @ b"), "{stderr}");
+}
+
+/// A sum of two weights of different shapes is a broadcast, which the fold
+/// does not implement: it is left to the runtime instead of panicking the
+/// compiler ("add shape mismatch"). x @ (V + [1, 2, 3, 4]) by hand (and
+/// NumPy): rows [12.5, 26, 24, 49] and [34.5, 62, 72, 129].
+#[test]
+fn a_broadcast_sum_of_two_weights_is_left_to_the_runtime() {
+    let program = format!(
+        "model Two:\n    a: Tensor = ones([4, 4]) * 2.0\n    b: Tensor = ones([4]) * 2.0\n\n    fn forward(self, x: Tensor) -> Tensor:\n        return x @ (self.a + self.b)\n\n\
+         let m = Two()\nlet x = arange(1.0, 9.0).reshape([2, 4])\n{}",
+        show("Y", "m.forward(x)")
+    );
+    let (stdout, stderr) = run_ok(
+        &program,
+        Some(&[("a", &[4, 4], &V), ("b", &[4], &[1.0, 2.0, 3.0, 4.0])]),
+        &[],
+    );
+    assert_close(
+        &section(&stdout, "Y"),
+        &[12.5, 26.0, 24.0, 49.0, 34.5, 62.0, 72.0, 129.0],
+        "y",
+    );
+    assert!(!stderr.contains("constant-folded"), "{stderr}");
+}
+
+// ── Exact values unless the user accepts an approximation ────────────────────
+
+/// The identity but for [0][0] = 1.0000005 (1.0000004768 in f32): within
+/// the default `--dead-weight-threshold` (1e-6) of the identity, and not the
+/// identity. (A deviation off the diagonal would not do: dead-weight
+/// elimination zeroes a value below the threshold in the compiler's copy,
+/// and the fold test below covers that copy.)
+const NEAR_IDENTITY: [f64; 16] = [
+    1.0000005, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+];
+
+/// x = [1e7, 1e7, 1e7, 1e7]: x @ NEAR_IDENTITY is 1e7 everywhere but in
+/// column 0, which is 1e7 * 1.0000004768 = 10000004.77 (NumPy: 10000005.0
+/// in f32, 10000004.768 in f64).
+fn near_program() -> String {
+    format!(
+        "model Toy:\n    w: Tensor = ones([4, 4]) * 2.0\n\n    fn forward(self, x: Tensor) -> Tensor:\n        return x @ self.w\n\n\
+         let m = Toy()\nlet x = full([1, 4], 10000000.0)\n{}",
+        show("Y", "m.forward(x)")
+    )
+}
+
+/// By default a rewrite uses the file's exact values: a weight 4.8e-7 off
+/// the identity is not taken for it (the default threshold, 1e-6, used to
+/// make it so, and column 0 lost its 4.77), and the report says why.
+#[test]
+fn a_weight_near_the_identity_is_not_dropped_by_default() {
+    let (stdout, stderr) = run_ok(
+        &near_program(),
+        Some(&[("w", &[4, 4], &NEAR_IDENTITY)]),
+        &[],
+    );
+    let y = section(&stdout, "Y");
+    assert_eq!(y.len(), 4, "{stdout}");
+    assert!(
+        (y[0] - 10_000_004.77).abs() < 0.5,
+        "column 0 is {} (want 1e7 + 4.77)",
+        y[0]
+    );
+    for (i, v) in y.iter().enumerate().skip(1) {
+        assert!((v - 10_000_000.0).abs() < 0.5, "column {i} is {v}");
+    }
+    assert!(!stderr.contains("eliminated"), "{stderr}");
+    let line = stderr
+        .lines()
+        .find(|l| l.contains("not specialized on 'w' (near-identity matmul elimination skipped)"))
+        .unwrap_or_else(|| panic!("{stderr}"));
+    assert!(
+        line.contains("not the identity") && line.contains("--dead-weight-threshold"),
+        "{line}"
+    );
+}
+
+/// Given explicitly, the threshold is the user's approximation to make: the
+/// matmul is dropped, the report says on what basis, and column 0 is 1e7.
+#[test]
+fn a_weight_near_the_identity_is_dropped_when_the_threshold_is_given() {
+    let dir = tempfile::tempdir().unwrap();
+    let weights = dir.path().join("weights.safetensors");
+    write_safetensors(&weights, &[("w", &[4, 4], &NEAR_IDENTITY)]);
+    let (exe, report) = build_with(
+        dir.path(),
+        &near_program(),
+        &weights,
+        &["--dead-weight-threshold", "1e-6"],
+    );
+    let line = report
+        .lines()
+        .find(|l| l.contains("eliminated near-identity matmul (weight 'w')"))
+        .unwrap_or_else(|| panic!("{report}"));
+    assert!(
+        line.contains("within the --dead-weight-threshold 1e-6 given"),
+        "{line}"
+    );
+    let out = Command::new(&exe).current_dir(dir.path()).output().unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let y = section(&text(&out.stdout), "Y");
+    assert!((y[0] - 10_000_000.0).abs() < 0.5, "column 0 is {}", y[0]);
+}
+
+/// Dead-weight elimination zeroes values below the threshold in the
+/// compiler's copy of the file. A fold resting on that copy would freeze
+/// the zeroed value into the program, so by default it is refused.
+#[test]
+fn a_fold_is_not_made_from_a_copy_dead_weight_elimination_changed() {
+    let mut a = V;
+    a[1] = 5e-7;
+    let (stdout, stderr) = run_ok(
+        &product_program(""),
+        Some(&[("a", &[4, 4], &a), ("b", &[4, 3], &HEAD)]),
+        &[],
+    );
+    // 5e-7 changes x @ a @ HEAD by at most 8 * 5e-7: within the tolerance.
+    assert_close(&section(&stdout, "Y"), &X_V_HEAD, "y");
+    assert!(!stderr.contains("constant-folded"), "{stderr}");
+    let line = stderr
+        .lines()
+        .find(|l| l.contains("not specialized on 'a' (constant fold skipped)"))
+        .unwrap_or_else(|| panic!("{stderr}"));
+    assert!(line.contains("dead-weight elimination zeroed"), "{line}");
 }
 
 // ── Adapters ─────────────────────────────────────────────────────────────────

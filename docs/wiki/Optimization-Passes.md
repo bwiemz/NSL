@@ -381,15 +381,31 @@ for the whole run:
   file the compiler found through `load_safetensors("...")` in the source,
   which stay inputs to planning only);
 - nothing in the program writes the parameter after it is loaded. A `train`,
-  `distill` or `quant` block, a `model_load`, any in-place tensor operation
-  (`copy_data`, `copy_`, `*_inplace`) or an element store through a variable
-  (`t[i] = v`) counts as writing every parameter; an assignment to a field
-  (`m.w = ...`, `self.w += ...`) counts as writing every field of that name.
-  The analysis is over the whole program, and whatever it cannot rule out is
-  a write;
+  `distill` or `quant` block, a `model_load` or `from_hf`, a model with
+  `@quantize`, any in-place tensor operation (`copy_data`, `copy_`,
+  `*_inplace`) or an element store through a variable (`t[i] = v`, which
+  includes a `kernel` storing to an argument) counts as writing every
+  parameter; an assignment to a field (`m.w = ...`, `self.w += ...`) counts
+  as writing every field of that name. A `grad` block counts too: dropping
+  `x @ W` would drop W's gradient. The analysis is over the whole program
+  (every module, called or not), and whatever it cannot rule out is a write;
 - one tensor, and only one, can reach the field: the file holds no other
   tensor whose name ends in the field's name, and for a bare name no other
-  model has a tensor field of that name.
+  model has a tensor field of that name;
+- the rewrite rests on the file's exact values. `--dead-weight-threshold`
+  (1e-6 by default) is a tolerance: dead-weight elimination zeroes values
+  below it in the compiler's copy of the file, and a weight within it of the
+  identity would count as the identity. A rewrite uses those approximations
+  only when the threshold is passed explicitly (`nsl build
+  --dead-weight-threshold 1e-6 -w ...`; `nsl run` has no such flag), and the
+  report line says which basis it used (`..., from the file's exact values`
+  or `..., from values within the --dead-weight-threshold 1e-6 given`).
+
+A folded constant is computed in f64 and, when the program runs, converted
+to the dtype and device of the parameters it replaces (a BF16 file loads
+into the model's f32 fields; the model may be on a GPU). Shapes the fold
+does not implement (a broadcast sum, a matmul that is not 2-D) are left to
+the runtime.
 
 A rewrite that is refused is not an error. The ordinary code is compiled,
 and the report says which parameter and why:
@@ -427,11 +443,9 @@ The path compiled into the program is the absolute path of the file given to
 `-w`. `--standalone -w` is a different mechanism (the file is bundled into
 the executable) and does no weight-aware compilation.
 
-Limits. The thresholds are tolerances, as before: a weight within
-`--dead-weight-threshold` of the identity counts as the identity, and
-dead-weight elimination zeroes values below the threshold in the compiler's
-copy before folding, so a folded constant can differ from the run-time
-product by that order. A one-element weight is no longer embedded as an
+Limits. A folded constant is the f64 product rounded once to the
+parameters' dtype, which can differ in the last bit from the product the
+program would have computed. A one-element weight is no longer embedded as an
 immediate (only tensor fields are loaded; the note says so). The
 `NSL_M52C_SPARSE_MATMUL=1` path is withheld and is not covered by the rules
 above.

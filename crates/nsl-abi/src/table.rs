@@ -651,6 +651,9 @@ macro_rules! for_each_runtime_fn {
             // shape is not the field's).
             [training] nsl_weights_bind(i64, i64, i64, i64) -> () = weights_file::nsl_weights_bind;
             [training] nsl_weights_load_field(i64, i64, i64, i64) -> () = weights_file::nsl_weights_load_field;
+            // A constant folded from two weights, converted to the dtype and device
+            // of an operand of the operation it replaces (constant, like) -> owned.
+            [training] nsl_weights_const_like(i64, i64) -> i64 = weights_file::nsl_weights_const_like;
             // Milestone B + item 8: full training-state checkpoint (θ .nslm + .optim
             // sidecar with m/v moments, micro-batch step counter, data position and
             // RNG state). Save: (path_ptr, path_len, names_list, param_list,
@@ -1363,6 +1366,6 @@ mod tests {
     fn table_is_the_recorded_size() {
         // The count is pinned so a row dropped by a bad merge is noticed; move
         // it with a row that is deliberately added or removed.
-        assert_eq!(RUNTIME_ABI.len(), 681);
+        assert_eq!(RUNTIME_ABI.len(), 682);
     }
 }

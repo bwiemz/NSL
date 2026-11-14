@@ -3052,6 +3052,14 @@ impl Compiler<'_> {
             Some(e) => e,
             None => return Ok(None),
         };
+        // Only float weights fold: an integer tensor is not loaded into a
+        // float parameter (the program refuses it at startup), and the
+        // folded value is a float.
+        use crate::weight_aware::WeightDType as D;
+        let is_float = |d: D| matches!(d, D::F16 | D::BF16 | D::F32 | D::F64);
+        if !is_float(lhs_entry.dtype) || !is_float(rhs_entry.dtype) {
+            return Ok(None);
+        }
 
         if !self.compile_options.weights.config.constant_fold {
             return Ok(None);
@@ -3072,14 +3080,24 @@ impl Compiler<'_> {
 
         match result {
             crate::weight_aware::FoldResult::Constant(ct) => {
-                nsl_log::nsl_log!(INFO, "nsl", 
-                    "[nsl] M52b: constant-folded {} @ {} → {:?} tensor ({} bytes)",
+                let symbol = if op == BinOp::MatMul { "@" } else { "+" };
+                let basis = self.weight_value_basis();
+                nsl_log::nsl_log!(INFO, "nsl",
+                    "[nsl] M52b: constant-folded {} {} {} → {:?} tensor ({} bytes), {}",
                     lk,
+                    symbol,
                     rk,
                     ct.shape,
-                    ct.data.len()
+                    ct.data.len(),
+                    basis
                 );
-                let val = self.embed_const_tensor(builder, &ct)?;
+                // The fold is computed in f64 on the host; the operation it
+                // replaces would give a tensor of its operands' dtype on
+                // their device, which only the running program knows.
+                let constant = self.embed_const_tensor(builder, &ct)?;
+                state.cleanup.tensor_temporaries.push(constant);
+                let val =
+                    self.compile_call_by_name(builder, "nsl_weights_const_like", &[constant, lhs])?;
                 Ok(Some(val))
             }
             _ => Ok(None),
@@ -3132,7 +3150,12 @@ impl Compiler<'_> {
         let dtype_id = match ct.dtype {
             crate::weight_aware::WeightDType::F64 => 0i64,
             crate::weight_aware::WeightDType::F32 => 1i64,
-            _ => 1i64, // default to f32
+            // Labelling 2-byte data f32 read past the symbol and gave garbage.
+            other => {
+                return Err(CodegenError::new(format!(
+                    "M52b: a folded constant is f64 or f32, not {other:?}"
+                )));
+            }
         };
         let dtype_val = builder.ins().iconst(cl_types::I64, dtype_id);
 
@@ -3154,12 +3177,17 @@ impl Compiler<'_> {
     /// The weight's values decide this, so it is done only for a parameter
     /// the program runs with exactly as the file has it (`may_specialize_on`).
     fn try_identity_elim(&mut self, state: &FuncState, lhs: Value, rhs: Value) -> Option<Value> {
+        // Under -w a rewrite uses the file's exact values: a weight that is
+        // only within --dead-weight-threshold of the identity is dropped only
+        // when the user passed that threshold (`weight_value_tolerance`).
+        let configured = self.compile_options.weights.config.dead_weight_threshold;
+        let tolerance = self.weight_value_tolerance().unwrap_or(0.0);
         // `x @ W` with W ≈ I is the common case; `W @ x` the other.
         for (weight, pass_through) in [(rhs, lhs), (lhs, rhs)] {
             let Some(key) = state.weight_values.get(&weight).cloned() else {
                 continue;
             };
-            let near_identity = {
+            let (near, identity) = {
                 let wmap = self.features.weight_map.as_ref()?;
                 let Some(entry) = wmap.get(&key) else {
                     continue;
@@ -3167,17 +3195,28 @@ impl Compiler<'_> {
                 let elim = crate::weight_aware::DeadWeightEliminator::new(
                     &self.compile_options.weights.config,
                 );
-                elim.is_near_identity(
-                    entry,
-                    self.compile_options.weights.config.dead_weight_threshold,
-                )
+                (elim.is_near_identity(entry, configured), elim.is_near_identity(entry, tolerance))
             };
-            if !near_identity || !self.may_specialize_on(&key, "near-identity matmul elimination") {
+            if near && !identity {
+                self.note_weight_refusal(
+                    &key,
+                    "near-identity matmul elimination",
+                    &format!(
+                        "it is within {configured:e} of the identity but not the identity, \
+                         and a rewrite uses the file's exact values unless \
+                         --dead-weight-threshold is given"
+                    ),
+                );
                 continue;
             }
+            if !identity || !self.may_specialize_on(&key, "near-identity matmul elimination") {
+                continue;
+            }
+            let basis = self.weight_value_basis();
             nsl_log::nsl_log!(INFO, "nsl",
-                "[nsl] M52b: eliminated near-identity matmul (weight '{}')",
-                key
+                "[nsl] M52b: eliminated near-identity matmul (weight '{}'), {}",
+                key,
+                basis
             );
             return Some(pass_through);
         }
