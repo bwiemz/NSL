@@ -18,8 +18,8 @@
 //! `crates/nsl-codegen/tests/fixtures/cep_canonical_with_train.nsl` and
 //! asserts:
 //!
-//!   - SP1+SP2 emission succeeds (already covered structurally by
-//!     `cep_g18_e2e_binary_claim`, but smoke-pinned here in CLI form).
+//!   - SP1+SP2 emission succeeds (`cep_pruned_model_runs` goes further and
+//!     runs the emitted pair; this pins the training-compile path).
 //!   - The SP2-emitted source compiles cleanly via `nsl build --emit-obj`
 //!     using the SP1-sliced weights as `--weights`. Today this exercises
 //!     the default AD path; the `--source-ad` path falls back to tape-AD

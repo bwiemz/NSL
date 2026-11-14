@@ -307,7 +307,12 @@ pub fn validate_cep_search_decorator(
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Option<CepSearchConfig> {
     let mut target: Option<Symbol> = None;
-    let mut objective = NasObjective::ParamEfficiency;
+    // There is no default objective. The one the proposal recommends,
+    // `param_efficiency`, is nearly constant across architectures and ranks
+    // the smallest block stack first, so applying it unasked would hand back
+    // a ranking the user never chose.
+    let mut objective: Option<NasObjective> = None;
+    let mut objective_given = false;
     let mut constraints = CepConstraints::default();
 
     if let Some(ref args) = deco.args {
@@ -339,8 +344,9 @@ pub fn validate_cep_search_decorator(
                         ExprKind::StringLiteral(s) => Some(s.clone()),
                         _ => None,
                     };
+                    objective_given = true;
                     match s.as_deref().and_then(NasObjective::parse) {
-                        Some(o) => objective = o,
+                        Some(o) => objective = Some(o),
                         None => diagnostics.push(
                             Diagnostic::error(
                                 "@cep_search: objective must be param_efficiency, \
@@ -362,9 +368,22 @@ pub fn validate_cep_search_decorator(
         }
     }
 
+    if !objective_given {
+        diagnostics.push(
+            Diagnostic::error(
+                "@cep_search: an objective is required: objective = min_latency, min_memory, \
+                 min_params, or param_efficiency"
+                    .to_string(),
+            )
+            .with_label(deco.span, "no objective given"),
+        );
+    }
+
     Some(CepSearchConfig {
         target,
-        objective,
+        // An error was pushed above when this is absent or invalid; the
+        // placeholder is never used for a ranking.
+        objective: objective.unwrap_or(NasObjective::MinLatency),
         constraints,
         span: deco.span,
     })

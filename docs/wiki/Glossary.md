@@ -15,7 +15,7 @@ Build-time per-channel weight quantization that scales by observed activation ma
 Block-granular activation checkpointing on the source-AD path: a transformer block's interior activations are freed after the forward and bit-exactly recomputed just before that block's backward. Implemented in [`crates/nsl-codegen/src/ccr.rs`](../../crates/nsl-codegen/src/ccr.rs); driven by `--checkpoint-blocks`. See [`CCR.pdf`](../research/CCR.pdf) for the research background and [Optimization-Passes](Optimization-Passes.md#ccr--compiler-chosen-recomputation) for the pass description.
 
 ### <a id="cep"></a>CEP — Compilation-Evaluated Pruning
-Compile-time head-pruning pass: the oracle, importance scorer, model rewriter, and greedy search are all applied before the binary is emitted — pruned heads generate no code at all. Implementation: `crates/nsl-codegen/src/cep.rs`; decisions surfaced via `nsl profile --explain-wggo`.
+Offline structured-pruning planner: a weight-magnitude importance scorer, an analytic cost estimate and a greedy search choose attention heads, FFN width and (optionally) layers to remove, and write a delta, sliced weights and rewritten source. It builds no binary; the pruned model is compiled from the emitted source. Implementation: `crates/nsl-codegen/src/cep.rs`; decisions surfaced via `nsl profile --explain-wggo`.
 
 ### <a id="cesh"></a>CESH — Compiler-Exempt Sensitivity Handling (proposal only)
 Research proposal for a role-aware quantization policy: the embedding and LM-head layers are quantized differently from the transformer blocks. None of it has been built; the `quant` block quantizes every field alike. See [CESH.pdf](../research/CESH.pdf) and its [errata](../research/CESH-errata.md).

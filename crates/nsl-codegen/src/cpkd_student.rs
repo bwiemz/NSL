@@ -159,8 +159,8 @@ pub fn design_student(input: StudentDesignInput) -> Result<StudentDesign, String
     if outcome.ranked_candidates.is_empty() {
         return Err(
             "CPKD: the @search axes enumerate no valid candidates \
-             (shape-algebra filters: n_kv_heads | n_heads, n_heads | d_model, \
-             d_model pow2-or-mult-64, d_ff mult-64); widen or fix the axes"
+             (filters: n_kv_heads | n_heads, d_model pow2-or-mult-64, \
+             d_ff mult-64); widen or fix the axes"
                 .to_string(),
         );
     }
@@ -194,10 +194,9 @@ pub fn design_student(input: StudentDesignInput) -> Result<StudentDesign, String
         Some(wm) => {
             let table = crate::cep_importance::analyse_weight_map(
                 wm,
-                &input.teacher_spec.n_heads,
-                teacher_n,
+                &input.teacher_spec,
                 &RooflineSlackTable::default(),
-            );
+            )?;
             normalized_layer_scores(&table, teacher_n)
         }
         // Degenerate uniform scores (documented above): no position division
@@ -346,7 +345,7 @@ mod tests {
             head_dim: 32,
             max_seq: 128,
             batch: 1,
-            dtype_bytes: 2,
+            dtype_bytes: 2, tied_lm_head: true,
         }
     }
 

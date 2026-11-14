@@ -208,6 +208,7 @@ pub mod cep_rewrite;
 pub mod cep_search;
 pub mod cep_emit_source;
 pub mod cep_slice;
+pub mod cep_weights;
 pub mod cfie;
 pub mod cfie_cost;
 pub mod cfie_decode_attention;
@@ -343,7 +344,7 @@ pub mod analysis {
 pub mod experimental {
     pub use crate::{
         cep, cep_extract, cep_importance, cep_oracle, cep_rewrite, cep_search,
-        cep_emit_source, cep_slice, cfie, cfie_fused_sample, cfie_grammar, cfie_kv_plan,
+        cep_emit_source, cep_slice, cep_weights, cfie, cfie_fused_sample, cfie_grammar, cfie_kv_plan,
         cfie_kv_quant, cfie_persistent, cfie_speculative, csha, csha_apply,
         csha_boundary, csha_patterns, csha_pipeline, csha_specialize, fase,
         fase_clip, fase_codegen_table, fase_memory, fase_optimizer, multimodal,

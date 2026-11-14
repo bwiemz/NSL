@@ -408,11 +408,14 @@ pub(crate) struct CheckArgs {
         #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "text")]
         pub(crate) training_report: Option<TrainingReportFormat>,
 
-        /// CEP: run hardware-aware architecture search.
+        /// CEP: rank the architectures the @search axes span, by the
+        /// @cep_search objective, on an analytic cost estimate. Fails when
+        /// no candidate meets the constraints.
         #[arg(long)]
         pub(crate) cep_search: bool,
-        /// CEP: print a bare CompilationProfile for the model (paper §7.1
-        /// differentiator — equivalent of PyTorch's missing 'nsl check --perf').
+        /// CEP: print an analytic cost estimate for the model (parameters,
+        /// FLOPs, memory traffic, roofline latency of one forward pass).
+        /// Nothing is compiled or measured.
         #[arg(long)]
         pub(crate) cep_profile: bool,
         /// CEP: target GPU for analysis (e.g. H100-SXM).
@@ -1116,10 +1119,14 @@ pub(crate) struct BuildArgs {
         #[arg(long, value_name = "SECONDS")]
         pub(crate) calibration_timeout: Option<u64>,
 
-        /// CEP: run compilation-verified pruning (requires --weights).
+        /// CEP: plan a structured prune of attention heads and FFN width
+        /// from weight magnitudes (requires --weights, .nslm or
+        /// .safetensors). Prints a report and writes the delta; builds no
+        /// binary. Fails, writing nothing, when the sparsity target or a
+        /// constraint cannot be met.
         #[arg(long)]
         pub(crate) cep_prune: bool,
-        /// CEP Mode 3 (paper §2.2): run joint prune-search (heads + FFN + layer drops).
+        /// CEP: as --cep-prune, and whole layers may be dropped as well.
         /// Requires --weights. Mutually exclusive with --cep-prune.
         #[arg(long)]
         pub(crate) cep_joint: bool,
@@ -1132,10 +1139,14 @@ pub(crate) struct BuildArgs {
         /// CEP: write the delta JSON here (default: <model>.cep.json).
         #[arg(long)]
         pub(crate) cep_out: Option<PathBuf>,
-        /// CEP: also emit the pruned (sliced) weights to this .safetensors path.
+        /// CEP: also write the pruned (sliced) weights here. A .nslm path
+        /// (which `model_load` reads) needs --weights to be .nslm too;
+        /// any other path is written as .safetensors.
         #[arg(long)]
         pub(crate) cep_emit_weights: Option<PathBuf>,
-        /// CEP SP2: also emit the rewritten NSL source with pruned dims to this path.
+        /// CEP: also write the NSL source with the pruned dimensions here.
+        /// The plan is then kept uniform across layers, and `preserve` is
+        /// refused, because the source has one block constructor.
         #[arg(long)]
         pub(crate) cep_emit_source: Option<PathBuf>,
 

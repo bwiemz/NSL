@@ -4,10 +4,9 @@
 //! `NSL_STDLIB_PATH` set so the frontend can resolve stdlib imports.
 //!
 //!   1. The repo searchable fixture (`cep_searchable.nsl`) prints the Student
-//!      Design Report. Its `@search` axes filter down to a single candidate
-//!      (n_kv_heads=3 forces n_heads=6 forces d_model=384 — the teacher
-//!      itself), so a sub-teacher selection is exercised via an inline
-//!      fixture whose axes admit smaller d_model candidates.
+//!      Design Report. Its `@search` axes span nine candidates (three widths
+//!      by three head counts); a budget that cuts the widest ones is
+//!      exercised here, and a sub-teacher selection on a one-axis fixture.
 //!   2. A budget below every candidate refuses loudly, naming the smallest
 //!      candidate's parameter count.
 //!   3. A model WITHOUT `@search` decorators (`cep_canonical_small.nsl`)
@@ -42,12 +41,12 @@ fn no_axes_fixture() -> PathBuf {
     workspace_root().join("crates/nsl-codegen/tests/fixtures/cep_canonical_small.nsl")
 }
 
-/// Variant of `cep_searchable.nsl` whose axes admit sub-teacher candidates:
-/// baseline d_model=384 with n_heads=4 / n_kv_heads=2, and a d_model axis
-/// [128, 256, 384]. All three candidates pass the shape-algebra filters
-/// (d % 4 == 0, 4 % 2 == 0, d mult-64), so the search space is
-/// {4.0M, 8.0M, 12.0M} params — a 9M budget forces a strictly smaller
-/// student than the teacher.
+/// Variant of `cep_searchable.nsl` with one axis: baseline d_model=384 with
+/// n_heads=4 / n_kv_heads=2, and a d_model axis [128, 256, 384]. All three
+/// candidates are valid (4 % 2 == 0, d mult-64). With the output head tied to
+/// the embedding a candidate has d·(4096 + 6·(2·4·64 + 2·2·64 + 3·1024 + 2) + 1)
+/// = 27,149·d parameters: {3,475,072; 6,950,144; 10,425,216} — a 9M budget
+/// forces a strictly smaller student than the teacher.
 fn write_sub_teacher_fixture(dir: &Path) -> PathBuf {
     let src = r#"from nsl.nn.norms import RMSNorm
 
@@ -79,8 +78,10 @@ fn nsl_check(file: &Path) -> Command {
 
 #[test]
 fn design_report_prints_on_searchable_fixture() {
-    // cep_searchable.nsl: single surviving candidate = the teacher
-    // (12,882,816 params) — a 13M budget admits it.
+    // cep_searchable.nsl spans d_model {256, 384, 512} x n_heads {4, 6, 8}
+    // with 2 key/value heads: d·(24,077 + 768·n_heads) parameters. The three
+    // d_model=512 candidates (13.9M, 14.7M, 15.5M) exceed a 13M budget; the
+    // other six (6.95M .. 11.6M) fit.
     let mut cmd = nsl_check(&searchable_fixture());
     cmd.arg("--cpkd-design-student")
         .arg("13M")
@@ -90,7 +91,7 @@ fn design_report_prints_on_searchable_fixture() {
         .success()
         .stdout(predicate::str::contains("=== CPKD Student Design Report ==="))
         .stdout(predicate::str::contains("Target: H100-SXM"))
-        .stdout(predicate::str::contains("Candidates: 1 enumerated, 1 within budget"))
+        .stdout(predicate::str::contains("Candidates: 9 enumerated, 6 within budget"))
         .stdout(predicate::str::contains("Teacher -> student layer mapping"))
         .stdout(predicate::str::contains("student  0 <- teacher  0"));
 }
@@ -99,8 +100,8 @@ fn design_report_prints_on_searchable_fixture() {
 fn budget_selects_sub_teacher_candidate() {
     let tmp = TempDir::new().unwrap();
     let fixture = write_sub_teacher_fixture(tmp.path());
-    // Teacher = 11,998,080 params; 9M budget leaves the d_model=256 (8.0M)
-    // and d_model=128 (4.0M) candidates.
+    // Teacher = 10,425,216 params; 9M budget leaves the d_model=256 (6.95M)
+    // and d_model=128 (3.48M) candidates.
     let mut cmd = nsl_check(&fixture);
     cmd.arg("--cpkd-design-student").arg("9M");
     cmd.assert()
@@ -116,13 +117,13 @@ fn budget_selects_sub_teacher_candidate() {
 fn budget_below_all_candidates_refuses_loudly() {
     let tmp = TempDir::new().unwrap();
     let fixture = write_sub_teacher_fixture(tmp.path());
-    // Smallest candidate (d_model=128) is 3,999,360 params — 1M cannot fit.
+    // Smallest candidate (d_model=128) is 3,475,072 params — 1M cannot fit.
     let mut cmd = nsl_check(&fixture);
     cmd.arg("--cpkd-design-student").arg("1M");
     cmd.assert()
         .failure()
         .stderr(predicate::str::contains("no student candidate fits"))
-        .stderr(predicate::str::contains("3999360"))
+        .stderr(predicate::str::contains("3475072"))
         .stderr(predicate::str::contains("widen the @search axes"));
 }
 

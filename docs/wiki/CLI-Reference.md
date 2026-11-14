@@ -67,8 +67,8 @@ nsl check [OPTIONS] <FILE>
 | `--dead-weight-threshold` | `<DEAD_WEIGHT_THRESHOLD>` | `0.000001` | M52: Dead weight threshold for analysis (default: 1e-6) |
 | `--sparse-threshold` | `<SPARSE_THRESHOLD>` | `0.5` | M52: Sparsity threshold for analysis (default: 0.5) |
 | `--training-report` | `<TRAINING_REPORT>` (optional; give a value as `=VALUE`) |  | Emit a training-pipeline decision audit for every train block in the file. Pass without value for text output, or `--training-report=json` for JSON [possible values: `text`, `json`] |
-| `--cep-search` |  |  | CEP: run hardware-aware architecture search |
-| `--cep-profile` |  |  | CEP: print a bare CompilationProfile for the model (paper §7.1 differentiator — equivalent of PyTorch's missing 'nsl check --perf') |
+| `--cep-search` |  |  | CEP: rank the architectures the @search axes span, by the @cep_search objective, on an analytic cost estimate. Fails when no candidate meets the constraints |
+| `--cep-profile` |  |  | CEP: print an analytic cost estimate for the model (parameters, FLOPs, memory traffic, roofline latency of one forward pass). Nothing is compiled or measured |
 | `--cep-target` | `<CEP_TARGET>` |  | CEP: target GPU for analysis (e.g. H100-SXM) |
 | `--cep-out` | `<CEP_OUT>` |  | CEP: write the delta JSON here (default: &lt;model&gt;.cep.json) |
 | `--cpkd-design-student` | `<PARAMS>` |  | CPKD Innovation 5: design a student architecture under a parameter budget via the CEP search oracle and print the teacher-&gt;student layer mapping. Budget accepts a raw integer or K/M/B suffix (e.g. "125M", "1.1B", "350000000"). Requires @search axes on the model. Uses `--weights` (if given) for teacher layer importance; without weights the mapping degenerates to the first k layers |
@@ -278,13 +278,13 @@ nsl build [OPTIONS] <FILE>
 | `--calibration-samples` | `<N>` |  | Calibration samples to consume. REFUSED with `--calibration-data` |
 | `--calibration-batch-size` | `<N>` |  | Calibration batch size. REFUSED with `--calibration-data` |
 | `--calibration-timeout` | `<SECONDS>` |  | Calibration wall-clock limit in seconds. REFUSED with `--calibration-data` |
-| `--cep-prune` |  |  | CEP: run compilation-verified pruning (requires --weights) |
-| `--cep-joint` |  |  | CEP Mode 3 (paper §2.2): run joint prune-search (heads + FFN + layer drops). Requires --weights. Mutually exclusive with --cep-prune |
+| `--cep-prune` |  |  | CEP: plan a structured prune of attention heads and FFN width from weight magnitudes (requires --weights, .nslm or .safetensors). Prints a report and writes the delta; builds no binary. Fails, writing nothing, when the sparsity target or a constraint cannot be met |
+| `--cep-joint` |  |  | CEP: as --cep-prune, and whole layers may be dropped as well. Requires --weights. Mutually exclusive with --cep-prune |
 | `--cep-target` | `<CEP_TARGET>` |  | CEP: target GPU for analysis (e.g. H100-SXM) |
 | `--cep-sparsity` | `<CEP_SPARSITY>` |  | CEP: override the decorator's prune sparsity |
 | `--cep-out` | `<CEP_OUT>` |  | CEP: write the delta JSON here (default: &lt;model&gt;.cep.json) |
-| `--cep-emit-weights` | `<CEP_EMIT_WEIGHTS>` |  | CEP: also emit the pruned (sliced) weights to this .safetensors path |
-| `--cep-emit-source` | `<CEP_EMIT_SOURCE>` |  | CEP SP2: also emit the rewritten NSL source with pruned dims to this path |
+| `--cep-emit-weights` | `<CEP_EMIT_WEIGHTS>` |  | CEP: also write the pruned (sliced) weights here. A .nslm path (which `model_load` reads) needs --weights to be .nslm too; any other path is written as .safetensors |
+| `--cep-emit-source` | `<CEP_EMIT_SOURCE>` |  | CEP: also write the NSL source with the pruned dimensions here. The plan is then kept uniform across layers, and `preserve` is refused, because the source has one block constructor |
 | `--activation-report` |  |  | Milestone A: print the activation-contract report — one line per requested optimization surface (flag or decorator) with what became of it (applied / declined / witnessed / UNSATISFIED) |
 | `--allow-inert-requests` |  |  | Milestone A escape hatch: demote unsatisfied activation contracts (a requested feature whose owner recorded no disposition) from a hard error to a warning. For migration only — an inert request is a correctness bug in the invocation or the compiler |
 | `--allow-unknown-decorators` |  |  | Milestone A escape hatch: demote UNKNOWN-decorator-name errors to warnings (one release, for migration). Documented-but-unimplemented decorators (e.g. @tie_weights) stay hard errors — accepting those would resurrect the silence this flag's namespace close exists to end |

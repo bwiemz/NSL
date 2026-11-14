@@ -621,14 +621,23 @@ pub const FEATURE_RULES: &[FeatureRule] = &[
         RuleKind::Requires,
         "--weights",
         CLI_CEP,
-        "--cep-prune requires --weights <file.safetensors>",
+        "--cep-prune requires --weights <file.nslm|file.safetensors>",
     ),
     src_rule(
         "--cep-joint",
         RuleKind::Requires,
         "--weights",
         CLI_CEP,
-        "--cep-joint requires --weights <file.safetensors>",
+        "--cep-joint requires --weights <file.nslm|file.safetensors>",
+    ),
+    // An .nslm output is read back by position, and only an .nslm input
+    // records the order to write it in.
+    src_rule(
+        "--cep-emit-weights",
+        RuleKind::Requires,
+        "--weights",
+        CLI_CEP,
+        "but --weights is a .safetensors file and that format does not record",
     ),
     src_rule(
         "--cep-search",
