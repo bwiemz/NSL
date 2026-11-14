@@ -1067,6 +1067,9 @@ pub struct DpChoice {
     /// Estimated recompute cost of the chosen partition (ns, window applied).
     pub est_recompute_ns: u64,
     pub fits_budget: bool,
+    /// How many block anchors there were to choose from: `keep.len()` of
+    /// these were kept.
+    pub total_anchors: usize,
 }
 
 /// P5 item 21 — choose a NON-UNIFORM checkpoint partition by dynamic
@@ -1113,7 +1116,15 @@ pub fn select_partition_dp(
     let mut escape_bytes = vec![0u64; n]; // coalescible boundary surface
     let mut forced_bytes = vec![0u64; n]; // force-saved (Selective) — always resident
     let mut rc_bytes = vec![0u64; n]; // recompute transient
-    let mut ops = vec![0u64; n]; // launch-count proxy (result vars in span)
+    // Launch-count proxy: one launch per result that is actually recomputed.
+    // A block's own victims always are; its escaping results are only when
+    // the block is coalesced with the one after it (they stop being a saved
+    // boundary). Force-saved results are never recomputed and cost nothing.
+    // Counting every result here made each partition cost the same wherever
+    // launches dominate the bandwidth floor, so the choice fell to search
+    // order and a partition that recomputes strictly more could win.
+    let mut rc_launches = vec![0u64; n];
+    let mut escape_launches = vec![0u64; n];
     for (b, (seg, seg_rc)) in base
         .segments
         .iter()
@@ -1129,7 +1140,8 @@ pub fn select_partition_dp(
             }
         }
         rc_bytes[b] = sum(seg_rc);
-        ops[b] = (seg.interior.len() + seg.escaping.len()) as u64;
+        rc_launches[b] = seg_rc.len() as u64;
+        escape_launches[b] = seg.escaping.len() as u64;
     }
     let forced_total: u64 = forced_bytes.iter().sum();
 
@@ -1140,7 +1152,8 @@ pub fn select_partition_dp(
         b
     };
     let seg_cost_ns = |s: usize, e: usize| -> u64 {
-        let launches: u64 = (s..=e).map(|i| ops[i]).sum();
+        let launches: u64 = (s..=e).map(|i| rc_launches[i]).sum::<u64>()
+            + (s..e).map(|i| escape_launches[i]).sum::<u64>();
         let launch_ns =
             (launches as f64 * model.bwd_launch_factor) as u64 * model.launch_overhead_ns;
         let bytes = seg_rc_bytes(s, e);
@@ -1269,6 +1282,7 @@ pub fn select_partition_dp(
         projected_peak_bytes: pk,
         est_recompute_ns: st.cost,
         fits_budget: model.budget_bytes.is_none_or(|b| pk <= b),
+        total_anchors: n,
     })
 }
 
@@ -1928,6 +1942,39 @@ mod tests {
             "anchor 2 (whose kept boundary is the huge v8) must be dropped: {:?}",
             choice.keep
         );
+    }
+
+    /// Small tensors, so launches dominate the bandwidth floor, and a budget
+    /// every partition fits. Keeping all four anchors recomputes the four
+    /// block interiors (4 launches); every coalescing recomputes those plus
+    /// the boundaries it swallowed (5 to 7 launches). The cheapest is all
+    /// four. When every result of a block counted as a launch, saved ones
+    /// included, each partition cost 8 launches and the choice fell to
+    /// search order.
+    #[test]
+    fn dp_keeps_every_anchor_when_launches_dominate_and_all_fit() {
+        let primal = toy_primal_4blocks();
+        let mut sizes: HashMap<VarId, u64> = HashMap::new();
+        for v in 0..16u32 {
+            sizes.insert(v, 64);
+        }
+        let choice = select_partition_dp(
+            &primal,
+            None,
+            CcrPolicy::Block,
+            &sizes,
+            &dp_model(1, Some(1 << 20)),
+        )
+        .expect("dp choice");
+        assert!(choice.fits_budget);
+        assert_eq!(choice.total_anchors, 4);
+        assert_eq!(
+            choice.keep,
+            vec![0, 1, 2, 3],
+            "the partition that recomputes least must win"
+        );
+        // 4 interiors x factor 2.0 x 6000 ns per launch, worked by hand.
+        assert_eq!(choice.est_recompute_ns, 48_000);
     }
 
     fn op(id: u32, result: VarId, p: PrimalOp, inputs: Vec<VarId>) -> WengertOp {

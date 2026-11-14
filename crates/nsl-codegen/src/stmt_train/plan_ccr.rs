@@ -196,8 +196,34 @@ impl Compiler<'_> {
                         .compile_options
                         .checkpoint.budget_mib
                         .map(|m| m.saturating_mul(1024 * 1024));
-                    let spec = crate::gpu_specs::find_gpu(&self.compile_options.target_gpu)
-                        .unwrap_or_else(crate::gpu_specs::default_gpu);
+                    // The launch overhead and bandwidth of the machine
+                    // this build runs on, when the driver can name it and
+                    // the database has that card. The configured target name
+                    // is a fixed "h100" on every machine, so reading it here
+                    // priced every partition with H100 constants.
+                    let spec = match crate::gpu_specs::resolve_local_gpu() {
+                        Some(local) => {
+                            nsl_log::nsl_log!(INFO, "ccr",
+                                "[ccr] --checkpoint-stride dp: cost model uses the local \
+                                 GPU's constants ({})",
+                                local.name
+                            );
+                            local
+                        }
+                        None => {
+                            let fallback =
+                                crate::gpu_specs::find_gpu(&self.compile_options.target_gpu)
+                                    .unwrap_or_else(crate::gpu_specs::default_gpu);
+                            nsl_log::nsl_log!(WARN, "ccr",
+                                "[ccr] --checkpoint-stride dp: the local GPU is not \
+                                 identified (no CUDA device, a build without CUDA, or a \
+                                 card with no GPU-database entry); the cost model uses {} \
+                                 constants, which are not this machine's",
+                                fallback.name
+                            );
+                            fallback
+                        }
+                    };
                     let model = crate::ccr::DpCostModel {
                         window,
                         budget_bytes,
@@ -258,7 +284,7 @@ impl Compiler<'_> {
                                      anchors {:?} (true peak {} MiB, DP projected {} MiB, \
                                      est recompute {:.2} ms/step, window G={window}{})",
                                     choice.keep.len(),
-                                    p.segments.len().max(choice.keep.len()),
+                                    choice.total_anchors,
                                     choice.keep,
                                     true_peak / (1024 * 1024),
                                     choice.projected_peak_bytes / (1024 * 1024),
