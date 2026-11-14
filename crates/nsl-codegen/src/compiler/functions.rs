@@ -486,28 +486,7 @@ impl Compiler<'_> {
                 let nh = builder.ins().iconst(cl_types::I64, num_heads);
                 let hd = builder.ins().iconst(cl_types::I64, head_dim);
                 let nl = builder.ins().iconst(cl_types::I64, num_layers);
-                // M42: Look up KV compression policy for this model (use first policy found)
-                let (compress_scheme, compress_window, compress_sinks) = self
-                    .features
-                    .kv_compress_policies
-                    .iter()
-                    .filter(|(key, _)| key.starts_with(&model_name))
-                    .filter_map(|(_, policies)| policies.first())
-                    .next()
-                    .map(|p| (p.scheme as i64, p.window as i64, p.sinks as i64))
-                    .unwrap_or((0, 0, 0));
-                if compress_scheme > 0 {
-                    nsl_log::nsl_log!(INFO, "nsl", 
-                        "[nsl] KV cache compression active: scheme={}, window={}, sinks={}",
-                        compress_scheme, compress_window, compress_sinks
-                    );
-                }
-                let cs = builder.ins().iconst(cl_types::I64, compress_scheme);
-                let cw = builder.ins().iconst(cl_types::I64, compress_window);
-                let ck = builder.ins().iconst(cl_types::I64, compress_sinks);
-                let call = builder
-                    .ins()
-                    .call(init_ref, &[nb, bs, nh, hd, nl, cs, cw, ck]);
+                let call = builder.ins().call(init_ref, &[nb, bs, nh, hd, nl]);
                 // Store the handle — for now just discard it (the handle is returned by init)
                 let _handle = builder.inst_results(call)[0];
             }

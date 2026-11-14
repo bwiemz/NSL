@@ -955,8 +955,8 @@ macro_rules! for_each_runtime_fn {
             [inference] nsl_standalone_arg_float_default(i64, i64, i64) -> i64 = weight_provider::nsl_standalone_arg_float_default;
             [inference] nsl_standalone_args_finish() -> () = weight_provider::nsl_standalone_args_finish;
             // Paged KV-cache (M25)
-            [inference] nsl_kv_cache_init(i64, i64, i64, i64, i64, i64, i64, i64) -> i64 = paged_kv::manager::nsl_kv_cache_init;
-            [inference] nsl_kv_cache_init_gpu(i64, i64, i64, i64, i64, i64, i64, i64) -> i64 = paged_kv::manager::nsl_kv_cache_init_gpu;
+            [inference] nsl_kv_cache_init(i64, i64, i64, i64, i64) -> i64 = paged_kv::manager::nsl_kv_cache_init;
+            [inference] nsl_kv_cache_init_gpu(i64, i64, i64, i64, i64) -> i64 = paged_kv::manager::nsl_kv_cache_init_gpu;
             [inference] nsl_kv_cache_alloc_seq(i64) -> i64 = paged_kv::manager::nsl_kv_cache_alloc_seq;
             [inference] nsl_kv_cache_append(i64, i64) -> i64 = paged_kv::manager::nsl_kv_cache_append;
             [inference] nsl_kv_cache_k_ptr(i64, i64, i64) -> i64 = paged_kv::manager::nsl_kv_cache_k_ptr;

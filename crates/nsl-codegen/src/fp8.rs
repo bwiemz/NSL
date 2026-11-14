@@ -24,15 +24,6 @@ pub enum Fp8ScalingMode {
     PerChannel,
 }
 
-/// Configuration for @fp4_compute decorator (NVFP4 Blackwell).
-#[derive(Debug, Clone)]
-pub struct Fp4ComputeInfo {
-    /// Block size for FP4 quantization (default 256).
-    pub block_size: usize,
-    /// Whether to apply Hadamard transform before quantization.
-    pub hadamard: bool,
-}
-
 pub fn extract_fp8_compute_decorator<'a>(
     decorators: &[Decorator],
     resolve_sym: &dyn Fn(Symbol) -> &'a str,
@@ -75,44 +66,6 @@ pub fn extract_fp8_compute_decorator<'a>(
                 calibrate,
                 scaling,
                 block_size,
-            });
-        }
-    }
-    None
-}
-
-/// Extract @fp4_compute decorator for NVFP4 Blackwell support.
-pub fn extract_fp4_compute_decorator<'a>(
-    decorators: &[Decorator],
-    resolve_sym: &dyn Fn(Symbol) -> &'a str,
-) -> Option<Fp4ComputeInfo> {
-    for deco in decorators {
-        if deco.name.len() == 1 && resolve_sym(deco.name[0]) == "fp4_compute" {
-            let mut block_size = 256usize;
-            let mut hadamard = true;
-            if let Some(ref args) = deco.args {
-                for arg in args {
-                    if let Some(name_sym) = arg.name {
-                        let name = resolve_sym(name_sym);
-                        match name {
-                            "block_size" => {
-                                if let ExprKind::IntLiteral(v) = &arg.value.kind {
-                                    block_size = *v as usize;
-                                }
-                            }
-                            "hadamard" => {
-                                if let ExprKind::BoolLiteral(b) = &arg.value.kind {
-                                    hadamard = *b;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            return Some(Fp4ComputeInfo {
-                block_size,
-                hadamard,
             });
         }
     }

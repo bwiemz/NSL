@@ -184,20 +184,6 @@ impl<'a> TypeChecker<'a> {
                                     &mut self.diagnostics,
                                 );
                             }
-                            // M50: @sparse decorator validation
-                            if dname == "sparse" {
-                                let resolve = |s: nsl_ast::Symbol| -> String {
-                                    self.interner
-                                        .resolve(s.0)
-                                        .unwrap_or("")
-                                        .to_string()
-                                };
-                                crate::sparse::validate_sparse_decorator(
-                                    deco,
-                                    &resolve,
-                                    &mut self.diagnostics,
-                                );
-                            }
                             // M37: @perf_budget decorator validation
                             if dname == "perf_budget" {
                                 let resolve = |s: nsl_ast::Symbol| -> String {
@@ -285,20 +271,6 @@ impl<'a> TypeChecker<'a> {
                                         }
                                     }
                                 }
-                            }
-                            // M42: @kv_compress decorator validation
-                            if dname == "kv_compress" {
-                                let resolve = |s: nsl_ast::Symbol| -> String {
-                                    self.interner
-                                        .resolve(s.0)
-                                        .unwrap_or("")
-                                        .to_string()
-                                };
-                                crate::kv_compress::validate_kv_compress_decorator(
-                                    deco,
-                                    &resolve,
-                                    &mut self.diagnostics,
-                                );
                             }
                             // M43: @pipeline decorator validation
                             if dname == "pipeline" {
