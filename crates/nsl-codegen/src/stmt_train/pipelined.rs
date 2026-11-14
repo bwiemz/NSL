@@ -91,6 +91,16 @@ impl Compiler<'_> {
             let msgs: Vec<String> = diags.into_iter().map(|d| d.message).collect();
             CodegenError::new(format!("train config refused: {}", msgs.join("; ")))
         })?;
+        // `schedule_unit` chooses between two step counts of the standard
+        // loop. This path has neither (no accumulation, no scheduler call),
+        // so the key would be accepted and mean nothing.
+        if pipe_cfg.schedule_unit.is_some() {
+            return Err(CodegenError::new(
+                "train 'schedule_unit' is not supported on the pipelined train path \
+                 (@pipeline): that path runs no learning-rate schedule. Drop the key \
+                 or the @pipeline decorator",
+            ));
+        }
         let model_sym: Option<nsl_ast::Symbol> = pipe_cfg.model;
 
         // Item 8 note: checkpointing is not lowered on this path, and does

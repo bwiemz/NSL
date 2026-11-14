@@ -334,6 +334,69 @@ fn distill_grad_accumulation_windows_the_optimizer_over_micro_batches() {
 /// end than at the start (the student learns; the frozen teacher's
 /// contribution is stable across epochs — its weights never move because
 /// no teacher gradient exists, I-11).
+/// `schedule_unit` reaches the loop a distill block lowers to.
+///
+/// The schedule here is at the optimizer's rate for schedule step 0 and at
+/// zero from step 1 on (`warmup_cosine(warmup_steps = 0, total_steps = 1,
+/// min_lr = 0.0)`). With a window of two, the first update is taken on
+/// micro-batch 1. Counted in micro-batches that is schedule step 1, rate
+/// zero: the student never moves and all eight losses are equal. Counted in
+/// optimizer steps it is schedule step 0: the student moves once, so the
+/// loss changes after the first window and is constant from there. A
+/// distill header that dropped the key, or a lowering that did not forward
+/// it, gives both spellings the same stream. Unstated, the block counts
+/// micro-batches (this channel's default).
+#[test]
+fn distill_schedule_unit_reaches_the_training_loop() {
+    let base = std::fs::read_to_string(fixture_path("cpkd_distill_basic.nsl")).unwrap();
+    let losses_with = |tag: &str, unit: &str| -> Vec<f64> {
+        let src = base
+            .replace(
+                "epochs = 1)",
+                &format!("epochs = 8, grad_accumulation = 2{unit})"),
+            )
+            .replace(
+                "    optimizer: AdamW(lr = 0.001)\n",
+                "    optimizer: AdamW(lr = 0.05)\n    scheduler: warmup_cosine(warmup_steps = 0, total_steps = 1, min_lr = 0.0)\n",
+            );
+        assert!(src.contains("scheduler:") && src.contains("epochs = 8"), "fixture knobs not found");
+        let file = write_temp_fixture(&format!("schedunit_{tag}"), &src);
+        let mut cmd = Command::cargo_bin("nsl").unwrap();
+        cmd.env("NSL_STDLIB_PATH", stdlib_path());
+        cmd.arg("run").arg("--source-ad").arg(&file);
+        let output = cmd.output().expect("nsl run failed to spawn");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "nsl run failed ({tag}).\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let losses: Vec<f64> = stdout
+            .lines()
+            .filter_map(|l| l.trim().parse::<f64>().ok())
+            .collect();
+        assert_eq!(losses.len(), 8, "{tag}: expected 8 losses: {losses:?}");
+        losses
+    };
+    let frozen = |l: &[f64]| l.iter().all(|v| *v == l[0]);
+    let moved_once = |l: &[f64]| l[0] == l[1] && l[2] != l[0] && l[2..].iter().all(|v| *v == l[2]);
+
+    let micro = losses_with("micro", ", schedule_unit = \"micro_batch\"");
+    assert!(frozen(&micro), "micro-batch units: the student moved: {micro:?}");
+    let optimizer = losses_with("opt", ", schedule_unit = \"optimizer_step\"");
+    assert!(
+        moved_once(&optimizer),
+        "optimizer-step units: expected one move after the first window: {optimizer:?}"
+    );
+    let unstated = losses_with("unstated", "");
+    let default_is_optimizer_steps = false;
+    if default_is_optimizer_steps {
+        assert!(moved_once(&unstated), "unit not stated: {unstated:?}");
+    } else {
+        assert!(frozen(&unstated), "unit not stated: {unstated:?}");
+    }
+}
+
 #[test]
 fn nsl_run_distill_loss_decreases() {
     let base = std::fs::read_to_string(fixture_path("cpkd_distill_basic.nsl")).unwrap();

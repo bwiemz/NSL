@@ -245,9 +245,14 @@ pub mod train_config {
     /// aborts by default and `NSL_RESUME_ALLOW_TRAJECTORY_DRIFT=1` turns
     /// the refusal into a loud acknowledgment. `sp4..sp6` are reserved
     /// ahead of any 4+-parameter scheduler: a parameter rendered under a
-    /// key in neither class would be silently unguarded.
-    pub const TRAJECTORY_KEYS: &[&str] =
-        &["lr", "sched", "sp1", "sp2", "sp3", "sp4", "sp5", "sp6", "clip"];
+    /// key in neither class would be silently unguarded. `sched_unit` is
+    /// rendered only for a stepped schedule counted in optimizer steps
+    /// under accumulation: resuming a
+    /// checkpoint under the other unit re-reads the restored step counter
+    /// through a schedule N times slower or faster.
+    pub const TRAJECTORY_KEYS: &[&str] = &[
+        "lr", "sched", "sp1", "sp2", "sp3", "sp4", "sp5", "sp6", "clip", "sched_unit",
+    ];
 }
 
 /// The AWQ activation-scales blob — the `"awq_activation_scales"` entry of

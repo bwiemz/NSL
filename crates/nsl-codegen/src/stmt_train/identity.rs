@@ -49,6 +49,8 @@ pub(crate) struct TrainConfigRecordInputs<'a> {
     pub(crate) adamw_lr_value: Option<f64>,
     pub(crate) no_decay_scope: &'a NoDecayScope,
     pub(crate) scheduler: &'a Option<ResolvedScheduler>,
+    /// `schedule_unit = "optimizer_step"`.
+    pub(crate) schedule_in_optimizer_steps: bool,
 }
 
 impl<'a> TrainConfigRecordInputs<'a> {
@@ -71,6 +73,7 @@ impl<'a> TrainConfigRecordInputs<'a> {
             adamw_lr_value: plan.spec.adamw_lr_value,
             no_decay_scope: &plan.spec.no_decay_scope,
             scheduler: &plan.spec.scheduler,
+            schedule_in_optimizer_steps: plan.schedule.schedule_in_optimizer_steps,
         }
     }
 }
@@ -99,6 +102,7 @@ pub(crate) fn render_train_config_record(inputs: &TrainConfigRecordInputs<'_>) -
         adamw_lr_value,
         no_decay_scope,
         scheduler,
+        schedule_in_optimizer_steps,
     } = *inputs;
     let clip_s = if grad_clip == f64::MAX {
         "none".to_string()
@@ -160,6 +164,18 @@ sched={sched_s}",
     );
     for (i, v) in sched_params.iter().enumerate() {
         rec.push_str(&format!(",sp{}={v}", i + 1));
+    }
+    // Appended only where the unit changes the trajectory: accumulation
+    // and a schedule that reads the step, counted in optimizer steps. The
+    // record of every block written before the key existed (all of them in
+    // micro-batch units) is then unchanged and their checkpoints still
+    // load. Later toolchains render the field under the same condition, so
+    // a block that states its unit has one record on both.
+    let stepped = scheduler.as_ref().is_some_and(|s| {
+        !matches!(s, nsl_semantic::optim_config::ResolvedScheduler::ConstantLr)
+    });
+    if schedule_in_optimizer_steps && grad_accumulation_steps > 1 && stepped {
+        rec.push_str(",sched_unit=optimizer_step");
     }
     rec
 }
@@ -276,6 +292,34 @@ mod tests {
             adamw_lr_value: None,
             no_decay_scope: no_decay,
             scheduler: sched,
+            schedule_in_optimizer_steps: false,
+        }
+    }
+
+    /// The unit is rendered only where it changes the trajectory: a stepped
+    /// schedule under accumulation, counted in optimizer steps. Every
+    /// record written before the key existed (micro-batch units, no field)
+    /// then still compares equal to the same block compiled today.
+    #[test]
+    fn the_schedule_unit_is_rendered_only_where_it_matters() {
+        let nd = NoDecayScope { static_roles: vec![], exempt_non_rank2: false };
+        let sched = Some(ResolvedScheduler::StepLr { step_size: 10.0, gamma: 0.5 });
+        let mut i = inputs(&nd, &sched);
+        let micro_unit = render_train_config_record(&i);
+        assert!(!micro_unit.contains("sched_unit"), "{micro_unit}");
+        i.schedule_in_optimizer_steps = true;
+        let rec = render_train_config_record(&i);
+        assert_eq!(rec, format!("{micro_unit},sched_unit=optimizer_step"));
+
+        // No accumulation: one micro-batch is one optimizer step.
+        i.grad_accumulation_steps = 1;
+        assert!(!render_train_config_record(&i).contains("sched_unit"));
+        // A schedule that ignores the step, or none.
+        for unstepped in [Some(ResolvedScheduler::ConstantLr), None] {
+            let mut j = inputs(&nd, &unstepped);
+            j.schedule_in_optimizer_steps = true;
+            let rec = render_train_config_record(&j);
+            assert!(!rec.contains("sched_unit"), "{rec}");
         }
     }
 

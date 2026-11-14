@@ -39,6 +39,9 @@ pub(crate) struct TrainConfigSection {
     pub(crate) checkpoint_save_path: Option<String>,
     pub(crate) checkpoint_every: i64,
     pub(crate) checkpoint_load_path: Option<String>,
+    /// `schedule_unit = "optimizer_step"`: the scheduler advances once per
+    /// optimizer step instead of once per micro-batch.
+    pub(crate) schedule_in_optimizer_steps: bool,
 }
 
 impl Compiler<'_> {
@@ -92,6 +95,8 @@ impl Compiler<'_> {
         let checkpoint_save_path: Option<String> = cfg.checkpoint_save;
         let checkpoint_every: i64 = cfg.checkpoint_every;
         let checkpoint_load_path: Option<String> = cfg.checkpoint_load;
+        let schedule_in_optimizer_steps = cfg.schedule_unit
+            == Some(nsl_semantic::train_config::ScheduleUnit::OptimizerStep);
 
         // P5 item 19: arm the cuda-graph runtime (its enable() re-checks the
         // runtime-only incompatibilities: NSL_CUDA_SYNC, kernel profiler,
@@ -131,6 +136,7 @@ impl Compiler<'_> {
             checkpoint_save_path,
             checkpoint_every,
             checkpoint_load_path,
+            schedule_in_optimizer_steps,
         })
     }
 }
