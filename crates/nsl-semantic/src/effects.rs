@@ -109,6 +109,7 @@ pub fn classify_builtin_effects(name: &str) -> EffectSet {
         | "model_save" | "model_load"
         | "nsl_model_save" | "nsl_model_load" | "nsl_model_load_named"
         | "nsl_model_load_with_adapters"
+        | "nsl_weights_bind" | "nsl_weights_load_field"
         => EffectSet::IO,
 
         // Random effects
