@@ -42,8 +42,8 @@
 //! The kernel is built as [`KernelIR`] ([`build`]) and lowered by
 //! `nsl_kir`'s printer. It shares its first sections with
 //! `cfie_spec_sampler_ptx` (the hidden-row load, the in-place RMSNorm and
-//! the f16 row dot, through [`Common`]) and its xorshift64* draw with
-//! `cfie_speculative_ptx`. `tests/cfie_sample_kir_equivalence.rs` runs it
+//! the f16 row dot, through [`Common`]).
+//! `tests/cfie_sample_kir_equivalence.rs` runs it
 //! against the frozen hand emitter on the cooperative-CTA interpreter and
 //! requires the same output bits, and `cpu_reference`'s token. It targets
 //! the KIR floor (`sm_70`), so [`FusedSampleKernelConfig`] has no
@@ -63,10 +63,19 @@ use std::fmt::Write;
 const TILE: u32 = 128;
 const BLOCK_DIM: u32 = TILE;
 
-/// Baked RMSNorm epsilon (paper stage 1).
-const RMS_EPS: f32 = 1e-5;
+/// The RMSNorm epsilon used when a model does not say otherwise.
+pub const DEFAULT_NORM_EPS: f32 = 1e-5;
 
 pub const KERNEL_NAME: &str = "nsl_cfie_fused_sample";
+
+/// The token id the kernel writes when it has nothing to choose from: every
+/// score was -inf or NaN, so no candidate entered the list. That happens
+/// when a grammar mask row allows no token, and when the model's output is
+/// NaN. It is not a vocabulary index, and the runtime's decode loop treats
+/// an out-of-vocabulary token as a failure. (The kernel used to emit token
+/// 0 here: the candidates' softmax was NaN and the walk fell back to the
+/// first slot, whose index was still its initial 0.)
+pub const NO_CANDIDATE: u32 = u32::MAX;
 
 pub fn kernel_name() -> &'static str {
     KERNEL_NAME
@@ -81,6 +90,9 @@ pub struct FusedSampleKernelConfig {
     pub top_k: u32,
     /// Number of grammar DFA states; 0 = no grammar hook emitted.
     pub grammar_states: u32,
+    /// The final RMSNorm's epsilon (the model's `norm_eps`; the decode
+    /// block takes the same value).
+    pub norm_eps: f32,
 }
 
 /// Host-readable launch metadata emitted alongside the PTX.
@@ -304,11 +316,13 @@ fn validate(program: &FusedSampleProgram, cfg: &FusedSampleKernelConfig) {
 ///                      thread 0: replace-min merge of the tile's scores into
 ///                      the candidate list (strict >, min re-scanned after
 ///                      each replacement); bar
-/// thread 0 selection   greedy: argmax (strict >, first wins)
+/// thread 0 selection   an empty candidate list (max == -inf) selects
+///                      NO_CANDIDATE, an id outside the vocabulary
+///                      greedy: argmax (strict >, first wins)
 ///                      sampling: max; softmax in place; [nucleus: insertion
 ///                      sort desc, cumulative cutoff at top_p, tail zeroed];
-///                      kept mass; xorshift64* draw (cfie_speculative_ptx's
-///                      build_prng_draw); multinomial CDF walk
+///                      kept mass; xorshift64* draw (build_prng_draw);
+///                      multinomial CDF walk
 /// store                out_token = sel, the kernel's only global store
 /// ```
 pub fn build(program: &FusedSampleProgram, cfg: &FusedSampleKernelConfig) -> KernelIR {
@@ -338,7 +352,7 @@ pub fn build(program: &FusedSampleProgram, cfg: &FusedSampleKernelConfig) -> Ker
 
     let entry = b.new_block();
     b.set_block(entry);
-    let c = common_at(&mut b, cfg.d_model, cfg.vocab_size, [hidden, norm_w, lm_head], R_RSTD);
+    let c = common_at(&mut b, cfg.d_model, cfg.vocab_size, cfg.norm_eps, [hidden, norm_w, lm_head], R_RSTD);
     let region = |b: &mut KirBuilder, r: u32, elem: KirType| {
         let dst = b.new_typed_var(ptr(elem, Shared));
         b.emit(KirOp::SharedRegion { dst, region: r });
@@ -514,13 +528,10 @@ pub fn build(program: &FusedSampleProgram, cfg: &FusedSampleKernelConfig) -> Ker
         let sel = b.add_block_param(head, U32);
         b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![c.one, v0, i0])));
 
+        let picked = b.new_block();
         b.set_block(head);
         let finished = cmp(&mut b, j, s.k, CmpOp::Ge);
-        b.terminate(KirTerminator::CondBranch(
-            finished,
-            KirEdge::with(store, vec![sel]),
-            KirEdge::to(body),
-        ));
+        b.terminate(KirTerminator::CondBranch(finished, KirEdge::to(picked), KirEdge::to(body)));
 
         b.set_block(body);
         let v_addr = at(&mut b, F32, Shared, s.topk_val, j);
@@ -532,6 +543,13 @@ pub fn build(program: &FusedSampleProgram, cfg: &FusedSampleKernelConfig) -> Ker
         let sel_next = select(&mut b, U32, higher, idx, sel);
         let j_next = op2(&mut b, U32, KirOp::Add, j, c.one);
         b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![j_next, max_next, sel_next])));
+
+        // No candidate at all (see `NO_CANDIDATE`): say so.
+        b.set_block(picked);
+        let nothing = cmp(&mut b, max, c.f_neg_inf, CmpOp::Eq);
+        let sentinel = konst(&mut b, ConstValue::U32(NO_CANDIDATE));
+        let chosen = select(&mut b, U32, nothing, sentinel, sel);
+        b.terminate(KirTerminator::Branch(KirEdge::with(store, vec![chosen])));
     } else {
         // Stable-softmax max over the k candidates.
         let v0 = load(&mut b, F32, s.topk_val, Shared);
@@ -553,6 +571,18 @@ pub fn build(program: &FusedSampleProgram, cfg: &FusedSampleKernelConfig) -> Ker
         b.terminate(KirTerminator::Branch(KirEdge::with(head, vec![j_next, max_next])));
         b.set_block(done);
 
+        // No candidate at all (see `NO_CANDIDATE`): say so, rather than
+        // softmax a list of -inf into NaN and fall through to slot 0.
+        let sample = b.new_block();
+        let nothing = cmp(&mut b, max, c.f_neg_inf, CmpOp::Eq);
+        let sentinel = konst(&mut b, ConstValue::U32(NO_CANDIDATE));
+        b.terminate(KirTerminator::CondBranch(
+            nothing,
+            KirEdge::with(store, vec![sentinel]),
+            KirEdge::to(sample),
+        ));
+        b.set_block(sample);
+
         // Softmax over k only (not vocab): p = exp(v - max), in place.
         let sum = build_k_sum(&mut b, &s, Some(max));
 
@@ -569,7 +599,7 @@ pub fn build(program: &FusedSampleProgram, cfg: &FusedSampleKernelConfig) -> Ker
         let seed_zero = cmp(&mut b, rng_seed, null_seed, CmpOp::Eq);
         let golden = konst(&mut b, ConstValue::U64(0x9E37_79B9_7F4A_7C15));
         let x = select(&mut b, U64, seed_zero, golden, rng_seed);
-        let (_state, r) = crate::cfie_speculative_ptx::build_prng_draw(&mut b, x);
+        let (_state, r) = build_prng_draw(&mut b, x);
         let target = op2(&mut b, F32, KirOp::Mul, r, kept);
 
         // Multinomial: walk the cumulative distribution. Zero-probability
@@ -628,6 +658,41 @@ pub fn build(program: &FusedSampleProgram, cfg: &FusedSampleKernelConfig) -> Ker
     b.set_block(exit);
     b.terminate(KirTerminator::Return);
     b.finalize()
+}
+
+/// One xorshift64* step and its [0,1) draw: the state advances by three
+/// shift-xors (`x ^= x >> 12; x ^= x << 25; x ^= x >> 27`) and becomes the
+/// new state; the output is `state * M`, and `r` is its top 24 bits over
+/// 2^24, exact in an f32 mantissa. Returns `(state, r)`.
+///
+/// The kernel takes ONE draw per launch, from its `rng_seed` parameter, so
+/// the host must give every launch its own seed: the runtime derives it
+/// from the request's key and the token's position
+/// (`nsl_runtime::cfie::engine::step_seed`).
+pub(crate) fn build_prng_draw(b: &mut KirBuilder, x: VarId) -> (VarId, VarId) {
+    use KirType::{F32, U32, U64};
+
+    let mut x = x;
+    for (shift, op) in [
+        (12u32, KirOp::Shr as fn(VarId, VarId, VarId) -> KirOp),
+        (25, KirOp::Shl),
+        (27, KirOp::Shr),
+    ] {
+        let amount = konst(b, ConstValue::U32(shift));
+        let shifted = op2(b, U64, op, x, amount);
+        x = op2(b, U64, KirOp::Xor, x, shifted);
+    }
+    let m = konst(b, ConstValue::U64(0x2545_F491_4F6C_DD1D));
+    let out = op2(b, U64, KirOp::Mul, x, m);
+    let forty = konst(b, ConstValue::U32(40));
+    let top = op2(b, U64, KirOp::Shr, out, forty);
+    let top32 = b.new_typed_var(U32);
+    b.emit(KirOp::Cast(top32, top, U32));
+    let wide = b.new_typed_var(F32);
+    b.emit(KirOp::Cast(wide, top32, F32));
+    let two_neg24 = konst(b, ConstValue::F32(1.0 / 16_777_216.0));
+    let r = op2(b, F32, KirOp::Mul, wide, two_neg24);
+    (x, r)
 }
 
 /// The nucleus filter over the softmaxed candidates: insertion sort
@@ -748,7 +813,7 @@ fn header_comment(program: &FusedSampleProgram, cfg: &FusedSampleKernelConfig) -
         writeln!(w, "//   top_p            = {} ({})", tp, f32_imm(tp)).unwrap();
     }
     if has_rms {
-        writeln!(w, "//   rms_eps          = {} ({})", RMS_EPS, f32_imm(RMS_EPS)).unwrap();
+        writeln!(w, "//   rms_eps          = {} ({})", cfg.norm_eps, f32_imm(cfg.norm_eps)).unwrap();
     }
     if cfg.grammar_states > 0 {
         writeln!(
@@ -844,6 +909,20 @@ pub fn cpu_reference(
     grammar_mask: Option<(&[u8], u32)>,
     seed: u64,
 ) -> u32 {
+    cpu_reference_with_eps(program, hidden, norm_w, lm_head_f32, grammar_mask, seed, DEFAULT_NORM_EPS)
+}
+
+/// [`cpu_reference`] with the final norm's epsilon given (the kernel's
+/// `FusedSampleKernelConfig::norm_eps`).
+pub fn cpu_reference_with_eps(
+    program: &FusedSampleProgram,
+    hidden: &[f32],
+    norm_w: &[f32],
+    lm_head_f32: &[f32],
+    grammar_mask: Option<(&[u8], u32)>,
+    seed: u64,
+    norm_eps: f32,
+) -> u32 {
     let dm = program.shape.d_model as usize;
     let vocab = program.shape.vocab_size as usize;
     let k = program.params.top_k as usize;
@@ -882,7 +961,7 @@ pub fn cpu_reference(
             }
         }
         let mean = partials[0] * (1.0 / dm as f32);
-        let rstd = 1.0 / (mean + RMS_EPS).sqrt();
+        let rstd = 1.0 / (mean + norm_eps).sqrt();
         for (i, hv) in h.iter_mut().enumerate() {
             *hv = (*hv * rstd) * norm_w[i];
         }
@@ -934,7 +1013,7 @@ pub fn cpu_reference(
                 sel = ti[j];
             }
         }
-        return sel;
+        return if mx == f32::NEG_INFINITY { NO_CANDIDATE } else { sel };
     }
 
     // Softmax over the k candidates only.
@@ -943,6 +1022,9 @@ pub fn cpu_reference(
         if tv[j] > mx {
             mx = tv[j];
         }
+    }
+    if mx == f32::NEG_INFINITY {
+        return NO_CANDIDATE;
     }
     let mut sum = 0f32;
     for v in tv.iter_mut() {
@@ -1032,6 +1114,7 @@ mod tests {
             vocab_tile: 128,
             top_k: 50,
             grammar_states: 0,
+            norm_eps: DEFAULT_NORM_EPS,
         }
     }
 
@@ -1426,6 +1509,45 @@ mod tests {
         }
         assert!(seen.len() > 1, "multinomial must not collapse to one token");
         assert!(seen.iter().all(|&t| t < vocab));
+    }
+
+    /// A state whose mask row allows no token, and a model whose output is
+    /// NaN, leave the candidate list empty. The answer is `NO_CANDIDATE`,
+    /// which no vocabulary contains; it used to be token 0.
+    #[test]
+    fn nothing_to_choose_from_is_not_token_zero() {
+        let (dm, vocab) = (2usize, 8u32);
+        let hidden = [0.9f32, -0.4];
+        let w = small_weights(vocab as usize, dm);
+        for strategy in [SamplingStrategy::Greedy, SamplingStrategy::TopK, SamplingStrategy::TopKTopP] {
+            let params = SamplingParams {
+                strategy,
+                temperature: if strategy == SamplingStrategy::Greedy { 0.0 } else { 1.0 },
+                top_k: 4,
+                grammar_masked: true,
+                rms_norm: false,
+                ..Default::default()
+            };
+            let prog = emit_program(params, shape(dm as u32, vocab));
+            // Two mask rows: state 0 allows token 5, state 1 allows nothing.
+            let mask = [0b0010_0000u8, 0];
+            for seed in [0u64, 1, 99] {
+                assert_eq!(cpu_reference(&prog, &hidden, &[], &w, Some((&mask, 0)), seed), 5, "{strategy:?}");
+                assert_eq!(
+                    cpu_reference(&prog, &hidden, &[], &w, Some((&mask, 1)), seed),
+                    NO_CANDIDATE,
+                    "{strategy:?}: an empty mask row"
+                );
+            }
+            // NaN in the hidden row makes every score NaN.
+            let prog = emit_program(SamplingParams { grammar_masked: false, ..params }, shape(dm as u32, vocab));
+            assert_eq!(
+                cpu_reference(&prog, &[f32::NAN, 0.0], &[], &w, None, 3),
+                NO_CANDIDATE,
+                "{strategy:?}: a NaN model output"
+            );
+        }
+        assert!(NO_CANDIDATE >= 1 << 31, "no vocabulary is this large");
     }
 
     // ── ptxas validation (skips silently when no validator present) ──

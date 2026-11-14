@@ -324,6 +324,7 @@ mod tests {
             vocab_tile: 128,
             top_k: 8,
             grammar_states: dfa.num_states,
+            norm_eps: 1e-5,
         };
         let (sampler, _) = emit_sampler(&program, &cfg);
         let spliced = splice_mask_into_module(&sampler, &emit_mask_global(&dfa));

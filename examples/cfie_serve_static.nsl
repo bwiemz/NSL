@@ -1,6 +1,12 @@
-# CFIE: compiler-fused inference-engine serve block (paper §8 config).
+# CFIE: compiler-fused inference-engine serve block.
 # `kv_layout: "static"` opts into compile-time KV planning; the build
-# prints the CFIE Inference Build Report.  Build with:
+# prints the CFIE Inference Build Report, which says which kernels the
+# binary carries.  `kv_quant: "auto"` adds an advisory per-layer precision
+# ranking to that report and changes nothing in the binary: the KV cache
+# is FP16.  (This example used to carry a `speculative:` section asking
+# for tree drafting with no draft model.  Nothing honoured it, and it is
+# now a compile error; examples/cfie_serve_speculative.nsl shows the
+# speculative configuration that has a driver.)  Build with:
 #   nsl build examples/cfie_serve_static.nsl
 #   nsl build --cfie-report report.txt examples/cfie_serve_static.nsl
 
@@ -22,11 +28,6 @@ serve CfieInference:
         top_k: 50
         top_p: 0.9
         fused: true
-
-    speculative:
-        tokens: 5
-        method: "tree"
-        tree_width: 2
 
     @endpoint
     fn generate(prompt: str) -> str:

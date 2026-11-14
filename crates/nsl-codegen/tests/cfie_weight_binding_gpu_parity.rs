@@ -428,6 +428,7 @@ fn build_sampler() -> (
             vocab_tile: 128,
             top_k: TOP_K,
             grammar_states: 0,
+            norm_eps: 1e-5,
         },
     );
     (program, s_ptx, s_meta.kernel_name, s_meta.block_dim)

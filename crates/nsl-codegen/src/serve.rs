@@ -34,28 +34,28 @@ const WORKER_EOS_TOKEN_OFFSET: i32 = 40;
 /// Values the compiled serve binary passes to the `nsl_cfie_*` init
 /// FFIs, sized from the compile-time CFIE plan.
 struct CfieRuntimeInit {
-    ring_capacity: i64,
     /// `(slot_count, per_slot_tokens)` for the KV slot free-list —
-    /// present only when the plan selected a static layout and the
-    /// decode-attention kernel was emitted.
+    /// present exactly when the decode block was emitted.
     kv_slots: Option<(i64, i64)>,
-    /// Cycle 6: kernel registrations for the compile-time-chosen
-    /// family (`cfie::kernel_registrations` — quant wins whenever the
-    /// per-layer kernels were emitted, else uniform).  Each entry
+    /// Kernel registrations (`cfie::kernel_registrations`).  Each entry
     /// becomes one `nsl_cfie_register_kernel` call at serve init.
     kernels: Vec<crate::cfie::CfieKernelReg>,
-    /// Device KV-pool bytes for `nsl_cfie_kv_pool_alloc` — `Some` only
-    /// when at least one KV-consuming kernel (kind 0/2/3/5) registers.
-    /// Quant family: `cfie_kv_quant_ptx::total_pool_bytes`; uniform:
-    /// `n_layers * 2 * (max_slots * per_slot_tokens) * n_kv_heads *
-    /// head_dim * 2` (f16).
+    /// Device KV-pool bytes for `nsl_cfie_kv_pool_alloc` — `Some`
+    /// exactly when the decode block was emitted: `n_layers * 2 *
+    /// (max_slots * per_slot_tokens) * n_kv_heads * head_dim * 2` (f16).
     pool_bytes: Option<i64>,
-    /// Cycle 11: model-binding + generation parameters resolved from the
-    /// serve config + the compile-time model shape.  `Some` only when
-    /// the plan actually wired the decode path (kernels emitted); `None`
-    /// leaves the generation FFIs unemitted so `generate()` refuses.
+    /// Model-binding + generation parameters resolved from the serve
+    /// config + the compile-time model shape.  `Some` exactly when the
+    /// decode path (decode block + fused sampler) is in the build.
     endpoint: Option<CfieEndpointInit>,
+    /// Why `generate()` cannot run in this build, when `endpoint` is
+    /// `None`: a `generate()` call is then a compile error with this
+    /// text.
+    generate_refusal: Option<String>,
 }
+
+/// The most static shared memory one thread block may declare, in bytes.
+const CFIE_STATIC_SMEM_LIMIT: u32 = 48 * 1024;
 
 /// Cycle 11: everything the monolithic serve path needs to emit the
 /// model-binding + generation-driver calls, resolved at compile time.
@@ -89,8 +89,10 @@ struct CfieEndpointInit {
     shape: crate::cfie_serve::ResolvedModelShape,
     max_new_tokens: i64,
     eos_token_id: i64,
+    /// The `sampling: seed:` value (default 0).
+    rng_seed: i64,
     /// Cycle 13 (G15): the resolved draft-model wiring — `Some` exactly
-    /// when the plan emitted the kind-6/7/8 draft kernels.  Serve init
+    /// when the plan emitted the two draft kernels.  Serve init
     /// then ALSO emits `nsl_model_create(draft) ->
     /// nsl_cfie_bind_draft_model -> nsl_cfie_draft_pool_alloc` after
     /// the target binding, and `generate()` rewrites to
@@ -103,8 +105,15 @@ struct CfieEndpointInit {
 /// CFIE-active serve body compiles.  Presence of this value is exactly
 /// the "CFIE serve context" the `generate()` rewrite tests for.
 pub struct CfieServeGen {
+    /// `Some(why)` when this build has no decode path: the serve block is
+    /// CFIE-active, but a `generate()` call must be refused at compile
+    /// time with this reason (the other fields are then unused).
+    pub refusal: Option<String>,
     pub max_new_tokens: i64,
     pub eos_token_id: i64,
+    /// The `sampling: seed:` value (default 0).  The runtime keys each
+    /// request's draws by it, the request's index and the position.
+    pub rng_seed: i64,
     /// FALLBACK prompt token count baked at serve init (host i64 array
     /// length) — used when `prompt_len_val` is `None`.
     pub prompt_len: i64,
@@ -356,8 +365,8 @@ impl Compiler<'_> {
         // Extract CFIE config from the serve block, resolve the mode
         // (CLI --cfie > @cfie decorator > implicit via CFIE keys), run
         // the orchestrator, and surface the build report.  The plan
-        // drives the report, the request-ring + KV-slot init calls, and
-        // the Cycle-6 kernel registration/finalize emission — the
+        // drives the report, the KV-slot init call, and the kernel
+        // registration/finalize emission — the
         // report must know the path up front because the disaggregated
         // branch emits NONE of that runtime wiring.
         let cfie_init = self.run_cfie_for_serve(serve, is_disaggregated)?;
@@ -394,15 +403,10 @@ impl Compiler<'_> {
             // inactive or the decode path was not wired.
             let mut cfie_prompt_ptr: Option<cranelift_codegen::ir::Value> = None;
 
-            // CFIE: size the continuous-batching request ring and the
-            // KV sequence-slot free-list from the compile-time plan
-            // (audit gaps G5/G8 — the runtime FFIs are now reachable
-            // from emitted code).  Monolithic path only; the
-            // disaggregated workers keep their M41 queueing until the
-            // persistent decode kernel lands (G16).
+            // CFIE: size the KV sequence-slot free-list from the
+            // compile-time plan.  Monolithic path only; the
+            // disaggregated workers keep their M41 queueing.
             if let Some(init) = &cfie_init {
-                let v_capacity = builder.ins().iconst(cl_types::I64, init.ring_capacity);
-                self.compile_call_by_name(builder, "nsl_cfie_ring_init", &[v_capacity])?;
                 if let Some((slot_count, per_slot_tokens)) = init.kv_slots {
                     let v_slots = builder.ins().iconst(cl_types::I64, slot_count);
                     let v_tokens = builder.ins().iconst(cl_types::I64, per_slot_tokens);
@@ -412,13 +416,12 @@ impl Compiler<'_> {
                         &[v_slots, v_tokens],
                     )?;
                 }
-                // CFIE Cycle 6: register the compiled kernel family,
-                // allocate the device KV pool, and finalize the engine
-                // (one cuModuleLoadData + cuModuleGetFunction per
-                // kernel) before any endpoint body runs.  Return values
-                // are intentionally ignored — the runtime warns on
-                // stderr and every launch FFI refuses cleanly (-1) when
-                // finalize did not succeed.
+                // Register the compiled kernels, allocate the device KV
+                // pool, and finalize the engine (one cuModuleLoadData +
+                // cuModuleGetFunction per kernel) before any endpoint
+                // body runs.  Return values are intentionally ignored —
+                // the runtime warns on stderr and every launch FFI
+                // refuses cleanly (-1) when finalize did not succeed.
                 if !init.kernels.is_empty() {
                     let scope = cfie_label_scope(self.resolve_sym(serve.name));
                     for reg in &init.kernels {
@@ -443,8 +446,10 @@ impl Compiler<'_> {
                     let scope = cfie_label_scope(self.resolve_sym(serve.name));
                     let wired = self.emit_cfie_endpoint_init(builder, &scope, ep)?;
                     self.bus.publish_cfie_serve_gen(CfieServeGen {
+                        refusal: None,
                         max_new_tokens: ep.max_new_tokens,
                         eos_token_id: ep.eos_token_id,
+                        rng_seed: ep.rng_seed,
                         prompt_len: ep.prompt_tokens.len() as i64,
                         prompt_len_val: wired.prompt_len_val,
                         tok_handle: wired.tok_handle,
@@ -453,6 +458,20 @@ impl Compiler<'_> {
                         speculative_k: ep.draft.as_ref().map(|d| d.k_tokens as i64),
                     });
                     cfie_prompt_ptr = Some(wired.prompt_ptr);
+                } else if let Some(why) = init.generate_refusal.clone() {
+                    // CFIE is active but the decode path is not in the
+                    // build: a `generate()` in an endpoint body is a
+                    // compile error that says why.
+                    self.bus.publish_cfie_serve_gen(CfieServeGen {
+                        refusal: Some(why),
+                        max_new_tokens: 0,
+                        eos_token_id: -1,
+                        rng_seed: 0,
+                        prompt_len: 0,
+                        prompt_len_val: None,
+                        tok_handle: None,
+                        speculative_k: None,
+                    });
                 }
             }
 
@@ -515,19 +534,14 @@ impl Compiler<'_> {
     /// PR #251 missing-NUL precedent); the registered lengths EXCLUDE
     /// the NUL per the frozen ABI.  Data labels follow the contract,
     /// scoped by serve-block name so two CFIE-active serve blocks don't
-    /// collide: `__nsl_cfie_{ptx,name}_{scope}_{kind}` (`_l{N}` suffix
-    /// for kind 5).
+    /// collide: `__nsl_cfie_{ptx,name}_{scope}_{kind}`.
     fn emit_cfie_register_kernel(
         &mut self,
         builder: &mut FunctionBuilder,
         label_scope: &str,
         reg: &crate::cfie::CfieKernelReg,
     ) -> Result<(), CodegenError> {
-        let suffix = if reg.kind == 5 {
-            format!("{label_scope}_{}_l{}", reg.kind, reg.layer_idx)
-        } else {
-            format!("{label_scope}_{}", reg.kind)
-        };
+        let suffix = format!("{label_scope}_{}", reg.kind);
 
         let (ptx_bytes, ptx_len) = cfie_nul_terminated(&reg.ptx);
         let ptx_id = embed_cfie_bytes(
@@ -775,7 +789,7 @@ impl Compiler<'_> {
     /// the `nsl_cfie_*` init FFIs, or `None` when CFIE is not active.
     ///
     /// `is_disaggregated`: the disaggregated serve branch emits NONE of
-    /// the CFIE runtime wiring (ring/slots/registration/finalize) — the
+    /// the CFIE runtime wiring (slots/registration/finalize) — the
     /// report must say so instead of claiming monolithic wiring.
     fn run_cfie_for_serve(
         &mut self,
@@ -827,69 +841,66 @@ impl Compiler<'_> {
         let prepared = crate::cfie_serve::prepare(&cfg, mode, gpu, weights)?;
         let mut plan = crate::cfie::run(prepared.input);
 
-        // Feature 1 (G7): emit the direct-indexing decode-attention
-        // kernel when the plan selected a static layout and the v1
-        // emitter's preconditions hold.  Precondition misses downgrade
-        // to a report note, not a build failure — the paged path stays
-        // available.
-        let mut kv_slots: Option<(i64, i64)> = None;
-        if plan.kv.uses_direct_indexing() {
-            let per_slot = plan
-                .kv
-                .direct
-                .as_ref()
-                .map(|d| d.per_sequence_max_tokens)
-                .unwrap_or(0);
-            let max_slots = plan.persistent.scheduler.max_active;
-            let attn_cfg = crate::cfie_decode_attention::DecodeAttentionConfig {
-                n_layers: prepared.shape.n_layers,
-                n_heads: prepared.shape.n_heads,
-                n_kv_heads: prepared.shape.n_kv_heads,
-                head_dim: prepared.shape.head_dim,
-                per_slot_max_tokens: per_slot,
-                max_slots,
-                kv_dtype_bytes: 2,
-            };
-            let supported = prepared.shape.head_dim <= 128
-                && prepared.shape.n_heads % prepared.shape.n_kv_heads.max(1) == 0
-                && per_slot >= 1
-                && max_slots >= 1
-                && (max_slots as u64) * (per_slot as u64) <= u32::MAX as u64;
-            if supported {
-                let (ptx, meta) = crate::cfie_decode_attention::emit(&attn_cfg);
-                plan.decode_attention_launch = Some(crate::cfie::CfieLaunchSpec {
-                    grid_x: if meta.grid_dim_is_n_heads {
-                        prepared.shape.n_heads
-                    } else {
-                        1
-                    },
-                    block_x: meta.block_dim,
-                    smem_dyn_bytes: 0,
-                });
-                plan.decode_attention_kernel = Some(meta.kernel_name);
-                plan.decode_attention_ptx = Some(ptx);
-                kv_slots = Some((max_slots as i64, per_slot as i64));
+        // The `kv_layout` key is honoured, not just used to switch CFIE
+        // on: "paged" forces the paged plan, and "static" with an
+        // envelope that does not fit is an error rather than a build
+        // whose pool is larger than the card.
+        match cfg.kv_layout.as_deref() {
+            Some("paged") => {
+                plan.kv = crate::cfie_kv_plan::KvLayoutPlan::paged(
+                    plan.kv.available_bytes,
+                    "kv_layout: \"paged\" was requested",
+                );
             }
+            Some("static") if !plan.kv.uses_direct_indexing() => {
+                return Err(CodegenError::new(format!(
+                    "CFIE kv_layout: \"static\" cannot be honoured on {}: {}. Lower max_batch \
+                     or max_seq, or use kv_layout: \"auto\" (which then plans the paged \
+                     layout, without the compiled decode path).",
+                    gpu.name, plan.kv.rationale
+                )));
+            }
+            _ => {}
         }
 
-        // Feature 4 (G16): emit the persistent decode-block kernel only
-        // when the planner sustained full Level-3 block fusion — the
-        // paper's whole-layer claim; Level1/2 stay plan-level with the
-        // honest report note — AND the same static-layout preconditions
-        // as the decode-attention kernel hold (the block appends into
-        // the same baked KV pool that kernel reads).
-        if plan.persistent.fusion == crate::cfie_persistent::FusionLevel::Level3
-            && plan.kv.uses_direct_indexing()
-        {
-            let per_slot = plan
-                .kv
-                .direct
-                .as_ref()
-                .map(|d| d.per_sequence_max_tokens)
-                .unwrap_or(0);
-            let max_slots = plan.persistent.scheduler.max_active;
-            let s = &prepared.shape;
-            let supported = s.head_dim >= 2
+        let s = &prepared.shape;
+        let per_slot = plan
+            .kv
+            .direct
+            .as_ref()
+            .map(|d| d.per_sequence_max_tokens)
+            .unwrap_or(0);
+        let max_slots = plan.persistent.scheduler.max_active;
+        // Serve keys with the common-architecture defaults; a model with
+        // a different RoPE base (e.g. 500000) or norm epsilon MUST set
+        // them or the baked constants are numerically wrong.  Every
+        // kernel that normalises takes the same epsilon.
+        let rope_theta = cfg.rope_theta.unwrap_or(10_000.0) as f32;
+        let norm_eps = cfg
+            .norm_eps
+            .map(|e| e as f32)
+            .unwrap_or(crate::cfie_sample_ptx::DEFAULT_NORM_EPS);
+
+        // The decode block: one launch runs one layer's decode step for
+        // one token.  It needs the static KV pool it appends to, the
+        // planner's whole-layer fusion verdict, the emitter's shape
+        // preconditions, and a static shared-memory footprint one thread
+        // block may declare.  A miss is recorded with its reason; the
+        // report prints it and `generate()` refuses with it.
+        plan.decode_block = if !plan.kv.uses_direct_indexing() {
+            crate::cfie::CfieKernel::refused(format!(
+                "the KV layout is paged ({}), and the decode block addresses a static pool",
+                plan.kv.rationale
+            ))
+        } else if plan.persistent.fusion != crate::cfie_persistent::FusionLevel::Level3 {
+            crate::cfie::CfieKernel::refused(format!(
+                "the planner's fusion level is {} (the whole-layer kernel does not fit the \
+                 target GPU's shared-memory budget), and only the whole-layer kernel has an \
+                 emitter",
+                plan.persistent.fusion.as_str()
+            ))
+        } else {
+            let shape_ok = s.head_dim >= 2
                 && s.head_dim % 2 == 0
                 && s.head_dim <= 128
                 && s.d_model >= 1
@@ -897,11 +908,19 @@ impl Compiler<'_> {
                 && s.d_ff >= 1
                 && s.d_ff <= 32768
                 && s.n_heads % s.n_kv_heads.max(1) == 0
-                && s.n_heads * s.head_dim <= 8192
+                && (s.n_heads as u64) * (s.head_dim as u64) <= 8192
                 && per_slot >= 1
                 && max_slots >= 1
                 && (max_slots as u64) * (per_slot as u64) <= u32::MAX as u64;
-            if supported {
+            if !shape_ok {
+                crate::cfie::CfieKernel::refused(format!(
+                    "the model shape is outside what the kernel supports (head_dim {} even \
+                     in 2..=128, d_model {} <= 8192, d_ff {} <= 32768, n_heads {} divisible \
+                     by n_kv_heads {}, n_heads*head_dim <= 8192, max_batch*max_seq below \
+                     2^32)",
+                    s.head_dim, s.d_model, s.d_ff, s.n_heads, s.n_kv_heads
+                ))
+            } else {
                 let blk_cfg = crate::cfie_persistent_ptx::DecodeBlockConfig {
                     d_model: s.d_model,
                     head_dim: s.head_dim,
@@ -911,321 +930,107 @@ impl Compiler<'_> {
                     per_slot_max_tokens: per_slot,
                     max_slots,
                     n_layers: s.n_layers,
-                    // Serve keys with the common-architecture defaults;
-                    // a model with a different RoPE base (e.g. 500000)
-                    // or norm epsilon MUST set them or the baked
-                    // constants are numerically wrong.
-                    rope_theta: cfg.rope_theta.unwrap_or(10_000.0) as f32,
-                    eps: cfg.norm_eps.unwrap_or(1e-5) as f32,
+                    rope_theta,
+                    eps: norm_eps,
                 };
                 // Static .shared declarations are capped at 48 KB per
-                // CTA; a bigger footprint would fail module load (and the
-                // KIR verifier refuses to build it), so downgrade to
-                // plan-level instead of emitting.
-                if crate::cfie_persistent_ptx::smem_bytes(&blk_cfg) <= 48 * 1024 {
+                // thread block; a bigger footprint would fail module
+                // load (and the KIR verifier refuses to build it).
+                let smem = crate::cfie_persistent_ptx::smem_bytes(&blk_cfg);
+                if smem > CFIE_STATIC_SMEM_LIMIT {
+                    crate::cfie::CfieKernel::refused(format!(
+                        "its static shared memory would be {smem} bytes and one thread block \
+                         may declare at most {CFIE_STATIC_SMEM_LIMIT} (d_model {}, {} heads of \
+                         {}): this model is too wide for the one-block kernel",
+                        s.d_model, s.n_heads, s.head_dim
+                    ))
+                } else {
                     let (ptx, meta) = crate::cfie_persistent_ptx::emit(&blk_cfg);
-                    // Persistent block: ONE CTA runs one layer's decode
-                    // step (grid = 1 by construction, see emitter doc).
-                    plan.decode_block_launch = Some(crate::cfie::CfieLaunchSpec {
-                        grid_x: 1,
-                        block_x: meta.block_dim,
-                        smem_dyn_bytes: 0,
-                    });
-                    plan.decode_block_kernel = Some(meta.kernel_name);
-                    plan.decode_block_ptx = Some(ptx);
+                    crate::cfie::CfieKernel::emitted(
+                        meta.kernel_name,
+                        ptx,
+                        crate::cfie::CfieLaunchSpec {
+                            grid_x: 1,
+                            block_x: meta.block_dim,
+                            smem_dyn_bytes: 0,
+                        },
+                    )
                 }
             }
-        }
+        };
 
-        // Feature 3 (G13/G14): emit the compiled speculative
-        // verification kernels — tree-mask verify attention (each node
-        // row's ancestor mask a baked u64 immediate; no mask tensor
-        // parameter) + rejection-sampling epilogue.  Requires the same
-        // static direct-index KV pool the decode kernels bake: the
-        // verify kernel reads draft rows the host appends at
-        // seq_len..seq_len+num_nodes, and the host rolls rejected rows
-        // back via nsl_cfie_kv_slot_rollback.  Non-tree methods verify
-        // a linear K+1 chain (a width-1 tree mask).
-        let spec_inputs = plan.speculative.as_ref().map(|spec| {
-            let mask = match spec.tree_mask.as_ref() {
-                Some(m) => m.clone(),
-                None => crate::cfie_speculative::build_tree_mask(spec.config.k_tokens + 1, 1),
-            };
-            (mask, spec.config.k_tokens)
-        });
-        if let Some((mask, k_tokens)) = spec_inputs
-            && plan.kv.uses_direct_indexing()
-        {
-            let per_slot = plan
-                .kv
-                .direct
-                .as_ref()
-                .map(|d| d.per_sequence_max_tokens)
-                .unwrap_or(0);
-            let max_slots = plan.persistent.scheduler.max_active;
-            let s = &prepared.shape;
-            let num_nodes = mask.num_nodes;
-            let supported = s.head_dim >= 1
-                && s.head_dim <= 128
-                && s.n_heads % s.n_kv_heads.max(1) == 0
-                && (1..=33).contains(&num_nodes)
-                && per_slot >= num_nodes
-                && max_slots >= 1
-                && (max_slots as u64) * (per_slot as u64) <= u32::MAX as u64
-                && k_tokens >= 1
-                && (k_tokens as u64) * (s.vocab_size as u64) <= u32::MAX as u64;
-            if supported {
-                let verify_cfg = crate::cfie_speculative_ptx::VerifyAttentionConfig {
-                    n_heads: s.n_heads,
-                    n_kv_heads: s.n_kv_heads,
-                    head_dim: s.head_dim,
-                    per_slot_max_tokens: per_slot,
-                    max_slots,
-                    num_nodes,
-                    mask_bits: crate::cfie_speculative_ptx::mask_bits_from_tree(&mask),
-                };
-                let (vptx, vmeta) =
-                    crate::cfie_speculative_ptx::emit_verify_attention(&verify_cfg);
-                let reject_cfg = crate::cfie_speculative_ptx::RejectionConfig {
-                    k_tokens,
-                    vocab_size: s.vocab_size,
-                };
-                let (rptx, rmeta) =
-                    crate::cfie_speculative_ptx::emit_rejection_kernel(&reject_cfg);
-                plan.spec_verify_launch = Some(crate::cfie::CfieLaunchSpec {
-                    grid_x: if vmeta.grid_dim_is_n_heads { s.n_heads } else { 1 },
-                    block_x: vmeta.block_dim,
-                    smem_dyn_bytes: 0,
-                });
-                plan.spec_reject_launch = Some(crate::cfie::CfieLaunchSpec {
-                    grid_x: if rmeta.grid_dim_is_n_heads { s.n_heads } else { 1 },
-                    block_x: rmeta.block_dim,
-                    smem_dyn_bytes: 0,
-                });
-                plan.spec_verify_kernel = Some(vmeta.kernel_name);
-                plan.spec_verify_ptx = Some(vptx);
-                plan.spec_reject_kernel = Some(rmeta.kernel_name);
-                plan.spec_reject_ptx = Some(rptx);
-            }
-        }
-
-        // Feature 6 (G11): bake the grammar's valid-token bitmask into
-        // the module image as an initialized .global — the data is a
-        // compile-time constant; the decode loop binds its device
-        // address to the sampler's grammar_mask_ptr param (G16).
-        if let Some(dfa) = plan.grammar.as_ref() {
-            plan.grammar_mask_ptx = Some(crate::cfie_grammar_ptx::emit_mask_global(dfa));
-        }
-
-        // Feature 5 (G18): per-layer decode-attention kernels with the
-        // KV-quant plan's precision baked into each layer's load path.
-        // Emitted only when the plan mixes in INT8 (an all-FP16 plan is
-        // exactly the base kernel) and every decision is FP16/INT8 (the
-        // v1 emitter refuses INT4/BF16).  This family bakes the
-        // mixed-precision pool layout, which differs from the uniform
-        // f16 pool the base/block/verify kernels assume — the decode
-        // loop picks ONE family per build at integration time.
-        let mut quant_pool_bytes: Option<i64> = None;
-        if plan.kv.uses_direct_indexing() && !plan.kv_quant.layers.is_empty() {
-            use crate::cfie_kv_quant::KvPrecision;
-            let s = &prepared.shape;
-            let precisions: Vec<(KvPrecision, KvPrecision)> = plan
-                .kv_quant
-                .layers
-                .iter()
-                .map(|l| (l.k_precision, l.v_precision))
-                .collect();
-            let all_supported = precisions.iter().all(|(k, v)| {
-                matches!(k, KvPrecision::Fp16 | KvPrecision::Int8)
-                    && matches!(v, KvPrecision::Fp16 | KvPrecision::Int8)
-            });
-            let any_int8 = precisions.iter().any(|(k, v)| {
-                matches!(k, KvPrecision::Int8) || matches!(v, KvPrecision::Int8)
-            });
-            let per_slot = plan
-                .kv
-                .direct
-                .as_ref()
-                .map(|d| d.per_sequence_max_tokens)
-                .unwrap_or(0);
-            let max_slots = plan.persistent.scheduler.max_active;
-            let supported = all_supported
-                && any_int8
-                && precisions.len() as u32 == s.n_layers
-                && s.head_dim >= 1
-                && s.head_dim <= 128
-                && s.n_heads % s.n_kv_heads.max(1) == 0
-                && per_slot >= 1
-                && max_slots >= 1
-                && (max_slots as u64) * (per_slot as u64) <= u32::MAX as u64;
-            if supported {
-                let qcfg = crate::cfie_kv_quant_ptx::QuantDecodeAttentionConfig {
-                    n_layers: s.n_layers,
-                    n_heads: s.n_heads,
-                    n_kv_heads: s.n_kv_heads,
-                    head_dim: s.head_dim,
-                    per_slot_max_tokens: per_slot,
-                    max_slots,
-                    layer_precisions: precisions,
-                };
-                // Mixed-precision pool sizing (Cycle 6): when this
-                // family wins registration, the device pool is sized
-                // by the quant layout, not the uniform-f16 formula.
-                quant_pool_bytes =
-                    Some(crate::cfie_kv_quant_ptx::total_pool_bytes(&qcfg) as i64);
-                let kernels = crate::cfie_kv_quant_ptx::emit_all(&qcfg);
-                if let Some((_, meta0)) = kernels.first() {
-                    // All layer kernels share one launch shape (same
-                    // flash-decode scheme as the base kernel).
-                    plan.quant_attention_launch = Some(crate::cfie::CfieLaunchSpec {
-                        grid_x: if meta0.grid_dim_is_n_heads { s.n_heads } else { 1 },
-                        block_x: meta0.block_dim,
-                        smem_dyn_bytes: 0,
-                    });
-                }
-                plan.quant_attention_kernels = kernels
-                    .into_iter()
-                    .map(|(ptx, meta)| (meta.kernel_name, ptx))
-                    .collect();
-            }
-        }
-
-        // Feature 2 (F2, Cycle 6): the fused decode-sample kernel —
-        // kernel kind 1, registered in BOTH families; the host decode
-        // loop (nsl_cfie_decode_step) launches it on the final hidden
-        // state.  Preconditions mirror the emitter's asserts, F1-style
-        // (miss => skip + report note, never a build failure): d_model
-        // 1..=8192 (hidden staged in static SMEM), vocab_size a
-        // positive multiple of the 128-wide tile (thread t owns row
-        // tile_base+t), top_k 1..=64 (serial SMEM candidate list).
-        // The plan's sampler program bakes vocab_tile 256 (the
-        // HBM-accounting default from `prepare`); the kernel tile is
-        // fixed at 128, so re-emit the program against the kernel tile
-        // with the SAME params (incl. grammar_masked).
-        let mut fused_sample_note: Option<String> = None;
-        if plan.sampling.is_fused() {
-            let s = &prepared.shape;
+        // The fused decode-sample kernel, launched by the host decode
+        // loop (nsl_cfie_decode_step) on the final hidden state.  The
+        // plan's sampler program bakes vocab_tile 256 (the accounting
+        // default from `prepare`); the kernel tile is fixed at 128, so
+        // the program is re-emitted against the kernel tile with the
+        // same parameters.
+        plan.fused_sample = {
             let top_k = plan.sampling.params.top_k;
             let supported = s.d_model >= 1
                 && s.d_model <= 8192
                 && s.vocab_size >= 128
                 && s.vocab_size % 128 == 0
                 && (1..=64).contains(&top_k);
-            if supported {
+            if !supported {
+                crate::cfie::CfieKernel::refused(format!(
+                    "the kernel needs d_model in 1..=8192 (is {}), a vocab_size that is a \
+                     positive multiple of 128 (is {}) and top_k in 1..=64 (is {})",
+                    s.d_model, s.vocab_size, top_k
+                ))
+            } else {
                 let shape128 = crate::cfie_fused_sample::LmHeadShape {
                     vocab_tile: 128,
                     ..plan.sampling.shape
                 };
                 let program =
                     crate::cfie_fused_sample::emit_program(plan.sampling.params, shape128);
-                // DFA state count sizes the grammar hook's comment and
-                // gates its emission; 0 = no grammar hook.
-                let grammar_states =
-                    plan.grammar.as_ref().map(|d| d.num_states).unwrap_or(0);
                 let sample_cfg = crate::cfie_sample_ptx::FusedSampleKernelConfig {
                     d_model: s.d_model,
                     vocab_size: s.vocab_size,
                     vocab_tile: 128,
                     top_k,
-                    grammar_states,
+                    // No grammar is ever bound: a `grammar:` section is
+                    // refused (cfie_serve::prepare).
+                    grammar_states: 0,
+                    norm_eps,
                 };
                 let (ptx, meta) = crate::cfie_sample_ptx::emit(&program, &sample_cfg);
-                // Splice the baked mask .global into the sampler module
-                // so the host can cuModuleGetGlobal it at finalize.
-                let ptx = match plan.grammar_mask_ptx.as_ref() {
-                    Some(mask) => {
-                        crate::cfie_grammar_ptx::splice_mask_into_module(&ptx, mask)
-                    }
-                    None => ptx,
-                };
-                plan.fused_sample_launch = Some(crate::cfie::CfieLaunchSpec {
-                    grid_x: 1, // single-CTA latency path
-                    block_x: meta.block_dim,
-                    smem_dyn_bytes: 0,
-                });
-                plan.fused_sample_kernel = Some(meta.kernel_name);
-                plan.fused_sample_ptx = Some(ptx);
-            } else {
-                fused_sample_note = Some(format!(
-                    "note: fused-sample kernel skipped (preconditions: d_model {} \
-                     in 1..=8192, vocab_size {} a positive multiple of 128, \
-                     top_k {} in 1..=64)\n",
-                    s.d_model, s.vocab_size, top_k
-                ));
+                crate::cfie::CfieKernel::emitted(
+                    meta.kernel_name,
+                    ptx,
+                    crate::cfie::CfieLaunchSpec {
+                        grid_x: 1, // single-CTA latency path
+                        block_x: meta.block_dim,
+                        smem_dyn_bytes: 0,
+                    },
+                )
             }
-        }
+        };
 
-        // CFIE Cycle 13 (G15 draft-model-in-binary): when the
-        // speculative section names `draft_weights`, emit the DRAFT
-        // decode block (kind 6 — the existing cfie_persistent_ptx
-        // emitter with the draft dims, max_slots = 1, per-slot capacity
-        // = the TARGET's per the engine's draft-pool sizing contract)
-        // plus the two sampler-family kernels (kind 7 draft greedy
-        // sampler over the DRAFT head, kind 8 target prob-row writer),
-        // and record the resolved draft info that drives the serve-init
-        // binding + the generate() -> speculative_generate rewrite.
-        // Misconfiguration REFUSES loudly (deferral-must-refuse): a
-        // configured draft that silently failed to wire would produce a
-        // binary whose generate() refuses at runtime with no compile-
-        // time hint.  This block runs after the Feature-3/4/2 emissions
-        // because it requires kinds 1/2/4 wired.
-        if let Some(draft_path) = cfg
-            .speculative
-            .as_ref()
-            .and_then(|sp| sp.draft_weights.clone())
+        // The draft model of a `speculative:` section: its decode block
+        // (the same emitter with the draft dims, max_slots = 1, per-slot
+        // capacity = the TARGET's per the engine's draft-pool sizing
+        // contract) and its greedy sampler, plus the resolved draft info
+        // that drives the serve-init binding and the generate() ->
+        // speculative_generate rewrite.  A section that cannot be wired
+        // is an error: it would otherwise build a binary whose
+        // generate() ran plain decoding, or refused, with no hint.
+        if let (Some(spec_cfg), Some(sp_sec)) = (plan.speculative.clone(), cfg.speculative.as_ref())
         {
-            let refuse = |what: &str| {
+            let draft_path = sp_sec.draft_weights.clone().unwrap_or_default();
+            let refuse = |what: String| {
                 Err(CodegenError::new(format!(
-                    "CFIE speculative draft_weights ('{draft_path}'): {what} — \
-                     the compiled speculative driver \
-                     (nsl_cfie_speculative_generate) cannot be wired. Fix the \
-                     serve config or remove draft_weights."
+                    "CFIE speculative (draft_weights '{draft_path}'): {what}. Fix the serve \
+                     config or remove the speculative: section."
                 )))
             };
-            if plan.decode_block_ptx.is_none() {
-                return refuse(
-                    "the persistent decode block (kind 2) was not emitted \
-                     (requires a static KV layout + Level-3 fusion + block \
-                     preconditions); the target verify chain runs on kind 2",
-                );
+            if let Some(why) = plan.generate_unavailable() {
+                return refuse(format!(
+                    "the speculative driver verifies with the target's decode block and \
+                     fused sampler, and {why}"
+                ));
             }
-            if plan.fused_sample_ptx.is_none() {
-                return refuse(
-                    "the fused sampler (kind 1) was not emitted (requires \
-                     sampling: fused + vocab_size a positive multiple of 128, \
-                     d_model <= 8192, top_k 1..=64); the driver's prefill/bonus \
-                     steps sample through kind 1",
-                );
-            }
-            if plan.spec_reject_ptx.is_none() || plan.spec_reject_launch.is_none() {
-                return refuse(
-                    "the rejection kernel (kind 4) was not emitted (requires \
-                     a speculative plan + static KV layout + K*vocab within \
-                     u32); the driver's accept/reject step is one kind-4 launch",
-                );
-            }
-            if !plan.quant_attention_kernels.is_empty() {
-                return refuse(
-                    "the QUANT kernel family won registration (kv_quant mixed \
-                     INT8 in), which excludes the kind-2 decode block the \
-                     verify chain needs; use kv_quant: \"uniform_fp16\"",
-                );
-            }
-            let spec_cfg = match plan.speculative.as_ref() {
-                Some(sp) => &sp.config,
-                None => {
-                    return refuse("no speculative plan (mode must plan speculative)");
-                }
-            };
-            if spec_cfg.method != crate::cfie_speculative::DraftMethod::Standard {
-                return refuse(
-                    "the v1 speculative driver drafts a LINEAR K-token chain \
-                     (method \"standard\"); tree/medusa/lookahead drafting is \
-                     not wired into nsl_cfie_speculative_generate",
-                );
-            }
-            let s = &prepared.shape;
-            let sp_sec = cfg.speculative.as_ref().expect("draft_weights implies section");
             // Draft dims: explicit draft_* keys, defaulting to the
             // TARGET's resolved values (self-speculation shape).  A
             // mismatch against the actual checkpoint refuses loudly at
@@ -1242,26 +1047,20 @@ impl Compiler<'_> {
             let dn_kv = pick(sp_sec.draft_n_kv_heads, s.n_kv_heads);
             let dhead = pick(sp_sec.draft_head_dim, s.head_dim);
             let dd_ff = pick(sp_sec.draft_d_ff, s.d_ff);
-            let per_slot = plan
-                .kv
-                .direct
-                .as_ref()
-                .map(|d| d.per_sequence_max_tokens)
-                .unwrap_or(0);
             let draft_ok = dhead >= 2
                 && dhead % 2 == 0
                 && dhead <= 128
                 && (1..=8192).contains(&dd_model)
                 && (1..=32768).contains(&dd_ff)
                 && dn_heads % dn_kv.max(1) == 0
-                && dn_heads * dhead <= 8192
+                && (dn_heads as u64) * (dhead as u64) <= 8192
                 && per_slot >= 1;
             if !draft_ok {
                 return refuse(
-                    "the draft dims fail the decode-block emitter \
-                     preconditions (head_dim even in 2..=128, d_model <= 8192, \
-                     d_ff <= 32768, n_heads divisible by n_kv_heads, \
-                     n_heads*head_dim <= 8192, static per-slot capacity >= 1)",
+                    "the draft dims fail the decode-block emitter preconditions (head_dim \
+                     even in 2..=128, d_model <= 8192, d_ff <= 32768, n_heads divisible by \
+                     n_kv_heads, n_heads*head_dim <= 8192, static per-slot capacity >= 1)"
+                        .to_string(),
                 );
             }
             let draft_blk_cfg = crate::cfie_persistent_ptx::DecodeBlockConfig {
@@ -1276,59 +1075,36 @@ impl Compiler<'_> {
                 per_slot_max_tokens: per_slot,
                 max_slots: 1,
                 n_layers: dn_layers,
-                rope_theta: cfg.rope_theta.unwrap_or(10_000.0) as f32,
-                eps: cfg.norm_eps.unwrap_or(1e-5) as f32,
+                rope_theta,
+                eps: norm_eps,
             };
-            if crate::cfie_persistent_ptx::smem_bytes(&draft_blk_cfg) > 48 * 1024 {
-                return refuse(
-                    "the draft decode block's static .shared footprint exceeds \
-                     the 48 KB per-CTA cap (shrink draft d_model/d_ff/head_dim)",
-                );
+            if crate::cfie_persistent_ptx::smem_bytes(&draft_blk_cfg) > CFIE_STATIC_SMEM_LIMIT {
+                return refuse(format!(
+                    "the draft decode block's static shared memory exceeds the \
+                     {CFIE_STATIC_SMEM_LIMIT}-byte limit of one thread block (shrink draft \
+                     d_model/d_ff/head_dim)"
+                ));
             }
             let (dptx, dmeta) = crate::cfie_persistent_ptx::emit(&draft_blk_cfg);
-            let sampler7_cfg = crate::cfie_spec_sampler_ptx::SpecSamplerConfig {
+            let sampler_cfg = crate::cfie_spec_sampler_ptx::SpecSamplerConfig {
                 d_model: dd_model,
                 vocab_size: s.vocab_size, // shared vocab
                 vocab_tile: 128,
+                norm_eps,
             };
-            let (sptx7, smeta7) =
-                crate::cfie_spec_sampler_ptx::emit_draft_sample(&sampler7_cfg);
-            let sampler8_cfg = crate::cfie_spec_sampler_ptx::SpecSamplerConfig {
-                d_model: s.d_model, // TARGET head
-                vocab_size: s.vocab_size,
-                vocab_tile: 128,
+            let (sptx, smeta) = crate::cfie_spec_sampler_ptx::emit_draft_sample(&sampler_cfg);
+            let one_block = |block_x: u32| crate::cfie::CfieLaunchSpec {
+                grid_x: 1,
+                block_x,
+                smem_dyn_bytes: 0,
             };
-            let (sptx8, smeta8) =
-                crate::cfie_spec_sampler_ptx::emit_verify_probs(&sampler8_cfg);
-
-            plan.draft_block_launch = Some(crate::cfie::CfieLaunchSpec {
-                grid_x: 1,
-                block_x: dmeta.block_dim,
-                smem_dyn_bytes: 0,
-            });
-            plan.draft_block_kernel = Some(dmeta.kernel_name);
-            plan.draft_block_ptx = Some(dptx);
-            plan.draft_sample_launch = Some(crate::cfie::CfieLaunchSpec {
-                grid_x: 1,
-                block_x: smeta7.block_dim,
-                smem_dyn_bytes: 0,
-            });
-            plan.draft_sample_kernel = Some(smeta7.kernel_name);
-            plan.draft_sample_ptx = Some(sptx7);
-            plan.verify_probs_launch = Some(crate::cfie::CfieLaunchSpec {
-                grid_x: 1,
-                block_x: smeta8.block_dim,
-                smem_dyn_bytes: 0,
-            });
-            plan.verify_probs_kernel = Some(smeta8.kernel_name);
-            plan.verify_probs_ptx = Some(sptx8);
+            plan.draft_block =
+                crate::cfie::CfieKernel::emitted(dmeta.kernel_name, dptx, one_block(dmeta.block_dim));
+            plan.draft_sample =
+                crate::cfie::CfieKernel::emitted(smeta.kernel_name, sptx, one_block(smeta.block_dim));
             // Draft KV pool: [n_layers][2][1 * per_slot][n_kv][hd] f16.
-            let pool_bytes = (dn_layers as i64)
-                * 2
-                * (per_slot as i64)
-                * (dn_kv as i64)
-                * (dhead as i64)
-                * 2;
+            let pool_bytes =
+                (dn_layers as i64) * 2 * (per_slot as i64) * (dn_kv as i64) * (dhead as i64) * 2;
             plan.speculative_draft = Some(crate::cfie::CfieSpeculativeDraft {
                 weights_path: draft_path,
                 n_layers: dn_layers,
@@ -1344,67 +1120,31 @@ impl Compiler<'_> {
             });
         }
 
-        // G22: estimated decode latency + throughput from the explicit
-        // roofline cost model.  Computed here because this is the only
-        // point with the resolved model shape, the weights precision, the
-        // per-layer KV-quant plan, and the GPU spec all in scope.  The
-        // baseline KV footprint is the plan's uniform-FP16 count when the
-        // quant pass ran (Full mode); otherwise a shape-derived fallback.
-        {
-            let s = &prepared.shape;
-            let baseline_kv_stored = if plan.kv_quant.bytes_per_token_uniform_fp16 > 0 {
-                plan.kv_quant.bytes_per_token_uniform_fp16
-            } else {
-                // Uniform FP16 KV per stored token across all layers:
-                // 2 (K+V) * n_kv_heads * head_dim * 2 bytes * n_layers.
-                2 * (s.n_kv_heads as u64) * (s.head_dim as u64) * 2 * (s.n_layers as u64)
-            };
-            let cost_inputs = crate::cfie_cost::CostModelInputs {
-                n_layers: s.n_layers,
-                n_heads: s.n_heads,
-                n_kv_heads: s.n_kv_heads,
-                head_dim: s.head_dim,
-                d_model: s.d_model,
-                d_ff: s.d_ff,
-                vocab_size: s.vocab_size,
-                weight_dtype_bytes: s.dtype_bytes,
-                cfie_launches_per_token: plan.kernel_launches_per_token_cfie,
-                baseline_launches_per_token: plan.kernel_launches_per_token_baseline,
-                kv_quant: &plan.kv_quant,
-                baseline_kv_bytes_per_stored_token: baseline_kv_stored,
-                max_seq: cfg.max_seq.unwrap_or(4096).max(1) as u32,
-                batch: plan.persistent.scheduler.max_active,
-                gpu,
-            };
-            plan.cost_estimate = Some(crate::cfie_cost::estimate(&cost_inputs));
-        }
-
-        // Build report: the paper's visible artifact (§8).  Provenance +
-        // wiring status keep it honest about what this build actually
-        // bakes into the binary.
+        // Build report: what this build bakes into the binary.
         plan.runtime_wiring_emitted = !is_disaggregated;
         let mut report = plan.render_report();
         report.push_str(&format!(
             "Model-shape provenance: {}\n",
             prepared.shape.provenance
         ));
-        if let Some(note) = fused_sample_note {
-            report.push_str(&note);
-        }
         if is_disaggregated {
             report.push_str(
                 "Kernel wiring: DISAGGREGATED serve — CFIE runtime wiring \
-                 (request ring, KV slots, kernel registration, engine \
-                 finalize) is NOT emitted on this path; the plan and \
-                 kernels above are report-only for this build \
-                 (monolithic serve gets the wiring).\n",
+                 (KV slots, kernel registration, engine finalize) is NOT \
+                 emitted on this path; the plan and kernels above are \
+                 report-only for this build (monolithic serve gets the \
+                 wiring).\n",
+            );
+        } else if plan.decode_path_emitted() {
+            report.push_str(
+                "Kernel wiring: KV-slot init + kernel registration + engine \
+                 finalize in this build; per-token launches go through the \
+                 host decode loop (nsl_cfie_decode_step).\n",
             );
         } else {
             report.push_str(
-                "Kernel wiring: plan + request-ring + KV-slot init + \
-                 kernel-family registration + engine finalize in this build; \
-                 per-token launches go through the host decode loop \
-                 (nsl_cfie_decode_step).\n",
+                "Kernel wiring: none in this build — the decode path is \
+                 incomplete, so no kernel is registered.\n",
             );
         }
         eprint!("{report}");
@@ -1417,41 +1157,30 @@ impl Compiler<'_> {
             );
         }
 
-        // Cycle 6: registration list for the compile-time-chosen family
-        // + KV pool sizing.  The pool allocates only when a KV-consuming
-        // kernel (kind 0/2/3/5) registers; the quant family sizes it
-        // from the mixed-precision layout, the uniform family from the
-        // f16 formula (both cover ALL layers of the baked pool).
+        // Registrations, the KV slot free-list and the device pool: all
+        // exist exactly when the decode path does (the decode block is
+        // the only kernel that reads or writes KV, and without the
+        // sampler nothing would drive it).  The pool is the uniform f16
+        // layout over ALL layers.
         let kernels = crate::cfie::kernel_registrations(&plan);
-        let has_kv_consumer = kernels.iter().any(|r| matches!(r.kind, 0 | 2 | 3 | 5));
-        let pool_bytes = if !has_kv_consumer {
-            None
-        } else {
-            match crate::cfie::choose_kernel_family(&plan) {
-                crate::cfie::CfieKernelFamily::Quant => quant_pool_bytes,
-                crate::cfie::CfieKernelFamily::Uniform => {
-                    kv_slots.map(|(slots, per_slot)| {
-                        let s = &prepared.shape;
-                        (s.n_layers as i64)
-                            * 2 // K + V halves
-                            * (slots * per_slot)
-                            * (s.n_kv_heads as i64)
-                            * (s.head_dim as i64)
-                            * 2 // f16 bytes
-                    })
-                }
-            }
-        };
+        let kv_slots = plan
+            .decode_path_emitted()
+            .then_some((max_slots as i64, per_slot as i64));
+        let pool_bytes = kv_slots.map(|(slots, per_slot)| {
+            (s.n_layers as i64)
+                * 2 // K + V halves
+                * (slots * per_slot)
+                * (s.n_kv_heads as i64)
+                * (s.head_dim as i64)
+                * 2 // f16 bytes
+        });
 
-        // Cycle 11: the endpoint's generation driver is wired ONLY when
-        // the decode path was actually emitted (kernels registered ->
-        // engine finalize will run -> nsl_cfie_generate can drive
-        // decode_step).  With no kernels the engine never finalizes, so
-        // emitting the binding + generate calls would produce a runtime
-        // that always refuses; instead leave `endpoint = None` so the
-        // `generate()` rewrite refuses at COMPILE time with a clear
-        // message (honest: no half-wired binary).
-        let endpoint = if kernels.is_empty() {
+        // The endpoint's generation driver is wired only when the decode
+        // path is in the build.  Otherwise `generate()` is a COMPILE
+        // error that says which kernel is missing and why: the runtime
+        // would refuse every call.
+        let generate_refusal = plan.generate_unavailable();
+        let endpoint = if generate_refusal.is_some() {
             None
         } else {
             // Weights: serve `weights:` key > `--weights` CLI path (the
@@ -1467,8 +1196,8 @@ impl Compiler<'_> {
             // `prompt:` is baked as byte-level token ids (the runtime
             // byte-tokenizer convention), clamped into [0, vocab_size) so
             // the runtime's per-token range guard passes; absent that, a
-            // single [0] sentinel keeps the body runnable.  Cycle 12:
-            // when `tokenizer:` is ALSO configured, serve init emits the
+            // single [0] sentinel keeps the body runnable.  When
+            // `tokenizer:` is ALSO configured, serve init emits the
             // runtime tokenizer encode (`nsl_tokenizer_encode` ->
             // `nsl_cfie_tensor_to_tokens`) and selects it over these
             // baked ids at runtime whenever it produces tokens.  A
@@ -1492,20 +1221,19 @@ impl Compiler<'_> {
                 shape: prepared.shape.clone(),
                 max_new_tokens: cfg.max_new_tokens.unwrap_or(64).max(1),
                 eos_token_id: cfg.eos_token_id.unwrap_or(-1),
-                // Cycle 13: present exactly when the kind-6/7/8 draft
-                // kernels were emitted above.
+                rng_seed: cfg.sampling.as_ref().and_then(|s| s.seed).unwrap_or(0).max(0),
+                // Present exactly when the draft kernels were emitted.
                 draft: plan.speculative_draft.clone(),
             })
         };
 
-        let capacity = plan.persistent.scheduler.ring_buffer.capacity as i64;
         self.bus.publish_cfie_plan(plan);
         Ok(Some(CfieRuntimeInit {
-            ring_capacity: capacity,
             kv_slots,
             kernels,
             pool_bytes,
             endpoint,
+            generate_refusal,
         }))
     }
 

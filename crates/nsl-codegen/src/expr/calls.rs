@@ -2788,6 +2788,16 @@ impl Compiler<'_> {
                      `kv_layout: \"static\"`) or use the runtime serve loop.",
                 ));
             };
+            if let Some(why) = serve_gen.refusal.as_deref() {
+                // The serve block is CFIE-active but this build has no
+                // decode path.  The runtime would refuse every call, so
+                // refuse here, with the reason.
+                return Err(CodegenError::new(format!(
+                    "generate() cannot run in this serve block: {why}. (The runtime decode \
+                     loop needs both kernels; this used to build a binary whose generate() \
+                     always refused.)"
+                )));
+            }
             if args.len() < 2 {
                 return Err(CodegenError::new(
                     "generate() requires at least 2 arguments (target_model, prompt)",
@@ -2795,6 +2805,7 @@ impl Compiler<'_> {
             }
             let max_new_tokens = serve_gen.max_new_tokens;
             let eos_token_id = serve_gen.eos_token_id;
+            let rng_seed = serve_gen.rng_seed;
             let prompt_len = serve_gen.prompt_len;
             // Cycle 12 wiring (Values are Copy; snapshot before the
             // mutable-borrow compiles below).
@@ -2825,16 +2836,17 @@ impl Compiler<'_> {
                 .unwrap_or_else(|| builder.ins().iconst(cl_types::I64, prompt_len));
             let v_max_new = builder.ins().iconst(cl_types::I64, max_new_tokens);
             let v_eos = builder.ins().iconst(cl_types::I64, eos_token_id);
-            // Fixed rng seed for the one-shot demo (deterministic output).
-            let v_seed = builder.ins().iconst(cl_types::I64, 0);
+            // The configured seed (`sampling: seed:`, default 0).  The
+            // runtime keys the request's draws by this, the request's
+            // index in the process and each token's position, so neither
+            // two tokens nor two generate() calls share a draw.
+            let v_seed = builder.ins().iconst(cl_types::I64, rng_seed);
 
-            // Cycle 13 (G15): with a compiled-in draft model, generate()
-            // drives nsl_cfie_speculative_generate (the paper's
-            // speculative decode loop: draft K greedily -> verify ->
-            // ONE rejection launch -> rollback), k_tokens from the
-            // speculative config — the SAME K the kind-4 reject kernel
-            // was compiled for.  Without a draft the plain driver is
-            // emitted, byte-identical to Cycle 11/12.
+            // With a compiled-in draft model, generate() drives
+            // nsl_cfie_speculative_generate (the draft proposes K tokens
+            // per round and the target's own sampler confirms or
+            // corrects them), k_tokens from the speculative config.
+            // Without a draft the plain driver is emitted.
             let rc = if let Some(k) = speculative_k {
                 let v_k = builder.ins().iconst(cl_types::I64, k);
                 self.compile_call_by_name(

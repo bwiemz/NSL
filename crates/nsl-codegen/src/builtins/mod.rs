@@ -322,12 +322,8 @@ mod tests {
         assert_eq!(arity("nsl_cfie_upload_weight_f16"), 2);
         assert_eq!(arity("nsl_cfie_upload_weight_f32"), 2);
         assert_eq!(arity("nsl_cfie_weights_reset"), 0);
-        assert_eq!(arity("nsl_cfie_launch_decode_attn"), 5);
         assert_eq!(arity("nsl_cfie_launch_fused_sample"), 6);
         assert_eq!(arity("nsl_cfie_launch_decode_block"), 14);
-        assert_eq!(arity("nsl_cfie_launch_spec_verify"), 5);
-        assert_eq!(arity("nsl_cfie_launch_spec_reject"), 6);
-        assert_eq!(arity("nsl_cfie_launch_quant_attn"), 7);
         assert_eq!(arity("nsl_cfie_decode_step"), 11);
         assert_eq!(arity("nsl_cfie_bind_model"), 8);
         assert_eq!(arity("nsl_cfie_generate"), 7);
@@ -342,7 +338,6 @@ mod tests {
         assert_eq!(arity("nsl_cfie_draft_reset"), 0);
         assert_eq!(arity("nsl_cfie_launch_draft_block"), 4);
         assert_eq!(arity("nsl_cfie_launch_draft_sample"), 4);
-        assert_eq!(arity("nsl_cfie_launch_verify_probs"), 2);
         assert_eq!(arity("nsl_cfie_speculative_generate"), 8);
     }
 }

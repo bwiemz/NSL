@@ -208,7 +208,12 @@ pub extern "C" fn nsl_speculative_decode_step(
         data.to_vec()
     };
 
-    let seed = draft_tokens.first().copied().unwrap_or(42) as u64;
+    // A fresh seed from the runtime's seeded generator. It used to be the
+    // first draft token's id: the accept/reject draws were then a function
+    // of the token being judged, the same for every request that drafted
+    // it, so a given draft token was always accepted or always rejected
+    // at a given position.
+    let seed = crate::sampling::rng_u64();
 
     // Run rejection sampling
     let result = verify::rejection_sample(
@@ -348,6 +353,18 @@ pub extern "C" fn nsl_speculative_verify_tree(
     }
 
     let temperature = f32::from_bits(temperature_bits as u32);
+    // Only greedy verification is defined for a tree. Its nodes are the
+    // top tokens of each head, chosen deterministically, and single-draft
+    // rejection sampling over such a tree does not reproduce a sampling
+    // target; that needs a multi-draft rule this runtime does not have.
+    // (This used to accept any node whose target probability exceeded
+    // 0.01 and never resampled.)
+    if temperature != 0.0 {
+        crate::nsl_log!(ERROR, "speculative",
+            "nsl_speculative_verify_tree: temperature {temperature} is not supported — tree verification is exact only for a greedy target (temperature 0)"
+        );
+        return -1;
+    }
 
     // Deserialize tree from buffer
     let buf = tree_ptr as *const i64;
@@ -394,28 +411,18 @@ pub extern "C" fn nsl_speculative_verify_tree(
         unsafe { slice::from_raw_parts(logits_tensor.data as *const f32, total) }.to_vec()
     };
 
-    // Run rejection sampling on each node: accept if verifier's top token
-    // matches the candidate token (greedy) or stochastic sampling passes.
+    // Greedy verification: a node is accepted iff its parent is and the
+    // verifier's argmax at that node is the node's token.
     nodes[0].accepted = true; // root always accepted
     for i in 1..n {
         let parent_idx = nodes[i].parent as usize;
         if !nodes[parent_idx].accepted {
             continue; // parent rejected → skip
         }
-
         let row = &logits_f32[i * vocab_size..(i + 1) * vocab_size];
-        if temperature == 0.0 {
-            // Greedy: accept iff verifier's argmax matches candidate
-            let verifier_best = row.iter().enumerate()
-                .max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
-            nodes[i].accepted = verifier_best as i64 == nodes[i].token_id;
-        } else {
-            // Stochastic: accept with probability p_target / p_draft
-            let probs = super::verify::softmax_with_temperature(row, temperature);
-            let p_target = probs[nodes[i].token_id as usize];
-            // Conservative: accept if p_target > threshold (simplified)
-            nodes[i].accepted = p_target > 0.01;
-        }
+        let verifier_best = row.iter().enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+        nodes[i].accepted = verifier_best as i64 == nodes[i].token_id;
     }
 
     let mut tree = super::types::SpeculativeTree {
@@ -524,4 +531,161 @@ pub extern "C" fn nsl_speculative_cleanup(page_table_handle: i64, seq_id: i64) -
     // which frees all physical pages mapped to this speculative branch.
     // For now, no-op since CoW paging isn't fully wired.
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::speculative::draft::DraftModelRunner;
+
+    /// A 1-D or 2-D f64 tensor over `values` (`rows == 0`: 1-D).
+    fn tensor(values: &[f64], rows: usize) -> i64 {
+        let data = checked_alloc(std::mem::size_of_val(values)) as *mut f64;
+        unsafe { std::ptr::copy_nonoverlapping(values.as_ptr(), data, values.len()) };
+        let ndim = if rows == 0 { 1 } else { 2 };
+        let shape = checked_alloc(ndim * std::mem::size_of::<i64>()) as *mut i64;
+        let strides = checked_alloc(ndim * std::mem::size_of::<i64>()) as *mut i64;
+        unsafe {
+            if rows == 0 {
+                *shape = values.len() as i64;
+                *strides = 1;
+            } else {
+                let cols = values.len() / rows;
+                *shape = rows as i64;
+                *shape.add(1) = cols as i64;
+                *strides = cols as i64;
+                *strides.add(1) = 1;
+            }
+        }
+        Box::into_raw(Box::new(NslTensor::new(
+            data as *mut c_void,
+            shape,
+            strides,
+            ndim as i64,
+            values.len() as i64,
+            0,
+            0,
+            1,
+            0,
+        ))) as i64
+    }
+
+    /// The draft and target distributions of the test below, as
+    /// probabilities; the models' logits are their logarithms.
+    const DRAFT_Q: [f64; 4] = [0.60, 0.25, 0.10, 0.05];
+    const TARGET_P: [f64; 4] = [0.30, 0.10, 0.20, 0.40];
+
+    /// A draft model whose logits are `ln DRAFT_Q` at every step.
+    extern "C" fn draft_forward(_input: i64, _kv: i64, _pos: i64) -> i64 {
+        let logits: Vec<f64> = DRAFT_Q.iter().map(|q| q.ln()).collect();
+        tensor(&logits, 0)
+    }
+
+    /// Draft one token from q, verify it against p, and count what comes
+    /// out: speculative sampling must emit a token distributed as p. The
+    /// counts are checked against the exact probabilities, each within
+    /// five standard deviations of its binomial count.
+    ///
+    /// Both defects this covers made the answer far from p: the draft's
+    /// "random" quantile was 0.6322 at step 0 of every request (so the
+    /// draft was always token 1 here, with q = 0.25 against p = 0.10), and
+    /// the verifier's generator was seeded by that token's id.
+    #[test]
+    fn draft_then_verify_samples_the_target_distribution() {
+        const N: usize = 20_000;
+        crate::sampling::nsl_manual_seed(20261113);
+        let runner = DraftModelRunner::new(draft_forward, 1, 1.0, 4);
+        // Row 0 is the target at the drafted position; row 1 (the bonus
+        // position) is the same distribution.
+        let verifier: Vec<f64> = TARGET_P.iter().chain(&TARGET_P).map(|p| p.ln()).collect();
+
+        let mut drafted = [0usize; 4];
+        let mut emitted = [0usize; 4];
+        for _ in 0..N {
+            let draft = runner.run_draft(0, 0, 0);
+            assert_eq!(draft.num_drafted, 1);
+            let d = unsafe { *(NslTensor::from_ptr(draft.tokens_ptr).data as *const f64) } as usize;
+            drafted[d] += 1;
+            let v = tensor(&verifier, 2);
+            let out = nsl_speculative_decode_step(
+                draft.tokens_ptr,
+                draft.logits_ptr,
+                v,
+                1,
+                4,
+                1.0f32.to_bits() as i64,
+                1,
+                0,
+                1,
+            );
+            let first = unsafe { *(NslTensor::from_ptr(out).data as *const f64) } as usize;
+            emitted[first] += 1;
+            for t in [draft.tokens_ptr, draft.logits_ptr, v, out] {
+                crate::tensor::nsl_tensor_free(t);
+            }
+        }
+        let within = |counts: &[usize; 4], probs: &[f64; 4], what: &str| {
+            for (tok, (&c, &p)) in counts.iter().zip(probs).enumerate() {
+                let mean = N as f64 * p;
+                let sd = (N as f64 * p * (1.0 - p)).sqrt();
+                assert!(
+                    (c as f64 - mean).abs() <= 5.0 * sd,
+                    "{what}: token {tok} came out {c} times of {N}; {mean:.0} expected (sd {sd:.1}). All counts: {counts:?}"
+                );
+            }
+        };
+        within(&drafted, &DRAFT_Q, "the draft samples q");
+        within(&emitted, &TARGET_P, "the emitted token samples p");
+    }
+
+    /// The serialized tree `nsl_speculative_verify_tree` reads: a root and
+    /// two children, tokens 2 and 1.
+    fn two_child_tree() -> Vec<i64> {
+        let n = 3;
+        let mut buf = vec![n];
+        buf.extend([-1, 2, 1]); // tokens (the root carries none)
+        buf.extend([-1, 0, 0]); // parents
+        buf.extend([0, 1, 3]); // dfs enter
+        buf.extend([5, 2, 4]); // dfs exit
+        buf
+    }
+
+    #[test]
+    fn tree_verification_is_greedy_and_refuses_a_sampling_target() {
+        let tree = two_child_tree();
+        // Verifier rows per node: the root's is unused; at node 1 the
+        // argmax is token 2 (the node's token), at node 2 it is token 3
+        // (not the node's token 1, though token 1 has probability well
+        // above the 0.01 the old rule accepted at).
+        let logits = [
+            0.0, 0.0, 0.0, 0.0, //
+            0.0, 0.5, 3.0, 0.1, //
+            0.0, 1.5, 0.2, 2.0,
+        ];
+        let v = tensor(&logits, 3);
+        let mut out = [-7i64; 4];
+        let greedy = nsl_speculative_verify_tree(
+            v,
+            0,
+            0,
+            tree.as_ptr() as i64,
+            0.0f32.to_bits() as i64,
+            out.as_mut_ptr() as i64,
+        );
+        assert_eq!(greedy, 1, "one accepted token");
+        assert_eq!(out[0], 2);
+
+        let mut out = [-7i64; 4];
+        let sampled = nsl_speculative_verify_tree(
+            v,
+            0,
+            0,
+            tree.as_ptr() as i64,
+            0.8f32.to_bits() as i64,
+            out.as_mut_ptr() as i64,
+        );
+        assert_eq!(sampled, -1, "a sampling target is refused, not approximated");
+        assert_eq!(out, [-7; 4], "and nothing is written");
+        crate::tensor::nsl_tensor_free(v);
+    }
 }

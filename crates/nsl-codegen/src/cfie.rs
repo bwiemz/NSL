@@ -1,46 +1,42 @@
 //! CFIE — Compiler-Fused Inference Engine: driver + report.
 //!
-//! Composes the six CFIE passes (KV plan, fused sample, speculative,
-//! persistent decode + scheduler, KV quant, grammar) into a single
-//! [`CfiePlan`].  Invoked from `serve.rs::run_cfie_for_serve` (Tier-A
-//! wiring) with inputs assembled by `cfie_serve.rs`.
+//! Composes the CFIE planning passes (KV layout, fused sampler, decode
+//! block, per-layer KV precision, speculative decoding) into a single
+//! [`CfiePlan`].  Invoked from `serve.rs::run_cfie_for_serve` with inputs
+//! assembled by `cfie_serve.rs`.
 //!
-//! What the plan drives today (post-Cycle-6): all five kernel families
-//! emit real PTX (G7/G13/G16/G18/F2), and on the monolithic serve path
-//! `serve.rs` embeds that PTX and emits the `nsl_cfie_register_kernel` /
-//! `nsl_cfie_kv_pool_alloc` / `nsl_cfie_engine_finalize` calls, so the
-//! chosen kernel family is registered with the runtime engine at serve
-//! init.  Per-token launches then go through the host decode loop
-//! (`nsl_cfie_decode_step`).  Cycle 11 wires the last mile: on the
-//! monolithic path the endpoint's `generate()` compiles to serve-init
-//! model binding (`nsl_model_create` + `nsl_cfie_bind_model`) + the
-//! `nsl_cfie_generate` decode driver, with the served model resolved
-//! from the serve `weights:` key / `--weights` (model defs carry only
-//! compile-time shape metadata, so there is no runtime model value).
-//! Cycle 12 closes the text loop: with `tokenizer:` configured the
-//! `prompt:` text is runtime-encoded (`nsl_tokenizer_encode` ->
-//! `nsl_cfie_tensor_to_tokens`, baked byte-ids as the select fallback)
-//! and the generated ids are decoded and printed as text
-//! (`nsl_cfie_tokens_to_tensor` -> `nsl_tokenizer_decode`).
-//! The disaggregated serve path emits none of the runtime wiring and the
+//! What a plan drives: on the monolithic serve path `serve.rs` emits the
+//! decode-block kernel and the fused sampler (and, with a
+//! `speculative:` section, the draft model's two kernels), embeds their
+//! PTX and emits the `nsl_cfie_register_kernel` /
+//! `nsl_cfie_kv_pool_alloc` / `nsl_cfie_engine_finalize` calls, so they
+//! are registered with the runtime engine at serve init.  The endpoint's
+//! `generate()` compiles to serve-init model binding (`nsl_model_create`
+//! + `nsl_cfie_bind_model`) and the `nsl_cfie_generate` decode driver,
+//! with the served model resolved from the serve `weights:` key /
+//! `--weights`.  With `tokenizer:` configured the `prompt:` text is
+//! runtime-encoded and the generated ids are decoded and printed.  The
+//! disaggregated serve path emits none of the runtime wiring and the
 //! report says so (`runtime_wiring_emitted`).
-//! Produces a human-readable report matching paper §8's sample output.
+//!
+//! The report states what the build contains.  It prints no latency or
+//! throughput figure: the repository has no measurement of this engine,
+//! and the cost model that used to supply those lines divided by the
+//! whole GPU's memory bandwidth for kernels that run on one thread block.
 
 use serde::Serialize;
 
-use crate::cfie_cost::CfieCostEstimate;
 use crate::cfie_fused_sample::{emit_program as emit_sample, FusedSampleProgram, LmHeadShape, SamplingParams};
-use crate::cfie_grammar::{compile as compile_dfa, minimise as minimise_dfa, CompiledDfa, GrammarSpec};
 use crate::cfie_kv_plan::{plan as plan_kv, KvBudget, KvLayoutPlan, KvShape};
 use crate::cfie_kv_quant::{plan as plan_kv_quant, KvQuantConfig, KvQuantPlan};
 use crate::cfie_persistent::{plan as plan_persistent, GpuBudget, PersistentModel, PersistentPlan};
-use crate::cfie_speculative::{emit_program as emit_spec, SpeculativeConfig, SpeculativeProgram};
+use crate::cfie_speculative::SpeculativeConfig;
 use crate::pass_trace::{DeclineReason, PassDisposition};
 use crate::weight_aware::WeightMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum CfieMode {
-    /// All six passes active.
+    /// All passes active.
     Full,
     /// KV plan + fused sample only (lowest-risk subset).
     Sampling,
@@ -67,9 +63,9 @@ impl CfieMode {
 }
 
 /// Host launch geometry for one emitted CFIE kernel — the values the
-/// compiled serve binary passes to `nsl_cfie_register_kernel` at init
-/// (Cycle 6 frozen ABI).  1-D launches only: every current CFIE kernel
-/// is `grid=(grid_x,1,1) block=(block_x,1,1)`.
+/// compiled serve binary passes to `nsl_cfie_register_kernel` at init.
+/// 1-D launches only: every CFIE kernel is
+/// `grid=(grid_x,1,1) block=(block_x,1,1)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CfieLaunchSpec {
     pub grid_x: u32,
@@ -80,47 +76,14 @@ pub struct CfieLaunchSpec {
     pub smem_dyn_bytes: u32,
 }
 
-/// Which kernel family a build registers with the runtime engine.
-/// Exactly ONE family registers per build: the quant family bakes the
-/// mixed-precision pool layout from `cfie_kv_quant_ptx::pool_layout`,
-/// which is incompatible with the uniform-f16 pool the decode-attn /
-/// decode-block / spec kernels bake.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CfieKernelFamily {
-    /// decode_attn / decode_block / spec kernels (uniform f16 KV pool)
-    /// plus the fused sampler.
-    Uniform,
-    /// per-layer KV-quant attention kernels (mixed-precision KV pool)
-    /// plus the fused sampler.
-    Quant,
-}
-
-impl CfieKernelFamily {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            CfieKernelFamily::Uniform => "uniform",
-            CfieKernelFamily::Quant => "quant",
-        }
-    }
-}
-
-/// Compile-time family chooser (pure): quant wins whenever the
-/// per-layer quant kernels were emitted, because their pool layout is
-/// mutually exclusive with the uniform pool (see [`CfieKernelFamily`]).
-pub fn choose_kernel_family(plan: &CfiePlan) -> CfieKernelFamily {
-    if plan.quant_attention_kernels.is_empty() {
-        CfieKernelFamily::Uniform
-    } else {
-        CfieKernelFamily::Quant
-    }
-}
+/// Registration kinds, as `nsl_runtime::cfie::engine` numbers them.
+pub const KIND_FUSED_SAMPLE: u8 = 1;
+pub const KIND_DECODE_BLOCK: u8 = 2;
+pub const KIND_DRAFT_BLOCK: u8 = 6;
+pub const KIND_DRAFT_SAMPLE: u8 = 7;
 
 /// One `nsl_cfie_register_kernel` call the compiled serve binary makes
-/// at init.  Kinds per the frozen Cycle-6 ABI: 0=decode_attn,
-/// 1=fused_sample, 2=decode_block, 3=spec_verify, 4=spec_reject,
-/// 5=quant_attn; Cycle-13 ABI: 6=draft decode_block, 7=draft_sample,
-/// 8=verify_probs.  `layer_idx` is meaningful only for kind 5 (0 for
-/// all other kinds).
+/// at init.  `layer_idx` is 0 for every kind there is today.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CfieKernelReg {
     pub kind: u8,
@@ -132,21 +95,20 @@ pub struct CfieKernelReg {
     pub smem_dyn: u32,
 }
 
-/// Build the registration list for the chosen kernel family (pure over
-/// the plan).  Kernels register only when BOTH the PTX and a launch
-/// spec exist; the fused sampler (kind 1) registers in both families —
-/// it is the host decode loop's (`nsl_cfie_decode_step`) second stage.
+/// Build the registration list (pure over the plan).  Every kernel listed
+/// here is launched by a generation driver: the decode block and the
+/// fused sampler by `nsl_cfie_decode_step`, the draft pair by
+/// `nsl_cfie_speculative_generate`.  The list is empty unless the decode
+/// path is complete — a sampler with no decode block (or the reverse)
+/// would be registered and never launched.
 pub fn kernel_registrations(plan: &CfiePlan) -> Vec<CfieKernelReg> {
-    fn reg(
-        kind: u8,
-        layer_idx: u32,
-        name: &str,
-        ptx: &str,
-        spec: CfieLaunchSpec,
-    ) -> CfieKernelReg {
+    if !plan.decode_path_emitted() {
+        return Vec::new();
+    }
+    fn reg(kind: u8, name: &str, ptx: &str, spec: CfieLaunchSpec) -> CfieKernelReg {
         CfieKernelReg {
             kind,
-            layer_idx,
+            layer_idx: 0,
             name: name.to_string(),
             ptx: ptx.to_string(),
             grid_x: spec.grid_x,
@@ -155,86 +117,61 @@ pub fn kernel_registrations(plan: &CfiePlan) -> Vec<CfieKernelReg> {
         }
     }
     let mut regs = Vec::new();
-    match choose_kernel_family(plan) {
-        CfieKernelFamily::Quant => {
-            if let Some(spec) = plan.quant_attention_launch {
-                for (idx, (name, ptx)) in plan.quant_attention_kernels.iter().enumerate() {
-                    regs.push(reg(5, idx as u32, name, ptx, spec));
-                }
-            }
+    let mut push = |kind: u8, k: &CfieKernel| {
+        if let Some(e) = k.emitted.as_ref() {
+            regs.push(reg(kind, &e.name, &e.ptx, e.launch));
         }
-        CfieKernelFamily::Uniform => {
-            if let (Some(name), Some(ptx), Some(spec)) = (
-                plan.decode_attention_kernel.as_ref(),
-                plan.decode_attention_ptx.as_ref(),
-                plan.decode_attention_launch,
-            ) {
-                regs.push(reg(0, 0, name, ptx, spec));
-            }
-            if let (Some(name), Some(ptx), Some(spec)) = (
-                plan.decode_block_kernel.as_ref(),
-                plan.decode_block_ptx.as_ref(),
-                plan.decode_block_launch,
-            ) {
-                regs.push(reg(2, 0, name, ptx, spec));
-            }
-            if let (Some(name), Some(ptx), Some(spec)) = (
-                plan.spec_verify_kernel.as_ref(),
-                plan.spec_verify_ptx.as_ref(),
-                plan.spec_verify_launch,
-            ) {
-                regs.push(reg(3, 0, name, ptx, spec));
-            }
-            if let (Some(name), Some(ptx), Some(spec)) = (
-                plan.spec_reject_kernel.as_ref(),
-                plan.spec_reject_ptx.as_ref(),
-                plan.spec_reject_launch,
-            ) {
-                regs.push(reg(4, 0, name, ptx, spec));
-            }
-            // Cycle 13 (G15): the draft family registers ONLY alongside
-            // the uniform family — the speculative driver's verify side
-            // is the kind-2 chain, which the quant family excludes.
-            if let (Some(name), Some(ptx), Some(spec)) = (
-                plan.draft_block_kernel.as_ref(),
-                plan.draft_block_ptx.as_ref(),
-                plan.draft_block_launch,
-            ) {
-                regs.push(reg(6, 0, name, ptx, spec));
-            }
-            if let (Some(name), Some(ptx), Some(spec)) = (
-                plan.draft_sample_kernel.as_ref(),
-                plan.draft_sample_ptx.as_ref(),
-                plan.draft_sample_launch,
-            ) {
-                regs.push(reg(7, 0, name, ptx, spec));
-            }
-            if let (Some(name), Some(ptx), Some(spec)) = (
-                plan.verify_probs_kernel.as_ref(),
-                plan.verify_probs_ptx.as_ref(),
-                plan.verify_probs_launch,
-            ) {
-                regs.push(reg(8, 0, name, ptx, spec));
-            }
-        }
-    }
-    if let (Some(name), Some(ptx), Some(spec)) = (
-        plan.fused_sample_kernel.as_ref(),
-        plan.fused_sample_ptx.as_ref(),
-        plan.fused_sample_launch,
-    ) {
-        regs.push(reg(1, 0, name, ptx, spec));
-    }
+    };
+    push(KIND_DECODE_BLOCK, &plan.decode_block);
+    push(KIND_DRAFT_BLOCK, &plan.draft_block);
+    push(KIND_DRAFT_SAMPLE, &plan.draft_sample);
+    push(KIND_FUSED_SAMPLE, &plan.fused_sample);
     regs
 }
 
-/// CFIE Cycle 13 (G15): everything the serve wiring resolved about the
-/// draft model compiled into the binary — the checkpoint path, the
-/// draft architecture (vocab is the target's; shared-vocab invariant),
-/// the draft KV pool size (`draft_n_layers * 2 * per_slot *
-/// draft_n_kv_heads * draft_head_dim * 2` f16 bytes, with per_slot =
-/// the TARGET per-slot capacity per the engine's sizing contract), and
-/// the speculative K the kind-4 reject kernel was compiled for.
+/// A kernel the serve wiring emitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmittedKernel {
+    pub name: String,
+    pub ptx: String,
+    pub launch: CfieLaunchSpec,
+}
+
+/// One kernel slot of the plan: the kernel, or why this build has none.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CfieKernel {
+    pub emitted: Option<EmittedKernel>,
+    /// Set by the serve wiring when it decided not to emit the kernel:
+    /// the reason, in words a user can act on.  `None` with no kernel
+    /// means the wiring did not consider it (a hand-built plan, or a
+    /// draft kernel with no `speculative:` section).
+    pub not_emitted: Option<String>,
+}
+
+impl CfieKernel {
+    pub fn emitted(name: String, ptx: String, launch: CfieLaunchSpec) -> Self {
+        Self {
+            emitted: Some(EmittedKernel { name, ptx, launch }),
+            not_emitted: None,
+        }
+    }
+    pub fn refused(why: impl Into<String>) -> Self {
+        Self {
+            emitted: None,
+            not_emitted: Some(why.into()),
+        }
+    }
+    pub fn is_emitted(&self) -> bool {
+        self.emitted.is_some()
+    }
+}
+
+/// Everything the serve wiring resolved about the draft model compiled
+/// into the binary — the checkpoint path, the draft architecture (vocab
+/// is the target's; shared-vocab invariant), the draft KV pool size
+/// (`draft_n_layers * 2 * per_slot * draft_n_kv_heads * draft_head_dim *
+/// 2` f16 bytes, with per_slot = the TARGET per-slot capacity per the
+/// engine's sizing contract), and the speculative K.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CfieSpeculativeDraft {
     pub weights_path: String,
@@ -248,11 +185,11 @@ pub struct CfieSpeculativeDraft {
     pub vocab_size: u32,
     /// Draft KV pool bytes for `nsl_cfie_draft_pool_alloc`.
     pub pool_bytes: i64,
-    /// Speculative K (`speculative.tokens`, clamped 1..=32) — passed to
-    /// `nsl_cfie_speculative_generate` and baked into the kind-4 kernel.
+    /// Speculative K (`speculative.tokens`, 1..=32) — passed to
+    /// `nsl_cfie_speculative_generate`.
     pub k_tokens: u32,
     /// The TARGET model's layer count (for the report's per-round
-    /// launch accounting: the verify side is the kind-2 chain).
+    /// launch accounting).
     pub target_n_layers: u32,
 }
 
@@ -264,19 +201,24 @@ pub struct CfieInput<'a> {
     pub kv_budget: KvBudget,
     pub lm_head: LmHeadShape,
     pub sampling: SamplingParams,
+    /// Whether `sampling` came from a `sampling:` section (false: the
+    /// defaults, which the report then names as defaults).
+    pub sampling_configured: bool,
     pub persistent_model: PersistentModel,
     pub gpu_budget: GpuBudget,
     pub max_active_requests: u32,
     pub kv_quant: KvQuantConfig,
+    /// Whether to run the advisory per-layer KV precision ranking
+    /// (`kv_quant: "auto"`).
+    pub kv_quant_advisory: bool,
     pub weights: Option<&'a WeightMap>,
     pub speculative: Option<SpeculativeConfig>,
-    pub speculative_acceptance: f32,
-    pub grammar: Option<GrammarSpec>,
-    /// Pre-compiled token-level DFA (the G12 schema->token pipeline in
-    /// `cfie_grammar::dfa_from_json_schema`).  Takes precedence over
-    /// `grammar` when both are set.
-    pub grammar_dfa: Option<CompiledDfa>,
 }
+
+/// Launches the unfused pipeline the plan is compared with would make
+/// for the sampling tail (RMSNorm, LM-head matmul, softmax, top-k, top-p,
+/// multinomial).
+const UNFUSED_SAMPLING_LAUNCHES: u32 = 6;
 
 #[derive(Debug, Clone)]
 pub struct CfiePlan {
@@ -284,126 +226,79 @@ pub struct CfiePlan {
     pub target_gpu: String,
     pub kv: KvLayoutPlan,
     pub sampling: FusedSampleProgram,
+    /// False when no `sampling:` section set the sampler's parameters.
+    pub sampling_configured: bool,
     pub persistent: PersistentPlan,
+    /// Advisory per-layer KV precision ranking.  NOT applied: every layer
+    /// of the KV pool is FP16, the only precision the decode block reads
+    /// and writes.  Empty unless `kv_quant: "auto"` asked for it.
     pub kv_quant: KvQuantPlan,
-    pub speculative: Option<SpeculativeProgram>,
-    pub grammar: Option<CompiledDfa>,
+    pub speculative: Option<SpeculativeConfig>,
+    /// The target model's layer count.
+    pub n_layers: u32,
+    /// Launches per generated token of the nominal unfused pipeline:
+    /// `baseline_launches_per_layer * n_layers + 6`.  A count of
+    /// operations, not a measurement of any engine.
     pub kernel_launches_per_token_baseline: u32,
-    pub kernel_launches_per_token_cfie: u32,
     pub solve_us: u64,
-    /// Feature 1 (G7): the direct-indexing decode-attention kernel,
-    /// emitted by the serve wiring when the KV plan selects a static
-    /// layout and the v1 emitter's preconditions hold.  Registered with
-    /// the runtime engine at serve init (uniform family) and launched by
-    /// the host decode loop (`nsl_cfie_decode_step`); still awaiting
-    /// endpoint model binding to be driven by real requests.
-    pub decode_attention_kernel: Option<String>,
-    pub decode_attention_ptx: Option<String>,
-    /// Feature 4 (G16): the persistent decode-block kernel (one CTA =
-    /// one layer's decode step for one token).  Emitted by the serve
-    /// wiring only when `persistent.fusion` is Level3 — the full-block
-    /// claim; Level1/2 stay plan-level — and the emitter preconditions
-    /// hold.  Registered at serve init (uniform family) and launched by
-    /// the host decode loop; awaiting endpoint model binding.
-    pub decode_block_kernel: Option<String>,
-    pub decode_block_ptx: Option<String>,
-    /// Feature 3 (G13/G14): compiled speculative verification kernels.
-    /// `spec_verify_*` is the tree-mask verification attention (each
-    /// node row's ancestor mask baked as a u64 immediate — no mask
-    /// tensor parameter); `spec_reject_*` is the rejection-sampling
-    /// epilogue (Leviathan residual + xorshift64* PRNG).  Emitted by
-    /// the serve wiring when `speculative` is planned AND the KV plan
-    /// selected the static direct-index layout both kernels bake their
-    /// pool strides from.  Registered at serve init (uniform family) and
-    /// launched by the host decode loop; awaiting endpoint model binding.
-    pub spec_verify_kernel: Option<String>,
-    pub spec_verify_ptx: Option<String>,
-    pub spec_reject_kernel: Option<String>,
-    pub spec_reject_ptx: Option<String>,
-    /// CFIE Cycle 13 (G15 draft-model-in-binary): the DRAFT decode
-    /// block (kind 6 — the `cfie_persistent_ptx` emitter instantiated
-    /// with the draft dims, max_slots = 1, per_slot_max_tokens = the
-    /// TARGET's per-slot capacity per the draft-pool sizing contract),
-    /// the draft greedy sampler (kind 7) and the target prob-row writer
-    /// (kind 8) from `cfie_spec_sampler_ptx`.  Emitted by the serve
-    /// wiring only when `speculative.draft_weights` is configured AND
-    /// the uniform family + spec kernels are wired; the engine's
-    /// `nsl_cfie_speculative_generate` drives them.
-    pub draft_block_kernel: Option<String>,
-    pub draft_block_ptx: Option<String>,
-    pub draft_sample_kernel: Option<String>,
-    pub draft_sample_ptx: Option<String>,
-    pub verify_probs_kernel: Option<String>,
-    pub verify_probs_ptx: Option<String>,
-    /// Feature 6 (G11): the initialized `.global` PTX fragment baking
-    /// the grammar's valid-token bitmask into the module image.  Emitted
-    /// by the serve wiring when `grammar` is set and spliced into the
-    /// fused-sampler module; the host resolves its device address via
-    /// `cuModuleGetGlobal` at `nsl_cfie_engine_finalize` so the sampler
-    /// reads it directly (no `grammar_mask_ptr` parameter needed).
-    pub grammar_mask_ptx: Option<String>,
-    /// Feature 5 (G18): per-layer decode-attention kernels with the
-    /// KV-quant plan's precision baked into each layer's load path
-    /// (`nsl_cfie_decode_attn_l{N}` — INT8 layers dequantize in
-    /// registers, FP16 layers load directly; no runtime dispatch).
-    /// `(kernel_name, ptx)` per layer.  NOTE: the quant kernel family
-    /// uses the mixed-precision pool layout from
-    /// `cfie_kv_quant_ptx::pool_layout`, which differs from the
-    /// uniform-f16 pool the base/block/verify kernels bake; the
-    /// compile-time chooser ([`choose_kernel_family`]) registers ONE
-    /// family per build.
-    pub quant_attention_kernels: Vec<(String, String)>,
-    /// Feature 2 (F2): the fused decode-sample kernel (RMSNorm +
-    /// LM-head matvec + top-k/top-p + multinomial in ONE launch, only
-    /// the token id touches HBM).  Emitted by the serve wiring when
-    /// the sampler program is fused and the emitter preconditions hold
-    /// (d_model 1..=8192, vocab_size a positive multiple of the
-    /// 128-wide tile, top_k 1..=64).  When a grammar mask exists the
-    /// initialized `.global` fragment is spliced into this module so
-    /// the host resolves `nsl_cfie_grammar_mask` via
-    /// `cuModuleGetGlobal` at engine finalize.
-    pub fused_sample_kernel: Option<String>,
-    pub fused_sample_ptx: Option<String>,
-    /// Launch geometry per kernel family, registered with
-    /// `nsl_cfie_register_kernel` at serve init.  Set alongside the
-    /// matching kernel/ptx pair; the quant layers share one spec.
-    pub decode_attention_launch: Option<CfieLaunchSpec>,
-    pub fused_sample_launch: Option<CfieLaunchSpec>,
-    pub decode_block_launch: Option<CfieLaunchSpec>,
-    pub spec_verify_launch: Option<CfieLaunchSpec>,
-    pub spec_reject_launch: Option<CfieLaunchSpec>,
-    pub quant_attention_launch: Option<CfieLaunchSpec>,
-    pub draft_block_launch: Option<CfieLaunchSpec>,
-    pub draft_sample_launch: Option<CfieLaunchSpec>,
-    pub verify_probs_launch: Option<CfieLaunchSpec>,
-    /// Cycle 13 (G15): resolved draft-model wiring info — set by the
-    /// serve wiring exactly when the kind-6/7/8 kernels above are
-    /// emitted.  Drives the serve-init draft binding emission
-    /// (`nsl_model_create(draft) -> nsl_cfie_bind_draft_model ->
-    /// nsl_cfie_draft_pool_alloc`), the `generate()` rewrite to
-    /// `nsl_cfie_speculative_generate`, and the report's truthful
-    /// per-round launch accounting.
+    /// The decode-block kernel (one launch = one layer's decode step for
+    /// one token), emitted when the planner sustains whole-layer fusion,
+    /// the KV layout is static, and the emitter's preconditions hold.
+    pub decode_block: CfieKernel,
+    /// The fused decode-sample kernel (RMSNorm + LM-head matvec +
+    /// top-k/top-p + multinomial in ONE launch; only the token id is
+    /// written back).
+    pub fused_sample: CfieKernel,
+    /// The draft model's decode block and greedy sampler, emitted with a
+    /// `speculative:` section; `nsl_cfie_speculative_generate` drives
+    /// them.
+    pub draft_block: CfieKernel,
+    pub draft_sample: CfieKernel,
+    /// Resolved draft-model wiring info — set by the serve wiring exactly
+    /// when the two draft kernels are emitted.  Drives the serve-init
+    /// draft binding emission and the `generate()` rewrite to
+    /// `nsl_cfie_speculative_generate`.
     pub speculative_draft: Option<CfieSpeculativeDraft>,
-    /// Whether the compiled binary actually carries the Cycle-6 runtime
-    /// wiring (register/pool/finalize/destroy emission).  Monolithic
-    /// serve sets this; the disaggregated path does NOT emit the wiring
-    /// and the report must not claim it (`false` for hand-built plans).
+    /// Whether the compiled binary actually carries the runtime wiring
+    /// (register/pool/finalize/destroy emission).  Monolithic serve sets
+    /// this; the disaggregated path does NOT emit the wiring and the
+    /// report must not claim it (`false` for hand-built plans).
     pub runtime_wiring_emitted: bool,
-    /// G22: estimated decode latency + throughput from the explicit
-    /// roofline cost model (`cfie_cost`).  Set by `run_cfie_for_serve`
-    /// (which has the resolved shape + weights precision + GPU spec);
-    /// hand-built plans and `cfie::run` leave it `None` and the report
-    /// simply omits the two estimate lines.
-    pub cost_estimate: Option<CfieCostEstimate>,
 }
 
 impl CfiePlan {
-    pub fn launch_reduction(&self) -> f64 {
-        if self.kernel_launches_per_token_baseline == 0 {
-            return 0.0;
+    /// Whether this build can run `generate()`: the runtime's decode loop
+    /// needs the decode block and the fused sampler, both.
+    pub fn decode_path_emitted(&self) -> bool {
+        self.decode_block.is_emitted() && self.fused_sample.is_emitted()
+    }
+
+    /// Why `generate()` cannot run in this build, when it cannot.
+    pub fn generate_unavailable(&self) -> Option<String> {
+        let mut why = Vec::new();
+        for (what, k) in [
+            ("the decode-block kernel", &self.decode_block),
+            ("the fused sampler kernel", &self.fused_sample),
+        ] {
+            if !k.is_emitted() {
+                why.push(format!(
+                    "{what} was not emitted: {}",
+                    k.not_emitted.as_deref().unwrap_or("it was not planned")
+                ));
+            }
         }
-        1.0 - (self.kernel_launches_per_token_cfie as f64
-            / self.kernel_launches_per_token_baseline as f64)
+        if why.is_empty() {
+            None
+        } else {
+            Some(why.join("; "))
+        }
+    }
+
+    /// Launches per generated token in this build: one decode-block
+    /// launch per layer, then one sampler launch.  `None` when the decode
+    /// path was not emitted.
+    pub fn kernel_launches_per_token(&self) -> Option<u32> {
+        self.decode_path_emitted().then_some(self.n_layers + 1)
     }
 
     pub fn render_report(&self) -> String {
@@ -412,500 +307,228 @@ impl CfiePlan {
         // emits the register/pool/finalize calls; the disaggregated
         // path (and hand-built plans) does not, so the report must not
         // claim registration there.
-        let wiring = if self.runtime_wiring_emitted {
-            "registered at serve init; host decode loop = nsl_cfie_decode_step"
-        } else {
+        let wiring = if !self.runtime_wiring_emitted {
             "runtime wiring NOT emitted on this serve path (report-only)"
+        } else if self.decode_path_emitted() {
+            "registered at serve init"
+        } else {
+            "NOT registered: the decode path is incomplete, so nothing would launch it"
+        };
+        let kernel_line = |k: &CfieKernel| -> String {
+            match (k.emitted.as_ref(), k.not_emitted.as_ref()) {
+                (Some(e), _) => format!("{} emitted ({} bytes PTX, {wiring})", e.name, e.ptx.len()),
+                (None, Some(why)) => format!("NOT emitted — {why}"),
+                (None, None) => "not planned in this build".to_string(),
+            }
         };
         let mut s = String::new();
         writeln!(s, "=== CFIE Inference Build Report ===").unwrap();
         writeln!(s, "Mode: {}", self.mode.as_str()).unwrap();
         writeln!(s, "Target: {}", self.target_gpu).unwrap();
         writeln!(s).unwrap();
-        writeln!(s, "Optimizations applied:").unwrap();
+        writeln!(s, "Plan:").unwrap();
         writeln!(s, "  [1] KV layout: {} ({})", self.kv.kind.as_str(), self.kv.rationale).unwrap();
-        if let Some(kernel) = self.decode_attention_kernel.as_ref() {
-            writeln!(
-                s,
-                "      direct-index decode attention: {} emitted ({} bytes PTX, {wiring})",
-                kernel,
-                self.decode_attention_ptx.as_ref().map_or(0, |p| p.len())
-            )
-            .unwrap();
-        }
-        writeln!(
-            s,
-            "  [2] Fused decode-sample: {} ops ({:.1} KB HBM saved per token)",
-            self.sampling.len(),
-            self.sampling.hbm_bytes_saved as f64 / 1024.0
-        )
-        .unwrap();
-        if let Some(kernel) = self.fused_sample_kernel.as_ref() {
-            writeln!(
-                s,
-                "      fused sampler kernel: {} emitted ({} bytes PTX, {wiring})",
-                kernel,
-                self.fused_sample_ptx.as_ref().map_or(0, |p| p.len())
-            )
-            .unwrap();
-        }
-        if let Some(spec) = self.speculative.as_ref() {
-            writeln!(
-                s,
-                "  [3] Compiled speculative: method={}, K={}, expected speedup={:.2}×",
-                spec.config.method.as_str(),
-                spec.config.k_tokens,
-                spec.expected_speedup
-            )
-            .unwrap();
-            if let Some(kernel) = self.spec_verify_kernel.as_ref() {
+
+        let p = &self.sampling.params;
+        let source = if self.sampling_configured {
+            "from the sampling: section"
+        } else {
+            "DEFAULTS — no sampling: section set them"
+        };
+        let settings = match p.strategy {
+            crate::cfie_fused_sample::SamplingStrategy::Greedy => "greedy (temperature 0)".to_string(),
+            crate::cfie_fused_sample::SamplingStrategy::TopKTopP => {
+                format!("temperature {}, top_k {}, top_p {}", p.temperature, p.top_k, p.top_p)
+            }
+            _ => format!("temperature {}, top_k {}, no top_p", p.temperature, p.top_k),
+        };
+        writeln!(s, "  [2] Sampler: {settings} ({source})").unwrap();
+        writeln!(s, "      fused sampler kernel: {}", kernel_line(&self.fused_sample)).unwrap();
+
+        match (self.speculative.as_ref(), self.speculative_draft.as_ref()) {
+            (Some(_), Some(draft)) => {
                 writeln!(
                     s,
-                    "      verify attention: {} emitted ({} bytes PTX, tree mask baked, {wiring})",
-                    kernel,
-                    self.spec_verify_ptx.as_ref().map_or(0, |p| p.len())
+                    "  [3] Speculative decoding: K={}, greedy draft model from '{}' ({} layers, d_model {}; draft KV pool {} bytes)",
+                    draft.k_tokens, draft.weights_path, draft.n_layers, draft.d_model, draft.pool_bytes
                 )
                 .unwrap();
-            }
-            if let Some(kernel) = self.spec_reject_kernel.as_ref() {
-                writeln!(
-                    s,
-                    "      rejection epilogue: {} emitted ({} bytes PTX, {wiring})",
-                    kernel,
-                    self.spec_reject_ptx.as_ref().map_or(0, |p| p.len())
-                )
-                .unwrap();
-            }
-            // Cycle 13 (G15): draft-model-in-binary — truthful lines
-            // for the draft kernel family + the speculative driver,
-            // present exactly when the serve wiring emitted them.
-            // These three kernels are driven by the SPECULATIVE loop,
-            // not the plain decode_step loop — say so per line rather
-            // than reusing the shared {wiring} suffix.
-            if let Some(draft) = self.speculative_draft.as_ref() {
-                let spec_wiring = if self.runtime_wiring_emitted {
-                    "registered at serve init; driven by nsl_cfie_speculative_generate"
-                } else {
-                    "runtime wiring NOT emitted on this serve path (report-only)"
-                };
-                if let Some(kernel) = self.draft_block_kernel.as_ref() {
-                    writeln!(
-                        s,
-                        "      draft decode block: {} emitted (kind 6, draft dims {}x{}d, {} bytes PTX, {spec_wiring})",
-                        kernel,
-                        draft.n_layers,
-                        draft.d_model,
-                        self.draft_block_ptx.as_ref().map_or(0, |p| p.len())
-                    )
-                    .unwrap();
-                }
-                if let Some(kernel) = self.draft_sample_kernel.as_ref() {
-                    writeln!(
-                        s,
-                        "      draft greedy sampler: {} emitted (kind 7, {} bytes PTX, {spec_wiring})",
-                        kernel,
-                        self.draft_sample_ptx.as_ref().map_or(0, |p| p.len())
-                    )
-                    .unwrap();
-                }
-                if let Some(kernel) = self.verify_probs_kernel.as_ref() {
-                    writeln!(
-                        s,
-                        "      verify prob-row writer: {} emitted (kind 8, {} bytes PTX, {spec_wiring})",
-                        kernel,
-                        self.verify_probs_ptx.as_ref().map_or(0, |p| p.len())
-                    )
-                    .unwrap();
-                }
-                // Per-round launch accounting for the speculative
-                // driver: K draft steps (draft_n_layers kind-6 + one
-                // kind-7 each) + K verify steps (target n_layers kind-2
-                // + one kind-8 each) + ONE kind-4 reject.  The target
-                // layer count comes from the persistent plan's model.
+                writeln!(s, "      draft decode block: {}", kernel_line(&self.draft_block)).unwrap();
+                writeln!(s, "      draft greedy sampler: {}", kernel_line(&self.draft_sample)).unwrap();
+                // Per round: K draft steps (draft layers + the draft
+                // sampler each) and at most K target steps (target
+                // layers + the fused sampler each).
                 let k = draft.k_tokens as u64;
-                let launches = k * (draft.n_layers as u64 + 1)
-                    + k * (draft.target_n_layers as u64 + 1)
-                    + 1;
+                let per_round =
+                    k * (draft.n_layers as u64 + 1) + k * (draft.target_n_layers as u64 + 1);
                 writeln!(
                     s,
-                    "      speculative decode driver: nsl_cfie_speculative_generate \
-                     (draft model bound at serve init from '{}'; draft KV pool {} bytes; \
-                     K={}, {} launches per round + 1 bonus step on all-accept)",
-                    draft.weights_path, draft.pool_bytes, draft.k_tokens, launches
+                    "      output: the tokens plain decoding gives for the same seed (each is drawn by the target's sampler; the draft only predicts it)"
+                )
+                .unwrap();
+                writeln!(
+                    s,
+                    "      cost: up to {per_round} launches per round for at most {k} tokens, against {} per token without a draft — SLOWER than plain decoding; the target verifies one position per step, not K in one pass",
+                    draft.target_n_layers as u64 + 1
                 )
                 .unwrap();
             }
-        } else {
-            writeln!(s, "  [3] Compiled speculative: disabled").unwrap();
+            _ => writeln!(s, "  [3] Speculative decoding: off").unwrap(),
         }
+
         writeln!(
             s,
-            "  [4] Persistent decode: fusion={}, {} launches/layer (vs {} baseline)",
+            "  [4] Decode block (planner: fusion={}): {}",
             self.persistent.fusion.as_str(),
-            self.persistent.persistent_launches_per_layer,
-            self.persistent.baseline_launches_per_layer
+            kernel_line(&self.decode_block)
         )
         .unwrap();
-        if let Some(kernel) = self.decode_block_kernel.as_ref() {
-            writeln!(
-                s,
-                "      persistent decode block: {} emitted ({} bytes PTX, {wiring})",
-                kernel,
-                self.decode_block_ptx.as_ref().map_or(0, |p| p.len())
-            )
-            .unwrap();
-        }
+
         writeln!(
             s,
-            "  [5] Per-layer KV quant: {} INT8 layers, {:.1}% memory savings",
-            self.kv_quant.int8_layer_count(),
-            100.0 * self.kv_quant.memory_savings_ratio()
+            "  [5] KV precision: FP16 in every layer (the only precision the decode block reads and writes)"
         )
         .unwrap();
-        if !self.quant_attention_kernels.is_empty() {
+        if !self.kv_quant.layers.is_empty() {
             writeln!(
                 s,
-                "      per-layer decode-attention kernels: {} emitted \
-                 (precision baked per layer)",
-                self.quant_attention_kernels.len()
+                "      advisory, NOT applied: {} of {} layers rank as INT8-tolerant. The ranking is relative — each layer's weight spectrum is scaled between this model's smallest and largest, so some layer always ranks lowest and some highest whatever their real sensitivity.",
+                self.kv_quant.int8_layer_count(),
+                self.kv_quant.layers.len()
             )
             .unwrap();
-            // Family exclusivity: the chooser registers the quant
-            // family INSTEAD OF decode-block/spec — never both.  Only
-            // claimed when a launch spec exists (i.e. the serve wiring
-            // actually selected the family, not a hand-built plan) and
-            // worded per path so it never contradicts the family line.
-            if self.quant_attention_launch.is_some() {
-                if self.runtime_wiring_emitted {
-                    writeln!(
-                        s,
-                        "      quant family registered exclusively at serve init; \
-                         decode-block/spec kernels NOT registered \
-                         (mixed-precision pool layout is incompatible)"
-                    )
-                    .unwrap();
-                } else {
-                    writeln!(
-                        s,
-                        "      quant family selected exclusively (report-only on \
-                         this path); decode-block/spec kernels excluded \
-                         (mixed-precision pool layout is incompatible)"
-                    )
-                    .unwrap();
-                }
-            }
-        }
-        if let Some(dfa) = self.grammar.as_ref() {
-            writeln!(
-                s,
-                "  [6] Grammar DFA: {} states, {} live transitions ({:.2}% density)",
-                dfa.num_states,
-                dfa.live_transitions,
-                100.0 * dfa.density()
-            )
-            .unwrap();
-            if let Some(mask) = self.grammar_mask_ptx.as_ref() {
-                if self.fused_sample_ptx.is_some() {
-                    writeln!(
-                        s,
-                        "      mask baked into module image ({} bytes PTX, spliced into the fused sampler module; host binds it via cuModuleGetGlobal at engine finalize)",
-                        mask.len()
-                    )
-                    .unwrap();
-                } else {
-                    writeln!(
-                        s,
-                        "      mask baked into module image ({} bytes PTX, fused sampler not emitted this build - mask unbound)",
-                        mask.len()
-                    )
-                    .unwrap();
-                }
-            }
-        } else {
-            writeln!(s, "  [6] Grammar DFA: disabled").unwrap();
         }
         writeln!(s).unwrap();
+
+        match self.kernel_launches_per_token() {
+            Some(n) => writeln!(
+                s,
+                "Kernel launches per generated token: {n} ({} decode-block + 1 sampler; a prompt token takes {} — its prediction is not sampled). The unfused pipeline this replaces would make {} ({} per layer + {UNFUSED_SAMPLING_LAUNCHES} for the sampling tail): a count of operations, not a measurement.",
+                self.n_layers,
+                self.n_layers,
+                self.kernel_launches_per_token_baseline,
+                self.persistent.baseline_launches_per_layer
+            )
+            .unwrap(),
+            None => writeln!(
+                s,
+                "Kernel launches per generated token: none — the decode path is not in this build."
+            )
+            .unwrap(),
+        }
         writeln!(
             s,
-            "Kernel launches per token: {} (vs {} baseline, {:.1}% reduction)",
-            self.kernel_launches_per_token_cfie,
-            self.kernel_launches_per_token_baseline,
-            100.0 * self.launch_reduction()
+            "Speed: not measured. Each kernel runs on one thread block; this report estimates no latency or throughput."
         )
         .unwrap();
-        // G22: estimated latency + throughput from the roofline cost
-        // model.  Present only when the serve wiring computed it (it has
-        // the shape + GPU spec); hand-built plans omit these two lines.
-        // ASCII-only: the paper's microsecond renders as "us", never a
-        // Unicode micro sign.
-        if let Some(est) = self.cost_estimate.as_ref() {
-            writeln!(
-                s,
-                "Estimated decode latency: {:.1}us/token (vs {:.1}us baseline) \
-                 [bandwidth-roofline model @ seq={}]",
-                est.cfie_us_per_token, est.baseline_us_per_token, est.kv_seq
-            )
-            .unwrap();
-            writeln!(
-                s,
-                "Estimated throughput (batch={}): {} tok/s \
-                 [same model; weights amortized across batch]",
-                est.batch,
-                group_thousands(est.throughput_tok_s.round() as u64)
-            )
-            .unwrap();
-            writeln!(s, "  cost-model assumptions: {}", est.assumptions).unwrap();
-        }
-        writeln!(s, "Continuous batching: on ({} active slots, ring capacity {})",
-                 self.persistent.scheduler.max_active,
-                 self.persistent.scheduler.ring_buffer.capacity).unwrap();
+        writeln!(
+            s,
+            "Requests: one sequence at a time ({} KV slot(s) planned; there is no batching scheduler).",
+            self.persistent.scheduler.max_active
+        )
+        .unwrap();
+
         let regs = kernel_registrations(self);
         if regs.is_empty() {
-            writeln!(s, "Kernel family: none registered (no kernels emitted this build)")
-                .unwrap();
+            writeln!(s, "Kernels: none registered in this build.").unwrap();
         } else {
             writeln!(
                 s,
-                "Kernel family: {} — {} kernel(s); {wiring}",
-                choose_kernel_family(self).as_str(),
-                regs.len()
+                "Kernels: {} ({}); {wiring}.",
+                regs.len(),
+                regs.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join(", ")
             )
             .unwrap();
         }
-        // Cycle 11: the endpoint's `generate()` now compiles to the
-        // model-binding + decode driver (nsl_model_create +
-        // nsl_cfie_bind_model + nsl_cfie_generate), emitted at serve init
-        // whenever the decode path was wired (kernels registered).  The
-        // served model comes from the serve `weights:` key / --weights,
-        // NOT a runtime model value.
-        if regs.is_empty() {
-            writeln!(
+        match self.generate_unavailable() {
+            Some(why) => writeln!(
                 s,
-                "Note: no decode kernels were emitted this build, so the \
-                 endpoint `generate()` call has no engine to finalize and \
-                 refuses at compile time (add CFIE serve config that wires \
-                 the static decode path)."
+                "generate(): NOT available in this build — {why}. An endpoint that calls generate() does not compile."
             )
-            .unwrap();
-        } else {
-            // Cycle 13: with a compiled-in draft, generate() drives the
-            // SPECULATIVE loop — the note must name the real driver.
-            let driver = if self.speculative_draft.is_some() {
-                "nsl_cfie_speculative_generate speculative decode driver \
-                 (draft K greedily -> verify -> ONE rejection launch -> \
-                 rollback)"
-            } else {
-                "nsl_cfie_generate decode driver"
-            };
-            writeln!(
-                s,
-                "Note: endpoint `generate()` compiles to serve-init model \
-                 binding (nsl_model_create + nsl_cfie_bind_model) + the \
-                 {driver}; the served model is bound \
-                 from the serve `weights:` key / --weights at serve init. \
-                 generate() returns the generated-token count. With \
-                 `tokenizer:` configured, the `prompt:` text is \
-                 runtime-encoded through that tokenizer (falling back to \
-                 baked byte-level ids if the encode yields nothing) and \
-                 the generated ids are decoded and printed as TEXT; \
-                 without a tokenizer the prompt stays byte-baked and only \
-                 the count is printed (live per-request prompts need the \
-                 deferred request loop)."
-            )
-            .unwrap();
+            .unwrap(),
+            None => {
+                let driver = if self.speculative_draft.is_some() {
+                    "nsl_cfie_speculative_generate"
+                } else {
+                    "nsl_cfie_generate"
+                };
+                writeln!(
+                    s,
+                    "generate(): compiles to serve-init model binding (nsl_model_create + nsl_cfie_bind_model) and the {driver} driver; the served model is bound from the serve `weights:` key / --weights. It returns the generated-token count. With `tokenizer:` configured, the `prompt:` text is runtime-encoded through that tokenizer (falling back to baked byte-level ids if the encode yields nothing) and the generated ids are decoded and printed as TEXT; without a tokenizer the prompt stays byte-baked and only the count is printed."
+                )
+                .unwrap();
+            }
         }
         writeln!(s, "Solve time: {:.2} ms", self.solve_us as f64 / 1000.0).unwrap();
         s
     }
 }
 
-/// Group an integer with ASCII commas every three digits (the paper
-/// prints throughput as `18,400 tok/s`).  ASCII-only by construction.
-fn group_thousands(n: u64) -> String {
-    let digits = n.to_string();
-    let bytes = digits.as_bytes();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    let len = bytes.len();
-    for (i, b) in bytes.iter().enumerate() {
-        if i > 0 && (len - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(*b as char);
-    }
-    out
-}
-
 pub fn run(input: CfieInput) -> CfiePlan {
     crate::pass_trace::record("CFIE");
     let t0 = std::time::Instant::now();
 
-    if input.mode == CfieMode::Off {
-        crate::pass_trace::record_disposition("CFIE", PassDisposition::Declined {
-            reason: DeclineReason::ModeOff,
-        });
-        return CfiePlan {
-            mode: CfieMode::Off,
-            target_gpu: input.target_gpu.to_string(),
-            kv: plan_kv(&input.kv_shape, &input.kv_budget),
-            sampling: emit_sample(input.sampling, input.lm_head),
-            persistent: plan_persistent(
-                &input.persistent_model,
-                &input.gpu_budget,
-                input.max_active_requests,
-            ),
-            kv_quant: KvQuantPlan::default(),
-            speculative: None,
-            grammar: None,
-            kernel_launches_per_token_baseline: 500,
-            kernel_launches_per_token_cfie: 500,
-            solve_us: t0.elapsed().as_micros() as u64,
-            decode_attention_kernel: None,
-            decode_attention_ptx: None,
-            decode_block_kernel: None,
-            decode_block_ptx: None,
-            spec_verify_kernel: None,
-            spec_verify_ptx: None,
-            spec_reject_kernel: None,
-            spec_reject_ptx: None,
-            grammar_mask_ptx: None,
-            quant_attention_kernels: Vec::new(),
-            fused_sample_kernel: None,
-            fused_sample_ptx: None,
-            decode_attention_launch: None,
-            fused_sample_launch: None,
-            decode_block_launch: None,
-            spec_verify_launch: None,
-            spec_reject_launch: None,
-            quant_attention_launch: None,
-            draft_block_kernel: None,
-            draft_block_ptx: None,
-            draft_sample_kernel: None,
-            draft_sample_ptx: None,
-            verify_probs_kernel: None,
-            verify_probs_ptx: None,
-            draft_block_launch: None,
-            draft_sample_launch: None,
-            verify_probs_launch: None,
-            speculative_draft: None,
-            runtime_wiring_emitted: false,
-            cost_estimate: None,
-        };
-    }
-
-    // 1. KV layout.
     let kv = plan_kv(&input.kv_shape, &input.kv_budget);
-
-    // 2. Fused sampler.  Enable grammar masking when a grammar is set.
-    let mut sampling_params = input.sampling;
-    sampling_params.grammar_masked = input.grammar.is_some() || input.grammar_dfa.is_some();
-    let sampling = emit_sample(sampling_params, input.lm_head);
-
-    // 3. Persistent decode + scheduler.
+    let sampling = emit_sample(input.sampling, input.lm_head);
     let persistent = plan_persistent(
         &input.persistent_model,
         &input.gpu_budget,
         input.max_active_requests,
     );
+    let n_layers = input.persistent_model.n_layers;
+    let baseline = persistent.baseline_launches_per_layer * n_layers + UNFUSED_SAMPLING_LAUNCHES;
+    let full = input.mode == CfieMode::Full;
 
-    // 4. Per-layer KV quantisation.
-    let kv_quant = if input.mode == CfieMode::Full {
+    // Advisory per-layer KV precision ranking.
+    let kv_quant = if full && input.kv_quant_advisory {
         plan_kv_quant(&input.kv_quant, input.weights)
     } else {
         KvQuantPlan::default()
     };
+    let speculative = if full { input.speculative.clone() } else { None };
 
-    // 5. Compiled speculative (optional).
-    let speculative = if input.mode == CfieMode::Full {
-        input
-            .speculative
-            .as_ref()
-            .map(|cfg| emit_spec(cfg.clone(), input.speculative_acceptance))
-    } else {
-        None
-    };
-
-    // 6. Grammar DFA (optional).  Pre-compiled token DFAs (G12 serve
-    // pipeline) win over edge-list specs; both get Hopcroft-minimised
-    // (the audit flagged `minimise` as implemented-but-never-called) —
-    // fewer states means a smaller baked mask, same language.
-    let grammar = if input.mode == CfieMode::Full {
-        input
-            .grammar_dfa
-            .clone()
-            .or_else(|| input.grammar.as_ref().and_then(|spec| compile_dfa(spec).ok()))
-            .map(|dfa| minimise_dfa(&dfa))
-    } else {
-        None
-    };
-
-    // Kernel-launch accounting.
-    let baseline = 500u32; // paper §1's "~500-1000 launches/token" figure
-    let saved_persistent = (persistent.baseline_launches_per_layer
-        .saturating_sub(persistent.persistent_launches_per_layer))
-        * input.persistent_model.n_layers;
-    // Sampling + residual layers: one fused kernel versus six.
-    let saved_sampling = if sampling.is_fused() { 5 } else { 0 };
-    let cfie_launches = baseline.saturating_sub(saved_persistent + saved_sampling);
-
-    // CFIE's product is launch collapse — it fuses the per-token decode into
-    // persistent kernels — so the honest rewrite count is the number of
-    // per-token launches it removed, not a count of IR nodes it touched
-    // (there are none; CFIE never sees a WengertList, which is why the
-    // registry files it as OutOfBand).
-    let launches_eliminated = baseline.saturating_sub(cfie_launches) as usize;
-    if launches_eliminated == 0 {
+    if input.mode == CfieMode::Off {
         crate::pass_trace::record_disposition("CFIE", PassDisposition::Declined {
-            reason: DeclineReason::NoCandidates(
-                "neither the persistent decode nor the fused sampler removed a launch",
-            ),
+            reason: DeclineReason::ModeOff,
         });
     } else {
-        crate::pass_trace::record_disposition("CFIE", PassDisposition::Applied {
-            rewrites: launches_eliminated,
-        });
+        // CFIE's product is launch collapse; the rewrite count is the
+        // number of per-token launches the plan removes from the nominal
+        // unfused pipeline (CFIE never sees a WengertList, which is why
+        // the registry files it as OutOfBand).
+        let planned = persistent.persistent_launches_per_layer * n_layers
+            + if sampling.is_fused() { 1 } else { UNFUSED_SAMPLING_LAUNCHES };
+        let launches_eliminated = baseline.saturating_sub(planned) as usize;
+        if launches_eliminated == 0 {
+            crate::pass_trace::record_disposition("CFIE", PassDisposition::Declined {
+                reason: DeclineReason::NoCandidates(
+                    "neither the persistent decode nor the fused sampler removed a launch",
+                ),
+            });
+        } else {
+            crate::pass_trace::record_disposition("CFIE", PassDisposition::Applied {
+                rewrites: launches_eliminated,
+            });
+        }
     }
     CfiePlan {
         mode: input.mode,
         target_gpu: input.target_gpu.to_string(),
         kv,
         sampling,
+        sampling_configured: input.sampling_configured,
         persistent,
         kv_quant,
         speculative,
-        grammar,
+        n_layers,
         kernel_launches_per_token_baseline: baseline,
-        kernel_launches_per_token_cfie: cfie_launches,
         solve_us: t0.elapsed().as_micros() as u64,
-        decode_attention_kernel: None,
-        decode_attention_ptx: None,
-        decode_block_kernel: None,
-        decode_block_ptx: None,
-        spec_verify_kernel: None,
-        spec_verify_ptx: None,
-        spec_reject_kernel: None,
-        spec_reject_ptx: None,
-        grammar_mask_ptx: None,
-        quant_attention_kernels: Vec::new(),
-        fused_sample_kernel: None,
-        fused_sample_ptx: None,
-        decode_attention_launch: None,
-        fused_sample_launch: None,
-        decode_block_launch: None,
-        spec_verify_launch: None,
-        spec_reject_launch: None,
-        quant_attention_launch: None,
-        draft_block_kernel: None,
-        draft_block_ptx: None,
-        draft_sample_kernel: None,
-        draft_sample_ptx: None,
-        verify_probs_kernel: None,
-        verify_probs_ptx: None,
-        draft_block_launch: None,
-        draft_sample_launch: None,
-        verify_probs_launch: None,
+        decode_block: CfieKernel::default(),
+        fused_sample: CfieKernel::default(),
+        draft_block: CfieKernel::default(),
+        draft_sample: CfieKernel::default(),
         speculative_draft: None,
         runtime_wiring_emitted: false,
-        cost_estimate: None,
     }
 }
 
@@ -938,6 +561,7 @@ mod tests {
                 dtype_bytes: 2,
             },
             sampling: SamplingParams::default(),
+            sampling_configured: true,
             persistent_model: PersistentModel {
                 d_model: 512,
                 head_dim: 64,
@@ -950,113 +574,184 @@ mod tests {
             gpu_budget: GpuBudget::default(),
             max_active_requests: 32,
             kv_quant: KvQuantConfig::new(8, 4, 128),
+            kv_quant_advisory: true,
             weights: None,
             speculative: Some(SpeculativeConfig::default()),
-            speculative_acceptance: 0.6,
-            grammar: None,
-            grammar_dfa: None,
         }
+    }
+
+    fn launch(grid_x: u32, block_x: u32) -> CfieLaunchSpec {
+        CfieLaunchSpec { grid_x, block_x, smem_dyn_bytes: 0 }
+    }
+
+    /// The plan the serve wiring produces for a build with the decode
+    /// path emitted.
+    fn emitted_plan() -> CfiePlan {
+        let mut plan = run(nslcoder_input());
+        plan.decode_block = CfieKernel::emitted("nsl_cfie_decode_block".into(), "BLOCK".into(), launch(1, 128));
+        plan.fused_sample = CfieKernel::emitted("nsl_cfie_fused_sample".into(), "SAMPLE".into(), launch(1, 128));
+        plan.runtime_wiring_emitted = true;
+        plan
     }
 
     #[test]
     fn full_mode_populates_every_pass() {
         let plan = run(nslcoder_input());
         assert_eq!(plan.mode, CfieMode::Full);
-        assert!(plan.kv.direct.is_some() || plan.kv.bump.is_some());
+        assert!(plan.kv.direct.is_some());
         assert!(plan.sampling.is_fused());
         assert!(plan.speculative.is_some());
         assert!(!plan.kv_quant.layers.is_empty());
     }
 
     #[test]
-    fn off_mode_does_not_emit_speculative_or_grammar() {
+    fn off_and_sampling_modes_plan_no_speculation_and_no_advisory() {
+        for mode in [CfieMode::Off, CfieMode::Sampling] {
+            let mut input = nslcoder_input();
+            input.mode = mode;
+            let plan = run(input);
+            assert!(plan.speculative.is_none(), "{mode:?}");
+            assert!(plan.kv_quant.layers.is_empty(), "{mode:?}");
+        }
+    }
+
+    /// The baseline is the planner's own count for THIS model, not the
+    /// proposal's "~500" (a 32-layer figure): 12 launches per layer for 8
+    /// layers, plus 6 for the sampling tail.
+    #[test]
+    fn the_baseline_is_counted_from_the_model() {
+        let plan = run(nslcoder_input());
+        assert_eq!(plan.persistent.baseline_launches_per_layer, 12);
+        assert_eq!(plan.kernel_launches_per_token_baseline, 12 * 8 + 6);
         let mut input = nslcoder_input();
-        input.mode = CfieMode::Off;
-        let plan = run(input);
-        assert!(plan.speculative.is_none());
-        assert!(plan.grammar.is_none());
+        input.persistent_model.n_layers = 32;
+        assert_eq!(run(input).kernel_launches_per_token_baseline, 12 * 32 + 6);
+    }
+
+    /// The launch count is what the decode loop does — one decode-block
+    /// launch per layer and one sampler launch — and exists only when
+    /// both kernels are in the build.  The report used to print 407 for
+    /// this model.
+    #[test]
+    fn launches_per_token_are_the_decode_loops() {
+        let plan = run(nslcoder_input());
+        assert_eq!(plan.kernel_launches_per_token(), None, "nothing emitted yet");
+        let plan = emitted_plan();
+        assert_eq!(plan.kernel_launches_per_token(), Some(9));
+        let rep = plan.render_report();
+        assert!(rep.contains("Kernel launches per generated token: 9 (8 decode-block + 1 sampler"), "{rep}");
+        assert!(rep.contains("would make 102 (12 per layer + 6 for the sampling tail)"), "{rep}");
+        assert!(!rep.contains("407") && !rep.contains("500"), "{rep}");
     }
 
     #[test]
-    fn grammar_when_supplied_activates_mask_and_dfa() {
-        let mut input = nslcoder_input();
-        input.grammar = Some(GrammarSpec::sequence(&[5, 6, 7], 32_000));
-        let plan = run(input);
-        assert!(plan.grammar.is_some());
-        // The sampler must have grammar masking turned on.
-        assert!(plan.sampling.params.grammar_masked);
+    fn the_report_claims_no_speed_and_no_batching() {
+        let rep = emitted_plan().render_report();
+        for gone in ["us/token", "tok/s", "Estimated", "Continuous batching", "speedup", "baseline,"] {
+            assert!(!rep.contains(gone), "the report still prints `{gone}`:\n{rep}");
+        }
+        assert!(rep.contains("Speed: not measured."), "{rep}");
+        assert!(rep.contains("Requests: one sequence at a time"), "{rep}");
+    }
+
+    /// One statement per kernel: emitted and registered, or not emitted
+    /// and why.  The report used to say the decode block was "registered
+    /// at serve init" two lines above "decode-block/spec kernels NOT
+    /// registered".
+    #[test]
+    fn the_report_says_one_thing_about_each_kernel() {
+        let rep = emitted_plan().render_report();
+        assert!(rep.contains("[4] Decode block (planner: fusion=level3): nsl_cfie_decode_block emitted (5 bytes PTX, registered at serve init)"), "{rep}");
+        assert!(rep.contains("Kernels: 2 (nsl_cfie_decode_block, nsl_cfie_fused_sample); registered at serve init."), "{rep}");
+        for absent in ["NOT emitted", "NOT registered", "NOT available"] {
+            assert!(!rep.contains(absent), "`{absent}` in:\n{rep}");
+        }
+
+        let mut plan = emitted_plan();
+        plan.decode_block = CfieKernel::refused("static shared memory of 70000 bytes exceeds the 49152-byte limit of one thread block");
+        let rep = plan.render_report();
+        assert!(rep.contains("[4] Decode block (planner: fusion=level3): NOT emitted — static shared memory of 70000 bytes"), "{rep}");
+        assert!(!rep.contains("nsl_cfie_decode_block emitted"), "{rep}");
+        // The sampler was built, but with no decode block nothing would
+        // launch it, so it is not registered and the report says so.
+        assert!(rep.contains("nsl_cfie_fused_sample emitted (6 bytes PTX, NOT registered: the decode path is incomplete"), "{rep}");
+        assert!(rep.contains("Kernels: none registered in this build."), "{rep}");
+        assert!(kernel_registrations(&plan).is_empty());
+        assert!(rep.contains("generate(): NOT available in this build — the decode-block kernel was not emitted: static shared memory"), "{rep}");
+        assert!(rep.contains("Kernel launches per generated token: none"), "{rep}");
     }
 
     #[test]
-    fn grammar_dfa_input_wins_and_is_minimised() {
-        use crate::cfie_grammar::GrammarEdge;
-        // 4-state DFA with two merge-equivalent middle states; Hopcroft
-        // must collapse them (proves cfie::run actually calls minimise).
-        let spec = GrammarSpec {
-            num_states: 4,
+    fn generate_needs_both_kernels() {
+        let plan = run(nslcoder_input());
+        let why = plan.generate_unavailable().unwrap();
+        assert!(why.contains("the decode-block kernel was not emitted"), "{why}");
+        assert!(why.contains("the fused sampler kernel was not emitted"), "{why}");
+        let mut plan = emitted_plan();
+        assert_eq!(plan.generate_unavailable(), None);
+        plan.fused_sample = CfieKernel::refused("top_k 100 is outside 1..=64");
+        let why = plan.generate_unavailable().unwrap();
+        assert_eq!(why, "the fused sampler kernel was not emitted: top_k 100 is outside 1..=64");
+    }
+
+    #[test]
+    fn the_report_names_defaulted_sampler_settings() {
+        let mut input = nslcoder_input();
+        input.sampling_configured = false;
+        let rep = run(input).render_report();
+        assert!(rep.contains("[2] Sampler: temperature 0.7, top_k 50, top_p 0.9 (DEFAULTS — no sampling: section set them)"), "{rep}");
+        let rep = run(nslcoder_input()).render_report();
+        assert!(rep.contains("(from the sampling: section)"), "{rep}");
+    }
+
+    #[test]
+    fn the_kv_precision_line_is_fp16_and_the_ranking_is_labelled() {
+        let rep = run(nslcoder_input()).render_report();
+        assert!(rep.contains("[5] KV precision: FP16 in every layer"), "{rep}");
+        assert!(rep.contains("advisory, NOT applied:"), "{rep}");
+        assert!(rep.contains("The ranking is relative"), "{rep}");
+        assert!(!rep.contains("memory savings"), "{rep}");
+        let mut input = nslcoder_input();
+        input.kv_quant_advisory = false;
+        let rep = run(input).render_report();
+        assert!(!rep.contains("advisory"), "{rep}");
+    }
+
+    #[test]
+    fn the_speculative_section_states_the_cost_not_a_speedup() {
+        let mut plan = emitted_plan();
+        plan.draft_block = CfieKernel::emitted("nsl_cfie_decode_block".into(), "D".into(), launch(1, 128));
+        plan.draft_sample = CfieKernel::emitted("nsl_cfie_draft_sample".into(), "S".into(), launch(1, 128));
+        plan.speculative_draft = Some(CfieSpeculativeDraft {
+            weights_path: "draft.safetensors".into(),
+            n_layers: 2,
+            d_model: 256,
+            n_heads: 2,
+            n_kv_heads: 1,
+            head_dim: 128,
+            d_ff: 704,
             vocab_size: 32_000,
-            start_state: 0,
-            accept_states: vec![3],
-            edges: vec![
-                GrammarEdge { from: 0, token_id: 0, to: 1 },
-                GrammarEdge { from: 0, token_id: 1, to: 2 },
-                GrammarEdge { from: 1, token_id: 0, to: 3 },
-                GrammarEdge { from: 2, token_id: 0, to: 3 },
-            ],
-        };
-        let dfa = crate::cfie_grammar::compile(&spec).unwrap();
-        let mut input = nslcoder_input();
-        input.grammar_dfa = Some(dfa.clone());
-        let plan = run(input);
-        let planned = plan.grammar.expect("grammar_dfa must reach the plan");
-        assert!(
-            planned.num_states < dfa.num_states,
-            "minimise must merge equivalent states: {} vs {}",
-            planned.num_states,
-            dfa.num_states
-        );
-        assert!(plan.sampling.params.grammar_masked);
-    }
-
-    #[test]
-    fn report_includes_baked_mask_line_when_present() {
-        let mut input = nslcoder_input();
-        input.grammar = Some(GrammarSpec::sequence(&[5, 6, 7], 32_000));
-        let mut plan = run(input);
-        let dfa = plan.grammar.as_ref().unwrap();
-        plan.grammar_mask_ptx = Some(crate::cfie_grammar_ptx::emit_mask_global(dfa));
+            pool_bytes: 1 << 20,
+            k_tokens: 4,
+            target_n_layers: 8,
+        });
         let rep = plan.render_report();
-        assert!(rep.contains("mask baked into module image"));
-    }
-
-    #[test]
-    fn launch_reduction_positive_on_h100() {
-        let plan = run(nslcoder_input());
-        assert!(plan.kernel_launches_per_token_cfie < plan.kernel_launches_per_token_baseline);
-        assert!(plan.launch_reduction() > 0.0);
-    }
-
-    #[test]
-    fn report_contains_all_six_sections() {
-        let plan = run(nslcoder_input());
-        let rep = plan.render_report();
-        assert!(rep.contains("CFIE Inference Build Report"));
-        assert!(rep.contains("[1] KV layout"));
-        assert!(rep.contains("[2] Fused decode-sample"));
-        assert!(rep.contains("[3] Compiled speculative"));
-        assert!(rep.contains("[4] Persistent decode"));
-        assert!(rep.contains("[5] Per-layer KV quant"));
-        assert!(rep.contains("[6] Grammar DFA"));
-        assert!(rep.contains("Continuous batching: on"));
+        // 4 draft steps of 2 + 1 launches, 4 target steps of 8 + 1.
+        assert!(rep.contains("up to 48 launches per round for at most 4 tokens, against 9 per token without a draft"), "{rep}");
+        assert!(rep.contains("SLOWER than plain decoding"), "{rep}");
+        assert!(rep.contains("nsl_cfie_speculative_generate"), "{rep}");
+        let regs = kernel_registrations(&plan);
+        assert_eq!(regs.iter().map(|r| r.kind).collect::<Vec<_>>(), [2, 6, 7, 1]);
     }
 
     #[test]
     fn deterministic_across_calls() {
         let r1 = run(nslcoder_input()).render_report();
         let r2 = run(nslcoder_input()).render_report();
+        // Strip the trailing "Solve time" line which varies.
         let strip = |s: &str| {
             s.lines()
-                .filter(|l| !l.contains("Solve time"))
+                .filter(|l| !l.starts_with("Solve time"))
                 .collect::<Vec<_>>()
                 .join("\n")
         };
@@ -1073,123 +768,23 @@ mod tests {
     }
 
     #[test]
-    fn sampling_mode_skips_quant_and_speculative() {
-        let mut input = nslcoder_input();
-        input.mode = CfieMode::Sampling;
-        let plan = run(input);
-        assert!(plan.speculative.is_none());
-        assert!(plan.kv_quant.layers.is_empty());
-    }
-
-    // ── Cycle 6: family chooser + registration list (pure fns) ──────
-
-    const SPEC_1X128: CfieLaunchSpec = CfieLaunchSpec {
-        grid_x: 1,
-        block_x: 128,
-        smem_dyn_bytes: 0,
-    };
-
-    #[test]
-    fn family_chooser_quant_wins_when_quant_kernels_exist() {
-        let mut plan = run(nslcoder_input());
-        assert_eq!(choose_kernel_family(&plan), CfieKernelFamily::Uniform);
-        plan.quant_attention_kernels = vec![("k".into(), "p".into())];
-        assert_eq!(choose_kernel_family(&plan), CfieKernelFamily::Quant);
-    }
-
-    #[test]
-    fn kernel_registrations_uniform_family_lists_emitted_kernels_plus_sampler() {
-        let mut plan = run(nslcoder_input());
-        plan.decode_attention_kernel = Some("attn".into());
-        plan.decode_attention_ptx = Some("ptx_attn".into());
-        plan.decode_attention_launch = Some(CfieLaunchSpec {
-            grid_x: 8,
-            block_x: 128,
-            smem_dyn_bytes: 0,
-        });
-        plan.decode_block_kernel = Some("blk".into());
-        plan.decode_block_ptx = Some("ptx_blk".into());
-        plan.decode_block_launch = Some(SPEC_1X128);
-        plan.spec_reject_kernel = Some("rej".into());
-        plan.spec_reject_ptx = Some("ptx_rej".into());
-        plan.spec_reject_launch = Some(CfieLaunchSpec {
-            grid_x: 1,
-            block_x: 32,
-            smem_dyn_bytes: 0,
-        });
-        plan.fused_sample_kernel = Some("samp".into());
-        plan.fused_sample_ptx = Some("ptx_samp".into());
-        plan.fused_sample_launch = Some(SPEC_1X128);
-
-        let regs = kernel_registrations(&plan);
-        assert_eq!(
-            regs.iter().map(|r| r.kind).collect::<Vec<_>>(),
-            vec![0, 2, 4, 1],
-            "uniform family: whichever of 0/2/3/4 exist, plus kind 1"
-        );
-        assert!(regs.iter().all(|r| r.layer_idx == 0));
-        assert!(regs.iter().all(|r| r.smem_dyn == 0));
-        let attn = &regs[0];
-        assert_eq!((attn.grid_x, attn.block_x), (8, 128));
-        let rej = regs.iter().find(|r| r.kind == 4).unwrap();
-        assert_eq!((rej.grid_x, rej.block_x), (1, 32));
-    }
-
-    #[test]
-    fn kernel_registrations_quant_family_excludes_uniform_kv_kernels() {
-        let mut plan = run(nslcoder_input());
-        // Uniform kernels emitted on the plan...
-        plan.decode_attention_kernel = Some("attn".into());
-        plan.decode_attention_ptx = Some("ptx_attn".into());
-        plan.decode_attention_launch = Some(SPEC_1X128);
-        plan.decode_block_kernel = Some("blk".into());
-        plan.decode_block_ptx = Some("ptx_blk".into());
-        plan.decode_block_launch = Some(SPEC_1X128);
-        // ...but the quant family wins registration.
-        plan.quant_attention_kernels = vec![
-            ("q0".into(), "ptx_q0".into()),
-            ("q1".into(), "ptx_q1".into()),
-        ];
-        plan.quant_attention_launch = Some(CfieLaunchSpec {
-            grid_x: 4,
-            block_x: 128,
-            smem_dyn_bytes: 0,
-        });
-        plan.fused_sample_kernel = Some("samp".into());
-        plan.fused_sample_ptx = Some("ptx_samp".into());
-        plan.fused_sample_launch = Some(SPEC_1X128);
-
-        let regs = kernel_registrations(&plan);
-        assert_eq!(
-            regs.iter().map(|r| (r.kind, r.layer_idx)).collect::<Vec<_>>(),
-            vec![(5, 0), (5, 1), (1, 0)],
-            "quant family: kind 5 per layer + kind 1; kinds 0/2/3/4 excluded"
-        );
-        assert_eq!(regs[0].name, "q0");
-        assert_eq!(regs[1].name, "q1");
-    }
-
-    #[test]
-    fn kernel_registrations_skip_kernels_without_launch_spec() {
-        let mut plan = run(nslcoder_input());
-        plan.decode_attention_kernel = Some("attn".into());
-        plan.decode_attention_ptx = Some("ptx_attn".into());
-        // decode_attention_launch deliberately left None.
+    fn kernel_registrations_list_emitted_kernels_only() {
+        let plan = run(nslcoder_input());
         assert!(kernel_registrations(&plan).is_empty());
+        let regs = kernel_registrations(&emitted_plan());
+        assert_eq!(regs.len(), 2);
+        assert_eq!((regs[0].kind, regs[0].name.as_str()), (2, "nsl_cfie_decode_block"));
+        assert_eq!((regs[1].kind, regs[1].name.as_str()), (1, "nsl_cfie_fused_sample"));
+        assert!(regs.iter().all(|r| r.layer_idx == 0 && r.smem_dyn == 0));
+        assert_eq!((regs[0].grid_x, regs[0].block_x), (1, 128));
     }
 
     #[test]
-    fn report_family_line_none_without_kernels_and_named_with() {
-        let mut plan = run(nslcoder_input());
-        assert!(plan
-            .render_report()
-            .contains("Kernel family: none registered"));
-        plan.fused_sample_kernel = Some("nsl_cfie_fused_sample".into());
-        plan.fused_sample_ptx = Some("ptx".into());
-        plan.fused_sample_launch = Some(SPEC_1X128);
+    fn report_without_wiring_does_not_claim_registration() {
+        let mut plan = emitted_plan();
+        plan.runtime_wiring_emitted = false;
         let rep = plan.render_report();
-        assert!(rep.contains("Kernel family: uniform"));
-        assert!(rep.contains("fused sampler kernel: nsl_cfie_fused_sample emitted"));
-        assert!(!rep.contains("launch wiring pending"));
+        assert!(!rep.contains("registered at serve init"), "{rep}");
+        assert!(rep.contains("runtime wiring NOT emitted on this serve path (report-only)"), "{rep}");
     }
 }

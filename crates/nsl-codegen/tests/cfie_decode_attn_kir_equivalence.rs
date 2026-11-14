@@ -38,9 +38,12 @@
 //! barrier).
 //!
 //! The interpreter models `ex2.approx.f32` as `f32::exp2` and `cvt` with
-//! `half`, so it does not prove the hardware's approximation — the device
-//! parity suite (`cfie_decode_attn_gpu_parity.rs`) and the `ptxas` gate
-//! carry fidelity to the machine. What it proves is what the migration put
+//! `half`, so it does not prove the hardware's approximation — the `ptxas`
+//! gate, and the device suites of the decode block that is assembled from
+//! these sections (`cfie_decode_block_gpu_parity.rs`), carry fidelity to
+//! the machine. (The standalone kernel is no longer registered by any
+//! build, and its own device suite went with its launch function.) What
+//! it proves is what the migration put
 //! at risk: same control flow, same addressing, same access widths, same
 //! floating-point operations in the same order.
 //!
@@ -340,7 +343,7 @@ fn the_kir_kernel_keeps_the_ffi_signature_and_entry_name() {
 #[test]
 fn the_kir_kernel_keeps_the_hand_kernels_baked_header_lines() {
     // Sibling CFIE kernels compare these lines with the decode kernel's
-    // byte for byte (see cfie_persistent_ptx / cfie_speculative_ptx).
+    // byte for byte (see cfie_persistent_ptx).
     for (g, _) in cases() {
         let header = |ptx: &str| -> Vec<String> {
             ptx.lines().take_while(|l| l.starts_with("//")).map(str::to_string).collect()

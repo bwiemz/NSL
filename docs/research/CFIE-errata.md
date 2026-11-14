@@ -43,8 +43,8 @@ With q(x*) = 1 the rule reproduces the target exactly: the total-variation
 distance was about 1e-17 on five random 8-token cases. With the softmax
 probability as the denominator, and the residual read as the target with the
 drafted token's probability reduced by the draft probability, the distance on
-the same cases was 0.17 to 0.58. The shipped code follows the pseudo-code on
-this point (Part 3).
+the same cases was 0.17 to 0.58. The shipped code followed the pseudo-code
+on this point until November 2026; it now uses the correct rule (Part 3).
 
 **Source.** Numeric check: exact enumeration of the rule's output
 distribution.
@@ -252,72 +252,100 @@ The citations for PagedAttention (SOSP 2023), speculative decoding
 ## Part 3 — What the code implements
 
 CFIE is implemented in part. It is switched on by any of the serve-block keys
-`kv_layout`, `kv_quant`, `sampling:` with `fused`, `speculative:` or
-`grammar:` (any one activates full mode), by the command-line flags
+`kv_layout`, `kv_quant`, `sampling:` with `fused`, or `speculative:` (any one
+activates full mode), by the command-line flags
 `--cfie [full|sampling|off]` and `--cfie-report PATH`, or by the decorator
 `@cfie(mode=, target=)`. Serve-block parsing is in
 `crates/nsl-codegen/src/cfie_serve.rs`, kernel emission is wired in
 `crates/nsl-codegen/src/serve.rs`, and the runtime driver is
 `crates/nsl-runtime/src/cfie/engine.rs` (`nsl_cfie_generate`,
-`nsl_cfie_decode_step`).
+`nsl_cfie_decode_step`, `nsl_cfie_speculative_generate`).
+
+A build carries two kernels, the decode block and the fused sampler, and two
+more for a draft model when `speculative:` is configured. Every kernel a
+build registers is launched by a generation driver. The engine serves one
+sequence at a time, and each kernel runs on one thread block.
 
 No shipped model uses CFIE: `models/coder50m/generate.nsl` re-runs the full
 forward pass for every token, with no KV cache, and samples with the standard
-library's `sample_top_k`. The CFIE GPU tests are marked `#[ignore]`, run on
-synthetic toy weights, and compare against CPU mirrors of the same algorithm.
-The repository contains no measurement of CFIE's speed.
+library's `sample_top_k`. CFIE binds only checkpoints with HF-Llama weight
+names, stored `[out][in]`; a checkpoint saved by an NSL model has other
+names and the other layout, and there is no exporter. The CFIE GPU tests are
+marked `#[ignore]` and run on synthetic toy weights. The repository contains
+no measurement of CFIE's speed, and the build report prints none.
 
 The codegen files named below are under `crates/nsl-codegen/src/`.
 
 - **Static KV layout (§2.1; key `kv_layout`) — implemented, narrower than
   proposed.** `cfie_kv_plan.rs` plans a contiguous half-precision pool laid
   out as `[layers][2][slots × per_slot][kv_heads][head_dim]`, with a slot
-  allocator on the host. The GPU-side bump allocator that the
-  `static_with_bump` layout names does not exist; it is a descriptor that
-  nothing consumes. A standalone decode-attention kernel
-  (`cfie_decode_attention.rs`) is registered and never launched.
+  allocator on the host, when `max_batch` sequences of `max_seq` tokens fit
+  the GPU's memory. When they do not, the plan is paged and no decode
+  kernel is emitted; `kv_layout: "static"` is then a compile error. There
+  is no bump allocator.
 - **Fused decode-sample (§2.2; sub-block `sampling:`) — implemented.**
   `cfie_fused_sample.rs` and `cfie_sample_ptx.rs` emit one CTA of 128
-  threads. Top-k is a serial replace-minimum on one thread, k is at most 64,
-  and the vocabulary size must be a multiple of 128. Temperature, top-k and
-  top-p are fixed at compile time, and the `params` argument of `generate()`
-  is ignored, which is documented. There is no repetition penalty. The code
-  differs from the proposal in two places and is right in both: its nucleus
-  rule keeps the crossing token (E5), and its softmax maximum is taken over
-  the candidates rather than over all logits including grammar-masked ones.
+  threads. Top-k is a serial replace-minimum on one thread, k is at most 64
+  (a larger `top_k` is a compile error), and the vocabulary size must be a
+  multiple of 128. Temperature, top-k and top-p are fixed at compile time,
+  and the `params` argument of `generate()` is ignored, which is
+  documented. A non-zero temperature must come with a `top_k`; `top_p` is
+  optional. Each token has its own random draw, keyed by `sampling: seed:`,
+  the request's index in the process and the token's position. There is no
+  repetition penalty. The code differs from the proposal in two places and
+  is right in both: its nucleus rule keeps the crossing token (E5), and its
+  softmax maximum is taken over the candidates rather than over all logits.
 - **Compiled speculative decoding (§2.3; sub-block `speculative:`) —
-  partial.** `cfie_speculative.rs`, `cfie_speculative_ptx.rs` and
-  `cfie_spec_sampler_ptx.rs` implement a linear greedy draft only. The
-  target verifies with K sequential single-token passes, not the proposal's
-  single batched forward. A tree-mask verification kernel is emitted and
-  registered and never launched; the `tree`, `medusa` and `lookahead`
-  methods are refused when `draft_weights` is set and are plan-only
-  otherwise. The keys `speculative.temperature`, `min_acceptance_rate` and
-  `share_kv` are parsed and never read. On the acceptance rule neither side
-  is right: the code implements the proposal's rule (E1).
+  implemented for a greedy draft model, with no speedup.** A draft model
+  compiled into the binary (`draft_weights`) proposes K tokens greedily
+  (`cfie_spec_sampler_ptx.rs` is its sampler). The target is then stepped
+  through the same positions, one at a time, and its own fused sampler
+  draws each token; a drawn token that equals the drafted one confirms the
+  next drafted input, and the first that differs ends the round
+  (`speculative_rounds` in the engine). For a greedy draft this is the
+  correct rule of E1 — the drafted token is emitted with the target's
+  probability of it, and otherwise the token comes from the target with
+  the drafted one removed — so the output is exactly what plain decoding
+  emits. The proposal's single batched verification pass does not exist,
+  so a round costs K draft steps on top of one target step per token:
+  speculation is slower than plain decoding, and the build report says so.
+  The `tree`, `medusa` and `lookahead` methods, `tree_width`, a draft
+  temperature and a `speculative:` section with no draft model are compile
+  errors.
 - **Persistent decode kernel (§2.4) — partial.** `cfie_persistent.rs` and
   `cfie_persistent_ptx.rs` emit a one-CTA whole-layer kernel, and only when
-  its static shared-memory footprint is at most 48 KB. Fusion levels 1 and 2
-  are plan-only. There is no on-device scheduler: the request ring is
-  initialised and never consumed, and the binary serves one sequence at a
-  time. The one-CTA design is the proposal's, and it is the problem (E2).
-- **Per-layer KV precision (§2.5; key `kv_quant`) — partial, read side
-  only.** `cfie_kv_quant.rs` plans a per-layer FP16-or-INT8 choice and
-  `cfie_kv_quant_ptx.rs` emits the matching read kernels. No kernel writes
-  INT8 KV, and nothing launches the read kernels outside tests. The INT8
-  scale is a launch-time parameter rather than a baked constant, which is
-  the better choice.
+  its static shared-memory footprint is at most 48 KB (a model of d_model
+  4096 does not fit, and `generate()` is then a compile error). Fusion
+  levels 1 and 2 are planner verdicts with no kernel. The kernel is
+  launched once per layer per token and exits; there is no on-device
+  scheduler and no request queue. Its rotary embedding pairs element j of
+  a head with element j + head_dim/2, as `stdlib/nsl/nn/rope.nsl` and
+  HF-Llama checkpoints do. The one-CTA design is the proposal's, and it is
+  the problem (E2).
+- **Per-layer KV precision (§2.5; key `kv_quant`) — advisory only.** The KV
+  pool is half precision in every layer. `cfie_kv_quant.rs` computes a
+  per-layer ranking that `kv_quant: "auto"` prints in the build report,
+  labelled as not applied; the ranking is relative to the model's other
+  layers and is not a measure of sensitivity. `kv_quant: "uniform_int8"`
+  is a compile error: no kernel writes or reads INT8 KV.
 - **CSHA decode fusion (§2.6) — subsumed** by the persistent decode kernel.
-- **Grammar-constrained decoding (§2.2, §3; sub-block `grammar:`) —
-  partial.** `cfie_grammar.rs` and `cfie_grammar_ptx.rs` build a byte-level
-  DFA, project it onto tokens, minimise it, and bake one token bitmask per
-  state into the kernel module; the sampler applies the mask. The transition
-  table is not shipped to the runtime and the automaton's state stays at 0,
-  so the grammar is not advanced from token to token. The baked masks are
-  capped at 16 × 2^20 cells, about 340 states at a 49,152-token vocabulary.
+- **Grammar-constrained decoding (§2.2, §3; sub-block `grammar:`) — not
+  available.** A `grammar:` section is a compile error. `cfie_grammar.rs`
+  and `cfie_grammar_ptx.rs` can build a byte-level DFA from a JSON Schema
+  (`schema_convert.rs`), project it onto tokens, minimise it and bake one
+  token bitmask per state, and the sampler kernel can apply such a mask,
+  but no driver advances the automaton from token to token or handles
+  end-of-sequence, so none of it is reachable from a serve block. The
+  baked masks are capped at 16 × 2^20 cells, about 340 states at a
+  49,152-token vocabulary.
 - **WGGO integration (§5) — report-only.** WGGO (Wengert Graph Global
   Optimization) is NSL's joint optimisation pass. `wggo_cfie.rs` is
   advisory, produces a report only, and is off by default.
+- **Build report (§3) — implemented, with different content.** It states
+  which kernels the build carries or why one is missing, the launches per
+  token the decode loop makes (layers + 1) beside a count of the
+  operations an unfused pipeline would launch, and that speed is not
+  measured. It prints no latency, throughput or speedup.
 
 Three older, separate paths cover some of the same ground:
 `@speculative(...)` with the `speculative_decode(...)` intrinsic,
@@ -329,9 +357,10 @@ Defects found in this code are listed in Part 5.
 
 ## Part 4 — Recommended direction
 
-1. Fix §2.3 first: use q(x*) = 1 for a greedy draft and resample from
-   max(0, p − q); give verification the same temperature, top-k and top-p
-   as the sampler; batch the K verification positions into one launch.
+1. In §2.3, use q(x*) = 1 for a greedy draft and resample from
+   max(0, p − q), with the sampler's temperature, top-k and top-p (the code
+   now does). Then batch the K verification positions into one launch:
+   without that, speculation costs time.
 2. Replace the one-CTA block with a few multi-CTA kernels whose loads are
    coalesced along weight rows (estimated 10–50× at 50M scale; not measured).
 3. Use Gumbel-max sampling, as FlashSampling does, in place of serial top-k.
@@ -359,143 +388,185 @@ directory are under `crates/nsl-codegen/src/`.
   the multinomial draw. Temperature 0 is now greedy
   (`stdlib/nsl/inference/sampling.nsl`; test
   `crates/nsl-cli/tests/sampling_temperature_zero_gate.rs`).
+- Every token was drawn at the same quantile. `generate()` passed seed 0 and
+  every step reused it, so the sampler's uniform draw was 0.0528 at each
+  step: "temperature 0.7, top-p 0.9" picked the top token whenever it held
+  5.3% of the kept mass. A request now has a key made from the configured
+  seed (`sampling: seed:`, default 0) and its index in the process, and the
+  draw at each position is seeded from the key and the position
+  (`request_key`, `step_seed`, `nsl_cfie_decode_step` in the engine).
+  `crates/nsl-codegen/tests/cfie_sampling_distribution.rs` runs the sampler
+  kernel for 3,000 positions and compares the token counts with the exact
+  probabilities; `cfie_speculative_generate_gpu_e2e.rs` does the same on the
+  GPU through `nsl_cfie_generate`.
+- Speculative decoding did not sample the target distribution. The draft is
+  greedy, yet a token was accepted when r < p_target/p_draft with p_draft
+  the draft's softmax value: target [0.3, 0.7] with draft softmax
+  [0.6, 0.4] gave [0.5, 0.5]. The rejection kernel is gone. The target's
+  own sampler now draws the token at each drafted position, and the round
+  continues while the draw equals the draft (`speculative_rounds` in the
+  engine), which for a greedy draft is the exact rule of E1. The engine's
+  unit tests enumerate the emitted token over a grid of quantiles and find
+  each token at its target probability, and check that the output is plain
+  decoding's for every draft tried.
+- Speculative verification ignored the sampler's settings: acceptance and
+  correction used a softmax at temperature 1 with no top-k or top-p, so
+  with `temperature: 0.0` the target's argmax was emitted with probability
+  0.44 or 0.69 where it should be 1. Verification is now the configured
+  sampler itself; the kernel that wrote the temperature-1 row is gone. The
+  GPU test requires speculative output to equal plain decoding for a
+  greedy target and for a temperature-0.7, top-k, top-p target, with a
+  draft that mispredicts.
+- A grammar restricted every token to the start state's token set: the
+  driver always passed state 0 while the baked mask was bound, so
+  `{"type":"boolean"}` yielded an endless run of `true`/`false` tokens. A
+  `grammar:` section is now a compile error that says the automaton is not
+  stepped (`validate_serve_config` in `crates/nsl-semantic/src/cfie.rs`,
+  `prepare` in `cfie_serve.rs`).
+- A grammar state with no allowed token emitted token id 0: every candidate
+  was masked to minus infinity, the probabilities became NaN, and the walk
+  fell back to the first candidate slot. The sampler kernel now writes an
+  id outside the vocabulary (`NO_CANDIDATE` in `cfie_sample_ptx.rs`) when
+  it has no candidate, which also covers a model whose output is NaN, and
+  the decode loop treats that id as a failure.
+- The decode block's RoPE was not the convention NSL models use. It rotated
+  adjacent pairs (2p, 2p+1); `stdlib/nsl/nn/rope.nsl` and HF-Llama
+  checkpoints rotate pairs (j, j + d/2), and the same q and k gave
+  different attention. The kernel and its CPU reference now use the
+  half-split pairing (`rope_pairs` in `cfie_persistent_ptx.rs`), and
+  `cfie_persistent_kir_equivalence.rs` checks the kernel's rotated keys
+  against values NumPy computed from the standard library's formula.
+- Weight binding compared element counts, so a matrix stored `[in][out]`
+  bound silently and was read transposed. Rank and every dimension are
+  compared now, and a transposed matrix is refused and named as such
+  (`check_weight_shape` in the engine). What is still missing is under
+  Open.
+- `norm_eps` did not reach the sampler kernels: the fused sampler and the
+  draft sampler baked 1e-5 for the final norm. Both take the configured
+  value (`FusedSampleKernelConfig::norm_eps`,
+  `SpecSamplerConfig::norm_eps`).
+- The KV-precision planner's score was presented as a sensitivity and
+  applied. It is min-max normalised across layers, so some layer always
+  scores 0 and some layer 1 whatever the real sensitivity. Nothing applies
+  the plan any more; `kv_quant: "auto"` prints it in the build report as an
+  advisory ranking, with that caveat in the line. A unit test gives the
+  same plan to a model whose most prominent layer exceeds the others by
+  0.2% and to one where it exceeds them 200-fold (`cfie_kv_quant.rs`).
+- The JSON-schema grammar was not JSON: integers allowed leading zeros
+  (`00`), strings were printable ASCII with no escapes, every property was
+  required, and whitespace was an unbounded run of spaces. Integers and
+  numbers now follow the JSON number grammar, strings take JSON's escapes
+  and well-formed UTF-8, `required` decides which properties are
+  mandatory, and at most one space is allowed where whitespace may go
+  (`schema_convert.rs`). Its tests enumerate what the grammar accepts and
+  parse every string with `serde_json`. Members are accepted in one order
+  only (the property names sorted), which is narrower than JSON Schema.
+- Common configurations built a binary whose `generate()` always refused:
+  `kv_layout: "static"` with no `kv_quant` key selected read-only quantised
+  kernels and excluded the decode block; d_model 4096 exceeds the 48 KB
+  shared-memory limit; `top_k: 100` skipped the sampler with only a note.
+  The first now builds the decode path. In the other cases, and whenever
+  the decode block or the sampler is not in the build, a `generate()` call
+  is a compile error that names the missing kernel and the reason
+  (`run_cfie_for_serve` in `serve.rs`; `cfie_serve_end_to_end.rs`).
+- `static_with_bump` sized the pool for the full envelope it had found too
+  big (a 137 GB pool on an 80 GB card in one build) and said a GPU-side
+  bump allocator would handle it; none existed. The layout kind is gone.
+  An envelope that does not fit is a paged plan with no decode kernel, and
+  `kv_layout: "static"` with such an envelope is a compile error that
+  gives both sizes (`plan` in `cfie_kv_plan.rs`).
+- Sampling keys were filled in or dropped without notice: a `sampling:`
+  section with only `temperature` got top_k = 50 and top_p = 0.9, and the
+  `speculative:` key `temperature` was stored and never read. A non-zero
+  temperature without `top_k` is now an error, a missing `top_p` means no
+  nucleus filter, and a non-zero `speculative: temperature`, `tree_width`,
+  the `tree`, `medusa` and `lookahead` methods, the `draft` key, and a
+  `speculative:` section with no `draft_weights` are errors. With no
+  `sampling:` section the defaults still apply, and the report names them
+  as defaults.
+- The build report's launch counts were placeholders: a hard-coded baseline
+  of 500 and "407 (vs 500 baseline)" for an 8-layer model that makes 9
+  launches per token. The report now prints the decode loop's count
+  (layers + 1) and, beside it, the planner's count for an unfused pipeline
+  (12 per layer + 6), labelled as a count of operations
+  (`kernel_launches_per_token` in `cfie.rs`).
+- The report described a batched mode that does not exist ("Continuous
+  batching: on", "Estimated throughput (batch=64)") and estimated latency
+  by dividing by the whole GPU's bandwidth. Those lines and the cost model
+  behind them (`cfie_cost.rs`) are removed. The report says the engine
+  serves one sequence at a time and that speed is not measured.
+- The report contradicted itself on the decode block ("registered at serve
+  init" two lines above "decode-block/spec kernels NOT registered"). Each
+  kernel now has one line: emitted and registered, or not emitted and why.
+- The report promised a speculative speedup ("expected speedup=1.50×", from
+  1 + K·p/(1 + K) with a placeholder p = 0.6) that the driver cannot give.
+  The figure is removed; the speculative section states the launches per
+  round and that speculation is slower than plain decoding.
+- Prefill ran the full LM-head sampler on every prompt token and discarded
+  the result. Only the last prompt position runs the sampler now
+  (`target_prefill` in the engine).
+- The speculative GPU test could not detect the acceptance defect: its CPU
+  reference applied the same rule as the kernel. That reference is deleted
+  with the kernel. `cfie_speculative_generate_gpu_e2e.rs` now compares
+  decoded token counts with exact probabilities and requires speculative
+  output to equal plain decoding.
+- Three kernel kinds were emitted and never launched, and a request ring
+  was initialised and never consumed. The tree-mask verification kernel
+  and the per-layer INT8/FP16 read kernels are deleted with their launch
+  functions and tests; the request ring and its `nsl_cfie_ring_*` functions
+  are deleted. The standalone decode-attention kernel is no longer emitted
+  into any binary or registered (`nsl_cfie_launch_decode_attn` is deleted);
+  its builder remains in `cfie_decode_attention.rs` because the decode
+  block is assembled from its sections, and its interpreter and assembler
+  tests remain as the tests of those sections.
 
-Nothing else below has been fixed.
+In the older paths:
+
+- `@speculative` draft sampling was not random: the draft sampler derived
+  its "random" number from the step index alone (0.6322, 0.9495, 0.2376 for
+  steps 0, 1, 2 of every request). It now draws from the runtime's seeded
+  generator (`stochastic_sample` in
+  `crates/nsl-runtime/src/speculative/draft.rs`).
+- `@speculative` verification was seeded by the first draft token id. It
+  takes a seed from the runtime's generator
+  (`nsl_speculative_decode_step`). A unit test drafts from one distribution,
+  verifies against another and checks 20,000 emitted tokens against the
+  target's probabilities.
+- `@speculative` tree verification accepted any token whose target
+  probability exceeded 0.01 at a non-zero temperature and never resampled.
+  `nsl_speculative_verify_tree` now refuses a non-zero temperature;
+  greedy tree verification is unchanged.
+- `nsl_grammar_init` built an automaton that masked every token. It now
+  refuses: it is given no transitions to build from. A grammar is installed
+  from a real table with `install_grammar` in
+  `crates/nsl-runtime/src/grammar.rs`.
+- Two sampling tests asserted nothing (`tests/m19_topk_test.nsl`,
+  `tests/test_sampling.nsl`) and no harness ran them. They are replaced by
+  `crates/nsl-cli/tests/sampling_distribution_gate.rs`, which checks the
+  standard library samplers' token counts against exact probabilities and
+  that a seed reproduces a draw.
 
 ### Open
 
-- **Every token is drawn at the same quantile.** `generate()` passes seed 0
-  and every step reuses it, so the sampler's uniform draw is 0.0528 at each
-  step: "temperature 0.7, top-p 0.9" picks the top token whenever it holds
-  5.3% of the kept mass. Each request and position should get its own draw.
-  `compile_call` (`expr/calls.rs`); `nsl_cfie_generate` and
-  `nsl_cfie_decode_step` (the engine); `build` (`cfie_sample_ptx.rs`).
-  Numeric check.
-- **Speculative decoding does not sample the target distribution.** The
-  draft is greedy, yet a token is accepted when r < p_target/p_draft with
-  p_draft the draft's softmax value. Target [0.3, 0.7] with draft softmax
-  [0.6, 0.4] gives [0.5, 0.5]; p_draft = 1 gives the target (E1).
-  `build_draft_sample` (`cfie_spec_sampler_ptx.rs`), `build_rejection`
-  (`cfie_speculative_ptx.rs`). Numeric check.
-- **Speculative verification ignores the sampler's settings.** Acceptance
-  and correction use a softmax at temperature 1 with no top-k or top-p. With
-  `temperature: 0.0` and target softmax [0.55, 0.45], the target's argmax is
-  emitted with probability 0.44 against draft softmax [0.2, 0.8] and 0.69
-  against [0.8, 0.2]; it should be 1. `build_verify_probs`
-  (`cfie_spec_sampler_ptx.rs`). Numeric check (greedy case only).
-- **A grammar restricts every token to the start state's token set.** The
-  driver always passes state 0 (its comment says "unconstrained") while the
-  baked mask is bound, so `{"type":"boolean"}` yields an endless run of
-  `true`/`false` tokens; nothing handles end-of-sequence. It should step
-  the automaton per token, or refuse at compile time. `nsl_cfie_generate`,
-  `nsl_cfie_engine_finalize` (the engine). By reading the code only.
-- **A grammar state with no allowed token emits token id 0.** Every
-  candidate is masked to minus infinity, the probabilities become NaN, and
-  the walk falls back to the first candidate slot. An empty mask row should
-  be an error. `build` (`cfie_sample_ptx.rs`). By reading the code only.
-- **The decode block's RoPE is not the convention NSL models use.** It
-  rotates adjacent pairs (2p, 2p+1); `stdlib/nsl/nn/rope.nsl` rotates pairs
-  (i, i + d/2). The same q and k give different attention probabilities,
-  equal only after permuting the projection rows. The GPU tests' CPU
-  reference uses the same adjacent-pair rule, so they pass. `rope_pairs`
-  (`cfie_persistent_ptx.rs`). Numeric check.
-- **Weight binding checks names and element counts, not layout.** Only
-  HF-Llama names are accepted and `[out][in]` is assumed, so a square
-  `[in][out]` matrix binds silently. An NSL checkpoint (`[in, out]`, names
-  like `blocks.i.attn.wq`, tied head) is refused by name, and there is no
-  exporter. `resolve_and_upload_model`, `upload_named` (the engine). By
-  reading the code only.
-- **`norm_eps` does not reach the sampler kernels.** The decode block takes
-  the configured epsilon; the fused sampler and the speculative sampler
-  kernels bake 1e-5 for the final norm. `RMS_EPS` (`cfie_sample_ptx.rs`,
-  `cfie_spec_sampler_ptx.rs`). By reading the code only.
-- **The KV-precision planner's score is relative, not absolute.** The
-  largest singular values are min-max normalised across layers, so some
-  layer always scores 0 and some layer 1 whatever the real sensitivity.
-  `min_max_normalize` (`cfie_kv_quant.rs`). By reading the code only.
-- **The JSON-schema grammar is not JSON.** Integers allow leading zeros
-  (`00`); strings are printable ASCII with no escapes; every property is
-  required, in map-iteration order; whitespace is an unbounded run of
-  spaces. `integer_element`, `string_element`, `convert_object`
-  (`schema_convert.rs`). By reading the code only.
-- **Common configurations build a binary whose `generate()` always
-  refuses.** `kv_layout: "static"` with no `kv_quant` key selects the
-  quantised kernels, which exclude the decode block; d_model 4096 exceeds
-  the 48 KB gate; `top_k: 100` skips the sampler with only a note. It should
-  be a compile error. `run_cfie_for_serve` (`serve.rs`). Reproduced by
-  running (the builds); the run-time refusal by reading the code only.
-- **`static_with_bump` sizes the pool for the full envelope it found too
-  big.** The plan says a GPU-side bump allocator handles fragmentation; none
-  exists, and direct-index kernels are emitted for max_batch × max_seq: a
-  137 GB pool on an 80 GB card in the case built. `plan`
-  (`cfie_kv_plan.rs`), `run_cfie_for_serve` (`serve.rs`). Reproduced by
-  running (the build); the pool formula by reading the code only.
-- **Sampling keys are filled in or dropped without notice.** A `sampling:`
-  section with only `temperature` gets top_k = 50 and top_p = 0.9. The
-  `speculative:` key `temperature` is stored and never read; the draft is
-  always greedy. `sampling_params`, `extract_speculative`
-  (`cfie_serve.rs`). By reading the code only.
-- **The build report's launch counts are placeholders.** The baseline is a
-  hard-coded 500. An 8-layer example prints "407 (vs 500 baseline)" and
-  "2069.4us/token", of which 2,035 µs is 407 × 5 µs; the real path makes
-  n_layers + 1 = 9 launches, and the planner's own baseline is 102. `run`
-  (`cfie.rs`), `estimate` (`cfie_cost.rs`). Reproduced by running.
-- **The report describes a batched mode that does not exist.** It prints
-  "Continuous batching: on" and "Estimated throughput (batch=64)" for a
-  binary that serves one sequence at a time, and its memory term divides by
-  the whole GPU's peak bandwidth although the kernels are single-CTA.
-  `render_report` (`cfie.rs`), `estimate` (`cfie_cost.rs`). Reproduced by
-  running.
-- **The report contradicts itself on the decode block.** For the shipped
-  `examples/cfie_serve_static.nsl` it prints that the persistent decode
-  block is "registered at serve init" two lines above "decode-block/spec
-  kernels NOT registered". `render_report` (`cfie.rs`). Reproduced by
-  running.
-- **The report promises a speculative speedup the driver cannot give.** A
-  round runs K draft steps, K sequential full target steps and a serial
-  vocabulary walk for at most K + 1 tokens: slower than plain decoding. The
-  report prints "expected speedup=1.50×" from 1 + K·p/(1 + K) with a
-  placeholder p = 0.6. `nsl_cfie_speculative_generate` (the engine),
-  `expected_speedup` (`cfie_speculative.rs`). By reading the code only.
-- **Decode kernels read weights uncoalesced, and prefill samples.** Each of
-  128 threads walks its own weight row with scalar half-precision loads, so
-  a warp's 32 loads hit 32 rows; estimated, not measured, at milliseconds
-  per token for the 50M model. Prefill also runs the full LM-head sampler on
-  every prompt token and discards the result. `dot_rows`
-  (`cfie_persistent_ptx.rs`), `nsl_cfie_generate`. By reading the code only.
-- **The speculative GPU test cannot detect the acceptance defect.** Its CPU
-  reference applies the same rule as the kernel, so a draft that differs
-  from the target still passes. `cpu_reference_reject`
-  (`cfie_speculative_ptx.rs`), used by
-  `crates/nsl-codegen/tests/cfie_speculative_generate_gpu_e2e.rs`. By reading
-  the code only.
-- **Three kernel kinds are emitted and never launched.** The standalone
-  decode-attention kernel, the tree-mask verification kernel and the
-  per-layer INT8/FP16 read kernels are launched only from tests; the request
-  ring is initialised and never consumed. `nsl_cfie_launch_decode_attn`,
-  `nsl_cfie_launch_spec_verify`, `nsl_cfie_launch_quant_attn` (the engine).
-  By reading the code only.
-
-#### Older paths in scope
-
-These predate CFIE and are separate from it (Part 3, last paragraph).
-
-- **`@speculative` draft sampling is not random.** The draft sampler derives
-  its "random" number from the step index alone: 0.6322, 0.9495, 0.2376 for
-  steps 0, 1, 2 of every request. `stochastic_sample` in
-  `crates/nsl-runtime/src/speculative/draft.rs`. Numeric check.
-- **`@speculative` verification is seeded by the first draft token id.**
-  `nsl_speculative_decode_step` in
-  `crates/nsl-runtime/src/speculative/ffi.rs`. By reading the code only.
-- **`@speculative` tree verification is not rejection sampling.** At a
-  non-zero temperature it accepts any token whose target probability
-  exceeds 0.01 and never resamples. `nsl_speculative_verify_tree` in
-  `crates/nsl-runtime/src/speculative/ffi.rs`. By reading the code only.
-- **`nsl_grammar_init` builds an automaton that masks every token.** It has
-  no transitions and all-zero masks, so `nsl_grammar_apply_mask` masks the
-  whole vocabulary. It has no production caller.
-  `crates/nsl-runtime/src/grammar.rs`. By reading the code only.
-- **Two sampling tests assert nothing.** `tests/m19_topk_test.nsl` prints
-  "deterministic RNG: PASS" without comparing its two seeded draws, and
-  `tests/test_sampling.nsl` prints its samples and "PASS" with no check. By
-  reading the code only.
+- **An NSL-trained checkpoint cannot be served.** Binding accepts HF-Llama
+  weight names and reads matrices `[out][in]`. An NSL checkpoint
+  (`[in, out]`, names like `blocks.i.attn.wq`, tied head) is refused by
+  name, and there is no exporter. A square matrix stored `[in][out]` under
+  an HF-Llama name has the expected shape and cannot be detected.
+  CFIE's logits have never been compared with an NSL model's own forward
+  pass; that comparison is the test that would close this.
+  `resolve_and_upload_model` (the engine). By reading the code only.
+- **Decode kernels read weights uncoalesced.** Each of 128 threads walks its
+  own weight row with scalar half-precision loads, so a warp's 32 loads hit
+  32 rows; estimated, not measured, at milliseconds per token for the 50M
+  model. This is the one-CTA design of E2. `dot_rows`
+  (`cfie_persistent_ptx.rs`). By reading the code only.
+- **Speculative decoding is slower than plain decoding.** The target
+  verifies one position per step, so a draft adds work and saves none. It
+  needs a batched verification pass (Part 4, item 1). The output is
+  correct, and the build report states the cost.
+  `nsl_cfie_speculative_generate` (the engine). By reading the code only.
+- **The WGGO advisory model still credits speculation with a speedup.**
+  `wggo_cfie.rs` divides a layer's cost by 1 + K·p/(1 + K) when it
+  considers speculative decoding. The model is advisory and off by
+  default. By reading the code only.

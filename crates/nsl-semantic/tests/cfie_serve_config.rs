@@ -1,6 +1,6 @@
-//! CFIE Tier-A wiring (audit gap G3): serve-block CFIE config
-//! validation — flat `kv_layout` / `kv_quant` / `max_seq` keys and the
-//! nested `sampling:` / `speculative:` / `grammar:` sections.
+//! Serve-block CFIE config validation — flat `kv_layout` / `kv_quant` /
+//! `max_seq` keys and the nested `sampling:` / `speculative:` sections —
+//! and the refusal of every request nothing would honour.
 
 use nsl_errors::FileId;
 use nsl_lexer::Interner;
@@ -35,17 +35,13 @@ serve Inference:
         temperature: 0.7
         top_k: 50
         top_p: 0.9
+        seed: 7
         fused: true
 
     speculative:
-        draft: "draft.nslm"
         tokens: 5
-        method: "tree"
-        tree_width: 2
-
-    grammar:
-        schema: "output_schema.json"
-        tokenizer: "vocab.txt"
+        method: "standard"
+        draft_weights: "draft.safetensors"
 
     @endpoint
     fn generate(prompt: str) -> str:
@@ -100,7 +96,7 @@ fn non_bool_fused_is_rejected() {
 
 #[test]
 fn unknown_speculative_method_is_rejected() {
-    let src = VALID_CFIE_SERVE.replace("\"tree\"", "\"eagle3\"");
+    let src = VALID_CFIE_SERVE.replace("\"standard\"", "\"eagle3\"");
     let errs = analyze_errs(&src);
     assert!(
         errs.iter().any(|m| m.contains("method")),
@@ -123,7 +119,7 @@ serve Inference:
     max_batch: 32
     max_seq: 2048
     kv_layout: "static"
-    kv_quant: "auto"
+    kv_quant: "uniform_fp16"
     target_gpu: "h100"
 
     sampling:
@@ -133,10 +129,9 @@ serve Inference:
         fused: true
 
     speculative:
-        draft: "draft.nslm"
         tokens: 5
-        method: "tree"
-        tree_width: 2
+        method: "standard"
+        temperature: 0.0
         draft_weights: "draft.safetensors"
         draft_n_layers: 2
         draft_d_model: 256
@@ -144,10 +139,6 @@ serve Inference:
         draft_n_kv_heads: 4
         draft_head_dim: 64
         draft_d_ff: 1024
-
-    grammar:
-        schema: "output_schema.json"
-        tokenizer: "vocab.txt"
 
     @endpoint
     fn generate(prompt: str) -> str:
@@ -226,50 +217,112 @@ fn unknown_sampling_key_is_rejected() {
     );
 }
 
+/// The one error in `errs` that contains `needle`, or a panic that shows
+/// what was reported instead.
+fn expect_error(errs: &[String], needle: &str) {
+    assert!(
+        errs.iter().any(|m| m.contains(needle)),
+        "expected an error containing `{needle}`, got: {errs:?}"
+    );
+}
+
+/// A `grammar:` section used to be accepted and to build a sampler that
+/// held every token to the grammar's start state.
 #[test]
-fn grammar_without_schema_is_rejected() {
-    let src = VALID_CFIE_SERVE.replace("schema: \"output_schema.json\"", "schema: \"x.json\"");
-    // sanity: still valid
+fn a_grammar_section_is_refused() {
+    let src = VALID_CFIE_SERVE.replace(
+        "    @endpoint",
+        "    grammar:\n        schema: \"output_schema.json\"\n        tokenizer: \"vocab.txt\"\n\n    @endpoint",
+    );
+    let errs = analyze_errs(&src);
+    expect_error(&errs, "serve `grammar:` is not supported");
+    assert_eq!(errs.len(), 1, "{errs:?}");
+}
+
+#[test]
+fn int8_kv_is_refused() {
+    for spelling in ["uniform_int8", "int8"] {
+        let src = VALID_CFIE_SERVE.replace("kv_quant: \"auto\"", &format!("kv_quant: \"{spelling}\""));
+        expect_error(&analyze_errs(&src), "INT8 KV is not supported");
+    }
+    for spelling in ["uniform_fp16", "fp16", "off", "auto"] {
+        let src = VALID_CFIE_SERVE.replace("kv_quant: \"auto\"", &format!("kv_quant: \"{spelling}\""));
+        assert!(analyze_errs(&src).is_empty(), "{spelling}");
+    }
+}
+
+/// A section with only `temperature` used to get top_k = 50 and
+/// top_p = 0.9 without notice.
+#[test]
+fn a_temperature_without_top_k_is_refused() {
+    let src = VALID_CFIE_SERVE.replace("        top_k: 50\n", "");
+    expect_error(&analyze_errs(&src), "a non-zero temperature needs top_k");
+    // top_p is optional, and greedy needs neither.
+    let src = VALID_CFIE_SERVE.replace("        top_p: 0.9\n", "");
     assert!(analyze_errs(&src).is_empty());
-    let src2 = VALID_CFIE_SERVE.replace(
-        "    grammar:\n        schema: \"output_schema.json\"\n        tokenizer: \"vocab.txt\"\n",
-        "    grammar:\n        strict: true\n",
-    );
-    let errs = analyze_errs(&src2);
-    assert!(
-        errs.iter().any(|m| m.contains("schema")),
-        "expected missing-schema error, got: {errs:?}"
-    );
+    let src = VALID_CFIE_SERVE
+        .replace("temperature: 0.7", "temperature: 0.0")
+        .replace("        top_k: 50\n", "")
+        .replace("        top_p: 0.9\n", "");
+    assert!(analyze_errs(&src).is_empty(), "{:?}", analyze_errs(&src));
+}
+
+/// `top_k: 100` used to pass the checker and then skip the sampler kernel
+/// with only a note, leaving a binary whose generate() always refused.
+#[test]
+fn a_top_k_the_sampler_cannot_hold_is_refused() {
+    let src = VALID_CFIE_SERVE.replace("top_k: 50", "top_k: 100");
+    expect_error(&analyze_errs(&src), "top_k must be an integer in [1, 64]");
+    let src = VALID_CFIE_SERVE.replace("top_k: 50", "top_k: 64");
+    assert!(analyze_errs(&src).is_empty());
 }
 
 #[test]
-fn grammar_tokenizer_must_be_a_string() {
-    let src = VALID_CFIE_SERVE.replace("tokenizer: \"vocab.txt\"", "tokenizer: 5");
-    let errs = analyze_errs(&src);
-    assert!(
-        errs.iter().any(|m| m.contains("tokenizer")),
-        "expected tokenizer error, got: {errs:?}"
-    );
+fn a_negative_seed_is_rejected() {
+    let src = VALID_CFIE_SERVE.replace("seed: 7", "seed: -1");
+    expect_error(&analyze_errs(&src), "seed must be a non-negative integer");
 }
 
+/// A shape key that is not a positive integer literal used to fall back to
+/// a default without a word, and `rope_theta: 0` baked NaN into the
+/// decode kernel's rotation.
 #[test]
-fn grammar_without_tokenizer_is_semantically_valid() {
-    // Codegen refuses schema-without-tokenizer (G12); semantically the
-    // key is optional so the refusal can carry the actionable message.
-    let src = VALID_CFIE_SERVE.replace("        tokenizer: \"vocab.txt\"\n", "");
-    let errs = analyze_errs(&src);
-    assert!(errs.is_empty(), "expected clean analysis, got: {errs:?}");
+fn shape_keys_and_baked_constants_must_be_positive() {
+    let with = |line: &str| VALID_CFIE_SERVE.replace("    target_gpu: \"h100\"\n", &format!("    target_gpu: \"h100\"\n    {line}\n"));
+    assert!(analyze_errs(&with("n_layers: 8")).is_empty());
+    assert!(analyze_errs(&with("rope_theta: 500000.0")).is_empty());
+    assert!(analyze_errs(&with("norm_eps: 0.000001")).is_empty());
+    for (line, needle) in [
+        ("n_layers: 0", "n_layers must be an integer in [1, 16777216]"),
+        ("n_layers: -2", "n_layers must be an integer"),
+        ("d_model: 4294967297", "d_model must be an integer"),
+        ("head_dim: \"wide\"", "head_dim must be an integer"),
+        ("vocab_size: 0", "vocab_size must be an integer"),
+        ("max_new_tokens: 0", "max_new_tokens must be an integer"),
+        ("rope_theta: 0", "rope_theta must be a positive number"),
+        ("rope_theta: -10000.0", "rope_theta must be a positive number"),
+        ("norm_eps: 0.0", "norm_eps must be a positive number"),
+    ] {
+        expect_error(&analyze_errs(&with(line)), needle);
+    }
 }
 
+/// Each of these was accepted, stored and never read.
 #[test]
-fn unknown_grammar_key_names_both_expected_keys() {
-    let src = VALID_CFIE_SERVE.replace("tokenizer: \"vocab.txt\"", "vocab: \"vocab.txt\"");
-    let errs = analyze_errs(&src);
-    assert!(
-        errs.iter()
-            .any(|m| m.contains("expected schema or tokenizer")),
-        "expected unknown-key error, got: {errs:?}"
-    );
+fn speculative_settings_with_no_driver_are_refused() {
+    for (from, to, needle) in [
+        ("method: \"standard\"", "method: \"tree\"", "method \"tree\" is not supported"),
+        ("method: \"standard\"", "method: \"medusa\"", "method \"medusa\" is not supported"),
+        ("method: \"standard\"", "method: \"lookahead\"", "method \"lookahead\" is not supported"),
+        ("tokens: 5", "tokens: 5\n        tree_width: 2", "tree_width is not supported"),
+        ("tokens: 5", "tokens: 5\n        temperature: 0.8", "speculative temperature is not supported"),
+        ("tokens: 5", "tokens: 5\n        draft: \"draft.nslm\"", "speculative `draft` is not supported"),
+        ("        draft_weights: \"draft.safetensors\"\n", "", "the section needs draft_weights"),
+    ] {
+        let src = VALID_CFIE_SERVE.replace(from, to);
+        assert_ne!(src, VALID_CFIE_SERVE, "`{from}` not found in the fixture");
+        expect_error(&analyze_errs(&src), needle);
+    }
 }
 
 #[test]

@@ -1,8 +1,11 @@
-//! The differential equivalence gate for the CFIE draft sampler and verify
-//! prob-row writer (roadmap A2 step 9, third slice).
+//! The differential equivalence gate for the CFIE draft sampler (roadmap A2
+//! step 9, third slice).
 //!
-//! `cfie_spec_sampler_ptx` emitted both kernels as hand-assembled PTX; it
-//! now builds them as KIR. This file runs the frozen hand emitter
+//! `cfie_spec_sampler_ptx` emitted the kernel as hand-assembled PTX; it now
+//! builds it as KIR. (It held a second kernel, the verification prob-row
+//! writer, which was removed with the rejection kernel it fed; the frozen
+//! fixture still carries its hand emitter, unused.) This file runs the
+//! frozen hand emitter
 //! (`tests/fixtures/cfie_spec_sampler_hand.rs`) and the KIR one side by
 //! side on the cooperative-CTA interpreter
 //! (`tests/support/cta_ptx_interp.rs`), the spec's level 3:
@@ -11,13 +14,10 @@
 //!    schedules, the hand module and the KIR module leave *the same bytes*
 //!    in all of global memory.
 //! 2. **Correctness** — the draft's token is `cpu_reference_draft_sample`'s
-//!    and its probability and the verify row are the references' to float
-//!    tolerance (the interpreter's `ex2` and `rsqrt` are exact where the
-//!    references' are libm's; nothing else differs).
-//! 3. **The self-speculation anchor** — with the same weights, the draft's
-//!    `p = 1 / sum` equals the verify row at the drafted token bit for bit.
-//!    The engine's determinism proof rests on exactly this.
-//! 4. **The gate bites** — deleting a barrier that matters, nudging a
+//!    and its probability is the reference's to float tolerance (the
+//!    interpreter's `ex2` and `rsqrt` are exact where the reference's are
+//!    libm's; nothing else differs).
+//! 3. **The gate bites** — deleting a barrier that matters, nudging a
 //!    baked constant, relaxing the first-max-wins comparison, or dropping
 //!    a tail-tile guard is caught. The mutants that are *not* caught are
 //!    named, with why they are equivalent.
@@ -26,8 +26,7 @@ use std::collections::HashMap;
 
 use half::f16;
 use nsl_codegen::cfie_spec_sampler_ptx::{
-    cpu_reference_draft_sample, cpu_reference_verify_probs, emit_draft_sample, emit_verify_probs,
-    SpecSamplerConfig,
+    cpu_reference_draft_sample, emit_draft_sample, SpecSamplerConfig,
 };
 
 /// The one `crate::` path the frozen emitter names, supplied from the
@@ -57,7 +56,6 @@ const SENTINEL: u32 = 0x7FC0_0001;
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Kernel {
     Draft,
-    Verify,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -68,7 +66,7 @@ struct Geometry {
 
 impl Geometry {
     fn cfg(&self) -> SpecSamplerConfig {
-        SpecSamplerConfig { d_model: self.d_model, vocab_size: self.vocab, vocab_tile: 128 }
+        SpecSamplerConfig { d_model: self.d_model, vocab_size: self.vocab, vocab_tile: 128, norm_eps: 1e-5 }
     }
 
     fn hand_cfg(&self) -> hand::SpecSamplerConfig {
@@ -124,14 +122,12 @@ fn scaled_inputs(g: Geometry, seed: u64, scale: f32) -> Inputs {
 }
 
 /// Global memory after running `ptx`: `[hidden, norm_w, lm_head, out,
-/// prob]`, where `out` is the token (draft) or the row (verify) and `prob`
-/// is the draft's probability (unused by verify).
+/// prob]`, where `out` is the token and `prob` its softmax probability.
 fn run(ptx: &str, kernel: Kernel, g: Geometry, input: &Inputs, order: Order) -> Vec<Vec<u8>> {
     let prog = parse(ptx);
     let f32s = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
     let out_words = match kernel {
         Kernel::Draft => 1,
-        Kernel::Verify => g.vocab as usize,
     };
     let mut global = vec![
         Segment { base: HIDDEN_BASE, bytes: f32s(&input.hidden) },
@@ -154,9 +150,6 @@ fn run(ptx: &str, kernel: Kernel, g: Geometry, input: &Inputs, order: Order) -> 
             args.insert("out_prob_ptr".into(), PROB_BASE);
             args.insert("rng_seed".into(), 0x5eed);
         }
-        Kernel::Verify => {
-            args.insert("out_probs_ptr".into(), OUT_BASE);
-        }
     }
     let mut launch = Launch {
         prog: &prog,
@@ -178,14 +171,12 @@ fn run(ptx: &str, kernel: Kernel, g: Geometry, input: &Inputs, order: Order) -> 
 fn kir_ptx(kernel: Kernel, g: Geometry) -> String {
     match kernel {
         Kernel::Draft => emit_draft_sample(&g.cfg()).0,
-        Kernel::Verify => emit_verify_probs(&g.cfg()).0,
     }
 }
 
 fn hand_ptx(kernel: Kernel, g: Geometry) -> String {
     match kernel {
         Kernel::Draft => hand::emit_draft_sample(&g.hand_cfg()).0,
-        Kernel::Verify => hand::emit_verify_probs(&g.hand_cfg()).0,
     }
 }
 
@@ -216,7 +207,7 @@ fn cases() -> Vec<Geometry> {
 fn the_kir_kernels_agree_with_the_hand_written_ones_bit_for_bit() {
     for g in cases() {
         let input = inputs(g, 0x5eed ^ g.d_model as u64);
-        for kernel in [Kernel::Draft, Kernel::Verify] {
+        for kernel in [Kernel::Draft] {
             let (hand, kir) = (hand_ptx(kernel, g), kir_ptx(kernel, g));
             for order in [Order::Ascending, Order::Descending] {
                 let expect = run(&hand, kernel, g, &input, order);
@@ -249,44 +240,16 @@ fn the_draft_picks_the_reference_token_and_probability() {
 }
 
 #[test]
-fn the_verify_row_is_the_reference_softmax() {
-    for g in cases() {
-        let input = inputs(g, 0x5eed ^ g.d_model as u64);
-        let mem = run(&kir_ptx(Kernel::Verify, g), Kernel::Verify, g, &input, Order::Ascending);
-        let got: Vec<f32> = words(&mem[3]).into_iter().map(f32::from_bits).collect();
-        let want = cpu_reference_verify_probs(&g.cfg(), &input.hidden, &input.norm_w, &input.lm_head_f32());
-        assert_eq!(got.len(), want.len());
-        for (i, (a, b)) in got.iter().zip(&want).enumerate() {
-            assert!((a - b).abs() <= 1e-5 * (1e-6 + b.abs()), "{g:?}: row[{i}] = {a}, reference {b}");
-        }
-    }
-}
-
-#[test]
-fn the_draft_probability_is_the_verify_row_at_the_drafted_token_bit_for_bit() {
-    for g in cases() {
-        let input = inputs(g, 0x5eed ^ g.d_model as u64);
-        let draft = run(&kir_ptx(Kernel::Draft, g), Kernel::Draft, g, &input, Order::Descending);
-        let verify = run(&kir_ptx(Kernel::Verify, g), Kernel::Verify, g, &input, Order::Ascending);
-        let token = words(&draft[3])[0] as usize;
-        assert_eq!(words(&draft[4])[0], words(&verify[3])[token], "{g:?}: the reject ratio would not be 1");
-    }
-}
-
-#[test]
 fn inputs_are_left_untouched() {
     let g = cases()[4];
     let input = inputs(g, 7);
-    for kernel in [Kernel::Draft, Kernel::Verify] {
+    for kernel in [Kernel::Draft] {
         let mem = run(&kir_ptx(kernel, g), kernel, g, &input, Order::Descending);
         let fresh = run(&kir_ptx(kernel, g), kernel, g, &input, Order::Ascending);
         assert!(mem[..3] == fresh[..3], "{kernel:?} wrote to its inputs");
         let f32s: Vec<u8> = input.hidden.iter().flat_map(|x| x.to_le_bytes()).collect();
         assert_eq!(mem[0], f32s, "{kernel:?} wrote to hidden");
     }
-    // Verify never touches the draft's probability word.
-    let mem = run(&kir_ptx(Kernel::Verify, g), Kernel::Verify, g, &input, Order::Ascending);
-    assert_eq!(words(&mem[4]), [SENTINEL]);
 }
 
 #[test]
@@ -298,7 +261,6 @@ fn the_kir_kernels_keep_the_launch_abi_and_entry_names() {
                 "nsl_cfie_draft_sample",
                 &["hidden_ptr", "norm_w_ptr", "lm_head_ptr", "out_token_ptr", "out_prob_ptr", "rng_seed"][..],
             ),
-            (Kernel::Verify, "nsl_cfie_verify_probs", &["hidden_ptr", "norm_w_ptr", "lm_head_ptr", "out_probs_ptr"][..]),
         ] {
             let (hand, kir) = (parse(&hand_ptx(kernel, g)), parse(&kir_ptx(kernel, g)));
             assert_eq!(hand.params, kir.params, "the launcher marshals these positionally");
@@ -314,7 +276,7 @@ fn the_kir_kernels_keep_the_launch_abi_and_entry_names() {
 #[test]
 fn the_kir_kernels_keep_the_hand_kernels_header_lines() {
     for g in cases() {
-        for kernel in [Kernel::Draft, Kernel::Verify] {
+        for kernel in [Kernel::Draft] {
             let header = |ptx: &str| -> Vec<String> {
                 ptx.lines().take_while(|l| l.starts_with("//")).map(str::to_string).collect()
             };
@@ -403,13 +365,12 @@ fn the_mutation_case_is_what_it_claims() {
     assert_eq!(twins.count(), 2, "the planted tie is there");
     // The baseline for every mutation below: without it, `caught` could be
     // reporting a difference the mutation did not cause.
-    for kernel in [Kernel::Draft, Kernel::Verify] {
+    for kernel in [Kernel::Draft] {
         assert!(!caught(kernel, &kir_ptx(kernel, g)), "{kernel:?}");
     }
 }
 
-/// Every barrier but two is load-bearing. The two that are not, in both
-/// kernels:
+/// Every barrier but two is load-bearing. The two that are not:
 ///
 /// * the one after the cooperative hidden load (index 0): the
 ///   sum-of-squares loop that follows reads, in each thread, exactly the
@@ -426,13 +387,12 @@ fn the_mutation_case_is_what_it_claims() {
 #[test]
 fn deleting_a_load_bearing_barrier_is_caught() {
     let g = mutation_case();
-    for (kernel, expected) in [(Kernel::Draft, 13), (Kernel::Verify, 14)] {
+    for (kernel, expected) in [(Kernel::Draft, 13)] {
         let ptx = kir_ptx(kernel, g);
         let barriers = ptx.lines().filter(|l| l.trim() == "bar.sync 0;").count();
         assert_eq!(
             barriers, expected,
-            "{kernel:?}: hidden load, sum of squares, 7 reduction steps, rstd, norm, tile scores, tile end{}",
-            if kernel == Kernel::Verify { ", (max, sum) publish" } else { "" }
+            "{kernel:?}: hidden load, sum of squares, 7 reduction steps, rstd, norm, tile scores, tile end"
         );
         for n in 0..barriers {
             let equivalent = n == 0 || n == 8;
@@ -451,7 +411,7 @@ fn nudging_a_baked_constant_is_caught() {
     let g = mutation_case();
     let f = |v: f32| format!("0f{:08X}", v.to_bits());
     let inv_dm = 1.0 / g.d_model as f32;
-    for kernel in [Kernel::Draft, Kernel::Verify] {
+    for kernel in [Kernel::Draft] {
         let ptx = kir_ptx(kernel, g);
         for (prefix, from, to) in [
             ("mov.u32", format!(", {};", g.vocab), format!(", {};", g.vocab - 1)),
@@ -471,8 +431,7 @@ fn nudging_a_baked_constant_is_caught() {
 #[test]
 fn relaxing_first_max_wins_is_caught() {
     // `s > m` -> `s >= m`: the planted twin, later in the vocab, would take
-    // the argmax from the first occurrence. Only the draft tracks one; the
-    // verify row does not depend on which twin is "the" max.
+    // the argmax from the first occurrence.
     let g = mutation_case();
     let ptx = kir_ptx(Kernel::Draft, g);
     let gt: Vec<&str> = ptx.lines().filter(|l| l.trim_start().starts_with("setp.gt.f32 ")).collect();
@@ -481,9 +440,9 @@ fn relaxing_first_max_wins_is_caught() {
     assert!(caught(Kernel::Draft, &mutant), "a later tie taking the argmax went unnoticed");
 }
 
-/// The tail-tile *guards* (`tok >= vocab` skips the row dot, and in verify
-/// pass 2 the store) are caught: without them the last tile reads LM-head
-/// rows past the end, which the interpreter faults on.
+/// The tail-tile *guard* (`tok >= vocab` skips the row dot) is caught:
+/// without it the last tile reads LM-head rows past the end, which the
+/// interpreter faults on.
 ///
 /// The tail *clamp* (`cnt = min(vocab - tile, TILE)`) is an equivalent
 /// mutant: the guard stores -inf for every lane past the vocab, and
@@ -492,7 +451,7 @@ fn relaxing_first_max_wins_is_caught() {
 #[test]
 fn dropping_a_tail_tile_guard_is_caught_and_the_clamp_is_equivalent() {
     let g = mutation_case();
-    for kernel in [Kernel::Draft, Kernel::Verify] {
+    for kernel in [Kernel::Draft] {
         let ptx = kir_ptx(kernel, g);
         // The guards compare a token against the vocab: `setp.ge.u32 p,
         // tok, vocab_reg`. Find the vocab register from its materialisation.
@@ -516,7 +475,7 @@ fn dropping_a_tail_tile_guard_is_caught_and_the_clamp_is_equivalent() {
         // Tile loop exits compare the tile cursor against the vocab too;
         // the guards are the ones that are not a loop exit. Each tile loop
         // has one exit, each tile body one guard.
-        let loops = if kernel == Kernel::Draft { 1 } else { 2 };
+        let loops = 1;
         assert_eq!(guards.len(), 2 * loops, "{kernel:?}: a loop exit and a guard per tile loop");
         let mut guards_caught = 0;
         for &at in &guards {

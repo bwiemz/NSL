@@ -526,6 +526,7 @@ fn decode_step_token_sequence_matches_cpu_chain() {
             vocab_tile: 128,
             top_k: TOP_K,
             grammar_states: 0,
+            norm_eps: 1e-5,
         },
     );
     let ptx = setup_engine(Some((&s_ptx, &s_meta.kernel_name, s_meta.block_dim)));
@@ -673,6 +674,7 @@ fn decode_step_pos_mismatch_refuses_minus3_and_rolls_back() {
             vocab_tile: 128,
             top_k: TOP_K,
             grammar_states: 0,
+            norm_eps: 1e-5,
         },
     );
     let ptx = setup_engine(Some((&s_ptx, &s_meta.kernel_name, s_meta.block_dim)));

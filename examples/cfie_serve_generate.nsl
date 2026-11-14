@@ -35,6 +35,11 @@
 #   * Sampling params (temperature/top_k/top_p) are baked into the fused
 #     sample kernel at plan time; generate()'s params arg is not
 #     re-plumbed.
+#   * Draws: each token has its own random draw, keyed by the
+#     `sampling: seed:` value (default 0), the request's index in the
+#     process, and the token's position. The same binary run twice
+#     gives the same text; a second generate() call in one run does not
+#     repeat the first.
 #
 # Running actually generates tokens only on a CUDA-enabled build with a
 # real GPU + a real `model.safetensors` at the `weights:` path; the

@@ -3,8 +3,7 @@
 //!
 //! `cfie_sample_ptx` emitted the kernel as hand-assembled PTX; it now
 //! builds it as KIR, from the same hidden-load / RMSNorm / row-dot sections
-//! as `cfie_spec_sampler_ptx` and the same xorshift64* draw as
-//! `cfie_speculative_ptx`. This file runs the frozen hand emitter
+//! as `cfie_spec_sampler_ptx`. This file runs the frozen hand emitter
 //! (`tests/fixtures/cfie_sample_hand.rs`) and the KIR one side by side on
 //! the cooperative-CTA interpreter (`tests/support/cta_ptx_interp.rs`), the
 //! spec's level 3:
@@ -98,6 +97,7 @@ impl Case {
             vocab_tile: 128,
             top_k: self.params.top_k,
             grammar_states: self.states(),
+            norm_eps: 1e-5,
         }
     }
 
