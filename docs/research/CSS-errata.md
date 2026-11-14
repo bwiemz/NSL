@@ -340,24 +340,22 @@ as of 2026-11-13.
   that these are device sizes, not those of the host storage (64-bit
   indices and f64 values in every format). The model still has no callers
   (`crates/nsl-codegen/src/sparse.rs`).
+- **A sparse-plus-sparse or sparse-times-sparse result was treated as a
+  dense tensor.** The checker accepted `a + b` and `a * b` for two
+  `Sparse<...>` operands where a `Tensor` is expected, and code generation
+  registered the sparse pointer that `nsl_sparse_add` or `nsl_sparse_mul`
+  returns as an owned dense tensor, so the first dense operation on it, or
+  the cleanup at the end of the statement, would have received a sparse
+  handle. No program could reach it, because no sparse value can be
+  constructed, so a repair could not have been tested by running. Both
+  expressions are now compile errors (`check_binary_op` in
+  `crates/nsl-semantic/src/checker/ops.rs`, with the same refusal in
+  `compile_sparse_binary_op`), so the fault cannot go live unnoticed when a
+  constructor is added. Sparse-with-dense arithmetic is unaffected.
 
 ### Open, in the adjacent code
 
-- **A sparse-plus-sparse or sparse-times-sparse result is treated as a
-  dense tensor.** The checker accepts `a + b` and `a * b` for two
-  `Sparse<...>` operands and accepts the result where a `Tensor` is
-  expected.
-  `compile_sparse_binary_op` in `crates/nsl-codegen/src/expr/advanced.rs`
-  emits `nsl_sparse_add` or `nsl_sparse_mul`, which return a sparse
-  pointer, and registers that pointer as an owned dense tensor, so the
-  first dense operation or the cleanup at the end of the statement would
-  receive a sparse handle. A function with two `Sparse` parameters that
-  returns `a + b` checks and compiles today; it cannot be called, because
-  no sparse value can be constructed, so the fault has been confirmed by
-  compiling and by reading the code only. The repair is to convert the
-  sum to dense where it is produced and free the sparse intermediate, or
-  to give sparse results their own type and cleanup; either needs a way
-  to construct a sparse value before it can be tested by running.
+Nothing in this list is open.
 
 The CSR and COO kernels in `crates/nsl-kir/src/kernels/` are not part of
 this list: they are tested against an independent reference.
