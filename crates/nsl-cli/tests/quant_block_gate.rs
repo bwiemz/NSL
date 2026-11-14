@@ -29,6 +29,10 @@ fn workspace_root() -> PathBuf {
 }
 
 fn nsl(subcommand: &str, source: &str) -> std::process::Output {
+    nsl_on(subcommand, source, "cpu")
+}
+
+fn nsl_on(subcommand: &str, source: &str, target: &str) -> std::process::Output {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("prog.nsl");
     std::fs::write(&path, source).unwrap();
@@ -38,7 +42,7 @@ fn nsl(subcommand: &str, source: &str) -> std::process::Output {
         .arg(subcommand)
         .arg(&path);
     if subcommand == "run" {
-        cmd.arg("--target").arg("cpu");
+        cmd.arg("--target").arg(target);
     }
     cmd.output().unwrap()
 }
@@ -255,4 +259,43 @@ print(1)
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success(), "the run should fail; stdout: {}", String::from_utf8_lossy(&out.stdout));
     assert!(stderr.contains("axis 1 is out of range for a 1-D tensor"), "{stderr}");
+}
+
+/// A model that lives on the GPU. The quantizer works on the host: it has
+/// to stage each weight there (it used to read the tensor's data pointer as
+/// host memory whatever the device), and the quantized copy has to end up
+/// usable beside GPU activations.
+///
+/// w is [[-2.5, -1.5], [-0.5, 0.5], [1.5, 2.5]], a transposed-free 3x2
+/// matrix, plus a transposed view of the same six numbers as a second
+/// field: w2 = [[-2.5, 0.5], [-1.5, 1.5], [-0.5, 2.5]]. With x = ones,
+/// x @ w = [-1.5, 1.5] and x @ w2 = [-4.5, 4.5]. Three int8 weights over
+/// [-2.5, 2.5] are off by at most 3 * 2.5/255 < 0.03 in sum.
+///
+/// Run: cargo test -p nsl-cli --features cuda --test quant_block_gate -- --ignored
+#[test]
+#[ignore = "requires a CUDA-capable GPU and --features cuda"]
+fn a_model_on_the_gpu_goes_through_a_quant_block() {
+    let source = r#"model V(dim: int):
+    w: Tensor = (arange(0.0, 6.0) - 2.5).reshape([3, 2])
+    w2: Tensor = (arange(0.0, 6.0) - 2.5).reshape([2, 3]).transpose(0, 1)
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+    fn forward2(self, x: Tensor) -> Tensor:
+        return x @ self.w2
+
+let m = V(3)
+m.to(cuda)
+let x = ones([1, 3]).to(cuda)
+quant static q8 from m:
+    default: int8, per_tensor
+let a: Tensor = q8.forward(x)
+print(a)
+let b: Tensor = q8.forward2(x)
+print(b)
+"#;
+    let got = numbers(&nsl_on("run", source, "cuda"));
+    assert_close(&got, &[-1.5, 1.5, -4.5, 4.5], 0.03, "int8 quant block on a GPU model");
 }
