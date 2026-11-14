@@ -1127,13 +1127,10 @@ macro_rules! for_each_runtime_fn {
             [quantization] nsl_fp8_gradient_scale(i64) -> f64 = fp8::nsl_fp8_gradient_scale;
             [quantization] nsl_fp8_cache_e5m2_ptx(i64, i64) -> () = fp8::nsl_fp8_cache_e5m2_ptx;
             [quantization] nsl_fp8_update_calibration(i64, i64, f64) -> f64 = fp8::nsl_fp8_update_calibration;
-            // --- M35: AWQ 4-bit quantization ---
+            // --- M35: 4-bit packed weight, per-group round-to-nearest (named AWQ; see awq.rs) ---
             [quantization] nsl_awq_quantize(i64, i64, i64) -> i64 = awq::nsl_awq_quantize;
             [quantization] nsl_awq_matmul(i64, i64, i64) -> i64 = awq::nsl_awq_matmul;
             [quantization] nsl_awq_free(i64) -> () = awq::nsl_awq_free;
-            // AWQ calibration sidecar: apply per-channel scales to weight tensor before quantizing.
-            // Signature: (weight_ptr, scales_ptr, scales_len, alpha) -> scaled_weight_ptr
-            [quantization] nsl_awq_pre_scale_weight(i64, i64, i64, f64) -> i64 = awq::nsl_awq_pre_scale_weight;
             // --- M35: GPTQ quantization ---
             [quantization] nsl_gptq_quantize(i64, i64, i64, i64) -> i64 = gptq::nsl_gptq_quantize;
             [quantization] nsl_gptq_quantize_ext(i64, i64, i64, i64, i64, i64, i64) -> i64 = gptq::nsl_gptq_quantize_ext;
@@ -1352,6 +1349,6 @@ mod tests {
     fn table_is_the_recorded_size() {
         // The count is pinned so a row dropped by a bad merge is noticed; move
         // it with a row that is deliberately added or removed.
-        assert_eq!(RUNTIME_ABI.len(), 678);
+        assert_eq!(RUNTIME_ABI.len(), 677);
     }
 }
