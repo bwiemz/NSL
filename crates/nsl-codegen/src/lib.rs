@@ -250,6 +250,7 @@ pub mod layerwise;
 pub mod parameter_plan;
 pub mod transient_arena;
 pub mod wggo_ilp;
+pub mod wggo_model_shape;
 pub mod wggo_overrides;
 pub mod wggo_prepass;
 pub mod wggo_prune;
@@ -983,6 +984,13 @@ pub struct CpdtOptions {
     /// Consumed by
     /// [`crate::cpdt_moe_capacity::apply_roofline_capacity_override`].
     pub moe_roofline_slack: f64,
+    /// `--cpdt-prune-experts`: let the MoE dead-expert pass slice out
+    /// experts whose router column norm is below its threshold. Off by
+    /// default, in which case the pass only reports them: the norm of a
+    /// router column does not show how often the expert is selected (a
+    /// zero column gives logit 0, which wins whenever the other logits are
+    /// negative), so slicing on it can change the model's output.
+    pub prune_experts: bool,
     /// Shared output slot the CLI reads after compile returns.
     /// `Compiler::invoke_cpdt_if_enabled` stashes the plan here so callers
     /// can render it without extending every entry-point return type.
@@ -997,6 +1005,7 @@ impl Default for CpdtOptions {
             cluster: None,
             report_requested: false,
             moe_roofline_slack: 0.0,
+            prune_experts: false,
             plan_out: None,
         }
     }

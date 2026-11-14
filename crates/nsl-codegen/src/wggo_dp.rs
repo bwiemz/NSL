@@ -314,8 +314,20 @@ fn layer_cost(decision: CoarseDecision, lut_best: Option<LayerCostEntry>) -> (f6
     }
 }
 
-/// Number of discretized memory buckets the knapsack DP tracks.
-const NB: usize = 256;
+/// Fewest memory buckets the knapsack DP tracks.
+const MIN_BUCKETS: usize = 4096;
+
+/// Upper bound on `layers × buckets`, which bounds the DP table.
+const MAX_DP_CELLS: usize = 4_000_000;
+
+/// Buckets for a model of `n` layers: at least [`MIN_BUCKETS`] and 64 per
+/// layer, within [`MAX_DP_CELLS`]. Each layer's memory is rounded up to a
+/// whole bucket, so the knapsack can overstate a plan's memory by up to
+/// `n / buckets` of the budget; 64 per layer keeps that under 1.6 %.
+fn bucket_count(n: usize) -> usize {
+    let wanted = MIN_BUCKETS.max(n.saturating_mul(64));
+    wanted.min((MAX_DP_CELLS / n.max(1)).max(256))
+}
 
 /// One candidate `(decision, sharding)` assignment for a single layer, with its
 /// resolved cost and resident-memory footprint.  The three shard factors are
@@ -479,6 +491,16 @@ fn assign_stages(costs: &[f64], stages: usize) -> Vec<u32> {
 /// **refuses** with [`DpError::Infeasible`] when no assignment fits rather than
 /// emitting an over-budget plan.
 ///
+/// The budget test itself is exact. Two assignments are tried on exact byte
+/// sums around the bucketed search: each layer's cheapest candidate (optimal
+/// whenever it fits, which is every model not under memory pressure), and,
+/// if the bucketed search finds nothing, each layer's smallest candidate (so
+/// a model that fits is never refused). Only the choice *between* feasible
+/// assignments under pressure is made on bucketed sizes. The DP used to
+/// round every layer up to 1/256 of the budget on every path: 96 identical
+/// layers using 76 % of the budget needed 288 of 256 buckets and were
+/// refused.
+///
 /// `luts` must be one LUT per layer (use `wggo_cost::build_lut`).  If the
 /// caller doesn't have per-layer LUTs, pass a single-element vec and the DP
 /// will re-use it for every layer.  `gpu` is the target spec used to cost the
@@ -491,7 +513,6 @@ pub fn solve(
 ) -> Result<InterLayerPlan, DpError> {
     let n = graph.layers.len();
     let budget = cfg.cluster.memory_budget.max(1);
-    let bucket_bytes = budget.div_ceil(NB as u64).max(1);
 
     // Per-layer candidate sets.
     let cands: Vec<Vec<Cand>> = graph
@@ -500,73 +521,60 @@ pub fn solve(
         .enumerate()
         .map(|(i, layer)| {
             let lut = luts.get(i).or_else(|| luts.first());
-            let lut_best = lut.and_then(|l| l.argmin_feasible().map(|(_, _, _, _, e)| e));
+            let lut_best = lut.and_then(LayerCostLut::as_written);
             layer_candidates(layer, cfg, lut_best, gpu)
         })
         .collect();
 
-    // Knapsack DP over memory buckets: dp[j][b] = min cost for the first j
-    // layers using ≤ b buckets of resident memory.  choice records the chosen
-    // candidate index and the predecessor bucket for backtracking.
-    let inf = f64::INFINITY;
-    let mut dp = vec![vec![inf; NB + 1]; n + 1];
-    let mut choice: Vec<Vec<Option<(usize, usize)>>> = vec![vec![None; NB + 1]; n + 1];
-    for b in 0..=NB {
-        dp[0][b] = 0.0;
-    }
-    for j in 1..=n {
-        let layer_cands = &cands[j - 1];
-        for b in 0..=NB {
-            for (ci, c) in layer_cands.iter().enumerate() {
-                let bc = c.resident.div_ceil(bucket_bytes) as usize;
-                if bc > b {
-                    continue;
-                }
-                let prev = dp[j - 1][b - bc];
-                if prev.is_finite() {
-                    let total = prev + c.cost_us;
-                    if total < dp[j][b] {
-                        dp[j][b] = total;
-                        choice[j][b] = Some((ci, b - bc));
-                    }
-                }
+    let exact_fit = |pick: &[usize]| -> bool {
+        let total = pick
+            .iter()
+            .zip(cands.iter())
+            .fold(0u64, |acc, (&ci, cs)| acc.saturating_add(cs[ci].resident));
+        total <= budget
+    };
+    // First of the minimal elements, so ties resolve as the bucketed search
+    // resolves them (earliest candidate wins).
+    let argmin_by = |cs: &[Cand], key: &dyn Fn(&Cand) -> f64| -> usize {
+        let mut best = 0usize;
+        for (i, c) in cs.iter().enumerate() {
+            if key(c) < key(&cs[best]) {
+                best = i;
             }
         }
-    }
+        best
+    };
+    let cheapest: Vec<usize> = cands.iter().map(|cs| argmin_by(cs, &|c| c.cost_us)).collect();
 
-    // Best terminal bucket (min cost using ≤ NB buckets = ≤ budget).
-    let mut best_b = 0usize;
-    let mut best_cost = inf;
-    for b in 0..=NB {
-        if dp[n][b] < best_cost {
-            best_cost = dp[n][b];
-            best_b = b;
+    let picked: Vec<usize> = if exact_fit(&cheapest) {
+        cheapest
+    } else {
+        match bucketed_knapsack(&cands, budget) {
+            Some(pick) => pick,
+            None => {
+                let smallest: Vec<usize> = cands
+                    .iter()
+                    .map(|cs| argmin_by(cs, &|c| c.resident as f64))
+                    .collect();
+                if !exact_fit(&smallest) {
+                    // Even the smallest config per layer overflows the budget.
+                    let required: u64 = cands
+                        .iter()
+                        .map(|cs| cs.iter().map(|c| c.resident).min().unwrap_or(0))
+                        .fold(0u64, u64::saturating_add);
+                    return Err(DpError::Infeasible {
+                        required_bytes: required,
+                        budget,
+                    });
+                }
+                smallest
+            }
         }
-    }
-    if !best_cost.is_finite() {
-        // Even the smallest feasible config per layer overflows the budget.
-        let required: u64 = cands
-            .iter()
-            .map(|cs| cs.iter().map(|c| c.resident).min().unwrap_or(0))
-            .sum();
-        return Err(DpError::Infeasible {
-            required_bytes: required,
-            budget,
-        });
-    }
-
-    // Backtrack the chosen candidate for every layer.
-    let mut chosen: Vec<Option<Cand>> = vec![None; n];
-    let mut b = best_b;
-    for j in (1..=n).rev() {
-        let (ci, prev_b) = choice[j][b]
-            .expect("DP backtrack: every layer on a finite-cost path has a recorded choice");
-        chosen[j - 1] = Some(cands[j - 1][ci]);
-        b = prev_b;
-    }
-    let chosen: Vec<Cand> = chosen
-        .into_iter()
-        .map(|c| c.expect("DP backtrack fills a candidate for every layer"))
+    };
+    let chosen: Vec<Cand> = picked
+        .iter()
+        .zip(cands.iter())
+        .map(|(&ci, cs)| cs[ci])
         .collect();
 
     // Pipeline-stage assignment + per-stage peak memory.
@@ -608,6 +616,69 @@ pub fn solve(
     })
 }
 
+/// The knapsack over bucketed sizes: the cheapest assignment whose layers,
+/// each rounded up to a whole bucket, fit the budget. Returns the chosen
+/// candidate index per layer, or `None` when no assignment fits at this
+/// resolution.
+fn bucketed_knapsack(cands: &[Vec<Cand>], budget: u64) -> Option<Vec<usize>> {
+    let n = cands.len();
+    let nb = bucket_count(n);
+    let bucket_bytes = budget.div_ceil(nb as u64).max(1);
+
+    // dp[b] = min cost for the layers so far using ≤ b buckets of resident
+    // memory. choice[j][b] records the chosen candidate index and the
+    // predecessor bucket for backtracking (`u32::MAX` = unreachable).
+    let inf = f64::INFINITY;
+    let mut dp = vec![0.0f64; nb + 1];
+    let mut choice: Vec<Vec<(u32, u32)>> = Vec::with_capacity(n);
+    for layer_cands in cands {
+        let mut next = vec![inf; nb + 1];
+        let mut row = vec![(u32::MAX, 0u32); nb + 1];
+        for b in 0..=nb {
+            for (ci, c) in layer_cands.iter().enumerate() {
+                let bc = c.resident.div_ceil(bucket_bytes);
+                if bc > b as u64 {
+                    continue;
+                }
+                let prev = dp[b - bc as usize];
+                if prev.is_finite() {
+                    let total = prev + c.cost_us;
+                    if total < next[b] {
+                        next[b] = total;
+                        row[b] = (ci as u32, (b - bc as usize) as u32);
+                    }
+                }
+            }
+        }
+        dp = next;
+        choice.push(row);
+    }
+
+    // Best terminal bucket (min cost using ≤ nb buckets = ≤ budget).
+    let mut best_b = 0usize;
+    let mut best_cost = inf;
+    for (b, &cost) in dp.iter().enumerate() {
+        if cost < best_cost {
+            best_cost = cost;
+            best_b = b;
+        }
+    }
+    if !best_cost.is_finite() {
+        return None;
+    }
+
+    // Backtrack the chosen candidate for every layer.
+    let mut picked = vec![0usize; n];
+    let mut b = best_b;
+    for j in (0..n).rev() {
+        let (ci, prev_b) = choice[j][b];
+        debug_assert!(ci != u32::MAX, "every layer on a finite-cost path has a recorded choice");
+        picked[j] = ci as usize;
+        b = prev_b as usize;
+    }
+    Some(picked)
+}
+
 /// Budget-agnostic passthrough plan: every layer `KeepFull` at the cluster's
 /// default shard factor, single stage — except the layers in
 /// [`DpConfig::forced_prune`], which stay `Prune` (a user's prune request is
@@ -626,7 +697,7 @@ pub fn passthrough_plan(
     let mut total_bytes = 0u64;
     for (i, layer) in graph.layers.iter().enumerate() {
         let lut = luts.get(i).or_else(|| luts.first());
-        let lut_best = lut.and_then(|l| l.argmin_feasible().map(|(_, _, _, _, e)| e));
+        let lut_best = lut.and_then(LayerCostLut::as_written);
         let decision = if cfg.forced_prune.contains(&layer.index) {
             CoarseDecision::Prune
         } else {
@@ -849,7 +920,7 @@ mod tests {
         // the global budget; the DP must shard every layer to fit.
         let g = toy_graph(4);
         let lut = build_lut(&shape(), gpu(), &LutAxes::default());
-        let one = lut.argmin_feasible().expect("feasible entry").4;
+        let one = lut.as_written().expect("feasible entry");
         let sharded = 3 * one.param_bytes / 8 + one.activation_bytes;
         let budget = 4 * sharded + sharded / 2;
         let cfg = DpConfig {
@@ -943,7 +1014,7 @@ mod tests {
         // Single GPU (no shard relief); budget only fits the thinned footprint.
         let g = toy_graph(2);
         let lut = build_lut(&shape(), gpu(), &LutAxes::default());
-        let one = lut.argmin_feasible().expect("feasible entry").4;
+        let one = lut.as_written().expect("feasible entry");
         let thin = 3 * (one.param_bytes * 60 / 100) + one.activation_bytes;
         let budget = 2 * thin + thin / 4;
         let cfg = DpConfig {
@@ -1000,5 +1071,80 @@ mod tests {
         let plan = solve(&g, &[lut], &DpConfig::default(), gpu()).expect("feasible");
         assert!(plan.layers.is_empty());
         assert_eq!(plan.total_us, 0.0);
+    }
+
+    /// 96 identical layers that together use 76 % of the budget fit, and
+    /// none is sharded or thinned. Rounding each layer up to 1/256 of the
+    /// budget made each one 3 buckets (2.03 rounded up), 288 of 256 in all,
+    /// and the plan was refused.
+    #[test]
+    fn many_layers_well_inside_the_budget_are_not_refused() {
+        let g = toy_graph(96);
+        let lut = build_lut(&shape(), gpu(), &LutAxes::default());
+        let one = lut.as_written().expect("feasible entry");
+        let per_layer = 3 * one.param_bytes + one.activation_bytes;
+        let budget = (96 * per_layer) * 100 / 76;
+        let cfg = DpConfig {
+            cluster: ClusterSpec {
+                num_gpus: 1,
+                memory_budget: budget,
+                max_stages: 1,
+                interconnect_gbs: 300.0,
+            },
+            ..Default::default()
+        };
+        let plan = solve(&g, &[lut], &cfg, gpu()).expect("76 % of the budget fits");
+        assert_eq!(plan.layers.len(), 96);
+        assert!(plan.layers.iter().all(|l| l.decision == CoarseDecision::KeepFull));
+        assert_eq!(plan.peak_memory_bytes, 96 * per_layer);
+    }
+
+    /// Four layers on two GPUs with room for three unsharded and one
+    /// sharded (plus half a percent): exactly one layer is sharded. An
+    /// unsharded layer is 3 x 8,388,608 + 4,194,304 = 29,360,128 bytes and a
+    /// sharded one 16,777,216, so the budget is 105,381,888. At 256 buckets
+    /// of 411,648 bytes those round to 72 and 41 buckets, 3 x 72 + 41 = 257,
+    /// one over, and two layers were sharded.
+    #[test]
+    fn only_as_many_layers_are_sharded_as_the_budget_requires() {
+        let g = toy_graph(4);
+        let lut = build_lut(&shape(), gpu(), &LutAxes::default());
+        let one = lut.as_written().expect("feasible entry");
+        assert_eq!((one.param_bytes, one.activation_bytes), (8_388_608, 4_194_304));
+        let unsharded = 3 * one.param_bytes + one.activation_bytes;
+        let sharded = 3 * one.param_bytes / 2 + one.activation_bytes;
+        let budget = (3 * unsharded + sharded) / 1000 * 1005;
+        let cfg = DpConfig {
+            cluster: ClusterSpec {
+                num_gpus: 2,
+                memory_budget: budget,
+                max_stages: 1,
+                interconnect_gbs: 300.0,
+            },
+            ..Default::default()
+        };
+        let plan = solve(&g, &[lut], &cfg, gpu()).expect("fits with one layer sharded");
+        let n_sharded = plan.layers.iter().filter(|l| l.shard_params == 2).count();
+        assert_eq!(n_sharded, 1);
+        let total: u64 = plan.layers.iter().map(|l| l.estimated_bytes).sum();
+        assert_eq!(total, 3 * unsharded + sharded);
+    }
+
+    /// A kept layer is sized as written: all its heads and its full FFN.
+    /// It was sized at the table's cheapest entry (1 head, the narrowest
+    /// FFN), 5.8 times fewer parameter bytes than the plan printed beside
+    /// it. The nominal layer: (4 x 512 x 512 + 3 x 512 x 2048) x 2 bytes.
+    #[test]
+    fn a_kept_layer_is_sized_as_written() {
+        let g = toy_graph(2);
+        let lut = build_lut(&shape(), gpu(), &LutAxes::default());
+        let cfg = DpConfig {
+            cluster: ClusterSpec { memory_budget: u64::MAX, ..ClusterSpec::default() },
+            ..Default::default()
+        };
+        let plan = solve(&g, &[lut], &cfg, gpu()).unwrap();
+        for l in &plan.layers {
+            assert_eq!(l.param_bytes, 8_388_608);
+        }
     }
 }

@@ -43,7 +43,7 @@ const fn k(name: &'static str, read_by: &'static str) -> KnownDecorator {
 }
 
 /// Every decorator name the toolchain reads anywhere, from the 2026-08-15
-/// empirical inventory (updated as consumers move): 34 validated in `checker/stmt.rs`, 11 in
+/// empirical inventory (updated as consumers move): 33 validated in `checker/stmt.rs`, 11 in
 /// `checker/model.rs`, 1 in another semantic module, and 3 read only by
 /// codegen. Names consumed by the parser before a `Decorator` node exists
 /// (`pack`, `unpack`, `backward`, `*_ptx` in datatype blocks; `endpoint` in
@@ -82,7 +82,6 @@ pub static KNOWN_DECORATORS: &[KnownDecorator] = &[
     k("trace_breakpoint", "crates/nsl-semantic/src/checker/stmt.rs"),
     k("tree_mask", "crates/nsl-semantic/src/checker/stmt.rs"),
     k("vmap", "crates/nsl-semantic/src/checker/stmt.rs"),
-    k("wggo", "crates/nsl-semantic/src/checker/stmt.rs"),
     k("wggo_target", "crates/nsl-semantic/src/checker/stmt.rs"),
     k("wrga", "crates/nsl-semantic/src/checker/stmt.rs"),
     k("quantize", "crates/nsl-semantic/src/checker/stmt.rs"),
@@ -115,6 +114,16 @@ pub static KNOWN_DECORATORS: &[KnownDecorator] = &[
 /// `--allow-unknown-decorators`, so a removed feature cannot be silently
 /// ignored.
 pub static UNIMPLEMENTED_DECORATORS: &[(&str, &str)] = &[
+    (
+        // Was validated in checker/stmt.rs and then dropped: the validator's
+        // result was discarded, so `@wggo(mode=full)` on a train block
+        // produced no plan and changed nothing, while the activation report
+        // counted the request as witnessed.
+        "wggo",
+        "@wggo has no effect in this toolchain version: whole-graph \
+         optimization is selected with the `--wggo <full|greedy|off>` flag, \
+         and nothing reads the decorator; remove it and pass the flag",
+    ),
     (
         // Found by this registry's own drift gate: `validate_layout_decorator`
         // exists in sparse_layout.rs with unit tests, but NOTHING dispatches

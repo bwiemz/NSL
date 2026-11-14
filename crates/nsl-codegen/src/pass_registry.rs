@@ -379,7 +379,9 @@ pub const PASSES: &[PassDescriptor] = &[
         // declaration false (PHASE MISMATCH on a real compile).
         // `pass_manager_gate.rs` pins the fix.
         phases: &[CompilePhase::KernelPrepass, CompilePhase::TrainBlock],
-        decorator_triggers: &["wggo", "wggo_target"],
+        // `@wggo` is refused (nsl-semantic's UNIMPLEMENTED_DECORATORS): the
+        // pass is selected by flag only.
+        decorator_triggers: &["wggo_target"],
         wiki: WikiCoverage::Documented("WGGO — Wengert Graph Global Optimization"),
         tape: TapeAccess::MutatesInPlace {
             refs: &[
@@ -476,9 +478,16 @@ pub const PASSES: &[PassDescriptor] = &[
             f("cpdt-num-gpus", BR),
             f("cpdt-inter-bw", BR),
             f("cpdt-intra-bw", BR),
+            f("cpdt-memory-budget", BR),
+            f("cpdt-prune-experts", BR),
         ],
         stage: PipelineStage::OnWengert,
-        phases: &[CompilePhase::TrainBlock],
+        // TrainBlock is where the planner runs. KernelPrepass is the MoE
+        // weight passes (dead-expert pruning, capacity factor), which act
+        // on the weight map before any train block and are all of CPDT
+        // that an inference-only MoE program reaches
+        // (`cpdt_moe_capacity::record_moe_disposition`).
+        phases: &[CompilePhase::TrainBlock, CompilePhase::KernelPrepass],
         decorator_triggers: &["cpdt"],
         wiki: WikiCoverage::Documented("CPDT — Compile-time Parallelism & Distributed Training"),
         // Registered OnWengert by stage, yet never touches the tape — the

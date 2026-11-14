@@ -58,6 +58,8 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             cpdt_intra_bw,
             cpdt_inter_bw,
             cpdt_report,
+            cpdt_memory_budget,
+            cpdt_prune_experts,
             wggo,
             wggo_report,
             wggo_moment_precision,
@@ -280,12 +282,18 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                         process::exit(2);
                     }
                 };
+                // `--cpdt-memory-budget` (GiB per GPU; default 80).
+                if !(cpdt_memory_budget.is_finite() && cpdt_memory_budget > 0.0) {
+                    nsl_log::nsl_log!(ERROR, "nsl", "nsl: --cpdt-memory-budget must be > 0 GiB");
+                    process::exit(2);
+                }
                 Some(nsl_codegen::cpdt_zero::ClusterSpec {
                     num_gpus: n,
-                    memory_budget_bytes: 80u64 * 1024 * 1024 * 1024,
+                    memory_budget_bytes: (cpdt_memory_budget * (1u64 << 30) as f64) as u64,
                     intra_bw_bps: cpdt_intra_bw,
                     inter_bw_bps: cpdt_inter_bw,
                     gpus_per_node: n.min(8),
+                    collective_latency_us: nsl_codegen::cpdt_zero::DEFAULT_COLLECTIVE_LATENCY_US,
                 })
             } else {
                 None
@@ -612,6 +620,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                     cluster: cpdt_cluster.clone(),
                     report_requested: cpdt_report,
                     moe_roofline_slack: 0.0,
+                    prune_experts: cpdt_prune_experts,
                     plan_out: cpdt_plan_out.clone(),
                 },
                 // `nsl run` never drives WRGA: no forwarded decorator configs,

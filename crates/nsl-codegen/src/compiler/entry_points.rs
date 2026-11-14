@@ -743,12 +743,13 @@ fn compile_returning_plan_impl(
         ast, interner, &mut compiler,
     );
     crate::cpdt_decorator::report_outcome(&cpdt_decor_outcome);
-    crate::cpdt_expert_prune::run_moe_prune_pass(&mut compiler);
+    let moe_pruned = crate::cpdt_expert_prune::run_moe_prune_pass(&mut compiler);
     // CPDT §4.1 — roofline-derived capacity-factor override. Runs after the
     // prune pass (so n_live is settled in moe_configs) and before any body
     // codegen (the moe_dispatch lowering reads MoeInfo.capacity_factor).
     // Same non-WGGO blocker-sidestep posture as the prune pass.
-    crate::cpdt_moe_capacity::run_moe_capacity_pass(&mut compiler);
+    let moe_raised = crate::cpdt_moe_capacity::run_moe_capacity_pass(&mut compiler);
+    crate::cpdt_moe_capacity::record_moe_disposition(&compiler, moe_pruned + moe_raised);
     populate_calibration_retention_from_ast_if_unset(&mut compiler, ast, interner)?;
     // Task 4: declare the calibration retention arena BEFORE method-body
     // codegen.  The pipe-site splice in `try_emit_retention_splice` early-
@@ -1523,8 +1524,9 @@ fn compile_entry_impl(
         ast, interner, &mut compiler,
     );
     crate::cpdt_decorator::report_outcome(&cpdt_decor_outcome);
-    crate::cpdt_expert_prune::run_moe_prune_pass(&mut compiler);
-    crate::cpdt_moe_capacity::run_moe_capacity_pass(&mut compiler);
+    let moe_pruned = crate::cpdt_expert_prune::run_moe_prune_pass(&mut compiler);
+    let moe_raised = crate::cpdt_moe_capacity::run_moe_capacity_pass(&mut compiler);
+    crate::cpdt_moe_capacity::record_moe_disposition(&compiler, moe_pruned + moe_raised);
 
     populate_calibration_retention_from_ast_if_unset(&mut compiler, ast, interner)?;
     // Task 4: declare the calibration retention arena BEFORE method-body

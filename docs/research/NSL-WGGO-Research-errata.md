@@ -401,10 +401,14 @@ rejects 8-bit moments outright.
 
 WGGO exists and runs, but no ILP is solved. `--wggo [full|greedy|off|auto]`
 is the only switch, and `--pretrain-optimized` implies `greedy`. The
-`@wggo(...)` decorator is accepted and has no effect. Without `--wggo-weights`
-or `--wggo-memory-budget` the plan is the same for every model, and by the
-project's own benchmark it does not change step time (see the list at the end
-of this part). Files named below without a directory are in
+`@wggo(...)` decorator is refused at compile time. Without `--wggo-weights`
+or `--wggo-memory-budget` every model gets the same decisions (the extreme of
+each axis, see E5), and by the project's own benchmark the plan does not
+change step time (see the list at the end of this part). The figures in a
+plan are the model's own: layer count, widths, head and KV-head counts,
+parameter bytes, batch and sequence length are read from the train block's
+tape (`wggo_model_shape.rs`), and a model whose shapes cannot be determined
+at compile time is not planned. Files named below without a directory are in
 `crates/nsl-codegen/src/`.
 
 - **Level 1 DP (§3.2): implemented, mostly idle.** `solve` in `wggo_dp.rs`
@@ -415,38 +419,44 @@ of this part). Files named below without a directory are in
   `--wggo-layer-prune-fraction`. `max_stages > 1` and `zero_stage_search`
   appear to be set only in tests (not fully traced).
 - **Level 2 "ILP" (§3.3, §5, §6.1): partial; an exhaustive scan, not an
-  ILP.** `solve_layer` in `wggo_ilp.rs` runs nested loops over a
-  precomputed cost table of 800 entries. There is no LP relaxation and no
-  subtree is pruned; the one bound is a comparison with the best cost so
-  far, made after a candidate is fully evaluated. The module comment that
-  names `argmin_feasible` as the bounding function is not accurate. The scan
-  is exact for its own formulation: checked against an independent
-  brute-force search on ten budget and gate combinations, the maximum
-  difference was 0. That formulation is monotone in every axis (E5), so the
-  answer is the extreme of each axis. When importance scores are supplied
-  the scan enumerates all 255 head subsets, although the cost depends only
-  on the head count. `full` and `greedy` return identical plans whenever no
-  weights file is supplied.
-- **Cost model (§2.3, §3.3): partial; constants, not derived from the
-  model.** `wggo_cost.rs` builds one table from a layer shape written into
-  `run_on_wengert_with_weights` in `wggo.rs`: batch 1, sequence 1024,
-  d_model 512, head_dim 64, 8 heads, 4 KV heads, a 2-byte dtype and FFN
-  widths from 384 to 2048, costed for an A100. The table is cloned for every
-  layer, including the bucket that holds embedding and norm parameters. The
-  coefficients are constants: a CSHA bonus of 0.20/0.45/0.65 applied to the
-  whole layer including the FFN, backward = 2 × forward, FASE speedup 0.10,
-  packing 0.15, thin layer 0.6×, non-layer overhead 15%. The QKᵀ and AV
-  matmuls of attention are not modelled; softmax is the only term quadratic
-  in sequence length. Forward and backward are per micro-batch at batch 1,
+  ILP.** `solve_layer` in `wggo_ilp.rs` runs nested loops over the layer's
+  cost table. There is no LP relaxation and no subtree is pruned; the one
+  bound is a comparison with the best cost so far, made after a candidate is
+  fully evaluated. The scan was exact for its formulation when reviewed:
+  checked against an independent brute-force search on ten budget and gate
+  combinations, the maximum difference was 0. That formulation is monotone
+  in every axis (E5), so the answer is the extreme of each axis. The head
+  axis is the candidates "keep the k most important KV groups", one per k,
+  since the cost depends only on the head count; the rule "CSHA level 2 or
+  3 needs every head" is applied inside the scan. `full` and `greedy`
+  return identical plans whenever no weights file is supplied.
+- **Cost model (§2.3, §3.3): partial; shapes from the model, coefficients
+  constant.** `build_layer_lut` in `wggo_cost.rs` builds one table per layer
+  from that layer's own matrix products, normalisations, attention shape,
+  parameter count and activations, at 4 bytes per element, costed for the
+  GPU the target names (or the local device, as CSHA resolves it). A layer
+  with no attention call, such as the bucket that holds the embedding and
+  final norm, has no head or CSHA axis; the FFN axis is the layer's one real
+  width. The coefficients are constants: a CSHA bonus of 0.20/0.45/0.65
+  applied to the whole layer including the FFN, backward = 2 × forward, FASE
+  speedup 0.10, packing 0.15, thin layer 0.6×, non-layer overhead 15%. The
+  QKᵀ and AV matmuls of attention are not modelled; softmax is the only term
+  quadratic in sequence length. Forward and backward are per micro-batch,
   the optimizer term is per optimizer step, and `grad_accumulation` is not
-  read.
+  read. `build_lut`, the older table for one nominal layer, remains for
+  callers that supply no model (`nsl profile --explain-wggo` on a program
+  with no train block, unit tests); a plan made that way says so.
 - **Conflict handling (§1.1, §6.2): implemented, after the solve.** The four
   conflicts are detected and resolved after solving, in both modes, by
-  `greedy_resolve` in `wggo_conflicts.rs`. The code is right to do something
-  simple here; the proposal's claim that a joint solve is required is the
-  side that is wrong (E6).
+  `greedy_resolve` in `wggo_conflicts.rs`, and each changed layer is then
+  recosted. The code is right to do something simple here; the proposal's
+  claim that a joint solve is required is the side that is wrong (E6). The
+  one conflict the solver could have avoided, pruned heads with a fused
+  level, is now a constraint of the scan.
 - **Importance scoring (§4, step 3): partial.** `--wggo-weights` turns on
-  weight-magnitude scoring (`wggo_weight_analysis.rs`). Gradient scoring
+  weight-magnitude scoring (`wggo_weight_analysis.rs`), sliced per head of
+  each layer's own shape. Scores alone prune nothing: head pruning needs
+  `--wggo-prune-fraction` above zero (default 0). Gradient scoring
   through `@wggo_target` (`wggo_gradient_scorer.rs`) cannot be reached from
   the command line: only `compile_and_calibrate` writes the file it reads,
   and nothing calls that function.
@@ -462,7 +472,7 @@ Which decisions reach generated code:
 | Decision | Reaches generated code? |
 |---|---|
 | Head keep-mask `h` | Count only. The fused attention dispatch in `csha.rs` keeps the first k heads, not the heads chosen. |
-| FFN width `f` | No. It is dropped, and the plan prints a warning. |
+| FFN width `f` | Not a decision: the table holds the layer's one real width. |
 | CSHA level `c` | Yes, as a preference that CSHA re-negotiates. |
 | Adapter rank and placement `r` | Yes, through the WRGA placement filter. Rank is 0 unless the model uses `@wrga`. |
 | FASE fusion `a` | Yes, through the FASE mode table. |
@@ -472,10 +482,12 @@ Which decisions reach generated code:
 | Gradient and optimizer shard factors, pipeline stage, communication schedule, thin layers | Report only. |
 | Whole-layer pruning | Yes, through `--wggo-prune-layers` or `--wggo-layer-prune-fraction`. |
 
-No shipped model uses `@wggo`, `@wggo_target` or `--wggo-weights`. The tests
-check direction (for example, that the solver picks the highest savings).
-None checks optimality, none uses more than 10 head groups, and none uses a
-shape other than d_model 512.
+No shipped model uses `@wggo_target` or `--wggo-weights`. Most of the older
+tests check direction (for example, that the solver picks the highest
+savings) on the nominal 512-wide layer. The tests added with the fixes in
+Part 5 assert figures worked out by hand for a 12-head, 768-wide model and a
+33,344-parameter model, and cover 16 head groups; none checks optimality
+against an independent solver.
 
 ### Benchmark records that cite WGGO
 
@@ -492,9 +504,10 @@ offload, not WGGO.
   constant default plan. The benchmark model happens to match the built-in
   layer shape.
 - The same plan line reads "CSHA-L3 requested → Level2 applied", with the
-  reason `smem_208kb_exceeds_180kb`. WGGO's estimate of shared memory (SMEM)
-  is 128 KB where CSHA's is 208 KB, so WGGO's L3 request never lands on that
-  model.
+  reason `smem_208kb_exceeds_180kb`. When the record was made WGGO's
+  estimate of shared memory (SMEM) was 128 KB where CSHA's is 208 KB, so
+  WGGO's L3 request never landed on that model. WGGO now uses CSHA's
+  estimate and budget (Part 5).
 - "CEP evidence gate: random init ⇒ keep-all" misstates the gate. The gate
   is the absence of a weights file; a weights file of randomly initialised
   values opens it.
@@ -521,10 +534,11 @@ Defects found in this code are listed in Part 5.
 
 1. Drop "globally-optimal", "ILP" and the Alpa timing comparison; describe
    the pass as a per-layer table scan followed by a priority resolver.
-2. Derive each layer's shape, dtype, batch and sequence length from the
-   model first. Every time and memory figure WGGO prints depends on it.
-3. Replace the enumeration with its closed form: sort heads by importance,
-   scan the head count, and apply the conflict rules inside the scan.
+2. Each layer's shape, batch and sequence length now come from the model
+   (Part 5). Every time and memory figure WGGO prints depends on it.
+3. The head enumeration is now its closed form (sort KV groups by
+   importance, scan the count), with the CSHA-versus-pruning rule inside
+   the scan; the other three conflict rules are still applied afterwards.
 4. Calibrate the cost table against measured phase timings, and replace
    weight magnitude with gradient- or activation-based importance.
 5. Build a coupled MILP in the style of Mist only if a measured case shows
@@ -559,131 +573,144 @@ with `crates/` are relative to `crates/nsl-codegen/src/`.
   when, without `--wggo-weights`, the scores are uniform. It now prints
   once, only when WGGO was requested, and says which case applies
   (`apply_auto_mode_fallback_note` in `compiler/entry_points.rs`).
+- Every plan, time and memory figure was computed for one built-in layer
+  (d_model 512, 8 heads, FFN up to 2048), not for the model: a model of
+  33,344 parameters and a 12-head, d_model-768 model both got "8/8 heads,
+  FFN=2048, CSHA-L3". Each layer's parameters, matrix products, attention
+  shape, batch and sequence length are now read from the train block's tape
+  (`derive` in `wggo_model_shape.rs`, fed by the same shape propagation the
+  transient arena uses), and each layer has its own cost table
+  (`build_layer_lut` in `wggo_cost.rs`). Parameters are the trained tensors;
+  buffers and config fields on the tape are not counted. When the shape of
+  a parameter, a product with a weight, a normalisation or an attention
+  query cannot be determined at compile time WGGO logs why and does not
+  plan; with a flag that only acts through the plan, that is a compile
+  error. An activation of unknown size is left out of the memory figure,
+  which the plan then reports as a lower bound, and makes
+  `--wggo-memory-budget` a compile error. The tests are
+  `the_plan_reports_the_models_own_heads_widths_and_bytes` in `wggo.rs` and
+  `crates/nsl-cli/tests/wggo_model_shape_gate.rs`.
+- `--wggo-memory-budget` was checked against that built-in layer: a 200 MiB
+  budget on a model whose parameters take 133 KB was refused as infeasible.
+  The budget is now compared with the model's own bytes, and split among
+  the layers in proportion to what each needs (`assign_layer_budgets` in
+  `wggo.rs`); the test is `a_budget_is_sized_from_the_model`.
+- `--wggo-weights` scoring sliced every tensor as d_model 512 with 8 heads
+  of 64 and never read its shape; a smaller tensor was skipped silently.
+  Each tensor is now checked against the shape of its layer and sliced per
+  head of that shape; a tensor of another shape is a compile error naming it
+  (`score_layer_checked` in `wggo_weight_analysis.rs`).
+- A `--wggo-weights` file of randomly initialised weights enabled head
+  pruning at a default fraction of 0.25. Head pruning is now opt-in: the
+  default fraction is 0, and scores open the structural axes only with
+  `--wggo-prune-fraction` above zero (`WeightAnalysisReport::apply_to`). A
+  weights file with any nonzero value still counts as evidence for a BF16
+  first moment on the block layers, which is stored only under
+  `--wggo-moment-precision` or `--wggo-memory-budget`.
+- Head scores were rounded through f32 while the retention threshold kept
+  its f64 value, so the intended top-k set missed the `>=` test by about
+  1e-8 in roughly half the layers, and with a prune fraction of 0.0 the
+  keep-all set itself failed in 2 of 8 layers. Scores stay in f64, the
+  threshold is recomputed from the scores the test uses, and the test has a
+  relative tolerance of 1e-9 (`importance_ok` in `wggo_ilp.rs`).
+- A layer with no feasible configuration silently took a fallback decision
+  (CSHA level 0, FASE not fused, FFN 1024) and the report printed "Step
+  time: inf μs". Such a layer is now left as written, named in a warning,
+  and left out of the step time, which stays finite
+  (`infeasible_solution` in `wggo_ilp.rs`; `apply` in `wggo_apply.rs`).
+- The importance cache written beside the weights file was keyed by the
+  file's hash alone and stores the threshold, so a later compile with
+  another `--wggo-prune-fraction`, or of another model, reused it. The key
+  now includes the fraction and each layer's name and attention shape
+  (`CacheKey` in `wggo_weight_analysis_cache.rs`).
+- In `full` mode with importance scores the solver picked pruned heads with
+  CSHA level 3, the conflict resolver then forced level 1, and the report
+  printed the cost from before that change. "CSHA level 2 or 3 needs every
+  head" is now a constraint of the scan, so the solver weighs the two
+  itself, and any layer the resolver still changes is recosted
+  (`refresh_solution` in `wggo_ilp.rs`). With every fusion level available
+  the result is all heads at a fused level, which costs less than fewer
+  heads without one; `--wggo-prune-fraction` therefore changes a plan only
+  where levels 2 and 3 do not fit.
+- "Peak memory" was not the plan's memory: the Level 1 DP sized each kept
+  layer at the table's cheapest entry (1 head, FFN 384), 5.8× fewer
+  parameter bytes than the plan printed beside it. The DP now sizes a kept
+  layer as written (`LayerCostLut::as_written`), and the plan's memory is
+  the sum over layers of the chosen configuration's parameters, moments and
+  activations (`apply` in `wggo_apply.rs`).
+- The same under-sized bytes were what CPDT's ZeRO fit test received. The
+  applied plan now carries the bytes of the configuration chosen for the
+  model, which is what `ModelSize::from_applied_plan` reads.
+- `--wggo-layer-prune-fraction` ranked blocks by the RMS of all their
+  tensors, pooling normalisation gains (all 1.0) with the weight matrices,
+  so the gains decided the ranking. It now ranks by the weight matrices
+  alone (`weight_matrices_by_name` in `wggo_weight_analysis_nslweights.rs`).
+  On freshly initialised weights the matrices' own RMS still differs only
+  by noise; the flag ranks by magnitude, which is what it says.
+- The target GPU was always A100-SXM, because the lookup was given the
+  compile target ("cuda", "cpu"), and the per-layer shared-memory budget was
+  H100's 228 KB whatever the GPU. WGGO now resolves the GPU as CSHA does
+  (`resolve_gpu_spec` in `csha.rs`) and uses CSHA's budget for it.
+- The Level 1 DP rounded each layer up to 1/256 of the budget, so 96
+  identical layers using 76% of the budget were refused, and 4 layers on 2
+  GPUs got 2 layers sharded where 1 suffices. The budget test is now exact
+  whenever each layer's cheapest candidate fits or only each layer's
+  smallest does, and the search between those uses at least 4096 buckets
+  and 64 per layer (`solve` in `wggo_dp.rs`).
+- A fused FASE step subtracted a parameter-sized gradient buffer from the
+  layer's activation bytes, which never contained one; at batch 1 this
+  zeroed the activations. The subtraction is gone (`apply_fase` in
+  `wggo_ilp.rs`).
+- `@wggo(mode=…, target=…)` was accepted and discarded, while
+  `--activation-report` printed "@wggo: witnessed by construction". The
+  decorator is now a compile-time error that points to the `--wggo` flag
+  (`UNIMPLEMENTED_DECORATORS` in
+  `crates/nsl-semantic/src/decorator_registry.rs`).
+- A model using the standard library's grouped-query attention through its
+  unpacked `forward` got `PCA=segment_id`, a 15% whole-layer discount and a
+  `[pca] … wggo-override-consumed` line, because any masked attention call
+  in an imported module counted as packing support. A packing mode is now
+  offered only when the module declares a packed dataset or the train step
+  itself consumes a packed batch (a packed attention call, or a read of the
+  batch's attention mask or segment ids), and only on layers that have
+  attention (`compile_flash_attention_kernels` in
+  `compiler/kernel.rs`; `default_constraints_for` in `wggo.rs`).
+- The 32-bit pin for embedding and LM-head parameters never applied: they
+  fall into the catch-all `other` layer, whose role only forbade going below
+  16 bits. `other` is now pinned to 32 bits (`role_sensitivity_floor` in
+  `wggo.rs`).
+- WGGO estimated 128 KB of shared memory for CSHA level 3 on the 512-wide
+  layer where CSHA's own figure is 208 KB, so the level 3 it planned was
+  applied as level 2. WGGO now calls CSHA's formulas (`smem_required` in
+  `wggo_cost.rs`), so it plans level 3 only where CSHA accepts it.
+- With more than 10 head groups the head enumeration built all 2^n subsets
+  and kept the first 1024, which never include keep-all. The candidates are
+  now the n sets "keep the k most important groups" (`enumerate_head_configs`
+  in `wggo_ilp.rs`).
+- The report's per-layer line printed the kept head count twice ("6/6
+  heads"); it now prints kept over total.
+- The decision trace labelled optimizer precision "INT32 m, FP32 v"; it now
+  names the stored formats ("FP32 m" or "BF16 m").
+- The gradient-scoring path compared raw calibration scores with a
+  threshold of about the head count: scores near 1e-3 made every layer
+  infeasible. Calibration scores are now normalised like magnitude scores
+  and the threshold is taken from them (`run_weight_analysis` in
+  `wggo.rs`); the test `calibration_scores_are_scale_free` checks the
+  decisions. The path still cannot be reached from the command line (Part
+  3).
+- The §2.4 shape gate could not fire, because every layer was given the
+  same `d_model`, and its `reshape_possible` test was not a valid reshape
+  test. The gate now checks the one decision that can break the constraint:
+  a pruned layer is replaced by the identity, so its input and output
+  widths, read from the model, must be equal (`validate_pruned` in
+  `wggo_shape.rs`).
+- The scorer built as the "magnitude fallback" was handed a provider that
+  returns no weights. It is now handed the weights file.
 
 ### Open
 
-- Every plan, time and memory figure is computed for one built-in layer
-  (d_model 512, 8 heads, FFN up to 2048), not for the model. A model of
-  33,344 parameters and a 12-head, d_model-768 model both got "8/8 heads,
-  FFN=2048, CSHA-L3". Where: `wggo.rs`, `run_on_wengert_with_weights`.
-  Reproduced by running. Right behaviour: derive each layer's shape, dtype,
-  batch and sequence length from the model.
-- `--wggo-memory-budget` is checked against that built-in layer. A 200 MiB
-  budget on a model whose parameters take 133 KB was refused as infeasible,
-  and a large model is undersized by the same arithmetic. The help text now
-  says the figures are model units; the sizing is unchanged. Where:
-  `wggo.rs`, `run`. Reproduced by running. Right behaviour: size from the
-  model, or refuse the flag when the shape is unknown.
-- `--wggo-weights` scoring slices every tensor as d_model 512 with 8 heads
-  of 64 and never reads its shape. A 12-head, d_model-768 model got 8 "head"
-  scores from the first 262,144 values of each matrix and a plan asking for
-  6 active heads; a smaller tensor is skipped silently, so d_model below 512
-  reads as "no weights". Where: `wggo_weight_analysis.rs`, `score_layer`.
-  Reproduced by running. Right behaviour: check shapes, stop on a mismatch.
-- A `--wggo-weights` file of randomly initialised weights counts as
-  evidence: any nonzero value opens the gate, and the default prune fraction
-  is 0.25 with no opt-in. In `full` mode, scores differing by ±0.3% gave 6–7
-  heads, FFN 384 and CSHA level 1 on all 8 blocks. Since the fixes above the
-  only precision it can cause is a BF16 first moment. Where:
-  `wggo_weight_analysis.rs`, `analyze`, `apply_to`. Reproduced by running.
-- Head scores are rounded through f32 while the retention threshold keeps
-  its f64 value, so the intended top-k set misses the `>=` test by about
-  1e-8 in roughly half the layers: eight layers meant to keep 6 heads kept
-  6,7,6,6,7,7,6,7. Where: `wggo.rs`, `run_weight_analysis`. Reproduced by
-  running. Right behaviour: compute the threshold from the final scores in
-  one precision, with a tolerance.
-- With `--wggo-prune-fraction 0.0` the keep-all set itself failed that test
-  in 2 of 8 layers. Those layers silently took the fallback decision (CSHA
-  level 0, FASE not fused, FFN 1024) and the report printed "Step time: inf
-  μs" with no warning. Where: `wggo_ilp.rs`, `fallback_decision`;
-  `wggo_apply.rs`, `apply`. Reproduced by running. Right behaviour: warn on
-  any infeasible layer.
-- The importance cache written beside the weights file
-  (`<file>.wggo-importance.json`) is keyed by the file's hash alone and
-  stores the threshold. After a run at 0.25, `--wggo-prune-fraction 0.5`
-  still pruned 2 heads; with a cache from 0.5, a fraction of 0.0 still
-  pruned 3–4. Where: `wggo_weight_analysis_cache.rs`, `try_load`. Reproduced
-  by running. Right behaviour: key on fraction, layer names and shape too.
-- In `full` mode with importance scores the solver picks pruned heads with
-  CSHA level 3, the conflict resolver then forces level 1, and the report
-  prints the cost from before that change: 251.72 μs for a plan that then
-  cost 479.58 μs, about 60% worse per layer than all heads at level 3.
-  Where: `wggo.rs`, `splice_resolved`. Reproduced by running. Right
-  behaviour: recost, and put "CSHA ≥ 2 ⇒ no pruned heads" inside the scan.
-- "Peak memory" is not the plan's memory. The Level 1 DP sizes each kept
-  layer at the table's cheapest entry (1 head, FFN 384), 5.8× fewer
-  parameter bytes than the 8-head, FFN-2048 plan printed beside it: 76.68 MB
-  shown where the plan's own accounting is 377 MB. Where: `wggo_dp.rs`,
-  `solve`; `wggo_apply.rs`, `apply`. Numeric check. Right behaviour: sum the
-  bytes of the configuration the solver chose.
-- The under-sized bytes of the item above (1.44 MB per layer) are also what
-  CPDT's ZeRO fit test receives, so it tests a model that does not exist.
-  Where: `cpdt_zero.rs`, `ModelSize::from_applied_plan`. By reading the code
-  only.
-- `--wggo-layer-prune-fraction` ranks blocks by the RMS of all their
-  tensors, pooling normalisation gains (all 1.0) with the weight matrices.
-  On freshly initialised weights the ranking is noise: scores of 1.0000 and
-  0.9993 selected `blocks.1`. Where: `wggo_forced_prune.rs`,
-  `select_by_magnitude`. Reproduced by running.
-- The target GPU is always A100-SXM: the lookup is given the compile target
-  ("cuda", "cpu", "sm_120"), never a GPU name. The per-layer shared-memory
-  budget defaults to H100's 228 KB whatever the GPU. Where: `wggo.rs`,
-  `run`; `wggo_ilp.rs`, the `Default` of `LayerIlpConstraints`. Reproduced
-  by running on a CPU target; for CUDA targets, by reading the code only.
-  Right behaviour: use CSHA's `resolve_gpu_spec`.
-- The Level 1 DP rounds each layer up to 1/256 of the budget, so 96
-  identical layers using 76% of the budget are refused (288 of 256 buckets),
-  and 4 layers on 2 GPUs get 2 layers sharded where 1 suffices. Little
-  effect today: one candidate per layer, and a refusal degrades to a
-  warning. Where: `wggo_dp.rs`, `solve`. Numeric check.
-- A fused FASE step subtracts a parameter-sized gradient buffer from the
-  layer's activation bytes, which never contained one; at batch 1 this
-  zeroes the activations. Where: `wggo_ilp.rs`, `apply_fase`. By reading the
-  code only.
-- `@wggo(mode=…, target=…)` is accepted and discarded. No plan is produced,
-  yet `--activation-report` prints "@wggo: witnessed by construction". The
-  validator's result is dropped, and a string `target` stores the argument's
-  name, not its value. Where: `crates/nsl-semantic/src/checker/stmt.rs`,
-  `check_stmt`; `crates/nsl-semantic/src/wggo.rs`,
-  `validate_wggo_decorator`. Reproduced by running.
-- A model using the standard library's grouped-query attention through its
-  unpacked `forward` got `PCA=segment_id`, a 15% whole-layer discount and a
-  `[pca] … wggo-override-consumed` line, beside `packing_detected=false`.
-  Any masked attention call in an imported module triggers it. Where:
-  `compiler/kernel.rs`, `compile_flash_attention_kernels`; `wggo.rs`,
-  `default_constraints_for`. Reproduced by running.
-- The 32-bit pin for embedding and LM-head parameters never applies: they
-  fall into the catch-all `other` layer, whose role only forbids going below
-  16 bits, and under a budget the plan showed `other` at 16 bits. Where:
-  `wggo_graph.rs`, `layer_prefix`; `wggo.rs`, `role_sensitivity_floor`.
-  Reproduced by running, before the budget fix above; it now needs a budget
-  too small for a 32-bit first moment.
-- WGGO estimates 128 KB of shared memory for CSHA level 3 on the built-in
-  layer; CSHA's own figure is 208 KB against a 180 KB limit, so the level 3
-  that WGGO plans and costs is applied as level 2 (Part 3, benchmark
-  records). Where: `wggo_cost.rs`, `smem_required`. Numeric check.
-- With more than 10 head groups the head enumeration builds all 2^n subsets
-  (2³² at 32 heads) and then keeps the first 1024, which are subsets of the
-  first ten groups, so keep-all is not a candidate. The comment says "top-k
-  groups". Unreachable while the head count is pinned at 8; live once shapes
-  come from the model. Where: `wggo_ilp.rs`, `enumerate_head_configs`.
-  Numeric check.
-- The report's per-layer line prints the kept head count twice ("6/6
-  heads"), not kept over total. Where: `wggo.rs`, `render_report`.
-  Reproduced by running.
-- The decision trace labels optimizer precision "INT32 m, FP32 v"; neither
-  moment is an integer. Where: `wggo_ilp.rs`, `build_decision_trace`.
-  Reproduced by running.
-- The gradient-scoring path compares raw calibration scores with a threshold
-  of about 6.0: scores near 1e-3 make every layer infeasible, and scores
-  like `[100, 1, …]` keep 1 of 8 heads. Its unit test checks only the report
-  field. The path cannot be reached from the command line (Part 3). Where:
-  `wggo.rs`, `run_weight_analysis`. Numeric check.
-- The §2.4 shape gate cannot fire, because every layer is given the same
-  `d_model` or no width at all, and its `reshape_possible` test (one width
-  divides the other) is not a valid reshape test. Where: `wggo_shape.rs`,
-  `validate`; `wggo.rs`, `inter_layer_dims`. By reading the code only.
-- The scorer built as the "magnitude fallback" is handed a provider that
-  returns no weights, not the weights file. Where: `wggo.rs`,
-  `run_on_wengert_with_weights`, at its call to `build_scorer`. By reading
-  the code only.
+None of the defects listed in this part remains open. Limits of the design
+that the fixes do not change are stated in Part 3: the cost coefficients are
+constants, FFN thinning is not a decision, the head keep-mask reaches
+generated code as a count only, and gradient scoring cannot be reached from
+the command line.

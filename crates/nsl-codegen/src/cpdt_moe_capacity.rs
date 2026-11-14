@@ -91,9 +91,11 @@ pub fn report_outcomes(outcomes: &[MoeCapacityOutcome]) {
 /// `compiler.features.moe_configs` + `compiler.cpdt_moe_roofline_slack` — never
 /// on WGGO/source-AD. Same blocker-sidestep posture as
 /// `cpdt_expert_prune::run_moe_prune_pass`.
-pub fn run_moe_capacity_pass(compiler: &mut crate::compiler::Compiler) {
+///
+/// Returns the number of MoE layers whose capacity factor was raised.
+pub fn run_moe_capacity_pass(compiler: &mut crate::compiler::Compiler) -> usize {
     if compiler.features.moe_configs.is_empty() {
-        return;
+        return 0;
     }
     let slack = compiler.cpdt_moe_roofline_slack;
     let outcomes = apply_capacity_overrides(
@@ -102,6 +104,45 @@ pub fn run_moe_capacity_pass(compiler: &mut crate::compiler::Compiler) {
         slack,
     );
     report_outcomes(&outcomes);
+    outcomes
+        .iter()
+        .filter(|o| matches!(o, MoeCapacityOutcome::Overridden { .. }))
+        .count()
+}
+
+/// Record what CPDT's MoE weight passes did, as the pass's disposition.
+///
+/// `rewrites` is the number of MoE layers the dead-expert pass sliced plus
+/// the number whose capacity factor was raised. Call after both passes.
+///
+/// These passes are all of CPDT that a program with no train block
+/// reaches, and they used to record nothing: an inference-only MoE program
+/// built with `--cpdt full` was refused with "owner CPDT recorded no
+/// disposition" although both passes had run. A program that does have a
+/// train block records the planner's own disposition later
+/// (`stmt_pass_bridges::invoke_cpdt_if_enabled`), which supersedes this one.
+///
+/// Nothing is recorded when CPDT is not in full mode or the program has no
+/// `@moe` layer: the passes did not run.
+pub fn record_moe_disposition(compiler: &crate::compiler::Compiler, rewrites: usize) {
+    use crate::pass_trace::{DeclineReason, PassDisposition};
+    if compiler.cpdt_mode != CpdtMode::Full || compiler.features.moe_configs.is_empty() {
+        return;
+    }
+    let _phase = crate::pass_trace::enter_phase(crate::pass_registry::CompilePhase::KernelPrepass);
+    crate::pass_trace::record("CPDT");
+    crate::pass_trace::record_disposition(
+        "CPDT",
+        if rewrites > 0 {
+            PassDisposition::Applied { rewrites }
+        } else {
+            PassDisposition::Declined {
+                reason: DeclineReason::NoCandidates(
+                    "no MoE layer had experts to prune or a capacity factor to raise",
+                ),
+            }
+        },
+    );
 }
 
 #[cfg(test)]

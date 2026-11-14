@@ -1285,12 +1285,11 @@ fn broadcast_bucket_gpu(ctx: &ZeROContext, bucket: &[BucketItem], owner: i32) ->
 /// In single-process mode (world_size=1), this is a no-op since gradients
 /// are already complete.
 ///
-/// NOTE (M43b): this path is currently DEAD in production. `nsl_zero_init`
-/// is registered as a builtin but never emitted by codegen and is absent
-/// from the stdlib, so `ZERO_CTX` is always `None` and this function
-/// returns -1 at the context guard before touching any tensor. Wiring
-/// `nsl_zero_init` emission is M43b-proper work; the body below is kept
-/// correct (CPU and GPU, f64/f32) so that wiring lands on a sound runtime.
+/// Code generation emits this call once per optimizer step when
+/// `--zero-stage` is set (`stmt_train/optimizer_step.rs`), after emitting
+/// `nsl_zero_init` at train-block setup (`stmt_train/model_params.rs`).
+/// Called without that setup, `ZERO_CTX` is `None` and this returns -1 at
+/// the context guard before touching any tensor.
 ///
 /// `grads_list_ptr`: pointer to an NslList of gradient tensors.
 /// `num_params`: number of gradient tensors in the list.

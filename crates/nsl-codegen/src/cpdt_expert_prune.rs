@@ -6,6 +6,23 @@
 //! reachable with `--cpdt --weights` (no `--wggo`), sidestepping Part II's
 //! WGGO/source-AD activation blocker. See
 //! `docs/superpowers/specs/2026-05-27-cpdt-moe-dead-expert-pruning-v1-design.md`.
+//!
+//! ## The criterion is a heuristic, and the transform is opt-in
+//!
+//! An expert is called "dead" when its router column has L2 norm below
+//! [`DEAD_EXPERT_THRESHOLD`]. That does not measure how often the expert is
+//! selected. A near-zero column gives the expert a near-constant logit of
+//! (bias, or) zero, and that logit is among the top `k` for every token
+//! whose other logits fall below it: when the other columns point away from
+//! the typical hidden state, the "dead" expert is the one selected for all
+//! of them. Slicing it out then changes the model's output on those tokens.
+//! No test on the router weights alone can show an expert is unused; that
+//! takes the routing counts of real inputs.
+//!
+//! So under `--cpdt full` the pass ([`run_moe_prune_pass`]) only *reports*
+//! such experts. It slices them out when the user also passes
+//! `--cpdt-prune-experts`, accepting the heuristic. Before, `--cpdt full`
+//! with a weights file sliced them unasked.
 
 use crate::weight_aware::WeightDType;
 
@@ -995,19 +1012,74 @@ pub fn report_outcomes(outcomes: &[MoePruneOutcome]) {
 /// `compiler.cpdt_mode` + `compiler.features.{moe_configs, weight_map}` — never
 /// on `wggo_applied`. Keep this call site out of any `wggo_applied` guard so
 /// the pass stays reachable with `--cpdt --weights` (no `--wggo`).
-pub fn run_moe_prune_pass(compiler: &mut crate::compiler::Compiler) {
+///
+/// Returns the number of MoE layers whose weights were sliced. Without
+/// `--cpdt-prune-experts` that is always 0: the candidates are reported and
+/// left in place (see the module header).
+pub fn run_moe_prune_pass(compiler: &mut crate::compiler::Compiler) -> usize {
     // `cpdt_mode` is `Copy` — read it before borrowing `features` so the single
     // `&mut features` split-borrow below doesn't conflict with reading it.
     let cpdt_mode = compiler.cpdt_mode;
+    let opted_in = compiler.compile_options.cpdt.prune_experts;
     let features = &mut compiler.features;
     let Some(weight_map) = features.weight_map.as_mut() else {
-        return;
+        return 0;
     };
     if features.moe_configs.is_empty() {
-        return;
+        return 0;
+    }
+    if !opted_in {
+        if cpdt_mode == crate::cpdt::CpdtMode::Full {
+            report_prune_candidates(&dead_expert_candidates(&features.moe_configs, weight_map));
+        }
+        return 0;
     }
     let outcomes = prune_moe_weights_in_map(cpdt_mode, &mut features.moe_configs, weight_map);
     report_outcomes(&outcomes);
+    outcomes
+        .iter()
+        .filter(|o| matches!(o, MoePruneOutcome::Pruned { .. }))
+        .count()
+}
+
+/// The experts of each MoE layer whose router column norm is below
+/// [`DEAD_EXPERT_THRESHOLD`], in layer-name order; layers with none, or with
+/// no router weight in the map, are omitted. Reads the weights, changes
+/// nothing.
+pub fn dead_expert_candidates(
+    moe_configs: &HashMap<String, crate::moe::MoeInfo>,
+    weight_map: &WeightMap,
+) -> Vec<(String, Vec<u32>)> {
+    let mut keys: Vec<&String> = moe_configs.keys().collect();
+    keys.sort();
+    keys.into_iter()
+        .filter_map(|key| {
+            let info = &moe_configs[key];
+            let lookup_key: &str = info.weight_prefix.as_deref().unwrap_or(key);
+            let router = resolve(
+                weight_map,
+                lookup_key,
+                &["router.weight", "gate.weight", "router", "gate"],
+            )?;
+            let affinities = crate::cpdt_expert::router_affinities(router, info.num_experts as u32);
+            let dead = crate::cpdt_expert::detect_dead_experts(&affinities, DEAD_EXPERT_THRESHOLD);
+            (!dead.is_empty()).then(|| (key.clone(), dead))
+        })
+        .collect()
+}
+
+/// Say which experts the heuristic picks out and that they were kept.
+fn report_prune_candidates(candidates: &[(String, Vec<u32>)]) {
+    for (layer, dead) in candidates {
+        nsl_log::nsl_log!(INFO, "cpdt",
+            "[cpdt] moe '{layer}': experts {dead:?} have a router column of norm below \
+             {DEAD_EXPERT_THRESHOLD}. They were NOT pruned: a near-zero column gives an expert a \
+             near-constant logit, which is still selected for every token whose other logits \
+             are lower, so the norm does not show the expert is unused. Pass \
+             --cpdt-prune-experts to slice them out anyway (the model's output changes for \
+             any token routed to them)."
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1034,6 +1106,57 @@ mod tests {
             dtype: WeightDType::F32,
             top_k: 1,
         }
+    }
+
+    /// A router column of near-zero norm does not mean the expert is
+    /// unused, which is why the pass only reports such experts unless asked
+    /// to slice them.
+    ///
+    /// Router `[d_model = 2, n_experts = 3]`: expert 0's column is
+    /// (1e-4, 0), norm 1e-4, far below the 0.01 threshold; experts 1 and 2
+    /// have columns (-1, 0) and (-2, 0). For any hidden state with a
+    /// positive first component h, the logits are (1e-4 h, -h, -2h): the
+    /// "dead" expert has the largest logit, so it is the top-1 choice of
+    /// every such token.
+    #[test]
+    fn a_near_zero_router_column_can_be_the_expert_every_token_selects() {
+        use crate::weight_aware::{WeightEntry, WeightMap};
+        let router: Vec<f32> = vec![
+            1e-4, -1.0, -2.0, // row 0: e0 e1 e2
+            0.0, 0.0, 0.0, // row 1
+        ];
+        // The selection, in f64, for three hidden states.
+        for h in [[0.5f64, -3.0], [1.0, 0.0], [7.0, 2.0]] {
+            let logit = |e: usize| {
+                f64::from(router[e]) * h[0] + f64::from(router[3 + e]) * h[1]
+            };
+            let top = (0..3).max_by(|&a, &b| logit(a).total_cmp(&logit(b))).unwrap();
+            assert_eq!(top, 0, "hidden {h:?}");
+        }
+
+        // The pass names expert 0 as a candidate and, not asked to prune,
+        // leaves the weights alone.
+        let mut map = WeightMap::new_for_test();
+        map.insert(WeightEntry::new(
+            "moe.router.weight".into(),
+            f32s(&router),
+            vec![2, 3],
+            WeightDType::F32,
+        ));
+        let mut cfgs = HashMap::new();
+        cfgs.insert(
+            "moe".to_string(),
+            crate::moe::MoeInfo {
+                num_experts: 3,
+                top_k: 1,
+                capacity_factor: 1.25,
+                aux_loss_coeff: 0.0,
+                activation: crate::moe::MoeActivation::default(),
+                weight_prefix: None,
+            },
+        );
+        assert_eq!(dead_expert_candidates(&cfgs, &map), vec![("moe".to_string(), vec![0u32])]);
+        assert_eq!(map.get("moe.router.weight").unwrap().shape, vec![2, 3]);
     }
 
     #[test]

@@ -1,8 +1,9 @@
 //! Phase 1 Commit 2 — unit tests for cpdt_sensitivity primitives.
 
 use nsl_codegen::cpdt_sensitivity::{
-    assign_tier, classify_layer_kind, gradient_magnitude_est, layer_of, position_criticality,
-    LayerKind, ANALYSIS_VERSION, CALIB_ALPHA, CALIB_K, CALIB_T0, CALIB_T1, CALIB_T2,
+    assign_tier, classify_layer_kind, gradient_magnitude_est, layer_count, layer_of,
+    position_criticality, LayerKind, ANALYSIS_VERSION, CALIB_ALPHA, CALIB_K, CALIB_T0, CALIB_T1,
+    CALIB_T2,
 };
 use nsl_codegen::cpdt_tier_apply::Tier;
 
@@ -191,4 +192,44 @@ fn layer_of_recognises_patterns() {
     assert_eq!(layer_of("layers.12.norm"), Some(12));
     assert_eq!(layer_of("h.3.mlp.fc"), Some(3));
     assert_eq!(layer_of("embedding.weight"), None);
+}
+
+/// A weights file may spell its keys with a leading container, and the
+/// model's own paths carry the model variable. Both name block 3.
+#[test]
+fn layer_of_reads_a_name_with_a_leading_container() {
+    assert_eq!(layer_of("model.blocks.3.w"), Some(3));
+    assert_eq!(layer_of("m.blocks.11.attn.wq"), Some(11));
+    assert_eq!(layer_of("m.final_norm"), None);
+}
+
+// --- layer_count ---
+
+/// The number of blocks is one more than the highest index named, whatever
+/// order the names come in; it is not a constant 8.
+#[test]
+fn layer_count_is_one_past_the_highest_block_named() {
+    let names = ["m.embed", "m.blocks.11.w", "m.blocks.0.w", "m.blocks.7.w", "m.final_norm"];
+    assert_eq!(layer_count(names.iter().copied()), Some(12));
+    assert_eq!(layer_count(["m.blocks.0.w"].iter().copied()), Some(1));
+    assert_eq!(layer_count(["m.embed", "m.final_norm"].iter().copied()), None);
+}
+
+/// With the count taken from the model, block 7 of 12 is an interior block
+/// and block 11 is the last. Under the old constant 8 it was the other way
+/// round: 7 was `8 - 1`.
+#[test]
+fn the_last_block_of_twelve_is_block_eleven() {
+    assert_eq!(position_criticality(Some(7), 12, CALIB_ALPHA), 1.0);
+    assert_eq!(position_criticality(Some(11), 12, CALIB_ALPHA), 2.0);
+    assert_eq!(classify_layer_kind("blocks.7.w", Some(7), 12), LayerKind::Generic);
+    assert_eq!(classify_layer_kind("blocks.11.w", Some(11), 12), LayerKind::FirstOrLast);
+}
+
+/// A weights file can name a block the model does not have. That is not a
+/// programming error; it used to abort a debug build on an assertion.
+#[test]
+fn a_block_index_past_the_count_is_scored_as_interior() {
+    assert_eq!(position_criticality(Some(8), 8, CALIB_ALPHA), 1.0);
+    assert_eq!(position_criticality(Some(20), 12, CALIB_ALPHA), 1.0);
 }

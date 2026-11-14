@@ -5,11 +5,12 @@ pub struct CpuRoutingResult {
     pub sorted_token_indices: Vec<i32>,
     /// Per-sorted-position routing weight. Length == `total_assigned`,
     /// aligned with `sorted_token_indices`. For each surviving assignment
-    /// `i`, this is the (re-normalized) softmax probability the routed
-    /// token gave the expert it was placed under. Downstream consumers
-    /// pass this directly to `dispatch::gather_tokens` for the
-    /// gating-weight broadcast (sum-of-weights == 1.0 per token when no
-    /// capacity drop occurs).
+    /// `i`, this is the softmax probability the routed token gave the
+    /// expert it was placed under, normalized over the token's SURVIVING
+    /// assignments. Downstream consumers pass this directly to
+    /// `dispatch::gather_tokens` for the gating-weight broadcast: the
+    /// weights of every token that keeps at least one assignment sum to
+    /// 1.0, whether or not a capacity drop took one of them.
     pub sorted_assignment_weights: Vec<f32>,
     pub expert_boundaries: Vec<i32>,
     pub total_assigned: i64,
@@ -19,6 +20,18 @@ pub struct CpuRoutingResult {
 
 /// Route tokens to experts via top-k gating with softmax.
 /// `logits`: flat [total_tokens, num_experts] row-major
+///
+/// An expert holds at most `ceil(total_tokens * top_k / num_experts *
+/// capacity_factor)` assignments. When more tokens select it, it keeps the
+/// ones that gave it the highest softmax probability (ties to the earlier
+/// token) and the rest of those assignments are dropped; a token whose
+/// other assignment survives has that one's weight renormalized to 1.0.
+///
+/// Which assignments are dropped used to be decided by token order: the
+/// first `capacity` tokens to select an expert kept it, so the end of every
+/// sequence lost its experts first whatever the router thought of it, and a
+/// token left with one of its two experts kept that expert's partial weight,
+/// scaling its output down by the weight of the dropped one.
 pub fn route_topk(
     logits: &[f32],
     total_tokens: usize,
@@ -40,6 +53,12 @@ pub fn route_topk(
 
     let mut expert_indices = Vec::with_capacity(total_tokens * top_k);
     let mut expert_weights = Vec::with_capacity(total_tokens * top_k);
+    // Softmax probability behind each assignment, before the top-k
+    // renormalization: the router's confidence, used to rank the
+    // assignments competing for an over-subscribed expert. (The
+    // renormalized weight cannot rank them: under top-1 it is 1.0 for
+    // every token.)
+    let mut assignment_probs: Vec<f32> = Vec::with_capacity(total_tokens * top_k);
 
     for t in 0..total_tokens {
         let row = &logits[t * num_experts..(t + 1) * num_experts];
@@ -62,6 +81,7 @@ pub fn route_topk(
         for &(expert_id, weight) in selected {
             expert_indices.push(expert_id as i32);
             expert_weights.push(weight / safe_weight_sum);
+            assignment_probs.push(weight);
         }
     }
 
@@ -70,14 +90,24 @@ pub fn route_topk(
     let mut expert_counts = vec![0usize; num_experts];
     let mut expert_boundaries = vec![0i32; num_experts + 1];
 
-    let mut assignment_to_expert = Vec::with_capacity(total_assignments);
-    for &idx in expert_indices.iter().take(total_assignments) {
-        let expert = idx as usize;
-        if expert_counts[expert] < capacity {
-            expert_counts[expert] += 1;
-            assignment_to_expert.push(Some(expert));
-        } else {
-            assignment_to_expert.push(None);
+    // Each expert keeps its `capacity` most confident assignments.
+    let mut by_expert: Vec<Vec<usize>> = vec![Vec::new(); num_experts];
+    for (i, &idx) in expert_indices.iter().enumerate().take(total_assignments) {
+        by_expert[idx as usize].push(i);
+    }
+    let mut kept = vec![false; total_assignments];
+    for (expert, assignments) in by_expert.iter_mut().enumerate() {
+        if assignments.len() > capacity {
+            assignments.sort_by(|&a, &b| {
+                assignment_probs[b]
+                    .total_cmp(&assignment_probs[a])
+                    .then(a.cmp(&b))
+            });
+            assignments.truncate(capacity);
+        }
+        expert_counts[expert] = assignments.len();
+        for &i in assignments.iter() {
+            kept[i] = true;
         }
     }
 
@@ -89,20 +119,37 @@ pub fn route_topk(
     expert_boundaries[num_experts] = offset;
     let total_assigned = offset as i64;
 
+    // What is left of each token's routing weight after the drops.
+    let mut surviving_weight = vec![0.0f32; total_tokens];
+    for (i, &k) in kept.iter().enumerate() {
+        if k {
+            surviving_weight[i / top_k] += expert_weights[i];
+        }
+    }
+
     let mut sorted_token_indices = vec![0i32; total_assigned as usize];
     let mut sorted_assignment_weights = vec![0.0f32; total_assigned as usize];
     let mut write_pos = vec![0usize; num_experts];
-    for (i, assignment) in assignment_to_expert.iter().enumerate() {
-        if let Some(expert) = *assignment {
-            let pos = expert_boundaries[expert] as usize + write_pos[expert];
-            sorted_token_indices[pos] = (i / top_k) as i32;
-            // expert_weights is indexed by the original assignment index `i`
-            // (length total_tokens * top_k). Re-aligning by sorted position
-            // here lets the gather pipeline broadcast gating weights
-            // without re-deriving (token, k-slot) -> assignment-index.
-            sorted_assignment_weights[pos] = expert_weights[i];
-            write_pos[expert] += 1;
+    // Token order within each expert's group.
+    for (i, &k) in kept.iter().enumerate() {
+        if !k {
+            continue;
         }
+        let expert = expert_indices[i] as usize;
+        let token = i / top_k;
+        let pos = expert_boundaries[expert] as usize + write_pos[expert];
+        sorted_token_indices[pos] = token as i32;
+        // expert_weights is indexed by the original assignment index `i`
+        // (length total_tokens * top_k). Re-aligning by sorted position
+        // here lets the gather pipeline broadcast gating weights
+        // without re-deriving (token, k-slot) -> assignment-index.
+        let survivors = surviving_weight[token];
+        sorted_assignment_weights[pos] = if survivors > 1e-8 {
+            expert_weights[i] / survivors
+        } else {
+            expert_weights[i]
+        };
+        write_pos[expert] += 1;
     }
 
     let (importance_loss, load_loss) = super::aux_loss::compute_aux_losses(
@@ -267,6 +314,56 @@ mod tests {
         let exp0_count = result.expert_boundaries[1] - result.expert_boundaries[0];
         assert_eq!(exp0_count, 3, "expert 0 should have capacity-limited 3 tokens, got {}", exp0_count);
         assert_eq!(result.total_assigned, 3, "total_assigned should be 3 (dropped 3)");
+    }
+
+    /// Over capacity, an expert keeps the tokens that selected it most
+    /// confidently, wherever they sit in the sequence.
+    ///
+    /// Four tokens all pick expert 0 under top-1; two experts at factor 1.0
+    /// give it room for ceil(4 * 1 / 2) = 2. The probability each token
+    /// gives expert 0 is the logistic of its logit gap (the other logit is
+    /// 0): 1/(1+e^-1) = 0.7311, 1/(1+e^-3) = 0.9526, 1/(1+e^-0.5) = 0.6225,
+    /// 1/(1+e^-2) = 0.8808. The two largest belong to tokens 1 and 3.
+    /// Dropping in token order kept tokens 0 and 1.
+    #[test]
+    fn over_capacity_keeps_the_most_confident_tokens_not_the_first() {
+        let logits: Vec<f32> = vec![
+            1.0, 0.0,
+            3.0, 0.0,
+            0.5, 0.0,
+            2.0, 0.0,
+        ];
+        let result = route_topk(&logits, 4, 2, 1, 1.0);
+        assert_eq!(result.total_assigned, 2);
+        assert_eq!(result.expert_boundaries, vec![0, 2, 2]);
+        assert_eq!(result.sorted_token_indices, vec![1, 3]);
+        assert_eq!(result.sorted_assignment_weights, vec![1.0, 1.0]);
+    }
+
+    /// A token that loses one of its two experts to capacity carries its
+    /// whole weight on the one it keeps.
+    ///
+    /// Two tokens, two experts, top-2, factor 0.5: capacity is
+    /// ceil(2 * 2 / 2 * 0.5) = 1 per expert, and both tokens select both
+    /// experts. Token 0 (logits 2, 0) gives expert 0 probability 0.8808 and
+    /// expert 1 0.1192; token 1 (logits 0, 1) gives them 0.2689 and 0.7311.
+    /// Expert 0 keeps token 0 and expert 1 keeps token 1, so each token has
+    /// one surviving assignment, at weight 1.0. Before, expert 1 also kept
+    /// token 0 (first come), token 1 was dropped by both, and the survivors
+    /// kept their partial weights 0.8808 and 0.1192.
+    #[test]
+    fn a_token_left_with_one_expert_gets_its_full_weight() {
+        let logits: Vec<f32> = vec![
+            2.0, 0.0,
+            0.0, 1.0,
+        ];
+        let result = route_topk(&logits, 2, 2, 2, 0.5);
+        assert_eq!(result.total_assigned, 2);
+        assert_eq!(result.expert_boundaries, vec![0, 1, 2]);
+        assert_eq!(result.sorted_token_indices, vec![0, 1]);
+        for &w in &result.sorted_assignment_weights {
+            assert!((w - 1.0).abs() < 1e-6, "surviving weight should be 1.0, got {w}");
+        }
     }
 
     /// Two experts, top-2: every token is assigned to both, so each expert

@@ -75,6 +75,8 @@ fn layer_ilp_solution_default_decision_trace_is_empty() {
         cost_us: 0.0,
         memory_bytes: 0,
         smem_bytes: 0,
+        param_bytes: 0,
+        activation_bytes: 0,
         nodes_explored: 0,
         feasible: false,
         decision_trace: vec![],

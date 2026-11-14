@@ -185,6 +185,13 @@ impl Compiler<'_> {
                     // so an in-place replan prices packing from the
                     // real distribution too.
                     self.features.dataset_packing_stats.clone(),
+                    // The shapes of THIS block's model, read off the tape
+                    // the plan is made for.
+                    self.wggo_model_geometry(
+                        extractor,
+                        crate::stmt_pass_bridges::train_block_param_paths(self, train)
+                            .as_deref(),
+                    ),
                 )
                 .map_err(|e| {
                     e.with_span_if_unset(crate::wggo_prepass::model_arg_span(
@@ -305,7 +312,15 @@ impl Compiler<'_> {
                         {
                             PackingKernelState::FusedSegmentMasked
                         }
-                        _ if self.features.packing_supported_in_module => {
+                        // A packed attention call on the tape masks at the
+                        // source level too (its decomposed fallback derives
+                        // the mask from the segment ids), whether or not the
+                        // module declares a packed dataset.
+                        _ if self.features.packing_supported_in_module
+                            || crate::wggo_model_shape::tape_has_packed_attention(
+                                extractor.wengert_list(),
+                            ) =>
+                        {
                             PackingKernelState::SourceMasked
                         }
                         _ => PackingKernelState::NoMaskedKernels,

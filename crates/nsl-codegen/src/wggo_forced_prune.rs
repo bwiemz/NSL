@@ -26,9 +26,11 @@ use crate::wggo_graph::{layer_prefix, LayerRole, OptGraph};
 pub struct LayerImportance {
     pub layer_index: u32,
     pub layer_name: String,
-    /// RMS over every element of every weight mapped to the layer, divided
+    /// RMS over every element of every tensor given for the layer, divided
     /// by the largest such RMS across the ranked layers (so the most
-    /// important layer reads 1.0).
+    /// important layer reads 1.0). The compile pipeline gives the layer's
+    /// weight matrices, not its gains or biases
+    /// (`NslWeightsCheckpoint::weight_matrices_by_name`).
     pub importance: f64,
 }
 
