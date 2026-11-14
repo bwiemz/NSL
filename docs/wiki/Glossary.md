@@ -9,7 +9,7 @@ Every acronym, keyword, and decorator you will see in NSL code, specs, or PRs. O
 ## Subsystems
 
 ### <a id="awq"></a>AWQ — Activation-aware Weight Quantization
-Build-time per-channel weight quantization that scales by observed activation magnitudes; produces INT4/INT8 weights with minimal perplexity loss. See [`spec/06-quantization.nsl.md`](../../spec/06-quantization.nsl.md); implementation in `crates/nsl-codegen/src/calibration/`.
+A published post-training quantization method that scales each input channel of a weight by a factor searched from activation statistics before rounding. NSL does not implement it: `@quantize(dtype="awq4")` and a `quant` block with `default: awq4` are compile errors, and the calibration pass that once collected activation maxima for it is deleted. The runtime module named `awq.rs` is per-group round-to-nearest into a 4-bit packed format, with no activation-aware step. To quantize weights use a `quant` block with `int4` or `int8`.
 
 ### <a id="ccr"></a>CCR — Compiler-Chosen Recomputation
 Block-granular activation checkpointing on the source-AD path: a transformer block's interior activations are freed after the forward and bit-exactly recomputed just before that block's backward. Implemented in [`crates/nsl-codegen/src/ccr.rs`](../../crates/nsl-codegen/src/ccr.rs); driven by `--checkpoint-blocks`. See [`CCR.pdf`](../research/CCR.pdf) for the research background and [Optimization-Passes](Optimization-Passes.md#ccr--compiler-chosen-recomputation) for the pass description.
@@ -134,7 +134,7 @@ Mutable binding. Full reference: [`spec/01-syntax-fundamentals.nsl.md`](../../sp
 Block keyword for defining a model (analogous to a class, but keyword-level so the compiler can track weight tensors and generate serialization automatically). `model` is reserved — parser rejects `model=m` as an identifier. Full reference: [`spec/04-model-definition.nsl.md`](../../spec/04-model-definition.nsl.md).
 
 ### <a id="kw-quant"></a>`quant`
-Block keyword for declarative quantization configuration (INT4, INT8, FP8, GPTQ, AWQ, per-channel/group granularity). Full reference: [`spec/06-quantization.nsl.md`](../../spec/06-quantization.nsl.md).
+Block keyword for declarative weight quantization: `quant static q from m:` with `default: int8` or `int4` and per-tensor, per-channel or per-group granularity. The `awq4`, `gptq4` and `gptq8` defaults are refused. Full reference: [`spec/06-quantization.nsl.md`](../../spec/06-quantization.nsl.md).
 
 ### <a id="kw-serve"></a>`serve`
 Block keyword (M29) for the continuous-batching serving engine: declares prefill/decode chunking, preemption policy, and KV-cache management as compile-time configuration. Full reference: [`spec/09-hardware-abstraction.nsl.md`](../../spec/09-hardware-abstraction.nsl.md).

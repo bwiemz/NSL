@@ -373,8 +373,13 @@ fn load_and_register_weights_if_needed(
     Ok(())
 }
 
-/// Run both AWQ and WGGO pre-scan discovery passes against the AST and
-/// populate `opts` fields that are still `None`.  This is the test-facing
+/// Run the WGGO pre-scan discovery pass against the AST and populate
+/// `opts.calibration.grad_retention` if it is still `None`. (An AWQ pass
+/// used to run here too, keyed on `@quantize(dtype="awq4")`: it filled
+/// `calibration.retention`, which made every build of such a model compile
+/// activation-retention copies into its forward for a calibration whose
+/// output nothing read. The decorator is refused and that pass is gone;
+/// `calibration.retention` is set only by a caller that hands it in.)  This is the test-facing
 /// seam: all compiler entry points delegate to
 /// [`populate_calibration_retention_from_ast_if_unset`] which calls this
 /// helper internally.
@@ -389,12 +394,6 @@ pub(crate) fn run_pre_scan_phase(
     interner: &Interner,
     mut opts: crate::CompileOptions,
 ) -> crate::CompileOptions {
-    if opts.calibration.retention.is_none() {
-        let discovered_awq = crate::calibration::pre_scan_awq_projections_from_ast(ast, interner);
-        if !discovered_awq.is_empty() {
-            opts.calibration.retention = Some(discovered_awq);
-        }
-    }
     if opts.calibration.grad_retention.is_none() {
         let discovered_wggo =
             crate::calibration::discovery::pre_scan_wggo_targets_from_ast(ast, interner);
@@ -573,23 +572,6 @@ fn populate_calibration_retention_from_ast_if_unset(
     let updated = run_pre_scan_phase(ast, interner, compiler.compile_options.clone());
     compiler.compile_options.calibration.retention = updated.calibration.retention;
     compiler.compile_options.calibration.grad_retention = updated.calibration.grad_retention;
-
-    // AWQ-specific error: if an @quantize decorator is present but discovery
-    // returned nothing, that is a user error we must surface.
-    if compiler.compile_options.calibration.retention.is_none()
-        && crate::calibration::discovery::ast_has_awq_quantize_decorator(ast, interner)
-    {
-        let model_name =
-            crate::calibration::discovery::first_awq_quantized_model_name(ast, interner)
-                .unwrap_or_else(|| "<unknown>".into());
-        return Err(CodegenError::new(format!(
-            "calibration: @quantize model declared but no AWQ projections discovered.\n\
- requested:  auto-discover AWQ projections for model '{model_name}'\n\
- expected:   @quantize(dtype=\"awq4\") model -> at least one DiscoveredProjection\n\
- found:      model '{model_name}' is AWQ-quantized but discovery returned zero projections.\n\
- Action:     either remove the @quantize decorator, or add the Linear/tensor projections the decorator is meant to target."
-        )));
-    }
 
     // §5.4-§5.6: grad-mode WGGO refusals.
     enforce_grad_mode_refusals(ast, interner, &compiler.compile_options)?;

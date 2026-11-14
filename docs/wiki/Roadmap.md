@@ -98,7 +98,7 @@ Symbolic dimension tracking; bounded syntax (`SeqLen < 4096`); runtime dimension
 `@context_parallel` for cross-GPU sequence parallelism over arbitrarily long sequences.
 
 ### M35 -- FP8/AWQ/GPTQ quantization (Shipped v0.3, 2026-03-17; extended 2026-03-26, 0.9 line unreleased)
-FP8 MMA paths; AWQ calibration pipeline; GPTQ full OBQ algorithm with Hessian-based error compensation (2026-03-26, unreleased). Design: [`2026-04-15-m35-fp8-mma-correctness-design.md`](../superpowers/specs/2026-04-15-m35-fp8-mma-correctness-design.md).
+FP8 MMA paths; GPTQ as a runtime library routine (2026-03-26, unreleased; corrected against a reference in 2026-11, not reachable from NSL). The AWQ calibration pipeline shipped here collected statistics nothing consumed and was removed in 2026-11; `awq4` is refused. Design: [`2026-04-15-m35-fp8-mma-correctness-design.md`](../superpowers/specs/2026-04-15-m35-fp8-mma-correctness-design.md).
 
 ### M36 -- Memory planning (Shipped v0.3, 2026-03-17)
 Compile-time tensor liveness analysis; slab allocator for static memory budgets.

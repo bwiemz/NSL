@@ -22,7 +22,7 @@ env:
   #     /usr/bin/ld: final link failed: No space left on device
   #
   # and the tests whose fixtures link a program (ccr_periodic_stride_gate,
-  # awq_full_pipeline, …) reported as FAILED. Every recent PR carried that red,
+  # the calibration link tests, …) reported as FAILED. Every recent PR carried that red,
   # which is worse than a broken lane — it is a lane nobody can read, so a real
   # regression and an out-of-disk look identical.
   #
@@ -171,29 +171,6 @@ jobs:
           echo
           echo "### -p nsl-cli --test ccr_periodic_stride_gate"
           cargo test -p nsl-cli --test ccr_periodic_stride_gate -- --test-threads=1 || true
-          echo
-          echo "### -p nsl-codegen --test awq_full_pipeline"
-          cargo test -p nsl-codegen --test awq_full_pipeline -- --test-threads=1 || true
-          echo
-          # The Windows intermittent in this target fails only in the
-          # workspace step, where its two calibration-subprocess tests run
-          # concurrently; the single-threaded re-run above has always
-          # passed, so it cannot show the failure. Re-run it the way the
-          # workspace step does (default thread count), up to three times,
-          # and print the first failing run with the MinGW fallback noise
-          # (the GCC-then-MSVC link attempt's `undefined reference` lines,
-          # present in passing runs too) filtered out.
-          echo "### -p nsl-codegen --test awq_full_pipeline (default threads, up to 3 runs)"
-          for run in 1 2 3; do
-            if cargo test -p nsl-codegen --test awq_full_pipeline > awq_parallel.log 2>&1; then
-              echo "run $run: ok"
-            else
-              echo "run $run: FAILED; output without the MinGW fallback lines:"
-              grep -v -e 'undefined reference' -e 'more undefined references' \
-                -e 'ld returned 1 exit status' -e 'corrupt .drectve' awq_parallel.log || true
-              break
-            fi
-          done
 
       # 28 nsl-codegen integration test files are `#![cfg(feature =
       # "test-helpers")]` and three more are `required-features` targets.

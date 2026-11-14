@@ -255,11 +255,12 @@ Older, adjacent code that a reader might mistake for it:
   4-bit packed format; it is not AWQ, and its module comment says so. The
   refusal remains the right behaviour: nothing feeds either routine
   calibration data from NSL source.
-- **`@quantize(dtype="awq4")`.** Reachable, with a compile-time warning
-  that it does not quantize the model. With `--calibration-data` it selects
-  the model for a calibration pass that writes per-channel activation
-  maxima to a sidecar file
-  (`crates/nsl-codegen/src/calibration/awq_hook.rs`). Nothing reads them.
+- **`@quantize(dtype="awq4")`.** Refused, in every form of the decorator.
+  It used to select the model for an activation-statistics pass and had
+  activation-retention copies compiled into the model's forward for it;
+  nothing read the statistics. The hook that collected them
+  (`awq_hook.rs` under `crates/nsl-codegen/src/calibration/`) and the
+  discovery that found the models are deleted.
 - **`@fp8_compute`.** Reachable. It sets one flag per function, so a
   decorated forward runs the LM-head matmul in FP8 like any other matmul.
 - **Block-scaled FP4 rounding with an optional Hadamard rotation.**
@@ -407,29 +408,29 @@ as of 2026-11-13.
   and maximum. It is not AWQ and no longer presents itself as AWQ: the
   module comment in `crates/nsl-runtime/src/awq.rs` and the status
   documents describe it as per-group round-to-nearest, and a non-null
-  calibration argument is refused instead of ignored. The statistic the
-  calibration hook collects (per-channel max |x|, where AWQ uses the mean)
-  is described as what it is; nothing consumes it.
+  calibration argument is refused instead of ignored. The calibration
+  hook that collected a per-channel max |x| (where AWQ uses the mean) has
+  since been deleted; see the last item of this list.
 - **The AWQ "end-to-end" tests checked only that bytes change.**
   `awq_quantize_with_scales`, an int8 abs-max stand-in, existed for tests
   that asserted its output differed when the scales differed. The
-  stand-in and those tests are removed; the calibration hook's test now
-  checks the statistic itself against values worked out by hand.
+  stand-in and those tests are removed.
 - **`docs/summaries/06-implementation-status.md` called AWQ and GPTQ
   "Production".** Its rows for M21-M22 and M35 and its feature list now
   say that NSL source reaches neither, and what each routine is.
+- **`@quantize(dtype="awq4")` computed scales that nothing consumed.** The
+  decorator was accepted and selected the model for a calibration pass
+  that wrote per-channel activation maxima to a sidecar file; it also had
+  activation-retention copies compiled into the model's forward in every
+  build. Nothing read the result. The decorator is now a compile error in
+  every form (`crates/nsl-semantic/src/quant_requests.rs`): `awq4`, and
+  the bare decorator that meant the same, say that AWQ calibration is not
+  implemented, any other dtype says that dtype is not implemented, and
+  both point at the `quant` block. The calibration hook, the discovery of
+  `@quantize` models and the tests that exercised only them are deleted.
+  The calibration harness itself remains for the gradient-importance
+  statistics; no `nsl` command runs it.
 
 ### Open, in the adjacent code
 
-- **`@quantize(dtype="awq4")` computes scales that nothing consumes.** The
-  decorator is accepted and, with `--calibration-data`, selects the model
-  for a calibration pass that writes per-channel activation maxima to a
-  sidecar file. Nothing reads them: the one reader, behind the refused
-  `awq4` block, has been removed. The decorator now produces a
-  compile-time warning that it does not quantize the model
-  (`crates/nsl-semantic/src/quant_requests.rs`), and the log line that
-  claimed a model was being compiled "with quantization" is gone. It is
-  not refused outright: the calibration harness, its sidecar format and
-  their tests are built around this decorator, and whether to delete that
-  pipeline or give the scales a consumer (which means implementing AWQ)
-  is still to be decided. By reading the code only.
+Nothing in this list is open.

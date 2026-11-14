@@ -74,13 +74,9 @@ Full reference: [`spec/03-automatic-differentiation.nsl.md`](../../spec/03-autom
 ## Quantization — `quant`
 
 ```python
-let quantized = quant(
-    scheme=awq,
-    mode=weight_only,
-    granularity=per_group(size=128)
-):
-    model = MyModel
-    calibration_data = calib_data
+quant static quantized from model:
+    default: int4, per_group(128)
+    exclude: ["*norm*"]
 ```
 
 Full reference: [`spec/06-quantization.nsl.md`](../../spec/06-quantization.nsl.md).

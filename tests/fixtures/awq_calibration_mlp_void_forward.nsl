@@ -1,6 +1,10 @@
+# Model fixture for the calibration harness tests (model-object emission,
+# two-object link, backward wrapper). The tests hand the harness the two
+# projections, up_proj [128, 64] and down_proj [64, 128], explicitly. The
+# file is named for the AWQ calibration it was written for, which is gone:
+# it carried `@quantize(dtype="awq4")`, a decorator that is now refused.
 from nsl.nn.losses import mse_loss
 
-@quantize(dtype="awq4")
 model TinyMLPVoid:
     up_proj: Tensor = zeros([128, 64])
     down_proj: Tensor = zeros([64, 128])

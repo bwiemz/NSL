@@ -24,6 +24,19 @@ fn fixture_path() -> std::path::PathBuf {
         .join("wggo_attn_4proj.nsl")
 }
 
+/// The four projections of the TinyAttn4 fixtures, in forward order, as a
+/// calibration caller hands them in through `calibration.retention`. They
+/// used to be scanned out of the fixture's `@quantize` decorator.
+fn attn4_projections() -> Vec<nsl_codegen::calibration::DiscoveredProjection> {
+    ["q_proj", "k_proj", "v_proj", "o_proj"]
+        .into_iter()
+        .map(|field| nsl_codegen::calibration::DiscoveredProjection {
+            projection: ProjectionRef(format!("TinyAttn4.{field}")),
+            weight_shape: [16, 16],
+        })
+        .collect()
+}
+
 fn parse_attn4_fixture() -> (nsl_ast::Module, Interner) {
     parse_src(&std::fs::read_to_string(fixture_path()).expect("fixture readable"))
 }
@@ -85,6 +98,7 @@ fn opts_with_backward(
         w_o_index: 3,
     }];
     opts.calibration.grad_retention = Some(targets);
+    opts.calibration.retention = Some(attn4_projections());
     opts
 }
 
@@ -123,7 +137,7 @@ fn count_grad_arena_refs(obj_bytes: &[u8]) -> usize {
 #[test]
 fn model_backward_emits_grad_arena_memcpy_for_each_w_star() {
     let (ast, interner) = parse_attn4_fixture();
-    let projections = nsl_codegen::calibration::pre_scan_awq_projections_from_ast(&ast, &interner);
+    let projections = attn4_projections();
     let arena_layout = build_arena_layout(&projections, 4, 4);
     let tmp = tempfile::tempdir().expect("tempdir");
     let out_path = tmp.path().join("calib_model_grad.o");
@@ -147,8 +161,7 @@ fn model_backward_emits_grad_arena_memcpy_for_each_w_star() {
 /// rather than training against some other eps.
 fn norm_eps_fixture(eps_decl: &str) -> String {
     format!(
-        r#"@quantize(dtype="awq4")
-model TinyAttn4:
+        r#"model TinyAttn4:
     q_proj: Tensor = zeros([16, 16])
     k_proj: Tensor = zeros([16, 16])
     v_proj: Tensor = zeros([16, 16])
@@ -168,7 +181,7 @@ fn main():
 
 fn emit(src: &str) -> Result<(), String> {
     let (ast, interner) = parse_src(src);
-    let projections = nsl_codegen::calibration::pre_scan_awq_projections_from_ast(&ast, &interner);
+    let projections = attn4_projections();
     let arena_layout = build_arena_layout(&projections, 4, 4);
     let tmp = tempfile::tempdir().expect("tempdir");
     let opts = opts_with_backward(&ast, &interner);

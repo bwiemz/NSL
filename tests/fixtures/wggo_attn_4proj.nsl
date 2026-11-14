@@ -1,12 +1,12 @@
 # Fixture for Task 16: model with four weight projections used in the forward pass.
-# Uses the pipe operator (|>) so AWQ pre-scan discovers all four projections.
+# Uses the pipe operator (|>); the test hands the four projections to the
+# harness itself (they were once discovered from an AWQ decorator, now refused).
 # The WengertExtractor sees q_proj, k_proj, v_proj, o_proj as Param VarIds whose
 # adjoints map to four grad-arena slots.
 #
 # Shape convention: x is [batch, seq, 16].  All projections are [16, 16] squares
 # so `x |> proj` = `x @ proj` succeeds for all.
 
-@quantize(dtype="awq4")
 model TinyAttn4:
     q_proj: Tensor = zeros([16, 16])
     k_proj: Tensor = zeros([16, 16])

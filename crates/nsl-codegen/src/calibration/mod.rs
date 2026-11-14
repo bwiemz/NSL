@@ -2,7 +2,6 @@
 //! `docs/superpowers/specs/2026-04-13-calibration-harness-design.md`.
 
 pub mod ast_evaluator;
-pub mod awq_hook;
 pub mod data_shape;
 pub mod discovery;
 pub mod wggo_gradient_hook;
@@ -20,10 +19,7 @@ pub mod sidecar;
 pub mod subprocess;
 
 pub use ctx::{BssGlobalEntry, BufferHandle, CalibCtx};
-pub use discovery::{
-    discover_awq_projections, discover_awq_projections_from_state,
-    pre_scan_awq_projections_from_ast, DiscoveredProjection, DiscoveryError,
-};
+pub use discovery::DiscoveredProjection;
 pub use hooks::{CalibrationHook, CalibrationResult, FinalizePlanEntry, ObservePlanEntry};
 pub use binary_codegen::{
     emit_calibration_model_object, emit_calibration_scaffolding_object,

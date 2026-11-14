@@ -133,11 +133,10 @@ edges and occasional API churn.
   source does not reach.
   Requests that were accepted and never honoured are refused: `nsl build`'s
   calibration flags, a `quant` block's `calibration:` section and its
-  `awq4`/`gptq*` defaults, `@quantize` arguments other than `dtype =
-  "awq4"`, `@fp8_compute(calibrate = true)`, and the decorators
-  `@kv_compress`, `@sparse` and `@fp4_compute`. `@quantize(dtype = "awq4")`
-  is accepted with a warning: it marks a model for the calibration pass and
-  quantizes nothing.
+  `awq4`/`gptq*` defaults, `@fp8_compute(calibrate = true)`, and the
+  decorators `@quantize` (every form: its one accepted dtype, `awq4`, drove
+  an activation-statistics pass whose output nothing read; that pass is
+  deleted), `@kv_compress`, `@sparse` and `@fp4_compute`.
 - **FlashAttention** — codegen path and selector (`analysis`).
 - **C ABI / shared-library export** — `nsl_model_*` C API and generated headers
   (M62), including the DLPack output-ownership models `nsl_model_call_into` /

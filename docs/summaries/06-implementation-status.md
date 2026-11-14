@@ -67,7 +67,7 @@ Core inference milestones shipped in v0.2.0, with later auditing showing M30-M31
 | M32 | Mixture of Experts | Functional | @moe decorator, router, dispatch, aux loss, expert parallel FFI (all-to-all stub) |
 | M33 | Speculative Decoding | Functional | DraftModelRunner (524 LOC), Lookahead n-gram decoding, rejection sampling (greedy + stochastic), tree attention masks; EAGLE-2/Medusa tree-method plumbing remains partial |
 | M34 | Ring Attention | Functional | @context_parallel extraction, ring comm basic |
-| M35 | FP8 compute; 4-bit weight routines | Partial | FP8 E4M3/E5M2 (`@fp8_compute`, H100 MMA PTX) is reachable from NSL. The 4-bit routines are runtime library code that no NSL program reaches: the one named AWQ is per-group round-to-nearest with no activation-aware scaling, and GPTQ (act-order, blocked updates, Cholesky factor of the inverse Hessian) is tested against a NumPy reference. `@quantize(dtype="awq4")` only marks a model for the calibration pass and warns that it quantizes nothing |
+| M35 | FP8 compute; 4-bit weight routines | Partial | FP8 E4M3/E5M2 (`@fp8_compute`, H100 MMA PTX) is reachable from NSL. The 4-bit routines are runtime library code that no NSL program reaches: the one named AWQ is per-group round-to-nearest with no activation-aware scaling, and GPTQ (act-order, blocked updates, Cholesky factor of the inverse Hessian) is tested against a NumPy reference. `@quantize` is refused in every form: its one accepted dtype, `awq4`, drove a calibration pass whose output nothing read, and that pass is deleted |
 
 ### Compiler Analysis (M36-M40) — FUNCTIONAL TO PRODUCTION
 

@@ -757,11 +757,13 @@ Quantization entry points.
 
 ### `fn quantize(t: Tensor, dtype: str, granularity: str, axis: int, group_size: int) -> QuantizedTensor`
 
-Quantize `t` to `dtype` (`"int8"`, `"int4"`, `"fp8_e4m3"`, …).
+Quantize `t` to `dtype`, which is `"int8"` or `"int4"`. No other name
+(`"fp8_e4m3"`, `"awq4"`, …) is implemented.
 
-`granularity` selects the scale's scope — per tensor, per `axis`, or
-per group of `group_size` elements along it. Finer granularity costs
-more scale storage and recovers more accuracy.
+`granularity` is `"per_tensor"`, `"per_channel"` (one scale per slice
+along `axis`) or `"per_group"` (one per group of `group_size` elements
+along `axis`). Finer granularity costs more scale storage and recovers
+more accuracy.
 
 ### `fn dequantize(qt: QuantizedTensor) -> Tensor`
 

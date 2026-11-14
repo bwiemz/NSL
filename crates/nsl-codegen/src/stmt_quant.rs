@@ -1,8 +1,6 @@
 //! The `quant` block lowering: `compile_quant_block` (the per-model
 //! quantisation call sequence — dtype and granularity selection and the
-//! walk over the model's fields and sub-models) and `discover_awq_projections` (the forward-method walk that
-//! enumerates the linear-projection call sites AWQ calibration needs;
-//! `lib.rs` also calls it when it synthesises the calibration harness).
+//! walk over the model's fields and sub-models).
 //!
 //! Moved out of `stmt.rs` whole, byte-for-byte (roadmap A1); the statement
 //! dispatch (`stmt.rs::compile_stmt_dispatch`) still calls
@@ -307,91 +305,5 @@ impl Compiler<'_> {
         }
 
         Ok(new_ptr)
-    }
-
-    /// Walk the compiled model's `quant { ... }` blocks and produce the
-    /// list of ProjectionRefs that AWQ needs calibration data for.
-    /// Returns `None` when no AWQ quant block is present or discovery
-    /// produces no matches.
-    ///
-    /// Implementation (Task 3): scans `self.features.quant_configs` for
-    /// models quantised with `"awq4"`.  For each such model, retrieves the
-    /// `forward` method body from `model_method_bodies`, walks its pipe chain
-    /// to enumerate linear-projection call sites, and returns the sorted,
-    /// deduplicated `Vec<ProjectionRef>`.  Discovery errors (e.g. empty match)
-    /// are logged to stderr and treated as `None` so the harness falls back to
-    /// its no-op path rather than crashing the compile.
-    pub(crate) fn discover_awq_projections(
-        &self,
-    ) -> Option<Vec<crate::calibration::DiscoveredProjection>> {
-        use crate::calibration::discover_awq_projections_from_state;
-
-        // Collect all AWQ-quantised model names.
-        let awq_models: Vec<String> = self
-            .features
-            .quant_configs
-            .iter()
-            .filter(|(_, cfg)| cfg.dtype == "awq4")
-            .map(|(name, _)| name.clone())
-            .collect();
-
-        if awq_models.is_empty() {
-            return None;
-        }
-
-        let mut all_projections: Vec<crate::calibration::DiscoveredProjection> = Vec::new();
-
-        for model_name in &awq_models {
-            // Retrieve the forward method body (if stored).
-            let forward_body: Option<&nsl_ast::stmt::Block> = self
-                .models
-                .model_method_bodies
-                .get(model_name)
-                .and_then(|methods| methods.get("forward"))
-                .map(|fn_def| &fn_def.body);
-
-            // Retrieve field-type and shape maps for this model.
-            let empty_field_types = std::collections::HashMap::new();
-            let field_types = self
-                .models
-                .model_field_types
-                .get(model_name)
-                .unwrap_or(&empty_field_types);
-
-            let empty_shapes = std::collections::HashMap::new();
-            let tensor_shapes = self
-                .models
-                .model_tensor_field_shapes
-                .get(model_name)
-                .unwrap_or(&empty_shapes);
-
-            match discover_awq_projections_from_state(
-                model_name,
-                forward_body,
-                field_types,
-                tensor_shapes,
-                &[], // no exclusions from the Compiler-level stub; the QuantBlock's
-                     // exclude list is stored in the AST which isn't retained here.
-                self.interner,
-            ) {
-                Ok(discovered) => {
-                    for dp in discovered {
-                        all_projections.push(dp);
-                    }
-                }
-                Err(e) => {
-                    nsl_log::nsl_log!(INFO, "calibration", "[calibration] AWQ discovery for model '{model_name}': {e}");
-                }
-            }
-        }
-
-        if all_projections.is_empty() {
-            None
-        } else {
-            // Sort + dedup across models (by qualified path for determinism).
-            all_projections.sort_by(|a, b| a.projection.0.cmp(&b.projection.0));
-            all_projections.dedup_by(|a, b| a.projection.0 == b.projection.0);
-            Some(all_projections)
-        }
     }
 }

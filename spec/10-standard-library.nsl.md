@@ -177,6 +177,14 @@ fn ParamGroup(params: list<Param>, **overrides) -> ParamGroup
 
 ## nsl.quant — Quantization Toolkit
 
+> **Status (2026-11).** The list below is the design. `nsl.quant.ops`
+> declares `quantize(t, dtype, granularity, axis, group_size)` for `"int8"`
+> and `"int4"` and `dequantize(qt)`, but the module does not type-check
+> today (its `QuantizedTensor` return type is not a name the checker
+> resolves), so it cannot be imported; `gptq`, `awq`, sensitivity analysis
+> and the rest are not implemented. To quantize a model's weights, use a
+> `quant` block (Section 6).
+
 Top 10 public APIs:
 
 ```nsl

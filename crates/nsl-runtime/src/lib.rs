@@ -224,13 +224,7 @@ pub mod weight_stream;
 /// Item 3: cross-checks the compiled ParameterPlan against the three
 /// residency tables (`weight_stream` / `zero` / `sr_bf16`) at run time.
 pub mod param_plan;
-#[allow(deprecated)]
-pub use awq::{
-    nsl_awq_write_sidecar,  // deprecated; kept as the rename shim during transition
-    nsl_calib_write_sidecar,
-    AwqProjectionDescriptor,
-    WggoLayerDescriptor,
-};
+pub use awq::{nsl_calib_write_sidecar, AwqProjectionDescriptor, WggoLayerDescriptor};
 pub mod gptq;
 
 // Calibration-data loader: .bin and .safetensors dispatch (unconditional)

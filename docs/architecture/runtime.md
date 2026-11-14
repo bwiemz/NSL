@@ -574,8 +574,8 @@ encoder token for token.
 `peek_shape(path)` read either the NSL-native `.bin` (magic `NSLB`; its
 header is `nsl_abi::wire::calibration_bin`, shared with the compiler's
 compile-time geometry peek) or a
-safetensors archive with a `calibration` tensor, for the AWQ/GPTQ pipelines
-(`src/awq.rs`, `src/gptq.rs`, `src/quantize.rs`).
+safetensors archive with a `calibration` tensor, for the calibration
+harness.
 
 ## Serving and interop
 

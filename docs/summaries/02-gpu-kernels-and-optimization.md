@@ -221,8 +221,8 @@ quant static:
 | INT4 | 4 | per-group | Full |
 | FP8 E4M3 | 8 | per-tensor | Full (H100 MMA) |
 | FP8 E5M2 | 8 | per-tensor | Full |
-| AWQ | 4 | activation-aware groups | Full |
-| GPTQ | 4/8 | column-wise | Full |
+| AWQ | 4 | — | Not implemented: `awq4` is refused. A runtime routine carries the name and is per-group round-to-nearest |
+| GPTQ | 4 | column-wise | Runtime library routine, tested against a NumPy reference; not reachable from NSL (`gptq4`/`gptq8` refused) |
 
 ### QuantizedTensor Type
 A distinct type in the type system — the compiler tracks quantized tensors separately from regular tensors, ensuring correct dequantization before incompatible operations.

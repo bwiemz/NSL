@@ -15,7 +15,7 @@
 //!      2D max-abs loop per projection that reads the retention arena and
 //!      accumulates into per-projection running-buffer globals.
 //!   7. After the batch loop, builds a stack-allocated descriptor array
-//!      and calls `nsl_awq_write_sidecar(sidecar_path, descriptors)`.
+//!      and calls `nsl_calib_write_sidecar(sidecar_path, descriptors)`.
 //!      Propagates non-zero return code.
 //!   8. Calls `nsl_calibration_free`; returns 0.
 //!
@@ -81,9 +81,9 @@ pub fn real_subprocess_entry(
     // For non-forward hooks: compute sidecar in-process so we can embed the
     // JSON in the binary.
     // For forward hooks: the subprocess writes the sidecar itself via
-    // nsl_awq_write_sidecar; we embed a placeholder JSON that is never read.
+    // nsl_calib_write_sidecar; we embed a placeholder JSON that is never read.
     let sidecar_json_for_binary = if needs_forward {
-        // The subprocess writes its own sidecar via nsl_awq_write_sidecar.
+        // The subprocess writes its own sidecar via nsl_calib_write_sidecar.
         // Embed a minimal placeholder so the binary emission code has something
         // to pass — it is not used by the forward-pass code path in main().
         b"{}".to_vec()
@@ -1995,24 +1995,18 @@ pub fn emit_calibration_model_object(
                 .into(),
         })?;
 
-    let mut compile_opts = opts.clone();
+    let compile_opts = opts.clone();
 
     // #134 §5.2 hop 6 generalization: emit_calibration_model_object reads
     // from the union calibration.retention ∪ calibration.grad_retention.
-    // AWQ flow: calibration.retention is non-empty (or AWQ pre-scan
-    // discovers it from the AST), so the first arm matches and the function
-    // reads exactly what it read before — byte-identical by inspection.
+    // Forward-retention flow: the caller handed in calibration.retention,
+    // so the first arm matches. (It used to be filled here from an AST scan
+    // for `@quantize(dtype="awq4")` models when the caller had not set it;
+    // that decorator is refused and the scan is gone.)
     // WGGO-only flow: calibration.retention is None or empty but
     // calibration.grad_retention is populated; the second arm synthesizes
     // projections from WGGO targets using grad_target_to_projection_meta
     // (one entry per target, using w_o_shape per spec §5.2).
-    if compile_opts.calibration.retention.is_none() {
-        let discovered =
-            crate::calibration::pre_scan_awq_projections_from_ast(ast, &bundle.interner);
-        if !discovered.is_empty() {
-            compile_opts.calibration.retention = Some(discovered);
-        }
-    }
 
     let projections: Vec<crate::calibration::discovery::DiscoveredProjection> = match (
         compile_opts.calibration.retention.as_ref(),
@@ -2024,7 +2018,7 @@ pub fn emit_calibration_model_object(
         }
         _ => {
             return Err(HarnessError::Infrastructure {
-                reason: "emit_calibration_model_object requires either AWQ \
+                reason: "emit_calibration_model_object requires either forward \
                          projections (calibration.retention) or WGGO targets \
                          (calibration.grad_retention)"
                     .into(),
@@ -3585,7 +3579,7 @@ pub fn link_calibration_binary(
 ///      `nsl_calibration_batch_at`; after each batch, runs a plan-driven
 ///      2D max-abs reduction into per-projection running-buffer globals.
 ///   5. After the batch loop: builds a descriptor array on the stack and
-///      calls `nsl_awq_write_sidecar(sidecar_path, descriptors)`.
+///      calls `nsl_calib_write_sidecar(sidecar_path, descriptors)`.
 ///      Propagates non-zero return code.
 ///   6. Calls `nsl_calibration_free(batches)` (deferred to final step).
 ///   7. Returns 0.
@@ -3728,7 +3722,7 @@ fn emit_and_link_calibration_binary(
         );
         let mut data = DataDescription::new();
         // Store the projection name as raw bytes (no NUL terminator needed;
-        // nsl_awq_write_sidecar receives the length explicitly).
+        // nsl_calib_write_sidecar receives the length explicitly).
         data.define(entry.projection.0.as_bytes().to_vec().into_boxed_slice());
         let id = module
             .declare_data(&sym, Linkage::Local, false, false)
@@ -3866,7 +3860,7 @@ fn emit_and_link_calibration_binary(
         //   loop_header(batches_ptr, sidecar_ptr, i): i < count → loop_body / loop_exit
         //   loop_body: batch_at + plan-driven 2D max-abs loops → loop_header
         //   loop_exit(sidecar_ptr): → finalize
-        //   finalize(sidecar_ptr): build descriptors → nsl_awq_write_sidecar
+        //   finalize(sidecar_ptr): build descriptors → nsl_calib_write_sidecar
         //                          → (write_ok | write_err)
         //   write_err: return rc
         //   write_ok: return 0
@@ -4039,7 +4033,7 @@ fn emit_and_link_calibration_binary(
             let le_sidecar_ptr = b.block_params(loop_exit)[0];
             b.ins().jump(finalize, &[BlockArg::Value(le_sidecar_ptr)]);
 
-            // ── Step 5: finalize — build descriptor array, call nsl_awq_write_sidecar ──
+            // ── Step 5: finalize — build descriptor array, call nsl_calib_write_sidecar ──
             b.switch_to_block(finalize);
             b.seal_block(finalize);
             let fin_sidecar_ptr = b.block_params(finalize)[0];
@@ -4198,6 +4192,18 @@ mod tests {
         repo_root().join("tests").join("fixtures").join(name)
     }
 
+    /// The two projections of the TinyMLP fixtures, in forward order, as a
+    /// calibration caller hands them in through `calibration.retention`.
+    fn tiny_mlp_projections(model: &str) -> Vec<crate::calibration::discovery::DiscoveredProjection> {
+        [("up_proj", [128, 64]), ("down_proj", [64, 128])]
+            .into_iter()
+            .map(|(field, weight_shape)| crate::calibration::discovery::DiscoveredProjection {
+                projection: crate::calibration::observation::ProjectionRef(format!("{model}.{field}")),
+                weight_shape,
+            })
+            .collect()
+    }
+
     fn parse_awq_fixture() -> (nsl_ast::Module, Interner) {
         let source = std::fs::read_to_string(fixture("awq_calibration_mlp.nsl"))
             .expect("fixture readable");
@@ -4243,11 +4249,12 @@ mod tests {
     #[test]
     fn emit_calibration_model_object_exports_wrapper_symbol() {
         let (ast, interner) = parse_awq_fixture();
-        let projections = crate::calibration::pre_scan_awq_projections_from_ast(&ast, &interner);
+        let projections = tiny_mlp_projections("TinyMLP");
         let arena_layout = build_arena_layout(&projections, 8, 4);
         let tmp = tempfile::tempdir().expect("tempdir");
         let out_path = tmp.path().join("calib_model.o");
-        let opts = awq_fixture_compile_options(&ast, &interner);
+        let mut opts = awq_fixture_compile_options(&ast, &interner);
+        opts.calibration.retention = Some(projections.clone());
 
         emit_calibration_model_object(
             &ast,
@@ -4271,11 +4278,12 @@ mod tests {
     #[test]
     fn calib_model_object_contains_model_forward_body() {
         let (ast, interner) = parse_awq_fixture();
-        let projections = crate::calibration::pre_scan_awq_projections_from_ast(&ast, &interner);
+        let projections = tiny_mlp_projections("TinyMLP");
         let arena_layout = build_arena_layout(&projections, 8, 4);
         let tmp = tempfile::tempdir().expect("tempdir");
         let out_path = tmp.path().join("calib_model.o");
-        let opts = awq_fixture_compile_options(&ast, &interner);
+        let mut opts = awq_fixture_compile_options(&ast, &interner);
+        opts.calibration.retention = Some(projections.clone());
 
         emit_calibration_model_object(&ast, &opts, &arena_layout, &out_path)
             .expect("emit succeeds");
@@ -4691,6 +4699,18 @@ mod backward_wrapper {
         repo_root().join("tests").join("fixtures").join(name)
     }
 
+    /// The two projections of the TinyMLP fixtures, in forward order, as a
+    /// calibration caller hands them in through `calibration.retention`.
+    fn tiny_mlp_projections(model: &str) -> Vec<crate::calibration::discovery::DiscoveredProjection> {
+        [("up_proj", [128, 64]), ("down_proj", [64, 128])]
+            .into_iter()
+            .map(|(field, weight_shape)| crate::calibration::discovery::DiscoveredProjection {
+                projection: crate::calibration::observation::ProjectionRef(format!("{model}.{field}")),
+                weight_shape,
+            })
+            .collect()
+    }
+
     /// Parse the AWQ MLP fixture — same model used by existing calib model tests.
     fn parse_awq_fixture() -> (nsl_ast::Module, Interner) {
         let source = std::fs::read_to_string(fixture("awq_calibration_mlp.nsl"))
@@ -4760,11 +4780,12 @@ mod backward_wrapper {
     #[test]
     fn calib_model_object_exports_nsl_calib_model_backward() {
         let (ast, interner) = parse_awq_fixture();
-        let projections = crate::calibration::pre_scan_awq_projections_from_ast(&ast, &interner);
+        let projections = tiny_mlp_projections("TinyMLP");
         let arena_layout = build_arena_layout(&projections, 8, 4);
         let tmp = tempfile::tempdir().expect("tempdir");
         let out_path = tmp.path().join("calib_model.o");
-        let opts = compile_options_with_backward(&ast, &interner);
+        let mut opts = compile_options_with_backward(&ast, &interner);
+        opts.calibration.retention = Some(projections.clone());
 
         emit_calibration_model_object(&ast, &opts, &arena_layout, &out_path)
             .expect("emit succeeds with grad_retention set");
@@ -4784,7 +4805,7 @@ mod backward_wrapper {
     #[test]
     fn calib_model_object_no_backward_when_grad_retention_absent() {
         let (ast, interner) = parse_awq_fixture();
-        let projections = crate::calibration::pre_scan_awq_projections_from_ast(&ast, &interner);
+        let projections = tiny_mlp_projections("TinyMLP");
         let arena_layout = build_arena_layout(&projections, 8, 4);
         let tmp = tempfile::tempdir().expect("tempdir");
         let out_path = tmp.path().join("calib_model.o");
@@ -4803,6 +4824,7 @@ mod backward_wrapper {
                 },
             ));
             o.weights.index_map = analysis.weight_index_map.clone();
+            o.calibration.retention = Some(projections.clone());
             o
         };
         // Confirm no grad retention.
@@ -4840,11 +4862,12 @@ mod backward_wrapper {
     #[test]
     fn backward_wrapper_emits_l2_loss_dy_alloc_and_scale() {
         let (ast, interner) = parse_awq_fixture();
-        let projections = crate::calibration::pre_scan_awq_projections_from_ast(&ast, &interner);
+        let projections = tiny_mlp_projections("TinyMLP");
         let arena_layout = build_arena_layout(&projections, 8, 4);
         let tmp = tempfile::tempdir().expect("tempdir");
         let out_path = tmp.path().join("calib_model.o");
-        let opts = compile_options_with_backward(&ast, &interner);
+        let mut opts = compile_options_with_backward(&ast, &interner);
+        opts.calibration.retention = Some(projections.clone());
 
         // This will fail with a Cranelift verifier error if the backward wrapper's body
         // tries to call model_forward but model_forward still has a void return (Task 14).
@@ -4918,12 +4941,13 @@ mod backward_wrapper {
         );
         let ast = parsed.module;
 
-        let projections = crate::calibration::pre_scan_awq_projections_from_ast(&ast, &interner);
+        let projections = tiny_mlp_projections("TinyMLPVoid");
         let arena_layout = build_arena_layout(&projections, 8, 4);
         let tmp = tempfile::tempdir().expect("tempdir");
         let out_path = tmp.path().join("calib_model_void.o");
 
-        let opts = compile_options_with_backward(&ast, &interner);
+        let mut opts = compile_options_with_backward(&ast, &interner);
+        opts.calibration.retention = Some(projections.clone());
 
         let result = emit_calibration_model_object(&ast, &opts, &arena_layout, &out_path);
 
