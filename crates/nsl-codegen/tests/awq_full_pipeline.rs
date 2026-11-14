@@ -49,30 +49,6 @@ fn fixture(name: &str) -> PathBuf {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Build a minimal AWQ Sidecar blob for a set of `(projection, scales)` pairs.
-fn build_awq_sidecar(projections: &[(&str, Vec<f32>)]) -> Sidecar {
-
-    let mut map: BTreeMap<String, Vec<f32>> = BTreeMap::new();
-    for (name, scales) in projections {
-        map.insert(name.to_string(), scales.clone());
-    }
-    let blob = nsl_abi::wire::awq_scales::encode(map.iter().map(|(k, v)| (k.as_str(), v.as_slice())));
-
-    let mut hooks = BTreeMap::new();
-    hooks.insert("awq_activation_scales".to_string(), blob);
-
-    Sidecar {
-        version: SIDECAR_VERSION,
-        checkpoint_sha256: "test".into(),
-        calibration_data_sha256: "test".into(),
-        hook_set_sha256: "test".into(),
-        cache_key_digest: String::new(),
-        num_samples_used: 1,
-        hooks,
-        wggo_head_gradients: None,
-    }
-}
-
 fn awq_fixture_compile_bundle(
 ) -> (
     Vec<DiscoveredProjection>,
@@ -220,15 +196,6 @@ fn assert_close(actual: &[f32], expected: &[f32], rtol: f32, label: &str) {
             rtol * scale
         );
     }
-}
-
-/// Parse + semantic-check + compile a source string with options.
-/// Returns Err as a formatted string on failure.
-fn try_compile(
-    src: &str,
-    opts: &nsl_codegen::CompileOptions,
-) -> Result<Vec<u8>, String> {
-    nsl_codegen::compile_with_options(src, opts).map_err(|e| format!("{e:?}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -447,7 +414,7 @@ fn awq_observation_with_real_calib_data_produces_nonuniform_scales() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn end_to_end_discovers_enumerates_calibrates_and_quantizes() {
+fn end_to_end_discovers_enumerates_and_calibrates() {
     let data_path = fixture("awq_calib_data.safetensors");
     assert!(
         data_path.exists(),
@@ -568,28 +535,6 @@ fn end_to_end_discovers_enumerates_calibrates_and_quantizes() {
         up.iter().any(|&v| v > 0.0),
         "AWQ up_proj scales must be positive-valued after real observation"
     );
-
-    // Assertion 5: final compile with the sidecar succeeds (exercises Task 9 lookup path).
-    // Use the TINY_AWQ_SRC fixture from awq_hook_end_to_end to avoid a full train-block compile.
-    const TINY_AWQ_SRC: &str = r#"model Tiny:
-    w: Tensor = ones([4, 4])
-
-    fn forward(self, x: Tensor) -> Tensor:
-        return x @ self.w
-
-fn main():
-    let m = Tiny()
-    quant static qm from m:
-        default: awq4
-    let x = ones([1, 4])
-    let y = qm.forward(x)
-"#;
-    // Prepare sidecar with "Tiny.w" matching the above quant block.
-    let sidecar_for_final = build_awq_sidecar(&[("Tiny.w", vec![1.0, 1.0, 1.0, 1.0])]);
-    let mut final_opts = nsl_codegen::CompileOptions::default();
-    final_opts.calibration.sidecar = Some(sidecar_for_final);
-    try_compile(TINY_AWQ_SRC, &final_opts)
-        .expect("final compile with sidecar should succeed (Task 9 lookup path)");
 
     // Also verify the original sidecar from our pipeline is a valid Sidecar object.
     let _ = sidecar; // already validated above; just assert no panic

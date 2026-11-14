@@ -1,21 +1,20 @@
-//! End-to-end data-flow test for AWQ calibration.
+//! Data-flow test for the AWQ calibration hook.
 //!
 //! Verifies: AwqCalibrationHook's sidecar output →
-//! nsl-runtime::awq::AwqScales::from_blob → awq_quantize_with_scales
-//! produces output that differs from the no-calibration baseline.
+//! nsl-runtime::awq::AwqScales::from_blob, i.e. that the per-channel
+//! statistic the hook records is the one the blob decoder reads back.
 //!
-//! Routes through the in-process harness stub (matching Task 12's
-//! run_harness_production dispatch for forward-activation hooks); a
-//! follow-up plan that emits the model forward pass into
-//! calibration_main will transparently flip this over to the real
-//! subprocess path.
+//! Nothing quantizes with these scales. The tests that fed them to a
+//! quantizer checked only that an int8 stand-in's bytes changed, and the
+//! tests of the `default: awq4` lowering compiled a program the checker
+//! refuses; both are gone, and the last test here pins the refusal.
 
 use nsl_codegen::calibration::{
     CalibCtx, CalibrationHook, CalibrationResult, ProjectionRef,
     awq_hook::AwqCalibrationHook,
     retention::{RetentionTable, TensorShape},
 };
-use nsl_runtime::awq::{AwqScales, awq_quantize_with_scales};
+use nsl_runtime::awq::AwqScales;
 
 fn setup_retention(projections: &[ProjectionRef], in_channels: u64) -> RetentionTable {
     let mut table = RetentionTable::new();
@@ -27,7 +26,7 @@ fn setup_retention(projections: &[ProjectionRef], in_channels: u64) -> Retention
 }
 
 #[test]
-fn awq_calibration_produces_nonuniform_scales_that_alter_quantization() {
+fn awq_calibration_records_the_largest_activation_per_channel() {
     // 1. Synthetic scenario: one projection with 8 input channels.
     //    Simulated activations vary per channel (channel 4 is 10x the
     //    others), so the calibration should produce a non-uniform
@@ -76,22 +75,10 @@ fn awq_calibration_produces_nonuniform_scales_that_alter_quantization() {
         "channel 4 should have the largest scale: {observed:?}"
     );
 
-    // 3. Feed the calibrated scales into the quantizer and verify its
-    //    output differs from the uncalibrated (None / all-ones) baseline.
-    let out_channels = 4;
-    let weight: Vec<f32> = (0..out_channels * in_channels)
-        .map(|i| (i as f32 - 16.0) * 0.1)
-        .collect();
-    let alpha = 0.5;
-
-    let baseline = awq_quantize_with_scales(&weight, in_channels, out_channels, None, alpha);
-    let calibrated =
-        awq_quantize_with_scales(&weight, in_channels, out_channels, Some(observed), alpha);
-
-    assert_ne!(
-        baseline.dequantized_check_bytes, calibrated.dequantized_check_bytes,
-        "calibrated quantization must differ from the uncalibrated baseline"
-    );
+    // The statistic is the running maximum of |x| per channel: 13.0 for
+    // channel 4 (the largest of 10, 11, 12, 13) and 1.0 elsewhere.
+    let want: Vec<f32> = (0..in_channels).map(|c| if c == 4 { 13.0 } else { 1.0 }).collect();
+    assert_eq!(observed, &want);
 }
 
 #[test]
@@ -127,12 +114,8 @@ fn awq_calibration_with_uniform_activations_matches_baseline() {
 }
 
 // ---------------------------------------------------------------------------
-// Task 9: sidecar lookup wired into final AWQ lowering
+// `default: awq4` is not lowered
 // ---------------------------------------------------------------------------
-//
-// The NSL source used by both tests below declares a tiny AWQ model with a
-// single weight field `w`.  The projection path that compile_quant_block
-// looks up is "Tiny.w" (model_type_name = "Tiny", field_name = "w").
 
 const TINY_AWQ_SRC: &str = r#"model Tiny:
     w: Tensor = ones([4, 4])
@@ -148,82 +131,31 @@ fn main():
     let y = qm.forward(x)
 "#;
 
-/// Build an AWQ sidecar blob for the given projection → scales mapping and
-/// wrap it in a `Sidecar` struct ready to set as `CompileOptions::calibration.sidecar`.
-fn build_awq_sidecar(projections: &[(&str, Vec<f32>)]) -> nsl_codegen::calibration::sidecar::Sidecar {
-    use std::collections::BTreeMap;
-    use nsl_codegen::calibration::sidecar::{Sidecar, SIDECAR_VERSION};
-
-    let mut map: BTreeMap<String, Vec<f32>> = BTreeMap::new();
-    for (name, scales) in projections {
-        map.insert(name.to_string(), scales.clone());
-    }
-    let blob = nsl_abi::wire::awq_scales::encode(map.iter().map(|(k, v)| (k.as_str(), v.as_slice())));
-
-    let mut hooks = std::collections::BTreeMap::new();
-    hooks.insert("awq_activation_scales".to_string(), blob);
-
-    Sidecar {
-        version: SIDECAR_VERSION,
-        checkpoint_sha256: "test".into(),
-        calibration_data_sha256: "test".into(),
-        hook_set_sha256: "test".into(),
-        cache_key_digest: String::new(),
-        num_samples_used: 1,
-        hooks,
-        wggo_head_gradients: None,
-    }
-}
-
-/// Helper: parse + semantic-analyse + compile a module.  Returns the
-/// `CodegenError` on failure (as its `Debug` string for easy assertion).
-fn try_compile(
-    src: &str,
-    opts: &nsl_codegen::CompileOptions,
-) -> Result<Vec<u8>, String> {
+/// The checker refuses `default: awq4`. Code generation used to accept it
+/// from a caller that skipped the checker, pre-scale the weight by the
+/// sidecar's activation scales with no inverse applied anywhere, and pass a
+/// dtype code the runtime quantizer aborts on. It refuses too.
+#[test]
+fn codegen_refuses_an_awq4_quant_block_the_checker_was_not_asked_about() {
     let mut interner = nsl_lexer::Interner::new();
-    let (tokens, _) =
-        nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
+    let (tokens, _) = nsl_lexer::tokenize(TINY_AWQ_SRC, nsl_errors::FileId(0), &mut interner);
     let parsed = nsl_parser::parse(&tokens, &mut interner);
-    // Tolerate semantic warnings/notes but not hard errors — the model
-    // above is intentionally minimal and may produce unused-variable hints.
     let analysis = nsl_semantic::analyze(&parsed.module, &mut interner);
-    nsl_codegen::compile_module(
+    assert!(
+        analysis.diagnostics.iter().any(|d| d.message.contains("`default: awq4` is not implemented")),
+        "the checker refuses it first: {:?}",
+        analysis.diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+    let err = nsl_codegen::compile_module(
         &parsed.module,
         &interner,
         &analysis.type_map,
         "",
         false,
-        opts,
+        &nsl_codegen::CompileOptions::default(),
     )
-    .map_err(|e| format!("{e:?}"))
-}
-
-#[test]
-fn missing_scales_is_hard_error_when_sidecar_present() {
-    // Sidecar exists but contains "Tiny.other_field" — NOT "Tiny.w".
-    // compile_quant_block must return MissingScales for "Tiny.w".
-    let sidecar =
-        build_awq_sidecar(&[("Tiny.other_field", vec![1.0, 1.0, 1.0, 1.0])]);
-    let mut opts = nsl_codegen::CompileOptions::default();
-    opts.calibration.sidecar = Some(sidecar);
-
-    let err = try_compile(TINY_AWQ_SRC, &opts)
-        .expect_err("compile must fail when projection is missing from sidecar");
-    assert!(
-        err.contains("MissingScales") || err.contains("missing scales") || err.contains("missing_scales"),
-        "expected a MissingScales error, got:\n{err}"
-    );
-    assert!(
-        err.contains("Tiny.w"),
-        "error must name the missing projection 'Tiny.w', got:\n{err}"
-    );
-}
-
-#[test]
-fn none_sidecar_falls_through_to_uncalibrated() {
-    // No sidecar → uncalibrated AWQ path; compile must succeed.
-    let opts = nsl_codegen::CompileOptions::default();
-    try_compile(TINY_AWQ_SRC, &opts)
-        .expect("compile must succeed when no calibration sidecar is present");
+    .map(|_| ())
+    .expect_err("codegen must not lower an awq4 quant block");
+    let text = format!("{err:?}");
+    assert!(text.contains("awq4") && text.contains("not implemented"), "{text}");
 }
