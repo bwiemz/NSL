@@ -148,18 +148,34 @@ pub struct PcaConfig {
     pub span: Span,
 }
 
+/// `@pca(strategy = per_document)`: accepted until 2026-11, and unable to
+/// run. Admission built a per-document kernel, every attention call site
+/// then passed it a document count of 0, the launcher refused that and
+/// returned an error code, and the program trapped.
+pub const PCA_PER_DOCUMENT_UNSUPPORTED: &str =
+    "@pca(strategy = per_document) is not supported: the per-document attention \
+     kernels exist, but no attention call site passes them a document count, so \
+     every launch is refused at run time. Remove the decorator; packed attention \
+     uses the segment-id path";
+
+/// `@pca(strategy = off)`: accepted until 2026-11, and read by nothing, so
+/// it did not turn packing off.
+pub const PCA_OFF_UNSUPPORTED: &str =
+    "@pca(strategy = off) is not supported: nothing reads it, so it would not \
+     turn packing off. Packing is decided by the data: drop `packing = true` \
+     from the dataset block or the DataLoader instead";
+
 /// Parse + validate the `@pca(strategy=...)` decorator on a train block.
+///
+/// `auto` and `segment_id` both name what happens anyway (the segment-id
+/// path). `per_document` and `off` are refused; see the two messages above.
 ///
 /// # Wiring
 ///
 /// The returned `PcaConfig` is collected by the caller in
 /// `checker/stmt.rs` onto `self.pca_configs` (mirroring how `@wrga` pushes
-/// onto `self.wrga_configs`). The strategy is plumbed through the CLI
-/// (`pipeline.rs` → `CompileOptions::pca_user_strategies`) to codegen, where
-/// `PerDocument` flips `PerDocAdmitConfig::enable_per_doc_cta` at the
-/// forward-emission site (`nsl_codegen::compiler::kernel.rs`). The per-doc CTA
-/// emitter (`per_doc_cta::synthesize_per_doc_cta_forward`/`_backward`) and the
-/// FFI dispatch (`nsl_flash_attention_csha`) consume that decision.
+/// onto `self.wrga_configs`) and plumbed through the CLI
+/// (`pipeline.rs` → `CompileOptions::pca_user_strategies`) to codegen.
 pub fn validate_pca_decorator(
     deco: &Decorator,
     resolve_sym: &dyn Fn(Symbol) -> String,
@@ -184,11 +200,21 @@ pub fn validate_pca_decorator(
                         _ => None,
                     };
                     match parsed {
+                        // Recognised, and refused: nothing can honour them.
+                        // The strategy stays `Auto`, so the refused request
+                        // never travels on to code generation.
+                        Some(PcaStrategy::PerDocument) => diagnostics.push(
+                            Diagnostic::error(PCA_PER_DOCUMENT_UNSUPPORTED.to_string())
+                                .with_label(arg.span, "not supported"),
+                        ),
+                        Some(PcaStrategy::Off) => diagnostics.push(
+                            Diagnostic::error(PCA_OFF_UNSUPPORTED.to_string())
+                                .with_label(arg.span, "not supported"),
+                        ),
                         Some(s) => strategy = s,
                         None => diagnostics.push(
                             Diagnostic::error(
-                                "@pca: strategy must be auto, segment_id, per_document, or off"
-                                    .to_string(),
+                                "@pca: strategy must be auto or segment_id".to_string(),
                             )
                             .with_label(arg.span, "invalid strategy"),
                         ),

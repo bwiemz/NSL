@@ -407,8 +407,8 @@ pub fn emit(
         // Cooperative-load scratch for the warp-0 prelude. The load loop
         // iterates over the runtime seq_len; the embedded seg_smem region
         // (sized to DEFAULT_SMEM_SEGMENT_BUDGET) caps the supported seq_len
-        // at DEFAULT_SMEM_SEGMENT_BUDGET / 2 entries — the same ceiling
-        // pca_segment::plan_kernel uses to pick Shared.
+        // at DEFAULT_SMEM_SEGMENT_BUDGET / 2 entries — the bound the
+        // runtime enforces before launching (`MAX_SEGMENT_MASKED_SEQ_LEN`).
         ptx.push_str("    .reg .u32 %r_pca_i, %r_pca_seq;\n");
         ptx.push_str("    .reg .u64 %rd_pca_off;\n");
         ptx.push_str("    .reg .b16 %rs_pca;\n");

@@ -298,8 +298,11 @@ fn zero_stage1_two_rank_parity() {
     // Anti-vacuity: the collectives ACTUALLY ran. Replicated-data parity alone
     // is satisfied even by a no-op reduce (identical grads → sum/ws == g); the
     // counter line proves otherwise. Fixture: 8 params, grad_accum=2, 13
-    // micro-batches → 6 optimizer steps; reduce_grads and sync_params each loop
-    // 8 params per step → 6 bucketed all_reduce + 12 owner-bucketed broadcast per rank.
+    // micro-batches → 7 optimizer steps: six full windows and the final step
+    // on the one micro-batch the last window holds, which every rank takes
+    // together (it used to be dropped, and these counts were 6 / 12 / 96).
+    // reduce_grads and sync_params each loop 8 params per step → 7 bucketed
+    // all_reduce + 14 owner-bucketed broadcast per rank.
     let zero_line = spmd
         .stderr
         .lines()
@@ -307,11 +310,11 @@ fn zero_stage1_two_rank_parity() {
         .unwrap_or_else(|| panic!("no [zero] ws=2 rank=0 line in SPMD stderr:\n{}", spmd.stderr))
         .to_string();
     assert!(
-        zero_line.contains("all_reduce=6 ")
-            && zero_line.contains("broadcast=12 ")
-            && zero_line.contains("bucket_members=96 "),
-        "ZeRO collective counts wrong (expected 6 grad buckets, 12 owner \
-         broadcasts, 96 bucketed members): {zero_line}"
+        zero_line.contains("all_reduce=7 ")
+            && zero_line.contains("broadcast=14 ")
+            && zero_line.contains("bucket_members=112 "),
+        "ZeRO collective counts wrong (expected 7 grad buckets, 14 owner \
+         broadcasts, 112 bucketed members): {zero_line}"
     );
     // Baseline (single process, ws=1) must NOT have run any collective.
     assert!(
@@ -613,11 +616,13 @@ fn zero_stage2_two_rank_parity_reduce_scatter() {
             .find(|l| l.contains(&format!("[zero] ws=2 rank={rank}")))
             .unwrap_or_else(|| panic!("no [zero] line for rank {rank}:\n{}", spmd.stderr));
         assert!(
-            line.contains(" reduce_scatter=6 ")
+            // Seven optimizer steps: six full windows and the final step
+            // on the trailing micro-batch (see the stage-1 test).
+            line.contains(" reduce_scatter=7 ")
                 && line.contains("all_reduce=0 ")
-                && line.contains("broadcast=12 "),
-            "stage-2 collective counts wrong (want 6 scatters, 0 all_reduce, \
-             12 owner broadcasts): {line}"
+                && line.contains("broadcast=14 "),
+            "stage-2 collective counts wrong (want 7 scatters, 0 all_reduce, \
+             14 owner broadcasts): {line}"
         );
     }
     // Same model bytes as baseline (θ fully synced despite partitioned grads).

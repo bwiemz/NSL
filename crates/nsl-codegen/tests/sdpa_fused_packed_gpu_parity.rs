@@ -261,9 +261,15 @@ fn tensor_device(ptr: i64) -> u8 {
 /// before anything consumes them. So the runtime's device-to-host staging
 /// branch (`segment_ids_host_u16`, `device > 0`) is the one a real step takes.
 fn device_segment_tensor(seg: &[u16]) -> i64 {
+    device_segment_tensor_of(seg, B, S)
+}
+
+/// The same for `rows` rows of `positions` ids.
+fn device_segment_tensor_of(seg: &[u16], rows: usize, positions: usize) -> i64 {
+    assert_eq!(seg.len(), rows * positions);
     let shape_list = nsl_list_new();
-    nsl_list_push(shape_list, B as i64);
-    nsl_list_push(shape_list, S as i64);
+    nsl_list_push(shape_list, rows as i64);
+    nsl_list_push(shape_list, positions as i64);
     let t = nsl_tensor_zeros_on(shape_list, 0);
     nsl_list_free(shape_list);
     assert_ne!(t, 0, "CPU tensor alloc failed");
@@ -493,6 +499,115 @@ fn packed_forward_matches_the_oracle_across_kv_tiles() {
         assert!(out_err < 2e-3, "forward (tier_b={tier_b}): out {out_err:.2e} from the oracle");
         // lse is f32 through ex2/lg2.approx over scores of a few units.
         assert!(lse_err < 5e-3, "forward (tier_b={tier_b}): lse {lse_err:.2e} from the oracle");
+    }
+}
+
+/// One batch row, one head: `s` positions in `DOC_LEN`-token documents. The
+/// fused forward's answer, or `None` when the runtime declined.
+fn long_packed_forward(s: usize, tier_b: bool, q: &[f32], k: &[f32], v: &[f32]) -> Option<Vec<f32>> {
+    let config = forward_config();
+    let emission = emit_tier_b_variants_for_config(&config);
+    let base_ptx = terminated(emission.base_ptx.clone());
+    let name = CString::new(emission.base_kernel_name.clone()).unwrap();
+    let tb_ptx = tier_b.then(|| terminated(emission.tier_b_on_ptx.clone().expect("the packed config emits Tier-B")));
+    let tb_off = tier_b_range_table_offset(&config, Direction::Forward);
+    let smem = (shared_mem_bytes_selected(&config) as i64)
+        .max((tb_off + tier_b_range_table_bytes(&config, TIER_B_MAX_BAKED_SEQ_LEN)) as i64);
+
+    let shape = [1, 1, s as i64, D as i64];
+    let (q_t, k_t, v_t) = (gpu_tensor(&shape, q), gpu_tensor(&shape, k), gpu_tensor(&shape, v));
+    let seg: Vec<u16> = (0..s).map(|i| (i / DOC_LEN) as u16).collect();
+    let seg_t = device_segment_tensor_of(&seg, 1, s);
+    let scale = 1.0f32 / (D as f32).sqrt();
+    let list = nsl_sdpa_fused_forward(
+        q_t,
+        k_t,
+        v_t,
+        scale.to_bits() as i64,
+        1,
+        seg_t,
+        base_ptx.as_ptr() as i64,
+        name.as_ptr() as i64,
+        tb_ptx.as_ref().map_or(0, |p| p.as_ptr() as i64),
+        if tier_b { name.as_ptr() as i64 } else { 0 },
+        config.block_q,
+        config.block_kv,
+        smem,
+    );
+    let out = (list != 0).then(|| {
+        let (out_t, lse_t) = (nsl_list_get(list, 0), nsl_list_get(list, 1));
+        let out = read_gpu(out_t, s * D);
+        nsl_tensor_free(out_t);
+        nsl_tensor_free(lse_t);
+        nsl_list_free(list);
+        out
+    });
+    for t in [q_t, k_t, v_t, seg_t] {
+        nsl_tensor_free(t);
+    }
+    out
+}
+
+/// Row `i` of causal-within-document attention, in f64: the keys are the
+/// positions of `i`'s document up to `i`.
+fn attention_row(i: usize, q: &[f32], k: &[f32], v: &[f32]) -> Vec<f64> {
+    let scale = 1.0 / (D as f64).sqrt();
+    let first = (i / DOC_LEN) * DOC_LEN;
+    let scores: Vec<f64> = (first..=i)
+        .map(|j| (0..D).map(|d| f64::from(q[i * D + d]) * f64::from(k[j * D + d])).sum::<f64>() * scale)
+        .collect();
+    let top = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let weights: Vec<f64> = scores.iter().map(|s| (s - top).exp()).collect();
+    let total: f64 = weights.iter().sum();
+    (0..D)
+        .map(|d| weights.iter().zip(first..=i).map(|(w, j)| w * f64::from(v[j * D + d])).sum::<f64>() / total)
+        .collect()
+}
+
+/// The segment-masked forward copies one 16-bit segment id per position
+/// into a 32768-byte shared-memory buffer, and its copy loop runs to the
+/// sequence length with no bound. 16384 positions fill the buffer exactly;
+/// one tile more would write 128 bytes past it. The runtime used to launch
+/// such a sequence. It must decline it (the decomposed path then handles
+/// the sequence), and it must still launch, and be right, at exactly 16384.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn the_packed_forward_declines_a_sequence_longer_than_its_segment_buffer() {
+    init_cuda();
+    const LIMIT: usize = 16_384;
+    let over = LIMIT + 64;
+    let n = over * D;
+    let (q, k, v) = (values(11, n), values(12, n), values(13, n));
+
+    for tier_b in [false, true] {
+        let before = (nsl_sdpa_fused_launch_count(0), nsl_sdpa_fused_launch_count(1));
+        let declined = long_packed_forward(over, tier_b, &q, &k, &v);
+        assert!(
+            declined.is_none(),
+            "tier_b={tier_b}: the fused forward launched on {over} positions, past its {LIMIT}-id buffer"
+        );
+        assert_eq!(
+            (nsl_sdpa_fused_launch_count(0), nsl_sdpa_fused_launch_count(1)),
+            before,
+            "tier_b={tier_b}: a kernel was launched before the refusal"
+        );
+
+        let out = long_packed_forward(LIMIT, tier_b, &q[..LIMIT * D], &k[..LIMIT * D], &v[..LIMIT * D])
+            .unwrap_or_else(|| panic!("tier_b={tier_b}: the fused forward declined {LIMIT} positions, which fit"));
+        assert_finite(&format!("forward at {LIMIT} (tier_b={tier_b})"), &out);
+        // Rows across the sequence, including the last position, whose
+        // segment id is the last one in the buffer.
+        let mut worst = 0f64;
+        for i in [0, 1, 63, 64, 99, 100, 4_095, 8_191, 8_192, 12_345, LIMIT - 65, LIMIT - 1] {
+            let want = attention_row(i, &q, &k, &v);
+            for d in 0..D {
+                worst = worst.max((f64::from(out[i * D + d]) - want[d]).abs());
+            }
+        }
+        eprintln!("forward at {LIMIT} positions (tier_b={tier_b}): worst sampled error {worst:.2e}");
+        // O is stored in f16 and the values are of order 1: the same bound
+        // the 448-position test uses, as an absolute error here.
+        assert!(worst < 4e-3, "tier_b={tier_b}: {worst:.2e} from the f64 rows at {LIMIT} positions");
     }
 }
 

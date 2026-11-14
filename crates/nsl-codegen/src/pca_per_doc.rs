@@ -18,40 +18,32 @@
 //!     v2 backward's `ds_compute::emit` hard-asserts this — wider tiles
 //!     land in T3.6+; per-doc inherits the same constraint).
 //!
-//! # Production wiring status (CFTP v2 follow-on Sprint 1+5)
+//! # Status: not reachable from an NSL program
 //!
-//! The forward FFI dispatch in `nsl_flash_attention_csha` / `_with_saves`
-//! (Sprint 1, commit `c80312dc`) recognises the `_per_doc_cta` kernel
-//! suffix and uses the new trailing `num_docs_or_zero` arg as `grid_x`.
-//! The backward FFI dispatch in `nsl_flash_attention_csha_backward`
-//! (Sprint 5) mirrors the same suffix-detection — when the dispatched
-//! backward kernel name carries `_per_doc_cta`, it launches with
-//! `grid_x = num_docs` (skipping the per-q-block outer loop entirely)
-//! and the per-doc prelude derives `%q_start` / `%k_max` from the
-//! doc_starts table loaded via the kernel param.
+//! The pieces exist. The forward and backward PTX
+//! ([`crate::flash_attention_v2::per_doc_cta::synthesize_per_doc_cta_forward`],
+//! [`crate::flash_attention_v2::per_doc_cta::synthesize_per_doc_cta_backward`])
+//! have GPU tests that launch them through test hooks, and the FFI
+//! dispatch in `nsl_flash_attention_csha` / `_with_saves` / `_backward`
+//! recognises the `_per_doc_cta` kernel suffix and takes the document
+//! count of a row from its trailing `num_docs_or_zero` argument.
 //!
-//! Both the forward PTX ([`crate::flash_attention_v2::per_doc_cta::synthesize_per_doc_cta_forward`])
-//! and the backward PTX ([`crate::flash_attention_v2::per_doc_cta::synthesize_per_doc_cta_backward`])
-//! are shipped and GPU-validated against segmented CPU references
-//! (forward: max_abs 2.08e-4; backward: dQ 3.4e-5, dK 1.3e-3, dV 2.0e-2
-//! on the 4-doc fixture with seg lengths {32, 28, 24, 16}).
+//! What is missing is that count. Every attention call site the compiler
+//! emits passes 0 for `num_docs_or_zero`, and the launchers refuse a
+//! per-document kernel with a count of 0, returning an error code that the
+//! call site turns into a trap. Admission also rests on the dataset
+//! block's declared length statistics (`mean + 3σ <= block_q`), with no
+//! run-time check that a real document fits one CTA, and the launcher
+//! expects an end sentinel in `doc_starts` that the loader does not write.
 //!
-//! The `@pca(strategy=per_document)` path is wired end to end:
-//!
-//!   - The user-facing `@pca(strategy=per_document)` decorator is parsed and
-//!     validated by `nsl_semantic::cftp::validate_pca_decorator`; the returned
-//!     `PcaConfig` is collected onto the semantic checker's `pca_configs` list
-//!     (analogous to `wrga_configs`, in `crates/nsl-semantic/src/checker/stmt.rs`).
-//!   - The strategy flows through the CLI into
-//!     `CompileOptions::pca_user_strategies`, and the forward-emission site in
-//!     `crate::compiler::kernel` constructs `PerDocAdmitConfig { enable_per_doc_cta:
-//!     true, .. }` when a per-document strategy is present, then calls [`admit`].
-//!
-//! From there admission → kernel-name suffix → `nsl_flash_attention_csha`
-//! `grid_x` override are all live. The path is reachable from surface NSL, not
-//! only from tests. (Note: it requires the explicit `@pca(strategy=per_document)`
-//! decorator; the detector recommending `PerDocumentCta` does not by itself
-//! enable it.)
+//! So `@pca(strategy = per_document)` is a compile-time error
+//! (`nsl_semantic::cftp::validate_pca_decorator`), and [`admit`] is
+//! reached only by callers that set
+//! `CompileOptions::analysis::pca_user_strategies` themselves, which no
+//! command-line path does. Making the strategy usable needs a per-row
+//! document count at the call sites, a guard for a document longer than
+//! `block_q`, and a test that checks the exit status and the outputs of a
+//! real program.
 
 use crate::flash_attention::FlashAttentionConfig;
 use crate::pca_detect::{DatasetPackingConfig, PcaDetection, PcaStrategy};

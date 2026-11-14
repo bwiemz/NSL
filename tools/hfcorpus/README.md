@@ -135,7 +135,11 @@ parts.
 than expressed as a loader weight. `make_mix.py` works on token ids, not text,
 so changing the ratio costs one pass over the `.bin` files instead of a full
 retokenization. Documents are located by the end-of-document id and emitted
-whole, and injections land at seeded random positions among the base documents —
+whole, and injections land at seeded random positions among the base documents
+(uniform over the base corpus's document index by default, so a stretch of short
+base documents gets more injected tokens per base token than a stretch of long
+ones; `--placement token` makes it uniform over token positions, and the
+mixture's manifest records which was used) —
 appending the minority corpus would give the model none of it until the end of
 the epoch, and cutting at token offsets would splice unrelated documents into
 single windows.
@@ -201,6 +205,16 @@ apart: they differ by three orders of magnitude in size and by their role, and a
 recipe that pointed at the wrong one would still run.
 
 ## Evaluation hygiene (item 5)
+
+`verify.py` compares every validation document of at least 32 tokens with
+every training document, for each of the web, sft and stack pairs, and fails
+on a shared one. (It used to compare the first and last 2^20 tokens of the two
+files, which a validation set cut from the middle of the training set passes.)
+The decontamination report's `coverage` section counts the benchmark problems
+the line rule below cannot see at all: those whose lines are all under 30
+normalized characters. Tests for both, and for the mixer's placement, are in
+`test_hfcorpus.py` (`python -m unittest discover -s tools/hfcorpus -p 'test_*.py'`).
+
 
 Every validation set is scanned against HumanEval and MBPP
 (`decontaminate.py`; exact normalized-line matching, method string recorded

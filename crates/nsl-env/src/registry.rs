@@ -456,6 +456,15 @@ pub static REGISTRY: &[EnvVar] = &[
         "FASE two-phase clip: batches the grad-norm sum-of-squares into one f64-accumulating call; 0 restores per-param f32 reads (bits differ)."
     ),
     var!(
+        "NSL_FASE_FLUSH_TAIL",
+        Bool,
+        "0 disables; anything else or unset = on",
+        "on",
+        Behavior,
+        Compile,
+        "0: a run that ends inside an accumulation window drops its pending micro-batches (with a warning) instead of stepping on them."
+    ),
+    var!(
         "NSL_FASE_FUSED_COUNTER",
         Bool,
         "1 only (both sites)",

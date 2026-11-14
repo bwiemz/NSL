@@ -143,8 +143,7 @@ pub fn emit_final_step(recipe: &UpdateRecipe) -> UpdateProgram {
     match recipe.optimizer {
         FaseOptimizer::AdamW => emit_adamw(recipe, /*decoupled_wd=*/ true),
         FaseOptimizer::Adam => emit_adamw(recipe, /*decoupled_wd=*/ false),
-        FaseOptimizer::Sgd => emit_sgd(recipe, /*with_momentum=*/ false),
-        FaseOptimizer::SgdMomentum => emit_sgd(recipe, /*with_momentum=*/ true),
+        FaseOptimizer::Sgd => emit_sgd(recipe),
         FaseOptimizer::Lion => emit_lion(recipe),
         FaseOptimizer::Unknown => emit_empty("optimizer is unknown — no update emitted"),
     }
@@ -261,30 +260,18 @@ fn emit_adamw(recipe: &UpdateRecipe, decoupled_wd: bool) -> UpdateProgram {
     }
 }
 
-fn emit_sgd(recipe: &UpdateRecipe, with_momentum: bool) -> UpdateProgram {
-    // In Deferred mode the caller has accumulated the mean gradient into
-    // m_partial.  Plain SGD applies it directly (θ -= lr·m_partial, via the
-    // SgdUpdate op which reads m_partial implicitly).  SGD+momentum folds
-    // m_partial into the running momentum buffer first.
-    let mut ops = Vec::new();
-    if with_momentum {
-        ops.push(UpdateOp::ScalarMulAdd {
-            dst: Register::M,
-            src: Register::M,
-            a: 1.0,
-            b_src: Some(Register::MPartial),
-            b_scale: 1.0,
-        });
-    }
-    ops.push(UpdateOp::SgdUpdate { lr: recipe.lr });
+fn emit_sgd(recipe: &UpdateRecipe) -> UpdateProgram {
+    // The caller has accumulated the mean gradient into m_partial; plain SGD
+    // applies it directly (θ -= lr·m_partial, via the SgdUpdate op which
+    // reads m_partial implicitly). There is no momentum form: SGD with
+    // momentum under accumulation is refused at compile time
+    // (`stmt_train/contract.rs`), and the variant that used to sit here
+    // added m_partial to the momentum buffer with coefficient 1 and never
+    // read the momentum value.
     UpdateProgram {
         optimizer: recipe.optimizer,
-        ops,
-        pseudocode: if with_momentum {
-            format!("m = m + m_partial; θ -= {}·m", recipe.lr)
-        } else {
-            format!("θ -= {}·m_partial", recipe.lr)
-        },
+        ops: vec![UpdateOp::SgdUpdate { lr: recipe.lr }],
+        pseudocode: format!("θ -= {}·m_partial", recipe.lr),
     }
 }
 
@@ -429,7 +416,6 @@ mod tests {
             eps: 1e-8,
             weight_decay: 0.01,
             accum_scale: 0.25, // 1/N for N=4
-            v_uses_approx: true,
         };
         let prog = emit_accumulate(&recipe);
         // m_partial += 0.25 * g
@@ -459,33 +445,12 @@ mod tests {
             one_minus_beta1: 0.0, one_minus_beta2: 0.0,
             eps: 0.0, weight_decay: 0.0,
             accum_scale: 0.25,
-            v_uses_approx: false,
         };
-        let prog = emit_sgd(&recipe, /*with_momentum=*/ false);
+        let prog = emit_sgd(&recipe);
         match &prog.ops[0] {
             UpdateOp::SgdUpdate { lr } => assert!((lr - 0.01).abs() < 1e-12),
             op => panic!("expected SgdUpdate, got {:?}", op),
         }
-    }
-
-    #[test]
-    fn sgd_momentum_accumulates_from_m_partial() {
-        let recipe = UpdateRecipe {
-            optimizer: FaseOptimizer::SgdMomentum,
-            lr: 0.01,
-            beta1: 0.0, beta2: 0.0,
-            one_minus_beta1: 0.0, one_minus_beta2: 0.0,
-            eps: 0.0, weight_decay: 0.0,
-            accum_scale: 0.25,
-            v_uses_approx: false,
-        };
-        let prog = emit_sgd(&recipe, /*with_momentum=*/ true);
-        let UpdateOp::ScalarMulAdd { dst, src, b_src, .. } = &prog.ops[0] else {
-            panic!("op 0 should be ScalarMulAdd");
-        };
-        assert_eq!(*dst, Register::M);
-        assert_eq!(*src, Register::M);
-        assert_eq!(*b_src, Some(Register::MPartial));
     }
 
     #[test]
@@ -500,7 +465,6 @@ mod tests {
             eps: 1e-8,
             weight_decay: 0.01,
             accum_scale: 0.25,
-            v_uses_approx: true,
         };
         let prog = emit_adamw(&recipe, /*decoupled_wd=*/ true);
 
@@ -659,7 +623,6 @@ mod tests {
             eps: 1e-8,
             weight_decay: 0.01,
             accum_scale: 0.25,
-            v_uses_approx: true,
         };
         let prog = emit_adamw(&recipe, /*decoupled_wd=*/ true);
 

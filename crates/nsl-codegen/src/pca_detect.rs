@@ -49,7 +49,9 @@ pub struct DatasetPackingConfig {
     /// Standard deviation of document length.  Used to decide whether per-
     /// doc CTA scheduling will suffer from load imbalance.
     pub doc_length_stddev: Option<u32>,
-    /// The separator token id used to mark document boundaries.
+    /// The separator token id used to mark document boundaries. Carried
+    /// for reports and tests only: no planner reads it, and a `dataset`
+    /// block cannot set it (the separator is given to the loader).
     pub separator_token_id: Option<i64>,
 }
 

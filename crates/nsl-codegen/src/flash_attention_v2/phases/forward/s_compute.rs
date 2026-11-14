@@ -290,6 +290,17 @@ pub fn emit(
     // Causal mask: if k_global > q_row_global, S = -inf.
     // When both config.causal and config.segment_masked are true, also
     // mask if segment_ids[q_row_global] != segment_ids[k_global] (spec §5.1).
+    //
+    // The document test exists only inside the causal arm below. A
+    // segment-masked kernel without the causal mask would therefore attend
+    // across documents with nothing to show for it; the two production
+    // callers refuse that configuration with a diagnostic
+    // (`compiler/kernel.rs`), and this stops any other caller.
+    assert!(
+        config.causal || !config.segment_masked,
+        "internal: a segment-masked forward kernel requires the causal mask; \
+         the document test is emitted only as part of the causal predicate"
+    );
     if config.causal {
         ptx.push_str("    // causal: if k_global > q_row_global -> S = -inf\n");
         ptx.push_str("    cvt.u64.u32 %rd34, %r1;                   // k\n");
@@ -335,9 +346,8 @@ pub fn emit(
             ptx.push_str("    and.pred %p0, %p0, %p_sink;                            // sink-bypass: never mask sinks\n");
         }
         // PCA Tier A: extend %p0 with cross-segment disjunction (spec §5.1).
-        // Guard: only when BOTH causal (so %p0 is already set) AND segment_masked.
-        // If !causal && segment_masked, %p0 is uninitialized; we skip rather than
-        // extend a garbage predicate (spec §3.2 rejects that config in practice).
+        // Only when BOTH causal (so %p0 is already set) AND segment_masked;
+        // `!causal && segment_masked` is refused at the top of this block.
         if config.segment_masked {
             crate::flash_attention_v2::phases::segment_mask::emit_segment_mask_predicate(
                 ptx,

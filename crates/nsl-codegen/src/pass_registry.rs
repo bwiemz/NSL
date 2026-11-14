@@ -329,9 +329,7 @@ pub const PASSES: &[PassDescriptor] = &[
         full_name: "Fused Accumulation + Step + Epilogue",
         source_files: &[
             "crates/nsl-codegen/src/fase.rs",
-            "crates/nsl-codegen/src/fase_clip.rs",
             "crates/nsl-codegen/src/fase_codegen_table.rs",
-            "crates/nsl-codegen/src/fase_memory.rs",
             "crates/nsl-codegen/src/fase_optimizer.rs",
         ],
         cli_flags: &[],

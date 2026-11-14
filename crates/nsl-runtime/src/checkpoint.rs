@@ -1432,9 +1432,12 @@ pub extern "C" fn nsl_train_checkpoint_load(
             if live_id != r.loader_id {
                 crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: the DataLoader does not match \
                      the one '{optim_path}' was saved from (loader_id {live_id} \
-                     vs sidecar {}) — a different corpus, batch geometry, or \
-                     shuffle seed. Slot {} of a different permutation is \
-                     different data; refusing the resume.",
+                     vs sidecar {}) — a different corpus, batch geometry, \
+                     shuffle seed, or shuffle scheme (`shuffle = true` has \
+                     permuted sequences, not whole batches, since 2026-11; a \
+                     shuffled checkpoint from before cannot be resumed). Slot \
+                     {} of a different permutation is different data; \
+                     refusing the resume.",
                     r.loader_id, r.loader_slot
                 );
                 std::process::abort();

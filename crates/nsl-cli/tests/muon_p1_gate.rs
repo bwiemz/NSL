@@ -44,6 +44,14 @@ fn run_source_env(tag: &str, src: &str, extra: &[&str], env: &[(&str, &str)]) ->
         .current_dir(&tmp)
         .envs(env.iter().copied())
         .env("NSL_STDLIB_PATH", root.join("stdlib"))
+        // A run that ends inside an accumulation window: the interleaved
+        // schedule steps once more on what the window holds, and the
+        // layer-major schedule (`--layerwise-accum`) cannot. The fixtures
+        // here end one micro-batch into a window, and the comparisons are
+        // of the windows both schedules run, so every arm is compiled with
+        // that last step off. (It has its own gate,
+        // `accumulation_full_buffer_gate.rs`.)
+        .env("NSL_FASE_FLUSH_TAIL", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()

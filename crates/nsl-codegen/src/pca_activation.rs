@@ -169,7 +169,6 @@ pub(crate) fn extract_dataset_packing(
     let mut max_sequence_length: u32 = 0;
     let mut mean_doc_length: Option<u32> = None;
     let mut doc_length_stddev: Option<u32> = None;
-    let mut separator_token_id: Option<i64> = None;
 
     for entry in &def.body {
         let key = resolve(interner, entry.key);
@@ -206,11 +205,9 @@ pub(crate) fn extract_dataset_packing(
                     doc_length_stddev = Some(v);
                 }
             }
-            "separator_token_id" => {
-                if let ExprKind::IntLiteral(n) = &entry.value.kind {
-                    separator_token_id = Some(*n);
-                }
-            }
+            // Every other field is refused by the checker
+            // (`check_dataset_def`). `separator_token_id` was read here and
+            // consumed by nothing; the separator belongs to the loader.
             _ => {}
         }
     }
@@ -220,7 +217,7 @@ pub(crate) fn extract_dataset_packing(
         max_sequence_length,
         mean_doc_length,
         doc_length_stddev,
-        separator_token_id,
+        separator_token_id: None,
     }
 }
 

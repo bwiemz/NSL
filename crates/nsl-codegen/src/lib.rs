@@ -145,7 +145,6 @@ pub mod pca_segment;
 pub mod pca_tier_b;
 pub mod pca_tile_config;
 pub mod pca_tilerange;
-pub mod pca_tileskip;
 pub mod weight_aware;
 
 // --- Distributed & parallelism -------------------------------------------
@@ -236,9 +235,7 @@ pub mod csha_patterns;
 pub mod csha_pipeline;
 pub mod csha_specialize;
 pub mod fase;
-pub mod fase_clip;
 pub mod fase_codegen_table;
-pub mod fase_memory;
 pub mod fase_optimizer;
 pub mod multimodal;
 pub mod sparse;
@@ -317,7 +314,7 @@ pub mod training {
 pub mod quantization {
     pub use crate::{
         bitnet, fp8, pca_activation, pca_detect, pca_per_doc, pca_rope, pca_segment, pca_tier_b,
-        pca_tile_config, pca_tilerange, pca_tileskip, weight_aware,
+        pca_tile_config, pca_tilerange, weight_aware,
     };
 }
 
@@ -347,7 +344,7 @@ pub mod experimental {
         cep_emit_source, cep_slice, cep_weights, cfie, cfie_fused_sample, cfie_grammar, cfie_kv_plan,
         cfie_kv_quant, cfie_persistent, cfie_speculative, csha, csha_apply,
         csha_boundary, csha_patterns, csha_pipeline, csha_specialize, fase,
-        fase_clip, fase_codegen_table, fase_memory, fase_optimizer, multimodal,
+        fase_codegen_table, fase_optimizer, multimodal,
         sparse, speculative, wggo, wggo_apply,
         wggo_conflicts, wggo_cost, wggo_dp, wggo_gradient_scorer, wggo_graph,
         wggo_ilp, wggo_overrides, wggo_prune, wggo_schedule, wggo_weight_analysis,
@@ -2158,6 +2155,14 @@ impl CompileOptions {
                 file_digest(self.wggo.weights.as_deref())
             ));
         }
+        // The final step on a trailing partial accumulation window, turned
+        // off at compile time. Emitted only when it is off, for the reason
+        // the prune keys are: every checkpoint written before the switch
+        // existed came from a build with no such key, and a key on every
+        // build would refuse them all.
+        if env("NSL_FASE_FLUSH_TAIL").as_deref() == Some("0") {
+            fields.push("fase_flush=0".to_string());
+        }
         fields.join(",")
     }
 }
@@ -2776,6 +2781,13 @@ mod exec_fingerprint_tests {
         // Only the values changed, never the key set or order.
         let keys = |fp: &str| fp.split(',').map(|f| f.split('=').next().unwrap().to_string()).collect::<Vec<_>>();
         assert_eq!(keys(&set), keys(&unset));
+
+        // The flush switch is recorded when it is off and absent otherwise.
+        assert!(!unset.contains("fase_flush"), "{unset}");
+        let off = o.exec_fingerprint_with_env(|name| (name == "NSL_FASE_FLUSH_TAIL").then(|| "0".into()));
+        assert_eq!(off, format!("{unset},fase_flush=0"));
+        let on = o.exec_fingerprint_with_env(|name| (name == "NSL_FASE_FLUSH_TAIL").then(|| "1".into()));
+        assert_eq!(on, unset);
     }
 
     #[test]

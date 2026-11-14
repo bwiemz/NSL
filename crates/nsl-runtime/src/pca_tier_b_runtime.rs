@@ -76,6 +76,18 @@ pub fn should_dispatch_tier_b_at_runtime(
         && (TIER_B_SEQ_LEN_FLOOR..=TIER_B_MAX_BAKED_SEQ_LEN).contains(&seq_len)
 }
 
+/// Whether one row's segment ids fit the shared-memory buffer the
+/// segment-masked forward kernel copies them into.
+///
+/// The kernel's load loop runs to the run-time sequence length with no
+/// bound of its own, storing one 16-bit id per position into a buffer of
+/// [`nsl_abi::wire::pca_tier_b::SEGMENT_IDS_SMEM_BYTES`] bytes. A longer
+/// packed sequence would write past it, so the fused forward must decline
+/// and leave the sequence to the decomposed, mask-driven path.
+pub fn segment_ids_fit_shared_memory(seq_len: i64) -> bool {
+    (0..=i64::from(nsl_abi::wire::pca_tier_b::MAX_SEGMENT_MASKED_SEQ_LEN)).contains(&seq_len)
+}
+
 /// Asserts the Tier B sentinel pair has both values either zero or both non-zero.
 /// Panics (via process abort) if mismatched — catches helper-bypass at call sites
 /// per planner spec §4.3.
@@ -102,5 +114,23 @@ pub fn assert_tier_b_sentinels(
              tier_b_enabled()?"
         );
         std::process::abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::segment_ids_fit_shared_memory;
+
+    /// The forward kernel declares `seg_smem[32768]` and stores two bytes
+    /// per position, so position 16383 is the last one inside it.
+    #[test]
+    fn the_segment_buffer_holds_16384_positions_and_no_more() {
+        assert!(segment_ids_fit_shared_memory(64));
+        assert!(segment_ids_fit_shared_memory(4096));
+        assert!(segment_ids_fit_shared_memory(16_384));
+        assert!(!segment_ids_fit_shared_memory(16_385));
+        assert!(!segment_ids_fit_shared_memory(16_448));
+        assert!(!segment_ids_fit_shared_memory(65_536));
+        assert!(!segment_ids_fit_shared_memory(-1));
     }
 }

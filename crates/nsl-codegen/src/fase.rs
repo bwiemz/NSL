@@ -13,9 +13,9 @@
 //!   4. The two-phase structure when `grad_clip` is enabled.
 //!
 //! The driver is pure — no state, no I/O — and produces the same output
-//! given the same input.  PTX emission for the fused backward is a separate
-//! concern handled by `fase_optimizer.rs` (update-rule codegen) and
-//! `fase_memory.rs` (per-layer slot scheduling).
+//! given the same input.  The update rule is described by
+//! `fase_optimizer.rs` and lowered by `stmt_fase.rs`; the clip of the window
+//! mean is written out in `stmt_train/optimizer_step.rs`.
 
 use serde::Serialize;
 
@@ -27,7 +27,6 @@ pub enum FaseOptimizer {
     AdamW,
     Adam,
     Sgd,
-    SgdMomentum,
     Lion,
     Unknown,
 }
@@ -38,7 +37,6 @@ impl FaseOptimizer {
             "adamw" => FaseOptimizer::AdamW,
             "adam" => FaseOptimizer::Adam,
             "sgd" => FaseOptimizer::Sgd,
-            "sgd_momentum" | "sgdmomentum" => FaseOptimizer::SgdMomentum,
             "lion" => FaseOptimizer::Lion,
             _ => FaseOptimizer::Unknown,
         }
@@ -159,12 +157,6 @@ pub struct UpdateRecipe {
     pub optimizer: FaseOptimizer,
     /// `1 / N` scaled into the accumulator per micro-batch.
     pub accum_scale: f64,
-    /// Historical name — carries the planner's `allow_v_approx` consent
-    /// through to reporting. The emitted math NEVER consults this flag:
-    /// `emit_adamw` always produces the exact windowed-AdamW
-    /// `v = β₂·v + (1-β₂)·(mean g)²` (see `FaseMode::Deferred` and the
-    /// discrimination test in fase_numerical_validation.rs).
-    pub v_uses_approx: bool,
     /// Cached constants we fold into the generated code.
     pub one_minus_beta1: f64,
     pub one_minus_beta2: f64,
@@ -233,7 +225,7 @@ pub fn plan(cfg: &FaseConfig) -> FasePlan {
             mode: FaseMode::Passthrough,
             accumulation: 1,
             backward_phases: vec![BackwardPhase::Standard],
-            recipe: make_recipe(cfg, accumulation, false),
+            recipe: make_recipe(cfg, accumulation),
             two_phase_clip: false,
             rationale: "accumulation=1 — no FASE rewrite needed".to_string(),
             per_layer_mode: None,
@@ -244,10 +236,9 @@ pub fn plan(cfg: &FaseConfig) -> FasePlan {
     // Decide Deferred vs FullBuffer based on optimizer.  Lion / Unknown →
     // FullBuffer because their update rules don't decompose into
     // incremental accumulator updates.
-    let (mode, v_approx, rationale) = match (cfg.optimizer, cfg.allow_v_approx) {
+    let (mode, rationale) = match (cfg.optimizer, cfg.allow_v_approx) {
         (FaseOptimizer::AdamW, true) | (FaseOptimizer::Adam, true) => (
             FaseMode::Deferred,
-            true,
             // The second moment is formed from the square of the window
             // MEAN gradient, which is what an optimizer stepped on the whole
             // window computes: no approximation, despite the flag's name.
@@ -258,28 +249,24 @@ pub fn plan(cfg: &FaseConfig) -> FasePlan {
         ),
         (FaseOptimizer::AdamW, false) | (FaseOptimizer::Adam, false) => (
             FaseMode::FullBuffer,
-            false,
             "@fase(allow_v_approx = false) — full gradient buffer; same update as the deferred \
              step, which is already exact"
                 .to_string(),
         ),
-        (FaseOptimizer::Sgd, _) | (FaseOptimizer::SgdMomentum, _) => (
-            // SGD with momentum is trivially deferred — momentum is a linear
-            // accumulator, identical to first-moment handling.  Plain SGD
-            // has no accumulator state at all.
+        (FaseOptimizer::Sgd, _) => (
+            // Plain SGD has no accumulator state at all. (SGD with momentum,
+            // dampening, weight decay or Nesterov under accumulation is
+            // refused before the planner runs: `stmt_train/contract.rs`.)
             FaseMode::Deferred,
-            false,
-            "SGD accumulator reduces to momentum/zero-state — deferred update is exact".to_string(),
+            "plain SGD steps on the window-mean gradient — deferred update is exact".to_string(),
         ),
         (FaseOptimizer::Lion, _) => (
             FaseMode::FullBuffer,
-            false,
             "Lion uses sign(m + g) which cannot be decomposed incrementally — full buffer"
                 .to_string(),
         ),
         (FaseOptimizer::Unknown, _) => (
             FaseMode::FullBuffer,
-            false,
             "unrecognised optimizer — falling back to full gradient buffer".to_string(),
         ),
     };
@@ -290,18 +277,16 @@ pub fn plan(cfg: &FaseConfig) -> FasePlan {
     // requiring Deferred is checked by the driver against the planned mode
     // (stmt.rs), keeping every hard refusal on the path that owns
     // CodegenError.
-    let (mode, v_approx, rationale) = match cfg.forced_mode {
+    let (mode, rationale) = match cfg.forced_mode {
         Some(FaseForce::Off) => (
             FaseMode::FullBuffer,
-            false,
             format!("@fase(mode = off) — rewrite declined by source decorator (planner would have said: {rationale})"),
         ),
         Some(FaseForce::FullBuffer) => (
             FaseMode::FullBuffer,
-            false,
             format!("@fase(mode = full_buffer) — forced by source decorator (planner would have said: {rationale})"),
         ),
-        Some(FaseForce::Deferred) | None => (mode, v_approx, rationale),
+        Some(FaseForce::Deferred) | None => (mode, rationale),
     };
 
     // Two-phase clip requires the Deferred accumulation convention: Phase A
@@ -340,7 +325,7 @@ pub fn plan(cfg: &FaseConfig) -> FasePlan {
         mode,
         accumulation,
         backward_phases: phases,
-        recipe: make_recipe(cfg, accumulation, v_approx),
+        recipe: make_recipe(cfg, accumulation),
         two_phase_clip: two_phase,
         rationale,
         per_layer_mode: None,
@@ -430,18 +415,16 @@ fn optimizer_name(o: FaseOptimizer) -> &'static str {
         FaseOptimizer::AdamW => "AdamW",
         FaseOptimizer::Adam => "Adam",
         FaseOptimizer::Sgd => "SGD",
-        FaseOptimizer::SgdMomentum => "SGD+Momentum",
         FaseOptimizer::Lion => "Lion",
         FaseOptimizer::Unknown => "unknown",
     }
 }
 
-fn make_recipe(cfg: &FaseConfig, n: u32, v_approx: bool) -> UpdateRecipe {
+fn make_recipe(cfg: &FaseConfig, n: u32) -> UpdateRecipe {
     let inv_n = 1.0 / n as f64;
     UpdateRecipe {
         optimizer: cfg.optimizer,
         accum_scale: inv_n,
-        v_uses_approx: v_approx,
         one_minus_beta1: 1.0 - cfg.beta1,
         one_minus_beta2: 1.0 - cfg.beta2,
         lr: cfg.lr,
@@ -479,7 +462,6 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(plan.mode, FaseMode::Deferred);
-        assert!(plan.recipe.v_uses_approx);
         assert!(plan.is_active());
     }
 
@@ -491,7 +473,6 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(plan.mode, FaseMode::FullBuffer);
-        assert!(!plan.recipe.v_uses_approx);
     }
 
     #[test]
@@ -502,7 +483,6 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(plan.mode, FaseMode::Deferred);
-        assert!(!plan.recipe.v_uses_approx);
     }
 
     #[test]

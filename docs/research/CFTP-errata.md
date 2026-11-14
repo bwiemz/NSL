@@ -13,8 +13,9 @@ literature, and the code in this repository. Every figure below was
 recomputed and every quotation was checked against the PDF. Each Source line
 says whether an external source was read directly, seen only in a
 search-result summary, or not re-checked. Statements about the code come from
-reading it and from small CPU runs; nothing was run on a GPU. Section numbers
-are the PDF's.
+reading it and from small CPU runs. The review itself ran nothing on a GPU;
+the GPU tests named in Parts 3 and 5 were run later, when the defects in
+Part 5 were fixed. Section numbers are the PDF's.
 
 ---
 
@@ -397,13 +398,24 @@ generated.
 - Two-phase clipping (§2.5): implemented, in
   `crates/nsl-codegen/src/stmt_train/optimizer_step.rs`, as a global-norm
   clip of the window mean, `min(1, τ/(‖mean g‖ + 1e-6))`, the same as
-  PyTorch's `clip_grad_norm_`. The module §7.1 plans for it,
-  `crates/nsl-codegen/src/fase_clip.rs` (`ClipPlan`, `ClipProgram`), has no
-  consumer.
-- Memory schedule and M36 planner integration (§2.4, §7.1): absent.
-  `crates/nsl-codegen/src/fase_memory.rs` is read only by the training report
-  (`crates/nsl-codegen/src/training_report.rs`), where `FaseSection::memory`
-  is always `None`.
+  PyTorch's `clip_grad_norm_`. The separate module §7.1 plans for it does
+  not exist: code generation writes the formula out itself.
+- Memory schedule and M36 planner integration (§2.4, §7.1): absent. The
+  training report (`crates/nsl-codegen/src/training_report.rs`) prints no
+  memory figures for FASE.
+- A run that ends inside an accumulation window (not covered by the
+  proposal): `emit_trailing_window_flush` in the same file steps once more,
+  on the mean of the micro-batches the window holds, after the last
+  epoch's `on_epoch` callback has run. Under `--layerwise-accum` it prints
+  a warning instead and the pending gradients are not applied (Part 5).
+- The learning-rate schedule under accumulation (not covered by the
+  proposal): it advances once per micro-batch, so `warmup_steps` and
+  `total_steps` are in micro-batches. `schedule_unit = "optimizer_step"` in
+  `train(...)` makes it advance once per optimizer step;
+  `schedule_unit = "micro_batch"` states the default. A block that combines
+  a schedule with accumulation and states neither gets a compile-time
+  warning (`schedule_unit_warning`,
+  `crates/nsl-semantic/src/train_config.rs`).
 - In use: `models/coder500m/pretrain_prod.nsl`,
   `models/coder1b/pilot_finish.nsl`, `models/coder-rl/pretrain.nsl` and
   others, with `grad_accumulation` of 4 or 8, mostly with `grad_clip = 1.0`.
@@ -415,14 +427,18 @@ one that works.
 
 - The proposal's surface (§4.1, §6.2), a `dataset` block with
   `packing = true`: partial. The block is planner metadata only; code
-  generation skips it and it never becomes a loader. `packing = true` there
-  makes the `@flash_attention` and CSHA kernels (the attention-fusion kernels
-  of the companion proposal) segment-masked, fed from a thread-local registry
-  (`crates/nsl-runtime/src/pca_rope_runtime.rs`). `pack_separator` in the
-  block is accepted by the checker and read by nothing:
-  `extract_dataset_packing` (`crates/nsl-codegen/src/pca_activation.rs`)
-  reads only `separator_token_id`, which is itself never consumed. No program
-  in the repository runs this route end to end with a packing loader.
+  generation skips it and it never becomes a loader. It accepts four
+  fields, `packing`, `max_sequence_length`, `mean_doc_length` and
+  `doc_length_stddev`, all literals, and refuses every other, including
+  `pack_separator` (`check_dataset_def`,
+  `crates/nsl-semantic/src/checker/block.rs`). `packing = true` there makes
+  the `@flash_attention` and CSHA kernels (the attention-fusion kernels of
+  the companion proposal) segment-masked, fed from a thread-local registry
+  (`crates/nsl-runtime/src/pca_rope_runtime.rs`). Nothing can feed that
+  registry correctly today: a `DataLoader(..., packing = true)` in the same
+  module is a compile-time error, because the loader's tensors are not in
+  the layout those kernels read. A kernel that is segment-masked and not
+  causal is also a compile-time error.
 - The working route: `DataLoader(..., packing=true, pack_separator=id)`, with
   the model calling `GroupedQueryAttention.forward_packed` on `x`,
   `batch.segment_ids`, `batch.position_ids` and the training flag
@@ -434,23 +450,25 @@ one that works.
   is `(k > q) OR seg[q] != seg[k]` on absolute positions, so documents that
   straddle tiles are handled per element. The fused kernels run only with all
   of: a GPU, `--source-ad`, head dimension 32, 64 or 128, a sequence length
-  that is a multiple of the tile size, and contiguous Q, K and V
-  (`nsl_sdpa_fused_forward` in `crates/nsl-runtime/src/flash_attention.rs`).
+  that is a multiple of the tile size and at most 16384, and contiguous Q,
+  K and V (`nsl_sdpa_fused_forward` in
+  `crates/nsl-runtime/src/flash_attention.rs`).
   Otherwise, and always under the default tape AD, attention falls back to a
   dense `[b,1,s,s]` float mask built in a host loop on every attention call
   (`nsl_packed_mask_from_segment_ids` in `crates/nsl-runtime/src/packing.rs`),
   which is the cost §3 set out to remove. Masking correctness was established
-  by reading the kernels, not by a GPU run.
+  by reading the kernels, and then by the GPU parity test named below.
 - Strategy 2, compile-time tile-skip map: absent, and the implementation is
-  the side that is right (E8). `pca_tileskip::build` and
-  `pca_segment::plan_kernel` have no production caller. In their place the
-  kernels skip tiles at run time from a per-tile segment-range table held in
-  shared memory (`crates/nsl-codegen/src/pca_tilerange.rs`). The skips are
-  sound for non-decreasing segment ids, which are validated at launch.
+  the side that is right (E8). The kernels skip tiles at run time from a
+  per-tile segment-range table held in shared memory
+  (`crates/nsl-codegen/src/pca_tilerange.rs`). The skips are sound for
+  non-decreasing segment ids, which are validated at launch.
 - Strategy 3, one CTA (CUDA thread block) per document: partial. Kernels
   exist (`crates/nsl-codegen/src/flash_attention_v2/per_doc_cta.rs`,
   `crates/nsl-codegen/src/pca_per_doc.rs`) but are not reachable from a
-  program. This was established by reading the call sites, not by a run.
+  program: no attention call site passes them a document count, and
+  `@pca(strategy = per_document)` is a compile-time error
+  (`validate_pca_decorator`, `crates/nsl-semantic/src/cftp.rs`).
 - Position fusion (§4.3, "no position_id tensor ever exists"): absent on the
   working route, where `position_ids` is a `[B,S]` float tensor passed to
   `rope.forward_with_positions`. An in-kernel reset from document starts
@@ -464,9 +482,9 @@ one that works.
   synthetic token streams.
 - Tests: `crates/nsl-cli/tests/stage_c_packed_parity.rs` (CPU, packed against
   masked) and `crates/nsl-codegen/tests/sdpa_fused_packed_gpu_parity.rs`
-  (kernels against 64-bit references with documents straddling tiles; marked
-  `#[ignore]`, needs the `cuda` and `test-hooks` features, and was not run
-  for this review).
+  (kernels against 64-bit references with documents straddling tiles, and
+  the 16384-position bound; marked `#[ignore]`, needs the `cuda` and
+  `test-hooks` features; it passes on an RTX PRO 4500).
 
 Defects found in this code are listed in Part 5.
 
@@ -522,6 +540,52 @@ code only.
   the arm without clipping does. Test: the same file.
 - The planner's rationale strings said the deferred path uses a
   "batch-variance v approximation". They now say it is exact.
+- A trailing partial accumulation window was discarded without a message.
+  With `grad_accumulation = 4`, a run of 10 micro-batches ended with the
+  weights of a run of 8; the last two gradients were computed and dropped.
+  The run now steps once more at the end, on the mean of the micro-batches
+  the window holds, with the same clip and the next bias-correction count,
+  as a PyTorch loop that steps on its last partial window does. The
+  layer-major schedule is the exception and is listed under Open. Test:
+  `crates/nsl-cli/tests/accumulation_full_buffer_gate.rs`, against an AdamW
+  written out in the test and checked there against PyTorch's.
+- Under accumulation the learning-rate schedule counts micro-batches, so
+  `warmup_steps` and `total_steps` are reached N times sooner than the same
+  number of optimizer steps, and nothing said so. The unit can now be
+  stated: `schedule_unit = "optimizer_step"` in `train(...)` counts
+  optimizer steps, `schedule_unit = "micro_batch"` is the unit a block has
+  always had. A block that combines a schedule with accumulation and states
+  neither still counts micro-batches, so no existing run changes, and gets a
+  compile-time warning. Test: `crates/nsl-cli/tests/schedule_unit_gate.rs`.
+- The plan's recipe carried a field `v_uses_approx` that was `true` for
+  AdamW and Adam on the deferred path, whose second moment is exact (E3).
+  Nothing read it. It is removed.
+- Two functions, `emit_deferred_accumulate` and `emit_deferred_final_step`,
+  returned `Ok(())` unconditionally, and two tests asserted that they did.
+  The functions and the tests are removed.
+- `fase_deferred_compiles_adamw_with_grad_clip`
+  (`crates/nsl-codegen/tests/fase_deferred_smoke.rs`) returned early, and so
+  passed, when its fixture file was missing. It now fails in that case.
+- The memory model `fase_breakdown` charged the standard baseline with
+  every layer's activations and FASE with one layer's, returned the same
+  numbers for Deferred and FullBuffer, and had no consumer; its test passed
+  because of the activation term. The module
+  (`crates/nsl-codegen/src/fase_memory.rs`) and the empty `memory` field of
+  the training report are removed.
+- `emit_sgd` had a momentum branch that added `m_partial` to the momentum
+  buffer with coefficient 1.0 and never read the momentum value. It was
+  unreachable (SGD with momentum under accumulation is refused at compile
+  time) and is removed, with the `SgdMomentum` plan variant.
+- `crates/nsl-codegen/src/fase_clip.rs` (`ClipPlan`, `ClipProgram`) had no
+  consumer and is removed.
+- `source_ad_peak_is_lower_than_tape_ad`
+  (`crates/nsl-codegen/tests/fase_peak_memory_impl.rs`) was presented as
+  FASE's peak-memory test. It compares NSL's source-AD path with NSL's own
+  tape path, which materialises every gradient, so it cannot show a saving
+  against ordinary in-place accumulation, and there is none (E1). The file
+  now says what it compares and what it does not show. Its fixture said
+  the test was blocked; run with the `test-hooks` feature it passes, at
+  4.21 MB against 3.42 MB, and the fixture now says that.
 
 #### PCA
 
@@ -534,106 +598,91 @@ code only.
   thread. With one worker the epoch ended early with exit status 0; with
   several the run hung. A worker panic now aborts the process with a
   message naming the separator.
+- The `dataset`-block route handed the loader's `segment_ids` and
+  `doc_starts`, stored as 32-bit floats, to kernels that read 16-bit and
+  32-bit integers, and never moved `doc_starts` to the device. A sequence
+  of at most one tile would have run with reinterpreted ids; a longer one
+  was refused at launch and trapped. `DataLoader(..., packing = true)` in a
+  module whose `@flash_attention` kernels are segment-masked is now a
+  compile-time error that names `GroupedQueryAttention.forward_packed`,
+  the route that converts the ids. A packed batch that reaches such a
+  train block some other way stops the run with the same message; that
+  second check was not exercised by a test. The route had a second defect
+  in front of this one: such a module failed to compile, with an internal
+  error, as soon as its train block read any `DataLoader`, because one
+  call in the batch prologue passed an 8-bit value where a 64-bit one was
+  declared. That call is fixed, so the case without a packing loader now
+  compiles. Test:
+  `crates/nsl-cli/tests/packed_flash_attention_refusal_gate.rs`.
+- The segment path had no upper bound on sequence length. The forward
+  kernel copies one 16-bit id per position into a 32768-byte shared-memory
+  buffer, and `nsl_sdpa_fused_forward` launched it on a packed sequence
+  longer than 16384, which writes past the buffer. It now declines such a
+  sequence, which then takes the dense-mask path, and says so once. Tests:
+  `segment_ids_fit_shared_memory` in
+  `crates/nsl-runtime/src/pca_tier_b_runtime.rs`, and on a GPU
+  `the_packed_forward_declines_a_sequence_longer_than_its_segment_buffer`
+  in `crates/nsl-codegen/tests/sdpa_fused_packed_gpu_parity.rs`.
+- `pack_separator` in a `dataset` block was accepted and read by nothing,
+  and so was `separator_token_id`. Both are refused, with every other
+  field of the block that nothing consumes; the message says the separator
+  is given to the loader.
+- A packed row with more than 256 documents stopped the run. The limit
+  only sized the position-reset table, which the working route does not
+  read. It is no longer a limit: such a row loads, with segment ids and
+  positions for every document, and the table records the first 257
+  document starts. What remains is the real bound, 65536 documents per row,
+  because segment ids are 16-bit. The reset table itself is still built.
+  Tests: `crates/nsl-runtime/src/packing.rs`,
+  `crates/nsl-cli/tests/packing_separator_gate.rs`.
+- `@pca(strategy = per_document)` could not run: every call site passed a
+  document count of 0, the launcher refused it, and the program trapped. It
+  is now a compile-time error, and so is `@pca(strategy = off)`, which
+  nothing read. The kernels and the admission code stay, unreachable from a
+  program. Test: `crates/nsl-cli/tests/run_pca_per_doc_gate.rs`, which used
+  to check a stderr marker and not the exit status.
+- The module comment of `crates/nsl-codegen/src/pca_per_doc.rs` said the
+  per-document path "is wired end to end". It now says what is missing.
+- A comment in `stdlib/nsl/nn/gqa.nsl` called the CPU fallback of
+  `forward_packed` "numerically identical to the fused path". It now says
+  that the two mask the same pairs and differ by 16-bit rounding.
+- `crates/nsl-codegen/src/pca_tileskip.rs` claimed to match the proposal's
+  55% (E9) and had no production caller, and neither had
+  `pca_segment::plan_kernel` nor `pca_rope::plan`. All three are removed
+  with their tests.
+- A kernel that was segment-masked but not causal omitted the segment test,
+  so it would have attended across documents. The combination is now a
+  compile-time error.
 
 ### Open
 
 #### FASE
 
-- A trailing partial accumulation window is discarded without a message.
-  With `grad_accumulation = 4`, a run of 10 micro-batches ends with the
-  weights of a run of 8; the last two gradients are computed and dropped.
-  `emit_train_teardown`, `crates/nsl-codegen/src/stmt_train/teardown.rs`.
-  Reproduced by running. Right behaviour: flush the window, rescaled for
-  the micro-batches it holds, or warn.
-- Under accumulation the learning-rate schedule counts micro-batches, so
-  `warmup_steps` and `total_steps` are in micro-batches, not optimizer
-  steps. `emit_scheduler_lr`,
-  `crates/nsl-codegen/src/stmt_train/scheduler_step.rs`; the module header
-  states the unit. By reading the code only. Either offer optimizer-step
-  units or refuse ambiguous use; the choice is open.
-- The plan's recipe field `v_uses_approx` is still `true` for AdamW and
-  Adam on the deferred path, whose second moment is exact (E3). `plan` and
-  `make_recipe`, `crates/nsl-codegen/src/fase.rs`. By reading the code only.
-- The tests `accumulate_stub_now_returns_ok` and
-  `final_step_free_function_is_a_marker` assert that
-  `emit_deferred_accumulate` and `emit_deferred_final_step` return
-  `Ok(())`, which both do unconditionally.
-  `crates/nsl-codegen/src/stmt_fase.rs`. By reading the code only. Right
-  behaviour: delete the two functions and their tests.
-- `fase_deferred_compiles_adamw_with_grad_clip`
-  (`crates/nsl-codegen/tests/fase_deferred_smoke.rs`) returns early, and so
-  passes, when its fixture file is missing. The file is present today. By
-  reading the code only.
-- `source_ad_peak_is_lower_than_tape_ad`
-  (`crates/nsl-codegen/tests/fase_peak_memory_impl.rs`) compares NSL's
-  source-AD path with NSL's own tape path, which materialises every
-  gradient. It cannot show a saving against ordinary in-place
-  accumulation, and there is none (E1). By reading the code only.
-- The memory model `fase_breakdown`
-  (`crates/nsl-codegen/src/fase_memory.rs`) charges the standard baseline
-  with every layer's activations and FASE with one layer's, and returns
-  the same numbers for Deferred and FullBuffer. Its test
-  `deferred_cuts_peak_under_accumulation` passes because of the activation
-  term. Nothing consumes the model (Part 3). By reading the code only.
-- `emit_sgd` with `with_momentum = true`
-  (`crates/nsl-codegen/src/fase_optimizer.rs`) adds `m_partial` to the
-  momentum buffer with coefficient 1.0 and ignores the momentum value. It
-  is unreachable: SGD with momentum under accumulation is refused at
-  compile time. By reading the code only. Right behaviour: delete it.
-- `crates/nsl-codegen/src/fase_clip.rs` (`ClipPlan`, `ClipProgram`) has no
-  consumer; code generation writes the same clip formula out itself
-  (Part 3). By reading the code only. Right behaviour: delete it.
+- Under `--layerwise-accum` (and so under `--zero-stage 3`, which requires
+  it) a trailing partial accumulation window is still not applied. That
+  schedule keeps saved activations, not gradients, between micro-batches,
+  and its window backward is built for exactly N of them. The run now
+  prints a warning with the number of dropped micro-batches. A run that
+  ends inside a window is therefore the one case in which
+  `--layerwise-accum` is not bit-identical to the interleaved schedule;
+  compiling with `NSL_FASE_FLUSH_TAIL=0` makes the interleaved schedule
+  drop the tail as well, which is how the parity tests compare the two.
+  `emit_trailing_window_flush`,
+  `crates/nsl-codegen/src/stmt_train/optimizer_step.rs`, and
+  `emit_csla_window_backward`,
+  `crates/nsl-codegen/src/stmt_train/csla_window.rs`. Reproduced by
+  running. Right behaviour: replay a window of fewer than N micro-batches.
 
 #### PCA
 
-- The `dataset`-block route hands the loader's `segment_ids` and
-  `doc_starts`, stored as 32-bit floats, to kernels that read 16-bit and
-  32-bit integers, and never moves `doc_starts` to the device. A sequence
-  of at most one tile would run with reinterpreted ids; a longer one is
-  refused and traps. `emit_packing_registry_stash`,
-  `crates/nsl-codegen/src/stmt.rs`. By reading the code only.
-- The segment path has no upper bound on sequence length. The forward
-  kernel copies one 16-bit id per position into a 32768-byte shared-memory
-  buffer, and `nsl_sdpa_fused_forward`
-  (`crates/nsl-runtime/src/flash_attention.rs`) does not refuse a packed
-  sequence longer than 16384, which would write past the buffer. Shipped
-  lengths are 1024 to 4096. By reading the code only.
-- `pack_separator` in a `dataset` block is accepted by `check_dataset_def`
-  (`crates/nsl-semantic/src/checker/block.rs`) and read by nothing.
-  `extract_dataset_packing` (`crates/nsl-codegen/src/pca_activation.rs`)
-  reads only `separator_token_id`, which nothing consumes. By reading the
-  code only. Right behaviour: remove the key or wire it through.
-- A packed row with more than 256 documents still stops the run, now by
-  aborting with a message. The limit, `MAX_NUM_DOCS` in `pack_batch`
-  (`crates/nsl-runtime/src/packing.rs`), only sizes the position-reset
-  table, which a RoPE model does not need (E13). Reproduced by running.
-  Right behaviour: remove the limit together with the reset.
-- `@pca(strategy = per_document)` cannot run. Every production call site
-  passes a document count of 0, and `nsl_flash_attention_csha`
-  (`crates/nsl-runtime/src/flash_attention.rs`) refuses a per-document
-  kernel with that count and returns −1, which traps. `admit`
-  (`crates/nsl-codegen/src/pca_per_doc.rs`) also trusts user-supplied
-  length estimates. By reading the code only. Right: wire it or delete it.
-- The module comment of `crates/nsl-codegen/src/pca_per_doc.rs` says the
-  per-document path "is wired end to end" and "reachable from surface
-  NSL"; it is not (previous item). Its only command-line test,
-  `crates/nsl-cli/tests/run_pca_per_doc_gate.rs`, checks a stderr marker
-  and not the exit status, because its fixture does not compile. By
-  reading the code only.
-- A comment in `stdlib/nsl/nn/gqa.nsl`, above `forward_packed`, calls the
-  CPU fallback "numerically identical to the fused path". The fused path
-  rounds its K and V tiles and its output to 16-bit floats, and the GPU
-  parity test requires its gradients to differ from the exact ones by more
-  than 1e-4 and less than 1e-2. By reading the code only.
-- `crates/nsl-codegen/src/pca_tileskip.rs` says its skip fraction matches
-  the proposal's 55% (see E9). Its test
-  `packed_sequence_skips_cross_doc_tiles` asserts only `> 0.5` on a
-  fraction that includes causal skips, 44/64 ≈ 0.69 for its layout.
-  `build` there and `pca_segment::plan_kernel` have no production caller.
-  By reading the code only. Right behaviour: delete both.
-- For a kernel that is segment-masked but not causal, the forward omits
-  the segment test (`emit`,
-  `crates/nsl-codegen/src/flash_attention_v2/phases/forward/s_compute.rs`),
-  so a bidirectional packed model would attend across documents with no
-  error. Unreachable today: the packed op is always causal. By reading the
-  code only. Right behaviour: refuse the combination.
+- The position-reset table (`doc_starts`), the loader's `position_ids` and
+  the in-kernel reset on the CSHA route are still built, although a RoPE
+  model does not need them (E13). They are no longer a limit on anything.
+  `pack_rows`, `crates/nsl-runtime/src/packing.rs`;
+  `crates/nsl-codegen/src/pca_rope.rs`. By reading the code only.
+- The per-document kernels and their admission code
+  (`crates/nsl-codegen/src/flash_attention_v2/per_doc_cta.rs`,
+  `crates/nsl-codegen/src/pca_per_doc.rs`) remain, unreachable from a
+  program. Wiring them needs a per-row document count at the attention call
+  sites and a guard for a document longer than one tile; deleting them is
+  the alternative. The choice is open.

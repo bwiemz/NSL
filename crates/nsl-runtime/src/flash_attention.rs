@@ -1201,6 +1201,20 @@ pub extern "C" fn nsl_sdpa_fused_forward(
         if s % block_q != 0 || s % block_kv != 0 {
             decline!(format!("ragged seq: s={s} block_q={block_q} block_kv={block_kv}"));
         }
+        // Packed sequences only: the segment-masked kernel copies one
+        // 16-bit id per position into a fixed shared-memory buffer and
+        // does not bound the copy. Past that buffer's capacity it would
+        // write over the tiles that follow it.
+        if segment_ids_ptr != 0
+            && !crate::pca_tier_b_runtime::segment_ids_fit_shared_memory(s)
+        {
+            flash_bwd_warn_once(
+                "[nsl] packed attention: the sequence is longer than the 16384 \
+                 positions the fused segment-masked kernel holds segment ids for; \
+                 using the decomposed (dense-mask) path",
+            );
+            decline!(format!("packed seq too long for the segment-id buffer: s={s}"));
+        }
 
         // ── Driver work starts here (thread-local context invariant) ──
         inner::ensure_context();

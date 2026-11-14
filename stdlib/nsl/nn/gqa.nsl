@@ -102,12 +102,19 @@ model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, head_di
     # PACKED variant (PCA Stage C): attention masking is derived ENTIRELY
     # from segment_ids ([batch, seq] — the DataLoader's per-token document
     # ids); position_ids ([batch, seq]) carries the per-token position
-    # WITHIN its document. On CUDA the attention lowers to the fused
-    # segment-masked flash kernel family (per-document tile skipping; LSE
-    # saved for the fused backward); on CPU / unsupported head_dims it
-    # falls back to the exact decomposed additive-mask path at runtime,
-    # deriving the dense causal-within-document mask from these same
-    # segment_ids (numerically identical to the fused path).
+    # WITHIN its document. On CUDA under --source-ad, for head dimensions
+    # 32, 64 and 128, a sequence length that is a multiple of the tile size
+    # and at most 16384, the attention lowers to the fused segment-masked
+    # flash kernel family (per-document tile skipping; LSE saved for the
+    # fused backward). Otherwise it falls back at runtime to the decomposed
+    # additive-mask path, deriving the dense causal-within-document mask
+    # from these same segment_ids.
+    #
+    # The two paths mask the same pairs, but they are not numerically
+    # identical: the fallback computes in 32-bit floats throughout, while
+    # the fused kernels round their K and V tiles and their output to
+    # 16-bit floats. Their gradients differ from the exact ones by more
+    # than 1e-4 and less than 1e-2 on the GPU parity fixture.
     #
     # No dense mask parameter (segment-metadata campaign item): the
     # DataLoader's O(seq^2) attention_mask is opt-in and only needed by

@@ -415,15 +415,16 @@ pub fn emit_with_smem_override(
         ptx.push_str("    .reg .pred %p_seg_SEGMASK;\n");
         // Cooperative-load scratch for the warp-0 prelude. The load loop
         // iterates over the runtime seq_len; the SMEM buffer below caps
-        // the supported seq_len at DEFAULT_SMEM_SEGMENT_BUDGET / 2 entries
-        // (the same ceiling pca_segment::plan_kernel uses to pick Shared).
+        // the supported seq_len at DEFAULT_SMEM_SEGMENT_BUDGET / 2 entries.
+        // The loop itself has no bound: `nsl_sdpa_fused_forward` declines a
+        // longer packed sequence (`MAX_SEGMENT_MASKED_SEQ_LEN`).
         ptx.push_str("    .reg .u32 %r_pca_i, %r_pca_seq;\n");
         ptx.push_str("    .reg .u64 %rd_pca_off;\n");
         ptx.push_str("    .reg .b16 %rs_pca;\n");
         ptx.push_str("    .reg .pred %p_pca_load, %p_pca_done, %p_seg_null;\n");
-        // SMEM buffer sized to pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET so
-        // it matches the ceiling pca_segment::plan_kernel uses to pick
-        // SegmentResidency::Shared. Kept separate from `shmem` so Q/K/V
+        // SMEM buffer sized to pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET,
+        // the one constant the runtime's length bound is derived from.
+        // Kept separate from `shmem` so Q/K/V
         // tile offset arithmetic is unaffected. Align 4 is safe for u16
         // loads (offsets are 2-byte aligned from a 4-byte-aligned base).
         ptx.push_str(&format!(

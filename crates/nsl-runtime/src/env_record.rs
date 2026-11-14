@@ -23,7 +23,7 @@
 //! refuse a resume whose PROGRAM carries the setting but whose shell no
 //! longer does. Compile-time-only behavior reads are the exec fingerprint's
 //! job (see `CompileOptions::exec_fingerprint`, keys `fa_mma`, `lce_gemm`,
-//! `fase_sumsq`, `fase_override`, `csha_save`).
+//! `fase_sumsq`, `fase_override`, `csha_save`, and `fase_flush` when off).
 //!
 //! WHAT IS RECORDED. `NAME=value` for every such variable that is SET, in
 //! registry (name) order, joined by `,`; an unset variable is absent from

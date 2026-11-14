@@ -22,7 +22,7 @@ const DEFAULT_DP_SHUFFLE_SEED: u64 = 0x1970_D31A_10AD_5EED;
 
 use crate::cpu::create_tensor_with_shape_rs_dtype;
 use crate::dict::{nsl_dict_free_tensor_values, nsl_dict_new, nsl_dict_set_str};
-use crate::packing::{pack_batch, packed_batch_to_dict};
+use crate::packing::{pack_rows, packed_batch_to_dict};
 use crate::string::nsl_str_from_rust;
 use crate::tensor::{DTYPE_I32, DTYPE_U16_TOKEN, NslTensor};
 
@@ -142,7 +142,6 @@ struct DataLoader {
     /// so each epoch's global permutation differs but stays identical across
     /// ranks (lockstep resets in SPMD).
     epoch: Arc<AtomicUsize>,
-    _shuffle_offsets: Vec<usize>,
     /// Item 8: a pending checkpoint resume, `(epoch, slot)`, consumed by the
     /// NEXT [`nsl_dataloader_reset`]. That reset pins the epoch instead of
     /// incrementing it (so the permutation is the saved epoch's) and starts
@@ -298,7 +297,6 @@ impl DataLoader {
             global_total_batches,
             rank,
             epoch: Arc::new(AtomicUsize::new(0)),
-            _shuffle_offsets: Vec::new(),
             pending_resume: None,
         }
     }
@@ -312,41 +310,49 @@ impl DataLoader {
         self.cursor.store(start_slot, Ordering::Relaxed);
         self.expected_batch_id.store(start_slot, Ordering::Relaxed);
 
-        // D3 v3: build the GLOBAL batch order first, then (only when sharding
-        // is opted in) stride to this rank's shard. When NOT sharding this
-        // reduces exactly to the original `(0..total_batches)` + entropy
-        // shuffle — byte-identical, whether world_size is 1 OR a replicated
-        // multi-rank loader (shard_by_rank=false).
+        // The epoch's order of sequence windows: batch `k` of the global
+        // order reads the `batch_size` windows `window_order[k * batch_size
+        // ..]`. Without `shuffle` this is the identity, so batch `k` is the
+        // contiguous slice it always was. With `shuffle` it is a seeded
+        // permutation of the windows (see `epoch_window_order`).
+        //
+        // Deterministic, keyed by (seed, epoch), on EVERY path.
+        //
+        // Sharded: every rank must derive the identical global permutation
+        // or the strided partition is neither disjoint nor complete.
+        //
+        // Single-rank: this used to be `rand::rng()` — entropy. Item 8
+        // makes it seeded because a checkpoint that records "resume at
+        // epoch 3, slot 412" is meaningless if epoch 3's permutation is a
+        // fresh random draw each process. The cost is that an unseeded
+        // run now repeats the same order run-to-run (standard seeded-
+        // training behavior); epochs still differ via the mix.
+        // MIXED, not `seed ^ epoch`. XOR is not injective across small
+        // (seed, epoch) pairs — seed 1 epoch 0 and seed 0 epoch 1 are the
+        // same key. That was harmless while `config.seed` was almost
+        // always the large `DEFAULT_DP_SHUFFLE_SEED` constant, but the
+        // `--seed` fallback routes a small seed in, which makes the
+        // collision reachable: an 8-seed sweep would have its arms
+        // enumerate ONE shared set of permutations in a swapped order. All
+        // ranks compute this identically, which is the only property the
+        // sharded path requires of the key.
         let sharding = self.config.world_size > 1 && self.config.shard_by_rank;
-        let mut batch_order: Vec<usize> = (0..self.global_total_batches).collect();
-        if self.config.shuffle {
-            // Deterministic shuffle keyed by (seed, epoch) on EVERY path.
-            //
-            // Sharded: every rank must derive the identical global permutation
-            // or the strided partition is neither disjoint nor complete.
-            //
-            // Single-rank: this used to be `rand::rng()` — entropy. Item 8
-            // makes it seeded because a checkpoint that records "resume at
-            // epoch 3, slot 412" is meaningless if epoch 3's permutation is a
-            // fresh random draw each process. The cost is that an unseeded
-            // run now repeats the same order run-to-run (standard seeded-
-            // training behavior); epochs still differ via the XOR.
-            // MIXED, not `seed ^ epoch`. XOR is not injective across small
-            // (seed, epoch) pairs — seed 1 epoch 0 and seed 0 epoch 1 are the
-            // same key. That was harmless while `config.seed` was almost
-            // always the large `DEFAULT_DP_SHUFFLE_SEED` constant, but the
-            // fallback added just above routes a small `--seed` in, which
-            // makes the collision reachable: an 8-seed sweep would have its
-            // arms enumerate ONE shared set of permutations in a swapped
-            // order. All ranks compute this identically, which is the only
-            // property the sharded path requires of the key.
+        let shuffle_key = self.config.shuffle.then(|| {
             let epoch = self.epoch.load(Ordering::Relaxed) as u64;
-            let key = crate::sr_bf16::sr_mix64(self.config.seed, epoch);
-            let mut rng = StdRng::seed_from_u64(key);
-            batch_order.shuffle(&mut rng);
-        }
-        // Strided per-rank shard: rank r takes global slots where slot % ws == r,
-        // capped to total_batches (floor) so every rank yields an equal count.
+            crate::sr_bf16::sr_mix64(self.config.seed, epoch)
+        });
+        let window_order = Arc::new(epoch_window_order(
+            self.data_len,
+            self.config.seq_len,
+            self.config.batch_size,
+            self.global_total_batches,
+            shuffle_key,
+        ));
+        // D3 v3: the GLOBAL batch order, then (only when sharding is opted
+        // in) strided to this rank's shard: rank r takes global slots where
+        // slot % ws == r, capped to total_batches (floor) so every rank
+        // yields an equal count.
+        let mut batch_order: Vec<usize> = (0..self.global_total_batches).collect();
         if sharding {
             let rank = self.rank;
             let ws = self.config.world_size;
@@ -358,7 +364,6 @@ impl DataLoader {
                 .take(self.total_batches)
                 .collect();
         }
-        self._shuffle_offsets = batch_order.clone();
         let batch_order = Arc::new(batch_order);
 
         let num_workers = self.config.num_workers.max(1);
@@ -383,6 +388,7 @@ impl DataLoader {
             let reorder_buffer = Arc::clone(&self.reorder_buffer);
             let condvar = Arc::clone(&self.condvar);
             let batch_order = Arc::clone(&batch_order);
+            let window_order = Arc::clone(&window_order);
 
             let handle = thread::spawn(move || {
                 // A panic in a worker must end the run. Left to unwind, it
@@ -433,16 +439,19 @@ impl DataLoader {
                         break;
                     }
                     let batch_id = batch_order[work_index];
+                    // Token offsets of this batch's rows, in row order.
+                    let row_starts: Vec<usize> = window_order
+                        [batch_id * batch_size..(batch_id + 1) * batch_size]
+                        .iter()
+                        .map(|&window| window * seq_len)
+                        .collect();
 
-                    let tokens_per_batch = batch_size * seq_len;
                     let dict_ptr = if packing {
-                        let mut cur = batch_id * tokens_per_batch;
-                        match pack_batch(
+                        match pack_rows(
                             data_ptr,
                             data_len,
                             data_dtype,
-                            &mut cur,
-                            batch_size,
+                            &row_starts,
                             seq_len,
                             pack_separator,
                             emit_attention_mask,
@@ -450,8 +459,7 @@ impl DataLoader {
                             Some(batch) => packed_batch_to_dict(&batch),
                             // Ragged packed tail: this CLAIMED work_index would
                             // otherwise become a permanent HOLE in the reorder
-                            // sequence — under shuffle the tail id can land at
-                            // an EARLY slot, the consumer parks on the hole,
+                            // sequence — the consumer parks on the hole,
                             // workers fill the buffer and park on the full
                             // gate: a wakeup-independent deadlock (review H1).
                             // Insert a 0 sentinel so the consumer skips the
@@ -464,8 +472,7 @@ impl DataLoader {
                             data_len,
                             labels_ptr,
                             labels_len,
-                            batch_id * tokens_per_batch,
-                            batch_size,
+                            &row_starts,
                             seq_len,
                             data_dtype,
                             labels_dtype,
@@ -522,7 +529,7 @@ impl DataLoader {
         for v in [
             c.batch_size as u64,
             c.seq_len as u64,
-            c.shuffle as u64,
+            if c.shuffle { SHUFFLE_SCHEME } else { 0 },
             c.drop_last as u64,
             c.packing as u64,
             c.pack_separator as u64,
@@ -586,6 +593,59 @@ impl DataLoader {
 }
 
 // ---------------------------------------------------------------------------
+// Epoch order
+// ---------------------------------------------------------------------------
+
+/// Which shuffle a `shuffle = true` loader performs, mixed into the
+/// loader's identity. 1 was a permutation of whole batches (each batch a
+/// fixed contiguous slice of the stream); 2 is a permutation of sequence
+/// windows. A checkpoint records a slot of one epoch's order, and slot `k`
+/// of the other scheme is different data, so the two must not resume each
+/// other.
+const SHUFFLE_SCHEME: u64 = 2;
+
+/// The order in which one epoch reads the stream's `seq_len`-token windows.
+/// Entry `i` is a window index (the window starts at token `index *
+/// seq_len`); batch `k` takes entries `k * batch_size .. (k + 1) *
+/// batch_size` as its rows. The length is `total_batches * batch_size`.
+///
+/// Without a shuffle key this is `0, 1, 2, ...`: batch `k` is the
+/// contiguous slice `[k * batch_size * seq_len, ...)`.
+///
+/// With one, every complete window of the stream is permuted and the
+/// batches are filled from the front of the permutation. `shuffle` used to
+/// permute whole batches instead: each batch was a fixed contiguous region
+/// of the corpus, and the same sequences met in the same batch, in the same
+/// row order, every epoch. Now a batch is `batch_size` windows drawn from
+/// all over the corpus, differently each epoch.
+///
+/// When the stream holds more complete windows than the batches use (the
+/// remainder `drop_last` drops), which ones are left out also changes per
+/// epoch. When the last batch is ragged (`drop_last = false`), the
+/// incomplete window and the padding windows after it keep their place at
+/// the end, as the last rows of the last batch.
+fn epoch_window_order(
+    data_len: usize,
+    seq_len: usize,
+    batch_size: usize,
+    total_batches: usize,
+    shuffle_key: Option<u64>,
+) -> Vec<usize> {
+    let slots = total_batches * batch_size;
+    let Some(key) = shuffle_key else {
+        return (0..slots).collect();
+    };
+    let complete = data_len.checked_div(seq_len).unwrap_or(0);
+    let mut order: Vec<usize> = (0..complete).collect();
+    let mut rng = StdRng::seed_from_u64(key);
+    order.shuffle(&mut rng);
+    order.truncate(slots);
+    let missing = slots - order.len();
+    order.extend((complete..).take(missing));
+    order
+}
+
+// ---------------------------------------------------------------------------
 // Simple (non-packed) batch builder
 // ---------------------------------------------------------------------------
 
@@ -606,47 +666,44 @@ fn build_simple_batch(
     data_len: usize,
     labels: *const c_void,
     labels_len: usize,
-    offset: usize,
-    batch_size: usize,
+    row_starts: &[usize],
     seq_len: usize,
     data_dtype: u16,
     labels_dtype: u16,
     has_labels: bool,
 ) -> i64 {
+    let batch_size = row_starts.len();
     let total = batch_size * seq_len;
-    let available = data_len.saturating_sub(offset);
-    if available == 0 {
+    if row_starts.iter().all(|&start| start >= data_len) {
         return 0;
     }
 
-    // Read input_ids — pad with 0 beyond available data
+    // Each row is one `seq_len`-token window of the stream, starting at its
+    // own offset: the rows of a batch are adjacent only when the loader
+    // does not shuffle. A window that runs past the end of the data is
+    // padded with 0, and the padded positions get -100 (ignore_index) so
+    // they don't contribute to loss.
     let mut input_ids = vec![0i64; total];
-    let read_count = available.min(total);
-    for i in 0..read_count {
-        input_ids[i] = read_flat_value(data, data_dtype, offset + i);
-    }
-
-    // Build labels from the provided tensor when available; otherwise shift the
-    // input_ids within each sequence and ignore only the final position.
-    // Padded positions get -100 (ignore_index) so they don't contribute to loss.
     let mut labels_vec = vec![-100i64; total];
-    if has_labels {
-        let label_available = labels_len.saturating_sub(offset);
-        let label_read = label_available.min(total);
-        for i in 0..label_read {
-            labels_vec[i] = read_flat_value(labels, labels_dtype, offset + i);
+    for (row, &start) in row_starts.iter().enumerate() {
+        let base = row * seq_len;
+        let read_count = data_len.saturating_sub(start).min(seq_len);
+        for i in 0..read_count {
+            input_ids[base + i] = read_flat_value(data, data_dtype, start + i);
         }
-    } else {
-        for b in 0..batch_size {
-            let base = b * seq_len;
-            if seq_len > 0 {
-                for i in 0..seq_len - 1 {
-                    if base + i + 1 < read_count {
-                        labels_vec[base + i] = input_ids[base + i + 1];
-                    }
-                    // positions beyond read_count stay -100
+        if has_labels {
+            // Labels from the provided tensor, position for position.
+            let label_read = labels_len.saturating_sub(start).min(seq_len);
+            for i in 0..label_read {
+                labels_vec[base + i] = read_flat_value(labels, labels_dtype, start + i);
+            }
+        } else {
+            // Next token within the row; the last position of a row (and
+            // of the data) has no target.
+            for i in 0..seq_len.saturating_sub(1) {
+                if i + 1 < read_count {
+                    labels_vec[base + i] = input_ids[base + i + 1];
                 }
-                // Last position in each sequence is always -100
             }
         }
     }
@@ -985,6 +1042,242 @@ mod tests {
     /// existed. Two independently constructed loaders on the same corpus must
     /// agree batch for batch, and consecutive epochs must still differ (or the
     /// XOR-by-epoch decorrelation is silently broken).
+    /// Drain a loader, returning each delivered batch as its rows of token
+    /// ids.
+    fn drain_rows(dl_ptr: i64, batch_size: usize, seq_len: usize) -> Vec<Vec<Vec<i64>>> {
+        let mut out = Vec::new();
+        loop {
+            let batch = nsl_dataloader_next_batch(dl_ptr);
+            if batch == 0 {
+                break;
+            }
+            let k = nsl_str_from_rust("input_ids");
+            let tensor = NslTensor::from_ptr(crate::dict::nsl_dict_get_str(batch, k));
+            let ids = tensor.data as *const i32;
+            let rows = (0..batch_size)
+                .map(|r| {
+                    (0..seq_len)
+                        .map(|i| unsafe { *ids.add(r * seq_len + i) } as i64)
+                        .collect()
+                })
+                .collect();
+            out.push(rows);
+            crate::string::nsl_string_free(k);
+            nsl_dict_free(batch);
+        }
+        out
+    }
+
+    #[test]
+    fn window_order_without_shuffle_is_the_stream_order() {
+        // 40 tokens, windows of 4, batches of 2: five batches, ten windows.
+        assert_eq!(
+            epoch_window_order(40, 4, 2, 5, None),
+            (0..10).collect::<Vec<usize>>()
+        );
+        // A ragged final batch (42 tokens, drop_last = false -> 6 batches):
+        // window 10 is the two-token one, window 11 is padding.
+        assert_eq!(
+            epoch_window_order(42, 4, 2, 6, None),
+            (0..12).collect::<Vec<usize>>()
+        );
+    }
+
+    #[test]
+    fn shuffled_window_order_is_a_permutation_of_the_complete_windows() {
+        let order = epoch_window_order(40, 4, 2, 5, Some(7));
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..10).collect::<Vec<usize>>(), "every window exactly once");
+        assert_ne!(order, sorted, "seed 7 left ten windows in stream order");
+        // A different key (another epoch) is a different order.
+        assert_ne!(order, epoch_window_order(40, 4, 2, 5, Some(8)));
+        // The same key is the same order: ranks and resumes depend on it.
+        assert_eq!(order, epoch_window_order(40, 4, 2, 5, Some(7)));
+    }
+
+    /// 11 complete windows and batches of 2 with `drop_last`: five batches
+    /// use ten windows. Which window is left out must depend on the epoch,
+    /// or the same tail of the corpus would never be trained on.
+    #[test]
+    fn the_window_dropped_by_drop_last_changes_with_the_epoch() {
+        let left_out = |key: u64| -> usize {
+            let order = epoch_window_order(44, 4, 2, 5, Some(key));
+            assert_eq!(order.len(), 10);
+            let mut seen = [false; 11];
+            for &w in &order {
+                assert!(!seen[w], "window {w} delivered twice");
+                seen[w] = true;
+            }
+            seen.iter().position(|&s| !s).unwrap()
+        };
+        let dropped: std::collections::HashSet<usize> = (0..32).map(left_out).collect();
+        assert!(dropped.len() > 1, "32 epochs all dropped window {dropped:?}");
+    }
+
+    /// A ragged final batch keeps the incomplete window and the padding at
+    /// the end; only complete windows are permuted.
+    #[test]
+    fn shuffled_window_order_keeps_the_ragged_tail_last() {
+        // 42 tokens: ten complete windows, one of two tokens, one of none.
+        let order = epoch_window_order(42, 4, 2, 6, Some(3));
+        assert_eq!(order.len(), 12);
+        assert_eq!(&order[10..], &[10, 11]);
+        let mut head: Vec<usize> = order[..10].to_vec();
+        head.sort_unstable();
+        assert_eq!(head, (0..10).collect::<Vec<usize>>());
+    }
+
+    /// `shuffle = true` used to permute whole batches: every batch was a
+    /// contiguous slice of the stream, so the same sequences always met in
+    /// one batch, in stream order. The corpus here labels each token with
+    /// its window (token value = window index), which makes the windows a
+    /// batch holds readable from the batch itself.
+    #[test]
+    fn shuffle_mixes_sequences_across_batches_and_epochs() {
+        const SEQ: usize = 4;
+        const BATCH: usize = 4;
+        const WINDOWS: usize = 64;
+        let data: Vec<f64> = (0..WINDOWS * SEQ).map(|t| (t / SEQ) as f64).collect();
+        let data_tensor = tensor_from_f64_slice(&data);
+        let cfg = make_shuffled_config_json(BATCH, SEQ, 11);
+        let dl = nsl_dataloader_create(data_tensor, 0, cfg.as_ptr() as i64, cfg.len() as i64);
+
+        let epoch = |dl: i64| -> Vec<Vec<i64>> {
+            drain_rows(dl, BATCH, SEQ)
+                .into_iter()
+                .map(|rows| {
+                    rows.into_iter()
+                        .map(|row| {
+                            assert!(
+                                row.iter().all(|&t| t == row[0]),
+                                "a row straddles two windows: {row:?}"
+                            );
+                            row[0]
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+
+        nsl_dataloader_start(dl);
+        let first = epoch(dl);
+        nsl_dataloader_reset(dl);
+        let second = epoch(dl);
+        nsl_dataloader_stop(dl);
+        nsl_dataloader_free(dl);
+
+        for (name, batches) in [("first", &first), ("second", &second)] {
+            assert_eq!(batches.len(), WINDOWS / BATCH, "{name} epoch");
+            let mut all: Vec<i64> = batches.iter().flatten().copied().collect();
+            all.sort_unstable();
+            assert_eq!(
+                all,
+                (0..WINDOWS as i64).collect::<Vec<i64>>(),
+                "{name} epoch: every sequence exactly once"
+            );
+        }
+        // A batch of the old scheme was windows 4k, 4k+1, 4k+2, 4k+3.
+        let contiguous = |b: &Vec<i64>| b[0] % BATCH as i64 == 0 && b.windows(2).all(|w| w[1] == w[0] + 1);
+        let mixed = first.iter().filter(|b| !contiguous(b)).count();
+        assert!(
+            mixed >= first.len() - 1,
+            "{} of {} batches are still contiguous slices of the stream: {first:?}",
+            first.len() - mixed,
+            first.len()
+        );
+        // And the same sequences must not meet again next epoch: compare the
+        // batches as sets of windows.
+        let as_sets = |batches: &Vec<Vec<i64>>| -> std::collections::HashSet<Vec<i64>> {
+            batches
+                .iter()
+                .map(|b| {
+                    let mut b = b.clone();
+                    b.sort_unstable();
+                    b
+                })
+                .collect()
+        };
+        let shared = as_sets(&first).intersection(&as_sets(&second)).count();
+        assert!(
+            shared <= 1,
+            "{shared} of {} batches hold the same sequences in both epochs",
+            first.len()
+        );
+    }
+
+    /// The packed path gathers rows the same way. Each row is checked
+    /// against its own tokens: the separator (token 0) is the last token of
+    /// every window here, so every row is one whole document.
+    #[test]
+    fn shuffle_gathers_packed_rows_from_across_the_stream() {
+        const SEQ: usize = 4;
+        const BATCH: usize = 2;
+        const WINDOWS: usize = 16;
+        // Window w is [w+1, w+1, w+1, 0].
+        let data: Vec<f64> = (0..WINDOWS * SEQ)
+            .map(|t| if t % SEQ == SEQ - 1 { 0.0 } else { (t / SEQ + 1) as f64 })
+            .collect();
+        let data_tensor = tensor_from_f64_slice(&data);
+        let cfg = format!(
+            r#"{{"batch_size":{BATCH},"seq_len":{SEQ},"num_workers":2,"packing":true,"shuffle":true,"prefetch":2,"pin_memory":false,"drop_last":true,"pack_separator":0,"seed":5}}"#
+        );
+        let dl = nsl_dataloader_create(data_tensor, 0, cfg.as_ptr() as i64, cfg.len() as i64);
+        nsl_dataloader_start(dl);
+        let mut seen: Vec<i64> = Vec::new();
+        let mut contiguous_batches = 0;
+        let mut batches = 0;
+        loop {
+            let batch = nsl_dataloader_next_batch(dl);
+            if batch == 0 {
+                break;
+            }
+            batches += 1;
+            let get = |name: &str| -> i64 {
+                let k = nsl_str_from_rust(name);
+                let t = crate::dict::nsl_dict_get_str(batch, k);
+                crate::string::nsl_string_free(k);
+                t
+            };
+            let ids = NslTensor::from_ptr(get("input_ids")).data as *const i32;
+            let labels = NslTensor::from_ptr(get("labels")).data as *const i32;
+            let segments = NslTensor::from_ptr(get("segment_ids")).data_f32();
+            let positions = NslTensor::from_ptr(get("position_ids")).data_f32();
+            let mut windows = Vec::new();
+            for r in 0..BATCH {
+                let at = |i: usize| r * SEQ + i;
+                let w = unsafe { *ids.add(at(0)) } as i64;
+                windows.push(w - 1);
+                for i in 0..SEQ {
+                    let want_id = if i == SEQ - 1 { 0 } else { w };
+                    assert_eq!(unsafe { *ids.add(at(i)) } as i64, want_id);
+                    // One document per row: segment 0, positions 0..4.
+                    assert_eq!(unsafe { *segments.add(at(i)) }, 0.0);
+                    assert_eq!(unsafe { *positions.add(at(i)) }, i as f32);
+                }
+                // w w w 0 -> labels w, w, 0 (the separator is a target), -100.
+                let want_labels = [w, w, 0, -100];
+                for (i, want) in want_labels.iter().enumerate() {
+                    assert_eq!(unsafe { *labels.add(at(i)) } as i64, *want, "row {r} label {i}");
+                }
+            }
+            if windows[1] == windows[0] + 1 && windows[0] % BATCH as i64 == 0 {
+                contiguous_batches += 1;
+            }
+            seen.extend(windows);
+            nsl_dict_free(batch);
+        }
+        nsl_dataloader_stop(dl);
+        nsl_dataloader_free(dl);
+        assert_eq!(batches, WINDOWS / BATCH);
+        seen.sort_unstable();
+        assert_eq!(seen, (0..WINDOWS as i64).collect::<Vec<i64>>());
+        assert!(
+            contiguous_batches <= 2,
+            "{contiguous_batches} of {batches} packed batches are contiguous slices"
+        );
+    }
+
     #[test]
     fn shuffle_is_reproducible_across_loaders() {
         let data: Vec<f64> = (0..64).map(|i| i as f64).collect();

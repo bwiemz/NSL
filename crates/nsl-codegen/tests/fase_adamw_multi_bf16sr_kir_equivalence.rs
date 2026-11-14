@@ -436,6 +436,22 @@ fn same(got: u32, want: u32) -> bool {
     got == want || (f32::from_bits(got).is_nan() && f32::from_bits(want).is_nan())
 }
 
+/// The same for a bf16 word: equal, or both NaN (exponent all ones, mantissa
+/// non-zero).
+///
+/// The rounding keeps the sign of a NaN θ', and the sign of a NaN that
+/// arithmetic PRODUCES is not a property of the kernel: IEEE 754 leaves it
+/// unspecified, x86 gives the default NaN the sign bit, and a compiler that
+/// folds or reorders the same expression gives another. The reference
+/// `step` below and the interpreter evaluate the step through different
+/// Rust code, so in an optimized build they disagreed on that one bit
+/// (0x7FC0 against 0xFFC0) while agreeing that θ' is NaN. `m` and `v` were
+/// already compared this way; θ' was compared with `assert_eq!`.
+fn same_bf16(got: u16, want: u16) -> bool {
+    let nan = |w: u16| w & 0x7F80 == 0x7F80 && w & 0x007F != 0;
+    got == want || (nan(got) && nan(want))
+}
+
 #[test]
 fn every_parameter_is_the_f32_step_then_the_host_rounding_at_its_own_counter() {
     let ps = params(9);
@@ -452,7 +468,7 @@ fn every_parameter_is_the_f32_step_then_the_host_rounding_at_its_own_counter() {
                 let wide = f((p.theta[i] as u32) << 16);
                 let (t, wm, wv) = step(wide, f(p.m[i]), f(p.v[i]), f(p.mp[i]), h);
                 let want = round(t.to_bits(), mix64(key, ctrs[j].wrapping_add(i as u64)) as u16);
-                assert_eq!(th[i], want, "{h:?} param {j} i={i}: θ' = {t:e}");
+                assert!(same_bf16(th[i], want), "{h:?} param {j} i={i}: θ' = {t:e}: {:#06x} vs {want:#06x}", th[i]);
                 if t.is_finite() && want & 0x7FFF == 0x7F7F && t.abs() > f32::from_bits(0x7F7F_0000) {
                     saturated += 1;
                 }

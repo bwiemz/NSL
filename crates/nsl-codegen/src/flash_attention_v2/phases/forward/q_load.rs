@@ -165,7 +165,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
                 ptx.push_str("    add.u64 %rd_doc_smem_addr, %r_doc_smem_base, %rd_doc_smem_addr;\n");
                 ptx.push_str("    ld.shared.s32 %r_doc_start, [%rd_doc_smem_addr];\n");
                 // effective_pos = abs_pos - doc_start (s32; non-negative under packing
-                // invariants from pca_rope::plan, so the result fits in u32).
+                // invariants (doc_start <= abs_pos), so the result fits in u32).
                 ptx.push_str("    sub.s32 %r_effective_pos_q, %r_abs_pos, %r_doc_start;\n");
                 // Zero-extend the (non-negative) effective_pos into the u64 cos/sin row
                 // scratch. Use cvt.u64.u32 — NOT cvt.u64.s32 — to match the backward T9

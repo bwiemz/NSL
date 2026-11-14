@@ -54,7 +54,7 @@ Research proposal for 2:4 and 4:8 structured sparsity as a first-class tensor ty
 Training optimization pass that defers gradient accumulation into a fused per-parameter loop (Deferred mode) or buffers it explicitly (FullBuffer mode), eliminating redundant optimizer-step dispatch. See [`docs/superpowers/specs/`](../superpowers/specs/) (search `fase`); implementation in `crates/nsl-codegen/src/fase.rs`.
 
 ### <a id="pca"></a>PCA — Packed Causal Attention
-FlashAttention-2 kernel variant that packs multiple variable-length sequences into a single tile pass, using per-segment masking to preserve causal isolation. Defined in CFTP §2. See [`docs/superpowers/specs/2026-04-18-pca-tier-a-design.md`](../superpowers/specs/2026-04-18-pca-tier-a-design.md); implementation in `crates/nsl-codegen/src/pca_segment.rs`.
+FlashAttention-2 kernel variant that packs multiple variable-length sequences into a single tile pass, using per-segment masking to preserve causal isolation. Defined in CFTP §2. See [`docs/superpowers/specs/2026-04-18-pca-tier-a-design.md`](../superpowers/specs/2026-04-18-pca-tier-a-design.md); the kernels are synthesized in `crates/nsl-codegen/src/flash_attention_v2/` and activated by `crates/nsl-codegen/src/pca_activation.rs`.
 
 ### <a id="wggo"></a>WGGO — Wengert Graph Global Optimization
 Multi-level ILP/DP pass that co-optimizes CEP head pruning, CSHA fusion level, WRGA adapter rank, and CPDT shard factor across all layers jointly, producing an `AppliedPlan` that downstream consumers consume. See [NSL-WGGO-Research.md.pdf](../research/NSL-WGGO-Research.md.pdf); implementation in `crates/nsl-codegen/src/wggo.rs`.

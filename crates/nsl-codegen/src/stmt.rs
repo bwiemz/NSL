@@ -163,6 +163,20 @@ pub(crate) fn resolvable_tensor_rank(ty: &Type) -> Option<usize> {
 /// canonical key (`source`); future keys should land in both places.
 const DATA_SECTION_KEYS: &[&str] = &["source"];
 
+/// Why a packed batch may not reach segment-masked `@flash_attention`
+/// training kernels. One text for the compile-time refusal at the
+/// `DataLoader(packing = true)` call and for the run-time one in the train
+/// block's batch prologue.
+pub(crate) const PACKED_BATCH_TO_MASKED_CSHA_MESSAGE: &str =
+    "a packed batch cannot be fed to this module's `@flash_attention` training \
+     kernels. A `dataset` block with `packing = true` made those kernels \
+     segment-masked; they read segment ids as 16-bit integers and document starts \
+     as 32-bit integers, and the loader stores both as 32-bit floats, so they \
+     would mask on reinterpreted bits. Packed attention is supported through \
+     `GroupedQueryAttention.forward_packed(x, batch.segment_ids, \
+     batch.position_ids, training)`: use it and drop `packing = true` from the \
+     dataset block, or drop `packing = true` from the DataLoader";
+
 /// Returns true iff `stmt` is a `data:` section config pair of the form
 /// `<allowlisted-key> = <expr>` (plain `Assign`, plain ident target). These
 /// are PCA-detection metadata consumed via the AST walker in
@@ -2464,6 +2478,20 @@ impl Compiler<'_> {
         // together — the packer emits them as a pair.
         builder.switch_to_block(has_seg_block);
         builder.seal_block(has_seg_block);
+        // The pointers stashed below are read only by segment-masked CSHA
+        // kernels, which load segment ids as 16-bit integers and document
+        // starts as 32-bit integers. The loader stores both as 32-bit
+        // floats (and leaves `doc_starts` on the host), so a masked kernel
+        // would mask on reinterpreted bits. `DataLoader(packing = true)` is
+        // refused at compile time in a module that has such kernels
+        // (`expr/calls.rs`); this is the same refusal for a packed batch
+        // that reaches the train block some other way.
+        if self.module_has_segment_masked_csha_kernels() {
+            let no = builder.ins().iconst(cl_types::I8, 0);
+            self.intern_string(PACKED_BATCH_TO_MASKED_CSHA_MESSAGE)?;
+            let msg = self.compile_string_literal(builder, PACKED_BATCH_TO_MASKED_CSHA_MESSAGE)?;
+            self.compile_call_by_name(builder, "nsl_assert", &[no, msg])?;
+        }
         let seg_tensor =
             self.compile_call_by_name(builder, "nsl_dict_get_str", &[batch_val, k_seg])?;
         let k_doc = self.compile_string_literal(builder, "doc_starts")?;
@@ -2519,17 +2547,32 @@ impl Compiler<'_> {
         // Gated on the ACTUAL synthesized config so non-packed training
         // (the common case) never sees this call. has_seg is the
         // nsl_dict_contains("segment_ids") i64 result from above.
-        let module_is_masked = self
-            .kernels
+        if self.module_has_segment_masked_csha_kernels() {
+            // `nsl_dict_contains` returns an i8 and this takes an i64. The
+            // i8 used to be passed as it was, which Cranelift's verifier
+            // rejects: a module with segment-masked kernels and a train
+            // block that reads any DataLoader failed to compile with an
+            // internal "failed to define main" error.
+            let had_segments = builder.ins().uextend(cl_types::I64, has_seg);
+            self.compile_call_by_name(
+                builder,
+                "nsl_pca_packing_mismatch_check",
+                &[had_segments],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Whether kernel synthesis built segment-masked CSHA training kernels
+    /// for this module (a train block whose `dataset` declares
+    /// `packing = true`, on a model with `@flash_attention`).
+    pub(crate) fn module_has_segment_masked_csha_kernels(&self) -> bool {
+        self.kernels
             .flash_attention_context
             .as_ref()
             .and_then(|c| c.csha_training_config.as_ref())
             .map(|cfg| cfg.segment_masked)
-            .unwrap_or(false);
-        if module_is_masked {
-            self.compile_call_by_name(builder, "nsl_pca_packing_mismatch_check", &[has_seg])?;
-        }
-        Ok(())
+            .unwrap_or(false)
     }
 
     pub(crate) fn free_wengert_owned_values(

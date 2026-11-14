@@ -17,6 +17,17 @@ is reported, not hidden: `data/tokcorpus/combined_train.txt` is ~9M tokens
 against ~10B of web, so any code share above ~0.1% means seeing the code corpus
 more than once, and a high share means seeing it many times.
 
+Where the added documents go is `--placement`. The default, `document`, spreads
+them uniformly over the base corpus's DOCUMENT INDEX: between any two
+neighbouring base documents an injection is equally likely. The share of added
+tokens in a stretch of the output therefore depends on how long the base
+documents there are: a region of short base documents gets more added
+documents per base token than a region of long ones. `token` spreads them
+uniformly over the base corpus's TOKEN positions instead, which makes the
+local share the same everywhere. `document` stays the default because the
+committed corpus manifest pins the hash of a mixture built that way; the
+mixture's own manifest records which was used.
+
 Usage (from the repo root):
     tools/hfcorpus/.venv/bin/python tools/hfcorpus/make_mix.py \
         --base data/tokens/mix/web_train.bin \
@@ -99,6 +110,37 @@ def document_offsets(tokens: np.ndarray, eos: int) -> np.ndarray:
     return np.stack([starts, ends + 1], axis=1)
 
 
+PLACEMENTS = ("document", "token")
+
+
+def injection_key(rng: random.Random, base_docs: np.ndarray, base_tokens: int,
+                  placement: str) -> float:
+    """Where one injected document sorts among the base documents.
+
+    Base document `i` has key `float(i)`; an injected document with a key in
+    `[i, i + 1)` is emitted after it (and before base document `i + 1`).
+
+    `document`: uniform over the document index, one `rng.uniform` draw. This
+    is the placement every mixture built before the option existed has, and
+    the draw sequence is unchanged, so a seed reproduces its old output.
+
+    `token`: a uniform token position of the base stream, mapped to the base
+    document that holds it. A base document of 1000 tokens is then ten times
+    as likely to be followed by an injection as one of 100, so injections
+    are spread evenly over tokens.
+    """
+    if placement == "document":
+        return rng.uniform(0, len(base_docs))
+    if placement == "token":
+        position = rng.uniform(0, base_tokens)
+        # The last base document whose start is <= position.
+        index = int(np.searchsorted(base_docs[:, 0], position, side="right")) - 1
+        index = min(max(index, 0), len(base_docs) - 1)
+        start, end = base_docs[index]
+        return index + min(max((position - start) / (end - start), 0.0), 1.0 - 1e-9)
+    raise ValueError(f"placement must be one of {PLACEMENTS}, got {placement!r}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", type=Path, required=True)
@@ -106,6 +148,11 @@ def main() -> int:
                     help="PATH:SHARE, e.g. data/tokens/mix/code_train.bin:0.03")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--seed", type=int, default=1337)
+    ap.add_argument("--placement", choices=PLACEMENTS, default="document",
+                    help="spread added documents uniformly over the base "
+                         "corpus's document index (default; the local share "
+                         "of added tokens then varies with base document "
+                         "length) or over its token positions")
     args = ap.parse_args()
 
     eos = load_specials()["<|endoftext|>"]
@@ -176,15 +223,14 @@ def main() -> int:
 
     # Shuffle only the injected entries into the base sequence, preserving base
     # order: sort by a key that is the base index for base docs and a random
-    # position for injections.
-    base_positions = len(base_docs)
+    # position for injections (see `injection_key` for what "position" is).
     keyed = []
-    bi = 0
     for src, idx in schedule:
         if src == -1:
             keyed.append((float(idx), src, idx))
         else:
-            keyed.append((rng.uniform(0, base_positions), src, idx))
+            keyed.append((injection_key(rng, base_docs, int(base.size), args.placement),
+                          src, idx))
     keyed.sort(key=lambda t: t[0])
 
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -225,6 +271,7 @@ def main() -> int:
     manifest = {
         "output": rel(out),
         "seed": args.seed,
+        "placement": args.placement,
         "eos_id": int(eos),
         "tokens": int(written),
         "sha256": digest.hexdigest(),
@@ -237,7 +284,8 @@ def main() -> int:
         },
     }
     out.with_suffix(".manifest.json").write_text(json.dumps(manifest, indent=2))
-    print(f"\n[mix] {written:,} tokens -> {out} ({out.stat().st_size / 1e9:.2f} GB)")
+    print(f"\n[mix] {written:,} tokens -> {out} ({out.stat().st_size / 1e9:.2f} GB), "
+          f"added documents placed uniformly by base {args.placement}")
     for k, v in counts.items():
         print(f"       {k:<24} {v:>14,}  {v / written:6.2%}")
     return 0

@@ -420,6 +420,7 @@ impl Compiler<'_> {
             checkpoint_save_path,
             checkpoint_every,
             checkpoint_load_path,
+            schedule_in_optimizer_steps,
         } = self.extract_train_config(builder, train)?;
 
         // ── 2. Resolve the optimizer/scheduler/callbacks contract ───────
@@ -580,6 +581,7 @@ impl Compiler<'_> {
             },
             schedule: TrainSchedule {
                 grad_accumulation_steps,
+                schedule_in_optimizer_steps,
                 checkpoint_save_path: checkpoint_save_path.clone(),
                 checkpoint_every,
             },
@@ -2700,6 +2702,10 @@ impl Compiler<'_> {
                 model_sym,
             },
         )?;
+
+        // A run that ends inside an accumulation window steps once more on
+        // the micro-batches that window holds (stmt_train/optimizer_step.rs).
+        self.emit_trailing_window_flush(builder, state, &plan, &emit)?;
 
         // Free the block's lists, sweep the trailing CSLA window, restore
         // streamed weights, print the graphs banner (stmt_train/teardown.rs).

@@ -27,14 +27,8 @@ fn run_wggo(source: &str, tag: &str) -> String {
     let root = repo_root();
     let tmp = std::env::temp_dir().join(format!("nsl_wggo_pack_{tag}_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
-    let corpus = tmp.join("tokens.bin");
-    std::fs::write(&corpus, [0u8; 128]).unwrap();
     let fixture = tmp.join("prog.nsl");
-    // Forward slashes: the corpus path lands inside an NSL string literal, and on
-    // Windows `display()` emits backslashes that the NSL lexer reads as escape
-    // sequences (`\U`, `\A`, ...). Forward slashes are valid on Windows too.
-    let corpus_path = corpus.to_string_lossy().replace('\\', "/");
-    std::fs::write(&fixture, source.replace("{CORPUS}", &corpus_path)).unwrap();
+    std::fs::write(&fixture, source).unwrap();
 
     let output = Command::new(env!("CARGO"))
         .args(["run", "-q", "--manifest-path"])
@@ -69,7 +63,7 @@ let m = TinyAttn()
 let x = ones([32, 32])
 "#;
 
-/// Packed dataset + @pca + @flash_attention: masked kernels exist, so a
+/// Packed dataset + @flash_attention: masked kernels exist, so a
 /// plan-side packing request must be CONSUMED (verdict names the kernel).
 #[test]
 fn wggo_packing_decision_consumed_when_masked_kernels_exist() {
@@ -77,13 +71,11 @@ fn wggo_packing_decision_consumed_when_masked_kernels_exist() {
         r#"from nsl.nn.losses import mse_loss
 
 dataset PackedCorpus("docs"):
-    source = "{{CORPUS}}"
     packing = true
     max_sequence_length = 64
     mean_doc_length = 16
 
 {ATTENTION_MODEL}
-@pca(strategy=per_document)
 train(model = m, epochs = 1):
     data:
         source = PackedCorpus

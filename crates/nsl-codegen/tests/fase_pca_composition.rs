@@ -135,7 +135,6 @@ fn pca_active_without_fase_when_grad_accumulation_one() {
         "{MODEL_PREAMBLE}{}",
         concat!(
             "dataset PretrainCorpus(\"/data/pile\"):\n",
-            "    source = \"/data/pile.bin\"\n",
             "    packing = true\n",
             "    max_sequence_length = 2048\n",
             "    mean_doc_length = 400\n",
@@ -175,7 +174,6 @@ fn fase_active_without_pca_when_dataset_has_no_packing() {
         "{MODEL_PREAMBLE}{}",
         concat!(
             "dataset PretrainCorpus(\"/data/pile\"):\n",
-            "    source = \"/data/pile.bin\"\n",
             "    max_sequence_length = 2048\n",
             "\n",
             "train(model = m, grad_accumulation = 4):\n",
@@ -208,7 +206,6 @@ fn fase_grad_clip_composes_with_pca_packing() {
         "{MODEL_PREAMBLE}{}",
         concat!(
             "dataset PretrainCorpus(\"/data/pile\"):\n",
-            "    source = \"/data/pile.bin\"\n",
             "    packing = true\n",
             "    max_sequence_length = 2048\n",
             "    mean_doc_length = 400\n",
@@ -291,7 +288,7 @@ fn data_section_unknown_key_is_refused() {
         "{MODEL_PREAMBLE}{}",
         concat!(
             "dataset PretrainCorpus(\"/data/pile\"):\n",
-            "    source = \"/data/pile.bin\"\n",
+            "    packing = true\n",
             "\n",
             "train(model = m, grad_accumulation = 4):\n",
             "    data:\n",
@@ -308,16 +305,16 @@ fn data_section_unknown_key_is_refused() {
     );
 }
 
-/// H2 regression: paper-canonical `separator_token_id` must pass semantic
-/// check AND populate the PCA packing config (the v8 first-pass omitted
-/// it — adversarial review caught it).
+/// `separator_token_id` in a `dataset` block used to pass the checker and
+/// travel into the PCA packing config, where nothing read it: the token
+/// that ends a document is the loader's `pack_separator`. This test used to
+/// assert the pass-through. The field is now refused by name.
 #[test]
-fn separator_token_id_accepted_and_threaded_through() {
+fn separator_token_id_in_a_dataset_block_is_refused() {
     let src = format!(
         "{MODEL_PREAMBLE}{}",
         concat!(
             "dataset PretrainCorpus(\"/data/pile\"):\n",
-            "    source = \"/data/pile.bin\"\n",
             "    packing = true\n",
             "    max_sequence_length = 2048\n",
             "    mean_doc_length = 400\n",
@@ -330,17 +327,18 @@ fn separator_token_id_accepted_and_threaded_through() {
         )
     );
     let (ast, interner, diags) = parse_and_check(&src);
-    assert_no_semantic_errors(&diags);
-    let report = build_report(&ast, &interner, Path::new("sep.nsl"));
-    let pca = report.train_blocks[0]
-        .pca
-        .as_ref()
-        .expect("expected PCA section");
-    assert_eq!(
-        pca.packing_config.separator_token_id,
-        Some(2),
-        "separator_token_id must flow into PCA packing config"
+    let errors: Vec<&nsl_errors::Diagnostic> =
+        diags.iter().filter(|d| matches!(d.level, nsl_errors::Level::Error)).collect();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        errors[0].message.contains("dataset field 'separator_token_id' is not supported"),
+        "{:?}",
+        errors[0]
     );
+    // And nothing carries it on: the planner's config has no separator.
+    let report = build_report(&ast, &interner, Path::new("sep.nsl"));
+    let pca = report.train_blocks[0].pca.as_ref().expect("expected PCA section");
+    assert_eq!(pca.packing_config.separator_token_id, None);
 }
 
 // ─── Subprocess regression: `nsl check --training-report` ──────────────────
