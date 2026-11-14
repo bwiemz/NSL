@@ -490,3 +490,80 @@ fn fused_kl_ce_gpu_forward_and_backward_match_reference() {
         nsl_test_cuda_free(d);
     }
 }
+
+/// A kernel launch that fails must end the process, not return.
+///
+/// The FFIs used to log and return a code, which the compiled step
+/// dropped: the zero-filled loss buffer then read as a loss of 0 with zero
+/// gradients, and training carried on. The launch is made to fail here by
+/// asking the (valid) module for an entry it does not have. The call exits
+/// the process, so it runs in a child: this test re-runs itself with
+/// `NSL_KLCE_FAILED_LAUNCH_CHILD` set and reads the child's exit status,
+/// which must be the runtime's CUDA-driver code, 13.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn a_failed_launch_exits_instead_of_returning() {
+    const CHILD: &str = "NSL_KLCE_FAILED_LAUNCH_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let out = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+            .args(["--ignored", "--exact", "a_failed_launch_exits_instead_of_returning", "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .expect("re-run the test binary");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("skipping:") {
+            eprintln!("{stderr}");
+            return;
+        }
+        assert_eq!(out.status.code(), Some(13), "the child must exit with the CUDA-driver code:\n{stderr}");
+        assert!(stderr.contains("the fused KL-CE kernel failed to launch"), "{stderr}");
+        assert!(!stderr.contains("returned from a failed launch"), "{stderr}");
+        return;
+    }
+
+    if !cuda_available() {
+        return;
+    }
+    let cfg = FusedKlCeConfig {
+        vocab_size: V as u32,
+        student_hidden: HS as u32,
+        teacher_hidden: HT as u32,
+        batch_size: B as u32,
+        seq_len: S as u32,
+        vocab_tile: VOCAB_TILE,
+        gpu_sm: 80,
+        ignore_index: IGNORE_INDEX,
+    };
+    let ptx = synthesize_fused_kl_ce_ptx(&cfg);
+    let alloc = |bytes: usize| nsl_test_cuda_alloc(bytes as i64);
+    let (xs, ws, bs) = (alloc(ROWS * HS * 4), alloc(V * HS * 4), alloc(V * 4));
+    let (xt, wt, bt) = (alloc(ROWS * HT * 4), alloc(V * HT * 4), alloc(V * 4));
+    let targets = alloc(ROWS * 8);
+    let outs = [alloc(ROWS * 4), alloc(ROWS * 4), alloc(ROWS * 4), alloc(ROWS * 4)];
+    let rc = nsl_fused_kl_ce_forward(
+        ptx.as_ptr() as i64,
+        c"nsl_no_such_kernel".as_ptr() as i64,
+        xs,
+        ws,
+        bs,
+        xt,
+        wt,
+        bt,
+        targets,
+        outs[0],
+        outs[1],
+        outs[2],
+        outs[3],
+        ROWS as i64,
+        V as i64,
+        HS as i64,
+        HT as i64,
+        f32_bits(ALPHA),
+        f32_bits(TEMP),
+        cfg.shared_mem_bytes() as i64,
+    );
+    // Not reached when the runtime is right. Exit 0 so the parent sees the
+    // wrong status, and say why.
+    eprintln!("nsl_fused_kl_ce_forward returned from a failed launch with rc={rc}");
+    std::process::exit(0);
+}

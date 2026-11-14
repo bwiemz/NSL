@@ -5547,7 +5547,11 @@ fn lower_fused_kl_ce_forward(
 
     // ABI lock-step: 20 args — must match builtins.rs declaration and the
     // runtime extern "C" fn (crates/nsl-runtime/src/fused_kl_ce.rs).
-    let _rc = call(
+    //
+    // The return value is always 0: a launch that fails does not return (the
+    // runtime reports it and exits). It used to return a code this site
+    // dropped, and the zero-filled loss buffer then read as a loss of 0.
+    call(
         compiler,
         builder,
         "nsl_fused_kl_ce_forward",
@@ -5773,7 +5777,9 @@ fn lower_fused_kl_ce_backward_extract(
         let temp_bits = FusedKlCeLowerParams::f32_bits_const(builder, p.temperature);
 
         // ABI lock-step: 23 args — must match builtins.rs and the runtime.
-        let _rc = call(
+        // Always returns 0; a failed launch exits in the runtime (see the
+        // forward site).
+        call(
             compiler,
             builder,
             "nsl_fused_kl_ce_backward",
