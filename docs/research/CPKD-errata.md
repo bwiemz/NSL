@@ -292,7 +292,12 @@ a directory are under `crates/nsl-codegen/src/`.
 
 ### Fixed
 
-None of the defects below has been fixed.
+- A `let t = t0` of a tensor copied the handle without taking a reference,
+  so two owning names shared one: at module level, with the tensor used in
+  a train or distill step, the run ended with `free(): double free detected
+  in tcache 2`. The binding now retains, as the assignment `t = t0` did
+  (`compile_stmt_dispatch` in `stmt.rs`); test
+  `crates/nsl-cli/tests/module_tensor_alias_gate.rs`.
 
 ### Open
 
@@ -355,8 +360,3 @@ None of the defects below has been fixed.
   4.2e-3, are below the 5e-3 absolute tolerance, so all-zero gradients pass.
   Swapping the KL direction moves the loss 5.4e-5 against a 1e-3 tolerance.
   `crates/nsl-codegen/tests/cpkd_fused_kl_ce_numerical.rs`. Numeric check.
-- **A module-level tensor alias aborts at exit.** This is a general
-  ownership defect found while testing, not part of CPKD: a module-level
-  `let t = t0` of a tensor that is then used inside a train or distill step
-  ends the run with `free(): double free detected in tcache 2`; the same
-  program without the alias exits cleanly. Reproduced by running.
