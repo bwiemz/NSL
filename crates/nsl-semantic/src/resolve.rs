@@ -59,11 +59,33 @@ impl<'a> TypeResolver<'a> {
                 shape,
                 dtype,
                 format,
-            } => Type::Sparse {
-                shape: self.resolve_shape(shape),
-                dtype: self.resolve_dtype(*dtype),
-                format: self.resolve_sparse_format(*format),
-            },
+            } => {
+                let resolved = self.resolve_sparse_format(*format);
+                // A format name that is not one of the four used to become
+                // the format `?` without a word, so `Sparse<[4, 4], f32, crs>`
+                // checked clean. Reported once per annotation (annotations
+                // are resolved more than once; see the tensor arm above).
+                if resolved == SparseFormat::Unknown {
+                    let name = self.interner.resolve(format.0).unwrap_or("");
+                    let msg = format!(
+                        "unknown sparse format `{name}` in a Sparse<...> type; the formats are coo, csr, csc and bsr"
+                    );
+                    if !self
+                        .diagnostics
+                        .iter()
+                        .any(|d| d.message == msg && d.labels.iter().any(|l| l.span == type_expr.span))
+                    {
+                        self.diagnostics.push(
+                            Diagnostic::error(msg).with_label(type_expr.span, "not a sparse format"),
+                        );
+                    }
+                }
+                Type::Sparse {
+                    shape: self.resolve_shape(shape),
+                    dtype: self.resolve_dtype(*dtype),
+                    format: resolved,
+                }
+            }
             TypeExprKind::Function { params, ret, effect } => {
                 let resolved_effect = if let Some(eff_expr) = effect {
                     self.resolve_effect_expr(eff_expr, scope)
@@ -739,6 +761,41 @@ mod tests {
             diagnostics: &mut diagnostics,
         };
         resolver.resolve_dtype(sym)
+    }
+
+    fn sparse_annotation_errors(format: &str) -> Vec<String> {
+        let src = format!("fn f(x: Sparse<[4, 4], f32, {format}>) -> int:\n    return 0\n");
+        let mut interner = nsl_lexer::Interner::new();
+        let (tokens, _) = nsl_lexer::tokenize(&src, nsl_errors::FileId(0), &mut interner);
+        let parsed = nsl_parser::parse(&tokens, &mut interner);
+        assert!(
+            parsed.diagnostics.iter().all(|d| d.level != nsl_errors::Level::Error),
+            "{format}: parse errors {:?}",
+            parsed.diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        crate::analyze(&parsed.module, &mut interner)
+            .diagnostics
+            .iter()
+            .filter(|d| d.level == nsl_errors::Level::Error)
+            .map(|d| d.message.clone())
+            .collect()
+    }
+
+    /// The four formats resolve; any other name is an error that lists them,
+    /// reported once. It used to become the format `?` and check clean.
+    #[test]
+    fn an_unknown_sparse_format_name_is_an_error() {
+        for format in ["coo", "csr", "csc", "bsr"] {
+            let e = sparse_annotation_errors(format);
+            assert!(e.iter().all(|m| !m.contains("sparse format")), "{format}: {e:?}");
+        }
+        for format in ["crs", "dense", "ell", "COO"] {
+            let e = sparse_annotation_errors(format);
+            let ours: Vec<&String> = e.iter().filter(|m| m.contains("unknown sparse format")).collect();
+            assert_eq!(ours.len(), 1, "{format}: {e:?}");
+            assert!(ours[0].contains(&format!("`{format}`")), "{ours:?}");
+            assert!(ours[0].contains("coo, csr, csc and bsr"), "{ours:?}");
+        }
     }
 
     #[test]

@@ -127,11 +127,17 @@ edges and occasional API churn.
   `Adam(weight_decay=..)` / `Adam(no_decay=..)` are refused (use AdamW):
   NSL never implemented coupled decay, and the knob meant different things
   on different update paths.
-- **Quantization** — FP8, BitNet, AWQ/GPTQ precision tiering (`quantization`).
+- **Quantization** — FP8, BitNet, and `quant` blocks at `int8`/`int4`
+  (`quantization`). The 4-bit weight routines in the runtime (one named AWQ,
+  which is per-group round-to-nearest, and GPTQ) are library code that NSL
+  source does not reach.
   Requests that were accepted and never honoured are refused: `nsl build`'s
   calibration flags, a `quant` block's `calibration:` section and its
   `awq4`/`gptq*` defaults, `@quantize` arguments other than `dtype =
-  "awq4"`, and `@fp8_compute(calibrate = true)`.
+  "awq4"`, `@fp8_compute(calibrate = true)`, and the decorators
+  `@kv_compress`, `@sparse` and `@fp4_compute`. `@quantize(dtype = "awq4")`
+  is accepted with a warning: it marks a model for the calibration pass and
+  quantizes nothing.
 - **FlashAttention** — codegen path and selector (`analysis`).
 - **C ABI / shared-library export** — `nsl_model_*` C API and generated headers
   (M62), including the DLPack output-ownership models `nsl_model_call_into` /

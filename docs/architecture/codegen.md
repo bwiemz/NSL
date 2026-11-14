@@ -874,7 +874,7 @@ or explaining why it is not one.
 `new`, `with_span` (override), `with_span_if_unset` (attach only if none and
 the span is not `Span::DUMMY`), `with_note`, `to_diagnostic()` (→
 `nsl_errors::Diagnostic` with the span as primary label and notes carried
-over; the CLI renders it through the source map), `missing_scales`. `Display`
+over; the CLI renders it through the source map). `Display`
 is the bare message — the CLI adds the `codegen error:` prefix.
 
 Spans are attached by exactly four dispatchers, each wrapping its

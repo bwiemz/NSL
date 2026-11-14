@@ -263,75 +263,27 @@ pub extern "C" fn nsl_sparse_from_dense(dense_ptr: i64, format: i64, threshold_b
 }
 
 /// Convert a sparse tensor to dense NslTensor.
-/// Returns pointer to NslTensor (f64, 2D), or 0 on error.
+/// Returns pointer to a 2-D NslTensor in the sparse tensor's dtype, or 0 on
+/// error (a null operand or an unknown format id).
+///
+/// Entries that share a coordinate ADD, as they do in every product
+/// (`nsl_sparse_spmm`, `nsl_sparse_spmv`, the GPU kernels). This used to
+/// keep the last duplicate instead, so one COO tensor stood for two
+/// different matrices depending on which routine read it. A CSC operand
+/// used to return null.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_sparse_to_dense(sparse_ptr: i64) -> i64 {
     if sparse_ptr == 0 { return 0; }
     let sparse = unsafe { &*(sparse_ptr as *const NslSparseTensor) };
     let rows = sparse.rows as usize;
     let cols = sparse.cols as usize;
-    let nnz = sparse.nnz as usize;
+    let Some(triples) = sparse_to_triples(sparse) else { return 0 };
 
-    // Allocate dense output (zeros)
     let mut dense = vec![0.0f64; rows * cols];
-    let vals = unsafe { std::slice::from_raw_parts(sparse.data as *const f64, nnz) };
-
-    match SparseFmtId::from_u8(sparse.format) {
-        Some(SparseFmtId::Coo) => {
-            let row_idx = unsafe { std::slice::from_raw_parts(sparse.indices_0, nnz) };
-            let col_idx = unsafe { std::slice::from_raw_parts(sparse.indices_1, nnz) };
-            for i in 0..nnz {
-                let r = row_idx[i] as usize;
-                let c = col_idx[i] as usize;
-                if r < rows && c < cols {
-                    dense[r * cols + c] = vals[i];
-                }
-            }
+    for (r, c, v) in triples {
+        if r >= 0 && c >= 0 && (r as usize) < rows && (c as usize) < cols {
+            dense[r as usize * cols + c as usize] += v;
         }
-        Some(SparseFmtId::Csr) => {
-            let row_ptr = unsafe { std::slice::from_raw_parts(sparse.indices_0, rows + 1) };
-            let col_idx = unsafe { std::slice::from_raw_parts(sparse.indices_1, nnz) };
-            for r in 0..rows {
-                let start = row_ptr[r] as usize;
-                let end = row_ptr[r + 1] as usize;
-                for j in start..end {
-                    let c = col_idx[j] as usize;
-                    if c < cols {
-                        dense[r * cols + c] = vals[j];
-                    }
-                }
-            }
-        }
-        Some(SparseFmtId::Bsr) => {
-            let br = sparse.block_rows as usize;
-            let bc = sparse.block_cols as usize;
-            if br == 0 || bc == 0 { return 0; }
-            let nblk_rows = rows.div_ceil(br);
-            let num_blocks = sparse.nnz as usize;
-            let block_size = br * bc;
-            let block_row_ptrs = unsafe { std::slice::from_raw_parts(sparse.indices_0, nblk_rows + 1) };
-            let block_col_indices = unsafe { std::slice::from_raw_parts(sparse.indices_1, num_blocks) };
-            let block_vals = unsafe { std::slice::from_raw_parts(sparse.data as *const f64, num_blocks * block_size) };
-
-            for blk_r in 0..nblk_rows {
-                let start = block_row_ptrs[blk_r] as usize;
-                let end = block_row_ptrs[blk_r + 1] as usize;
-                for (blk_idx, &blk_c_raw) in block_col_indices.iter().enumerate().take(end).skip(start) {
-                    let blk_c = blk_c_raw as usize;
-                    let val_base = blk_idx * block_size;
-                    for r in 0..br {
-                        for c in 0..bc {
-                            let gr = blk_r * br + r;
-                            let gc = blk_c * bc + c;
-                            if gr < rows && gc < cols {
-                                dense[gr * cols + gc] = block_vals[val_base + r * bc + c];
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        _ => return 0,
     }
 
     let out =
@@ -374,7 +326,8 @@ fn result_in_dtype(result: i64, operand_dtype: u16) -> i64 {
 }
 
 /// Sparse-dense matrix multiply: sparse(M×K) × dense(K×N) → dense(M×N).
-/// sparse_ptr: NslSparseTensor (COO or CSR)
+/// sparse_ptr: NslSparseTensor (COO, CSR, CSC or BSR; a CSC operand used to
+/// return null)
 /// dense_ptr: NslTensor (2D, the sparse tensor's dtype)
 /// Returns pointer to new NslTensor, or 0 on error.
 #[unsafe(no_mangle)]
@@ -395,6 +348,22 @@ pub extern "C" fn nsl_sparse_spmm(sparse_ptr: i64, dense_ptr: i64) -> i64 {
 
     // Verify dimension compatibility: sparse cols == dense rows
     if sparse.cols as usize != k { return 0; }
+
+    // While a tape is recording, the product has to be an operation the
+    // tape knows, or the result is a constant to it and everything upstream
+    // of the dense operand gets a gradient of exactly zero. None of the
+    // sparse kernels records anything, so the sparse operand is expanded and
+    // the product is the dense matmul, which records itself. (Decided here,
+    // at run time: the compiler cannot know whether a tape is live.)
+    if crate::autodiff::is_recording() {
+        let expanded = nsl_sparse_to_dense(sparse_ptr);
+        if expanded == 0 { return 0; }
+        let placed = crate::tensor::nsl_tensor_to_device(expanded, dense.device as i64);
+        crate::tensor::nsl_tensor_free(expanded);
+        let out = crate::tensor::nsl_tensor_matmul(placed, dense_ptr, 0);
+        crate::tensor::nsl_tensor_free(placed);
+        return out;
+    }
 
     // GPU dispatch: if dense tensor is on GPU, use GPU sparse kernels
     #[cfg(feature = "cuda")]
@@ -483,7 +452,17 @@ pub extern "C" fn nsl_sparse_spmm(sparse_ptr: i64, dense_ptr: i64) -> i64 {
                 }
             }
         }
-        _ => return 0,
+        Some(SparseFmtId::Csc) => {
+            // Column-compressed: walk the entries as (row, col, value).
+            let Some(triples) = sparse_to_triples(sparse) else { return 0 };
+            for (r, c, v) in triples {
+                let (r, c) = (r as usize, c as usize);
+                for j in 0..n {
+                    output[r * n + j] += v * d_data[c * n + j];
+                }
+            }
+        }
+        None => return 0,
     }
 
     let out = crate::tensor::creation::create_tensor_from_f64_data(&output, &[m as i64, n as i64]);
@@ -894,7 +873,7 @@ pub extern "C" fn nsl_sparse_csc_to_coo(csc_ptr: i64) -> i64 {
 // SpMV: sparse matrix × dense vector → dense vector
 // ---------------------------------------------------------------------------
 
-/// SpMV: CSR sparse matrix [M,K] × dense vector [K] → dense vector [M].
+/// SpMV: sparse matrix [M,K] (any format) × dense vector [K] → dense vector [M].
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_sparse_spmv(sparse_ptr: i64, vec_ptr: i64) -> i64 {
     if sparse_ptr == 0 || vec_ptr == 0 { return 0; }
@@ -989,7 +968,13 @@ pub extern "C" fn nsl_sparse_spmv(sparse_ptr: i64, vec_ptr: i64) -> i64 {
                 }
             }
         }
-        _ => return 0,
+        Some(SparseFmtId::Csc) => {
+            let Some(triples) = sparse_to_triples(sparse) else { return 0 };
+            for (r, c, v) in triples {
+                output[r as usize] += v * x[c as usize];
+            }
+        }
+        None => return 0,
     }
 
     let out = crate::tensor::creation::create_tensor_from_f64_data(&output, &[m as i64]);
@@ -1017,9 +1002,11 @@ pub extern "C" fn nsl_sparse_add(a_ptr: i64, b_ptr: i64) -> i64 {
     let rows = a.rows;
     let cols = a.cols;
 
-    // Convert both to COO-like (row, col, val) triples
-    let a_triples = sparse_to_triples(a);
-    let b_triples = sparse_to_triples(b);
+    // Convert both to (row, col, val) triples. Any format: a CSC or BSR
+    // operand used to come back as an empty list and count as all zeros.
+    let (Some(a_triples), Some(b_triples)) = (sparse_to_triples(a), sparse_to_triples(b)) else {
+        return 0;
+    };
 
     // Merge using workspace: dense row accumulator
     let num_cols = cols as usize;
@@ -1088,8 +1075,14 @@ pub extern "C" fn nsl_sparse_mul(a_ptr: i64, b_ptr: i64) -> i64 {
     let num_rows = rows as usize;
     let num_cols = cols as usize;
 
-    let a_triples = sparse_to_triples(a);
-    let b_triples = sparse_to_triples(b);
+    // Entries that share a coordinate add, so each operand is coalesced
+    // before the product: (a1 + a2) * (b1 + b2), not a sum of whichever
+    // pairs happened to be stored last.
+    let (Some(a_triples), Some(b_triples)) = (sparse_to_triples(a), sparse_to_triples(b)) else {
+        return 0;
+    };
+    let a_triples = coalesce(a_triples);
+    let b_triples = coalesce(b_triples);
 
     // Group B by row for quick lookup
     let mut b_by_row: Vec<Vec<(i64, f64)>> = vec![Vec::new(); num_rows];
@@ -1144,19 +1137,27 @@ pub extern "C" fn nsl_sparse_mul(a_ptr: i64, b_ptr: i64) -> i64 {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Extract (row, col, val) triples from any sparse format.
-fn sparse_to_triples(s: &NslSparseTensor) -> Vec<(i64, i64, f64)> {
+/// Every stored entry of a sparse tensor as a (row, col, value) triple, in
+/// any of the four formats; `None` for an unknown format id. Entries that
+/// share a coordinate stay separate (see [`coalesce`]); a BSR block
+/// contributes its nonzero elements.
+///
+/// CSC and BSR used to yield an empty list, which made `nsl_sparse_add` and
+/// `nsl_sparse_mul` treat such an operand as a matrix of zeros.
+fn sparse_to_triples(s: &NslSparseTensor) -> Option<Vec<(i64, i64, f64)>> {
+    let fmt = SparseFmtId::from_u8(s.format)?;
     let nnz = s.nnz as usize;
-    if nnz == 0 { return Vec::new(); }
-    let vals = unsafe { std::slice::from_raw_parts(s.data as *const f64, nnz) };
+    if nnz == 0 { return Some(Vec::new()); }
 
-    match SparseFmtId::from_u8(s.format) {
-        Some(SparseFmtId::Coo) => {
+    Some(match fmt {
+        SparseFmtId::Coo => {
+            let vals = unsafe { std::slice::from_raw_parts(s.data as *const f64, nnz) };
             let rows = unsafe { std::slice::from_raw_parts(s.indices_0, nnz) };
             let cols = unsafe { std::slice::from_raw_parts(s.indices_1, nnz) };
             (0..nnz).map(|i| (rows[i], cols[i], vals[i])).collect()
         }
-        Some(SparseFmtId::Csr) => {
+        SparseFmtId::Csr => {
+            let vals = unsafe { std::slice::from_raw_parts(s.data as *const f64, nnz) };
             let nrows = s.rows as usize;
             let row_ptr = unsafe { std::slice::from_raw_parts(s.indices_0, nrows + 1) };
             let col_idx = unsafe { std::slice::from_raw_parts(s.indices_1, nnz) };
@@ -1170,8 +1171,68 @@ fn sparse_to_triples(s: &NslSparseTensor) -> Vec<(i64, i64, f64)> {
             }
             triples
         }
-        _ => Vec::new(),
+        SparseFmtId::Csc => {
+            // indices_0 = col_ptr [cols + 1], indices_1 = row index per entry.
+            let vals = unsafe { std::slice::from_raw_parts(s.data as *const f64, nnz) };
+            let ncols = s.cols as usize;
+            let col_ptr = unsafe { std::slice::from_raw_parts(s.indices_0, ncols + 1) };
+            let row_idx = unsafe { std::slice::from_raw_parts(s.indices_1, nnz) };
+            let mut triples = Vec::with_capacity(nnz);
+            for c in 0..ncols {
+                let start = col_ptr[c] as usize;
+                let end = col_ptr[c + 1] as usize;
+                for j in start..end {
+                    triples.push((row_idx[j], c as i64, vals[j]));
+                }
+            }
+            triples
+        }
+        SparseFmtId::Bsr => {
+            // `nnz` counts blocks; each is a dense block_rows x block_cols
+            // tile, the last ones overhanging the matrix edge.
+            let br = s.block_rows as usize;
+            let bc = s.block_cols as usize;
+            if br == 0 || bc == 0 { return None; }
+            let (rows, cols) = (s.rows as usize, s.cols as usize);
+            let nblk_rows = rows.div_ceil(br);
+            let block_size = br * bc;
+            let block_row_ptrs = unsafe { std::slice::from_raw_parts(s.indices_0, nblk_rows + 1) };
+            let block_cols = unsafe { std::slice::from_raw_parts(s.indices_1, nnz) };
+            let block_vals = unsafe { std::slice::from_raw_parts(s.data as *const f64, nnz * block_size) };
+            let mut triples = Vec::new();
+            for blk_r in 0..nblk_rows {
+                let start = block_row_ptrs[blk_r] as usize;
+                let end = block_row_ptrs[blk_r + 1] as usize;
+                for blk_idx in start..end {
+                    let blk_c = block_cols[blk_idx] as usize;
+                    for r in 0..br {
+                        for c in 0..bc {
+                            let (gr, gc) = (blk_r * br + r, blk_c * bc + c);
+                            let v = block_vals[blk_idx * block_size + r * bc + c];
+                            if gr < rows && gc < cols && v != 0.0 {
+                                triples.push((gr as i64, gc as i64, v));
+                            }
+                        }
+                    }
+                }
+            }
+            triples
+        }
+    })
+}
+
+/// Sum the entries that share a coordinate, leaving one triple per (row,
+/// col) in row-major order.
+fn coalesce(mut triples: Vec<(i64, i64, f64)>) -> Vec<(i64, i64, f64)> {
+    triples.sort_by_key(|&(r, c, _)| (r, c));
+    let mut out: Vec<(i64, i64, f64)> = Vec::with_capacity(triples.len());
+    for (r, c, v) in triples {
+        match out.last_mut() {
+            Some(last) if last.0 == r && last.1 == c => last.2 += v,
+            _ => out.push((r, c, v)),
+        }
     }
+    out
 }
 
 /// Build a COO NslSparseTensor from triples. `dtype` is the tag results take
@@ -1524,4 +1585,193 @@ mod tests {
         nsl_sparse_free(s);
         crate::tensor::nsl_tensor_free(d);
     }
+
+    // -----------------------------------------------------------------------
+    // One matrix, four formats, every routine
+    //
+    //   A = [0 5 0  0]      stored with duplicates: (0,1) = 2 and 3,
+    //       [0 0 0 -1]      (2,0) = 4 and -4 (which cancel), (2,2) = 7,
+    //       [0 0 7  0]      (1,3) = -1.
+    //
+    // Every expected value below is worked out by hand from that matrix.
+    // -----------------------------------------------------------------------
+
+    fn dup_coo() -> i64 {
+        let rows = [0i64, 2, 0, 1, 2, 2];
+        let cols = [1i64, 0, 1, 3, 2, 0];
+        let vals = [2.0f64, 4.0, 3.0, -1.0, 7.0, -4.0];
+        nsl_sparse_coo(rows.as_ptr() as i64, cols.as_ptr() as i64, vals.as_ptr() as i64, 3, 4, 6)
+    }
+
+    const A_DENSE: [f64; 12] = [0.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 7.0, 0.0];
+
+    fn dense_f64(shape: &[i64], vals: &[f64]) -> i64 {
+        let ptr = crate::cpu::create_tensor_with_shape_rs_dtype(shape, 0);
+        let t = crate::tensor::NslTensor::from_ptr(ptr);
+        for (i, v) in vals.iter().enumerate() {
+            unsafe { *t.data_f64().add(i) = *v };
+        }
+        ptr
+    }
+
+    fn read_f64(ptr: i64) -> Vec<f64> {
+        assert_ne!(ptr, 0, "the routine returned a null tensor");
+        let t = crate::tensor::NslTensor::from_ptr(ptr);
+        let v = (0..t.len as usize).map(|i| unsafe { *t.data_f64().add(i) }).collect();
+        crate::tensor::nsl_tensor_free(ptr);
+        v
+    }
+
+    /// The matrix in each format: COO as given (duplicates and all), CSR and
+    /// CSC converted from it, BSR built from the dense matrix.
+    fn all_formats() -> Vec<(&'static str, i64)> {
+        let coo = dup_coo();
+        let csr = nsl_sparse_coo_to_csr(coo);
+        let csc = nsl_sparse_coo_to_csc(coo);
+        let dense = dense_f64(&[3, 4], &A_DENSE);
+        let bsr = nsl_sparse_from_dense(dense, SparseFmtId::Bsr as i64, f64::to_bits(1e-12) as i64);
+        crate::tensor::nsl_tensor_free(dense);
+        for (name, p, fmt) in [("csr", csr, 1u8), ("csc", csc, 2), ("bsr", bsr, 3)] {
+            assert_ne!(p, 0, "{name} conversion failed");
+            assert_eq!(unsafe { &*(p as *const NslSparseTensor) }.format, fmt, "{name}");
+        }
+        vec![("coo", coo), ("csr", csr), ("csc", csc), ("bsr", bsr)]
+    }
+
+    fn free_all(formats: Vec<(&'static str, i64)>) {
+        for (_, p) in formats {
+            nsl_sparse_free(p);
+        }
+    }
+
+    /// Duplicates add (2 + 3 = 5, 4 - 4 = 0) in every format. COO used to
+    /// keep the last duplicate (3 and -4), and CSC returned null.
+    #[test]
+    fn to_dense_sums_duplicates_in_every_format() {
+        let formats = all_formats();
+        for (name, p) in &formats {
+            assert_eq!(read_f64(nsl_sparse_to_dense(*p)), A_DENSE, "{name}");
+        }
+        free_all(formats);
+    }
+
+    /// A @ B for B = [[1,2],[3,4],[5,6],[7,8]]:
+    /// row 0 = 5*[3,4], row 1 = -1*[7,8], row 2 = 7*[5,6].
+    #[test]
+    fn spmm_matches_the_hand_product_in_every_format() {
+        let b = dense_f64(&[4, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        let formats = all_formats();
+        for (name, p) in &formats {
+            assert_eq!(
+                read_f64(nsl_sparse_spmm(*p, b)),
+                vec![15.0, 20.0, -7.0, -8.0, 35.0, 42.0],
+                "{name}"
+            );
+        }
+        free_all(formats);
+        crate::tensor::nsl_tensor_free(b);
+    }
+
+    /// A @ [1,2,3,4] = [5*2, -1*4, 7*3].
+    #[test]
+    fn spmv_matches_the_hand_product_in_every_format() {
+        let x = dense_f64(&[4], &[1.0, 2.0, 3.0, 4.0]);
+        let formats = all_formats();
+        for (name, p) in &formats {
+            assert_eq!(read_f64(nsl_sparse_spmv(*p, x)), vec![10.0, -4.0, 21.0], "{name}");
+        }
+        free_all(formats);
+        crate::tensor::nsl_tensor_free(x);
+    }
+
+    /// A + C and A * C with C = [1 0 0 0; 0 0 0 1; 0 0 0 0], for every pair
+    /// of formats. By hand: A + C has 1 at (0,0), keeps 5 at (0,1) and 7 at
+    /// (2,2), and -1 + 1 cancels at (1,3); A * C is -1 at (1,3) alone. With
+    /// a CSC or BSR operand the sum used to be the other operand unchanged
+    /// and the product all zeros.
+    #[test]
+    fn add_and_mul_see_every_format() {
+        let c_dense = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
+        let c_formats = || {
+            let rows = [0i64, 1];
+            let cols = [0i64, 3];
+            let vals = [1.0f64, 1.0];
+            let coo = nsl_sparse_coo(rows.as_ptr() as i64, cols.as_ptr() as i64, vals.as_ptr() as i64, 3, 4, 2);
+            let dense = dense_f64(&[3, 4], &c_dense);
+            let bsr = nsl_sparse_from_dense(dense, SparseFmtId::Bsr as i64, f64::to_bits(1e-12) as i64);
+            crate::tensor::nsl_tensor_free(dense);
+            vec![("coo", coo), ("csr", nsl_sparse_coo_to_csr(coo)), ("csc", nsl_sparse_coo_to_csc(coo)), ("bsr", bsr)]
+        };
+        let want_sum = [1.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 7.0, 0.0];
+        let want_product = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0];
+        let a_formats = all_formats();
+        let c_formats = c_formats();
+        for (a_name, a) in &a_formats {
+            for (c_name, c) in &c_formats {
+                for (x, y, order) in [(*a, *c, "A op C"), (*c, *a, "C op A")] {
+                    let sum = nsl_sparse_add(x, y);
+                    assert_eq!(read_f64(nsl_sparse_to_dense(sum)), want_sum, "{a_name} + {c_name} ({order})");
+                    nsl_sparse_free(sum);
+                    let product = nsl_sparse_mul(x, y);
+                    assert_eq!(
+                        read_f64(nsl_sparse_to_dense(product)),
+                        want_product,
+                        "{a_name} * {c_name} ({order})"
+                    );
+                    nsl_sparse_free(product);
+                }
+            }
+        }
+        free_all(a_formats);
+        free_all(c_formats);
+    }
+
+    /// Duplicates are summed BEFORE a product: with B holding 2 and 3 at one
+    /// coordinate and A holding 10 there, A * B is 10 * 5, not 10 * 3.
+    #[test]
+    fn mul_coalesces_duplicates_first() {
+        let (r, c) = ([0i64, 0], [0i64, 0]);
+        let b_vals = [2.0f64, 3.0];
+        let b = nsl_sparse_coo(r.as_ptr() as i64, c.as_ptr() as i64, b_vals.as_ptr() as i64, 1, 1, 2);
+        let a_vals = [10.0f64];
+        let a = nsl_sparse_coo(r.as_ptr() as i64, c.as_ptr() as i64, a_vals.as_ptr() as i64, 1, 1, 1);
+        for (x, y) in [(a, b), (b, a)] {
+            let p = nsl_sparse_mul(x, y);
+            assert_eq!(read_f64(nsl_sparse_to_dense(p)), vec![50.0]);
+            nsl_sparse_free(p);
+        }
+        nsl_sparse_free(a);
+        nsl_sparse_free(b);
+    }
+
+    /// Under a recording tape the product must reach the dense operand's
+    /// gradient. For loss = sum(A @ B), dL/dB[k, j] is the sum of column k
+    /// of A: 4 - 4 = 0, 2 + 3 = 5, 7 and -1. The sparse kernels record
+    /// nothing, so this gradient used to be all zeros.
+    #[test]
+    fn spmm_under_a_tape_gives_the_dense_operand_its_gradient() {
+        use crate::list::{nsl_list_free, nsl_list_get, nsl_list_new, nsl_list_push};
+        let formats = all_formats();
+        for (name, a) in &formats {
+            let b = dense_f64(&[4, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+            let params = nsl_list_new();
+            nsl_list_push(params, b);
+            crate::autodiff::nsl_tape_start(params);
+            let y = nsl_sparse_spmm(*a, b);
+            let loss = crate::tensor::nsl_tensor_sum(y);
+            let grads = crate::autodiff::nsl_tape_backward(loss, params);
+            crate::autodiff::nsl_tape_stop();
+            let g = nsl_list_get(grads, 0);
+            let gt = crate::tensor::NslTensor::from_ptr(g);
+            let got: Vec<f64> = (0..gt.len as usize).map(|i| gt.read_scalar_as_f64(i)).collect();
+            assert_eq!(got, vec![0.0, 0.0, 5.0, 5.0, 7.0, 7.0, -1.0, -1.0], "{name}");
+            // The forward value is unchanged by the route taken.
+            let yt = crate::tensor::NslTensor::from_ptr(y);
+            let fwd: Vec<f64> = (0..yt.len as usize).map(|i| yt.read_scalar_as_f64(i)).collect();
+            assert_eq!(fwd, vec![15.0, 20.0, -7.0, -8.0, 35.0, 42.0], "{name}");
+            nsl_list_free(params);
+        }
+        free_all(formats);
+    }
 }
+

@@ -17,13 +17,15 @@ use std::path::Path;
 pub struct WeightAwareConfig {
     /// Threshold below which weights are considered "dead" (default: 1e-6)
     pub dead_weight_threshold: f64,
-    /// Sparsity fraction above which sparse kernels are emitted (default: 0.5)
+    /// Near-zero fraction at or above which a 2-D weight is recorded as
+    /// sparse (default: 0.5). A record only: no sparse kernel is emitted.
     pub sparse_threshold: f64,
     /// Enable constant propagation through matmul/add/relu
     pub constant_fold: bool,
     /// Enable dead weight elimination
     pub dead_weight_elim: bool,
-    /// Enable sparsity-aware codegen
+    /// Enable the sparsity analysis and its per-matmul hints. Every matmul
+    /// is the dense one either way.
     pub sparse_codegen: bool,
 }
 
@@ -168,7 +170,8 @@ pub struct SparsityInfo {
     pub near_zero_count: usize,
     /// Fraction of exact zeros
     pub exact_zero_fraction: f64,
-    /// Whether this matrix qualifies for sparse codegen
+    /// Whether this matrix is 2-D and at or above the sparse threshold.
+    /// The name is historical: nothing emits a sparse kernel for it.
     pub use_sparse_kernel: bool,
     /// If sparse: the CSR representation for codegen
     pub csr: Option<CsrLayout>,
@@ -931,14 +934,14 @@ impl<'a> DeadWeightEliminator<'a> {
 // SparsityHint (consumed by codegen)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Hint attached to a matmul operation, consumed by codegen to choose
-/// between dense and sparse kernel emission.
+/// Hint attached to a matmul operation: whether a weight operand is at or
+/// above the sparse threshold. Recorded and read by nothing; the matmul is
+/// dense in both cases.
 #[derive(Debug, Clone)]
 pub enum SparsityHint {
     /// Weight matrix is dense enough for standard matmul kernel.
     Dense,
-    /// Weight matrix is sparse -- annotated for future CSR-based sparse matmul.
-    /// M52a: annotation only. M52b: actual sparse kernel emission.
+    /// Weight matrix is at or above the sparse threshold. Annotation only.
     Sparse {
         /// Weight name in the WeightMap
         weight_name: String,
@@ -1036,15 +1039,17 @@ pub fn print_weight_analysis_report(weight_map: &WeightMap, config: &WeightAware
         let info = temp_entry.analyze_sparsity(config);
         total_near_zero += info.near_zero_count;
 
+        // What the tensor IS, not what is generated for it: every matmul
+        // is the dense kernel. This line used to read "(SPARSE kernel)".
         let kernel_label = if info.use_sparse_kernel {
             sparse_count += 1;
-            "SPARSE"
+            "at or above the sparse threshold"
         } else {
-            "dense"
+            "below the sparse threshold"
         };
 
         nsl_log::nsl_log!(INFO, "weight-aware", 
-            "    {}: {:>5.1}% near-zero ({} kernel)  [shape: {:?}, dtype: {:?}]",
+            "    {}: {:>5.1}% near-zero ({})  [shape: {:?}, dtype: {:?}]",
             name,
             info.near_zero_fraction * 100.0,
             kernel_label,
@@ -1074,7 +1079,7 @@ pub fn print_weight_analysis_report(weight_map: &WeightMap, config: &WeightAware
         }
     );
     nsl_log::nsl_log!(INFO, "weight-aware", 
-        "    Sparse-eligible tensors: {}/{}",
+        "    Tensors at or above the sparse threshold: {}/{} (all matmuls are dense)",
         sparse_count,
         analysis_entries.len()
     );

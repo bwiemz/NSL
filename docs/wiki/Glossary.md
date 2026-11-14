@@ -39,7 +39,7 @@ Research document covering compile-time wiring of teacher and student models so 
 Compile-time pass that fuses RMSNorm + Q/K/V projection (via m16n8k16 MMA) + RoPE rotation + FlashAttention-2 into a single PTX kernel, eliminating intermediate HBM traffic. See [NSL-CSHA-Research.PDF](../research/NSL-CSHA-Research.PDF); design specs in [`docs/superpowers/specs/`](../superpowers/specs/) (search `csha`); implementation in `crates/nsl-codegen/src/csha.rs`.
 
 ### <a id="css"></a>CSS — Compiler-Scheduled Sparsity (proposal only)
-Research proposal for 2:4 and 4:8 structured sparsity as a first-class tensor type. None of it has been built: `Sparse<...>` types parse but cannot be constructed from NSL source, and `@sparse(pattern=...)` has no effect. See [CSS.pdf](../research/CSS.pdf) and its [errata](../research/CSS-errata.md).
+Research proposal for 2:4 and 4:8 structured sparsity as a first-class tensor type. None of it has been built: `Sparse<...>` types parse but cannot be constructed from NSL source, and `@sparse(pattern=...)` is a refused decorator. See [CSS.pdf](../research/CSS.pdf) and its [errata](../research/CSS-errata.md).
 
 ### <a id="fase"></a>FASE — Fused Accumulation-Step Elimination
 Training optimization pass that defers gradient accumulation into a fused per-parameter loop (Deferred mode) or buffers it explicitly (FullBuffer mode), eliminating redundant optimizer-step dispatch. See [`docs/superpowers/specs/`](../superpowers/specs/) (search `fase`); implementation in `crates/nsl-codegen/src/fase.rs`.

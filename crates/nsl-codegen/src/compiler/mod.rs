@@ -489,8 +489,6 @@ pub struct FeatureConfigs {
     pub moe_configs: HashMap<String, crate::moe::MoeInfo>,
     /// M33: Speculative decoding configs — "ModelName.layer_name" → SpeculativeInfo
     pub speculative_configs: HashMap<String, crate::speculative::SpeculativeInfo>,
-    /// M42: Per-model KV compression policies from @kv_compress decorators.
-    pub kv_compress_policies: HashMap<String, Vec<KvCompressPolicy>>,
     /// M44: Compiled grammar FSMs from @grammar decorators and generate() schema= args.
     pub grammar_configs: HashMap<String, GrammarInfo>,
 
@@ -584,7 +582,6 @@ impl FeatureConfigs {
             muon_state_bf16: options.muon.state_bf16,
             moe_configs: HashMap::new(),
             speculative_configs: HashMap::new(),
-            kv_compress_policies: HashMap::new(),
             grammar_configs: HashMap::new(),
             fp8_compute_fns: HashSet::new(),
             fp8_compute_methods: HashSet::new(),
@@ -1129,15 +1126,6 @@ pub struct GrammarInfo {
     pub grammar_source: String, // "json_schema", "bnf", "regex"
 }
 
-/// M42: Codegen-side KV compression config.
-pub struct KvCompressPolicy {
-    pub method: String,
-    pub scheme: u8,
-    pub window: usize,
-    pub sinks: usize,
-    pub budget: usize,
-}
-
 /// Mangle a function name with a module prefix for unique Cranelift symbols.
 /// If prefix is empty, returns the name unchanged.
 pub(crate) fn mangle_name(prefix: &str, name: &str) -> String {
@@ -1513,21 +1501,6 @@ impl<'a> Compiler<'a> {
     pub(crate) fn cuda_sm(&self) -> Option<u32> {
         crate::gpu_target::CompileTarget::resolve(&self.compile_options.target)
             .and_then(crate::gpu_target::CompileTarget::cuda_sm)
-    }
-
-    /// M42: Look up the first KV compression policy for a specific model layer.
-    /// Key format: `"ModelName.layer_name"` (matches collection.rs insertion key).
-    /// Returns `None` when no `@kv_compress` decorator was found for that layer.
-    pub fn kv_compress_for_layer(
-        &self,
-        model_name: &str,
-        layer_name: &str,
-    ) -> Option<&KvCompressPolicy> {
-        let key = format!("{}.{}", model_name, layer_name);
-        self.features
-            .kv_compress_policies
-            .get(&key)
-            .and_then(|policies| policies.first())
     }
 
     /// Allocate a unique function index for Cranelift.

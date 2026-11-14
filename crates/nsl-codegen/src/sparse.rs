@@ -108,6 +108,14 @@ pub struct SparseCostEstimate {
 }
 
 /// Estimates sparse operation costs for different formats on a given GPU.
+///
+/// The byte counts are those of the arrays the runtime's GPU kernels are
+/// handed (`gpu_csr_spmm_f32`, `gpu_coo_spmm_f32`, `gpu_bsr_spmm_f32` in
+/// nsl-runtime): f32 values throughout, 32-bit indices for CSR and BSR,
+/// 64-bit indices for COO. They are not the sizes of the runtime's host
+/// storage, which keeps 64-bit indices and f64 values in every format.
+///
+/// Nothing calls this model; no format is selected from it.
 pub struct SparseCostModel<'a> {
     pub gpu: &'a GpuSpec,
 }
@@ -128,8 +136,10 @@ impl<'a> SparseCostModel<'a> {
         let (flops, memory_bytes) = match format {
             SparseFormat::Coo => {
                 // COO SpMV: 2 * nnz FLOPs (mul + add per nonzero)
-                // Memory: nnz * 12 bytes (row_idx:4 + col_idx:4 + value:4)
-                (2.0 * nnz as f64, nnz * 12)
+                // Memory: nnz * 20 bytes (row_idx:8 + col_idx:8 + value:4).
+                // The COO kernels take 64-bit indices; this was 12, as if
+                // they were 32-bit like CSR's.
+                (2.0 * nnz as f64, nnz * 20)
             }
             SparseFormat::Csr => {
                 // CSR SpMV: 2 * nnz FLOPs
@@ -726,6 +736,20 @@ mod tests {
         assert!(est.flops > 0.0, "CSR FLOPs should be positive");
         assert!(est.memory_bytes > 0, "CSR memory should be positive");
         assert!(est.estimated_time_us > 0.0, "CSR time should be positive");
+    }
+
+    /// The byte counts, against the widths the GPU kernels are given:
+    /// CSR (m + 1) u32 row pointers + nnz (u32 + f32); COO nnz
+    /// (i64 + i64 + f32); dense m * n f32.
+    #[test]
+    fn memory_estimates_use_the_widths_the_gpu_kernels_take() {
+        let gpu = crate::gpu_specs::find_gpu("H100-SXM").unwrap();
+        let model = SparseCostModel::new(gpu);
+        let (m, n, nnz) = (1000, 2000, 5000);
+        assert_eq!(model.estimate(SparseFormat::Csr, m, n, nnz).memory_bytes, 1001 * 4 + 5000 * 8);
+        assert_eq!(model.estimate(SparseFormat::Csc, m, n, nnz).memory_bytes, 2001 * 4 + 5000 * 8);
+        assert_eq!(model.estimate(SparseFormat::Coo, m, n, nnz).memory_bytes, 5000 * 20);
+        assert_eq!(model.estimate(SparseFormat::Dense, m, n, nnz).memory_bytes, 1000 * 2000 * 4);
     }
 
     #[test]

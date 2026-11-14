@@ -1,7 +1,6 @@
 //! The `quant` block lowering: `compile_quant_block` (the per-model
-//! quantisation call sequence — dtype and granularity selection, the
-//! calibration-driven AWQ/GPTQ paths, and the wire-format handoff to the
-//! runtime) and `discover_awq_projections` (the forward-method walk that
+//! quantisation call sequence — dtype and granularity selection and the
+//! walk over the model's fields and sub-models) and `discover_awq_projections` (the forward-method walk that
 //! enumerates the linear-projection call sites AWQ calibration needs;
 //! `lib.rs` also calls it when it synthesises the calibration harness).
 //!
@@ -12,15 +11,24 @@
 use cranelift_codegen::ir::types as cl_types;
 use cranelift_codegen::ir::{InstBuilder, MemFlagsData};
 use cranelift_frontend::FunctionBuilder;
-use cranelift_module::Module;
 use nsl_ast::block::{QuantDtype, QuantGranularity};
 
 use crate::compiler::Compiler;
-use crate::context::FuncState;
+use crate::context::{FieldKind, FuncState};
 use crate::error::CodegenError;
 
 use crate::stmt::glob_match;
 use cranelift_codegen::ir::Value;
+
+/// The runtime quantizer's arguments, as constants of the function being
+/// built: the same four values go to every tensor field of a quant block.
+struct QuantCodes {
+    dtype: Value,
+    granularity: Value,
+    axis: Value,
+    group_size: Value,
+}
+
 impl Compiler<'_> {
     // ── Quant block codegen ──────────────────────────────────────────
 
@@ -42,30 +50,28 @@ impl Compiler<'_> {
             builder.use_var(*var)
         };
 
-        // 2. Resolve model type name using the same strategy as train blocks:
-        //    scan the type_map for a Model type with a known struct layout.
-        let model_type_name = {
-            let mut found_name = None;
-            for (_node_id, ty) in self.type_map.iter() {
-                match ty {
-                    nsl_semantic::types::Type::Model { name, .. } => {
-                        let n = self.resolve_sym(*name).to_string();
-                        if self.types.struct_layouts.contains_key(&n) {
-                            found_name = Some(n);
-                            break;
-                        }
+        // 2. The model type is the SOURCE VARIABLE's type, resolved the way a
+        //    train block resolves its model. This used to scan the whole type
+        //    map for any model with a layout and take the first hit; the map
+        //    is a hash map, so a program with two model types (a model and
+        //    its sub-model) got one or the other from run to run, and the
+        //    wrong one walked the outer model's memory with the inner model's
+        //    layout.
+        let model_type_name = self
+            .models
+            .model_var_types
+            .get(&source_sym)
+            .cloned()
+            .or_else(|| {
+                state.variable_types.get(&source_sym).and_then(|ty| match ty {
+                    nsl_semantic::types::Type::Model { name, .. }
+                    | nsl_semantic::types::Type::Struct { name, .. } => {
+                        Some(self.resolve_sym(*name).to_string())
                     }
-                    nsl_semantic::types::Type::Struct { name, .. } => {
-                        let n = self.resolve_sym(*name).to_string();
-                        if self.types.struct_layouts.contains_key(&n) {
-                            found_name = Some(n);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            found_name.unwrap_or_else(|| self.resolve_sym(source_sym).to_string())
-        };
+                    _ => None,
+                })
+            })
+            .unwrap_or_else(|| self.resolve_sym(source_sym).to_string());
 
         let layout = self
             .types
@@ -74,18 +80,26 @@ impl Compiler<'_> {
             .cloned()
             .ok_or_else(|| {
                 CodegenError::new(format!(
-                    "no struct layout found for model '{}' in quant block",
+                    "quant block: '{}' is not a model whose layout is known (resolved type '{}')",
+                    self.resolve_sym(source_sym),
                     model_type_name
                 ))
             })?;
 
-        // 3. Compute dtype/granularity integer codes for the runtime call
+        // 3. Compute dtype/granularity integer codes for the runtime call.
+        //    The checker refuses awq4/gptq4/gptq8 (`quant_requests.rs`); a
+        //    caller that skipped the checker gets the same answer here
+        //    instead of a dtype code the runtime quantizer aborts on.
         let dtype_code: i64 = match quant.default_dtype {
             Some(QuantDtype::Int4) => 1,
-            Some(QuantDtype::Awq4) => 2,
-            Some(QuantDtype::Gptq4) => 3,
-            Some(QuantDtype::Gptq8) => 4,
             Some(QuantDtype::Int8) | None => 0,
+            Some(QuantDtype::Awq4) | Some(QuantDtype::Gptq4) | Some(QuantDtype::Gptq8) => {
+                return Err(CodegenError::new(
+                    "quant blocks implement only `int8` and `int4`: `awq4`, `gptq4` and `gptq8` \
+                     are not implemented"
+                        .to_string(),
+                ));
+            }
         };
         let (gran_code, axis_val, gs_val): (i64, i64, i64) = match &quant.default_granularity {
             Some(QuantGranularity::PerChannel(a)) => (1, *a, 0),
@@ -93,190 +107,206 @@ impl Compiler<'_> {
             Some(QuantGranularity::PerTensor) | None => (0, 0, 0),
         };
 
-        let dtype_v = builder.ins().iconst(cl_types::I64, dtype_code);
-        let gran_v = builder.ins().iconst(cl_types::I64, gran_code);
-        let axis_v = builder.ins().iconst(cl_types::I64, axis_val);
-        let gs_v = builder.ins().iconst(cl_types::I64, gs_val);
-
-        // 4. Allocate a new struct with the same layout as the source model
-        let alloc_size = builder
-            .ins()
-            .iconst(cl_types::I64, layout.total_size.max(8) as i64);
-        let new_ptr = self.compile_call_by_name(builder, "nsl_alloc", &[alloc_size])?;
-
-        // 4b. If this is an AWQ quant block and a calibration sidecar is present,
-        //     decode the AWQ activation scales once.  We'll use them per-field below.
-        //
-        //     Key: "awq_activation_scales" in sidecar.hooks (binary blob).
-        //     Projection path format: "{model_type_name}.{field_name}" — same
-        //     cache key as Task 8's discovery pass.
-        //
-        //     Hard error when sidecar present but projection missing:
-        //     silent fallback to uncalibrated is a correctness trap.
-        let is_awq = matches!(quant.default_dtype, Some(QuantDtype::Awq4));
-        let awq_scales_opt: Option<nsl_abi::wire::awq_scales::AwqScales> = if is_awq {
-            match self.compile_options.calibration.sidecar.as_ref() {
-                None => None,
-                Some(sidecar) => {
-                    match sidecar.hooks.get(nsl_abi::wire::awq_scales::AWQ_SIDECAR_KEY) {
-                        None => None, // Sidecar present but no AWQ hook blob → treat as uncalibrated.
-                        Some(blob) => {
-                            match nsl_abi::wire::awq_scales::AwqScales::from_blob(blob) {
-                                Ok(scales) => Some(scales),
-                                Err(e) => {
-                                    // Blob present but malformed → hard error.
-                                    return Err(CodegenError::new(format!(
-                                        "AWQ calibration sidecar blob is malformed: {e}"
-                                    )));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-            None
+        let codes = QuantCodes {
+            dtype: builder.ins().iconst(cl_types::I64, dtype_code),
+            granularity: builder.ins().iconst(cl_types::I64, gran_code),
+            axis: builder.ins().iconst(cl_types::I64, axis_val),
+            group_size: builder.ins().iconst(cl_types::I64, gs_val),
         };
 
-        // AWQ calibration alpha (matches awq_quantize_with_scales default).
-        let awq_alpha: f64 = 0.5;
+        // 4. Build the quantized copy, descending into sub-models.
+        let new_ptr = self.emit_quantized_model_copy(
+            builder,
+            &model_type_name,
+            source_val,
+            "",
+            &quant.exclude,
+            &codes,
+            0,
+        )?;
 
-        // 5. For each field: quantize→dequantize (or clone if excluded)
-        for field in &layout.fields {
-            let is_excluded = quant.exclude.iter().any(|pat| glob_match(pat, &field.name));
-            let src_val = builder.ins().load(
-                field.cl_type,
-                MemFlagsData::trusted(),
-                source_val,
-                field.offset as i32,
-            );
-
-            if is_excluded {
-                // Copy as-is via clone (bumps refcount internally)
-                let cloned = self.compile_call_by_name(builder, "nsl_tensor_clone", &[src_val])?;
-                builder
-                    .ins()
-                    .store(MemFlagsData::trusted(), cloned, new_ptr, field.offset as i32);
-            } else {
-                // For AWQ with a calibration sidecar, pre-scale the weight tensor using
-                // the per-input-channel activation statistics before quantizing.
-                // This embeds the scale data as compile-time constants in the object file
-                // and calls nsl_awq_pre_scale_weight at runtime to apply them.
-                let weight_for_quantize: Value = if is_awq {
-                    match awq_scales_opt.as_ref() {
-                        None => {
-                            // No sidecar → uncalibrated, pass weight through unchanged.
-                            src_val
-                        }
-                        Some(scales_map) => {
-                            // Sidecar present — projection MUST have scales.
-                            let projection_path =
-                                format!("{}.{}", model_type_name, field.name);
-                            let field_scales = scales_map
-                                .by_projection
-                                .get(&projection_path)
-                                .ok_or_else(|| {
-                                    CodegenError::missing_scales(&projection_path)
-                                })?;
-
-                            // Embed scale data as a compile-time constant in .rodata.
-                            let data_label = format!(
-                                "__nsl_awq_scales_{}_{}",
-                                model_type_name, field.name
-                            );
-                            let scale_bytes: Vec<u8> = field_scales
-                                .iter()
-                                .flat_map(|v: &f32| v.to_le_bytes())
-                                .collect();
-                            let scale_data_id = self
-                                .module
-                                .declare_data(
-                                    &data_label,
-                                    cranelift_module::Linkage::Local,
-                                    false,
-                                    false,
-                                )
-                                .map_err(|e| {
-                                    CodegenError::new(format!(
-                                        "failed to declare AWQ scale data for \
-                                         '{projection_path}': {e}"
-                                    ))
-                                })?;
-                            let mut data_desc = cranelift_module::DataDescription::new();
-                            data_desc.define(scale_bytes.into_boxed_slice());
-                            self.module
-                                .define_data(scale_data_id, &data_desc)
-                                .map_err(|e| {
-                                    CodegenError::new(format!(
-                                        "failed to define AWQ scale data for \
-                                         '{projection_path}': {e}"
-                                    ))
-                                })?;
-
-                            // Get a pointer to the scale data in this function.
-                            let scale_gv = self
-                                .module
-                                .declare_data_in_func(scale_data_id, builder.func);
-                            let scales_ptr =
-                                builder.ins().symbol_value(cl_types::I64, scale_gv);
-                            let scales_len = builder
-                                .ins()
-                                .iconst(cl_types::I64, field_scales.len() as i64);
-                            let alpha_v = builder.ins().f64const(awq_alpha);
-
-                            // Apply calibration scaling: returns a new NslTensor.
-                            self.compile_call_by_name(
-                                builder,
-                                "nsl_awq_pre_scale_weight",
-                                &[src_val, scales_ptr, scales_len, alpha_v],
-                            )?
-                        }
-                    }
-                } else {
-                    src_val
-                };
-
-                // Quantize then immediately dequantize — validates the roundtrip and
-                // shows quantization effects (precision loss) while storing a regular
-                // NslTensor that the original forward method can consume directly.
-                let qt = self.compile_call_by_name(
-                    builder,
-                    "nsl_qtensor_quantize",
-                    &[weight_for_quantize, dtype_v, gran_v, axis_v, gs_v],
-                )?;
-                let deq = self.compile_call_by_name(builder, "nsl_qtensor_dequantize", &[qt])?;
-                // Release the intermediate QuantizedTensor (refcount-aware)
-                self.compile_call_by_name(builder, "nsl_qtensor_release", &[qt])?;
-                // If we pre-scaled the weight, release the intermediate scaled tensor too.
-                if is_awq && awq_scales_opt.is_some() {
-                    self.compile_call_by_name(
-                        builder,
-                        "nsl_tensor_release",
-                        &[weight_for_quantize],
-                    )?;
-                }
-                builder
-                    .ins()
-                    .store(MemFlagsData::trusted(), deq, new_ptr, field.offset as i32);
-            }
-        }
-
-        // 6. Register the quantized model with the same struct layout and methods
+        // 5. Register the quantized model with the same struct layout and methods
         //    so that forward dispatch works identically to the source model.
         let quant_name = self.resolve_sym(quant.name).to_string();
         if !self.types.struct_layouts.contains_key(&quant_name) {
             self.types.struct_layouts.insert(quant_name.clone(), layout);
         }
+        if let Some(field_types) = self.models.model_field_types.get(&model_type_name).cloned() {
+            self.models
+                .model_field_types
+                .entry(quant_name.clone())
+                .or_insert(field_types);
+        }
         if let Some(methods) = self.models.model_methods.get(&model_type_name).cloned() {
             self.models.model_methods.insert(quant_name, methods);
         }
 
-        // 7. Bind the new struct pointer as the output variable
+        // 6. Bind the new struct pointer as the output variable
         let var = builder.declare_var(cl_types::I64);
         builder.def_var(var, new_ptr);
         state.variables.insert(quant.name, (var, cl_types::I64));
 
         Ok(())
+    }
+
+    /// Emit a copy of the model at `src_ptr` (of type `model_name`) in which
+    /// every tensor field has been quantized and dequantized, and return the
+    /// pointer to the copy.
+    ///
+    /// The walk follows the layout's field kinds. It used to treat every
+    /// field as a tensor: a sub-model's pointer went to the quantizer as a
+    /// tensor handle ("invalid tensor handle"), and an `int` field did too.
+    ///
+    /// - A tensor or buffer field is quantized, unless an `exclude:` glob
+    ///   matches its dotted path from the block's source model (`w`,
+    ///   `inner.w`, `blocks.0.w`) or its own name; then it is cloned. The
+    ///   result is moved back to the device the source tensor is on.
+    /// - A sub-model field is copied by recursion, and each element of a
+    ///   `[Model; N]` field likewise. The sub-model's methods are compiled
+    ///   against its own type, so they run on the copy unchanged.
+    /// - Every other slot (an `int`, a `str`, the adapter side-table) is
+    ///   copied as it is.
+    /// - A nested field that is neither (a struct, a list of models) is a
+    ///   compile error naming the field: nothing here knows its layout.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_quantized_model_copy(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        model_name: &str,
+        src_ptr: Value,
+        path_prefix: &str,
+        exclude: &[String],
+        codes: &QuantCodes,
+        depth: usize,
+    ) -> Result<Value, CodegenError> {
+        // A model cannot contain itself by value, so this only guards a
+        // malformed layout table from recursing without end.
+        if depth > 64 {
+            return Err(CodegenError::new(format!(
+                "quant block: model '{model_name}' nests more than 64 levels deep"
+            )));
+        }
+        let layout = self.types.struct_layouts.get(model_name).cloned().ok_or_else(|| {
+            CodegenError::new(format!("quant block: no struct layout for model '{model_name}'"))
+        })?;
+        let field_types = self.models.model_field_types.get(model_name).cloned();
+        let flags = MemFlagsData::trusted();
+
+        let alloc_size = builder
+            .ins()
+            .iconst(cl_types::I64, layout.total_size.max(8) as i64);
+        let new_ptr = self.compile_call_by_name(builder, "nsl_alloc", &[alloc_size])?;
+
+        // Start from a slot-for-slot copy, so that whatever the loop below
+        // does not rebuild (scalars, strings, the adapter side-table slot)
+        // holds the source's value rather than uninitialised memory.
+        let whole_slots = layout.total_size / 8;
+        for slot in 0..whole_slots {
+            let off = (slot * 8) as i32;
+            let v = builder.ins().load(cl_types::I64, flags, src_ptr, off);
+            builder.ins().store(flags, v, new_ptr, off);
+        }
+        // A layout that ends in a field narrower than a slot (a `bool`).
+        for byte in (whole_slots * 8)..layout.total_size {
+            let v = builder.ins().load(cl_types::I8, flags, src_ptr, byte as i32);
+            builder.ins().store(flags, v, new_ptr, byte as i32);
+        }
+
+        for field in &layout.fields {
+            let path = if path_prefix.is_empty() {
+                field.name.clone()
+            } else {
+                format!("{path_prefix}.{}", field.name)
+            };
+            match field.kind {
+                FieldKind::Scalar => {}
+                FieldKind::Tensor | FieldKind::Buffer => {
+                    let src_val = builder.ins().load(field.cl_type, flags, src_ptr, field.offset as i32);
+                    let is_excluded = exclude
+                        .iter()
+                        .any(|pat| glob_match(pat, &path) || glob_match(pat, &field.name));
+                    let out = if is_excluded {
+                        // Copy as-is via clone (bumps refcount internally)
+                        self.compile_call_by_name(builder, "nsl_tensor_clone", &[src_val])?
+                    } else {
+                        // Quantize then immediately dequantize: the copy holds
+                        // a regular tensor carrying the quantization error,
+                        // which the model's own methods consume directly.
+                        let qt = self.compile_call_by_name(
+                            builder,
+                            "nsl_qtensor_quantize",
+                            &[src_val, codes.dtype, codes.granularity, codes.axis, codes.group_size],
+                        )?;
+                        let deq = self.compile_call_by_name(builder, "nsl_qtensor_dequantize", &[qt])?;
+                        self.compile_call_by_name(builder, "nsl_qtensor_release", &[qt])?;
+                        // The quantizer works on the host. Put the result
+                        // where the source lives, or a model moved to a GPU
+                        // would get a host weight beside device activations.
+                        let placed =
+                            self.compile_call_by_name(builder, "nsl_tensor_to_device_like", &[deq, src_val])?;
+                        self.compile_call_by_name(builder, "nsl_tensor_free", &[deq])?;
+                        placed
+                    };
+                    builder.ins().store(flags, out, new_ptr, field.offset as i32);
+                }
+                FieldKind::Nested => {
+                    let sub_type = field_types.as_ref().and_then(|ft| ft.get(&field.name).cloned());
+                    let unsupported = |what: &str| {
+                        CodegenError::new(format!(
+                            "quant block: field '{path}' of model '{model_name}' is {what}; a quant block \
+                             can copy tensor fields, sub-model fields and fixed-size model arrays only"
+                        ))
+                    };
+                    let Some(sub_type) = sub_type else {
+                        return Err(unsupported("a nested value whose type is not recorded"));
+                    };
+                    if let Some(inner) = sub_type.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+                        // `[Model; N]`: N model pointers stored inline.
+                        let mut parts = inner.split(';');
+                        let elem_type = parts.next().unwrap_or("").trim().to_string();
+                        let count = parts.next().and_then(|c| c.trim().parse::<usize>().ok());
+                        let Some(count) = count else {
+                            return Err(unsupported(&format!("an array `{sub_type}` whose length is not a literal")));
+                        };
+                        if !self.types.struct_layouts.contains_key(&elem_type) {
+                            return Err(unsupported(&format!("an array of `{elem_type}`, which is not a model")));
+                        }
+                        for i in 0..count {
+                            let off = (field.offset + i * 8) as i32;
+                            let elem_ptr = builder.ins().load(cl_types::I64, flags, src_ptr, off);
+                            let elem_copy = self.emit_quantized_model_copy(
+                                builder,
+                                &elem_type,
+                                elem_ptr,
+                                &format!("{path}.{i}"),
+                                exclude,
+                                codes,
+                                depth + 1,
+                            )?;
+                            builder.ins().store(flags, elem_copy, new_ptr, off);
+                        }
+                    } else if self.types.struct_layouts.contains_key(&sub_type) {
+                        let sub_ptr = builder.ins().load(cl_types::I64, flags, src_ptr, field.offset as i32);
+                        let sub_copy = self.emit_quantized_model_copy(
+                            builder,
+                            &sub_type,
+                            sub_ptr,
+                            &path,
+                            exclude,
+                            codes,
+                            depth + 1,
+                        )?;
+                        builder.ins().store(flags, sub_copy, new_ptr, field.offset as i32);
+                    } else if !self.types.enum_defs.contains_key(&sub_type) {
+                        // (An enum value is a plain integer; the slot copy
+                        // above already carried it over.)
+                        return Err(unsupported(&format!("a `{sub_type}`")));
+                    }
+                }
+            }
+        }
+
+        Ok(new_ptr)
     }
 
     /// Walk the compiled model's `quant { ... }` blocks and produce the

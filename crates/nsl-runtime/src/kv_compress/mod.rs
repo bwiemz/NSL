@@ -1,10 +1,14 @@
 // crates/nsl-runtime/src/kv_compress/mod.rs
-//! M42: KV-cache compression and eviction.
+//! M42: KV-cache compression and eviction routines.
 //!
-//! Three strategies that compose:
-//! - Quantized KV storage (INT8/INT4/FP8) — reduces bytes per element
-//! - Sliding window with attention sinks — caps token count
-//! - H2O (Heavy Hitter Oracle) — attention-score-based eviction
+//! Library code with FFI entry points and unit tests. The paged KV cache
+//! does not call any of it: K and V are stored as written, and the
+//! `@kv_compress` decorator is refused by the checker.
+//!
+//! - Quantizers for one K or V block (INT8 per head or per token, INT4 per
+//!   group, FP8) and their inverses
+//! - Sliding window with attention sinks — which blocks fall out of a window
+//! - H2O (Heavy Hitter Oracle) — attention-score-based block eviction
 
 pub mod quantize;
 pub mod sliding_window;
@@ -30,7 +34,9 @@ pub enum KvQuantScheme {
 }
 
 impl KvQuantScheme {
-    /// Bytes per element for this scheme.
+    /// Payload bytes per element for this scheme. The per-block metadata
+    /// (`KvBlockQuantMeta`, 1,032 bytes for the INT8 and INT4 schemes) is
+    /// not included; `quantize::block_total_bytes` counts it.
     pub fn bytes_per_element(&self) -> f64 {
         match self {
             KvQuantScheme::None => 2.0,      // FP16

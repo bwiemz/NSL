@@ -655,7 +655,9 @@ pub extern "C" fn nsl_fp8_update_calibration(
 /// MXFP8 block size: 32 contiguous elements per scale factor.
 pub const MXFP8_BLOCK_SIZE: usize = 32;
 
-/// NVFP4 block size: 256 elements per scale factor (16x16).
+/// Default block size of this module's block-scaled FP4 routine
+/// ([`quantize_nvfp4`]): 256 elements per scale. This is not the block size
+/// of NVIDIA's NVFP4 data format, which scales 16-element blocks.
 pub const NVFP4_BLOCK_SIZE: usize = 256;
 
 /// FP4 E2M1 max representable value.
@@ -822,7 +824,16 @@ fn move_to_original_device(host_ptr: i64, orig_device: u8) -> i64 {
 }
 
 // ===========================================================================
-// NVFP4: 4-bit E2M1 with Hadamard preprocessing (Blackwell)
+// Block-scaled FP4 (E2M1) fake quantization with an optional Hadamard rotation
+//
+// What this is, and is not. Each block of `block_size` elements is scaled
+// by its largest magnitude and rounded to the E2M1 grid; the result is kept
+// as f32 values, with f32 scales of any magnitude. It carries the name
+// NVFP4 but is not that data format (16-element blocks, an 8-bit scale per
+// block, a second scale per tensor), and nothing is packed to 4 bits. The
+// Hadamard option rotates the whole flattened tensor, so it needs a
+// power-of-two element count. Nothing in the compiler calls it:
+// `@fp4_compute` is not wired to code generation.
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
@@ -884,35 +895,69 @@ fn quantize_fp4_e2m1(value: f32, scale: f32) -> f32 {
     sign * quantized * scale
 }
 
-/// Result of NVFP4 quantization.
+/// Result of [`quantize_nvfp4`].
 pub struct NvFp4Quantized {
-    /// Quantized FP4 values (simulated as f32 with E2M1 precision loss).
+    /// The rounded values, as f32. When `hadamard_applied` is set these are
+    /// in the ROTATED basis, not the tensor's own: [`dequantize_nvfp4`]
+    /// turns them back.
     pub data: Vec<f32>,
-    /// Scale factors, one per block of NVFP4_BLOCK_SIZE elements.
+    /// Scale factors, one per block.
     pub block_scales: Vec<f32>,
     /// Number of elements.
     pub len: usize,
-    /// Whether Hadamard preprocessing was applied.
+    /// Whether `data` is in the Hadamard-rotated basis.
     pub hadamard_applied: bool,
 }
 
-/// Quantize a tensor using NVFP4 (E2M1) with optional Hadamard preprocessing.
+/// Why a block-scaled FP4 request cannot be carried out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NvFp4Error {
+    /// The Hadamard rotation is defined for power-of-two lengths only.
+    HadamardLength(usize),
+    /// `block_size` is zero.
+    ZeroBlockSize,
+}
+
+impl std::fmt::Display for NvFp4Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HadamardLength(n) => write!(
+                f,
+                "the Hadamard rotation needs a power-of-two element count of at least 2 (the tensor has {n} elements)"
+            ),
+            Self::ZeroBlockSize => write!(f, "the block size must be positive"),
+        }
+    }
+}
+
+impl std::error::Error for NvFp4Error {}
+
+/// Round `data` to the E2M1 grid in blocks of `block_size`, each scaled by
+/// its largest magnitude, optionally in a Hadamard-rotated basis.
 ///
 /// Pipeline:
-/// 1. Apply Hadamard transform (if enabled) — smears outliers across dimensions
-/// 2. Compute per-block scale factors (blocks of NVFP4_BLOCK_SIZE)
-/// 3. Quantize each element to E2M1
-pub fn quantize_nvfp4(data: &[f32], block_size: usize, apply_hadamard: bool) -> NvFp4Quantized {
+/// 1. Apply the Hadamard transform to the flattened data (if requested), to
+///    spread an outlier over every element.
+/// 2. Compute one scale per block.
+/// 3. Round each element to the E2M1 grid.
+///
+/// A rotation requested for a length that is not a power of two is an
+/// error. It used to be skipped without a word, so the caller got plain
+/// block rounding while believing the rotation had run.
+pub fn quantize_nvfp4(data: &[f32], block_size: usize, apply_hadamard: bool) -> Result<NvFp4Quantized, NvFp4Error> {
     let n = data.len();
+    if block_size == 0 {
+        return Err(NvFp4Error::ZeroBlockSize);
+    }
     let mut working = data.to_vec();
 
     // Step 1: Hadamard preprocessing (optional)
-    let hadamard_applied = if apply_hadamard && n.is_power_of_two() && n >= 2 {
+    if apply_hadamard {
+        if !n.is_power_of_two() || n < 2 {
+            return Err(NvFp4Error::HadamardLength(n));
+        }
         fast_hadamard_transform(&mut working);
-        true
-    } else {
-        false
-    };
+    }
 
     // Step 2: Per-block quantization
     let num_blocks = n.div_ceil(block_size);
@@ -933,27 +978,38 @@ pub fn quantize_nvfp4(data: &[f32], block_size: usize, apply_hadamard: bool) -> 
         }
     }
 
-    NvFp4Quantized { data: quantized, block_scales, len: n, hadamard_applied }
+    Ok(NvFp4Quantized { data: quantized, block_scales, len: n, hadamard_applied: apply_hadamard })
 }
 
-/// Dequantize NVFP4 data back to f32.
-/// If Hadamard was applied during quantization, applies inverse Hadamard.
+/// The values a [`NvFp4Quantized`] stands for, in the tensor's own basis:
+/// the rounded data, rotated back if it was rotated.
 pub fn dequantize_nvfp4(quantized: &NvFp4Quantized) -> Vec<f32> {
     let mut result = quantized.data.clone();
-    if quantized.hadamard_applied && result.len().is_power_of_two() {
+    if quantized.hadamard_applied {
         inverse_hadamard_transform(&mut result);
     }
     result
 }
 
-/// FFI: Quantize tensor with NVFP4 (E2M1) and optional Hadamard preprocessing.
+/// FFI: the block-scaled FP4 reconstruction of a tensor, as an f32 tensor
+/// of the same shape on the same device.
+///
+/// The result is always in the tensor's own basis. With `apply_hadamard`
+/// set, the rounding happens in the rotated basis and the result is rotated
+/// back before it is returned. It used to be returned un-rotated, in the
+/// original shape, with nothing to say so: a tensor of transform
+/// coefficients standing where the weights were (relative error 1.4 on a
+/// test vector whose reconstruction error is 0.12).
+///
+/// Fatal, with a message, when the rotation is requested for an element
+/// count that is not a power of two, or the block size is not positive.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_nvfp4_quantize(tensor_ptr: i64, block_size: i64, apply_hadamard: i64) -> i64 {
     let orig_device = NslTensor::from_ptr(tensor_ptr).device;
     let (src_ptr, staged) = stage_for_host_read(tensor_ptr, "nsl_nvfp4_quantize");
     let t = NslTensor::from_ptr(src_ptr);
     let len = t.len as usize;
-    let bs = block_size as usize;
+    let bs = usize::try_from(block_size).unwrap_or(0);
 
     let src: Vec<f32> = if t.dtype == 0 {
         unsafe { std::slice::from_raw_parts(t.data as *const f64, len) }
@@ -962,10 +1018,13 @@ pub extern "C" fn nsl_nvfp4_quantize(tensor_ptr: i64, block_size: i64, apply_had
         unsafe { std::slice::from_raw_parts(t.data as *const f32, len) }.to_vec()
     };
 
-    let result = quantize_nvfp4(&src, bs, apply_hadamard != 0);
+    let result = match quantize_nvfp4(&src, bs, apply_hadamard != 0) {
+        Ok(q) => dequantize_nvfp4(&q),
+        Err(e) => crate::fatal::die(crate::fatal::Fatal::Unsupported, &format!("nsl_nvfp4_quantize: {e}")),
+    };
 
     let out_data = checked_alloc(len * std::mem::size_of::<f32>()) as *mut f32;
-    for (i, &v) in result.data.iter().enumerate() {
+    for (i, &v) in result.iter().enumerate() {
         unsafe { *out_data.add(i) = v };
     }
 
@@ -1545,26 +1604,108 @@ mod tests {
     #[test]
     fn test_nvfp4_quantize_without_hadamard() {
         let data = vec![1.0f32, 2.0, 3.0, 4.0];
-        let result = quantize_nvfp4(&data, 4, false);
+        let result = quantize_nvfp4(&data, 4, false).expect("plain block rounding");
 
         assert_eq!(result.len, 4);
         assert!(!result.hadamard_applied);
-        assert_eq!(result.block_scales.len(), 1); // 4/4 = 1 block
+        assert_eq!(result.block_scales, vec![4.0 / 6.0]); // one block, abs-max 4
+        // 1.5, 3, 4.5, 6 in units of the scale: 1.5 and 3 and 6 are on the
+        // grid; 4.5 is not and rounds to 4.
+        let s = 4.0f32 / 6.0;
+        assert_eq!(result.data, vec![1.5 * s, 3.0 * s, 4.0 * s, 6.0 * s]);
     }
 
+    /// [1, 2, 3, 4] rotates to [5, -1, -2, 0] exactly; with scale 5/6 the
+    /// codes are 6, -1 (from -1.2) and -2 (from -2.4), i.e. [5, -5/6, -5/3, 0],
+    /// which rotates back to [1.25, 2.083.., 2.916.., 3.75].
     #[test]
     fn test_nvfp4_quantize_with_hadamard() {
         let data = vec![1.0f32, 2.0, 3.0, 4.0];
-        let result = quantize_nvfp4(&data, 4, true);
-
+        let result = quantize_nvfp4(&data, 4, true).expect("length 4 is a power of two");
         assert!(result.hadamard_applied);
 
-        // Dequantize should approximately recover original
-        let recovered = dequantize_nvfp4(&result);
-        for (orig, rec) in data.iter().zip(recovered.iter()) {
-            let err = (orig - rec).abs();
-            assert!(err < 2.0, "NVFP4 roundtrip error too large: {orig} → {rec} (err={err})");
+        let want_rotated = [5.0f32, -5.0 / 6.0, -5.0 / 3.0, 0.0];
+        for (got, want) in result.data.iter().zip(want_rotated) {
+            assert!((got - want).abs() < 1e-6, "rotated-basis code {got}, by hand {want}");
         }
+        let want = [1.25f32, 25.0 / 12.0, 35.0 / 12.0, 3.75];
+        for (got, want) in dequantize_nvfp4(&result).iter().zip(want) {
+            assert!((got - want).abs() < 1e-6, "reconstruction {got}, by hand {want}");
+        }
+    }
+
+    /// The rotation is refused for a length it is not defined for. It used
+    /// to be skipped, and the caller could not tell from the FFI's result.
+    #[test]
+    fn the_hadamard_rotation_is_refused_for_a_length_that_is_not_a_power_of_two() {
+        for n in [0usize, 1, 3, 6, 12, 1000] {
+            let data = vec![1.0f32; n];
+            assert_eq!(
+                quantize_nvfp4(&data, 4, true).err(),
+                Some(NvFp4Error::HadamardLength(n)),
+                "length {n}"
+            );
+            assert!(quantize_nvfp4(&data, 4, false).is_ok(), "length {n} without the rotation");
+        }
+        assert_eq!(quantize_nvfp4(&[1.0; 8], 0, false).err(), Some(NvFp4Error::ZeroBlockSize));
+    }
+
+    /// The test vector of the reference: 1024 values uniform in [-0.5, 0.5)
+    /// from a 64-bit LCG, with two outliers.
+    fn nvfp4_reference_input() -> Vec<f32> {
+        let mut state: u64 = 5;
+        let mut x: Vec<f32> = (0..1024)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((state >> 11) as f64 / (1u64 << 53) as f64 - 0.5) as f32
+            })
+            .collect();
+        x[100] = 40.0;
+        x[700] = -25.0;
+        x
+    }
+
+    fn relative_error(got: &[f32], want: &[f32]) -> f64 {
+        let num: f64 = got.iter().zip(want).map(|(a, b)| (f64::from(*a) - f64::from(*b)).powi(2)).sum();
+        let den: f64 = want.iter().map(|b| f64::from(*b).powi(2)).sum();
+        (num / den).sqrt()
+    }
+
+    /// `nsl_nvfp4_quantize` against a NumPy float32 implementation written
+    /// from the routine's description: the relative error of what the FFI
+    /// returns, and four of its elements. Returning the rotated-basis values
+    /// (what the FFI did with the flag set) scores 1.435 on this vector.
+    #[test]
+    fn nvfp4_ffi_returns_the_reconstruction_the_reference_computes() {
+        let x = nvfp4_reference_input();
+        assert_eq!((x[0], x[1023]), (0.303_211_24, 0.239_828_54), "the reference's input");
+        let t = make_2d(32, 32, &x);
+
+        // (flag, reference relative error, reference y[0], y[100], y[513], y[1023])
+        let cases = [
+            (0i64, 0.06453732147982742_f64, 0.332_287_6_f32, 40.0_f32, -0.247_582_23_f32, 0.243_502_62_f32),
+            (1, 0.12173981618867122, 0.296_314_57, 39.541_237, -0.291_287_3, 0.079_951_82),
+        ];
+        for (flag, want_rel, y0, y100, y513, y1023) in cases {
+            let out = nsl_nvfp4_quantize(t, 64, flag);
+            let o = NslTensor::from_ptr(out);
+            assert_eq!((o.ndim, unsafe { *o.shape }, unsafe { *o.shape.add(1) }), (2, 32, 32));
+            let y: Vec<f32> = (0..1024).map(|i| unsafe { *o.data_f32().add(i) }).collect();
+            let got_rel = relative_error(&y, &x);
+            assert!(
+                (got_rel - want_rel).abs() < 1e-5 * want_rel,
+                "hadamard={flag}: relative error {got_rel}, reference {want_rel}"
+            );
+            for (i, want) in [(0usize, y0), (100, y100), (513, y513), (1023, y1023)] {
+                assert!(
+                    (y[i] - want).abs() <= 2e-5 * want.abs().max(1.0),
+                    "hadamard={flag}: y[{i}] = {}, reference {want}",
+                    y[i]
+                );
+            }
+            crate::tensor::nsl_tensor_free(out);
+        }
+        crate::tensor::nsl_tensor_free(t);
     }
 
     // ── Host-staging guard tests (device/view/dtype hazards) ────────────

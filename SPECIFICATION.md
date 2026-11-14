@@ -143,14 +143,18 @@ kernel matmul_naive(A, B, C, M, K, N):
 | FP8 E4M3 | 8-bit float (forward) | Per-tensor scale with EMA calibration |
 | FP8 E5M2 | 8-bit float (backward) | Wider dynamic range for gradients |
 | MXFP8 | Block FP8 | E8M0 scale per 32 elements (Blackwell) |
-| AWQ 4-bit | 4-bit | Activation-aware weight quantization |
-| GPTQ 4-bit | 4-bit | Hessian-based optimal quantization |
+
+`quant` blocks implement `int8` and `int4`. A block quantizes each tensor
+field of the model (and of its sub-models) and stores the dequantized f32
+result in a copy of the model; there is no packed inference. `default: awq4`,
+`gptq4` and `gptq8` are refused: the runtime holds a GPTQ routine and a
+per-group round-to-nearest packer named AWQ, and neither is wired to the
+language.
 
 ```python
-quant static:
-    dtype: int4
-    granularity: per_group(128)
-    exclude: "*.norm*"
+quant static qm from m:
+    default: int4, per_group(128)
+    exclude: ["*norm*"]
 ```
 
 ---
@@ -274,11 +278,17 @@ block_kv with fused projections) are rejected at compile time.
 - Fourier-Motzkin bound reasoning for inequality chains
 
 ### Sparse Tensors (M50)
+
+A runtime library. NSL source can name a `Sparse<[shape], dtype, format>`
+type but has no way to construct a sparse value, so none of this is reached
+from a program today.
+
 - COO, CSR, CSC, BSR formats with conversion
 - SpMV, SpMM, sparse add/mul
 - TACO-style merge lattices (intersection for mul, union for add)
 - Workspace transformation for output assembly
-- `@sparse(pattern="2:4")` decorator for Ampere structured sparsity
+- `@sparse(pattern=...)` is refused by the checker: no pruning, mask or
+  2:4 kernel exists behind it
 
 ---
 

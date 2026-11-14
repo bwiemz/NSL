@@ -9524,6 +9524,20 @@ pub(crate) fn gpu_csr_spmv_f32(sparse: &crate::sparse::NslSparseTensor, vec_ptr:
 }
 
 /// GPU BSR SpMM: C[M,N] = A_bsr @ B[K,N]. Uploads BSR arrays, launches kernel.
+///
+/// The kernel works in whole blocks: thread `(block row, row in block,
+/// column)` writes `C[block_row * block_rows + row, column]` for every row of
+/// the block, and reads `B[block_col * block_cols + c, column]` for every
+/// column of the block. When M or K is not a multiple of the block size the
+/// last block overhangs the matrix, so this wrapper gives the kernel a C
+/// with `nblk_rows * block_rows` rows and a B with `nblk_cols * block_cols`
+/// rows (zero beyond K, where the block values are zero too) and hands back
+/// the first M rows. It used to allocate C as M x N and pass B as it was:
+/// writes past C and reads past B for any size that is not a multiple of 16.
+///
+/// The launch asked for `min(256, N) x block_rows` threads per block, which
+/// is over the limit of 1024 whenever N > 64 with 16-row blocks, so the
+/// kernel could not start. The block is now as wide as the limit allows.
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_bsr_spmm_f32(sparse: &crate::sparse::NslSparseTensor, dense_ptr: i64) -> i64 {
     use crate::tensor::NslTensor;
@@ -9531,16 +9545,42 @@ pub(crate) fn gpu_bsr_spmm_f32(sparse: &crate::sparse::NslSparseTensor, dense_pt
     assert_gpu_f32(b, "bsr_spmm_f32", "dense operand");
     let n_out = if b.ndim >= 2 { unsafe { *b.shape.add(b.ndim as usize - 1) } } else { 1 } as usize;
     let m = sparse.rows as usize;
+    let k = sparse.cols as usize;
     let br = sparse.block_rows as usize;
     let bc = sparse.block_cols as usize;
     if br == 0 || bc == 0 { return 0; }
-    let nblk_rows = (m + br - 1) / br;
+    // More rows per block than a CUDA block has threads: no launch shape
+    // exists for this kernel.
+    const MAX_THREADS_PER_BLOCK: usize = 1024;
+    if br > MAX_THREADS_PER_BLOCK {
+        crate::fatal::die(
+            crate::fatal::Fatal::Unsupported,
+            &format!("bsr_spmm_f32: {br}-row blocks exceed the {MAX_THREADS_PER_BLOCK}-thread block limit of the GPU kernel"),
+        );
+    }
+    let nblk_rows = m.div_ceil(br);
+    let nblk_cols = k.div_ceil(bc);
     let num_blocks = sparse.nnz as usize;
     let block_size = br * bc;
 
     let out_total = m * n_out;
-    let out_data = inner::alloc_managed(out_total * 4);
-    inner::memset_d8(out_data, out_total * 4);
+    let padded_rows = nblk_rows * br;
+    let padded_total = padded_rows * n_out;
+    let padded_out = inner::alloc_managed(padded_total.max(1) * 4);
+    inner::memset_d8(padded_out, padded_total.max(1) * 4);
+
+    // B with whole blocks of rows. When K already is a multiple of the block
+    // width the operand is used as it is.
+    let padded_k = nblk_cols * bc;
+    let padded_b = if padded_k == k {
+        None
+    } else {
+        let bytes = padded_k * n_out * 4;
+        let buf = inner::alloc_managed(bytes.max(1));
+        inner::memset_d8(buf, bytes.max(1));
+        inner::memcpy_dtod(buf, b.data as *const std::ffi::c_void, k * n_out * 4);
+        Some(buf)
+    };
 
     // Upload BSR arrays: row_ptrs(u32), col_indices(u32), values(f32)
     let rp_bytes = (nblk_rows + 1) * 4;
@@ -9575,8 +9615,8 @@ pub(crate) fn gpu_bsr_spmm_f32(sparse: &crate::sparse::NslSparseTensor, dense_pt
     let mut rp = gpu_rp as u64;
     let mut ci = gpu_ci as u64;
     let mut v = gpu_v as u64;
-    let mut bd = b.data as u64;
-    let mut cd = out_data as u64;
+    let mut bd = padded_b.map_or(b.data as u64, |p| p as u64);
+    let mut cd = padded_out as u64;
     let mut n_val = n_out as u64;
     let mut br_val = br as u64;
     let mut bc_val = bc as u64;
@@ -9594,19 +9634,37 @@ pub(crate) fn gpu_bsr_spmm_f32(sparse: &crate::sparse::NslSparseTensor, dense_pt
         &mut nblk_val as *mut _ as *mut std::ffi::c_void,
     ];
 
-    let block_x = 256i64.min(n_out as i64).max(1);
+    // block_x * block_rows threads per block, at most 1024 in all.
+    let block_x = (256usize.min(n_out).min(MAX_THREADS_PER_BLOCK / br)).max(1) as i64;
     let grid_x = nblk_rows as i64;
     let grid_y = ((n_out as i64) + block_x - 1) / block_x;
-    let result = inner::kernel_launch(
-        fused_kernels::bsr_spmm_f32_ptx().as_ptr(), b"nsl_bsr_spmm_f32\0".as_ptr(),
-        [grid_x, grid_y, 1], [block_x, br as i64, 1], &args, 0,
-    );
+    let result = if nblk_rows == 0 || n_out == 0 {
+        cudarc::driver::sys::CUresult::CUDA_SUCCESS
+    } else {
+        inner::kernel_launch(
+            fused_kernels::bsr_spmm_f32_ptx().as_ptr(), b"nsl_bsr_spmm_f32\0".as_ptr(),
+            [grid_x, grid_y, 1], [block_x, br as i64, 1], &args, 0,
+        )
+    };
     assert_eq!(result as u32, 0, "GPU BSR SpMM kernel failed");
     inner::sync_after_kernel();
 
     inner::free_managed(gpu_rp);
     inner::free_managed(gpu_ci);
     inner::free_managed(gpu_v);
+    if let Some(buf) = padded_b {
+        inner::free_managed(buf);
+    }
+
+    // Hand back exactly M rows.
+    let out_data = if padded_rows == m {
+        padded_out
+    } else {
+        let exact = inner::alloc_managed(out_total.max(1) * 4);
+        inner::memcpy_dtod(exact, padded_out as *const std::ffi::c_void, out_total * 4);
+        inner::free_managed(padded_out);
+        exact
+    };
 
     let out_shape = crate::memory::checked_alloc(2 * 8) as *mut i64;
     unsafe { *out_shape = m as i64; *out_shape.add(1) = n_out as i64; }
