@@ -1281,6 +1281,48 @@ fn the_flag_set_each_header_documents_is_the_one_that_builds() {
     }
 }
 
+/// `models/coder1b/pretrain_1b2048.nsl` does not parse as it stands, by
+/// design: `B2048_CKPT_ARGS` sits inside the `train(...)` arguments until
+/// models/benchmarks/endurance_1b.py rewrites it (fmt_roundtrip.rs lists the
+/// file as a template). What has to hold is that the programs the harness
+/// generates from it are current NSL. This builds both, the way
+/// `build_workdir` does (model and config copied beside it, the two exact
+/// rewrites, save and resume phase), and type-checks them.
+#[test]
+fn the_1b_endurance_template_type_checks_after_the_harness_rewrites() {
+    let root = repo_root();
+    let template = std::fs::read_to_string(root.join("models/coder1b/pretrain_1b2048.nsl"))
+        .expect("pretrain_1b2048.nsl");
+    let tmp = tempfile::tempdir().unwrap();
+    for name in ["model.nsl", "config.nsl"] {
+        std::fs::copy(root.join("models/coder1b").join(name), tmp.path().join(name)).unwrap();
+    }
+    for (phase, ckpt_args) in [
+        ("save", r#", checkpoint_save = "b2048.ckpt.nslm", checkpoint_every = 50"#),
+        ("resume", r#", checkpoint_load = "b2048.ckpt.nslm""#),
+    ] {
+        assert!(template.contains(" B2048_CKPT_ARGS"), "the harness rewrites ` B2048_CKPT_ARGS`");
+        let program = template
+            .replace("B2048_TOKENS_PATH", "tokens.u16")
+            .replace(" B2048_CKPT_ARGS", ckpt_args);
+        let path = tmp.path().join(format!("pretrain_1b2048_{phase}.nsl"));
+        std::fs::write(&path, program).unwrap();
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_nsl"))
+            .arg("check")
+            .arg(&path)
+            .current_dir(tmp.path())
+            .env("NSL_STDLIB_PATH", root.join("stdlib"))
+            .output()
+            .expect("spawn nsl check");
+        assert!(
+            out.status.success(),
+            "the {phase}-phase program endurance_1b.py generates from \
+             pretrain_1b2048.nsl does not type-check:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 /// Item 10: every production recipe declares `grad_clip`, and the flag choice
 /// that would silently cost it is pinned as a refusal.
 ///
