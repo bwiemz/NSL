@@ -1062,14 +1062,17 @@ fn emit_fused_forward_under_claim(
         }
         bytes
     };
-    // active_heads from the bridge (same source as
-    // `compile_flash_attention_call`'s non-source-AD branch).
-    let active_heads_i64 = compiler
-        .bus
-        .csha_bridge()
-        .and_then(|b| b.extras_for_layer(layer))
-        .map(|e| e.active_heads as i64)
-        .unwrap_or(0);
+    // active_heads from the training config: the kernels this launch and
+    // its backward run were synthesized from it, and the backward lowering
+    // (`PrimalOp::FusedCshaBackward`) passes the same value. Today that is
+    // always 0, "every head" (`maybe_synthesize_csha_training_ptx`).
+    //
+    // It used to come from the planner's per-layer extras, which are made on
+    // a nominal 8-head layer whatever the model is. The kernel compares its
+    // head index with this run-time value, so a model with more than 8 heads
+    // had heads 8 and up left at zero by the forward while the backward
+    // (passing 0) differentiated all of them.
+    let active_heads_i64 = csha_training_active_heads(&training_cfg);
 
     // --- 2. SDPA inputs: [q, k, v, scale, ...].  The scale slot is an
     //        f64 literal (NSL float literals lower to F64); the FFI
@@ -1461,6 +1464,13 @@ fn emit_fused_forward_under_claim(
     );
 
     Ok(out_val)
+}
+
+/// The active-head count a CSHA training launch passes to its kernel, forward
+/// and backward alike: the one in the configuration the kernels were
+/// synthesized from (0 means every head).
+fn csha_training_active_heads(cfg: &crate::flash_attention::FlashAttentionConfig) -> i64 {
+    cfg.csha.as_ref().map_or(0, |c| i64::from(c.active_heads))
 }
 
 /// A norm's eps as an f64 Value: the constant, or the run-time scalar the
@@ -3153,7 +3163,7 @@ fn lower_single_op(
             // `seq_len == block_q` check happens below using the Cranelift
             // `seq_len` Value already extracted via `nsl_tensor_shape_dim`.
             let (block_q, block_kv, head_dim, is_causal, d_model, shmem_bytes,
-                 tier_b2_compile_time_eligible) =
+                 tier_b2_compile_time_eligible, active_heads) =
                 match training_cfg {
                     Some(cfg) => {
                         // Backward kernel sizes shmem differently than forward:
@@ -3171,7 +3181,8 @@ fn lower_single_op(
                         let dm = cfg.csha.as_ref().map(|c| c.d_model as i64).unwrap_or(0);
                         let b2_ct =
                             crate::flash_attention_v2::tier_b2::dispatch::tier_b2_hybrid_backward_compile_time_eligible(&cfg);
-                        (cfg.block_q, cfg.block_kv, cfg.head_dim, cfg.causal, dm, bytes, b2_ct)
+                        let ah = csha_training_active_heads(&cfg);
+                        (cfg.block_q, cfg.block_kv, cfg.head_dim, cfg.causal, dm, bytes, b2_ct, ah)
                     }
                     None => {
                         // No training config — the backward launch cannot
@@ -3326,11 +3337,10 @@ fn lower_single_op(
                 &[batch, seq_len, d_model_val], cuda_device,
             )?;
 
-            // Launch the 44-arg backward kernel.
-            // Forward-side `active_heads` — take from the training config
-            // (stored on the FA context via Gap B).  When the ctx is gone,
-            // pass 0 (kernel interprets as "all heads live").
-            let active_heads_val = builder.ins().iconst(cl_types::I64, 0);
+            // The same `active_heads` the forward launch was given
+            // (`emit_fused_forward_under_claim`): both read it from the
+            // training config the kernels were synthesized from.
+            let active_heads_val = builder.ins().iconst(cl_types::I64, active_heads);
 
             // CFTP §4.3 / Tier A activation (spec 2026-05-17): the same
             // packing metadata the forward consumed. Item 17 phase 3a:

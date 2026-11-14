@@ -1576,6 +1576,23 @@ impl Compiler<'_> {
         // `nsl-runtime/src/pca_tier_b_runtime.rs`) can pick the variant.
         let csha_with_saves_tier_b_on_ptx_id = ctx.csha_with_saves_tier_b_on_ptx_id;
         let csha_with_saves_tier_b_on_name_id = ctx.csha_with_saves_tier_b_on_name_id;
+        // The active-head count each launch below passes is the one in the
+        // configuration its kernel was synthesized from (0 = every head): the
+        // kernel compares its head index with the run-time value, so the two
+        // must describe the same pruning. It used to be the planner's
+        // per-layer count, which is made on a nominal 8-head layer whatever
+        // the model is, so a 16-head model had heads 8 to 15 left at zero.
+        let kernel_active_heads = |c: &crate::flash_attention::FlashAttentionConfig| -> i64 {
+            c.csha.as_ref().map_or(0, |x| i64::from(x.active_heads))
+        };
+        let inference_active_heads = kernel_active_heads(&ctx.config);
+        // The with-saves launch runs the training kernel when one was
+        // synthesized, and the inference kernel otherwise.
+        let with_saves_active_heads =
+            match (csha_with_saves_ptx_id, csha_with_saves_name_id, ctx.csha_training_config.as_ref()) {
+                (Some(_), Some(_), Some(c)) => kernel_active_heads(c),
+                _ => inference_active_heads,
+            };
         let csha_training_shmem_bytes = ctx
             .csha_training_config
             .as_ref()
@@ -1725,9 +1742,10 @@ impl Compiler<'_> {
             let eps_bits = builder
                 .ins()
                 .iconst(cl_types::I64, extras.rmsnorm_eps.to_bits() as i64);
-            let active_heads_val = builder
-                .ins()
-                .iconst(cl_types::I64, extras.active_heads as i64);
+            let with_saves_active_heads_val =
+                builder.ins().iconst(cl_types::I64, with_saves_active_heads);
+            let inference_active_heads_val =
+                builder.ins().iconst(cl_types::I64, inference_active_heads);
             let d_model_val = builder
                 .ins()
                 .iconst(cl_types::I64, extras.d_model as i64);
@@ -1950,7 +1968,7 @@ impl Compiler<'_> {
                         x_v, norm_w_v,
                         wq_v, wk_v, wv_v, wo_v,
                         eps_bits,
-                        active_heads_val,
+                        with_saves_active_heads_val,
                         d_model_val,
                         // Tier C activation-save pointers.
                         q_proj_v, k_proj_v, v_proj_v,
@@ -2077,7 +2095,7 @@ impl Compiler<'_> {
                         norm_w_v,                  // resolved via conventional-name probe
                         wq_v, wk_v, wv_v, wo_v,    // resolved via bridge marks
                         eps_bits,
-                        active_heads_val,
+                        inference_active_heads_val,
                         d_model_val,
                         // PCA Tier A: segment_ids_ptr — read from the
                         // thread-local packing registry.

@@ -208,14 +208,22 @@ block0(v0: i64, v1: i64):
     v44 = iconst.i64 0
     v45 = iconst.i64 0
     v46 = call fn16(v7, v10, v13, v18, v43, v28, v33, v34, v35, v36, v25, v25, v25, v25, v25, v25, v25, v25, v23, v19, v20, v21, v22, v24, v44, v45)  ; v25 = 0, v25 = 0, v25 = 0, v25 = 0, v25 = 0, v25 = 0, v25 = 0, v25 = 0, v23 = 9216, v21 = 64, v22 = 64, v24 = 1, v44 = 0, v45 = 0
-    call fn17(v10)
     v47 = iconst.i64 0
-    call fn18(v7)
-    v48 = iconst.i64 0
-    call fn19(v13)
+    v48 = icmp ne v46, v47  ; v47 = 0
+    brif v48, block2, block1
+
+block2:
+    trap user3
+
+block1:
+    call fn17(v10)
     v49 = iconst.i64 0
-    call fn20(v4)
+    call fn18(v7)
     v50 = iconst.i64 0
+    call fn19(v13)
+    v51 = iconst.i64 0
+    call fn20(v4)
+    v52 = iconst.i64 0
     return v18
 }
 
