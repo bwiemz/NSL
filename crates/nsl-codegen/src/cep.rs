@@ -800,6 +800,7 @@ pub enum CepBridgeError {
     UnknownTarget { target: String, supported: String },
     BadPreserve(String),
     PreserveLayerOutOfRange { entry: String, n_layers: u32 },
+    BadSparsity(f64),
 }
 
 impl std::fmt::Display for CepBridgeError {
@@ -818,6 +819,10 @@ impl std::fmt::Display for CepBridgeError {
             CepBridgeError::PreserveLayerOutOfRange { entry, n_layers } => write!(
                 f,
                 "CEP: preserve entry '{entry}' references layer >= n_layers ({n_layers})"
+            ),
+            CepBridgeError::BadSparsity(s) => write!(
+                f,
+                "CEP: sparsity must be a fraction between 0 and 1 (for example 0.3), got {s}"
             ),
         }
     }
@@ -908,6 +913,11 @@ pub fn build_prune_input<'a>(
         });
     }
     let target_sparsity = sparsity_override.unwrap_or(cfg.sparsity);
+    // A negative target is "met" by doing nothing and would be reported as a
+    // success; one above 1 can never be met. Neither is a request.
+    if !(0.0..=1.0).contains(&target_sparsity) {
+        return Err(CepBridgeError::BadSparsity(target_sparsity));
+    }
     let preserve_layers = parse_preserve_layers(&cfg.preserve, spec.n_layers)?;
     let constraints = Constraints {
         peak_memory_bytes: cfg.constraints.peak_memory_bytes.unwrap_or(u64::MAX),
@@ -1329,6 +1339,21 @@ mod bridge_tests {
         assert_eq!(input.constraints.target_sparsity, 0.5); // override beats cfg.sparsity (0.3)
         assert_eq!(input.constraints.preserve_layers, vec![0, 5]);
         assert!(matches!(input.granularity, Granularity::HeadAndFfn));
+    }
+
+    #[test]
+    fn build_prune_input_refuses_a_sparsity_that_is_not_a_fraction() {
+        let cfg = prune_cfg();
+        for bad in [-0.1, 1.5, 30.0, f64::NAN] {
+            let err = build_prune_input(&cfg, spec(), None, "H100-SXM", Some(bad)).unwrap_err();
+            assert!(
+                matches!(err, CepBridgeError::BadSparsity(_)),
+                "{bad}: {err:?}"
+            );
+        }
+        for ok in [0.0, 1.0] {
+            build_prune_input(&cfg, spec(), None, "H100-SXM", Some(ok)).expect("in range");
+        }
     }
 
     #[test]

@@ -515,17 +515,27 @@ fn rewrite_scalar(
     Ok(out)
 }
 
-/// Serialise sliced entries to `path`: `.nslm` (in the order given, which is
-/// what `model_load` needs) or `.safetensors` (which its format sorts).
+/// The bytes of the weights file `path` asks for: `.nslm` (in the order
+/// given, which is what `model_load` needs) or `.safetensors` (which its
+/// format sorts).
+pub fn sliced_weights_bytes(
+    entries: &[WeightEntry],
+    path: &std::path::Path,
+) -> std::io::Result<Vec<u8>> {
+    if crate::cep_weights::wants_nslm(path) {
+        let refs: Vec<&WeightEntry> = entries.iter().collect();
+        crate::cep_weights::nslm_bytes(&refs)
+    } else {
+        serialize_safetensors(entries)
+    }
+}
+
+/// Serialise sliced entries to `path` (see [`sliced_weights_bytes`]).
 pub fn write_sliced_weights(
     entries: &[WeightEntry],
     path: &std::path::Path,
 ) -> std::io::Result<()> {
-    if crate::cep_weights::wants_nslm(path) {
-        let refs: Vec<&WeightEntry> = entries.iter().collect();
-        return crate::cep_weights::write_nslm(&refs, path);
-    }
-    crate::cep_weights::write_atomically(path, &serialize_safetensors(entries)?)
+    crate::cep_weights::write_atomically(path, &sliced_weights_bytes(entries, path)?)
 }
 
 /// The bytes of a `.safetensors` file holding `entries`.

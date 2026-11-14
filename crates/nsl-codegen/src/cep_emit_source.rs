@@ -317,28 +317,46 @@ pub fn apply_prune_delta_to_source(
         }),
     };
 
-    // For each of the three slots, find the positional index by NAME, then the arg expr,
-    // then either rewrite the arg literal in place or (if Ident) rewrite the const decl.
+    // For each slot, find the positional index by NAME, then the arg expr,
+    // then either rewrite the arg literal in place or (if Ident) rewrite the
+    // const decl. Slots whose value does not change are looked at too, when
+    // they are bound to a const: rewriting `const K` for one slot changes
+    // every slot that uses `K`, so a slot that must keep its value turns a
+    // shared const into a collision instead of a silent change.
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
     for (dim, baseline_val, new_val) in [
+        ("d_model", baseline.d_model, baseline.d_model),
         ("n_heads", baseline.n_heads[0], pruned.n_heads),
         ("n_kv_heads", baseline.n_kv_heads[0], pruned.n_kv_heads),
+        ("head_dim", baseline.head_dim[0], baseline.head_dim[0]),
         ("d_ff", baseline.d_ff[0], pruned.d_ff),
+        // The stdlib attention scales its output projection's initial
+        // values by the block's `n_layers`, when it has one.
+        ("n_layers", baseline.n_layers, pruned.n_layers),
     ] {
-        // No-op if the value isn't changing (preserves bytes; also handles empty-delta case).
-        if baseline_val == new_val {
+        let changed = baseline_val != new_val;
+        let arg: Option<&Arg> =
+            block_param_index(block_def, resolve, dim).and_then(|idx| block_args.get(idx));
+        let Some(arg) = arg else {
+            // `n_layers` is optional; the others are needed only to change them.
+            if changed && dim != "n_layers" {
+                return Err(CepEmitError::MissingArg { what: dim });
+            }
             continue;
+        };
+        if changed {
+            edits.push(edit_for_arg(module, resolve, dim, &arg.value, baseline_val, new_val)?);
+        } else if matches!(arg.value.kind, ExprKind::Ident(_))
+            && let Ok((start, end, _)) =
+                edit_for_arg(module, resolve, dim, &arg.value, baseline_val, new_val)
+            && let Some(original) = source.get(start..end)
+        {
+            // Keeps its text; present only so a clash is seen below.
+            edits.push((start, end, original.to_string()));
         }
-        let idx = block_param_index(block_def, resolve, dim).ok_or(CepEmitError::MissingArg {
-            what: dim,
-        })?;
-        let arg: &Arg = block_args.get(idx).ok_or(CepEmitError::MissingArg { what: dim })?;
-        edits.push(edit_for_arg(module, resolve, dim, &arg.value, baseline_val, new_val)?);
     }
 
-    // Dropped layers: the array's declared length, and the block's `n_layers`
-    // argument when it has one (the stdlib attention scales its output
-    // projection's initial values by it).
+    // Dropped layers: the array's declared length.
     if pruned.n_layers != baseline.n_layers {
         edits.push(edit_for_layer_count(
             source,
@@ -347,18 +365,6 @@ pub fn apply_prune_delta_to_source(
             baseline.n_layers,
             pruned.n_layers,
         )?);
-        if let Some(idx) = block_param_index(block_def, resolve, "n_layers") {
-            let arg: &Arg =
-                block_args.get(idx).ok_or(CepEmitError::MissingArg { what: "n_layers" })?;
-            edits.push(edit_for_arg(
-                module,
-                resolve,
-                "n_layers",
-                &arg.value,
-                baseline.n_layers,
-                pruned.n_layers,
-            )?);
-        }
     }
 
     // Sort right-to-left so earlier spans aren't invalidated by later splices.
@@ -771,6 +777,27 @@ model Net:
         let err = apply_prune_delta_to_source(CANONICAL, &module, &resolve, &baseline, &delta)
             .unwrap_err();
         assert!(matches!(err, CepEmitError::SpecMismatch { .. }), "got: {err}");
+    }
+
+    /// `const K = 6` is both the head count and the block's `n_layers`. A
+    /// head prune wants K = 4; the layer count must stay 6. Rewriting K would
+    /// change both, so the rewrite is refused.
+    #[test]
+    fn const_shared_with_a_slot_that_keeps_its_value_refuses() {
+        let src = WITH_LAYER_COUNT
+            .replace("\nmodel GroupedQueryAttention", "\nconst K = 6\nmodel GroupedQueryAttention")
+            .replace("TransformerBlock(384, 6, 3, 64, 1024, 0.1, 6)", "TransformerBlock(384, K, 3, 64, 1024, 0.1, K)");
+        assert!(src.contains("const K = 6") && src.contains("(384, K, 3, 64, 1024, 0.1, K)"));
+        let (module, interner) = parse(&src);
+        let resolve = |s: Symbol| interner.resolve(s.0).unwrap_or("").to_string();
+        let baseline = baseline_canonical();
+        let delta = PruneDelta {
+            per_layer: (0..6).map(|l| LayerDelta {
+                layer: l, pruned_heads: vec![0, 1], new_d_ff: None, drop_layer: false,
+            }).collect(),
+        };
+        let err = apply_prune_delta_to_source(&src, &module, &resolve, &baseline, &delta).unwrap_err();
+        assert!(matches!(err, CepEmitError::SharedConstCollision { .. }), "got: {err}");
     }
 
     /// A single top-level const is used to initialize TWO different slots whose chosen

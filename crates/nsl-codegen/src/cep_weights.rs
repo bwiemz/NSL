@@ -291,10 +291,9 @@ fn parse_nslm(data: &[u8]) -> Result<Vec<WeightEntry>, String> {
     Ok(out)
 }
 
-/// Write `entries`, in the order given, as an `.nslm` file that `model_load`
-/// reads back. Written to a temporary and renamed, so a failed write leaves
-/// no partial file under the final name.
-pub fn write_nslm(entries: &[&WeightEntry], path: &Path) -> std::io::Result<()> {
+/// The bytes of an `.nslm` file holding `entries` in the order given, as
+/// `model_load` reads it back.
+pub fn nslm_bytes(entries: &[&WeightEntry]) -> std::io::Result<Vec<u8>> {
     let mut params = Vec::with_capacity(entries.len());
     let mut offset = 0u64;
     for e in entries {
@@ -320,18 +319,67 @@ pub fn write_nslm(entries: &[&WeightEntry], path: &Path) -> std::io::Result<()> 
     for e in entries {
         bytes.extend_from_slice(&e.data);
     }
-    write_atomically(path, &bytes)
+    Ok(bytes)
+}
+
+/// Write `entries` as an `.nslm` file. Written to a temporary and renamed, so
+/// a failed write leaves no partial file under the final name.
+pub fn write_nslm(entries: &[&WeightEntry], path: &Path) -> std::io::Result<()> {
+    write_atomically(path, &nslm_bytes(entries)?)
+}
+
+fn temp_sibling(path: &Path) -> std::path::PathBuf {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".tmp.{}", std::process::id()));
+    std::path::PathBuf::from(tmp)
 }
 
 /// Write `bytes` to `path` through a sibling temporary and a rename.
 pub fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(format!(".tmp.{}", std::process::id()));
-    let tmp = std::path::PathBuf::from(tmp);
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })
+    write_all_or_nothing(&[(path, bytes)])
+}
+
+/// Write several files so that either all of them appear or none does.
+///
+/// Every file is first written in full beside its destination, which is
+/// where an unwritable directory, a destination that is a directory, or a
+/// full disk shows up; only then are the temporaries renamed into place. If
+/// anything fails, the temporaries and any file this call already put in
+/// place are removed and the error names the path.
+pub fn write_all_or_nothing(outputs: &[(&Path, &[u8])]) -> std::io::Result<()> {
+    let named = |path: &Path, e: std::io::Error| {
+        std::io::Error::new(e.kind(), format!("{}: {e}", path.display()))
+    };
+    let temps: Vec<std::path::PathBuf> = outputs.iter().map(|(p, _)| temp_sibling(p)).collect();
+    let discard = |upto: usize| {
+        for t in &temps[..upto] {
+            let _ = std::fs::remove_file(t);
+        }
+    };
+    for (i, (path, bytes)) in outputs.iter().enumerate() {
+        let staged = if path.is_dir() {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::IsADirectory,
+                "is a directory",
+            ))
+        } else {
+            std::fs::write(&temps[i], bytes)
+        };
+        if let Err(e) = staged {
+            discard(i + 1);
+            return Err(named(path, e));
+        }
+    }
+    for (i, (path, _)) in outputs.iter().enumerate() {
+        if let Err(e) = std::fs::rename(&temps[i], path) {
+            discard(temps.len());
+            for (placed, _) in &outputs[..i] {
+                let _ = std::fs::remove_file(placed);
+            }
+            return Err(named(path, e));
+        }
+    }
+    Ok(())
 }
 
 /// Whether `path` asks for `.nslm` output.
@@ -450,6 +498,43 @@ mod tests {
             vec!["blocks[0].w".to_string(), "embed".to_string()]
         );
         assert_eq!(w.map.get("embed").unwrap().data, 4.0f32.to_le_bytes());
+    }
+
+    /// Two outputs, the second into a directory that does not exist: the
+    /// first must not be left behind, and no temporary either.
+    #[test]
+    fn several_outputs_are_written_together_or_not_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.json");
+        let b = dir.path().join("missing").join("b.bin");
+        let err = write_all_or_nothing(&[(a.as_path(), &b"one"[..]), (b.as_path(), &b"two"[..])])
+            .unwrap_err();
+        assert!(err.to_string().contains("b.bin"), "{err}");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "nothing may be left"
+        );
+
+        // A destination that is a directory fails the same way.
+        let d = dir.path().join("d");
+        std::fs::create_dir(&d).unwrap();
+        assert!(
+            write_all_or_nothing(&[(a.as_path(), &b"one"[..]), (d.as_path(), &b"two"[..])])
+                .is_err()
+        );
+        assert!(!a.exists());
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "only the directory"
+        );
+
+        // And when both can be written, both are.
+        let c = dir.path().join("c.bin");
+        write_all_or_nothing(&[(a.as_path(), &b"one"[..]), (c.as_path(), &b"two"[..])]).unwrap();
+        assert_eq!(std::fs::read(&a).unwrap(), b"one");
+        assert_eq!(std::fs::read(&c).unwrap(), b"two");
     }
 
     #[test]

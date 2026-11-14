@@ -260,12 +260,7 @@ impl Costs {
             // the lower index), so the slicer keeps exactly the neurons this
             // total was not charged for.
             let mut order: Vec<usize> = (0..costs.len()).collect();
-            order.sort_by(|&a, &b| {
-                costs[a]
-                    .partial_cmp(&costs[b])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(b.cmp(&a))
-            });
+            order.sort_by(|&a, &b| costs[a].total_cmp(&costs[b]).then(b.cmp(&a)));
             let mut prefix = Vec::with_capacity(order.len() + 1);
             let mut total = 0.0;
             prefix.push(0.0);
@@ -356,11 +351,7 @@ impl PruneState<'_> {
         (0..n_groups as u32)
             .filter(|g| !st.groups_removed.contains(g))
             .map(|g| (g, self.costs.group[l][g as usize]))
-            .min_by(|a, b| {
-                a.1.partial_cmp(&b.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(a.0.cmp(&b.0))
-            })
+            .min_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)))
     }
 
     /// The next FFN step for layer `l`: how many neurons, and what they cost.
@@ -785,11 +776,9 @@ pub fn architecture_search(
     // Feasible first, then by score (descending). The sort is stable, so
     // equal scores keep enumeration order.
     evaluated.sort_by(|a, b| {
-        b.feasible.cmp(&a.feasible).then(
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal),
-        )
+        b.feasible
+            .cmp(&a.feasible)
+            .then(b.score.total_cmp(&a.score))
     });
     let wall_clock_us = t0.elapsed().as_micros() as u64;
     let chosen = evaluated.iter().find(|c| c.feasible).cloned();

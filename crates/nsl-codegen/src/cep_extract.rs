@@ -674,13 +674,14 @@ pub fn cross_check_dims(
         });
     }
     for l in 0..spec.n_layers as usize {
-        let q_proj = spec.n_heads[l] * spec.head_dim[l];
-        let kv_proj = spec.n_kv_heads[l] * spec.head_dim[l];
-        let d_ff = spec.d_ff[l];
-        let dm = spec.d_model;
+        // u64: the factors come from the model source.
+        let q_proj = spec.n_heads[l] as u64 * spec.head_dim[l] as u64;
+        let kv_proj = spec.n_kv_heads[l] as u64 * spec.head_dim[l] as u64;
+        let d_ff = spec.d_ff[l] as u64;
+        let dm = spec.d_model as u64;
 
         // (path inside the block, [rows, cols], what the shape means)
-        let checks: [(&str, [u32; 2], String); 7] = [
+        let checks: [(&str, [u64; 2], String); 7] = [
             ("attn.wq", [dm, q_proj], format!("[d_model, n_heads·head_dim] = [{dm}, {q_proj}]")),
             ("attn.wk", [dm, kv_proj], format!("[d_model, n_kv_heads·head_dim] = [{dm}, {kv_proj}]")),
             ("attn.wv", [dm, kv_proj], format!("[d_model, n_kv_heads·head_dim] = [{dm}, {kv_proj}]")),
@@ -698,7 +699,7 @@ pub fn cross_check_dims(
                     found: "no such tensor in the weights file".to_string(),
                 });
             };
-            if entry.shape != [shape[0] as usize, shape[1] as usize] {
+            if entry.shape.iter().map(|&d| d as u64).ne(shape) {
                 return Err(CepCrossCheckError {
                     tensor: entry.name.clone(),
                     expected: format!("{label} from GroupedQueryAttention/SwiGLUFFN args"),

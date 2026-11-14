@@ -104,11 +104,21 @@ fn run_cep_prune_mode(
 
     let flag = if joint { "--cep-joint" } else { "--cep-prune" };
     let Some(weights_path) = weights else {
-        nsl_log::nsl_log!(ERROR, "cli",
-            "error: {flag} requires --weights <file.nslm|file.safetensors> \
-             (importance is read from the weights; without them every component would \
-             count the same)"
-        );
+        // One literal per flag: the feature-composition gate pins each
+        // refusal's text at its log call.
+        if joint {
+            nsl_log::nsl_log!(ERROR, "cli",
+                "error: --cep-joint requires --weights <file.nslm|file.safetensors> \
+                 (importance is read from the weights; without them every component would \
+                 count the same)"
+            );
+        } else {
+            nsl_log::nsl_log!(ERROR, "cli",
+                "error: --cep-prune requires --weights <file.nslm|file.safetensors> \
+                 (importance is read from the weights; without them every component would \
+                 count the same)"
+            );
+        }
         return 1;
     };
 
@@ -189,6 +199,27 @@ fn run_cep_prune_mode(
             );
             return 1;
         }
+    }
+    // An output that is also an input, or two outputs under one name, would
+    // overwrite a file this run still needs or leave one result in place of two.
+    let inputs = [resolved(file), resolved(weights_path)];
+    let mut seen: Vec<PathBuf> = Vec::new();
+    for (flag, path) in [
+        ("--cep-out", Some(&out_path)),
+        ("--cep-emit-weights", ov.cep_emit_weights.as_ref()),
+        ("--cep-emit-source", ov.cep_emit_source.as_ref()),
+    ] {
+        let Some(path) = path else { continue };
+        let full = resolved(path);
+        if inputs.contains(&full) || seen.contains(&full) {
+            nsl_log::nsl_log!(ERROR, "cli",
+                "error: {flag}: {} is the model source, the input weights or another output of \
+                 this run; every output needs a file of its own",
+                path.display()
+            );
+            return 1;
+        }
+        seen.push(full);
     }
     if ov.cep_emit_source.is_some() && !cfg.preserve.is_empty() {
         nsl_log::nsl_log!(ERROR, "cli",
@@ -302,38 +333,62 @@ fn run_cep_prune_mode(
         }
     };
 
-    // Everything exists; write it.
-    if let Err(e) = nsl_codegen::cep_weights::write_atomically(&out_path, delta_json.as_bytes()) {
-        nsl_log::nsl_log!(ERROR, "cli", "error: failed to write delta: {e}");
+    // Everything exists; write it, all of it or none of it.
+    let weights_bytes = match (ov.cep_emit_weights.as_ref(), sliced.as_ref()) {
+        (Some(path), Some(sliced)) => {
+            match nsl_codegen::cep_slice::sliced_weights_bytes(sliced, path) {
+                Ok(b) => Some(b),
+                Err(e) => {
+                    nsl_log::nsl_log!(ERROR, "cli", "error: failed to serialise the sliced weights: {e}");
+                    return 1;
+                }
+            }
+        }
+        _ => None,
+    };
+    let mut outputs: Vec<(&std::path::Path, &[u8])> = vec![(out_path.as_path(), delta_json.as_bytes())];
+    if let (Some(path), Some(bytes)) = (ov.cep_emit_weights.as_ref(), weights_bytes.as_ref()) {
+        outputs.push((path.as_path(), bytes.as_slice()));
+    }
+    if let (Some(path), Some(src)) = (ov.cep_emit_source.as_ref(), rewritten.as_ref()) {
+        outputs.push((path.as_path(), src.as_bytes()));
+    }
+    if let Err(e) = nsl_codegen::cep_weights::write_all_or_nothing(&outputs) {
+        nsl_log::nsl_log!(ERROR, "cli", "error: failed to write {e}; no file was written");
         return 1;
     }
+
     println!(
         "CEP {}delta written to {}",
         if joint { "joint " } else { "" },
         out_path.display()
     );
-
     if let (Some(weights_out), Some(sliced)) = (ov.cep_emit_weights.as_ref(), sliced.as_ref()) {
         let orig: usize = loaded.map.entries().map(|(_, e)| e.num_elements).sum();
         let new: usize = sliced.iter().map(|e| e.num_elements).sum();
-        if let Err(e) = nsl_codegen::cep_slice::write_sliced_weights(sliced, weights_out) {
-            nsl_log::nsl_log!(ERROR, "cli", "error: failed to write sliced weights: {e}");
-            return 1;
-        }
         println!(
             "CEP sliced weights written to {} ({orig} -> {new} stored values)",
             weights_out.display()
         );
     }
-
-    if let (Some(source_out), Some(src)) = (ov.cep_emit_source.as_ref(), rewritten.as_ref()) {
-        if let Err(e) = nsl_codegen::cep_weights::write_atomically(source_out, src.as_bytes()) {
-            nsl_log::nsl_log!(ERROR, "cli", "error: failed to write rewritten source: {e}");
-            return 1;
-        }
+    if let Some(source_out) = ov.cep_emit_source.as_ref() {
         println!("CEP rewritten source written to {}", source_out.display());
     }
     0
+}
+
+/// `path` with its directory resolved, so two spellings of one file compare
+/// equal whether or not the file exists yet.
+fn resolved(path: &std::path::Path) -> PathBuf {
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let dir = dir.canonicalize().unwrap_or(dir);
+    match path.file_name() {
+        Some(name) => dir.join(name),
+        None => dir,
+    }
 }
 
 pub(crate) fn run_cep_search(file: &PathBuf, ov: &nsl_codegen::cep::CliOverrides) -> i32 {

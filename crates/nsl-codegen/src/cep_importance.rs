@@ -180,15 +180,23 @@ pub struct AttentionWeights<'a> {
 impl AttentionWeights<'_> {
     /// Refuse any tensor whose shape is not the one the dimensions imply.
     pub fn validate(&self) -> Result<(), String> {
-        let d = self.d_model as usize;
-        let q = (self.n_heads * self.head_dim) as usize;
-        let kv = (self.n_kv_heads * self.head_dim) as usize;
         if self.n_kv_heads == 0 || !self.n_heads.is_multiple_of(self.n_kv_heads) {
             return Err(format!(
                 "CEP: n_heads ({}) must be a positive multiple of n_kv_heads ({})",
                 self.n_heads, self.n_kv_heads
             ));
         }
+        // Widths in u64: the factors come from the model source.
+        let width = |heads: u32| -> Result<usize, String> {
+            usize::try_from(heads as u64 * self.head_dim as u64).map_err(|_| {
+                format!(
+                    "CEP: {heads} heads of dimension {} is too wide",
+                    self.head_dim
+                )
+            })
+        };
+        let d = self.d_model as usize;
+        let (q, kv) = (width(self.n_heads)?, width(self.n_kv_heads)?);
         expect_shape(self.wq, d, q, "d_model x n_heads*head_dim")?;
         expect_shape(self.wk, d, kv, "d_model x n_kv_heads*head_dim")?;
         expect_shape(self.wv, d, kv, "d_model x n_kv_heads*head_dim")?;
@@ -225,13 +233,23 @@ pub fn ffn_neuron_magnitudes(
     expect_shape(w_gate, d, ff, "d_model x d_ff")?;
     expect_shape(w_up, d, ff, "d_model x d_ff")?;
     expect_shape(w_down, ff, d, "d_ff x d_model")?;
-    Ok((0..ff)
+    let mags: Vec<f64> = (0..ff)
         .map(|j| {
             column_block_norm(w_gate, j, j + 1)
                 * column_block_norm(w_up, j, j + 1)
                 * row_block_norm(w_down, j, j + 1)
         })
-        .collect())
+        .collect();
+    // A NaN or infinite weight has no rank; a diverged checkpoint is refused
+    // rather than pruned by whatever order the sort happens to give.
+    if let Some(j) = mags.iter().position(|m| !m.is_finite()) {
+        return Err(format!(
+            "CEP: FFN neuron {j} of '{}' has a non-finite magnitude; the weights hold NaN or \
+             infinite values",
+            w_gate.name
+        ));
+    }
+    Ok(mags)
 }
 
 /// The `keep` highest-magnitude neurons, as ascending indices. Ties go to the
@@ -240,8 +258,7 @@ pub fn ffn_survivors(magnitudes: &[f64], keep: usize) -> Vec<u32> {
     let mut order: Vec<u32> = (0..magnitudes.len() as u32).collect();
     order.sort_by(|&a, &b| {
         magnitudes[b as usize]
-            .partial_cmp(&magnitudes[a as usize])
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .total_cmp(&magnitudes[a as usize])
             .then(a.cmp(&b))
     });
     order.truncate(keep);
@@ -376,6 +393,12 @@ pub fn analyse_weight_map(
         let mut attn_score = 0.0_f64;
         for head in 0..spec.n_heads[l] {
             let mag = attn.head_magnitude(head);
+            if !mag.is_finite() {
+                return Err(format!(
+                    "CEP: head {head} of layer {layer} has a non-finite magnitude; the weights \
+                     hold NaN or infinite values"
+                ));
+            }
             let score = mag * spectral * slack * pos;
             attn_score += score;
             heads.push(HeadImportance {
@@ -584,6 +607,37 @@ mod tests {
         close(mags[0], 10.0);
         assert_eq!(mags[1], 0.0);
         assert_eq!(mags[2], 0.0);
+    }
+
+    /// A diverged checkpoint (a NaN in one weight) has no importance order.
+    #[test]
+    fn non_finite_weights_are_refused() {
+        let gate = entry(
+            "blocks[0].ffn.w_gate",
+            2,
+            3,
+            &[3., 0., 1., 4., f32::NAN, 1.],
+        );
+        let up = entry("u", 2, 3, &[1., 2., 1., 1., 2., 1.]);
+        let down = entry("d", 3, 2, &[2., 0., 1., 1., 1., 0.]);
+        let err = ffn_neuron_magnitudes(&gate, &up, &down, 2, 3).unwrap_err();
+        assert!(
+            err.contains("neuron 1") && err.contains("non-finite"),
+            "{err}"
+        );
+
+        let mut wm = weights_2x2(true);
+        wm.insert(entry(
+            "blocks[0].attn.wo",
+            2,
+            2,
+            &[0., 5., f32::INFINITY, 8.],
+        ));
+        let err = analyse_weight_map(&wm, &spec_2x2(), &RooflineSlackTable::default()).unwrap_err();
+        assert!(
+            err.contains("head 1 of layer 0") && err.contains("non-finite"),
+            "{err}"
+        );
     }
 
     #[test]

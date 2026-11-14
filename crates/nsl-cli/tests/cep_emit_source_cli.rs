@@ -212,3 +212,90 @@ fn cep_outputs_are_all_or_nothing() {
     assert!(!delta_out.exists(), "the delta must not be written when an output cannot be");
     assert!(!weights_out.exists(), "the weights must not be written when the source cannot be");
 }
+
+/// The same when the failure only shows at write time: the weights path is
+/// an existing directory. The delta and the source, which could have been
+/// written, are not.
+#[test]
+fn cep_outputs_are_all_or_nothing_when_a_write_fails() {
+    let tmp = TempDir::new().unwrap();
+    let w = tmp.path().join("w.safetensors");
+    write_matching_safetensors(&w);
+    let delta_out = tmp.path().join("m.cep.json");
+    let weights_out = tmp.path().join("a_directory.safetensors");
+    fs::create_dir(&weights_out).unwrap();
+    let source_out = tmp.path().join("m.pruned.nsl");
+    let mut cmd = Command::cargo_bin("nsl").unwrap();
+    cmd.env("NSL_STDLIB_PATH", stdlib_path());
+    cmd.arg("build")
+        .arg(canonical_fixture())
+        .arg("--cep-prune")
+        .arg("--weights")
+        .arg(&w)
+        .arg("--cep-out")
+        .arg(&delta_out)
+        .arg("--cep-emit-weights")
+        .arg(&weights_out)
+        .arg("--cep-emit-source")
+        .arg(&source_out);
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("a_directory.safetensors"))
+        .stderr(predicate::str::contains("no file was written"));
+    assert!(!delta_out.exists() && !source_out.exists());
+    let left: Vec<_> = fs::read_dir(tmp.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(left.len(), 2, "only the input and the directory remain: {left:?}");
+}
+
+/// An output may not be the file the run reads from.
+#[test]
+fn cep_output_over_an_input_is_refused() {
+    let tmp = TempDir::new().unwrap();
+    let w = tmp.path().join("w.safetensors");
+    write_matching_safetensors(&w);
+    let before = fs::read(&w).unwrap();
+    let mut cmd = Command::cargo_bin("nsl").unwrap();
+    cmd.env("NSL_STDLIB_PATH", stdlib_path());
+    cmd.arg("build")
+        .arg(canonical_fixture())
+        .arg("--cep-prune")
+        .arg("--weights")
+        .arg(&w)
+        .arg("--cep-out")
+        .arg(tmp.path().join("m.cep.json"))
+        .arg("--cep-emit-weights")
+        // A second spelling of the same file.
+        .arg(tmp.path().join(".").join("w.safetensors"));
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("--cep-emit-weights"))
+        .stderr(predicate::str::contains("every output needs a file of its own"));
+    assert_eq!(fs::read(&w).unwrap(), before, "the input weights are untouched");
+    assert!(!tmp.path().join("m.cep.json").exists());
+}
+
+/// A negative sparsity is "met" by doing nothing; it used to be reported as
+/// a successful prune.
+#[test]
+fn cep_sparsity_outside_zero_to_one_is_refused() {
+    let tmp = TempDir::new().unwrap();
+    let w = tmp.path().join("w.safetensors");
+    write_matching_safetensors(&w);
+    for bad in ["-0.5", "1.5"] {
+        let delta_out = tmp.path().join("m.cep.json");
+        let mut cmd = Command::cargo_bin("nsl").unwrap();
+        cmd.env("NSL_STDLIB_PATH", stdlib_path());
+        cmd.arg("build")
+            .arg(canonical_fixture())
+            .arg("--cep-prune")
+            .arg("--weights")
+            .arg(&w)
+            .arg("--cep-out")
+            .arg(&delta_out)
+            .arg(format!("--cep-sparsity={bad}"));
+        cmd.assert()
+            .failure()
+            .stderr(predicate::str::contains("sparsity must be a fraction between 0 and 1"));
+        assert!(!delta_out.exists());
+    }
+}
