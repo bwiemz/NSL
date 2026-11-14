@@ -9,6 +9,10 @@
 //!    Under tape AD the mode was ignored and everything trained. The two AD
 //!    modes now agree: `@freeze` alone decides what trains.
 //!
+//!    `mode = hybrid` is now refused outright: it asks for automatic
+//!    placement, which does not exist. `budget=` and `target=` are held to
+//!    what they say (see the tests of each).
+//!
 //! 2. Any `@adapter` on an activation of rank 3 aborted at the first
 //!    optimizer step when the build pinned a target (`--target sm_80`).
 //!    A pinned target alone selected the fused adapter call, whose
@@ -146,18 +150,18 @@ fn mode_manual_trains_under_both_ad_modes() {
     );
 }
 
-/// `mode = hybrid` with a layer scope: same requirement.
+/// `mode = hybrid` asks the compiler to place adapters inside a layer scope.
+/// Nothing places an adapter automatically, so the mode is refused; it used
+/// to be accepted and to change nothing.
 #[test]
-fn mode_hybrid_trains_under_source_ad() {
+fn mode_hybrid_is_refused() {
     let source = r#"from nsl.nn.losses import mse_loss
 
 model Blk:
     wq: Tensor = randn([8, 8]) * 0.2
-    wf: Tensor = randn([8, 8]) * 0.2
 
     fn forward(self, x: Tensor) -> Tensor:
-        let q = x @ self.wq
-        return (x + tanh(q)) @ self.wf
+        return x @ self.wq
 
 model Net:
     b0: Blk = Blk()
@@ -168,37 +172,124 @@ model Net:
 
 @wrga(mode=hybrid, layers=["b1"])
 let m = Net()
-let x = randn([2, 5, 8])
-let y = randn([2, 5, 8])
-let before: Tensor = m.b1.wf
-print("W0_BEGIN")
-print(before)
-print("W0_END")
-train(model = m, epochs = 3):
+print("RAN")
+"#;
+    for ad in [&["--target", "cpu"][..], &["--target", "cpu", "--source-ad"][..]] {
+        let r = run(source, ad);
+        assert!(!r.ok && !r.stdout.contains("RAN"), "{ad:?}: mode=hybrid should not build");
+        assert!(
+            r.stderr.contains("@wrga(mode=hybrid) is not supported"),
+            "{ad:?}: the error should name the mode:\n{}",
+            r.stderr
+        );
+    }
+}
+
+/// Six 8×8 weights, each with a rank-2 LoRA adapter: 6 × 2 × (8 + 8) = 192
+/// adapter parameters.
+fn budget_program(budget: &str) -> String {
+    format!(
+        r#"from nsl.nn.losses import mse_loss
+
+model Blk:
+    wq: Tensor = randn([8, 8]) * 0.2
+    wk: Tensor = randn([8, 8]) * 0.2
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return (x @ self.wq) @ self.wk
+
+model Net:
+    blocks: [Blk; 3] = Blk()
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = x
+        for blk in self.blocks:
+            h = blk.forward(h)
+        return h
+
+@wrga({budget})
+@freeze
+@adapter(type=lora, target=["Blk.wq", "Blk.wk"], rank=2)
+let m = Net()
+let x = randn([4, 8])
+let y = randn([4, 8])
+train(model = m, epochs = 1):
     optimizer: SGD(lr = 0.05)
     step(batch):
         let loss = mse_loss(m.forward(x), y)
-let after: Tensor = m.b1.wf
-print("W_BEGIN")
-print(after)
-print("W_END")
-"#;
-    let mut finals: Vec<Vec<f64>> = Vec::new();
+print("RAN")
+"#
+    )
+}
+
+/// `@wrga(budget=N)` is a cap on the parameters the declared adapters hold.
+/// It used to reach only the report's rank suggestions, as a number of
+/// ranks, and bound nothing.
+#[test]
+fn a_budget_the_adapters_exceed_fails_the_build() {
     for ad in [&["--target", "cpu"][..], &["--target", "cpu", "--source-ad"][..]] {
-        let r = run(source, ad);
-        assert!(r.ok, "{ad:?} failed:\n{}", r.stderr);
-        let w0 = section(&r.stdout, "W0");
-        let w = section(&r.stdout, "W");
+        // 192 parameters: a budget of 192 holds them, 191 does not.
+        let fits = run(&budget_program("budget=192"), ad);
+        assert!(fits.ok && fits.stdout.contains("RAN"), "{ad:?}:\n{}", fits.stderr);
+
+        let over = run(&budget_program("budget=191"), ad);
+        assert!(!over.ok && !over.stdout.contains("RAN"), "{ad:?}: 192 > 191 should not build");
         assert!(
-            largest_change(&w0, &w) > 1e-4,
-            "{ad:?}: b1.wf did not move in 3 SGD steps"
+            over.stderr.contains("@wrga(budget=191)")
+                && over.stderr.contains("hold 192 parameters")
+                && over.stderr.contains("1 over the budget"),
+            "{ad:?}: the error should give the budget and the count:\n{}",
+            over.stderr
         );
-        finals.push(w);
+
+        // No budget: nothing to exceed.
+        let free = run(&budget_program("mode=manual"), ad);
+        assert!(free.ok && free.stdout.contains("RAN"), "{ad:?}:\n{}", free.stderr);
     }
-    assert!(
-        largest_change(&finals[0], &finals[1]) < 1e-5,
-        "tape AD and source AD trained mode=hybrid to different weights"
-    );
+}
+
+/// `@wrga(target=...)` names the GPU the analysis runs for. A name the GPU
+/// table does not have used to fall back to the default GPU without a word.
+#[test]
+fn an_unknown_target_gpu_fails_the_build() {
+    for ad in [&["--target", "cpu"][..], &["--target", "cpu", "--source-ad"][..]] {
+        let r = run(&budget_program("target=rtx9999"), ad);
+        assert!(!r.ok && !r.stdout.contains("RAN"), "{ad:?}: rtx9999 is not a GPU");
+        assert!(
+            r.stderr.contains("WRGA target 'rtx9999'") && r.stderr.contains("H100-SXM"),
+            "{ad:?}: the error should name the target and list the known ones:\n{}",
+            r.stderr
+        );
+        for known in ["target=h100", "target=rtx5070ti", "target=\"RTX-4090\""] {
+            let ok = run(&budget_program(known), ad);
+            assert!(ok.ok && ok.stdout.contains("RAN"), "{ad:?} {known}:\n{}", ok.stderr);
+        }
+    }
+}
+
+/// An adapter tensor read off a model is a tensor to the type checker, so an
+/// expression on it prints as a number. `print(m.lora_B_... .sum())` used to
+/// print the tensor's handle, a large integer.
+#[test]
+fn an_expression_on_an_adapter_tensor_prints_its_value() {
+    let source = r#"from nsl.nn.losses import mse_loss
+
+model Toy:
+    w: Tensor = randn([4, 4]) * 0.3
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+@adapter(type=ia3, target=["Toy.w"])
+let m = Toy()
+print("SUM_BEGIN")
+print(m.ia3_scale_Toy_w__ia3.sum())
+print("SUM_END")
+"#;
+    let r = run(source, &["--target", "cpu"]);
+    assert!(r.ok, "{}", r.stderr);
+    // The IA³ scale is four ones.
+    assert_eq!(section(&r.stdout, "SUM"), [4.0], "stdout:\n{}", r.stdout);
 }
 
 /// A LoRA adapter on a `[batch, seq, d]` activation, built for a pinned

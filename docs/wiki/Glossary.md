@@ -60,7 +60,7 @@ FlashAttention-2 kernel variant that packs multiple variable-length sequences in
 Multi-level ILP/DP pass that co-optimizes CEP head pruning, CSHA fusion level, WRGA adapter rank, and CPDT shard factor across all layers jointly, producing an `AppliedPlan` that downstream consumers consume. See [NSL-WGGO-Research.md.pdf](../research/NSL-WGGO-Research.md.pdf); implementation in `crates/nsl-codegen/src/wggo.rs`.
 
 ### <a id="wrga"></a>WRGA — Wengert-Pruned Roofline-Guided Adaptation
-Pass that decides per-layer LoRA/IA³/GatedLoRA adapter ranks by combining Wengert-graph pruning, roofline bandwidth analysis, and spectral rank scoring, then emits fused MMA PTX for the adapter forward (and optionally backward) pass. See [NSL-WRGA-Research.PDF](../research/NSL-WRGA-Research.PDF); design specs in [`docs/superpowers/specs/`](../superpowers/specs/) (search `wrga`); implementation in `crates/nsl-codegen/src/wrga.rs`.
+The adapter subsystem: `@adapter` adds a LoRA, IA³ or gated-LoRA adapter at a declared rank to a named model weight, `@freeze` freezes parameters, and `@wrga` adds a report on the train block (backward pruning, roofline classification, spectral ranks, fusible sites) that describes the declared adapters and chooses none. Fused MMA PTX for the adapter forward pass is opt-in (`NSL_WRGA_FUSED_CUDA=1`). See [NSL-WRGA-Research.PDF](../research/NSL-WRGA-Research.PDF); design specs in [`docs/superpowers/specs/`](../superpowers/specs/) (search `wrga`); implementation in `crates/nsl-codegen/src/wrga.rs`.
 
 ---
 
@@ -197,7 +197,7 @@ Marks a tensor as sharded across the GPU world (M30); the compiler inserts NCCL 
 **Not implemented.** The spec ([`spec/04-model-definition.nsl.md`](../../spec/04-model-definition.nsl.md)) describes it declaring that two model fields share one weight tensor, but no compiler support exists; since Milestone A the decorator is a typed compile error rather than a silent no-op. Share weights by assigning the same tensor to both fields.
 
 ### <a id="dec-wrga"></a>`@wrga`
-Attaches WRGA adapter configuration to a model, specifying adapter type (LoRA/IA³/GatedLoRA), rank bounds, and target layers. Used alongside `@freeze` and `@adapter`. See [Glossary#wrga](#wrga).
+Asks for the WRGA analysis of a model's train block: `mode=auto|manual` (alike: adapters are the ones `@adapter` declares), `budget=N` (a compile-time cap on the declared adapters' parameters) and `target=<gpu>` (the GPU the report's roofline uses). The adapters themselves are declared with `@adapter` and the frozen parameters with `@freeze`. See [Glossary#wrga](#wrga).
 
 ---
 

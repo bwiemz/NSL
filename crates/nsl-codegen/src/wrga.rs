@@ -14,12 +14,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use nsl_ast::block::WrgaMode;
 
-use crate::gpu_specs::{default_gpu, find_gpu};
+use crate::gpu_specs::{default_gpu, find_gpu, GpuSpec, GPU_DATABASE};
 use crate::wengert::{PrimalOp, VarId, WengertList};
 use crate::weight_aware::WeightMap;
-use crate::wrga_fusion::{
-    build_fusion_plan, verify_fused_sites_have_no_intermediate, FusionPlan,
-};
+use crate::wrga_fusion::{build_fusion_plan, FusionPlan};
 use crate::wrga_memory::{plan_memory_with_pin, MemoryPlan, SizeHints};
 use crate::wrga_prune::{prune, PruneResult};
 use crate::pass_trace::{DeclineReason, PassDisposition};
@@ -101,28 +99,40 @@ impl WrgaAblation {
 #[derive(Clone)]
 pub struct WrgaInput<'a> {
     pub mode: WrgaMode,
-    /// Parameter names to *exclude* from freezing (i.e. these are trainable).
-    /// Supports the same glob dialect as `wrga_prune::glob_match` —
-    /// e.g. `blocks.6.*`.
+    /// The parameters that train, as names or globs in the dialect of
+    /// `wrga_prune::glob_match` (e.g. `blocks.6.*`; `*` for all of them).
+    /// A parameter no pattern matches is frozen, so an empty list is a model
+    /// with nothing trainable. (Empty used to mean "everything trains",
+    /// which is what a fully frozen model then reported.)
     pub trainable_patterns: Vec<&'a str>,
-    /// Explicit adapter target layer globs for `mode=manual`.  Ignored for
-    /// `auto` (which runs placement automatically) and `hybrid` (which uses
-    /// the layer scope instead).
-    pub manual_adapter_targets: Vec<&'a str>,
-    /// Explicit layer scope for `mode=hybrid`.
-    pub hybrid_layers: Vec<&'a str>,
+    /// The adapters the program declares with `@adapter`, by the name of the
+    /// parameter each one adapts, as the Wengert list spells it
+    /// (`m.blocks.0.wq`). When there are any, they are the plan's sites,
+    /// trainable or frozen, with their declared kind and rank; the roofline
+    /// and spectral stages then describe them and choose nothing. Empty means
+    /// the program declares no adapter, and the plan lists the sites an
+    /// adapter could go on, none of which gets one.
+    pub declared_adapters: BTreeMap<String, DeclaredAdapter>,
+    /// Weight shapes known at compile time, by parameter name.
+    pub param_shapes: HashMap<String, [usize; 2]>,
+    /// Whether this build runs adapters through the synthesized fused
+    /// kernels (a pinned target and `NSL_WRGA_FUSED_CUDA=1`). The report
+    /// says so beside its count of fusible sites.
+    pub fused_kernels_active: bool,
     /// Forward Wengert list (from source-AD extraction).
     pub wengert: &'a WengertList,
     /// VarId of the scalar loss (the adjoint seed).
     pub loss_output: VarId,
     /// Optional pre-trained weights for spectral analysis.
     pub weights: Option<&'a WeightMap>,
-    /// Target GPU name.  Looked up in `gpu_specs::GPU_DATABASE`.  Empty /
-    /// unknown falls back to `default_gpu()`.
+    /// Target GPU name, resolved with [`resolve_gpu`].  Empty means none was
+    /// given: the analysis then uses `default_gpu()` and the report says so.
+    /// A caller with a name from the user checks it with [`resolve_gpu`]
+    /// first; an unknown name reaching here also falls back, labelled.
     pub target: &'a str,
-    /// Total adapter parameter budget.  A budget of 0 means "unbounded"; in
-    /// that case WRGA falls back to `r_max`-sized adapters on every site that
-    /// the roofline picks.
+    /// Cap on the total parameter count of the SUGGESTED adapters, when the
+    /// program declares none (0 = no cap). Declared adapters are held to the
+    /// budget at compile time instead (`Compiler::check_adapter_budget`).
     pub budget_params: usize,
     /// Rank band.
     pub r_min: usize,
@@ -149,6 +159,56 @@ pub struct WrgaInput<'a> {
     /// user-defined model instead of one of the built-in flavours.
     /// `None` keeps the compiler-chosen flavour selection.
     pub custom_adapter: Option<&'a str>,
+}
+
+/// One adapter the program declares with `@adapter`, on one parameter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredAdapter {
+    pub kind: crate::AdapterKind,
+    /// The declared rank (LoRA and gated LoRA; unused by IA³).
+    pub rank: usize,
+    /// The number of parameters its tensors hold, when the adapted weight's
+    /// shape is known at compile time.
+    pub params: Option<usize>,
+}
+
+/// Look a GPU up by the name a user wrote: `h100`, `rtx5070ti`, `RTX-4090`.
+///
+/// [`find_gpu`] wants the table's own punctuation, so `rtx5070ti` (the
+/// spelling the proposal and the decorator's own error message use) matched
+/// no entry and the analysis silently ran for the default GPU. This also
+/// accepts a name that matches once punctuation is dropped.
+pub fn resolve_gpu(name: &str) -> Option<&'static GpuSpec> {
+    // An empty name is no name: `find_gpu` would take it as a prefix of
+    // every entry.
+    if !name.chars().any(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    if let Some(gpu) = find_gpu(name) {
+        return Some(gpu);
+    }
+    let squash = |s: &str| -> String {
+        s.chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .map(|c| c.to_ascii_lowercase())
+            .collect()
+    };
+    let want = squash(name);
+    let matches: Vec<&GpuSpec> = GPU_DATABASE
+        .iter()
+        .filter(|g| squash(g.name).starts_with(&want))
+        .collect();
+    matches
+        .iter()
+        .find(|g| squash(g.name) == want)
+        .or_else(|| matches.iter().find(|g| g.name.contains("SXM")))
+        .or(matches.first())
+        .copied()
+}
+
+/// The names [`resolve_gpu`] knows, for an error message.
+pub fn known_gpu_names() -> Vec<&'static str> {
+    GPU_DATABASE.iter().map(|g| g.name).collect()
 }
 
 /// Compiled WRGA plan — consumed by downstream codegen stages.
@@ -178,6 +238,19 @@ pub struct WrgaPlan {
     /// cycle; for now the flavour selection falls back to the existing
     /// LoRA/IA³/GatedLoRA pipeline regardless of this field.
     pub custom_adapter: Option<String>,
+    /// Whether `placements` are the adapters the program declares (true) or
+    /// only the sites an adapter could go on (false: nothing in the plan is
+    /// built).
+    pub adapters_declared: bool,
+    /// Sites left out of `adapter_params()` because the shape of their
+    /// weight is not known at compile time.
+    pub unsized_sites: usize,
+    /// For each entry of `ranks`, `m + n` of the weight it sits on (0 when
+    /// the shape is unknown): what a method with its own rank formula needs
+    /// to count parameters on the same sites.
+    pub rank_site_mn: Vec<usize>,
+    /// Whether the build runs adapters through the fused kernels.
+    pub fused_kernels_active: bool,
 }
 
 impl WrgaPlan {
@@ -210,6 +283,10 @@ impl WrgaPlan {
             override_diagnostics: Vec::new(),
             ablation: WrgaAblation::default(),
             custom_adapter: None,
+            adapters_declared: false,
+            unsized_sites: 0,
+            rank_site_mn: Vec::new(),
+            fused_kernels_active: false,
         }
     }
 
@@ -244,10 +321,13 @@ impl WrgaPlan {
             writeln!(s, "Ablation: skip={}", self.ablation.human_label()).unwrap();
         }
         writeln!(s).unwrap();
+        // Both sides of each arrow count the same thing: the left is what a
+        // backward pass with every parameter trainable would differentiate
+        // (or save), the right is what this one does.
         writeln!(
             s,
             "Backward pruning: {} ops → {} ops ({:.1}% eliminated)",
-            self.prune.stats.forward_ops_total,
+            self.prune.stats.full_backward_ops,
             self.prune.stats.backward_ops_retained,
             100.0 * self.prune.stats.backward_elimination_ratio()
         )
@@ -267,16 +347,65 @@ impl WrgaPlan {
         )
         .unwrap();
         writeln!(s).unwrap();
-        writeln!(
-            s,
-            "Adapter parameters: {}  |  Sites: {}  |  Fused: {}/{} ({:.1}%)",
-            self.adapter_params(),
-            self.fusion.total_count(),
-            self.fusion.fused_count(),
-            self.fusion.total_count(),
-            100.0 * self.fusion.fusion_ratio()
-        )
-        .unwrap();
+        let unsized_note = match self.unsized_sites {
+            0 => String::new(),
+            n => format!(" (+ {n} sites whose weight shape is not known at compile time)"),
+        };
+        if self.adapters_declared {
+            // The program's own adapters. "Fusible" is whether a fused kernel
+            // exists for the site's kind; whether the build uses it is the
+            // opt-in, stated beside it.
+            writeln!(
+                s,
+                "Adapter parameters: {}{}  |  Sites: {}  |  Fusible: {}/{} ({:.1}%), fused kernels {}",
+                self.adapter_params(),
+                unsized_note,
+                self.fusion.total_count(),
+                self.fusion.fused_count(),
+                self.fusion.total_count(),
+                100.0 * self.fusion.fusion_ratio(),
+                if self.fused_kernels_active { "on" } else { "off" },
+            )
+            .unwrap();
+        } else {
+            // No `@adapter` in the program: these are the sites an adapter
+            // could go on and the ranks the analysis suggests. None is built.
+            writeln!(
+                s,
+                "Suggested adapters (none declared, none built): {} parameters{}  |  Sites: {}  |  Fusible: {}/{} ({:.1}%)",
+                self.adapter_params(),
+                unsized_note,
+                self.fusion.total_count(),
+                self.fusion.fused_count(),
+                self.fusion.total_count(),
+                100.0 * self.fusion.fusion_ratio()
+            )
+            .unwrap();
+        }
+        if !self.spectral.is_empty() {
+            // Present only when a checkpoint was given and some of its
+            // weights are sites. The figures describe the weights; they do
+            // not size an adapter.
+            let sites = self
+                .placements
+                .iter()
+                .filter(|p| !matches!(p.adapter, crate::wrga_roofline::AdapterKind::Skip))
+                .count();
+            let ranks = self.spectral.iter().map(|sp| sp.effective_rank);
+            let (lo, hi) = ranks.fold((f64::INFINITY, 0.0_f64), |(lo, hi), r| (lo.min(r), hi.max(r)));
+            let kept = self.spectral.iter().map(|sp| sp.truncated_rank).max().unwrap_or(0);
+            writeln!(
+                s,
+                "Spectral analysis: {} of {} sites matched a checkpoint weight; effective rank \
+                 {:.1} to {:.1} over the top {} singular values",
+                self.spectral.len(),
+                sites,
+                lo,
+                hi,
+                kept
+            )
+            .unwrap();
+        }
         writeln!(
             s,
             "Memory plan: {} live activations → {} slots (reuse {:.1}%)",
@@ -288,45 +417,31 @@ impl WrgaPlan {
         s
     }
 
-    /// Render a PEFT comparison report — WRGA's measured numbers against
-    /// theoretical baselines for LoRA, AdaLoRA, GaLore, and ReFT, derived
-    /// from the same per-site shape data that drove this plan.
+    /// Render a PEFT comparison report: the adapter parameter count of this
+    /// plan beside what LoRA at a fixed rank, GaLore and ReFT would hold on
+    /// the same sites, by each method's parameter formula.
     ///
     /// Surface: `nsl check --wrga-compare <file>.nsl [--weights w.safetensors]`
     /// (WRGA paper §8.3).
     ///
-    /// The comparison is **theoretical**: it answers "if we re-ran the same
-    /// site selection under each baseline's parameter formula, how would the
-    /// adapter parameter count, backward FLOPs ratio, activation memory ratio,
-    /// and fusion ratio differ?" It does NOT compare empirical quality or
-    /// wall-clock speed — those require the §9 benchmark suite and the §9.3
-    /// ablation harness (separate audit gaps).
+    /// Only parameter counts are compared, because only they can be derived
+    /// from the plan. Per site `i` with weight shape `[m_i, n_i]`:
+    /// - **LoRA (Hu et al. 2021)**: fixed rank `r=16`; `16 * (m_i + n_i)`.
+    /// - **GaLore (Zhao et al. 2024)**: trains the full parameters through a
+    ///   low-rank gradient projection, so it adds no adapter parameters.
+    /// - **ReFT (Wu et al. 2024)**: rank-4 interventions on the top 25% of
+    ///   sites; `4 * n_i` for those, with `n_i` taken as `(m_i + n_i) / 2`.
     ///
-    /// ## Baseline formulas
+    /// The table used to carry three more columns (backward ops, saved
+    /// activations, fusion), filled for every baseline with the constants
+    /// 100%, 100% and 0%. Nothing had been computed for them, and the first
+    /// two are not even true of the baselines: PyTorch records an operation
+    /// for the backward pass only when one of its inputs requires a gradient,
+    /// so a frozen parameter's gradient is skipped there as well. It also had
+    /// an "AdaLoRA" row holding this plan's own count; AdaLoRA's ranks come
+    /// out of training, and no count for it follows from the program.
     ///
-    /// Per WRGA-placed site `i` with weight shape `[m_i, n_i]`:
-    /// - **LoRA (Hu et al. 2021)**: fixed rank `r=16`; `params_i = 16 * (m_i + n_i)`.
-    ///   No backward pruning, no fusion, no activation savings.
-    /// - **AdaLoRA (Zhang et al. 2023)**: SVD-derived rank — modeled here as
-    ///   WRGA's own spectral allocation (both methods use the same
-    ///   singular-value-importance heuristic). Same param count as WRGA but
-    ///   no Wengert pruning and no fusion.
-    /// - **GaLore (Zhao et al. 2024)**: full-parameter training with low-rank
-    ///   gradient projection — zero adapter parameters by construction. No
-    ///   backward pruning (GaLore prunes the gradient subspace, not the
-    ///   compute graph) and no fusion.
-    /// - **ReFT (Wu et al. 2024)**: rank-4 intervention vectors on the top
-    ///   25% of placement sites; `params_i = 4 * n_i` for those sites only.
-    ///   No backward pruning, no fusion.
-    ///
-    /// The "Backward FLOPs %" column reports each method's retained-backward
-    /// op count as a fraction of the unpruned forward op count. The
-    /// "Activation Memory %" column does the same for saved activations.
-    /// Both lower-is-better. The "Fusion %" column is the fraction of
-    /// placement sites whose adapter is fused into an adjacent matmul.
-    ///
-    /// Output is deterministic given the input plan: column widths are
-    /// fixed, ordering is fixed, every numeric is computed from struct fields.
+    /// Output is deterministic given the input plan.
     pub fn render_compare_report(&self) -> String {
         use std::fmt::Write as _;
 
@@ -336,119 +451,71 @@ impl WrgaPlan {
         writeln!(s, "Target hardware: {}", self.target_gpu).unwrap();
         writeln!(s, "Placement sites: {}", self.placements.len()).unwrap();
         writeln!(s).unwrap();
-
-        let baselines = self.compute_compare_baselines();
-
-        // Table: Method | Params | Bwd Live % | Act Saved % | Fusion %
-        // Widths chosen so the WRGA row plus baseline rows line up.
-        writeln!(
-            s,
-            "{:<22} | {:>10} | {:>10} | {:>11} | {:>7}",
-            "Method", "Params", "Bwd Live %", "Act Saved %", "Fusion %"
-        )
-        .unwrap();
-        writeln!(
-            s,
-            "{0:-<22}-+-{0:-<10}-+-{0:-<10}-+-{0:-<11}-+-{0:-<7}",
-            ""
-        )
-        .unwrap();
-
-        for row in &baselines {
+        writeln!(s, "Adapter parameters on this plan's sites, by each method's formula:").unwrap();
+        writeln!(s, "{:<22} | {:>10}", "Method", "Params").unwrap();
+        writeln!(s, "{0:-<22}-+-{0:-<10}", "").unwrap();
+        for row in self.compute_compare_rows() {
+            writeln!(s, "{:<22} | {:>10}", row.label, fmt_with_commas(row.adapter_params)).unwrap();
+        }
+        if self.unsized_sites > 0 {
             writeln!(
                 s,
-                "{:<22} | {:>10} | {:>9.1}% | {:>10.1}% | {:>6.1}%",
-                row.label,
-                fmt_with_commas(row.adapter_params),
-                100.0 * row.backward_retained_ratio,
-                100.0 * row.activation_retained_ratio,
-                100.0 * row.fusion_ratio,
+                "({} sites are left out of every row: the shape of their weight is not known \
+                 at compile time.)",
+                self.unsized_sites
             )
             .unwrap();
         }
-
         writeln!(s).unwrap();
+        let stats = &self.prune.stats;
         writeln!(
             s,
-            "Bwd Live %  — fraction of forward Wengert ops that must stay live \
-             for the backward pass (lower = more Wengert pruning)."
+            "This plan: the backward pass differentiates {} of the {} ops a pass with every \
+             parameter trainable would, and saves {} of its {} activations; {} of {} sites \
+             could use a fused kernel.",
+            stats.backward_ops_retained,
+            stats.full_backward_ops,
+            stats.pruned_saved_activations,
+            stats.full_backward_saved_activations,
+            self.fusion.fused_count(),
+            self.fusion.total_count(),
         )
         .unwrap();
         writeln!(
             s,
-            "Act Saved % — fraction of saved-for-backward activations retained \
-             after Innovation 5 memory planning (lower = more activation reuse)."
+            "No such figures are given for the other methods: none was computed, and a \
+             framework that records only operations with a trainable input skips the same \
+             frozen-parameter gradients. AdaLoRA has no row: its ranks come out of training."
         )
         .unwrap();
         writeln!(
             s,
-            "Fusion %    — share of placement sites whose adapter fuses into an \
-             adjacent matmul (Innovation 4)."
-        )
-        .unwrap();
-        writeln!(s).unwrap();
-        writeln!(
-            s,
-            "Comparison is structural (param formulas + WRGA's measured \
-             pruning/fusion); empirical quality and wall-clock require the \
-             §9 benchmark suite."
+            "The counts are formulas over the sites above. They say nothing about quality \
+             or speed."
         )
         .unwrap();
         s
     }
 
-    /// Build the five comparison rows (WRGA + four baselines). Pulled out so
-    /// the table renderer and tests can share one source of truth for the
-    /// numerics.
-    fn compute_compare_baselines(&self) -> Vec<CompareRow> {
-        // Recover each site's (m + n) from the actual adapter parameter
-        // formula `params = rank * (m + n)`. Sites with rank == 0 (skipped
-        // by the placement stage) contribute zero — there's no shape to
-        // recover for them.
-        let mn_sums: Vec<usize> = self
-            .ranks
-            .iter()
-            .map(|r| if r.rank == 0 { 0 } else { r.adapter_params / r.rank })
+    /// The comparison's rows: this plan, then each baseline's parameter count
+    /// on the same sites. Pulled out so the renderer and tests share one
+    /// source for the numbers.
+    fn compute_compare_rows(&self) -> Vec<CompareRow> {
+        // `m + n` per site; 0 for a site whose weight shape is unknown.
+        let mn_sums: Vec<usize> = (0..self.ranks.len())
+            .map(|i| self.rank_site_mn.get(i).copied().unwrap_or(0))
             .collect();
 
-        // WRGA: measured values from the plan itself.
         let wrga_params: usize = self.ranks.iter().map(|r| r.adapter_params).sum();
-        let total_fwd_ops = self.prune.stats.forward_ops_total.max(1);
-        let wrga_backward_retained =
-            self.prune.stats.backward_ops_retained as f64 / total_fwd_ops as f64;
-        let naive_acts = self.prune.stats.full_backward_saved_activations.max(1);
-        let wrga_activation_retained =
-            self.prune.stats.pruned_saved_activations as f64 / naive_acts as f64;
-        let wrga_fusion = self.fusion.fusion_ratio();
 
-        // LoRA: fixed rank r = 16 on every placement site.
+        // LoRA: fixed rank r = 16 on every site.
         const LORA_FIXED_RANK: usize = 16;
         let lora_params: usize = mn_sums.iter().map(|mn| LORA_FIXED_RANK * mn).sum();
 
-        // AdaLoRA: SVD-driven rank allocation — model as WRGA's own
-        // adapter_params, since both methods share the same singular-value
-        // importance formula. The differentiator is that AdaLoRA does NOT do
-        // Wengert pruning or fusion-integrated adapters.
-        let adalora_params = wrga_params;
-
-        // GaLore: zero adapter parameters by construction (it projects
-        // full-parameter gradients into a low-rank subspace instead of
-        // adding adapter weights).
-        let galore_params = 0usize;
-
-        // ReFT: rank-4 intervention vectors on the top 25% of placement
-        // sites by parameter footprint (round up). Each intervention
-        // contributes `4 * n_i` params, approximating `n_i = mn_sum / 2` when
-        // m_i ≈ n_i (square weights — typical for transformer attention
-        // projections). For non-square weights this over- or under-estimates
-        // by the m/n ratio; acceptable at paper §8.3's order-of-magnitude
-        // intent.
-        //
-        // Sites with `mn_sum == 0` (placements WRGA rank-skipped) contribute
-        // ZERO ReFT params — the `if mn == 0 { 0 }` branch is load-bearing
-        // when WRGA prunes >75% of candidate sites, since those rank-0 entries
-        // can otherwise survive the top-25% take and each would silently add
-        // `REFT_RANK * 1` phantom params via the historical `.max(1)`.
+        // ReFT: rank-4 intervention vectors on the top 25% of sites by
+        // footprint (round up). Each contributes `4 * n_i`, with `n_i` taken
+        // as `mn_sum / 2`, which is exact for a square weight and off by the
+        // m/n ratio otherwise. A site of unknown shape contributes nothing.
         const REFT_RANK: usize = 4;
         let reft_site_count = self.placements.len().div_ceil(4);
         let mut sorted_mn: Vec<usize> = mn_sums.clone();
@@ -460,55 +527,21 @@ impl WrgaPlan {
             .sum();
 
         vec![
-            CompareRow {
-                label: "WRGA (this run)".to_string(),
-                adapter_params: wrga_params,
-                backward_retained_ratio: wrga_backward_retained,
-                activation_retained_ratio: wrga_activation_retained,
-                fusion_ratio: wrga_fusion,
-            },
-            CompareRow {
-                label: "LoRA (r=16)".to_string(),
-                adapter_params: lora_params,
-                backward_retained_ratio: 1.0,
-                activation_retained_ratio: 1.0,
-                fusion_ratio: 0.0,
-            },
-            CompareRow {
-                label: "AdaLoRA".to_string(),
-                adapter_params: adalora_params,
-                backward_retained_ratio: 1.0,
-                activation_retained_ratio: 1.0,
-                fusion_ratio: 0.0,
-            },
-            CompareRow {
-                label: "GaLore".to_string(),
-                adapter_params: galore_params,
-                backward_retained_ratio: 1.0,
-                activation_retained_ratio: 1.0,
-                fusion_ratio: 0.0,
-            },
-            CompareRow {
-                label: "ReFT (r=4, top-25%)".to_string(),
-                adapter_params: reft_params,
-                backward_retained_ratio: 1.0,
-                activation_retained_ratio: 1.0,
-                fusion_ratio: 0.0,
-            },
+            CompareRow { label: "WRGA (this run)".to_string(), adapter_params: wrga_params },
+            CompareRow { label: "LoRA (r=16)".to_string(), adapter_params: lora_params },
+            // GaLore projects full-parameter gradients into a low-rank
+            // subspace instead of adding adapter weights.
+            CompareRow { label: "GaLore".to_string(), adapter_params: 0 },
+            CompareRow { label: "ReFT (r=4, top-25%)".to_string(), adapter_params: reft_params },
         ]
     }
 }
 
-/// One row of the PEFT comparison table. All numerics are dimensionless or
-/// in [0, 1] (ratios); the renderer multiplies by 100 for the percentage
-/// columns.
+/// One row of the PEFT comparison table.
 #[derive(Debug, Clone, PartialEq)]
 struct CompareRow {
     label: String,
     adapter_params: usize,
-    backward_retained_ratio: f64,
-    activation_retained_ratio: f64,
-    fusion_ratio: f64,
 }
 
 /// Format an integer with thousands separators (commas) using a
@@ -536,10 +569,10 @@ fn fmt_with_commas(n: usize) -> String {
 /// every "would-save" activation as needing save. Mirrors what a naive PyTorch
 /// backward would produce — every intermediate stays alive for the adjoint.
 ///
-/// `stats.backward_ops_retained == stats.forward_ops_total` and
+/// `stats.backward_ops_retained == stats.full_backward_ops` and
 /// `stats.pruned_saved_activations == stats.full_backward_saved_activations`
-/// so `render_report` reports 100% retained / 0% eliminated for both
-/// rows of the prune summary.
+/// so `render_report` reports 0% eliminated on both rows of the prune
+/// summary.
 fn prune_noop(list: &WengertList, trainable: &BTreeSet<VarId>) -> PruneResult {
     use crate::wrga_prune::PruneStats;
 
@@ -550,13 +583,9 @@ fn prune_noop(list: &WengertList, trainable: &BTreeSet<VarId>) -> PruneResult {
     // pruner: build the live sets first, then stamp the bits.
     let mut backward_live: BTreeSet<VarId> = BTreeSet::new();
     let mut activation_live: BTreeSet<VarId> = BTreeSet::new();
-    let mut total_full_saves: usize = 0;
     for op in &list.ops {
         backward_live.insert(op.result);
         let req = crate::wrga_prune::save_requirements(&op.op);
-        if req.needs_output || req.needs_inputs {
-            total_full_saves += 1;
-        }
         if req.needs_output {
             activation_live.insert(op.result);
         }
@@ -583,15 +612,11 @@ fn prune_noop(list: &WengertList, trainable: &BTreeSet<VarId>) -> PruneResult {
         activation_live,
         stats: PruneStats {
             forward_ops_total: list.len(),
+            // Everything is kept, so both baselines equal what is kept and
+            // the report reads 0% eliminated on both lines.
+            full_backward_ops: list.len(),
             backward_ops_retained: list.len(),
-            // Mirror the unit mismatch in `wrga_prune::prune()` exactly:
-            // `full_backward_saved_activations` is op-count (the naive
-            // PyTorch baseline counts ops with any save requirement);
-            // `pruned_saved_activations` is VarId-count (distinct tensors
-            // actually kept alive). The ratio is what feeds `render_report`'s
-            // "X tensors → Y tensors" line, so consistent units with the
-            // real pruner matters for diffability across runs.
-            full_backward_saved_activations: total_full_saves,
+            full_backward_saved_activations: pruned_saved,
             pruned_saved_activations: pruned_saved,
             gradient_targets: trainable.len(),
             frozen_params,
@@ -643,9 +668,8 @@ fn spectral_noop(
             name: p.name.clone(),
             rank: p.suggested_rank,
             effective_rank: p.suggested_rank as f64,
-            // No spectral data ⇒ no (m+n) recovery. Comparison renderer
-            // tolerates rank * 0 = 0 here; downstream consumers that need a
-            // real param count must NOT ablate spectral.
+            // The spectral stage is what sizes the adapters; ablated, the
+            // plan holds ranks and no parameter count.
             adapter_params: 0,
         })
         .collect();
@@ -694,40 +718,109 @@ pub fn run(input: WrgaInput) -> WrgaPlan {
     };
 
     // ── Stage 3: Innovation 2 — Roofline placement ────────────────────────
-    let gpu = find_gpu(input.target).unwrap_or_else(default_gpu);
+    let (gpu, target_gpu) = if input.target.is_empty() {
+        let gpu = default_gpu();
+        (gpu, format!("{} (default: no target given)", gpu.name))
+    } else {
+        match resolve_gpu(input.target) {
+            Some(gpu) => (gpu, gpu.name.to_string()),
+            None => {
+                let gpu = default_gpu();
+                (gpu, format!("{} (default: '{}' is not a known GPU)", gpu.name, input.target))
+            }
+        }
+    };
+    let adapters_declared = !input.declared_adapters.is_empty();
     let sites = infer_sites_from_wengert(input.wengert, &trainable, &input);
-    let (placements, placement_diags) = if abl.skip_roofline_placement {
+    let site_shapes: HashMap<String, [usize; 2]> = sites
+        .iter()
+        .filter(|s| s.shape_known)
+        .map(|s| (s.site.name.clone(), [s.site.shape[0] as usize, s.site.shape[1] as usize]))
+        .collect();
+    let roofline_sites: Vec<AdapterSite> = sites.into_iter().map(|s| s.site).collect();
+    let (mut placements, placement_diags) = if abl.skip_roofline_placement {
         // §9.3 ablation: skip roofline AND the WGGO placement filter — the
         // no-op output is deliberately a uniform "adapter on every site at
         // r_max", and the WGGO filter is part of Innovation 2's pipeline so
         // running it on the no-op would corrupt the ablation contract.
-        (placements_noop(&sites, input.r_max), Vec::new())
+        (placements_noop(&roofline_sites, input.r_max), Vec::new())
     } else {
-        let mut placements = place_adapters(&sites, gpu, input.r_min, input.r_max);
+        let mut placements = place_adapters(&roofline_sites, gpu, input.r_min, input.r_max);
         // Narrow the roofline placement to the projections WGGO budgeted for
         // (its `adapter_placement` is the comm-budget-feasible set, G5/G7).
         // Sites outside it are forced to Skip; each overruled site yields a
-        // diagnostic.
-        let diags = apply_wggo_placement_filter(&mut placements, input.wggo_overrides);
+        // diagnostic. A declared adapter exists whatever WGGO prefers, so
+        // the filter is for suggestions only.
+        let diags = if adapters_declared {
+            Vec::new()
+        } else {
+            apply_wggo_placement_filter(&mut placements, input.wggo_overrides)
+        };
         (placements, diags)
     };
+    // A declared adapter is what it was declared to be: the roofline stage
+    // classifies its site and chooses nothing.
+    for p in placements.iter_mut() {
+        if let Some(decl) = input.declared_adapters.get(&p.name) {
+            p.decorator_kind = Some(decl.kind);
+            (p.adapter, p.suggested_rank) = match decl.kind {
+                crate::AdapterKind::Lora | crate::AdapterKind::GatedLora => {
+                    (crate::wrga_roofline::AdapterKind::Lora, decl.rank)
+                }
+                crate::AdapterKind::Ia3 => (crate::wrga_roofline::AdapterKind::Ia3, 0),
+            };
+            p.rationale = "declared with @adapter".to_string();
+        }
+    }
 
     // ── Stage 4: Innovation 3 — Spectral rank allocation ──────────────────
     let (spectral, ranks, override_diags) = if abl.skip_spectral_allocation {
         spectral_noop(&placements)
     } else {
-        run_spectral(input.weights, &placements, &input)
+        run_spectral(input.weights, &placements, &site_shapes, &input)
+    };
+    // `m + n` of each ranked site, and how many have no known shape.
+    let rank_site_mn: Vec<usize> = ranks
+        .iter()
+        .map(|r| {
+            spectral
+                .iter()
+                .find(|sp| names_match(&sp.name, &r.name))
+                .map(|sp| sp.shape)
+                .or_else(|| site_shapes.get(&r.name).copied())
+                .map_or(0, |[m, n]| m + n)
+        })
+        .collect();
+    let unsized_sites = if abl.skip_spectral_allocation {
+        0
+    } else {
+        ranks
+            .iter()
+            .zip(&rank_site_mn)
+            .filter(|(r, mn)| {
+                **mn == 0 && input.declared_adapters.get(&r.name).is_none_or(|d| d.params.is_none())
+            })
+            .count()
     };
 
     // ── Stage 5: Innovation 4 — Fusion integration ────────────────────────
-    let rank_overrides: Vec<usize> =
-        ranks.iter().map(|r| r.rank).collect();
+    // The rank of each placement, by NAME: `ranks` holds only the sites that
+    // were ranked, in an order of its own (with weights, the checkpoint's),
+    // so pairing the i-th placement with the i-th rank paired arbitrary
+    // sites.
+    let rank_overrides: Vec<usize> = placements
+        .iter()
+        .map(|p| {
+            ranks
+                .iter()
+                .find(|r| names_match(&r.name, &p.name))
+                .map_or(p.suggested_rank, |r| r.rank)
+        })
+        .collect();
     let fusion = if abl.skip_fusion_integration {
         FusionPlan::default()
     } else {
-        let f = build_fusion_plan(&placements, Some(&rank_overrides));
-        verify_fused_sites_have_no_intermediate(&f, input.wengert);
-        f
+        build_fusion_plan(&placements, Some(&rank_overrides))
     };
 
     // ── Stage 6: Innovation 5 — Memory plan ───────────────────────────────
@@ -735,15 +828,20 @@ pub fn run(input: WrgaInput) -> WrgaPlan {
         memory_noop(&prune_result.activation_live)
     } else {
         let size_hints: SizeHints = HashMap::new();
+        // Every activation in `activation_live` is one the backward pass
+        // reads, and the backward pass runs after the last forward op: each
+        // is live from its birth to the end of the forward list. Their
+        // lifetimes used to end at their last FORWARD use, which let two of
+        // them share a slot although the backward reads both ("18 live
+        // activations → 5 slots"); applied, that plan would have aliased
+        // live tensors.
+        let mut live_at_end = prune_result.activation_live.clone();
+        live_at_end.insert(input.loss_output);
         plan_memory_with_pin(
             input.wengert,
             &prune_result.activation_live,
             &size_hints,
-            &{
-                let mut s = BTreeSet::new();
-                s.insert(input.loss_output);
-                s
-            },
+            &live_at_end,
             &input.inspect_pinned_vars,
         )
     };
@@ -783,7 +881,7 @@ pub fn run(input: WrgaInput) -> WrgaPlan {
     }
     WrgaPlan {
         mode: input.mode,
-        target_gpu: gpu.name.to_string(),
+        target_gpu,
         prune: prune_result,
         placements,
         spectral,
@@ -799,7 +897,22 @@ pub fn run(input: WrgaInput) -> WrgaPlan {
         },
         ablation: abl,
         custom_adapter: input.custom_adapter.map(str::to_string),
+        adapters_declared,
+        unsized_sites,
+        rank_site_mn,
+        fused_kernels_active: input.fused_kernels_active,
     }
+}
+
+/// Whether a checkpoint key and a parameter name are the same weight.
+/// Placements carry Wengert names rooted at the train block's model variable
+/// (`m.blocks.0.attn.wq`) while checkpoint keys are bare (`blocks.0.attn.wq`)
+/// or rooted at something else, so equality or a dot-boundary suffix in
+/// either direction counts.
+fn names_match(a: &str, b: &str) -> bool {
+    a == b
+        || a.strip_suffix(b).is_some_and(|rest| rest.ends_with('.'))
+        || b.strip_suffix(a).is_some_and(|rest| rest.ends_with('.'))
 }
 
 /// Narrow WRGA's roofline-chosen adapter sites to the projections WGGO
@@ -875,7 +988,14 @@ fn apply_wggo_placement_filter(
 // Stage helpers
 // ---------------------------------------------------------------------------
 
-/// Determine the set of trainable parameter VarIds per [`WrgaMode`].
+/// The trainable parameter VarIds: every parameter a pattern of
+/// `trainable_patterns` matches.
+///
+/// The patterns come from `@freeze`, which alone decides what trains; the
+/// `@wrga` mode has no say. `mode=manual` used to select the parameters
+/// matching the `@adapter` targets and `mode=hybrid` those starting with a
+/// `layers=` prefix; a `Class.field` target and a bare layer prefix never
+/// match a parameter path such as `m.b1.wq`, so both sets were always empty.
 fn select_trainable(list: &WengertList, input: &WrgaInput) -> BTreeSet<VarId> {
     use crate::wrga_prune::glob_match;
     let mut out = BTreeSet::new();
@@ -884,75 +1004,91 @@ fn select_trainable(list: &WengertList, input: &WrgaInput) -> BTreeSet<VarId> {
             PrimalOp::Param(n) => n.as_str(),
             _ => continue,
         };
-        let included = match input.mode {
-            WrgaMode::Auto => {
-                // If the caller supplied patterns, honour them; otherwise all
-                // parameters are trainable.  `Auto` is expected to be paired
-                // with an upstream `@freeze(exclude=...)` that resolves into
-                // `trainable_patterns` — but we don't require it.
-                if input.trainable_patterns.is_empty() {
-                    true
-                } else {
-                    input
-                        .trainable_patterns
-                        .iter()
-                        .any(|p| glob_match(p, name))
-                }
-            }
-            WrgaMode::Manual => {
-                // Manual mode: only explicit adapter targets receive gradients.
-                input
-                    .manual_adapter_targets
-                    .iter()
-                    .any(|p| glob_match(p, name))
-            }
-            WrgaMode::Hybrid => {
-                // Hybrid: the layer scope defines trainability; treat each
-                // layer prefix as `blocks.N.*`.
-                input
-                    .hybrid_layers
-                    .iter()
-                    .any(|layer| name.starts_with(layer))
-            }
-        };
-        if included {
+        if input.trainable_patterns.iter().any(|p| glob_match(p, name)) {
             out.insert(op.result);
         }
     }
     out
 }
 
-/// Infer candidate adapter sites by walking the Wengert list and attaching a
-/// [`SiteKind`] to each trainable parameter based on its downstream op.
+/// A candidate site and whether its shape is the weight's real one.
+struct InferredSite {
+    site: AdapterSite,
+    /// False when the weight's shape is not known and `site.shape` is the
+    /// nominal 512×512.
+    shape_known: bool,
+}
+
+/// The shape used for a site whose weight shape is not known at compile
+/// time, and the activation every site is costed at: one sequence of 128
+/// tokens in 2-byte elements. Neither is read from the program.
+const NOMINAL_WEIGHT: [u64; 2] = [512, 512];
+const NOMINAL_SEQ: u64 = 128;
+
+/// The plan's sites, from the Wengert list.
 ///
-/// This is a simple heuristic — the real compiler has richer shape info via
-/// the type-map — but it's good enough for the driver to produce a deterministic
-/// placement plan even in unit tests.
+/// With declared adapters, the sites are the parameters they adapt, each
+/// under the op that consumes it. This is what makes a frozen base work: the
+/// adapted weights are then exactly the frozen ones, and looking only at
+/// TRAINABLE parameters found the adapters' own `lora_A`/`lora_B` instead,
+/// which no checkpoint holds.
+///
+/// Without any, the sites are the trainable parameters an adapter could go
+/// on: one per parameter consumed by a matmul, norm, softmax, embedding or
+/// reduction.
+///
+/// A parameter may reach its op through a transpose (`x @
+/// self.w.transpose(0, 1)`, the standard library's `Linear`).
+///
+/// The Wengert list has no activation shapes, so every site is costed at a
+/// nominal activation ([`NOMINAL_SEQ`]); the weight's shape is real when
+/// `param_shapes` or the checkpoint has it.
 fn infer_sites_from_wengert(
     list: &WengertList,
     trainable: &BTreeSet<VarId>,
-    _input: &WrgaInput,
-) -> Vec<AdapterSite> {
-    let mut out = Vec::new();
-    // Index param VarId → name for friendly site names.
-    let mut param_name: BTreeMap<VarId, String> = BTreeMap::new();
+    input: &WrgaInput,
+) -> Vec<InferredSite> {
+    // Param VarId → name, and every var that is a parameter or a transpose
+    // of one → that parameter. One pass suffices: inputs precede their users.
+    let mut param_name: BTreeMap<VarId, &str> = BTreeMap::new();
+    let mut param_of: BTreeMap<VarId, VarId> = BTreeMap::new();
     for op in &list.ops {
-        if let PrimalOp::Param(n) = &op.op {
-            param_name.insert(op.result, n.clone());
+        match &op.op {
+            PrimalOp::Param(n) => {
+                param_name.insert(op.result, n.as_str());
+                param_of.insert(op.result, op.result);
+            }
+            PrimalOp::Transpose { .. } => {
+                if let Some(&p) = op.inputs.first().and_then(|v| param_of.get(v)) {
+                    param_of.insert(op.result, p);
+                }
+            }
+            _ => {}
         }
     }
+    let declared = !input.declared_adapters.is_empty();
+    let is_site = |param: VarId| -> bool {
+        let Some(name) = param_name.get(&param) else {
+            return false;
+        };
+        if declared {
+            input.declared_adapters.contains_key(*name)
+        } else {
+            trainable.contains(&param)
+        }
+    };
 
-    // For each op that consumes a trainable param, decide a site kind from
-    // the op type.  Matmul → Matmul, LayerNorm/RMSNorm → Norm, Softmax →
-    // Softmax, Embedding → Embedding, others → skip.
+    let mut out = Vec::new();
+    let mut seen: BTreeSet<VarId> = BTreeSet::new();
     for op in &list.ops {
-        let Some(&trainable_id) = op.inputs.iter().find(|v| trainable.contains(v)) else {
+        let Some(param) = op
+            .inputs
+            .iter()
+            .filter_map(|v| param_of.get(v).copied())
+            .find(|p| is_site(*p))
+        else {
             continue;
         };
-        let name = param_name
-            .get(&trainable_id)
-            .cloned()
-            .unwrap_or_else(|| format!("var_{trainable_id}"));
         let kind = match op.op {
             PrimalOp::Matmul => SiteKind::Matmul,
             PrimalOp::LayerNorm { .. } | PrimalOp::RMSNorm { .. } => SiteKind::Norm,
@@ -964,84 +1100,106 @@ fn infer_sites_from_wengert(
             PrimalOp::Sum { .. } | PrimalOp::Mean { .. } => SiteKind::Reduction,
             _ => continue,
         };
-        // No shape info in the Wengert list; use a modest default so the
-        // cost model still produces a meaningful AI for the placement.
-        out.push(AdapterSite {
-            name,
-            kind,
-            shape: vec![512, 512],
-            dtype_bytes: 2,
-            batch: 1,
-            seq: 128,
+        // A declared adapter is one site however often its weight is used.
+        if declared && !seen.insert(param) {
+            continue;
+        }
+        let name = param_name[&param];
+        let known = input.param_shapes.get(name).copied().or_else(|| {
+            let wm = input.weights?;
+            wm.entries()
+                .find(|(key, entry)| entry.shape.len() == 2 && names_match(key, name))
+                .map(|(_, entry)| [entry.shape[0], entry.shape[1]])
+        });
+        let shape = known.map_or(NOMINAL_WEIGHT, |[m, n]| [m as u64, n as u64]);
+        out.push(InferredSite {
+            site: AdapterSite {
+                name: name.to_string(),
+                kind,
+                shape: shape.to_vec(),
+                dtype_bytes: 2,
+                batch: 1,
+                seq: NOMINAL_SEQ,
+            },
+            shape_known: known.is_some(),
         });
     }
     out
 }
 
+/// Rank every adapted site.
+///
+/// A declared adapter keeps its declared rank and its real parameter count;
+/// the spectral figures are computed for its weight when the checkpoint has
+/// it, and size nothing. Without declared adapters the ranks are
+/// suggestions: the spectral formula over the checkpoint's weights when
+/// there are any, the roofline's rank otherwise, in both cases brought under
+/// `budget_params` when one is given.
 fn run_spectral(
     weights: Option<&WeightMap>,
     placements: &[AdapterPlacement],
+    site_shapes: &HashMap<String, [usize; 2]>,
     input: &WrgaInput,
 ) -> (Vec<SpectralAnalysis>, Vec<RankAllocation>, Vec<crate::wggo_overrides::OverrideDiagnostic>) {
-    let Some(wm) = weights else {
-        // Without weights, fall back to uniform r_max (clamped by budget) per
-        // non-skipped placement.
-        let ranks: Vec<RankAllocation> = placements
-            .iter()
-            .map(|p| RankAllocation {
-                name: p.name.clone(),
-                rank: p.suggested_rank.max(input.r_min).min(input.r_max),
-                effective_rank: 0.0,
-                adapter_params: p.suggested_rank * 1024, // rough guess
-            })
-            .collect();
-        return (Vec::new(), ranks, Vec::new());
-    };
-
-    // Collect analyses only for sites we actually plan to adapt.
-    let active_names: BTreeSet<&str> = placements
+    let active: Vec<&AdapterPlacement> = placements
         .iter()
         .filter(|p| !matches!(p.adapter, crate::wrga_roofline::AdapterKind::Skip))
-        .map(|p| p.name.as_str())
         .collect();
-    let mut spectral = analyse_weight_map(wm, input.r_max.max(8), 5, 8, input.seed);
-    // Join weight-map keys to placement names TOLERANTLY: placements carry
-    // Wengert Param compounds rooted at the train-block model variable
-    // ("m.blocks.0.attn.wq") while checkpoint keys are typically bare
-    // ("blocks.0.attn.wq") or model-class-rooted — exact equality never
-    // matched a real checkpoint, leaving the spectral set empty (review
-    // finding). Accept equality or a dot-boundary suffix relation in
-    // either direction.
-    let dot_suffix_match = |a: &str, b: &str| -> bool {
-        a == b
-            || a.strip_suffix(b)
-                .is_some_and(|rest| rest.ends_with('.'))
-            || b.strip_suffix(a)
-                .is_some_and(|rest| rest.ends_with('.'))
+
+    // Spectral analysis of the checkpoint weights that are sites.
+    let mut spectral = match weights {
+        Some(wm) => analyse_weight_map(wm, input.r_max.max(8), 5, 8, input.seed),
+        None => Vec::new(),
     };
-    spectral.retain(|sp| active_names.iter().any(|n| dot_suffix_match(n, &sp.name)));
-    if spectral.is_empty() && !active_names.is_empty() {
-        // No key overlap at all (e.g. an HF-convention checkpoint whose
-        // projection names share no suffix with the model's field names):
-        // fall back to the weightless roofline allocation rather than
-        // returning an EMPTY rank plan — empty is strictly worse than the
-        // pre-threading behavior (adapter totals report 0, fusion
-        // rank_overrides vanish).
-        nsl_log::nsl_log!(WARN, "wrga", 
-            "[wrga] weights present but no checkpoint key matches any adapter \
-             placement name — falling back to roofline suggested ranks \
-             (spectral allocation needs key-compatible names)"
+    spectral.retain(|sp| active.iter().any(|p| names_match(&p.name, &sp.name)));
+    if weights.is_some() && spectral.is_empty() && !active.is_empty() {
+        nsl_log::nsl_log!(
+            WARN,
+            "wrga",
+            "[wrga] weights present but no checkpoint key matches any adapter site name: \
+             the report has no spectral figures (the keys must end in the model's field path)"
         );
-        let ranks: Vec<RankAllocation> = placements
+    }
+
+    if !input.declared_adapters.is_empty() {
+        let ranks = active
             .iter()
-            .filter(|p| !matches!(p.adapter, crate::wrga_roofline::AdapterKind::Skip))
-            .map(|p| RankAllocation {
-                name: p.name.clone(),
-                rank: p.suggested_rank.max(input.r_min).min(input.r_max),
-                effective_rank: 0.0,
-                adapter_params: p.suggested_rank * 1024,
+            .map(|p| {
+                let decl = input.declared_adapters.get(&p.name);
+                RankAllocation {
+                    name: p.name.clone(),
+                    rank: p.suggested_rank,
+                    effective_rank: spectral
+                        .iter()
+                        .find(|sp| names_match(&sp.name, &p.name))
+                        .map_or(0.0, |sp| sp.effective_rank),
+                    adapter_params: decl.and_then(|d| d.params).unwrap_or(0),
+                }
             })
             .collect();
+        return (spectral, ranks, Vec::new());
+    }
+
+    let budget = (input.budget_params > 0).then_some(input.budget_params);
+    if spectral.is_empty() {
+        // No spectral data: the roofline's suggested rank on every site,
+        // counted from the weight's real shape where it is known.
+        let mn = |name: &str| site_shapes.get(name).map_or(0, |[m, n]| m + n);
+        let mut ranks: Vec<RankAllocation> = active
+            .iter()
+            .map(|p| {
+                let rank = p.suggested_rank.max(input.r_min).min(input.r_max);
+                RankAllocation {
+                    name: p.name.clone(),
+                    rank,
+                    effective_rank: 0.0,
+                    adapter_params: rank * mn(&p.name),
+                }
+            })
+            .collect();
+        if let Some(budget) = budget {
+            crate::wrga_spectral::enforce_param_budget(&mut ranks, budget, input.r_min, &mn, None);
+        }
         return (Vec::new(), ranks, Vec::new());
     }
 
@@ -1050,22 +1208,19 @@ fn run_spectral(
     for p in placements {
         slack.insert(p.name.clone(), p.roofline_slack.max(1e-6));
     }
-
-    // Derive a parameter budget: if the user specified one, use it; otherwise
-    // let every site claim `r_max` (i.e. R_total = r_max · sites).
-    let budget = if input.budget_params > 0 {
-        input.budget_params
-    } else {
-        spectral.len().max(1) * input.r_max
-    };
+    // The rank pool the proposal's formula divides: `r_max` per site. The
+    // parameter budget is a separate, later constraint; it used to be passed
+    // here as the rank pool, so `budget=1000` meant a thousand ranks to hand
+    // out and capped nothing.
+    //
     // `snap_to_grid = false`: the realized per-projection rank is left off-grid
     // (the current behaviour).  Paper §2.2 declares `r[l,w] ∈ {0,2,4,8,16}`, and
     // `allocate_ranks` can floor the realized rank onto that grid (audit gap #5),
     // but errata E3 lists snapping as an open sub-decision awaiting author
-    // sign-off, so it stays off by default.  Flip this to `true` (or surface it
-    // as a `WrgaInput`/CLI option) to activate paper-grid ranks.
+    // sign-off, so it stays off by default.
     let (ranks, override_diags) = allocate_ranks(
         &spectral,
+        spectral.len().max(1) * input.r_max,
         budget,
         input.r_min,
         input.r_max,
@@ -1131,8 +1286,9 @@ mod tests {
         let input = WrgaInput {
             mode: WrgaMode::Auto,
             trainable_patterns: vec!["blocks.7.*"],
-            manual_adapter_targets: Vec::new(),
-            hybrid_layers: Vec::new(),
+            declared_adapters: BTreeMap::new(),
+            param_shapes: HashMap::new(),
+            fused_kernels_active: false,
             wengert: &w,
             loss_output: 7,
             weights: None,
@@ -1157,65 +1313,14 @@ mod tests {
     }
 
     #[test]
-    fn manual_mode_only_adapts_explicit_targets() {
-        let w = tiny_transformer_like();
-        let input = WrgaInput {
-            mode: WrgaMode::Manual,
-            trainable_patterns: Vec::new(),
-            manual_adapter_targets: vec!["blocks.6.wq"],
-            hybrid_layers: Vec::new(),
-            wengert: &w,
-            loss_output: 7,
-            weights: None,
-            target: "",
-            budget_params: 0,
-            r_min: 2,
-            r_max: 16,
-            seed: 42,
-            inspect_pinned_vars: BTreeSet::new(),
-            wggo_overrides: None,
-            ablation: WrgaAblation::default(),
-            custom_adapter: None,
-        };
-        let plan = run(input);
-        assert_eq!(plan.prune.stats.gradient_targets, 1);
-    }
-
-    #[test]
-    fn hybrid_mode_layer_scope() {
-        let w = tiny_transformer_like();
-        let input = WrgaInput {
-            mode: WrgaMode::Hybrid,
-            trainable_patterns: Vec::new(),
-            manual_adapter_targets: Vec::new(),
-            hybrid_layers: vec!["blocks.6"],
-            wengert: &w,
-            loss_output: 7,
-            weights: None,
-            target: "",
-            budget_params: 0,
-            r_min: 2,
-            r_max: 16,
-            seed: 42,
-            inspect_pinned_vars: BTreeSet::new(),
-            wggo_overrides: None,
-            ablation: WrgaAblation::default(),
-            custom_adapter: None,
-        };
-        let plan = run(input);
-        // Both blocks.6.wq and blocks.6.wk match the layer scope.
-        assert_eq!(plan.prune.stats.gradient_targets, 2);
-        assert_eq!(plan.prune.stats.frozen_params, 1);
-    }
-
-    #[test]
     fn render_report_is_deterministic() {
         let w = tiny_transformer_like();
         let make = || WrgaInput {
             mode: WrgaMode::Auto,
             trainable_patterns: vec!["blocks.7.*"],
-            manual_adapter_targets: Vec::new(),
-            hybrid_layers: Vec::new(),
+            declared_adapters: BTreeMap::new(),
+            param_shapes: HashMap::new(),
+            fused_kernels_active: false,
             wengert: &w,
             loss_output: 7,
             weights: None,
@@ -1240,8 +1345,9 @@ mod tests {
         let input = WrgaInput {
             mode: WrgaMode::Auto,
             trainable_patterns: vec!["blocks.7.*"],
-            manual_adapter_targets: Vec::new(),
-            hybrid_layers: Vec::new(),
+            declared_adapters: BTreeMap::new(),
+            param_shapes: HashMap::new(),
+            fused_kernels_active: false,
             wengert: &w,
             loss_output: 7,
             weights: None,
@@ -1302,8 +1408,9 @@ mod tests {
         let input = WrgaInput {
             mode: WrgaMode::Auto,
             trainable_patterns: vec!["blocks.6.*"],
-            manual_adapter_targets: Vec::new(),
-            hybrid_layers: Vec::new(),
+            declared_adapters: BTreeMap::new(),
+            param_shapes: HashMap::new(),
+            fused_kernels_active: false,
             wengert: &w,
             loss_output: w.output,
             weights: None, // no SVD → spectral path skipped → no clamp diag
@@ -1330,8 +1437,9 @@ mod tests {
         let input = WrgaInput {
             mode: WrgaMode::Auto,
             trainable_patterns: vec!["blocks.6.*"],
-            manual_adapter_targets: Vec::new(),
-            hybrid_layers: Vec::new(),
+            declared_adapters: BTreeMap::new(),
+            param_shapes: HashMap::new(),
+            fused_kernels_active: false,
             wengert: &w,
             loss_output: w.output,
             weights: None,
@@ -1385,7 +1493,7 @@ mod tests {
                 optim_v_bits: 32,
             }],
         };
-        let (_allocs, diags) = allocate_ranks(&spectral, 10_000_000, 2, 16, None, Some(&over), false);
+        let (_allocs, diags) = allocate_ranks(&spectral, 10_000_000, None, 2, 16, None, Some(&over), false);
         assert!(
             diags.iter().any(|d| matches!(
                 d.reason,
@@ -1412,18 +1520,18 @@ mod tests {
         assert_eq!(super::fmt_with_commas(1_000_000), "1,000,000");
     }
 
-    #[test]
-    fn compare_report_contains_all_baselines_and_wrga_row() {
-        let w = tiny_transformer_like();
-        let input = WrgaInput {
+    /// A `WrgaInput` over `w` with everything trainable and no adapters.
+    fn plain_input(w: &WengertList) -> WrgaInput<'_> {
+        WrgaInput {
             mode: WrgaMode::Auto,
-            trainable_patterns: vec!["blocks.7.*"],
-            manual_adapter_targets: Vec::new(),
-            hybrid_layers: Vec::new(),
-            wengert: &w,
+            trainable_patterns: vec!["*"],
+            declared_adapters: BTreeMap::new(),
+            param_shapes: HashMap::new(),
+            fused_kernels_active: false,
+            wengert: w,
             loss_output: w.output,
             weights: None,
-            target: "rtx5070ti",
+            target: "",
             budget_params: 0,
             r_min: 2,
             r_max: 16,
@@ -1432,213 +1540,398 @@ mod tests {
             wggo_overrides: None,
             ablation: WrgaAblation::default(),
             custom_adapter: None,
-        };
-        let plan = run(input);
-        let report = plan.render_compare_report();
-
-        // Header + every baseline row must be present so users get a complete
-        // table even when WRGA's measured numbers and a baseline coincide.
-        assert!(report.contains("=== WRGA PEFT Comparison Report ==="));
-        assert!(report.contains("WRGA (this run)"));
-        assert!(report.contains("LoRA (r=16)"));
-        assert!(report.contains("AdaLoRA"));
-        assert!(report.contains("GaLore"));
-        assert!(report.contains("ReFT (r=4, top-25%)"));
-
-        // Explanatory footer prevents a casual reader from over-interpreting
-        // the structural ratios as empirical quality/speed.
-        assert!(report.contains("structural"));
-        assert!(report.contains("§9 benchmark suite"));
+        }
     }
 
+    /// `@freeze` decides what trains, in every mode. `mode=manual` used to
+    /// select the parameters matching `@adapter` targets and `mode=hybrid`
+    /// those under a layer prefix, and both sets were always empty.
     #[test]
-    fn compare_report_is_deterministic() {
+    fn the_mode_has_no_say_in_what_trains() {
         let w = tiny_transformer_like();
-        let make = || WrgaInput {
-            mode: WrgaMode::Auto,
-            trainable_patterns: vec!["blocks.7.*"],
-            manual_adapter_targets: Vec::new(),
-            hybrid_layers: Vec::new(),
-            wengert: &w,
-            loss_output: w.output,
-            weights: None,
-            target: "rtx5070ti",
-            budget_params: 0,
-            r_min: 2,
-            r_max: 16,
-            seed: 42,
-            inspect_pinned_vars: BTreeSet::new(),
-            wggo_overrides: None,
-            ablation: WrgaAblation::default(),
-            custom_adapter: None,
-        };
-        assert_eq!(
-            run(make()).render_compare_report(),
-            run(make()).render_compare_report(),
+        for mode in [WrgaMode::Auto, WrgaMode::Manual, WrgaMode::Hybrid] {
+            let mut input = plain_input(&w);
+            input.mode = mode;
+            input.trainable_patterns = vec!["blocks.7.*"];
+            let stats = run(input).prune.stats;
+            assert_eq!((stats.gradient_targets, stats.frozen_params), (1, 2), "{mode:?}");
+        }
+    }
+
+    /// An empty allowlist is a model with nothing trainable, not one with
+    /// everything trainable.
+    #[test]
+    fn no_trainable_pattern_means_nothing_trains() {
+        let w = tiny_transformer_like();
+        let mut input = plain_input(&w);
+        input.trainable_patterns = Vec::new();
+        let stats = run(input).prune.stats;
+        assert_eq!((stats.gradient_targets, stats.frozen_params), (0, 3));
+        assert_eq!(stats.backward_ops_retained, 0, "nothing to differentiate");
+    }
+
+    /// With nothing frozen the backward pass is the full one, so nothing is
+    /// eliminated. The pruning line used to compare the differentiated ops
+    /// with ALL forward ops (the input `x` counted as "eliminated"), and the
+    /// activation line compared a count of ops with a count of tensors.
+    #[test]
+    fn nothing_frozen_reports_nothing_eliminated() {
+        let w = tiny_transformer_like();
+        let plan = run(plain_input(&w));
+        let stats = &plan.prune.stats;
+        // Of the 8 forward ops, 6 carry an adjoint: the three parameters, the
+        // two matmuls that reach the loss, and the add. The input x has none,
+        // and `wk @ x` (#5) does not reach the loss.
+        assert_eq!(stats.forward_ops_total, 8);
+        assert_eq!(stats.full_backward_ops, 6);
+        assert_eq!(stats.backward_ops_retained, 6);
+        // Saved: the operands of the live ops matmul(1,0), matmul(3,0) and
+        // add(4,6), that is {0, 1, 3, 4, 6}.
+        assert_eq!(stats.full_backward_saved_activations, 5);
+        assert_eq!(stats.pruned_saved_activations, 5);
+        let report = plan.render_report();
+        assert!(report.contains("Backward pruning: 6 ops → 6 ops (0.0% eliminated)"), "{report}");
+        assert!(
+            report.contains("Activation memory: 5 tensors → 5 tensors (0.0% eliminated)"),
+            "{report}"
         );
     }
 
-    /// Baseline contract — every baseline that does no Wengert pruning must
-    /// report 100% backward retained and 100% activation retained, with 0%
-    /// fusion. Pins the contract so a future bug that quietly attributes
-    /// WRGA's pruning to a baseline can't slip through.
+    /// Freezing all but `blocks.7.wq` leaves its matmul, the add and the
+    /// parameter itself to differentiate: 3 of the 6.
     #[test]
-    fn compare_baselines_report_unpruned_ratios_for_lora_adalora_galore_reft() {
+    fn a_frozen_branch_is_counted_against_the_full_backward() {
         let w = tiny_transformer_like();
-        let input = WrgaInput {
-            mode: WrgaMode::Auto,
-            trainable_patterns: vec!["blocks.7.*"],
-            manual_adapter_targets: Vec::new(),
-            hybrid_layers: Vec::new(),
-            wengert: &w,
-            loss_output: w.output,
-            weights: None,
-            target: "rtx5070ti",
-            budget_params: 0,
-            r_min: 2,
-            r_max: 16,
-            seed: 42,
-            inspect_pinned_vars: BTreeSet::new(),
-            wggo_overrides: None,
-            ablation: WrgaAblation::default(),
-            custom_adapter: None,
-        };
+        let mut input = plain_input(&w);
+        input.trainable_patterns = vec!["blocks.7.*"];
         let plan = run(input);
-        let rows = plan.compute_compare_baselines();
+        let stats = &plan.prune.stats;
+        assert_eq!((stats.full_backward_ops, stats.backward_ops_retained), (6, 3));
+        // The live ops are matmul(3,0) and add(4,6): they read 3, 0, 4, 6.
+        assert_eq!((stats.full_backward_saved_activations, stats.pruned_saved_activations), (5, 4));
+        let report = plan.render_report();
+        assert!(report.contains("Backward pruning: 6 ops → 3 ops (50.0% eliminated)"), "{report}");
+        assert!(
+            report.contains("Activation memory: 5 tensors → 4 tensors (20.0% eliminated)"),
+            "{report}"
+        );
+    }
 
-        // Row 0 is WRGA; rows 1-4 are LoRA, AdaLoRA, GaLore, ReFT.
-        assert_eq!(rows.len(), 5);
-        assert_eq!(rows[0].label, "WRGA (this run)");
-        for baseline_idx in 1..5 {
-            let r = &rows[baseline_idx];
+    /// Every saved activation is read by the backward pass, after the last
+    /// forward op, so no two can share a slot. Their lifetimes used to end
+    /// at their last forward use, which planned 2 slots for these 4.
+    #[test]
+    fn saved_activations_do_not_share_slots() {
+        let w = tiny_transformer_like();
+        let mut input = plain_input(&w);
+        input.trainable_patterns = vec!["blocks.7.*"];
+        let plan = run(input);
+        assert_eq!(plan.memory.stats.live_activations, 4);
+        assert_eq!(plan.memory.stats.slots_used, 4);
+        let last = (w.ops.len() - 1) as u32;
+        assert!(plan.memory.assignments.iter().all(|a| a.death == last));
+        assert!(
+            plan.render_report().contains("Memory plan: 4 live activations → 4 slots (reuse 0.0%)")
+        );
+    }
+
+    /// A frozen base with LoRA on one weight, as `@freeze` + `@adapter`
+    /// leaves the Wengert list: the weight is frozen and the adapter's own
+    /// A and B are the trainable parameters.
+    fn frozen_base_with_lora() -> WengertList {
+        let ops = vec![
+            op(0, 0, PrimalOp::Input("x".into()), vec![]),
+            op(1, 1, PrimalOp::Param("m.wq".into()), vec![]),
+            op(2, 2, PrimalOp::Param("m.lora_A_Toy_wq__lora".into()), vec![]),
+            op(3, 3, PrimalOp::Param("m.lora_B_Toy_wq__lora".into()), vec![]),
+            op(4, 4, PrimalOp::Matmul, vec![0, 1]),
+            op(5, 5, PrimalOp::Matmul, vec![0, 2]),
+            op(6, 6, PrimalOp::Matmul, vec![5, 3]),
+            op(7, 7, PrimalOp::Add, vec![4, 6]),
+        ];
+        WengertList { ops, output: 7, var_names: HashMap::new(), var_types: HashMap::new() }
+    }
+
+    /// The plan's sites are the adapted weights, with the declared rank and
+    /// the real parameter count. They used to be the trainable parameters
+    /// under a matmul, here A and B themselves, each "adapted" at rank 16 and
+    /// counted as 16 × 1024 parameters.
+    #[test]
+    fn a_declared_adapter_on_a_frozen_weight_is_the_plan_s_site() {
+        let w = frozen_base_with_lora();
+        let mut input = plain_input(&w);
+        input.trainable_patterns = vec!["m.lora_A_Toy_wq__lora", "m.lora_B_Toy_wq__lora"];
+        input.param_shapes.insert("m.wq".to_string(), [32, 48]);
+        input.declared_adapters.insert(
+            "m.wq".to_string(),
+            DeclaredAdapter {
+                kind: crate::AdapterKind::Lora,
+                rank: 2,
+                // A is [32, 2] and B is [2, 48].
+                params: Some(2 * (32 + 48)),
+            },
+        );
+        let plan = run(input);
+        let names: Vec<&str> = plan.placements.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["m.wq"]);
+        assert_eq!(plan.placements[0].suggested_rank, 2);
+        assert_eq!(plan.placements[0].decorator_kind, Some(crate::AdapterKind::Lora));
+        assert_eq!(plan.adapter_params(), 160);
+        assert_eq!(plan.unsized_sites, 0);
+        assert_eq!(plan.rank_site_mn, [80]);
+        let report = plan.render_report();
+        assert!(
+            report.contains("Adapter parameters: 160  |  Sites: 1  |  Fusible: 1/1 (100.0%), fused kernels off"),
+            "{report}"
+        );
+    }
+
+    /// 32×48 values with no structure: a full-rank weight for the tests of
+    /// the spectral stage.
+    fn weight_map_with(name: &str) -> WeightMap {
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let data: Vec<u8> = (0..32 * 48)
+            .flat_map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let unit = (state >> 40) as f32 / (1u64 << 24) as f32; // [0, 1)
+                (unit - 0.5).to_le_bytes()
+            })
+            .collect();
+        let mut wm = WeightMap::new_for_test();
+        wm.insert(crate::weight_aware::WeightEntry::new(
+            name.to_string(),
+            data,
+            vec![32, 48],
+            crate::weight_aware::WeightDType::F32,
+        ));
+        wm
+    }
+
+    /// The PEFT configuration with a checkpoint: the base is frozen, the
+    /// adapter is declared, and the checkpoint holds the base weight under
+    /// its field path. The spectral stage analyses that weight and leaves
+    /// the declared rank alone. It used to find no site at all, because it
+    /// looked among the trainable parameters, which are A and B.
+    #[test]
+    fn spectral_figures_are_computed_for_a_frozen_adapted_weight() {
+        let w = frozen_base_with_lora();
+        let wm = weight_map_with("wq");
+        let mut input = plain_input(&w);
+        input.trainable_patterns = vec!["m.lora_A_Toy_wq__lora", "m.lora_B_Toy_wq__lora"];
+        input.weights = Some(&wm);
+        input.declared_adapters.insert(
+            "m.wq".to_string(),
+            DeclaredAdapter { kind: crate::AdapterKind::Lora, rank: 2, params: Some(160) },
+        );
+        let plan = run(input);
+        assert_eq!(plan.spectral.len(), 1);
+        assert_eq!((plan.spectral[0].name.as_str(), plan.spectral[0].shape), ("wq", [32, 48]));
+        assert_eq!((plan.ranks[0].rank, plan.ranks[0].adapter_params), (2, 160));
+        // 16 singular values are kept; a structureless weight's are of
+        // similar size, so its effective rank is near 16.
+        let r_eff = plan.ranks[0].effective_rank;
+        assert!((12.0..=16.0).contains(&r_eff), "effective rank {r_eff}");
+        assert!(
+            plan.render_report()
+                .contains("Spectral analysis: 1 of 1 sites matched a checkpoint weight"),
+            "{}",
+            plan.render_report()
+        );
+        // Without the checkpoint there is no such line.
+        let mut input = plain_input(&w);
+        input.declared_adapters.insert(
+            "m.wq".to_string(),
+            DeclaredAdapter { kind: crate::AdapterKind::Lora, rank: 2, params: Some(160) },
+        );
+        assert!(!run(input).render_report().contains("Spectral analysis"));
+    }
+
+    /// A site's shape comes from the checkpoint when the model definition
+    /// does not give it.
+    #[test]
+    fn a_site_takes_its_shape_from_the_checkpoint() {
+        let w = frozen_base_with_lora();
+        let wm = weight_map_with("wq");
+        let mut input = plain_input(&w);
+        input.trainable_patterns = vec!["m.wq"];
+        input.weights = Some(&wm);
+        let plan = run(input);
+        // One suggested site, the weight; r_total = 16 goes to it whole.
+        assert_eq!(plan.unsized_sites, 0);
+        assert_eq!(plan.rank_site_mn, [32 + 48]);
+        assert_eq!(plan.adapter_params(), plan.ranks[0].rank * 80);
+    }
+
+    /// A declared adapter whose weight shape is not known is counted as a
+    /// site and left out of the parameter total, and the report says so.
+    #[test]
+    fn a_declared_adapter_of_unknown_shape_is_reported_as_unsized() {
+        let w = frozen_base_with_lora();
+        let mut input = plain_input(&w);
+        input.declared_adapters.insert(
+            "m.wq".to_string(),
+            DeclaredAdapter { kind: crate::AdapterKind::Lora, rank: 2, params: None },
+        );
+        let plan = run(input);
+        assert_eq!((plan.adapter_params(), plan.unsized_sites), (0, 1));
+        assert!(
+            plan.render_report().contains(
+                "Adapter parameters: 0 (+ 1 sites whose weight shape is not known at compile time)"
+            ),
+            "{}",
+            plan.render_report()
+        );
+    }
+
+    /// A weight reaches its matmul through a transpose in the standard
+    /// library's `Linear` (`x @ self.w.transpose(0, 1)`); it is a site all
+    /// the same.
+    #[test]
+    fn a_weight_used_through_a_transpose_is_a_site() {
+        let ops = vec![
+            op(0, 0, PrimalOp::Input("x".into()), vec![]),
+            op(1, 1, PrimalOp::Param("m.fc.w".into()), vec![]),
+            op(2, 2, PrimalOp::Transpose { dim0: 0, dim1: 1 }, vec![1]),
+            op(3, 3, PrimalOp::Matmul, vec![0, 2]),
+        ];
+        let w = WengertList { ops, output: 3, var_names: HashMap::new(), var_types: HashMap::new() };
+        let plan = run(plain_input(&w));
+        let names: Vec<&str> = plan.placements.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["m.fc.w"]);
+    }
+
+    /// Six matmul weights of 32×32, as the budget tests below use them.
+    fn six_square_sites() -> (WengertList, HashMap<String, [usize; 2]>) {
+        let mut ops = vec![op(0, 0, PrimalOp::Input("x".into()), vec![])];
+        let mut shapes = HashMap::new();
+        let mut last = 0;
+        for i in 0..6u32 {
+            let (param, out) = (1 + 2 * i, 2 + 2 * i);
+            let name = format!("m.w{i}");
+            ops.push(op(param, param, PrimalOp::Param(name.clone()), vec![]));
+            ops.push(op(out, out, PrimalOp::Matmul, vec![last, param]));
+            shapes.insert(name, [32, 32]);
+            last = out;
+        }
+        (WengertList { ops, output: last, var_names: HashMap::new(), var_types: HashMap::new() }, shapes)
+    }
+
+    /// Without weights the suggested count comes from each weight's real
+    /// shape: rank 16 on six 32×32 weights is 6 × 16 × 64 = 6,144. It used to
+    /// be rank × 1024 per site whatever the shape: 98,304.
+    #[test]
+    fn suggested_parameters_come_from_the_weights_shapes() {
+        let (w, shapes) = six_square_sites();
+        let mut input = plain_input(&w);
+        input.param_shapes = shapes;
+        let plan = run(input);
+        assert_eq!(plan.ranks.iter().map(|r| r.rank).collect::<Vec<_>>(), [16; 6]);
+        assert_eq!(plan.adapter_params(), 6_144);
+        assert!(
+            plan.render_report().contains(
+                "Suggested adapters (none declared, none built): 6144 parameters  |  Sites: 6"
+            ),
+            "{}",
+            plan.render_report()
+        );
+    }
+
+    /// A budget bounds the suggested count. One rank on a 32×32 weight is 64
+    /// parameters, so 1,000 allows 15 ranks in all (960), and 500 allows 7:
+    /// fewer than the six sites' minimum of 2 each, so three sites lose their
+    /// adapter and three keep rank 2 (384). A budget above the need changes
+    /// nothing. It used to be read as a number of ranks and bound nothing.
+    #[test]
+    fn a_budget_bounds_the_suggested_parameters() {
+        let (w, shapes) = six_square_sites();
+        let with_budget = |budget: usize| {
+            let mut input = plain_input(&w);
+            input.param_shapes = shapes.clone();
+            input.budget_params = budget;
+            run(input)
+        };
+        assert_eq!(with_budget(100_000).adapter_params(), 6_144);
+        let tight = with_budget(1_000);
+        assert_eq!(tight.adapter_params(), 960);
+        assert_eq!(tight.ranks.iter().map(|r| r.rank).sum::<usize>(), 15);
+        assert!(tight.ranks.iter().all(|r| (2..=3).contains(&r.rank)), "{:?}", tight.ranks);
+        let tighter = with_budget(500);
+        assert_eq!(tighter.adapter_params(), 384);
+        let mut ranks: Vec<usize> = tighter.ranks.iter().map(|r| r.rank).collect();
+        ranks.sort_unstable();
+        assert_eq!(ranks, [0, 0, 0, 2, 2, 2]);
+    }
+
+    /// A site of unknown shape is costed at the nominal 512×512 for the
+    /// roofline and left out of the parameter count.
+    #[test]
+    fn a_suggested_site_of_unknown_shape_is_not_counted() {
+        let (w, mut shapes) = six_square_sites();
+        shapes.remove("m.w0");
+        let mut input = plain_input(&w);
+        input.param_shapes = shapes;
+        let plan = run(input);
+        assert_eq!((plan.adapter_params(), plan.unsized_sites), (5 * 16 * 64, 1));
+    }
+
+    #[test]
+    fn a_gpu_resolves_by_the_name_a_user_writes() {
+        assert_eq!(resolve_gpu("h100").map(|g| g.name), Some("H100-SXM"));
+        assert_eq!(resolve_gpu("H100-PCIe").map(|g| g.name), Some("H100-PCIe"));
+        // The table spells it "RTX-5070-Ti"; the proposal and the decorator's
+        // own error message spell it "rtx5070ti".
+        assert_eq!(resolve_gpu("rtx5070ti").map(|g| g.name), Some("RTX-5070-Ti"));
+        assert_eq!(resolve_gpu("rtx4090").map(|g| g.name), Some("RTX-4090"));
+        assert!(resolve_gpu("rtx9999").is_none());
+        assert!(resolve_gpu("").is_none());
+    }
+
+    /// The report names the GPU the analysis ran for, and says when that is
+    /// the default because none was given. A `target=h100` used to be
+    /// dropped and reported as "A100-SXM".
+    #[test]
+    fn the_report_names_the_target_and_marks_a_default() {
+        let w = tiny_transformer_like();
+        let mut input = plain_input(&w);
+        input.target = "h100";
+        assert_eq!(run(input).target_gpu, "H100-SXM");
+        let mut input = plain_input(&w);
+        input.target = "rtx5070ti";
+        assert_eq!(run(input).target_gpu, "RTX-5070-Ti");
+        assert_eq!(run(plain_input(&w)).target_gpu, "A100-SXM (default: no target given)");
+    }
+
+    /// The fusion stage looks each placement's rank up by name. `ranks`
+    /// holds only the ranked sites, in its own order, so the i-th rank is
+    /// not the i-th placement's.
+    #[test]
+    fn fusion_takes_each_site_s_rank_by_name() {
+        let (w, shapes) = six_square_sites();
+        let mut input = plain_input(&w);
+        input.param_shapes = shapes;
+        input.budget_params = 1_000;
+        let plan = run(input);
+        for decision in &plan.fusion.decisions {
+            let rank = plan.ranks.iter().find(|r| r.name == decision.site).unwrap().rank;
             assert_eq!(
-                r.backward_retained_ratio, 1.0,
-                "{} must report 100% backward retained",
-                r.label,
-            );
-            assert_eq!(
-                r.activation_retained_ratio, 1.0,
-                "{} must report 100% activation retained",
-                r.label,
-            );
-            assert_eq!(
-                r.fusion_ratio, 0.0,
-                "{} must report 0% fusion",
-                r.label,
+                decision.target,
+                crate::wrga_fusion::FusionTarget::EpilogueFusedLora { rank },
+                "{}",
+                decision.site
             );
         }
     }
 
-    /// GaLore is the only baseline with zero adapter parameters — by
-    /// construction (it projects gradients into a low-rank subspace rather
-    /// than adding adapter weights). Pinning this catches a future
-    /// off-by-one that flips GaLore to using LoRA's formula.
-    #[test]
-    fn compare_baseline_galore_has_zero_adapter_params() {
-        let w = tiny_transformer_like();
-        let input = WrgaInput {
-            mode: WrgaMode::Auto,
-            trainable_patterns: vec!["blocks.7.*"],
-            manual_adapter_targets: Vec::new(),
-            hybrid_layers: Vec::new(),
-            wengert: &w,
-            loss_output: w.output,
-            weights: None,
-            target: "rtx5070ti",
-            budget_params: 0,
-            r_min: 2,
-            r_max: 16,
-            seed: 42,
-            inspect_pinned_vars: BTreeSet::new(),
-            wggo_overrides: None,
-            ablation: WrgaAblation::default(),
-            custom_adapter: None,
-        };
-        let plan = run(input);
-        let rows = plan.compute_compare_baselines();
-        let galore = rows.iter().find(|r| r.label == "GaLore").unwrap();
-        assert_eq!(galore.adapter_params, 0);
-    }
+    // -----------------------------------------------------------------------
+    // `nsl check --wrga-compare`
+    // -----------------------------------------------------------------------
 
-    /// Numeric-correctness test for the LoRA-fixed-rank-16 formula on a
-    /// hand-constructed plan with two synthetic rank allocations. Locks in
-    /// the `mn_sum = adapter_params / rank` recovery so a future refactor
-    /// can't silently change the per-site shape derivation.
-    ///
-    /// Two placements: site A with rank=8 and 8*(m+n)=8*200 = 1600 params,
-    /// site B with rank=4 and 4*(m+n)=4*100 = 400 params. LoRA at fixed
-    /// rank 16 must be 16*200 + 16*100 = 4800.
-    #[test]
-    fn compare_baseline_lora_params_recover_from_adapter_params_division() {
+    /// Two sites: A with `m + n` = 200 at rank 8, B with `m + n` = 100 at
+    /// rank 4.
+    fn two_site_plan() -> WrgaPlan {
         use crate::cost_model::BoundClassification;
         use crate::wrga_roofline::AdapterKind;
-        let mut plan = WrgaPlan::test_dummy();
-        plan.placements = vec![
-            crate::wrga_roofline::AdapterPlacement {
-                name: "A".into(),
-                kind: crate::wrga_roofline::SiteKind::Matmul,
-                arithmetic_intensity: 0.0,
-                classification: BoundClassification::MemoryBound,
-                roofline_slack: 1.0,
-                adapter: AdapterKind::Lora,
-                suggested_rank: 8,
-                rationale: String::new(),
-                decorator_kind: None,
-                alpha: None,
-                synthesized_fields: Vec::new(),
-                init_strategies: Vec::new(),
-            },
-            crate::wrga_roofline::AdapterPlacement {
-                name: "B".into(),
-                kind: crate::wrga_roofline::SiteKind::Matmul,
-                arithmetic_intensity: 0.0,
-                classification: BoundClassification::MemoryBound,
-                roofline_slack: 1.0,
-                adapter: AdapterKind::Lora,
-                suggested_rank: 4,
-                rationale: String::new(),
-                decorator_kind: None,
-                alpha: None,
-                synthesized_fields: Vec::new(),
-                init_strategies: Vec::new(),
-            },
-        ];
-        plan.ranks = vec![
-            crate::wrga_spectral::RankAllocation {
-                name: "A".into(),
-                rank: 8,
-                effective_rank: 8.0,
-                adapter_params: 8 * 200, // (m + n) = 200
-            },
-            crate::wrga_spectral::RankAllocation {
-                name: "B".into(),
-                rank: 4,
-                effective_rank: 4.0,
-                adapter_params: 4 * 100, // (m + n) = 100
-            },
-        ];
-
-        let rows = plan.compute_compare_baselines();
-        let lora = rows.iter().find(|r| r.label == "LoRA (r=16)").unwrap();
-        assert_eq!(lora.adapter_params, 16 * 200 + 16 * 100);
-
-        // AdaLoRA mirrors WRGA's measured rank allocation exactly.
-        let wrga = rows.iter().find(|r| r.label == "WRGA (this run)").unwrap();
-        let ada = rows.iter().find(|r| r.label == "AdaLoRA").unwrap();
-        assert_eq!(ada.adapter_params, wrga.adapter_params);
-    }
-
-    /// Rank-0 sites must contribute ZERO ReFT params, even when they survive
-    /// the top-25% take (which happens when WRGA prunes >75% of candidate
-    /// sites). Pins the rank-0 guard that replaced a `.max(1)` quirk that
-    /// would otherwise silently inflate ReFT's reported count by `4 *
-    /// rank_0_site_count_in_top_quartile` phantom params.
-    #[test]
-    fn compare_baseline_reft_skips_rank_zero_sites_in_top_quartile() {
-        use crate::cost_model::BoundClassification;
-        use crate::wrga_roofline::AdapterKind;
-        let mut plan = WrgaPlan::test_dummy();
-        let mk_placement = |name: &str, rank: usize| crate::wrga_roofline::AdapterPlacement {
+        let placement = |name: &str, rank: usize| crate::wrga_roofline::AdapterPlacement {
             name: name.into(),
             kind: crate::wrga_roofline::SiteKind::Matmul,
             arithmetic_intensity: 0.0,
@@ -1652,38 +1945,66 @@ mod tests {
             synthesized_fields: Vec::new(),
             init_strategies: Vec::new(),
         };
-        let mk_rank = |name: &str, rank: usize, mn: usize| crate::wrga_spectral::RankAllocation {
+        let rank = |name: &str, rank: usize, mn: usize| crate::wrga_spectral::RankAllocation {
             name: name.into(),
             rank,
             effective_rank: rank as f64,
             adapter_params: rank * mn,
         };
+        let mut plan = WrgaPlan::test_dummy();
+        plan.placements = vec![placement("A", 8), placement("B", 4)];
+        plan.ranks = vec![rank("A", 8, 200), rank("B", 4, 100)];
+        plan.rank_site_mn = vec![200, 100];
+        plan
+    }
 
-        // 4 placements: only the first has real shape; the other three are
-        // rank-0 (pruned). reft_site_count = ceil(4 / 4) = 1, so the top-25%
-        // slice is exactly one site — the rank-0 entries cannot interleave
-        // here because of the sort by mn descending. But this test pins the
-        // behavior regardless: a rank-0 site, if it ever ended up in the
-        // slice (e.g. zero rank-non-zero sites), MUST contribute 0.
-        plan.placements = vec![
-            mk_placement("S0", 0),
-            mk_placement("S1", 0),
-            mk_placement("S2", 0),
-            mk_placement("S3", 0),
-        ];
-        plan.ranks = vec![
-            mk_rank("S0", 0, 0),
-            mk_rank("S1", 0, 0),
-            mk_rank("S2", 0, 0),
-            mk_rank("S3", 0, 0),
-        ];
+    /// The comparison's rows, by each method's formula over the two sites.
+    #[test]
+    fn compare_rows_are_each_method_s_parameter_formula() {
+        let rows = two_site_plan().compute_compare_rows();
+        let params = |label: &str| rows.iter().find(|r| r.label == label).unwrap().adapter_params;
+        assert_eq!(params("WRGA (this run)"), 8 * 200 + 4 * 100);
+        assert_eq!(params("LoRA (r=16)"), 16 * 200 + 16 * 100);
+        assert_eq!(params("GaLore"), 0);
+        // ceil(2 / 4) = 1 site, the larger: 4 × (200 / 2).
+        assert_eq!(params("ReFT (r=4, top-25%)"), 400);
+        // No AdaLoRA row: its ranks come out of training.
+        assert_eq!(rows.len(), 4);
+    }
 
-        let rows = plan.compute_compare_baselines();
-        let reft = rows.iter().find(|r| r.label == "ReFT (r=4, top-25%)").unwrap();
+    /// The rendered table has the parameter column only, and the text says
+    /// why the other methods have no backward, activation or fusion figure.
+    #[test]
+    fn compare_report_gives_no_figure_it_did_not_compute() {
+        let report = two_site_plan().render_compare_report();
+        assert!(report.contains("=== WRGA PEFT Comparison Report ==="));
+        assert!(report.contains("WRGA (this run)        |      2,000"), "{report}");
+        assert!(report.contains("LoRA (r=16)            |      4,800"), "{report}");
+        assert!(report.contains("GaLore                 |          0"), "{report}");
+        assert!(report.contains("ReFT (r=4, top-25%)    |        400"), "{report}");
+        assert!(!report.contains("100.0%"), "{report}");
+        assert!(report.contains("No such figures are given for the other methods"), "{report}");
+        // A table row would start the line with the method's name.
+        assert!(!report.lines().any(|l| l.starts_with("AdaLoRA")), "{report}");
+    }
+
+    #[test]
+    fn compare_report_is_deterministic() {
+        let w = tiny_transformer_like();
         assert_eq!(
-            reft.adapter_params, 0,
-            "rank-0 sites must contribute 0 ReFT params (no phantom .max(1))",
+            run(plain_input(&w)).render_compare_report(),
+            run(plain_input(&w)).render_compare_report(),
         );
+    }
+
+    /// Rank-0 sites of unknown shape contribute no ReFT parameters.
+    #[test]
+    fn compare_reft_counts_nothing_for_sites_without_a_shape() {
+        let mut plan = two_site_plan();
+        plan.rank_site_mn = vec![0, 0];
+        let rows = plan.compute_compare_rows();
+        let reft = rows.iter().find(|r| r.label == "ReFT (r=4, top-25%)").unwrap();
+        assert_eq!(reft.adapter_params, 0);
     }
 
     // -----------------------------------------------------------------------
@@ -1696,8 +2017,9 @@ mod tests {
         WrgaInput {
             mode: WrgaMode::Auto,
             trainable_patterns: vec!["blocks.7.*"],
-            manual_adapter_targets: Vec::new(),
-            hybrid_layers: Vec::new(),
+            declared_adapters: BTreeMap::new(),
+            param_shapes: HashMap::new(),
+            fused_kernels_active: false,
             wengert: w,
             loss_output: w.output,
             weights: None,
@@ -2126,9 +2448,10 @@ mod tests {
         let w = mean_pool_head_like();
         let input = WrgaInput {
             mode: WrgaMode::Auto,
-            trainable_patterns: Vec::new(), // all params trainable
-            manual_adapter_targets: Vec::new(),
-            hybrid_layers: Vec::new(),
+            trainable_patterns: vec!["*"], // all params trainable
+            declared_adapters: BTreeMap::new(),
+            param_shapes: HashMap::new(),
+            fused_kernels_active: false,
             wengert: &w,
             loss_output: 3,
             weights: None,
@@ -2179,9 +2502,10 @@ mod tests {
         };
         let input = WrgaInput {
             mode: WrgaMode::Auto,
-            trainable_patterns: Vec::new(),
-            manual_adapter_targets: Vec::new(),
-            hybrid_layers: Vec::new(),
+            trainable_patterns: vec!["*"],
+            declared_adapters: BTreeMap::new(),
+            param_shapes: HashMap::new(),
+            fused_kernels_active: false,
             wengert: &w,
             loss_output: 3,
             weights: None,
@@ -2224,9 +2548,10 @@ mod tests {
         // to `blocks.7.*` and would skip `head.pool_scale`).
         let mk_input = |abl: WrgaAblation| WrgaInput {
             mode: WrgaMode::Auto,
-            trainable_patterns: Vec::new(), // empty ⇒ all params trainable
-            manual_adapter_targets: Vec::new(),
-            hybrid_layers: Vec::new(),
+            trainable_patterns: vec!["*"], // empty ⇒ all params trainable
+            declared_adapters: BTreeMap::new(),
+            param_shapes: HashMap::new(),
+            fused_kernels_active: false,
             wengert: &w,
             loss_output: 3,
             weights: None,
@@ -2277,8 +2602,9 @@ mod tests {
         WrgaInput {
             mode: WrgaMode::Auto,
             trainable_patterns: vec!["blocks.7.*"],
-            manual_adapter_targets: Vec::new(),
-            hybrid_layers: Vec::new(),
+            declared_adapters: BTreeMap::new(),
+            param_shapes: HashMap::new(),
+            fused_kernels_active: false,
             wengert: w,
             loss_output: w.output,
             weights: None,

@@ -318,18 +318,20 @@ pub(crate) fn invoke_cpdt_if_enabled(
 pub(crate) fn invoke_wrga_if_enabled(
     compiler: &mut crate::compiler::Compiler,
     list: &crate::wengert::WengertList,
-) -> Option<crate::wrga::WrgaPlan> {
+) -> Result<Option<crate::wrga::WrgaPlan>, CodegenError> {
     // Experimental subsystem (WRGA). Compiled in by default; a build that opts
     // out (`--no-default-features` without `experimental-wrga`) turns WRGA
     // adapter/freeze codegen into a no-op here. See STATUS.md / docs/architecture/.
     #[cfg(not(feature = "experimental-wrga"))]
     {
         let _ = (compiler, list);
-        return None;
+        return Ok(None);
     }
-    let inputs = compiler.wrga_inputs.as_ref()?;
+    let Some(inputs) = compiler.wrga_inputs.as_ref() else {
+        return Ok(None);
+    };
     if inputs.wrga.is_empty() && inputs.freeze.is_empty() && inputs.adapter.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let mode = inputs
@@ -359,18 +361,6 @@ pub(crate) fn invoke_wrga_if_enabled(
     trainable_owned.sort();
     trainable_owned.dedup();
 
-    let manual_adapter_owned: Vec<String> = inputs
-        .adapter
-        .iter()
-        .flat_map(|a| a.targets.iter().cloned())
-        .collect();
-
-    let hybrid_owned: Vec<String> = inputs
-        .wrga
-        .iter()
-        .flat_map(|c| c.layers.iter().cloned())
-        .collect();
-
     let budget_params = inputs
         .wrga
         .iter()
@@ -380,30 +370,69 @@ pub(crate) fn invoke_wrga_if_enabled(
 
     // Borrow the owned strings into the `&'a str` slots `WrgaInput` expects.
     let trainable_patterns: Vec<&str> = trainable_owned.iter().map(|s| s.as_str()).collect();
-    let manual_adapter_targets: Vec<&str> =
-        manual_adapter_owned.iter().map(|s| s.as_str()).collect();
-    let hybrid_layers: Vec<&str> = hybrid_owned.iter().map(|s| s.as_str()).collect();
 
-    // WRGA paper §8.3: surface the first non-empty `target=` set on
-    // `WrgaInputs::wrga[*]`. The CLI's `--wrga-target` override pipes through
-    // this field via `apply_wrga_target_override` in the CLI's bridge
-    // functions. Source-level `@wrga(target="...")` decorators do NOT yet
-    // populate this field — both bridge functions still emit `target: None`
-    // pending symbol-resolution wiring — so this `find_map` falls back to the
-    // historical "rtx5070ti" default for the `nsl build` path. Existing build
-    // behaviour is therefore unchanged; only the `nsl check --wrga-analyze`
-    // path produces a non-None target today.
-    let target_override = inputs
+    // The first `target=` among the `@wrga(...)` decorators (the CLI's
+    // `--wrga-target` overwrites it on every one). None given is "", for
+    // which the analysis uses its default GPU and says so; the fallback used
+    // to be the name "rtx5070ti", which matched no entry of the GPU table.
+    // An unknown name is refused before this point
+    // (`Compiler::check_wrga_decorators`).
+    let target = inputs
         .wrga
         .iter()
         .find_map(|c| c.target.as_deref().filter(|s| !s.is_empty()))
-        .unwrap_or("rtx5070ti");
+        .unwrap_or("");
+
+    // What the compiler knows about each parameter of the list: the class
+    // and field that own it, hence its literal shape and whether an
+    // `@adapter` targets it. A parameter is named by its path
+    // (`m.blocks.0.wq`) and a target by `Class.field`; the targets used to be
+    // matched against the paths as globs, which a `Class.field` never
+    // matches.
+    let root = compiler.freeze_ctx.as_ref().map(|t| t.model.clone());
+    let mut declared_adapters = std::collections::BTreeMap::new();
+    let mut param_shapes = std::collections::HashMap::new();
+    for op in &list.ops {
+        let crate::wengert::PrimalOp::Param(name) = &op.op else {
+            continue;
+        };
+        let Some((class, field)) =
+            root.as_deref().and_then(|root| compiler.resolve_param_owner(root, name))
+        else {
+            continue;
+        };
+        if let Some(dims) = compiler.models.model_field_dims.get(&class).and_then(|m| m.get(&field))
+            && let [d0, d1] = dims[..]
+            && d0 > 0
+            && d1 > 0
+        {
+            param_shapes.insert(name.clone(), [d0 as usize, d1 as usize]);
+        }
+        if let Some(site) = compiler
+            .bus
+            .adapter_sites()
+            .iter()
+            .find(|s| s.target_model == class && s.target_field == field)
+        {
+            declared_adapters.insert(
+                name.clone(),
+                crate::wrga::DeclaredAdapter {
+                    kind: site.kind,
+                    rank: site.rank.max(1) as usize,
+                    params: site.param_count(),
+                },
+            );
+        }
+    }
 
     let wrga_input = crate::wrga::WrgaInput {
         mode,
         trainable_patterns,
-        manual_adapter_targets,
-        hybrid_layers,
+        declared_adapters,
+        param_shapes,
+        fused_kernels_active: crate::wrga_adapter_rewrite::fused_path_selected(
+            compiler.target_sm(),
+        ),
         wengert: list,
         loss_output: list.output,
         // M52 weights (--weights safetensors) feed WRGA's spectral rank
@@ -412,7 +441,7 @@ pub(crate) fn invoke_wrga_if_enabled(
         // `allocate_ranks` (the actual paper allocator) never ran in the
         // build path. Same field wggo_prune dereferences further down.
         weights: compiler.features.weight_map.as_ref(),
-        target: target_override,
+        target,
         budget_params,
         r_min: 2,
         r_max: 16,
@@ -433,54 +462,32 @@ pub(crate) fn invoke_wrga_if_enabled(
     };
     let mut plan = crate::wrga::run(wrga_input);
 
-    // B.2 Task 2b: thread the user-facing `@adapter(type=..., alpha=...)`
-    // decorator config onto each matching placement, then run the adapter
-    // inject pass to populate `synthesized_fields` / `init_strategies`.
-    for adapter_cfg in &inputs.adapter {
+    // Give each placement on an adapted weight that adapter's alpha and the
+    // names of its tensors. The sites themselves are the pre-scan's: every
+    // model constructor built its side-table from them and the methods were
+    // rewritten against their names, before any train block was reached.
+    if let Some(root) = root {
         for placement in plan.placements.iter_mut() {
-            let matches = adapter_cfg
-                .targets
+            let Some((class, field)) = compiler.resolve_param_owner(&root, &placement.name) else {
+                continue;
+            };
+            let Some(site) = compiler
+                .bus
+                .adapter_sites()
                 .iter()
-                .any(|pat| crate::wrga_prune::glob_match(pat, &placement.name));
-            if matches {
-                placement.decorator_kind = Some(adapter_cfg.kind);
-                placement.alpha = adapter_cfg.alpha;
-                if let Some(r) = adapter_cfg.rank
-                    && r > 0
-                {
-                    placement.suggested_rank = r as usize;
-                }
-            }
+                .find(|s| s.target_model == class && s.target_field == field)
+            else {
+                continue;
+            };
+            let (fields, inits) =
+                crate::wrga_adapter_inject::synthesized_for(site.kind, &site.site_id);
+            placement.alpha = Some(site.alpha);
+            placement.synthesized_fields = fields;
+            placement.init_strategies = inits;
         }
-    }
-    let inject = crate::wrga_adapter_inject::run_with_compiler(&mut plan, compiler);
-    // B.2.1 Task 5.5: only publish `adapter_sites` when this invocation
-    // actually produced sites. Otherwise we'd wipe the pre-scan result
-    // (which runs before user-function compilation) when a target pattern
-    // like "Toy.w" doesn't match any placement name emitted by
-    // `infer_sites_from_wengert` (which uses bare "w"-style names).
-    //
-    // Nor does it replace a pre-scan result: every model constructor built
-    // its adapter side-table from the pre-scan sites, and the model methods
-    // were rewritten against their names, so a different list here would
-    // index those tables with a layout they were not built with.
-    // `bus.wrga_plan` is always overwritten — the train-block plan is
-    // strictly more informative (real Wengert list, real placements).
-    if !inject.sites.is_empty() && compiler.bus.adapter_sites().is_empty() {
-        // B.3 Task 4: wire fusion decisions onto each newly-injected site.
-        let mut sites = inject.sites;
-        for site in sites.iter_mut() {
-            for decision in &plan.fusion.decisions {
-                if decision.site == site.target_param {
-                    site.fusion_decision = Some(decision.target.clone());
-                    break;
-                }
-            }
-        }
-        compiler.bus.publish_adapter_sites(sites);
     }
     compiler.bus.publish_wrga_plan(plan.clone());
-    Some(plan)
+    Ok(Some(plan))
 }
 
 /// CSHA driver bridge — mirrors `invoke_wrga_if_enabled` (Milestone C).

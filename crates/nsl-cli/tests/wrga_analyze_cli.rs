@@ -264,12 +264,11 @@ fn wrga_analyze_does_not_emit_object_file() {
     );
 }
 
-/// Unknown GPU name passes through to the WRGA roofline. The codegen falls
-/// back to its database default rather than erroring, so the report still
-/// renders successfully but with the fallback GPU's name. Pins the
-/// "graceful fallback" contract so a future hard-fail change is observable.
+/// An unknown GPU name is an error that lists the known ones. It used to
+/// fall back to the database default without a word, so a report asked for
+/// one GPU described another.
 #[test]
-fn wrga_analyze_with_unknown_target_falls_back_gracefully() {
+fn wrga_analyze_with_unknown_target_is_an_error() {
     let tmp = TempDir::new().unwrap();
     let src_path = tmp.path().join("t.nsl");
     fs::write(&src_path, SRC_WITH_DECORATORS).unwrap();
@@ -282,10 +281,80 @@ fn wrga_analyze_with_unknown_target_falls_back_gracefully() {
         .arg("--wrga-target")
         .arg("definitely-not-a-real-gpu-x999");
     cmd.assert()
-        .success()
-        .stdout(predicate::str::contains("=== WRGA Compilation Report ==="))
-        // Report must include some target line — verifies graceful fallback
-        // rather than the bogus name surviving end-to-end.
-        .stdout(predicate::str::contains("Target hardware:"))
-        .stdout(predicate::str::contains("definitely-not-a-real-gpu-x999").not());
+        .failure()
+        .stdout(predicate::str::contains("=== WRGA Compilation Report ===").not())
+        .stderr(predicate::str::contains("WRGA target 'definitely-not-a-real-gpu-x999'"))
+        .stderr(predicate::str::contains("H100-SXM"));
+}
+
+/// A safetensors file holding one 32-bit float tensor: an 8-byte header
+/// length, a JSON header, then the data.
+fn write_safetensors(path: &std::path::Path, name: &str, shape: [usize; 2], data: &[f32]) {
+    assert_eq!(data.len(), shape[0] * shape[1]);
+    let header = format!(
+        r#"{{"{name}":{{"dtype":"F32","shape":[{},{}],"data_offsets":[0,{}]}}}}"#,
+        shape[0],
+        shape[1],
+        data.len() * 4
+    );
+    let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+    bytes.extend_from_slice(header.as_bytes());
+    for v in data {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    fs::write(path, bytes).unwrap();
+}
+
+/// `--weights` reaches the analysis: the report gains its spectral line.
+/// The flag used to be dropped by `nsl check --wrga-analyze`, whose report
+/// was the same with and without it.
+#[test]
+fn wrga_analyze_uses_the_weights_it_is_given() {
+    const SRC: &str = r#"from nsl.nn.losses import mse_loss
+
+model Toy:
+    w: Tensor = randn([16, 12]) * 0.3
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+@freeze
+@adapter(type=lora, target=["Toy.w"], rank=4)
+let m = Toy()
+let x = ones([4, 16])
+let y = zeros([4, 12])
+
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let loss = mse_loss(m.forward(x), y)
+"#;
+    let tmp = TempDir::new().unwrap();
+    let src_path = tmp.path().join("t.nsl");
+    fs::write(&src_path, SRC).unwrap();
+    let weights_path = tmp.path().join("w.safetensors");
+    // No structure, so no singular value dominates.
+    let data: Vec<f32> = (0..16 * 12).map(|i| ((i * 37 + 11) % 101) as f32 / 101.0 - 0.5).collect();
+    write_safetensors(&weights_path, "w", [16, 12], &data);
+
+    let report = |with_weights: bool| -> String {
+        let mut cmd = Command::cargo_bin("nsl").unwrap();
+        cmd.env("NSL_STDLIB_PATH", stdlib_path()).arg("check").arg(&src_path).arg("--wrga-analyze");
+        if with_weights {
+            cmd.arg("--weights").arg(&weights_path);
+        }
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let (plain, weighted) = (report(false), report(true));
+    // The declared adapter, at its real size either way: 4 × (16 + 12).
+    for r in [&plain, &weighted] {
+        assert!(r.contains("Adapter parameters: 112  |  Sites: 1"), "{r}");
+    }
+    assert!(!plain.contains("Spectral analysis"), "{plain}");
+    assert!(
+        weighted.contains("Spectral analysis: 1 of 1 sites matched a checkpoint weight"),
+        "{weighted}"
+    );
 }

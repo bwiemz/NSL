@@ -131,6 +131,7 @@ impl Compiler<'_> {
         });
         let param_paths = self.enumerate_model_tensor_paths(&model_var_name, &model_type_name);
         self.check_freeze_patterns(&model_var_name, &model_type_name, &param_paths)?;
+        self.check_wrga_decorators(&model_var_name, &model_type_name, &param_paths)?;
         let param_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
         for path in &param_paths {
             let param_ptr = self

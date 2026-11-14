@@ -9,8 +9,16 @@
 //! * **Balanced** matmul                   → medium-rank LoRA
 //! * **Compute-bound** projection          → low-rank or skip
 //!
-//! The pass is deterministic and hardware-aware: the exact same model compiled
-//! for an RTX 5070 Ti and an H100 will receive different placements.
+//! The pass is deterministic, and the classification depends on the GPU's
+//! ridge. What it is given does not let that show: the driver
+//! (`wrga::infer_sites_from_wengert`) has no activation shapes, so it costs
+//! every site at one sequence of 128 tokens in 2-byte elements. A matmul's
+//! arithmetic intensity is then at most 2 · 128 / 2 = 128 FLOP per byte
+//! whatever the weight's shape, below the half-precision ridge of every GPU
+//! in the table (the lowest is 151.7). Every matmul site is therefore
+//! memory-bound, and is suggested LoRA at the maximum rank, on every target.
+//! The suggestions are printed by `--wrga-report` and build nothing; the
+//! adapters that exist are the ones `@adapter` declares.
 
 use crate::cost_model::{
     arithmetic_intensity, classify_op, matmul_cost, rmsnorm_cost, softmax_cost,
