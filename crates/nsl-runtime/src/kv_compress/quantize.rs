@@ -1,15 +1,67 @@
 // crates/nsl-runtime/src/kv_compress/quantize.rs
 //! KV-cache quantization: INT8/INT4/FP8 compress and decompress.
 //!
-//! Quantization is fused into the KV write path: after K = matmul(x, W_k),
-//! the runtime quantizes in-place and writes the compressed dtype to the
-//! block pool. Dequantization runs on read (CPU) or in FlashAttention
-//! tile-loading (GPU, deferred to M42b).
+//! These are library routines. Nothing calls them from the KV write path:
+//! the paged KV cache stores K and V as written, and `@kv_compress` is a
+//! refused decorator.
 
 use super::KvQuantScheme;
 
-/// Maximum number of scale/zero entries per block (covers up to 128 heads or 128 tokens).
+/// Maximum number of scale/zero entries per block: 128 heads, 128 tokens or
+/// 128 INT4 groups. A block that needs more is refused with
+/// [`KvQuantError::TooManyScales`]; the quantizers used to index past the
+/// arrays and panic (INT4 on 8 heads x 16 tokens x 128 dims needs 256
+/// groups; per-token INT8 fails above 128 tokens per block).
 pub const MAX_SCALES: usize = 128;
+
+/// Why a block cannot be quantized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvQuantError {
+    /// The scheme needs `needed` scales and the metadata holds [`MAX_SCALES`].
+    TooManyScales { needed: usize },
+    /// An input or output slice is shorter than the block's dimensions say.
+    BufferTooSmall { needed: usize, got: usize },
+    /// A token range that does not fit in the block.
+    TokenRange { offset: usize, tokens: usize, block_size: usize },
+    /// The group size is zero.
+    ZeroGroupSize,
+}
+
+impl std::fmt::Display for KvQuantError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooManyScales { needed } => write!(
+                f,
+                "the block needs {needed} scale entries and its metadata holds {MAX_SCALES}"
+            ),
+            Self::BufferTooSmall { needed, got } => {
+                write!(f, "a buffer of {got} elements where the block needs {needed}")
+            }
+            Self::TokenRange { offset, tokens, block_size } => write!(
+                f,
+                "tokens {offset}..{} do not fit in a block of {block_size}",
+                offset + tokens
+            ),
+            Self::ZeroGroupSize => write!(f, "the group size must be positive"),
+        }
+    }
+}
+
+impl std::error::Error for KvQuantError {}
+
+fn check_scales(needed: usize) -> Result<(), KvQuantError> {
+    if needed > MAX_SCALES {
+        return Err(KvQuantError::TooManyScales { needed });
+    }
+    Ok(())
+}
+
+fn check_len(needed: usize, got: usize) -> Result<(), KvQuantError> {
+    if got < needed {
+        return Err(KvQuantError::BufferTooSmall { needed, got });
+    }
+    Ok(())
+}
 
 /// Per-block quantization metadata stored alongside block data.
 ///
@@ -85,7 +137,11 @@ pub fn quantize_int8_per_head(
     num_heads: usize,
     block_size: usize,
     head_dim: usize,
-) {
+) -> Result<(), KvQuantError> {
+    check_scales(num_heads)?;
+    let n = num_heads * block_size * head_dim;
+    check_len(n, values.len())?;
+    check_len(n, output.len())?;
     meta.scheme = KvQuantScheme::Int8PerHead as u8;
     meta.num_scales = num_heads as u16;
     let head_stride = block_size * head_dim;
@@ -107,6 +163,7 @@ pub fn quantize_int8_per_head(
             output[start + i] = q;
         }
     }
+    Ok(())
 }
 
 /// Dequantize INT8 per-head back to f32.
@@ -135,6 +192,9 @@ pub fn dequantize_int8_per_head(
 /// Quantize f32 values to INT8 with per-token symmetric scaling.
 ///
 /// For each token t: scale_t = max(|values[:, t, :]|) / 127.0
+///
+/// A whole block at once: `values` and `output` are both
+/// `[num_heads, block_size, head_dim]`.
 pub fn quantize_int8_per_token(
     values: &[f32],
     output: &mut [i8],
@@ -142,32 +202,64 @@ pub fn quantize_int8_per_token(
     num_heads: usize,
     block_size: usize,
     head_dim: usize,
-) {
-    meta.scheme = KvQuantScheme::Int8PerToken as u8;
-    meta.num_scales = block_size as u16;
+) -> Result<(), KvQuantError> {
+    meta.num_scales = 0;
+    append_int8_per_token(values, output, meta, num_heads, block_size, head_dim, 0, block_size)
+}
 
-    for t in 0..block_size {
+/// Quantize `num_tokens` new tokens into a block that already holds
+/// `token_offset` tokens, per-token INT8.
+///
+/// `values` is `[num_heads, num_tokens, head_dim]` (the new tokens only);
+/// `block` is the whole block, `[num_heads, block_size, head_dim]`. Each new
+/// token gets its own scale, stored at its ABSOLUTE position
+/// `token_offset + t`, and its codes go to that position in the block. The
+/// scales and codes of tokens already stored are not touched, so they decode
+/// with the scale they were written with.
+#[allow(clippy::too_many_arguments)]
+pub fn append_int8_per_token(
+    values: &[f32],
+    block: &mut [i8],
+    meta: &mut KvBlockQuantMeta,
+    num_heads: usize,
+    block_size: usize,
+    head_dim: usize,
+    token_offset: usize,
+    num_tokens: usize,
+) -> Result<(), KvQuantError> {
+    if token_offset + num_tokens > block_size {
+        return Err(KvQuantError::TokenRange { offset: token_offset, tokens: num_tokens, block_size });
+    }
+    check_scales(token_offset + num_tokens)?;
+    check_len(num_heads * num_tokens * head_dim, values.len())?;
+    check_len(num_heads * block_size * head_dim, block.len())?;
+    meta.scheme = KvQuantScheme::Int8PerToken as u8;
+    meta.num_scales = meta.num_scales.max((token_offset + num_tokens) as u16);
+
+    for t in 0..num_tokens {
         // Find max across all heads for this token
         let mut abs_max = 0.0f32;
         for h in 0..num_heads {
-            let offset = h * block_size * head_dim + t * head_dim;
+            let src = h * num_tokens * head_dim + t * head_dim;
             for d in 0..head_dim {
-                abs_max = abs_max.max(values[offset + d].abs());
+                abs_max = abs_max.max(values[src + d].abs());
             }
         }
         let scale = if abs_max == 0.0 { 1.0 } else { abs_max / 127.0 };
-        meta.scales[t] = scale;
+        meta.scales[token_offset + t] = scale;
 
         // Quantize all heads for this token
         let inv_scale = 1.0 / scale;
         for h in 0..num_heads {
-            let offset = h * block_size * head_dim + t * head_dim;
+            let src = h * num_tokens * head_dim + t * head_dim;
+            let dst = h * block_size * head_dim + (token_offset + t) * head_dim;
             for d in 0..head_dim {
-                let q = (values[offset + d] * inv_scale).round().clamp(-127.0, 127.0) as i8;
-                output[offset + d] = q;
+                let q = (values[src + d] * inv_scale).round().clamp(-127.0, 127.0) as i8;
+                block[dst + d] = q;
             }
         }
     }
+    Ok(())
 }
 
 /// Dequantize INT8 per-token back to f32.
@@ -207,11 +299,16 @@ pub fn quantize_int4_per_group(
     output: &mut [u8],
     meta: &mut KvBlockQuantMeta,
     group_size: usize,
-) {
+) -> Result<(), KvQuantError> {
+    if group_size == 0 {
+        return Err(KvQuantError::ZeroGroupSize);
+    }
+    let num_groups = values.len().div_ceil(group_size);
+    check_scales(num_groups)?;
+    check_len(values.len().div_ceil(2), output.len())?;
     // IMPORTANT-3 fix: zero output buffer to prevent stale high nibbles from buffer reuse
     output.fill(0);
     meta.scheme = KvQuantScheme::Int4PerGroup as u8;
-    let num_groups = values.len().div_ceil(group_size);
     meta.num_scales = num_groups as u16;
 
     for g in 0..num_groups {
@@ -237,6 +334,7 @@ pub fn quantize_int4_per_group(
             }
         }
     }
+    Ok(())
 }
 
 /// Dequantize INT4 per-group back to f32.
@@ -336,7 +434,7 @@ mod tests {
         let mut quantized = vec![0i8; n];
         let mut meta = KvBlockQuantMeta::default();
 
-        quantize_int8_per_head(&values, &mut quantized, &mut meta, num_heads, block_size, head_dim);
+        quantize_int8_per_head(&values, &mut quantized, &mut meta, num_heads, block_size, head_dim).unwrap();
         assert_eq!(meta.scheme, KvQuantScheme::Int8PerHead as u8);
         assert_eq!(meta.num_scales, 4);
 
@@ -362,7 +460,7 @@ mod tests {
         let mut quantized = vec![0i8; n];
         let mut meta = KvBlockQuantMeta::default();
 
-        quantize_int8_per_token(&values, &mut quantized, &mut meta, num_heads, block_size, head_dim);
+        quantize_int8_per_token(&values, &mut quantized, &mut meta, num_heads, block_size, head_dim).unwrap();
         assert_eq!(meta.scheme, KvQuantScheme::Int8PerToken as u8);
         assert_eq!(meta.num_scales, 4);
 
@@ -383,7 +481,7 @@ mod tests {
         let mut packed = vec![0u8; packed_len];
         let mut meta = KvBlockQuantMeta::default();
 
-        quantize_int4_per_group(&values, &mut packed, &mut meta, INT4_GROUP_SIZE);
+        quantize_int4_per_group(&values, &mut packed, &mut meta, INT4_GROUP_SIZE).unwrap();
         assert_eq!(meta.scheme, KvQuantScheme::Int4PerGroup as u8);
 
         let mut restored = vec![0.0f32; values.len()];
@@ -472,7 +570,131 @@ mod tests {
         let values = vec![0.0f32; 32];
         let mut quantized = vec![0i8; 32];
         let mut meta = KvBlockQuantMeta::default();
-        quantize_int8_per_head(&values, &mut quantized, &mut meta, 1, 2, 16);
+        quantize_int8_per_head(&values, &mut quantized, &mut meta, 1, 2, 16).unwrap();
         assert!(quantized.iter().all(|&q| q == 0));
+    }
+
+    /// A deterministic block of a realistic size, values in [-1, 1).
+    fn block_values(n: usize) -> Vec<f32> {
+        let mut s: u32 = 12345;
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                ((s >> 16) as f32 / 32768.0) - 1.0
+            })
+            .collect()
+    }
+
+    /// 8 heads x 16 tokens x 128 dims in groups of 64 is 256 groups, twice
+    /// what the metadata holds. This used to index past the scale array and
+    /// panic; the unit tests ran 16 elements.
+    #[test]
+    fn int4_on_a_realistic_block_is_refused_not_a_panic() {
+        let n = 8 * 16 * 128;
+        let values = block_values(n);
+        let mut packed = vec![0u8; n / 2];
+        let mut meta = KvBlockQuantMeta::default();
+        assert_eq!(
+            quantize_int4_per_group(&values, &mut packed, &mut meta, INT4_GROUP_SIZE),
+            Err(KvQuantError::TooManyScales { needed: 256 })
+        );
+        // The largest block the metadata does cover round-trips within half
+        // a step of each group's own range.
+        let n = MAX_SCALES * INT4_GROUP_SIZE;
+        let values = block_values(n);
+        let mut packed = vec![0u8; n / 2];
+        quantize_int4_per_group(&values, &mut packed, &mut meta, INT4_GROUP_SIZE).unwrap();
+        assert_eq!(meta.num_scales as usize, MAX_SCALES);
+        let mut restored = vec![0.0f32; n];
+        dequantize_int4_per_group(&packed, &mut restored, &meta, n, INT4_GROUP_SIZE);
+        for g in 0..MAX_SCALES {
+            let group = &values[g * INT4_GROUP_SIZE..(g + 1) * INT4_GROUP_SIZE];
+            let lo = group.iter().cloned().fold(f32::MAX, f32::min);
+            let hi = group.iter().cloned().fold(f32::MIN, f32::max);
+            let half_step = 0.5 * (hi - lo) / 15.0;
+            for (i, v) in group.iter().enumerate() {
+                let r = restored[g * INT4_GROUP_SIZE + i];
+                assert!((v - r).abs() <= half_step * 1.001, "group {g}, element {i}: {v} decoded as {r}");
+            }
+        }
+    }
+
+    /// A block of 256 tokens (the serving engine's default block) needs 256
+    /// per-token scales.
+    #[test]
+    fn per_token_int8_above_128_tokens_is_refused_not_a_panic() {
+        let (heads, block, dim) = (2, 256, 4);
+        let values = block_values(heads * block * dim);
+        let mut out = vec![0i8; values.len()];
+        let mut meta = KvBlockQuantMeta::default();
+        assert_eq!(
+            quantize_int8_per_token(&values, &mut out, &mut meta, heads, block, dim),
+            Err(KvQuantError::TooManyScales { needed: 256 })
+        );
+        assert_eq!(
+            quantize_int8_per_head(&values[..129 * 4], &mut out[..129 * 4], &mut meta, 129, 1, 4),
+            Err(KvQuantError::TooManyScales { needed: 129 })
+        );
+    }
+
+    /// Appending tokens to a block must leave the tokens already stored
+    /// decodable. Two heads, a block of four tokens, two dims; tokens 0 and
+    /// 1 are written first, then 2 and 3, which are 100 times larger.
+    ///
+    /// By hand: token t's scale is its largest magnitude / 127. Token 0 holds
+    /// {0.1, -0.2, 0.3, 0.4} -> 0.4/127; token 1 {0.5, 0.6, -0.7, 0.8} ->
+    /// 0.8/127; token 2 {10, 20, 30, -40} -> 40/127; token 3 {50, 60, 70, 80}
+    /// -> 80/127.
+    #[test]
+    fn appending_tokens_keeps_the_scales_of_earlier_tokens() {
+        let (heads, block, dim) = (2usize, 4usize, 2usize);
+        // [heads, 2 tokens, dim] for each call
+        let first = [0.1f32, -0.2, 0.5, 0.6, /* head 1 */ 0.3, 0.4, -0.7, 0.8];
+        let second = [10.0f32, 20.0, 50.0, 60.0, /* head 1 */ 30.0, -40.0, 70.0, 80.0];
+        let mut codes = vec![0i8; heads * block * dim];
+        let mut meta = KvBlockQuantMeta::default();
+
+        append_int8_per_token(&first, &mut codes, &mut meta, heads, block, dim, 0, 2).unwrap();
+        assert_eq!(meta.num_scales, 2);
+        assert_eq!(&meta.scales[..2], &[0.4 / 127.0, 0.8 / 127.0]);
+
+        append_int8_per_token(&second, &mut codes, &mut meta, heads, block, dim, 2, 2).unwrap();
+        assert_eq!(meta.num_scales, 4);
+        assert_eq!(&meta.scales[..4], &[0.4 / 127.0, 0.8 / 127.0, 40.0 / 127.0, 80.0 / 127.0]);
+
+        // The whole block, [heads, 4 tokens, dim], as it was written.
+        let whole = [
+            0.1f32, -0.2, 0.5, 0.6, 10.0, 20.0, 50.0, 60.0, // head 0
+            0.3, 0.4, -0.7, 0.8, 30.0, -40.0, 70.0, 80.0, // head 1
+        ];
+        let mut restored = vec![0.0f32; whole.len()];
+        dequantize_int8_per_token(&codes, &mut restored, &meta, heads, block, dim);
+        for h in 0..heads {
+            for t in 0..block {
+                let half_step = 0.5 * meta.scales[t];
+                for d in 0..dim {
+                    let i = h * block * dim + t * dim + d;
+                    assert!(
+                        (whole[i] - restored[i]).abs() <= half_step * 1.001,
+                        "head {h} token {t} dim {d}: {} decoded as {}",
+                        whole[i],
+                        restored[i]
+                    );
+                }
+            }
+        }
+
+        // And it is the block a single call over all four tokens produces.
+        let mut once = vec![0i8; whole.len()];
+        let mut once_meta = KvBlockQuantMeta::default();
+        quantize_int8_per_token(&whole, &mut once, &mut once_meta, heads, block, dim).unwrap();
+        assert_eq!(codes, once);
+        assert_eq!(&meta.scales[..4], &once_meta.scales[..4]);
+
+        // A range that runs off the block is refused.
+        assert_eq!(
+            append_int8_per_token(&first, &mut codes, &mut meta, heads, block, dim, 3, 2),
+            Err(KvQuantError::TokenRange { offset: 3, tokens: 2, block_size: 4 })
+        );
     }
 }

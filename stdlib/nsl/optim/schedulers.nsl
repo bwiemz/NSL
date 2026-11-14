@@ -3,6 +3,18 @@
 ## Each is a pure function of the step number, so a schedule can be
 ## evaluated anywhere without carrying optimizer state, and two
 ## schedules can be compared by plotting them.
+##
+## In a `train` block's `scheduler:` section the block supplies the step:
+## the number of optimizer steps taken so far. Under
+## `grad_accumulation = N` every micro-batch of a window therefore runs at
+## one rate, and `warmup_steps`, `total_steps`, `step_size` and `t_max`
+## count optimizer steps. Writing `schedule_unit = "micro_batch"` in
+## `train(...)` makes the step the number of micro-batches run, N per
+## optimizer step, which is what a block counted before 2026-11;
+## `schedule_unit = "optimizer_step"` states the default. A block that
+## combines a schedule with accumulation and states neither is compiled
+## with a warning, because a schedule written for the old unit now runs
+## N times slower.
 
 ## A flat schedule: `base_lr` at every step. The null control for a
 ## schedule comparison.

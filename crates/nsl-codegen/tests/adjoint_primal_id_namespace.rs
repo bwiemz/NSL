@@ -162,15 +162,14 @@ fn adjoint_with_recompute_clones(
     let seg = segments.last().expect("two blocks");
     let victims: Vec<VarId> = seg.interior.clone();
     let recompute: HashSet<VarId> = victims.iter().copied().collect();
-    let plan = CcrPlan {
+    let mut plan = CcrPlan {
         segments,
         recompute,
         per_segment_recompute: vec![Vec::new(), victims],
-        free_eligible: HashSet::new(),
-        compress: Vec::new(),
+        ..CcrPlan::default()
     };
     let before = sdpa_count(&adjoint);
-    apply_to_adjoint(primal, &mut adjoint, &plan, &mut fresh).expect("ccr splice");
+    apply_to_adjoint(primal, &mut adjoint, &mut plan, &mut fresh, false).expect("ccr splice");
     let added = sdpa_count(&adjoint) - before;
     (adjoint, added)
 }

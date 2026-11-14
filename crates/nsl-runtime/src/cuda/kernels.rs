@@ -123,7 +123,7 @@ pub(crate) fn muon_scale_inv_frob_f32_ptx() -> &'static str {
 use nsl_kir::kernels::elementwise::UnaryOp;
 
 pub(crate) fn unary_module(op: UnaryOp) -> &'static str {
-    static MODULES: std::sync::OnceLock<[String; 13]> = std::sync::OnceLock::new();
+    static MODULES: std::sync::OnceLock<[String; 12]> = std::sync::OnceLock::new();
     let modules = MODULES.get_or_init(|| {
         UnaryOp::ALL.map(|op| {
             String::from_utf8(nsl_kir::kernels::elementwise::unary_ptx(op)).expect("PTX must be ASCII")
@@ -188,11 +188,17 @@ pub(crate) fn silu_f32_ptx() -> &'static str {
     unary_module(UnaryOp::Silu)
 }
 
-/// `nsl_gelu_f32`: `c[i] = a[i] * sigmoid(1.702 * a[i])`, NUL-terminated. The
-/// slope is `nsl_kir::kernels::elementwise::GELU_SLOPE`, the one
-/// `nsl_gelu_backward_srcad_f32` differentiates with (`BackwardOp::GeluSrcad`).
+/// `nsl_gelu_f32(a, c, n)`: the GELU tanh approximation
+/// `c[i] = 0.5·a[i]·(1 + tanh(√(2/π)·(a[i] + 0.044715·a[i]³)))`, built by
+/// `nsl_kir::kernels::elementwise::build_gelu`. It is the function the CPU
+/// path computes (`nsl_tensor_gelu`'s host loop) and PyTorch's
+/// `gelu(approximate="tanh")`; [`gelu_backward_f32_ptx`] is its adjoint.
+/// NUL-terminated.
 pub(crate) fn gelu_f32_ptx() -> &'static str {
-    unary_module(UnaryOp::Gelu)
+    static MODULE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    MODULE.get_or_init(|| {
+        String::from_utf8(nsl_kir::kernels::elementwise::gelu_ptx()).expect("PTX must be ASCII")
+    })
 }
 
 /// `nsl_clamp_f32`: `c[i] = min(max(a[i], lo), hi)`, NUL-terminated.
@@ -236,7 +242,7 @@ pub(crate) fn rotate_half_module(op: nsl_kir::kernels::elementwise::RotateHalfOp
 // --- Backward kernels for activation functions ---
 //
 // The tape-AD `nsl_{relu,sigmoid,tanh,silu}_backward_f32`, the source-AD
-// `nsl_{sigmoid,tanh,silu,gelu}_backward_srcad_f32` and the fused SwiGLU gate
+// `nsl_{sigmoid,tanh,silu}_backward_srcad_f32` and the fused SwiGLU gate
 // adjoint `nsl_swiglu_gate_backward_f32` are built by
 // `nsl_kir::kernels::elementwise` (its `elementwise_backward_kir_equivalence`
 // gate). The source-AD kernels match a chain of separate launches bit for
@@ -248,7 +254,7 @@ pub(crate) fn rotate_half_module(op: nsl_kir::kernels::elementwise::RotateHalfOp
 use nsl_kir::kernels::elementwise::BackwardOp;
 
 pub(crate) fn backward_module(op: BackwardOp) -> &'static str {
-    static MODULES: std::sync::OnceLock<[String; 9]> = std::sync::OnceLock::new();
+    static MODULES: std::sync::OnceLock<[String; 8]> = std::sync::OnceLock::new();
     let modules = MODULES.get_or_init(|| {
         BackwardOp::ALL.map(|op| {
             String::from_utf8(nsl_kir::kernels::elementwise::backward_ptx(op)).expect("PTX must be ASCII")
@@ -258,19 +264,16 @@ pub(crate) fn backward_module(op: BackwardOp) -> &'static str {
     &modules[slot]
 }
 
-/// `nsl_gelu_backward_f32(grad, input, out, n)`: the tape-AD adjoint of the
-/// GELU tanh approximation, built by
+/// `nsl_gelu_backward_f32(grad, input, out, n)`: the adjoint of the GELU
+/// tanh approximation ([`gelu_f32_ptx`]), built by
 /// `nsl_kir::kernels::elementwise::build_gelu_backward` (its
 /// `tanh_gelu_backward_kir_equivalence` gate). Past `|k| = 43.5` the
 /// derivative is its limit, 1 above and 0 below; the hand kernel returned
 /// garbage and then NaN there (`div.approx.f32`'s flush range).
 /// NUL-terminated.
 ///
-/// Nothing launches it now: the GPU forward is the sigmoid form, and the
-/// tape pairs it with `BackwardOp::GeluSrcad` (`gpu_gelu_backward`). It stays
-/// in the assembler gate's kernel list — hence `cfg(test)` — as the adjoint
-/// the GPU forward needs the day it moves to the tanh form the CPU runs.
-#[cfg(test)]
+/// Tape AD (`gpu_gelu_backward`) and source AD (`nsl_tensor_gelu_backward`)
+/// both launch it: one forward, one adjoint, on every device.
 pub(crate) fn gelu_backward_f32_ptx() -> &'static str {
     static MODULE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     MODULE.get_or_init(|| {

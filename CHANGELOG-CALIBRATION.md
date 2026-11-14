@@ -3,7 +3,8 @@
 Dedicated changelog for calibration-affecting changes. Per #134 §6.3, any
 PR modifying `crates/nsl-codegen/tests/snapshots/awq_*.snap` (or other
 calibration snapshot files) MUST add a corresponding entry here.
-CI enforces the pairing (`.github/workflows/calibration-snapshot-changelog.yml`).
+CI enforced the pairing (`.github/workflows/calibration-snapshot-changelog.yml`)
+until the AWQ snapshot was deleted; no calibration snapshot remains.
 
 **Entry format:**
 
@@ -29,3 +30,18 @@ before any #134 logic changes. Determinism verified across 11 runs
 (10 serial + 1 thread-varied). Subsequent commits in #134 (hop 6 fix,
 wrapper-level firing, train-block deletion, un-ignore) must NOT change
 this snapshot per (c-i)'s zero-by-construction merge gate.
+
+## 2026-11-14 — AWQ calibration removed
+
+**Snapshot files:** `crates/nsl-codegen/tests/snapshots/awq_full_pipeline__awq_sidecar_baseline.snap` (deleted)
+
+**Cause:** The AWQ calibration hook recorded per-channel activation maxima
+that no quantizer read, and the decorator that triggered it,
+`@quantize(dtype="awq4")`, is now a compile error. The hook, the
+`awq_full_pipeline` test that owned this snapshot, and the CI workflow that
+paired AWQ snapshots with this file are deleted.
+
+**Bit-equivalence evidence:** Not applicable: no AWQ sidecar is produced
+any more. The WGGO gradient sidecar is unaffected (`wggo_backward_pipeline`
+compares it with its analytical reference).
+

@@ -265,14 +265,12 @@ decorator or test for any of it.
 holds:
 
 - `train_grpo.nsl` is an SFT script. GRPO appears only in comments, which
-  defer it to a Rust "reward server" (`grpo_server`) and a
-  `collect_rejections.nsl`; neither exists in the tree. The comments say
-  per-token log-probs are available from an unreduced `cross_entropy`, but
-  the standard library's `cross_entropy` has no unreduced mode.
-- `reward.nsl` is constants and comments ("In a real implementation, these
-  would call the NSL CLI as subprocesses"). Beyond the five stages the
-  proposal quotes, it has a `REWARD_RUN_OK` of 0.85 and per-statement partial
-  credit.
+  describe a "reward server" and a rejection-sampling step and now say
+  that neither exists in the tree, and that the standard library's
+  `cross_entropy` has no unreduced mode to supply per-token log-probs.
+- `reward.nsl` is constants and comments; its header says nothing runs it.
+  Beyond the five stages the proposal quotes, it has a `REWARD_RUN_OK` of
+  0.85 and per-statement partial credit.
 - `tasks.nsl` is comments only.
 - `model.nsl` defines a model of 11.31M parameters by count (its banner says
   10.1M and its header 12M) with vocabulary 4096. The proposal's
@@ -287,12 +285,13 @@ holds:
   its claim of fitting in 16 GB.
 
 §2.6's promise that a user writes the loss as an NSL function and source AD
-does the rest does not hold today. Under `--source-ad` a user-defined loss
-function is not extracted, in a `grad` block or a `train` block, and the
-compiler falls back to tape AD. Under tape AD a loss written as a function
-now gets its gradient; it used to get all zeros (Part 5, "Fixed"). The same
-mathematics written inline in a train-block step body trains correctly in
-both modes.
+does the rest now holds for a loss written as an ordinary function: under
+`--source-ad` the function is inlined into the block that calls it and
+differentiated at compile time, in a `grad`, `train` or `distill` block
+(Part 5, "Fixed"). Under tape AD a loss written as a function gets its
+gradient too; it used to get all zeros. What still falls back to the tape
+is a function source AD cannot inline (recursive, variadic, decorated, or
+with an early return), and the compiler says so.
 
 `docs/wiki/Glossary.md` used to define CFA as "Compiler-Fused Attention" and
 to send FlashAttention readers to this PDF, which is about alignment. It now
@@ -340,26 +339,47 @@ check, or by reading the code only.
   test `crates/nsl-cli/tests/tape_fused_chain_gate.rs`), so the DPO and SimPO
   losses written as functions now get non-zero gradients under tape AD.
 
+- `models/coder-rl/train_grpo.nsl` ran its 210 steps (21 per epoch at batch
+  8, 10 epochs) under `warmup_steps=100, total_steps=1000`: warm-up was 48%
+  of the run and the rate never fell below 2.9e-4 of 3e-4. The schedule is
+  now `warmup_steps=10, total_steps=210`, the script reads the same corpus
+  path as `train_sft.nsl`, and like it trains with dropout off and no weight
+  decay. Its header and closing banner no longer present Phases 2 and 3 as
+  runnable: they say that only Phase 1 exists, that there is no reward
+  server or rejection-sampling script, and that the standard library's
+  `cross_entropy` has no unreduced mode.
+- `models/coder-rl/train_sft.nsl`'s comments described batch 4, 43 steps
+  per epoch and a 20-step warm-up above code that uses batch 2, 86 steps
+  per epoch and `warmup_steps=40`. The comments now state what the code
+  does.
+
+- Under `--source-ad` a call to a function the user wrote was not
+  extracted: a `grad` or `train` block warned of an "unrecognized FFI
+  callee" and fell back to tape AD, and a `distill` block, which refuses
+  the tape, failed to build. Source AD now inlines the body of an
+  undecorated free function, of the module or of one it imports, into the
+  graph of the block that calls it (`inline_user_fn` in
+  `crates/nsl-codegen/src/source_ad.rs`). A call inside an inlined body
+  resolves in the module that body was written in: a module's own function
+  takes precedence over a builtin of the same name, and a library function
+  never calls a same-named function of the user's module. Inside the body
+  every name is one of the function's parameters or locals, never a model
+  found by its name. A function it cannot inline (recursive, variadic,
+  decorated, returning from anywhere but the end of its body, writing into
+  a tensor, a container or a field, or taking a model as an argument) is
+  named with the reason, and the block falls back to the tape as before.
+  Test `crates/nsl-cli/tests/source_ad_user_fn_inline_gate.rs`.
+
 ### Open, in the adjacent code
 
-- **`train_grpo.nsl`'s schedule does not fit its run.** At batch 8 the
-  172-sequence corpus gives 21 steps per epoch and 210 steps in 10 epochs,
-  against `warmup_steps=100, total_steps=1000`: warm-up is 48% of the run and
-  the rate ends near 2.9e-4 of 3e-4. Unlike `train_sft.nsl` it also trains
-  with dropout on, weight decay 0.01, and data read from `data/`. By reading
-  the code only; the corpus is not in the tree and 172 is `train_sft.nsl`'s.
-- **Source AD does not extract a user-defined loss function.** Under
-  `--source-ad`, in a `grad` block or a `train` block, the compiler warns of
-  an "unrecognized FFI callee" and falls back to tape AD; a `distill` block
-  refuses the tape instead. It should inline the function or refuse loudly.
-  `extract_expr_inner` in `crates/nsl-codegen/src/source_ad.rs`. Reproduced
-  by running.
-- **`train_sft.nsl`'s comments disagree with its code.** They say
-  "batch_size=4" with 43 steps per epoch and a 20-step warm-up; the code
-  uses batch 2 and `warmup_steps=40`. By reading the code only.
 - **The reward ladder in `reward.nsl` can be gamed.** A valid program that
   ignores the prompt earns 0.85 with no test, or 0.8 with a failing one,
   while an attempt that fails to compile earns at most 0.6; partial credit
   pays 0.02 per valid statement before a parse error. The compiler checks
-  validity, not whether the task was done. Nothing runs this ladder yet. By
-  reading the code only.
+  validity, not whether the task was done. Nothing runs this ladder, so
+  there is no behaviour to correct yet: the file's header now states the
+  weakness, lists the `REWARD_RUN_OK` and partial-credit rungs it used to
+  omit, and says that nothing executes it. Choosing the rewards (for
+  example, no reward above the compile level without a passing task test)
+  is a design decision for whoever builds the loop. By reading the code
+  only.

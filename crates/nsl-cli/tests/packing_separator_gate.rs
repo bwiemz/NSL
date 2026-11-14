@@ -5,11 +5,12 @@
 //! and the next-token target is dropped. The separator defaulted to id 0,
 //! and id 0 is an ordinary token -- "!" in both shipped tokenizers. A
 //! loader built without `pack_separator` therefore split documents at every
-//! "!" and printed nothing. Rows dense in the separator then tripped the
+//! "!" and printed nothing. Rows dense in the separator then tripped a
 //! 256-documents-per-row limit inside a loader worker thread, whose panic
 //! killed only that thread: with one worker the epoch ended early with exit
 //! status 0, with several the consumer waited forever for the batch the
-//! dead worker had claimed.
+//! dead worker had claimed. That limit was only the size of a table and is
+//! gone; a worker panic of any cause now aborts the process.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -118,17 +119,55 @@ fn an_explicit_none_for_labels_is_accepted_with_packing() {
     assert!(out.status.success(), "{stderr}");
 }
 
-/// More than 256 documents in one row, with one worker and with two. Both
-/// must stop the process with a failure status; neither may run on to the
-/// statement after the loop, and neither may hang.
+/// More than 256 documents in one row. 256 is the size of the loader's
+/// `doc_starts` table, and it used to be enforced as a limit on documents
+/// per row by a panic in a loader worker. A row of 512 two-token documents
+/// is ordinary data and must load: token `i` of the row belongs to document
+/// `i / 2`, so the segment ids of one row sum to `2 * (0 + 1 + ... + 511)`.
 #[test]
-fn a_row_with_too_many_documents_stops_the_run() {
-    // 1024 tokens alternating 1, 0: 512 two-token documents in one row.
-    let source = |workers: usize| {
-        format!(
+fn a_row_with_more_than_256_documents_loads() {
+    let want: u64 = 2 * (511 * 512 / 2);
+    for workers in [1, 2] {
+        let dir = tempfile::tempdir().unwrap();
+        let source = format!(
             r#"let pair = tensor_cat([ones([1]), zeros([1])], 0)
 let tokens = pair.reshape([1, 2]).expand([1024, 2]).contiguous().reshape([2048])
 let loader = DataLoader(tokens, batch_size=1, seq_len=1024, shuffle=false, num_workers={workers}, packing=true, pack_separator=0)
+for batch in loader:
+    print(batch.segment_ids.sum())
+    print(batch.position_ids.sum())
+print("LOOP FINISHED")
+"#
+        );
+        let out = nsl(dir.path(), &source).output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{workers} worker(s): {stderr}");
+        let numbers: Vec<f64> = stdout.lines().filter_map(|l| l.trim().parse().ok()).collect();
+        // Two rows of 1024 tokens; in each, positions alternate 0, 1.
+        assert_eq!(
+            numbers,
+            vec![want as f64, 512.0, want as f64, 512.0],
+            "{workers} worker(s):\n{stdout}\n{stderr}"
+        );
+        assert!(stdout.contains("LOOP FINISHED"), "{workers} worker(s):\n{stdout}");
+    }
+}
+
+/// A panic inside a loader worker must stop the process with a failure
+/// status, with one worker and with two: it used to kill only the worker's
+/// thread, so with one worker the epoch ended early with exit status 0 and
+/// with several the consumer waited forever for the batch the dead worker
+/// had claimed. The trigger here is the one real limit the packer has:
+/// segment ids are 16-bit, so a row cannot hold more than 65536 documents.
+#[test]
+fn a_loader_worker_panic_stops_the_run() {
+    // 131074 tokens alternating 1, 0: 65537 two-token documents in one row.
+    let source = |workers: usize| {
+        format!(
+            r#"let pair = tensor_cat([ones([1]), zeros([1])], 0)
+let tokens = pair.reshape([1, 2]).expand([131074, 2]).contiguous().reshape([262148])
+let loader = DataLoader(tokens, batch_size=1, seq_len=131074, shuffle=false, num_workers={workers}, packing=true, pack_separator=0)
 for batch in loader:
     print(batch.segment_ids.sum())
 print("LOOP FINISHED")
@@ -178,7 +217,7 @@ print("LOOP FINISHED")
             "{workers} worker(s): the loop ended as if the data had run out"
         );
         assert!(
-            stderr.contains("holds more than 256 documents")
+            stderr.contains("holds more than 65536 documents")
                 && stderr.contains("DataLoader worker thread panicked"),
             "{workers} worker(s): {stderr}"
         );

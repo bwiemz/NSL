@@ -207,41 +207,38 @@ pruning schedule, 2:4 mask computation, compressed 2:4 storage, `mma.sp`
 emitter, format selection or composition with other features, and
 `Sparse<[…], dtype, "2:4">` does not parse.
 
-Older, adjacent code that a reader might mistake for it:
+Older, adjacent code that a reader might have mistaken for it has mostly
+been removed:
 
-- **The `Sparse<[shape], dtype, coo|csr|csc|bsr>` type.** It parses and
-  resolves (`crates/nsl-semantic/src/sparse.rs`), which is the "scaffolding"
-  §1.3 refers to. NSL source cannot use it: there is no constructor, and the
-  checker rejects `sparse @ dense`.
-- **The runtime sparse library.** `crates/nsl-runtime/src/sparse.rs` (COO,
-  CSR, CSC and BSR formats; sparse-times-dense matrix and vector products,
-  add, multiply and conversions), the kernels in
-  `crates/nsl-kir/src/kernels/spmm.rs` and `spmv.rs`, and the GPU wrappers
-  in `crates/nsl-runtime/src/cuda/mod.rs`. None of it is reachable from NSL
-  source, and none of these formats is 2:4.
-- **Sparse codegen planning.** `crates/nsl-codegen/src/sparse.rs` holds
-  kernel selection (including a `PtxMmaSp` variant), the `SparseCostModel`,
-  format selection and merge lattices. It has no callers.
-- **`@sparse(pattern="2:4"|"block")`.** Reachable, and validated by the
-  checker, but it has no effect: the decorated weight stays fully dense and
-  the matmul is dense.
-- **Weight-aware sparse matmul (milestone M52c).** `try_sparse_matmul` in
-  `crates/nsl-codegen/src/expr/advanced.rs`, with the analysis in
-  `crates/nsl-codegen/src/weight_aware.rs`. This is the only sparse path NSL
-  source can reach, and it is withheld: a run with `-w weights.safetensors`
-  uses the dense matmul unless the environment variable
-  `NSL_M52C_SPARSE_MATMUL=1` is set (and `--no-sparse-codegen` is not
-  given). When reached, it emits a CSR matmul for a 2-D weight that is at
-  least 50% near-zero; it is not 2:4.
-- **`@layout`.** Listed in `docs/summaries/06-implementation-status.md`, but
-  it is a refused decorator (`UNIMPLEMENTED_DECORATORS` in
-  `crates/nsl-semantic/src/decorator_registry.rs`).
+- **General sparse tensors (milestone M50) are in the attic.** The
+  `Sparse<[shape], dtype, coo|csr|csc|bsr>` type (the "scaffolding" §1.3
+  refers to), the code generation for it, the runtime sparse library
+  (COO, CSR, CSC and BSR formats with products, add, multiply and
+  conversions), its SpMM and SpMV kernels and GPU wrappers, and the sparse
+  planning module (kernel selection, cost model, merge lattices) were
+  removed in 2026-11 and are preserved at tag
+  `attic/sparse-tensors-2026-11`. No program could construct a value of the
+  type, and none of its formats was 2:4. A `Sparse<...>` annotation is now
+  a compile error that names the tag (`refuse_sparse_type` in
+  `crates/nsl-parser/src/types.rs`).
+- **`@sparse(pattern="2:4"|"block")` and `@layout`.** Refused decorators
+  (`UNIMPLEMENTED_DECORATORS` in
+  `crates/nsl-semantic/src/decorator_registry.rs`). `@sparse` used to be
+  validated and then ignored; `@layout`'s validator was never called and
+  went to the attic with the type.
+- **Weight-aware sparsity analysis (milestone M52).** Still present. A run
+  with `-w weights.safetensors` measures each weight's near-zero fraction
+  and reports it (`crates/nsl-codegen/src/weight_aware.rs`);
+  `--sparse-threshold` and `--no-sparse-codegen` control that report. Every
+  matmul is dense. A CSR matmul for a 2-D weight at least 50% near-zero
+  used to be emitted here; it never worked and has been removed. It was
+  not 2:4 either.
 
-No shipped model uses any of this.
-`docs/summaries/06-implementation-status.md` calls the M50 and M52 sparse
-milestones "Production", which is not accurate. `docs/wiki/Glossary.md` used
-to describe CSS as existing compiler behaviour; it now says the proposal is
-not implemented.
+No shipped model used any of this.
+`docs/summaries/06-implementation-status.md` used to call the M50 and M52
+sparse milestones "Production"; it now says the first was removed and the
+second is a report. `docs/wiki/Glossary.md` used to describe CSS as existing
+compiler behaviour; it now says the proposal is not implemented.
 
 Defects found in this code are listed in Part 5.
 
@@ -272,14 +269,19 @@ as of 2026-11-13.
 
 ### Fixed
 
+Several entries below describe repairs to the runtime sparse library and its
+GPU wrappers. Those repairs were made and tested, and the code they are in
+was then moved to the attic with the rest of general sparse tensors (last
+entry); they describe the code as it stands at tag
+`attic/sparse-tensors-2026-11`.
+
+
 - **A run with `-w weights.safetensors` aborted if the model held a 2-D
   weight at least half zeros.** Such a weight reached the weight-aware
   sparse matmul, which aborted on CPU ("invalid tensor handle") and, by
   reading, was wrong on GPU in operand order, pointers and dtype. That path
-  is now withheld unless `NSL_M52C_SPARSE_MATMUL=1` is set
-  (`try_sparse_matmul` in `crates/nsl-codegen/src/expr/advanced.rs`), so
-  the dense matmul runs. The path itself is not repaired; it is the first
-  and seventh items of the open list.
+  was first withheld unless `NSL_M52C_SPARSE_MATMUL=1` was set, and has
+  since been removed (next item), so the dense matmul runs.
 - **A variable was treated as a sparse tensor because of a function's
   name.** Whenever the function that produced a value had "sparse" in its
   name, the value was dispatched as sparse, so a dense result of
@@ -288,64 +290,75 @@ as of 2026-11-13.
 - **The Glossary described CSS as existing compiler behaviour.** The entry
   in `docs/wiki/Glossary.md` now says the proposal is not implemented.
 
+- **The withheld sparse matmul was an opt-in to wrong results.** With
+  `NSL_M52C_SPARSE_MATMUL=1`, `x @ self.w` with a 4×8 weight that is 87.5%
+  zeros stopped on CPU with "invalid tensor handle" (the fallback passed a
+  raw data pointer to the dense matmul as a tensor), and on GPU the kernel
+  computed `W_sparse @ x` for a call site that is `x @ W`, from host
+  addresses passed as device pointers, reading the weight's stored dtype as
+  f32. `try_sparse_matmul`, the runtime function `nsl_sparse_matmul` and the
+  environment variable are deleted; the sparsity analysis remains as a
+  report, and its lines no longer say "SPARSE kernel" or "sparse kernel
+  eligible" for a matmul that is dense.
+- **Duplicate entries in a COO tensor gave different results on different
+  paths.** `nsl_sparse_to_dense` kept the last duplicate while every product
+  summed them. Duplicates now add everywhere, and `nsl_sparse_mul` sums each
+  operand's duplicates before multiplying
+  (`crates/nsl-runtime/src/sparse.rs`). Tests compare all four formats
+  with a matrix worked out by hand.
+- **`nsl_sparse_add` and `nsl_sparse_mul` treated a CSC or BSR operand as
+  all zeros**, and `nsl_sparse_to_dense`, `nsl_sparse_spmm` and
+  `nsl_sparse_spmv` returned a null tensor for a CSC operand on CPU.
+  `sparse_to_triples` returned an empty list for those two formats and the
+  products had no CSC arm. Every routine now handles all four formats.
+- **Sparse-times-dense recorded no gradient.** `nsl_sparse_spmm` is not an
+  operation the autodiff tape knows, so under a recording tape the dense
+  operand's gradient was exactly zero. While a tape is recording it now
+  expands the sparse operand and uses the dense matmul, which records
+  itself; a test checks the gradient of `sum(A @ B)` against the column
+  sums of A. Sparse-plus-sparse and sparse-times-sparse have no dense
+  operand and no gradient to record: a sparse tensor cannot be a parameter.
+- **`@sparse(pattern="2:4")` and `@sparse(pattern="block")` were accepted
+  and not honoured.** The decorated weight stayed fully dense and the
+  matmul was dense, with no message. The decorator is now refused through
+  `UNIMPLEMENTED_DECORATORS`, as `@layout` is, and its validator is removed.
+- **An unknown format name in a `Sparse<...>` type was accepted.** Anything
+  other than `coo`, `csr`, `csc` or `bsr` silently became the format `?`.
+  It is now an error that lists the four (`resolve` in
+  `crates/nsl-semantic/src/resolve.rs`).
+- **`gpu_bsr_spmm_f32` could not launch for more than 64 output columns,
+  and mis-sized its buffers.** It asked for min(256, N) × 16 threads per
+  block, over the limit of 1024 when N > 64; it allocated the output as
+  M × N while the kernel writes whole 16-row blocks, and let the kernel read
+  rows of B past K, whenever a size was not a multiple of 16. The wrapper
+  (`crates/nsl-runtime/src/cuda/mod.rs`) now sizes the thread block to the
+  limit and gives the kernel block-aligned buffers. A GPU test compares the
+  result with a product written out in f64 for sizes of each kind.
+- **`docs/summaries/06-implementation-status.md` called the M50 and M52
+  sparse milestones "Production" and listed `@layout`.** It was corrected,
+  and now records M50 as removed and M52 as a report. `SPECIFICATION.md`
+  is corrected the same way.
+- **`SparseCostModel` used a placeholder size for COO.** It counted 12
+  bytes per nonzero; the COO kernels take two 64-bit indices and an f32
+  value, 20 bytes. Its CSR, CSC and BSR figures (32-bit indices, f32
+  values) do match what the GPU kernels are given, and the comment now says
+  that these are device sizes, not those of the host storage (64-bit
+  indices and f64 values in every format). The model had no callers.
+- **A sparse-plus-sparse or sparse-times-sparse result was treated as a
+  dense tensor.** The checker accepted `a + b` and `a * b` for two
+  `Sparse<...>` operands where a `Tensor` is expected, and code generation
+  registered the sparse pointer the runtime returns as an owned dense
+  tensor. No program could reach it, so it was first refused at compile
+  time and then removed with the type.
+- **General sparse tensors could not be used and were removed.** Nothing
+  in NSL could construct a value of the `Sparse<...>` type, so the type,
+  its code generation, the runtime library, the sparse kernels and the
+  planning module were unreachable. They are removed and preserved at tag
+  `attic/sparse-tensors-2026-11`; `Sparse<...>` and `@layout` are refused
+  with a message that names the tag. The sparsity that the project's GPUs
+  support in hardware is 2:4 structured sparsity, which is a question of
+  weight layout and not of a user-facing sparse type.
+
 ### Open, in the adjacent code
 
-- **With `NSL_M52C_SPARSE_MATMUL=1`, the sparse matmul is wrong on GPU in
-  three ways.** The call site is `x @ W` but the kernel computes
-  `W_sparse @ x`; the CSR arrays are host addresses passed as device
-  pointers; the values keep the weight's stored dtype while the kernel
-  reads f32. Where: `try_sparse_matmul`, and `nsl_sparse_matmul` in
-  `crates/nsl-runtime/src/tensor/arithmetic.rs`. By reading the code only.
-- **Duplicate entries in a COO tensor give different results on different
-  paths.** `nsl_sparse_to_dense` overwrites with the last duplicate; COO
-  and CSR `nsl_sparse_spmm` and the GPU kernels sum them. Where:
-  `crates/nsl-runtime/src/sparse.rs`; NSL source cannot reach it. By
-  reading the code only.
-- **`nsl_sparse_add` and `nsl_sparse_mul` treat a CSC or BSR operand as all
-  zeros.** `sparse_to_triples` returns an empty list for those two formats.
-  Where: `crates/nsl-runtime/src/sparse.rs`; NSL source cannot reach it. By
-  reading the code only.
-- **Sparse operations record no gradient.** `compile_sparse_binary_op` in
-  `crates/nsl-codegen/src/expr/advanced.rs` emits `nsl_sparse_spmm`,
-  `nsl_sparse_add` and `nsl_sparse_mul` as plain calls, not traced calls.
-  Unreachable while no sparse value can be constructed. By reading the
-  code only.
-- **`@sparse(pattern="2:4")` and `@sparse(pattern="block")` are accepted
-  and not honoured.** The decorated weight stays fully dense and the matmul
-  is dense, with no message. Where: `validate_sparse_decorator`, called
-  from `crates/nsl-semantic/src/checker/model.rs`; codegen never reads the
-  decorator. Reproduced by running. Right behaviour: refuse it through
-  `UNIMPLEMENTED_DECORATORS`, as `@layout` is.
-- **An unknown format name in a `Sparse<...>` type is accepted.** Anything
-  other than `coo`, `csr`, `csc` or `bsr` silently becomes the format `?`.
-  Where: `resolve_sparse_format` in `crates/nsl-semantic/src/resolve.rs`.
-  By reading the code only.
-- **With `NSL_M52C_SPARSE_MATMUL=1`, the sparse matmul aborts on CPU.**
-  `x @ self.w` with a 4×8 weight that is 87.5% zeros stops with "invalid
-  tensor handle": the fallback in `nsl_sparse_matmul` passes a raw data
-  pointer to the dense matmul as a tensor. Reproduced by running, before
-  the path was withheld. No test covers the path. It needs the dense
-  weight on the fallback and a test of `x @ W` on both targets.
-- **`nsl_sparse_spmm` returns a null tensor for a CSC operand** on CPU.
-  Where: `crates/nsl-runtime/src/sparse.rs`; NSL source cannot reach it. By
-  reading the code only.
-- **`gpu_bsr_spmm_f32` cannot launch for more than 64 output columns, and
-  mis-sizes its output.** It asks for min(256, N) × 16 threads per block,
-  over the limit of 1024 when N > 64. It allocates M × N while the kernel
-  writes whole 16-row blocks, and reads rows of B past K, when sizes are
-  not multiples of 16. Where: `crates/nsl-runtime/src/cuda/mod.rs`; not
-  reachable from NSL source. By reading the code only.
-- **A sparse-plus-sparse or sparse-times-sparse result is cleaned up as a
-  dense tensor.** `compile_sparse_binary_op` registers the sparse pointer
-  those calls return as an owned dense tensor. Where:
-  `crates/nsl-codegen/src/expr/advanced.rs`; unreachable while no sparse
-  value can be constructed. By reading the code only.
-- **`docs/summaries/06-implementation-status.md` calls the M50 and M52
-  sparse milestones "Production" and lists `@layout`.** NSL source cannot
-  reach the M50 library, the M52 sparse path is withheld, and `@layout` is
-  a refused decorator. By reading the code only.
-- **`SparseCostModel` uses placeholder sizes.** It assumes 4-byte indices
-  and values; the runtime stores 64-bit indices and f64 values. Where:
-  `crates/nsl-codegen/src/sparse.rs`, which has no callers. By reading the
-  code only. The CSR and COO kernels in `crates/nsl-kir/src/kernels/` are
-  not part of this list: they are tested against an independent reference.
+Nothing in this list is open.

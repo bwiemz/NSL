@@ -5,7 +5,7 @@
 //! Produces bespoke binaries optimized for a specific checkpoint.
 
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -17,13 +17,15 @@ use std::path::Path;
 pub struct WeightAwareConfig {
     /// Threshold below which weights are considered "dead" (default: 1e-6)
     pub dead_weight_threshold: f64,
-    /// Sparsity fraction above which sparse kernels are emitted (default: 0.5)
+    /// Near-zero fraction at or above which a 2-D weight is recorded as
+    /// sparse (default: 0.5). A record only: no sparse kernel is emitted.
     pub sparse_threshold: f64,
     /// Enable constant propagation through matmul/add/relu
     pub constant_fold: bool,
     /// Enable dead weight elimination
     pub dead_weight_elim: bool,
-    /// Enable sparsity-aware codegen
+    /// Enable the sparsity analysis and its per-matmul hints. Every matmul
+    /// is the dense one either way.
     pub sparse_codegen: bool,
 }
 
@@ -75,10 +77,22 @@ impl WeightDType {
             WeightDType::F64 => f64::from_le_bytes(bytes[..8].try_into().unwrap()),
             WeightDType::I8 => bytes[0] as i8 as f64,
             WeightDType::I32 => i32::from_le_bytes(bytes[..4].try_into().unwrap()) as f64,
-            WeightDType::F8E4M3 | WeightDType::F8E5M2 => {
-                // FP8: interpret as u8 scaled; approximation sufficient for analysis
-                (bytes[0] as f64) / 127.0
-            }
+            WeightDType::F8E4M3 => decode_fp8(bytes[0], 4, 3),
+            WeightDType::F8E5M2 => decode_fp8(bytes[0], 5, 2),
+        }
+    }
+
+    /// The dtype as a safetensors header spells it.
+    pub fn safetensors_name(&self) -> &'static str {
+        match self {
+            WeightDType::F16 => "F16",
+            WeightDType::BF16 => "BF16",
+            WeightDType::F32 => "F32",
+            WeightDType::F64 => "F64",
+            WeightDType::F8E4M3 => "F8_E4M3",
+            WeightDType::F8E5M2 => "F8_E5M2",
+            WeightDType::I8 => "I8",
+            WeightDType::I32 => "I32",
         }
     }
 
@@ -95,6 +109,39 @@ impl WeightDType {
             other => Err(WeightLoadError::UnsupportedDType(other.to_string())),
         }
     }
+}
+
+/// Decode one 8-bit float: a sign bit, `exp_bits` of biased exponent and
+/// `mant_bits` of mantissa, with subnormals at exponent zero.
+///
+/// - E4M3 (`exp_bits = 4`, bias 7) has no infinities. Its top exponent is an
+///   ordinary one, except that the all-ones mantissa there is NaN, so its
+///   largest value is 1.75 × 2⁸ = 448.
+/// - E5M2 (`exp_bits = 5`, bias 15) is IEEE-like: the top exponent holds the
+///   infinities and NaNs, and its largest value is 1.75 × 2¹⁵ = 57344.
+///
+/// The byte used to be read as `byte / 127.0`, which is not a float decode
+/// at all: 0x80, which is −0.0, came out as 1.008, and every negative value
+/// as a positive one above 1.
+fn decode_fp8(byte: u8, exp_bits: u32, mant_bits: u32) -> f64 {
+    let sign = if byte & 0x80 != 0 { -1.0 } else { 1.0 };
+    let exp = i32::from((byte >> mant_bits) & ((1 << exp_bits) - 1));
+    let mant = f64::from(byte & ((1 << mant_bits) - 1)) / f64::from(1u32 << mant_bits);
+    let max_exp = (1 << exp_bits) - 1;
+    let bias = (1 << (exp_bits - 1)) - 1;
+    let ieee_like = exp_bits == 5;
+    if exp == max_exp {
+        if ieee_like {
+            return if mant == 0.0 { sign * f64::INFINITY } else { f64::NAN };
+        }
+        if byte & ((1 << mant_bits) - 1) == (1 << mant_bits) - 1 {
+            return f64::NAN;
+        }
+    }
+    if exp == 0 {
+        return sign * mant * 2f64.powi(1 - bias);
+    }
+    sign * (1.0 + mant) * 2f64.powi(exp - bias)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -137,7 +184,8 @@ pub struct SparsityInfo {
     pub near_zero_count: usize,
     /// Fraction of exact zeros
     pub exact_zero_fraction: f64,
-    /// Whether this matrix qualifies for sparse codegen
+    /// Whether this matrix is 2-D and at or above the sparse threshold.
+    /// The name is historical: nothing emits a sparse kernel for it.
     pub use_sparse_kernel: bool,
     /// If sparse: the CSR representation for codegen
     pub csr: Option<CsrLayout>,
@@ -398,6 +446,59 @@ pub struct WeightMap {
     source_path: String,
     /// Total bytes of raw tensor data loaded
     total_bytes: u64,
+}
+
+/// One tensor of a weights file, as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredTensor {
+    pub shape: Vec<usize>,
+    pub dtype: WeightDType,
+    /// [`tensor_content_hash`] of the stored bytes.
+    pub hash: [u8; 32],
+}
+
+/// The hash that ties a compiled program to one tensor of its weights file:
+/// SHA-256 over the dtype as the file spells it, a zero byte, each dimension
+/// as a little-endian u64, and the stored bytes. The runtime computes the
+/// same over the file it opens (`nsl-runtime/src/weights_file.rs`).
+pub fn tensor_content_hash(dtype_name: &str, shape: &[usize], data: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(dtype_name.as_bytes());
+    hasher.update([0u8]);
+    for dim in shape {
+        hasher.update((*dim as u64).to_le_bytes());
+    }
+    hasher.update(data);
+    hasher.finalize().into()
+}
+
+/// Every tensor of a weights file as it is stored, by name: shape, dtype and
+/// content hash. Read once per build (by the CLI, for [`WeightBinding`]) and
+/// shared by every module's compile; it is the file itself, untouched by the
+/// passes that edit a [`WeightMap`] (the Mixtral auto-pack renames and merges
+/// entries, dead-weight elimination zeroes values).
+pub fn read_stored_tensors(path: &Path) -> Result<BTreeMap<String, StoredTensor>, WeightLoadError> {
+    let file_bytes = std::fs::read(path)
+        .map_err(|e| WeightLoadError::IoError(path.display().to_string(), e))?;
+    let tensors = safetensors::SafeTensors::deserialize(&file_bytes)
+        .map_err(|e| WeightLoadError::InvalidFormat(e.to_string()))?;
+    let mut stored = BTreeMap::new();
+    for (name, view) in tensors.tensors() {
+        use safetensors::Dtype as ST;
+        let dtype = match view.dtype() {
+            ST::F16 => WeightDType::F16,
+            ST::BF16 => WeightDType::BF16,
+            ST::F32 => WeightDType::F32,
+            ST::F64 => WeightDType::F64,
+            ST::I8 => WeightDType::I8,
+            ST::I32 => WeightDType::I32,
+            other => return Err(WeightLoadError::UnsupportedDType(format!("{:?}", other))),
+        };
+        let shape: Vec<usize> = view.shape().to_vec();
+        let hash = tensor_content_hash(dtype.safetensors_name(), &shape, view.data());
+        stored.insert(name.clone(), StoredTensor { shape, dtype, hash });
+    }
+    Ok(stored)
 }
 
 impl WeightMap {
@@ -662,11 +763,16 @@ impl<'a> ConstantFolder<'a> {
     /// If only one operand is known, return Partial.
     pub fn fold_matmul(&mut self, lhs: &FoldResult, rhs: &FoldResult) -> FoldResult {
         match (lhs, rhs) {
-            (FoldResult::Constant(a), FoldResult::Constant(b)) => {
-                let c = self.compute_matmul(a, b);
-                self.stats.folded_ops += 1;
-                FoldResult::Constant(c)
-            }
+            (FoldResult::Constant(a), FoldResult::Constant(b)) => match self.compute_matmul(a, b) {
+                Some(c) => {
+                    self.stats.folded_ops += 1;
+                    FoldResult::Constant(c)
+                }
+                None => {
+                    self.stats.runtime_ops += 1;
+                    FoldResult::Runtime
+                }
+            },
             (FoldResult::Runtime, FoldResult::Constant(_)) => {
                 // Input is runtime, weight is known -- annotate for sparsity but cannot fold
                 FoldResult::Partial {
@@ -686,9 +792,16 @@ impl<'a> ConstantFolder<'a> {
     pub fn fold_add(&mut self, lhs: &FoldResult, rhs: &FoldResult) -> FoldResult {
         match (lhs, rhs) {
             (FoldResult::Constant(a), FoldResult::Constant(b)) => {
-                let c = self.compute_elementwise_add(a, b);
-                self.stats.folded_ops += 1;
-                FoldResult::Constant(c)
+                match self.compute_elementwise_add(a, b) {
+                    Some(c) => {
+                        self.stats.folded_ops += 1;
+                        FoldResult::Constant(c)
+                    }
+                    None => {
+                        self.stats.runtime_ops += 1;
+                        FoldResult::Runtime
+                    }
+                }
             }
             _ => {
                 self.stats.runtime_ops += 1;
@@ -712,72 +825,59 @@ impl<'a> ConstantFolder<'a> {
         }
     }
 
-    /// Compute matmul of two constant tensors at compile time.
-    /// Supports 2D [M, K] x [K, N] -> [M, N].
-    /// CRITICAL FIX: use separate byte widths for each tensor.
-    fn compute_matmul(&self, a: &ConstTensor, b: &ConstTensor) -> ConstTensor {
-        assert_eq!(a.shape.len(), 2, "compile-time matmul requires 2D tensors");
-        assert_eq!(b.shape.len(), 2, "compile-time matmul requires 2D tensors");
-        let m = a.shape[0];
-        let k = a.shape[1];
-        assert_eq!(
-            k, b.shape[0],
-            "matmul dimension mismatch: {} vs {}",
-            k, b.shape[0]
-        );
-        let n = b.shape[1];
-
-        let bw_a = a.dtype.byte_width();
-        let bw_b = b.dtype.byte_width();
-        // Output uses dtype of lhs (a)
-        let bw_out = a.dtype.byte_width();
-        let mut result = vec![0u8; m * n * bw_out];
-
+    /// Compute matmul of two constant tensors at compile time: 2-D
+    /// `[M, K] x [K, N] -> [M, N]`, or `None` (the operation stays at run
+    /// time) for anything else.
+    ///
+    /// The result is f64 whatever the operands' dtype: it stands for the
+    /// product the program would compute from the loaded parameters, whose
+    /// dtype is the model's, not the file's (a BF16 file loads into f32
+    /// fields), so the program converts it to the operands' dtype and device
+    /// when it runs. Rounding it to the file's dtype here would lose that
+    /// precision, and labelling 2-byte data as f32 read garbage.
+    fn compute_matmul(&self, a: &ConstTensor, b: &ConstTensor) -> Option<ConstTensor> {
+        if a.shape.len() != 2 || b.shape.len() != 2 || a.shape[1] != b.shape[0] {
+            return None;
+        }
+        let (m, k, n) = (a.shape[0], a.shape[1], b.shape[1]);
+        let (bw_a, bw_b) = (a.dtype.byte_width(), b.dtype.byte_width());
+        if a.data.len() < m * k * bw_a || b.data.len() < k * n * bw_b {
+            return None;
+        }
+        let mut result = Vec::with_capacity(m * n * 8);
         for i in 0..m {
             for j in 0..n {
                 let mut sum = 0.0f64;
                 for p in 0..k {
-                    let a_val = a
-                        .dtype
-                        .to_f64(&a.data[(i * k + p) * bw_a..(i * k + p + 1) * bw_a]);
-                    let b_val = b
-                        .dtype
-                        .to_f64(&b.data[(p * n + j) * bw_b..(p * n + j + 1) * bw_b]);
+                    let a_val = a.dtype.to_f64(&a.data[(i * k + p) * bw_a..(i * k + p + 1) * bw_a]);
+                    let b_val = b.dtype.to_f64(&b.data[(p * n + j) * bw_b..(p * n + j + 1) * bw_b]);
                     sum += a_val * b_val;
                 }
-                write_f64_as_dtype(
-                    sum,
-                    a.dtype,
-                    &mut result[(i * n + j) * bw_out..(i * n + j + 1) * bw_out],
-                );
+                result.extend_from_slice(&sum.to_le_bytes());
             }
         }
-
-        ConstTensor {
-            data: result,
-            shape: vec![m, n],
-            dtype: a.dtype,
-        }
+        Some(ConstTensor { data: result, shape: vec![m, n], dtype: WeightDType::F64 })
     }
 
-    /// Compute element-wise addition of two constant tensors.
-    fn compute_elementwise_add(&self, a: &ConstTensor, b: &ConstTensor) -> ConstTensor {
-        assert_eq!(a.shape, b.shape, "add shape mismatch");
-        let bw = a.dtype.byte_width();
+    /// Element-wise sum of two constant tensors of the same shape, in f64
+    /// (see [`Self::compute_matmul`]), or `None` when the shapes differ: a
+    /// broadcast (`[4, 4] + [4]`) is left to the runtime, which implements it.
+    fn compute_elementwise_add(&self, a: &ConstTensor, b: &ConstTensor) -> Option<ConstTensor> {
+        if a.shape != b.shape {
+            return None;
+        }
         let num_elements: usize = a.shape.iter().product();
-        let mut result = vec![0u8; num_elements * bw];
-
+        let (bw_a, bw_b) = (a.dtype.byte_width(), b.dtype.byte_width());
+        if a.data.len() < num_elements * bw_a || b.data.len() < num_elements * bw_b {
+            return None;
+        }
+        let mut result = Vec::with_capacity(num_elements * 8);
         for i in 0..num_elements {
-            let a_val = a.dtype.to_f64(&a.data[i * bw..(i + 1) * bw]);
-            let b_val = b.dtype.to_f64(&b.data[i * bw..(i + 1) * bw]);
-            write_f64_as_dtype(a_val + b_val, a.dtype, &mut result[i * bw..(i + 1) * bw]);
+            let a_val = a.dtype.to_f64(&a.data[i * bw_a..(i + 1) * bw_a]);
+            let b_val = b.dtype.to_f64(&b.data[i * bw_b..(i + 1) * bw_b]);
+            result.extend_from_slice(&(a_val + b_val).to_le_bytes());
         }
-
-        ConstTensor {
-            data: result,
-            shape: a.shape.clone(),
-            dtype: a.dtype,
-        }
+        Some(ConstTensor { data: result, shape: a.shape.clone(), dtype: WeightDType::F64 })
     }
 
     /// Compute element-wise ReLU of a constant tensor.
@@ -900,14 +1000,14 @@ impl<'a> DeadWeightEliminator<'a> {
 // SparsityHint (consumed by codegen)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Hint attached to a matmul operation, consumed by codegen to choose
-/// between dense and sparse kernel emission.
+/// Hint attached to a matmul operation: whether a weight operand is at or
+/// above the sparse threshold. Recorded and read by nothing; the matmul is
+/// dense in both cases.
 #[derive(Debug, Clone)]
 pub enum SparsityHint {
     /// Weight matrix is dense enough for standard matmul kernel.
     Dense,
-    /// Weight matrix is sparse -- annotated for future CSR-based sparse matmul.
-    /// M52a: annotation only. M52b: actual sparse kernel emission.
+    /// Weight matrix is at or above the sparse threshold. Annotation only.
     Sparse {
         /// Weight name in the WeightMap
         weight_name: String,
@@ -942,6 +1042,216 @@ impl WeightIntegrity {
             hash_hex,
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Binding a program to its weights file
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// A rewrite that depends on a weight's VALUES (folding a product of two
+// weights into a constant, dropping a matmul by a near-identity weight,
+// embedding a one-element weight as an immediate) is right only if the
+// program runs with exactly those values. Three things make that true:
+//
+//   1. `-w` loads the file into the model: every constructor copies the
+//      file's tensor into each field the file names.
+//   2. Only a parameter that nothing writes afterwards is specialized on
+//      ([`WeightWriteFacts`]). A trained, assigned or reloaded parameter is
+//      loaded and left alone.
+//   3. The program records the content hash of every tensor it may have
+//      specialized on, and at startup refuses a file in which one differs.
+//
+// These passes used to key on the field name and assume the model held the
+// file's values, while the model still held its initializer: a `[4, 4]`
+// weight of twos compiled against an identity file printed `x` for
+// `x @ self.w`.
+
+/// What a whole program does to model parameters after they are loaded, as
+/// far as the weight-aware rewrites need to know. Built by
+/// [`analyze_weight_writes`] over every module of the program; everything
+/// it cannot rule out counts as a write.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WeightWriteFacts {
+    /// Why every parameter counts as written, when something in the program
+    /// can write parameters it does not name: a train or distill block, a
+    /// `quant` block, `model_load`, or an in-place tensor operation.
+    pub all_written: Option<String>,
+    /// Fields assigned somewhere in the program (`m.w = ...`,
+    /// `self.w += ...`), by field name, with the reason to report. By name
+    /// alone: an assignment to `w` of one class counts for every class.
+    pub written_fields: BTreeMap<String, String>,
+}
+
+impl WeightWriteFacts {
+    /// Why the parameter a weight key names (`Class.field`, `field`, or a
+    /// dotted path ending in the field) may be written after loading, or
+    /// `None` when nothing in the program writes it.
+    pub fn written(&self, key: &str) -> Option<&str> {
+        if let Some(reason) = &self.all_written {
+            return Some(reason);
+        }
+        let field = key.rsplit('.').next().unwrap_or(key);
+        self.written_fields.get(field).map(String::as_str)
+    }
+}
+
+/// Whether a call by this name writes a tensor argument in place. The same
+/// rule the training analysis uses (`is_inplace_mutator` in `stmt.rs`):
+/// `copy_data`, `copy_` and the `*_inplace` family are NSL's only in-place
+/// tensor operations.
+fn writes_in_place(name: &str) -> bool {
+    matches!(name, "copy_data" | "copy_") || name.ends_with("_inplace")
+}
+
+/// Find everything in `modules` that can write a model parameter after the
+/// model is constructed. `resolve` turns a symbol into its name.
+pub fn analyze_weight_writes(
+    modules: &[&nsl_ast::Module],
+    resolve: &dyn Fn(nsl_ast::Symbol) -> String,
+) -> WeightWriteFacts {
+    use nsl_ast::expr::{Expr, ExprKind};
+    use nsl_ast::stmt::{Stmt, StmtKind};
+    use nsl_ast::visitor::{walk_expr, walk_stmt, Visitor};
+
+    struct Scan<'a> {
+        resolve: &'a dyn Fn(nsl_ast::Symbol) -> String,
+        facts: WeightWriteFacts,
+        /// How direct the reported reason is; a more direct one replaces it.
+        rank: u8,
+    }
+    impl Scan<'_> {
+        /// Everything is written. Of several reasons the most direct is the
+        /// one reported: a train block before the `copy_data` inside the
+        /// optimizer it imports.
+        fn all(&mut self, rank: u8, reason: &str) {
+            if self.facts.all_written.is_none() || rank > self.rank {
+                self.facts.all_written = Some(reason.to_string());
+                self.rank = rank;
+            }
+        }
+        /// The field an assignment target writes: `<expr>.field`, or an
+        /// element of it.
+        fn assigned_field(&self, target: &Expr) -> Option<String> {
+            match &target.kind {
+                ExprKind::MemberAccess { member, .. } => Some((self.resolve)(*member)),
+                ExprKind::Subscript { object, .. } => self.assigned_field(object),
+                ExprKind::Paren(inner) => self.assigned_field(inner),
+                _ => None,
+            }
+        }
+    }
+    impl Visitor for Scan<'_> {
+        fn visit_stmt(&mut self, stmt: &Stmt) {
+            match &stmt.kind {
+                StmtKind::TrainBlock(_) => self.all(3, "the program has a train block, which updates parameters"),
+                StmtKind::DistillBlock(_) => {
+                    self.all(3, "the program has a distill block, which updates parameters")
+                }
+                StmtKind::QuantBlock(_) => {
+                    self.all(3, "the program has a quant block, which rewrites parameters")
+                }
+                // Not a write, but a rewrite on a parameter's values would
+                // take the operation out of the graph `grad` differentiates
+                // (a dropped `x @ W` gives W no gradient), in the block and
+                // in every function it calls.
+                StmtKind::GradBlock(_) => self.all(
+                    3,
+                    "the program has a grad block, which differentiates through the forward \
+                     pass; a rewrite on a parameter's values would drop its gradient",
+                ),
+                StmtKind::Decorated { decorators, .. }
+                    if decorators.iter().any(|d| {
+                        d.name.last().is_some_and(|s| (self.resolve)(*s) == "quantize")
+                    }) =>
+                {
+                    self.all(
+                        2,
+                        "a model has @quantize, which may store its parameters quantized",
+                    )
+                }
+                StmtKind::Assign { target, .. } => {
+                    if let Some(field) = self.assigned_field(target) {
+                        self.facts
+                            .written_fields
+                            .entry(field.clone())
+                            .or_insert_with(|| format!("the program assigns to a field named '{field}'"));
+                    } else if matches!(target.kind, ExprKind::Subscript { .. }) {
+                        // `t[i] = v` stores into `t` in place, and `t` may be
+                        // a parameter under another name (`let t = m.w`).
+                        self.all(
+                            0,
+                            "the program assigns to an element of a variable, which may be a \
+                             parameter under another name",
+                        );
+                    }
+                }
+                _ => {}
+            }
+            walk_stmt(self, stmt);
+        }
+
+        fn visit_expr(&mut self, expr: &Expr) {
+            if let ExprKind::Call { callee, .. } = &expr.kind {
+                let name = match &callee.kind {
+                    ExprKind::Ident(sym) => Some((self.resolve)(*sym)),
+                    ExprKind::MemberAccess { member, .. } => Some((self.resolve)(*member)),
+                    _ => None,
+                };
+                if let Some(name) = name {
+                    // `model_load(m, path)` and `from_hf(repo, m)` store a
+                    // checkpoint into the model's parameter slots. (The
+                    // runtime has no other entry point that writes a model's
+                    // parameters outside a train/distill/quant block: the
+                    // rest copy them unchanged, to a device or a server.)
+                    if matches!(name.as_str(), "model_load" | "from_hf") {
+                        self.all(2, &format!("the program calls {name}, which overwrites parameters"));
+                    } else if writes_in_place(&name) {
+                        self.all(1, &format!("the program calls {name}, which writes a tensor in place"));
+                    }
+                }
+            }
+            walk_expr(self, expr);
+        }
+    }
+
+    let mut scan = Scan { resolve, facts: WeightWriteFacts::default(), rank: 0 };
+    for module in modules {
+        scan.visit_module(module);
+    }
+    scan.facts
+}
+
+/// The request that a program run with its weights file's values: `-w` on a
+/// build that produces something to run. Without it the file is an input to
+/// planners only: nothing is loaded and no value-dependent rewrite is made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WeightBinding {
+    /// The file, as an absolute path: the program opens it when it starts.
+    pub path: std::path::PathBuf,
+    /// What the program writes after loading.
+    pub writes: WeightWriteFacts,
+    /// The file's tensors ([`read_stored_tensors`]).
+    pub stored: std::sync::Arc<BTreeMap<String, StoredTensor>>,
+}
+
+/// The names and hashes a program checks at startup, encoded for
+/// `nsl_weights_bind`: for each tensor a little-endian u32 name length, the
+/// name, and the 32-byte [`tensor_content_hash`].
+pub fn encode_weight_expectations(expectations: &[(String, [u8; 32])]) -> Vec<u8> {
+    let mut table = Vec::new();
+    for (name, hash) in expectations {
+        table.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        table.extend_from_slice(name.as_bytes());
+        table.extend_from_slice(hash);
+    }
+    table
+}
+
+/// A short digest of the expectations for the execution fingerprint: the
+/// first 8 bytes, in hex, of the SHA-256 of the encoded table.
+pub fn weight_expectations_digest(expectations: &[(String, [u8; 32])]) -> String {
+    let hash: [u8; 32] = Sha256::digest(encode_weight_expectations(expectations)).into();
+    hash[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1005,15 +1315,17 @@ pub fn print_weight_analysis_report(weight_map: &WeightMap, config: &WeightAware
         let info = temp_entry.analyze_sparsity(config);
         total_near_zero += info.near_zero_count;
 
+        // What the tensor IS, not what is generated for it: every matmul
+        // is the dense kernel. This line used to read "(SPARSE kernel)".
         let kernel_label = if info.use_sparse_kernel {
             sparse_count += 1;
-            "SPARSE"
+            "at or above the sparse threshold"
         } else {
-            "dense"
+            "below the sparse threshold"
         };
 
         nsl_log::nsl_log!(INFO, "weight-aware", 
-            "    {}: {:>5.1}% near-zero ({} kernel)  [shape: {:?}, dtype: {:?}]",
+            "    {}: {:>5.1}% near-zero ({})  [shape: {:?}, dtype: {:?}]",
             name,
             info.near_zero_fraction * 100.0,
             kernel_label,
@@ -1043,7 +1355,7 @@ pub fn print_weight_analysis_report(weight_map: &WeightMap, config: &WeightAware
         }
     );
     nsl_log::nsl_log!(INFO, "weight-aware", 
-        "    Sparse-eligible tensors: {}/{}",
+        "    Tensors at or above the sparse threshold: {}/{} (all matmuls are dense)",
         sparse_count,
         analysis_entries.len()
     );
@@ -1090,6 +1402,167 @@ mod tests {
     use super::*;
     use std::collections::HashMap as StdHashMap;
     use std::io::Write;
+
+    fn writes_of(source: &str) -> WeightWriteFacts {
+        let mut interner = nsl_lexer::Interner::new();
+        let (tokens, _) = nsl_lexer::tokenize(source, nsl_errors::FileId(0), &mut interner);
+        let parsed = nsl_parser::parse(&tokens, &mut interner);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let resolve = |sym: nsl_ast::Symbol| interner.resolve(sym.0).unwrap_or("").to_string();
+        analyze_weight_writes(&[&parsed.module], &resolve)
+    }
+
+    const MODEL: &str = "model Toy:\n    w: Tensor = ones([4, 4])\n    v: Tensor = ones([4])\n\n    fn forward(self, x: Tensor) -> Tensor:\n        return x @ self.w + self.v\n\n";
+
+    /// A program that only reads its parameters writes none of them.
+    #[test]
+    fn a_program_that_only_runs_the_model_writes_nothing() {
+        let facts = writes_of(&format!("{MODEL}let m = Toy()\nlet y = m.forward(ones([2, 4]))\nprint(m.w.sum())\n"));
+        assert_eq!(facts, WeightWriteFacts::default());
+        assert_eq!(facts.written("Toy.w"), None);
+        assert_eq!(facts.written("w"), None);
+    }
+
+    /// An assignment to a field, plain or compound, to the whole tensor or
+    /// to an element, by a variable or by `self`, writes that field (of
+    /// every class: the match is by field name) and no other.
+    #[test]
+    fn an_assignment_writes_the_field_it_names() {
+        for assignment in [
+            "let m = Toy()\nm.w = zeros([4, 4])\n",
+            "let m = Toy()\nm.w += ones([4, 4])\n",
+            "let m = Toy()\nm.w[0] = zeros([4])\n",
+        ] {
+            let facts = writes_of(&format!("{MODEL}{assignment}"));
+            assert_eq!(facts.all_written, None, "{assignment}");
+            assert!(facts.written("Toy.w").is_some_and(|r| r.contains("'w'")), "{assignment}");
+            assert!(facts.written("Other.w").is_some(), "{assignment}");
+            assert_eq!(facts.written("Toy.v"), None, "{assignment}");
+        }
+        let in_method = "model Toy:\n    w: Tensor = ones([4, 4])\n\n    fn reset(self):\n        self.w = zeros([4, 4])\n";
+        assert!(writes_of(in_method).written("w").is_some());
+    }
+
+    /// Anything that can write parameters it does not name writes them all.
+    #[test]
+    fn training_reloading_and_in_place_operations_write_every_parameter() {
+        let train = format!(
+            "{MODEL}let m = Toy()\ntrain(model = m, epochs = 1):\n    optimizer: SGD(lr = 0.1)\n    step(batch):\n        let loss = mean(m.forward(ones([2, 4])))\n"
+        );
+        for (program, word) in [
+            (train, "train block"),
+            (format!("{MODEL}let m = Toy()\nmodel_load(m, \"a.nslm\")\n"), "model_load"),
+            (format!("{MODEL}let m = Toy()\nlet t = m.w\ncopy_data(t, zeros([4, 4]))\n"), "copy_data"),
+            (format!("{MODEL}fn bump(t: Tensor):\n    add_inplace(t, ones([4, 4]))\n"), "add_inplace"),
+            (format!("{MODEL}fn clear(t: Tensor):\n    zero_inplace(t)\n"), "zero_inplace"),
+            (format!("{MODEL}fn scale(t: Tensor):\n    mul_inplace(t, t)\n"), "mul_inplace"),
+            (format!("{MODEL}let m = Toy()\nlet t = m.v\nt[0] = 5.0\n"), "element of a variable"),
+            (format!("{MODEL}let m = Toy()\nfrom_hf(\"org/x\", m)\n"), "from_hf"),
+            (
+                format!("{MODEL}let m = Toy()\nlet (loss, g) = grad(m.w):\n    let l = mean(m.forward(ones([2, 4])))\n"),
+                "grad block",
+            ),
+            (
+                "@quantize(dtype=\"awq4\")\nmodel Toy:\n    w: Tensor = ones([4, 4])\n\nlet m = Toy()\n".to_string(),
+                "@quantize",
+            ),
+            (
+                format!("{MODEL}kernel bump(a, out):\n    let i = thread_id()\n    out[i] = a[i]\n"),
+                "element of a variable",
+            ),
+        ] {
+            let facts = writes_of(&program);
+            assert!(
+                facts.all_written.as_deref().is_some_and(|r| r.contains(word)),
+                "{word}: {facts:?}"
+            );
+            assert!(facts.written("Toy.v").is_some(), "{word}");
+        }
+    }
+
+    /// Of several reasons the most direct is reported, wherever it comes in
+    /// the program: the optimizer a train block imports calls `copy_data`,
+    /// and "the program calls copy_data" would send the reader looking for
+    /// a call they did not write.
+    #[test]
+    fn a_train_block_is_the_reason_reported_over_an_in_place_call() {
+        let program = format!(
+            "{MODEL}fn step_like(t: Tensor):\n    copy_data(t, t)\n\nlet m = Toy()\ntrain(model = m, epochs = 1):\n    optimizer: SGD(lr = 0.1)\n    step(batch):\n        let loss = mean(m.forward(ones([2, 4])))\n\nfn later(t: Tensor):\n    zero_inplace(t)\n"
+        );
+        let facts = writes_of(&program);
+        assert!(facts.all_written.as_deref().is_some_and(|r| r.contains("train block")), "{facts:?}");
+    }
+
+    /// The table the program checks at startup, byte for byte: per tensor a
+    /// u32 name length, the name, the 32-byte hash.
+    #[test]
+    fn the_expectation_table_is_length_name_hash() {
+        let table = encode_weight_expectations(&[("ab".to_string(), [7u8; 32])]);
+        let mut want = vec![2u8, 0, 0, 0, b'a', b'b'];
+        want.extend_from_slice(&[7u8; 32]);
+        assert_eq!(table, want);
+        assert_eq!(weight_expectations_digest(&[]).len(), 16);
+    }
+
+    /// The content hash of `[1.0f32, 2.0]` stored as F32 with shape [2],
+    /// against Python's hashlib:
+    ///   sha256(b"F32" + b"\0" + (2).to_bytes(8, "little")
+    ///          + struct.pack("<2f", 1.0, 2.0))
+    /// The runtime's test (`weights_file.rs`) holds its own hash to the same
+    /// literal, so the two sides cannot drift apart.
+    #[test]
+    fn the_tensor_content_hash_is_the_documented_one() {
+        let data: Vec<u8> = [1.0f32, 2.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let hex: String =
+            tensor_content_hash("F32", &[2], &data).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "6774455a26a851dd86ea91ff83c714320b9746d476d63204492fb74fa11d32b3");
+    }
+
+    /// The stored table gives each tensor of the file its shape, dtype and
+    /// content hash.
+    #[test]
+    fn the_stored_table_describes_the_file() {
+        let tmp = write_temp_safetensors("w", &[2, 2], &[1.0, 0.0, 0.0, 1.0]);
+        let table = read_stored_tensors(tmp.as_ref()).unwrap();
+        assert_eq!(table.len(), 1);
+        let stored = &table["w"];
+        assert_eq!((stored.shape.as_slice(), stored.dtype), (&[2usize, 2][..], WeightDType::F32));
+        let data: Vec<u8> = [1.0f32, 0.0, 0.0, 1.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(stored.hash, tensor_content_hash("F32", &[2, 2], &data));
+    }
+
+    /// 8-bit floats decode as floats. The values are worked out from the
+    /// formats' definitions: sign, biased exponent (bias 7 for E4M3, 15 for
+    /// E5M2), mantissa. The old decode was `byte / 127`.
+    #[test]
+    fn fp8_bytes_decode_as_floating_point() {
+        let e4m3 = |b: u8| WeightDType::F8E4M3.to_f64(&[b]);
+        assert_eq!(e4m3(0x00), 0.0);
+        // 0x80 is negative zero; it used to read as 128 / 127 = 1.008.
+        assert_eq!(e4m3(0x80), 0.0);
+        assert!(e4m3(0x80).is_sign_negative());
+        assert_eq!(e4m3(0x38), 1.0); // 0 0111 000
+        assert_eq!(e4m3(0xB8), -1.0);
+        assert_eq!(e4m3(0x3C), 1.5); // 0 0111 100
+        assert_eq!(e4m3(0xC4), -3.0); // 1 1000 100 = -(1.5 × 2)
+        assert_eq!(e4m3(0x08), 0.015625); // smallest normal, 2⁻⁶
+        assert_eq!(e4m3(0x01), 0.001953125); // smallest subnormal, 2⁻⁹
+        assert_eq!(e4m3(0x7E), 448.0); // largest: 1.75 × 2⁸
+        assert!(e4m3(0x7F).is_nan() && e4m3(0xFF).is_nan());
+
+        let e5m2 = |b: u8| WeightDType::F8E5M2.to_f64(&[b]);
+        assert_eq!(e5m2(0x00), 0.0);
+        assert!(e5m2(0x80) == 0.0 && e5m2(0x80).is_sign_negative());
+        assert_eq!(e5m2(0x3C), 1.0); // 0 01111 00
+        assert_eq!(e5m2(0xC0), -2.0); // 1 10000 00
+        assert_eq!(e5m2(0x3E), 1.5); // 0 01111 10
+        assert_eq!(e5m2(0x04), 0.00006103515625); // smallest normal, 2⁻¹⁴
+        assert_eq!(e5m2(0x01), 0.0000152587890625); // smallest subnormal, 2⁻¹⁶
+        assert_eq!(e5m2(0x7B), 57344.0); // largest: 1.75 × 2¹⁵
+        assert_eq!(e5m2(0x7C), f64::INFINITY);
+        assert_eq!(e5m2(0xFC), f64::NEG_INFINITY);
+        assert!(e5m2(0x7D).is_nan());
+    }
 
     /// Helper: write a minimal safetensors file with one f32 tensor.
     fn write_temp_safetensors(name: &str, shape: &[usize], data_f32: &[f32]) -> tempfile::TempPath {
@@ -1297,10 +1770,9 @@ mod tests {
 
         if let FoldResult::Constant(c) = result {
             assert_eq!(c.shape, vec![2, 2]);
-            let v00 = c.dtype.to_f64(&c.data[0..4]);
-            let v01 = c.dtype.to_f64(&c.data[4..8]);
-            let v10 = c.dtype.to_f64(&c.data[8..12]);
-            let v11 = c.dtype.to_f64(&c.data[12..16]);
+            assert_eq!(c.dtype, WeightDType::F64);
+            let at = |i: usize| c.dtype.to_f64(&c.data[i * 8..(i + 1) * 8]);
+            let (v00, v01, v10, v11) = (at(0), at(1), at(2), at(3));
             assert!((v00 - 19.0).abs() < 1e-5, "expected 19.0, got {}", v00);
             assert!((v01 - 22.0).abs() < 1e-5, "expected 22.0, got {}", v01);
             assert!((v10 - 43.0).abs() < 1e-5, "expected 43.0, got {}", v10);
@@ -1337,8 +1809,9 @@ mod tests {
 
         if let FoldResult::Constant(c) = result {
             assert_eq!(c.shape, vec![4]);
+            let bw = c.dtype.byte_width();
             let vals: Vec<f64> = (0..4)
-                .map(|i| c.dtype.to_f64(&c.data[i * 4..(i + 1) * 4]))
+                .map(|i| c.dtype.to_f64(&c.data[i * bw..(i + 1) * bw]))
                 .collect();
             assert!((vals[0] - 11.0).abs() < 1e-5);
             assert!((vals[1] - 22.0).abs() < 1e-5);
@@ -1347,6 +1820,55 @@ mod tests {
         } else {
             panic!("expected Constant result");
         }
+    }
+
+    /// A fold of BF16 operands is computed and kept in f64. BF16 stores the
+    /// top half of an f32, so these small integers and halves are exact:
+    /// [[1, 0.5], [2, -1]] @ [[2, 1], [4, 0]] = [[4, 1], [0, 2]] by hand.
+    #[test]
+    fn a_fold_of_bf16_operands_is_f64() {
+        let bf16 = |vals: &[f32]| -> Vec<u8> {
+            vals.iter().flat_map(|v| (v.to_bits() >> 16).to_le_bytes()[..2].to_vec()).collect()
+        };
+        let a = ConstTensor { data: bf16(&[1.0, 0.5, 2.0, -1.0]), shape: vec![2, 2], dtype: WeightDType::BF16 };
+        let b = ConstTensor { data: bf16(&[2.0, 1.0, 4.0, 0.0]), shape: vec![2, 2], dtype: WeightDType::BF16 };
+        let wmap = WeightMap::default();
+        let mut folder = ConstantFolder::new(&wmap);
+        let FoldResult::Constant(c) =
+            folder.fold_matmul(&FoldResult::Constant(a.clone()), &FoldResult::Constant(b.clone()))
+        else {
+            panic!("the product of two BF16 constants should fold");
+        };
+        assert_eq!((c.dtype, c.shape.clone(), c.data.len()), (WeightDType::F64, vec![2, 2], 32));
+        let got: Vec<f64> = c.data.chunks(8).map(|ch| f64::from_le_bytes(ch.try_into().unwrap())).collect();
+        assert_eq!(got, vec![4.0, 1.0, 0.0, 2.0]);
+        let FoldResult::Constant(sum) =
+            folder.fold_add(&FoldResult::Constant(a), &FoldResult::Constant(b))
+        else {
+            panic!("the sum of two same-shaped BF16 constants should fold");
+        };
+        let got: Vec<f64> = sum.data.chunks(8).map(|ch| f64::from_le_bytes(ch.try_into().unwrap())).collect();
+        assert_eq!(got, vec![3.0, 1.5, 6.0, -1.0]);
+    }
+
+    /// Shapes the fold does not implement decline instead of panicking the
+    /// compiler: a broadcast add, a matmul with mismatched inner widths, and
+    /// a matmul of a 3-D operand.
+    #[test]
+    fn unsupported_shapes_are_left_to_the_runtime() {
+        let f32s = |n: usize| -> Vec<u8> { (0..n).flat_map(|i| (i as f32).to_le_bytes()).collect() };
+        let t = |shape: &[usize]| ConstTensor {
+            data: f32s(shape.iter().product()),
+            shape: shape.to_vec(),
+            dtype: WeightDType::F32,
+        };
+        let wmap = WeightMap::default();
+        let mut folder = ConstantFolder::new(&wmap);
+        let c = |x: ConstTensor| FoldResult::Constant(x);
+        assert!(matches!(folder.fold_add(&c(t(&[4, 4])), &c(t(&[4]))), FoldResult::Runtime));
+        assert!(matches!(folder.fold_matmul(&c(t(&[2, 3])), &c(t(&[4, 2]))), FoldResult::Runtime));
+        assert!(matches!(folder.fold_matmul(&c(t(&[2, 2, 2])), &c(t(&[2, 2]))), FoldResult::Runtime));
+        assert_eq!(folder.stats.folded_ops, 0);
     }
 
     #[test]

@@ -473,30 +473,6 @@ impl Compiler<'_> {
             for arg in args {
                 arg_vals.push(self.compile_expr(builder, state, &arg.value)?);
             }
-            // M42: For kv_cache_init variants, append KV compression params.
-            // Use the first policy found across all models (v1: single-policy heuristic).
-            if func_name == "kv_cache_init" || func_name == "kv_cache_init_gpu" {
-                let (compress_scheme, compress_window, compress_sinks) = self
-                    .features
-                    .kv_compress_policies
-                    .values()
-                    .next()
-                    .and_then(|policies| policies.first())
-                    .map(|p| (p.scheme as i64, p.window as i64, p.sinks as i64))
-                    .unwrap_or((0, 0, 0));
-                if compress_scheme > 0 {
-                    nsl_log::nsl_log!(INFO, "nsl", 
-                        "[nsl] KV cache compression active: scheme={}, window={}, sinks={}",
-                        compress_scheme, compress_window, compress_sinks
-                    );
-                }
-                let scheme_val = builder.ins().iconst(cl_types::I64, compress_scheme);
-                let window_val = builder.ins().iconst(cl_types::I64, compress_window);
-                let sinks_val = builder.ins().iconst(cl_types::I64, compress_sinks);
-                arg_vals.push(scheme_val);
-                arg_vals.push(window_val);
-                arg_vals.push(sinks_val);
-            }
             let rt_name = format!("nsl_{func_name}");
             return self.compile_call_by_name(builder, &rt_name, &arg_vals);
         }
@@ -2788,6 +2764,16 @@ impl Compiler<'_> {
                      `kv_layout: \"static\"`) or use the runtime serve loop.",
                 ));
             };
+            if let Some(why) = serve_gen.refusal.as_deref() {
+                // The serve block is CFIE-active but this build has no
+                // decode path.  The runtime would refuse every call, so
+                // refuse here, with the reason.
+                return Err(CodegenError::new(format!(
+                    "generate() cannot run in this serve block: {why}. (The runtime decode \
+                     loop needs both kernels; this used to build a binary whose generate() \
+                     always refused.)"
+                )));
+            }
             if args.len() < 2 {
                 return Err(CodegenError::new(
                     "generate() requires at least 2 arguments (target_model, prompt)",
@@ -2795,6 +2781,7 @@ impl Compiler<'_> {
             }
             let max_new_tokens = serve_gen.max_new_tokens;
             let eos_token_id = serve_gen.eos_token_id;
+            let rng_seed = serve_gen.rng_seed;
             let prompt_len = serve_gen.prompt_len;
             // Cycle 12 wiring (Values are Copy; snapshot before the
             // mutable-borrow compiles below).
@@ -2825,16 +2812,17 @@ impl Compiler<'_> {
                 .unwrap_or_else(|| builder.ins().iconst(cl_types::I64, prompt_len));
             let v_max_new = builder.ins().iconst(cl_types::I64, max_new_tokens);
             let v_eos = builder.ins().iconst(cl_types::I64, eos_token_id);
-            // Fixed rng seed for the one-shot demo (deterministic output).
-            let v_seed = builder.ins().iconst(cl_types::I64, 0);
+            // The configured seed (`sampling: seed:`, default 0).  The
+            // runtime keys the request's draws by this, the request's
+            // index in the process and each token's position, so neither
+            // two tokens nor two generate() calls share a draw.
+            let v_seed = builder.ins().iconst(cl_types::I64, rng_seed);
 
-            // Cycle 13 (G15): with a compiled-in draft model, generate()
-            // drives nsl_cfie_speculative_generate (the paper's
-            // speculative decode loop: draft K greedily -> verify ->
-            // ONE rejection launch -> rollback), k_tokens from the
-            // speculative config — the SAME K the kind-4 reject kernel
-            // was compiled for.  Without a draft the plain driver is
-            // emitted, byte-identical to Cycle 11/12.
+            // With a compiled-in draft model, generate() drives
+            // nsl_cfie_speculative_generate (the draft proposes K tokens
+            // per round and the target's own sampler confirms or
+            // corrects them), k_tokens from the speculative config.
+            // Without a draft the plain driver is emitted.
             let rc = if let Some(k) = speculative_k {
                 let v_k = builder.ins().iconst(cl_types::I64, k);
                 self.compile_call_by_name(
@@ -3146,6 +3134,17 @@ impl Compiler<'_> {
                      ordinary token in most vocabularies, and packing on it splits \
                      documents at every occurrence",
                 ));
+            }
+            // Segment-masked CSHA kernels (a `dataset` block with
+            // `packing = true` on a `@flash_attention` model) cannot read
+            // what a packing loader produces; see the message. Kernel
+            // synthesis runs before any statement is lowered, so the
+            // answer is known here.
+            if packing_on && self.module_has_segment_masked_csha_kernels() {
+                return Err(CodegenError::new(format!(
+                    "DataLoader(): {}",
+                    crate::stmt::PACKED_BATCH_TO_MASKED_CSHA_MESSAGE
+                )));
             }
             // A packed batch derives its labels from the token stream (the
             // next token, with -100 across a document boundary), so a
@@ -3514,9 +3513,30 @@ impl Compiler<'_> {
             _ => {
                 // For Unknown types, check the Cranelift value type
                 let cl_type = builder.func.dfg.value_type(val);
-                if cl_type == cl_types::F64 {
+                if cl_type == cl_types::F64 || cl_type == cl_types::F32 {
                     "nsl_print_float"
+                } else if arg_type.is_indeterminate()
+                    && self.expr_result_is_owned_tensor(builder, state, &arg.value, val)
+                {
+                    // The checker could not type the expression, but the
+                    // emission can: the value is the fresh result of a
+                    // tensor-returning call (`block.w.sum()` on a receiver
+                    // of unknown type). Printing it as an integer printed
+                    // the tensor's handle.
+                    "nsl_tensor_print"
                 } else {
+                    if arg_type.is_indeterminate() {
+                        // Nothing says what this 64-bit value is. It is
+                        // printed as an integer, which for a tensor is its
+                        // handle; say so rather than print a pointer
+                        // without comment.
+                        nsl_log::nsl_log!(WARN, "nsl",
+                            "warning: print() argument has no type known at compile time and \
+                             is printed as an integer. If it is a tensor, the number shown \
+                             is its handle, not its value: bind it first with an explicit \
+                             type (`let t: Tensor = <expr>`) and print that."
+                        );
+                    }
                     "nsl_print_int"
                 }
             }

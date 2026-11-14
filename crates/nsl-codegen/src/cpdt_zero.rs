@@ -1,12 +1,40 @@
 //! CPDT — analytical ZeRO-config planner.
 //!
 //! Enumerates the `(s_p, s_g, s_os)` cross-product of shard factors and
-//! ranks feasible configurations by analytical step-time.  The whole
-//! search runs in ~200 ms because every per-config evaluation is a
-//! closed-form cost-model call (paper §3.1).
+//! ranks feasible configurations by analytical step time. Every per-config
+//! evaluation is a closed-form cost-model call (paper §3.1).
 //!
-//! No runtime profiling; no external solver.  The winner is a
-//! compile-time constant the downstream comm scheduler consumes.
+//! No runtime profiling; no external solver. The result is advisory: it is
+//! printed by `--cpdt-report` and read by nothing else. The stage a
+//! compiled program runs comes from `--zero-stage`
+//! ([`crate::cpdt::CpdtPlan::render_report`] says so).
+//!
+//! ## Communication model
+//!
+//! Volumes are bytes sent per rank per optimizer step, by ring collectives
+//! over all `N` data-parallel ranks, for a model of `Ψ` bytes
+//! ([`comm_per_step`]):
+//!
+//! | Configuration | Collectives | Volume |
+//! |---|---|---|
+//! | plain data-parallel | gradient all-reduce | `2·Ψ·(N−1)/N` |
+//! | optimizer state sharded | gradient all-reduce, parameter broadcast | `3·Ψ·(N−1)/N` |
+//! | + gradients sharded | gradient reduce-scatter, parameter broadcast | `2·Ψ·(N−1)/N` |
+//! | + parameters sharded | two parameter all-gathers and a gradient reduce-scatter, per micro-batch | `3·M·Ψ·(N−1)/N` |
+//!
+//! The first, third and fourth rows are the ZeRO paper's `2Ψ`, `2Ψ` and
+//! `3Ψ`; the second is what the runtime in `nsl-runtime/src/zero.rs` does at
+//! stage 1 (an all-reduce, then each owner broadcasts its updated
+//! parameters). Each collective also costs a fixed latency
+//! ([`ClusterSpec::collective_latency_us`]) per parameter group, and all of
+//! it is added to the step: the runtime's collectives are synchronous, so
+//! none of the time is hidden under compute.
+//!
+//! The earlier model charged plain data-parallel training nothing, left out
+//! the second all-gather, the micro-batch factor and the latency, and
+//! counted communication only where it exceeded the whole step's compute
+//! time; with communication thus hidden every configuration tied on time
+//! and the tie went to the least memory, the most sharding.
 
 use serde::Serialize;
 
@@ -36,16 +64,32 @@ pub struct ClusterSpec {
     /// Number of GPUs per node (used to classify intra- vs inter-node
     /// traffic).
     pub gpus_per_node: u32,
+    /// Fixed cost of launching one collective, in microseconds, whatever
+    /// its size. An assumed order of magnitude
+    /// ([`DEFAULT_COLLECTIVE_LATENCY_US`]), not a measurement of any
+    /// cluster.
+    pub collective_latency_us: f64,
 }
+
+/// Per-GPU memory the planner assumes when the user gives none
+/// (`--cpdt-memory-budget`): 80 GiB, the capacity of an A100-80G or H100.
+pub const DEFAULT_MEMORY_BUDGET_BYTES: u64 = 80u64 * 1024 * 1024 * 1024;
+
+/// Assumed fixed latency of one collective. Collective launch latencies are
+/// tens of microseconds on a single node and more across nodes; this is a
+/// round figure of that order so that a plan of many small collectives is
+/// not costed as free, not a measured value.
+pub const DEFAULT_COLLECTIVE_LATENCY_US: f64 = 50.0;
 
 impl Default for ClusterSpec {
     fn default() -> Self {
         Self {
             num_gpus: 8,
-            memory_budget_bytes: 80u64 * 1024 * 1024 * 1024,
+            memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
             intra_bw_bps: 9e11,
             inter_bw_bps: 1e11,
             gpus_per_node: 8,
+            collective_latency_us: DEFAULT_COLLECTIVE_LATENCY_US,
         }
     }
 }
@@ -68,6 +112,10 @@ pub struct ModelSize {
     /// [`ModelSize::retained_activation_bytes`] from the full sequential
     /// live-set (sum) to a checkpoint-aware estimate.
     pub activation_checkpointing: bool,
+    /// Micro-batches per optimizer step (`grad_accumulation`). The compute
+    /// times above are per micro-batch, and with sharded parameters every
+    /// micro-batch gathers them again.
+    pub micro_batches_per_step: u32,
 }
 
 impl ModelSize {
@@ -120,8 +168,13 @@ impl ModelSize {
     /// uses `estimated_us` as the compute-time proxy. `optim_state_multiplier`
     /// defaults to 2.0 (fp32 AdamW m+v = 2 × param BYTES — see
     /// [`ADAMW_FP32_OPTIM_MULTIPLIER`]). `activation_checkpointing` defaults
-    /// to `false`; the caller that knows the compile's checkpoint policies
-    /// (`invoke_cpdt_if_enabled`) sets it after construction.
+    /// to `false` and `micro_batches_per_step` to 1; the caller that knows
+    /// the compile's checkpoint policies and the train block's
+    /// `grad_accumulation` (`invoke_cpdt_if_enabled`) sets them after
+    /// construction.
+    ///
+    /// The plan's bytes are those of the configuration WGGO chose for each
+    /// layer of the model being compiled (`wggo_apply::apply`).
     pub fn from_applied_plan(plan: &crate::wggo_apply::AppliedPlan) -> Self {
         Self {
             per_layer_param_bytes: plan.layers.iter().map(|l| l.param_bytes).collect(),
@@ -129,6 +182,7 @@ impl ModelSize {
             per_layer_compute_us: plan.layers.iter().map(|l| l.estimated_us).collect(),
             optim_state_multiplier: ADAMW_FP32_OPTIM_MULTIPLIER,
             activation_checkpointing: false,
+            micro_batches_per_step: 1,
         }
     }
 }
@@ -203,7 +257,11 @@ pub struct ZeroEvaluation {
     pub grad_bytes_per_gpu: u64,
     pub optim_bytes_per_gpu: u64,
     pub activation_bytes_per_gpu: u64,
+    /// Bytes each rank sends per optimizer step ([`comm_per_step`]).
     pub comm_volume_bytes: u64,
+    /// Communication time on the step: transfer plus per-collective
+    /// latency. All of it, since the runtime does not overlap collectives
+    /// with compute.
     pub exposed_comm_us: f64,
     pub step_time_us: f64,
     pub feasible: bool,
@@ -226,29 +284,50 @@ impl ZeroSearchResult {
 // Cost model
 // ---------------------------------------------------------------------------
 
-/// Effective bandwidth depends on which mesh this shard group lives on.
-fn bandwidth_bps(cluster: &ClusterSpec, inter: bool) -> f64 {
-    if inter {
-        cluster.inter_bw_bps
-    } else {
-        cluster.intra_bw_bps
-    }
+/// Communication of one optimizer step under a configuration.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StepComm {
+    /// Bytes each rank sends, summed over the step's collectives.
+    pub volume_bytes: u64,
+    /// Collectives launched per parameter group.
+    pub collectives: u32,
 }
 
-/// All-gather latency for `n` shards × `bytes_per_shard` on the given mesh.
+/// Volume and collective count of one optimizer step (see the module
+/// header for the table this implements).
 ///
-/// Ring-allgather volume: `(n - 1) × bytes_per_shard`.
-fn allgather_us(n: u32, bytes_per_shard: u64, bw: f64) -> f64 {
-    if n <= 1 || bw <= 0.0 {
-        return 0.0;
+/// `total_param_bytes` is the model's `Ψ`, `n` the number of data-parallel
+/// ranks, `micro_batches` the micro-batches per optimizer step. On one rank
+/// nothing is sent.
+pub fn comm_per_step(
+    total_param_bytes: u64,
+    n: u32,
+    config: ZeroConfig,
+    micro_batches: u32,
+) -> StepComm {
+    if n <= 1 {
+        return StepComm { volume_bytes: 0, collectives: 0 };
     }
-    let volume = (n as u64 - 1) * bytes_per_shard;
-    (volume as f64 / bw) * 1e6
-}
-
-/// Reduce-scatter latency: same volume as allgather for ring algorithm.
-fn reducescatter_us(n: u32, bytes: u64, bw: f64) -> f64 {
-    allgather_us(n, bytes, bw)
+    // One ring pass over a tensor of Ψ bytes moves Ψ·(N−1)/N per rank; an
+    // all-reduce is two passes (reduce, then distribute).
+    let pass = (total_param_bytes as u128 * (n as u128 - 1) / n as u128) as u64;
+    let m = micro_batches.max(1);
+    let (passes, collectives) = if config.s_p > 1 {
+        // Parameters live sharded: gather them for the forward and again
+        // for the backward, reduce-scatter the gradients, every micro-batch.
+        (3 * m, 3 * m)
+    } else {
+        // Gradients: reduce-scatter when sharded, else a full all-reduce.
+        let grad_passes = if config.s_g > 1 { 1 } else { 2 };
+        // Sharded optimizer state: each owner updates its slice and the
+        // updated parameters go back out to every rank.
+        let sync = u32::from(config.s_os > 1);
+        (grad_passes + sync, 1 + sync)
+    };
+    StepComm {
+        volume_bytes: pass.saturating_mul(u64::from(passes)),
+        collectives,
+    }
 }
 
 /// Single-config evaluator.  Pure function of inputs; O(n_layers) work.
@@ -257,7 +336,6 @@ pub fn evaluate_config(
     cluster: &ClusterSpec,
     config: ZeroConfig,
 ) -> ZeroEvaluation {
-    let dtype_factor = 1.0; // already folded into param_bytes
     let total_params = model.total_param_bytes();
 
     let param_per_gpu = (total_params / config.s_p as u64).max(1);
@@ -271,44 +349,31 @@ pub fn evaluate_config(
     let memory = param_per_gpu + grad_per_gpu + optim_per_gpu + activation_per_gpu;
     let feasible = memory <= cluster.memory_budget_bytes;
 
-    // Communication volumes.
-    let p_bw = bandwidth_bps(cluster, config.mesh_p_inter);
-    let g_bw = bandwidth_bps(cluster, config.mesh_g_inter);
-    let os_bw = bandwidth_bps(cluster, config.mesh_os_inter);
+    // Every collective spans all the data-parallel ranks, so it crosses
+    // nodes as soon as the cluster does.
+    let n = cluster.num_gpus.max(1);
+    let bw = if n > cluster.gpus_per_node.max(1) {
+        cluster.inter_bw_bps
+    } else {
+        cluster.intra_bw_bps
+    };
+    let micro_batches = model.micro_batches_per_step.max(1);
+    let comm = comm_per_step(total_params, n, config, micro_batches);
+    let transfer_us = if bw > 0.0 {
+        comm.volume_bytes as f64 / bw * 1e6
+    } else {
+        0.0
+    };
+    // One collective per parameter group (layer) per pass kind.
+    let groups = model.n_layers().max(1) as f64;
+    let latency_us = comm.collectives as f64 * groups * cluster.collective_latency_us.max(0.0);
+    let comm_total_us = transfer_us + latency_us;
 
-    let fwd_allgather_us = allgather_us(config.s_p, param_per_gpu, p_bw);
-    let bwd_reducescatter_us = reducescatter_us(config.s_g, grad_per_gpu, g_bw);
-    // Post-step parameter all-gather: the optimizer step updates only the
-    // 1/s_os slice of parameters whose optimizer state this rank owns, so the
-    // updated parameters are re-gathered across the s_os-way optimizer-shard
-    // group before the next forward (this is exactly the collective
-    // `cpdt_comm::build_schedule` emits in its optimizer pass: AllGather,
-    // group_size = s_os, per layer). The shard each rank contributes is
-    // total/s_os — NOT total/s_p, which the pre-fix code passed and which
-    // over-counted the gather s_os/s_p× (8× for ZeRO-1 on 8 GPUs).
-    //
-    // ZeRO stage notes: ZeRO-1/2 (s_p == 1) — this is the textbook post-step
-    // gather back to fully-replicated parameters. ZeRO-3 (s_p == s_os) — the
-    // scheduler currently emits this gather too, so the cost model charges it
-    // for consistency; arguably it is redundant there (parameters are stored
-    // sharded and the forward-prologue all-gather re-collects layers on
-    // demand). TODO(cpdt): deciding to skip it at s_p == s_os is a protocol
-    // decision (keep parameters sharded between steps) that is not encoded
-    // anywhere — change `build_schedule` and this term together if taken.
-    let optim_shard_bytes = (total_params / config.s_os as u64).max(1);
-    let poststep_param_allgather_us = allgather_us(config.s_os, optim_shard_bytes, os_bw);
-
-    // Overlap efficiency: compute-bound layers mask communication.
-    let compute_total_us: f64 = model.per_layer_compute_us.iter().sum();
-    let comm_total_us = fwd_allgather_us + bwd_reducescatter_us + poststep_param_allgather_us;
-    let exposed = (comm_total_us - compute_total_us).max(0.0);
-
-    let step_time_us = compute_total_us + exposed;
-
-    let comm_volume_bytes =
-        (config.s_p as u64 - 1).saturating_mul(param_per_gpu) * dtype_factor as u64
-            + (config.s_g as u64 - 1).saturating_mul(grad_per_gpu)
-            + (config.s_os as u64 - 1).saturating_mul(optim_shard_bytes);
+    // The runtime's collectives are synchronous: all of the communication
+    // time is on the step.
+    let compute_total_us: f64 =
+        model.per_layer_compute_us.iter().sum::<f64>() * micro_batches as f64;
+    let step_time_us = compute_total_us + comm_total_us;
 
     ZeroEvaluation {
         config,
@@ -317,8 +382,8 @@ pub fn evaluate_config(
         grad_bytes_per_gpu: grad_per_gpu,
         optim_bytes_per_gpu: optim_per_gpu,
         activation_bytes_per_gpu: activation_per_gpu,
-        comm_volume_bytes,
-        exposed_comm_us: exposed,
+        comm_volume_bytes: comm.volume_bytes,
+        exposed_comm_us: comm_total_us,
         step_time_us,
         feasible,
     }
@@ -361,9 +426,9 @@ fn generate_candidates(cluster: &ClusterSpec) -> Vec<ZeroConfig> {
 
 /// Deterministic total order for ranking candidate evaluations.
 ///
-/// Step-time ties are COMMON, not exotic: whenever compute fully hides
-/// communication, `step_time_us == compute_total_us` for every such config,
-/// and the pre-fix sort left the winner to candidate-generation order.
+/// Step-time ties happen between configurations with the same collectives
+/// (for example `(1, 2, 8)` and `(1, 4, 8)`), and on a single GPU, where
+/// nothing is sent.
 /// Tie-break chain (each rung only consulted when the previous ties):
 ///
 ///   1. feasible before infeasible;
@@ -420,6 +485,18 @@ mod tests {
             optim_state_multiplier: ADAMW_FP32_OPTIM_MULTIPLIER,
             per_layer_compute_us: vec![10.0; 8],
             activation_checkpointing: false,
+            micro_batches_per_step: 1,
+        }
+    }
+
+    fn cfg(s_p: u32, s_g: u32, s_os: u32) -> ZeroConfig {
+        ZeroConfig {
+            s_p,
+            s_g,
+            s_os,
+            mesh_p_inter: false,
+            mesh_g_inter: false,
+            mesh_os_inter: false,
         }
     }
 
@@ -531,16 +608,57 @@ mod tests {
         assert!(retained >= model.peak_activation_bytes());
     }
 
+    /// The communication volumes of the ZeRO paper (arXiv 1910.02054,
+    /// section 7), which states them for a model of Ψ bytes with the
+    /// `(N−1)/N` ring factor taken as 1: data-parallel 2Ψ, `P_os+g` 2Ψ,
+    /// `P_os+g+p` 3Ψ.
+    ///
+    /// Here Ψ = 48 MB and N = 8, so one ring pass is 48 MB × 7/8 = 42 MB:
+    /// 84 MB, 84 MB and 126 MB. Stage 1 as this runtime does it (all-reduce
+    /// then a parameter broadcast) is three passes, 126 MB.
     #[test]
-    fn poststep_allgather_volume_uses_optimizer_shard_size() {
-        // ZeRO-1 (s_p=1, s_g=1, s_os=8): the only sharded collective is the
-        // post-step parameter all-gather over the s_os group. Ring volume is
-        // (s_os - 1) × total/s_os = 7 × 6 MB = 42 MB. The pre-fix code used
-        // param_per_gpu = total/s_p = 48 MB per shard → 336 MB (8× over).
+    fn comm_volume_matches_the_zero_paper() {
+        const PASS: u64 = 42_000_000;
+        let psi = tiny_model().total_param_bytes();
+        assert_eq!(psi, 48_000_000);
+        let volume = |c: ZeroConfig| comm_per_step(psi, 8, c, 1).volume_bytes;
+        assert_eq!(volume(cfg(1, 1, 1)), 2 * PASS, "data-parallel: 2 psi");
+        assert_eq!(volume(ZeroConfig::zero_2(8)), 2 * PASS, "P_os+g: 2 psi");
+        assert_eq!(volume(ZeroConfig::zero_3(8)), 3 * PASS, "P_os+g+p: 3 psi");
+        assert_eq!(volume(ZeroConfig::zero_1(8)), 3 * PASS, "all-reduce + broadcast");
+    }
+
+    /// Plain data-parallel training all-reduces its gradients. It was
+    /// charged nothing, which made every sharded configuration look no
+    /// slower than it.
+    #[test]
+    fn data_parallel_training_pays_for_its_all_reduce() {
         let model = tiny_model();
         let cluster = ClusterSpec::default();
-        let eval = evaluate_config(&model, &cluster, ZeroConfig::zero_1(8));
-        assert_eq!(eval.comm_volume_bytes, 7 * 6_000_000);
+        let eval = evaluate_config(&model, &cluster, cfg(1, 1, 1));
+        assert_eq!(eval.comm_volume_bytes, 84_000_000);
+        // 84 MB at 9e11 B/s = 93.33 us, plus one collective for each of the
+        // 8 parameter groups at 50 us = 400 us; compute is 8 x 10 us.
+        let transfer = 84_000_000.0 / 9e11 * 1e6;
+        assert!((eval.exposed_comm_us - (transfer + 400.0)).abs() < 1e-6);
+        assert!((eval.step_time_us - (80.0 + transfer + 400.0)).abs() < 1e-6);
+    }
+
+    /// With sharded parameters every micro-batch gathers them twice and
+    /// reduce-scatters once; with replicated parameters the gradients are
+    /// reduced once per optimizer step, however many micro-batches fed it.
+    #[test]
+    fn sharded_parameters_pay_per_micro_batch() {
+        let psi = 48_000_000;
+        assert_eq!(comm_per_step(psi, 8, ZeroConfig::zero_3(8), 4).volume_bytes, 12 * 42_000_000);
+        assert_eq!(comm_per_step(psi, 8, ZeroConfig::zero_2(8), 4).volume_bytes, 2 * 42_000_000);
+        assert_eq!(comm_per_step(psi, 8, cfg(1, 1, 1), 4).volume_bytes, 2 * 42_000_000);
+    }
+
+    #[test]
+    fn one_rank_sends_nothing() {
+        let c = comm_per_step(48_000_000, 1, cfg(1, 1, 1), 4);
+        assert_eq!(c, StepComm { volume_bytes: 0, collectives: 0 });
     }
 
     #[test]
@@ -593,23 +711,6 @@ mod tests {
     }
 
     #[test]
-    fn comm_volume_is_zero_when_no_sharding() {
-        let model = tiny_model();
-        let cluster = ClusterSpec::default();
-        let cfg = ZeroConfig {
-            s_p: 1,
-            s_g: 1,
-            s_os: 1,
-            mesh_p_inter: false,
-            mesh_g_inter: false,
-            mesh_os_inter: false,
-        };
-        let eval = evaluate_config(&model, &cluster, cfg);
-        assert_eq!(eval.comm_volume_bytes, 0);
-        assert_eq!(eval.exposed_comm_us, 0.0);
-    }
-
-    #[test]
     fn candidates_respect_monotonicity() {
         let cluster = ClusterSpec::default();
         let candidates = generate_candidates(&cluster);
@@ -651,16 +752,21 @@ mod tests {
         }
     }
 
+    /// The runtime's collectives are synchronous, so compute hides none of
+    /// the communication: making the layers a million times slower leaves
+    /// the communication time on the step unchanged.
     #[test]
-    fn exposed_comm_is_zero_when_compute_covers_comm() {
-        let mut model = tiny_model();
-        // Huge compute budget → comm fully hidden.
-        for t in model.per_layer_compute_us.iter_mut() {
+    fn compute_time_hides_no_communication() {
+        let cluster = ClusterSpec::default();
+        let fast = evaluate_config(&tiny_model(), &cluster, ZeroConfig::zero_3(8));
+        let mut slow_model = tiny_model();
+        for t in slow_model.per_layer_compute_us.iter_mut() {
             *t = 1_000_000.0;
         }
-        let cluster = ClusterSpec::default();
-        let eval = evaluate_config(&model, &cluster, ZeroConfig::zero_3(8));
-        assert_eq!(eval.exposed_comm_us, 0.0);
+        let slow = evaluate_config(&slow_model, &cluster, ZeroConfig::zero_3(8));
+        assert!(fast.exposed_comm_us > 0.0);
+        assert_eq!(slow.exposed_comm_us, fast.exposed_comm_us);
+        assert!((slow.step_time_us - (8_000_000.0 + slow.exposed_comm_us)).abs() < 1e-3);
     }
 
     #[test]
@@ -699,53 +805,35 @@ mod tests {
         assert_eq!(rank_cmp(&high_mem, &infeasible_fast), std::cmp::Ordering::Less);
     }
 
+    /// When everything fits, the planner recommends the configuration with
+    /// the least communication, which is plain data-parallel training (one
+    /// collective per group; gradient sharding moves the same bytes in two).
+    /// It used to recommend full sharding for any model, because hidden
+    /// communication made every configuration tie on time and the tie went
+    /// to the least memory.
     #[test]
-    fn search_breaks_hidden_comm_ties_toward_lowest_memory() {
-        // Huge per-layer compute hides ALL communication, so every candidate
-        // ties on step_time_us == total compute. The winner must then be the
-        // minimum-memory config — full (s_p, s_g, s_os) = (8, 8, 8) sharding
-        // for this model — and stay stable across runs.
-        let mut model = tiny_model();
-        for t in model.per_layer_compute_us.iter_mut() {
-            *t = 1_000_000.0;
-        }
-        let cluster = ClusterSpec::default();
-        let result = search(&model, &cluster);
+    fn an_unconstrained_search_does_not_shard() {
+        let result = search(&tiny_model(), &ClusterSpec::default());
         let best = result.best.expect("feasible config expected");
-        let min_mem = result
-            .ranked
-            .iter()
-            .filter(|e| e.feasible)
-            .map(|e| e.memory_per_gpu_bytes)
-            .min()
-            .unwrap();
-        assert_eq!(best.memory_per_gpu_bytes, min_mem);
-        assert_eq!(
-            (best.config.s_p, best.config.s_g, best.config.s_os),
-            (8, 8, 8),
-            "hidden-comm tie must resolve to the lowest-memory candidate"
-        );
+        assert_eq!((best.config.s_p, best.config.s_g, best.config.s_os), (1, 1, 1));
+        assert_eq!(best.config.stage_label(), "DDP");
     }
 
+    /// Under a budget that plain data-parallel training does not fit, the
+    /// cheapest configuration that fits wins: with these sizes that is
+    /// gradient and optimizer sharding with replicated parameters, not
+    /// parameter sharding, which costs a further pass per micro-batch.
+    ///
+    /// Memory per GPU is 48/s_p + 48/s_g + 96/s_os + 16 MB: 208 MB
+    /// unsharded, 82 MB at (1, 8, 8), 40 MB at (8, 8, 8).
     #[test]
-    fn ddp_has_no_comm() {
-        let model = tiny_model();
-        let cluster = ClusterSpec::default();
-        let cfg = ZeroConfig {
-            s_p: 1,
-            s_g: 1,
-            s_os: 1,
-            mesh_p_inter: false,
-            mesh_g_inter: false,
-            mesh_os_inter: false,
+    fn a_tight_budget_shards_only_as_far_as_it_must() {
+        let cluster = ClusterSpec {
+            memory_budget_bytes: 100_000_000,
+            ..ClusterSpec::default()
         };
-        let e = evaluate_config(&model, &cluster, cfg);
-        assert_eq!(e.stage_label_of_config(), "DDP");
-    }
-
-    impl ZeroEvaluation {
-        fn stage_label_of_config(&self) -> &'static str {
-            self.config.stage_label()
-        }
+        let best = search(&tiny_model(), &cluster).best.expect("a configuration fits");
+        assert_eq!((best.config.s_p, best.config.s_g, best.config.s_os), (1, 8, 8));
+        assert_eq!(best.memory_per_gpu_bytes, 82_000_000);
     }
 }

@@ -29,29 +29,6 @@ pub(crate) struct FusedAdamwScalars {
     pub(crate) one_minus_beta2: f64,
     pub(crate) eps: f64,
 }
-use crate::fase::FasePlan;
-
-/// Emit the Deferred-mode per-micro-batch accumulator update.
-///
-/// Free-function marker hook — the actual Cranelift IR emission is
-/// `Compiler::fase_emit_accumulate`.
-///
-/// Returns `Ok(())` unconditionally; callers that only need to check whether
-/// the stub is wired can call this.
-pub fn emit_deferred_accumulate(_plan: &FasePlan) -> Result<(), String> {
-    Ok(())
-}
-
-/// Emit the Deferred-mode fused final step (runs after the last micro-batch
-/// backward): per-parameter optimizer update sourced from `m_partial`, then
-/// `m_partial = 0`.
-///
-/// The real work lives in `Compiler::fase_emit_final_step`.  This free-function
-/// is kept as a marker / integration test hook.
-pub fn emit_deferred_final_step(_plan: &FasePlan) -> Result<(), String> {
-    Ok(())
-}
-
 impl Compiler<'_> {
     /// Emit the per-parameter fused optimizer step for FASE Deferred mode.
     ///
@@ -1764,38 +1741,5 @@ impl Compiler<'_> {
         }
 
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::fase::{plan, FaseConfig, FaseOptimizer};
-
-    #[test]
-    fn accumulate_stub_now_returns_ok() {
-        let p = plan(&FaseConfig {
-            accumulation: 4,
-            optimizer: FaseOptimizer::AdamW,
-            grad_clip: None,
-            allow_v_approx: true,
-            ..Default::default()
-        });
-        assert!(emit_deferred_accumulate(&p).is_ok());
-    }
-
-    #[test]
-    fn final_step_free_function_is_a_marker() {
-        // The real emission lives on Compiler::fase_emit_final_step; this free
-        // function is kept only for future non-Compiler callers.
-        let p = plan(&FaseConfig {
-            accumulation: 4,
-            optimizer: FaseOptimizer::AdamW,
-            grad_clip: None,
-            allow_v_approx: true,
-            ..Default::default()
-        });
-        // Task 8: free-function now returns Ok (stub promoted to wired).
-        assert!(emit_deferred_final_step(&p).is_ok());
     }
 }

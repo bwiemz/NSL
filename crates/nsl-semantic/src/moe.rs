@@ -53,7 +53,9 @@ pub fn validate_moe_decorator(
     let mut num_experts: Option<usize> = None;
     let mut top_k: usize = 2;
     let mut capacity_factor: f64 = 1.25;
-    let mut aux_loss_coeff: f64 = 0.01;
+    // No auxiliary loss is applied (see the `aux_loss_coeff` arm), so the
+    // coefficient a decorator carries is 0.
+    let mut aux_loss_coeff: f64 = 0.0;
 
     if let Some(ref args) = deco.args {
         for arg in args {
@@ -109,20 +111,27 @@ pub fn validate_moe_decorator(
                             }
                         }
                     }
-                    "aux_loss_coeff" => {
-                        if let ExprKind::FloatLiteral(f) = &arg.value.kind {
-                            if *f < 0.0 {
-                                diagnostics.push(
-                                    Diagnostic::error(
-                                        "@moe: aux_loss_coeff must be >= 0.0".to_string(),
-                                    )
-                                    .with_label(arg.span, "must be >= 0.0"),
-                                );
-                            } else {
-                                aux_loss_coeff = *f;
-                            }
-                        }
-                    }
+                    // A load-balancing loss needs a trainable router, and
+                    // MoE here is inference-only: `moe_dispatch` has no
+                    // backward rule and no call to the auxiliary-loss
+                    // routine is emitted. A coefficient used to be accepted
+                    // and ignored, which reads as "balanced by 0.01" to
+                    // anyone looking at the decorator. An explicit 0.0 asks
+                    // for what happens and is accepted.
+                    "aux_loss_coeff" => match &arg.value.kind {
+                        ExprKind::FloatLiteral(f) if *f == 0.0 => aux_loss_coeff = 0.0,
+                        ExprKind::IntLiteral(0) => aux_loss_coeff = 0.0,
+                        _ => diagnostics.push(
+                            Diagnostic::error(
+                                "@moe: aux_loss_coeff is not supported: no auxiliary \
+                                 load-balancing loss is applied, because MoE dispatch has no \
+                                 backward rule and the router cannot be trained. Remove the \
+                                 argument (or pass 0.0)"
+                                    .to_string(),
+                            )
+                            .with_label(arg.span, "accepted before, but never applied"),
+                        ),
+                    },
                     // CPDT Part III v2.5 (closes a v2.4 surface gap):
                     // `activation` selects the per-expert nonlinearity
                     // for the v3 paper-faithful MoE FFN, AND drives the
@@ -227,6 +236,46 @@ pub fn validate_moe_decorator(
 #[cfg(test)]
 mod tests {
     use super::validate_weight_prefix_shape;
+
+    fn moe_diagnostics(decorator: &str) -> Vec<String> {
+        let src = format!(
+            "model MoEModel:\n    {decorator}\n    experts: int = 2\n\n    \
+             fn forward(self, x: Tensor) -> Tensor:\n        return x\n"
+        );
+        let mut interner = nsl_lexer::Interner::new();
+        let (tokens, _) = nsl_lexer::tokenize(&src, nsl_errors::FileId(0), &mut interner);
+        let parsed = nsl_parser::parse(&tokens, &mut interner);
+        assert!(parsed.diagnostics.is_empty(), "fixture must parse: {:?}", parsed.diagnostics);
+        crate::analyze(&parsed.module, &mut interner)
+            .diagnostics
+            .iter()
+            .map(|d| format!("{d:?}"))
+            .collect()
+    }
+
+    /// `@moe(aux_loss_coeff=…)` used to be accepted and to change nothing.
+    #[test]
+    fn a_nonzero_aux_loss_coeff_is_refused() {
+        let diags = moe_diagnostics("@moe(num_experts=2, top_k=1, aux_loss_coeff=0.05)");
+        assert!(
+            diags.iter().any(|d| d.contains("aux_loss_coeff is not supported")),
+            "expected a refusal naming aux_loss_coeff, got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_zero_or_absent_aux_loss_coeff_is_accepted() {
+        for deco in [
+            "@moe(num_experts=2, top_k=1)",
+            "@moe(num_experts=2, top_k=1, aux_loss_coeff=0.0)",
+        ] {
+            let diags = moe_diagnostics(deco);
+            assert!(
+                !diags.iter().any(|d| d.contains("aux_loss_coeff")),
+                "`{deco}` must not be refused, got: {diags:?}"
+            );
+        }
+    }
 
     // CPDT Part III v2.10 fix F2 (LOW adversarial review). Pin the
     // semantic-layer duplicate of the codegen `validate_weight_prefix`

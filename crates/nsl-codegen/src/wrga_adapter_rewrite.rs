@@ -1,16 +1,22 @@
 //! WRGA Milestone B.2.1 Tasks 3+4: LoRA / IA³ / GatedLoRA forward-pass AST rewrite.
 //!
-//! Walks each model-method body and replaces every matmul of the form
-//! `x @ self.W` — where `W` is a raw `Tensor<...>` field targeted by an
-//! active adapter — with the adapter-specific rewritten expression:
+//! Walks each model-method body and replaces every matmul whose right
+//! operand is an adapted weight — `x @ self.W`, or `x @ self.W.transpose(0,
+//! 1)` as the standard library's `Linear` writes it — with the
+//! adapter-specific rewritten expression (`M` below is that matmul,
+//! unchanged):
 //!
 //! ```text
-//! LoRA:       x @ self.W + ((x @ self.lora_A_<site>) @ self.lora_B_<site>) * (alpha / rank)
-//! IA³:        (x @ self.W) * self.ia3_scale_<site>
-//! GatedLoRA:  x @ self.W + sigmoid(self.gate_<site>)
-//!                          * ((x @ self.lora_A_<site>) @ self.lora_B_<site>)
-//!                          * (alpha / rank)
+//! LoRA:       M + ((x @ self.lora_A_<site>) @ self.lora_B_<site>) * (alpha / rank)
+//! IA³:        M * self.ia3_scale_<site>
+//! GatedLoRA:  M + sigmoid(self.gate_<site>)
+//!                 * ((x @ self.lora_A_<site>) @ self.lora_B_<site>)
+//!                 * (alpha / rank)
 //! ```
+//!
+//! `lora_A` is `[in, rank]` and `lora_B` is `[rank, out]` for both forms; the
+//! form only decides which axis of `W` is `in` (see
+//! [`crate::wrga_adapter_inject::WeightUse`]).
 //!
 //! # Risk #6 — Step-0 invariant for GatedLoRA (LOAD-BEARING)
 //!
@@ -35,8 +41,18 @@ use nsl_ast::operator::BinOp;
 use nsl_ast::stmt::{Stmt, StmtKind, Block};
 use nsl_ast::{NodeId, Symbol};
 
-use crate::wrga_adapter_inject::AdapterSite;
+use crate::wrga_adapter_inject::{AdapterSite, WeightUse};
 use crate::AdapterKind;
+
+/// How often a model's methods use one weight field in each matmul form an
+/// adapter can attach to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WeightUseCounts {
+    /// `x @ self.w`
+    pub direct: usize,
+    /// `x @ self.w.transpose(0, 1)`
+    pub transposed: usize,
+}
 
 /// Context for a single model-method rewrite pass.
 pub struct RewriteContext<'a> {
@@ -76,6 +92,17 @@ pub struct RewriteContext<'a> {
     /// GatedLoRA handles = `fused_kernel_order.len() + position_in_this_vec`.
     /// Sorted by the same key tuple as `fused_kernel_order`.
     pub fused_gatedlora_kernel_order: Vec<crate::wrga_fused_ptx::LoraKernelKey>,
+    /// The same for IA³ kernels (keyed with `rank = 0`); their handles
+    /// follow the gated-LoRA ones.
+    pub fused_ia3_kernel_order: Vec<crate::wrga_fused_ptx::LoraKernelKey>,
+    /// The interned `transpose`, when the program mentions it at all: what
+    /// lets the matcher recognise `self.W.transpose(0, 1)`.
+    pub transpose_sym: Option<Symbol>,
+    /// Probe mode: count the matmuls on each field in `use_counts` and
+    /// rewrite nothing. A site matches in either form.
+    pub probe: bool,
+    /// Matmuls seen per target field, by form.
+    pub use_counts: HashMap<String, WeightUseCounts>,
 }
 
 impl<'a> RewriteContext<'a> {
@@ -89,7 +116,98 @@ impl<'a> RewriteContext<'a> {
             synth_call_overrides: HashMap::new(),
             fused_kernel_order: Vec::new(),
             fused_gatedlora_kernel_order: Vec::new(),
+            fused_ia3_kernel_order: Vec::new(),
+            transpose_sym: None,
+            probe: false,
+            use_counts: HashMap::new(),
         }
+    }
+}
+
+/// Count, over every method of `model_name`, the matmuls whose right operand
+/// is `self.<field>` in each form an adapter can attach to.
+///
+/// This runs the rewrite's own matcher in probe mode, so "the adapter has a
+/// place to attach" and "the rewrite attaches it" cannot disagree.
+pub(crate) fn count_weight_uses(
+    compiler: &crate::compiler::Compiler<'_>,
+    model_name: &str,
+    field: &str,
+) -> WeightUseCounts {
+    let Some(methods) = compiler.models.model_method_bodies.get(model_name) else {
+        return WeightUseCounts::default();
+    };
+    let probe_site = AdapterSite {
+        site_id: String::new(),
+        kind: AdapterKind::Lora,
+        target_param: String::new(),
+        rank: 1,
+        alpha: 1,
+        synthesized_fields: Vec::new(),
+        input_dim: 0,
+        output_dim: 0,
+        target_model: model_name.to_string(),
+        target_field: field.to_string(),
+        weight_use: WeightUse::Direct,
+        fusion_decision: None,
+    };
+    let mut counts = WeightUseCounts::default();
+    for fn_def in methods.values() {
+        let mut ctx = RewriteContext::new(vec![&probe_site]);
+        ctx.probe = true;
+        fill_symbols(&mut ctx, compiler, model_name, fn_def);
+        for stmt in &fn_def.body.stmts {
+            let _ = rewrite_stmt(stmt.clone(), &mut ctx);
+        }
+        if let Some(c) = ctx.use_counts.get(field) {
+            counts.direct += c.direct;
+            counts.transposed += c.transposed;
+        }
+    }
+    counts
+}
+
+/// Give `ctx` the symbols the matcher compares against: the method's `self`
+/// parameter, the model's field names, `transpose`, and `sigmoid` (the
+/// callee the gated-LoRA rewrite synthesizes).
+fn fill_symbols(
+    ctx: &mut RewriteContext<'_>,
+    compiler: &crate::compiler::Compiler<'_>,
+    model_name: &str,
+    fn_def: &nsl_ast::decl::FnDef,
+) {
+    ctx.self_sym = fn_def
+        .params
+        .iter()
+        .find(|p| compiler.resolve_sym(p.name) == "self")
+        .map(|p| p.name);
+    // Every field of the model, whichever map knows it: nested models and
+    // arrays (`model_field_types`), tensors with a literal shape
+    // (`model_tensor_field_shapes`), and the struct layout, which has them
+    // all, including a tensor whose shape comes from a constructor argument
+    // and the fields of a model imported from another module.
+    let mut names: Vec<String> = Vec::new();
+    if let Some(m) = compiler.models.model_field_types.get(model_name) {
+        names.extend(m.keys().cloned());
+    }
+    if let Some(m) = compiler.models.model_tensor_field_shapes.get(model_name) {
+        names.extend(m.keys().cloned());
+    }
+    if let Some(layout) = compiler.types.struct_layouts.get(model_name) {
+        names.extend(layout.fields.iter().map(|f| f.name.clone()));
+    }
+    for fname in names {
+        if let Some(s) = compiler.interner.get(&fname) {
+            ctx.field_symbols.insert(fname, nsl_ast::Symbol(s));
+        }
+    }
+    ctx.transpose_sym = compiler.interner.get("transpose").map(nsl_ast::Symbol);
+    // The gated-LoRA rewrite builds a `sigmoid(self.gate_<site>)` call and
+    // takes the callee symbol from here; without it the fallback would be an
+    // arbitrary field symbol and the call would name that field.
+    if let Some(s) = compiler.interner.get("sigmoid") {
+        ctx.field_symbols
+            .insert("sigmoid".to_string(), nsl_ast::Symbol(s));
     }
 }
 
@@ -155,57 +273,11 @@ pub fn rewrite_stmts_for_model(
         .collect();
     gl_order.sort_by_key(|k| (k.m, k.n, k.k, k.rank, k.target_sm));
     ctx.fused_gatedlora_kernel_order = gl_order;
-    // Find the `self` Symbol and populate field_symbols from the model's
-    // known fields for matcher support.
-    ctx.self_sym = fn_def
-        .params
-        .iter()
-        .find(|p| compiler.resolve_sym(p.name) == "self")
-        .map(|p| p.name);
-    if let Some(field_map) = compiler
-        .models
-        .model_field_types
-        .get(model_name)
-        .cloned()
-    {
-        for fname in field_map.keys() {
-            if let Some(s) = compiler.interner.get(fname) {
-                ctx.field_symbols
-                    .insert(fname.clone(), nsl_ast::Symbol(s));
-            }
-        }
-    }
-    // B.2.1 Task 5.5: also include Tensor-typed fields (whose shape
-    // strings live in the separate `model_tensor_field_shapes` map) so
-    // the rewrite matcher can recognise `self.w @ ...` for adapted tensor
-    // fields.
-    if let Some(field_map) = compiler
-        .models
-        .model_tensor_field_shapes
-        .get(model_name)
-        .cloned()
-    {
-        for fname in field_map.keys() {
-            if let Some(s) = compiler.interner.get(fname) {
-                ctx.field_symbols
-                    .insert(fname.clone(), nsl_ast::Symbol(s));
-            }
-        }
-    }
-    // B.3.1 Task 5.1: GatedLoRA's synthesize_gatedlora_adapted builds a
-    // `sigmoid(self.gate_<site>)` Call node and resolves the callee by
-    // looking up `field_symbols["sigmoid"]`. Without this insertion the
-    // fallback picks an arbitrary field symbol (e.g. `w`) as the callee,
-    // emitting `w(gate_...)` which fails at codegen with "undefined
-    // variable 'w'".
-    //
-    // We insert the symbol unconditionally for all models that have
-    // adapter sites — it is a no-op if no GatedLoRA site is present
-    // since non-GatedLoRA rewrites never consult `field_symbols["sigmoid"]`.
-    if let Some(s) = compiler.interner.get("sigmoid") {
-        ctx.field_symbols
-            .insert("sigmoid".to_string(), nsl_ast::Symbol(s));
-    }
+    let mut ia3_order: Vec<crate::wrga_fused_ptx::LoraKernelKey> =
+        compiler.fused_ia3_ptx_kernels.keys().cloned().collect();
+    ia3_order.sort_by_key(|k| (k.m, k.n, k.k, k.rank, k.target_sm));
+    ctx.fused_ia3_kernel_order = ia3_order;
+    fill_symbols(&mut ctx, compiler, model_name, fn_def);
     let out: Vec<Stmt> = stmts
         .iter()
         .cloned()
@@ -233,44 +305,91 @@ fn is_self_expr(expr: &Expr, self_sym: Option<Symbol>) -> bool {
     }
 }
 
-/// Attempt to match a `BinaryOp MatMul` whose right operand is
-/// `self.<field>` where `<field>` is the `target_field` of an active
-/// adapter site (any kind) in `ctx`. On match, returns `(site, lhs_expr)`.
+/// An integer literal, with or without a leading minus.
+fn int_literal(expr: &Expr) -> Option<i64> {
+    match &expr.kind {
+        ExprKind::IntLiteral(n) => Some(*n),
+        ExprKind::UnaryOp { op: nsl_ast::operator::UnaryOp::Neg, operand } => {
+            match &operand.kind {
+                ExprKind::IntLiteral(n) => Some(-*n),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Whether `(a, b)` swaps the two axes of a 2-D tensor.
+fn swaps_matrix_axes(a: i64, b: i64) -> bool {
+    matches!((a, b), (0, 1) | (1, 0) | (-2, -1) | (-1, -2))
+}
+
+/// The weight operand of a matmul, when it is one an adapter can attach to:
+/// `self.<field>` or `self.<field>.transpose(0, 1)`. Returns the field's
+/// symbol and the form.
+fn weight_operand(right: &Expr, ctx: &RewriteContext<'_>) -> Option<(Symbol, WeightUse)> {
+    let mut right = right;
+    while let ExprKind::Paren(inner) = &right.kind {
+        right = inner;
+    }
+    match &right.kind {
+        ExprKind::MemberAccess { object, member } if is_self_expr(object, ctx.self_sym) => {
+            Some((*member, WeightUse::Direct))
+        }
+        ExprKind::Call { callee, args } => {
+            let ExprKind::MemberAccess { object, member } = &callee.kind else {
+                return None;
+            };
+            if Some(*member) != ctx.transpose_sym || args.len() != 2 {
+                return None;
+            }
+            if args.iter().any(|a| a.name.is_some()) {
+                return None;
+            }
+            let (a, b) = (int_literal(&args[0].value)?, int_literal(&args[1].value)?);
+            if !swaps_matrix_axes(a, b) {
+                return None;
+            }
+            match &object.kind {
+                ExprKind::MemberAccess { object: owner, member: field }
+                    if is_self_expr(owner, ctx.self_sym) =>
+                {
+                    Some((*field, WeightUse::Transposed))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Attempt to match a `BinaryOp MatMul` whose right operand is the
+/// `target_field` of an active adapter site (any kind) in `ctx`, in the form
+/// the site was resolved for. On match, returns `(site, lhs_expr, form)`.
 ///
-/// The matcher is shared across all adapter kinds — the pattern
-/// (`x @ self.W`) is identical; only the synthesized replacement differs.
+/// The matcher is shared across all adapter kinds; only the synthesized
+/// replacement differs. In probe mode the site matches in either form.
 pub fn match_adapter_site<'a, 'b>(
     expr: &'b Expr,
     ctx: &'a RewriteContext<'a>,
-) -> Option<(&'a AdapterSite, &'b Expr)> {
+) -> Option<(&'a AdapterSite, &'b Expr, WeightUse)> {
     let (left, right) = match &expr.kind {
         ExprKind::BinaryOp { left, op: BinOp::MatMul, right } => (left.as_ref(), right.as_ref()),
         _ => return None,
     };
-    let (obj, member) = match &right.kind {
-        ExprKind::MemberAccess { object, member } => (object.as_ref(), *member),
-        _ => return None,
-    };
-    if !is_self_expr(obj, ctx.self_sym) {
-        return None;
-    }
+    let (member, form) = weight_operand(right, ctx)?;
     // Resolve member symbol to a string via the context's field_symbols
-    // reverse lookup (the rewrite caller populates this by resolving
-    // `self.resolve_sym` once up front).
+    // reverse lookup.
     let member_name = ctx
         .field_symbols
         .iter()
-        .find_map(|(name, sym)| if *sym == member { Some(name.as_str()) } else { None });
-    let member_name = member_name?;
-    for site in &ctx.sites {
-        if site.target_field == member_name
-            && site.input_dim > 0
-            && site.output_dim > 0
-        {
-            return Some((*site, left));
-        }
-    }
-    None
+        .find_map(|(name, sym)| if *sym == member { Some(name.as_str()) } else { None })?;
+    ctx.sites
+        .iter()
+        .find(|site| {
+            site.target_field == member_name && (ctx.probe || site.weight_use == form)
+        })
+        .map(|site| (*site, left, form))
 }
 
 /// Backwards-compatible alias used by the original Task 3 tests.
@@ -279,7 +398,7 @@ pub fn match_lora_site<'a, 'b>(
     ctx: &'a RewriteContext<'a>,
 ) -> Option<(&'a AdapterSite, &'b Expr)> {
     match match_adapter_site(expr, ctx) {
-        Some((site, lhs)) if site.kind == AdapterKind::Lora => Some((site, lhs)),
+        Some((site, lhs, _)) if site.kind == AdapterKind::Lora => Some((site, lhs)),
         _ => None,
     }
 }
@@ -346,7 +465,7 @@ fn make_float(v: f64, span: nsl_errors::Span) -> Expr {
 /// aborted at the first optimizer step; and the kernel itself measured 15
 /// to 67 times slower than the ordinary GEMMs (Appendix B, section B.6).
 /// The unfused triple is correct for every rank.
-fn fused_path_selected(target_sm: Option<u32>) -> bool {
+pub(crate) fn fused_path_selected(target_sm: Option<u32>) -> bool {
     target_sm.is_some_and(|sm| sm >= 80)
         && std::env::var("NSL_WRGA_FUSED_CUDA").ok().as_deref() == Some("1")
 }
@@ -372,10 +491,53 @@ pub fn synthesize_lora_adapted(
         Some(crate::wrga_fusion::FusionTarget::EpilogueFusedLora { .. })
     );
     let sm_ok = fused_path_selected(ctx.target_sm);
-    if is_fused && sm_ok {
+    if is_fused && sm_ok && lora_kernel_handle(site, ctx).is_some() {
         return synthesize_lora_fused_call(original, lhs, site, ctx);
     }
     synthesize_lora_unfused_triple(original, lhs, site, ctx)
+}
+
+/// The runtime handle of the fused LoRA kernel synthesized for `site`'s
+/// shape, or `None` when there is none (the weight's shape is not a literal,
+/// or this compile registered no kernel). A site without a kernel takes the
+/// ordinary operations rather than a fused call that could only fall back.
+fn lora_kernel_handle(site: &AdapterSite, ctx: &RewriteContext<'_>) -> Option<i64> {
+    let rank = match &site.fusion_decision {
+        Some(crate::wrga_fusion::FusionTarget::EpilogueFusedLora { rank }) => *rank as u32,
+        _ => site.rank as u32,
+    };
+    let key = crate::wrga_fused_ptx::LoraKernelKey {
+        m: 1,
+        n: site.output_dim,
+        k: site.input_dim,
+        rank,
+        target_sm: ctx.target_sm.unwrap_or(0),
+    };
+    ctx.fused_kernel_order
+        .iter()
+        .position(|k| k == &key)
+        .map(|p| p as i64)
+}
+
+/// As [`lora_kernel_handle`], for gated LoRA. Its handles follow the LoRA
+/// ones so the two kinds never share a handle for the same shape.
+fn gatedlora_kernel_handle(site: &AdapterSite, ctx: &RewriteContext<'_>) -> Option<i64> {
+    let rank = match &site.fusion_decision {
+        Some(crate::wrga_fusion::FusionTarget::EpilogueFusedGatedLora { rank }) => *rank as u32,
+        _ => site.rank as u32,
+    };
+    let key = crate::wrga_fused_ptx::LoraKernelKey {
+        m: 1,
+        n: site.output_dim,
+        k: site.input_dim,
+        rank,
+        target_sm: ctx.target_sm.unwrap_or(0),
+    };
+    let lora_offset = ctx.fused_kernel_order.len() as i64;
+    ctx.fused_gatedlora_kernel_order
+        .iter()
+        .position(|k| k == &key)
+        .map(|p| lora_offset + p as i64)
 }
 
 /// B.3 Task 4: synthesize a single `Call` to `nsl_adapter_fused_lora_matmul`
@@ -418,32 +580,10 @@ pub fn synthesize_lora_fused_call(
     let alpha = site.alpha.max(1) as f64;
     let scale = alpha / rank;
 
-    // B.3 Task 5: derive a deterministic kernel_handle by looking up
-    // this site's `LoraKernelKey` in the sorted `fused_kernel_order`.
-    // Sites whose key isn't in the order (rank > 16, dims unresolved,
-    // non-sm_80 target) get handle = -1 so the runtime can detect a
-    // miswiring and fall back deterministically.
-    let kernel_handle: i64 = {
-        let target_sm = ctx.target_sm.unwrap_or(0);
-        // Rank from FusionTarget::EpilogueFusedLora { rank }; fall back
-        // to site.rank when the decision shape doesn't carry it.
-        let rank = match &site.fusion_decision {
-            Some(crate::wrga_fusion::FusionTarget::EpilogueFusedLora { rank }) => *rank as u32,
-            _ => site.rank as u32,
-        };
-        let key = crate::wrga_fused_ptx::LoraKernelKey {
-            m: 1,
-            n: site.output_dim,
-            k: site.input_dim,
-            rank,
-            target_sm,
-        };
-        ctx.fused_kernel_order
-            .iter()
-            .position(|k| k == &key)
-            .map(|p| p as i64)
-            .unwrap_or(-1)
-    };
+    // -1 is unreachable from `synthesize_lora_adapted`, which takes this
+    // path only for a site with a kernel; the runtime treats it as "no
+    // kernel" and runs the ordinary operations.
+    let kernel_handle: i64 = lora_kernel_handle(site, ctx).unwrap_or(-1);
 
     // Build the callee Ident with a sentinel symbol + override entry
     // pointing at the FFI name.
@@ -544,10 +684,27 @@ pub fn synthesize_ia3_adapted(
         Some(crate::wrga_fusion::FusionTarget::ActivationFusedIa3)
     );
     let sm_ok = fused_path_selected(ctx.target_sm);
-    if is_fused && sm_ok {
+    if is_fused && sm_ok && ia3_kernel_handle(site, ctx).is_some() {
         return synthesize_ia3_fused_call(original, site, ctx);
     }
     synthesize_ia3_unfused_mul(original, site, ctx)
+}
+
+/// As [`lora_kernel_handle`], for IA³: its handles follow the LoRA and
+/// gated-LoRA ones.
+fn ia3_kernel_handle(site: &AdapterSite, ctx: &RewriteContext<'_>) -> Option<i64> {
+    let key = crate::wrga_fused_ptx::LoraKernelKey {
+        m: 1,
+        n: site.output_dim,
+        k: site.input_dim,
+        rank: 0,
+        target_sm: ctx.target_sm.unwrap_or(0),
+    };
+    let offset = (ctx.fused_kernel_order.len() + ctx.fused_gatedlora_kernel_order.len()) as i64;
+    ctx.fused_ia3_kernel_order
+        .iter()
+        .position(|k| k == &key)
+        .map(|p| offset + p as i64)
 }
 
 /// B.3 Task 4: single-Call fused IA³ entry —
@@ -574,9 +731,9 @@ pub fn synthesize_ia3_fused_call(
     let self_s = make_self_expr(span);
     let ma_scale = make_synth_member_access(ctx, self_s, &scale_name, span, sentinel);
 
-    // B.3 Task 5: IA³ has no PTX registry yet (LoRA-only in prescan), so
-    // emit -1 as a sentinel.  The Task-4 CPU stub ignores the handle.
-    let kernel_handle: i64 = -1;
+    // -1 is unreachable from `synthesize_ia3_adapted`, which takes this path
+    // only for a site with a kernel.
+    let kernel_handle: i64 = ia3_kernel_handle(site, ctx).unwrap_or(-1);
 
     let callee_id = NodeId::next();
     ctx.synth_call_overrides
@@ -684,31 +841,7 @@ pub fn synthesize_gatedlora_fused_call(
     let alpha = site.alpha.max(1) as f64;
     let scale = alpha / rank;
 
-    // B.3.1 Task 5.0.c: look up the GatedLoRA-specific kernel order.
-    // GatedLoRA handles are assigned as `lora_order.len() + idx_in_gatedlora_order`
-    // to avoid collisions with LoRA handles that share the same shape.
-    let kernel_handle: i64 = {
-        let target_sm = ctx.target_sm.unwrap_or(0);
-        let rank_u32 = match &site.fusion_decision {
-            Some(crate::wrga_fusion::FusionTarget::EpilogueFusedGatedLora { rank }) => {
-                *rank as u32
-            }
-            _ => site.rank as u32,
-        };
-        let key = crate::wrga_fused_ptx::LoraKernelKey {
-            m: 1,
-            n: site.output_dim,
-            k: site.input_dim,
-            rank: rank_u32,
-            target_sm,
-        };
-        let lora_offset = ctx.fused_kernel_order.len() as i64;
-        ctx.fused_gatedlora_kernel_order
-            .iter()
-            .position(|k| k == &key)
-            .map(|p| lora_offset + p as i64)
-            .unwrap_or(-1)
-    };
+    let kernel_handle: i64 = gatedlora_kernel_handle(site, ctx).unwrap_or(-1);
 
     let callee_id = NodeId::next();
     ctx.synth_call_overrides
@@ -779,7 +912,7 @@ pub fn synthesize_gatedlora_adapted(
         Some(crate::wrga_fusion::FusionTarget::EpilogueFusedGatedLora { .. })
     );
     let sm_ok = fused_path_selected(ctx.target_sm);
-    if is_fused && sm_ok {
+    if is_fused && sm_ok && gatedlora_kernel_handle(site, ctx).is_some() {
         return synthesize_gatedlora_fused_call(original, lhs, site, ctx);
     }
     synthesize_gatedlora_unfused(original, lhs, site, ctx)
@@ -961,22 +1094,21 @@ pub fn rewrite_expr(mut expr: Expr, ctx: &mut RewriteContext<'_>) -> Expr {
     };
 
     // Post-order pattern match on the rewritten node.
-    if let Some((site, lhs)) = match_adapter_site(&expr, ctx) {
-        // Clone the site handle before we mutate ctx via synth_overrides.
-        let site_copy = AdapterSite {
-            site_id: site.site_id.clone(),
-            kind: site.kind,
-            target_param: site.target_param.clone(),
-            rank: site.rank,
-            alpha: site.alpha,
-            synthesized_fields: site.synthesized_fields.clone(),
-            input_dim: site.input_dim,
-            output_dim: site.output_dim,
-            target_model: site.target_model.clone(),
-            target_field: site.target_field.clone(),
-            fusion_decision: site.fusion_decision.clone(),
-        };
+    if let Some((site, lhs, form)) = match_adapter_site(&expr, ctx) {
+        // Clone the site handle before we mutate ctx.
+        let site_copy: AdapterSite = site.clone();
         let lhs_clone = lhs.clone();
+        let counts = ctx
+            .use_counts
+            .entry(site_copy.target_field.clone())
+            .or_default();
+        match form {
+            WeightUse::Direct => counts.direct += 1,
+            WeightUse::Transposed => counts.transposed += 1,
+        }
+        if ctx.probe {
+            return expr;
+        }
         return match site_copy.kind {
             AdapterKind::Lora => synthesize_lora_adapted(expr, &lhs_clone, &site_copy, ctx),
             AdapterKind::Ia3 => synthesize_ia3_adapted(expr, &site_copy, ctx),
@@ -1091,6 +1223,7 @@ mod tests {
             output_dim: 32,
             target_model: "Toy".to_string(),
             target_field: target_field.to_string(),
+            weight_use: WeightUse::Direct,
             fusion_decision: None,
         }
     }
@@ -1193,6 +1326,7 @@ mod tests {
             output_dim: 32,
             target_model: "Toy".to_string(),
             target_field: target_field.to_string(),
+            weight_use: WeightUse::Direct,
             fusion_decision: None,
         }
     }

@@ -115,7 +115,7 @@ Line counts are `wc -l` at the time of writing.
 | `cpdt.rs` | 380 | `@cpdt(mode=, cluster=, …)` validator. |
 | `wggo.rs` | 431 | `@wggo`, `@wggo_target` validators. |
 | `cfie.rs` | 568 | `@cfie` serve-block config. |
-| `moe.rs`, `pipeline.rs`, `speculative.rs`, `kv_compress.rs`, `context_parallel.rs`, `sparse.rs`, `sparse_layout.rs`, `fp8.rs`, `perf_budget.rs`, `grammar.rs`, `multimodal.rs`, `target.rs`, `vmap.rs`, `inspect.rs` | 24–491 each | One `validate_<name>_decorator` per model- or statement-level decorator. `sparse_layout.rs` (`@layout`) has a validator but no dispatch, which is why `layout` is on the unimplemented list. |
+| `moe.rs`, `pipeline.rs`, `speculative.rs`, `context_parallel.rs`, `fp8.rs`, `perf_budget.rs`, `grammar.rs`, `multimodal.rs`, `target.rs`, `vmap.rs`, `inspect.rs` | 24–491 each | One `validate_<name>_decorator` per model- or statement-level decorator. (`@kv_compress`, `@sparse` and `@layout` had validators here; all three decorators are refused and the validators are gone.) |
 
 `benches/analyze.rs` benchmarks `analyze` over `examples/*.nsl`
 (`cargo bench -p nsl-semantic`).

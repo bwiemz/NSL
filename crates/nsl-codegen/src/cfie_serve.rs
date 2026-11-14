@@ -20,11 +20,10 @@ use nsl_ast::Symbol;
 
 use crate::cfie::{CfieInput, CfieMode};
 use crate::cfie_fused_sample::{LmHeadShape, SamplingParams, SamplingStrategy};
-use crate::cfie_grammar::{dfa_from_json_schema, CompiledDfa, TokenVocab};
 use crate::cfie_kv_plan::{KvBudget, KvShape};
 use crate::cfie_kv_quant::KvQuantConfig;
 use crate::cfie_persistent::PersistentModel;
-use crate::cfie_speculative::{DraftMethod, SpeculativeConfig};
+use crate::cfie_speculative::SpeculativeConfig;
 use crate::error::CodegenError;
 use crate::gpu_specs::GpuSpec;
 use crate::weight_aware::WeightMap;
@@ -32,10 +31,6 @@ use crate::weight_aware::WeightMap;
 /// Paper default: CUDA driver + workspace reserve subtracted from HBM
 /// before planning the KV budget (§2's worked example uses 800 MB).
 const CUDA_RUNTIME_OVERHEAD_BYTES: u64 = 800 * 1024 * 1024;
-
-/// Default acceptance rate assumed for speculative-speedup estimates
-/// until measurement-driven acceptance lands (audit gap G15).
-const DEFAULT_SPECULATIVE_ACCEPTANCE: f32 = 0.6;
 
 // ---------------------------------------------------------------------------
 // Serve-block extraction
@@ -48,6 +43,9 @@ pub struct SamplingSection {
     pub top_k: Option<i64>,
     pub top_p: Option<f64>,
     pub fused: Option<bool>,
+    /// `seed: <int>` — the seed every request's draws are keyed by
+    /// (with the request's index and the token's position).  Default 0.
+    pub seed: Option<i64>,
 }
 
 /// `speculative:` section values (paper §5).
@@ -237,6 +235,7 @@ fn extract_sampling(sub: &ServeSubBlock, resolve: &dyn Fn(Symbol) -> String) -> 
             "top_k" => s.top_k = entry_int(entry),
             "top_p" => s.top_p = entry_float(entry),
             "fused" => s.fused = entry_bool(entry),
+            "seed" => s.seed = entry_int(entry),
             _ => {}
         }
     }
@@ -448,60 +447,93 @@ pub fn resolve_model_shape(
 // CfieInput assembly
 // ---------------------------------------------------------------------------
 
-fn parse_draft_method(name: &str) -> Option<DraftMethod> {
-    match name {
-        "standard" => Some(DraftMethod::Standard),
-        "tree" => Some(DraftMethod::Tree),
-        "medusa" => Some(DraftMethod::Medusa),
-        "lookahead" => Some(DraftMethod::Lookahead),
-        _ => None,
+/// The largest `top_k` the fused sampler supports: its candidate list is
+/// a serial structure in shared memory.
+pub const MAX_TOP_K: i64 = 64;
+
+/// The fused sampler's parameters from the `sampling:` section.
+///
+/// Nothing the user did not write is filled in. A section that sets a
+/// non-zero temperature must set `top_k`: the kernel keeps a candidate
+/// list of at most [`MAX_TOP_K`] tokens and cannot sample the whole
+/// vocabulary, so there is no honest meaning for "no top_k". `top_p` is
+/// optional, and without it no nucleus filter runs. (A section with only
+/// `temperature` used to get `top_k = 50` and `top_p = 0.9` silently.)
+/// With no section at all the documented defaults apply and the build
+/// report names them as defaults.
+fn sampling_params(section: Option<&SamplingSection>) -> Result<SamplingParams, CodegenError> {
+    let Some(s) = section else {
+        return Ok(SamplingParams::default());
+    };
+    let wrote_anything = s.temperature.is_some() || s.top_k.is_some() || s.top_p.is_some();
+    if !wrote_anything {
+        // `sampling: fused: true` alone: the defaults, by request.
+        return Ok(SamplingParams::default());
     }
+    if let Some(k) = s.top_k
+        && !(1..=MAX_TOP_K).contains(&k)
+    {
+        return Err(CodegenError::new(format!(
+            "CFIE sampling: top_k {k} is not supported — the fused sampler keeps at most \
+             {MAX_TOP_K} candidates. Use a top_k in 1..={MAX_TOP_K}."
+        )));
+    }
+    let temperature = s.temperature.unwrap_or(1.0) as f32;
+    if temperature == 0.0 {
+        // Greedy: top_k and top_p cannot change an argmax.
+        return Ok(SamplingParams {
+            strategy: SamplingStrategy::Greedy,
+            temperature: 0.0,
+            top_k: s.top_k.unwrap_or(1) as u32,
+            ..SamplingParams::default()
+        });
+    }
+    let Some(top_k) = s.top_k else {
+        return Err(CodegenError::new(format!(
+            "CFIE sampling: a non-zero temperature needs `top_k` (1..={MAX_TOP_K}). The fused \
+             sampler draws from a candidate list of at most {MAX_TOP_K} tokens and cannot sample \
+             the whole vocabulary; it will not pick a top_k for you. Add `top_k:`, or set \
+             `temperature: 0.0` for greedy decoding."
+        )));
+    };
+    Ok(match s.top_p {
+        Some(top_p) => SamplingParams {
+            strategy: SamplingStrategy::TopKTopP,
+            temperature,
+            top_k: top_k as u32,
+            top_p: top_p as f32,
+            ..SamplingParams::default()
+        },
+        None => SamplingParams {
+            strategy: SamplingStrategy::TopK,
+            temperature,
+            top_k: top_k as u32,
+            top_p: 1.0,
+            ..SamplingParams::default()
+        },
+    })
 }
 
-fn sampling_params(section: Option<&SamplingSection>) -> SamplingParams {
-    let mut params = SamplingParams::default();
-    if let Some(s) = section {
-        if let Some(t) = s.temperature {
-            params.temperature = t as f32;
-        }
-        if let Some(k) = s.top_k {
-            params.top_k = k.max(1) as u32;
-        }
-        if let Some(p) = s.top_p {
-            params.top_p = p as f32;
-        }
-        params.strategy = if params.temperature == 0.0 {
-            SamplingStrategy::Greedy
-        } else if s.top_p.is_some() {
-            SamplingStrategy::TopKTopP
-        } else if s.top_k.is_some() {
-            SamplingStrategy::TopK
-        } else {
-            SamplingStrategy::TopKTopP
-        };
-    }
-    params
-}
-
-/// KV-quant thresholds for the requested choice.  `auto` uses the
-/// planner's tuned thresholds; the uniform choices force every layer to
-/// one side of the sensitivity bands (scores live in [0, 1]).
-fn kv_quant_config(choice: Option<&str>, shape: &ResolvedModelShape) -> KvQuantConfig {
-    let mut cfg = KvQuantConfig::new(shape.n_layers, shape.n_kv_heads, shape.head_dim);
+/// What the `kv_quant` key asks for. The KV pool is FP16 in every layer:
+/// that is the only precision the decode block writes and reads.
+///
+/// * absent, `"uniform_fp16"` / `"fp16"`, `"off"`: FP16, which is what
+///   the build does. `Ok(false)`.
+/// * `"auto"`: FP16 as well, plus the advisory per-layer ranking in the
+///   build report, labelled as not applied. `Ok(true)`.
+/// * `"uniform_int8"` / `"int8"`: refused. No kernel stores INT8 keys or
+///   values, so an INT8 pool could only be read, never filled.
+fn kv_quant_advisory(choice: Option<&str>) -> Result<bool, CodegenError> {
     match choice {
-        Some("uniform_fp16") | Some("fp16") => {
-            // Every layer scores above `high_threshold` => stays FP16.
-            cfg.high_threshold = -1.0;
-            cfg.low_threshold = -2.0;
-        }
-        Some("uniform_int8") | Some("int8") => {
-            // Every layer scores below `low_threshold` => full INT8.
-            cfg.low_threshold = 2.0;
-            cfg.high_threshold = 3.0;
-        }
-        _ => {}
+        Some("uniform_int8") | Some("int8") => Err(CodegenError::new(
+            "CFIE kv_quant: INT8 KV is not supported — no kernel quantizes keys or values \
+             into the cache, so an INT8 pool could never be filled. Use \
+             `kv_quant: \"uniform_fp16\"` (or drop the key)."
+                .to_string(),
+        )),
+        Some("auto") => Ok(true),
+        _ => Ok(false),
     }
-    cfg
 }
 
 /// Resolve whether CFIE runs for this serve block, and in which mode.
@@ -533,6 +565,60 @@ pub fn resolve_mode(
     })
 }
 
+/// The `speculative:` section as the one configuration that has a driver:
+/// a greedy draft model compiled into the binary (`draft_weights`),
+/// proposing a linear chain of `tokens` tokens. Everything else the
+/// section can say is refused, because nothing would honour it.
+fn speculative_config(sp: &SpeculativeSection) -> Result<SpeculativeConfig, CodegenError> {
+    let refuse = |what: String| Err(CodegenError::new(format!("CFIE speculative: {what}")));
+    if let Some(draft) = sp.draft_path.as_deref() {
+        return refuse(format!(
+            "the `draft` key is not supported ('{draft}'): nothing loads it. Name the draft \
+             checkpoint with `draft_weights: \"<path.safetensors>\"` plus the draft_* shape \
+             keys (draft_n_layers/draft_d_model/draft_n_heads/draft_n_kv_heads/\
+             draft_head_dim/draft_d_ff)."
+        ));
+    }
+    if let Some(method) = sp.method.as_deref()
+        && method != "standard"
+    {
+        return refuse(format!(
+            "method \"{method}\" is not supported. The driver drafts a linear chain of tokens \
+             (method \"standard\"); tree, medusa and lookahead drafting have no driver. Use \
+             `method: \"standard\"` or drop the key."
+        ));
+    }
+    if sp.tree_width.is_some() {
+        return refuse(
+            "`tree_width` is not supported: there is no tree drafting. Remove the key."
+                .to_string(),
+        );
+    }
+    if let Some(t) = sp.temperature
+        && t != 0.0
+    {
+        return refuse(format!(
+            "`temperature: {t}` is not supported: the draft model is greedy. Remove the key \
+             (the TARGET's sampling is set in the sampling: section and is what the output \
+             follows)."
+        ));
+    }
+    if sp.draft_weights.is_none() {
+        return refuse(
+            "the section needs `draft_weights: \"<path.safetensors>\"`. Without a draft model \
+             there is nothing to speculate with, and generate() would run plain decoding \
+             while the build report described speculation. Add the draft checkpoint or \
+             remove the section."
+                .to_string(),
+        );
+    }
+    let k_tokens = sp.tokens.unwrap_or(SpeculativeConfig::default().k_tokens as i64);
+    if !(1..=32).contains(&k_tokens) {
+        return refuse(format!("`tokens: {k_tokens}` is outside 1..=32."));
+    }
+    Ok(SpeculativeConfig { k_tokens: k_tokens as u32 })
+}
+
 /// Everything `compile_serve_block` needs to run the orchestrator.
 pub struct PreparedCfie<'a> {
     pub input: CfieInput<'a>,
@@ -549,67 +635,29 @@ pub fn prepare<'a>(
     gpu: &'a GpuSpec,
     weights: Option<&'a WeightMap>,
 ) -> Result<PreparedCfie<'a>, CodegenError> {
-    // Grammar (G12): a schema needs a tokenizer vocab to be projected
-    // from the byte-level DFA to token level — without one there is
-    // nothing kernel-consumable, so refuse rather than half-compile.
-    let grammar_dfa: Option<CompiledDfa> = match (&cfg.grammar_schema, &cfg.grammar_tokenizer) {
-        (Some(schema), Some(tokenizer)) => {
-            let schema_src = std::fs::read_to_string(schema).map_err(|e| {
-                CodegenError::new(format!(
-                    "CFIE grammar: cannot read schema '{schema}': {e}"
-                ))
-            })?;
-            let vocab = TokenVocab::load(std::path::Path::new(tokenizer))
-                .map_err(|e| CodegenError::new(format!("CFIE grammar: {e}")))?;
-            let dfa = dfa_from_json_schema(&schema_src, &vocab).map_err(|e| {
-                CodegenError::new(format!(
-                    "CFIE grammar fusion (schema '{schema}'): {e}"
-                ))
-            })?;
-            Some(dfa)
-        }
-        (Some(schema), None) => {
+    if let Some(schema) = cfg.grammar_schema.as_deref() {
+        return Err(CodegenError::new(format!(
+            "CFIE grammar: grammar-constrained decoding is not supported (schema \
+             '{schema}'). The decode loop does not advance the grammar's automaton from \
+             token to token and has no end-of-sequence rule, so a `grammar:` section would \
+             hold every token to the set allowed at the start. Remove the section."
+        )));
+    }
+    let speculative = match cfg.speculative.as_ref() {
+        None => None,
+        // Only full mode plans speculation. In `sampling` mode the section
+        // would be dropped and generate() would run plain decoding.
+        Some(_) if mode != CfieMode::Full => {
             return Err(CodegenError::new(format!(
-                "CFIE grammar fusion: JSON-schema '{schema}' cannot be \
-                 token-projected without a tokenizer vocabulary (audit \
-                 gap G12). Add `tokenizer: \"vocab.txt\"` (one token \
-                 per line) or `tokenizer: \"vocab.json\"` (JSON string \
-                 array) to the grammar: section, or remove the section."
+                "CFIE speculative: the section needs CFIE mode `full`; mode `{}` does not \
+                 plan speculative decoding. Remove the section or the mode override.",
+                mode.as_str()
             )));
         }
-        _ => None,
+        Some(sp) => Some(speculative_config(sp)?),
     };
-    if let Some(draft) = cfg.speculative.as_ref().and_then(|s| s.draft_path.as_deref()) {
-        // The legacy `draft:` key predates the landed G15 path and was
-        // never loaded; keep refusing it, but point at the REAL
-        // mechanism now that draft-in-binary exists (Cycle 13).
-        return Err(CodegenError::new(format!(
-            "CFIE compiled speculative: the legacy `draft` key is not \
-             loaded ('{draft}').  Draft-model-in-binary landed (G15): \
-             use `draft_weights: \"<path.safetensors>\"` plus the \
-             draft_* shape keys (draft_n_layers/draft_d_model/\
-             draft_n_heads/draft_n_kv_heads/draft_head_dim/draft_d_ff) \
-             in the speculative: section, or remove the `draft` key for \
-             plan-only speculative structure."
-        )));
-    }
 
     let shape = resolve_model_shape(cfg, weights);
-
-    // The sampler kernel's grammar-mask row stride is baked from the
-    // LM-head vocab; a tokenizer of a different size would silently
-    // index the wrong rows once the mask is bound (G16 seam) — enforce
-    // equality at the only point that sees both numbers.
-    if let Some(dfa) = grammar_dfa.as_ref()
-        && dfa.vocab_size != shape.vocab_size
-    {
-        return Err(CodegenError::new(format!(
-            "CFIE grammar fusion: tokenizer vocabulary has {} tokens but the \
-                 model's vocab_size is {} — the baked mask row stride requires \
-                 them to match. Fix the tokenizer file or the vocab_size key.",
-            dfa.vocab_size, shape.vocab_size
-        )));
-    }
 
     let max_seq = cfg.max_seq.unwrap_or(4096).max(1) as u32;
     let max_batch = cfg.max_batch.unwrap_or(32).max(1) as u32;
@@ -649,39 +697,23 @@ pub fn prepare<'a>(
     };
     let gpu_budget = crate::cfie_persistent::gpu_budget_from_spec(gpu);
 
-    let speculative = cfg.speculative.as_ref().map(|s| {
-        let mut spec = SpeculativeConfig::default();
-        if let Some(m) = s.method.as_deref().and_then(parse_draft_method) {
-            spec.method = m;
-        }
-        if let Some(k) = s.tokens {
-            spec.k_tokens = k.clamp(1, 32) as u32;
-        }
-        if let Some(w) = s.tree_width {
-            spec.tree_width = w.clamp(1, 8) as u32;
-        }
-        if let Some(t) = s.temperature {
-            spec.draft_temperature = t as f32;
-        }
-        spec
-    });
-
     let input = CfieInput {
         mode,
         target_gpu: gpu.name,
         kv_shape,
         kv_budget,
         lm_head,
-        sampling: sampling_params(cfg.sampling.as_ref()),
+        sampling: sampling_params(cfg.sampling.as_ref())?,
+        sampling_configured: cfg.sampling.as_ref().is_some_and(|s| {
+            s.temperature.is_some() || s.top_k.is_some() || s.top_p.is_some()
+        }),
         persistent_model,
         gpu_budget,
         max_active_requests: max_batch,
-        kv_quant: kv_quant_config(cfg.kv_quant.as_deref(), &shape),
+        kv_quant: KvQuantConfig::new(shape.n_layers, shape.n_kv_heads, shape.head_dim),
+        kv_quant_advisory: kv_quant_advisory(cfg.kv_quant.as_deref())?,
         weights,
         speculative,
-        speculative_acceptance: DEFAULT_SPECULATIVE_ACCEPTANCE,
-        grammar: None,
-        grammar_dfa,
     };
 
     Ok(PreparedCfie { input, shape })
@@ -694,7 +726,6 @@ pub fn prepare<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cfie_kv_quant::plan as plan_kv_quant;
     use crate::gpu_specs::find_gpu;
 
     fn cfg_with(kv_layout: Option<&str>) -> CfieServeConfig {
@@ -762,189 +793,154 @@ mod tests {
         assert!(plan.kv.uses_direct_indexing(), "H100 fits static layout");
     }
 
+
+    fn refusal(cfg: &CfieServeConfig) -> String {
+        let gpu = find_gpu("H100").unwrap();
+        match prepare(cfg, CfieMode::Full, gpu, None) {
+            Err(e) => e.message,
+            Ok(_) => panic!("this configuration must be refused"),
+        }
+    }
+
     #[test]
-    fn grammar_schema_without_tokenizer_refuses_loudly() {
+    fn a_grammar_section_is_refused() {
         let mut cfg = cfg_with(Some("static"));
         cfg.grammar_schema = Some("schema.json".to_string());
-        let gpu = find_gpu("H100").unwrap();
-        let err = match prepare(&cfg, CfieMode::Full, gpu, None) {
-            Err(e) => e,
-            Ok(_) => panic!("schema without tokenizer cannot be token-projected"),
-        };
-        assert!(
-            err.message.contains("G12") && err.message.contains("tokenizer"),
-            "refusal must cite the audit gap and the fix: {}",
-            err.message
-        );
+        cfg.grammar_tokenizer = Some("vocab.txt".to_string());
+        let msg = refusal(&cfg);
+        assert!(msg.contains("grammar-constrained decoding is not supported"), "{msg}");
+        assert!(msg.contains("schema.json"), "{msg}");
     }
 
     #[test]
-    fn grammar_schema_with_tokenizer_compiles_token_dfa() {
-        let dir = tempfile::tempdir().unwrap();
-        let schema = dir.path().join("schema.json");
-        std::fs::write(&schema, r#"{"type": "boolean"}"#).unwrap();
-        let vocab = dir.path().join("vocab.txt");
-        std::fs::write(&vocab, "true\nfalse\nx\n").unwrap();
-
+    fn int8_kv_is_refused_and_auto_is_advisory() {
         let mut cfg = cfg_with(Some("static"));
-        // The mask row stride is baked from the LM-head vocab, so the
-        // tokenizer size must equal the model vocab_size.
-        cfg.vocab_size = Some(3);
-        cfg.grammar_schema = Some(schema.display().to_string());
-        cfg.grammar_tokenizer = Some(vocab.display().to_string());
+        for spelling in ["uniform_int8", "int8"] {
+            cfg.kv_quant = Some(spelling.to_string());
+            let msg = refusal(&cfg);
+            assert!(msg.contains("INT8 KV is not supported"), "{msg}");
+        }
         let gpu = find_gpu("H100").unwrap();
-        let prepared = prepare(&cfg, CfieMode::Full, gpu, None).unwrap();
-        let dfa = prepared
-            .input
-            .grammar_dfa
-            .as_ref()
-            .expect("schema + tokenizer must yield a token DFA");
-        assert_eq!(dfa.vocab_size, 3);
-        // Tokens "true"/"false" valid from start; "x" is not.
-        assert!(dfa.is_valid(dfa.start_state, 0));
-        assert!(dfa.is_valid(dfa.start_state, 1));
-        assert!(!dfa.is_valid(dfa.start_state, 2));
+        for (choice, advisory) in [
+            (None, false),
+            (Some("uniform_fp16"), false),
+            (Some("fp16"), false),
+            (Some("off"), false),
+            (Some("auto"), true),
+        ] {
+            cfg.kv_quant = choice.map(str::to_string);
+            let prepared = prepare(&cfg, CfieMode::Full, gpu, None).unwrap();
+            assert_eq!(prepared.input.kv_quant_advisory, advisory, "{choice:?}");
+        }
+    }
 
-        let plan = crate::cfie::run(prepared.input);
-        assert!(plan.grammar.is_some());
-        assert!(plan.sampling.params.grammar_masked);
+    fn section(temperature: Option<f64>, top_k: Option<i64>, top_p: Option<f64>) -> SamplingSection {
+        SamplingSection { temperature, top_k, top_p, fused: Some(true), seed: None }
     }
 
     #[test]
-    fn grammar_tokenizer_vocab_size_mismatch_refuses() {
-        let dir = tempfile::tempdir().unwrap();
-        let schema = dir.path().join("schema.json");
-        std::fs::write(&schema, r#"{"type": "boolean"}"#).unwrap();
-        let vocab = dir.path().join("vocab.txt");
-        std::fs::write(&vocab, "true\nfalse\nx\n").unwrap();
-
-        let mut cfg = cfg_with(Some("static"));
-        // cfg_with sets vocab_size = 49152; the 3-token tokenizer must
-        // refuse instead of silently mis-striding the baked mask.
-        cfg.grammar_schema = Some(schema.display().to_string());
-        cfg.grammar_tokenizer = Some(vocab.display().to_string());
-        let gpu = find_gpu("H100").unwrap();
-        let err = match prepare(&cfg, CfieMode::Full, gpu, None) {
-            Err(e) => e,
-            Ok(_) => panic!("vocab-size mismatch must refuse"),
-        };
-        assert!(
-            err.message.contains("vocab_size"),
-            "refusal must explain the mismatch: {}",
-            err.message
-        );
-    }
-
-    #[test]
-    fn grammar_missing_files_refuse_with_context() {
-        let mut cfg = cfg_with(Some("static"));
-        cfg.grammar_schema = Some("does_not_exist.json".to_string());
-        cfg.grammar_tokenizer = Some("also_missing.txt".to_string());
-        let gpu = find_gpu("H100").unwrap();
-        let err = match prepare(&cfg, CfieMode::Full, gpu, None) {
-            Err(e) => e,
-            Ok(_) => panic!("missing schema file must refuse"),
-        };
-        assert!(
-            err.message.contains("does_not_exist.json"),
-            "error must name the file: {}",
-            err.message
-        );
-    }
-
-    #[test]
-    fn uniform_kv_quant_choices_land_all_layers_on_one_side() {
-        let shape = resolve_model_shape(&cfg_with(None), None);
-
-        let int8 = plan_kv_quant(&kv_quant_config(Some("uniform_int8"), &shape), None);
-        assert_eq!(int8.int8_layer_count() as u32, shape.n_layers);
-
-        let fp16 = plan_kv_quant(&kv_quant_config(Some("uniform_fp16"), &shape), None);
-        assert_eq!(fp16.int8_layer_count(), 0);
-    }
-
-    #[test]
-    fn sampling_section_maps_to_params() {
-        let s = SamplingSection {
-            temperature: Some(0.0),
-            top_k: Some(50),
-            top_p: Some(0.9),
-            fused: Some(true),
-        };
-        let p = sampling_params(Some(&s));
+    fn sampling_section_maps_to_params_without_filling_anything_in() {
+        // temperature 0: greedy, whatever else is written.
+        let p = sampling_params(Some(&section(Some(0.0), Some(50), Some(0.9)))).unwrap();
         assert_eq!(p.strategy, SamplingStrategy::Greedy);
 
-        let s2 = SamplingSection {
-            temperature: Some(0.7),
-            top_k: Some(50),
-            top_p: Some(0.9),
-            fused: Some(true),
-        };
-        let p2 = sampling_params(Some(&s2));
-        assert_eq!(p2.strategy, SamplingStrategy::TopKTopP);
-        assert_eq!(p2.top_k, 50);
-    }
+        let p = sampling_params(Some(&section(Some(0.7), Some(50), Some(0.9)))).unwrap();
+        assert_eq!(p.strategy, SamplingStrategy::TopKTopP);
+        assert_eq!((p.temperature, p.top_k, p.top_p), (0.7, 50, 0.9));
 
-    #[test]
-    fn speculative_section_maps_to_config() {
-        let mut cfg = cfg_with(Some("static"));
-        cfg.speculative = Some(SpeculativeSection {
-            draft_path: None,
-            tokens: Some(5),
-            method: Some("tree".to_string()),
-            tree_width: Some(2),
-            temperature: Some(0.0),
-            ..Default::default()
-        });
-        let gpu = find_gpu("H100").unwrap();
-        let prepared = prepare(&cfg, CfieMode::Full, gpu, None).unwrap();
-        let spec = prepared.input.speculative.expect("speculative config");
-        assert_eq!(spec.method, DraftMethod::Tree);
-        assert_eq!(spec.k_tokens, 5);
-        assert_eq!(spec.tree_width, 2);
-    }
-
-    #[test]
-    fn speculative_legacy_draft_key_refuses_and_points_at_draft_weights() {
-        let mut cfg = cfg_with(Some("static"));
-        cfg.speculative = Some(SpeculativeSection {
-            draft_path: Some("draft.nslm".to_string()),
-            tokens: Some(5),
-            method: Some("tree".to_string()),
-            tree_width: Some(2),
-            temperature: Some(0.0),
-            ..Default::default()
-        });
-        let gpu = find_gpu("H100").unwrap();
-        let err = match prepare(&cfg, CfieMode::Full, gpu, None) {
-            Err(e) => e,
-            Ok(_) => panic!("the legacy draft key is never loaded and must refuse"),
-        };
-        assert!(
-            err.message.contains("draft_weights"),
-            "refusal must point at the landed G15 mechanism: {}",
-            err.message
+        // No top_p: no nucleus filter. It used to become 0.9.
+        let p = sampling_params(Some(&section(Some(0.7), Some(40), None))).unwrap();
+        assert_eq!(p.strategy, SamplingStrategy::TopK);
+        assert_eq!((p.temperature, p.top_k), (0.7, 40));
+        let prog = crate::cfie_fused_sample::emit_program(
+            p,
+            LmHeadShape { d_model: 8, vocab_size: 128, vocab_tile: 128, dtype_bytes: 2 },
         );
+        assert!(
+            !prog.ops.iter().any(|op| matches!(op, crate::cfie_fused_sample::FusedSampleOp::NucleusFilter { .. })),
+            "no nucleus filter without top_p"
+        );
+
+        // top_k without a temperature: temperature 1.
+        let p = sampling_params(Some(&section(None, Some(8), None))).unwrap();
+        assert_eq!((p.strategy, p.temperature, p.top_k), (SamplingStrategy::TopK, 1.0, 8));
+
+        // No section, or a section that only says `fused: true`: the
+        // documented defaults.
+        let d = SamplingParams::default();
+        for p in [sampling_params(None).unwrap(), sampling_params(Some(&section(None, None, None))).unwrap()] {
+            assert_eq!((p.strategy, p.temperature, p.top_k, p.top_p), (d.strategy, d.temperature, d.top_k, d.top_p));
+        }
     }
 
     #[test]
-    fn speculative_draft_weights_key_passes_prepare() {
-        // `draft_weights` (the landed G15 path) is consumed by the
-        // serve wiring, not by prepare() — prepare must NOT refuse it.
-        let mut cfg = cfg_with(Some("static"));
-        cfg.speculative = Some(SpeculativeSection {
+    fn a_temperature_without_top_k_is_refused() {
+        let err = sampling_params(Some(&section(Some(0.7), None, None))).unwrap_err();
+        assert!(err.message.contains("a non-zero temperature needs `top_k`"), "{}", err.message);
+        let err = sampling_params(Some(&section(Some(0.7), None, Some(0.9)))).unwrap_err();
+        assert!(err.message.contains("needs `top_k`"), "{}", err.message);
+    }
+
+    #[test]
+    fn a_top_k_the_sampler_cannot_hold_is_refused() {
+        let err = sampling_params(Some(&section(Some(0.7), Some(100), Some(0.9)))).unwrap_err();
+        assert!(err.message.contains("top_k 100 is not supported"), "{}", err.message);
+        assert!(sampling_params(Some(&section(Some(0.7), Some(64), None))).is_ok());
+    }
+
+    fn draft_section() -> SpeculativeSection {
+        SpeculativeSection {
             tokens: Some(3),
             method: Some("standard".to_string()),
             draft_weights: Some("draft.safetensors".to_string()),
             draft_n_layers: Some(2),
             ..Default::default()
-        });
+        }
+    }
+
+    #[test]
+    fn a_speculative_section_with_a_draft_model_is_accepted() {
+        let mut cfg = cfg_with(Some("static"));
+        cfg.speculative = Some(draft_section());
         let gpu = find_gpu("H100").unwrap();
-        let prepared =
-            prepare(&cfg, CfieMode::Full, gpu, None).expect("draft_weights must not refuse");
-        assert_eq!(
-            prepared.input.speculative.expect("speculative config").k_tokens,
-            3
-        );
+        let prepared = prepare(&cfg, CfieMode::Full, gpu, None).unwrap();
+        assert_eq!(prepared.input.speculative, Some(SpeculativeConfig { k_tokens: 3 }));
+        // `temperature: 0.0` says what the draft does anyway.
+        cfg.speculative = Some(SpeculativeSection { temperature: Some(0.0), ..draft_section() });
+        assert!(prepare(&cfg, CfieMode::Full, gpu, None).is_ok());
+    }
+
+    /// `--cfie sampling` (or `@cfie(mode=sampling)`) plans no speculation;
+    /// a `speculative:` section must not be dropped without a word.
+    #[test]
+    fn a_speculative_section_outside_full_mode_is_refused() {
+        let mut cfg = cfg_with(Some("static"));
+        cfg.speculative = Some(draft_section());
+        let gpu = find_gpu("H100").unwrap();
+        let err = match prepare(&cfg, CfieMode::Sampling, gpu, None) {
+            Err(e) => e.message,
+            Ok(_) => panic!("must be refused"),
+        };
+        assert!(err.contains("needs CFIE mode `full`; mode `sampling`"), "{err}");
+        cfg.speculative = None;
+        assert!(prepare(&cfg, CfieMode::Sampling, gpu, None).is_ok());
+    }
+
+    #[test]
+    fn speculative_requests_nothing_honours_are_refused() {
+        let cases: [(SpeculativeSection, &str); 6] = [
+            (SpeculativeSection { method: Some("tree".into()), ..draft_section() }, "method \"tree\" is not supported"),
+            (SpeculativeSection { method: Some("medusa".into()), ..draft_section() }, "method \"medusa\" is not supported"),
+            (SpeculativeSection { tree_width: Some(2), ..draft_section() }, "`tree_width` is not supported"),
+            (SpeculativeSection { temperature: Some(0.8), ..draft_section() }, "`temperature: 0.8` is not supported"),
+            (SpeculativeSection { draft_weights: None, ..draft_section() }, "needs `draft_weights"),
+            (SpeculativeSection { draft_path: Some("draft.nslm".into()), ..draft_section() }, "the `draft` key is not supported"),
+        ];
+        for (section, expect) in cases {
+            let mut cfg = cfg_with(Some("static"));
+            cfg.speculative = Some(section);
+            let msg = refusal(&cfg);
+            assert!(msg.contains(expect), "expected `{expect}` in: {msg}");
+        }
     }
 }

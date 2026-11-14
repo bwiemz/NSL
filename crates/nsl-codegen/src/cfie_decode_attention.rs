@@ -246,15 +246,10 @@ pub(crate) fn load(b: &mut KirBuilder, ty: KirType, addr: VarId, space: AddressS
 /// and how one becomes an f32.
 #[derive(Clone, Copy)]
 pub(crate) struct HalfReader {
-    /// Points at element 0 of the half's addressing: the pool itself for
-    /// the uniform layout (the plane offset is then an element index), the
-    /// half's own first element for a baked one.
+    /// The pool: element 0 of the half's addressing.
     base: VarId,
-    /// Element index of the half inside `base`, if it is not 0.
-    plane: Option<VarId>,
-    /// `None`: f16, widened. `Some(scale)`: int8, converted and multiplied
-    /// by `scale` — dequantized in registers.
-    int8_scale: Option<VarId>,
+    /// Element index of the half inside `base`.
+    plane: VarId,
 }
 
 impl HalfReader {
@@ -273,61 +268,32 @@ impl HalfReader {
         let kv_half = konst(b, ConstValue::U64(kv_half_stride));
         let v_plane = op2(b, KirType::U64, KirOp::Add, k_plane, kv_half);
         (
-            HalfReader { base: kv_base, plane: Some(k_plane), int8_scale: None },
-            HalfReader { base: kv_base, plane: Some(v_plane), int8_scale: None },
+            HalfReader { base: kv_base, plane: k_plane },
+            HalfReader { base: kv_base, plane: v_plane },
         )
     }
 
-    fn elem(&self) -> KirType {
-        if self.int8_scale.is_some() { KirType::I8 } else { KirType::F16 }
-    }
-
-    /// The element at index `index` (relative to `base`), as f32.
+    /// The f16 element at index `index` (relative to `base`), as f32.
     fn load(&self, b: &mut KirBuilder, index: VarId) -> VarId {
-        let elem = self.elem();
-        let addr = at(b, elem.clone(), AddressSpace::Global, self.base, index);
-        let raw = load(b, elem, addr, AddressSpace::Global);
+        let addr = at(b, KirType::F16, AddressSpace::Global, self.base, index);
+        let raw = load(b, KirType::F16, addr, AddressSpace::Global);
         let wide = b.new_typed_var(KirType::F32);
         b.emit(KirOp::Cast(wide, raw, KirType::F32));
-        match self.int8_scale {
-            None => wide,
-            Some(scale) => op2(b, KirType::F32, KirOp::Mul, wide, scale),
-        }
+        wide
     }
 
     /// `row` shifted into this half's plane.
     pub(crate) fn in_plane(&self, b: &mut KirBuilder, row: VarId) -> VarId {
-        match self.plane {
-            Some(plane) => op2(b, KirType::U64, KirOp::Add, plane, row),
-            None => row,
-        }
+        op2(b, KirType::U64, KirOp::Add, self.plane, row)
     }
 }
 
-/// The pool the shared flash-decode builder reads.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum PoolLayout {
-    /// `[n_layers][2][max_tokens][n_kv_heads][head_dim]`, f16 throughout;
-    /// the layer is the runtime `layer_idx` param. This module's kernel.
-    UniformF16,
-    /// One layer, its K and V halves at baked byte offsets from `kv_base`,
-    /// each f16 or int8; an int8 half is dequantized by the runtime
-    /// `k_scale` / `v_scale` param. `cfie_kv_quant_ptx`'s per-layer
-    /// kernels.
-    Baked { k: BakedHalf, v: BakedHalf },
-}
-
-/// One half of a [`PoolLayout::Baked`] layer.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct BakedHalf {
-    /// Byte offset of the half's first element from `kv_base`. A multiple
-    /// of the element size, which the caller checks.
-    pub offset_bytes: u64,
-    pub int8: bool,
-}
-
-/// What the shared flash-decode builder needs: the entry name, the
-/// geometry, and the pool it reads.
+/// What the flash-decode builder needs: the entry name and the geometry.
+/// The pool is `[n_layers][2][max_tokens][n_kv_heads][head_dim]`, f16
+/// throughout; the layer is the runtime `layer_idx` param. (A second
+/// layout, with int8 halves dequantized by a launch-time scale, served
+/// per-layer INT8 read kernels that nothing wrote KV for; it was removed
+/// with them.)
 #[derive(Debug, Clone)]
 pub(crate) struct FlashDecode<'a> {
     pub name: &'a str,
@@ -336,7 +302,6 @@ pub(crate) struct FlashDecode<'a> {
     pub head_dim: u32,
     pub per_slot_max_tokens: u32,
     pub max_slots: u32,
-    pub pool: PoolLayout,
 }
 
 /// Build the direct-indexing decode-attention kernel as KIR.
@@ -387,30 +352,13 @@ pub fn build(cfg: &DecodeAttentionConfig) -> KernelIR {
         head_dim: cfg.head_dim,
         per_slot_max_tokens: cfg.per_slot_max_tokens,
         max_slots: cfg.max_slots,
-        pool: PoolLayout::UniformF16,
     })
 }
 
-/// The flash-decode kernel [`build`] documents, over either pool layout.
-///
-/// The two layouts differ only in the entry's parameters and in where a
-/// K or V element is read from; the CFG, the shared regions and every
-/// floating-point operation are the same:
-///
-/// * [`PoolLayout::UniformF16`] takes `(q_ptr, kv_base, out_ptr,
-///   layer_idx, slot_idx, seq_len)` and indexes the pool in f16 elements,
-///   the layer's K plane at `layer_idx * layer_stride` and V a half-stride
-///   later.
-/// * [`PoolLayout::Baked`] takes `(q_ptr, kv_base, out_ptr, slot_idx,
-///   seq_len, k_scale, v_scale)`. `kv_base` is a byte pointer; each half
-///   starts at its baked byte offset and is indexed in its own element
-///   type. An int8 element is converted and multiplied by its half's
-///   scale param before it enters the dot product or the accumulator. An
-///   f16 half never reads its scale; the param is declared anyway, so
-///   every layer's kernel shares one launch ABI.
-///
-/// The caller has checked the geometry (and, for a baked layout, the
-/// offsets' alignment).
+/// The flash-decode kernel [`build`] documents. It takes `(q_ptr,
+/// kv_base, out_ptr, layer_idx, slot_idx, seq_len)` and indexes the pool
+/// in f16 elements, the layer's K plane at `layer_idx * layer_stride` and
+/// V a half-stride later. The caller has checked the geometry.
 pub(crate) fn build_flash_decode(spec: &FlashDecode<'_>) -> KernelIR {
     use KirType::U32;
 
@@ -473,10 +421,6 @@ pub(crate) struct TileSpan {
     pub tcnt: VarId,
 }
 
-/// Rewrites a thread's scaled pass-1 score before it is stored (the
-/// verify kernel's tree mask). Runs in the block that stores the score.
-pub(crate) type ScoreHook<'a> = &'a dyn Fn(&mut KirBuilder, VarId) -> VarId;
-
 /// Start a flash-decode kernel: the params in FFI order, the shared
 /// layout, and the entry block's strides, `kv_head`, and region pointers.
 /// Returns with the entry block current and unterminated.
@@ -491,26 +435,11 @@ pub(crate) fn begin_flash_decode(spec: &FlashDecode<'_>) -> (KirBuilder, FlashEn
     // The direct params, in FFI order (the launcher marshals them
     // positionally).
     let q_ptr = b.add_param("q_ptr", ptr(F32, Global), Global);
-    let kv_elem = match spec.pool {
-        PoolLayout::UniformF16 => KirType::F16,
-        // A byte pointer: each half's offset is in bytes.
-        PoolLayout::Baked { .. } => KirType::I8,
-    };
-    let kv_base = b.add_param("kv_base", ptr(kv_elem, Global), Global);
+    let kv_base = b.add_param("kv_base", ptr(KirType::F16, Global), Global);
     let out_ptr = b.add_param("out_ptr", ptr(F32, Global), Global);
-    let layer_idx = match spec.pool {
-        PoolLayout::UniformF16 => Some(b.add_param("layer_idx", U32, Global)),
-        PoolLayout::Baked { .. } => None,
-    };
+    let layer_idx = b.add_param("layer_idx", U32, Global);
     let slot_idx = b.add_param("slot_idx", U32, Global);
     let seq_len = b.add_param("seq_len", U32, Global);
-    let scales = match spec.pool {
-        PoolLayout::UniformF16 => None,
-        PoolLayout::Baked { .. } => Some((
-            b.add_param("k_scale", F32, Global),
-            b.add_param("v_scale", F32, Global),
-        )),
-    };
 
     b.set_smem_layout(smem_layout(hd));
     b.set_workgroup_size([BLOCK_DIM, 1, 1]);
@@ -530,28 +459,9 @@ pub(crate) fn begin_flash_decode(spec: &FlashDecode<'_>) -> (KirBuilder, FlashEn
     let group = konst(&mut b, ConstValue::U32(spec.n_heads / spec.n_kv_heads));
     let kv_head = op2(&mut b, U32, KirOp::Div, head, group);
 
-    let (k_half, v_half) = match (spec.pool, layer_idx, scales) {
-        (PoolLayout::UniformF16, Some(layer_idx), None) => {
-            // K plane of this layer, and V = K + kv_half_stride (elements).
-            let kv_half_stride = spec.max_slots as u64 * spec.per_slot_max_tokens as u64 * token_stride_elems;
-            HalfReader::uniform_f16(&mut b, kv_base, layer_idx, kv_half_stride)
-        }
-        (PoolLayout::Baked { k, v }, None, Some((k_scale, v_scale))) => {
-            // Each half's first element: kv_base + its baked byte offset,
-            // then addressed in the half's own element type.
-            let half = |b: &mut KirBuilder, h: BakedHalf, scale: VarId| {
-                let offset = konst(b, ConstValue::U64(h.offset_bytes));
-                let start = at(b, KirType::I8, Global, kv_base, offset);
-                let elem = if h.int8 { KirType::I8 } else { KirType::F16 };
-                let base_ty = ptr(elem, Global);
-                let base = b.new_typed_var(base_ty.clone());
-                b.emit(KirOp::Cast(base, start, base_ty));
-                HalfReader { base, plane: None, int8_scale: h.int8.then_some(scale) }
-            };
-            (half(&mut b, k, k_scale), half(&mut b, v, v_scale))
-        }
-        _ => unreachable!("the params follow the pool layout"),
-    };
+    // K plane of this layer, and V = K + kv_half_stride (elements).
+    let kv_half_stride = spec.max_slots as u64 * spec.per_slot_max_tokens as u64 * token_stride_elems;
+    let (k_half, v_half) = HalfReader::uniform_f16(&mut b, kv_base, layer_idx, kv_half_stride);
 
     // The slot's first global token.
     let per_slot = konst(&mut b, ConstValue::U32(spec.per_slot_max_tokens));
@@ -649,7 +559,7 @@ pub(crate) fn prefix_pass(b: &mut KirBuilder, c: &FlashCtx, seq_len: VarId) -> (
     let tok = op2(b, U32, KirOp::Add, tile, c.tid);
     let scores = cmp(b, tok, seq_len, CmpOp::Lt);
     let span = TileSpan { first: tile, tok, scores, tcnt };
-    let (acc_next, m_next, l_next) = flash_tile(b, c, &span, (acc, m, l), None);
+    let (acc_next, m_next, l_next) = flash_tile(b, c, &span, (acc, m, l));
 
     let tile_next = op2(b, U32, KirOp::Add, tile, tile_width);
     b.terminate(KirTerminator::Branch(KirEdge::with(
@@ -669,12 +579,11 @@ pub(crate) fn prefix_pass(b: &mut KirBuilder, c: &FlashCtx, seq_len: VarId) -> (
 ///
 /// Only thread 0's `m`/`l` are meaningful: the other threads carry
 /// theirs through unchanged, as the hand kernel's untouched registers did.
-pub(crate) fn flash_tile(
+fn flash_tile(
     b: &mut KirBuilder,
     c: &FlashCtx,
     span: &TileSpan,
     state: (VarId, VarId, VarId),
-    score_hook: Option<ScoreHook<'_>>,
 ) -> (VarId, VarId, VarId) {
     use AddressSpace::Shared;
     use KirType::{F32, U32, U64};
@@ -743,10 +652,6 @@ pub(crate) fn flash_tile(
 
     b.set_block(dot_done);
     let scaled = op2(b, F32, KirOp::Mul, dot, c.inv_sqrt_hd);
-    let scaled = match score_hook {
-        Some(hook) => hook(b, scaled),
-        None => scaled,
-    };
     let score_slot = at(b, F32, Shared, c.scores, c.tid);
     b.emit(KirOp::Store(score_slot, scaled, Shared));
     b.terminate(KirTerminator::Branch(KirEdge::to(score_done)));
@@ -908,9 +813,8 @@ pub(crate) fn publish_output(
 }
 
 /// The `//` header: what the kernel bakes, in elements. Sibling kernels
-/// reading the same pool (`cfie_kv_quant_ptx`, `cfie_persistent_ptx`,
-/// `cfie_speculative_ptx`) compare their `//   <name> = <value>` lines
-/// with these byte for byte.
+/// reading the same pool (`cfie_persistent_ptx`) compare their
+/// `//   <name> = <value>` lines with these byte for byte.
 fn header_comment(cfg: &DecodeAttentionConfig, s: &KvStrides) -> String {
     let mut w = String::new();
     writeln!(w, "//").unwrap();

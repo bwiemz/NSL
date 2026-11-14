@@ -43,6 +43,10 @@ fn repo_root() -> PathBuf {
 }
 
 fn program() -> String {
+    program_with_dtype("f32")
+}
+
+fn program_with_dtype(dtype: &str) -> String {
     let targets = TARGETS
         .iter()
         .map(|t| format!("full([1], {t:.1})"))
@@ -70,7 +74,7 @@ print("B0_BEGIN")
 print(m.b)
 print("B0_END")
 
-@fused_lm_ce(enabled=true, dtype="f32", vocab_size={V}, hidden_size={H}, batch_size=1, seq_len={N}, vocab_tile=128)
+@fused_lm_ce(enabled=true, dtype="{dtype}", vocab_size={V}, hidden_size={H}, batch_size=1, seq_len={N}, vocab_tile=128)
 train(model=m, epochs=1):
     optimizer: SGD(lr={LR:.1})
     step(batch):
@@ -165,6 +169,94 @@ fn fused_linear_ce_step() {
     }
 
     compare(&before, &after, &["dx", "dW", "db"], |q| fd_grad(q, LCE));
+}
+
+/// `v` rounded to bfloat16 (round to nearest, ties to even) and widened
+/// back: what `nsl_tensor_to_bf16` stores and the kernels load.
+fn as_bf16(v: f32) -> f32 {
+    let bits = v.to_bits();
+    f32::from_bits(bits.wrapping_add(0x7FFF + ((bits >> 16) & 1)) & 0xFFFF_0000)
+}
+
+/// The gradients of the loss the bf16 kernels compute, in f64.
+///
+/// With `dtype = "bf16"` the operands are stored in bf16, and the forward
+/// stages each logit in bf16 too, so its loss is the cross-entropy of the
+/// ROUNDED logits `z = bf16(x_r . W_r + b_r)`. Its gradient with respect to
+/// those logits is `softmax(z) - onehot`, and through the (straight-through)
+/// rounding `dW = g^T x_r`, `dx = g W_r`, `db = sum_rows g`. The dot is
+/// taken in f32 with fused multiply-adds in index order, as the kernels
+/// take it, so that the rounding to bf16 lands where theirs does.
+fn bf16_grads(p: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    let stored = |v: &Vec<f64>| -> Vec<f32> { v.iter().map(|&e| as_bf16(e as f32)).collect() };
+    let (x, w, b) = (stored(&p[0]), stored(&p[1]), stored(&p[2]));
+    let valid = TARGETS.iter().filter(|t| **t >= 0.0).count() as f64;
+    let (mut dx, mut dw, mut db) = (vec![0.0; N * H], vec![0.0; V * H], vec![0.0; V]);
+    for (i, &t) in TARGETS.iter().enumerate() {
+        if t < 0.0 {
+            continue;
+        }
+        let z: Vec<f64> = (0..V)
+            .map(|v| {
+                let dot = (0..H).fold(0.0f32, |acc, h| x[i * H + h].mul_add(w[v * H + h], acc));
+                as_bf16(dot + b[v]) as f64
+            })
+            .collect();
+        let m = z.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let lse = m + z.iter().map(|l| (l - m).exp()).sum::<f64>().ln();
+        for v in 0..V {
+            let onehot = if v == t as usize { 1.0 } else { 0.0 };
+            let g = ((z[v] - lse).exp() - onehot) * SCALE / valid;
+            db[v] += g;
+            for h in 0..H {
+                dx[i * H + h] += g * w[v * H + h] as f64;
+                dw[v * H + h] += g * x[i * H + h] as f64;
+            }
+        }
+    }
+    vec![dx, dw, db]
+}
+
+/// `@fused_lm_ce(dtype = "bf16")`: the backward is the gradient of the loss
+/// the forward computed.
+///
+/// It was not. The forward's loss and saved log-sum-exp are over logits
+/// rounded to bf16; the backward took `exp(logit - lse)` from the unrounded
+/// f32 logit, so each probability was off by the factor `exp(rounding)`,
+/// up to about 4e-3 of a logit near 1, and a row's probabilities did not
+/// sum to one.
+///
+/// Two checks. Against the f64 gradients of the rounded-logit loss
+/// (`bf16_grads`), every operand within 1e-4 of its largest entry, as for
+/// f32 above. And, since that measure is dominated by the six target
+/// entries, the bias gradient entry by entry: `db[v]` is a sum of
+/// probabilities over the rows, so the old error shows in it undiluted (a
+/// root-mean-square relative error near 1e-3), against about 5e-5 of noise
+/// from reading f32 parameters back before and after the step.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn fused_linear_ce_step_bf16() {
+    let (stdout, stderr) = run(&program_with_dtype("bf16"), "lce_bf16");
+    assert!(stderr.contains("Using source-to-source AD for backward pass"), "{stderr}");
+    assert!(!stderr.contains("falling back to tape-based AD"), "{stderr}");
+    let (fwd, bwd) = (between(&stdout, "FWD")[0], between(&stdout, "BWD")[0]);
+    assert!(fwd >= 1.0 && bwd >= 1.0, "the fused kernels must have launched (fwd {fwd}, bwd {bwd})");
+
+    let before = [between(&stdout, "X0"), between(&stdout, "W0"), between(&stdout, "B0")];
+    let after = [between(&stdout, "X1"), between(&stdout, "W1"), between(&stdout, "B1")];
+    compare(&before, &after, &["dx", "dW", "db"], bf16_grads);
+
+    let want = &bf16_grads(&before)[2];
+    let mean_square: f64 = before[2]
+        .iter()
+        .zip(&after[2])
+        .zip(want)
+        .map(|((b, a), w)| (((b - a) / LR - w) / w).powi(2))
+        .sum::<f64>()
+        / V as f64;
+    let rms = mean_square.sqrt();
+    eprintln!("db: root-mean-square relative error {rms:.3e}");
+    assert!(rms < 2e-4, "the bias gradient is {rms:e} (rms, relative) from the gradient of the forward's loss");
 }
 
 /// Run `src` with `nsl run --source-ad` on the GPU; its (stdout, stderr).

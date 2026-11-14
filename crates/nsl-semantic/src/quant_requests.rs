@@ -16,10 +16,10 @@
 //!   and int4 and aborts the process on anything else, so a program that
 //!   checked and built died when the block ran. GPTQ's Hessian API is never
 //!   emitted, and AWQ's pre-scaled weight is never un-scaled.
-//! - **`@quantize`.** Codegen reads `dtype` (only `"awq4"`, which marks the
-//!   model for AWQ projection discovery) and logs `group_size` without using
-//!   it; every other argument fell through a `_ => {}` arm. The decorator's
-//!   arguments are now a closed set.
+//! - **`@quantize`.** Refused in every form. Codegen read `dtype` (only
+//!   `"awq4"`, which marked the model for an AWQ activation-statistics
+//!   pass whose output nothing consumed) and nothing else; that pass is
+//!   deleted, and no dtype of the decorator has an implementation.
 //!
 //! `@fp8_compute(calibrate = true)` is refused in `fp8.rs`, next to the rest
 //! of that decorator's validation.
@@ -62,52 +62,56 @@ pub fn check_quant_block_requests(quant: &QuantBlock, diagnostics: &mut Vec<Diag
     }
 }
 
-/// The one `@quantize(dtype = ...)` value codegen acts on.
-pub const QUANTIZE_DTYPES: &[&str] = &["awq4"];
+/// What to write instead of `@quantize`: the two things that do work.
+const QUANTIZE_ALTERNATIVES: &str = "Remove the decorator. To quantize weights, use a `quant` block \
+     (`default: int4` or `default: int8`); for FP8 matmuls, use `@fp8_compute`";
 
-/// Validate `@quantize(...)` on a model: at most `dtype = "awq4"`, named.
+/// Why `@quantize(dtype = "awq4")` (and bare `@quantize`, which meant the
+/// same) is refused.
+///
+/// The decorator read as "quantize this model with AWQ" and changed no
+/// weight. It selected the model's linear projections for an
+/// activation-statistics pass (and had retention copies compiled into the
+/// model's forward for it) whose output, per-channel activation maxima in a
+/// sidecar file, no quantizer read. A warning on a decorator that does
+/// nothing is the same defect as a report that claims an effect the program
+/// does not have, so the pass is deleted and the spelling refuses. `awq4`
+/// stays reserved: it is refused here and as a `quant` block default.
+pub const QUANTIZE_AWQ_REFUSAL: &str = "AWQ calibration is not implemented: this decorator selected the model \
+     for an activation-statistics pass whose output no quantizer read, so it had no effect on the model";
+
+/// Refuse `@quantize(...)` on a model. No dtype of it is implemented:
+/// nothing in the compiler reads the decorator, so every form is an error
+/// that says so and points at what does work.
 pub fn validate_quantize_decorator(
     deco: &Decorator,
     resolve_sym: &dyn Fn(Symbol) -> String,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    let Some(ref args) = deco.args else { return };
-    for arg in args {
-        let Some(name_sym) = arg.name else {
-            diagnostics.push(
-                Diagnostic::error("@quantize takes named arguments only".to_string())
-                    .with_label(arg.span, "write `dtype = \"awq4\"`"),
-            );
-            continue;
-        };
-        let name = resolve_sym(name_sym);
-        match name.as_str() {
-            "dtype" => match &arg.value.kind {
-                ExprKind::StringLiteral(s) if QUANTIZE_DTYPES.contains(&s.as_str()) => {}
-                ExprKind::StringLiteral(s) => diagnostics.push(
-                    Diagnostic::error(format!("@quantize: dtype \"{s}\" is not implemented"))
-                        .with_label(arg.span, "the only implemented @quantize dtype is \"awq4\""),
-                ),
-                _ => diagnostics.push(
-                    Diagnostic::error("@quantize: dtype must be a string literal".to_string())
-                        .with_label(arg.span, "write `dtype = \"awq4\"`"),
-                ),
-            },
-            "group_size" => diagnostics.push(
-                Diagnostic::error("@quantize: `group_size` is not implemented".to_string())
-                    .with_label(arg.span, "the group size was logged and never used; remove the argument"),
-            ),
-            _ => diagnostics.push(
-                Diagnostic::error(format!("@quantize: unknown argument '{name}'"))
-                    .with_label(arg.span, "@quantize accepts only `dtype = \"awq4\"`"),
-            ),
-        }
-    }
+    // The dtype the decorator names, if it names one as a string; bare
+    // `@quantize` historically meant "awq4".
+    let named_dtype: Option<String> = deco.args.as_ref().and_then(|args| {
+        args.iter().find_map(|arg| {
+            let name = resolve_sym(arg.name?);
+            match (&arg.value.kind, name.as_str()) {
+                (ExprKind::StringLiteral(s), "dtype") => Some(s.clone()),
+                _ => None,
+            }
+        })
+    });
+    let diagnostic = match named_dtype.as_deref() {
+        None | Some("awq4") => Diagnostic::error("@quantize(dtype=\"awq4\"): AWQ calibration is not implemented".to_string())
+            .with_label(deco.span, QUANTIZE_AWQ_REFUSAL)
+            .with_note(QUANTIZE_ALTERNATIVES),
+        Some(other) => Diagnostic::error(format!("@quantize: dtype \"{other}\" is not implemented"))
+            .with_label(deco.span, "@quantize has no implemented dtype: nothing in the compiler reads the decorator")
+            .with_note(QUANTIZE_ALTERNATIVES),
+    };
+    diagnostics.push(diagnostic);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use nsl_errors::Level;
 
     fn errors(src: &str) -> Vec<String> {
@@ -167,27 +171,50 @@ mod tests {
         format!("@quantize{args}\n{MODEL}")
     }
 
+    /// Every form of the decorator is one error. `awq4` and the bare form
+    /// (which meant awq4) say AWQ calibration is not implemented; any other
+    /// dtype says that dtype is not implemented; both point at the `quant`
+    /// block, which does quantize, and at `@fp8_compute`.
+    ///
+    /// This replaces the tests of the deleted AWQ calibration hook and its
+    /// pipeline: the decorator used to be accepted (later with a warning)
+    /// and to drive a calibration pass whose output nothing read.
     #[test]
-    fn quantize_accepts_awq4_and_no_arguments() {
-        for args in ["", "(dtype=\"awq4\")"] {
-            let e = errors(&decorated(args));
-            assert!(e.is_empty(), "{args}: {e:?}");
-        }
-    }
-
-    #[test]
-    fn quantize_refuses_what_codegen_never_read() {
+    fn quantize_is_refused_in_every_form() {
         for (args, want) in [
-            ("(dtype=\"int8\")", "dtype \"int8\" is not implemented"),
-            ("(dtype=\"gptq4\")", "dtype \"gptq4\" is not implemented"),
-            ("(dtype=4)", "dtype must be a string literal"),
-            ("(group_size=64)", "`group_size` is not implemented"),
-            ("(bits=4)", "unknown argument 'bits'"),
-            ("(\"awq4\")", "named arguments only"),
+            ("", "@quantize(dtype=\"awq4\"): AWQ calibration is not implemented"),
+            ("(dtype=\"awq4\")", "@quantize(dtype=\"awq4\"): AWQ calibration is not implemented"),
+            ("(dtype=\"awq4\", group_size=128)", "AWQ calibration is not implemented"),
+            ("(group_size=64)", "AWQ calibration is not implemented"),
+            ("(dtype=\"int8\")", "@quantize: dtype \"int8\" is not implemented"),
+            ("(dtype=\"gptq4\")", "@quantize: dtype \"gptq4\" is not implemented"),
+            ("(dtype=\"fp8\")", "@quantize: dtype \"fp8\" is not implemented"),
         ] {
             let e = errors(&decorated(args));
             assert_eq!(e.len(), 1, "{args}: {e:?}");
             assert!(e[0].contains(want), "{args}: {e:?}");
         }
+        // The undecorated model is clean, so the error is the decorator's.
+        assert!(errors(MODEL).is_empty());
+    }
+
+    /// The refusal names alternatives that exist: a `quant` block with
+    /// int4 or int8, which the next assertion shows checks clean.
+    #[test]
+    fn the_refusal_points_at_a_quant_block_that_checks() {
+        let mut interner = nsl_lexer::Interner::new();
+        let src = decorated("(dtype=\"awq4\")");
+        let (tokens, _) = nsl_lexer::tokenize(&src, nsl_errors::FileId(0), &mut interner);
+        let parsed = nsl_parser::parse(&tokens, &mut interner);
+        let analysis = crate::analyze(&parsed.module, &mut interner);
+        let refusal = analysis
+            .diagnostics
+            .iter()
+            .find(|d| d.message.contains("AWQ calibration is not implemented"))
+            .expect("the refusal");
+        let notes = refusal.notes.join(" ");
+        assert!(notes.contains("`quant` block") && notes.contains("default: int4"), "{notes}");
+        assert!(notes.contains("@fp8_compute"), "{notes}");
+        assert!(errors(&quant("    default: int4")).is_empty());
     }
 }

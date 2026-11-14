@@ -411,12 +411,9 @@ let student = Student()
              teacher_hidden = 256, batch_size = 2, seq_len = 32)
 distill(teacher = teacher, student = student, epochs = 3):
     optimizer: AdamW(lr = 1e-4)
-    loss:
+    loss:                     # optional; see "The loss: section" below
         alpha = 0.5           # hard-label CE weight; KL gets (1 - alpha)
         temperature = 2.0     # KL temperature (Hinton T^2 scaling)
-        feature_weight = 0.1  # advisory metadata for user feature losses
-        feature_layers = "auto"
-        attn_transfer = false # `true` is refused (deferred in v1)
     step(batch):
         let t_h = teacher.encode(x)
         let s_h = student.encode(x)
@@ -477,14 +474,35 @@ Semantics and constraints (v1):
   resolves only `train(...)` and reports "no train block or top-level fn
   found" for a distill-only module.
 - `fused_kl_ce(x_s, W_s, b_s, x_t, W_t, b_t, targets, alpha, T)` computes
-  `alpha*CE(student, targets) + (1-alpha)*T^2*KL(softmax(t/T) || softmax(s/T))`
-  in ONE kernel without materializing either `[rows, vocab]` logit tensor in
-  HBM. Requires the `@fused_kl_ce` decorator with all shape hints; otherwise
-  the stdlib composite runs (tape-only, so refused inside `distill`).
-  `alpha`/`temperature` must be numeric literals and must agree with the
-  `loss:` section when it sets them. v1 limits: f32 only, `vocab_size <= 8192`.
-- Every `distill` compile prints a Distillation Build Report (stderr) stating
-  what fired and what is advisory: teacher scheduling is sequential in v1
-  (two-stream overlap advisory), spectral logit compression is advisory
-  (`nsl check --cpkd-design-student` reports the effective vocabulary rank
-  and searches student architectures under a parameter budget).
+  `alpha*CE(student, targets) + (1-alpha)*T^2*KL(softmax(t/T) || softmax(s/T))`,
+  the mean over rows whose target is not negative. With the `@fused_kl_ce`
+  decorator (`enabled = true` and all shape hints) on a CUDA target it is ONE
+  kernel that materializes neither `[rows, vocab]` logit tensor in HBM;
+  `alpha`/`temperature` must then be numeric literals. Without an enabled
+  decorator, under `--target cpu`, and under `--training-reference`, it is
+  the standard library's composite of the same name, differentiated at
+  compile time like the rest of the step. The two compute the same loss.
+  Kernel limits: f32 only, `vocab_size <= 8192`, hidden sizes a multiple of
+  32. A target `>= vocab_size` aborts the run on either path.
+- **The `loss:` section** is optional and states `alpha` and `temperature`
+  for the block's `fused_kl_ce(...)` call. It does not define the loss: the
+  step body does. The call's literals must equal the section's, and a
+  section whose values no `fused_kl_ce` call consumes is a compile error.
+  `alpha` must be in `[0, 1]` and `temperature` positive, at the call as
+  well as in the section. `feature_weight` and `feature_layers` are refused
+  (feature matching is not implemented; write a feature loss in the step
+  body), as is `attn_transfer = true`.
+- **The teacher is evaluated, not trained.** Inside a method called on the
+  teacher, `dropout(...)` is the identity whatever its training argument,
+  and `is_training()` is false, so a teacher built on the stdlib `Dropout`
+  module gives the same output on every step.
+- A loss may be written as an ordinary function and called from the step:
+  source AD inlines undecorated free functions (see "Shipped AD modes" in
+  `03-automatic-differentiation.nsl.md`).
+- Every `distill` compile prints a Distillation Build Report (stderr): the
+  loss the step computes (`fused_kl_ce` and whether the kernel or the
+  composite runs it, or "the step body's own expression"), whether the
+  fused kernel fired, the frozen-teacher counts, and that teacher scheduling
+  is sequential. `nsl check --cpkd-design-student` separately searches
+  student architectures under a parameter budget and prints an advisory
+  layer map.

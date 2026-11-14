@@ -43,10 +43,13 @@ pub enum CcrPolicy {
     /// Recompute every (owned, replayable) block interior — maximum memory
     /// reduction, pays ~one extra forward of block-interior compute.
     Block,
-    /// Megatron-style selective: NEVER recompute matmul-class ops (their
-    /// outputs stay saved); replay only cheap bandwidth-bound work — norms,
-    /// RoPE, elementwise activations, softmax, reshapes. Saves less memory
-    /// than `Block` at near-zero recompute cost.
+    /// Selective: NEVER recompute matmul-class ops (their outputs stay
+    /// saved); replay only cheap bandwidth-bound work — norms, RoPE,
+    /// elementwise activations, softmax, reshapes. Saves less memory than
+    /// `Block` at near-zero recompute cost. This is the "must-save matmul,
+    /// convolution and attention" policy of PyTorch's selective activation
+    /// checkpointing; Megatron's selective recomputation is the reverse (it
+    /// recomputes the attention core and saves the linear layers).
     Selective,
 }
 
@@ -96,7 +99,7 @@ pub struct BlockSegment {
 }
 
 /// The whole-tape checkpointing decision.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct CcrPlan {
     pub segments: Vec<BlockSegment>,
     /// Final RECOMPUTE set (union over segments of interior minus
@@ -121,6 +124,20 @@ pub struct CcrPlan {
     /// are tensors by construction — the scalar-misclassification hazard
     /// cannot arise here. Empty unless compression was requested.
     pub compress: Vec<VarId>,
+    /// Per segment, in primal order: the plain matrix products the Selective
+    /// policy keeps saved (and does not compress). A candidate for release
+    /// at the segment's end when the backward turns out not to read its
+    /// value; see `per_segment_released`. Empty under the Block policy.
+    pub per_segment_kept: Vec<Vec<VarId>>,
+    /// Filled by [`apply_to_adjoint`]: interiors that are freed at their
+    /// segment's end and that the backward reads for SHAPE only, each with
+    /// the VarId of the stub that stands in for it there
+    /// (`nsl_tensor_shape_stub`). In primal order.
+    pub shape_stubs: Vec<(VarId, VarId)>,
+    /// Filled by [`apply_to_adjoint`]: per segment, the `per_segment_kept`
+    /// saves that are freed at the segment's end after all, because the
+    /// backward never reads their value.
+    pub per_segment_released: Vec<Vec<VarId>>,
 }
 
 impl CcrPlan {
@@ -162,6 +179,9 @@ impl CcrPlan {
         for seg in self.per_segment_recompute.iter_mut() {
             seg.retain(keep);
         }
+        for seg in self.per_segment_kept.iter_mut() {
+            seg.retain(|v| matches!(owned.get(v), Some(WengertType::Tensor)));
+        }
         self.recompute.retain(keep);
         self.free_eligible = self
             .recompute
@@ -176,85 +196,155 @@ impl CcrPlan {
 /// P1.c — budget-driven per-tensor SAVE/RECOMPUTE arbitration (the CCR
 /// paper's MILP, section 3.3).
 ///
-/// Structural simplification that makes the optimum EXACT: this transform
-/// recomputes each victim exactly once per backward, from always-available
-/// inputs (saved boundaries / params / earlier clones), so per-tensor
-/// costs are independent — no recompute-chain multiplicities, no DAG
-/// cycles (the paper's F-15 is impossible by construction). The MILP
-/// therefore reduces to a 0/1 knapsack: choose the SAVE subset that
-/// maximizes avoided recompute cost subject to saved-interior bytes <=
-/// budget, solved optimally by DP over a quantized budget axis.
+/// Structural simplification: this transform recomputes each victim exactly
+/// once per backward, from always-available inputs (saved boundaries /
+/// params / earlier clones), so per-tensor costs are independent — no
+/// recompute-chain multiplicities, no DAG cycles (the paper's F-15 is
+/// impossible by construction). The MILP therefore reduces to a 0/1
+/// knapsack: choose the SAVE subset that maximizes avoided recompute cost
+/// subject to saved-interior bytes <= budget, solved by DP over a quantized
+/// budget axis. The optimum is exact for the cost it is given, and that
+/// cost is an operation count estimated from static shapes
+/// ([`recompute_ops`]), not a measured time.
 pub struct CcrBudget {
     /// Bytes per VarId where the type map had a concrete shape. Vars
     /// WITHOUT a size hint cannot be budgeted and stay RECOMPUTE.
     pub sizes: HashMap<VarId, u64>,
-    /// Allowed SAVED-interior bytes across all segments (after any C-01
-    /// credit the caller applied).
+    /// Dimensions per VarId, where the type map had a concrete shape. Read
+    /// for the inner dimension of a matrix product; a var absent here falls
+    /// back to the output's own last dimension (see [`recompute_ops`]).
+    pub shapes: HashMap<VarId, Vec<u64>>,
+    /// Allowed SAVED-interior bytes across all segments: the number the
+    /// user typed, in bytes.
     pub budget_bytes: u64,
 }
 
-/// Relative cost of recomputing one output byte of this op — a bandwidth /
-/// arithmetic-intensity proxy, not a calibrated model. Matmul-class ops
-/// dominate; pure data movement is nearly free.
-fn recompute_cost_weight(op: &PrimalOp) -> u64 {
-    if selective_saves(op) {
-        25 // matmul / attention class: arithmetic-intensity-heavy
-    } else {
-        match op {
-            PrimalOp::Transpose { .. } | PrimalOp::Passthrough(_) => 1,
-            _ => 4, // norms, RoPE, elementwise, softmax: bandwidth-bound
-        }
+/// Estimated arithmetic operations to recompute one result: the value the
+/// knapsack assigns to keeping it. An operation count from static shapes,
+/// not a measurement.
+///
+///   - matrix product `[.., m, k] @ [.., k, n]`: `2 * m * n * k` per batch
+///     element (one multiply and one add per term), i.e. `2 * out_elems * k`.
+///     `k` is the last dimension of the left operand; when that operand has
+///     no static shape the output's last dimension stands in for it.
+///   - convolution: `2 * out_elems * c_in * k_h * k_w`, from the weight's
+///     shape (operand 1).
+///   - scaled dot-product attention over `[.., s, d]`: the score product and
+///     the value product, `4 * out_elems * s`.
+///   - norms, activations, softmax and the other elementwise work: a few
+///     operations per output element, counted as 4.
+///   - transposes, reshapes and other data movement: one per output element.
+///
+/// A per-output-byte class weight was used here before, which made a score
+/// product over a 64-wide head and a projection over a 4096-wide hidden
+/// state equally worth keeping.
+fn recompute_ops(op: &WengertOp, out_bytes: u64, shapes: &HashMap<VarId, Vec<u64>>) -> u64 {
+    let out_shape = shapes.get(&op.result);
+    let out_elems: u64 = match out_shape {
+        Some(dims) => dims.iter().fold(1u64, |a, d| a.saturating_mul(*d)),
+        // Sizes are byte counts at the declared dtype; f32 is the device
+        // width, and the ratio between two candidates is what matters.
+        None => out_bytes / 4,
     }
+    .max(1);
+    let operand = |i: usize| op.inputs.get(i).and_then(|v| shapes.get(v));
+    let last = |dims: &Vec<u64>| dims.last().copied().unwrap_or(1).max(1);
+    let per_elem: u64 = match &op.op {
+        PrimalOp::Conv2d { .. } => match operand(1) {
+            // weight = [c_out, c_in, k_h, k_w]
+            Some(w) if w.len() == 4 => 2u64
+                .saturating_mul(w[1].max(1))
+                .saturating_mul(w[2].max(1))
+                .saturating_mul(w[3].max(1)),
+            _ => 2,
+        },
+        PrimalOp::ScaledDotProductAttention { .. } | PrimalOp::ScaledDotProductAttentionPacked => {
+            match operand(0) {
+                // q = [.., s, d]
+                Some(q) if q.len() >= 2 => 4u64.saturating_mul(q[q.len() - 2].max(1)),
+                _ => 4,
+            }
+        }
+        p if selective_saves(p) => {
+            let k = operand(0).or(out_shape).map(last).unwrap_or(1);
+            2u64.saturating_mul(k)
+        }
+        PrimalOp::Transpose { .. } | PrimalOp::Passthrough(_) => 1,
+        _ => 4,
+    };
+    out_elems.saturating_mul(per_elem)
 }
 
-/// Knapsack granularity: 256 KiB per DP cell keeps the state table small
-/// (a 16 GiB budget = 65 536 cells) while activation tensors of interest
-/// are MiB-scale.
-const BUDGET_QUANTUM: u64 = 256 * 1024;
+/// The knapsack's budget axis has at most this many cells; the cell size is
+/// `budget / MAX_BUDGET_CELLS` bytes, rounded up to at least one byte. A
+/// fixed 256 KiB cell was used before, which charged every tensor smaller
+/// than that a full 256 KiB, so on a small model a budget of several MiB
+/// bought only a handful of tensors.
+const MAX_BUDGET_CELLS: u64 = 65_536;
 
-/// Refine a `Block`-policy plan under a byte budget: pick the SAVE subset
-/// (removed from `recompute`) that maximizes avoided recompute cost while
-/// keeping saved-interior bytes within `budget.budget_bytes`. Returns the
-/// number of tensors flipped to SAVE.
-pub fn apply_budget(plan: &mut CcrPlan, primal: &WengertList, budget: &CcrBudget) -> usize {
-    // Candidate items: recompute victims with a known size.
+/// Recompute victims the knapsack can weigh: those with a static size.
+pub fn budget_candidates(plan: &CcrPlan, sizes: &HashMap<VarId, u64>) -> usize {
+    plan.per_segment_recompute
+        .iter()
+        .flatten()
+        .filter(|v| sizes.get(v).is_some_and(|b| *b > 0))
+        .count()
+}
+
+/// Refine a plan under a byte budget: pick the SAVE subset (removed from
+/// `recompute`) that maximizes avoided recompute work ([`recompute_ops`])
+/// while keeping saved-interior bytes within `budget.budget_bytes`. Returns
+/// the number of tensors flipped to SAVE. A victim without a static size is
+/// never flipped; the caller refuses the request when no victim has one.
+/// `reads` is how the backward uses each victim ([`backward_reads`]); `None`
+/// treats every victim as recomputed.
+pub fn apply_budget(
+    plan: &mut CcrPlan,
+    primal: &WengertList,
+    budget: &CcrBudget,
+    reads: Option<&BackwardReads>,
+) -> usize {
+    // Candidate items: recompute victims with a known size that the
+    // backward would actually recompute. A victim it reads for shape only,
+    // or not at all, is never recomputed; keeping it would spend budget on
+    // nothing.
     let mut items: Vec<(VarId, u64, u64)> = Vec::new(); // (var, bytes, value)
     for victims in &plan.per_segment_recompute {
         for &v in victims {
+            if reads.is_some_and(|r| !r.value.contains(&v)) {
+                continue;
+            }
             let Some(&bytes) = budget.sizes.get(&v) else {
                 continue;
             };
             if bytes == 0 {
                 continue;
             }
-            let weight = primal
+            let value = primal
                 .find_producer(v)
-                .map(|op| recompute_cost_weight(&op.op))
+                .map(|op| recompute_ops(op, bytes, &budget.shapes))
                 .unwrap_or(1);
-            items.push((v, bytes, bytes.saturating_mul(weight)));
+            items.push((v, bytes, value));
         }
     }
-    if items.is_empty() || budget.budget_bytes < BUDGET_QUANTUM {
-        if items.is_empty() {
-            nsl_log::nsl_log!(INFO, "ccr", 
-                "[ccr] budget arbitration: no recompute victims carry static \
-                 size hints (symbolic shapes?) — keeping full recompute"
-            );
-        }
+    if items.is_empty() || budget.budget_bytes == 0 {
         return 0;
     }
 
-    let cap = (budget.budget_bytes / BUDGET_QUANTUM) as usize;
+    let quantum = budget.budget_bytes.div_ceil(MAX_BUDGET_CELLS).max(1);
+    let cap = (budget.budget_bytes / quantum) as usize;
     // dp[w] = best total value using <= w quanta; choice tracking per item.
+    // A tensor is charged its size rounded UP to whole quanta, so the bytes
+    // actually saved never exceed the budget.
     let mut dp = vec![0u64; cap + 1];
     let mut take = vec![vec![false; cap + 1]; items.len()];
     for (i, (_, bytes, value)) in items.iter().enumerate() {
-        let w = (bytes.div_ceil(BUDGET_QUANTUM)) as usize;
+        let w = (bytes.div_ceil(quantum)) as usize;
         if w > cap {
             continue;
         }
         for c in (w..=cap).rev() {
-            let cand = dp[c - w] + value;
+            let cand = dp[c - w].saturating_add(*value);
             if cand > dp[c] {
                 dp[c] = cand;
                 take[i][c] = true;
@@ -268,7 +358,7 @@ pub fn apply_budget(plan: &mut CcrPlan, primal: &WengertList, budget: &CcrBudget
         if take[i][c] {
             let (v, bytes, _) = items[i];
             saved.insert(v);
-            c -= (bytes.div_ceil(BUDGET_QUANTUM)) as usize;
+            c -= (bytes.div_ceil(quantum)) as usize;
         }
     }
     if saved.is_empty() {
@@ -732,6 +822,7 @@ fn plan_impl(
     let mut compress: Vec<VarId> = Vec::new();
     let mut segments = Vec::new();
     let mut per_segment_recompute = Vec::new();
+    let mut per_segment_kept = Vec::new();
     let mut recompute = HashSet::new();
 
     for (i, (key, start)) in anchors.iter().enumerate() {
@@ -743,6 +834,7 @@ fn plan_impl(
         let mut escaping = Vec::new();
         let mut interior = Vec::new();
         let mut seg_recompute = Vec::new();
+        let mut seg_kept = Vec::new();
 
         // CSHA-claimed attention chains: the claim table is keyed by primal
         // OpId, which a recompute clone cannot satisfy, and the fused
@@ -813,9 +905,22 @@ fn plan_impl(
             if draws_random_numbers(&op.op) {
                 continue;
             }
+            // A compressed save (present only when a caller plans again
+            // over a tape that already carries them): it IS the saved
+            // value, and its source is freed right after it.
+            if matches!(&op.op, PrimalOp::Passthrough(n) if n.starts_with("ccr_cast_")) {
+                continue;
+            }
             if policy == CcrPolicy::Selective && selective_saves(&op.op) {
                 if compress_saves {
                     compress.push(op.result);
+                } else if matches!(op.op, PrimalOp::Matmul) {
+                    // Only the plain matrix product: its backward is made of
+                    // ordinary tape ops, so "the adjoint does not name it"
+                    // means "nothing reads it". The fused members of this
+                    // class may hand their output to the backward through a
+                    // side channel the tape does not show.
+                    seg_kept.push(op.result);
                 }
                 continue;
             }
@@ -831,6 +936,7 @@ fn plan_impl(
             interior,
         });
         per_segment_recompute.push(seg_recompute);
+        per_segment_kept.push(seg_kept);
     }
 
     if recompute.is_empty() && compress.is_empty() {
@@ -868,14 +974,23 @@ fn plan_impl(
         per_segment_recompute,
         free_eligible,
         compress,
+        per_segment_kept,
+        shape_stubs: Vec::new(),
+        per_segment_released: Vec::new(),
     })
 }
 
-/// Compile-time projection of the peak concurrent ACTIVATION bytes a CCR plan
-/// implies, split into the two terms that trade off against the checkpoint
-/// stride. This is the peak-concurrent-activation model the scheduler was
-/// missing (WGGO's model is resident bytes; the runtime surfaces are measured,
-/// not predictive).
+/// Compile-time projection of the peak concurrent BLOCK-ACTIVATION bytes a
+/// CCR plan implies, split into the two terms that trade off against the
+/// checkpoint stride.
+///
+/// The figure covers the tensors produced inside the block segments and
+/// nothing else. It leaves out everything the step holds outside them (the
+/// embedding output, the final norm, the logits and the loss), the
+/// parameters, and every temporary of the backward pass. It is the right
+/// quantity for comparing one stride with another, since those other terms
+/// are the same for every stride; it is not the step's peak memory, and
+/// "fits the budget" is a statement about this figure only.
 ///
 ///   - `saved_boundary_bytes`: Σ over segments of the escaping (checkpointed)
 ///     activations — these stay resident for the whole backward. Under CSLA
@@ -906,9 +1021,11 @@ impl ActivationPeak {
 }
 
 /// Project [`ActivationPeak`] for a plan given per-VarId byte sizes (from
-/// `profiling::captures::size_hints_from_var_nodes`). Unsized vars contribute 0
-/// — an honest under-count of the unknown, matching the budget knapsack's
-/// treatment. Pure and cheap: safe to call once per candidate stride.
+/// `profiling::captures::size_hints_from_var_nodes`). A var without a size
+/// contributes 0, so the result is only meaningful when every tensor of the
+/// segments has one: callers check [`unsized_segment_tensors`] first and
+/// refuse to search on a partial map. Pure and cheap: safe to call once per
+/// candidate stride.
 pub fn project_activation_peak(
     plan: &CcrPlan,
     sizes: &HashMap<VarId, u64>,
@@ -948,6 +1065,29 @@ pub fn project_activation_peak(
         max_recompute_bytes,
         num_segments: plan.segments.len(),
     }
+}
+
+/// The tensors of a plan's segments that have no static size: every escaping
+/// or interior result the lowering owns as a tensor (`owned`, from
+/// `wengert_lower::infer_primal_owned`) and that `sizes` does not cover.
+/// [`project_activation_peak`] counts each of these as zero bytes, so a
+/// stride search over a plan where this is non-empty would compare
+/// under-counted peaks against the budget. Returned in primal order.
+pub fn unsized_segment_tensors(
+    plan: &CcrPlan,
+    owned: &HashMap<VarId, WengertType>,
+    sizes: &HashMap<VarId, u64>,
+) -> Vec<VarId> {
+    let mut out: Vec<VarId> = plan
+        .segments
+        .iter()
+        .flat_map(|seg| seg.escaping.iter().chain(seg.interior.iter()))
+        .copied()
+        .filter(|v| matches!(owned.get(v), Some(WengertType::Tensor)) && !sizes.contains_key(v))
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// The stride chosen by an `Auto` activation-budget search, with the
@@ -1067,6 +1207,9 @@ pub struct DpChoice {
     /// Estimated recompute cost of the chosen partition (ns, window applied).
     pub est_recompute_ns: u64,
     pub fits_budget: bool,
+    /// How many block anchors there were to choose from: `keep.len()` of
+    /// these were kept.
+    pub total_anchors: usize,
 }
 
 /// P5 item 21 — choose a NON-UNIFORM checkpoint partition by dynamic
@@ -1113,7 +1256,15 @@ pub fn select_partition_dp(
     let mut escape_bytes = vec![0u64; n]; // coalescible boundary surface
     let mut forced_bytes = vec![0u64; n]; // force-saved (Selective) — always resident
     let mut rc_bytes = vec![0u64; n]; // recompute transient
-    let mut ops = vec![0u64; n]; // launch-count proxy (result vars in span)
+    // Launch-count proxy: one launch per result that is actually recomputed.
+    // A block's own victims always are; its escaping results are only when
+    // the block is coalesced with the one after it (they stop being a saved
+    // boundary). Force-saved results are never recomputed and cost nothing.
+    // Counting every result here made each partition cost the same wherever
+    // launches dominate the bandwidth floor, so the choice fell to search
+    // order and a partition that recomputes strictly more could win.
+    let mut rc_launches = vec![0u64; n];
+    let mut escape_launches = vec![0u64; n];
     for (b, (seg, seg_rc)) in base
         .segments
         .iter()
@@ -1129,7 +1280,8 @@ pub fn select_partition_dp(
             }
         }
         rc_bytes[b] = sum(seg_rc);
-        ops[b] = (seg.interior.len() + seg.escaping.len()) as u64;
+        rc_launches[b] = seg_rc.len() as u64;
+        escape_launches[b] = seg.escaping.len() as u64;
     }
     let forced_total: u64 = forced_bytes.iter().sum();
 
@@ -1140,7 +1292,8 @@ pub fn select_partition_dp(
         b
     };
     let seg_cost_ns = |s: usize, e: usize| -> u64 {
-        let launches: u64 = (s..=e).map(|i| ops[i]).sum();
+        let launches: u64 = (s..=e).map(|i| rc_launches[i]).sum::<u64>()
+            + (s..e).map(|i| escape_launches[i]).sum::<u64>();
         let launch_ns =
             (launches as f64 * model.bwd_launch_factor) as u64 * model.launch_overhead_ns;
         let bytes = seg_rc_bytes(s, e);
@@ -1269,6 +1422,7 @@ pub fn select_partition_dp(
         projected_peak_bytes: pk,
         est_recompute_ns: st.cost,
         fits_budget: model.budget_bytes.is_none_or(|b| pk <= b),
+        total_anchors: n,
     })
 }
 
@@ -1312,9 +1466,18 @@ pub const DEFAULT_STRIDE_CANDIDATES: &[usize] = &[1, 2, 3, 4, 6, 8, 12, 16, 24, 
 /// order). Dummy result ids are minted per-list in the adjoint half exactly
 /// as in [`build_early_free_list`] — nothing reads them; each list is lowered
 /// by its own `compile_wengert_ops` call.
+///
+/// Two additions made by [`apply_to_adjoint`] ride on these lists. A kept
+/// save the backward never reads for value (`per_segment_released`) is
+/// freed here with the victims. And an interior the backward reads for
+/// shape only (`shape_stubs`) gets, just before its free, one
+/// `ccr_shape_stub` op whose result is the stub the adjoint was rewritten to
+/// read; the result is a real VarId, mapped by the lowering that every later
+/// slice and the adjoint share.
 pub fn build_segment_free_lists(plan: &CcrPlan) -> Vec<WengertList> {
+    let stub_of: HashMap<VarId, VarId> = plan.shape_stubs.iter().copied().collect();
     let mut lists = Vec::with_capacity(plan.per_segment_recompute.len());
-    for seg_victims in &plan.per_segment_recompute {
+    for (si, seg_victims) in plan.per_segment_recompute.iter().enumerate() {
         // Same dummy-id headroom refusal as build_early_free_list: descending
         // ids minted from u32::MAX-1 must never approach real VarIds. (F2:
         // the single-list guard did not carry over on its own.)
@@ -1328,14 +1491,27 @@ pub fn build_segment_free_lists(plan: &CcrPlan) -> Vec<WengertList> {
                 .iter()
                 .copied()
                 .filter(|v| plan.free_eligible.contains(v))
+                .chain(plan.per_segment_released.get(si).into_iter().flatten().copied())
                 .collect();
             v.sort_unstable();
             v
         };
         let mut ops = Vec::new();
+        let mut var_types = HashMap::new();
         for (i, victim) in victims.into_iter().enumerate() {
+            if let Some(&stub) = stub_of.get(&victim) {
+                ops.push(WengertOp {
+                    id: crate::wengert::adjoint_op_id(ops.len()),
+                    result: stub,
+                    op: PrimalOp::Passthrough("ccr_shape_stub".to_string()),
+                    inputs: vec![victim],
+                    saved_for_backward: false,
+                    checkpointed: false,
+                });
+                var_types.insert(stub, WengertType::Tensor);
+            }
             ops.push(WengertOp {
-                id: crate::wengert::adjoint_op_id(i),
+                id: crate::wengert::adjoint_op_id(ops.len()),
                 result: u32::MAX - 1 - i as u32,
                 op: PrimalOp::FreeTensor,
                 inputs: vec![victim],
@@ -1347,13 +1523,21 @@ pub fn build_segment_free_lists(plan: &CcrPlan) -> Vec<WengertList> {
             ops,
             output: 0,
             var_names: HashMap::new(),
-            var_types: HashMap::new(),
+            var_types,
         });
     }
     lists
 }
 
 pub fn build_early_free_list(plan: &CcrPlan) -> WengertList {
+    // The post-forward list is lowered into a map of its own that is thrown
+    // away, so a stub made here could not reach the adjoint. Stubs and
+    // released saves exist only when the caller told `apply_to_adjoint` the
+    // per-segment lists are in use.
+    assert!(
+        plan.shape_stubs.is_empty() && plan.per_segment_released.iter().all(Vec::is_empty),
+        "[ccr] the post-forward free list cannot carry shape stubs or released saves"
+    );
     let victims = plan.early_free_vars();
     assert!(
         victims.len() < (1 << 16),
@@ -1391,72 +1575,120 @@ pub fn build_early_free_list(plan: &CcrPlan) -> WengertList {
     }
 }
 
-/// CCR phases 5-6: append the compressed-save tail to the PRIMAL list.
+/// The only storage format `--checkpoint-compress` offers.
+///
+/// IEEE half precision (`fp16`) was offered as well and has been withdrawn:
+/// the cast has no range check, half precision overflows to infinity above
+/// 65504, and one such activation turned the loss into NaN from the next
+/// step on. bf16 has the exponent range of f32, so it cannot overflow, and
+/// it is the same two bytes per element.
+pub const COMPRESS_DTYPE: &str = "bf16";
+
+/// CCR phases 5-6: insert the compressed saves into the PRIMAL list.
 ///
 /// For each compress victim v (a Selective-policy saved matmul-class
-/// interior consumed only by the adjoint), append:
-///     half = Passthrough("ccr_cast_fp16"|"ccr_cast_bf16")(v)
+/// interior consumed only inside its segment and by the adjoint), insert at
+/// the END OF ITS SEGMENT:
+///     half = Passthrough("ccr_cast_bf16")(v)
 ///     FreeTensor(v)
-/// The tail lowers with the main primal call, so the half tensors land in
-/// `full_vars` and are resolvable by the adjoint. The adjoint generator's
-/// reverse walk sees these tail ops FIRST and produces no adjoints (the
-/// ad_rules default arm), which is correct: they wrap saved-for-backward
-/// values.
+/// and move the plan's segment bounds to match (a segment now ends after its
+/// own casts). The inserted ops lower with the forward, so the half tensors
+/// land in `full_vars` and are resolvable by the adjoint. The adjoint
+/// generator's reverse walk produces no adjoints for them (the ad_rules
+/// default arm), which is correct: they wrap saved-for-backward values.
 ///
-/// Returns v -> half VarId. `dtype` must be "fp16" or "bf16".
-pub fn append_compressed_saves(
+/// The casts were appended after the whole forward before. Every
+/// full-precision save was then still live at the end of the forward, which
+/// is where the step's peak sits, so compressing could not lower it. At the
+/// segment end, the forward holds one segment's saves at full precision and
+/// every earlier segment's at half.
+///
+/// This MOVES primal ops: every position at or after the first insertion
+/// shifts. The plan's segments are the positional references the CCR pass
+/// itself holds, and they are rewritten here; the caller re-digests the
+/// tape for the scheduler afterwards.
+///
+/// Returns v -> half VarId.
+pub fn insert_compressed_saves(
     primal: &mut WengertList,
-    plan: &CcrPlan,
-    dtype: &str,
+    plan: &mut CcrPlan,
     fresh: &mut VarId,
 ) -> HashMap<VarId, VarId> {
-    let cast_name = match dtype {
-        "fp16" => "ccr_cast_fp16",
-        "bf16" => "ccr_cast_bf16",
-        other => panic!("[ccr] unsupported compress dtype '{other}' (fp16|bf16)"),
-    };
+    let cast_name = format!("ccr_cast_{COMPRESS_DTYPE}");
     let mut map = HashMap::new();
+    // The victims of each segment, in primal order.
+    let victims: HashSet<VarId> = plan.compress.iter().copied().collect();
+    let per_segment: Vec<Vec<VarId>> = plan
+        .segments
+        .iter()
+        .map(|seg| {
+            primal.ops[seg.start..seg.end]
+                .iter()
+                .map(|op| op.result)
+                .filter(|v| victims.contains(v))
+                .collect()
+        })
+        .collect();
     // fresh_op_id, NOT ops.len(): the primal reaching this point has been
     // through deletions (the fused-LCE prune, WGGO's sub-block prune) that
     // do not renumber, so len sits BELOW the surviving max id and a
     // len-minted id collides with a live op — at which point the id-keyed
     // claim tables (CSHA's dispatch map, CCR's own exemption set) can
-    // match the appended cast instead of the op they claimed. Hoisted to a
+    // match the inserted cast instead of the op they claimed. Hoisted to a
     // running counter (one max-scan, not one per push); uniqueness is
     // re-asserted at the end of this function.
     let mut next_id = primal.fresh_op_id();
-    for &v in &plan.compress {
-        let half = *fresh;
-        *fresh += 1;
-        let id = next_id;
-        next_id += 1;
-        primal.ops.push(WengertOp {
-            id,
-            result: half,
-            op: PrimalOp::Passthrough(cast_name.to_string()),
-            inputs: vec![v],
-            saved_for_backward: false,
-            checkpointed: false,
-        });
-        primal.var_types.insert(half, WengertType::Tensor);
-        if let Some(name) = primal.var_names.get(&v).cloned() {
-            primal.var_names.insert(half, format!("{name}.ccr_half"));
+    // Build each segment's ops first (ids and VarIds in primal order), then
+    // insert from the last segment back so earlier positions stay valid.
+    let mut inserts: Vec<Vec<WengertOp>> = Vec::with_capacity(per_segment.len());
+    for seg_victims in &per_segment {
+        let mut ops = Vec::with_capacity(seg_victims.len() * 2);
+        for &v in seg_victims {
+            let half = *fresh;
+            *fresh += 1;
+            let id = next_id;
+            next_id += 1;
+            ops.push(WengertOp {
+                id,
+                result: half,
+                op: PrimalOp::Passthrough(cast_name.clone()),
+                inputs: vec![v],
+                saved_for_backward: false,
+                checkpointed: false,
+            });
+            primal.var_types.insert(half, WengertType::Tensor);
+            if let Some(name) = primal.var_names.get(&v).cloned() {
+                primal.var_names.insert(half, format!("{name}.ccr_half"));
+            }
+            let free_result = *fresh;
+            *fresh += 1;
+            let id = next_id;
+            next_id += 1;
+            ops.push(WengertOp {
+                id,
+                result: free_result,
+                op: PrimalOp::FreeTensor,
+                inputs: vec![v],
+                saved_for_backward: false,
+                checkpointed: false,
+            });
+            map.insert(v, half);
         }
-        let free_result = *fresh;
-        *fresh += 1;
-        let id = next_id;
-        next_id += 1;
-        primal.ops.push(WengertOp {
-            id,
-            result: free_result,
-            op: PrimalOp::FreeTensor,
-            inputs: vec![v],
-            saved_for_backward: false,
-            checkpointed: false,
-        });
-        map.insert(v, half);
+        inserts.push(ops);
     }
-    primal.assert_unique_op_ids("ccr::append_compressed_saves");
+    for (si, ops) in inserts.iter().enumerate().rev() {
+        let at = plan.segments[si].end;
+        primal.ops.splice(at..at, ops.iter().cloned());
+    }
+    // Segment i moves right by everything inserted before it and grows by
+    // its own casts.
+    let mut shift = 0usize;
+    for (seg, ops) in plan.segments.iter_mut().zip(&inserts) {
+        seg.start += shift;
+        shift += ops.len();
+        seg.end += shift;
+    }
+    primal.assert_unique_op_ids("ccr::insert_compressed_saves");
     map
 }
 
@@ -1557,17 +1789,117 @@ pub fn splice_decompress(
     Ok(())
 }
 
+/// How the backward uses the block interiors of a plan.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct BackwardReads {
+    /// Interiors whose VALUE the backward needs: read by an adjoint op as
+    /// anything but the shape target of a `reduce_to_shape`, or read by the
+    /// recompute clone of another needed victim. A victim in this set is
+    /// recomputed; a kept save in it stays resident.
+    pub value: HashSet<VarId>,
+    /// Interiors the backward reads only as the target of a
+    /// `reduce_to_shape` (operand 1), which takes its shape and device and
+    /// never its contents: the residual stream's `h + f` reads `f` this way.
+    /// Disjoint from `value`.
+    pub shape_only: HashSet<VarId>,
+}
+
+/// Classify how `adjoint` (the final adjoint, before the CCR splice) uses
+/// each recompute victim and each kept save of `plan`.
+///
+/// `stubs_allowed` says whether a shape-only reader can be given a shape
+/// stub (the per-segment free lists are in use). When it cannot, or the
+/// victim is not a freeable tensor, a shape-only victim has to be recomputed
+/// like any other and counts as a value read, as do the inputs of its clone.
+pub fn backward_reads(
+    primal: &WengertList,
+    adjoint: &WengertList,
+    plan: &CcrPlan,
+    stubs_allowed: bool,
+) -> BackwardReads {
+    let victims: HashSet<VarId> = plan.per_segment_recompute.iter().flatten().copied().collect();
+    let kept: HashSet<VarId> = plan.per_segment_kept.iter().flatten().copied().collect();
+    let tracked = |v: &VarId| victims.contains(v) || kept.contains(v);
+
+    let mut value: HashSet<VarId> = HashSet::new();
+    let mut shape: HashSet<VarId> = HashSet::new();
+    for op in &adjoint.ops {
+        let reduce = matches!(&op.op, PrimalOp::Passthrough(n) if n == "reduce_to_shape");
+        for (i, v) in op.inputs.iter().enumerate() {
+            if !tracked(v) {
+                continue;
+            }
+            if reduce && i == 1 {
+                shape.insert(*v);
+            } else {
+                value.insert(*v);
+            }
+        }
+    }
+    // A victim that is only measured still has to exist when it cannot be
+    // replaced by a stub.
+    for v in &shape {
+        if victims.contains(v) && !(stubs_allowed && plan.free_eligible.contains(v)) {
+            value.insert(*v);
+        }
+    }
+    // A clone reads its inputs for their value. Walk each segment backwards
+    // so a chain of victims is followed to its start.
+    for (seg, seg_victims) in plan.segments.iter().zip(&plan.per_segment_recompute) {
+        let in_seg: HashSet<VarId> = seg_victims.iter().copied().collect();
+        for idx in (seg.start..seg.end).rev() {
+            let op = &primal.ops[idx];
+            if in_seg.contains(&op.result) && value.contains(&op.result) {
+                for input in &op.inputs {
+                    if tracked(input) {
+                        value.insert(*input);
+                    }
+                }
+            }
+        }
+    }
+    shape.retain(|v| !value.contains(v));
+    BackwardReads { value, shape_only: shape }
+}
+
+/// What [`apply_to_adjoint`] did with the plan's victims.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SpliceSummary {
+    /// Victims recomputed in the backward (one clone each).
+    pub recomputed: usize,
+    /// Victims the backward reads for shape only: freed, not recomputed, a
+    /// stub standing in.
+    pub shape_only: usize,
+    /// Victims the backward does not read at all: freed, not recomputed.
+    pub unread: usize,
+    /// Kept saves released at their segment's end because the backward does
+    /// not read their value.
+    pub released: usize,
+}
+
 /// Splice recompute clones + `FreeTensor` markers into the adjoint and
 /// remap its references from original interior VarIds to the fresh clones.
+///
+/// Only the victims whose value the backward needs are cloned
+/// ([`backward_reads`]). Every victim used to be: the matrix product feeding
+/// each residual add was recomputed in full so that the add's backward could
+/// read its shape, and a victim nothing read was recomputed for nothing.
+///
+/// `release_at_segment_end` must be true exactly when the forward will lower
+/// [`build_segment_free_lists`] (and not the single post-forward list). Only
+/// then can a shape-only victim be served by a stub, and a kept save the
+/// backward never reads for value be released; both are recorded on `plan`
+/// for those lists to carry out.
 ///
 /// `fresh` must start above every VarId in `primal` and `adjoint`; it is
 /// advanced as clones are allocated.
 pub fn apply_to_adjoint(
     primal: &WengertList,
     adjoint: &mut WengertList,
-    plan: &CcrPlan,
+    plan: &mut CcrPlan,
     fresh: &mut VarId,
-) -> Result<(), CodegenError> {
+    release_at_segment_end: bool,
+) -> Result<SpliceSummary, CodegenError> {
     // Checked on the way IN, where it can fail. An assertion placed after
     // `renumber_adjoint_ops` would only re-read what that call unconditionally
     // wrote — it can never fire, and a check that cannot fail is worse than no
@@ -1591,13 +1923,56 @@ pub fn apply_to_adjoint(
         adjoint.var_types.entry(*k).or_insert(*v);
     }
 
-    // Global remap original-interior -> clone.
+    let reads = backward_reads(primal, adjoint, plan, release_at_segment_end);
+    let mut summary = SpliceSummary::default();
+
+    // Global remap original-interior -> clone, for the victims that are
+    // recomputed, and original-interior -> stub for those only measured.
     let mut remap: HashMap<VarId, VarId> = HashMap::new();
+    let mut stub_remap: HashMap<VarId, VarId> = HashMap::new();
+    let mut shape_stubs: Vec<(VarId, VarId)> = Vec::new();
     for victims in &plan.per_segment_recompute {
         for v in victims {
-            remap.insert(*v, *fresh);
-            *fresh += 1;
+            if reads.value.contains(v) {
+                remap.insert(*v, *fresh);
+                *fresh += 1;
+                summary.recomputed += 1;
+            } else if reads.shape_only.contains(v) {
+                stub_remap.insert(*v, *fresh);
+                shape_stubs.push((*v, *fresh));
+                *fresh += 1;
+                summary.shape_only += 1;
+            } else {
+                summary.unread += 1;
+            }
         }
+    }
+    // Kept saves the backward does not read for value: release them at the
+    // segment's end, with a stub when their shape is read.
+    let mut per_segment_released: Vec<Vec<VarId>> = vec![Vec::new(); plan.segments.len()];
+    if release_at_segment_end {
+        for (si, kept) in plan.per_segment_kept.iter().enumerate() {
+            for v in kept {
+                if reads.value.contains(v) {
+                    continue;
+                }
+                if reads.shape_only.contains(v) {
+                    stub_remap.insert(*v, *fresh);
+                    shape_stubs.push((*v, *fresh));
+                    *fresh += 1;
+                }
+                per_segment_released[si].push(*v);
+                summary.released += 1;
+            }
+        }
+    }
+    for (original, stub) in &shape_stubs {
+        adjoint.var_types.insert(*stub, WengertType::Tensor);
+        let name = match primal.var_names.get(original) {
+            Some(name) => format!("{name}.ccr_shape"),
+            None => format!("v{original}.ccr_shape"),
+        };
+        adjoint.var_names.insert(*stub, name);
     }
 
     // Per segment: the first adjoint index referencing any of its victims.
@@ -1606,10 +1981,11 @@ pub fn apply_to_adjoint(
     // never shift a pending position.)
     let mut splices: Vec<(usize, usize)> = Vec::new(); // (segment_idx, adjoint_idx)
     for (si, victims) in plan.per_segment_recompute.iter().enumerate() {
-        if victims.is_empty() {
+        let vset: HashSet<VarId> =
+            victims.iter().copied().filter(|v| remap.contains_key(v)).collect();
+        if vset.is_empty() {
             continue;
         }
-        let vset: HashSet<VarId> = victims.iter().copied().collect();
         let first = adjoint
             .ops
             .iter()
@@ -1648,7 +2024,11 @@ pub fn apply_to_adjoint(
 
     for (si, at) in splices {
         let seg = &plan.segments[si];
-        let vset: HashSet<VarId> = plan.per_segment_recompute[si].iter().copied().collect();
+        let vset: HashSet<VarId> = plan.per_segment_recompute[si]
+            .iter()
+            .copied()
+            .filter(|v| remap.contains_key(v))
+            .collect();
         // Clone the producing ops in primal order, remapping inputs.
         let mut clones = Vec::new();
         for idx in seg.start..seg.end {
@@ -1699,11 +2079,14 @@ pub fn apply_to_adjoint(
         adjoint.ops.splice(at..at, clones);
     }
 
-    // Remap every adjoint reference to a recomputed original.
+    // Remap every adjoint reference to a recomputed original onto its
+    // clone, and every shape-only reference onto the stub.
     for op in adjoint.ops.iter_mut() {
         for input in op.inputs.iter_mut() {
             if let Some(fresh_id) = remap.get(input) {
                 *input = *fresh_id;
+            } else if let Some(stub) = stub_remap.get(input) {
+                *input = *stub;
             }
         }
     }
@@ -1721,7 +2104,7 @@ pub fn apply_to_adjoint(
         let fresh_set: HashSet<VarId> = victims
             .iter()
             .filter(|v| plan.free_eligible.contains(v))
-            .map(|v| remap[v])
+            .filter_map(|v| remap.get(v).copied())
             .collect();
         if fresh_set.is_empty() {
             continue;
@@ -1762,7 +2145,10 @@ pub fn apply_to_adjoint(
     // recompute clone spliced above from ever matching a primal claim key.
     crate::wengert::renumber_adjoint_ops(&mut adjoint.ops);
 
-    validate(primal, adjoint, plan)
+    plan.shape_stubs = shape_stubs;
+    plan.per_segment_released = per_segment_released;
+    validate(primal, adjoint, plan)?;
+    Ok(summary)
 }
 
 /// Static post-transform validation — loud failure over silent skip.
@@ -1770,8 +2156,8 @@ pub fn apply_to_adjoint(
 /// (1) every adjoint input is defined (primal result, primal leaf, earlier
 ///     adjoint result, or clone);
 /// (2) no adjoint op after a `FreeTensor` references its victim;
-/// (3) no adjoint op references an early-freed ORIGINAL interior (they were
-///     freed right after the forward).
+/// (3) no adjoint op references an early-freed ORIGINAL interior (a
+///     recompute victim or a released save: they were freed in the forward).
 fn validate(
     primal: &WengertList,
     adjoint: &WengertList,
@@ -1780,6 +2166,7 @@ fn validate(
     let primal_defined: HashSet<VarId> = primal.ops.iter().map(|o| o.result).collect();
     let mut defined: HashSet<VarId> = primal_defined.clone();
     let mut freed: HashMap<VarId, usize> = HashMap::new();
+    let released: HashSet<VarId> = plan.per_segment_released.iter().flatten().copied().collect();
 
     for (idx, op) in adjoint.ops.iter().enumerate() {
         for input in &op.inputs {
@@ -1790,7 +2177,7 @@ fn validate(
                     op.op, op.result
                 )));
             }
-            if plan.recompute.contains(input) {
+            if plan.recompute.contains(input) || released.contains(input) {
                 return Err(CodegenError::new(format!(
                     "[ccr] validation: adjoint op {idx} ({:?} -> v{}) still \
                      references early-freed original v{input} (remap missed it)",
@@ -1928,6 +2315,130 @@ mod tests {
             "anchor 2 (whose kept boundary is the huge v8) must be dropped: {:?}",
             choice.keep
         );
+    }
+
+    /// Small tensors, so launches dominate the bandwidth floor, and a budget
+    /// every partition fits. Keeping all four anchors recomputes the four
+    /// block interiors (4 launches); every coalescing recomputes those plus
+    /// the boundaries it swallowed (5 to 7 launches). The cheapest is all
+    /// four. When every result of a block counted as a launch, saved ones
+    /// included, each partition cost 8 launches and the choice fell to
+    /// search order.
+    #[test]
+    fn dp_keeps_every_anchor_when_launches_dominate_and_all_fit() {
+        let primal = toy_primal_4blocks();
+        let mut sizes: HashMap<VarId, u64> = HashMap::new();
+        for v in 0..16u32 {
+            sizes.insert(v, 64);
+        }
+        let choice = select_partition_dp(
+            &primal,
+            None,
+            CcrPolicy::Block,
+            &sizes,
+            &dp_model(1, Some(1 << 20)),
+        )
+        .expect("dp choice");
+        assert!(choice.fits_budget);
+        assert_eq!(choice.total_anchors, 4);
+        assert_eq!(
+            choice.keep,
+            vec![0, 1, 2, 3],
+            "the partition that recomputes least must win"
+        );
+        // 4 interiors x factor 2.0 x 6000 ns per launch, worked by hand.
+        assert_eq!(choice.est_recompute_ns, 48_000);
+    }
+
+    // ---- budget knapsack ------------------------------------------------
+
+    /// `[2, 3, 4] @ [4, 5]` is 2 x 3 x 5 = 30 output elements, each a sum of
+    /// 4 products: 30 x 4 multiplies and as many adds, 240 operations.
+    #[test]
+    fn a_matrix_product_is_weighed_by_its_inner_dimension() {
+        let matmul = op(3, 3, PrimalOp::Matmul, vec![0, 1]);
+        let mut shapes: HashMap<VarId, Vec<u64>> = HashMap::new();
+        shapes.insert(0, vec![2, 3, 4]);
+        shapes.insert(1, vec![4, 5]);
+        shapes.insert(3, vec![2, 3, 5]);
+        assert_eq!(recompute_ops(&matmul, 30 * 4, &shapes), 240);
+        // An elementwise op over the same output: 4 per element.
+        let relu = op(4, 3, PrimalOp::Relu, vec![0]);
+        assert_eq!(recompute_ops(&relu, 30 * 4, &shapes), 120);
+    }
+
+    /// Two matrix products with the same 1 MiB output, one over a 64-wide
+    /// inner dimension and one over a 4096-wide one, and room to keep one.
+    /// Recomputing the second costs 64 times the first, so it is the one to
+    /// keep. A per-output-byte weight valued them equally and kept the first.
+    #[test]
+    fn the_budget_keeps_the_product_that_costs_more_to_recompute() {
+        let primal = toy_primal();
+        let mut plan = plan(&primal, None, CcrPolicy::Block, false, 1).expect("plan");
+        assert!(plan.recompute.contains(&3) && plan.recompute.contains(&5));
+        let mib: u64 = 1 << 20;
+        let mut sizes: HashMap<VarId, u64> = HashMap::new();
+        sizes.insert(3, mib);
+        sizes.insert(5, mib);
+        let mut shapes: HashMap<VarId, Vec<u64>> = HashMap::new();
+        shapes.insert(0, vec![2, 64, 64]); // left operand of v3: k = 64
+        shapes.insert(3, vec![2, 64, 2048]);
+        shapes.insert(4, vec![2, 64, 4096]); // left operand of v5: k = 4096
+        shapes.insert(5, vec![2, 64, 2048]);
+        let flipped = apply_budget(
+            &mut plan,
+            &primal,
+            &CcrBudget { sizes, shapes, budget_bytes: mib },
+            None,
+        );
+        assert_eq!(flipped, 1);
+        assert!(
+            !plan.recompute.contains(&5),
+            "the 4096-wide product must be the one kept"
+        );
+        assert!(plan.recompute.contains(&3));
+    }
+
+    /// Two 1 KiB tensors fit a 2 KiB budget exactly. With a fixed 256 KiB
+    /// cell each was charged 256 KiB and neither was kept.
+    #[test]
+    fn a_small_budget_buys_small_tensors() {
+        let primal = toy_primal();
+        let mut plan = plan(&primal, None, CcrPolicy::Block, false, 1).expect("plan");
+        let mut sizes: HashMap<VarId, u64> = HashMap::new();
+        sizes.insert(3, 1024);
+        sizes.insert(5, 1024);
+        assert_eq!(budget_candidates(&plan, &sizes), 2);
+        let budget = |bytes: u64| CcrBudget {
+            sizes: sizes.clone(),
+            shapes: HashMap::new(),
+            budget_bytes: bytes,
+        };
+        assert_eq!(apply_budget(&mut plan, &primal, &budget(2048), None), 2);
+        assert!(plan.recompute.is_empty());
+
+        // One byte short of two: only one is kept, and never more bytes than
+        // the budget.
+        let mut plan = super::plan(&primal, None, CcrPolicy::Block, false, 1).expect("plan");
+        assert_eq!(apply_budget(&mut plan, &primal, &budget(2047), None), 1);
+        assert_eq!(plan.recompute.len(), 1);
+    }
+
+    /// A tensor of a segment that the lowering owns and that has no static
+    /// size is what makes a projected peak an under-count.
+    #[test]
+    fn unsized_segment_tensors_are_reported() {
+        let primal = toy_primal();
+        let plan = plan(&primal, None, CcrPolicy::Block, false, 1).expect("plan");
+        let owned: HashMap<VarId, WengertType> =
+            [3u32, 4, 5, 6].into_iter().map(|v| (v, WengertType::Tensor)).collect();
+        let mut sizes: HashMap<VarId, u64> = HashMap::new();
+        sizes.insert(3, 64);
+        sizes.insert(4, 64);
+        assert_eq!(unsized_segment_tensors(&plan, &owned, &sizes), vec![5, 6]);
+        sizes.insert(5, 64);
+        sizes.insert(6, 64);
+        assert!(unsized_segment_tensors(&plan, &owned, &sizes).is_empty());
     }
 
     fn op(id: u32, result: VarId, p: PrimalOp, inputs: Vec<VarId>) -> WengertOp {
@@ -2165,7 +2676,7 @@ mod tests {
     #[test]
     fn adjoint_splice_remaps_and_frees() {
         let primal = toy_primal();
-        let plan = plan(&primal, None, CcrPolicy::Block, false, 1).unwrap();
+        let mut plan = plan(&primal, None, CcrPolicy::Block, false, 1).unwrap();
         // Toy adjoint touching both interiors: block-1 grads first (reverse
         // order), then block-0 grads.
         let mut adjoint = WengertList {
@@ -2182,7 +2693,11 @@ mod tests {
             var_types: HashMap::new(),
         };
         let mut fresh = 200;
-        apply_to_adjoint(&primal, &mut adjoint, &plan, &mut fresh).unwrap();
+        let summary = apply_to_adjoint(&primal, &mut adjoint, &mut plan, &mut fresh, true).unwrap();
+        assert_eq!(
+            summary,
+            SpliceSummary { recomputed: 2, shape_only: 0, unread: 0, released: 0 }
+        );
 
         // No adjoint op may still reference the originals v3 / v5.
         for o in &adjoint.ops {
@@ -2207,6 +2722,239 @@ mod tests {
             .count();
         assert_eq!(free_count, 2);
         // Frees come after last uses (validate() already enforced this).
+    }
+
+    /// The tape of `toy_primal` with a Relu between block 0's matrix product
+    /// and its residual add, so block 0 has a chain of two interiors:
+    ///   v3 = Matmul(v0, w0)   v9 = Relu(v3)   v4 = Add(v9, v0)
+    /// Block 1 is unchanged: v5 = Matmul(v4, w1), v6 = Add(v5, v4).
+    fn toy_primal_with_relu() -> WengertList {
+        let mut primal = toy_primal();
+        primal.ops[4] = op(4, 4, PrimalOp::Add, vec![9, 0]);
+        primal.ops.insert(4, op(9, 9, PrimalOp::Relu, vec![3]));
+        primal
+    }
+
+    fn adjoint_of(ops: Vec<WengertOp>) -> WengertList {
+        WengertList {
+            ops,
+            output: 0,
+            var_names: HashMap::new(),
+            var_types: HashMap::new(),
+        }
+    }
+
+    fn reduce(pos: u32, result: VarId, grad: VarId, target: VarId) -> WengertOp {
+        adj_op(
+            pos,
+            result,
+            PrimalOp::Passthrough("reduce_to_shape".into()),
+            vec![grad, target],
+        )
+    }
+
+    fn count_ops(list: &WengertList, pred: impl Fn(&PrimalOp) -> bool) -> usize {
+        list.ops.iter().filter(|o| pred(&o.op)).count()
+    }
+
+    /// The backward of `v6 = v5 + v4` reduces the incoming gradient to the
+    /// shape of `v5` and never reads its contents. `v5` (a matrix product)
+    /// must not be recomputed for that: a stub captured at the end of the
+    /// block stands in. `v3` is read for its value and is recomputed.
+    #[test]
+    fn a_victim_read_only_for_its_shape_is_not_recomputed() {
+        let primal = toy_primal();
+        let mut plan = plan(&primal, None, CcrPolicy::Block, false, 1).unwrap();
+        let mut adjoint = adjoint_of(vec![
+            reduce(0, 100, 50, 5),
+            adj_op(1, 101, PrimalOp::Mul, vec![3, 100]),
+        ]);
+        let reads = backward_reads(&primal, &adjoint, &plan, true);
+        assert_eq!(reads.value, HashSet::from([3]));
+        assert_eq!(reads.shape_only, HashSet::from([5]));
+
+        let mut fresh = 200;
+        let summary = apply_to_adjoint(&primal, &mut adjoint, &mut plan, &mut fresh, true).unwrap();
+        assert_eq!(
+            summary,
+            SpliceSummary { recomputed: 1, shape_only: 1, unread: 0, released: 0 }
+        );
+        // One clone (of v3), not two.
+        assert_eq!(count_ops(&adjoint, |o| matches!(o, PrimalOp::Matmul)), 1);
+        let (original, stub) = plan.shape_stubs[0];
+        assert_eq!(original, 5);
+        let reduce_op = adjoint
+            .ops
+            .iter()
+            .find(|o| matches!(&o.op, PrimalOp::Passthrough(n) if n == "reduce_to_shape"))
+            .unwrap();
+        assert_eq!(reduce_op.inputs, vec![50, stub], "the reduce reads the stub");
+        assert!(adjoint.ops.iter().all(|o| !o.inputs.contains(&5)));
+
+        // The forward makes the stub just before it frees v5, in block 1's
+        // free list; block 0's list only frees v3.
+        plan.free_eligible = HashSet::from([3, 5]);
+        let lists = build_segment_free_lists(&plan);
+        assert_eq!(lists[0].ops.len(), 1);
+        assert!(matches!(lists[0].ops[0].op, PrimalOp::FreeTensor));
+        assert_eq!(lists[1].ops.len(), 2);
+        assert!(
+            matches!(&lists[1].ops[0].op, PrimalOp::Passthrough(n) if n == "ccr_shape_stub")
+        );
+        assert_eq!((lists[1].ops[0].inputs.clone(), lists[1].ops[0].result), (vec![5], stub));
+        assert!(matches!(lists[1].ops[1].op, PrimalOp::FreeTensor));
+        assert_eq!(lists[1].ops[1].inputs, vec![5]);
+    }
+
+    /// Only the TARGET of a `reduce_to_shape` (operand 1) is read for its
+    /// shape. Its gradient operand (operand 0) is summed, so a victim there
+    /// is read for its value and must be recomputed.
+    #[test]
+    fn the_gradient_operand_of_a_reduce_is_a_value_read() {
+        let primal = toy_primal();
+        let mut plan = plan(&primal, None, CcrPolicy::Block, false, 1).unwrap();
+        let mut adjoint = adjoint_of(vec![reduce(0, 100, 5, 0), reduce(1, 101, 3, 3)]);
+        let reads = backward_reads(&primal, &adjoint, &plan, true);
+        assert_eq!(reads.value, HashSet::from([3, 5]));
+        assert!(reads.shape_only.is_empty());
+        let mut fresh = 200;
+        let summary = apply_to_adjoint(&primal, &mut adjoint, &mut plan, &mut fresh, true).unwrap();
+        assert_eq!(
+            summary,
+            SpliceSummary { recomputed: 2, shape_only: 0, unread: 0, released: 0 }
+        );
+        assert!(plan.shape_stubs.is_empty());
+    }
+
+    /// Without the per-segment free lists there is nowhere to make a stub,
+    /// so the shape-only victim is recomputed as before.
+    #[test]
+    fn a_shape_only_victim_is_recomputed_when_no_stub_can_be_made() {
+        let primal = toy_primal();
+        let mut plan = plan(&primal, None, CcrPolicy::Block, false, 1).unwrap();
+        let mut adjoint = adjoint_of(vec![
+            reduce(0, 100, 50, 5),
+            adj_op(1, 101, PrimalOp::Mul, vec![3, 100]),
+        ]);
+        let mut fresh = 200;
+        let summary =
+            apply_to_adjoint(&primal, &mut adjoint, &mut plan, &mut fresh, false).unwrap();
+        assert_eq!(
+            summary,
+            SpliceSummary { recomputed: 2, shape_only: 0, unread: 0, released: 0 }
+        );
+        assert_eq!(count_ops(&adjoint, |o| matches!(o, PrimalOp::Matmul)), 2);
+        assert!(plan.shape_stubs.is_empty());
+        // The post-forward list must build (it refuses a plan with stubs).
+        build_early_free_list(&plan);
+    }
+
+    /// A victim nothing in the backward reads is freed and not recomputed;
+    /// a victim read only by the clone of a needed victim is recomputed.
+    #[test]
+    fn only_victims_the_backward_needs_are_recomputed() {
+        let primal = toy_primal_with_relu();
+        // Block 0's victims are v3 and v9; block 1's is v5.
+        let mut plan = plan(&primal, None, CcrPolicy::Block, false, 1).unwrap();
+        assert_eq!(plan.per_segment_recompute, vec![vec![3, 9], vec![5]]);
+
+        // The backward reads v9 for its value: its clone reads v3, so both
+        // are recomputed. Nothing reads v5.
+        let mut adjoint = adjoint_of(vec![adj_op(0, 100, PrimalOp::Mul, vec![9, 0])]);
+        let mut fresh = 200;
+        let summary = apply_to_adjoint(&primal, &mut adjoint, &mut plan, &mut fresh, true).unwrap();
+        assert_eq!(
+            summary,
+            SpliceSummary { recomputed: 2, shape_only: 0, unread: 1, released: 0 }
+        );
+        assert_eq!(count_ops(&adjoint, |o| matches!(o, PrimalOp::Matmul)), 1);
+        assert_eq!(count_ops(&adjoint, |o| matches!(o, PrimalOp::Relu)), 1);
+
+        // The backward reads v9 for its shape only: v9 is not recomputed,
+        // so nothing needs v3 either.
+        let mut plan = super::plan(&primal, None, CcrPolicy::Block, false, 1).unwrap();
+        let mut adjoint = adjoint_of(vec![reduce(0, 100, 50, 9)]);
+        let mut fresh = 200;
+        let summary = apply_to_adjoint(&primal, &mut adjoint, &mut plan, &mut fresh, true).unwrap();
+        assert_eq!(
+            summary,
+            SpliceSummary { recomputed: 0, shape_only: 1, unread: 2, released: 0 }
+        );
+        assert_eq!(count_ops(&adjoint, |o| matches!(o, PrimalOp::Matmul | PrimalOp::Relu)), 0);
+    }
+
+    /// Under the selective policy the matrix products stay saved. One the
+    /// backward reads for shape only is released at the end of its block
+    /// with a stub; one a clone reads for its value stays.
+    #[test]
+    fn a_selective_save_the_backward_only_measures_is_released() {
+        let primal = toy_primal_with_relu();
+        let mut plan = plan(&primal, None, CcrPolicy::Selective, false, 1).unwrap();
+        assert_eq!(plan.per_segment_recompute, vec![vec![9], vec![]]);
+        assert_eq!(plan.per_segment_kept, vec![vec![3], vec![5]]);
+
+        // v9 is read for value, so its clone reads the saved v3; v5 is only
+        // measured.
+        let mut adjoint = adjoint_of(vec![
+            reduce(0, 100, 50, 5),
+            adj_op(1, 101, PrimalOp::Mul, vec![9, 100]),
+        ]);
+        let mut fresh = 200;
+        let summary = apply_to_adjoint(&primal, &mut adjoint, &mut plan, &mut fresh, true).unwrap();
+        assert_eq!(
+            summary,
+            SpliceSummary { recomputed: 1, shape_only: 0, unread: 0, released: 1 }
+        );
+        assert_eq!(plan.per_segment_released, vec![vec![], vec![5]]);
+        assert_eq!(plan.shape_stubs.len(), 1);
+        assert_eq!(plan.shape_stubs[0].0, 5);
+        // The clone of the Relu still reads the saved original v3.
+        let relu = adjoint.ops.iter().find(|o| matches!(o.op, PrimalOp::Relu)).unwrap();
+        assert_eq!(relu.inputs, vec![3]);
+        // Block 1's free list: the stub, then the release of v5.
+        let lists = build_segment_free_lists(&plan);
+        assert_eq!(lists[1].ops.len(), 2);
+        assert_eq!(lists[1].ops[0].result, plan.shape_stubs[0].1);
+        assert_eq!(lists[1].ops[1].inputs, vec![5]);
+
+        // Without the per-segment lists nothing is released.
+        let mut plan = super::plan(&primal, None, CcrPolicy::Selective, false, 1).unwrap();
+        let mut adjoint = adjoint_of(vec![
+            reduce(0, 100, 50, 5),
+            adj_op(1, 101, PrimalOp::Mul, vec![9, 100]),
+        ]);
+        let mut fresh = 200;
+        let summary =
+            apply_to_adjoint(&primal, &mut adjoint, &mut plan, &mut fresh, false).unwrap();
+        assert_eq!(summary.released, 0);
+        assert!(plan.shape_stubs.is_empty());
+        let reduce_op = &adjoint.ops[0];
+        assert_eq!(reduce_op.inputs, vec![50, 5], "the reduce still reads the saved v5");
+    }
+
+    /// The knapsack does not spend budget on a victim the backward never
+    /// recomputes.
+    #[test]
+    fn the_budget_ignores_victims_that_are_never_recomputed() {
+        let primal = toy_primal();
+        let mut plan = plan(&primal, None, CcrPolicy::Block, false, 1).unwrap();
+        let adjoint = adjoint_of(vec![
+            reduce(0, 100, 50, 5),
+            adj_op(1, 101, PrimalOp::Mul, vec![3, 100]),
+        ]);
+        let reads = backward_reads(&primal, &adjoint, &plan, true);
+        let mut sizes: HashMap<VarId, u64> = HashMap::new();
+        sizes.insert(3, 1024);
+        sizes.insert(5, 1024);
+        let flipped = apply_budget(
+            &mut plan,
+            &primal,
+            &CcrBudget { sizes, shapes: HashMap::new(), budget_bytes: 1 << 20 },
+            Some(&reads),
+        );
+        assert_eq!(flipped, 1, "room for both, but only v3 is worth keeping");
+        assert!(!plan.recompute.contains(&3));
+        assert!(plan.recompute.contains(&5));
     }
 
     #[test]
@@ -2315,33 +3063,50 @@ mod tests {
         let mut primal = toy_primal();
         primal.ops[4] = op(4, 4, PrimalOp::Add, vec![9, 0]);
         primal.ops.insert(4, op(9, 9, PrimalOp::Relu, vec![3]));
-        let plan = plan(&primal, None, CcrPolicy::Selective, true, 1).unwrap();
+        let mut plan = plan(&primal, None, CcrPolicy::Selective, true, 1).unwrap();
         assert!(
             plan.compress.contains(&3) && plan.compress.contains(&5),
             "both blocks' matmul outputs compressible: {:?}",
             plan.compress
         );
+        // The tape, by position: 0 x, 1-2 block params, 3 Matmul v3,
+        // 4 Relu v9, 5 Add v4 | 6 Matmul v5, 7 Add v6, 8 head param |
+        // 9 head Matmul. Block 0 is [3, 6), block 1 is [6, 9).
+        assert_eq!((plan.segments[0].start, plan.segments[0].end), (3, 6));
+        assert_eq!((plan.segments[1].start, plan.segments[1].end), (6, 9));
 
         let mut fresh = 300;
-        let map = append_compressed_saves(&mut primal, &plan, "bf16", &mut fresh);
+        let map = insert_compressed_saves(&mut primal, &mut plan, &mut fresh);
         let half = map[&3];
-        // Tail = cast + free per compressed original.
-        let casts = primal
-            .ops
-            .iter()
-            .filter(|o| matches!(&o.op, PrimalOp::Passthrough(p) if p == "ccr_cast_bf16"))
-            .count();
-        let frees = primal
-            .ops
-            .iter()
-            .filter(|o| matches!(o.op, PrimalOp::FreeTensor))
-            .count();
-        assert_eq!(casts, 2);
-        assert_eq!(frees, 2);
-        assert!(primal
-            .ops
-            .iter()
-            .any(|o| matches!(o.op, PrimalOp::FreeTensor) && o.inputs == vec![3]));
+        let is_cast_of = |o: &WengertOp, v: VarId| {
+            matches!(&o.op, PrimalOp::Passthrough(p) if p == "ccr_cast_bf16") && o.inputs == vec![v]
+        };
+        let is_free_of =
+            |o: &WengertOp, v: VarId| matches!(o.op, PrimalOp::FreeTensor) && o.inputs == vec![v];
+        // Each block's cast and free sit at the END OF THAT BLOCK, after its
+        // last reader of the full-precision value (the Relu at 4) and before
+        // the next block's first op: v3 is released while block 1 runs, not
+        // after the whole forward.
+        assert!(is_cast_of(&primal.ops[6], 3), "{:?}", primal.ops[6]);
+        assert!(is_free_of(&primal.ops[7], 3), "{:?}", primal.ops[7]);
+        assert!(
+            matches!(primal.ops[8].op, PrimalOp::Matmul) && primal.ops[8].result == 5,
+            "block 1 starts right after block 0's casts: {:?}",
+            primal.ops[8]
+        );
+        assert!(is_cast_of(&primal.ops[11], 5), "{:?}", primal.ops[11]);
+        assert!(is_free_of(&primal.ops[12], 5), "{:?}", primal.ops[12]);
+        assert_eq!(primal.ops[13].result, 8, "the head follows block 1's casts");
+        assert_eq!(primal.ops.len(), 14);
+        // The segments moved with the ops they describe.
+        assert_eq!((plan.segments[0].start, plan.segments[0].end), (3, 8));
+        assert_eq!((plan.segments[1].start, plan.segments[1].end), (8, 13));
+        // Planning again over the rewritten tape changes nothing: a cast
+        // result is a save, not something to recompute.
+        let again = super::plan(&primal, None, CcrPolicy::Selective, true, 1).unwrap();
+        assert!(!again.recompute.contains(&half));
+        assert_eq!((again.segments[0].start, again.segments[0].end), (3, 8));
+        assert_eq!((again.segments[1].start, again.segments[1].end), (8, 13));
 
         // Adjoint consuming the original v3 gets a restore.
         let mut adjoint = WengertList {

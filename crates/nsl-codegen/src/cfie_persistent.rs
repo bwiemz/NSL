@@ -1,23 +1,20 @@
-//! CFIE — persistent decode kernel + GPU-side continuous-batching
-//! scheduler.
+//! CFIE — the decode-block planner: which fusion level the target GPU's
+//! shared memory can sustain for this model.
 //!
-//! Paper §6 describes a single kernel that, once launched, retains
-//! the SMs and loops internally until `<EOS>` — one kernel launch per
-//! layer per decode step instead of 15-30.  Paper §6 assumes a static
-//! batch; Gemini's review insists (correctly) that a production
-//! inference engine must accept new requests mid-stream.
+//! Only one level has an emitter: Level 3, the whole-layer decode block
+//! (`cfie_persistent_ptx`), one launch per layer per token. Levels 1 and 2
+//! are verdicts with no kernel behind them; a model the planner places
+//! there gets no decode block, and the build report says so.
 //!
-//! This module PLANS the missing piece (the runtime that executes it
-//! lives in `nsl-runtime::cfie`):
-//!
-//!   * a **request ring buffer** the host pushes new requests into (the
-//!     runtime ships a lock-free SPSC ring, though the shipped consumer
-//!     is still host-side — see `nsl-runtime::cfie`),
-//!   * a **scheduler descriptor** that, at the top of every decode loop
-//!     iteration, is meant to integrate pending requests into the active
-//!     batch (GPU-side on-device dequeue is the intended endpoint),
-//!   * a **feasibility analysis** that decides which CSHA fusion
-//!     level the persistent kernel can sustain on the target GPU.
+//! The kernel is not persistent in the sense of staying resident: it is
+//! launched once per layer per token and exits. There is no on-device
+//! scheduler and no request queue. This module used to describe both (a
+//! request ring buffer and a "continuous batching" flag that was always
+//! true), and the runtime initialised a ring that nothing consumed; they
+//! are gone. The engine serves one sequence at a time. What remains of the
+//! scheduler is `max_active`, the number of KV sequence slots the static
+//! pool is divided into, and the shared-memory reserve the fusion verdict
+//! subtracts for it.
 
 use serde::Serialize;
 
@@ -91,32 +88,17 @@ pub struct PersistentModel {
     pub dtype_bytes: u32,
 }
 
-/// Host → device ring-buffer descriptor (the request queue; the runtime
-/// ring is a lock-free SPSC structure, popped host-side today).
-#[derive(Debug, Clone, Serialize)]
-pub struct RingBuffer {
-    /// Capacity in slots.  Must be a power of two so the GPU-side
-    /// scheduler can mask the index without a modulo.
-    pub capacity: u32,
-    /// Bytes per slot (pointer + sequence id + length + metadata).
-    pub slot_bytes: u32,
-    /// CPU-side pinned-memory footprint in bytes.
-    pub pinned_bytes: u64,
-}
-
-/// Scheduler metadata baked into the persistent kernel.
+/// The sequence-slot count the plan is made for.
 #[derive(Debug, Clone, Serialize)]
 pub struct Scheduler {
-    pub ring_buffer: RingBuffer,
-    /// Maximum active sequences the persistent kernel tracks.
+    /// Number of KV sequence slots (the serve block's `max_batch`). The
+    /// engine drives one sequence at a time; a slot is what a request
+    /// holds while it runs.
     pub max_active: u32,
-    /// Bytes reserved in SMEM for the per-CTA scheduler state (head /
-    /// tail pointers, per-slot status flags).
+    /// Bytes the fusion verdict reserves in shared memory per thread
+    /// block for slot bookkeeping (a planning allowance; no kernel
+    /// declares it).
     pub smem_scheduler_bytes: u32,
-    /// True when the scheduler dequeues requests at the top of every
-    /// decode loop iteration.  Always `true` for CFIE; retained so
-    /// future variants (e.g., warmup-only ingestion) are expressible.
-    pub continuous_batching: bool,
 }
 
 /// Complete persistent-kernel plan.
@@ -214,14 +196,6 @@ fn scheduler_smem_bytes(max_active: u32) -> u32 {
     16 * max_active.max(1) + 32 /* head/tail/signal */
 }
 
-fn next_pow2(n: u32) -> u32 {
-    let mut x = 1u32;
-    while x < n && x < u32::MAX / 2 {
-        x <<= 1;
-    }
-    x
-}
-
 /// Pick the deepest fusion level that fits in the per-SM SMEM budget
 /// alongside the scheduler overhead.
 pub fn choose_fusion(model: &PersistentModel, budget: &GpuBudget, max_active: u32) -> FusionLevel {
@@ -238,22 +212,13 @@ pub fn choose_fusion(model: &PersistentModel, budget: &GpuBudget, max_active: u3
     }
 }
 
-/// Build the persistent-kernel plan + the GPU-side scheduler.
+/// Build the decode-block plan.
 pub fn plan(model: &PersistentModel, budget: &GpuBudget, max_active: u32) -> PersistentPlan {
     let max_active = max_active.max(1);
-    let ring_capacity = next_pow2(max_active).max(16);
-    let slot_bytes = 64; // pointer + id + len + pad
-    let ring = RingBuffer {
-        capacity: ring_capacity,
-        slot_bytes,
-        pinned_bytes: (ring_capacity as u64) * (slot_bytes as u64),
-    };
     let sched_smem = scheduler_smem_bytes(max_active);
     let scheduler = Scheduler {
-        ring_buffer: ring,
         max_active,
         smem_scheduler_bytes: sched_smem,
-        continuous_batching: true,
     };
 
     let fusion = choose_fusion(model, budget, max_active);
@@ -336,19 +301,6 @@ mod tests {
             p.persistent_launches_per_layer,
             p.baseline_launches_per_layer
         );
-    }
-
-    #[test]
-    fn ring_capacity_is_power_of_two() {
-        let p = plan(&nslcoder_model(), &GpuBudget::default(), 33);
-        assert!(p.scheduler.ring_buffer.capacity.is_power_of_two());
-        assert!(p.scheduler.ring_buffer.capacity >= 64);
-    }
-
-    #[test]
-    fn continuous_batching_is_always_enabled() {
-        let p = plan(&nslcoder_model(), &GpuBudget::default(), 16);
-        assert!(p.scheduler.continuous_batching);
     }
 
     #[test]

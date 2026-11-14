@@ -211,6 +211,7 @@ fn kernel_cfg(vocab: u32, grammar_states: u32) -> FusedSampleKernelConfig {
         vocab_tile: 128,
         top_k: TOP_K,
         grammar_states,
+        norm_eps: 1e-5,
     }
 }
 

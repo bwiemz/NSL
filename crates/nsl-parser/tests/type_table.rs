@@ -37,5 +37,4 @@ cases! { ty;
     tensor_bounded_dimension: "Tensor<[SeqLen < 4096], f32>" => "(Tensor [SeqLen<4096] f32)";
     param_type: "Param<[768, 768], f32>" => "(Param [768 768] f32)";
     buffer_type: "Buffer<[10], i32>" => "(Buffer [10] i32)";
-    sparse_type: "Sparse<[100, 100], f32, csr>" => "(Sparse [100 100] f32 csr)";
 }

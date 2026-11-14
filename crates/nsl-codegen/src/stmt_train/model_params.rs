@@ -131,6 +131,7 @@ impl Compiler<'_> {
         });
         let param_paths = self.enumerate_model_tensor_paths(&model_var_name, &model_type_name);
         self.check_freeze_patterns(&model_var_name, &model_type_name, &param_paths)?;
+        self.check_wrga_decorators(&model_var_name, &model_type_name, &param_paths)?;
         let param_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
         for path in &param_paths {
             let param_ptr = self
@@ -357,10 +358,9 @@ impl Compiler<'_> {
                     // moment buffer(s)", activation with no effect, the
                     // exact shape the join defect had. A non-empty
                     // precision plan whose names join ZERO of this block's
-                    // params is certainly wrong; refuse it. (Partial joins
-                    // are the join's documented residual gaps and are not
-                    // judged here; the WGGO-path validate, when it runs,
-                    // still checks the stronger every-layer property.)
+                    // params is certainly wrong; refuse it. (A partial join
+                    // is reported below; the WGGO-path validate, when it
+                    // runs, still checks the stronger every-layer property.)
                     if crate::cpdt_precision_exec::joined_param_count(
                         &plan.precision,
                         &param_paths,
@@ -370,12 +370,28 @@ impl Compiler<'_> {
                             "--cpdt full derived a per-param precision plan \
                              from the weight map, but none of its parameter \
                              names join this train block's parameters — \
-                             either the weight file describes a different \
-                             model, or the parameter paths nest deeper than \
-                             the join's one-segment strip accommodates (a \
-                             recorded join limitation). Pass the checkpoint \
-                             for THIS model, or drop --cpdt.",
+                             the weight file describes a different model. \
+                             Pass the checkpoint for THIS model, or drop \
+                             --cpdt.",
                         ));
+                    }
+                    // Weights-file tensors that join no parameter have no
+                    // effect; say which, so a misnamed tensor is not taken
+                    // for one whose moments were reduced.
+                    let unjoined = crate::cpdt_precision_exec::unjoined_plan_names(
+                        &plan.precision,
+                        &param_paths,
+                    );
+                    if !unjoined.is_empty() {
+                        const SHOWN: usize = 5;
+                        nsl_log::nsl_log!(WARN, "cpdt",
+                            "[cpdt] {} tensor(s) in the weights file match no parameter of \
+                             this train block's model and take no part in the moment \
+                             precision plan: {}{}",
+                            unjoined.len(),
+                            unjoined.iter().take(SHOWN).copied().collect::<Vec<_>>().join(", "),
+                            if unjoined.len() > SHOWN { ", ..." } else { "" },
+                        );
                     }
                     Some(crate::cpdt_precision_exec::build_dtype_lists(
                         &plan.precision,
@@ -451,14 +467,26 @@ impl Compiler<'_> {
                         // arm is invisible — this one WAS silent, which is
                         // part of how its dead consult went unnoticed.
                         let sub32 = m.iter().chain(v.iter()).filter(|&&c| c != DTYPE_F32).count();
-                        nsl_log::nsl_log!(INFO, "cpdt", 
-                            "[cpdt] optimizer-moment precision active (CPDT \
-                             per-param plan): {sub32} first-moment buffer(s) in \
-                             BF16 storage; second moments stay FP32 \
-                             (device-resident; GPU runs use the CFTP-v7 PTX \
-                             cast kernels for the dequant->step->quant \
-                             envelope)."
-                        );
+                        if sub32 == 0 {
+                            // A plan that reduces nothing is not "active":
+                            // every parameter it names is one it holds at
+                            // full precision (an embedding, a norm, the
+                            // first or last block).
+                            nsl_log::nsl_log!(INFO, "cpdt",
+                                "[cpdt] optimizer-moment precision plan (CPDT per-param) \
+                                 reduces no moment: every parameter it names is held at \
+                                 FP32. All moments stay FP32."
+                            );
+                        } else {
+                            nsl_log::nsl_log!(INFO, "cpdt",
+                                "[cpdt] optimizer-moment precision active (CPDT \
+                                 per-param plan): {sub32} first-moment buffer(s) in \
+                                 BF16 storage; second moments stay FP32 \
+                                 (device-resident; GPU runs use the CFTP-v7 PTX \
+                                 cast kernels for the dequant->step->quant \
+                                 envelope)."
+                            );
+                        }
                         Some((m, v))
                     }
                     MPA::Inactive => None,

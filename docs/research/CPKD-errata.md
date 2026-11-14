@@ -208,10 +208,13 @@ re-checked.
   `crates/nsl-codegen/src/stmt_distill.rs`; `distill_as_train_block` in
   `crates/nsl-codegen/src/cpkd.rs` lowers it to a synthetic train block. It
   requires `--source-ad`; there is no tape fallback, and a step body that
-  source AD cannot extract is a hard error.
+  source AD cannot extract is a hard error. A loss written as an ordinary
+  function is extracted: source AD inlines it.
 - **Frozen teacher — implemented structurally.** Teacher fields enter the
   differentiated graph as inputs, not parameters, so no teacher gradient
-  exists. Teacher weights were checked unchanged after SGD at lr = 4.
+  exists. Teacher weights were checked unchanged after SGD at lr = 4. The
+  teacher is also evaluated rather than trained: inside a method called on
+  it, `dropout` is the identity and `is_training()` is false.
 - **Fused KL-CE kernel — implemented, narrower than proposed.**
   `build_forward` and `build_backward` in
   `crates/nsl-codegen/src/cpkd_fused_loss.rs`; `nsl_fused_kl_ce_forward` and
@@ -220,34 +223,39 @@ re-checked.
   teacher_hidden=, batch_size=, seq_len=)` on the distill block plus a
   `fused_kl_ce(...)` call in the step. It is f32 and GPU-only, needs hidden
   sizes that are multiples of 32 and literal alpha and T, and is capped at
-  `vocab_size <= 8192` (`KL_CE_MAX_VOCAB_V1`). The code's mathematics is
+  `vocab_size <= 8192` (`KL_CE_MAX_VOCAB_V1`). Where it does not apply (no
+  enabled decorator, `--target cpu`, `--training-reference`) the same call
+  is the composite below, so a distill block can use `fused_kl_ce` on any
+  model and on the CPU. The code's mathematics is
   right where the proposal's pseudo-code is not (E1): loss and all three
   student gradients agree with a PyTorch reference
   (`F.cross_entropy` plus `F.kl_div` scaled by T², mean over valid rows),
   the loss to about 1e-7 and the gradients to about 2e-8. The proposal's
   scope is unmet: its vocabulary of 32000, and this repository's
-  49152-vocabulary models, are above the cap. A CPU composite of the same
-  name in `stdlib/nsl/nn/losses.nsl` also matches PyTorch.
-- **`loss:` section — report-only.** It is parsed, range-checked and echoed
-  in the build report (`render_report` in `cpkd.rs`). None of `alpha`,
-  `temperature`, `feature_weight` or `feature_layers` changes the loss, which
-  is whatever the step body computes. Neither side is right: a declared loss
-  should drive the loss or be reported as unused.
+  49152-vocabulary models, are above the cap. The composite of the same
+  name in `stdlib/nsl/nn/losses.nsl` also matches PyTorch, under tape AD
+  and, inlined into a distill step, under source AD.
+- **`loss:` section — a checked statement, not a definition.** The loss is
+  whatever the step body computes. The section may state `alpha` and
+  `temperature`; they must then equal the literals of the block's
+  `fused_kl_ce(...)` call, and a section no such call consumes is a compile
+  error. `feature_weight` and `feature_layers` are refused. The build
+  report (`render_report` in `cpkd.rs`) prints the loss the step computes.
 - **Two-stream teacher scheduling — absent.** The build report prints
   "sequential". The code is right (E6).
-- **Spectral k-selector — dead code.** `effective_vocab_rank` and
-  `teacher_lm_head_rank` in `crates/nsl-codegen/src/cpkd_spectral.rs` have no
-  callers outside that file's own tests. The idea is unsound (E4), so neither
-  side is right.
+- **Spectral k-selector — absent.** `cpkd_spectral.rs` was removed: it had
+  no callers, and the idea is unsound (E4).
 - **Feature matching and attention transfer — absent.**
-  `attn_transfer = true` is a semantic error, which is the right behaviour
-  for an unimplemented feature.
+  `attn_transfer = true`, `feature_weight` and `feature_layers` are semantic
+  errors, which is the right behaviour for an unimplemented feature.
 - **CEP student design — report-only.**
   `nsl check --cpkd-design-student <budget> [--cpkd-target <gpu>]`
   (`run_cpkd_design` in `crates/nsl-cli/src/commands/cpkd_design.rs`,
   `design_student` and `select_layer_mapping` in
   `crates/nsl-codegen/src/cpkd_student.rs`) prints an advisory architecture
-  and layer map. No student source or weights are generated or initialised.
+  and layer map (one teacher layer per student layer, spread over the
+  teacher's depth, last to last). No student source or weights are
+  generated or initialised.
 - **WGGO variables — present, never enabled.**
   `crates/nsl-codegen/src/wggo_cpkd.rs` is a sidecar whose configuration
   (`constraints.cpkd`) is set only in test modules. Its costs are
@@ -255,14 +263,17 @@ re-checked.
   always chooses all-off.
 - **Absent altogether:** `distill_step`, `forward_with_intermediates`,
   `cosine_distance`, the `--distill` and `--teacher-weights` flags,
-  `cpkd_schedule.rs`, `cpkd_feature.rs`, and any teacher evaluation mode.
+  `cpkd_schedule.rs` and `cpkd_feature.rs`.
 
 Teacher and student may have different hidden sizes (checked at 32/64 and
 64/32). Different vocabularies are refused: the kernel takes one
 `vocab_size`. No file under `models/` or `examples/` contains a `distill`
-block, and the fused path is exercised end to end only by GPU tests that are
-ignored by default (`fused_kl_ce_step` in
-`crates/nsl-cli/tests/fused_loss_gradient_cert_gpu.rs`).
+block. The composite path is exercised end to end against PyTorch by
+default (`crates/nsl-cli/tests/cpkd_distill_loss_gate.rs`); the fused
+kernel only by GPU tests that are ignored by default (`fused_kl_ce_step` in
+`crates/nsl-cli/tests/fused_loss_gradient_cert_gpu.rs`, and
+`crates/nsl-cli/tests/fused_kl_ce_gpu_gate.rs`, which holds it to the same
+PyTorch numbers).
 
 Defects found in this code are listed in Part 5.
 
@@ -272,12 +283,13 @@ Defects found in this code are listed in Part 5.
 
 1. Rebuild the fused loss on the GEMM-chunked linear-CE path. That removes
    the 8192 cap for 2 · chunk · V · 4 bytes of scratch, independent of batch.
-2. Until then, let `fused_kl_ce` expand to its composite inside a distill
-   block when the kernel cannot fire, so it runs on every model and on CPU.
+2. Until then `fused_kl_ce` expands to its composite inside a distill block
+   wherever the kernel does not apply (done; Part 5).
 3. Drop spectral top-k and two-stream overlap as goals.
 4. Restate the memory case like-for-like, against Liger's fused loss (E3, E7).
-5. Add reverse-KL and JSD options, a logit-only preset (alpha = 0, T = 1), a
-   teacher evaluation mode, and a uniform, last-to-last default layer map.
+5. Add reverse-KL and JSD options and a logit-only preset (alpha = 0,
+   T = 1). (The teacher evaluation mode and the uniform, last-to-last layer
+   map are done; Part 5.)
 
 ---
 
@@ -286,77 +298,112 @@ Defects found in this code are listed in Part 5.
 The review also ran the code. This part lists what it found wrong in the
 implementation, as distinct from the proposal's own errors in Part 1. Fixed
 items are described in `CHANGELOG.md` under "Unreleased"; the open list is as
-of 2026-11-13. Each item ends with how it was established: reproduced by
-running, numeric check, or by reading the code only. File names given without
-a directory are under `crates/nsl-codegen/src/`.
+of 2026-11-13. File names given without a directory are under
+`crates/nsl-codegen/src/`.
 
 ### Fixed
 
-None of the defects below has been fixed.
+- A `let t = t0` of a tensor copied the handle without taking a reference,
+  so two owning names shared one: at module level, with the tensor used in
+  a train or distill step, the run ended with `free(): double free detected
+  in tcache 2`. The binding now retains, as the assignment `t = t0` did
+  (`compile_stmt_dispatch` in `stmt.rs`); test
+  `crates/nsl-cli/tests/module_tensor_alias_gate.rs`.
+- The teacher had no evaluation mode: `dropout(..., 0.5, true)` in its
+  forward fired on every distillation step, so the target the student was
+  fitted to changed from step to step, and a teacher built on the stdlib
+  `Dropout` module did not compile. Inside a method called on the teacher
+  (and anything it calls), `dropout` is now the identity whatever its
+  training argument and `is_training()` is false (`frozen_inline_depth` in
+  `source_ad.rs`). With `dropout(..., 0.5, true)` in the teacher the losses
+  match a PyTorch run with the teacher in `eval()`; test
+  `crates/nsl-cli/tests/cpkd_distill_loss_gate.rs`.
+- The `loss:` section was parsed, range-checked, echoed in the build report
+  and otherwise ignored, and call-site `fused_kl_ce(..., 0.6, 0.0)` or
+  `(..., 1.7, 2.0)` passed `nsl check` when the section omitted those keys.
+  Now `alpha` and `temperature` in the section must equal the literals of
+  the block's `fused_kl_ce(...)` call, and a section whose values no such
+  call consumes is a compile error; `feature_weight` and `feature_layers`
+  are refused (there is no feature matching); the call-site literals are
+  range-checked by `nsl check` whether or not the section restates them;
+  and the report prints the loss the step computes and what computes it.
+  Fixtures whose step body is not `fused_kl_ce` lost their `loss:` section.
+  Test `cpkd_distill_loss_gate.rs`.
+- `--target cpu` did not keep the fused path off the GPU: the lowering
+  allocated device tensors and launched the kernel. On a host-only target
+  the decorator is now set aside with a warning and `fused_kl_ce` is the
+  standard library's composite (`compile_train_block_inner` in
+  `stmt_train/driver.rs`). The test runs on a build without CUDA, where a
+  device allocation is fatal.
+- `fused_kl_ce` in a distill block had no fallback: where the kernel could
+  not fire, extraction failed and the build stopped. Without an enabled
+  `@fused_kl_ce` decorator the call now inlines the standard library's
+  composite, differentiated at compile time; its loss and the student's
+  updates over four SGD steps match PyTorch. An enabled decorator that
+  cannot build the kernel (a missing shape hint, a non-literal alpha) is a
+  compile error naming what is missing.
+- `--training-reference` did not run the composite baseline in a distill
+  block; the build ended in "distill step body could not be extracted for
+  source AD". It now runs the composite, as the comment in
+  `compile_train_block_inner` said, with the same PyTorch-checked numbers.
+- The build report said spectral logit compression was advisory, "see `nsl
+  check --cpkd-design-student` / cpkd_spectral"; that command never called
+  `cpkd_spectral.rs` and nothing else did. The report line is gone, and so
+  is `cpkd_spectral.rs` with its tests: it had no callers, its
+  `MAX_SKETCH_CAP` of 192 could not represent the proposal's own 500 to
+  2000, and the idea it served is unsound (E4).
+- The advisory layer map took the top-k teacher layers by importance and
+  paired them in order, so nothing stopped teacher layers 20 to 31 serving
+  a 12-layer student; with no `--weights` every score tied and the student
+  was mapped onto the teacher's first k layers; and a layer the importance
+  pass did not match was shown with an importance of 0.0.
+  `select_layer_mapping` (`cpkd_student.rs`) now cuts the teacher's depth
+  into one segment per student layer, takes the most important layer of
+  each segment (the deepest on a tie or with no scores), and always pairs
+  the last student layer with the last teacher layer. A layer without a
+  score is reported as having none. Unit tests in `cpkd_student.rs`.
+- A target the fused kernels could not use gave a NaN or infinite loss and
+  the step still updated: the kernels skip only target -100 while the
+  lowering's mask ignores every negative target, so -1 printed `NaN`, and a
+  target equal to the vocabulary size printed `inf`. The host-side copy of
+  the targets that both fused losses make before a launch now rewrites
+  every negative target to -100 and aborts, naming the row, on a target at
+  or above `vocab_size` (`normalize_fused_targets` in
+  `crates/nsl-runtime/src/fused_linear_ce.rs`), for `@fused_lm_ce` as well
+  as `@fused_kl_ce`. With -1 in place of -100 the fused loss and updates
+  match PyTorch; tests `crates/nsl-cli/tests/fused_kl_ce_gpu_gate.rs` (GPU)
+  and the unit tests beside `normalize_fused_targets`.
+- A fused KL-CE kernel launch that failed returned a code the compiled step
+  discarded, leaving a zero-filled loss buffer: loss 0, zero gradients, and
+  training continued. `nsl_fused_kl_ce_forward` and
+  `nsl_fused_kl_ce_backward` now report the CUDA error and exit with the
+  runtime's CUDA-driver code (13); a runtime built without CUDA exits the
+  same way instead of returning -1. Triggered on the GPU by asking a valid
+  module for an entry it does not have
+  (`a_failed_launch_exits_instead_of_returning` in
+  `crates/nsl-codegen/tests/cpkd_fused_kl_ce_numerical.rs`).
+- A wrong `batch_size` or `seq_len` on `@fused_kl_ce` aborted with a
+  message about "the @fused_lm_ce decorator", which the program does not
+  contain. `nsl_fused_lce_targets_i64_alloc` is now told which decorator
+  it is checking and names it. Test `fused_kl_ce_gpu_gate.rs` (GPU).
+- The on-device numerical test could not fail for dx_s, dW_s or the KL
+  term: its inputs were U(-0.3, 0.3), the reference gradient maxima were
+  below its absolute 5e-3 tolerance, and swapping the KL direction moved
+  the loss by less than its forward tolerance.
+  `crates/nsl-codegen/tests/cpkd_fused_kl_ce_numerical.rs` now draws from
+  U(-1, 1), compares against an f64 reference written out in the test,
+  holds the loss to 2e-5 and each gradient tensor to 1e-4 of its own
+  largest entry. Two further tests show it can fail: on the device, a
+  backward that never ran, another temperature and a missing KL term are
+  each reported; and reversing or dropping the KL term moves the reference
+  by more than a hundred times those tolerances.
 
 ### Open
 
-- **The teacher has no evaluation mode.** With `dropout(..., 0.5, true)` in
-  the teacher's forward and SGD at lr = 0, the loss changes every step (84.2,
-  85.6, 91.2, 93.7, 90.1); with `false` it is constant. Dropout is emitted
-  unless its training argument is a literal false or p = 0, and a teacher
-  using the stdlib `Dropout` module fails extraction. `extract_expr_inner`
-  (`source_ad.rs`). Reproduced by running.
-- **A bad target gives a NaN or infinite fused loss and the step still
-  updates.** The kernel skips only target −100; the host-side mask treats
-  every negative as ignored. Target −1 prints `NaN` and target = V prints
-  `inf`; the composite gives the −100 loss for −1 and aborts for V.
-  `build_forward`, `build_backward` (`cpkd_fused_loss.rs`);
-  `lower_fused_kl_ce_forward` (`wengert_lower.rs`). Reproduced by running.
-- **A failed kernel launch would train on a zero loss.** The return codes of
-  `nsl_fused_kl_ce_forward` and `nsl_fused_kl_ce_backward` are discarded; on
-  failure the zero-filled buffers give loss 0 and zero gradients and
-  training continues. It should abort. `lower_fused_kl_ce_forward`,
-  `lower_fused_kl_ce_backward_extract` (`wengert_lower.rs`). By reading the
-  code only; not triggered.
-- **The `loss:` section is accepted, reported and not honoured.** With
-  `alpha`, `temperature`, `feature_weight` and `feature_layers` set and a
-  step body of `mse_loss(s_logits, t_logits)`, the report prints the values
-  and none affects anything. Call-site `fused_kl_ce(..., 0.6, 0.0)` and
-  `(..., 1.7, 2.0)` pass `nsl check` when `loss:` omits those keys.
-  `render_report` (`cpkd.rs`). Reproduced by running.
-- **`--target cpu` does not keep the fused path off the GPU.** With
-  host-placed tensors and `--target cpu`, the log shows a device allocation
-  and the kernel's result. `lower_fused_kl_ce_forward` (`wengert_lower.rs`)
-  allocates device tensors unconditionally. Reproduced by running.
-- **`fused_kl_ce` in a distill block has no fallback.** When the kernel
-  cannot fire (any vocabulary above 8192) extraction fails and the build
-  stops, though every op of the composite is supported under source AD.
-  `stdlib/nsl/nn/losses.nsl` says the composites "run anywhere".
-  `extract_expr_inner` (`source_ad.rs`). Reproduced by running.
-- **`--training-reference` does not run the composite baseline in a distill
-  block.** A comment in `compile_train_block_inner`
-  (`stmt_train/driver.rs`) says it does; the build ends in "distill step
-  body could not be extracted for source AD". Reproduced by running.
-- **The build report points at an analysis that never runs.** It says
-  spectral compression is advisory, "see `nsl check --cpkd-design-student` /
-  cpkd_spectral"; that command never calls `cpkd_spectral.rs`, and nothing
-  else does. Its `MAX_SKETCH_CAP` of 192 could not represent the proposal's
-  own 500 to 2000. `render_report` (`cpkd.rs`). Reproduced by running; the
-  absence of callers by reading the code only.
-- **A wrong `batch_size` or `seq_len` on `@fused_kl_ce` is blamed on another
-  decorator.** The abort message says "the @fused_lm_ce decorator pins
-  batch_size * seq_len", which the program does not contain.
-  `nsl_fused_lce_targets_i64_alloc` in
-  `crates/nsl-runtime/src/fused_linear_ce.rs`. Reproduced by running.
-- **The advisory layer map can cluster.** It takes the top-k teacher layers
-  by importance and pairs them in order; nothing prevents, say, teacher
-  layers 20 to 31 for a 12-layer student, or guarantees last-to-last. Layers
-  the importance pass does not match score 0.0 silently. The CLI tests never
-  pass `--weights`. `select_layer_mapping` (`cpkd_student.rs`). By reading
-  the code only.
-- **The on-device numerical test cannot fail for dx_s, dW_s or the KL
-  term.** Inputs are U(−0.3, 0.3); the reference gradient maxima, 2.3e-3 and
-  4.2e-3, are below the 5e-3 absolute tolerance, so all-zero gradients pass.
-  Swapping the KL direction moves the loss 5.4e-5 against a 1e-3 tolerance.
-  `crates/nsl-codegen/tests/cpkd_fused_kl_ce_numerical.rs`. Numeric check.
-- **A module-level tensor alias aborts at exit.** This is a general
-  ownership defect found while testing, not part of CPKD: a module-level
-  `let t = t0` of a tensor that is then used inside a train or distill step
-  ends the run with `free(): double free detected in tcache 2`; the same
-  program without the alias exits cleanly. Reproduced by running.
+Nothing from this review is open. Two limits of the fixes above are worth
+knowing. The fused kernel is still capped at `vocab_size <= 8192` (Part 3);
+above it a distill block runs the composite, which materialises both logit
+tensors. And a student, unlike the teacher, is extracted in training mode
+only where its dropout is written with a literal training argument: a
+student built on the stdlib `Dropout` module, whose forward asks
+`is_training()`, still fails extraction inside a distill block.

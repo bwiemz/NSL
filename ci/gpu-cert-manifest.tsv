@@ -199,10 +199,6 @@ crates/nsl-codegen/tests/bitnet_gpu_correctness.rs	output_addressing_does_not_wr
 crates/nsl-codegen/tests/bitnet_gpu_correctness.rs	weight_scale_is_applied_multiplicatively	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/bitnet_logit_match.rs	end_to_end_logit_match_against_hf_b158_3b	broken	requires fetched HF checkpoint; run `bash scripts/fetch_bitnet_b158_3b.sh` then `cargo test -p nsl-codegen --test bitnet_logit_match -- --ignored` on Linux
 crates/nsl-codegen/tests/bitnet_reference.rs	generate_fixtures	generator	fixture generator — run manually when regenerating after deliberate ref-impl changes
-crates/nsl-codegen/tests/cfie_decode_attn_gpu_parity.rs	decode_attn_layer0_slot0_partial_tile_matches_cpu	gpu	requires CUDA GPU
-crates/nsl-codegen/tests/cfie_decode_attn_gpu_parity.rs	decode_attn_mid_pool_layer1_slot1_ignores_decoy_regions	gpu	requires CUDA GPU
-crates/nsl-codegen/tests/cfie_decode_attn_gpu_parity.rs	decode_attn_seq_len_zero_writes_zeros	gpu	requires CUDA GPU
-crates/nsl-codegen/tests/cfie_decode_attn_gpu_parity.rs	decode_attn_full_slot_seq_len_equals_per_slot	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/cfie_decode_block_gpu_parity.rs	decode_block_chained_positions_match_cpu_kv_append_chain	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/cfie_decode_block_gpu_parity.rs	decode_step_token_sequence_matches_cpu_chain	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/cfie_decode_block_gpu_parity.rs	decode_step_pos_mismatch_refuses_minus3_and_rolls_back	gpu	requires CUDA GPU
@@ -214,20 +210,12 @@ crates/nsl-codegen/tests/cfie_generate_gpu_e2e.rs	generate_token_sequence_matche
 crates/nsl-codegen/tests/cfie_generate_gpu_e2e.rs	eos_mid_generation_stops_early	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/cfie_generate_gpu_e2e.rs	out_cap_smaller_than_generated_clamps_without_overrun	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/cfie_generate_gpu_e2e.rs	regenerate_after_reset_and_rebind_reproduces	gpu	requires CUDA GPU
-crates/nsl-codegen/tests/cfie_kv_quant_gpu_parity.rs	quant_attn_layer0_int8_register_dequant_matches_cpu	gpu	requires CUDA GPU
-crates/nsl-codegen/tests/cfie_kv_quant_gpu_parity.rs	quant_attn_layer1_fp16_mid_pool_ignores_decoy_regions	gpu	requires CUDA GPU
-crates/nsl-codegen/tests/cfie_kv_quant_gpu_parity.rs	quant_attn_both_layers_back_to_back_use_their_own_registration	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/cfie_serve_binary_gpu_e2e.rs	built_serve_binary_generates_expected_text_on_gpu	gpu	requires CUDA GPU + builds the CLI
-crates/nsl-codegen/tests/cfie_speculative_generate_gpu_e2e.rs	lossless_self_speculation_matches_generate_exactly	gpu	requires CUDA GPU
-crates/nsl-codegen/tests/cfie_speculative_generate_gpu_e2e.rs	draft_differs_from_target_matches_cpu_mirror_with_rejections	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/cfie_speculative_generate_gpu_e2e.rs	decoding_samples_the_configured_distribution_with_and_without_a_draft	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/cfie_speculative_generate_gpu_e2e.rs	self_speculation_matches_plain_decoding_exactly	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/cfie_speculative_generate_gpu_e2e.rs	a_different_draft_does_not_change_the_output	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/cfie_speculative_generate_gpu_e2e.rs	speculative_eos_stops_early	gpu	requires CUDA GPU
-crates/nsl-codegen/tests/cfie_speculative_generate_gpu_e2e.rs	speculative_capacity_tail_fallback_matches_generate	gpu	requires CUDA GPU
-crates/nsl-codegen/tests/cfie_speculative_gpu_parity.rs	spec_verify_tree_mask_layer0_slot0_matches_cpu	gpu	requires CUDA GPU
-crates/nsl-codegen/tests/cfie_speculative_gpu_parity.rs	spec_verify_mid_pool_layer1_slot1_ignores_decoy_regions	gpu	requires CUDA GPU
-crates/nsl-codegen/tests/cfie_speculative_gpu_parity.rs	spec_verify_seq_len_zero_tree_mask_only_matches_cpu	gpu	requires CUDA GPU
-crates/nsl-codegen/tests/cfie_speculative_gpu_parity.rs	spec_reject_profiles_match_cpu_exactly	gpu	requires CUDA GPU
-crates/nsl-codegen/tests/cfie_speculative_gpu_parity.rs	spec_reject_seeded_profiles_and_zero_seed_guard_match_cpu_exactly	gpu	requires CUDA GPU
-crates/nsl-codegen/tests/cfie_speculative_gpu_parity.rs	spec_reject_k_tokens_edges_match_cpu_exactly	gpu	requires CUDA GPU
+crates/nsl-codegen/tests/cfie_speculative_generate_gpu_e2e.rs	speculative_capacity_tail_matches_plain_decoding	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/cfie_weight_binding_gpu_parity.rs	ffi_uploaded_weights_drive_decode_step_matches_cpu_chain	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/cfie_weight_binding_gpu_parity.rs	upload_zero_elems_refuses_minus1	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/cpdt_precision_fp16_weights_gen.rs	gen_cpdt_precision_fp16_weights	generator	generator: rewrites tests/fixtures/cpdt_precision_fp16_weights.safetensors; manual invocation only

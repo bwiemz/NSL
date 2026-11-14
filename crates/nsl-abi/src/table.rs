@@ -442,11 +442,12 @@ macro_rules! for_each_runtime_fn {
             [abi_tensor] nsl_tensor_cast_from_host(i64, i64) -> i64 = tensor::precision_cast::nsl_tensor_cast_from_host;
             // CFTP v6 forward inline-cast wrappers: src_ptr -> new tensor (scope-tracked).
             [abi_tensor] nsl_tensor_to_bf16(i64) -> i64 = tensor::precision_cast::nsl_tensor_to_bf16;
+            // CCR compressed saves: f32 -> bf16, refusing any other source dtype.
+            [abi_tensor] nsl_ccr_compress_bf16(i64) -> i64 = tensor::precision_cast::nsl_ccr_compress_bf16;
             [abi_tensor] nsl_tensor_to_fp16(i64) -> i64 = tensor::precision_cast::nsl_tensor_to_fp16;
             [abi_tensor] nsl_tensor_to_f32(i64) -> i64 = tensor::precision_cast::nsl_tensor_to_f32;
             [abi_tensor] nsl_tensor_to_dtype(i64, i64) -> i64 = tensor::precision_cast::nsl_tensor_to_dtype;
             // M52c: CSR sparse matmul (row_ptrs, col_indices, values, B, nrows, ncols, nnz) -> C
-            [abi_tensor] nsl_sparse_matmul(i64, i64, i64, i64, i64, i64, i64) -> i64 = tensor::arithmetic::nsl_sparse_matmul;
             // Fused RoPE backward: -rotate_half(dy) in one launch (bit-exact)
             [abi_tensor] nsl_tensor_rotate_half_neg(i64) -> i64 = tensor::shape_ops::nsl_tensor_rotate_half_neg;
             [abi_tensor] nsl_tensor_softmax(i64, i64) -> i64 = tensor::reduction::nsl_tensor_softmax;
@@ -458,6 +459,9 @@ macro_rules! for_each_runtime_fn {
             [abi_tensor] nsl_rmsnorm_dgamma_backward(i64, i64, i64, f64) -> i64 = tensor::nsl_rmsnorm_dgamma_backward;
             // Source AD: reduce gradient to match parameter shape (matmul broadcast backward)
             [abi_tensor] nsl_tensor_reduce_to_shape(i64, i64) -> i64 = tensor::ad_ops::nsl_tensor_reduce_to_shape;
+            // CCR: a one-element broadcast view with the operand's shape and device, read by
+            // `nsl_tensor_reduce_to_shape` in place of a block interior freed after the forward.
+            [abi_tensor] nsl_tensor_shape_stub(i64) -> i64 = tensor::ad_ops::nsl_tensor_shape_stub;
             // Source-AD dropout forward: returns an NslList [out, mask] so the
             // compiled backward can consume the exact RNG mask (two-op split,
             // wengert.rs DropoutMask).
@@ -550,24 +554,6 @@ macro_rules! for_each_runtime_fn {
             // runtime and the fingerprint cannot disagree about which arithmetic ran.
             // (mode, rounding, min_ratio, cast_cache, lt, lt_workspace_mib, lt_tune)
             [abi_tensor] nsl_set_matmul_config(i64, i64, f64, i64, i64, i64, i64) -> i64 = matmul_config::nsl_set_matmul_config;
-            // --- M50: Sparse tensors ---
-            [abi_tensor] nsl_sparse_coo(i64, i64, i64, i64, i64, i64) -> i64 = sparse::nsl_sparse_coo;
-            [abi_tensor] nsl_sparse_from_dense(i64, i64, i64) -> i64 = sparse::nsl_sparse_from_dense;
-            // M50b: +threshold
-            [abi_tensor] nsl_sparse_to_dense(i64) -> i64 = sparse::nsl_sparse_to_dense;
-            [abi_tensor] nsl_sparse_nnz(i64) -> i64 = sparse::nsl_sparse_nnz;
-            [abi_tensor] nsl_sparse_density(i64) -> i64 = sparse::nsl_sparse_density;
-            [abi_tensor] nsl_sparse_spmm(i64, i64) -> i64 = sparse::nsl_sparse_spmm;
-            [abi_tensor] nsl_sparse_spmv(i64, i64) -> i64 = sparse::nsl_sparse_spmv;
-            [abi_tensor] nsl_sparse_coo_to_csr(i64) -> i64 = sparse::nsl_sparse_coo_to_csr;
-            [abi_tensor] nsl_sparse_coo_to_csc(i64) -> i64 = sparse::nsl_sparse_coo_to_csc;
-            [abi_tensor] nsl_sparse_csr_to_csc(i64) -> i64 = sparse::nsl_sparse_csr_to_csc;
-            [abi_tensor] nsl_sparse_csc_to_csr(i64) -> i64 = sparse::nsl_sparse_csc_to_csr;
-            [abi_tensor] nsl_sparse_csr_to_coo(i64) -> i64 = sparse::nsl_sparse_csr_to_coo;
-            [abi_tensor] nsl_sparse_csc_to_coo(i64) -> i64 = sparse::nsl_sparse_csc_to_coo;
-            [abi_tensor] nsl_sparse_add(i64, i64) -> i64 = sparse::nsl_sparse_add;
-            [abi_tensor] nsl_sparse_mul(i64, i64) -> i64 = sparse::nsl_sparse_mul;
-            [abi_tensor] nsl_sparse_free(i64) -> i64 = sparse::nsl_sparse_free;
             // --- M40: Source AD runtime helpers ---
             [abi_tensor] nsl_tensor_compare(i64, i64, i64) -> i64 = tensor::ad_ops::nsl_tensor_compare;
             [abi_tensor] nsl_tensor_where(i64, i64, i64) -> i64 = tensor::ad_ops::nsl_tensor_where;
@@ -640,6 +626,20 @@ macro_rules! for_each_runtime_fn {
             // `model_load`: also checks each entry's name against the live parameter
             // at its position (path_ptr, path_len, names_list, param_list).
             [training] nsl_model_load_named(i64, i64, i64, i64) -> () = checkpoint::nsl_model_load_named;
+            // `model_load` of a model with adapters: the tensors past `base_count` are
+            // adapter tensors, which the file may hold or leave out
+            // (path_ptr, path_len, names_list, param_list, base_count).
+            [training] nsl_model_load_with_adapters(i64, i64, i64, i64, i64) -> () = checkpoint::nsl_model_load_with_adapters;
+            // `-w`: open the weights file at startup and check the tensors the compile
+            // specialized on (path_ptr, path_len, expectation_table_ptr, table_len); then
+            // each model constructor copies a named tensor into a field
+            // (tensor, name_ptr, name_len, strict: 0 skips a tensor whose
+            // shape is not the field's).
+            [training] nsl_weights_bind(i64, i64, i64, i64) -> () = weights_file::nsl_weights_bind;
+            [training] nsl_weights_load_field(i64, i64, i64, i64) -> () = weights_file::nsl_weights_load_field;
+            // A constant folded from two weights, converted to the dtype and device
+            // of an operand of the operation it replaces (constant, like) -> owned.
+            [training] nsl_weights_const_like(i64, i64) -> i64 = weights_file::nsl_weights_const_like;
             // Milestone B + item 8: full training-state checkpoint (θ .nslm + .optim
             // sidecar with m/v moments, micro-batch step counter, data position and
             // RNG state). Save: (path_ptr, path_len, names_list, param_list,
@@ -740,7 +740,10 @@ macro_rules! for_each_runtime_fn {
             // each fused forward/backward FFI.
             // Second arg: expected row count (decorator batch*seq) — the runtime
             // aborts loudly on mismatch instead of overreading the staging buffer.
-            [training] nsl_fused_lce_targets_i64_alloc(i64, i64) -> i64 = fused_linear_ce::nsl_fused_lce_targets_i64_alloc;
+            // Third: vocab_size, for the label range check (negatives become
+            // the ignore index, a label >= vocab aborts). Fourth: which
+            // decorator the site belongs to (0 @fused_lm_ce, 1 @fused_kl_ce).
+            [training] nsl_fused_lce_targets_i64_alloc(i64, i64, i64, i64) -> i64 = fused_linear_ce::nsl_fused_lce_targets_i64_alloc;
             // (x_tensor, w_tensor, batch, seq, vocab_size, hidden_size, site_code)
             // -> void. Aborts when the decorator hints disagree with the head
             // tensors. batch and seq stay SEPARATE: collapsing them to rows here
@@ -815,6 +818,9 @@ macro_rules! for_each_runtime_fn {
             [optimizer] nsl_fase_sum_sq_list(i64) -> f64 = fase_step::nsl_fase_sum_sq_list;
             // FASE Deferred bias correction: 1/(1 - base^step).  Scalar, no tensor args.
             [optimizer] nsl_bias_correction_inv(f64, i64) -> f64 = fase_bc::nsl_bias_correction_inv;
+            // A trailing partial accumulation window that was not stepped on:
+            // (pending micro-batches, window, reason code) -> stderr warning.
+            [optimizer] nsl_train_partial_window_dropped(i64, i64, i64) -> () = fase_bc::nsl_train_partial_window_dropped;
             // AdamW parameter groups: resolve ONE param's weight decay from its
             // compile-time role flag + its runtime rank.
             // (param, static_exempt, exempt_non_rank2, wd) -> wd_for_this_param
@@ -955,8 +961,8 @@ macro_rules! for_each_runtime_fn {
             [inference] nsl_standalone_arg_float_default(i64, i64, i64) -> i64 = weight_provider::nsl_standalone_arg_float_default;
             [inference] nsl_standalone_args_finish() -> () = weight_provider::nsl_standalone_args_finish;
             // Paged KV-cache (M25)
-            [inference] nsl_kv_cache_init(i64, i64, i64, i64, i64, i64, i64, i64) -> i64 = paged_kv::manager::nsl_kv_cache_init;
-            [inference] nsl_kv_cache_init_gpu(i64, i64, i64, i64, i64, i64, i64, i64) -> i64 = paged_kv::manager::nsl_kv_cache_init_gpu;
+            [inference] nsl_kv_cache_init(i64, i64, i64, i64, i64) -> i64 = paged_kv::manager::nsl_kv_cache_init;
+            [inference] nsl_kv_cache_init_gpu(i64, i64, i64, i64, i64) -> i64 = paged_kv::manager::nsl_kv_cache_init_gpu;
             [inference] nsl_kv_cache_alloc_seq(i64) -> i64 = paged_kv::manager::nsl_kv_cache_alloc_seq;
             [inference] nsl_kv_cache_append(i64, i64) -> i64 = paged_kv::manager::nsl_kv_cache_append;
             [inference] nsl_kv_cache_k_ptr(i64, i64, i64) -> i64 = paged_kv::manager::nsl_kv_cache_k_ptr;
@@ -977,11 +983,7 @@ macro_rules! for_each_runtime_fn {
             [inference] nsl_serve_completed_count() -> i64 = serving::ffi::nsl_serve_completed_count;
             [inference] nsl_serve_preempt(i64) -> i64 = serving::ffi::nsl_serve_preempt;
             [inference] nsl_serve_destroy() -> i64 = serving::ffi::nsl_serve_destroy;
-            // --- CFIE: continuous-batching request ring + grammar-table helper ---
-            [inference] nsl_cfie_ring_init(i64) -> i64 = cfie::ffi::nsl_cfie_ring_init;
-            [inference] nsl_cfie_ring_push(i64, i64, i64, i64, i64, i64) -> i64 = cfie::ffi::nsl_cfie_ring_push;
-            [inference] nsl_cfie_ring_pop(i64, i64, i64, i64, i64, i64) -> i64 = cfie::ffi::nsl_cfie_ring_pop;
-            [inference] nsl_cfie_ring_len() -> i64 = cfie::ffi::nsl_cfie_ring_len;
+            // --- CFIE: grammar-table lookup (host-side; tests only) ---
             [inference] nsl_cfie_grammar_transition(i64, i64, i64, i64, i64) -> i64 = cfie::ffi::nsl_cfie_grammar_transition;
             // --- CFIE: KV sequence-slot free-list ---
             [inference] nsl_cfie_kv_slots_init(i64, i64) -> i64 = cfie::ffi::nsl_cfie_kv_slots_init;
@@ -991,11 +993,9 @@ macro_rules! for_each_runtime_fn {
             [inference] nsl_cfie_kv_slot_rollback(i64, i64) -> i64 = cfie::ffi::nsl_cfie_kv_slot_rollback;
             [inference] nsl_cfie_kv_slots_active() -> i64 = cfie::ffi::nsl_cfie_kv_slots_active;
             [inference] nsl_cfie_kv_attach_device(i64, i64) -> i64 = cfie::ffi::nsl_cfie_kv_attach_device;
-            // --- CFIE Cycle 6: compiled-engine registration/lifecycle + launch
-            // FFIs (frozen ABI).  All params/returns i64; f32 kernel params are
-            // passed as f32::to_bits in the LOW 32 bits.  Kernel kinds:
-            // 0=decode_attn, 1=fused_sample, 2=decode_block, 3=spec_verify,
-            // 4=spec_reject, 5=quant_attn (layer_idx meaningful only for 5). ---
+            // --- CFIE: compiled-engine registration/lifecycle + launch FFIs.
+            // All params/returns i64.  Kernel kinds: 1=fused_sample,
+            // 2=decode_block, 6=draft decode_block, 7=draft_sample. ---
             [inference] nsl_cfie_register_kernel(i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 = cfie::engine::nsl_cfie_register_kernel;
             [inference] nsl_cfie_kv_pool_alloc(i64) -> i64 = cfie::engine::nsl_cfie_kv_pool_alloc;
             // bytes
@@ -1007,12 +1007,8 @@ macro_rules! for_each_runtime_fn {
             [inference] nsl_cfie_upload_weight_f16(i64, i64) -> i64 = cfie::engine::nsl_cfie_upload_weight_f16;
             [inference] nsl_cfie_upload_weight_f32(i64, i64) -> i64 = cfie::engine::nsl_cfie_upload_weight_f32;
             [inference] nsl_cfie_weights_reset() -> i64 = cfie::engine::nsl_cfie_weights_reset;
-            [inference] nsl_cfie_launch_decode_attn(i64, i64, i64, i64, i64) -> i64 = cfie::engine::nsl_cfie_launch_decode_attn;
             [inference] nsl_cfie_launch_fused_sample(i64, i64, i64, i64, i64, i64) -> i64 = cfie::engine::nsl_cfie_launch_fused_sample;
             [inference] nsl_cfie_launch_decode_block(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 = cfie::engine::nsl_cfie_launch_decode_block;
-            [inference] nsl_cfie_launch_spec_verify(i64, i64, i64, i64, i64) -> i64 = cfie::engine::nsl_cfie_launch_spec_verify;
-            [inference] nsl_cfie_launch_spec_reject(i64, i64, i64, i64, i64, i64) -> i64 = cfie::engine::nsl_cfie_launch_spec_reject;
-            [inference] nsl_cfie_launch_quant_attn(i64, i64, i64, i64, i64, i64, i64) -> i64 = cfie::engine::nsl_cfie_launch_quant_attn;
             [inference] nsl_cfie_decode_step(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 = cfie::engine::nsl_cfie_decode_step;
             // --- CFIE Cycle 10: model binding + generation driver. bind_model
             // resolves an NslModel's host f32 weights by the HF-Llama name
@@ -1034,7 +1030,7 @@ macro_rules! for_each_runtime_fn {
             // serve wiring emits bind_draft_model/draft_pool_alloc at serve init
             // (after the target bind) and speculative_generate from the
             // endpoint's generate() when the speculative draft is configured;
-            // the launch FFIs are the kind-6/7/8 wrappers the driver uses
+            // the launch FFIs are the kind-6/7 wrappers the driver uses
             // internally (registered for ABI completeness + direct testing). ---
             [inference] nsl_cfie_bind_draft_model(i64, i64, i64, i64, i64, i64, i64, i64) -> i64 = cfie::engine::nsl_cfie_bind_draft_model;
             [inference] nsl_cfie_draft_pool_alloc(i64) -> i64 = cfie::engine::nsl_cfie_draft_pool_alloc;
@@ -1042,7 +1038,6 @@ macro_rules! for_each_runtime_fn {
             [inference] nsl_cfie_draft_reset() -> i64 = cfie::engine::nsl_cfie_draft_reset;
             [inference] nsl_cfie_launch_draft_block(i64, i64, i64, i64) -> i64 = cfie::engine::nsl_cfie_launch_draft_block;
             [inference] nsl_cfie_launch_draft_sample(i64, i64, i64, i64) -> i64 = cfie::engine::nsl_cfie_launch_draft_sample;
-            [inference] nsl_cfie_launch_verify_probs(i64, i64) -> i64 = cfie::engine::nsl_cfie_launch_verify_probs;
             [inference] nsl_cfie_speculative_generate(i64, i64, i64, i64, i64, i64, i64, i64) -> i64 = cfie::engine::nsl_cfie_speculative_generate;
             // --- M32: MoE runtime functions ---
             [inference] nsl_moe_route(i64, i64, i64, i64, i64, i64) -> i64 = moe::ffi::nsl_moe_route;
@@ -1127,13 +1122,10 @@ macro_rules! for_each_runtime_fn {
             [quantization] nsl_fp8_gradient_scale(i64) -> f64 = fp8::nsl_fp8_gradient_scale;
             [quantization] nsl_fp8_cache_e5m2_ptx(i64, i64) -> () = fp8::nsl_fp8_cache_e5m2_ptx;
             [quantization] nsl_fp8_update_calibration(i64, i64, f64) -> f64 = fp8::nsl_fp8_update_calibration;
-            // --- M35: AWQ 4-bit quantization ---
+            // --- M35: 4-bit packed weight, per-group round-to-nearest (named AWQ; see awq.rs) ---
             [quantization] nsl_awq_quantize(i64, i64, i64) -> i64 = awq::nsl_awq_quantize;
             [quantization] nsl_awq_matmul(i64, i64, i64) -> i64 = awq::nsl_awq_matmul;
             [quantization] nsl_awq_free(i64) -> () = awq::nsl_awq_free;
-            // AWQ calibration sidecar: apply per-channel scales to weight tensor before quantizing.
-            // Signature: (weight_ptr, scales_ptr, scales_len, alpha) -> scaled_weight_ptr
-            [quantization] nsl_awq_pre_scale_weight(i64, i64, i64, f64) -> i64 = awq::nsl_awq_pre_scale_weight;
             // --- M35: GPTQ quantization ---
             [quantization] nsl_gptq_quantize(i64, i64, i64, i64) -> i64 = gptq::nsl_gptq_quantize;
             [quantization] nsl_gptq_quantize_ext(i64, i64, i64, i64, i64, i64, i64) -> i64 = gptq::nsl_gptq_quantize_ext;
@@ -1143,16 +1135,8 @@ macro_rules! for_each_runtime_fn {
             [quantization] nsl_gptq_hessian_add_batch(i64) -> i64 = gptq::nsl_gptq_hessian_add_batch;
             [quantization] nsl_gptq_hessian_finalize() -> i64 = gptq::nsl_gptq_hessian_finalize;
             // --- M42: KV-cache compression ---
-            [quantization] nsl_kv_quantize_and_store(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 = kv_compress::ffi::nsl_kv_quantize_and_store;
-            [quantization] nsl_kv_sliding_window_init(i64, i64, i64) -> i64 = kv_compress::ffi::nsl_kv_sliding_window_init;
-            [quantization] nsl_kv_sliding_window_check(i64, i64, i64, i64) -> i64 = kv_compress::ffi::nsl_kv_sliding_window_check;
-            [quantization] nsl_kv_sliding_window_destroy() -> i64 = kv_compress::ffi::nsl_kv_sliding_window_destroy;
-            [quantization] nsl_kv_h2o_init(i64, i64, i64) -> i64 = kv_compress::ffi::nsl_kv_h2o_init;
-            [quantization] nsl_kv_h2o_accumulate(i64, i64, i64) -> i64 = kv_compress::ffi::nsl_kv_h2o_accumulate;
-            [quantization] nsl_kv_h2o_check(i64, i64, i64, i64) -> i64 = kv_compress::ffi::nsl_kv_h2o_check;
-            [quantization] nsl_kv_h2o_remove_sequence(i64) -> i64 = kv_compress::ffi::nsl_kv_h2o_remove_sequence;
-            [quantization] nsl_kv_h2o_destroy() -> i64 = kv_compress::ffi::nsl_kv_h2o_destroy;
-            [quantization] nsl_kv_compress_ratio(i64) -> i64 = kv_compress::ffi::nsl_kv_compress_ratio;
+            [quantization] nsl_kv_quantize_and_store(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 = kv_compress::ffi::nsl_kv_quantize_and_store;
+            [quantization] nsl_kv_compress_ratio(i64, i64, i64, i64) -> i64 = kv_compress::ffi::nsl_kv_compress_ratio;
 
             // ── diagnostics (was runtime_abi/diagnostics.rs) ──
             // Training diagnostics (temporary)
@@ -1352,6 +1336,6 @@ mod tests {
     fn table_is_the_recorded_size() {
         // The count is pinned so a row dropped by a bad merge is noticed; move
         // it with a row that is deliberately added or removed.
-        assert_eq!(RUNTIME_ABI.len(), 678);
+        assert_eq!(RUNTIME_ABI.len(), 650);
     }
 }

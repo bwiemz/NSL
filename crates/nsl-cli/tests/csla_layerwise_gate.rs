@@ -112,6 +112,14 @@ fn run_program_env(
         .arg(&prog)
         .current_dir(&tmp)
         .env("NSL_STDLIB_PATH", root.join("stdlib"))
+        // A run that ends inside an accumulation window: the interleaved
+        // schedule steps once more on what the window holds, and the
+        // layer-major schedule (`--layerwise-accum`) cannot. The fixtures
+        // here end one micro-batch into a window, and the comparisons are
+        // of the windows both schedules run, so every arm is compiled with
+        // that last step off. (It has its own gate,
+        // `accumulation_full_buffer_gate.rs`.)
+        .env("NSL_FASE_FLUSH_TAIL", "0")
         // Anti-vacuity counter report on every arm; deterministic embedding
         // scatter for the CPU cases (harmless there, load-bearing on GPU
         // EmbedCpu-style runs).
@@ -335,8 +343,9 @@ fn parity_case_with_schedule(
         csla.stderr
     );
     // Anti-vacuity: the window backward fired exactly once per complete
-    // accumulation window (trailing partial windows never fire, matching the
-    // baseline's discarded m_partial tail).
+    // accumulation window (trailing partial windows never fire; the
+    // baseline arm drops the same tail because the harness compiles it
+    // with NSL_FASE_FLUSH_TAIL=0).
     assert_eq!(
         window_phase_count(&csla.stderr),
         Some(expected_windows),
@@ -381,7 +390,7 @@ fn parity_case_with_schedule(
 /// batches, N=2): exercises the save/replay machinery AND the teardown sweep.
 #[test]
 fn csla_parity_ffn_cpu() {
-    parity_case_with_schedule(
+    let (base, csla) = parity_case_with_schedule(
         "csla_layerwise_ffn.nsl",
         false,
         false,
@@ -390,6 +399,21 @@ fn csla_parity_ffn_cpu() {
         &[],
         6,
         Some("[csla] layer-major schedule: 3 ranges, 6 layer-grouped params, 2 epilogue params"),
+    );
+    // The thirteenth micro-batch is not applied by either arm, and each
+    // says so, with its own reason: the window schedule cannot step on a
+    // partial window, and the baseline was compiled not to (see the note
+    // at `NSL_FASE_FLUSH_TAIL` in `run_program_env`).
+    const DROPPED: &str = "training ended 1 micro-batch(es) into a gradient-accumulation window of 2";
+    assert!(
+        csla.stderr.contains(DROPPED) && csla.stderr.contains("--layerwise-accum replays whole windows only"),
+        "the layerwise arm did not report its dropped micro-batch:\n{}",
+        csla.stderr
+    );
+    assert!(
+        base.stderr.contains(DROPPED) && base.stderr.contains("NSL_FASE_FLUSH_TAIL=0"),
+        "the baseline arm did not report its dropped micro-batch:\n{}",
+        base.stderr
     );
 }
 

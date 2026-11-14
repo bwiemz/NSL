@@ -56,7 +56,7 @@ impl LayerCostEntry {
 }
 
 /// Shape parameters for one transformer layer.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct LayerShape {
     pub batch: u64,
     pub seq: u64,
@@ -143,6 +143,21 @@ impl LayerCostLut {
         Some(self.entries[self.index(hi, fi, ci, ri)])
     }
 
+    /// The entry for the layer as written — every head, its widest FFN, the
+    /// smallest adapter rank on the axis — at the cheapest feasible CSHA
+    /// level. This is what a layer the Level-1 DP keeps is, before Level 2
+    /// decides anything; the DP sizes and costs kept layers from it.
+    pub fn as_written(&self) -> Option<LayerCostEntry> {
+        let heads = self.axes_head_counts.iter().copied().max()?;
+        let ffn = self.axes_ffn_widths.iter().copied().max()?;
+        let rank = self.axes_adapter_ranks.iter().copied().min()?;
+        self.axes_csha_levels
+            .iter()
+            .filter_map(|&c| self.get(heads, ffn, c, rank))
+            .filter(|e| e.feasible)
+            .min_by(|a, b| a.total_us().total_cmp(&b.total_us()))
+    }
+
     /// Cheapest feasible entry, if any.  Returned tuple is `(heads, ffn,
     /// csha, rank, entry)`.
     pub fn argmin_feasible(&self) -> Option<(u64, u64, u8, u64, LayerCostEntry)> {
@@ -202,6 +217,148 @@ pub fn build_lut(shape: &LayerShape, gpu: &GpuSpec, axes: &LutAxes) -> LayerCost
     }
 }
 
+/// Build one layer's LUT from the layer's own geometry
+/// ([`crate::wggo_model_shape::LayerGeometry`]): its real matrix products,
+/// normalisations, attention shape, parameter count and activations.
+///
+/// The head axis is `1..=n_heads` of the layer (a single placeholder entry
+/// for a layer with no attention call, which then offers no head or CSHA
+/// decision); the FFN axis is the layer's one real inner width, because no
+/// pass lowers a thinner one. `axes` supplies the CSHA levels and adapter
+/// ranks.
+///
+/// At a candidate that keeps `h` of `H` heads, the Q and O projections are
+/// costed and sized at `h / H` of their width and the K and V projections
+/// at the whole key/value groups those heads need; at `h == H` the
+/// parameter bytes are exactly the layer's. The time model is otherwise the
+/// one [`build_lut`] applies to a nominal layer: roofline latency of each
+/// product, the softmax as the only term quadratic in sequence length, a
+/// CSHA discount on the layer, backward as twice forward.
+pub fn build_layer_lut(
+    layer: &crate::wggo_model_shape::LayerGeometry,
+    dtype_bytes: u64,
+    gpu: &GpuSpec,
+    axes: &LutAxes,
+) -> LayerCostLut {
+    use crate::wggo_ilp::ProjRole;
+    let attn = layer.attention;
+    let head_counts: Vec<u64> = match attn {
+        Some(a) => (1..=a.n_heads).collect(),
+        None => vec![1],
+    };
+    let csha_levels: Vec<u8> = if attn.is_some() {
+        axes.csha_levels.clone()
+    } else {
+        vec![0]
+    };
+    let ffn_widths = vec![layer.ffn_width];
+    let dtype = dtype_bytes as usize;
+    // Shared memory is sized for the fused kernel's tiles, which are f16
+    // whatever the model's element width: the same 2-byte shape CSHA plans
+    // on, so the two passes get the same figure.
+    let shape = layer.layer_shape(2);
+    let smem_budget = crate::csha_pipeline::smem_budget_bytes(gpu);
+    let max_rows = layer.matmuls.iter().map(|m| m.rows).max().unwrap_or(0);
+
+    let mut entries = Vec::with_capacity(
+        head_counts.len() * csha_levels.len() * axes.adapter_ranks.len(),
+    );
+    for &heads in &head_counts {
+        // Fractions of the attention projections this candidate keeps.
+        let (h_num, h_den, kv_num, kv_den) = match attn {
+            Some(a) => (
+                heads,
+                a.n_heads,
+                heads.div_ceil(a.group()).min(a.n_kv_heads),
+                a.n_kv_heads,
+            ),
+            None => (1, 1, 1, 1),
+        };
+        let mut matmul_us = 0.0;
+        let mut widest: Option<(u64, u64, u64)> = None;
+        for m in &layer.matmuls {
+            let (k, n) = match m.role {
+                Some(ProjRole::Q) => (m.in_dim, m.out_dim * h_num / h_den),
+                Some(ProjRole::K) | Some(ProjRole::V) => (m.in_dim, m.out_dim * kv_num / kv_den),
+                Some(ProjRole::O) => (m.in_dim * h_num / h_den, m.out_dim),
+                _ => (m.in_dim, m.out_dim),
+            };
+            let (flops, br, bw) = matmul_cost(m.rows, k, n, dtype_bytes);
+            matmul_us += latency_us(flops, br + bw, gpu, dtype);
+            if widest.is_none_or(|(f, ..)| flops > f) {
+                widest = Some((flops, br, bw));
+            }
+        }
+        let norm_us: f64 = layer
+            .norms
+            .iter()
+            .map(|&(elements, width)| {
+                let (f, r, w) = rmsnorm_cost(1, elements / width.max(1), width, dtype_bytes);
+                latency_us(f, r + w, gpu, dtype)
+            })
+            .sum();
+        let softmax_us = match attn {
+            Some(a) => {
+                let (f, r, w) = softmax_cost(a.batch * heads, a.seq * a.seq, dtype_bytes);
+                latency_us(f, r + w, gpu, dtype)
+            }
+            None => 0.0,
+        };
+        let layer_param_bytes = layer.param_elements_at(heads) * dtype_bytes;
+        let activation_bytes = layer.activation_elements * dtype_bytes;
+        let classification = match widest {
+            Some((flops, br, bw)) => {
+                classify_op(arithmetic_intensity(flops, br, bw), gpu.crossover(dtype))
+            }
+            None => BoundClassification::Unknown,
+        };
+
+        for &csha in &csha_levels {
+            let csha_bonus = match csha {
+                1 => 0.20,
+                2 => 0.45,
+                3 => 0.65,
+                _ => 0.0,
+            };
+            let forward_us = (1.0 - csha_bonus) * (matmul_us + norm_us + softmax_us);
+            let attn_quadratic_us = (1.0 - csha_bonus) * softmax_us;
+            let attn_quadratic_backward_us = 2.0 * attn_quadratic_us * (1.0 - csha_bonus * 0.7);
+            let smem_bytes = shape.as_ref().map_or(0, |s| smem_required(s, gpu, csha));
+            for &rank in &axes.adapter_ranks {
+                let (d_in, d_out) = match attn {
+                    Some(a) => (a.d_model, heads * a.head_dim),
+                    None => (0, 0),
+                };
+                let adapter_us = (rank as f64) * (max_rows as f64) * (d_in as f64) * 2.0
+                    / gpu.peak_tflops(dtype).max(1.0)
+                    / 1e12
+                    * 1e6;
+                let backward_us = 2.0 * forward_us * (1.0 - csha_bonus * 0.7) + adapter_us;
+                entries.push(LayerCostEntry {
+                    forward_us: forward_us + adapter_us,
+                    backward_us,
+                    param_bytes: layer_param_bytes + rank * (d_in + d_out) * dtype_bytes,
+                    activation_bytes,
+                    smem_bytes,
+                    feasible: smem_bytes <= smem_budget,
+                    classification,
+                    attn_quadratic_us,
+                    attn_quadratic_backward_us,
+                });
+            }
+        }
+    }
+    LayerCostLut {
+        axes_head_counts: head_counts,
+        axes_ffn_widths: ffn_widths,
+        axes_csha_levels: csha_levels,
+        axes_adapter_ranks: axes.adapter_ranks.clone(),
+        entries,
+        dtype_bytes,
+        peak_bandwidth_gbs: gpu.peak_bandwidth_gbs,
+    }
+}
+
 /// Latency (μs) of a pretend matmul with the given flop/byte footprint.
 fn latency_us(flops: u64, bytes: u64, gpu: &GpuSpec, dtype_bytes: usize) -> f64 {
     let peak_flops = gpu.peak_tflops(dtype_bytes) * 1e12;
@@ -211,17 +368,20 @@ fn latency_us(flops: u64, bytes: u64, gpu: &GpuSpec, dtype_bytes: usize) -> f64 
     compute_s.max(memory_s) * 1e6 // seconds → μs
 }
 
-/// SMEM required at the given CSHA level.  Level 1 = small norm-prologue
-/// scratch; Level 2 = producer/consumer tile pair; Level 3 = full block
-/// co-scheduling.
-fn smem_required(shape: &LayerShape, heads: u64, csha: u8) -> u64 {
-    let bytes = shape.dtype_bytes;
-    let tile = 64 * shape.head_dim * bytes;
+/// Shared memory a layer's fused attention kernel needs at a CSHA level.
+///
+/// This is CSHA's own estimate ([`crate::csha_pipeline::pipeline_smem_bytes`]
+/// and [`crate::csha_pipeline::block_smem_bytes`] at the tile sizes
+/// [`crate::csha_pipeline::roofline_tile_config`] picks), so a level WGGO
+/// finds feasible is one CSHA will accept. WGGO used to carry a formula of
+/// its own that put level 3 at 128 KB on a layer CSHA sizes at 208 KB, so
+/// the level 3 it planned and costed was applied as level 2. Levels 0 and 1
+/// hold nothing in shared memory.
+pub fn smem_required(shape: &LayerShape, gpu: &GpuSpec, csha: u8) -> u64 {
+    let tiles = crate::csha_pipeline::roofline_tile_config(*shape, gpu);
     match csha {
-        0 => 0,
-        1 => 4 * 1024 + tile,               // norm scratch + one tile
-        2 => 2 * tile + heads * tile,        // producer + consumer + weight tiles
-        3 => 4 * tile + heads * tile + 32768, // plus FFN scratch
+        2 => crate::csha_pipeline::pipeline_smem_bytes(*shape, tiles),
+        3 => crate::csha_pipeline::block_smem_bytes(*shape, tiles),
         _ => 0,
     }
 }
@@ -290,8 +450,8 @@ fn evaluate_single(
 
     let activation_bytes = bs * shape.d_model * shape.dtype_bytes * 4;
 
-    let smem_bytes = smem_required(shape, heads, csha);
-    let smem_budget = (gpu.l1_cache_kb as u64) * 1024;
+    let smem_bytes = smem_required(shape, gpu, csha);
+    let smem_budget = crate::csha_pipeline::smem_budget_bytes(gpu);
     let feasible = smem_bytes <= smem_budget && heads > 0 && ffn > 0;
 
     let ai = arithmetic_intensity(proj_flops, proj_br, proj_bw);
@@ -457,10 +617,8 @@ pub fn moment_state_bytes(param_bytes: u64, dtype_bytes: u64, m_bits: u8, v_bits
 }
 
 /// Extra resident bytes from the FASE **Deferred** fused optimizer step that
-/// [`resident_training_bytes`] does not count. `crate::fase_memory` models
-/// these correctly (`params + accumulator + one-layer-grad + opt_state + peak
-/// activation`) but is disconnected from the cost model, so a budget compared
-/// against the bare `param + m + v + activation` charge under-counts.
+/// [`resident_training_bytes`] does not count, so a budget compared against
+/// the bare `param + m + v + activation` charge under-counts.
 ///
 /// Two surfaces are added:
 ///   * **`m_partial`** — the windowed gradient-mean accumulator materialised
@@ -475,7 +633,7 @@ pub fn moment_state_bytes(param_bytes: u64, dtype_bytes: u64, m_bits: u8, v_bits
 /// **two** surfaces (making 4 live surfaces total with the base
 /// `param + m + v + activation` — NOT 5). Sized per-layer against the layer's
 /// own `param_bytes`, which is a conservative over-estimate of the true
-/// single-tensor `one-live-param` grad (`fase_memory` uses `max_param_bytes`);
+/// single-tensor `one-live-param` grad (the largest single parameter);
 /// over-estimating is the safe direction for a hard budget gate.
 pub fn fase_deferred_extra_bytes(param_bytes: u64, dtype_bytes: u64) -> u64 {
     let elements = param_bytes / dtype_bytes.max(1);

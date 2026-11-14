@@ -43,13 +43,13 @@ const fn k(name: &'static str, read_by: &'static str) -> KnownDecorator {
 }
 
 /// Every decorator name the toolchain reads anywhere, from the 2026-08-15
-/// empirical inventory (updated as consumers move): 34 validated in `checker/stmt.rs`, 13 in
-/// `checker/model.rs`, 1 in another semantic module, and 4 read only by
+/// empirical inventory (updated as consumers move): 33 validated in `checker/stmt.rs`, 11 in
+/// `checker/model.rs`, 1 in another semantic module, and 3 read only by
 /// codegen. Names consumed by the parser before a `Decorator` node exists
 /// (`pack`, `unpack`, `backward`, `*_ptx` in datatype blocks; `endpoint` in
 /// serve blocks) are deliberately absent — their namespaces were already
-/// closed at the parse sites. `layout` is deliberately NOT here: its
-/// validator has no dispatch (see UNIMPLEMENTED_DECORATORS).
+/// closed at the parse sites. `layout` is deliberately NOT here: it
+/// was never dispatched and is refused (see UNIMPLEMENTED_DECORATORS).
 pub static KNOWN_DECORATORS: &[KnownDecorator] = &[
     // --- validated in nsl-semantic/src/checker/stmt.rs ---
     k("adapter", "crates/nsl-semantic/src/checker/stmt.rs"),
@@ -82,7 +82,6 @@ pub static KNOWN_DECORATORS: &[KnownDecorator] = &[
     k("trace_breakpoint", "crates/nsl-semantic/src/checker/stmt.rs"),
     k("tree_mask", "crates/nsl-semantic/src/checker/stmt.rs"),
     k("vmap", "crates/nsl-semantic/src/checker/stmt.rs"),
-    k("wggo", "crates/nsl-semantic/src/checker/stmt.rs"),
     k("wggo_target", "crates/nsl-semantic/src/checker/stmt.rs"),
     k("wrga", "crates/nsl-semantic/src/checker/stmt.rs"),
     k("quantize", "crates/nsl-semantic/src/checker/stmt.rs"),
@@ -90,20 +89,17 @@ pub static KNOWN_DECORATORS: &[KnownDecorator] = &[
     k("context_parallel", "crates/nsl-semantic/src/checker/model.rs"),
     k("fp8_compute", "crates/nsl-semantic/src/checker/model.rs"),
     k("grammar", "crates/nsl-semantic/src/checker/model.rs"),
-    k("kv_compress", "crates/nsl-semantic/src/checker/model.rs"),
     k("medusa", "crates/nsl-semantic/src/checker/model.rs"),
     k("moe", "crates/nsl-semantic/src/checker/model.rs"),
     k("multimodal", "crates/nsl-semantic/src/checker/model.rs"),
     k("perf_budget", "crates/nsl-semantic/src/checker/model.rs"),
     k("pipeline", "crates/nsl-semantic/src/checker/model.rs"),
     k("shard", "crates/nsl-semantic/src/checker/model.rs"),
-    k("sparse", "crates/nsl-semantic/src/checker/model.rs"),
     k("speculative", "crates/nsl-semantic/src/checker/model.rs"),
     k("target", "crates/nsl-semantic/src/checker/model.rs"),
     // --- validated elsewhere in nsl-semantic ---
     k("export", "crates/nsl-semantic/src/export.rs"),
     // --- read only by nsl-codegen ---
-    k("fp4_compute", "crates/nsl-codegen/src/fp8.rs"),
     k("no_grad", "crates/nsl-codegen/src/compiler/declaration.rs"),
     k("param_role", "crates/nsl-codegen/src/compiler/collection.rs"),
     k("search", "crates/nsl-codegen/src/cep_extract.rs"),
@@ -119,15 +115,14 @@ pub static KNOWN_DECORATORS: &[KnownDecorator] = &[
 /// ignored.
 pub static UNIMPLEMENTED_DECORATORS: &[(&str, &str)] = &[
     (
-        // Found by this registry's own drift gate: `validate_layout_decorator`
-        // exists in sparse_layout.rs with unit tests, but NOTHING dispatches
-        // it — no checker arm, no parser route. A validator without a
-        // dispatch is an inert feature, so the name refuses rather than
-        // silently ignoring the annotation.
-        "layout",
-        "@layout has validation logic (sparse_layout.rs) but is not dispatched \
-         by the checker in this version, so it would be silently ignored; \
-         remove the decorator",
+        // Was validated in checker/stmt.rs and then dropped: the validator's
+        // result was discarded, so `@wggo(mode=full)` on a train block
+        // produced no plan and changed nothing, while the activation report
+        // counted the request as witnessed.
+        "wggo",
+        "@wggo has no effect in this toolchain version: whole-graph \
+         optimization is selected with the `--wggo <full|greedy|off>` flag, \
+         and nothing reads the decorator; remove it and pass the flag",
     ),
     (
         "tie_weights",
@@ -174,6 +169,45 @@ pub static UNIMPLEMENTED_DECORATORS: &[(&str, &str)] = &[
          no launch passes the kernel its cos/sin tables, and that kernel \
          rotates Q only. Apply RoPE to Q and K before the attention call (as \
          nsl.nn.gqa does) and remove the decorator",
+    ),
+    (
+        // Its validator accepted `method = ...` and refused `scheme = ...`;
+        // codegen read only `scheme`. So every spelling the checker let
+        // through reached the KV cache as "no compression", and the cache
+        // never had a compressed store in any case: the scheme was recorded
+        // on the manager and read by nothing.
+        "kv_compress",
+        "@kv_compress is not implemented: the paged KV cache has no compressed \
+         storage, and the decorator's arguments were validated and then \
+         dropped, so the cache stayed uncompressed whatever it said. Remove \
+         the decorator",
+    ),
+    (
+        // Validated (`pattern = "2:4" | "block"`), then read by nothing: the
+        // decorated weight stayed dense and its matmul was the dense one.
+        "sparse",
+        "@sparse is not implemented: no pruning, mask or sparse kernel is \
+         generated for the decorated weight, which stayed fully dense with \
+         no message. Remove the decorator",
+    ),
+    (
+        // `extract_fp4_compute_decorator` existed in nsl-codegen and nothing
+        // called it, so the decorator was accepted and the function ran in
+        // full precision.
+        "fp4_compute",
+        "@fp4_compute is not implemented: no code generation path reads it, \
+         so the decorated function ran exactly as if it were absent. Remove \
+         the decorator (for FP8 compute use @fp8_compute)",
+    ),
+    // ---- removed with general sparse tensors (2026-11) ---------------
+    (
+        // Its validator (sparse_layout.rs) had unit tests and no dispatch:
+        // no checker arm ever called it, so the decorator was refused as
+        // inert. The validator went to the attic with the sparse type.
+        "layout",
+        "@layout was removed with general sparse tensors (M50): its validator \
+         was never dispatched, so the decorator had no effect; the code is \
+         preserved at tag `attic/sparse-tensors-2026-11`. Remove the decorator",
     ),
     // ---- removed in the Phase 0.6 scope freeze -----------------------
     (
@@ -285,6 +319,28 @@ mod tests {
         let msg = unimplemented_refusal("rope").expect("@rope must get a typed refusal");
         assert!(msg.contains("never wired"), "{msg}");
         assert!(msg.contains("nsl.nn.gqa"), "{msg}");
+    }
+
+    /// Three decorators that were accepted, validated and then read by
+    /// nothing. Each now says so.
+    #[test]
+    fn accepted_and_ignored_decorators_are_refused() {
+        for (name, needle) in [
+            ("kv_compress", "no compressed"),
+            ("sparse", "stayed fully dense"),
+            ("fp4_compute", "no code generation path reads it"),
+        ] {
+            assert!(find(name).is_none(), "@{name} must not be a known decorator");
+            let msg = unimplemented_refusal(name).unwrap_or_else(|| panic!("@{name} must get a typed refusal"));
+            assert!(msg.contains("is not implemented") && msg.contains(needle), "{msg}");
+        }
+    }
+
+    #[test]
+    fn layout_refuses_with_the_sparse_attic_tag() {
+        assert!(find("layout").is_none());
+        let msg = unimplemented_refusal("layout").expect("@layout must get a typed refusal");
+        assert!(msg.contains("general sparse tensors") && msg.contains("attic/sparse-tensors-2026-11"), "{msg}");
     }
 
     #[test]

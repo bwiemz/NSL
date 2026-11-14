@@ -88,6 +88,8 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
             cpdt_intra_bw,
             cpdt_inter_bw,
             cpdt_report,
+            cpdt_memory_budget,
+            cpdt_prune_experts,
             cfie,
             cfie_report,
             calibration_data,
@@ -343,12 +345,18 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                         process::exit(2);
                     }
                 };
+                // `--cpdt-memory-budget` (GiB per GPU; default 80).
+                if !(cpdt_memory_budget.is_finite() && cpdt_memory_budget > 0.0) {
+                    nsl_log::nsl_log!(ERROR, "nsl", "nsl: --cpdt-memory-budget must be > 0 GiB");
+                    process::exit(2);
+                }
                 Some(nsl_codegen::cpdt_zero::ClusterSpec {
                     num_gpus: n,
-                    memory_budget_bytes: 80u64 * 1024 * 1024 * 1024,
+                    memory_budget_bytes: (cpdt_memory_budget * (1u64 << 30) as f64) as u64,
                     intra_bw_bps: cpdt_intra_bw,
                     inter_bw_bps: cpdt_inter_bw,
                     gpus_per_node: n.min(8),
+                    collective_latency_us: nsl_codegen::cpdt_zero::DEFAULT_COLLECTIVE_LATENCY_US,
                 })
             } else {
                 None
@@ -454,7 +462,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                 weights: nsl_codegen::WeightsOptions {
                     file: if standalone { None } else { resolved_weight_file.clone() },
                     config: nsl_codegen::weight_aware::WeightAwareConfig {
-                        dead_weight_threshold,
+                        dead_weight_threshold: dead_weight_threshold.unwrap_or(1e-6),
                         sparse_threshold,
                         constant_fold: !no_constant_fold,
                         dead_weight_elim: !no_dead_weight,
@@ -464,6 +472,12 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                     // Populated from the semantic analysis in the build paths
                     // that have it in scope.
                     index_map: std::collections::HashMap::new(),
+                    // `-w` asks for the program to run with the file's values;
+                    // the build paths that produce a program bind it
+                    // (`pipeline::bind_weights_file`).
+                    from_flag: weights.is_some() && !standalone,
+                    bind: None,
+                    threshold_given: dead_weight_threshold.is_some(),
                 },
                 linear_types_enabled: linear_types,
                 // Semantic-analysis facts: all empty here. The loader fills
@@ -580,6 +594,7 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                     cluster: cpdt_cluster.clone(),
                     report_requested: cpdt_report,
                     moe_roofline_slack: 0.0,
+                    prune_experts: cpdt_prune_experts,
                     plan_out: cpdt_plan_out.clone(),
                 },
                 wrga: nsl_codegen::WrgaOptions {

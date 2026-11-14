@@ -156,6 +156,7 @@ fn driver_input<'a>(
         mode: WggoMode::Full,
         target: "H100-SXM",
         wengert: w,
+        model: None,
         layer_shape: tiny_shape(),
         cluster: ClusterSpec::default(),
         lut_axes: tiny_axes(),

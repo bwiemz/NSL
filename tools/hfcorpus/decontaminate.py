@@ -21,6 +21,14 @@ HumanEval/MBPP inside a code corpus scraped from the same GitHub the
 benchmarks leaked into. It does NOT catch paraphrase or near-duplication;
 the manifest records the method string so nobody mistakes the claim.
 
+It also cannot see a benchmark problem whose lines are all short. The length
+floor removes every line under MIN_LINE_CHARS from the benchmark set, so a
+solution written as a few short statements leaves nothing to match, and a
+verbatim copy of it in a corpus is counted as clean. The report's `coverage`
+section says how many problems and how many solutions that is, per
+benchmark, by running the rule itself on each one: a "0 contaminated
+documents" line is a statement about the detectable ones only.
+
 Output: a JSON report (default data/text/decontamination.json) that
 manifest.py folds into CORPUS_MANIFEST_v2.json. Exit is nonzero if any set
 named in --fail-on has a contaminated document — validation sets must be
@@ -40,9 +48,8 @@ import argparse
 import json
 import sys
 import time
+from collections.abc import Iterable, Iterator
 from pathlib import Path
-
-import pyarrow.parquet as pq
 
 REPO = Path(__file__).resolve().parents[2]
 MIN_LINE_CHARS = 30
@@ -57,8 +64,17 @@ METHOD = (
     f"counter' flagged an innocent repo on first contact); a document is "
     f"contaminated at >= {DOC_LINE_THRESHOLD} distinct matched lines or one "
     f"matched line >= {STRONG_LINE_CHARS} chars; catches verbatim inclusion "
-    f"only, not paraphrase"
+    f"only, not paraphrase, and not a benchmark problem whose lines are all "
+    f"under the length floor (counted in the report's coverage section)"
 )
+
+# The benchmark columns whose text is matched, and the column that holds a
+# problem's reference solution.
+HUMANEVAL_COLUMNS = ("prompt", "canonical_solution", "test")
+HUMANEVAL_SOLUTION = "canonical_solution"
+MBPP_COLUMNS = ("text", "prompt", "code", "test_list", "test_imports",
+                "challenge_test_list", "test_setup_code")
+MBPP_SOLUTION = "code"
 
 
 def normalize(line: str) -> str:
@@ -67,6 +83,8 @@ def normalize(line: str) -> str:
 
 def benchmark_lines() -> tuple[dict[str, int], set[str]]:
     """(per-benchmark source line counts, the normalized line set)."""
+    import pyarrow.parquet as pq
+
     lines: set[str] = set()
     counts: dict[str, int] = {}
 
@@ -92,7 +110,7 @@ def benchmark_lines() -> tuple[dict[str, int], set[str]]:
     if not he_files:
         sys.exit(f"no HumanEval parquet under {he} — run fetch.py --only benchmarks")
     for f in he_files:
-        t = pq.read_table(f, columns=["prompt", "canonical_solution", "test"])
+        t = pq.read_table(f, columns=list(HUMANEVAL_COLUMNS))
         for col in t.column_names:
             add("humaneval", [v.as_py() or "" for v in t[col]])
 
@@ -103,9 +121,7 @@ def benchmark_lines() -> tuple[dict[str, int], set[str]]:
     for f in mbpp_files:
         t = pq.read_table(f)
         for col in t.column_names:
-            if col not in ("text", "prompt", "code", "test_list",
-                           "test_imports", "challenge_test_list",
-                           "test_setup_code"):
+            if col not in MBPP_COLUMNS:
                 continue
             vals = []
             for v in t[col]:
@@ -130,6 +146,66 @@ def doc_is_contaminated(doc: str, lines: set[str]) -> tuple[bool, set[str]]:
             if len(norm) >= STRONG_LINE_CHARS:
                 strong = True
     return (strong or len(hits) >= DOC_LINE_THRESHOLD, hits)
+
+
+def _cell_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return "\n".join(str(v) for v in value)
+    return str(value)
+
+
+def benchmark_problems() -> Iterator[tuple[str, str, str]]:
+    """Every benchmark problem as `(benchmark, whole text, solution text)`.
+
+    The whole text is every matched column of the row, one after another:
+    what a corpus document holds if it includes the problem verbatim. The
+    files and columns are the ones `benchmark_lines` reads.
+    """
+    import pyarrow.parquet as pq
+
+    for f in sorted((REPO / "data/hf/humaneval/openai_humaneval").glob("*.parquet")):
+        for row in pq.read_table(f, columns=list(HUMANEVAL_COLUMNS)).to_pylist():
+            yield ("humaneval",
+                   "\n".join(_cell_text(row[c]) for c in HUMANEVAL_COLUMNS),
+                   _cell_text(row[HUMANEVAL_SOLUTION]))
+    for f in sorted((REPO / "data/hf/mbpp").rglob("*.parquet")):
+        table = pq.read_table(f)
+        columns = [c for c in table.column_names if c in MBPP_COLUMNS]
+        for row in table.to_pylist():
+            yield ("mbpp",
+                   "\n".join(_cell_text(row[c]) for c in columns),
+                   _cell_text(row.get(MBPP_SOLUTION)))
+
+
+def coverage(problems: Iterable[tuple[str, str, str]], lines: set[str]) -> dict[str, dict[str, int]]:
+    """How much of each benchmark the rule can see at all.
+
+    For every problem, `doc_is_contaminated` is run on the problem's own
+    text and on its solution alone, against the same line set the corpus
+    scan uses. A problem that does not flag itself has too few lines over
+    the length floor: a corpus document containing it verbatim would pass
+    the scan. Counted per benchmark:
+
+      * `problems`: rows read;
+      * `undetectable_problems`: rows whose whole text (prompt, solution and
+        tests together) would not be flagged;
+      * `undetectable_solutions`: rows whose solution, on its own, would not
+        be flagged. This is the larger number and the more relevant one: a
+        scraped repository holds the solution far more often than the
+        benchmark's own prompt and tests.
+    """
+    out: dict[str, dict[str, int]] = {}
+    for name, whole, solution in problems:
+        entry = out.setdefault(name, {"problems": 0, "undetectable_problems": 0,
+                                      "undetectable_solutions": 0})
+        entry["problems"] += 1
+        if not doc_is_contaminated(whole, lines)[0]:
+            entry["undetectable_problems"] += 1
+        if not doc_is_contaminated(solution, lines)[0]:
+            entry["undetectable_solutions"] += 1
+    return out
 
 
 def scan_set(text_dir: Path, lines: set[str]) -> dict:
@@ -184,10 +260,19 @@ def main() -> int:
           f"({', '.join(f'{k}: {v}' for k, v in sorted(counts.items()))})",
           flush=True)
 
+    blind = coverage(benchmark_problems(), lines)
+    for name, entry in sorted(blind.items()):
+        print(f"[decontaminate] {name}: of {entry['problems']} problems, "
+              f"{entry['undetectable_problems']} could not be detected even "
+              f"if copied whole, and {entry['undetectable_solutions']} have a "
+              f"solution that could not be detected on its own "
+              f"(all lines under {MIN_LINE_CHARS} chars)", flush=True)
+
     report = {
         "method": METHOD,
         "benchmarks": counts,
         "benchmark_line_count": len(lines),
+        "coverage": blind,
         "sets": {},
     }
     dirty = []

@@ -29,6 +29,23 @@ fn f32_from_bits_i64(bits: i64) -> f32 {
     f32::from_bits((bits as u64 & 0xFFFF_FFFF) as u32)
 }
 
+/// A fused KL-CE kernel launch failed: report it and exit.
+///
+/// The caller's output buffers are zero-filled, so returning would hand the
+/// compiled step a loss of 0 and all-zero gradients, and training would
+/// carry on as if a step had been taken. There is no partial result to
+/// continue from, so this is fatal, like any other failed driver call.
+#[cfg(feature = "cuda")]
+fn launch_failed(pass: &str, rc: i64) -> ! {
+    crate::fatal::die(
+        crate::fatal::Fatal::CudaDriver,
+        &format!(
+            "nsl_fused_kl_ce_{pass}: the fused KL-CE kernel failed to launch (CUDA error {rc}). \
+             The distillation loss and its gradients were not computed."
+        ),
+    )
+}
+
 /// Forward: per-row loss + the three saved LSEs.
 ///
 /// * `ptx_ptr`/`kname_ptr` — null-terminated PTX module + kernel name.
@@ -41,7 +58,7 @@ fn f32_from_bits_i64(bits: i64) -> f32 {
 /// * `alpha_bits/temp_bits` — f32 bits in i64.
 /// * `smem_bytes` — from `FusedKlCeConfig::shared_mem_bytes()`.
 ///
-/// Returns 0 on success, negative on error.
+/// Returns 0. A launch that fails does not return: see [`launch_failed`].
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_fused_kl_ce_forward(
@@ -91,8 +108,7 @@ pub extern "C" fn nsl_fused_kl_ce_forward(
             smem_bytes as u32,
         );
         if rc != 0 {
-            crate::nsl_log!(ERROR, "fused-kl-ce", "nsl_fused_kl_ce_forward: CUDA launch failed rc={rc}");
-            return -(rc as i64);
+            launch_failed("forward", rc as i64);
         }
         crate::cuda::inner::sync_after_kernel(); // p3: stream-ordered by default
         0
@@ -121,19 +137,19 @@ pub extern "C" fn nsl_fused_kl_ce_forward(
             temp_bits,
             smem_bytes,
         );
-        crate::nsl_log!(WARN, "fused-kl-ce", 
-            "nsl_fused_kl_ce_forward: compiled without the cuda feature; the fused \
-             KL-CE distillation loss is GPU-only in v1 (use the stdlib composite \
-             fused_kl_ce on CPU)"
+        crate::nsl_log!(ERROR, "fused-kl-ce",
+            "nsl_fused_kl_ce_forward: this runtime was built without the cuda feature; \
+             the fused KL-CE kernel is GPU-only (compile with --target cpu, or without \
+             @fused_kl_ce(enabled = true), to use the composite fused_kl_ce)"
         );
-        -1
+        crate::fatal::cuda_not_compiled()
     }
 }
 
 /// Backward: student gradients only (`dxs/dws/dbs`; caller zero-fills —
 /// the kernel accumulates via `red.global.add.f32`).
 ///
-/// Returns 0 on success, negative on error.
+/// Returns 0. A launch that fails does not return: see [`launch_failed`].
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_fused_kl_ce_backward(
@@ -195,8 +211,7 @@ pub extern "C" fn nsl_fused_kl_ce_backward(
             num_valid as u32,
         );
         if rc != 0 {
-            crate::nsl_log!(ERROR, "fused-kl-ce", "nsl_fused_kl_ce_backward: CUDA launch failed rc={rc}");
-            return -(rc as i64);
+            launch_failed("backward", rc as i64);
         }
         crate::cuda::inner::sync_after_kernel(); // p3: stream-ordered by default
         0
@@ -228,10 +243,10 @@ pub extern "C" fn nsl_fused_kl_ce_backward(
             temp_bits,
             num_valid,
         );
-        crate::nsl_log!(WARN, "fused-kl-ce", 
-            "nsl_fused_kl_ce_backward: compiled without the cuda feature; the fused \
-             KL-CE distillation loss is GPU-only in v1"
+        crate::nsl_log!(ERROR, "fused-kl-ce",
+            "nsl_fused_kl_ce_backward: this runtime was built without the cuda feature; \
+             the fused KL-CE kernel is GPU-only"
         );
-        -1
+        crate::fatal::cuda_not_compiled()
     }
 }

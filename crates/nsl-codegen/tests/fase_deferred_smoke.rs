@@ -27,18 +27,9 @@ fn fase_deferred_compiles_adamw_grad_accum_4() {
 
 #[test]
 fn fase_deferred_compiles_adamw_with_grad_clip() {
-    let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/fase_deferred_grad_accum_4_clipped.nsl");
-
-    // Fixture lands in Task 7; skip this test until it exists so Task 6
-    // can land without a file-not-found failure.
-    if !fixture_path.exists() {
-        eprintln!("skipping: fixture not yet present (Task 7)");
-        return;
-    }
-
-    let src = std::fs::read_to_string(&fixture_path)
-        .unwrap_or_else(|e| panic!("failed to read fixture {:?}: {}", fixture_path, e));
+    // Read through `fixture`, which panics when the file is missing. This
+    // test used to return early, and so pass, in that case.
+    let src = fixture("fase_deferred_grad_accum_4_clipped.nsl");
     let opts = CompileOptions {
         source_ad: true,
         ..Default::default()

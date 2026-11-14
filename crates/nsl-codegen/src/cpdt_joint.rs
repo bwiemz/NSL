@@ -198,6 +198,7 @@ mod tests {
             optim_state_multiplier: crate::cpdt_zero::ADAMW_FP32_OPTIM_MULTIPLIER,
             per_layer_compute_us: vec![10.0; 8],
             activation_checkpointing: false,
+            micro_batches_per_step: 1,
         }
     }
 

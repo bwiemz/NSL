@@ -42,16 +42,31 @@ impl std::error::Error for GrammarError {}
 
 /// Convert a JSON Schema to a Grammar.
 ///
-/// Handles the following JSON Schema types:
-/// - `boolean` -> `"true" | "false"`
-/// - `null` -> `"null"`
-/// - `integer` -> optional `-` followed by one or more digits
-/// - `number` -> integer part with optional `.digits` decimal part
-/// - `string` -> `"` followed by any characters, then `"`
+/// Everything the grammar accepts is JSON (RFC 8259) that satisfies the
+/// schema. It does not accept every such document: it fixes a layout.
+///
+/// - `boolean` -> `true | false`
+/// - `null` -> `null`
+/// - `integer` -> `-? (0 | [1-9][0-9]*)` — no leading zeros
+/// - `number` -> an integer, an optional `.digits` fraction and an
+///   optional exponent
+/// - `string` -> `"`, then characters and escapes as JSON defines them
+///   (any byte sequence that is well-formed UTF-8 except `"`, `\` and
+///   the control characters; `\"`, `\\`, `\/`, `\b`, `\f`, `\n`, `\r`,
+///   `\t`, `\uXXXX`), then `"`
 /// - `array` -> `[` items `,` ... `]`
-/// - `object` -> `{` key-value pairs `}`
-/// - `enum` -> choice between literal values
+/// - `object` -> `{` members `}`: the properties named in `required` are
+///   mandatory and the rest optional; members appear in ONE order, the
+///   properties' names sorted (the order `serde_json` iterates them in).
+///   Other orders and additional properties are valid JSON for the
+///   schema and are not accepted.
+/// - `enum` -> choice between the values, each as JSON
 /// - `oneOf` -> choice between sub-schemas
+///
+/// Whitespace: at most one space where JSON allows whitespace between
+/// tokens (after `[`, `{`, `,` and `:`, before `:`, `]` and `}`). JSON
+/// allows any amount, and a model held to a grammar that does too can
+/// emit spaces without end.
 pub fn json_schema_to_grammar(schema: &serde_json::Value) -> Result<Grammar, GrammarError> {
     let mut rules = Vec::new();
     let start_element = convert_schema_value(schema, &mut rules, "root")?;
@@ -113,49 +128,120 @@ fn convert_schema_value(
     }
 }
 
-/// Integer: optional `-` followed by one or more digits `[0-9]+`.
+fn digit() -> GrammarElement {
+    GrammarElement::CharClass(vec![CharRange { lo: b'0', hi: b'9' }])
+}
+
+fn literal(text: &str) -> GrammarElement {
+    GrammarElement::Literal(text.into())
+}
+
+/// Integer, as JSON writes one: an optional `-`, then `0` or a non-zero
+/// digit followed by digits. `00`, `-01` and `007` are not JSON.
 fn integer_element() -> GrammarElement {
-    let digit = GrammarElement::CharClass(vec![CharRange { lo: b'0', hi: b'9' }]);
+    let nonzero = GrammarElement::CharClass(vec![CharRange { lo: b'1', hi: b'9' }]);
     GrammarElement::Sequence(vec![
-        GrammarElement::Repeat(
-            Box::new(GrammarElement::Literal("-".into())),
-            RepeatMode::Optional,
-        ),
-        GrammarElement::Repeat(Box::new(digit), RepeatMode::OneOrMore),
+        GrammarElement::Repeat(Box::new(literal("-")), RepeatMode::Optional),
+        GrammarElement::Choice(vec![
+            literal("0"),
+            GrammarElement::Sequence(vec![
+                nonzero,
+                GrammarElement::Repeat(Box::new(digit()), RepeatMode::ZeroOrMore),
+            ]),
+        ]),
     ])
 }
 
-/// Number: integer part with optional `.digits` decimal portion.
+/// Number: an integer, an optional `.digits` fraction, an optional
+/// exponent (`e` or `E`, an optional sign, digits).
 fn number_element() -> GrammarElement {
-    let digit = GrammarElement::CharClass(vec![CharRange { lo: b'0', hi: b'9' }]);
-    let decimal_part = GrammarElement::Sequence(vec![
-        GrammarElement::Literal(".".into()),
-        GrammarElement::Repeat(Box::new(digit.clone()), RepeatMode::OneOrMore),
+    let fraction = GrammarElement::Sequence(vec![
+        literal("."),
+        GrammarElement::Repeat(Box::new(digit()), RepeatMode::OneOrMore),
+    ]);
+    let exponent = GrammarElement::Sequence(vec![
+        GrammarElement::Choice(vec![literal("e"), literal("E")]),
+        GrammarElement::Repeat(
+            Box::new(GrammarElement::Choice(vec![literal("+"), literal("-")])),
+            RepeatMode::Optional,
+        ),
+        GrammarElement::Repeat(Box::new(digit()), RepeatMode::OneOrMore),
     ]);
 
     GrammarElement::Sequence(vec![
         integer_element(),
-        GrammarElement::Repeat(Box::new(decimal_part), RepeatMode::Optional),
+        GrammarElement::Repeat(Box::new(fraction), RepeatMode::Optional),
+        GrammarElement::Repeat(Box::new(exponent), RepeatMode::Optional),
     ])
 }
 
-/// String: `"` followed by zero or more non-quote, non-backslash chars or
-/// escaped sequences, then `"`.
-///
-/// Simplified: `"` [^"\]* `"` (does not handle escape sequences for M44a).
-fn string_element() -> GrammarElement {
-    // Characters allowed inside a JSON string (simplified: any printable ASCII except " and \)
-    let string_char = GrammarElement::CharClass(vec![
-        CharRange { lo: 0x20, hi: 0x21 }, // space through !
-        CharRange { lo: 0x23, hi: 0x5B }, // # through [
-        CharRange { lo: 0x5D, hi: 0x7E }, // ] through ~
-    ]);
-
-    GrammarElement::Sequence(vec![
-        GrammarElement::Literal("\"".into()),
-        GrammarElement::Repeat(Box::new(string_char), RepeatMode::ZeroOrMore),
-        GrammarElement::Literal("\"".into()),
+/// One character of a JSON string that is not an escape: any Unicode
+/// scalar value except `"`, `\` and U+0000..U+001F, as its UTF-8 bytes.
+/// The multi-byte alternatives are the well-formed UTF-8 sequences
+/// (Unicode 15, table 3-7), so no overlong form and no surrogate is
+/// accepted.
+fn string_char() -> GrammarElement {
+    let range = |lo: u8, hi: u8| GrammarElement::CharClass(vec![CharRange { lo, hi }]);
+    let tail = || range(0x80, 0xBF);
+    let seq = |parts: Vec<GrammarElement>| GrammarElement::Sequence(parts);
+    GrammarElement::Choice(vec![
+        GrammarElement::CharClass(vec![
+            CharRange { lo: 0x20, hi: 0x21 }, // space, !
+            CharRange { lo: 0x23, hi: 0x5B }, // # through [
+            CharRange { lo: 0x5D, hi: 0x7F }, // ] through DEL
+        ]),
+        seq(vec![range(0xC2, 0xDF), tail()]),
+        seq(vec![range(0xE0, 0xE0), range(0xA0, 0xBF), tail()]),
+        seq(vec![range(0xE1, 0xEC), tail(), tail()]),
+        seq(vec![range(0xED, 0xED), range(0x80, 0x9F), tail()]),
+        seq(vec![range(0xEE, 0xEF), tail(), tail()]),
+        seq(vec![range(0xF0, 0xF0), range(0x90, 0xBF), tail(), tail()]),
+        seq(vec![range(0xF1, 0xF3), tail(), tail(), tail()]),
+        seq(vec![range(0xF4, 0xF4), range(0x80, 0x8F), tail(), tail()]),
     ])
+}
+
+/// A JSON escape: `\` then one of `"\/bfnrt`, or `u` and four hex digits.
+fn string_escape() -> GrammarElement {
+    let hex = || {
+        GrammarElement::CharClass(vec![
+            CharRange { lo: b'0', hi: b'9' },
+            CharRange { lo: b'A', hi: b'F' },
+            CharRange { lo: b'a', hi: b'f' },
+        ])
+    };
+    let simple = GrammarElement::CharClass(
+        b"\"\\/bfnrt".iter().map(|&c| CharRange { lo: c, hi: c }).collect(),
+    );
+    GrammarElement::Sequence(vec![
+        literal("\\"),
+        GrammarElement::Choice(vec![
+            simple,
+            GrammarElement::Sequence(vec![literal("u"), hex(), hex(), hex(), hex()]),
+        ]),
+    ])
+}
+
+/// String: `"`, zero or more characters or escapes, `"`.
+fn string_element() -> GrammarElement {
+    GrammarElement::Sequence(vec![
+        literal("\""),
+        GrammarElement::Repeat(
+            Box::new(GrammarElement::Choice(vec![string_char(), string_escape()])),
+            RepeatMode::ZeroOrMore,
+        ),
+        literal("\""),
+    ])
+}
+
+/// Where JSON allows whitespace between tokens: nothing, or one space.
+fn ws() -> GrammarElement {
+    GrammarElement::Repeat(Box::new(literal(" ")), RepeatMode::Optional)
+}
+
+/// `text` as a JSON string literal, quoted and escaped.
+fn json_string(text: &str) -> String {
+    serde_json::Value::String(text.to_string()).to_string()
 }
 
 /// Convert a JSON Schema `enum` to a choice between literal values.
@@ -175,8 +261,10 @@ fn convert_enum(enum_values: &serde_json::Value) -> Result<GrammarElement, Gramm
         .map(|v| {
             match v {
                 serde_json::Value::String(s) => {
-                    // Enum string values are emitted as JSON strings with quotes
-                    GrammarElement::Literal(format!("\"{}\"", s))
+                    // As a JSON string: quoted, and escaped where the
+                    // value holds a quote, a backslash or a control
+                    // character.
+                    GrammarElement::Literal(json_string(s))
                 }
                 serde_json::Value::Number(n) => GrammarElement::Literal(n.to_string()),
                 serde_json::Value::Bool(b) => GrammarElement::Literal(b.to_string()),
@@ -233,17 +321,8 @@ fn convert_array(
         ])
     };
 
-    // Array: "[" ws (item ("," ws item)*)? ws "]"
-    let ws = GrammarElement::Repeat(
-        Box::new(GrammarElement::Literal(" ".into())),
-        RepeatMode::ZeroOrMore,
-    );
-
-    let comma_item = GrammarElement::Sequence(vec![
-        GrammarElement::Literal(",".into()),
-        ws.clone(),
-        item_element.clone(),
-    ]);
+    // Array: "[" ws ((item ("," ws item)*) ws)? "]"
+    let comma_item = GrammarElement::Sequence(vec![literal(","), ws(), item_element.clone()]);
 
     let items_list = GrammarElement::Sequence(vec![
         item_element,
@@ -251,78 +330,109 @@ fn convert_array(
     ]);
 
     Ok(GrammarElement::Sequence(vec![
-        GrammarElement::Literal("[".into()),
-        ws.clone(),
-        GrammarElement::Repeat(Box::new(items_list), RepeatMode::Optional),
-        ws,
-        GrammarElement::Literal("]".into()),
+        literal("["),
+        ws(),
+        GrammarElement::Repeat(
+            Box::new(GrammarElement::Sequence(vec![items_list, ws()])),
+            RepeatMode::Optional,
+        ),
+        literal("]"),
     ]))
 }
 
 /// Convert a JSON Schema `object` to a grammar element.
 ///
-/// `{ "key": value, ... }`
+/// `{ "key": value, ... }`: the properties in name order, those listed in
+/// `required` mandatory and the others optional, with a comma between the
+/// members that are present and nowhere else.
 fn convert_object(
     schema: &serde_json::Value,
     rules: &mut Vec<Rule>,
     prefix: &str,
 ) -> Result<GrammarElement, GrammarError> {
-    let properties = schema.get("properties").and_then(|v| v.as_object());
-
-    let ws = GrammarElement::Repeat(
-        Box::new(GrammarElement::Literal(" ".into())),
-        RepeatMode::ZeroOrMore,
-    );
-
-    if let Some(props) = properties {
-        if props.is_empty() {
-            // Empty object: "{}"
-            return Ok(GrammarElement::Sequence(vec![
-                GrammarElement::Literal("{".into()),
-                ws.clone(),
-                GrammarElement::Literal("}".into()),
-            ]));
-        }
-
-        let mut kv_elements = Vec::new();
-        for (i, (key, value_schema)) in props.iter().enumerate() {
-            let value_prefix = format!("{prefix}_{key}");
-            let value_element = convert_schema_value(value_schema, rules, &value_prefix)?;
-
-            let kv = GrammarElement::Sequence(vec![
-                GrammarElement::Literal(format!("\"{}\"", key)),
-                ws.clone(),
-                GrammarElement::Literal(":".into()),
-                ws.clone(),
-                value_element,
-            ]);
-
-            if i > 0 {
-                kv_elements.push(GrammarElement::Sequence(vec![
-                    GrammarElement::Literal(",".into()),
-                    ws.clone(),
-                    kv,
-                ]));
-            } else {
-                kv_elements.push(kv);
-            }
-        }
-
-        Ok(GrammarElement::Sequence(vec![
-            GrammarElement::Literal("{".into()),
-            ws.clone(),
-            GrammarElement::Sequence(kv_elements),
-            ws,
-            GrammarElement::Literal("}".into()),
-        ]))
-    } else {
-        // Object with no properties defined: just `{}`
-        Ok(GrammarElement::Sequence(vec![
-            GrammarElement::Literal("{".into()),
-            ws.clone(),
-            GrammarElement::Literal("}".into()),
-        ]))
+    let empty = serde_json::Map::new();
+    let props = match schema.get("properties") {
+        None => &empty,
+        Some(v) => v
+            .as_object()
+            .ok_or_else(|| GrammarError::InvalidSchema("properties must be an object".into()))?,
+    };
+    let required: Vec<&str> = match schema.get("required") {
+        None => Vec::new(),
+        Some(v) => v
+            .as_array()
+            .ok_or_else(|| GrammarError::InvalidSchema("required must be an array".into()))?
+            .iter()
+            .map(|name| {
+                name.as_str()
+                    .ok_or_else(|| GrammarError::InvalidSchema("required must list strings".into()))
+            })
+            .collect::<Result<_, _>>()?,
+    };
+    if let Some(missing) = required.iter().find(|name| !props.contains_key(**name)) {
+        return Err(GrammarError::InvalidSchema(format!(
+            "required names `{missing}`, which is not in properties"
+        )));
     }
+
+    // (member, is it required), in the order members are written.
+    let mut members: Vec<(GrammarElement, bool)> = Vec::with_capacity(props.len());
+    for (key, value_schema) in props {
+        let value_prefix = format!("{prefix}_{key}");
+        let value_element = convert_schema_value(value_schema, rules, &value_prefix)?;
+        let member = GrammarElement::Sequence(vec![
+            GrammarElement::Literal(json_string(key)),
+            ws(),
+            literal(":"),
+            ws(),
+            value_element,
+        ]);
+        members.push((member, required.contains(&key.as_str())));
+    }
+
+    // After a first member, each later one is `, member`, optional when
+    // the property is.
+    let rest_after = |from: usize| -> GrammarElement {
+        GrammarElement::Sequence(
+            members[from..]
+                .iter()
+                .map(|(member, required)| {
+                    let item = GrammarElement::Sequence(vec![literal(","), ws(), member.clone()]);
+                    if *required {
+                        item
+                    } else {
+                        GrammarElement::Repeat(Box::new(item), RepeatMode::Optional)
+                    }
+                })
+                .collect(),
+        )
+    };
+    // The first member present is member `j` when every member before it
+    // is optional and absent; there may be none when all are optional.
+    let mut bodies: Vec<GrammarElement> = Vec::new();
+    for (j, (member, required)) in members.iter().enumerate() {
+        bodies.push(GrammarElement::Sequence(vec![member.clone(), rest_after(j + 1)]));
+        if *required {
+            break;
+        }
+    }
+    let all_optional = members.iter().all(|(_, required)| !required);
+    let body = GrammarElement::Choice(bodies);
+
+    let mut object = vec![literal("{"), ws()];
+    if members.is_empty() {
+        // `{}` (or `{ }`): no member to write.
+    } else if all_optional {
+        object.push(GrammarElement::Repeat(
+            Box::new(GrammarElement::Sequence(vec![body, ws()])),
+            RepeatMode::Optional,
+        ));
+    } else {
+        object.push(body);
+        object.push(ws());
+    }
+    object.push(literal("}"));
+    Ok(GrammarElement::Sequence(object))
 }
 
 // ---------------------------------------------------------------------------
@@ -532,18 +642,242 @@ mod tests {
             "properties": {
                 "name": {"type": "string"},
                 "age": {"type": "integer"}
-            }
+            },
+            "required": ["name", "age"]
         });
         let grammar = json_schema_to_grammar(&schema).unwrap();
         let dfa = compile_grammar(&grammar);
-        // serde_json uses BTreeMap so properties are in alphabetical order: age before name
+        // Members are written in name order: age before name.
         assert!(dfa.accepts(b"{\"age\":25,\"name\":\"alice\"}"));
         assert!(dfa.accepts(b"{\"age\":-1,\"name\":\"bob\"}"));
-        // With optional whitespace (no space before comma — grammar puts ws after comma)
+        // With the one optional space where whitespace may go.
         assert!(dfa.accepts(b"{ \"age\" : 42, \"name\" : \"x\" }"));
-        // Reject non-objects
+        // Both are required.
         assert!(!dfa.accepts(b"{}"));
+        assert!(!dfa.accepts(b"{\"age\":25}"));
         assert!(!dfa.accepts(b"\"hello\""));
+    }
+
+    fn dfa_for(schema: serde_json::Value) -> crate::grammar_compiler::DFA {
+        compile_grammar(&json_schema_to_grammar(&schema).unwrap())
+    }
+
+    /// Every string of at most `max_len` bytes drawn from `alphabet` that
+    /// `dfa` accepts.
+    fn accepted_strings(dfa: &crate::grammar_compiler::DFA, alphabet: &[u8], max_len: usize) -> Vec<Vec<u8>> {
+        fn walk(
+            dfa: &crate::grammar_compiler::DFA,
+            alphabet: &[u8],
+            left: usize,
+            state: u32,
+            text: &mut Vec<u8>,
+            out: &mut Vec<Vec<u8>>,
+        ) {
+            if dfa.accept.contains(&state) {
+                out.push(text.clone());
+            }
+            if left == 0 {
+                return;
+            }
+            for &b in alphabet {
+                if let Some(next) = dfa.transitions[state as usize][b as usize] {
+                    text.push(b);
+                    walk(dfa, alphabet, left - 1, next, text, out);
+                    text.pop();
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dfa, alphabet, max_len, dfa.start, &mut Vec::new(), &mut out);
+        out
+    }
+
+    /// Soundness against an independent JSON implementation: everything
+    /// the grammar accepts (over a sampled alphabet, up to a length) is
+    /// parsed by `serde_json`, and is a value of the schema's type.
+    fn assert_all_accepted_are_json(
+        schema: serde_json::Value,
+        alphabet: &[u8],
+        max_len: usize,
+        is_right_type: impl Fn(&serde_json::Value) -> bool,
+    ) -> usize {
+        let dfa = dfa_for(schema.clone());
+        let accepted = accepted_strings(&dfa, alphabet, max_len);
+        for text in &accepted {
+            let shown = String::from_utf8_lossy(text).into_owned();
+            let value: serde_json::Value = serde_json::from_slice(text)
+                .unwrap_or_else(|e| panic!("{schema}: the grammar accepts {shown:?} ({text:?}), which is not JSON: {e}"));
+            assert!(is_right_type(&value), "{schema}: the grammar accepts {shown:?}, a {value:?}");
+        }
+        accepted.len()
+    }
+
+    #[test]
+    fn integers_have_no_leading_zeros() {
+        let dfa = dfa_for(serde_json::json!({"type": "integer"}));
+        for ok in ["0", "-0", "7", "42", "-7", "100", "9007199254740993"] {
+            assert!(dfa.accepts(ok.as_bytes()), "{ok}");
+        }
+        // `00` used to be accepted; no JSON parser reads it.
+        for bad in ["00", "01", "-01", "007", "", "-", "--1", "+1", "1.0", "1e3"] {
+            assert!(!dfa.accepts(bad.as_bytes()), "{bad}");
+            if !bad.is_empty() && bad != "1.0" && bad != "1e3" {
+                assert!(serde_json::from_str::<serde_json::Value>(bad).is_err(), "{bad} is not JSON");
+            }
+        }
+        // `-0` is a JSON number with no fraction, so an integer; serde_json
+        // reads it as the float -0.0.
+        let n = assert_all_accepted_are_json(
+            serde_json::json!({"type": "integer"}),
+            b"0129-.e+",
+            6,
+            |v| v.is_i64() || v.is_u64() || v.as_f64() == Some(0.0),
+        );
+        assert!(n > 1000, "the enumeration found {n} integers");
+    }
+
+    #[test]
+    fn numbers_are_json_numbers() {
+        let dfa = dfa_for(serde_json::json!({"type": "number"}));
+        for ok in ["0", "-0", "1.5", "-0.25", "10", "1e10", "1E-3", "2.5e+7", "0.0"] {
+            assert!(dfa.accepts(ok.as_bytes()), "{ok}");
+            assert!(serde_json::from_str::<serde_json::Value>(ok).is_ok(), "{ok}");
+        }
+        for bad in ["1.", ".5", "1e", "01.5", "1.e3", "1e+", "--1", "1.5.2", "e3", "Infinity", "NaN"] {
+            assert!(!dfa.accepts(bad.as_bytes()), "{bad}");
+            assert!(serde_json::from_str::<serde_json::Value>(bad).is_err(), "{bad} is not JSON");
+        }
+        // Five bytes over these digits keep every exponent below 223:
+        // serde_json refuses a number past f64's range (`1e999`), which is
+        // its limit and not a rule of JSON's grammar.
+        let n = assert_all_accepted_are_json(serde_json::json!({"type": "number"}), b"012-.eE+", 5, |v| v.is_number());
+        assert!(n > 300, "the enumeration found {n} numbers");
+    }
+
+    #[test]
+    fn strings_take_json_escapes_and_utf8_and_nothing_else() {
+        let dfa = dfa_for(serde_json::json!({"type": "string"}));
+        let ok: [&[u8]; 9] = [
+            b"\"\"",
+            b"\"plain\"",
+            b"\"a\\\"b\"",        // an escaped quote
+            b"\"back\\\\slash\"", // an escaped backslash
+            b"\"tab\\there\"",    // \t
+            b"\"\\u00e9\"",       // \u00e9
+            "\"caf\u{e9}\"".as_bytes(), // e-acute as UTF-8
+            "\"\u{4e2d}\u{6587}\"".as_bytes(), // three-byte sequences
+            "\"\u{1f600}\"".as_bytes(), // a four-byte sequence
+        ];
+        for text in ok {
+            assert!(dfa.accepts(text), "{:?}", String::from_utf8_lossy(text));
+            assert!(serde_json::from_slice::<serde_json::Value>(text).is_ok(), "{text:?} is JSON");
+        }
+        let bad: [&[u8]; 10] = [
+            b"\"line\nbreak\"",      // a raw control character
+            b"\"tab\there\"",        // a raw tab
+            b"\"lone\\\"",           // the closing quote is escaped
+            b"\"\\x41\"",            // not a JSON escape
+            b"\"\\u12\"",            // a short \u
+            b"\"\\u12G4\"",          // not hex
+            b"\"\xff\"",             // not UTF-8
+            b"\"\xc0\x80\"",         // an overlong encoding
+            b"\"\xed\xa0\x80\"",     // a surrogate
+            b"\"\xe4\xb8\"",         // a truncated sequence
+        ];
+        for text in bad {
+            assert!(!dfa.accepts(text), "{:?}", String::from_utf8_lossy(text));
+            assert!(serde_json::from_slice::<serde_json::Value>(text).is_err(), "{text:?} is not JSON");
+        }
+        // 0xC3 0xA9 is e-acute; 0x09 a raw tab; 0x80 a stray continuation.
+        let n = assert_all_accepted_are_json(
+            serde_json::json!({"type": "string"}),
+            b"\"\\/un0Fa \xc3\xa9\x09\x80",
+            7,
+            |v| v.is_string(),
+        );
+        assert!(n > 1000, "the enumeration found {n} strings");
+    }
+
+    #[test]
+    fn required_properties_are_required_and_the_others_optional() {
+        let schema = |required: serde_json::Value| {
+            serde_json::json!({
+                "type": "object",
+                "properties": {"a": {"type": "integer"}, "b": {"type": "boolean"}, "c": {"type": "null"}},
+                "required": required
+            })
+        };
+        let dfa = dfa_for(schema(serde_json::json!(["b"])));
+        for ok in [
+            r#"{"b":true}"#,
+            r#"{"a":1,"b":true}"#,
+            r#"{"b":false,"c":null}"#,
+            r#"{"a":1,"b":false,"c":null}"#,
+            r#"{ "a" : 1, "b" : true }"#,
+        ] {
+            assert!(dfa.accepts(ok.as_bytes()), "{ok}");
+        }
+        for bad in [
+            "{}",
+            r#"{"a":1}"#,
+            r#"{"a":1,"c":null}"#,
+            r#"{"b":true,"a":1}"#, // members are written in name order
+            r#"{,"b":true}"#,
+            r#"{"a":1,"b":true,}"#,
+            r#"{"a":1 "b":true}"#,
+            r#"{"b":true,"b":true}"#,
+        ] {
+            assert!(!dfa.accepts(bad.as_bytes()), "{bad}");
+        }
+
+        // No `required`: every property is optional, `{}` included. They
+        // all used to be mandatory.
+        let dfa = dfa_for(serde_json::json!({
+            "type": "object",
+            "properties": {"a": {"type": "integer"}, "b": {"type": "boolean"}, "c": {"type": "null"}}
+        }));
+        for ok in ["{}", "{ }", r#"{"a":1}"#, r#"{"c":null}"#, r#"{"a":1,"c":null}"#, r#"{"a":1,"b":true,"c":null}"#] {
+            assert!(dfa.accepts(ok.as_bytes()), "{ok}");
+        }
+        for bad in [r#"{,"a":1}"#, r#"{"a":1,}"#, r#"{"c":null,"a":1}"#] {
+            assert!(!dfa.accepts(bad.as_bytes()), "{bad}");
+        }
+
+        // Everything accepted is JSON, an object, and carries `b`.
+        let n = assert_all_accepted_are_json(schema(serde_json::json!(["b"])), b"{}\"abc:,1truefalsn", 30, |v| {
+            v.as_object().is_some_and(|o| o.contains_key("b") && o.keys().all(|k| ["a", "b", "c"].contains(&k.as_str())))
+        });
+        assert!(n >= 8, "the enumeration found {n} objects");
+
+        let err = json_schema_to_grammar(&schema(serde_json::json!(["zzz"]))).unwrap_err();
+        assert!(err.to_string().contains("required names `zzz`"), "{err}");
+    }
+
+    #[test]
+    fn enum_strings_and_property_names_are_escaped() {
+        let dfa = dfa_for(serde_json::json!({"enum": ["a\"b", "back\\slash"]}));
+        assert!(dfa.accepts(br#""a\"b""#));
+        assert!(dfa.accepts(br#""back\\slash""#));
+        assert!(!dfa.accepts(br#""a"b""#), "the unescaped form is not JSON");
+        let dfa = dfa_for(serde_json::json!({
+            "type": "object",
+            "properties": {"k\"": {"type": "null"}},
+            "required": ["k\""]
+        }));
+        assert!(dfa.accepts(br#"{"k\"":null}"#));
+    }
+
+    /// At most one space where whitespace may go. An unbounded run let a
+    /// constrained model emit spaces for ever.
+    #[test]
+    fn whitespace_is_one_space_at_most() {
+        let dfa = dfa_for(serde_json::json!({"type": "array", "items": {"type": "integer"}}));
+        for ok in ["[]", "[ ]", "[1]", "[1,2]", "[1, 2]", "[ 1, 2 ]"] {
+            assert!(dfa.accepts(ok.as_bytes()), "{ok}");
+        }
+        for bad in ["[1,  2]", "[  1]", "[  ]", "[1 ,2]", "[1,\t2]", "[1,\n2]"] {
+            assert!(!dfa.accepts(bad.as_bytes()), "{bad}");
+        }
     }
 
     #[test]

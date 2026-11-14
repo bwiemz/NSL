@@ -161,6 +161,33 @@ pub extern "C" fn nsl_tensor_to_bf16(src_ptr: i64) -> i64 {
     cast_and_publish(src_ptr, DTYPE_BF16)
 }
 
+/// `--checkpoint-compress`: store a saved activation as bf16. Returns a NEW
+/// owned bf16 tensor, published into the scope sweep; `src` is not consumed.
+///
+/// Only an f32 activation is accepted. The backward restores a compressed
+/// save by widening it to f32 (`nsl_tensor_to_f32`), which is the original
+/// only if the original was f32: an f64 activation would come back narrower
+/// than every tensor it meets, and a half-precision one would come back
+/// wider. `nsl_tensor_to_bf16` accepted both and the restore then changed
+/// the dtype silently. Any other dtype exits with the unsupported-dtype
+/// code and a message that names the flag.
+#[unsafe(no_mangle)]
+pub extern "C" fn nsl_ccr_compress_bf16(src_ptr: i64) -> i64 {
+    let dtype = NslTensor::from_ptr_ref(src_ptr).dtype;
+    if dtype != DTYPE_F32 {
+        crate::fatal::die(
+            crate::fatal::Fatal::UnsupportedDtype,
+            &format!(
+                "--checkpoint-compress: a saved activation has dtype {}, and only f32 \
+                 activations can be stored as bf16 and restored unchanged in dtype. Run \
+                 this model without --checkpoint-compress",
+                crate::checkpoint::checkpoint_dtype_name(dtype)
+            ),
+        );
+    }
+    cast_and_publish(src_ptr, DTYPE_BF16)
+}
+
 /// CFTP v6 convenience: cast a tensor to FP16, returning a NEW owned tensor
 /// published into the scope sweep. See `nsl_tensor_to_bf16`. Uses the crate's
 /// `f32_to_f16_bits` primitive (truncating, not RTE — see module note).

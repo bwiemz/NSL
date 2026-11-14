@@ -119,6 +119,8 @@ fn run_build_single(
     // M62 Task 6: route weight_index_map from semantic analysis into codegen so
     // compile_export_model_methods can resolve self.<field> → weight-array index.
     options.weights.index_map = analysis.weight_index_map.clone();
+    // `-w`: the program runs with the file's values (see `bind_weights_file`).
+    crate::pipeline::bind_weights_file(&mut options, &[&parse_result.module], &interner, entry);
     // Item 5: constructor-argument folding — dims for parameterized
     // submodule weights (`randn([d_model, d_ff])` under `Ctor(512, 1408)`),
     // which literal-only collection cannot derive. Routed through the
@@ -307,6 +309,28 @@ fn run_build_multi(
 
     let mut obj_files: Vec<PathBuf> = Vec::new();
 
+    // `-w`: the program runs with the file's values. What it may be
+    // specialized on is decided over every module, and every module is
+    // compiled with the same decision (see `bind_weights_file`).
+    let bound_options = {
+        let mut bound = options.clone();
+        let all_modules: Vec<&nsl_ast::Module> =
+            graph.dep_order.iter().map(|p| &graph.modules[p].ast).collect();
+        crate::pipeline::bind_weights_file(&mut bound, &all_modules, &interner, entry);
+        bound
+    };
+    let options = &bound_options;
+
+    // What the modules the entry imports are compiled with, and what their
+    // model layouts are collected with: the entry's `@adapter` decorators go
+    // with them (see `options_for_imported_module`).
+    let entry_data = &graph.modules[&graph.entry];
+    let imported_options = crate::pipeline::options_for_imported_module(options, entry_data);
+    let layout_options = crate::pipeline::options_for_imported_module(
+        &nsl_codegen::CompileOptions::default(),
+        entry_data,
+    );
+
     // Compile each module in dependency order
     for path in &graph.dep_order {
         let mod_data = &graph.modules[path];
@@ -338,7 +362,7 @@ fn run_build_multi(
                 let dep_data = &graph.modules[dep_path];
 
                 // Build function signatures and struct layouts using a temporary compiler
-                let mut temp_compiler = match nsl_codegen::compiler::Compiler::new(&interner, &dep_data.type_map, &nsl_codegen::CompileOptions::default()) {
+                let mut temp_compiler = match nsl_codegen::compiler::Compiler::new(&interner, &dep_data.type_map, &layout_options) {
                     Ok(c) => c,
                     Err(e) => crate::pipeline::exit_on_codegen_error_in(&source_map, &e, dep_path),
                 };
@@ -484,6 +508,7 @@ fn run_build_multi(
             entry_options.imported_model.tensor_fields_without_dims =
                 imported_tensor_fields_without_dims;
             entry_options.imported_model.field_values = imported_model_field_values;
+            entry_options.imported_model.functions = graph.imported_functions(&interner);
             let entry_options = &entry_options;
 
             match nsl_codegen::compile_entry_returning_plan(
@@ -535,7 +560,7 @@ fn run_build_multi(
                     }
 
                     let dep_data = &graph.modules[dep_path];
-                    let mut temp_compiler = match nsl_codegen::compiler::Compiler::new(&interner, &dep_data.type_map, &nsl_codegen::CompileOptions::default()) {
+                    let mut temp_compiler = match nsl_codegen::compiler::Compiler::new(&interner, &dep_data.type_map, &layout_options) {
                         Ok(c) => c,
                         Err(e) => crate::pipeline::exit_on_codegen_error_in(&source_map, &e, dep_path),
                     };
@@ -631,7 +656,7 @@ fn run_build_multi(
                 lib_model_names,
                 lib_model_method_bodies,
                 dump_ir,
-                options,
+                &imported_options,
             ) {
                 Ok(bytes) => bytes,
                 Err(e) => crate::pipeline::exit_on_codegen_error_in(&source_map, &e, path),

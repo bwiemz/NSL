@@ -92,7 +92,7 @@ let x = full([4, 8], 0.5)
 let target = zeros([4, 8])
 
 print("LOSS_STREAM_BEGIN")
-train(model = m, epochs = 1, grad_accumulation = 2):
+train(model = m, epochs = 1, grad_accumulation = 2, schedule_unit = "micro_batch"):
     optimizer: AdamW(lr = 0.01)
 {scheduler_line}    step(batch):
         let pred = m.forward(x)
@@ -398,7 +398,7 @@ fn standard_route_applies_the_schedule() {
 fn lion_fullbuffer_route_applies_the_schedule() {
     assert_route_freeze_differential(&Route {
         tag: "lion",
-        train_cfg: "epochs = 1, grad_accumulation = 2",
+        train_cfg: "epochs = 1, grad_accumulation = 2, schedule_unit = \"micro_batch\"",
         optimizer: "Lion(lr = 0.01)",
         extra_flags: &[],
         env: &[("NSL_FASE_FUSED_COUNTER", "1")],
@@ -414,7 +414,7 @@ fn lion_fullbuffer_route_applies_the_schedule() {
 fn fused_multi_clip_route_applies_the_schedule() {
     assert_route_freeze_differential(&Route {
         tag: "fused_clip",
-        train_cfg: "epochs = 1, grad_accumulation = 2, grad_clip = 1.0",
+        train_cfg: "epochs = 1, grad_accumulation = 2, schedule_unit = \"micro_batch\", grad_clip = 1.0",
         optimizer: "AdamW(lr = 0.01)",
         extra_flags: &[],
         env: &[],
@@ -430,7 +430,7 @@ fn fused_multi_clip_route_applies_the_schedule() {
 fn fase_perparam_sgd_route_applies_the_schedule() {
     assert_route_freeze_differential(&Route {
         tag: "fase_sgd",
-        train_cfg: "epochs = 1, grad_accumulation = 2",
+        train_cfg: "epochs = 1, grad_accumulation = 2, schedule_unit = \"micro_batch\"",
         optimizer: "SGD(lr = 0.05)",
         extra_flags: &[],
         env: &[],
@@ -447,7 +447,7 @@ fn fase_perparam_sgd_route_applies_the_schedule() {
 fn fase_perparam_fused_single_route_applies_the_schedule() {
     assert_route_freeze_differential(&Route {
         tag: "fase_single",
-        train_cfg: "epochs = 1, grad_accumulation = 2",
+        train_cfg: "epochs = 1, grad_accumulation = 2, schedule_unit = \"micro_batch\"",
         optimizer: "AdamW(lr = 0.01)",
         extra_flags: &[],
         env: &[("NSL_FASE_MULTI_STEP", "0"), ("NSL_FASE_FUSED_COUNTER", "1")],
@@ -463,7 +463,7 @@ fn fase_perparam_fused_single_route_applies_the_schedule() {
 fn fase_perparam_interpreted_route_applies_the_schedule() {
     assert_route_freeze_differential(&Route {
         tag: "fase_interp",
-        train_cfg: "epochs = 1, grad_accumulation = 2",
+        train_cfg: "epochs = 1, grad_accumulation = 2, schedule_unit = \"micro_batch\"",
         optimizer: "AdamW(lr = 0.01, weight_decay = 0.01)",
         extra_flags: &["--training-reference"],
         env: &[],
@@ -482,7 +482,7 @@ fn fase_perparam_interpreted_route_applies_the_schedule() {
 fn clip_perparam_phase_b_route_applies_the_schedule() {
     assert_route_freeze_differential(&Route {
         tag: "clip_perparam",
-        train_cfg: "epochs = 1, grad_accumulation = 2, grad_clip = 1.0",
+        train_cfg: "epochs = 1, grad_accumulation = 2, schedule_unit = \"micro_batch\", grad_clip = 1.0",
         optimizer: "SGD(lr = 0.05)",
         extra_flags: &[],
         env: &[],
@@ -499,7 +499,7 @@ fn clip_perparam_phase_b_route_applies_the_schedule() {
 fn offload_perparam_route_applies_the_schedule() {
     assert_route_freeze_differential(&Route {
         tag: "offload",
-        train_cfg: "epochs = 1, grad_accumulation = 2",
+        train_cfg: "epochs = 1, grad_accumulation = 2, schedule_unit = \"micro_batch\"",
         optimizer: "AdamW(lr = 0.01)",
         extra_flags: &["--optim-state-offload"],
         env: &[],
@@ -677,7 +677,7 @@ fn each_step_trains_at_its_own_scheduled_rate() {
     };
     let accum = Route {
         tag: "applied_accum2",
-        train_cfg: "epochs = 1, grad_accumulation = 2",
+        train_cfg: "epochs = 1, grad_accumulation = 2, schedule_unit = \"micro_batch\"",
         optimizer: "AdamW(lr = 0.01)",
         extra_flags: &[],
         env: &[],

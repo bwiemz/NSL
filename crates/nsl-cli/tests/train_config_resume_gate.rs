@@ -105,13 +105,13 @@ fn fresh_dir(tag: &str) -> std::path::PathBuf {
 // Loaderless: ONE micro-step per epoch, and the save cadence is
 // checkpoint_every * accum = 2 micro-steps — so epochs = 2 makes the save
 // fire exactly once, at the end of the single optimizer step.
-const SAVE_CFG: &str = r#", epochs = 2, grad_accumulation = 2, grad_clip = 1.0, checkpoint_save = "ck.nslm", checkpoint_every = 1"#;
+const SAVE_CFG: &str = r#", epochs = 2, grad_accumulation = 2, schedule_unit = "micro_batch", grad_clip = 1.0, checkpoint_save = "ck.nslm", checkpoint_every = 1"#;
 const BASE_OPT: &str = "AdamW(lr = 0.01, weight_decay = 0.01, beta1 = 0.9, beta2 = 0.95, eps = 1e-8)";
 const BASE_SCHED: &str =
     "    scheduler: warmup_cosine(warmup_steps = 2, total_steps = 8, min_lr = 0.001)\n";
 
 fn load_cfg(extra: &str) -> String {
-    format!(r#", epochs = 4, grad_accumulation = 2{extra}, checkpoint_load = "ck.nslm""#)
+    format!(r#", epochs = 4, grad_accumulation = 2, schedule_unit = "micro_batch"{extra}, checkpoint_load = "ck.nslm""#)
 }
 
 fn save_phase(dir: &std::path::Path) {
@@ -279,7 +279,7 @@ fn changing_grad_accumulation_mid_resume_is_moment_class() {
         "b.nsl",
         &[("NSL_RESUME_ALLOW_TRAJECTORY_DRIFT", "1")],
         &fixture(
-            &format!(r#", epochs = 4, grad_accumulation = 4, grad_clip = 1.0, checkpoint_load = "ck.nslm""#),
+            &format!(r#", epochs = 4, grad_accumulation = 4, schedule_unit = "micro_batch", grad_clip = 1.0, checkpoint_load = "ck.nslm""#),
             BASE_OPT,
             BASE_SCHED,
         ),

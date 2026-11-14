@@ -181,11 +181,11 @@ fn grouped_dispatch_map_keys_are_op_ids_not_positions() {
 
 /// After a deletion, `ops.len()` is at-or-below the surviving max id, so a
 /// len-minted id collides. `fresh_op_id` must mint ABOVE the max, and
-/// `append_compressed_saves` must use it — asserted directly here by
-/// running the real append on a deletion-shaped tape (the pre-fix code
+/// `insert_compressed_saves` must use it — asserted directly here by
+/// running the real insertion on a deletion-shaped tape (the pre-fix code
 /// panics in `assert_unique_op_ids` / produced a duplicate).
 #[test]
-fn ccr_append_mints_unique_ids_after_a_deletion() {
+fn ccr_insert_mints_unique_ids_after_a_deletion() {
     // Ids 0..6 with op 2 deleted: len = 6, max id = 6 — a len-minted id (6)
     // collides with the surviving last op.
     let mut primal = WengertList {
@@ -203,22 +203,31 @@ fn ccr_append_mints_unique_ids_after_a_deletion() {
     };
     assert_eq!(primal.fresh_op_id(), 7, "fresh ids mint above the max id");
 
-    let ccr_plan = nsl_codegen::ccr::CcrPlan {
-        segments: Vec::new(),
-        recompute: HashSet::new(),
-        per_segment_recompute: Vec::new(),
-        free_eligible: HashSet::new(),
+    // One segment over the three computing ops (positions 2..5); the Sum
+    // at position 5 is outside it.
+    let mut ccr_plan = nsl_codegen::ccr::CcrPlan {
+        segments: vec![nsl_codegen::ccr::BlockSegment {
+            layer_key: "blocks.0".to_string(),
+            start: 2,
+            end: 5,
+            escaping: vec![5],
+            interior: vec![3, 4],
+        }],
+        per_segment_recompute: vec![Vec::new()],
         compress: vec![3],
+        ..nsl_codegen::ccr::CcrPlan::default()
     };
     let mut fresh: VarId = 100;
-    let map =
-        nsl_codegen::ccr::append_compressed_saves(&mut primal, &ccr_plan, "fp16", &mut fresh);
+    let map = nsl_codegen::ccr::insert_compressed_saves(&mut primal, &mut ccr_plan, &mut fresh);
     assert_eq!(map.len(), 1);
-    // The two appended ops (cast + free) carry ids 7 and 8 — unique by
+    // The two inserted ops (cast + free) carry ids 7 and 8 — unique by
     // construction; the old len-minted scheme would have handed out 6.
-    primal.assert_unique_op_ids("test: post-append");
-    let appended: Vec<u32> = primal.ops[6..].iter().map(|o| o.id).collect();
-    assert_eq!(appended, vec![7, 8]);
+    // They sit at the end of the segment, ahead of the Sum.
+    primal.assert_unique_op_ids("test: post-insert");
+    let inserted: Vec<u32> = primal.ops[5..7].iter().map(|o| o.id).collect();
+    assert_eq!(inserted, vec![7, 8]);
+    assert_eq!(primal.ops[7].id, 6, "the Sum moved behind the inserted pair");
+    assert_eq!((ccr_plan.segments[0].start, ccr_plan.segments[0].end), (2, 7));
 }
 
 /// The uniqueness belt itself: duplicate ids panic, naming the context.

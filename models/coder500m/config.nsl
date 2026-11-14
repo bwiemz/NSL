@@ -23,8 +23,11 @@ const DROPOUT = 0.1
 # model size (three since item 10; coder1b reads these same two slices at a
 # 4096-token delivery slot rather than 2048). The scheduler numbers are
 # DERIVED from the real corpus:
-#   PRETRAIN_TOTAL_STEPS = PRETRAIN_EPOCHS
+#   micro-batches        = PRETRAIN_EPOCHS
 #                        * floor(TRAIN_TOKENS / (MAX_SEQ_LEN * PRETRAIN_BATCH_SIZE))
+#   PRETRAIN_TOTAL_STEPS = ceil(micro-batches / PRETRAIN_GRAD_ACCUMULATION)
+# (scheduler steps are OPTIMIZER steps, schedule_unit="optimizer_step" in
+# pretrain_prod.nsl; until 2026-11 they were micro-batches, 400 and 4096.)
 #
 # (Roadmap item 9. The previous 305000/3000 pair described a corpus this
 # repo has never contained — the same fiction item 4 removed from the 50M
@@ -70,8 +73,8 @@ const CORPUS_TOKENS = 8925916
 const TRAIN_TOKENS = 8388608
 const VAL_TOKENS = 524288
 const PRETRAIN_LR = 0.00015
-const PRETRAIN_WARMUP = 400
-const PRETRAIN_TOTAL_STEPS = 4096
+const PRETRAIN_WARMUP = 50
+const PRETRAIN_TOTAL_STEPS = 512
 const PRETRAIN_MIN_LR = 0.00003
 const PRETRAIN_BATCH_SIZE = 2
 const PRETRAIN_GRAD_ACCUMULATION = 8

@@ -185,39 +185,62 @@ pub fn capacity_factor(roofline_slack: f64, top_k: u32, n_experts: u32) -> f64 {
 // Placement evaluation
 // ---------------------------------------------------------------------------
 
+/// Bytes of token activations a step dispatches when every one of its
+/// `tokens × top_k` assignments is sent to another device: one `d_model`
+/// vector each.
+fn full_dispatch_bytes(shape: &MoeLayerShape) -> u64 {
+    (shape.batch as u64)
+        .saturating_mul(shape.seq as u64)
+        .saturating_mul(shape.top_k as u64)
+        .saturating_mul(shape.d_model as u64)
+        .saturating_mul(shape.dtype_bytes as u64)
+}
+
+fn dispatch_us(bytes: u64, cfg: &ExpertConfig) -> f64 {
+    (bytes as f64 / cfg.intra_bw_bps.max(1.0)) * 1e6
+}
+
+/// Each GPU owns `n_experts / num_gpus` experts. A token on one GPU whose
+/// expert lives on another has to be sent there, so with tokens and routing
+/// spread evenly `(G − 1) / G` of the assignments are dispatched. (This
+/// used to be charged the partitioned memory and no dispatch at all, which
+/// no placement can deliver: it made Balanced free and therefore always the
+/// winner.)
 fn balanced_eval(shape: &MoeLayerShape, cfg: &ExpertConfig) -> PlacementEvaluation {
-    let experts_per_gpu = shape.n_experts.div_ceil(cfg.num_gpus);
+    let gpus = cfg.num_gpus.max(1);
+    let experts_per_gpu = shape.n_experts.div_ceil(gpus);
     let memory_per_gpu = (experts_per_gpu as u64) * shape.per_expert_bytes();
-    let comm_volume = 0u64; // no dispatch: every expert is local
+    let comm_volume =
+        (full_dispatch_bytes(shape) as u128 * (gpus as u128 - 1) / gpus as u128) as u64;
     let load_balance = 1.0; // every GPU owns exactly the same expert count
-    let step_time = 0.0; // dominated by expert compute itself, not plotted here
     PlacementEvaluation {
         strategy: PlacementStrategy::Balanced,
         comm_volume_bytes: comm_volume,
         load_balance,
         memory_per_gpu_bytes: memory_per_gpu,
-        step_time_us: step_time,
+        step_time_us: dispatch_us(comm_volume, cfg),
         feasible: memory_per_gpu <= cfg.per_gpu_memory_bytes,
-        rationale: format!("balanced: {experts_per_gpu} experts/GPU, no all-to-all"),
+        rationale: format!(
+            "balanced: {experts_per_gpu} experts/GPU, tokens dispatched to the GPU holding \
+             their expert"
+        ),
     }
 }
 
 fn expert_parallel_eval(shape: &MoeLayerShape, cfg: &ExpertConfig) -> PlacementEvaluation {
     // In pure expert-parallel, each GPU hosts one expert group.  Tokens
     // must be dispatched to the owning GPU via all-to-all.
-    let experts_per_gpu = shape.n_experts.div_ceil(cfg.num_gpus);
+    let experts_per_gpu = shape.n_experts.div_ceil(cfg.num_gpus.max(1));
     let memory_per_gpu = (experts_per_gpu as u64) * shape.per_expert_bytes();
     // All-to-all volume per step: every token goes to top_k experts.
-    let tokens = (shape.batch as u64) * (shape.seq as u64);
-    let comm_volume = tokens * (shape.top_k as u64) * (shape.d_model as u64) * shape.dtype_bytes as u64;
-    let step_time = (comm_volume as f64 / cfg.intra_bw_bps.max(1.0)) * 1e6;
+    let comm_volume = full_dispatch_bytes(shape);
     let load_balance = if cfg.num_gpus == 0 { 0.0 } else { 1.0 / cfg.num_gpus as f64 }; // pessimistic
     PlacementEvaluation {
         strategy: PlacementStrategy::ExpertParallel,
         comm_volume_bytes: comm_volume,
         load_balance,
         memory_per_gpu_bytes: memory_per_gpu,
-        step_time_us: step_time,
+        step_time_us: dispatch_us(comm_volume, cfg),
         feasible: memory_per_gpu <= cfg.per_gpu_memory_bytes,
         rationale: format!(
             "expert-parallel: all-to-all dispatch, {experts_per_gpu} experts/GPU"
@@ -232,20 +255,17 @@ fn hybrid_eval(shape: &MoeLayerShape, cfg: &ExpertConfig) -> PlacementEvaluation
     let replicated_count = (shape.n_experts / 2).max(1);
     let sharded_count = shape.n_experts - replicated_count;
     let memory_per_gpu = replicated_count as u64 * shape.per_expert_bytes()
-        + sharded_count.div_ceil(cfg.num_gpus) as u64 * shape.per_expert_bytes();
-    let tokens = (shape.batch as u64) * (shape.seq as u64);
-    // Only half the tokens incur all-to-all.
-    let comm_volume = tokens
-        .saturating_mul((shape.top_k as u64) / 2)
-        .saturating_mul(shape.d_model as u64)
-        .saturating_mul(shape.dtype_bytes as u64);
-    let step_time = (comm_volume as f64 / cfg.intra_bw_bps.max(1.0)) * 1e6;
+        + sharded_count.div_ceil(cfg.num_gpus.max(1)) as u64 * shape.per_expert_bytes();
+    // Half the assignments go to a replicated (local) expert; the other
+    // half are dispatched. Halved on the byte total: halving `top_k` in
+    // integer arithmetic, as this did, made the volume 0 for top-1 routing.
+    let comm_volume = full_dispatch_bytes(shape) / 2;
     PlacementEvaluation {
         strategy: PlacementStrategy::Hybrid,
         comm_volume_bytes: comm_volume,
         load_balance: 0.75,
         memory_per_gpu_bytes: memory_per_gpu,
-        step_time_us: step_time,
+        step_time_us: dispatch_us(comm_volume, cfg),
         feasible: memory_per_gpu <= cfg.per_gpu_memory_bytes,
         rationale: format!(
             "hybrid: {replicated_count} replicated + {sharded_count} sharded experts, halved all-to-all"
@@ -381,10 +401,50 @@ mod tests {
         assert!(aff[3].affinity > aff[0].affinity);
     }
 
+    /// The three placements on one shape, worked by hand.
+    ///
+    /// 4 x 256 = 1024 tokens, top-2, 512-wide, 2 bytes: dispatching every
+    /// assignment moves 1024 x 2 x 512 x 2 = 2,097,152 bytes. On 8 GPUs a
+    /// partition keeps 1/8 of the assignments local (1,835,008 dispatched),
+    /// expert-parallel dispatches all, and the hybrid dispatches half
+    /// (1,048,576). An expert is 2 x 512 x 1024 x 2 = 2,097,152 bytes; a
+    /// partition holds 1 per GPU and the hybrid 4 replicated + 1 sharded.
     #[test]
-    fn balanced_placement_has_zero_all_to_all() {
-        let eval = balanced_eval(&shape(), &ExpertConfig::default());
-        assert_eq!(eval.comm_volume_bytes, 0);
+    fn placements_are_charged_for_what_they_dispatch_and_hold() {
+        let cfg = ExpertConfig::default();
+        let balanced = balanced_eval(&shape(), &cfg);
+        let parallel = expert_parallel_eval(&shape(), &cfg);
+        let hybrid = hybrid_eval(&shape(), &cfg);
+        assert_eq!(balanced.comm_volume_bytes, 1_835_008);
+        assert_eq!(parallel.comm_volume_bytes, 2_097_152);
+        assert_eq!(hybrid.comm_volume_bytes, 1_048_576);
+        assert_eq!(balanced.memory_per_gpu_bytes, 2_097_152);
+        assert_eq!(parallel.memory_per_gpu_bytes, 2_097_152);
+        assert_eq!(hybrid.memory_per_gpu_bytes, 5 * 2_097_152);
+        // 1,835,008 bytes at 9e11 B/s.
+        assert!((balanced.step_time_us - 1_835_008.0 / 9e11 * 1e6).abs() < 1e-9);
+    }
+
+    /// Halving `top_k` as an integer made the hybrid's dispatch 0 for top-1
+    /// routing. Half of 1024 x 1 x 512 x 2 bytes is 524,288.
+    #[test]
+    fn hybrid_dispatch_is_not_zero_for_top_1() {
+        let top1 = MoeLayerShape { top_k: 1, ..shape() };
+        assert_eq!(hybrid_eval(&top1, &ExpertConfig::default()).comm_volume_bytes, 524_288);
+    }
+
+    /// With room for the replicated experts, the hybrid's smaller dispatch
+    /// wins; when memory only fits a partition, the partition does. Balanced
+    /// used to win every time, at a cost of zero.
+    #[test]
+    fn the_cheapest_placement_that_fits_wins() {
+        let roomy = plan_placement(&shape(), &ExpertConfig::default());
+        assert_eq!(roomy.strategy, PlacementStrategy::Hybrid);
+        let tight = ExpertConfig {
+            per_gpu_memory_bytes: 3 * 2_097_152,
+            ..ExpertConfig::default()
+        };
+        assert_eq!(plan_placement(&shape(), &tight).strategy, PlacementStrategy::Balanced);
     }
 
     #[test]

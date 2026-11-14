@@ -456,6 +456,15 @@ pub static REGISTRY: &[EnvVar] = &[
         "FASE two-phase clip: batches the grad-norm sum-of-squares into one f64-accumulating call; 0 restores per-param f32 reads (bits differ)."
     ),
     var!(
+        "NSL_FASE_FLUSH_TAIL",
+        Bool,
+        "0 disables; anything else or unset = on",
+        "on",
+        Behavior,
+        Compile,
+        "0: a run that ends inside an accumulation window drops its pending micro-batches (with a warning) instead of stepping on them."
+    ),
+    var!(
         "NSL_FASE_FUSED_COUNTER",
         Bool,
         "1 only (both sites)",
@@ -814,15 +823,6 @@ pub static REGISTRY: &[EnvVar] = &[
         Platform,
         Both,
         "This process's distributed rank; the SPMD spawner sets it per child (its presence stops re-spawning) and the runtime reads it."
-    ),
-    var!(
-        "NSL_M52C_SPARSE_MATMUL",
-        Bool,
-        "1 only (exact match)",
-        "off (dense matmul)",
-        Behavior,
-        Compile,
-        "Set to 1 to re-enable the weight-aware CSR sparse matmul in `-w` builds; withheld because it aborts on CPU and miscomputes on GPU."
     ),
     var!(
         "NSL_MATMUL_BF16",
@@ -1506,7 +1506,7 @@ pub static REGISTRY: &[EnvVar] = &[
         "off (unfused adapter ops)",
         Behavior,
         Both,
-        "Set to 1 to compile @adapter sites to the fused call on a pinned sm_80+ target (2-D activations only) and to launch its CUDA kernel at run time."
+        "Set to 1 to compile @adapter sites to the fused call on a pinned sm_80+ target and launch its kernel at run time. Half precision, base product included."
     ),
     var!(
         "NSL_WRGA_GPU_LAUNCH_COUNTER",

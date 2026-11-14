@@ -74,13 +74,13 @@ impl PruneDelta {
 /// Apply a [`PruneDelta`] to a [`ModelSpec`] and return a new spec.
 ///
 /// Rules:
-///   * Dropped heads reduce `n_heads[layer]` and `n_kv_heads[layer]`.
-///     When heads are pruned inside a GQA group, the KV-head count is
-///     reduced proportionally (at least 1 KV head is retained).
+///   * Dropped heads reduce `n_heads[layer]` and `n_kv_heads[layer]`
+///     together. The count kept is rounded down to whole key/value groups
+///     and at least one group is retained, so callers should ask for whole
+///     groups (the search and the slicer do).
 ///   * Dropped layers are removed from all per-layer vectors and
 ///     `n_layers` is decremented.
-///   * FFN width is clamped to at least `head_dim` (avoids zero-width
-///     FFNs the backend can't lower).
+///   * FFN width is the delta's, and at least 1.
 pub fn apply_delta(spec: &ModelSpec, delta: &PruneDelta) -> ModelSpec {
     let mut out = spec.clone();
     let mut keep = vec![true; spec.n_layers as usize];
@@ -110,10 +110,11 @@ pub fn apply_delta(spec: &ModelSpec, delta: &PruneDelta) -> ModelSpec {
             let new_kv = (snapped / group).max(1);
             out.n_kv_heads[l] = new_kv;
         }
-        // Adjust FFN.
+        // Adjust FFN. The width is taken as given: the weight slicer and
+        // the source rewriter use the delta's number, so a different one
+        // here would describe a model that neither of them produces.
         if let Some(ff) = ld.new_d_ff {
-            let floor = spec.head_dim.get(l).copied().unwrap_or(1);
-            out.d_ff[l] = ff.max(floor).max(1);
+            out.d_ff[l] = ff.max(1);
         }
     }
 
@@ -145,6 +146,7 @@ pub struct SearchAxes {
     pub max_seq: u32,
     pub batch: u32,
     pub dtype_bytes: u32,
+    pub tied_lm_head: bool,
 }
 
 impl SearchAxes {
@@ -159,11 +161,14 @@ impl SearchAxes {
     }
 
     /// Enumerate all combinations as [`ModelSpec`]s.  Candidates are filtered
-    /// by shape-algebra invariants and §4.3 granularity constraints:
+    /// by:
     ///   * `n_kv_heads` must divide `n_heads` evenly (GQA invariant)
-    ///   * `n_heads` must divide `d_model` evenly (head-dim derivation)
     ///   * `d_model` must be a power of two OR a multiple of 64 (§4.3 table row 1)
     ///   * `d_ff` must be a multiple of 64 (§4.3 table row 6)
+    ///
+    /// `head_dim` is the base model's for every candidate (NSL's attention
+    /// takes it as an explicit argument), so `n_heads` need not divide
+    /// `d_model`: the projections are `[d_model, n_heads·head_dim]`.
     pub fn enumerate(&self) -> Vec<ModelSpec> {
         let mut out = Vec::new();
         for &d in &self.d_model {
@@ -177,9 +182,6 @@ impl SearchAxes {
                 for &nh in &self.n_heads {
                     for &nkv in &self.n_kv_heads {
                         if nkv == 0 || nh % nkv != 0 {
-                            continue;
-                        }
-                        if d % nh != 0 {
                             continue;
                         }
                         for &ff in &self.d_ff {
@@ -202,6 +204,7 @@ impl SearchAxes {
                                         activation: act,
                                         norm,
                                         dtype_bytes: self.dtype_bytes,
+                                        tied_lm_head: self.tied_lm_head,
                                     });
                                 }
                             }
@@ -253,13 +256,15 @@ mod tests {
         assert_eq!(pruned.n_heads.len(), 3);
     }
 
+    /// The width in the spec is the width in the delta: the slicer narrows
+    /// the weights to that number, so the spec must describe the same model.
     #[test]
-    fn ffn_shrink_honours_head_dim_floor() {
-        let spec = base();
+    fn ffn_width_is_the_deltas() {
+        let spec = base(); // head_dim 64
         let delta = PruneDelta::for_spec(&spec).with_ffn(0, 32);
-        // head_dim=64 → floor prevents FFN going below 64.
         let pruned = apply_delta(&spec, &delta);
-        assert_eq!(pruned.d_ff[0], 64);
+        assert_eq!(pruned.d_ff[0], 32);
+        assert_eq!(pruned.d_ff[1], 1024);
     }
 
     #[test]
@@ -279,6 +284,35 @@ mod tests {
         pruned.validate().expect("pruned spec valid");
     }
 
+    /// `head_dim` is explicit, so a head count that does not divide
+    /// `d_model` is a legal candidate: the projections are
+    /// `[d_model, n_heads·head_dim]`.
+    #[test]
+    fn enumerate_keeps_head_counts_that_do_not_divide_d_model() {
+        let axes = SearchAxes {
+            d_model: vec![256, 384, 512],
+            n_layers: vec![6],
+            n_heads: vec![4, 6, 8],
+            n_kv_heads: vec![2],
+            d_ff: vec![1024],
+            activation: vec![Activation::SwiGlu],
+            norm: vec![NormType::RmsNorm],
+            vocab: 4096,
+            head_dim: 64,
+            max_seq: 2048,
+            batch: 1,
+            dtype_bytes: 4,
+            tied_lm_head: true,
+        };
+        let candidates = axes.enumerate();
+        assert_eq!(candidates.len(), 9);
+        assert!(candidates.iter().any(|c| c.d_model == 256 && c.n_heads[0] == 6));
+        for c in &candidates {
+            c.validate().expect("enumerated candidate valid");
+            assert_eq!(c.head_dim[0], 64);
+        }
+    }
+
     #[test]
     fn search_axes_enumerate_rejects_bad_ratios() {
         let axes = SearchAxes {
@@ -293,7 +327,7 @@ mod tests {
             head_dim: 64,
             max_seq: 1024,
             batch: 1,
-            dtype_bytes: 2,
+            dtype_bytes: 2, tied_lm_head: true,
         };
         let candidates = axes.enumerate();
         // d=256 × {nh=4,nkv=2} ok, {nh=8,nkv=2} ok: 2
@@ -318,7 +352,7 @@ mod tests {
             head_dim: 64,
             max_seq: 1024,
             batch: 1,
-            dtype_bytes: 2,
+            dtype_bytes: 2, tied_lm_head: true,
         };
         assert_eq!(axes.num_candidates(), 4); // 2 ffn × 2 activation
         assert_eq!(axes.enumerate().len(), 4); // nothing filtered
@@ -354,7 +388,7 @@ mod tests {
             head_dim: 64,
             max_seq: 1024,
             batch: 1,
-            dtype_bytes: 2,
+            dtype_bytes: 2, tied_lm_head: true,
         };
         let candidates = axes.enumerate();
         // d_model=100 and d_ff=1000 must never appear.

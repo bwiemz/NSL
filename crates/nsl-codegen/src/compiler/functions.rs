@@ -91,6 +91,19 @@ impl Compiler<'_> {
             self.build_escape_analysis(stmts);
         }
 
+        // The bodies source AD may inline (see the field doc). Recorded
+        // here because this runs before any statement of the module body
+        // -- and so before any train/distill/grad block -- is lowered.
+        self.free_fn_bodies = stmts
+            .iter()
+            .filter_map(|s| match &s.kind {
+                StmtKind::FnDef(fn_def) => {
+                    Some((self.resolve_sym(fn_def.name).to_string(), fn_def.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+
         let fn_defs: Vec<_> = stmts
             .iter()
             .filter_map(|s| match &s.kind {
@@ -454,6 +467,10 @@ impl Compiler<'_> {
                 }
             }
 
+            // `-w`: the fields the weights file names take its values, before
+            // anything (the adapter tables below included) reads them.
+            self.emit_weight_file_loads(&mut builder, ptr, &model_name)?;
+
             // WRGA: the adapter side-table. The pre-scan
             // (`wrga_prescan::prescan_adapter_sites_from_decorators`) runs
             // before any constructor is compiled, so the adapter sites are
@@ -486,28 +503,7 @@ impl Compiler<'_> {
                 let nh = builder.ins().iconst(cl_types::I64, num_heads);
                 let hd = builder.ins().iconst(cl_types::I64, head_dim);
                 let nl = builder.ins().iconst(cl_types::I64, num_layers);
-                // M42: Look up KV compression policy for this model (use first policy found)
-                let (compress_scheme, compress_window, compress_sinks) = self
-                    .features
-                    .kv_compress_policies
-                    .iter()
-                    .filter(|(key, _)| key.starts_with(&model_name))
-                    .filter_map(|(_, policies)| policies.first())
-                    .next()
-                    .map(|p| (p.scheme as i64, p.window as i64, p.sinks as i64))
-                    .unwrap_or((0, 0, 0));
-                if compress_scheme > 0 {
-                    nsl_log::nsl_log!(INFO, "nsl", 
-                        "[nsl] KV cache compression active: scheme={}, window={}, sinks={}",
-                        compress_scheme, compress_window, compress_sinks
-                    );
-                }
-                let cs = builder.ins().iconst(cl_types::I64, compress_scheme);
-                let cw = builder.ins().iconst(cl_types::I64, compress_window);
-                let ck = builder.ins().iconst(cl_types::I64, compress_sinks);
-                let call = builder
-                    .ins()
-                    .call(init_ref, &[nb, bs, nh, hd, nl, cs, cw, ck]);
+                let call = builder.ins().call(init_ref, &[nb, bs, nh, hd, nl]);
                 // Store the handle — for now just discard it (the handle is returned by init)
                 let _handle = builder.inst_results(call)[0];
             }
@@ -570,16 +566,6 @@ impl Compiler<'_> {
                             || self.features.fp8_compute_fns.contains(&mangled)
                         {
                             state.flags.is_fp8_compute = true;
-                        }
-
-                        // M35: @quantize on the model — log active quantization config for
-                        // this method. The config is used by the caller (e.g., serve engine)
-                        // to select the appropriate runtime dequantization path.
-                        if let Some(qcfg) = self.features.quant_configs.get(&model_name) {
-                            nsl_log::nsl_log!(INFO, "nsl", 
-                                "[nsl] M35: compiling '{}' with quantization — dtype={}, group_size={}",
-                                method_name, qcfg.dtype, qcfg.group_size
-                            );
                         }
 
                         // First Cranelift param is self (pointer)

@@ -163,6 +163,8 @@ fn build_table() -> HashMap<&'static str, FfiOwnershipKind> {
     //   gpu_backward_binary output, CPU elementwise fresh); frees its own
     //   ones/contiguous/deriv temps.
     m.insert("nsl_tensor_reduce_to_shape", OwnedNewResult);
+    // A fresh broadcast view over its own one-element buffer.
+    m.insert("nsl_tensor_shape_stub", OwnedNewResult);
     m.insert("nsl_tensor_gelu_backward", OwnedNewResult);
     // Dispatch-arm terminals with no allowlist entry (their free-function
     // results stranded in nested/receiver/statement position until the

@@ -23,26 +23,63 @@ impl<'a> TypeChecker<'a> {
         // cannot disagree (the pre-contract asymmetry — `nsl check` green
         // on headers `nsl build` refused, and vice versa — was the bug;
         // see crate::train_config's module doc).
-        if let Err(diags) = crate::train_config::resolve_train_config(
+        let train_cfg = match crate::train_config::resolve_train_config(
             train,
             &|sym| self.resolve_name(sym),
             crate::train_config::TrainConfigPurpose::UserTrainBlock,
         ) {
-            self.diagnostics.extend(diags);
-        }
+            Ok(cfg) => Some(cfg),
+            Err(diags) => {
+                self.diagnostics.extend(diags);
+                None
+            }
+        };
 
         // Same contract for the optimizer:/scheduler:/callbacks: sections
         // (crate::optim_config's module doc records the pre-contract holes:
         // typo'd kwargs silently defaulted, unknown scheduler names
         // silently trained at constant lr, unknown callback names were
         // never emitted).
-        if let Err(diags) = crate::optim_config::resolve_optim_config(
+        let optim_cfg = match crate::optim_config::resolve_optim_config(
             &train.sections,
             train.span,
             &|sym| self.resolve_name(sym),
             crate::train_config::TrainConfigPurpose::UserTrainBlock,
         ) {
-            self.diagnostics.extend(diags);
+            Ok(cfg) => Some(cfg),
+            Err(diags) => {
+                self.diagnostics.extend(diags);
+                None
+            }
+        };
+
+        // Under accumulation the schedule's step arguments are counted in
+        // optimizer steps unless the header says otherwise; older toolchains
+        // counted micro-batches. That is a unit nobody can read off the
+        // source, so say it once, at compile time.
+        if let (Some(train_cfg), Some(optim_cfg)) = (&train_cfg, &optim_cfg) {
+            let stepped = optim_cfg.scheduler.as_ref().is_some_and(|s| {
+                !matches!(s, crate::optim_config::ResolvedScheduler::ConstantLr)
+            });
+            if let Some(message) = crate::train_config::schedule_unit_warning(
+                train_cfg.grad_accumulation,
+                train_cfg.schedule_unit,
+                stepped,
+            ) {
+                // On the `grad_accumulation` argument: the block's own span
+                // runs to its last line and would quote all of it.
+                let at = train
+                    .config
+                    .iter()
+                    .find(|arg| {
+                        arg.name.is_some_and(|n| self.resolve_name(n) == "grad_accumulation")
+                    })
+                    .map_or(train.span, |arg| arg.span);
+                self.diagnostics.push(
+                    Diagnostic::warning(message)
+                        .with_label(at, "a scheduler: section is combined with this"),
+                );
+            }
         }
 
         let mut has_step = false;
@@ -214,6 +251,9 @@ impl<'a> TypeChecker<'a> {
         // the program does not contain).
         let mut seen_config: std::collections::HashSet<String> =
             std::collections::HashSet::new();
+        // For the schedule-unit warning below, as on a train block.
+        let mut accumulation: (i64, Option<nsl_errors::Span>) = (1, None);
+        let mut schedule_unit: Option<crate::train_config::ScheduleUnit> = None;
 
         for arg in &distill.config {
             let key = arg
@@ -300,7 +340,7 @@ impl<'a> TypeChecker<'a> {
                     // Passthrough, hence no CPDT optimizer-moment precision) with
                     // no diagnostic to explain why the envelope never engaged.
                     match arg.value.kind {
-                        ExprKind::IntLiteral(n) if n >= 1 => {}
+                        ExprKind::IntLiteral(n) if n >= 1 => accumulation = (n, Some(arg.span)),
                         _ => {
                             self.diagnostics.push(
                                 Diagnostic::error(
@@ -313,12 +353,38 @@ impl<'a> TypeChecker<'a> {
                     }
                     self.check_expr(&arg.value);
                 }
+                "schedule_unit" => {
+                    use crate::train_config::ScheduleUnit;
+                    match &arg.value.kind {
+                        ExprKind::StringLiteral(s) if s == "micro_batch" => {
+                            schedule_unit = Some(ScheduleUnit::MicroBatch);
+                        }
+                        ExprKind::StringLiteral(s) if s == "optimizer_step" => {
+                            schedule_unit = Some(ScheduleUnit::OptimizerStep);
+                        }
+                        _ => {
+                            self.diagnostics.push(
+                                Diagnostic::error(
+                                    "distill 'schedule_unit' must be \"micro_batch\" or \
+                                     \"optimizer_step\" (a string literal): what one step \
+                                     of the scheduler: section counts under \
+                                     grad_accumulation",
+                                )
+                                .with_label(
+                                    arg.span,
+                                    "expected \"micro_batch\" or \"optimizer_step\"",
+                                ),
+                            );
+                        }
+                    }
+                }
                 other => {
                     self.diagnostics.push(
                         Diagnostic::error(format!("unknown distill config key '{other}'"))
                             .with_label(
                                 arg.span,
-                                "expected teacher=, student=, epochs=, or grad_accumulation=",
+                                "expected teacher=, student=, epochs=, grad_accumulation=, \
+                                 or schedule_unit=",
                             ),
                     );
                 }
@@ -416,30 +482,19 @@ impl<'a> TypeChecker<'a> {
                         .with_label(entry.value.span, "expected positive numeric literal"),
                     ),
                 },
-                "feature_weight" => match entry.value.kind {
-                    ExprKind::FloatLiteral(v) if v >= 0.0 => {}
-                    ExprKind::IntLiteral(v) if v >= 0 => {}
-                    _ => self.diagnostics.push(
-                        Diagnostic::error(
-                            "distill loss feature_weight must be a non-negative literal in v1",
-                        )
-                        .with_label(entry.value.span, "expected non-negative numeric literal"),
-                    ),
-                },
-                "feature_layers" => match &entry.value.kind {
-                    ExprKind::StringLiteral(s) if s == "auto" => {}
-                    ExprKind::ListLiteral(items)
-                        if items
-                            .iter()
-                            .all(|e| matches!(e.kind, ExprKind::IntLiteral(_))) => {}
-                    _ => self.diagnostics.push(
-                        Diagnostic::error(
-                            "distill loss feature_layers must be \"auto\" or a list of \
-                             integer literals in v1",
-                        )
-                        .with_label(entry.value.span, "expected \"auto\" or [int, ...]"),
-                    ),
-                },
+                // Feature matching does not exist: nothing lowers a
+                // feature loss, picks layers for one, or weights it. These
+                // two keys used to be range-checked, echoed in the build
+                // report and otherwise ignored. A user who wants a feature
+                // loss writes it in the step body, with its own weight.
+                "feature_weight" | "feature_layers" => self.diagnostics.push(
+                    Diagnostic::error(format!(
+                        "distill loss key `{key}` is not supported: feature matching is \
+                         not implemented, so the key would have no effect. Remove it; \
+                         a feature loss can be written in the step body."
+                    ))
+                    .with_label(entry.span, "unsupported loss config key"),
+                ),
                 "attn_transfer" => match entry.value.kind {
                     ExprKind::BoolLiteral(false) => {}
                     ExprKind::BoolLiteral(true) => self.diagnostics.push(
@@ -470,13 +525,32 @@ impl<'a> TypeChecker<'a> {
         // optimizer kwarg passed `nsl check` and refused only at build —
         // with a message naming `train`, a construct the program does not
         // contain.
-        if let Err(diags) = crate::optim_config::resolve_optim_config(
+        match crate::optim_config::resolve_optim_config(
             &distill.sections,
             distill.span,
             &|sym| self.resolve_name(sym),
             crate::train_config::TrainConfigPurpose::DistillLowering,
         ) {
-            self.diagnostics.extend(diags);
+            Err(diags) => self.diagnostics.extend(diags),
+            // The same unit question as on a train block, and the same
+            // warning: a distill block runs the train loop.
+            Ok(optim_cfg) => {
+                let stepped = optim_cfg.scheduler.as_ref().is_some_and(|s| {
+                    !matches!(s, crate::optim_config::ResolvedScheduler::ConstantLr)
+                });
+                if let Some(message) = crate::train_config::schedule_unit_warning(
+                    accumulation.0,
+                    schedule_unit,
+                    stepped,
+                ) {
+                    self.diagnostics.push(
+                        Diagnostic::warning(message).with_label(
+                            accumulation.1.unwrap_or(distill.span),
+                            "a scheduler: section is combined with this",
+                        ),
+                    );
+                }
+            }
         }
 
         let mut has_step = false;
@@ -910,32 +984,34 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// A `dataset` block declares the packing statistics of a corpus for
+    /// attention planning, and nothing else: code generation reads
+    /// `packing`, `max_sequence_length` (`max_seq_len`), `mean_doc_length`
+    /// and `doc_length_stddev` (`nsl-codegen`'s
+    /// `pca_activation::extract_dataset_packing`) and skips the block
+    /// otherwise. It opens no file and builds no loader.
+    ///
+    /// The checker used to accept eleven more fields that read as
+    /// instructions to a data pipeline (`source`, `format`, `transform`,
+    /// `filter`, `shuffle`, `max_samples`, `shuffle_buffer`,
+    /// `sequence_length`, `pack_separator`, `separator_token_id`,
+    /// `resume_from`) and even required `source`. Nothing consumed any of
+    /// them: a block naming a file that does not exist, with a filter that
+    /// rejects every sample, compiled and ran with no effect. Each is now
+    /// refused by name ([`unsupported_dataset_field`]).
     pub(crate) fn check_dataset_def(&mut self, ds: &DatasetDef) {
         self.declare_symbol(ds.name, Type::Unknown, ds.span, true, false);
 
         self.check_assignable_expr(&ds.source, &Type::Str, "dataset name");
 
         let mut seen_fields = HashSet::new();
-        let mut has_source_field = false;
         for entry in &ds.body {
             self.check_duplicate_key(&mut seen_fields, entry, "dataset field");
             let key = self.resolve_name(entry.key);
             match key.as_str() {
-                "source" => {
-                    has_source_field = true;
-                    self.check_expr(&entry.value);
-                }
-                "format" => match &entry.value.kind {
-                    ExprKind::Ident(_) | ExprKind::StringLiteral(_) => {}
-                    _ => {
-                        self.check_expr(&entry.value);
-                    }
-                },
-                "transform" | "filter" => {
-                    self.check_expr(&entry.value);
-                }
-                "shuffle" | "packing" => {
+                "packing" => {
                     self.check_assignable_expr(&entry.value, &Type::Bool, &format!("dataset {key}"));
+                    self.check_dataset_literal(&entry.value, key.as_str(), "`true` or `false`");
                 }
                 // v9 M4: `mean_doc_length` / `doc_length_stddev` accept
                 // BOTH Int and Float literals. Real-corpus calibration
@@ -944,47 +1020,75 @@ impl<'a> TypeChecker<'a> {
                 // pca_activation.rs::extract_dataset_packing rounds Float
                 // to u32 (nearest-even) — the storage stays u32.
                 //
-                // v9 L4: all length fields (including the pre-v9 gap on
-                // `sequence_length` / `max_sequence_length` / `max_seq_len`)
-                // refuse a negative literal at semantic time. Negatives
-                // would silently wrap to a huge u32 downstream and misroute
-                // PCA planning / dataset stride math.
-                //
-                // `separator_token_id` accepts any i64 (token ids include
-                // 0; negative sentinels are legal for absent-separator
-                // configs), so it stays out of the non-negative check.
+                // v9 L4: the length fields refuse a negative literal at
+                // semantic time. Negatives would silently wrap to a huge
+                // u32 downstream and misroute PCA planning.
                 "mean_doc_length" | "doc_length_stddev" => {
                     self.check_int_or_float_expr(&entry.value, &format!("dataset {key}"));
                     self.check_non_negative_literal(&entry.value, key.as_str());
+                    self.check_dataset_literal(&entry.value, key.as_str(), "a number");
                 }
-                "sequence_length"
-                | "max_sequence_length"
-                | "max_seq_len" => {
+                "max_sequence_length" | "max_seq_len" => {
                     self.check_assignable_expr(&entry.value, &Type::Int, &format!("dataset {key}"));
                     self.check_non_negative_literal(&entry.value, key.as_str());
+                    self.check_dataset_literal(&entry.value, key.as_str(), "an integer");
                 }
-                "max_samples"
-                | "shuffle_buffer"
-                | "pack_separator"
-                | "separator_token_id" => {
-                    self.check_assignable_expr(&entry.value, &Type::Int, &format!("dataset {key}"));
-                }
-                "resume_from" => {
-                    self.check_assignable_expr(&entry.value, &Type::Str, "dataset resume_from");
-                }
-                _ => {
-                    self.diagnostics.push(
-                        Diagnostic::error(format!("unknown dataset field '{key}'"))
-                            .with_label(entry.span, "unknown dataset field"),
-                    );
+                other => {
+                    // Still type-check the value, so an undefined name in a
+                    // refused field is reported as well.
+                    match (&entry.value.kind, other) {
+                        (ExprKind::Ident(_), "format") => {}
+                        _ => {
+                            self.check_expr(&entry.value);
+                        }
+                    }
+                    let message = match unsupported_dataset_field(other) {
+                        Some(reason) => format!(
+                            "dataset field '{other}' is not supported: {reason}. A dataset block \
+                             declares packing statistics for attention planning (packing, \
+                             max_sequence_length, mean_doc_length, doc_length_stddev) and \
+                             loads no data; load data with load_mmap(...) and DataLoader(...)"
+                        ),
+                        None => format!("unknown dataset field '{other}'"),
+                    };
+                    let label = if unsupported_dataset_field(other).is_some() {
+                        "nothing reads this field"
+                    } else {
+                        "unknown dataset field"
+                    };
+                    self.diagnostics
+                        .push(Diagnostic::error(message).with_label(entry.span, label));
                 }
             }
         }
+    }
 
-        if !has_source_field {
+    /// The accepted `dataset` fields are read at compile time, and only as
+    /// literals (`pca_activation::extract_dataset_packing`). A name or an
+    /// expression type-checked and was then read as "not given":
+    /// `packing = use_packing` left packing off whatever the constant held.
+    /// A literal behind a unary minus is left to
+    /// `check_non_negative_literal`, which has already reported it.
+    fn check_dataset_literal(&mut self, expr: &Expr, field: &str, wanted: &str) {
+        let literal = |kind: &ExprKind| {
+            matches!(
+                kind,
+                ExprKind::BoolLiteral(_) | ExprKind::IntLiteral(_) | ExprKind::FloatLiteral(_)
+            )
+        };
+        let ok = match &expr.kind {
+            ExprKind::UnaryOp { op: nsl_ast::operator::UnaryOp::Neg, operand } => {
+                literal(&operand.kind)
+            }
+            kind => literal(kind),
+        };
+        if !ok {
             self.diagnostics.push(
-                Diagnostic::error("dataset body must declare 'source'")
-                    .with_label(ds.span, "missing source field"),
+                Diagnostic::error(format!(
+                    "dataset {field} must be a literal ({wanted}): the block is read at \
+                     compile time, and a name or an expression here would be ignored"
+                ))
+                .with_label(expr.span, "not a literal"),
             );
         }
     }
@@ -1114,5 +1218,33 @@ impl<'a> TypeChecker<'a> {
                 );
             }
         }
+    }
+}
+
+
+/// Why a `dataset` field that used to be accepted is refused, or `None`
+/// for a name that was never a field. Every one of these parsed, passed
+/// the checker and was read by nothing.
+pub(crate) fn unsupported_dataset_field(key: &str) -> Option<&'static str> {
+    match key {
+        "source" | "format" => Some("a dataset block does not open or read a file"),
+        "transform" | "filter" => Some("a dataset block applies no function to samples"),
+        "shuffle" | "shuffle_buffer" => {
+            Some("a dataset block does not order data; pass `shuffle` to DataLoader(...)")
+        }
+        "max_samples" => Some("a dataset block does not limit how much data is read"),
+        "sequence_length" => Some(
+            "a dataset block does not cut sequences; pass `seq_len` to DataLoader(...) \
+             (the planning bound is `max_sequence_length`)",
+        ),
+        "pack_separator" | "separator_token_id" => Some(
+            "the token that ends a document is given to the loader, as \
+             DataLoader(..., packing = true, pack_separator = <token id>)",
+        ),
+        "resume_from" => Some(
+            "a dataset block has no position to resume; a train block resumes with \
+             `checkpoint_load`",
+        ),
+        _ => None,
     }
 }

@@ -46,6 +46,11 @@ fn wrga_check_context(
 /// on `opts.wrga.check.target_override` and is applied to `WrgaInputs` by the
 /// CLI WRGA bridge (`pipeline::apply_wrga_check_overrides`).
 ///
+/// `weights` is the `--weights` checkpoint, handed to the build exactly as
+/// `nsl build --weights` hands it, so the report's spectral figures are the
+/// ones a build would print. (It used to be dropped here: the report was the
+/// same with and without it.)
+///
 /// Returns the process exit code: `0` on success, `2` on "no WRGA decorators
 /// in source" (so CI can distinguish absence from compile failure), `1` on
 /// any other error.
@@ -54,6 +59,7 @@ pub(crate) fn run_check_wrga_analyze(
     report_path: &std::path::Path,
     wrga_target: Option<&str>,
     ablation: nsl_codegen::wrga::WrgaAblation,
+    weights: Option<&std::path::Path>,
 ) -> i32 {
     // Pre-check: surface "no decorators" as exit 2 BEFORE running codegen.
     // The build path would silently report "no plan" with exit 0, which the
@@ -91,6 +97,10 @@ pub(crate) fn run_check_wrga_analyze(
         source_ad: true,
         wrga: nsl_codegen::WrgaOptions {
             check: wrga_check_context(wrga_target, ablation, None),
+            ..Default::default()
+        },
+        weights: nsl_codegen::WeightsOptions {
+            file: weights.map(std::path::Path::to_path_buf),
             ..Default::default()
         },
         ..nsl_codegen::CompileOptions::default()
@@ -147,18 +157,17 @@ pub(crate) fn run_check_wrga_compare(
     report_path: &std::path::Path,
     wrga_target: Option<&str>,
     ablation: nsl_codegen::wrga::WrgaAblation,
+    weights: Option<&std::path::Path>,
 ) -> i32 {
-    // `--wrga-compare` recovers each site's `(m + n)` weight footprint from
-    // `RankAllocation.adapter_params / rank`. When `--wrga-ablate=spectral`
-    // is active, `spectral_noop` returns `adapter_params: 0` (no SVD ran =
-    // no shape data), which would silently zero every LoRA/AdaLoRA/ReFT row
-    // in the PEFT table. Warn rather than continuing into a misleading report.
+    // With `--wrga-ablate=spectral` the stage that turns ranks into
+    // parameter counts does not run (`spectral_noop` gives every site
+    // `adapter_params: 0`), so the table's WRGA row would read as "no
+    // parameters". Warn rather than continuing into a misleading report.
     if ablation.skip_spectral_allocation {
         nsl_log::nsl_log!(WARN, "nsl", 
-            "nsl: --wrga-compare: warning — --wrga-ablate=spectral disables the SVD that \
-             recovers per-site weight shapes; the comparison table's LoRA / AdaLoRA / ReFT \
-             rows will all show 0 params. Use --wrga-analyze if you want the bare ablated \
-             plan."
+            "nsl: --wrga-compare: warning — --wrga-ablate=spectral skips the stage that sizes \
+             the adapters; the comparison table's WRGA row will show 0 parameters. Use \
+             --wrga-analyze if you want the bare ablated plan."
         );
     }
     let (_interner, _parse_result, analysis) = crate::pipeline::frontend_with_flags(file, false);
@@ -195,6 +204,10 @@ pub(crate) fn run_check_wrga_compare(
         source_ad: true,
         wrga: nsl_codegen::WrgaOptions {
             check: wrga_check_context(wrga_target, ablation, Some(plan_capture.clone())),
+            ..Default::default()
+        },
+        weights: nsl_codegen::WeightsOptions {
+            file: weights.map(std::path::Path::to_path_buf),
             ..Default::default()
         },
         ..nsl_codegen::CompileOptions::default()

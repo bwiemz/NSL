@@ -126,6 +126,11 @@ fn install_per_compile_program_facts(
     interner: &Interner,
     type_map: &TypeMap,
 ) -> Result<(), crate::CodegenError> {
+    // `-w`: the binding to the weights file goes to every module's compile,
+    // including the modules the entry imports, which load no weight map of
+    // their own: their constructors load the file into the models they
+    // define all the same.
+    compiler.features.weight_binding = compiler.compile_options.weights.bind.clone();
     compiler.compile_options.calibration.compile_bundle = Some(Arc::new(
         crate::calibration::CalibrationCompileBundle {
             ast: ast.clone(),
@@ -368,13 +373,40 @@ fn load_and_register_weights_if_needed(
         integrity.hash_hex
     );
 
+    if let Some(binding) = options.weights.bind.as_ref() {
+        let specializable =
+            binding.stored.keys().filter(|name| binding.writes.written(name).is_none()).count();
+        match binding.writes.all_written.as_deref() {
+            Some(reason) => nsl_log::nsl_log!(
+                INFO,
+                "nsl",
+                "[nsl] weight-aware: the model is loaded from {}; no rewrite depends on its \
+                 values: {reason}",
+                binding.path.display()
+            ),
+            None => nsl_log::nsl_log!(
+                INFO,
+                "nsl",
+                "[nsl] weight-aware: the model is loaded from {}; rewrites may depend on the \
+                 values of {specializable} of its {} tensors, which the program checks at \
+                 startup",
+                binding.path.display(),
+                binding.stored.len()
+            ),
+        }
+    }
     compiler.features.weight_integrity = Some(integrity);
     compiler.features.weight_map = Some(wmap);
     Ok(())
 }
 
-/// Run both AWQ and WGGO pre-scan discovery passes against the AST and
-/// populate `opts` fields that are still `None`.  This is the test-facing
+/// Run the WGGO pre-scan discovery pass against the AST and populate
+/// `opts.calibration.grad_retention` if it is still `None`. (An AWQ pass
+/// used to run here too, keyed on `@quantize(dtype="awq4")`: it filled
+/// `calibration.retention`, which made every build of such a model compile
+/// activation-retention copies into its forward for a calibration whose
+/// output nothing read. The decorator is refused and that pass is gone;
+/// `calibration.retention` is set only by a caller that hands it in.)  This is the test-facing
 /// seam: all compiler entry points delegate to
 /// [`populate_calibration_retention_from_ast_if_unset`] which calls this
 /// helper internally.
@@ -389,12 +421,6 @@ pub(crate) fn run_pre_scan_phase(
     interner: &Interner,
     mut opts: crate::CompileOptions,
 ) -> crate::CompileOptions {
-    if opts.calibration.retention.is_none() {
-        let discovered_awq = crate::calibration::pre_scan_awq_projections_from_ast(ast, interner);
-        if !discovered_awq.is_empty() {
-            opts.calibration.retention = Some(discovered_awq);
-        }
-    }
     if opts.calibration.grad_retention.is_none() {
         let discovered_wggo =
             crate::calibration::discovery::pre_scan_wggo_targets_from_ast(ast, interner);
@@ -574,23 +600,6 @@ fn populate_calibration_retention_from_ast_if_unset(
     compiler.compile_options.calibration.retention = updated.calibration.retention;
     compiler.compile_options.calibration.grad_retention = updated.calibration.grad_retention;
 
-    // AWQ-specific error: if an @quantize decorator is present but discovery
-    // returned nothing, that is a user error we must surface.
-    if compiler.compile_options.calibration.retention.is_none()
-        && crate::calibration::discovery::ast_has_awq_quantize_decorator(ast, interner)
-    {
-        let model_name =
-            crate::calibration::discovery::first_awq_quantized_model_name(ast, interner)
-                .unwrap_or_else(|| "<unknown>".into());
-        return Err(CodegenError::new(format!(
-            "calibration: @quantize model declared but no AWQ projections discovered.\n\
- requested:  auto-discover AWQ projections for model '{model_name}'\n\
- expected:   @quantize(dtype=\"awq4\") model -> at least one DiscoveredProjection\n\
- found:      model '{model_name}' is AWQ-quantized but discovery returned zero projections.\n\
- Action:     either remove the @quantize decorator, or add the Linear/tensor projections the decorator is meant to target."
-        )));
-    }
-
     // §5.4-§5.6: grad-mode WGGO refusals.
     enforce_grad_mode_refusals(ast, interner, &compiler.compile_options)?;
 
@@ -643,7 +652,7 @@ pub fn compile_returning_splice_count_for_tests(
     compiler.register_batched_functions(&vmap_results);
     compiler.compile_datatype_defs(&ast.stmts)?;
     compiler.compile_kernels(&ast.stmts)?;
-    crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler);
+    crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler)?;
     crate::wrga_prescan::rewrite_model_method_bodies_with_adapter_sites(&mut compiler);
     compiler.compile_flash_attention_kernels(&ast.stmts)?;
     // Swallow the result intentionally.  The splice runs BEFORE
@@ -743,12 +752,13 @@ fn compile_returning_plan_impl(
         ast, interner, &mut compiler,
     );
     crate::cpdt_decorator::report_outcome(&cpdt_decor_outcome);
-    crate::cpdt_expert_prune::run_moe_prune_pass(&mut compiler);
+    let moe_pruned = crate::cpdt_expert_prune::run_moe_prune_pass(&mut compiler);
     // CPDT §4.1 — roofline-derived capacity-factor override. Runs after the
     // prune pass (so n_live is settled in moe_configs) and before any body
     // codegen (the moe_dispatch lowering reads MoeInfo.capacity_factor).
     // Same non-WGGO blocker-sidestep posture as the prune pass.
-    crate::cpdt_moe_capacity::run_moe_capacity_pass(&mut compiler);
+    let moe_raised = crate::cpdt_moe_capacity::run_moe_capacity_pass(&mut compiler);
+    crate::cpdt_moe_capacity::record_moe_disposition(&compiler, moe_pruned + moe_raised);
     populate_calibration_retention_from_ast_if_unset(&mut compiler, ast, interner)?;
     // Task 4: declare the calibration retention arena BEFORE method-body
     // codegen.  The pipe-site splice in `try_emit_retention_splice` early-
@@ -771,7 +781,7 @@ fn compile_returning_plan_impl(
     // are compiled. Without this, the Task 3 LoRA AST rewrite never fires
     // because adapter_sites is empty at that point (train-block WRGA
     // invocation happens later, inside compile_main).
-    crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler);
+    crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler)?;
     // B.3.2 Option 3 phase 3e: re-apply the adapter rewrite to
     // `model_method_bodies` (the source-AD-walked copy) so the fused FFI
     // call is visible in the code path source-AD traverses during train
@@ -947,7 +957,7 @@ fn compile_standalone_best_effort_plan(
         compiler.register_batched_functions(&vmap_results);
         compiler.compile_datatype_defs(&ast.stmts)?;
         compiler.compile_kernels(&ast.stmts)?;
-        crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler);
+        crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler)?;
         // B.3.2 Option 3 phase 3e: re-apply rewrite to model_method_bodies
         // so source-AD's inline expansion sees the fused FFI call.
         crate::wrga_prescan::rewrite_model_method_bodies_with_adapter_sites(&mut compiler);
@@ -1231,7 +1241,7 @@ pub fn compile_module_with_imports_best_effort_plans(
         compiler.register_batched_functions(&vmap_results);
         compiler.compile_datatype_defs(&ast.stmts)?;
         compiler.compile_kernels(&ast.stmts)?;
-        crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler);
+        crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler)?;
         // B.3.2 Option 3 phase 3e: re-apply rewrite to model_method_bodies
         // so source-AD's inline expansion sees the fused FFI call.
         crate::wrga_prescan::rewrite_model_method_bodies_with_adapter_sites(&mut compiler);
@@ -1523,8 +1533,9 @@ fn compile_entry_impl(
         ast, interner, &mut compiler,
     );
     crate::cpdt_decorator::report_outcome(&cpdt_decor_outcome);
-    crate::cpdt_expert_prune::run_moe_prune_pass(&mut compiler);
-    crate::cpdt_moe_capacity::run_moe_capacity_pass(&mut compiler);
+    let moe_pruned = crate::cpdt_expert_prune::run_moe_prune_pass(&mut compiler);
+    let moe_raised = crate::cpdt_moe_capacity::run_moe_capacity_pass(&mut compiler);
+    crate::cpdt_moe_capacity::record_moe_disposition(&compiler, moe_pruned + moe_raised);
 
     populate_calibration_retention_from_ast_if_unset(&mut compiler, ast, interner)?;
     // Task 4: declare the calibration retention arena BEFORE method-body
@@ -1540,7 +1551,7 @@ fn compile_entry_impl(
     compiler.register_batched_functions(&vmap_results);
     compiler.compile_datatype_defs(&ast.stmts)?;
     compiler.compile_kernels(&ast.stmts)?;
-    crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler);
+    crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler)?;
     // B.3.2 Option 3 phase 3e: re-apply rewrite to model_method_bodies
     // so source-AD's inline expansion sees the fused FFI call.
     crate::wrga_prescan::rewrite_model_method_bodies_with_adapter_sites(&mut compiler);

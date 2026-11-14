@@ -1,5 +1,14 @@
 # Section 6 — Quantization as a Language Feature
 
+> **Status (2026-11).** This section is the design. What the compiler
+> accepts today is narrower: a `quant static <name> from <model>:` block
+> with `default: int8` or `default: int4` and `per_tensor`, `per_channel`
+> or `per_group` granularity, which builds a dequantized copy of the model.
+> The `awq`, `gptq`, `nf4`, `nf8` and `smoothquant` schemes, calibration,
+> and the `dynamic` and `aware` modes are not implemented; `default: awq4`,
+> `gptq4` and `gptq8`, a `calibration:` section and the `@quantize`
+> decorator are compile errors.
+
 ## Design Rationale
 
 Quantization in PyTorch is an afterthought — a sprawling library of incompatible APIs

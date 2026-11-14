@@ -43,10 +43,71 @@ pub const TRAIN_CONFIG_KEYS: &[&str] = &[
     "checkpoint_save",
     "checkpoint_every",
     "checkpoint_load",
+    "schedule_unit",
 ];
 
 const EXPECTED_KEYS_LABEL: &str = "expected model=, epochs=, grad_accumulation=, \
-     grad_clip=, checkpoint_save=, checkpoint_every=, or checkpoint_load=";
+     grad_clip=, checkpoint_save=, checkpoint_every=, checkpoint_load=, or schedule_unit=";
+
+/// What one step of the learning-rate schedule is, under gradient
+/// accumulation: the unit of `warmup_steps`, `total_steps`, `step_size`
+/// and `t_max` in the `scheduler:` section.
+///
+/// Without accumulation the two are the same thing. With
+/// `grad_accumulation = N` the default is optimizer steps, the unit every
+/// other framework's scheduler counts. Until 2026-11 a train block counted
+/// micro-batches, so a schedule written for that reaches its `warmup_steps`
+/// and `total_steps` N times later under the default; the checker warns
+/// when the choice was not written down ([`schedule_unit_warning`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduleUnit {
+    /// The schedule advances once per micro-batch: the rate changes inside
+    /// an accumulation window, and the update at the end of a window uses
+    /// the rate of its last micro-batch.
+    MicroBatch,
+    /// The schedule advances once per optimizer step (the default): every
+    /// micro-batch of an accumulation window runs at `schedule(window index)`.
+    OptimizerStep,
+}
+
+impl ScheduleUnit {
+    /// The unit a train header means: what it wrote, or optimizer steps.
+    pub fn resolve(written: Option<ScheduleUnit>) -> ScheduleUnit {
+        written.unwrap_or(ScheduleUnit::OptimizerStep)
+    }
+
+    /// The spelling accepted in source.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScheduleUnit::MicroBatch => "micro_batch",
+            ScheduleUnit::OptimizerStep => "optimizer_step",
+        }
+    }
+}
+
+/// The compile-time warning for a schedule combined with accumulation
+/// when `schedule_unit` was not written. `None` when there is nothing
+/// ambiguous: no accumulation, the unit given, or `has_stepped_schedule`
+/// false (no `scheduler:` section, or one that ignores the step).
+pub fn schedule_unit_warning(
+    grad_accumulation: i64,
+    schedule_unit: Option<ScheduleUnit>,
+    has_stepped_schedule: bool,
+) -> Option<String> {
+    if grad_accumulation <= 1 || schedule_unit.is_some() || !has_stepped_schedule {
+        return None;
+    }
+    Some(format!(
+        "the learning-rate schedule counts optimizer steps, not micro-batches: with \
+         grad_accumulation = {grad_accumulation}, the scheduler's step arguments \
+         (warmup_steps, total_steps, step_size, t_max) are reached after \
+         {grad_accumulation} times that many micro-batches. Toolchains before 2026-11 \
+         counted micro-batches here, so a schedule written for them now runs \
+         {grad_accumulation} times slower. Write schedule_unit = \"optimizer_step\" in \
+         the train or distill header to confirm this unit and silence the warning, or schedule_unit = \
+         \"micro_batch\" to count micro-batches as before"
+    ))
+}
 
 /// A fully validated train header. Produced once; every consumer reads
 /// these fields instead of re-scanning `TrainBlock.config`.
@@ -71,6 +132,9 @@ pub struct ResolvedTrainConfig {
     /// when `checkpoint_save` is absent — the pairing is validated).
     pub checkpoint_every: i64,
     pub checkpoint_load: Option<String>,
+    /// `Some` when `schedule_unit=` was written. `None` means the default,
+    /// optimizer steps (see [`ScheduleUnit::resolve`]).
+    pub schedule_unit: Option<ScheduleUnit>,
 }
 
 /// Who is asking. Distill lowering synthesizes a `TrainBlock` whose model
@@ -140,6 +204,7 @@ pub fn resolve_train_config(
     let mut checkpoint_save: Option<String> = None;
     let mut checkpoint_every: i64 = 0;
     let mut checkpoint_load: Option<String> = None;
+    let mut schedule_unit: Option<ScheduleUnit> = None;
 
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Spans for the pairing diagnostics below, so the label lands on the
@@ -277,6 +342,22 @@ pub fn resolve_train_config(
                     .with_label(arg.span, "expected a string literal path"),
                 ),
             },
+            "schedule_unit" => match &arg.value.kind {
+                ExprKind::StringLiteral(s) if s == "micro_batch" => {
+                    schedule_unit = Some(ScheduleUnit::MicroBatch);
+                }
+                ExprKind::StringLiteral(s) if s == "optimizer_step" => {
+                    schedule_unit = Some(ScheduleUnit::OptimizerStep);
+                }
+                _ => diags.push(
+                    Diagnostic::error(
+                        "train 'schedule_unit' must be \"micro_batch\" or \
+                         \"optimizer_step\" (a string literal): what one step of \
+                         the scheduler: section counts under grad_accumulation",
+                    )
+                    .with_label(arg.span, "expected \"micro_batch\" or \"optimizer_step\""),
+                ),
+            },
             other => diags.push(
                 Diagnostic::error(format!("unknown train config key '{other}'"))
                     .with_label(arg.span, EXPECTED_KEYS_LABEL),
@@ -332,6 +413,7 @@ pub fn resolve_train_config(
             checkpoint_save,
             checkpoint_every,
             checkpoint_load,
+            schedule_unit,
         })
     } else {
         Err(diags)
@@ -341,6 +423,32 @@ pub fn resolve_train_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_default_unit_is_optimizer_steps() {
+        assert_eq!(ScheduleUnit::resolve(None), ScheduleUnit::OptimizerStep);
+        assert_eq!(
+            ScheduleUnit::resolve(Some(ScheduleUnit::MicroBatch)),
+            ScheduleUnit::MicroBatch
+        );
+    }
+
+    #[test]
+    fn the_schedule_unit_warning_fires_only_when_the_unit_is_ambiguous() {
+        // Accumulation, a stepped schedule, no unit written: ambiguous.
+        let w = schedule_unit_warning(4, None, true).expect("a warning");
+        assert!(w.contains("grad_accumulation = 4"), "{w}");
+        assert!(w.contains("counts optimizer steps, not micro-batches"), "{w}");
+        assert!(w.contains("schedule_unit = \"optimizer_step\""), "{w}");
+        assert!(w.contains("schedule_unit = \"micro_batch\""), "{w}");
+        // No accumulation: the two units are the same.
+        assert_eq!(schedule_unit_warning(1, None, true), None);
+        // The unit was written, either way.
+        assert_eq!(schedule_unit_warning(4, Some(ScheduleUnit::MicroBatch), true), None);
+        assert_eq!(schedule_unit_warning(4, Some(ScheduleUnit::OptimizerStep), true), None);
+        // No schedule that reads the step.
+        assert_eq!(schedule_unit_warning(4, None, false), None);
+    }
 
     /// TRAIN_CONFIG_KEYS ↔ EXPECTED_KEYS_LABEL drift guard. (The third copy
     /// — the resolver's match arms — is pinned by the checker-level

@@ -1,4 +1,31 @@
-//! M35: AWQ (Activation-Aware Weight Quantization) 4-bit runtime.
+//! M35: a 4-bit packed weight format, quantized by per-group round-to-nearest.
+//!
+//! The module, its types and its FFI symbols carry the name AWQ
+//! (Activation-Aware Weight Quantization, Lin et al.), and this is not that
+//! method. AWQ searches a per-input-channel scale from activation statistics
+//! and a clipping range, applies the scale to the weight and its inverse to
+//! the preceding operation, and then rounds. What is here is the last step
+//! only:
+//!
+//! - [`awq_quantize_cpu`] / `nsl_awq_quantize`: each group of `group_size`
+//!   inputs of each output gets an asymmetric scale and zero from its own
+//!   minimum and maximum, and each weight is rounded to 4 bits. No
+//!   activation statistic enters.
+//! - [`AwqPackedWeight`]: the packed result (two codes per byte), also the
+//!   output format of `gptq.rs`.
+//! - [`awq_matmul_cpu`] / `nsl_awq_matmul`: `x @ W` decoding W on the fly.
+//!
+//! Nothing in the compiler emits a call to these: a `quant` block with
+//! `default: awq4` is refused by the checker.
+//!
+//! The second half of the file is unrelated to quantizing: it reads and
+//! writes the calibration sidecar for the compiler's calibration harness.
+//! The writer can store per-channel activation maxima for a set of
+//! projections under `hooks.awq_activation_scales`. The compiler hook that
+//! asked for them (for `@quantize(dtype="awq4")` models) is deleted and the
+//! decorator refused, so only tests hand the writer such entries, and
+//! nothing reads them back: `awq_scales_from_sidecar_json_path` has no
+//! caller.
 
 use std::sync::atomic::AtomicI64;
 use std::ffi::c_void;
@@ -229,25 +256,39 @@ pub fn awq_matmul_cpu(input: &[f64], packed: &AwqPackedWeight, m: usize) -> Vec<
 // FFI
 // ---------------------------------------------------------------------------
 
-/// Quantize weight tensor to AWQ4 packed format.
+/// Quantize a `[K, N]` weight tensor to the packed 4-bit format by per-group
+/// round-to-nearest (see the module comment: no calibration is involved).
+///
+/// The third argument was a calibration pointer that was accepted and never
+/// read. It must now be 0: a caller that passes calibration data is told it
+/// is not used instead of receiving an uncalibrated result in silence.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_awq_quantize(
     weight_ptr: i64,
     group_size: i64,
-    _calibration_ptr: i64,
+    calibration_ptr: i64,
 ) -> i64 {
     if weight_ptr == 0 { crate::nsl_log!(WARN, "awq", "nsl_awq_quantize: null weight tensor"); return 0; }
+    if calibration_ptr != 0 {
+        crate::fatal::die(
+            crate::fatal::Fatal::Unsupported,
+            "nsl_awq_quantize: calibration data was passed, and this quantizer does not use any \
+             (it rounds each group to its own minimum and maximum); pass 0",
+        );
+    }
     let t = NslTensor::from_ptr_ref(weight_ptr);
-    assert!(t.ndim >= 2, "nsl_awq_quantize requires 2D weight tensor (got {}D)", t.ndim);
-    let len = t.len as usize;
-
-    let data: Vec<f64> = if t.dtype == 1 {
-        let raw = unsafe { std::slice::from_raw_parts(t.data as *const f32, len) };
-        raw.iter().map(|&v| v as f64).collect()
-    } else {
-        let raw = unsafe { std::slice::from_raw_parts(t.data as *const f64, len) };
-        raw.to_vec()
-    };
+    if t.ndim != 2 || group_size <= 0 {
+        crate::fatal::die(
+            crate::fatal::Fatal::ShapeMismatch,
+            &format!(
+                "nsl_awq_quantize: needs a 2-D [K, N] weight and a positive group size (got {}-D, group size {group_size})",
+                t.ndim
+            ),
+        );
+    }
+    // Logical order, on the host: a transposed weight or a device tensor
+    // used to be read as raw storage (see `logical_values_f64`).
+    let data: Vec<f64> = crate::quantize::logical_values_f64(weight_ptr);
 
     let k = unsafe { *t.shape } as usize;
     let n = unsafe { *t.shape.add(1) } as usize;
@@ -256,7 +297,8 @@ pub extern "C" fn nsl_awq_quantize(
     Box::into_raw(Box::new(packed)) as i64
 }
 
-/// AWQ dequantize-in-GEMM matmul.
+/// `input[M, K] @ packed[K, N]`, decoding the packed weight on the fly.
+/// Returns an f32 host tensor `[M, N]`.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_awq_matmul(
     input_ptr: i64,
@@ -267,16 +309,20 @@ pub extern "C" fn nsl_awq_matmul(
     let input_t = NslTensor::from_ptr_ref(input_ptr);
     let packed = unsafe { &*(packed_ptr as *const AwqPackedWeight) };
 
+    // The packed weight is [K, N] with K the input features: the input is
+    // [M, K]. Anything else indexed past the input buffer.
+    let k = packed.k;
+    if input_t.ndim != 2 || unsafe { *input_t.shape.add(1) } != k {
+        crate::fatal::die(
+            crate::fatal::Fatal::ShapeMismatch,
+            &format!(
+                "nsl_awq_matmul: the input must be [M, {k}] for a packed [{k}, {}] weight (got a {}-D tensor)",
+                packed.n, input_t.ndim
+            ),
+        );
+    }
     let m = unsafe { *input_t.shape } as usize;
-    let len = input_t.len as usize;
-
-    let input: Vec<f64> = if input_t.dtype == 1 {
-        let raw = unsafe { std::slice::from_raw_parts(input_t.data as *const f32, len) };
-        raw.iter().map(|&v| v as f64).collect()
-    } else {
-        let raw = unsafe { std::slice::from_raw_parts(input_t.data as *const f64, len) };
-        raw.to_vec()
-    };
+    let input: Vec<f64> = crate::quantize::logical_values_f64(input_ptr);
 
     let result = awq_matmul_cpu(&input, packed, m);
 
@@ -307,106 +353,6 @@ pub extern "C" fn nsl_awq_matmul(
         0,
     ));
     Box::into_raw(tensor) as i64
-}
-
-/// Apply AWQ calibration per-channel scaling to a weight tensor.
-///
-/// Used by the final-compile AWQ lowering pass when a calibration sidecar is
-/// present.  Multiplies each input-channel column of the weight matrix by
-/// `scale[col]^alpha`.  Returns a new NslTensor (f32, CPU, [k, n]) with the
-/// scaled values; the caller is responsible for freeing it.
-///
-/// Parameters:
-///   * `weight_ptr`  — pointer to an NslTensor of shape `[k, n]` (f32 or f64)
-///   * `scales_ptr`  — pointer to a C array of `scales_len` f32 scale values;
-///                     must have length == `n` (number of input channels)
-///   * `scales_len`  — number of elements in the scales array (must equal `n`)
-///   * `alpha`       — exponent applied to each scale (typically 0.5)
-///
-/// Returns 0 on error (null weight, shape mismatch).
-#[unsafe(no_mangle)]
-pub extern "C" fn nsl_awq_pre_scale_weight(
-    weight_ptr: i64,
-    scales_ptr: i64,
-    scales_len: i64,
-    alpha: f64,
-) -> i64 {
-    if weight_ptr == 0 {
-        crate::nsl_log!(WARN, "awq", "nsl_awq_pre_scale_weight: null weight tensor");
-        return 0;
-    }
-    let t = NslTensor::from_ptr_ref(weight_ptr);
-    if t.ndim < 2 {
-        crate::nsl_log!(WARN, "awq", "nsl_awq_pre_scale_weight: weight must be 2D (got {}D)", t.ndim);
-        return 0;
-    }
-
-    let k = unsafe { *t.shape } as usize;
-    let n = unsafe { *t.shape.add(1) } as usize;
-    let len = t.len as usize;
-
-    if scales_ptr == 0 || scales_len as usize != n {
-        // No scaling — clone the weight as-is.
-        let data: Vec<f32> = if t.dtype == 1 {
-            let raw = unsafe { std::slice::from_raw_parts(t.data as *const f32, len) };
-            raw.to_vec()
-        } else {
-            let raw = unsafe { std::slice::from_raw_parts(t.data as *const f64, len) };
-            raw.iter().map(|&v| v as f32).collect()
-        };
-        let shape_arr = [k as i64, n as i64];
-        return make_f32_tensor(&data, &shape_arr);
-    }
-
-    let scales_raw =
-        unsafe { std::slice::from_raw_parts(scales_ptr as *const f32, scales_len as usize) };
-
-    let data: Vec<f32> = if t.dtype == 1 {
-        let raw = unsafe { std::slice::from_raw_parts(t.data as *const f32, len) };
-        raw.to_vec()
-    } else {
-        let raw = unsafe { std::slice::from_raw_parts(t.data as *const f64, len) };
-        raw.iter().map(|&v| v as f32).collect()
-    };
-
-    let alpha_f32 = alpha as f32;
-    let mut scaled = Vec::with_capacity(len);
-    for row in 0..k {
-        for col in 0..n {
-            let s = scales_raw[col].powf(alpha_f32);
-            scaled.push(data[row * n + col] * s);
-        }
-    }
-
-    let shape_arr = [k as i64, n as i64];
-    make_f32_tensor(&scaled, &shape_arr)
-}
-
-/// Helper: allocate a new f32 NslTensor from `data` with the given `shape`.
-fn make_f32_tensor(data: &[f32], shape: &[i64]) -> i64 {
-    let ndim = shape.len() as i64;
-    let total = data.len();
-    let shape_ptr =
-        crate::memory::checked_alloc(std::mem::size_of_val(shape)) as *mut i64;
-    for (i, &s) in shape.iter().enumerate() {
-        unsafe { *shape_ptr.add(i) = s };
-    }
-    let strides = NslTensor::compute_strides(shape_ptr, ndim);
-    let data_size = std::mem::size_of_val(data);
-    let data_ptr = crate::memory::checked_alloc(data_size) as *mut f32;
-    unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), data_ptr, total) };
-    let t = Box::new(NslTensor::new(
-        data_ptr as *mut std::ffi::c_void,
-        shape_ptr,
-        strides,
-        ndim,
-        total as i64,
-        0,  // device: CPU
-        1,  // dtype: f32
-        1,  // owns_data
-        0,  // data_owner
-    ));
-    Box::into_raw(t) as i64
 }
 
 /// Free an AWQ packed weight.
@@ -653,116 +599,8 @@ mod awq_sidecar_reader_tests {
     }
 }
 
-/// Lightweight output suitable for round-trip tests without requiring
-/// a full `AwqPackedWeight` comparison.  The real packed-weight path
-/// can layer on top of this helper once the wider AWQ codegen plumbing
-/// is in place (Task 13).
-#[derive(Debug, Clone, PartialEq)]
-pub struct AwqQuantizedChecked {
-    pub dequantized_check_bytes: Vec<u8>,
-}
-
-/// Quantize a weight matrix using optional calibrated per-input-channel
-/// scales.  When `scales` is `None`, uses a vector of 1.0s (equivalent
-/// to uncalibrated AWQ).  Otherwise applies `s[c]^alpha` per input
-/// channel to protect salient channels during quantization.
-///
-/// `weight` is `[out_channels, in_channels]` in row-major layout.
-/// `scales`, when provided, has length `in_channels`.
-///
-/// This helper is the entry point for calibration-driven AWQ scaling.
-/// It replaces the `_calibration_ptr` placeholder in the existing AWQ
-/// runtime — callers that have calibration data supply it; callers
-/// that don't pass `None` and get the uncalibrated baseline.
-pub fn awq_quantize_with_scales(
-    weight: &[f32],
-    in_channels: usize,
-    out_channels: usize,
-    scales: Option<&[f32]>,
-    alpha: f32,
-) -> AwqQuantizedChecked {
-    assert_eq!(weight.len(), in_channels * out_channels, "weight length mismatch");
-    let effective: Vec<f32> = match scales {
-        Some(s) => {
-            assert_eq!(s.len(), in_channels, "scales length must equal in_channels");
-            s.iter().map(|v| v.powf(alpha)).collect()
-        }
-        None => vec![1.0; in_channels],
-    };
-    // Apply per-input-channel scaling to the weight matrix.
-    let mut scaled = Vec::with_capacity(weight.len());
-    for row in 0..out_channels {
-        for col in 0..in_channels {
-            let v = weight[row * in_channels + col] * effective[col];
-            scaled.push(v);
-        }
-    }
-    // Minimal quantization: absmax per row, scale to int8 range.
-    // Real AWQ would do groupwise; this is enough to expose scale
-    // differences in tests and serves as the integration surface for
-    // Task 13's quant-pass wiring.
-    let mut out_bytes = Vec::with_capacity(weight.len());
-    for row in 0..out_channels {
-        let start = row * in_channels;
-        let amax = scaled[start..start + in_channels]
-            .iter()
-            .map(|v| v.abs())
-            .fold(0.0_f32, f32::max)
-            .max(1e-9);
-        for i in 0..in_channels {
-            let q = ((scaled[start + i] / amax) * 127.0).round().clamp(-128.0, 127.0);
-            out_bytes.push(q as i8 as u8);
-        }
-    }
-    AwqQuantizedChecked {
-        dequantized_check_bytes: out_bytes,
-    }
-}
-
-#[cfg(test)]
-mod awq_quantize_with_scales_tests {
-    use super::*;
-
-    fn toy_weight(out_channels: usize, in_channels: usize) -> Vec<f32> {
-        (0..out_channels * in_channels)
-            .map(|i| (i as f32 - (out_channels * in_channels) as f32 / 2.0) * 0.01)
-            .collect()
-    }
-
-    #[test]
-    fn quantize_with_none_scales_matches_all_ones_baseline() {
-        let weight = toy_weight(8, 16);
-        let out_none = awq_quantize_with_scales(&weight, 16, 8, None, 0.5);
-        let ones = vec![1.0_f32; 16];
-        let out_ones = awq_quantize_with_scales(&weight, 16, 8, Some(&ones), 0.5);
-        assert_eq!(out_none.dequantized_check_bytes, out_ones.dequantized_check_bytes,
-            "None scales must equal [1.0; in_channels] scales after s^alpha (1^x = 1)");
-    }
-
-    #[test]
-    fn quantize_with_nontrivial_scales_differs_from_baseline() {
-        let weight = toy_weight(8, 16);
-        let ones = vec![1.0_f32; 16];
-        let varied: Vec<f32> = (0..16).map(|i| 0.5 + i as f32 * 0.2).collect();
-        let out_ones = awq_quantize_with_scales(&weight, 16, 8, Some(&ones), 0.5);
-        let out_varied = awq_quantize_with_scales(&weight, 16, 8, Some(&varied), 0.5);
-        assert_ne!(out_ones.dequantized_check_bytes, out_varied.dequantized_check_bytes,
-            "Non-trivial scales must change quantization output");
-    }
-
-    #[test]
-    fn quantize_rejects_wrong_length_scales() {
-        let weight = toy_weight(8, 16);
-        let bad = vec![1.0_f32; 99]; // wrong length
-        let result = std::panic::catch_unwind(|| {
-            awq_quantize_with_scales(&weight, 16, 8, Some(&bad), 0.5)
-        });
-        assert!(result.is_err(), "mismatched scales length must panic");
-    }
-}
-
 // ---------------------------------------------------------------------------
-// nsl_awq_write_sidecar — subprocess-side serialization FFI
+// nsl_calib_write_sidecar — subprocess-side serialization FFI
 // ---------------------------------------------------------------------------
 
 #[repr(C)]
@@ -980,28 +818,6 @@ pub extern "C" fn nsl_calib_write_sidecar(
     }
 }
 
-/// Deprecated thin shim retained for the rename transition. Forwards to
-/// `nsl_calib_write_sidecar` with empty WGGO arrays. Scheduled for
-/// deletion in milestone N+1; deletion gated by workspace-wide grep
-/// confirming no callers remain.
-#[unsafe(no_mangle)]
-#[deprecated(note = "use nsl_calib_write_sidecar")]
-pub extern "C" fn nsl_awq_write_sidecar(
-    sidecar_path_ptr: *const u8,
-    sidecar_path_len: usize,
-    projections_ptr: *const AwqProjectionDescriptor,
-    projections_len: usize,
-) -> i32 {
-    nsl_calib_write_sidecar(
-        sidecar_path_ptr,
-        sidecar_path_len,
-        projections_ptr,
-        projections_len,
-        std::ptr::null(),
-        0,
-    )
-}
-
 // ---------------------------------------------------------------------------
 // Atomic file write — write-temp-then-rename + fsync.
 // Spec §6.4 of WGGO Phase 2 merge-gate completion design.
@@ -1035,7 +851,6 @@ mod write_sidecar_tests {
     use tempfile::NamedTempFile;
 
     #[test]
-    #[allow(deprecated)] // Exercises the shim during rename transition.
     fn writes_sidecar_with_two_projections() {
         let tmp = NamedTempFile::new().unwrap();
         let path_str = tmp.path().to_string_lossy().to_string();
@@ -1062,9 +877,10 @@ mod write_sidecar_tests {
             },
         ];
 
-        let rc = nsl_awq_write_sidecar(
+        let rc = nsl_calib_write_sidecar(
             path_str.as_ptr(), path_str.len(),
             descs.as_ptr(), descs.len(),
+            std::ptr::null(), 0,
         );
         assert_eq!(rc, 0);
 
@@ -1074,11 +890,11 @@ mod write_sidecar_tests {
     }
 
     #[test]
-    #[allow(deprecated)] // Exercises the shim during rename transition.
     fn returns_1_on_invalid_utf8_path() {
         let bad: [u8; 4] = [0xff, 0xfe, 0xfd, 0xfc];
-        let rc = nsl_awq_write_sidecar(
+        let rc = nsl_calib_write_sidecar(
             bad.as_ptr(), bad.len(),
+            std::ptr::null(), 0,
             std::ptr::null(), 0,
         );
         assert_eq!(rc, 1);

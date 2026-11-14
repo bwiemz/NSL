@@ -69,6 +69,7 @@ fn build_cluster(cfg: &CpdtConfig, base: &Option<ClusterSpec>) -> Option<Cluster
         intra_bw_bps: cfg.cluster.intra_bw_bps.unwrap_or(defaults.intra_bw_bps),
         inter_bw_bps: cfg.cluster.inter_bw_bps.unwrap_or(defaults.inter_bw_bps),
         gpus_per_node: cfg.cluster.gpus_per_node.map(|n| n as u32).unwrap_or(defaults.gpus_per_node),
+        collective_latency_us: defaults.collective_latency_us,
     })
 }
 
@@ -185,6 +186,7 @@ mod tests {
             intra_bw_bps: 1e10,
             inter_bw_bps: 2e10,
             gpus_per_node: 4,
+            collective_latency_us: 0.0,
         });
         let result = build_cluster(&cfg, &base).expect("inherits base");
         assert_eq!(result.num_gpus, 4);
@@ -222,6 +224,7 @@ mod tests {
             intra_bw_bps: 1e10,
             inter_bw_bps: 2e10,
             gpus_per_node: 4,
+            collective_latency_us: 0.0,
         });
         let result = build_cluster(&cfg, &base).expect("override");
         assert_eq!(result.num_gpus, 16); // decorator-overridden

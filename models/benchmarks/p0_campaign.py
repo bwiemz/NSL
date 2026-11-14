@@ -469,18 +469,13 @@ def cmd_bench(steps: int) -> None:
             [*base, "--stream-arena", "--stream-prefetch", "--stream-async-writeback"],
         ),
         (
-            "E_ckpt_stride_auto",
-            [
-                *base, "--stream-arena", "--stream-prefetch",
-                "--stream-async-writeback", "--checkpoint-stride", "auto",
-            ],
-        ),
-        (
-            # NOTE: `auto` falls back to stride 1 at 1B (symbolic shapes —
-            # nothing to price), and explicit stride >= 2 REFUSES under
+            # NOTE: there is no stride arm. `--checkpoint-stride auto` is
+            # refused at 1B (the RoPE tables computed inside the blocks have
+            # no static size, so a stride's activation peak cannot be
+            # projected), and explicit stride >= 2 REFUSES under
             # --layerwise-accum (SDPA side-bands cannot cross replay
-            # ranges), so the stride lever is measured as documented-inert
-            # on this stack; E == D functionally.
+            # ranges). An earlier arm E passed `auto`, which resolved to
+            # stride 1 without saying so and was functionally arm D.
             "F_fused_rmsnorm_all",
             [
                 *base, "--stream-arena", "--stream-prefetch",

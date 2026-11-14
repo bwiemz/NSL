@@ -55,15 +55,6 @@ impl<'a> TypeResolver<'a> {
                 shape: self.resolve_shape(shape),
                 dtype: self.resolve_dtype(*dtype),
             },
-            TypeExprKind::Sparse {
-                shape,
-                dtype,
-                format,
-            } => Type::Sparse {
-                shape: self.resolve_shape(shape),
-                dtype: self.resolve_dtype(*dtype),
-                format: self.resolve_sparse_format(*format),
-            },
             TypeExprKind::Function { params, ret, effect } => {
                 let resolved_effect = if let Some(eff_expr) = effect {
                     self.resolve_effect_expr(eff_expr, scope)
@@ -149,6 +140,13 @@ impl<'a> TypeResolver<'a> {
                 // Look up in scope for user-defined types
                 if let Some((_sid, info)) = self.scopes.lookup(scope, sym) {
                     info.ty.clone()
+                } else if name == "Sparse" {
+                    // A bare `Sparse` (no `<...>`): the parser refuses the
+                    // spelled-out form; this is the same refusal.
+                    self.diagnostics.push(
+                        Diagnostic::error(nsl_ast::types::SPARSE_TYPE_REMOVED).with_label(span, "removed type"),
+                    );
+                    Type::Error
                 } else {
                     self.diagnostics.push(
                         Diagnostic::error(format!("undefined type `{name}`"))
@@ -442,17 +440,6 @@ impl<'a> TypeResolver<'a> {
             Some(*n as u32)
         } else {
             None
-        }
-    }
-
-    fn resolve_sparse_format(&self, sym: Symbol) -> SparseFormat {
-        let name = self.interner.resolve(sym.0).unwrap_or("");
-        match name {
-            "coo" => SparseFormat::Coo,
-            "csr" => SparseFormat::Csr,
-            "csc" => SparseFormat::Csc,
-            "bsr" => SparseFormat::Bsr,
-            _ => SparseFormat::Unknown,
         }
     }
 

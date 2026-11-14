@@ -326,14 +326,6 @@ impl Printer<'_> {
             TypeExprKind::Buffer { shape, dtype } => {
                 node("Buffer", &[self.dims(shape), self.sym(*dtype)])
             }
-            TypeExprKind::Sparse {
-                shape,
-                dtype,
-                format,
-            } => node(
-                "Sparse",
-                &[self.dims(shape), self.sym(*dtype), self.sym(*format)],
-            ),
             TypeExprKind::Function {
                 params,
                 ret,

@@ -362,20 +362,48 @@ fn pretrain_prod_agrees_with_config_and_the_corpus_arithmetic() {
         }
 
         // ── the scheduler length is DERIVED, not asserted ──────────────────
-        // total_steps = epochs * floor(train_tokens / (seq_len * batch_size)),
-        // in micro-batches (the scheduler counts micro-batches).
+        // micro-batches = epochs * floor(train_tokens / (seq_len * batch_size)),
+        // and total_steps = ceil(micro-batches / grad_accumulation): the
+        // scheduler counts optimizer steps, and a run that ends inside an
+        // accumulation window steps once more on what the window holds.
         let train_tokens = config_const(&config, pair.train_tokens_const, dir);
         let seq_len = config_const(&config, "MAX_SEQ_LEN", dir);
         let epochs = config_const(&config, "PRETRAIN_EPOCHS", dir);
         let batch = config_const(&config, "PRETRAIN_BATCH_SIZE", dir);
-        let derived = epochs * (train_tokens / (seq_len * batch)).floor();
+        let accum = config_const(&config, "PRETRAIN_GRAD_ACCUMULATION", dir);
+        let micro_batches = epochs * (train_tokens / (seq_len * batch)).floor();
+        let derived = (micro_batches / accum).ceil();
         let total = config_const(&config, "PRETRAIN_TOTAL_STEPS", dir);
         assert!(
             (derived - total).abs() < 1e-9,
-            "{dir}: PRETRAIN_TOTAL_STEPS={total} but epochs*floor({}/(seq*batch))\
-             ={derived} — the scheduler no longer matches the corpus it \
-             schedules over",
+            "{dir}: PRETRAIN_TOTAL_STEPS={total} but ceil({micro_batches} micro-batches \
+             of {} / accumulation {accum}) = {derived} — the scheduler no longer \
+             matches the corpus it schedules over",
             pair.train_tokens_const
+        );
+
+        // The numbers are optimizer steps, so the train header must say so.
+        // The toolchain under test counts optimizer steps by default, but
+        // 500M and 1B are pinned to 0.10-lts, whose default is
+        // micro-batches: a recipe that left the key out would run a
+        // schedule `grad_accumulation` times too short there, with only a
+        // warning. (0.10-lts also drops a trailing partial window where
+        // this toolchain steps on it; the schedule length is the same.)
+        let headers: Vec<&str> = prod
+            .lines()
+            .filter(|l| l.starts_with("train("))
+            .collect();
+        assert_eq!(
+            headers.len(),
+            1,
+            "{dir}: expected exactly one train(...) header, found {headers:?}"
+        );
+        assert!(
+            headers[0].contains("schedule_unit=\"optimizer_step\"")
+                || headers[0].contains("schedule_unit = \"optimizer_step\""),
+            "{dir}: the schedule is derived in optimizer steps, so the train header \
+             must say schedule_unit=\"optimizer_step\": {}",
+            headers[0]
         );
 
         // Warmup must fit inside the schedule with room to decay.

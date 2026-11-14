@@ -23,7 +23,7 @@
 //! - [`analysis`] — cost model, autotuning, fusion, memory planning,
 //!   FlashAttention codegen, calibration.
 //! - [`experimental`] — research subsystems (CEP, CFIE, CSHA, WGGO, WRGA,
-//!   FASE, sparse, speculative, multimodal). These APIs
+//!   FASE, speculative, multimodal). These APIs
 //!   are **not stable** and may change or be removed between releases.
 //!
 //! These facades re-export the same modules that remain available at the crate
@@ -145,8 +145,8 @@ pub mod pca_segment;
 pub mod pca_tier_b;
 pub mod pca_tile_config;
 pub mod pca_tilerange;
-pub mod pca_tileskip;
 pub mod weight_aware;
+mod weight_bind;
 
 // --- Distributed & parallelism -------------------------------------------
 pub mod context_parallel;
@@ -208,25 +208,22 @@ pub mod cep_rewrite;
 pub mod cep_search;
 pub mod cep_emit_source;
 pub mod cep_slice;
+pub mod cep_weights;
 pub mod cfie;
-pub mod cfie_cost;
 pub mod cfie_decode_attention;
 pub mod cfie_fused_sample;
 pub mod cfie_grammar;
 pub mod cfie_grammar_ptx;
 pub mod cfie_kv_plan;
 pub mod cfie_kv_quant;
-pub mod cfie_kv_quant_ptx;
 pub mod cfie_persistent;
 pub mod cfie_persistent_ptx;
 pub mod cfie_sample_ptx;
 pub mod cfie_serve;
 pub mod cfie_spec_sampler_ptx;
 pub mod cfie_speculative;
-pub mod cfie_speculative_ptx;
 pub mod cpkd;
 pub mod cpkd_fused_loss;
-pub mod cpkd_spectral;
 pub mod cpkd_student;
 pub mod csha;
 pub mod csha_apply;
@@ -235,12 +232,9 @@ pub mod csha_patterns;
 pub mod csha_pipeline;
 pub mod csha_specialize;
 pub mod fase;
-pub mod fase_clip;
 pub mod fase_codegen_table;
-pub mod fase_memory;
 pub mod fase_optimizer;
 pub mod multimodal;
-pub mod sparse;
 pub mod speculative;
 pub mod wggo;
 pub mod wggo_apply;
@@ -256,6 +250,7 @@ pub mod layerwise;
 pub mod parameter_plan;
 pub mod transient_arena;
 pub mod wggo_ilp;
+pub mod wggo_model_shape;
 pub mod wggo_overrides;
 pub mod wggo_prepass;
 pub mod wggo_prune;
@@ -316,7 +311,7 @@ pub mod training {
 pub mod quantization {
     pub use crate::{
         bitnet, fp8, pca_activation, pca_detect, pca_per_doc, pca_rope, pca_segment, pca_tier_b,
-        pca_tile_config, pca_tilerange, pca_tileskip, weight_aware,
+        pca_tile_config, pca_tilerange, weight_aware,
     };
 }
 
@@ -343,11 +338,11 @@ pub mod analysis {
 pub mod experimental {
     pub use crate::{
         cep, cep_extract, cep_importance, cep_oracle, cep_rewrite, cep_search,
-        cep_emit_source, cep_slice, cfie, cfie_fused_sample, cfie_grammar, cfie_kv_plan,
+        cep_emit_source, cep_slice, cep_weights, cfie, cfie_fused_sample, cfie_grammar, cfie_kv_plan,
         cfie_kv_quant, cfie_persistent, cfie_speculative, csha, csha_apply,
         csha_boundary, csha_patterns, csha_pipeline, csha_specialize, fase,
-        fase_clip, fase_codegen_table, fase_memory, fase_optimizer, multimodal,
-        sparse, speculative, wggo, wggo_apply,
+        fase_codegen_table, fase_optimizer, multimodal,
+        speculative, wggo, wggo_apply,
         wggo_conflicts, wggo_cost, wggo_dp, wggo_gradient_scorer, wggo_graph,
         wggo_ilp, wggo_overrides, wggo_prune, wggo_schedule, wggo_weight_analysis,
         wggo_weight_analysis_cache, wggo_weight_analysis_nslweights, wrga,
@@ -651,6 +646,12 @@ pub struct WrgaInputs {
     pub freeze: Vec<FreezeDecoratorConfig>,
     /// Validated `@adapter(...)` configs.
     pub adapter: Vec<AdapterDecoratorConfig>,
+    /// Whether `adapter` holds the decorators of the module that imports this
+    /// one, handed down so that this module builds the adapters of the models
+    /// it defines (a model's constructor and methods are compiled with the
+    /// module that defines it). Such a compile resolves only the targets that
+    /// name its own models; the importing module checks them all.
+    pub adapters_inherited: bool,
     /// Paper §9.3 ablation harness — per-Innovation skip flags forwarded to
     /// `wrga::run`. Default `WrgaAblation::default()` (= all false = no
     /// ablation, standard WRGA). Set via `nsl check --wrga-ablate=<name>`.
@@ -983,6 +984,13 @@ pub struct CpdtOptions {
     /// Consumed by
     /// [`crate::cpdt_moe_capacity::apply_roofline_capacity_override`].
     pub moe_roofline_slack: f64,
+    /// `--cpdt-prune-experts`: let the MoE dead-expert pass slice out
+    /// experts whose router column norm is below its threshold. Off by
+    /// default, in which case the pass only reports them: the norm of a
+    /// router column does not show how often the expert is selected (a
+    /// zero column gives logit 0, which wins whenever the other logits are
+    /// negative), so slicing on it can change the model's output.
+    pub prune_experts: bool,
     /// Shared output slot the CLI reads after compile returns.
     /// `Compiler::invoke_cpdt_if_enabled` stashes the plan here so callers
     /// can render it without extending every entry-point return type.
@@ -997,6 +1005,7 @@ impl Default for CpdtOptions {
             cluster: None,
             report_requested: false,
             moe_roofline_slack: 0.0,
+            prune_experts: false,
             plan_out: None,
         }
     }
@@ -1392,21 +1401,27 @@ pub struct CheckpointOptions {
     /// block are freed after the forward and recomputed just before that
     /// block's adjoint runs — activation residency drops from
     /// O(layers x interiors) to O(layers x boundaries + one block).
-    /// Bit-exact (same kernels, same order, same inputs); Dropout results
-    /// and CSHA-claimed chains are force-saved. No-ops with a loud stderr
-    /// note when the tape has no `blocks.N` structure.
+    /// Bit-exact (same kernels, same order, same inputs); Dropout results,
+    /// random draws and CSHA-claimed chains are force-saved.
     pub blocks: bool,
     /// CCR P1.b: with `blocks`, use the SELECTIVE policy —
     /// matmul-class outputs stay saved, only cheap bandwidth-bound ops
     /// (norms, RoPE, elementwise, softmax, reshapes) are replayed. Less
     /// memory reduction than the block policy at near-zero recompute cost.
     pub selective: bool,
-    /// CCR P1.c (`--checkpoint-budget-mib`): allowed SAVED-interior bytes.
-    /// The per-tensor SAVE/RECOMPUTE knapsack (ccr::apply_budget) flips the
-    /// highest-value tensors back to SAVE within this budget, minimizing
-    /// recompute cost. Under FASE Deferred the C-01 credit (the gradient
-    /// buffer Deferred never materializes) is added when parameter sizes
-    /// are statically known. None = pure policy decision, no arbitration.
+    /// CCR P1.c (`--checkpoint-budget-mib`). Its meaning depends on
+    /// `stride`, and it is used once:
+    ///
+    ///   - at a fixed stride it is the allowed SAVED-interior bytes: the
+    ///     per-tensor SAVE/RECOMPUTE knapsack (`ccr::apply_budget`) flips
+    ///     the tensors that cost most to recompute back to SAVE within it;
+    ///   - under `Auto` and `Dp` it is the cap on the projected
+    ///     block-activation peak the search honours, and the knapsack does
+    ///     not run.
+    ///
+    /// It is the number given, in MiB; nothing is added to it. Both uses
+    /// need static tensor sizes and the build fails without them.
+    /// None = pure policy decision, no arbitration.
     pub budget_mib: Option<u64>,
     /// Item 8 (`--checkpoint-stride N|auto`): periodic checkpointing. With
     /// `Fixed(k)`, CCR coalesces every `k` transformer-block anchors into one
@@ -1414,22 +1429,24 @@ pub struct CheckpointOptions {
     /// the k-block span. Trades recompute for a k× smaller saved-boundary
     /// surface (the activation surface CSLA buffers across the accumulation
     /// window). `Auto` searches strides with `ccr::project_activation_peak`
-    /// and picks the smallest projected peak within `budget_mib`
-    /// (or the min-peak stride if none fits). `Fixed(1)` = classic per-block.
+    /// and picks the smallest stride whose projected peak is within
+    /// `budget_mib` (the min-peak stride if none fits, or if no budget was
+    /// given). `Fixed(1)` = classic per-block.
     /// Bit-exact regardless of stride (recompute replays the same kernels).
     ///
-    /// NOTE: under `Auto`, `budget_mib` is consulted twice with two
-    /// meanings — first as a peak-concurrent-activation budget to pick the
-    /// stride (`select_stride`), then as a saved-interior-bytes budget by the
-    /// per-tensor knapsack (`ccr::apply_budget`). Both keep the plan valid (the
-    /// number is a soft target, not a hard cap), so the dual use is safe but
-    /// deliberate; unifying them is future work (the full DP scheduler).
+    /// The projected peak is of the tensors computed inside the blocks
+    /// only: tensors outside them and the temporaries of the backward are
+    /// not in it, so it is a figure for ranking strides, not the step's
+    /// peak memory. `Auto` and `Dp` need a static size for every block
+    /// tensor; the build fails when one is missing.
     pub stride: CheckpointStride,
-    /// CCR phases 5-6 (`--checkpoint-compress fp16|bf16`): compress the
-    /// Selective policy's saved matmul-class interiors to half precision
-    /// between forward and backward (cast-on-save, dequant-on-load via the
-    /// CFTP-v7 GPU cast kernels). NOT bit-exact — backward reads rounded
-    /// activations; gated by the repo's 3-4 dp loss-parity standard.
+    /// CCR phases 5-6 (`--checkpoint-compress bf16`): compress the
+    /// Selective policy's saved matmul-class interiors to bf16, each at the
+    /// end of its block segment, and widen it back to f32 before its first
+    /// reader in the backward (the CFTP-v7 GPU cast kernels). NOT bit-exact —
+    /// backward reads rounded activations; gated by the repo's 3-4 dp
+    /// loss-parity standard. `Some("bf16")` is the only accepted value
+    /// (`ccr::COMPRESS_DTYPE`); anything else fails the build.
     pub compress: Option<String>,
     /// Cycle-10 §5.3 paper checkpointing-aware backward (Task 6):
     /// per-function `@checkpoint(policy=...)` policies collected by
@@ -1553,6 +1570,39 @@ pub struct ImportedModelOptions {
     /// `int(self._n_heads.item())` reads these back, so the arena's shape
     /// propagation needs them to fold attention reshape targets.
     pub field_values: std::collections::HashMap<String, std::collections::HashMap<String, f64>>,
+    /// The free functions and models of the imported modules, for source AD
+    /// to inline (see [`ImportedFunctions`]).
+    pub functions: ImportedFunctions,
+}
+
+/// What source AD needs to know about the imported modules to inline a call
+/// into one of them, and to resolve the calls made inside the inlined body
+/// in the module that body was written in.
+#[derive(Clone, Default)]
+pub struct ImportedFunctions {
+    /// The undecorated free functions of every imported module (the standard
+    /// library included), by name, with the module that declares each. A
+    /// call from the module being compiled to a function the builtin table
+    /// has no rule for is inlined from here; `fused_kl_ce` reaches its
+    /// composite this way. A name declared by more than one imported module
+    /// is left out: such a call cannot be attributed.
+    pub by_name: std::collections::HashMap<String, ImportedFnBody>,
+    /// The same functions per module: `module -> name -> body`. A call
+    /// written inside an imported body resolves against its own module's
+    /// functions first, as it does when that module is compiled.
+    pub by_module:
+        std::collections::HashMap<String, std::collections::HashMap<String, nsl_ast::decl::FnDef>>,
+    /// The module that declares each imported model, by model name, so a
+    /// call written inside one of its methods resolves in that module.
+    pub model_modules: std::collections::HashMap<String, String>,
+}
+
+/// An imported free function: its body and the module that declares it.
+#[derive(Clone)]
+pub struct ImportedFnBody {
+    /// The declaring module (its path, as the module loader names it).
+    pub module: String,
+    pub def: nsl_ast::decl::FnDef,
 }
 
 /// ZeRO optimizer-sharding options (`--zero-stage`, `--zero-elementwise`).
@@ -1625,6 +1675,21 @@ pub struct WeightsOptions {
     pub config: weight_aware::WeightAwareConfig,
     /// M52: Whether to emit a weight analysis report (nsl check --weight-analysis)
     pub analysis: bool,
+    /// Whether `file` was given with `-w` / `--weights` (as opposed to found
+    /// in the source's `load_safetensors(...)`): the CLI's cue to bind.
+    pub from_flag: bool,
+    /// The program runs with the file's values: constructors load them, and
+    /// rewrites may then depend on them. `None` (the default, and what every
+    /// build that does not produce a program to run leaves it at) keeps the
+    /// file an input to planning only: nothing is loaded and no rewrite that
+    /// depends on a weight's values is made.
+    pub bind: Option<weight_aware::WeightBinding>,
+    /// Whether the user passed `--dead-weight-threshold`. Only then may a
+    /// rewrite on a bound file's values use the approximations that
+    /// threshold makes (a weight within it of the identity taken as the
+    /// identity, small values zeroed before a fold); otherwise it uses the
+    /// file's exact values.
+    pub threshold_given: bool,
     /// M62 Task 6: maps `self.<field>` `NodeId`s to weight-array indices for
     /// `@export` model methods compiled via `WeightPtrsArray` self-resolution.
     /// Populated from `nsl_semantic::AnalysisResult.weight_index_map` before
@@ -2157,6 +2222,14 @@ impl CompileOptions {
                 file_digest(self.wggo.weights.as_deref())
             ));
         }
+        // The final step on a trailing partial accumulation window, turned
+        // off at compile time. Emitted only when it is off, for the reason
+        // the prune keys are: every checkpoint written before the switch
+        // existed came from a build with no such key, and a key on every
+        // build would refuse them all.
+        if env("NSL_FASE_FLUSH_TAIL").as_deref() == Some("0") {
+            fields.push("fase_flush=0".to_string());
+        }
         fields.join(",")
     }
 }
@@ -2262,10 +2335,9 @@ impl Default for CompileOptions {
 ///
 /// The NSL source no longer needs a `train` block for calibration to fire.
 /// Calibration fires whenever `calibration.data.is_some()`, driven by the
-/// wrapper-level block (see `#134 (c-i)`).  Models decorated with
-/// `@quantize(dtype="awq4")` will have their AWQ projections discovered via
-/// `discover_awq_projections`; WGGO gradient targets are wired via
-/// `WggoGradientHook` when `calibration.grad_retention` is populated.
+/// wrapper-level block (see `#134 (c-i)`).  WGGO gradient targets are wired
+/// via `WggoGradientHook` when `calibration.grad_retention` is populated;
+/// that is the only hook this entry point registers.
 pub fn compile_and_calibrate(
     source_path: &std::path::Path,
     data_path: &std::path::Path,
@@ -2352,7 +2424,7 @@ pub fn compile_and_calibrate(
         compiler.register_batched_functions(&vmap_results);
         compiler.compile_datatype_defs(&parsed.module.stmts)?;
         compiler.compile_kernels(&parsed.module.stmts)?;
-        crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler);
+        crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler)?;
         // #134 (c-i) wrapper-level firing — spec §4.1 + §8.1 commit 3.
         // Previously: compile_train_block fired the calibration harness as a
         // side-effect inside compile_main, coupling calibration to the
@@ -2375,32 +2447,16 @@ pub fn compile_and_calibrate(
         // pre-pass and the in-place planner with DIFFERENT importance, so the
         // pre-plan's graph fingerprint would never match and it would be
         // rejected. Firing here (right after wrga_prescan, before any kernel
-        // synthesis) keeps both read sites consistent. discover_awq_projections
-        // reads only collect_models-era state, which wrga_prescan has already
-        // finalized, so nothing the harness needs is produced by the synthesis
-        // calls now sequenced below it. Spec §4.1's "after compile_main
+        // synthesis) keeps both read sites consistent. Nothing the harness
+        // needs is produced by the synthesis calls now sequenced below it. Spec §4.1's "after compile_main
         // returns" wording was over-specified; the architectural goal
         // "calibration runs around the compiled code" (§4.3) is preserved.
         if let Some(data_path) = compiler.compile_options.calibration.data.clone() {
             let mut registry = crate::calibration::registry::HookRegistry::new();
-            let awq_projections = compiler.discover_awq_projections().unwrap_or_default();
-            if let Some(pre_scan) = compiler.compile_options.calibration.retention.as_ref() {
-                crate::calibration::discovery::check_discovery_agreement(
-                    pre_scan,
-                    &awq_projections,
-                )
-                .map_err(|err| CodegenError::new(err.to_string()))?;
-            }
-            if !awq_projections.is_empty() {
-                let proj_refs: Vec<crate::calibration::ProjectionRef> = awq_projections
-                    .iter()
-                    .map(|dp| dp.projection.clone())
-                    .collect();
-                registry.register(Box::new(
-                    crate::calibration::awq_hook::AwqCalibrationHook::new(proj_refs),
-                ));
-                compiler.compile_options.calibration.retention = Some(awq_projections);
-            }
+            // The only hook is the WGGO gradient hook. An AWQ hook used
+            // to be registered here for `@quantize(dtype="awq4")` models; it
+            // recorded activation maxima that no quantizer read, and it is
+            // deleted with the decorator's refusal.
             if let Some(targets) = compiler.compile_options.calibration.grad_retention.as_ref()
                 && !targets.is_empty()
             {
@@ -2485,9 +2541,8 @@ pub fn compile_and_calibrate(
     sidecar.ok_or_else(|| {
         CodegenError::new(
             "compile_and_calibrate: calibration harness ran but produced no sidecar. \
-             Ensure at least one @quantize(dtype=\"awq4\")-decorated model is present \
-             (for AWQ projections) and/or @wggo_target decorators (for WGGO gradients), \
-             and that the registered hook set is non-empty."
+             Ensure at least one @wggo_target-decorated forward is reachable \
+             (the WGGO gradient hook is the only calibration hook)."
                 .to_string(),
         )
     })
@@ -2775,6 +2830,13 @@ mod exec_fingerprint_tests {
         // Only the values changed, never the key set or order.
         let keys = |fp: &str| fp.split(',').map(|f| f.split('=').next().unwrap().to_string()).collect::<Vec<_>>();
         assert_eq!(keys(&set), keys(&unset));
+
+        // The flush switch is recorded when it is off and absent otherwise.
+        assert!(!unset.contains("fase_flush"), "{unset}");
+        let off = o.exec_fingerprint_with_env(|name| (name == "NSL_FASE_FLUSH_TAIL").then(|| "0".into()));
+        assert_eq!(off, format!("{unset},fase_flush=0"));
+        let on = o.exec_fingerprint_with_env(|name| (name == "NSL_FASE_FLUSH_TAIL").then(|| "1".into()));
+        assert_eq!(on, unset);
     }
 
     #[test]

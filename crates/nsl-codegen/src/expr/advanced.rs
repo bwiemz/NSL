@@ -81,7 +81,6 @@ impl Compiler<'_> {
         let merge_block = builder.create_block();
         let incoming_variables = state.variables.clone();
         let incoming_variable_types = state.variable_types.clone();
-        let incoming_sparse_vars = state.ownership.sparse_vars.clone();
         let incoming_loader_symbols = state.dataloader_symbols.clone();
         let mut reaching_loader_sets: Vec<std::collections::HashSet<nsl_ast::Symbol>> = Vec::new();
         let incoming_loader_vars = state.cleanup.dataloader_vars.clone();
@@ -107,7 +106,6 @@ impl Compiler<'_> {
         state.current_block = Some(then_block);
         state.variables = incoming_variables.clone();
         state.variable_types = incoming_variable_types.clone();
-        state.ownership.sparse_vars = incoming_sparse_vars.clone();
         state.dataloader_symbols = incoming_loader_symbols.clone();
         state.cleanup.dataloader_vars = incoming_loader_vars.clone();
         state.cleanup.tensor_temporaries.truncate(temp_base_len);
@@ -181,7 +179,6 @@ impl Compiler<'_> {
         state.current_block = Some(else_block);
         state.variables = incoming_variables.clone();
         state.variable_types = incoming_variable_types.clone();
-        state.ownership.sparse_vars = incoming_sparse_vars.clone();
         state.dataloader_symbols = incoming_loader_symbols.clone();
         state.cleanup.dataloader_vars = incoming_loader_vars.clone();
         state.cleanup.tensor_temporaries.truncate(temp_base_len);
@@ -252,7 +249,6 @@ impl Compiler<'_> {
 
         state.variables = incoming_variables.clone();
         state.variable_types = incoming_variable_types;
-        state.ownership.sparse_vars = incoming_sparse_vars;
 
         state.dataloader_symbols = if let Some(first) = reaching_loader_sets.first().cloned() {
             reaching_loader_sets
@@ -834,23 +830,8 @@ impl Compiler<'_> {
         op: BinOp,
         left_is_tensor: bool,
         right_is_tensor: bool,
-        left_is_sparse: bool,
-        right_is_sparse: bool,
     ) -> Result<Value, CodegenError> {
         if left_is_tensor && right_is_tensor {
-            // M50: Sparse dispatch — if either operand is sparse, route to sparse ops
-            if left_is_sparse || right_is_sparse {
-                return self.compile_sparse_binary_op(
-                    builder,
-                    state,
-                    lhs,
-                    rhs,
-                    op,
-                    left_is_sparse,
-                    right_is_sparse,
-                );
-            }
-
             // M52b: Try constant folding if both operands are known weights
             if let Some(folded) = self.try_weight_fold(builder, state, lhs, rhs, op)? {
                 state.cleanup.tensor_temporaries.push(folded);
@@ -873,21 +854,6 @@ impl Compiler<'_> {
                 // state (BorrowedWeight for the weight or whatever the
                 // other operand was).
                 return Ok(pass_through);
-            }
-
-            // M52c: Try sparse matmul if RHS weight is >50% sparse
-            if op == BinOp::MatMul && !state.flags.is_fp8_compute
-                && let Some(sparse_result) = self.try_sparse_matmul(builder, state, lhs, rhs)?
-            {
-                state.cleanup.tensor_temporaries.push(sparse_result);
-                // ELTLS: nsl_sparse_matmul returns a fresh owned tensor.
-                self.set_ownership(
-                    builder,
-                    state,
-                    sparse_result,
-                    Ownership::Owned,
-                );
-                return Ok(sparse_result);
             }
 
             // Tensor-tensor ops (normal runtime path)
@@ -935,7 +901,7 @@ impl Compiler<'_> {
         } else if left_is_tensor {
             // M52d: Scaling constant fusion — if this is `tensor * scalar` where
             // the scalar is a known weight scale, emit it as a compile-time constant.
-            let (scalar, scale_fused) = self.try_fuse_weight_scale(builder, state, rhs, op);
+            let (scalar, scale_fused) = self.try_fuse_weight_scale(state, rhs, op);
             let rhs_for_scalar = scalar.unwrap_or(rhs);
 
             // Tensor-scalar: ensure scalar is f64 for the runtime FFI
@@ -1505,6 +1471,26 @@ impl Compiler<'_> {
         None
     }
 
+    /// Trap when a fused-attention launcher returned non-zero.
+    ///
+    /// Every launcher logs the reason before it returns. The output tensor is
+    /// allocated zeroed before the launch, so carrying on after a refusal
+    /// hands zeros to the rest of the program as the attention output (and,
+    /// on the path that saves activations, zeroed saves to the backward).
+    /// `TrapCode::unwrap_user(3)` is the code for "attention launch failed".
+    fn trap_on_attention_launch_failure(builder: &mut FunctionBuilder, launch_rc: Value) {
+        use cranelift_codegen::ir::{condcodes::IntCC, TrapCode};
+        let ok_block = builder.create_block();
+        let trap_block = builder.create_block();
+        let is_err = builder.ins().icmp_imm_s(IntCC::NotEqual, launch_rc, 0);
+        builder.ins().brif(is_err, trap_block, &[], ok_block, &[]);
+        builder.switch_to_block(trap_block);
+        builder.seal_block(trap_block);
+        builder.ins().trap(TrapCode::unwrap_user(3));
+        builder.switch_to_block(ok_block);
+        builder.seal_block(ok_block);
+    }
+
     pub(crate) fn compile_flash_attention_call(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -1556,6 +1542,23 @@ impl Compiler<'_> {
         // `nsl-runtime/src/pca_tier_b_runtime.rs`) can pick the variant.
         let csha_with_saves_tier_b_on_ptx_id = ctx.csha_with_saves_tier_b_on_ptx_id;
         let csha_with_saves_tier_b_on_name_id = ctx.csha_with_saves_tier_b_on_name_id;
+        // The active-head count each launch below passes is the one in the
+        // configuration its kernel was synthesized from (0 = every head): the
+        // kernel compares its head index with the run-time value, so the two
+        // must describe the same pruning. It used to be the planner's
+        // per-layer count, which is made on a nominal 8-head layer whatever
+        // the model is, so a 16-head model had heads 8 to 15 left at zero.
+        let kernel_active_heads = |c: &crate::flash_attention::FlashAttentionConfig| -> i64 {
+            c.csha.as_ref().map_or(0, |x| i64::from(x.active_heads))
+        };
+        let inference_active_heads = kernel_active_heads(&ctx.config);
+        // The with-saves launch runs the training kernel when one was
+        // synthesized, and the inference kernel otherwise.
+        let with_saves_active_heads =
+            match (csha_with_saves_ptx_id, csha_with_saves_name_id, ctx.csha_training_config.as_ref()) {
+                (Some(_), Some(_), Some(c)) => kernel_active_heads(c),
+                _ => inference_active_heads,
+            };
         let csha_training_shmem_bytes = ctx
             .csha_training_config
             .as_ref()
@@ -1705,9 +1708,10 @@ impl Compiler<'_> {
             let eps_bits = builder
                 .ins()
                 .iconst(cl_types::I64, extras.rmsnorm_eps.to_bits() as i64);
-            let active_heads_val = builder
-                .ins()
-                .iconst(cl_types::I64, extras.active_heads as i64);
+            let with_saves_active_heads_val =
+                builder.ins().iconst(cl_types::I64, with_saves_active_heads);
+            let inference_active_heads_val =
+                builder.ins().iconst(cl_types::I64, inference_active_heads);
             let d_model_val = builder
                 .ins()
                 .iconst(cl_types::I64, extras.d_model as i64);
@@ -1930,7 +1934,7 @@ impl Compiler<'_> {
                         x_v, norm_w_v,
                         wq_v, wk_v, wv_v, wo_v,
                         eps_bits,
-                        active_heads_val,
+                        with_saves_active_heads_val,
                         d_model_val,
                         // Tier C activation-save pointers.
                         q_proj_v, k_proj_v, v_proj_v,
@@ -1960,21 +1964,7 @@ impl Compiler<'_> {
                         null,
                     ],
                 )?;
-                {
-                    use cranelift_codegen::ir::{condcodes::IntCC, TrapCode};
-                    let ok_block   = builder.create_block();
-                    let trap_block = builder.create_block();
-                    let is_err = builder
-                        .ins()
-                        .icmp_imm_s(IntCC::NotEqual, launch_rc, 0);
-                    builder.ins().brif(is_err, trap_block, &[], ok_block, &[]);
-                    builder.switch_to_block(trap_block);
-                    builder.seal_block(trap_block);
-                    // TrapCode user(3) = CSHA forward launch rc != 0.
-                    builder.ins().trap(TrapCode::unwrap_user(3));
-                    builder.switch_to_block(ok_block);
-                    builder.seal_block(ok_block);
-                }
+                Self::trap_on_attention_launch_failure(builder, launch_rc);
 
                 // Scope-immediate free (save-buffer-leak fix, 2026-07-02).
                 //
@@ -2029,7 +2019,11 @@ impl Compiler<'_> {
                 // for call-site uniformity; the runtime-side
                 // `assert_tier_b_sentinels` panic enforces (0,0) agreement.
                 let tier_b_inference = crate::pca_tier_b::tier_b_disabled_sentinel(builder);
-                let _err = self.compile_call_by_name(
+                // The launcher can refuse (it returns non-zero and logs why:
+                // a kernel that cannot serve the shape, a failed module load
+                // or launch). `out_val` is zero-initialised, so a discarded
+                // return code let zeros flow on as the attention output.
+                let launch_rc = self.compile_call_by_name(
                     builder,
                     "nsl_flash_attention_csha",
                     &[
@@ -2067,7 +2061,7 @@ impl Compiler<'_> {
                         norm_w_v,                  // resolved via conventional-name probe
                         wq_v, wk_v, wv_v, wo_v,    // resolved via bridge marks
                         eps_bits,
-                        active_heads_val,
+                        inference_active_heads_val,
                         d_model_val,
                         // PCA Tier A: segment_ids_ptr — read from the
                         // thread-local packing registry.
@@ -2089,6 +2083,7 @@ impl Compiler<'_> {
                         null,
                     ],
                 )?;
+                Self::trap_on_attention_launch_failure(builder, launch_rc);
             }
         } else {
             // PCA Tier B planner spec §4: the non-CSHA path has no Tier-B-on
@@ -2098,7 +2093,9 @@ impl Compiler<'_> {
             // nsl_flash_attention entry sees a valid (0, 0) pair instead of
             // reading stack garbage.
             let tier_b_non_csha = crate::pca_tier_b::tier_b_disabled_sentinel(builder);
-            let _err = self.compile_call_by_name(
+            // As for the CSHA launches above: a refused launch must not let
+            // the zero-initialised `out_val` flow on.
+            let launch_rc = self.compile_call_by_name(
                 builder,
                 "nsl_flash_attention",
                 &[
@@ -2132,6 +2129,7 @@ impl Compiler<'_> {
                     tier_b_non_csha[1],
                 ],
             )?;
+            Self::trap_on_attention_launch_failure(builder, launch_rc);
         }
 
         // Logsumexp is consumed by the runtime's tape recording in nsl_flash_attention.
@@ -2569,12 +2567,65 @@ impl Compiler<'_> {
         Ok(None)
     }
 
+    /// The adapter tensors of a `model_name` instance and of every model
+    /// nested in it, named as `model_save` names parameters
+    /// (`blocks[0].lora_A_Blk_w__lora`), in a fixed order. They live in each
+    /// instance's adapter side-table, not in the struct, so the walk over
+    /// struct fields (`generate_param_metadata`) does not see them.
+    fn adapter_tensor_names(&self, model_name: &str, prefix: &str, depth: usize) -> Vec<String> {
+        let mut names = Vec::new();
+        if depth > 16 {
+            return names;
+        }
+        let Some(layout) = self.types.struct_layouts.get(model_name) else {
+            return names;
+        };
+        let join = |field: &str| -> String {
+            if prefix.is_empty() {
+                field.to_string()
+            } else {
+                format!("{prefix}.{field}")
+            }
+        };
+        let field_types = self.models.model_field_types.get(model_name);
+        for field in &layout.fields {
+            let Some(marker) = field_types.and_then(|t| t.get(&field.name)) else {
+                continue;
+            };
+            let path = join(&field.name);
+            if let Some(inner) = marker.strip_prefix('[').and_then(|m| m.strip_suffix(']')) {
+                if let Some((elem_type, count)) = inner.rsplit_once(';') {
+                    let count: usize = count.trim().parse().unwrap_or(0);
+                    for i in 0..count {
+                        names.extend(self.adapter_tensor_names(
+                            elem_type.trim(),
+                            &format!("{path}[{i}]"),
+                            depth + 1,
+                        ));
+                    }
+                }
+            } else {
+                names.extend(self.adapter_tensor_names(marker, &path, depth + 1));
+            }
+        }
+        for site in self.bus.adapter_sites() {
+            if site.target_model == model_name {
+                names.extend(site.synthesized_fields.iter().map(|f| join(f)));
+            }
+        }
+        names
+    }
+
     /// Compile `model_save(model, "path.nslm")` — serialize model parameters to disk.
     ///
     /// Codegen emits:
     ///   1. Build NslList of parameter name C-string pointers
     ///   2. Build NslList of parameter tensor pointers (from struct fields)
     ///   3. Call nsl_model_save(path_ptr, path_len, names_list, tensors_list)
+    ///
+    /// The tensors of the model's adapters follow its own parameters. They
+    /// used to be left out, so a trained adapter was not in the file at all
+    /// and a reload gave back the model as it was before training.
     pub(crate) fn compile_model_save(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -2631,12 +2682,17 @@ impl Compiler<'_> {
             })?;
 
         // Collect recursive leaf tensor names so checkpoint headers stay stable
-        // for nested sub-models and fixed arrays.
-        let param_metadata = self.generate_param_metadata(&model_name, "", 0);
+        // for nested sub-models and fixed arrays; then the adapter tensors.
+        let mut tensor_names: Vec<String> = self
+            .generate_param_metadata(&model_name, "", 0)
+            .into_iter()
+            .map(|(field_name, _field_offset, _needs_transpose)| field_name)
+            .collect();
+        tensor_names.extend(self.adapter_tensor_names(&model_name, "", 0));
 
         // Build NslList of parameter name pointers (null-terminated C strings)
         let names_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
-        for (field_name, _field_offset, _needs_transpose) in &param_metadata {
+        for field_name in &tensor_names {
             let name_data_id = self.intern_string(field_name)?;
             let gv = self.module.declare_data_in_func(name_data_id, builder.func);
             let name_ptr = builder.ins().symbol_value(cl_types::I64, gv);
@@ -2644,7 +2700,7 @@ impl Compiler<'_> {
         }
 
         let tensors_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
-        for (field_name, _field_offset, _needs_transpose) in &param_metadata {
+        for field_name in &tensor_names {
             let nested_path = format!("$model.{}", field_name.replace('[', ".").replace(']', ""));
             let tensor_ptr = self
                 .load_nested_field(builder, model_val, &layout, &model_name, &nested_path)
@@ -2671,6 +2727,10 @@ impl Compiler<'_> {
     ///   1. Build NslLists of parameter names and tensor pointers (from struct
     ///      fields, the same lists `model_save` writes)
     ///   2. Call nsl_model_load_named(path_ptr, path_len, names_list, tensors_list)
+    ///
+    /// For a model with adapters the adapter tensors follow the parameters,
+    /// as in `model_save`, and the call is `nsl_model_load_with_adapters`,
+    /// which also accepts a file of the base parameters alone.
     pub(crate) fn compile_model_load(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -2726,19 +2786,25 @@ impl Compiler<'_> {
                 ))
             })?;
 
-        let param_metadata = self.generate_param_metadata(&model_name, "", 0);
+        let mut tensor_names: Vec<String> = self
+            .generate_param_metadata(&model_name, "", 0)
+            .into_iter()
+            .map(|(field_name, _field_offset, _needs_transpose)| field_name)
+            .collect();
+        let base_count = tensor_names.len();
+        tensor_names.extend(self.adapter_tensor_names(&model_name, "", 0));
         // The names let the runtime refuse a file whose parameters were
         // reordered since the save: same-shaped tensors swapped positionally
         // pass every size check.
         let names_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
-        for (field_name, _field_offset, _needs_transpose) in &param_metadata {
+        for field_name in &tensor_names {
             let name_data_id = self.intern_string(field_name)?;
             let gv = self.module.declare_data_in_func(name_data_id, builder.func);
             let name_ptr = builder.ins().symbol_value(cl_types::I64, gv);
             self.compile_call_by_name(builder, "nsl_list_push", &[names_list, name_ptr])?;
         }
         let tensors_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
-        for (field_name, _field_offset, _needs_transpose) in &param_metadata {
+        for field_name in &tensor_names {
             let nested_path = format!("$model.{}", field_name.replace('[', ".").replace(']', ""));
             let tensor_ptr = self
                 .load_nested_field(builder, model_val, &layout, &model_name, &nested_path)
@@ -2751,182 +2817,20 @@ impl Compiler<'_> {
             self.compile_call_by_name(builder, "nsl_list_push", &[tensors_list, tensor_ptr])?;
         }
 
+        if tensor_names.len() > base_count {
+            let base = builder.ins().iconst(cl_types::I64, base_count as i64);
+            return self.compile_call_by_name(
+                builder,
+                "nsl_model_load_with_adapters",
+                &[path_val, path_len, names_list, tensors_list, base],
+            );
+        }
         self.compile_call_by_name(
             builder,
             "nsl_model_load_named",
             &[path_val, path_len, names_list, tensors_list],
         )
     }
-
-    // ── M50: Sparse tensor operations ──────────────────────────────────
-
-    /// Compile a binary op where at least one operand is a sparse tensor.
-    /// Dispatches to sparse-specific runtime functions.
-    #[allow(clippy::too_many_arguments)]
-    fn compile_sparse_binary_op(
-        &mut self,
-        builder: &mut FunctionBuilder,
-        state: &mut FuncState,
-        lhs: Value,
-        rhs: Value,
-        op: BinOp,
-        left_is_sparse: bool,
-        right_is_sparse: bool,
-    ) -> Result<Value, CodegenError> {
-        let result = match op {
-            BinOp::MatMul => {
-                if left_is_sparse && !right_is_sparse {
-                    // Sparse @ Dense → Dense (SpMM)
-                    self.compile_call_by_name(builder, "nsl_sparse_spmm", &[lhs, rhs])?
-                } else if !left_is_sparse && right_is_sparse {
-                    // Dense @ Sparse → convert sparse to dense, then dense matmul
-                    // (SpMM expects sparse on the left; transposing CSR is non-trivial)
-                    let dense_rhs =
-                        self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[rhs])?;
-                    let flags_zero = builder.ins().iconst(cl_types::I8, 0);
-                    let result =
-                        self.compile_traced_call(builder, "nsl_tensor_matmul", &[lhs, dense_rhs, flags_zero])?;
-                    self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_rhs])?;
-                    result
-                } else {
-                    // Sparse @ Sparse → convert both to dense (rare case)
-                    let dense_lhs =
-                        self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[lhs])?;
-                    let dense_rhs =
-                        self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[rhs])?;
-                    let flags_zero = builder.ins().iconst(cl_types::I8, 0);
-                    let result = self.compile_traced_call(
-                        builder,
-                        "nsl_tensor_matmul",
-                        &[dense_lhs, dense_rhs, flags_zero],
-                    )?;
-                    self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_lhs])?;
-                    self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_rhs])?;
-                    result
-                }
-            }
-            BinOp::Add => {
-                if left_is_sparse && right_is_sparse {
-                    // Sparse + Sparse → Sparse (union merge)
-                    self.compile_call_by_name(builder, "nsl_sparse_add", &[lhs, rhs])?
-                } else {
-                    // Mixed: convert sparse to dense, then dense add
-                    let (dense_lhs, free_lhs) = if left_is_sparse {
-                        (
-                            self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[lhs])?,
-                            true,
-                        )
-                    } else {
-                        (lhs, false)
-                    };
-                    let (dense_rhs, free_rhs) = if right_is_sparse {
-                        (
-                            self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[rhs])?,
-                            true,
-                        )
-                    } else {
-                        (rhs, false)
-                    };
-                    // ELTLS (FBIP-3): nsl_tensor_add takes flags=0 here.
-                    let flags_zero = builder.ins().iconst(cl_types::I8, 0);
-                    let result = self.compile_traced_call(
-                        builder,
-                        "nsl_tensor_add",
-                        &[dense_lhs, dense_rhs, flags_zero],
-                    )?;
-                    if free_lhs {
-                        self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_lhs])?;
-                    }
-                    if free_rhs {
-                        self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_rhs])?;
-                    }
-                    result
-                }
-            }
-            BinOp::Mul => {
-                if left_is_sparse && right_is_sparse {
-                    // Sparse * Sparse → Sparse (intersection merge)
-                    self.compile_call_by_name(builder, "nsl_sparse_mul", &[lhs, rhs])?
-                } else {
-                    // Mixed: convert sparse to dense, then dense mul
-                    let (dense_lhs, free_lhs) = if left_is_sparse {
-                        (
-                            self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[lhs])?,
-                            true,
-                        )
-                    } else {
-                        (lhs, false)
-                    };
-                    let (dense_rhs, free_rhs) = if right_is_sparse {
-                        (
-                            self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[rhs])?,
-                            true,
-                        )
-                    } else {
-                        (rhs, false)
-                    };
-                    let flags_zero = builder.ins().iconst(cl_types::I8, 0);
-                    let result = self.compile_traced_call(
-                        builder,
-                        "nsl_tensor_mul",
-                        &[dense_lhs, dense_rhs, flags_zero],
-                    )?;
-                    if free_lhs {
-                        self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_lhs])?;
-                    }
-                    if free_rhs {
-                        self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_rhs])?;
-                    }
-                    result
-                }
-            }
-            // Sub, Div, etc.: convert to dense and use normal tensor ops
-            _ => {
-                let (dense_lhs, free_lhs) = if left_is_sparse {
-                    (
-                        self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[lhs])?,
-                        true,
-                    )
-                } else {
-                    (lhs, false)
-                };
-                let (dense_rhs, free_rhs) = if right_is_sparse {
-                    (
-                        self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[rhs])?,
-                        true,
-                    )
-                } else {
-                    (rhs, false)
-                };
-                let rt_name = match op {
-                    BinOp::Sub => "nsl_tensor_sub",
-                    BinOp::Div => "nsl_tensor_div",
-                    _ => {
-                        return Err(CodegenError::new(format!(
-                            "unsupported sparse tensor op: {op:?}"
-                        )))
-                    }
-                };
-                let flags_zero = builder.ins().iconst(cl_types::I8, 0);
-                let result = self.compile_traced_call(builder, rt_name, &[dense_lhs, dense_rhs, flags_zero])?;
-                if free_lhs {
-                    self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_lhs])?;
-                }
-                if free_rhs {
-                    self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_rhs])?;
-                }
-                result
-            }
-        };
-        state.cleanup.tensor_temporaries.push(result);
-        // ELTLS: compile_sparse_binary_op always produces a fresh owned
-        // tensor result (either from an nsl_sparse_* op or an
-        // nsl_tensor_* op on converted-dense inputs).
-        self.set_ownership(builder, state, result, Ownership::Owned);
-        Ok(result)
-    }
-
-    // ── M52b: Weight constant folding ────────────────────────────────
 
     /// Try to constant-fold a tensor binary op where both operands are known weights.
     /// Returns Some(Value) if folding succeeded, None to fall through to runtime.
@@ -2938,10 +2842,12 @@ impl Compiler<'_> {
         rhs: Value,
         op: BinOp,
     ) -> Result<Option<Value>, CodegenError> {
-        let wmap = match self.features.weight_map {
-            Some(ref w) => w,
-            None => return Ok(None),
-        };
+        if self.features.weight_map.is_none()
+            || !self.compile_options.weights.config.constant_fold
+            || !matches!(op, BinOp::MatMul | BinOp::Add)
+        {
+            return Ok(None);
+        }
 
         let lhs_key = state.weight_values.get(&lhs).cloned();
         let rhs_key = state.weight_values.get(&rhs).cloned();
@@ -2952,6 +2858,20 @@ impl Compiler<'_> {
             _ => return Ok(None),
         };
 
+        // The folded constant stands for both weights' values: each must be
+        // one the program is known to run with.
+        let both_usable = [
+            self.may_specialize_on(&lk, "constant fold"),
+            self.may_specialize_on(&rk, "constant fold"),
+        ];
+        if both_usable != [true, true] {
+            return Ok(None);
+        }
+        let wmap = match self.features.weight_map {
+            Some(ref w) => w,
+            None => return Ok(None),
+        };
+
         let lhs_entry = match wmap.get(&lk) {
             Some(e) => e,
             None => return Ok(None),
@@ -2960,6 +2880,14 @@ impl Compiler<'_> {
             Some(e) => e,
             None => return Ok(None),
         };
+        // Only float weights fold: an integer tensor is not loaded into a
+        // float parameter (the program refuses it at startup), and the
+        // folded value is a float.
+        use crate::weight_aware::WeightDType as D;
+        let is_float = |d: D| matches!(d, D::F16 | D::BF16 | D::F32 | D::F64);
+        if !is_float(lhs_entry.dtype) || !is_float(rhs_entry.dtype) {
+            return Ok(None);
+        }
 
         if !self.compile_options.weights.config.constant_fold {
             return Ok(None);
@@ -2980,14 +2908,24 @@ impl Compiler<'_> {
 
         match result {
             crate::weight_aware::FoldResult::Constant(ct) => {
-                nsl_log::nsl_log!(INFO, "nsl", 
-                    "[nsl] M52b: constant-folded {} @ {} → {:?} tensor ({} bytes)",
+                let symbol = if op == BinOp::MatMul { "@" } else { "+" };
+                let basis = self.weight_value_basis();
+                nsl_log::nsl_log!(INFO, "nsl",
+                    "[nsl] M52b: constant-folded {} {} {} → {:?} tensor ({} bytes), {}",
                     lk,
+                    symbol,
                     rk,
                     ct.shape,
-                    ct.data.len()
+                    ct.data.len(),
+                    basis
                 );
-                let val = self.embed_const_tensor(builder, state, &ct)?;
+                // The fold is computed in f64 on the host; the operation it
+                // replaces would give a tensor of its operands' dtype on
+                // their device, which only the running program knows.
+                let constant = self.embed_const_tensor(builder, &ct)?;
+                state.cleanup.tensor_temporaries.push(constant);
+                let val =
+                    self.compile_call_by_name(builder, "nsl_weights_const_like", &[constant, lhs])?;
                 Ok(Some(val))
             }
             _ => Ok(None),
@@ -2998,13 +2936,17 @@ impl Compiler<'_> {
     fn embed_const_tensor(
         &mut self,
         builder: &mut FunctionBuilder,
-        state: &mut FuncState,
         ct: &crate::weight_aware::ConstTensor,
     ) -> Result<Value, CodegenError> {
         use cranelift_module::{DataDescription, Linkage, Module};
 
         // Create a unique .rodata symbol for this constant
-        let sym_name = format!("__nsl_const_tensor_{}", self.string_pool.len());
+        // (A name not taken yet: a second fold, or the same method compiled
+        // twice, must not redefine the first one's symbol.)
+        let sym_name = (self.string_pool.len()..)
+            .map(|n| format!("__nsl_const_tensor_{n}"))
+            .find(|name| self.module.get_name(name).is_none())
+            .expect("an unbounded range has a free name");
         let data_id = self
             .module
             .declare_data(&sym_name, Linkage::Local, false, false)
@@ -3012,6 +2954,11 @@ impl Compiler<'_> {
 
         let mut desc = DataDescription::new();
         desc.define(ct.data.clone().into_boxed_slice());
+        // The runtime reads this as f32 or f64 in place. Without an
+        // alignment the linker puts it at any byte, and the first read of a
+        // folded constant was a misaligned dereference (a panic in a debug
+        // runtime).
+        desc.set_align(8);
         self.module
             .define_data(data_id, &desc)
             .map_err(|e| CodegenError::new(format!("failed to define const tensor data: {e}")))?;
@@ -3031,7 +2978,12 @@ impl Compiler<'_> {
         let dtype_id = match ct.dtype {
             crate::weight_aware::WeightDType::F64 => 0i64,
             crate::weight_aware::WeightDType::F32 => 1i64,
-            _ => 1i64, // default to f32
+            // Labelling 2-byte data f32 read past the symbol and gave garbage.
+            other => {
+                return Err(CodegenError::new(format!(
+                    "M52b: a folded constant is f64 or f32, not {other:?}"
+                )));
+            }
         };
         let dtype_val = builder.ins().iconst(cl_types::I64, dtype_id);
 
@@ -3041,195 +2993,74 @@ impl Compiler<'_> {
             "nsl_tensor_from_static",
             &[data_ptr, shape_list, dtype_val],
         )?;
-
-        state.cleanup.tensor_temporaries.push(tensor);
+        // Not registered as a temporary here: the caller (the M52b fold in
+        // `compile_binary_op`) does that, and registering it twice freed the
+        // tensor twice at scope exit (glibc then aborted, or the next use
+        // found a freed handle).
         Ok(tensor)
     }
 
     /// Check if a matmul operand is a near-identity weight → skip the matmul.
-    fn try_identity_elim(&self, state: &FuncState, lhs: Value, rhs: Value) -> Option<Value> {
-        let wmap = self.features.weight_map.as_ref()?;
-
-        // Check RHS (more common: x @ W where W ≈ I)
-        if let Some(key) = state.weight_values.get(&rhs)
-            && let Some(entry) = wmap.get(key)
-        {
-            let elim = crate::weight_aware::DeadWeightEliminator::new(
-                &self.compile_options.weights.config,
-            );
-            if elim.is_near_identity(
-                entry,
-                self.compile_options.weights.config.dead_weight_threshold,
-            ) {
-                nsl_log::nsl_log!(INFO, "nsl", 
-                    "[nsl] M52b: eliminated near-identity matmul (weight '{}')",
-                    key
+    ///
+    /// The weight's values decide this, so it is done only for a parameter
+    /// the program runs with exactly as the file has it (`may_specialize_on`).
+    fn try_identity_elim(&mut self, state: &FuncState, lhs: Value, rhs: Value) -> Option<Value> {
+        // Under -w a rewrite uses the file's exact values: a weight that is
+        // only within --dead-weight-threshold of the identity is dropped only
+        // when the user passed that threshold (`weight_value_tolerance`).
+        let configured = self.compile_options.weights.config.dead_weight_threshold;
+        let tolerance = self.weight_value_tolerance().unwrap_or(0.0);
+        // `x @ W` with W ≈ I is the common case; `W @ x` the other.
+        for (weight, pass_through) in [(rhs, lhs), (lhs, rhs)] {
+            let Some(key) = state.weight_values.get(&weight).cloned() else {
+                continue;
+            };
+            let (near, identity) = {
+                let wmap = self.features.weight_map.as_ref()?;
+                let Some(entry) = wmap.get(&key) else {
+                    continue;
+                };
+                let elim = crate::weight_aware::DeadWeightEliminator::new(
+                    &self.compile_options.weights.config,
                 );
-                return Some(lhs); // x @ I ≈ x
-            }
-        }
-
-        // Check LHS (less common: W @ x where W ≈ I)
-        if let Some(key) = state.weight_values.get(&lhs)
-            && let Some(entry) = wmap.get(key)
-        {
-            let elim = crate::weight_aware::DeadWeightEliminator::new(
-                &self.compile_options.weights.config,
-            );
-            if elim.is_near_identity(
-                entry,
-                self.compile_options.weights.config.dead_weight_threshold,
-            ) {
-                nsl_log::nsl_log!(INFO, "nsl", 
-                    "[nsl] M52b: eliminated near-identity matmul (weight '{}')",
-                    key
+                (elim.is_near_identity(entry, configured), elim.is_near_identity(entry, tolerance))
+            };
+            if near && !identity {
+                self.note_weight_refusal(
+                    &key,
+                    "near-identity matmul elimination",
+                    &format!(
+                        "it is within {configured:e} of the identity but not the identity, \
+                         and a rewrite uses the file's exact values unless \
+                         --dead-weight-threshold is given"
+                    ),
                 );
-                return Some(rhs); // I @ x ≈ x
+                continue;
             }
+            if !identity || !self.may_specialize_on(&key, "near-identity matmul elimination") {
+                continue;
+            }
+            let basis = self.weight_value_basis();
+            nsl_log::nsl_log!(INFO, "nsl",
+                "[nsl] M52b: eliminated near-identity matmul (weight '{}'), {}",
+                key,
+                basis
+            );
+            return Some(pass_through);
         }
-
         None
-    }
-
-    /// M52c: Try to emit a CSR sparse matmul when the RHS weight is >50% sparse.
-    /// Embeds CSR (row_ptrs, col_indices, values) in .rodata and emits nsl_sparse_matmul.
-    fn try_sparse_matmul(
-        &mut self,
-        builder: &mut FunctionBuilder,
-        state: &mut FuncState,
-        lhs: Value, // dense input (x)
-        rhs: Value, // potentially sparse weight (W)
-    ) -> Result<Option<Value>, CodegenError> {
-        use cranelift_module::{DataDescription, Linkage, Module};
-
-        let wmap = match self.features.weight_map {
-            Some(ref w) => w,
-            None => return Ok(None),
-        };
-
-        if !self.compile_options.weights.config.sparse_codegen {
-            return Ok(None);
-        }
-        // Withheld until the path is rebuilt. Sparse codegen is on by
-        // default, so any `-w` run whose model held a matrix at least half
-        // zeros reached the code below, and it does not work:
-        //   - on CPU the runtime's fallback passes the `.rodata` VALUES
-        //     pointer to `nsl_tensor_matmul` as if it were a tensor handle,
-        //     and the program aborts ("invalid tensor handle");
-        //   - for the GPU the call site is `x @ W` but the kernel is
-        //     `A_sparse @ B_dense` with A = W, the CSR arrays are host
-        //     `.rodata` addresses passed as device pointers, and the values
-        //     are embedded in the weight's stored dtype while the kernel
-        //     reads f32.
-        // No test exercised it. The dense matmul is always correct. Set
-        // `NSL_M52C_SPARSE_MATMUL=1` to reach the old path while fixing it.
-        if std::env::var("NSL_M52C_SPARSE_MATMUL").ok().as_deref() != Some("1") {
-            return Ok(None);
-        }
-
-        // Check if RHS is a known sparse weight
-        let rhs_key = match state.weight_values.get(&rhs) {
-            Some(k) => k.clone(),
-            None => return Ok(None),
-        };
-
-        let entry = match wmap.get(&rhs_key) {
-            Some(e) => e,
-            None => return Ok(None),
-        };
-
-        let sparsity = match entry.sparsity() {
-            Some(s) => s,
-            None => return Ok(None),
-        };
-
-        if !sparsity.use_sparse_kernel {
-            return Ok(None);
-        }
-
-        let csr = match &sparsity.csr {
-            Some(c) => c,
-            None => return Ok(None),
-        };
-
-        nsl_log::nsl_log!(INFO, "nsl", 
-            "[nsl] M52c: emitting CSR sparse matmul for weight '{}' ({:.1}% sparse, {} nnz / {} total)",
-            rhs_key, sparsity.near_zero_fraction * 100.0, csr.nnz, entry.num_elements
-        );
-
-        // Embed CSR arrays in .rodata
-        let sym_prefix = format!("__nsl_csr_{}", rhs_key.replace('.', "_"));
-
-        // row_ptrs: Vec<u32>
-        let rp_name = format!("{}_row_ptrs", sym_prefix);
-        let rp_bytes: Vec<u8> = csr.row_ptrs.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let rp_data_id = self
-            .module
-            .declare_data(&rp_name, Linkage::Local, false, false)
-            .map_err(|e| CodegenError::new(format!("CSR row_ptrs declare: {e}")))?;
-        let mut rp_desc = DataDescription::new();
-        rp_desc.define(rp_bytes.into_boxed_slice());
-        self.module
-            .define_data(rp_data_id, &rp_desc)
-            .map_err(|e| CodegenError::new(format!("CSR row_ptrs define: {e}")))?;
-
-        // col_indices: Vec<u32>
-        let ci_name = format!("{}_col_indices", sym_prefix);
-        let ci_bytes: Vec<u8> = csr
-            .col_indices
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
-        let ci_data_id = self
-            .module
-            .declare_data(&ci_name, Linkage::Local, false, false)
-            .map_err(|e| CodegenError::new(format!("CSR col_indices declare: {e}")))?;
-        let mut ci_desc = DataDescription::new();
-        ci_desc.define(ci_bytes.into_boxed_slice());
-        self.module
-            .define_data(ci_data_id, &ci_desc)
-            .map_err(|e| CodegenError::new(format!("CSR col_indices define: {e}")))?;
-
-        // values: raw bytes (f32)
-        let val_name = format!("{}_values", sym_prefix);
-        let val_data_id = self
-            .module
-            .declare_data(&val_name, Linkage::Local, false, false)
-            .map_err(|e| CodegenError::new(format!("CSR values declare: {e}")))?;
-        let mut val_desc = DataDescription::new();
-        val_desc.define(csr.values.clone().into_boxed_slice());
-        self.module
-            .define_data(val_data_id, &val_desc)
-            .map_err(|e| CodegenError::new(format!("CSR values define: {e}")))?;
-
-        // Get .rodata pointers as Cranelift Values
-        let rp_ref = self.module.declare_data_in_func(rp_data_id, builder.func);
-        let rp_ptr = builder.ins().symbol_value(cl_types::I64, rp_ref);
-
-        let ci_ref = self.module.declare_data_in_func(ci_data_id, builder.func);
-        let ci_ptr = builder.ins().symbol_value(cl_types::I64, ci_ref);
-
-        let val_ref = self.module.declare_data_in_func(val_data_id, builder.func);
-        let val_ptr = builder.ins().symbol_value(cl_types::I64, val_ref);
-
-        // Emit constants for dimensions
-        let nrows_val = builder.ins().iconst(cl_types::I64, csr.nrows as i64);
-        let ncols_val = builder.ins().iconst(cl_types::I64, csr.ncols as i64);
-        let nnz_val = builder.ins().iconst(cl_types::I64, csr.nnz as i64);
-
-        // Call nsl_sparse_matmul(row_ptrs, col_indices, values, B, nrows, ncols, nnz)
-        let result = self.compile_call_by_name(
-            builder,
-            "nsl_sparse_matmul",
-            &[rp_ptr, ci_ptr, val_ptr, lhs, nrows_val, ncols_val, nnz_val],
-        )?;
-
-        Ok(Some(result))
     }
 
     /// Annotate sparsity hints when one operand is a known sparse weight.
     /// Stores a `SparsityHint` keyed by the Cranelift Value's u32 index (cast to NodeId)
     /// so that downstream passes can inspect per-matmul sparsity decisions.
+    ///
+    /// The hint is a record and nothing more: the matmul is the dense one
+    /// whatever it says. A CSR matmul used to be emitted here for a 2-D
+    /// weight at or above the sparse threshold (`try_sparse_matmul`,
+    /// `nsl_sparse_matmul`); it aborted on the CPU and computed `W @ x` from
+    /// host pointers on the GPU, was withheld behind an environment variable,
+    /// and has been removed.
     fn annotate_sparsity_hints(&mut self, state: &FuncState, lhs: Value, rhs: Value, op: BinOp) {
         use crate::weight_aware::SparsityHint;
         use nsl_ast::NodeId;
@@ -3250,7 +3081,7 @@ impl Compiler<'_> {
                 if info.use_sparse_kernel {
                     if let Some(ref csr) = info.csr {
                         nsl_log::nsl_log!(INFO, "nsl", 
-                            "[nsl] M52b: weight '{}' is {:.1}% sparse ({} nnz / {} total) — sparse kernel eligible",
+                            "[nsl] M52b: weight '{}' is {:.1}% sparse ({} nnz / {} total), at or above the sparse threshold; its matmul is dense",
                             key, info.near_zero_fraction * 100.0, csr.nnz, entry.num_elements
                         );
                         SparsityHint::Sparse {
@@ -3284,7 +3115,7 @@ impl Compiler<'_> {
                 if info.use_sparse_kernel {
                     if let Some(ref csr) = info.csr {
                         nsl_log::nsl_log!(INFO, "nsl", 
-                            "[nsl] M52b: weight '{}' is {:.1}% sparse ({} nnz / {} total) — sparse kernel eligible",
+                            "[nsl] M52b: weight '{}' is {:.1}% sparse ({} nnz / {} total), at or above the sparse threshold; its matmul is dense",
                             key, info.near_zero_fraction * 100.0, csr.nnz, entry.num_elements
                         );
                         SparsityHint::Sparse {
@@ -3312,9 +3143,13 @@ impl Compiler<'_> {
     /// M52d: Scaling constant fusion — when a scalar operand is a known weight scale,
     /// replace the runtime value with a compile-time constant embedded in the code.
     /// Returns (Some(constant_value), true) if fused, (None, false) otherwise.
+    ///
+    /// The operand here is a scalar field of a model that shares its name
+    /// with a tensor of the weights file. `-w` loads the file into tensor
+    /// fields only, so the program does not run with the file's value for
+    /// it, and the fusion is refused (with the reason, once).
     fn try_fuse_weight_scale(
-        &self,
-        builder: &mut FunctionBuilder,
+        &mut self,
         state: &FuncState,
         scalar_val: Value,
         op: BinOp,
@@ -3322,40 +3157,26 @@ impl Compiler<'_> {
         if op != BinOp::Mul {
             return (None, false);
         }
-
-        // Check if the scalar comes from a known weight (e.g., scale tensor loaded from safetensors)
-        if let Some(key) = state.weight_values.get(&scalar_val)
-            && let Some(&scale) = self.memory.weight_scales.get(key)
-        {
-            nsl_log::nsl_log!(INFO, "nsl", 
-                "[nsl] M52d: fused scaling constant {:.6e} for weight '{}'",
-                scale, key
-            );
-            let const_val = builder.ins().f64const(scale as f64);
-            return (Some(const_val), true);
-        }
-
-        // Also check: if the scalar is from a weight entry that IS a scale factor
-        // (common pattern: model has a `scale` field that's a single-element tensor)
-        if let Some(key) = state.weight_values.get(&scalar_val)
-            && let Some(ref wmap) = self.features.weight_map
-            && let Some(entry) = wmap.get(key)
-        {
-            // Single-element weight used as a scalar multiplier → embed as constant
-            if entry.num_elements == 1 {
-                let bw = entry.dtype.byte_width();
-                if bw <= entry.data.len() {
-                    let val = entry.dtype.to_f64(&entry.data[0..bw]);
-                    nsl_log::nsl_log!(INFO, "nsl", 
-                        "[nsl] M52d: fused single-element weight '{}' = {:.6e} as compile-time constant",
-                        key, val
-                    );
-                    let const_val = builder.ins().f64const(val);
-                    return (Some(const_val), true);
-                }
+        if let Some(key) = state.weight_values.get(&scalar_val).cloned() {
+            let fusible = self.memory.weight_scales.contains_key(&key)
+                || self
+                    .features
+                    .weight_map
+                    .as_ref()
+                    .and_then(|w| w.get(&key))
+                    .is_some_and(|e| e.num_elements == 1);
+            if fusible
+                && self.features.weight_notes.insert(format!("scale fusion\u{0}{key}"))
+            {
+                nsl_log::nsl_log!(
+                    INFO,
+                    "nsl",
+                    "[nsl] weight-aware: not specialized on '{key}' (scaling-constant fusion \
+                     skipped): the field is a scalar, and only tensor fields are loaded from \
+                     the weights file"
+                );
             }
         }
-
         (None, false)
     }
 }

@@ -276,6 +276,62 @@ fn dequantize_val(q: u8, scale: f32, zp: u8) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
+// Reading a tensor the way a quantizer must
+// ---------------------------------------------------------------------------
+
+/// The elements of a tensor in logical (row-major) order, read on the host.
+///
+/// Every quantizer entry point (`nsl_qtensor_quantize`, `nsl_awq_quantize`,
+/// `nsl_gptq_quantize`, ...) sees its weight through this and nothing else,
+/// because each of them used to get the same two things wrong:
+///
+/// - **A strided view was read in storage order.** `w.transpose(0, 1)` shares
+///   its parent's buffer and differs only in strides, so reading elements
+///   `0..len` returned the parent's layout under the view's shape: a
+///   transposed 3x2 field quantized to a different matrix, and `x @ w` came
+///   back as `[-1.49, 1.49]` where the model gives `[-4.5, 4.5]`.
+/// - **The device was never looked at.** A tensor on a CUDA device holds a
+///   device address in `data`; reading it as host memory is a wild read. It
+///   is staged to the host here (`nsl_tensor_to_device` materializes a view
+///   on the way).
+pub(crate) fn logical_values_f64(tensor_ptr: i64) -> Vec<f64> {
+    let t = NslTensor::from_ptr_ref(tensor_ptr);
+    if t.device != 0 {
+        let staged = crate::tensor::nsl_tensor_to_device(tensor_ptr, 0);
+        let values = logical_values_f64(staged);
+        crate::tensor::nsl_tensor_free(staged);
+        return values;
+    }
+
+    let len = t.len as usize;
+    if t.strides_are_row_major() {
+        return (0..len).map(|i| t.read_scalar_as_f64(i)).collect();
+    }
+
+    // Walk the coordinates in row-major order, keeping the storage offset
+    // of the current element up to date as the odometer turns.
+    let ndim = t.ndim as usize;
+    let shape: Vec<usize> = (0..ndim).map(|d| unsafe { *t.shape.add(d) } as usize).collect();
+    let strides: Vec<isize> = (0..ndim).map(|d| unsafe { *t.strides.add(d) } as isize).collect();
+    let mut coord = vec![0usize; ndim];
+    let mut offset: isize = 0;
+    let mut values = Vec::with_capacity(len);
+    for _ in 0..len {
+        values.push(t.read_scalar_as_f64(offset as usize));
+        for d in (0..ndim).rev() {
+            coord[d] += 1;
+            offset += strides[d];
+            if coord[d] < shape[d] {
+                break;
+            }
+            offset -= strides[d] * shape[d] as isize;
+            coord[d] = 0;
+        }
+    }
+    values
+}
+
+// ---------------------------------------------------------------------------
 // nsl_qtensor_quantize — weight-only RTN quantization
 // ---------------------------------------------------------------------------
 
@@ -301,6 +357,18 @@ pub extern "C" fn nsl_qtensor_quantize(
     let ndim = tensor.ndim;
     let total = tensor.len as usize;
 
+    // The axis indexes the shape below; an axis outside the tensor's rank
+    // read whatever followed the shape array.
+    if let Some(msg) = granularity_axis_error(granularity, ndim, gran_axis) {
+        crate::fatal::die(crate::fatal::Fatal::ShapeMismatch, &msg);
+    }
+    if granularity == GRAN_PER_GROUP && group_size <= 0 {
+        crate::fatal::die(
+            crate::fatal::Fatal::ShapeMismatch,
+            &format!("quantize: per-group quantization needs a positive group size (got {group_size})"),
+        );
+    }
+
     let qt = alloc_qtensor(tensor.shape, ndim, dtype, granularity, gran_axis, group_size);
     let qt_ref = unsafe { &mut *qt };
 
@@ -310,9 +378,10 @@ pub extern "C" fn nsl_qtensor_quantize(
         _ => { crate::nsl_log!(WARN, "nsl", "nsl: unknown quantization dtype {}", dtype); std::process::abort(); }
     };
 
-    // Read all source data into a Vec for easier slicing
-    // f32 or f64 (it read f64 only, so a default f32 tensor aborted).
-    let src: Vec<f64> = (0..total).map(|i| tensor.read_scalar_as_f64(i)).collect();
+    // Every index below is a row-major index into the tensor's SHAPE, so the
+    // values have to be in that order: `logical_values_f64` reads a strided
+    // view through its strides and stages a device tensor to the host.
+    let src: Vec<f64> = logical_values_f64(tensor_ptr);
 
     match granularity {
         GRAN_PER_TENSOR => {
@@ -655,6 +724,38 @@ pub extern "C" fn nsl_qtensor_shape(qtensor_ptr: i64) -> i64 {
     Box::into_raw(out) as i64
 }
 
+/// The refusal for a per-channel or per-group request whose axis the tensor
+/// does not have. A 0-D tensor has no axis at all: its shape array is empty,
+/// so any axis would read past it.
+fn granularity_axis_error(granularity: i64, ndim: i64, axis: i64) -> Option<String> {
+    if granularity == GRAN_PER_TENSOR || (axis >= 0 && axis < ndim) {
+        return None;
+    }
+    Some(format!("quantize: axis {axis} is out of range for a {ndim}-D tensor"))
+}
+
+#[cfg(test)]
+mod granularity_axis_tests {
+    use super::*;
+
+    #[test]
+    fn a_scalar_has_no_axis_to_quantize_along() {
+        for gran in [GRAN_PER_CHANNEL, GRAN_PER_GROUP] {
+            let msg = granularity_axis_error(gran, 0, 0).expect("a 0-D tensor has no axis 0");
+            assert!(msg.contains("axis 0 is out of range for a 0-D tensor"), "{msg}");
+        }
+        assert_eq!(granularity_axis_error(GRAN_PER_TENSOR, 0, 0), None);
+    }
+
+    #[test]
+    fn the_axis_must_lie_inside_the_rank() {
+        assert_eq!(granularity_axis_error(GRAN_PER_CHANNEL, 2, 0), None);
+        assert_eq!(granularity_axis_error(GRAN_PER_CHANNEL, 2, 1), None);
+        assert!(granularity_axis_error(GRAN_PER_CHANNEL, 2, 2).is_some());
+        assert!(granularity_axis_error(GRAN_PER_GROUP, 2, -1).is_some());
+    }
+}
+
 #[cfg(test)]
 mod scale_zero_point_tests {
     use super::{compute_scale_zp, dequantize_val, quantize_val};
@@ -705,5 +806,78 @@ mod scale_zero_point_tests {
             let (worst, scale) = worst_error(&values, 0.0, 255.0);
             assert!(worst <= 0.5 * scale * 1.0001 + 1e-9, "constant {constant}: error {worst}");
         }
+    }
+}
+
+#[cfg(test)]
+mod logical_order_tests {
+    use super::*;
+
+    fn f32_tensor(shape: &[i64], vals: &[f32]) -> i64 {
+        let ptr = crate::cpu::create_tensor_with_shape_rs_dtype(shape, crate::tensor::DTYPE_F32);
+        let t = NslTensor::from_ptr(ptr);
+        for (i, v) in vals.iter().enumerate() {
+            unsafe { *t.data_f32().add(i) = *v };
+        }
+        ptr
+    }
+
+    fn host_f32(ptr: i64) -> Vec<f32> {
+        let t = NslTensor::from_ptr(ptr);
+        (0..t.len as usize).map(|i| unsafe { *t.data_f32().add(i) }).collect()
+    }
+
+    /// A transposed 2x3 tensor is a 3x2 view over the same six floats. Its
+    /// rows, written out by hand, are what a quantizer has to see; it used
+    /// to see the parent's rows under the view's shape.
+    #[test]
+    fn a_transposed_view_is_read_through_its_strides() {
+        let base = f32_tensor(&[2, 3], &[-2.5, -1.5, -0.5, 0.5, 1.5, 2.5]);
+        let view = crate::tensor::shape_ops::nsl_tensor_transpose(base, 0, 1);
+        assert!(!NslTensor::from_ptr(view).strides_are_row_major(), "fixture must be a strided view");
+        assert_eq!(logical_values_f64(view), vec![-2.5, 0.5, -1.5, 1.5, -0.5, 2.5]);
+        crate::tensor::nsl_tensor_free(view);
+        crate::tensor::nsl_tensor_free(base);
+    }
+
+    /// The round trip of a strided view must land on the VIEW's values, each
+    /// within half a quantization step. The step for [-2.5, 2.5] at int8 is
+    /// 5/255; the storage-order read was off by 2.0 on four of six elements.
+    #[test]
+    fn quantizing_a_transposed_view_round_trips_the_view() {
+        let base = f32_tensor(&[2, 3], &[-2.5, -1.5, -0.5, 0.5, 1.5, 2.5]);
+        let view = crate::tensor::shape_ops::nsl_tensor_transpose(base, 0, 1);
+        let expected = [-2.5_f32, 0.5, -1.5, 1.5, -0.5, 2.5];
+        let half_step = 0.5 * 5.0 / 255.0;
+        for (dtype, tol) in [(DTYPE_INT8, half_step), (DTYPE_INT4, 0.5 * 5.0 / 15.0)] {
+            for (gran, axis, gs) in [(GRAN_PER_TENSOR, 0, 0), (GRAN_PER_CHANNEL, 1, 0), (GRAN_PER_GROUP, 0, 2)] {
+                let q = nsl_qtensor_quantize(view, dtype, gran, axis, gs);
+                let d = nsl_qtensor_dequantize(q);
+                let got = host_f32(d);
+                assert_eq!(unsafe { *NslTensor::from_ptr(d).shape }, 3, "shape is the view's");
+                for (i, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
+                    assert!(
+                        (g - e).abs() <= tol * 1.001,
+                        "dtype {dtype} gran {gran}: element {i} is {g}, the view holds {e}"
+                    );
+                }
+                nsl_qtensor_release(q);
+                crate::tensor::nsl_tensor_free(d);
+            }
+        }
+        crate::tensor::nsl_tensor_free(view);
+        crate::tensor::nsl_tensor_free(base);
+    }
+
+    /// A stepped view of a 1-D tensor: rank 1, stride 2.
+    #[test]
+    fn a_column_of_a_matrix_is_read_with_its_stride() {
+        let base = f32_tensor(&[3, 2], &[1.0, 10.0, 2.0, 20.0, 3.0, 30.0]);
+        let t = crate::tensor::shape_ops::nsl_tensor_transpose(base, 0, 1);
+        let row = crate::tensor::shape_ops::nsl_tensor_slice(t, 0, 1, 2);
+        assert_eq!(logical_values_f64(row), vec![10.0, 20.0, 30.0]);
+        crate::tensor::nsl_tensor_free(row);
+        crate::tensor::nsl_tensor_free(t);
+        crate::tensor::nsl_tensor_free(base);
     }
 }

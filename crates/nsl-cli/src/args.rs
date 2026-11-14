@@ -408,11 +408,14 @@ pub(crate) struct CheckArgs {
         #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "text")]
         pub(crate) training_report: Option<TrainingReportFormat>,
 
-        /// CEP: run hardware-aware architecture search.
+        /// CEP: rank the architectures the @search axes span, by the
+        /// @cep_search objective, on an analytic cost estimate. Fails when
+        /// no candidate meets the constraints.
         #[arg(long)]
         pub(crate) cep_search: bool,
-        /// CEP: print a bare CompilationProfile for the model (paper §7.1
-        /// differentiator — equivalent of PyTorch's missing 'nsl check --perf').
+        /// CEP: print an analytic cost estimate for the model (parameters,
+        /// FLOPs, memory traffic, roofline latency of one forward pass).
+        /// Nothing is compiled or measured.
         #[arg(long)]
         pub(crate) cep_profile: bool,
         /// CEP: target GPU for analysis (e.g. H100-SXM).
@@ -443,14 +446,15 @@ pub(crate) struct CheckArgs {
         pub(crate) wrga_analyze: Option<PathBuf>,
 
         /// WRGA paper §8.3: target GPU for the WRGA roofline analysis (e.g.
-        /// "H100-SXM", "A100-PCIe", "RTX-4090"). Overrides any `target=` set
+        /// "H100-SXM", "A100-PCIe", "rtx4090"). Overrides any `target=` set
         /// on `@wrga(...)` decorators. Looked up in the codegen GPU spec
-        /// database; empty / unknown falls back to the database default.
+        /// database; a name it does not have is an error.
         #[arg(long)]
         pub(crate) wrga_target: Option<String>,
 
-        /// WRGA paper §8.3: emit a structural PEFT comparison report (WRGA vs.
-        /// LoRA / AdaLoRA / GaLore / ReFT) without running codegen output.
+        /// WRGA paper §8.3: emit a comparison of adapter parameter counts (this
+        /// plan vs. LoRA at rank 16, GaLore and ReFT on the same sites) without
+        /// running codegen output.
         /// Pass without value (or `-`) for stdout; provide a path to write to
         /// a file. Mutually exclusive with `--wrga-analyze`. Requires `@wrga`
         /// decorators in the source.
@@ -551,7 +555,11 @@ pub(crate) struct BuildArgs {
         #[arg(long)]
         pub(crate) standalone: bool,
 
-        /// Path to the model weights file to bundle with the standalone executable
+        /// Path to the model's weights file (.safetensors). The built program
+        /// loads it into the model when it starts (every parameter the file
+        /// names), and may be specialized on the values of parameters it never
+        /// writes; it then refuses to start if those tensors have changed.
+        /// With --standalone the file is bundled into the executable instead
         #[arg(short = 'w', long)]
         pub(crate) weights: Option<PathBuf>,
 
@@ -703,9 +711,12 @@ pub(crate) struct BuildArgs {
         #[arg(long)]
         pub(crate) seed: Option<u64>,
 
-        /// M52: Dead weight threshold (default: 1e-6). Weights with |value| < threshold are zeroed.
-        #[arg(long, default_value_t = 1e-6)]
-        pub(crate) dead_weight_threshold: f64,
+        /// M52: Dead weight threshold (default: 1e-6). Weights with |value| < threshold are
+        /// zeroed in the compiler's copy, and a weight within it of the identity counts as the
+        /// identity. With -w, rewrites that depend on weight values use the file's exact values
+        /// unless this is given
+        #[arg(long)]
+        pub(crate) dead_weight_threshold: Option<f64>,
 
         /// M52: Sparsity threshold (default: 0.5). Matrices with near-zero fraction >= threshold get sparse annotation.
         #[arg(long, default_value_t = 0.5)]
@@ -824,8 +835,8 @@ pub(crate) struct BuildArgs {
         /// from O(layers x interiors) to O(layers x boundaries + one
         /// block's interiors). Bit-exact — the recompute replays the same
         /// kernels in the same order on the same inputs (dropout results
-        /// are never replayed; they stay saved). No-op with a stderr note
-        /// on models without `blocks.N`-style structure.
+        /// and random draws are never replayed; they stay saved). The build
+        /// fails on a model without `blocks.N`-style structure.
         #[arg(long)]
         pub(crate) checkpoint_blocks: bool,
 
@@ -835,11 +846,16 @@ pub(crate) struct BuildArgs {
         #[arg(long, requires = "checkpoint_blocks")]
         pub(crate) checkpoint_selective: bool,
 
-        /// With --checkpoint-blocks: allowed SAVED-interior activation
-        /// budget in MiB. The CCR knapsack flips the most
-        /// expensive-to-recompute tensors back to SAVE within the budget.
-        /// Under FASE Deferred the freed-gradient-buffer credit (C-01) is
-        /// added automatically when parameter sizes are statically known.
+        /// With --checkpoint-blocks: a budget in MiB, used once. At a fixed
+        /// --checkpoint-stride it is the bytes of block interiors that may
+        /// stay SAVED: a knapsack flips the tensors that cost most to
+        /// recompute (an operation count from their shapes) back to SAVE
+        /// within it. Under --checkpoint-stride auto|dp it is instead the
+        /// cap on the projected block-activation peak the search honours.
+        /// It is the number given; nothing is added to it. Needs static
+        /// tensor sizes (literal shapes, or a DataLoader with literal
+        /// batch_size and seq_len and drop_last=true): the build fails when
+        /// no recomputed tensor has one.
         #[arg(long, requires = "checkpoint_blocks")]
         pub(crate) checkpoint_budget_mib: Option<u64>,
 
@@ -848,16 +864,27 @@ pub(crate) struct BuildArgs {
         /// one CCR super-segment — saving only every N-th block boundary and
         /// recomputing the N-block span, for a ~N x smaller saved-boundary
         /// surface (the activation surface CSLA buffers across the accumulation
-        /// window). `auto` searches strides against --checkpoint-budget-mib and
-        /// picks the smallest projected activation peak that fits. `1` (default)
-        /// = classic per-block. Bit-exact at any stride.
-        /// `N` coalesces every N block anchors; `auto` searches uniform
-        /// strides against the projected activation peak; `dp` (P5 item 21)
-        /// runs the non-uniform partition DP — minimum GpuSpec-calibrated
-        /// recompute time subject to --checkpoint-budget-mib, with the CSLA
-        /// window applied, fusion-aware launch costs and a conservative
-        /// prefetch-overlap credit. Any choice is bit-exact.
-        #[arg(long, requires = "checkpoint_blocks", default_value = "1")]
+        /// window). `1` (default) = classic per-block. `auto` searches uniform
+        /// strides: the smallest stride whose projected peak fits
+        /// --checkpoint-budget-mib, or the smallest projected peak when no
+        /// budget is given or none fits. `dp` (P5 item 21) runs the
+        /// non-uniform partition DP — minimum estimated recompute time
+        /// subject to --checkpoint-budget-mib (smallest projected peak
+        /// without one), with the CSLA window applied. Its time estimate is
+        /// a launch count times the local GPU's database constants, not a
+        /// measurement. The projected peak counts the tensors computed
+        /// inside the blocks only, not the rest of the step or the
+        /// backward's temporaries. `auto` and `dp` need a static size for
+        /// every tensor computed inside the blocks (from literal shapes, or
+        /// from a DataLoader with literal batch_size and seq_len and
+        /// drop_last=true) and fail the build otherwise. Any choice is
+        /// bit-exact.
+        #[arg(
+            long,
+            requires = "checkpoint_blocks",
+            default_value = "1",
+            value_parser = crate::meta_flags::checkpoint_stride_arg
+        )]
         pub(crate) checkpoint_stride: String,
 
         /// Item 9 + P5 item 20: lower the source-AD RMSNorm input gradient
@@ -901,11 +928,14 @@ pub(crate) struct BuildArgs {
         )]
         pub(crate) fuse_wgrad_accum: bool,
 
-        /// With --checkpoint-selective: compress the saved matmul-class
-        /// activations to half precision between forward and backward
-        /// (fp16 or bf16). Not bit-exact — backward reads rounded
-        /// activations; validate loss parity at the 3-4 dp standard.
-        #[arg(long, requires = "checkpoint_selective", value_parser = ["fp16", "bf16"])]
+        /// With --checkpoint-selective: store the saved matmul-class
+        /// activations as bf16, each cast at the end of its block segment
+        /// and widened back before the backward reads it. Not bit-exact —
+        /// backward reads rounded activations; validate loss parity at the
+        /// 3-4 dp standard. `bf16` is the only format: IEEE half precision
+        /// (fp16) was withdrawn because it overflows above 65504 with no
+        /// range check and turned the loss into NaN.
+        #[arg(long, requires = "checkpoint_selective", value_parser = ["bf16"])]
         pub(crate) checkpoint_compress: Option<String>,
 
         /// CSLA Stage-2 (docs/research/CSLA paper §7): window-buffered
@@ -1077,6 +1107,18 @@ pub(crate) struct BuildArgs {
         #[arg(long, default_value_t = false)]
         pub(crate) cpdt_report: bool,
 
+        /// CPDT: memory available on each GPU, in GiB, for the ZeRO planner's
+        /// fit test (default 80).
+        #[arg(long, value_name = "GIB", default_value_t = 80.0)]
+        pub(crate) cpdt_memory_budget: f64,
+
+        /// CPDT: under `--cpdt full` with weights, slice out MoE experts whose
+        /// router column has norm below 0.01. Off by default: a near-zero
+        /// column does not show an expert is unused, so this can change the
+        /// model's output.
+        #[arg(long, default_value_t = false)]
+        pub(crate) cpdt_prune_experts: bool,
+
         /// CFIE: compiler-fused inference-engine mode ("full",
         /// "sampling", or "off").  Passing `--cfie` without a value
         /// enables full mode.  Overrides the serve block's `@cfie`
@@ -1116,10 +1158,14 @@ pub(crate) struct BuildArgs {
         #[arg(long, value_name = "SECONDS")]
         pub(crate) calibration_timeout: Option<u64>,
 
-        /// CEP: run compilation-verified pruning (requires --weights).
+        /// CEP: plan a structured prune of attention heads and FFN width
+        /// from weight magnitudes (requires --weights, .nslm or
+        /// .safetensors). Prints a report and writes the delta; builds no
+        /// binary. Fails, writing nothing, when the sparsity target or a
+        /// constraint cannot be met.
         #[arg(long)]
         pub(crate) cep_prune: bool,
-        /// CEP Mode 3 (paper §2.2): run joint prune-search (heads + FFN + layer drops).
+        /// CEP: as --cep-prune, and whole layers may be dropped as well.
         /// Requires --weights. Mutually exclusive with --cep-prune.
         #[arg(long)]
         pub(crate) cep_joint: bool,
@@ -1132,10 +1178,14 @@ pub(crate) struct BuildArgs {
         /// CEP: write the delta JSON here (default: <model>.cep.json).
         #[arg(long)]
         pub(crate) cep_out: Option<PathBuf>,
-        /// CEP: also emit the pruned (sliced) weights to this .safetensors path.
+        /// CEP: also write the pruned (sliced) weights here. A .nslm path
+        /// (which `model_load` reads) needs --weights to be .nslm too;
+        /// any other path is written as .safetensors.
         #[arg(long)]
         pub(crate) cep_emit_weights: Option<PathBuf>,
-        /// CEP SP2: also emit the rewritten NSL source with pruned dims to this path.
+        /// CEP: also write the NSL source with the pruned dimensions here.
+        /// The plan is then kept uniform across layers, and `preserve` is
+        /// refused, because the source has one block constructor.
         #[arg(long)]
         pub(crate) cep_emit_source: Option<PathBuf>,
 
@@ -1371,6 +1421,18 @@ pub(crate) struct RunArgs {
         #[arg(long, default_value_t = false)]
         pub(crate) cpdt_report: bool,
 
+        /// CPDT: memory available on each GPU, in GiB, for the ZeRO planner's
+        /// fit test (default 80).
+        #[arg(long, value_name = "GIB", default_value_t = 80.0)]
+        pub(crate) cpdt_memory_budget: f64,
+
+        /// CPDT: under `--cpdt full` with weights, slice out MoE experts whose
+        /// router column has norm below 0.01. Off by default: a near-zero
+        /// column does not show an expert is unused, so this can change the
+        /// model's output.
+        #[arg(long, default_value_t = false)]
+        pub(crate) cpdt_prune_experts: bool,
+
         /// WGGO: global-optimization mode ("full", "greedy", "off", or "auto").
         /// Passing `--wggo` without a value enables full mode. Mirrors
         /// `nsl build --wggo` so the WGGO mode-table dispatch reaches
@@ -1460,8 +1522,8 @@ pub(crate) struct RunArgs {
         /// from O(layers x interiors) to O(layers x boundaries + one
         /// block's interiors). Bit-exact — the recompute replays the same
         /// kernels in the same order on the same inputs (dropout results
-        /// are never replayed; they stay saved). No-op with a stderr note
-        /// on models without `blocks.N`-style structure.
+        /// and random draws are never replayed; they stay saved). The build
+        /// fails on a model without `blocks.N`-style structure.
         #[arg(long)]
         pub(crate) checkpoint_blocks: bool,
 
@@ -1471,11 +1533,16 @@ pub(crate) struct RunArgs {
         #[arg(long, requires = "checkpoint_blocks")]
         pub(crate) checkpoint_selective: bool,
 
-        /// With --checkpoint-blocks: allowed SAVED-interior activation
-        /// budget in MiB. The CCR knapsack flips the most
-        /// expensive-to-recompute tensors back to SAVE within the budget.
-        /// Under FASE Deferred the freed-gradient-buffer credit (C-01) is
-        /// added automatically when parameter sizes are statically known.
+        /// With --checkpoint-blocks: a budget in MiB, used once. At a fixed
+        /// --checkpoint-stride it is the bytes of block interiors that may
+        /// stay SAVED: a knapsack flips the tensors that cost most to
+        /// recompute (an operation count from their shapes) back to SAVE
+        /// within it. Under --checkpoint-stride auto|dp it is instead the
+        /// cap on the projected block-activation peak the search honours.
+        /// It is the number given; nothing is added to it. Needs static
+        /// tensor sizes (literal shapes, or a DataLoader with literal
+        /// batch_size and seq_len and drop_last=true): the build fails when
+        /// no recomputed tensor has one.
         #[arg(long, requires = "checkpoint_blocks")]
         pub(crate) checkpoint_budget_mib: Option<u64>,
 
@@ -1484,16 +1551,27 @@ pub(crate) struct RunArgs {
         /// one CCR super-segment — saving only every N-th block boundary and
         /// recomputing the N-block span, for a ~N x smaller saved-boundary
         /// surface (the activation surface CSLA buffers across the accumulation
-        /// window). `auto` searches strides against --checkpoint-budget-mib and
-        /// picks the smallest projected activation peak that fits. `1` (default)
-        /// = classic per-block. Bit-exact at any stride.
-        /// `N` coalesces every N block anchors; `auto` searches uniform
-        /// strides against the projected activation peak; `dp` (P5 item 21)
-        /// runs the non-uniform partition DP — minimum GpuSpec-calibrated
-        /// recompute time subject to --checkpoint-budget-mib, with the CSLA
-        /// window applied, fusion-aware launch costs and a conservative
-        /// prefetch-overlap credit. Any choice is bit-exact.
-        #[arg(long, requires = "checkpoint_blocks", default_value = "1")]
+        /// window). `1` (default) = classic per-block. `auto` searches uniform
+        /// strides: the smallest stride whose projected peak fits
+        /// --checkpoint-budget-mib, or the smallest projected peak when no
+        /// budget is given or none fits. `dp` (P5 item 21) runs the
+        /// non-uniform partition DP — minimum estimated recompute time
+        /// subject to --checkpoint-budget-mib (smallest projected peak
+        /// without one), with the CSLA window applied. Its time estimate is
+        /// a launch count times the local GPU's database constants, not a
+        /// measurement. The projected peak counts the tensors computed
+        /// inside the blocks only, not the rest of the step or the
+        /// backward's temporaries. `auto` and `dp` need a static size for
+        /// every tensor computed inside the blocks (from literal shapes, or
+        /// from a DataLoader with literal batch_size and seq_len and
+        /// drop_last=true) and fail the build otherwise. Any choice is
+        /// bit-exact.
+        #[arg(
+            long,
+            requires = "checkpoint_blocks",
+            default_value = "1",
+            value_parser = crate::meta_flags::checkpoint_stride_arg
+        )]
         pub(crate) checkpoint_stride: String,
 
         /// Item 9 + P5 item 20: lower the source-AD RMSNorm input gradient
@@ -1537,11 +1615,14 @@ pub(crate) struct RunArgs {
         )]
         pub(crate) fuse_wgrad_accum: bool,
 
-        /// With --checkpoint-selective: compress the saved matmul-class
-        /// activations to half precision between forward and backward
-        /// (fp16 or bf16). Not bit-exact — backward reads rounded
-        /// activations; validate loss parity at the 3-4 dp standard.
-        #[arg(long, requires = "checkpoint_selective", value_parser = ["fp16", "bf16"])]
+        /// With --checkpoint-selective: store the saved matmul-class
+        /// activations as bf16, each cast at the end of its block segment
+        /// and widened back before the backward reads it. Not bit-exact —
+        /// backward reads rounded activations; validate loss parity at the
+        /// 3-4 dp standard. `bf16` is the only format: IEEE half precision
+        /// (fp16) was withdrawn because it overflows above 65504 with no
+        /// range check and turned the loss into NaN.
+        #[arg(long, requires = "checkpoint_selective", value_parser = ["bf16"])]
         pub(crate) checkpoint_compress: Option<String>,
 
         /// CSLA Stage-2 (docs/research/CSLA paper §7): window-buffered
@@ -1667,8 +1748,10 @@ pub(crate) struct RunArgs {
         #[arg(long, requires = "stream_arena")]
         pub(crate) stream_async_writeback: bool,
 
-        /// Path to the model weights file (.safetensors) for the
-        /// weight-aware CPDT path. Mirrors `nsl build -w/--weights`.
+        /// Path to the model's weights file (.safetensors). The program runs
+        /// with the file's values: every parameter the file names is loaded
+        /// when its model is constructed. Also the input to the weight-aware
+        /// planners (CPDT, WRGA, CEP). Mirrors `nsl build -w/--weights`.
         #[arg(short = 'w', long)]
         pub(crate) weights: Option<PathBuf>,
 

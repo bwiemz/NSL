@@ -172,7 +172,11 @@ pub fn position_criticality(layer: Option<u32>, n_layers: u32, alpha: f64) -> f6
     }
     let l = l as i64;
     let big_l = n_layers as i64;
-    debug_assert!(l >= 0 && l < big_l);
+    // A layer index at or past the count is not a programming error: the
+    // index comes from a name in the user's weights file, which may name a
+    // block this model does not have. Such a tensor joins no parameter and
+    // its tier is never used; it is scored as an interior layer. (This was
+    // a `debug_assert!`, which aborted a debug build on such a file.)
     if l == 0 || l == big_l - 1 {
         return 2.0;
     }
@@ -216,15 +220,21 @@ pub fn classify_layer_kind(name: &str, layer: Option<u32>, n_layers: u32) -> Lay
     LayerKind::Generic
 }
 
+/// The block index a parameter name carries: the `N` of `blocks.N.`,
+/// `layers.N.` or `h.N.`, at the start of the name or after a dot (a
+/// weights file may spell its keys with a leading container, as in
+/// `model.blocks.3.w`, and the model's own paths carry the model variable,
+/// as in `m.blocks.3.w`). Start-anchored matching alone read every such
+/// name as belonging to no block.
 pub fn layer_of(name: &str) -> Option<u32> {
-    for prefix in ["blocks.", "layers.", "h."] {
-        if let Some(rest) = name.strip_prefix(prefix)
-            && let Some(end) = rest.find('.')
-        {
-            return rest[..end].parse::<u32>().ok();
-        }
-    }
-    None
+    let prefix = crate::wggo_graph::layer_prefix(name)?;
+    prefix.rsplit('.').next()?.parse::<u32>().ok()
+}
+
+/// Number of blocks a set of parameter names spans: one more than the
+/// highest block index any of them carries, `None` when none names a block.
+pub fn layer_count<'a>(names: impl Iterator<Item = &'a str>) -> Option<u32> {
+    names.filter_map(layer_of).max().map(|l| l + 1)
 }
 
 fn is_embedding(name: &str) -> bool {

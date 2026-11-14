@@ -24,7 +24,6 @@ use nsl_lexer::Interner;
 use serde::Serialize;
 
 use crate::fase::{self, FaseConfig, FaseOptimizer, FasePlan};
-use crate::fase_memory::MemorySchedule;
 use crate::pca_activation::{collect_dataset_configs, extract_dataset_ref};
 use crate::pca_detect::{DatasetPackingConfig, PcaDetection, PcaDetectConfig};
 
@@ -68,7 +67,6 @@ impl BlockKind {
 #[derive(Debug, Clone, Serialize)]
 pub struct FaseSection {
     pub plan: FasePlan,
-    pub memory: Option<MemorySchedule>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -94,9 +92,8 @@ pub struct PcaSection {
 ///
 /// **Scope note (Task 3):** `model_name` extraction, dataset-block packing
 /// config, and `data: source = <ident>` resolution are all implemented.
-/// `MemorySchedule` (`FaseSection::memory`) is always `None` because it
-/// requires a `ModelFootprint` that cannot be cheaply derived from the AST
-/// without running semantic analysis; this is deferred to a later task.
+/// The report carries no memory figures: accumulation with a fused step
+/// holds the same buffers as ordinary in-place accumulation.
 pub fn build_report(ast: &nsl_ast::Module, interner: &Interner, source_path: &std::path::Path) -> TrainingReport {
     // Item 2 step 2: this is a real pass driver — it produces the report BY
     // running the FASE and PCA planners — but it is not the compile pipeline.
@@ -174,10 +171,6 @@ fn build_block_report(
     let fase_config = extract_fase_config(train, interner);
     let plan = fase::plan(&fase_config);
 
-    // MemorySchedule requires a ModelFootprint derivable only from semantic
-    // analysis — always None at the AST-walk stage.
-    let memory = None;
-
     let pca = extract_dataset_ref(train, interner)
         .and_then(|ds| datasets.get(&ds))
         .filter(|cfg| cfg.enabled)
@@ -189,7 +182,7 @@ fn build_block_report(
     TrainBlockReport {
         kind,
         model_name,
-        fase: FaseSection { plan, memory },
+        fase: FaseSection { plan },
         pca,
     }
 }
@@ -311,31 +304,6 @@ fn render_fase_section(f: &mut std::fmt::Formatter<'_>, sec: &FaseSection) -> st
         format_phases(&sec.plan.backward_phases)
     )?;
     writeln!(f, "    two_phase_clip:    {}", sec.plan.two_phase_clip)?;
-    if let Some(mem) = &sec.memory {
-        writeln!(f, "    memory:")?;
-        writeln!(
-            f,
-            "      standard peak: {} bytes",
-            format_thousands(mem.standard.peak)
-        )?;
-        writeln!(
-            f,
-            "      FASE peak:     {} bytes",
-            format_thousands(mem.fase.peak)
-        )?;
-        let savings = mem.standard.peak.saturating_sub(mem.fase.peak);
-        let pct = if mem.standard.peak > 0 {
-            (savings as f64 / mem.standard.peak as f64) * 100.0
-        } else {
-            0.0
-        };
-        writeln!(
-            f,
-            "      savings:       {} bytes ({:.1}%)",
-            format_thousands(savings),
-            pct
-        )?;
-    }
     Ok(())
 }
 
@@ -388,18 +356,6 @@ fn format_phases(phases: &[fase::BackwardPhase]) -> String {
         .join(", ")
 }
 
-fn format_thousands(n: u64) -> String {
-    let s = n.to_string();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    for (i, c) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out.chars().rev().collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,7 +375,7 @@ mod tests {
             train_blocks: vec![TrainBlockReport {
                 kind: BlockKind::Train,
                 model_name: Some("NSLCoder".to_string()),
-                fase: FaseSection { plan, memory: None },
+                fase: FaseSection { plan },
                 pca: None,
             }],
         }

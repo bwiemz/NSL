@@ -587,8 +587,9 @@ pub fn classify_recompute(op_name: &str) -> RecomputeClass {
             RecomputeClass::Moderate
         }
 
-        "matmul" | "batched_matmul" | "flash_attention" | "conv2d" | "scatter" | "gather"
-        | "sparse_matmul" => RecomputeClass::Expensive,
+        "matmul" | "batched_matmul" | "flash_attention" | "conv2d" | "scatter" | "gather" => {
+            RecomputeClass::Expensive
+        }
 
         _ => RecomputeClass::Expensive, // unknown → don't recompute
     }
@@ -754,7 +755,7 @@ pub fn matmul_access_pattern(m: u64, n: u64, tile_m: u64, tile_n: u64) -> Access
 pub enum CostConfidence {
     /// Well-characterized operation (matmul, softmax, layernorm, elementwise)
     High,
-    /// Partially modeled (custom kernel, fusion chain, sparse)
+    /// Partially modeled (custom kernel, fusion chain)
     Medium,
     /// Unknown or highly variable (user-defined kernels, dynamic shapes)
     Low,
@@ -766,7 +767,7 @@ pub fn op_confidence(op_name: &str) -> CostConfidence {
         "matmul" | "batched_matmul" | "softmax" | "layernorm" | "rmsnorm" | "elementwise"
         | "relu" | "gelu" | "sigmoid" | "add" | "mul" | "embedding" | "transpose" | "concat"
         | "reduction" => CostConfidence::High,
-        "flash_attention" | "conv2d" | "sparse_matmul" | "fused_chain" => CostConfidence::Medium,
+        "flash_attention" | "conv2d" | "fused_chain" => CostConfidence::Medium,
         _ => CostConfidence::Low,
     }
 }

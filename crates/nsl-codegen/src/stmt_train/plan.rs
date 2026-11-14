@@ -65,6 +65,10 @@ pub(crate) struct ParamPlan {
 /// Accumulation and checkpointing.
 pub(crate) struct TrainSchedule {
     pub(crate) grad_accumulation_steps: i64,
+    /// The learning-rate schedule is evaluated at the optimizer-step index,
+    /// `step_count / N`, instead of at the micro-batch count. True unless
+    /// the header says `schedule_unit = "micro_batch"`.
+    pub(crate) schedule_in_optimizer_steps: bool,
     pub(crate) checkpoint_save_path: Option<String>,
     pub(crate) checkpoint_every: i64,
 }

@@ -117,38 +117,34 @@ fn ad_rule_produces_distinct_adjoints_per_input() {
 }
 
 #[test]
-fn ad_rule_emits_reduce_sum_for_gate_not_matmul() {
-    // Broadcast-axis / reduction-axis correctness:
+fn ad_rule_reduces_the_gate_gradient_to_the_gate_s_shape() {
+    // The gate is `[N]` and the product `dy * xab * sig'` it is the gradient
+    // of has every dimension of the activation, `[B, N]` or `[B, T, N]`. The
+    // rule must sum it over all of the leading dimensions, which is what
+    // `reduce_to_shape(<product>, gate)` does.
     //
-    // The `dgate` accumulator must be formed via a `PrimalOp::Sum { dim:
-    // Some(0) }` (reduction over the batch axis), NOT a `Matmul`. This
-    // catches the two most plausible regressions:
-    //
-    //   (a) axis-swap: if `sig` is broadcast along axis 1 instead of axis 0,
-    //       the `dy * xab * sig_prime` tensor gets reduced along the wrong
-    //       axis and `dgate` ends up with shape `[B]` instead of `[N]`.
-    //   (b) matmul-for-reduction: if the AD rule emits `Matmul` instead of
-    //       `Sum` when collapsing `[B, N] -> [N]`, the gradient dimensions
-    //       don't line up and optimization silently goes through a wrong
-    //       update path.
-    //
-    // Probe: walk the adjoint ops, find one with `PrimalOp::Sum { dim:
-    // Some(0) }`, and confirm it exists. This is necessary but not
-    // sufficient — the numerical equivalence test
-    // `gatedlora_fused_backward_matches_unfused_reference` provides the
-    // sufficiency check.
+    // This test used to require a `Sum { dim: Some(0) }` in the adjoint.
+    // That sums one axis: right for a 2-D activation and wrong for a 3-D
+    // one, where it left a `[T, N]` gradient for an `[N]` gate and the
+    // optimizer step aborted. The numbers are checked against an f64
+    // reference in `nsl-cli/tests/wrga_adapter_gradients_gate.rs`; this is
+    // the structural half.
     let primal = build_fused_gatedlora_list();
     let mut generator = AdjointGenerator::new(primal.ops.len() as VarId);
     let adjoint = generator.generate(&primal);
 
-    let has_axis0_sum = adjoint
-        .ops
-        .iter()
-        .any(|op| matches!(op.op, PrimalOp::Sum { dim: Some(0) }));
+    const GATE: VarId = 4;
+    let reduced_to_gate = adjoint.ops.iter().any(|op| {
+        matches!(&op.op, PrimalOp::Passthrough(name) if name == "reduce_to_shape")
+            && op.inputs.get(1) == Some(&GATE)
+    });
     assert!(
-        has_axis0_sum,
-        "AD rule for FusedGatedLoraMatmul must emit a `Sum {{ dim: Some(0) }}` \
-         for dgate reduction; none found. Likely bugs: reduction emitted \
-         on wrong axis, or emitted as Matmul instead of Sum.",
+        reduced_to_gate,
+        "the adjoint of FusedGatedLoraMatmul must reduce the gate's gradient to the gate's \
+         shape (a `reduce_to_shape` whose target is the gate); none found",
+    );
+    assert!(
+        !adjoint.ops.iter().any(|op| matches!(op.op, PrimalOp::Sum { dim: Some(0) })),
+        "a sum over axis 0 alone is the 2-D-only reduction this rule used to emit",
     );
 }

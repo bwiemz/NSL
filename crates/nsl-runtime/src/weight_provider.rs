@@ -296,6 +296,13 @@ pub fn provider_is_set() -> bool {
 }
 
 pub fn try_load_from_provider(tensors: &crate::list::NslList) -> bool {
+    try_load_from_provider_prefix(tensors, tensors.len as usize)
+}
+
+/// [`try_load_from_provider`] for the first `count` tensors of `list` only:
+/// the base parameters of a model whose adapter tensors follow them, which
+/// the embedded weights do not hold.
+pub fn try_load_from_provider_prefix(tensors: &crate::list::NslList, count: usize) -> bool {
     let provider = match WEIGHT_PROVIDER.get() {
         Some(p) => p,
         None => return false,
@@ -303,7 +310,7 @@ pub fn try_load_from_provider(tensors: &crate::list::NslList) -> bool {
 
     let raw = provider.data.as_slice();
 
-    for i in 0..tensors.len as usize {
+    for i in 0..count.min(tensors.len as usize) {
         let tensor_ptr = unsafe { *tensors.data.add(i) };
         let tensor = crate::tensor::NslTensor::from_ptr(tensor_ptr);
         let byte_count = (tensor.len as usize) * tensor.element_size();

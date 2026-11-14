@@ -1,11 +1,17 @@
 // Frozen fixture (roadmap A2 step 9): the hand-written PTX emitter for the
 // CFIE persistent decode-block kernel, exactly as `crates/nsl-codegen/src/
 // cfie_persistent_ptx.rs` held it at 350d026c, before the kernel moved onto
-// KIR. Lines below this comment are that file's first 846 lines, unedited;
-// `cfie_persistent_kir_equivalence.rs` includes it with `#[path]`
-// (supplying the two `crate::` paths it names) and runs its output against
-// the KIR kernel's. Do not change it: it is the pre-migration behaviour the
-// equivalence claim is about.
+// KIR. Lines below this comment are that file's first 846 lines, with one
+// deliberate edit made in November 2026: the RoPE pair loop
+// (`emit_pair_loop` and its two stores) pairs element j of a head with
+// element j + head_dim/2, as the KIR kernel now does, instead of pairing
+// adjacent elements. The adjacent pairing was a defect — it is not the
+// convention NSL models or HF-Llama checkpoints use — so the fixture was
+// changed with the kernel rather than left asserting it. Everything else is
+// unedited. `cfie_persistent_kir_equivalence.rs` includes this file with
+// `#[path]` (supplying the two `crate::` paths it names) and runs its output
+// against the KIR kernel's. Do not change it otherwise: it is the
+// pre-migration behaviour the equivalence claim is about.
 //
 // Not scanned by the hand-PTX freeze: nothing under `tests/` is.
 
@@ -410,12 +416,20 @@ pub fn emit(cfg: &DecodeBlockConfig) -> (String, DecodeBlockMeta) {
         writeln!(w, "{}:", prefix).unwrap();
         writeln!(w, "    setp.ge.u32 %p0, %r10, {};", pairs).unwrap();
         writeln!(w, "    @%p0 bra {}_D;", prefix).unwrap();
-        writeln!(w, "    shl.b32 %r11, %r10, 1;").unwrap();
-        writeln!(w, "    // dual dot: weight rows e0 and e0+1 against XN").unwrap();
+        // RoPE pairing changed with the kernel (half-split, the layout
+        // NSL models and HF-Llama checkpoints use): pair p of the
+        // projection is elements e0 = head*hd + j and e0 + hd/2, with
+        // head = p / (hd/2) and j = p % (hd/2). It was (2p, 2p + 1).
+        writeln!(w, "    div.u32 %r12, %r10, {};", hd / 2).unwrap();
+        writeln!(w, "    mul.lo.u32 %r13, %r12, {};", hd / 2).unwrap();
+        writeln!(w, "    sub.u32 %r13, %r10, %r13;").unwrap();
+        writeln!(w, "    mul.lo.u32 %r11, %r12, {};", hd).unwrap();
+        writeln!(w, "    add.u32 %r11, %r11, %r13;").unwrap();
+        writeln!(w, "    // dual dot: weight rows e0 and e0+hd/2 against XN").unwrap();
         writeln!(w, "    mul.lo.u32 %r12, %r11, {};", d * 2).unwrap();
         writeln!(w, "    cvt.u64.u32 %rd10, %r12;").unwrap();
         writeln!(w, "    add.u64 %rd10, {}, %rd10;", wreg).unwrap();
-        writeln!(w, "    add.u64 %rd11, %rd10, {};", d * 2).unwrap();
+        writeln!(w, "    add.u64 %rd11, %rd10, {};", d * 2 * (hd / 2)).unwrap();
         writeln!(w, "    mov.f32 %f10, {};", zero).unwrap();
         writeln!(w, "    mov.f32 %f11, {};", zero).unwrap();
         writeln!(w, "    mov.u32 %r13, 0;").unwrap();
@@ -436,10 +450,11 @@ pub fn emit(cfg: &DecodeBlockConfig) -> (String, DecodeBlockMeta) {
         writeln!(w, "    add.u32 %r13, %r13, 1;").unwrap();
         writeln!(w, "    bra {}_DOT;", prefix).unwrap();
         writeln!(w, "{}_DOTD:", prefix).unwrap();
-        writeln!(w, "    // RoPE: i2 = e0 % head_dim; angle = pos * ex2(i2 * c_rope)").unwrap();
+        writeln!(w, "    // RoPE: i2 = 2 * (e0 % head_dim); angle = pos * ex2(i2 * c_rope)").unwrap();
         writeln!(w, "    div.u32 %r12, %r11, {};", hd).unwrap();
         writeln!(w, "    mul.lo.u32 %r12, %r12, {};", hd).unwrap();
         writeln!(w, "    sub.u32 %r12, %r11, %r12;").unwrap();
+        writeln!(w, "    shl.b32 %r12, %r12, 1;").unwrap();
         writeln!(w, "    cvt.rn.f32.u32 %f12, %r12;").unwrap();
         writeln!(w, "    mul.f32 %f12, %f12, {};", c_rope).unwrap();
         writeln!(w, "    ex2.approx.f32 %f12, %f12;").unwrap();
@@ -460,12 +475,12 @@ pub fn emit(cfg: &DecodeBlockConfig) -> (String, DecodeBlockMeta) {
     };
 
     // ── phase 3a: Q = rope(Wq @ xn) -> SMEM ───────────────────────
-    writeln!(w, "    // phase 3a: Q pairs (thread p owns elements 2p, 2p+1)").unwrap();
+    writeln!(w, "    // phase 3a: Q pairs (thread p owns elements e0, e0+hd/2)").unwrap();
     emit_pair_loop(w, "QP", nhd / 2, "%rd_wq", &|w| {
         writeln!(w, "    mul.lo.u32 %r12, %r11, 4;").unwrap();
         writeln!(w, "    add.u32 %r12, %r12, %r_sb;").unwrap();
         writeln!(w, "    st.shared.f32 [%r12+{}], %f16;", q_off).unwrap();
-        writeln!(w, "    st.shared.f32 [%r12+{}], %f17;", q_off + 4).unwrap();
+        writeln!(w, "    st.shared.f32 [%r12+{}], %f17;", q_off + 4 * (hd / 2)).unwrap();
     });
     writeln!(w).unwrap();
 
@@ -478,7 +493,7 @@ pub fn emit(cfg: &DecodeBlockConfig) -> (String, DecodeBlockMeta) {
         writeln!(w, "    cvt.rn.f16.f32 %h0, %f16;").unwrap();
         writeln!(w, "    st.global.b16 [%rd12], %h0;").unwrap();
         writeln!(w, "    cvt.rn.f16.f32 %h1, %f17;").unwrap();
-        writeln!(w, "    st.global.b16 [%rd12+2], %h1;").unwrap();
+        writeln!(w, "    st.global.b16 [%rd12+{}], %h1;", 2 * (hd / 2)).unwrap();
     });
     writeln!(w).unwrap();
 

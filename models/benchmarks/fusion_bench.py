@@ -180,7 +180,7 @@ let loader = DataLoader(tokens, batch_size=MICRO_BATCH, seq_len=SEQ_LEN, shuffle
 print("LOSS_STREAM_BEGIN")
 
 @fused_lm_ce(enabled=true, vocab_size=VOCAB_SIZE, hidden_size=HIDDEN_SIZE, batch_size=MICRO_BATCH, seq_len=SEQ_LEN)
-train(model=m, epochs=1, grad_accumulation=ACCUM, grad_clip=GRAD_CLIP):
+train(model=m, epochs=1, grad_accumulation=ACCUM, schedule_unit="micro_batch", grad_clip=GRAD_CLIP):
     optimizer: OPTIMIZER_SPEC
     scheduler: warmup_cosine(warmup_steps=WARMUP_MICRO, total_steps=TOTAL_MICRO, min_lr=MIN_LR)
     step(batch):

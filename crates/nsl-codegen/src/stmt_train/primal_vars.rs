@@ -116,12 +116,6 @@ impl Compiler<'_> {
                         Type::Borrow(inner) => inner.as_ref(),
                         other => other,
                     };
-                    // NOT Sparse: NslSparseTensor is a different
-                    // repr(C) with no magic field — handing it to
-                    // the guard is the wild-read class this filter
-                    // exists to kill (review S1). Unreachable today
-                    // (source AD has no sparse handlers); a skip is
-                    // the safe direction if that changes.
                     matches!(
                         inner,
                         Type::Tensor { .. }
@@ -314,6 +308,38 @@ impl Compiler<'_> {
         grad_accumulation_steps: i64,
     ) -> Result<(), CodegenError> {
         if let Some(distill) = self.active_distill_context.clone() {
+            // The loss the step body computes. A `loss:` section that states
+            // alpha or temperature is a statement about a `fused_kl_ce(...)`
+            // call; with no such call nothing reads it, and the loss is
+            // whatever the step computes. That used to compile, and the
+            // report printed the declared values as if they were in force.
+            let loss = match extractor.kl_ce_calls().first() {
+                Some(call) => crate::cpkd::DistillLoss::KlCe {
+                    alpha: call.alpha,
+                    temperature: call.temperature,
+                    fused: call.fused,
+                },
+                None => crate::cpkd::DistillLoss::StepBody,
+            };
+            if loss == crate::cpkd::DistillLoss::StepBody {
+                let declared: Vec<&str> = [
+                    distill.loss_alpha_explicit.map(|_| "alpha"),
+                    distill.loss_temperature_explicit.map(|_| "temperature"),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                if !declared.is_empty() {
+                    return Err(CodegenError::new(format!(
+                        "the distill block's `loss:` section declares {}, but the step \
+                         body does not call fused_kl_ce(...), so nothing reads it: the \
+                         loss is whatever the step body computes. Remove the `loss:` \
+                         section, or compute the loss with fused_kl_ce(x_s, W_s, bias_s, \
+                         x_t, W_t, bias_t, targets, alpha, temperature).",
+                        declared.join(" and ")
+                    )));
+                }
+            }
             let fused_op = extractor.wengert_list().ops.iter().find_map(|op| {
                 if let crate::wengert::PrimalOp::FusedKlCe {
                     vocab_size,
@@ -367,7 +393,7 @@ impl Compiler<'_> {
                 // mode the emitted code does not have.
                 grad_accumulation: grad_accumulation_steps.max(1),
                 fase_mode: format!("{:?}", fase_plan.mode),
-                loss: distill.loss.clone(),
+                loss: loss.clone(),
                 trainable_params: extractor.named_param_var_ids().len(),
                 frozen_teacher_inputs: extractor.frozen_input_var_ids().len(),
                 fused_shape: fused_op,

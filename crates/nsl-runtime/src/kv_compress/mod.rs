@@ -1,14 +1,20 @@
 // crates/nsl-runtime/src/kv_compress/mod.rs
-//! M42: KV-cache compression and eviction.
+//! M42: KV-cache compression and eviction routines.
 //!
-//! Three strategies that compose:
-//! - Quantized KV storage (INT8/INT4/FP8) — reduces bytes per element
-//! - Sliding window with attention sinks — caps token count
-//! - H2O (Heavy Hitter Oracle) — attention-score-based eviction
+//! Library code with FFI entry points and unit tests. The paged KV cache
+//! does not call any of it: K and V are stored as written, and the
+//! `@kv_compress` decorator is refused by the checker.
+//!
+//! What is here: quantizers for one K or V block (INT8 per head or per
+//! token, INT4 per group, FP8) and their inverses.
+//!
+//! Two eviction managers lived here too (a sliding window with attention
+//! sinks, and H2O, attention-score-based eviction). Neither had a caller,
+//! and H2O's rule evicted a block only when every token in it was among
+//! the lowest-scoring, which scattered scores almost never produce. Both
+//! were deleted with their FFI.
 
 pub mod quantize;
-pub mod sliding_window;
-pub mod h2o;
 pub mod ffi;
 
 /// Quantization scheme for KV-cache storage.
@@ -30,7 +36,9 @@ pub enum KvQuantScheme {
 }
 
 impl KvQuantScheme {
-    /// Bytes per element for this scheme.
+    /// Payload bytes per element for this scheme. The per-block metadata
+    /// (`KvBlockQuantMeta`, 1,032 bytes for the INT8 and INT4 schemes) is
+    /// not included; `quantize::block_total_bytes` counts it.
     pub fn bytes_per_element(&self) -> f64 {
         match self {
             KvQuantScheme::None => 2.0,      // FP16
@@ -53,29 +61,6 @@ impl KvQuantScheme {
     }
 }
 
-
-/// Sliding window configuration.
-#[derive(Debug, Clone)]
-pub struct SlidingWindowConfig {
-    pub window_size: usize,
-    pub num_sinks: usize,
-}
-
-/// H2O (Heavy Hitter Oracle) configuration.
-#[derive(Debug, Clone)]
-pub struct H2OConfig {
-    pub budget: usize,
-    pub num_sinks: usize,
-}
-
-/// Per-layer compression policy, resolved from @kv_compress decorators.
-#[derive(Debug, Clone, Default)]
-pub struct LayerCompressionPolicy {
-    pub quant_scheme: KvQuantScheme,
-    pub window: Option<SlidingWindowConfig>,
-    pub h2o: Option<H2OConfig>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,13 +81,5 @@ mod tests {
         assert_eq!(KvQuantScheme::from_i64(3), KvQuantScheme::Int4PerGroup);
         assert_eq!(KvQuantScheme::from_i64(4), KvQuantScheme::Fp8);
         assert_eq!(KvQuantScheme::from_i64(99), KvQuantScheme::None);
-    }
-
-    #[test]
-    fn layer_policy_default_is_none() {
-        let p = LayerCompressionPolicy::default();
-        assert_eq!(p.quant_scheme, KvQuantScheme::None);
-        assert!(p.window.is_none());
-        assert!(p.h2o.is_none());
     }
 }

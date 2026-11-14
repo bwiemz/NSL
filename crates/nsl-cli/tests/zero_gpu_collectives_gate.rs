@@ -51,6 +51,13 @@ fn run_gpu(tag: &str, extra: &[&str]) -> RunOut {
         .arg(&prog)
         .current_dir(&tmp)
         .env("NSL_STDLIB_PATH", root.join("stdlib"))
+        // The fixture ends one micro-batch into an accumulation window. A
+        // run now steps once more on that micro-batch, on every rank
+        // together, which adds one optimizer step's collectives to each
+        // count this file pins. That step is covered on the CPU
+        // (`zero_spmd_gate.rs`, whose counts include it); here it is
+        // compiled out so the counts stay those of the six full windows.
+        .env("NSL_FASE_FLUSH_TAIL", "0")
         .env("NSL_ZERO_COUNTER", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -228,6 +235,13 @@ fn run_gpu_stage2(tag: &str, envs: &[(&str, &str)]) -> RunOut {
     .arg(&prog)
     .current_dir(&tmp)
     .env("NSL_STDLIB_PATH", root.join("stdlib"))
+    // The fixture ends one micro-batch into an accumulation window. A
+    // run now steps once more on that micro-batch, on every rank
+    // together, which adds one optimizer step's collectives to each
+    // count this file pins. That step is covered on the CPU
+    // (`zero_spmd_gate.rs`, whose counts include it); here it is
+    // compiled out so the counts stay those of the six full windows.
+    .env("NSL_FASE_FLUSH_TAIL", "0")
     .env("NSL_ZERO_COUNTER", "1")
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
@@ -437,6 +451,13 @@ fn run_gpu_fase(tag: &str, extra: &[&str], env: &[(&str, &str)]) -> FaseOut {
         .arg(&prog)
         .current_dir(&tmp)
         .env("NSL_STDLIB_PATH", root.join("stdlib"))
+        // The fixture ends one micro-batch into an accumulation window. A
+        // run now steps once more on that micro-batch, on every rank
+        // together, which adds one optimizer step's collectives to each
+        // count this file pins. That step is covered on the CPU
+        // (`zero_spmd_gate.rs`, whose counts include it); here it is
+        // compiled out so the counts stay those of the six full windows.
+        .env("NSL_FASE_FLUSH_TAIL", "0")
         .env("NSL_ZERO_COUNTER", "1")
         .env("NSL_FASE_FUSED_COUNTER", "1");
     for (k, v) in env {

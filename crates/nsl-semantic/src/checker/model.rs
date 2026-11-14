@@ -184,20 +184,6 @@ impl<'a> TypeChecker<'a> {
                                     &mut self.diagnostics,
                                 );
                             }
-                            // M50: @sparse decorator validation
-                            if dname == "sparse" {
-                                let resolve = |s: nsl_ast::Symbol| -> String {
-                                    self.interner
-                                        .resolve(s.0)
-                                        .unwrap_or("")
-                                        .to_string()
-                                };
-                                crate::sparse::validate_sparse_decorator(
-                                    deco,
-                                    &resolve,
-                                    &mut self.diagnostics,
-                                );
-                            }
                             // M37: @perf_budget decorator validation
                             if dname == "perf_budget" {
                                 let resolve = |s: nsl_ast::Symbol| -> String {
@@ -285,20 +271,6 @@ impl<'a> TypeChecker<'a> {
                                         }
                                     }
                                 }
-                            }
-                            // M42: @kv_compress decorator validation
-                            if dname == "kv_compress" {
-                                let resolve = |s: nsl_ast::Symbol| -> String {
-                                    self.interner
-                                        .resolve(s.0)
-                                        .unwrap_or("")
-                                        .to_string()
-                                };
-                                crate::kv_compress::validate_kv_compress_decorator(
-                                    deco,
-                                    &resolve,
-                                    &mut self.diagnostics,
-                                );
                             }
                             // M43: @pipeline decorator validation
                             if dname == "pipeline" {
@@ -390,6 +362,17 @@ impl<'a> TypeChecker<'a> {
                             .resolve(deco.name[0].0)
                             .unwrap_or("")
                             .to_string();
+                        // `@checkpoint` is read on top-level functions
+                        // only (`checker/stmt.rs`). On a method it used to
+                        // be accepted with any arguments and do nothing.
+                        if dname == "checkpoint" {
+                            self.diagnostics.push(
+                                Diagnostic::error(
+                                    "@checkpoint is not supported on a model method: it applies to a top-level function. For block checkpointing of a train block use --checkpoint-blocks and the other --checkpoint-* flags".to_string(),
+                                )
+                                .with_label(deco.span, "unsupported @checkpoint target"),
+                            );
+                        }
                         // `@fp8_compute` on a method is what codegen reads
                         // (compiler/functions.rs); validate it here too.
                         if dname == "fp8_compute" {

@@ -85,11 +85,13 @@ print(f"GPT-2 initialized: {count_params(gpt)} parameters")
 
 # STEP 3: DATASET
 
+# A dataset block declares packing statistics for attention planning; it
+# loads nothing. (The token file and the separator belong to a
+# DataLoader: load_mmap(...) and DataLoader(..., packing = true,
+# pack_separator = <id>).)
 dataset train_data("openwebtext"):
-    source = MemoryMapped("data/openwebtext_tokens.bin", dtype = int32)
-    sequence_length = CONFIG.max_seq
     packing = true
-    pack_separator = gpt_tokenizer.eos_token_id
+    max_sequence_length = 1024
 
 # STEP 4: TRAINING
 

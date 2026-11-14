@@ -30,6 +30,15 @@ points.
 
 ## 2. The fix: fuse — and match each device's actual forward
 
+> **Update, 2026-11.** The per-device split described in this section is
+> gone. The GPU forward `nsl_gelu_f32` is now the tanh approximation
+> `0.5x(1+tanh(√(2/π)(x+0.044715x³)))`, the function the CPU already
+> computed, and both AD modes launch one adjoint for it on the GPU
+> (`nsl_gelu_backward_f32`). The sigmoid-form kernels named below
+> (`GELU_F32_PTX`'s `x·σ(1.702x)` and `GELU_BACKWARD_SRCAD_F32_PTX`) no
+> longer exist. The aliasing analysis in section 1 and the fusion itself
+> stand.
+
 `AdjointExpr::GeluBackward` now emits a single `Passthrough("gelu_backward")` →
 `nsl_tensor_gelu_backward(grad, x)`. Fusing eliminates the temp entirely; no
 aliasing can exist inside one kernel. This also completes the p4 elementwise

@@ -361,7 +361,7 @@ pub fn emit_drope_branch(
                 ));
                 // Zero-extend effective_pos into %rd35 (cs row register).
                 // effective_pos is non-negative under the packing invariants
-                // (see pca_rope::plan), so a u32→u64 cvt is sufficient.
+                // (doc_start <= row), so a u32→u64 cvt is sufficient.
                 ptx.push_str(&format!(
                     "    cvt.u64.u32 %rd35, {eff_pos_reg};\n"
                 ));

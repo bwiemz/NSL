@@ -57,9 +57,6 @@ unsafe extern "C" {
     fn nsl_tensor_layernorm(input: i64, weight: i64, bias: i64, eps: f64) -> i64;
     fn nsl_tensor_rmsnorm(input: i64, weight: i64, eps: f64) -> i64;
     fn nsl_tensor_scalar_rhs(x: i64, s: f64, opcode: i64) -> i64;
-    fn nsl_sparse_from_dense(dense: i64, format: i64, threshold_bits: i64) -> i64;
-    fn nsl_sparse_spmm(sparse: i64, dense: i64) -> i64;
-    fn nsl_sparse_spmv(sparse: i64, vec: i64) -> i64;
     fn nsl_qtensor_quantize(t: i64, dtype: i64, granularity: i64, axis: i64, group: i64) -> i64;
     fn nsl_qtensor_dequantize(qt: i64) -> i64;
     fn nsl_qtensor_matmul_mixed(x: i64, qw: i64) -> i64;
@@ -171,14 +168,6 @@ fn zz_mixed_dtype_child() {
         "rmsnorm" => unsafe { nsl_tensor_rmsnorm(a64(), full(&[3], 1.0, F32), 1e-5) },
         // Replays the baseline: x OP an f32 scalar tensor, refused by the op.
         "scalar_rhs" => unsafe { nsl_tensor_scalar_rhs(a64(), 2.0, 0) },
-        "spmm" => unsafe {
-            let sp = nsl_sparse_from_dense(full(&[2, 2], 1.0, F64), 1, 0f64.to_bits() as i64);
-            nsl_sparse_spmm(sp, full(&[2, 3], 1.0, F32))
-        },
-        "spmv" => unsafe {
-            let sp = nsl_sparse_from_dense(full(&[2, 2], 1.0, F32), 1, 0f64.to_bits() as i64);
-            nsl_sparse_spmv(sp, full(&[2], 1.0, F64))
-        },
         other => panic!("unknown {SCENARIO} '{other}'"),
     };
     // Only reached if nothing refused.
@@ -234,8 +223,6 @@ fn contractions_refuse_mixed_dtypes() {
     assert_refused("conv2d", "nsl_tensor_conv2d", ("f32", "f64"));
     assert_refused("conv2d_bias", "nsl_tensor_conv2d", ("f64", "f32"));
     assert_refused("bias_add", "nsl_tensor_bias_add", ("f32", "f64"));
-    assert_refused("spmm", "nsl_sparse_spmm", ("f64", "f32"));
-    assert_refused("spmv", "nsl_sparse_spmv", ("f32", "f64"));
 }
 
 #[test]

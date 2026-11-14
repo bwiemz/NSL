@@ -89,6 +89,14 @@ pub struct CpdtPlan {
     /// the run; `render_report` prints the caveat so `--cpdt-report`
     /// cannot present zero-model shard math as a recommendation.
     pub planned_without_wggo: bool,
+    /// The per-GPU memory budget the ZeRO search was held to. Printed by
+    /// `render_report`.
+    pub memory_budget_bytes: u64,
+    /// The ZeRO stage the compiled program will actually run, from
+    /// `--zero-stage` (`None` when the flag is absent). Set by
+    /// `invoke_cpdt_if_enabled`; `render_report` prints it beside the
+    /// planner's recommendation, which nothing applies.
+    pub applied_zero_stage: Option<u8>,
 }
 
 impl CpdtPlan {
@@ -110,7 +118,7 @@ impl CpdtPlan {
         }
         if let Some(zero) = self.zero.as_ref() {
             writeln!(s).unwrap();
-            writeln!(s, "ZeRO Configuration:").unwrap();
+            writeln!(s, "ZeRO Configuration (recommendation only, not applied):").unwrap();
             writeln!(
                 s,
                 "  s_p={} s_g={} s_os={} ({})",
@@ -120,17 +128,38 @@ impl CpdtPlan {
                 zero.config.stage_label()
             )
             .unwrap();
+            // Nothing reads the planner's choice: the stage the program
+            // runs is the one `--zero-stage` names.
+            match self.applied_zero_stage {
+                Some(stage) => writeln!(
+                    s,
+                    "  Not applied: the compiled program runs ZeRO stage {stage}, from --zero-stage."
+                ),
+                None => writeln!(
+                    s,
+                    "  Not applied: --zero-stage is not set, so the compiled program does no \
+                     ZeRO sharding. Pass --zero-stage to choose a stage."
+                ),
+            }
+            .unwrap();
             writeln!(
                 s,
-                "  Memory per GPU: {:.2} GB (params={:.2} MB, grads={:.2} MB, optim={:.2} MB, act={:.2} MB)",
+                "  Memory per GPU: {:.2} GB (params={:.2} MB, grads={:.2} MB, optim={:.2} MB, act={:.2} MB) of a {:.2} GiB budget",
                 zero.memory_per_gpu_bytes as f64 / 1e9,
                 zero.param_bytes_per_gpu as f64 / 1e6,
                 zero.grad_bytes_per_gpu as f64 / 1e6,
                 zero.optim_bytes_per_gpu as f64 / 1e6,
                 zero.activation_bytes_per_gpu as f64 / 1e6,
+                self.memory_budget_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
             )
             .unwrap();
-            writeln!(s, "  Exposed comm: {:.2} μs", zero.exposed_comm_us).unwrap();
+            writeln!(
+                s,
+                "  Communication: {:.2} MB sent per rank per step, {:.2} μs (not overlapped with compute)",
+                zero.comm_volume_bytes as f64 / 1e6,
+                zero.exposed_comm_us
+            )
+            .unwrap();
             writeln!(s, "  Estimated step time: {:.2} μs", zero.step_time_us).unwrap();
         }
         writeln!(s).unwrap();
@@ -202,8 +231,12 @@ pub fn run(input: CpdtInput) -> CpdtPlan {
             solve_us: t0.elapsed().as_micros() as u64,
             override_diagnostics: Vec::new(),
             planned_without_wggo: false,
+            memory_budget_bytes: input.cluster.memory_budget_bytes,
+            applied_zero_stage: None,
         };
     }
+
+    let memory_budget_bytes = input.cluster.memory_budget_bytes;
 
     // 1. ZeRO search — builds the full eval table and selects the default best.
     let zero_search = crate::cpdt_zero::search(&input.model, &input.cluster);
@@ -358,6 +391,8 @@ pub fn run(input: CpdtInput) -> CpdtPlan {
         solve_us: t0.elapsed().as_micros() as u64,
         override_diagnostics,
         planned_without_wggo: false,
+        memory_budget_bytes,
+        applied_zero_stage: None,
     }
 }
 
@@ -408,6 +443,7 @@ mod override_tests {
                 optim_state_multiplier: crate::cpdt_zero::ADAMW_FP32_OPTIM_MULTIPLIER,
                 per_layer_compute_us: vec![10.0; 8],
                 activation_checkpointing: false,
+                micro_batches_per_step: 1,
             },
             cluster: ClusterSpec {
                 num_gpus: world_size,
@@ -415,6 +451,7 @@ mod override_tests {
                 intra_bw_bps: 9e11,
                 inter_bw_bps: 1e11,
                 gpus_per_node: world_size.min(8),
+                collective_latency_us: crate::cpdt_zero::DEFAULT_COLLECTIVE_LATENCY_US,
             },
             weights: None,
             precision_cfg: PrecisionConfig::default(),
@@ -596,6 +633,7 @@ mod tests {
             optim_state_multiplier: crate::cpdt_zero::ADAMW_FP32_OPTIM_MULTIPLIER,
             per_layer_compute_us: vec![10.0; 8],
             activation_checkpointing: false,
+            micro_batches_per_step: 1,
         }
     }
 

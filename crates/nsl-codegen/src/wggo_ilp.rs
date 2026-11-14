@@ -1,29 +1,29 @@
-//! WGGO — Level 2 per-layer Integer Linear Program.
+//! WGGO — Level 2 per-layer solve.
 //!
-//! A compact **branch-and-bound** ILP solver specialised for WGGO's
-//! per-layer problem (Gemini's review: "20-50 variables per layer").  No
-//! external solver dependency — written in pure Rust so it compiles into
-//! the release binary with zero-config.
+//! An exhaustive scan of one layer's decision space, specialised for WGGO's
+//! per-layer problem. No external solver dependency.
 //!
 //! The per-layer problem is:
 //!
 //! ```text
-//! minimise   forward + backward + adapter_overhead
+//! minimise   forward + backward + adapter_overhead + optimizer step
 //! subject to  memory(heads, ffn, rank, prec) ≤ memory_budget
 //!             smem(heads, ffn, csha)          ≤ smem_budget
 //!             Σ_k head[k] ≥ 1
 //!             gqa_group_constraint
 //!             (heads kept must form whole KV groups)
+//!             csha ≥ 2 ⇒ no pruned heads
 //!             adapter_comm ≤ comm_budget
 //!             numerical_sensitivity ⇒ prec ≥ min_bits
 //! ```
 //!
-//! The search space is `2^H × |FFN widths| × 4 × |ranks| × 3 × 3` ≈ 30 k
-//! at H=8, small enough that branch-and-bound with LUT-based cost
-//! evaluation visits the whole tree in microseconds.
-//!
-//! The solver's bounding function uses the LUT's `argmin_feasible` as a
-//! global lower bound and prunes aggressively.
+//! Every candidate is costed from the layer's cost table and compared with
+//! the best so far; nothing is bounded away before it is evaluated. The cost
+//! depends on how many heads are kept, not on which, so the head axis is the
+//! `G` candidates "keep the `k` most important key/value groups" for
+//! `k = 1..=G`, not the `2^G` subsets. The space is then
+//! `G × |FFN widths| × 4 × |ranks| × 2 × 2 × |packing modes|`, a few thousand
+//! candidates at most.
 
 use serde::{Deserialize, Serialize};
 
@@ -297,10 +297,7 @@ pub struct LayerIlpConstraints {
     /// resolver would defer it anyway, but pre-pruning saves work).
     pub allow_fase: bool,
     /// Estimated relative speedup of the backward pass when FASE fuses
-    /// the optimizer step into it.  Typical values: 0.05–0.15.  The
-    /// fused step also eliminates a separate gradient HBM round-trip,
-    /// which is modeled as removing one parameter-sized buffer from the
-    /// activation footprint.
+    /// the optimizer step into it.  Typical values: 0.05–0.15.
     pub fase_backward_speedup: f64,
     /// Bit-mask of permitted PCA packing modes.  Bit `i` set = mode `i`
     /// allowed.  Default `0b1111` (all four modes).  Callers set this to
@@ -382,6 +379,10 @@ pub struct LayerIlpSolution {
     pub cost_us: f64,
     pub memory_bytes: u64,
     pub smem_bytes: u64,
+    /// Parameter bytes of the chosen configuration (0 when infeasible).
+    pub param_bytes: u64,
+    /// Forward-activation bytes of the chosen configuration.
+    pub activation_bytes: u64,
     /// Number of interior nodes explored (diagnostic).
     pub nodes_explored: u64,
     /// Whether the solver found a feasible assignment at all.
@@ -510,6 +511,19 @@ pub fn solve_layer_cpkd(
                                     state.nodes += 1;
                                     let h_count =
                                         heads_config.iter().filter(|b| **b).count() as u64;
+                                    // A fused kernel at level 2 or 3 is
+                                    // built for the full head set, so a
+                                    // candidate that prunes heads may not
+                                    // take one. The conflict resolver
+                                    // enforces the same rule afterwards;
+                                    // applying it here means the solver
+                                    // weighs "all heads at level 3" against
+                                    // "fewer heads at level 1" itself
+                                    // instead of choosing an impossible
+                                    // pair and having it broken.
+                                    if c >= 2 && (h_count as usize) < heads_config.len() {
+                                        continue;
+                                    }
                                     let Some(base) = lut.get(h_count.max(1), f, c, r) else {
                                         continue;
                                     };
@@ -661,6 +675,8 @@ pub fn solve_layer_cpkd(
                     cost_us: state.best_cost,
                     memory_bytes,
                     smem_bytes: entry.smem_bytes,
+                    param_bytes: entry.param_bytes,
+                    activation_bytes: entry.activation_bytes,
                     nodes_explored: state.nodes,
                     feasible: true,
                     decision_trace,
@@ -670,15 +686,7 @@ pub fn solve_layer_cpkd(
             )
         }
         None => (
-            LayerIlpSolution {
-                decision: fallback_decision(constraints),
-                cost_us: f64::INFINITY,
-                memory_bytes: 0,
-                smem_bytes: 0,
-                nodes_explored: state.nodes,
-                feasible: false,
-                decision_trace: Vec::new(),
-            },
+            infeasible_solution(lut, constraints, state.nodes),
             None,
             None,
         ),
@@ -758,6 +766,59 @@ pub fn recost_decision_cpkd(
     cost
 }
 
+/// Bring a solution's figures back in line with its decision after the
+/// conflict resolver changed that decision (a CSHA downgrade, a removed
+/// adapter, a deferred FASE step). Without this the plan reported the cost
+/// and memory of the configuration the solver chose, not the one applied.
+/// An infeasible solution is left alone.
+pub fn refresh_solution(
+    lut: &LayerCostLut,
+    sol: &mut LayerIlpSolution,
+    c: &LayerIlpConstraints,
+    cfie: Option<CfieInferenceChoice>,
+    cpkd: Option<CpkdChoice>,
+) {
+    if !sol.feasible {
+        return;
+    }
+    let d = &sol.decision;
+    let h_count = (d.active_heads() as u64).max(1);
+    // A decision the table does not hold (the resolver removed an adapter
+    // the `@wrga` mandate had taken off the rank axis) keeps the figures it
+    // was solved with.
+    let Some(base) = lut.get(h_count, d.ffn_width, d.csha_level, d.adapter_rank) else {
+        return;
+    };
+    let entry = apply_packing(
+        apply_fase(base, d.fase_fused, c.fase_backward_speedup),
+        d.packing_mode,
+        &c.packing_savings,
+        c.packing_scales_quadratic_only,
+    );
+    let cfie_pool = match (cfie, c.cfie_infer.as_ref()) {
+        (Some(ch), Some(cfg)) => crate::wggo_cfie::kv_pool_bytes(ch, cfg),
+        _ => 0,
+    };
+    let cpkd_bytes = match (cpkd, c.cpkd.as_ref()) {
+        (Some(ch), Some(cfg)) => crate::wggo_cpkd::choice_bytes(ch, cfg),
+        _ => 0,
+    };
+    sol.memory_bytes = ilp_resident_bytes(
+        &entry,
+        lut,
+        d.optim_m_bits,
+        d.optim_v_bits,
+        d.fase_fused,
+        c.budget_informed,
+    )
+    .saturating_add(cfie_pool)
+    .saturating_add(cpkd_bytes);
+    sol.smem_bytes = entry.smem_bytes;
+    sol.param_bytes = entry.param_bytes;
+    sol.activation_bytes = entry.activation_bytes;
+    sol.cost_us = recost_decision_cpkd(lut, &sol.decision, c, cfie, cpkd);
+}
+
 /// Resident memory the ILP charges a candidate layer: the shared
 /// training-memory formula ([`crate::wggo_cost::resident_training_bytes`]) with
 /// the layer's chosen moment precision, sized **unsharded** (`shard = 1`).
@@ -776,10 +837,8 @@ pub fn recost_decision_cpkd(
 /// [`crate::wggo_cost::fase_deferred_extra_bytes`], so the budget is compared
 /// against an honest footprint. The surcharge is gated on `budget_informed` so
 /// non-budget plans' reported `memory_bytes` stay byte-identical to today
-/// (pinned tests depend on it). `apply_fase` already removed one param-sized
-/// buffer from `entry.activation_bytes`; the surcharge re-introduces the true
-/// Deferred surfaces (one live grad + the accumulator that the full grad buffer
-/// is replaced by).
+/// (pinned tests depend on it). The surcharge is the two Deferred surfaces: one
+/// live gradient and the accumulator the full gradient buffer is replaced by.
 fn ilp_resident_bytes(
     entry: &LayerCostEntry,
     lut: &LayerCostLut,
@@ -806,18 +865,8 @@ fn ilp_resident_bytes(
     }
 }
 
-/// Smallest resident footprint the moment-precision axis can give a layer
-/// without dropping below fp16 — the identity structural decision (max heads,
-/// max FFN, no adapter, no CSHA, no packing, FASE off) charged at 16-bit m and
-/// v. This is the "fp16-moment floor": if the budget cannot fit even this, no
-/// moment-precision decision the solver can make will help, so the budget path
-/// hard-fails with a required-vs-budget diagnostic (see `wggo::run`).
-pub fn fp16_moment_floor_bytes(lut: &LayerCostLut) -> u64 {
-    moment_floor_bytes(lut, 16, 16)
-}
-
 /// The identity-structural resident footprint of a layer at an EXPLICIT moment
-/// precision — the generalization of [`fp16_moment_floor_bytes`]. Used by the
+/// precision. Used by the
 /// budget refusal to size each layer at its OWN role-permitted precision floor
 /// (32-bit for a critical-sensitivity layer such as the embedding / LM-head,
 /// 16-bit for a quantizable transformer block) instead of assuming every layer
@@ -1080,11 +1129,14 @@ pub fn solve_layer_greedy_cpkd(
     // greedy solution will actually use — a hardcoded rank-0 probe missed
     // EVERY entry under the adapter mandate (0 off the axis), silently
     // collapsing csha_level to 0 for the whole plan.
+    let heads_pruned = (h_count as usize) < keep_head.len();
     let c = lut
         .axes_csha_levels
         .iter()
         .copied()
         .rev()
+        // Levels 2 and 3 need the full head set (see `solve_layer_cpkd`).
+        .filter(|&lvl| !(heads_pruned && lvl >= 2))
         .find(|&lvl| {
             nodes += 1;
             lut.get(h_count, f, lvl, r)
@@ -1104,19 +1156,7 @@ pub fn solve_layer_greedy_cpkd(
     let packing_mode = enumerate_packing_modes(constraints)[0];
 
     let Some(base) = lut.get(h_count, f, c, r) else {
-        return (
-            LayerIlpSolution {
-                decision: fallback_decision(constraints),
-                cost_us: f64::INFINITY,
-                memory_bytes: 0,
-                smem_bytes: 0,
-                nodes_explored: nodes,
-                feasible: false,
-                decision_trace: Vec::new(),
-            },
-            None,
-            None,
-        );
+        return (infeasible_solution(lut, constraints, nodes), None, None);
     };
     let entry = apply_packing(
         apply_fase(base, fase_fused, constraints.fase_backward_speedup),
@@ -1178,19 +1218,7 @@ pub fn solve_layer_greedy_cpkd(
         && memory_bytes <= constraints.memory_budget;
 
     if !feasible {
-        return (
-            LayerIlpSolution {
-                decision: fallback_decision(constraints),
-                cost_us: f64::INFINITY,
-                memory_bytes,
-                smem_bytes: entry.smem_bytes,
-                nodes_explored: nodes,
-                feasible: false,
-                decision_trace: Vec::new(),
-            },
-            None,
-            None,
-        );
+        return (infeasible_solution(lut, constraints, nodes), None, None);
     }
 
     (
@@ -1224,6 +1252,8 @@ pub fn solve_layer_greedy_cpkd(
                 + cpkd_us,
             memory_bytes,
             smem_bytes: entry.smem_bytes,
+            param_bytes: entry.param_bytes,
+            activation_bytes: entry.activation_bytes,
             nodes_explored: nodes,
             feasible: true,
             decision_trace: Vec::new(),
@@ -1388,7 +1418,19 @@ fn prec_allowed(bits: u8, c: &LayerIlpConstraints) -> bool {
     true
 }
 
-/// Enumerate feasible head-keep vectors honouring the GQA-group constraint.
+/// The head-keep vectors worth considering, honouring the GQA-group
+/// constraint (within a kept group every head is kept, within a dropped one
+/// every head is dropped).
+///
+/// A candidate's cost depends on how many heads it keeps, and among the
+/// subsets of one size the one that keeps the most important groups retains
+/// the most importance, so it is feasible whenever any subset of that size
+/// is. The candidates are therefore "keep the `k` most important groups"
+/// for `k = n_groups, …, 1` (keep-all first), `n_groups` vectors in all.
+/// Ties in importance go to the lower group index. The earlier form built
+/// all `2^n_groups` subsets and, above 10 groups, kept the first 1024 of
+/// them, which are subsets of the first ten groups and do not include
+/// keep-all.
 fn enumerate_head_configs(c: &LayerIlpConstraints) -> Vec<Vec<bool>> {
     let h = c.num_heads as usize;
     if h == 0 {
@@ -1400,28 +1442,35 @@ fn enumerate_head_configs(c: &LayerIlpConstraints) -> Vec<Vec<bool>> {
         return vec![vec![true; h]];
     }
     let n_groups = h / group;
-    let mut out = Vec::new();
-    // Iterate over the 2^n_groups subsets; within a kept group, every head
-    // is kept, within a dropped group every head is dropped.  That honours
-    // the "kept heads must form whole KV groups" constraint.
-    for mask in 1u64..(1u64 << n_groups) {
-        let mut config = vec![false; h];
-        for g in 0..n_groups {
-            if (mask >> g) & 1 == 1 {
+    let group_importance = |g: usize| -> f64 {
+        (0..group)
+            .map(|i| c.head_importance.get(g * group + i).copied().unwrap_or(0.0))
+            .sum()
+    };
+    let mut order: Vec<usize> = (0..n_groups).collect();
+    order.sort_by(|&a, &b| {
+        group_importance(b)
+            .total_cmp(&group_importance(a))
+            .then(a.cmp(&b))
+    });
+    (1..=n_groups)
+        .rev()
+        .map(|k| {
+            let mut config = vec![false; h];
+            for &g in &order[..k] {
                 for i in 0..group {
                     config[g * group + i] = true;
                 }
             }
-        }
-        out.push(config);
-    }
-    // Cap size for the largest problems — when n_groups > 10 (unusual),
-    // enumerate only the "top-k groups" subsets.
-    if n_groups > 10 {
-        out.truncate(1024);
-    }
-    out
+            config
+        })
+        .collect()
 }
+
+/// Relative slack on the retained-importance test. The threshold is a sum of
+/// the same scores the test adds up, in a different order; without slack the
+/// set the threshold was built from can miss it by one rounding step.
+const IMPORTANCE_TOLERANCE: f64 = 1e-9;
 
 fn importance_ok(config: &[bool], c: &LayerIlpConstraints) -> bool {
     if c.head_importance.is_empty() || c.min_retained_importance <= 0.0 {
@@ -1432,7 +1481,7 @@ fn importance_ok(config: &[bool], c: &LayerIlpConstraints) -> bool {
         .zip(c.head_importance.iter())
         .filter_map(|(k, w)| if *k { Some(*w) } else { None })
         .sum();
-    retained >= c.min_retained_importance
+    retained >= c.min_retained_importance * (1.0 - IMPORTANCE_TOLERANCE)
 }
 
 /// Small per-(rank·site) compute surcharge so the solver prefers the smallest
@@ -1609,8 +1658,15 @@ fn build_decision_trace(
     let cpdt_trace = DecisionTrace {
         kind: DecisionKind::CpdtPrecision,
         chosen: format!(
-            "INT{} m, FP{} v",
-            decision.optim_m_bits, decision.optim_v_bits
+            "{} m, FP{} v",
+            match decision.optim_m_bits {
+                32 => "FP32".to_string(),
+                // A 16-bit first moment is stored as BF16
+                // (`cpdt_precision_exec::first_moment_storage`).
+                16 => "BF16".to_string(),
+                bits => format!("{bits}-bit"),
+            },
+            decision.optim_v_bits
         ),
         runner_up: None,
         binding_constraint: Some(tier_label.clone()),
@@ -1665,12 +1721,41 @@ fn build_decision_trace(
     ]
 }
 
-fn fallback_decision(c: &LayerIlpConstraints) -> LayerDecision {
+/// The solution recorded for a layer with no feasible configuration: the
+/// layer as written (all heads, its full FFN width, nothing fused, 32-bit
+/// moments), marked infeasible and sized at that configuration so the
+/// plan's memory total still counts it.
+fn infeasible_solution(
+    lut: &LayerCostLut,
+    c: &LayerIlpConstraints,
+    nodes: u64,
+) -> LayerIlpSolution {
+    let decision = fallback_decision(lut, c);
+    let entry = lut.get(
+        (decision.active_heads() as u64).max(1),
+        decision.ffn_width,
+        decision.csha_level,
+        decision.adapter_rank,
+    );
+    LayerIlpSolution {
+        memory_bytes: entry.map_or(0, |e| ilp_resident_bytes(&e, lut, 32, 32, false, false)),
+        smem_bytes: 0,
+        param_bytes: entry.map_or(0, |e| e.param_bytes),
+        activation_bytes: entry.map_or(0, |e| e.activation_bytes),
+        decision,
+        cost_us: f64::INFINITY,
+        nodes_explored: nodes,
+        feasible: false,
+        decision_trace: Vec::new(),
+    }
+}
+
+fn fallback_decision(lut: &LayerCostLut, c: &LayerIlpConstraints) -> LayerDecision {
     LayerDecision {
         keep_head: vec![true; c.num_heads as usize],
-        ffn_width: 1024,
+        ffn_width: lut.axes_ffn_widths.iter().copied().max().unwrap_or(0),
         csha_level: 0,
-        adapter_rank: 0,
+        adapter_rank: lut.axes_adapter_ranks.iter().copied().min().unwrap_or(0),
         optim_m_bits: 32,
         optim_v_bits: 32,
         fase_fused: false,
@@ -1740,26 +1825,25 @@ fn apply_packing(
     }
 }
 
-/// Adjust a baseline LUT entry for the FASE fused-step option.  Fusing the
-/// optimizer step into the backward kernel removes the explicit gradient
-/// HBM round-trip (modeled as one parameter-sized buffer dropping out of
-/// the activation footprint) and reduces backward latency by
-/// `fase_backward_speedup` (typically 5–15 %).  Both adjustments saturate
-/// at zero so the entry remains physically meaningful.
+/// Adjust a baseline LUT entry for the FASE fused-step option: backward
+/// latency drops by `fase_backward_speedup` (typically 5–15 %). The memory
+/// side of the fused step is accounted in [`ilp_resident_bytes`], under a
+/// budget.
 fn apply_fase(base: LayerCostEntry, fase_fused: bool, speedup: f64) -> LayerCostEntry {
     if !fase_fused {
         return base;
     }
     let s = speedup.clamp(0.0, 0.5);
     let backward_us = base.backward_us * (1.0 - s);
-    // Fused step writes parameter updates directly — the gradient buffer
-    // (≈ param_bytes) never lands in HBM as a distinct activation tensor.
-    let activation_bytes = base.activation_bytes.saturating_sub(base.param_bytes);
+    // The activation bytes pass through unchanged. They are the layer's
+    // forward activations and never included a gradient buffer, so there is
+    // none to take out; subtracting a parameter-sized one, as this did,
+    // zeroed the activations of any layer whose parameters outweigh them.
     LayerCostEntry {
         forward_us: base.forward_us,
         backward_us,
         param_bytes: base.param_bytes,
-        activation_bytes,
+        activation_bytes: base.activation_bytes,
         smem_bytes: base.smem_bytes,
         feasible: base.feasible,
         classification: base.classification,
@@ -2159,10 +2243,16 @@ mod tests {
     fn smem_budget_tightens_csha_level() {
         let lut = build_lut(&shape(), h100(), &LutAxes::default());
         let mut constraints = LayerIlpConstraints::default();
-        constraints.smem_budget = 1024; // Only CSHA level 0 fits.
+        // Levels 2 and 3 hold tiles in shared memory (49,664 and 213,504
+        // bytes on this layer, by CSHA's formulas); levels 0 and 1 hold
+        // none, so 1 KB admits level 1 and nothing above it.
+        constraints.smem_budget = 1024;
         let sol = solve_layer(&lut, &constraints);
         assert!(sol.feasible);
-        assert_eq!(sol.decision.csha_level, 0);
+        assert_eq!(sol.decision.csha_level, 1);
+        assert_eq!(lut.get(8, 2048, 2, 0).unwrap().smem_bytes, 49_664);
+        assert_eq!(lut.get(8, 2048, 3, 0).unwrap().smem_bytes, 213_504);
+        assert_eq!(lut.get(8, 2048, 1, 0).unwrap().smem_bytes, 0);
     }
 
     #[test]
@@ -2457,10 +2547,10 @@ mod tests {
     fn greedy_respects_smem_budget() {
         let lut = build_lut(&shape(), h100(), &LutAxes::default());
         let mut c = LayerIlpConstraints::default();
-        c.smem_budget = 1024; // forces csha=0
+        c.smem_budget = 1024; // rules out levels 2 and 3 (see the test above)
         let g = solve_layer_greedy(&lut, &c);
         assert!(g.feasible);
-        assert_eq!(g.decision.csha_level, 0);
+        assert_eq!(g.decision.csha_level, 1);
     }
 
     #[test]
@@ -2566,8 +2656,127 @@ mod tests {
                 assert!(kept == 0 || kept == 2);
             }
         }
-        // 2^2 - 1 = 3 non-empty subsets of 2 groups.
-        assert_eq!(configs.len(), 3);
+        // One candidate per count of kept groups: both, then the stronger.
+        assert_eq!(configs.len(), 2);
+        assert_eq!(configs[0], vec![true; 4]);
+    }
+
+    /// The candidates are "keep the k most important groups", keep-all
+    /// first, at any head count. Above 10 groups the earlier enumeration
+    /// built 2^n subsets and kept the first 1024, which never keep a group
+    /// past the tenth and do not include keep-all.
+    #[test]
+    fn head_candidates_are_the_top_k_groups_at_any_head_count() {
+        // 32 heads in 16 groups of 2; group g has importance g + 1, so the
+        // most important groups are the last ones.
+        let c = LayerIlpConstraints {
+            num_heads: 32,
+            gqa_group: 2,
+            head_importance: (0..32).map(|h| (h / 2 + 1) as f64 / 2.0).collect(),
+            ..Default::default()
+        };
+        let configs = enumerate_head_configs(&c);
+        assert_eq!(configs.len(), 16);
+        assert_eq!(configs[0], vec![true; 32], "keep-all is the first candidate");
+        // Keeping 3 groups keeps groups 13, 14 and 15: heads 26..32.
+        let three = &configs[13];
+        let kept: Vec<usize> =
+            three.iter().enumerate().filter_map(|(i, k)| k.then_some(i)).collect();
+        assert_eq!(kept, vec![26, 27, 28, 29, 30, 31]);
+        // The last candidate keeps the single most important group.
+        assert_eq!(configs[15].iter().filter(|k| **k).count(), 2);
+        assert!(configs[15][30] && configs[15][31]);
+    }
+
+    /// The retention threshold is a sum of the scores the test adds up in
+    /// another order; the set it was built from must pass it. In f64,
+    /// 0.3 + 0.2 + 0.1 is 0.6 and 0.1 + 0.2 + 0.3 is 0.6000000000000001:
+    /// the threshold is built from the scores sorted ascending and the test
+    /// sums them in head order, so with no tolerance keeping every head
+    /// failed its own threshold.
+    #[test]
+    fn the_set_the_threshold_was_built_from_passes_it() {
+        let scores: Vec<f64> = vec![0.3, 0.2, 0.1];
+        let in_head_order: f64 = scores.iter().sum();
+        let threshold: f64 = 0.1 + 0.2 + 0.3;
+        assert!(in_head_order < threshold, "premise: the two sums differ");
+        let keep_all = LayerIlpConstraints {
+            num_heads: 3,
+            head_importance: scores,
+            min_retained_importance: threshold,
+            ..Default::default()
+        };
+        assert!(importance_ok(&[true; 3], &keep_all));
+        // And a set that really falls short still fails.
+        assert!(!importance_ok(&[true, true, false], &keep_all));
+    }
+
+    /// Pruned heads and a fused level 2 or 3 kernel cannot be combined, and
+    /// the solver now weighs the two against each other itself.
+    ///
+    /// On this table keeping all eight heads at level 3 costs less than six
+    /// heads at level 1 (level 3 discounts the layer by 65 %, level 1 by
+    /// 20 %, and two heads of eight are well under half the layer), so with
+    /// pruning allowed the solver keeps every head. It used to choose six
+    /// heads with level 3, which the resolver then broke down to level 1,
+    /// the worst of the three.
+    #[test]
+    fn the_solver_does_not_choose_pruned_heads_with_a_fused_level() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let c = LayerIlpConstraints {
+            importance_informed: true,
+            head_importance: vec![1.3, 1.2, 1.1, 1.0, 0.9, 0.8, 0.9, 0.8],
+            // The six strongest: a quarter of the heads may go.
+            min_retained_importance: 1.3 + 1.2 + 1.1 + 1.0 + 0.9 + 0.9,
+            gqa_group: 1,
+            ..Default::default()
+        };
+        let sol = solve_layer(&lut, &c);
+        assert!(sol.feasible);
+        let pruned = sol.decision.keep_head.iter().any(|k| !k);
+        assert!(
+            !(pruned && sol.decision.csha_level >= 2),
+            "pruned heads with level {}",
+            sol.decision.csha_level
+        );
+        let all_l3 = lut.get(8, 2048, 3, 0).unwrap().total_us();
+        let six_l1 = lut.get(6, 2048, 1, 0).unwrap().total_us();
+        assert!(all_l3 < six_l1, "premise: {all_l3} vs {six_l1}");
+        assert_eq!(sol.decision.active_heads(), 8);
+        assert_eq!(sol.decision.csha_level, 3);
+    }
+
+    /// The trace names the formats that are stored: a 16-bit first moment
+    /// is BF16, and neither moment is an integer.
+    #[test]
+    fn the_precision_trace_names_the_stored_formats() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let label = |c: &LayerIlpConstraints| {
+            solve_layer(&lut, c)
+                .decision_trace
+                .into_iter()
+                .find(|t| matches!(t.kind, DecisionKind::CpdtPrecision))
+                .map(|t| t.chosen)
+                .unwrap()
+        };
+        assert_eq!(label(&LayerIlpConstraints::default()), "FP32 m, FP32 v");
+        let informed = LayerIlpConstraints { sensitivity_informed: true, ..Default::default() };
+        assert_eq!(label(&informed), "BF16 m, FP32 v");
+    }
+
+    /// A fused FASE step leaves the layer's forward activations alone. It
+    /// used to subtract a parameter-sized buffer from them, which at batch 1
+    /// (4 MB of activations against 8 MB of parameters) left zero.
+    #[test]
+    fn a_fused_fase_step_does_not_shrink_the_activations() {
+        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        let base = lut.get(8, 2048, 0, 0).unwrap();
+        assert!(base.param_bytes > base.activation_bytes, "premise of the old defect");
+        let fused = apply_fase(base, true, 0.10);
+        assert_eq!(fused.activation_bytes, base.activation_bytes);
+        // 1 x 1024 tokens x 512 wide x 2 bytes x 4 tensors.
+        assert_eq!(fused.activation_bytes, 4_194_304);
+        assert!((fused.backward_us - base.backward_us * 0.9).abs() < 1e-9);
     }
 
     // -----------------------------------------------------------------------
@@ -2861,9 +3070,13 @@ mod tests {
 
     #[test]
     fn informed_importance_allows_head_pruning() {
-        // Same constraints WITH evidence: the solver may (and, being
-        // cost-only, will) drop heads down to the retention floor.
-        let lut = build_lut(&shape(), h100(), &LutAxes::default());
+        // Same constraints WITH evidence: where no fused level is on offer
+        // the solver (being cost-only) drops heads down to the retention
+        // floor. With levels 2 and 3 on offer it keeps every head at one of
+        // them instead, which costs less; see
+        // `the_solver_does_not_choose_pruned_heads_with_a_fused_level`.
+        let axes = LutAxes { csha_levels: vec![0, 1], ..LutAxes::default() };
+        let lut = build_lut(&shape(), h100(), &axes);
         let constraints = LayerIlpConstraints {
             num_heads: 8,
             gqa_group: 1,

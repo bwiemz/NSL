@@ -422,6 +422,47 @@ impl Parser {
     }
 }
 
+/// PTX `max.f32`: the non-NaN operand when one is NaN, and `+0` for the
+/// pair of zeros of opposite sign.
+///
+/// The second rule is why this is not `f32::max`. Rust leaves the sign of
+/// `max(-0.0, +0.0)` unspecified, and the answer really does vary: this
+/// function, compiled once in an unoptimized build and once in an optimized
+/// one, disagreed with itself, which made an equivalence gate that compares
+/// the interpreter with a model written as `x.max(0.0)` pass in one build
+/// and fail in the other. The hardware does not vary: `-0` orders below
+/// `+0` for `max.f32` and `min.f32` (measured on an RTX PRO 4500 by
+/// `nsl-runtime`'s `hwcert_kir_numerics_gpu` gate).
+pub fn ptx_max_f32(a: f32, b: f32) -> f32 {
+    if a.is_nan() {
+        b
+    } else if b.is_nan() {
+        a
+    } else if a == b {
+        // Equal, so either the same value or the two zeros.
+        f32::from_bits(a.to_bits() & b.to_bits())
+    } else if a > b {
+        a
+    } else {
+        b
+    }
+}
+
+/// PTX `min.f32`: as [`ptx_max_f32`], with `-0` for the pair of zeros.
+pub fn ptx_min_f32(a: f32, b: f32) -> f32 {
+    if a.is_nan() {
+        b
+    } else if b.is_nan() {
+        a
+    } else if a == b {
+        f32::from_bits(a.to_bits() | b.to_bits())
+    } else if a < b {
+        a
+    } else {
+        b
+    }
+}
+
 pub(crate) fn parse_signature(ptx: &str) -> Vec<(String, String)> {
     let start = ptx.find(".visible .entry ").expect("an entry");
     let open = start + ptx[start..].find('(').expect("a parameter list");
@@ -1267,10 +1308,8 @@ pub(crate) fn run_until_blocked(t: &mut Thread, launch: &mut Launch, tid: u32) {
                     FOp::Add => a + b,
                     FOp::Sub => a - b,
                     FOp::Mul => a * b,
-                    // PTX `max.f32` returns the non-NaN operand, as Rust's.
-                    FOp::Max => a.max(b),
-                    // Likewise `min.f32`.
-                    FOp::Min => a.min(b),
+                    FOp::Max => ptx_max_f32(a, b),
+                    FOp::Min => ptx_min_f32(a, b),
                     FOp::DivRn => a / b,
                     // `a * (1/b)`, the reciprocal flushed to zero for
                     // 2^126 < |b| < 2^128 (the PTX ISA's documented range).

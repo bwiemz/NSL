@@ -1,6 +1,10 @@
 from nsl.nn.norms import RMSNorm
 
-@cep_search(target = h100, objective = param_efficiency)
+# Search fixture: three widths by three head counts. With two key/value heads
+# every head count is a whole number of groups, so all nine candidates are
+# valid. `min_latency` has a known answer: the estimate grows with both axes,
+# so d_model=256 with 4 heads ranks first and d_model=512 with 8 heads last.
+@cep_search(target = h100, objective = min_latency)
 @search(d_model, [256, 384, 512])
 @search(n_heads, [4, 6, 8])
 model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, dropout_p: float):
@@ -13,4 +17,4 @@ model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, head_dim: in
     norm: RMSNorm = RMSNorm(d_model)
 model SearchNet:
     embed: Tensor = randn([4096, 384]) * full([1], 0.02)
-    blocks: [TransformerBlock; 6] = TransformerBlock(384, 6, 3, 64, 1024, 0.1)
+    blocks: [TransformerBlock; 6] = TransformerBlock(384, 6, 2, 64, 1024, 0.1)

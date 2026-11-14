@@ -127,11 +127,16 @@ edges and occasional API churn.
   `Adam(weight_decay=..)` / `Adam(no_decay=..)` are refused (use AdamW):
   NSL never implemented coupled decay, and the knob meant different things
   on different update paths.
-- **Quantization** — FP8, BitNet, AWQ/GPTQ precision tiering (`quantization`).
+- **Quantization** — FP8, BitNet, and `quant` blocks at `int8`/`int4`
+  (`quantization`). The 4-bit weight routines in the runtime (one named AWQ,
+  which is per-group round-to-nearest, and GPTQ) are library code that NSL
+  source does not reach.
   Requests that were accepted and never honoured are refused: `nsl build`'s
   calibration flags, a `quant` block's `calibration:` section and its
-  `awq4`/`gptq*` defaults, `@quantize` arguments other than `dtype =
-  "awq4"`, and `@fp8_compute(calibrate = true)`.
+  `awq4`/`gptq*` defaults, `@fp8_compute(calibrate = true)`, and the
+  decorators `@quantize` (every form: its one accepted dtype, `awq4`, drove
+  an activation-statistics pass whose output nothing read; that pass is
+  deleted), `@kv_compress`, `@sparse` and `@fp4_compute`.
 - **FlashAttention** — codegen path and selector (`analysis`).
 - **C ABI / shared-library export** — `nsl_model_*` C API and generated headers
   (M62), including the DLPack output-ownership models `nsl_model_call_into` /
@@ -158,7 +163,8 @@ tests that are *not* part of the green-build contract (see README → Benchmarks
 - **WGGO** — weight-graph global optimization.
 - **WRGA** — weight-rewrite / gated-LoRA adapter codegen (PEFT fusion).
 - **CEP** — compiler-extracted pruning.
-- **CFIE** — fused inference engine (speculative, grammar, KV planning).
+- **CFIE** — fused inference engine (static KV layout, decode block, fused
+  sampler, draft-model speculative decoding).
 - **CSHA** — compiler-specialized hardware attention (FlashAttention-v2 tiers).
 - **CPDT** — compiler-planned distributed training (ZeRO, expert/precision tiers).
 - **CPKD** — compiler-planned knowledge distillation (distill block, frozen
@@ -183,6 +189,13 @@ tests that are *not* part of the green-build contract (see README → Benchmarks
   freeze; preserved at tag `attic/scope-freeze-2026-10`. `agent` stays a
   reserved word and an `agent` block is refused with the tag, as are
   `@pipeline_agent`/`@auto_device_transfer`. `--linear-types` (M38a) stays.
+- **General sparse tensors** (M50: the `Sparse<[shape], dtype, format>`
+  type, sparse code generation and planning, the COO/CSR/CSC/BSR runtime
+  library, its SpMM/SpMV kernels and `nsl_sparse_*` ABI rows) — **Removed**
+  in 2026-11; preserved at tag `attic/sparse-tensors-2026-11`. Nothing
+  could construct a value of the type. A `Sparse<...>` annotation and the
+  `@layout` decorator are refused with the tag. The weight-aware sparsity
+  report (`--weights`, `--sparse-threshold`) stays.
 - **Distributed** — tensor / pipeline / context parallelism, MoE serving.
 - **Inference serving** — speculative decoding, paged KV, disaggregated serving.
 - **Non-CUDA GPU backends** (M47: AMDGPU/ROCm, Metal, WGSL/WebGPU KIR printers)

@@ -126,6 +126,17 @@ pub struct CshaPlan {
     /// overrides were applied verbatim. Stable wire shape; consumed by
     /// `--csha-report` and the Phase 3 decision explainer.
     pub override_diagnostics: Vec<OverrideDiagnostic>,
+    /// Whether the layer shape the plan was made on is the model's own
+    /// (`true`) or a nominal one. Set by the train-block bridge
+    /// (`stmt_pass_bridges::invoke_csha_if_enabled`), which is where the
+    /// model's shape is known; `false` from [`run`] itself.
+    pub shape_from_model: bool,
+    /// The shape the plan was made on and the head count, for the report.
+    pub planned_shape: Option<(LayerShape, u32)>,
+    /// Names of the attention kernels this build actually emits, when the
+    /// bridge knows them. The report marks a planned kernel spec that is
+    /// not among them as not emitted.
+    pub emitted_kernels: Vec<String>,
 }
 
 /// A.5: aggregated HBM-traffic savings across every CSHA-active layer
@@ -242,18 +253,31 @@ impl CshaPlan {
         writeln!(s, "=== CSHA Compilation Report ===").unwrap();
         writeln!(s, "Mode: {}", self.mode.as_str()).unwrap();
         writeln!(s, "Target GPU: {}", self.target_gpu).unwrap();
-        // What the numbers below are, so they are not read as measurements
-        // of this model: the traffic figures come from a byte-count model on
-        // a nominal layer shape (`run_on_wengert`'s default, not the model's
-        // dimensions), and each time is that byte count divided by the
+        // What the numbers below are, so they are not read as measurements:
+        // the traffic figures come from a byte-count model on the layer
+        // shape named here, and each time is that byte count divided by the
         // GPU's peak bandwidth — so every "speedup" equals its traffic ratio
         // by construction. Training builds emit the Level-1 configuration
         // (`compiler/kernel.rs`): a level above it is planned, not emitted.
+        let shape_line = match (self.shape_from_model, self.planned_shape) {
+            (true, Some((sh, heads))) => format!(
+                "this model's attention shape (batch {}, sequence {}, d_model {}, {} heads of \
+                 {}, {} KV heads)",
+                sh.batch, sh.seq, sh.d_model, heads, sh.head_dim, sh.n_kv_heads
+            ),
+            (false, Some((sh, heads))) => format!(
+                "a nominal layer shape (batch {}, sequence {}, d_model {}, {} heads of {}, {} \
+                 KV heads), because this model's attention shape could not be determined at \
+                 compile time",
+                sh.batch, sh.seq, sh.d_model, heads, sh.head_dim, sh.n_kv_heads
+            ),
+            (_, None) => "a nominal layer shape, not the model's".to_string(),
+        };
         writeln!(
             s,
-            "Note: traffic and time figures are a bandwidth model on a nominal layer \
-             shape, not measurements of this model; training builds emit the Level-1 \
-             kernel configuration whatever level is planned below."
+            "Note: traffic and time figures are a bandwidth model on {shape_line}, not \
+             measurements; training builds emit the Level-1 kernel configuration whatever \
+             level is planned below."
         )
         .unwrap();
         writeln!(s).unwrap();
@@ -357,7 +381,23 @@ impl CshaPlan {
                 .iter()
                 .find(|k| k.layer == plan.layer)
             {
-                writeln!(s, "  Kernel: {}", kspec.kernel_name).unwrap();
+                // Name a kernel as the build's only when the build emits
+                // it. The spec planned for a level above the one emitted
+                // names a kernel that does not exist in the object.
+                if self.emitted_kernels.contains(&kspec.kernel_name) {
+                    writeln!(s, "  Kernel: {}", kspec.kernel_name).unwrap();
+                } else if self.emitted_kernels.is_empty() {
+                    writeln!(s, "  Kernel spec (planned, not emitted): {}", kspec.kernel_name)
+                        .unwrap();
+                } else {
+                    writeln!(
+                        s,
+                        "  Kernel spec (planned, not emitted): {}\n  Kernel emitted: {}",
+                        kspec.kernel_name,
+                        self.emitted_kernels.join(", ")
+                    )
+                    .unwrap();
+                }
             }
             if let Some(pat) = self.patterns.get(&plan.layer) {
                 // Report honesty: the GQA zero-copy strategy is planned by
@@ -495,7 +535,7 @@ fn downgrade_until_feasible(
 /// 5070 Ti every "smem_..._exceeds_180kb" negotiation message cited a
 /// budget for hardware that wasn't there. The detection result (or its
 /// absence) is printed once per process so plan reports are attributable.
-fn resolve_gpu_spec(target: &str) -> &'static GpuSpec {
+pub(crate) fn resolve_gpu_spec(target: &str) -> &'static GpuSpec {
     if let Some(gpu) = find_gpu(target) {
         return gpu;
     }
@@ -563,6 +603,9 @@ pub fn run(input: CshaInput) -> CshaPlan {
             marks: Vec::new(),
             solve_us: t0.elapsed().as_micros() as u64,
             override_diagnostics: Vec::new(),
+            shape_from_model: false,
+            planned_shape: None,
+            emitted_kernels: Vec::new(),
         };
     }
 
@@ -720,6 +763,9 @@ pub fn run(input: CshaInput) -> CshaPlan {
         marks: Vec::new(),
         solve_us: 0,
         override_diagnostics: Vec::new(),
+        shape_from_model: false,
+        planned_shape: None,
+        emitted_kernels: Vec::new(),
     };
     let mut diags = Vec::<String>::new();
     let bridge = crate::csha_apply::bridge(
@@ -756,6 +802,9 @@ pub fn run(input: CshaInput) -> CshaPlan {
         marks: bridge.marks,
         solve_us: t0.elapsed().as_micros() as u64,
         override_diagnostics,
+        shape_from_model: false,
+        planned_shape: Some((input.shape, input.n_heads)),
+        emitted_kernels: Vec::new(),
     }
 }
 

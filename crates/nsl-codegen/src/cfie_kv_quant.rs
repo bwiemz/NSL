@@ -1,27 +1,37 @@
-//! CFIE — per-layer KV-cache precision selection.
+//! CFIE — an advisory per-layer KV-cache precision ranking.
 //!
-//! Paper §7: instead of a uniform INT8 / FP16 KV cache across every
-//! layer, the compiler analyses attention projection weights and
-//! assigns a precision per layer:
+//! **Nothing applies this plan.** The KV pool is FP16 in every layer: that
+//! is the only precision the decode block writes and reads, and no kernel
+//! quantizes keys or values into the cache. (Per-layer INT8/FP16 read
+//! kernels existed once; with no writer for the INT8 half they could
+//! never be launched correctly and were removed.) The plan is printed in
+//! the build report for `kv_quant: "auto"`, labelled as not applied.
+//!
+//! **The ranking is relative, not a measure of sensitivity.** With weight
+//! data the top singular value (sigma_max) of each layer's K-projection
+//! and V-projection weight is computed (the deterministic randomized SVD
+//! in [`crate::wrga_spectral`], fixed seed), and the values are min-max
+//! scaled across the layers of THIS model to [0, 1] — per metric, K
+//! sigmas across layers and V sigmas across layers. So the layer with the
+//! smallest sigma always scores 0 and the one with the largest always 1,
+//! whether the spread between them is a factor of a thousand or of
+//! 1.0001: the score says where a layer stands among its siblings and
+//! nothing about how much error its cache tolerates. (When every measured
+//! value is equal the scaled value is defined as 0.5.) Published work
+//! finds per-layer KV sensitivity to be model-specific and searched
+//! offline, not readable from a weight norm; see the CFIE errata, Part 2.
+//!
+//! The paper's positional prior, which the score blends in:
 //!
 //!   * Layer 0         → FP16 K, FP16 V  (high position sensitivity)
 //!   * Layer 1         → FP16 K, INT8 V  (K needs position precision)
 //!   * Mid layers 2..L-2 → INT8 K, INT8 V  (low sensitivity)
 //!   * Final layer     → FP16 K, FP16 V  (high impact on output)
 //!
-//! When weight data is available we perform *real* spectral analysis:
-//! the top singular value (sigma_max) of each layer's K-projection and
-//! V-projection weight is computed via the deterministic randomized SVD
-//! in [`crate::wrga_spectral`] (fixed seed → identical results across
-//! runs).  Raw sigma_max values are normalised **per metric** (K-proj
-//! sigmas across layers, V-proj sigmas across layers) with min-max
-//! scaling to [0, 1]; when every measured value is equal (degenerate
-//! spectrum) the normalised value is defined as 0.5.
-//!
-//! With weights present, the measured spectral score dominates:
+//! With weights present, the scaled spectral value dominates:
 //! `score = 0.7 * spectral + 0.3 * position`.  Without weights (or for
-//! a layer whose projections cannot be found by name) we fall back to
-//! the position-based prior: `score = 0.7 * position + 0.3 * 0.5`.
+//! a layer whose projections cannot be found by name) the score falls
+//! back to the positional prior: `score = 0.7 * position + 0.3 * 0.5`.
 //!
 //! Note on the "first RoPE layer": true RoPE-awareness requires model
 //! IR that is not available at this planning layer, so layer 0 is used
@@ -202,10 +212,12 @@ fn sigma_max(entry: &WeightEntry) -> Option<f64> {
     sv.first().copied().filter(|s| s.is_finite())
 }
 
-/// Min-max normalise the measured values across layers to [0, 1].
-/// `None` entries (layer had no weight) stay `None`.  Degenerate case
-/// (all measured values equal, including a single measurement) maps
-/// every measured value to 0.5.
+/// Min-max scale the measured values across layers to [0, 1]: a RANK
+/// among this model's layers, not an absolute quantity (the smallest
+/// always maps to 0 and the largest to 1, whatever they are — see the
+/// module documentation).  `None` entries (layer had no weight) stay
+/// `None`.  Degenerate case (all measured values equal, including a
+/// single measurement) maps every measured value to 0.5.
 fn min_max_normalize(raw: &[Option<f64>]) -> Vec<Option<f64>> {
     let measured: Vec<f64> = raw.iter().filter_map(|v| *v).collect();
     if measured.is_empty() {
@@ -650,6 +662,32 @@ mod tests {
         // forced High by position alone (0.3*1.0 = 0.3 → Medium).
         assert_ne!(plan.layers[0].sensitivity, Sensitivity::High);
         assert_eq!(plan.layers[0].k_precision, KvPrecision::Fp16);
+    }
+
+    /// The score is a rank among this model's layers. A model whose layer
+    /// 3 has a top singular value 0.2% above the others and one where it
+    /// is 200 times theirs get the same scores and the same plan: nothing
+    /// in the score is a measure of how sensitive a layer is. (This is
+    /// why the build report labels the plan a relative ranking, and why
+    /// nothing applies it.)
+    #[test]
+    fn the_score_is_relative_to_the_models_other_layers() {
+        let cfg = KvQuantConfig::new(8, 4, 64);
+        let barely = plan(&cfg, Some(&synthetic_weights(8, |i| if i == 3 { 1.002 } else { 1.0 })));
+        let hugely = plan(&cfg, Some(&synthetic_weights(8, |i| if i == 3 { 200.0 } else { 1.0 })));
+        for (a, b) in barely.layers.iter().zip(&hugely.layers) {
+            assert!(
+                (a.sensitivity_score - b.sensitivity_score).abs() < 1e-3,
+                "layer {}: {} against {}",
+                a.layer,
+                a.sensitivity_score,
+                b.sensitivity_score
+            );
+            assert_eq!(a.sensitivity, b.sensitivity, "layer {}", a.layer);
+            assert_eq!((a.k_precision, a.v_precision), (b.k_precision, b.v_precision));
+        }
+        assert_eq!(barely.layers[3].sensitivity, Sensitivity::High, "0.2% above its siblings");
+        assert_eq!(barely.layers[4].sensitivity, Sensitivity::Low);
     }
 
     #[test]

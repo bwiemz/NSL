@@ -598,13 +598,10 @@ tokenizer demo_tokenizer(algorithm=bpe, vocab_size=1024):
         strategy = longest_first
 
 dataset train_data("demo"):
-    source = "data.bin"
-    format = binary
-    sequence_length = 128
     packing = true
-    pack_separator = 0
-    shuffle = false
-    max_samples = 100
+    max_sequence_length = 128
+    mean_doc_length = 32
+    doc_length_stddev = 8
 "#;
     let diags = check_source_all(src);
     let relevant: Vec<_> = diags
@@ -643,7 +640,7 @@ tokenizer bad_tokenizer(algorithm=bpe, vocab_size=128):
 fn test_dataset_unknown_field_reports_error() {
     let src = r#"
 dataset bad_data("demo"):
-    source = "data.bin"
+    packing = true
     unexpected = 1
 "#;
     let diags = check_source(src);
@@ -680,15 +677,14 @@ tokenizer dup_sections(algorithm=bpe, vocab_size=128):
 fn test_duplicate_dataset_field_reports_error() {
     let src = r#"
 dataset dup_fields("demo"):
-    source = "data.bin"
-    sequence_length = 128
-    sequence_length = 256
+    max_sequence_length = 128
+    max_sequence_length = 256
 "#;
     let diags = check_source(src);
     assert!(
         diags
             .iter()
-            .any(|d| format!("{:?}", d).contains("duplicate dataset field 'sequence_length'")),
+            .any(|d| format!("{:?}", d).contains("duplicate dataset field 'max_sequence_length'")),
         "expected duplicate dataset field error, got: {:?}",
         diags
     );
@@ -704,8 +700,7 @@ fn v9_m4_mean_doc_length_accepts_float_literal() {
     // The semantic checker must accept these; codegen rounds to u32.
     let src = r#"
 dataset calibrated("demo"):
-    source = "data.bin"
-    sequence_length = 1024
+    max_sequence_length = 1024
     packing = true
     mean_doc_length = 384.7
     doc_length_stddev = 42.5
@@ -724,8 +719,7 @@ fn v9_m4_mean_doc_length_still_accepts_int_literal() {
     // Backwards compatibility: existing Int-literal fixtures must keep working.
     let src = r#"
 dataset intcorpus("demo"):
-    source = "data.bin"
-    sequence_length = 1024
+    max_sequence_length = 1024
     packing = true
     mean_doc_length = 384
     doc_length_stddev = 42
@@ -744,8 +738,7 @@ fn v9_m4_mean_doc_length_rejects_string() {
     // The widening is Int|Float only — not "anything goes". String must still error.
     let src = r#"
 dataset weird("demo"):
-    source = "data.bin"
-    sequence_length = 1024
+    max_sequence_length = 1024
     packing = true
     mean_doc_length = "not a number"
 "#;
@@ -767,8 +760,7 @@ dataset weird("demo"):
 fn v9_l4_mean_doc_length_rejects_negative_int() {
     let src = r#"
 dataset bad_stats("demo"):
-    source = "data.bin"
-    sequence_length = 1024
+    max_sequence_length = 1024
     packing = true
     mean_doc_length = -50
 "#;
@@ -786,8 +778,7 @@ dataset bad_stats("demo"):
 fn v9_l4_doc_length_stddev_rejects_negative_float() {
     let src = r#"
 dataset bad_stats("demo"):
-    source = "data.bin"
-    sequence_length = 1024
+    max_sequence_length = 1024
     packing = true
     doc_length_stddev = -3.14
 "#;
@@ -802,30 +793,9 @@ dataset bad_stats("demo"):
 }
 
 #[test]
-fn v9_l4_sequence_length_rejects_negative() {
-    // Pre-v9 gap: `sequence_length` also silently wraps to a huge u32
-    // downstream when negative. v9 L4 closes this for all length fields.
-    let src = r#"
-dataset seq_len_bad("demo"):
-    source = "data.bin"
-    sequence_length = -100
-"#;
-    let diags = check_source(src);
-    assert!(
-        diags
-            .iter()
-            .any(|d| format!("{:?}", d).contains("dataset sequence_length must be non-negative")),
-        "v9 L4: negative sequence_length must be refused up-front; got: {:?}",
-        diags
-    );
-}
-
-#[test]
 fn v9_l4_max_sequence_length_rejects_negative() {
     let src = r#"
 dataset ms_bad("demo"):
-    source = "data.bin"
-    sequence_length = 1024
     packing = true
     max_sequence_length = -1024
 "#;
@@ -839,26 +809,100 @@ dataset ms_bad("demo"):
     );
 }
 
+/// Every field a `dataset` block used to accept and nothing read. The
+/// block in the last case is the one that compiled and ran with no effect:
+/// a file that does not exist, a filter that rejects everything, a shuffle
+/// and a sample limit.
 #[test]
-fn v9_l4_separator_token_id_still_allows_any_int() {
-    // separator_token_id is a token id (which can legally be negative
-    // as a sentinel). It intentionally stays out of the L4 non-negative
-    // check. This test pins that behavior so a future L4 extension
-    // doesn't accidentally sweep it in.
-    let src = r#"
-dataset with_neg_sep("demo"):
-    source = "data.bin"
-    sequence_length = 1024
+fn dataset_fields_nothing_consumes_are_refused_by_name() {
+    for (field, value) in [
+        ("source", "\"this/file/does/not/exist.bin\""),
+        ("format", "parquet"),
+        ("transform", "keep_nothing"),
+        ("filter", "keep_nothing"),
+        ("shuffle", "true"),
+        ("shuffle_buffer", "5"),
+        ("max_samples", "10"),
+        ("sequence_length", "2048"),
+        ("pack_separator", "0"),
+        ("separator_token_id", "2"),
+        ("resume_from", "\"nowhere\""),
+    ] {
+        let src = format!(
+            r#"
+fn keep_nothing(x: Tensor) -> bool:
+    return false
+
+dataset train_data("corpus"):
     packing = true
-    separator_token_id = -1
+    {field} = {value}
+"#
+        );
+        let diags = check_source(&src);
+        let needle = format!("dataset field '{field}' is not supported");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.level == nsl_errors::Level::Error && d.message.contains(&needle)),
+            "{field}: expected an error containing {needle:?}, got: {diags:?}"
+        );
+    }
+}
+
+/// Code generation reads the accepted fields as literals and nothing else,
+/// so a name or an expression there used to type-check and then count as
+/// "not given".
+#[test]
+fn dataset_fields_must_be_literals() {
+    for (field, value) in [
+        ("packing", "USE_PACKING"),
+        ("max_sequence_length", "MAX_LEN"),
+        ("max_sequence_length", "1024 * 2"),
+        ("mean_doc_length", "MAX_LEN"),
+        ("doc_length_stddev", "0.5 * 100.0"),
+    ] {
+        let src = format!(
+            r#"
+const USE_PACKING = true
+const MAX_LEN = 2048
+
+dataset corpus("demo"):
+    {field} = {value}
+"#
+        );
+        let diags = check_source(&src);
+        let needle = format!("dataset {field} must be a literal");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.level == nsl_errors::Level::Error && d.message.contains(&needle)),
+            "{field} = {value}: expected an error containing {needle:?}, got: {diags:?}"
+        );
+    }
+}
+
+/// The four fields code generation reads are the whole accepted set, and a
+/// block no longer has to name a `source` it would not open.
+#[test]
+fn dataset_packing_statistics_are_accepted_without_a_source() {
+    let src = r#"
+dataset corpus("demo"):
+    packing = true
+    max_sequence_length = 2048
+    mean_doc_length = 400
+    doc_length_stddev = 120.5
 "#;
     let diags = check_source(src);
     let errs: Vec<_> = diags.iter().filter(|d| d.level == nsl_errors::Level::Error).collect();
-    assert!(
-        errs.is_empty(),
-        "v9 L4: separator_token_id must continue accepting any i64 (including negative sentinels); got: {:?}",
-        errs
-    );
+    assert!(errs.is_empty(), "{errs:?}");
+
+    let alias = r#"
+dataset corpus("demo"):
+    max_seq_len = 2048
+"#;
+    let diags = check_source(alias);
+    let errs: Vec<_> = diags.iter().filter(|d| d.level == nsl_errors::Level::Error).collect();
+    assert!(errs.is_empty(), "{errs:?}");
 }
 
 #[test]
@@ -868,8 +912,7 @@ fn v9_l4_zero_length_still_allowed() {
     // separately (that's a semantic error, not a "wrong sign" one).
     let src = r#"
 dataset zero_ok("demo"):
-    source = "data.bin"
-    sequence_length = 0
+    max_sequence_length = 0
 "#;
     let diags = check_source(src);
     // The L4 check itself should not fire. (Other checks may fire but not
@@ -1613,6 +1656,22 @@ let m = MyModel()
     assert_eq!(cfg.alpha, Some(8), "alpha must be captured from decorator");
 }
 
+/// Gated LoRA scales its update by alpha / rank exactly as LoRA does, so an
+/// alpha on it draws no warning; IA3 has no such factor and says so. (The
+/// warning used to claim alpha was ignored for gated LoRA as well.)
+#[test]
+fn adapter_alpha_warns_for_ia3_only() {
+    let warns = |kind: &str| -> bool {
+        let src = format!(
+            "\n@adapter(type={kind}, target=[\"m.w\"], rank=4, alpha=8)\nlet m = MyModel()\n"
+        );
+        analyze_source(&src).diagnostics.iter().any(|d| d.message.contains("alpha"))
+    };
+    assert!(!warns("lora"));
+    assert!(!warns("gatedlora"));
+    assert!(warns("ia3"));
+}
+
 #[test]
 fn adapter_alpha_defaults_to_rank_when_absent() {
     let src = r#"
@@ -1624,24 +1683,61 @@ let m = MyModel()
     assert_eq!(cfg.alpha, None, "absent alpha stays None; codegen defaults to rank");
 }
 
+/// `mode=hybrid` (the compiler places adapters inside `layers=[...]`) and a
+/// `layers=` scope under any other mode are refused: nothing places an
+/// adapter automatically, so both used to be accepted and change nothing.
 #[test]
-fn wrga_hybrid_without_layers_errors() {
-    let src = r#"
-@wrga(mode=hybrid)
+fn wrga_hybrid_mode_and_its_layer_scope_are_refused() {
+    for (decorator, needle) in [
+        ("@wrga(mode=hybrid)", "mode=hybrid) is not supported"),
+        ("@wrga(mode=hybrid, layers=[\"blocks.6\"])", "mode=hybrid) is not supported"),
+        ("@wrga(mode=manual, layers=[\"blocks.6\"])", "`layers=` is the scope of mode=hybrid"),
+        ("@wrga(layers=[\"blocks.6\"])", "`layers=` is the scope of mode=hybrid"),
+    ] {
+        let src = format!(
+            r#"
+{decorator}
 model Toy:
     layer lin: Linear<16, 16>
 
     fn forward(self, x: Tensor<[4, 16], f32>) -> Tensor<[4, 16], f32>:
         return self.lin(x)
-"#;
-    let res = analyze_source(src);
-    assert!(
-        res.diagnostics
-            .iter()
-            .any(|d| format!("{:?}", d).contains("hybrid) requires a `layers=")),
-        "expected hybrid-mode layer-scope error, got: {:?}",
-        res.diagnostics
-    );
+"#
+        );
+        let res = analyze_source(&src);
+        assert!(
+            res.diagnostics.iter().any(|d| format!("{:?}", d).contains(needle)),
+            "{decorator}: expected `{needle}`, got: {:?}",
+            res.diagnostics
+        );
+    }
+    // The modes that mean something are accepted.
+    for decorator in ["@wrga(mode=auto)", "@wrga(mode=manual)", "@wrga"] {
+        let src = format!("\n{decorator}\nlet m = MyModel()\n");
+        let res = analyze_source(&src);
+        assert!(
+            !res.diagnostics.iter().any(|d| format!("{:?}", d).contains("@wrga")),
+            "{decorator} should be accepted, got: {:?}",
+            res.diagnostics
+        );
+    }
+}
+
+/// `target=` is carried as text, whether written as an identifier or as a
+/// string. A string used to store the argument's own name, "target".
+#[test]
+fn wrga_target_is_the_name_written_as_identifier_or_string() {
+    for decorator in ["@wrga(target=h100)", "@wrga(target=\"h100\")"] {
+        let src = format!("\n{decorator}\nlet m = MyModel()\n");
+        let res = analyze_source(&src);
+        assert_eq!(
+            res.wrga_configs[0].target_name.as_deref(),
+            Some("h100"),
+            "{decorator}"
+        );
+    }
+    let res = analyze_source("\n@wrga\nlet m = MyModel()\n");
+    assert_eq!(res.wrga_configs[0].target_name, None);
 }
 
 #[test]
@@ -2489,8 +2585,53 @@ model Attention:
 // CFTP §4.3 G2 Strategy 3 (Item 4): @pca decorator collection tests
 // -----------------------------------------------------------------------
 
+/// `per_document` and `off` are recognised and refused: the first cannot
+/// be launched, the second was read by nothing. Neither may reach code
+/// generation as a strategy.
 #[test]
-fn pca_decorator_per_document_strategy_is_captured() {
+fn pca_decorator_refuses_the_strategies_nothing_honours() {
+    for (strategy, needle) in [
+        ("per_document", "@pca(strategy = per_document) is not supported"),
+        ("per_doc", "@pca(strategy = per_document) is not supported"),
+        ("off", "@pca(strategy = off) is not supported"),
+    ] {
+        let src = format!(
+            r#"
+model Tiny:
+    w: Tensor = ones([2, 1])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+let m = Tiny()
+let x = ones([4, 2])
+
+@pca(strategy = {strategy})
+train(model = m, epochs = 5):
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let pred = m.forward(x)
+"#
+        );
+        let res = analyze_source(&src);
+        assert!(
+            res.diagnostics.iter().any(|d| {
+                matches!(d.level, nsl_errors::Level::Error) && d.message.contains(needle)
+            }),
+            "{strategy}: expected an error containing {needle:?}, got {:?}",
+            res.diagnostics
+        );
+        assert_eq!(res.pca_configs.len(), 1);
+        assert!(
+            matches!(res.pca_configs[0].strategy, crate::cftp::PcaStrategy::Auto),
+            "{strategy}: a refused strategy must not be carried on: {:?}",
+            res.pca_configs[0].strategy
+        );
+    }
+}
+
+#[test]
+fn pca_decorator_segment_id_strategy_is_captured() {
     let src = r#"
 model Tiny:
     w: Tensor = ones([2, 1])
@@ -2501,26 +2642,25 @@ model Tiny:
 let m = Tiny()
 let x = ones([4, 2])
 
-@pca(strategy = per_document)
+@pca(strategy = segment_id)
 train(model = m, epochs = 5):
     optimizer: SGD(lr = 0.01)
     step(batch):
         let pred = m.forward(x)
 "#;
     let res = analyze_source(src);
-    assert_eq!(
-        res.pca_configs.len(),
-        1,
-        "expected one @pca config, got {:?}",
-        res.pca_configs.len()
-    );
+    assert_eq!(res.pca_configs.len(), 1);
     assert!(
-        matches!(
-            res.pca_configs[0].strategy,
-            crate::cftp::PcaStrategy::PerDocument
-        ),
+        matches!(res.pca_configs[0].strategy, crate::cftp::PcaStrategy::SegmentId),
         "strategy mismatch: {:?}",
         res.pca_configs[0].strategy
+    );
+    assert!(
+        !res.diagnostics
+            .iter()
+            .any(|d| matches!(d.level, nsl_errors::Level::Error) && d.message.contains("@pca")),
+        "{:?}",
+        res.diagnostics
     );
 }
 
@@ -2583,7 +2723,7 @@ train(model = m, epochs = 1):
 fn pca_decorator_multiple_occurrences_are_collected() {
     let src = r#"
 let m = Tiny()
-@pca(strategy = per_document)
+@pca(strategy = auto)
 train(model = m, epochs = 1):
     optimizer: SGD(lr = 0.01)
     step(batch):
@@ -2912,6 +3052,66 @@ fn distill_epochs_zero_is_refused_like_train() {
         errs.iter().any(|m| m.contains("distill 'epochs' must be >= 1")),
         "distill epochs=0 must refuse, got {errs:?}"
     );
+}
+
+/// A distill block runs the train loop, so the unit of its schedule under
+/// accumulation is the same question: it can be stated, a bad value is
+/// refused by name, and leaving it out beside a stepped schedule warns.
+#[test]
+fn distill_takes_and_checks_schedule_unit_like_train() {
+    let with_schedule = |header: &str| {
+        distill_fixture(header).replace(
+            "    optimizer: SGD(lr = 0.01)\n",
+            "    optimizer: SGD(lr = 0.01)\n    scheduler: step_lr(step_size = 2, gamma = 0.5)\n",
+        )
+    };
+    let diags = |src: &str| -> (Vec<String>, Vec<String>) {
+        let all = check_source(src);
+        let pick = |level_is_error: bool| {
+            all.iter()
+                .filter(|d| matches!(d.level, nsl_errors::Level::Error) == level_is_error)
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+        };
+        (pick(true), pick(false))
+    };
+
+    let (errs, other) = diags(&with_schedule(
+        "distill(teacher = t, student = s, epochs = 1, grad_accumulation = 2):",
+    ));
+    assert!(errs.is_empty(), "{errs:?}");
+    assert!(
+        other.iter().any(|m| m.contains("the learning-rate schedule counts optimizer steps, not micro-batches")),
+        "no warning about the unit: {other:?}"
+    );
+
+    for unit in ["micro_batch", "optimizer_step"] {
+        let (errs, other) = diags(&with_schedule(&format!(
+            "distill(teacher = t, student = s, epochs = 1, grad_accumulation = 2, \
+             schedule_unit = \"{unit}\"):"
+        )));
+        assert!(errs.is_empty(), "{unit}: {errs:?}");
+        assert!(
+            !other.iter().any(|m| m.contains("the learning-rate schedule counts")),
+            "{unit}: warned although the unit is stated: {other:?}"
+        );
+    }
+
+    let (errs, _) = diags(&with_schedule(
+        "distill(teacher = t, student = s, epochs = 1, grad_accumulation = 2, \
+         schedule_unit = \"steps\"):",
+    ));
+    assert!(
+        errs.iter().any(|m| m.contains("distill 'schedule_unit' must be")),
+        "{errs:?}"
+    );
+
+    // No schedule that reads the step: nothing to state.
+    let (errs, other) = diags(&distill_fixture(
+        "distill(teacher = t, student = s, epochs = 1, grad_accumulation = 2):",
+    ));
+    assert!(errs.is_empty(), "{errs:?}");
+    assert!(!other.iter().any(|m| m.contains("the learning-rate schedule counts")), "{other:?}");
 }
 
 #[test]

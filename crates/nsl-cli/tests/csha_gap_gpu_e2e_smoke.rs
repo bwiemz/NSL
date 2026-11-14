@@ -1,4 +1,15 @@
-//! CSHA Gap-suite — **end-to-end** GPU smoke + fused-vs-baseline parity.
+//! CSHA Gap-suite — **end-to-end** GPU smoke of the toy program, per-op AD arm.
+//!
+//! This file used to have two more tests: one that trained the toy through
+//! the CSHA fused forward and backward (`--csha auto`), and one that
+//! compared that run's per-parameter weight movements with this arm's under
+//! a loose tolerance. Training through the fused pair is now a compile
+//! error, because its gradients do not match a reference (see
+//! `crates/nsl-codegen/tests/csha_training_withheld.rs` and
+//! `csha_toy_pretrain_gate.rs` in this directory), so both are gone. What
+//! is left is the arm that still exists. The history below is kept for the
+//! fixture it explains.
+//!
 //!
 //! # What this test proves
 //!
@@ -302,200 +313,5 @@ fn csha_gap_gpu_e2e_weights_change_after_one_step() {
          {stuck:?}.  Expected ALL FOUR params (wq, wk, wv, w_norm) to \
          receive a non-zero gradient and update under SGD(lr=0.05, \
          mse_loss, sin-varied input).  Full per-param deltas above."
-    );
-}
-
-/// CSHA variant: same toy program via `nsl run --csha auto` so the CSHA
-/// boundary scanner + fused-forward-with-saves + fused-backward
-/// dispatcher fire end-to-end (the baseline test above takes the
-/// per-op AD path).
-///
-/// Structural anti-vacuity: the `[csha] csha[auto]: ... chains` summary
-/// and the `CSHA fused backward: emitted dgamma` stderr lines must BOTH
-/// appear — proof the fused path actually fired rather than silently
-/// falling back to the decomposed graph.
-#[test]
-#[ignore = "requires a CUDA-capable GPU; runs the full CSHA fused-backward \
-            pipeline end-to-end including SGD writeback on f16 grads."]
-fn csha_gap_gpu_e2e_csha_fused_path() {
-    let (ok, stdout, stderr) = run_toy(&["--csha", "auto"]);
-
-    // Compile-time bellwether: BOTH diagnostic lines that prove the
-    // CSHA pass + the dgamma extract emission fired.  These are
-    // independent of runtime success.
-    let chains_line = stderr
-        .lines()
-        .find(|l| l.contains("[csha] csha[auto]:") && l.contains("chains,"));
-    assert!(
-        chains_line.is_some(),
-        "[csha-gpu-e2e-csha] missing `[csha] csha[auto]: ... chains` summary in \
-         stderr — `nsl run --csha auto` flag did not reach the CSHA pass.\n\
-         stderr:\n{stderr}"
-    );
-    eprintln!("[csha-gpu-e2e-csha] chains line: {}", chains_line.unwrap());
-
-    let dgamma_line = stderr
-        .lines()
-        .find(|l| l.contains("CSHA fused backward: emitted dgamma"));
-    assert!(
-        dgamma_line.is_some(),
-        "[csha-gpu-e2e-csha] missing `CSHA fused backward: emitted dgamma` line — \
-         the fused-backward emission arm did not fire.  Either `chain_varids` \
-         resolved to None or EmitFused took the Fallback branch.\n\
-         stderr:\n{stderr}"
-    );
-    eprintln!("[csha-gpu-e2e-csha] dgamma line: {}", dgamma_line.unwrap());
-
-    if !ok {
-        if is_driver_missing(&stderr) {
-            eprintln!(
-                "[csha-gpu-e2e-csha] SKIP — no CUDA driver.\nstderr tail:\n{}",
-                stderr.lines().rev().take(5).collect::<Vec<_>>().join("\n")
-            );
-            return;
-        }
-        panic!(
-            "[csha-gpu-e2e-csha] `nsl run --csha auto` failed.\n\n\
-             stdout:\n{stdout}\n\nstderr:\n{stderr}"
-        );
-    }
-
-    let deltas = parse_deltas(&stdout).unwrap_or_else(|e| {
-        panic!(
-            "[csha-gpu-e2e-csha] failed to parse DELTA param movements: {e}\n\
-             stdout:\n{stdout}\n\nstderr:\n{stderr}"
-        )
-    });
-    log_deltas("csha-gpu-e2e-csha", &deltas);
-
-    for (name, d) in &deltas {
-        assert!(
-            d.is_finite(),
-            "[csha-gpu-e2e-csha] DELTA_{name} = {d} is not finite — NaN here \
-             historically meant the backward divided by an unsaved \
-             row_sum=0 (softmax-state save gate) or consumed a garbage \
-             forward output (f16-as-f32 widen bug, fixed 2026-07-24)."
-        );
-    }
-
-    let stuck: Vec<&String> = deltas
-        .iter()
-        .filter(|(_, d)| *d <= MIN_DELTA_L1)
-        .map(|(n, _)| n)
-        .collect();
-    assert!(
-        stuck.is_empty(),
-        "[csha-gpu-e2e-csha] trainable param(s) did not move after one CSHA \
-         step: {stuck:?}.  The fixture makes dQ/dK mathematically nonzero, \
-         so a frozen param is a fused-backward bug, not fixture vacuity.  \
-         Full per-param deltas above."
-    );
-}
-
-/// Certification gate: fused CSHA path vs per-op AD baseline — the
-/// per-parameter L1 weight movements must AGREE.
-///
-/// One SGD step means `delta_l1 = lr * |grad|_1` exactly, so comparing
-/// movements compares gradient L1 norms: dV and dgamma (first-order
-/// paths) and dQ/dK (softmax-Jacobian second-order paths) all get
-/// checked against the decomposed reference.
-///
-/// Tolerance: the fused kernel computes through f16 SMEM tiles and
-/// stores f16 activations for the backward, so bit-parity is not
-/// expected; 5e-2 relative is the certification bar (matches the
-/// kernel-level tolerance in csha_cuda_backward.rs).
-///
-/// Anti-vacuity is enforced twice:
-///   - every baseline delta must exceed MIN_DELTA_L1 (a zero-vs-zero
-///     comparison certifies nothing — the old all-ones fixture failed
-///     exactly this way);
-///   - the fused arm's stderr must carry the chains + dgamma lines
-///     (proof the fused kernels actually ran).
-#[test]
-#[ignore = "requires a CUDA-capable GPU; runs the toy train twice \
-            (baseline + --csha auto) and compares per-param movements."]
-fn csha_gap_gpu_e2e_fused_vs_baseline_parity() {
-    let (base_ok, base_stdout, base_stderr) = run_toy(&[]);
-    if !base_ok {
-        if is_driver_missing(&base_stderr) {
-            eprintln!("[csha-parity] SKIP — no CUDA driver.");
-            return;
-        }
-        panic!(
-            "[csha-parity] baseline `nsl run` failed.\n\n\
-             stdout:\n{base_stdout}\n\nstderr:\n{base_stderr}"
-        );
-    }
-    let base = parse_deltas(&base_stdout).unwrap_or_else(|e| {
-        panic!(
-            "[csha-parity] baseline delta parse: {e}\n\
-             stdout:\n{base_stdout}\n\nstderr:\n{base_stderr}"
-        )
-    });
-
-    let (fused_ok, fused_stdout, fused_stderr) = run_toy(&["--csha", "auto"]);
-    assert!(
-        fused_ok,
-        "[csha-parity] fused `nsl run --csha auto` failed.\n\n\
-         stdout:\n{fused_stdout}\n\nstderr:\n{fused_stderr}"
-    );
-    // Anti-vacuity: the fused arm must actually have taken the fused path.
-    assert!(
-        fused_stderr
-            .lines()
-            .any(|l| l.contains("[csha] csha[auto]:") && l.contains("chains,")),
-        "[csha-parity] fused arm missing the `[csha] csha[auto]: ... chains` \
-         line — it silently ran the baseline path, the comparison is vacuous.\n\
-         stderr:\n{fused_stderr}"
-    );
-    assert!(
-        fused_stderr
-            .lines()
-            .any(|l| l.contains("CSHA fused backward: emitted dgamma")),
-        "[csha-parity] fused arm missing the `CSHA fused backward: emitted \
-         dgamma` line — fused backward did not fire.\n\
-         stderr:\n{fused_stderr}"
-    );
-    let fused = parse_deltas(&fused_stdout).unwrap_or_else(|e| {
-        panic!(
-            "[csha-parity] fused delta parse: {e}\n\
-             stdout:\n{fused_stdout}\n\nstderr:\n{fused_stderr}"
-        )
-    });
-
-    log_deltas("csha-parity baseline", &base);
-    log_deltas("csha-parity fused   ", &fused);
-
-    const REL_TOL: f64 = 5e-2;
-    let mut failures: Vec<String> = Vec::new();
-    for ((name, b), (fname, f)) in base.iter().zip(fused.iter()) {
-        assert_eq!(name, fname, "param order mismatch");
-        assert!(
-            b.is_finite() && f.is_finite(),
-            "[csha-parity] non-finite delta for {name}: baseline={b} fused={f}"
-        );
-        // Anti-vacuity: the baseline reference itself must show real
-        // movement on every param, or the comparison proves nothing.
-        assert!(
-            *b > MIN_DELTA_L1,
-            "[csha-parity] baseline delta for {name} is ~zero ({b:e}) — the \
-             fixture regressed to a degenerate probe; parity on zeros is \
-             vacuous."
-        );
-        let rel = (f - b).abs() / b;
-        eprintln!("[csha-parity] {name:>8}: baseline={b:.8} fused={f:.8} rel={rel:.4}");
-        if rel > REL_TOL {
-            failures.push(format!(
-                "{name}: baseline={b:.8} fused={f:.8} rel={rel:.4} > {REL_TOL}"
-            ));
-        }
-    }
-    assert!(
-        failures.is_empty(),
-        "[csha-parity] fused-vs-baseline weight movement diverged:\n  {}\n\
-         (one SGD step: delta_l1 = lr * |grad|_1, so this is gradient-L1 \
-         disagreement between the fused CSHA backward and the per-op AD \
-         reference)",
-        failures.join("\n  ")
     );
 }

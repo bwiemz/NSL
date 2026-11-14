@@ -17,7 +17,6 @@
 # declaration needed.
 from nsl.nn.losses import mse_loss
 
-@quantize(dtype="awq4")
 model AttentionMLP(dim: int, num_heads: int):
     head_dim: int = dim // num_heads
     q_proj: Tensor<[dim, dim], f32> = zeros([dim, dim])

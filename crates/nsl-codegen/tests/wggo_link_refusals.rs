@@ -17,7 +17,7 @@ use std::path::PathBuf;
 
 use nsl_codegen::calibration::{
     build_arena_layout, emit_calibration_model_object, emit_calibration_scaffolding_object,
-    link_calibration_binary, pre_scan_awq_projections_from_ast, DiscoveredProjection,
+    link_calibration_binary, DiscoveredProjection,
     FinalizePlanEntry, ObservePlanEntry, ProjectionRef,
 };
 use nsl_errors::{FileId, Level};
@@ -33,6 +33,19 @@ fn repo_root() -> PathBuf {
 
 fn fixture(name: &str) -> PathBuf {
     repo_root().join("tests").join("fixtures").join(name)
+}
+
+/// The two projections of the TinyMLP fixture, in forward order. A
+/// calibration caller hands these in through `calibration.retention`; they
+/// used to be scanned out of the fixture's `@quantize` decorator.
+fn tiny_mlp_projections() -> Vec<DiscoveredProjection> {
+    [("up_proj", [128, 64]), ("down_proj", [64, 128])]
+        .into_iter()
+        .map(|(field, weight_shape)| DiscoveredProjection {
+            projection: ProjectionRef(format!("TinyMLP.{field}")),
+            weight_shape,
+        })
+        .collect()
 }
 
 fn parse_awq_fixture() -> (nsl_ast::Module, Interner) {
@@ -116,6 +129,7 @@ fn forward_only_compile_options(
         },
     ));
     opts.weights.index_map = analysis.weight_index_map.clone();
+    opts.calibration.retention = Some(tiny_mlp_projections());
     // calibration_grad_retention intentionally left None.
     opts
 }
@@ -159,6 +173,7 @@ fn backward_compile_options(
         w_o_index: 1,
     }];
     opts.calibration.grad_retention = Some(targets);
+    opts.calibration.retention = Some(tiny_mlp_projections());
     opts
 }
 
@@ -201,7 +216,7 @@ fn minimal_plans_and_layout() -> (
 #[test]
 fn link_fails_when_backward_wrapper_missing() {
     let (ast, interner) = parse_awq_fixture();
-    let projections = pre_scan_awq_projections_from_ast(&ast, &interner);
+    let projections = tiny_mlp_projections();
     let arena_layout = build_arena_layout(&projections, 8, 4);
     let (observe_plan, finalize_plan, _) = minimal_plans_and_layout();
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -292,7 +307,7 @@ fn link_fails_when_backward_wrapper_missing() {
 #[test]
 fn link_succeeds_when_backward_not_needed_and_wrapper_absent() {
     let (ast, interner) = parse_awq_fixture();
-    let projections = pre_scan_awq_projections_from_ast(&ast, &interner);
+    let projections = tiny_mlp_projections();
     let arena_layout = build_arena_layout(&projections, 8, 4);
     let (observe_plan, finalize_plan, _) = minimal_plans_and_layout();
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -344,7 +359,7 @@ fn backward_wrapper_exported_with_shape_validation() {
     use object::{Object, ObjectSymbol};
 
     let (ast, interner) = parse_awq_fixture();
-    let projections = pre_scan_awq_projections_from_ast(&ast, &interner);
+    let projections = tiny_mlp_projections();
     let arena_layout = build_arena_layout(&projections, 8, 4);
     let tmp = tempfile::tempdir().expect("tempdir");
     let out_path = tmp.path().join("calib_model_bwd.o");
@@ -499,9 +514,8 @@ fn backward_batch_shape_mismatch_subprocess_returns_3() {
 
 /// PR 1b regression: when `calibration_grad_retention` is non-empty, the
 /// hook registry built in `compile_train_block` MUST contain a
-/// `WggoGradientHook` alongside the `AwqCalibrationHook`. Conversely,
-/// when `calibration_grad_retention` is None, only the AWQ hook is
-/// registered.
+/// `WggoGradientHook`. Conversely, when `calibration_grad_retention` is
+/// None or empty, no hook is registered.
 ///
 /// We exercise this through the registry-builder path used by
 /// `compile_and_calibrate`. The test inspects the registry's hook IDs

@@ -69,6 +69,10 @@ const ARITHMETIC_KEYS: &[&str] = &[
     //                 softmax state (corrupts the backward)
     // The RUNTIME-read half of the tier is `env_record.rs`.
     "fa_mma", "lce_gemm", "fase_sumsq", "fase_override", "csha_save",
+    //   fase_flush    NSL_FASE_FLUSH_TAIL      0 = a run ending inside an
+    //                 accumulation window drops its pending micro-batches
+    //                 instead of stepping on them. Emitted only when 0.
+    "fase_flush",
     // WGGO layer prune (#807): the train block's forward deletes these
     // blocks. Emitted only when a prune is requested, so an unpruned build
     // and an older checkpoint agree by both lacking them.
@@ -76,6 +80,12 @@ const ARITHMETIC_KEYS: &[&str] = &[
     //   prune_frac    --wggo-layer-prune-fraction and a digest of the
     //                 --wggo-weights file it ranks blocks by
     "prune_layers", "prune_frac",
+    // `-w` value specialization: a digest of the content hashes of the
+    // weights-file tensors the compiled code may depend on. Emitted only when
+    // there are any (a build that specializes on nothing, and an older
+    // checkpoint, agree by both lacking it). A resume under a program
+    // specialized on other values is a different computation.
+    "wspec",
 ];
 
 /// Keys that move bytes without changing the value computed.
@@ -234,7 +244,7 @@ mod tests {
 
     #[test]
     fn the_compile_time_environment_keys_are_arithmetic_class() {
-        for k in ["fa_mma", "lce_gemm", "fase_sumsq", "fase_override", "csha_save"] {
+        for k in ["fa_mma", "lce_gemm", "fase_sumsq", "fase_override", "csha_save", "fase_flush"] {
             assert!(super::ARITHMETIC_KEYS.contains(&k), "{k}");
             assert!(!super::PLACEMENT_KEYS.contains(&k), "{k}");
         }

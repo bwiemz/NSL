@@ -48,9 +48,10 @@ fn tiny_tape(n: u32) -> WengertList {
 fn minimal_wrga_plan(tape: &WengertList) -> nsl_codegen::wrga::WrgaPlan {
     nsl_codegen::wrga::run(nsl_codegen::wrga::WrgaInput {
         mode: nsl_ast::block::WrgaMode::Auto,
-        trainable_patterns: Vec::new(),
-        manual_adapter_targets: Vec::new(),
-        hybrid_layers: Vec::new(),
+        trainable_patterns: vec!["*"],
+        declared_adapters: Default::default(),
+        param_shapes: Default::default(),
+        fused_kernels_active: false,
         wengert: tape,
         loss_output: tape.output,
         weights: None,

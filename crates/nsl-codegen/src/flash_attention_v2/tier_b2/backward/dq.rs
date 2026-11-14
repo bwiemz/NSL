@@ -110,6 +110,8 @@ fn emit_register_decls(ptx: &mut String, config: &FlashAttentionConfig) {
     // NOTE: user register named %r_tid (not %tid) to avoid shadowing the PTX special register
     // %tid (a vector); ptxas rejects %tid.x when %tid is declared as a user u32.
     ptx.push_str("    .reg .u32 %r_tid, %lane_id, %warp_id;\n");
+    // Scratch predicate of `emit_ds_clamp`.
+    ptx.push_str("    .reg .pred %p_ds_clamp;\n");
     // Sprint 1 cycle-4: dq.rs uses ONLY a Q-axis band base (no KV-axis
     // dual-use, unlike dkdv.rs). The `_q` suffix codifies this invariant
     // explicitly. The 4-delimiter absence check in the test module verifies
@@ -987,6 +989,26 @@ fn emit_intra_tile_causal_mask(ptx: &mut String, config: &FlashAttentionConfig) 
     ptx.push_str("    selp.f32 %s_d3, %f_neg_inf, %s_d3, %p_cm_3;\n");
 }
 
+/// Saturate the four dS values a lane holds at f16's largest finite
+/// magnitude before they are narrowed for the tensor-core matmul.
+///
+/// The launcher prescales dO so that its largest element is in [64, 128)
+/// (`CSHA_BWD_GRAD_SCALE_EXP` in nsl-runtime's `flash_attention.rs`), and
+/// dS = P * (dP - D) is bounded by `|dO_row| * |V_row|` in those units. A
+/// value row hundreds of times its usual norm, aligned with a gradient row
+/// that is all maximum, could push it past 65504; `cvt.rn.f16.f32` would
+/// turn that into infinity and the whole step's gradient into NaN, where
+/// saturating costs one element its tail. Ordered compares, so a NaN dS
+/// stays NaN and is still visible downstream.
+fn emit_ds_clamp(ptx: &mut String) {
+    for i in 0..4 {
+        ptx.push_str(&format!("    setp.gt.f32 %p_ds_clamp, %ds_{i}, 0f477FE000;  // > 65504 (f16 max)\n"));
+        ptx.push_str(&format!("    @%p_ds_clamp mov.f32 %ds_{i}, 0f477FE000;\n"));
+        ptx.push_str(&format!("    setp.lt.f32 %p_ds_clamp, %ds_{i}, 0fC77FE000;  // < -65504\n"));
+        ptx.push_str(&format!("    @%p_ds_clamp mov.f32 %ds_{i}, 0fC77FE000;\n"));
+    }
+}
+
 /// F1: Scatter each lane's 4 dS f32 values to the row-major dS tile in SMEM.
 ///
 /// Per PTX m16n8 D-fragment layout, lane `t` holds:
@@ -1067,6 +1089,7 @@ fn emit_ds_scatter_to_smem(ptx: &mut String, config: &FlashAttentionConfig) {
 
     // 4 stores: convert each f32 dS value to f16, scatter into the row-major dS
     // tile in SMEM (the dQ A-fragment reads it as packed f16).
+    emit_ds_clamp(ptx);
     ptx.push_str("    cvt.rn.f16.f32 %ds_h0, %ds_0;\n");
     ptx.push_str("    st.shared.b16 [%f1_addr_lolo], %ds_h0;\n");
     ptx.push_str("    cvt.rn.f16.f32 %ds_h1, %ds_1;\n");

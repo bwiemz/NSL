@@ -214,6 +214,10 @@ def build() -> int:
         "method": decon_raw["method"],
         "benchmarks": decon_raw["benchmarks"],
         "benchmark_line_count": decon_raw["benchmark_line_count"],
+        # How many benchmark problems the method cannot see (all lines under
+        # its length floor). Absent from reports written before
+        # decontaminate.py measured it.
+        **({"coverage": decon_raw["coverage"]} if "coverage" in decon_raw else {}),
         "sets": {
             name: {
                 "documents": e["documents"],

@@ -106,7 +106,7 @@ The FlashAttention implementation includes tree-structured causal masks to suppo
 **Runtime**: `moe/` module
 
 ```
-@moe(num_experts=8, top_k=2, capacity_factor=1.25, aux_loss_coeff=0.01)
+@moe(num_experts=8, top_k=2, capacity_factor=1.25)
 model MoELayer:
     experts: [FFN; 8]
     gate: Linear
@@ -117,7 +117,7 @@ model MoELayer:
 
 Implementation:
 - **Router**: Softmax-based top-k routing with capacity tracking
-- **Load balancing**: Auxiliary loss (importance + load) to prevent expert collapse
+- **Load balancing**: none applied. MoE dispatch is inference-only (no backward rule), so `@moe(aux_loss_coeff=…)` is refused at compile time; the importance and load terms exist only as a runtime routine that nothing calls
 - **Token dispatch**: Scatter/gather operations for routing tokens to selected experts
 - **Capacity factor**: Controls maximum tokens per expert (overflow → dropped or routed to fallback)
 
@@ -203,9 +203,7 @@ Reduces KV-cache memory footprint:
 | INT4 per-group | 4-bit quantization with group scaling |
 | FP8 | 8-bit floating point (E4M3) |
 
-Additional compression strategies:
-- **H2O (Heavy Hitter Oracle)**: Evicts KV entries with lowest cumulative attention scores, preserving "sink tokens" (first few tokens that receive disproportionate attention)
-- **Sliding window**: Only retains recent KV entries within a fixed window size
+These are block quantizers in the runtime library. The paged KV cache stores K and V uncompressed and calls none of them, and `@kv_compress` is a refused decorator. The H2O and sliding-window eviction managers that used to be listed here had no caller and were removed.
 
 ---
 

@@ -19,10 +19,10 @@
 #     nested sub-model; GatedLoRA on a top-level field.
 # Every tensor feeds the loss, so each one gets a nonzero gradient.
 #
-# The harness reads the struct fields from `model_save` before and after
-# training, and the adapters' side-table tensors, which `model_save` does not
-# write, from `snapshot`: each `ADAPTER <path>` line is followed by that
-# tensor, `*` standing for the array index in iteration order. `snapshot`
+# The harness reads the struct fields and the adapters' tensors from
+# `model_save` before and after training, and the adapters' tensors again
+# from `snapshot`, which must agree: each `ADAPTER <path>` line is followed by
+# that tensor, `*` standing for the array index in iteration order. `snapshot`
 # must print every adapter the declarations below create -- the harness
 # derives that set from them and fails on one that is missing. The scalar
 # fields come the same way, as `SCALAR <path>` lines each followed by the

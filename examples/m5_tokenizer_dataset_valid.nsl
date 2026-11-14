@@ -14,13 +14,11 @@ tokenizer demo_tokenizer(algorithm=bpe, vocab_size=1024):
         max_length = 128
         strategy = longest_first
 
+# A dataset block declares packing statistics for attention planning. It
+# loads no data: that is load_mmap(...) and DataLoader(...).
 dataset train_data("demo"):
-    source = "data.bin"
-    format = binary
-    sequence_length = 128
     packing = true
-    pack_separator = 0
-    shuffle = false
-    max_samples = 100
+    max_sequence_length = 128
+    mean_doc_length = 32
 
 print("ok")

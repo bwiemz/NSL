@@ -31,6 +31,9 @@ pub(crate) struct PreForwardPlanInputs<'a> {
     pub(crate) extractor: &'a crate::source_ad::WengertExtractor<'a>,
     /// The accumulation window (the CCR budget accounts per-step).
     pub(crate) grad_accumulation_steps: i64,
+    /// The primal VarIds the driver seeds the forward lowering with; the
+    /// stride search classifies the block tensors against them.
+    pub(crate) planned_primal_keys: &'a std::collections::HashSet<crate::wengert::VarId>,
     /// The pass scheduler handle the driver took before the pipeline (the WRGA guard re-digests through it).
     pub(crate) sched: crate::pass_manager::PassScheduler,
     /// The WRGA plan; `Some` forks the effective primal onto it.
@@ -50,6 +53,24 @@ pub(crate) struct PreForwardPlans {
     pub(crate) ccr_compress_map: std::collections::HashMap<crate::wengert::VarId, crate::wengert::VarId>,
 }
 
+/// What is statically known about the size of the forward's tensors, for the
+/// CCR planner's byte accounting.
+pub(crate) struct StaticSizes {
+    /// Bytes per tensor.
+    pub(crate) bytes: std::collections::HashMap<crate::wengert::VarId, u64>,
+    /// Dimensions per tensor, where the dimensions (not only the element
+    /// count) are known.
+    pub(crate) shapes: std::collections::HashMap<crate::wengert::VarId, Vec<u64>>,
+}
+
+/// Bytes as MiB, for the decision lines. Printed with two decimals: whole
+/// MiB read "0 MiB" for every candidate of a small model, and a decision
+/// line whose numbers are all zero cannot be told from a search that had
+/// no sizes to work with.
+fn mib(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
+}
+
 impl Compiler<'_> {
     /// Fork the forward onto the WRGA plan and plan CCR (see the module
     /// header).
@@ -61,6 +82,7 @@ impl Compiler<'_> {
             csla_active,
             extractor,
             grad_accumulation_steps,
+            planned_primal_keys,
             sched,
             wrga_plan,
         } = inputs;
@@ -132,15 +154,10 @@ impl Compiler<'_> {
         // (the generator `take()`s it later) so claimed segments
         // can be exempted — the claim table is keyed by primal
         // OpId, which a recompute clone cannot satisfy.
-        // P1.7 --training-reference: ignore @checkpoint decorators so a
-        // decorated program still runs the un-checkpointed reference
-        // path (the --checkpoint-blocks flag is already forced off).
-        let ccr_selective_decorated = !self.compile_options.diagnostics.training_reference
-            && self
-                .compile_options
-                .checkpoint.policies
-                .values()
-                .any(|p| matches!(p, nsl_semantic::effects::CheckpointPolicy::Selective));
+        // Switched on by --checkpoint-blocks only. A
+        // `@checkpoint(policy="selective")` decorator used to switch it on
+        // too, for the whole train block and whether or not the step called
+        // the decorated function; the checker now refuses that policy.
         let mut effective_primal = effective_primal;
         let mut ccr_compress_map: std::collections::HashMap<
             crate::wengert::VarId,
@@ -151,17 +168,20 @@ impl Compiler<'_> {
         // with adjoint-generator ids (the generator start is bumped
         // to this watermark below).
         let mut ccr_fresh: crate::wengert::VarId = extractor.next_var_id();
-        let ccr_plan = if self.compile_options.checkpoint.blocks
-            || ccr_selective_decorated
-        {
+        // A request the planning below cannot honour (a stride search with
+        // no static sizes, a compression with nothing to compress). Set
+        // inside the scheduled region and raised after it, so the pass
+        // scheduler sees the region close either way.
+        let mut request_refused: Option<String> = None;
+        let ccr_plan = if self.compile_options.checkpoint.blocks {
             // Milestone C: SCHEDULED as ONE region — the whole
             // search (DP partition, stride candidates, final plan)
             // is one CCR invocation; recording stays at the callee
             // (plan_impl) and last-wins dispositions already model
             // the candidate sweep. tape=None at schedule time
             // because the body itself mutates the scanned list
-            // (append_compressed_saves appends the compressed-save
-            // tail), so the entry digest would be stale by the
+            // (insert_compressed_saves inserts the compressed saves
+            // at each segment's end), so the entry digest would be stale by the
             // pass's own declared mutation — rescan_tape below
             // captures the state the pass LEFT, which is what the
             // consumption forks must see intact.
@@ -172,9 +192,7 @@ impl Compiler<'_> {
                 self.bus.csha_backward_claims().map(|claims| {
                     claims.op_to_chain.keys().copied().collect()
                 });
-            let policy = if self.compile_options.checkpoint.selective
-                || ccr_selective_decorated
-            {
+            let policy = if self.compile_options.checkpoint.selective {
                 crate::ccr::CcrPolicy::Selective
             } else {
                 crate::ccr::CcrPolicy::Block
@@ -192,10 +210,7 @@ impl Compiler<'_> {
             let resolved_stride = match self.compile_options.checkpoint.stride {
                 crate::CheckpointStride::Fixed(k) => k,
                 crate::CheckpointStride::Dp => {
-                    let sizes = crate::profiling::captures::size_hints_from_var_nodes(
-                        extractor.var_nodes(),
-                        self.type_map,
-                    );
+                    let sizes = self.ccr_static_sizes(extractor, &effective_primal).bytes;
                     let window = if csla_active {
                         (grad_accumulation_steps.max(1)) as u64
                     } else {
@@ -205,8 +220,34 @@ impl Compiler<'_> {
                         .compile_options
                         .checkpoint.budget_mib
                         .map(|m| m.saturating_mul(1024 * 1024));
-                    let spec = crate::gpu_specs::find_gpu(&self.compile_options.target_gpu)
-                        .unwrap_or_else(crate::gpu_specs::default_gpu);
+                    // The launch overhead and bandwidth of the machine
+                    // this build runs on, when the driver can name it and
+                    // the database has that card. The configured target name
+                    // is a fixed "h100" on every machine, so reading it here
+                    // priced every partition with H100 constants.
+                    let spec = match crate::gpu_specs::resolve_local_gpu() {
+                        Some(local) => {
+                            nsl_log::nsl_log!(INFO, "ccr",
+                                "[ccr] --checkpoint-stride dp: cost model uses the local \
+                                 GPU's constants ({})",
+                                local.name
+                            );
+                            local
+                        }
+                        None => {
+                            let fallback =
+                                crate::gpu_specs::find_gpu(&self.compile_options.target_gpu)
+                                    .unwrap_or_else(crate::gpu_specs::default_gpu);
+                            nsl_log::nsl_log!(WARN, "ccr",
+                                "[ccr] --checkpoint-stride dp: the local GPU is not \
+                                 identified (no CUDA device, a build without CUDA, or a \
+                                 card with no GPU-database entry); the cost model uses {} \
+                                 constants, which are not this machine's",
+                                fallback.name
+                            );
+                            fallback
+                        }
+                    };
                     let model = crate::ccr::DpCostModel {
                         window,
                         budget_bytes,
@@ -231,12 +272,16 @@ impl Compiler<'_> {
                         },
                     };
                     let mut fell_back = true;
-                    if sizes.is_empty() {
-                        nsl_log::nsl_log!(WARN, "ccr", 
-                            "[ccr] --checkpoint-stride dp: no static tensor sizes \
-                             available (symbolic shapes) — falling back to the \
-                             uniform-stride search"
-                        );
+                    if let Some(why) = self.stride_search_blocker(
+                        "dp",
+                        &effective_primal,
+                        claimed_ids.as_ref(),
+                        policy,
+                        planned_primal_keys,
+                        &sizes,
+                    ) {
+                        request_refused = Some(why);
+                        return None;
                     } else if let Some(choice) = crate::ccr::select_partition_dp(
                         &effective_primal,
                         claimed_ids.as_ref(),
@@ -264,13 +309,15 @@ impl Compiler<'_> {
                             if budget_ok {
                                 nsl_log::nsl_log!(INFO, "ccr", 
                                     "[ccr] --checkpoint-stride dp: kept {} of {} block \
-                                     anchors {:?} (true peak {} MiB, DP projected {} MiB, \
-                                     est recompute {:.2} ms/step, window G={window}{})",
+                                     anchors {:?} (block-activation peak {:.2} MiB, DP \
+                                     projected {:.2} MiB, est recompute {:.2} ms/step, window \
+                                     G={window}{}; tensors outside the blocks and backward \
+                                     temporaries are not counted)",
                                     choice.keep.len(),
-                                    p.segments.len().max(choice.keep.len()),
+                                    choice.total_anchors,
                                     choice.keep,
-                                    true_peak / (1024 * 1024),
-                                    choice.projected_peak_bytes / (1024 * 1024),
+                                    mib(true_peak),
+                                    mib(choice.projected_peak_bytes),
                                     choice.est_recompute_ns as f64 / 1e6,
                                     if choice.fits_budget {
                                         ""
@@ -283,10 +330,10 @@ impl Compiler<'_> {
                             } else {
                                 nsl_log::nsl_log!(WARN, "ccr", 
                                     "[ccr] --checkpoint-stride dp: true plan peak \
-                                     {} MiB contradicts the DP projection ({} MiB) \
+                                     {:.2} MiB contradicts the DP projection ({:.2} MiB) \
                                      over budget — falling back to the uniform search",
-                                    true_peak / (1024 * 1024),
-                                    choice.projected_peak_bytes / (1024 * 1024),
+                                    mib(true_peak),
+                                    mib(choice.projected_peak_bytes),
                                 );
                             }
                         }
@@ -309,9 +356,9 @@ impl Compiler<'_> {
                             Some(c) => {
                                 nsl_log::nsl_log!(WARN, "ccr", 
                                     "[ccr] --checkpoint-stride dp fallback: uniform \
-                                     stride {} (peak {} MiB)",
+                                     stride {} (peak {:.2} MiB)",
                                     c.stride,
-                                    c.peak_bytes / (1024 * 1024)
+                                    mib(c.peak_bytes)
                                 );
                                 c.stride
                             }
@@ -322,21 +369,21 @@ impl Compiler<'_> {
                     }
                 }
                 crate::CheckpointStride::Auto => {
-                    let sizes = crate::profiling::captures::size_hints_from_var_nodes(
-                        extractor.var_nodes(),
-                        self.type_map,
-                    );
-                    // Review MEDIUM: with fully symbolic shapes the size
-                    // map is empty → every candidate projects to peak 0
-                    // and the search silently returns stride 1. Say so,
-                    // rather than printing a decision that looks real.
-                    if sizes.is_empty() {
-                        nsl_log::nsl_log!(WARN, "ccr", 
-                            "[ccr] --checkpoint-stride auto: no static tensor sizes \
-                             available (symbolic shapes) — cannot project the \
-                             activation peak; using stride 1. Pass an explicit \
-                             --checkpoint-stride N to force periodic checkpointing."
-                        );
+                    let sizes = self.ccr_static_sizes(extractor, &effective_primal).bytes;
+                    // With symbolic shapes the size map is empty or
+                    // partial, every candidate projects to an under-counted
+                    // peak (zero, when it is empty) and the search returns
+                    // stride 1 with a decision line that looks real. Refuse.
+                    if let Some(why) = self.stride_search_blocker(
+                        "auto",
+                        &effective_primal,
+                        claimed_ids.as_ref(),
+                        policy,
+                        planned_primal_keys,
+                        &sizes,
+                    ) {
+                        request_refused = Some(why);
+                        return None;
                     }
                     let window = if csla_active {
                         (grad_accumulation_steps.max(1)) as u64
@@ -360,16 +407,15 @@ impl Compiler<'_> {
                             let log: Vec<String> = choice
                                 .considered
                                 .iter()
-                                .map(|(k, pb)| {
-                                    format!("k={k}:{}MiB", pb / (1024 * 1024))
-                                })
+                                .map(|(k, pb)| format!("k={k}:{:.2}MiB", mib(*pb)))
                                 .collect();
                             nsl_log::nsl_log!(INFO, "ccr", 
                                 "[ccr] --checkpoint-stride auto: chose stride {} \
-                                 (projected activation peak {} MiB{}, window G={window}); \
-                                 candidates [{}]",
+                                 (projected block-activation peak {:.2} MiB{}, window \
+                                 G={window}; tensors outside the blocks and backward \
+                                 temporaries are not counted); candidates [{}]",
                                 choice.stride,
-                                choice.peak_bytes / (1024 * 1024),
+                                mib(choice.peak_bytes),
                                 if choice.fits_budget {
                                     ""
                                 } else {
@@ -418,40 +464,57 @@ impl Compiler<'_> {
                     p.segments.len()
                 );
             }
+            let mut plan = plan;
             if let (Some(p), Some(dtype)) =
-                (&plan, self.compile_options.checkpoint.compress.as_deref())
+                (&mut plan, self.compile_options.checkpoint.compress.as_deref())
             {
-                if !p.compress.is_empty() {
-                    ccr_compress_map = crate::ccr::append_compressed_saves(
-                        &mut effective_primal,
-                        p,
-                        dtype,
-                        &mut ccr_fresh,
-                    );
-                    nsl_log::nsl_log!(INFO, "ccr", 
-                        "[ccr] compressed saves: {} matmul-class tensors -> {dtype}",
-                        ccr_compress_map.len()
-                    );
-                } else if compress_requested {
-                    nsl_log::nsl_log!(WARN, "ccr", 
-                        "[ccr] --checkpoint-compress requested but no \
-                         compressible saves exist (policy must be selective \
-                         with matmul-class interiors); continuing without"
-                    );
+                if dtype != crate::ccr::COMPRESS_DTYPE {
+                    request_refused = Some(format!(
+                        "--checkpoint-compress {dtype} is not supported: the only format \
+                         is {}. IEEE half precision (fp16) was withdrawn because it \
+                         overflows to infinity above 65504 and the cast does not check \
+                         the range, which turned the loss into NaN; bf16 has the range \
+                         of f32 and the same size.",
+                        crate::ccr::COMPRESS_DTYPE
+                    ));
+                    return None;
                 }
+                if p.compress.is_empty() {
+                    // Used to be a warning and a build that ran uncompressed.
+                    request_refused = Some(
+                        "--checkpoint-compress cannot be honoured: the selective policy \
+                         saves no matmul-, convolution- or attention-class tensor inside \
+                         this model's blocks, so there is nothing to compress. Drop the \
+                         flag."
+                            .to_string(),
+                    );
+                    return None;
+                }
+                ccr_compress_map =
+                    crate::ccr::insert_compressed_saves(&mut effective_primal, p, &mut ccr_fresh);
+                nsl_log::nsl_log!(INFO, "ccr", 
+                    "[ccr] compressed saves: {} matmul-class tensors -> {dtype}, each cast \
+                     at the end of its segment",
+                    ccr_compress_map.len()
+                );
             }
             plan
                 })
                 .map_err(CodegenError::new)?;
-            // The body appended the compressed-save tail to
-            // `effective_primal` (append-only: existing positions
-            // stay valid, but an exact-equality digest from entry
-            // would now refuse every --checkpoint-compress build).
+            // The body inserted the compressed saves into
+            // `effective_primal` at each segment's end and moved the
+            // plan's segment bounds with them (an exact-equality
+            // digest from entry would now refuse every
+            // --checkpoint-compress build).
             // Re-digest the state the pass left; the
             // apply_to_adjoint / CSLA seg_bounds forks below assert
             // against THIS.
             scheduled.rescan_tape(&effective_primal);
-            scheduled.finish(&self.bus).map_err(CodegenError::new)?
+            let plan = scheduled.finish(&self.bus).map_err(CodegenError::new)?;
+            if let Some(why) = request_refused {
+                return Err(CodegenError::new(why));
+            }
+            plan
         } else {
             None
         };
@@ -462,5 +525,158 @@ impl Compiler<'_> {
             ccr_fresh,
             ccr_compress_map,
         })
+    }
+
+    /// Static sizes of the forward's tensors.
+    ///
+    /// The declared semantic types give a size only to a value whose own
+    /// expression has a concrete tensor type, and most do not: the result of
+    /// `rmsnorm(h, g, eps)` or `silu(u)` is an open-shaped `Tensor` even when
+    /// the `let` that binds it is annotated, so on a fully annotated model a
+    /// quarter of the block tensors had no size and counted as zero bytes.
+    /// The sizes are therefore completed by propagating shapes through the
+    /// tape, from the same seeds the transient arena uses: the declared
+    /// shapes, the model fields' initializer shapes, and the `[batch_size,
+    /// seq_len]` of the batch fields when the DataLoader's literals prove it.
+    /// A model with no shape annotation at all is sized this way when its
+    /// loader is proven.
+    ///
+    /// A derived size is billed at four bytes per element (f32, what an
+    /// unannotated tensor is at run time); a declared one at its dtype.
+    pub(crate) fn ccr_static_sizes(
+        &self,
+        extractor: &crate::source_ad::WengertExtractor<'_>,
+        primal: &crate::wengert::WengertList,
+    ) -> StaticSizes {
+        let mut bytes = crate::profiling::captures::size_hints_from_var_nodes(
+            extractor.var_nodes(),
+            self.type_map,
+        );
+        let mut dim_seeds: std::collections::HashMap<crate::wengert::VarId, Vec<i64>> =
+            crate::profiling::captures::dim_hints_from_var_nodes(
+                extractor.var_nodes(),
+                self.type_map,
+            );
+        for (vid, dims) in extractor.known_param_dims() {
+            dim_seeds.entry(*vid).or_insert_with(|| dims.clone());
+        }
+        let field_dims = self.models.unique_field_dims();
+        for (name, vid) in extractor.named_param_var_ids() {
+            if dim_seeds.contains_key(vid) {
+                continue;
+            }
+            let leaf = name.rsplit('.').next().unwrap_or(name);
+            if let Some(dims) = field_dims.get(leaf) {
+                dim_seeds.insert(*vid, dims.clone());
+            }
+        }
+        // The DataLoader proof: every batch is exactly [batch_size, seq_len].
+        // Only fields the runtime emits at that shape, and only reads of the
+        // step's own batch (an Input leaf).
+        if let Some(facts) = self.lm_head_loader_scan.facts() {
+            let input_leaves: std::collections::HashSet<crate::wengert::VarId> = primal
+                .ops
+                .iter()
+                .filter(|o| matches!(o.op, crate::wengert::PrimalOp::Input(_)))
+                .map(|o| o.result)
+                .collect();
+            for op in &primal.ops {
+                let crate::wengert::PrimalOp::Passthrough(name) = &op.op else {
+                    continue;
+                };
+                let Some(field) = name.strip_prefix("dict_get:") else {
+                    continue;
+                };
+                if matches!(field, "input_ids" | "labels" | "segment_ids" | "position_ids")
+                    && op.inputs.len() == 1
+                    && input_leaves.contains(&op.inputs[0])
+                {
+                    dim_seeds
+                        .entry(op.result)
+                        .or_insert_with(|| vec![facts.batch_size as i64, facts.seq_len as i64]);
+                }
+            }
+        }
+        let scalar_seeds = extractor.known_param_scalar_values();
+        let no_adjoint = crate::wengert::WengertList {
+            ops: Vec::new(),
+            output: 0,
+            var_names: Default::default(),
+            var_types: Default::default(),
+        };
+        let derived = crate::transient_arena::propagate_size_info(
+            primal,
+            &no_adjoint,
+            &|v| dim_seeds.get(&v).cloned(),
+            &|v| scalar_seeds.get(&v).copied(),
+            &[],
+        );
+        let mut shapes = std::collections::HashMap::new();
+        for (var, info) in &derived {
+            if let Some(elems) = info.numel() {
+                bytes.entry(*var).or_insert(elems.saturating_mul(4));
+            }
+            if let crate::transient_arena::SizeInfo::Shape(dims) = info {
+                shapes.insert(*var, dims.iter().map(|d| (*d).max(0) as u64).collect());
+            }
+        }
+        StaticSizes { bytes, shapes }
+    }
+
+    /// Why `--checkpoint-stride auto|dp` cannot search this model, or `None`
+    /// when it can.
+    ///
+    /// Both searches compare projected block-activation peaks, and the
+    /// projection adds up static tensor sizes. A tensor whose shape is not
+    /// literal has none and counts as zero bytes, so with symbolic shapes
+    /// every candidate projects to the same under-count (zero, when no shape
+    /// is literal at all) and the search "chooses" stride 1. That used to be
+    /// a note on stderr and exit status 0; the request is refused instead.
+    ///
+    /// A model the block planner declines altogether returns `None` here:
+    /// that refusal has its own message and its own guard.
+    fn stride_search_blocker(
+        &self,
+        mode: &str,
+        primal: &crate::wengert::WengertList,
+        claimed_ids: Option<&std::collections::HashSet<u32>>,
+        policy: crate::ccr::CcrPolicy,
+        planned_primal_keys: &std::collections::HashSet<crate::wengert::VarId>,
+        sizes: &std::collections::HashMap<crate::wengert::VarId, u64>,
+    ) -> Option<String> {
+        let base = crate::ccr::plan(primal, claimed_ids, policy, false, 1)?;
+        let owned = crate::wengert_lower::infer_primal_owned(primal, planned_primal_keys);
+        let missing = crate::ccr::unsized_segment_tensors(&base, &owned, sizes);
+        if missing.is_empty() {
+            return None;
+        }
+        let total = base
+            .segments
+            .iter()
+            .flat_map(|seg| seg.escaping.iter().chain(seg.interior.iter()))
+            .filter(|v| matches!(owned.get(v), Some(crate::wengert::WengertType::Tensor)))
+            .count();
+        let examples: Vec<String> = missing
+            .iter()
+            .take(4)
+            .map(|v| match primal.var_names.get(v) {
+                Some(name) => format!("`{name}`"),
+                None => match primal.find_producer(*v) {
+                    Some(op) => format!("the result of {:?}", op.op),
+                    None => format!("v{v}"),
+                },
+            })
+            .collect();
+        Some(format!(
+            "--checkpoint-stride {mode} cannot be honoured: {} of the {total} tensors \
+             computed inside the model's blocks have no static size (for example {}), so \
+             the activation peak of a candidate stride cannot be projected. Sizes come \
+             from literal shapes (for example `Tensor<[2, 64, 256], f32>`) and from a \
+             DataLoader with literal batch_size and seq_len and drop_last=true, carried \
+             through the forward; where they do not reach every value computed inside \
+             the blocks, pass an explicit --checkpoint-stride N instead.",
+            missing.len(),
+            examples.join(", "),
+        ))
     }
 }

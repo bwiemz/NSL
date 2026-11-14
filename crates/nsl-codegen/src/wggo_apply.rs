@@ -49,11 +49,13 @@ pub struct AppliedLayer {
     /// PCA packing mode (0=none, 1=segment_id, 2=tile_skip, 3=multi_seq).
     /// Forced to 0 on pruned layers.
     pub packing_mode: u8,
-    /// Estimated layer cost post-application (μs).
+    /// Estimated layer cost post-application (μs). 0 for a pruned layer and
+    /// for a layer with no feasible configuration.
     pub estimated_us: f64,
-    /// Parameter bytes for this layer (sum of all weights).
+    /// Parameter bytes of the configuration the plan chose for this layer
+    /// (0 for a pruned layer).
     pub param_bytes: u64,
-    /// Peak activation bytes during forward pass for this layer.
+    /// Forward-activation bytes of that configuration.
     pub activation_bytes: u64,
 }
 
@@ -61,7 +63,11 @@ pub struct AppliedLayer {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct AppliedPlan {
     pub layers: Vec<AppliedLayer>,
+    /// Sum of the layers' `estimated_us`.
     pub total_us: f64,
+    /// Per-device resident training memory of the plan: for every kept
+    /// layer, the parameters and optimizer moments of its chosen
+    /// configuration divided by its shard factor, plus its activations.
     pub peak_memory_bytes: u64,
 }
 
@@ -81,6 +87,12 @@ impl AppliedPlan {
 
 /// Combine a [`InterLayerPlan`] with per-layer ILP solutions into a
 /// single [`AppliedPlan`].
+///
+/// Sizes come from the Level-2 solution: the configuration the solver chose
+/// for the layer, at the moment precision it chose. The Level-1 plan's own
+/// sizes describe one fixed configuration per layer and were what the plan
+/// used to report as its memory; they are read here only for a layer the
+/// Level-2 solve carries no size for (a hand-built solution).
 pub fn apply(inter: &InterLayerPlan, ilp: &[LayerIlpSolution]) -> AppliedPlan {
     assert_eq!(
         inter.layers.len(),
@@ -89,29 +101,51 @@ pub fn apply(inter: &InterLayerPlan, ilp: &[LayerIlpSolution]) -> AppliedPlan {
     );
     let mut layers = Vec::with_capacity(inter.layers.len());
     let mut total = 0.0;
-    let mut peak = inter.peak_memory_bytes;
+    let mut memory = 0u64;
     for (coarse, ilp_sol) in inter.layers.iter().zip(ilp.iter()) {
         let active_heads = ilp_sol.decision.active_heads() as u32;
+        let pruned = coarse.decision == CoarseDecision::Prune;
         // Prune-decision propagation: if the inter-layer DP decided to
         // prune, force adapter rank and csha level to safe defaults.
-        let (csha_level, adapter_rank, adapter_placement, fase_fused, packing_mode) =
-            match coarse.decision {
-                CoarseDecision::Prune => (0, 0, AdapterPlacement::None, false, 0u8),
-                _ => (
-                    ilp_sol.decision.csha_level,
-                    ilp_sol.decision.adapter_rank,
-                    ilp_sol.decision.adapter_placement,
-                    ilp_sol.decision.fase_fused,
-                    ilp_sol.decision.packing_mode,
-                ),
-            };
-        let cost = if coarse.decision == CoarseDecision::Prune {
+        let (csha_level, adapter_rank, adapter_placement, fase_fused, packing_mode) = if pruned {
+            (0, 0, AdapterPlacement::None, false, 0u8)
+        } else {
+            (
+                ilp_sol.decision.csha_level,
+                ilp_sol.decision.adapter_rank,
+                ilp_sol.decision.adapter_placement,
+                ilp_sol.decision.fase_fused,
+                ilp_sol.decision.packing_mode,
+            )
+        };
+        // A pruned layer costs nothing; a layer with no feasible
+        // configuration has no cost to add (its `cost_us` is infinite, and
+        // adding it made the plan's total infinite).
+        let cost = if pruned || !ilp_sol.cost_us.is_finite() {
             0.0
         } else {
             ilp_sol.cost_us
         };
         total += cost;
-        peak = peak.max(ilp_sol.memory_bytes);
+        let (param_bytes, activation_bytes) = if pruned {
+            (0, 0)
+        } else if ilp_sol.param_bytes == 0 && ilp_sol.activation_bytes == 0 {
+            (coarse.param_bytes, coarse.activation_bytes)
+        } else {
+            (ilp_sol.param_bytes, ilp_sol.activation_bytes)
+        };
+        if !pruned {
+            // `memory_bytes` is the unsharded resident figure: parameters,
+            // moments at the chosen precision, activations (and the FASE
+            // surfaces under a budget). Everything but the activations is
+            // sharded.
+            let resident = ilp_sol
+                .memory_bytes
+                .max(param_bytes.saturating_add(activation_bytes));
+            let sharded = resident.saturating_sub(activation_bytes)
+                / u64::from(coarse.shard_params.max(1));
+            memory = memory.saturating_add(sharded.saturating_add(activation_bytes));
+        }
         layers.push(AppliedLayer {
             layer_index: coarse.layer_index,
             layer_name: coarse.name.clone(),
@@ -130,14 +164,14 @@ pub fn apply(inter: &InterLayerPlan, ilp: &[LayerIlpSolution]) -> AppliedPlan {
             fase_fused,
             packing_mode,
             estimated_us: cost,
-            param_bytes: coarse.param_bytes,
-            activation_bytes: coarse.activation_bytes,
+            param_bytes,
+            activation_bytes,
         });
     }
     AppliedPlan {
         layers,
         total_us: total,
-        peak_memory_bytes: peak,
+        peak_memory_bytes: memory,
     }
 }
 
@@ -322,17 +356,61 @@ mod tests {
         assert!(applied.layers[0].fase_fused, "kept layer preserves choice");
     }
 
+    /// The applied plan carries the sizes of the configuration the Level-2
+    /// solve chose, and its memory is their sum.
+    ///
+    /// Three layers at a shard factor of 4, the third pruned. Layer 0:
+    /// 6,000,000 parameter bytes, 2,000,000 of activations, 20,000,000
+    /// resident (so 18,000,000 of parameters and moments, 4,500,000 after
+    /// sharding, 6,500,000 with the activations). Layer 1: 500,000 and
+    /// 300,000 with 1,800,000 resident, so 375,000 + 300,000. The pruned
+    /// layer holds nothing. The plan used to carry the Level-1 plan's sizes
+    /// and report the larger of its total and one layer's resident bytes.
     #[test]
-    fn applied_layer_carries_param_and_activation_bytes() {
+    fn applied_layer_carries_the_chosen_configurations_bytes() {
         let lut = build_lut(&toy_shape(), gpu(), &LutAxes::default());
-        let ilp: Vec<_> = (0..3)
-            .map(|_| solve_layer(&lut, &LayerIlpConstraints::default()))
-            .collect();
-        let applied = apply(&inter_plan(3), &ilp);
+        let sized = |param: u64, act: u64, resident: u64| {
+            let mut s = solve_layer(&lut, &LayerIlpConstraints::default());
+            s.param_bytes = param;
+            s.activation_bytes = act;
+            s.memory_bytes = resident;
+            s
+        };
+        let ilp = vec![
+            sized(6_000_000, 2_000_000, 20_000_000),
+            sized(500_000, 300_000, 1_800_000),
+            sized(700_000, 100_000, 2_200_000),
+        ];
+        // The Level-1 plan's own sizes differ from every one of these.
+        let mut inter = inter_plan(3);
+        for l in &mut inter.layers {
+            l.param_bytes = 1;
+            l.activation_bytes = 1;
+        }
+        let applied = apply(&inter, &ilp);
         assert_eq!(applied.layers[0].param_bytes, 6_000_000);
         assert_eq!(applied.layers[0].activation_bytes, 2_000_000);
         assert_eq!(applied.layers[1].param_bytes, 500_000);
         assert_eq!(applied.layers[1].activation_bytes, 300_000);
+        assert_eq!(applied.layers[2].param_bytes, 0, "a pruned layer holds nothing");
+        assert_eq!(applied.layers[2].activation_bytes, 0);
+        assert_eq!(applied.peak_memory_bytes, 6_500_000 + 675_000);
+    }
+
+    /// A layer with no feasible configuration has an infinite cost; it adds
+    /// nothing to the plan's step time, which used to become infinite.
+    #[test]
+    fn an_infeasible_layer_does_not_make_the_step_time_infinite() {
+        let lut = build_lut(&toy_shape(), gpu(), &LutAxes::default());
+        let mut ilp: Vec<_> = (0..3)
+            .map(|_| solve_layer(&lut, &LayerIlpConstraints::default()))
+            .collect();
+        let finite = ilp[1].cost_us;
+        ilp[0].cost_us = f64::INFINITY;
+        ilp[0].feasible = false;
+        let applied = apply(&inter_plan(3), &ilp);
+        assert_eq!(applied.layers[0].estimated_us, 0.0);
+        assert!((applied.total_us - finite).abs() < 1e-9, "{}", applied.total_us);
     }
 
     #[test]

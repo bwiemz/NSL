@@ -375,8 +375,12 @@ pub extern "C" fn nsl_tensor_arange_dtype(start: f64, stop: f64, step: f64, dtyp
 }
 
 /// Create a tensor from a raw f64 slice and shape array.
-/// Used by sparse → dense conversion, SpMM output, and other internal APIs.
 /// Returns pointer to NslTensor as i64, or 0 on empty data.
+///
+/// Test-only since general sparse tensors (its one library caller: sparse
+/// to dense conversion and the SpMM/SpMV outputs) were removed; the Muon and
+/// autodiff unit tests still build their fixtures with it.
+#[cfg(test)]
 pub(crate) fn create_tensor_from_f64_data(data_slice: &[f64], shape_slice: &[i64]) -> i64 {
     let ndim = shape_slice.len() as i64;
     let len: i64 = shape_slice.iter().product();

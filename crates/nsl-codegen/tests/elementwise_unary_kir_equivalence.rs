@@ -1,5 +1,5 @@
 //! The differential equivalence gate for the unary elementwise kernels
-//! `nsl_{neg,relu,exp,log,sqrt,abs,sign,sigmoid,sin,cos,silu,gelu,clamp}_f32`
+//! `nsl_{neg,relu,exp,log,sqrt,abs,sign,sigmoid,sin,cos,silu,clamp}_f32`
 //! (roadmap A2 step 11).
 //!
 //! The runtime carried them as hand-written PTX
@@ -67,7 +67,6 @@ fn hand_ptx(op: UnaryOp) -> String {
         Sin => hand::SIN_F32_PTX,
         Cos => hand::COS_F32_PTX,
         Silu => hand::SILU_F32_PTX,
-        Gelu => hand::GELU_F32_PTX,
         Clamp => hand::CLAMP_F32_PTX,
     }
     .trim_end_matches('\0')
@@ -76,9 +75,6 @@ fn hand_ptx(op: UnaryOp) -> String {
 
 const LOG2_E: f32 = f32::from_bits(0x3FB8_AA3B);
 const LN_2: f32 = f32::from_bits(0x3F31_7218);
-/// 1.702f, `nsl_gelu_f32`'s slope, written out rather than taken from
-/// `nsl_kir` so a change there shows here.
-const GELU_K: f32 = f32::from_bits(0x3FD9_DB23);
 
 /// `1 / (2^(-x * log2 e) + 1)`, as the kernels compute it.
 fn sigmoid_model(x: f32) -> f32 {
@@ -91,7 +87,19 @@ fn model(op: UnaryOp, x: f32) -> f32 {
     use UnaryOp::*;
     match op {
         Neg => f32::from_bits(x.to_bits() ^ 0x8000_0000),
-        Relu => x.max(0.0),
+        // `max.f32(x, 0)` on the hardware: x when it is above zero, and
+        // `+0` otherwise, for a negative x, for a NaN (the non-NaN operand
+        // wins) and for `-0` (which orders below `+0`). Written out because
+        // `x.max(0.0)` leaves the sign of `max(-0.0, 0.0)` to the compiler:
+        // an optimized build of this test answered `+0` here while the
+        // interpreter's own `f32::max` answered `-0`.
+        Relu => {
+            if x > 0.0 {
+                x
+            } else {
+                0.0
+            }
+        }
         Exp => (x * LOG2_E).exp2(),
         Log => x.log2() * LN_2,
         Sqrt => x.sqrt(),
@@ -109,7 +117,6 @@ fn model(op: UnaryOp, x: f32) -> f32 {
         Sin => x.sin(),
         Cos => x.cos(),
         Silu => x * sigmoid_model(x),
-        Gelu => x * sigmoid_model(x * GELU_K),
         Clamp => x.max(LO).min(HI),
     }
 }
@@ -130,7 +137,6 @@ fn exact(op: UnaryOp, x: f64) -> f64 {
         Sin => x.sin(),
         Cos => x.cos(),
         Silu => x * sig(x),
-        Gelu => x * sig(1.702 * x),
         Clamp => x.max(LO as f64).min(HI as f64),
     }
 }
@@ -335,7 +341,7 @@ fn nudging_the_element_size_is_caught() {
 }
 
 /// Every baked f32 constant, one ulp off: log2(e), ln 2, the
-/// sigmoid's 1, relu's and sign's 0, sign's +-1, GELU's slope.
+/// sigmoid's 1, relu's and sign's 0, sign's +-1.
 #[test]
 fn nudging_a_baked_constant_is_caught() {
     use UnaryOp::*;
@@ -345,10 +351,6 @@ fn nudging_a_baked_constant_is_caught() {
         (Sigmoid, "0f3FB8AA3B", "0f3FB8AA3C"),
         (Sigmoid, "0f3F800000", "0f3F800001"),
         (Silu, "0f3F800000", "0f3F800001"),
-        (Gelu, "0f3FD9DB23", "0f3FD9DB24"),
-        (Gelu, "0f3FD9DB23", "0f3FD9999A"),
-        (Gelu, "0f3FB8AA3B", "0f3FB8AA3C"),
-        (Gelu, "0f3F800000", "0f3F800001"),
         (Relu, "0f00000000", "0f3F800000"),
         (Sign, "0f3F800000", "0f3F800001"),
         (Sign, "0fBF800000", "0fBF800001"),

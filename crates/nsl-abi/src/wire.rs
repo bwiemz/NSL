@@ -132,6 +132,13 @@ pub mod pca_tier_b {
     pub const TIER_B_SEQ_LEN_FLOOR: u32 = 128;
     /// Conservative-max seq_len baked into the Tier-B-on PTX SMEM allocation.
     pub const TIER_B_MAX_BAKED_SEQ_LEN: u32 = 16384;
+    /// Bytes of shared memory the segment-masked forward kernel reserves
+    /// for one row's 16-bit segment ids.
+    pub const SEGMENT_IDS_SMEM_BYTES: u32 = 32768;
+    /// The longest sequence whose segment ids fit that buffer. The kernel
+    /// copies one id per position with no bound of its own, so the runtime
+    /// must not launch it on a longer packed sequence.
+    pub const MAX_SEGMENT_MASKED_SEQ_LEN: u32 = SEGMENT_IDS_SMEM_BYTES / 2;
 }
 
 /// The C-API tensor descriptor (`NslTensorDesc` in every generated header):
@@ -245,9 +252,14 @@ pub mod train_config {
     /// aborts by default and `NSL_RESUME_ALLOW_TRAJECTORY_DRIFT=1` turns
     /// the refusal into a loud acknowledgment. `sp4..sp6` are reserved
     /// ahead of any 4+-parameter scheduler: a parameter rendered under a
-    /// key in neither class would be silently unguarded.
-    pub const TRAJECTORY_KEYS: &[&str] =
-        &["lr", "sched", "sp1", "sp2", "sp3", "sp4", "sp5", "sp6", "clip"];
+    /// key in neither class would be silently unguarded. `sched_unit` is
+    /// rendered only for a stepped schedule counted in optimizer steps
+    /// under accumulation (the default unit): resuming a
+    /// checkpoint under the other unit re-reads the restored step counter
+    /// through a schedule N times slower or faster.
+    pub const TRAJECTORY_KEYS: &[&str] = &[
+        "lr", "sched", "sp1", "sp2", "sp3", "sp4", "sp5", "sp6", "clip", "sched_unit",
+    ];
 }
 
 /// The AWQ activation-scales blob — the `"awq_activation_scales"` entry of

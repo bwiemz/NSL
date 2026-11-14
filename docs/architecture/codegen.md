@@ -62,7 +62,7 @@ later emission consults.
    │  intern_string · collect_strings · collect_enums · collect_structs
    │  collect_models
    │  cpdt_decorator / cpdt_expert_prune / cpdt_moe_capacity (metadata-only passes)
-   │  populate_calibration_retention_from_ast_if_unset (AWQ + WGGO pre-scan)
+   │  populate_calibration_retention_from_ast_if_unset (WGGO pre-scan)
    │  emit_retention_arena · emit_grad_retention_arena
    ├── DECLARE ─────────────────────────┼──────────────────── src/compiler/declaration.rs
    │  declare_runtime_functions   ← the nsl-abi table (nsl_abi::for_each_runtime_fn!)
@@ -112,7 +112,7 @@ is the shortest readable copy of the sequence.
   `invoke_csha_if_enabled` — each builds the pass input from the state
   stashed on the `Compiler`, runs the pass, records its disposition and
   publishes the product on the bus) live in `src/stmt_pass_bridges.rs`;
-  the `quant` block lowering and the AWQ projection discovery in
+  the `quant` block lowering in
   `src/stmt_quant.rs`, the `distill` block (a synthetic train block with
   the teacher frozen) in `src/stmt_distill.rs`, and the `@inspect` hook
   emission in `src/stmt_inspect.rs`. `stmt.rs` is the file that also owns
@@ -354,8 +354,8 @@ The struct has 29 `pub` fields today. The decomposition into cohesive
 sub-structs that already exists (grep `Options {` in `src/lib.rs`):
 `WggoOptions` (`opts.wggo`), `CfieOptions` (`opts.cfie`), `CshaOptions`
 (`opts.csha`), `CpdtOptions` (`opts.cpdt`), `CalibrationOptions` (`opts.calibration`:
-data path, mode, sample/batch/timeout budgets, the AWQ `retention` and
-WGGO `grad_retention` plans, `batch_seq`, the subprocess `compile_bundle`
+data path, mode, sample/batch/timeout budgets, the forward `retention`
+plan a harness caller hands in and the WGGO `grad_retention` plan, `batch_seq`, the subprocess `compile_bundle`
 and the `sidecar` the harness writes back), `DevToolsOptions`
 (`opts.dev_tools`: the kernel profiler's `profile_kernels` /
 `manifest_output_path` / `profile_source_text` / `profile_source_file_name`,
@@ -501,9 +501,7 @@ TIER_B_SEQ_LEN_FLOOR}` (re-exported by `src/pca_tier_b.rs`),
 `src/calibration/binary_codegen.rs`), `nsl_runtime::tensor::DTYPE_*`
 (compile-time asserts in `src/cpdt_precision_exec.rs`),
 `nsl_runtime::c_api::{NSL_ABI_VERSION_MAJOR, NSL_ABI_VERSION_MINOR,
-nsl_abi_version}` (`src/c_header.rs`), `nsl_abi::wire::awq_scales::AwqScales`
-(`src/stmt_quant.rs`; the AWQ blob's one encoder and decoder, shared with
-the runtime's sidecar writer), `nsl_abi::wire::calibration_bin` (the `.bin`
+nsl_abi_version}` (`src/c_header.rs`), `nsl_abi::wire::calibration_bin` (the `.bin`
 corpus header, read by `src/calibration/data_shape.rs` for the batch
 geometry at compile time and by the runtime's loader), and `nsl_runtime::cuda_device_identity` /
 `cuda_device_name` (`src/gpu_specs.rs`, `src/autotune.rs`; the identity
@@ -620,58 +618,53 @@ lowering accepts and `tests/kernel_block_ptxas.rs` assembles it.
 `src/cfie_decode_attention.rs::build` is the first CFIE kernel built as KIR
 (roadmap A2 step 9): block parameters for the tile loop and its three inner
 loops, an `SmemLayout` of four f32 regions, and a header of baked strides
-(`kv_strides`) that the sibling CFIE kernels compare with theirs. It targets
+(`kv_strides`) that the decode block compares with its own. It targets
 the backend floor rather than the serving GPU (see its module docs).
 `tests/cfie_decode_attn_kir_equivalence.rs` runs it against the frozen hand
 emitter (`tests/fixtures/cfie_decode_attn_hand.rs`) on a cooperative-CTA PTX
-interpreter, and `tests/cfie_decode_attn_ptxas.rs` assembles it for sm_75
-through sm_120. `backend_ptx::global_byte_array` prints the initialized
-`.global` array `src/cfie_grammar_ptx.rs` splices into the sampler module.
-`src/cfie_kv_quant_ptx.rs::build_layer` is the second: the per-layer
-KV-quant kernels are the same flash-decode KIR (`build_flash_decode`) over a
-`PoolLayout::Baked` pool, each half at its baked byte offset and read as f16
-or as int8 dequantized by its runtime scale.
-`tests/cfie_kv_quant_kir_equivalence.rs` runs them against their frozen hand
-emitter (`tests/fixtures/cfie_kv_quant_hand.rs`) on the same interpreter,
-which lives in `tests/support/cta_ptx_interp.rs`.
-`src/cfie_spec_sampler_ptx.rs::build_draft_sample` / `build_verify_probs`
-are the third: the draft greedy sampler and the target prob-row writer, one
-CTA each, built from shared sections (hidden load and RMSNorm, the
-row matvec, the streaming online-softmax pass) so the two kernels' shared
-arithmetic order — which the self-speculation anchor needs bit-identical —
-is one piece of code. `tests/cfie_spec_sampler_kir_equivalence.rs` runs
-them against `tests/fixtures/cfie_spec_sampler_hand.rs` on the same
-interpreter.
-`src/cfie_speculative_ptx.rs` holds the fourth and fifth.
-`build_rejection` is the serial rejection-sampling epilogue, its xorshift64*
-PRNG as 64-bit shift/xor/mul KIR ops. `tests/cfie_speculative_kir_equivalence.rs`
-runs it against `tests/fixtures/cfie_speculative_hand.rs`.
-`build_verify_attention` is the tree-mask verify attention kernel: the
-decode-attention kernel run once per tree node, assembled from the
-sections `build_flash_decode` is made of (`begin_flash_decode`,
-`load_q_row`, `prefix_pass`, `flash_tile`, `publish_output`), with one more
-`flash_tile` over the appended draft rows whose score hook applies the
-node's baked mask with a `Select`. `tests/cfie_spec_verify_kir_equivalence.rs`
-runs it against the same fixture.
-`src/cfie_sample_ptx.rs::build` is the sixth: the fused decode-sample
-kernel. Its hidden-row load, RMSNorm and row dot are
-`cfie_spec_sampler_ptx`'s sections (`hidden_load`, `rmsnorm_in_place`,
-`build_row_dot`, over a `Common` built by `common_at`), its PRNG draw is
-`cfie_speculative_ptx::build_prng_draw`, and its own sections are the
-replace-min candidate merge, the argmax, the softmax, the nucleus sort and
-cutoff, and the multinomial walk. `tests/cfie_sample_kir_equivalence.rs`
-runs it against `tests/fixtures/cfie_sample_hand.rs`.
-`src/cfie_persistent_ptx.rs::build` is the seventh and last: the persistent
-decode block, one CTA running a whole layer's decode step. Its attention is
-the flash-decode tile loop and output publish (`prefix_pass`,
-`publish_output`) run once per Q head over a `FlashCtx` its head loop
-builds, publishing each head's row to shared rather than global memory; its
-two RMSNorms start with `cfie_spec_sampler_ptx::sum_of_squares_tree`; its
-own sections are the RoPE pair projections (with `KirOp::Exp2`), the f16 KV
-append, the W_o and FFN matvecs and the silu. `smem_bytes` answers its
-static footprint before `emit`, which the verifier refuses past 48 KB.
+interpreter (`tests/support/cta_ptx_interp.rs`), and
+`tests/cfie_decode_attn_ptxas.rs` assembles it for sm_75 through sm_120. No
+serve binary carries this kernel: the decode block does its own attention
+from the same sections, and the standalone kernel is kept as the place
+those sections (`prefix_pass`, `flash_tile`, `publish_output`) are tested
+on their own. `backend_ptx::global_byte_array` prints the initialized
+`.global` array `src/cfie_grammar_ptx.rs` builds for a grammar's token
+masks; no serve build uses it (a `grammar:` section is refused).
+`src/cfie_spec_sampler_ptx.rs::build_draft_sample` is the draft model's
+greedy sampler, one CTA, built from sections the fused sampler shares
+(hidden load and RMSNorm, the row matvec) plus a streaming online-softmax
+pass. `tests/cfie_spec_sampler_kir_equivalence.rs` runs it against
+`tests/fixtures/cfie_spec_sampler_hand.rs` on the same interpreter.
+`src/cfie_sample_ptx.rs::build` is the fused decode-sample kernel. Its
+hidden-row load, RMSNorm and row dot are `cfie_spec_sampler_ptx`'s sections
+(`hidden_load`, `rmsnorm_in_place`, `build_row_dot`, over a `Common` built
+by `common_at`), and its own sections are the replace-min candidate merge,
+the argmax, the softmax, the nucleus sort and cutoff, the xorshift64* draw
+(`build_prng_draw`) and the multinomial walk.
+`tests/cfie_sample_kir_equivalence.rs` runs it against
+`tests/fixtures/cfie_sample_hand.rs`, and
+`tests/cfie_sampling_distribution.rs` runs it for thousands of positions on
+the interpreter and compares the tokens' frequencies with the exact
+probabilities.
+`src/cfie_persistent_ptx.rs::build` is the decode block, one CTA running a
+whole layer's decode step. Its attention is the flash-decode tile loop and
+output publish (`prefix_pass`, `publish_output`) run once per Q head over a
+`FlashCtx` its head loop builds, publishing each head's row to shared
+rather than global memory; its two RMSNorms start with
+`cfie_spec_sampler_ptx::sum_of_squares_tree`; its own sections are the RoPE
+pair projections (with `KirOp::Exp2`; element j of a head pairs with
+element j + head_dim/2, the convention of `stdlib/nsl/nn/rope.nsl`), the
+f16 KV append, the W_o and FFN matvecs and the silu. `smem_bytes` answers
+its static footprint before `emit`, which the verifier refuses past 48 KB.
 `tests/cfie_persistent_kir_equivalence.rs` runs it against
-`tests/fixtures/cfie_persistent_hand.rs`.
+`tests/fixtures/cfie_persistent_hand.rs`, and checks its rotated K record
+against values NumPy computed from the stdlib formula.
+Four more CFIE kernels were built this way and have been removed, because
+no driver launched them or (for the first two) because the driver stopped
+needing them: the rejection-sampling kernel and the verification prob-row
+writer (speculative decoding now verifies with the fused sampler itself),
+the tree-mask verification attention kernel, and the per-layer INT8/FP16
+KV read kernels (nothing wrote INT8 KV).
 `src/fused_linear_ce.rs::build_forward` is the first loss-head kernel (roadmap
 A2 step 10): the v1 single-CTA fused linear-CE forward, one builder for f32,
 f16 and bf16 (the storage dtype picks the element type of the inputs and of
@@ -846,13 +839,18 @@ fixtures `tests/train_clif/*.nsl`.
   `measure_variants`, `find_best_variant`, `find_best_variant_cost_model`,
   `AutotuneCacheRecord` keyed by `DeviceIdentity` under `.nsl-cache/autotune/`);
   `crates/nsl-codegen/tests/autotune_cache_identity.rs`, `crates/nsl-codegen/tests/autotune_frozen_db.rs`.
-- **Calibration** — `src/calibration/` (compile-time AWQ / WGGO-gradient
-  calibration: `discovery.rs`, `hooks.rs`, `awq_hook.rs`,
+- **Calibration** — `src/calibration/` (compile-time WGGO-gradient
+  calibration: `discovery.rs`, `hooks.rs`,
   `wggo_gradient_hook.rs`, `retention_pass.rs`, `binary_codegen.rs` emits a
   `calibration_main()` binary, `subprocess.rs` runs it, `sidecar.rs`
-  carries results back; the AWQ activation-scales blob inside it is
-  `nsl_abi::wire::awq_scales`). Entry: `compile_and_calibrate`
-  (`src/lib.rs`); tests `tests/calibration_*.rs`, `tests/awq_*.rs`.
+  carries results back). Entry: `compile_and_calibrate`
+  (`src/lib.rs`), which no `nsl` command calls; tests
+  `tests/calibration_*.rs`, `tests/wggo_*.rs`,
+  `tests/awq_real_subprocess_link.rs`. The AWQ activation-statistics hook
+  that used to sit here (`awq_hook.rs`, triggered by
+  `@quantize(dtype="awq4")`) is deleted and the decorator refused; the
+  scaffolding still knows how to reduce a forward activation to a
+  per-channel maximum for a hook that asks, and no hook does.
 - **Weight-aware compilation** — `src/weight_aware.rs` (M52 constant folding
   from `--weights`), `src/ctor_fold.rs`, `src/lm_head_inference.rs`
   (`--fuse-lm-head`), `src/param_roles.rs`, `src/parameter_plan.rs`.
@@ -879,7 +877,7 @@ or explaining why it is not one.
 `new`, `with_span` (override), `with_span_if_unset` (attach only if none and
 the span is not `Span::DUMMY`), `with_note`, `to_diagnostic()` (→
 `nsl_errors::Diagnostic` with the span as primary label and notes carried
-over; the CLI renders it through the source map), `missing_scales`. `Display`
+over; the CLI renders it through the source map). `Display`
 is the bare message — the CLI adds the `codegen error:` prefix.
 
 Spans are attached by exactly four dispatchers, each wrapping its
@@ -935,7 +933,7 @@ Cargo feature at its `stmt.rs` entry), **CEP** `src/cep.rs`, **CFIE**
 **CPKD** `src/cpkd.rs`, **CCR** `src/ccr.rs`, **CSLA** `src/layerwise.rs` +
 `src/stmt_csla.rs` (`docs/research/CSLA-compiler-scheduled-layerwise-accumulation.md`),
 **PCA** `src/pca_detect.rs` (+ `pca_tier_b.rs`, `pca_per_doc.rs`, …),
-**FASE** `src/fase.rs`, **sparse** `src/sparse.rs`, **speculative** `src/speculative.rs`, **multimodal**
+**FASE** `src/fase.rs`, **speculative** `src/speculative.rs`, **multimodal**
 `src/multimodal.rs`, **BitNet** `src/bitnet/`. Their APIs, flags and on-disk
 formats are not stable; see `STATUS.md` ("Experimental" and "Opting out of
 experimental subsystems") for the tier contract and `docs/wiki/Optimization-Passes.md`
@@ -1022,7 +1020,7 @@ should fail before review.
 prefix the largest families are `tier_*` (45, FA-v2 Tier B1/B2 kernels),
 `csha_*` (34), `pca_*` (29), `fused_*` (25, fused linear-CE and LM head),
 `wggo_*` (14), `cpdt_*` (13), `bitnet_*` (11), `wrga_*` (10), `cfie_*` (10),
-`pass_*` (8), `fase_*` (8), `fa_*` (6), `sinks_*` (5), `awq_*` (5),
+`pass_*` (8), `fase_*` (8), `fa_*` (6), `sinks_*` (5),
 `profiling_*`/`profile_*` (8), `bench_*` (4), plus the ABI/export,
 calibration, autotune and drift-gate singles. Functionally they fall into:
 

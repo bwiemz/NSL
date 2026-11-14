@@ -40,7 +40,7 @@ Then pick a milestone from [Roadmap](Roadmap.md) or an open issue.
 
 ## Recently landed
 
-- **AWQ retention subprocess** — shipped end-to-end. `real_subprocess_entry` is the canonical calibration path; AWQ analytical reference and snapshot tests both green (PRs #134, #145, #146, #148, #149).
+- **Calibration subprocess** — `real_subprocess_entry` is the canonical calibration path (PRs #134, #145, #146, #148, #149). Its AWQ activation-statistics hook was removed in 2026-11: nothing consumed its output, and `@quantize(dtype="awq4")` is now a compile error. The WGGO gradient hook below is the one hook left.
 - **WGGO Phase 2 gradient scoring** — shipped end-to-end. Merge-gate test (`wggo_backward_pipeline::end_to_end_backward_subprocess_matches_analytical_reference`) passes against the analytical reference; `CalibratedGradientScorer` reads real per-head gradients from the calibration sidecar (PRs #132, #136–#141, #144, #146, #148, #149).
 
 ## If you get stuck

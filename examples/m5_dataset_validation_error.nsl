@@ -1,5 +1,5 @@
 dataset bad_data("demo"):
-    source = "data.bin"
+    packing = true
     unexpected = 1
 
 print("unreachable")

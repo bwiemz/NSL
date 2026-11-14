@@ -21,9 +21,11 @@
 //! (membar.cta effect — sufficient because grid = 1).
 //!
 //! Approximations (documented per house style):
-//!   * RoPE angle: freq = theta^(-i2/head_dim) computed as
-//!     ex2(i2 * -log2(theta)/head_dim) with `ex2.approx.f32`, then
-//!     `sin.approx.f32` / `cos.approx.f32` on angle = pos * freq.
+//!   * RoPE angle: freq = theta^(-2j/head_dim) for pair j of a head,
+//!     computed as ex2(2j * -log2(theta)/head_dim) with `ex2.approx.f32`,
+//!     then `sin.approx.f32` / `cos.approx.f32` on angle = pos * freq.
+//!     Pair j is elements (j, j + head_dim/2) of the head: the half-split
+//!     convention of NSL's `RotaryEmbedding` and of HF-Llama checkpoints.
 //!   * softmax exponentials: `ex2.approx.f32` with a baked log2(e).
 //!   * silu(g) = g * sigmoid(g) with sigmoid = 1/(1 + ex2(-g*log2(e))).
 //!
@@ -122,7 +124,8 @@ fn check(cfg: &DecodeBlockConfig) {
     assert!(
         cfg.head_dim >= 2 && cfg.head_dim <= BLOCK_DIM,
         "attention pass 3 maps one thread per output element and RoPE \
-         rotates even/odd pairs; head_dim must be even and in 2..={}",
+         rotates each element with the one head_dim/2 above it; head_dim \
+         must be even and in 2..={}",
         BLOCK_DIM
     );
     assert_eq!(
@@ -236,9 +239,8 @@ struct Block {
     one: VarId,
     /// u32 `BLOCK_DIM`: every strided loop's step.
     stride: VarId,
-    /// u32 and u64 `d_model`.
+    /// u32 `d_model`.
     d: VarId,
-    d_wide: VarId,
     f_zero: VarId,
     /// f32 `1.0`.
     f_one: VarId,
@@ -362,27 +364,49 @@ fn build_rmsnorm(b: &mut KirBuilder, k: &Block, cfg: &DecodeBlockConfig, weight:
     b.emit(KirOp::Barrier);
 }
 
-/// Thread `p` of each strided round owns elements `e0 = 2p` and `e0 + 1`
-/// of a `pairs * 2`-wide projection: the dual dot of weight rows `e0` and
-/// `e0 + 1` with `xn`, rotated by RoPE at `pos` (`i2 = e0 % head_dim`,
-/// `angle = pos * 2^(i2 * c_rope)`), handed to `store(e0, even, odd)`.
-/// Leaves the builder in the loop's exit block.
+/// Thread `p` of each strided round owns one rotary pair of a
+/// `pairs * 2`-wide projection, in the half-split layout: within head `h`,
+/// pair `j` is elements `e0 = h * head_dim + j` and `e1 = e0 + head_dim/2`.
+/// It takes the dual dot of weight rows `e0` and `e1` with `xn` and rotates
+/// the two by `angle = pos * theta^(-2j / head_dim)`:
+///
+/// ```text
+/// (a', b') = (a cos - b sin, a sin + b cos)
+/// ```
+///
+/// which is `x * cos + rotate_half(x) * sin` with
+/// `rotate_half(x) = cat(-x[d/2:], x[:d/2])` — the convention of
+/// `stdlib/nsl/nn/rope.nsl` and of HF-Llama checkpoints, whose names and
+/// `[out][in]` layout the weight binding expects. (Until November 2026 the
+/// kernel paired adjacent elements `(2p, 2p + 1)` instead. The two
+/// conventions give different attention for the same weights; they agree
+/// only after permuting the rows of `W_q` and `W_k`.)
+///
+/// The rotated pair is handed to `store(e0, e1, first, second)`. Leaves the
+/// builder in the loop's exit block.
 fn rope_pairs(
     b: &mut KirBuilder,
     k: &Block,
     cfg: &DecodeBlockConfig,
     pairs: u32,
     weights: VarId,
-    store: impl Fn(&mut KirBuilder, VarId, VarId, VarId),
+    store: impl Fn(&mut KirBuilder, VarId, VarId, VarId, VarId),
 ) {
-    use KirType::{F32, U32, U64};
+    use KirType::{F32, U32};
 
     let end = konst(b, ConstValue::U32(pairs));
     strided(b, k, end, |b, p| {
-        let e0 = op2(b, U32, KirOp::Shl, p, k.one);
+        let half = konst(b, ConstValue::U32(cfg.head_dim / 2));
+        let head_dim = konst(b, ConstValue::U32(cfg.head_dim));
+        let head = op2(b, U32, KirOp::Div, p, half);
+        let j = op2(b, U32, KirOp::Rem, p, half);
+        let head_base = op2(b, U32, KirOp::Mul, head, head_dim);
+        let e0 = op2(b, U32, KirOp::Add, head_base, j);
+        let e1 = op2(b, U32, KirOp::Add, e0, half);
         let row0 = op2(b, U32, KirOp::Mul, e0, k.d);
         let start0 = widen(b, row0);
-        let start1 = op2(b, U64, KirOp::Add, start0, k.d_wide);
+        let row1 = op2(b, U32, KirOp::Mul, e1, k.d);
+        let start1 = widen(b, row1);
         let dots = dot_rows(
             b,
             k,
@@ -393,8 +417,8 @@ fn rope_pairs(
         );
         let (e, o) = (dots[0], dots[1]);
 
-        let head_dim = konst(b, ConstValue::U32(cfg.head_dim));
-        let i2 = op2(b, U32, KirOp::Rem, e0, head_dim);
+        // freq = theta^(-2j / head_dim) = 2^(2j * c_rope).
+        let i2 = op2(b, U32, KirOp::Shl, j, k.one);
         let i2_f = b.new_typed_var(F32);
         b.emit(KirOp::Cast(i2_f, i2, F32));
         let c_rope = konst(b, ConstValue::F32(-(cfg.rope_theta.log2()) / cfg.head_dim as f32));
@@ -407,14 +431,14 @@ fn rope_pairs(
         let cos = b.new_typed_var(F32);
         b.emit(KirOp::Cos(cos, angle));
 
-        // (e', o') = (e*cos - o*sin, e*sin + o*cos)
+        // (a', b') = (a*cos - b*sin, a*sin + b*cos)
         let e_cos = op2(b, F32, KirOp::Mul, e, cos);
         let o_sin = op2(b, F32, KirOp::Mul, o, sin);
-        let even = op2(b, F32, KirOp::Sub, e_cos, o_sin);
+        let first = op2(b, F32, KirOp::Sub, e_cos, o_sin);
         let e_sin = op2(b, F32, KirOp::Mul, e, sin);
-        let odd = b.new_typed_var(F32);
-        b.emit(KirOp::Fma(odd, o, cos, e_sin));
-        store(b, e0, even, odd);
+        let second = b.new_typed_var(F32);
+        b.emit(KirOp::Fma(second, o, cos, e_sin));
+        store(b, e0, e1, first, second);
     });
 }
 
@@ -434,8 +458,8 @@ fn store_half(b: &mut KirBuilder, pool: VarId, index: VarId, value: VarId) {
 /// ```text
 /// 1  x[i] = x_in[i]                                          bar
 /// 2  xn = rmsnorm(x) * norm1_w        (sum-of-squares tree)  bar x9
-/// 3a q[2p], q[2p+1]     = rope(wq rows 2p, 2p+1 . xn)
-/// 3b k_pool[pos][2p..]  = f16(rope(wk rows . xn))
+/// 3a q[e0], q[e1]       = rope(wq rows e0, e1 . xn)   (e1 = e0 + head_dim/2)
+/// 3b k_pool[pos][e0,e1] = f16(rope(wk rows e0, e1 . xn))
 /// 3c v_pool[pos][e]     = f16(wv row e . xn)                 bar
 /// 4  per Q head hh:   (acc, m, l) = flash tile loop over pos+1 tokens
 ///                     ao[hh*hd + tid] = acc / l               bar x3 per tile, x2 per head
@@ -500,7 +524,6 @@ pub fn build(cfg: &DecodeBlockConfig) -> KernelIR {
         one,
         stride: konst(&mut b, ConstValue::U32(BLOCK_DIM)),
         d: konst(&mut b, ConstValue::U32(cfg.d_model)),
-        d_wide: konst(&mut b, ConstValue::U64(cfg.d_model as u64)),
         f_zero: konst(&mut b, ConstValue::F32(0.0)),
         f_one: konst(&mut b, ConstValue::F32(1.0)),
         pos_f,
@@ -543,22 +566,21 @@ pub fn build(cfg: &DecodeBlockConfig) -> KernelIR {
     build_rmsnorm(&mut b, &k, cfg, norm1_w);
 
     // ── phase 3a: Q = rope(Wq @ xn) -> SMEM ─────────────────────────
-    rope_pairs(&mut b, &k, cfg, nhd / 2, wq, |b, e0, even, odd| {
-        let e_addr = at(b, F32, Shared, q_smem, e0);
-        b.emit(KirOp::Store(e_addr, even, Shared));
-        let e1 = op2(b, U32, KirOp::Add, e0, one);
-        let o_addr = at(b, F32, Shared, q_smem, e1);
-        b.emit(KirOp::Store(o_addr, odd, Shared));
+    rope_pairs(&mut b, &k, cfg, nhd / 2, wq, |b, e0, e1, first, second| {
+        let a_addr = at(b, F32, Shared, q_smem, e0);
+        b.emit(KirOp::Store(a_addr, first, Shared));
+        let b_addr = at(b, F32, Shared, q_smem, e1);
+        b.emit(KirOp::Store(b_addr, second, Shared));
     });
 
     // ── phase 3b: K = rope(Wk @ xn), appended to the pool (f16) ────
-    rope_pairs(&mut b, &k, cfg, kv_rows / 2, wk, |b, e0, even, odd| {
+    rope_pairs(&mut b, &k, cfg, kv_rows / 2, wk, |b, e0, e1, first, second| {
         let e0_wide = widen(b, e0);
-        let index = op2(b, U64, KirOp::Add, k_rec, e0_wide);
-        store_half(b, kv_base, index, even);
-        let next = konst(b, ConstValue::U64(1));
-        let index1 = op2(b, U64, KirOp::Add, index, next);
-        store_half(b, kv_base, index1, odd);
+        let index0 = op2(b, U64, KirOp::Add, k_rec, e0_wide);
+        store_half(b, kv_base, index0, first);
+        let e1_wide = widen(b, e1);
+        let index1 = op2(b, U64, KirOp::Add, k_rec, e1_wide);
+        store_half(b, kv_base, index1, second);
     });
 
     // ── phase 3c: V = Wv @ xn, appended to the pool (f16) ───────────
@@ -828,19 +850,21 @@ fn rmsnorm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
     x.iter().zip(w).map(|(v, g)| v / rms * g).collect()
 }
 
+/// Rotary embedding of every head of `row` at `pos`, half-split (see
+/// [`rope_pairs`]): elements `j` and `j + head_dim/2` of a head rotate by
+/// `pos * theta^(-2j / head_dim)`.
 fn rope_rotate(row: &mut [f32], head_dim: usize, pos: u32, theta: f32) {
+    let half = head_dim / 2;
     for h in 0..row.len() / head_dim {
         let base = h * head_dim;
-        let mut i = 0;
-        while i < head_dim {
-            let freq = theta.powf(-(i as f32) / head_dim as f32);
+        for j in 0..half {
+            let freq = theta.powf(-((2 * j) as f32) / head_dim as f32);
             let ang = pos as f32 * freq;
             let (s, c) = ang.sin_cos();
-            let e = row[base + i];
-            let o = row[base + i + 1];
-            row[base + i] = e * c - o * s;
-            row[base + i + 1] = e * s + o * c;
-            i += 2;
+            let a = row[base + j];
+            let b = row[base + j + half];
+            row[base + j] = a * c - b * s;
+            row[base + j + half] = a * s + b * c;
         }
     }
 }

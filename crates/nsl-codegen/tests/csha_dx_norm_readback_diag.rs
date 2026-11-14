@@ -180,8 +180,9 @@ fn dx_norm_hbm_buffer_is_populated() {
     let sin_f32: Vec<f32> = vec![0.0f32; seq * hd / 2];
     let cos_f16: Vec<u16> = cos_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
     let sin_f16: Vec<u16> = sin_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
+    // dO is f32 on the device: the backward reads the incoming gradient
+    // with `ld.global.f32`.
     let do_host_f32 = det_seq(99, seq * kv_dim);
-    let do_f16: Vec<u16> = do_host_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
 
     // ── GPU allocations ──────────────────────────────────────────────────
     let _ = nsl_cuda_init();
@@ -210,13 +211,14 @@ fn dx_norm_hbm_buffer_is_populated() {
     let wv_dev = nsl_test_cuda_alloc(w_bytes);
     let cos_dev = nsl_test_cuda_alloc(rope_bytes);
     let sin_dev = nsl_test_cuda_alloc(rope_bytes);
-    let do_dev = nsl_test_cuda_alloc(qkv_bytes);
-    let dq_dev = nsl_test_cuda_alloc(qkv_bytes);
-    let dk_dev = nsl_test_cuda_alloc(qkv_bytes);
-    let dv_dev = nsl_test_cuda_alloc(qkv_bytes);
-    let dwq_dev = nsl_test_cuda_alloc(dw_bytes);
-    let dwk_dev = nsl_test_cuda_alloc(dw_bytes);
-    let dwv_dev = nsl_test_cuda_alloc(dw_bytes);
+    // dO and every gradient are f32: twice the f16 operand sizes.
+    let do_dev = nsl_test_cuda_alloc(qkv_bytes * 2);
+    let dq_dev = nsl_test_cuda_alloc(qkv_bytes * 2);
+    let dk_dev = nsl_test_cuda_alloc(qkv_bytes * 2);
+    let dv_dev = nsl_test_cuda_alloc(qkv_bytes * 2);
+    let dwq_dev = nsl_test_cuda_alloc(dw_bytes * 2);
+    let dwk_dev = nsl_test_cuda_alloc(dw_bytes * 2);
+    let dwv_dev = nsl_test_cuda_alloc(dw_bytes * 2);
     let dx_dev = nsl_test_cuda_alloc(dx_bytes);
     let dxn_dev = nsl_test_cuda_alloc(dxn_bytes);
 
@@ -241,7 +243,7 @@ fn dx_norm_hbm_buffer_is_populated() {
     nsl_test_cuda_h2d(nw_dev, nw.as_ptr() as i64, nw_bytes);
     nsl_test_cuda_h2d(cos_dev, cos_f16.as_ptr() as i64, rope_bytes);
     nsl_test_cuda_h2d(sin_dev, sin_f16.as_ptr() as i64, rope_bytes);
-    nsl_test_cuda_h2d(do_dev, do_f16.as_ptr() as i64, qkv_bytes);
+    nsl_test_cuda_h2d(do_dev, do_host_f32.as_ptr() as i64, qkv_bytes * 2);
 
     // ── Forward with saves ──────────────────────────────────────────────
     let fwd_ptx = synthesize_flash_attention_ptx_v2(&config);

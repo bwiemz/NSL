@@ -316,9 +316,10 @@ pub const PASSES: &[PassDescriptor] = &[
         tape: TapeAccess::MutatesInPlace {
             refs: &[TapeRef::PositionalIndex, TapeRef::VarId],
             via: &["crates/nsl-codegen/src/ccr.rs"],
-            what: "appends the compressed-save tail to the primal (fresh \
-                   ids above the max — a len-minted id collides after any \
-                   deletion); its OnAdjoint half splices recompute clones \
+            what: "inserts the compressed saves into the primal at each \
+                   segment's end and moves its own segment bounds with them \
+                   (fresh ids above the max — a len-minted id collides after \
+                   any deletion); its OnAdjoint half splices recompute clones \
                    and decompress ops into the adjoint and renumbers that \
                    list to ADJOINT_ID_BASE + index, keeping adjoint ids \
                    positional within the adjoint half of the id space",
@@ -329,9 +330,7 @@ pub const PASSES: &[PassDescriptor] = &[
         full_name: "Fused Accumulation + Step + Epilogue",
         source_files: &[
             "crates/nsl-codegen/src/fase.rs",
-            "crates/nsl-codegen/src/fase_clip.rs",
             "crates/nsl-codegen/src/fase_codegen_table.rs",
-            "crates/nsl-codegen/src/fase_memory.rs",
             "crates/nsl-codegen/src/fase_optimizer.rs",
         ],
         cli_flags: &[],
@@ -380,7 +379,9 @@ pub const PASSES: &[PassDescriptor] = &[
         // declaration false (PHASE MISMATCH on a real compile).
         // `pass_manager_gate.rs` pins the fix.
         phases: &[CompilePhase::KernelPrepass, CompilePhase::TrainBlock],
-        decorator_triggers: &["wggo", "wggo_target"],
+        // `@wggo` is refused (nsl-semantic's UNIMPLEMENTED_DECORATORS): the
+        // pass is selected by flag only.
+        decorator_triggers: &["wggo_target"],
         wiki: WikiCoverage::Documented("WGGO — Wengert Graph Global Optimization"),
         tape: TapeAccess::MutatesInPlace {
             refs: &[
@@ -477,9 +478,16 @@ pub const PASSES: &[PassDescriptor] = &[
             f("cpdt-num-gpus", BR),
             f("cpdt-inter-bw", BR),
             f("cpdt-intra-bw", BR),
+            f("cpdt-memory-budget", BR),
+            f("cpdt-prune-experts", BR),
         ],
         stage: PipelineStage::OnWengert,
-        phases: &[CompilePhase::TrainBlock],
+        // TrainBlock is where the planner runs. KernelPrepass is the MoE
+        // weight passes (dead-expert pruning, capacity factor), which act
+        // on the weight map before any train block and are all of CPDT
+        // that an inference-only MoE program reaches
+        // (`cpdt_moe_capacity::record_moe_disposition`).
+        phases: &[CompilePhase::TrainBlock, CompilePhase::KernelPrepass],
         decorator_triggers: &["cpdt"],
         wiki: WikiCoverage::Documented("CPDT — Compile-time Parallelism & Distributed Training"),
         // Registered OnWengert by stage, yet never touches the tape — the
@@ -521,7 +529,6 @@ pub const PASSES: &[PassDescriptor] = &[
         source_files: &[
             "crates/nsl-codegen/src/cpkd.rs",
             "crates/nsl-codegen/src/cpkd_fused_loss.rs",
-            "crates/nsl-codegen/src/cpkd_spectral.rs",
             "crates/nsl-codegen/src/cpkd_student.rs",
         ],
         // Design-time analysis only — CPKD's runtime half is driven by the

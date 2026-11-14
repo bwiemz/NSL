@@ -148,6 +148,11 @@ pub(crate) fn invoke_cpdt_if_enabled(
     // matching codegen (which ignores @checkpoint decorators in that mode).
     model.activation_checkpointing = !compiler.compile_options.diagnostics.training_reference
         && !compiler.compile_options.checkpoint.policies.is_empty();
+    // Micro-batches per optimizer step: the plan's compute times are per
+    // micro-batch, and sharded parameters are gathered once per micro-batch.
+    model.micro_batches_per_step = train_block
+        .and_then(|t| train_block_grad_accumulation(t, compiler.interner))
+        .unwrap_or(1);
     let adamw = adamw_from_train_block(train_block, compiler.interner);
 
     // Phase 1 weight-aware CPDT: the compiler holds a WeightMap loaded from
@@ -171,7 +176,30 @@ pub(crate) fn invoke_cpdt_if_enabled(
     };
 
     let weights_present = weight_map_ref.is_some();
-    let precision_cfg = PrecisionConfig::default();
+    // The number of blocks decides which block is the last one (the first
+    // and last are held at full precision) and which sit next to them. It
+    // is the model's, counted from the train block's own parameters; the
+    // planner used to assume 8, so on a 12-block model block 7 was pinned
+    // as "last" and block 11 was treated as a middle block.
+    let precision_cfg = match train_block_layer_count(compiler, train_block, applied_plan) {
+        Some(n_layers) => PrecisionConfig {
+            n_layers,
+            ..PrecisionConfig::default()
+        },
+        None => {
+            if weights_present && compiler.cpdt_mode == CpdtMode::Full {
+                nsl_log::nsl_log!(WARN, "cpdt",
+                    "[cpdt] the number of blocks in this train block's model could not be \
+                     determined; no block is treated as first or last, so only embeddings \
+                     and norms are held at full moment precision by position."
+                );
+            }
+            PrecisionConfig {
+                n_layers: 0,
+                ..PrecisionConfig::default()
+            }
+        }
+    };
 
     // Phase 1 weight-map validation: when weights + CpdtMode::Full, verify
     // every hierarchical AppliedPlan layer has matching tensors in the
@@ -227,6 +255,9 @@ pub(crate) fn invoke_cpdt_if_enabled(
 
     let mut plan = cpdt_run(input);
     plan.planned_without_wggo = applied_plan.is_none();
+    // The stage the program will actually run; the report prints it beside
+    // the planner's recommendation, which nothing applies.
+    plan.applied_zero_stage = compiler.features.zero_stage.filter(|&s| s >= 1);
 
     // Say which capacity CPDT planned in. The precision half, when one was
     // built at all, is fully valid (it never reads the applied plan); the
@@ -315,21 +346,101 @@ pub(crate) fn invoke_cpdt_if_enabled(
     Ok(())
 }
 
+/// The number of repeated blocks in the model a train block trains: one more
+/// than the highest `blocks.N` / `layers.N` / `h.N` index among the model's
+/// tensor parameters.
+///
+/// The parameters are enumerated from the model's type (the same walk that
+/// builds the runtime parameter list). When the model's type cannot be
+/// resolved here, the WGGO plan's layer names, which come from the same
+/// parameters, are used. `None` when neither names a block.
+fn train_block_layer_count(
+    compiler: &crate::compiler::Compiler,
+    train_block: Option<&nsl_ast::block::TrainBlock>,
+    applied_plan: Option<&crate::wggo_apply::AppliedPlan>,
+) -> Option<u32> {
+    let from_model = train_block
+        .and_then(|train| train_block_param_paths(compiler, train))
+        .and_then(|paths| crate::cpdt_sensitivity::layer_count(paths.iter().map(String::as_str)));
+    from_model.or_else(|| {
+        let plan = applied_plan?;
+        // A layer name is a bare prefix (`blocks.3`); `layer_count` reads
+        // the index of a parameter path, so give it one.
+        let names: Vec<String> = plan
+            .layers
+            .iter()
+            .map(|l| format!("{}.w", l.layer_name))
+            .collect();
+        crate::cpdt_sensitivity::layer_count(names.iter().map(String::as_str))
+    })
+}
+
+/// The trained tensor parameters of the model a train block names in its
+/// header, as `<model variable>.<field path>`: the walk that builds the
+/// runtime parameter list. `None` when the header's `model` is not a plain
+/// variable or its type cannot be resolved here.
+pub(crate) fn train_block_param_paths(
+    compiler: &crate::compiler::Compiler,
+    train: &nsl_ast::block::TrainBlock,
+) -> Option<Vec<String>> {
+    use nsl_semantic::types::Type;
+    let arg = train
+        .config
+        .iter()
+        .find(|a| a.name.is_some_and(|n| compiler.resolve_sym(n) == "model"))?;
+    let nsl_ast::expr::ExprKind::Ident(sym) = &arg.value.kind else {
+        return None;
+    };
+    let type_name = compiler
+        .models
+        .model_var_types
+        .get(sym)
+        .cloned()
+        .or_else(|| match compiler.type_map.get(&arg.value.id) {
+            Some(Type::Model { name, .. }) | Some(Type::Struct { name, .. }) => {
+                Some(compiler.resolve_sym(*name).to_string())
+            }
+            _ => None,
+        })?;
+    let var_name = compiler.resolve_sym(*sym).to_string();
+    Some(compiler.enumerate_model_tensor_paths(&var_name, &type_name))
+}
+
+/// `grad_accumulation = N` from a train block's header, when it is an
+/// integer literal of at least 1.
+fn train_block_grad_accumulation(
+    train: &nsl_ast::block::TrainBlock,
+    interner: &nsl_lexer::Interner,
+) -> Option<u32> {
+    train.config.iter().find_map(|arg| {
+        let name = arg.name.and_then(|n| interner.resolve(n.0))?;
+        if name != "grad_accumulation" {
+            return None;
+        }
+        match &arg.value.kind {
+            nsl_ast::expr::ExprKind::IntLiteral(n) if *n >= 1 => u32::try_from(*n).ok(),
+            _ => None,
+        }
+    })
+}
+
 pub(crate) fn invoke_wrga_if_enabled(
     compiler: &mut crate::compiler::Compiler,
     list: &crate::wengert::WengertList,
-) -> Option<crate::wrga::WrgaPlan> {
+) -> Result<Option<crate::wrga::WrgaPlan>, CodegenError> {
     // Experimental subsystem (WRGA). Compiled in by default; a build that opts
     // out (`--no-default-features` without `experimental-wrga`) turns WRGA
     // adapter/freeze codegen into a no-op here. See STATUS.md / docs/architecture/.
     #[cfg(not(feature = "experimental-wrga"))]
     {
         let _ = (compiler, list);
-        return None;
+        return Ok(None);
     }
-    let inputs = compiler.wrga_inputs.as_ref()?;
+    let Some(inputs) = compiler.wrga_inputs.as_ref() else {
+        return Ok(None);
+    };
     if inputs.wrga.is_empty() && inputs.freeze.is_empty() && inputs.adapter.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let mode = inputs
@@ -359,18 +470,6 @@ pub(crate) fn invoke_wrga_if_enabled(
     trainable_owned.sort();
     trainable_owned.dedup();
 
-    let manual_adapter_owned: Vec<String> = inputs
-        .adapter
-        .iter()
-        .flat_map(|a| a.targets.iter().cloned())
-        .collect();
-
-    let hybrid_owned: Vec<String> = inputs
-        .wrga
-        .iter()
-        .flat_map(|c| c.layers.iter().cloned())
-        .collect();
-
     let budget_params = inputs
         .wrga
         .iter()
@@ -380,30 +479,69 @@ pub(crate) fn invoke_wrga_if_enabled(
 
     // Borrow the owned strings into the `&'a str` slots `WrgaInput` expects.
     let trainable_patterns: Vec<&str> = trainable_owned.iter().map(|s| s.as_str()).collect();
-    let manual_adapter_targets: Vec<&str> =
-        manual_adapter_owned.iter().map(|s| s.as_str()).collect();
-    let hybrid_layers: Vec<&str> = hybrid_owned.iter().map(|s| s.as_str()).collect();
 
-    // WRGA paper §8.3: surface the first non-empty `target=` set on
-    // `WrgaInputs::wrga[*]`. The CLI's `--wrga-target` override pipes through
-    // this field via `apply_wrga_target_override` in the CLI's bridge
-    // functions. Source-level `@wrga(target="...")` decorators do NOT yet
-    // populate this field — both bridge functions still emit `target: None`
-    // pending symbol-resolution wiring — so this `find_map` falls back to the
-    // historical "rtx5070ti" default for the `nsl build` path. Existing build
-    // behaviour is therefore unchanged; only the `nsl check --wrga-analyze`
-    // path produces a non-None target today.
-    let target_override = inputs
+    // The first `target=` among the `@wrga(...)` decorators (the CLI's
+    // `--wrga-target` overwrites it on every one). None given is "", for
+    // which the analysis uses its default GPU and says so; the fallback used
+    // to be the name "rtx5070ti", which matched no entry of the GPU table.
+    // An unknown name is refused before this point
+    // (`Compiler::check_wrga_decorators`).
+    let target = inputs
         .wrga
         .iter()
         .find_map(|c| c.target.as_deref().filter(|s| !s.is_empty()))
-        .unwrap_or("rtx5070ti");
+        .unwrap_or("");
+
+    // What the compiler knows about each parameter of the list: the class
+    // and field that own it, hence its literal shape and whether an
+    // `@adapter` targets it. A parameter is named by its path
+    // (`m.blocks.0.wq`) and a target by `Class.field`; the targets used to be
+    // matched against the paths as globs, which a `Class.field` never
+    // matches.
+    let root = compiler.freeze_ctx.as_ref().map(|t| t.model.clone());
+    let mut declared_adapters = std::collections::BTreeMap::new();
+    let mut param_shapes = std::collections::HashMap::new();
+    for op in &list.ops {
+        let crate::wengert::PrimalOp::Param(name) = &op.op else {
+            continue;
+        };
+        let Some((class, field)) =
+            root.as_deref().and_then(|root| compiler.resolve_param_owner(root, name))
+        else {
+            continue;
+        };
+        if let Some(dims) = compiler.models.model_field_dims.get(&class).and_then(|m| m.get(&field))
+            && let [d0, d1] = dims[..]
+            && d0 > 0
+            && d1 > 0
+        {
+            param_shapes.insert(name.clone(), [d0 as usize, d1 as usize]);
+        }
+        if let Some(site) = compiler
+            .bus
+            .adapter_sites()
+            .iter()
+            .find(|s| s.target_model == class && s.target_field == field)
+        {
+            declared_adapters.insert(
+                name.clone(),
+                crate::wrga::DeclaredAdapter {
+                    kind: site.kind,
+                    rank: site.rank.max(1) as usize,
+                    params: site.param_count(),
+                },
+            );
+        }
+    }
 
     let wrga_input = crate::wrga::WrgaInput {
         mode,
         trainable_patterns,
-        manual_adapter_targets,
-        hybrid_layers,
+        declared_adapters,
+        param_shapes,
+        fused_kernels_active: crate::wrga_adapter_rewrite::fused_path_selected(
+            compiler.target_sm(),
+        ),
         wengert: list,
         loss_output: list.output,
         // M52 weights (--weights safetensors) feed WRGA's spectral rank
@@ -412,7 +550,7 @@ pub(crate) fn invoke_wrga_if_enabled(
         // `allocate_ranks` (the actual paper allocator) never ran in the
         // build path. Same field wggo_prune dereferences further down.
         weights: compiler.features.weight_map.as_ref(),
-        target: target_override,
+        target,
         budget_params,
         r_min: 2,
         r_max: 16,
@@ -433,55 +571,37 @@ pub(crate) fn invoke_wrga_if_enabled(
     };
     let mut plan = crate::wrga::run(wrga_input);
 
-    // B.2 Task 2b: thread the user-facing `@adapter(type=..., alpha=...)`
-    // decorator config onto each matching placement, then run the adapter
-    // inject pass to populate `synthesized_fields` / `init_strategies`.
-    for adapter_cfg in &inputs.adapter {
+    // Give each placement on an adapted weight that adapter's alpha and the
+    // names of its tensors. The sites themselves are the pre-scan's: every
+    // model constructor built its side-table from them and the methods were
+    // rewritten against their names, before any train block was reached.
+    if let Some(root) = root {
         for placement in plan.placements.iter_mut() {
-            let matches = adapter_cfg
-                .targets
+            let Some((class, field)) = compiler.resolve_param_owner(&root, &placement.name) else {
+                continue;
+            };
+            let Some(site) = compiler
+                .bus
+                .adapter_sites()
                 .iter()
-                .any(|pat| crate::wrga_prune::glob_match(pat, &placement.name));
-            if matches {
-                placement.decorator_kind = Some(adapter_cfg.kind);
-                placement.alpha = adapter_cfg.alpha;
-                if let Some(r) = adapter_cfg.rank
-                    && r > 0
-                {
-                    placement.suggested_rank = r as usize;
-                }
-            }
+                .find(|s| s.target_model == class && s.target_field == field)
+            else {
+                continue;
+            };
+            let (fields, inits) =
+                crate::wrga_adapter_inject::synthesized_for(site.kind, &site.site_id);
+            placement.alpha = Some(site.alpha);
+            placement.synthesized_fields = fields;
+            placement.init_strategies = inits;
         }
-    }
-    let inject = crate::wrga_adapter_inject::run_with_compiler(&mut plan, compiler);
-    // B.2.1 Task 5.5: only publish `adapter_sites` when this invocation
-    // actually produced sites. Otherwise we'd wipe the pre-scan result
-    // (which runs before user-function compilation) when a target pattern
-    // like "Toy.w" doesn't match any placement name emitted by
-    // `infer_sites_from_wengert` (which uses bare "w"-style names).
-    //
-    // Nor does it replace a pre-scan result: every model constructor built
-    // its adapter side-table from the pre-scan sites, and the model methods
-    // were rewritten against their names, so a different list here would
-    // index those tables with a layout they were not built with.
-    // `bus.wrga_plan` is always overwritten — the train-block plan is
-    // strictly more informative (real Wengert list, real placements).
-    if !inject.sites.is_empty() && compiler.bus.adapter_sites().is_empty() {
-        // B.3 Task 4: wire fusion decisions onto each newly-injected site.
-        let mut sites = inject.sites;
-        for site in sites.iter_mut() {
-            for decision in &plan.fusion.decisions {
-                if decision.site == site.target_param {
-                    site.fusion_decision = Some(decision.target.clone());
-                    break;
-                }
-            }
-        }
-        compiler.bus.publish_adapter_sites(sites);
     }
     compiler.bus.publish_wrga_plan(plan.clone());
-    Some(plan)
+    Ok(Some(plan))
 }
+
+/// Head count of the nominal layer CSHA plans on when the model's attention
+/// shape is unknown.
+const NOMINAL_CSHA_HEADS: u32 = 8;
 
 /// CSHA driver bridge — mirrors `invoke_wrga_if_enabled` (Milestone C).
 ///
@@ -497,10 +617,16 @@ pub(crate) fn invoke_wrga_if_enabled(
 ///
 /// No-op when `--csha` was not passed, when the flag or the per-model
 /// decorator disables it, or when the planner returns no plan.
+///
+/// `attention` is the attention shape of the model being trained
+/// (`ModelGeometry::uniform_attention`), `None` when the compiler could not
+/// determine it or the model's attention layers differ. The plan is made on
+/// it; without it the plan falls back to a nominal layer, and says so.
 pub(crate) fn invoke_csha_if_enabled(
     compiler: &mut crate::compiler::Compiler,
     list: &crate::wengert::WengertList,
     model_type_name: &str,
+    attention: Option<crate::wggo_model_shape::AttentionGeometry>,
 ) {
     let Some(ref mode_str) = compiler.compile_options.csha.mode else {
         return;
@@ -566,27 +692,77 @@ pub(crate) fn invoke_csha_if_enabled(
         // The dispatcher then silently falls back to per-op
         // adjoints and the toy pretrain smoke never emits
         // `nsl_flash_attention_csha_backward`.
-        let csha_shape_override = compiler
+        //
+        // The rest of the shape is the model's: batch, sequence length,
+        // stream width, head and KV-head counts come from the attention call
+        // on the tape. They used to be fixed at batch 1, sequence 1024,
+        // d_model 512, 8 heads and 4 KV heads for every model. The element
+        // width stays 2 bytes: it is the width of the kernel's f16 tiles,
+        // which is what the shared-memory figures size, not the model's
+        // dtype. When the model's shape is unknown the nominal layer is
+        // still planned (the kernels a decorated model already gets depend
+        // on this plan), and the plan is marked nominal.
+        let decorator_head_dim = compiler
             .kernels
             .flash_attention_context
             .as_ref()
-            .map(|ctx| crate::wggo_cost::LayerShape {
-                batch: 1,
-                seq: 1024,
-                d_model: 512,
-                head_dim: ctx.config.head_dim as u64,
-                n_kv_heads: 4,
-                dtype_bytes: 2,
-            });
-        if let Some(plan) = crate::csha::run_on_wengert(
+            .map(|ctx| ctx.config.head_dim as u64);
+        let (csha_shape, csha_heads) = match attention {
+            Some(a) => (
+                crate::wggo_cost::LayerShape {
+                    batch: a.batch,
+                    seq: a.seq,
+                    d_model: a.d_model,
+                    head_dim: decorator_head_dim.unwrap_or(a.head_dim),
+                    n_kv_heads: a.n_kv_heads,
+                    dtype_bytes: 2,
+                },
+                a.n_heads as u32,
+            ),
+            None => (
+                crate::wggo_cost::LayerShape {
+                    head_dim: decorator_head_dim
+                        .unwrap_or(crate::wggo::NOMINAL_LAYER_SHAPE.head_dim),
+                    ..crate::wggo::NOMINAL_LAYER_SHAPE
+                },
+                NOMINAL_CSHA_HEADS,
+            ),
+        };
+        if let Some(mut plan) = crate::csha::run_on_wengert(
             list,
             effective_target,
             effective_mode_str,
             None, // weight-aware analysis hooked up via CompileOptions.weight_file in follow-up
-            csha_shape_override, // H.1: forward decorator head_dim to the planner
-            8,    // default head count; weight-informed path refines this
+            Some(csha_shape),
+            csha_heads,
             compiler.bus.wggo_overrides(),
         ) {
+            plan.shape_from_model = attention.is_some();
+            // The attention kernels this build emits, by the names the
+            // synthesis gives them, so the report can tell a planned kernel
+            // spec from an emitted kernel.
+            if let Some(ctx) = compiler.kernels.flash_attention_context.as_ref() {
+                let mut names = vec![
+                    crate::flash_attention_selector::flash_attention_kernel_name_selected(
+                        &ctx.config,
+                    ),
+                ];
+                if let Some(cfg) = ctx.csha_training_config.as_ref() {
+                    let name =
+                        crate::flash_attention_selector::flash_attention_kernel_name_selected(cfg);
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
+                plan.emitted_kernels = names;
+                if attention.is_none() {
+                    nsl_log::nsl_log!(WARN, "csha",
+                        "[csha] this model's attention shape could not be determined at \
+                         compile time; the plan is made on a nominal layer (batch 1, sequence \
+                         1024, d_model 512, 8 heads, 4 KV heads) with the decorator's head_dim."
+                    );
+                }
+            }
             // CSHA's kernels are emitted only for attention inside an
             // `@flash_attention` method. A model without one (every stock
             // model: `stdlib/nsl/nn/gqa.nsl` calls
@@ -666,6 +842,11 @@ pub(crate) fn invoke_csha_if_enabled(
             // and with-saves FFI variants.
             for extras in bridge_out.extras.values_mut() {
                 extras.save_activations_for_backward = true;
+            }
+            // A plan made on the nominal layer knows no head count of this
+            // model; its 8 must not reach the forward launch as a limit.
+            if attention.is_none() {
+                bridge_out.forget_nominal_head_count(NOMINAL_CSHA_HEADS);
             }
             compiler.bus.publish_csha_bridge(bridge_out);
             for d in diags { nsl_log::nsl_log!(WARN, "codegen", "warning: {d}"); }

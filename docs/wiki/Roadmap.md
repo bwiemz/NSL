@@ -18,7 +18,7 @@ NSL's development is organized into milestones (M9-M62) grouped into phases (1-1
 | 6 | v0.6 | M41 full (NVLink/RDMA/TCP KV backends), M47 full (KIR + backends), M39b AST transform | Shipped 2026-03-18 |
 | 7 | v0.6-v0.7 | M38b (linear types codegen), M40b (source AD extraction), M43 (pipeline parallel) | Shipped 2026-03-18 |
 | 8 | v0.8 | M45 (tensor debugger), M46 (reproducibility), M48 (multimodal) | Shipped 2026-03-18 |
-| 9 | v0.8 | M49 (shape algebra), M50 (sparse tensors), M51 (effect system) | Shipped 2026-03-18 |
+| 9 | v0.8 | M49 (shape algebra), M50 (sparse tensors), M51 (effect system) | Shipped 2026-03-18; M50 removed 2026-11 (preserved at tag `attic/sparse-tensors-2026-11`) |
 | 10 | v0.9 | M52 (weight-aware compilation), M62 (PyTorch FFI), M54 (unikernels) | M52/M62 shipped; M54 removed in the Phase 0.6 scope freeze (preserved at tag `attic/scope-freeze-2026-10`) |
 | 11 | v1.0 | M53 (WCET proofs), M55 (ZK circuits), M56 (agent shared memory) | M53/M55/M56 removed in the Phase 0.6 scope freeze (preserved at tag `attic/scope-freeze-2026-10`) |
 | 12 | v1.1 | M58 (elastic FT), M59 (topology routing), M61 (cluster debug) | Planned |
@@ -98,7 +98,7 @@ Symbolic dimension tracking; bounded syntax (`SeqLen < 4096`); runtime dimension
 `@context_parallel` for cross-GPU sequence parallelism over arbitrarily long sequences.
 
 ### M35 -- FP8/AWQ/GPTQ quantization (Shipped v0.3, 2026-03-17; extended 2026-03-26, 0.9 line unreleased)
-FP8 MMA paths; AWQ calibration pipeline; GPTQ full OBQ algorithm with Hessian-based error compensation (2026-03-26, unreleased). Design: [`2026-04-15-m35-fp8-mma-correctness-design.md`](../superpowers/specs/2026-04-15-m35-fp8-mma-correctness-design.md).
+FP8 MMA paths; GPTQ as a runtime library routine (2026-03-26, unreleased; corrected against a reference in 2026-11, not reachable from NSL). The AWQ calibration pipeline shipped here collected statistics nothing consumed and was removed in 2026-11; `awq4` is refused. Design: [`2026-04-15-m35-fp8-mma-correctness-design.md`](../superpowers/specs/2026-04-15-m35-fp8-mma-correctness-design.md).
 
 ### M36 -- Memory planning (Shipped v0.3, 2026-03-17)
 Compile-time tensor liveness analysis; slab allocator for static memory budgets.
@@ -122,7 +122,7 @@ Wengert list construction and adjoint rules (M40a); source extraction and backwa
 Prefill/decode worker separation; KV transfer abstraction; NVLink, RDMA, and TCP backends (M41b, 2026-03-26, unreleased).
 
 ### M42 -- KV-cache compression (Shipped v0.5, 2026-03-18)
-INT8/INT4/FP8 KV compression; sliding-window eviction; H2O token-importance eviction policy.
+INT8/INT4/FP8 KV block quantizers (runtime library; the KV cache does not use them and `@kv_compress` is refused). The sliding-window and H2O eviction managers shipped here had no caller and were removed in 2026-11.
 
 ### M43 -- Pipeline parallelism (Shipped v0.7, 2026-03-18)
 1F1B and GPipe micro-batch scheduling; 3D rank mapping (tensor x pipeline x data); ZeRO-style gradient sharding.
@@ -146,7 +146,7 @@ Kernel IR (KIR) intermediate representation; PTX backend; `GpuTarget`/`GpuBacken
 Symbolic dimension solver; equality, divisibility, and range proofs at compile time.
 
 ### M50 -- Sparse tensors (Shipped v0.8, 2026-03-18)
-`NslSparseTensor`; COO/CSR/CSC/BSR format dispatch; sparse-dense matmul routing.
+`NslSparseTensor`; COO/CSR/CSC/BSR format dispatch; sparse-dense matmul routing. Removed in 2026-11 (preserved at tag `attic/sparse-tensors-2026-11`): nothing could construct a sparse value, so none of it was reachable from NSL.
 
 ### M51 -- Effect system (Shipped v0.8, 2026-03-18)
 Effect annotations on functions; pure/stateful/io effect tracking; required by M46 determinism proofs and M49 shape algebra.

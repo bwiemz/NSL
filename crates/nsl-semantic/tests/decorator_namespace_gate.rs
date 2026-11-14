@@ -131,3 +131,56 @@ fn analyze_enforces_the_closed_namespace() {
         "ghost must get its typed refusal: {ghost:?}"
     );
 }
+
+/// Three decorators that used to pass the checker and then do nothing, each
+/// written where a program would write it. Every one is now an error that
+/// names the decorator and says it is not implemented, including the
+/// spellings the old validators accepted.
+#[test]
+fn accepted_and_ignored_decorators_are_refused_where_they_are_written() {
+    let errors = |src: &str| -> Vec<String> {
+        let mut interner = nsl_lexer::Interner::new();
+        let (tokens, _) = nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
+        let parse = nsl_parser::parse(&tokens, &mut interner);
+        assert!(
+            parse.diagnostics.iter().all(|d| d.level != nsl_errors::Level::Error),
+            "parse errors in {src:?}: {:?}",
+            parse.diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        nsl_semantic::analyze(&parse.module, &mut interner)
+            .diagnostics
+            .iter()
+            .filter(|d| d.level == nsl_errors::Level::Error)
+            .map(|d| d.message.clone())
+            .collect()
+    };
+
+    let field = |deco: &str| {
+        format!(
+            "model M:\n    {deco}\n    w: Tensor = zeros([4, 4])\n\n    fn forward(self, x: Tensor) -> Tensor:\n        return x @ self.w\n"
+        )
+    };
+    for (deco, name) in [
+        ("@kv_compress(method=\"quantize\", dtype=\"int8\")", "kv_compress"),
+        ("@kv_compress(method=\"sliding_window\", window=1024, sinks=4)", "kv_compress"),
+        ("@kv_compress", "kv_compress"),
+        ("@sparse(pattern=\"2:4\")", "sparse"),
+        ("@sparse(pattern=\"block\", block_size=16)", "sparse"),
+    ] {
+        let e = errors(&field(deco));
+        let ours: Vec<&String> = e.iter().filter(|m| m.contains(&format!("@{name} is not implemented"))).collect();
+        assert_eq!(ours.len(), 1, "{deco}: {e:?}");
+        assert!(ours[0].contains("Remove the decorator"), "{deco}: {ours:?}");
+    }
+
+    let e = errors("@fp4_compute(block_size=16, hadamard=true)\nfn f(x: Tensor, w: Tensor) -> Tensor:\n    return x @ w\n");
+    assert!(
+        e.iter().any(|m| m.contains("@fp4_compute is not implemented") && m.contains("@fp8_compute")),
+        "@fp4_compute: {e:?}"
+    );
+
+    // The undecorated model is clean, so the errors above are the
+    // decorators' and nothing else's.
+    let clean = errors(&field("# no decorator"));
+    assert!(clean.is_empty(), "{clean:?}");
+}

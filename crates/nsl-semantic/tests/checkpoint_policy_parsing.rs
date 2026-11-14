@@ -57,11 +57,21 @@ fn block(x: Tensor<[4, 16], f32>) -> Tensor<[4, 16], f32>:
     );
 }
 
+/// The error messages of a source, for the refusal tests below.
+fn error_messages(src: &str) -> Vec<String> {
+    analyze_source(src)
+        .diagnostics
+        .iter()
+        .filter(|d| matches!(d.level, nsl_errors::Level::Error))
+        .map(|d| d.message.clone())
+        .collect()
+}
+
 #[test]
-fn checkpoint_policy_selective_is_published() {
-    // CCR P1.b: "selective" is no longer reserved — it publishes the
-    // Selective policy for the train-block CCR gate (block-granular
-    // recompute with matmul-class outputs saved).
+fn checkpoint_policy_selective_is_refused() {
+    // The selective recompute policy belongs to a train block
+    // (`--checkpoint-selective`). Accepted on a function, it switched the
+    // policy on for every train block of the program, called or not.
     let src = r#"
 @pure
 @checkpoint(policy="selective")
@@ -74,12 +84,63 @@ fn block(x: Tensor<[4, 16], f32>) -> Tensor<[4, 16], f32>:
         .iter()
         .filter(|d| matches!(d.level, nsl_errors::Level::Error))
         .collect();
-    assert!(errors.is_empty(), "selective must be accepted; got: {errors:?}");
-    assert_eq!(
-        res.checkpoint_policies.get("block"),
-        Some(&CheckpointPolicy::Selective),
-        "policy map must carry Selective for the decorated fn"
+    assert!(
+        errors.iter().any(|d| d.message.contains("policy=\"selective\"")
+            && d.message.contains("not supported")
+            && d.message.contains("--checkpoint-selective")),
+        "selective must be refused and point at the flag; got: {errors:?}"
     );
+    assert!(
+        !res.checkpoint_policies.contains_key("block"),
+        "a refused policy must not reach the codegen-side policy map"
+    );
+}
+
+#[test]
+fn checkpoint_on_a_model_is_refused() {
+    // Accepted before with any arguments, and ignored.
+    for args in ["(budget=0.5)", "(policy=\"bogus_value\")", "(policy=\"full\")", ""] {
+        let src = format!(
+            r#"
+@checkpoint{args}
+model M:
+    w: Tensor<[4, 4], f32> = ones([4, 4])
+
+    fn forward(self, x: Tensor<[4, 4], f32>) -> Tensor<[4, 4], f32>:
+        return x @ self.w
+"#
+        );
+        let errors = error_messages(&src);
+        assert!(
+            errors
+                .iter()
+                .any(|m| m.contains("@checkpoint is not supported on a model")),
+            "@checkpoint{args} on a model must be refused; got: {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn checkpoint_on_a_model_method_is_refused() {
+    for args in ["(budget=0.5)", "(policy=\"bogus_value\")", "(policy=\"full\")", ""] {
+        let src = format!(
+            r#"
+model M:
+    w: Tensor<[4, 4], f32> = ones([4, 4])
+
+    @checkpoint{args}
+    fn forward(self, x: Tensor<[4, 4], f32>) -> Tensor<[4, 4], f32>:
+        return x @ self.w
+"#
+        );
+        let errors = error_messages(&src);
+        assert!(
+            errors
+                .iter()
+                .any(|m| m.contains("@checkpoint is not supported on a model method")),
+            "@checkpoint{args} on a method must be refused; got: {errors:?}"
+        );
+    }
 }
 
 #[test]

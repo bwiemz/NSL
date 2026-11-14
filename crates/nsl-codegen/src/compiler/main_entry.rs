@@ -121,7 +121,15 @@ impl Compiler<'_> {
             // treats that as "unknown" rather than as a mismatch. A default
             // build must therefore still say so explicitly.
             {
-                let fp = self.compile_options.exec_fingerprint();
+                let mut fp = self.compile_options.exec_fingerprint();
+                // What the program was specialized on, when it was: emitted
+                // only then, like the layer-prune keys, so that a build with
+                // no value-dependent rewrite and an older checkpoint agree by
+                // both lacking it.
+                if let Some(key) = self.weight_fingerprint_key() {
+                    fp.push(',');
+                    fp.push_str(&key);
+                }
                 let fp_len = fp.len() as i64;
                 let fp_data_id = self.intern_string(&fp)?;
                 let fp_gv = self.module.declare_data_in_func(fp_data_id, builder.func);
@@ -133,6 +141,10 @@ impl Compiler<'_> {
                     &[fp_ptr, fp_len_val],
                 )?;
             }
+
+            // `-w`: open the weights file and check what the compile
+            // specialized on, before any constructor loads from it.
+            self.emit_weight_file_bind(&mut builder)?;
 
             // Item 4: install the matmul arithmetic alongside the fingerprint,
             // from the SAME clamped compile options that were just rendered
@@ -453,7 +465,10 @@ impl Compiler<'_> {
         &mut self,
         builder: &mut FunctionBuilder,
     ) -> Result<(), CodegenError> {
-        if self.fused_ptx_kernels.is_empty() && self.fused_gatedlora_ptx_kernels.is_empty() {
+        if self.fused_ptx_kernels.is_empty()
+            && self.fused_gatedlora_ptx_kernels.is_empty()
+            && self.fused_ia3_ptx_kernels.is_empty()
+        {
             return Ok(());
         }
 
@@ -477,6 +492,16 @@ impl Compiler<'_> {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         gl_order.sort_by_key(|(k, _)| (k.m, k.n, k.k, k.rank, k.target_sm));
+
+        // IA³ kernels follow the gated-LoRA ones, the offset
+        // `wrga_adapter_rewrite::ia3_kernel_handle` bakes into each call.
+        let gl_count = gl_order.len();
+        let mut ia3_order: Vec<(crate::wrga_fused_ptx::LoraKernelKey, String)> = self
+            .fused_ia3_ptx_kernels
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        ia3_order.sort_by_key(|(k, _)| (k.m, k.n, k.k, k.rank, k.target_sm));
 
         let register_id = self.registry.runtime_fns["nsl_wrga_register_fused_ptx"].0;
         let register_ref = self
@@ -599,6 +624,22 @@ impl Compiler<'_> {
                 &ptx,
                 &kernel_name,
                 "fused_gatedlora",
+            )?;
+        }
+
+        // ── IA³ kernels (handles after the LoRA and gated-LoRA ones) ─────
+        for (idx, (key, ptx)) in ia3_order.into_iter().enumerate() {
+            // Must match the entry name `synthesize_fused_ia3_ptx` emits.
+            let kernel_name = format!("nsl_wrga_fused_ia3_m{}n{}k{}", key.m, key.n, key.k);
+            emit_one_registration(
+                &mut self.module,
+                builder,
+                register_ref,
+                lora_count + gl_count + idx,
+                &key,
+                &ptx,
+                &kernel_name,
+                "fused_ia3",
             )?;
         }
 

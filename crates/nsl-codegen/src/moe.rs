@@ -674,7 +674,9 @@ pub fn extract_moe_decorator<'a>(
             let mut num_experts: usize = 0;
             let mut top_k: usize = 2;
             let mut capacity_factor: f32 = 1.25;
-            let mut aux_loss_coeff: f32 = 0.01;
+            // The semantic checker refuses a non-zero coefficient: no
+            // auxiliary loss is emitted (MoE dispatch is inference-only).
+            let mut aux_loss_coeff: f32 = 0.0;
             let mut activation: MoeActivation = MoeActivation::default();
             let mut weight_prefix: Option<String> = None;
 

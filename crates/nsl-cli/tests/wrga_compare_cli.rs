@@ -1,10 +1,11 @@
 //! WRGA paper §8.3 — `nsl check --wrga-compare` integration tests.
 //!
-//! Closes audit Gap #3: the paper specifies a PEFT comparison CLI that
-//! contrasts WRGA's measured numbers against LoRA / AdaLoRA / GaLore / ReFT
-//! baselines. Before this PR there was no comparison surface — only the
-//! existing `nsl build --wrga-report` and (since Gap #2 / PR #262)
-//! `nsl check --wrga-analyze`.
+//! The paper specifies a PEFT comparison CLI. What can be derived from a
+//! plan is each method's adapter parameter count on the plan's sites, so
+//! that is what the report holds: this plan, LoRA at rank 16, GaLore and
+//! ReFT. (It used to carry three more columns filled with the constants
+//! 100%, 100% and 0% for every baseline, and an "AdaLoRA" row that repeated
+//! WRGA's own count.)
 
 use assert_cmd::prelude::*;
 use predicates::prelude::*;
@@ -85,9 +86,12 @@ fn wrga_compare_no_path_prints_full_comparison_table() {
         .stdout(predicate::str::contains("=== WRGA PEFT Comparison Report ==="))
         .stdout(predicate::str::contains("WRGA (this run)"))
         .stdout(predicate::str::contains("LoRA (r=16)"))
-        .stdout(predicate::str::contains("AdaLoRA"))
         .stdout(predicate::str::contains("GaLore"))
-        .stdout(predicate::str::contains("ReFT (r=4, top-25%)"));
+        .stdout(predicate::str::contains("ReFT (r=4, top-25%)"))
+        // No row for AdaLoRA (a row starts its line with the method's name),
+        // and no percentage column.
+        .stdout(predicate::str::contains("\nAdaLoRA").not())
+        .stdout(predicate::str::contains("100.0%").not());
 }
 
 /// `--wrga-compare=path.txt` writes to file and emits nothing of substance
@@ -111,7 +115,7 @@ fn wrga_compare_with_path_writes_to_file() {
     let contents = fs::read_to_string(&report_path).unwrap();
     assert!(contents.contains("=== WRGA PEFT Comparison Report ==="));
     assert!(contents.contains("LoRA (r=16)"));
-    assert!(contents.contains("§9 benchmark suite"));
+    assert!(contents.contains("They say nothing about quality or speed."));
 }
 
 /// `--wrga-compare` must suppress the analyze report — only the comparison

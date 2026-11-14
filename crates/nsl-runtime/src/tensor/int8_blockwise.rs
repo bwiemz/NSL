@@ -11,10 +11,22 @@
 //! the logical INT8-element count (scales are metadata, not visible to ops).
 //!
 //! Scaling: symmetric absmax (`scale = max(|x|) / 127`). Round-to-nearest by
-//! default; stochastic rounding (paper §3.3) when the flag is set —
-//! `floor(v / scale + u01)` where `u01` is drawn from a thread-local PRNG.
-//! Stochastic mode is unbiased in expectation, which is the property §3.3
-//! cites for INT8 stability on embeddings.
+//! default; stochastic rounding (paper §3.3) when the `stochastic` argument
+//! is non-zero — `floor(v / scale + u01)` where `u01` comes from a generator
+//! seeded with that argument. Stochastic mode is unbiased in expectation
+//! over seeds, which is the property §3.3 cites for INT8 stability on
+//! embeddings; a caller that quantizes the same tensor every step must pass
+//! a different seed each step, or each element is rounded the same way
+//! every time and the bias it was meant to remove is back.
+//!
+//! This is a LINEAR code: every element of a block shares one step,
+//! `max(|x|) / 127`. An element more than about two orders of magnitude
+//! below its block's largest rounds to zero (or, stochastically, to zero
+//! most of the time). That is tolerable for Adam's first moment and wrong
+//! for its second moment, whose elements within one block routinely span
+//! several decades and whose small elements set the largest steps: do not
+//! store `v` in this format. Nothing in the optimizer does; the functions
+//! are not called by generated code.
 
 use std::ffi::c_void;
 
@@ -42,9 +54,24 @@ pub fn int8_blockwise_scales_offset(n: usize) -> usize {
     (n + 3) & !3
 }
 
-/// Thread-local xorshift PRNG seeded once from `n` so stochastic rounding is
-/// reproducible per-tensor-size — good enough for the unbiased-in-expectation
-/// property and stable enough for tests.
+/// Initial generator state for one quantization call: a mix of the caller's
+/// seed and the element count, never zero (xorshift's fixed point).
+///
+/// The state used to come from the element count alone, so every call on a
+/// tensor of a given size drew the same dither: an element was rounded the
+/// same way on every step, and "stochastic" rounding was a fixed rounding
+/// rule.
+fn rng_state_for(seed: u64, n: usize) -> u64 {
+    // splitmix64 finalizer over the seed, offset by the size.
+    let mut z = seed
+        .wrapping_add(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add((n as u64).wrapping_mul(0xD1B5_4A32_D192_ED03));
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    (z ^ (z >> 31)) | 1
+}
+
+/// xorshift64* step, mapped to `[0, 1)`.
 fn xorshift_u01(state: &mut u64) -> f32 {
     // xorshift64*
     let mut x = *state;
@@ -64,7 +91,7 @@ pub fn quant_to_buffer(src: &[f32], dst_bytes: &mut [u8], stochastic: bool, rng_
     let n = src.len();
     debug_assert_eq!(dst_bytes.len(), int8_blockwise_byte_size(n));
     let scales_off = int8_blockwise_scales_offset(n);
-    let mut rng_state = rng_seed | 1;
+    let mut rng_state = rng_state_for(rng_seed, n);
     let (int8_part, tail) = dst_bytes.split_at_mut(scales_off);
     let int8_part = &mut int8_part[..n];
     let n_blocks = n.div_ceil(INT8_BLOCK_SIZE);
@@ -126,8 +153,12 @@ fn block_absmax(block: &[f32]) -> f32 {
 
 /// Quantize an FP32 tensor to blockwise INT8.
 ///
-/// `stochastic` non-zero enables stochastic rounding (paper §3.3). The returned
-/// tensor's dtype is `DTYPE_INT8_BLOCKWISE`; `len` is the logical INT8 element count.
+/// `stochastic == 0` rounds to nearest. Any other value enables stochastic
+/// rounding (paper §3.3) and is the seed of its dither: two calls with the
+/// same seed round identically, so a caller quantizing a value repeatedly
+/// (an optimizer step) passes a different non-zero value each time, such as
+/// the step count plus one. The returned tensor's dtype is
+/// `DTYPE_INT8_BLOCKWISE`; `len` is the logical INT8 element count.
 /// Caller owns the result and must `nsl_tensor_free` it.
 ///
 /// # Safety
@@ -164,7 +195,7 @@ pub extern "C" fn nsl_tensor_quant_int8_blockwise(
         dst_data.add(int8_blockwise_scales_offset(n)) as *mut f32
     };
 
-    let mut rng_state: u64 = (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut rng_state: u64 = rng_state_for(stochastic as u64, n);
     let do_stochastic = stochastic != 0;
 
     for (block_idx, chunk_start) in (0..n).step_by(INT8_BLOCK_SIZE).enumerate() {
@@ -341,36 +372,73 @@ mod tests {
         nsl_tensor_free(dqt);
     }
 
+    /// One block: element 0 is 1.0, which fixes the step at 1/127, and the
+    /// other 63 are 10.25 steps. Returns the dequantized values of those 63
+    /// in units of a step.
+    fn quantize_quarter_step_block(stochastic: i64) -> Vec<f64> {
+        let mut vals = vec![10.25f32 / 127.0; 64];
+        vals[0] = 1.0;
+        let src = make_f32(&vals);
+        let qt = nsl_tensor_quant_int8_blockwise(src, stochastic);
+        let dqt = nsl_tensor_dequant_int8_blockwise(qt);
+        let out: Vec<f64> = read_f32(dqt)[1..].iter().map(|v| f64::from(*v) * 127.0).collect();
+        nsl_tensor_free(src);
+        nsl_tensor_free(qt);
+        nsl_tensor_free(dqt);
+        out
+    }
+
+    /// Stochastic rounding is unbiased over seeds where round-to-nearest is
+    /// not.
+    ///
+    /// A value of 10.25 steps rounds to 10 every time under round-to-nearest:
+    /// a bias of 0.25 step. Under stochastic rounding it is 11 with
+    /// probability 0.25 and 10 otherwise, mean 10.25. Over 4000 seeds the
+    /// mean of one element has standard deviation sqrt(0.25 x 0.75 / 4000) =
+    /// 0.0068 step, so 0.05 step is more than seven standard deviations and
+    /// a fifth of the bias any fixed rounding rule leaves.
+    ///
+    /// The earlier form of this test ran 64 trials that were all the same
+    /// trial (the generator was reseeded from the element count on every
+    /// call) under a tolerance of one whole step, which round-to-nearest,
+    /// floor and ceiling all meet.
     #[test]
-    fn stochastic_rounding_is_unbiased_in_mean() {
-        // Paper §3.3: stochastic rounding is unbiased in expectation. Quantize
-        // a slope -> dequantize -> repeat enough times that the per-sample
-        // noise averages out. The blockwise absmax stays the same across runs
-        // (input is unchanged), so the only stochastic variation is the
-        // round-up/down decision.
-        let vals: Vec<f32> = (0..64).map(|i| (i as f32) / 64.0).collect(); // 0..1
-        let mut sums = vec![0.0f64; 64];
-        let trials = 64;
-        for _ in 0..trials {
-            let src = make_f32(&vals);
-            let qt = nsl_tensor_quant_int8_blockwise(src, 1);
-            let dqt = nsl_tensor_dequant_int8_blockwise(qt);
-            let out = read_f32(dqt);
-            for (i, v) in out.iter().enumerate() {
-                sums[i] += *v as f64;
+    fn stochastic_rounding_is_unbiased_over_seeds() {
+        // The bias the stochastic mode exists to remove.
+        for v in quantize_quarter_step_block(0) {
+            assert!((v - 10.0).abs() < 1e-3, "round-to-nearest gives 10 steps, got {v}");
+        }
+
+        const SEEDS: i64 = 4000;
+        let mut sums = vec![0.0f64; 63];
+        for seed in 1..=SEEDS {
+            for (sum, v) in sums.iter_mut().zip(quantize_quarter_step_block(seed)) {
+                assert!(
+                    (v - 10.0).abs() < 1e-3 || (v - 11.0).abs() < 1e-3,
+                    "a value of 10.25 steps rounds to 10 or 11, got {v}"
+                );
+                *sum += v;
             }
-            nsl_tensor_free(src);
-            nsl_tensor_free(qt);
-            nsl_tensor_free(dqt);
         }
-        // Mean residual should be smaller than the deterministic quantization
-        // error (one-sided bias of truncate-to-zero is the failure we'd see
-        // without stochastic rounding). Tolerance: 1/127 (one INT8 step).
-        for (i, s) in sums.iter().enumerate() {
-            let mean = (*s / trials as f64) as f32;
-            let err = (vals[i] - mean).abs();
-            assert!(err < 1.0 / 127.0, "i={i} input {} mean {} err {}", vals[i], mean, err);
+        for (i, sum) in sums.iter().enumerate() {
+            let mean = sum / SEEDS as f64;
+            assert!(
+                (mean - 10.25).abs() < 0.05,
+                "element {i}: mean over {SEEDS} seeds is {mean} steps, expected 10.25"
+            );
         }
+    }
+
+    /// The seed decides the dither: the same seed rounds identically, and
+    /// different seeds do not all round alike.
+    #[test]
+    fn the_seed_selects_the_dither() {
+        assert_eq!(quantize_quarter_step_block(7), quantize_quarter_step_block(7));
+        let first = quantize_quarter_step_block(1);
+        assert!(
+            (2..=20).any(|seed| quantize_quarter_step_block(seed) != first),
+            "twenty seeds produced the same rounding of every element"
+        );
     }
 
     #[test]

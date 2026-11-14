@@ -242,24 +242,32 @@ Older, adjacent code that a reader might mistake for it:
   and `per_tensor|per_channel|per_group` is the only quantization path NSL
   source can reach (`crates/nsl-codegen/src/stmt_quant.rs`,
   `nsl_qtensor_quantize` in `crates/nsl-runtime/src/quantize.rs`). It
-  quantizes and immediately dequantizes into a new f32 model; there is no
-  packed inference. It treats every field alike unless the user writes
+  quantizes and immediately dequantizes into a new f32 copy of the model,
+  descending into sub-models; there is no packed inference. It quantizes
+  every tensor field alike, whatever its role, unless the user writes
   `exclude:` globs.
 - **AWQ and GPTQ.** `awq4`, `gptq4` and `gptq8` parse in a `quant` block but
-  are refused by `crates/nsl-semantic/src/quant_requests.rs`. The runtime
-  code behind them (`crates/nsl-runtime/src/awq.rs`, `gptq.rs`) is reachable
-  only from Rust unit tests. Neither follows its published algorithm
-  faithfully, so the refusal is the right behaviour.
-- **`@quantize(dtype="awq4")`.** Reachable. It runs a calibration pass that
-  writes per-channel activation scales to a sidecar file
-  (`crates/nsl-codegen/src/calibration/awq_hook.rs`). The only consumer sits
-  behind the refused `awq4` block, so the output is never used.
+  are refused by `crates/nsl-semantic/src/quant_requests.rs`, and code
+  generation refuses them too. The runtime code behind the names
+  (`crates/nsl-runtime/src/awq.rs`, `gptq.rs`) is reachable only from Rust
+  unit tests. `gptq.rs` follows the published algorithm and is tested
+  against a NumPy reference. `awq.rs` is per-group round-to-nearest into a
+  4-bit packed format; it is not AWQ, and its module comment says so. The
+  refusal remains the right behaviour: nothing feeds either routine
+  calibration data from NSL source.
+- **`@quantize(dtype="awq4")`.** Refused, in every form of the decorator.
+  It used to select the model for an activation-statistics pass and had
+  activation-retention copies compiled into the model's forward for it;
+  nothing read the statistics. The hook that collected them
+  (`awq_hook.rs` under `crates/nsl-codegen/src/calibration/`) and the
+  discovery that found the models are deleted.
 - **`@fp8_compute`.** Reachable. It sets one flag per function, so a
   decorated forward runs the LM-head matmul in FP8 like any other matmul.
-- **NVFP4 quantization with an optional Hadamard transform.**
+- **Block-scaled FP4 rounding with an optional Hadamard rotation.**
   `nsl_nvfp4_quantize` in `crates/nsl-runtime/src/fp8.rs`. Not reachable:
-  `extract_fp4_compute_decorator` in `crates/nsl-codegen/src/fp8.rs` has no
-  caller.
+  `@fp4_compute` is a refused decorator. Despite the name it is not the
+  NVFP4 data format: it takes any block size and keeps f32 scales, and the
+  rotation runs over the whole flattened tensor.
 - **BitNet loader.** `crates/nsl-codegen/src/bitnet/loader.rs` ternarizes
   only attention and MLP projections, chosen by a name-suffix whitelist. This
   is the one other place where embedding and head are left alone.
@@ -267,12 +275,13 @@ Older, adjacent code that a reader might mistake for it:
 No shipped model uses `quant`, `@quantize` or `@fp8_compute`; only
 `examples/m16_quantize.nsl` and the `examples/m35_*` files do.
 
-One document in the repository still misdescribes this area:
-`docs/summaries/06-implementation-status.md` lists AWQ and GPTQ as
-"Production"; `STATUS.md` is the accurate one. `docs/wiki/Glossary.md` used
-to expand CESH as "Compiler-Evaluated Speculative Hypothesis" and describe
-speculative decoding, which is not what `CESH.pdf` proposes; it now gives
-the real title and says the proposal is not implemented.
+`docs/summaries/06-implementation-status.md` and `SPECIFICATION.md` used to
+list AWQ and GPTQ as available ("Production"); both now say that the
+routines are runtime library code NSL source does not reach.
+`docs/wiki/Glossary.md` used to expand CESH as "Compiler-Evaluated
+Speculative Hypothesis" and describe speculative decoding, which is not what
+`CESH.pdf` proposes; it now gives the real title and says the proposal is
+not implemented.
 
 Defects found in this code are listed in Part 5.
 
@@ -313,90 +322,115 @@ as of 2026-11-13.
   Hypothesis" and described speculative decoding. It now gives the real
   title and says the proposal is not implemented.
 
+- **A `quant` block read a strided view in storage order.** With a model
+  field that is a transposed 3×2 view, `x @ w` is `[-4.5, 4.5]`; the
+  quantized model returned `[-1.49, 1.49]` and reported nothing. The
+  quantizer now reads every tensor in logical order (`logical_values_f64`
+  in `crates/nsl-runtime/src/quantize.rs`); a test runs that model through
+  a `quant` block.
+- **The other quantizer entry points read tensors the same way, and none
+  checked the device.** `nsl_awq_quantize`, `nsl_awq_matmul`
+  (`crates/nsl-runtime/src/awq.rs`), `nsl_gptq_quantize`,
+  `nsl_gptq_quantize_ext` and `nsl_gptq_hessian_add_batch`
+  (`crates/nsl-runtime/src/gptq.rs`) took elements in storage order, and
+  neither they nor `nsl_qtensor_quantize` looked at which device holds the
+  tensor. All of them now read through the same routine, which follows
+  strides and stages a GPU tensor to the host, and a `quant` block moves
+  each quantized field back to the device its source is on. Tests cover a
+  strided view on the host, a tensor and a strided view on a GPU at each
+  entry point, and a `quant` block on a model that was moved to the GPU.
+- **A `quant` block could not handle a model that has a sub-model, and
+  what it did varied from run to run.** It took the model type from a scan
+  of a hash map and passed every field, sub-model pointers and `int`
+  fields included, to the tensor quantizer: of six runs on a model with
+  one sub-model, three aborted with "invalid tensor handle" and three ran
+  the inner model's layout on the outer's data. It now uses the source
+  variable's type and copies the model field by field: tensors are
+  quantized, sub-models and fixed-size arrays of sub-models are copied
+  recursively, other fields are carried over. An `exclude:` pattern
+  matches a field's dotted path (`inner.w`) or its own name
+  (`compile_quant_block` in `crates/nsl-codegen/src/stmt_quant.rs`).
+- **`gptq_quantize_obq` did worse than plain rounding on GPTQ's own
+  objective**, because it moved its group scales and never updated H⁻¹.
+  Each group's scale and zero were recomputed from compensated weights at
+  every column, so earlier codes decoded with a later scale, and the
+  inverse Hessian was used unchanged throughout. For a 128×64 weight in
+  groups of 32 with correlated inputs the output error tr(ΔᵀHΔ) was 0.769
+  against 0.615 for round-to-nearest. Group parameters now come from the
+  original W and each rounding error is spread with the upper Cholesky
+  factor of H⁻¹. On a problem of that shape the output error is 0.0108
+  against 0.0474 for round-to-nearest, and it equals a NumPy
+  implementation of the published algorithm to seven digits on three
+  shapes; those numbers are in the unit tests.
+- **GPTQ accepted a bit width and ignored it.** A request for 8 bits
+  produced 4-bit codes. The packed format has one width, so any other is
+  now an error (`GptqError::UnsupportedBits`), as is a Hessian that is
+  neither K×K nor a K-element diagonal, which used to fall back to
+  rounding without a message.
+- **The `gptq.rs` module comment named a step the code did not perform.**
+  It said "Compute Cholesky factorization of H^{-1}" where the code
+  factored H and inverted it once. The comment now describes the
+  algorithm, and the code performs that step.
+- **The GPTQ tests could not detect any of this.**
+  `test_gptq_obq_reduces_error_vs_rtn` compared weight mean-squared error,
+  which a correct GPTQ increases; the others asserted only that an error
+  was under a fixed bound. The tests now compare output error with
+  round-to-nearest and with stored reference values, and one asserts that
+  the weight error rises.
+- **`nsl_nvfp4_quantize` with the Hadamard flag returned transformed
+  values.** The result was in the Hadamard domain, in the original shape,
+  with no inverse applied and no record that one was needed. It now
+  returns the reconstruction in the tensor's own basis. On a 1,024-element
+  test vector the returned tensor's relative error is 0.122 (0.065 with
+  the flag off), where the transformed values scored 1.435; a unit test
+  holds those numbers, computed separately in NumPy.
+- **The NVFP4 Hadamard flag was silently skipped unless the tensor's
+  total length is a power of two.** A request it cannot honour is now an
+  error (`NvFp4Error::HadamardLength`; fatal with a message from the FFI
+  entry point). The rotation still runs over the whole flattened tensor,
+  and blocks still default to 256 elements with unconstrained f32 scales:
+  the routine is block-scaled FP4 rounding, not the NVFP4 format, and its
+  comments now say so (`crates/nsl-runtime/src/fp8.rs`).
+- **The only test that called `nsl_nvfp4_quantize` compared the GPU result
+  with the CPU result of the same code**, so the missing inverse passed.
+  That device test stays for what it checks; the reference test above
+  calls the same entry point on the host.
+- **AWQ pre-scaling and the AWQ matmul disagreed on the input-channel
+  axis.** `nsl_awq_pre_scale_weight` scaled columns and documented them as
+  input channels; `nsl_awq_matmul` treats rows as input channels; and the
+  inverse scale was applied nowhere, so a pre-scaled weight would have
+  changed the model's function. `nsl_awq_pre_scale_weight` and the code
+  in `compile_quant_block` that called it, behind the refused `awq4`
+  block, are removed. `nsl_awq_matmul` now checks that its input is
+  `[M, K]` for a `[K, N]` weight.
+- **The code named AWQ did not use its calibration.** `nsl_awq_quantize`
+  ignored its calibration argument and rounded to each group's minimum
+  and maximum. It is not AWQ and no longer presents itself as AWQ: the
+  module comment in `crates/nsl-runtime/src/awq.rs` and the status
+  documents describe it as per-group round-to-nearest, and a non-null
+  calibration argument is refused instead of ignored. The calibration
+  hook that collected a per-channel max |x| (where AWQ uses the mean) has
+  since been deleted; see the last item of this list.
+- **The AWQ "end-to-end" tests checked only that bytes change.**
+  `awq_quantize_with_scales`, an int8 abs-max stand-in, existed for tests
+  that asserted its output differed when the scales differed. The
+  stand-in and those tests are removed.
+- **`docs/summaries/06-implementation-status.md` called AWQ and GPTQ
+  "Production".** Its rows for M21-M22 and M35 and its feature list now
+  say that NSL source reaches neither, and what each routine is.
+- **`@quantize(dtype="awq4")` computed scales that nothing consumed.** The
+  decorator was accepted and selected the model for a calibration pass
+  that wrote per-channel activation maxima to a sidecar file; it also had
+  activation-retention copies compiled into the model's forward in every
+  build. Nothing read the result. The decorator is now a compile error in
+  every form (`crates/nsl-semantic/src/quant_requests.rs`): `awq4`, and
+  the bare decorator that meant the same, say that AWQ calibration is not
+  implemented, any other dtype says that dtype is not implemented, and
+  both point at the `quant` block. The calibration hook, the discovery of
+  `@quantize` models and the tests that exercised only them are deleted.
+  The calibration harness itself remains for the gradient-importance
+  statistics; no `nsl` command runs it.
+
 ### Open, in the adjacent code
 
-- **A `quant` block reads a strided view in storage order.** With a model
-  field that is a transposed 3×2 view, `x @ w` should be `[-4.5, 4.5]`; the
-  quantized model returns `[-1.49, 1.49]` and reports nothing. Where:
-  `nsl_qtensor_quantize` in `crates/nsl-runtime/src/quantize.rs`.
-  Reproduced by running. Right behaviour: materialize the view first.
-- **The other quantizer entry points read tensors the same way, and none
-  checks the device.** `nsl_awq_quantize` (`crates/nsl-runtime/src/awq.rs`)
-  and `nsl_gptq_quantize` (`crates/nsl-runtime/src/gptq.rs`) also take
-  elements in storage order; neither they nor `nsl_qtensor_quantize` look
-  at which device holds the tensor. By reading the code only. Right
-  behaviour: stage a GPU tensor to the host, or refuse it.
-- **`gptq_quantize_obq` does worse than plain rounding on GPTQ's own
-  objective.** For a 128×64 weight in groups of 32 with correlated inputs,
-  the output error tr(ΔᵀHΔ) is 0.615 for round-to-nearest, 0.769 for this
-  code and 0.254 for reference GPTQ. Where:
-  `crates/nsl-runtime/src/gptq.rs`; NSL source cannot reach it. Numeric
-  check.
-- **`gptq_quantize_obq` moves its group scales and never updates H⁻¹.**
-  Each group's scale and zero are recomputed from compensated weights at
-  every column, so earlier codes decode with a later scale. Numeric check,
-  on a second matrix of that shape: fixing this alone takes the error from
-  0.665 to 0.268, and the upper Cholesky factor of H⁻¹ then gives 0.240,
-  the reference value. Group parameters should come from the original W.
-- **`nsl_nvfp4_quantize` with the Hadamard flag returns transformed
-  values.** The result is in the Hadamard domain, in the original shape,
-  with no inverse applied and no record that one is needed: relative error
-  1.43, against 0.106 once the inverse is applied and 0.104 with the flag
-  off. Where: `crates/nsl-runtime/src/fp8.rs`; NSL source cannot reach it.
-  Numeric check.
-- **AWQ pre-scaling and the AWQ matmul disagree on the input-channel
-  axis.** `nsl_awq_pre_scale_weight` scales columns and documents them as
-  input channels; `nsl_awq_matmul` treats rows as input channels. The
-  inverse scale is applied nowhere, so a pre-scaled weight would change the
-  model's function. Where: `crates/nsl-runtime/src/awq.rs`, behind the
-  refused `awq4` block. By reading the code only.
-- **`@quantize(dtype="awq4")` computes scales that nothing consumes.** The
-  decorator is accepted and runs a calibration pass that writes a sidecar
-  file. Its only reader is in `compile_quant_block`
-  (`crates/nsl-codegen/src/stmt_quant.rs`), behind the refused `awq4`
-  block. By reading the code only. Right behaviour: drop the calibration
-  trigger or wire a consumer.
-- **The code named AWQ does not use its calibration.** `nsl_awq_quantize`
-  (`crates/nsl-runtime/src/awq.rs`) ignores its calibration argument and
-  rounds to each group's minimum and maximum. The hook in
-  `crates/nsl-codegen/src/calibration/awq_hook.rs` collects per-channel
-  max |x| where AWQ uses the mean, and the exponent is fixed at 0.5 with
-  no search over it and no clip search. By reading the code only.
-- **GPTQ accepts a bit width and ignores it.** `gptq_quantize_cpu` passes
-  `bits` to `gptq_quantize_obq`, which always calls `quantize_int4`, so a
-  request for 8 bits would produce 4-bit codes. Where:
-  `crates/nsl-runtime/src/gptq.rs`; NSL source cannot reach it. By reading
-  the code only.
-- **The NVFP4 Hadamard flag is silently skipped unless the tensor's total
-  length is a power of two.** When it does apply, it runs over the whole
-  flattened tensor. Blocks default to 256 elements with unconstrained f32
-  scales, which is not the NVFP4 format. Where: `quantize_nvfp4` in
-  `crates/nsl-runtime/src/fp8.rs`. By reading the code only.
-- **A `quant` block cannot handle a model that has a sub-model, and what
-  it does varies from run to run.** Of six runs on a model with one
-  sub-model field, three aborted with "invalid tensor handle"; three ran
-  the inner model's layout on the outer's data and died in a matmul.
-  `compile_quant_block`, `crates/nsl-codegen/src/stmt_quant.rs`. Reproduced
-  by running. It should use the source's type and recurse into sub-models.
-- **`docs/summaries/06-implementation-status.md` calls AWQ and GPTQ
-  "Production".** Its rows for M21-M22 and M35 and its feature list say
-  so. NSL source can reach neither, and the items above show neither is
-  correct. `STATUS.md` is accurate. By reading the code only.
-- **The `gptq.rs` module comment names a step the code does not perform.**
-  It says "Compute Cholesky factorization of H^{-1}"; the code factors H
-  and inverts it once. Where: `crates/nsl-runtime/src/gptq.rs`. By reading
-  the code only.
-- **The GPTQ tests cannot detect the defects above.**
-  `test_gptq_obq_reduces_error_vs_rtn` compares weight mean-squared error,
-  which a correct GPTQ increases; the others assert only that an error is
-  under a fixed bound. Where: `crates/nsl-runtime/src/gptq.rs`. By reading
-  the code only. Right behaviour: compare output error with
-  round-to-nearest and with a stored reference.
-- **The AWQ "end-to-end" tests check only that bytes change.**
-  `awq_quantize_with_scales` in `crates/nsl-runtime/src/awq.rs` is, by
-  design, an int8 abs-max stand-in, and its tests assert only that the
-  output bytes differ when the scales differ. By reading the code only.
-- **The only test that calls `nsl_nvfp4_quantize` compares the GPU result
-  with the CPU result of the same code**, so the missing inverse passes.
-  Where: `crates/nsl-runtime/tests/fp8_gpu_device_guard.rs`. By reading
-  the code only.
+Nothing in this list is open.

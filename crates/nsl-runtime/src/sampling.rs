@@ -78,6 +78,12 @@ pub fn rng_f64() -> f64 {
     RNG.with(|r| r.borrow_mut().random::<f64>())
 }
 
+/// Generate a uniform random u64 using the thread-local seeded RNG — a
+/// seed for a routine that keeps its own generator.
+pub fn rng_u64() -> u64 {
+    RNG.with(|r| r.borrow_mut().random::<u64>())
+}
+
 /// Capture this thread's RNG as (seed bytes, word position) — see
 /// [`crate::rng_state::RngSnapshot`]. The seed alone is not the state: the
 /// stream has advanced, and resuming from the seed would re-draw masks the

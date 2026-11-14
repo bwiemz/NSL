@@ -37,6 +37,8 @@ fn empty_layer_solution() -> LayerIlpSolution {
         cost_us: 0.0,
         memory_bytes: 0,
         smem_bytes: 0,
+        param_bytes: 0,
+        activation_bytes: 0,
         nodes_explored: 0,
         feasible: true,
         decision_trace: Vec::new(),
@@ -47,6 +49,7 @@ fn empty_plan() -> WggoPlan {
     WggoPlan {
         mode: WggoMode::Full,
         target_gpu: "H100".into(),
+        shapes_from_model: false,
         graph: OptGraph::default(),
         inter_layer: InterLayerPlan {
             layers: Vec::new(),

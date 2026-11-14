@@ -9,13 +9,13 @@ Every acronym, keyword, and decorator you will see in NSL code, specs, or PRs. O
 ## Subsystems
 
 ### <a id="awq"></a>AWQ — Activation-aware Weight Quantization
-Build-time per-channel weight quantization that scales by observed activation magnitudes; produces INT4/INT8 weights with minimal perplexity loss. See [`spec/06-quantization.nsl.md`](../../spec/06-quantization.nsl.md); implementation in `crates/nsl-codegen/src/calibration/`.
+A published post-training quantization method that scales each input channel of a weight by a factor searched from activation statistics before rounding. NSL does not implement it: `@quantize(dtype="awq4")` and a `quant` block with `default: awq4` are compile errors, and the calibration pass that once collected activation maxima for it is deleted. The runtime module named `awq.rs` is per-group round-to-nearest into a 4-bit packed format, with no activation-aware step. To quantize weights use a `quant` block with `int4` or `int8`.
 
 ### <a id="ccr"></a>CCR — Compiler-Chosen Recomputation
 Block-granular activation checkpointing on the source-AD path: a transformer block's interior activations are freed after the forward and bit-exactly recomputed just before that block's backward. Implemented in [`crates/nsl-codegen/src/ccr.rs`](../../crates/nsl-codegen/src/ccr.rs); driven by `--checkpoint-blocks`. See [`CCR.pdf`](../research/CCR.pdf) for the research background and [Optimization-Passes](Optimization-Passes.md#ccr--compiler-chosen-recomputation) for the pass description.
 
 ### <a id="cep"></a>CEP — Compilation-Evaluated Pruning
-Compile-time head-pruning pass: the oracle, importance scorer, model rewriter, and greedy search are all applied before the binary is emitted — pruned heads generate no code at all. Implementation: `crates/nsl-codegen/src/cep.rs`; decisions surfaced via `nsl profile --explain-wggo`.
+Offline structured-pruning planner: a weight-magnitude importance scorer, an analytic cost estimate and a greedy search choose attention heads, FFN width and (optionally) layers to remove, and write a delta, sliced weights and rewritten source. It builds no binary; the pruned model is compiled from the emitted source. Implementation: `crates/nsl-codegen/src/cep.rs`; decisions surfaced via `nsl profile --explain-wggo`.
 
 ### <a id="cesh"></a>CESH — Compiler-Exempt Sensitivity Handling (proposal only)
 Research proposal for a role-aware quantization policy: the embedding and LM-head layers are quantized differently from the transformer blocks. None of it has been built; the `quant` block quantizes every field alike. See [CESH.pdf](../research/CESH.pdf) and its [errata](../research/CESH-errata.md).
@@ -24,19 +24,10 @@ Research proposal for a role-aware quantization policy: the embedding and LM-hea
 Research proposal for compiling post-training alignment (DPO, SimPO, KTO, GRPO) into the training binary. It is not about attention fusion, and none of it has been built. See [NSL-CFA-Research.md.pdf](../research/NSL-CFA-Research.md.pdf) and its [errata](../research/NSL-CFA-Research-errata.md). For attention fusion see [CSHA](#csha).
 
 ### <a id="cfie"></a>CFIE — Compiler-Fused Inference Engine
-NSL's inference-serving orchestration layer: KV plan, fused sampling, speculative decode, persistent KV cache, and grammar-constrained generation compose into one codegen pass. Shipped today: compile-time planning + real PTX emission for all five kernel families, plus (on the monolithic serve path) kernel registration with the runtime engine at serve init and a host-side decode loop (`nsl_cfie_decode_step`). Still pending: endpoint-driven generation needs serve-block model binding, so the compiled decode loop is exercised by tests/host callers until that lands. See [CFIE.pdf](../research/CFIE.pdf); implementation in `crates/nsl-codegen/src/cfie.rs` (driver + report) and `crates/nsl-codegen/src/serve.rs` (`run_cfie_for_serve`).
-
-### <a id="cftp"></a>CFTP — Compiler-Fused Training Pipeline
-Research framework covering NSL's full training pipeline as a compile-time transformation: batching, packing, gradient accumulation, and optimizer dispatch fused into a single low-level loop. See [CFTP.pdf](../research/CFTP.pdf); PCA (§2) and FASE (§1) are the shipped sub-systems.
-
-### <a id="cgac"></a>CGAC — Compiler-Generated All-Reduce Compression (proposal only)
-Research proposal for per-layer gradient compression (PowerSGD, QSGD, signSGD) in the distributed all-reduce. It is not about activation checkpointing (that is [CCR](#ccr)), and none of it has been built. See [CGAC.pdf](../research/CGAC.pdf) and its [errata](../research/CGAC-errata.md).
-
-### <a id="cidp"></a>CIDP — Compile-Integrated Data Pipeline (proposal only)
-Research proposal for compiling data-quality weighting, deduplication, curriculum scheduling and source mixing into the training binary. None of it has been built: data preparation is the offline tooling under `tools/hfcorpus/`, and the `dataset` block is planner metadata only. See [NSL-CIDP-Research.md.pdf](../research/NSL-CIDP-Research.md.pdf) and its [errata](../research/NSL-CIDP-Research-errata.md).
+NSL's compiled inference path for `serve` blocks: a static KV layout, a whole-layer decode kernel, and a fused sampling kernel (RMSNorm, LM head, top-k/top-p and the draw in one launch), planned at compile time and driven by a host decode loop (`nsl_cfie_generate`). A greedy draft model can be compiled in for speculative decoding, which gives the same tokens as plain decoding and is slower. One sequence at a time, each kernel on one thread block; no speed has been measured, and no shipped model uses it (weights must be an HF-Llama-named checkpoint). Grammar-constrained decoding and INT8 KV are refused at compile time. See [CFIE.pdf](../research/CFIE.pdf) and its [errata](../research/CFIE-errata.md); implementation in `crates/nsl-codegen/src/cfie.rs` (plan + report), `crates/nsl-codegen/src/serve.rs` (`run_cfie_for_serve`) and `crates/nsl-runtime/src/cfie/engine.rs`.
 
 ### <a id="ckvq"></a>CKVQ — Compiler-Known Value Quantization (proposal only)
-Research proposal for compile-time planning of KV-cache quantization (pre-RoPE keys, per-page scales, outlier lists). None of it has been built; the nearest code is CFIE's INT8 KV read kernels, which have no writer. See [CKVQ.pdf](../research/CKVQ.pdf) and its [errata](../research/CKVQ-errata.md).
+Research proposal for compile-time planning of KV-cache quantization (pre-RoPE keys, per-page scales, outlier lists). None of it has been built. (CFIE once had INT8 KV read kernels with no writer; they were removed.) See [CKVQ.pdf](../research/CKVQ.pdf) and its [errata](../research/CKVQ-errata.md).
 
 ### <a id="cpdt"></a>CPDT — Compile-time Parallelism & Distributed Training
 Pass that plans ZeRO-style tensor sharding, collective-comm scheduling, mixed precision, and expert placement across a `ClusterSpec` before binary emission. See [CPDT Research.pdf](<../research/CPDT Research.pdf>); design specs in [`docs/superpowers/specs/`](../superpowers/specs/) (search `cpdt`); implementation in `crates/nsl-codegen/src/cpdt.rs`.
@@ -48,19 +39,19 @@ Research document covering compile-time wiring of teacher and student models so 
 Compile-time pass that fuses RMSNorm + Q/K/V projection (via m16n8k16 MMA) + RoPE rotation + FlashAttention-2 into a single PTX kernel, eliminating intermediate HBM traffic. See [NSL-CSHA-Research.PDF](../research/NSL-CSHA-Research.PDF); design specs in [`docs/superpowers/specs/`](../superpowers/specs/) (search `csha`); implementation in `crates/nsl-codegen/src/csha.rs`.
 
 ### <a id="css"></a>CSS — Compiler-Scheduled Sparsity (proposal only)
-Research proposal for 2:4 and 4:8 structured sparsity as a first-class tensor type. None of it has been built: `Sparse<...>` types parse but cannot be constructed from NSL source, and `@sparse(pattern=...)` has no effect. See [CSS.pdf](../research/CSS.pdf) and its [errata](../research/CSS-errata.md).
+Research proposal for 2:4 and 4:8 structured sparsity as a first-class tensor type. None of it has been built. The older general sparse tensor type (`Sparse<...>`, COO/CSR/CSC/BSR) was removed in 2026-11 and is preserved at tag `attic/sparse-tensors-2026-11`; `Sparse<...>` annotations, `@sparse(pattern=...)` and `@layout` are refused. See [CSS.pdf](../research/CSS.pdf) and its [errata](../research/CSS-errata.md).
 
 ### <a id="fase"></a>FASE — Fused Accumulation-Step Elimination
 Training optimization pass that defers gradient accumulation into a fused per-parameter loop (Deferred mode) or buffers it explicitly (FullBuffer mode), eliminating redundant optimizer-step dispatch. See [`docs/superpowers/specs/`](../superpowers/specs/) (search `fase`); implementation in `crates/nsl-codegen/src/fase.rs`.
 
 ### <a id="pca"></a>PCA — Packed Causal Attention
-FlashAttention-2 kernel variant that packs multiple variable-length sequences into a single tile pass, using per-segment masking to preserve causal isolation. Defined in CFTP §2. See [`docs/superpowers/specs/2026-04-18-pca-tier-a-design.md`](../superpowers/specs/2026-04-18-pca-tier-a-design.md); implementation in `crates/nsl-codegen/src/pca_segment.rs`.
+FlashAttention-2 kernel variant that packs multiple variable-length sequences into a single tile pass, using per-segment masking to preserve causal isolation. Defined in CFTP §2. See [`docs/superpowers/specs/2026-04-18-pca-tier-a-design.md`](../superpowers/specs/2026-04-18-pca-tier-a-design.md); the kernels are synthesized in `crates/nsl-codegen/src/flash_attention_v2/` and activated by `crates/nsl-codegen/src/pca_activation.rs`.
 
 ### <a id="wggo"></a>WGGO — Wengert Graph Global Optimization
 Multi-level ILP/DP pass that co-optimizes CEP head pruning, CSHA fusion level, WRGA adapter rank, and CPDT shard factor across all layers jointly, producing an `AppliedPlan` that downstream consumers consume. See [NSL-WGGO-Research.md.pdf](../research/NSL-WGGO-Research.md.pdf); implementation in `crates/nsl-codegen/src/wggo.rs`.
 
 ### <a id="wrga"></a>WRGA — Wengert-Pruned Roofline-Guided Adaptation
-Pass that decides per-layer LoRA/IA³/GatedLoRA adapter ranks by combining Wengert-graph pruning, roofline bandwidth analysis, and spectral rank scoring, then emits fused MMA PTX for the adapter forward (and optionally backward) pass. See [NSL-WRGA-Research.PDF](../research/NSL-WRGA-Research.PDF); design specs in [`docs/superpowers/specs/`](../superpowers/specs/) (search `wrga`); implementation in `crates/nsl-codegen/src/wrga.rs`.
+The adapter subsystem: `@adapter` adds a LoRA, IA³ or gated-LoRA adapter at a declared rank to a named model weight, `@freeze` freezes parameters, and `@wrga` adds a report on the train block (backward pruning, roofline classification, spectral ranks, fusible sites) that describes the declared adapters and chooses none. Fused MMA PTX for the adapter forward pass is opt-in (`NSL_WRGA_FUSED_CUDA=1`). See [NSL-WRGA-Research.PDF](../research/NSL-WRGA-Research.PDF); design specs in [`docs/superpowers/specs/`](../superpowers/specs/) (search `wrga`); implementation in `crates/nsl-codegen/src/wrga.rs`.
 
 ---
 
@@ -134,7 +125,7 @@ Mutable binding. Full reference: [`spec/01-syntax-fundamentals.nsl.md`](../../sp
 Block keyword for defining a model (analogous to a class, but keyword-level so the compiler can track weight tensors and generate serialization automatically). `model` is reserved — parser rejects `model=m` as an identifier. Full reference: [`spec/04-model-definition.nsl.md`](../../spec/04-model-definition.nsl.md).
 
 ### <a id="kw-quant"></a>`quant`
-Block keyword for declarative quantization configuration (INT4, INT8, FP8, GPTQ, AWQ, per-channel/group granularity). Full reference: [`spec/06-quantization.nsl.md`](../../spec/06-quantization.nsl.md).
+Block keyword for declarative weight quantization: `quant static q from m:` with `default: int8` or `int4` and per-tensor, per-channel or per-group granularity. The `awq4`, `gptq4` and `gptq8` defaults are refused. Full reference: [`spec/06-quantization.nsl.md`](../../spec/06-quantization.nsl.md).
 
 ### <a id="kw-serve"></a>`serve`
 Block keyword (M29) for the continuous-batching serving engine: declares prefill/decode chunking, preemption policy, and KV-cache management as compile-time configuration. Full reference: [`spec/09-hardware-abstraction.nsl.md`](../../spec/09-hardware-abstraction.nsl.md).
@@ -197,7 +188,7 @@ Marks a tensor as sharded across the GPU world (M30); the compiler inserts NCCL 
 **Not implemented.** The spec ([`spec/04-model-definition.nsl.md`](../../spec/04-model-definition.nsl.md)) describes it declaring that two model fields share one weight tensor, but no compiler support exists; since Milestone A the decorator is a typed compile error rather than a silent no-op. Share weights by assigning the same tensor to both fields.
 
 ### <a id="dec-wrga"></a>`@wrga`
-Attaches WRGA adapter configuration to a model, specifying adapter type (LoRA/IA³/GatedLoRA), rank bounds, and target layers. Used alongside `@freeze` and `@adapter`. See [Glossary#wrga](#wrga).
+Asks for the WRGA analysis of a model's train block: `mode=auto|manual` (alike: adapters are the ones `@adapter` declares), `budget=N` (a compile-time cap on the declared adapters' parameters) and `target=<gpu>` (the GPU the report's roofline uses). The adapters themselves are declared with `@adapter` and the frozen parameters with `@freeze`. See [Glossary#wrga](#wrga).
 
 ---
 

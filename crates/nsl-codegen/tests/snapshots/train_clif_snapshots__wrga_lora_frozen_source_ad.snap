@@ -10,54 +10,58 @@ function <model ctor 'Toy'>() -> i64 <callconv> {
     sig3 = (i64) -> i64 <callconv>
     sig4 = (i64, f64, i8) -> i64 <callconv>
     sig5 = (i64) -> i64 <callconv>
-    sig6 = () -> i64 <callconv>
-    sig7 = (i64, i64) <callconv>
-    sig8 = (i64, i64) <callconv>
-    sig9 = (i64) -> i64 <callconv>
-    sig10 = (i64) <callconv>
-    sig11 = () -> i64 <callconv>
-    sig12 = (i64, i64) <callconv>
-    sig13 = (i64, f64) -> i64 <callconv>
-    sig14 = (i64) <callconv>
-    sig15 = (i64, i64, i8) -> i64 <callconv>
+    sig6 = (i64, i64) -> i64 <callconv>
+    sig7 = (i64, i64) -> i64 <callconv>
+    sig8 = () -> i64 <callconv>
+    sig9 = (i64, i64) <callconv>
+    sig10 = (i64, i64) <callconv>
+    sig11 = (i64) -> i64 <callconv>
+    sig12 = (i64) <callconv>
+    sig13 = () -> i64 <callconv>
+    sig14 = (i64, i64) <callconv>
+    sig15 = (i64, f64) -> i64 <callconv>
     sig16 = (i64) <callconv>
-    sig17 = (i64) <callconv>
-    sig18 = (i64, i64) -> i64 <callconv>
+    sig17 = (i64, i64, i8) -> i64 <callconv>
+    sig18 = (i64) <callconv>
     sig19 = (i64) <callconv>
-    sig20 = () -> i64 <callconv>
-    sig21 = (i64, i64) <callconv>
-    sig22 = (i64, i64) <callconv>
-    sig23 = (i64) -> i64 <callconv>
-    sig24 = (i64) <callconv>
-    sig25 = (i64, i64) -> i64 <callconv>
+    sig20 = (i64, i64) -> i64 <callconv>
+    sig21 = (i64) <callconv>
+    sig22 = () -> i64 <callconv>
+    sig23 = (i64, i64) <callconv>
+    sig24 = (i64, i64) <callconv>
+    sig25 = (i64) -> i64 <callconv>
     sig26 = (i64) <callconv>
+    sig27 = (i64, i64) -> i64 <callconv>
+    sig28 = (i64) <callconv>
     fn0 = nsl_alloc sig0
     fn1 = nsl_list_new sig1
     fn2 = nsl_list_push sig2
     fn3 = nsl_tensor_ones sig3
     fn4 = nsl_tensor_mul_scalar sig4
     fn5 = nsl_alloc sig5
-    fn6 = nsl_list_new sig6
-    fn7 = nsl_list_push sig7
-    fn8 = nsl_list_push sig8
-    fn9 = nsl_tensor_randn sig9
-    fn10 = nsl_list_free sig10
-    fn11 = nsl_list_new sig11
-    fn12 = nsl_list_push sig12
-    fn13 = nsl_tensor_full sig13
-    fn14 = nsl_list_free sig14
-    fn15 = nsl_tensor_mul sig15
-    fn16 = nsl_tensor_free sig16
-    fn17 = nsl_tensor_free sig17
-    fn18 = nsl_tensor_to_device_like sig18
+    fn6 = nsl_tensor_shape_dim sig6
+    fn7 = nsl_tensor_shape_dim sig7
+    fn8 = nsl_list_new sig8
+    fn9 = nsl_list_push sig9
+    fn10 = nsl_list_push sig10
+    fn11 = nsl_tensor_randn sig11
+    fn12 = nsl_list_free sig12
+    fn13 = nsl_list_new sig13
+    fn14 = nsl_list_push sig14
+    fn15 = nsl_tensor_full sig15
+    fn16 = nsl_list_free sig16
+    fn17 = nsl_tensor_mul sig17
+    fn18 = nsl_tensor_free sig18
     fn19 = nsl_tensor_free sig19
-    fn20 = nsl_list_new sig20
-    fn21 = nsl_list_push sig21
-    fn22 = nsl_list_push sig22
-    fn23 = nsl_tensor_zeros sig23
-    fn24 = nsl_list_free sig24
-    fn25 = nsl_tensor_to_device_like sig25
-    fn26 = nsl_tensor_free sig26
+    fn20 = nsl_tensor_to_device_like sig20
+    fn21 = nsl_tensor_free sig21
+    fn22 = nsl_list_new sig22
+    fn23 = nsl_list_push sig23
+    fn24 = nsl_list_push sig24
+    fn25 = nsl_tensor_zeros sig25
+    fn26 = nsl_list_free sig26
+    fn27 = nsl_tensor_to_device_like sig27
+    fn28 = nsl_tensor_free sig28
 
 block0:
     v0 = iconst.i64 16
@@ -77,48 +81,52 @@ block0:
     v10 = iconst.i64 16
     v11 = call fn5(v10)  ; v10 = 16
     v12 = load.i64 notrap aligned v1
-    v13 = call fn6()
-    v14 = iconst.i64 8
-    call fn7(v13, v14)  ; v14 = 8
-    v15 = iconst.i64 0
-    v16 = iconst.i64 2
-    call fn8(v13, v16)  ; v16 = 2
-    v17 = iconst.i64 0
-    v18 = call fn9(v13)
-    call fn10(v13)
+    v13 = iconst.i64 0
+    v14 = iconst.i64 1
+    v15 = call fn6(v12, v13)  ; v13 = 0
+    v16 = call fn7(v12, v14)  ; v14 = 1
+    v17 = iconst.i64 2
+    v18 = call fn8()
+    call fn9(v18, v15)
     v19 = iconst.i64 0
-    v20 = call fn11()
-    v21 = iconst.i64 1
-    call fn12(v20, v21)  ; v21 = 1
+    call fn10(v18, v17)  ; v17 = 2
+    v20 = iconst.i64 0
+    v21 = call fn11(v18)
+    call fn12(v18)
     v22 = iconst.i64 0
-    v23 = f64const 0x1.6a09e667f3bccp-2
-    v24 = call fn13(v20, v23)  ; v23 = 0x1.6a09e667f3bccp-2
-    call fn14(v20)
-    v25 = iconst.i64 0
-    v26 = iconst.i8 0
-    v27 = call fn15(v18, v24, v26)  ; v26 = 0
-    call fn16(v18)
-    v28 = iconst.i64 0
-    call fn17(v24)
+    v23 = fcvt_from_sint.f64 v15
+    v24 = sqrt v23
+    v25 = f64const 0x1.0000000000000p0
+    v26 = fdiv v25, v24  ; v25 = 0x1.0000000000000p0
+    v27 = iconst.i64 1
+    v28 = call fn13()
+    call fn14(v28, v27)  ; v27 = 1
     v29 = iconst.i64 0
-    v30 = call fn18(v27, v12)
-    call fn19(v27)
+    v30 = call fn15(v28, v26)
+    call fn16(v28)
     v31 = iconst.i64 0
-    store notrap aligned v30, v11
-    v32 = call fn20()
-    v33 = iconst.i64 2
-    call fn21(v32, v33)  ; v33 = 2
+    v32 = iconst.i8 0
+    v33 = call fn17(v21, v30, v32)  ; v32 = 0
+    call fn18(v21)
     v34 = iconst.i64 0
-    v35 = iconst.i64 8
-    call fn22(v32, v35)  ; v35 = 8
-    v36 = iconst.i64 0
-    v37 = call fn23(v32)
-    call fn24(v32)
-    v38 = iconst.i64 0
-    v39 = call fn25(v37, v12)
-    call fn26(v37)
+    call fn19(v30)
+    v35 = iconst.i64 0
+    v36 = call fn20(v33, v12)
+    call fn21(v33)
+    v37 = iconst.i64 0
+    store notrap aligned v36, v11
+    v38 = call fn22()
+    call fn23(v38, v17)  ; v17 = 2
+    v39 = iconst.i64 0
+    call fn24(v38, v16)
     v40 = iconst.i64 0
-    store notrap aligned v39, v11+8
+    v41 = call fn25(v38)
+    call fn26(v38)
+    v42 = iconst.i64 0
+    v43 = call fn27(v41, v12)
+    call fn28(v41)
+    v44 = iconst.i64 0
+    store notrap aligned v43, v11+8
     store notrap aligned v11, v1+8
     return v1
 }

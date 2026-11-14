@@ -72,7 +72,7 @@ The optimization passes that operate on the `WengertList` run inside `compile_tr
 6. **WRGA** — `invoke_wrga_if_enabled`; consumes the `WengertList`; runs dead-gradient elimination (`wrga_prune`), rank allocation (`wrga_roofline`), memory planning (`wrga_memory`), and fusion decisions (`wrga_fusion`).
 7. **CPDT** — `invoke_cpdt_if_enabled`; consumes the `AppliedPlan` from WGGO **when one exists**. It does NOT require one: with no `AppliedPlan` it plans weights-only, which is the path a `distill` block and a loop-bound `train` block take. See the CPDT section below.
 8. **Source-AD adjoint generation + lowering** — `AdjointGenerator` rewrites the pruned `WengertList` into an adjoint program; `wengert_lower` lowers it to Cranelift IR.
-9. **CCR (Compiler-Chosen Recomputation)** — straddles step 8. Its *planning* half (`ccr::plan`, `select_partition_dp`, `apply_budget`) runs on the PRIMAL tape before `AdjointGenerator`, segmenting per transformer block and classifying each result as escaping or interior; its *rewriting* half (`apply_to_adjoint`, `splice_decompress`, `insert_adjoint_last_use_frees`) then early-frees the interiors and splices recompute clones into the generated adjoint. Driven by `--checkpoint-blocks` / `--checkpoint-stride`; see the per-pass description below.
+9. **CCR (Compiler-Chosen Recomputation)** — straddles step 8. Its *planning* half (`ccr::plan`, `select_partition_dp`) runs on the PRIMAL tape before `AdjointGenerator`, segmenting per transformer block and classifying each result as escaping or interior; its *rewriting* half (`apply_budget`, `apply_to_adjoint`, `splice_decompress`, `insert_adjoint_last_use_frees`) reads the generated adjoint to see which interiors the backward needs, then early-frees the interiors and splices recompute clones into it. Driven by `--checkpoint-blocks` / `--checkpoint-stride`; see the per-pass description below.
 10. **Memory planner (M36)** — runs after all user-function bodies are compiled, before `compile_main`. See above.
 
 **Pass ordering is load-bearing.** FASE planning reads `wggo_overrides` from the compiler state, which is set by a prior WGGO run — on a fresh first-pass compile, FASE falls back to `fase::plan` (no overrides). CSHA receives WGGO's `AppliedPlan` (via `WggoOverrides`) so per-layer fusion-level decisions from WGGO are honoured — or rejected with a diagnostic — by CSHA. CPDT does NOT hard-depend on WGGO — `invoke_cpdt_if_enabled` gates on `cpdt_mode` and a configured cluster, and publishes `cpdt_plan` on the weights-only path with `--wggo` absent (pinned by `cpdt_moment_precision_gate::cpdt_without_wggo_activates_weights_only`). What IS ordering-sensitive is that the moment-precision consult must read the channel AFTER it is published; publishing it late is the defect that made CPDT-sourced precision structurally dead until #462/#466 made it visible. The memory planner (M36) must run after `compile_user_functions` and before `compile_main`; reversing this order means the slab-initialization call is emitted before the plan is computed.
@@ -340,6 +340,122 @@ admission cases, shape-rule semantics, packing non-overlap),
 `crates/nsl-cli/tests/transient_arena_gpu_gate.rs` (report plumbing),
 `crates/nsl-runtime/src/transient_arena.rs` unit tests (pin exactness).
 
+## Weight-aware compilation (`-w weights.safetensors`)
+
+`nsl run -w FILE` and `nsl build -w FILE` do two things with a safetensors
+file, and the second is only correct because of the first.
+
+**1. The program runs with the file's values.** Every model constructor
+copies the file's tensors into the parameters the file names, in place,
+before the constructor returns, so no user code can read a parameter before
+it is loaded. `main` opens the file (memory-mapped) before anything else. In
+the constructor of a model `M`, a parameter is looked up by:
+
+| Parameter | Names tried, in order |
+|---|---|
+| a tensor field `f` of `M` | `M.f`, then `f` |
+| a parameter of a nested model or model array | its path from the instance, as `model_save` spells it (`blocks[0].w`), then dotted (`blocks.0.w`) |
+
+A nested model's own constructor runs first, so the enclosing model's
+path-named tensor is the one that stays. F16, BF16, F32 and F64 tensors are
+converted to the field's float width. A shape that differs from the field's
+is an error (at compile time when the field's shape is a literal, otherwise
+when the constructor runs), with one exception: a bare name `f` that more
+than one parameter could claim (another model has a tensor field `f`, or the
+file also holds a tensor whose name ends in `.f`) is loaded where the shapes
+agree and skipped where they do not. A tensor that no parameter of a model
+the entry module defines or imports could be loaded from is listed in the
+report. Adapter tensors (`@adapter`) are not
+model fields and are not loaded by `-w`; a base-only file loads into a model
+with adapters, as it does through `model_load`.
+
+**2. Code may be specialized on the values of parameters that are never
+written.** The value-dependent rewrites are constant folding of a product or
+sum of two weights (`[nsl] M52b: constant-folded ...`) and elimination of a
+matmul by a near-identity weight (`[nsl] M52b: eliminated near-identity
+matmul ...`). Each is made only when the parameter holds the file's values
+for the whole run:
+
+- the build loads the file (`-w` on `nsl run` or on an `nsl build` that
+  produces an executable; not `nsl check`, a shared library, or a weights
+  file the compiler found through `load_safetensors("...")` in the source,
+  which stay inputs to planning only);
+- nothing in the program writes the parameter after it is loaded. A `train`,
+  `distill` or `quant` block, a `model_load` or `from_hf`, a model with
+  `@quantize`, any in-place tensor operation (`copy_data`, `copy_`,
+  `*_inplace`) or an element store through a variable (`t[i] = v`, which
+  includes a `kernel` storing to an argument) counts as writing every
+  parameter; an assignment to a field (`m.w = ...`, `self.w += ...`) counts
+  as writing every field of that name. A `grad` block counts too: dropping
+  `x @ W` would drop W's gradient. The analysis is over the whole program
+  (every module, called or not), and whatever it cannot rule out is a write;
+- one tensor, and only one, can reach the field: the file holds no other
+  tensor whose name ends in the field's name, and for a bare name no other
+  model has a tensor field of that name;
+- the rewrite rests on the file's exact values. `--dead-weight-threshold`
+  (1e-6 by default) is a tolerance: dead-weight elimination zeroes values
+  below it in the compiler's copy of the file, and a weight within it of the
+  identity would count as the identity. A rewrite uses those approximations
+  only when the threshold is passed explicitly (`nsl build
+  --dead-weight-threshold 1e-6 -w ...`; `nsl run` has no such flag), and the
+  report line says which basis it used (`..., from the file's exact values`
+  or `..., from values within the --dead-weight-threshold 1e-6 given`).
+
+A folded constant is computed in f64 and, when the program runs, converted
+to the dtype and device of the parameters it replaces (a BF16 file loads
+into the model's f32 fields; the model may be on a GPU). Shapes the fold
+does not implement (a broadcast sum, a matmul that is not 2-D) are left to
+the runtime.
+
+A rewrite that is refused is not an error. The ordinary code is compiled,
+and the report says which parameter and why:
+
+```
+[nsl] weight-aware: 'Toy.w' is loaded from the file's 'w'
+[nsl] weight-aware: not specialized on 'w' (near-identity matmul elimination skipped): the program has a train block, which updates parameters
+```
+
+Shape specialization (reading a dimension from the file) and the planners
+that take the file as an input (CPDT, WRGA, CEP, KV-cache quantization) are
+not affected by any of this, except that a program planned from the file now
+also runs with it: `nsl run --cpdt full -w FILE` used to choose each block's
+moment precision from the file's magnitudes and then train from the model's
+initializer.
+
+**3. A specialized program is tied to the file.** The compiler records the
+SHA-256 of every stored tensor a rewrite was allowed to depend on (dtype,
+shape and bytes; every tensor of the file when the program writes none, none
+when it trains). At startup the program hashes those tensors as it finds
+them in the file and refuses to run if one differs or is gone:
+
+```
+nsl: -w: the weights file '/data/model.safetensors' has changed since this program was compiled with it: parameter 'w' has different contents. The compiled code depends on that parameter's values, so it would compute wrong results with this file. Recompile with the file as it is now.
+```
+
+The digest of that list is also a key of the run's execution fingerprint
+(`wspec=<16 hex digits>`, classed with the keys that change the arithmetic),
+present only when the list is not empty. A program that specialized on
+nothing, because it trains or reassigns its parameters, carries no hashes
+and no key: it loads whatever the file holds when it starts, which is what a
+fine-tuning run wants.
+
+The path compiled into the program is the absolute path of the file given to
+`-w`. `--standalone -w` is a different mechanism (the file is bundled into
+the executable) and does no weight-aware compilation.
+
+Limits. A folded constant is the f64 product rounded once to the
+parameters' dtype, which can differ in the last bit from the product the
+program would have computed. A one-element weight is no longer embedded as an
+immediate (only tensor fields are loaded; the note says so). The weight-aware
+sparse matmul that `NSL_M52C_SPARSE_MATMUL=1` used to enable has been removed;
+a weight above the sparse threshold is only reported, and its matmul is dense.
+
+Gates: `crates/nsl-cli/tests/weights_flag_binds_model_gate.rs` (loaded
+values, refused rewrites, the startup check on a built program),
+`crates/nsl-codegen/src/weight_aware.rs` unit tests (the write analysis, the
+hash and the expectation table), `crates/nsl-runtime/src/weights_file.rs`
+unit tests (header parsing, the mismatch message, dtype conversion).
+
 ## Per-pass descriptions
 
 ### CCR — Compiler-Chosen Recomputation
@@ -350,25 +466,32 @@ Block-granular activation checkpointing on the decorator-free source-AD path. Th
 
 1. **Segments** the flat inlined primal tape into per-transformer-block ranges using the same `blocks.N` parameter-name prefixes WGGO uses (`wggo_graph::layer_prefix`).
 2. **Classifies** each in-segment result: *escaping* (consumed by a later primal op — the residual stream and anything else crossing the block boundary) stays SAVED; *interior* (consumed only inside the segment and/or by the adjoint) becomes RECOMPUTE.
-3. **Early-frees** the original interiors right after the forward.
-4. **Splices** clones of the interior-producing ops into the adjoint immediately before the first adjoint op that consumes them, remapping those consumers.
+3. **Early-frees** the original interiors, each at the end of its own segment during the forward (after the whole forward under `--layerwise-accum`).
+4. **Splices** clones of the interior-producing ops into the adjoint immediately before the first adjoint op that consumes them, remapping those consumers. Only an interior whose *value* the backward reads is cloned (`backward_reads`). One it reads for shape only — the operand of a residual add, read as the target of a `reduce_to_shape` — is not recomputed: a one-element shape stub captured just before the free stands in for it. One it does not read at all is simply freed.
 5. **Frees** each recomputed tensor right after the last adjoint op that consumes it.
 
-Recompute clones run the same kernels in the same order on the same inputs, so the transform is **bit-exact**. Ops with non-replayable semantics (Dropout — RNG) are force-saved, and segments owned by a CSHA backward claim are exempted (the claim table is keyed by primal `OpId`, which a clone cannot satisfy).
+Recompute clones run the same kernels in the same order on the same inputs, so the transform is **bit-exact**. Ops with non-replayable semantics (Dropout and `randn` — RNG) are force-saved, and segments owned by a CSHA backward claim are exempted (the claim table is keyed by primal `OpId`, which a clone cannot satisfy).
 
-Driven by `--checkpoint-blocks`, with `--checkpoint-selective` (never recompute matmul-class ops), `--checkpoint-budget-mib` (knapsack flips the most expensive-to-recompute tensors back to SAVE within budget), and `--checkpoint-stride` (coalesce every N block anchors into one super-segment; `auto` searches strides against the budget). Codegen integration lives in `stmt.rs` (`CcrPolicy`, `DpCostModel`, `select_partition_dp`, `plan_with_kept_anchors`, `project_activation_peak`).
+Driven by `--checkpoint-blocks`, with:
 
-Fires: **source-AD backward only**, and only on models with `blocks.N`-style structure — otherwise it is a no-op with a stderr note.
+- `--checkpoint-selective`: never recompute matmul-class ops. A plain matrix product the backward reads for shape only is still released at the end of its segment.
+- `--checkpoint-stride N|auto|dp`: coalesce block anchors into super-segments. `N` is a fixed stride; `auto` searches uniform strides and `dp` non-uniform partitions against the projected block-activation peak (`project_activation_peak`), which counts the tensors computed inside the blocks and nothing else.
+- `--checkpoint-budget-mib`: used once. At a fixed stride a knapsack flips the tensors that cost most to recompute (an operation count from their shapes, `recompute_ops`) back to SAVE within the budget; under `auto` and `dp` the number caps the projected peak instead.
+- `--checkpoint-compress bf16` (with `--checkpoint-selective`): store the saved matmul-class activations as bf16, each cast at the end of its segment. Not bit-exact.
+
+`auto`, `dp` and the budget need static tensor sizes. They come from literal shapes and from a DataLoader with literal `batch_size` and `seq_len` and `drop_last=true`, propagated through the forward (`ccr_static_sizes`); the build fails when they do not reach the block tensors. Codegen integration lives in `stmt_train/plan_ccr.rs` and `stmt_train/driver.rs`.
+
+Fires: **source-AD backward only**, and only on models with `blocks.N`-style structure. On any other model, or without `--source-ad`, the build fails: a requested feature may not be silently inert.
 
 ---
 
 ### FASE — Fused Accumulation + Step + Epilogue
 
-Source: [`crates/nsl-codegen/src/fase.rs`](../../crates/nsl-codegen/src/fase.rs) (core analysis), [`fase_optimizer.rs`](../../crates/nsl-codegen/src/fase_optimizer.rs) (update-rule codegen), [`fase_memory.rs`](../../crates/nsl-codegen/src/fase_memory.rs) (per-layer slot scheduling), [`fase_clip.rs`](../../crates/nsl-codegen/src/fase_clip.rs) (two-phase grad-clip), [`stmt_fase.rs`](../../crates/nsl-codegen/src/stmt_fase.rs) (codegen integration).
+Source: [`crates/nsl-codegen/src/fase.rs`](../../crates/nsl-codegen/src/fase.rs) (core analysis), [`fase_optimizer.rs`](../../crates/nsl-codegen/src/fase_optimizer.rs) (update-rule description), [`stmt_fase.rs`](../../crates/nsl-codegen/src/stmt_fase.rs) (codegen integration), [`stmt_train/optimizer_step.rs`](../../crates/nsl-codegen/src/stmt_train/optimizer_step.rs) (the step, the clip of the window mean, and the flush of a trailing partial window).
 
 Design specs: [`docs/superpowers/specs/2026-04-14-fase-deferred-codegen-integration-design.md`](../../docs/superpowers/specs/2026-04-14-fase-deferred-codegen-integration-design.md), [`2026-04-15-fase-codegen-phase2-design.md`](../../docs/superpowers/specs/2026-04-15-fase-codegen-phase2-design.md).
 
-Given a `train` block configuration (optimizer, gradient accumulation count, clipping setting), `fase::plan` produces a `FasePlan` that the backward-codegen stage consumes. The plan describes: (1) whether to rewrite the backward at all (active only when `accumulation > 1`); (2) whether to run in **Deferred** mode (first-moment accumulation) or **Full** mode (standard gradient buffer, used when the optimizer does not match FASE invariants, e.g. Lion); (3) the mathematical update rule for the chosen optimizer, already specialised to the accumulation count; (4) the two-phase structure when `grad_clip` is enabled. The driver is pure — no state, no I/O — and produces the same output given the same inputs. PTX emission for the fused backward is handled by `fase_optimizer.rs` and `fase_memory.rs`.
+Given a `train` block configuration (optimizer, gradient accumulation count, clipping setting), `fase::plan` produces a `FasePlan` that the backward-codegen stage consumes. The plan describes: (1) whether to rewrite the backward at all (active only when `accumulation > 1`); (2) whether to run in **Deferred** mode (first-moment accumulation) or **Full** mode (standard gradient buffer, used when the optimizer does not match FASE invariants, e.g. Lion); (3) the mathematical update rule for the chosen optimizer, already specialised to the accumulation count; (4) the two-phase structure when `grad_clip` is enabled. The driver is pure — no state, no I/O — and produces the same output given the same inputs. The update rule is described by `fase_optimizer.rs` and lowered by `stmt_fase.rs`. A run whose micro-batch count is not a multiple of the accumulation count ends with one more step on the mean of the micro-batches its last window holds; a `--layerwise-accum` run cannot take that step and prints a warning instead (`NSL_FASE_FLUSH_TAIL=0` at compile time makes the ordinary schedule drop the tail too, for comparing the two). Under accumulation the `scheduler:` section counts micro-batches unless the train header says `schedule_unit = "optimizer_step"`.
 
 Fires: **train-block only** (both planning and codegen run inside `compile_train_block`). The plan is a no-op (`FaseMode::Full` with N=1 scale) when `accumulation == 1`. Forward-only compilation and inference are unaffected.
 
@@ -382,6 +505,8 @@ Research paper: [`docs/research/NSL-WGGO-Research.md.pdf`](../../docs/research/N
 
 The WGGO driver orchestrates eight stages (§5 of the research paper): (1) Wengert graph extraction (from `wengert.rs`); (2) cost-model annotation (`wggo_cost::build_lut`); (3) optional weight-analysis; (4) Level 1 inter-layer DP (`wggo_dp::solve`); (5) Level 2 per-layer ILP (greedy or templated solvers in `wggo_ilp`); (6) Level 3 kernel generation (delegated to backend); (7) memory planning (delegated to M36 `memory_planner.rs`); (8) communication schedule (`wggo_schedule::build_schedule`). The driver is pure data-in / data-out and has no backend side effects. It produces a `WggoPlan` (with embedded `AppliedPlan`) that all downstream passes consume as `WggoOverrides`. WGGO's `CoarseDecision::Prune` decisions are applied by the layer-to-residual-identity IR rewrite in `wggo_prune.rs`, wired at the train-block lowering site (source-AD only): a sub-block (`.attn` / `.ffn`) has its closure ops and residual Add deleted and its output aliased to its input, and a whole block (`LayerRole::Block`, `blocks.N`) is **chain-collapsed** — its residual Adds must form one stream chain `h0 → h1 → … → hk`, the closure and every Add are deleted, and `hk` is aliased to `h0` (spec §3.6). Each applied prune prints `[prune] layer=N name=… role=… applied=true closure_size=… ops_deleted=… residual_add_op=…`; a prune whose preconditions fail refuses the compile with a three-part `prune: …` error. The DP only emits `Prune` on its own below an importance floor production planning never fills, so a prune is requested explicitly with `--wggo-prune-layers` or `--wggo-layer-prune-fraction` (below).
 
+Every figure in a plan (layer count, widths, head and KV-head counts, parameter bytes, batch and sequence length) is read from the model being compiled: the dims of its tensor fields and one-element config fields, and the batch shape of the step's inputs, propagated through the train block's tape (`wggo_model_shape.rs`). When some shape cannot be determined at compile time WGGO does not plan that train block: it logs `[wggo] not planned: …` with the reason and the downstream passes run as they do without `--wggo`. If a flag that only acts through the plan was passed (`--wggo-memory-budget`, `--wggo-moment-precision`, `--wggo-weights`, `--wggo-prune-fraction`, `--wggo-prune-layers`, `--wggo-layer-prune-fraction`) the same condition is a compile error.
+
 Fires: **train-block, when `--wggo <mode>` is set.** Pure advisory on forward-only builds.
 
 **CLI flags** (on `nsl build`, unless noted):
@@ -390,9 +515,9 @@ Fires: **train-block, when `--wggo <mode>` is set.** Pure advisory on forward-on
 | --- | --- | --- |
 | `--wggo <mode>` | `full` \| `greedy` \| `off`; bare `--wggo` ⇒ `full`; absent ⇒ off | Selects the global-optimization mode. `full` runs the inter-layer DP + per-layer ILP + conflict resolution; `greedy` skips the ILP and re-costs the resolved config, escalating layers that regress > 5%; `off` runs each pass independently. |
 | `--wggo-report` | off | Prints the global-optimization report to stderr, including the **Warnings / limitations** section (degradation notices, weights-load failures). |
-| `--wggo-weights <path>` | none | A `.nslweights` sidecar for real weight-based head-importance scoring. On load failure WGGO falls back to uniform scores and records a warning in the report. |
+| `--wggo-weights <path>` | none | A `.nslweights` sidecar for weight-based head-importance scoring. Each tensor is checked against the shape of the model's layer; a file from a model of another shape is a compile error. On load failure WGGO falls back to uniform scores and records a warning in the report. A weights file alone prunes nothing: head pruning needs `--wggo-prune-fraction`. |
 | `--wggo-importance <mode>` | `auto` (default) \| `magnitude` \| `grad` | Head-importance scoring source. `auto` uses gradient scoring when a calibration sidecar is present, else magnitude; `grad` errors if no sidecar is present. |
-| `--wggo-prune-fraction <F>` | `0.25`, clamped `[0.0, 0.9]` | Fraction of heads the default `min_retained_importance` threshold may prune. |
+| `--wggo-prune-fraction <F>` | `0.0` (no head pruning), clamped `[0.0, 0.9]` | Fraction of heads the `min_retained_importance` threshold may prune. Head pruning is opt-in: without a fraction above zero every head is kept, whatever the scores. |
 | `--wggo-prune-layers <NAMES>` | none | Prune these layers, comma-separated, named as WGGO's layer graph names them (`blocks.1,blocks.3`). A whole block is chain-collapsed to an identity. An unknown name, or a layer with no residual identity (`other`, an embedding), is a hard error listing the graph's layers. Requires `--source-ad` and `--wggo <full\|greedy\|auto>`; refused on `@pipeline`. |
 | `--wggo-layer-prune-fraction <F>` | none, `0 < F < 1` | Additionally prune the `floor(F × n)` of the `n` block layers with the lowest weight-magnitude importance: the RMS of each block's weights in `--wggo-weights` (names map to layers like `blocks.2.wq` or `m.blocks.2.wq`), normalized by the max; ties go to the lower layer index, and all `n` are never pruned. Refused without `--wggo-weights`, when a block has no weights in the file, and when `floor(F × n) = 0`. The `[wggo] layer-prune:` line prints the ranking. Same `--source-ad` / `--wggo` requirements. |
 | `--devices <N>` | `1` | Cluster size (compile-time `world_size`). Drives WGGO's ZeRO-sharding budget — the DP only shards (`shard > 1`) when `N > 1` and memory pressure requires it. Unlike `nsl run --devices`, this spawns no processes; it only informs the plan. |
@@ -447,9 +572,13 @@ Research paper: [`docs/research/NSL-WRGA-Research.PDF`](../../docs/research/NSL-
 
 Design specs: [`docs/superpowers/specs/2026-04-13-wrga-milestone-b3-design.md`](../../docs/superpowers/specs/2026-04-13-wrga-milestone-b3-design.md), [`2026-04-19-wrga-b32-option3-revised-design.md`](../../docs/superpowers/specs/2026-04-19-wrga-b32-option3-revised-design.md).
 
-WRGA composes five innovations. Innovation 1 (`wrga_prune`) performs **dead gradient elimination**: given a `WengertList` and a set of trainable `VarId`s, it identifies the minimal subset of forward ops that participate in the backward pass and emits a pruned list — adjoint ops for frozen or irrelevant parameters are never generated. Innovation 2 (`wrga_roofline`) performs **roofline-guided adapter kind selection**: for each candidate attention site it compares memory bandwidth vs compute ratios against the target GPU's roofline model and recommends the adapter kind (LoRA at a computed rank, IA³ scaling vector, GatedLoRA, or none) that best exploits the site's bottleneck — the exact recommendation differs between architectures like an RTX 5070 Ti and an H100 for the same model. Innovation 3 (`wrga_spectral`) performs **randomized-SVD rank allocation under a parameter budget**: it approximates the spectral entropy and effective rank of each 2-D weight matrix using a randomized SVD (Halko–Martinsson–Tropp, 2011) and allocates per-layer LoRA ranks proportionally, keeping total adapter parameter count within the user-specified budget while concentrating rank where it matters most. Innovation 4 (`wrga_fusion`) decides, per adapter site, whether the LoRA or IA³ adapter can be epilogue-fused into the host matmul or norm kernel. Innovation 5 (`wrga_memory`) solves activation-sharing via interference-graph colouring over Wengert `VarId` liveness, reusing the same greedy-colouring heuristic as M36 `memory_planner.rs` but driving it from the pruned backward graph (which is nearly trivial to colour because ~85% of forward ops carry no adjoint). Adapter site pre-scanning (`wrga_prescan`) rewrites `model_method_bodies` so the source-AD extractor sees fused FFI callees rather than raw PyTorch-style adapter calls. Fused LoRA / IA³ / GatedLoRA PTX is synthesized by [`wrga_fused_ptx.rs`](../../crates/nsl-codegen/src/wrga_fused_ptx.rs) and registered at startup via `emit_fused_ptx_registration`.
+What trains and what is adapted comes from two decorators. `@freeze(include=|exclude=)` leaves frozen parameters out of the train block's parameter list. `@adapter(type=lora|ia3|gatedlora, target=["Class.field"], rank=, alpha=)` adds an adapter to the named weight of every instance of the class, wherever it is defined (the module that carries the decorator, or one it imports, such as the standard library's `Linear`): [`wrga_adapter_inject.rs`](../../crates/nsl-codegen/src/wrga_adapter_inject.rs) resolves the target, [`wrga_adapter_init.rs`](../../crates/nsl-codegen/src/wrga_adapter_init.rs) builds the adapter tensors in the model's constructor, sized from the weight, and [`wrga_adapter_rewrite.rs`](../../crates/nsl-codegen/src/wrga_adapter_rewrite.rs) rewrites `x @ self.w` or `x @ self.w.transpose(0, 1)` into the adapted form. A target that resolves to no weight, or to a weight no matmul uses, is a compile error, and so is a weight named by more than one target (two `@adapter` decorators, or one listing it twice): a weight takes one adapter. `model_save` and `model_load` carry the adapter tensors after the model's own.
 
-Fires: **train-block, when `@adapter` decorators are present and `--wrga` is set (or `NSL_WRGA_FUSED_CUDA=1`).**
+`@wrga(mode=auto|manual, budget=, target=)` adds an analysis of the train block, printed by `nsl build --wrga-report` and `nsl check --wrga-analyze`. It chooses nothing: the adapters are the declared ones, in either mode (`mode=hybrid` is refused). `budget=N` is a compile-time cap on the parameters the declared adapters hold. The analysis has five stages. `wrga_prune` reports how much of the backward pass the frozen parameters remove, against a backward pass with every parameter trainable; the removal itself is done by the source-AD pass `eliminate_dead_gradients`, with or without WRGA. `wrga_roofline` classifies each site against the target GPU's roofline; it has no activation shapes, so every site is costed at one sequence of 128 tokens, at which every matmul is memory-bound on every GPU in the table. `wrga_spectral` computes each checkpoint weight's effective rank with a randomized SVD and, when the program declares no adapter, suggests ranks under the budget; the suggestion sizes nothing. `wrga_fusion` marks the sites a fused kernel exists for. `wrga_memory` counts the activations saved for the backward pass; all of them are live when it starts, so none can share a slot.
+
+Fused LoRA, gated-LoRA and IA³ kernels are synthesized by [`wrga_fused_ptx.rs`](../../crates/nsl-codegen/src/wrga_fused_ptx.rs) and registered at startup via `emit_fused_ptx_registration`. They are used only with a pinned target (`--target sm_80` or later) and `NSL_WRGA_FUSED_CUDA=1`, compute in half precision including the base product, are right for one output tile only (at most 16 activation rows, 8 output columns and rank 8; the runtime runs the ordinary operations for anything larger and says so), and measured slower than the ordinary operations, which are the default.
+
+Fires: **the adapter rewrite, whenever `@adapter` is present, in both AD modes; the analysis, in a train block under `--source-ad` when `@wrga`, `@freeze` or `@adapter` is present.**
 
 ---
 
@@ -461,43 +590,49 @@ Research paper: [`docs/research/CPDT Research.pdf`](<../../docs/research/CPDT Re
 
 Design specs: [`docs/superpowers/specs/2026-04-15-cpdt-pipeline-integration-design.md`](../../docs/superpowers/specs/2026-04-15-cpdt-pipeline-integration-design.md), [`2026-04-18-cpdt-weight-aware-phase1-design.md`](../../docs/superpowers/specs/2026-04-18-cpdt-weight-aware-phase1-design.md).
 
-The CPDT driver composes five passes into a single `CpdtPlan`: (1) ZeRO evaluation — chooses the ZeRO stage (0, 1, 2, or 3) based on cluster topology and model size derived from WGGO's `AppliedPlan`; (2) communication schedule — builds the AllReduce / ReduceScatter / AllGather sequence for the chosen ZeRO stage; (3) precision selection (`cpdt_tier_apply::plan_map`) — assigns fp32 / fp16 / int8 / int4 tiers per-layer using weight-aware calibration data when `--weights` is supplied; (4) quantized optimizer codegen — emits the fused AdamW step for the selected precision; (5) expert placement — assigns MoE expert shards to GPUs. When `CpdtMode::Full` is active, `cpdt_joint.rs` drives an iterative joint solver that alternates between fixing expert placement while optimising ZeRO + precision and fixing ZeRO + precision while optimising expert placement, converging in 3–5 iterations. The driver is pure and deterministic. **CPDT does not require a WGGO plan.** `invoke_cpdt_if_enabled` gates only on `cpdt_mode != Off` and a configured cluster; with no `AppliedPlan` it plans WEIGHTS-ONLY — the precision half (3) is a pure function of the `--weights` map and is fully valid, while the ZeRO/comm halves (1, 2) run over an empty cost model and say so on stderr (`[cpdt] planned without a WGGO plan for this block (weights-only)`). That path exists for blocks the WGGO pre-pass cannot plan: loop-bound train blocks, and `distill` blocks. (This paragraph used to claim the pass checked a `wggo_applied` flag; no such check exists, and the claim outlived the weights-only path that PR #474 shipped.) The `@cpdt(weight_aware=false)` decorator opts individual models out of weight-aware precision selection; the compiler enforces that at most one `@cpdt` decorator appears per program.
+The CPDT driver composes five passes into a single `CpdtPlan`: (1) ZeRO evaluation — recommends a ZeRO configuration from cluster topology, the per-GPU memory budget (`--cpdt-memory-budget`, default 80 GiB) and the model size in WGGO's `AppliedPlan`; the recommendation is printed by `--cpdt-report` and is not applied (the stage a program runs comes from `--zero-stage`, and the report says which); (2) communication schedule — builds the AllReduce / ReduceScatter / AllGather sequence for the chosen ZeRO stage; (3) precision selection (`cpdt_tier_apply::plan_map`) — assigns fp32 / fp16 / int8 / int4 tiers per-layer using weight-aware calibration data when `--weights` is supplied; (4) quantized optimizer codegen — emits the fused AdamW step for the selected precision; (5) expert placement — assigns MoE expert shards to GPUs. When `CpdtMode::Full` is active, `cpdt_joint.rs` drives an iterative joint solver that alternates between fixing expert placement while optimising ZeRO + precision and fixing ZeRO + precision while optimising expert placement, converging in 3–5 iterations. The driver is pure and deterministic. **CPDT does not require a WGGO plan.** `invoke_cpdt_if_enabled` gates only on `cpdt_mode != Off` and a configured cluster; with no `AppliedPlan` it plans WEIGHTS-ONLY — the precision half (3) is a pure function of the `--weights` map and is fully valid, while the ZeRO/comm halves (1, 2) run over an empty cost model and say so on stderr (`[cpdt] planned without a WGGO plan for this block (weights-only)`). That path exists for blocks the WGGO pre-pass cannot plan: loop-bound train blocks, and `distill` blocks. (This paragraph used to claim the pass checked a `wggo_applied` flag; no such check exists, and the claim outlived the weights-only path that PR #474 shipped.) The `@cpdt(weight_aware=false)` decorator opts individual models out of weight-aware precision selection; the compiler enforces that at most one `@cpdt` decorator appears per program.
 
 Fires: **per training block — `train` and `distill` alike — when `--cpdt` is set and a cluster is configured.** A `distill` block reaches it through the synthetic `TrainBlock` that `compile_distill_block` lowers it as, and takes the weights-only path (no WGGO pre-plan exists for it).
 
 ### PCA — Packed Causal Attention
 
-Source: [`crates/nsl-codegen/src/pca_detect.rs`](../../crates/nsl-codegen/src/pca_detect.rs) (variant detection), plus [`pca_segment.rs`](../../crates/nsl-codegen/src/pca_segment.rs) (segment-id construction), [`pca_activation.rs`](../../crates/nsl-codegen/src/pca_activation.rs) (dispatch/activation), [`pca_per_doc.rs`](../../crates/nsl-codegen/src/pca_per_doc.rs) (per-document CTA admission), [`pca_tier_b.rs`](../../crates/nsl-codegen/src/pca_tier_b.rs) (Tier-B kernels).
+Source: [`crates/nsl-codegen/src/pca_detect.rs`](../../crates/nsl-codegen/src/pca_detect.rs) (variant detection), plus [`pca_segment.rs`](../../crates/nsl-codegen/src/pca_segment.rs) (the segment-id buffer's size), [`pca_activation.rs`](../../crates/nsl-codegen/src/pca_activation.rs) (dispatch/activation), [`pca_per_doc.rs`](../../crates/nsl-codegen/src/pca_per_doc.rs) (per-document CTA admission, not reachable from a program), [`pca_tier_b.rs`](../../crates/nsl-codegen/src/pca_tier_b.rs) (Tier-B kernels).
 
 When a `dataset` block sets `packing = true`, many short documents are concatenated into one fixed-length sequence, and attention must not cross document boundaries. The naive encoding is a dense `S x S` boolean mask, which costs `O(S^2)` memory and bandwidth for information that is really `O(S)`. PCA replaces it with a compact `segment_ids: [u16; seq_len]` tensor and synthesises an attention kernel that compares segment ids instead of reading a mask.
 
-`pca_detect` chooses between three variants: **SegmentIdMasked** (the general case, arbitrary document lengths), **PerDocumentCta** (documents short and roughly even — each CTA takes one whole document rather than one Q-tile), and **NoPacking** (packing disabled; ordinary FlashAttention).
+`pca_detect` chooses between three variants: **SegmentIdMasked** (the general case, arbitrary document lengths), **PerDocumentCta** (documents short and roughly even — each CTA takes one whole document rather than one Q-tile), and **NoPacking** (packing disabled; ordinary FlashAttention). Only the first and the last are built for a program: the per-document kernels exist, but no attention call site passes them a document count.
 
-Fires: **during kernel synthesis, when the dataset block enables packing.** PCA is not a `compile_train_block` pass and never sees the `WengertList` — `pca_activation::detect_packing_for_stmts` is called from `compiler/kernel.rs` as a scan over the module AST, before `compile_main`. Consequently it cannot consume WGGO's `AppliedPlan`. The `@pca(strategy = per_document)` decorator selects the per-document-CTA path; it does not by itself enable packing, and the detector recommending `PerDocumentCta` does not by itself enable it either. No CLI flag.
+A `dataset` block carries four fields, all literals: `packing`, `max_sequence_length`, `mean_doc_length` and `doc_length_stddev`. It loads no data, and every other field is a compile-time error. The kernels this pass builds cannot be fed by a packing `DataLoader` (that combination is a compile-time error too, because the loader's tensors are not in the layout the kernels read); the working packed-attention route is `GroupedQueryAttention.forward_packed`, which lowers to `scaled_dot_product_attention_packed` and does not go through this pass. A segment-masked kernel must be causal.
+
+Fires: **during kernel synthesis, when the dataset block enables packing.** PCA is not a `compile_train_block` pass and never sees the `WengertList` — `pca_activation::detect_packing_for_stmts` is called from `compiler/kernel.rs` as a scan over the module AST, before `compile_main`. Consequently it cannot consume WGGO's `AppliedPlan`. The `@pca` decorator accepts `strategy = auto` and `strategy = segment_id`, which both name what happens anyway; `strategy = per_document` and `strategy = off` are compile-time errors (the first cannot be launched, the second was read by nothing). No CLI flag.
 
 ### CPKD — Compiler-Planned Knowledge Distillation
 
-Source: [`crates/nsl-codegen/src/cpkd.rs`](../../crates/nsl-codegen/src/cpkd.rs) (driver), plus [`cpkd_fused_loss.rs`](../../crates/nsl-codegen/src/cpkd_fused_loss.rs) (fused KL-CE kernel), [`cpkd_spectral.rs`](../../crates/nsl-codegen/src/cpkd_spectral.rs) (spectral logit compression), [`cpkd_student.rs`](../../crates/nsl-codegen/src/cpkd_student.rs) (CEP-guided student design).
+Source: [`crates/nsl-codegen/src/cpkd.rs`](../../crates/nsl-codegen/src/cpkd.rs) (driver), plus [`cpkd_fused_loss.rs`](../../crates/nsl-codegen/src/cpkd_fused_loss.rs) (fused KL-CE kernel), [`cpkd_student.rs`](../../crates/nsl-codegen/src/cpkd_student.rs) (CEP-guided student design).
 
-Treats distillation as one compilation problem rather than two model executions. In a `distill(teacher=t, student=s, epochs=N)` block the **teacher is structurally frozen**: every teacher model field registers as a `PrimalOp::Input` leaf, so no adjoint is ever generated for it and the teacher backward is physically absent from the compiled step — there are no teacher gradient buffers to blow up memory. The `@fused_kl_ce` decorator additionally fuses both LM-head matmuls, the temperature-scaled KL term and the hard-label CE term into one kernel, so neither logit tensor is materialized in HBM.
+Treats distillation as one compilation problem rather than two model executions. In a `distill(teacher=t, student=s, epochs=N)` block the **teacher is structurally frozen**: every teacher model field registers as a `PrimalOp::Input` leaf, so no adjoint is ever generated for it and the teacher backward is physically absent from the compiled step — there are no teacher gradient buffers to blow up memory. The `@fused_kl_ce` decorator additionally fuses both LM-head matmuls, the temperature-scaled KL term and the hard-label CE term into one kernel, so neither logit tensor is materialized in HBM. The kernel is CUDA-only and capped at `vocab_size <= 8192`; without an enabled decorator, under `--target cpu`, and under `--training-reference`, `fused_kl_ce(...)` is the standard library's composite of the same name, which computes the same loss. Methods called on the teacher run in evaluation mode: `dropout` is the identity and `is_training()` is false there.
 
-Remaining paper innovations are **advisory** plan entries in v1 (spectral rank, WGGO per-layer feature-match choices, CEP-guided student design); v1 deferrals refuse loudly rather than degrading silently.
+The block's `loss:` section states `alpha` and `temperature` for that call and is checked against it; it does not define the loss, and a section no `fused_kl_ce` call consumes is refused, as are its feature-matching keys. Remaining paper innovations are **advisory** in v1 (WGGO per-layer feature-match choices, CEP-guided student design); v1 deferrals refuse loudly rather than degrading silently. The proposal's spectral top-k logit compression was never built, and its rank selector was removed: the rank of the LM head bounds the dimension of the logit subspace, not the number of tokens that carry probability.
 
 Fires: **distill-block.** Design-time analysis is driven by `--cpkd-target` / `--cpkd-design-student` on `nsl check`.
 
 ### CEP — Compilation-Evaluated Pruning
 
-Source: [`crates/nsl-codegen/src/cep.rs`](../../crates/nsl-codegen/src/cep.rs) (driver), plus [`cep_extract.rs`](../../crates/nsl-codegen/src/cep_extract.rs), [`cep_importance.rs`](../../crates/nsl-codegen/src/cep_importance.rs), [`cep_rewrite.rs`](../../crates/nsl-codegen/src/cep_rewrite.rs), [`cep_search.rs`](../../crates/nsl-codegen/src/cep_search.rs), [`cep_slice.rs`](../../crates/nsl-codegen/src/cep_slice.rs).
+Source: [`crates/nsl-codegen/src/cep.rs`](../../crates/nsl-codegen/src/cep.rs) (driver), plus [`cep_extract.rs`](../../crates/nsl-codegen/src/cep_extract.rs), [`cep_importance.rs`](../../crates/nsl-codegen/src/cep_importance.rs), [`cep_rewrite.rs`](../../crates/nsl-codegen/src/cep_rewrite.rs), [`cep_search.rs`](../../crates/nsl-codegen/src/cep_search.rs), [`cep_slice.rs`](../../crates/nsl-codegen/src/cep_slice.rs), [`cep_weights.rs`](../../crates/nsl-codegen/src/cep_weights.rs).
 
-Structured pruning verified by compilation rather than by a runtime proxy. Three CLI-reachable entry points: `run_prune` prunes a pre-trained model (`--cep-prune` / `@cep_prune`), `run_joint` runs joint prune-search over heads, FFN and layer drops (`--cep-joint`), and `run_search` performs hardware-aware architecture search (`--cep-search` / `@cep_search`). The driver is pure and deterministic — the same inputs always produce an identical report. (`cep.rs`'s own module doc still says "two user-facing entry points"; `run_joint` was added later.)
+Structured pruning planned from weight magnitudes and an analytic cost estimate (parameters, FLOPs, memory traffic and a roofline latency computed from the model's dimensions; nothing is compiled or measured). Three CLI-reachable entry points: `run_prune` prunes attention heads and FFN width of a pre-trained model (`--cep-prune` / `@cep_prune`), `run_joint` does the same and may also drop whole layers (`--cep-joint`), and `run_search` ranks the architectures the `@search` axes span (`--cep-search` / `@cep_search`, whose `objective` is required). The driver is deterministic — the same inputs always produce an identical report.
 
-**Not a train-block pass.** CEP rewrites the model offline and emits new weights and/or new NSL source, so it sits outside the `compile_train_block` pass sequence. `--cep-search` and `--cep-profile` are analysis-only and live on `nsl check`; `--cep-prune`, `--cep-joint`, `--cep-sparsity`, `--cep-emit-source` and `--cep-emit-weights` perform surgery and live on `nsl build`; `--cep-target` and `--cep-out` are accepted by both.
+The prune search removes, one step at a time, whichever key/value group of heads, slice of FFN width, or (joint) layer loses the least importance per parameter saved, until the sparsity target and the memory and latency limits are all met. A plan that cannot meet them exits non-zero and writes nothing; so does a search in which no candidate is feasible.
+
+**Not a train-block pass.** CEP plans offline and emits a delta, new weights and/or new NSL source; it builds no binary, so it sits outside the `compile_train_block` pass sequence. `--cep-search` and `--cep-profile` are analysis-only and live on `nsl check`; `--cep-prune`, `--cep-joint`, `--cep-sparsity`, `--cep-emit-source` and `--cep-emit-weights` live on `nsl build`; `--cep-target` and `--cep-out` are accepted by both. `--weights` takes the `.nslm` that `model_save` writes or a `.safetensors` file; `--cep-emit-weights` writes `.nslm` (loadable with `model_load` into the emitted source) when given an `.nslm` input, otherwise `.safetensors`. With `--cep-emit-source` the plan is kept uniform across layers, because the source declares all layers with one block constructor.
 
 ### CFIE — Compiler-Fused Inference Engine
 
 Source: [`crates/nsl-codegen/src/cfie.rs`](../../crates/nsl-codegen/src/cfie.rs) (driver), plus [`cfie_kv_plan.rs`](../../crates/nsl-codegen/src/cfie_kv_plan.rs), [`cfie_persistent.rs`](../../crates/nsl-codegen/src/cfie_persistent.rs), [`cfie_serve.rs`](../../crates/nsl-codegen/src/cfie_serve.rs), [`cfie_speculative.rs`](../../crates/nsl-codegen/src/cfie_speculative.rs).
 
-Composes six inference passes — KV planning, fused sampling, speculative decoding, persistent decode + scheduler, KV quantization, and grammar-constrained decoding — into a single `CfiePlan`. Five of the six contribute a *kernel family*, and all five emit real PTX (KV planning shapes the pool rather than emitting a kernel of its own). On the monolithic `serve` path that PTX is embedded and registered with the runtime engine at serve init, and per-token launches go through the host decode loop.
+Plans a `serve` block's inference path — the KV layout, the fused sampler, the decode block, and optionally speculative decoding with a draft model — into a single `CfiePlan`, and prints a build report that says which kernels the binary carries. On the monolithic `serve` path, when the KV layout is static and the model fits the one-thread-block decode kernel, two kernels are emitted and registered with the runtime engine at serve init: the decode block (one launch per layer per token) and the fused sampler (one launch per generated token). A `speculative:` section with `draft_weights` adds the draft model's two kernels. The endpoint's `generate()` drives them through the host decode loop; when the decode path is not in the build, `generate()` is a compile error that says why.
+
+Requests nothing would honour are compile errors: a `grammar:` section, `kv_quant: "uniform_int8"`, a non-zero sampling temperature with no `top_k`, a `top_k` above 64, `kv_layout: "static"` with an envelope the GPU cannot hold, and any `speculative:` setting other than a greedy draft model drafting a linear chain. `kv_quant: "auto"` adds an advisory per-layer precision ranking to the report and changes nothing in the binary. The engine serves one sequence at a time, each kernel runs on a single thread block, and the report estimates no speed. See the [CFIE errata](../research/CFIE-errata.md) for what the proposal claimed and what is built.
 
 **Not a train-block pass.** CFIE is invoked from `serve.rs::run_cfie_for_serve`, a separate driver entry point. Flags (`--cfie`, `--cfie-report`) live on `nsl build` only.
 

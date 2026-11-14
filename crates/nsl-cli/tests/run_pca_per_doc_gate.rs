@@ -1,36 +1,26 @@
-//! Regression gate for roadmap item 2.2: `nsl run` must deliver
-//! `@pca(strategy=per_document)` to the per-document CTA admission gate.
+//! `@pca(strategy = per_document)` is refused, by `nsl run` and `nsl check`.
 //!
-//! # History
+//! The decorator used to be accepted and could not run. Admission built a
+//! per-document attention kernel during kernel synthesis and printed a
+//! `[pca-per-doc] admitted` line; every attention call site the compiler
+//! emits then passed that kernel a document count of 0; the launcher
+//! refused the count and returned an error code; and the call site turned
+//! the code into a trap.
 //!
-//! Pre-PR-#281, `nsl run` passed an empty `pca_user_strategies` list to codegen,
-//! so `@pca(strategy=per_document)` was a silent no-op under `nsl run` (while
-//! `nsl build` plumbed it). #281 fixed both commands by overwriting the field
-//! from semantic analysis inside the shared `run_build_single`/`run_build_multi`
-//! (`build/normal.rs:86`/`:349`), which `nsl run` reaches via `run_run` →
-//! `run_build_inner`. This test pins that plumbing on the RUN path specifically:
-//! the `[pca-per-doc]` stderr marker is printed by the admission gate inside
-//! `maybe_synthesize_csha_training_ptx` (compiler/kernel.rs) — in BOTH its
-//! admitted and refused branches — and the gate is only reached at all when the
-//! strategy list arriving from the CLI is non-empty. Marker present ⇒ the run
-//! path delivered the strategies; marker absent ⇒ the pre-#281 silent no-op
-//! regressed.
+//! This file used to hold a test of the plumbing only: it looked for the
+//! `[pca-per-doc]` marker on stderr and, in its own words, deliberately did
+//! not assert the exit status, because its fixture did not compile. It
+//! passed on a program that could not run. What it checks now is the
+//! behaviour a user sees: a failure status and a message that names the
+//! decorator, on the command that is run.
 //!
-//! # Why exit status is deliberately NOT asserted
-//!
-//! The admission gate fires during kernel synthesis, well before train-block
-//! lowering and execution. This fixture's shape (an `@flash_attention` method +
-//! `dataset` block + non-accumulating train block) currently fails LATER in
-//! compilation with `undefined function 'nsl_optim_adamw__adamw_step'` — a
-//! pre-existing optimizer-resolution gap for this program shape, unrelated to
-//! PCA plumbing (the same optimizer resolves fine in e.g.
-//! `fase_deferred_adamw_equivalence.nsl`, and with `grad_accumulation` present
-//! this fixture also gets past codegen). Asserting only the marker keeps this
-//! test pinned to exactly the regression it guards; when the optimizer gap is
-//! fixed, tightening this to also assert success is welcome.
+//! `@pca(strategy = off)` is refused for the plainer reason that nothing
+//! read it, so it did not turn packing off.
 
 use std::path::PathBuf;
 use std::process::Command;
+
+use assert_cmd::prelude::*;
 
 fn repo_root() -> PathBuf {
     // crates/nsl-cli -> crates -> repo root
@@ -42,26 +32,13 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-#[test]
-fn nsl_run_delivers_pca_per_document_to_admission_gate() {
-    let root = repo_root();
-    let tmp = std::env::temp_dir().join(format!("nsl_run_pca_gate_{}", std::process::id()));
-    std::fs::create_dir_all(&tmp).unwrap();
-
-    // Minimal binary corpus so the dataset's `source` points at a real file
-    // (the marker does not depend on its contents — codegen never opens it —
-    // but a real path keeps the fixture honest if later phases start to).
-    let corpus = tmp.join("tokens.bin");
-    std::fs::write(&corpus, [0u8; 128]).unwrap();
-
-    // An @flash_attention model method + packed dataset + @pca(per_document)
-    // train block: the exact combination whose admission gate prints the
-    // [pca-per-doc] marker during kernel synthesis.
-    let source = format!(
+/// An `@flash_attention` model method, a packed dataset and a decorated
+/// train block: the combination that used to reach per-document admission.
+fn program(decorator: &str) -> String {
+    format!(
         r#"from nsl.nn.losses import mse_loss
 
 dataset PackedCorpus("docs"):
-    source = "{corpus}"
     packing = true
     max_sequence_length = 64
     mean_doc_length = 16
@@ -84,7 +61,7 @@ model TinyAttn:
 let m = TinyAttn()
 let x = ones([32, 32])
 
-@pca(strategy=per_document)
+{decorator}
 train(model = m, epochs = 1):
     data:
         source = PackedCorpus
@@ -92,36 +69,77 @@ train(model = m, epochs = 1):
     step(batch):
         let out = m.forward(x)
         let loss = mse_loss(out, x)
-"#,
-        // Embed the path into an NSL string literal with forward slashes. On
-        // Windows `Path::display()` yields backslashes, which the NSL lexer reads
-        // as escape sequences, corrupting the `source = "..."` path so the run
-        // never reaches the admission gate. Forward slashes are valid on Windows.
-        corpus = corpus.to_string_lossy().replace('\\', "/")
-    );
-    let fixture = tmp.join("pca_gate.nsl");
-    std::fs::write(&fixture, source).unwrap();
 
-    // Same invocation shape as fase_numerical_validation.rs: drive the real
-    // `nsl run` CLI so the strategies travel the actual run-command path
-    // (commands/run.rs dispatch -> run_build_inner -> normal.rs overwrite).
-    let output = Command::new(env!("CARGO"))
-        .args(["run", "-q", "--manifest-path"])
-        .arg(root.join("Cargo.toml"))
-        .args(["-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run"])
-        .arg(&fixture)
-        .current_dir(&tmp)
-        .env("NSL_STDLIB_PATH", root.join("stdlib"))
+print("RAN TO THE END")
+"#
+    )
+}
+
+fn nsl(subcommand: &[&str], source: &str) -> std::process::Output {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pca_gate.nsl");
+    std::fs::write(&path, source).unwrap();
+    Command::cargo_bin("nsl")
+        .unwrap()
+        .env("NSL_STDLIB_PATH", repo_root().join("stdlib"))
+        .current_dir(dir.path())
+        .args(subcommand)
+        .arg(&path)
         .output()
-        .expect("failed to spawn nsl run");
+        .unwrap()
+}
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
+#[test]
+fn per_document_is_refused_at_compile_time() {
+    for subcommand in [&["check"][..], &["run", "--target", "cpu"][..]] {
+        let out = nsl(subcommand, &program("@pca(strategy=per_document)"));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success(),
+            "nsl {subcommand:?} accepted @pca(strategy=per_document):\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stderr.contains("@pca(strategy = per_document) is not supported"),
+            "nsl {subcommand:?}: the failure does not name the decorator:\n{stderr}"
+        );
+        assert!(
+            !stdout.contains("RAN TO THE END"),
+            "nsl {subcommand:?}: the program ran"
+        );
+    }
+}
+
+#[test]
+fn off_is_refused_at_compile_time() {
+    let out = nsl(&["check"], &program("@pca(strategy=off)"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("[pca-per-doc]"),
-        "`nsl run` did not reach the per-document admission gate — the \
-         @pca(strategy=per_document) strategy list was dropped on the run path \
-         (pre-#281 silent-no-op regression).\n--- stderr ---\n{stderr}"
+        !out.status.success(),
+        "nsl check accepted @pca(strategy=off):\n{stderr}"
     );
+    assert!(
+        stderr.contains("@pca(strategy = off) is not supported"),
+        "{stderr}"
+    );
+}
 
-    std::fs::remove_dir_all(&tmp).ok();
+/// The strategies that name what happens anyway stay accepted by the
+/// checker, so the refusals above are about those two spellings and not
+/// about the decorator.
+#[test]
+fn the_default_strategies_are_still_accepted() {
+    for decorator in [
+        "@pca",
+        "@pca(strategy=auto)",
+        "@pca(strategy=segment_id)",
+        "",
+    ] {
+        let out = nsl(&["check"], &program(decorator));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "nsl check refused the program with {decorator:?}:\n{stderr}"
+        );
+    }
 }

@@ -239,27 +239,9 @@ ZK circuits require a static computation DAG with no data-dependent branching. P
 
 ## Sparse Tensor Compilation (M50)
 
-**Codegen**: `sparse.rs`
-**Semantic**: `sparse.rs`
-**Runtime**: `sparse.rs`
+**Removed in 2026-11**; preserved at tag `attic/sparse-tensors-2026-11`.
 
-### Sparse Formats
-| Format | Description | Best For |
-|--------|-------------|----------|
-| COO | Coordinate (row, col, value arrays) | Construction, conversion |
-| CSR | Compressed Sparse Row | Row-major SpMV/SpMM |
-| CSC | Compressed Sparse Column | Column-major operations |
-| BSR | Block Sparse Row | Structured sparsity (2:4) |
-
-### Implementation
-- **Type system**: `Sparse<format, [shape], dtype>` as distinct type
-- **`@layout` annotation**: Format-agnostic sparsity — users annotate tensors with `@layout("CSR")` and write standard dense equations; compiler auto-generates optimal sparse iteration
-- **TACO-style merge lattices**: Intersection (for multiply) and union (for add) co-iteration over multiple sparse tensors
-- **Level format composition**: Dense, Compressed, Singleton, CompressedNonUnique, Hashed — compose per-dimension to express CSR, CSC, COO, BCSR, and custom formats
-- **Concrete index notation lowering**: Translates tensor index notation to TACO's loop nesting + workspace allocation, then lowers directly to Cranelift IR (no intermediate C code generation)
-- **Workspace transformation**: Dense temporary for inner-loop accumulation, compressed output assembly
-- **Kernel selection**: Dispatcher routes to format-specific CPU or GPU kernels (SpMV, SpMM, structured MMA.sp for Ampere 2:4)
-- **Cost model integration**: Density-aware FLOP estimation for kernel selection
+M50 added a `Sparse<[shape], dtype, format>` type (COO, CSR, CSC, BSR), a runtime library with SpMV/SpMM and conversions, GPU kernels, and planning code (merge lattices, format selection, a cost model, a `@layout` validator). NSL never had a way to construct a sparse value, so no program could reach any of it. A `Sparse<...>` annotation and the `@layout` decorator are now compile errors that name the tag. None of the formats was 2:4 structured sparsity, which is what the target GPUs accelerate and is a weight-layout question, not a user-facing type.
 
 ---
 

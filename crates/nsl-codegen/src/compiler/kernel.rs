@@ -96,6 +96,14 @@ fn last_dim_from_init_expr(expr: &nsl_ast::expr::Expr) -> Option<i64> {
     None
 }
 
+/// Refusal text for a packed (segment-masked) attention kernel requested
+/// without the causal mask.
+pub(crate) const SEGMENT_MASK_NEEDS_CAUSAL_MESSAGE: &str =
+    "packed attention without a causal mask is not supported: the forward kernel \
+     applies the document mask only as part of the causal mask, so a kernel built \
+     with `causal = false` for a `packing = true` dataset would attend across \
+     documents. Use causal attention with packing, or drop `packing = true`";
+
 impl Compiler<'_> {
     // ── Compile kernel definitions (PTX → .rodata, before functions) ──
 
@@ -514,16 +522,20 @@ impl Compiler<'_> {
         // only on the non-deferred arm made a calibration-deferred build
         // plan packing_mode=0 for a genuinely packed module (review
         // finding).
+        //
+        // The signal is what this module itself declares: a packed dataset,
+        // or a masked attention call in its own statements. It used to also
+        // be true whenever ANY model method body known to the compiler
+        // called a masked attention builtin, and the stdlib's grouped-query
+        // attention always carries `forward_masked` and `forward_packed`,
+        // so every program importing it was "packing-capable": a model
+        // trained through the unpacked `forward` was planned
+        // `PCA=segment_id` with a whole-layer discount. Whether a train
+        // block's own tape reaches a packed attention call is decided where
+        // the tape exists (`wggo::run_on_wengert_with_weights`).
         self.features.packing_supported_in_module =
             crate::pca_activation::detect_packing_for_stmts(stmts, self.interner)
-                || crate::wggo_prepass::stmts_contain_masked_sdpa(stmts, self.interner)
-                || crate::wggo_prepass::fn_bodies_contain_masked_sdpa(
-                    self.models
-                        .model_method_bodies
-                        .values()
-                        .flat_map(|m| m.values()),
-                    self.interner,
-                );
+                || crate::wggo_prepass::stmts_contain_masked_sdpa(stmts, self.interner);
         // WGGO campaign item 6: resolve the train block's packed-dataset
         // document-length statistics once here (AST-only, same lifetime as the
         // packing-supported signal) so both the pre-pass and the in-place
@@ -844,6 +856,12 @@ impl Compiler<'_> {
             .map_err(CodegenError::new)?
             .finish(&self.bus)
             .map_err(CodegenError::new)?;
+        // The forward kernel folds the document test into the causal
+        // predicate and has no other place for it: built without the
+        // causal mask, a "segment-masked" kernel attends across documents.
+        if segment_masked && !base_config.causal {
+            return Err(CodegenError::new(SEGMENT_MASK_NEEDS_CAUSAL_MESSAGE));
+        }
 
         // Resolve `d_model` from the layer's RMSNorm gamma / Q/K/V
         // projection shapes.  Without this the AD emitter allocates
@@ -2199,6 +2217,9 @@ impl Compiler<'_> {
         // scalar matrix / SMEM budget.
         const TILE_CANDIDATES: &[(i64, i64)] = &[(64, 64), (32, 32), (32, 16), (16, 16)];
 
+        if segment_masked && !causal {
+            return Err(CodegenError::new(SEGMENT_MASK_NEEDS_CAUSAL_MESSAGE));
+        }
         if let Some(table) = self.kernels.sdpa_fwd_variants.get(&(causal, segment_masked)) {
             return Ok(table.clone());
         }

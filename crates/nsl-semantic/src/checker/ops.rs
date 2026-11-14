@@ -60,7 +60,8 @@ impl<'a> TypeChecker<'a> {
     /// they fall back to the left operand's type as before.
     pub(crate) fn check_bitwise(&mut self, lty: &Type, rty: &Type, op: BinOp, span: Span) -> Type {
         if lty.is_tensor() && rty.is_tensor() {
-            // A sparse operand has no dense parts; it is not typed here.
+            // Every tensor-family type has dense parts; the else arm is a
+            // backstop for a type that one day does not.
             let (Some((ls, ld, ldev)), Some((rs, rd, rdev))) = (lty.as_tensor_parts(), rty.as_tensor_parts())
             else {
                 return Type::Unknown;
@@ -103,8 +104,8 @@ impl<'a> TypeChecker<'a> {
             | (Type::Float, Type::Int) => Type::Float,
             // Tensor element-wise ops (includes Param/Buffer)
             (l, r) if l.is_tensor() && r.is_tensor() => {
-                // A sparse operand has no dense parts; it is not typed here
-                // (`as_tensor_parts` is None for it, and this unwrapped).
+                // Every tensor-family type has dense parts; the else arm is
+                // a backstop for a type that one day does not.
                 let (Some((ls, ld, ldev)), Some((rs, rd, rdev))) = (l.as_tensor_parts(), r.as_tensor_parts())
                 else {
                     return Type::Unknown;
@@ -316,23 +317,56 @@ impl<'a> TypeChecker<'a> {
     /// Until calls bind by name, a named argument must sit in the position
     /// of the parameter it names; anything else is refused here, where the
     /// declaration's parameter names are known: a function or model declared
-    /// in this module, or a method called on a value whose type is a model
-    /// declared in this module. Every other call (imported callables,
-    /// builtins, receivers of unknown type) is left alone — its parameter
-    /// names are not visible here.
+    /// in this module or imported into it (`from m import f`, `import m as
+    /// a` then `a.f(...)`), or a method called on a value whose type is such
+    /// a model. Every other call (builtins, receivers of unknown type) is
+    /// left alone — its parameter names are not visible here.
     fn check_named_argument_order(&mut self, callee: &Expr, args: &[Arg]) {
         if args.iter().all(|a| a.name.is_none()) {
             return;
         }
-        let key = match &callee.kind {
-            ExprKind::Ident(sym) => (None, *sym),
+        let (names, callable) = match &callee.kind {
+            ExprKind::Ident(sym) => {
+                let key = (None, *sym);
+                let names = self
+                    .call_param_names
+                    .get(&key)
+                    .or_else(|| self.import_param_names.direct.get(&key));
+                (names.cloned(), *sym)
+            }
             ExprKind::MemberAccess { object, member } => match self.type_map.get(&object.id) {
-                Some(Type::Model { name, .. }) => (Some(*name), *member),
+                Some(Type::Model { name, .. }) => {
+                    let key = (Some(*name), *member);
+                    let local = self.call_param_names.get(&key);
+                    let imported = self.import_param_names.direct.get(&key);
+                    // A model of this module and an imported model can share
+                    // a declared name (the import carries an alias). The
+                    // receiver's type does not say which one it is, so when
+                    // their lists differ the call is not judged.
+                    let names = match (local, imported) {
+                        (Some(l), Some(i)) if l != i => None,
+                        (Some(l), _) => Some(l),
+                        (None, i) => i,
+                    };
+                    (names.cloned(), *member)
+                }
+                // `alias.f(...)` after `import m as alias`.
+                Some(Type::Module { .. }) => {
+                    let names = match &object.kind {
+                        ExprKind::Ident(alias) => self
+                            .import_param_names
+                            .modules
+                            .get(alias)
+                            .and_then(|table| table.get(&(None, *member))),
+                        _ => None,
+                    };
+                    (names.cloned(), *member)
+                }
                 _ => return,
             },
             _ => return,
         };
-        let Some(names) = self.call_param_names.get(&key).cloned() else {
+        let Some(names) = names else {
             return;
         };
         let Some((index, arg)) =
@@ -345,7 +379,7 @@ impl<'a> TypeChecker<'a> {
             Some(n) => format!("parameter `{}`", self.resolve_name(*n)),
             None => "no parameter".to_string(),
         };
-        let callable = self.resolve_name(key.1);
+        let callable = self.resolve_name(callable);
         self.diagnostics.push(
             Diagnostic::error(format!(
                 "argument `{given}` of `{callable}` is passed in position {}, which binds {binds}",
@@ -358,12 +392,65 @@ impl<'a> TypeChecker<'a> {
         );
     }
 
+    /// `fused_kl_ce(..., alpha, temperature)`: where the two weights are
+    /// numeric literals they have a range, whatever block the call is in.
+    /// `alpha` weights the hard-label cross-entropy and `1 - alpha` the KL
+    /// term, so outside [0, 1] one of them is negative; the logits are
+    /// divided by `temperature`. A distill block's `loss:` section checked
+    /// these only when it restated them, so `fused_kl_ce(..., 1.7, 0.0)`
+    /// passed. A function of that name declared in this module is the
+    /// user's own and is left alone.
+    fn check_kl_ce_literals(&mut self, callee: &Expr, args: &[Arg]) {
+        let ExprKind::Ident(sym) = &callee.kind else {
+            return;
+        };
+        if args.len() != 9
+            || self.call_param_names.contains_key(&(None, *sym))
+            || self.resolve_name(*sym) != "fused_kl_ce"
+        {
+            return;
+        }
+        fn literal(e: &Expr) -> Option<f64> {
+            match &e.kind {
+                ExprKind::FloatLiteral(v) => Some(*v),
+                ExprKind::IntLiteral(v) => Some(*v as f64),
+                ExprKind::Paren(inner) => literal(inner),
+                ExprKind::UnaryOp { op: nsl_ast::operator::UnaryOp::Neg, operand } => {
+                    literal(operand).map(|v| -v)
+                }
+                _ => None,
+            }
+        }
+        if let Some(alpha) = literal(&args[7].value)
+            && !(0.0..=1.0).contains(&alpha)
+        {
+            self.diagnostics.push(
+                Diagnostic::error(format!("fused_kl_ce: alpha = {alpha} is outside [0, 1]"))
+                    .with_label(
+                        args[7].value.span,
+                        "alpha weights the cross-entropy and 1 - alpha the KL term",
+                    ),
+            );
+        }
+        if let Some(temperature) = literal(&args[8].value)
+            && temperature <= 0.0
+        {
+            self.diagnostics.push(
+                Diagnostic::error(format!(
+                    "fused_kl_ce: temperature = {temperature} is not positive"
+                ))
+                .with_label(args[8].value.span, "the logits are divided by the temperature"),
+            );
+        }
+    }
+
     pub(crate) fn check_call(&mut self, callee: &Expr, args: &[Arg], span: Span) -> Type {
         let callee_ty = self.check_expr(callee);
 
         // Check each argument
         let arg_types: Vec<Type> = args.iter().map(|a| self.check_expr(&a.value)).collect();
         self.check_named_argument_order(callee, args);
+        self.check_kl_ce_literals(callee, args);
 
         // C5 step 5: moving a tensor, or a model holding one, to a device
         // that cannot hold its dtype is a compile error, not the runtime
@@ -786,6 +873,19 @@ impl<'a> TypeChecker<'a> {
                 }
                 if let Some((_, method_ty)) = methods.iter().find(|(name, _)| *name == member) {
                     return method_ty.clone();
+                }
+                // The tensors an `@adapter` adds to a model (`lora_A_<site>`,
+                // `lora_B_<site>`, `ia3_scale_<site>`, `gate_<site>`) are not
+                // declared fields, so they have no entry above; they are
+                // tensors all the same. Left untyped, `m.lora_A_... .sum()`
+                // was an expression of unknown type and `print` wrote its
+                // handle as an integer.
+                if crate::wrga::is_adapter_tensor_name(&self.resolve_name(member)) {
+                    return Type::Tensor {
+                        shape: crate::types::Shape::unknown(),
+                        dtype: crate::types::DType::Unknown,
+                        device: crate::types::Device::Unknown,
+                    };
                 }
                 // Models have many dynamic attributes, be lenient
                 Type::Unknown

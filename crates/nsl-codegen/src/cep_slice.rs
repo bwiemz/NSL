@@ -1,33 +1,121 @@
-//! CEP Option 2 — SP1: weight slicing (pure data transform).
+//! CEP — weight slicing: apply a prune delta to a checkpoint.
+//!
+//! A pure data transform. Pruned heads lose their columns of `wq` and rows of
+//! `wo`, and their key/value group its columns of `wk`/`wv`; a narrowed FFN
+//! keeps the same neurons in `w_gate`, `w_up` and `w_down`; a dropped layer
+//! loses every tensor it owns and the layers after it are renumbered. The
+//! head counts that `GroupedQueryAttention` stores as tensors (`_n_heads`,
+//! `_n_kv_heads`, `_n_rep`) are rewritten to match, because its forward
+//! reshapes by them. Tensors come out in the order they went in.
 
 use std::collections::HashMap;
 
+use crate::cep_importance::{ffn_neuron_magnitudes, ffn_survivors};
 use crate::cep_oracle::ModelSpec;
 use crate::cep_rewrite::{LayerDelta, PruneDelta};
-use crate::weight_aware::{WeightDType, WeightEntry, WeightMap};
+use crate::cep_weights::{BlockIndex, CepWeights, parse_block_name};
+use crate::weight_aware::{WeightDType, WeightEntry, write_f64_as_dtype};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CepSliceError {
-    HeadIndexOutOfRange { layer: u32, head: u32, n_heads: u32 },
-    ShapeMismatch { tensor: String, expected: String, found: String },
-    MissingTensor { tensor: String },
-    InconsistentFfn { layer: u32, detail: String },
-    UnitOutOfRange { tensor: String, unit: u32, n_units: u32 },
+    HeadIndexOutOfRange {
+        layer: u32,
+        head: u32,
+        n_heads: u32,
+    },
+    ShapeMismatch {
+        tensor: String,
+        expected: String,
+        found: String,
+    },
+    MissingTensor {
+        tensor: String,
+    },
+    InconsistentFfn {
+        layer: u32,
+        detail: String,
+    },
+    UnitOutOfRange {
+        tensor: String,
+        unit: u32,
+        n_units: u32,
+    },
+    /// A tensor or a delta entry names a layer the model does not have.
+    UnknownLayer {
+        what: String,
+        layer: u32,
+        n_layers: u32,
+    },
+    /// The delta asks for something the slicer cannot do consistently.
+    BadDelta {
+        layer: u32,
+        detail: String,
+    },
+    /// A stored configuration scalar disagrees with the model source.
+    StaleScalar {
+        tensor: String,
+        expected: u32,
+        found: f64,
+    },
+    /// The weights file itself is inconsistent.
+    BadWeights(String),
 }
 
 impl std::fmt::Display for CepSliceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CepSliceError::HeadIndexOutOfRange { layer, head, n_heads } =>
-                write!(f, "CEP slice: layer {layer} head {head} out of range (n_heads={n_heads})"),
-            CepSliceError::ShapeMismatch { tensor, expected, found } =>
-                write!(f, "CEP slice: '{tensor}' shape mismatch\n  expected: {expected}\n  found:    {found}"),
-            CepSliceError::MissingTensor { tensor } =>
-                write!(f, "CEP slice: expected tensor '{tensor}' not found in weights"),
-            CepSliceError::InconsistentFfn { layer, detail } =>
-                write!(f, "CEP slice: layer {layer} FFN inconsistency: {detail}"),
-            CepSliceError::UnitOutOfRange { tensor, unit, n_units } =>
-                write!(f, "CEP slice: '{tensor}' survivor unit {unit} out of range (n_units={n_units})"),
+            CepSliceError::HeadIndexOutOfRange {
+                layer,
+                head,
+                n_heads,
+            } => write!(
+                f,
+                "CEP slice: layer {layer} head {head} out of range (n_heads={n_heads})"
+            ),
+            CepSliceError::ShapeMismatch {
+                tensor,
+                expected,
+                found,
+            } => write!(
+                f,
+                "CEP slice: '{tensor}' shape mismatch\n  expected: {expected}\n  found:    {found}"
+            ),
+            CepSliceError::MissingTensor { tensor } => write!(
+                f,
+                "CEP slice: expected tensor '{tensor}' not found in weights"
+            ),
+            CepSliceError::InconsistentFfn { layer, detail } => {
+                write!(f, "CEP slice: layer {layer} FFN inconsistency: {detail}")
+            }
+            CepSliceError::UnitOutOfRange {
+                tensor,
+                unit,
+                n_units,
+            } => write!(
+                f,
+                "CEP slice: '{tensor}' survivor unit {unit} out of range (n_units={n_units})"
+            ),
+            CepSliceError::UnknownLayer {
+                what,
+                layer,
+                n_layers,
+            } => write!(
+                f,
+                "CEP slice: {what} names layer {layer}, but the model has {n_layers} layers"
+            ),
+            CepSliceError::BadDelta { layer, detail } => {
+                write!(f, "CEP slice: layer {layer}: {detail}")
+            }
+            CepSliceError::StaleScalar {
+                tensor,
+                expected,
+                found,
+            } => write!(
+                f,
+                "CEP slice: '{tensor}' stores {found}, but the model source says {expected} \
+                           (the weights were not saved from this model)"
+            ),
+            CepSliceError::BadWeights(m) => write!(f, "{m}"),
         }
     }
 }
@@ -87,16 +175,17 @@ pub fn slice_blocks(
                 tensor: entry.name.clone(),
                 expected: "axis 0 or 1".into(),
                 found: format!("axis {axis}"),
-            })
+            });
         }
     };
-    let span = (n_units as usize).checked_mul(block).ok_or_else(|| {
-        CepSliceError::ShapeMismatch {
-            tensor: entry.name.clone(),
-            expected: format!("n_units({n_units}) * block_width({block}) fits in usize"),
-            found: "multiplication overflow".into(),
-        }
-    })?;
+    let span =
+        (n_units as usize)
+            .checked_mul(block)
+            .ok_or_else(|| CepSliceError::ShapeMismatch {
+                tensor: entry.name.clone(),
+                expected: format!("n_units({n_units}) * block_width({block}) fits in usize"),
+                found: "multiplication overflow".into(),
+            })?;
     if span != axis_dim {
         return Err(CepSliceError::ShapeMismatch {
             tensor: entry.name.clone(),
@@ -106,7 +195,11 @@ pub fn slice_blocks(
     }
     for &u in survivor_units {
         if u >= n_units {
-            return Err(CepSliceError::UnitOutOfRange { tensor: entry.name.clone(), unit: u, n_units });
+            return Err(CepSliceError::UnitOutOfRange {
+                tensor: entry.name.clone(),
+                unit: u,
+                n_units,
+            });
         }
     }
     let n_surv = survivor_units.len();
@@ -143,7 +236,7 @@ pub fn slice_blocks(
                 tensor: entry.name.clone(),
                 expected: "axis 0 or 1".into(),
                 found: format!("axis {axis}"),
-            })
+            });
         }
     };
     let num_elements = new_rows * new_cols;
@@ -156,57 +249,6 @@ pub fn slice_blocks(
         sparsity: None,
         eliminated: false,
     })
-}
-
-/// Rank d_ff neurons by column L2 norm of w_gate (`[d_model, d_ff]`, neurons on axis-1);
-/// return the top `new_d_ff` survivor indices in ascending order. dtype-agnostic via to_f64.
-/// Returns `Ok(empty)` when `new_d_ff == 0` (or `d_ff == 0`); never panics on a
-/// well-formed `WeightEntry` (a data-length mismatch yields `ShapeMismatch`).
-pub fn ffn_survivors_by_magnitude(
-    w_gate: &WeightEntry,
-    d_ff: u32,
-    new_d_ff: u32,
-) -> Result<Vec<u32>, CepSliceError> {
-    if w_gate.shape.len() != 2 || w_gate.shape[1] != d_ff as usize {
-        return Err(CepSliceError::ShapeMismatch {
-            tensor: w_gate.name.clone(),
-            expected: format!("[d_model, {d_ff}]"),
-            found: format!("{:?}", w_gate.shape),
-        });
-    }
-    let rows = w_gate.shape[0];
-    let cols = d_ff as usize;
-    let bw = w_gate.dtype.byte_width();
-    // Data must cover the claimed shape, else the per-column reads below would index-panic
-    // (parity with slice_blocks).
-    let expected_bytes = rows * cols * bw;
-    if w_gate.data.len() != expected_bytes {
-        return Err(CepSliceError::ShapeMismatch {
-            tensor: w_gate.name.clone(),
-            expected: format!("{expected_bytes} bytes ({rows}x{cols}x{bw})"),
-            found: format!("{} bytes", w_gate.data.len()),
-        });
-    }
-    let keep = (new_d_ff as usize).min(cols);
-
-    let mut norms: Vec<(u32, f64)> = (0..cols)
-        .map(|c| {
-            let mut sumsq = 0.0_f64;
-            for r in 0..rows {
-                let off = (r * cols + c) * bw;
-                let v = w_gate.dtype.to_f64(&w_gate.data[off..off + bw]);
-                sumsq += v * v;
-            }
-            (c as u32, sumsq) // sqrt is monotonic; ranking on sumsq is equivalent
-        })
-        .collect();
-    // Highest magnitude first; tie-break by lower index for determinism.
-    norms.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0))
-    });
-    let mut survivors: Vec<u32> = norms.into_iter().take(keep).map(|(c, _)| c).collect();
-    survivors.sort_unstable();
-    Ok(survivors)
 }
 
 /// Map our dtype to the safetensors crate's dtype for re-serialization.
@@ -223,189 +265,290 @@ pub(crate) fn to_safetensors_dtype(dt: WeightDType) -> safetensors::Dtype {
     }
 }
 
-/// Parse "blocks.{l}.{attn|ffn}.{name}" into (layer, "attn"|"ffn", leaf). Returns None
-/// for non-per-layer tensors (embed, final norm, lm_head) — copied through unchanged.
-/// Only `blocks.N.*` naming is recognized; `layers.N.*` / `h.N.*` conventions return None
-/// here and pass through unsliced (NSL canonical models, the only ones CEP extracts, use
-/// `blocks.*`).
-fn parse_layer_tensor(name: &str) -> Option<(u32, &'static str, String)> {
-    let prefix = crate::wggo_graph::layer_prefix(name)?; // "blocks.0"
-    let layer: u32 = prefix.strip_prefix("blocks.")?.parse().ok()?;
-    let rest = name.strip_prefix(&prefix)?.strip_prefix('.')?; // "attn.wq" | "ffn.w_gate"
-    let (sect, leaf) = rest.split_once('.')?;
-    match sect {
-        "attn" => Some((layer, "attn", leaf.to_string())),
-        "ffn" => Some((layer, "ffn", leaf.to_string())),
-        _ => None,
-    }
-}
-
-/// Slice a model's weights to a PruneDelta. Returns the sliced entries (a smaller set).
-/// Pure data transform — drops pruned heads' blocks (GQA-group-aligned), narrows FFN by
-/// magnitude survivors (consistent across w_gate/w_up/w_down), drops + re-keys dropped layers.
+/// Slice a model's weights to a [`PruneDelta`]. Returns the surviving tensors
+/// in the order of `weights.order`.
 ///
-/// LIMITATION (SP1 scope): only `attn.*` and `ffn.*` per-layer tensors are sliced/re-keyed.
-/// Other intra-layer tensors (e.g. RMSNorm scales `blocks.{l}.norm.*`) take the passthrough
-/// path with their ORIGINAL key. That is correct for head/FFN pruning (which never renumbers
-/// layers), but it is NOT drop-aware: if `drop_layer` is ever set, such tensors are neither
-/// omitted for dropped layers nor renumbered for survivors. The greedy planner never sets
-/// `drop_layer` (it is always false today), so this is latent; full layer-drop support that
-/// also handles norm/other intra-layer tensors is deferred (SP2).
+/// Every tensor that belongs to a block is handled, whatever its section: a
+/// dropped layer loses all of them (attention, FFN, norms, RoPE tables,
+/// stored scalars) and later layers are renumbered as a whole. Names keep the
+/// spelling they were read in (`blocks[0].…` or `blocks.0.…`).
 pub fn apply_prune_delta_to_weights(
-    wm: &WeightMap,
+    weights: &CepWeights,
     spec: &ModelSpec,
     delta: &PruneDelta,
-) -> Result<HashMap<String, WeightEntry>, CepSliceError> {
-    // Per-layer drop flags + the old->new layer re-key map (skip dropped layers).
-    let mut drop = vec![false; spec.n_layers as usize];
+) -> Result<Vec<WeightEntry>, CepSliceError> {
+    let wm = &weights.map;
+    let n_layers = spec.n_layers;
+    let index = BlockIndex::build(wm).map_err(CepSliceError::BadWeights)?;
+
+    let mut by_layer: HashMap<u32, &LayerDelta> = HashMap::new();
     for ld in &delta.per_layer {
-        if (ld.layer as usize) < drop.len() && ld.drop_layer {
-            drop[ld.layer as usize] = true;
+        if ld.layer >= n_layers {
+            return Err(CepSliceError::UnknownLayer {
+                what: "the prune delta".into(),
+                layer: ld.layer,
+                n_layers,
+            });
         }
+        by_layer.insert(ld.layer, ld);
     }
-    let mut rekey = vec![None; spec.n_layers as usize];
+    let dropped = |l: u32| by_layer.get(&l).is_some_and(|ld| ld.drop_layer);
+    // Old layer index -> new layer index, skipping dropped layers.
+    let mut rekey: Vec<Option<u32>> = Vec::with_capacity(n_layers as usize);
     let mut next = 0u32;
-    for (l, d) in drop.iter().enumerate() {
-        if !*d {
-            rekey[l] = Some(next);
+    for l in 0..n_layers {
+        if dropped(l) {
+            rekey.push(None);
+        } else {
+            rekey.push(Some(next));
             next += 1;
         }
     }
-    // Index the delta by layer for quick lookup.
-    let by_layer: HashMap<u32, &LayerDelta> =
-        delta.per_layer.iter().map(|ld| (ld.layer, ld)).collect();
 
-    // Precompute per-layer FFN survivor sets (one ranking per layer, from w_gate).
-    // Guard `l >= drop.len()` mirrors the main slicing loop (see below) and the
-    // drop-flag pass above (line 229) — both silently skip out-of-range layer
-    // indices rather than panic on `spec.d_ff[l]`. Reaching this branch requires
-    // a hand-crafted delta (the greedy planner only emits 0..n_layers) AND a
-    // WeightMap containing `blocks.{l}.ffn.w_gate` for that stray l, so it's
-    // latent today but a panic in defense-in-depth terms.
-    let mut ffn_survivors: HashMap<u32, Vec<u32>> = HashMap::new();
-    for ld in &delta.per_layer {
-        if let Some(new_ff) = ld.new_d_ff {
-            let l = ld.layer;
-            if (l as usize) >= drop.len() {
-                continue;
-            }
-            let gate_name = format!("blocks.{l}.ffn.w_gate");
-            let gate = wm
-                .get(&gate_name)
-                .ok_or(CepSliceError::MissingTensor { tensor: gate_name })?;
-            let surv = ffn_survivors_by_magnitude(gate, spec.d_ff[l as usize], new_ff)?;
-            ffn_survivors.insert(l, surv);
+    // Per surviving layer: which heads, key/value groups and FFN neurons stay.
+    let mut plans: HashMap<u32, LayerPlan> = HashMap::new();
+    for l in 0..n_layers {
+        if dropped(l) {
+            continue;
         }
+        let Some(ld) = by_layer.get(&l) else { continue };
+        plans.insert(l, LayerPlan::build(wm, &index, spec, ld)?);
     }
 
-    let mut out: HashMap<String, WeightEntry> = HashMap::new();
-    for (name, entry) in wm.entries() {
-        match parse_layer_tensor(name) {
-            None => {
-                // Passthrough (embed, final norm, lm_head, etc.).
-                out.insert(name.clone(), entry.clone());
-            }
-            Some((l, sect, leaf)) => {
-                if (l as usize) >= drop.len() || drop[l as usize] {
-                    continue; // dropped layer — omit
-                }
-                let new_l = rekey[l as usize].expect("surviving layer has a rekey");
-                let ld = by_layer.get(&l);
-                let hd = spec.head_dim[l as usize];
-
-                let mut sliced = if let Some(ld) = ld {
-                    slice_one(entry, sect, &leaf, l, spec, ld, hd, &ffn_survivors)?
-                } else {
-                    entry.clone()
-                };
-                sliced.name = format!("blocks.{new_l}.{sect}.{leaf}");
-                out.insert(sliced.name.clone(), sliced);
-            }
+    let mut out = Vec::with_capacity(weights.order.len());
+    for name in &weights.order {
+        let entry = wm.get(name).ok_or_else(|| CepSliceError::MissingTensor {
+            tensor: name.clone(),
+        })?;
+        let Some(block) = parse_block_name(name) else {
+            out.push(entry.clone()); // embedding, final norm, ...
+            continue;
+        };
+        if block.layer >= n_layers {
+            return Err(CepSliceError::UnknownLayer {
+                what: format!("tensor '{name}'"),
+                layer: block.layer,
+                n_layers,
+            });
         }
+        let Some(new_layer) = rekey[block.layer as usize] else {
+            continue;
+        };
+        let mut sliced = match plans.get(&block.layer) {
+            Some(plan) => plan.slice(entry, block.rest)?,
+            None => entry.clone(),
+        };
+        sliced.name = block.with_layer(new_layer);
+        out.push(sliced);
     }
     Ok(out)
 }
 
-/// Slice a single per-layer tensor according to its role + the layer's delta.
-#[allow(clippy::too_many_arguments)]
-fn slice_one(
-    entry: &WeightEntry,
-    sect: &str,
-    leaf: &str,
-    layer: u32,
-    spec: &ModelSpec,
-    ld: &LayerDelta,
-    hd: u32,
-    ffn_survivors: &HashMap<u32, Vec<u32>>,
-) -> Result<WeightEntry, CepSliceError> {
-    let l = layer as usize;
-    // Attention head survivors (group-aligned: pruned_heads are whole groups).
-    let n_heads = spec.n_heads[l];
-    let n_kv = spec.n_kv_heads[l].max(1);
-    let group = (n_heads / n_kv).max(1);
-    // Invariant (upheld by plan_to_prune_delta): pruned_heads are whole GQA groups, so the
-    // KV-survivor test below — checking each group's first head as representative — is sound.
-    // Guard it in debug builds against a hand-edited/future-planner delta that violates
-    // group-alignment, which would otherwise desync Q survivors from KV survivors.
-    debug_assert!(
-        ld.pruned_heads.iter().all(|&h| {
-            let base = (h / group) * group;
-            (base..base + group).all(|x| ld.pruned_heads.contains(&x))
-        }),
-        "slice_one: layer {layer} pruned_heads {:?} are not whole GQA groups (group={group})",
-        ld.pruned_heads
-    );
-    let survivor_q: Vec<u32> = (0..n_heads).filter(|h| !ld.pruned_heads.contains(h)).collect();
-    // KV survivors: a group survives iff its query heads survive.
-    let survivor_kv: Vec<u32> = (0..n_kv)
-        .filter(|&g| !ld.pruned_heads.contains(&(g * group)))
-        .collect();
+/// What survives in one layer.
+struct LayerPlan {
+    n_heads: u32,
+    n_kv: u32,
+    head_dim: u32,
+    d_ff: u32,
+    /// Surviving query heads and key/value heads, each ascending. `None`
+    /// when no head is pruned.
+    heads: Option<(Vec<u32>, Vec<u32>)>,
+    /// Surviving FFN neurons, ascending. `None` when the FFN keeps its width.
+    neurons: Option<Vec<u32>>,
+}
 
-    match (sect, leaf) {
-        ("attn", "wq") if !ld.pruned_heads.is_empty() => {
-            slice_blocks(entry, 1, n_heads, hd, &survivor_q)
-        }
-        ("attn", "wo") if !ld.pruned_heads.is_empty() => {
-            slice_blocks(entry, 0, n_heads, hd, &survivor_q)
-        }
-        ("attn", "wk") | ("attn", "wv") if !ld.pruned_heads.is_empty() => {
-            slice_blocks(entry, 1, n_kv, hd, &survivor_kv)
-        }
-        ("ffn", "w_gate") | ("ffn", "w_up") => {
-            if let Some(surv) = ffn_survivors.get(&layer) {
-                slice_blocks(entry, 1, spec.d_ff[l], 1, surv)
-            } else {
-                Ok(entry.clone())
+impl LayerPlan {
+    fn build(
+        wm: &crate::weight_aware::WeightMap,
+        index: &BlockIndex,
+        spec: &ModelSpec,
+        ld: &LayerDelta,
+    ) -> Result<Self, CepSliceError> {
+        let layer = ld.layer;
+        let l = layer as usize;
+        let n_heads = spec.n_heads[l];
+        let n_kv = spec.n_kv_heads[l].max(1);
+        let group = (n_heads / n_kv).max(1);
+
+        let heads = if ld.pruned_heads.is_empty() {
+            None
+        } else {
+            if let Some(&h) = ld.pruned_heads.iter().find(|&&h| h >= n_heads) {
+                return Err(CepSliceError::HeadIndexOutOfRange {
+                    layer,
+                    head: h,
+                    n_heads,
+                });
             }
-        }
-        ("ffn", "w_down") => {
-            if let Some(surv) = ffn_survivors.get(&layer) {
-                slice_blocks(entry, 0, spec.d_ff[l], 1, surv)
-            } else {
-                Ok(entry.clone())
+            // A key/value head serves a whole group of query heads, so the
+            // group goes or stays as one.
+            let whole_groups = ld.pruned_heads.iter().all(|&h| {
+                let base = (h / group) * group;
+                (base..base + group).all(|x| ld.pruned_heads.contains(&x))
+            });
+            if !whole_groups {
+                return Err(CepSliceError::BadDelta {
+                    layer,
+                    detail: format!(
+                        "pruned heads {:?} are not whole key/value groups of {group}",
+                        ld.pruned_heads
+                    ),
+                });
             }
+            let q: Vec<u32> = (0..n_heads)
+                .filter(|h| !ld.pruned_heads.contains(h))
+                .collect();
+            let kv: Vec<u32> = (0..n_kv)
+                .filter(|&g| !ld.pruned_heads.contains(&(g * group)))
+                .collect();
+            if q.is_empty() {
+                return Err(CepSliceError::BadDelta {
+                    layer,
+                    detail: "every head is pruned; drop the layer instead".into(),
+                });
+            }
+            Some((q, kv))
+        };
+
+        let neurons = match ld.new_d_ff {
+            Some(new_ff) if new_ff < spec.d_ff[l] => {
+                if new_ff == 0 {
+                    return Err(CepSliceError::BadDelta {
+                        layer,
+                        detail: "an FFN width of 0 was requested; drop the layer instead".into(),
+                    });
+                }
+                let fetch = |rest: &str| {
+                    index
+                        .get(wm, layer, rest)
+                        .ok_or_else(|| CepSliceError::MissingTensor {
+                            tensor: format!("blocks[{layer}].{rest}"),
+                        })
+                };
+                let mags = ffn_neuron_magnitudes(
+                    fetch("ffn.w_gate")?,
+                    fetch("ffn.w_up")?,
+                    fetch("ffn.w_down")?,
+                    spec.d_model,
+                    spec.d_ff[l],
+                )
+                .map_err(|detail| CepSliceError::InconsistentFfn { layer, detail })?;
+                Some(ffn_survivors(&mags, new_ff as usize))
+            }
+            Some(new_ff) if new_ff > spec.d_ff[l] => {
+                return Err(CepSliceError::BadDelta {
+                    layer,
+                    detail: format!(
+                        "FFN width {new_ff} is wider than the model's {}",
+                        spec.d_ff[l]
+                    ),
+                });
+            }
+            _ => None,
+        };
+
+        Ok(Self {
+            n_heads,
+            n_kv,
+            head_dim: spec.head_dim[l],
+            d_ff: spec.d_ff[l],
+            heads,
+            neurons,
+        })
+    }
+
+    /// Slice one of this layer's tensors, named by its path inside the block.
+    fn slice(&self, entry: &WeightEntry, rest: &str) -> Result<WeightEntry, CepSliceError> {
+        match (rest, &self.heads, &self.neurons) {
+            ("attn.wq", Some((q, _)), _) => slice_blocks(entry, 1, self.n_heads, self.head_dim, q),
+            ("attn.wo", Some((q, _)), _) => slice_blocks(entry, 0, self.n_heads, self.head_dim, q),
+            ("attn.wk" | "attn.wv", Some((_, kv)), _) => {
+                slice_blocks(entry, 1, self.n_kv, self.head_dim, kv)
+            }
+            // `GroupedQueryAttention` stores its head counts as tensors and
+            // reshapes by them, so they must follow the projections.
+            ("attn._n_heads", heads, _) => {
+                let new = heads.as_ref().map_or(self.n_heads, |(q, _)| q.len() as u32);
+                rewrite_scalar(entry, self.n_heads, new)
+            }
+            ("attn._n_kv_heads", heads, _) => {
+                let new = heads.as_ref().map_or(self.n_kv, |(_, kv)| kv.len() as u32);
+                rewrite_scalar(entry, self.n_kv, new)
+            }
+            ("attn._n_rep", _, _) => {
+                // Whole groups go, so heads per key/value head is unchanged.
+                let rep = self.n_heads / self.n_kv;
+                rewrite_scalar(entry, rep, rep)
+            }
+            ("ffn.w_gate" | "ffn.w_up", _, Some(n)) => slice_blocks(entry, 1, self.d_ff, 1, n),
+            ("ffn.w_down", _, Some(n)) => slice_blocks(entry, 0, self.d_ff, 1, n),
+            _ => Ok(entry.clone()), // norms, RoPE tables, other scalars
         }
-        _ => Ok(entry.clone()), // norm scales etc. inside a layer — passthrough
     }
 }
 
-/// Re-serialize sliced entries to a smaller .safetensors at `path`.
+/// Replace a one-element configuration tensor's value, after checking that it
+/// held what the model source says it should.
+fn rewrite_scalar(
+    entry: &WeightEntry,
+    expected: u32,
+    new: u32,
+) -> Result<WeightEntry, CepSliceError> {
+    let bw = entry.dtype.byte_width();
+    if entry.num_elements != 1 || entry.data.len() != bw {
+        return Err(CepSliceError::ShapeMismatch {
+            tensor: entry.name.clone(),
+            expected: "a one-element tensor".into(),
+            found: format!("{:?}", entry.shape),
+        });
+    }
+    let found = entry.dtype.to_f64(&entry.data);
+    if found != expected as f64 {
+        return Err(CepSliceError::StaleScalar {
+            tensor: entry.name.clone(),
+            expected,
+            found,
+        });
+    }
+    let mut out = entry.clone();
+    write_f64_as_dtype(new as f64, entry.dtype, &mut out.data);
+    Ok(out)
+}
+
+/// The bytes of the weights file `path` asks for: `.nslm` (in the order
+/// given, which is what `model_load` needs) or `.safetensors` (which its
+/// format sorts).
+pub fn sliced_weights_bytes(
+    entries: &[WeightEntry],
+    path: &std::path::Path,
+) -> std::io::Result<Vec<u8>> {
+    if crate::cep_weights::wants_nslm(path) {
+        let refs: Vec<&WeightEntry> = entries.iter().collect();
+        crate::cep_weights::nslm_bytes(&refs)
+    } else {
+        serialize_safetensors(entries)
+    }
+}
+
+/// Serialise sliced entries to `path` (see [`sliced_weights_bytes`]).
 pub fn write_sliced_weights(
-    entries: &HashMap<String, WeightEntry>,
+    entries: &[WeightEntry],
     path: &std::path::Path,
 ) -> std::io::Result<()> {
+    crate::cep_weights::write_atomically(path, &sliced_weights_bytes(entries, path)?)
+}
+
+/// The bytes of a `.safetensors` file holding `entries`.
+pub fn serialize_safetensors(entries: &[WeightEntry]) -> std::io::Result<Vec<u8>> {
     use safetensors::tensor::TensorView;
-    // Build views, propagating a shape/data-length inconsistency as an io::Error rather than
-    // panicking at the serialization boundary (`?` can't be used inside a `.map` closure).
+    let invalid = |e: String| std::io::Error::new(std::io::ErrorKind::InvalidData, e);
     let mut views: Vec<(String, TensorView)> = Vec::with_capacity(entries.len());
-    for (name, e) in entries {
+    for e in entries {
         let v = TensorView::new(to_safetensors_dtype(e.dtype), e.shape.clone(), &e.data)
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))?;
-        views.push((name.clone(), v));
+            .map_err(|err| invalid(err.to_string()))?;
+        views.push((e.name.clone(), v));
     }
-    let bytes = safetensors::serialize(views, None)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-    std::fs::write(path, bytes)
+    safetensors::serialize(views, None).map_err(|e| invalid(e.to_string()))
 }
 
 #[cfg(test)]
@@ -418,100 +561,433 @@ mod tests {
     fn small_spec() -> ModelSpec {
         // d_model=8, 2 layers, 4 heads, 2 kv (group=2), head_dim=2, d_ff=6.
         ModelSpec {
-            d_model: 8, n_layers: 2,
-            n_heads: vec![4, 4], n_kv_heads: vec![2, 2], head_dim: vec![2, 2], d_ff: vec![6, 6],
-            vocab: 16, max_seq: 32, batch: 1,
-            activation: Activation::SwiGlu, norm: NormType::RmsNorm, dtype_bytes: 4,
+            d_model: 8,
+            n_layers: 2,
+            n_heads: vec![4, 4],
+            n_kv_heads: vec![2, 2],
+            head_dim: vec![2, 2],
+            d_ff: vec![6, 6],
+            vocab: 16,
+            max_seq: 32,
+            batch: 1,
+            activation: Activation::SwiGlu,
+            norm: NormType::RmsNorm,
+            dtype_bytes: 4,
+            tied_lm_head: true,
         }
     }
 
-    // Build a WeightMap with per-layer attn+ffn tensors (ramp values) + an embed passthrough.
-    fn small_weights(spec: &ModelSpec) -> WeightMap {
+    /// A checkpoint shaped like one `model_save` writes for `small_spec`, in
+    /// model order: the embedding, then per layer the norm, the attention's
+    /// stored scalars and projections, the second norm and the FFN, then the
+    /// final norm. Values are ramps offset by 10000 per layer, so a tensor's
+    /// layer can be read off its data.
+    fn small_weights(spec: &ModelSpec, bracket: bool) -> CepWeights {
+        let mut order = Vec::new();
         let mut entries = std::collections::HashMap::new();
-        // Each layer gets a distinct base offset so a tensor's layer identity is recoverable
-        // from its data — this lets the drop/re-key test assert the surviving tensor holds the
-        // ORIGINAL layer's bytes (not a different layer's). Layer 0 uses base 0, so the
-        // value-identity assertions in the head/FFN slicing test are unaffected.
-        let mut ramp = |name: &str, shape: Vec<usize>, base: f32| {
-            let n: usize = shape.iter().product();
-            let vals: Vec<f32> = (0..n).map(|i| base + i as f32).collect();
-            entries.insert(name.to_string(), f32_entry(name, shape, &vals));
+        let mut put = |name: String, shape: Vec<usize>, vals: Vec<f32>| {
+            entries.insert(name.clone(), f32_entry(&name, shape, &vals));
+            order.push(name);
         };
+        let ramp = |n: usize, base: f32| -> Vec<f32> { (0..n).map(|i| base + i as f32).collect() };
         let dm = spec.d_model as usize;
+        put(
+            "embed".into(),
+            vec![spec.vocab as usize, dm],
+            ramp(spec.vocab as usize * dm, 0.0),
+        );
         for l in 0..spec.n_layers as usize {
             let nh = spec.n_heads[l] as usize;
             let nkv = spec.n_kv_heads[l] as usize;
             let hd = spec.head_dim[l] as usize;
             let dff = spec.d_ff[l] as usize;
             let base = (l as f32) * 10_000.0;
-            ramp(&format!("blocks.{l}.attn.wq"), vec![dm, nh * hd], base);
-            ramp(&format!("blocks.{l}.attn.wk"), vec![dm, nkv * hd], base);
-            ramp(&format!("blocks.{l}.attn.wv"), vec![dm, nkv * hd], base);
-            ramp(&format!("blocks.{l}.attn.wo"), vec![nh * hd, dm], base);
-            ramp(&format!("blocks.{l}.ffn.w_gate"), vec![dm, dff], base);
-            ramp(&format!("blocks.{l}.ffn.w_up"), vec![dm, dff], base);
-            ramp(&format!("blocks.{l}.ffn.w_down"), vec![dff, dm], base);
+            let p = |rest: &str| {
+                if bracket {
+                    format!("blocks[{l}].{rest}")
+                } else {
+                    format!("blocks.{l}.{rest}")
+                }
+            };
+            put(p("attn_norm.weight"), vec![dm], vec![1.0 + l as f32; dm]);
+            put(p("attn._n_heads"), vec![1], vec![nh as f32]);
+            put(p("attn._n_kv_heads"), vec![1], vec![nkv as f32]);
+            put(p("attn._head_dim"), vec![1], vec![hd as f32]);
+            put(p("attn._n_rep"), vec![1], vec![(nh / nkv) as f32]);
+            put(p("attn.wq"), vec![dm, nh * hd], ramp(dm * nh * hd, base));
+            put(p("attn.wk"), vec![dm, nkv * hd], ramp(dm * nkv * hd, base));
+            put(p("attn.wv"), vec![dm, nkv * hd], ramp(dm * nkv * hd, base));
+            put(p("attn.wo"), vec![nh * hd, dm], ramp(nh * hd * dm, base));
+            put(p("ffn_norm.weight"), vec![dm], vec![1.5 + l as f32; dm]);
+            put(p("ffn.w_gate"), vec![dm, dff], ramp(dm * dff, base));
+            put(p("ffn.w_up"), vec![dm, dff], ramp(dm * dff, base));
+            put(p("ffn.w_down"), vec![dff, dm], ramp(dff * dm, base));
         }
-        ramp("embed", vec![spec.vocab as usize, dm], 0.0);
-        WeightMap::from_entries(entries)
+        put("norm.weight".into(), vec![dm], vec![9.0; dm]);
+        CepWeights {
+            map: WeightMap::from_entries(entries),
+            order,
+            format: crate::cep_weights::WeightFormat::Nslm,
+        }
+    }
+
+    fn find<'a>(out: &'a [WeightEntry], name: &str) -> &'a WeightEntry {
+        out.iter().find(|e| e.name == name).unwrap_or_else(|| {
+            panic!(
+                "no tensor '{name}' in {:?}",
+                out.iter().map(|e| &e.name).collect::<Vec<_>>()
+            )
+        })
     }
 
     #[test]
     fn orchestrator_slices_heads_ffn_and_passes_through() {
         let spec = small_spec();
-        let wm = small_weights(&spec);
+        let w = small_weights(&spec, false);
         // Drop group 0 (heads 0,1) of layer 0 -> 2 surviving heads {2,3}, 1 kv head {1}.
-        // Narrow layer 0 FFN to 4 (drop 2 lowest-magnitude neurons). Layer 1 untouched.
+        // Narrow layer 0 FFN to 4. Layer 1 untouched.
         let delta = PruneDelta {
             per_layer: vec![
-                LayerDelta { layer: 0, pruned_heads: vec![0, 1], new_d_ff: Some(4), drop_layer: false },
-                LayerDelta { layer: 1, pruned_heads: vec![], new_d_ff: None, drop_layer: false },
+                LayerDelta {
+                    layer: 0,
+                    pruned_heads: vec![0, 1],
+                    new_d_ff: Some(4),
+                    drop_layer: false,
+                },
+                LayerDelta {
+                    layer: 1,
+                    pruned_heads: vec![],
+                    new_d_ff: None,
+                    drop_layer: false,
+                },
             ],
         };
-        let out = apply_prune_delta_to_weights(&wm, &spec, &delta).unwrap();
+        let out = apply_prune_delta_to_weights(&w, &spec, &delta).unwrap();
 
         // wq [8, 8] -> survivor heads {2,3} -> cols {4,5,6,7} -> [8, 4]
-        let wq = &out["blocks.0.attn.wq"];
+        let wq = find(&out, "blocks.0.attn.wq");
         assert_eq!(wq.shape, vec![8, 4]);
-        // identity: row 0 of sliced == original row 0 cols 4..8 = [4,5,6,7]
-        let wq_f = read_f32(wq);
-        assert_eq!(&wq_f[0..4], &[4., 5., 6., 7.]);
-        // wk [8,4] -> survivor kv head {1} -> cols {2,3} -> [8,2]
-        assert_eq!(out["blocks.0.attn.wk"].shape, vec![8, 2]);
-        // wo [8,8] -> survivor heads {2,3} -> rows {4,5,6,7} -> [4,8]
-        assert_eq!(out["blocks.0.attn.wo"].shape, vec![4, 8]);
-        // FFN narrowed to 4 across all three (consistent)
-        assert_eq!(out["blocks.0.ffn.w_gate"].shape, vec![8, 4]);
-        assert_eq!(out["blocks.0.ffn.w_up"].shape, vec![8, 4]);
-        assert_eq!(out["blocks.0.ffn.w_down"].shape, vec![4, 8]);
+        // row 0 of the original is 0..8; columns 4..8 of it are 4,5,6,7.
+        assert_eq!(&read_f32(wq)[0..4], &[4., 5., 6., 7.]);
+        // wk [8,4] -> survivor kv head {1} -> cols {2,3} -> [8,2]; row 0 was 0..4.
+        let wk = find(&out, "blocks.0.attn.wk");
+        assert_eq!(wk.shape, vec![8, 2]);
+        assert_eq!(&read_f32(wk)[0..2], &[2., 3.]);
+        // wo [8,8] -> survivor heads {2,3} -> rows {4,5,6,7} -> [4,8]; row 4 starts at 32.
+        let wo = find(&out, "blocks.0.attn.wo");
+        assert_eq!(wo.shape, vec![4, 8]);
+        assert_eq!(read_f32(wo)[0], 32.0);
+        // FFN narrowed to 4 across all three, keeping the same neurons in each.
+        // With ramp values the last columns/rows are the largest, so neurons
+        // 2..6 survive: w_gate row 0 was 0..6 -> 2,3,4,5; w_down row 2 starts at 16.
+        let gate = find(&out, "blocks.0.ffn.w_gate");
+        assert_eq!(gate.shape, vec![8, 4]);
+        assert_eq!(&read_f32(gate)[0..4], &[2., 3., 4., 5.]);
+        assert_eq!(find(&out, "blocks.0.ffn.w_up").shape, vec![8, 4]);
+        let down = find(&out, "blocks.0.ffn.w_down");
+        assert_eq!(down.shape, vec![4, 8]);
+        assert_eq!(read_f32(down)[0], 16.0);
         // layer 1 untouched
-        assert_eq!(out["blocks.1.attn.wq"].shape, vec![8, 8]);
+        assert_eq!(find(&out, "blocks.1.attn.wq").shape, vec![8, 8]);
         // passthrough
-        assert_eq!(out["embed"].shape, vec![16, 8]);
+        assert_eq!(find(&out, "embed").shape, vec![16, 8]);
+    }
+
+    /// `GroupedQueryAttention.forward` reshapes by the head counts it stores
+    /// as tensors, so a sliced `wq` beside the old `_n_heads` cannot run.
+    #[test]
+    fn stored_head_counts_follow_the_projections() {
+        let spec = small_spec();
+        let w = small_weights(&spec, true);
+        let delta = PruneDelta {
+            per_layer: vec![
+                LayerDelta {
+                    layer: 0,
+                    pruned_heads: vec![2, 3],
+                    new_d_ff: None,
+                    drop_layer: false,
+                },
+                LayerDelta {
+                    layer: 1,
+                    pruned_heads: vec![],
+                    new_d_ff: None,
+                    drop_layer: false,
+                },
+            ],
+        };
+        let out = apply_prune_delta_to_weights(&w, &spec, &delta).unwrap();
+        assert_eq!(read_f32(find(&out, "blocks[0].attn._n_heads")), vec![2.0]);
+        assert_eq!(
+            read_f32(find(&out, "blocks[0].attn._n_kv_heads")),
+            vec![1.0]
+        );
+        assert_eq!(read_f32(find(&out, "blocks[0].attn._n_rep")), vec![2.0]);
+        assert_eq!(read_f32(find(&out, "blocks[0].attn._head_dim")), vec![2.0]);
+        // The untouched layer keeps its counts.
+        assert_eq!(read_f32(find(&out, "blocks[1].attn._n_heads")), vec![4.0]);
+        assert_eq!(
+            read_f32(find(&out, "blocks[1].attn._n_kv_heads")),
+            vec![2.0]
+        );
     }
 
     #[test]
-    fn orchestrator_drops_and_rekeys_layers() {
+    fn a_stored_head_count_that_disagrees_with_the_source_is_refused() {
         let spec = small_spec();
-        let wm = small_weights(&spec);
-        // Drop layer 0 entirely -> layer 1 re-keyed to blocks.0.
+        let mut w = small_weights(&spec, true);
+        w.map
+            .insert(f32_entry("blocks[0].attn._n_heads", vec![1], &[8.0]));
+        let delta = PruneDelta {
+            per_layer: vec![LayerDelta {
+                layer: 0,
+                pruned_heads: vec![0, 1],
+                new_d_ff: None,
+                drop_layer: false,
+            }],
+        };
+        let err = apply_prune_delta_to_weights(&w, &spec, &delta).unwrap_err();
+        assert!(
+            matches!(err, CepSliceError::StaleScalar { expected: 4, .. }),
+            "{err}"
+        );
+    }
+
+    /// Tensors come out in the order they went in: `model_load` copies by
+    /// position.
+    #[test]
+    fn output_keeps_the_input_order() {
+        let spec = small_spec();
+        let w = small_weights(&spec, true);
         let delta = PruneDelta {
             per_layer: vec![
-                LayerDelta { layer: 0, pruned_heads: vec![], new_d_ff: None, drop_layer: true },
-                LayerDelta { layer: 1, pruned_heads: vec![], new_d_ff: None, drop_layer: false },
+                LayerDelta {
+                    layer: 0,
+                    pruned_heads: vec![0, 1],
+                    new_d_ff: Some(4),
+                    drop_layer: false,
+                },
+                LayerDelta {
+                    layer: 1,
+                    pruned_heads: vec![0, 1],
+                    new_d_ff: Some(4),
+                    drop_layer: false,
+                },
             ],
         };
-        let out = apply_prune_delta_to_weights(&wm, &spec, &delta).unwrap();
-        assert!(!out.contains_key("blocks.1.attn.wq"), "old layer-1 name must be re-keyed");
-        // original layer-1 wq now lives at blocks.0.attn.wq
-        assert!(out.contains_key("blocks.0.attn.wq"));
-        assert_eq!(out["blocks.0.attn.wq"].shape, vec![8, 8]);
-        // non-vacuous: it must hold the ORIGINAL layer-1 bytes (base 10000), not layer-0's
-        // (base 0) — proves the re-key carried the surviving layer's data, not a stale copy.
-        let wq_f = read_f32(&out["blocks.0.attn.wq"]);
-        assert_eq!(wq_f[0], 10_000.0);
-        assert_eq!(wq_f[63], 10_063.0);
-        assert!(out.contains_key("embed"));
+        let out = apply_prune_delta_to_weights(&w, &spec, &delta).unwrap();
+        let names: Vec<&str> = out.iter().map(|e| e.name.as_str()).collect();
+        let want: Vec<&str> = w.order.iter().map(String::as_str).collect();
+        assert_eq!(names, want);
+    }
+
+    #[test]
+    fn dropping_a_layer_moves_every_tensor_of_the_layers_after_it() {
+        let spec = small_spec();
+        for bracket in [true, false] {
+            let w = small_weights(&spec, bracket);
+            let name = |l: u32, rest: &str| {
+                if bracket {
+                    format!("blocks[{l}].{rest}")
+                } else {
+                    format!("blocks.{l}.{rest}")
+                }
+            };
+            // Drop layer 0 entirely -> layer 1 becomes layer 0.
+            let delta = PruneDelta {
+                per_layer: vec![
+                    LayerDelta {
+                        layer: 0,
+                        pruned_heads: vec![],
+                        new_d_ff: None,
+                        drop_layer: true,
+                    },
+                    LayerDelta {
+                        layer: 1,
+                        pruned_heads: vec![],
+                        new_d_ff: None,
+                        drop_layer: false,
+                    },
+                ],
+            };
+            let out = apply_prune_delta_to_weights(&w, &spec, &delta).unwrap();
+            assert!(
+                out.iter()
+                    .all(|e| !e.name.contains("blocks[1]") && !e.name.contains("blocks.1.")),
+                "nothing may be left under the old layer-1 name"
+            );
+            // The projection holds the ORIGINAL layer 1's values (base 10000)...
+            let wq = read_f32(find(&out, &name(0, "attn.wq")));
+            assert_eq!((wq[0], wq[63]), (10_000.0, 10_063.0));
+            // ...and so do the norms, which the layer owns just as much: layer
+            // 1's scales were 2.0 and 2.5, the dropped layer's 1.0 and 1.5.
+            assert_eq!(
+                read_f32(find(&out, &name(0, "attn_norm.weight"))),
+                vec![2.0; 8]
+            );
+            assert_eq!(
+                read_f32(find(&out, &name(0, "ffn_norm.weight"))),
+                vec![2.5; 8]
+            );
+            // 13 per-layer tensors + embed + final norm.
+            assert_eq!(out.len(), 15);
+            assert_eq!(read_f32(find(&out, "norm.weight")), vec![9.0; 8]);
+        }
+    }
+
+    #[test]
+    fn a_tensor_for_a_layer_the_model_lacks_is_refused() {
+        let spec = small_spec();
+        let mut w = small_weights(&spec, false);
+        w.map
+            .insert(f32_entry("blocks.99.ffn.w_gate", vec![8, 6], &[0.0; 48]));
+        w.order.push("blocks.99.ffn.w_gate".into());
+        let delta = PruneDelta::for_spec(&spec);
+        let err = apply_prune_delta_to_weights(&w, &spec, &delta).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CepSliceError::UnknownLayer {
+                    layer: 99,
+                    n_layers: 2,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_delta_for_a_layer_the_model_lacks_is_refused() {
+        let spec = small_spec();
+        let w = small_weights(&spec, false);
+        let delta = PruneDelta {
+            per_layer: vec![LayerDelta {
+                layer: 99,
+                pruned_heads: vec![],
+                new_d_ff: Some(2),
+                drop_layer: false,
+            }],
+        };
+        let err = apply_prune_delta_to_weights(&w, &spec, &delta).unwrap_err();
+        assert!(
+            matches!(err, CepSliceError::UnknownLayer { layer: 99, .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn half_a_key_value_group_is_refused() {
+        let spec = small_spec();
+        let w = small_weights(&spec, false);
+        let delta = PruneDelta {
+            per_layer: vec![LayerDelta {
+                layer: 0,
+                pruned_heads: vec![0],
+                new_d_ff: None,
+                drop_layer: false,
+            }],
+        };
+        let err = apply_prune_delta_to_weights(&w, &spec, &delta).unwrap_err();
+        assert!(
+            matches!(err, CepSliceError::BadDelta { layer: 0, .. }),
+            "{err}"
+        );
+    }
+
+    /// 64 neurons with a large gate column and a zero `w_down` row contribute
+    /// nothing; the other 64 have a gate ten times smaller and live `w_up` and
+    /// `w_down`. Narrowing to 64 must keep the live ones. (Ranking by the gate
+    /// column alone keeps exactly the dead ones.)
+    #[test]
+    fn ffn_narrowing_keeps_live_neurons_over_dead_ones_with_large_gates() {
+        let spec = ModelSpec {
+            d_model: 2,
+            n_layers: 1,
+            n_heads: vec![1],
+            n_kv_heads: vec![1],
+            head_dim: vec![2],
+            d_ff: vec![128],
+            vocab: 4,
+            max_seq: 8,
+            batch: 1,
+            activation: Activation::SwiGlu,
+            norm: NormType::RmsNorm,
+            dtype_bytes: 4,
+            tied_lm_head: true,
+        };
+        let mut entries = std::collections::HashMap::new();
+        let mut order = Vec::new();
+        let mut put = |name: &str, shape: Vec<usize>, vals: Vec<f32>| {
+            entries.insert(name.to_string(), f32_entry(name, shape, &vals));
+            order.push(name.to_string());
+        };
+        put("blocks[0].attn.wq", vec![2, 2], vec![1.0; 4]);
+        put("blocks[0].attn.wk", vec![2, 2], vec![1.0; 4]);
+        put("blocks[0].attn.wv", vec![2, 2], vec![1.0; 4]);
+        put("blocks[0].attn.wo", vec![2, 2], vec![1.0; 4]);
+        // Columns 0..64: gate 10; columns 64..128: gate 1.
+        let gate: Vec<f32> = (0..2 * 128)
+            .map(|i| if i % 128 < 64 { 10.0 } else { 1.0 })
+            .collect();
+        put("blocks[0].ffn.w_gate", vec![2, 128], gate);
+        put("blocks[0].ffn.w_up", vec![2, 128], vec![1.0; 256]);
+        // Rows 0..64 zero; row j >= 64 holds the value j.
+        let down: Vec<f32> = (0..128 * 2)
+            .map(|i| if i / 2 < 64 { 0.0 } else { (i / 2) as f32 })
+            .collect();
+        put("blocks[0].ffn.w_down", vec![128, 2], down);
+        let w = CepWeights {
+            map: WeightMap::from_entries(entries),
+            order,
+            format: crate::cep_weights::WeightFormat::Nslm,
+        };
+        let delta = PruneDelta {
+            per_layer: vec![LayerDelta {
+                layer: 0,
+                pruned_heads: vec![],
+                new_d_ff: Some(64),
+                drop_layer: false,
+            }],
+        };
+        let out = apply_prune_delta_to_weights(&w, &spec, &delta).unwrap();
+        let down = read_f32(find(&out, "blocks[0].ffn.w_down"));
+        // Surviving rows are the original rows 64..128, in order.
+        let want: Vec<f32> = (64..128).flat_map(|j| [j as f32, j as f32]).collect();
+        assert_eq!(down, want);
+        assert!(
+            read_f32(find(&out, "blocks[0].ffn.w_gate"))
+                .iter()
+                .all(|&v| v == 1.0)
+        );
+    }
+
+    #[test]
+    fn safetensors_and_nslm_outputs_hold_the_same_tensors() {
+        let spec = small_spec();
+        let w = small_weights(&spec, true);
+        let out = apply_prune_delta_to_weights(&w, &spec, &PruneDelta::for_spec(&spec)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let st = dir.path().join("o.safetensors");
+        let nslm = dir.path().join("o.nslm");
+        write_sliced_weights(&out, &st).unwrap();
+        write_sliced_weights(&out, &nslm).unwrap();
+        let a = crate::cep_weights::load_weights(&st).unwrap();
+        let b = crate::cep_weights::load_weights(&nslm).unwrap();
+        // .nslm keeps the model's order; both hold identical bytes per name.
+        assert_eq!(b.order, w.order);
+        assert_eq!(a.map.len(), b.map.len());
+        for name in &w.order {
+            assert_eq!(
+                a.map.get(name).unwrap().data,
+                b.map.get(name).unwrap().data,
+                "{name}"
+            );
+            assert_eq!(
+                a.map.get(name).unwrap().shape,
+                b.map.get(name).unwrap().shape,
+                "{name}"
+            );
+        }
     }
 
     fn f32_entry(name: &str, shape: Vec<usize>, vals: &[f32]) -> WeightEntry {
@@ -531,7 +1007,10 @@ mod tests {
     }
 
     fn read_f32(e: &WeightEntry) -> Vec<f32> {
-        e.data.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()
+        e.data
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect()
     }
 
     #[test]
@@ -624,78 +1103,5 @@ mod tests {
             CepSliceError::ShapeMismatch { .. } => {}
             other => panic!("expected ShapeMismatch, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn ffn_survivors_rejects_truncated_data() {
-        // shape claims [2,4] (32 bytes) but only 6 floats (24 bytes) of data.
-        let w_gate = f32_entry("ffn.w_gate", vec![2, 4], &[0., 1., 2., 3., 4., 5.]);
-        assert!(ffn_survivors_by_magnitude(&w_gate, 4, 2).is_err());
-    }
-
-    #[test]
-    fn ffn_survivors_keep_highest_magnitude_columns() {
-        // w_gate [2, 4]: column L2 norms ~ [sqrt(0+0), sqrt(1+1), sqrt(9+9), sqrt(4+4)]
-        // = col0=0, col1=1.41, col2=4.24, col3=2.83. Keep top 2 -> cols {2, 3} (ascending).
-        let w_gate = f32_entry("ffn.w_gate", vec![2, 4], &[
-            0., 1., 3., 2.,
-            0., 1., 3., 2.,
-        ]);
-        let surv = ffn_survivors_by_magnitude(&w_gate, 4, 2).unwrap();
-        assert_eq!(surv, vec![2, 3]);
-    }
-
-    #[test]
-    fn ffn_survivors_full_width_is_identity() {
-        let w_gate = f32_entry("ffn.w_gate", vec![2, 3], &[1., 2., 3., 4., 5., 6.]);
-        assert_eq!(ffn_survivors_by_magnitude(&w_gate, 3, 3).unwrap(), vec![0, 1, 2]);
-    }
-
-    // Regression: precompute loop previously panicked at `spec.d_ff[l as usize]`
-    // when `delta.per_layer` carried an out-of-range layer AND the WeightMap
-    // happened to contain `blocks.{l}.ffn.w_gate` for that index. The drop-flag
-    // pass (line ~229) and the main slicing loop (line ~267) both silently skip
-    // out-of-range `l`; the precompute now matches that convention.
-    #[test]
-    fn precompute_skips_out_of_range_layer_in_delta() {
-        let spec = small_spec(); // n_layers=2, d_ff.len()=2
-        let mut wm_entries = std::collections::HashMap::new();
-        // Reuse the standard small-weights generator then inject a stray
-        // `blocks.99.ffn.w_gate` so the wm.get() lookup in the precompute would
-        // succeed and reach the formerly-unguarded `spec.d_ff[99]` access.
-        let base_wm = small_weights(&spec);
-        for (k, v) in base_wm.entries() {
-            wm_entries.insert(k.clone(), v.clone());
-        }
-        let stray_dm = spec.d_model as usize;
-        let stray_dff = spec.d_ff[0] as usize;
-        let stray_vals: Vec<f32> = (0..(stray_dm * stray_dff))
-            .map(|i| 99_000.0 + i as f32)
-            .collect();
-        wm_entries.insert(
-            "blocks.99.ffn.w_gate".to_string(),
-            f32_entry("blocks.99.ffn.w_gate", vec![stray_dm, stray_dff], &stray_vals),
-        );
-        let wm = WeightMap::from_entries(wm_entries);
-
-        let delta = PruneDelta {
-            per_layer: vec![
-                // The out-of-range delta — would have panicked at `spec.d_ff[99]`.
-                LayerDelta { layer: 99, pruned_heads: vec![], new_d_ff: Some(2), drop_layer: false },
-                // A real in-range layer so the rest of the orchestrator still produces output.
-                LayerDelta { layer: 0, pruned_heads: vec![], new_d_ff: Some(4), drop_layer: false },
-            ],
-        };
-
-        let out = apply_prune_delta_to_weights(&wm, &spec, &delta)
-            .expect("must not panic on out-of-range layer in delta");
-
-        // The in-range slicing still happens (layer 0 FFN narrowed 6 -> 4).
-        assert_eq!(out["blocks.0.ffn.w_gate"].shape, vec![8, 4]);
-        // The stray tensor is untouched by the precompute (no survivor set is
-        // computed for layer 99) and the main slicing loop's guard at line ~267
-        // also skips it; the orchestrator's parse_layer_tensor path simply
-        // never reaches `slice_one` for layer 99, so it's omitted from output.
-        assert!(!out.contains_key("blocks.99.ffn.w_gate"));
     }
 }

@@ -105,7 +105,7 @@ pub fn analysis_to_wrga_inputs(
             .map(|c| WrgaDecoratorConfig {
                 mode: c.block.mode,
                 budget: c.block.budget,
-                target: None, // Symbol->string resolution happens at codegen if needed
+                target: c.target_name.clone(),
                 layers: c.block.layers.clone(),
                 custom_adapter: c.adapter_name.clone(),
             })
@@ -141,6 +141,7 @@ pub fn analysis_to_wrga_inputs(
             })
             .collect(),
         ablation: Default::default(),
+        adapters_inherited: false,
     };
     apply_wrga_check_overrides(&mut inputs, ctx);
     inputs

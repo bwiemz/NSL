@@ -6,7 +6,7 @@
 ## Version History
 - **v0.1.0** (2026-03-12): Core language, tensors, autodiff, models, training DSL, GPU/CUDA
 - **v0.2.0** (2026-03-15): Inference-focused release — PagedAttention, FlashAttention, continuous batching, plus early tensor-parallel and graph-fusion work
-- **v0.9.0** (current): Most M9-M62 compiler/runtime features have landed — FlashAttention-3 scaffolding, 50+ AD rules, speculative decoding core with lookahead plus tree-method scaffolding, Blackwell quantization scaffolding (MXFP8/NVFP4 helpers and runtime quantizers), FBIP in-place mutation, effect polymorphism, format-agnostic @layout sparsity, fusion analysis/profitability scaffolding, two-tier WCET, Jolt ZK lookup-native, rematerialization, SharedMem pipeline comm, C API forward pass, x86_64 unikernel boot-stub generation, and tuple/list `*rest` destructuring in pattern bindings. Some subsystems still retain deferred or fallback-only paths (for example RDMA ibverbs wiring, GDS cuFile integration, partial tree-method speculative serving, and several backend-specific runtime paths).
+- **v0.9.0** (current): Most M9-M62 compiler/runtime features have landed — FlashAttention-3 scaffolding, 50+ AD rules, speculative decoding core with lookahead plus tree-method scaffolding, Blackwell quantization scaffolding (MXFP8/NVFP4 helpers and runtime quantizers), FBIP in-place mutation, effect polymorphism, fusion analysis/profitability scaffolding, two-tier WCET, Jolt ZK lookup-native, rematerialization, SharedMem pipeline comm, C API forward pass, x86_64 unikernel boot-stub generation, and tuple/list `*rest` destructuring in pattern bindings. Some subsystems still retain deferred or fallback-only paths (for example RDMA ibverbs wiring, GDS cuFile integration, partial tree-method speculative serving, and several backend-specific runtime paths).
 
 ## Codebase Size
 - ~131,800 lines of Rust across 285 files in 8 crates
@@ -43,7 +43,7 @@ All complete and shipped in v0.1.0.
 | M15-M16 | Data pipeline, tokenization | Production | DataLoader, BPE tokenizer |
 | M17 | GPU/CUDA + kernel keyword | Production | 15 PTX kernels, cudarc 0.19 |
 | M18 | Interop (ONNX, SafeTensors, HuggingFace) | Production | SafeTensors I/O, ONNX export, HF model loading |
-| M21-M22 | INT4/INT8 quantization | Production | Per-tensor/channel/group, AWQ, GPTQ (full OBQ) |
+| M21-M22 | INT4/INT8 quantization | Functional | `quant` block: per-tensor/channel/group round-to-nearest into a dequantized f32 copy of the model (no packed inference). `awq4`/`gptq4`/`gptq8` blocks are refused |
 
 ### Production Inference (M23-M31) — MOSTLY SHIPPED
 Core inference milestones shipped in v0.2.0, with later auditing showing M30-M31 remain more functional/partial than fully productionized.
@@ -67,7 +67,7 @@ Core inference milestones shipped in v0.2.0, with later auditing showing M30-M31
 | M32 | Mixture of Experts | Functional | @moe decorator, router, dispatch, aux loss, expert parallel FFI (all-to-all stub) |
 | M33 | Speculative Decoding | Functional | DraftModelRunner (524 LOC), Lookahead n-gram decoding, rejection sampling (greedy + stochastic), tree attention masks; EAGLE-2/Medusa tree-method plumbing remains partial |
 | M34 | Ring Attention | Functional | @context_parallel extraction, ring comm basic |
-| M35 | FP8/AWQ/GPTQ Quantization | **Production** | E4M3/E5M2, H100 MMA PTX, calibration, AWQ 4-bit, **GPTQ full OBQ** (Hessian-based error compensation, Cholesky inverse, act-order, blocked updates) |
+| M35 | FP8 compute; 4-bit weight routines | Partial | FP8 E4M3/E5M2 (`@fp8_compute`, H100 MMA PTX) is reachable from NSL. The 4-bit routines are runtime library code that no NSL program reaches: the one named AWQ is per-group round-to-nearest with no activation-aware scaling, and GPTQ (act-order, blocked updates, Cholesky factor of the inverse Hessian) is tested against a NumPy reference. `@quantize` is refused in every form: its one accepted dtype, `awq4`, drove a calibration pass whose output nothing read, and that pass is deleted |
 
 ### Compiler Analysis (M36-M40) — FUNCTIONAL TO PRODUCTION
 
@@ -84,7 +84,7 @@ Core inference milestones shipped in v0.2.0, with later auditing showing M30-M31
 | Milestone | Feature | Status | Notes |
 |-----------|---------|--------|-------|
 | M41 | Disaggregated Inference | Functional | Router, KV transfer (KVXF format), **real prefill/decode worker loops**, NVLink/TCP transport backends, auto-detection, CUDA IPC GPU-direct, PCI bus scan; RDMA backend currently falls back to TCP until ibverbs is wired |
-| M42 | KV Compression | Functional | INT8/INT4/FP8 quantization, H2O eviction, sliding window |
+| M42 | KV Compression | Library only | INT8/INT4/FP8 block quantizers exist as runtime routines. The paged KV cache stores K and V uncompressed and calls none of them; `@kv_compress` is refused. The H2O and sliding-window eviction managers had no caller and were removed |
 | M43 | Pipeline Parallelism | **Functional** | Config parsed, 1F1B/GPipe schedules, SharedMemPipeline backend with mailbox pattern, condvar signaling |
 | M44 | Constrained Decoding | Functional | Thompson NFA → DFA → Hopcroft minimize, token alignment, logit masking |
 
@@ -97,14 +97,14 @@ Core inference milestones shipped in v0.2.0, with later auditing showing M30-M31
 | M47 | Multi-Backend | Framework | PTX production; AMDGPU/Metal/WGSL generate plausible code but untested on real hardware |
 | M48 | Multimodal | Functional | Patch embed, mel spectrogram, cross-attention config |
 | M49 | Shape Algebra | Functional | Symbolic solver, Fourier-Motzkin constraints, range bounds |
-| M50 | Sparse Tensors | **Production** | COO/CSR/CSC/BSR, SpMV/SpMM, TACO merge lattices, **@layout format-agnostic annotations**, level format composition, concrete index notation lowering |
+| M50 | Sparse Tensors | Removed | Removed in 2026-11; preserved at tag `attic/sparse-tensors-2026-11`. Nothing could construct a `Sparse<...>` value, so the type, its codegen, the COO/CSR/CSC/BSR runtime library and its kernels were unreachable. `Sparse<...>` and `@layout` are refused with the tag; `@sparse` is refused |
 | M51 | Effect System | **Production** | 4 effects (IO, Random, Mutation, Communication), bitset tracking, @pure/@deterministic, effect polymorphism (Effect::Var, Effect::Union, substitute, unification) |
 
 ### Weight Intelligence & Frontier (M52-M55) — FUNCTIONAL TO PRODUCTION
 
 | Milestone | Feature | Status | Notes |
 |-----------|---------|--------|-------|
-| M52 | Weight-Aware Compilation | Production | SafeTensors loading, constant folding, dead weight elimination, sparsity detection |
+| M52 | Weight-Aware Compilation | Functional | SafeTensors loading, constant folding, dead weight elimination, sparsity detection (a report only: every matmul is dense) |
 | M53 | WCET Proofs | **Production** | Two-tier model: GPU statistical bounds + FPGA certified path (wcet_matmul_fpga_certified, wcet_elementwise_fpga_certified), DO-178C reporting |
 | M54 | Unikernels | **Functional** | Config, linker script, boot config, **x86_64 boot stub** (Multiboot2, GDT, page tables, SSE/AVX), **bump allocator**, serial console, **PCI GPU discovery** (VFIO + direct), ELF image builder |
 | M55 | ZK Inference | **Functional** | **AST-to-ZkDag** compilation, IR lowering, witness gen, **Jolt lookup-native gates**, **folding proofs** (sumcheck + Fiat-Shamir), Mersenne-31 field, **INT8→M31 mapping**, **CLI pipeline** (build/verify/stats); Halo2/Plonky3 backend coverage remains partial |
@@ -141,11 +141,11 @@ This list includes both production-ready features and higher-value functional su
 5. **Models**: model keyword, parameter management, serialization (.nslm), @shared weights
 6. **Training**: train block, 6 optimizers, 7 schedulers, loss functions, gradient checkpointing, **resumable training state** (`.optim` sidecar v2, item 8 2026-08-19: θ + AdamW moments + step counter + training/loader epoch + loader delivery slot + corpus fingerprint + RNG streams — a resumed run continues the data order and the dropout masks, and refuses a corpus/geometry mismatch)
 7. **GPU**: 15+ PTX kernels, .to(cuda), kernel keyword, FlashAttention-3 scaffolding with Hopper-specific wgmma/TMA work still partially placeholder
-8. **Quantization**: INT4/8, FP8 E4M3/E5M2 (H100 MMA), AWQ, GPTQ (full OBQ with Hessian-based error compensation)
+8. **Quantization**: INT4/8 `quant` blocks (round-to-nearest, dequantized copy), FP8 E4M3/E5M2 (H100 MMA). AWQ-named and GPTQ 4-bit routines exist in the runtime and are not reachable from NSL source
 9. **Inference serving**: PagedAttention (CoW), continuous batching, chunked prefill, speculative decoding core with Lookahead plus partial EAGLE-2/Medusa tree-method scaffolding
 10. **Disaggregated inference**: Prefill/decode worker separation, NVLink/TCP KV transfer, RDMA backend scaffold with TCP fallback, auto-detection
 11. **Optimization**: Fusion analysis/pattern detection (elementwise + epilogue + reduction), multi-level cache cost model, memory planning
-12. **Sparse tensors**: Format-agnostic @layout, TACO merge lattices, COO/CSR/CSC/BSR, GPU SpMM/SpMV
+12. **Sparse tensors**: removed in 2026-11 (tag `attic/sparse-tensors-2026-11`); the weight-aware sparsity report remains
 13. **Weight-aware compilation**: Constant folding, dead weight elimination, sparsity-aware codegen, scaling fusion
 14. **Interop**: C API (real forward pass), DLPack, SafeTensors, ONNX export, HuggingFace loading
 15. **ZK circuits**: AST-to-ZkDag, Jolt lookup-native gates, folding proofs (sumcheck + Fiat-Shamir), Mersenne-31 field, CLI pipeline

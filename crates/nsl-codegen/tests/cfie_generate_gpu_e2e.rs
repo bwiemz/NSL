@@ -419,6 +419,7 @@ fn setup_engine() -> String {
             vocab_tile: 128,
             top_k: TOP_K,
             grammar_states: 0,
+            norm_eps: 1e-5,
         },
     );
     let rc = nsl_cfie_register_kernel(

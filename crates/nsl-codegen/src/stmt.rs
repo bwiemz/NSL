@@ -143,8 +143,7 @@ pub(crate) fn resolvable_tensor_rank(ty: &Type) -> Option<usize> {
     let rank = match inner {
         Type::Tensor { shape, .. }
         | Type::Param { shape, .. }
-        | Type::Buffer { shape, .. }
-        | Type::Sparse { shape, .. } => shape.rank(),
+        | Type::Buffer { shape, .. } => shape.rank(),
         _ => return None,
     };
     if rank == 0 {
@@ -162,6 +161,20 @@ pub(crate) fn resolvable_tensor_rank(ty: &Type) -> Option<usize> {
 /// `compile_assign` with the same failure mode. v8 ships with a single
 /// canonical key (`source`); future keys should land in both places.
 const DATA_SECTION_KEYS: &[&str] = &["source"];
+
+/// Why a packed batch may not reach segment-masked `@flash_attention`
+/// training kernels. One text for the compile-time refusal at the
+/// `DataLoader(packing = true)` call and for the run-time one in the train
+/// block's batch prologue.
+pub(crate) const PACKED_BATCH_TO_MASKED_CSHA_MESSAGE: &str =
+    "a packed batch cannot be fed to this module's `@flash_attention` training \
+     kernels. A `dataset` block with `packing = true` made those kernels \
+     segment-masked; they read segment ids as 16-bit integers and document starts \
+     as 32-bit integers, and the loader stores both as 32-bit floats, so they \
+     would mask on reinterpreted bits. Packed attention is supported through \
+     `GroupedQueryAttention.forward_packed(x, batch.segment_ids, \
+     batch.position_ids, training)`: use it and drop `packing = true` from the \
+     dataset block, or drop `packing = true` from the DataLoader";
 
 /// Returns true iff `stmt` is a `data:` section config pair of the form
 /// `<allowlisted-key> = <expr>` (plain `Assign`, plain ident target). These
@@ -291,6 +304,40 @@ impl Compiler<'_> {
                             builder.ins().iconst(cl_types::I64, 0)
                         };
 
+                        // `let t = t0`, both tensors: the new name is a second
+                        // OWNER of the tensor (it is swept, and freed on
+                        // rebind, like any other tensor local), so it takes
+                        // its own reference -- as `t = t0` already does in
+                        // `compile_assign`. Without the retain two owning
+                        // names shared one reference: the teardown sweep
+                        // freed the tensor once per name (`free(): double
+                        // free detected` at exit when a train or distill
+                        // block had used it), and an in-place op on one name
+                        // could overwrite the other, since the tensor looked
+                        // uniquely owned. A source that is itself a borrow
+                        // (a parameter, a view of a field) stays a borrow:
+                        // `update_non_owning_binding` below marks the new
+                        // name non-owning and nothing frees it.
+                        if let Some(expr) = value
+                            && let Some(source) = Self::bare_ident(expr)
+                            && self.node_type(expr.id).is_tensor()
+                            && builder.func.dfg.value_type(init_val) == cl_types::I64
+                            && state.variables.contains_key(&source)
+                            && !state.param_symbols.contains(&source)
+                            && !state.non_owning_symbols.contains(&source)
+                            && !state.borrowed_batch_symbols.contains(&source)
+                            && !state.flags.in_dtype_method
+                            // Under linear types the binding MOVES the
+                            // tensor: the source gives its reference up.
+                            && state.ownership.lowering.is_none()
+                        {
+                            let _ = self.compile_call_by_name(
+                                builder,
+                                "nsl_tensor_retain",
+                                &[init_val],
+                            );
+                        }
+
                         let cl_type = if let Some(expr) = value {
                             let nsl_ty = self.node_type(expr.id).clone();
                             // When the semantic pass returns Error/Unknown, fall back
@@ -369,23 +416,6 @@ impl Compiler<'_> {
                             state.dataloader_symbols.remove(&sym);
                         }
                         self.update_non_owning_binding(state, sym, value.as_ref());
-
-                        // M50: Track sparse tensor variables for end-to-end dispatch.
-                        // The TYPE decides. This also used to treat the result
-                        // of any call whose callee's name contained "sparse"
-                        // (or was `from_dense`) as a sparse tensor, so a dense
-                        // tensor returned by a user function called
-                        // `make_sparse_like` was handed to
-                        // `nsl_sparse_to_dense` at its first `+` and the
-                        // program aborted in the allocator.
-                        if let Some(expr) = value
-                            && matches!(
-                                self.node_type(expr.id),
-                                nsl_semantic::types::Type::Sparse { .. }
-                            )
-                        {
-                            state.ownership.sparse_vars.insert(sym);
-                        }
 
                         // Free intermediate tensor temporaries (keep init_val which is now owned by the variable)
                         self.free_tensor_temporaries(builder, state, Some(init_val));
@@ -1161,6 +1191,16 @@ impl Compiler<'_> {
             }
         }
         inserted
+    }
+
+    /// The symbol an expression names when it is a bare identifier, through
+    /// any parentheses.
+    fn bare_ident(expr: &nsl_ast::expr::Expr) -> Option<nsl_ast::Symbol> {
+        match &expr.kind {
+            nsl_ast::expr::ExprKind::Ident(sym) => Some(*sym),
+            nsl_ast::expr::ExprKind::Paren(inner) => Self::bare_ident(inner),
+            _ => None,
+        }
     }
 
     /// ELTLS (spec §6.5): clear a tensor-typed variable's old value before
@@ -2464,6 +2504,20 @@ impl Compiler<'_> {
         // together — the packer emits them as a pair.
         builder.switch_to_block(has_seg_block);
         builder.seal_block(has_seg_block);
+        // The pointers stashed below are read only by segment-masked CSHA
+        // kernels, which load segment ids as 16-bit integers and document
+        // starts as 32-bit integers. The loader stores both as 32-bit
+        // floats (and leaves `doc_starts` on the host), so a masked kernel
+        // would mask on reinterpreted bits. `DataLoader(packing = true)` is
+        // refused at compile time in a module that has such kernels
+        // (`expr/calls.rs`); this is the same refusal for a packed batch
+        // that reaches the train block some other way.
+        if self.module_has_segment_masked_csha_kernels() {
+            let no = builder.ins().iconst(cl_types::I8, 0);
+            self.intern_string(PACKED_BATCH_TO_MASKED_CSHA_MESSAGE)?;
+            let msg = self.compile_string_literal(builder, PACKED_BATCH_TO_MASKED_CSHA_MESSAGE)?;
+            self.compile_call_by_name(builder, "nsl_assert", &[no, msg])?;
+        }
         let seg_tensor =
             self.compile_call_by_name(builder, "nsl_dict_get_str", &[batch_val, k_seg])?;
         let k_doc = self.compile_string_literal(builder, "doc_starts")?;
@@ -2519,17 +2573,32 @@ impl Compiler<'_> {
         // Gated on the ACTUAL synthesized config so non-packed training
         // (the common case) never sees this call. has_seg is the
         // nsl_dict_contains("segment_ids") i64 result from above.
-        let module_is_masked = self
-            .kernels
+        if self.module_has_segment_masked_csha_kernels() {
+            // `nsl_dict_contains` returns an i8 and this takes an i64. The
+            // i8 used to be passed as it was, which Cranelift's verifier
+            // rejects: a module with segment-masked kernels and a train
+            // block that reads any DataLoader failed to compile with an
+            // internal "failed to define main" error.
+            let had_segments = builder.ins().uextend(cl_types::I64, has_seg);
+            self.compile_call_by_name(
+                builder,
+                "nsl_pca_packing_mismatch_check",
+                &[had_segments],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Whether kernel synthesis built segment-masked CSHA training kernels
+    /// for this module (a train block whose `dataset` declares
+    /// `packing = true`, on a model with `@flash_attention`).
+    pub(crate) fn module_has_segment_masked_csha_kernels(&self) -> bool {
+        self.kernels
             .flash_attention_context
             .as_ref()
             .and_then(|c| c.csha_training_config.as_ref())
             .map(|cfg| cfg.segment_masked)
-            .unwrap_or(false);
-        if module_is_masked {
-            self.compile_call_by_name(builder, "nsl_pca_packing_mismatch_check", &[has_seg])?;
-        }
-        Ok(())
+            .unwrap_or(false)
     }
 
     pub(crate) fn free_wengert_owned_values(
@@ -2884,9 +2953,6 @@ impl Compiler<'_> {
         // `adapter_field_index`.
         for site in self.bus.adapter_sites() {
             if site.target_model != type_name {
-                continue;
-            }
-            if site.input_dim == 0 || site.output_dim == 0 {
                 continue;
             }
             for synth in &site.synthesized_fields {

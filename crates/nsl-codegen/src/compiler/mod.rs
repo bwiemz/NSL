@@ -184,12 +184,14 @@ pub struct ModelMetadata {
     pub paged_kv_configs: HashMap<String, (i64, i64, i64, i64, i64)>,
     /// Model method AST bodies for source AD inlining: model_type_name -> method_name -> FnDef
     pub model_method_bodies: HashMap<String, HashMap<String, nsl_ast::decl::FnDef>>,
-    /// B.2.1 Task 5.5: shape strings (`Tensor<[out, in], dtype>`) for
-    /// Tensor-typed model fields whose initializer carries a literal
-    /// shape (e.g. `w: Tensor = zeros([8, 8])`). Stored separately from
-    /// `model_field_types` so source-AD's sub-model traversal does not
-    /// accidentally treat tensor shapes as nested model types. Consumed
-    /// by `wrga_adapter_inject::resolve_dims_for_target`.
+    /// B.2.1 Task 5.5: shape strings (`Tensor<[d0, d1], dtype>`, the two
+    /// dims in declaration order) for Tensor-typed model fields whose
+    /// initializer carries a literal shape (e.g. `w: Tensor = zeros([8,
+    /// 8])`). Stored separately from `model_field_types` so source-AD's
+    /// sub-model traversal does not accidentally treat tensor shapes as
+    /// nested model types. Consumed by
+    /// `wrga_adapter_inject::resolve_sites`, which decides which dim is the
+    /// input width from how the model's matmul uses the weight.
     pub model_tensor_field_shapes: HashMap<String, HashMap<String, String>>,
     /// CFTP v10 (item 5): declared tensor rank of `model.field` weight
     /// declarations, keyed as `model_name -> field_name -> rank`.
@@ -487,8 +489,6 @@ pub struct FeatureConfigs {
     pub moe_configs: HashMap<String, crate::moe::MoeInfo>,
     /// M33: Speculative decoding configs — "ModelName.layer_name" → SpeculativeInfo
     pub speculative_configs: HashMap<String, crate::speculative::SpeculativeInfo>,
-    /// M42: Per-model KV compression policies from @kv_compress decorators.
-    pub kv_compress_policies: HashMap<String, Vec<KvCompressPolicy>>,
     /// M44: Compiled grammar FSMs from @grammar decorators and generate() schema= args.
     pub grammar_configs: HashMap<String, GrammarInfo>,
 
@@ -519,8 +519,6 @@ pub struct FeatureConfigs {
     /// Populated during codegen; used by the CLI to finalize wrapper functions
     /// in the shared-lib object file.
     pub export_wrappers: Vec<crate::c_wrapper::ExportWrapper>,
-    /// M35: Model quantization configs — "ModelName" -> QuantConfig
-    pub quant_configs: HashMap<String, QuantConfig>,
 
     // ── Ownership & Safety (M38, M39, M40) ───────────────────────────
     /// M38b: Whether --linear-types flag is active
@@ -562,6 +560,11 @@ pub struct FeatureConfigs {
     pub sparsity_hints: HashMap<NodeId, crate::weight_aware::SparsityHint>,
     /// M52: Weight integrity hash for embedding in .rodata
     pub weight_integrity: Option<crate::weight_aware::WeightIntegrity>,
+    /// The program is bound to the weights file (`weight_bind.rs`); copied
+    /// from the options when the compile starts, in every module of a build.
+    pub weight_binding: Option<crate::weight_aware::WeightBinding>,
+    /// Weight-aware report lines already printed, so each is said once.
+    pub weight_notes: std::collections::HashSet<String>,
 }
 
 impl FeatureConfigs {
@@ -582,13 +585,11 @@ impl FeatureConfigs {
             muon_state_bf16: options.muon.state_bf16,
             moe_configs: HashMap::new(),
             speculative_configs: HashMap::new(),
-            kv_compress_policies: HashMap::new(),
             grammar_configs: HashMap::new(),
             fp8_compute_fns: HashSet::new(),
             fp8_compute_methods: HashSet::new(),
             export_functions: Vec::new(),
             export_wrappers: Vec::new(),
-            quant_configs: HashMap::new(),
             linear_types_enabled: options.linear_types_enabled,
             ownership_info: options.analysis.ownership_info.clone(),
             vmap_configs: HashMap::new(),
@@ -599,6 +600,8 @@ impl FeatureConfigs {
             weight_map: None,
             sparsity_hints: HashMap::new(),
             weight_integrity: None,
+            weight_binding: None,
+            weight_notes: std::collections::HashSet::new(),
         }
     }
 }
@@ -685,6 +688,12 @@ pub struct Compiler<'a> {
     /// parameter escapes = the historical blanket refusal) until
     /// `build_escape_analysis` runs.
     pub escape: crate::escape::EscapeAnalysis,
+    /// The undecorated free functions of the module being compiled, by
+    /// name: the bodies source AD inlines when a `train`, `distill` or
+    /// `grad` block calls one (see `WengertExtractor::set_user_fn_bodies`).
+    /// Decorated functions are left out on purpose: inlining one would drop
+    /// whatever its decorator does. Filled by `compile_user_functions`.
+    pub free_fn_bodies: HashMap<String, nsl_ast::decl::FnDef>,
 
     // ── Type system ──────────────────────────────────────────────────
     pub types: TypeRegistry,
@@ -1052,6 +1061,10 @@ pub struct Compiler<'a> {
     /// baked into each GatedLoRA call site's `kernel_handle` arg.
     pub fused_gatedlora_ptx_kernels:
         std::collections::HashMap<crate::wrga_fused_ptx::LoraKernelKey, String>,
+    /// Deduplicated fused-IA³ PTX kernel cache, keyed like the two above
+    /// with `rank = 0`. Its registration handles follow the gated-LoRA ones.
+    pub fused_ia3_ptx_kernels:
+        std::collections::HashMap<crate::wrga_fused_ptx::LoraKernelKey, String>,
     pub synth_call_names: std::collections::HashMap<nsl_ast::NodeId, String>,
 
     // ── Calibration retention pass (Task 4) ─────────────────────
@@ -1104,26 +1117,10 @@ pub struct Compiler<'a> {
     pub weight_index_map: HashMap<NodeId, usize>,
 }
 
-/// Quantization configuration for a model.
-#[derive(Debug, Clone)]
-pub struct QuantConfig {
-    pub dtype: String, // "awq4", "gptq4", "gptq8"
-    pub group_size: i64,
-}
-
 /// M44: Codegen-side grammar configuration.
 pub struct GrammarInfo {
     pub start_rule: String,
     pub grammar_source: String, // "json_schema", "bnf", "regex"
-}
-
-/// M42: Codegen-side KV compression config.
-pub struct KvCompressPolicy {
-    pub method: String,
-    pub scheme: u8,
-    pub window: usize,
-    pub sinks: usize,
-    pub budget: usize,
 }
 
 /// Mangle a function name with a module prefix for unique Cranelift symbols.
@@ -1225,6 +1222,7 @@ impl<'a> Compiler<'a> {
             passes: crate::pass_manager::PassManager::begin(),
             registry: FunctionRegistry::new(),
             escape: crate::escape::EscapeAnalysis::disabled(),
+            free_fn_bodies: HashMap::new(),
             types: TypeRegistry::new(),
             models: ModelMetadata::new(),
             module_prefix: String::new(),
@@ -1285,6 +1283,7 @@ impl<'a> Compiler<'a> {
             csha_forward_saves: std::collections::HashMap::new(),
             fused_ptx_kernels: std::collections::HashMap::new(),
             fused_gatedlora_ptx_kernels: std::collections::HashMap::new(),
+            fused_ia3_ptx_kernels: std::collections::HashMap::new(),
             synth_call_names: std::collections::HashMap::new(),
             retention_arena_data_id: None,
             retention_offsets: std::collections::HashMap::new(),
@@ -1499,21 +1498,6 @@ impl<'a> Compiler<'a> {
     pub(crate) fn cuda_sm(&self) -> Option<u32> {
         crate::gpu_target::CompileTarget::resolve(&self.compile_options.target)
             .and_then(crate::gpu_target::CompileTarget::cuda_sm)
-    }
-
-    /// M42: Look up the first KV compression policy for a specific model layer.
-    /// Key format: `"ModelName.layer_name"` (matches collection.rs insertion key).
-    /// Returns `None` when no `@kv_compress` decorator was found for that layer.
-    pub fn kv_compress_for_layer(
-        &self,
-        model_name: &str,
-        layer_name: &str,
-    ) -> Option<&KvCompressPolicy> {
-        let key = format!("{}.{}", model_name, layer_name);
-        self.features
-            .kv_compress_policies
-            .get(&key)
-            .and_then(|policies| policies.first())
     }
 
     /// Allocate a unique function index for Cranelift.
