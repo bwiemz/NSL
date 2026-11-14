@@ -875,7 +875,9 @@ fn plan_train_block(
         // The shapes of this block's model, read off the tape just
         // extracted (the same derivation the in-place planner makes on the
         // codegen-time tape).
-        let model_geometry = compiler.wggo_model_geometry(&extractor);
+        let trained_paths = compiler
+            .enumerate_model_tensor_paths(&compiler.resolve_sym(model_sym).to_string(), &model_type_name);
+        let model_geometry = compiler.wggo_model_geometry(&extractor, Some(&trained_paths));
         let sched = compiler.passes.scheduler();
         let scheduled = match sched.schedule("WGGO", None, || {
             crate::wggo::run_on_wengert_with_weights(

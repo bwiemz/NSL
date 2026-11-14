@@ -359,30 +359,9 @@ fn train_block_layer_count(
     train_block: Option<&nsl_ast::block::TrainBlock>,
     applied_plan: Option<&crate::wggo_apply::AppliedPlan>,
 ) -> Option<u32> {
-    use nsl_semantic::types::Type;
-    let from_model = train_block.and_then(|train| {
-        let arg = train
-            .config
-            .iter()
-            .find(|a| a.name.is_some_and(|n| compiler.resolve_sym(n) == "model"))?;
-        let nsl_ast::expr::ExprKind::Ident(sym) = &arg.value.kind else {
-            return None;
-        };
-        let type_name = compiler
-            .models
-            .model_var_types
-            .get(sym)
-            .cloned()
-            .or_else(|| match compiler.type_map.get(&arg.value.id) {
-                Some(Type::Model { name, .. }) | Some(Type::Struct { name, .. }) => {
-                    Some(compiler.resolve_sym(*name).to_string())
-                }
-                _ => None,
-            })?;
-        let var_name = compiler.resolve_sym(*sym).to_string();
-        let paths = compiler.enumerate_model_tensor_paths(&var_name, &type_name);
-        crate::cpdt_sensitivity::layer_count(paths.iter().map(String::as_str))
-    });
+    let from_model = train_block
+        .and_then(|train| train_block_param_paths(compiler, train))
+        .and_then(|paths| crate::cpdt_sensitivity::layer_count(paths.iter().map(String::as_str)));
     from_model.or_else(|| {
         let plan = applied_plan?;
         // A layer name is a bare prefix (`blocks.3`); `layer_count` reads
@@ -394,6 +373,37 @@ fn train_block_layer_count(
             .collect();
         crate::cpdt_sensitivity::layer_count(names.iter().map(String::as_str))
     })
+}
+
+/// The trained tensor parameters of the model a train block names in its
+/// header, as `<model variable>.<field path>`: the walk that builds the
+/// runtime parameter list. `None` when the header's `model` is not a plain
+/// variable or its type cannot be resolved here.
+pub(crate) fn train_block_param_paths(
+    compiler: &crate::compiler::Compiler,
+    train: &nsl_ast::block::TrainBlock,
+) -> Option<Vec<String>> {
+    use nsl_semantic::types::Type;
+    let arg = train
+        .config
+        .iter()
+        .find(|a| a.name.is_some_and(|n| compiler.resolve_sym(n) == "model"))?;
+    let nsl_ast::expr::ExprKind::Ident(sym) = &arg.value.kind else {
+        return None;
+    };
+    let type_name = compiler
+        .models
+        .model_var_types
+        .get(sym)
+        .cloned()
+        .or_else(|| match compiler.type_map.get(&arg.value.id) {
+            Some(Type::Model { name, .. }) | Some(Type::Struct { name, .. }) => {
+                Some(compiler.resolve_sym(*name).to_string())
+            }
+            _ => None,
+        })?;
+    let var_name = compiler.resolve_sym(*sym).to_string();
+    Some(compiler.enumerate_model_tensor_paths(&var_name, &type_name))
 }
 
 /// `grad_accumulation = N` from a train block's header, when it is an

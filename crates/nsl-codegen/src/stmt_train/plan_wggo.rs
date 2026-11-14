@@ -187,7 +187,11 @@ impl Compiler<'_> {
                     self.features.dataset_packing_stats.clone(),
                     // The shapes of THIS block's model, read off the tape
                     // the plan is made for.
-                    self.wggo_model_geometry(extractor),
+                    self.wggo_model_geometry(
+                        extractor,
+                        crate::stmt_pass_bridges::train_block_param_paths(self, train)
+                            .as_deref(),
+                    ),
                 )
                 .map_err(|e| {
                     e.with_span_if_unset(crate::wggo_prepass::model_arg_span(

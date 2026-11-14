@@ -13,10 +13,27 @@
 //! types of the step's inputs, and the batch shape a proven `DataLoader`
 //! yields, propagated through the tape by
 //! [`crate::transient_arena::propagate_size_info`]. Nothing is assumed: a
-//! parameter, a matrix product or an attention call whose shape the
-//! propagation cannot prove makes [`derive`] return [`ShapeUnknown`], and
-//! the caller then declines to plan instead of substituting a layer that is
-//! not the model's.
+//! trainable parameter, a product with a weight, a normalisation or an
+//! attention query whose shape the propagation cannot prove makes
+//! [`derive`] return [`ShapeUnknown`], and the caller then declines to plan
+//! instead of substituting a layer that is not the model's.
+//!
+//! What is read, and what is not:
+//!
+//! * Parameters are the trainable ones (`stmt::is_trainable_param_leaf_name`):
+//!   they are what the optimizer holds moments for. Buffers and one-element
+//!   config fields (`_cos_table`, `_n_heads`) are on the tape as parameters
+//!   but are not counted.
+//! * A matrix product is recorded when one operand is a weight (a parameter,
+//!   possibly through a transpose or reshape). The products of two
+//!   activations inside attention (QKᵀ, AV) are not part of the cost model
+//!   and need no shape here.
+//! * Attention is found as a scaled-dot-product-attention op, or, for the
+//!   decomposed masked form, as the softmax over a product of two
+//!   activations; its geometry is the query operand's shape.
+//! * Activation bytes are the sized results; results of unknown size are
+//!   counted in [`LayerGeometry::unsized_ops`] and make the figure a lower
+//!   bound.
 //!
 //! Parameter roles (Q/K/V/O projection, FFN projection) come from
 //! [`crate::wggo_ilp::proj_role`], the name table WRGA's placement filter
@@ -172,7 +189,7 @@ pub struct ShapeUnknown {
 impl ShapeUnknown {
     /// The first few reasons, for a one-line diagnostic.
     pub fn summary(&self) -> String {
-        const SHOWN: usize = 3;
+        const SHOWN: usize = 6;
         let mut s = self
             .reasons
             .iter()
@@ -207,12 +224,22 @@ fn is_attention(op: &PrimalOp) -> bool {
     )
 }
 
-/// True when the tape contains a packed attention call: the only op whose
-/// lowering consumes a packing decision.
+/// True when the train step consumes a packed batch: its tape holds a
+/// packed attention call, or reads the batch's `attention_mask` or
+/// `segment_ids` (the masked form of attention is decomposed into plain ops,
+/// so the read of the mask is what marks it). Only then is there something
+/// for a packing decision to apply to.
 pub fn tape_has_packed_attention(list: &WengertList) -> bool {
-    list.ops
-        .iter()
-        .any(|op| matches!(op.op, PrimalOp::ScaledDotProductAttentionPacked))
+    list.ops.iter().any(|op| match &op.op {
+        PrimalOp::ScaledDotProductAttentionPacked => true,
+        PrimalOp::Passthrough(name) => {
+            matches!(
+                name.as_str(),
+                "dict_get:attention_mask" | "dict_get:segment_ids"
+            )
+        }
+        _ => false,
+    })
 }
 
 /// Read every layer's geometry from the forward tape.
@@ -225,6 +252,31 @@ pub fn derive(
     sizes: &HashMap<VarId, SizeInfo>,
     dtype_bytes: u64,
 ) -> Result<ModelGeometry, ShapeUnknown> {
+    derive_for(list, graph, sizes, dtype_bytes, None)
+}
+
+/// [`derive`], told which of the tape's `Param` ops are the model's trained
+/// tensor parameters.
+///
+/// The tape registers every model field a step reads as a `Param`: the
+/// weights, but also buffers (`_cos_table`), one-element config tensors
+/// (`_n_heads`) and plain `float` fields (a norm's `eps`). Only the first
+/// kind is a parameter of the model. `trained` is the train block's own
+/// parameter list (`Compiler::enumerate_model_tensor_paths`); when it is
+/// `None`, or names nothing on this tape, a `Param` counts when its leaf
+/// name is a trainable one and the tape types it as a tensor.
+pub fn derive_for(
+    list: &WengertList,
+    graph: &OptGraph,
+    sizes: &HashMap<VarId, SizeInfo>,
+    dtype_bytes: u64,
+    trained: Option<&HashSet<String>>,
+) -> Result<ModelGeometry, ShapeUnknown> {
+    let trained = trained.filter(|set| {
+        list.ops
+            .iter()
+            .any(|op| matches!(&op.op, PrimalOp::Param(n) if set.contains(n)))
+    });
     let mut reasons: Vec<String> = Vec::new();
     let param_name: HashMap<VarId, &str> = list
         .ops
@@ -249,6 +301,23 @@ pub fn derive(
     };
     let last_dim =
         |v: VarId| -> Option<u64> { dims_u64(sizes.get(&v)?).and_then(|d| d.last().copied()) };
+    let producer: HashMap<VarId, &crate::wengert::WengertOp> =
+        list.ops.iter().map(|op| (op.result, op)).collect();
+    // The parameter a value is, or is a view of (a transposed or reshaped
+    // weight is still that weight).
+    let weight_of = |mut v: VarId| -> Option<&str> {
+        for _ in 0..8 {
+            if let Some(name) = param_name.get(&v) {
+                return Some(name);
+            }
+            let op = producer.get(&v)?;
+            if !is_view_producing_op(&op.op) {
+                return None;
+            }
+            v = *op.inputs.first()?;
+        }
+        None
+    };
 
     let mut layers = Vec::with_capacity(graph.layers.len());
     for layer in &graph.layers {
@@ -270,7 +339,8 @@ pub fn derive(
         };
         let mut k_cols: Option<u64> = None;
         let mut q_rows: Option<u64> = None;
-        let mut attn_q: Vec<(u32, Vec<u64>)> = Vec::new();
+        // (tape op, query var) of each attention call in the layer.
+        let mut attn_q: Vec<(u32, VarId)> = Vec::new();
 
         for (op, _) in list
             .ops
@@ -280,6 +350,19 @@ pub fn derive(
         {
             match &op.op {
                 PrimalOp::Param(name) => {
+                    // Buffers and config fields are not optimized: no
+                    // gradient, no moments, and often no literal shape (a
+                    // computed table). They are not model parameters here.
+                    let is_model_parameter = match trained {
+                        Some(set) => set.contains(name),
+                        None => {
+                            crate::stmt::is_trainable_param_leaf_name(name)
+                                && result_ty(op) == WengertType::Tensor
+                        }
+                    };
+                    if !is_model_parameter {
+                        continue;
+                    }
                     let Some(n) = sizes.get(&op.result).and_then(SizeInfo::numel) else {
                         reasons.push(format!("parameter `{name}` has no compile-time shape"));
                         continue;
@@ -311,53 +394,74 @@ pub fn derive(
                     continue;
                 }
                 PrimalOp::Matmul => {
-                    let a = op.inputs.first().and_then(|v| sizes.get(v));
-                    let b = op.inputs.get(1).and_then(|v| sizes.get(v));
-                    let b_dims = b.and_then(dims_u64).filter(|d| d.len() >= 2);
-                    let a_numel = a.and_then(SizeInfo::numel);
-                    match (a_numel, b_dims) {
-                        (Some(a_numel), Some(bd)) => {
-                            let (k, n) = (bd[bd.len() - 2], bd[bd.len() - 1]);
-                            if k == 0 || !a_numel.is_multiple_of(k) {
-                                reasons.push(format!(
-                                    "matrix product at tape op {} in `{}` has operands of \
-                                     inconsistent size",
-                                    op.id, layer.name
-                                ));
-                            } else {
-                                let role = op
-                                    .inputs
-                                    .get(1)
-                                    .and_then(|v| param_name.get(v))
-                                    .and_then(|n| proj_role(n));
-                                g.matmuls.push(MatmulGeometry {
-                                    rows: a_numel / k,
-                                    in_dim: k,
-                                    out_dim: n,
-                                    role,
-                                });
+                    // A product with a weight. Products of two activations
+                    // (QKᵀ and AV inside attention) are not costed.
+                    let weight = op
+                        .inputs
+                        .get(1)
+                        .and_then(|v| weight_of(*v))
+                        .or_else(|| op.inputs.first().and_then(|v| weight_of(*v)));
+                    if let Some(weight) = weight {
+                        let a = op.inputs.first().and_then(|v| sizes.get(v));
+                        let b = op.inputs.get(1).and_then(|v| sizes.get(v));
+                        let b_dims = b.and_then(dims_u64).filter(|d| d.len() >= 2);
+                        let a_numel = a.and_then(SizeInfo::numel);
+                        match (a_numel, b_dims) {
+                            (Some(a_numel), Some(bd)) => {
+                                let (k, n) = (bd[bd.len() - 2], bd[bd.len() - 1]);
+                                if k == 0 || !a_numel.is_multiple_of(k) {
+                                    reasons.push(format!(
+                                        "matrix product at tape op {} in `{}` has operands of \
+                                         inconsistent size",
+                                        op.id, layer.name
+                                    ));
+                                } else {
+                                    g.matmuls.push(MatmulGeometry {
+                                        rows: a_numel / k,
+                                        in_dim: k,
+                                        out_dim: n,
+                                        role: proj_role(weight),
+                                    });
+                                }
                             }
+                            _ => reasons.push(format!(
+                                "matrix product with `{weight}` at tape op {} in `{}` has an \
+                                 operand of unknown shape",
+                                op.id, layer.name
+                            )),
                         }
-                        _ => reasons.push(format!(
-                            "matrix product at tape op {} in `{}` has an operand of unknown \
-                             shape",
-                            op.id, layer.name
-                        )),
                     }
                 }
-                o if is_attention(o) => {
-                    match op
-                        .inputs
-                        .first()
-                        .and_then(|v| sizes.get(v))
-                        .and_then(dims_u64)
-                        .filter(|d| d.len() == 4)
-                    {
-                        Some(d) => attn_q.push((op.id, d)),
-                        None => reasons.push(format!(
-                            "attention at tape op {} in `{}` has a query of unknown shape",
-                            op.id, layer.name
-                        )),
+                o if is_attention(o) => match op.inputs.first() {
+                    Some(q) => attn_q.push((op.id, *q)),
+                    None => reasons.push(format!(
+                        "attention at tape op {} in `{}` has no query operand",
+                        op.id, layer.name
+                    )),
+                },
+                // Decomposed attention: softmax over a product of two
+                // activations, reached through the scale and mask
+                // arithmetic. The query is that product's left operand.
+                PrimalOp::Softmax { .. } => {
+                    let mut v = op.inputs.first().copied();
+                    for _ in 0..6 {
+                        let Some(p) = v.and_then(|v| producer.get(&v)) else {
+                            break;
+                        };
+                        match p.op {
+                            PrimalOp::Add | PrimalOp::Sub | PrimalOp::Mul | PrimalOp::Div => {
+                                v = p.inputs.first().copied();
+                            }
+                            PrimalOp::Matmul => {
+                                if p.inputs.iter().all(|i| weight_of(*i).is_none())
+                                    && let Some(q) = p.inputs.first()
+                                {
+                                    attn_q.push((op.id, *q));
+                                }
+                                break;
+                            }
+                            _ => break,
+                        }
                     }
                 }
                 PrimalOp::RMSNorm { .. } | PrimalOp::LayerNorm { .. } => {
@@ -390,15 +494,29 @@ pub fn derive(
             }
         }
 
-        // Attention geometry: every attention call of the layer must agree.
-        if let Some((first_id, q)) = attn_q.first() {
-            if attn_q.iter().any(|(_, d)| d != q) {
+        // Attention geometry: the query is `[batch, heads, seq, head_dim]`,
+        // or `[batch, seq, head_dim]` / `[seq, head_dim]` for one head.
+        // Every attention call of the layer must agree.
+        let mut queries: Vec<(u32, [u64; 4])> = Vec::new();
+        for (op_id, q) in &attn_q {
+            match sizes.get(q).and_then(dims_u64).as_deref() {
+                Some(&[b, h, s, d]) => queries.push((*op_id, [b, h, s, d])),
+                Some(&[b, s, d]) => queries.push((*op_id, [b, 1, s, d])),
+                Some(&[s, d]) => queries.push((*op_id, [1, 1, s, d])),
+                _ => reasons.push(format!(
+                    "attention at tape op {op_id} in `{}` has a query of unknown shape",
+                    layer.name
+                )),
+            }
+        }
+        if let Some((first_id, q)) = queries.first() {
+            if queries.iter().any(|(_, d)| d != q) {
                 reasons.push(format!(
                     "`{}` has attention calls of differing shapes (first at tape op {first_id})",
                     layer.name
                 ));
             } else {
-                let (batch, n_heads, seq, head_dim) = (q[0], q[1], q[2], q[3]);
+                let [batch, n_heads, seq, head_dim] = *q;
                 let n_kv_heads = match k_cols {
                     Some(c) if head_dim > 0 && c.is_multiple_of(head_dim) && c > 0 => c / head_dim,
                     _ => n_heads,
@@ -538,10 +656,15 @@ impl crate::compiler::Compiler<'_> {
     /// dims resolved through the owning model type, uniquely named field
     /// dims as a fallback, and the `[batch, seq]` shape of a proven
     /// `DataLoader`'s batch fields.
+    ///
+    /// `trained` is the train block's parameter list when the caller has it
+    /// (see [`derive_for`]).
     pub(crate) fn wggo_model_geometry(
         &self,
         extractor: &crate::source_ad::WengertExtractor<'_>,
+        trained: Option<&[String]>,
     ) -> Result<ModelGeometry, ShapeUnknown> {
+        let trained: Option<HashSet<String>> = trained.map(|p| p.iter().cloned().collect());
         let list = extractor.wengert_list();
         let mut dim_seeds: HashMap<VarId, Vec<i64>> =
             crate::profiling::captures::dim_hints_from_var_nodes(
@@ -602,7 +725,7 @@ impl crate::compiler::Compiler<'_> {
             &[],
         );
         let graph = crate::wggo_graph::build(list);
-        derive(list, &graph, &sizes, TENSOR_ELEMENT_BYTES)
+        derive_for(list, &graph, &sizes, TENSOR_ELEMENT_BYTES, trained.as_ref())
     }
 }
 
@@ -906,13 +1029,153 @@ mod tests {
         assert!(err.reasons.iter().any(|r| r.contains("attention")), "{err}");
     }
 
+    /// Buffers and config fields sit on the tape as parameters but are not
+    /// trained; an unknown shape for one must not stop the plan, and a known
+    /// one is not counted as a parameter.
+    #[test]
+    fn untrained_buffers_are_not_model_parameters() {
+        let (mut list, mut sizes) = transformer(Dims::gqa12(1), false);
+        let table = list.ops.len() as u32;
+        list.ops.push(crate::wengert::WengertOp {
+            id: table,
+            result: table,
+            op: PrimalOp::Param("m.blocks.0.attn.rope._cos_table".into()),
+            inputs: vec![],
+            saved_for_backward: false,
+            checkpointed: false,
+        });
+        let geo = derive(&list, &build_graph(&list), &sizes, 4).expect("an unsized buffer is fine");
+        let block = geo.layers.iter().find(|l| l.name == "blocks.0").unwrap();
+        assert_eq!(block.param_elements, 6_292_224);
+        sizes.insert(table, SizeInfo::Shape(vec![16, 32]));
+        let geo = derive(&list, &build_graph(&list), &sizes, 4).unwrap();
+        let block = geo.layers.iter().find(|l| l.name == "blocks.0").unwrap();
+        assert_eq!(block.param_elements, 6_292_224);
+    }
+
+    /// A `float` field read by the step (a norm's `eps`) is a `Param` on the
+    /// tape with no shape. It is not one of the model's trained tensors, so
+    /// with the train block's parameter list it is ignored; without the
+    /// list it is ignored when the tape types it as a scalar, and reported
+    /// when nothing says what it is.
+    #[test]
+    fn a_scalar_field_is_not_a_parameter() {
+        let (mut list, sizes) = transformer(Dims::gqa12(1), false);
+        let trained: HashSet<String> = list
+            .ops
+            .iter()
+            .filter_map(|op| match &op.op {
+                PrimalOp::Param(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        let eps = list.ops.len() as u32;
+        list.ops.push(crate::wengert::WengertOp {
+            id: eps,
+            result: eps,
+            op: PrimalOp::Param("m.blocks.0.norm.eps".into()),
+            inputs: vec![],
+            saved_for_backward: false,
+            checkpointed: false,
+        });
+        let graph = build_graph(&list);
+        let geo = derive_for(&list, &graph, &sizes, 4, Some(&trained)).expect("eps is not trained");
+        let block = geo.layers.iter().find(|l| l.name == "blocks.0").unwrap();
+        assert_eq!(block.param_elements, 6_292_224);
+
+        let err = derive(&list, &graph, &sizes, 4).unwrap_err();
+        assert!(
+            err.reasons
+                .iter()
+                .any(|r| r.contains("m.blocks.0.norm.eps")),
+            "{err}"
+        );
+        list.var_types.insert(eps, WengertType::Scalar);
+        assert!(derive(&list, &graph, &sizes, 4).is_ok());
+    }
+
+    /// The decomposed (masked) form of attention has no attention op: it is
+    /// a softmax over `q @ kᵀ` scaled and masked. Its geometry is read from
+    /// the query all the same, and the product of two activations needs no
+    /// shape of its own.
+    #[test]
+    fn decomposed_attention_is_recognised_by_its_softmax() {
+        let (mut list, mut sizes) = transformer(Dims::gqa12(1), false);
+        let attn_pos = list.ops.iter().position(|op| is_attention(&op.op)).unwrap();
+        let (q, k) = (list.ops[attn_pos].inputs[0], list.ops[attn_pos].inputs[1]);
+        let attn_var = list.ops[attn_pos].result;
+        // scores = q @ k (shape unknown), softmax(scores) in place of the
+        // attention op's result.
+        let scores = list.ops.len() as u32;
+        list.ops.push(crate::wengert::WengertOp {
+            id: scores,
+            result: scores,
+            op: PrimalOp::Matmul,
+            inputs: vec![q, k],
+            saved_for_backward: false,
+            checkpointed: false,
+        });
+        list.ops[attn_pos].op = PrimalOp::Softmax { dim: -1 };
+        list.ops[attn_pos].inputs = vec![scores];
+        // Keep the tape topological: move the product before the softmax.
+        let product = list.ops.pop().unwrap();
+        list.ops.insert(attn_pos, product);
+        sizes.remove(&scores);
+        let _ = attn_var;
+        let geo = derive(&list, &build_graph(&list), &sizes, 4).expect("decomposed attention");
+        let block = geo.layers.iter().find(|l| l.name == "blocks.0").unwrap();
+        assert_eq!(
+            block
+                .attention
+                .map(|a| (a.n_heads, a.n_kv_heads, a.head_dim)),
+            Some((12, 4, 64))
+        );
+        assert_eq!(
+            block.matmuls.len(),
+            6,
+            "the activation product is not a weight product"
+        );
+        assert_eq!(
+            block.unsized_ops, 1,
+            "and its unknown size is counted, not guessed"
+        );
+    }
+
+    /// A single-head attention over `[seq, head_dim]` operands is one head.
+    #[test]
+    fn a_rank_2_query_is_one_head() {
+        let (list, mut sizes) = transformer(Dims::gqa12(1), false);
+        let attn = list.ops.iter().find(|op| is_attention(&op.op)).unwrap();
+        sizes.insert(attn.inputs[0], SizeInfo::Shape(vec![16, 256]));
+        let geo = derive(&list, &build_graph(&list), &sizes, 4).unwrap();
+        let block = geo.layers.iter().find(|l| l.name == "blocks.0").unwrap();
+        // K projection is 256 wide: one key/value head of 256.
+        assert_eq!(
+            block
+                .attention
+                .map(|a| (a.batch, a.n_heads, a.n_kv_heads, a.seq, a.head_dim)),
+            Some((1, 1, 1, 16, 256))
+        );
+    }
+
     #[test]
     fn packed_attention_is_found_on_the_tape_that_has_it() {
         assert!(tape_has_packed_attention(
             &transformer(Dims::gqa12(1), true).0
         ));
-        assert!(!tape_has_packed_attention(
-            &transformer(Dims::gqa12(1), false).0
-        ));
+        let (mut unpacked, _) = transformer(Dims::gqa12(1), false);
+        assert!(!tape_has_packed_attention(&unpacked));
+        // The masked form is decomposed; the step's read of the batch's
+        // mask is what shows it.
+        let id = unpacked.ops.len() as u32;
+        unpacked.ops.push(crate::wengert::WengertOp {
+            id,
+            result: id,
+            op: PrimalOp::Passthrough("dict_get:attention_mask".into()),
+            inputs: vec![0],
+            saved_for_backward: false,
+            checkpointed: false,
+        });
+        assert!(tape_has_packed_attention(&unpacked));
     }
 }

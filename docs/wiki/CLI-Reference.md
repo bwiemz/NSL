@@ -140,6 +140,8 @@ nsl run [OPTIONS] <FILE> [-- <ARGS>...]
 | `--cpdt-intra-bw` | `<BPS>` | `900000000000` | CPDT: intra-node bandwidth in bytes/sec (default 9e11 = 900 GB/s) |
 | `--cpdt-inter-bw` | `<BPS>` | `100000000000` | CPDT: inter-node bandwidth in bytes/sec (default 1e11 = 100 GB/s) |
 | `--cpdt-report` |  |  | CPDT: emit the full plan to stdout. Implies `--cpdt` (full mode) |
+| `--cpdt-memory-budget` | `<GIB>` | `80` | CPDT: memory available on each GPU, in GiB, for the ZeRO planner's fit test (default 80) |
+| `--cpdt-prune-experts` |  |  | CPDT: under `--cpdt full` with weights, slice out MoE experts whose router column has norm below 0.01. Off by default: a near-zero column does not show an expert is unused, so this can change the model's output |
 | `--wggo` | `<MODE>` (optional) |  | WGGO: global-optimization mode ("full", "greedy", "off", or "auto"). Passing `--wggo` without a value enables full mode. Mirrors `nsl build --wggo` so the WGGO mode-table dispatch reaches `emit_unified_optim_step_dispatch` end-to-end via `nsl run` |
 | `--wggo-report` |  |  | WGGO: print the global-optimization report to stderr |
 | `--wggo-moment-precision` |  |  | WGGO: lower the plan's optimizer-moment precision decisions (optim_m/v_bits) to real m/v storage dtypes. Opt-in: changes training numerics. Works on CPU and GPU (the GPU cast envelope uses the CFTP-v7 PTX cast kernels) |
@@ -271,6 +273,8 @@ nsl build [OPTIONS] <FILE>
 | `--cpdt-intra-bw` | `<BPS>` | `900000000000` | CPDT: intra-node bandwidth in bytes/sec (default 9e11 = 900 GB/s) |
 | `--cpdt-inter-bw` | `<BPS>` | `100000000000` | CPDT: inter-node bandwidth in bytes/sec (default 1e11 = 100 GB/s) |
 | `--cpdt-report` |  |  | CPDT: emit the full plan to stdout. Implies `--cpdt` (full mode) |
+| `--cpdt-memory-budget` | `<GIB>` | `80` | CPDT: memory available on each GPU, in GiB, for the ZeRO planner's fit test (default 80) |
+| `--cpdt-prune-experts` |  |  | CPDT: under `--cpdt full` with weights, slice out MoE experts whose router column has norm below 0.01. Off by default: a near-zero column does not show an expert is unused, so this can change the model's output |
 | `--cfie` | `<MODE>` (optional) |  | CFIE: compiler-fused inference-engine mode ("full", "sampling", or "off").  Passing `--cfie` without a value enables full mode.  Overrides the serve block's `@cfie` decorator; serve-block CFIE keys (kv_layout, sampling:, ...) activate CFIE even without this flag |
 | `--cfie-report` | `<PATH>` |  | CFIE: also write the inference build report to this file. The report always prints to stderr when CFIE is active |
 | `--calibration-data` | `<PATH>` |  | Calibration dataset (.bin or .safetensors). REFUSED: `nsl build` does not run calibration (the harness, `nsl_codegen::compile_and_calibrate`, has no build-path caller), so a corpus would be validated and ignored. Declared so the refusal can name it rather than clap calling it unknown |

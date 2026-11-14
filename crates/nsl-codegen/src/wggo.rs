@@ -642,6 +642,9 @@ pub fn run(mut input: WggoInput) -> WggoPlan {
     let n = graph.layers.len();
     let model = input.model.take().filter(|m| m.layers.len() == n);
     let shapes_from_model = model.is_some();
+    let unsized_ops: u32 = model
+        .as_ref()
+        .map_or(0, |m| m.layers.iter().map(|l| l.unsized_ops).sum());
 
     // `--wggo-memory-budget`: enforce the per-device cap at the Level-1 DP
     // (the ClusterSpec budget the DP knapsack checks) and derive per-layer
@@ -676,6 +679,12 @@ pub fn run(mut input: WggoInput) -> WggoPlan {
     // mode bypasses optimization, so there an over-budget passthrough is the
     // intended behavior rather than a refusal, and nothing is warned.
     let mut warnings: Vec<String> = Vec::new();
+    if unsized_ops > 0 {
+        warnings.push(format!(
+            "{unsized_ops} tensor operation(s) in the step have no compile-time size; their \
+             activations are not in the plan's memory, which is therefore a lower bound"
+        ));
+    }
     let mut effective_mode = input.mode;
     let inter = match dp_solve(&graph, &luts, &dp_cfg, gpu) {
         Ok(p) => p,
@@ -1539,6 +1548,21 @@ pub fn run_on_wengert_with_weights(
             return Ok(None);
         }
     };
+
+    // Activation memory is the sum of the sized results; a result of unknown
+    // size is left out, which makes the figure a lower bound. That is not
+    // good enough to hold a budget against.
+    let unsized_ops: u32 = model.layers.iter().map(|l| l.unsized_ops).sum();
+    if unsized_ops > 0
+        && compile_options.is_some_and(|o| o.wggo.memory_budget_bytes.is_some())
+    {
+        return Err(CodegenError::new(format!(
+            "--wggo-memory-budget cannot be honoured: {unsized_ops} tensor operation(s) in \
+             this train block's step have no compile-time size, so the model's activation \
+             memory is not known and a budget cannot be checked against it. Feed the step \
+             from a `DataLoader` with a fixed batch shape, or drop the flag.",
+        )));
+    }
 
     // No `--wggo-memory-budget` means no budget: the Level-1 DP has nothing
     // to hold the model to. (`ClusterSpec::default()` carries an 8 GiB

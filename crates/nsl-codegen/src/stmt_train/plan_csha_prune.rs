@@ -69,7 +69,8 @@ impl Compiler<'_> {
         // The model's attention shape, read off the tape CSHA plans on
         // (only when CSHA was asked for: the derivation walks the tape).
         let attention = if self.compile_options.csha.mode.is_some() {
-            self.wggo_model_geometry(extractor)
+            // No parameter list is needed for the attention shape.
+            self.wggo_model_geometry(extractor, None)
                 .ok()
                 .and_then(|g| g.uniform_attention())
         } else {

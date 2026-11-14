@@ -580,9 +580,14 @@ with `crates/` are relative to `crates/nsl-codegen/src/`.
   shape, batch and sequence length are now read from the train block's tape
   (`derive` in `wggo_model_shape.rs`, fed by the same shape propagation the
   transient arena uses), and each layer has its own cost table
-  (`build_layer_lut` in `wggo_cost.rs`). When a shape cannot be determined
-  at compile time WGGO logs why and does not plan; with a flag that only
-  acts through the plan, that is a compile error. The tests are
+  (`build_layer_lut` in `wggo_cost.rs`). Parameters are the trained tensors;
+  buffers and config fields on the tape are not counted. When the shape of
+  a parameter, a product with a weight, a normalisation or an attention
+  query cannot be determined at compile time WGGO logs why and does not
+  plan; with a flag that only acts through the plan, that is a compile
+  error. An activation of unknown size is left out of the memory figure,
+  which the plan then reports as a lower bound, and makes
+  `--wggo-memory-budget` a compile error. The tests are
   `the_plan_reports_the_models_own_heads_widths_and_bytes` in `wggo.rs` and
   `crates/nsl-cli/tests/wggo_model_shape_gate.rs`.
 - `--wggo-memory-budget` was checked against that built-in layer: a 200 MiB
@@ -665,9 +670,10 @@ with `crates/` are relative to `crates/nsl-codegen/src/`.
   unpacked `forward` got `PCA=segment_id`, a 15% whole-layer discount and a
   `[pca] … wggo-override-consumed` line, because any masked attention call
   in an imported module counted as packing support. A packing mode is now
-  offered only when the module declares a packed dataset or the train
-  block's own tape reaches a packed attention call, and only on layers that
-  have an attention call (`compile_flash_attention_kernels` in
+  offered only when the module declares a packed dataset or the train step
+  itself consumes a packed batch (a packed attention call, or a read of the
+  batch's attention mask or segment ids), and only on layers that have
+  attention (`compile_flash_attention_kernels` in
   `compiler/kernel.rs`; `default_constraints_for` in `wggo.rs`).
 - The 32-bit pin for embedding and LM-head parameters never applied: they
   fall into the catch-all `other` layer, whose role only forbade going below
