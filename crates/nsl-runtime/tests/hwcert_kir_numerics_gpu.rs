@@ -490,14 +490,22 @@ fn max_and_min_order_negative_zero_below_positive_zero_on_silicon() {
 /// that doc — NOT imported — so the gate checks the kernel against the
 /// contract rather than against itself.
 fn dropout_keep(seed: u64, i: u64, threshold: u32) -> bool {
-    let mut h = seed.wrapping_add(i) as u32;
-    h = h.wrapping_mul(0x9E37_79B9);
-    h ^= h >> 16;
-    h = h.wrapping_mul(0x85EB_CA6B);
-    h ^= h >> 13;
-    h = h.wrapping_mul(0xC2B2_AE35);
-    h ^= h >> 16;
-    h < threshold
+    fn r1(x: u32) -> u32 {
+        let x = x.wrapping_mul(0x9E37_79B9);
+        x ^ (x >> 16)
+    }
+    fn r2(x: u32) -> u32 {
+        let x = x.wrapping_mul(0x85EB_CA6B);
+        x ^ (x >> 13)
+    }
+    fn r3(x: u32) -> u32 {
+        let x = x.wrapping_mul(0xC2B2_AE35);
+        x ^ (x >> 16)
+    }
+    let c = seed.wrapping_add(i);
+    let (lo, hi) = (c as u32, (c >> 32) as u32);
+    let key = r3(r2(r1(hi)));
+    r3(r2(r1(lo).wrapping_add(key))) < threshold
 }
 
 /// `nsl_dropout_f32` on silicon, BIT-EXACT against the documented algorithm.
@@ -508,9 +516,12 @@ fn dropout_keep(seed: u64, i: u64, threshold: u32) -> bool {
 /// for a negative `x`; the comparison is on bits, so the sign of zero counts.
 ///
 /// The counter base is pinned above 2³² and so that `base + i` wraps its low
-/// 32 bits inside the launch, which exercises the `u32(seed + i)` truncation
-/// the doc specifies. The gate also checks:
+/// 32 bits inside the launch, so the launch spans two of the hash's 2³²
+/// blocks and both halves of the counter are exercised. The gate also checks:
 ///
+/// * a second launch on the same input with the counter 2³² higher draws a
+///   DIFFERENT mask. The kernel used to hash the low 32 bits alone, and this
+///   comparison came out identical: the stream repeated every 2³² elements;
 /// * the launch claims exactly `len` counter values — the contract that keeps
 ///   consecutive masks uncorrelated and makes checkpoint resume reproducible;
 /// * the kept fraction lands within 6σ of `1 − p` — bit-exactness against a
@@ -575,6 +586,29 @@ fn dropout_kir_kernel_is_bit_exact_against_its_documented_hash_on_silicon() {
             6.0 * sigma
         );
         println!("dropout p={p}: bit-exact over {len} elements, kept {kept} (expected {expect:.0})");
+
+        // Same input, counter exactly 2^32 higher. Two unrelated masks agree
+        // on p^2 + (1-p)^2 of their elements; a repeating stream agrees on
+        // all of them.
+        set_gpu_dropout_counter(base + (1u64 << 32));
+        let z_t = nsl_tensor_dropout(t, p, 1);
+        let z = download(z_t, len);
+        let agree = (0..len).filter(|&i| (y[i] == 0.0) == (z[i] == 0.0)).count();
+        let q = p * p + (1.0 - p) * (1.0 - p);
+        let (mean, sd) = (n * q, (n * q * (1.0 - q)).sqrt());
+        assert!(
+            (agree as f64 - mean).abs() <= 6.0 * sd,
+            "dropout p={p}: masks 2^32 counters apart agree on {agree} of {len} elements; \
+             unrelated masks agree on {mean:.0} ± {:.0} (6σ), and {len} means the stream repeats",
+            6.0 * sd
+        );
+        for i in 0..len {
+            let keep = dropout_keep(base + (1u64 << 32), i as u64, threshold);
+            let want = x[i] * if keep { scale } else { 0.0 };
+            assert_eq!(z[i].to_bits(), want.to_bits(), "dropout p={p}, second block, element {i}");
+        }
+        println!("dropout p={p}: a launch 2^32 counters later agrees on {agree} of {len} (unrelated: {mean:.0})");
+        nsl_tensor_free(z_t);
         nsl_tensor_free(y_t);
         nsl_tensor_free(t);
     }
