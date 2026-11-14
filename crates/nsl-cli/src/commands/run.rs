@@ -467,6 +467,8 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 // weight-aware tier assignment runs during train-block codegen.
                 weights: nsl_codegen::WeightsOptions {
                     file: resolved_weight_file.clone(),
+                    // `-w` asks for the program to run with the file's values.
+                    from_flag: weights.is_some(),
                     // `index_map` is populated from the semantic analysis in
                     // run_build_single (where analysis is in scope).
                     ..Default::default()

@@ -476,10 +476,16 @@ fn write_filled_safetensors(path: &std::path::Path, tensors: &[(&str, &[usize], 
 /// moments leave it, for gradients of realistic size.
 ///
 /// Every block weight here receives a gradient of exactly 1e-3 per element
-/// (`x = ones[2, 8]`, `embed = ones`, loss = `sum(pred) * 6.25e-5`), so the
-/// AdamW trajectory is known: the weight falls from 1.0 at close to `lr`
-/// per step. The weights file puts blocks 1..6 in the plan's LOW tier,
-/// which asks for an 8-bit `m` and a 16-bit `v`.
+/// (`x = ones[2, 8]`, `embed = ones`, loss = `sum(pred) * 6.25e-5`), whatever
+/// the weights are, so the AdamW trajectory is known: each weight falls from
+/// its starting value at close to `lr` per step. The weights file puts
+/// blocks 1..6 in the plan's LOW tier, which asks for an 8-bit `m` and a
+/// 16-bit `v`.
+///
+/// `--weights` loads the file into the model, so blocks 1..6 start at the
+/// file's 2e-5 and blocks 0 and 7 at 1.0. The full-precision reference is
+/// given the same file (without `--cpdt`) so that both runs start from the
+/// same weights, and what is compared is how far each block moved.
 ///
 /// Stored as f16, `v` could not hold `(1 - beta2) * g^2 = 1e-9` at all: it
 /// stayed zero, the step became `m_hat / eps`, and after 200 steps those
@@ -532,13 +538,13 @@ m.probe()
     std::fs::write(&program, src).unwrap();
 
     let block_names: Vec<String> = (0..8).map(|i| format!("blocks.{i}.w")).collect();
+    // Small-magnitude interior blocks score into the LOW tier; the first
+    // and last blocks are pinned HIGH by position.
+    let fills: Vec<f32> = (0..8).map(|i| if i == 0 || i == 7 { 1.0 } else { 2e-5 }).collect();
     let mut tensors: Vec<(&str, &[usize], f32)> =
         vec![("embed", &[8, 64], 1.0), ("final_norm", &[64], 1.0)];
-    for (i, name) in block_names.iter().enumerate() {
-        // Small-magnitude interior blocks score into the LOW tier; the
-        // first and last blocks are pinned HIGH by position.
-        let fill = if i == 0 || i == 7 { 1.0 } else { 2e-5 };
-        tensors.push((name.as_str(), &[64, 64], fill));
+    for (name, fill) in block_names.iter().zip(&fills) {
+        tensors.push((name.as_str(), &[64, 64], *fill));
     }
     let weights_path = tmp.path().join("low_tier.safetensors");
     write_filled_safetensors(&weights_path, &tensors);
@@ -548,13 +554,9 @@ m.probe()
         cmd.env("NSL_STDLIB_PATH", workspace_root().join("stdlib"));
         cmd.current_dir(tmp.path());
         cmd.arg("run").arg(&program).arg("--target").arg("cpu").arg("--source-ad");
+        cmd.arg("--weights").arg(&weights_path);
         if reduced {
-            cmd.arg("--cpdt")
-                .arg("full")
-                .arg("--cpdt-num-gpus")
-                .arg("1")
-                .arg("--weights")
-                .arg(&weights_path);
+            cmd.arg("--cpdt").arg("full").arg("--cpdt-num-gpus").arg("1");
         }
         let out = cmd.output().unwrap();
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -575,11 +577,17 @@ m.probe()
          storage, so it proves nothing:\n{stderr}"
     );
     // 200 optimizer steps at lr 1e-3 on a constant gradient: about 0.18.
+    let start = |i: usize| f64::from(fills[i]);
     for (i, &w) in full.iter().enumerate() {
-        assert!((0.80..0.83).contains(&w), "f32 reference drifted: block {i} = {w}");
+        let moved = start(i) - w;
+        assert!(
+            (0.17..0.20).contains(&moved),
+            "f32 reference drifted: block {i} went from {} to {w}",
+            start(i)
+        );
     }
     for (i, (&r, &f)) in reduced.iter().zip(&full).enumerate() {
-        let (moved_reduced, moved_full) = (1.0 - r, 1.0 - f);
+        let (moved_reduced, moved_full) = (start(i) - r, start(i) - f);
         assert!(
             (moved_reduced / moved_full - 1.0).abs() < 0.02,
             "block {i}: reduced-precision moments moved the weight by \

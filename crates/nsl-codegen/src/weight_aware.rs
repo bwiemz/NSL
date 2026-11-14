@@ -5,7 +5,7 @@
 //! Produces bespoke binaries optimized for a specific checkpoint.
 
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -77,6 +77,20 @@ impl WeightDType {
             WeightDType::I32 => i32::from_le_bytes(bytes[..4].try_into().unwrap()) as f64,
             WeightDType::F8E4M3 => decode_fp8(bytes[0], 4, 3),
             WeightDType::F8E5M2 => decode_fp8(bytes[0], 5, 2),
+        }
+    }
+
+    /// The dtype as a safetensors header spells it.
+    pub fn safetensors_name(&self) -> &'static str {
+        match self {
+            WeightDType::F16 => "F16",
+            WeightDType::BF16 => "BF16",
+            WeightDType::F32 => "F32",
+            WeightDType::F64 => "F64",
+            WeightDType::F8E4M3 => "F8_E4M3",
+            WeightDType::F8E5M2 => "F8_E5M2",
+            WeightDType::I8 => "I8",
+            WeightDType::I32 => "I32",
         }
     }
 
@@ -429,6 +443,59 @@ pub struct WeightMap {
     source_path: String,
     /// Total bytes of raw tensor data loaded
     total_bytes: u64,
+}
+
+/// One tensor of a weights file, as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredTensor {
+    pub shape: Vec<usize>,
+    pub dtype: WeightDType,
+    /// [`tensor_content_hash`] of the stored bytes.
+    pub hash: [u8; 32],
+}
+
+/// The hash that ties a compiled program to one tensor of its weights file:
+/// SHA-256 over the dtype as the file spells it, a zero byte, each dimension
+/// as a little-endian u64, and the stored bytes. The runtime computes the
+/// same over the file it opens (`nsl-runtime/src/weights_file.rs`).
+pub fn tensor_content_hash(dtype_name: &str, shape: &[usize], data: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(dtype_name.as_bytes());
+    hasher.update([0u8]);
+    for dim in shape {
+        hasher.update((*dim as u64).to_le_bytes());
+    }
+    hasher.update(data);
+    hasher.finalize().into()
+}
+
+/// Every tensor of a weights file as it is stored, by name: shape, dtype and
+/// content hash. Read once per build (by the CLI, for [`WeightBinding`]) and
+/// shared by every module's compile; it is the file itself, untouched by the
+/// passes that edit a [`WeightMap`] (the Mixtral auto-pack renames and merges
+/// entries, dead-weight elimination zeroes values).
+pub fn read_stored_tensors(path: &Path) -> Result<BTreeMap<String, StoredTensor>, WeightLoadError> {
+    let file_bytes = std::fs::read(path)
+        .map_err(|e| WeightLoadError::IoError(path.display().to_string(), e))?;
+    let tensors = safetensors::SafeTensors::deserialize(&file_bytes)
+        .map_err(|e| WeightLoadError::InvalidFormat(e.to_string()))?;
+    let mut stored = BTreeMap::new();
+    for (name, view) in tensors.tensors() {
+        use safetensors::Dtype as ST;
+        let dtype = match view.dtype() {
+            ST::F16 => WeightDType::F16,
+            ST::BF16 => WeightDType::BF16,
+            ST::F32 => WeightDType::F32,
+            ST::F64 => WeightDType::F64,
+            ST::I8 => WeightDType::I8,
+            ST::I32 => WeightDType::I32,
+            other => return Err(WeightLoadError::UnsupportedDType(format!("{:?}", other))),
+        };
+        let shape: Vec<usize> = view.shape().to_vec();
+        let hash = tensor_content_hash(dtype.safetensors_name(), &shape, view.data());
+        stored.insert(name.clone(), StoredTensor { shape, dtype, hash });
+    }
+    Ok(stored)
 }
 
 impl WeightMap {
@@ -976,6 +1043,192 @@ impl WeightIntegrity {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Binding a program to its weights file
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// A rewrite that depends on a weight's VALUES (folding a product of two
+// weights into a constant, dropping a matmul by a near-identity weight,
+// embedding a one-element weight as an immediate) is right only if the
+// program runs with exactly those values. Three things make that true:
+//
+//   1. `-w` loads the file into the model: every constructor copies the
+//      file's tensor into each field the file names.
+//   2. Only a parameter that nothing writes afterwards is specialized on
+//      ([`WeightWriteFacts`]). A trained, assigned or reloaded parameter is
+//      loaded and left alone.
+//   3. The program records the content hash of every tensor it may have
+//      specialized on, and at startup refuses a file in which one differs.
+//
+// These passes used to key on the field name and assume the model held the
+// file's values, while the model still held its initializer: a `[4, 4]`
+// weight of twos compiled against an identity file printed `x` for
+// `x @ self.w`.
+
+/// What a whole program does to model parameters after they are loaded, as
+/// far as the weight-aware rewrites need to know. Built by
+/// [`analyze_weight_writes`] over every module of the program; everything
+/// it cannot rule out counts as a write.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WeightWriteFacts {
+    /// Why every parameter counts as written, when something in the program
+    /// can write parameters it does not name: a train or distill block, a
+    /// `quant` block, `model_load`, or an in-place tensor operation.
+    pub all_written: Option<String>,
+    /// Fields assigned somewhere in the program (`m.w = ...`,
+    /// `self.w += ...`), by field name, with the reason to report. By name
+    /// alone: an assignment to `w` of one class counts for every class.
+    pub written_fields: BTreeMap<String, String>,
+}
+
+impl WeightWriteFacts {
+    /// Why the parameter a weight key names (`Class.field`, `field`, or a
+    /// dotted path ending in the field) may be written after loading, or
+    /// `None` when nothing in the program writes it.
+    pub fn written(&self, key: &str) -> Option<&str> {
+        if let Some(reason) = &self.all_written {
+            return Some(reason);
+        }
+        let field = key.rsplit('.').next().unwrap_or(key);
+        self.written_fields.get(field).map(String::as_str)
+    }
+}
+
+/// Whether a call by this name writes a tensor argument in place. The same
+/// rule the training analysis uses (`is_inplace_mutator` in `stmt.rs`):
+/// `copy_data`, `copy_` and the `*_inplace` family are NSL's only in-place
+/// tensor operations.
+fn writes_in_place(name: &str) -> bool {
+    matches!(name, "copy_data" | "copy_") || name.ends_with("_inplace")
+}
+
+/// Find everything in `modules` that can write a model parameter after the
+/// model is constructed. `resolve` turns a symbol into its name.
+pub fn analyze_weight_writes(
+    modules: &[&nsl_ast::Module],
+    resolve: &dyn Fn(nsl_ast::Symbol) -> String,
+) -> WeightWriteFacts {
+    use nsl_ast::expr::{Expr, ExprKind};
+    use nsl_ast::stmt::{Stmt, StmtKind};
+    use nsl_ast::visitor::{walk_expr, walk_stmt, Visitor};
+
+    struct Scan<'a> {
+        resolve: &'a dyn Fn(nsl_ast::Symbol) -> String,
+        facts: WeightWriteFacts,
+        /// How direct the reported reason is; a more direct one replaces it.
+        rank: u8,
+    }
+    impl Scan<'_> {
+        /// Everything is written. Of several reasons the most direct is the
+        /// one reported: a train block before the `copy_data` inside the
+        /// optimizer it imports.
+        fn all(&mut self, rank: u8, reason: &str) {
+            if self.facts.all_written.is_none() || rank > self.rank {
+                self.facts.all_written = Some(reason.to_string());
+                self.rank = rank;
+            }
+        }
+        /// The field an assignment target writes: `<expr>.field`, or an
+        /// element of it.
+        fn assigned_field(&self, target: &Expr) -> Option<String> {
+            match &target.kind {
+                ExprKind::MemberAccess { member, .. } => Some((self.resolve)(*member)),
+                ExprKind::Subscript { object, .. } => self.assigned_field(object),
+                ExprKind::Paren(inner) => self.assigned_field(inner),
+                _ => None,
+            }
+        }
+    }
+    impl Visitor for Scan<'_> {
+        fn visit_stmt(&mut self, stmt: &Stmt) {
+            match &stmt.kind {
+                StmtKind::TrainBlock(_) => self.all(3, "the program has a train block, which updates parameters"),
+                StmtKind::DistillBlock(_) => {
+                    self.all(3, "the program has a distill block, which updates parameters")
+                }
+                StmtKind::QuantBlock(_) => {
+                    self.all(3, "the program has a quant block, which rewrites parameters")
+                }
+                StmtKind::Assign { target, .. } => {
+                    if let Some(field) = self.assigned_field(target) {
+                        self.facts
+                            .written_fields
+                            .entry(field.clone())
+                            .or_insert_with(|| format!("the program assigns to a field named '{field}'"));
+                    } else if matches!(target.kind, ExprKind::Subscript { .. }) {
+                        // `t[i] = v` stores into `t` in place, and `t` may be
+                        // a parameter under another name (`let t = m.w`).
+                        self.all(
+                            0,
+                            "the program assigns to an element of a variable, which may be a \
+                             parameter under another name",
+                        );
+                    }
+                }
+                _ => {}
+            }
+            walk_stmt(self, stmt);
+        }
+
+        fn visit_expr(&mut self, expr: &Expr) {
+            if let ExprKind::Call { callee, .. } = &expr.kind {
+                let name = match &callee.kind {
+                    ExprKind::Ident(sym) => Some((self.resolve)(*sym)),
+                    ExprKind::MemberAccess { member, .. } => Some((self.resolve)(*member)),
+                    _ => None,
+                };
+                if let Some(name) = name {
+                    if name == "model_load" {
+                        self.all(2, "the program calls model_load, which overwrites parameters");
+                    } else if writes_in_place(&name) {
+                        self.all(1, &format!("the program calls {name}, which writes a tensor in place"));
+                    }
+                }
+            }
+            walk_expr(self, expr);
+        }
+    }
+
+    let mut scan = Scan { resolve, facts: WeightWriteFacts::default(), rank: 0 };
+    for module in modules {
+        scan.visit_module(module);
+    }
+    scan.facts
+}
+
+/// The request that a program run with its weights file's values: `-w` on a
+/// build that produces something to run. Without it the file is an input to
+/// planners only: nothing is loaded and no value-dependent rewrite is made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WeightBinding {
+    /// The file, as an absolute path: the program opens it when it starts.
+    pub path: std::path::PathBuf,
+    /// What the program writes after loading.
+    pub writes: WeightWriteFacts,
+    /// The file's tensors ([`read_stored_tensors`]).
+    pub stored: std::sync::Arc<BTreeMap<String, StoredTensor>>,
+}
+
+/// The names and hashes a program checks at startup, encoded for
+/// `nsl_weights_bind`: for each tensor a little-endian u32 name length, the
+/// name, and the 32-byte [`tensor_content_hash`].
+pub fn encode_weight_expectations(expectations: &[(String, [u8; 32])]) -> Vec<u8> {
+    let mut table = Vec::new();
+    for (name, hash) in expectations {
+        table.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        table.extend_from_slice(name.as_bytes());
+        table.extend_from_slice(hash);
+    }
+    table
+}
+
+/// A short digest of the expectations for the execution fingerprint: the
+/// first 8 bytes, in hex, of the SHA-256 of the encoded table.
+pub fn weight_expectations_digest(expectations: &[(String, [u8; 32])]) -> String {
+    let hash: [u8; 32] = Sha256::digest(encode_weight_expectations(expectations)).into();
+    hash[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Weight Analysis Report
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1121,6 +1374,121 @@ mod tests {
     use super::*;
     use std::collections::HashMap as StdHashMap;
     use std::io::Write;
+
+    fn writes_of(source: &str) -> WeightWriteFacts {
+        let mut interner = nsl_lexer::Interner::new();
+        let (tokens, _) = nsl_lexer::tokenize(source, nsl_errors::FileId(0), &mut interner);
+        let parsed = nsl_parser::parse(&tokens, &mut interner);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let resolve = |sym: nsl_ast::Symbol| interner.resolve(sym.0).unwrap_or("").to_string();
+        analyze_weight_writes(&[&parsed.module], &resolve)
+    }
+
+    const MODEL: &str = "model Toy:\n    w: Tensor = ones([4, 4])\n    v: Tensor = ones([4])\n\n    fn forward(self, x: Tensor) -> Tensor:\n        return x @ self.w + self.v\n\n";
+
+    /// A program that only reads its parameters writes none of them.
+    #[test]
+    fn a_program_that_only_runs_the_model_writes_nothing() {
+        let facts = writes_of(&format!("{MODEL}let m = Toy()\nlet y = m.forward(ones([2, 4]))\nprint(m.w.sum())\n"));
+        assert_eq!(facts, WeightWriteFacts::default());
+        assert_eq!(facts.written("Toy.w"), None);
+        assert_eq!(facts.written("w"), None);
+    }
+
+    /// An assignment to a field, plain or compound, to the whole tensor or
+    /// to an element, by a variable or by `self`, writes that field (of
+    /// every class: the match is by field name) and no other.
+    #[test]
+    fn an_assignment_writes_the_field_it_names() {
+        for assignment in [
+            "let m = Toy()\nm.w = zeros([4, 4])\n",
+            "let m = Toy()\nm.w += ones([4, 4])\n",
+            "let m = Toy()\nm.w[0] = zeros([4])\n",
+        ] {
+            let facts = writes_of(&format!("{MODEL}{assignment}"));
+            assert_eq!(facts.all_written, None, "{assignment}");
+            assert!(facts.written("Toy.w").is_some_and(|r| r.contains("'w'")), "{assignment}");
+            assert!(facts.written("Other.w").is_some(), "{assignment}");
+            assert_eq!(facts.written("Toy.v"), None, "{assignment}");
+        }
+        let in_method = "model Toy:\n    w: Tensor = ones([4, 4])\n\n    fn reset(self):\n        self.w = zeros([4, 4])\n";
+        assert!(writes_of(in_method).written("w").is_some());
+    }
+
+    /// Anything that can write parameters it does not name writes them all.
+    #[test]
+    fn training_reloading_and_in_place_operations_write_every_parameter() {
+        let train = format!(
+            "{MODEL}let m = Toy()\ntrain(model = m, epochs = 1):\n    optimizer: SGD(lr = 0.1)\n    step(batch):\n        let loss = mean(m.forward(ones([2, 4])))\n"
+        );
+        for (program, word) in [
+            (train, "train block"),
+            (format!("{MODEL}let m = Toy()\nmodel_load(m, \"a.nslm\")\n"), "model_load"),
+            (format!("{MODEL}let m = Toy()\nlet t = m.w\ncopy_data(t, zeros([4, 4]))\n"), "copy_data"),
+            (format!("{MODEL}fn bump(t: Tensor):\n    add_inplace(t, ones([4, 4]))\n"), "add_inplace"),
+            (format!("{MODEL}fn clear(t: Tensor):\n    zero_inplace(t)\n"), "zero_inplace"),
+            (format!("{MODEL}fn scale(t: Tensor):\n    mul_inplace(t, t)\n"), "mul_inplace"),
+            (format!("{MODEL}let m = Toy()\nlet t = m.v\nt[0] = 5.0\n"), "element of a variable"),
+        ] {
+            let facts = writes_of(&program);
+            assert!(
+                facts.all_written.as_deref().is_some_and(|r| r.contains(word)),
+                "{word}: {facts:?}"
+            );
+            assert!(facts.written("Toy.v").is_some(), "{word}");
+        }
+    }
+
+    /// Of several reasons the most direct is reported, wherever it comes in
+    /// the program: the optimizer a train block imports calls `copy_data`,
+    /// and "the program calls copy_data" would send the reader looking for
+    /// a call they did not write.
+    #[test]
+    fn a_train_block_is_the_reason_reported_over_an_in_place_call() {
+        let program = format!(
+            "{MODEL}fn step_like(t: Tensor):\n    copy_data(t, t)\n\nlet m = Toy()\ntrain(model = m, epochs = 1):\n    optimizer: SGD(lr = 0.1)\n    step(batch):\n        let loss = mean(m.forward(ones([2, 4])))\n\nfn later(t: Tensor):\n    zero_inplace(t)\n"
+        );
+        let facts = writes_of(&program);
+        assert!(facts.all_written.as_deref().is_some_and(|r| r.contains("train block")), "{facts:?}");
+    }
+
+    /// The table the program checks at startup, byte for byte: per tensor a
+    /// u32 name length, the name, the 32-byte hash.
+    #[test]
+    fn the_expectation_table_is_length_name_hash() {
+        let table = encode_weight_expectations(&[("ab".to_string(), [7u8; 32])]);
+        let mut want = vec![2u8, 0, 0, 0, b'a', b'b'];
+        want.extend_from_slice(&[7u8; 32]);
+        assert_eq!(table, want);
+        assert_eq!(weight_expectations_digest(&[]).len(), 16);
+    }
+
+    /// The content hash of `[1.0f32, 2.0]` stored as F32 with shape [2],
+    /// against Python's hashlib:
+    ///   sha256(b"F32" + b"\0" + (2).to_bytes(8, "little")
+    ///          + struct.pack("<2f", 1.0, 2.0))
+    /// The runtime's test (`weights_file.rs`) holds its own hash to the same
+    /// literal, so the two sides cannot drift apart.
+    #[test]
+    fn the_tensor_content_hash_is_the_documented_one() {
+        let data: Vec<u8> = [1.0f32, 2.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let hex: String =
+            tensor_content_hash("F32", &[2], &data).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "6774455a26a851dd86ea91ff83c714320b9746d476d63204492fb74fa11d32b3");
+    }
+
+    /// The stored table gives each tensor of the file its shape, dtype and
+    /// content hash.
+    #[test]
+    fn the_stored_table_describes_the_file() {
+        let tmp = write_temp_safetensors("w", &[2, 2], &[1.0, 0.0, 0.0, 1.0]);
+        let table = read_stored_tensors(tmp.as_ref()).unwrap();
+        assert_eq!(table.len(), 1);
+        let stored = &table["w"];
+        assert_eq!((stored.shape.as_slice(), stored.dtype), (&[2usize, 2][..], WeightDType::F32));
+        let data: Vec<u8> = [1.0f32, 0.0, 0.0, 1.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(stored.hash, tensor_content_hash("F32", &[2, 2], &data));
+    }
 
     /// 8-bit floats decode as floats. The values are worked out from the
     /// formats' definitions: sign, biased exponent (bias 7 for E4M3, 15 for

@@ -126,6 +126,11 @@ fn install_per_compile_program_facts(
     interner: &Interner,
     type_map: &TypeMap,
 ) -> Result<(), crate::CodegenError> {
+    // `-w`: the binding to the weights file goes to every module's compile,
+    // including the modules the entry imports, which load no weight map of
+    // their own: their constructors load the file into the models they
+    // define all the same.
+    compiler.features.weight_binding = compiler.compile_options.weights.bind.clone();
     compiler.compile_options.calibration.compile_bundle = Some(Arc::new(
         crate::calibration::CalibrationCompileBundle {
             ast: ast.clone(),
@@ -368,6 +373,28 @@ fn load_and_register_weights_if_needed(
         integrity.hash_hex
     );
 
+    if let Some(binding) = options.weights.bind.as_ref() {
+        let specializable =
+            binding.stored.keys().filter(|name| binding.writes.written(name).is_none()).count();
+        match binding.writes.all_written.as_deref() {
+            Some(reason) => nsl_log::nsl_log!(
+                INFO,
+                "nsl",
+                "[nsl] weight-aware: the model is loaded from {}; no rewrite depends on its \
+                 values: {reason}",
+                binding.path.display()
+            ),
+            None => nsl_log::nsl_log!(
+                INFO,
+                "nsl",
+                "[nsl] weight-aware: the model is loaded from {}; rewrites may depend on the \
+                 values of {specializable} of its {} tensors, which the program checks at \
+                 startup",
+                binding.path.display(),
+                binding.stored.len()
+            ),
+        }
+    }
     compiler.features.weight_integrity = Some(integrity);
     compiler.features.weight_map = Some(wmap);
     Ok(())

@@ -464,6 +464,11 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
                     // Populated from the semantic analysis in the build paths
                     // that have it in scope.
                     index_map: std::collections::HashMap::new(),
+                    // `-w` asks for the program to run with the file's values;
+                    // the build paths that produce a program bind it
+                    // (`pipeline::bind_weights_file`).
+                    from_flag: weights.is_some() && !standalone,
+                    bind: None,
                 },
                 linear_types_enabled: linear_types,
                 // Semantic-analysis facts: all empty here. The loader fills

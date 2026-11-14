@@ -147,6 +147,7 @@ pub mod pca_tile_config;
 pub mod pca_tilerange;
 pub mod pca_tileskip;
 pub mod weight_aware;
+mod weight_bind;
 
 // --- Distributed & parallelism -------------------------------------------
 pub mod context_parallel;
@@ -1631,6 +1632,15 @@ pub struct WeightsOptions {
     pub config: weight_aware::WeightAwareConfig,
     /// M52: Whether to emit a weight analysis report (nsl check --weight-analysis)
     pub analysis: bool,
+    /// Whether `file` was given with `-w` / `--weights` (as opposed to found
+    /// in the source's `load_safetensors(...)`): the CLI's cue to bind.
+    pub from_flag: bool,
+    /// The program runs with the file's values: constructors load them, and
+    /// rewrites may then depend on them. `None` (the default, and what every
+    /// build that does not produce a program to run leaves it at) keeps the
+    /// file an input to planning only: nothing is loaded and no rewrite that
+    /// depends on a weight's values is made.
+    pub bind: Option<weight_aware::WeightBinding>,
     /// M62 Task 6: maps `self.<field>` `NodeId`s to weight-array indices for
     /// `@export` model methods compiled via `WeightPtrsArray` self-resolution.
     /// Populated from `nsl_semantic::AnalysisResult.weight_index_map` before

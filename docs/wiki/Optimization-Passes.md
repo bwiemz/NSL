@@ -340,6 +340,108 @@ admission cases, shape-rule semantics, packing non-overlap),
 `crates/nsl-cli/tests/transient_arena_gpu_gate.rs` (report plumbing),
 `crates/nsl-runtime/src/transient_arena.rs` unit tests (pin exactness).
 
+## Weight-aware compilation (`-w weights.safetensors`)
+
+`nsl run -w FILE` and `nsl build -w FILE` do two things with a safetensors
+file, and the second is only correct because of the first.
+
+**1. The program runs with the file's values.** Every model constructor
+copies the file's tensors into the parameters the file names, in place,
+before the constructor returns, so no user code can read a parameter before
+it is loaded. `main` opens the file (memory-mapped) before anything else. In
+the constructor of a model `M`, a parameter is looked up by:
+
+| Parameter | Names tried, in order |
+|---|---|
+| a tensor field `f` of `M` | `M.f`, then `f` |
+| a parameter of a nested model or model array | its path from the instance, as `model_save` spells it (`blocks[0].w`), then dotted (`blocks.0.w`) |
+
+A nested model's own constructor runs first, so the enclosing model's
+path-named tensor is the one that stays. F16, BF16, F32 and F64 tensors are
+converted to the field's float width. A shape that differs from the field's
+is an error (at compile time when the field's shape is a literal, otherwise
+when the constructor runs), with one exception: a bare name `f` that more
+than one parameter could claim (another model has a tensor field `f`, or the
+file also holds a tensor whose name ends in `.f`) is loaded where the shapes
+agree and skipped where they do not. A tensor that no parameter of a model
+the entry module defines or imports could be loaded from is listed in the
+report. Adapter tensors (`@adapter`) are not
+model fields and are not loaded by `-w`; a base-only file loads into a model
+with adapters, as it does through `model_load`.
+
+**2. Code may be specialized on the values of parameters that are never
+written.** The value-dependent rewrites are constant folding of a product or
+sum of two weights (`[nsl] M52b: constant-folded ...`) and elimination of a
+matmul by a near-identity weight (`[nsl] M52b: eliminated near-identity
+matmul ...`). Each is made only when the parameter holds the file's values
+for the whole run:
+
+- the build loads the file (`-w` on `nsl run` or on an `nsl build` that
+  produces an executable; not `nsl check`, a shared library, or a weights
+  file the compiler found through `load_safetensors("...")` in the source,
+  which stay inputs to planning only);
+- nothing in the program writes the parameter after it is loaded. A `train`,
+  `distill` or `quant` block, a `model_load`, any in-place tensor operation
+  (`copy_data`, `copy_`, `*_inplace`) or an element store through a variable
+  (`t[i] = v`) counts as writing every parameter; an assignment to a field
+  (`m.w = ...`, `self.w += ...`) counts as writing every field of that name.
+  The analysis is over the whole program, and whatever it cannot rule out is
+  a write;
+- one tensor, and only one, can reach the field: the file holds no other
+  tensor whose name ends in the field's name, and for a bare name no other
+  model has a tensor field of that name.
+
+A rewrite that is refused is not an error. The ordinary code is compiled,
+and the report says which parameter and why:
+
+```
+[nsl] weight-aware: 'Toy.w' is loaded from the file's 'w'
+[nsl] weight-aware: not specialized on 'w' (near-identity matmul elimination skipped): the program has a train block, which updates parameters
+```
+
+Shape specialization (reading a dimension from the file) and the planners
+that take the file as an input (CPDT, WRGA, CEP, KV-cache quantization) are
+not affected by any of this, except that a program planned from the file now
+also runs with it: `nsl run --cpdt full -w FILE` used to choose each block's
+moment precision from the file's magnitudes and then train from the model's
+initializer.
+
+**3. A specialized program is tied to the file.** The compiler records the
+SHA-256 of every stored tensor a rewrite was allowed to depend on (dtype,
+shape and bytes; every tensor of the file when the program writes none, none
+when it trains). At startup the program hashes those tensors as it finds
+them in the file and refuses to run if one differs or is gone:
+
+```
+nsl: -w: the weights file '/data/model.safetensors' has changed since this program was compiled with it: parameter 'w' has different contents. The compiled code depends on that parameter's values, so it would compute wrong results with this file. Recompile with the file as it is now.
+```
+
+The digest of that list is also a key of the run's execution fingerprint
+(`wspec=<16 hex digits>`, classed with the keys that change the arithmetic),
+present only when the list is not empty. A program that specialized on
+nothing, because it trains or reassigns its parameters, carries no hashes
+and no key: it loads whatever the file holds when it starts, which is what a
+fine-tuning run wants.
+
+The path compiled into the program is the absolute path of the file given to
+`-w`. `--standalone -w` is a different mechanism (the file is bundled into
+the executable) and does no weight-aware compilation.
+
+Limits. The thresholds are tolerances, as before: a weight within
+`--dead-weight-threshold` of the identity counts as the identity, and
+dead-weight elimination zeroes values below the threshold in the compiler's
+copy before folding, so a folded constant can differ from the run-time
+product by that order. A one-element weight is no longer embedded as an
+immediate (only tensor fields are loaded; the note says so). The
+`NSL_M52C_SPARSE_MATMUL=1` path is withheld and is not covered by the rules
+above.
+
+Gates: `crates/nsl-cli/tests/weights_flag_binds_model_gate.rs` (loaded
+values, refused rewrites, the startup check on a built program),
+`crates/nsl-codegen/src/weight_aware.rs` unit tests (the write analysis, the
+hash and the expectation table), `crates/nsl-runtime/src/weights_file.rs`
+unit tests (header parsing, the mismatch message, dtype conversion).
+
 ## Per-pass descriptions
 
 ### CCR — Compiler-Chosen Recomputation

@@ -119,6 +119,8 @@ fn run_build_single(
     // M62 Task 6: route weight_index_map from semantic analysis into codegen so
     // compile_export_model_methods can resolve self.<field> → weight-array index.
     options.weights.index_map = analysis.weight_index_map.clone();
+    // `-w`: the program runs with the file's values (see `bind_weights_file`).
+    crate::pipeline::bind_weights_file(&mut options, &[&parse_result.module], &interner, entry);
     // Item 5: constructor-argument folding — dims for parameterized
     // submodule weights (`randn([d_model, d_ff])` under `Ctor(512, 1408)`),
     // which literal-only collection cannot derive. Routed through the
@@ -306,6 +308,18 @@ fn run_build_multi(
     }
 
     let mut obj_files: Vec<PathBuf> = Vec::new();
+
+    // `-w`: the program runs with the file's values. What it may be
+    // specialized on is decided over every module, and every module is
+    // compiled with the same decision (see `bind_weights_file`).
+    let bound_options = {
+        let mut bound = options.clone();
+        let all_modules: Vec<&nsl_ast::Module> =
+            graph.dep_order.iter().map(|p| &graph.modules[p].ast).collect();
+        crate::pipeline::bind_weights_file(&mut bound, &all_modules, &interner, entry);
+        bound
+    };
+    let options = &bound_options;
 
     // What the modules the entry imports are compiled with, and what their
     // model layouts are collected with: the entry's `@adapter` decorators go

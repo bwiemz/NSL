@@ -121,7 +121,15 @@ impl Compiler<'_> {
             // treats that as "unknown" rather than as a mismatch. A default
             // build must therefore still say so explicitly.
             {
-                let fp = self.compile_options.exec_fingerprint();
+                let mut fp = self.compile_options.exec_fingerprint();
+                // What the program was specialized on, when it was: emitted
+                // only then, like the layer-prune keys, so that a build with
+                // no value-dependent rewrite and an older checkpoint agree by
+                // both lacking it.
+                if let Some(key) = self.weight_fingerprint_key() {
+                    fp.push(',');
+                    fp.push_str(&key);
+                }
                 let fp_len = fp.len() as i64;
                 let fp_data_id = self.intern_string(&fp)?;
                 let fp_gv = self.module.declare_data_in_func(fp_data_id, builder.func);
@@ -133,6 +141,10 @@ impl Compiler<'_> {
                     &[fp_ptr, fp_len_val],
                 )?;
             }
+
+            // `-w`: open the weights file and check what the compile
+            // specialized on, before any constructor loads from it.
+            self.emit_weight_file_bind(&mut builder)?;
 
             // Item 4: install the matmul arithmetic alongside the fingerprint,
             // from the SAME clamped compile options that were just rendered

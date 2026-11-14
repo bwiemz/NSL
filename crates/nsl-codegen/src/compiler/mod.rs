@@ -564,6 +564,11 @@ pub struct FeatureConfigs {
     pub sparsity_hints: HashMap<NodeId, crate::weight_aware::SparsityHint>,
     /// M52: Weight integrity hash for embedding in .rodata
     pub weight_integrity: Option<crate::weight_aware::WeightIntegrity>,
+    /// The program is bound to the weights file (`weight_bind.rs`); copied
+    /// from the options when the compile starts, in every module of a build.
+    pub weight_binding: Option<crate::weight_aware::WeightBinding>,
+    /// Weight-aware report lines already printed, so each is said once.
+    pub weight_notes: std::collections::HashSet<String>,
 }
 
 impl FeatureConfigs {
@@ -601,6 +606,8 @@ impl FeatureConfigs {
             weight_map: None,
             sparsity_hints: HashMap::new(),
             weight_integrity: None,
+            weight_binding: None,
+            weight_notes: std::collections::HashSet::new(),
         }
     }
 }

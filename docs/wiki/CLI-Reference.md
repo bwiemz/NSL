@@ -169,7 +169,7 @@ nsl run [OPTIONS] <FILE> [-- <ARGS>...]
 | `--stream-arena` |  |  | Item 10 (requires --weight-stream): batch each layer's per-param transfers into ONE contiguous host&lt;-&gt;device transfer through a stable, reused device staging arena. Bit-exact with per-param |
 | `--stream-prefetch` |  |  | Item 11 (requires --stream-arena): double-buffer the backward weight stream with async prefetch + per-pack CUDA events. Bit-exact |
 | `--stream-async-writeback` |  |  | Item 11 writeback half (requires --stream-arena): async pack writeback DtoH on the transfer stream; scatter at drain points |
-| `-w`, `--weights` | `<WEIGHTS>` |  | Path to the model weights file (.safetensors) for the weight-aware CPDT path. Mirrors `nsl build -w/--weights` |
+| `-w`, `--weights` | `<WEIGHTS>` |  | Path to the model's weights file (.safetensors). The program runs with the file's values: every parameter the file names is loaded when its model is constructed. Also the input to the weight-aware planners (CPDT, WRGA, CEP). Mirrors `nsl build -w/--weights` |
 | `--activation-report` |  |  | Milestone A: print the activation-contract report — one line per requested optimization surface (flag or decorator) with what became of it (applied / declined / witnessed / UNSATISFIED) |
 | `--allow-inert-requests` |  |  | Milestone A escape hatch: demote unsatisfied activation contracts (a requested feature whose owner recorded no disposition) from a hard error to a warning. For migration only — an inert request is a correctness bug in the invocation or the compiler |
 | `--allow-unknown-decorators` |  |  | Milestone A escape hatch: demote UNKNOWN-decorator-name errors to warnings (one release, for migration). Documented-but-unimplemented decorators (e.g. @tie_weights) stay hard errors — accepting those would resurrect the silence this flag's namespace close exists to end |
@@ -193,7 +193,7 @@ nsl build [OPTIONS] <FILE>
 | `--emit-obj` |  |  | Emit only the object file (skip linking). It goes to -o when given, else &lt;stem&gt;.o beside the source. A program that imports other modules emits one object per module into a scratch directory instead (each path is printed), and -o does not apply |
 | `--dump-ir` |  |  | Print the Cranelift IR for each function |
 | `--standalone` |  |  | Produce a zero-dependency standalone bundle (requires -w/--weights) |
-| `-w`, `--weights` | `<WEIGHTS>` |  | Path to the model weights file to bundle with the standalone executable |
+| `-w`, `--weights` | `<WEIGHTS>` |  | Path to the model's weights file (.safetensors). The built program loads it into the model when it starts (every parameter the file names), and may be specialized on the values of parameters it never writes; it then refuses to start if those tensors have changed. With --standalone the file is bundled into the executable instead |
 | `--embed-weights` | `<EMBED_WEIGHTS>` | `auto` | Weight embedding strategy: auto, always, never (default: auto) |
 | `--embed-threshold` | `<EMBED_THRESHOLD>` | `268435456` | Size threshold in bytes above which auto mode streams weights instead of embedding (default: 256 MiB) |
 | `--no-autotune` |  |  | Skip @autotune benchmarking; use middle values from each parameter range |
