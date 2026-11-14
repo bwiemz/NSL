@@ -104,6 +104,12 @@ fn error_of(src: &str) -> String {
 /// every runtime function unconditionally).  Mirrors the relocation-walk
 /// in `csha_gap_a_forward_saves.rs`.
 fn called_runtime_symbols(src: &str) -> std::collections::HashSet<String> {
+    runtime_call_counts(src).into_keys().collect()
+}
+
+/// For each runtime function `src` calls, the number of call sites (one
+/// relocation each).
+fn runtime_call_counts(src: &str) -> std::collections::HashMap<String, usize> {
     use object::{Object, ObjectSection, ObjectSymbol};
 
     let mut interner = nsl_lexer::Interner::new();
@@ -136,13 +142,13 @@ fn called_runtime_symbols(src: &str) -> std::collections::HashSet<String> {
         })
         .collect();
 
-    let mut called = std::collections::HashSet::new();
+    let mut called = std::collections::HashMap::new();
     for section in file.sections() {
         for (_offset, reloc) in section.relocations() {
             if let object::RelocationTarget::Symbol(idx) = reloc.target()
                 && let Some(name) = name_by_index.get(&idx)
             {
-                called.insert(name.clone());
+                *called.entry(name.clone()).or_insert(0) += 1;
             }
         }
     }
@@ -245,6 +251,36 @@ fn a_tokenizer_and_prompt_add_the_runtime_encode_and_the_text_tail() {
     let called = called_runtime_symbols(&serve_src(STATIC, SAMPLING, GENERATE));
     assert!(called.contains("nsl_cfie_generate") && called.contains("nsl_cfie_bind_model"));
     assert!(!called.contains("nsl_tokenizer_load"));
+}
+
+/// Each `generate()` allocates its token buffer (`nsl_alloc`, capacity
+/// `max_new_tokens`) and must free it: the buffer was never freed, one per
+/// call. Counted as call sites in the object: an endpoint calling
+/// `generate()` twice has two more `nsl_alloc` and two more `nsl_free`
+/// sites than one that does not call it, with and without the tokenizer
+/// tail, plain and speculative.
+#[test]
+fn every_generate_frees_its_token_buffer() {
+    const TWICE: &str = "            let n = generate(prompt, prompt, 0)\n            let m = generate(prompt, prompt, 0)\n            print(n + m)";
+    let tokenizer = format!(
+        "{STATIC}        weights: \"model.safetensors\"\n        tokenizer: \"tokenizer.json\"\n        prompt: \"Hello\"\n        max_new_tokens: 16\n        eos_token_id: 2\n"
+    );
+    let speculative = format!("{SAMPLING}\n{DRAFT}");
+    for (what, config, sections) in [
+        ("plain", STATIC, SAMPLING),
+        ("tokenizer", tokenizer.as_str(), SAMPLING),
+        ("speculative", STATIC, speculative.as_str()),
+    ] {
+        let none = runtime_call_counts(&serve_src(config, sections, NO_GENERATE));
+        let two = runtime_call_counts(&serve_src(config, sections, TWICE));
+        let count = |m: &std::collections::HashMap<String, usize>, f: &str| m.get(f).copied().unwrap_or(0);
+        assert_eq!(count(&two, "nsl_alloc"), count(&none, "nsl_alloc") + 2, "{what}: nsl_alloc sites");
+        assert_eq!(
+            count(&two, "nsl_free"),
+            count(&none, "nsl_free") + 2,
+            "{what}: each generate() must free the buffer it allocated"
+        );
+    }
 }
 
 #[test]

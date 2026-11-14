@@ -2957,6 +2957,10 @@ impl Compiler<'_> {
                 builder.seal_block(merge_blk);
                 state.current_block = Some(merge_blk);
             }
+            // The token buffer is this call's alone: the drivers write into
+            // it during the call and `nsl_cfie_tokens_to_tensor` copies out
+            // of it. It used to be left allocated, one buffer per call.
+            self.compile_call_by_name(builder, "nsl_free", &[out_ptr])?;
             return Ok(rc);
         }
 
