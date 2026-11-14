@@ -504,6 +504,12 @@ is as of 2026-11-13.
 
 ### Open
 
+- An inference-only program that dispatches through `moe_dispatch`, built
+  with `--cpdt full --weights`, now compiles and then stops at run time with
+  "invalid tensor handle 0x2". The compile used to be refused as inert, which
+  hid it; the gate for that case (`cpdt_model_facts_gate`) checks the compile
+  only. Reproduced by running. Right: find the handle that is passed before
+  it is created, or refuse the configuration at compile time again.
 - The INT8 blockwise code, which is not wired into the optimizer, is a linear
   absmax quantizer, and that is unsound for `v`: with a five-decade spread
   inside a block the small elements round to zero and the median step is 33
