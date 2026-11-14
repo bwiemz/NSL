@@ -285,11 +285,12 @@ itself was not opened.
 
 WRGA is switched on by decorators only: `@adapter(type=lora|ia3|gatedlora,
 target=["Class.field"], rank=, alpha=)`, `@freeze(include=|exclude=)` and
-`@wrga(mode=, budget=, target=, layers=, adapter=)`. `nsl run` has no WRGA
-flag. `nsl build` has `--wrga-report` and `--wrga-fold-allocations`;
+`@wrga(mode=, budget=, target=, adapter=)`. `nsl run` has no WRGA flag.
+`nsl build` has `--wrga-report` and `--wrga-fold-allocations`;
 `nsl check` has `--wrga-analyze`, `--wrga-compare`, `--wrga-ablate` and
 `--wrga-target`. No shipped model uses any of the three decorators; only
-test fixtures do, all with 2-D inputs and square 4×4 or 8×8 weights.
+test fixtures do. They cover 2-D and 3-D inputs, square and non-square
+weights, and the standard library's `Linear`.
 
 - **Dead-gradient elimination (Innovation 1): implemented, but not by
   WRGA.** It is the generic source-AD pass `eliminate_dead_gradients` in
@@ -303,24 +304,31 @@ test fixtures do, all with 2-D inputs and square 4×4 or 8×8 weights.
   the train block's parameter list, so they receive no update and no
   optimizer state. Checked with SGD and with AdamW weight decay, on CPU and
   GPU.
-- **`@adapter` (LoRA, IA³, gated LoRA): partial.** The rewrite lives in
-  `crates/nsl-codegen/src/wrga_adapter_rewrite.rs`, with
-  `wrga_adapter_inject.rs` and `wrga_adapter_init.rs` beside it. LoRA is
+- **`@adapter` (LoRA, IA³, gated LoRA): implemented, without merge.** The
+  target is resolved in `crates/nsl-codegen/src/wrga_adapter_inject.rs`,
+  the tensors are built in the model's constructor by
+  `wrga_adapter_init.rs`, and the forward pass is rewritten by
+  `wrga_adapter_rewrite.rs`. LoRA is
   `x @ W + ((x @ A) @ B) * (alpha / rank)` with A of shape [in, r], B of
   shape [r, out] initialised to zero, and alpha defaulting to the rank. IA³
-  is `(x @ W) * gamma` with gamma initialised to one. On the default
-  (unfused) path the gradients of LoRA, frozen-base LoRA, IA³ and gated
-  LoRA agree with PyTorch autograd in 64-bit floats to within 7e-8 after
-  two SGD steps, for 2-D and 3-D inputs, under both tape and source AD. The
-  rewrite matches only the form `x @ self.w`, the rank is the declared
-  `rank=` or 2, and there is no save, merge or unmerge for adapters.
+  is `(x @ W) * gamma` with gamma initialised to one. The rewrite matches
+  `x @ self.w` and `x @ self.w.transpose(0, 1)`, on a weight of any 2-D
+  shape, in a model defined in the decorated file or imported into it; a
+  target that attaches nowhere is a compile error. The rank is the
+  declared `rank=` or 2. The gradients agree with an f64 reference for
+  2-D and 3-D inputs under both tape and source AD. `model_save` and
+  `model_load` carry the adapter tensors. There is no merge or unmerge
+  operation; a LoRA update can be folded into its weight in NSL source,
+  since the adapter tensors are readable and assignable fields.
 - **Roofline placement (Innovation 2): report-only.**
   `crates/nsl-codegen/src/wrga_roofline.rs` is fed by
-  `infer_sites_from_wengert` in `wrga.rs`, which supplies placeholder sites
-  (512×512, 2-byte elements, batch 1, sequence 128) rather than the model's
-  shapes. The result appears only in the `--wrga-report` output; the
-  adapters that exist come solely from `@adapter`. Neither side is right
-  here; see E4, E5 and E7.
+  `infer_sites_from_wengert` in `wrga.rs`. A site has its weight's real
+  shape when the model definition or the checkpoint gives it, and a
+  nominal activation (one sequence of 128 tokens, 2-byte elements), at
+  which every matmul is memory-bound on every GPU in the table. With
+  declared adapters the sites are the adapted weights and the stage
+  classifies them; otherwise it suggests an adapter per site, which
+  nothing builds. Neither side is right here; see E4, E5 and E7.
 - **Spectral rank allocation (Innovation 3, "requires --weights"):
   report-only.** A randomized SVD exists (`run_spectral` in `wrga.rs`,
   `compute_spectral_rank` in `crates/nsl-codegen/src/wrga_spectral.rs`), but
@@ -328,39 +336,45 @@ test fixtures do, all with 2-D inputs and square 4×4 or 8×8 weights.
   uses the declared rank or 2. Only the top 16 singular values are kept, so
   the effective rank is at most 16 and the values in the proposal's sample
   report (48.2, 52.1, 89) cannot occur. Neither side is right; see E8.
-- **Epilogue fusion (Innovation 4): partial, opt-in.** PTX kernels for LoRA
-  and gated LoRA are emitted by `crates/nsl-codegen/src/wrga_fused_ptx.rs`
-  and launched from `crates/nsl-runtime/src/fused_adapter.rs`. They need a
-  pinned target (`--target sm_80` or later) and `NSL_WRGA_FUSED_CUDA=1`.
-  The kernel computes in half precision, handles 2-D inputs only, and
-  measured 15–67× slower than cuBLAS (E5). The IA³ "fused" path always
-  runs the CPU-style arithmetic. The implementation's default, unfused, is
-  the right side.
+- **Epilogue fusion (Innovation 4): partial, opt-in.** PTX kernels for LoRA,
+  gated LoRA and IA³ are emitted by
+  `crates/nsl-codegen/src/wrga_fused_ptx.rs` and launched from
+  `crates/nsl-runtime/src/fused_adapter.rs`. They need a pinned target
+  (`--target sm_80` or later) and `NSL_WRGA_FUSED_CUDA=1`, for a weight
+  whose shape is a literal in the model definition. The kernels compute in
+  half precision, handle contiguous 2-D operands only (anything else runs
+  the ordinary operations), and measured 15–67× slower than cuBLAS (E5).
+  The implementation's default, unfused, is the right side.
 - **Memory-planned activation sharing (Innovation 5): report-only.**
   `crates/nsl-codegen/src/wrga_memory.rs` produces a slot count that is
-  printed in the report. `apply_wrga_hints` in
-  `crates/nsl-codegen/src/memory_planner.rs` does not change the allocator,
-  and the sizes it is given are always zero. Neither side is right.
+  printed in the report. Every saved activation is live until the backward
+  pass has read it, so the count equals the number of activations: there
+  is nothing to share. `apply_wrga_hints` in
+  `crates/nsl-codegen/src/memory_planner.rs` does not change the allocator.
+  Neither side is right.
 - **`@wrga(mode=auto)`, "compiler synthesizes optimal adapter config":
   absent.** No adapter is created without `@adapter`; the full model
   trains.
-- **`mode=manual` and `mode=hybrid`: parsed, no effect on training.**
-  Trainability is decided by `@freeze` alone, under tape AD and source AD
-  alike, so neither mode changes what trains as the proposal describes.
-  The modes should be given a meaning or refused.
-- **`budget=0.5M`, `target=h100`: not honoured.** The budget must be an
-  integer literal and does not bound the adapter parameter count; the
-  `target=` written in the decorator does not reach the analysis.
+- **`mode=manual`: the same as `mode=auto`. `mode=hybrid`: refused.**
+  Trainability is decided by `@freeze` alone and adapters by `@adapter`
+  alone, under tape AD and source AD alike. `mode=hybrid` and its
+  `layers=` scope ask for automatic placement and are a compile error.
+- **`budget=`: a compile-time cap. `target=`: reaches the report.** The
+  budget must be an integer literal (`budget=0.5M` is not accepted); a
+  model whose declared adapters hold more parameters does not compile.
+  The target, written as an identifier or a string, selects the GPU of
+  the roofline stage; an unknown name is a compile error.
 - **Per-instance targets such as `"blocks.6.wq"`: absent.** Only
-  `Class.field` is accepted, and it applies to every instance.
+  `Class.field` is accepted, and it applies to every instance; a path is a
+  compile error.
 - **Custom adapter model (`adapter=GatedLoRA`, §8.2): absent.** It is
   validated and then reported as "(placement integration pending)". The
   built-in `type=gatedlora` uses `sigmoid(gate)` with the gate and B
   initialised to zero, unlike the proposal's `gate = ones` with no sigmoid.
   The implementation's initialisation is sound; the adapter starts as a
   no-op.
-- **`nsl_wrga_epilogue_fused_lora` (§7.3): present, unused.** It is defined
-  in `crates/nsl-runtime/src/peft/ffi.rs` and nothing calls it.
+- **`nsl_wrga_epilogue_fused_lora` (§7.3): absent.** The uncalled runtime
+  entry of that name has been removed.
 - **DoRA, rsLoRA scaling, adapter dropout, and an AdaLoRA-style rank
   schedule: absent.**
 
@@ -370,8 +384,9 @@ Defects found in this code are listed in Part 5.
 
 ## Part 4 — Recommended direction
 
-1. Finish plain LoRA first: any weight shape, the transposed-weight form
-   `x @ self.w.transpose(0, 1)`, adapters saved with the model, and merge.
+1. Finish plain LoRA first. Any weight shape, the transposed-weight form
+   `x @ self.w.transpose(0, 1)` and saving adapters with the model are
+   done (Part 5); merge is not.
 2. Withdraw the §2.5 table, the L / |L_a| formula and the "impossible in
    PyTorch" framing (E1–E3).
 3. Replace roofline placement and weight-spectrum ranks with something
@@ -415,164 +430,182 @@ under "Unreleased". The open list is as of 2026-11-13.
   back to the ordinary operations (`kernel_can_read` in
   `crates/nsl-runtime/src/fused_adapter.rs`).
 
-### Open
+- An adapter on a non-square weight aborted in every mode: for `w` of shape
+  [4, 6] used as `x @ self.w`, A was created as [6, 2] and the run stopped
+  on "matmul inner dimension mismatch (3x4 @ 6x2)", because the shape
+  literal was read as [out, in]. The adapter tensors are now sized from the
+  weight itself when the model is constructed, in the order its matmul uses
+  the two widths (`emit_adapter_init_sidetable` in
+  `crates/nsl-codegen/src/wrga_adapter_init.rs`), so a weight whose shape is
+  a constructor argument can be adapted too. The tests are in
+  `crates/nsl-cli/tests/wrga_adapter_targets_gate.rs`.
+- `@adapter` on a weight used as `x @ self.w.transpose(0, 1)`, the form of
+  the standard library's `Linear`, was accepted and did nothing: A and B
+  were allocated and handed to the optimizer but never entered the forward
+  pass. The rewrite now matches this form as well (`match_adapter_site` in
+  `crates/nsl-codegen/src/wrga_adapter_rewrite.rs`), with A as [in, rank]
+  and B as [rank, out] in both. A weight that no matmul of its model uses,
+  or that is used in both forms, is a compile error.
+- `@adapter(target=["Linear.w"])` on a model imported from another module
+  gave only a warning and attached nothing. The decorators of the entry
+  module are now handed to the modules it imports, each of which builds the
+  adapters of the models it defines (`options_for_imported_module` in
+  `crates/nsl-cli/src/pipeline.rs`), and a target that resolves to no model
+  or no weight field is a compile error (`resolve_sites` in
+  `crates/nsl-codegen/src/wrga_adapter_inject.rs`).
+- The class in an `@adapter` target was ignored: with models `Aaa` and
+  `Zzz` both owning a field `w`, `target=["Zzz.w"]` attached the adapter to
+  `Aaa`. The class is now taken as written. A target whose first part is
+  not a model class (a variable name, as in `"m.w"`) is a compile error
+  that lists the classes owning such a field.
+- Trained adapters were not saved: `model_save` followed by `model_load`
+  into a fresh model gave back the untrained loss. `model_save` now writes
+  the adapter tensors after the model's own, and `model_load` reads them
+  back; it also accepts a file that holds the base parameters alone, which
+  is what a fine-tune starts from (`compile_model_save` and
+  `compile_model_load` in `crates/nsl-codegen/src/expr/advanced.rs`,
+  `nsl_model_load_with_adapters` in `crates/nsl-runtime/src/checkpoint.rs`).
+  A file saved with adapters does not load into a model without them.
+  Merging an adapter into its base weight is still absent; see the open
+  list.
+- An expression on an adapter tensor read off a model, such as
+  `print(m.lora_A_Toy_w__lora.sum())`, printed the tensor's handle as a
+  large integer: the checker gave a synthesized adapter field no type. It
+  is now typed as a tensor (`check_member_access` in
+  `crates/nsl-semantic/src/checker/ops.rs`).
+- The randomized SVD behind the spectral figures was biased on low-rank
+  input: on an exactly rank-5 40×30 matrix the largest singular value came
+  out 1.333 instead of 1.0, because residual columns that were only
+  rounding error were normalised into the basis. `qr_orthonormalize` in
+  `crates/nsl-codegen/src/wrga_spectral.rs` now drops a column whose
+  residual is below 1e-10 of its original length and projects each column
+  twice; the unit test holds all five singular values to 1e-9.
+- A checkpoint stored as 8-bit floats was decoded as `byte / 127.0`: the
+  byte 0x80, which is −0.0, read as 1.008. `WeightDType::to_f64` in
+  `crates/nsl-codegen/src/weight_aware.rs` now decodes both 8-bit formats
+  (E4M3 and E5M2) as floating point.
+- `@wrga(mode=hybrid, layers=[...])` was accepted and changed nothing about
+  what is adapted or trained. It is now a compile error, as is `layers=`
+  under another mode: no adapter is placed automatically
+  (`validate_wrga_decorator` in `crates/nsl-semantic/src/wrga.rs`).
+  `mode=manual` and `mode=auto` behave alike. The report's trainable set no
+  longer depends on the mode (`select_trainable` in
+  `crates/nsl-codegen/src/wrga.rs`).
+- `@wrga(budget=N)` did not bound anything: it reached only the report's
+  rank suggestions, as a number of ranks. It is now a compile-time cap on
+  the parameters held by the adapters the program declares
+  (`check_wrga_decorators` in `crates/nsl-codegen/src/wrga_prescan.rs`), in
+  both AD modes, and the report's suggestions are brought under it
+  (`enforce_param_budget` in `crates/nsl-codegen/src/wrga_spectral.rs`).
+- `@wrga(target=h100)` was reported as "Target hardware: A100-SXM": the
+  decorator's target never reached the analysis, a target written as a
+  string stored the argument's name, and the fallback name "rtx5070ti"
+  matched no entry of the GPU table. The target now reaches the analysis
+  in both spellings, names are matched without regard to punctuation
+  (`resolve_gpu` in `crates/nsl-codegen/src/wrga.rs`), an unknown name is a
+  compile error, and a report made without a target says that the GPU
+  shown is the default.
+- With a frozen base and `--weights`, the analysis looked for sites among
+  the trainable parameters, which were then the adapter matrices
+  themselves, so no checkpoint key matched. The sites are now the weights
+  the declared adapters sit on (`infer_sites_from_wengert` in
+  `crates/nsl-codegen/src/wrga.rs`), with their real shapes, including a
+  weight used through a transpose. The spectral figures are computed for
+  them and still size nothing: the rank is the declared one.
+- `nsl check --wrga-analyze --weights w.safetensors` ignored the weights.
+  They are now passed to the analysis as `nsl build --weights` passes them
+  (`run_check_wrga_analyze` in
+  `crates/nsl-cli/src/commands/build/wrga_check.rs`), and the report has a
+  line for the spectral analysis when one ran.
+- `--wrga-report` printed "Activation memory: 15 tensors → 18 tensors",
+  comparing a count of operations with a count of tensors, and "Backward
+  pruning: 27 ops → 19 ops (29.6% eliminated)" with nothing frozen,
+  counting inputs and constants as eliminated. Both lines now compare the
+  backward pass with the one a model with every parameter trainable would
+  have (`prune` in `crates/nsl-codegen/src/wrga_prune.rs`), so a model with
+  nothing frozen reports 0.0% on both.
+- The report printed "Fused: 6/6 (100.0%)" for a program with no adapters,
+  in a build that runs unfused. The figure is now labelled "Fusible", the
+  line says whether the build uses the fused kernels, and for a program
+  that declares no adapter the whole line is headed "Suggested adapters
+  (none declared, none built)".
+- The adapter parameter count in the report was the suggested rank times
+  1024 per site. It is now computed from each weight's shape (the literal
+  in the model definition, or the checkpoint's), for the declared adapters
+  when there are any; sites whose shape is not known are counted
+  separately and said to be left out.
+- The baselines of `--wrga-compare` were not computed: every baseline's
+  backward and activation columns were the constant 100%, its fusion
+  column 0%, and the "AdaLoRA" row was WRGA's own count. The table now has
+  the parameter counts only (this plan, LoRA at rank 16, GaLore, ReFT), and
+  says why the other figures are not given.
+- "Memory plan: 18 live activations → 5 slots" ended each saved
+  activation's lifetime at its last forward use, although the backward
+  pass reads all of them later. Their lifetimes now run to the end of the
+  forward pass, so the plan reports one slot per activation; it is still
+  not applied.
+- The warning "alpha is only meaningful for LoRA; ignored for
+  ia3/gatedlora" was false for gated LoRA, which scales by alpha / rank as
+  LoRA does. It is now given for IA³ only.
+- The documentation of `AdapterConfig.rank` and of
+  `crates/nsl-codegen/src/wrga_roofline.rs` said that an analysis picks the
+  rank and that placements differ between GPUs. Both now say what happens:
+  the rank is the declared one or 2, and every matmul site is classified
+  memory-bound on every GPU in the table because sites are costed at a
+  nominal activation.
+- The check that a fused site left no `x @ A` intermediate could not fire
+  (it searched for a name that is never produced) and is removed, with the
+  test of it that asserted nothing.
+- The fusion plan paired placement i with the i-th rank of a list in
+  another order. It now looks each placement's rank up by name, and the
+  spectral results are in name order rather than hash order.
+- `nsl_wrga_epilogue_fused_lora` and the module around it
+  (`crates/nsl-runtime/src/peft/`) had no caller and are removed.
 
 - With the fused path opted in (`NSL_WRGA_FUSED_CUDA=1` and a pinned
   target), the GPU kernel computes in half precision, including the base
-  product `x @ W`, with no notice. On 2-D non-constant inputs the result
-  was off by up to 1.0e-3 (relative 3.3e-4) against a 64-bit reference.
-  Where: `try_cuda_launch_fused_lora` in
-  `crates/nsl-runtime/src/fused_adapter.rs`. Reproduced by running.
-- The class in an `@adapter` target is ignored. With models `Aaa` and `Zzz`
-  both owning a field `w`, `target=["Zzz.w"]` attaches the adapter to `Aaa`
-  with only an INFO line; the adapter on `Aaa` trains and `Zzz` gets none.
-  Where: `run_with_compiler` in
-  `crates/nsl-codegen/src/wrga_adapter_inject.rs`. Reproduced by running.
-  Right: honour the class, and make an ambiguous field an error.
-- Trained adapters are not saved. A frozen-base LoRA run took the loss from
-  1.3207 to 0.3248; `model_save` followed by `model_load` into a fresh
-  model gave 1.3207 again, with no message. There is no merge, so a LoRA
-  fine-tune has no persistent output. Where: `compile_model_save` in
-  `crates/nsl-codegen/src/expr/advanced.rs`. Reproduced by running.
-  Right: save and load the adapter tensors, and add merge and unmerge.
-- `print(m.lora_A_Toy_w__lora.sum())` prints a raw pointer value, a large
-  integer, instead of the sum: a synthesized adapter field has no type
-  unless it is first bound with `let a: Tensor = ...`. The cause was not
-  located; these fields are resolved in `compile_member_access` in
-  `crates/nsl-codegen/src/expr/access.rs`. Reproduced by running.
-- The randomized SVD behind the spectral figures is biased on low-rank
-  input. On an exactly rank-5 40×30 matrix the largest singular value came
-  out 1.333 instead of 1.0, because numerically zero residual columns are
-  normalised (max |QᵀQ − I| = 0.70); the unit test accepts this as a
-  "known bias". Where: `qr_orthonormalize` in
-  `crates/nsl-codegen/src/wrga_spectral.rs`. Numeric check.
-- A checkpoint stored as 8-bit floats is decoded as `byte / 127.0`, not as
-  floating point: the byte 0x80, which is −0.0, reads as 1.008. Spectral
-  analysis of such a checkpoint is meaningless, and nothing says so.
-  Where: `WeightDType::to_f64` in `crates/nsl-codegen/src/weight_aware.rs`.
-  By reading the code only.
-- `@adapter` on a weight used as `x @ self.w.transpose(0, 1)`, the form of
-  the standard library's `Linear`, is accepted and does nothing: A and B
-  are allocated and handed to the optimizer but never enter the forward, A
-  is unchanged, B stays zero, and the run exits 0 with no message. Where:
-  `match_adapter_site` in `crates/nsl-codegen/src/wrga_adapter_rewrite.rs`.
-  Reproduced by running. Right: match this form, or fail the build.
-- `@adapter(target=["Linear.w"])` on a model imported from the standard
-  library gives only a warning, "field 'w' not found in any known model".
-  With `@freeze` beside it nothing trains and the loss does not change.
-  Where: `run_with_compiler` in
-  `crates/nsl-codegen/src/wrga_adapter_inject.rs`. Reproduced by running.
-  Right: a target that resolves to no field is a compile error.
-- `@wrga(mode=manual)` and `@wrga(mode=hybrid, layers=[...])` are accepted
-  and change nothing about what trains (see Fixed). `select_trainable` in
-  `crates/nsl-codegen/src/wrga.rs` still matches `Class.field` targets and
-  bare layer prefixes against instance paths such as `m.b1.wq`, so the set
-  it gives the report is empty in these modes. By reading the code only.
-  Right: give the modes a meaning, or refuse them.
-- `@wrga(budget=N)` does not bound the adapter parameter count. On six
-  32×32 sites with weights supplied, `budget=1000` and `budget=100000` both
-  gave 6,144 parameters, and `budget=0` (unbounded) gave 4,352. The
-  parameter count is passed on as a total of ranks. Where: `run_spectral`
-  in `crates/nsl-codegen/src/wrga.rs` and `allocate_ranks` in
-  `crates/nsl-codegen/src/wrga_spectral.rs`. Reproduced by running.
-- `@wrga(target=h100)` is reported as "Target hardware: A100-SXM": the
-  decorator's target never reaches the analysis, and the build's fallback
-  name "rtx5070ti" matches no entry in the GPU table, so the default GPU is
-  used. Where: `analysis_to_wrga_inputs` in
-  `crates/nsl-cli/src/analysis_bridges.rs` and `invoke_wrga_if_enabled` in
-  `crates/nsl-codegen/src/stmt_pass_bridges.rs`. Reproduced by running.
-- A target written as a string literal, `@wrga(target="h100")`, stores the
-  argument's name instead of its value. Where: `validate_wrga_decorator`
-  in `crates/nsl-semantic/src/wrga.rs`. By reading the code only.
-- With a frozen base (`@freeze` plus `@adapter`) and `--weights`, the
-  spectral allocator cannot run: sites are inferred from the trainable
-  parameters, which are then the adapter matrices, so no checkpoint key
-  matches (a warning says so) and A keeps the declared rank or 2. Where:
-  `infer_sites_from_wengert` in `crates/nsl-codegen/src/wrga.rs`.
-  Reproduced by running. Right: key the sites on the frozen weights.
-- The documentation of `AdapterConfig.rank` says that without a declared
-  rank "WRGA picks the rank via roofline + spectral analysis". The rank is
-  then 2. Where: `AdapterConfig` in `crates/nsl-semantic/src/wrga.rs` and
-  `prescan_adapter_sites_from_decorators` in
-  `crates/nsl-codegen/src/wrga_prescan.rs`. Reproduced by running.
-- `nsl check --wrga-analyze --weights w.safetensors` ignores the weights
-  with no message; the report is the same with and without them. Where:
-  `run_check_wrga_analyze` in
-  `crates/nsl-cli/src/commands/build/wrga_check.rs`. Reproduced by running.
-- With the fused path opted in, the synthesized IA³ kernel can never
-  launch: the call is always emitted with kernel handle −1. Where:
-  `synthesize_ia3_fused_call` in
-  `crates/nsl-codegen/src/wrga_adapter_rewrite.rs`. By reading the code
-  only.
-- With the fused path opted in, an `@adapter` on a 3-D activation aborts at
-  the first optimizer step under `--source-ad`: the fused adjoints do not
-  sum over leading dimensions, so for `x` of shape [2, 3, 4] the weight
-  gradient has 32 elements, not 16. Right: flatten the leading dimensions.
-  Where: `generate` in `crates/nsl-codegen/src/source_ad.rs`. Reproduced
-  by running, when a pinned target alone selected this path.
-- An adapter on a non-square weight aborts in every mode: for `w` of shape
-  [4, 6] used as `x @ self.w`, A is created as [6, 2] and the run stops on
-  "matmul inner dimension mismatch (3x4 @ 6x2)". The shape is read as
-  [out, in]; the matched form needs [in, out]. Right: take the widths
-  from the use site. Where: `resolve_dims_for_target` in
-  `crates/nsl-codegen/src/wrga_adapter_inject.rs`. Reproduced by running.
-- `--wrga-report` prints "Activation memory: 15 tensors → 18 tensors (0.0%
-  eliminated)": the left figure counts operations and the right counts
-  tensors, and `--wrga-compare` then shows WRGA at "120.0%". "Backward
-  pruning: 27 ops → 19 ops (29.6% eliminated)", with nothing frozen, counts
-  inputs and constants as eliminated. Where: `prune` in
-  `crates/nsl-codegen/src/wrga_prune.rs`. Reproduced by running.
-- The report prints "Fused: 6/6 (100.0%)" for a program with no adapters,
-  in a build that runs unfused. Where: `render_report` in
-  `crates/nsl-codegen/src/wrga.rs`. Reproduced by running.
-- The adapter parameter count in the report is a placeholder. Without
-  weights, or when no checkpoint key matches, it is the suggested rank
-  times 1024 per site and the budget is ignored: 98,304 for a model whose
-  figure would be 6,144, and "Adapter parameters: 65536 | Sites: 4" for a
-  program with 256 adapter parameters on 2 weights. Where: `run_spectral`
-  in `crates/nsl-codegen/src/wrga.rs`. Reproduced by running.
-- The baselines of `--wrga-compare` are not computed for the program. The
-  "AdaLoRA" row is WRGA's own parameter count, and every baseline's
-  backward and activation columns are the constant 100% and its fusion
-  column 0%. Where: `compute_compare_baselines` in
-  `crates/nsl-codegen/src/wrga.rs`. Reproduced by running.
-- "Memory plan: 18 live activations → 5 slots (reuse 72.2%)" is suspected
-  to be unachievable. Each saved activation's lifetime ends at its last
-  forward use, but these are the tensors the backward reads later, so all
-  are live at the forward/backward boundary and shared slots would alias
-  them. The plan is not applied today. Where: `compute_var_ranges` in
-  `crates/nsl-codegen/src/wrga_memory.rs`. By reading the code only.
-- The warning "alpha is only meaningful for LoRA; ignored for
-  ia3/gatedlora" is false for gated LoRA: with `alpha=4, rank=2` the
-  adapter trains exactly as with scale 2.0. Where:
-  `validate_adapter_decorator` in `crates/nsl-semantic/src/wrga.rs`.
-  Reproduced by running. Right: drop the warning for gated LoRA.
-- The module documentation of `crates/nsl-codegen/src/wrga_roofline.rs`
-  says a model compiled for an RTX 5070 Ti and for an H100 receives
-  different placements. Every matmul site is the placeholder of
-  `infer_sites_from_wengert`, whose arithmetic intensity of 85.3 is
-  memory-bound on every GPU in the table (lowest half-precision ridge
-  151.7), so every site gets LoRA at the maximum rank. Numeric check.
-- The GPU tests of the fused kernels cannot detect a wrong kernel: the
-  LoRA fixture has `w = zeros` and `x`, A and B all ones, and its expected
-  16.0 ± 1e-4 is also what a kernel returns that drops the base product,
-  transposes A or B or mis-indexes an operand. Where: `BUILD4_SRC_GPU` in
-  `crates/nsl-cli/tests/wrga_adapter_runtime_equivalence.rs`. By reading
-  the code only. The IA³ and gated fixtures are constant fills as well.
-- No test trains a model with an adapter on a non-square weight, or checks
-  a `budget` that should bind, so neither defect above is guarded. Where:
-  `crates/nsl-cli/tests/`. By reading the code only.
-- The check that a fused site left no `x @ A` intermediate cannot fire. It
-  searches for `lora_A_<site>` with the site written with a dot ("Toy.w"),
-  while the field names use underscores ("lora_A_Toy_w__lora"). Where:
-  `verify_fused_sites_have_no_intermediate` in
-  `crates/nsl-codegen/src/wrga_fusion.rs`. By reading the code only.
-- The fusion plan pairs placement i with the i-th rank, but the ranks come
-  back in the iteration order of a hash map of checkpoint weights, which
-  differs from run to run, and only for the keys that matched. The pairing
-  is arbitrary; nothing consumes it today. Where: `build_fusion_plan` in
-  `crates/nsl-codegen/src/wrga_fusion.rs`, called from `run` in
-  `crates/nsl-codegen/src/wrga.rs`. By reading the code only.
-- `nsl_wrga_epilogue_fused_lora` (the proposal's §7.3 runtime entry) and
-  the module around it have no caller. Where:
-  `crates/nsl-runtime/src/peft/ffi.rs`. By reading the code only.
+  product `x @ W`, and nothing said so. The precision is unchanged: the
+  kernels are built on 16-bit tensor-core fragments. A build that
+  synthesizes them now warns that an adapted matmul runs in half precision
+  (`prescan_adapter_sites_from_decorators` in
+  `crates/nsl-codegen/src/wrga_prescan.rs`), and the environment-variable
+  reference says the same.
+- With the fused path opted in, an `@adapter` on a 3-D activation aborted
+  at the first optimizer step under `--source-ad`: the fused call's adjoint
+  rules did not sum the weight, A and B gradients over the activation's
+  leading dimensions, and summed the IA³ scale and the gate over one axis
+  only. Each gradient is now reduced to its parameter's shape (`generate`
+  in `crates/nsl-codegen/src/source_ad.rs`). The test,
+  `crates/nsl-cli/tests/wrga_adapter_gradients_gate.rs`, holds LoRA, gated
+  LoRA and IA³ to an f64 reference on a [2, 3, 4] input through tape AD,
+  source AD and the fused call.
+- No test trained a model with an adapter on a non-square weight, or
+  checked a budget that binds. Both now exist
+  (`crates/nsl-cli/tests/wrga_adapter_targets_gate.rs` and
+  `crates/nsl-cli/tests/wrga_mode_and_rank_gate.rs`), with references
+  computed in the tests in f64.
+
+### Open
+
+- There is no operation that merges an adapter into its base weight, or
+  takes it out again. A LoRA update can be folded in by hand in NSL source
+  (`m.w = m.w + (m.lora_A_<site> @ m.lora_B_<site>) * (alpha / rank)`, then
+  B set to zero), which a test exercises, but nothing does it for every
+  adapted weight of a model, or for IA³ and gated LoRA. Where it would go:
+  beside `compile_model_save` in `crates/nsl-codegen/src/expr/advanced.rs`.
+- With the fused path opted in, the synthesized IA³ kernel could never
+  launch: the call was always emitted with kernel handle −1, no IA³ kernel
+  was registered, and the launcher passed four of the kernel's six
+  arguments. The kernel is now synthesized, registered and launched with
+  all six (`synthesize_ia3_adapted` in
+  `crates/nsl-codegen/src/wrga_adapter_rewrite.rs`, `try_cuda_launch_fused_ia3`
+  in `crates/nsl-runtime/src/fused_adapter.rs`), but it has not yet been run
+  on a GPU, so whether it computes the right result is not known.
+- The GPU tests of the fused kernels could not detect a wrong kernel: the
+  LoRA fixture had `w = zeros` and `x`, A and B all ones, and the IA³ and
+  gated fixtures were constant fills as well. They are replaced by fixtures
+  with non-constant operands, shapes off the kernel's tile grid and a
+  reference computed in the test in f64
+  (`run_fused_kernel_fixture` in
+  `crates/nsl-cli/tests/wrga_adapter_runtime_equivalence.rs`). The new
+  tests have not yet been run on a GPU.
