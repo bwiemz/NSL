@@ -132,6 +132,13 @@ pub mod pca_tier_b {
     pub const TIER_B_SEQ_LEN_FLOOR: u32 = 128;
     /// Conservative-max seq_len baked into the Tier-B-on PTX SMEM allocation.
     pub const TIER_B_MAX_BAKED_SEQ_LEN: u32 = 16384;
+    /// Bytes of shared memory the segment-masked forward kernel reserves
+    /// for one row's 16-bit segment ids.
+    pub const SEGMENT_IDS_SMEM_BYTES: u32 = 32768;
+    /// The longest sequence whose segment ids fit that buffer. The kernel
+    /// copies one id per position with no bound of its own, so the runtime
+    /// must not launch it on a longer packed sequence.
+    pub const MAX_SEGMENT_MASKED_SEQ_LEN: u32 = SEGMENT_IDS_SMEM_BYTES / 2;
 }
 
 /// The C-API tensor descriptor (`NslTensorDesc` in every generated header):
