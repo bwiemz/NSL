@@ -29,14 +29,21 @@ freeing**: per-surface accounting showed the 500M/seq-1024 OOM held 5.36 GB
 of live adjoint temporaries (272 concurrent `nsl_add_f32` blocks) that all
 waited for the end-of-backward bulk free.
 
-Surfaces: `--checkpoint-blocks` (Block policy), `--checkpoint-selective` /
-`@checkpoint(policy="selective")` (matmul-class outputs saved, cheap ops
-replayed), `--checkpoint-budget-mib` (exact 0/1-knapsack SAVE/RECOMPUTE
-arbitration — per-victim costs are independent in this transform, so the
-paper's MILP has an exact solution; C-01 FASE-Deferred credit applied when
-parameter sizes are static), `--checkpoint-compress fp16|bf16` (phases 5-6:
-saved matmul-class activations stored in half precision via the CFTP-v7
-cast kernels).
+Surfaces: `--checkpoint-blocks` (Block policy), `--checkpoint-selective`
+(matmul-class outputs saved, cheap ops replayed), `--checkpoint-budget-mib`
+(0/1-knapsack SAVE/RECOMPUTE arbitration — per-victim costs are independent
+in this transform, so the knapsack is exact for the cost it is given, an
+operation count from static shapes), `--checkpoint-compress bf16` (phases
+5-6: saved matmul-class activations stored as bf16 via the CFTP-v7 cast
+kernels).
+
+Since these measurements were taken (2026-11): the
+`@checkpoint(policy="selective")` decorator and `--checkpoint-compress fp16`
+were withdrawn, the FASE-Deferred credit is no longer added to the budget,
+the budget's knapsack weighs by operation count rather than a per-byte
+class weight, and the compressed saves are cast at the end of each block
+segment instead of after the whole forward. The tables below were not
+re-measured.
 
 **Correctness gates** (`nsl-cli/tests/ccr_checkpoint_parity.rs`): baseline
 determinism probe, then strict — loss stream identical AND `model_save`
