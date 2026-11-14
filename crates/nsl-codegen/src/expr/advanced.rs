@@ -3063,7 +3063,7 @@ impl Compiler<'_> {
                     ct.shape,
                     ct.data.len()
                 );
-                let val = self.embed_const_tensor(builder, state, &ct)?;
+                let val = self.embed_const_tensor(builder, &ct)?;
                 Ok(Some(val))
             }
             _ => Ok(None),
@@ -3074,13 +3074,17 @@ impl Compiler<'_> {
     fn embed_const_tensor(
         &mut self,
         builder: &mut FunctionBuilder,
-        state: &mut FuncState,
         ct: &crate::weight_aware::ConstTensor,
     ) -> Result<Value, CodegenError> {
         use cranelift_module::{DataDescription, Linkage, Module};
 
         // Create a unique .rodata symbol for this constant
-        let sym_name = format!("__nsl_const_tensor_{}", self.string_pool.len());
+        // (A name not taken yet: a second fold, or the same method compiled
+        // twice, must not redefine the first one's symbol.)
+        let sym_name = (self.string_pool.len()..)
+            .map(|n| format!("__nsl_const_tensor_{n}"))
+            .find(|name| self.module.get_name(name).is_none())
+            .expect("an unbounded range has a free name");
         let data_id = self
             .module
             .declare_data(&sym_name, Linkage::Local, false, false)
@@ -3088,6 +3092,11 @@ impl Compiler<'_> {
 
         let mut desc = DataDescription::new();
         desc.define(ct.data.clone().into_boxed_slice());
+        // The runtime reads this as f32 or f64 in place. Without an
+        // alignment the linker puts it at any byte, and the first read of a
+        // folded constant was a misaligned dereference (a panic in a debug
+        // runtime).
+        desc.set_align(8);
         self.module
             .define_data(data_id, &desc)
             .map_err(|e| CodegenError::new(format!("failed to define const tensor data: {e}")))?;
@@ -3117,8 +3126,10 @@ impl Compiler<'_> {
             "nsl_tensor_from_static",
             &[data_ptr, shape_list, dtype_val],
         )?;
-
-        state.cleanup.tensor_temporaries.push(tensor);
+        // Not registered as a temporary here: the caller (the M52b fold in
+        // `compile_binary_op`) does that, and registering it twice freed the
+        // tensor twice at scope exit (glibc then aborted, or the next use
+        // found a freed handle).
         Ok(tensor)
     }
 
