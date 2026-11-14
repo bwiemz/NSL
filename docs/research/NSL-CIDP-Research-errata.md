@@ -253,18 +253,21 @@ no per-sample loss path.
 
 Older, adjacent code that a reader might mistake for it:
 
-- **The `dataset` block.** NSL source can write one, and the checker accepts
-  `source`, `format`, `transform`, `filter`, `shuffle`, `packing`,
-  `max_samples`, `shuffle_buffer`, `sequence_length`, `resume_from` and
-  others (`crates/nsl-semantic/src/checker/block.rs`). Code generation reads
-  only its packing statistics, for attention planning
+- **The `dataset` block.** NSL source can write one. It declares packing
+  statistics for attention planning and nothing else: the checker accepts
+  `packing`, `max_sequence_length`, `mean_doc_length` and
+  `doc_length_stddev`, as literals, and refuses every other field,
+  including `source`, `format`, `transform`, `filter`, `shuffle`,
+  `max_samples`, `shuffle_buffer`, `sequence_length` and `resume_from`
+  (`check_dataset_def`, `crates/nsl-semantic/src/checker/block.rs`). Code
+  generation reads those four
   (`crates/nsl-codegen/src/pca_activation.rs`). The block loads, filters and
   shuffles nothing, so it is not the compiled pipeline §1.2 describes. No
   shipped model uses one; all use `load_mmap` and `DataLoader(...)`.
 - **The DataLoader.** `crates/nsl-runtime/src/dataloader.rs`, reached from
   NSL source through `DataLoader(...)`. It is a multi-threaded Rust loader
-  over a flat token tensor with a seeded shuffle, resume, rank sharding and
-  optional packing at end-of-sequence tokens
+  over a flat token tensor with a seeded shuffle of sequence windows,
+  resume, rank sharding and optional packing at end-of-sequence tokens
   (`crates/nsl-runtime/src/packing.rs`). It has no weights, filters or
   deduplication. It is already free of Python, so the "zero Python overhead"
   gain the proposal claims is already in hand.
@@ -272,8 +275,10 @@ Older, adjacent code that a reader might mistake for it:
   and not reachable from NSL source. It assembles FineWeb sample-10BT
   (already filtered and deduplicated per dump upstream), Stack v3 and the
   repository corpus; removes benchmark contamination by exact line match
-  (`decontaminate.py`); mixes at document granularity and reports repetition
-  (`make_mix.py`); and runs checks on the output (`verify.py`). The project
+  (`decontaminate.py`), reporting how many benchmark problems that match
+  cannot see; mixes at document granularity and reports repetition
+  (`make_mix.py`); and runs checks on the output (`verify.py`), among them
+  a comparison of every validation document with the training stream. The project
   adds no deduplication or quality filter of its own.
 
 The offline tools are where the code and the proposal differ by design, and
@@ -323,35 +328,52 @@ as of 2026-11-13.
   compile error.
 - **The Glossary described CIDP as existing compiler behaviour.** The entry
   in `docs/wiki/Glossary.md` now says the proposal is not implemented.
+- **The train/val disjointness check passed on real overlap.** It compared
+  only the first and the last 2²⁰ tokens of the two files, so a validation
+  set copied whole from the middle of the training set passed.
+  `tools/hfcorpus/verify.py` now hashes every validation document of at
+  least 32 tokens, tests every training document against the set, and
+  fails with the count on a hit (test `tools/hfcorpus/test_hfcorpus.py`).
+  It has not been run against the full corpora.
+- **A `dataset` block accepted fields and honoured none of them.** `source`,
+  `format`, `transform`, `filter`, `shuffle`, `shuffle_buffer`,
+  `max_samples`, `sequence_length`, `pack_separator`, `separator_token_id`
+  and `resume_from` are each a compile-time error that says the block
+  loads no data. What is left is what code generation reads, as literals:
+  `packing`, `max_sequence_length`, `mean_doc_length`, `doc_length_stddev`
+  (tests in `crates/nsl-semantic/src/checker/tests.rs`).
+- **`DataLoader(..., shuffle = true)` permuted batches, not sequences.**
+  Each batch was a fixed contiguous slice of the corpus, so the same
+  sequences met in the same order every epoch. It now permutes the
+  sequence windows and fills each batch from the permutation, on the plain
+  and the packed path. The order of data in an existing shuffled run
+  changes, and a checkpoint saved by a shuffled run before the change is
+  refused on resume (tests in `crates/nsl-runtime/src/dataloader.rs`).
+- **The decontamination rate has blind spots, and now counts them.** Only
+  benchmark lines of at least 30 normalized characters are matched, so a
+  benchmark solution made of short lines is invisible.
+  `tools/hfcorpus/decontaminate.py` reports, per benchmark, how many
+  problems and how many reference solutions the rule could not detect if
+  they were copied whole, and the corpus manifest carries the counts. The
+  rule is unchanged, and contamination in training sets is still reported,
+  not removed, as documented.
+- **Mixed-in documents are placed by document index.** That stays the
+  default of `tools/hfcorpus/make_mix.py`, because the committed manifest
+  pins a mixture built that way; the script now states it, records the
+  placement in its manifest, and offers `--placement token`, which spreads
+  the added documents uniformly over token positions.
 
 ### Open, in the adjacent code
 
-- **The train/val disjointness check passes on real overlap.** It compares
-  only the first and the last 2²⁰ tokens of the two files, so a validation
-  set copied whole from the middle of the training set passes. Only the
-  Stack split has real evidence, from repository ids. Where: `main` in
-  `tools/hfcorpus/verify.py`. Reproduced by running. It should hash every
-  validation document, test it against the training set, and fail on a hit.
-- **A `dataset` block accepts fields and honours none of them.** A block
-  with a nonexistent `source` file, a `filter` that rejects everything,
-  `shuffle`, `max_samples` and `format = parquet` compiles and runs with no
-  effect and no error; `transform`, `shuffle_buffer` and `resume_from` are
-  the same. Where: `check_dataset_def` in
-  `crates/nsl-semantic/src/checker/block.rs`. Reproduced by running.
-- **`DataLoader(..., shuffle = true)` permutes batches, not sequences.**
-  Each batch is a fixed contiguous slice of `batch_size × seq_len` tokens,
-  so the same sequences meet in the same order every epoch, and each batch
-  is one contiguous region of the corpus. Where: `start_workers_at` in
-  `crates/nsl-runtime/src/dataloader.rs`. By reading the code only. Right
-  behaviour: permute window indices and gather `batch_size` per batch.
-- **The decontamination rate has blind spots.** Only benchmark lines of at
-  least 30 normalized characters are matched, so a benchmark solution made
-  of short lines is invisible, and contamination in training sets is
-  reported, not removed. This is documented behaviour. Where:
-  `benchmark_lines` and `doc_is_contaminated` in
-  `tools/hfcorpus/decontaminate.py`. By reading the code only.
-- **Mixed-in documents are placed by document index, not token position.**
-  Injected documents are spread uniformly over the base corpus's document
-  indices, so the local mixture share varies with base document length.
-  The effect is small. Where: `main` in `tools/hfcorpus/make_mix.py`. By
-  reading the code only.
+- **Benchmark contamination in training sets is reported, not removed, and
+  short-line benchmark problems are not matched.** Both are the documented
+  design of `tools/hfcorpus/decontaminate.py`; the second is now counted in
+  its report. A token-window overlap test beside the line rule would close
+  it. Where: `benchmark_lines` and `doc_is_contaminated`.
+- **The committed corpus was mixed by document index.** `make_mix.py` can
+  now place by token position, but the corpus named in
+  `models/datasets/CORPUS_MANIFEST_v2.json` was not rebuilt. The effect is
+  small.
+- **The new train/val document comparison has not been run on the
+  corpora.** They are not in the repository. Where: `shared_documents` in
+  `tools/hfcorpus/verify.py`.
