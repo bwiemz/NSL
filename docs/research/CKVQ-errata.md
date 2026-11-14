@@ -278,15 +278,15 @@ extension, and no pass over the compiler's mid-level IR.
 
 Two existing pieces are the nearest, and cover almost none of it:
 
-- **CFIE per-layer KV precision** — `crates/nsl-codegen/src/cfie_kv_quant.rs`
-  and `crates/nsl-codegen/src/cfie_kv_quant_ptx.rs`, enabled by the
-  serve-block key `kv_quant`. It chooses FP16 or INT8 per layer, from a
-  positional prior or from the largest singular value of the key and value
-  projection weights, and emits read-side attention kernels that dequantize
-  INT8 with one scalar scale per layer and per K or V, passed at launch.
-  Keys are stored after RoPE. There is no quantize-on-store kernel, nothing
-  launches the read kernels outside tests, and the scheme is not
-  per-channel, per-token or per-page.
+- **CFIE per-layer KV precision** — `crates/nsl-codegen/src/cfie_kv_quant.rs`,
+  reached through the serve-block key `kv_quant`. It ranks layers as FP16
+  or INT8 from a positional prior or from the largest singular value of the
+  key and value projection weights, and `kv_quant: "auto"` prints the
+  ranking in the CFIE build report as advice. Nothing applies it: the CFIE
+  KV cache is FP16 in every layer, and `kv_quant: "uniform_int8"` is a
+  compile error. (Read-side INT8 attention kernels existed until November
+  2026, with one scalar scale per layer and no kernel to write what they
+  read; they were removed.)
 - **`@kv_compress`** — `crates/nsl-runtime/src/kv_compress/`. CPU routines
   for INT8 per head or per token, INT4 per 64-element group, and an FP8
   cast, plus sliding-window and H2O eviction managers. The decorator's
@@ -330,7 +330,16 @@ reproduced by running, numeric check, or by reading the code only.
 
 ### Fixed
 
-None of the defects below has been fixed.
+- The CFIE INT8 read kernels took one scale per layer and per K or V, and
+  nothing said when it was fixed: a scale chosen from early tokens clips
+  later ones, and a scale updated later invalidates stored codes. Nothing
+  wrote INT8 KV, and no driver launched the kernels. They are deleted
+  (`crates/nsl-codegen/src/cfie_kv_quant_ptx.rs` and the runtime's
+  `nsl_cfie_launch_quant_attn`). The CFIE KV cache is FP16 in every layer.
+- The INT8 read-kernel GPU test could not see a wrong scale: it compared
+  the kernel with a CPU dequantization that used the same scale. It is
+  deleted with the kernels
+  (`crates/nsl-codegen/tests/cfie_kv_quant_gpu_parity.rs`).
 
 ### Open, in the adjacent code
 
@@ -340,12 +349,6 @@ None of the defects below has been fixed.
   dequantized with a scale they were not stored with. Scales should be kept
   per absolute token, or fixed in advance. It has no caller today.
   `crates/nsl-runtime/src/kv_compress/ffi.rs`. By reading the code only.
-- **The CFIE INT8 read kernels take one scale per layer and per K or V, and
-  nothing says when it is fixed.** A scale chosen from early tokens clips
-  later ones; a scale updated later invalidates stored codes. On synthetic
-  keys with outlier channels, one scale gives 13.6% mean relative error on
-  ordinary channels against 1.1% on outlier channels. Nothing writes INT8
-  KV. `crates/nsl-codegen/src/cfie_kv_quant_ptx.rs`. Numeric check.
 - **`@kv_compress(method="quantize", ...)` is accepted, reported as active,
   and does nothing.** Compile time and run time both log "KV cache
   compression"; the cache stays uncompressed. It should be refused or wired.
@@ -366,10 +369,6 @@ None of the defects below has been fixed.
   tokens × 64 dims, against FP16, INT8 is 8192/5124 = 1.60× (not 2×) and
   INT4 is 8192/3076 = 2.66× (not 4×). `bytes_per_element` in
   `crates/nsl-runtime/src/kv_compress/mod.rs`. Numeric check.
-- **The INT8 read-kernel GPU test cannot see a wrong scale.** It compares
-  the kernel with a CPU dequantization that uses the same scale.
-  `crates/nsl-codegen/tests/cfie_kv_quant_gpu_parity.rs`. By reading the
-  code only.
 - **The H2O and sliding-window managers have no callers.** H2O also evicts
   a block only when every token in it is in the lowest-score set, which
   scattered scores almost never produce, and it does not track blocks it

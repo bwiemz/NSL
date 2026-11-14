@@ -620,58 +620,53 @@ lowering accepts and `tests/kernel_block_ptxas.rs` assembles it.
 `src/cfie_decode_attention.rs::build` is the first CFIE kernel built as KIR
 (roadmap A2 step 9): block parameters for the tile loop and its three inner
 loops, an `SmemLayout` of four f32 regions, and a header of baked strides
-(`kv_strides`) that the sibling CFIE kernels compare with theirs. It targets
+(`kv_strides`) that the decode block compares with its own. It targets
 the backend floor rather than the serving GPU (see its module docs).
 `tests/cfie_decode_attn_kir_equivalence.rs` runs it against the frozen hand
 emitter (`tests/fixtures/cfie_decode_attn_hand.rs`) on a cooperative-CTA PTX
-interpreter, and `tests/cfie_decode_attn_ptxas.rs` assembles it for sm_75
-through sm_120. `backend_ptx::global_byte_array` prints the initialized
-`.global` array `src/cfie_grammar_ptx.rs` splices into the sampler module.
-`src/cfie_kv_quant_ptx.rs::build_layer` is the second: the per-layer
-KV-quant kernels are the same flash-decode KIR (`build_flash_decode`) over a
-`PoolLayout::Baked` pool, each half at its baked byte offset and read as f16
-or as int8 dequantized by its runtime scale.
-`tests/cfie_kv_quant_kir_equivalence.rs` runs them against their frozen hand
-emitter (`tests/fixtures/cfie_kv_quant_hand.rs`) on the same interpreter,
-which lives in `tests/support/cta_ptx_interp.rs`.
-`src/cfie_spec_sampler_ptx.rs::build_draft_sample` / `build_verify_probs`
-are the third: the draft greedy sampler and the target prob-row writer, one
-CTA each, built from shared sections (hidden load and RMSNorm, the
-row matvec, the streaming online-softmax pass) so the two kernels' shared
-arithmetic order — which the self-speculation anchor needs bit-identical —
-is one piece of code. `tests/cfie_spec_sampler_kir_equivalence.rs` runs
-them against `tests/fixtures/cfie_spec_sampler_hand.rs` on the same
-interpreter.
-`src/cfie_speculative_ptx.rs` holds the fourth and fifth.
-`build_rejection` is the serial rejection-sampling epilogue, its xorshift64*
-PRNG as 64-bit shift/xor/mul KIR ops. `tests/cfie_speculative_kir_equivalence.rs`
-runs it against `tests/fixtures/cfie_speculative_hand.rs`.
-`build_verify_attention` is the tree-mask verify attention kernel: the
-decode-attention kernel run once per tree node, assembled from the
-sections `build_flash_decode` is made of (`begin_flash_decode`,
-`load_q_row`, `prefix_pass`, `flash_tile`, `publish_output`), with one more
-`flash_tile` over the appended draft rows whose score hook applies the
-node's baked mask with a `Select`. `tests/cfie_spec_verify_kir_equivalence.rs`
-runs it against the same fixture.
-`src/cfie_sample_ptx.rs::build` is the sixth: the fused decode-sample
-kernel. Its hidden-row load, RMSNorm and row dot are
-`cfie_spec_sampler_ptx`'s sections (`hidden_load`, `rmsnorm_in_place`,
-`build_row_dot`, over a `Common` built by `common_at`), its PRNG draw is
-`cfie_speculative_ptx::build_prng_draw`, and its own sections are the
-replace-min candidate merge, the argmax, the softmax, the nucleus sort and
-cutoff, and the multinomial walk. `tests/cfie_sample_kir_equivalence.rs`
-runs it against `tests/fixtures/cfie_sample_hand.rs`.
-`src/cfie_persistent_ptx.rs::build` is the seventh and last: the persistent
-decode block, one CTA running a whole layer's decode step. Its attention is
-the flash-decode tile loop and output publish (`prefix_pass`,
-`publish_output`) run once per Q head over a `FlashCtx` its head loop
-builds, publishing each head's row to shared rather than global memory; its
-two RMSNorms start with `cfie_spec_sampler_ptx::sum_of_squares_tree`; its
-own sections are the RoPE pair projections (with `KirOp::Exp2`), the f16 KV
-append, the W_o and FFN matvecs and the silu. `smem_bytes` answers its
-static footprint before `emit`, which the verifier refuses past 48 KB.
+interpreter (`tests/support/cta_ptx_interp.rs`), and
+`tests/cfie_decode_attn_ptxas.rs` assembles it for sm_75 through sm_120. No
+serve binary carries this kernel: the decode block does its own attention
+from the same sections, and the standalone kernel is kept as the place
+those sections (`prefix_pass`, `flash_tile`, `publish_output`) are tested
+on their own. `backend_ptx::global_byte_array` prints the initialized
+`.global` array `src/cfie_grammar_ptx.rs` builds for a grammar's token
+masks; no serve build uses it (a `grammar:` section is refused).
+`src/cfie_spec_sampler_ptx.rs::build_draft_sample` is the draft model's
+greedy sampler, one CTA, built from sections the fused sampler shares
+(hidden load and RMSNorm, the row matvec) plus a streaming online-softmax
+pass. `tests/cfie_spec_sampler_kir_equivalence.rs` runs it against
+`tests/fixtures/cfie_spec_sampler_hand.rs` on the same interpreter.
+`src/cfie_sample_ptx.rs::build` is the fused decode-sample kernel. Its
+hidden-row load, RMSNorm and row dot are `cfie_spec_sampler_ptx`'s sections
+(`hidden_load`, `rmsnorm_in_place`, `build_row_dot`, over a `Common` built
+by `common_at`), and its own sections are the replace-min candidate merge,
+the argmax, the softmax, the nucleus sort and cutoff, the xorshift64* draw
+(`build_prng_draw`) and the multinomial walk.
+`tests/cfie_sample_kir_equivalence.rs` runs it against
+`tests/fixtures/cfie_sample_hand.rs`, and
+`tests/cfie_sampling_distribution.rs` runs it for thousands of positions on
+the interpreter and compares the tokens' frequencies with the exact
+probabilities.
+`src/cfie_persistent_ptx.rs::build` is the decode block, one CTA running a
+whole layer's decode step. Its attention is the flash-decode tile loop and
+output publish (`prefix_pass`, `publish_output`) run once per Q head over a
+`FlashCtx` its head loop builds, publishing each head's row to shared
+rather than global memory; its two RMSNorms start with
+`cfie_spec_sampler_ptx::sum_of_squares_tree`; its own sections are the RoPE
+pair projections (with `KirOp::Exp2`; element j of a head pairs with
+element j + head_dim/2, the convention of `stdlib/nsl/nn/rope.nsl`), the
+f16 KV append, the W_o and FFN matvecs and the silu. `smem_bytes` answers
+its static footprint before `emit`, which the verifier refuses past 48 KB.
 `tests/cfie_persistent_kir_equivalence.rs` runs it against
-`tests/fixtures/cfie_persistent_hand.rs`.
+`tests/fixtures/cfie_persistent_hand.rs`, and checks its rotated K record
+against values NumPy computed from the stdlib formula.
+Four more CFIE kernels were built this way and have been removed, because
+no driver launched them or (for the first two) because the driver stopped
+needing them: the rejection-sampling kernel and the verification prob-row
+writer (speculative decoding now verifies with the fused sampler itself),
+the tree-mask verification attention kernel, and the per-layer INT8/FP16
+KV read kernels (nothing wrote INT8 KV).
 `src/fused_linear_ce.rs::build_forward` is the first loss-head kernel (roadmap
 A2 step 10): the v1 single-CTA fused linear-CE forward, one builder for f32,
 f16 and bf16 (the storage dtype picks the element type of the inputs and of

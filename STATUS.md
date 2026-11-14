@@ -158,7 +158,8 @@ tests that are *not* part of the green-build contract (see README → Benchmarks
 - **WGGO** — weight-graph global optimization.
 - **WRGA** — weight-rewrite / gated-LoRA adapter codegen (PEFT fusion).
 - **CEP** — compiler-extracted pruning.
-- **CFIE** — fused inference engine (speculative, grammar, KV planning).
+- **CFIE** — fused inference engine (static KV layout, decode block, fused
+  sampler, draft-model speculative decoding).
 - **CSHA** — compiler-specialized hardware attention (FlashAttention-v2 tiers).
 - **CPDT** — compiler-planned distributed training (ZeRO, expert/precision tiers).
 - **CPKD** — compiler-planned knowledge distillation (distill block, frozen
