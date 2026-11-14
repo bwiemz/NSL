@@ -2532,8 +2532,53 @@ model Attention:
 // CFTP §4.3 G2 Strategy 3 (Item 4): @pca decorator collection tests
 // -----------------------------------------------------------------------
 
+/// `per_document` and `off` are recognised and refused: the first cannot
+/// be launched, the second was read by nothing. Neither may reach code
+/// generation as a strategy.
 #[test]
-fn pca_decorator_per_document_strategy_is_captured() {
+fn pca_decorator_refuses_the_strategies_nothing_honours() {
+    for (strategy, needle) in [
+        ("per_document", "@pca(strategy = per_document) is not supported"),
+        ("per_doc", "@pca(strategy = per_document) is not supported"),
+        ("off", "@pca(strategy = off) is not supported"),
+    ] {
+        let src = format!(
+            r#"
+model Tiny:
+    w: Tensor = ones([2, 1])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+let m = Tiny()
+let x = ones([4, 2])
+
+@pca(strategy = {strategy})
+train(model = m, epochs = 5):
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let pred = m.forward(x)
+"#
+        );
+        let res = analyze_source(&src);
+        assert!(
+            res.diagnostics.iter().any(|d| {
+                matches!(d.level, nsl_errors::Level::Error) && d.message.contains(needle)
+            }),
+            "{strategy}: expected an error containing {needle:?}, got {:?}",
+            res.diagnostics
+        );
+        assert_eq!(res.pca_configs.len(), 1);
+        assert!(
+            matches!(res.pca_configs[0].strategy, crate::cftp::PcaStrategy::Auto),
+            "{strategy}: a refused strategy must not be carried on: {:?}",
+            res.pca_configs[0].strategy
+        );
+    }
+}
+
+#[test]
+fn pca_decorator_segment_id_strategy_is_captured() {
     let src = r#"
 model Tiny:
     w: Tensor = ones([2, 1])
@@ -2544,26 +2589,25 @@ model Tiny:
 let m = Tiny()
 let x = ones([4, 2])
 
-@pca(strategy = per_document)
+@pca(strategy = segment_id)
 train(model = m, epochs = 5):
     optimizer: SGD(lr = 0.01)
     step(batch):
         let pred = m.forward(x)
 "#;
     let res = analyze_source(src);
-    assert_eq!(
-        res.pca_configs.len(),
-        1,
-        "expected one @pca config, got {:?}",
-        res.pca_configs.len()
-    );
+    assert_eq!(res.pca_configs.len(), 1);
     assert!(
-        matches!(
-            res.pca_configs[0].strategy,
-            crate::cftp::PcaStrategy::PerDocument
-        ),
+        matches!(res.pca_configs[0].strategy, crate::cftp::PcaStrategy::SegmentId),
         "strategy mismatch: {:?}",
         res.pca_configs[0].strategy
+    );
+    assert!(
+        !res.diagnostics
+            .iter()
+            .any(|d| matches!(d.level, nsl_errors::Level::Error) && d.message.contains("@pca")),
+        "{:?}",
+        res.diagnostics
     );
 }
 
@@ -2626,7 +2670,7 @@ train(model = m, epochs = 1):
 fn pca_decorator_multiple_occurrences_are_collected() {
     let src = r#"
 let m = Tiny()
-@pca(strategy = per_document)
+@pca(strategy = auto)
 train(model = m, epochs = 1):
     optimizer: SGD(lr = 0.01)
     step(batch):
