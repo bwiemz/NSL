@@ -96,6 +96,14 @@ fn last_dim_from_init_expr(expr: &nsl_ast::expr::Expr) -> Option<i64> {
     None
 }
 
+/// Refusal text for a packed (segment-masked) attention kernel requested
+/// without the causal mask.
+pub(crate) const SEGMENT_MASK_NEEDS_CAUSAL_MESSAGE: &str =
+    "packed attention without a causal mask is not supported: the forward kernel \
+     applies the document mask only as part of the causal mask, so a kernel built \
+     with `causal = false` for a `packing = true` dataset would attend across \
+     documents. Use causal attention with packing, or drop `packing = true`";
+
 impl Compiler<'_> {
     // ── Compile kernel definitions (PTX → .rodata, before functions) ──
 
@@ -844,6 +852,12 @@ impl Compiler<'_> {
             .map_err(CodegenError::new)?
             .finish(&self.bus)
             .map_err(CodegenError::new)?;
+        // The forward kernel folds the document test into the causal
+        // predicate and has no other place for it: built without the
+        // causal mask, a "segment-masked" kernel attends across documents.
+        if segment_masked && !base_config.causal {
+            return Err(CodegenError::new(SEGMENT_MASK_NEEDS_CAUSAL_MESSAGE));
+        }
 
         // Resolve `d_model` from the layer's RMSNorm gamma / Q/K/V
         // projection shapes.  Without this the AD emitter allocates
@@ -2199,6 +2213,9 @@ impl Compiler<'_> {
         // scalar matrix / SMEM budget.
         const TILE_CANDIDATES: &[(i64, i64)] = &[(64, 64), (32, 32), (32, 16), (16, 16)];
 
+        if segment_masked && !causal {
+            return Err(CodegenError::new(SEGMENT_MASK_NEEDS_CAUSAL_MESSAGE));
+        }
         if let Some(table) = self.kernels.sdpa_fwd_variants.get(&(causal, segment_masked)) {
             return Ok(table.clone());
         }

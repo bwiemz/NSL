@@ -1,11 +1,11 @@
-//! A combination of `packing = true` and `@flash_attention` that used to
-//! compile and compute the wrong attention, and is now a compile-time error.
+//! Two combinations of `packing = true` and `@flash_attention` that used to
+//! compile and compute the wrong attention, and are now compile-time errors.
 //!
 //! A `dataset` block with `packing = true` makes the `@flash_attention`
 //! training kernels of its module segment-masked: they read one segment id
 //! per position and mask every pair of positions in different documents.
 //!
-//! **Fed by a packing loader.** The train block hands those kernels the
+//! 1. **Fed by a packing loader.** The train block hands those kernels the
 //!    raw data pointers of the batch's `segment_ids` and `doc_starts`. The
 //!    kernels load segment ids as 16-bit integers and document starts as
 //!    32-bit integers; the loader stores both as 32-bit floats and leaves
@@ -16,8 +16,12 @@
 //!    Packed attention has a working route,
 //!    `GroupedQueryAttention.forward_packed`, which converts the ids
 //!    properly; the message names it.
+//! 2. **Without the causal mask.** The forward kernel emits the document
+//!    test only as an extension of the causal predicate. Built with
+//!    `causal = false` it emitted neither, so a "segment-masked" kernel
+//!    attended across documents with nothing reported.
 //!
-//! It is refused while the module is compiled, before anything runs, so
+//! Both are refused while the module is compiled, before anything runs, so
 //! these tests need no GPU: the default target synthesizes the kernels.
 
 use std::path::PathBuf;
@@ -134,4 +138,17 @@ fn each_half_of_the_combination_still_compiles() {
         let (ok, stderr) = build(&source);
         assert!(ok, "{what}: {stderr}");
     }
+}
+
+#[test]
+fn segment_masked_flash_attention_requires_the_causal_mask() {
+    let (ok, stderr) = build(&program(true, ", causal=false", ""));
+    assert!(!ok, "the program compiled:\n{stderr}");
+    assert!(
+        stderr.contains("packed attention without a causal mask is not supported"),
+        "{stderr}"
+    );
+    // Not packed: a bidirectional kernel is an ordinary request.
+    let (ok, stderr) = build(&program(false, ", causal=false", ""));
+    assert!(ok, "causal=false without packing: {stderr}");
 }
