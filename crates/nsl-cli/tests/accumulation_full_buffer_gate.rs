@@ -136,12 +136,22 @@ print(m.w.sum())
 /// Runs `source` on the CPU and returns the last number it prints (the sum
 /// of the two weights, which stay equal by symmetry), halved.
 fn trained_weight(source: &str, extra_args: &[&str]) -> f64 {
+    trained_weight_with_env(source, extra_args, &[]).0
+}
+
+/// The same, with environment variables for the compile, and the run's
+/// stderr.
+fn trained_weight_with_env(source: &str, extra_args: &[&str], env: &[(&str, &str)]) -> (f64, String) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("accum.nsl");
     std::fs::write(&path, source).unwrap();
     let out = Command::cargo_bin("nsl")
         .unwrap()
         .env("NSL_STDLIB_PATH", workspace_root().join("stdlib"))
+        // The suite may itself be run with the switch set (that is how the
+        // tests of the final step were shown able to fail).
+        .env_remove("NSL_FASE_FLUSH_TAIL")
+        .envs(env.iter().copied())
         .current_dir(dir.path())
         .arg("run")
         .arg(&path)
@@ -158,7 +168,7 @@ fn trained_weight(source: &str, extra_args: &[&str]) -> f64 {
         .rev()
         .find_map(|l| l.trim().parse().ok())
         .unwrap_or_else(|| panic!("no number printed:\n{stdout}\n{stderr}"));
-    sum / 2.0
+    (sum / 2.0, stderr.into_owned())
 }
 
 fn assert_close(got: f64, want: f64, what: &str) {
@@ -309,6 +319,35 @@ fn a_trailing_partial_window_is_stepped_on_its_own_mean() {
             }
         }
     }
+}
+
+/// `NSL_FASE_FLUSH_TAIL=0` at compile time turns the final step off (the
+/// layer-major schedule cannot take it, and a comparison of the two
+/// schedules needs both to stop at the same place). The run then ends with
+/// the weights of the two full windows, and says what it dropped and why.
+/// Without the switch nothing is dropped and nothing is said.
+#[test]
+fn the_final_step_can_be_compiled_out_and_then_says_so() {
+    let source = program_for(10, "", "");
+    let (dropped, stderr) = trained_weight_with_env(&source, &[], &[("NSL_FASE_FLUSH_TAIL", "0")]);
+    assert_close(dropped, reference_run(8, None), "10 micro-batches, final step off");
+    assert!(
+        stderr.contains("training ended 2 micro-batch(es) into a gradient-accumulation window of 4")
+            && stderr.contains("NSL_FASE_FLUSH_TAIL=0")
+            && stderr.contains("were not applied"),
+        "the dropped micro-batches were not reported:\n{stderr}"
+    );
+
+    let (flushed, stderr) = trained_weight_with_env(&source, &[], &[]);
+    assert_close(flushed, reference_run(10, None), "10 micro-batches");
+    assert!(!stderr.contains("training ended"), "{stderr}");
+
+    // A whole number of windows: nothing pending, so nothing to say even
+    // with the switch set.
+    let (whole, stderr) =
+        trained_weight_with_env(&program_for(8, "", ""), &[], &[("NSL_FASE_FLUSH_TAIL", "0")]);
+    assert_close(whole, reference_run(8, None), "8 micro-batches, final step off");
+    assert!(!stderr.contains("training ended"), "{stderr}");
 }
 
 /// The same when the micro-batches come from a `DataLoader`: ten batches in

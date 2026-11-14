@@ -23,6 +23,13 @@
 //!
 //! Both are refused while the module is compiled, before anything runs, so
 //! these tests need no GPU: the default target synthesizes the kernels.
+//!
+//! The first combination could not actually be reached before: a module
+//! with segment-masked kernels failed to compile, with an internal "failed
+//! to define main" error, as soon as its train block read any `DataLoader`
+//! (one call in the batch prologue passed an 8-bit value where a 64-bit one
+//! was declared). `each_half_of_the_combination_still_compiles` builds that
+//! case, with a loader that does not pack.
 
 use std::path::PathBuf;
 use std::process::Command;

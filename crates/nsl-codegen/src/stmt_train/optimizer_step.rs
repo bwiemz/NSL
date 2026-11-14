@@ -1159,6 +1159,12 @@ impl Compiler<'_> {
     /// too, with the same warning, which is what a comparison of the two
     /// schedules on such a run needs.
     ///
+    /// The step comes after the last epoch has closed, so the final epoch's
+    /// `on_epoch` callback runs before it: a callback that evaluates or
+    /// saves the model there sees the weights without this step, and code
+    /// after the train block sees them with it. `on_step` is not called
+    /// for it.
+    ///
     /// Runs with the epoch loop's exit block current; must precede the
     /// teardown, which frees the lists the step reads.
     pub(crate) fn emit_trailing_window_flush(
