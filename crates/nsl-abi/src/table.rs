@@ -1356,6 +1356,6 @@ mod tests {
     fn table_is_the_recorded_size() {
         // The count is pinned so a row dropped by a bad merge is noticed; move
         // it with a row that is deliberately added or removed.
-        assert_eq!(RUNTIME_ABI.len(), 672);
+        assert_eq!(RUNTIME_ABI.len(), 673);
     }
 }
