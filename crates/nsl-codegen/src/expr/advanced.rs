@@ -2569,12 +2569,65 @@ impl Compiler<'_> {
         Ok(None)
     }
 
+    /// The adapter tensors of a `model_name` instance and of every model
+    /// nested in it, named as `model_save` names parameters
+    /// (`blocks[0].lora_A_Blk_w__lora`), in a fixed order. They live in each
+    /// instance's adapter side-table, not in the struct, so the walk over
+    /// struct fields (`generate_param_metadata`) does not see them.
+    fn adapter_tensor_names(&self, model_name: &str, prefix: &str, depth: usize) -> Vec<String> {
+        let mut names = Vec::new();
+        if depth > 16 {
+            return names;
+        }
+        let Some(layout) = self.types.struct_layouts.get(model_name) else {
+            return names;
+        };
+        let join = |field: &str| -> String {
+            if prefix.is_empty() {
+                field.to_string()
+            } else {
+                format!("{prefix}.{field}")
+            }
+        };
+        let field_types = self.models.model_field_types.get(model_name);
+        for field in &layout.fields {
+            let Some(marker) = field_types.and_then(|t| t.get(&field.name)) else {
+                continue;
+            };
+            let path = join(&field.name);
+            if let Some(inner) = marker.strip_prefix('[').and_then(|m| m.strip_suffix(']')) {
+                if let Some((elem_type, count)) = inner.rsplit_once(';') {
+                    let count: usize = count.trim().parse().unwrap_or(0);
+                    for i in 0..count {
+                        names.extend(self.adapter_tensor_names(
+                            elem_type.trim(),
+                            &format!("{path}[{i}]"),
+                            depth + 1,
+                        ));
+                    }
+                }
+            } else {
+                names.extend(self.adapter_tensor_names(marker, &path, depth + 1));
+            }
+        }
+        for site in self.bus.adapter_sites() {
+            if site.target_model == model_name {
+                names.extend(site.synthesized_fields.iter().map(|f| join(f)));
+            }
+        }
+        names
+    }
+
     /// Compile `model_save(model, "path.nslm")` — serialize model parameters to disk.
     ///
     /// Codegen emits:
     ///   1. Build NslList of parameter name C-string pointers
     ///   2. Build NslList of parameter tensor pointers (from struct fields)
     ///   3. Call nsl_model_save(path_ptr, path_len, names_list, tensors_list)
+    ///
+    /// The tensors of the model's adapters follow its own parameters. They
+    /// used to be left out, so a trained adapter was not in the file at all
+    /// and a reload gave back the model as it was before training.
     pub(crate) fn compile_model_save(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -2631,12 +2684,17 @@ impl Compiler<'_> {
             })?;
 
         // Collect recursive leaf tensor names so checkpoint headers stay stable
-        // for nested sub-models and fixed arrays.
-        let param_metadata = self.generate_param_metadata(&model_name, "", 0);
+        // for nested sub-models and fixed arrays; then the adapter tensors.
+        let mut tensor_names: Vec<String> = self
+            .generate_param_metadata(&model_name, "", 0)
+            .into_iter()
+            .map(|(field_name, _field_offset, _needs_transpose)| field_name)
+            .collect();
+        tensor_names.extend(self.adapter_tensor_names(&model_name, "", 0));
 
         // Build NslList of parameter name pointers (null-terminated C strings)
         let names_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
-        for (field_name, _field_offset, _needs_transpose) in &param_metadata {
+        for field_name in &tensor_names {
             let name_data_id = self.intern_string(field_name)?;
             let gv = self.module.declare_data_in_func(name_data_id, builder.func);
             let name_ptr = builder.ins().symbol_value(cl_types::I64, gv);
@@ -2644,7 +2702,7 @@ impl Compiler<'_> {
         }
 
         let tensors_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
-        for (field_name, _field_offset, _needs_transpose) in &param_metadata {
+        for field_name in &tensor_names {
             let nested_path = format!("$model.{}", field_name.replace('[', ".").replace(']', ""));
             let tensor_ptr = self
                 .load_nested_field(builder, model_val, &layout, &model_name, &nested_path)
@@ -2671,6 +2729,10 @@ impl Compiler<'_> {
     ///   1. Build NslLists of parameter names and tensor pointers (from struct
     ///      fields, the same lists `model_save` writes)
     ///   2. Call nsl_model_load_named(path_ptr, path_len, names_list, tensors_list)
+    ///
+    /// For a model with adapters the adapter tensors follow the parameters,
+    /// as in `model_save`, and the call is `nsl_model_load_with_adapters`,
+    /// which also accepts a file of the base parameters alone.
     pub(crate) fn compile_model_load(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -2726,19 +2788,25 @@ impl Compiler<'_> {
                 ))
             })?;
 
-        let param_metadata = self.generate_param_metadata(&model_name, "", 0);
+        let mut tensor_names: Vec<String> = self
+            .generate_param_metadata(&model_name, "", 0)
+            .into_iter()
+            .map(|(field_name, _field_offset, _needs_transpose)| field_name)
+            .collect();
+        let base_count = tensor_names.len();
+        tensor_names.extend(self.adapter_tensor_names(&model_name, "", 0));
         // The names let the runtime refuse a file whose parameters were
         // reordered since the save: same-shaped tensors swapped positionally
         // pass every size check.
         let names_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
-        for (field_name, _field_offset, _needs_transpose) in &param_metadata {
+        for field_name in &tensor_names {
             let name_data_id = self.intern_string(field_name)?;
             let gv = self.module.declare_data_in_func(name_data_id, builder.func);
             let name_ptr = builder.ins().symbol_value(cl_types::I64, gv);
             self.compile_call_by_name(builder, "nsl_list_push", &[names_list, name_ptr])?;
         }
         let tensors_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
-        for (field_name, _field_offset, _needs_transpose) in &param_metadata {
+        for field_name in &tensor_names {
             let nested_path = format!("$model.{}", field_name.replace('[', ".").replace(']', ""));
             let tensor_ptr = self
                 .load_nested_field(builder, model_val, &layout, &model_name, &nested_path)
@@ -2751,6 +2819,14 @@ impl Compiler<'_> {
             self.compile_call_by_name(builder, "nsl_list_push", &[tensors_list, tensor_ptr])?;
         }
 
+        if tensor_names.len() > base_count {
+            let base = builder.ins().iconst(cl_types::I64, base_count as i64);
+            return self.compile_call_by_name(
+                builder,
+                "nsl_model_load_with_adapters",
+                &[path_val, path_len, names_list, tensors_list, base],
+            );
+        }
         self.compile_call_by_name(
             builder,
             "nsl_model_load_named",

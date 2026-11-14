@@ -387,19 +387,38 @@ fn live_shape(tensor: &NslTensor) -> Vec<i64> {
 /// refused load leaves the model untouched. The copy is positional; this is
 /// what makes a reordered, resized or transposed parameter a refusal instead
 /// of bytes read from the wrong place.
+///
+/// `base_count` is how many of the live tensors are the model's own
+/// parameters; the rest, at the end of the list, are the tensors of its
+/// adapters. A file that holds exactly the base parameters (a checkpoint
+/// saved before the adapters were added) is accepted, and loads those; a
+/// file with every tensor loads them all. `None` means the model has no
+/// adapters and the counts must agree.
 fn check_nslm_against_live(
     layout: &NslmLayout,
     tensors: &NslList,
     names: Option<&NslList>,
+    base_count: Option<usize>,
 ) -> Result<(), String> {
     let live = tensors.len as usize;
-    if layout.entries.len() != live {
-        return Err(format!(
-            "the file has {} tensors and the model has {live}. A train-block checkpoint holds \
-             only the trained parameters; tools/nslm_splice.py merges one into a full model \
-             file by name.",
-            layout.entries.len()
-        ));
+    let base_only = base_count.is_some_and(|b| b < live && layout.entries.len() == b);
+    if layout.entries.len() != live && !base_only {
+        return Err(match base_count {
+            Some(b) if b < live => format!(
+                "the file has {} tensors; the model has {b} parameters and {} adapter tensors, \
+                 so a file for it holds {b} (a checkpoint of the base model) or {live} (one \
+                 saved with its adapters)",
+                layout.entries.len(),
+                live - b
+            ),
+            _ => format!(
+                "the file has {} tensors and the model has {live}. A train-block checkpoint \
+                 holds only the trained parameters; tools/nslm_splice.py merges one into a \
+                 full model file by name. A file saved from a model with adapters also holds \
+                 the adapter tensors, and loads only into a model with the same adapters.",
+                layout.entries.len()
+            ),
+        });
     }
     if let Some(n) = names
         && n.len as usize != live
@@ -447,10 +466,12 @@ fn read_validated_nslm(
     path: &str,
     tensors: &NslList,
     names: Option<&NslList>,
+    base_count: Option<usize>,
 ) -> Result<(Vec<u8>, NslmLayout), String> {
     let data = std::fs::read(path).map_err(|e| format!("cannot read file '{path}': {e}"))?;
     let layout = parse_nslm(&data).map_err(|e| format!("'{path}': {e}"))?;
-    check_nslm_against_live(&layout, tensors, names).map_err(|e| format!("'{path}': {e}"))?;
+    check_nslm_against_live(&layout, tensors, names, base_count)
+        .map_err(|e| format!("'{path}': {e}"))?;
     Ok((data, layout))
 }
 
@@ -485,9 +506,25 @@ fn copy_nslm_into(data: &[u8], layout: &NslmLayout, tensors: &NslList) {
     }
 }
 
-fn model_load_impl(path: &str, tensors: &NslList, names: Option<&NslList>) {
-    match read_validated_nslm(path, tensors, names) {
-        Ok((data, layout)) => copy_nslm_into(&data, &layout, tensors),
+fn model_load_impl(
+    path: &str,
+    tensors: &NslList,
+    names: Option<&NslList>,
+    base_count: Option<usize>,
+) {
+    match read_validated_nslm(path, tensors, names, base_count) {
+        Ok((data, layout)) => {
+            if layout.entries.len() < tensors.len as usize {
+                crate::nsl_log!(
+                    INFO,
+                    "nsl",
+                    "nsl: model_load: '{path}' holds the base model only; the {} adapter \
+                     tensors keep their initial values",
+                    tensors.len as usize - layout.entries.len()
+                );
+            }
+            copy_nslm_into(&data, &layout, tensors)
+        }
         Err(e) => {
             crate::nsl_log!(ERROR, "nsl", "nsl: model_load: {e}");
             std::process::abort();
@@ -509,7 +546,7 @@ pub extern "C" fn nsl_model_load(path_ptr: i64, path_len: i64, param_tensors_ptr
         let slice = std::slice::from_raw_parts(path_ptr as *const u8, path_len as usize);
         std::str::from_utf8_unchecked(slice)
     };
-    model_load_impl(path, tensors, None);
+    model_load_impl(path, tensors, None, None);
 }
 
 /// [`nsl_model_load`] that also requires each file entry to name the live
@@ -530,7 +567,35 @@ pub extern "C" fn nsl_model_load_named(
         let slice = std::slice::from_raw_parts(path_ptr as *const u8, path_len as usize);
         std::str::from_utf8_unchecked(slice)
     };
-    model_load_impl(path, tensors, Some(NslList::from_ptr(param_names_ptr)));
+    model_load_impl(path, tensors, Some(NslList::from_ptr(param_names_ptr)), None);
+}
+
+/// [`nsl_model_load_named`] for a model that carries adapters. The first
+/// `base_count` tensors are the model's own parameters and the rest are its
+/// adapter tensors (`lora_A_*`, `lora_B_*`, `ia3_scale_*`, `gate_*`), which
+/// `model_save` writes after them. The file may hold all of them, or only
+/// the base parameters: a checkpoint saved before the adapters existed is
+/// what an adapter is trained on, and it leaves the adapter tensors as the
+/// constructor initialised them.
+#[unsafe(no_mangle)]
+pub extern "C" fn nsl_model_load_with_adapters(
+    path_ptr: i64,
+    path_len: i64,
+    param_names_ptr: i64,
+    param_tensors_ptr: i64,
+    base_count: i64,
+) {
+    let tensors = NslList::from_ptr(param_tensors_ptr);
+    let base = (base_count.max(0) as usize).min(tensors.len as usize);
+    // Embedded weights are the base model's: hand the provider those only.
+    if crate::weight_provider::try_load_from_provider_prefix(tensors, base) {
+        return;
+    }
+    let path = unsafe {
+        let slice = std::slice::from_raw_parts(path_ptr as *const u8, path_len as usize);
+        std::str::from_utf8_unchecked(slice)
+    };
+    model_load_impl(path, tensors, Some(NslList::from_ptr(param_names_ptr)), Some(base));
 }
 
 // ---------------------------------------------------------------------------
@@ -1096,7 +1161,7 @@ pub extern "C" fn nsl_train_checkpoint_load(
     recover_interrupted_commit(path, &optim_path);
     let param_tensors = NslList::from_ptr(param_tensors_ptr);
     let param_names = NslList::from_ptr(param_names_ptr);
-    let (model_data, model_layout) = read_validated_nslm(path, param_tensors, Some(param_names))
+    let (model_data, model_layout) = read_validated_nslm(path, param_tensors, Some(param_names), None)
         .unwrap_or_else(|e| {
             crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: {e}");
             std::process::abort();
