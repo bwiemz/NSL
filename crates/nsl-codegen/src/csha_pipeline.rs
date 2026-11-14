@@ -336,9 +336,16 @@ pub fn fused_hbm_bytes(shape: LayerShape, level: FusionLevel) -> u64 {
     match level {
         FusionLevel::None => baseline_hbm_bytes(shape),
         FusionLevel::Boundary => {
-            // Eliminates RMSNorm output + RoPE scratch across Q/K.  The
-            // paper reports ~16MB savings out of ~40MB (roughly 40%).
-            (baseline_hbm_bytes(shape) as f64 * 0.58) as u64
+            // Level 1 runs the norm in the projection kernels' prologue and
+            // RoPE in the Q and K projections' epilogue, so three of the
+            // baseline's passes over HBM do not happen: the norm's own read
+            // and write (2·B·S·D), RoPE on Q (2·B·S·D) and RoPE on K
+            // (2·B·S·D_kv). Everything else in `baseline_hbm_bytes` stays.
+            // This was the constant 0.58 x baseline, a figure from the
+            // paper's example that no shape entered; on the 512-wide,
+            // 4-of-8 KV-head layer the terms above leave 13/18 = 0.72.
+            let bsdkv = bs * shape.n_kv_heads * shape.head_dim * dtype;
+            baseline_hbm_bytes(shape) - (2 * bsd + 2 * bsd + 2 * bsdkv)
         }
         FusionLevel::Pipeline => {
             // V3 audit (spec §7.1) correction: L2 reads x + writes attn_out,
@@ -593,6 +600,33 @@ mod tests {
     fn baseline_exceeds_pipeline_traffic() {
         let s = small_shape();
         assert!(baseline_hbm_bytes(s) > fused_hbm_bytes(s, FusionLevel::Pipeline));
+    }
+
+    /// Level 1 removes three passes over HBM from the baseline: the norm's
+    /// read and write and RoPE on Q (4 passes of B·S·D bytes in all) and
+    /// RoPE on K (2 of B·S·D_kv).
+    ///
+    /// On the 512-wide layer B·S·D is 1024 x 512 x 2 = 1,048,576 bytes and
+    /// B·S·D_kv half that; the baseline is 14 of the first and 8 of the
+    /// second, 18,874,368 bytes, and level 1 leaves 13,631,488. On a
+    /// 768-wide layer with 4 KV heads of 64, batch 2 and 16 tokens the
+    /// units are 49,152 and 16,384: 819,200 and 589,824. The result was
+    /// 0.58 x baseline whatever the shape.
+    #[test]
+    fn boundary_traffic_is_the_baseline_less_the_fused_passes() {
+        let s = small_shape();
+        assert_eq!(baseline_hbm_bytes(s), 18_874_368);
+        assert_eq!(fused_hbm_bytes(s, FusionLevel::Boundary), 13_631_488);
+        let wide = LayerShape {
+            batch: 2,
+            seq: 16,
+            d_model: 768,
+            head_dim: 64,
+            n_kv_heads: 4,
+            dtype_bytes: 2,
+        };
+        assert_eq!(baseline_hbm_bytes(wide), 819_200);
+        assert_eq!(fused_hbm_bytes(wide, FusionLevel::Boundary), 589_824);
     }
 
     #[test]

@@ -596,10 +596,16 @@ pub(crate) fn invoke_wrga_if_enabled(
 ///
 /// No-op when `--csha` was not passed, when the flag or the per-model
 /// decorator disables it, or when the planner returns no plan.
+///
+/// `attention` is the attention shape of the model being trained
+/// (`ModelGeometry::uniform_attention`), `None` when the compiler could not
+/// determine it or the model's attention layers differ. The plan is made on
+/// it; without it the plan falls back to a nominal layer, and says so.
 pub(crate) fn invoke_csha_if_enabled(
     compiler: &mut crate::compiler::Compiler,
     list: &crate::wengert::WengertList,
     model_type_name: &str,
+    attention: Option<crate::wggo_model_shape::AttentionGeometry>,
 ) {
     let Some(ref mode_str) = compiler.compile_options.csha.mode else {
         return;
@@ -665,27 +671,77 @@ pub(crate) fn invoke_csha_if_enabled(
         // The dispatcher then silently falls back to per-op
         // adjoints and the toy pretrain smoke never emits
         // `nsl_flash_attention_csha_backward`.
-        let csha_shape_override = compiler
+        //
+        // The rest of the shape is the model's: batch, sequence length,
+        // stream width, head and KV-head counts come from the attention call
+        // on the tape. They used to be fixed at batch 1, sequence 1024,
+        // d_model 512, 8 heads and 4 KV heads for every model. The element
+        // width stays 2 bytes: it is the width of the kernel's f16 tiles,
+        // which is what the shared-memory figures size, not the model's
+        // dtype. When the model's shape is unknown the nominal layer is
+        // still planned (the kernels a decorated model already gets depend
+        // on this plan), and the plan is marked nominal.
+        let decorator_head_dim = compiler
             .kernels
             .flash_attention_context
             .as_ref()
-            .map(|ctx| crate::wggo_cost::LayerShape {
-                batch: 1,
-                seq: 1024,
-                d_model: 512,
-                head_dim: ctx.config.head_dim as u64,
-                n_kv_heads: 4,
-                dtype_bytes: 2,
-            });
-        if let Some(plan) = crate::csha::run_on_wengert(
+            .map(|ctx| ctx.config.head_dim as u64);
+        let (csha_shape, csha_heads) = match attention {
+            Some(a) => (
+                crate::wggo_cost::LayerShape {
+                    batch: a.batch,
+                    seq: a.seq,
+                    d_model: a.d_model,
+                    head_dim: decorator_head_dim.unwrap_or(a.head_dim),
+                    n_kv_heads: a.n_kv_heads,
+                    dtype_bytes: 2,
+                },
+                a.n_heads as u32,
+            ),
+            None => (
+                crate::wggo_cost::LayerShape {
+                    head_dim: decorator_head_dim
+                        .unwrap_or(crate::wggo::NOMINAL_LAYER_SHAPE.head_dim),
+                    ..crate::wggo::NOMINAL_LAYER_SHAPE
+                },
+                8,
+            ),
+        };
+        if let Some(mut plan) = crate::csha::run_on_wengert(
             list,
             effective_target,
             effective_mode_str,
             None, // weight-aware analysis hooked up via CompileOptions.weight_file in follow-up
-            csha_shape_override, // H.1: forward decorator head_dim to the planner
-            8,    // default head count; weight-informed path refines this
+            Some(csha_shape),
+            csha_heads,
             compiler.bus.wggo_overrides(),
         ) {
+            plan.shape_from_model = attention.is_some();
+            // The attention kernels this build emits, by the names the
+            // synthesis gives them, so the report can tell a planned kernel
+            // spec from an emitted kernel.
+            if let Some(ctx) = compiler.kernels.flash_attention_context.as_ref() {
+                let mut names = vec![
+                    crate::flash_attention_selector::flash_attention_kernel_name_selected(
+                        &ctx.config,
+                    ),
+                ];
+                if let Some(cfg) = ctx.csha_training_config.as_ref() {
+                    let name =
+                        crate::flash_attention_selector::flash_attention_kernel_name_selected(cfg);
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
+                plan.emitted_kernels = names;
+                if attention.is_none() {
+                    nsl_log::nsl_log!(WARN, "csha",
+                        "[csha] this model's attention shape could not be determined at \
+                         compile time; the plan is made on a nominal layer (batch 1, sequence \
+                         1024, d_model 512, 8 heads, 4 KV heads) with the decorator's head_dim."
+                    );
+                }
+            }
             // CSHA's kernels are emitted only for attention inside an
             // `@flash_attention` method. A model without one (every stock
             // model: `stdlib/nsl/nn/gqa.nsl` calls

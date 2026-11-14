@@ -66,6 +66,15 @@ impl Compiler<'_> {
         // nothing the pass retained. A digest nobody can ever read
         // is a full-tape hash per train block buying only a trace
         // token, so none is captured.
+        // The model's attention shape, read off the tape CSHA plans on
+        // (only when CSHA was asked for: the derivation walks the tape).
+        let attention = if self.compile_options.csha.mode.is_some() {
+            self.wggo_model_geometry(extractor)
+                .ok()
+                .and_then(|g| g.uniform_attention())
+        } else {
+            None
+        };
         let sched = self.passes.scheduler();
         sched
             .schedule("CSHA", None, || {
@@ -73,6 +82,7 @@ impl Compiler<'_> {
                     self,
                     extractor.wengert_list(),
                     model_type_name,
+                    attention,
                 );
             })
             .map_err(CodegenError::new)?
