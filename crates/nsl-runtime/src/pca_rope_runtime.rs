@@ -88,10 +88,13 @@ pub extern "C" fn nsl_pca_packing_mismatch_check(had_segments: i64) {
         && !WARNED.swap(true, Ordering::Relaxed)
     {
         crate::nsl_log!(WARN, "nsl-pca", 
-            "[nsl-pca] packing was declared (segment masking active) but no \
+            "[nsl-pca] a dataset block declared packing = true, so the \
+             @flash_attention training kernels were built segment-masked, but no \
              segment_ids appeared in the first {WARN_AFTER_N_STEPS} steps — the \
-             masked kernel is running UNMASKED (identity). Check that your \
-             DataLoader actually packs (emits batch[\"segment_ids\"])."
+             masked kernel is running UNMASKED (identity). These kernels cannot \
+             be fed by a packing DataLoader (that combination is refused at \
+             compile time); for packed attention use \
+             GroupedQueryAttention.forward_packed."
         );
     }
 }

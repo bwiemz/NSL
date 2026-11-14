@@ -3147,6 +3147,17 @@ impl Compiler<'_> {
                      documents at every occurrence",
                 ));
             }
+            // Segment-masked CSHA kernels (a `dataset` block with
+            // `packing = true` on a `@flash_attention` model) cannot read
+            // what a packing loader produces; see the message. Kernel
+            // synthesis runs before any statement is lowered, so the
+            // answer is known here.
+            if packing_on && self.module_has_segment_masked_csha_kernels() {
+                return Err(CodegenError::new(format!(
+                    "DataLoader(): {}",
+                    crate::stmt::PACKED_BATCH_TO_MASKED_CSHA_MESSAGE
+                )));
+            }
             // A packed batch derives its labels from the token stream (the
             // next token, with -100 across a document boundary), so a
             // `labels` tensor would be read by nothing. An explicit `None`
