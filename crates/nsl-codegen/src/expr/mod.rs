@@ -759,6 +759,22 @@ impl Compiler<'_> {
         expr: &Expr,
         value: Value,
     ) {
+        if self.expr_result_is_owned_tensor(builder, state, expr, value) {
+            Self::track_tensor_temporary(state, value);
+        }
+    }
+
+    /// Whether `value`, the result of compiling `expr`, is an owning tensor
+    /// temporary. Decided from the emission as well as the checker's type,
+    /// so it is also the answer to "is this value a tensor" for an
+    /// expression the checker could not type (`print` uses it for that).
+    pub(crate) fn expr_result_is_owned_tensor(
+        &self,
+        builder: &FunctionBuilder,
+        state: &FuncState,
+        expr: &Expr,
+        value: Value,
+    ) -> bool {
         // ELTLS v2a: a value the dispatch boundary registered as the fresh
         // output of a table-classified FFI DURING THIS STATEMENT is an
         // owning anonymous temporary even when its NSL-level name has no
@@ -770,10 +786,10 @@ impl Compiler<'_> {
         let dispatch_fresh_call = matches!(expr.kind, ExprKind::Call { .. })
             && state.cleanup.dispatch_fresh.contains(&value);
         if !self.expr_call_returns_owning_ref(expr) && !dispatch_fresh_call {
-            return;
+            return false;
         }
         if builder.func.dfg.value_type(value) != cl_types::I64 {
-            return;
+            return false;
         }
         let ty = self.node_type(expr.id);
         // For dispatch-fresh values the emission is ground truth — the
@@ -781,13 +797,10 @@ impl Compiler<'_> {
         // indeterminate checker type is acceptable (the `expand`-typed-
         // Unknown lesson). A CONCRETE non-tensor type still refuses:
         // when the checker and the emission disagree, leak-not-crash.
-        let trackable = ty.is_tensor()
+        ty.is_tensor()
             || matches!(ty, Type::Sparse { .. })
             || (ty.is_indeterminate()
-                && (dispatch_fresh_call || self.expr_is_owning_tensor_method_call(expr)));
-        if trackable {
-            Self::track_tensor_temporary(state, value);
-        }
+                && (dispatch_fresh_call || self.expr_is_owning_tensor_method_call(expr)))
     }
 
     pub(crate) fn compile_nested_expr(
