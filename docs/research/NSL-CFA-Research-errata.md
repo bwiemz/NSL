@@ -359,12 +359,16 @@ check, or by reading the code only.
   the tape, failed to build. Source AD now inlines the body of an
   undecorated free function, of the module or of one it imports, into the
   graph of the block that calls it (`inline_user_fn` in
-  `crates/nsl-codegen/src/source_ad.rs`), and a function of the module
-  takes precedence over a builtin of the same name. A function it cannot
-  inline (recursive, variadic, decorated, returning from anywhere but the
-  end of its body) is named with the reason, and the block falls back to
-  the tape as before. Test
-  `crates/nsl-cli/tests/source_ad_user_fn_inline_gate.rs`.
+  `crates/nsl-codegen/src/source_ad.rs`). A call inside an inlined body
+  resolves in the module that body was written in: a module's own function
+  takes precedence over a builtin of the same name, and a library function
+  never calls a same-named function of the user's module. Inside the body
+  every name is one of the function's parameters or locals, never a model
+  found by its name. A function it cannot inline (recursive, variadic,
+  decorated, returning from anywhere but the end of its body, writing into
+  a tensor, a container or a field, or taking a model as an argument) is
+  named with the reason, and the block falls back to the tape as before.
+  Test `crates/nsl-cli/tests/source_ad_user_fn_inline_gate.rs`.
 
 ### Open, in the adjacent code
 
