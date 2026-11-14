@@ -10,9 +10,13 @@
 //! Determinism guard: the bit-exact cases first run the BASELINE twice. If the
 //! environment itself is not run-to-run deterministic (e.g. a GPU path with
 //! atomic scatter ordering), the byte-compare gate cannot distinguish
-//! checkpointing effects from ambient noise — the test then only asserts the
-//! checkpointed run diverges no more from baseline than baseline does from
-//! itself, and says so loudly.
+//! checkpointing effects from ambient noise. On the CPU that is a failure:
+//! the CPU path is deterministic and a baseline that is not means something
+//! else is broken. On a GPU the case falls back to the band the production
+//! gate uses, over the WHOLE loss curve: the checkpointed run may differ from
+//! the baseline by no more than a few times what the baseline differs from
+//! itself (`assert_within_noise_band`). It used to compare the first loss
+//! only, which is a pure forward that checkpointing cannot affect.
 //!
 //! A2 (post-#374): three GPU strategies, from strongest to most production-real
 //!   - `Det::EmbedCpu`  — embedding backward forced to the deterministic host
@@ -27,6 +31,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use assert_cmd::prelude::*;
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -81,14 +87,14 @@ fn run_program(source: &str, tag: &str, cuda: bool, det: Det, extra_args: &[&str
     let prog = tmp.join("ccr_parity.nsl");
     std::fs::write(&prog, source).unwrap();
 
-    let mut cmd = Command::new(env!("CARGO"));
-    cmd.arg("run").arg("-q");
-    if cuda {
-        cmd.args(["--features", "cuda"]);
+    // The binary of this test's own profile and features, not `cargo run`:
+    // that built a second, debug copy of the compiler and rebuilt it whenever
+    // a source file had changed since.
+    let mut cmd = Command::cargo_bin("nsl").expect("the nsl binary of this test build");
+    cmd.arg("run").arg("--source-ad");
+    if !cuda {
+        cmd.args(["--target", "cpu"]);
     }
-    cmd.arg("--manifest-path")
-        .arg(root.join("Cargo.toml"))
-        .args(["-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run", "--source-ad"]);
     if det == Det::Deterministic {
         cmd.arg("--deterministic");
     }
@@ -212,19 +218,83 @@ fn parity_case(cuda: bool, det: Det, tag: &str) {
             "saved model bytes diverged under --checkpoint-blocks (must be bit-exact)"
         );
     } else {
-        // Ambient nondeterminism: the strongest honest claim is that the
-        // checkpointed run is indistinguishable from a baseline re-run.
+        assert!(
+            cuda,
+            "the CPU baseline is not run-to-run deterministic ({tag}): two identical \
+             runs gave different losses or weights, so this gate cannot test \
+             checkpointing here and something else is wrong"
+        );
+        // Ambient nondeterminism on the device: the strongest honest claim
+        // is that the checkpointed run is indistinguishable from a baseline
+        // re-run, over the whole curve.
         eprintln!(
             "[ccr-parity] WARNING: baseline is not run-to-run deterministic \
-             in this environment ({tag}); falling back to loss-prefix comparison"
+             in this environment ({tag}); comparing the loss curves within the \
+             baseline's own noise band instead of bit for bit"
         );
-        let first_a = base_a.loss_stream.lines().next().unwrap_or("");
-        let first_c = ckpt.loss_stream.lines().next().unwrap_or("");
-        assert_eq!(
-            first_a, first_c,
-            "first loss (pure forward on deterministic init) must still match"
-        );
+        if let Err(why) = assert_within_noise_band(
+            &parse_losses(&base_a.loss_stream),
+            &parse_losses(&base_b.loss_stream),
+            &parse_losses(&ckpt.loss_stream),
+        ) {
+            panic!("{tag}: {why}");
+        }
     }
+}
+
+/// The comparison for a run-to-run nondeterministic device: at every step
+/// the checkpointed loss `c` may differ from baseline `a` by at most four
+/// times the largest difference between the two baselines `a` and `b`, with
+/// an absolute floor of 1e-2. All three curves must have the same length and
+/// at least four steps. Returns the largest deviation and the tolerance.
+fn assert_within_noise_band(a: &[f64], b: &[f64], c: &[f64]) -> Result<(f64, f64), String> {
+    if a.len() != b.len() || a.len() != c.len() {
+        return Err(format!(
+            "loss curves differ in length: baselines {} and {}, checkpointed {}",
+            a.len(),
+            b.len(),
+            c.len()
+        ));
+    }
+    if a.len() < 4 {
+        return Err(format!("expected several loss steps, got {}", a.len()));
+    }
+    let mut max_noise = 0.0f64;
+    let mut max_dev = 0.0f64;
+    for i in 0..a.len() {
+        max_noise = max_noise.max((b[i] - a[i]).abs());
+        max_dev = max_dev.max((c[i] - a[i]).abs());
+    }
+    let tol = (max_noise * 4.0).max(1e-2);
+    if max_dev > tol {
+        return Err(format!(
+            "checkpointed loss diverged from baseline by {max_dev:.6} > tol {tol:.6} \
+             (ambient noise {max_noise:.6}) — recompute is not faithful\n\
+             base_a={a:?}\nckpt ={c:?}"
+        ));
+    }
+    Ok((max_dev, tol))
+}
+
+/// The band comparison itself, on curves written out by hand: it must
+/// accept a checkpointed curve inside the baselines' own noise and reject
+/// one outside it, one of a different length, and one too short to judge.
+#[test]
+fn the_noise_band_accepts_noise_and_rejects_a_divergence() {
+    let a = [5.0, 4.0, 3.0, 2.5, 2.2];
+    let b = [5.0, 4.01, 3.02, 2.49, 2.21]; // noise up to 0.02 -> tol 0.08
+    let inside = [5.0, 4.03, 2.95, 2.5, 2.27];
+    let (dev, tol) = assert_within_noise_band(&a, &b, &inside).expect("inside the band");
+    assert!((dev - 0.07).abs() < 1e-12 && (tol - 0.08).abs() < 1e-12, "{dev} {tol}");
+    // The first loss equal and a later one off by 0.2: the old first-loss
+    // comparison accepted exactly this.
+    let outside = [5.0, 4.0, 3.0, 2.7, 2.2];
+    assert!(assert_within_noise_band(&a, &b, &outside).is_err());
+    // With identical baselines the floor applies: 1e-2.
+    assert!(assert_within_noise_band(&a, &a, &[5.0, 4.0, 3.0, 2.5, 2.209]).is_ok());
+    assert!(assert_within_noise_band(&a, &a, &[5.0, 4.0, 3.0, 2.5, 2.22]).is_err());
+    assert!(assert_within_noise_band(&a, &b, &inside[..4]).is_err());
+    assert!(assert_within_noise_band(&a[..3], &b[..3], &inside[..3]).is_err());
 }
 
 /// CPU gate — ungated, runs in the default suite.
@@ -297,28 +367,15 @@ fn ccr_production_gpu_tolerance() {
     let la = parse_losses(&a.loss_stream);
     let lb = parse_losses(&b.loss_stream);
     let lc = parse_losses(&c.loss_stream);
-    let n = la.len().min(lb.len()).min(lc.len());
-    assert!(n >= 4, "expected several loss steps, got {n}");
-
     // Per-step: the checkpointed deviation from baseline A must stay within the
     // ambient noise (baseline B vs A) plus a small absolute floor. If CCR had a
     // real recompute bug, the checkpointed curve would drift far outside this
     // band even on a nondeterministic device.
-    let mut max_noise = 0.0f64;
-    let mut max_ckpt_dev = 0.0f64;
-    for i in 0..n {
-        max_noise = max_noise.max((lb[i] - la[i]).abs());
-        max_ckpt_dev = max_ckpt_dev.max((lc[i] - la[i]).abs());
-    }
-    let tol = (max_noise * 4.0).max(1e-2);
-    assert!(
-        max_ckpt_dev <= tol,
-        "checkpointed loss diverged from baseline by {max_ckpt_dev:.6} > tol {tol:.6} \
-         (ambient noise {max_noise:.6}) — CCR recompute is not faithful on the production path\n\
-         base_a={la:?}\nckpt ={lc:?}"
-    );
+    let (max_ckpt_dev, tol) = match assert_within_noise_band(&la, &lb, &lc) {
+        Ok(band) => band,
+        Err(why) => panic!("production path: {why}"),
+    };
     eprintln!(
-        "[ccr-tol] production-path CCR OK: max ckpt deviation {max_ckpt_dev:.6} within tol {tol:.6} \
-         (noise floor {max_noise:.6})"
+        "[ccr-tol] production-path CCR OK: max ckpt deviation {max_ckpt_dev:.6} within tol {tol:.6}"
     );
 }
