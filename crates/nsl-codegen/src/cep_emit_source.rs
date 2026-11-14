@@ -1,10 +1,16 @@
-//! CEP Option 2 — SP2: pruned-model source emission (pure text rewrite over the AST).
+//! CEP — pruned-model source emission (a text rewrite guided by the AST).
 //!
-//! Given the original NSL source + the same `PruneDelta` SP1 consumes, emit a rewritten
-//! NSL source whose `(n_heads, n_kv_heads, d_ff)` constructor args reflect the chosen
-//! surviving values. Pure: no I/O. v1 supports the **uniform-delta** case only —
-//! heterogeneous per-layer deltas refuse with a "deferred to SP3" error.
+//! Given the original NSL source and the prune delta the weight slicer
+//! consumes, emit a source whose block constructor carries the surviving
+//! `n_heads`, `n_kv_heads` and `d_ff`, and whose block array has the surviving
+//! layer count. Pure: no I/O.
+//!
+//! NSL declares all layers with one constructor call
+//! (`blocks: [Block; N] = Block(...)`), so only a plan that leaves every
+//! surviving layer at the same shape can be written. Any other plan is
+//! refused; the search has a uniform mode for this.
 
+use nsl_ast::decl::ModelMember;
 use nsl_ast::expr::{Arg, Expr, ExprKind};
 use nsl_ast::stmt::StmtKind;
 use nsl_ast::{Module, Symbol};
@@ -14,12 +20,13 @@ use crate::cep_rewrite::PruneDelta;
 
 type Resolve<'a> = &'a dyn Fn(Symbol) -> String;
 
-/// All surviving layers must agree on these three values for SP2 v1.
+/// The one shape every surviving layer has, and how many layers survive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UniformPrunedSpec {
     pub n_heads: u32,
     pub n_kv_heads: u32,
     pub d_ff: u32,
+    pub n_layers: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -47,7 +54,9 @@ impl std::fmt::Display for CepEmitError {
         match self {
             CepEmitError::HeterogeneousDelta { detail } => write!(
                 f,
-                "CEP emit: heterogeneous per-layer delta cannot be emitted by SP2 v1\n  detail: {detail}\n  (per-layer block-variant emission is deferred to SP3)"
+                "CEP emit: the plan leaves layers at different shapes, and the source declares all \
+                 layers with one block constructor\n  detail: {detail}\n  (a different block per \
+                 layer cannot be written; prune without `preserve`, so the plan is uniform)"
             ),
             CepEmitError::UnrewritableExpr { dim, detail } => write!(
                 f,
@@ -71,10 +80,9 @@ impl std::fmt::Display for CepEmitError {
     }
 }
 
-/// Derive the surviving (n_heads, n_kv_heads, d_ff) implied by `delta`, requiring all
-/// surviving layers to agree. The delta is GQA-group-aligned (produced by
-/// `plan_to_prune_delta`), so for each layer the number of dropped KV groups is
-/// `pruned_heads.len() / group` where `group = baseline.n_heads[l] / baseline.n_kv_heads[l]`.
+/// Derive the surviving `(n_heads, n_kv_heads, d_ff)` and layer count implied
+/// by `delta`, requiring all surviving layers to agree. Pruned heads must be
+/// whole key/value groups (`group = n_heads / n_kv_heads`).
 pub fn derive_uniform_pruned_spec(
     baseline: &ModelSpec,
     delta: &PruneDelta,
@@ -88,34 +96,40 @@ pub fn derive_uniform_pruned_spec(
     let by_layer: std::collections::HashMap<u32, &crate::cep_rewrite::LayerDelta> =
         delta.per_layer.iter().map(|ld| (ld.layer, ld)).collect();
 
-    let mut first: Option<UniformPrunedSpec> = None;
+    let mut first: Option<(usize, UniformPrunedSpec)> = None;
+    let mut n_layers = 0u32;
     for l in 0..baseline.n_layers as usize {
+        let ld = by_layer.get(&(l as u32));
+        if ld.is_some_and(|d| d.drop_layer) {
+            continue;
+        }
+        n_layers += 1;
         let base_h = baseline.n_heads[l];
         let base_kv = baseline.n_kv_heads[l].max(1);
         let group = (base_h / base_kv).max(1);
 
-        let ld = by_layer.get(&(l as u32));
         let pruned_heads = ld.map(|d| d.pruned_heads.len() as u32).unwrap_or(0);
         let new_d_ff = ld.and_then(|d| d.new_d_ff).unwrap_or(baseline.d_ff[l]);
 
-        if !pruned_heads.is_multiple_of(group) {
+        if !pruned_heads.is_multiple_of(group) || pruned_heads >= base_h {
             return Err(CepEmitError::SpecMismatch {
                 detail: format!(
-                    "layer {l}: pruned_heads.len() = {pruned_heads} is not a multiple of GQA group {group}"
+                    "layer {l}: {pruned_heads} pruned heads is not a number of whole key/value \
+                     groups of {group} that leaves a head"
                 ),
             });
         }
         let n_heads = base_h - pruned_heads;
         let n_kv_heads = base_kv - (pruned_heads / group);
-        let triple = UniformPrunedSpec { n_heads, n_kv_heads, d_ff: new_d_ff };
+        let triple = UniformPrunedSpec { n_heads, n_kv_heads, d_ff: new_d_ff, n_layers: 0 };
 
         match &first {
-            None => first = Some(triple),
-            Some(prev) if prev == &triple => {}
-            Some(prev) => {
+            None => first = Some((l, triple)),
+            Some((_, prev)) if prev == &triple => {}
+            Some((l0, prev)) => {
                 return Err(CepEmitError::HeterogeneousDelta {
                     detail: format!(
-                        "layer 0 -> (n_heads={}, n_kv_heads={}, d_ff={}); layer {l} -> (n_heads={}, n_kv_heads={}, d_ff={})",
+                        "layer {l0} -> (n_heads={}, n_kv_heads={}, d_ff={}); layer {l} -> (n_heads={}, n_kv_heads={}, d_ff={})",
                         prev.n_heads, prev.n_kv_heads, prev.d_ff,
                         triple.n_heads, triple.n_kv_heads, triple.d_ff,
                     ),
@@ -123,7 +137,54 @@ pub fn derive_uniform_pruned_spec(
             }
         }
     }
-    Ok(first.expect("non-zero layers checked"))
+    let Some((_, mut spec)) = first else {
+        return Err(CepEmitError::SpecMismatch { detail: "the plan drops every layer".into() });
+    };
+    spec.n_layers = n_layers;
+    Ok(spec)
+}
+
+/// The edit that changes `[Block; N]` to `[Block; new]` in the block array's
+/// type annotation, located through the field whose initializer is
+/// `block_init`.
+fn edit_for_layer_count(
+    source: &str,
+    top_md: &nsl_ast::decl::ModelDef,
+    block_init: &Expr,
+    baseline_layers: u32,
+    new_layers: u32,
+) -> Result<(usize, usize, String), CepEmitError> {
+    let mismatch = |detail: String| CepEmitError::SpecMismatch { detail };
+    let type_ann = top_md
+        .members
+        .iter()
+        .find_map(|m| match m {
+            ModelMember::LayerDecl { type_ann, init: Some(init), .. }
+                if std::ptr::eq(init, block_init) =>
+            {
+                Some(type_ann)
+            }
+            _ => None,
+        })
+        .ok_or_else(|| mismatch("the block array field was not found".to_string()))?;
+    let (start, end) = (type_ann.span.start.0 as usize, type_ann.span.end.0 as usize);
+    let text = source
+        .get(start..end)
+        .ok_or_else(|| mismatch(format!("type span [{start}, {end}) is outside the source")))?;
+    // `[Block; N]`: the count is what lies between the last `;` and the `]`.
+    let semi = text.rfind(';').ok_or_else(|| mismatch(format!("`{text}` is not `[Block; N]`")))?;
+    let close = text.rfind(']').filter(|&c| c > semi).ok_or_else(|| {
+        mismatch(format!("`{text}` is not `[Block; N]`"))
+    })?;
+    let digits = text[semi + 1..close].trim();
+    if digits.parse::<u32>().ok() != Some(baseline_layers) {
+        return Err(mismatch(format!(
+            "the block array is declared `{text}`, but the model has {baseline_layers} layers"
+        )));
+    }
+    let lead = text[semi + 1..close].len() - text[semi + 1..close].trim_start().len();
+    let at = start + semi + 1 + lead;
+    Ok((at, at + digits.len(), new_layers.to_string()))
 }
 
 /// Find the block model's positional parameter index whose declared NAME matches `param_name`.
@@ -214,7 +275,8 @@ fn edit_for_arg(
 }
 
 /// Rewrite the NSL source so the block constructor call's positional args
-/// `n_heads`, `n_kv_heads`, `d_ff` carry the chosen uniform pruned values.
+/// `n_heads`, `n_kv_heads`, `d_ff` carry the chosen uniform pruned values and
+/// the block array has the surviving layer count.
 pub fn apply_prune_delta_to_source(
     source: &str,
     module: &Module,
@@ -225,7 +287,7 @@ pub fn apply_prune_delta_to_source(
     let pruned = derive_uniform_pruned_spec(baseline, delta)?;
 
     // Locate the top model + its block ctor call site (reuse cep_extract).
-    let (_top_md, block_type, _n_layers, block_init) =
+    let (top_md, block_type, _n_layers, block_init) =
         crate::cep_extract::find_top_model(module, resolve).ok_or(CepEmitError::SpecMismatch {
             detail: "no top-level model with a `blocks: [Block; N]` field".to_string(),
         })?;
@@ -272,6 +334,31 @@ pub fn apply_prune_delta_to_source(
         })?;
         let arg: &Arg = block_args.get(idx).ok_or(CepEmitError::MissingArg { what: dim })?;
         edits.push(edit_for_arg(module, resolve, dim, &arg.value, baseline_val, new_val)?);
+    }
+
+    // Dropped layers: the array's declared length, and the block's `n_layers`
+    // argument when it has one (the stdlib attention scales its output
+    // projection's initial values by it).
+    if pruned.n_layers != baseline.n_layers {
+        edits.push(edit_for_layer_count(
+            source,
+            top_md,
+            block_init,
+            baseline.n_layers,
+            pruned.n_layers,
+        )?);
+        if let Some(idx) = block_param_index(block_def, resolve, "n_layers") {
+            let arg: &Arg =
+                block_args.get(idx).ok_or(CepEmitError::MissingArg { what: "n_layers" })?;
+            edits.push(edit_for_arg(
+                module,
+                resolve,
+                "n_layers",
+                &arg.value,
+                baseline.n_layers,
+                pruned.n_layers,
+            )?);
+        }
     }
 
     // Sort right-to-left so earlier spans aren't invalidated by later splices.
@@ -333,7 +420,7 @@ mod tests {
             head_dim: vec![16, 16], d_ff: vec![128, 128],
             vocab: 256, max_seq: 512, batch: 1,
             activation: Activation::SwiGlu, norm: NormType::RmsNorm,
-            dtype_bytes: 4,
+            dtype_bytes: 4, tied_lm_head: true,
         }
     }
 
@@ -347,7 +434,7 @@ mod tests {
             ],
         };
         let u = derive_uniform_pruned_spec(&baseline, &delta).unwrap();
-        assert_eq!(u, UniformPrunedSpec { n_heads: 2, n_kv_heads: 1, d_ff: 64 });
+        assert_eq!(u, UniformPrunedSpec { n_heads: 2, n_kv_heads: 1, d_ff: 64, n_layers: 2 });
     }
 
     #[test]
@@ -362,7 +449,36 @@ mod tests {
         let err = derive_uniform_pruned_spec(&baseline, &delta).unwrap_err();
         assert!(matches!(err, CepEmitError::HeterogeneousDelta { .. }), "got: {err}");
         let msg = err.to_string();
-        assert!(msg.contains("SP3"), "error message must mention SP3");
+        assert!(msg.contains("one block constructor"), "the message must say why: {msg}");
+        assert!(msg.contains("layer 0 -> (n_heads=2") && msg.contains("layer 1 -> (n_heads=4"), "{msg}");
+    }
+
+    /// A dropped layer has no shape to disagree about; the survivors' count
+    /// is reported.
+    #[test]
+    fn derive_uniform_skips_dropped_layers() {
+        let baseline = baseline_spec_2layer();
+        let delta = PruneDelta {
+            per_layer: vec![
+                LayerDelta { layer: 0, pruned_heads: vec![], new_d_ff: None, drop_layer: true },
+                LayerDelta { layer: 1, pruned_heads: vec![2, 3], new_d_ff: Some(96), drop_layer: false },
+            ],
+        };
+        let u = derive_uniform_pruned_spec(&baseline, &delta).unwrap();
+        assert_eq!(u, UniformPrunedSpec { n_heads: 2, n_kv_heads: 1, d_ff: 96, n_layers: 1 });
+    }
+
+    #[test]
+    fn derive_uniform_refuses_half_a_group() {
+        let baseline = baseline_spec_2layer(); // groups of 2
+        let delta = PruneDelta {
+            per_layer: vec![
+                LayerDelta { layer: 0, pruned_heads: vec![0], new_d_ff: None, drop_layer: false },
+                LayerDelta { layer: 1, pruned_heads: vec![0], new_d_ff: None, drop_layer: false },
+            ],
+        };
+        let err = derive_uniform_pruned_spec(&baseline, &delta).unwrap_err();
+        assert!(matches!(err, CepEmitError::SpecMismatch { .. }), "got: {err}");
     }
 
     #[test]
@@ -375,7 +491,7 @@ mod tests {
             ],
         };
         let u = derive_uniform_pruned_spec(&baseline, &delta).unwrap();
-        assert_eq!(u, UniformPrunedSpec { n_heads: 4, n_kv_heads: 2, d_ff: 128 });
+        assert_eq!(u, UniformPrunedSpec { n_heads: 4, n_kv_heads: 2, d_ff: 128, n_layers: 2 });
     }
 
     const CANONICAL: &str = r#"
@@ -402,7 +518,7 @@ model TinyCoder:
             head_dim: vec![64; 6], d_ff: vec![1024; 6],
             vocab: 4096, max_seq: 2048, batch: 1,
             activation: Activation::SwiGlu, norm: NormType::RmsNorm,
-            dtype_bytes: 4,
+            dtype_bytes: 4, tied_lm_head: true,
         }
     }
 
@@ -437,6 +553,54 @@ model TinyCoder:
                 "rewritten ctor call must match expected form, got:\n{out}");
         assert!(out.contains("randn([4096, 384])"),
                 "embed shape must not be touched");
+    }
+
+    const WITH_LAYER_COUNT: &str = r#"
+model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, dropout_p: float, n_layers: int):
+    wq: Tensor = randn([d_model, d_model])
+model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
+    w_gate: Tensor = randn([d_model, d_ff])
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, d_ff: int, dropout_p: float, n_layers: int):
+    attn_norm: RMSNorm = RMSNorm(d_model)
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, head_dim, dropout_p, n_layers)
+    ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p)
+model TinyCoder:
+    embed: Tensor = randn([4096, 384]) * full([1], 0.02)
+    blocks: [TransformerBlock;  6 ] = TransformerBlock(384, 6, 3, 64, 1024, 0.1, 6)
+    norm: RMSNorm = RMSNorm(384)
+"#;
+
+    /// Dropping layers 1 and 4 of six leaves four: the array's length and the
+    /// block's `n_layers` argument both become 4, and nothing else moves
+    /// (the 6 in `n_heads` position stays a 6).
+    #[test]
+    fn dropped_layers_shrink_the_block_array() {
+        let (module, interner) = parse(WITH_LAYER_COUNT);
+        let resolve = |s: Symbol| interner.resolve(s.0).unwrap_or("").to_string();
+        let baseline = baseline_canonical();
+        let delta = PruneDelta {
+            per_layer: (0..6).map(|l| LayerDelta {
+                layer: l, pruned_heads: vec![], new_d_ff: None, drop_layer: l == 1 || l == 4,
+            }).collect(),
+        };
+        let out = apply_prune_delta_to_source(WITH_LAYER_COUNT, &module, &resolve, &baseline, &delta)
+            .expect("rewrite ok");
+        assert!(
+            out.contains("blocks: [TransformerBlock;  4 ] = TransformerBlock(384, 6, 3, 64, 1024, 0.1, 4)"),
+            "got:\n{out}"
+        );
+        // One line changed, by two characters.
+        let changed: Vec<(&str, &str)> = WITH_LAYER_COUNT
+            .lines()
+            .zip(out.lines())
+            .filter(|(a, b)| a != b)
+            .collect();
+        assert_eq!(changed.len(), 1, "{changed:?}");
+        let (module2, interner2) = parse(&out);
+        let resolve2 = |s: Symbol| interner2.resolve(s.0).unwrap_or("").to_string();
+        let spec2 = crate::cep_extract::extract_model_spec(&module2, &resolve2).expect("re-extract");
+        assert_eq!(spec2.n_layers, 4);
+        assert_eq!(spec2.n_heads, vec![6; 4]);
     }
 
     #[test]
@@ -480,7 +644,7 @@ model ConstNet:
             head_dim: vec![32; 2], d_ff: vec![512; 2],
             vocab: 1000, max_seq: 2048, batch: 1,
             activation: Activation::SwiGlu, norm: NormType::RmsNorm,
-            dtype_bytes: 4,
+            dtype_bytes: 4, tied_lm_head: true,
         }
     }
 
@@ -541,7 +705,7 @@ model Net:
             head_dim: vec![16; 2], d_ff: vec![512; 2],
             vocab: 1000, max_seq: 2048, batch: 1,
             activation: Activation::SwiGlu, norm: NormType::RmsNorm,
-            dtype_bytes: 4,
+            dtype_bytes: 4, tied_lm_head: true,
         };
         let delta = PruneDelta {
             per_layer: (0..2).map(|l| LayerDelta {
@@ -579,7 +743,7 @@ model Net:
             head_dim: vec![64; 2], d_ff: vec![128; 2],
             vocab: 1000, max_seq: 2048, batch: 1,
             activation: Activation::SwiGlu, norm: NormType::RmsNorm,
-            dtype_bytes: 4,
+            dtype_bytes: 4, tied_lm_head: true,
         };
         let delta = PruneDelta {
             per_layer: (0..2).map(|l| LayerDelta {
@@ -637,7 +801,7 @@ model Net:
             head_dim: vec![32; 2], d_ff: vec![8; 2],
             vocab: 1000, max_seq: 2048, batch: 1,
             activation: Activation::SwiGlu, norm: NormType::RmsNorm,
-            dtype_bytes: 4,
+            dtype_bytes: 4, tied_lm_head: true,
         };
         // Prune 4 query heads (= 2 groups of 2) -> n_heads=4, n_kv_heads=2. Narrow d_ff
         // to 6 (NOT 4). Now: n_heads slot wants "4", d_ff slot wants "6", both target the
@@ -728,7 +892,7 @@ model Net:
             entries.insert(format!("blocks.{l}.ffn.w_up"), zero_entry(&format!("blocks.{l}.ffn.w_up"), vec![384, 1024]));
             entries.insert(format!("blocks.{l}.ffn.w_down"), zero_entry(&format!("blocks.{l}.ffn.w_down"), vec![1024, 384]));
         }
-        let wm = WeightMap::from_entries(entries);
+        let wm = crate::cep_weights::CepWeights::from_map(WeightMap::from_entries(entries));
 
         let delta = PruneDelta {
             per_layer: (0..6).map(|l| LayerDelta {
@@ -739,6 +903,7 @@ model Net:
 
         let sliced = crate::cep_slice::apply_prune_delta_to_weights(&wm, &baseline, &delta)
             .expect("SP1 slice ok");
+        let tensor = |name: &str| sliced.iter().find(|e| e.name == name);
         let out = apply_prune_delta_to_source(CANONICAL, &module, &resolve, &baseline, &delta)
             .expect("SP2 rewrite ok");
         let (module2, interner2) = parse(&out);
@@ -746,7 +911,7 @@ model Net:
         let spec2 = crate::cep_extract::extract_model_spec(&module2, &resolve2).unwrap();
 
         // d_ff axis: SP1 sliced w_gate has [d_model, new_d_ff] cols; SP2 recognizes the same.
-        let sliced_wgate = sliced.get("blocks.0.ffn.w_gate").expect("layer 0 w_gate sliced");
+        let sliced_wgate = tensor("blocks.0.ffn.w_gate").expect("layer 0 w_gate sliced");
         assert_eq!(sliced_wgate.shape[1] as u32, spec2.d_ff[0],
                    "SP1 sliced w_gate cols {} must equal SP2 emitted d_ff {}",
                    sliced_wgate.shape[1], spec2.d_ff[0]);
@@ -761,7 +926,7 @@ model Net:
         // KV head count + projection width: SP1's sliced wk has shape
         // [d_model, surviving_kv * head_dim]. With head_dim now explicit, the SP2-emitted
         // spec's `n_kv_heads * head_dim` projection width MUST equal SP1's sliced wk cols.
-        let sliced_wk = sliced.get("blocks.0.attn.wk").expect("layer 0 wk sliced");
+        let sliced_wk = tensor("blocks.0.attn.wk").expect("layer 0 wk sliced");
         let sp1_kv_proj = sliced_wk.shape[1] as u32;
         let sp2_kv_proj = spec2.n_kv_heads[0] * spec2.head_dim[0];
         assert_eq!(sp1_kv_proj, sp2_kv_proj,
@@ -769,7 +934,7 @@ model Net:
                    sp1_kv_proj, spec2.n_kv_heads[0], spec2.head_dim[0], sp2_kv_proj);
 
         // Query projection width: same invariant for wq cols = n_heads * head_dim.
-        let sliced_wq = sliced.get("blocks.0.attn.wq").expect("layer 0 wq sliced");
+        let sliced_wq = tensor("blocks.0.attn.wq").expect("layer 0 wq sliced");
         let sp1_q_proj = sliced_wq.shape[1] as u32;
         let sp2_q_proj = spec2.n_heads[0] * spec2.head_dim[0];
         assert_eq!(sp1_q_proj, sp2_q_proj,

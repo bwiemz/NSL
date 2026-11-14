@@ -1,19 +1,29 @@
-//! CEP — weight-aware importance scoring.
+//! CEP — weight-magnitude importance scoring.
 //!
-//! Per-component scores that guide the pruning search.  The scoring
-//! function from §3.3 of the paper:
+//! Per-component scores that order the pruning search:
 //!
 //! ```text
-//! importance(head_h_in_layer_l) =
-//!     weight_magnitude   × spectral_energy
-//!     × roofline_slack   × position_factor
+//! importance(head h in layer l) =
+//!     ‖Wq_h‖ · ‖Wk_g‖ · ‖Wv_g‖ · ‖Wo_h‖        (g = h's key/value group)
+//!     × spectral_energy(Wq) × roofline_slack × position_factor
+//! importance(FFN neuron j in layer l) =
+//!     ‖w_gate_j‖ · ‖w_up_j‖ · ‖w_down_j‖ × roofline_slack × position_factor
 //! ```
 //!
-//! All four factors are computable from pre-trained weights + the
-//! compilation oracle — no forward/backward pass, no calibration data.
+//! NSL stores a linear weight as `[in, out]` (the forward is `x @ w`), so a
+//! head is a block of `head_dim` COLUMNS of `wq`, its key/value group a block
+//! of columns of `wk`/`wv`, and a block of ROWS of `wo`. An FFN neuron is a
+//! column of `w_gate` and `w_up` and a row of `w_down`.
+//!
+//! This is a magnitude criterion. It needs no forward pass, and it is known
+//! to be a weak guide to which components a model needs; a component whose
+//! score is exactly zero contributes nothing through that product, which is
+//! the one case the score is reliable for.
 
 use serde::Serialize;
 
+use crate::cep_oracle::ModelSpec;
+use crate::cep_weights::BlockIndex;
 use crate::weight_aware::{WeightEntry, WeightMap};
 
 /// Per-attention-head importance.
@@ -28,16 +38,19 @@ pub struct HeadImportance {
     pub score: f64,
 }
 
-/// Per-FFN-neuron importance (rolled up to per-layer since scoring
-/// individual neurons is expensive; the paper collapses this to
-/// "per-layer FFN width reduction" decisions).
+/// Per-layer FFN importance, with the per-neuron magnitudes it sums.
 #[derive(Debug, Clone, Serialize)]
 pub struct FfnImportance {
     pub layer: u32,
+    /// Sum of `neuron_magnitudes`.
     pub weight_magnitude: f64,
     pub position_factor: f64,
     pub roofline_slack: f64,
     pub score: f64,
+    /// `‖w_gate_j‖ · ‖w_up_j‖ · ‖w_down_j‖` for each neuron `j`. Empty when
+    /// no weights were available.
+    #[serde(skip)]
+    pub neuron_magnitudes: Vec<f64>,
 }
 
 /// Per-layer aggregate importance.
@@ -84,15 +97,11 @@ impl RooflineSlackTable {
     }
 }
 
-/// Position factor (paper §3.3):
+/// Position factor: `1.0 + 0.3 × |2·l/(L−1) − 1|`.
 ///
-/// ```text
-/// position_factor(l/L) = 1.0 + 0.3 × |2l/L - 1|
-/// ```
-///
-/// Produces a U-shaped curve: early (l=0) and late (l=L-1) layers are
-/// weighted more heavily because empirical evidence shows they're the
-/// most sensitive to pruning.
+/// A U-shaped curve over layers `0..L`: 1.3 at the first and last layer and
+/// 1.0 in the middle. The proposal writes `2l/L`, which is not symmetric
+/// (1.3 at layer 0 but 1.225 at layer 7 of 8); dividing by `L−1` is.
 pub fn position_factor(layer: u32, n_layers: u32) -> f64 {
     if n_layers <= 1 {
         return 1.0;
@@ -101,69 +110,143 @@ pub fn position_factor(layer: u32, n_layers: u32) -> f64 {
     1.0 + 0.3 * (2.0 * normalized - 1.0).abs()
 }
 
-/// Frobenius norm of a rectangular slice of a weight entry, interpreted
-/// row-major as `[rows, cols]` where `head_range` slices the outer
-/// dimension (standard HuggingFace `[n_heads * head_dim, d_model]` layout).
-pub fn head_frobenius(entry: &WeightEntry, head: u32, n_heads: u32) -> f64 {
-    if entry.shape.len() != 2 || n_heads == 0 {
-        return 0.0;
-    }
-    let rows = entry.shape[0];
-    let cols = entry.shape[1];
-    // Heads partition either the row or the column axis — try row first.
-    let (per_head_rows, on_rows) = if rows.is_multiple_of(n_heads as usize) {
-        (rows / n_heads as usize, true)
-    } else if cols.is_multiple_of(n_heads as usize) {
-        (cols / n_heads as usize, false)
-    } else {
-        return 0.0;
-    };
+/// Read element `[r, c]` of a row-major 2-D entry.
+fn at(entry: &WeightEntry, cols: usize, r: usize, c: usize) -> f64 {
     let bw = entry.dtype.byte_width();
+    let off = (r * cols + c) * bw;
+    entry.dtype.to_f64(&entry.data[off..off + bw])
+}
+
+/// Check that `entry` is a 2-D tensor of exactly `[rows, cols]` whose data
+/// covers that shape, so the readers below cannot index out of bounds.
+fn expect_shape(entry: &WeightEntry, rows: usize, cols: usize, what: &str) -> Result<(), String> {
+    if entry.shape != [rows, cols] {
+        return Err(format!(
+            "CEP: '{}' has shape {:?}, expected [{rows}, {cols}] ({what}; NSL stores a linear \
+             weight as [in, out])",
+            entry.name, entry.shape
+        ));
+    }
+    if entry.data.len() != rows * cols * entry.dtype.byte_width() {
+        return Err(format!(
+            "CEP: '{}' holds {} bytes, expected {} for shape [{rows}, {cols}]",
+            entry.name,
+            entry.data.len(),
+            rows * cols * entry.dtype.byte_width()
+        ));
+    }
+    Ok(())
+}
+
+/// Frobenius norm of columns `[c0, c1)` of a `[rows, cols]` entry.
+fn column_block_norm(entry: &WeightEntry, c0: usize, c1: usize) -> f64 {
+    let (rows, cols) = (entry.shape[0], entry.shape[1]);
     let mut sum_sq = 0.0_f64;
-    if on_rows {
-        let r_start = head as usize * per_head_rows;
-        let r_end = r_start + per_head_rows;
-        for r in r_start..r_end {
-            for c in 0..cols {
-                let idx = r * cols + c;
-                let off = idx * bw;
-                if off + bw > entry.data.len() {
-                    return 0.0;
-                }
-                let v = entry.dtype.to_f64(&entry.data[off..off + bw]);
-                sum_sq += v * v;
-            }
-        }
-    } else {
-        let c_start = head as usize * per_head_rows;
-        let c_end = c_start + per_head_rows;
-        for r in 0..rows {
-            for c in c_start..c_end {
-                let idx = r * cols + c;
-                let off = idx * bw;
-                if off + bw > entry.data.len() {
-                    return 0.0;
-                }
-                let v = entry.dtype.to_f64(&entry.data[off..off + bw]);
-                sum_sq += v * v;
-            }
+    for r in 0..rows {
+        for c in c0..c1 {
+            let v = at(entry, cols, r, c);
+            sum_sq += v * v;
         }
     }
     sum_sq.sqrt()
 }
 
-/// L1 norm of a flat weight entry — used for FFN neurons.
-pub fn weight_l1(entry: &WeightEntry) -> f64 {
-    let bw = entry.dtype.byte_width();
-    let mut sum = 0.0_f64;
-    for i in 0..entry.num_elements {
-        let off = i * bw;
-        if off + bw > entry.data.len() {
-            break;
+/// Frobenius norm of rows `[r0, r1)` of a `[rows, cols]` entry.
+fn row_block_norm(entry: &WeightEntry, r0: usize, r1: usize) -> f64 {
+    let cols = entry.shape[1];
+    let mut sum_sq = 0.0_f64;
+    for r in r0..r1 {
+        for c in 0..cols {
+            let v = at(entry, cols, r, c);
+            sum_sq += v * v;
         }
-        sum += entry.dtype.to_f64(&entry.data[off..off + bw]).abs();
     }
-    sum
+    sum_sq.sqrt()
+}
+
+/// The four projections of one attention layer, in NSL's `[in, out]` layout,
+/// with the dimensions that say where each head lives in them.
+pub struct AttentionWeights<'a> {
+    pub wq: &'a WeightEntry,
+    pub wk: &'a WeightEntry,
+    pub wv: &'a WeightEntry,
+    pub wo: &'a WeightEntry,
+    pub d_model: u32,
+    pub n_heads: u32,
+    pub n_kv_heads: u32,
+    pub head_dim: u32,
+}
+
+impl AttentionWeights<'_> {
+    /// Refuse any tensor whose shape is not the one the dimensions imply.
+    pub fn validate(&self) -> Result<(), String> {
+        let d = self.d_model as usize;
+        let q = (self.n_heads * self.head_dim) as usize;
+        let kv = (self.n_kv_heads * self.head_dim) as usize;
+        if self.n_kv_heads == 0 || !self.n_heads.is_multiple_of(self.n_kv_heads) {
+            return Err(format!(
+                "CEP: n_heads ({}) must be a positive multiple of n_kv_heads ({})",
+                self.n_heads, self.n_kv_heads
+            ));
+        }
+        expect_shape(self.wq, d, q, "d_model x n_heads*head_dim")?;
+        expect_shape(self.wk, d, kv, "d_model x n_kv_heads*head_dim")?;
+        expect_shape(self.wv, d, kv, "d_model x n_kv_heads*head_dim")?;
+        expect_shape(self.wo, q, d, "n_heads*head_dim x d_model")
+    }
+
+    /// `‖Wq_h‖ · ‖Wk_g‖ · ‖Wv_g‖ · ‖Wo_h‖` for head `head`, where `g` is the
+    /// key/value head it shares (`head / (n_heads / n_kv_heads)`). Call
+    /// [`Self::validate`] first.
+    pub fn head_magnitude(&self, head: u32) -> f64 {
+        let hd = self.head_dim as usize;
+        let group = (self.n_heads / self.n_kv_heads) as usize;
+        let h = head as usize;
+        let g = h / group;
+        column_block_norm(self.wq, h * hd, (h + 1) * hd)
+            * column_block_norm(self.wk, g * hd, (g + 1) * hd)
+            * column_block_norm(self.wv, g * hd, (g + 1) * hd)
+            * row_block_norm(self.wo, h * hd, (h + 1) * hd)
+    }
+}
+
+/// Per-neuron FFN magnitudes: `‖w_gate_j‖ · ‖w_up_j‖ · ‖w_down_j‖`, the L2
+/// norms of column `j` of `w_gate` and `w_up` (`[d_model, d_ff]`) and of row
+/// `j` of `w_down` (`[d_ff, d_model]`). A neuron with any factor zero
+/// contributes nothing to `(silu(x·gate) ⊙ x·up)·down`.
+pub fn ffn_neuron_magnitudes(
+    w_gate: &WeightEntry,
+    w_up: &WeightEntry,
+    w_down: &WeightEntry,
+    d_model: u32,
+    d_ff: u32,
+) -> Result<Vec<f64>, String> {
+    let (d, ff) = (d_model as usize, d_ff as usize);
+    expect_shape(w_gate, d, ff, "d_model x d_ff")?;
+    expect_shape(w_up, d, ff, "d_model x d_ff")?;
+    expect_shape(w_down, ff, d, "d_ff x d_model")?;
+    Ok((0..ff)
+        .map(|j| {
+            column_block_norm(w_gate, j, j + 1)
+                * column_block_norm(w_up, j, j + 1)
+                * row_block_norm(w_down, j, j + 1)
+        })
+        .collect())
+}
+
+/// The `keep` highest-magnitude neurons, as ascending indices. Ties go to the
+/// lower index, so the planner and the slicer always agree on the set.
+pub fn ffn_survivors(magnitudes: &[f64], keep: usize) -> Vec<u32> {
+    let mut order: Vec<u32> = (0..magnitudes.len() as u32).collect();
+    order.sort_by(|&a, &b| {
+        magnitudes[b as usize]
+            .partial_cmp(&magnitudes[a as usize])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
+    });
+    order.truncate(keep);
+    order.sort_unstable();
+    order
 }
 
 /// Approximate spectral energy via power iteration: ratio of the dominant
@@ -187,9 +270,7 @@ pub fn spectral_energy(entry: &WeightEntry) -> f64 {
 
     // Start with a simple deterministic seed vector (sin-based — no RNG,
     // same across runs).
-    let mut v: Vec<f64> = (0..cols)
-        .map(|i| (i as f64 * 0.123 + 0.1).sin())
-        .collect();
+    let mut v: Vec<f64> = (0..cols).map(|i| (i as f64 * 0.123 + 0.1).sin()).collect();
     let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt().max(1e-30);
     for x in v.iter_mut() {
         *x /= norm;
@@ -254,110 +335,77 @@ pub fn spectral_energy(entry: &WeightEntry) -> f64 {
     }
 }
 
-/// Score a single attention head using the paper's formula.
-pub fn score_head(
-    wq: &WeightEntry,
-    wk: &WeightEntry,
-    wv: &WeightEntry,
-    layer: u32,
-    head: u32,
-    n_heads: u32,
-    n_layers: u32,
-    roofline_slack: f64,
-) -> HeadImportance {
-    let q = head_frobenius(wq, head, n_heads);
-    let k = head_frobenius(wk, head, n_heads);
-    let v = head_frobenius(wv, head, n_heads);
-    let weight_mag = q * k * v; // product — combines all three projections
-    let spectral = spectral_energy(wq);
-    let pos = position_factor(layer, n_layers);
-    let score = weight_mag * spectral * roofline_slack * pos;
-    HeadImportance {
-        layer,
-        head,
-        weight_magnitude: weight_mag,
-        spectral_energy: spectral,
-        roofline_slack,
-        position_factor: pos,
-        score,
-    }
-}
-
-/// Score an entire FFN block for a layer.
-pub fn score_ffn(
-    w_in: &WeightEntry,
-    w_out: &WeightEntry,
-    layer: u32,
-    n_layers: u32,
-    roofline_slack: f64,
-) -> FfnImportance {
-    let mag = weight_l1(w_in) * weight_l1(w_out);
-    let pos = position_factor(layer, n_layers);
-    let score = mag * roofline_slack * pos;
-    FfnImportance {
-        layer,
-        weight_magnitude: mag,
-        position_factor: pos,
-        roofline_slack,
-        score,
-    }
-}
-
-/// Naming convention for finding a layer's weights in a WeightMap.  Tries
-/// the common `blocks.N.attn.wq` / `h.N.attn.W_q` / `layers.N.q_proj`
-/// patterns.
-fn find_weight<'a>(wm: &'a WeightMap, layer: u32, suffixes: &[&str]) -> Option<&'a WeightEntry> {
-    for prefix in [
-        format!("blocks.{layer}."),
-        format!("layers.{layer}."),
-        format!("h.{layer}."),
-    ] {
-        for suf in suffixes {
-            let name = format!("{prefix}{suf}");
-            if let Some(e) = wm.get(&name) {
-                return Some(e);
-            }
-        }
-    }
-    None
-}
-
-/// Scan a [`WeightMap`] and score every attention head + FFN block the
-/// oracle's [`ModelSpec`] describes.
+/// Score every attention head and FFN neuron that `spec` describes.
+///
+/// Every layer must have its seven weight tensors (`attn.wq`, `wk`, `wv`,
+/// `wo`, `ffn.w_gate`, `w_up`, `w_down`) in NSL's layout; a missing or
+/// misshapen tensor is an error, never a silent score of zero.
 pub fn analyse_weight_map(
     wm: &WeightMap,
-    n_heads_per_layer: &[u32],
-    n_layers: u32,
+    spec: &ModelSpec,
     slacks: &RooflineSlackTable,
-) -> ImportanceTable {
+) -> Result<ImportanceTable, String> {
+    let index = BlockIndex::build(wm)?;
+    let fetch = |layer: u32, rest: &str| {
+        index
+            .get(wm, layer, rest)
+            .ok_or_else(|| format!("CEP: the weights file has no tensor 'blocks[{layer}].{rest}'"))
+    };
     let mut heads = Vec::new();
     let mut ffns = Vec::new();
     let mut layers = Vec::new();
-    for layer in 0..n_layers {
-        let h = *n_heads_per_layer.get(layer as usize).unwrap_or(&0);
+    for layer in 0..spec.n_layers {
+        let l = layer as usize;
         let slack = slacks.get(layer);
+        let pos = position_factor(layer, spec.n_layers);
 
-        let wq = find_weight(wm, layer, &["attn.wq", "attn.W_q", "q_proj.weight", "wq"]);
-        let wk = find_weight(wm, layer, &["attn.wk", "attn.W_k", "k_proj.weight", "wk"]);
-        let wv = find_weight(wm, layer, &["attn.wv", "attn.W_v", "v_proj.weight", "wv"]);
-        let w_in = find_weight(wm, layer, &["ffn.w_in", "mlp.fc_in", "mlp.up_proj.weight"]);
-        let w_out = find_weight(wm, layer, &["ffn.w_out", "mlp.fc_out", "mlp.down_proj.weight"]);
-
+        let attn = AttentionWeights {
+            wq: fetch(layer, "attn.wq")?,
+            wk: fetch(layer, "attn.wk")?,
+            wv: fetch(layer, "attn.wv")?,
+            wo: fetch(layer, "attn.wo")?,
+            d_model: spec.d_model,
+            n_heads: spec.n_heads[l],
+            n_kv_heads: spec.n_kv_heads[l],
+            head_dim: spec.head_dim[l],
+        };
+        attn.validate()?;
+        // One value per layer: the concentration of the whole query
+        // projection, not of any one head's slice.
+        let spectral = spectral_energy(attn.wq);
         let mut attn_score = 0.0_f64;
-        if let (Some(q), Some(k), Some(v)) = (wq, wk, wv) {
-            for head in 0..h {
-                let hs = score_head(q, k, v, layer, head, h, n_layers, slack);
-                attn_score += hs.score;
-                heads.push(hs);
-            }
+        for head in 0..spec.n_heads[l] {
+            let mag = attn.head_magnitude(head);
+            let score = mag * spectral * slack * pos;
+            attn_score += score;
+            heads.push(HeadImportance {
+                layer,
+                head,
+                weight_magnitude: mag,
+                spectral_energy: spectral,
+                roofline_slack: slack,
+                position_factor: pos,
+                score,
+            });
         }
 
-        let mut ffn_score = 0.0_f64;
-        if let (Some(i), Some(o)) = (w_in, w_out) {
-            let fi = score_ffn(i, o, layer, n_layers, slack);
-            ffn_score = fi.score;
-            ffns.push(fi);
-        }
+        let neuron_magnitudes = ffn_neuron_magnitudes(
+            fetch(layer, "ffn.w_gate")?,
+            fetch(layer, "ffn.w_up")?,
+            fetch(layer, "ffn.w_down")?,
+            spec.d_model,
+            spec.d_ff[l],
+        )?;
+        let mag: f64 = neuron_magnitudes.iter().sum();
+        let ffn_score = mag * slack * pos;
+        ffns.push(FfnImportance {
+            layer,
+            weight_magnitude: mag,
+            position_factor: pos,
+            roofline_slack: slack,
+            score: ffn_score,
+            neuron_magnitudes,
+        });
 
         layers.push(LayerImportance {
             layer,
@@ -366,11 +414,11 @@ pub fn analyse_weight_map(
             total_score: attn_score + ffn_score,
         });
     }
-    ImportanceTable {
+    Ok(ImportanceTable {
         heads,
         ffns,
         layers,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -381,39 +429,28 @@ pub fn analyse_weight_map(
 mod tests {
     use super::*;
     use crate::weight_aware::{WeightDType, WeightEntry};
+    use std::collections::HashMap;
 
-    fn make_weight(name: &str, per_head_rows: usize, cols: usize, per_head_mag: &[f64]) -> WeightEntry {
-        let n_heads = per_head_mag.len();
-        let rows = per_head_rows * n_heads;
-        let mut data = vec![0u8; rows * cols * 4];
-        for (h, target) in per_head_mag.iter().enumerate() {
-            let elements = per_head_rows * cols;
-            let value = (target / (elements as f64).sqrt()) as f32;
-            for r in (h * per_head_rows)..((h + 1) * per_head_rows) {
-                for c in 0..cols {
-                    let idx = r * cols + c;
-                    let off = idx * 4;
-                    data[off..off + 4].copy_from_slice(&value.to_le_bytes());
-                }
-            }
-        }
-        WeightEntry {
-            name: name.to_string(),
-            data,
-            shape: vec![rows, cols],
-            dtype: WeightDType::F32,
-            num_elements: rows * cols,
-            sparsity: None,
-            eliminated: false,
-        }
+    fn entry(name: &str, rows: usize, cols: usize, vals: &[f32]) -> WeightEntry {
+        assert_eq!(vals.len(), rows * cols);
+        let data: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        WeightEntry::new(name.to_string(), data, vec![rows, cols], WeightDType::F32)
+    }
+
+    fn close(got: f64, want: f64) {
+        assert!(
+            (got - want).abs() <= 1e-9 * want.abs().max(1.0),
+            "got {got}, want {want}"
+        );
     }
 
     #[test]
     fn position_factor_is_u_shaped() {
         assert!((position_factor(0, 8) - 1.3).abs() < 1e-9);
         assert!((position_factor(7, 8) - 1.3).abs() < 1e-9);
-        let mid = position_factor(3, 8);
-        assert!(mid < 1.3 && mid > 0.9);
+        // |2·3/7 − 1| = 1/7, so 1 + 0.3/7.
+        assert!((position_factor(3, 8) - (1.0 + 0.3 / 7.0)).abs() < 1e-12);
+        assert!((position_factor(4, 8) - (1.0 + 0.3 / 7.0)).abs() < 1e-12);
     }
 
     #[test]
@@ -421,80 +458,224 @@ mod tests {
         assert_eq!(position_factor(0, 1), 1.0);
     }
 
+    /// d_model 2, two query heads sharing one key/value head, head_dim 1.
+    /// `wq` is `[d_model, n_heads·head_dim]`, so head h is COLUMN h:
+    ///
+    /// ```text
+    /// wq = | 3  0 |    wk = | 2 |    wv = | 1 |    wo = | 0  5 |
+    ///      | 4  1 |         | 0 |         | 1 |         | 6  8 |
+    /// ```
+    ///
+    /// head 0: ‖(3,4)‖·‖(2,0)‖·‖(1,1)‖·‖(0,5)‖ = 5·2·√2·5  = 50√2
+    /// head 1: ‖(0,1)‖·‖(2,0)‖·‖(1,1)‖·‖(6,8)‖ = 1·2·√2·10 = 20√2
+    ///
+    /// Read along the other axis (rows of `wq`, columns of `wo`) the two
+    /// heads would come out as 3·…·6 and √17·…·√89: neither number above.
     #[test]
-    fn head_frobenius_scales_with_weight_magnitude() {
-        let w = make_weight("wq", 4, 16, &[1.0, 2.0, 3.0, 4.0]);
-        for (head, expected) in [(0u32, 1.0_f64), (1, 2.0), (2, 3.0), (3, 4.0)].iter() {
-            let got = head_frobenius(&w, *head, 4);
-            assert!((got - expected).abs() / expected < 1e-3);
-        }
+    fn head_magnitude_reads_columns_of_wq_and_rows_of_wo() {
+        let wq = entry("wq", 2, 2, &[3., 0., 4., 1.]);
+        let wk = entry("wk", 2, 1, &[2., 0.]);
+        let wv = entry("wv", 2, 1, &[1., 1.]);
+        let wo = entry("wo", 2, 2, &[0., 5., 6., 8.]);
+        let attn = AttentionWeights {
+            wq: &wq,
+            wk: &wk,
+            wv: &wv,
+            wo: &wo,
+            d_model: 2,
+            n_heads: 2,
+            n_kv_heads: 1,
+            head_dim: 1,
+        };
+        attn.validate().unwrap();
+        close(attn.head_magnitude(0), 50.0 * 2f64.sqrt());
+        close(attn.head_magnitude(1), 20.0 * 2f64.sqrt());
+    }
+
+    /// Four query heads in two key/value groups (heads 0,1 -> group 0; heads
+    /// 2,3 -> group 1), head_dim 1, d_model 1, every query and output entry
+    /// 1. `wk = (3, 4)` and `wv = (1, 2)`, so the magnitudes are
+    /// 3·1 = 3 for heads 0 and 1 and 4·2 = 8 for heads 2 and 3. Cutting
+    /// `wk`/`wv` by query head instead of by group would index past them.
+    #[test]
+    fn head_magnitude_uses_the_key_value_group() {
+        let wq = entry("wq", 1, 4, &[1., 1., 1., 1.]);
+        let wk = entry("wk", 1, 2, &[3., 4.]);
+        let wv = entry("wv", 1, 2, &[1., 2.]);
+        let wo = entry("wo", 4, 1, &[1., 1., 1., 1.]);
+        let attn = AttentionWeights {
+            wq: &wq,
+            wk: &wk,
+            wv: &wv,
+            wo: &wo,
+            d_model: 1,
+            n_heads: 4,
+            n_kv_heads: 2,
+            head_dim: 1,
+        };
+        attn.validate().unwrap();
+        let mags: Vec<f64> = (0..4).map(|h| attn.head_magnitude(h)).collect();
+        assert_eq!(mags, vec![3.0, 3.0, 8.0, 8.0]);
+    }
+
+    /// A head whose output rows are zero writes nothing into the residual
+    /// stream whatever its query, key and value weights are.
+    #[test]
+    fn a_head_with_a_zero_output_projection_scores_zero() {
+        let wq = entry("wq", 2, 2, &[3., 9., 4., 9.]);
+        let wk = entry("wk", 2, 1, &[2., 0.]);
+        let wv = entry("wv", 2, 1, &[1., 1.]);
+        let wo = entry("wo", 2, 2, &[0., 5., 0., 0.]);
+        let attn = AttentionWeights {
+            wq: &wq,
+            wk: &wk,
+            wv: &wv,
+            wo: &wo,
+            d_model: 2,
+            n_heads: 2,
+            n_kv_heads: 1,
+            head_dim: 1,
+        };
+        assert_eq!(attn.head_magnitude(1), 0.0);
+        assert!(attn.head_magnitude(0) > 0.0);
     }
 
     #[test]
-    fn spectral_energy_high_for_low_rank() {
-        // Rank-1 matrix: all columns identical → spectral_energy ≈ 1.
-        let mut data = vec![0u8; 16 * 16 * 4];
-        for r in 0..16 {
-            for c in 0..16 {
-                let v = ((r + 1) as f32) * 0.1; // column-independent
-                let idx = r * 16 + c;
-                let off = idx * 4;
-                data[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    fn a_transposed_projection_is_refused() {
+        // [n_heads·head_dim, d_model] = [4, 2] where NSL stores [2, 4].
+        let wq = entry("blocks[0].attn.wq", 4, 2, &[0.; 8]);
+        let wk = entry("wk", 2, 2, &[0.; 4]);
+        let wv = entry("wv", 2, 2, &[0.; 4]);
+        let wo = entry("wo", 4, 2, &[0.; 8]);
+        let attn = AttentionWeights {
+            wq: &wq,
+            wk: &wk,
+            wv: &wv,
+            wo: &wo,
+            d_model: 2,
+            n_heads: 2,
+            n_kv_heads: 1,
+            head_dim: 2,
+        };
+        let err = attn.validate().unwrap_err();
+        assert!(
+            err.contains("blocks[0].attn.wq") && err.contains("[2, 4]"),
+            "{err}"
+        );
+    }
+
+    /// d_model 2, d_ff 3:
+    ///
+    /// ```text
+    /// w_gate = | 3  0  1 |   w_up = | 1  2  0 |   w_down = | 2  0 |
+    ///          | 4  0  1 |          | 0  2  0 |            | 1  1 |
+    ///                                                      | 0  0 |
+    /// ```
+    ///
+    /// neuron 0: 5 · 1 · 2 = 10; neuron 1: 0 · √8 · √2 = 0 (dead gate);
+    /// neuron 2: √2 · 0 · 0 = 0. The gate column alone would rank neuron 2
+    /// above neuron 1.
+    #[test]
+    fn ffn_magnitude_is_the_product_of_all_three_matrices() {
+        let gate = entry("g", 2, 3, &[3., 0., 1., 4., 0., 1.]);
+        let up = entry("u", 2, 3, &[1., 2., 0., 0., 2., 0.]);
+        let down = entry("d", 3, 2, &[2., 0., 1., 1., 0., 0.]);
+        let mags = ffn_neuron_magnitudes(&gate, &up, &down, 2, 3).unwrap();
+        close(mags[0], 10.0);
+        assert_eq!(mags[1], 0.0);
+        assert_eq!(mags[2], 0.0);
+    }
+
+    #[test]
+    fn ffn_survivors_keep_the_largest_and_break_ties_low() {
+        assert_eq!(ffn_survivors(&[1.0, 5.0, 3.0, 5.0], 2), vec![1, 3]);
+        assert_eq!(ffn_survivors(&[2.0, 2.0, 2.0], 2), vec![0, 1]);
+        assert_eq!(ffn_survivors(&[1.0, 2.0], 5), vec![0, 1]);
+        assert_eq!(ffn_survivors(&[1.0, 2.0], 0), Vec::<u32>::new());
+    }
+
+    /// diag(2, 1, 1, 1): σ₁² / ‖A‖_F² = 4 / 7. Power iteration contracts the
+    /// other directions by (1/4) per step, so five steps are ample.
+    #[test]
+    fn spectral_energy_of_a_known_spectrum() {
+        let mut vals = vec![0f32; 16];
+        for (i, d) in [2.0f32, 1.0, 1.0, 1.0].iter().enumerate() {
+            vals[i * 4 + i] = *d;
+        }
+        let se = spectral_energy(&entry("diag", 4, 4, &vals));
+        assert!(
+            (se - 4.0 / 7.0).abs() < 1e-3,
+            "got {se}, want {}",
+            4.0 / 7.0
+        );
+    }
+
+    #[test]
+    fn spectral_energy_is_one_for_rank_one() {
+        // Outer product of (1, 2, 3) and (1, 1): one non-zero singular value.
+        let se = spectral_energy(&entry("r1", 3, 2, &[1., 1., 2., 2., 3., 3.]));
+        assert!((se - 1.0).abs() < 1e-9, "got {se}");
+    }
+
+    fn spec_2x2() -> ModelSpec {
+        // d_model 2, one layer, 2 query heads, 1 key/value head, head_dim 1, d_ff 3.
+        let mut s = ModelSpec::uniform(2, 1, 2, 1, 1, 3, 4);
+        s.dtype_bytes = 4;
+        s
+    }
+
+    fn weights_2x2(bracket: bool) -> WeightMap {
+        let name = |rest: &str| {
+            if bracket {
+                format!("blocks[0].{rest}")
+            } else {
+                format!("blocks.0.{rest}")
             }
-        }
-        let entry = WeightEntry {
-            name: "rank1".into(),
-            data,
-            shape: vec![16, 16],
-            dtype: WeightDType::F32,
-            num_elements: 256,
-            sparsity: None,
-            eliminated: false,
         };
-        let se = spectral_energy(&entry);
-        assert!(se > 0.9, "expected high spectral energy, got {se}");
-    }
-
-    #[test]
-    fn spectral_energy_low_for_full_rank_random() {
-        // Diagonal matrix — approximately full rank, low spectral energy.
-        let mut data = vec![0u8; 16 * 16 * 4];
-        for i in 0..16 {
-            let off = (i * 16 + i) * 4;
-            let v = 1.0_f32;
-            data[off..off + 4].copy_from_slice(&v.to_le_bytes());
-        }
-        let entry = WeightEntry {
-            name: "diag".into(),
-            data,
-            shape: vec![16, 16],
-            dtype: WeightDType::F32,
-            num_elements: 256,
-            sparsity: None,
-            eliminated: false,
+        let mut m = HashMap::new();
+        let mut put = |rest: &str, rows, cols, vals: &[f32]| {
+            let n = name(rest);
+            m.insert(n.clone(), entry(&n, rows, cols, vals));
         };
-        let se = spectral_energy(&entry);
-        assert!(se < 0.5, "expected low spectral energy, got {se}");
+        put("attn.wq", 2, 2, &[3., 0., 4., 1.]);
+        put("attn.wk", 2, 1, &[2., 0.]);
+        put("attn.wv", 2, 1, &[1., 1.]);
+        put("attn.wo", 2, 2, &[0., 5., 6., 8.]);
+        put("ffn.w_gate", 2, 3, &[3., 0., 1., 4., 0., 1.]);
+        put("ffn.w_up", 2, 3, &[1., 2., 0., 0., 2., 0.]);
+        put("ffn.w_down", 3, 2, &[2., 0., 1., 1., 0., 0.]);
+        WeightMap::from_entries(m)
+    }
+
+    /// The table for the hand-worked weights above, under both spellings of
+    /// the layer name. With neutral slack and one layer (position factor 1)
+    /// a head's score is its magnitude times the layer's spectral energy.
+    #[test]
+    fn analyse_scores_heads_and_neurons_under_both_name_spellings() {
+        for bracket in [true, false] {
+            let wm = weights_2x2(bracket);
+            let t = analyse_weight_map(&wm, &spec_2x2(), &RooflineSlackTable::default()).unwrap();
+            assert_eq!(t.heads.len(), 2);
+            close(t.heads[0].weight_magnitude, 50.0 * 2f64.sqrt());
+            close(t.heads[1].weight_magnitude, 20.0 * 2f64.sqrt());
+            assert_eq!(t.heads[0].spectral_energy, t.heads[1].spectral_energy);
+            close(
+                t.heads[0].score,
+                t.heads[0].weight_magnitude * t.heads[0].spectral_energy,
+            );
+            assert_eq!(t.ffns.len(), 1, "the FFN must be found by NSL's names");
+            assert_eq!(t.ffns[0].neuron_magnitudes.len(), 3);
+            close(t.ffns[0].weight_magnitude, 10.0);
+            close(t.layers[0].ffn_score, 10.0);
+        }
     }
 
     #[test]
-    fn head_score_aggregates_all_factors() {
-        let wq = make_weight("wq", 4, 8, &[10.0, 0.1]);
-        let wk = make_weight("wk", 4, 8, &[10.0, 0.1]);
-        let wv = make_weight("wv", 4, 8, &[10.0, 0.1]);
-        let big = score_head(&wq, &wk, &wv, 0, 0, 2, 4, 1.2);
-        let small = score_head(&wq, &wk, &wv, 0, 1, 2, 4, 1.2);
-        assert!(big.score > small.score);
-        assert!(big.position_factor > 0.0);
-        assert!(big.weight_magnitude > 0.0);
-        assert!(big.roofline_slack == 1.2);
-    }
-
-    #[test]
-    fn weight_l1_matches_sum_of_abs() {
-        let w = make_weight("w", 2, 4, &[1.0]); // one "head" filling 8 elements
-        let l1 = weight_l1(&w);
-        assert!(l1 > 0.0);
+    fn analyse_refuses_a_missing_tensor() {
+        let mut wm = weights_2x2(true);
+        wm.remove("blocks[0].ffn.w_down");
+        let err = analyse_weight_map(&wm, &spec_2x2(), &RooflineSlackTable::default()).unwrap_err();
+        assert!(err.contains("blocks[0].ffn.w_down"), "{err}");
     }
 
     #[test]

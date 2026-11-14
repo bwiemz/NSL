@@ -1,28 +1,26 @@
-//! CEP — Compilation-Evaluated Pruning: driver + report.
+//! CEP — pruning and architecture-search driver, and its report.
 //!
-//! Unifies the oracle, importance scorer, model rewriter, and search
-//! algorithm into two user-facing entry points:
+//! Ties the cost estimate, the importance scorer, the spec rewriter and the
+//! search together behind three entry points:
 //!
-//!   * [`run_prune`] — compilation-verified pruning from a pre-trained
-//!     model (`@cep_prune` decorator flow).
-//!   * [`run_search`] — hardware-aware architecture search
-//!     (`@cep_search` decorator flow).
+//!   * [`run_prune`] — prune heads and FFN width (`@cep_prune`, `--cep-prune`).
+//!   * [`run_joint`] — the same, with whole-layer drops (`--cep-joint`).
+//!   * [`run_search`] — rank architectures (`@cep_search`, `--cep-search`).
 //!
-//! The driver is pure and deterministic — every invocation with the same
-//! inputs produces an identical report.
+//! The driver is deterministic: the same inputs give the same plan.
 
 use std::path::Path;
 
 use serde::Serialize;
 
-use crate::cep_importance::{analyse_weight_map, ImportanceTable, RooflineSlackTable};
-use crate::cep_oracle::{evaluate, CompilationProfile, ModelSpec};
-use crate::cep_rewrite::{LayerDelta, PruneDelta, SearchAxes};
+use crate::cep_importance::{ImportanceTable, RooflineSlackTable, analyse_weight_map};
+use crate::cep_oracle::{CompilationProfile, ModelSpec, evaluate};
+use crate::cep_rewrite::{PruneDelta, SearchAxes};
 use crate::cep_search::{
-    architecture_search, joint_prune_search, prune_greedy, Constraints, Granularity, NasObjective,
-    SearchOutcome,
+    Constraints, Granularity, NasObjective, SearchOutcome, architecture_search, joint_prune_search,
+    prune_greedy,
 };
-use crate::gpu_specs::{default_gpu, find_gpu, GPU_DATABASE};
+use crate::gpu_specs::{GPU_DATABASE, GpuSpec, find_gpu};
 use crate::pass_trace::{DeclineReason, PassDisposition};
 use crate::weight_aware::WeightMap;
 
@@ -54,18 +52,33 @@ pub struct CepPlan {
     pub target_gpu: String,
     pub outcome: SearchOutcome,
     pub importance: ImportanceTable,
+    /// The limits and targets the search ran under.
+    pub constraints: Constraints,
+    /// Search mode: the ranking objective.
+    pub objective: Option<NasObjective>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum CepMode {
     Prune,
     Search,
-    /// Paper §2.2 Mode 3 — joint prune-search over heads + FFN + layer drops.
+    /// Heads, FFN width and whole-layer drops.
     Joint,
 }
 
+impl CepMode {
+    /// The spelling written to the delta file.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CepMode::Prune => "prune",
+            CepMode::Search => "search",
+            CepMode::Joint => "joint",
+        }
+    }
+}
+
 impl CepPlan {
-    /// Parameter reduction fraction (prune mode).
+    /// Fraction of parameters removed (prune modes).
     pub fn param_reduction(&self) -> f64 {
         let Some(baseline) = self.outcome.baseline.as_ref() else {
             return 0.0;
@@ -80,7 +93,58 @@ impl CepPlan {
         1.0 - (chosen.profile.param_bytes as f64 / bp)
     }
 
-    /// Render the compilation report (paper §6.3 format).
+    /// Whether the plan did what was asked: prune modes met the sparsity
+    /// target and both limits; search found at least one feasible candidate.
+    pub fn succeeded(&self) -> bool {
+        self.outcome.chosen.as_ref().is_some_and(|c| c.feasible)
+    }
+
+    /// One line per target or limit the plan missed; empty when it met all.
+    pub fn failures(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let o = &self.outcome;
+        match self.mode {
+            CepMode::Search => {
+                if o.chosen.is_none() {
+                    out.push(format!(
+                        "no candidate meets the constraints ({} evaluated)",
+                        o.candidates_evaluated
+                    ));
+                }
+            }
+            CepMode::Prune | CepMode::Joint => {
+                let Some(chosen) = o.chosen.as_ref() else {
+                    out.push("the search produced no result".to_string());
+                    return out;
+                };
+                if !o.sparsity_met {
+                    out.push(format!(
+                        "sparsity target missed: {:.1}% of parameters requested, {:.1}% removed, \
+                         and nothing more can be removed (granularity, preserved layers and the \
+                         one-group and FFN-width floors limit what may go)",
+                        100.0 * o.target_sparsity,
+                        100.0 * o.achieved_sparsity
+                    ));
+                }
+                let c = &self.constraints;
+                if chosen.profile.peak_memory_bytes > c.peak_memory_bytes {
+                    out.push(format!(
+                        "peak memory limit missed: {} bytes estimated, limit {}",
+                        chosen.profile.peak_memory_bytes, c.peak_memory_bytes
+                    ));
+                }
+                if chosen.profile.estimated_latency_us > c.latency_us {
+                    out.push(format!(
+                        "latency limit missed: {:.1}us per forward estimated, limit {:.1}us",
+                        chosen.profile.estimated_latency_us, c.latency_us
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    /// Render the report.
     pub fn render_report(&self) -> String {
         use std::fmt::Write as _;
         let mut s = String::new();
@@ -93,19 +157,21 @@ impl CepPlan {
         writeln!(s).unwrap();
 
         if matches!(self.mode, CepMode::Prune | CepMode::Joint) {
-            // §6.3: "Search time: <S> seconds (<N> candidates evaluated)"
             let secs = self.outcome.wall_clock_us as f64 / 1e6;
             writeln!(
                 s,
-                "Search time: {:.2} seconds ({} candidates evaluated)",
+                "Search time: {:.2} seconds ({} cost estimates)",
                 secs, self.outcome.candidates_evaluated
             )
             .unwrap();
 
+            if let Some(chosen) = self.outcome.chosen.as_ref() {
+                writeln!(s, "{}", assumptions_line(&chosen.spec)).unwrap();
+            }
             if let Some(baseline) = self.outcome.baseline.as_ref() {
                 writeln!(
                     s,
-                    "Baseline: params={:.1}MB, peak={:.2}GB, latency={:.1}us",
+                    "Baseline: params={:.1}MB, peak={:.2}GB, latency={:.1}us/forward",
                     baseline.param_bytes as f64 / 1e6,
                     baseline.peak_memory_bytes as f64 / 1e9,
                     baseline.estimated_latency_us
@@ -115,40 +181,47 @@ impl CepPlan {
             if let Some(chosen) = self.outcome.chosen.as_ref() {
                 writeln!(
                     s,
-                    "Chosen:   params={:.1}MB, peak={:.2}GB, latency={:.1}us  (feasible={})",
+                    "Chosen:   params={:.1}MB, peak={:.2}GB, latency={:.1}us/forward",
                     chosen.profile.param_bytes as f64 / 1e6,
                     chosen.profile.peak_memory_bytes as f64 / 1e9,
                     chosen.profile.estimated_latency_us,
-                    chosen.feasible
                 )
                 .unwrap();
                 writeln!(
                     s,
-                    "Reduction: {:.1}% of params removed",
-                    100.0 * self.param_reduction()
+                    "Reduction: {:.1}% of params removed (target {:.1}%)",
+                    100.0 * self.outcome.achieved_sparsity,
+                    100.0 * self.outcome.target_sparsity
                 )
                 .unwrap();
 
-                // §6.3: constraint status
-                if chosen.feasible {
-                    writeln!(s, "All constraints satisfied.").unwrap();
+                let failures = self.failures();
+                if failures.is_empty() {
+                    writeln!(s, "Sparsity target and constraints met.").unwrap();
                 } else {
-                    writeln!(s, "Constraints violated: feasible=false").unwrap();
+                    for f in &failures {
+                        writeln!(s, "NOT MET: {f}").unwrap();
+                    }
+                }
+                if self.constraints.uniform {
+                    writeln!(
+                        s,
+                        "Uniform plan: every unpreserved layer is pruned in step."
+                    )
+                    .unwrap();
                 }
 
-                // §6.3: "Binary size: <orig> -> <pruned>"
                 if let Some(baseline) = self.outcome.baseline.as_ref() {
                     writeln!(
                         s,
-                        "Binary size: {} -> {}",
+                        "Weights + nominal code size: {} -> {}",
                         format_bytes_si(baseline.binary_size_bytes),
                         format_bytes_si(chosen.profile.binary_size_bytes)
                     )
                     .unwrap();
-                    // §6.3: "Kernel launches per forward: <orig> -> <pruned>"
                     writeln!(
                         s,
-                        "Kernel launches per forward: {} -> {}",
+                        "Kernel launches per forward (fusion template): {} -> {}",
                         baseline.kernel_launches, chosen.profile.kernel_launches
                     )
                     .unwrap();
@@ -156,71 +229,132 @@ impl CepPlan {
 
                 writeln!(s).unwrap();
                 writeln!(s, "Per-layer post-prune shape:").unwrap();
-                for (i, (&nh, &ff)) in chosen
-                    .spec
-                    .n_heads
-                    .iter()
-                    .zip(chosen.spec.d_ff.iter())
-                    .enumerate()
-                {
-                    writeln!(s, "  Layer {i}: heads={nh}, FFN={ff}").unwrap();
+                let dropped: Vec<u32> = self
+                    .outcome
+                    .delta
+                    .as_ref()
+                    .map(|d| {
+                        d.per_layer
+                            .iter()
+                            .filter(|l| l.drop_layer)
+                            .map(|l| l.layer)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let mut survivors = chosen.spec.n_heads.iter().zip(chosen.spec.d_ff.iter());
+                let n_base = chosen.spec.n_layers as usize + dropped.len();
+                for l in 0..n_base as u32 {
+                    if dropped.contains(&l) {
+                        writeln!(s, "  Layer {l}: dropped").unwrap();
+                    } else if let Some((nh, ff)) = survivors.next() {
+                        writeln!(s, "  Layer {l}: heads={nh}, FFN={ff}").unwrap();
+                    }
                 }
             }
 
             writeln!(s).unwrap();
             writeln!(s, "Prune log ({} steps):", self.outcome.prune_log.len()).unwrap();
             for step in &self.outcome.prune_log {
+                let what = match step.kind.as_str() {
+                    "head" => format!("heads {:?} removed", step.heads),
+                    "ffn" => format!("FFN narrowed to {}", step.new_d_ff.unwrap_or(0)),
+                    _ => "layer dropped".to_string(),
+                };
                 writeln!(
                     s,
-                    "  [{}] layer={} {}{} - {} (params={:.1}MB)",
-                    if step.accepted { "OK" } else { "-" },
+                    "  layer={} {what} - {} (params={:.1}MB, latency={:.1}us)",
                     step.layer,
-                    step.kind,
-                    step.head.map(|h| format!(" head={h}")).unwrap_or_default(),
                     step.reason,
-                    step.new_param_bytes as f64 / 1e6
+                    step.new_param_bytes as f64 / 1e6,
+                    step.new_latency_us
                 )
                 .unwrap();
             }
         } else {
-            // Search mode — §6.3
-            let n_feasible = self.outcome.ranked_candidates.iter().filter(|c| c.feasible).count();
+            let ranked = &self.outcome.ranked_candidates;
+            let n_feasible = ranked.iter().filter(|c| c.feasible).count();
             writeln!(
                 s,
-                "Search space: {} candidates",
-                self.outcome.candidates_enumerated
+                "Search space: {} candidates, {} distinct",
+                self.outcome.candidates_enumerated,
+                ranked.len()
             )
             .unwrap();
             writeln!(s, "Feasible (constraints met): {} candidates", n_feasible).unwrap();
             let secs = self.outcome.wall_clock_us as f64 / 1e6;
-            writeln!(s, "Compilation time: {:.2} seconds", secs).unwrap();
+            writeln!(s, "Search time: {:.2} seconds", secs).unwrap();
+            if let Some(first) = ranked.first() {
+                writeln!(s, "{}", assumptions_line(&first.spec)).unwrap();
+            }
+            if let Some(obj) = self.objective {
+                writeln!(s, "Objective: {}", objective_str(obj)).unwrap();
+                if let Some(caveat) = obj.caveat() {
+                    writeln!(s, "Note: {caveat}").unwrap();
+                }
+            }
             writeln!(s).unwrap();
 
-            writeln!(s, "Top 3 architectures:").unwrap();
-            for (i, cand) in self.outcome.ranked_candidates.iter().take(3).enumerate() {
+            if n_feasible == 0 {
+                writeln!(s, "NOT MET: no candidate meets the constraints.").unwrap();
+                writeln!(s, "Closest candidates (none is feasible):").unwrap();
+            } else {
+                writeln!(s, "Top {} architectures:", n_feasible.min(3)).unwrap();
+            }
+            let shown = if n_feasible == 0 {
+                3
+            } else {
+                n_feasible.min(3)
+            };
+            for (i, cand) in ranked.iter().take(shown).enumerate() {
                 writeln!(
                     s,
-                    "  {}. d={}, L={}, H={}, KV={}, FFN={} -> {}M params, {:.2}GB, {:.1}us/tok, util={:.2}",
+                    "  {}. d={}, L={}, H={}, KV={}, FFN={}, act={}, norm={} -> {}M params, {:.2}GB, {:.1}us/forward, util={:.2}{}",
                     i + 1,
                     cand.spec.d_model,
                     cand.spec.n_layers,
                     cand.spec.n_heads.first().copied().unwrap_or(0),
                     cand.spec.n_kv_heads.first().copied().unwrap_or(0),
                     cand.spec.d_ff.first().copied().unwrap_or(0),
+                    cand.spec.activation.as_str(),
+                    cand.spec.norm.as_str(),
                     format_params_si(cand.spec.param_count()),
                     cand.profile.peak_memory_bytes as f64 / 1e9,
                     cand.profile.estimated_latency_us,
                     cand.profile.roofline_utilization,
+                    if cand.feasible { "" } else { "  (infeasible)" },
                 )
                 .unwrap();
+                if !cand.also.is_empty() {
+                    writeln!(s, "     same estimate: {}", cand.also.join("; ")).unwrap();
+                }
             }
         }
         s
     }
 }
 
+/// The inputs every estimate in a report rests on.
+pub fn assumptions_line(spec: &ModelSpec) -> String {
+    format!(
+        "Estimates are for one forward pass of batch {} x {} tokens, {}-byte values, {} output head.",
+        spec.batch,
+        spec.max_seq,
+        spec.dtype_bytes,
+        if spec.tied_lm_head { "tied" } else { "untied" }
+    )
+}
+
+fn objective_str(o: NasObjective) -> &'static str {
+    match o {
+        NasObjective::ParamEfficiency => "param_efficiency",
+        NasObjective::MinLatency => "min_latency",
+        NasObjective::MinMemory => "min_memory",
+        NasObjective::MinParams => "min_params",
+    }
+}
+
 // ---------------------------------------------------------------------------
-// SI formatting helpers (paper §6.3 spelling)
+// SI formatting helpers
 // ---------------------------------------------------------------------------
 
 fn format_bytes_si(bytes: u64) -> String {
@@ -237,14 +371,15 @@ fn format_bytes_si(bytes: u64) -> String {
 
 /// Render param count as millions to one decimal place.  The render line uses
 /// `"{}M params"` with a literal "M", so this MUST return only the magnitude
-/// (no suffix).  Sub-1M counts render as "0.5M params" etc., which is correct
-/// and honest (toy fixtures never have genuinely large param counts).
+/// (no suffix).  Sub-1M counts render as "0.5M params" etc.
 fn format_params_si(p: u64) -> String {
     format!("{:.1}", p as f64 / 1e6)
 }
 
-/// Default roofline-slack proxy when the user doesn't supply one: derive
-/// from the baseline profile's per-layer classification.
+/// Roofline-slack multiplier when the caller supplies none: 0.8 for a layer
+/// the estimate classes as compute-bound, 1.5 otherwise. The two constants
+/// are placeholders; in a model whose layers share one shape they are the
+/// same for every layer and change no ranking.
 fn slack_from_profile(p: &CompilationProfile) -> RooflineSlackTable {
     let mut v = Vec::new();
     for layer in &p.per_layer {
@@ -256,155 +391,156 @@ fn slack_from_profile(p: &CompilationProfile) -> RooflineSlackTable {
     RooflineSlackTable { per_layer: v }
 }
 
-/// Run compilation-verified pruning.
-pub fn run_prune(input: CepPruneInput) -> CepPlan {
-    crate::pass_trace::record("CEP");
-    let gpu = find_gpu(input.target).unwrap_or_else(default_gpu);
-    // 1. Baseline compile (for slack estimates + importance context).
-    let baseline = evaluate(&input.spec, gpu).expect("base spec must validate");
+fn resolve_gpu(target: &str) -> Result<&'static GpuSpec, String> {
+    find_gpu(target).ok_or_else(|| {
+        CepBridgeError::UnknownTarget {
+            target: target.to_string(),
+            supported: supported_gpus(),
+        }
+        .to_string()
+    })
+}
 
-    // 2. Resolve roofline slacks — prefer the user's, else derive.
+/// Shared body of [`run_prune`] and [`run_joint`].
+fn run_prune_mode(input: CepPruneInput, mode: CepMode) -> Result<CepPlan, String> {
+    crate::pass_trace::record("CEP");
+    let gpu = resolve_gpu(input.target)?;
+    let baseline =
+        evaluate(&input.spec, gpu).map_err(|e| format!("CEP: invalid model spec: {e}"))?;
+
     let slacks = if input.roofline_slack.per_layer.is_empty() {
         slack_from_profile(&baseline)
     } else {
         input.roofline_slack
     };
 
-    // 3. Importance table (from weights if available; otherwise synthesise
-    //    a uniform table so the search still runs).
-    let importance = if let Some(wm) = input.weights {
-        analyse_weight_map(wm, &input.spec.n_heads, input.spec.n_layers, &slacks)
-    } else {
-        synthetic_importance(&input.spec, &slacks)
+    // Importance from the weights when there are any; otherwise a table in
+    // which every component of a layer counts the same.
+    let importance = match input.weights {
+        Some(wm) => analyse_weight_map(wm, &input.spec, &slacks)?,
+        None => synthetic_importance(&input.spec, &slacks),
     };
 
-    // 4. Greedy prune.
-    let outcome = prune_greedy(
-        &input.spec,
-        &importance,
-        gpu,
-        &input.constraints,
-        input.granularity,
-    );
+    let outcome = match mode {
+        CepMode::Joint => joint_prune_search(
+            &input.spec,
+            &importance,
+            gpu,
+            &input.constraints,
+            input.granularity,
+        ),
+        _ => prune_greedy(
+            &input.spec,
+            &importance,
+            gpu,
+            &input.constraints,
+            input.granularity,
+        ),
+    };
 
-    // One prune step = one structural edit to the model spec, and the log is
-    // the authoritative record of them (the rewrite + weight emission
-    // downstream replay exactly this list). An empty log means the greedy
-    // search could not take a single step inside the accuracy constraints.
-    if outcome.prune_log.is_empty() {
-        crate::pass_trace::record_disposition("CEP", PassDisposition::Declined {
-            reason: DeclineReason::NoCandidates("no prune step fits the accuracy constraints"),
-        });
-    } else {
-        crate::pass_trace::record_disposition("CEP", PassDisposition::Applied {
-            rewrites: outcome.prune_log.len(),
-        });
-    }
-    CepPlan {
-        mode: CepMode::Prune,
+    let disposition = prune_disposition(&outcome);
+    crate::pass_trace::record_disposition("CEP", disposition);
+    Ok(CepPlan {
+        mode,
         target_gpu: gpu.name.to_string(),
         outcome,
         importance,
-    }
+        constraints: input.constraints,
+        objective: None,
+    })
 }
 
-/// Paper §2.2 Mode 3 — joint prune-search. Same input contract as `run_prune` (weights
-/// required for non-synthetic importance), but `joint_prune_search` extends the action
-/// space with layer drops on top of head + FFN pruning.
-pub fn run_joint(input: CepPruneInput) -> CepPlan {
-    crate::pass_trace::record("CEP");
-    let gpu = find_gpu(input.target).unwrap_or_else(default_gpu);
-    let baseline = evaluate(&input.spec, gpu).expect("base spec must validate");
-    let slacks = if input.roofline_slack.per_layer.is_empty() {
-        slack_from_profile(&baseline)
-    } else {
-        input.roofline_slack
-    };
-    let importance = if let Some(wm) = input.weights {
-        analyse_weight_map(wm, &input.spec.n_heads, input.spec.n_layers, &slacks)
-    } else {
-        synthetic_importance(&input.spec, &slacks)
-    };
-    let outcome = joint_prune_search(
-        &input.spec,
-        &importance,
-        gpu,
-        &input.constraints,
-        input.granularity,
-    );
-    if outcome.prune_log.is_empty() {
-        crate::pass_trace::record_disposition("CEP", PassDisposition::Declined {
-            reason: DeclineReason::NoCandidates(
-                "no head / FFN / layer-drop action fits the accuracy constraints",
-            ),
-        });
-    } else {
-        crate::pass_trace::record_disposition("CEP", PassDisposition::Applied {
+/// What a prune run reports to the pass trace. `rewrites` is the number of
+/// pruning steps applied, and every log entry is one. An empty log is either
+/// a request that needed nothing or a model with nothing the search is
+/// allowed to remove.
+fn prune_disposition(outcome: &SearchOutcome) -> PassDisposition {
+    if !outcome.prune_log.is_empty() {
+        PassDisposition::Applied {
             rewrites: outcome.prune_log.len(),
-        });
-    }
-    CepPlan {
-        mode: CepMode::Joint,
-        target_gpu: gpu.name.to_string(),
-        outcome,
-        importance,
+        }
+    } else if outcome.sparsity_met && outcome.constraints_met {
+        PassDisposition::Declined {
+            reason: DeclineReason::NoCandidates("the model already meets the target and limits"),
+        }
+    } else {
+        PassDisposition::Declined {
+            reason: DeclineReason::NoCandidates("nothing may be removed at this granularity"),
+        }
     }
 }
 
-/// Run hardware-aware architecture search.
-pub fn run_search(input: CepSearchInput) -> CepPlan {
+/// Prune attention heads and FFN width. Errors when the target GPU is
+/// unknown, the spec is invalid, or the weights do not match the spec.
+pub fn run_prune(input: CepPruneInput) -> Result<CepPlan, String> {
+    run_prune_mode(input, CepMode::Prune)
+}
+
+/// As [`run_prune`], with whole-layer drops as a further kind of step.
+pub fn run_joint(input: CepPruneInput) -> Result<CepPlan, String> {
+    run_prune_mode(input, CepMode::Joint)
+}
+
+/// Rank the architectures the search axes span.
+pub fn run_search(input: CepSearchInput) -> Result<CepPlan, String> {
     crate::pass_trace::record("CEP");
-    let gpu = find_gpu(input.target).unwrap_or_else(default_gpu);
+    let gpu = resolve_gpu(input.target)?;
     let outcome = architecture_search(&input.axes, gpu, &input.constraints, input.objective);
     // Architecture search RECOMMENDS a spec; it rewrites nothing. Its flag
     // (`--cep-search`) lives on `nsl check` only, and the result is printed
-    // for a human to act on. This is the difference `AdvisoryOnly` exists to
-    // record: reporting `Applied { rewrites: 0 }` here would read as a failed
-    // prune rather than as a search that did exactly its job.
+    // for a human to act on.
     crate::pass_trace::record_disposition("CEP", PassDisposition::AdvisoryOnly);
-    CepPlan {
+    Ok(CepPlan {
         mode: CepMode::Search,
         target_gpu: gpu.name.to_string(),
         outcome,
         importance: ImportanceTable::default(),
-    }
+        constraints: input.constraints,
+        objective: Some(input.objective),
+    })
 }
 
-/// Uniform-score importance table for the weight-less case.  The search
-/// degenerates to "prune from the last layer back" — not ideal but
-/// deterministic.
+/// Importance table for the weight-less case: every head of a layer scores
+/// the same and no neuron magnitudes are recorded, so layers differ by the
+/// position factor and the slack alone.
 fn synthetic_importance(spec: &ModelSpec, slacks: &RooflineSlackTable) -> ImportanceTable {
-    use crate::cep_importance::{HeadImportance, LayerImportance};
+    use crate::cep_importance::{FfnImportance, HeadImportance, LayerImportance};
     let mut heads = Vec::new();
-    for (layer, &nh) in spec.n_heads.iter().enumerate() {
-        let slack = slacks.get(layer as u32);
+    let mut ffns = Vec::new();
+    let mut layers = Vec::new();
+    for (l, &nh) in spec.n_heads.iter().enumerate() {
+        let layer = l as u32;
+        let slack = slacks.get(layer);
+        let pos = crate::cep_importance::position_factor(layer, spec.n_layers);
         for h in 0..nh {
             heads.push(HeadImportance {
-                layer: layer as u32,
+                layer,
                 head: h,
                 weight_magnitude: 1.0,
-                spectral_energy: 0.5,
+                spectral_energy: 1.0,
                 roofline_slack: slack,
-                position_factor: crate::cep_importance::position_factor(layer as u32, spec.n_layers),
-                // Earlier/later layers and lower-slack (compute-bound) layers
-                // get higher scores so the greedy search targets the middle
-                // first.
-                score: slack
-                    * crate::cep_importance::position_factor(layer as u32, spec.n_layers),
+                position_factor: pos,
+                score: slack * pos,
             });
         }
+        ffns.push(FfnImportance {
+            layer,
+            weight_magnitude: 1.0,
+            position_factor: pos,
+            roofline_slack: slack,
+            score: slack * pos,
+            neuron_magnitudes: Vec::new(),
+        });
+        layers.push(LayerImportance {
+            layer,
+            attention_score: nh as f64 * slack * pos,
+            ffn_score: slack * pos,
+            total_score: (nh as f64 + 1.0) * slack * pos,
+        });
     }
-    let layers = (0..spec.n_layers)
-        .map(|l| LayerImportance {
-            layer: l,
-            attention_score: spec.n_heads[l as usize] as f64,
-            ffn_score: 1.0,
-            total_score: spec.n_heads[l as usize] as f64 + 1.0,
-        })
-        .collect();
     ImportanceTable {
         heads,
-        ffns: Vec::new(),
+        ffns,
         layers,
     }
 }
@@ -502,151 +638,44 @@ struct PruneDeltaBody {
 }
 
 #[derive(Serialize)]
+struct SparsityDto {
+    target: f64,
+    achieved: f64,
+    met: bool,
+}
+
+#[derive(Serialize)]
 struct PruneDeltaDoc {
     cep_version: u32,
     mode: &'static str,
     target: String,
+    /// The sparsity target and both limits were met.
+    feasible: bool,
+    sparsity: SparsityDto,
+    constraints_met: bool,
     baseline_profile: BaselineProfileDto,
     chosen: ChosenDto,
     delta: PruneDeltaBody,
 }
 
-/// Build a GQA-group-aligned, importance-ranked PruneDelta from a prune plan.
-/// The shared source consumed by both `write_prune_delta` (JSON) and SP1's slicer.
-///
-/// Head pruning: `apply_delta` snaps `n_heads` to a group multiple by COUNT, so the
-/// chosen spec gives survivor counts but not identities. We pick which groups to drop
-/// by lowest summed head-importance (authoritative — `plan.importance.heads` is always
-/// populated in prune mode), keeping `pruned_heads` group-aligned and exactly consistent
-/// with `chosen.n_heads`.
+/// The plan's removals as a [`PruneDelta`] against `baseline`: whole
+/// key/value groups of heads, FFN widths, and dropped layers, exactly as the
+/// search chose them. The JSON writer, the weight slicer and the source
+/// rewriter all consume this one value.
 pub fn plan_to_prune_delta(plan: &CepPlan, baseline: &ModelSpec) -> PruneDelta {
-    let chosen = plan.outcome.chosen.as_ref().map(|c| &c.spec);
-
-    // Joint mode (Mode 3) bug fix: collect baseline layer indices that the
-    // planner accepted-dropped. The planner emits a
-    // `PruneStep { kind: "layer", layer: l, accepted: true }` per accepted
-    // drop (see `cep_search.rs::~647-682`). In Prune mode this set is empty
-    // so the delta produced for that mode is byte-identical to the
-    // pre-fix behavior.
-    let dropped_layers: std::collections::HashSet<u32> = plan
-        .outcome
-        .prune_log
-        .iter()
-        .filter(|s| s.accepted && s.kind == "layer")
-        .map(|s| s.layer)
-        .collect();
-
-    // Build baseline-layer-index → compacted-chosen-spec-index map. The
-    // chosen spec emitted by `apply_delta` (`cep_rewrite.rs::~120-124`)
-    // COMPACTS dropped layers out of every per-layer vector, so
-    // `chosen.spec.n_heads[k]` is the k-th *surviving* layer's head count,
-    // NOT the k-th baseline layer's.  Indexing chosen.n_heads with the
-    // raw baseline layer index produces off-by-N wrong deltas for every
-    // baseline layer following a dropped one — the silent correctness
-    // bug that shipped with PR #229 (Mode 3) and was latent on main
-    // until this fix.
-    let baseline_to_chosen: std::collections::HashMap<u32, usize> = {
-        let mut m = std::collections::HashMap::new();
-        let mut k = 0usize;
-        for l in 0..baseline.n_layers {
-            if !dropped_layers.contains(&l) {
-                m.insert(l, k);
-                k += 1;
-            }
-        }
-        m
-    };
-
-    // Pre-index head importances by layer so per-group scoring is a small local scan
-    // rather than re-walking the full `plan.importance.heads` slice for every group.
-    let mut head_scores_by_layer: Vec<Vec<(u32, f64)>> =
-        vec![Vec::new(); baseline.n_layers as usize];
-    for h in &plan.importance.heads {
-        if (h.layer as usize) < head_scores_by_layer.len() {
-            head_scores_by_layer[h.layer as usize].push((h.head, h.score));
-        }
-    }
-
-    let mut per_layer = Vec::with_capacity(baseline.n_layers as usize);
-    for l in 0..baseline.n_layers as usize {
-        // Dropped baseline layer: emit `drop_layer: true` and skip head/FFN
-        // delta computation.  `apply_delta` consumes `drop_layer` directly
-        // (see `cep_rewrite.rs::~93`); on dropped layers the per-layer
-        // head/FFN fields are ignored downstream, but leaving them empty
-        // here makes the emitted .cep.json unambiguous.
-        if dropped_layers.contains(&(l as u32)) {
-            per_layer.push(LayerDelta {
-                layer: l as u32,
-                pruned_heads: Vec::new(),
-                new_d_ff: None,
-                drop_layer: true,
-            });
-            continue;
-        }
-
-        let base_heads = baseline.n_heads[l];
-        let base_kv = baseline.n_kv_heads[l].max(1);
-        let group = (base_heads / base_kv).max(1);
-
-        // Look up the chosen spec via the COMPACTED index (NOT the raw
-        // baseline index) so layers following a dropped one resolve to
-        // the correct surviving-layer slot.  In Prune mode (no layer
-        // drops) `baseline_to_chosen[l] = l` for all l, so this is
-        // byte-identical to the pre-fix behavior.
-        let compacted_idx = baseline_to_chosen.get(&(l as u32)).copied();
-        let chosen_heads = chosen
-            .and_then(|c| compacted_idx.and_then(|k| c.n_heads.get(k).copied()))
-            .unwrap_or(base_heads);
-        let n_drop_heads = base_heads.saturating_sub(chosen_heads);
-        // The planner snaps n_heads to a group multiple, so the drop count is always a
-        // whole number of groups. Assert it so a future caller or planner change that
-        // breaks the invariant is caught in debug builds rather than silently truncating.
-        debug_assert_eq!(
-            n_drop_heads % group,
-            0,
-            "layer {l}: chosen_heads={chosen_heads} not a multiple of group={group}"
-        );
-        let n_drop_groups = (n_drop_heads / group) as usize;
-
-        let mut pruned_heads = Vec::new();
-        if n_drop_groups > 0 {
-            let layer_scores = &head_scores_by_layer[l];
-            // Score each of the `base_kv` groups by summed head importance for this layer.
-            let mut group_scores: Vec<(u32, f64)> = (0..base_kv)
-                .map(|g| {
-                    let lo = g * group;
-                    let hi = lo + group;
-                    let s: f64 = layer_scores
-                        .iter()
-                        .filter(|(head, _)| *head >= lo && *head < hi)
-                        .map(|(_, score)| *score)
-                        .sum();
-                    (g, s)
-                })
-                .collect();
-            // Lowest-score groups first; tie-break by lower group index for determinism.
-            group_scores.sort_by(|a, b| {
-                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0))
-            });
-            for &(g, _) in group_scores.iter().take(n_drop_groups) {
-                for h in (g * group)..((g + 1) * group) {
-                    pruned_heads.push(h);
-                }
-            }
-            pruned_heads.sort_unstable();
-        }
-
-        let new_d_ff = chosen
-            .and_then(|c| compacted_idx.and_then(|k| c.d_ff.get(k).copied()))
-            .filter(|&w| w < baseline.d_ff[l]);
-
-        per_layer.push(LayerDelta { layer: l as u32, pruned_heads, new_d_ff, drop_layer: false });
-    }
-    PruneDelta { per_layer }
+    plan.outcome
+        .delta
+        .clone()
+        .unwrap_or_else(|| PruneDelta::for_spec(baseline))
 }
 
-/// Serialize the prune delta — the Option-2 input contract.
+/// Serialize the prune delta.
 pub fn write_prune_delta(plan: &CepPlan, baseline: &ModelSpec, path: &Path) -> std::io::Result<()> {
+    crate::cep_weights::write_atomically(path, prune_delta_json(plan, baseline)?.as_bytes())
+}
+
+/// The delta file's contents.
+pub fn prune_delta_json(plan: &CepPlan, baseline: &ModelSpec) -> std::io::Result<String> {
     let chosen = plan.outcome.chosen.as_ref();
     let chosen_spec = chosen.map(|c| &c.spec);
 
@@ -665,8 +694,15 @@ pub fn write_prune_delta(plan: &CepPlan, baseline: &ModelSpec, path: &Path) -> s
     let bp = plan.outcome.baseline.as_ref();
     let doc = PruneDeltaDoc {
         cep_version: CEP_DELTA_VERSION,
-        mode: "prune",
+        mode: plan.mode.as_str(),
         target: plan.target_gpu.clone(),
+        feasible: plan.succeeded(),
+        sparsity: SparsityDto {
+            target: plan.outcome.target_sparsity,
+            achieved: plan.outcome.achieved_sparsity,
+            met: plan.outcome.sparsity_met,
+        },
+        constraints_met: plan.outcome.constraints_met,
         baseline_profile: BaselineProfileDto {
             total_flops: bp.map(|p| p.total_flops).unwrap_or(0),
             param_bytes: bp.map(|p| p.param_bytes).unwrap_or(0),
@@ -678,14 +714,17 @@ pub fn write_prune_delta(plan: &CepPlan, baseline: &ModelSpec, path: &Path) -> s
             profile: ChosenProfileDto {
                 param_bytes: chosen.map(|c| c.profile.param_bytes).unwrap_or(0),
                 peak_memory_bytes: chosen.map(|c| c.profile.peak_memory_bytes).unwrap_or(0),
-                estimated_latency_us: chosen.map(|c| c.profile.estimated_latency_us).unwrap_or(0.0),
-                roofline_utilization: chosen.map(|c| c.profile.roofline_utilization).unwrap_or(0.0),
+                estimated_latency_us: chosen
+                    .map(|c| c.profile.estimated_latency_us)
+                    .unwrap_or(0.0),
+                roofline_utilization: chosen
+                    .map(|c| c.profile.roofline_utilization)
+                    .unwrap_or(0.0),
             },
         },
         delta: PruneDeltaBody { per_layer },
     };
-    let json = serde_json::to_string_pretty(&doc)?;
-    std::fs::write(path, json)
+    Ok(serde_json::to_string_pretty(&doc)?)
 }
 
 #[derive(Serialize)]
@@ -767,7 +806,10 @@ impl std::fmt::Display for CepBridgeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CepBridgeError::UnknownTarget { target, supported } => {
-                write!(f, "CEP: unknown --cep-target '{target}'. Supported GPUs: {supported}")
+                write!(
+                    f,
+                    "CEP: unknown --cep-target '{target}'. Supported GPUs: {supported}"
+                )
             }
             CepBridgeError::BadPreserve(s) => write!(
                 f,
@@ -782,7 +824,11 @@ impl std::fmt::Display for CepBridgeError {
 }
 
 fn supported_gpus() -> String {
-    GPU_DATABASE.iter().map(|g| g.name).collect::<Vec<_>>().join(", ")
+    GPU_DATABASE
+        .iter()
+        .map(|g| g.name)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Public alias used by the CLI to report supported GPU names.
@@ -868,6 +914,7 @@ pub fn build_prune_input<'a>(
         latency_us: cfg.constraints.latency_us.unwrap_or(f64::INFINITY),
         target_sparsity,
         preserve_layers,
+        uniform: false,
     };
     Ok(CepPruneInput {
         spec,
@@ -875,7 +922,9 @@ pub fn build_prune_input<'a>(
         target,
         constraints,
         granularity: map_granularity(cfg.granularity),
-        roofline_slack: RooflineSlackTable { per_layer: Vec::new() },
+        roofline_slack: RooflineSlackTable {
+            per_layer: Vec::new(),
+        },
     })
 }
 
@@ -896,6 +945,7 @@ pub fn build_search_input<'a>(
         latency_us: cfg.constraints.latency_us.unwrap_or(f64::INFINITY),
         target_sparsity: 0.0,
         preserve_layers: Vec::new(),
+        uniform: false,
     };
     Ok(CepSearchInput {
         axes,
@@ -915,49 +965,126 @@ mod tests {
     use crate::cep_oracle::{Activation, ModelSpec, NormType};
     use crate::cep_rewrite::SearchAxes;
 
+    /// d=256, 4 layers, 8 query heads in 4 key/value groups, head_dim 32,
+    /// d_ff 512, vocab 8192, tied head: 4,458,752 parameters, of which one
+    /// key/value group or one FFN step (64 neurons) is 49,152. The arithmetic
+    /// is written out beside `cep_search`'s tests.
     fn tiny_spec() -> ModelSpec {
         ModelSpec::uniform(256, 4, 8, 4, 32, 512, 8192)
     }
 
+    fn prune_input(sparsity: f64, granularity: Granularity) -> CepPruneInput<'static> {
+        CepPruneInput {
+            spec: tiny_spec(),
+            weights: None,
+            target: "H100",
+            constraints: Constraints {
+                target_sparsity: sparsity,
+                ..Default::default()
+            },
+            granularity,
+            roofline_slack: RooflineSlackTable::default(),
+        }
+    }
+
+    /// 5% of 4,458,752 is 222,938 parameters: five steps of 49,152.
     #[test]
     fn run_prune_without_weights_still_produces_plan() {
-        let plan = run_prune(CepPruneInput {
-            spec: tiny_spec(),
-            weights: None,
-            target: "H100",
-            constraints: Constraints {
-                target_sparsity: 0.05,
-                ..Default::default()
-            },
-            granularity: Granularity::HeadAndFfn,
-            roofline_slack: RooflineSlackTable::default(),
-        });
+        let plan = run_prune(prune_input(0.05, Granularity::HeadAndFfn)).unwrap();
         assert_eq!(plan.mode, CepMode::Prune);
-        assert!(plan.outcome.baseline.is_some());
-        assert!(plan.outcome.chosen.is_some());
+        assert_eq!(plan.outcome.prune_log.len(), 5);
+        assert!(plan.succeeded());
         let report = plan.render_report();
         assert!(report.contains("CEP Pruning Report"));
+        assert!(
+            report.contains("Sparsity target and constraints met."),
+            "{report}"
+        );
+        assert!(!report.contains("NOT MET"), "{report}");
+    }
+
+    /// 1% is 44,588 parameters: one group, 49,152 / 4,458,752 = 1.1024%.
+    #[test]
+    fn run_prune_reports_the_reduction_it_made() {
+        let plan = run_prune(prune_input(0.01, Granularity::Head)).unwrap();
+        assert!((plan.param_reduction() - 49_152.0 / 4_458_752.0).abs() < 1e-12);
+        assert!(
+            plan.render_report()
+                .contains("Reduction: 1.1% of params removed (target 1.0%)")
+        );
+    }
+
+    /// Heads alone stop at 13.2% of this model (see `cep_search`). A plan that
+    /// misses its target must say so and must not count as a success.
+    #[test]
+    fn a_missed_target_is_not_reported_as_success() {
+        let plan = run_prune(prune_input(0.9, Granularity::Head)).unwrap();
+        assert!(!plan.succeeded());
+        let failures = plan.failures();
+        assert_eq!(failures.len(), 1);
+        assert!(
+            failures[0].contains("90.0% of parameters requested, 13.2% removed"),
+            "{failures:?}"
+        );
+        let report = plan.render_report();
+        assert!(
+            report.contains("NOT MET: sparsity target missed"),
+            "{report}"
+        );
+        assert!(!report.contains("constraints met"), "{report}");
     }
 
     #[test]
-    fn run_prune_reports_positive_reduction_when_sparsity_hit() {
-        let plan = run_prune(CepPruneInput {
-            spec: tiny_spec(),
-            weights: None,
-            target: "H100",
-            constraints: Constraints {
-                target_sparsity: 0.01,
-                ..Default::default()
-            },
-            granularity: Granularity::Head,
-            roofline_slack: RooflineSlackTable::default(),
-        });
-        assert!(plan.param_reduction() >= 0.0);
+    fn a_missed_limit_names_the_limit() {
+        let mut input = prune_input(0.0, Granularity::HeadAndFfn);
+        input.constraints.latency_us = 1.0; // launch overhead alone is far more
+        let plan = run_prune(input).unwrap();
+        assert!(!plan.succeeded());
+        let failures = plan.failures();
+        assert_eq!(failures.len(), 1);
+        assert!(
+            failures[0].starts_with("latency limit missed"),
+            "{failures:?}"
+        );
+        assert!(failures[0].contains("limit 1.0us"), "{failures:?}");
     }
 
     #[test]
-    fn run_search_produces_ranked_candidates() {
-        let axes = SearchAxes {
+    fn an_unknown_target_is_an_error_not_a_default() {
+        let mut input = prune_input(0.05, Granularity::Head);
+        input.target = "NoSuchGPU";
+        let err = run_prune(input).unwrap_err();
+        assert!(err.contains("NoSuchGPU"), "{err}");
+    }
+
+    /// The pass record counts the steps that were applied.
+    #[test]
+    fn pass_record_counts_applied_steps() {
+        let plan = run_prune(prune_input(0.05, Granularity::HeadAndFfn)).unwrap();
+        assert_eq!(
+            prune_disposition(&plan.outcome),
+            PassDisposition::Applied { rewrites: 5 }
+        );
+
+        let nothing_needed = run_prune(prune_input(0.0, Granularity::Head)).unwrap();
+        assert!(matches!(
+            prune_disposition(&nothing_needed.outcome),
+            PassDisposition::Declined { reason: DeclineReason::NoCandidates(m) } if m.contains("already meets")
+        ));
+
+        // One key/value head: head pruning has nothing it may remove.
+        let mut stuck = prune_input(0.3, Granularity::Head);
+        stuck.spec = ModelSpec::uniform(256, 4, 8, 1, 32, 512, 8192);
+        let stuck = run_prune(stuck).unwrap();
+        assert!(stuck.outcome.prune_log.is_empty() && !stuck.succeeded());
+        assert!(matches!(
+            prune_disposition(&stuck.outcome),
+            PassDisposition::Declined { reason: DeclineReason::NoCandidates(m) } if m.contains("nothing may be removed")
+        ));
+    }
+
+    fn search_axes() -> SearchAxes {
+        SearchAxes {
             d_model: vec![128, 256],
             n_layers: vec![2, 4],
             n_heads: vec![4, 8],
@@ -970,54 +1097,102 @@ mod tests {
             max_seq: 512,
             batch: 1,
             dtype_bytes: 2,
-        };
+            tied_lm_head: true,
+        }
+    }
+
+    #[test]
+    fn run_search_produces_ranked_candidates() {
         let plan = run_search(CepSearchInput {
-            axes,
+            axes: search_axes(),
+            target: "H100",
+            constraints: Constraints::default(),
+            objective: NasObjective::MinLatency,
+        })
+        .unwrap();
+        assert_eq!(plan.mode, CepMode::Search);
+        assert_eq!(plan.outcome.candidates_evaluated, 32);
+        assert!(plan.succeeded());
+        let report = plan.render_report();
+        assert!(report.contains("CEP Architecture Search Report"));
+        assert!(
+            report.contains("Search space: 32 candidates, 32 distinct"),
+            "{report}"
+        );
+        assert!(report.contains("Top 3 architectures:"), "{report}");
+        // The smallest of every axis is the fastest, so it is row 1.
+        assert!(
+            report.contains("  1. d=128, L=2, H=4, KV=2, FFN=256, act=swiglu, norm=rms_norm"),
+            "{report}"
+        );
+        assert!(!report.contains("infeasible"), "{report}");
+        assert!(
+            !report.contains("Note:"),
+            "min_latency carries no caveat\n{report}"
+        );
+    }
+
+    /// With a limit nothing meets there is no architecture to recommend. The
+    /// report must say so, and every row it shows must be marked.
+    #[test]
+    fn a_search_with_no_feasible_candidate_says_so() {
+        let plan = run_search(CepSearchInput {
+            axes: search_axes(),
+            target: "H100",
+            constraints: Constraints {
+                peak_memory_bytes: 1,
+                ..Default::default()
+            },
+            objective: NasObjective::MinLatency,
+        })
+        .unwrap();
+        assert!(!plan.succeeded());
+        assert_eq!(plan.failures().len(), 1);
+        let report = plan.render_report();
+        assert!(
+            report.contains("Feasible (constraints met): 0 candidates"),
+            "{report}"
+        );
+        assert!(
+            report.contains("NOT MET: no candidate meets the constraints."),
+            "{report}"
+        );
+        assert!(!report.contains("Top 3 architectures"), "{report}");
+        let rows: Vec<&str> = report.lines().filter(|l| l.contains(" d=")).collect();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|r| r.ends_with("(infeasible)")), "{rows:?}");
+    }
+
+    #[test]
+    fn param_efficiency_is_reported_with_its_caveat() {
+        let plan = run_search(CepSearchInput {
+            axes: search_axes(),
             target: "H100",
             constraints: Constraints::default(),
             objective: NasObjective::ParamEfficiency,
-        });
-        assert_eq!(plan.mode, CepMode::Search);
-        assert!(plan.outcome.candidates_evaluated > 0);
+        })
+        .unwrap();
         let report = plan.render_report();
-        assert!(report.contains("CEP Architecture Search Report"));
+        assert!(report.contains("Objective: param_efficiency"), "{report}");
+        assert!(report.contains("Note: param_efficiency"), "{report}");
+        assert!(report.contains("no task-quality term"), "{report}");
     }
 
     #[test]
     fn plan_is_deterministic_across_runs() {
-        let input = || CepPruneInput {
-            spec: tiny_spec(),
-            weights: None,
-            target: "H100",
-            constraints: Constraints {
-                target_sparsity: 0.05,
-                ..Default::default()
-            },
-            granularity: Granularity::Head,
-            roofline_slack: RooflineSlackTable::default(),
-        };
-        // Strip the MEASURED wall-clock lines: they depend on the clock, not
-        // on the plan, and this test is about the plan. `render_report` prints
-        // "Search time: {:.2} seconds" (Prune/Joint) or "Compilation time:
-        // {:.2} seconds" (Search) — `{:.2}` on SECONDS quantizes to 10 ms, so
-        // a >= 5 ms scheduler stall inside either call flips one to "0.01"
-        // and this assertion fails on a plan that is in fact identical. The
-        // sibling WGGO determinism test strips its "Solve time" line for the
-        // same reason.
-        //
-        // Only "Search time:" is reachable from `run_prune` today (the two
-        // are mutually exclusive branches), but the identical hazard sits one
-        // branch over, so both are stripped rather than leaving it armed for
-        // whoever next changes report formatting.
+        // The measured wall-clock line depends on the clock, not on the plan.
         let strip = |s: &str| -> String {
             s.lines()
                 .filter(|l| !l.starts_with("Search time:"))
-                .filter(|l| !l.starts_with("Compilation time:"))
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        let r1 = run_prune(input()).render_report();
-        let r2 = run_prune(input()).render_report();
+        let r1 = run_prune(prune_input(0.05, Granularity::Head))
+            .unwrap()
+            .render_report();
+        let r2 = run_prune(prune_input(0.05, Granularity::Head))
+            .unwrap()
+            .render_report();
         assert_eq!(strip(&r1), strip(&r2));
     }
 
@@ -1028,16 +1203,16 @@ mod tests {
         let table = synthetic_importance(&spec, &slacks);
         let expected: u32 = spec.n_heads.iter().sum();
         assert_eq!(table.heads.len() as u32, expected);
+        assert_eq!(table.ffns.len() as u32, spec.n_layers);
     }
 
-    // W4-1: format_params_si must always return millions-only (no suffix), so the render
+    // format_params_si must always return millions-only (no suffix), so the render
     // line "{}M params" composes correctly for sub-1M model candidates.
     #[test]
     fn format_params_si_handles_sub_1m() {
         assert_eq!(format_params_si(500_000), "0.5");
         assert_eq!(format_params_si(100), "0.0");
         assert_eq!(format_params_si(48_800_000), "48.8");
-        // Values >= 1M still render correctly (no "K" or "M" suffix appended by the helper).
         assert_eq!(format_params_si(1_000_000), "1.0");
         assert_eq!(format_params_si(7_000_000_000), "7000.0");
     }
@@ -1049,103 +1224,28 @@ mod tests {
             target_gpu: "test".into(),
             outcome: SearchOutcome::default(),
             importance: ImportanceTable::default(),
+            constraints: Constraints::default(),
+            objective: None,
         };
         assert_eq!(plan.param_reduction(), 0.0);
     }
 
-    /// G19 — paper §8.1 projection smoke test (NSLCoder-50M on H100).
+    /// The shipped 50M-parameter shape (`models/coder50m/model.nsl`):
+    /// 48,767,488 parameters, of which the tied embedding is 25,165,824.
+    /// A key/value group (2 of 8 query heads) is 2·512·128 + 2·512·64 =
+    /// 196,608 parameters and an FFN step (128 of 1408 neurons) is
+    /// 3·512·128 = 196,608.
     ///
-    /// Asserts that CEP pruning produces PROJECTED-direction effects: monotonic decrease
-    /// in params / peak memory / binary size / kernel launches as sparsity rises, within
-    /// 3× of the §8.1 ratios. Does NOT assert exact paper numbers (those are projections,
-    /// not ground truth) — the oracle's first-order models for peak memory + binary size
-    /// are deliberately conservative, so we allow wide windows but require direction.
-    ///
-    /// Paper §3: NSLCoder-50M shape — D=512, L=8, H=8, KV=4, FFN=1408, head_dim=64.
-    /// Paper §8.1 baseline row: 48.8M params, 5.2 GB peak mem, 6.9 μs/tok, 195 MB binary.
+    /// A 30% request needs 14,630,247 parameters gone: 75 steps, 30.24%.
+    /// The most head and FFN pruning can remove is 3 groups and 7 FFN steps
+    /// (1408 -> 512) from each of 8 layers, 80 steps, 32.25%: a 50% request
+    /// cannot be met, because half the model is the embedding.
     #[test]
-    fn nslcoder_50m_projection_monotonicity() {
-        // §3 shape: D=512, L=8, H=8, KV=4, head_dim=64, FFN=1408, vocab=32000.
-        let spec = ModelSpec::uniform(512, 8, 8, 4, 64, 1408, 32000);
-        // find_gpu("H100") prefix-matches to H100-SXM (prefers SXM per gpu_specs::find_gpu).
-        let gpu = crate::gpu_specs::find_gpu("H100").expect("H100 in GPU_DATABASE");
-
-        // --- Baseline ---
-        let baseline = crate::cep_oracle::evaluate(&spec, gpu).expect("baseline profile");
-
-        // Param count: paper says 48.8M. Oracle uses fp16 (dtype_bytes=2).
-        let param_count = baseline.param_bytes / spec.dtype_bytes as u64;
-        assert!(
-            param_count >= 20_000_000 && param_count <= 100_000_000,
-            "NSLCoder-50M param count out of [20M, 100M]: {}",
-            param_count
-        );
-
-        // Peak memory: paper says 5.2 GB (full deployment with KV cache + batch).
-        // The oracle computes a first-order estimate: param_bytes + max_activation_per_layer,
-        // which is much smaller (order of 100s of MB for a 50M param FP16 model). We assert
-        // the oracle's output is in a sane range relative to what it can compute.
-        //
-        // Note: peak_memory_bytes = param_bytes + max_activation_bytes (oracle formula), so
-        // its monotonic decrease under pruning is GUARANTEED by param_bytes monotonicity.
-        // The assertions here are sanity coverage, not independent signal.
-        //
-        // Floor: at least param_bytes + 1024 (the activation term must add at least a small
-        // page — this checks the formula structure rather than being a tautology of >= param_bytes).
-        // Ceiling: 50 GB (any sane oracle estimate for a ~50M param model is well below this).
-        assert!(
-            baseline.peak_memory_bytes >= baseline.param_bytes + 1024,
-            "peak_memory_bytes {} must exceed param_bytes {} by at least 1 KiB (activation term)",
-            baseline.peak_memory_bytes,
-            baseline.param_bytes
-        );
-        assert!(
-            baseline.peak_memory_bytes <= 50_000_000_000,
-            "peak_memory_bytes > 50 GB: {}",
-            baseline.peak_memory_bytes
-        );
-
-        // Latency must be positive and finite.
-        assert!(
-            baseline.estimated_latency_us > 0.0 && baseline.estimated_latency_us.is_finite(),
-            "estimated_latency_us invalid: {}",
-            baseline.estimated_latency_us
-        );
-
-        // Binary size: paper says 195 MB. Oracle is first-order; allow up to 1 GB.
-        //
-        // Note: binary_size_bytes = param_bytes + ~20 KB/layer + 60 KB overhead (oracle
-        // formula), so its monotonic decrease under pruning is GUARANTEED by param_bytes
-        // monotonicity. The assertions here are sanity coverage, not independent signal.
-        //
-        // Floor: at least param_bytes + 20_000 (at least one layer's code section) — this
-        // checks the formula structure rather than being a tautology of >= param_bytes.
-        assert!(
-            baseline.binary_size_bytes >= baseline.param_bytes + 20_000,
-            "binary_size_bytes {} must exceed param_bytes {} by at least 20 KB (per-layer overhead)",
-            baseline.binary_size_bytes,
-            baseline.param_bytes
-        );
-        assert!(
-            baseline.binary_size_bytes <= 1_000_000_000,
-            "binary_size_bytes > 1 GB: {}",
-            baseline.binary_size_bytes
-        );
-
-        // Kernel launches: 8-layer model; paper estimates ~16 launches/layer × 8 + 2 ≈ 130.
-        // Allow wide [10, 200] window.
-        assert!(
-            baseline.kernel_launches >= 10 && baseline.kernel_launches <= 200,
-            "kernel_launches out of [10, 200]: {}",
-            baseline.kernel_launches
-        );
-
-        // --- Pruned profiles at three sparsity levels ---
-        let sparsities: &[f64] = &[0.2, 0.3, 0.5];
-        let mut pruned_profiles: Vec<crate::cep_oracle::CompilationProfile> = Vec::new();
-
-        for &sparsity in sparsities {
-            let plan = run_prune(CepPruneInput {
+    fn nslcoder_50m_budget_adherence() {
+        let spec = ModelSpec::uniform(512, 8, 8, 4, 64, 1408, 49152);
+        assert_eq!(spec.param_count(), 48_767_488);
+        let run = |sparsity: f64| {
+            run_prune(CepPruneInput {
                 spec: spec.clone(),
                 weights: None,
                 target: "H100",
@@ -1155,81 +1255,30 @@ mod tests {
                 },
                 granularity: Granularity::HeadAndFfn,
                 roofline_slack: RooflineSlackTable::default(),
-            });
+            })
+            .unwrap()
+        };
 
-            let chosen = plan.outcome.chosen.as_ref().expect("chosen must be Some after pruning");
-            // Pruned must be strictly smaller than baseline on params.
-            assert!(
-                chosen.profile.param_bytes < baseline.param_bytes,
-                "sparsity={}: pruned param_bytes {} >= baseline {}",
-                sparsity,
-                chosen.profile.param_bytes,
-                baseline.param_bytes
-            );
-            // Peak memory: ≤ baseline (may not strictly decrease at low sparsity).
-            assert!(
-                chosen.profile.peak_memory_bytes <= baseline.peak_memory_bytes,
-                "sparsity={}: pruned peak_memory_bytes {} > baseline {}",
-                sparsity,
-                chosen.profile.peak_memory_bytes,
-                baseline.peak_memory_bytes
-            );
-            // Binary size: ≤ baseline.
-            assert!(
-                chosen.profile.binary_size_bytes <= baseline.binary_size_bytes,
-                "sparsity={}: pruned binary_size_bytes {} > baseline {}",
-                sparsity,
-                chosen.profile.binary_size_bytes,
-                baseline.binary_size_bytes
-            );
-            // Kernel launches: under HeadAndFfn granularity without layer drop,
-            // kernel_launches is INVARIANT (depends only on layer count, not head
-            // count).  No per-pruned assertion — it would be vacuously true.
-            // Real search time was measured.
-            assert!(
-                plan.outcome.wall_clock_us > 0,
-                "sparsity={}: wall_clock_us must be > 0",
-                sparsity
-            );
+        let p30 = run(0.3);
+        assert!(p30.succeeded());
+        assert_eq!(p30.outcome.prune_log.len(), 75);
+        let chosen = p30.outcome.chosen.as_ref().unwrap();
+        assert_eq!(chosen.spec.param_count(), 48_767_488 - 75 * 196_608);
+        assert!((p30.outcome.achieved_sparsity - 14_745_600.0 / 48_767_488.0).abs() < 1e-12);
 
-            pruned_profiles.push(chosen.profile.clone());
-        }
-
-        // --- Monotonicity: 20% < 30% < 50% sparsity means profiles[0] >= profiles[1] >= profiles[2] ---
-        // profiles[0]=20%, profiles[1]=30%, profiles[2]=50%
-        // Higher sparsity → strictly fewer params (and ≤ on other metrics).
-        //
-        // param_bytes monotonicity is the load-bearing signal.
-        // peak_memory_bytes and binary_size_bytes are derived from param_bytes plus small
-        // constants in the oracle (max_activation_bytes for peak; ~20KB/layer + 60KB for
-        // binary), so their monotonic decrease is GUARANTEED by param_bytes monotonicity.
-        // These assertions are sanity coverage, not independent signal.
-        //
-        // kernel_launches depends only on layer count (not head count), so under
-        // HeadAndFfn-without-layer-drop it is INVARIANT — monotonicity would be vacuous.
-        // No kernel_launches monotonicity assertion.
-        for w in pruned_profiles.windows(2) {
-            let less_sparse = &w[0];
-            let more_sparse = &w[1];
-            assert!(
-                more_sparse.param_bytes <= less_sparse.param_bytes,
-                "monotonicity violated on param_bytes: 30%/50% profile ({}) > 20%/30% profile ({})",
-                more_sparse.param_bytes,
-                less_sparse.param_bytes
-            );
-            assert!(
-                more_sparse.binary_size_bytes <= less_sparse.binary_size_bytes,
-                "monotonicity violated on binary_size_bytes: {} > {}",
-                more_sparse.binary_size_bytes,
-                less_sparse.binary_size_bytes
-            );
-            assert!(
-                more_sparse.peak_memory_bytes <= less_sparse.peak_memory_bytes,
-                "monotonicity violated on peak_memory_bytes: {} > {}",
-                more_sparse.peak_memory_bytes,
-                less_sparse.peak_memory_bytes
-            );
-        }
+        let p50 = run(0.5);
+        assert!(!p50.succeeded());
+        assert!(!p50.outcome.sparsity_met);
+        assert_eq!(p50.outcome.prune_log.len(), 80);
+        let chosen = p50.outcome.chosen.as_ref().unwrap();
+        assert_eq!(chosen.spec.n_heads, vec![2; 8]);
+        assert_eq!(chosen.spec.d_ff, vec![512; 8]);
+        assert_eq!(chosen.spec.param_count(), 48_767_488 - 80 * 196_608);
+        // Head and FFN pruning change kernel sizes, not how many are launched.
+        assert_eq!(
+            chosen.profile.kernel_launches,
+            p50.outcome.baseline.as_ref().unwrap().kernel_launches
+        );
     }
 }
 
@@ -1252,6 +1301,7 @@ mod bridge_tests {
             activation: Activation::SwiGlu,
             norm: NormType::RmsNorm,
             dtype_bytes: 4,
+            tied_lm_head: true,
         }
     }
 
@@ -1308,7 +1358,8 @@ mod bridge_tests {
         let mut cfg = prune_cfg();
         // Paper §6.1 syntax:
         cfg.preserve = vec!["blocks.0.*".to_string(), "blocks.5.*".to_string()];
-        let input = build_prune_input(&cfg, baseline.clone(), None, "H100-SXM", None).expect("input");
+        let input =
+            build_prune_input(&cfg, baseline.clone(), None, "H100-SXM", None).expect("input");
         assert_eq!(input.constraints.preserve_layers, vec![0, 5]);
     }
 
@@ -1317,7 +1368,8 @@ mod bridge_tests {
         let baseline = spec();
         let mut cfg = prune_cfg();
         cfg.preserve = vec!["blocks.1".to_string(), "blocks.3.attn".to_string()];
-        let input = build_prune_input(&cfg, baseline.clone(), None, "H100-SXM", None).expect("input");
+        let input =
+            build_prune_input(&cfg, baseline.clone(), None, "H100-SXM", None).expect("input");
         assert_eq!(input.constraints.preserve_layers, vec![1, 3]);
     }
 
@@ -1348,15 +1400,19 @@ mod bridge_tests {
     fn write_prune_delta_emits_versioned_json() {
         let baseline = spec();
         let cfg = prune_cfg();
-        let input = build_prune_input(&cfg, baseline.clone(), None, "H100-SXM", Some(0.2)).expect("input");
-        let plan = run_prune(input);
+        let input =
+            build_prune_input(&cfg, baseline.clone(), None, "H100-SXM", Some(0.2)).expect("input");
+        let plan = run_prune(input).unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("model.cep.json");
         write_prune_delta(&plan, &baseline, &path).expect("write");
 
         let mut s = String::new();
-        std::fs::File::open(&path).unwrap().read_to_string(&mut s).unwrap();
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_to_string(&mut s)
+            .unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["cep_version"], 2);
         assert_eq!(v["mode"], "prune");
@@ -1365,7 +1421,43 @@ mod bridge_tests {
         assert!(v["chosen"]["spec"]["d_model"].is_number());
         assert!(v["chosen"]["spec"]["activation"].is_string());
         assert!(v["delta"]["per_layer"].is_array());
-        assert_eq!(v["delta"]["per_layer"].as_array().unwrap().len(), baseline.n_layers as usize);
+        assert_eq!(
+            v["delta"]["per_layer"].as_array().unwrap().len(),
+            baseline.n_layers as usize
+        );
+        // The plan met a 20% target; the file says so and by how much.
+        assert_eq!(v["feasible"], true);
+        assert_eq!(v["sparsity"]["met"], true);
+        assert_eq!(v["sparsity"]["target"], 0.2);
+        assert!(v["sparsity"]["achieved"].as_f64().unwrap() >= 0.2);
+        assert_eq!(v["constraints_met"], true);
+    }
+
+    /// A joint plan's file says it is one, and carries the dropped layers.
+    #[test]
+    fn joint_delta_json_is_labelled_joint() {
+        let baseline = spec();
+        let mut cfg = prune_cfg();
+        cfg.preserve = Vec::new();
+        cfg.constraints.peak_memory_bytes = None;
+        cfg.constraints.latency_us = None;
+        let input =
+            build_prune_input(&cfg, baseline.clone(), None, "H100-SXM", Some(0.5)).expect("input");
+        let plan = run_joint(input).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&prune_delta_json(&plan, &baseline).unwrap()).unwrap();
+        assert_eq!(v["mode"], "joint");
+        let dropped = v["delta"]["per_layer"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|l| l["drop_layer"] == true)
+            .count();
+        assert_eq!(
+            dropped as u32,
+            baseline.n_layers - plan.outcome.chosen.as_ref().unwrap().spec.n_layers
+        );
+        assert!(dropped > 0);
     }
 
     #[test]
@@ -1373,8 +1465,11 @@ mod bridge_tests {
         // baseline: 6 heads, 3 kv -> group size 2. Prune to 4 heads / 2 kv (drop 1 group).
         let baseline = spec(); // d_model=384, n_layers=6, n_heads=[6;6], n_kv_heads=[3;6], head_dim=[64;6], d_ff=[1024;6]
         let cfg = prune_cfg();
-        let input = build_prune_input(&cfg, baseline.clone(), None, "H100-SXM", Some(0.2)).expect("input");
-        let plan = run_prune(input);
+        // 30% of 11,309,952 is more than the four unpreserved layers' FFNs can
+        // give (4 x 5 steps x 147,456 = 2,949,120), so head groups must go too.
+        let input =
+            build_prune_input(&cfg, baseline.clone(), None, "H100-SXM", Some(0.3)).expect("input");
+        let plan = run_prune(input).unwrap();
         let delta = plan_to_prune_delta(&plan, &baseline);
 
         // Non-vacuous: the chosen plan must actually prune at least one layer, or the
@@ -1389,7 +1484,11 @@ mod bridge_tests {
             let l = ld.layer as usize;
             let group = baseline.n_heads[l] / baseline.n_kv_heads[l]; // 2
             // pruned_heads must be a whole number of groups
-            assert_eq!(ld.pruned_heads.len() % group as usize, 0, "layer {l}: not group-aligned");
+            assert_eq!(
+                ld.pruned_heads.len() % group as usize,
+                0,
+                "layer {l}: not group-aligned"
+            );
             // survivor count must equal the chosen spec exactly
             assert_eq!(
                 baseline.n_heads[l] - ld.pruned_heads.len() as u32,
@@ -1444,9 +1543,9 @@ mod bridge_tests {
         // default cfg's peak_memory_bytes / latency_us are tight.
         cfg.constraints.peak_memory_bytes = None;
         cfg.constraints.latency_us = None;
-        let input = build_prune_input(&cfg, baseline.clone(), None, "H100-SXM", Some(0.5))
-            .expect("input");
-        let plan = run_joint(input);
+        let input =
+            build_prune_input(&cfg, baseline.clone(), None, "H100-SXM", Some(0.5)).expect("input");
+        let plan = run_joint(input).unwrap();
 
         // Force the test to fail loudly if the planner doesn't actually drop a layer
         // — otherwise (1)+(2) below would pass trivially on the empty drop set.
@@ -1454,7 +1553,7 @@ mod bridge_tests {
             .outcome
             .prune_log
             .iter()
-            .filter(|s| s.accepted && s.kind == "layer")
+            .filter(|s| s.kind == "layer")
             .map(|s| s.layer)
             .collect();
         assert!(
@@ -1495,7 +1594,11 @@ mod bridge_tests {
         //     For each surviving baseline layer, walk a parallel compacted-index
         //     counter; the survivor head count from the delta must match
         //     chosen.spec.n_heads[compacted_idx] — the off-by-N case in Bug 2.
-        let chosen = plan.outcome.chosen.as_ref().expect("joint produced no chosen spec");
+        let chosen = plan
+            .outcome
+            .chosen
+            .as_ref()
+            .expect("joint produced no chosen spec");
         let mut compacted_idx = 0usize;
         for ld in &delta.per_layer {
             let l = ld.layer as usize;
@@ -1504,10 +1607,14 @@ mod bridge_tests {
             }
             let surviving_heads = baseline.n_heads[l] - ld.pruned_heads.len() as u32;
             assert_eq!(
-                surviving_heads, chosen.spec.n_heads[compacted_idx],
+                surviving_heads,
+                chosen.spec.n_heads[compacted_idx],
                 "layer {} (compacted index {}): survivor count from delta = {}, \
                  chosen.spec.n_heads[{}] = {} — off-by-N bug surfacing again",
-                l, compacted_idx, surviving_heads, compacted_idx,
+                l,
+                compacted_idx,
+                surviving_heads,
+                compacted_idx,
                 chosen.spec.n_heads[compacted_idx]
             );
             // FFN check: new_d_ff must either be None (no shrink) OR match
@@ -1517,19 +1624,16 @@ mod bridge_tests {
                 assert_eq!(
                     new_d_ff, chosen.spec.d_ff[compacted_idx],
                     "layer {} (compacted index {}): new_d_ff = {} != chosen.spec.d_ff[{}] = {}",
-                    l, compacted_idx, new_d_ff, compacted_idx,
-                    chosen.spec.d_ff[compacted_idx]
+                    l, compacted_idx, new_d_ff, compacted_idx, chosen.spec.d_ff[compacted_idx]
                 );
             }
             compacted_idx += 1;
         }
         // Total surviving layers in delta must equal the chosen spec's layer count.
         assert_eq!(
-            compacted_idx as u32,
-            chosen.spec.n_layers,
+            compacted_idx as u32, chosen.spec.n_layers,
             "delta surviving-layer count ({}) != chosen.spec.n_layers ({})",
-            compacted_idx,
-            chosen.spec.n_layers
+            compacted_idx, chosen.spec.n_layers
         );
     }
 
@@ -1542,7 +1646,7 @@ mod bridge_tests {
         let cfg = prune_cfg();
         let input =
             build_prune_input(&cfg, baseline.clone(), None, "H100-SXM", Some(0.2)).expect("input");
-        let plan = run_prune(input);
+        let plan = run_prune(input).unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("delta.cep.json");
@@ -1568,11 +1672,19 @@ mod bridge_tests {
     fn write_search_delta_emits_ranked_candidates() {
         use crate::cep_rewrite::SearchAxes;
         let axes = SearchAxes {
-            d_model: vec![256, 384], n_layers: vec![4], n_heads: vec![4, 8],
-            n_kv_heads: vec![2], d_ff: vec![512, 1024],
+            d_model: vec![256, 384],
+            n_layers: vec![4],
+            n_heads: vec![4, 8],
+            n_kv_heads: vec![2],
+            d_ff: vec![512, 1024],
             activation: vec![crate::cep_oracle::Activation::SwiGlu],
             norm: vec![crate::cep_oracle::NormType::RmsNorm],
-            vocab: 4096, head_dim: 64, max_seq: 2048, batch: 1, dtype_bytes: 4,
+            vocab: 4096,
+            head_dim: 64,
+            max_seq: 2048,
+            batch: 1,
+            dtype_bytes: 4,
+            tied_lm_head: true,
         };
         let scfg = nsl_semantic::cep::CepSearchConfig {
             target: None,
@@ -1581,7 +1693,7 @@ mod bridge_tests {
             span: nsl_errors::Span::DUMMY,
         };
         let input = build_search_input(&scfg, axes, "H100-SXM").expect("input");
-        let plan = run_search(input);
+        let plan = run_search(input).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.cep.json");
         write_search_delta(&plan, &path).expect("write");
@@ -1592,53 +1704,31 @@ mod bridge_tests {
     }
 
     #[test]
-    fn prune_report_includes_search_time_constraints_binary_kernel_launches() {
+    fn prune_report_names_what_its_figures_are() {
         let baseline = spec();
         let cfg = prune_cfg();
-        let input = build_prune_input(&cfg, baseline.clone(), None, "H100-SXM", Some(0.2)).expect("input");
-        let plan = run_prune(input);
+        let input =
+            build_prune_input(&cfg, baseline.clone(), None, "H100-SXM", Some(0.2)).expect("input");
+        let plan = run_prune(input).unwrap();
         let rendered = plan.render_report();
-        // §6.3 mandatory lines
-        assert!(rendered.contains("Search time:"), "missing 'Search time:' line\n{}", rendered);
+        for line in [
+            "Search time:",
+            "Estimates are for one forward pass of batch 1 x 2048 tokens, 4-byte values, tied output head.",
+            "us/forward",
+            "Sparsity target and constraints met.",
+            "Weights + nominal code size:",
+            "Kernel launches per forward (fusion template): 50 -> 50",
+        ] {
+            assert!(rendered.contains(line), "missing '{line}'\n{rendered}");
+        }
+        // Layers 0 and 5 are preserved in `prune_cfg`, and say so by their shape.
         assert!(
-            rendered.contains("All constraints satisfied") || rendered.contains("Constraints violated"),
-            "missing constraint-status line\n{}", rendered
+            rendered.contains("  Layer 0: heads=6, FFN=1024"),
+            "{rendered}"
         );
-        assert!(rendered.contains("Binary size:"), "missing 'Binary size:' line\n{}", rendered);
         assert!(
-            rendered.contains("Kernel launches per forward:"),
-            "missing 'Kernel launches per forward:' line\n{}", rendered
-        );
-    }
-
-    #[test]
-    fn search_report_includes_search_space_feasible_compilation_time_top3() {
-        use crate::cep_rewrite::SearchAxes;
-        let axes = SearchAxes {
-            d_model: vec![256, 384], n_layers: vec![4], n_heads: vec![4, 8],
-            n_kv_heads: vec![2], d_ff: vec![512, 1024],
-            activation: vec![crate::cep_oracle::Activation::SwiGlu],
-            norm: vec![crate::cep_oracle::NormType::RmsNorm],
-            vocab: 4096, head_dim: 64, max_seq: 2048, batch: 1, dtype_bytes: 4,
-        };
-        let scfg = nsl_semantic::cep::CepSearchConfig {
-            target: None,
-            objective: nsl_semantic::cep::NasObjective::ParamEfficiency,
-            constraints: Default::default(),
-            span: nsl_errors::Span::DUMMY,
-        };
-        let input = build_search_input(&scfg, axes, "H100-SXM").expect("input");
-        let plan = run_search(input);
-        let rendered = plan.render_report();
-        assert!(rendered.contains("Search space:"), "{}", rendered);
-        assert!(rendered.contains("Feasible"), "{}", rendered);
-        assert!(rendered.contains("Compilation time:"), "{}", rendered);
-        assert!(rendered.contains("Top 3 architectures:"), "{}", rendered);
-        // Per-candidate line shape — paper §6.3 example
-        assert!(
-            rendered.contains("d=") && rendered.contains("L=")
-                && rendered.contains("H=") && rendered.contains("KV="),
-            "per-candidate line missing d=/L=/H=/KV= tokens\n{}", rendered
+            rendered.contains("  Layer 5: heads=6, FFN=1024"),
+            "{rendered}"
         );
     }
 }

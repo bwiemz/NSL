@@ -424,6 +424,7 @@ pub fn extract_model_spec(module: &Module, resolve: Resolve) -> Result<ModelSpec
 
     // 4. Embedding: first 2-int ListLiteral on an Embedding-role field.
     let mut vocab = None;
+    let mut embed_field = None;
     for member in &top_md.members {
         let ModelMember::LayerDecl {
             name,
@@ -438,6 +439,7 @@ pub fn extract_model_spec(module: &Module, resolve: Resolve) -> Result<ModelSpec
             && let Some(shape) = first_int_list(init, 2)
         {
             vocab = Some(shape[0] as u32);
+            embed_field = Some(*name);
             break;
         }
     }
@@ -446,6 +448,23 @@ pub fn extract_model_spec(module: &Module, resolve: Resolve) -> Result<ModelSpec
             "no embedding tensor (a 2-D `embed`/`embedding` field) found".to_string(),
         )
     })?;
+
+    // 5. Output head. The shipped models reuse the embedding
+    //    (`x @ self.embed.transpose(0, 1)`) and declare no second matrix. A
+    //    separate head shows up as another top-level field shaped
+    //    `[d_model, vocab]` or `[vocab, d_model]`; only then is it counted.
+    let tied_lm_head = !top_md.members.iter().any(|member| {
+        let ModelMember::LayerDecl { name, init: Some(init), .. } = member else {
+            return false;
+        };
+        if Some(*name) == embed_field {
+            return false;
+        }
+        first_int_list(init, 2).is_some_and(|shape| {
+            let (a, b) = (shape[0], shape[1]);
+            (a == vocab as i64 && b == d_model as i64) || (a == d_model as i64 && b == vocab as i64)
+        })
+    });
 
     let max_seq = ctx
         .consts
@@ -462,10 +481,15 @@ pub fn extract_model_spec(module: &Module, resolve: Resolve) -> Result<ModelSpec
         d_ff: vec![d_ff; n_layers as usize],
         vocab,
         max_seq,
+        // The source does not say what batch or precision the model will
+        // run at. One sequence of f32 values is what an NSL model is unless
+        // told otherwise; callers that know better (a weights file states
+        // its dtype) overwrite these, and every report prints them.
         batch: 1,
         activation,
         norm,
         dtype_bytes: 4,
+        tied_lm_head,
     };
     spec.validate().map_err(CepExtractError::InvalidSpec)?;
     Ok(spec)
@@ -566,6 +590,7 @@ pub fn extract_search_axes(module: &Module, resolve: Resolve) -> Result<SearchAx
         max_seq: base.max_seq,
         batch: base.batch,
         dtype_bytes: base.dtype_bytes,
+        tied_lm_head: base.tied_lm_head,
     };
     // Integer-valued axes (d_model, n_layers, n_heads, n_kv_heads, d_ff).
     for (axis, values) in collect_search_axes(module, resolve) {
@@ -625,57 +650,71 @@ impl std::fmt::Display for CepCrossCheckError {
     }
 }
 
-/// True if `shape` matches `[a, b]` in either orientation.
-fn dims_match(shape: &[usize], a: u32, b: u32) -> bool {
-    shape.len() == 2
-        && ((shape[0] as u32 == a && shape[1] as u32 == b)
-            || (shape[0] as u32 == b && shape[1] as u32 == a))
-}
-
-/// Cross-check extracted dims against actual tensor shapes for the attention +
-/// FFN tensors only. The embedding is excluded (vocab is fixed/legitimately
-/// padded — DR-8). Returns the first disagreement.
+/// Cross-check the dims read from the source against the weights file: every
+/// layer must have its four attention projections and three FFN matrices, in
+/// NSL's `[in, out]` layout. Accepts both spellings of a layer's name
+/// (`blocks[0].attn.wq`, as `model_save` writes it, and `blocks.0.attn.wq`).
+/// The embedding is not checked (a vocabulary may be padded). Returns the
+/// first disagreement.
 pub fn cross_check_dims(
     spec: &ModelSpec,
     wm: &WeightMap,
     _resolve: Resolve,
 ) -> Result<(), CepCrossCheckError> {
-    let mut checked = 0usize;
+    let index = crate::cep_weights::BlockIndex::build(wm).map_err(|e| CepCrossCheckError {
+        tensor: "blocks[N].*".to_string(),
+        expected: "each tensor stored once".to_string(),
+        found: e,
+    })?;
+    if index.is_empty() {
+        return Err(CepCrossCheckError {
+            tensor: "blocks[0].attn.wq".to_string(),
+            expected: "tensors named blocks[N].attn.* / blocks[N].ffn.* (or blocks.N.…)".to_string(),
+            found: "no tensors matching the model's attention/FFN naming convention".to_string(),
+        });
+    }
     for l in 0..spec.n_layers as usize {
         let q_proj = spec.n_heads[l] * spec.head_dim[l];
         let kv_proj = spec.n_kv_heads[l] * spec.head_dim[l];
         let d_ff = spec.d_ff[l];
         let dm = spec.d_model;
 
-        let checks: [(String, u32, String); 5] = [
-            (format!("blocks.{l}.attn.wq"), q_proj, format!("n_heads·head_dim = {q_proj}")),
-            (format!("blocks.{l}.attn.wk"), kv_proj, format!("n_kv_heads·head_dim = {kv_proj}")),
-            (format!("blocks.{l}.attn.wv"), kv_proj, format!("n_kv_heads·head_dim = {kv_proj}")),
-            (format!("blocks.{l}.ffn.w_gate"), d_ff, format!("d_ff = {d_ff}")),
-            (format!("blocks.{l}.ffn.w_up"), d_ff, format!("d_ff = {d_ff}")),
+        // (path inside the block, [rows, cols], what the shape means)
+        let checks: [(&str, [u32; 2], String); 7] = [
+            ("attn.wq", [dm, q_proj], format!("[d_model, n_heads·head_dim] = [{dm}, {q_proj}]")),
+            ("attn.wk", [dm, kv_proj], format!("[d_model, n_kv_heads·head_dim] = [{dm}, {kv_proj}]")),
+            ("attn.wv", [dm, kv_proj], format!("[d_model, n_kv_heads·head_dim] = [{dm}, {kv_proj}]")),
+            ("attn.wo", [q_proj, dm], format!("[n_heads·head_dim, d_model] = [{q_proj}, {dm}]")),
+            ("ffn.w_gate", [dm, d_ff], format!("[d_model, d_ff] = [{dm}, {d_ff}]")),
+            ("ffn.w_up", [dm, d_ff], format!("[d_model, d_ff] = [{dm}, {d_ff}]")),
+            ("ffn.w_down", [d_ff, dm], format!("[d_ff, d_model] = [{d_ff}, {dm}]")),
         ];
-        for (name, other, label) in checks {
-            let Some(entry) = wm.get(&name) else { continue };
-            checked += 1;
-            if !dims_match(&entry.shape, dm, other) {
+        for (rest, shape, label) in checks {
+            let tensor = format!("blocks[{l}].{rest}");
+            let Some(entry) = index.get(wm, l as u32, rest) else {
                 return Err(CepCrossCheckError {
-                    tensor: name,
-                    expected: format!(
-                        "{label} (with d_model = {dm}) from GroupedQueryAttention/SwiGLUFFN args"
-                    ),
+                    tensor,
+                    expected: format!("{label} from GroupedQueryAttention/SwiGLUFFN args"),
+                    found: "no such tensor in the weights file".to_string(),
+                });
+            };
+            if entry.shape != [shape[0] as usize, shape[1] as usize] {
+                return Err(CepCrossCheckError {
+                    tensor: entry.name.clone(),
+                    expected: format!("{label} from GroupedQueryAttention/SwiGLUFFN args"),
                     found: format!("weight shape {:?}", entry.shape),
                 });
             }
         }
     }
-    if checked == 0 {
-        return Err(CepCrossCheckError {
-            tensor: "blocks.0.attn.wq".to_string(),
-            expected: "tensors named blocks.N.attn.* / blocks.N.ffn.*".to_string(),
-            found: "no tensors matching the model's attention/FFN naming convention".to_string(),
-        });
-    }
     Ok(())
+}
+
+/// The byte width of the model's weights as stored, read from the first
+/// layer's query projection. `None` when that tensor is absent.
+pub fn weights_dtype_bytes(wm: &WeightMap) -> Option<u32> {
+    let index = crate::cep_weights::BlockIndex::build(wm).ok()?;
+    index.get(wm, 0, "attn.wq").map(|e| e.dtype.byte_width() as u32)
 }
 
 #[cfg(test)]
@@ -719,21 +758,75 @@ mod tests {
             batch: 1,
             activation: Activation::SwiGlu,
             norm: NormType::RmsNorm,
-            dtype_bytes: 4,
+            dtype_bytes: 4, tied_lm_head: true,
         }
     }
 
-    fn matching_tensors() -> Vec<(String, Vec<usize>)> {
+    /// The seven weight tensors of each of the six layers, named as a
+    /// train-block checkpoint names them (`blocks.0.…`) or as `model_save`
+    /// does (`blocks[0].…`).
+    fn matching_tensors_named(bracket: bool) -> Vec<(String, Vec<usize>)> {
         let mut t = Vec::new();
         for l in 0..6 {
-            t.push((format!("blocks.{l}.attn.wq"), vec![384, 384])); // n_heads*head_dim = 384
-            t.push((format!("blocks.{l}.attn.wk"), vec![384, 192])); // n_kv_heads*head_dim = 192
-            t.push((format!("blocks.{l}.attn.wv"), vec![384, 192]));
-            t.push((format!("blocks.{l}.ffn.w_gate"), vec![384, 1024]));
-            t.push((format!("blocks.{l}.ffn.w_up"), vec![384, 1024]));
+            let p = |rest: &str| {
+                if bracket { format!("blocks[{l}].{rest}") } else { format!("blocks.{l}.{rest}") }
+            };
+            t.push((p("attn.wq"), vec![384, 384])); // [d_model, n_heads*head_dim]
+            t.push((p("attn.wk"), vec![384, 192])); // [d_model, n_kv_heads*head_dim]
+            t.push((p("attn.wv"), vec![384, 192]));
+            t.push((p("attn.wo"), vec![384, 384])); // [n_heads*head_dim, d_model]
+            t.push((p("ffn.w_gate"), vec![384, 1024]));
+            t.push((p("ffn.w_up"), vec![384, 1024]));
+            t.push((p("ffn.w_down"), vec![1024, 384]));
         }
         t.push(("embed".to_string(), vec![4224, 384])); // padded vocab — must NOT be flagged
         t
+    }
+
+    fn matching_tensors() -> Vec<(String, Vec<usize>)> {
+        matching_tensors_named(false)
+    }
+
+    fn check(tensors: &[(String, Vec<usize>)]) -> Result<(), CepCrossCheckError> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.safetensors");
+        write_safetensors(&path, tensors);
+        let wm = WeightMap::load(&path).unwrap();
+        let resolve = |_s: nsl_ast::Symbol| String::new();
+        cross_check_dims(&canonical_spec(), &wm, &resolve)
+    }
+
+    /// `model_save` and `nsl export` write `blocks[0].attn.wq`.
+    #[test]
+    fn cross_check_accepts_model_save_names() {
+        check(&matching_tensors_named(true)).expect("bracketed layer names are the toolchain's own");
+    }
+
+    #[test]
+    fn cross_check_refuses_a_missing_tensor() {
+        let mut t = matching_tensors();
+        t.retain(|(n, _)| n != "blocks.3.attn.wo");
+        let err = check(&t).unwrap_err();
+        assert_eq!(err.tensor, "blocks[3].attn.wo");
+        assert!(err.found.contains("no such tensor"), "{err}");
+    }
+
+    /// `[d_ff, d_model]` where NSL stores `w_gate` as `[d_model, d_ff]`: the
+    /// right numbers on the wrong axes.
+    #[test]
+    fn cross_check_refuses_a_transposed_tensor() {
+        let mut t = matching_tensors();
+        let i = t.iter().position(|(n, _)| n == "blocks.0.ffn.w_gate").unwrap();
+        t[i].1 = vec![1024, 384];
+        let err = check(&t).unwrap_err();
+        assert_eq!(err.tensor, "blocks.0.ffn.w_gate");
+        assert!(err.expected.contains("[384, 1024]"), "{err}");
+    }
+
+    #[test]
+    fn cross_check_refuses_weights_with_no_layer_tensors() {
+        let err = check(&[("embed".to_string(), vec![4096, 384])]).unwrap_err();
+        assert!(err.found.contains("no tensors matching"), "{err}");
     }
 
     #[test]
@@ -783,6 +876,32 @@ model TinyCoder:
     blocks: [TransformerBlock; 6] = TransformerBlock(384, 6, 3, 64, 1024, 0.1)
     norm: RMSNorm = RMSNorm(384)
 "#;
+
+    /// The canonical source has no second `[d_model, vocab]` matrix: the head
+    /// reuses the embedding, and must not be counted again.
+    #[test]
+    fn a_model_without_a_head_matrix_has_a_tied_head() {
+        let (module, interner) = parse(CANONICAL);
+        let resolve = |s: nsl_ast::Symbol| interner.resolve(s.0).unwrap_or("").to_string();
+        let spec = extract_model_spec(&module, &resolve).expect("recognized");
+        assert!(spec.tied_lm_head);
+        // embed 4096·384; six blocks of (2·384·384 + 2·384·192 + 3·384·1024 + 2·384); final norm.
+        assert_eq!(spec.param_count(), 1_572_864 + 6 * 1_622_784 + 384);
+    }
+
+    #[test]
+    fn a_separate_head_matrix_is_counted() {
+        let src = CANONICAL.replace(
+            "    norm: RMSNorm = RMSNorm(384)\n",
+            "    norm: RMSNorm = RMSNorm(384)\n    lm_head: Tensor = randn([384, 4096])\n",
+        );
+        assert_ne!(src, CANONICAL);
+        let (module, interner) = parse(&src);
+        let resolve = |s: nsl_ast::Symbol| interner.resolve(s.0).unwrap_or("").to_string();
+        let spec = extract_model_spec(&module, &resolve).expect("recognized");
+        assert!(!spec.tied_lm_head);
+        assert_eq!(spec.param_count(), 2 * 1_572_864 + 6 * 1_622_784 + 384);
+    }
 
     #[test]
     fn extracts_canonical_modelspec() {
