@@ -10,22 +10,25 @@ use crate::dict::{nsl_dict_new, nsl_dict_set_str};
 use crate::string::nsl_str_from_rust;
 use crate::tensor::{DTYPE_I32, DTYPE_U16_SEGMENT, DTYPE_U16_TOKEN, NslTensor};
 
-/// Maximum number of documents per packed batch.
+/// Number of document starts the `doc_starts` table records per packed row.
 ///
-/// This constant is the producer-side bound for the PCA §4.3 RoPE position
-/// reset path. The `doc_starts` tensor emitted alongside `segment_ids` is
-/// padded to `[MAX_NUM_DOCS + 1]` with sentinel `-1` for unused slots so
-/// the GPU kernel can emit a constant-size SMEM load independent of the
-/// per-batch document count.
+/// The `doc_starts` tensor emitted alongside `segment_ids` is padded to
+/// `[MAX_NUM_DOCS + 1]` per row with sentinel `-1` for unused slots, the
+/// constant-size layout the CSHA kernels' position-reset load expects.
+///
+/// This is the size of that table and nothing else. It is NOT a limit on
+/// how many documents a row may hold: a row with more records the first
+/// `MAX_NUM_DOCS + 1` starts and leaves the rest out. `segment_ids` and
+/// `position_ids`, which the working packed-attention route reads, cover
+/// every document. No program reads the table from a loader today (the
+/// route that would hand it to a kernel is refused at compile time), and a
+/// RoPE model would not need it in any case.
 ///
 /// **Source of truth:** `crates/nsl-codegen/src/pca_rope.rs::MAX_NUM_DOCS`
 /// (declared there as `u32 = 256`). `nsl-runtime` cannot depend on
 /// `nsl-codegen` directly (would introduce a circular crate dependency),
 /// so the bound is duplicated here as `usize`. The two declarations MUST
-/// agree numerically; a divergence is a producer/consumer ABI bug. T1's
-/// const_assert on the codegen side keeps `(MAX_NUM_DOCS + 1) * 4` within
-/// the per-CTA SMEM budget, so changing the value here without also
-/// updating the codegen side will silently break the kernel.
+/// agree numerically.
 pub const MAX_NUM_DOCS: usize = 256;
 
 /// A packed batch of token sequences with attention mask.
@@ -51,7 +54,8 @@ pub struct PackedBatch {
     /// row `r`, **relative to that row's local position 0** (not the flat
     /// batch_size * seq_len stream). Each row's 257-element subtable is
     /// independently accumulated during the EOS scan; unused slots are
-    /// sentinel `-1`.
+    /// sentinel `-1`. A row with more than `MAX_NUM_DOCS + 1` documents
+    /// records only the first `MAX_NUM_DOCS + 1` starts.
     ///
     /// The per-row shape is load-bearing for `batch_size > 1`: Tier A's
     /// `segment_ids` resets to 0 per batch row, so the kernel must index
@@ -173,20 +177,24 @@ pub fn pack_batch(
             if i > 0 && input_ids[offset + i - 1] == eos_token {
                 current_doc += 1;
                 current_doc_start = i;
-                // PCA §4.3 per-row accumulator: EOS at local position i-1
-                // ends the current doc; the next doc starts at local
-                // position i (row-local, not flat). Write into this row's
-                // 257-element subtable at offset row_base + current_row_doc_idx.
-                // MAX_NUM_DOCS is enforced *per row* — exceeding it would
-                // overflow this row's constant-size SMEM load on the kernel side.
+                // Segment ids are 16-bit. A row cannot hold more documents
+                // than it has tokens, so this is reachable only for a row
+                // longer than 65536 tokens made of one-token documents; the
+                // narrowing below would otherwise wrap and merge documents.
                 assert!(
-                    current_row_doc_idx <= MAX_NUM_DOCS,
-                    "packed row {b} holds more than {MAX_NUM_DOCS} documents: the separator \
-                     token {eos_token} occurs that often in one row of {seq_len} tokens. \
-                     Check that `pack_separator` is the tokenizer's end-of-document id \
-                     and not a token that appears in ordinary text."
+                    current_doc <= u32::from(u16::MAX),
+                    "packed row {b} holds more than 65536 documents: the separator \
+                     token {eos_token} occurs that often in one row of {seq_len} tokens, \
+                     and segment ids are 16-bit. Check that `pack_separator` is the \
+                     tokenizer's end-of-document id and not a token that appears in \
+                     ordinary text."
                 );
-                doc_starts[row_base + current_row_doc_idx] = i as i32;
+                // Row-local start of the document that begins here, while
+                // the table has slots (see `MAX_NUM_DOCS`: the table's
+                // size, not a limit on documents per row).
+                if current_row_doc_idx <= MAX_NUM_DOCS {
+                    doc_starts[row_base + current_row_doc_idx] = i as i32;
+                }
                 current_row_doc_idx += 1;
             }
             doc_ids[i] = current_doc;
@@ -196,8 +204,8 @@ pub fn pack_batch(
 
         // PCA Tier A (spec §3.5): emit per-position segment IDs alongside
         // the dense mask. Reuses the doc_ids computed above to preserve
-        // byte-identity with the dense-mask baseline. u16 ceiling enforced
-        // upstream by pca_detect::validate_config.
+        // byte-identity with the dense-mask baseline. The 16-bit ceiling
+        // is asserted where a document starts, above.
         for d in doc_ids.iter() {
             segment_ids.push(*d as u16);
         }
@@ -1003,6 +1011,80 @@ mod tests {
         .expect("pack_batch produced a batch");
 
         assert_eq!(batch.segment_ids, vec![0u16, 0, 0, 1, 1, 1, 1, 2]);
+    }
+
+    /// A row of 600 two-token documents `[x, EOS]`. The 256-slot
+    /// `doc_starts` table used to be enforced as a limit on documents per
+    /// row, by a panic inside a loader worker. Every expected value below
+    /// is written out from the layout: token `i` belongs to document
+    /// `i / 2`, at position `i % 2` within it.
+    #[test]
+    fn pack_batch_row_with_more_documents_than_the_starts_table() {
+        const DOCS: usize = 600;
+        let stream: Vec<f64> = (0..2 * DOCS)
+            .map(|i| if i % 2 == 0 { 7.0 } else { 2.0 })
+            .collect();
+        let mut cursor: usize = 0;
+        let batch = pack_batch(
+            stream.as_ptr() as *const c_void,
+            stream.len(),
+            0,
+            &mut cursor,
+            1,
+            2 * DOCS,
+            2,
+            false, // emit_attention_mask
+        )
+        .expect("pack_batch produced a batch");
+
+        let want_segments: Vec<u16> = (0..2 * DOCS).map(|i| (i / 2) as u16).collect();
+        let want_positions: Vec<i32> = (0..2 * DOCS).map(|i| (i % 2) as i32).collect();
+        assert_eq!(batch.segment_ids, want_segments);
+        assert_eq!(batch.position_ids, want_positions);
+        assert_eq!(*batch.segment_ids.last().unwrap(), 599);
+        // Labels: the token before a separator predicts the separator; the
+        // separator predicts nothing.
+        for i in 0..2 * DOCS {
+            let want = if i % 2 == 0 { 2 } else { -100 };
+            assert_eq!(batch.labels[i], want, "label at {i}");
+        }
+        // The table holds the first 257 starts (0, 2, 4, ..., 512) and is
+        // not written past its end.
+        assert_eq!(batch.doc_starts.len(), MAX_NUM_DOCS + 1);
+        for (k, &start) in batch.doc_starts.iter().enumerate() {
+            assert_eq!(start, 2 * k as i32, "doc_starts[{k}]");
+        }
+    }
+
+    /// With two rows, the second row's table must not be written by the
+    /// first row's overflow.
+    #[test]
+    fn pack_batch_starts_table_overflow_stays_inside_its_row() {
+        const DOCS: usize = 300;
+        // Row 0: 300 two-token documents. Row 1: one document, no separator.
+        let mut stream: Vec<f64> = (0..2 * DOCS)
+            .map(|i| if i % 2 == 0 { 7.0 } else { 2.0 })
+            .collect();
+        stream.extend(std::iter::repeat_n(9.0, 2 * DOCS));
+        let mut cursor: usize = 0;
+        let batch = pack_batch(
+            stream.as_ptr() as *const c_void,
+            stream.len(),
+            0,
+            &mut cursor,
+            2,
+            2 * DOCS,
+            2,
+            false, // emit_attention_mask
+        )
+        .expect("pack_batch produced a batch");
+        let stride = MAX_NUM_DOCS + 1;
+        assert_eq!(batch.doc_starts[stride], 0, "row 1 opens document 0 at 0");
+        assert!(
+            batch.doc_starts[stride + 1..].iter().all(|&v| v == -1),
+            "row 1 has one document; the rest of its table is the sentinel"
+        );
+        assert_eq!(&batch.segment_ids[2 * DOCS..], vec![0u16; 2 * DOCS].as_slice());
     }
 
     /// Per-document RoPE positions (deferral-closure 2026-07-14): the
