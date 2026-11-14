@@ -535,9 +535,16 @@ that saves activations and the scalar fused backward.
   `block_kv` (`fa_refuses_ragged_seq` in
   `crates/nsl-runtime/src/flash_attention.rs`; the per-document kernels,
   which bound rows by the document, are not checked), and the generated
-  code stops on the refusal. The packed source-AD channel already declined
+  code stops on the refusal. The Tier B.2 branch of the backward returns
+  before the scalar path's check and has its own, against `block_q` and
+  the tile its dq and dkdv kernels use; compiled NSL selects that branch
+  only when the sequence is one tile, but a direct FFI call could pass a
+  longer one. The packed source-AD channel already declined
   such shapes. The tests are
-  `a_sequence_that_does_not_fill_whole_tiles_is_ragged` in that file and
+  `a_sequence_that_does_not_fill_whole_tiles_is_ragged` in that file,
+  `tier_b2_backward_refuses_a_sequence_that_does_not_fill_whole_tiles` in
+  `crates/nsl-codegen/tests/tier_b2_backward_f64_gate.rs` (refused at 96
+  rows under a 64-row tile with no output touched, not refused at 128), and
   `crates/nsl-cli/tests/flash_attention_ragged_seq_gate.rs`, which checks
   the refusal at a sequence of 32 and the output against attention written
   out by hand at 64 and 128. The same example at a sequence of 64, one
@@ -596,6 +603,13 @@ before `CSHA_FUSED_TRAINING_WITHHELD` is lifted.
   head size and tiles. By reading the code only. Right: keep the context
   per decorated function, and lower other attention as if there were no
   decorator.
+- `nsl_flash_attention_quantized` launches the kernel its caller passes
+  with `grid_x = ceil(seq_len / block_q)` and no check of the sequence. Nothing
+  calls it: it is exported in `crates/nsl-abi/src/table.rs` and no emitter,
+  runtime function, stdlib module or test refers to it. It is left without
+  the refusal because it serves a paged, quantized KV cache, whose query
+  length in decoding need not be a whole tile; whoever wires it up has to
+  decide what its tail does.
 - For decorated attention the plan is still made on a nominal layer shape
   (batch 1, sequence 1024, `d_model` 512, 8 heads, 4 KV heads), the level-1
   saving is the constant 0.58, and the kernel named in the report is not

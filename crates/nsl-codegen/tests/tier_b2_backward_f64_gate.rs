@@ -160,6 +160,21 @@ fn launch(
     d_o: &[f32],
     seq: usize,
 ) -> [Vec<f32>; 8] {
+    let (rc, read) = launch_rc(cfg, inputs, reference, d_o, seq, 0.0);
+    assert_eq!(rc, 0, "Tier B.2 backward launch failed, rc={rc}");
+    read
+}
+
+/// [`launch`] without the check of the return code, with every output
+/// buffer filled with `fill` beforehand.
+fn launch_rc(
+    cfg: &FlashAttentionConfig,
+    inputs: &Inputs,
+    reference: &Grads64,
+    d_o: &[f32],
+    seq: usize,
+    fill: f32,
+) -> (i64, [Vec<f32>; 8]) {
     let hd = cfg.head_dim as usize;
     let qkv = seq * hd;
     let w = hd * hd;
@@ -179,8 +194,17 @@ fn launch(
     let wv_dev = upload(&f32_to_f16(&inputs.wv));
     // The gradient in, f32, and the eight gradients out, f32.
     let do_dev = upload(d_o);
-    let zeros = |n: usize| upload(&vec![0f32; n]);
-    let outs = [zeros(qkv), zeros(qkv), zeros(qkv), zeros(w), zeros(w), zeros(w), zeros(qkv), zeros(qkv)];
+    let filled = |n: usize| upload(&vec![fill; n]);
+    let outs = [
+        filled(qkv),
+        filled(qkv),
+        filled(qkv),
+        filled(w),
+        filled(w),
+        filled(w),
+        filled(qkv),
+        filled(qkv),
+    ];
 
     let mut ptx = synthesize_tier_b2_backward(cfg).expect("synthesize_tier_b2_backward").into_bytes();
     if ptx.last() != Some(&0) {
@@ -229,8 +253,7 @@ fn launch(
     {
         nsl_test_cuda_free(p);
     }
-    assert_eq!(rc, 0, "Tier B.2 backward launch failed, rc={rc}");
-    read
+    (rc, read)
 }
 
 const NAMES: [&str; 8] = ["dq", "dk", "dv", "dwq", "dwk", "dwv", "dx", "dx_norm"];
@@ -319,5 +342,39 @@ fn tier_b2_backward_is_bit_exact_under_a_power_of_two_rescale_of_do() {
             "{name}: {differing} of {} entries are not the exact 2^-20 multiple",
             big.len()
         );
+    }
+}
+
+/// The dq and dkdv kernels have no tail guard: at a sequence that is not a
+/// multiple of the tile, the last CTA reads and writes rows past the end of
+/// the buffers. The four-kernel branch returns before the scalar path's
+/// check, so it has its own: at 96 rows under a 64-row tile the launch is
+/// refused and no output is touched. At 128 rows, two whole tiles, it is
+/// not refused; its gradients are not checked there, since Tier B.2 is
+/// dispatched only for one tile.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn tier_b2_backward_refuses_a_sequence_that_does_not_fill_whole_tiles() {
+    if !cuda_available() {
+        eprintln!("skipping: no CUDA");
+        return;
+    }
+    const FILL: f32 = 7.0;
+    let (hd, block) = (64usize, 64usize);
+    let cfg = tier_b2_config(hd, block);
+    for (seq, refused) in [(96usize, true), (128, false)] {
+        let inputs = Inputs::new(seq, hd);
+        let d_o = d_o_seq(seq * hd, 1e-2);
+        let want = inputs.reference(seq, hd, &d_o);
+        let (rc, got) = launch_rc(&cfg, &inputs, &want, &d_o, seq, FILL);
+        if refused {
+            assert_eq!(rc, -1, "seq={seq} under block {block}: not refused, rc={rc}");
+            for (name, g) in NAMES.into_iter().zip(&got) {
+                let touched = g.iter().filter(|v| **v != FILL).count();
+                assert_eq!(touched, 0, "seq={seq}: refused, but {touched} entries of {name} changed");
+            }
+        } else {
+            assert_eq!(rc, 0, "seq={seq} under block {block}: refused or failed, rc={rc}");
+        }
     }
 }

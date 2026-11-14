@@ -3437,6 +3437,19 @@ fn csha_backward_impl(
                 );
                 return -1;
             }
+            // The dq and dkdv kernels tile both the queries and the keys by
+            // the effective tile (`tier_b2_effective_bq`) and have no tail
+            // guard, and `proj_backward` walks the sequence in `block_q`
+            // steps; the ragged-sequence refusal of the scalar path below is
+            // not reached from this branch.
+            if fa_refuses_ragged_seq(
+                "nsl_flash_attention_csha_backward[tier_b2]",
+                seq_len,
+                block_q,
+                tier_b2_effective_bq(block_q, head_dim),
+            ) {
+                return -1;
+            }
             // Review 2026-07-24 (finding 3): Tier B.2's d_prepass reads O
             // as f16 (`ld.global.b16` in tier_b2/backward/d_prepass.rs),
             // and kernel 4 (proj_backward, scalar ABI) reads Wq/Wk/Wv as
