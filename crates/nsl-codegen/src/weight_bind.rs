@@ -84,9 +84,11 @@ impl Compiler<'_> {
     /// Whether `rewrite` may assume the parameter `key` holds the file's
     /// values when the program runs. It may when the program is bound to the
     /// file, the file stores a tensor of that name, nothing in the program
-    /// writes the parameter after it is loaded, and no other tensor can be
-    /// loaded into the field. Otherwise the caller compiles the ordinary
-    /// code, and the reason is reported once.
+    /// writes the parameter after it is loaded, no other tensor can be
+    /// loaded into the field, and the compiler's copy of the tensor is the
+    /// file's (unless the user accepted an approximation, see
+    /// [`Self::weight_value_tolerance`]). Otherwise the caller compiles the
+    /// ordinary code, and the reason is reported once.
     pub(crate) fn may_specialize_on(&mut self, key: &str, rewrite: &str) -> bool {
         let reason: Option<String> = match self.features.weight_binding.as_ref() {
             None => Some(
@@ -99,14 +101,32 @@ impl Compiler<'_> {
                     Some("the file stores no tensor of that name".to_string())
                 } else if let Some(written) = binding.writes.written(key) {
                     Some(written.to_string())
+                } else if let Some(ambiguity) = self.weight_key_ambiguity(key) {
+                    Some(ambiguity)
+                } else if self.weight_value_tolerance().is_none()
+                    && !self.compiler_copy_is_exact(key)
+                {
+                    Some(format!(
+                        "dead-weight elimination zeroed its values below {:e} in the \
+                         compiler's copy, which is then not the file's; a rewrite uses the \
+                         file's exact values unless --dead-weight-threshold is given",
+                        self.compile_options.weights.config.dead_weight_threshold
+                    ))
                 } else {
-                    self.weight_key_ambiguity(key)
+                    None
                 }
             }
         };
         let Some(reason) = reason else {
             return true;
         };
+        self.note_weight_refusal(key, rewrite, &reason);
+        false
+    }
+
+    /// Report, once per rewrite and parameter, that `rewrite` was not made
+    /// on `key` and why.
+    pub(crate) fn note_weight_refusal(&mut self, key: &str, rewrite: &str, reason: &str) {
         if self
             .features
             .weight_notes
@@ -118,7 +138,69 @@ impl Compiler<'_> {
                 "[nsl] weight-aware: not specialized on '{key}' ({rewrite} skipped): {reason}"
             );
         }
-        false
+    }
+
+    /// How far a value-dependent rewrite may let a weight differ from the
+    /// file: the `--dead-weight-threshold` the user passed, or `None` when
+    /// none was passed, and the rewrite must rest on the file's exact
+    /// values. (The threshold's default, 1e-6, is a tolerance the user did
+    /// not ask for: a weight 9e-7 off the identity was treated as the
+    /// identity, and dead-weight elimination's zeroed copy was folded.)
+    pub(crate) fn weight_value_tolerance(&self) -> Option<f64> {
+        self.compile_options
+            .weights
+            .threshold_given
+            .then_some(self.compile_options.weights.config.dead_weight_threshold)
+    }
+
+    /// The report's words for what a rewrite rested on.
+    pub(crate) fn weight_value_basis(&self) -> String {
+        match self.weight_value_tolerance() {
+            None => "from the file's exact values".to_string(),
+            Some(t) => format!("from values within the --dead-weight-threshold {t:e} given"),
+        }
+    }
+
+    /// Whether the compiler's copy of the file's tensor `key` still holds
+    /// the file's bytes: dead-weight elimination zeroes small values in it.
+    fn compiler_copy_is_exact(&mut self, key: &str) -> bool {
+        if self
+            .features
+            .weight_notes
+            .contains(&format!("exact\u{0}{key}"))
+        {
+            return true;
+        }
+        if self
+            .features
+            .weight_notes
+            .contains(&format!("inexact\u{0}{key}"))
+        {
+            return false;
+        }
+        let exact = match (
+            self.features
+                .weight_binding
+                .as_ref()
+                .and_then(|b| b.stored.get(key)),
+            self.features.weight_map.as_ref().and_then(|w| w.get(key)),
+        ) {
+            (Some(stored), Some(entry)) => {
+                entry.dtype == stored.dtype
+                    && entry.shape == stored.shape
+                    && crate::weight_aware::tensor_content_hash(
+                        entry.dtype.safetensors_name(),
+                        &entry.shape,
+                        &entry.data,
+                    ) == stored.hash
+            }
+            _ => false,
+        };
+        let tag = if exact { "exact" } else { "inexact" };
+        self.features
+            .weight_notes
+            .insert(format!("{tag}\u{0}{key}"));
+        exact
     }
 
     /// The tensors whose content the program checks at startup: every stored

@@ -1658,6 +1658,12 @@ pub struct WeightsOptions {
     /// file an input to planning only: nothing is loaded and no rewrite that
     /// depends on a weight's values is made.
     pub bind: Option<weight_aware::WeightBinding>,
+    /// Whether the user passed `--dead-weight-threshold`. Only then may a
+    /// rewrite on a bound file's values use the approximations that
+    /// threshold makes (a weight within it of the identity taken as the
+    /// identity, small values zeroed before a fold); otherwise it uses the
+    /// file's exact values.
+    pub threshold_given: bool,
     /// M62 Task 6: maps `self.<field>` `NodeId`s to weight-array indices for
     /// `@export` model methods compiled via `WeightPtrsArray` self-resolution.
     /// Populated from `nsl_semantic::AnalysisResult.weight_index_map` before

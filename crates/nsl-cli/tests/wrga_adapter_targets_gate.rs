@@ -505,6 +505,41 @@ fn a_target_without_class_is_refused() {
     );
 }
 
+/// A weight takes one adapter. A second `@adapter` on the same `Class.field`,
+/// or the same target listed twice in one, used to be accepted: both sets of
+/// tensors got the same names (`lora_A_Toy_w__lora` twice in a saved
+/// checkpoint) and only the first entered the forward pass.
+#[test]
+fn a_weight_named_by_two_adapters_is_refused() {
+    for decorators in [
+        "@adapter(type=lora, target=[\"Toy.w\"], rank=2)\n@adapter(type=lora, target=[\"Toy.w\"], rank=4)",
+        "@adapter(type=lora, target=[\"Toy.w\", \"Toy.w\"], rank=2)",
+        "@adapter(type=lora, target=[\"Toy.w\"], rank=2)\n@adapter(type=ia3, target=[\"Toy.w\"])",
+    ] {
+        assert_refused(
+            &program_with(DIRECT_FORWARD, decorators),
+            &["@adapter target 'Toy.w'", "named more than once", "a weight takes one adapter"],
+        );
+    }
+}
+
+/// The control: two adapters on two different weights are fine.
+#[test]
+fn two_adapters_on_two_weights_are_accepted() {
+    let body = "    v: Tensor = randn([4, 4]) * 0.3
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return (x @ self.w) @ self.v";
+    let r = run(
+        &program_with(
+            body,
+            "@adapter(type=lora, target=[\"Toy.w\"], rank=2)\n@adapter(type=lora, target=[\"Toy.v\"], rank=2)",
+        ),
+        false,
+    );
+    assert!(r.ok && r.stdout.contains("RAN"), "{}", r.stderr);
+}
+
 #[test]
 fn a_weight_no_matmul_uses_is_refused() {
     // `self.w` is only ever added, so there is no matmul for the adapter to

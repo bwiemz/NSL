@@ -711,9 +711,12 @@ pub(crate) struct BuildArgs {
         #[arg(long)]
         pub(crate) seed: Option<u64>,
 
-        /// M52: Dead weight threshold (default: 1e-6). Weights with |value| < threshold are zeroed.
-        #[arg(long, default_value_t = 1e-6)]
-        pub(crate) dead_weight_threshold: f64,
+        /// M52: Dead weight threshold (default: 1e-6). Weights with |value| < threshold are
+        /// zeroed in the compiler's copy, and a weight within it of the identity counts as the
+        /// identity. With -w, rewrites that depend on weight values use the file's exact values
+        /// unless this is given
+        #[arg(long)]
+        pub(crate) dead_weight_threshold: Option<f64>,
 
         /// M52: Sparsity threshold (default: 0.5). Matrices with near-zero fraction >= threshold get sparse annotation.
         #[arg(long, default_value_t = 0.5)]

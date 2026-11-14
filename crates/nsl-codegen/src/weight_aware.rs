@@ -763,11 +763,16 @@ impl<'a> ConstantFolder<'a> {
     /// If only one operand is known, return Partial.
     pub fn fold_matmul(&mut self, lhs: &FoldResult, rhs: &FoldResult) -> FoldResult {
         match (lhs, rhs) {
-            (FoldResult::Constant(a), FoldResult::Constant(b)) => {
-                let c = self.compute_matmul(a, b);
-                self.stats.folded_ops += 1;
-                FoldResult::Constant(c)
-            }
+            (FoldResult::Constant(a), FoldResult::Constant(b)) => match self.compute_matmul(a, b) {
+                Some(c) => {
+                    self.stats.folded_ops += 1;
+                    FoldResult::Constant(c)
+                }
+                None => {
+                    self.stats.runtime_ops += 1;
+                    FoldResult::Runtime
+                }
+            },
             (FoldResult::Runtime, FoldResult::Constant(_)) => {
                 // Input is runtime, weight is known -- annotate for sparsity but cannot fold
                 FoldResult::Partial {
@@ -787,9 +792,16 @@ impl<'a> ConstantFolder<'a> {
     pub fn fold_add(&mut self, lhs: &FoldResult, rhs: &FoldResult) -> FoldResult {
         match (lhs, rhs) {
             (FoldResult::Constant(a), FoldResult::Constant(b)) => {
-                let c = self.compute_elementwise_add(a, b);
-                self.stats.folded_ops += 1;
-                FoldResult::Constant(c)
+                match self.compute_elementwise_add(a, b) {
+                    Some(c) => {
+                        self.stats.folded_ops += 1;
+                        FoldResult::Constant(c)
+                    }
+                    None => {
+                        self.stats.runtime_ops += 1;
+                        FoldResult::Runtime
+                    }
+                }
             }
             _ => {
                 self.stats.runtime_ops += 1;
@@ -813,72 +825,59 @@ impl<'a> ConstantFolder<'a> {
         }
     }
 
-    /// Compute matmul of two constant tensors at compile time.
-    /// Supports 2D [M, K] x [K, N] -> [M, N].
-    /// CRITICAL FIX: use separate byte widths for each tensor.
-    fn compute_matmul(&self, a: &ConstTensor, b: &ConstTensor) -> ConstTensor {
-        assert_eq!(a.shape.len(), 2, "compile-time matmul requires 2D tensors");
-        assert_eq!(b.shape.len(), 2, "compile-time matmul requires 2D tensors");
-        let m = a.shape[0];
-        let k = a.shape[1];
-        assert_eq!(
-            k, b.shape[0],
-            "matmul dimension mismatch: {} vs {}",
-            k, b.shape[0]
-        );
-        let n = b.shape[1];
-
-        let bw_a = a.dtype.byte_width();
-        let bw_b = b.dtype.byte_width();
-        // Output uses dtype of lhs (a)
-        let bw_out = a.dtype.byte_width();
-        let mut result = vec![0u8; m * n * bw_out];
-
+    /// Compute matmul of two constant tensors at compile time: 2-D
+    /// `[M, K] x [K, N] -> [M, N]`, or `None` (the operation stays at run
+    /// time) for anything else.
+    ///
+    /// The result is f64 whatever the operands' dtype: it stands for the
+    /// product the program would compute from the loaded parameters, whose
+    /// dtype is the model's, not the file's (a BF16 file loads into f32
+    /// fields), so the program converts it to the operands' dtype and device
+    /// when it runs. Rounding it to the file's dtype here would lose that
+    /// precision, and labelling 2-byte data as f32 read garbage.
+    fn compute_matmul(&self, a: &ConstTensor, b: &ConstTensor) -> Option<ConstTensor> {
+        if a.shape.len() != 2 || b.shape.len() != 2 || a.shape[1] != b.shape[0] {
+            return None;
+        }
+        let (m, k, n) = (a.shape[0], a.shape[1], b.shape[1]);
+        let (bw_a, bw_b) = (a.dtype.byte_width(), b.dtype.byte_width());
+        if a.data.len() < m * k * bw_a || b.data.len() < k * n * bw_b {
+            return None;
+        }
+        let mut result = Vec::with_capacity(m * n * 8);
         for i in 0..m {
             for j in 0..n {
                 let mut sum = 0.0f64;
                 for p in 0..k {
-                    let a_val = a
-                        .dtype
-                        .to_f64(&a.data[(i * k + p) * bw_a..(i * k + p + 1) * bw_a]);
-                    let b_val = b
-                        .dtype
-                        .to_f64(&b.data[(p * n + j) * bw_b..(p * n + j + 1) * bw_b]);
+                    let a_val = a.dtype.to_f64(&a.data[(i * k + p) * bw_a..(i * k + p + 1) * bw_a]);
+                    let b_val = b.dtype.to_f64(&b.data[(p * n + j) * bw_b..(p * n + j + 1) * bw_b]);
                     sum += a_val * b_val;
                 }
-                write_f64_as_dtype(
-                    sum,
-                    a.dtype,
-                    &mut result[(i * n + j) * bw_out..(i * n + j + 1) * bw_out],
-                );
+                result.extend_from_slice(&sum.to_le_bytes());
             }
         }
-
-        ConstTensor {
-            data: result,
-            shape: vec![m, n],
-            dtype: a.dtype,
-        }
+        Some(ConstTensor { data: result, shape: vec![m, n], dtype: WeightDType::F64 })
     }
 
-    /// Compute element-wise addition of two constant tensors.
-    fn compute_elementwise_add(&self, a: &ConstTensor, b: &ConstTensor) -> ConstTensor {
-        assert_eq!(a.shape, b.shape, "add shape mismatch");
-        let bw = a.dtype.byte_width();
+    /// Element-wise sum of two constant tensors of the same shape, in f64
+    /// (see [`Self::compute_matmul`]), or `None` when the shapes differ: a
+    /// broadcast (`[4, 4] + [4]`) is left to the runtime, which implements it.
+    fn compute_elementwise_add(&self, a: &ConstTensor, b: &ConstTensor) -> Option<ConstTensor> {
+        if a.shape != b.shape {
+            return None;
+        }
         let num_elements: usize = a.shape.iter().product();
-        let mut result = vec![0u8; num_elements * bw];
-
+        let (bw_a, bw_b) = (a.dtype.byte_width(), b.dtype.byte_width());
+        if a.data.len() < num_elements * bw_a || b.data.len() < num_elements * bw_b {
+            return None;
+        }
+        let mut result = Vec::with_capacity(num_elements * 8);
         for i in 0..num_elements {
-            let a_val = a.dtype.to_f64(&a.data[i * bw..(i + 1) * bw]);
-            let b_val = b.dtype.to_f64(&b.data[i * bw..(i + 1) * bw]);
-            write_f64_as_dtype(a_val + b_val, a.dtype, &mut result[i * bw..(i + 1) * bw]);
+            let a_val = a.dtype.to_f64(&a.data[i * bw_a..(i + 1) * bw_a]);
+            let b_val = b.dtype.to_f64(&b.data[i * bw_b..(i + 1) * bw_b]);
+            result.extend_from_slice(&(a_val + b_val).to_le_bytes());
         }
-
-        ConstTensor {
-            data: result,
-            shape: a.shape.clone(),
-            dtype: a.dtype,
-        }
+        Some(ConstTensor { data: result, shape: a.shape.clone(), dtype: WeightDType::F64 })
     }
 
     /// Compute element-wise ReLU of a constant tensor.
@@ -1151,6 +1150,25 @@ pub fn analyze_weight_writes(
                 StmtKind::QuantBlock(_) => {
                     self.all(3, "the program has a quant block, which rewrites parameters")
                 }
+                // Not a write, but a rewrite on a parameter's values would
+                // take the operation out of the graph `grad` differentiates
+                // (a dropped `x @ W` gives W no gradient), in the block and
+                // in every function it calls.
+                StmtKind::GradBlock(_) => self.all(
+                    3,
+                    "the program has a grad block, which differentiates through the forward \
+                     pass; a rewrite on a parameter's values would drop its gradient",
+                ),
+                StmtKind::Decorated { decorators, .. }
+                    if decorators.iter().any(|d| {
+                        d.name.last().is_some_and(|s| (self.resolve)(*s) == "quantize")
+                    }) =>
+                {
+                    self.all(
+                        2,
+                        "a model has @quantize, which may store its parameters quantized",
+                    )
+                }
                 StmtKind::Assign { target, .. } => {
                     if let Some(field) = self.assigned_field(target) {
                         self.facts
@@ -1180,8 +1198,13 @@ pub fn analyze_weight_writes(
                     _ => None,
                 };
                 if let Some(name) = name {
-                    if name == "model_load" {
-                        self.all(2, "the program calls model_load, which overwrites parameters");
+                    // `model_load(m, path)` and `from_hf(repo, m)` store a
+                    // checkpoint into the model's parameter slots. (The
+                    // runtime has no other entry point that writes a model's
+                    // parameters outside a train/distill/quant block: the
+                    // rest copy them unchanged, to a device or a server.)
+                    if matches!(name.as_str(), "model_load" | "from_hf") {
+                        self.all(2, &format!("the program calls {name}, which overwrites parameters"));
                     } else if writes_in_place(&name) {
                         self.all(1, &format!("the program calls {name}, which writes a tensor in place"));
                     }
@@ -1434,6 +1457,19 @@ mod tests {
             (format!("{MODEL}fn clear(t: Tensor):\n    zero_inplace(t)\n"), "zero_inplace"),
             (format!("{MODEL}fn scale(t: Tensor):\n    mul_inplace(t, t)\n"), "mul_inplace"),
             (format!("{MODEL}let m = Toy()\nlet t = m.v\nt[0] = 5.0\n"), "element of a variable"),
+            (format!("{MODEL}let m = Toy()\nfrom_hf(\"org/x\", m)\n"), "from_hf"),
+            (
+                format!("{MODEL}let m = Toy()\nlet (loss, g) = grad(m.w):\n    let l = mean(m.forward(ones([2, 4])))\n"),
+                "grad block",
+            ),
+            (
+                "@quantize(dtype=\"awq4\")\nmodel Toy:\n    w: Tensor = ones([4, 4])\n\nlet m = Toy()\n".to_string(),
+                "@quantize",
+            ),
+            (
+                format!("{MODEL}kernel bump(a, out):\n    let i = thread_id()\n    out[i] = a[i]\n"),
+                "element of a variable",
+            ),
         ] {
             let facts = writes_of(&program);
             assert!(
@@ -1734,10 +1770,9 @@ mod tests {
 
         if let FoldResult::Constant(c) = result {
             assert_eq!(c.shape, vec![2, 2]);
-            let v00 = c.dtype.to_f64(&c.data[0..4]);
-            let v01 = c.dtype.to_f64(&c.data[4..8]);
-            let v10 = c.dtype.to_f64(&c.data[8..12]);
-            let v11 = c.dtype.to_f64(&c.data[12..16]);
+            assert_eq!(c.dtype, WeightDType::F64);
+            let at = |i: usize| c.dtype.to_f64(&c.data[i * 8..(i + 1) * 8]);
+            let (v00, v01, v10, v11) = (at(0), at(1), at(2), at(3));
             assert!((v00 - 19.0).abs() < 1e-5, "expected 19.0, got {}", v00);
             assert!((v01 - 22.0).abs() < 1e-5, "expected 22.0, got {}", v01);
             assert!((v10 - 43.0).abs() < 1e-5, "expected 43.0, got {}", v10);
@@ -1774,8 +1809,9 @@ mod tests {
 
         if let FoldResult::Constant(c) = result {
             assert_eq!(c.shape, vec![4]);
+            let bw = c.dtype.byte_width();
             let vals: Vec<f64> = (0..4)
-                .map(|i| c.dtype.to_f64(&c.data[i * 4..(i + 1) * 4]))
+                .map(|i| c.dtype.to_f64(&c.data[i * bw..(i + 1) * bw]))
                 .collect();
             assert!((vals[0] - 11.0).abs() < 1e-5);
             assert!((vals[1] - 22.0).abs() < 1e-5);
@@ -1784,6 +1820,55 @@ mod tests {
         } else {
             panic!("expected Constant result");
         }
+    }
+
+    /// A fold of BF16 operands is computed and kept in f64. BF16 stores the
+    /// top half of an f32, so these small integers and halves are exact:
+    /// [[1, 0.5], [2, -1]] @ [[2, 1], [4, 0]] = [[4, 1], [0, 2]] by hand.
+    #[test]
+    fn a_fold_of_bf16_operands_is_f64() {
+        let bf16 = |vals: &[f32]| -> Vec<u8> {
+            vals.iter().flat_map(|v| (v.to_bits() >> 16).to_le_bytes()[..2].to_vec()).collect()
+        };
+        let a = ConstTensor { data: bf16(&[1.0, 0.5, 2.0, -1.0]), shape: vec![2, 2], dtype: WeightDType::BF16 };
+        let b = ConstTensor { data: bf16(&[2.0, 1.0, 4.0, 0.0]), shape: vec![2, 2], dtype: WeightDType::BF16 };
+        let wmap = WeightMap::default();
+        let mut folder = ConstantFolder::new(&wmap);
+        let FoldResult::Constant(c) =
+            folder.fold_matmul(&FoldResult::Constant(a.clone()), &FoldResult::Constant(b.clone()))
+        else {
+            panic!("the product of two BF16 constants should fold");
+        };
+        assert_eq!((c.dtype, c.shape.clone(), c.data.len()), (WeightDType::F64, vec![2, 2], 32));
+        let got: Vec<f64> = c.data.chunks(8).map(|ch| f64::from_le_bytes(ch.try_into().unwrap())).collect();
+        assert_eq!(got, vec![4.0, 1.0, 0.0, 2.0]);
+        let FoldResult::Constant(sum) =
+            folder.fold_add(&FoldResult::Constant(a), &FoldResult::Constant(b))
+        else {
+            panic!("the sum of two same-shaped BF16 constants should fold");
+        };
+        let got: Vec<f64> = sum.data.chunks(8).map(|ch| f64::from_le_bytes(ch.try_into().unwrap())).collect();
+        assert_eq!(got, vec![3.0, 1.5, 6.0, -1.0]);
+    }
+
+    /// Shapes the fold does not implement decline instead of panicking the
+    /// compiler: a broadcast add, a matmul with mismatched inner widths, and
+    /// a matmul of a 3-D operand.
+    #[test]
+    fn unsupported_shapes_are_left_to_the_runtime() {
+        let f32s = |n: usize| -> Vec<u8> { (0..n).flat_map(|i| (i as f32).to_le_bytes()).collect() };
+        let t = |shape: &[usize]| ConstTensor {
+            data: f32s(shape.iter().product()),
+            shape: shape.to_vec(),
+            dtype: WeightDType::F32,
+        };
+        let wmap = WeightMap::default();
+        let mut folder = ConstantFolder::new(&wmap);
+        let c = |x: ConstTensor| FoldResult::Constant(x);
+        assert!(matches!(folder.fold_add(&c(t(&[4, 4])), &c(t(&[4]))), FoldResult::Runtime));
+        assert!(matches!(folder.fold_matmul(&c(t(&[2, 3])), &c(t(&[4, 2]))), FoldResult::Runtime));
+        assert!(matches!(folder.fold_matmul(&c(t(&[2, 2, 2])), &c(t(&[2, 2]))), FoldResult::Runtime));
+        assert_eq!(folder.stats.folded_ops, 0);
     }
 
     #[test]

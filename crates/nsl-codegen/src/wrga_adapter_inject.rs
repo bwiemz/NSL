@@ -233,6 +233,7 @@ pub fn resolve_sites(
 
     let mut result = run(plan);
     let mut resolved: Vec<AdapterSite> = Vec::with_capacity(result.sites.len());
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for mut site in result.sites.drain(..) {
         let target = site.target_param.clone();
         let fail = |why: String| -> CodegenError {
@@ -257,6 +258,19 @@ pub fn resolve_sites(
             && !compiler.models.imported_model_names.contains(class);
         if scope == TargetScope::OwnModelsOnly && !defined_here {
             continue;
+        }
+        // One adapter per weight. A second one on the same `Class.field`
+        // (in another @adapter, or listed twice in one) was accepted: both
+        // got the same tensor names, and the forward rewrite took the first
+        // site it matched, so the second was allocated, saved and handed to
+        // the optimizer without ever entering the forward pass.
+        if !seen.insert(target.clone()) {
+            return Err(fail(
+                "it is named more than once in the program's @adapter targets (in two \
+                 @adapter decorators, or twice in one); a weight takes one adapter, so remove \
+                 the repeat"
+                    .to_string(),
+            ));
         }
         let Some(layout) = compiler.types.struct_layouts.get(class) else {
             let owners = models_with_field(compiler, field);
