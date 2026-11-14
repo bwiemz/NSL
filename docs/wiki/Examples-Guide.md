@@ -48,7 +48,7 @@ Annotated reading order for [`examples/`](../../examples/). Each entry tells you
 
 **Key lines:** 3–8 (model with a `forward` method), 13–20 (`train(model=m, epochs=10):` — optimizer, scheduler, step, callbacks).
 
-**Next:** `gpt2.nsl` — a production-scale model that uses every feature above.
+**Next:** `gpt2.nsl` — the GPT-2 architecture, trained end to end on the CPU.
 
 [`examples/m14_adam_scheduler.nsl`](../../examples/m14_adam_scheduler.nsl)
 
@@ -56,9 +56,9 @@ Annotated reading order for [`examples/`](../../examples/). Each entry tells you
 
 ### 5. `gpt2.nsl`
 
-**What it teaches:** A complete GPT-2 (124 M) pipeline including imports from `nsl.nn`, `nsl.optim`, `nsl.data`, `nsl.quant`, and `nsl.export`; a `CONFIG` dict; nested `model` blocks (GPT2Block, full GPT2); quantization via `gptq`; and ONNX export — everything from a blank file to a deployable checkpoint.
+**What it teaches:** The GPT-2 architecture written out in NSL and trained end to end on the CPU: learned token and position embeddings, pre-LayerNorm decoder blocks of causal multi-head self-attention (one fused `c_attn` projection, `scaled_dot_product_attention` with the causal mask) and a 4x GELU MLP, a final LayerNorm and an LM head tied to the token embedding, with GPT-2's initialisation. Nested `model` blocks (`CausalSelfAttention`, `GPT2MLP`, `GPT2Block`) and a `[GPT2Block; N]` model array; an in-memory `DataLoader`; a `train` block with AdamW, warmup-cosine, gradient clipping and an `on_step` callback. The sizes are a toy configuration (the header says which constants make it GPT-2 small); `nsl run examples/gpt2.nsl --target cpu` trains for 60 steps in seconds and the loss falls from about ln(64) to below 0.5.
 
-**Key lines:** 1–13 (import surface — good reference for which stdlib modules exist), 17–31 (CONFIG dict), 36–40 (opening of `model GPT2Block` showing `LayerNorm` + `Linear` composition).
+**Key lines:** the `CausalSelfAttention` forward (splitting the fused projection with `tensor_slice`, heads by `reshape`/`transpose`), the `GPT2` model (tied head), and the `train` block.
 
 **Next:** `codeforge_nano.nsl` — a real proof-of-concept trained model with a byte-level tokenizer.
 

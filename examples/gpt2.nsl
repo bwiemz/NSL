@@ -1,149 +1,121 @@
-## GPT-2 (124M) — Complete Training, Quantization, and Deployment Pipeline
-## NeuralScript v0.1
+## GPT-2: the architecture of Radford et al. (2019), trained end to end.
+##
+## Every piece of GPT-2 is here: learned token and position embeddings,
+## pre-LayerNorm decoder blocks of causal multi-head self-attention (one
+## fused `c_attn` projection for queries, keys and values) and a 4x GELU
+## MLP, a final LayerNorm, and an LM head tied to the token embedding. The
+## initialisation is GPT-2's: N(0, 0.02^2) everywhere, and the two
+## projections that write into the residual stream scaled down by
+## 1/sqrt(2 * n_layer).
+##
+## The sizes below are a toy configuration so that the example trains on
+## a CPU in seconds (`nsl run examples/gpt2.nsl --target cpu`). GPT-2
+## small (124M) is vocab 50257, d_model 768, 12 layers, 12 heads,
+## d_ff 3072, context 1024: change `VOCAB`, the literals in the `GPT2`
+## model's fields, the corpus and the DataLoader together.
+##
+## The corpus is synthetic: a token stream whose next token follows from
+## the current one and the one before it, so the loss visibly falls within
+## the 60 optimizer steps of one epoch.
 
-import nsl.nn.{Linear, Embedding, LayerNorm, Dropout, MLP, softmax, gelu}
-import nsl.nn.{cross_entropy, causal_mask}
-import nsl.optim.{AdamW, WarmupCosine}
-import nsl.data.{MemoryMapped, DataLoader, SequencePacker}
-import nsl.tokenize.{BPETrainer, Tokenizer}
-import nsl.quant.{quantize, gptq}
-import nsl.export.{to_onnx}
-import nsl.bench.{benchmark, count_params, summary}
-import nsl.compat.{save_safetensors}
-import nsl.data.{Dataset}
+from nsl.nn.norms import LayerNorm
+from nsl.nn.losses import cross_entropy
 
-# CONFIGURATION
+# The configuration, as the `GPT2` model's fields spell it: vocab 64,
+# d_model 64, 2 layers of 4 heads, d_ff 256, context 32; batches of 4.
+const VOCAB = 64
 
-const CONFIG = {
-    vocab_size:    50257,
-    d_model:       768,
-    n_layers:      12,
-    n_heads:       12,
-    d_ff:          3072,
-    max_seq:       1024,
-    dropout:       0.1,
-    batch_size:    8,
-    accumulate:    4,
-    lr:            6e-4,
-    warmup_steps:  2000,
-    total_steps:   100000,
-    weight_decay:  0.1,
-}
+## Causal multi-head self-attention with GPT-2's fused QKV projection.
+model CausalSelfAttention(d_model: int, n_heads: int, n_layers: int):
+    c_attn_w: Tensor = randn([d_model, 3 * d_model]) * full([1], 0.02)
+    c_attn_b: Tensor = zeros([3 * d_model])
+    c_proj_w: Tensor = randn([d_model, d_model]) * full([1], 0.02 / sqrt(full([1], float(2 * n_layers))).item())
+    c_proj_b: Tensor = zeros([d_model])
+    n_head: int = n_heads
+    width: int = d_model
 
-# STEP 2: MODEL — GPT-2 Transformer Decoder
+    fn forward(self, x: Tensor) -> Tensor:
+        let s = x.shape
+        let batch = s[0]
+        let seq = s[1]
+        let c = self.width
+        let nh = self.n_head
+        let hd = c // nh
+        let qkv = x @ self.c_attn_w + self.c_attn_b
+        let q = tensor_slice(qkv, 2, 0, c).reshape([batch, seq, nh, hd]).transpose(1, 2)
+        let k = tensor_slice(qkv, 2, c, 2 * c).reshape([batch, seq, nh, hd]).transpose(1, 2)
+        let v = tensor_slice(qkv, 2, 2 * c, 3 * c).reshape([batch, seq, nh, hd]).transpose(1, 2)
+        let y = scaled_dot_product_attention(q, k, v, 1.0 / sqrt(float(hd)), true)
+        let merged = y.transpose(1, 2).reshape([batch, seq, c])
+        return merged @ self.c_proj_w + self.c_proj_b
 
-## Single transformer block
-model GPT2Block(d_model: int, n_heads: int, d_ff: int, dropout: f32):
-    ln1: LayerNorm = LayerNorm(d_model)
-    ln2: LayerNorm = LayerNorm(d_model)
-    c_attn: Linear = Linear(d_model, 3 * d_model)
-    c_proj: Linear = Linear(d_model, d_model)
-    attn_drop: Dropout = Dropout(dropout)
-    resid_drop: Dropout = Dropout(dropout)
-    c_fc: Linear = Linear(d_model, d_ff)
-    c_fc_proj: Linear = Linear(d_ff, d_model)
-    mlp_drop: Dropout = Dropout(dropout)
-    n_heads: int = n_heads
-    head_dim: int = d_model // n_heads
+## The position-wise MLP: expand 4x, GELU (GPT-2's tanh form), project back.
+model GPT2MLP(d_model: int, d_ff: int, n_layers: int):
+    c_fc_w: Tensor = randn([d_model, d_ff]) * full([1], 0.02)
+    c_fc_b: Tensor = zeros([d_ff])
+    c_proj_w: Tensor = randn([d_ff, d_model]) * full([1], 0.02 / sqrt(full([1], float(2 * n_layers))).item())
+    c_proj_b: Tensor = zeros([d_model])
 
-    fn forward(self, x: Tensor < [batch, seq, d_model], bf16 > ) -> Tensor < [batch, seq, d_model], bf16 > :
-        let h = self.ln1(x)
-        let qkv = self.c_attn(h)
-        let attn = softmax(qkv, dim = -1) |> self.attn_drop
-        let out = self.c_proj(attn) |> self.resid_drop
-        let x = x + out
-        let h = self.ln2(x)
-        let ff = self.c_fc(h) |> gelu |> self.c_fc_proj |> self.mlp_drop
-        return x + ff
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = gelu(x @ self.c_fc_w + self.c_fc_b)
+        return h @ self.c_proj_w + self.c_proj_b
 
-## Full GPT-2
-model GPT2(vocab_size: int, d_model: int, n_layers: int, n_heads: int, d_ff: int, max_seq: int, dropout: f32):
-    wte: Embedding = Embedding(vocab_size, d_model)
-    wpe: Embedding = Embedding(max_seq, d_model)
-    drop: Dropout = Dropout(dropout)
-    ln_f: LayerNorm = LayerNorm(d_model)
-    lm_head: Linear = Linear(d_model, vocab_size, bias = false)
+## One decoder block, LayerNorm before each sublayer (GPT-2's arrangement).
+model GPT2Block(d_model: int, n_heads: int, d_ff: int, n_layers: int):
+    ln_1: LayerNorm = LayerNorm(d_model)
+    attn: CausalSelfAttention = CausalSelfAttention(d_model, n_heads, n_layers)
+    ln_2: LayerNorm = LayerNorm(d_model)
+    mlp: GPT2MLP = GPT2MLP(d_model, d_ff, n_layers)
 
-    fn forward(self, input_ids: Tensor < [batch, seq], int32 > ) -> Tensor < [batch, seq, vocab_size], bf16 > :
-        let h = self.wte(input_ids) + self.wpe(input_ids)
-        let h = self.drop(h)
-        let h = self.ln_f(h)
-        return self.lm_head(h)
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = x + self.attn.forward(self.ln_1.forward(x))
+        return h + self.mlp.forward(self.ln_2.forward(h))
 
-# Instantiate
-let gpt = GPT2(
-    vocab_size = CONFIG.vocab_size,
-    d_model = CONFIG.d_model,
-    n_layers = CONFIG.n_layers,
-    n_heads = CONFIG.n_heads,
-    d_ff = CONFIG.d_ff,
-    max_seq = CONFIG.max_seq,
-    dropout = CONFIG.dropout
-)
+## The full model. The LM head is the token embedding, transposed.
+model GPT2:
+    wte: Tensor = randn([64, 64]) * full([1], 0.02)
+    wpe: Tensor = randn([32, 64]) * full([1], 0.02)
+    h: [GPT2Block; 2] = GPT2Block(64, 4, 256, 2)
+    ln_f: LayerNorm = LayerNorm(64)
 
-print(f"GPT-2 initialized: {count_params(gpt)} parameters")
+    fn forward(self, input_ids: Tensor) -> Tensor:
+        let s = input_ids.shape
+        let batch = s[0]
+        let seq = s[1]
+        let width = self.wte.shape[1]
+        let tok = embedding_lookup(self.wte, input_ids.reshape([batch * seq])).reshape([batch, seq, width])
+        let x = tok + tensor_slice(self.wpe, 0, 0, seq)
+        for block in self.h:
+            x = block.forward(x)
+        return self.ln_f.forward(x) @ self.wte.transpose(0, 1)
 
-# STEP 3: DATASET
+let gpt = GPT2()
 
-# A dataset block declares packing statistics for attention planning; it
-# loads nothing. (The token file and the separator belong to a
-# DataLoader: load_mmap(...) and DataLoader(..., packing = true,
-# pack_separator = <id>).)
-dataset train_data("openwebtext"):
-    packing = true
-    max_sequence_length = 1024
+# The corpus: t[i] = (t[i-1] + 3 * t[i-2] + 1) mod VOCAB, a stream a model
+# with two tokens of context predicts exactly. 60 batches of 4 rows of 33.
+let n_tokens = 4 * 33 * 60
+let corpus = zeros([n_tokens])
+let a = 1
+let b = 2
+for i in range(n_tokens):
+    corpus[i] = float(b)
+    let next = (b + 3 * a + 1) % VOCAB
+    a = b
+    b = next
+let loader = DataLoader(corpus, batch_size=4, seq_len=32, shuffle=false, drop_last=true)
 
-# STEP 4: TRAINING
-
-train(epochs = 1, precision = bf16):
-    data:
-        source = train_data
-        batch_size = CONFIG.batch_size
-        num_workers = 8
-
-    optimizer: AdamW(
-        lr = CONFIG.lr,
-        weight_decay = CONFIG.weight_decay
-    )
-
-    scheduler: WarmupCosine(
-        warmup_steps = CONFIG.warmup_steps,
-        total_steps = CONFIG.total_steps
-    )
-
+train(model=gpt, epochs=1, schedule_unit="optimizer_step", grad_clip=1.0):
+    optimizer: AdamW(lr=0.003, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
+    scheduler: warmup_cosine(warmup_steps=6, total_steps=60, min_lr=0.0003)
     step(batch):
         let logits = gpt.forward(batch.input_ids)
-        loss = cross_entropy(logits, batch.labels)
-
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
     callbacks:
         on_step(step, loss):
-            if step % 200 == 0:
-                print(f"step {step} | loss {loss}")
+            if step % 10 == 0:
+                print(f"step {step} | loss {loss.item()}")
 
-print("Training complete!")
-
-# STEP 5: QUANTIZATION
-
-quant(scheme = int8, mode = aware, granularity = per_channel):
-    target = gpt
-
-# STEP 6: EXPORT
-
-to_onnx(gpt, input_shape = [1, CONFIG.max_seq], output = "exports/gpt2.onnx")
-
-# STEP 7: BENCHMARK
-
-let perf = benchmark(gpt, input_shape = [1, CONFIG.max_seq], num_iters = 100)
-print(f"Throughput: {perf.tokens_per_second} tok/s")
-
-# Helper function
-@no_grad
-fn evaluate_loss(mdl: GPT2, data: Dataset, max_batches: int = -1) -> f32:
-    let total_loss = 0.0
-    let count = 0
-    for batch in data:
-        let logits = mdl.forward(batch.input_ids)
-        let loss = cross_entropy(logits, batch.labels)
-        total_loss = total_loss + loss
-        count = count + 1
-    return total_loss / count
+print("GPT-2 training complete")
