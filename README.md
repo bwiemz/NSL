@@ -328,6 +328,7 @@ Key entry points for contributors:
 
 - No REPL
 - CUDA is the only GPU backend (the ROCm/Metal/WebGPU printers were removed; preserved at tag `attic/scope-freeze-2026-10`)
+- No sparse tensor type (general sparse tensors were removed; preserved at tag `attic/sparse-tensors-2026-11`). `Sparse<...>` annotations are refused
 - Windows requires Visual Studio Build Tools for linking
 - Fusion fires on elementwise chains; matmul+epilogue fusion (fused bias+relu inside matmul) is analysis-only
 

@@ -252,7 +252,7 @@ fn dtype_str_to_kir(dtype: &str) -> KirType {
 /// not a scalar. Kept beside [`dtype_str_to_kir`] so the two stay in step:
 /// a name here must never also be a dtype there.
 fn is_aggregate_type_name(name: &str) -> bool {
-    matches!(name, "Tensor" | "Param" | "Buffer" | "Sparse")
+    matches!(name, "Tensor" | "Param" | "Buffer")
 }
 
 /// Build a type map from kernel parameter names to their KIR types.
@@ -276,7 +276,7 @@ pub fn build_param_type_map(kernel: &KernelDef, interner: &Interner) -> HashMap<
                 }
                 TypeExprKind::Named(sym) => {
                     let name = interner.resolve(sym.0).unwrap_or("f32");
-                    // `Tensor` / `Param` / `Buffer` / `Sparse` written WITHOUT
+                    // `Tensor` / `Param` / `Buffer` written WITHOUT
                     // their `<[shape], dtype>` arguments parse as `Named`, not
                     // as the variants above -- and it is the dominant idiom in
                     // the examples (`kernel k(data: Tensor, ...)`). They are
@@ -1801,7 +1801,7 @@ mod tests {
     /// refused with "which is not a tensor" and `e2e_m26_autotune` failed.
     #[test]
     fn test_param_type_map_bare_aggregate_names_are_pointers() {
-        for ty in ["Tensor", "Param", "Buffer", "Sparse"] {
+        for ty in ["Tensor", "Param", "Buffer"] {
             let mut interner = make_interner();
             let name_sym = nsl_ast::Symbol(interner.get_or_intern("bare_kernel"));
             let p_data = nsl_ast::Symbol(interner.get_or_intern("data"));

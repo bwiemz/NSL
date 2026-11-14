@@ -782,7 +782,6 @@ impl Compiler<'_> {
         // Unknown lesson). A CONCRETE non-tensor type still refuses:
         // when the checker and the emission disagree, leak-not-crash.
         let trackable = ty.is_tensor()
-            || matches!(ty, Type::Sparse { .. })
             || (ty.is_indeterminate()
                 && (dispatch_fresh_call || self.expr_is_owning_tensor_method_call(expr)));
         if trackable {

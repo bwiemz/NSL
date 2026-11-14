@@ -278,17 +278,7 @@ block_kv with fused projections) are rejected at compile time.
 - Fourier-Motzkin bound reasoning for inequality chains
 
 ### Sparse Tensors (M50)
-
-A runtime library. NSL source can name a `Sparse<[shape], dtype, format>`
-type but has no way to construct a sparse value, so none of this is reached
-from a program today.
-
-- COO, CSR, CSC, BSR formats with conversion
-- SpMV, SpMM, sparse add/mul
-- TACO-style merge lattices (intersection for mul, union for add)
-- Workspace transformation for output assembly
-- `@sparse(pattern=...)` is refused by the checker: no pruning, mask or
-  2:4 kernel exists behind it
+- Removed in 2026-11 (the `Sparse<[shape], dtype, format>` type, sparse code generation, the COO/CSR/CSC/BSR runtime library with SpMV/SpMM and its `nsl_sparse_*` ABI rows are gone; a `Sparse<...>` annotation and the `@layout` decorator now get a refusal that names the tag); preserved at tag `attic/sparse-tensors-2026-11`. No program could construct a sparse value. `@sparse(pattern=...)` is refused as well: no pruning, mask or 2:4 kernel existed behind it
 
 ---
 

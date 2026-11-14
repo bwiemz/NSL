@@ -207,38 +207,37 @@ pruning schedule, 2:4 mask computation, compressed 2:4 storage, `mma.sp`
 emitter, format selection or composition with other features, and
 `Sparse<[…], dtype, "2:4">` does not parse.
 
-Older, adjacent code that a reader might mistake for it:
+Older, adjacent code that a reader might have mistaken for it has mostly
+been removed:
 
-- **The `Sparse<[shape], dtype, coo|csr|csc|bsr>` type.** It parses and
-  resolves (`resolve_sparse_format` in `crates/nsl-semantic/src/resolve.rs`;
-  any other format name is an error), which is the "scaffolding" §1.3 refers
-  to. NSL source cannot use it: there is no constructor, and the checker
-  rejects `sparse @ dense`.
-- **The runtime sparse library.** `crates/nsl-runtime/src/sparse.rs` (COO,
-  CSR, CSC and BSR formats; sparse-times-dense matrix and vector products,
-  add, multiply and conversions), the kernels in
-  `crates/nsl-kir/src/kernels/spmm.rs` and `spmv.rs`, and the GPU wrappers
-  in `crates/nsl-runtime/src/cuda/mod.rs`. None of it is reachable from NSL
-  source, and none of these formats is 2:4.
-- **Sparse codegen planning.** `crates/nsl-codegen/src/sparse.rs` holds
-  kernel selection (including a `PtxMmaSp` variant), the `SparseCostModel`,
-  format selection and merge lattices. It has no callers.
+- **General sparse tensors (milestone M50) are in the attic.** The
+  `Sparse<[shape], dtype, coo|csr|csc|bsr>` type (the "scaffolding" §1.3
+  refers to), the code generation for it, the runtime sparse library
+  (COO, CSR, CSC and BSR formats with products, add, multiply and
+  conversions), its SpMM and SpMV kernels and GPU wrappers, and the sparse
+  planning module (kernel selection, cost model, merge lattices) were
+  removed in 2026-11 and are preserved at tag
+  `attic/sparse-tensors-2026-11`. No program could construct a value of the
+  type, and none of its formats was 2:4. A `Sparse<...>` annotation is now
+  a compile error that names the tag (`refuse_sparse_type` in
+  `crates/nsl-parser/src/types.rs`).
 - **`@sparse(pattern="2:4"|"block")` and `@layout`.** Refused decorators
   (`UNIMPLEMENTED_DECORATORS` in
   `crates/nsl-semantic/src/decorator_registry.rs`). `@sparse` used to be
-  validated and then ignored.
-- **Weight-aware sparsity analysis (milestone M52).** A run with
-  `-w weights.safetensors` measures each weight's near-zero fraction and
-  reports it (`crates/nsl-codegen/src/weight_aware.rs`); `--sparse-threshold`
-  and `--no-sparse-codegen` control that report. Every matmul is dense. A
-  CSR matmul for a 2-D weight at least 50% near-zero used to be emitted
-  here (`try_sparse_matmul`); it never worked and has been removed. It was
+  validated and then ignored; `@layout`'s validator was never called and
+  went to the attic with the type.
+- **Weight-aware sparsity analysis (milestone M52).** Still present. A run
+  with `-w weights.safetensors` measures each weight's near-zero fraction
+  and reports it (`crates/nsl-codegen/src/weight_aware.rs`);
+  `--sparse-threshold` and `--no-sparse-codegen` control that report. Every
+  matmul is dense. A CSR matmul for a 2-D weight at least 50% near-zero
+  used to be emitted here; it never worked and has been removed. It was
   not 2:4 either.
 
-No shipped model uses any of this.
+No shipped model used any of this.
 `docs/summaries/06-implementation-status.md` used to call the M50 and M52
-sparse milestones "Production"; it now describes them as a runtime library
-and a report. `docs/wiki/Glossary.md` used to describe CSS as existing
+sparse milestones "Production"; it now says the first was removed and the
+second is a report. `docs/wiki/Glossary.md` used to describe CSS as existing
 compiler behaviour; it now says the proposal is not implemented.
 
 Defects found in this code are listed in Part 5.
@@ -269,6 +268,13 @@ items are described in `CHANGELOG.md` under "Unreleased". The open list is
 as of 2026-11-13.
 
 ### Fixed
+
+Several entries below describe repairs to the runtime sparse library and its
+GPU wrappers. Those repairs were made and tested, and the code they are in
+was then moved to the attic with the rest of general sparse tensors (last
+entry); they describe the code as it stands at tag
+`attic/sparse-tensors-2026-11`.
+
 
 - **A run with `-w weights.safetensors` aborted if the model held a 2-D
   weight at least half zeros.** Such a weight reached the weight-aware
@@ -329,33 +335,30 @@ as of 2026-11-13.
   limit and gives the kernel block-aligned buffers. A GPU test compares the
   result with a product written out in f64 for sizes of each kind.
 - **`docs/summaries/06-implementation-status.md` called the M50 and M52
-  sparse milestones "Production" and listed `@layout`.** It now says that
-  NSL source cannot reach the M50 library, that M52 produces a report, and
-  that `@sparse` and `@layout` are refused. `SPECIFICATION.md` is corrected
-  the same way.
+  sparse milestones "Production" and listed `@layout`.** It was corrected,
+  and now records M50 as removed and M52 as a report. `SPECIFICATION.md`
+  is corrected the same way.
 - **`SparseCostModel` used a placeholder size for COO.** It counted 12
   bytes per nonzero; the COO kernels take two 64-bit indices and an f32
   value, 20 bytes. Its CSR, CSC and BSR figures (32-bit indices, f32
   values) do match what the GPU kernels are given, and the comment now says
   that these are device sizes, not those of the host storage (64-bit
-  indices and f64 values in every format). The model still has no callers
-  (`crates/nsl-codegen/src/sparse.rs`).
+  indices and f64 values in every format). The model had no callers.
 - **A sparse-plus-sparse or sparse-times-sparse result was treated as a
   dense tensor.** The checker accepted `a + b` and `a * b` for two
   `Sparse<...>` operands where a `Tensor` is expected, and code generation
-  registered the sparse pointer that `nsl_sparse_add` or `nsl_sparse_mul`
-  returns as an owned dense tensor, so the first dense operation on it, or
-  the cleanup at the end of the statement, would have received a sparse
-  handle. No program could reach it, because no sparse value can be
-  constructed, so a repair could not have been tested by running. Both
-  expressions are now compile errors (`check_binary_op` in
-  `crates/nsl-semantic/src/checker/ops.rs`, with the same refusal in
-  `compile_sparse_binary_op`), so the fault cannot go live unnoticed when a
-  constructor is added. Sparse-with-dense arithmetic is unaffected.
+  registered the sparse pointer the runtime returns as an owned dense
+  tensor. No program could reach it, so it was first refused at compile
+  time and then removed with the type.
+- **General sparse tensors could not be used and were removed.** Nothing
+  in NSL could construct a value of the `Sparse<...>` type, so the type,
+  its code generation, the runtime library, the sparse kernels and the
+  planning module were unreachable. They are removed and preserved at tag
+  `attic/sparse-tensors-2026-11`; `Sparse<...>` and `@layout` are refused
+  with a message that names the tag. The sparsity that the project's GPUs
+  support in hardware is 2:4 structured sparsity, which is a question of
+  weight layout and not of a user-facing sparse type.
 
 ### Open, in the adjacent code
 
 Nothing in this list is open.
-
-The CSR and COO kernels in `crates/nsl-kir/src/kernels/` are not part of
-this list: they are tested against an independent reference.

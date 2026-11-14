@@ -13,25 +13,6 @@ impl<'a> TypeChecker<'a> {
             };
         }
 
-        // `Sparse + Sparse` and `Sparse * Sparse` are the two operations
-        // whose result is itself sparse. Nothing downstream knows that: this
-        // function types the result as a tensor, and code generation handed
-        // the sparse handle the runtime returns on as an owned DENSE tensor,
-        // to be read and freed as one. No program can reach that today (no
-        // sparse value can be constructed), so it could not be fixed and
-        // tested by running; it is refused so that it cannot go live
-        // unnoticed the day a constructor is added.
-        if matches!(op, BinOp::Add | BinOp::Mul) && is_sparse(&lty) && is_sparse(&rty) {
-            self.diagnostics.push(
-                Diagnostic::error(format!(
-                    "`{}` on two Sparse tensors is not supported",
-                    binop_symbol(op)
-                ))
-                .with_label(span, SPARSE_SPARSE_REFUSAL),
-            );
-            return Type::Error;
-        }
-
         match op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::FloorDiv | BinOp::Mod | BinOp::Pow => {
                 self.check_arithmetic(&lty, &rty, op, span)
@@ -79,7 +60,8 @@ impl<'a> TypeChecker<'a> {
     /// they fall back to the left operand's type as before.
     pub(crate) fn check_bitwise(&mut self, lty: &Type, rty: &Type, op: BinOp, span: Span) -> Type {
         if lty.is_tensor() && rty.is_tensor() {
-            // A sparse operand has no dense parts; it is not typed here.
+            // Every tensor-family type has dense parts; the else arm is a
+            // backstop for a type that one day does not.
             let (Some((ls, ld, ldev)), Some((rs, rd, rdev))) = (lty.as_tensor_parts(), rty.as_tensor_parts())
             else {
                 return Type::Unknown;
@@ -122,8 +104,8 @@ impl<'a> TypeChecker<'a> {
             | (Type::Float, Type::Int) => Type::Float,
             // Tensor element-wise ops (includes Param/Buffer)
             (l, r) if l.is_tensor() && r.is_tensor() => {
-                // A sparse operand has no dense parts; it is not typed here
-                // (`as_tensor_parts` is None for it, and this unwrapped).
+                // Every tensor-family type has dense parts; the else arm is
+                // a backstop for a type that one day does not.
                 let (Some((ls, ld, ldev)), Some((rs, rd, rdev))) = (l.as_tensor_parts(), r.as_tensor_parts())
                 else {
                     return Type::Unknown;
@@ -981,19 +963,6 @@ impl<'a> TypeChecker<'a> {
 }
 
 /// The source spelling of a binary operator, for diagnostics.
-/// Why `Sparse + Sparse` and `Sparse * Sparse` are refused.
-pub const SPARSE_SPARSE_REFUSAL: &str = "the result of this operation is a sparse value, and the compiler has \
-     no sparse result type: it treated the result as a dense tensor. Sparse-with-dense arithmetic is unaffected";
-
-/// A `Sparse<...>` type, possibly behind a borrow.
-fn is_sparse(ty: &Type) -> bool {
-    match ty {
-        Type::Sparse { .. } => true,
-        Type::Borrow(inner) => is_sparse(inner),
-        _ => false,
-    }
-}
-
 pub(crate) fn binop_symbol(op: BinOp) -> &'static str {
     match op {
         BinOp::Add => "+",

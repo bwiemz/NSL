@@ -23,7 +23,7 @@
 //! - [`analysis`] — cost model, autotuning, fusion, memory planning,
 //!   FlashAttention codegen, calibration.
 //! - [`experimental`] — research subsystems (CEP, CFIE, CSHA, WGGO, WRGA,
-//!   FASE, sparse, speculative, multimodal). These APIs
+//!   FASE, speculative, multimodal). These APIs
 //!   are **not stable** and may change or be removed between releases.
 //!
 //! These facades re-export the same modules that remain available at the crate
@@ -240,7 +240,6 @@ pub mod fase_codegen_table;
 pub mod fase_memory;
 pub mod fase_optimizer;
 pub mod multimodal;
-pub mod sparse;
 pub mod speculative;
 pub mod wggo;
 pub mod wggo_apply;
@@ -347,7 +346,7 @@ pub mod experimental {
         cfie_kv_quant, cfie_persistent, cfie_speculative, csha, csha_apply,
         csha_boundary, csha_patterns, csha_pipeline, csha_specialize, fase,
         fase_clip, fase_codegen_table, fase_memory, fase_optimizer, multimodal,
-        sparse, speculative, wggo, wggo_apply,
+        speculative, wggo, wggo_apply,
         wggo_conflicts, wggo_cost, wggo_dp, wggo_gradient_scorer, wggo_graph,
         wggo_ilp, wggo_overrides, wggo_prune, wggo_schedule, wggo_weight_analysis,
         wggo_weight_analysis_cache, wggo_weight_analysis_nslweights, wrga,

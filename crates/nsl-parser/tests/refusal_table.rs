@@ -152,3 +152,18 @@ fn an_agent_block_is_refused_by_name_and_its_body_is_skipped() {
     let at_eof = sexpr::parse_errors("agent Drafter:\n    steps: int = 0");
     assert_eq!(at_eof.diagnostics.len(), 1, "{:#?}", at_eof.diagnostics);
 }
+
+// General sparse tensors (M50) went to the attic in 2026-11: the type had no
+// constructor, so no program could hold a value of it. The annotation is one
+// error that names the removal and the tag, and the rest of the line parses
+// (the annotation becomes a wildcard), so there is no cascade.
+refusals! {
+    sparse_type_in_a_let: "let x: Sparse<[3, 3], f32, csr> = 1"
+        => "error: `Sparse<...>` types were removed: general sparse tensors (M50) had no constructor, so no program could hold one; the code is preserved at tag `attic/sparse-tensors-2026-11`. Use a dense `Tensor`", true;
+    sparse_type_with_an_unknown_format: "let x: Sparse<[3, 3], f32, crs> = 1"
+        => "error: `Sparse<...>` types were removed: general sparse tensors (M50) had no constructor, so no program could hold one; the code is preserved at tag `attic/sparse-tensors-2026-11`. Use a dense `Tensor`", true;
+    sparse_type_as_a_parameter: "fn f(a: Sparse<[N, N], f32, coo>) -> int:\n    return 0"
+        => "error: `Sparse<...>` types were removed: general sparse tensors (M50) had no constructor, so no program could hold one; the code is preserved at tag `attic/sparse-tensors-2026-11`. Use a dense `Tensor`", true;
+    sparse_type_cut_short: "let x: Sparse<[3, 3], f32"
+        => "error: `Sparse<...>` types were removed: general sparse tensors (M50) had no constructor, so no program could hold one; the code is preserved at tag `attic/sparse-tensors-2026-11`. Use a dense `Tensor`", true;
+}

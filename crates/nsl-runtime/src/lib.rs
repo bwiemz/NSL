@@ -295,7 +295,6 @@ pub mod train_config_record;
 pub mod multimodal;
 pub mod cfie;
 pub mod cpdt;
-pub mod sparse;
 pub mod peft;
 
 // WRGA B.3 Task 4: fused LoRA/IA³ adapter FFIs
@@ -406,5 +405,5 @@ pub mod interop {
 /// Experimental research subsystems. **APIs here are unstable** and may change
 /// or be removed between releases.
 pub mod experimental {
-    pub use crate::{cfie, cpdt, multimodal, sparse};
+    pub use crate::{cfie, cpdt, multimodal};
 }

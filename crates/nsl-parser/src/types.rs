@@ -184,7 +184,7 @@ fn parse_generic_or_tensor_type(p: &mut Parser, name: Symbol, start: Span) -> Ty
         }),
         "Param" => parse_param_type(p, start),
         "Buffer" => parse_buffer_type(p, start),
-        "Sparse" => parse_sparse_type(p, start),
+        "Sparse" => refuse_sparse_type(p, start),
         _ => {
             // Generic type: Name<A, B, C>
             p.advance(); // consume <
@@ -266,22 +266,33 @@ fn parse_buffer_type(p: &mut Parser, start: Span) -> TypeExpr {
     }
 }
 
-fn parse_sparse_type(p: &mut Parser, start: Span) -> TypeExpr {
+/// `Sparse<[shape], dtype, format>` was a type no value could have: the
+/// language had no way to construct a sparse tensor. The type, its codegen
+/// and the runtime library behind it were removed (tag
+/// `attic/sparse-tensors-2026-11`). The spelling is refused here, with one
+/// error that names the removal, so that an old annotation fails loudly
+/// instead of reparsing as a user generic called `Sparse`.
+///
+/// The arguments are skipped to the matching `>` and the annotation becomes
+/// a wildcard, so the rest of the declaration parses and nothing downstream
+/// reports a second error about the same annotation.
+fn refuse_sparse_type(p: &mut Parser, start: Span) -> TypeExpr {
+    p.diagnostics
+        .push(nsl_errors::Diagnostic::error(nsl_ast::types::SPARSE_TYPE_REMOVED).with_label(start, "removed type"));
     p.advance(); // consume <
-    p.expect(&TokenKind::LeftBracket);
-    let shape = parse_dim_list(p);
-    p.expect(&TokenKind::RightBracket);
-    p.expect(&TokenKind::Comma);
-    let (dtype, _) = p.expect_ident();
-    p.expect(&TokenKind::Comma);
-    let (format, _) = p.expect_ident();
-    let end = p.expect(&TokenKind::Gt);
+    let mut depth = 1usize;
+    let mut end = start;
+    while depth > 0 && !p.at(&TokenKind::Eof) && !p.at(&TokenKind::Newline) {
+        if p.at(&TokenKind::Lt) {
+            depth += 1;
+        } else if p.at(&TokenKind::Gt) {
+            depth -= 1;
+        }
+        end = p.current_span();
+        p.advance();
+    }
     TypeExpr {
-        kind: TypeExprKind::Sparse {
-            shape,
-            dtype,
-            format,
-        },
+        kind: TypeExprKind::Wildcard,
         span: start.merge(end),
         id: p.next_node_id(),
     }
@@ -470,7 +481,7 @@ fn reject_borrow_in_type(ty: &TypeExpr, p: &mut Parser) {
         TypeExprKind::FixedArray { element_type, .. } => {
             reject_borrow_in_type(element_type, p);
         }
-        // Named, Tensor, Param, Buffer, Sparse, Wildcard — leaf types, never borrow
+        // Named, Tensor, Param, Buffer, Wildcard — leaf types, never borrow
         _ => {}
     }
 }

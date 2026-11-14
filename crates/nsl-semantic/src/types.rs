@@ -114,11 +114,6 @@ pub enum Type {
         shape: Shape,
         dtype: DType,
     },
-    Sparse {
-        shape: Shape,
-        dtype: DType,
-        format: SparseFormat,
-    },
 
     /// Opaque quantized tensor handle (always i64 pointer at IR level).
     QuantizedTensor,
@@ -195,7 +190,7 @@ impl Type {
     /// Returns true if this type is a tensor family type.
     pub fn is_tensor(&self) -> bool {
         match self {
-            Type::Tensor { .. } | Type::Param { .. } | Type::Buffer { .. } | Type::Sparse { .. } => true,
+            Type::Tensor { .. } | Type::Param { .. } | Type::Buffer { .. } => true,
             Type::Borrow(inner) => inner.is_tensor(),
             _ => false,
         }
@@ -356,15 +351,6 @@ pub enum Device {
     Metal,
     Rocm(Option<u32>),
     Npu(Symbol),
-    Unknown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SparseFormat {
-    Coo,
-    Csr,
-    Csc,
-    Bsr,
     Unknown,
 }
 
@@ -621,18 +607,6 @@ pub fn display_type(ty: &Type) -> String {
             let shape_str = crate::shapes::fmt_shape(shape);
             let dtype_str = display_dtype(dtype);
             format!("Buffer<{}, {}>", shape_str, dtype_str)
-        }
-        Type::Sparse { shape, dtype, format } => {
-            let shape_str = crate::shapes::fmt_shape(shape);
-            let dtype_str = display_dtype(dtype);
-            let fmt_str = match format {
-                SparseFormat::Coo => "coo",
-                SparseFormat::Csr => "csr",
-                SparseFormat::Csc => "csc",
-                SparseFormat::Bsr => "bsr",
-                SparseFormat::Unknown => "?",
-            };
-            format!("Sparse<{}, {}, {}>", shape_str, dtype_str, fmt_str)
         }
         Type::List(inner) => format!("list<{}>", display_type(inner)),
         Type::Dict(k, v) => format!("dict<{}, {}>", display_type(k), display_type(v)),

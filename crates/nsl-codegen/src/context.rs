@@ -33,7 +33,7 @@ pub struct StructField {
 /// ("invalid tensor handle 0x3"), and a `Buffer` trained like a parameter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FieldKind {
-    /// `Tensor`, `Param<...>`, `Sparse<...>`, or a declaration that does not
+    /// `Tensor`, `Param<...>`, or a declaration that does not
     /// pin the kind down (`_`, a union with a tensor member): a parameter. It
     /// trains unless `_`-prefixed, `inv_freq`, or `@freeze`-frozen.
     Tensor,
@@ -143,7 +143,7 @@ impl Default for TensorCleanupState {
 }
 
 /// Ownership and linear-type lowering state.
-/// Tracks linear tensor consumption and sparse variable classification.
+/// Tracks linear tensor consumption.
 pub struct OwnershipState {
     /// M38b: Ownership lowering state for linear types free-at-consumption.
     /// `Some` when `--linear-types` is active and the function has ownership metadata.
@@ -152,10 +152,6 @@ pub struct OwnershipState {
     /// After statement-level cleanup, these are freed via `nsl_tensor_free` instead
     /// of waiting for scope exit. Only populated when `lowering.is_some()`.
     pub linear_consume_pending: Vec<ir::Value>,
-    /// M50: Set of Symbol names that are known sparse tensor variables.
-    /// Populated when codegen emits sparse_from_dense, sparse_coo, or format conversion calls
-    /// assigned to a variable. Checked during binary op dispatch to route to sparse ops.
-    pub sparse_vars: HashSet<Symbol>,
 }
 
 impl OwnershipState {
@@ -163,7 +159,6 @@ impl OwnershipState {
         OwnershipState {
             lowering: None,
             linear_consume_pending: Vec::new(),
-            sparse_vars: HashSet::new(),
         }
     }
 }

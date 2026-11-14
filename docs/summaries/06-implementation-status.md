@@ -97,7 +97,7 @@ Core inference milestones shipped in v0.2.0, with later auditing showing M30-M31
 | M47 | Multi-Backend | Framework | PTX production; AMDGPU/Metal/WGSL generate plausible code but untested on real hardware |
 | M48 | Multimodal | Functional | Patch embed, mel spectrogram, cross-attention config |
 | M49 | Shape Algebra | Functional | Symbolic solver, Fourier-Motzkin constraints, range bounds |
-| M50 | Sparse Tensors | Library only | COO/CSR/CSC/BSR runtime library with SpMV/SpMM (CPU and GPU kernels) and planning code (merge lattices, format selection) that nothing calls. `Sparse<...>` types parse, but NSL source has no way to construct a sparse value; `@sparse` and `@layout` are refused |
+| M50 | Sparse Tensors | Removed | Removed in 2026-11; preserved at tag `attic/sparse-tensors-2026-11`. Nothing could construct a `Sparse<...>` value, so the type, its codegen, the COO/CSR/CSC/BSR runtime library and its kernels were unreachable. `Sparse<...>` and `@layout` are refused with the tag; `@sparse` is refused |
 | M51 | Effect System | **Production** | 4 effects (IO, Random, Mutation, Communication), bitset tracking, @pure/@deterministic, effect polymorphism (Effect::Var, Effect::Union, substitute, unification) |
 
 ### Weight Intelligence & Frontier (M52-M55) — FUNCTIONAL TO PRODUCTION
@@ -145,7 +145,7 @@ This list includes both production-ready features and higher-value functional su
 9. **Inference serving**: PagedAttention (CoW), continuous batching, chunked prefill, speculative decoding core with Lookahead plus partial EAGLE-2/Medusa tree-method scaffolding
 10. **Disaggregated inference**: Prefill/decode worker separation, NVLink/TCP KV transfer, RDMA backend scaffold with TCP fallback, auto-detection
 11. **Optimization**: Fusion analysis/pattern detection (elementwise + epilogue + reduction), multi-level cache cost model, memory planning
-12. **Sparse tensors**: COO/CSR/CSC/BSR runtime library with GPU SpMM/SpMV, not reachable from NSL source
+12. **Sparse tensors**: removed in 2026-11 (tag `attic/sparse-tensors-2026-11`); the weight-aware sparsity report remains
 13. **Weight-aware compilation**: Constant folding, dead weight elimination, sparsity-aware codegen, scaling fusion
 14. **Interop**: C API (real forward pass), DLPack, SafeTensors, ONNX export, HuggingFace loading
 15. **ZK circuits**: AST-to-ZkDag, Jolt lookup-native gates, folding proofs (sumcheck + Fiat-Shamir), Mersenne-31 field, CLI pipeline

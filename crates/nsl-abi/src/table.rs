@@ -549,24 +549,6 @@ macro_rules! for_each_runtime_fn {
             // runtime and the fingerprint cannot disagree about which arithmetic ran.
             // (mode, rounding, min_ratio, cast_cache, lt, lt_workspace_mib, lt_tune)
             [abi_tensor] nsl_set_matmul_config(i64, i64, f64, i64, i64, i64, i64) -> i64 = matmul_config::nsl_set_matmul_config;
-            // --- M50: Sparse tensors ---
-            [abi_tensor] nsl_sparse_coo(i64, i64, i64, i64, i64, i64) -> i64 = sparse::nsl_sparse_coo;
-            [abi_tensor] nsl_sparse_from_dense(i64, i64, i64) -> i64 = sparse::nsl_sparse_from_dense;
-            // M50b: +threshold
-            [abi_tensor] nsl_sparse_to_dense(i64) -> i64 = sparse::nsl_sparse_to_dense;
-            [abi_tensor] nsl_sparse_nnz(i64) -> i64 = sparse::nsl_sparse_nnz;
-            [abi_tensor] nsl_sparse_density(i64) -> i64 = sparse::nsl_sparse_density;
-            [abi_tensor] nsl_sparse_spmm(i64, i64) -> i64 = sparse::nsl_sparse_spmm;
-            [abi_tensor] nsl_sparse_spmv(i64, i64) -> i64 = sparse::nsl_sparse_spmv;
-            [abi_tensor] nsl_sparse_coo_to_csr(i64) -> i64 = sparse::nsl_sparse_coo_to_csr;
-            [abi_tensor] nsl_sparse_coo_to_csc(i64) -> i64 = sparse::nsl_sparse_coo_to_csc;
-            [abi_tensor] nsl_sparse_csr_to_csc(i64) -> i64 = sparse::nsl_sparse_csr_to_csc;
-            [abi_tensor] nsl_sparse_csc_to_csr(i64) -> i64 = sparse::nsl_sparse_csc_to_csr;
-            [abi_tensor] nsl_sparse_csr_to_coo(i64) -> i64 = sparse::nsl_sparse_csr_to_coo;
-            [abi_tensor] nsl_sparse_csc_to_coo(i64) -> i64 = sparse::nsl_sparse_csc_to_coo;
-            [abi_tensor] nsl_sparse_add(i64, i64) -> i64 = sparse::nsl_sparse_add;
-            [abi_tensor] nsl_sparse_mul(i64, i64) -> i64 = sparse::nsl_sparse_mul;
-            [abi_tensor] nsl_sparse_free(i64) -> i64 = sparse::nsl_sparse_free;
             // --- M40: Source AD runtime helpers ---
             [abi_tensor] nsl_tensor_compare(i64, i64, i64) -> i64 = tensor::ad_ops::nsl_tensor_compare;
             [abi_tensor] nsl_tensor_where(i64, i64, i64) -> i64 = tensor::ad_ops::nsl_tensor_where;
@@ -1340,6 +1322,6 @@ mod tests {
     fn table_is_the_recorded_size() {
         // The count is pinned so a row dropped by a bad merge is noticed; move
         // it with a row that is deliberately added or removed.
-        assert_eq!(RUNTIME_ABI.len(), 668);
+        assert_eq!(RUNTIME_ABI.len(), 652);
     }
 }

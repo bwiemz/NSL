@@ -29,9 +29,7 @@ pub(crate) fn field_kind_of_annotation(
     resolve: &dyn Fn(nsl_ast::Symbol) -> String,
 ) -> FieldKind {
     match &ty.kind {
-        TypeExprKind::Tensor { .. } | TypeExprKind::Param { .. } | TypeExprKind::Sparse { .. } => {
-            FieldKind::Tensor
-        }
+        TypeExprKind::Tensor { .. } | TypeExprKind::Param { .. } => FieldKind::Tensor,
         TypeExprKind::Buffer { .. } => FieldKind::Buffer,
         TypeExprKind::FixedArray { .. } => FieldKind::Nested,
         TypeExprKind::Borrow(inner) => field_kind_of_annotation(inner, resolve),
@@ -61,9 +59,7 @@ pub(crate) fn field_kind_of_annotation(
 /// [`field_kind_of_annotation`] for a type the checker already resolved.
 pub(crate) fn field_kind_of_type(ty: &Type) -> FieldKind {
     match ty {
-        Type::Tensor { .. } | Type::Param { .. } | Type::Sparse { .. } | Type::QuantizedTensor => {
-            FieldKind::Tensor
-        }
+        Type::Tensor { .. } | Type::Param { .. } | Type::QuantizedTensor => FieldKind::Tensor,
         Type::Buffer { .. } => FieldKind::Buffer,
         Type::Model { .. } | Type::Struct { .. } | Type::FixedModelArray { .. } => FieldKind::Nested,
         Type::Borrow(inner) | Type::Optional(inner) => field_kind_of_type(inner),

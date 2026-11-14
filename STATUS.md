@@ -188,6 +188,13 @@ tests that are *not* part of the green-build contract (see README → Benchmarks
   freeze; preserved at tag `attic/scope-freeze-2026-10`. `agent` stays a
   reserved word and an `agent` block is refused with the tag, as are
   `@pipeline_agent`/`@auto_device_transfer`. `--linear-types` (M38a) stays.
+- **General sparse tensors** (M50: the `Sparse<[shape], dtype, format>`
+  type, sparse code generation and planning, the COO/CSR/CSC/BSR runtime
+  library, its SpMM/SpMV kernels and `nsl_sparse_*` ABI rows) — **Removed**
+  in 2026-11; preserved at tag `attic/sparse-tensors-2026-11`. Nothing
+  could construct a value of the type. A `Sparse<...>` annotation and the
+  `@layout` decorator are refused with the tag. The weight-aware sparsity
+  report (`--weights`, `--sparse-threshold`) stays.
 - **Distributed** — tensor / pipeline / context parallelism, MoE serving.
 - **Inference serving** — speculative decoding, paged KV, disaggregated serving.
 - **Non-CUDA GPU backends** (M47: AMDGPU/ROCm, Metal, WGSL/WebGPU KIR printers)

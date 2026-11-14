@@ -1,5 +1,12 @@
 # Section 2 — Tensor Type System
 
+> **Status (2026-11).** The `Sparse<[shape], dtype, format>` type in the
+> grammar and in Example 6 below is not part of the language any more:
+> general sparse tensors were removed (preserved at tag
+> `attic/sparse-tensors-2026-11`) because nothing could construct a sparse
+> value, and a `Sparse<...>` annotation is a compile error that names the
+> tag. `to_sparse` never existed.
+
 ## Design Rationale
 
 The single biggest source of bugs in PyTorch code is shape mismatches discovered at runtime.

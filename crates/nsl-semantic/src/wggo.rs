@@ -303,7 +303,6 @@ fn type_expr_summary(
         TypeExprKind::Tensor { .. } => "Tensor".to_string(),
         TypeExprKind::Param { .. } => "Param".to_string(),
         TypeExprKind::Buffer { .. } => "Buffer".to_string(),
-        TypeExprKind::Sparse { .. } => "Sparse".to_string(),
         TypeExprKind::Generic { name, .. } => format!("generic:{}", resolve_sym(*name)),
         TypeExprKind::Function { .. } => "function type".to_string(),
         TypeExprKind::Union(_) => "union type".to_string(),

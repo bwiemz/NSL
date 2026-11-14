@@ -18,7 +18,7 @@ NSL's development is organized into milestones (M9-M62) grouped into phases (1-1
 | 6 | v0.6 | M41 full (NVLink/RDMA/TCP KV backends), M47 full (KIR + backends), M39b AST transform | Shipped 2026-03-18 |
 | 7 | v0.6-v0.7 | M38b (linear types codegen), M40b (source AD extraction), M43 (pipeline parallel) | Shipped 2026-03-18 |
 | 8 | v0.8 | M45 (tensor debugger), M46 (reproducibility), M48 (multimodal) | Shipped 2026-03-18 |
-| 9 | v0.8 | M49 (shape algebra), M50 (sparse tensors), M51 (effect system) | Shipped 2026-03-18 |
+| 9 | v0.8 | M49 (shape algebra), M50 (sparse tensors), M51 (effect system) | Shipped 2026-03-18; M50 removed 2026-11 (preserved at tag `attic/sparse-tensors-2026-11`) |
 | 10 | v0.9 | M52 (weight-aware compilation), M62 (PyTorch FFI), M54 (unikernels) | M52/M62 shipped; M54 removed in the Phase 0.6 scope freeze (preserved at tag `attic/scope-freeze-2026-10`) |
 | 11 | v1.0 | M53 (WCET proofs), M55 (ZK circuits), M56 (agent shared memory) | M53/M55/M56 removed in the Phase 0.6 scope freeze (preserved at tag `attic/scope-freeze-2026-10`) |
 | 12 | v1.1 | M58 (elastic FT), M59 (topology routing), M61 (cluster debug) | Planned |
@@ -146,7 +146,7 @@ Kernel IR (KIR) intermediate representation; PTX backend; `GpuTarget`/`GpuBacken
 Symbolic dimension solver; equality, divisibility, and range proofs at compile time.
 
 ### M50 -- Sparse tensors (Shipped v0.8, 2026-03-18)
-`NslSparseTensor`; COO/CSR/CSC/BSR format dispatch; sparse-dense matmul routing.
+`NslSparseTensor`; COO/CSR/CSC/BSR format dispatch; sparse-dense matmul routing. Removed in 2026-11 (preserved at tag `attic/sparse-tensors-2026-11`): nothing could construct a sparse value, so none of it was reachable from NSL.
 
 ### M51 -- Effect system (Shipped v0.8, 2026-03-18)
 Effect annotations on functions; pure/stateful/io effect tracking; required by M46 determinism proofs and M49 shape algebra.

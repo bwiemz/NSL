@@ -52,8 +52,7 @@ pub fn nsl_type_to_cl(ty: &Type) -> types::Type {
         // Borrow: same IR representation as the inner type
         Type::Borrow(inner) => nsl_type_to_cl(inner),
         // Remaining variants: all pointer/opaque at IR level
-        Type::Sparse { .. }
-        | Type::QuantizedTensor
+        Type::QuantizedTensor
         | Type::Function { .. }
         | Type::Enum { .. }
         | Type::Union(_)

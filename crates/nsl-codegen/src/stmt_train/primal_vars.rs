@@ -116,12 +116,6 @@ impl Compiler<'_> {
                         Type::Borrow(inner) => inner.as_ref(),
                         other => other,
                     };
-                    // NOT Sparse: NslSparseTensor is a different
-                    // repr(C) with no magic field — handing it to
-                    // the guard is the wild-read class this filter
-                    // exists to kill (review S1). Unreachable today
-                    // (source AD has no sparse handlers); a skip is
-                    // the safe direction if that changes.
                     matches!(
                         inner,
                         Type::Tensor { .. }

@@ -143,8 +143,7 @@ pub(crate) fn resolvable_tensor_rank(ty: &Type) -> Option<usize> {
     let rank = match inner {
         Type::Tensor { shape, .. }
         | Type::Param { shape, .. }
-        | Type::Buffer { shape, .. }
-        | Type::Sparse { shape, .. } => shape.rank(),
+        | Type::Buffer { shape, .. } => shape.rank(),
         _ => return None,
     };
     if rank == 0 {
@@ -369,23 +368,6 @@ impl Compiler<'_> {
                             state.dataloader_symbols.remove(&sym);
                         }
                         self.update_non_owning_binding(state, sym, value.as_ref());
-
-                        // M50: Track sparse tensor variables for end-to-end dispatch.
-                        // The TYPE decides. This also used to treat the result
-                        // of any call whose callee's name contained "sparse"
-                        // (or was `from_dense`) as a sparse tensor, so a dense
-                        // tensor returned by a user function called
-                        // `make_sparse_like` was handed to
-                        // `nsl_sparse_to_dense` at its first `+` and the
-                        // program aborted in the allocator.
-                        if let Some(expr) = value
-                            && matches!(
-                                self.node_type(expr.id),
-                                nsl_semantic::types::Type::Sparse { .. }
-                            )
-                        {
-                            state.ownership.sparse_vars.insert(sym);
-                        }
 
                         // Free intermediate tensor temporaries (keep init_val which is now owned by the variable)
                         self.free_tensor_temporaries(builder, state, Some(init_val));

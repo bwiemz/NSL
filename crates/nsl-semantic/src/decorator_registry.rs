@@ -48,8 +48,8 @@ const fn k(name: &'static str, read_by: &'static str) -> KnownDecorator {
 /// codegen. Names consumed by the parser before a `Decorator` node exists
 /// (`pack`, `unpack`, `backward`, `*_ptx` in datatype blocks; `endpoint` in
 /// serve blocks) are deliberately absent — their namespaces were already
-/// closed at the parse sites. `layout` is deliberately NOT here: its
-/// validator has no dispatch (see UNIMPLEMENTED_DECORATORS).
+/// closed at the parse sites. `layout` is deliberately NOT here: it
+/// was never dispatched and is refused (see UNIMPLEMENTED_DECORATORS).
 pub static KNOWN_DECORATORS: &[KnownDecorator] = &[
     // --- validated in nsl-semantic/src/checker/stmt.rs ---
     k("adapter", "crates/nsl-semantic/src/checker/stmt.rs"),
@@ -115,17 +115,6 @@ pub static KNOWN_DECORATORS: &[KnownDecorator] = &[
 /// `--allow-unknown-decorators`, so a removed feature cannot be silently
 /// ignored.
 pub static UNIMPLEMENTED_DECORATORS: &[(&str, &str)] = &[
-    (
-        // Found by this registry's own drift gate: `validate_layout_decorator`
-        // exists in sparse_layout.rs with unit tests, but NOTHING dispatches
-        // it — no checker arm, no parser route. A validator without a
-        // dispatch is an inert feature, so the name refuses rather than
-        // silently ignoring the annotation.
-        "layout",
-        "@layout has validation logic (sparse_layout.rs) but is not dispatched \
-         by the checker in this version, so it would be silently ignored; \
-         remove the decorator",
-    ),
     (
         "tie_weights",
         "@tie_weights is documented (spec/04-model-definition, wiki) but has no \
@@ -200,6 +189,16 @@ pub static UNIMPLEMENTED_DECORATORS: &[(&str, &str)] = &[
         "@fp4_compute is not implemented: no code generation path reads it, \
          so the decorated function ran exactly as if it were absent. Remove \
          the decorator (for FP8 compute use @fp8_compute)",
+    ),
+    // ---- removed with general sparse tensors (2026-11) ---------------
+    (
+        // Its validator (sparse_layout.rs) had unit tests and no dispatch:
+        // no checker arm ever called it, so the decorator was refused as
+        // inert. The validator went to the attic with the sparse type.
+        "layout",
+        "@layout was removed with general sparse tensors (M50): its validator \
+         was never dispatched, so the decorator had no effect; the code is \
+         preserved at tag `attic/sparse-tensors-2026-11`. Remove the decorator",
     ),
     // ---- removed in the Phase 0.6 scope freeze -----------------------
     (
@@ -326,6 +325,13 @@ mod tests {
             let msg = unimplemented_refusal(name).unwrap_or_else(|| panic!("@{name} must get a typed refusal"));
             assert!(msg.contains("is not implemented") && msg.contains(needle), "{msg}");
         }
+    }
+
+    #[test]
+    fn layout_refuses_with_the_sparse_attic_tag() {
+        assert!(find("layout").is_none());
+        let msg = unimplemented_refusal("layout").expect("@layout must get a typed refusal");
+        assert!(msg.contains("general sparse tensors") && msg.contains("attic/sparse-tensors-2026-11"), "{msg}");
     }
 
     #[test]

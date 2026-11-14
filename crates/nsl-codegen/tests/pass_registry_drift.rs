@@ -728,7 +728,6 @@ const NOT_A_PASS: &[(&str, &str)] = &[
     ("schema_convert", "schema conversion"),
     ("serve", "serving entry point"),
     ("source_ad", "the source-AD extractor - produces the WengertList passes consume"),
-    ("sparse", "sparse tensor support"),
     ("speculative", "speculative decoding support"),
     ("standalone", "standalone binary emission"),
     ("stdlib_loader", "stdlib module loading"),
