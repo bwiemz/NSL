@@ -67,7 +67,7 @@ Core inference milestones shipped in v0.2.0, with later auditing showing M30-M31
 | M32 | Mixture of Experts | Functional | @moe decorator, router, dispatch, aux loss, expert parallel FFI (all-to-all stub) |
 | M33 | Speculative Decoding | Functional | DraftModelRunner (524 LOC), Lookahead n-gram decoding, rejection sampling (greedy + stochastic), tree attention masks; EAGLE-2/Medusa tree-method plumbing remains partial |
 | M34 | Ring Attention | Functional | @context_parallel extraction, ring comm basic |
-| M35 | FP8 compute; 4-bit weight routines | Partial | FP8 E4M3/E5M2 (`@fp8_compute`, H100 MMA PTX) is reachable from NSL. The 4-bit routines are runtime library code that no NSL program reaches: the one named AWQ is per-group round-to-nearest with no activation-aware scaling, and GPTQ (act-order, blocked updates, Cholesky factor of the inverse Hessian) is tested against a NumPy reference. `@quantize(dtype="awq4")` only marks a model for the calibration pass and warns that it quantizes nothing |
+| M35 | FP8 compute; 4-bit weight routines | Partial | FP8 E4M3/E5M2 (`@fp8_compute`, H100 MMA PTX) is reachable from NSL. The 4-bit routines are runtime library code that no NSL program reaches: the one named AWQ is per-group round-to-nearest with no activation-aware scaling, and GPTQ (act-order, blocked updates, Cholesky factor of the inverse Hessian) is tested against a NumPy reference. `@quantize` is refused in every form: its one accepted dtype, `awq4`, drove a calibration pass whose output nothing read, and that pass is deleted |
 
 ### Compiler Analysis (M36-M40) — FUNCTIONAL TO PRODUCTION
 
@@ -84,7 +84,7 @@ Core inference milestones shipped in v0.2.0, with later auditing showing M30-M31
 | Milestone | Feature | Status | Notes |
 |-----------|---------|--------|-------|
 | M41 | Disaggregated Inference | Functional | Router, KV transfer (KVXF format), **real prefill/decode worker loops**, NVLink/TCP transport backends, auto-detection, CUDA IPC GPU-direct, PCI bus scan; RDMA backend currently falls back to TCP until ibverbs is wired |
-| M42 | KV Compression | Library only | INT8/INT4/FP8 block quantizers, H2O and sliding-window eviction managers exist as runtime routines. The paged KV cache stores K and V uncompressed and calls none of them; `@kv_compress` is refused |
+| M42 | KV Compression | Library only | INT8/INT4/FP8 block quantizers exist as runtime routines. The paged KV cache stores K and V uncompressed and calls none of them; `@kv_compress` is refused. The H2O and sliding-window eviction managers had no caller and were removed |
 | M43 | Pipeline Parallelism | **Functional** | Config parsed, 1F1B/GPipe schedules, SharedMemPipeline backend with mailbox pattern, condvar signaling |
 | M44 | Constrained Decoding | Functional | Thompson NFA → DFA → Hopcroft minimize, token alignment, logit masking |
 
@@ -97,7 +97,7 @@ Core inference milestones shipped in v0.2.0, with later auditing showing M30-M31
 | M47 | Multi-Backend | Framework | PTX production; AMDGPU/Metal/WGSL generate plausible code but untested on real hardware |
 | M48 | Multimodal | Functional | Patch embed, mel spectrogram, cross-attention config |
 | M49 | Shape Algebra | Functional | Symbolic solver, Fourier-Motzkin constraints, range bounds |
-| M50 | Sparse Tensors | Library only | COO/CSR/CSC/BSR runtime library with SpMV/SpMM (CPU and GPU kernels) and planning code (merge lattices, format selection) that nothing calls. `Sparse<...>` types parse, but NSL source has no way to construct a sparse value; `@sparse` and `@layout` are refused |
+| M50 | Sparse Tensors | Removed | Removed in 2026-11; preserved at tag `attic/sparse-tensors-2026-11`. Nothing could construct a `Sparse<...>` value, so the type, its codegen, the COO/CSR/CSC/BSR runtime library and its kernels were unreachable. `Sparse<...>` and `@layout` are refused with the tag; `@sparse` is refused |
 | M51 | Effect System | **Production** | 4 effects (IO, Random, Mutation, Communication), bitset tracking, @pure/@deterministic, effect polymorphism (Effect::Var, Effect::Union, substitute, unification) |
 
 ### Weight Intelligence & Frontier (M52-M55) — FUNCTIONAL TO PRODUCTION
@@ -145,7 +145,7 @@ This list includes both production-ready features and higher-value functional su
 9. **Inference serving**: PagedAttention (CoW), continuous batching, chunked prefill, speculative decoding core with Lookahead plus partial EAGLE-2/Medusa tree-method scaffolding
 10. **Disaggregated inference**: Prefill/decode worker separation, NVLink/TCP KV transfer, RDMA backend scaffold with TCP fallback, auto-detection
 11. **Optimization**: Fusion analysis/pattern detection (elementwise + epilogue + reduction), multi-level cache cost model, memory planning
-12. **Sparse tensors**: COO/CSR/CSC/BSR runtime library with GPU SpMM/SpMV, not reachable from NSL source
+12. **Sparse tensors**: removed in 2026-11 (tag `attic/sparse-tensors-2026-11`); the weight-aware sparsity report remains
 13. **Weight-aware compilation**: Constant folding, dead weight elimination, sparsity-aware codegen, scaling fusion
 14. **Interop**: C API (real forward pass), DLPack, SafeTensors, ONNX export, HuggingFace loading
 15. **ZK circuits**: AST-to-ZkDag, Jolt lookup-native gates, folding proofs (sumcheck + Fiat-Shamir), Mersenne-31 field, CLI pipeline

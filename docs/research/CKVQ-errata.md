@@ -289,7 +289,8 @@ Two existing pieces are the nearest, and cover almost none of it:
   read; they were removed.)
 - **KV compression routines** — `crates/nsl-runtime/src/kv_compress/`. CPU
   routines for INT8 per head or per token, INT4 per 64-element group, and an
-  FP8 cast, plus sliding-window and H2O eviction managers. Nothing calls
+  FP8 cast. (Sliding-window and H2O eviction managers stood beside them and
+  have been removed.) Nothing calls
   them: the paged KV cache
   (`crates/nsl-runtime/src/paged_kv/manager.rs`) stores keys and values as
   written, `nsl_kv_quantize_and_store` has no caller, and the `@kv_compress`
@@ -376,15 +377,12 @@ reproduced by running, numeric check, or by reading the code only.
   dimensions and returns that figure; `bytes_per_element` in
   `crates/nsl-runtime/src/kv_compress/mod.rs` is documented as the payload
   figure it is.
+- **The H2O and sliding-window eviction managers had no callers, and H2O
+  rarely evicted.** H2O marked the lowest-scoring tokens and then evicted a
+  block only when every token in it was marked, which scattered scores
+  almost never produce, and it did not track blocks it had already evicted.
+  Both managers, their FFI entry points and their tests are deleted.
 
 ### Open, in the adjacent code
 
-- **The H2O and sliding-window managers have no callers, and H2O rarely
-  evicts.** H2O marks the lowest-scoring tokens for eviction and then evicts
-  a block only when every token in it is marked, which scattered scores
-  almost never produce; it also does not track blocks it has already
-  evicted, so a caller would be told to evict the same block again. H2O is
-  defined per token and the paged cache frees whole blocks, so the rule
-  that maps one onto the other is a design decision that has not been made.
-  `check_eviction` in `crates/nsl-runtime/src/kv_compress/h2o.rs`. By
-  reading the code only.
+Nothing in this list is open.

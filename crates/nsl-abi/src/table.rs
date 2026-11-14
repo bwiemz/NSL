@@ -554,24 +554,6 @@ macro_rules! for_each_runtime_fn {
             // runtime and the fingerprint cannot disagree about which arithmetic ran.
             // (mode, rounding, min_ratio, cast_cache, lt, lt_workspace_mib, lt_tune)
             [abi_tensor] nsl_set_matmul_config(i64, i64, f64, i64, i64, i64, i64) -> i64 = matmul_config::nsl_set_matmul_config;
-            // --- M50: Sparse tensors ---
-            [abi_tensor] nsl_sparse_coo(i64, i64, i64, i64, i64, i64) -> i64 = sparse::nsl_sparse_coo;
-            [abi_tensor] nsl_sparse_from_dense(i64, i64, i64) -> i64 = sparse::nsl_sparse_from_dense;
-            // M50b: +threshold
-            [abi_tensor] nsl_sparse_to_dense(i64) -> i64 = sparse::nsl_sparse_to_dense;
-            [abi_tensor] nsl_sparse_nnz(i64) -> i64 = sparse::nsl_sparse_nnz;
-            [abi_tensor] nsl_sparse_density(i64) -> i64 = sparse::nsl_sparse_density;
-            [abi_tensor] nsl_sparse_spmm(i64, i64) -> i64 = sparse::nsl_sparse_spmm;
-            [abi_tensor] nsl_sparse_spmv(i64, i64) -> i64 = sparse::nsl_sparse_spmv;
-            [abi_tensor] nsl_sparse_coo_to_csr(i64) -> i64 = sparse::nsl_sparse_coo_to_csr;
-            [abi_tensor] nsl_sparse_coo_to_csc(i64) -> i64 = sparse::nsl_sparse_coo_to_csc;
-            [abi_tensor] nsl_sparse_csr_to_csc(i64) -> i64 = sparse::nsl_sparse_csr_to_csc;
-            [abi_tensor] nsl_sparse_csc_to_csr(i64) -> i64 = sparse::nsl_sparse_csc_to_csr;
-            [abi_tensor] nsl_sparse_csr_to_coo(i64) -> i64 = sparse::nsl_sparse_csr_to_coo;
-            [abi_tensor] nsl_sparse_csc_to_coo(i64) -> i64 = sparse::nsl_sparse_csc_to_coo;
-            [abi_tensor] nsl_sparse_add(i64, i64) -> i64 = sparse::nsl_sparse_add;
-            [abi_tensor] nsl_sparse_mul(i64, i64) -> i64 = sparse::nsl_sparse_mul;
-            [abi_tensor] nsl_sparse_free(i64) -> i64 = sparse::nsl_sparse_free;
             // --- M40: Source AD runtime helpers ---
             [abi_tensor] nsl_tensor_compare(i64, i64, i64) -> i64 = tensor::ad_ops::nsl_tensor_compare;
             [abi_tensor] nsl_tensor_where(i64, i64, i64) -> i64 = tensor::ad_ops::nsl_tensor_where;
@@ -1151,14 +1133,6 @@ macro_rules! for_each_runtime_fn {
             [quantization] nsl_gptq_hessian_finalize() -> i64 = gptq::nsl_gptq_hessian_finalize;
             // --- M42: KV-cache compression ---
             [quantization] nsl_kv_quantize_and_store(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 = kv_compress::ffi::nsl_kv_quantize_and_store;
-            [quantization] nsl_kv_sliding_window_init(i64, i64, i64) -> i64 = kv_compress::ffi::nsl_kv_sliding_window_init;
-            [quantization] nsl_kv_sliding_window_check(i64, i64, i64, i64) -> i64 = kv_compress::ffi::nsl_kv_sliding_window_check;
-            [quantization] nsl_kv_sliding_window_destroy() -> i64 = kv_compress::ffi::nsl_kv_sliding_window_destroy;
-            [quantization] nsl_kv_h2o_init(i64, i64, i64) -> i64 = kv_compress::ffi::nsl_kv_h2o_init;
-            [quantization] nsl_kv_h2o_accumulate(i64, i64, i64) -> i64 = kv_compress::ffi::nsl_kv_h2o_accumulate;
-            [quantization] nsl_kv_h2o_check(i64, i64, i64, i64) -> i64 = kv_compress::ffi::nsl_kv_h2o_check;
-            [quantization] nsl_kv_h2o_remove_sequence(i64) -> i64 = kv_compress::ffi::nsl_kv_h2o_remove_sequence;
-            [quantization] nsl_kv_h2o_destroy() -> i64 = kv_compress::ffi::nsl_kv_h2o_destroy;
             [quantization] nsl_kv_compress_ratio(i64, i64, i64, i64) -> i64 = kv_compress::ffi::nsl_kv_compress_ratio;
 
             // ── diagnostics (was runtime_abi/diagnostics.rs) ──
@@ -1359,6 +1333,6 @@ mod tests {
     fn table_is_the_recorded_size() {
         // The count is pinned so a row dropped by a bad merge is noticed; move
         // it with a row that is deliberately added or removed.
-        assert_eq!(RUNTIME_ABI.len(), 673);
+        assert_eq!(RUNTIME_ABI.len(), 649);
     }
 }

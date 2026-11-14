@@ -60,7 +60,8 @@ impl<'a> TypeChecker<'a> {
     /// they fall back to the left operand's type as before.
     pub(crate) fn check_bitwise(&mut self, lty: &Type, rty: &Type, op: BinOp, span: Span) -> Type {
         if lty.is_tensor() && rty.is_tensor() {
-            // A sparse operand has no dense parts; it is not typed here.
+            // Every tensor-family type has dense parts; the else arm is a
+            // backstop for a type that one day does not.
             let (Some((ls, ld, ldev)), Some((rs, rd, rdev))) = (lty.as_tensor_parts(), rty.as_tensor_parts())
             else {
                 return Type::Unknown;
@@ -103,8 +104,8 @@ impl<'a> TypeChecker<'a> {
             | (Type::Float, Type::Int) => Type::Float,
             // Tensor element-wise ops (includes Param/Buffer)
             (l, r) if l.is_tensor() && r.is_tensor() => {
-                // A sparse operand has no dense parts; it is not typed here
-                // (`as_tensor_parts` is None for it, and this unwrapped).
+                // Every tensor-family type has dense parts; the else arm is
+                // a backstop for a type that one day does not.
                 let (Some((ls, ld, ldev)), Some((rs, rd, rdev))) = (l.as_tensor_parts(), r.as_tensor_parts())
                 else {
                     return Type::Unknown;

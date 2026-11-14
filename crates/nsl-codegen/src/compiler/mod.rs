@@ -519,8 +519,6 @@ pub struct FeatureConfigs {
     /// Populated during codegen; used by the CLI to finalize wrapper functions
     /// in the shared-lib object file.
     pub export_wrappers: Vec<crate::c_wrapper::ExportWrapper>,
-    /// M35: Model quantization configs — "ModelName" -> QuantConfig
-    pub quant_configs: HashMap<String, QuantConfig>,
 
     // ── Ownership & Safety (M38, M39, M40) ───────────────────────────
     /// M38b: Whether --linear-types flag is active
@@ -592,7 +590,6 @@ impl FeatureConfigs {
             fp8_compute_methods: HashSet::new(),
             export_functions: Vec::new(),
             export_wrappers: Vec::new(),
-            quant_configs: HashMap::new(),
             linear_types_enabled: options.linear_types_enabled,
             ownership_info: options.analysis.ownership_info.clone(),
             vmap_configs: HashMap::new(),
@@ -1118,13 +1115,6 @@ pub struct Compiler<'a> {
     /// Empty on the default path — only consulted when
     /// `FuncState.self_resolution` is `WeightPtrsArray`.
     pub weight_index_map: HashMap<NodeId, usize>,
-}
-
-/// Quantization configuration for a model.
-#[derive(Debug, Clone)]
-pub struct QuantConfig {
-    pub dtype: String, // "awq4", "gptq4", "gptq8"
-    pub group_size: i64,
 }
 
 /// M44: Codegen-side grammar configuration.

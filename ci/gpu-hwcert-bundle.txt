@@ -33,7 +33,6 @@
 #    `nsl_tensor_compare` dtype abort that acd2535c FIXED on 2026-08-25, nine
 #    days after the gate was parked. It joins this list once it passes on the
 #    device and is re-tiered; until then the filter would (rightly) refuse it.
-#  * SpMM (CSR/COO/BSR, which #785 moves to KIR): NO GPU gate exists at all.
 #  * `nsl_log_softmax_f32`: no public entry point, no GPU gate.
 #  * Performance: nothing here times a kernel. Benchmarks are a separate step.
 

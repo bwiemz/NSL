@@ -81,7 +81,6 @@ impl Compiler<'_> {
         let merge_block = builder.create_block();
         let incoming_variables = state.variables.clone();
         let incoming_variable_types = state.variable_types.clone();
-        let incoming_sparse_vars = state.ownership.sparse_vars.clone();
         let incoming_loader_symbols = state.dataloader_symbols.clone();
         let mut reaching_loader_sets: Vec<std::collections::HashSet<nsl_ast::Symbol>> = Vec::new();
         let incoming_loader_vars = state.cleanup.dataloader_vars.clone();
@@ -107,7 +106,6 @@ impl Compiler<'_> {
         state.current_block = Some(then_block);
         state.variables = incoming_variables.clone();
         state.variable_types = incoming_variable_types.clone();
-        state.ownership.sparse_vars = incoming_sparse_vars.clone();
         state.dataloader_symbols = incoming_loader_symbols.clone();
         state.cleanup.dataloader_vars = incoming_loader_vars.clone();
         state.cleanup.tensor_temporaries.truncate(temp_base_len);
@@ -181,7 +179,6 @@ impl Compiler<'_> {
         state.current_block = Some(else_block);
         state.variables = incoming_variables.clone();
         state.variable_types = incoming_variable_types.clone();
-        state.ownership.sparse_vars = incoming_sparse_vars.clone();
         state.dataloader_symbols = incoming_loader_symbols.clone();
         state.cleanup.dataloader_vars = incoming_loader_vars.clone();
         state.cleanup.tensor_temporaries.truncate(temp_base_len);
@@ -252,7 +249,6 @@ impl Compiler<'_> {
 
         state.variables = incoming_variables.clone();
         state.variable_types = incoming_variable_types;
-        state.ownership.sparse_vars = incoming_sparse_vars;
 
         state.dataloader_symbols = if let Some(first) = reaching_loader_sets.first().cloned() {
             reaching_loader_sets
@@ -834,23 +830,8 @@ impl Compiler<'_> {
         op: BinOp,
         left_is_tensor: bool,
         right_is_tensor: bool,
-        left_is_sparse: bool,
-        right_is_sparse: bool,
     ) -> Result<Value, CodegenError> {
         if left_is_tensor && right_is_tensor {
-            // M50: Sparse dispatch — if either operand is sparse, route to sparse ops
-            if left_is_sparse || right_is_sparse {
-                return self.compile_sparse_binary_op(
-                    builder,
-                    state,
-                    lhs,
-                    rhs,
-                    op,
-                    left_is_sparse,
-                    right_is_sparse,
-                );
-            }
-
             // M52b: Try constant folding if both operands are known weights
             if let Some(folded) = self.try_weight_fold(builder, state, lhs, rhs, op)? {
                 state.cleanup.tensor_temporaries.push(folded);
@@ -2850,176 +2831,6 @@ impl Compiler<'_> {
             &[path_val, path_len, names_list, tensors_list],
         )
     }
-
-    // ── M50: Sparse tensor operations ──────────────────────────────────
-
-    /// Compile a binary op where at least one operand is a sparse tensor.
-    /// Dispatches to sparse-specific runtime functions.
-    #[allow(clippy::too_many_arguments)]
-    fn compile_sparse_binary_op(
-        &mut self,
-        builder: &mut FunctionBuilder,
-        state: &mut FuncState,
-        lhs: Value,
-        rhs: Value,
-        op: BinOp,
-        left_is_sparse: bool,
-        right_is_sparse: bool,
-    ) -> Result<Value, CodegenError> {
-        let result = match op {
-            BinOp::MatMul => {
-                if left_is_sparse && !right_is_sparse {
-                    // Sparse @ Dense → Dense (SpMM)
-                    self.compile_call_by_name(builder, "nsl_sparse_spmm", &[lhs, rhs])?
-                } else if !left_is_sparse && right_is_sparse {
-                    // Dense @ Sparse → convert sparse to dense, then dense matmul
-                    // (SpMM expects sparse on the left; transposing CSR is non-trivial)
-                    let dense_rhs =
-                        self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[rhs])?;
-                    let flags_zero = builder.ins().iconst(cl_types::I8, 0);
-                    let result =
-                        self.compile_traced_call(builder, "nsl_tensor_matmul", &[lhs, dense_rhs, flags_zero])?;
-                    self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_rhs])?;
-                    result
-                } else {
-                    // Sparse @ Sparse → convert both to dense (rare case)
-                    let dense_lhs =
-                        self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[lhs])?;
-                    let dense_rhs =
-                        self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[rhs])?;
-                    let flags_zero = builder.ins().iconst(cl_types::I8, 0);
-                    let result = self.compile_traced_call(
-                        builder,
-                        "nsl_tensor_matmul",
-                        &[dense_lhs, dense_rhs, flags_zero],
-                    )?;
-                    self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_lhs])?;
-                    self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_rhs])?;
-                    result
-                }
-            }
-            BinOp::Add => {
-                if left_is_sparse && right_is_sparse {
-                    // Sparse + Sparse → Sparse (union merge)
-                    self.compile_call_by_name(builder, "nsl_sparse_add", &[lhs, rhs])?
-                } else {
-                    // Mixed: convert sparse to dense, then dense add
-                    let (dense_lhs, free_lhs) = if left_is_sparse {
-                        (
-                            self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[lhs])?,
-                            true,
-                        )
-                    } else {
-                        (lhs, false)
-                    };
-                    let (dense_rhs, free_rhs) = if right_is_sparse {
-                        (
-                            self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[rhs])?,
-                            true,
-                        )
-                    } else {
-                        (rhs, false)
-                    };
-                    // ELTLS (FBIP-3): nsl_tensor_add takes flags=0 here.
-                    let flags_zero = builder.ins().iconst(cl_types::I8, 0);
-                    let result = self.compile_traced_call(
-                        builder,
-                        "nsl_tensor_add",
-                        &[dense_lhs, dense_rhs, flags_zero],
-                    )?;
-                    if free_lhs {
-                        self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_lhs])?;
-                    }
-                    if free_rhs {
-                        self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_rhs])?;
-                    }
-                    result
-                }
-            }
-            BinOp::Mul => {
-                if left_is_sparse && right_is_sparse {
-                    // Sparse * Sparse → Sparse (intersection merge)
-                    self.compile_call_by_name(builder, "nsl_sparse_mul", &[lhs, rhs])?
-                } else {
-                    // Mixed: convert sparse to dense, then dense mul
-                    let (dense_lhs, free_lhs) = if left_is_sparse {
-                        (
-                            self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[lhs])?,
-                            true,
-                        )
-                    } else {
-                        (lhs, false)
-                    };
-                    let (dense_rhs, free_rhs) = if right_is_sparse {
-                        (
-                            self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[rhs])?,
-                            true,
-                        )
-                    } else {
-                        (rhs, false)
-                    };
-                    let flags_zero = builder.ins().iconst(cl_types::I8, 0);
-                    let result = self.compile_traced_call(
-                        builder,
-                        "nsl_tensor_mul",
-                        &[dense_lhs, dense_rhs, flags_zero],
-                    )?;
-                    if free_lhs {
-                        self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_lhs])?;
-                    }
-                    if free_rhs {
-                        self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_rhs])?;
-                    }
-                    result
-                }
-            }
-            // Sub, Div, etc.: convert to dense and use normal tensor ops
-            _ => {
-                let (dense_lhs, free_lhs) = if left_is_sparse {
-                    (
-                        self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[lhs])?,
-                        true,
-                    )
-                } else {
-                    (lhs, false)
-                };
-                let (dense_rhs, free_rhs) = if right_is_sparse {
-                    (
-                        self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[rhs])?,
-                        true,
-                    )
-                } else {
-                    (rhs, false)
-                };
-                let rt_name = match op {
-                    BinOp::Sub => "nsl_tensor_sub",
-                    BinOp::Div => "nsl_tensor_div",
-                    _ => {
-                        return Err(CodegenError::new(format!(
-                            "unsupported sparse tensor op: {op:?}"
-                        )))
-                    }
-                };
-                let flags_zero = builder.ins().iconst(cl_types::I8, 0);
-                let result = self.compile_traced_call(builder, rt_name, &[dense_lhs, dense_rhs, flags_zero])?;
-                if free_lhs {
-                    self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_lhs])?;
-                }
-                if free_rhs {
-                    self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_rhs])?;
-                }
-                result
-            }
-        };
-        state.cleanup.tensor_temporaries.push(result);
-        // ELTLS: compile_sparse_binary_op always produces a fresh owned
-        // tensor result (either from an nsl_sparse_* op or an
-        // nsl_tensor_* op on converted-dense inputs).
-        self.set_ownership(builder, state, result, Ownership::Owned);
-        Ok(result)
-    }
-
-    // ── M52b: Weight constant folding ────────────────────────────────
 
     /// Try to constant-fold a tensor binary op where both operands are known weights.
     /// Returns Some(Value) if folding succeeded, None to fall through to runtime.

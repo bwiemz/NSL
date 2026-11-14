@@ -153,15 +153,6 @@ impl Compiler<'_> {
                     || both_indeterminate
                     || left_is_float_literal));
         if left_is_tensor || right_is_tensor {
-            // M50: Extract sparse flags for sparse operation dispatch.
-            // Check semantic type AND runtime sparse_vars tracking (for values
-            // created by sparse_from_dense where the type checker doesn't
-            // assign Type::Sparse).
-            let left_is_sparse = matches!(left_type, Type::Sparse { .. })
-                || matches!(&left.kind, nsl_ast::expr::ExprKind::Ident(sym) if state.ownership.sparse_vars.contains(sym));
-            let right_is_sparse = matches!(right_type, Type::Sparse { .. })
-                || matches!(&right.kind, nsl_ast::expr::ExprKind::Ident(sym) if state.ownership.sparse_vars.contains(sym));
-
             // ELTLS commit 5 (Task 13): plumb the FBIP-3 flag byte from
             // `compute_fbip_flags` through `compile_tensor_binary_op` so
             // future tasks can flip on relinquish behavior without
@@ -193,8 +184,6 @@ impl Compiler<'_> {
                 op,
                 left_is_tensor,
                 right_is_tensor,
-                left_is_sparse,
-                right_is_sparse,
             )?;
 
             // Match `compute_fbip_flags`'s current policy: no operands

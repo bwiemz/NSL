@@ -29,9 +29,7 @@ pub(crate) fn field_kind_of_annotation(
     resolve: &dyn Fn(nsl_ast::Symbol) -> String,
 ) -> FieldKind {
     match &ty.kind {
-        TypeExprKind::Tensor { .. } | TypeExprKind::Param { .. } | TypeExprKind::Sparse { .. } => {
-            FieldKind::Tensor
-        }
+        TypeExprKind::Tensor { .. } | TypeExprKind::Param { .. } => FieldKind::Tensor,
         TypeExprKind::Buffer { .. } => FieldKind::Buffer,
         TypeExprKind::FixedArray { .. } => FieldKind::Nested,
         TypeExprKind::Borrow(inner) => field_kind_of_annotation(inner, resolve),
@@ -61,9 +59,7 @@ pub(crate) fn field_kind_of_annotation(
 /// [`field_kind_of_annotation`] for a type the checker already resolved.
 pub(crate) fn field_kind_of_type(ty: &Type) -> FieldKind {
     match ty {
-        Type::Tensor { .. } | Type::Param { .. } | Type::Sparse { .. } | Type::QuantizedTensor => {
-            FieldKind::Tensor
-        }
+        Type::Tensor { .. } | Type::Param { .. } | Type::QuantizedTensor => FieldKind::Tensor,
         Type::Buffer { .. } => FieldKind::Buffer,
         Type::Model { .. } | Type::Struct { .. } | Type::FixedModelArray { .. } => FieldKind::Nested,
         Type::Borrow(inner) | Type::Optional(inner) => field_kind_of_type(inner),
@@ -432,57 +428,6 @@ impl Compiler<'_> {
 
     pub fn collect_models(&mut self, stmts: &[Stmt]) -> Result<(), CodegenError> {
         for stmt in stmts {
-            // M35: Scan for top-level @quantize(dtype=..., group_size=...) decorators on model blocks.
-            // Syntax: `@quantize(dtype="awq4", group_size=128)\nmodel MyModel: ...`
-            if let StmtKind::Decorated {
-                decorators,
-                stmt: inner,
-            } = &stmt.kind
-                && let StmtKind::ModelDef(md) = &inner.kind
-            {
-                let model_name = self.resolve_sym(md.name).to_string();
-                for deco in decorators {
-                    if deco.name.len() == 1 && self.resolve_sym(deco.name[0]) == "quantize" {
-                        let mut dtype = "awq4".to_string();
-                        let mut group_size: i64 = 128;
-                        if let Some(ref args) = deco.args {
-                            for arg in args {
-                                if let Some(ref name_sym) = arg.name {
-                                    let aname = self.resolve_sym(*name_sym).to_string();
-                                    match aname.as_str() {
-                                        "dtype" => {
-                                            if let nsl_ast::expr::ExprKind::StringLiteral(s) =
-                                                &arg.value.kind
-                                            {
-                                                dtype = s.clone();
-                                            }
-                                        }
-                                        "group_size" => {
-                                            if let nsl_ast::expr::ExprKind::IntLiteral(n) =
-                                                &arg.value.kind
-                                            {
-                                                group_size = *n;
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                        }
-                        // Say what the decorator does, which is not what its
-                        // name says: no weight of the model is quantized.
-                        nsl_log::nsl_log!(INFO, "nsl",
-                            "[nsl] @quantize(dtype=\"{}\") on model '{}': marked for calibration statistics only; the model is not quantized",
-                            dtype, model_name
-                        );
-                        self.features.quant_configs.insert(
-                            model_name.clone(),
-                            super::QuantConfig { dtype, group_size },
-                        );
-                    }
-                }
-            }
-
             let model_def = match &stmt.kind {
                 StmtKind::ModelDef(md) => Some(md),
                 StmtKind::Decorated { stmt: inner, .. } => match &inner.kind {

@@ -30,7 +30,6 @@ pub mod resolve;
 pub mod scope;
 pub mod shape_algebra;
 pub mod shapes;
-pub mod sparse_layout;
 pub mod speculative;
 pub mod target;
 pub mod train_config;

@@ -5,14 +5,16 @@
 //! does not call any of it: K and V are stored as written, and the
 //! `@kv_compress` decorator is refused by the checker.
 //!
-//! - Quantizers for one K or V block (INT8 per head or per token, INT4 per
-//!   group, FP8) and their inverses
-//! - Sliding window with attention sinks — which blocks fall out of a window
-//! - H2O (Heavy Hitter Oracle) — attention-score-based block eviction
+//! What is here: quantizers for one K or V block (INT8 per head or per
+//! token, INT4 per group, FP8) and their inverses.
+//!
+//! Two eviction managers lived here too (a sliding window with attention
+//! sinks, and H2O, attention-score-based eviction). Neither had a caller,
+//! and H2O's rule evicted a block only when every token in it was among
+//! the lowest-scoring, which scattered scores almost never produce. Both
+//! were deleted with their FFI.
 
 pub mod quantize;
-pub mod sliding_window;
-pub mod h2o;
 pub mod ffi;
 
 /// Quantization scheme for KV-cache storage.
@@ -59,29 +61,6 @@ impl KvQuantScheme {
     }
 }
 
-
-/// Sliding window configuration.
-#[derive(Debug, Clone)]
-pub struct SlidingWindowConfig {
-    pub window_size: usize,
-    pub num_sinks: usize,
-}
-
-/// H2O (Heavy Hitter Oracle) configuration.
-#[derive(Debug, Clone)]
-pub struct H2OConfig {
-    pub budget: usize,
-    pub num_sinks: usize,
-}
-
-/// Per-layer compression policy, resolved from @kv_compress decorators.
-#[derive(Debug, Clone, Default)]
-pub struct LayerCompressionPolicy {
-    pub quant_scheme: KvQuantScheme,
-    pub window: Option<SlidingWindowConfig>,
-    pub h2o: Option<H2OConfig>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,13 +81,5 @@ mod tests {
         assert_eq!(KvQuantScheme::from_i64(3), KvQuantScheme::Int4PerGroup);
         assert_eq!(KvQuantScheme::from_i64(4), KvQuantScheme::Fp8);
         assert_eq!(KvQuantScheme::from_i64(99), KvQuantScheme::None);
-    }
-
-    #[test]
-    fn layer_policy_default_is_none() {
-        let p = LayerCompressionPolicy::default();
-        assert_eq!(p.quant_scheme, KvQuantScheme::None);
-        assert!(p.window.is_none());
-        assert!(p.h2o.is_none());
     }
 }

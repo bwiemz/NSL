@@ -203,9 +203,7 @@ Reduces KV-cache memory footprint:
 | INT4 per-group | 4-bit quantization with group scaling |
 | FP8 | 8-bit floating point (E4M3) |
 
-Additional compression strategies:
-- **H2O (Heavy Hitter Oracle)**: Evicts KV entries with lowest cumulative attention scores, preserving "sink tokens" (first few tokens that receive disproportionate attention)
-- **Sliding window**: Only retains recent KV entries within a fixed window size
+These are block quantizers in the runtime library. The paged KV cache stores K and V uncompressed and calls none of them, and `@kv_compress` is a refused decorator. The H2O and sliding-window eviction managers that used to be listed here had no caller and were removed.
 
 ---
 

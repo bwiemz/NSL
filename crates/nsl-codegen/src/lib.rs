@@ -23,7 +23,7 @@
 //! - [`analysis`] — cost model, autotuning, fusion, memory planning,
 //!   FlashAttention codegen, calibration.
 //! - [`experimental`] — research subsystems (CEP, CFIE, CSHA, WGGO, WRGA,
-//!   FASE, sparse, speculative, multimodal). These APIs
+//!   FASE, speculative, multimodal). These APIs
 //!   are **not stable** and may change or be removed between releases.
 //!
 //! These facades re-export the same modules that remain available at the crate
@@ -235,7 +235,6 @@ pub mod fase;
 pub mod fase_codegen_table;
 pub mod fase_optimizer;
 pub mod multimodal;
-pub mod sparse;
 pub mod speculative;
 pub mod wggo;
 pub mod wggo_apply;
@@ -343,7 +342,7 @@ pub mod experimental {
         cfie_kv_quant, cfie_persistent, cfie_speculative, csha, csha_apply,
         csha_boundary, csha_patterns, csha_pipeline, csha_specialize, fase,
         fase_codegen_table, fase_optimizer, multimodal,
-        sparse, speculative, wggo, wggo_apply,
+        speculative, wggo, wggo_apply,
         wggo_conflicts, wggo_cost, wggo_dp, wggo_gradient_scorer, wggo_graph,
         wggo_ilp, wggo_overrides, wggo_prune, wggo_schedule, wggo_weight_analysis,
         wggo_weight_analysis_cache, wggo_weight_analysis_nslweights, wrga,
@@ -2304,10 +2303,9 @@ impl Default for CompileOptions {
 ///
 /// The NSL source no longer needs a `train` block for calibration to fire.
 /// Calibration fires whenever `calibration.data.is_some()`, driven by the
-/// wrapper-level block (see `#134 (c-i)`).  Models decorated with
-/// `@quantize(dtype="awq4")` will have their AWQ projections discovered via
-/// `discover_awq_projections`; WGGO gradient targets are wired via
-/// `WggoGradientHook` when `calibration.grad_retention` is populated.
+/// wrapper-level block (see `#134 (c-i)`).  WGGO gradient targets are wired
+/// via `WggoGradientHook` when `calibration.grad_retention` is populated;
+/// that is the only hook this entry point registers.
 pub fn compile_and_calibrate(
     source_path: &std::path::Path,
     data_path: &std::path::Path,
@@ -2417,32 +2415,16 @@ pub fn compile_and_calibrate(
         // pre-pass and the in-place planner with DIFFERENT importance, so the
         // pre-plan's graph fingerprint would never match and it would be
         // rejected. Firing here (right after wrga_prescan, before any kernel
-        // synthesis) keeps both read sites consistent. discover_awq_projections
-        // reads only collect_models-era state, which wrga_prescan has already
-        // finalized, so nothing the harness needs is produced by the synthesis
-        // calls now sequenced below it. Spec §4.1's "after compile_main
+        // synthesis) keeps both read sites consistent. Nothing the harness
+        // needs is produced by the synthesis calls now sequenced below it. Spec §4.1's "after compile_main
         // returns" wording was over-specified; the architectural goal
         // "calibration runs around the compiled code" (§4.3) is preserved.
         if let Some(data_path) = compiler.compile_options.calibration.data.clone() {
             let mut registry = crate::calibration::registry::HookRegistry::new();
-            let awq_projections = compiler.discover_awq_projections().unwrap_or_default();
-            if let Some(pre_scan) = compiler.compile_options.calibration.retention.as_ref() {
-                crate::calibration::discovery::check_discovery_agreement(
-                    pre_scan,
-                    &awq_projections,
-                )
-                .map_err(|err| CodegenError::new(err.to_string()))?;
-            }
-            if !awq_projections.is_empty() {
-                let proj_refs: Vec<crate::calibration::ProjectionRef> = awq_projections
-                    .iter()
-                    .map(|dp| dp.projection.clone())
-                    .collect();
-                registry.register(Box::new(
-                    crate::calibration::awq_hook::AwqCalibrationHook::new(proj_refs),
-                ));
-                compiler.compile_options.calibration.retention = Some(awq_projections);
-            }
+            // The only hook is the WGGO gradient hook. An AWQ hook used
+            // to be registered here for `@quantize(dtype="awq4")` models; it
+            // recorded activation maxima that no quantizer read, and it is
+            // deleted with the decorator's refusal.
             if let Some(targets) = compiler.compile_options.calibration.grad_retention.as_ref()
                 && !targets.is_empty()
             {
@@ -2527,9 +2509,8 @@ pub fn compile_and_calibrate(
     sidecar.ok_or_else(|| {
         CodegenError::new(
             "compile_and_calibrate: calibration harness ran but produced no sidecar. \
-             Ensure at least one @quantize(dtype=\"awq4\")-decorated model is present \
-             (for AWQ projections) and/or @wggo_target decorators (for WGGO gradients), \
-             and that the registered hook set is non-empty."
+             Ensure at least one @wggo_target-decorated forward is reachable \
+             (the WGGO gradient hook is the only calibration hook)."
                 .to_string(),
         )
     })

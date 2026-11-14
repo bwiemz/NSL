@@ -19,9 +19,13 @@
 //! `default: awq4` is refused by the checker.
 //!
 //! The second half of the file is unrelated to quantizing: it reads and
-//! writes the calibration sidecar. The calibration pass records, for each
-//! linear projection of a model marked `@quantize(dtype="awq4")`, the
-//! largest |activation| per input channel. No quantizer reads those values.
+//! writes the calibration sidecar for the compiler's calibration harness.
+//! The writer can store per-channel activation maxima for a set of
+//! projections under `hooks.awq_activation_scales`. The compiler hook that
+//! asked for them (for `@quantize(dtype="awq4")` models) is deleted and the
+//! decorator refused, so only tests hand the writer such entries, and
+//! nothing reads them back: `awq_scales_from_sidecar_json_path` has no
+//! caller.
 
 use std::sync::atomic::AtomicI64;
 use std::ffi::c_void;
@@ -596,7 +600,7 @@ mod awq_sidecar_reader_tests {
 }
 
 // ---------------------------------------------------------------------------
-// nsl_awq_write_sidecar — subprocess-side serialization FFI
+// nsl_calib_write_sidecar — subprocess-side serialization FFI
 // ---------------------------------------------------------------------------
 
 #[repr(C)]
@@ -814,28 +818,6 @@ pub extern "C" fn nsl_calib_write_sidecar(
     }
 }
 
-/// Deprecated thin shim retained for the rename transition. Forwards to
-/// `nsl_calib_write_sidecar` with empty WGGO arrays. Scheduled for
-/// deletion in milestone N+1; deletion gated by workspace-wide grep
-/// confirming no callers remain.
-#[unsafe(no_mangle)]
-#[deprecated(note = "use nsl_calib_write_sidecar")]
-pub extern "C" fn nsl_awq_write_sidecar(
-    sidecar_path_ptr: *const u8,
-    sidecar_path_len: usize,
-    projections_ptr: *const AwqProjectionDescriptor,
-    projections_len: usize,
-) -> i32 {
-    nsl_calib_write_sidecar(
-        sidecar_path_ptr,
-        sidecar_path_len,
-        projections_ptr,
-        projections_len,
-        std::ptr::null(),
-        0,
-    )
-}
-
 // ---------------------------------------------------------------------------
 // Atomic file write — write-temp-then-rename + fsync.
 // Spec §6.4 of WGGO Phase 2 merge-gate completion design.
@@ -869,7 +851,6 @@ mod write_sidecar_tests {
     use tempfile::NamedTempFile;
 
     #[test]
-    #[allow(deprecated)] // Exercises the shim during rename transition.
     fn writes_sidecar_with_two_projections() {
         let tmp = NamedTempFile::new().unwrap();
         let path_str = tmp.path().to_string_lossy().to_string();
@@ -896,9 +877,10 @@ mod write_sidecar_tests {
             },
         ];
 
-        let rc = nsl_awq_write_sidecar(
+        let rc = nsl_calib_write_sidecar(
             path_str.as_ptr(), path_str.len(),
             descs.as_ptr(), descs.len(),
+            std::ptr::null(), 0,
         );
         assert_eq!(rc, 0);
 
@@ -908,11 +890,11 @@ mod write_sidecar_tests {
     }
 
     #[test]
-    #[allow(deprecated)] // Exercises the shim during rename transition.
     fn returns_1_on_invalid_utf8_path() {
         let bad: [u8; 4] = [0xff, 0xfe, 0xfd, 0xfc];
-        let rc = nsl_awq_write_sidecar(
+        let rc = nsl_calib_write_sidecar(
             bad.as_ptr(), bad.len(),
+            std::ptr::null(), 0,
             std::ptr::null(), 0,
         );
         assert_eq!(rc, 1);

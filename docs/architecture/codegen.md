@@ -62,7 +62,7 @@ later emission consults.
    │  intern_string · collect_strings · collect_enums · collect_structs
    │  collect_models
    │  cpdt_decorator / cpdt_expert_prune / cpdt_moe_capacity (metadata-only passes)
-   │  populate_calibration_retention_from_ast_if_unset (AWQ + WGGO pre-scan)
+   │  populate_calibration_retention_from_ast_if_unset (WGGO pre-scan)
    │  emit_retention_arena · emit_grad_retention_arena
    ├── DECLARE ─────────────────────────┼──────────────────── src/compiler/declaration.rs
    │  declare_runtime_functions   ← the nsl-abi table (nsl_abi::for_each_runtime_fn!)
@@ -112,7 +112,7 @@ is the shortest readable copy of the sequence.
   `invoke_csha_if_enabled` — each builds the pass input from the state
   stashed on the `Compiler`, runs the pass, records its disposition and
   publishes the product on the bus) live in `src/stmt_pass_bridges.rs`;
-  the `quant` block lowering and the AWQ projection discovery in
+  the `quant` block lowering in
   `src/stmt_quant.rs`, the `distill` block (a synthetic train block with
   the teacher frozen) in `src/stmt_distill.rs`, and the `@inspect` hook
   emission in `src/stmt_inspect.rs`. `stmt.rs` is the file that also owns
@@ -354,8 +354,8 @@ The struct has 29 `pub` fields today. The decomposition into cohesive
 sub-structs that already exists (grep `Options {` in `src/lib.rs`):
 `WggoOptions` (`opts.wggo`), `CfieOptions` (`opts.cfie`), `CshaOptions`
 (`opts.csha`), `CpdtOptions` (`opts.cpdt`), `CalibrationOptions` (`opts.calibration`:
-data path, mode, sample/batch/timeout budgets, the AWQ `retention` and
-WGGO `grad_retention` plans, `batch_seq`, the subprocess `compile_bundle`
+data path, mode, sample/batch/timeout budgets, the forward `retention`
+plan a harness caller hands in and the WGGO `grad_retention` plan, `batch_seq`, the subprocess `compile_bundle`
 and the `sidecar` the harness writes back), `DevToolsOptions`
 (`opts.dev_tools`: the kernel profiler's `profile_kernels` /
 `manifest_output_path` / `profile_source_text` / `profile_source_file_name`,
@@ -501,9 +501,7 @@ TIER_B_SEQ_LEN_FLOOR}` (re-exported by `src/pca_tier_b.rs`),
 `src/calibration/binary_codegen.rs`), `nsl_runtime::tensor::DTYPE_*`
 (compile-time asserts in `src/cpdt_precision_exec.rs`),
 `nsl_runtime::c_api::{NSL_ABI_VERSION_MAJOR, NSL_ABI_VERSION_MINOR,
-nsl_abi_version}` (`src/c_header.rs`), `nsl_abi::wire::awq_scales::AwqScales`
-(`src/stmt_quant.rs`; the AWQ blob's one encoder and decoder, shared with
-the runtime's sidecar writer), `nsl_abi::wire::calibration_bin` (the `.bin`
+nsl_abi_version}` (`src/c_header.rs`), `nsl_abi::wire::calibration_bin` (the `.bin`
 corpus header, read by `src/calibration/data_shape.rs` for the batch
 geometry at compile time and by the runtime's loader), and `nsl_runtime::cuda_device_identity` /
 `cuda_device_name` (`src/gpu_specs.rs`, `src/autotune.rs`; the identity
@@ -841,13 +839,18 @@ fixtures `tests/train_clif/*.nsl`.
   `measure_variants`, `find_best_variant`, `find_best_variant_cost_model`,
   `AutotuneCacheRecord` keyed by `DeviceIdentity` under `.nsl-cache/autotune/`);
   `crates/nsl-codegen/tests/autotune_cache_identity.rs`, `crates/nsl-codegen/tests/autotune_frozen_db.rs`.
-- **Calibration** — `src/calibration/` (compile-time AWQ / WGGO-gradient
-  calibration: `discovery.rs`, `hooks.rs`, `awq_hook.rs`,
+- **Calibration** — `src/calibration/` (compile-time WGGO-gradient
+  calibration: `discovery.rs`, `hooks.rs`,
   `wggo_gradient_hook.rs`, `retention_pass.rs`, `binary_codegen.rs` emits a
   `calibration_main()` binary, `subprocess.rs` runs it, `sidecar.rs`
-  carries results back; the AWQ activation-scales blob inside it is
-  `nsl_abi::wire::awq_scales`). Entry: `compile_and_calibrate`
-  (`src/lib.rs`); tests `tests/calibration_*.rs`, `tests/awq_*.rs`.
+  carries results back). Entry: `compile_and_calibrate`
+  (`src/lib.rs`), which no `nsl` command calls; tests
+  `tests/calibration_*.rs`, `tests/wggo_*.rs`,
+  `tests/awq_real_subprocess_link.rs`. The AWQ activation-statistics hook
+  that used to sit here (`awq_hook.rs`, triggered by
+  `@quantize(dtype="awq4")`) is deleted and the decorator refused; the
+  scaffolding still knows how to reduce a forward activation to a
+  per-channel maximum for a hook that asks, and no hook does.
 - **Weight-aware compilation** — `src/weight_aware.rs` (M52 constant folding
   from `--weights`), `src/ctor_fold.rs`, `src/lm_head_inference.rs`
   (`--fuse-lm-head`), `src/param_roles.rs`, `src/parameter_plan.rs`.
@@ -930,7 +933,7 @@ Cargo feature at its `stmt.rs` entry), **CEP** `src/cep.rs`, **CFIE**
 **CPKD** `src/cpkd.rs`, **CCR** `src/ccr.rs`, **CSLA** `src/layerwise.rs` +
 `src/stmt_csla.rs` (`docs/research/CSLA-compiler-scheduled-layerwise-accumulation.md`),
 **PCA** `src/pca_detect.rs` (+ `pca_tier_b.rs`, `pca_per_doc.rs`, …),
-**FASE** `src/fase.rs`, **sparse** `src/sparse.rs`, **speculative** `src/speculative.rs`, **multimodal**
+**FASE** `src/fase.rs`, **speculative** `src/speculative.rs`, **multimodal**
 `src/multimodal.rs`, **BitNet** `src/bitnet/`. Their APIs, flags and on-disk
 formats are not stable; see `STATUS.md` ("Experimental" and "Opting out of
 experimental subsystems") for the tier contract and `docs/wiki/Optimization-Passes.md`
@@ -1017,7 +1020,7 @@ should fail before review.
 prefix the largest families are `tier_*` (45, FA-v2 Tier B1/B2 kernels),
 `csha_*` (34), `pca_*` (29), `fused_*` (25, fused linear-CE and LM head),
 `wggo_*` (14), `cpdt_*` (13), `bitnet_*` (11), `wrga_*` (10), `cfie_*` (10),
-`pass_*` (8), `fase_*` (8), `fa_*` (6), `sinks_*` (5), `awq_*` (5),
+`pass_*` (8), `fase_*` (8), `fa_*` (6), `sinks_*` (5),
 `profiling_*`/`profile_*` (8), `bench_*` (4), plus the ABI/export,
 calibration, autotune and drift-gate singles. Functionally they fall into:
 

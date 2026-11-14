@@ -328,7 +328,8 @@ Some things worth knowing about `block.rs`:
   `quant static Name from Source:` and its `dtype`/`granularity`/`exclude`/
   `calibration` entries into typed fields at parse time. `nsl-semantic`
   (`quant_requests.rs`) refuses `calibration` and the `awq4`/`gptq4`/`gptq8`
-  dtypes, which codegen and the runtime never honoured.
+  dtypes, which codegen and the runtime never honoured, and every form of
+  the `@quantize` decorator.
 - `WrgaBlock` / `WrgaMode` are **not produced by the parser**. They are the
   validated form of a `@wrga(...)` decorator that `nsl-semantic` and
   `nsl-codegen` share; the module comment explains why they live here.
