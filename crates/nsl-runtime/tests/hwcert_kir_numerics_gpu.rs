@@ -43,9 +43,9 @@ use std::sync::Mutex;
 
 use nsl_runtime::list::{nsl_list_free, nsl_list_new, nsl_list_push};
 use nsl_runtime::tensor::{
-    nsl_tensor_data_ptr, nsl_tensor_dropout, nsl_tensor_free, nsl_tensor_from_static,
-    nsl_tensor_get_dtype, nsl_tensor_layernorm, nsl_tensor_rmsnorm, nsl_tensor_softmax,
-    nsl_tensor_to_device,
+    nsl_tensor_clamp, nsl_tensor_data_ptr, nsl_tensor_dropout, nsl_tensor_free,
+    nsl_tensor_from_static, nsl_tensor_get_dtype, nsl_tensor_layernorm, nsl_tensor_relu,
+    nsl_tensor_rmsnorm, nsl_tensor_softmax, nsl_tensor_to_device,
 };
 use nsl_runtime::{test_kernel_launch_census_arm, test_kernel_launch_count};
 
@@ -420,6 +420,68 @@ fn rmsnorm_forward_kir_kernel_matches_an_independent_f64_rmsnorm_on_silicon() {
          some other path, so the numerics above certified nothing about the kernel"
     );
     println!("rmsnorm forward: {launched} launch(es) certified, worst relative error {worst:.3e}");
+}
+
+// ─────────────────────────── max / min on signed zeros ───────────────────────────
+
+/// How `max.f32` and `min.f32` treat the two zeros, measured.
+///
+/// The PTX interpreter that the kernel equivalence gates run on has to model
+/// this, and neither Rust (`f32::max` leaves the sign of `max(-0.0, +0.0)`
+/// unspecified, and an optimized and an unoptimized build of the same test
+/// disagreed) nor the instruction's description settles it. The hardware
+/// does: `-0` orders below `+0`. `nsl_relu_f32` is `max(x, +0)`, so
+/// `relu(-0)` is `+0`; `nsl_clamp_f32` is `min(max(x, lo), hi)`, so clamping
+/// `+0` to `[-1, -0]` is `-0`. The interpreter's `ptx_max_f32` /
+/// `ptx_min_f32` (`nsl-codegen/tests/support/cta_ptx_interp.rs`) state the
+/// same rule; this gate is what holds them to the silicon.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn max_and_min_order_negative_zero_below_positive_zero_on_silicon() {
+    let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    if !cuda_available() {
+        eprintln!("skipping: no usable CUDA GPU");
+        return;
+    }
+    test_kernel_launch_census_arm();
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+    const NEG_ZERO: u32 = 0x8000_0000;
+    const POS_ZERO: u32 = 0x0000_0000;
+
+    // relu: max(x, +0).
+    let x = [-0.0f32, 0.0, -1.5, 2.5, f32::NAN, f32::NEG_INFINITY, -f32::MIN_POSITIVE];
+    let t = upload(&[x.len()], &x);
+    let y_t = nsl_tensor_relu(t);
+    let y = bits(&download(y_t, x.len()));
+    println!("relu({x:?}) = {y:#010x?}");
+    assert_eq!(y[0], POS_ZERO, "max(-0, +0) on silicon is {:#010x}", y[0]);
+    assert_eq!(y[1], POS_ZERO, "max(+0, +0)");
+    assert_eq!(y[2], POS_ZERO, "max(-1.5, +0)");
+    assert_eq!(y[3], 2.5f32.to_bits(), "max(2.5, +0)");
+    assert_eq!(y[4], POS_ZERO, "max(NaN, +0) is the non-NaN operand");
+    assert_eq!(y[5], POS_ZERO, "max(-inf, +0)");
+    assert_eq!(y[6], POS_ZERO, "max(-tiny, +0)");
+    nsl_tensor_free(y_t);
+    nsl_tensor_free(t);
+
+    // clamp to [-1, -0]: min(max(x, -1), -0).
+    let x = [0.0f32, -0.0, 3.0, -0.25, -7.0];
+    let t = upload(&[x.len()], &x);
+    let y_t = nsl_tensor_clamp(t, -1.0, -0.0);
+    let y = bits(&download(y_t, x.len()));
+    println!("clamp({x:?}, -1, -0) = {y:#010x?}");
+    assert_eq!(y[0], NEG_ZERO, "min(+0, -0) on silicon is {:#010x}", y[0]);
+    assert_eq!(y[1], NEG_ZERO, "min(-0, -0)");
+    assert_eq!(y[2], NEG_ZERO, "min(3, -0)");
+    assert_eq!(y[3], (-0.25f32).to_bits(), "min(-0.25, -0)");
+    assert_eq!(y[4], (-1.0f32).to_bits(), "max(-7, -1)");
+    nsl_tensor_free(y_t);
+    nsl_tensor_free(t);
+
+    for kernel in ["nsl_relu_f32", "nsl_clamp_f32"] {
+        let n = test_kernel_launch_count(kernel);
+        assert!(n >= 1, "{kernel} did not launch ({n}): the values above came from another path");
+    }
 }
 
 // ───────────────────────────────── dropout ─────────────────────────────────

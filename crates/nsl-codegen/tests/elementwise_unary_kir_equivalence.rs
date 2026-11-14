@@ -91,7 +91,19 @@ fn model(op: UnaryOp, x: f32) -> f32 {
     use UnaryOp::*;
     match op {
         Neg => f32::from_bits(x.to_bits() ^ 0x8000_0000),
-        Relu => x.max(0.0),
+        // `max.f32(x, 0)` on the hardware: x when it is above zero, and
+        // `+0` otherwise, for a negative x, for a NaN (the non-NaN operand
+        // wins) and for `-0` (which orders below `+0`). Written out because
+        // `x.max(0.0)` leaves the sign of `max(-0.0, 0.0)` to the compiler:
+        // an optimized build of this test answered `+0` here while the
+        // interpreter's own `f32::max` answered `-0`.
+        Relu => {
+            if x > 0.0 {
+                x
+            } else {
+                0.0
+            }
+        }
         Exp => (x * LOG2_E).exp2(),
         Log => x.log2() * LN_2,
         Sqrt => x.sqrt(),
