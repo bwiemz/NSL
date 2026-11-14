@@ -285,9 +285,10 @@ proposal's own figures.
 How it is switched on:
 
 - CPDT: `--cpdt [full|zero_only|off]` with `--cpdt-num-gpus N` (required) and
-  optionally `--cpdt-intra-bw`, `--cpdt-inter-bw`, `--cpdt-report` and
-  `-w/--weights`; or `@cpdt(...)` on a train block. The cargo feature
-  `experimental-cpdt` is on by default.
+  optionally `--cpdt-intra-bw`, `--cpdt-inter-bw`, `--cpdt-memory-budget`,
+  `--cpdt-prune-experts`, `--cpdt-report` and `-w/--weights`; or
+  `@cpdt(...)` on a train block. The cargo feature `experimental-cpdt` is on
+  by default.
 - ZeRO itself is separate: `--zero-stage 1|2|3`, `--zero-elementwise`,
   `--devices N`, `--collectives sim|sim-gpu|nccl`.
 - Reduced-precision moments are also reached through
@@ -297,9 +298,13 @@ Component by component:
 
 - **ZeRO configuration search (§2) — report-only.**
   `crates/nsl-codegen/src/cpdt_zero.rs` is a cost model whose result goes only
-  to `CpdtPlan::render_report`. The stage that code generation uses comes
-  from `--zero-stage`. Neither side is right: the planner is advisory, and its
-  cost model repeats E4.
+  to `CpdtPlan::render_report`, which labels it as a recommendation that is
+  not applied. The stage that code generation uses comes from `--zero-stage`.
+  The cost model no longer repeats E4: plain data-parallel training is
+  charged its all-reduce, sharded parameters two all-gathers and a
+  reduce-scatter per micro-batch, every collective a fixed latency, and no
+  communication is treated as hidden under compute. The latency (50 μs per
+  collective) is an assumed figure, not a measurement.
 - **Per-layer overlapped communication schedule (§2.1) — report-only.**
   `crates/nsl-codegen/src/cpdt_comm.rs` builds a list, and its header says
   "ADVISORY / COST-MODEL ARTIFACT — NOT lowered". The `nsl_cpdt_*` functions
@@ -317,8 +322,9 @@ Component by component:
 - **Sensitivity score (§3.1) — partial.**
   `crates/nsl-codegen/src/cpdt_sensitivity.rs` computes rms(weights) ×
   position / element count. The spectral factor is absent; embedding, norm,
-  first and last layers are forced to High. Neither side is validated. In
-  effect the tier is a function of tensor size and position.
+  first and last layers are forced to High, where "last" is the model's own
+  last block. Neither side is validated. In effect the tier is a function of
+  tensor size and position.
 - **Precision tiers to storage (§3.1) — partial, and deliberately different.**
   `first_moment_storage` and `second_moment_storage` in
   `crates/nsl-codegen/src/cpdt_precision_exec.rs` store `m` as BF16 for any
@@ -336,9 +342,10 @@ Component by component:
   structurally fine.
 - **INT8 blockwise quantization (§3.2) — not wired.**
   `crates/nsl-runtime/src/tensor/int8_blockwise.rs` is a linear absmax code
-  with block size 64, CPU only. The proposal's "blockwise dynamic
-  quantization", a non-linear code, is the right one; a linear INT8 code is
-  unsound for `v`.
+  with block size 64, CPU only, whose stochastic rounding is seeded by the
+  caller. The proposal's "blockwise dynamic quantization", a non-linear
+  code, is the right one; a linear INT8 code is unsound for `v`, and the
+  module says so.
 - **Stochastic rounding for embeddings (§3.3) — inert.** The flag is set
   only on embeddings, which are forced to FP32, and acts only on INT8, which
   is never emitted.
@@ -348,10 +355,12 @@ Component by component:
   `--cpdt full` and never lowers it, but the roofline slack it uses is a
   constant 0.0, so that value is 1.0 for every layer. Neither side is right
   (E5).
-- **Dead-expert pruning (§4.2) — implemented.**
-  `crates/nsl-codegen/src/cpdt_expert_prune.rs` really slices the router and
-  expert weights where the column norm is below 0.01. The mechanism is real;
-  the criterion is wrong (E6).
+- **Dead-expert pruning (§4.2) — implemented, opt-in.**
+  `crates/nsl-codegen/src/cpdt_expert_prune.rs` slices the router and
+  expert weights where the column norm is below 0.01, but only under
+  `--cpdt-prune-experts`; without the flag it reports the experts the
+  criterion picks out and leaves them. The mechanism is real; the criterion
+  is wrong (E6), which is why it is no longer applied unasked.
 - **Expert placement (§4.3) and joint solver (§5) — present, never run on
   MoE.** `crates/nsl-codegen/src/cpdt_expert.rs` and
   `crates/nsl-codegen/src/cpdt_joint.rs` exist, but `invoke_cpdt_if_enabled`
@@ -359,8 +368,9 @@ Component by component:
   and no router. The joint loop recomputes the same deterministic ZeRO
   search and stops at iteration 2.
 - **MoE training (assumed throughout §4) — absent.** Dispatch is CPU,
-  forward-only, and has no autodiff rule. `aux_loss_coeff` is parsed, but
-  `nsl_moe_aux_loss` is never emitted. MoE is inference-only.
+  forward-only, and has no autodiff rule. `@moe(aux_loss_coeff=…)` with a
+  non-zero value is refused at compile time, and `nsl_moe_aux_loss` is never
+  emitted. MoE is inference-only.
 - **`@cpdt(target_memory, precision)` (§6.1) — refused** with a diagnostic
   ("has no consumer"), which is the correct behaviour.
 
@@ -376,7 +386,8 @@ No shipped model uses CPDT. Defects found in this code are listed in Part 5.
    `m` (about 8×), and the sensitivity score with a measured or size rule.
 3. Rewrite the ZeRO cost model: charge DDP its all-reduce, add per-collective
    latency, and give no overlap credit while the runtime is synchronous.
-4. Have the planner set the ZeRO stage, or label its report "not applied".
+4. Have the planner set the ZeRO stage; its report is now labelled "not
+   applied".
 5. Make MoE trainable and dropless before planning capacity or placement.
 6. Restate the novelty claims against DeepCompile and AsyncHZP.
 
@@ -415,89 +426,91 @@ is as of 2026-11-13.
   constant 0.0. The pass may now only raise a layer's factor
   (`apply_capacity_overrides` in
   `crates/nsl-codegen/src/cpdt_moe_capacity.rs`).
+- Under `--cpdt full` with a weights file, an MoE expert whose router column
+  has norm below 0.01 was sliced out of the router and expert weights. Such
+  an expert can be the one selected most often (E6), so pruning it changes
+  the model's output. The pass now only reports those experts; slicing them
+  needs `--cpdt-prune-experts` (`run_moe_prune_pass` in
+  `crates/nsl-codegen/src/cpdt_expert_prune.rs`).
+- When an MoE expert was over capacity, assignments were dropped in token
+  order, so later positions lost first, and a token that kept only one of
+  its experts kept that expert's weight without renormalisation. An expert
+  now keeps the assignments with the highest routing probability, and each
+  token's surviving weights are renormalised to sum to one (`route_topk` in
+  `crates/nsl-runtime/src/moe/router.rs`).
+- The precision planner assumed every model has 8 layers: on a 12-block
+  model block 7 was taken for the last layer and kept FP32, and block 11,
+  the real last layer, was reduced. The count now comes from the train
+  block's own parameters (`train_block_layer_count` in
+  `crates/nsl-codegen/src/stmt_pass_bridges.rs`), and a plan that reduces no
+  moment no longer reports precision as active.
+- `@moe(aux_loss_coeff=…)` was accepted and had no effect. A non-zero
+  coefficient is now a compile-time error that says no auxiliary loss is
+  applied (`validate_moe_decorator` in `crates/nsl-semantic/src/moe.rs`).
+  MoE dispatch still has no backward rule (Part 3).
+- With `--cpdt full --weights`, a parameter whose name in the weights file
+  carries a leading prefix, as in `model.blocks.0.w`, was not matched to the
+  train block's parameter and silently kept FP32 moments. Such a name now
+  joins when it is the only one ending in the parameter's path, and the
+  weights-file tensors that join nothing are listed in a warning
+  (`precision_for_path` and `unjoined_plan_names` in
+  `crates/nsl-codegen/src/cpdt_precision_exec.rs`).
+- An inference-only MoE program compiled with `--cpdt full` failed with
+  "--cpdt: owner CPDT recorded no disposition", although the MoE passes had
+  run. They now record what they did (`record_moe_disposition` in
+  `crates/nsl-codegen/src/cpdt_moe_capacity.rs`).
+- In a debug build, a weights file naming a layer numbered at or above the
+  assumed count of 8 would panic on an assertion in `position_criticality`
+  (`crates/nsl-codegen/src/cpdt_sensitivity.rs`). The assertion is removed;
+  such a layer is scored as an interior one.
+- `--cpdt-report` for a 33,344-parameter model printed "params=12.98 MB";
+  the parameters are 0.13 MB. The size came from WGGO's cost table for a
+  built-in layer. WGGO's plan now carries the model's own bytes (see the
+  WGGO errata), and the report prints 0.13 MB.
+- The ZeRO cost model charged plain data-parallel training no communication,
+  omitted the second all-gather for sharded parameters, the micro-batch
+  factor and per-collective latency, and counted communication only where it
+  exceeded total compute time, so every configuration tied and the tie went
+  to the most sharding. It now charges each configuration its collectives
+  (2Ψ, 2Ψ and 3Ψ per micro-batch for data-parallel, gradient-sharded and
+  parameter-sharded, as in the ZeRO paper), a fixed latency per collective,
+  and no overlap (`comm_per_step` and `evaluate_config` in
+  `crates/nsl-codegen/src/cpdt_zero.rs`). On a cluster where everything
+  fits, the recommendation is now plain data-parallel.
+- The planner's memory budget was a constant 80 GiB per GPU. It is now set
+  with `--cpdt-memory-budget <GiB>` (default 80), and the report prints it.
+- The ZeRO stage printed by `--cpdt-report` is not applied, and the report
+  did not say so. The section is now headed "recommendation only, not
+  applied" and states which stage the compiled program runs, from
+  `--zero-stage` (`CpdtPlan::render_report` in
+  `crates/nsl-codegen/src/cpdt.rs`).
+- The comment on `nsl_zero_reduce_grads` in `crates/nsl-runtime/src/zero.rs`
+  said the path "is currently DEAD in production". It now describes where
+  code generation emits the call.
+- The test `stochastic_rounding_is_unbiased_in_mean` in
+  `crates/nsl-runtime/src/tensor/int8_blockwise.rs` could not fail:
+  `nsl_tensor_quant_int8_blockwise` reseeded its generator from the element
+  count on every call, so its 64 trials were identical, and its tolerance
+  exceeded the error of any rounding rule. The `stochastic` argument is now
+  the seed, and the test (`stochastic_rounding_is_unbiased_over_seeds`)
+  requires the mean of a value of 10.25 quantization steps over 4000 seeds
+  to be within 0.05 step of 10.25, where round-to-nearest gives 10.
+- The expert placement planner (`crates/nsl-codegen/src/cpdt_expert.rs`),
+  which no production path runs, charged a balanced partition no dispatch
+  and halved `top_k` in integer arithmetic for the hybrid, so balanced
+  always won at zero cost. A partition is now charged the dispatch of the
+  `(G−1)/G` of assignments whose expert is on another GPU, and the hybrid
+  half of the full dispatch.
 
 ### Open
 
-- Under `--cpdt full` with a weights file, an MoE expert whose router column
-  has norm below 0.01 is sliced out of the router and expert weights,
-  whatever the other columns and any bias are. Such an expert can be the one
-  selected most often (E6), so pruning it changes the model's output. Where:
-  `prune_moe_weights_in_map` in `crates/nsl-codegen/src/cpdt_expert_prune.rs`.
-  Established: numeric check (of the criterion; the pass itself was not run).
-- When an MoE expert is over capacity, assignments are dropped in token
-  order, so later positions lose first, and a token that keeps only one of
-  its experts keeps that expert's weight without renormalisation. Where:
-  `route_topk` in `crates/nsl-runtime/src/moe/router.rs`. Established: by
-  reading the code only.
-- The precision planner assumes every model has 8 layers. On a 12-block
-  model, a weights file naming only `blocks.7.w` reduced no moment (block 7
-  was taken for the last layer) while the log reported precision active with
-  0 buffers; `blocks.11.w`, the real last layer, was reduced. Where:
-  `invoke_cpdt_if_enabled` in `crates/nsl-codegen/src/stmt_pass_bridges.rs`.
-  Established: reproduced by running. The count should come from the model.
-- `@moe(aux_loss_coeff=…)` is accepted and has no effect: no call to
-  `nsl_moe_aux_loss` is emitted, and MoE dispatch has no backward rule, so
-  the router cannot be trained. The load term (`compute_aux_losses`,
-  `crates/nsl-runtime/src/moe/aux_loss.rs`) uses hard counts and would have
-  zero gradient even if wired. Where: `extract_moe_decorator` in
-  `crates/nsl-codegen/src/moe.rs`. Established: by reading the code only.
-- With `--cpdt full --weights`, a parameter whose name in the weights file
-  carries a leading prefix, as in `model.blocks.0.w`, is not matched to the
-  train block's parameter and silently keeps FP32 moments; the compile is
-  refused only when no name in the file matches. Where: `precision_for_path`
-  in `crates/nsl-codegen/src/cpdt_precision_exec.rs`, whose comment records
-  the gap. Established: by reading the code only.
-- An inference-only MoE program compiled with `--cpdt full` fails with
-  "requested feature(s) were silently inert" and "--cpdt: owner CPDT recorded
-  no disposition", although the MoE passes ran; they record no disposition.
-  Where: `run_moe_prune_pass` (`crates/nsl-codegen/src/cpdt_expert_prune.rs`)
-  and `run_moe_capacity_pass` (`crates/nsl-codegen/src/cpdt_moe_capacity.rs`).
-  Established: reproduced by running.
-- In a debug build, a weights file that names a layer numbered 8 or higher
-  would panic on the assertion in `position_criticality`
-  (`crates/nsl-codegen/src/cpdt_sensitivity.rs`), which checks the layer
-  index against the assumed count of 8. Established: by reading the code
-  only.
-- `--cpdt-report` for a 33,344-parameter model on a nominal 8 × 80 GiB
-  cluster prints "s_p=1 s_g=8 s_os=8 (ZeRO-2)" with "params=12.98 MB". The
-  parameters are 0.13 MB; the size is taken from WGGO's layer costs. Where:
-  `search` and `ModelSize::from_applied_plan` in
-  `crates/nsl-codegen/src/cpdt_zero.rs`. Established: reproduced by running.
-- The ZeRO cost model (`evaluate_config` and `rank_cmp` in
-  `crates/nsl-codegen/src/cpdt_zero.rs`) charges plain data-parallel training
-  no communication, omits the second all-gather for sharded parameters, the
-  micro-batch factor and per-collective latency, and counts communication
-  only where it exceeds total compute time; ties then go to the lowest
-  memory, the most sharding. Established: by reading the code only.
-- The planner's memory budget is a constant 80 GiB per GPU, and no flag sets
-  it. Where: the `ClusterSpec` built in `crates/nsl-cli/src/commands/run.rs`
-  and `crates/nsl-cli/src/commands/build/options.rs`. Established: by reading
-  the code only.
-- The ZeRO stage printed by `--cpdt-report` is not applied, and the report
-  does not say so: nothing else reads the planner's choice, and the compiled
-  program's stage comes from `--zero-stage` alone. Where:
-  `CpdtPlan::render_report` in `crates/nsl-codegen/src/cpdt.rs`. Established:
-  by reading the code only. The planner should set the stage when
-  `--zero-stage` is absent, or the report should say "not applied".
-- The comment on `nsl_zero_reduce_grads` in `crates/nsl-runtime/src/zero.rs`
-  says the path "is currently DEAD in production" because code generation
-  never emits `nsl_zero_init`. Code generation emits both functions now.
-  Established: by reading the code only.
-- The test `stochastic_rounding_is_unbiased_in_mean` in
-  `crates/nsl-runtime/src/tensor/int8_blockwise.rs` cannot fail.
-  `nsl_tensor_quant_int8_blockwise` reseeds its generator from the element
-  count on every call, so the 64 trials are identical, each element gets the
-  same dither on every step, and the 1/127 tolerance exceeds the worst error
-  of any rounding rule here. Established: by reading the code only.
 - The INT8 blockwise code, which is not wired into the optimizer, is a linear
   absmax quantizer, and that is unsound for `v`: with a five-decade spread
   inside a block the small elements round to zero and the median step is 33
   times too large, with or without stochastic rounding. Where:
   `crates/nsl-runtime/src/tensor/int8_blockwise.rs`. Established: numeric
-  check (a simulation of the same algorithm, not a run of this code).
-- The expert placement planner (`crates/nsl-codegen/src/cpdt_expert.rs`),
-  which no production path runs, is inconsistent: `balanced_eval` charges
-  each GPU only its share of the experts and no dispatch, though tokens must
-  then reach the GPU holding their expert, and `hybrid_eval` halves `top_k`
-  in integer arithmetic, so its communication is 0 for top_k = 1. Balanced
-  always wins. Established: by reading the code only.
+  check (a simulation of the same algorithm, not a run of this code). The
+  module now states this and nothing stores `v` in the format; replacing it
+  with a non-linear code (the dynamic map bitsandbytes uses) needs that
+  code's table reproduced and checked against the reference implementation,
+  which was not available.

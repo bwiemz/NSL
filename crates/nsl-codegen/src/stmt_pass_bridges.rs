@@ -148,6 +148,11 @@ pub(crate) fn invoke_cpdt_if_enabled(
     // matching codegen (which ignores @checkpoint decorators in that mode).
     model.activation_checkpointing = !compiler.compile_options.diagnostics.training_reference
         && !compiler.compile_options.checkpoint.policies.is_empty();
+    // Micro-batches per optimizer step: the plan's compute times are per
+    // micro-batch, and sharded parameters are gathered once per micro-batch.
+    model.micro_batches_per_step = train_block
+        .and_then(|t| train_block_grad_accumulation(t, compiler.interner))
+        .unwrap_or(1);
     let adamw = adamw_from_train_block(train_block, compiler.interner);
 
     // Phase 1 weight-aware CPDT: the compiler holds a WeightMap loaded from
@@ -171,7 +176,30 @@ pub(crate) fn invoke_cpdt_if_enabled(
     };
 
     let weights_present = weight_map_ref.is_some();
-    let precision_cfg = PrecisionConfig::default();
+    // The number of blocks decides which block is the last one (the first
+    // and last are held at full precision) and which sit next to them. It
+    // is the model's, counted from the train block's own parameters; the
+    // planner used to assume 8, so on a 12-block model block 7 was pinned
+    // as "last" and block 11 was treated as a middle block.
+    let precision_cfg = match train_block_layer_count(compiler, train_block, applied_plan) {
+        Some(n_layers) => PrecisionConfig {
+            n_layers,
+            ..PrecisionConfig::default()
+        },
+        None => {
+            if weights_present && compiler.cpdt_mode == CpdtMode::Full {
+                nsl_log::nsl_log!(WARN, "cpdt",
+                    "[cpdt] the number of blocks in this train block's model could not be \
+                     determined; no block is treated as first or last, so only embeddings \
+                     and norms are held at full moment precision by position."
+                );
+            }
+            PrecisionConfig {
+                n_layers: 0,
+                ..PrecisionConfig::default()
+            }
+        }
+    };
 
     // Phase 1 weight-map validation: when weights + CpdtMode::Full, verify
     // every hierarchical AppliedPlan layer has matching tensors in the
@@ -227,6 +255,9 @@ pub(crate) fn invoke_cpdt_if_enabled(
 
     let mut plan = cpdt_run(input);
     plan.planned_without_wggo = applied_plan.is_none();
+    // The stage the program will actually run; the report prints it beside
+    // the planner's recommendation, which nothing applies.
+    plan.applied_zero_stage = compiler.features.zero_stage.filter(|&s| s >= 1);
 
     // Say which capacity CPDT planned in. The precision half, when one was
     // built at all, is fully valid (it never reads the applied plan); the
@@ -313,6 +344,74 @@ pub(crate) fn invoke_cpdt_if_enabled(
     }
     compiler.bus.publish_cpdt_plan(plan);
     Ok(())
+}
+
+/// The number of repeated blocks in the model a train block trains: one more
+/// than the highest `blocks.N` / `layers.N` / `h.N` index among the model's
+/// tensor parameters.
+///
+/// The parameters are enumerated from the model's type (the same walk that
+/// builds the runtime parameter list). When the model's type cannot be
+/// resolved here, the WGGO plan's layer names, which come from the same
+/// parameters, are used. `None` when neither names a block.
+fn train_block_layer_count(
+    compiler: &crate::compiler::Compiler,
+    train_block: Option<&nsl_ast::block::TrainBlock>,
+    applied_plan: Option<&crate::wggo_apply::AppliedPlan>,
+) -> Option<u32> {
+    use nsl_semantic::types::Type;
+    let from_model = train_block.and_then(|train| {
+        let arg = train
+            .config
+            .iter()
+            .find(|a| a.name.is_some_and(|n| compiler.resolve_sym(n) == "model"))?;
+        let nsl_ast::expr::ExprKind::Ident(sym) = &arg.value.kind else {
+            return None;
+        };
+        let type_name = compiler
+            .models
+            .model_var_types
+            .get(sym)
+            .cloned()
+            .or_else(|| match compiler.type_map.get(&arg.value.id) {
+                Some(Type::Model { name, .. }) | Some(Type::Struct { name, .. }) => {
+                    Some(compiler.resolve_sym(*name).to_string())
+                }
+                _ => None,
+            })?;
+        let var_name = compiler.resolve_sym(*sym).to_string();
+        let paths = compiler.enumerate_model_tensor_paths(&var_name, &type_name);
+        crate::cpdt_sensitivity::layer_count(paths.iter().map(String::as_str))
+    });
+    from_model.or_else(|| {
+        let plan = applied_plan?;
+        // A layer name is a bare prefix (`blocks.3`); `layer_count` reads
+        // the index of a parameter path, so give it one.
+        let names: Vec<String> = plan
+            .layers
+            .iter()
+            .map(|l| format!("{}.w", l.layer_name))
+            .collect();
+        crate::cpdt_sensitivity::layer_count(names.iter().map(String::as_str))
+    })
+}
+
+/// `grad_accumulation = N` from a train block's header, when it is an
+/// integer literal of at least 1.
+fn train_block_grad_accumulation(
+    train: &nsl_ast::block::TrainBlock,
+    interner: &nsl_lexer::Interner,
+) -> Option<u32> {
+    train.config.iter().find_map(|arg| {
+        let name = arg.name.and_then(|n| interner.resolve(n.0))?;
+        if name != "grad_accumulation" {
+            return None;
+        }
+        match &arg.value.kind {
+            nsl_ast::expr::ExprKind::IntLiteral(n) if *n >= 1 => u32::try_from(*n).ok(),
+            _ => None,
+        }
+    })
 }
 
 pub(crate) fn invoke_wrga_if_enabled(

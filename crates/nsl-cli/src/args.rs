@@ -1077,6 +1077,18 @@ pub(crate) struct BuildArgs {
         #[arg(long, default_value_t = false)]
         pub(crate) cpdt_report: bool,
 
+        /// CPDT: memory available on each GPU, in GiB, for the ZeRO planner's
+        /// fit test (default 80).
+        #[arg(long, value_name = "GIB", default_value_t = 80.0)]
+        pub(crate) cpdt_memory_budget: f64,
+
+        /// CPDT: under `--cpdt full` with weights, slice out MoE experts whose
+        /// router column has norm below 0.01. Off by default: a near-zero
+        /// column does not show an expert is unused, so this can change the
+        /// model's output.
+        #[arg(long, default_value_t = false)]
+        pub(crate) cpdt_prune_experts: bool,
+
         /// CFIE: compiler-fused inference-engine mode ("full",
         /// "sampling", or "off").  Passing `--cfie` without a value
         /// enables full mode.  Overrides the serve block's `@cfie`
@@ -1370,6 +1382,18 @@ pub(crate) struct RunArgs {
         /// CPDT: emit the full plan to stdout. Implies `--cpdt` (full mode).
         #[arg(long, default_value_t = false)]
         pub(crate) cpdt_report: bool,
+
+        /// CPDT: memory available on each GPU, in GiB, for the ZeRO planner's
+        /// fit test (default 80).
+        #[arg(long, value_name = "GIB", default_value_t = 80.0)]
+        pub(crate) cpdt_memory_budget: f64,
+
+        /// CPDT: under `--cpdt full` with weights, slice out MoE experts whose
+        /// router column has norm below 0.01. Off by default: a near-zero
+        /// column does not show an expert is unused, so this can change the
+        /// model's output.
+        #[arg(long, default_value_t = false)]
+        pub(crate) cpdt_prune_experts: bool,
 
         /// WGGO: global-optimization mode ("full", "greedy", "off", or "auto").
         /// Passing `--wggo` without a value enables full mode. Mirrors

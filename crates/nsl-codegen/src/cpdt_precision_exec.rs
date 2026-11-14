@@ -84,29 +84,65 @@ fn precision_for_path<'a>(plan: &'a PrecisionPlan, path: &str) -> Option<&'a Par
     // the per-param plan. One segment only: stripping repeatedly would let
     // `blocks.0.w` on some sibling container match a plan entry for a
     // different parameter.
-    //
-    // Residual gaps, recorded rather than silently carried: (a) a plan name
-    // that itself carries a prefix (HF-style `model.blocks.0.w`) still
-    // falls to F32 — the strip applies to the PATH only, never the name;
-    // (b) two model variables joined against one weights file both strip
-    // to the same keys, so the second silently inherits the first's
-    // decisions — the same property as the WGGO-side layer_prefix join.
     if let Some(pp) = plan.params.iter().find(|p| name_matches_path(&p.name, path)) {
         return Some(pp);
     }
     let stripped = path.split_once('.').map(|(_, rest)| rest)?;
-    plan.params.iter().find(|p| name_matches_path(&p.name, stripped))
+    if let Some(pp) = plan.params.iter().find(|p| name_matches_path(&p.name, stripped)) {
+        return Some(pp);
+    }
+    // Last, a plan name that carries a container prefix of its own, as a
+    // checkpoint exported from another framework does (`model.blocks.0.w`
+    // for the field path `blocks.0.w`): the name ends with the field path
+    // at a dot boundary. Taken only when exactly one plan name does, since
+    // two (`enc.blocks.0.w` and `dec.blocks.0.w`) cannot be told apart from
+    // here. Such names used to join nothing and their parameters silently
+    // kept FP32 moments.
+    let mut prefixed = plan.params.iter().filter(|p| name_has_prefix_of(&p.name, stripped));
+    match (prefixed.next(), prefixed.next()) {
+        (Some(pp), None) => Some(pp),
+        _ => None,
+    }
+}
+
+/// True when `name`, or `name` without a trailing `.weight` / `.bias`, is
+/// `<prefix>.<field_path>` for some non-empty prefix.
+fn name_has_prefix_of(name: &str, field_path: &str) -> bool {
+    let ends = |n: &str| {
+        n.len() > field_path.len() + 1
+            && n.ends_with(field_path)
+            && n.as_bytes()[n.len() - field_path.len() - 1] == b'.'
+    };
+    ends(name)
+        || name.strip_suffix(".weight").is_some_and(ends)
+        || name.strip_suffix(".bias").is_some_and(ends)
+}
+
+/// The plan entries that join none of `param_paths`: tensors the weights
+/// file names that this train block's model does not have (or that
+/// [`precision_for_path`] cannot tell apart). Their precision decisions are
+/// not applied; the caller reports them so that is not silent.
+pub fn unjoined_plan_names<'a>(plan: &'a PrecisionPlan, param_paths: &[String]) -> Vec<&'a str> {
+    let joined: std::collections::HashSet<*const ParamPrecision> = param_paths
+        .iter()
+        .filter_map(|p| precision_for_path(plan, p))
+        .map(|pp| pp as *const ParamPrecision)
+        .collect();
+    plan.params
+        .iter()
+        .filter(|pp| !joined.contains(&(*pp as *const ParamPrecision)))
+        .map(|pp| pp.name.as_str())
+        .collect()
 }
 
 /// How many of this block's parameters the precision plan's names actually
-/// join (exact match or the one-segment strip). The weights-only path has
+/// join (see [`precision_for_path`]). The weights-only path has
 /// no `cpdt_sensitivity::validate` (there is no AppliedPlan to check the
 /// WeightMap against), so a wrong checkpoint would otherwise sail through
 /// as "active: 0 moment buffer(s)" — activation with no effect, the exact
 /// shape the join defect had. A non-empty plan joining ZERO params is the
-/// certainly-wrong case the caller refuses on; partial joins are the
-/// documented residual gaps of `precision_for_path` and are not judged
-/// here.
+/// certainly-wrong case the caller refuses on; a partial join is reported
+/// by the caller from [`unjoined_plan_names`].
 pub fn joined_param_count(plan: &PrecisionPlan, param_paths: &[String]) -> usize {
     param_paths
         .iter()
@@ -362,6 +398,68 @@ mod tests {
         let (m, v) = build_dtype_lists(&plan, &paths);
         assert_eq!(m, vec![DTYPE_F32, DTYPE_F32, DTYPE_BF16]);
         assert_eq!(v, vec![DTYPE_F32, DTYPE_F32, DTYPE_F32]);
+    }
+
+    /// A weights file whose keys carry a container prefix of their own
+    /// (`model.blocks.0.w`, as an exported checkpoint spells them) joins the
+    /// model's parameters. It used to join none, and those parameters
+    /// silently kept FP32 moments.
+    #[test]
+    fn a_prefixed_weights_file_name_joins_its_parameter() {
+        let plan = PrecisionPlan {
+            params: vec![
+                pp("model.blocks.0.w", OptimPrecision::Fp16, OptimPrecision::Fp32),
+                pp("model.blocks.1.w.weight", OptimPrecision::Fp16, OptimPrecision::Fp32),
+                pp("model.embed", OptimPrecision::Fp32, OptimPrecision::Fp32),
+            ],
+            total_optim_bytes: 0,
+            baseline_fp32_bytes: 0,
+        };
+        let paths = vec![
+            "m.embed".to_string(),
+            "m.blocks.0.w".to_string(),
+            "m.blocks.1.w".to_string(),
+            "m.final_norm".to_string(),
+        ];
+        let (m, v) = build_dtype_lists(&plan, &paths);
+        assert_eq!(m, vec![DTYPE_F32, DTYPE_BF16, DTYPE_BF16, DTYPE_F32]);
+        assert_eq!(v, vec![DTYPE_F32; 4]);
+        assert_eq!(joined_param_count(&plan, &paths), 3);
+        assert!(unjoined_plan_names(&plan, &paths).is_empty());
+    }
+
+    /// The prefix match is a suffix test at a dot boundary, never a bare
+    /// suffix: `xblocks.0.w` is not `blocks.0.w` under a prefix.
+    #[test]
+    fn a_name_that_merely_ends_like_the_path_does_not_join() {
+        let plan = PrecisionPlan {
+            params: vec![pp("xblocks.0.w", OptimPrecision::Fp16, OptimPrecision::Fp32)],
+            total_optim_bytes: 0,
+            baseline_fp32_bytes: 0,
+        };
+        let paths = vec!["m.blocks.0.w".to_string()];
+        assert_eq!(build_dtype_lists(&plan, &paths).0, vec![DTYPE_F32]);
+        assert_eq!(unjoined_plan_names(&plan, &paths), vec!["xblocks.0.w"]);
+    }
+
+    /// Two prefixed names for one field path cannot be told apart, so
+    /// neither is applied, and both are reported.
+    #[test]
+    fn two_prefixed_names_for_one_parameter_join_neither() {
+        let plan = PrecisionPlan {
+            params: vec![
+                pp("enc.blocks.0.w", OptimPrecision::Fp16, OptimPrecision::Fp32),
+                pp("dec.blocks.0.w", OptimPrecision::Fp16, OptimPrecision::Fp32),
+            ],
+            total_optim_bytes: 0,
+            baseline_fp32_bytes: 0,
+        };
+        let paths = vec!["m.blocks.0.w".to_string()];
+        assert_eq!(build_dtype_lists(&plan, &paths).0, vec![DTYPE_F32]);
+        assert_eq!(
+            unjoined_plan_names(&plan, &paths),
+            vec!["enc.blocks.0.w", "dec.blocks.0.w"]
+        );
     }
 
     #[test]
