@@ -361,9 +361,8 @@ Recomputation was checked to be bit-identical to the baseline on CPU for
 stride 1, 2 and 3, the selective policy, the budget, `dp` and dropout. On
 one GPU (an RTX PRO 4500 Blackwell) the block and selective policies,
 stride 2 and `dp` printed the same losses and trained weights as the run
-without
-checkpointing, and the existing GPU parity cases pass; no larger model and
-no other card was run. The CPU end-to-end parity tests are
+without checkpointing, and the existing GPU parity cases pass; no larger
+model and no other card was run. The CPU end-to-end parity tests are
 `crates/nsl-cli/tests/ccr_checkpoint_parity.rs` and
 `crates/nsl-cli/tests/ccr_checkpoint_activation_parity.rs`. These compare
 NSL with NSL; `crates/nsl-cli/tests/ccr_reference_gradient_gate.rs` compares
