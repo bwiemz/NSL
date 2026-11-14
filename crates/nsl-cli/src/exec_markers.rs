@@ -304,6 +304,23 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
         "the p9 fused FASE optimizer-step counter reported (NSL_FASE_FUSED_COUNTER=1)",
     ),
     m(
+        "[bf16-cast-cache]",
+        &[
+            "crates/nsl-runtime/src/args.rs",
+            "crates/nsl-runtime/src/cuda/bf16_cast_cache.rs",
+        ],
+        "the BF16 operand-cast cache's hit / recast / eviction counts at exit \
+         (NSL_BF16_CAST_CACHE_COUNTER=1), or its disabled-under-cuda-graphs note",
+    ),
+    m(
+        "[bf16-lt]",
+        &[
+            "crates/nsl-runtime/src/args.rs",
+            "crates/nsl-runtime/src/cuda/lt_matmul.rs",
+        ],
+        "the cuBLASLt BF16 matmul counts at exit (NSL_BF16_LT_COUNTER=1), or a tuning note",
+    ),
+    m(
         "[weight-stream]",
         &[
             "crates/nsl-codegen/src/stmt.rs",
@@ -872,6 +889,21 @@ pub const EVENT_SCHEMAS: &[EventSchema] = &[
         kind: "wgrad_counters",
         marker: "[wgrad-accum]",
         fields: &["fused_gemm", "decomposed_fallback"],
+    },
+    // The two below are emitted at exit by a CUDA build only
+    // (`nsl-runtime/src/args.rs`), which is how they went unregistered: the
+    // gate that checks every emitted kind against this table runs its
+    // fixture on the CPU-only build in CI, and failed on the first CUDA
+    // build that ran it.
+    EventSchema {
+        kind: "bf16_cast_cache_counters",
+        marker: "[bf16-cast-cache]",
+        fields: &["hits", "recasts", "evictions"],
+    },
+    EventSchema {
+        kind: "bf16_lt_counters",
+        marker: "[bf16-lt]",
+        fields: &["issued", "tuned", "fallbacks"],
     },
     EventSchema {
         kind: "kernel_launch_count",
