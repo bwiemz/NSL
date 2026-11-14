@@ -89,7 +89,9 @@ fn backward_kernel_name(cfg: &FlashAttentionConfig) -> String {
 }
 
 /// One fused-projection layer: a single head, square tiles of `block`.
-/// The fused kernel pair supports `d_model == head_dim` only.
+/// The fused kernel pair reads `x` as rows `head_dim` wide, so the numerical
+/// cases all have `d_model == head_dim`; a wider `d_model` is refused (see
+/// `fused_kernels_refuse_a_d_model_above_head_dim`).
 #[derive(Clone, Copy, Debug)]
 struct Case {
     block: u32,
@@ -415,13 +417,15 @@ fn launch(case: &Case, inputs: &Inputs, d_o: &[f32]) -> Result<GpuRun, String> {
 /// precision: Q, K and V are saved by the forward as f16 and the weights are
 /// narrowed to f16, a relative rounding of at most 2^-11 per element, plus
 /// the kernel's `ex2.approx` / `div.approx` / `rsqrt.approx`. Measured on an
-/// RTX PRO 4500 the worst gradient is below 1.5e-3 across every case in this
-/// file; the old f16 gradient path sat at 0.57 for dQ at dO = 1e-6 and at 1.0
-/// (all zero) at 1e-7.
+/// RTX PRO 4500 the worst gradient across every case in this file is 2.1e-3
+/// (head_dim 64 with RoPE; 8e-4 to 1.1e-3 at head_dim 32), the same at every
+/// magnitude of dO. With the f16 gradient path that this gate replaced, the
+/// same cases read 4% to 13% at dO = 1e-6, 53% to 100% at 1e-7 and 100%
+/// (every gradient all zero) at 1e-9.
 const GRAD_REL_TOL: f64 = 4e-3;
 
 /// Relative L2 error allowed on the forward output, which the kernel stores
-/// as f16.
+/// as f16. Measured: 6e-4 to 1.3e-3.
 const FWD_REL_TOL: f64 = 2e-3;
 
 /// Compare one run with the reference. Returns the failures and prints one
@@ -557,4 +561,54 @@ fn fused_backward_matches_reference_across_head_dim_causal_and_rope() {
         }
     }
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// `d_model` above `head_dim` is refused by both launchers.
+///
+/// The fused kernels read `x`, and the backward its saved copy, as rows
+/// `head_dim` wide while indexing by `d_model`, and the save buffer is sized
+/// by `head_dim`. At `d_model = 64`, `head_dim = 32` the forward output was
+/// 126% off the reference and every gradient between 125% and 215%, with a
+/// success return code. The launch must fail instead.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn fused_kernels_refuse_a_d_model_above_head_dim() {
+    if !cuda_available() {
+        eprintln!("skipping: no CUDA");
+        return;
+    }
+    let case = Case { block: 32, head_dim: 32, d_model: 64, seq: 32, causal: true, rope: false };
+    let inputs = Inputs::new(&case);
+    let d_o = d_o_seq(case.seq * 32, 1e-6);
+    let err = match launch(&case, &inputs, &d_o) {
+        Ok(_) => panic!("a fused launch with d_model 64 and head_dim 32 was accepted"),
+        Err(e) => e,
+    };
+    assert!(err.starts_with("forward rc=-1"), "expected the forward to refuse, got: {err}");
+
+    // The backward on its own: it refuses on the kernel's name and the two
+    // dimensions, before it touches a buffer or loads the module.
+    let name = CString::new(
+        "flash_attn_backward_p0_r0_hs_g1_c1_t0_q32_kv32_cshaL2_n1_p1_o0_h1_v2",
+    )
+    .unwrap();
+    let rc = nsl_flash_attention_csha_backward(
+        0, 0, 0, 0, 0,
+        (1.0f32 / 32f32.sqrt()).to_bits() as i64,
+        1, 1, 32, 32,
+        0, 0, 0, 0,
+        0, 0,
+        0, 0,
+        0,
+        0, name.as_ptr() as i64,
+        32, 32,
+        1,
+        0, 0, 0, 0, 0,
+        0, NORM_EPS.to_bits() as i64,
+        1, 64,
+        0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0,
+    );
+    assert_eq!(rc, -1, "the backward must refuse d_model 64 with head_dim 32");
 }

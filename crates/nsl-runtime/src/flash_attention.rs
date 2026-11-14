@@ -1809,6 +1809,37 @@ fn csha_is_fused_projection_kernel(name_ptr: i64) -> bool {
     name_bytes[pos..].windows(3).any(|w| w == b"_p1")
 }
 
+/// True, after logging why, when a fused-projection kernel is asked for a
+/// `d_model` wider than `head_dim`.
+///
+/// The scalar fused kernels lay `x` out as `[batch, heads, seq, head_dim]`:
+/// the forward normalises and projects rows `head_dim` wide, the save buffer
+/// `x_raw` (`nsl_csha_alloc_backward_activations`) is sized
+/// `batch * heads * seq * head_dim`, and the backward and its multi-tile
+/// post-pass then index both as rows of `d_model`. With `d_model` above
+/// `head_dim` every row read runs into the next one and the last rows run
+/// off the end of the buffer; measured at `d_model = 64`, `head_dim = 32`
+/// the forward output and all eight gradients were more than 100% off.
+/// Such a launch is refused instead. Tier B.1 kernels are exempt: their `x`
+/// is re-laid-out by a pre-pass that takes `d_model` into account.
+#[cfg(feature = "cuda")]
+fn csha_refuses_wide_fused_projection(entry: &str, name_ptr: i64, d_model: i64, head_dim: i64) -> bool {
+    if d_model <= head_dim
+        || !csha_is_fused_projection_kernel(name_ptr)
+        || csha_tier_b1_chunk_for_kernel(name_ptr).is_some()
+    {
+        return false;
+    }
+    crate::nsl_log!(ERROR, "flash-attention",
+        "[nsl::flash_attention] {entry}: fused-projection kernel {:?} was launched with \
+         d_model={d_model} above head_dim={head_dim}; these kernels read x and its saved \
+         copy as rows head_dim wide, so a wider d_model reads across rows and past the \
+         end of the save buffer — refusing",
+        csha_kernel_name_for_diag(name_ptr),
+    );
+    true
+}
+
 /// Tier B.1 per-call scratch RAII holder: the re-laid-out copy of `x` and
 /// of the three projection weights. Drop queues the buffers for a
 /// stream-ordered deferred free (p3-remainder): a NULL-stream event is
@@ -2130,6 +2161,12 @@ pub extern "C" fn nsl_flash_attention_csha(
                 csha_kernel_name_for_diag(effective_name_ptr),
                 _block_kv,
             );
+            return -1;
+        }
+
+        if csha_refuses_wide_fused_projection(
+            "nsl_flash_attention_csha", effective_name_ptr, d_model, head_dim,
+        ) {
             return -1;
         }
 
@@ -2588,6 +2625,12 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
                 );
                 return -1;
             }
+        }
+
+        if csha_refuses_wide_fused_projection(
+            "nsl_flash_attention_csha_with_saves", effective_name_ptr, d_model, head_dim,
+        ) {
+            return -1;
         }
 
         let grid_x = if per_doc_cta {
@@ -3312,6 +3355,16 @@ fn csha_backward_impl(
     #[cfg(feature = "cuda")]
     {
         if tier_b2_active != 0 {
+            // The four-kernel backward is built for `d_model == head_dim`
+            // (its dispatch predicate requires it) and shares the `x_raw`
+            // layout above.
+            if d_model != head_dim {
+                crate::nsl_log!(ERROR, "flash-attention",
+                    "[nsl::flash_attention] nsl_flash_attention_csha_backward[tier_b2]: \
+                     d_model={d_model} must equal head_dim={head_dim} — refusing"
+                );
+                return -1;
+            }
             // Review 2026-07-24 (finding 3): Tier B.2's d_prepass reads O
             // as f16 (`ld.global.b16` in tier_b2/backward/d_prepass.rs),
             // and kernel 4 (proj_backward, scalar ABI) reads Wq/Wk/Wv as
@@ -3459,6 +3512,11 @@ fn csha_backward_impl(
                      (batch={batch}, heads={heads}) — gradients NOT guaranteed correct for heads>1/batch>1"
                 );
             }
+        }
+        if csha_refuses_wide_fused_projection(
+            "nsl_flash_attention_csha_backward", effective_name_ptr, d_model, head_dim,
+        ) {
+            return -1;
         }
         let q_blocks = (seq_len + block_q - 1) / block_q;
         let grid_x = if per_doc_cta { num_docs_or_zero } else { 1i64 };
