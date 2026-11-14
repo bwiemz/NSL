@@ -2364,23 +2364,28 @@ pub struct WengertExtractor<'a> {
     /// `loss:` section nothing consumed.
     kl_ce_calls: Vec<KlCeCall>,
     /// Free functions declared in the module being compiled, by name.
-    /// A call to one is inlined into the Wengert list, ahead of the
-    /// by-name builtin table: a user's own `fn gelu` is the function the
-    /// program calls, whatever a builtin of that name computes.
+    /// A call written in that module (the block's own body, a function or
+    /// a method of that module) to one of them is inlined into the Wengert
+    /// list, ahead of the by-name builtin table: a user's own `fn gelu` is
+    /// the function the program calls, whatever a builtin of that name
+    /// computes. A call written inside an imported body never sees these:
+    /// that module cannot name them.
     local_fn_bodies: HashMap<String, nsl_ast::decl::FnDef>,
-    /// Free functions declared in imported modules (the standard library
-    /// included), by name. Consulted only for a callee the builtin table
-    /// does not know, and for the `fused_kl_ce` composite.
-    imported_fn_bodies: HashMap<String, nsl_ast::decl::FnDef>,
-    /// The bindings registered from outside before extraction started
-    /// (`register_input*` / `register_param*`): the names a free function
-    /// can see besides its own parameters. An inlined function body is
-    /// extracted against these, not against the caller's locals.
-    root_scope: HashMap<nsl_ast::Symbol, VarId>,
-    /// Names of the free functions currently being inlined, innermost
-    /// last. A function already on the stack is recursive and cannot be
-    /// inlined.
-    fn_inline_stack: Vec<String>,
+    /// The functions and models of the imported modules (the standard
+    /// library included). A call written in an imported module resolves
+    /// against that module's own functions first, as `local_fn_bodies` does
+    /// for the module being compiled; a callee the builtin table does not
+    /// know, and the `fused_kl_ce` composite, come from the by-name view.
+    imported_fns: crate::ImportedFunctions,
+    /// The bodies being inlined, innermost last (empty: the block's own
+    /// body). They say which module a call is written in, and whether
+    /// names are a free function's parameters and locals (see
+    /// [`InlineFrame`]).
+    inline_frames: Vec<InlineFrame>,
+    /// Why the innermost inlined free function could not be extracted, when
+    /// the failure point knows better than "an expression source AD does
+    /// not extract". Taken by `inline_user_fn` for its message.
+    inline_decline: Option<String>,
     /// Free functions that were inlined, for the caller's log line.
     inlined_user_fns: std::collections::BTreeSet<String>,
     /// How many method calls on a FROZEN model (the distill teacher) the
@@ -2827,31 +2832,114 @@ pub struct KlCeCall {
     pub fused: bool,
 }
 
-/// Whether every statement of a function body, at any depth, is of a kind
-/// the extraction handles explicitly. `extract_stmt` lets every other kind
-/// pass as a no-op (a decorated statement, a `match`, a nested block), which
-/// is harmless for a step body the ordinary code path also compiles, but
+/// One body being inlined into the block's Wengert list.
+#[derive(Debug, Clone)]
+enum InlineFrame {
+    /// A free function (`inline_user_fn`). Inside it, a name is one of its
+    /// parameters or locals, and a value, never a model resolved by name.
+    Function {
+        name: String,
+        /// `None`: declared in the module being compiled; `Some(path)`:
+        /// in that imported module.
+        module: Option<String>,
+    },
+    /// A model method (`inline_method_body`), with the module that declares
+    /// the model.
+    Method { module: Option<String> },
+}
+
+/// The parameters of `fn_def` and every name a `let` in its body declares,
+/// at any depth: the names an inlined body may assign to.
+fn function_own_names(fn_def: &nsl_ast::decl::FnDef) -> HashSet<nsl_ast::Symbol> {
+    fn collect(stmts: &[nsl_ast::stmt::Stmt], out: &mut HashSet<nsl_ast::Symbol>) {
+        for stmt in stmts {
+            match &stmt.kind {
+                StmtKind::VarDecl { pattern, .. } => {
+                    if let nsl_ast::pattern::PatternKind::Ident(sym) = &pattern.kind {
+                        out.insert(*sym);
+                    }
+                }
+                StmtKind::If { then_block, elif_clauses, else_block, .. } => {
+                    collect(&then_block.stmts, out);
+                    for (_, block) in elif_clauses {
+                        collect(&block.stmts, out);
+                    }
+                    if let Some(block) = else_block {
+                        collect(&block.stmts, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out: HashSet<nsl_ast::Symbol> = fn_def.params.iter().map(|p| p.name).collect();
+    collect(&fn_def.body.stmts, &mut out);
+    out
+}
+
+/// Whether every statement of a function body, at any depth, is one the
+/// extraction implements; otherwise why not. `extract_stmt` lets other kinds
+/// pass as a no-op (a decorated statement, a `match`, a nested block), but
 /// for an inlined function the extraction IS the function: a statement it
 /// skipped would simply not happen.
-fn body_is_extractable(stmts: &[nsl_ast::stmt::Stmt]) -> bool {
-    stmts.iter().all(|stmt| match &stmt.kind {
-        StmtKind::VarDecl { value: Some(_), .. }
-        | StmtKind::Return(Some(_))
-        | StmtKind::Expr(_)
-        | StmtKind::Assign { .. } => true,
-        StmtKind::If { then_block, elif_clauses, else_block, .. } => {
-            body_is_extractable(&then_block.stmts)
-                && elif_clauses.iter().all(|(_, b)| body_is_extractable(&b.stmts))
-                && else_block.as_ref().is_none_or(|b| body_is_extractable(&b.stmts))
+///
+/// Assignments are the subtle case. The extraction rebinds a name to a new
+/// value; it implements no write into a tensor, a container or a field, and
+/// a name the function does not own (one of its parameters or a `let` of
+/// its own) would be an outer variable whose update the graph never makes.
+/// Such a body is not inlined. (It used to be: `y[0, 0] = 0.0` vanished
+/// from the inlined function, and the loss came out as if it had not been
+/// written.)
+fn body_is_extractable(
+    stmts: &[nsl_ast::stmt::Stmt],
+    own: &HashSet<nsl_ast::Symbol>,
+    interner: &Interner,
+) -> Result<(), String> {
+    for stmt in stmts {
+        match &stmt.kind {
+            StmtKind::VarDecl { pattern, value: Some(_), .. } => {
+                if !matches!(pattern.kind, nsl_ast::pattern::PatternKind::Ident(_)) {
+                    return Err("it destructures a value in a `let`".to_string());
+                }
+            }
+            StmtKind::Return(Some(_)) | StmtKind::Expr(_) => {}
+            StmtKind::Assign { target, .. } => match &target.kind {
+                ExprKind::Ident(sym) if own.contains(sym) => {}
+                ExprKind::Ident(sym) => {
+                    return Err(format!(
+                        "it assigns to `{}`, which is neither one of its parameters nor one of \
+                         its locals",
+                        interner.resolve(sym.0).unwrap_or("?")
+                    ));
+                }
+                _ => {
+                    return Err(
+                        "it writes through a subscript or a field (`y[i, j] = ...`, \
+                         `obj.field = ...`), which source AD does not implement"
+                            .to_string(),
+                    );
+                }
+            },
+            StmtKind::If { then_block, elif_clauses, else_block, .. } => {
+                body_is_extractable(&then_block.stmts, own, interner)?;
+                for (_, block) in elif_clauses {
+                    body_is_extractable(&block.stmts, own, interner)?;
+                }
+                if let Some(block) = else_block {
+                    body_is_extractable(&block.stmts, own, interner)?;
+                }
+            }
+            // A loop is unrolled only over a model array, and models do not
+            // reach a free function.
+            StmtKind::For { .. } => return Err("it has a `for` loop".to_string()),
+            _ => return Err("its body has a statement source AD does not extract".to_string()),
         }
-        // The extraction unrolls a loop over a model array or refuses it.
-        StmtKind::For { body, .. } => body_is_extractable(&body.stmts),
-        _ => false,
-    })
+    }
+    Ok(())
 }
 
 /// Whether `stmts` contains a `return` at any depth. Only called on bodies
-/// [`body_is_extractable`] accepted, so these are all the nesting kinds.
+/// [`body_is_extractable`] accepted, so `if` is the only nesting kind.
 fn contains_return(stmts: &[nsl_ast::stmt::Stmt]) -> bool {
     stmts.iter().any(|stmt| match &stmt.kind {
         StmtKind::Return(_) => true,
@@ -2860,7 +2948,6 @@ fn contains_return(stmts: &[nsl_ast::stmt::Stmt]) -> bool {
                 || elif_clauses.iter().any(|(_, b)| contains_return(&b.stmts))
                 || else_block.as_ref().is_some_and(|b| contains_return(&b.stmts))
         }
-        StmtKind::For { body, .. } => contains_return(&body.stmts),
         _ => false,
     })
 }
@@ -2936,9 +3023,9 @@ impl<'a> WengertExtractor<'a> {
             distill_loss_alpha_temp: (None, None),
             kl_ce_calls: Vec::new(),
             local_fn_bodies: HashMap::new(),
-            imported_fn_bodies: HashMap::new(),
-            root_scope: HashMap::new(),
-            fn_inline_stack: Vec::new(),
+            imported_fns: crate::ImportedFunctions::default(),
+            inline_frames: Vec::new(),
+            inline_decline: None,
             inlined_user_fns: std::collections::BTreeSet::new(),
             frozen_inline_depth: 0,
             frozen_model_roots: HashSet::new(),
@@ -3117,15 +3204,87 @@ impl<'a> WengertExtractor<'a> {
 
     /// Install the free functions source AD may inline: those of the module
     /// being compiled, and those of the modules it imports (see the
-    /// `local_fn_bodies` / `imported_fn_bodies` field docs for how the two
+    /// `local_fn_bodies` / `imported_fns` field docs for how the two
     /// differ).
     pub fn set_user_fn_bodies(
         &mut self,
         local: HashMap<String, nsl_ast::decl::FnDef>,
-        imported: HashMap<String, nsl_ast::decl::FnDef>,
+        imported: crate::ImportedFunctions,
     ) {
         self.local_fn_bodies = local;
-        self.imported_fn_bodies = imported;
+        self.imported_fns = imported;
+    }
+
+    /// The module a call being extracted is written in: `None` for the
+    /// module being compiled, `Some(path)` for an imported one.
+    fn current_module(&self) -> Option<&str> {
+        self.inline_frames.last().and_then(|frame| match frame {
+            InlineFrame::Function { module, .. } | InlineFrame::Method { module } => module.as_deref(),
+        })
+    }
+
+    /// Whether the code being extracted is the body of an inlined free
+    /// function (and not a method that function's caller inlined).
+    fn in_function_frame(&self) -> bool {
+        matches!(self.inline_frames.last(), Some(InlineFrame::Function { .. }))
+    }
+
+    /// The function a call to `name` written in the current module names,
+    /// when that module declares one: the module being compiled, or the
+    /// imported module the body being extracted came from.
+    fn own_module_fn(&self, name: &str) -> Option<nsl_ast::decl::FnDef> {
+        match self.current_module() {
+            None => self.local_fn_bodies.get(name).cloned(),
+            Some(module) => self.imported_fns.by_module.get(module).and_then(|fns| fns.get(name)).cloned(),
+        }
+    }
+
+    /// Record why the innermost inlined function cannot be extracted; the
+    /// first reason wins.
+    fn note_inline_decline(&mut self, why: String) {
+        if self.in_function_frame() && self.inline_decline.is_none() {
+            self.inline_decline = Some(why);
+        }
+    }
+
+    /// Whether `expr`, in the code being extracted, denotes a model
+    /// instance (or an array of them) rather than a value: `self`, an
+    /// instance the block registered, or a field path that names a nested
+    /// model. Inside an inlined free function nothing does: models cannot
+    /// be passed in (see `inline_user_fn`).
+    fn expr_denotes_model(&self, expr: &nsl_ast::expr::Expr) -> bool {
+        if self.in_function_frame() {
+            return false;
+        }
+        match &expr.kind {
+            ExprKind::Paren(inner) => self.expr_denotes_model(inner),
+            ExprKind::SelfRef => self.self_context.is_some(),
+            ExprKind::Ident(sym) => {
+                let name = self
+                    .symbol_name_overrides
+                    .get(sym)
+                    .cloned()
+                    .unwrap_or_else(|| self.interner.resolve(sym.0).unwrap_or("?").to_string());
+                self.model_instance_types.contains_key(sym) || self.context_to_model_type.contains_key(&name)
+            }
+            ExprKind::MemberAccess { .. } | ExprKind::Subscript { .. } => {
+                let Some(path) = self.resolve_member_access_prefix(expr) else {
+                    return false;
+                };
+                if self.context_to_model_type.contains_key(&path) {
+                    return true;
+                }
+                // A field whose declared type is a model or an array of
+                // models (only those are in `model_field_types`).
+                path.rsplit_once('.').is_some_and(|(parent, field)| {
+                    self.context_to_model_type
+                        .get(parent)
+                        .and_then(|ty| self.model_field_types.get(ty))
+                        .is_some_and(|fields| fields.contains_key(field))
+                })
+            }
+            _ => false,
+        }
     }
 
     /// The `fused_kl_ce(...)` calls this extraction lowered (see the field).
@@ -3852,7 +4011,6 @@ impl<'a> WengertExtractor<'a> {
     ) {
         let var = self.alloc_var();
         self.symbol_to_var.insert(sym, var);
-        self.root_scope.insert(sym, var);
         self.param_symbols.insert(sym);
 
         let name = self.interner.resolve(sym.0).unwrap_or("?").to_string();
@@ -3887,7 +4045,6 @@ impl<'a> WengertExtractor<'a> {
     ) {
         let var = self.alloc_var();
         self.symbol_to_var.insert(sym, var);
-        self.root_scope.insert(sym, var);
 
         let name = self.interner.resolve(sym.0).unwrap_or("?").to_string();
         self.list.var_names.insert(var, name.clone());
@@ -4214,8 +4371,22 @@ impl<'a> WengertExtractor<'a> {
             // Assignment: x = expr (rebind variable to new value)
             StmtKind::Assign { target, op, value } => {
                 use nsl_ast::operator::AssignOp;
+                // A write through a subscript or a field (`y[i, j] = v`,
+                // `obj.field = v`) is not implemented: nothing in the graph
+                // stores into a tensor or a container. It used to be skipped
+                // (`return true`), so the forward computed the value as if
+                // the write had not happened -- `y[0, 0] = 0.0` after
+                // `let y = w * 2.0` gave a loss of 20 where the program
+                // computes 18. Decline instead: a train or grad block runs
+                // on the tape, which performs the write; a distill block
+                // refuses.
                 let nsl_ast::expr::ExprKind::Ident(sym) = &target.kind else {
-                    return true;
+                    nsl_log::nsl_log!(WARN, "source-ad",
+                        "[source-ad] warning: an assignment through a subscript or a field \
+                         (`y[i, j] = ...`, `obj.field = ...`) is not differentiated at compile \
+                         time; this block falls back to tape-based AD"
+                    );
+                    return false;
                 };
                 // `y op= e` is `y = y op e`. A compound assignment used to
                 // fall through to `true` here: the statement vanished from
@@ -4238,7 +4409,16 @@ impl<'a> WengertExtractor<'a> {
                 };
                 // A name the graph never bound (a host-side counter) is not
                 // part of the differentiated program; leave it to codegen.
+                // Inside an inlined function there is no codegen to leave it
+                // to -- the extraction is the function -- so decline.
                 let Some(&current) = self.symbol_to_var.get(sym) else {
+                    if self.in_function_frame() {
+                        let name = self.interner.resolve(sym.0).unwrap_or("?").to_string();
+                        self.note_inline_decline(format!(
+                            "it updates `{name}` where no value of that name is bound"
+                        ));
+                        return false;
+                    }
                     return true;
                 };
                 let Some(rhs) = self.extract_expr(value) else {
@@ -4301,7 +4481,55 @@ impl<'a> WengertExtractor<'a> {
     /// flow.
     fn extract_expr_inner(&mut self, expr: &nsl_ast::expr::Expr) -> Option<VarId> {
         match &expr.kind {
-            ExprKind::Ident(sym) => self.symbol_to_var.get(sym).copied(),
+            ExprKind::Ident(sym) => {
+                let found = self.symbol_to_var.get(sym).copied();
+                if found.is_none() {
+                    let name = self.interner.resolve(sym.0).unwrap_or("?").to_string();
+                    self.note_inline_decline(format!(
+                        "it refers to `{name}`, which is neither one of its parameters nor one \
+                         of its locals"
+                    ));
+                }
+                found
+            }
+
+            // Inside an inlined free function a field read is a read of a
+            // value: the object is one of the function's parameters or
+            // locals, never a model found by its NAME. The name-based path
+            // below would bind a parameter called `m` to the block's model
+            // `m` whatever the caller passed (models themselves cannot be
+            // passed in; see `inline_user_fn`). Only `.shape`, `.ndim` and a
+            // field of a dict (the step's batch) are values source AD can
+            // read; anything else declines.
+            ExprKind::MemberAccess { object, member } if self.in_function_frame() => {
+                let member_name = self.interner.resolve(member.0).unwrap_or("?").to_string();
+                let is_dict = matches!(
+                    self.type_map.and_then(|tm| tm.get(&object.id)),
+                    Some(nsl_semantic::types::Type::Dict(..))
+                );
+                let op = match member_name.as_str() {
+                    "shape" | "ndim" => PrimalOp::Passthrough(member_name.clone()),
+                    _ if is_dict => PrimalOp::Passthrough(format!("dict_get:{member_name}")),
+                    _ => {
+                        self.note_inline_decline(format!(
+                            "it reads the field `.{member_name}` of a value whose type source \
+                             AD cannot resolve inside a function"
+                        ));
+                        return None;
+                    }
+                };
+                let obj_var = self.extract_expr(object)?;
+                let result = self.alloc_var();
+                self.push_op(WengertOp {
+                    id: self.list.ops.len() as u32,
+                    result,
+                    op,
+                    inputs: vec![obj_var],
+                    saved_for_backward: false,
+                    checkpointed: false,
+                });
+                Some(result)
+            }
 
             // Field access: self.w, m.w, block.attn → treat as a parameter reference
             ExprKind::MemberAccess { object, member } => {
@@ -4736,8 +4964,13 @@ impl<'a> WengertExtractor<'a> {
             }
 
             ExprKind::Call { callee, args } => {
-                // Check for model method calls: obj.method(args) → inline the method body
-                if let ExprKind::MemberAccess { object, member } = &callee.kind {
+                // Check for model method calls: obj.method(args) → inline the method body.
+                // Not inside an inlined free function: there the receiver is
+                // a value, and dispatching on its NAME would bind a
+                // parameter called `m` to the block's model `m`.
+                if !self.in_function_frame()
+                    && let ExprKind::MemberAccess { object, member } = &callee.kind
+                {
                     let method_name = self.interner.resolve(member.0).unwrap_or("?").to_string();
 
                     // Case 1: obj.method(args) where obj is an Ident (e.g., m.forward_train(...))
@@ -5018,6 +5251,7 @@ impl<'a> WengertExtractor<'a> {
                         _ => format!("{:?}", std::mem::discriminant(&object.kind)),
                     };
                     nsl_log::nsl_log!(INFO, "source-ad", "[source-ad] unresolved method call: {}.{}() — model type not found in method bodies", obj_desc, method);
+                    self.note_inline_decline(format!("it calls the method `.{method}()`, which source AD does not resolve inside a function"));
                     return None;
                 } else {
                     nsl_log::nsl_log!(WARN, "source-ad", 
@@ -5037,19 +5271,23 @@ impl<'a> WengertExtractor<'a> {
                     }
                 }
 
-                // A function this module declares is the function the call
-                // names, whatever a builtin of the same name computes: inline
-                // its body. (Without this the by-name table below answered
-                // for it, or -- for a name the table does not know -- the
-                // whole block fell back to the tape.) Synthesised callees
-                // carry a sentinel symbol and are never user functions; a
-                // local binding of the same name is a value, not this fn.
+                // A function the module this call is written in declares is
+                // the function the call names, whatever a builtin of the same
+                // name computes: inline its body. "The module this call is
+                // written in" is the module being compiled for the block's
+                // own body and its functions, and the imported module for a
+                // body inlined from one: a library function never calls the
+                // user's `fn sq` because the user happens to declare one.
+                // Synthesised callees carry a sentinel symbol and are never
+                // user functions; a local binding of the same name is a
+                // value, not this fn.
                 if !self.synth_call_names.contains_key(&callee.id)
                     && let ExprKind::Ident(callee_sym) = &callee.kind
                     && !self.symbol_to_var.contains_key(callee_sym)
-                    && let Some(fn_def) = self.local_fn_bodies.get(&func_name).cloned()
+                    && let Some(fn_def) = self.own_module_fn(&func_name)
                 {
-                    return self.inline_user_fn(&func_name, &fn_def, args, &input_vars);
+                    let module = self.current_module().map(str::to_string);
+                    return self.inline_user_fn(&func_name, module, &fn_def, args, &input_vars);
                 }
 
                 let result = self.alloc_var();
@@ -5282,7 +5520,7 @@ impl<'a> WengertExtractor<'a> {
                             return Some(result);
                         }
                         // No enabled decorator: the composite.
-                        let Some(fn_def) = self.imported_fn_bodies.get("fused_kl_ce").cloned()
+                        let Some(body) = self.imported_fns.by_name.get("fused_kl_ce").cloned()
                         else {
                             nsl_log::nsl_log!(WARN, "source-ad",
                                 "[source-ad] fused_kl_ce: the standard-library definition is not \
@@ -5292,8 +5530,13 @@ impl<'a> WengertExtractor<'a> {
                             );
                             return None;
                         };
-                        let composite =
-                            self.inline_user_fn("fused_kl_ce", &fn_def, args, &input_vars)?;
+                        let composite = self.inline_user_fn(
+                            "fused_kl_ce",
+                            Some(body.module),
+                            &body.def,
+                            args,
+                            &input_vars,
+                        )?;
                         self.kl_ce_calls.push(KlCeCall { alpha, temperature, fused: false });
                         return Some(composite);
                     }
@@ -6105,10 +6348,19 @@ impl<'a> WengertExtractor<'a> {
                         // for: inline its body, as for a function of this
                         // module.
                         if !self.synth_call_names.contains_key(&callee.id)
-                            && let Some(fn_def) = self.imported_fn_bodies.get(&func_name).cloned()
+                            && let Some(body) = self.imported_fns.by_name.get(&func_name).cloned()
                         {
-                            return self.inline_user_fn(&func_name, &fn_def, args, &input_vars);
+                            return self.inline_user_fn(
+                                &func_name,
+                                Some(body.module),
+                                &body.def,
+                                args,
+                                &input_vars,
+                            );
                         }
+                        self.note_inline_decline(format!(
+                            "it calls `{func_name}`, which source AD has no rule for"
+                        ));
                         nsl_log::nsl_log!(WARN, "source-ad",
                             "[source-ad] warning: unrecognized FFI callee '{}': source AD has \
                              no rule for it, and it is not a function whose body can be \
@@ -6184,7 +6436,11 @@ impl<'a> WengertExtractor<'a> {
                 // `is_model_param` before the recursive descent that
                 // would register intermediate contexts, locking in the
                 // wrong classification.
-                self.preregister_chain_contexts(expr);
+                // Not inside an inlined free function: there the object is a
+                // value, and the pre-pass resolves names.
+                if !self.in_function_frame() {
+                    self.preregister_chain_contexts(expr);
+                }
 
                 let obj = self.extract_expr(object)?;
                 if let nsl_ast::expr::SubscriptKind::Index(idx_expr) = index.as_ref() {
@@ -6559,6 +6815,7 @@ impl<'a> WengertExtractor<'a> {
     fn inline_user_fn(
         &mut self,
         name: &str,
+        module: Option<String>,
         fn_def: &nsl_ast::decl::FnDef,
         call_args: &[nsl_ast::expr::Arg],
         arg_vars: &[VarId],
@@ -6577,11 +6834,14 @@ impl<'a> WengertExtractor<'a> {
                 name, why
             );
         };
-        if self.fn_inline_stack.iter().any(|n| n == name) {
+        let recursive = self.inline_frames.iter().any(|frame| {
+            matches!(frame, InlineFrame::Function { name: n, module: m } if n == name && *m == module)
+        });
+        if recursive {
             decline("it is recursive");
             return None;
         }
-        if self.fn_inline_stack.len() >= MAX_INLINE_DEPTH {
+        if self.inline_frames.len() >= MAX_INLINE_DEPTH {
             decline("the call chain is too deep");
             return None;
         }
@@ -6597,8 +6857,10 @@ impl<'a> WengertExtractor<'a> {
             decline("it is async");
             return None;
         }
-        if !body_is_extractable(&fn_def.body.stmts) {
-            decline("its body has a statement source AD does not extract");
+        if let Err(why) =
+            body_is_extractable(&fn_def.body.stmts, &function_own_names(fn_def), self.interner)
+        {
+            decline(&why);
             return None;
         }
         // The if/else merge handles a `return` in both arms of a final
@@ -6619,15 +6881,27 @@ impl<'a> WengertExtractor<'a> {
             decline("a named argument is not in its parameter's position");
             return None;
         }
+        // A model passed in would have to be found again through the
+        // parameter by name, which is how a parameter called `m` used to
+        // bind to the block's model `m` whatever the caller passed. Inside
+        // the inlined body every name is a value; a model argument is left
+        // to the tape.
+        if let Some(i) = call_args.iter().position(|a| self.expr_denotes_model(&a.value)) {
+            decline(&format!("argument {} is a model instance", i + 1));
+            return None;
+        }
 
-        // The callee sees its parameters and the module-level names, never
-        // the caller's locals; `self` means nothing in a free function.
-        let saved_symbols = std::mem::replace(&mut self.symbol_to_var, self.root_scope.clone());
+        // The callee sees its own parameters and locals and nothing else: a
+        // function body cannot name the caller's variables (the checker
+        // refuses a free name there), and none of them may leak in by
+        // accident. `self` means nothing in a free function.
+        let saved_symbols = std::mem::take(&mut self.symbol_to_var);
         let saved_self = self.self_context.take();
         let saved_output = self.list.output;
+        let saved_decline = self.inline_decline.take();
         // `frozen_inline_depth` is deliberately left alone: a helper called
         // from inside the teacher's forward is still the teacher's forward.
-        self.fn_inline_stack.push(name.to_string());
+        self.inline_frames.push(InlineFrame::Function { name: name.to_string(), module });
 
         let mut ok = true;
         for (i, param) in fn_def.params.iter().enumerate() {
@@ -6653,16 +6927,18 @@ impl<'a> WengertExtractor<'a> {
             ok = self.extract_stmts(&fn_def.body.stmts);
         }
         let result = self.list.output;
+        let why = self.inline_decline.take();
 
-        self.fn_inline_stack.pop();
+        self.inline_frames.pop();
         self.symbol_to_var = saved_symbols;
         self.self_context = saved_self;
         self.list.output = saved_output;
+        self.inline_decline = saved_decline;
 
         if !ok {
-            // `extract_stmts` (or the default-argument extraction) has
-            // already said what it could not take.
-            decline("its body or a default argument has an expression source AD does not extract");
+            decline(why.as_deref().unwrap_or(
+                "its body or a default argument has an expression source AD does not extract",
+            ));
             return None;
         }
         if result == NO_RETURN {
@@ -6711,6 +6987,21 @@ impl<'a> WengertExtractor<'a> {
 
     /// Inline a method body with pre-extracted argument bindings.
     fn inline_method_body(
+        &mut self,
+        fn_def: &nsl_ast::decl::FnDef,
+        extracted_args: Vec<(nsl_ast::Symbol, String, VarId)>,
+        model_type: Option<&str>,
+    ) -> Option<VarId> {
+        // A call written in the method resolves in the module that declares
+        // the model; names in it are resolved as the method's own.
+        let module = model_type.and_then(|ty| self.imported_fns.model_modules.get(ty)).cloned();
+        self.inline_frames.push(InlineFrame::Method { module });
+        let result = self.inline_method_body_in_frame(fn_def, extracted_args, model_type);
+        self.inline_frames.pop();
+        result
+    }
+
+    fn inline_method_body_in_frame(
         &mut self,
         fn_def: &nsl_ast::decl::FnDef,
         extracted_args: Vec<(nsl_ast::Symbol, String, VarId)>,

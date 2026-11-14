@@ -87,35 +87,46 @@ pub struct ModuleGraph {
 }
 
 impl ModuleGraph {
-    /// The undecorated free functions of every module but the entry, by
-    /// name, for source AD to inline (`ImportedModelOptions::fn_bodies`).
+    /// The undecorated free functions and the models of every module but
+    /// the entry, for source AD to inline
+    /// (`ImportedModelOptions::functions`).
     ///
     /// Imported functions are registered with codegen under their bare
     /// name, whichever module they come from, so a name two modules both
-    /// declare cannot be attributed to one body; such names are left out.
-    pub fn imported_fn_bodies(
-        &self,
-        interner: &Interner,
-    ) -> HashMap<String, nsl_ast::decl::FnDef> {
-        let mut bodies: HashMap<String, nsl_ast::decl::FnDef> = HashMap::new();
+    /// declare cannot be attributed to one body; such names are left out of
+    /// the by-name view. Each module's own table keeps them: a call written
+    /// inside that module resolves there.
+    pub fn imported_functions(&self, interner: &Interner) -> nsl_codegen::ImportedFunctions {
+        let mut out = nsl_codegen::ImportedFunctions::default();
         let mut ambiguous: HashSet<String> = HashSet::new();
         for path in &self.dep_order {
             if *path == self.entry {
                 continue;
             }
+            let module = path.display().to_string();
+            let own = out.by_module.entry(module.clone()).or_default();
             for stmt in &self.modules[path].ast.stmts {
-                if let StmtKind::FnDef(fn_def) = &stmt.kind {
-                    let name = interner.resolve(fn_def.name.0).unwrap_or("<unknown>").to_string();
-                    if bodies.insert(name.clone(), fn_def.clone()).is_some() {
-                        ambiguous.insert(name);
+                match &stmt.kind {
+                    StmtKind::FnDef(fn_def) => {
+                        let name = interner.resolve(fn_def.name.0).unwrap_or("<unknown>").to_string();
+                        own.insert(name.clone(), fn_def.clone());
+                        let body = nsl_codegen::ImportedFnBody { module: module.clone(), def: fn_def.clone() };
+                        if out.by_name.insert(name.clone(), body).is_some() {
+                            ambiguous.insert(name);
+                        }
                     }
+                    StmtKind::ModelDef(model_def) => {
+                        let name = interner.resolve(model_def.name.0).unwrap_or("<unknown>").to_string();
+                        out.model_modules.insert(name, module.clone());
+                    }
+                    _ => {}
                 }
             }
         }
         for name in &ambiguous {
-            bodies.remove(name);
+            out.by_name.remove(name);
         }
-        bodies
+        out
     }
 }
 

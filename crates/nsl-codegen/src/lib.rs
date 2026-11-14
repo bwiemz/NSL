@@ -1552,13 +1552,39 @@ pub struct ImportedModelOptions {
     /// `int(self._n_heads.item())` reads these back, so the arena's shape
     /// propagation needs them to fold attention reshape targets.
     pub field_values: std::collections::HashMap<String, std::collections::HashMap<String, f64>>,
-    /// The undecorated free functions declared in imported modules (the
-    /// standard library included), by name. Source AD inlines a call to one
-    /// that it has no built-in rule for, instead of sending the whole block
-    /// to the tape; `fused_kl_ce` reaches its composite this way. A name
-    /// declared by more than one imported module is left out: the call
-    /// cannot be attributed.
-    pub fn_bodies: std::collections::HashMap<String, nsl_ast::decl::FnDef>,
+    /// The free functions and models of the imported modules, for source AD
+    /// to inline (see [`ImportedFunctions`]).
+    pub functions: ImportedFunctions,
+}
+
+/// What source AD needs to know about the imported modules to inline a call
+/// into one of them, and to resolve the calls made inside the inlined body
+/// in the module that body was written in.
+#[derive(Clone, Default)]
+pub struct ImportedFunctions {
+    /// The undecorated free functions of every imported module (the standard
+    /// library included), by name, with the module that declares each. A
+    /// call from the module being compiled to a function the builtin table
+    /// has no rule for is inlined from here; `fused_kl_ce` reaches its
+    /// composite this way. A name declared by more than one imported module
+    /// is left out: such a call cannot be attributed.
+    pub by_name: std::collections::HashMap<String, ImportedFnBody>,
+    /// The same functions per module: `module -> name -> body`. A call
+    /// written inside an imported body resolves against its own module's
+    /// functions first, as it does when that module is compiled.
+    pub by_module:
+        std::collections::HashMap<String, std::collections::HashMap<String, nsl_ast::decl::FnDef>>,
+    /// The module that declares each imported model, by model name, so a
+    /// call written inside one of its methods resolves in that module.
+    pub model_modules: std::collections::HashMap<String, String>,
+}
+
+/// An imported free function: its body and the module that declares it.
+#[derive(Clone)]
+pub struct ImportedFnBody {
+    /// The declaring module (its path, as the module loader names it).
+    pub module: String,
+    pub def: nsl_ast::decl::FnDef,
 }
 
 /// ZeRO optimizer-sharding options (`--zero-stage`, `--zero-elementwise`).

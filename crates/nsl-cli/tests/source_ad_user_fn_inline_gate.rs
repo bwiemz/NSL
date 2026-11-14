@@ -250,3 +250,212 @@ print(g)
     // sum(z^3) = 1 + 8 + 27; d/dz = 3 z^2.
     assert_close(&got, &[36.0, 3.0, 12.0, 27.0], "power(w, 3)");
 }
+
+// ---------------------------------------------------------------------------
+// Writes the extraction does not implement
+// ---------------------------------------------------------------------------
+
+/// A write into a tensor inside a function: `y[0, 0] = 0.0` after
+/// `y = x * 2` with `x = [[1, 2], [3, 4]]` leaves `y = [[0, 4], [6, 8]]`,
+/// whose sum is 18. Inlined, the write used to vanish and the loss came out
+/// as 20. The function is now left to the tape, which performs the write.
+///
+/// Only the loss is asserted. The tape does not record `nsl_tensor_set`, so
+/// its gradient here is `[[2, 2], [2, 2]]` where `[[0, 2], [2, 2]]` is
+/// right; that is a defect of the tape, not of this fallback.
+#[test]
+fn a_function_that_writes_into_a_tensor_is_left_to_the_tape() {
+    let (got, stderr) = run_files(&[(
+        "prog.nsl",
+        r#"
+let w = arange(1.0, 5.0).reshape([2, 2])
+fn f(x: Tensor) -> Tensor:
+    let y = x * 2.0
+    y[0, 0] = 0.0
+    return sum(y)
+let (l, g) = grad(w):
+    f(w)
+print(l)
+"#,
+    )]);
+    assert!(
+        stderr.contains("'f' cannot be inlined") && stderr.contains("writes through a subscript or a field"),
+        "the reason for the fallback must be stated:\n{stderr}"
+    );
+    assert_close(&got, &[18.0], "loss with the element write");
+}
+
+/// A write into a PARAMETER changes the caller's tensor. With
+/// `x[0, 0] = 10` the loss is `100 + 4 + 9 + 16 = 129`, and the caller's
+/// `w` reads `[[10, 2], [3, 4]]` afterwards. Inlined, both used to be lost:
+/// the loss was 30 and `w` was unchanged.
+#[test]
+fn a_write_into_a_parameter_reaches_the_caller() {
+    let (got, _) = run_files(&[(
+        "prog.nsl",
+        r#"
+let w = arange(1.0, 5.0).reshape([2, 2])
+fn f(x: Tensor) -> Tensor:
+    x[0, 0] = 10.0
+    return sum(x * x)
+let (l, g) = grad(w):
+    f(w)
+print(l)
+print(w)
+"#,
+    )]);
+    assert_close(&got, &[129.0, 10.0, 2.0, 3.0, 4.0], "loss, then the caller's w");
+}
+
+/// The same element write in a grad block's own body: it used to be
+/// dropped there too (loss 20). The block now runs on the tape.
+#[test]
+fn an_element_write_in_a_block_body_is_left_to_the_tape() {
+    let (got, stderr) = run_files(&[(
+        "prog.nsl",
+        r#"
+let w = arange(1.0, 5.0).reshape([2, 2])
+let (l, g) = grad(w):
+    let y = w * 2.0
+    y[0, 0] = 0.0
+    sum(y)
+print(l)
+"#,
+    )]);
+    assert!(stderr.contains("assignment through a subscript or a field"), "{stderr}");
+    assert_close(&got, &[18.0], "loss with the element write");
+}
+
+// ---------------------------------------------------------------------------
+// Names resolve where the inlined code was written
+// ---------------------------------------------------------------------------
+
+const MYLIB: &str = r#"
+fn sq(x: Tensor) -> Tensor:
+    return sum(x * x)
+
+fn half_sq(x: Tensor) -> Tensor:
+    return sq(x) * 0.5
+
+fn relu(x: Tensor) -> Tensor:
+    return x * 2.0
+
+fn act(x: Tensor) -> Tensor:
+    return sum(relu(x))
+
+fn helper(x: Tensor) -> Tensor:
+    return x * 3.0
+
+model Scaler:
+    w: Tensor = full([3], 1.0)
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return sum(helper(x * self.w))
+"#;
+
+/// An imported function calls its own module's `sq`, not the `sq` the
+/// importing module declares. `0.5 * sum(w * w)` at `w = [1, 2, 3]` is 7
+/// with gradient `w`; the captured `sq` (`sum(x)`) gave 3 and 0.5.
+#[test]
+fn an_imported_function_calls_its_own_modules_function() {
+    let (got, stderr) = run_files(&[
+        (
+            "prog.nsl",
+            "from mylib import half_sq\n\
+             fn sq(x: Tensor) -> Tensor:\n\
+             \x20   return sum(x)\n\
+             let w = arange(1.0, 4.0)\n\
+             let (l, g) = grad(w):\n\
+             \x20   half_sq(w)\n\
+             print(l)\n\
+             print(g)\n",
+        ),
+        ("mylib.nsl", MYLIB),
+    ]);
+    assert_compile_time(&stderr);
+    assert_close(&got, &[7.0, 1.0, 2.0, 3.0], "half_sq");
+}
+
+/// An imported module's own `fn relu` is the function its code calls, not
+/// the builtin. `sum(2 * w)` at `w = -1.5` (three elements) is -9 with
+/// gradient 2; the builtin relu gave 0 and 0.
+#[test]
+fn an_imported_modules_function_named_like_a_builtin_is_its_own() {
+    let (got, stderr) = run_files(&[
+        (
+            "prog.nsl",
+            "from mylib import act\n\
+             let w = full([3], -1.5)\n\
+             let (l, g) = grad(w):\n\
+             \x20   act(w)\n\
+             print(l)\n\
+             print(g)\n",
+        ),
+        ("mylib.nsl", MYLIB),
+    ]);
+    assert_compile_time(&stderr);
+    assert_close(&got, &[-9.0, 2.0, 2.0, 2.0], "act");
+}
+
+/// A method of an imported model calls its own module's `helper`, not the
+/// importing module's. `sum(3 * w * 1)` at `w = [1, 2, 3]` is 18 with
+/// gradient 3; the captured `helper` (`x * 100`) gave 600 and 100.
+#[test]
+fn a_method_of_an_imported_model_calls_its_own_modules_function() {
+    let (got, stderr) = run_files(&[
+        (
+            "prog.nsl",
+            "from mylib import Scaler\n\
+             fn helper(x: Tensor) -> Tensor:\n\
+             \x20   return x * 100.0\n\
+             let k = Scaler()\n\
+             let w = arange(1.0, 4.0)\n\
+             let (l, g) = grad(w):\n\
+             \x20   k.forward(w)\n\
+             print(l)\n\
+             print(g)\n",
+        ),
+        ("mylib.nsl", MYLIB),
+    ]);
+    assert_compile_time(&stderr);
+    assert_close(&got, &[18.0, 3.0, 3.0, 3.0], "Scaler.forward");
+}
+
+/// Two models with a `scale` method; a function takes the second one in a
+/// parameter that happens to be called `m`, like the first. Inside the
+/// inlined body `m.scale(x)` and `m.w` used to resolve to the model NAMED
+/// `m`, whatever was passed: 12 and gradient 2 where the program computes
+/// `sum(w * 5) = 30` and 5. A model argument now leaves the function to
+/// the tape, and inside a function no name is resolved as a model.
+#[test]
+fn a_parameter_named_like_a_model_is_the_argument_passed() {
+    let models = "model M:\n\
+                  \x20   w: Tensor = full([3], 2.0)\n\
+                  \n\
+                  \x20   fn scale(self, x: Tensor) -> Tensor:\n\
+                  \x20       return x * self.w\n\
+                  \n\
+                  model N:\n\
+                  \x20   w: Tensor = full([3], 5.0)\n\
+                  \n\
+                  \x20   fn scale(self, x: Tensor) -> Tensor:\n\
+                  \x20       return x * self.w\n\
+                  \n\
+                  let m = M()\n\
+                  let n = N()\n\
+                  let w = arange(1.0, 4.0)\n";
+    for (what, body) in [("method call", "sum(m.scale(x))"), ("field read", "sum(x * m.w)")] {
+        let source = format!(
+            "{models}fn apply(m: N, x: Tensor) -> Tensor:\n\
+             \x20   return {body}\n\
+             let (l, g) = grad(w):\n\
+             \x20   apply(n, w)\n\
+             print(l)\n\
+             print(g)\n"
+        );
+        let (got, stderr) = run(&source);
+        assert!(stderr.contains("'apply' cannot be inlined") && stderr.contains("is a model instance"), "{what}:\n{stderr}");
+        assert_close(&got, &[30.0, 5.0, 5.0, 5.0], what);
+    }
+}
+
