@@ -15,9 +15,12 @@
 //!   without materializing either logit tensor in HBM;
 //! - remaining paper innovations surface as **advisory** plan entries in v1
 //!   (repo doctrine: opt-in, gate-off byte-identical, advisory before
-//!   consumed): spectral logit-compression rank (`cpkd_spectral`), WGGO
-//!   per-layer feature-match/attn-transfer/teacher-stream choices
-//!   (`wggo_cpkd`), and CEP-guided student design (`cpkd_student`).
+//!   consumed): WGGO per-layer feature-match/attn-transfer/teacher-stream
+//!   choices (`wggo_cpkd`), and CEP-guided student design
+//!   (`cpkd_student`). Spectral top-k logit compression is not one of
+//!   them: the rank of the LM head does not give a top-k (it bounds the
+//!   dimension of the logit subspace, not the number of tokens that carry
+//!   probability), and its selector was removed.
 //!
 //! v1 deferrals refuse loudly (never degrade silently):
 //! - two-stream teacher/student overlap: the runtime has no stream plumbing

@@ -226,7 +226,6 @@ pub mod cfie_speculative;
 pub mod cfie_speculative_ptx;
 pub mod cpkd;
 pub mod cpkd_fused_loss;
-pub mod cpkd_spectral;
 pub mod cpkd_student;
 pub mod csha;
 pub mod csha_apply;

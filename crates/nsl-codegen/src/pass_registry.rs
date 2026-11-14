@@ -521,7 +521,6 @@ pub const PASSES: &[PassDescriptor] = &[
         source_files: &[
             "crates/nsl-codegen/src/cpkd.rs",
             "crates/nsl-codegen/src/cpkd_fused_loss.rs",
-            "crates/nsl-codegen/src/cpkd_spectral.rs",
             "crates/nsl-codegen/src/cpkd_student.rs",
         ],
         // Design-time analysis only — CPKD's runtime half is driven by the
