@@ -277,8 +277,10 @@ fn f32s(bytes: &[u8]) -> Vec<f32> {
 
 /// `(loss, lse)` per row. Kernel A stages each logit in the storage dtype
 /// before its tile's max and sum, so the lse is over rounded logits; Kernel
-/// B recomputes the target's logit in f32 and does not round it. An ignored
-/// row is `(0, 0)`.
+/// B recomputes the target's logit and rounds it the same way, so the loss
+/// is the cross-entropy of the rounded logits. (The hand Kernel B did not
+/// round it: at 16 bits its loss was the lse of one logit vector minus an
+/// entry of another.) An ignored row is `(0, 0)`.
 fn reference(c: &Case, input: &Inputs) -> Vec<(f64, f64)> {
     let (v, h) = (c.vocab as usize, c.hidden as usize);
     let round = |x: f64| stored(c.dtype, x as f32).1 as f64;
@@ -296,7 +298,7 @@ fn reference(c: &Case, input: &Inputs) -> Vec<(f64, f64)> {
             let logits: Vec<f64> = (0..v).map(|j| round(logit(j))).collect();
             let m = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
             let lse = m + logits.iter().map(|l| (l - m).exp()).sum::<f64>().ln();
-            (lse - logit(t as usize), lse)
+            (lse - logits[t as usize], lse)
         })
         .collect()
 }
@@ -329,9 +331,22 @@ fn cases() -> Vec<Case> {
 // The gate
 // ---------------------------------------------------------------------------
 
+/// Bit agreement with the hand kernels: both kernels at f32, and Kernel A
+/// (the partials) at every dtype. Kernel B's loss differs at 16 bits by
+/// design, see [`reference`].
 #[test]
 fn the_kir_kernels_agree_with_the_hand_written_ones_bit_for_bit() {
     for c in cases() {
+        if c.dtype != Dtype::F32 {
+            let (hand, kir) = (hand_ptx(&c), kir_ptx(&c));
+            let input = inputs(&c, 0x5eed ^ c.vocab as u64);
+            for order in [Order::Ascending, Order::Descending] {
+                let (expect, got) = (run(&hand, &c, &input, order), run(&kir, &c, &input, order));
+                assert!(expect[PARTIALS] == got[PARTIALS], "{c:?} {order:?}: partials differ");
+                assert!(expect[LSE] == got[LSE], "{c:?} {order:?}: lse differs");
+            }
+            continue;
+        }
         let (hand, kir) = (hand_ptx(&c), kir_ptx(&c));
         let input = inputs(&c, 0x5eed ^ c.vocab as u64);
         for order in [Order::Ascending, Order::Descending] {
@@ -365,7 +380,14 @@ fn a_vocab_past_the_threshold_routes_here_and_agrees() {
         let routed = text(synthesize_fused_linear_ce_ptx(&c.cfg()));
         assert_eq!(routed, kir_ptx(&c));
         let input = inputs(&c, 3);
-        assert!(run(&hand_ptx(&c), &c, &input, Order::Ascending) == run(&routed, &c, &input, Order::Ascending));
+        let (hand, got) = (run(&hand_ptx(&c), &c, &input, Order::Ascending), run(&routed, &c, &input, Order::Ascending));
+        // Kernel B's loss differs from the hand kernel's at 16 bits by
+        // design (see `reference`); everything else is the same bytes.
+        if dtype == Dtype::F32 {
+            assert!(hand == got);
+        } else {
+            assert!(hand[PARTIALS] == got[PARTIALS] && hand[LSE] == got[LSE]);
+        }
     }
 }
 
@@ -441,16 +463,18 @@ fn mutation_cases() -> Vec<Case> {
     cases().into_iter().filter(|c| c.vocab == 1100 && c.dtype != Dtype::Bf16).collect()
 }
 
-/// Whether `mutate(kir)` is told apart from the hand module for some
-/// mutation case: under either schedule its memory differs, or the
-/// interpreter faults on it.
+/// Whether `mutate(kir)` is told apart from the unmutated KIR module for
+/// some mutation case: under either schedule its memory differs, or the
+/// interpreter faults on it. (The baseline is the KIR module, which the
+/// gates above hold to the hand kernels at f32 and to the reference at
+/// every dtype; at 16 bits the hand kernels are not the answer.)
 fn caught(mutate: impl Fn(&str) -> String) -> bool {
     mutation_cases().into_iter().any(|c| {
         let input = inputs(&c, 11);
-        let hand = hand_ptx(&c);
-        let mutant = mutate(&kir_ptx(&c));
+        let kir = kir_ptx(&c);
+        let mutant = mutate(&kir);
         [Order::Ascending, Order::Descending].into_iter().any(|order| {
-            let expect = run(&hand, &c, &input, order);
+            let expect = run(&kir, &c, &input, order);
             let (c, input) = (&c, &input);
             match std::panic::catch_unwind(|| run(&mutant, c, input, order)) {
                 Ok(mem) => mem != expect,

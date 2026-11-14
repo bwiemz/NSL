@@ -8,7 +8,7 @@
 //! (`tests/support/cta_ptx_interp.rs`), one CTA per row as the host
 //! launches them.
 //!
-//! 1. **Agreement**: for every dtype and geometry below, under two thread
+//! 1. **Agreement**: at f32, for every geometry below, under two thread
 //!    schedules, the hand module and the KIR module leave *the same bytes*
 //!    in all of global memory — `dx`, `dW` and `dbias`, including ignored
 //!    rows (whose `dx` row is zeroed) and a target past the vocab. The
@@ -18,6 +18,17 @@
 //!    per-thread order, so the sums agree bit for bit.
 //! 2. **Correctness**: those bytes are the gradient of the cross-entropy of
 //!    the linear head, against an f64 reference over the same inputs.
+//!
+//!    At fp16 and bf16 the hand kernels are NOT the reference. The forward
+//!    stages each logit in the storage dtype, so its loss and saved lse are
+//!    over ROUNDED logits; the hand backward took its softmax from the
+//!    unrounded f32 logit against that lse, so its probabilities did not sum
+//!    to one and its gradient was not the gradient of the forward's loss.
+//!    This gate used to hand the backward an lse it computed itself from
+//!    unrounded logits, which is how the two agreed here and nowhere else.
+//!    The lse below is the forward's, and
+//!    `the_hand_kernels_miss_the_forwards_gradient_at_16_bits` holds the
+//!    hand kernels to failing against it.
 //! 3. **The gate bites**: deleting any scatter, running any loop one trip
 //!    long, relaxing a guard, nudging a baked constant, the ignore index or
 //!    the target's `1` is caught, and the one equivalent mutant is named.
@@ -144,10 +155,14 @@ struct Inputs {
     lse: Vec<f32>,
 }
 
-/// Row `r`'s logit at column `j`, in f64 from the widened inputs.
+/// Row `r`'s logit at column `j` as the forward kernel stages it: the f32
+/// fused dot over the widened inputs, in index order, plus the bias, then
+/// rounded to the storage dtype. (The dot is taken in f32, not f64, so the
+/// rounding to 16 bits lands on the same side as the kernel's.)
 fn logit(c: &Case, x: &[f32], w: &[f32], bias: &[f32], r: usize, j: usize) -> f64 {
     let h = c.hidden as usize;
-    (0..h).map(|k| x[r * h + k] as f64 * w[j * h + k] as f64).sum::<f64>() + bias[j] as f64
+    let dot = (0..h).fold(0.0f32, |acc, k| x[r * h + k].mul_add(w[j * h + k], acc));
+    stored(c.dtype, dot + bias[j]).1 as f64
 }
 
 fn inputs(c: &Case, seed: u64) -> Inputs {
@@ -308,7 +323,7 @@ fn cases() -> Vec<Case> {
 
 #[test]
 fn the_kir_kernel_agrees_with_the_hand_written_one_bit_for_bit() {
-    for c in cases() {
+    for c in cases().into_iter().filter(|c| c.dtype == Dtype::F32) {
         let (hand, kir) = (hand_ptx(&c), kir_ptx(&c));
         let input = inputs(&c, 0x5eed ^ c.vocab as u64);
         for order in [Order::Ascending, Order::Descending] {
@@ -338,6 +353,54 @@ fn the_shared_answer_is_the_gradient() {
                 assert!((*g as f64 - w).abs() <= tol * (1.0 + w.abs()), "{c:?}: {name}[{i}] {g} vs {w}");
             }
         }
+    }
+}
+
+/// The largest relative error of `ptx`'s bias gradient against the
+/// reference, over the vocabulary. `dbias[v]` is a sum over rows of
+/// `(p_v - [v == target]) * scale`: no entry is near zero, and a relative
+/// error in a row's `p_v` shows in it undiluted. (The `1 + |want|` measure
+/// of the gate above is dominated by the handful of target entries, which
+/// are hundreds of times larger than the rest.)
+fn worst_bias_gradient_error(ptx: &str, c: &Case, input: &Inputs) -> f64 {
+    let mem = run(ptx, c, input, Order::Ascending);
+    let (_, _, dbias) = reference(c, input);
+    f32s(&mem[DBIAS]).iter().zip(&dbias).map(|(g, w)| (*g as f64 - w).abs() / w.abs()).fold(0.0, f64::max)
+}
+
+/// The defect the 16-bit backward had, shown on the frozen hand kernels:
+/// given the forward's lse (over logits rounded to the storage dtype), a
+/// softmax taken from unrounded logits is not the gradient. Each
+/// probability is off by the factor `exp(rounding of its logit)`: up to
+/// about 4e-3 of a logit near 1 at bf16 (eight significand bits), and an
+/// eighth of that at fp16.
+#[test]
+fn the_hand_kernels_miss_the_forwards_gradient_at_16_bits() {
+    for c in cases() {
+        let input = inputs(&c, 0x5eed ^ c.vocab as u64);
+        let kir = worst_bias_gradient_error(&kir_ptx(&c), &c, &input);
+        let hand = worst_bias_gradient_error(&hand_ptx(&c), &c, &input);
+        assert!(kir < 2e-5, "{c:?}: the KIR kernel's bias gradient is off by {kir:e}");
+        match c.dtype {
+            Dtype::F32 => assert!(hand < 2e-5, "{c:?}: hand {hand:e}"),
+            Dtype::Bf16 => assert!(hand > 1e-3, "{c:?}: the hand kernel is only {hand:e} off"),
+            Dtype::F16 => assert!(hand > 1e-4, "{c:?}: the hand kernel is only {hand:e} off"),
+        }
+    }
+}
+
+/// The probabilities the backward forms sum to one, so the bias gradient
+/// sums to zero over the vocabulary: `sum_v dbias[v] = scale * sum_rows
+/// (sum_v p_v - 1)`. Independent of the reference above. (Rows whose target
+/// is past the vocab have no `-1` and are left out of the cases here.)
+#[test]
+fn the_bias_gradient_sums_to_zero() {
+    for dtype in [Dtype::F32, Dtype::F16, Dtype::Bf16] {
+        let c = Case { dtype, vocab: 600, hidden: 24, vocab_tile: 256, targets: vec![5, IGNORE, 599, 300, 0, 256] };
+        let input = inputs(&c, 77);
+        let mem = run(&kir_ptx(&c), &c, &input, Order::Ascending);
+        let total: f64 = f32s(&mem[DBIAS]).iter().map(|&g| g as f64).sum();
+        assert!(total.abs() < 2e-5, "{dtype:?}: the bias gradient sums to {total:e}");
     }
 }
 
@@ -380,16 +443,18 @@ fn mutation_cases() -> Vec<Case> {
     cases().into_iter().filter(|c| c.vocab == 600 && c.dtype != Dtype::Bf16).collect()
 }
 
-/// Whether `mutate(kir)` is told apart from the hand kernel for some
-/// mutation case: under either schedule its memory differs, or the
-/// interpreter faults on it.
+/// Whether `mutate(kir)` is told apart from the unmutated KIR module for
+/// some mutation case: under either schedule its memory differs, or the
+/// interpreter faults on it. (The baseline is the KIR module, which the
+/// gates above hold to the hand kernels at f32 and to the reference at
+/// every dtype; at 16 bits the hand kernels are not the answer.)
 fn caught(mutate: impl Fn(&str) -> String) -> bool {
     mutation_cases().into_iter().any(|c| {
         let input = inputs(&c, 11);
-        let hand = hand_ptx(&c);
-        let mutant = mutate(&kir_ptx(&c));
+        let kir = kir_ptx(&c);
+        let mutant = mutate(&kir);
         [Order::Ascending, Order::Descending].into_iter().any(|order| {
-            let expect = run(&hand, &c, &input, order);
+            let expect = run(&kir, &c, &input, order);
             let (c, input) = (&c, &input);
             match std::panic::catch_unwind(|| run(&mutant, c, input, order)) {
                 Ok(mem) => mem != expect,

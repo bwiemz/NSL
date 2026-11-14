@@ -569,6 +569,28 @@ fn to_elem(b: &mut KirBuilder, dtype: Dtype, v: VarId) -> VarId {
     narrow
 }
 
+/// An f32 logit as the forward kernels see it: rounded to the storage dtype
+/// and widened again. The identity at f32.
+///
+/// The forward kernels stage every logit in shared memory in the storage
+/// dtype, so at fp16 / bf16 the loss is the cross-entropy of the ROUNDED
+/// logits. Whatever else reads a logit has to read the same number: the
+/// backward (whose softmax is `exp(logit - lse)` against the forward's
+/// saved lse) and the large-vocab finalize (which recomputes the target's
+/// logit). Both used the unrounded f32 logit, so at the reduced dtypes the
+/// backward's probabilities did not sum to one -- the gradient was not the
+/// gradient of the loss the forward had computed -- and the large-vocab
+/// loss was not the cross-entropy of any one logit vector.
+fn as_staged_logit(b: &mut KirBuilder, dtype: Dtype, logit: VarId) -> VarId {
+    if dtype == Dtype::F32 {
+        return logit;
+    }
+    let narrow = to_elem(b, dtype, logit);
+    let wide = b.new_typed_var(KirType::F32);
+    b.emit(KirOp::Cast(wide, narrow, KirType::F32));
+    wide
+}
+
 /// `for (i = start; i < end; i += step) body(i)`, entered from the current
 /// block; the builder is left in the loop's exit block.
 fn counted_loop(
@@ -1121,7 +1143,7 @@ pub fn build_large_partials(cfg: &FusedLinearCEConfig) -> KernelIR {
 ///             m = max(max, tmax)
 ///             sum = sum * exp(max - m) + tsum * exp(tmax - m); max = m
 ///           lse = log(sum) + max
-///           loss = lse - (fma-dot(x[row], W[target]) + bias[target])
+///           loss = lse - elem(fma-dot(x[row], W[target]) + bias[target])
 ///           loss_out[row] = loss; lse_out[row] = lse
 /// skip      loss_out[row] = lse_out[row] = 0
 /// ```
@@ -1227,6 +1249,9 @@ pub fn build_large_finalize(cfg: &FusedLinearCEConfig) -> KernelIR {
     let bias_addr = at(&mut b, elem.clone(), Global, bias, target);
     let bias_v = load_elem(&mut b, dtype, bias_addr, Global);
     let logit_at_target = op2(&mut b, F32, KirOp::Add, dot, bias_v);
+    // The lse is over logits Kernel A rounded to the storage dtype; the
+    // target's logit is rounded the same way (see `as_staged_logit`).
+    let logit_at_target = as_staged_logit(&mut b, dtype, logit_at_target);
     let loss = op2(&mut b, F32, KirOp::Sub, lse, logit_at_target);
     b.emit(KirOp::Store(loss_addr, loss, Global));
     b.emit(KirOp::Store(lse_addr, lse, Global));
@@ -1316,7 +1341,7 @@ pub(crate) fn bottom_tested_loop(
 /// live      scale = grad_output / f32(num_valid)
 ///           per tile t, per sub-tile j (bottom-tested):
 ///             v = j*128 + tid + t*vtile; v < V ?
-///               logit = fma-dot(x[row], W[v]) + bias[v]
+///               logit = elem(fma-dot(x[row], W[v]) + bias[v])
 ///               p = exp(logit - lse[row]); v == target ? p -= 1
 ///               g = p * scale
 ///               per h (bottom-tested):
@@ -1327,7 +1352,9 @@ pub(crate) fn bottom_tested_loop(
 /// ```
 ///
 /// `x`, `W` and `bias` are in the storage dtype and widened to f32; `lse`
-/// and the three gradients are f32 whatever the dtype.
+/// and the three gradients are f32 whatever the dtype. `elem(..)` is the
+/// logit rounded to the storage dtype, as the forward staged it
+/// ([`as_staged_logit`]); at f32 it is the logit itself.
 pub fn build_backward(cfg: &FusedLinearCEConfig) -> KernelIR {
     use AddressSpace::Global;
     use KirType::{F32, I64, U32, U64};
@@ -1416,6 +1443,8 @@ pub fn build_backward(cfg: &FusedLinearCEConfig) -> KernelIR {
             })[0];
             let bias_v = elem_at(b, bias, v);
             let logit = op2(b, F32, KirOp::Add, dot, bias_v);
+            // The logit the forward's lse was taken over.
+            let logit = as_staged_logit(b, dtype, logit);
             let shifted = op2(b, F32, KirOp::Sub, logit, lse_row);
             let p = b.new_typed_var(F32);
             b.emit(KirOp::Exp(p, shifted));
