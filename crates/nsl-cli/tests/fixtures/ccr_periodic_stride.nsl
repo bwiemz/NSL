@@ -7,11 +7,12 @@
 #
 # Every tensor computed inside a block has a LITERAL shape. `--checkpoint-stride
 # auto|dp` and `--checkpoint-budget-mib` project byte sizes from static shapes
-# and refuse a model without them, so with symbolic shapes the searches this
-# fixture exists to exercise would never run. The gate's expected strides are
-# worked out by hand from these shapes (batch 2, seq 64, width 32, hidden 64):
-# per block, the three recomputed interiors are 16 + 32 + 16 KiB and the one
-# saved boundary is 16 KiB.
+# and refuse a model they cannot size. The gate's expected strides are worked
+# out by hand from these shapes (batch 2, seq 64, width 32, hidden 64): per
+# block, the three freed interiors are 16 + 32 + 16 KiB and the one saved
+# boundary is 16 KiB. The gate also derives an unsized variant of this file
+# by exact-string replacement of the annotated lines, the two reshapes and
+# `drop_last=true`; keep those spellings.
 #
 # Markers (exact-string harness rewrites): "# GPU_PLACEMENT" -> "m.to(cuda)".
 from nsl.nn.losses import cross_entropy

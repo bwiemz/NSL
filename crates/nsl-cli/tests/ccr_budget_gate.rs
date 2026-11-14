@@ -129,13 +129,22 @@ fn unsized_model() -> String {
         .replace("let u: Tensor<[2, 64, 1024], f32> =", "let u =")
         .replace("let v: Tensor<[2, 64, 1024], f32> =", "let v =")
         .replace("let f: Tensor<[2, 64, 256], f32> =", "let f =")
-        .replace("logits.reshape([128, 16])", "logits.reshape([s2[0] * s2[1], 16])")
-        .replace("batch.labels.reshape([128])", "batch.labels.reshape([s2[0] * s2[1]])")
+        .replace(
+            "logits.reshape([128, 16])",
+            "logits.reshape([s2[0] * s2[1], 16])",
+        )
+        .replace(
+            "batch.labels.reshape([128])",
+            "batch.labels.reshape([s2[0] * s2[1]])",
+        )
         .replace(
             "        let flat_logits =",
             "        let s2 = logits.shape\n        let flat_logits =",
         );
-    assert!(!src.contains("Tensor<[2, 64"), "an annotation survived:\n{src}");
+    assert!(
+        !src.contains("Tensor<[2, 64"),
+        "an annotation survived:\n{src}"
+    );
     src
 }
 
@@ -177,7 +186,11 @@ fn losses_of(run: &Run, what: &str) -> String {
     assert!(run.ok, "{what} failed:\n{}", run.stderr);
     assert!(!run.losses.is_empty(), "{what}: no losses printed");
     let lower = run.losses.to_ascii_lowercase();
-    assert!(!lower.contains("nan") && !lower.contains("inf"), "{what}: {}", run.losses);
+    assert!(
+        !lower.contains("nan") && !lower.contains("inf"),
+        "{what}: {}",
+        run.losses
+    );
     run.losses.clone()
 }
 
@@ -186,15 +199,22 @@ fn the_budget_keeps_the_tensors_that_cost_most_to_recompute() {
     let source = model(SGD);
     let plain = losses_of(&run(&source, &[]), "the run without checkpointing");
     for (mib, kept) in [("1", 2), ("2", 4)] {
-        let r = run(&source, &["--checkpoint-blocks", "--checkpoint-budget-mib", mib]);
+        let r = run(
+            &source,
+            &["--checkpoint-blocks", "--checkpoint-budget-mib", mib],
+        );
         let losses = losses_of(&r, "the budgeted run");
         assert!(
-            r.stderr
-                .contains(&format!("budget {mib} MiB: {kept} tensors flipped back to SAVE")),
+            r.stderr.contains(&format!(
+                "budget {mib} MiB: {kept} tensors flipped back to SAVE"
+            )),
             "a {mib} MiB budget must keep {kept} of the 512 KiB up-projections:\n{}",
             r.stderr
         );
-        assert_eq!(losses, plain, "budget {mib} MiB: recomputation must be exact");
+        assert_eq!(
+            losses, plain,
+            "budget {mib} MiB: recomputation must be exact"
+        );
     }
 }
 
@@ -205,14 +225,22 @@ fn the_budget_keeps_the_tensors_that_cost_most_to_recompute() {
 fn the_budget_is_not_enlarged_under_deferred_accumulation() {
     let source = model(ADAMW_ACCUMULATING);
     let plain = losses_of(&run(&source, &[]), "the run without checkpointing");
-    let r = run(&source, &["--checkpoint-blocks", "--checkpoint-budget-mib", "1"]);
+    let r = run(
+        &source,
+        &["--checkpoint-blocks", "--checkpoint-budget-mib", "1"],
+    );
     let losses = losses_of(&r, "the budgeted run");
     assert!(
-        r.stderr.contains("budget 1 MiB: 2 tensors flipped back to SAVE"),
+        r.stderr
+            .contains("budget 1 MiB: 2 tensors flipped back to SAVE"),
         "the budget must stay 1 MiB and keep two tensors:\n{}",
         r.stderr
     );
-    assert!(!r.stderr.contains("credit"), "a credit was applied:\n{}", r.stderr);
+    assert!(
+        !r.stderr.contains("credit"),
+        "a credit was applied:\n{}",
+        r.stderr
+    );
     assert_eq!(losses, plain, "recomputation must be exact");
 }
 
@@ -226,7 +254,13 @@ fn under_a_stride_search_the_budget_is_spent_once() {
     let plain = losses_of(&run(&source, &[]), "the run without checkpointing");
     let r = run(
         &source,
-        &["--checkpoint-blocks", "--checkpoint-stride", "dp", "--checkpoint-budget-mib", "2"],
+        &[
+            "--checkpoint-blocks",
+            "--checkpoint-stride",
+            "dp",
+            "--checkpoint-budget-mib",
+            "2",
+        ],
     );
     let losses = losses_of(&r, "the dp run");
     assert!(
@@ -235,7 +269,11 @@ fn under_a_stride_search_the_budget_is_spent_once() {
         "all four boundaries fit 2 MiB (1.75 MiB projected) and recompute least:\n{}",
         r.stderr
     );
-    assert!(r.stderr.contains("block-activation peak 1.75 MiB"), "{}", r.stderr);
+    assert!(
+        r.stderr.contains("block-activation peak 1.75 MiB"),
+        "{}",
+        r.stderr
+    );
     assert!(
         !r.stderr.contains("flipped back to SAVE"),
         "the knapsack ran after the partition search:\n{}",
@@ -251,10 +289,14 @@ fn a_budget_on_a_model_without_static_sizes_is_refused() {
     let source = unsized_model();
     // The model itself trains under plain block checkpointing.
     losses_of(&run(&source, &["--checkpoint-blocks"]), "the unsized model");
-    let r = run(&source, &["--checkpoint-blocks", "--checkpoint-budget-mib", "1"]);
+    let r = run(
+        &source,
+        &["--checkpoint-blocks", "--checkpoint-budget-mib", "1"],
+    );
     assert!(!r.ok, "the budget must fail the build:\n{}", r.stderr);
     assert!(
-        r.stderr.contains("--checkpoint-budget-mib cannot be honoured")
+        r.stderr
+            .contains("--checkpoint-budget-mib cannot be honoured")
             && r.stderr.contains("static size"),
         "expected the refusal to name the flag and the reason:\n{}",
         r.stderr

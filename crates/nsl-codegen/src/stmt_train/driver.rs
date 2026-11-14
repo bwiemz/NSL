@@ -1673,9 +1673,9 @@ impl Compiler<'_> {
                                  the budget can be spent on. Sizes come from literal shapes \
                                  (for example `Tensor<[2, 64, 256], f32>`) and from a \
                                  DataLoader with literal batch_size and seq_len and \
-                                 drop_last=true; without them, drop the flag or choose the \
-                                 policy with --checkpoint-selective / --checkpoint-stride N \
-                                 instead.",
+                                 drop_last=true; without them, drop the flag, or choose \
+                                 what is recomputed with the selective policy or a fixed \
+                                 stride instead.",
                             ));
                         }
                         let budget_bytes = budget_mib.saturating_mul(1024 * 1024);

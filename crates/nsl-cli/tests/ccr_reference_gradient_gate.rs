@@ -243,7 +243,11 @@ fn assert_matches_reference(run: &Run, flags: &[&str], tolerance: f64) {
             "{flags:?}: loss at step {step} is {got}, PyTorch gives {want}"
         );
     }
-    assert_eq!(run.weights.len(), 2 * WEIGHTS.len(), "{flags:?}: probe count");
+    assert_eq!(
+        run.weights.len(),
+        2 * WEIGHTS.len(),
+        "{flags:?}: probe count"
+    );
     for (i, (name, want_sum, want_probe)) in WEIGHTS.into_iter().enumerate() {
         let (got_sum, got_probe) = (run.weights[2 * i], run.weights[2 * i + 1]);
         assert!(

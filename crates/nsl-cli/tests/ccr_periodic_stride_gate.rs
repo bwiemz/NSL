@@ -68,8 +68,10 @@ struct Run {
 }
 
 fn fixture() -> String {
-    std::fs::read_to_string(repo_root().join("crates/nsl-cli/tests/fixtures/ccr_periodic_stride.nsl"))
-        .expect("read fixture")
+    std::fs::read_to_string(
+        repo_root().join("crates/nsl-cli/tests/fixtures/ccr_periodic_stride.nsl"),
+    )
+    .expect("read fixture")
 }
 
 /// Run `source` under source AD with the given extra args. `gpu` moves the
@@ -109,8 +111,14 @@ fn run(gpu: bool, extra: &[&str]) -> Run {
 /// Panics on an empty stream or a non-finite loss: two empty streams, or two
 /// streams of `NaN`, compare equal.
 fn loss_stream(stdout: &str) -> String {
-    let after = stdout.split_once("LOSS_STREAM_BEGIN").map(|(_, r)| r).unwrap_or("");
-    let inner = after.split_once("LOSS_STREAM_END").map(|(l, _)| l).unwrap_or("");
+    let after = stdout
+        .split_once("LOSS_STREAM_BEGIN")
+        .map(|(_, r)| r)
+        .unwrap_or("");
+    let inner = after
+        .split_once("LOSS_STREAM_END")
+        .map(|(l, _)| l)
+        .unwrap_or("");
     let stream = inner
         .lines()
         .map(str::trim)
@@ -129,13 +137,24 @@ fn loss_stream(stdout: &str) -> String {
 fn act_peak(stdout: &str) -> Option<u64> {
     let after = stdout.split_once("ACT_PEAK_BEGIN").map(|(_, r)| r)?;
     let inner = after.split_once("ACT_PEAK_END").map(|(l, _)| l)?;
-    inner.lines().map(str::trim).find_map(|l| l.parse::<u64>().ok())
+    inner
+        .lines()
+        .map(str::trim)
+        .find_map(|l| l.parse::<u64>().ok())
 }
 
 /// The stride-1 reference under CSLA, which every search result must match
 /// bit for bit.
 fn stride_one_reference() -> String {
-    let r = run(false, &["--checkpoint-blocks", "--layerwise-accum", "--checkpoint-stride", "1"]);
+    let r = run(
+        false,
+        &[
+            "--checkpoint-blocks",
+            "--layerwise-accum",
+            "--checkpoint-stride",
+            "1",
+        ],
+    );
     assert!(r.ok, "stride-1 run failed:\n{}", r.stderr);
     loss_stream(&r.stdout)
 }
@@ -147,11 +166,17 @@ fn periodic_stride_is_bit_exact_across_strides_cpu() {
     for k in ["2", "4"] {
         let r = run(
             false,
-            &["--checkpoint-blocks", "--layerwise-accum", "--checkpoint-stride", k],
+            &[
+                "--checkpoint-blocks",
+                "--layerwise-accum",
+                "--checkpoint-stride",
+                k,
+            ],
         );
         assert!(r.ok, "stride {k} run failed:\n{}", r.stderr);
         assert!(
-            r.stderr.contains(&format!("periodic checkpointing: stride {k}")),
+            r.stderr
+                .contains(&format!("periodic checkpointing: stride {k}")),
             "stride {k} did not coalesce, so the comparison is stride 1 with itself:\n{}",
             r.stderr
         );
@@ -168,7 +193,8 @@ fn periodic_stride_emits_coalescing_note() {
     let r = run(false, &["--checkpoint-blocks", "--checkpoint-stride", "2"]);
     assert!(r.ok, "run failed:\n{}", r.stderr);
     assert!(
-        r.stderr.contains("periodic checkpointing: stride 2 → 4 CCR super-segment(s)"),
+        r.stderr
+            .contains("periodic checkpointing: stride 2 → 4 CCR super-segment(s)"),
         "expected the coalescing note for 8 blocks at stride 2 on stderr:\n{}",
         r.stderr
     );
@@ -181,15 +207,27 @@ fn periodic_stride_emits_coalescing_note() {
 fn auto_stride_chooses_the_minimum_peak_stride() {
     let r = run(
         false,
-        &["--checkpoint-blocks", "--layerwise-accum", "--checkpoint-stride", "auto"],
+        &[
+            "--checkpoint-blocks",
+            "--layerwise-accum",
+            "--checkpoint-stride",
+            "auto",
+        ],
     );
     assert!(r.ok, "auto run failed:\n{}", r.stderr);
     assert!(
-        r.stderr.contains("--checkpoint-stride auto: chose stride 2 "),
+        r.stderr
+            .contains("--checkpoint-stride auto: chose stride 2 "),
         "auto must choose stride 2:\n{}",
         r.stderr
     );
-    for candidate in ["k=1:0.56MiB", "k=2:0.39MiB", "k=3:0.41MiB", "k=4:0.42MiB", "k=8:0.67MiB"] {
+    for candidate in [
+        "k=1:0.56MiB",
+        "k=2:0.39MiB",
+        "k=3:0.41MiB",
+        "k=4:0.42MiB",
+        "k=8:0.67MiB",
+    ] {
         assert!(
             r.stderr.contains(candidate),
             "candidate `{candidate}` missing from the decision line:\n{}",
@@ -197,7 +235,8 @@ fn auto_stride_chooses_the_minimum_peak_stride() {
         );
     }
     assert!(
-        r.stderr.contains("periodic checkpointing: stride 2 → 4 CCR super-segment(s)"),
+        r.stderr
+            .contains("periodic checkpointing: stride 2 → 4 CCR super-segment(s)"),
         "the chosen stride was not applied:\n{}",
         r.stderr
     );
@@ -225,7 +264,8 @@ fn auto_stride_takes_the_smallest_stride_that_fits_the_budget() {
     );
     assert!(r.ok, "auto run failed:\n{}", r.stderr);
     assert!(
-        r.stderr.contains("--checkpoint-stride auto: chose stride 1 "),
+        r.stderr
+            .contains("--checkpoint-stride auto: chose stride 1 "),
         "auto must keep stride 1 under a budget stride 1 fits:\n{}",
         r.stderr
     );
@@ -245,7 +285,12 @@ fn auto_stride_takes_the_smallest_stride_that_fits_the_budget() {
 fn dp_stride_keeps_the_minimum_peak_partition_and_is_bit_exact() {
     let dp = run(
         false,
-        &["--checkpoint-blocks", "--layerwise-accum", "--checkpoint-stride", "dp"],
+        &[
+            "--checkpoint-blocks",
+            "--layerwise-accum",
+            "--checkpoint-stride",
+            "dp",
+        ],
     );
     assert!(dp.ok, "dp run failed:\n{}", dp.stderr);
     assert!(
@@ -284,9 +329,8 @@ fn dp_stride_with_a_loose_budget_keeps_every_anchor() {
     );
     assert!(dp.ok, "dp+budget run failed:\n{}", dp.stderr);
     assert!(
-        dp.stderr.contains(
-            "--checkpoint-stride dp: kept 8 of 8 block anchors [0, 1, 2, 3, 4, 5, 6, 7]"
-        ),
+        dp.stderr
+            .contains("--checkpoint-stride dp: kept 8 of 8 block anchors [0, 1, 2, 3, 4, 5, 6, 7]"),
         "dp must keep all 8 anchors when every partition fits:\n{}",
         dp.stderr
     );
@@ -295,7 +339,11 @@ fn dp_stride_with_a_loose_budget_keeps_every_anchor() {
         "the knapsack ran after the partition search:\n{}",
         dp.stderr
     );
-    assert_eq!(loss_stream(&dp.stdout), stride_one_reference(), "dp+budget diverged");
+    assert_eq!(
+        loss_stream(&dp.stdout),
+        stride_one_reference(),
+        "dp+budget diverged"
+    );
 }
 
 /// The same model with nothing a size can be read from: no shape
@@ -307,7 +355,10 @@ fn dp_stride_with_a_loose_budget_keeps_every_anchor() {
 #[test]
 fn a_stride_search_without_static_shapes_is_refused() {
     let symbolic = fixture()
-        .replace("fn forward(self, h: Tensor<[2, 64, 32], f32>) -> Tensor<[2, 64, 32], f32>:", "fn forward(self, h: Tensor) -> Tensor:")
+        .replace(
+            "fn forward(self, h: Tensor<[2, 64, 32], f32>) -> Tensor<[2, 64, 32], f32>:",
+            "fn forward(self, h: Tensor) -> Tensor:",
+        )
         .replace("let n: Tensor<[2, 64, 32], f32> =", "let n =")
         .replace("let u: Tensor<[2, 64, 64], f32> =", "let u =")
         .replace("let f: Tensor<[2, 64, 32], f32> =", "let f =")
@@ -327,8 +378,16 @@ fn a_stride_search_without_static_shapes_is_refused() {
         "the fixture changed shape; update the replacements above"
     );
     // The model itself still trains with a fixed stride.
-    let fixed = run_source(&symbolic, false, &["--checkpoint-blocks", "--checkpoint-stride", "2"]);
-    assert!(fixed.ok, "the symbolic fixture must run at a fixed stride:\n{}", fixed.stderr);
+    let fixed = run_source(
+        &symbolic,
+        false,
+        &["--checkpoint-blocks", "--checkpoint-stride", "2"],
+    );
+    assert!(
+        fixed.ok,
+        "the symbolic fixture must run at a fixed stride:\n{}",
+        fixed.stderr
+    );
     loss_stream(&fixed.stdout);
 
     for mode in ["auto", "dp"] {

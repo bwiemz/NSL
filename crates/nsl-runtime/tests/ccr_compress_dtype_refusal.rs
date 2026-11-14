@@ -60,7 +60,11 @@ fn full(dims: &[i64], value: f64, dtype: i64) -> i64 {
         unsafe { nsl_list_push(list, d) };
     }
     let t = unsafe { nsl_tensor_full_dtype(list, value, dtype) };
-    assert_eq!(view(t).dtype as i64, dtype, "the producer must make the dtype asked for");
+    assert_eq!(
+        view(t).dtype as i64,
+        dtype,
+        "the producer must make the dtype asked for"
+    );
     t
 }
 
@@ -76,13 +80,21 @@ fn an_f32_activation_compresses_to_bf16_and_restores_to_f32() {
     assert_eq!(h.dtype as i64, BF16);
     assert_eq!(h.len, 6);
     for i in 0..6 {
-        assert_eq!(unsafe { *(h.data as *const u16).add(i) }, 0x4020, "element {i}");
+        assert_eq!(
+            unsafe { *(h.data as *const u16).add(i) },
+            0x4020,
+            "element {i}"
+        );
     }
     let back = unsafe { nsl_tensor_to_f32(half) };
     let b = view(back);
     assert_eq!(b.dtype as i64, F32);
     for i in 0..6 {
-        assert_eq!(unsafe { *(b.data as *const f32).add(i) }, 2.5, "element {i}");
+        assert_eq!(
+            unsafe { *(b.data as *const f32).add(i) },
+            2.5,
+            "element {i}"
+        );
     }
 }
 
@@ -111,7 +123,12 @@ fn zz_ccr_compress_child() {
 fn assert_refused(scenario: &str) {
     let exe = std::env::current_exe().expect("test binary path");
     let out = std::process::Command::new(exe)
-        .args(["zz_ccr_compress_child", "--exact", "--nocapture", "--test-threads=1"])
+        .args([
+            "zz_ccr_compress_child",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
         .env(SCENARIO, scenario)
         .env("RUST_BACKTRACE", "0")
         .output()
@@ -129,7 +146,10 @@ fn assert_refused(scenario: &str) {
         "scenario '{scenario}': expected the unsupported-dtype exit code.\n{ctx}"
     );
     let want = format!("--checkpoint-compress: a saved activation has dtype {scenario}");
-    assert!(stderr.contains(&want), "scenario '{scenario}': expected `{want}`.\n{ctx}");
+    assert!(
+        stderr.contains(&want),
+        "scenario '{scenario}': expected `{want}`.\n{ctx}"
+    );
 }
 
 #[test]
