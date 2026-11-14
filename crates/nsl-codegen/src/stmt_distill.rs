@@ -71,58 +71,25 @@ impl Compiler<'_> {
             CodegenError::new("distill block requires 'student=<model ident>'")
         })?;
 
-        // ── Parse loss: section into DistillLossConfig ──────────────────
-        let mut loss_cfg = crate::cpkd::DistillLossConfig::default();
+        // ── Read the loss: section ──────────────────────────────────────
+        // `alpha` and `temperature` are the only keys that reach codegen
+        // with a meaning: the semantic layer refuses the feature-matching
+        // keys and `attn_transfer = true`, none of which is implemented.
+        // The values do not define the loss (the step body does); they are
+        // checked against the `fused_kl_ce(...)` call that must consume
+        // them (`WengertExtractor`, `plan_cpkd_report`).
         let mut loss_alpha_explicit: Option<f64> = None;
         let mut loss_temperature_explicit: Option<f64> = None;
         for entry in &distill.loss {
             let Some(name_sym) = entry.name else { continue };
-            let key = self.resolve_sym(name_sym).to_string();
-            let as_f64 = |e: &nsl_ast::expr::Expr| -> Option<f64> {
-                match e.kind {
-                    ExprKind::FloatLiteral(v) => Some(v),
-                    ExprKind::IntLiteral(v) => Some(v as f64),
-                    _ => None,
-                }
+            let value = match entry.value.kind {
+                ExprKind::FloatLiteral(v) => Some(v),
+                ExprKind::IntLiteral(v) => Some(v as f64),
+                _ => None,
             };
-            match key.as_str() {
-                "alpha" => {
-                    if let Some(v) = as_f64(&entry.value) {
-                        loss_cfg.alpha = v;
-                        loss_alpha_explicit = Some(v);
-                    }
-                }
-                "temperature" => {
-                    if let Some(v) = as_f64(&entry.value) {
-                        loss_cfg.temperature = v;
-                        loss_temperature_explicit = Some(v);
-                    }
-                }
-                "feature_weight" => {
-                    if let Some(v) = as_f64(&entry.value) {
-                        loss_cfg.feature_weight = v;
-                    }
-                }
-                "feature_layers" => match &entry.value.kind {
-                    ExprKind::StringLiteral(s) if s == "auto" => {
-                        loss_cfg.feature_layers = crate::cpkd::FeatureLayers::Auto;
-                    }
-                    ExprKind::ListLiteral(items) => {
-                        let mut layers = Vec::with_capacity(items.len());
-                        for item in items {
-                            if let ExprKind::IntLiteral(n) = item.kind {
-                                layers.push(n);
-                            }
-                        }
-                        loss_cfg.feature_layers =
-                            crate::cpkd::FeatureLayers::Explicit(layers);
-                    }
-                    _ => {}
-                },
-                // attn_transfer=true was refused at the semantic layer;
-                // false is the only value that reaches codegen and it is
-                // the default (no state to record).
-                "attn_transfer" => {}
+            match self.resolve_sym(name_sym) {
+                "alpha" => loss_alpha_explicit = value,
+                "temperature" => loss_temperature_explicit = value,
                 _ => {}
             }
         }
@@ -149,7 +116,6 @@ impl Compiler<'_> {
             teacher_sym,
             student_sym,
             epochs,
-            loss: loss_cfg,
             fused_kl_ce,
             loss_alpha_explicit,
             loss_temperature_explicit,

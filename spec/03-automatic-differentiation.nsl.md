@@ -277,6 +277,25 @@ knowing that the tape prose does not cover:
   statically-known `p=0` is elided entirely.
 - **Unresolved `Input` leaves are a hard error**, not a warning: a leaf the
   lowering cannot attribute would silently train a submodel.
+- **User functions are inlined.** A call from a `grad`, `train` or `distill`
+  block to an undecorated free function (of the module or of a module it
+  imports, the standard library included) is differentiated by extracting
+  the function's body into the caller's graph, exactly as model methods
+  are. A function declared in the module is the function a call names even
+  when a builtin shares its name. What is not inlined: a decorated function
+  (inlining would drop its decorator), a recursive or variadic one, one
+  that returns from anywhere but the end of its body (or from both arms of
+  a final if/else), and one whose body holds a statement or expression the
+  extraction does not handle. In those cases the compiler says which
+  function and why, and the block falls back to the tape; a `distill`
+  block, which refuses the tape, fails to build.
+- **`mse_loss` and `l1_loss` broadcast.** Both are the mean over the
+  elements of the broadcast difference `pred - target`, and each operand's
+  gradient is summed down to that operand's shape.
+- **GELU is one function.** `gelu(x)` is the tanh approximation
+  `0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))` (PyTorch's
+  `gelu(approximate="tanh")`) on the CPU and on the GPU, with one derivative
+  in both AD modes. It differs from the exact `x·Φ(x)` by at most 4.8e-4.
 
 Cross-mode agreement is enforced by differential gates (tape vs source at
 matched seeds), not asserted.

@@ -8,9 +8,12 @@
 //!   gradient in storage order: `relu(x)` followed by `.transpose(0, 1)`
 //!   multiplied `g[i]` by `f'(x[j])` for the wrong `(i, j)`. The CPU arms
 //!   wrap the same loop in `with_row_major`.
-//! * The GPU GELU forward is `x * sigmoid(1.702 x)`; the tape backward
+//! * The GPU GELU forward was `x * sigmoid(1.702 x)` while the tape backward
 //!   launched the adjoint of the TANH approximation the CPU runs — the
-//!   derivative of a different function, 22% off at x = -1.
+//!   derivative of a different function, 22% off at x = -1. The forward is
+//!   now the tanh approximation on both devices, so GELU is one function
+//!   with one derivative; this gate holds the GPU gradient to PyTorch's
+//!   `gelu(approximate="tanh")`.
 //!
 //! Each arm runs `d/dx sum(act(x).transpose(0, 1) * w)` on both devices.
 //!
@@ -25,11 +28,9 @@ fn repo_root() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap().to_path_buf()
 }
 
-/// x = [[-0.6, -0.3, 0.0], [0.3, 0.6, 0.9]], w = [[1, 2], [3, 4], [5, 6]].
-const X: [f32; 6] = [-0.6, -0.3, 0.0, 0.3, 0.6, 0.9];
-/// dL/dy for y = act(x): `w` transposed back, row-major over x's shape.
-const W_T: [f32; 6] = [1.0, 3.0, 5.0, 2.0, 4.0, 6.0];
-
+/// `d/dx sum(act(x).transpose(0, 1) * w)` with
+/// x = [[-0.6, -0.3, 0.0], [0.3, 0.6, 0.9]] and w = [[1, 2], [3, 4], [5, 6]],
+/// so dL/dy for y = act(x) is `w` transposed back: [[1, 3, 5], [2, 4, 6]].
 fn gradient(act: &str, device: &str) -> Vec<f32> {
     let dir = std::env::temp_dir().join(format!("nsl_actbwd_{}_{act}_{device}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -87,24 +88,17 @@ fn gpu_gradient_through_a_transposed_activation_matches_cpu() {
     }
 }
 
-/// GELU differs by device in the forward (sigmoid form on GPU, tanh form on
-/// CPU), so the GPU gradient is checked against the derivative of the GPU's
-/// own forward: `s * (1 + k x (1 - s))`, `s = sigmoid(k x)`, `k = 1.702`.
+/// GELU is the tanh approximation on both devices. The expected gradient is
+/// a literal from PyTorch 2.15: `F.gelu(x, approximate="tanh")` through the
+/// same transpose and weights, `.backward()`.
 #[test]
 #[ignore = "requires CUDA GPU"]
-fn gpu_gelu_gradient_is_the_derivative_of_the_gpu_forward() {
-    let gpu = gradient("gelu", "cuda");
-    let want: Vec<f32> = X
-        .iter()
-        .zip(W_T)
-        .map(|(&x, g)| {
-            let kx = 1.702f64 * x as f64;
-            let s = 1.0 / (1.0 + (-kx).exp());
-            (g as f64 * s * (1.0 + kx * (1.0 - s))) as f32
-        })
-        .collect();
-    assert_close("gelu", &gpu, &want);
-    // The tanh form's derivative at x = -0.6 is 0.0745 against the sigmoid
-    // form's 0.0660: the two are told apart.
-    assert!((gpu[0] - 0.074_508).abs() > 5e-3, "gelu'(-0.6) = {} is the tanh form's", gpu[0]);
+fn gpu_gelu_gradient_is_the_tanh_approximations() {
+    let want = [0.074_508_5f32, 0.803_113_7, 2.5, 1.464_591, 3.701_966_3, 6.330_403_8];
+    let (cpu, gpu) = (gradient("gelu", "cpu"), gradient("gelu", "cuda"));
+    assert_close("gelu (cpu)", &cpu, &want);
+    assert_close("gelu (gpu)", &gpu, &want);
+    // The sigmoid form's derivative at x = -0.6 is 0.0660 against the tanh
+    // form's 0.0745: the two are told apart.
+    assert!((gpu[0] - 0.066_0).abs() > 5e-3, "gelu'(-0.6) = {} is the sigmoid form's", gpu[0]);
 }

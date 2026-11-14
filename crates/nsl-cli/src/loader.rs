@@ -25,6 +25,10 @@ pub struct ModuleData {
     pub scopes: ScopeMap,
     /// Exported top-level symbols: name → Type
     pub exports: HashMap<Symbol, Type>,
+    /// Declared parameter names of this module's functions, model
+    /// constructors and methods, for checking named arguments in the
+    /// modules that import them.
+    pub param_names: nsl_semantic::ParamNames,
     /// Struct layouts extracted from codegen (populated during codegen phase)
     pub struct_names: Vec<String>,
     /// Enum variant → tag mapping
@@ -80,6 +84,39 @@ pub struct ModuleGraph {
     pub modules: HashMap<PathBuf, ModuleData>,
     /// Topological order: dependencies before dependents. Entry module is last.
     pub dep_order: Vec<PathBuf>,
+}
+
+impl ModuleGraph {
+    /// The undecorated free functions of every module but the entry, by
+    /// name, for source AD to inline (`ImportedModelOptions::fn_bodies`).
+    ///
+    /// Imported functions are registered with codegen under their bare
+    /// name, whichever module they come from, so a name two modules both
+    /// declare cannot be attributed to one body; such names are left out.
+    pub fn imported_fn_bodies(
+        &self,
+        interner: &Interner,
+    ) -> HashMap<String, nsl_ast::decl::FnDef> {
+        let mut bodies: HashMap<String, nsl_ast::decl::FnDef> = HashMap::new();
+        let mut ambiguous: HashSet<String> = HashSet::new();
+        for path in &self.dep_order {
+            if *path == self.entry {
+                continue;
+            }
+            for stmt in &self.modules[path].ast.stmts {
+                if let StmtKind::FnDef(fn_def) = &stmt.kind {
+                    let name = interner.resolve(fn_def.name.0).unwrap_or("<unknown>").to_string();
+                    if bodies.insert(name.clone(), fn_def.clone()).is_some() {
+                        ambiguous.insert(name);
+                    }
+                }
+            }
+        }
+        for name in &ambiguous {
+            bodies.remove(name);
+        }
+        bodies
+    }
 }
 
 /// Represents a discovered import — either `from X import Y` or `import X as alias`.
@@ -401,8 +438,23 @@ pub fn load_all_modules(
             }
         }
 
+        // The parameter names of what this module imports: types carry
+        // none, and a named argument is only checkable against them.
+        let mut import_param_names = nsl_semantic::ImportedParamNames::default();
+        for (dep_path, import_info) in &imports {
+            if let Some(dep_data) = modules.get(dep_path) {
+                inject_import_param_names(import_info, &dep_data.param_names, &mut import_param_names);
+            }
+        }
+
         // Analyze with real imported types
-        let analysis = nsl_semantic::analyze_with_imports(&ast, interner, &import_types, false);
+        let analysis = nsl_semantic::analyze_with_import_context(
+            &ast,
+            interner,
+            &import_types,
+            &import_param_names,
+            false,
+        );
 
         for diag in &analysis.diagnostics {
             source_map.emit_diagnostic(diag);
@@ -438,8 +490,11 @@ pub fn load_all_modules(
             crate::mangling::module_prefix(path, base_dir)
         };
 
+        let param_names = nsl_semantic::declared_param_names(&ast.stmts, interner);
+
         modules.insert(path.clone(), ModuleData {
             path: path.clone(),
+            param_names,
             ast,
             type_map: analysis.type_map,
             scopes: analysis.scopes,
@@ -503,6 +558,58 @@ fn inject_import_types(
         }
         ImportItems::Module => {
             // `from X import` without names — no-op for now
+        }
+    }
+}
+
+/// Record the parameter names a module gains from one import statement.
+///
+/// Functions and constructors are keyed by the name the importing module
+/// calls them by; methods stay keyed by the model's declared name, which is
+/// what a receiver's type carries. Two imports that disagree about one key
+/// (the same declared model name from two modules) drop it: a call that
+/// cannot be attributed is not judged.
+fn inject_import_param_names(
+    import_info: &ImportInfo,
+    dep_names: &nsl_semantic::ParamNames,
+    out: &mut nsl_semantic::ImportedParamNames,
+) {
+    let add = |out: &mut nsl_semantic::ParamNames, key: (Option<Symbol>, Symbol), names: &Vec<Symbol>| {
+        match out.get(&key) {
+            Some(existing) if existing != names => {
+                // Two declarations claim this key. Judging a call against
+                // either list could refuse a valid call to the other.
+                out.remove(&key);
+            }
+            _ => {
+                out.insert(key, names.clone());
+            }
+        }
+    };
+    match import_info {
+        ImportInfo::From(from_import) => match &from_import.items {
+            ImportItems::Named(items) => {
+                for item in items {
+                    let local_name = item.alias.unwrap_or(item.name);
+                    if let Some(names) = dep_names.get(&(None, item.name)) {
+                        add(&mut out.direct, (None, local_name), names);
+                    }
+                    for ((owner, method), names) in dep_names {
+                        if *owner == Some(item.name) {
+                            add(&mut out.direct, (*owner, *method), names);
+                        }
+                    }
+                }
+            }
+            ImportItems::Glob => {
+                for (key, names) in dep_names {
+                    add(&mut out.direct, *key, names);
+                }
+            }
+            ImportItems::Module => {}
+        },
+        ImportInfo::Alias { alias, .. } => {
+            out.modules.insert(*alias, dep_names.clone());
         }
     }
 }

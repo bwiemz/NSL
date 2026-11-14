@@ -1,6 +1,6 @@
 //! The differential equivalence gate for the activation-backward kernels
 //! (roadmap A2 step 11): the tape-AD `nsl_{relu,sigmoid,tanh,silu}_backward_f32`,
-//! the source-AD `nsl_{sigmoid,tanh,silu,gelu}_backward_srcad_f32`, and the
+//! the source-AD `nsl_{sigmoid,tanh,silu}_backward_srcad_f32`, and the
 //! fused SwiGLU gate adjoint `nsl_swiglu_gate_backward_f32`.
 //!
 //! The runtime carried them as hand-written PTX; they are now built by
@@ -71,7 +71,6 @@ fn hand_ptx(op: BackwardOp) -> String {
         SigmoidSrcad => hand::SIGMOID_BACKWARD_SRCAD_F32_PTX,
         TanhSrcad => hand::TANH_BACKWARD_SRCAD_F32_PTX,
         SiluSrcad => hand::SILU_BACKWARD_SRCAD_F32_PTX,
-        GeluSrcad => hand::GELU_BACKWARD_SRCAD_F32_PTX,
         SwigluGate => hand::SWIGLU_GATE_BACKWARD_F32_PTX,
     })
 }
@@ -87,9 +86,6 @@ fn saved_name(op: BackwardOp) -> &'static str {
 }
 
 const LOG2_E: f32 = f32::from_bits(0x3FB8_AA3B);
-/// 1.702f, the GELU slope, written out rather than taken from `nsl_kir` so a
-/// change there shows here.
-const GELU_K: f32 = f32::from_bits(0x3FD9_DB23);
 
 /// `1 / (2^(-x * log2 e) + 1)`, as the kernels compute it.
 fn sigmoid_model(x: f32) -> f32 {
@@ -116,10 +112,6 @@ fn model(op: BackwardOp, g: f32, x: f32, u: f32) -> f32 {
             g * (s + s * (x * (1.0 - s)))
         }
         SiluSrcad => g * srcad_tail(x, sigmoid_model(x)),
-        GeluSrcad => {
-            let kx = x * GELU_K;
-            g * srcad_tail(kx, sigmoid_model(kx))
-        }
         SwigluGate => (g * u) * srcad_tail(x, sigmoid_model(x)),
     }
 }
@@ -139,10 +131,6 @@ fn exact(op: BackwardOp, g: f64, x: f64, u: f64) -> f64 {
         Sigmoid | SigmoidSrcad => g * x * (1.0 - x),
         Tanh | TanhSrcad => g * (1.0 - x * x),
         Silu | SiluSrcad => g * (sig(x) + x * sig(x) * (1.0 - sig(x))),
-        GeluSrcad => {
-            let k = 1.702;
-            g * (sig(k * x) + x * k * sig(k * x) * (1.0 - sig(k * x)))
-        }
         SwigluGate => g * u * (sig(x) + x * sig(x) * (1.0 - sig(x))),
     }
 }
@@ -335,7 +323,7 @@ fn the_arithmetic_is_spelled_as_in_the_hand_kernels() {
         }
     }
     use BackwardOp::*;
-    for (op, rounded) in [(SigmoidSrcad, 3), (TanhSrcad, 3), (SiluSrcad, 5), (GeluSrcad, 6), (SwigluGate, 6)] {
+    for (op, rounded) in [(SigmoidSrcad, 3), (TanhSrcad, 3), (SiluSrcad, 5), (SwigluGate, 6)] {
         assert_eq!(kir_ptx(op).matches(".rn.f32 ").count(), rounded, "{op:?}");
     }
     for op in [Relu, Sigmoid, Tanh, Silu] {
@@ -387,7 +375,7 @@ fn the_unmutated_kernels_are_not_caught() {
 /// why the spelling test above exists.
 #[test]
 fn dropping_rn_is_invisible_to_execution_and_pinned_by_spelling_instead() {
-    for op in [BackwardOp::TanhSrcad, BackwardOp::SiluSrcad, BackwardOp::GeluSrcad, BackwardOp::SwigluGate] {
+    for op in [BackwardOp::TanhSrcad, BackwardOp::SiluSrcad, BackwardOp::SwigluGate] {
         for form in ["mul.rn.f32 ", "add.rn.f32 ", "sub.rn.f32 "] {
             if kir_ptx(op).contains(form) {
                 let bare = form.replace(".rn", "");
@@ -421,7 +409,7 @@ fn nudging_an_element_size_is_caught() {
 }
 
 /// Every baked f32 constant, one ulp off, each occurrence on its own: the
-/// ones, log2(e), the GELU slope, relu's zeros.
+/// ones, log2(e), relu's zeros.
 #[test]
 fn nudging_a_baked_constant_is_caught() {
     use BackwardOp::*;
@@ -435,10 +423,6 @@ fn nudging_a_baked_constant_is_caught() {
         (TanhSrcad, "0f3F800000", "0f3F800001"),
         (SiluSrcad, "0f3F800000", "0f3F800001"),
         (SiluSrcad, "0f3FB8AA3B", "0f3FB8AA3C"),
-        (GeluSrcad, "0f3FD9DB23", "0f3FD9DB24"),
-        (GeluSrcad, "0f3FD9DB23", "0f3FD9999A"),
-        (GeluSrcad, "0f3F800000", "0f3F800001"),
-        (GeluSrcad, "0f3FB8AA3B", "0f3FB8AA3C"),
         (SwigluGate, "0f3F800000", "0f3F800001"),
         (SwigluGate, "0f3FB8AA3B", "0f3FB8AA3C"),
     ] {

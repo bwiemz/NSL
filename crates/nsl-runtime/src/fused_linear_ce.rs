@@ -790,26 +790,38 @@ mod hint_extent_tests {
 /// the row-preserving flatten) would otherwise read past this staging
 /// buffer on device — garbage class indices or ILLEGAL_ADDRESS. Pass 0 to
 /// skip the check (no caller does today).
+///
+/// `vocab` is the class count the kernel was built for. The labels are
+/// brought to the one convention the kernels and the lowering's host-side
+/// mask both understand (see [`normalize_fused_targets`]); a label at or
+/// above `vocab` aborts here, naming the row. Pass 0 to skip (no caller
+/// does today).
+///
+/// `site` says which decorator the call was lowered for, so a refusal names
+/// the one the program contains: 0 = `@fused_lm_ce`, 1 = `@fused_kl_ce`.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_fused_lce_targets_i64_alloc(
     tensor_ptr: i64,
     expected_rows: i64,
+    vocab: i64,
+    site: i64,
 ) -> i64 {
     if tensor_ptr == 0 {
         crate::nsl_log!(ERROR, "fused-linear-ce", "nsl_fused_lce_targets_i64_alloc: null tensor");
         std::process::abort();
     }
-    // The length pin is a device-path guard; the no-cuda build never stages.
+    // The checks below are device-path guards; the no-cuda build never stages.
     #[cfg(not(feature = "cuda"))]
-    let _ = expected_rows;
+    let _ = (expected_rows, vocab, site);
     #[cfg(feature = "cuda")]
     {
+        let decorator = fused_targets_decorator(site);
         let t = crate::tensor::NslTensor::from_ptr(tensor_ptr);
         let n = t.len as usize;
         if expected_rows > 0 && t.len != expected_rows {
             crate::nsl_log!(WARN, "fused-linear-ce", 
                 "nsl_fused_lce_targets_i64_alloc: label tensor has {} entries \
-                 but the @fused_lm_ce decorator pins batch_size * seq_len = \
+                 but the {decorator} decorator pins batch_size * seq_len = \
                  {expected_rows}. The loss flatten and the decorator hints \
                  disagree — the fused kernel would read out of bounds. Fix \
                  the reshape (it must be the row-preserving \
@@ -890,6 +902,17 @@ pub extern "C" fn nsl_fused_lce_targets_i64_alloc(
                 std::process::abort();
             }
         };
+        let mut host_i64 = host_i64;
+        if let Err((row, label)) = normalize_fused_targets(&mut host_i64, vocab) {
+            crate::nsl_log!(ERROR, "fused-linear-ce",
+                "nsl_fused_lce_targets_i64_alloc: target {label} at row {row} is out of \
+                 range for the {decorator} vocab_size of {vocab} (valid classes are 0..{}; \
+                 a negative target is ignored). The fused kernel would read the weight \
+                 row of a class that does not exist.",
+                vocab - 1
+            );
+            std::process::abort();
+        }
         let dev = crate::cuda::inner::alloc_managed(n * 8);
         crate::cuda::inner::memcpy_htod(
             dev,
@@ -903,6 +926,45 @@ pub extern "C" fn nsl_fused_lce_targets_i64_alloc(
         crate::nsl_log!(ERROR, "fused-linear-ce", "nsl_fused_lce_targets_i64_alloc: compiled without cuda feature");
         std::process::abort();
     }
+}
+
+/// The ignore index the fused loss kernels test for.
+pub const FUSED_IGNORE_INDEX: i64 = -100;
+
+/// The decorator a fused-targets call site belongs to (its `site` code).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn fused_targets_decorator(site: i64) -> &'static str {
+    match site {
+        1 => "@fused_kl_ce",
+        _ => "@fused_lm_ce",
+    }
+}
+
+/// Bring a label vector to the convention the fused loss kernels and the
+/// lowering's host-side mask share.
+///
+/// The kernels skip a row only when its target EQUALS the ignore index
+/// (−100). The lowering's mask and valid-row count are
+/// `clamp(target + 1, 0, 1)`, which ignores EVERY negative target, as the
+/// standard-library `cross_entropy` does. A target of −1 was therefore a
+/// row the kernel computed (indexing class −1: an infinite or NaN per-row
+/// loss) and the mask then multiplied by zero, which made the whole loss
+/// NaN while the step still updated. Every negative target is rewritten to
+/// the ignore index here, so the kernel skips exactly the rows the mask
+/// drops.
+///
+/// A target at or above `vocab` has no class to stand for: the kernel would
+/// index past the last weight row. It is returned as `Err((row, target))`
+/// for the caller to refuse. `vocab <= 0` skips that check.
+pub fn normalize_fused_targets(targets: &mut [i64], vocab: i64) -> Result<(), (usize, i64)> {
+    for (row, target) in targets.iter_mut().enumerate() {
+        if *target < 0 {
+            *target = FUSED_IGNORE_INDEX;
+        } else if vocab > 0 && *target >= vocab {
+            return Err((row, *target));
+        }
+    }
+    Ok(())
 }
 
 /// Free a buffer produced by [`nsl_fused_lce_targets_i64_alloc`].
@@ -1446,5 +1508,38 @@ mod v7_default_activation_tests {
             rc, -1,
             "backward FFI must short-circuit with -1 when diagnostic override is set"
         );
+    }
+}
+
+#[cfg(test)]
+mod fused_target_tests {
+    use super::{normalize_fused_targets, FUSED_IGNORE_INDEX};
+
+    /// Every negative label becomes the one value the kernels skip, so the
+    /// kernel and the lowering's `clamp(target + 1, 0, 1)` mask agree on
+    /// which rows are ignored. In-range labels are untouched.
+    #[test]
+    fn negative_targets_become_the_ignore_index() {
+        let mut targets = vec![0, 3, -1, -100, -7, 4, i64::MIN];
+        assert_eq!(normalize_fused_targets(&mut targets, 5), Ok(()));
+        assert_eq!(targets, vec![0, 3, -100, -100, -100, 4, -100]);
+        assert_eq!(FUSED_IGNORE_INDEX, -100);
+    }
+
+    /// The first label at or above the vocabulary is reported with its row.
+    #[test]
+    fn a_target_at_or_above_the_vocabulary_is_reported() {
+        let mut at_vocab = vec![0, 4, 5, 9];
+        assert_eq!(normalize_fused_targets(&mut at_vocab, 5), Err((2, 5)));
+        let mut last_class = vec![4, -1];
+        assert_eq!(normalize_fused_targets(&mut last_class, 5), Ok(()));
+    }
+
+    /// `vocab <= 0` skips the range check and still rewrites negatives.
+    #[test]
+    fn a_non_positive_vocab_skips_the_range_check() {
+        let mut targets = vec![1_000_000, -3];
+        assert_eq!(normalize_fused_targets(&mut targets, 0), Ok(()));
+        assert_eq!(targets, vec![1_000_000, -100]);
     }
 }

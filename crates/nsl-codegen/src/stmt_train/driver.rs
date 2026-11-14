@@ -940,11 +940,24 @@ impl Compiler<'_> {
             let (fused_kl_ce_cfg, distill_alpha, distill_temp) = match &self.active_distill_context
             {
                 Some(d) => (
-                    // P1.7: --training-reference disables the fused KL-CE
-                    // substitution so the composite KL-CE baseline runs instead
-                    // (mirrors the @fused_lm_ce gate on active_fused_ce_config).
-                    // The composite distill loss (alpha/temperature) still runs.
+                    // The fused KL-CE kernel is a CUDA kernel. Two compiles
+                    // must not select it: `--training-reference`, whose
+                    // point is the unfused baseline, and a host-only
+                    // `--target cpu` compile, which used to lower the fused
+                    // path anyway and allocate its buffers on the device.
+                    // With no config the extractor inlines the standard
+                    // library's composite `fused_kl_ce`, the same loss.
                     if self.compile_options.diagnostics.training_reference {
+                        None
+                    } else if self.cuda_sm().is_none() {
+                        if d.fused_kl_ce.as_ref().is_some_and(|c| c.enabled) {
+                            nsl_log::nsl_log!(WARN, "fused-kl-ce",
+                                "[fused-kl-ce] @fused_kl_ce(enabled = true) on a --target {} \
+                                 compile: the fused kernel is CUDA-only, so fused_kl_ce is \
+                                 computed with the standard-library composite on the host",
+                                self.compile_options.target
+                            );
+                        }
                         None
                     } else {
                         d.fused_kl_ce.clone()
@@ -967,6 +980,12 @@ impl Compiler<'_> {
 
             // Wire model method bodies and field types for inline expansion
             extractor.set_model_method_bodies(self.models.model_method_bodies.clone());
+            // ... and the free functions a step body may call, so a loss
+            // written as a function is differentiated at compile time too.
+            extractor.set_user_fn_bodies(
+                self.free_fn_bodies.clone(),
+                self.compile_options.imported_model.fn_bodies.clone(),
+            );
             extractor.set_type_map(self.type_map);
             extractor.set_model_field_types(self.models.model_field_types.clone());
             // CFTP v10 (item 5): thread per-model-field rank info so the

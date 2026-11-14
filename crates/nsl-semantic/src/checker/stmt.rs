@@ -46,13 +46,26 @@ impl<'a> TypeChecker<'a> {
                         // Iterating over a tuple: element type is union or first element
                         elems.first().cloned().unwrap_or(Type::Unknown)
                     }
+                    // The element is the model the array was declared
+                    // with, fields and methods included, exactly as
+                    // `blocks[i]` resolves it. A bare `Type::Model` with no
+                    // fields left `block.w` (and everything built on it)
+                    // untyped inside the loop, so `print(block.w.sum())`
+                    // printed the tensor's handle as an integer.
                     Type::FixedModelArray { element_model, .. } => {
-                        Type::Model {
-                            name: *element_model,
-                            type_params: Vec::new(),
-                            type_args: Vec::new(),
-                            fields: Vec::new(),
-                            methods: Vec::new(),
+                        let scope_ty = self
+                            .scopes
+                            .lookup(self.current_scope, *element_model)
+                            .map(|(_, info)| info.ty.clone());
+                        match scope_ty {
+                            Some(ty @ Type::Model { .. }) => ty,
+                            _ => Type::Model {
+                                name: *element_model,
+                                type_params: Vec::new(),
+                                type_args: Vec::new(),
+                                fields: Vec::new(),
+                                methods: Vec::new(),
+                            },
                         }
                     }
                     _ => Type::Unknown,

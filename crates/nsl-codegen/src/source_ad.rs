@@ -1097,8 +1097,8 @@ impl AdjointGenerator {
             // --- GELU backward: grad * gelu'(x) ---
             // Fused (Milestone C · p4 GELU fix): a single
             // `nsl_tensor_gelu_backward(grad, x)` launch computing the derivative
-            // of the forward each device actually ran (GPU: sigmoid approx
-            // σ(1.702x)·(1+1.702x·(1−σ)); CPU: tanh-approx, same as tape-AD).
+            // of the forward: the tanh approximation, on every device, the
+            // same derivative tape AD uses.
             //
             // The previous 7-op expansion here was numerically WRONG: its
             // internal temp `kx = Mul(1.702, x)` had refcount 1, and the
@@ -1497,41 +1497,48 @@ impl AdjointGenerator {
                 vec![y_bar, logits, targets],
             ),
 
-            // --- MSE backward: d/d(pred_i) = grad_output * 2 * (pred_i - target_i) / N ---
-            // Forward `PrimalOp::MSELoss` lowers to a global `mean((pred-target)^2)`
-            // (scalar over all N=numel(pred)), so the /N factor must be applied here
-            // or the gradient is N× too large (was causing dO inflation in CSHA e2e).
-            // Delegated to `nsl_mse_backward` so `N` can be read at runtime from the
-            // pred tensor header without plumbing shape info through the Wengert list.
-            AdjointExpr::MSEBackward(y_bar, pred, target) => self.emit_op(
-                PrimalOp::Passthrough("mse_backward".into()),
-                vec![y_bar, pred, target],
-            ),
-
-            // --- L1 backward: d/d(pred_i) = grad_output * sign(pred_i - target_i) / N ---
-            // Same intercept pattern as MSE: the forward `PrimalOp::L1Loss` lowers to
-            // `mean(|pred - target|)` (global mean over N=numel(pred), scalar out), so
-            // backward must apply the /N factor or gradients come out N× too large.
-            // Delegated to `nsl_l1_backward` so N can be read at runtime from the
-            // pred tensor header without plumbing shape info through the Wengert list.
-            AdjointExpr::L1Backward(y_bar, pred, target) => self.emit_op(
-                PrimalOp::Passthrough("l1_backward".into()),
-                vec![y_bar, pred, target],
-            ),
-            AdjointExpr::MSETargetBackward(y_bar, pred, target) => {
-                let d_pred = self.emit_op(
+            // --- MSE backward: d/d(diff_i) = grad_output * 2 * diff_i / N ---
+            // Forward `PrimalOp::MSELoss` lowers to a global
+            // `mean((pred-target)^2)`, a scalar over the N elements of the
+            // BROADCAST difference. `nsl_mse_backward` returns the gradient
+            // with respect to that difference, in its broadcast shape, with
+            // N read at run time; each operand's adjoint is that gradient
+            // summed down to the operand's own shape (negated for `target`).
+            // Without the `reduce_to` on `pred`, a `pred` smaller than
+            // `target` received a gradient of the wrong shape, scaled by
+            // 1/numel(pred) instead of 1/N.
+            AdjointExpr::MSEBackward(y_bar, pred, target) => {
+                let d_diff = self.emit_op(
                     PrimalOp::Passthrough("mse_backward".into()),
                     vec![y_bar, pred, target],
                 );
-                let neg = self.emit_op(PrimalOp::Neg, vec![d_pred]);
-                self.reduce_to(neg, target)
+                self.reduce_to(d_diff, pred)
             }
-            AdjointExpr::L1TargetBackward(y_bar, pred, target) => {
-                let d_pred = self.emit_op(
+
+            // --- L1 backward: d/d(diff_i) = grad_output * sign(diff_i) / N ---
+            // Same shape as MSE: `nsl_l1_backward` returns the gradient with
+            // respect to the broadcast difference.
+            AdjointExpr::L1Backward(y_bar, pred, target) => {
+                let d_diff = self.emit_op(
                     PrimalOp::Passthrough("l1_backward".into()),
                     vec![y_bar, pred, target],
                 );
-                let neg = self.emit_op(PrimalOp::Neg, vec![d_pred]);
+                self.reduce_to(d_diff, pred)
+            }
+            AdjointExpr::MSETargetBackward(y_bar, pred, target) => {
+                let d_diff = self.emit_op(
+                    PrimalOp::Passthrough("mse_backward".into()),
+                    vec![y_bar, pred, target],
+                );
+                let neg = self.emit_op(PrimalOp::Neg, vec![d_diff]);
+                self.reduce_to(neg, target)
+            }
+            AdjointExpr::L1TargetBackward(y_bar, pred, target) => {
+                let d_diff = self.emit_op(
+                    PrimalOp::Passthrough("l1_backward".into()),
+                    vec![y_bar, pred, target],
+                );
+                let neg = self.emit_op(PrimalOp::Neg, vec![d_diff]);
                 self.reduce_to(neg, target)
             }
 
@@ -2349,6 +2356,38 @@ pub struct WengertExtractor<'a> {
     /// only to refuse a divergent call-site literal (loud consistency
     /// check between the report surface and the kernel constants).
     distill_loss_alpha_temp: (Option<f64>, Option<f64>),
+    /// CPKD: one entry per `fused_kl_ce(...)` call the extraction lowered,
+    /// whichever way: the call-site alpha and temperature when they are
+    /// literals, and whether the fused kernel took it (`true`) or the
+    /// stdlib composite was inlined (`false`). The distill lowering reads
+    /// it to report the loss that is actually computed, and to refuse a
+    /// `loss:` section nothing consumed.
+    kl_ce_calls: Vec<KlCeCall>,
+    /// Free functions declared in the module being compiled, by name.
+    /// A call to one is inlined into the Wengert list, ahead of the
+    /// by-name builtin table: a user's own `fn gelu` is the function the
+    /// program calls, whatever a builtin of that name computes.
+    local_fn_bodies: HashMap<String, nsl_ast::decl::FnDef>,
+    /// Free functions declared in imported modules (the standard library
+    /// included), by name. Consulted only for a callee the builtin table
+    /// does not know, and for the `fused_kl_ce` composite.
+    imported_fn_bodies: HashMap<String, nsl_ast::decl::FnDef>,
+    /// The bindings registered from outside before extraction started
+    /// (`register_input*` / `register_param*`): the names a free function
+    /// can see besides its own parameters. An inlined function body is
+    /// extracted against these, not against the caller's locals.
+    root_scope: HashMap<nsl_ast::Symbol, VarId>,
+    /// Names of the free functions currently being inlined, innermost
+    /// last. A function already on the stack is recursive and cannot be
+    /// inlined.
+    fn_inline_stack: Vec<String>,
+    /// Free functions that were inlined, for the caller's log line.
+    inlined_user_fns: std::collections::BTreeSet<String>,
+    /// How many method calls on a FROZEN model (the distill teacher) the
+    /// extraction is currently inside. Non-zero means "this is the
+    /// teacher's forward": it runs in evaluation mode, so `dropout` is the
+    /// identity and `is_training()` is false there.
+    frozen_inline_depth: usize,
     /// CFTP v10 (item 5): known tensor rank per VarId, when the frontend
     /// could derive it (from an annotated function-parameter type or a
     /// rank-preserving op).  Populated by `register_input_with_rank` /
@@ -2776,6 +2815,79 @@ pub struct LmHeadInferenceCtx {
 // ask for would change training numerics on the strength of a flag whose
 // stated job is to pick the best VALIDATED stack.
 
+/// One `fused_kl_ce(...)` call as the extraction lowered it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KlCeCall {
+    /// The call-site alpha, when it is a numeric literal.
+    pub alpha: Option<f64>,
+    /// The call-site temperature, when it is a numeric literal.
+    pub temperature: Option<f64>,
+    /// `true`: the fused kernel computes it. `false`: the standard-library
+    /// composite was inlined.
+    pub fused: bool,
+}
+
+/// Whether every statement of a function body, at any depth, is of a kind
+/// the extraction handles explicitly. `extract_stmt` lets every other kind
+/// pass as a no-op (a decorated statement, a `match`, a nested block), which
+/// is harmless for a step body the ordinary code path also compiles, but
+/// for an inlined function the extraction IS the function: a statement it
+/// skipped would simply not happen.
+fn body_is_extractable(stmts: &[nsl_ast::stmt::Stmt]) -> bool {
+    stmts.iter().all(|stmt| match &stmt.kind {
+        StmtKind::VarDecl { value: Some(_), .. }
+        | StmtKind::Return(Some(_))
+        | StmtKind::Expr(_)
+        | StmtKind::Assign { .. } => true,
+        StmtKind::If { then_block, elif_clauses, else_block, .. } => {
+            body_is_extractable(&then_block.stmts)
+                && elif_clauses.iter().all(|(_, b)| body_is_extractable(&b.stmts))
+                && else_block.as_ref().is_none_or(|b| body_is_extractable(&b.stmts))
+        }
+        // The extraction unrolls a loop over a model array or refuses it.
+        StmtKind::For { body, .. } => body_is_extractable(&body.stmts),
+        _ => false,
+    })
+}
+
+/// Whether `stmts` contains a `return` at any depth. Only called on bodies
+/// [`body_is_extractable`] accepted, so these are all the nesting kinds.
+fn contains_return(stmts: &[nsl_ast::stmt::Stmt]) -> bool {
+    stmts.iter().any(|stmt| match &stmt.kind {
+        StmtKind::Return(_) => true,
+        StmtKind::If { then_block, elif_clauses, else_block, .. } => {
+            contains_return(&then_block.stmts)
+                || elif_clauses.iter().any(|(_, b)| contains_return(&b.stmts))
+                || else_block.as_ref().is_some_and(|b| contains_return(&b.stmts))
+        }
+        StmtKind::For { body, .. } => contains_return(&body.stmts),
+        _ => false,
+    })
+}
+
+/// Whether every `return` of a function body is its last action: the body
+/// ends in a `return`, or in an if/else whose every arm does, and nothing
+/// before that returns. This is the shape the extraction's if/else merge
+/// turns into a `Select`; an early return followed by more statements is
+/// not (the later `return` would simply replace it).
+fn returns_only_in_tail_position(stmts: &[nsl_ast::stmt::Stmt]) -> bool {
+    let Some((last, before)) = stmts.split_last() else {
+        return false;
+    };
+    if contains_return(before) {
+        return false;
+    }
+    match &last.kind {
+        StmtKind::Return(Some(_)) => true,
+        StmtKind::If { then_block, elif_clauses, else_block: Some(else_block), .. } => {
+            returns_only_in_tail_position(&then_block.stmts)
+                && elif_clauses.iter().all(|(_, b)| returns_only_in_tail_position(&b.stmts))
+                && returns_only_in_tail_position(&else_block.stmts)
+        }
+        _ => false,
+    }
+}
+
 impl<'a> WengertExtractor<'a> {
     pub fn new(interner: &'a Interner) -> Self {
         WengertExtractor {
@@ -2822,6 +2934,13 @@ impl<'a> WengertExtractor<'a> {
             fused_lce_substitutions: 0,
             fused_kl_ce_config: None,
             distill_loss_alpha_temp: (None, None),
+            kl_ce_calls: Vec::new(),
+            local_fn_bodies: HashMap::new(),
+            imported_fn_bodies: HashMap::new(),
+            root_scope: HashMap::new(),
+            fn_inline_stack: Vec::new(),
+            inlined_user_fns: std::collections::BTreeSet::new(),
+            frozen_inline_depth: 0,
             frozen_model_roots: HashSet::new(),
             frozen_input_vars: Vec::new(),
             var_nodes: HashMap::new(),
@@ -2994,6 +3113,29 @@ impl<'a> WengertExtractor<'a> {
         self.fused_kl_ce_config = cfg;
         self.distill_loss_alpha_temp = (loss_alpha, loss_temperature);
         self
+    }
+
+    /// Install the free functions source AD may inline: those of the module
+    /// being compiled, and those of the modules it imports (see the
+    /// `local_fn_bodies` / `imported_fn_bodies` field docs for how the two
+    /// differ).
+    pub fn set_user_fn_bodies(
+        &mut self,
+        local: HashMap<String, nsl_ast::decl::FnDef>,
+        imported: HashMap<String, nsl_ast::decl::FnDef>,
+    ) {
+        self.local_fn_bodies = local;
+        self.imported_fn_bodies = imported;
+    }
+
+    /// The `fused_kl_ce(...)` calls this extraction lowered (see the field).
+    pub fn kl_ce_calls(&self) -> &[KlCeCall] {
+        &self.kl_ce_calls
+    }
+
+    /// Names of the free functions this extraction inlined.
+    pub fn inlined_user_fns(&self) -> impl Iterator<Item = &str> {
+        self.inlined_user_fns.iter().map(String::as_str)
     }
 
     fn alloc_var(&mut self) -> VarId {
@@ -3710,6 +3852,7 @@ impl<'a> WengertExtractor<'a> {
     ) {
         let var = self.alloc_var();
         self.symbol_to_var.insert(sym, var);
+        self.root_scope.insert(sym, var);
         self.param_symbols.insert(sym);
 
         let name = self.interner.resolve(sym.0).unwrap_or("?").to_string();
@@ -3744,6 +3887,7 @@ impl<'a> WengertExtractor<'a> {
     ) {
         let var = self.alloc_var();
         self.symbol_to_var.insert(sym, var);
+        self.root_scope.insert(sym, var);
 
         let name = self.interner.resolve(sym.0).unwrap_or("?").to_string();
         self.list.var_names.insert(var, name.clone());
@@ -4669,13 +4813,23 @@ impl<'a> WengertExtractor<'a> {
                                         // to the caller's model (TransformerBlock), not the callee (GQA).
                                         let extracted = self.pre_extract_args(&fn_def, args)?;
                                         let saved_self = self.self_context.clone();
+                                        // `teacher.encoder.forward(x)` from
+                                        // the step body is the teacher's
+                                        // forward too (`frozen_inline_depth`).
+                                        let frozen = self.is_frozen_compound(&compound_prefix);
                                         self.self_context = Some(compound_prefix);
+                                        if frozen {
+                                            self.frozen_inline_depth += 1;
+                                        }
                                         let sub_type_owned = sub_type.clone();
                                         let result = self.inline_method_body(
                                             &fn_def,
                                             extracted,
                                             Some(sub_type_owned.as_str()),
                                         );
+                                        if frozen {
+                                            self.frozen_inline_depth -= 1;
+                                        }
                                         self.self_context = saved_self;
                                         return result;
                                     }
@@ -4883,6 +5037,21 @@ impl<'a> WengertExtractor<'a> {
                     }
                 }
 
+                // A function this module declares is the function the call
+                // names, whatever a builtin of the same name computes: inline
+                // its body. (Without this the by-name table below answered
+                // for it, or -- for a name the table does not know -- the
+                // whole block fell back to the tape.) Synthesised callees
+                // carry a sentinel symbol and are never user functions; a
+                // local binding of the same name is a value, not this fn.
+                if !self.synth_call_names.contains_key(&callee.id)
+                    && let ExprKind::Ident(callee_sym) = &callee.kind
+                    && !self.symbol_to_var.contains_key(callee_sym)
+                    && let Some(fn_def) = self.local_fn_bodies.get(&func_name).cloned()
+                {
+                    return self.inline_user_fn(&func_name, &fn_def, args, &input_vars);
+                }
+
                 let result = self.alloc_var();
                 let primal_op = match func_name.as_str() {
                     // Elementwise unary
@@ -4971,13 +5140,24 @@ impl<'a> WengertExtractor<'a> {
                     // invariant: a program without `@fused_lm_ce` always emits
                     // the composite.
                     // CPKD: user-facing `fused_kl_ce(x_s, W_s, b_s, x_t, W_t,
-                    // b_t, targets, alpha, temperature)`. Recognised as a
-                    // single PrimalOp::FusedKlCe when the enclosing distill
-                    // block carries `@fused_kl_ce(enabled=true)` with all
-                    // five shape hints. alpha/temperature must be numeric
-                    // LITERALS in v1 (they bake into the op as compile-time
-                    // constants) and must agree with the distill `loss:`
-                    // section when it specifies them.
+                    // b_t, targets, alpha, temperature)`.
+                    //
+                    // With `@fused_kl_ce(enabled = true)` and all five shape
+                    // hints on the enclosing distill block it becomes one
+                    // `PrimalOp::FusedKlCe`; alpha and temperature must then
+                    // be numeric LITERALS (they bake into the kernel as
+                    // compile-time constants). Without an enabled decorator
+                    // -- none written, `enabled = false`, a `--target cpu`
+                    // or `--training-reference` compile -- the standard
+                    // library's composite of the same name is inlined, so the
+                    // call computes the same loss everywhere. (It used to
+                    // fail the extraction instead, which a distill block
+                    // turns into a hard error: `fused_kl_ce` could only be
+                    // used where the kernel could fire.)
+                    //
+                    // Either way the call-site alpha and temperature are
+                    // range-checked, and must agree with the distill `loss:`
+                    // section when it states them.
                     "fused_kl_ce" => {
                         if args.len() != 9 {
                             nsl_log::nsl_log!(INFO, "source-ad", 
@@ -4987,53 +5167,89 @@ impl<'a> WengertExtractor<'a> {
                             );
                             return None;
                         }
-                        let lit_f64 = |e: &nsl_ast::expr::Expr| -> Option<f64> {
-                            match e.kind {
-                                ExprKind::FloatLiteral(v) => Some(v),
-                                ExprKind::IntLiteral(v) => Some(v as f64),
-                                _ => None,
-                            }
-                        };
-                        let (Some(alpha), Some(temperature)) =
-                            (lit_f64(&args[7].value), lit_f64(&args[8].value))
-                        else {
-                            nsl_log::nsl_log!(WARN, "source-ad", 
-                                "[source-ad] fused_kl_ce: alpha and temperature must be \
-                                 numeric literals in v1 (compile-time kernel constants)"
-                            );
-                            return None;
-                        };
-                        // Consistency with the distill loss: section — a
-                        // divergent literal would make the build report lie.
-                        let (loss_alpha, loss_temp) = self.distill_loss_alpha_temp;
-                        if let Some(la) = loss_alpha
-                            && (la - alpha).abs() > 1e-12
+                        let alpha = Self::extract_f64_literal(&args[7].value);
+                        let temperature = Self::extract_f64_literal(&args[8].value);
+                        if let Some(a) = alpha
+                            && !(0.0..=1.0).contains(&a)
                         {
-                            nsl_log::nsl_log!(INFO, "source-ad", 
-                                "[source-ad] fused_kl_ce: call-site alpha {alpha} \
-                                     != distill loss: section alpha {la}"
-                            );
+                            self.pending_refusal = Some(format!(
+                                "fused_kl_ce: alpha = {a} is outside [0, 1]. alpha weights the \
+                                 hard-label cross-entropy and 1 - alpha the KL term, so a value \
+                                 outside that range gives one of them a negative weight."
+                            ));
                             return None;
                         }
-                        if let Some(lt) = loss_temp
-                            && (lt - temperature).abs() > 1e-12
+                        if let Some(t) = temperature
+                            && t <= 0.0
                         {
-                            nsl_log::nsl_log!(INFO, "source-ad", 
-                                "[source-ad] fused_kl_ce: call-site temperature \
-                                     {temperature} != distill loss: section temperature {lt}"
-                            );
+                            self.pending_refusal = Some(format!(
+                                "fused_kl_ce: temperature = {t} is not positive. The logits are \
+                                 divided by it."
+                            ));
                             return None;
+                        }
+                        // Consistency with the distill `loss:` section: the
+                        // section states the loss, the call computes it, and
+                        // the two must be the same numbers.
+                        let (loss_alpha, loss_temp) = self.distill_loss_alpha_temp;
+                        for (key, declared, written) in [
+                            ("alpha", loss_alpha, alpha),
+                            ("temperature", loss_temp, temperature),
+                        ] {
+                            let Some(declared) = declared else { continue };
+                            match written {
+                                Some(w) if (w - declared).abs() <= 1e-12 => {}
+                                Some(w) => {
+                                    self.pending_refusal = Some(format!(
+                                        "fused_kl_ce is called with {key} = {w}, but the distill \
+                                         block's `loss:` section declares {key} = {declared}. \
+                                         Make them agree, or remove the key from the section."
+                                    ));
+                                    return None;
+                                }
+                                None => {
+                                    self.pending_refusal = Some(format!(
+                                        "the distill block's `loss:` section declares {key} = \
+                                         {declared}, but fused_kl_ce is called with a {key} \
+                                         that is not a numeric literal, so the two cannot be \
+                                         checked against each other. Write the literal at the \
+                                         call, or remove the key from the section."
+                                    ));
+                                    return None;
+                                }
+                            }
                         }
                         if let Some(cfg) = self.fused_kl_ce_config.as_ref()
                             && cfg.enabled
-                            && let (Some(v), Some(hs), Some(ht), Some(b), Some(s)) = (
+                        {
+                            let (Some(v), Some(hs), Some(ht), Some(b), Some(sl)) = (
                                 cfg.vocab_size,
                                 cfg.student_hidden,
                                 cfg.teacher_hidden,
                                 cfg.batch_size,
                                 cfg.seq_len,
-                            )
-                        {
+                            ) else {
+                                self.pending_refusal = Some(
+                                    "@fused_kl_ce(enabled = true) is missing one of its shape \
+                                     hints (vocab_size, hidden_size, teacher_hidden, batch_size, \
+                                     seq_len), so the fused kernel cannot be built. Add the \
+                                     hints, or set enabled = false to compute fused_kl_ce with \
+                                     the standard-library composite."
+                                        .to_string(),
+                                );
+                                return None;
+                            };
+                            let (Some(alpha), Some(temperature)) = (alpha, temperature) else {
+                                self.pending_refusal = Some(
+                                    "@fused_kl_ce(enabled = true): alpha and temperature must \
+                                     be numeric literals at the fused_kl_ce(...) call, because \
+                                     the kernel takes them as compile-time constants. Write \
+                                     literals, or set enabled = false to compute fused_kl_ce \
+                                     with the standard-library composite."
+                                        .to_string(),
+                                );
+                                return None;
+                            };
                             let vt = cfg.vocab_tile.unwrap_or(
                                 crate::cpkd_fused_loss::FusedKlCeConfig::default()
                                     .vocab_tile,
@@ -5048,7 +5264,7 @@ impl<'a> WengertExtractor<'a> {
                                     student_hidden: hs,
                                     teacher_hidden: ht,
                                     batch_size: b,
-                                    seq_len: s,
+                                    seq_len: sl,
                                     vocab_tile: vt,
                                     ignore_index: -100,
                                     alpha_bits: alpha.to_bits(),
@@ -5058,32 +5274,28 @@ impl<'a> WengertExtractor<'a> {
                                 saved_for_backward: false,
                                 checkpointed: false,
                             });
+                            self.kl_ce_calls.push(KlCeCall {
+                                alpha: Some(alpha),
+                                temperature: Some(temperature),
+                                fused: true,
+                            });
                             return Some(result);
                         }
-                        // Fall through: composite expansion via the stdlib
-                        // `fused_kl_ce` body (tape AD — refused inside
-                        // distill blocks, so an incomplete/missing decorator
-                        // there surfaces as a loud compile error). Name the
-                        // exact precondition so the refusal is actionable
-                        // rather than a bare "extraction failed".
-                        match self.fused_kl_ce_config.as_ref() {
-                            None => nsl_log::nsl_log!(WARN, "source-ad", 
-                                "[source-ad] fused_kl_ce called without an active \
-                                 @fused_kl_ce decorator config; add \
-                                 @fused_kl_ce(enabled=true, vocab_size=, hidden_size=, \
-                                 teacher_hidden=, batch_size=, seq_len=) to the distill block"
-                            ),
-                            Some(cfg) if !cfg.enabled => nsl_log::nsl_log!(INFO, "source-ad", 
-                                "[source-ad] fused_kl_ce: @fused_kl_ce is present but \
-                                 enabled=false; set enabled=true to activate the fused kernel"
-                            ),
-                            Some(_) => nsl_log::nsl_log!(WARN, "source-ad", 
-                                "[source-ad] fused_kl_ce: @fused_kl_ce is enabled but one of \
-                                 the shape hints (vocab_size, hidden_size, teacher_hidden, \
-                                 batch_size, seq_len) is missing"
-                            ),
-                        }
-                        return None;
+                        // No enabled decorator: the composite.
+                        let Some(fn_def) = self.imported_fn_bodies.get("fused_kl_ce").cloned()
+                        else {
+                            nsl_log::nsl_log!(WARN, "source-ad",
+                                "[source-ad] fused_kl_ce: the standard-library definition is not \
+                                 available to inline (import it with `from nsl.nn.losses import \
+                                 fused_kl_ce`), and no enabled @fused_kl_ce decorator selects the \
+                                 fused kernel"
+                            );
+                            return None;
+                        };
+                        let composite =
+                            self.inline_user_fn("fused_kl_ce", &fn_def, args, &input_vars)?;
+                        self.kl_ce_calls.push(KlCeCall { alpha, temperature, fused: false });
+                        return Some(composite);
                     }
                     "fused_linear_ce" => {
                         if args.len() != 4 {
@@ -5361,6 +5573,15 @@ impl<'a> WengertExtractor<'a> {
                     // user's training=false. The model never sees a stable
                     // representation and loss plateaus near random.
                     "dropout" => {
+                        // A frozen model's forward (the distill teacher) is
+                        // evaluated, not trained: dropout there is the
+                        // identity whatever its training argument says.
+                        // Emitting it made the teacher's logits -- the
+                        // target the student is fitted to -- different on
+                        // every step.
+                        if self.frozen_inline_depth > 0 {
+                            return input_vars.first().copied();
+                        }
                         // Check the training arg (input_vars[2]) — if it
                         // resolves to PrimalOp::Constant(0.0), this is an
                         // inference-mode dropout call: emit identity.
@@ -5872,11 +6093,26 @@ impl<'a> WengertExtractor<'a> {
                         });
                         return Some(result);
                     }
+                    // The teacher of a distill block runs in evaluation mode
+                    // (see `frozen_inline_depth`). Outside it the training
+                    // flag is run-time state this extraction cannot read.
+                    "is_training" if self.frozen_inline_depth > 0 && args.is_empty() => {
+                        PrimalOp::Constant(0.0)
+                    }
                     _ => {
-                        nsl_log::nsl_log!(WARN, "source-ad", 
-                            "[source-ad] warning: unrecognized FFI callee '{}' in train block; \
-                             falling back to unfused AST evaluation. If you expected a fused kernel, \
-                             check that source-AD has a handler for this FFI.",
+                        // A function of an imported module (the standard
+                        // library included) that the table above has no entry
+                        // for: inline its body, as for a function of this
+                        // module.
+                        if !self.synth_call_names.contains_key(&callee.id)
+                            && let Some(fn_def) = self.imported_fn_bodies.get(&func_name).cloned()
+                        {
+                            return self.inline_user_fn(&func_name, &fn_def, args, &input_vars);
+                        }
+                        nsl_log::nsl_log!(WARN, "source-ad",
+                            "[source-ad] warning: unrecognized FFI callee '{}': source AD has \
+                             no rule for it, and it is not a function whose body can be \
+                             inlined. This block falls back to tape-based AD.",
                             func_name
                         );
                         return None;
@@ -6295,10 +6531,146 @@ impl<'a> WengertExtractor<'a> {
                     .to_string()
             });
         let saved_self = self.self_context.clone();
+        // A method called on the frozen model (or on anything reached
+        // through it) is the teacher's forward; see `frozen_inline_depth`.
+        let frozen = self.is_frozen_compound(&name);
         self.self_context = Some(name);
+        if frozen {
+            self.frozen_inline_depth += 1;
+        }
         let result = self.inline_method_body(fn_def, extracted, model_type);
+        if frozen {
+            self.frozen_inline_depth -= 1;
+        }
         self.self_context = saved_self;
         result
+    }
+
+    /// Inline a call to a free function: bind its parameters to the
+    /// already-extracted arguments and extract its body into the current
+    /// Wengert list, so the function is differentiated as part of the
+    /// block that calls it.
+    ///
+    /// Returns `None` -- and the block falls back to the tape, with the
+    /// reason logged -- for what cannot be inlined: a recursive function, a
+    /// variadic one, a call whose named arguments are out of position, a
+    /// missing argument with no default, or a body with something the
+    /// extraction does not handle.
+    fn inline_user_fn(
+        &mut self,
+        name: &str,
+        fn_def: &nsl_ast::decl::FnDef,
+        call_args: &[nsl_ast::expr::Arg],
+        arg_vars: &[VarId],
+    ) -> Option<VarId> {
+        /// Nesting bound: far above any hand-written call chain, and a
+        /// guard against mutual recursion the name check cannot see.
+        const MAX_INLINE_DEPTH: usize = 64;
+        /// `list.output` while a body that has not yet returned is being
+        /// extracted. No real variable has this id.
+        const NO_RETURN: VarId = VarId::MAX;
+
+        let decline = |why: &str| {
+            nsl_log::nsl_log!(WARN, "source-ad",
+                "[source-ad] warning: function '{}' cannot be inlined for compile-time \
+                 differentiation ({}); this block falls back to tape-based AD.",
+                name, why
+            );
+        };
+        if self.fn_inline_stack.iter().any(|n| n == name) {
+            decline("it is recursive");
+            return None;
+        }
+        if self.fn_inline_stack.len() >= MAX_INLINE_DEPTH {
+            decline("the call chain is too deep");
+            return None;
+        }
+        if fn_def.params.iter().any(|p| p.is_variadic) {
+            decline("it has a variadic parameter");
+            return None;
+        }
+        if call_args.len() > fn_def.params.len() || call_args.len() != arg_vars.len() {
+            decline("the call passes more arguments than it declares");
+            return None;
+        }
+        if fn_def.is_async {
+            decline("it is async");
+            return None;
+        }
+        if !body_is_extractable(&fn_def.body.stmts) {
+            decline("its body has a statement source AD does not extract");
+            return None;
+        }
+        // The if/else merge handles a `return` in both arms of a final
+        // if/else; a return anywhere else (an early return followed by more
+        // code) would be overwritten by the later one.
+        if !returns_only_in_tail_position(&fn_def.body.stmts) {
+            decline("it returns from somewhere other than the end of its body");
+            return None;
+        }
+        // Arguments bind by position; a name must agree with the position
+        // it sits in (the checker refuses anything else where it can see
+        // the declaration).
+        if call_args
+            .iter()
+            .zip(&fn_def.params)
+            .any(|(a, p)| a.name.is_some_and(|n| n != p.name))
+        {
+            decline("a named argument is not in its parameter's position");
+            return None;
+        }
+
+        // The callee sees its parameters and the module-level names, never
+        // the caller's locals; `self` means nothing in a free function.
+        let saved_symbols = std::mem::replace(&mut self.symbol_to_var, self.root_scope.clone());
+        let saved_self = self.self_context.take();
+        let saved_output = self.list.output;
+        // `frozen_inline_depth` is deliberately left alone: a helper called
+        // from inside the teacher's forward is still the teacher's forward.
+        self.fn_inline_stack.push(name.to_string());
+
+        let mut ok = true;
+        for (i, param) in fn_def.params.iter().enumerate() {
+            let var = match (arg_vars.get(i), &param.default) {
+                (Some(&v), _) => Some(v),
+                (None, Some(default)) => self.extract_expr(default),
+                (None, None) => None,
+            };
+            let Some(var) = var else {
+                ok = false;
+                break;
+            };
+            self.symbol_to_var.insert(param.name, var);
+            // Name the value after the parameter only if it has no name: an
+            // argument that is a model parameter is found again BY its name
+            // (`m.w`), and renaming it would register it a second time.
+            let pname = self.interner.resolve(param.name.0).unwrap_or("?").to_string();
+            self.list.var_names.entry(var).or_insert(pname);
+        }
+
+        if ok {
+            self.list.output = NO_RETURN;
+            ok = self.extract_stmts(&fn_def.body.stmts);
+        }
+        let result = self.list.output;
+
+        self.fn_inline_stack.pop();
+        self.symbol_to_var = saved_symbols;
+        self.self_context = saved_self;
+        self.list.output = saved_output;
+
+        if !ok {
+            // `extract_stmts` (or the default-argument extraction) has
+            // already said what it could not take.
+            decline("its body or a default argument has an expression source AD does not extract");
+            return None;
+        }
+        if result == NO_RETURN {
+            decline("it does not return a value on every path");
+            return None;
+        }
+        self.inlined_user_fns.insert(name.to_string());
+        Some(result)
     }
 
     /// Inline a model method call's body into the current Wengert list.

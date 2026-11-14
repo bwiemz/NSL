@@ -305,6 +305,40 @@ impl Compiler<'_> {
                             builder.ins().iconst(cl_types::I64, 0)
                         };
 
+                        // `let t = t0`, both tensors: the new name is a second
+                        // OWNER of the tensor (it is swept, and freed on
+                        // rebind, like any other tensor local), so it takes
+                        // its own reference -- as `t = t0` already does in
+                        // `compile_assign`. Without the retain two owning
+                        // names shared one reference: the teardown sweep
+                        // freed the tensor once per name (`free(): double
+                        // free detected` at exit when a train or distill
+                        // block had used it), and an in-place op on one name
+                        // could overwrite the other, since the tensor looked
+                        // uniquely owned. A source that is itself a borrow
+                        // (a parameter, a view of a field) stays a borrow:
+                        // `update_non_owning_binding` below marks the new
+                        // name non-owning and nothing frees it.
+                        if let Some(expr) = value
+                            && let Some(source) = Self::bare_ident(expr)
+                            && self.node_type(expr.id).is_tensor()
+                            && builder.func.dfg.value_type(init_val) == cl_types::I64
+                            && state.variables.contains_key(&source)
+                            && !state.param_symbols.contains(&source)
+                            && !state.non_owning_symbols.contains(&source)
+                            && !state.borrowed_batch_symbols.contains(&source)
+                            && !state.flags.in_dtype_method
+                            // Under linear types the binding MOVES the
+                            // tensor: the source gives its reference up.
+                            && state.ownership.lowering.is_none()
+                        {
+                            let _ = self.compile_call_by_name(
+                                builder,
+                                "nsl_tensor_retain",
+                                &[init_val],
+                            );
+                        }
+
                         let cl_type = if let Some(expr) = value {
                             let nsl_ty = self.node_type(expr.id).clone();
                             // When the semantic pass returns Error/Unknown, fall back
@@ -1175,6 +1209,16 @@ impl Compiler<'_> {
             }
         }
         inserted
+    }
+
+    /// The symbol an expression names when it is a bare identifier, through
+    /// any parentheses.
+    fn bare_ident(expr: &nsl_ast::expr::Expr) -> Option<nsl_ast::Symbol> {
+        match &expr.kind {
+            nsl_ast::expr::ExprKind::Ident(sym) => Some(*sym),
+            nsl_ast::expr::ExprKind::Paren(inner) => Self::bare_ident(inner),
+            _ => None,
+        }
     }
 
     /// ELTLS (spec §6.5): clear a tensor-typed variable's old value before

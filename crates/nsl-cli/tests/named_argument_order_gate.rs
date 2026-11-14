@@ -5,7 +5,8 @@
 //! -9 where the call as written is 9 — for free functions, methods and model
 //! constructors alike, with no diagnostic. Until calls bind by name, the
 //! checker refuses the call where it knows the declaration's parameter
-//! names (the module's own callables).
+//! names: the module's own callables, and those it imports (the module
+//! loader hands the checker the imported declarations' parameter names).
 
 use std::process::Command;
 
@@ -76,6 +77,101 @@ fn a_named_argument_out_of_position_is_refused() {
     ] {
         let (ok, text) = check(tag, call);
         assert!(!ok, "[{tag}] the call checked clean and would have bound by position:\n{text}");
+        assert!(text.contains(needle), "[{tag}] expected {needle:?} in:\n{text}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Imported callables
+// ---------------------------------------------------------------------------
+
+const LIB: &str = "fn sub2(a: float, b: float) -> float:\n\
+                   \x20   return a - b\n\
+                   \n\
+                   model Scaler(scale: float, shift: float):\n\
+                   \x20   w: Tensor = full([1], scale - shift)\n\
+                   \n\
+                   \x20   fn f(self, a: float, b: float) -> float:\n\
+                   \x20       return a - b\n";
+
+/// Builds and runs `main` beside a module `lib.nsl` holding [`LIB`]. The
+/// program is run, not just checked: `nsl check` analyses one file and does
+/// not see what an import declares.
+fn run_with_lib(tag: &str, main: &str) -> (bool, String) {
+    let dir = std::env::temp_dir().join(format!("nsl_namedarg_import_{}_{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("lib.nsl"), LIB).unwrap();
+    let prog = dir.join("main.nsl");
+    std::fs::write(&prog, main).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_nsl"))
+        .arg("run")
+        .arg(&prog)
+        .args(["--target", "cpu"])
+        .current_dir(&dir)
+        .env("NSL_STDLIB_PATH", repo_root().join("stdlib"))
+        .output()
+        .expect("spawn nsl run");
+    let _ = std::fs::remove_dir_all(&dir);
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    (out.status.success(), text)
+}
+
+/// In declaration order the names are accepted, and the call computes what
+/// it says: `sub2(a = 10, b = 1)` is 9.
+#[test]
+fn named_arguments_to_imported_callables_in_order_are_accepted() {
+    let (ok, text) = run_with_lib(
+        "ok",
+        "from lib import sub2, Scaler\n\
+         print(sub2(a = 10.0, b = 1.0))\n\
+         let m = Scaler(scale = 3.0, shift = 1.0)\n\
+         print(m.f(a = 7.0, b = 2.0))\n",
+    );
+    assert!(ok, "in-order named arguments to imports must compile and run:\n{text}");
+    let printed: Vec<f64> = text.lines().filter_map(|l| l.trim().parse().ok()).collect();
+    assert_eq!(printed, [9.0, 5.0], "{text}");
+}
+
+/// Out of position, an imported callable is refused exactly as a local one
+/// is. Before, `sub2(b = 1.0, a = 10.0)` on an imported `sub2` compiled and
+/// printed -9.
+#[test]
+fn a_named_argument_to_an_imported_callable_out_of_position_is_refused() {
+    for (tag, main, needle) in [
+        (
+            "function",
+            "from lib import sub2\nprint(sub2(b = 1.0, a = 10.0))\n",
+            "argument `b` of `sub2` is passed in position 1, which binds parameter `a`",
+        ),
+        (
+            "aliased",
+            "from lib import sub2 as minus\nprint(minus(b = 1.0, a = 10.0))\n",
+            "argument `b` of `minus` is passed in position 1, which binds parameter `a`",
+        ),
+        (
+            "constructor",
+            "from lib import Scaler\nlet m = Scaler(shift = 1.0, scale = 3.0)\nprint(m.w)\n",
+            "argument `shift` of `Scaler` is passed in position 1, which binds parameter `scale`",
+        ),
+        (
+            "method",
+            "from lib import Scaler\nlet m = Scaler(3.0, 1.0)\nprint(m.f(b = 1.0, a = 10.0))\n",
+            "argument `b` of `f` is passed in position 1, which binds parameter `a`",
+        ),
+        (
+            "module_alias",
+            "import lib as L\nprint(L.sub2(b = 1.0, a = 10.0))\n",
+            "argument `b` of `sub2` is passed in position 1, which binds parameter `a`",
+        ),
+        (
+            "stdlib",
+            "from nsl.nn.losses import mse_loss\nlet a = ones([2])\nlet b = zeros([2])\nprint(mse_loss(target = b, pred = a))\n",
+            "argument `target` of `mse_loss` is passed in position 1, which binds parameter `pred`",
+        ),
+    ] {
+        let (ok, text) = run_with_lib(tag, main);
+        assert!(!ok, "[{tag}] the call compiled and would have bound by position:\n{text}");
         assert!(text.contains(needle), "[{tag}] expected {needle:?} in:\n{text}");
     }
 }

@@ -740,7 +740,10 @@ macro_rules! for_each_runtime_fn {
             // each fused forward/backward FFI.
             // Second arg: expected row count (decorator batch*seq) — the runtime
             // aborts loudly on mismatch instead of overreading the staging buffer.
-            [training] nsl_fused_lce_targets_i64_alloc(i64, i64) -> i64 = fused_linear_ce::nsl_fused_lce_targets_i64_alloc;
+            // Third: vocab_size, for the label range check (negatives become
+            // the ignore index, a label >= vocab aborts). Fourth: which
+            // decorator the site belongs to (0 @fused_lm_ce, 1 @fused_kl_ce).
+            [training] nsl_fused_lce_targets_i64_alloc(i64, i64, i64, i64) -> i64 = fused_linear_ce::nsl_fused_lce_targets_i64_alloc;
             // (x_tensor, w_tensor, batch, seq, vocab_size, hidden_size, site_code)
             // -> void. Aborts when the decorator hints disagree with the head
             // tensors. batch and seq stay SEPARATE: collapsing them to rows here

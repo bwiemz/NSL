@@ -7,14 +7,15 @@
 //! `nsl_mul_f32`, each `c[i] = a[i] op b[i]` over `n` f32 elements.
 //!
 //! The unary family follows: `nsl_{neg,relu,exp,log,sqrt,abs,sign,sigmoid,
-//! sin,cos,silu,gelu}_f32` (`c[i] = f(a[i])`) and `nsl_clamp_f32`
+//! sin,cos,silu}_f32` (`c[i] = f(a[i])`) and `nsl_clamp_f32`
 //! (`c[i] = min(max(a[i], lo), hi)`), each in the hand kernel's instruction
 //! sequence: `exp` as `ex2.approx` of `x * log2(e)`, `log` as `lg2.approx`
 //! times `ln 2`, the sigmoid family through `ex2.approx` and `rcp.approx`,
-//! `sqrt` IEEE-rounded. GELU is the sigmoid approximation `x·σ(k·x)` with
-//! `k` = [`GELU_SLOPE`], the slope `nsl_gelu_backward_srcad_f32`
-//! differentiates with. `nsl_tanh_f32` is built on its own ([`build_tanh`]),
-//! as is the tape-AD GELU adjoint ([`build_gelu_backward`]). Both divide
+//! `sqrt` IEEE-rounded. `nsl_tanh_f32` is built on its own ([`build_tanh`]),
+//! and so is GELU: the forward ([`build_gelu`]) and its adjoint
+//! ([`build_gelu_backward`]) are the tanh approximation
+//! `0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))`, the function the CPU
+//! computes, and one adjoint serves tape AD and source AD. All three divide
 //! with `div.approx.f32` and saturate at [`TANH_SATURATION`].
 //!
 //! The scalar-operand family, `nsl_{mul,add,sub}_scalar_f32`
@@ -384,21 +385,14 @@ pub enum UnaryOp {
     Sin,
     Cos,
     Silu,
-    Gelu,
     Clamp,
 }
 
 /// `log2(e)`, the hand kernels' `0f3FB8AA3B`.
 const LOG2_E: u32 = 0x3FB8_AA3B;
 
-/// GELU's slope `k` in `x·σ(k·x)`: 1.702f, `0f3FD9DB23`. The runtime's
-/// source-AD backward, `nsl_gelu_backward_srcad_f32`, is hand-written with
-/// the same constant; a CPU-lane gate in `nsl-runtime` (`gelu_slope_drift`)
-/// holds the two together.
-pub const GELU_SLOPE: u32 = 0x3FD9_DB23;
-
 impl UnaryOp {
-    pub const ALL: [UnaryOp; 13] = [
+    pub const ALL: [UnaryOp; 12] = [
         UnaryOp::Neg,
         UnaryOp::Relu,
         UnaryOp::Exp,
@@ -410,7 +404,6 @@ impl UnaryOp {
         UnaryOp::Sin,
         UnaryOp::Cos,
         UnaryOp::Silu,
-        UnaryOp::Gelu,
         UnaryOp::Clamp,
     ];
 
@@ -428,7 +421,6 @@ impl UnaryOp {
             UnaryOp::Sin => "nsl_sin_f32",
             UnaryOp::Cos => "nsl_cos_f32",
             UnaryOp::Silu => "nsl_silu_f32",
-            UnaryOp::Gelu => "nsl_gelu_f32",
             UnaryOp::Clamp => "nsl_clamp_f32",
         }
     }
@@ -527,12 +519,6 @@ pub fn build_unary(op: UnaryOp) -> KernelIR {
             let s = sigmoid_of(&mut b, x);
             f32_op2(&mut b, KirOp::Mul, x, s)
         }
-        UnaryOp::Gelu => {
-            let slope = f32_const(&mut b, GELU_SLOPE);
-            let kx = f32_op2(&mut b, KirOp::Mul, x, slope);
-            let s = sigmoid_of(&mut b, kx);
-            f32_op2(&mut b, KirOp::Mul, x, s)
-        }
         UnaryOp::Clamp => {
             let (lo, hi) = bounds.expect("clamp has bounds");
             let t = f32_op2(&mut b, KirOp::Max, x, lo);
@@ -577,8 +563,8 @@ pub fn unary_ptx(op: UnaryOp) -> Vec<u8> {
 /// of separate launches and must match it bit for bit, so every derivative
 /// operation is explicitly rounded (`MulRn`/`AddRn`/`SubRn`); their sigmoid
 /// stays bare, as in `nsl_sigmoid_f32`, since `ex2.approx`/`rcp.approx`
-/// leave no contractible pair. `nsl_gelu_backward_f32` (the tape-AD tanh
-/// approximation) is [`build_gelu_backward`].
+/// leave no contractible pair. GELU's adjoint, `nsl_gelu_backward_f32`, is
+/// [`build_gelu_backward`]; both AD modes use it.
 /// `nsl_clamp_backward_f32` follows once the interpreter its gate runs on
 /// models `and.pred`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -597,9 +583,6 @@ pub enum BackwardOp {
     TanhSrcad,
     /// Source-AD `s = σ(x)`; `grad * (s * (1 + x * (1 - s)))`.
     SiluSrcad,
-    /// Source-AD `kx = k·x`, `s = σ(kx)`; `grad * (s * (1 + kx * (1 - s)))`,
-    /// `k` = [`GELU_SLOPE`]: the exact derivative of `nsl_gelu_f32`.
-    GeluSrcad,
     /// `t = grad * up`, then [`BackwardOp::SiluSrcad`] of `t` at `input`:
     /// the SwiGLU gate adjoint, bit-exact with the multiply launch and the
     /// silu-backward launch it replaces.
@@ -607,7 +590,7 @@ pub enum BackwardOp {
 }
 
 impl BackwardOp {
-    pub const ALL: [BackwardOp; 9] = [
+    pub const ALL: [BackwardOp; 8] = [
         BackwardOp::Relu,
         BackwardOp::Sigmoid,
         BackwardOp::Tanh,
@@ -615,7 +598,6 @@ impl BackwardOp {
         BackwardOp::SigmoidSrcad,
         BackwardOp::TanhSrcad,
         BackwardOp::SiluSrcad,
-        BackwardOp::GeluSrcad,
         BackwardOp::SwigluGate,
     ];
 
@@ -629,7 +611,6 @@ impl BackwardOp {
             BackwardOp::SigmoidSrcad => "nsl_sigmoid_backward_srcad_f32",
             BackwardOp::TanhSrcad => "nsl_tanh_backward_srcad_f32",
             BackwardOp::SiluSrcad => "nsl_silu_backward_srcad_f32",
-            BackwardOp::GeluSrcad => "nsl_gelu_backward_srcad_f32",
             BackwardOp::SwigluGate => "nsl_swiglu_gate_backward_f32",
         }
     }
@@ -647,7 +628,7 @@ impl BackwardOp {
 }
 
 /// `s·(1 + x·(1 − s))` in explicitly rounded steps, `s` already computed:
-/// the source-AD derivative tail shared by SiLU, GELU and the SwiGLU gate.
+/// the source-AD derivative tail shared by SiLU and the SwiGLU gate.
 fn srcad_silu_tail(b: &mut KirBuilder, x: VarId, s: VarId) -> VarId {
     let one = f32_const(b, 1.0f32.to_bits());
     let t = f32_op2(b, KirOp::SubRn, one, s);
@@ -726,13 +707,6 @@ pub fn build_backward(op: BackwardOp) -> KernelIR {
         BackwardOp::SiluSrcad | BackwardOp::SwigluGate => {
             let s = sigmoid_of(&mut b, x);
             let t = srcad_silu_tail(&mut b, x, s);
-            f32_op2(&mut b, KirOp::MulRn, g, t)
-        }
-        BackwardOp::GeluSrcad => {
-            let slope = f32_const(&mut b, GELU_SLOPE);
-            let kx = f32_op2(&mut b, KirOp::MulRn, x, slope);
-            let s = sigmoid_of(&mut b, kx);
-            let t = srcad_silu_tail(&mut b, kx, s);
             f32_op2(&mut b, KirOp::MulRn, g, t)
         }
     };
@@ -869,7 +843,10 @@ pub fn clamp_backward_ptx() -> Vec<u8> {
 /// The tanh forward's entry name.
 pub const TANH_NAME: &str = "nsl_tanh_f32";
 
-/// The tape-AD GELU adjoint's entry name.
+/// The GELU forward's entry name.
+pub const GELU_NAME: &str = "nsl_gelu_f32";
+
+/// The GELU adjoint's entry name.
 pub const GELU_BACKWARD_NAME: &str = "nsl_gelu_backward_f32";
 
 /// Where the kernels' tanh saturates: 43.5, `0f422E0000`.
@@ -884,11 +861,20 @@ pub const GELU_BACKWARD_NAME: &str = "nsl_gelu_backward_f32";
 /// about 10). At `|v| ≤ 43.5` the divisor stays below `2^125.6`.
 pub const TANH_SATURATION: u32 = 0x422E_0000;
 
-/// The GELU tanh-approximation constants the hand adjoint used:
-/// `k = 0.0356774·x³ + 0.797885·x` and `k' = 0.107032·x² + 0.797885`.
-const GELU_TANH_CUBIC: u32 = 0x3D12_4925;
+/// The GELU tanh-approximation constants: `k = 0.0356774·x³ + 0.797885·x`
+/// and `k' = 0.107032·x² + 0.797885`, i.e. `√(2/π)·(0.044715·x³ + x)` and
+/// its derivative. The forward and the adjoint share them.
+///
+/// The hand-written adjoint these kernels replaced carried two other
+/// words: `0f3D124925` (0.0357143, which is 1/28) for the cubic coefficient
+/// and `0f3DD8ECA1` (0.105920) for the squared slope, 0.1% and 1% away from
+/// the function's. Nothing launched that kernel when the error was found
+/// (the GPU forward was then the sigmoid form, with an adjoint of its own),
+/// and the f64 reference in its equivalence gate was built from the same
+/// two words.
+const GELU_TANH_CUBIC: u32 = 0x3D12_2279;
 const GELU_TANH_LINEAR: u32 = 0x3F4C_422A;
-const GELU_TANH_SLOPE_SQUARE: u32 = 0x3DD8_ECA1;
+const GELU_TANH_SLOPE_SQUARE: u32 = 0x3DDB_33B6;
 
 /// `(e − 1) / (e + 1)`, `e = 2^(2v·log2 e)`, in the hand kernels' order: the
 /// doubling, the pre-scale, `ex2.approx`, then the denominator, the
@@ -947,20 +933,85 @@ pub fn tanh_ptx() -> Vec<u8> {
     verified_ptx(build_tanh())
 }
 
-/// `nsl_gelu_backward_f32(grad, input, out, n)`: the tape-AD adjoint of the
-/// GELU tanh approximation.
+/// `k(x) = 0.0356774·x³ + 0.797885·x`, the argument of GELU's tanh, in the
+/// hand adjoint's operation order: the cube, its coefficient, the linear
+/// term, the sum. Shared by the forward and the adjoint, so the two cannot
+/// disagree about the function.
+fn gelu_tanh_argument(b: &mut KirBuilder, x: VarId) -> VarId {
+    let x2 = f32_op2(b, KirOp::Mul, x, x);
+    let x3 = f32_op2(b, KirOp::Mul, x2, x);
+    let cubic = f32_const(b, GELU_TANH_CUBIC);
+    let kc = f32_op2(b, KirOp::Mul, x3, cubic);
+    let linear = f32_const(b, GELU_TANH_LINEAR);
+    let kl = f32_op2(b, KirOp::Mul, x, linear);
+    f32_op2(b, KirOp::Add, kc, kl)
+}
+
+/// `nsl_gelu_f32(a, c, n)`: `c[i] = gelu(a[i])`, the tanh approximation
+///
+/// `gelu(x) = 0.5·x·(1 + tanh(k))`, `k = 0.0356774·x³ + 0.797885·x`
+///
+/// which is `0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))`: PyTorch's
+/// `gelu(approximate="tanh")`, and the function the CPU path, the MoE
+/// expert FFN and [`build_gelu_backward`] all compute. (The GPU forward was
+/// the sigmoid approximation `x·σ(1.702·x)` instead, so one model computed
+/// two different functions depending on the device it ran on: they differ
+/// by up to about 0.02.)
+///
+/// `k` is clamped to ±[`TANH_SATURATION`] before the tanh, as in
+/// [`build_tanh`], so the quotient never meets `div.approx.f32`'s flush
+/// range. Past the clamp `tanh` is ±1 in f32, so the result is `x` above
+/// and `0.5·x·0` below. A NaN `x` makes `k` NaN, which the clamp turns into
+/// the saturation point; the NaN comes back through the final multiply by
+/// `x`.
+pub fn build_gelu() -> KernelIR {
+    use AddressSpace::Global;
+    let mut b = KirBuilder::new(GELU_NAME);
+    let a = b.add_param("a", f32_ptr(), Global);
+    let c = b.add_param("c", f32_ptr(), Global);
+    let n = b.add_param("n", KirType::U64, Global);
+    let (i, _, exit) = index_and_bound(&mut b, n);
+
+    let x = load_f32(&mut b, a, i);
+    let k = gelu_tanh_argument(&mut b, x);
+    let hi = f32_const(&mut b, TANH_SATURATION);
+    let v = f32_op2(&mut b, KirOp::Min, k, hi);
+    let lo = f32_const(&mut b, TANH_SATURATION | 0x8000_0000);
+    let v = f32_op2(&mut b, KirOp::Max, v, lo);
+    let t = tanh_of(&mut b, v);
+    let one = f32_const(&mut b, 1.0f32.to_bits());
+    let p = f32_op2(&mut b, KirOp::Add, one, t);
+    let half = f32_const(&mut b, 0.5f32.to_bits());
+    let hx = f32_op2(&mut b, KirOp::Mul, half, x);
+    let y = f32_op2(&mut b, KirOp::Mul, hx, p);
+    store_f32(&mut b, c, i, y);
+    finish(b, exit)
+}
+
+/// [`build_gelu`] lowered to a NUL-terminated PTX module.
+///
+/// # Panics
+///
+/// If the built kernel fails verification: a bug in this module.
+pub fn gelu_ptx() -> Vec<u8> {
+    verified_ptx(build_gelu())
+}
+
+/// `nsl_gelu_backward_f32(grad, input, out, n)`: the adjoint of the GELU
+/// tanh approximation ([`build_gelu`]), for tape AD and source AD alike.
 ///
 /// `k = 0.0356774·x³ + 0.797885·x`, `t = tanh(k)`, and
 /// `d = 0.5·(1 + t + x·(1 − t²)·(0.107032·x² + 0.797885))`. `out = grad·d`.
 ///
-/// The arithmetic is the hand kernel's, bare. ptxas contracts it as it did
+/// The arithmetic is the hand kernel's, bare, with the two constants
+/// corrected (see [`GELU_TANH_CUBIC`]). ptxas contracts it as it did
 /// (`0.797885·x` into the `k` sum, `t·t` into `1 − t²`, and so on). Past
 /// [`TANH_SATURATION`] in `k` the hand kernel's tanh fell into
 /// `div.approx.f32`'s flush range. Even a correct `t` there would leave
 /// `1 − t²` as rounding noise multiplied by a large `x·(…)`. So two selects
 /// on `k` replace the derivative with its limit: 1 above, 0 below. A NaN
 /// `k` passes through both, and `x` carries its NaN into `d`. For
-/// `|k| ≤ 43.5` the result is the hand kernel's bit for bit.
+/// `|k| ≤ 43.5` the instruction sequence is the hand kernel's.
 pub fn build_gelu_backward() -> KernelIR {
     use AddressSpace::Global;
     let mut b = KirBuilder::new(GELU_BACKWARD_NAME);
@@ -972,13 +1023,7 @@ pub fn build_gelu_backward() -> KernelIR {
 
     let g = load_f32(&mut b, grad, i);
     let x = load_f32(&mut b, input, i);
-    let x2 = f32_op2(&mut b, KirOp::Mul, x, x);
-    let x3 = f32_op2(&mut b, KirOp::Mul, x2, x);
-    let cubic = f32_const(&mut b, GELU_TANH_CUBIC);
-    let kc = f32_op2(&mut b, KirOp::Mul, x3, cubic);
-    let linear = f32_const(&mut b, GELU_TANH_LINEAR);
-    let kl = f32_op2(&mut b, KirOp::Mul, x, linear);
-    let k = f32_op2(&mut b, KirOp::Add, kc, kl);
+    let k = gelu_tanh_argument(&mut b, x);
     let t = tanh_of(&mut b, k);
     let tt = f32_op2(&mut b, KirOp::Mul, t, t);
     let one = f32_const(&mut b, 1.0f32.to_bits());
@@ -1081,7 +1126,6 @@ mod tests {
             (UnaryOp::Log, &["lg2.approx.f32 ", "mul.f32 "][..]),
             (UnaryOp::Sqrt, &["sqrt.rn.f32 "][..]),
             (UnaryOp::Sigmoid, &["neg.f32 ", "ex2.approx.f32 ", "rcp.approx.f32 "][..]),
-            (UnaryOp::Gelu, &["0f3FD9DB23", "neg.f32 ", "ex2.approx.f32 ", "rcp.approx.f32 "][..]),
             (UnaryOp::Sin, &["sin.approx.f32 "][..]),
             (UnaryOp::Cos, &["cos.approx.f32 "][..]),
             (UnaryOp::Sign, &["setp.gt.f32 ", "setp.lt.f32 ", "selp.f32 "][..]),
@@ -1209,8 +1253,7 @@ mod tests {
     }
 
     /// The tape-AD kernels are bare, the source-AD ones explicitly rounded
-    /// in every derivative operation; GELU's backward carries the forward's
-    /// slope.
+    /// in every derivative operation.
     #[test]
     fn the_backward_kernels_spell_their_rounding() {
         let text = |op| String::from_utf8(backward_ptx(op)).unwrap();
@@ -1221,13 +1264,11 @@ mod tests {
             (BackwardOp::SigmoidSrcad, 3),
             (BackwardOp::TanhSrcad, 3),
             (BackwardOp::SiluSrcad, 5),
-            (BackwardOp::GeluSrcad, 6),
             (BackwardOp::SwigluGate, 6),
         ] {
             let t = text(op);
             assert_eq!(t.matches(".rn.f32 ").count(), rounded, "{op:?}: {t}");
         }
-        assert!(text(BackwardOp::GeluSrcad).contains(&format!("0f{GELU_SLOPE:08X}")));
         for op in BackwardOp::ALL {
             let t = text(op);
             assert!(!t.contains("div.") && !t.contains("fma."), "{op:?}");
@@ -1238,6 +1279,7 @@ mod tests {
     fn the_tanh_kernels_verify_keep_their_signatures_and_saturate() {
         for (ir, name, params) in [
             (build_tanh(), TANH_NAME, &["a", "c", "n"][..]),
+            (build_gelu(), GELU_NAME, &["a", "c", "n"][..]),
             (build_gelu_backward(), GELU_BACKWARD_NAME, &["grad", "input", "out", "n"][..]),
         ] {
             verify(&ir).unwrap_or_else(|e| panic!("{name}: {e:?}"));
@@ -1246,8 +1288,20 @@ mod tests {
             assert_eq!(names, params, "{name}");
         }
         let text = |ptx: Vec<u8>| String::from_utf8(ptx).unwrap();
-        let (t, g) = (text(tanh_ptx()), text(gelu_backward_ptx()));
-        for (name, p) in [(TANH_NAME, &t), (GELU_BACKWARD_NAME, &g)] {
+        let (t, f, g) = (text(tanh_ptx()), text(gelu_ptx()), text(gelu_backward_ptx()));
+        // The constants are the function's, computed here rather than read
+        // back: sqrt(2/pi) * 0.044715, sqrt(2/pi), and three times the first.
+        let c = (2.0f64 / std::f64::consts::PI).sqrt();
+        assert_eq!(GELU_TANH_CUBIC, ((c * 0.044715) as f32).to_bits());
+        assert_eq!(GELU_TANH_LINEAR, (c as f32).to_bits());
+        assert_eq!(GELU_TANH_SLOPE_SQUARE, ((3.0 * c * 0.044715) as f32).to_bits());
+        // The forward and its adjoint are one function: the same two
+        // constants in the tanh's argument.
+        for constant in [GELU_TANH_CUBIC, GELU_TANH_LINEAR] {
+            assert!(f.contains(&format!("0f{constant:08X}")), "forward lacks 0f{constant:08X}");
+            assert!(g.contains(&format!("0f{constant:08X}")), "adjoint lacks 0f{constant:08X}");
+        }
+        for (name, p) in [(TANH_NAME, &t), (GELU_NAME, &f), (GELU_BACKWARD_NAME, &g)] {
             assert_eq!(p.matches("div.approx.f32 ").count(), 1, "{name}");
             assert!(p.contains(&format!("0f{TANH_SATURATION:08X}")), "{name}");
         }

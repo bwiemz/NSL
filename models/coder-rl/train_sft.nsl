@@ -25,8 +25,7 @@ print("Model created and transferred to GPU")
 
 # ─── Data ───
 # 172 sequences of 2048 tokens from stdlib + examples + models + spec code
-# batch_size=4: 43 steps/epoch, 430 total steps over 10 epochs
-# batch_size=4 balances GPU utilization with gradient noise for this tiny corpus
+# batch_size=2: 86 steps/epoch, 860 total steps over 10 epochs
 let tokens = load_mmap("models/coder-rl/data/sft_tokens.bin", 3)
 let labels = load_mmap("models/coder-rl/data/sft_labels.bin", 2)
 let loader = DataLoader(tokens, labels=labels, batch_size=2, seq_len=2048, shuffle=true, drop_last=true)
@@ -42,7 +41,7 @@ let epoch_loss_count = 0
 
 # ─── Training ───
 # - AdamW with no weight decay (memorization, not generalization)
-# - Warmup cosine: 20 steps warmup, cosine decay to 3e-5
+# - Warmup cosine: 40 steps warmup, cosine decay to 3e-5 at step 860
 # - Grad clip at 1.0 to prevent explosion on small corpus
 # - Dropout disabled (training=false) — memorize the tiny corpus
 # - 10 epochs is aggressive for 172 sequences but the model needs to memorize

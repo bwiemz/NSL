@@ -150,6 +150,12 @@ impl Compiler<'_> {
                     self.compile_options.checkpoint.policies.clone()
                 });
         extractor.set_model_method_bodies(self.models.model_method_bodies.clone());
+        // Free functions the block may call: inlined, so a loss written as a
+        // function is differentiated here rather than sent to the tape.
+        extractor.set_user_fn_bodies(
+            self.free_fn_bodies.clone(),
+            self.compile_options.imported_model.fn_bodies.clone(),
+        );
         extractor.set_type_map(self.type_map);
         extractor.set_model_field_types(self.models.model_field_types.clone());
         // WRGA B.3.2 Option 3: plumb synth overrides so the extractor

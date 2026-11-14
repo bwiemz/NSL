@@ -49,8 +49,7 @@
 //!   is a mechanical extension, deferred);
 //! - `vocab_size <= 8192` (single-CTA path; the two-kernel large-vocab
 //!   split is deferred);
-//! - spectral top-k logit compression is ADVISORY in v1 (`cpkd_spectral`
-//!   reports the effective rank; this kernel always runs the full vocab).
+//! - no logit compression: this kernel always runs the full vocabulary.
 //!
 //! Both kernels are built as KIR ([`build_forward`], [`build_backward`];
 //! roadmap A2 step 10) and lowered to null-terminated module bytes

@@ -9,6 +9,16 @@
 //!   * candidate enumeration + roofline ranking — [`crate::cep_search::architecture_search`]
 //!   * per-layer teacher importance — [`crate::cep_importance::analyse_weight_map`]
 //!
+//! The layer mapping is uniform in depth: the teacher's layers are cut into
+//! as many contiguous segments as the student has layers, each student
+//! layer learns from one teacher layer of its own segment (the most
+//! important one when teacher weights are given, the deepest otherwise),
+//! and the last student layer always learns from the last teacher layer.
+//! Ranking teacher layers by importance alone and taking the top k could
+//! hand a 12-layer student teacher layers 20 to 31, and with no weights at
+//! all (every score tied) it mapped the student onto the teacher's FIRST k
+//! layers.
+//!
 //! Two v1 deviations from stock CEP, both deliberate:
 //!   * **Parameter budget is enforced caller-side.** `Constraints`
 //!     (cep_search.rs) has no budget field — feasibility only checks peak
@@ -56,9 +66,12 @@ pub struct StudentDesignInput<'a> {
 pub struct LayerMapEntry {
     pub teacher_layer: u32,
     pub student_layer: u32,
-    /// Position-normalized teacher-layer importance (the score the layer was
-    /// selected by — `total_score / position_factor`).
-    pub teacher_importance: f64,
+    /// Position-normalized teacher-layer importance (`total_score /
+    /// position_factor`), the score the layer was preferred by within its
+    /// depth segment. `None` when the layer has no score: no teacher weights
+    /// were given, or the importance pass matched none of this layer's
+    /// weight names. A missing score is not an importance of zero.
+    pub teacher_importance: Option<f64>,
 }
 
 /// Output of [`design_student`].
@@ -76,6 +89,13 @@ pub struct StudentDesign {
     /// Teacher->student layer pairing for feature matching, ascending by
     /// teacher layer. Covers `min(student_layers, teacher_layers)` entries.
     pub layer_mapping: Vec<LayerMapEntry>,
+    /// Whether teacher weights were given, i.e. whether importance scores
+    /// took part in the mapping at all.
+    pub teacher_scored: bool,
+    /// Teacher layers the importance pass produced no score for although
+    /// weights were given (none of their weight names matched). Empty when
+    /// `teacher_scored` is false.
+    pub unscored_teacher_layers: Vec<u32>,
 }
 
 /// Per-layer teacher importance with the U-shaped position prior divided out.
@@ -83,49 +103,60 @@ pub struct StudentDesign {
 /// `analyse_weight_map` bakes `position_factor(l, L)` into every head and FFN
 /// score (it models *pruning* sensitivity); dividing `total_score` by the
 /// factor recovers a positionally unbiased informativeness signal for
-/// teacher-layer selection. Layers missing from the table score 0.0 (the
-/// importance pass scores unmatched weight names as zero — silently, per its
-/// contract).
-pub fn normalized_layer_scores(table: &ImportanceTable, n_layers: u32) -> Vec<f64> {
+/// teacher-layer selection. A layer missing from the table has no score
+/// (`None`): the importance pass matched none of its weight names. It used
+/// to be reported as an importance of 0.0, which reads as a measurement.
+pub fn normalized_layer_scores(table: &ImportanceTable, n_layers: u32) -> Vec<Option<f64>> {
     (0..n_layers)
         .map(|l| {
-            let raw = table
+            table
                 .layers
                 .iter()
                 .find(|li| li.layer == l)
-                .map(|li| li.total_score)
-                .unwrap_or(0.0);
-            raw / position_factor(l, n_layers)
+                .map(|li| li.total_score / position_factor(l, n_layers))
         })
         .collect()
 }
 
-/// Select the top `student_n_layers` teacher layers by normalized importance
-/// and pair them with student layers `0..n` in order.
+/// Pair each student layer with one teacher layer, spread over the teacher's
+/// depth.
 ///
-/// Determinism: ties are broken toward the LOWER teacher layer index. The
-/// selected teacher layers are sorted ascending so depth order is preserved
-/// on both sides of the mapping. If the student is deeper than the teacher,
-/// only `teacher_layers` entries are produced (extra student layers are left
-/// unmapped — v1 has no fan-out mapping).
-pub fn select_layer_mapping(normalized: &[f64], student_n_layers: u32) -> Vec<LayerMapEntry> {
-    let teacher_n = normalized.len();
+/// With `T` teacher layers and `k = min(student_n_layers, T)` mapped student
+/// layers, student layer `i` owns the teacher segment
+/// `[i*T/k, (i+1)*T/k)`. It is paired with the highest-scoring layer of that
+/// segment; a layer without a score ranks below every scored one, and a tie
+/// goes to the DEEPER layer, so with no scores at all this is the usual
+/// uniform map (student `i` from teacher `(i+1)*T/k - 1`). The last student
+/// layer is always paired with the last teacher layer: the student's output
+/// is fitted to the teacher's output, so their final representations are the
+/// ones that must correspond.
+///
+/// The pairs come out ascending in both layers, one per segment, so they
+/// can neither cluster nor skip a stretch of the teacher's depth. If the
+/// student is deeper than the teacher, only `T` entries are produced (extra
+/// student layers are left unmapped — v1 has no fan-out mapping).
+pub fn select_layer_mapping(scores: &[Option<f64>], student_n_layers: u32) -> Vec<LayerMapEntry> {
+    let teacher_n = scores.len();
     let k = (student_n_layers as usize).min(teacher_n);
-    let mut order: Vec<usize> = (0..teacher_n).collect();
-    order.sort_by(|&a, &b| {
-        normalized[b]
-            .partial_cmp(&normalized[a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.cmp(&b))
-    });
-    let mut top: Vec<usize> = order.into_iter().take(k).collect();
-    top.sort_unstable();
-    top.iter()
-        .enumerate()
-        .map(|(student, &teacher)| LayerMapEntry {
-            teacher_layer: teacher as u32,
-            student_layer: student as u32,
-            teacher_importance: normalized[teacher],
+    (0..k)
+        .map(|student| {
+            let (start, end) = (student * teacher_n / k, (student + 1) * teacher_n / k);
+            let teacher = if student + 1 == k {
+                teacher_n - 1
+            } else {
+                // `max_by` keeps the LAST maximum, which is the deeper layer.
+                (start..end)
+                    .max_by(|&a, &b| {
+                        let key = |l: usize| scores[l].unwrap_or(f64::NEG_INFINITY);
+                        key(a).partial_cmp(&key(b)).unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .unwrap_or(start)
+            };
+            LayerMapEntry {
+                teacher_layer: teacher as u32,
+                student_layer: student as u32,
+                teacher_importance: scores[teacher],
+            }
         })
         .collect()
 }
@@ -139,9 +170,9 @@ pub fn select_layer_mapping(normalized: &[f64], student_n_layers: u32) -> Vec<La
 /// (`slack_from_profile`, cep.rs) is private and profile-coupled; v1
 /// deliberately uses neutral slack so the layer score is a pure
 /// weight-magnitude x spectral x position signal (position then normalized
-/// out). Without `weights` the scores are uniform — DEGENERATE: every layer
-/// ties, so the lower-index tie-break maps the FIRST `k` teacher layers to
-/// the student. Pass teacher weights for a meaningful mapping.
+/// out). Without `weights` no layer has a score and the mapping is the
+/// uniform-depth one (see [`select_layer_mapping`]); with them, importance
+/// chooses within each depth segment.
 pub fn design_student(input: StudentDesignInput) -> Result<StudentDesign, String> {
     let Some(gpu) = crate::gpu_specs::find_gpu(input.target_gpu) else {
         return Err(format!(
@@ -190,7 +221,7 @@ pub fn design_student(input: StudentDesignInput) -> Result<StudentDesign, String
     };
 
     let teacher_n = input.teacher_spec.n_layers;
-    let normalized = match input.weights {
+    let scores = match input.weights {
         Some(wm) => {
             let table = crate::cep_importance::analyse_weight_map(
                 wm,
@@ -199,11 +230,16 @@ pub fn design_student(input: StudentDesignInput) -> Result<StudentDesign, String
             )?;
             normalized_layer_scores(&table, teacher_n)
         }
-        // Degenerate uniform scores (documented above): no position division
-        // here — the prior is only baked into analyse_weight_map's output.
-        None => vec![1.0; teacher_n as usize],
+        // No weights, no scores: the mapping is by depth alone.
+        None => vec![None; teacher_n as usize],
     };
-    let layer_mapping = select_layer_mapping(&normalized, chosen.spec.n_layers);
+    let layer_mapping = select_layer_mapping(&scores, chosen.spec.n_layers);
+    let teacher_scored = input.weights.is_some();
+    let unscored_teacher_layers = if teacher_scored {
+        (0..teacher_n).filter(|&l| scores[l as usize].is_none()).collect()
+    } else {
+        Vec::new()
+    };
 
     Ok(StudentDesign {
         spec: chosen.spec.clone(),
@@ -211,6 +247,8 @@ pub fn design_student(input: StudentDesignInput) -> Result<StudentDesign, String
         candidates_considered: considered,
         candidates_within_budget: within_budget,
         layer_mapping,
+        teacher_scored,
+        unscored_teacher_layers,
     })
 }
 
@@ -302,17 +340,32 @@ pub fn render_design_report(
 
     writeln!(
         s,
-        "Teacher -> student layer mapping (position-normalized importance):"
+        "Teacher -> student layer mapping (one teacher layer per student layer, \
+         spread over the teacher's depth, last to last; {}):",
+        if design.teacher_scored {
+            "within a depth segment the layer of highest position-normalized importance"
+        } else {
+            "no teacher weights given, so by depth alone"
+        }
     )
     .unwrap();
     if design.layer_mapping.is_empty() {
         writeln!(s, "  (none)").unwrap();
     }
     for e in &design.layer_mapping {
+        let importance = match e.teacher_importance {
+            Some(v) => format!("  (importance {v:.4})"),
+            None if design.teacher_scored => "  (no importance score)".to_string(),
+            None => String::new(),
+        };
+        writeln!(s, "  student {:>2} <- teacher {:>2}{importance}", e.student_layer, e.teacher_layer).unwrap();
+    }
+    if !design.unscored_teacher_layers.is_empty() {
+        let layers: Vec<String> = design.unscored_teacher_layers.iter().map(u32::to_string).collect();
         writeln!(
             s,
-            "  student {:>2} <- teacher {:>2}  (importance {:.4})",
-            e.student_layer, e.teacher_layer, e.teacher_importance
+            "Teacher layers with no importance score (none of their weight names matched): {}",
+            layers.join(", ")
         )
         .unwrap();
     }
@@ -448,38 +501,88 @@ mod tests {
 
     // --- layer mapping -----------------------------------------------------
 
+    fn teachers(mapping: &[LayerMapEntry]) -> Vec<u32> {
+        mapping.iter().map(|e| e.teacher_layer).collect()
+    }
+
+    fn scored(v: &[f64]) -> Vec<Option<f64>> {
+        v.iter().copied().map(Some).collect()
+    }
+
+    /// With no scores the map is the uniform one: student `i` of `k` from
+    /// teacher `(i + 1) * T / k - 1`. Worked by hand for T = 12, k = 4 and
+    /// T = 32, k = 12.
     #[test]
-    fn mapping_selects_top_k_and_sorts_ascending() {
-        let normalized = [0.5, 2.0, 1.0, 3.0, 0.1, 0.2];
-        let mapping = select_layer_mapping(&normalized, 3);
-        // Top-3 by score: layers 3 (3.0), 1 (2.0), 2 (1.0) — ascending 1, 2, 3.
+    fn mapping_without_scores_is_uniform_in_depth() {
+        assert_eq!(teachers(&select_layer_mapping(&[None; 12], 4)), vec![2, 5, 8, 11]);
+        assert_eq!(
+            teachers(&select_layer_mapping(&[None; 32], 12)),
+            vec![1, 4, 7, 9, 12, 15, 17, 20, 23, 25, 28, 31]
+        );
+        let students: Vec<u32> = select_layer_mapping(&[None; 12], 4).iter().map(|e| e.student_layer).collect();
+        assert_eq!(students, vec![0, 1, 2, 3]);
+    }
+
+    /// The defect this replaced: every important teacher layer at the deep
+    /// end. Top-k by importance mapped a 4-layer student onto teacher layers
+    /// 8..=11; the map must still take one layer from each third of the
+    /// teacher and end on its last layer.
+    #[test]
+    fn mapping_cannot_cluster_at_one_end() {
+        let mut scores = vec![0.1; 12];
+        for (l, s) in scores.iter_mut().enumerate().skip(8) {
+            *s = 10.0 + l as f64;
+        }
+        let mapping = select_layer_mapping(&scored(&scores), 4);
+        let t = teachers(&mapping);
+        assert_eq!(t.len(), 4);
+        for (i, &layer) in t.iter().enumerate() {
+            let (start, end) = (i as u32 * 3, (i as u32 + 1) * 3);
+            assert!((start..end).contains(&layer), "student {i} got teacher {layer}, outside {start}..{end}");
+        }
+        assert_eq!(*t.last().unwrap(), 11, "last student layer maps to the last teacher layer");
+    }
+
+    /// Within a segment the highest score wins; the last student layer is
+    /// pinned to the last teacher layer whatever the scores say.
+    #[test]
+    fn importance_chooses_within_a_segment_and_last_maps_to_last() {
+        //            seg 0        seg 1        seg 2 (pinned to 5)
+        let scores = [0.5, 2.0, 3.0, 1.0, 9.0, 0.2];
+        let mapping = select_layer_mapping(&scored(&scores), 3);
         assert_eq!(
             mapping,
             vec![
-                LayerMapEntry { teacher_layer: 1, student_layer: 0, teacher_importance: 2.0 },
-                LayerMapEntry { teacher_layer: 2, student_layer: 1, teacher_importance: 1.0 },
-                LayerMapEntry { teacher_layer: 3, student_layer: 2, teacher_importance: 3.0 },
+                LayerMapEntry { teacher_layer: 1, student_layer: 0, teacher_importance: Some(2.0) },
+                LayerMapEntry { teacher_layer: 2, student_layer: 1, teacher_importance: Some(3.0) },
+                LayerMapEntry { teacher_layer: 5, student_layer: 2, teacher_importance: Some(0.2) },
             ]
         );
     }
 
     #[test]
-    fn mapping_ties_break_toward_lower_layer_index() {
-        let normalized = [1.0; 6];
-        let mapping = select_layer_mapping(&normalized, 3);
-        let teachers: Vec<u32> = mapping.iter().map(|e| e.teacher_layer).collect();
-        assert_eq!(teachers, vec![0, 1, 2]);
-        // Determinism: same input, same output.
-        assert_eq!(select_layer_mapping(&normalized, 3), mapping);
+    fn mapping_ties_break_toward_the_deeper_layer_and_are_deterministic() {
+        let scores = scored(&[1.0; 6]);
+        let mapping = select_layer_mapping(&scores, 3);
+        assert_eq!(teachers(&mapping), vec![1, 3, 5]);
+        assert_eq!(select_layer_mapping(&scores, 3), mapping);
+    }
+
+    /// A layer with no score never beats a scored one, however small.
+    #[test]
+    fn an_unscored_layer_ranks_below_every_scored_one() {
+        let scores = [Some(1e-9), None, Some(0.5), Some(0.7)];
+        let mapping = select_layer_mapping(&scores, 2);
+        assert_eq!(teachers(&mapping), vec![0, 3]);
+        assert_eq!(mapping[0].teacher_importance, Some(1e-9));
     }
 
     #[test]
     fn mapping_caps_at_teacher_depth() {
-        let normalized = [2.0, 1.0];
-        let mapping = select_layer_mapping(&normalized, 4);
-        assert_eq!(mapping.len(), 2);
-        let teachers: Vec<u32> = mapping.iter().map(|e| e.teacher_layer).collect();
-        assert_eq!(teachers, vec![0, 1]);
+        let mapping = select_layer_mapping(&scored(&[2.0, 1.0]), 4);
+        assert_eq!(teachers(&mapping), vec![0, 1]);
+        assert!(select_layer_mapping(&[], 3).is_empty());
+        assert!(select_layer_mapping(&scored(&[1.0, 2.0]), 0).is_empty());
     }
 
     #[test]
@@ -502,6 +605,7 @@ mod tests {
         };
         let normalized = normalized_layer_scores(&table, n);
         for (got, want) in normalized.iter().zip(base.iter()) {
+            let got = got.expect("every layer is in the table");
             assert!((got - want).abs() < 1e-12, "got {got}, want {want}");
         }
     }
@@ -510,7 +614,8 @@ mod tests {
     fn normalization_changes_selection_vs_raw_scores() {
         // position_factor(0, 4) = 1.3, position_factor(1, 4) = 1.1.
         // Raw scores favor layer 0 (1.43 > 1.32) but the normalized signal
-        // favors layer 1 (1.1 > 1.0) — proving the prior is removed.
+        // favors layer 1 (1.2 > 1.1) — proving the prior is removed. Two
+        // student layers: the first chooses within teacher layers {0, 1}.
         let n = 4u32;
         let raw = [1.43, 1.32, 0.5, 0.1];
         let table = ImportanceTable {
@@ -526,31 +631,33 @@ mod tests {
                 .collect(),
         };
         let normalized = normalized_layer_scores(&table, n);
-        let mapping = select_layer_mapping(&normalized, 1);
-        assert_eq!(mapping.len(), 1);
-        assert_eq!(mapping[0].teacher_layer, 1);
+        let mapping = select_layer_mapping(&normalized, 2);
+        assert_eq!(teachers(&mapping), vec![1, 3]);
     }
 
+    /// A layer the importance pass did not score has NO score, not zero.
     #[test]
-    fn missing_table_layers_score_zero() {
+    fn missing_table_layers_have_no_score() {
         let table = ImportanceTable::default();
-        let normalized = normalized_layer_scores(&table, 3);
-        assert_eq!(normalized, vec![0.0, 0.0, 0.0]);
+        assert_eq!(normalized_layer_scores(&table, 3), vec![None, None, None]);
     }
 
     #[test]
-    fn design_without_weights_maps_first_k_layers_uniformly() {
-        // Documented degeneracy: uniform scores tie everywhere, lower index
-        // wins, so student layers pair with teacher layers 0..k.
+    fn design_without_weights_maps_by_depth_and_reports_no_importance() {
+        // Teacher has 4 layers, the student 2: students 0 and 1 learn from
+        // teacher layers 1 and 3. (This used to be teacher layers 0 and 1,
+        // each printed with an "importance" of 1.0 nothing had measured.)
         let design = design_student(input_with_budget(u64::MAX)).expect("design succeeds");
         assert_eq!(design.spec.n_layers, 2);
-        let teachers: Vec<u32> = design.layer_mapping.iter().map(|e| e.teacher_layer).collect();
+        assert_eq!(teachers(&design.layer_mapping), vec![1, 3]);
         let students: Vec<u32> = design.layer_mapping.iter().map(|e| e.student_layer).collect();
-        assert_eq!(teachers, vec![0, 1]);
         assert_eq!(students, vec![0, 1]);
-        for e in &design.layer_mapping {
-            assert!((e.teacher_importance - 1.0).abs() < 1e-12);
-        }
+        assert!(design.layer_mapping.iter().all(|e| e.teacher_importance.is_none()));
+        assert!(!design.teacher_scored);
+        assert!(design.unscored_teacher_layers.is_empty());
+        let report = render_design_report(&design, &teacher(), 1_000_000, "H100-SXM");
+        assert!(report.contains("no teacher weights given, so by depth alone"), "{report}");
+        assert!(!report.contains("importance 1.0000"), "{report}");
     }
 
     // --- report ------------------------------------------------------------
@@ -567,7 +674,8 @@ mod tests {
         assert!(report.contains("d_model="));
         assert!(report.contains("Candidates: 4 enumerated, 4 within budget"));
         assert!(report.contains("Teacher -> student layer mapping"));
-        assert!(report.contains("student  0 <- teacher  0"));
+        assert!(report.contains("student  0 <- teacher  1"));
+        assert!(report.contains("student  1 <- teacher  3"));
         // ASCII only (repo doctrine for report text consumed in terminals).
         assert!(report.is_ascii());
     }

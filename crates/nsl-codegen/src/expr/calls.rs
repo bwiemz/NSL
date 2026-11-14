@@ -3525,9 +3525,30 @@ impl Compiler<'_> {
             _ => {
                 // For Unknown types, check the Cranelift value type
                 let cl_type = builder.func.dfg.value_type(val);
-                if cl_type == cl_types::F64 {
+                if cl_type == cl_types::F64 || cl_type == cl_types::F32 {
                     "nsl_print_float"
+                } else if arg_type.is_indeterminate()
+                    && self.expr_result_is_owned_tensor(builder, state, &arg.value, val)
+                {
+                    // The checker could not type the expression, but the
+                    // emission can: the value is the fresh result of a
+                    // tensor-returning call (`block.w.sum()` on a receiver
+                    // of unknown type). Printing it as an integer printed
+                    // the tensor's handle.
+                    "nsl_tensor_print"
                 } else {
+                    if arg_type.is_indeterminate() {
+                        // Nothing says what this 64-bit value is. It is
+                        // printed as an integer, which for a tensor is its
+                        // handle; say so rather than print a pointer
+                        // without comment.
+                        nsl_log::nsl_log!(WARN, "nsl",
+                            "warning: print() argument has no type known at compile time and \
+                             is printed as an integer. If it is a tensor, the number shown \
+                             is its handle, not its value: bind it first with an explicit \
+                             type (`let t: Tensor = <expr>`) and print that."
+                        );
+                    }
                     "nsl_print_int"
                 }
             }

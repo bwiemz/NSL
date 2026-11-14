@@ -15,9 +15,12 @@
 //!   without materializing either logit tensor in HBM;
 //! - remaining paper innovations surface as **advisory** plan entries in v1
 //!   (repo doctrine: opt-in, gate-off byte-identical, advisory before
-//!   consumed): spectral logit-compression rank (`cpkd_spectral`), WGGO
-//!   per-layer feature-match/attn-transfer/teacher-stream choices
-//!   (`wggo_cpkd`), and CEP-guided student design (`cpkd_student`).
+//!   consumed): WGGO per-layer feature-match/attn-transfer/teacher-stream
+//!   choices (`wggo_cpkd`), and CEP-guided student design
+//!   (`cpkd_student`). Spectral top-k logit compression is not one of
+//!   them: the rank of the LM head does not give a top-k (it bounds the
+//!   dimension of the logit subspace, not the number of tokens that carry
+//!   probability), and its selector was removed.
 //!
 //! v1 deferrals refuse loudly (never degrade silently):
 //! - two-stream teacher/student overlap: the runtime has no stream plumbing
@@ -34,42 +37,27 @@
 
 use serde::Serialize;
 
-/// Which teacher layers feed the (advisory in v1) feature-matching loss.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
-pub enum FeatureLayers {
-    /// WGGO/importance-driven selection (advisory in v1).
-    #[default]
-    Auto,
-    /// Explicit teacher layer indices from the `loss:` section.
-    Explicit(Vec<i64>),
-}
-
-/// Parsed `loss:` section of a distill block (semantic layer has already
-/// validated keys, literal-ness, and ranges; attn_transfer=true is refused
-/// there).
-#[derive(Debug, Clone, Serialize)]
-pub struct DistillLossConfig {
-    /// Hard-label CE weight; soft KL term gets `1 - alpha`.
-    pub alpha: f64,
-    /// KL softmax temperature (classic Hinton scaling: the KL term is
-    /// multiplied by `T^2`).
-    pub temperature: f64,
-    /// Weight on the (user-composed) feature-matching loss. Advisory
-    /// metadata in v1 — the step body owns the actual feature loss.
-    pub feature_weight: f64,
-    /// Teacher layers for feature matching (advisory in v1).
-    pub feature_layers: FeatureLayers,
-}
-
-impl Default for DistillLossConfig {
-    fn default() -> Self {
-        DistillLossConfig {
-            alpha: 0.5,
-            temperature: 2.0,
-            feature_weight: 0.1,
-            feature_layers: FeatureLayers::Auto,
-        }
-    }
+/// The loss a distill step computes, as the lowering found it.
+///
+/// The block's `loss:` section does not define the loss: the step body
+/// does. The section may state `alpha` and `temperature`, and they are then
+/// checked against the `fused_kl_ce(...)` call that must consume them. This
+/// is what the build report prints, so it names what runs.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub enum DistillLoss {
+    /// The step body calls `fused_kl_ce(...)`.
+    KlCe {
+        /// Hard-label CE weight; the KL term gets `1 - alpha`. `None` when
+        /// the call passes something other than a numeric literal.
+        alpha: Option<f64>,
+        /// KL softmax temperature (the KL term is multiplied by `T^2`).
+        temperature: Option<f64>,
+        /// `true`: the fused kernel computes it. `false`: the
+        /// standard-library composite does.
+        fused: bool,
+    },
+    /// The step body computes its own loss, with no `fused_kl_ce` call.
+    StepBody,
 }
 
 /// Compiler-side context for the distill block currently being lowered.
@@ -106,7 +94,7 @@ pub struct CpkdPlan {
     /// re-derived: a report that re-computed the mode from the window could
     /// disagree with the emitted code.
     pub fase_mode: String,
-    pub loss: DistillLossConfig,
+    pub loss: DistillLoss,
     /// Trainable (student) tensor params registered on the Wengert list.
     pub trainable_params: usize,
     /// Frozen teacher-field Input leaves (I-11 evidence: these received
@@ -167,11 +155,23 @@ impl CpkdPlan {
             "Student: {} (trainable; {} tensor params)",
             self.student_name, self.trainable_params
         );
-        let _ = writeln!(
-            s,
-            "Loss: alpha={} temperature={} feature_weight={}",
-            self.loss.alpha, self.loss.temperature, self.loss.feature_weight
-        );
+        let shown = |v: Option<f64>| match v {
+            Some(v) => v.to_string(),
+            None => "<not a literal>".to_string(),
+        };
+        let _ = match &self.loss {
+            DistillLoss::KlCe { alpha, temperature, fused } => writeln!(
+                s,
+                "Loss: fused_kl_ce(alpha={}, temperature={}), computed by {}",
+                shown(*alpha),
+                shown(*temperature),
+                if *fused { "the fused kernel" } else { "the standard-library composite" }
+            ),
+            DistillLoss::StepBody => writeln!(
+                s,
+                "Loss: the step body's own expression (no fused_kl_ce call)"
+            ),
+        };
         let _ = writeln!(s, "Epochs: {}", self.epochs);
         // The caveat keys on the MODE, not on the window. Keying it on
         // `grad_accumulation > 1` was wrong in the one case that matters:
@@ -224,11 +224,6 @@ impl CpkdPlan {
             "  [3] Teacher scheduling: sequential (two-stream overlap is \
              advisory-only in v1; the runtime is single-stream)"
         );
-        let _ = writeln!(
-            s,
-            "  [4] Spectral logit compression: advisory-only in v1 \
-             (see `nsl check --cpkd-design-student` / cpkd_spectral)"
-        );
         s
     }
 }
@@ -238,16 +233,15 @@ pub struct DistillContext {
     pub teacher_sym: nsl_ast::Symbol,
     pub student_sym: nsl_ast::Symbol,
     pub epochs: i64,
-    pub loss: DistillLossConfig,
     /// The `@fused_kl_ce` decorator config for THIS distill block (looked
     /// up by `distill_block_stmt_id` in `compile_distill_block`), threaded
     /// into the Wengert extractor so `fused_kl_ce(...)` calls in the step
     /// body are recognised as a single fused op.
     pub fused_kl_ce: Option<crate::FusedKlCeDecoratorConfig>,
-    /// alpha as EXPLICITLY written in the `loss:` section (`None` when the
-    /// user omitted it). Used for the call-site literal cross-check only —
-    /// `loss.alpha` always holds the effective (defaulted) value for the
-    /// report, and defaults must not veto a call-site literal.
+    /// alpha as written in the `loss:` section (`None` when the user
+    /// omitted it). The `fused_kl_ce(...)` call in the step body must pass
+    /// the same literal, and there must be such a call: a declared value
+    /// nothing reads is refused.
     pub loss_alpha_explicit: Option<f64>,
     /// temperature as explicitly written in the `loss:` section.
     pub loss_temperature_explicit: Option<f64>,
