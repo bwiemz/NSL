@@ -361,22 +361,6 @@ fn stmts_contain_any_call(
     f.found
 }
 
-/// Companion to [`stmts_contain_masked_sdpa`] for model method bodies —
-/// covers models declared in IMPORTED modules (e.g. the stdlib GQA's
-/// `forward_masked`), whose statements are not part of the entry module's
-/// stmt list but are registered in `Compiler.models.model_method_bodies`.
-pub fn fn_bodies_contain_masked_sdpa<'a>(
-    bodies: impl Iterator<Item = &'a nsl_ast::decl::FnDef>,
-    interner: &nsl_lexer::Interner,
-) -> bool {
-    for def in bodies {
-        if stmts_contain_masked_sdpa(&def.body.stmts, interner) {
-            return true;
-        }
-    }
-    false
-}
-
 /// Companion to [`stmts_contain_packed_sdpa`] for model method bodies
 /// (e.g. the stdlib GQA's `forward_packed`).
 pub fn fn_bodies_contain_packed_sdpa<'a>(
@@ -888,6 +872,10 @@ fn plan_train_block(
         // through its own schedule before any positional consumption — so a
         // digest captured here would be guaranteed-overwritten before any
         // assert could read it, a full-tape hash per block buying nothing.
+        // The shapes of this block's model, read off the tape just
+        // extracted (the same derivation the in-place planner makes on the
+        // codegen-time tape).
+        let model_geometry = compiler.wggo_model_geometry(&extractor);
         let sched = compiler.passes.scheduler();
         let scheduled = match sched.schedule("WGGO", None, || {
             crate::wggo::run_on_wengert_with_weights(
@@ -903,6 +891,7 @@ fn plan_train_block(
                 // (before this pre-pass) so packing is priced from the real
                 // distribution; `None` on non-packed modules → legacy constants.
                 compiler.features.dataset_packing_stats.clone(),
+                model_geometry,
             )
             .map_err(|e| e.with_span_if_unset(model_arg_span(train, compiler.interner)))
         }) {

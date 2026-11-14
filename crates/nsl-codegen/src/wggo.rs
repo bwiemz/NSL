@@ -19,25 +19,24 @@
 
 use serde::Serialize;
 
-use crate::gpu_specs::{default_gpu, find_gpu};
 use crate::error::CodegenError;
 use crate::pass_trace::{DeclineReason, PassDisposition};
 use crate::wengert::WengertList;
 use crate::wggo_apply::{apply, AppliedPlan};
 use crate::wggo_conflicts::{greedy_resolve, LayerDecisions, Resolution};
 use crate::pca_detect::DatasetPackingConfig;
-use crate::wggo_cost::{build_lut, LayerCostLut, LayerShape, LutAxes};
+use crate::wggo_cost::{build_layer_lut, build_lut, LayerCostLut, LayerShape, LutAxes};
+use crate::wggo_model_shape::{ModelGeometry, ShapeUnknown};
 use crate::wggo_dp::{
     passthrough_plan, solve as dp_solve, ClusterSpec, DpConfig, ImportanceScores, InterLayerPlan,
 };
 use crate::wggo_graph::{build as build_graph, LayerRole, OptGraph};
-use crate::wggo_shape::LayerShapeInfo;
 use crate::wggo_cfie::{surface_from_plan, CfieInferenceChoice, CfieLayerInference};
 use crate::wggo_cpkd::{
     surface_from_plan as cpkd_surface_from_plan, CpkdChoice, CpkdLayerDistill,
 };
 use crate::wggo_ilp::{
-    recost_decision_cpkd, solve_all_greedy_cpkd as ilp_solve_all_greedy_cpkd,
+    recost_decision_cpkd, refresh_solution, solve_all_greedy_cpkd as ilp_solve_all_greedy_cpkd,
     solve_all_templated_cpkd as ilp_solve_all_templated_cpkd,
     solve_layer_cpkd as ilp_solve_layer_cpkd, LayerIlpConstraints, LayerIlpSolution,
     TemplateStats,
@@ -45,8 +44,8 @@ use crate::wggo_ilp::{
 use crate::wggo_schedule::{build_schedule, CommSchedule};
 use crate::wggo_gradient_scorer::GradientScorer;
 use crate::wggo_weight_analysis::{
-    analyze as analyze_weights, score_layer_magnitude, AnalysisConfig, NullWeightProvider,
-    WeightAnalysisReport, WeightProvider,
+    analyze_layers, normalise, percentile_threshold, AnalysisConfig, HeadLayout,
+    NullWeightProvider, WeightAnalysisReport, WeightProvider, WeightShapeMismatch,
 };
 
 /// User-visible optimisation mode.
@@ -90,6 +89,16 @@ pub struct WggoInput<'a> {
     pub mode: WggoMode,
     pub target: &'a str,
     pub wengert: &'a WengertList,
+    /// The shape of every layer of the model being compiled, parallel to
+    /// the layer graph of `wengert` ([`crate::wggo_model_shape::derive`]).
+    /// When `Some`, each layer's cost table, head count, key/value grouping
+    /// and parameter bytes come from it, and `layer_shape` and the head and
+    /// FFN axes of `lut_axes` are not read. The compile pipeline always
+    /// supplies it; `None` is for callers that size a nominal layer
+    /// themselves (unit tests, `nsl profile --explain-wggo` on a synthetic
+    /// graph), and the plan then says so.
+    pub model: Option<ModelGeometry>,
+    /// Nominal layer shape, used only when `model` is `None`.
     pub layer_shape: LayerShape,
     pub cluster: ClusterSpec,
     pub lut_axes: LutAxes,
@@ -186,6 +195,9 @@ pub struct BudgetInfeasibility {
 pub struct WggoPlan {
     pub mode: WggoMode,
     pub target_gpu: String,
+    /// Whether the figures below were computed from the shapes of the model
+    /// being compiled (`true`) or from a nominal layer the caller supplied.
+    pub shapes_from_model: bool,
     pub graph: OptGraph,
     pub inter_layer: InterLayerPlan,
     pub per_layer: Vec<LayerIlpSolution>,
@@ -236,6 +248,17 @@ impl WggoPlan {
         writeln!(s, "Target GPU: {}", self.target_gpu).unwrap();
         writeln!(
             s,
+            "Layer shapes: {}",
+            if self.shapes_from_model {
+                "from the model being compiled"
+            } else {
+                "a nominal layer supplied by the caller, not the model; \
+                 times and memory below describe that layer"
+            }
+        )
+        .unwrap();
+        writeln!(
+            s,
             "Layers: {} ({} pruned, {} kept)",
             self.inter_layer.layers.len(),
             self.inter_layer.pruned_layers(),
@@ -254,13 +277,19 @@ impl WggoPlan {
         )
         .unwrap();
         writeln!(s, "Level 2 (per-layer ILP):").unwrap();
-        for layer in &self.applied.layers {
+        for (i, layer) in self.applied.layers.iter().enumerate() {
+            // Kept over total: the total is the length of the layer's keep
+            // mask (`per_layer` is parallel to `applied.layers`).
+            let total_heads = self
+                .per_layer
+                .get(i)
+                .map_or(layer.active_heads as usize, |sol| sol.decision.keep_head.len());
             writeln!(
                 s,
                 "  {}: {}/{} heads, FFN={}, CSHA-L{}, LoRA r={} [{}], m={}b v={}b, FASE={}, PCA={}",
                 layer.layer_name,
                 layer.active_heads,
-                layer.active_heads, // number of actually-kept heads (no "of total" info here)
+                total_heads,
                 layer.ffn_width,
                 layer.csha_level,
                 layer.adapter_rank,
@@ -358,6 +387,15 @@ impl WggoPlan {
             self.applied.peak_memory_bytes as f64 / 1e6
         )
         .unwrap();
+        let infeasible = self.per_layer.iter().filter(|sol| !sol.feasible).count();
+        if infeasible > 0 {
+            writeln!(
+                s,
+                "  ({infeasible} layer(s) with no feasible configuration are left as written \
+                 and are not in the step time)"
+            )
+            .unwrap();
+        }
         writeln!(s, "  Solve time: {:.2} ms", self.estimated_solve_us as f64 / 1000.0).unwrap();
         writeln!(
             s,
@@ -440,12 +478,43 @@ fn build_layer_decisions(
 
 /// Feed the resolver's verdicts back into the per-layer ILP solutions so
 /// `apply` sees post-resolution decisions (downgraded CSHA, removed adapter,
-/// deferred FASE step).
-fn splice_resolved(per_layer: &mut [LayerIlpSolution], resolved: &[LayerDecisions]) {
-    for (sol, r) in per_layer.iter_mut().zip(resolved.iter()) {
-        sol.decision.csha_level = r.csha_level;
-        sol.decision.adapter_rank = r.adapter_rank;
-        sol.decision.fase_fused = r.fase_fused;
+/// deferred FASE step), and bring each changed layer's cost and memory back
+/// in line with the decision it now carries. The plan used to report the
+/// cost of what the solver chose before the resolver changed it.
+fn splice_resolved(
+    per_layer: &mut [LayerIlpSolution],
+    resolved: &[LayerDecisions],
+    luts: &[LayerCostLut],
+    constraints: &[LayerIlpConstraints],
+    cfie_choices: &[Option<CfieInferenceChoice>],
+    cpkd_choices: &[Option<CpkdChoice>],
+) {
+    for (i, (sol, r)) in per_layer.iter_mut().zip(resolved.iter()).enumerate() {
+        let d = &mut sol.decision;
+        let changed = d.csha_level != r.csha_level
+            || d.adapter_rank != r.adapter_rank
+            || d.fase_fused != r.fase_fused;
+        d.csha_level = r.csha_level;
+        d.adapter_rank = r.adapter_rank;
+        d.fase_fused = r.fase_fused;
+        if d.adapter_rank == 0 {
+            d.adapter_placement = crate::wggo_ilp::AdapterPlacement::None;
+        }
+        if !changed {
+            continue;
+        }
+        if let (Some(lut), Some(cons)) = (
+            luts.get(i).or_else(|| luts.first()),
+            constraints.get(i).or_else(|| constraints.first()),
+        ) {
+            refresh_solution(
+                lut,
+                sol,
+                cons,
+                cfie_choices.get(i).copied().flatten(),
+                cpkd_choices.get(i).copied().flatten(),
+            );
+        }
     }
 }
 
@@ -490,17 +559,66 @@ fn recost_total(
 /// coarse; a measured non-layer footprint is the natural refinement.
 const NON_LAYER_OVERHEAD_FRACTION: f64 = 0.15;
 
-/// Divide a per-device model budget into a per-layer ILP budget: reserve
-/// [`NON_LAYER_OVERHEAD_FRACTION`] for non-layer surfaces, split the rest
-/// evenly across `n_layers`. `None` in → `None` out (no budget). Never returns
-/// 0 (a layer must be allowed at least 1 byte or every candidate is infeasible
-/// for the wrong reason).
-fn per_layer_ilp_budget(model_budget: Option<u64>, n_layers: usize) -> Option<u64> {
-    model_budget.map(|b| {
-        let n = n_layers.max(1) as u64;
-        let usable = (b as f64 * (1.0 - NON_LAYER_OVERHEAD_FRACTION)) as u64;
-        (usable / n).max(1)
-    })
+/// Divide a per-device budget among the layers and mark them
+/// budget-informed. `None` leaves every layer unbudgeted.
+///
+/// [`NON_LAYER_OVERHEAD_FRACTION`] is reserved first. What is left is split
+/// in proportion to what each layer needs, so a small layer is not handed
+/// the same share as the embedding:
+///
+/// * if every layer fits with 32-bit moments, in proportion to that
+///   footprint, so each share is at least the layer's own need and no layer
+///   lowers precision;
+/// * otherwise in proportion to each layer's floor (32-bit moments where
+///   its role pins them, a 16-bit first moment elsewhere), so the layers
+///   fit at their floors exactly when the model as a whole does.
+///
+/// A share is never 0 (a layer must be allowed at least 1 byte or every
+/// candidate is infeasible for the wrong reason).
+fn assign_layer_budgets(
+    constraints: &mut [LayerIlpConstraints],
+    luts: &[LayerCostLut],
+    model_budget: Option<u64>,
+) {
+    let Some(budget) = model_budget else {
+        return;
+    };
+    let usable = (budget as f64 * (1.0 - NON_LAYER_OVERHEAD_FRACTION)) as u128;
+    let lut_of = |i: usize| luts.get(i).or_else(|| luts.first());
+    let full: Vec<u128> = (0..constraints.len())
+        .map(|i| lut_of(i).map_or(0, |l| crate::wggo_ilp::moment_floor_bytes(l, 32, 32)) as u128)
+        .collect();
+    let floor: Vec<u128> = constraints
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            lut_of(i).map_or(0, |l| {
+                crate::wggo_ilp::moment_floor_bytes(l, moment_floor_bits(c), 32)
+            }) as u128
+        })
+        .collect();
+    let total_full: u128 = full.iter().sum();
+    let (weights, total) = if total_full <= usable {
+        (&full, total_full)
+    } else {
+        (&floor, floor.iter().sum())
+    };
+    for (c, w) in constraints.iter_mut().zip(weights.iter()) {
+        let share = if total == 0 { usable } else { usable * w / total };
+        c.memory_budget = (share.min(u64::MAX as u128) as u64).max(1);
+        c.budget_informed = true;
+    }
+}
+
+/// The lowest first-moment precision a layer's role permits: 32 bits where
+/// its sensitivity clears the critical threshold, else 16 (the lowest tier
+/// codegen stores).
+fn moment_floor_bits(c: &LayerIlpConstraints) -> u8 {
+    if c.sensitivity >= c.critical_prec_threshold {
+        32
+    } else {
+        16
+    }
 }
 
 /// Run the WGGO driver.
@@ -512,40 +630,85 @@ pub fn run(mut input: WggoInput) -> WggoPlan {
     // indistinguishable from the flag never being passed.
     crate::pass_trace::record("WGGO");
     let t0 = std::time::Instant::now();
-    let gpu = find_gpu(input.target).unwrap_or_else(default_gpu);
+    // The GPU the cost model prices against: the named target, else the
+    // local device, else the database default — the same resolution CSHA
+    // uses, so the two passes agree on the shared-memory budget. `target`
+    // is the compile target ("cuda", "cpu", "sm_120"), which names no GPU;
+    // looking it up directly always fell through to the A100 default.
+    let gpu = crate::csha::resolve_gpu_spec(input.target);
 
     // 1. Build the layer graph.
     let graph = build_graph(input.wengert);
+    let n = graph.layers.len();
+    let model = input.model.take().filter(|m| m.layers.len() == n);
+    let shapes_from_model = model.is_some();
 
     // `--wggo-memory-budget`: enforce the per-device cap at the Level-1 DP
-    // (the ClusterSpec budget the DP knapsack checks) and derive a per-layer
-    // ILP budget for the Level-2 solve. `None` leaves both untouched, so a
-    // build without the flag is byte-identical to today.
+    // (the ClusterSpec budget the DP knapsack checks) and derive per-layer
+    // budgets for the Level-2 solve. `None` leaves both untouched.
     let model_budget = input.memory_budget_bytes;
     if let Some(b) = model_budget {
         input.cluster.memory_budget = b;
     }
-    let ilp_budget = per_layer_ilp_budget(model_budget, graph.layers.len());
 
-    // §2.4 inter-layer shape-compatibility precondition (a *hard* constraint).
-    // Every kept layer's output activation width must match what its successors
-    // consume (or a reshape must bridge them).  On a *provable* incompatibility
-    // WGGO must emit NO structural transforms — it returns a transform-free plan
-    // (empty `AppliedPlan` ⇒ no per-layer overrides ⇒ the type-checked model
+    // 2. Cost tables: one per layer from that layer's own geometry, or one
+    //    nominal table for every layer when the caller supplied no model.
+    let luts: Vec<LayerCostLut> = match model.as_ref() {
+        Some(m) => m
+            .layers
+            .iter()
+            .map(|l| build_layer_lut(l, m.dtype_bytes, gpu, &input.lut_axes))
+            .collect(),
+        None => vec![build_lut(&input.layer_shape, gpu, &input.lut_axes); n.max(1)],
+    };
+
+    // 4. Level 1 DP.
+    let dp_cfg = DpConfig {
+        cluster: input.cluster.clone(),
+        importance: input.importance.clone(),
+        forced_prune: input.forced_prune.clone(),
+        ..Default::default()
+    };
+    // G4 degradation ladder, rung 0: the inter-layer DP is shared by Full and
+    // Greedy, so if it refuses the budget neither optimized mode can proceed —
+    // degrade to Off and run the downstream passes independently, with a
+    // warning, rather than emitting a silently over-budget optimization. Off
+    // mode bypasses optimization, so there an over-budget passthrough is the
+    // intended behavior rather than a refusal, and nothing is warned.
+    let mut warnings: Vec<String> = Vec::new();
+    let mut effective_mode = input.mode;
+    let inter = match dp_solve(&graph, &luts, &dp_cfg, gpu) {
+        Ok(p) => p,
+        Err(e) => {
+            if effective_mode != WggoMode::Off {
+                warnings.push(format!(
+                    "inter-layer DP infeasible ({e}); degraded {} -> off (downstream passes run independently)",
+                    effective_mode.as_str()
+                ));
+                effective_mode = WggoMode::Off;
+            }
+            passthrough_plan(&graph, &luts, &dp_cfg, gpu)
+        }
+    };
+
+    // §2.4 shape precondition (a *hard* constraint), for the one structural
+    // decision that can break it. A pruned layer is replaced by the identity
+    // on its input, so it must hand on a tensor as wide as the one it
+    // receives; pruning a layer that changes the width leaves its successors
+    // reading the wrong shape. On a *provable* violation WGGO emits NO
+    // structural transforms — it returns a transform-free plan (empty
+    // `AppliedPlan` ⇒ no per-layer overrides ⇒ the type-checked model
     // compiles unchanged), honoring the project invariant that an unmet
-    // transformation precondition must refuse, never silently weaken.  This is
-    // deliberately stronger than the inter-layer DP's budget degradation: an
-    // over-budget *passthrough* is still a structurally valid model, whereas a
-    // shape-incompatible plan is *wrong*, so we refuse the transforms outright
-    // rather than letting CSHA fusion / adapters / thinning ride on a broken
-    // graph.
+    // transformation precondition must refuse, never silently weaken.
     //
-    // For the uniform residual transformers WGGO targets today the feeder
-    // (`inter_layer_dims`) yields a single `d_model` on every edge, so this is
-    // satisfied-by-construction and never triggers; it becomes binding once
-    // per-layer or dim-changing activation widths are introduced (see the
-    // `wggo_shape` module docs).
-    let shape_warns = shape_warnings(&graph, input.layer_shape.d_model);
+    // Head pruning and FFN thinning are absorbed by the layer's own output
+    // projection and cannot change an inter-layer width, so kept layers need
+    // no check. The widths are the model's (`ModelGeometry`); with a nominal
+    // layer they are unknown and the gate, as before, proves nothing.
+    let shape_warns = match model.as_ref() {
+        Some(m) => prune_shape_warnings(&inter, m),
+        None => Vec::new(),
+    };
     if !shape_warns.is_empty() {
         let empty_inter = InterLayerPlan {
             layers: Vec::new(),
@@ -565,12 +728,13 @@ pub fn run(mut input: WggoInput) -> WggoPlan {
         // is recorded here rather than left to the exit below.
         crate::pass_trace::record_disposition("WGGO", PassDisposition::Declined {
             reason: DeclineReason::PreconditionViolated(
-                "inter-layer activation widths are shape-incompatible",
+                "a pruned layer changes the width of the tensor passing through it",
             ),
         });
         return WggoPlan {
             mode: WggoMode::Off,
             target_gpu: gpu.name.to_string(),
+            shapes_from_model,
             graph,
             inter_layer: empty_inter,
             per_layer: Vec::new(),
@@ -589,136 +753,57 @@ pub fn run(mut input: WggoInput) -> WggoPlan {
         };
     }
 
-    // Off mode: build a trivial plan that passes through decisions.
-    if input.mode == WggoMode::Off {
-        let n = graph.layers.len();
-        let lut = build_lut(&input.layer_shape, gpu, &input.lut_axes);
-        let luts: Vec<LayerCostLut> = vec![lut; n.max(1)];
-        let dp_cfg = DpConfig {
-            cluster: input.cluster.clone(),
-            importance: input.importance.clone(),
-            forced_prune: input.forced_prune.clone(),
-            ..Default::default()
-        };
-        // Off mode bypasses optimization, so an over-budget passthrough is the
-        // intended behavior rather than a refusal.
-        let inter =
-            dp_solve(&graph, &luts, &dp_cfg, gpu).unwrap_or_else(|_| passthrough_plan(&graph, &luts, &dp_cfg, gpu));
-        let mut ilp_defaults: Vec<LayerIlpConstraints> = if input.ilp_constraints.is_empty() {
-            default_constraints_for(
-                &graph,
-                input.packing_supported,
-                ilp_budget,
-                input.packing_stats.as_ref(),
-            )
-        } else {
-            input.ilp_constraints
-        };
-        let weight_analysis = match input.cached_analysis {
-            Some(ref cached) => cached.clone(),
-            None => run_weight_analysis(
-                &graph,
-                &input.layer_shape,
-                &ilp_defaults,
-                input.weights,
-                &input.analysis_config,
-                input.scorer.as_deref(),
-            ),
-        };
-        weight_analysis.apply_to(&mut ilp_defaults);
-        let (per_layer, template_stats, cfie_choices, cpkd_choices) =
-            ilp_solve_all_templated_cpkd(&luts, &ilp_defaults);
-        let cfie_inference = surface_from_plan(&inter, &cfie_choices, &ilp_defaults);
-        let cpkd_distill = cpkd_surface_from_plan(&inter, &cpkd_choices, &ilp_defaults);
-        let applied = apply(&inter, &per_layer);
-        let schedule = build_schedule(&inter, &applied);
-        // `--wggo off` still solves a passthrough plan so downstream passes
-        // have decisions to read, but it applies no optimization; reporting
-        // that as `Applied` would make "the user turned it off" look like
-        // "the pass did work".
-        crate::pass_trace::record_disposition("WGGO", PassDisposition::Declined {
-            reason: DeclineReason::ModeOff,
-        });
-        return WggoPlan {
-            mode: WggoMode::Off,
-            target_gpu: gpu.name.to_string(),
-            graph,
-            inter_layer: inter,
-            per_layer,
-            resolutions: Vec::new(),
-            applied,
-            schedule,
-            template_stats,
-            weight_analysis,
-            estimated_solve_us: t0.elapsed().as_micros() as u64,
-            warnings: Vec::new(),
-            cfie_inference,
-            cpkd_distill,
-            // Off mode intentionally passes an over-budget model through
-            // (bypasses optimization), so it never raises the budget refusal.
-            budget_infeasible: None,
-        };
-    }
-
-    // 2. Cost LUT.
-    let lut = build_lut(&input.layer_shape, gpu, &input.lut_axes);
-    let n = graph.layers.len();
-    let luts: Vec<LayerCostLut> = vec![lut; n.max(1)];
-
-    // 4. Level 1 DP.
-    let dp_cfg = DpConfig {
-        cluster: input.cluster.clone(),
-        importance: input.importance.clone(),
-        forced_prune: input.forced_prune.clone(),
-        ..Default::default()
-    };
-    // G4 degradation ladder, rung 0: the inter-layer DP is shared by Full and
-    // Greedy, so if it refuses the budget neither optimized mode can proceed —
-    // degrade to Off and run the downstream passes independently, with a
-    // warning, rather than emitting a silently over-budget optimization.
-    let mut warnings: Vec<String> = Vec::new();
-    let mut effective_mode = input.mode;
-    let inter = match dp_solve(&graph, &luts, &dp_cfg, gpu) {
-        Ok(p) => p,
-        Err(e) => {
-            warnings.push(format!(
-                "inter-layer DP infeasible ({e}); degraded {} -> off (downstream passes run independently)",
-                effective_mode.as_str()
-            ));
-            effective_mode = WggoMode::Off;
-            passthrough_plan(&graph, &luts, &dp_cfg, gpu)
-        }
-    };
-
-    // 5. Level 2 ILP (per layer, independent once inter-layer decisions
-    //    are fixed — paper §5.2).
+    // 5. Level 2 (per layer, independent once inter-layer decisions are
+    //    fixed — paper §5.2).
     let mut ilp_constraints: Vec<LayerIlpConstraints> = if input.ilp_constraints.is_empty() {
-        default_constraints_for(
+        let mut c = default_constraints_for(
             &graph,
+            model.as_ref(),
+            gpu,
             input.packing_supported,
-            ilp_budget,
             input.packing_stats.as_ref(),
-        )
+        );
+        assign_layer_budgets(&mut c, &luts, model_budget);
+        c
     } else {
         input.ilp_constraints
     };
     // Stage 3: weight analysis — overwrites head_importance and (when
     // the caller left it zero) min_retained_importance on each layer's
-    // constraints, before the ILP runs.
+    // constraints, before the solve.
     let weight_analysis = match input.cached_analysis {
         Some(ref cached) => cached.clone(),
-        None => run_weight_analysis(
-            &graph,
-            &input.layer_shape,
-            &ilp_constraints,
-            input.weights,
-            &input.analysis_config,
-            input.scorer.as_deref(),
-        ),
+        None => {
+            let layouts = head_layouts(&graph, model.as_ref(), &input.layer_shape, &ilp_constraints);
+            match run_weight_analysis(
+                &graph,
+                &layouts,
+                input.weights,
+                &input.analysis_config,
+                input.scorer.as_deref(),
+            ) {
+                Ok(report) => report,
+                // The compile pipeline runs the analysis itself and turns a
+                // mismatch into a compile error before it gets here
+                // (`run_on_wengert_with_weights`). A direct caller gets the
+                // unscored plan and the reason.
+                Err(e) => {
+                    warnings.push(format!("weights ignored: {e}"));
+                    run_weight_analysis(
+                        &graph,
+                        &layouts,
+                        None,
+                        &input.analysis_config,
+                        None,
+                    )
+                    .unwrap_or_default()
+                }
+            }
+        }
     };
     weight_analysis.apply_to(&mut ilp_constraints);
     // NOTE: FASE is intentionally *not* pre-pruned on sharded layers here.
-    // Letting the ILP pick a fused optimizer step and then resolving the
+    // Letting the solver pick a fused optimizer step and then resolving the
     // resulting FaseVsCpdt conflict (DeferFaseStep) is the architecturally
     // correct path: it keeps the conflict detector live in production (G8) and
     // surfaces a visible resolution in the report, instead of silently
@@ -732,9 +817,9 @@ pub fn run(mut input: WggoInput) -> WggoPlan {
             _ => ilp_solve_all_templated_cpkd(&luts, &ilp_constraints),
         };
 
-    // G4 degradation ladder, rung 1: if the full branch-and-bound ILP could not
-    // make a single layer feasible, fall back to the greedy solver before
-    // giving up entirely.
+    // G4 degradation ladder, rung 1: if the full scan could not make a single
+    // layer feasible, fall back to the greedy solver before giving up
+    // entirely.
     if effective_mode == WggoMode::Full
         && !per_layer.is_empty()
         && per_layer.iter().all(|s| !s.feasible)
@@ -762,14 +847,21 @@ pub fn run(mut input: WggoInput) -> WggoPlan {
             .map(|s| s.cost_us)
             .sum();
         let (resolved, mut resolutions) = greedy_resolve(layer_decisions);
-        splice_resolved(&mut per_layer, &resolved);
+        splice_resolved(
+            &mut per_layer,
+            &resolved,
+            &luts,
+            &ilp_constraints,
+            &cfie_choices,
+            &cpkd_choices,
+        );
 
         // G3 (greedy mode only): re-cost the resolved configuration and, if the
         // conflict resolution worsened it beyond the threshold, escalate the
-        // conflicting layers to the full ILP and re-resolve.  Greedy's fast
+        // conflicting layers to the full scan and re-resolve.  Greedy's fast
         // local heuristics can leave a lot on the table once a conflict forces
-        // a change, so spending the full branch-and-bound on just those layers
-        // recovers quality without the cost of a full-model ILP.
+        // a change, so spending the full scan on just those layers recovers
+        // quality without the cost of a full-model solve.
         if effective_mode == WggoMode::Greedy && !resolutions.is_empty() {
             let cost_after = recost_total(
                 &luts,
@@ -802,19 +894,47 @@ pub fn run(mut input: WggoInput) -> WggoPlan {
                 // Re-detect + re-resolve on the escalated decisions.
                 let ld2 = build_layer_decisions(&inter, &per_layer);
                 let (resolved2, resolutions2) = greedy_resolve(ld2);
-                splice_resolved(&mut per_layer, &resolved2);
+                splice_resolved(
+                    &mut per_layer,
+                    &resolved2,
+                    &luts,
+                    &ilp_constraints,
+                    &cfie_choices,
+                    &cpkd_choices,
+                );
                 resolutions = resolutions2;
             }
         }
         resolutions
     };
 
+    // A layer with no feasible configuration is left as written and carries
+    // no cost. That used to pass without a word: the report printed "Step
+    // time: inf" and the layer's fallback decision read like a choice.
+    {
+        let infeasible: Vec<&str> = per_layer
+            .iter()
+            .zip(graph.layers.iter())
+            .filter(|(s, _)| !s.feasible)
+            .map(|(_, l)| l.name.as_str())
+            .collect();
+        if !infeasible.is_empty() {
+            warnings.push(format!(
+                "{} layer(s) have no feasible configuration under their constraints and are \
+                 left as written (all heads, nothing fused, 32-bit moments): {}; their time \
+                 is not in the plan's step time",
+                infeasible.len(),
+                infeasible.join(", ")
+            ));
+        }
+    }
+
     // CEP honesty advisories: structural decisions the plan carries that
     // downstream codegen does not (or only partially) lowers. These fire
     // only when the decision was actually taken (which requires an
     // informed importance signal — evidence-free plans are pinned to
     // keep-all/full-width by `importance_informed`).
-    {
+    if effective_mode != WggoMode::Off {
         let pruned_layers = per_layer
             .iter()
             .filter(|s| s.decision.keep_head.iter().any(|k| !k))
@@ -827,10 +947,18 @@ pub fn run(mut input: WggoInput) -> WggoPlan {
                  paths the decision is report-only"
             ));
         }
-        let max_ffn = per_layer.iter().map(|s| s.decision.ffn_width).max().unwrap_or(0);
+        // A thinned FFN is a width below the widest the layer's own table
+        // offers. With the model's geometry the table holds the one real
+        // width, so this can only fire for a caller-supplied axis set.
         let thinned_layers = per_layer
             .iter()
-            .filter(|s| s.decision.ffn_width < max_ffn)
+            .enumerate()
+            .filter(|(i, s)| {
+                luts.get(*i)
+                    .or_else(|| luts.first())
+                    .and_then(|l| l.axes_ffn_widths.iter().copied().max())
+                    .is_some_and(|max_ffn| s.decision.ffn_width < max_ffn)
+            })
             .count();
         if thinned_layers > 0 {
             warnings.push(format!(
@@ -842,9 +970,8 @@ pub fn run(mut input: WggoInput) -> WggoPlan {
         }
     }
 
-    // 8. Apply + communication schedule.  (The §2.4 shape-compatibility
-    // precondition was checked up front; a violation would have forced Off
-    // above, so reaching here means the plan is shape-compatible.)
+    // 8. Apply + communication schedule.  (The §2.4 shape precondition was
+    // checked above; a violation would have returned there.)
     let applied = apply(&inter, &per_layer);
     let schedule = build_schedule(&inter, &applied);
     // G20 advisory surface: chosen CFIE inference decisions per non-pruned
@@ -853,66 +980,48 @@ pub fn run(mut input: WggoInput) -> WggoPlan {
     // CPKD advisory surface (v1): same contract as the CFIE sidecar.
     let cpkd_distill = cpkd_surface_from_plan(&inter, &cpkd_choices, &ilp_constraints);
 
-    // `--wggo-memory-budget` refusal channel. The AUTHORITATIVE "infeasible
-    // even at fp16" signal is the per-layer ILP: each layer is admitted against
-    // its per-device share only if some config fits — and `budget_informed` let
-    // the solver quantize moments to fp16 (and, when importance-informed, thin
-    // structure). So `feasible == false` means "no fp16 plan fits this layer".
+    // `--wggo-memory-budget` refusal channel. Size EACH layer at its OWN
+    // role-permitted moment floor (32-bit where its sensitivity clears the
+    // critical threshold, else a 16-bit first moment — the lowest tier
+    // codegen stores), sum, gross up by the non-layer overhead reserve, and
+    // hard-fail only when that true minimum exceeds the budget. The layer
+    // budgets (`assign_layer_budgets`) are split so that every layer fits at
+    // its floor exactly when this sum fits, so the two cannot disagree.
     //
     // A DP refusal alone does NOT hard-fail: the Level-1 DP is precision-blind
-    // (it sizes moments at f32), so under any tight budget it refuses even when
-    // the per-layer fp16 plan fits — hard-failing on that would defeat the whole
-    // feature. When every layer is feasible the model fits (Σ per-layer shares
-    // ≤ (1-overhead)·budget < budget), so we let the fp16 plan proceed (the DP
-    // degrades to Off with its warning, already pushed above).
-    let budget_infeasible = model_budget.and_then(|budget| {
-        // GLOBAL role-aware feasibility (review fix). The per-layer ILP solves
-        // against an EVEN `budget/n` share, so a role-pinned high-precision
-        // layer (embedding / LM-head, held at 32-bit moments by its
-        // sensitivity ceiling) can be infeasible against its 1/n slice while
-        // the quantizable transformer blocks leave slack — a model that fits
-        // GLOBALLY. Refusing on per-share infeasibility therefore false-failed
-        // exactly those fittable models. Instead, size EACH layer at its OWN
-        // role-permitted moment floor (32-bit when its sensitivity clears the
-        // critical threshold, else 16-bit — the lowest tier codegen stores),
-        // sum, gross up by the non-layer overhead reserve, and hard-fail only
-        // when that true minimum exceeds the budget. (A pure fp16 floor for
-        // every layer would UNDER-count the role-pinned 32-bit layers and let
-        // a genuinely-infeasible model slip through to a runtime OOM.)
-        let floor_sum: u64 = (0..per_layer.len())
-            .map(|i| {
-                let lut = luts.get(i).or_else(|| luts.first());
-                let c = ilp_constraints.get(i).or_else(|| ilp_constraints.first());
-                match (lut, c) {
-                    (Some(lut), Some(c)) => {
-                        let floor_bits: u8 =
-                            if c.sensitivity >= c.critical_prec_threshold { 32 } else { 16 };
+    // (it sizes moments at parameter precision), so under a tight budget it
+    // refuses even when the reduced-precision plan fits. Off mode
+    // intentionally passes an over-budget model through, so it never raises
+    // the refusal.
+    let budget_infeasible = model_budget
+        .filter(|_| input.mode != WggoMode::Off)
+        .and_then(|budget| {
+            let floor_sum: u64 = (0..per_layer.len())
+                .map(|i| {
+                    let lut = luts.get(i).or_else(|| luts.first());
+                    let c = ilp_constraints.get(i).or_else(|| ilp_constraints.first());
+                    match (lut, c) {
                         // The second moment is always 32-bit
                         // (`second_moment_bits_allowed`).
-                        crate::wggo_ilp::moment_floor_bytes(lut, floor_bits, 32)
+                        (Some(lut), Some(c)) => {
+                            crate::wggo_ilp::moment_floor_bytes(lut, moment_floor_bits(c), 32)
+                        }
+                        _ => 0,
                     }
-                    _ => 0,
-                }
+                })
+                .fold(0u64, |acc, b| acc.saturating_add(b));
+            let required_fp16_floor_bytes =
+                (floor_sum as f64 / (1.0 - NON_LAYER_OVERHEAD_FRACTION)).ceil() as u64;
+            if required_fp16_floor_bytes <= budget {
+                return None;
+            }
+            let infeasible_layers = per_layer.iter().filter(|s| !s.feasible).count();
+            Some(BudgetInfeasibility {
+                budget_bytes: budget,
+                required_fp16_floor_bytes,
+                infeasible_layers,
             })
-            .fold(0u64, |acc, b| acc.saturating_add(b));
-        let required_fp16_floor_bytes =
-            (floor_sum as f64 / (1.0 - NON_LAYER_OVERHEAD_FRACTION)).ceil() as u64;
-        if required_fp16_floor_bytes <= budget {
-            // The model fits at its role-aware floor; any per-share
-            // infeasibility was an artifact of the even split (some layers
-            // simply need more than 1/n while others need less). Let the fp16
-            // plan proceed rather than hard-failing a fittable model.
-            return None;
-        }
-        // Report how many layers the even-share ILP could not seat, for the
-        // diagnostic (the authoritative refusal is the global floor above).
-        let infeasible_layers = per_layer.iter().filter(|s| !s.feasible).count();
-        Some(BudgetInfeasibility {
-            budget_bytes: budget,
-            required_fp16_floor_bytes,
-            infeasible_layers,
-        })
-    });
+        });
 
     // `applied.layers.len()` is the count of per-layer decisions WGGO
     // produced — the overrides CSHA / WRGA / FASE / CPDT then read. It is NOT
@@ -920,7 +1029,15 @@ pub fn run(mut input: WggoInput) -> WggoPlan {
     // mutation happens later, in `wggo_prune::run`, driven from `stmt.rs`,
     // which supersedes this with the tape-rewrite count when it rewrites
     // anything.
-    if budget_infeasible.is_some() {
+    if input.mode == WggoMode::Off {
+        // `--wggo off` still solves a passthrough plan so downstream passes
+        // have decisions to read, but it applies no optimization; reporting
+        // that as `Applied` would make "the user turned it off" look like
+        // "the pass did work".
+        crate::pass_trace::record_disposition("WGGO", PassDisposition::Declined {
+            reason: DeclineReason::ModeOff,
+        });
+    } else if budget_infeasible.is_some() {
         crate::pass_trace::record_disposition("WGGO", PassDisposition::Declined {
             reason: DeclineReason::BudgetInfeasible,
         });
@@ -936,6 +1053,7 @@ pub fn run(mut input: WggoInput) -> WggoPlan {
     WggoPlan {
         mode: effective_mode,
         target_gpu: gpu.name.to_string(),
+        shapes_from_model,
         graph,
         inter_layer: inter,
         per_layer,
@@ -952,45 +1070,83 @@ pub fn run(mut input: WggoInput) -> WggoPlan {
     }
 }
 
-/// Inter-layer activation widths for a layer, by transformer role.
+/// The attention layout of each graph layer for the head scorer: the
+/// layer's own when the model's geometry is known, else the nominal shape
+/// with the head count the first constraint carries (what a caller who
+/// sizes the layer itself supplies).
+fn head_layouts(
+    graph: &OptGraph,
+    model: Option<&ModelGeometry>,
+    nominal: &LayerShape,
+    constraints: &[LayerIlpConstraints],
+) -> Vec<Option<HeadLayout>> {
+    match model {
+        Some(m) => m.layers.iter().map(head_layout_of).collect(),
+        None => {
+            let num_heads = constraints.first().map_or(8, |c| c.num_heads as usize);
+            vec![Some(HeadLayout::nominal(nominal, num_heads)); graph.layers.len()]
+        }
+    }
+}
+
+/// A layer's attention layout, `None` for a layer with no attention call.
+pub(crate) fn head_layout_of(layer: &crate::wggo_model_shape::LayerGeometry) -> Option<HeadLayout> {
+    layer.attention.map(|a| HeadLayout {
+        d_model: a.d_model as usize,
+        num_heads: a.n_heads as usize,
+        n_kv_heads: a.n_kv_heads as usize,
+        head_dim: a.head_dim as usize,
+    })
+}
+
+/// One message per pruned layer that provably changes the width of the
+/// tensor passing through it (see the gate's call site in [`run`]).
+fn prune_shape_warnings(inter: &InterLayerPlan, model: &ModelGeometry) -> Vec<String> {
+    use crate::wggo_dp::CoarseDecision;
+    use crate::wggo_shape::LayerShapeInfo;
+    let infos: Vec<LayerShapeInfo> = inter
+        .layers
+        .iter()
+        .zip(model.layers.iter())
+        .filter(|(l, _)| l.decision == CoarseDecision::Prune)
+        .map(|(l, g)| LayerShapeInfo {
+            layer: l.layer_index,
+            name: l.name.clone(),
+            input_dim: g.input_width,
+            output_dim: g.output_width,
+            depends_on: Vec::new(),
+        })
+        .collect();
+    crate::wggo_shape::validate_pruned(&infos)
+        .iter()
+        .map(|v| v.message())
+        .collect()
+}
+
+/// Conservative role-based numerical-sensitivity floor for the per-layer
+/// solve.
 ///
-/// Residual-stream sublayers (`Attention` / `Ffn` / `Block`) carry `d_model`
-/// in and out: per-head pruning and FFN thinning are absorbed by the output
-/// projection (`W_O` / `W_down`), so the *inter-layer* tensor width is
-/// invariant under WGGO's structural decisions.  The boundary roles expose one
-/// real width and one unknown — `Embedding` consumes token ids (unknown width)
-/// and produces `d_model`; `LmHead` consumes `d_model` and produces vocab
-/// logits (not an inter-layer activation).  `Other` is an unclassified op group
-/// with no known residual projection, so both widths are unknown.  Unknown
-/// (`None`) widths are treated as compatible by [`crate::wggo_shape::classify`]
-/// (fail-safe — only provable mismatches are flagged).
-/// Conservative role-based numerical-sensitivity floor for the per-layer ILP.
+/// The solver costs optimizer precision ([`crate::wggo_cost::optimizer_us`]),
+/// so with no floor it would recommend the cheapest moments for *every*
+/// layer — including the numerically fragile ones. Assign a coarse floor by
+/// [`LayerRole`]: fragile layers are pinned to 32-bit moments; the
+/// transformer blocks, where a reduced first moment is established, may be
+/// lowered.
 ///
-/// The ILP now costs optimizer precision ([`crate::wggo_cost::optimizer_us`]),
-/// so with no sensitivity signal it would recommend the cheapest (8-bit) Adam
-/// moments for *every* layer — including the numerically fragile ones.
-/// Production callers pass no explicit `ilp_constraints`, and the weight-
-/// analysis stage populates importance but never sensitivity, so without this
-/// floor the embeddings / LM-head / norms would be advised down to 8-bit.
-/// Assign a coarse floor by [`LayerRole`]: fragile layers are pinned to high
-/// precision; the transformer blocks — where low-bit Adam moments are well
-/// established — may be lowered.
-///
-/// The graph builder buckets most non-`blocks.N` params (embeddings, norms, the
-/// LM head, the raw input) into the catch-all `Other` role, so `Other` is held
-/// at ≥16-bit as the conservative default.  This is intentionally coarse; a
-/// gradient/spectral per-layer sensitivity score (cf. `cpdt_sensitivity`) is the
-/// natural refinement.  Note the optimizer-precision decision is currently
-/// *advisory* — it is surfaced in the plan/report but not yet lowered to
-/// optimizer codegen (`PerLayerOverride` does not carry it), so this governs the
-/// recommendation, not yet generated code.
+/// The graph builder buckets every parameter outside `blocks.N` / `layers.N`
+/// / `h.N` — the embedding, the LM head, the final norm — into the catch-all
+/// `Other` layer, so `Other` is pinned to 32 bits like the roles it holds.
+/// It used to be allowed 16 bits, which the plan then showed and counted
+/// for it under a budget; but the embedding and LM head are the parameters
+/// the pin exists for, and no reduced moment is stored for a parameter
+/// outside the block layers anyway
+/// (`cpdt_precision_exec::build_dtype_lists_from_overrides`), so the plan
+/// was both unsafe as advice and two bytes per element short as accounting.
 fn role_sensitivity_floor(role: LayerRole) -> f64 {
     match role {
         // ≥ critical_prec_threshold (0.9 default) → forces 32-bit moments.
-        LayerRole::Embedding | LayerRole::LmHead => 0.95,
-        // ≥ high_prec_threshold (0.5 default) → forces ≥16-bit.
-        LayerRole::Other => 0.6,
-        // The bulk transformer compute may use low-bit Adam moments.
+        LayerRole::Embedding | LayerRole::LmHead | LayerRole::Other => 0.95,
+        // The bulk transformer compute may use a reduced first moment.
         LayerRole::Attention | LayerRole::Ffn | LayerRole::Block => 0.0,
     }
 }
@@ -1053,195 +1209,198 @@ fn density_packing_savings(cfg: &DatasetPackingConfig) -> Option<(u8, [f64; 4], 
     Some((mask, [0.0, base_saving, mode2_saving, 0.0], true))
 }
 
-/// Per-layer default ILP constraints with the [`role_sensitivity_floor`]
+/// Per-layer default constraints with the [`role_sensitivity_floor`]
 /// applied (used when the caller supplies no explicit `ilp_constraints`).
 ///
-/// `ilp_budget` (`Some` only under `--wggo-memory-budget`) sets each layer's
-/// `memory_budget` to the per-layer share and flips `budget_informed = true`,
-/// which exempts the moment-precision evidence gate (see
-/// [`crate::wggo_ilp::LayerIlpConstraints::budget_informed`]). `None` leaves
-/// the budget at `u64::MAX` and `budget_informed = false` — byte-identical to
-/// today.
+/// With the model's geometry, each layer gets its own head count and
+/// key/value grouping, and a layer with no attention call gets none (and no
+/// packing mode: there is no attention kernel for one to apply to). Without
+/// it every layer keeps the nominal defaults. The shared-memory budget is
+/// the one CSHA will hold the layer to on `gpu`
+/// ([`crate::csha_pipeline::smem_budget_bytes`]), not a constant for one
+/// card.
 ///
 /// `packing_stats` (`Some` only when a `dataset` block supplied real
-/// `mean_doc_length` and the module can lower packing) replaces the fictional
-/// flat savings with the document-density-derived savings
-/// ([`density_packing_savings`]); when `None` the legacy `[0, 0.15, 0, 0]`
-/// constants are used — byte-identical to every pre-campaign-item-6 plan.
+/// `mean_doc_length` and the module can lower packing) replaces the flat
+/// savings with the document-density-derived savings
+/// ([`density_packing_savings`]); when `None` the flat `[0, 0.15, 0, 0]`
+/// constants are used.
+///
+/// Memory budgets are assigned afterwards by [`assign_layer_budgets`].
 fn default_constraints_for(
     graph: &OptGraph,
+    model: Option<&ModelGeometry>,
+    gpu: &crate::gpu_specs::GpuSpec,
     packing_supported: bool,
-    ilp_budget: Option<u64>,
     packing_stats: Option<&DatasetPackingConfig>,
 ) -> Vec<LayerIlpConstraints> {
-    // Packing honesty: a module with no packed dataset and no masked-attention
-    // call exposes mode 0 only, with zeroed savings — advertising savings for
-    // unlowerable modes made the solver "choose" packing it could never apply.
+    // Packing honesty: a module with no packed dataset and no packed
+    // attention call exposes mode 0 only, with zeroed savings — advertising
+    // savings for unlowerable modes made the solver "choose" packing it could
+    // never apply.
     //
     // When the module IS packing-capable:
     //   * with real doc-length statistics (`density_packing_savings`), the
     //     savings come from the document-length DISTRIBUTION and mode 2
     //     (tile_skip, promoted Tier-B) unlocks under dense docs — the saving
     //     scales only the O(s²) attention share (`quadratic_only = true`);
-    //   * without statistics, the legacy `{none, segment_id}` mask with the
-    //     flat `[0, 0.15, 0, 0]` constants applies (whole-layer discount) —
-    //     BYTE-IDENTICAL to every pre-item-6 plan.
+    //   * without statistics, the `{none, segment_id}` mask with the flat
+    //     `[0, 0.15, 0, 0]` constants applies (whole-layer discount).
+    let unpacked = (0b0001, [0.0; 4], false);
     let (mask, savings, quadratic_only) = if packing_supported {
         packing_stats
             .and_then(density_packing_savings)
             .unwrap_or((0b0011, [0.0, 0.15, 0.0, 0.0], false))
     } else {
-        (0b0001, [0.0; 4], false)
+        unpacked
     };
+    let smem_budget = crate::csha_pipeline::smem_budget_bytes(gpu);
     graph
         .layers
         .iter()
-        .map(|l| LayerIlpConstraints {
-            sensitivity: role_sensitivity_floor(l.role),
-            packing_modes_mask: mask,
-            packing_savings: savings,
-            packing_scales_quadratic_only: quadratic_only,
-            // Budget driver: cap each layer and flip the evidence-gate
-            // exemption so the ILP may pick fp16 moments under pressure. When
-            // `ilp_budget` is `None` these stay at the `Default` values
-            // (`u64::MAX`, `false`) — byte-identical to today.
-            memory_budget: ilp_budget.unwrap_or(u64::MAX),
-            budget_informed: ilp_budget.is_some(),
-            ..Default::default()
-        })
-        .collect()
-}
-
-fn inter_layer_dims(role: LayerRole, d_model: u64) -> (Option<u64>, Option<u64>) {
-    // A zero `d_model` is a defensively-initialised / unknown shape, not a real
-    // width: report unknown on every edge so the gate stays fail-safe.
-    if d_model == 0 {
-        return (None, None);
-    }
-    match role {
-        LayerRole::Attention | LayerRole::Ffn | LayerRole::Block => (Some(d_model), Some(d_model)),
-        LayerRole::Embedding => (None, Some(d_model)),
-        LayerRole::LmHead => (Some(d_model), None),
-        LayerRole::Other => (None, None),
-    }
-}
-
-/// Build the per-layer [`LayerShapeInfo`] records the §2.4 shape gate validates.
-///
-/// Widths come from [`inter_layer_dims`]; producer edges are the graph's
-/// `depends_on` lists.  `d_model` is the uniform residual-stream width the
-/// driver sizes the model with.
-fn build_shape_infos(graph: &OptGraph, d_model: u64) -> Vec<LayerShapeInfo> {
-    graph
-        .layers
-        .iter()
-        .map(|l| {
-            let (input_dim, output_dim) = inter_layer_dims(l.role, d_model);
-            LayerShapeInfo {
-                layer: l.index,
-                name: l.name.clone(),
-                input_dim,
-                output_dim,
-                depends_on: l.depends_on.clone(),
+        .enumerate()
+        .map(|(i, l)| {
+            let base = LayerIlpConstraints {
+                sensitivity: role_sensitivity_floor(l.role),
+                packing_modes_mask: mask,
+                packing_savings: savings,
+                packing_scales_quadratic_only: quadratic_only,
+                smem_budget,
+                ..Default::default()
+            };
+            let Some(geometry) = model.and_then(|m| m.layers.get(i)) else {
+                return base;
+            };
+            match geometry.attention {
+                Some(a) => LayerIlpConstraints {
+                    num_heads: a.n_heads as u32,
+                    num_kv_groups: a.n_kv_heads as u32,
+                    gqa_group: a.group() as u32,
+                    ..base
+                },
+                None => LayerIlpConstraints {
+                    num_heads: 0,
+                    num_kv_groups: 0,
+                    gqa_group: 1,
+                    packing_modes_mask: unpacked.0,
+                    packing_savings: unpacked.1,
+                    packing_scales_quadratic_only: unpacked.2,
+                    ..base
+                },
             }
         })
         .collect()
 }
 
-/// Run the §2.4 shape-compatibility gate over `graph` and return one warning
-/// message per provably-incompatible inter-layer edge (empty when the
-/// constraint holds).  See the gate's call site in [`run`] for how a non-empty
-/// result forces a passthrough refusal.
-fn shape_warnings(graph: &OptGraph, d_model: u64) -> Vec<String> {
-    crate::wggo_shape::validate(&build_shape_infos(graph, d_model))
-        .iter()
-        .map(|v| v.message())
-        .collect()
-}
-
-/// Run Stage 3 over `graph`, using the first layer's `num_heads` as the
-/// shape hint (the driver constructs all layers with uniform num_heads
-/// today).  When `weights` is `None`, falls back to `NullWeightProvider`
-/// so every layer gets a uniform score vector.
+/// Run Stage 3 over `graph`. `layouts` is each layer's attention layout
+/// (`None` for a layer with no attention). When `weights` is `None`, falls
+/// back to `NullWeightProvider` so every attention layer gets a uniform
+/// score vector.
 ///
-/// When `scorer` is `Some`, its `score_layer` output is applied
-/// **after** the magnitude analysis: for each layer where the scorer
-/// returns `Some(HeadImportance)`, the magnitude-derived `head_scores`
-/// in the report are replaced by the scorer's per-head values (converted
-/// to `f64`).  Layers where the scorer returns `None` retain the
-/// magnitude scores unchanged.  An `importance_source` line is emitted
-/// to stderr for each layer so that `--wggo-report` consumers can
-/// verify which path fired.
-fn run_weight_analysis(
+/// When `scorer` is `Some`, its `score_layer` output is applied **after**
+/// the magnitude analysis: for each layer where the scorer returns one
+/// score per head of that layer, the magnitude-derived scores are replaced
+/// by the scorer's. Layers where it returns nothing, or a vector of another
+/// length, keep the magnitude scores. An `importance_source` line is logged
+/// for each layer so that `--wggo-report` consumers can verify which path
+/// fired.
+///
+/// The scorer's values are raw calibration numbers on whatever scale the
+/// calibration produced. They are normalised like the magnitude scores (to
+/// sum to the head count) and the retention threshold is recomputed from
+/// them, so the threshold and the scores it is compared with are the same
+/// numbers in the same precision. Substituting raw scores under a threshold
+/// built from the normalised magnitude scores, as this did, compared scores
+/// near 1e-3 with a threshold near the head count (every layer infeasible),
+/// and even same-scale scores missed their own threshold by the rounding of
+/// the f32 round trip.
+///
+/// `Err` when a weights tensor has a shape other than its layer's.
+pub(crate) fn run_weight_analysis(
     graph: &crate::wggo_graph::OptGraph,
-    layer_shape: &LayerShape,
-    constraints: &[LayerIlpConstraints],
+    layouts: &[Option<HeadLayout>],
     weights: Option<&dyn WeightProvider>,
     config: &AnalysisConfig,
     scorer: Option<&dyn GradientScorer>,
-) -> WeightAnalysisReport {
-    let num_heads = constraints
-        .first()
-        .map(|c| c.num_heads as usize)
-        .unwrap_or(8);
+) -> Result<WeightAnalysisReport, WeightShapeMismatch> {
     let null = NullWeightProvider;
     let provider: &dyn WeightProvider = weights.unwrap_or(&null);
-    let mut report = analyze_weights(graph, layer_shape, num_heads, provider, config);
+    let mut report = analyze_layers(graph, layouts, provider, config)?;
 
     // Scorer override pass: for each layer, attempt to get a gradient-
     // informed score and substitute it for the magnitude baseline.
     if let Some(sc) = scorer {
-        for (layer, imp) in graph.layers.iter().zip(report.per_layer.iter_mut()) {
+        for (i, (layer, imp)) in graph.layers.iter().zip(report.per_layer.iter_mut()).enumerate() {
+            let Some(layout) = layouts.get(i).copied().flatten() else {
+                continue;
+            };
+            let shape = LayerShape {
+                batch: 1,
+                seq: 1,
+                d_model: layout.d_model as u64,
+                head_dim: layout.head_dim as u64,
+                n_kv_heads: layout.n_kv_heads as u64,
+                dtype_bytes: 4,
+            };
             let has_real_gradient_for_layer = sc.has_gradient_data_for_layer(&layer.name);
-            // Calibrated gradient evidence is a REAL signal for the
-            // informed gates (the field docs promise 'weight analysis with
-            // an actual provider, or calibration') — without this, users
-            // with measured gradients but no --wggo-weights stayed
-            // uninformed and quantization was silently impossible.
-            if has_real_gradient_for_layer {
-                imp.has_signal = true;
-            }
-            let from_scorer = sc.score_layer(&layer.name, layer_shape);
-            let (new_scores, source) = match from_scorer {
-                Some(hi) => {
-                    // Truth-in-logging: a CalibratedGradientScorer may return
-                    // Some(...) via its internal magnitude fallback when the
-                    // sidecar lacks an entry for this layer.  Only claim
-                    // "gradient (calibrated)" when the scorer confirmed it has
-                    // real sidecar-derived data for the layer.
-                    let label = if has_real_gradient_for_layer {
-                        "gradient (calibrated)"
+            let source = match sc.score_layer(&layer.name, &shape) {
+                Some(hi) if hi.per_head.len() == layout.num_heads => {
+                    let raw: Vec<f64> = hi.per_head.iter().map(|&v| f64::from(v)).collect();
+                    let usable = raw.iter().all(|v| v.is_finite() && *v >= 0.0)
+                        && raw.iter().any(|v| *v > 0.0);
+                    if usable {
+                        imp.head_scores = normalise(raw, layout.num_heads);
+                        imp.default_min_retained =
+                            percentile_threshold(&imp.head_scores, report.prune_fraction);
+                        // Calibrated gradient evidence is a REAL signal for
+                        // the informed gates (the field docs promise 'weight
+                        // analysis with an actual provider, or calibration').
+                        if has_real_gradient_for_layer {
+                            imp.has_signal = true;
+                        }
+                        // Truth-in-logging: a CalibratedGradientScorer may
+                        // return scores via its internal magnitude fallback
+                        // when the sidecar lacks an entry for this layer.
+                        if has_real_gradient_for_layer {
+                            "gradient (calibrated)"
+                        } else {
+                            "magnitude (fallback within CalibratedGradientScorer)"
+                        }
                     } else {
-                        "magnitude (fallback within CalibratedGradientScorer)"
-                    };
-                    (
-                        hi.per_head.iter().map(|&v| v as f64).collect::<Vec<f64>>(),
-                        label,
-                    )
+                        "magnitude (scorer returned no usable scores)"
+                    }
                 }
-                None => (
-                    score_layer_magnitude(&layer.name, layer_shape, provider)
-                        .per_head
-                        .iter()
-                        .map(|&v| v as f64)
-                        .collect::<Vec<f64>>(),
-                    "magnitude (fallback)",
-                ),
+                Some(_) => "magnitude (scorer returned a different head count)",
+                None => "magnitude (fallback)",
             };
             nsl_log::nsl_log!(INFO, "wggo", "[wggo] layer:{} importance_source={}", layer.name, source);
-            imp.head_scores = new_scores;
         }
     }
 
-    report
+    Ok(report)
 }
 
-/// Convenience: run WGGO on a Wengert list with default cluster/importance/
-/// LUT axes.  Used by the compile-pipeline integration point so callers
-/// don't have to hand-assemble `WggoInput`.
+/// The layer [`run_on_wengert`] sizes every layer as when it is given no
+/// model: d_model 512, 8 heads of 64, 4 key/value heads, batch 1, 1024
+/// tokens, 2-byte elements.
+pub const NOMINAL_LAYER_SHAPE: LayerShape = LayerShape {
+    batch: 1,
+    seq: 1024,
+    d_model: 512,
+    head_dim: 64,
+    n_kv_heads: 4,
+    dtype_bytes: 2,
+};
+
+/// Run WGGO on a Wengert list that comes with no model shapes, sizing every
+/// layer as [`NOMINAL_LAYER_SHAPE`]. The plan it returns says so
+/// ([`WggoPlan::shapes_from_model`] is `false`, and the report's "Layer
+/// shapes" line): its times and bytes describe that nominal layer, not the
+/// program. For tools that explain how the planner decides
+/// (`nsl profile --explain-wggo`); the compile pipeline uses
+/// [`run_on_wengert_with_weights`], which requires the model's shapes.
 ///
-/// * `target` — GPU name (e.g. "H100"); falls back to the default when
-///              unknown.
+/// * `target` — GPU name (e.g. "H100") or a compile target.
 /// * `mode_str` — "full" | "greedy" | "off" | "auto" | "disable".
 ///              Returns `None` if the string is invalid.
 /// * `world_size` — number of devices (drives the `ClusterSpec`).
@@ -1260,17 +1419,9 @@ pub fn run_on_wengert(
         mode,
         target,
         wengert,
-        packing_supported: true,
-        // Reasonable defaults for a small transformer layer; used only to
-        // size the LUT — the graph drives which layers are present.
-        layer_shape: LayerShape {
-            batch: 1,
-            seq: 1024,
-            d_model: 512,
-            head_dim: 64,
-            n_kv_heads: 4,
-            dtype_bytes: 2,
-        },
+        packing_supported: crate::wggo_model_shape::tape_has_packed_attention(wengert),
+        model: None,
+        layer_shape: NOMINAL_LAYER_SHAPE,
         cluster,
         lut_axes: LutAxes::default(),
         importance: ImportanceScores::default(),
@@ -1281,7 +1432,7 @@ pub fn run_on_wengert(
         cached_analysis: None,
         // Convenience entry point (no CompileOptions) → no budget driver.
         memory_budget_bytes: None,
-        // No dataset/stmt context here → legacy flat packing constants.
+        // No dataset/stmt context here → flat packing constants.
         packing_stats: None,
         // No CompileOptions → no user prune request.
         forced_prune: std::collections::BTreeSet::new(),
@@ -1289,21 +1440,55 @@ pub fn run_on_wengert(
     Some(run(input))
 }
 
-/// Extended convenience entry point — accepts an optional weights file
-/// and `AnalysisConfig` so Stage 3 can use real importance scoring.
+/// The WGGO flags that only mean something through the plan. When the plan
+/// cannot be made they cannot be honoured, and saying nothing would leave
+/// the user believing a budget was enforced or a layer pruned.
+fn plan_dependent_flags(opts: &crate::WggoOptions) -> Vec<&'static str> {
+    let mut flags = Vec::new();
+    if opts.memory_budget_bytes.is_some() {
+        flags.push("--wggo-memory-budget");
+    } else if opts.moment_precision {
+        // The budget flag implies this one; name it only when it stands alone.
+        flags.push("--wggo-moment-precision");
+    }
+    if !opts.prune_layers.is_empty() {
+        flags.push("--wggo-prune-layers");
+    }
+    if opts.layer_prune_fraction.is_some() {
+        flags.push("--wggo-layer-prune-fraction");
+    }
+    if opts.weights.is_some() {
+        flags.push("--wggo-weights");
+    }
+    if opts.prune_fraction.is_some_and(|f| f > 0.0) {
+        flags.push("--wggo-prune-fraction");
+    }
+    flags
+}
+
+/// The compile pipeline's entry point: plan one train block from the shapes
+/// of its own model.
 ///
-/// When `weights_path` fails to load, emits a warning on stderr and
-/// falls back to uniform scores rather than failing the compile.
+/// `model` is [`crate::wggo_model_shape::derive`] over `wengert`. When it is
+/// `Err` — some parameter, matrix product or attention call has a shape the
+/// compiler cannot prove — WGGO does not plan: it logs why, records a
+/// decline on the pass trace and returns `Ok(None)`, so the downstream
+/// passes run on their own defaults exactly as under `--wggo off`. If the
+/// user passed a flag that only acts through the plan
+/// ([`plan_dependent_flags`]) the same condition is a compile error
+/// instead, because that flag would otherwise be silently ignored.
+///
+/// When `weights_path` fails to load, a warning is logged and recorded in
+/// the plan and scoring falls back to uniform scores. A weights file whose
+/// tensors do not have the model's shapes is a compile error.
 ///
 /// When `compile_options` is `Some`, [`build_scorer`] is invoked to
-/// construct the appropriate [`GradientScorer`] and wire it into
-/// `WggoInput`.  Passing `None` preserves the Phase 1 magnitude-only
-/// path (used in tests that don't need gradient scoring).
+/// construct the appropriate [`GradientScorer`].
 ///
-/// `Ok(None)` means WGGO did not run (an unrecognised mode string, or the
-/// scorer could not be built — reported on stderr). `Err` is a compile
-/// failure: the `--wggo-memory-budget` refusal, see
-/// [`WggoPlan::budget_infeasible`].
+/// `Ok(None)` means WGGO did not plan (an unrecognised mode string, unknown
+/// shapes, or the scorer could not be built — each reported). `Err` is a
+/// compile failure.
+#[allow(clippy::too_many_arguments)]
 pub fn run_on_wengert_with_weights(
     wengert: &WengertList,
     target: &str,
@@ -1314,52 +1499,118 @@ pub fn run_on_wengert_with_weights(
     compile_options: Option<&crate::CompileOptions>,
     packing_supported: bool,
     packing_stats: Option<DatasetPackingConfig>,
+    model: Result<ModelGeometry, ShapeUnknown>,
 ) -> Result<Option<WggoPlan>, CodegenError> {
     use crate::wggo_gradient_scorer::build_scorer;
+    use crate::wggo_weight_analysis_cache::CacheKey;
     use std::sync::Arc;
 
     let Some(mode) = WggoMode::parse(mode_str) else {
         return Ok(None);
     };
+
+    let model = match model {
+        Ok(m) => m,
+        Err(unknown) => {
+            let dependent = compile_options
+                .map(|o| plan_dependent_flags(&o.wggo))
+                .unwrap_or_default();
+            if !dependent.is_empty() {
+                return Err(CodegenError::new(format!(
+                    "{} cannot be honoured: WGGO plans from the shapes of the model being \
+                     compiled, and they could not be determined at compile time ({unknown}). \
+                     Give the model's tensor fields literal or constructor-constant shapes \
+                     and feed the step from a `DataLoader` with a fixed batch shape, or drop \
+                     the flag.",
+                    dependent.join(" / "),
+                )));
+            }
+            crate::pass_trace::record("WGGO");
+            crate::pass_trace::record_disposition("WGGO", PassDisposition::Declined {
+                reason: DeclineReason::PreconditionViolated(
+                    "the model's layer shapes could not be determined at compile time",
+                ),
+            });
+            nsl_log::nsl_log!(WARN, "wggo",
+                "[wggo] not planned: the shapes of this train block's model could not be \
+                 determined at compile time ({unknown}). No plan is produced and the \
+                 downstream passes run as they do without --wggo."
+            );
+            return Ok(None);
+        }
+    };
+
+    // No `--wggo-memory-budget` means no budget: the Level-1 DP has nothing
+    // to hold the model to. (`ClusterSpec::default()` carries an 8 GiB
+    // figure for callers that size a nominal layer; applied to a real model
+    // nobody asked to cap, it would refuse every model above that size.)
     let cluster = ClusterSpec {
         num_gpus: world_size.max(1) as u32,
+        memory_budget: u64::MAX,
         ..ClusterSpec::default()
+    };
+
+    // What the Stage-3 report depends on besides the file's bytes.
+    let graph = build_graph(wengert);
+    if graph.layers.len() != model.layers.len() {
+        return Err(CodegenError::new(format!(
+            "internal error: WGGO was given the shapes of {} layer(s) for a train block \
+             whose layer graph has {}",
+            model.layers.len(),
+            graph.layers.len()
+        )));
+    }
+    let layouts: Vec<Option<HeadLayout>> = model.layers.iter().map(head_layout_of).collect();
+    let cache_key = CacheKey {
+        prune_fraction: analysis_config.default_prune_fraction.clamp(0.0, 0.9),
+        layers: graph
+            .layers
+            .iter()
+            .zip(layouts.iter())
+            .map(|(l, layout)| {
+                let dims = layout.map_or([0; 4], |h| {
+                    [h.d_model as u64, h.num_heads as u64, h.n_kv_heads as u64, h.head_dim as u64]
+                });
+                (l.name.clone(), dims)
+            })
+            .collect(),
     };
 
     // Check the sidecar cache first — a hit lets us skip the
     // checkpoint load entirely.
     let cached_report = weights_path
-        .and_then(crate::wggo_weight_analysis_cache::try_load);
+        .and_then(|p| crate::wggo_weight_analysis_cache::try_load(p, &cache_key));
 
     // Load the weights file up front so its lifetime covers the call.
     // Skip the load when the cache hit already carries the scores.
     // On failure, capture the message so it lands in the plan's report
     // (Phase 9 field 6) — not only on stderr (G11).
     let mut load_warning: Option<String> = None;
-    let checkpoint = if cached_report.is_some() {
-        None
-    } else {
-        match weights_path {
-            Some(p) => {
-                match crate::wggo_weight_analysis_nslweights::NslWeightsCheckpoint::load(p) {
-                    Ok(ck) => Some(ck),
-                    Err(e) => {
-                        let msg = format!(
-                            "could not load weights from {}: {} — falling back to uniform importance scores",
-                            p.display(),
-                            e
-                        );
-                        nsl_log::nsl_log!(WARN, "wggo", "[wggo] warning: {msg}");
-                        load_warning = Some(msg);
-                        None
+    let checkpoint: Option<Arc<crate::wggo_weight_analysis_nslweights::NslWeightsCheckpoint>> =
+        if cached_report.is_some() {
+            None
+        } else {
+            match weights_path {
+                Some(p) => {
+                    match crate::wggo_weight_analysis_nslweights::NslWeightsCheckpoint::load(p) {
+                        Ok(ck) => Some(Arc::new(ck)),
+                        Err(e) => {
+                            let msg = format!(
+                                "could not load weights from {}: {} — falling back to uniform importance scores",
+                                p.display(),
+                                e
+                            );
+                            nsl_log::nsl_log!(WARN, "wggo", "[wggo] warning: {msg}");
+                            load_warning = Some(msg);
+                            None
+                        }
                     }
                 }
+                None => None,
             }
-            None => None,
-        }
-    };
+        };
     let weights_ref: Option<&dyn WeightProvider> = checkpoint
-        .as_ref()
+        .as_deref()
         .map(|ck| ck as &dyn WeightProvider);
 
     // Build the gradient scorer when compile options are present.
@@ -1367,11 +1618,14 @@ pub fn run_on_wengert_with_weights(
     // `wggo_importance` and `calibration.sidecar`.  A `Grad` mode
     // without a sidecar is a hard error propagated as `None` (the
     // compile pipeline will have already caught this via its own
-    // validation, but we guard here too).
+    // validation, but we guard here too). Its magnitude fallback reads the
+    // weights file; it used to be handed a provider that returns nothing.
     let scorer: Option<Box<dyn crate::wggo_gradient_scorer::GradientScorer>> =
         if let Some(opts) = compile_options {
-            let provider: Arc<dyn WeightProvider + Send + Sync> =
-                Arc::new(NullWeightProvider);
+            let provider: Arc<dyn WeightProvider + Send + Sync> = match checkpoint.as_ref() {
+                Some(ck) => ck.clone(),
+                None => Arc::new(NullWeightProvider),
+            };
             match build_scorer(opts, provider) {
                 Ok(s) => Some(s),
                 Err(e) => {
@@ -1383,63 +1637,30 @@ pub fn run_on_wengert_with_weights(
             None
         };
 
-    // `--wggo-memory-budget` (bytes; the CLI converted MiB→bytes and validated
-    // non-zero). `None` on every non-budget build → byte-identical to today.
-    let memory_budget_bytes = compile_options.and_then(|o| o.wggo.memory_budget_bytes);
-
-    // LayerShape honesty (recon §3/§5.8): the hardcoded default makes absolute
-    // resident bytes fictional for any real model. When a budget is set — the
-    // ONLY time absolute bytes are compared against a cap — thread the best
-    // available REAL dims so the comparison is honest, falling back to the old
-    // constants when unknown. The threading is gated on the budget so a build
-    // WITHOUT the flag keeps its byte-identical LUT (pinned-plan tests).
-    //
-    // Best available source: the `@fused_lm_ce` decorator config carries the
-    // real hidden_size (= d_model), batch_size, and seq_len (baked into the
-    // fused-CE PTX). head_dim / n_kv_heads are not in reach here and keep the
-    // documented fallback constants; fully threading them (and seq/batch when
-    // no `@fused_lm_ce` is present) needs the train-block shape captured in
-    // stmt.rs — see the orchestrator note in the PR report.
-    let mut layer_shape = LayerShape {
-        batch: 1,
-        seq: 1024,
-        d_model: 512,
-        head_dim: 64,
-        n_kv_heads: 4,
-        dtype_bytes: 2,
+    // Stage 3, here rather than inside `run`, so that a weights file that
+    // does not have this model's shapes stops the compile.
+    let analysis = match cached_report.clone() {
+        Some(report) => report,
+        None => run_weight_analysis(
+            &graph,
+            &layouts,
+            weights_ref,
+            &analysis_config,
+            scorer.as_deref(),
+        )
+        .map_err(|e| {
+            CodegenError::new(format!(
+                "--wggo-weights {}: {e}. The file's tensors are sliced per attention head, so \
+                 a file from a model of another shape cannot be scored; pass the weights of \
+                 the model being compiled.",
+                weights_path.map_or_else(|| "<weights>".to_string(), |p| p.display().to_string()),
+            ))
+        })?,
     };
-    if memory_budget_bytes.is_some()
-        && let Some(opts) = compile_options
-        && let Some(cfg) = opts
-            .analysis
-            .fused_ce_configs
-            .iter()
-            .find(|c| c.hidden_size.is_some() || c.batch_size.is_some() || c.seq_len.is_some())
-    {
-        if let Some(h) = cfg.hidden_size {
-            layer_shape.d_model = h as u64;
-        }
-        if let Some(b) = cfg.batch_size {
-            layer_shape.batch = b as u64;
-        }
-        if let Some(s) = cfg.seq_len {
-            layer_shape.seq = s as u64;
-        }
-    }
-    // Cheap fidelity bundle (recon §6 footnote): when a `dataset` block carries
-    // a real packed `max_sequence_length`, use it for the s²-quadratic cost
-    // term so the modeled attention seq matches the density ratio's denominator
-    // (`density_packing_savings` uses the SAME `max_sequence_length` as `s`).
-    // Gated on `packing_stats.is_some()`, so a build with no dataset annotation
-    // keeps the byte-identical hardcoded seq (pinned-plan tests). Takes
-    // precedence over the budget path's fused-CE `seq_len` because the packed
-    // sequence is the geometry both the cost term and the packing saving must
-    // agree on.
-    if let Some(cfg) = packing_stats.as_ref()
-        && cfg.max_sequence_length > 0
-    {
-        layer_shape.seq = cfg.max_sequence_length as u64;
-    }
+
+    // `--wggo-memory-budget` (bytes; the CLI converted MiB→bytes and validated
+    // non-zero). `None` on every non-budget build.
+    let memory_budget_bytes = compile_options.and_then(|o| o.wggo.memory_budget_bytes);
 
     // `--wggo-prune-layers` / `--wggo-layer-prune-fraction`: the user's
     // layer-prune request, resolved against THIS list's layer graph (the
@@ -1447,7 +1668,7 @@ pub fn run_on_wengert_with_weights(
     // neither flag is set — no graph is built and the plan is unchanged.
     let forced_prune = match compile_options {
         Some(opts) if opts.wggo.layer_prune_requested() => {
-            resolve_forced_prune(wengert, &opts.wggo, checkpoint.as_ref(), weights_path)?
+            resolve_forced_prune(wengert, &opts.wggo, checkpoint.as_deref(), weights_path)?
         }
         _ => std::collections::BTreeSet::new(),
     };
@@ -1456,16 +1677,22 @@ pub fn run_on_wengert_with_weights(
         mode,
         target,
         wengert,
-        layer_shape,
+        model: Some(model),
+        // Not read: `model` is supplied.
+        layer_shape: NOMINAL_LAYER_SHAPE,
         cluster,
         lut_axes: LutAxes::default(),
         importance: ImportanceScores::default(),
         ilp_constraints: Vec::new(),
         weights: weights_ref,
         analysis_config,
-        scorer,
-        packing_supported,
-        cached_analysis: cached_report.clone(),
+        scorer: None,
+        // A packing mode is offered only where one can be lowered: the
+        // module declares a packed dataset, or this train block's tape
+        // reaches a packed attention call.
+        packing_supported: packing_supported
+            || crate::wggo_model_shape::tape_has_packed_attention(wengert),
+        cached_analysis: Some(analysis),
         memory_budget_bytes,
         packing_stats,
         forced_prune: forced_prune.clone(),
@@ -1473,7 +1700,7 @@ pub fn run_on_wengert_with_weights(
     // WRGA budget semantics (paper §7.1 @wrga(mode=auto): errata E3's
     // two-level split): when the user opted into adapters via
     // @wrga/@adapter decorators, adapters are MANDATED — rank 0 stops
-    // being a feasible per-layer choice, and the ILP picks the grid rank
+    // being a feasible per-layer choice, and the solver picks the grid rank
     // + comm-feasible placement per layer; WRGA's spectral allocator then
     // distributes the user's budget_params across the layer's matrices.
     // Without this, the cost-only objective always chose rank 0 (adapters
@@ -1499,7 +1726,7 @@ pub fn run_on_wengert_with_weights(
     }
 
     // `--wggo-memory-budget` HARD refusal: `run()` set `budget_infeasible`
-    // when the plan cannot fit even at the fp16-moment floor. This is a
+    // when the plan cannot fit even at the moment-precision floor. This is a
     // compile-fatal diagnostic — the user asked for a hard cap and the model
     // does not fit, so we refuse loudly rather than silently degrade (the
     // degrade-to-Off warning path is for the no-budget case). It is returned
@@ -1517,7 +1744,7 @@ pub fn run_on_wengert_with_weights(
             budget = bi.budget_bytes,
             budget_mib = bi.budget_bytes / (1024 * 1024),
             required = bi.required_fp16_floor_bytes,
-            required_mib = bi.required_fp16_floor_bytes / (1024 * 1024),
+            required_mib = bi.required_fp16_floor_bytes.div_ceil(1024 * 1024),
             layers = if bi.infeasible_layers > 0 {
                 format!(" ({} layer(s) infeasible at that floor)", bi.infeasible_layers)
             } else {
@@ -1533,14 +1760,12 @@ pub fn run_on_wengert_with_weights(
         plan.warnings.insert(0, msg);
     }
 
-    // Cache-hit reports were passed into run() via `cached_analysis`
-    // (pre-solve), so the plan already carries them.
+    // Cache miss — persist the freshly-computed report alongside the
+    // checkpoint.  Failures are silent; the cache is advisory.
     if cached_report.is_none()
         && let Some(p) = weights_path
     {
-    // Cache miss — persist the freshly-computed report alongside
-    // the checkpoint.  Failures are silent; the cache is advisory.
-    let _ = crate::wggo_weight_analysis_cache::store(p, &plan.weight_analysis);
+        let _ = crate::wggo_weight_analysis_cache::store(p, &cache_key, &plan.weight_analysis);
     }
 
     Ok(Some(plan))
@@ -1585,7 +1810,9 @@ fn resolve_forced_prune(
             }
             (None, None) => None,
         };
-        let tensors = checkpoint.map(|ck| ck.tensors_by_name());
+        // Weight matrices only: pooled with the normalisation gains (all
+        // 1.0) the ranking was decided by the gains.
+        let tensors = checkpoint.map(|ck| ck.weight_matrices_by_name());
         let label = weights_path.map_or_else(|| "-".to_string(), |p| p.display().to_string());
         let selected = select_by_magnitude(&graph, fraction, tensors.as_deref(), &label)
             .map_err(CodegenError::new)?;
@@ -1669,7 +1896,9 @@ fn check_forced_prune_applied(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gpu_specs::{default_gpu, find_gpu};
     use crate::wengert::{PrimalOp, WengertOp};
+    use crate::wggo_model_shape::fixtures::{geometry, transformer, Dims};
     use std::collections::HashMap;
 
     fn op(id: u32, result: u32, o: PrimalOp, inputs: Vec<u32>) -> WengertOp {
@@ -1704,14 +1933,8 @@ mod tests {
             mode: WggoMode::Full,
             target: "H100",
             wengert: w,
-            layer_shape: LayerShape {
-                batch: 1,
-                seq: 1024,
-                d_model: 512,
-                head_dim: 64,
-                n_kv_heads: 4,
-                dtype_bytes: 2,
-            },
+            model: None,
+            layer_shape: NOMINAL_LAYER_SHAPE,
             cluster: ClusterSpec::default(),
             lut_axes: LutAxes::default(),
             importance: ImportanceScores::default(),
@@ -1724,6 +1947,20 @@ mod tests {
             memory_budget_bytes: None,
             packing_stats: None,
             forced_prune: std::collections::BTreeSet::new(),
+        }
+    }
+
+    /// A [`WggoInput`] for a fixture transformer, planned from its own
+    /// shapes, with no budget.
+    fn model_input<'a>(w: &'a WengertList, model: ModelGeometry) -> WggoInput<'a> {
+        WggoInput {
+            model: Some(model),
+            cluster: ClusterSpec {
+                memory_budget: u64::MAX,
+                ..ClusterSpec::default()
+            },
+            packing_supported: false,
+            ..toy_input(w)
         }
     }
 
@@ -1841,7 +2078,7 @@ mod tests {
         // printed and `process::exit(1)`-ed from inside the library, which no
         // test could observe without spawning a process; now the refusal is
         // an `Err` naming the budget, the floor, and what to do.
-        let w = two_block_wengert();
+        let (w, sizes) = transformer(Dims::base512(2), false);
         let mut opts = crate::CompileOptions::default();
         opts.wggo.memory_budget_bytes = Some(1);
         opts.wggo.importance = crate::WggoImportance::Magnitude;
@@ -1855,6 +2092,7 @@ mod tests {
             Some(&opts),
             true,
             None,
+            Ok(geometry(&w, &sizes)),
         )
         .expect_err("a 1-byte budget must refuse the compile");
         assert!(
@@ -1885,61 +2123,90 @@ mod tests {
             Some(&opts),
             true,
             None,
+            Ok(geometry(&w, &sizes)),
         )
         .expect("an unknown mode is not a compile error");
         assert!(none.is_none());
     }
 
+    /// The budget is split in proportion to what each layer needs, after the
+    /// overhead reserve. Two tables are given footprints by hand: at 32-bit
+    /// moments a layer holds params + 2 x params of moments + activations.
     #[test]
-    fn per_layer_ilp_budget_reserves_overhead_and_splits() {
-        // None in ⇒ None out (no budget driver).
-        assert_eq!(per_layer_ilp_budget(None, 4), None);
-        // Reserve NON_LAYER_OVERHEAD_FRACTION, split the rest evenly.
-        let model = 1_000_000u64;
-        let got = per_layer_ilp_budget(Some(model), 4).unwrap();
-        let expect = ((model as f64 * (1.0 - NON_LAYER_OVERHEAD_FRACTION)) as u64) / 4;
-        assert_eq!(got, expect);
-        // Never returns 0 even for a tiny budget.
-        assert!(per_layer_ilp_budget(Some(1), 100).unwrap() >= 1);
-    }
+    fn layer_budgets_are_proportional_to_need() {
+        let gpu = find_gpu("H100").unwrap_or_else(default_gpu);
+        let (w, sizes) = transformer(Dims::base512(2), false);
+        let model = geometry(&w, &sizes);
+        let luts: Vec<LayerCostLut> = model
+            .layers
+            .iter()
+            .map(|l| build_layer_lut(l, 4, gpu, &LutAxes::default()))
+            .collect();
+        let full: Vec<u64> =
+            luts.iter().map(|l| crate::wggo_ilp::moment_floor_bytes(l, 32, 32)).collect();
+        let total: u64 = full.iter().sum();
 
-    #[test]
-    fn inter_layer_dims_maps_roles_to_residual_widths() {
-        assert_eq!(inter_layer_dims(LayerRole::Attention, 512), (Some(512), Some(512)));
-        assert_eq!(inter_layer_dims(LayerRole::Ffn, 512), (Some(512), Some(512)));
-        assert_eq!(inter_layer_dims(LayerRole::Block, 512), (Some(512), Some(512)));
-        assert_eq!(inter_layer_dims(LayerRole::Embedding, 512), (None, Some(512)));
-        assert_eq!(inter_layer_dims(LayerRole::LmHead, 512), (Some(512), None));
-        assert_eq!(inter_layer_dims(LayerRole::Other, 512), (None, None));
-    }
+        // No budget: nothing is assigned.
+        let mut none = vec![LayerIlpConstraints::default(); luts.len()];
+        assign_layer_budgets(&mut none, &luts, None);
+        assert!(none.iter().all(|c| c.memory_budget == u64::MAX && !c.budget_informed));
 
-    #[test]
-    fn inter_layer_dims_zero_d_model_is_unknown() {
-        // A zero/defaulted d_model must not synthesise Some(0) widths (which
-        // would otherwise drive false classifications): report unknown.
-        assert_eq!(inter_layer_dims(LayerRole::Block, 0), (None, None));
-        assert_eq!(inter_layer_dims(LayerRole::Attention, 0), (None, None));
-    }
-
-    #[test]
-    fn build_shape_infos_for_residual_blocks_carry_d_model_and_validate_clean() {
-        let w = two_block_wengert();
-        let graph = build_graph(&w);
-        let infos = build_shape_infos(&graph, 512);
-        // Every transformer block exposes d_model on both inter-layer edges.
-        for info in infos.iter().filter(|i| i.name.starts_with("blocks.")) {
-            assert_eq!(info.input_dim, Some(512));
-            assert_eq!(info.output_dim, Some(512));
+        // A budget twice the model's 32-bit footprint (after the reserve):
+        // every layer's share is twice its own need, whatever its size.
+        let budget = (2.0 * total as f64 / (1.0 - NON_LAYER_OVERHEAD_FRACTION)).ceil() as u64;
+        let mut cs = vec![LayerIlpConstraints::default(); luts.len()];
+        assign_layer_budgets(&mut cs, &luts, Some(budget));
+        for (c, need) in cs.iter().zip(full.iter()) {
+            assert!(c.budget_informed);
+            assert!(c.memory_budget >= 2 * need - 2 && c.memory_budget <= 2 * need + 2);
         }
-        // The uniform residual chain satisfies §2.4 by construction.
-        assert!(crate::wggo_shape::validate(&infos).is_empty());
+        // Never 0, even for a 1-byte budget.
+        let mut tiny = vec![LayerIlpConstraints::default(); luts.len()];
+        assign_layer_budgets(&mut tiny, &luts, Some(1));
+        assert!(tiny.iter().all(|c| c.memory_budget >= 1));
     }
 
+    /// Pruning a layer replaces it with the identity, which is sound only
+    /// if the layer hands on a tensor as wide as the one it receives.
     #[test]
-    fn shape_warnings_empty_for_uniform_residual_graph() {
-        let w = two_block_wengert();
+    fn pruning_a_width_changing_layer_is_a_shape_violation() {
+        use crate::wggo_dp::CoarseDecision;
+        let (w, sizes) = transformer(Dims::base512(2), false);
+        let mut model = geometry(&w, &sizes);
         let graph = build_graph(&w);
-        assert!(shape_warnings(&graph, 512).is_empty());
+        let gpu = find_gpu("H100").unwrap_or_else(default_gpu);
+        let luts: Vec<LayerCostLut> = model
+            .layers
+            .iter()
+            .map(|l| build_layer_lut(l, 4, gpu, &LutAxes::default()))
+            .collect();
+        let idx = graph.layers.iter().position(|l| l.name == "blocks.1").unwrap();
+        let cfg = DpConfig {
+            cluster: ClusterSpec { memory_budget: u64::MAX, ..ClusterSpec::default() },
+            forced_prune: [idx as u32].into_iter().collect(),
+            ..Default::default()
+        };
+        let inter = dp_solve(&graph, &luts, &cfg, gpu).unwrap();
+        assert_eq!(inter.layers[idx].decision, CoarseDecision::Prune);
+
+        // A block on the 512-wide stream: fine.
+        assert_eq!(model.layers[idx].input_width, Some(512));
+        assert_eq!(model.layers[idx].output_width, Some(512));
+        assert!(prune_shape_warnings(&inter, &model).is_empty());
+
+        // The same layer handing on a 256-wide tensor: refused, and the
+        // whole plan declines its transforms.
+        model.layers[idx].output_width = Some(256);
+        let warns = prune_shape_warnings(&inter, &model);
+        assert_eq!(warns.len(), 1);
+        assert!(warns[0].contains("blocks.1") && warns[0].contains("256"), "{warns:?}");
+
+        let mut input = model_input(&w, model);
+        input.forced_prune = [idx as u32].into_iter().collect();
+        let plan = run(input);
+        assert_eq!(plan.mode, WggoMode::Off);
+        assert!(plan.applied.layers.is_empty(), "a shape refusal carries no decisions");
+        assert!(plan.warnings.iter().any(|m| m.contains("shape_incompatible")));
     }
 
     #[test]
@@ -1957,8 +2224,9 @@ mod tests {
     fn role_sensitivity_floor_pins_fragile_roles_high_and_blocks_low() {
         assert!(role_sensitivity_floor(LayerRole::Embedding) >= 0.9);
         assert!(role_sensitivity_floor(LayerRole::LmHead) >= 0.9);
-        assert!(role_sensitivity_floor(LayerRole::Other) >= 0.5);
-        assert!(role_sensitivity_floor(LayerRole::Other) < 0.9);
+        // `other` holds the embedding, LM head and final norm of a real
+        // model, so it is pinned like them.
+        assert!(role_sensitivity_floor(LayerRole::Other) >= 0.9);
         assert_eq!(role_sensitivity_floor(LayerRole::Block), 0.0);
         assert_eq!(role_sensitivity_floor(LayerRole::Attention), 0.0);
         assert_eq!(role_sensitivity_floor(LayerRole::Ffn), 0.0);
@@ -2135,7 +2403,7 @@ mod tests {
     fn run_on_wengert_with_weights_handles_missing_file() {
         // A nonexistent weights path should warn and fall back to
         // uniform scores, not fail the call.
-        let w = two_block_wengert();
+        let (w, sizes) = transformer(Dims::base512(2), false);
         let plan = run_on_wengert_with_weights(
             &w,
             "H100",
@@ -2146,15 +2414,13 @@ mod tests {
             None,
             true,
             None,
+            Ok(geometry(&w, &sizes)),
         )
         .expect("no compile error")
         .expect("plan");
-        // Every layer should be counted as without_weights since the
-        // checkpoint didn't load.
-        assert_eq!(
-            plan.weight_analysis.layers_without_weights,
-            plan.weight_analysis.per_layer.len() as u32
-        );
+        // Every attention layer (the two blocks) should be counted as
+        // without_weights since the checkpoint didn't load.
+        assert_eq!(plan.weight_analysis.layers_without_weights, 2);
     }
 
     #[test]
@@ -2205,7 +2471,7 @@ mod tests {
         let mut inp = toy_input(&w);
         let gpu = find_gpu("H100").unwrap_or_else(default_gpu);
         let lut = build_lut(&inp.layer_shape, gpu, &inp.lut_axes);
-        let one = lut.argmin_feasible().expect("feasible entry").4;
+        let one = lut.as_written().expect("feasible entry");
         let sharded = 3 * one.param_bytes / 8 + one.activation_bytes;
         inp.cluster = ClusterSpec {
             num_gpus: 8,
@@ -2232,7 +2498,7 @@ mod tests {
     fn sharded_cluster(inp: &WggoInput) -> ClusterSpec {
         let gpu = find_gpu("H100").unwrap_or_else(default_gpu);
         let lut = build_lut(&inp.layer_shape, gpu, &inp.lut_axes);
-        let one = lut.argmin_feasible().expect("feasible entry").4;
+        let one = lut.as_written().expect("feasible entry");
         let sharded = 3 * one.param_bytes / 8 + one.activation_bytes;
         let n = build_graph(inp.wengert).layers.len() as u64;
         ClusterSpec {
@@ -2380,7 +2646,7 @@ mod tests {
     /// (`warnings` -> "Warnings / limitations" section), not only on stderr.
     #[test]
     fn weights_load_failure_surfaces_in_report() {
-        let w = two_block_wengert();
+        let (w, sizes) = transformer(Dims::base512(2), false);
         let missing = std::path::Path::new("definitely/does/not/exist.nslweights");
         let plan = run_on_wengert_with_weights(
             &w,
@@ -2392,6 +2658,7 @@ mod tests {
             None,
             true,
             None,
+            Ok(geometry(&w, &sizes)),
         )
         .expect("no compile error")
         .expect("plan is still produced via uniform-importance fallback");
@@ -2632,7 +2899,7 @@ mod tests {
         opts.wggo.importance = WggoImportance::Auto;
         opts.calibration.sidecar = Some(sidecar);
 
-        let w = two_block_wengert();
+        let (w, sizes) = transformer(Dims::base512(2), false);
         let plan = run_on_wengert_with_weights(
             &w,
             "H100",
@@ -2643,6 +2910,7 @@ mod tests {
             Some(&opts),
             true,
             None,
+            Ok(geometry(&w, &sizes)),
         )
         .expect("no compile error")
         .expect("plan");
@@ -2808,7 +3076,8 @@ mod tests {
         // mask 0b0011, flat savings [0, 0.15, 0, 0], whole-layer discount.
         let w = two_block_wengert();
         let graph = build_graph(&w);
-        let cs = default_constraints_for(&graph, true, None, None);
+        let gpu = find_gpu("H100").unwrap_or_else(default_gpu);
+        let cs = default_constraints_for(&graph, None, gpu, true, None);
         assert!(!cs.is_empty());
         for c in &cs {
             assert_eq!(c.packing_modes_mask, 0b0011);
@@ -2816,7 +3085,7 @@ mod tests {
             assert!(!c.packing_scales_quadratic_only, "legacy whole-layer discount");
         }
         // And packing_supported=false collapses to mode 0 with zeroed savings.
-        let cs0 = default_constraints_for(&graph, false, None, None);
+        let cs0 = default_constraints_for(&graph, None, gpu, false, None);
         for c in &cs0 {
             assert_eq!(c.packing_modes_mask, 0b0001);
             assert_eq!(c.packing_savings, [0.0; 4]);
@@ -2888,5 +3157,345 @@ mod tests {
                 s.decision.packing_mode
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Plans made from the model's own shapes.
+    // -----------------------------------------------------------------------
+
+    /// The plan describes the model compiled, not a built-in layer.
+    ///
+    /// A 12-head, 768-wide model with an FFN of 3072 used to be planned as
+    /// "8/8 heads, FFN=2048" like every other model. Its figures are worked
+    /// out by hand below: a block has 6,292,224 parameter elements (see
+    /// `wggo_model_shape`), 25,168,896 bytes at f32, and with two 32-bit
+    /// moments, 75,506,688 bytes; its forward activations are 286,720
+    /// elements, 1,146,880 bytes. The output projection is 76,800 elements
+    /// and its one product writes 2x16x100 = 3,200.
+    #[test]
+    fn the_plan_reports_the_models_own_heads_widths_and_bytes() {
+        let (w, sizes) = transformer(Dims::gqa12(2), false);
+        let plan = run(model_input(&w, geometry(&w, &sizes)));
+        assert!(plan.shapes_from_model);
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+
+        let blocks: Vec<_> =
+            plan.applied.layers.iter().filter(|l| l.layer_name.starts_with("blocks.")).collect();
+        assert_eq!(blocks.len(), 2);
+        for b in &blocks {
+            assert_eq!(b.active_heads, 12);
+            assert_eq!(b.ffn_width, 3072);
+            assert_eq!(b.param_bytes, 25_168_896);
+            assert_eq!(b.activation_bytes, 1_146_880);
+        }
+        let other = plan.applied.layers.iter().find(|l| l.layer_name == "other").unwrap();
+        assert_eq!(other.active_heads, 0);
+        assert_eq!(other.param_bytes, 307_200);
+
+        // Memory: params + 32-bit m + 32-bit v + activations, every layer.
+        let block_bytes = 3 * 25_168_896 + 1_146_880;
+        let other_bytes = 3 * 307_200 + 4 * 3_200;
+        assert_eq!(plan.applied.peak_memory_bytes, 2 * block_bytes + other_bytes);
+
+        let report = plan.render_report();
+        assert!(report.contains("blocks.0: 12/12 heads, FFN=3072"), "{report}");
+        assert!(report.contains("Layer shapes: from the model being compiled"), "{report}");
+        assert!(!report.contains("8/8 heads") && !report.contains("FFN=2048"), "{report}");
+    }
+
+    /// A caller that supplies no model gets a plan labelled as nominal.
+    #[test]
+    fn a_plan_without_model_shapes_says_so() {
+        let w = two_block_wengert();
+        let plan = run(toy_input(&w));
+        assert!(!plan.shapes_from_model);
+        assert!(plan.render_report().contains("a nominal layer supplied by the caller"));
+    }
+
+    /// The pipeline entry point does not plan a model whose shapes it could
+    /// not determine, and refuses a flag that needs the plan.
+    #[test]
+    fn unknown_shapes_decline_to_plan_and_refuse_a_budget() {
+        let w = two_block_wengert();
+        let unknown = || {
+            Err(ShapeUnknown {
+                reasons: vec!["parameter `blocks.0.attn.wq` has no compile-time shape".into()],
+            })
+        };
+        let none = run_on_wengert_with_weights(
+            &w,
+            "H100",
+            "full",
+            1,
+            None,
+            AnalysisConfig::default(),
+            Some(&crate::CompileOptions::default()),
+            false,
+            None,
+            unknown(),
+        )
+        .expect("declining to plan is not a compile error");
+        assert!(none.is_none());
+
+        let mut opts = crate::CompileOptions::default();
+        opts.wggo.memory_budget_bytes = Some(200 * 1024 * 1024);
+        let err = run_on_wengert_with_weights(
+            &w,
+            "H100",
+            "full",
+            1,
+            None,
+            AnalysisConfig::default(),
+            Some(&opts),
+            false,
+            None,
+            unknown(),
+        )
+        .expect_err("a budget that cannot be checked must not be accepted");
+        assert!(err.message.starts_with("--wggo-memory-budget cannot be honoured"), "{}", err.message);
+        assert!(err.message.contains("blocks.0.attn.wq"), "{}", err.message);
+    }
+
+    /// A budget is checked against the model. This two-block model needs
+    /// 2 x 76,653,568 + 934,400 = 154,241,536 bytes at 32-bit moments
+    /// (blocks: 3 x 25,168,896 + 1,146,880; output projection: 3 x 307,200 +
+    /// 12,800), or 181,460,631 with the 15 % reserve. 200 MiB fits it with
+    /// nothing lowered; the floor (a 16-bit first moment on the two blocks,
+    /// saving 2 x 12,584,448) is 129,072,640 bytes, 151,850,165 with the
+    /// reserve, so 150 MiB fits only with reduced first moments and 140 MiB
+    /// does not fit.
+    #[test]
+    fn a_budget_is_sized_from_the_model() {
+        let (w, sizes) = transformer(Dims::gqa12(2), false);
+        let with_budget = |mib: u64| {
+            let mut input = model_input(&w, geometry(&w, &sizes));
+            input.memory_budget_bytes = Some(mib * 1024 * 1024);
+            run(input)
+        };
+
+        let roomy = with_budget(200);
+        assert!(roomy.budget_infeasible.is_none());
+        for l in &roomy.applied.layers {
+            assert_eq!(l.optim_m_bits, 32, "{}: nothing is lowered when it all fits", l.layer_name);
+        }
+
+        let tight = with_budget(150);
+        assert!(tight.budget_infeasible.is_none(), "150 MiB holds the model at its floor");
+        for l in &tight.applied.layers {
+            let expected = if l.layer_name.starts_with("blocks.") { 16 } else { 32 };
+            assert_eq!(l.optim_m_bits, expected, "{}", l.layer_name);
+            assert_eq!(l.optim_v_bits, 32, "the second moment is never lowered");
+        }
+
+        let short = with_budget(140).budget_infeasible.expect("140 MiB is below the floor");
+        assert_eq!(short.required_fp16_floor_bytes, 151_850_165);
+    }
+
+    /// A layer with no feasible configuration is warned about, and the
+    /// plan's step time stays finite.
+    #[test]
+    fn an_infeasible_layer_is_warned_about_and_costs_nothing() {
+        let (w, sizes) = transformer(Dims::gqa12(2), false);
+        let model = geometry(&w, &sizes);
+        let n = model.layers.len();
+        let mut input = model_input(&w, model);
+        // Explicit constraints no layer can meet: one byte of memory each.
+        input.ilp_constraints = vec![
+            LayerIlpConstraints {
+                num_heads: 12,
+                num_kv_groups: 4,
+                gqa_group: 3,
+                memory_budget: 1,
+                ..Default::default()
+            };
+            n
+        ];
+        let plan = run(input);
+        assert!(plan.per_layer.iter().all(|s| !s.feasible));
+        assert!(plan.applied.total_us.is_finite());
+        assert!(
+            plan.warnings.iter().any(|m| m.contains("no feasible configuration")),
+            "{:?}",
+            plan.warnings
+        );
+        assert!(!plan.render_report().contains("Step time: inf"));
+    }
+
+    /// A weights file is not a request to prune heads.
+    ///
+    /// Strongly unequal scores on every block, with no prune fraction: all
+    /// heads are kept. With a fraction of 0.25, and only fusion levels 0
+    /// and 1 on offer, the three weakest of twelve go (one key/value group
+    /// of three). With every level on offer the solver keeps all twelve at
+    /// a fused level, which costs less, and no conflict is left to resolve.
+    #[test]
+    fn head_pruning_needs_a_prune_fraction() {
+        use crate::wggo_gradient_scorer::{CalibratedGradientScorer, MagnitudeFallbackScorer};
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+        let (w, sizes) = transformer(Dims::gqa12(2), false);
+        let scorer = || -> Box<dyn GradientScorer> {
+            let mut scores = BTreeMap::new();
+            for name in ["blocks.0", "blocks.1"] {
+                // Group 2 (heads 6..9) is the weakest by far.
+                scores.insert(
+                    name.to_string(),
+                    vec![9.0f32, 9.0, 9.0, 8.0, 8.0, 8.0, 0.1, 0.1, 0.1, 7.0, 7.0, 7.0],
+                );
+            }
+            Box::new(CalibratedGradientScorer::new(
+                scores,
+                MagnitudeFallbackScorer::new(
+                    Arc::new(NullWeightProvider) as Arc<dyn WeightProvider + Send + Sync>
+                ),
+            ))
+        };
+        let plan_at = |fraction: f64, csha_levels: Vec<u8>| {
+            let mut input = model_input(&w, geometry(&w, &sizes));
+            input.scorer = Some(scorer());
+            input.analysis_config = AnalysisConfig { default_prune_fraction: fraction };
+            input.lut_axes.csha_levels = csha_levels;
+            run(input)
+        };
+
+        let default_plan = plan_at(AnalysisConfig::default().default_prune_fraction, vec![0, 1]);
+        for l in default_plan.applied.layers.iter().filter(|l| l.layer_name.starts_with("blocks.")) {
+            assert_eq!(l.active_heads, 12, "no fraction given, no head pruned");
+        }
+
+        // Every level on offer: all heads at level 3 beats nine at level 1.
+        let fused = plan_at(0.25, vec![0, 1, 2, 3]);
+        for l in fused.applied.layers.iter().filter(|l| l.layer_name.starts_with("blocks.")) {
+            assert_eq!((l.active_heads, l.csha_level), (12, 3));
+        }
+        assert!(fused.resolutions.is_empty());
+
+        let pruned = plan_at(0.25, vec![0, 1]);
+        assert!(pruned.applied.total_us > fused.applied.total_us);
+        for (sol, layer) in pruned.per_layer.iter().zip(pruned.graph.layers.iter()) {
+            if !layer.name.starts_with("blocks.") {
+                continue;
+            }
+            let dropped: Vec<usize> = sol
+                .decision
+                .keep_head
+                .iter()
+                .enumerate()
+                .filter_map(|(i, k)| (!k).then_some(i))
+                .collect();
+            assert_eq!(dropped, vec![6, 7, 8], "the weakest key/value group is the one dropped");
+            // Pruned heads rule out fusion levels 2 and 3, inside the solve.
+            assert!(sol.decision.csha_level <= 1);
+        }
+        // The cost reported is the cost of the decisions carried.
+        let recost: f64 = pruned.per_layer.iter().map(|s| s.cost_us).sum();
+        assert!((pruned.applied.total_us - recost).abs() < 1e-9);
+        assert!(pruned.resolutions.is_empty(), "the solver no longer picks a conflicting pair");
+    }
+
+    /// Raw calibration scores are on an arbitrary scale. They are
+    /// normalised before the retention threshold is taken from them, so a
+    /// sidecar of scores near 1e-3 plans exactly as one a thousand times
+    /// larger. Compared raw against a threshold of about the head count,
+    /// every layer was infeasible.
+    #[test]
+    fn calibration_scores_are_scale_free() {
+        use crate::wggo_gradient_scorer::{CalibratedGradientScorer, MagnitudeFallbackScorer};
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+        let (w, sizes) = transformer(Dims::base512(2), false);
+        let plan_with = |scale: f32| {
+            let mut scores = BTreeMap::new();
+            for name in ["blocks.0", "blocks.1"] {
+                scores.insert(
+                    name.to_string(),
+                    [4.0f32, 4.0, 3.0, 3.0, 1.0, 1.0, 2.0, 2.0].iter().map(|v| v * scale).collect(),
+                );
+            }
+            let mut input = model_input(&w, geometry(&w, &sizes));
+            input.scorer = Some(Box::new(CalibratedGradientScorer::new(
+                scores,
+                MagnitudeFallbackScorer::new(
+                    Arc::new(NullWeightProvider) as Arc<dyn WeightProvider + Send + Sync>
+                ),
+            )));
+            input.analysis_config = AnalysisConfig { default_prune_fraction: 0.25 };
+            // Without a fused level on offer, fewer heads is cheaper, so the
+            // retention threshold is what decides how many are kept.
+            input.lut_axes.csha_levels = vec![0, 1];
+            run(input)
+        };
+        let small = plan_with(1e-3);
+        let large = plan_with(1.0);
+        for (a, b) in small.per_layer.iter().zip(large.per_layer.iter()) {
+            assert!(a.feasible && b.feasible);
+            assert_eq!(a.decision.keep_head, b.decision.keep_head);
+        }
+        // 8 heads in 4 groups of 2, a quarter may go: the weakest group
+        // (heads 4 and 5) is dropped, the other six kept.
+        let block = &small.per_layer[small.graph.layers.iter().position(|l| l.name == "blocks.0").unwrap()];
+        assert_eq!(
+            block.decision.keep_head,
+            vec![true, true, true, true, false, false, true, true]
+        );
+        // Normalised to sum to the head count: 4/20 x 8 = 1.6 for head 0.
+        let scores = &small.weight_analysis.per_layer
+            [small.graph.layers.iter().position(|l| l.name == "blocks.0").unwrap()];
+        assert!((scores.head_scores[0] - 1.6).abs() < 1e-6, "{:?}", scores.head_scores);
+        // Threshold: the six strongest, (4+4+3+3+2+2)/20 x 8 = 7.2.
+        assert!((scores.default_min_retained - 7.2).abs() < 1e-6);
+    }
+
+    /// A packing mode is planned only where a packed attention call can
+    /// consume it.
+    #[test]
+    fn packing_is_planned_only_for_a_packed_attention_tape() {
+        let entry = |packed: bool| {
+            let (w, sizes) = transformer(Dims::base512(2), packed);
+            run_on_wengert_with_weights(
+                &w,
+                "H100",
+                "greedy",
+                1,
+                None,
+                AnalysisConfig::default(),
+                None,
+                false, // the module declares no packed dataset
+                None,
+                Ok(geometry(&w, &sizes)),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        assert!(entry(false).applied.layers.iter().all(|l| l.packing_mode == 0));
+        let packed = entry(true);
+        for l in &packed.applied.layers {
+            let expected = u8::from(l.layer_name.starts_with("blocks."));
+            assert_eq!(l.packing_mode, expected, "{}", l.layer_name);
+        }
+    }
+
+    /// The cost model prices against the GPU the target names, and its
+    /// shared-memory test is CSHA's: level 3 on the 512-wide layer needs
+    /// 213,504 bytes by CSHA's formula (49,664 for the pipeline, 32,768 for
+    /// the output-projection tile and 131,072 for the FFN tile), which an
+    /// H100 holds (228 KB, the most one block may request) and an A100 does
+    /// not (192 KB less a 12 KB reserve).
+    #[test]
+    fn the_csha_level_planned_is_one_csha_accepts_on_the_target_gpu() {
+        let (w, sizes) = transformer(Dims::base512(2), false);
+        let level_on = |target: &'static str| {
+            let mut input = model_input(&w, geometry(&w, &sizes));
+            input.target = target;
+            let plan = run(input);
+            let block = plan.applied.layers.iter().find(|l| l.layer_name == "blocks.0").unwrap();
+            (plan.target_gpu.clone(), block.csha_level)
+        };
+        let (h100, h100_level) = level_on("H100");
+        assert!(h100.contains("H100"), "{h100}");
+        assert_eq!(h100_level, 3);
+        let (a100, a100_level) = level_on("A100-SXM");
+        assert!(a100.contains("A100"), "{a100}");
+        assert_eq!(a100_level, 2);
     }
 }

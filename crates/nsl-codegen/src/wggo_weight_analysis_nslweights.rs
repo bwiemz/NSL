@@ -162,6 +162,18 @@ impl NslWeightsCheckpoint {
         v.sort_by(|a, b| a.0.cmp(b.0));
         v
     }
+
+    /// The weight matrices of the checkpoint: its tensors of rank 2 or
+    /// more, as `(name, f32 data)`, sorted by name. Normalisation gains and
+    /// biases (rank 1) and config scalars are left out: a gain vector of
+    /// ones has an RMS of 1.0, fifty times that of an initialised weight
+    /// matrix, and pooled with the matrices it decides the result.
+    pub fn weight_matrices_by_name(&self) -> Vec<(&str, &[f32])> {
+        self.tensors_by_name()
+            .into_iter()
+            .filter(|(name, _)| self.shapes.get(*name).is_some_and(|s| s.len() >= 2))
+            .collect()
+    }
 }
 
 impl std::fmt::Debug for NslWeightsCheckpoint {
@@ -356,6 +368,57 @@ mod tests {
         blob
     }
 
+    /// `--wggo-layer-prune-fraction` ranks blocks by the RMS of their weight
+    /// matrices. Two blocks whose matrices are 0.02 and 0.03 throughout,
+    /// each with a gain vector of ones as large as the matrix: over the
+    /// matrices alone the first block's RMS is 2/3 of the second's. Pooled
+    /// with the gains, as the ranking was, the two are sqrt((0.0004 + 1) /
+    /// 2) = 0.70725 and sqrt((0.0009 + 1) / 2) = 0.70742, a ratio of
+    /// 0.99975: the gains decide it and the matrices are noise.
+    #[test]
+    fn layer_ranking_reads_weight_matrices_not_gains() {
+        use crate::wggo_forced_prune::select_by_magnitude;
+        use crate::wggo_graph::{Layer, LayerRole, OptGraph};
+        let f32s = |v: f32, n: usize| -> Vec<u8> {
+            std::iter::repeat_n(v, n).flat_map(|x| x.to_le_bytes()).collect()
+        };
+        let blob = build_blob(&[
+            ("blocks.0.w", "f32", vec![8, 8], f32s(0.02, 64)),
+            ("blocks.0.norm", "f32", vec![64], f32s(1.0, 64)),
+            ("blocks.1.w", "f32", vec![8, 8], f32s(0.03, 64)),
+            ("blocks.1.norm", "f32", vec![64], f32s(1.0, 64)),
+        ]);
+        let ck = NslWeightsCheckpoint::from_bytes(&blob).expect("parse");
+        let names: Vec<&str> = ck.weight_matrices_by_name().iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, vec!["blocks.0.w", "blocks.1.w"]);
+
+        let layer = |index: u32, name: &str| Layer {
+            index,
+            name: name.to_string(),
+            role: LayerRole::Block,
+            op_indices: vec![index],
+            param_names: Vec::new(),
+            depends_on: Vec::new(),
+        };
+        let graph = OptGraph {
+            layers: vec![layer(0, "blocks.0"), layer(1, "blocks.1")],
+            total_ops: 2,
+        };
+        let importance_of_block0 = |tensors: Vec<(&str, &[f32])>| {
+            select_by_magnitude(&graph, 0.5, Some(&tensors), "w")
+                .unwrap()
+                .ranking
+                .iter()
+                .find(|r| r.layer_name == "blocks.0")
+                .unwrap()
+                .importance
+        };
+        let matrices = importance_of_block0(ck.weight_matrices_by_name());
+        assert!((matrices - 2.0 / 3.0).abs() < 1e-6, "{matrices}");
+        let pooled = importance_of_block0(ck.tensors_by_name());
+        assert!((pooled - 0.99975).abs() < 1e-4, "{pooled}");
+    }
+
     #[test]
     fn parses_single_f32_tensor() {
         let data: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0]
@@ -496,7 +559,7 @@ mod tests {
             n_kv_heads: 4,
             dtype_bytes: 2,
         };
-        let rep = analyze(&g, &shape, 4, &ck, &AnalysisConfig::default());
+        let rep = analyze(&g, &shape, 4, &ck, &AnalysisConfig::default()).unwrap();
         let idx = g
             .layers
             .iter()

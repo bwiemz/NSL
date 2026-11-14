@@ -181,8 +181,11 @@ pub fn detect(decisions: &[LayerDecisions]) -> Vec<ConflictKind> {
     if decisions.len() > 1 {
         let shards_used = decisions.iter().any(|d| d.shard_factor > 1);
         if shards_used {
-            let first = decisions[0].head_count;
-            for d in decisions.iter().skip(1) {
+            // Layers with no attention (head_count 0) have no head count to
+            // differ by; the comparison is among the layers that have one.
+            let mut with_heads = decisions.iter().filter(|d| d.head_count > 0);
+            let first = with_heads.next().map_or(0, |d| d.head_count);
+            for d in with_heads {
                 if d.head_count != first {
                     out.push(ConflictKind::CepVsCpdt {
                         layer: d.layer,

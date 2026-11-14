@@ -256,6 +256,7 @@ pub mod layerwise;
 pub mod parameter_plan;
 pub mod transient_arena;
 pub mod wggo_ilp;
+pub mod wggo_model_shape;
 pub mod wggo_overrides;
 pub mod wggo_prepass;
 pub mod wggo_prune;
