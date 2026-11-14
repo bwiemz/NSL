@@ -512,12 +512,12 @@ fn the_device_comparison_catches_wrong_results() {
 /// gradients, and training carried on. The launch is made to fail here by
 /// asking the (valid) module for an entry it does not have. The call exits
 /// the process, so it runs in a child: this test re-runs itself with
-/// `NSL_KLCE_FAILED_LAUNCH_CHILD` set and reads the child's exit status,
+/// `KLCE_TEST_FAILED_LAUNCH_CHILD` set and reads the child's exit status,
 /// which must be the runtime's CUDA-driver code, 13.
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn a_failed_launch_exits_instead_of_returning() {
-    const CHILD: &str = "NSL_KLCE_FAILED_LAUNCH_CHILD";
+    const CHILD: &str = "KLCE_TEST_FAILED_LAUNCH_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let out = std::process::Command::new(std::env::current_exe().expect("test binary path"))
             .args(["--ignored", "--exact", "a_failed_launch_exits_instead_of_returning", "--nocapture"])

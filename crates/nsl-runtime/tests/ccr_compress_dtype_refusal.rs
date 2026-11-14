@@ -98,7 +98,7 @@ fn an_f32_activation_compresses_to_bf16_and_restores_to_f32() {
     }
 }
 
-const SCENARIO: &str = "NSL_CCR_COMPRESS_SCENARIO";
+const SCENARIO: &str = "CCR_TEST_COMPRESS_SCENARIO";
 
 /// One compress call per scenario. Returns immediately unless the parent set
 /// the scenario; is expected to EXIT inside the call.
