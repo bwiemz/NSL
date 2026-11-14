@@ -122,7 +122,7 @@ Wengert list construction and adjoint rules (M40a); source extraction and backwa
 Prefill/decode worker separation; KV transfer abstraction; NVLink, RDMA, and TCP backends (M41b, 2026-03-26, unreleased).
 
 ### M42 -- KV-cache compression (Shipped v0.5, 2026-03-18)
-INT8/INT4/FP8 KV compression; sliding-window eviction; H2O token-importance eviction policy.
+INT8/INT4/FP8 KV block quantizers (runtime library; the KV cache does not use them and `@kv_compress` is refused). The sliding-window and H2O eviction managers shipped here had no caller and were removed in 2026-11.
 
 ### M43 -- Pipeline parallelism (Shipped v0.7, 2026-03-18)
 1F1B and GPipe micro-batch scheduling; 3D rank mapping (tensor x pipeline x data); ZeRO-style gradient sharding.

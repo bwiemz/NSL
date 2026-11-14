@@ -84,7 +84,7 @@ Core inference milestones shipped in v0.2.0, with later auditing showing M30-M31
 | Milestone | Feature | Status | Notes |
 |-----------|---------|--------|-------|
 | M41 | Disaggregated Inference | Functional | Router, KV transfer (KVXF format), **real prefill/decode worker loops**, NVLink/TCP transport backends, auto-detection, CUDA IPC GPU-direct, PCI bus scan; RDMA backend currently falls back to TCP until ibverbs is wired |
-| M42 | KV Compression | Library only | INT8/INT4/FP8 block quantizers, H2O and sliding-window eviction managers exist as runtime routines. The paged KV cache stores K and V uncompressed and calls none of them; `@kv_compress` is refused |
+| M42 | KV Compression | Library only | INT8/INT4/FP8 block quantizers exist as runtime routines. The paged KV cache stores K and V uncompressed and calls none of them; `@kv_compress` is refused. The H2O and sliding-window eviction managers had no caller and were removed |
 | M43 | Pipeline Parallelism | **Functional** | Config parsed, 1F1B/GPipe schedules, SharedMemPipeline backend with mailbox pattern, condvar signaling |
 | M44 | Constrained Decoding | Functional | Thompson NFA → DFA → Hopcroft minimize, token alignment, logit masking |
 
