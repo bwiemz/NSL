@@ -391,12 +391,65 @@ impl<'a> TypeChecker<'a> {
         );
     }
 
+    /// `fused_kl_ce(..., alpha, temperature)`: where the two weights are
+    /// numeric literals they have a range, whatever block the call is in.
+    /// `alpha` weights the hard-label cross-entropy and `1 - alpha` the KL
+    /// term, so outside [0, 1] one of them is negative; the logits are
+    /// divided by `temperature`. A distill block's `loss:` section checked
+    /// these only when it restated them, so `fused_kl_ce(..., 1.7, 0.0)`
+    /// passed. A function of that name declared in this module is the
+    /// user's own and is left alone.
+    fn check_kl_ce_literals(&mut self, callee: &Expr, args: &[Arg]) {
+        let ExprKind::Ident(sym) = &callee.kind else {
+            return;
+        };
+        if args.len() != 9
+            || self.call_param_names.contains_key(&(None, *sym))
+            || self.resolve_name(*sym) != "fused_kl_ce"
+        {
+            return;
+        }
+        fn literal(e: &Expr) -> Option<f64> {
+            match &e.kind {
+                ExprKind::FloatLiteral(v) => Some(*v),
+                ExprKind::IntLiteral(v) => Some(*v as f64),
+                ExprKind::Paren(inner) => literal(inner),
+                ExprKind::UnaryOp { op: nsl_ast::operator::UnaryOp::Neg, operand } => {
+                    literal(operand).map(|v| -v)
+                }
+                _ => None,
+            }
+        }
+        if let Some(alpha) = literal(&args[7].value)
+            && !(0.0..=1.0).contains(&alpha)
+        {
+            self.diagnostics.push(
+                Diagnostic::error(format!("fused_kl_ce: alpha = {alpha} is outside [0, 1]"))
+                    .with_label(
+                        args[7].value.span,
+                        "alpha weights the cross-entropy and 1 - alpha the KL term",
+                    ),
+            );
+        }
+        if let Some(temperature) = literal(&args[8].value)
+            && temperature <= 0.0
+        {
+            self.diagnostics.push(
+                Diagnostic::error(format!(
+                    "fused_kl_ce: temperature = {temperature} is not positive"
+                ))
+                .with_label(args[8].value.span, "the logits are divided by the temperature"),
+            );
+        }
+    }
+
     pub(crate) fn check_call(&mut self, callee: &Expr, args: &[Arg], span: Span) -> Type {
         let callee_ty = self.check_expr(callee);
 
         // Check each argument
         let arg_types: Vec<Type> = args.iter().map(|a| self.check_expr(&a.value)).collect();
         self.check_named_argument_order(callee, args);
+        self.check_kl_ce_literals(callee, args);
 
         // C5 step 5: moving a tensor, or a model holding one, to a device
         // that cannot hold its dtype is a compile error, not the runtime

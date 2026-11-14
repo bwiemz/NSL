@@ -6,6 +6,8 @@
 # composite KD-proxy loss (hard CE + logit-matching MSE) built entirely
 # from source-AD-recognized primitives so this fixture exercises Phase A
 # (frontend + frozen-teacher lowering) without the fused KL-CE kernel.
+# There is no `loss:` section: its alpha/temperature describe a
+# `fused_kl_ce(...)` call, and a section no such call consumes is refused.
 #
 # Shapes are tiny on purpose: V=64, H=32, rows=16 (2-D data — the CPU
 # cross_entropy gather path requires flattened [rows, V] logits).
@@ -31,9 +33,6 @@ let targets = zeros([16])
 
 distill(teacher = teacher, student = student, epochs = 1):
     optimizer: AdamW(lr = 0.001)
-    loss:
-        alpha = 0.5
-        temperature = 2.0
     step(batch):
         let t_logits = teacher.forward(x)
         let s_logits = student.forward(x)

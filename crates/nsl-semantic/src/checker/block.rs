@@ -416,30 +416,19 @@ impl<'a> TypeChecker<'a> {
                         .with_label(entry.value.span, "expected positive numeric literal"),
                     ),
                 },
-                "feature_weight" => match entry.value.kind {
-                    ExprKind::FloatLiteral(v) if v >= 0.0 => {}
-                    ExprKind::IntLiteral(v) if v >= 0 => {}
-                    _ => self.diagnostics.push(
-                        Diagnostic::error(
-                            "distill loss feature_weight must be a non-negative literal in v1",
-                        )
-                        .with_label(entry.value.span, "expected non-negative numeric literal"),
-                    ),
-                },
-                "feature_layers" => match &entry.value.kind {
-                    ExprKind::StringLiteral(s) if s == "auto" => {}
-                    ExprKind::ListLiteral(items)
-                        if items
-                            .iter()
-                            .all(|e| matches!(e.kind, ExprKind::IntLiteral(_))) => {}
-                    _ => self.diagnostics.push(
-                        Diagnostic::error(
-                            "distill loss feature_layers must be \"auto\" or a list of \
-                             integer literals in v1",
-                        )
-                        .with_label(entry.value.span, "expected \"auto\" or [int, ...]"),
-                    ),
-                },
+                // Feature matching does not exist: nothing lowers a
+                // feature loss, picks layers for one, or weights it. These
+                // two keys used to be range-checked, echoed in the build
+                // report and otherwise ignored. A user who wants a feature
+                // loss writes it in the step body, with its own weight.
+                "feature_weight" | "feature_layers" => self.diagnostics.push(
+                    Diagnostic::error(format!(
+                        "distill loss key `{key}` is not supported: feature matching is \
+                         not implemented, so the key would have no effect. Remove it; \
+                         a feature loss can be written in the step body."
+                    ))
+                    .with_label(entry.span, "unsupported loss config key"),
+                ),
                 "attn_transfer" => match entry.value.kind {
                     ExprKind::BoolLiteral(false) => {}
                     ExprKind::BoolLiteral(true) => self.diagnostics.push(
