@@ -2,12 +2,17 @@
 # ============================================================================
 # GRPO Training Loop — Group Relative Policy Optimization
 # ============================================================================
-# The three-phase training pipeline:
+# The three-phase training pipeline, as designed:
 #   Phase 1: SFT on existing NSL code (warm up the model)
 #   Phase 2: Rejection sampling (filter by compiler, retrain on winners)
 #   Phase 3: GRPO with compiler-as-reward-model
 #
-# This file defines the GRPO phase. Phases 1-2 use the standard train block.
+# Only Phase 1 exists. This file runs it (the same supervised fine-tuning
+# as train_sft.nsl, at batch size 8) and then describes Phases 2 and 3 in
+# comments; nothing in this repository implements them yet.
+#
+# Run from the repository root, like train_sft.nsl:
+#   cargo run --release --features cuda -- run --source-ad models/coder-rl/train_grpo.nsl
 
 from model import NSLCoderRL
 from nsl.nn.losses import cross_entropy
@@ -24,16 +29,27 @@ print("================================================================")
 let m = NSLCoderRL()
 print("Model created")
 
-# SFT data: pre-tokenized NSL corpus + synthetic task-code pairs
-let sft_tokens = load_mmap("data/sft_tokens.bin", 3)
-let sft_labels = load_mmap("data/sft_labels.bin", 2)
+# SFT data: the corpus train_sft.nsl uses (172 sequences of 2048 tokens,
+# written by data/prepare_sft.py; not checked in).
+let sft_tokens = load_mmap("models/coder-rl/data/sft_tokens.bin", 3)
+let sft_labels = load_mmap("models/coder-rl/data/sft_labels.bin", 2)
 let sft_loader = DataLoader(sft_tokens, labels=sft_labels, batch_size=8, seq_len=2048, shuffle=true, drop_last=true)
 
+# The schedule is sized to the run: 172 sequences at batch 8 with
+# drop_last is 21 steps per epoch, 210 steps over 10 epochs. Warm-up is 10
+# steps (the same ~5% of the run as train_sft.nsl's 40 of 860) and the
+# cosine reaches min_lr on the last step. It used to be warmup_steps=100,
+# total_steps=1000: warm-up took 48% of the run and the rate never fell
+# below ~2.9e-4 of 3e-4. If the corpus changes, recompute both numbers.
+#
+# As in train_sft.nsl, and for the reason given there (the aim is to
+# memorise a tiny corpus), there is no weight decay and dropout is off
+# (`forward_train(..., false)`).
 train(model=m, epochs=10):
-    optimizer: AdamW(lr=0.0003, weight_decay=0.01)
-    scheduler: warmup_cosine(warmup_steps=100, total_steps=1000, min_lr=0.00003)
+    optimizer: AdamW(lr=0.0003, weight_decay=0.0)
+    scheduler: warmup_cosine(warmup_steps=10, total_steps=210, min_lr=0.00003)
     step(batch):
-        let logits = m.forward_train(batch.input_ids, true)
+        let logits = m.forward_train(batch.input_ids, false)
         let ls = logits.shape
         let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
         let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
@@ -47,28 +63,22 @@ train(model=m, epochs=10):
             print("SFT Epoch complete:")
             print(epoch)
             print(loss)
-            model_save(m, "checkpoints/coder_rl_sft.nslm")
+            model_save(m, "models/coder-rl/checkpoints/coder_rl_sft.nslm")
 
 print("SFT complete!")
-model_save(m, "checkpoints/coder_rl_sft_final.nslm")
+model_save(m, "models/coder-rl/checkpoints/coder_rl_sft_final.nslm")
 
-# ─── Phase 3: GRPO ───
-# Note: Phase 2 (rejection sampling) runs as a separate script that
-# generates completions, filters by compiler, and prepares a new dataset.
-# Phase 3 is the main RL loop.
+# ─── Phases 2 and 3: not implemented ───
+# Phase 2 (rejection sampling) would generate completions, filter them by
+# the compiler, and prepare a new dataset. Phase 3 is the RL loop.
 #
-# The GRPO loop cannot be expressed as a standard train block because:
+# GRPO cannot be expressed as a standard train block because:
 # 1. It generates K candidates per prompt (requires sampling, not teacher forcing)
 # 2. The reward comes from the compiler, not from a loss function
 # 3. The policy gradient update uses advantages, not cross-entropy
 #
-# Instead, GRPO is implemented as a custom training loop in the
-# reward server (Rust), which calls the model's forward pass via FFI
-# and computes the GRPO gradient update externally.
-#
-# See: docs/plans/2026-03-28-nsl-coder-rl-design.md Section 5 for details.
-#
-# The reward server architecture:
+# The design (docs/plans/2026-03-28-nsl-coder-rl-design.md, Section 5) puts
+# the loop in a separate "reward server" that would:
 #   1. Load the SFT checkpoint
 #   2. For each training step:
 #      a. Sample a task from the task generator
@@ -79,19 +89,19 @@ model_save(m, "checkpoints/coder_rl_sft_final.nslm")
 #      f. Backward + optimizer step
 #   3. Save checkpoint every 100 steps
 #
-# This requires the NSL model to support:
-#   - Autoregressive generation (token-by-token sampling)
-#   - Per-token log-probability computation (for policy gradient)
-#   - KL divergence against a frozen reference model
-#
-# These are already available via:
-#   - nsl.inference.generate (M19)
-#   - cross_entropy per-token (no reduction)
-#   - A frozen copy of the SFT model for KL reference
+# None of that exists in this repository: there is no reward server, no
+# rejection-sampling script, and reward.nsl and tasks.nsl hold constants
+# and comments only. What the loop needs from NSL, and where each stands:
+#   - Autoregressive generation: available (nsl.inference.generate).
+#   - Per-token log-probabilities: NOT available. The standard library's
+#     cross_entropy returns the mean over valid positions and has no
+#     unreduced mode.
+#   - KL against a frozen reference model: not available as a library
+#     function; a frozen model exists only as the teacher of a distill
+#     block.
 
 print("================================================================")
-print("  Training pipeline defined.")
-print("  Phase 1: SFT (this script)")
-print("  Phase 2: Rejection sampling (run collect_rejections.nsl)")
-print("  Phase 3: GRPO (run grpo_server)")
+print("  Phase 1 (SFT) complete.")
+print("  Phase 2 (rejection sampling) and Phase 3 (GRPO) are not")
+print("  implemented; see the comments at the end of this script.")
 print("================================================================")

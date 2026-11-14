@@ -2,21 +2,31 @@
 # ============================================================================
 # GRPO Reward Function — Compiler-as-Reward-Model
 # ============================================================================
-# Scores generated NSL code through the 5-stage compilation pipeline.
-# Returns a scalar reward in [0.0, 1.0] plus the error string for retry.
+# The reward ladder a GRPO loop would score generated NSL code with: a
+# scalar in [0.0, 1.0] from how far the code gets through the compiler.
 #
-# Stage 1: Parse          → 0.0 (fail) / 0.2 (pass)
+# Stage 1: Parse           → 0.0 (fail) / 0.2 (pass)
 # Stage 2: Semantic check  → 0.4
-# Stage 3: Shape check    → 0.6
-# Stage 4: Full compile   → 0.8
-# Stage 5: Execute + test → 1.0
+# Stage 3: Shape check     → 0.6
+# Stage 4: Full compile    → 0.8
+# Stage 5: Execute         → 0.85 (ran without error)
+#          Execute + test  → 1.0  (the task's test passed)
+# Partial credit below Stage 1: 0.02 per statement that parsed before the
+# first parse error, up to 0.15.
 #
-# This module is called from the GRPO training loop.
-# It shells out to `nsl check` and `nsl run` as subprocesses.
-
-# ─── Reward computation ───
-# In a real implementation, these would call the NSL CLI as subprocesses.
-# For now, we define the reward structure and scoring logic.
+# NOTHING RUNS THIS LADDER. This file is constants and comments; there is
+# no scoring function, no GRPO loop and no reward server in the repository.
+# A real implementation would run `nsl check` and `nsl run` on the
+# generated code as subprocesses, with time and memory limits.
+#
+# KNOWN WEAKNESS, to settle before anything uses these numbers: the
+# compiler checks that code is valid, not that it does what the prompt
+# asked. A valid program that ignores the prompt earns 0.85 on a task with
+# no test and 0.8 on a task whose test it fails, while an honest attempt
+# that does not compile earns at most 0.6; and the partial credit pays for
+# statements, not for progress on the task. A policy trained on this ladder
+# as written is rewarded for emitting any valid program. Rewards above the
+# compile level should require a passing task test.
 
 const REWARD_PARSE_FAIL = 0.0
 const REWARD_PARSE_OK = 0.2
