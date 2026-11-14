@@ -309,9 +309,11 @@ pub fn plan(cfg: &FaseConfig) -> FasePlan {
     // the clip factor before the fused step. A FullBuffer-global plan
     // (Lion/Unknown/allow_v_approx=false) has no m_partial convention to
     // norm over, and its optimizer step is the stdlib per-param call — so
-    // it keeps the legacy pre-FASE clipping (per-micro-batch
-    // nsl_clip_grad_norm on grads_list) with the FULL standard accumulation
-    // loop. Tagging it FinalTwoPhase used to make stmt.rs skip the standard
+    // it runs the FULL standard accumulation loop and clips once, with
+    // nsl_clip_grad_norm on the accumulated window-mean buffers at the top
+    // of the optimizer block (`optimizer_step.rs`; the per-micro-batch clip
+    // in the driver runs only when there is no accumulation). Tagging it
+    // FinalTwoPhase used to make stmt.rs skip the standard
     // accumulation on the stepping micro-batch while no Phase A existed to
     // recover it — silently dropping the final micro-batch's gradients.
     let two_phase = cfg.grad_clip.is_some() && mode == FaseMode::Deferred;
