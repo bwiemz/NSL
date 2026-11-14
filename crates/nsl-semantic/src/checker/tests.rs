@@ -1624,24 +1624,61 @@ let m = MyModel()
     assert_eq!(cfg.alpha, None, "absent alpha stays None; codegen defaults to rank");
 }
 
+/// `mode=hybrid` (the compiler places adapters inside `layers=[...]`) and a
+/// `layers=` scope under any other mode are refused: nothing places an
+/// adapter automatically, so both used to be accepted and change nothing.
 #[test]
-fn wrga_hybrid_without_layers_errors() {
-    let src = r#"
-@wrga(mode=hybrid)
+fn wrga_hybrid_mode_and_its_layer_scope_are_refused() {
+    for (decorator, needle) in [
+        ("@wrga(mode=hybrid)", "mode=hybrid) is not supported"),
+        ("@wrga(mode=hybrid, layers=[\"blocks.6\"])", "mode=hybrid) is not supported"),
+        ("@wrga(mode=manual, layers=[\"blocks.6\"])", "`layers=` is the scope of mode=hybrid"),
+        ("@wrga(layers=[\"blocks.6\"])", "`layers=` is the scope of mode=hybrid"),
+    ] {
+        let src = format!(
+            r#"
+{decorator}
 model Toy:
     layer lin: Linear<16, 16>
 
     fn forward(self, x: Tensor<[4, 16], f32>) -> Tensor<[4, 16], f32>:
         return self.lin(x)
-"#;
-    let res = analyze_source(src);
-    assert!(
-        res.diagnostics
-            .iter()
-            .any(|d| format!("{:?}", d).contains("hybrid) requires a `layers=")),
-        "expected hybrid-mode layer-scope error, got: {:?}",
-        res.diagnostics
-    );
+"#
+        );
+        let res = analyze_source(&src);
+        assert!(
+            res.diagnostics.iter().any(|d| format!("{:?}", d).contains(needle)),
+            "{decorator}: expected `{needle}`, got: {:?}",
+            res.diagnostics
+        );
+    }
+    // The modes that mean something are accepted.
+    for decorator in ["@wrga(mode=auto)", "@wrga(mode=manual)", "@wrga"] {
+        let src = format!("\n{decorator}\nlet m = MyModel()\n");
+        let res = analyze_source(&src);
+        assert!(
+            !res.diagnostics.iter().any(|d| format!("{:?}", d).contains("@wrga")),
+            "{decorator} should be accepted, got: {:?}",
+            res.diagnostics
+        );
+    }
+}
+
+/// `target=` is carried as text, whether written as an identifier or as a
+/// string. A string used to store the argument's own name, "target".
+#[test]
+fn wrga_target_is_the_name_written_as_identifier_or_string() {
+    for decorator in ["@wrga(target=h100)", "@wrga(target=\"h100\")"] {
+        let src = format!("\n{decorator}\nlet m = MyModel()\n");
+        let res = analyze_source(&src);
+        assert_eq!(
+            res.wrga_configs[0].target_name.as_deref(),
+            Some("h100"),
+            "{decorator}"
+        );
+    }
+    let res = analyze_source("\n@wrga\nlet m = MyModel()\n");
+    assert_eq!(res.wrga_configs[0].target_name, None);
 }
 
 #[test]

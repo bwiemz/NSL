@@ -23,6 +23,17 @@ use nsl_errors::Diagnostic;
 /// `nsl-codegen`.
 const WRGA_MAX_ADAPTER_RANK: i64 = 16;
 
+/// Whether `name` is one of the tensors an `@adapter` adds to a model:
+/// `lora_A_<site>`, `lora_B_<site>`, `ia3_scale_<site>` or `gate_<site>`.
+/// Codegen reads these from the model's adapter side-table
+/// (`nsl-codegen`'s `is_synthesized_adapter_field_name`, the same four
+/// prefixes); they are not declared fields.
+pub fn is_adapter_tensor_name(name: &str) -> bool {
+    ["lora_A_", "lora_B_", "ia3_scale_", "gate_"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
 /// Validated `@wrga(...)` configuration.
 #[derive(Debug, Clone)]
 pub struct WrgaConfig {
@@ -33,15 +44,23 @@ pub struct WrgaConfig {
     /// to pass the adapter name through.  `None` when `block.adapter`
     /// is `None`.
     pub adapter_name: Option<String>,
+    /// The `target=` argument as text: the identifier's name
+    /// (`target=h100`) or the string's value (`target="h100"`). The codegen
+    /// bridge passes it on as the GPU the analysis runs for.
+    pub target_name: Option<String>,
 }
 
 /// Validate a single `@wrga(...)` decorator.
 ///
 /// Accepted arguments:
-/// * `mode = auto | manual | hybrid`   (default: `auto`)
-/// * `budget = <int>`                  (optional; total adapter parameter cap)
-/// * `target = <identifier>`           (optional; GPU name)
-/// * `layers = ["blocks.6", ...]`      (optional; hybrid-mode layer scope)
+/// * `mode = auto | manual`            (default: `auto`). The two behave
+///   alike: adapters are the ones `@adapter` declares and `@freeze` decides
+///   what trains. `mode = hybrid`, which asks the compiler to place adapters
+///   inside a `layers=[...]` scope, is refused: nothing places an adapter
+///   automatically, so the mode used to be accepted and change nothing.
+/// * `budget = <int>`                  (optional; cap on the parameters the
+///   declared adapters may hold, enforced at compile time)
+/// * `target = <identifier or string>` (optional; GPU name)
 /// * `adapter = <identifier>`          (optional; WRGA paper §8.2 — name of a
 ///   user-defined adapter model, e.g. `adapter=GatedLoRA`)
 pub fn validate_wrga_decorator(
@@ -52,6 +71,7 @@ pub fn validate_wrga_decorator(
     let mut mode = WrgaMode::Auto;
     let mut budget: Option<i64> = None;
     let mut target: Option<Symbol> = None;
+    let mut target_name: Option<String> = None;
     let mut layers: Vec<String> = Vec::new();
     let mut adapter: Option<Symbol> = None;
 
@@ -99,14 +119,18 @@ pub fn validate_wrga_decorator(
                     ),
                 },
                 "target" => match &arg.value.kind {
-                    ExprKind::Ident(sym) => target = Some(*sym),
-                    ExprKind::StringLiteral(_) => {
-                        // Allowed but we prefer an ident.  Don't error.
-                        target = Some(*name_sym);
+                    ExprKind::Ident(sym) => {
+                        target = Some(*sym);
+                        target_name = Some(resolve_sym(*sym));
                     }
+                    // A string names the GPU as well. (This arm used to store
+                    // the ARGUMENT's name, so `target="h100"` asked for a GPU
+                    // called "target".)
+                    ExprKind::StringLiteral(s) => target_name = Some(s.clone()),
                     _ => diagnostics.push(
                         Diagnostic::error(
-                            "@wrga: target must be an identifier (e.g. h100, rtx5070ti)"
+                            "@wrga: target must be an identifier or a string (e.g. h100, \
+                             \"rtx5070ti\")"
                                 .to_string(),
                         )
                         .with_label(arg.span, "expected ident"),
@@ -154,28 +178,29 @@ pub fn validate_wrga_decorator(
         }
     }
 
-    // Cross-field validation:
-    //   - hybrid mode needs at least one layer
-    //   - manual mode should not be paired with `layers`
-    match mode {
-        WrgaMode::Hybrid if layers.is_empty() => {
-            diagnostics.push(
-                Diagnostic::error(
-                    "@wrga(mode=hybrid) requires a `layers=[...]` argument".to_string(),
-                )
-                .with_label(deco.span, "missing layer scope"),
-            );
-        }
-        WrgaMode::Manual if !layers.is_empty() => {
-            diagnostics.push(
-                Diagnostic::error(
-                    "@wrga(mode=manual) ignores `layers=...`; use @adapter(target=...) instead"
-                        .to_string(),
-                )
-                .with_label(deco.span, "layers ignored in manual mode"),
-            );
-        }
-        _ => {}
+    // `mode=hybrid` and its `layers=` scope ask for something that does not
+    // exist: the compiler choosing where adapters go. They used to be
+    // accepted and to change nothing about what was adapted or trained.
+    if mode == WrgaMode::Hybrid {
+        diagnostics.push(
+            Diagnostic::error(
+                "@wrga(mode=hybrid) is not supported: it asks the compiler to place adapters \
+                 within `layers=[...]`, and no adapter is placed automatically. Declare each \
+                 adapter with @adapter(target=[\"Class.field\"]) and freeze the rest with \
+                 @freeze"
+                    .to_string(),
+            )
+            .with_label(deco.span, "unsupported mode"),
+        );
+    } else if !layers.is_empty() {
+        diagnostics.push(
+            Diagnostic::error(
+                "@wrga: `layers=` is the scope of mode=hybrid, which is not supported; \
+                 name the weights to adapt with @adapter(target=[\"Class.field\"])"
+                    .to_string(),
+            )
+            .with_label(deco.span, "unsupported argument"),
+        );
     }
 
     let adapter_name = adapter.map(resolve_sym);
@@ -189,6 +214,7 @@ pub fn validate_wrga_decorator(
             span: deco.span,
         },
         adapter_name,
+        target_name,
     })
 }
 
@@ -289,11 +315,12 @@ pub fn validate_freeze_decorator(
 pub struct AdapterConfig {
     pub kind: AdapterKind,
     pub targets: Vec<String>,
-    /// Explicit rank override; if `None`, WRGA picks the rank via roofline
-    /// + spectral analysis.
+    /// The declared `rank=`. `None` means the default rank, 2: no analysis
+    /// chooses a rank (the spectral figures of `--wrga-report` size nothing).
     pub rank: Option<i64>,
-    /// LoRA scaling: `scale = alpha / rank`.  `None` → codegen uses
-    /// `alpha = rank` (scale = 1.0).  Ignored for non-LoRA adapters.
+    /// LoRA and gated-LoRA scaling: `scale = alpha / rank`.  `None` →
+    /// codegen uses `alpha = rank` (scale = 1.0).  IA³ has no such factor
+    /// and ignores it.
     pub alpha: Option<i64>,
     pub span: Span,
 }
@@ -462,10 +489,14 @@ pub fn validate_adapter_decorator(
             .with_label(deco.span, "missing target"),
         );
     }
-    if alpha.is_some() && !matches!(kind, AdapterKind::Lora) {
+    // Gated LoRA scales its update by `alpha / rank` exactly as LoRA does;
+    // only IA³, a per-channel multiplier, has nothing for alpha to scale.
+    // (The warning used to name gated LoRA too, which was false.)
+    if alpha.is_some() && matches!(kind, AdapterKind::Ia3) {
         diagnostics.push(
             Diagnostic::warning(
-                "@adapter: alpha is only meaningful for LoRA; ignored for ia3/gatedlora"
+                "@adapter: alpha scales a LoRA or gated-LoRA update; ia3 has no such factor \
+                 and ignores it"
                     .to_string(),
             )
             .with_label(deco.span, "alpha ignored"),
