@@ -955,26 +955,12 @@ pub extern "C" fn nsl_cross_entropy_backward(
 // 5d. nsl_mse_backward — MSE gradient: grad_output * 2 * (pred - target) / N
 // ---------------------------------------------------------------------------
 
-/// Compute the MSE loss backward gradient w.r.t. `pred`.
+/// The scalar upstream adjoint of a loss, read on the host.
 ///
-/// Forward:  `loss = mean((pred - target)^2)`   (scalar over all N = numel(pred))
-/// Backward: `d(loss)/d(pred_i) = (2/N) * (pred_i - target_i) * grad_output`
-///
-/// `grad_output` is the upstream adjoint of `loss`. Because MSE's output is a
-/// scalar, `grad_output` is always a 0-dim / 1-element tensor — we fold its
-/// value directly into the `mul_scalar` factor to sidestep
-/// `gpu_elementwise_binary`, which is element-count-matched and would
-/// silently misfire on a scalar × n-dim multiply.
-#[unsafe(no_mangle)]
-pub extern "C" fn nsl_mse_backward(
-    grad_output_ptr: i64,
-    pred_ptr: i64,
-    target_ptr: i64,
-) -> i64 {
-    let pred = NslTensor::from_ptr_ref(pred_ptr);
-    if pred.len <= 0 {
-        return super::nsl_tensor_clone(pred_ptr);
-    }
+/// `mse_loss` and `l1_loss` return a scalar, so their `grad_output` is a
+/// 0-dim / 1-element tensor. Its value is folded into a `mul_scalar` factor
+/// rather than multiplied in as a tensor.
+fn scalar_grad_output(grad_output_ptr: i64, who: &str) -> f64 {
     let grad_out_cpu = if NslTensor::from_ptr_ref(grad_output_ptr).device > 0 {
         nsl_tensor_to_device(grad_output_ptr, 0)
     } else {
@@ -987,9 +973,9 @@ pub extern "C" fn nsl_mse_backward(
             _ => unsafe { *go.data_f64() },
         }
     } else {
-        // Non-scalar grad_output is not expected for a scalar MSE loss; log
-        // and fall back to 1.0 rather than corrupting the gradient silently.
-        crate::nsl_log!(WARN, "nsl", "nsl: nsl_mse_backward expected a scalar grad_output, got len={}; defaulting multiplier to 1.0",
+        // Non-scalar grad_output is not expected for a scalar loss; log and
+        // fall back to 1.0 rather than corrupting the gradient silently.
+        crate::nsl_log!(WARN, "nsl", "nsl: {who} expected a scalar grad_output, got len={}; defaulting multiplier to 1.0",
             go.len
         );
         1.0
@@ -997,8 +983,34 @@ pub extern "C" fn nsl_mse_backward(
     if grad_out_cpu != grad_output_ptr {
         nsl_tensor_free(grad_out_cpu);
     }
-    let factor = (2.0_f64 * go_scalar) / pred.len as f64;
+    go_scalar
+}
+
+/// Compute the MSE loss backward gradient w.r.t. the difference
+/// `pred - target`, in the BROADCAST shape of the two.
+///
+/// Forward:  `loss = mean((pred - target)^2)`, a scalar over all
+///           `N = numel(broadcast(pred, target))` elements.
+/// Backward: `d(loss)/d(diff_i) = (2/N) * diff_i * grad_output`
+///
+/// `N` is the element count of the difference, not of `pred`: with
+/// `pred: [3]` and `target: [2, 3]` the mean is over six elements. The
+/// result has the broadcast shape; the caller sums it down to the shape of
+/// whichever operand it differentiates (`reduce_to_shape`), negating it for
+/// `target`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nsl_mse_backward(
+    grad_output_ptr: i64,
+    pred_ptr: i64,
+    target_ptr: i64,
+) -> i64 {
     let diff = super::arithmetic::nsl_tensor_sub(pred_ptr, target_ptr, 0);
+    let n = NslTensor::from_ptr_ref(diff).len;
+    if n <= 0 {
+        return diff;
+    }
+    let go_scalar = scalar_grad_output(grad_output_ptr, "nsl_mse_backward");
+    let factor = (2.0_f64 * go_scalar) / n as f64;
     super::arithmetic::nsl_tensor_mul_scalar(diff, factor, super::fbip_flags::RELINQUISH_A)
 }
 
@@ -1006,141 +1018,34 @@ pub extern "C" fn nsl_mse_backward(
 // 5e. nsl_l1_backward — L1 gradient: grad_output * sign(pred - target) / N
 // ---------------------------------------------------------------------------
 
-/// Compute the L1 loss backward gradient w.r.t. `pred`.
+/// Compute the L1 loss backward gradient w.r.t. the difference
+/// `pred - target`, in the BROADCAST shape of the two.
 ///
-/// Forward:  `loss = mean(|pred - target|)`   (scalar over all N = numel(pred))
-/// Backward: `d(loss)/d(pred_i) = (1/N) * sign(pred_i - target_i) * grad_output`
+/// Forward:  `loss = mean(|pred - target|)`, a scalar over all
+///           `N = numel(broadcast(pred, target))` elements.
+/// Backward: `d(loss)/d(diff_i) = (1/N) * sign(diff_i) * grad_output`
 ///
-/// Mirrors `nsl_mse_backward`'s scalar-folding discipline: `grad_output` is the
-/// upstream adjoint of the scalar loss, so we read its one element and bake it
-/// into a per-element factor rather than risking the non-broadcasting GPU
-/// `gpu_elementwise_binary` path with a 0-dim × n-dim multiply.
-///
-/// The computation runs on CPU then publishes back to the input device, same
-/// pattern as `nsl_cross_entropy_backward`.
+/// The difference is formed with `nsl_tensor_sub`, so the operands broadcast
+/// exactly as they do in the forward. (This used to walk `pred` and `target`
+/// with one index up to `numel(pred)`, which read past the end of a smaller
+/// `target` and divided by the wrong `N` whenever the shapes differed.) The
+/// caller sums the result down to the operand it differentiates.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_l1_backward(
     grad_output_ptr: i64,
     pred_ptr: i64,
     target_ptr: i64,
 ) -> i64 {
-    let pred_hdr = NslTensor::from_ptr(pred_ptr);
-    if pred_hdr.len <= 0 {
-        return super::nsl_tensor_clone(pred_ptr);
+    let diff = super::arithmetic::nsl_tensor_sub(pred_ptr, target_ptr, 0);
+    let n = NslTensor::from_ptr_ref(diff).len;
+    if n <= 0 {
+        return diff;
     }
-    let out_device = pred_hdr.device;
-    let n = pred_hdr.len as usize;
-
-    // Pull grad_output to CPU to read its scalar value.
-    let grad_out_cpu = if NslTensor::from_ptr(grad_output_ptr).device > 0 {
-        nsl_tensor_to_device(grad_output_ptr, 0)
-    } else {
-        grad_output_ptr
-    };
-    let go_tensor = NslTensor::from_ptr(grad_out_cpu);
-    let go_scalar = if go_tensor.len == 1 {
-        match go_tensor.dtype {
-            1 => (unsafe { *go_tensor.data_f32() }) as f64,
-            _ => unsafe { *go_tensor.data_f64() },
-        }
-    } else {
-        crate::nsl_log!(WARN, "nsl", "nsl: nsl_l1_backward expected a scalar grad_output, got len={}; defaulting multiplier to 1.0",
-            go_tensor.len
-        );
-        1.0
-    };
-    if grad_out_cpu != grad_output_ptr {
-        nsl_tensor_free(grad_out_cpu);
-    }
+    let go_scalar = scalar_grad_output(grad_output_ptr, "nsl_l1_backward");
     let factor = go_scalar / n as f64;
-
-    // Pull pred/target to CPU for the sign comparison.
-    let pred_c = nsl_tensor_contiguous(pred_ptr);
-    let target_c = nsl_tensor_contiguous(target_ptr);
-    let (pred_cpu, pred_needs_free) = if NslTensor::from_ptr(pred_c).device > 0 {
-        (nsl_tensor_to_device(pred_c, 0), true)
-    } else {
-        (pred_c, false)
-    };
-    let (target_cpu, target_needs_free) = if NslTensor::from_ptr(target_c).device > 0 {
-        (nsl_tensor_to_device(target_c, 0), true)
-    } else {
-        (target_c, false)
-    };
-    let pred = NslTensor::from_ptr(pred_cpu);
-    let target = NslTensor::from_ptr(target_cpu);
-
-    // Branch on the CPU-RESIDENT dtype, not the original device dtype. They
-    // used to differ: the download widened device f32 to CPU f64, so a GPU
-    // f32 pred arrived here as f64 and reading it through data_f32() tripped
-    // the accessor assert (P5 fix). Since C5 step 2a the download keeps the
-    // tag, but a CPU caller can still pass f64. The output tensor is built
-    // with the same CPU dtype; publish converts back for the device as usual.
-    let cpu_dtype = pred.dtype;
-    let elem_size = if cpu_dtype == 1 {
-        std::mem::size_of::<f32>()
-    } else {
-        std::mem::size_of::<f64>()
-    };
-    let out_data = checked_alloc(n * elem_size);
-
-    if cpu_dtype == 1 {
-        let p = pred.data_f32();
-        let t = target.data_f32();
-        let d = out_data as *mut f32;
-        let f = factor as f32;
-        for i in 0..n {
-            let diff = unsafe { *p.add(i) - *t.add(i) };
-            let s = if diff > 0.0 {
-                1.0_f32
-            } else if diff < 0.0 {
-                -1.0_f32
-            } else {
-                0.0_f32
-            };
-            unsafe { *d.add(i) = s * f };
-        }
-    } else {
-        let p = pred.data_f64();
-        let t = target.data_f64();
-        let d = out_data as *mut f64;
-        for i in 0..n {
-            let diff = unsafe { *p.add(i) - *t.add(i) };
-            let s = if diff > 0.0 {
-                1.0_f64
-            } else if diff < 0.0 {
-                -1.0_f64
-            } else {
-                0.0_f64
-            };
-            unsafe { *d.add(i) = s * factor };
-        }
-    }
-
-    let ndim = pred.ndim;
-    let shape_ptr = NslTensor::copy_shape(pred.shape, ndim);
-    let strides_ptr = NslTensor::compute_strides(shape_ptr, ndim);
-    let result = Box::new(NslTensor::new(
-        out_data as *mut c_void,
-        shape_ptr,
-        strides_ptr,
-        ndim,
-        n as i64,
-        0,
-        cpu_dtype,
-        1,
-        0,
-    ));
-
-    if pred_needs_free {
-        nsl_tensor_free(pred_cpu);
-    }
-    if target_needs_free {
-        nsl_tensor_free(target_cpu);
-    }
-    nsl_tensor_free(pred_c);
-    nsl_tensor_free(target_c);
-    publish_cpu_result_to_device(result, out_device, "ad_l1_backward")
+    let sign = super::activation::nsl_tensor_sign(diff);
+    nsl_tensor_free(diff);
+    super::arithmetic::nsl_tensor_mul_scalar(sign, factor, super::fbip_flags::RELINQUISH_A)
 }
 
 // ---------------------------------------------------------------------------

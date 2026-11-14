@@ -1497,41 +1497,48 @@ impl AdjointGenerator {
                 vec![y_bar, logits, targets],
             ),
 
-            // --- MSE backward: d/d(pred_i) = grad_output * 2 * (pred_i - target_i) / N ---
-            // Forward `PrimalOp::MSELoss` lowers to a global `mean((pred-target)^2)`
-            // (scalar over all N=numel(pred)), so the /N factor must be applied here
-            // or the gradient is N× too large (was causing dO inflation in CSHA e2e).
-            // Delegated to `nsl_mse_backward` so `N` can be read at runtime from the
-            // pred tensor header without plumbing shape info through the Wengert list.
-            AdjointExpr::MSEBackward(y_bar, pred, target) => self.emit_op(
-                PrimalOp::Passthrough("mse_backward".into()),
-                vec![y_bar, pred, target],
-            ),
-
-            // --- L1 backward: d/d(pred_i) = grad_output * sign(pred_i - target_i) / N ---
-            // Same intercept pattern as MSE: the forward `PrimalOp::L1Loss` lowers to
-            // `mean(|pred - target|)` (global mean over N=numel(pred), scalar out), so
-            // backward must apply the /N factor or gradients come out N× too large.
-            // Delegated to `nsl_l1_backward` so N can be read at runtime from the
-            // pred tensor header without plumbing shape info through the Wengert list.
-            AdjointExpr::L1Backward(y_bar, pred, target) => self.emit_op(
-                PrimalOp::Passthrough("l1_backward".into()),
-                vec![y_bar, pred, target],
-            ),
-            AdjointExpr::MSETargetBackward(y_bar, pred, target) => {
-                let d_pred = self.emit_op(
+            // --- MSE backward: d/d(diff_i) = grad_output * 2 * diff_i / N ---
+            // Forward `PrimalOp::MSELoss` lowers to a global
+            // `mean((pred-target)^2)`, a scalar over the N elements of the
+            // BROADCAST difference. `nsl_mse_backward` returns the gradient
+            // with respect to that difference, in its broadcast shape, with
+            // N read at run time; each operand's adjoint is that gradient
+            // summed down to the operand's own shape (negated for `target`).
+            // Without the `reduce_to` on `pred`, a `pred` smaller than
+            // `target` received a gradient of the wrong shape, scaled by
+            // 1/numel(pred) instead of 1/N.
+            AdjointExpr::MSEBackward(y_bar, pred, target) => {
+                let d_diff = self.emit_op(
                     PrimalOp::Passthrough("mse_backward".into()),
                     vec![y_bar, pred, target],
                 );
-                let neg = self.emit_op(PrimalOp::Neg, vec![d_pred]);
-                self.reduce_to(neg, target)
+                self.reduce_to(d_diff, pred)
             }
-            AdjointExpr::L1TargetBackward(y_bar, pred, target) => {
-                let d_pred = self.emit_op(
+
+            // --- L1 backward: d/d(diff_i) = grad_output * sign(diff_i) / N ---
+            // Same shape as MSE: `nsl_l1_backward` returns the gradient with
+            // respect to the broadcast difference.
+            AdjointExpr::L1Backward(y_bar, pred, target) => {
+                let d_diff = self.emit_op(
                     PrimalOp::Passthrough("l1_backward".into()),
                     vec![y_bar, pred, target],
                 );
-                let neg = self.emit_op(PrimalOp::Neg, vec![d_pred]);
+                self.reduce_to(d_diff, pred)
+            }
+            AdjointExpr::MSETargetBackward(y_bar, pred, target) => {
+                let d_diff = self.emit_op(
+                    PrimalOp::Passthrough("mse_backward".into()),
+                    vec![y_bar, pred, target],
+                );
+                let neg = self.emit_op(PrimalOp::Neg, vec![d_diff]);
+                self.reduce_to(neg, target)
+            }
+            AdjointExpr::L1TargetBackward(y_bar, pred, target) => {
+                let d_diff = self.emit_op(
+                    PrimalOp::Passthrough("l1_backward".into()),
+                    vec![y_bar, pred, target],
+                );
+                let neg = self.emit_op(PrimalOp::Neg, vec![d_diff]);
                 self.reduce_to(neg, target)
             }
 

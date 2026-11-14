@@ -2,19 +2,22 @@
 ##
 ## `mse_loss` / `l1_loss` / `bce_loss` are elementwise regressions;
 ## `cross_entropy` is the classification loss the language-modeling head
-## uses, and honours -100 as an ignore index. `fused_linear_ce` and
-## `fused_kl_ce` are the fusible forms — written as ordinary composites
-## so they run anywhere, and recognised by codegen inside a decorated
-## `train`/`distill` block so the logits are never materialised.
+## uses; a negative target (by convention -100, the ignore index) is left
+## out of the mean. `fused_linear_ce` and `fused_kl_ce` are the fusible
+## forms — written as ordinary composites so they run anywhere, and
+## recognised by codegen inside a decorated `train`/`distill` block so the
+## logits are never materialised.
 
 ## Mean squared error between `pred` and `target`, averaged over every
-## element. Both tensors must broadcast to a common shape.
+## element of their common (broadcast) shape. Both tensors must broadcast
+## to a common shape.
 fn mse_loss(pred: Tensor, target: Tensor) -> Tensor:
     let diff = pred - target
     return mean(diff * diff)
 
 ## Mean absolute error between `pred` and `target`, averaged over every
-## element. Less sensitive to outliers than `mse_loss`.
+## element of their common (broadcast) shape. Less sensitive to outliers
+## than `mse_loss`.
 fn l1_loss(pred: Tensor, target: Tensor) -> Tensor:
     return mean(abs(pred - target))
 
