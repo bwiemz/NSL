@@ -1035,7 +1035,9 @@ fn every_pass_trace_record_names_a_registered_pass() {
          finding them, so this gate proves nothing"
     );
     assert!(
-        disposition_sites >= 36,
+        // 34 since CEP's prune and joint entry points share one body, and
+        // with it one exit (they had two each).
+        disposition_sites >= 34,
         "found only {disposition_sites} pass_trace::record_disposition call \
          sites — a pass exit lost its disposition, or the scan is not finding \
          them (the name must be on the same line as the call)"

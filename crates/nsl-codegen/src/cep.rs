@@ -1,4 +1,5 @@
-//! CEP — pruning and architecture-search driver, and its report.
+//! CEP — Compilation-Evaluated Pruning: the pruning and architecture-search
+//! driver, and its report.
 //!
 //! Ties the cost estimate, the importance scorer, the spec rewriter and the
 //! search together behind three entry points:
