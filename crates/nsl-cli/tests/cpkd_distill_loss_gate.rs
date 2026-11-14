@@ -101,6 +101,18 @@ fn fused_kl_ce_without_a_decorator_runs_the_composite() {
     assert!(!stderr.contains("Spectral"), "the report still points at the removed spectral analysis:\n{stderr}");
 }
 
+/// The composite is the standard library's code: a function the user's
+/// module declares under a name it calls (`log_softmax` here) is not
+/// substituted into it. It used to be, and the user's `x * 0.0` replaced
+/// both log-softmaxes of the KL term.
+#[test]
+fn the_composite_does_not_call_the_users_functions() {
+    let user = "fn log_softmax(x: Tensor, dim: int) -> Tensor:\n    return x * 0.0\n";
+    let source = kd::program(user, "", LOSS_SECTION, kd::TARGETS, "0.6", "2.0");
+    let (got, _) = run(&source, &["--target", "cpu"]);
+    assert_kd_numbers(&got, "a user log_softmax in the program");
+}
+
 /// `--target cpu` with the decorator enabled: the fused kernel is CUDA-only,
 /// so the composite runs on the host and the compile says it did. Nothing
 /// is allocated on a device (this test runs on a build without CUDA, where

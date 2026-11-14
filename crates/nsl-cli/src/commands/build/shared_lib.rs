@@ -456,7 +456,7 @@ fn run_build_shared_multi(
             entry_options.imported_model.tensor_fields_without_dims =
                 imported_tensor_fields_without_dims;
             entry_options.imported_model.field_values = imported_model_field_values;
-            entry_options.imported_model.fn_bodies = graph.imported_fn_bodies(&interner);
+            entry_options.imported_model.functions = graph.imported_functions(&interner);
             let entry_options = &entry_options;
 
             match nsl_codegen::compile_entry_returning_plan(
