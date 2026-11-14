@@ -200,12 +200,120 @@ fn the_cpdt_report_describes_the_model_and_says_it_is_not_applied() {
     assert!(text.contains("--zero-stage is not set"), "{text}");
 }
 
+/// A safetensors file of f32 tensors with the given values.
+fn write_valued_tensors(path: &Path, tensors: &[(&str, Vec<usize>, Vec<f32>)]) {
+    let blobs: Vec<Vec<u8>> = tensors
+        .iter()
+        .map(|(_, _, values)| values.iter().flat_map(|v| v.to_le_bytes()).collect())
+        .collect();
+    let mut views = HashMap::new();
+    for ((name, shape, _), bytes) in tensors.iter().zip(blobs.iter()) {
+        views.insert(
+            name.to_string(),
+            TensorView::new(Dtype::F32, shape.clone(), bytes).unwrap(),
+        );
+    }
+    fs::write(path, serialize(&views, None).unwrap()).unwrap();
+}
+
+/// The expert weights of the MoE fixtures: two experts of 3 x 3,
+/// `0.5 * [0, 1, ..., 17]` packed `[experts, hidden * intermediate]`.
+fn moe_expert_values() -> Vec<f32> {
+    (0..18).map(|i| 0.5 * i as f32).collect()
+}
+
+/// `nsl run` of `source` with the router ([hidden 3, 2 experts]) and expert
+/// ([2 experts, 3 x 3]) weights `--cpdt full` plans the MoE layer from.
+/// Router columns of ones have norm sqrt(3), far above the dead-expert
+/// threshold.
+fn run_moe(dir: &Path, source: &str) -> std::process::Output {
+    let src = dir.join("moe.nsl");
+    fs::write(&src, source).unwrap();
+    let weights = dir.join("w.safetensors");
+    write_valued_tensors(
+        &weights,
+        &[
+            ("MoEModel.experts.router.weight", vec![3, 2], vec![1.0; 6]),
+            ("MoEModel.experts.experts.weight", vec![2, 9], moe_expert_values()),
+        ],
+    );
+    let mut cmd = Command::cargo_bin("nsl").unwrap();
+    cmd.env("NSL_STDLIB_PATH", stdlib_path())
+        .arg("run")
+        .arg(&src)
+        .arg("--target")
+        .arg("cpu")
+        .arg("--weights")
+        .arg(&weights)
+        .arg("--cpdt")
+        .arg("full")
+        .arg("--cpdt-num-gpus")
+        .arg("2");
+    cmd.output().expect("spawn nsl run")
+}
+
+/// An inference-only MoE program under `--cpdt full` runs the expert matmul
+/// (`nsl_moe_dispatch_full_v2`) and is not refused as inert. Tokens 0 and 2
+/// route to expert 0, 1 and 3 to expert 1 (top-1, routing weight 1), so
+/// row t of the output is `x[t] @ W_e` with `W_e` the expert's 3 x 3 block,
+/// computed here in f64. The weights file holds the same expert values as
+/// the model's field: which of the two the dispatch reads is not what this
+/// test is about.
 #[test]
-fn an_inference_only_moe_program_compiles_under_cpdt_full() {
+fn an_inference_only_moe_program_runs_under_cpdt_full() {
     let tmp = TempDir::new().unwrap();
-    let src = tmp.path().join("moe.nsl");
-    fs::write(
-        &src,
+    let out = run_moe(
+        tmp.path(),
+        r#"model MoEModel:
+    @moe(num_experts=2, top_k=1, capacity_factor=2.0)
+    experts: Tensor = arange(0.0, 18.0).reshape([2, 9]) * 0.5
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let logits = zeros([4, 2])
+        logits[0, 0] = 1.0
+        logits[1, 1] = 1.0
+        logits[2, 0] = 1.0
+        logits[3, 1] = 1.0
+        return moe_dispatch(x, logits, self.experts)
+
+let m = MoEModel()
+let x = arange(1.0, 13.0).reshape([4, 3])
+print(m.forward(x))
+"#,
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        !stderr.contains("silently inert") && !stderr.contains("recorded no disposition"),
+        "the MoE passes ran; that is not an inert request:\n{stderr}"
+    );
+    assert!(out.status.success(), "{stderr}");
+    let w: Vec<f64> = moe_expert_values().iter().map(|&v| v as f64).collect();
+    let mut want = Vec::new();
+    for t in 0..4 {
+        let expert = t % 2;
+        let x: Vec<f64> = (0..3).map(|k| (3 * t + k + 1) as f64).collect();
+        for j in 0..3 {
+            want.push((0..3).map(|k| x[k] * w[expert * 9 + k * 3 + j]).sum::<f64>());
+        }
+    }
+    let got: Vec<f64> = String::from_utf8_lossy(&out.stdout)
+        .split(|c: char| !(c.is_ascii_digit() || matches!(c, '.' | '-' | 'e' | 'E' | '+')))
+        .filter_map(|token| token.parse::<f64>().ok())
+        .collect();
+    assert_eq!(got, want, "x @ W_expert per routed token");
+}
+
+/// The M32 spelling passes an int field as the experts argument
+/// (`experts: int = 2`); the identity dispatch ignores it. Under
+/// `--cpdt full` the production dispatch multiplies by it, and it used to
+/// compile and then die at run time on "invalid tensor handle 0x2" (the int
+/// read as a tensor handle). It is refused at compile time, naming the
+/// argument and the size the weights file gives the layer.
+#[test]
+fn an_int_experts_argument_is_refused_under_cpdt_full() {
+    let tmp = TempDir::new().unwrap();
+    let out = run_moe(
+        tmp.path(),
         r#"model MoEModel:
     @moe(num_experts=2, top_k=2, capacity_factor=2.0)
     experts: int = 2
@@ -220,39 +328,43 @@ let x = ones([4, 3])
 let y = m.forward(x)
 print(y)
 "#,
-    )
-    .unwrap();
-    // The router ([hidden 3, 2 experts]) and expert ([2 experts, 3 x 3])
-    // weights the MoE lowering needs under `--cpdt full`. Router columns of
-    // ones have norm sqrt(3), far above the dead-expert threshold.
-    let weights = tmp.path().join("w.safetensors");
-    write_tensors(
-        &weights,
-        &[
-            ("MoEModel.experts.router.weight", vec![3, 2], 1.0),
-            ("MoEModel.experts.experts.weight", vec![2, 9], 1.0),
-        ],
     );
-    let mut cmd = Command::cargo_bin("nsl").unwrap();
-    cmd.env("NSL_STDLIB_PATH", stdlib_path())
-        // Compile only: the refusal this test is about was raised after a
-        // successful compile, before the program ran.
-        .arg("build")
-        .arg(&src)
-        .arg("--emit-obj")
-        .arg("-o")
-        .arg(tmp.path().join("moe.o"))
-        .arg("--weights")
-        .arg(&weights)
-        .arg("--cpdt")
-        .arg("full")
-        .arg("--cpdt-num-gpus")
-        .arg("2");
-    let out = cmd.output().expect("spawn nsl build");
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(!out.status.success(), "{stderr}");
     assert!(
-        !stderr.contains("silently inert") && !stderr.contains("recorded no disposition"),
-        "the MoE passes ran; that is not an inert request:\n{stderr}"
+        stderr.contains("third (experts) argument is multiplied as the expert weights")
+            && stderr.contains("a tensor of 18 elements"),
+        "{stderr}"
     );
-    assert!(out.status.success(), "{stderr}");
+    assert!(!stderr.contains("invalid tensor handle"), "{stderr}");
+}
+
+/// An experts tensor of the wrong size is refused by the dispatch at run
+/// time (it returns a null handle). That 0 used to flow on as the layer's
+/// output; the program now stops with the reason.
+#[test]
+fn an_experts_tensor_of_the_wrong_size_stops_the_run() {
+    let tmp = TempDir::new().unwrap();
+    let out = run_moe(
+        tmp.path(),
+        r#"model MoEModel:
+    @moe(num_experts=2, top_k=1, capacity_factor=2.0)
+    experts: Tensor = ones([2, 4])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let logits = ones([4, 2])
+        return moe_dispatch(x, logits, self.experts)
+
+let m = MoEModel()
+let x = ones([4, 3])
+print(m.forward(x))
+"#,
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(!out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("nsl_moe_dispatch_full_v2 refused its operands")
+            && stderr.contains("must hold 18 elements"),
+        "{stderr}"
+    );
 }
