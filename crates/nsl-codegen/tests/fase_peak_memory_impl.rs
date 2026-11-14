@@ -1,5 +1,18 @@
 //! Implementation of the peak-memory regression test.
 //!
+//! What it compares: two NSL paths. Under `--source-ad` the accumulation
+//! hook folds each parameter's gradient into its accumulator and frees it
+//! before the next one is computed; under tape AD the whole gradient list
+//! of a micro-batch is built first and then added. The test asserts that
+//! the first peaks lower than the second.
+//!
+//! What it does not show: that accumulation with a fused optimizer step
+//! uses less memory than ordinary in-place accumulation. A loop that does
+//! `grad += g` per micro-batch also holds one accumulator per parameter and
+//! one gradient at a time, which is what the hook path holds; there is no
+//! saving against that baseline, and this test's baseline is NSL's own
+//! tape path, which holds more than either.
+//!
 //! Uses `cargo run -p nsl-cli` to invoke `nsl build --shared-lib`, then
 //! libloading to dlopen the produced library and call the exported symbols
 //! directly in-process.
@@ -259,11 +272,10 @@ fn source_ad_peak_is_lower_than_tape_ad() {
     let peak_tape = run_and_measure_peak(&tape_dll);
     let peak_source = run_and_measure_peak(&source_dll);
 
-    // Fixture is a 2-parameter MLP with two 256x256 weight matrices (~512 KB
-    // gradient each).  Tape-AD holds both live simultaneously (~1 MB); the
-    // source-AD consume-per-param hook holds only one at a time (~512 KB
-    // peak gradient memory).  Expected delta: >= 400 KB, leaving margin for
-    // ~100 KB of bookkeeping noise.
+    // The fixture has four 256x256 weight matrices, 256 KB of f32 gradient
+    // each. The tape path holds all four at once (about 1 MB); the hook
+    // holds one at a time. Expected difference: at least 400 KB, which
+    // leaves room for bookkeeping noise. Measured: 4.21 MB against 3.42 MB.
     const MIN_DELTA_BYTES: usize = 400_000;
 
     println!("peak_tape   = {} bytes", peak_tape);
