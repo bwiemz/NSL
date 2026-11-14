@@ -9,7 +9,8 @@ code in this repository that implements it. Arithmetic corrections were
 recomputed from the proposal's own figures. External facts carry a link where
 they were checked against a source, and say so where they were not. The
 statements about the code come from reading it and from compile-only builds;
-no kernel was run on a GPU for this review.
+no kernel was run on a GPU for the review itself. The fixes recorded in
+Part 5 came afterwards, and those marked as run were run on a GPU.
 
 Notation used below: S is the sequence length, D the model width, d the head
 dimension. HBM is the GPU's main (high-bandwidth) memory. A CTA is a
@@ -356,10 +357,18 @@ Defects found in this code are listed in Part 5.
 ## Part 5 — Implementation defects found in the same review
 
 The review also built the code and emulated its f16 gradient path
-numerically; no kernel was launched on a GPU. This part lists what it found
-wrong in the implementation, as distinct from the proposal's own errors in
-Part 1. Fixed items are described in `CHANGELOG.md` under "Unreleased". The
-open list is as of 2026-11-13.
+numerically; no kernel was launched on a GPU for it. This part lists what it
+found wrong in the implementation, as distinct from the proposal's own
+errors in Part 1. Fixed items are described in `CHANGELOG.md` under
+"Unreleased". The open list is as of 2026-11-13.
+
+The fixes after the first two were made in a second pass, which did launch
+the kernels, on an RTX PRO 4500. Its measurements are relative L2 errors
+against an f64 evaluation of the layer from the unrounded inputs
+(`crates/nsl-codegen/tests/csha_f64_reference.rs`), which CPU tests hold to
+literals from PyTorch's float64 autograd. The GPU tests named below are
+`#[ignore]` and need `--features cuda`; "the fused pair" means the forward
+that saves activations and the scalar fused backward.
 
 ### Fixed
 
@@ -377,71 +386,153 @@ open list is as of 2026-11-13.
 - Outside CSHA's own code, the stock flash-attention backward (not a CSHA
   kernel) converted its gradient operands to f16 unscaled and underflowed;
   that was fixed separately by per-tile power-of-two scaling and is
-  described in `CHANGELOG.md`, while the CSHA kernels' own f16 gradient
-  handling is not fixed and is the first open item below.
+  described in `CHANGELOG.md`.
+- The CSHA backward lost small gradients to f16: it narrowed the incoming
+  gradient dO to f16 without scaling and stored dQ, dK, dV, dWq, dWk and
+  dWv as f16, which is exactly zero below 2.98e-8. Run on the old code with
+  dO drawn uniformly in ±5e-7, dQ was 6% to 11% off, dV 8% to 16% and dWq
+  4% to 8%; in ±5e-8, dQ was 82% to 89% off and dV 86% to 100%; in ±5e-10
+  every gradient was zero. The kernel now reads dO as f32 and stores every
+  gradient as f32, the lowering allocates f32 outputs, and the launcher
+  refuses an f16 tensor in a gradient slot (`csha_backward_impl` in
+  `crates/nsl-runtime/src/flash_attention.rs`, `phases/backward/` under
+  `crates/nsl-codegen/src/flash_attention_v2/`, `PrimalOp::FusedCshaBackward`
+  in `crates/nsl-codegen/src/wengert_lower.rs`). The error is now 5e-4 to
+  2.1e-3 at every magnitude of dO, which is the f16 precision of the
+  operands Q, K, V and the weights. The test is
+  `crates/nsl-codegen/tests/csha_cuda_backward.rs`.
+- The backward test that should have caught that could not: it drew dO of
+  order 1, rounded it to f16, gave the rounded values to its CPU oracle too,
+  and compared under absolute tolerances of 5e-3 to 4e-2. It passed on the
+  old code. It is replaced by the gate above, which draws dO at 1, 1e-6,
+  1e-7 and 1e-9, compares all eight gradients and the forward output with
+  the f64 reference under a relative tolerance of 4e-3, and requires a
+  2^-20 rescale of dO to rescale every output bit for bit. Run against the
+  old code, the new gate fails at every magnitude below 1.
+- The tensor-core backward (Tier B.2, test-only) converted dS and the dO
+  tile to f16 unscaled before `mma.sync`. Run on the old code at dO in
+  ±5e-7, dQ was 80% to 92% off with 93% of it exactly zero; at ±5e-8 it was
+  all zero. The launcher now multiplies each (batch, head) slice of dO by
+  the power of two that puts its largest element in [64, 128) as it narrows
+  it, and multiplies dQ, dK and dV by the reciprocal before the projection
+  kernel reads them; the dQ and dK/dV kernels saturate dS at f16's largest
+  finite value (`csha_tier_b2_backward_launch` in
+  `crates/nsl-runtime/src/flash_attention.rs`, `emit_ds_clamp` in
+  `tier_b2/backward/dq.rs` and `dkdv.rs`). The error is now 3e-4 to 6e-4 at
+  every magnitude. The test is
+  `crates/nsl-codegen/tests/tier_b2_backward_f64_gate.rs`.
+- With head pruning and a batch above 1, whole batch elements were skipped:
+  the launch grid was `batch × active_heads`, but the kernel derives batch
+  and head from the full head count. Run with batch 2, 8 heads and 4
+  active, the output and all three gradients of batch element 1 were
+  exactly zero under a success code, in the forward and in the backward.
+  All four CSHA launch sites now launch `batch × heads` blocks and rely on
+  the kernel's own guard to skip pruned heads (`nsl_flash_attention_csha`,
+  `nsl_flash_attention_csha_with_saves` and both backward launchers in
+  `crates/nsl-runtime/src/flash_attention.rs`). The test is
+  `crates/nsl-codegen/tests/csha_cuda_training_config.rs`.
+- The training forward took its active head count from the planner's
+  nominal 8-head layer while the backward passed 0, and so did the launches
+  in a method body, so a model with more than 8 heads would have had heads
+  8 and up left at zero. Every launch now passes the count of the
+  configuration its kernel was synthesized from, which is 0 (every head)
+  for a training build (`emit_fused_forward_under_claim` and
+  `lower_single_op` in `crates/nsl-codegen/src/wengert_lower.rs`,
+  `compile_flash_attention_call` in
+  `crates/nsl-codegen/src/expr/advanced.rs`). The test,
+  `every_csha_launch_passes_the_same_active_head_count` in
+  `crates/nsl-codegen/tests/train_clif_snapshots.rs`, reads the emitted IR.
+  The defect was not reproduced from an NSL program: a program with more
+  than one head stops earlier, for the reason in the open list below.
+- The result of the forward launch was discarded for
+  `nsl_flash_attention_csha` and `nsl_flash_attention`, so a refused launch
+  let the zero-initialised output flow on. All three forward launches in a
+  method body now trap on a non-zero return code
+  (`trap_on_attention_launch_failure` in
+  `crates/nsl-codegen/src/expr/advanced.rs`). The test is
+  `a_refused_attention_launch_traps` in
+  `crates/nsl-codegen/tests/train_clif_snapshots.rs`.
+- The fused-projection kernels read `x`, and the backward its saved copy
+  `x_raw`, as rows `head_dim` wide while indexing them by `d_model`, and
+  the save buffer is sized by `head_dim`. Run at `d_model` 64 and
+  `head_dim` 32, the forward output was 126% off and every gradient between
+  125% and 215%, with a success code. Both forward launchers and the
+  backward now refuse a fused-projection kernel whose `d_model` exceeds
+  `head_dim`, and the tensor-core backward refuses any `d_model` other than
+  `head_dim` (`csha_refuses_wide_fused_projection` in
+  `crates/nsl-runtime/src/flash_attention.rs`). The test is
+  `fused_kernels_refuse_a_d_model_above_head_dim` in
+  `crates/nsl-codegen/tests/csha_cuda_backward.rs`.
+- The Tier B.1 launcher kept its re-laid-out copy of each projection weight
+  in a cache keyed on the weight's device address, never invalidated or
+  freed, so an in-place weight update or a reused address left the kernel
+  on old weights. The cache is removed; the weights are converted on every
+  launch and the scratch is freed with it (`csha_tier_b1_prepass_substitute`
+  in `crates/nsl-runtime/src/flash_attention.rs`,
+  `crates/nsl-runtime/src/cuda/tier_b1_prepass.rs`). The test is
+  `tier_b1_rereads_weights_updated_in_place` in
+  `crates/nsl-codegen/tests/tier_b1_csha_ffi_e2e.rs`.
+- The Tier B.1 pre-passes handle one batch element and one head, and a
+  larger launch went ahead. The launcher now refuses a batch or head count
+  above 1 for a Tier B.1 kernel, and refuses instead of launching the
+  kernel on buffers the pre-pass did not prepare. The test is
+  `tier_b1_refuses_batch_or_heads_above_one` in the same file.
+- `examples/csha_toy_pretrain_hd32.nsl` could not run (its `x` was
+  two-dimensional, which the fused forward aborts on) and was degenerate:
+  `x` and every weight were ones and the loss was `sum(out)`, so dQ, dK,
+  dWq and dWk were exactly zero. It is replaced by a program with
+  non-uniform inputs, a gradient of order 1e-6 at the attention output and
+  printed statistics of each weight's update, and
+  `crates/nsl-cli/tests/csha_toy_pretrain_gate.rs` runs it on a GPU and
+  compares with PyTorch. The gate asserts the loss and the statistics that
+  agree; the ones that do not are the first open item below.
 
 ### Open
 
-- The CSHA backward loses small gradients to f16: dO is narrowed unscaled,
-  and dQ, dK, dV, dWq, dWk and dWv are stored as f16, which is zero below
-  2.98e-8. Emulated at rms(dO) = 1e-6, dQ has 57% relative error with 80%
-  exact zeros, dV 12% and dWq 4.2%; at 1e-7 dQ is all zero. Where:
-  `csha_backward_impl` in `crates/nsl-runtime/src/flash_attention.rs`.
-  Numeric check; no GPU run. Right: f32 from end to end.
-- The tensor-core backward (Tier B.2, test-only) converts dS and the dO
-  tile to f16 unscaled before `mma.sync`, as the stock backward did before
-  its fix. Where: `emit_ds_scatter_to_smem` in `tier_b2/backward/dq.rs` and
-  `emit_dscol_scatter` in `tier_b2/backward/dkdv.rs`, both under
-  `crates/nsl-codegen/src/flash_attention_v2/`. By reading the code only.
-  Right: the same power-of-two scaling.
-- With head pruning and a batch above 1, whole batch elements are suspected
-  to be skipped: the launch grid is `batch × active_heads`, but the kernel
-  derives batch and head from the full head count. Batch 2, 8 heads, 4
-  active would leave batch 1 zero with a success code. Where:
-  `nsl_flash_attention_csha` in `crates/nsl-runtime/src/flash_attention.rs`.
-  By reading the code only. Right: launch the full `batch × heads` grid.
-- The training forward takes its active head count from the planner's
-  nominal 8 while the backward passes 0, so a claimed model with more than 8
-  heads would compute only 8 in the forward. Where:
-  `emit_fused_forward_under_claim` and `lower_single_op` in
-  `crates/nsl-codegen/src/wengert_lower.rs`. By reading the code only.
-- The result of the forward launch is discarded for
-  `nsl_flash_attention_csha` and `nsl_flash_attention`. The launcher can
-  refuse with -1, and the zero-initialised output then flows on. Where:
-  `compile_flash_attention_call` in
-  `crates/nsl-codegen/src/expr/advanced.rs`. By reading the code only.
-  Right: trap, as the path that saves activations already does.
-- The saved `x_raw` buffer is sized `batch·heads·seq·head_dim` f32 but is
-  indexed as `[seq, d_model]` by the backward and its post-pass; it is
-  suspected to be read out of bounds whenever `d_model > heads·head_dim`.
-  Where: `nsl_csha_alloc_backward_activations` in
-  `crates/nsl-runtime/src/flash_attention.rs`. By reading the code only.
-- The Tier B.1 weight cache is keyed on the device address and is never
-  invalidated or freed. It goes stale after an in-place weight write, or
-  when a freed address is reused by another tensor of the same shape. It is
-  reachable only from tests, the bench binary and direct FFI calls. Where:
-  `w_chunkified_cached` in `crates/nsl-runtime/src/cuda/tier_b1_prepass.rs`.
-  By reading the code only.
-- The Tier B.1 pre-passes handle one batch element and one head's width
-  (the `x` pre-pass has no batch dimension), while the planner advertises
-  Tier B.1 for an 8-head, grouped-KV model. Where:
-  `csha_tier_b1_prepass_substitute` in
-  `crates/nsl-runtime/src/flash_attention.rs`. By reading the code only.
-  Right: refuse batch or head counts above 1 in the launcher.
+- The one NSL program that reaches the fused pair gets a wrong gradient for
+  Wq, and Wk and Wv gradients that are too large. Run on a GPU against
+  PyTorch (`examples/csha_toy_pretrain_hd32.nsl`, one head, one tile): the
+  loss agrees to 0.1%, and so do the RMSNorm weight's update and the
+  projections of the Wk and Wv updates on a probe; but the squared norm of
+  the Wq update is 17.2 against 0.0061, and those of Wk and Wv are 12%
+  high. The same model without the decorator, on the CPU, agrees with
+  PyTorch to 1e-6. The kernel-level gates pass for the fused-projection
+  configuration, so the fault is specific to the configuration a training
+  build emits (level 1, no fusion flag), where the kernel is nonetheless
+  handed `x` and the weights. The cause was not found. Suspected, by
+  reading: `emit_dproj` and `emit_drmsnorm` in
+  `crates/nsl-codegen/src/flash_attention_v2/phases/backward/csha_hooks_backward.rs`,
+  and the forward's RMSNorm prologue, which that configuration also runs
+  on an `x` that is already normalised.
+  `crates/nsl-cli/tests/csha_toy_pretrain_gate.rs` prints the affected
+  statistics without asserting them. Right: every statistic it prints
+  agrees with PyTorch.
+- The backward of the kernel pair a training build emits is wrong at more
+  than one tile. Run with the training configuration (level 1, no fusion
+  flag) at two tiles, the forward output is right (3e-4) and dQ, dK and dV
+  are 130%, 45% and 43% off, at batch 1 with one head as at batch 2 with
+  four; at one tile the same shapes are right (4e-4). With fused
+  projections more than one tile is right at batch 1 with one head and
+  refused otherwise. Where: the per-query-tile launch loop of
+  `csha_backward_impl` in `crates/nsl-runtime/src/flash_attention.rs` and
+  the kernel it launches.
+- A program whose attention has more than one head cannot train through
+  the fused pair. With `x` of shape `[2, 16, 32, 32]` the train step stops
+  with "tensor shape mismatch in elementwise op" (`[1, 2, 32, 32]` against
+  `[2, 16, 32, 32]`), and a direct call of the method returns NaN. Run on a
+  GPU; the same before and after the fixes above. Suspected, by reading:
+  the gradient with respect to `x` that the fused backward returns is
+  allocated as `[batch, seq, d_model]`, with no head dimension
+  (`PrimalOp::FusedCshaBackward` in
+  `crates/nsl-codegen/src/wengert_lower.rs`).
+- The scalar backward reads Wq, Wk and Wv without a null check whenever its
+  configuration has a nonzero `d_model`, so a launch with null weights is a
+  GPU fault instead of a skipped phase. Where: `emit_drmsnorm` in
+  `crates/nsl-codegen/src/flash_attention_v2/phases/backward/csha_hooks_backward.rs`.
+  Seen in a run (CUDA_ERROR_ILLEGAL_ADDRESS).
 - For decorated attention the plan is still made on a nominal layer shape
   (batch 1, sequence 1024, `d_model` 512, 8 heads, 4 KV heads), the level-1
   saving is the constant 0.58, and the kernel named in the report is not
   one that is emitted. Where: `invoke_csha_if_enabled` in
   `crates/nsl-codegen/src/stmt_pass_bridges.rs`. By reading the code only.
   Right: plan from the model's dimensions; name only emitted kernels.
-- The backward test that would catch the f16 loss cannot. It draws dO of
-  order 1, rounds it to f16 and gives the rounded values to the CPU
-  reference, so both sides round alike at a magnitude where f16 is
-  harmless, under absolute tolerances of 1e-2. Where:
-  `run_fused_backward_config_seq` in
-  `crates/nsl-codegen/tests/csha_cuda_backward.rs`. By reading the code only.
-- The toy pretraining test asserts relocation symbols only, and its example
-  is degenerate: `x` and every weight are ones and the loss is `sum(out)`,
-  so dQ, dK, dWq and dWk are exactly zero and any path for them passes.
-  Where: `crates/nsl-codegen/tests/csha_gap_f_toy_pretrain_smoke.rs` and
-  `examples/csha_toy_pretrain_hd32.nsl`. By reading the code only.
