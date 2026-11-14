@@ -612,3 +612,45 @@ fn fused_kernels_refuse_a_d_model_above_head_dim() {
     );
     assert_eq!(rc, -1, "the backward must refuse d_model 64 with head_dim 32");
 }
+
+/// A backward launch with a nonzero `d_model` and a null projection weight
+/// is refused. The kernel's RMSNorm phase reads Wq, Wk and Wv with no null
+/// check, so such a launch used to be a GPU fault that surfaced at a later,
+/// unrelated driver call.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn backward_refuses_a_null_projection_weight() {
+    if !cuda_available() {
+        eprintln!("skipping: no CUDA");
+        return;
+    }
+    let name = CString::new(
+        "flash_attn_backward_p0_r0_hs_g1_c1_t0_q32_kv32_cshaL1_n0_p0_o0_h0_v2",
+    )
+    .unwrap();
+    // The launcher refuses on its arguments alone, before it resolves a
+    // pointer or loads the module, so no buffer is needed. A non-null
+    // placeholder stands in for the weights that are present.
+    let present = 0x1000i64;
+    for (wq, wk, wv) in [(0, present, present), (present, 0, present), (present, present, 0)] {
+        let rc = nsl_flash_attention_csha_backward(
+            0, 0, 0, 0, 0,
+            (1.0f32 / 32f32.sqrt()).to_bits() as i64,
+            1, 1, 32, 32,
+            0, 0, 0, 0,
+            0, 0,
+            0, 0,
+            0,
+            0, name.as_ptr() as i64,
+            32, 32,
+            1,
+            0, 0, wq, wk, wv,
+            0, NORM_EPS.to_bits() as i64,
+            0, 32,
+            0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0,
+        );
+        assert_eq!(rc, -1, "null weight (wq={wq:#x}, wk={wk:#x}, wv={wv:#x}) must be refused");
+    }
+}

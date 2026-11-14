@@ -3518,6 +3518,24 @@ fn csha_backward_impl(
         ) {
             return -1;
         }
+        // A kernel built with a nonzero `d_model` runs the projection and
+        // RMSNorm backward phases, and the RMSNorm phase reads Wq, Wk and Wv
+        // with no null check (`emit_drmsnorm` in nsl-codegen's
+        // phases/backward/csha_hooks_backward.rs). A null weight there is a
+        // GPU fault (CUDA_ERROR_ILLEGAL_ADDRESS), surfacing at some later
+        // driver call. Callers that want only dQ, dK and dV pass `d_model`
+        // 0 and a kernel built with it. The per-document kernels have no
+        // projection phases.
+        if !per_doc_cta && d_model > 0 && (wq_ptr == 0 || wk_ptr == 0 || wv_ptr == 0) {
+            crate::nsl_log!(ERROR, "flash-attention",
+                "[nsl::flash_attention] nsl_flash_attention_csha_backward: kernel {:?} was \
+                 launched with d_model={d_model} and a null projection weight \
+                 (wq={wq_ptr:#x}, wk={wk_ptr:#x}, wv={wv_ptr:#x}); its RMSNorm backward reads \
+                 all three — refusing",
+                csha_kernel_name_for_diag(effective_name_ptr),
+            );
+            return -1;
+        }
         let q_blocks = (seq_len + block_q - 1) / block_q;
         let grid_x = if per_doc_cta { num_docs_or_zero } else { 1i64 };
         // Full grid: see `nsl_flash_attention_csha`.
