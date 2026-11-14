@@ -920,7 +920,7 @@ impl Compiler<'_> {
         } else if left_is_tensor {
             // M52d: Scaling constant fusion — if this is `tensor * scalar` where
             // the scalar is a known weight scale, emit it as a compile-time constant.
-            let (scalar, scale_fused) = self.try_fuse_weight_scale(builder, state, rhs, op);
+            let (scalar, scale_fused) = self.try_fuse_weight_scale(state, rhs, op);
             let rhs_for_scalar = scalar.unwrap_or(rhs);
 
             // Tensor-scalar: ensure scalar is f64 for the runtime FFI
@@ -2999,10 +2999,12 @@ impl Compiler<'_> {
         rhs: Value,
         op: BinOp,
     ) -> Result<Option<Value>, CodegenError> {
-        let wmap = match self.features.weight_map {
-            Some(ref w) => w,
-            None => return Ok(None),
-        };
+        if self.features.weight_map.is_none()
+            || !self.compile_options.weights.config.constant_fold
+            || !matches!(op, BinOp::MatMul | BinOp::Add)
+        {
+            return Ok(None);
+        }
 
         let lhs_key = state.weight_values.get(&lhs).cloned();
         let rhs_key = state.weight_values.get(&rhs).cloned();
@@ -3011,6 +3013,20 @@ impl Compiler<'_> {
         let (lk, rk) = match (lhs_key, rhs_key) {
             (Some(l), Some(r)) => (l, r),
             _ => return Ok(None),
+        };
+
+        // The folded constant stands for both weights' values: each must be
+        // one the program is known to run with.
+        let both_usable = [
+            self.may_specialize_on(&lk, "constant fold"),
+            self.may_specialize_on(&rk, "constant fold"),
+        ];
+        if both_usable != [true, true] {
+            return Ok(None);
+        }
+        let wmap = match self.features.weight_map {
+            Some(ref w) => w,
+            None => return Ok(None),
         };
 
         let lhs_entry = match wmap.get(&lk) {
@@ -3048,7 +3064,7 @@ impl Compiler<'_> {
                     ct.shape,
                     ct.data.len()
                 );
-                let val = self.embed_const_tensor(builder, state, &ct)?;
+                let val = self.embed_const_tensor(builder, &ct)?;
                 Ok(Some(val))
             }
             _ => Ok(None),
@@ -3059,13 +3075,17 @@ impl Compiler<'_> {
     fn embed_const_tensor(
         &mut self,
         builder: &mut FunctionBuilder,
-        state: &mut FuncState,
         ct: &crate::weight_aware::ConstTensor,
     ) -> Result<Value, CodegenError> {
         use cranelift_module::{DataDescription, Linkage, Module};
 
         // Create a unique .rodata symbol for this constant
-        let sym_name = format!("__nsl_const_tensor_{}", self.string_pool.len());
+        // (A name not taken yet: a second fold, or the same method compiled
+        // twice, must not redefine the first one's symbol.)
+        let sym_name = (self.string_pool.len()..)
+            .map(|n| format!("__nsl_const_tensor_{n}"))
+            .find(|name| self.module.get_name(name).is_none())
+            .expect("an unbounded range has a free name");
         let data_id = self
             .module
             .declare_data(&sym_name, Linkage::Local, false, false)
@@ -3073,6 +3093,11 @@ impl Compiler<'_> {
 
         let mut desc = DataDescription::new();
         desc.define(ct.data.clone().into_boxed_slice());
+        // The runtime reads this as f32 or f64 in place. Without an
+        // alignment the linker puts it at any byte, and the first read of a
+        // folded constant was a misaligned dereference (a panic in a debug
+        // runtime).
+        desc.set_align(8);
         self.module
             .define_data(data_id, &desc)
             .map_err(|e| CodegenError::new(format!("failed to define const tensor data: {e}")))?;
@@ -3102,53 +3127,45 @@ impl Compiler<'_> {
             "nsl_tensor_from_static",
             &[data_ptr, shape_list, dtype_val],
         )?;
-
-        state.cleanup.tensor_temporaries.push(tensor);
+        // Not registered as a temporary here: the caller (the M52b fold in
+        // `compile_binary_op`) does that, and registering it twice freed the
+        // tensor twice at scope exit (glibc then aborted, or the next use
+        // found a freed handle).
         Ok(tensor)
     }
 
     /// Check if a matmul operand is a near-identity weight → skip the matmul.
-    fn try_identity_elim(&self, state: &FuncState, lhs: Value, rhs: Value) -> Option<Value> {
-        let wmap = self.features.weight_map.as_ref()?;
-
-        // Check RHS (more common: x @ W where W ≈ I)
-        if let Some(key) = state.weight_values.get(&rhs)
-            && let Some(entry) = wmap.get(key)
-        {
-            let elim = crate::weight_aware::DeadWeightEliminator::new(
-                &self.compile_options.weights.config,
-            );
-            if elim.is_near_identity(
-                entry,
-                self.compile_options.weights.config.dead_weight_threshold,
-            ) {
-                nsl_log::nsl_log!(INFO, "nsl", 
-                    "[nsl] M52b: eliminated near-identity matmul (weight '{}')",
-                    key
+    ///
+    /// The weight's values decide this, so it is done only for a parameter
+    /// the program runs with exactly as the file has it (`may_specialize_on`).
+    fn try_identity_elim(&mut self, state: &FuncState, lhs: Value, rhs: Value) -> Option<Value> {
+        // `x @ W` with W ≈ I is the common case; `W @ x` the other.
+        for (weight, pass_through) in [(rhs, lhs), (lhs, rhs)] {
+            let Some(key) = state.weight_values.get(&weight).cloned() else {
+                continue;
+            };
+            let near_identity = {
+                let wmap = self.features.weight_map.as_ref()?;
+                let Some(entry) = wmap.get(&key) else {
+                    continue;
+                };
+                let elim = crate::weight_aware::DeadWeightEliminator::new(
+                    &self.compile_options.weights.config,
                 );
-                return Some(lhs); // x @ I ≈ x
+                elim.is_near_identity(
+                    entry,
+                    self.compile_options.weights.config.dead_weight_threshold,
+                )
+            };
+            if !near_identity || !self.may_specialize_on(&key, "near-identity matmul elimination") {
+                continue;
             }
-        }
-
-        // Check LHS (less common: W @ x where W ≈ I)
-        if let Some(key) = state.weight_values.get(&lhs)
-            && let Some(entry) = wmap.get(key)
-        {
-            let elim = crate::weight_aware::DeadWeightEliminator::new(
-                &self.compile_options.weights.config,
+            nsl_log::nsl_log!(INFO, "nsl",
+                "[nsl] M52b: eliminated near-identity matmul (weight '{}')",
+                key
             );
-            if elim.is_near_identity(
-                entry,
-                self.compile_options.weights.config.dead_weight_threshold,
-            ) {
-                nsl_log::nsl_log!(INFO, "nsl", 
-                    "[nsl] M52b: eliminated near-identity matmul (weight '{}')",
-                    key
-                );
-                return Some(rhs); // I @ x ≈ x
-            }
+            return Some(pass_through);
         }
-
         None
     }
 
@@ -3244,9 +3261,13 @@ impl Compiler<'_> {
     /// M52d: Scaling constant fusion — when a scalar operand is a known weight scale,
     /// replace the runtime value with a compile-time constant embedded in the code.
     /// Returns (Some(constant_value), true) if fused, (None, false) otherwise.
+    ///
+    /// The operand here is a scalar field of a model that shares its name
+    /// with a tensor of the weights file. `-w` loads the file into tensor
+    /// fields only, so the program does not run with the file's value for
+    /// it, and the fusion is refused (with the reason, once).
     fn try_fuse_weight_scale(
-        &self,
-        builder: &mut FunctionBuilder,
+        &mut self,
         state: &FuncState,
         scalar_val: Value,
         op: BinOp,
@@ -3254,40 +3275,26 @@ impl Compiler<'_> {
         if op != BinOp::Mul {
             return (None, false);
         }
-
-        // Check if the scalar comes from a known weight (e.g., scale tensor loaded from safetensors)
-        if let Some(key) = state.weight_values.get(&scalar_val)
-            && let Some(&scale) = self.memory.weight_scales.get(key)
-        {
-            nsl_log::nsl_log!(INFO, "nsl", 
-                "[nsl] M52d: fused scaling constant {:.6e} for weight '{}'",
-                scale, key
-            );
-            let const_val = builder.ins().f64const(scale as f64);
-            return (Some(const_val), true);
-        }
-
-        // Also check: if the scalar is from a weight entry that IS a scale factor
-        // (common pattern: model has a `scale` field that's a single-element tensor)
-        if let Some(key) = state.weight_values.get(&scalar_val)
-            && let Some(ref wmap) = self.features.weight_map
-            && let Some(entry) = wmap.get(key)
-        {
-            // Single-element weight used as a scalar multiplier → embed as constant
-            if entry.num_elements == 1 {
-                let bw = entry.dtype.byte_width();
-                if bw <= entry.data.len() {
-                    let val = entry.dtype.to_f64(&entry.data[0..bw]);
-                    nsl_log::nsl_log!(INFO, "nsl", 
-                        "[nsl] M52d: fused single-element weight '{}' = {:.6e} as compile-time constant",
-                        key, val
-                    );
-                    let const_val = builder.ins().f64const(val);
-                    return (Some(const_val), true);
-                }
+        if let Some(key) = state.weight_values.get(&scalar_val).cloned() {
+            let fusible = self.memory.weight_scales.contains_key(&key)
+                || self
+                    .features
+                    .weight_map
+                    .as_ref()
+                    .and_then(|w| w.get(&key))
+                    .is_some_and(|e| e.num_elements == 1);
+            if fusible
+                && self.features.weight_notes.insert(format!("scale fusion\u{0}{key}"))
+            {
+                nsl_log::nsl_log!(
+                    INFO,
+                    "nsl",
+                    "[nsl] weight-aware: not specialized on '{key}' (scaling-constant fusion \
+                     skipped): the field is a scalar, and only tensor fields are loaded from \
+                     the weights file"
+                );
             }
         }
-
         (None, false)
     }
 }

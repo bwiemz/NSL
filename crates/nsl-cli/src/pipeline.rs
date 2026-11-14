@@ -177,6 +177,43 @@ pub(crate) fn module_data_to_wrga_inputs(
     inputs
 }
 
+/// Bind the program to its `-w` weights file: record the file's absolute
+/// path, which the program opens when it starts, and what the whole program
+/// (`modules`: every module of the build) writes to parameters after they
+/// are loaded, which decides what the compiler may specialize on.
+///
+/// Only for a build that produces a program to run, and only when the file
+/// came from `-w` / `--weights`: a file found through the source's
+/// `load_safetensors(...)`, and any file given to `nsl check`, stays an
+/// input to planning.
+pub(crate) fn bind_weights_file(
+    options: &mut nsl_codegen::CompileOptions,
+    modules: &[&nsl_ast::Module],
+    interner: &nsl_lexer::Interner,
+    entry: nsl_codegen::pass_registry::Subcommand,
+) {
+    use nsl_codegen::pass_registry::Subcommand;
+    if !options.weights.from_flag || !matches!(entry, Subcommand::Run | Subcommand::Build) {
+        return;
+    }
+    let Some(file) = options.weights.file.as_ref() else {
+        return;
+    };
+    let path = std::fs::canonicalize(file).unwrap_or_else(|_| file.clone());
+    // A file that cannot be read is reported by the compile, which loads it
+    // next; there is nothing to bind to.
+    let Ok(stored) = nsl_codegen::weight_aware::read_stored_tensors(&path) else {
+        return;
+    };
+    let resolve = |sym: nsl_ast::Symbol| interner.resolve(sym.0).unwrap_or("").to_string();
+    let writes = nsl_codegen::weight_aware::analyze_weight_writes(modules, &resolve);
+    options.weights.bind = Some(nsl_codegen::weight_aware::WeightBinding {
+        path,
+        writes,
+        stored: std::sync::Arc::new(stored),
+    });
+}
+
 /// `base` with the entry module's `@adapter` decorators handed down, for
 /// compiling (or laying out the models of) a module the entry imports.
 ///

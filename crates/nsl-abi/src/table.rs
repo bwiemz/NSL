@@ -648,6 +648,13 @@ macro_rules! for_each_runtime_fn {
             // adapter tensors, which the file may hold or leave out
             // (path_ptr, path_len, names_list, param_list, base_count).
             [training] nsl_model_load_with_adapters(i64, i64, i64, i64, i64) -> () = checkpoint::nsl_model_load_with_adapters;
+            // `-w`: open the weights file at startup and check the tensors the compile
+            // specialized on (path_ptr, path_len, expectation_table_ptr, table_len); then
+            // each model constructor copies a named tensor into a field
+            // (tensor, name_ptr, name_len, strict: 0 skips a tensor whose
+            // shape is not the field's).
+            [training] nsl_weights_bind(i64, i64, i64, i64) -> () = weights_file::nsl_weights_bind;
+            [training] nsl_weights_load_field(i64, i64, i64, i64) -> () = weights_file::nsl_weights_load_field;
             // Milestone B + item 8: full training-state checkpoint (θ .nslm + .optim
             // sidecar with m/v moments, micro-batch step counter, data position and
             // RNG state). Save: (path_ptr, path_len, names_list, param_list,
@@ -1352,6 +1359,6 @@ mod tests {
     fn table_is_the_recorded_size() {
         // The count is pinned so a row dropped by a bad merge is noticed; move
         // it with a row that is deliberately added or removed.
-        assert_eq!(RUNTIME_ABI.len(), 671);
+        assert_eq!(RUNTIME_ABI.len(), 673);
     }
 }

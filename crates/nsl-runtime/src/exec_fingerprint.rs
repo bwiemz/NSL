@@ -80,6 +80,12 @@ const ARITHMETIC_KEYS: &[&str] = &[
     //   prune_frac    --wggo-layer-prune-fraction and a digest of the
     //                 --wggo-weights file it ranks blocks by
     "prune_layers", "prune_frac",
+    // `-w` value specialization: a digest of the content hashes of the
+    // weights-file tensors the compiled code may depend on. Emitted only when
+    // there are any (a build that specializes on nothing, and an older
+    // checkpoint, agree by both lacking it). A resume under a program
+    // specialized on other values is a different computation.
+    "wspec",
 ];
 
 /// Keys that move bytes without changing the value computed.

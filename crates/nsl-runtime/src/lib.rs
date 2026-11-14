@@ -268,6 +268,7 @@ pub mod data_source;
 pub mod packing;
 pub mod dataloader;
 pub mod weight_provider;
+pub mod weights_file;
 pub mod paged_kv;
 pub mod profiling;
 pub mod kernel_profiler;

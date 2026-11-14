@@ -467,6 +467,10 @@ impl Compiler<'_> {
                 }
             }
 
+            // `-w`: the fields the weights file names take its values, before
+            // anything (the adapter tables below included) reads them.
+            self.emit_weight_file_loads(&mut builder, ptr, &model_name)?;
+
             // WRGA: the adapter side-table. The pre-scan
             // (`wrga_prescan::prescan_adapter_sites_from_decorators`) runs
             // before any constructor is compiled, so the adapter sites are

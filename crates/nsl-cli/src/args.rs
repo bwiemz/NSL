@@ -555,7 +555,11 @@ pub(crate) struct BuildArgs {
         #[arg(long)]
         pub(crate) standalone: bool,
 
-        /// Path to the model weights file to bundle with the standalone executable
+        /// Path to the model's weights file (.safetensors). The built program
+        /// loads it into the model when it starts (every parameter the file
+        /// names), and may be specialized on the values of parameters it never
+        /// writes; it then refuses to start if those tensors have changed.
+        /// With --standalone the file is bundled into the executable instead
         #[arg(short = 'w', long)]
         pub(crate) weights: Option<PathBuf>,
 
@@ -1741,8 +1745,10 @@ pub(crate) struct RunArgs {
         #[arg(long, requires = "stream_arena")]
         pub(crate) stream_async_writeback: bool,
 
-        /// Path to the model weights file (.safetensors) for the
-        /// weight-aware CPDT path. Mirrors `nsl build -w/--weights`.
+        /// Path to the model's weights file (.safetensors). The program runs
+        /// with the file's values: every parameter the file names is loaded
+        /// when its model is constructed. Also the input to the weight-aware
+        /// planners (CPDT, WRGA, CEP). Mirrors `nsl build -w/--weights`.
         #[arg(short = 'w', long)]
         pub(crate) weights: Option<PathBuf>,
 
