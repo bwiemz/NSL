@@ -316,23 +316,56 @@ impl<'a> TypeChecker<'a> {
     /// Until calls bind by name, a named argument must sit in the position
     /// of the parameter it names; anything else is refused here, where the
     /// declaration's parameter names are known: a function or model declared
-    /// in this module, or a method called on a value whose type is a model
-    /// declared in this module. Every other call (imported callables,
-    /// builtins, receivers of unknown type) is left alone — its parameter
-    /// names are not visible here.
+    /// in this module or imported into it (`from m import f`, `import m as
+    /// a` then `a.f(...)`), or a method called on a value whose type is such
+    /// a model. Every other call (builtins, receivers of unknown type) is
+    /// left alone — its parameter names are not visible here.
     fn check_named_argument_order(&mut self, callee: &Expr, args: &[Arg]) {
         if args.iter().all(|a| a.name.is_none()) {
             return;
         }
-        let key = match &callee.kind {
-            ExprKind::Ident(sym) => (None, *sym),
+        let (names, callable) = match &callee.kind {
+            ExprKind::Ident(sym) => {
+                let key = (None, *sym);
+                let names = self
+                    .call_param_names
+                    .get(&key)
+                    .or_else(|| self.import_param_names.direct.get(&key));
+                (names.cloned(), *sym)
+            }
             ExprKind::MemberAccess { object, member } => match self.type_map.get(&object.id) {
-                Some(Type::Model { name, .. }) => (Some(*name), *member),
+                Some(Type::Model { name, .. }) => {
+                    let key = (Some(*name), *member);
+                    let local = self.call_param_names.get(&key);
+                    let imported = self.import_param_names.direct.get(&key);
+                    // A model of this module and an imported model can share
+                    // a declared name (the import carries an alias). The
+                    // receiver's type does not say which one it is, so when
+                    // their lists differ the call is not judged.
+                    let names = match (local, imported) {
+                        (Some(l), Some(i)) if l != i => None,
+                        (Some(l), _) => Some(l),
+                        (None, i) => i,
+                    };
+                    (names.cloned(), *member)
+                }
+                // `alias.f(...)` after `import m as alias`.
+                Some(Type::Module { .. }) => {
+                    let names = match &object.kind {
+                        ExprKind::Ident(alias) => self
+                            .import_param_names
+                            .modules
+                            .get(alias)
+                            .and_then(|table| table.get(&(None, *member))),
+                        _ => None,
+                    };
+                    (names.cloned(), *member)
+                }
                 _ => return,
             },
             _ => return,
         };
-        let Some(names) = self.call_param_names.get(&key).cloned() else {
+        let Some(names) = names else {
             return;
         };
         let Some((index, arg)) =
@@ -345,7 +378,7 @@ impl<'a> TypeChecker<'a> {
             Some(n) => format!("parameter `{}`", self.resolve_name(*n)),
             None => "no parameter".to_string(),
         };
-        let callable = self.resolve_name(key.1);
+        let callable = self.resolve_name(callable);
         self.diagnostics.push(
             Diagnostic::error(format!(
                 "argument `{given}` of `{callable}` is passed in position {}, which binds {binds}",

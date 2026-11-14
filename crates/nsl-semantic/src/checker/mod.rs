@@ -105,6 +105,11 @@ pub struct TypeChecker<'a> {
     /// refuse a named argument that is not in its parameter's position — see
     /// `check_named_argument_order`.
     pub(crate) call_param_names: HashMap<(Option<Symbol>, Symbol), Vec<Symbol>>,
+    /// The same, for callables imported from other modules (supplied by the
+    /// module loader, which has their declarations). Consulted after
+    /// `call_param_names`, so a declaration in this module shadows an import
+    /// of the same name.
+    pub(crate) import_param_names: crate::ImportedParamNames,
 }
 
 impl<'a> TypeChecker<'a> {
@@ -129,41 +134,25 @@ impl<'a> TypeChecker<'a> {
             fused_kl_ce_configs: Vec::new(),
             pca_configs: Vec::new(),
             call_param_names: HashMap::new(),
+            import_param_names: crate::ImportedParamNames::default(),
         }
     }
 
     /// Record the parameter names of every function, model constructor and
     /// method declared in `stmts` (decorated declarations included).
     fn collect_call_param_names(&mut self, stmts: &[Stmt]) {
-        for stmt in stmts {
-            let mut inner = stmt;
-            while let StmtKind::Decorated { stmt: wrapped, .. } = &inner.kind {
-                inner = wrapped;
-            }
-            match &inner.kind {
-                StmtKind::FnDef(fn_def) => self.record_param_names(None, fn_def.name, &fn_def.params),
-                StmtKind::ModelDef(model_def) => {
-                    self.record_param_names(None, model_def.name, &model_def.params);
-                    for member in &model_def.members {
-                        if let nsl_ast::decl::ModelMember::Method(method, _) = member {
-                            self.record_param_names(Some(model_def.name), method.name, &method.params);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    fn record_param_names(&mut self, owner: Option<Symbol>, callable: Symbol, params: &[nsl_ast::decl::Param]) {
-        let names: Vec<Symbol> =
-            params.iter().map(|p| p.name).filter(|n| self.resolve_name(*n) != "self").collect();
-        self.call_param_names.insert((owner, callable), names);
+        self.call_param_names = crate::declared_param_names(stmts, self.interner);
     }
 
     /// Set pre-resolved import types from other modules.
     pub fn set_import_types(&mut self, import_types: &HashMap<Symbol, Type>) {
         self.import_types = import_types.clone();
+    }
+
+    /// Set the parameter names of imported callables (see
+    /// [`crate::ImportedParamNames`]).
+    pub fn set_import_param_names(&mut self, names: &crate::ImportedParamNames) {
+        self.import_param_names = names.clone();
     }
 
     pub fn check_module(&mut self, module: &Module) {

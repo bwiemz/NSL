@@ -55,6 +55,61 @@ use crate::types::Type;
 /// Maps imported symbol names to their resolved types from other modules.
 pub type ImportTypes = HashMap<Symbol, Type>;
 
+/// Declared parameter names (without `self`) of callables, keyed as the
+/// checker keys its own module's: a free function or a model constructor is
+/// `(None, name)`, a method is `(Some(model), method)`.
+pub type ParamNames = HashMap<(Option<Symbol>, Symbol), Vec<Symbol>>;
+
+/// What a module can know about the callables it imports, beyond their
+/// types: their parameter NAMES. Types carry none, and codegen binds
+/// arguments by position, so without this `f(b = 1, a = 2)` on an imported
+/// `f(a, b)` ran as `f(a = 1, b = 2)` with no diagnostic.
+#[derive(Debug, Clone, Default)]
+pub struct ImportedParamNames {
+    /// `from m import f` / `from m import f as g` / `from m import *`:
+    /// functions and constructors under their LOCAL name, methods under the
+    /// model's declared name (a receiver's type keeps that name whatever the
+    /// import was called).
+    pub direct: ParamNames,
+    /// `import m as alias`: the module's own table, reached as `alias.f(...)`.
+    pub modules: HashMap<Symbol, ParamNames>,
+}
+
+/// The parameter names of every function, model constructor and method
+/// declared at the top level of `stmts` (decorated declarations included).
+pub fn declared_param_names(stmts: &[nsl_ast::stmt::Stmt], interner: &Interner) -> ParamNames {
+    use nsl_ast::stmt::StmtKind;
+    let names = |params: &[nsl_ast::decl::Param]| -> Vec<Symbol> {
+        params
+            .iter()
+            .map(|p| p.name)
+            .filter(|n| interner.resolve(n.0) != Some("self"))
+            .collect()
+    };
+    let mut out = ParamNames::new();
+    for stmt in stmts {
+        let mut inner = stmt;
+        while let StmtKind::Decorated { stmt: wrapped, .. } = &inner.kind {
+            inner = wrapped;
+        }
+        match &inner.kind {
+            StmtKind::FnDef(fn_def) => {
+                out.insert((None, fn_def.name), names(&fn_def.params));
+            }
+            StmtKind::ModelDef(model_def) => {
+                out.insert((None, model_def.name), names(&model_def.params));
+                for member in &model_def.members {
+                    if let nsl_ast::decl::ModelMember::Method(method, _) = member {
+                        out.insert((Some(model_def.name), method.name), names(&method.params));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Per-function ownership metadata extracted during M38a analysis.
 #[derive(Debug, Clone, Default)]
 pub struct FunctionOwnershipInfo {
@@ -134,6 +189,25 @@ pub fn analyze_with_imports(
     import_types: &ImportTypes,
     linear_types: bool,
 ) -> AnalysisResult {
+    analyze_with_import_context(
+        module,
+        interner,
+        import_types,
+        &ImportedParamNames::default(),
+        linear_types,
+    )
+}
+
+/// [`analyze_with_imports`], plus the parameter names of the imported
+/// callables, so a named argument to one of them is checked against its
+/// declaration exactly as a call to a function of this module is.
+pub fn analyze_with_import_context(
+    module: &Module,
+    interner: &mut Interner,
+    import_types: &ImportTypes,
+    import_param_names: &ImportedParamNames,
+    linear_types: bool,
+) -> AnalysisResult {
     let mut scopes = ScopeMap::new();
 
     // Phase 1: Register built-in types and functions
@@ -142,6 +216,7 @@ pub fn analyze_with_imports(
     // Phase 2: Run the type checker with import context
     let mut checker = TypeChecker::new(interner, &mut scopes);
     checker.set_import_types(import_types);
+    checker.set_import_param_names(import_param_names);
     checker.check_module(module);
 
     // M51: Effect analysis is now integrated into TypeChecker — propagation
