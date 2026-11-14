@@ -54,21 +54,28 @@ const EXPECTED_KEYS_LABEL: &str = "expected model=, epochs=, grad_accumulation=,
 /// and `t_max` in the `scheduler:` section.
 ///
 /// Without accumulation the two are the same thing. With
-/// `grad_accumulation = N` a schedule written for optimizer steps runs N
-/// times too fast if it is advanced per micro-batch, which is what a train
-/// block does unless told otherwise: the default is kept so that no
-/// existing run changes, and the checker warns when the choice was not
-/// written down ([`schedule_unit_warning`]).
+/// `grad_accumulation = N` the default is optimizer steps, the unit every
+/// other framework's scheduler counts. Until 2026-11 a train block counted
+/// micro-batches, so a schedule written for that reaches its `warmup_steps`
+/// and `total_steps` N times later under the default; the checker warns
+/// when the choice was not written down ([`schedule_unit_warning`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScheduleUnit {
-    /// The schedule advances once per micro-batch (the default).
+    /// The schedule advances once per micro-batch: the rate changes inside
+    /// an accumulation window, and the update at the end of a window uses
+    /// the rate of its last micro-batch.
     MicroBatch,
-    /// The schedule advances once per optimizer step: every micro-batch of
-    /// an accumulation window runs at `schedule(window index)`.
+    /// The schedule advances once per optimizer step (the default): every
+    /// micro-batch of an accumulation window runs at `schedule(window index)`.
     OptimizerStep,
 }
 
 impl ScheduleUnit {
+    /// The unit a train header means: what it wrote, or optimizer steps.
+    pub fn resolve(written: Option<ScheduleUnit>) -> ScheduleUnit {
+        written.unwrap_or(ScheduleUnit::OptimizerStep)
+    }
+
     /// The spelling accepted in source.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -91,13 +98,14 @@ pub fn schedule_unit_warning(
         return None;
     }
     Some(format!(
-        "the learning-rate schedule counts micro-batches, not optimizer steps: with \
+        "the learning-rate schedule counts optimizer steps, not micro-batches: with \
          grad_accumulation = {grad_accumulation}, the scheduler's step arguments \
-         (warmup_steps, total_steps, step_size, t_max) are reached after that many \
-         micro-batches, which is {grad_accumulation} times sooner than the same number of \
-         optimizer steps. Write schedule_unit = \"micro_batch\" in train(...) to keep \
-         this and silence the warning, or schedule_unit = \"optimizer_step\" to count \
-         optimizer steps"
+         (warmup_steps, total_steps, step_size, t_max) are reached after \
+         {grad_accumulation} times that many micro-batches. Toolchains before 2026-11 \
+         counted micro-batches here, so a schedule written for them now runs \
+         {grad_accumulation} times slower. Write schedule_unit = \"optimizer_step\" in \
+         train(...) to confirm this unit and silence the warning, or schedule_unit = \
+         \"micro_batch\" to count micro-batches as before"
     ))
 }
 
@@ -125,7 +133,7 @@ pub struct ResolvedTrainConfig {
     pub checkpoint_every: i64,
     pub checkpoint_load: Option<String>,
     /// `Some` when `schedule_unit=` was written. `None` means the default,
-    /// micro-batches (see [`ScheduleUnit`]).
+    /// optimizer steps (see [`ScheduleUnit::resolve`]).
     pub schedule_unit: Option<ScheduleUnit>,
 }
 
@@ -417,10 +425,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_default_unit_is_optimizer_steps() {
+        assert_eq!(ScheduleUnit::resolve(None), ScheduleUnit::OptimizerStep);
+        assert_eq!(
+            ScheduleUnit::resolve(Some(ScheduleUnit::MicroBatch)),
+            ScheduleUnit::MicroBatch
+        );
+    }
+
+    #[test]
     fn the_schedule_unit_warning_fires_only_when_the_unit_is_ambiguous() {
         // Accumulation, a stepped schedule, no unit written: ambiguous.
         let w = schedule_unit_warning(4, None, true).expect("a warning");
         assert!(w.contains("grad_accumulation = 4"), "{w}");
+        assert!(w.contains("counts optimizer steps, not micro-batches"), "{w}");
         assert!(w.contains("schedule_unit = \"optimizer_step\""), "{w}");
         assert!(w.contains("schedule_unit = \"micro_batch\""), "{w}");
         // No accumulation: the two units are the same.

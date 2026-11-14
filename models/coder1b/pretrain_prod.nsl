@@ -30,8 +30,8 @@
 # Derivation (config.nsl carries the same numbers):
 #   micro-steps/epoch = floor(22,595,922,912 / (2048*2)) = 5,516,582
 #   total micro-steps = 1 epoch x 5,516,582              = 5,516,582
-#   warmup            = 8,192 micro-steps                (~0.15%)
-#   optimizer steps   = floor(5,516,582 / accum(4))      = 1,379,145
+#   optimizer steps   = ceil(5,516,582 / accum(4))       = 1,379,146
+#   warmup            = 2,048 optimizer steps            (~0.15%)
 #   tokens/opt step   = 2 * 2048 * 4                     = 16,384
 #   checkpoints       = every 2,000 opt steps            (~83 min at 6,568 tok/s)
 #   wall estimate     = 22.6B / 6,568 tok/s              = ~40 days resident
@@ -130,10 +130,18 @@
 # decayed -- a 4-5x noise reduction. An A/B at this size should decay for
 # MEASUREMENT reasons alone, independent of convergence.
 #
-# UNITS (same as the 50M/500M recipes): the scheduler counts MICRO-batches (lr
-# is recomputed every micro-batch; with grad_accumulation=4 the effective
-# warmup is 8192/4 = 2,048 optimizer steps). checkpoint_every counts OPTIMIZER
-# steps — codegen converts internally. DROPOUT is 0.0 at this size, so the
+# UNITS (same as the 50M/500M recipes): the scheduler counts OPTIMIZER steps
+# (schedule_unit below): every micro-batch of an accumulation window runs at
+# one rate. Until 2026-11 this file was written in micro-batches (warmup 8192,
+# total 5516582), the only unit the compiler then had; 2048 and 1379146 are
+# those divided by the accumulation. The unit is stated because this directory
+# is pinned to the 0.10-lts toolchain, whose default is still micro-batches; it
+# needs an 0.10-lts install that knows the key (2026-11 or later). A checkpoint
+# saved by the micro-batch version of this file is refused on resume as a
+# trajectory change (NSL_RESUME_ALLOW_TRAJECTORY_DRIFT=1 acknowledges it: the
+# restored step counter lands at the same point of the schedule, and the rate
+# then holds within a window instead of moving every micro-batch).
+# checkpoint_every counts OPTIMIZER steps as well. DROPOUT is 0.0 at this size, so the
 # dropout op elides entirely (Milestone B: a p=0 config that could not resolve
 # its p ran REAL dropout at 0.1 and cost 1.5 GiB; PR #507 made an unresolved p
 # refuse instead of defaulting).
@@ -325,9 +333,9 @@ print("LOSS_STREAM_BEGIN")
 # the absence of a `[fused-lce] forward route=` line, and the PEAK_* block
 # below.
 @fused_lm_ce(enabled=true, vocab_size=49152, hidden_size=2048, batch_size=2, seq_len=2048)
-train(model=m, epochs=1, grad_accumulation=4, grad_clip=1.0, checkpoint_load="checkpoints/pretrain_prod_state.nslm", checkpoint_save="checkpoints/pretrain_prod_state.nslm", checkpoint_every=2000):
+train(model=m, epochs=1, grad_accumulation=4, schedule_unit="optimizer_step", grad_clip=1.0, checkpoint_load="checkpoints/pretrain_prod_state.nslm", checkpoint_save="checkpoints/pretrain_prod_state.nslm", checkpoint_every=2000):
     optimizer: AdamW(lr=0.000015, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
-    scheduler: warmup_cosine(warmup_steps=8192, total_steps=5516582, min_lr=0.0000045)
+    scheduler: warmup_cosine(warmup_steps=2048, total_steps=1379146, min_lr=0.0000045)
     step(batch):
         let logits = m.forward_train(batch.input_ids, true)
         let flat_logits = logits.reshape([4096, 49152])

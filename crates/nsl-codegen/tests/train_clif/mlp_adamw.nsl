@@ -17,7 +17,7 @@ let m = Mlp()
 let x = ones([4, 4])
 let y = zeros([4, 2])
 
-train(model = m, epochs = 2, grad_accumulation = 2, grad_clip = 1.0):
+train(model = m, epochs = 2, grad_accumulation = 2, schedule_unit = "micro_batch", grad_clip = 1.0):
     optimizer: AdamW(lr = 0.01, weight_decay = 0.01)
     scheduler: warmup_cosine(warmup_steps = 1, total_steps = 4, min_lr = 0.001)
     step(batch):

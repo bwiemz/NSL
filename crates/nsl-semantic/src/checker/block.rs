@@ -54,8 +54,9 @@ impl<'a> TypeChecker<'a> {
         };
 
         // Under accumulation the schedule's step arguments are counted in
-        // micro-batches unless the header says otherwise. That is a unit
-        // nobody can read off the source, so say it once, at compile time.
+        // optimizer steps unless the header says otherwise; older toolchains
+        // counted micro-batches. That is a unit nobody can read off the
+        // source, so say it once, at compile time.
         if let (Some(train_cfg), Some(optim_cfg)) = (&train_cfg, &optim_cfg) {
             let stepped = optim_cfg.scheduler.as_ref().is_some_and(|s| {
                 !matches!(s, crate::optim_config::ResolvedScheduler::ConstantLr)

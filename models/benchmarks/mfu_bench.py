@@ -161,7 +161,11 @@ def build_program(
         batch_size=batch_size,
         seq_len=seq_len,
         grad_clip=grad_clip,
-        accum_arg=f", grad_accumulation={grad_accum}" if grad_accum > 1 else "",
+        accum_arg=(
+            f', grad_accumulation={grad_accum}, schedule_unit="micro_batch"'
+            if grad_accum > 1
+            else ""
+        ),
         extra_train_args=extra,
         decorator=decorator,
         rows=batch_size * seq_len,

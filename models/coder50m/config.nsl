@@ -16,13 +16,15 @@ const DROPOUT = 0.1
 # Pretrain hyperparameters — MUST agree with pretrain_prod.nsl; enforced by
 # crates/nsl-cli/tests/pretrain_prod_agreement_gate.rs. The scheduler
 # numbers are DERIVED from the real corpus:
-#   PRETRAIN_TOTAL_STEPS = PRETRAIN_EPOCHS * floor(CORPUS_TOKENS / MAX_SEQ_LEN)
-# (scheduler steps are micro-batches; the old 305000 figure described a
-# corpus this repo never contained.)
+#   micro-batches        = PRETRAIN_EPOCHS * floor(CORPUS_TOKENS / MAX_SEQ_LEN) = 26148
+#   PRETRAIN_TOTAL_STEPS = ceil(micro-batches / PRETRAIN_GRAD_ACCUMULATION)
+# (scheduler steps are OPTIMIZER steps, schedule_unit="optimizer_step" in
+# pretrain_prod.nsl; until 2026-11 they were micro-batches, 1300 and 26148.
+# The old 305000 figure described a corpus this repo never contained.)
 const CORPUS_TOKENS = 8925916
 const PRETRAIN_LR = 0.0003
-const PRETRAIN_WARMUP = 1300
-const PRETRAIN_TOTAL_STEPS = 26148
+const PRETRAIN_WARMUP = 163
+const PRETRAIN_TOTAL_STEPS = 3269
 const PRETRAIN_MIN_LR = 0.00003
 const PRETRAIN_BATCH_SIZE = 1
 const PRETRAIN_GRAD_ACCUMULATION = 8

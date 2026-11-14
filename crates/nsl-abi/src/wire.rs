@@ -253,7 +253,8 @@ pub mod train_config {
     /// the refusal into a loud acknowledgment. `sp4..sp6` are reserved
     /// ahead of any 4+-parameter scheduler: a parameter rendered under a
     /// key in neither class would be silently unguarded. `sched_unit` is
-    /// rendered only for `schedule_unit = "optimizer_step"`: resuming a
+    /// rendered only for a stepped schedule counted in optimizer steps
+    /// under accumulation (the default unit): resuming a
     /// checkpoint under the other unit re-reads the restored step counter
     /// through a schedule N times slower or faster.
     pub const TRAJECTORY_KEYS: &[&str] = &[

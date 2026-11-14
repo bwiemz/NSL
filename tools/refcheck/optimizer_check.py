@@ -45,9 +45,29 @@ WARMUP, TOTAL, MIN_LR = 8.0, 100.0, 1e-5
 FIT_PARAMS = ["blocks[3].ffn.w_up", "blocks[7].attn.wo", "blocks[0].ffn.w_down"]
 
 
+def schedule_step(a: argparse.Namespace, k: int) -> int:
+    """The schedule step of the update that micro-batch ``k``'s window ends in.
+
+    Optimizer-step units: the index of that update. Micro-batch units (and
+    "legacy", a toolchain from before the key, which counted micro-batches):
+    the index of the window's last micro-batch.
+    """
+    window = k // a.accum
+    if a.schedule_unit == "optimizer_step":
+        return window
+    return window * a.accum + a.accum - 1
+
+
 def nsl_run(a: argparse.Namespace, cfg, seq: int, optimizer: str, micro: int) -> None:
-    train_args = (f", grad_accumulation={a.accum}" if a.accum > 1 else "") + (
-        f", grad_clip={a.clip}" if a.clip > 0 else ""
+    unit = (
+        f', schedule_unit="{a.schedule_unit}"'
+        if a.accum > 1 and (a.schedule or a.applied_lr) and a.schedule_unit != "legacy"
+        else ""
+    )
+    train_args = (
+        (f", grad_accumulation={a.accum}" if a.accum > 1 else "")
+        + unit
+        + (f", grad_clip={a.clip}" if a.clip > 0 else "")
     )
     schedule = f"    scheduler: warmup_cosine(warmup_steps={WARMUP:g}, total_steps={TOTAL:g}, min_lr={MIN_LR})\n"
     program = TRAIN_PROGRAM.format(
@@ -89,11 +109,8 @@ def applied_lr(
     basis = np.stack(grads, axis=1)
     coeffs, *_ = np.linalg.lstsq(basis, delta, rcond=None)
     residual = float(np.linalg.norm(basis @ coeffs - delta) / np.linalg.norm(delta))
-    # The update at the end of an accumulation window uses the rate of its last micro-batch.
     expected = [
-        warmup_cosine(
-            a.lr, (k // a.accum) * a.accum + a.accum - 1, WARMUP, TOTAL, MIN_LR
-        )
+        warmup_cosine(a.lr, schedule_step(a, k), WARMUP, TOTAL, MIN_LR)
         for k in range(micro)
     ]
     print(f"{'micro':>5s} {'applied lr':>12s} {'schedule':>12s}")
@@ -133,7 +150,9 @@ def update_parity(
         if (k + 1) % a.accum == 0:
             if a.schedule:
                 for group in opt.param_groups:
-                    group["lr"] = warmup_cosine(a.lr, k, WARMUP, TOTAL, MIN_LR)
+                    group["lr"] = warmup_cosine(
+                        a.lr, schedule_step(a, k), WARMUP, TOTAL, MIN_LR
+                    )
             if a.clip > 0:
                 torch.nn.utils.clip_grad_norm_(params, a.clip)
             opt.step()
@@ -171,6 +190,13 @@ def main() -> int:
     ap.add_argument("--workdir", type=Path, default=Path("refcheck-work/optim"))
     ap.add_argument("--steps", type=int, default=3, help="optimizer steps")
     ap.add_argument("--accum", type=int, default=1)
+    ap.add_argument(
+        "--schedule-unit",
+        choices=["optimizer_step", "micro_batch", "legacy"],
+        default="optimizer_step",
+        help="what one schedule step is under --accum; 'legacy' omits the key "
+        "for a toolchain that predates it (0.10-lts), which counts micro-batches",
+    )
     ap.add_argument("--clip", type=float, default=0.0)
     ap.add_argument("--wd", type=float, default=0.0)
     ap.add_argument("--lr", type=float, default=1e-3)

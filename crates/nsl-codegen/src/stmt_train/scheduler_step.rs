@@ -5,10 +5,10 @@
 //! * [`Compiler::emit_scheduler_lr`] runs at the TOP of every micro-step,
 //!   before the forward: it calls the resolved scheduler with the current
 //!   0-based step and redefines the learning rate. The step is the
-//!   micro-batch count by default, so under `grad_accumulation = N` the
-//!   schedule's `warmup_steps` / `total_steps` are in micro-batches;
-//!   `schedule_unit = "optimizer_step"` in the train header makes it the
-//!   optimizer-step index, `step_count / N`. Either way
+//!   optimizer-step index, `step_count / N`, by default, so under
+//!   `grad_accumulation = N` the schedule's `warmup_steps` / `total_steps`
+//!   are in optimizer steps; `schedule_unit = "micro_batch"` in the train
+//!   header makes it the micro-batch count. Either way
 //!   the optimizer update taken at step `k` uses `schedule(k)` — on the
 //!   standard step, on the CSLA window schedule that updates parameters
 //!   inside the backward, and on the first step after a checkpoint resume.
@@ -100,11 +100,12 @@ impl Compiler<'_> {
 
             let base_lr_val = builder.ins().f64const(lr_value);
             let step_count_val = builder.use_var(step_count_var);
-            // `schedule_unit = "optimizer_step"`: the schedule's step is the
+            // Optimizer-step units (the default): the schedule's step is the
             // index of the optimizer step this micro-batch belongs to, so
             // every micro-batch of a window runs at one rate and
-            // `warmup_steps` / `total_steps` count optimizer steps. The
-            // default (micro-batches) emits nothing here.
+            // `warmup_steps` / `total_steps` count optimizer steps.
+            // `schedule_unit = "micro_batch"`, and any block without
+            // accumulation, emits nothing here.
             let window = plan.schedule.grad_accumulation_steps;
             let schedule_step = if plan.schedule.schedule_in_optimizer_steps && window > 1 {
                 let n = builder.ins().iconst(cl_types::I64, window);

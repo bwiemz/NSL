@@ -1,18 +1,18 @@
 //! What one step of the learning-rate schedule is, under accumulation.
 //!
-//! With `grad_accumulation = N` a train block advances its `scheduler:`
-//! once per micro-batch, so `warmup_steps`, `total_steps`, `step_size` and
-//! `t_max` are reached N times sooner than the same number of optimizer
-//! steps. Nothing in the source says so, and a recipe copied from a
-//! framework that counts optimizer steps warms up and decays N times too
-//! fast without any message.
+//! With `grad_accumulation = N` a train block used to advance its
+//! `scheduler:` once per micro-batch, so `warmup_steps`, `total_steps`,
+//! `step_size` and `t_max` were reached N times sooner than the same number
+//! of optimizer steps. Nothing in the source said so, and a recipe copied
+//! from a framework that counts optimizer steps warmed up and decayed N
+//! times too fast without any message.
 //!
-//! The unit is now something a program can state:
-//! `schedule_unit = "optimizer_step"` counts optimizer steps, and
-//! `schedule_unit = "micro_batch"` is the unit a block has always had. A
-//! block that combines a schedule with accumulation and states neither
-//! keeps counting micro-batches, so no run changes, and gets a compile-time
-//! warning.
+//! The unit is now something a program can state, and the default is the
+//! one other frameworks use: `schedule_unit = "optimizer_step"` counts
+//! optimizer steps, and `schedule_unit = "micro_batch"` is the unit a block
+//! had before. A block that combines a schedule with accumulation and
+//! states neither counts optimizer steps and gets a compile-time warning,
+//! because a schedule written for the old unit now runs N times slower.
 //!
 //! The reference is worked out by hand. `pred = x @ w` with
 //! `x = ones([4, 2])`, `w = ones([2, 1])` and `loss = mean(pred^2)` gives
@@ -125,14 +125,14 @@ fn assert_close(got: f64, want: f64, what: &str) {
     );
 }
 
-const WARNING: &str = "the learning-rate schedule counts micro-batches, not optimizer steps";
+const WARNING: &str = "the learning-rate schedule counts optimizer steps, not micro-batches";
 
 #[test]
-fn the_default_unit_is_micro_batches_and_says_so() {
+fn the_default_unit_is_optimizer_steps_and_says_so() {
     let source = program(8, ", grad_accumulation = 2", STEP_LR);
-    for ad in [&[][..], &["--source-ad"][..]] {
+    for ad in [&[][..], &["--source-ad"][..], &["--training-reference"][..]] {
         let (w, stderr) = trained_weight(&source, ad);
-        assert_close(w, 0.6 * 0.8 * 0.9 * 0.95, &format!("default unit, {ad:?}"));
+        assert_close(w, 0.6 * 0.6 * 0.8 * 0.8, &format!("default unit, {ad:?}"));
         assert!(
             stderr.contains(WARNING),
             "{ad:?}: no warning about the unit:\n{stderr}"
@@ -147,9 +147,15 @@ fn micro_batch_units_can_be_stated_and_are_then_silent() {
         ", grad_accumulation = 2, schedule_unit = \"micro_batch\"",
         STEP_LR,
     );
-    let (w, stderr) = trained_weight(&source, &[]);
-    assert_close(w, 0.6 * 0.8 * 0.9 * 0.95, "schedule_unit = \"micro_batch\"");
-    assert!(!stderr.contains(WARNING), "{stderr}");
+    for ad in [&[][..], &["--source-ad"][..], &["--training-reference"][..]] {
+        let (w, stderr) = trained_weight(&source, ad);
+        assert_close(
+            w,
+            0.6 * 0.8 * 0.9 * 0.95,
+            &format!("schedule_unit = \"micro_batch\", {ad:?}"),
+        );
+        assert!(!stderr.contains(WARNING), "{ad:?}: {stderr}");
+    }
 }
 
 #[test]
@@ -203,6 +209,12 @@ fn the_trailing_window_is_stepped_at_its_own_rate_in_either_unit() {
         trained_weight(&optimizer, &[]).0,
         0.2304 * 0.9,
         "9 micro-batches, optimizer-step unit",
+    );
+    let unstated = program(9, ", grad_accumulation = 2", STEP_LR);
+    assert_close(
+        trained_weight(&unstated, &[]).0,
+        0.2304 * 0.9,
+        "9 micro-batches, unit not stated",
     );
 }
 

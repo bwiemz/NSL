@@ -49,7 +49,8 @@ pub(crate) struct TrainConfigRecordInputs<'a> {
     pub(crate) adamw_lr_value: Option<f64>,
     pub(crate) no_decay_scope: &'a NoDecayScope,
     pub(crate) scheduler: &'a Option<ResolvedScheduler>,
-    /// `schedule_unit = "optimizer_step"`.
+    /// The schedule counts optimizer steps (the default; false only for
+    /// `schedule_unit = "micro_batch"`).
     pub(crate) schedule_in_optimizer_steps: bool,
 }
 
@@ -165,10 +166,17 @@ sched={sched_s}",
     for (i, v) in sched_params.iter().enumerate() {
         rec.push_str(&format!(",sp{}={v}", i + 1));
     }
-    // Appended only when set, so the record of every block written before
-    // the key existed (all of them in micro-batch units) is unchanged and
-    // their checkpoints still load.
-    if schedule_in_optimizer_steps {
+    // Appended only where the unit changes the trajectory: accumulation
+    // and a schedule that reads the step. Every checkpoint written before
+    // the key existed was in micro-batch units and carries no such field,
+    // so it still loads into a block that states `schedule_unit =
+    // "micro_batch"` (or to which the unit makes no difference), and is
+    // refused as a trajectory change by a block that now counts optimizer
+    // steps.
+    let stepped = scheduler.as_ref().is_some_and(|s| {
+        !matches!(s, nsl_semantic::optim_config::ResolvedScheduler::ConstantLr)
+    });
+    if schedule_in_optimizer_steps && grad_accumulation_steps > 1 && stepped {
         rec.push_str(",sched_unit=optimizer_step");
     }
     rec
@@ -290,19 +298,33 @@ mod tests {
         }
     }
 
-    /// The unit is rendered only when it is optimizer steps, so every
-    /// record written before the key existed still compares equal to the
-    /// same block compiled today.
+    /// The unit is rendered only where it changes the trajectory: a stepped
+    /// schedule under accumulation, counted in optimizer steps. Every
+    /// record written before the key existed (micro-batch units, no field)
+    /// then still compares equal to the same block stating
+    /// `schedule_unit = "micro_batch"`.
     #[test]
-    fn the_schedule_unit_is_rendered_only_for_optimizer_steps() {
+    fn the_schedule_unit_is_rendered_only_where_it_matters() {
         let nd = NoDecayScope { static_roles: vec![], exempt_non_rank2: false };
         let sched = Some(ResolvedScheduler::StepLr { step_size: 10.0, gamma: 0.5 });
         let mut i = inputs(&nd, &sched);
-        let default_unit = render_train_config_record(&i);
-        assert!(!default_unit.contains("sched_unit"), "{default_unit}");
+        let micro_unit = render_train_config_record(&i);
+        assert!(!micro_unit.contains("sched_unit"), "{micro_unit}");
         i.schedule_in_optimizer_steps = true;
         let rec = render_train_config_record(&i);
-        assert_eq!(rec, format!("{default_unit},sched_unit=optimizer_step"));
+        assert_eq!(rec, format!("{micro_unit},sched_unit=optimizer_step"));
+
+        // No accumulation: one micro-batch is one optimizer step.
+        i.grad_accumulation_steps = 1;
+        assert!(!render_train_config_record(&i).contains("sched_unit"));
+        i.grad_accumulation_steps = 4;
+        // A schedule that ignores the step, or none.
+        for unstepped in [Some(ResolvedScheduler::ConstantLr), None] {
+            let mut j = inputs(&nd, &unstepped);
+            j.schedule_in_optimizer_steps = true;
+            let rec = render_train_config_record(&j);
+            assert!(!rec.contains("sched_unit"), "{rec}");
+        }
     }
 
     /// The exact string is the contract: the runtime parses it by key and

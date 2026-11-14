@@ -409,13 +409,17 @@ generated.
   epoch's `on_epoch` callback has run. Under `--layerwise-accum` it prints
   a warning instead and the pending gradients are not applied (Part 5).
 - The learning-rate schedule under accumulation (not covered by the
-  proposal): it advances once per micro-batch, so `warmup_steps` and
-  `total_steps` are in micro-batches. `schedule_unit = "optimizer_step"` in
-  `train(...)` makes it advance once per optimizer step;
-  `schedule_unit = "micro_batch"` states the default. A block that combines
-  a schedule with accumulation and states neither gets a compile-time
-  warning (`schedule_unit_warning`,
-  `crates/nsl-semantic/src/train_config.rs`).
+  proposal): it advances once per optimizer step, so `warmup_steps` and
+  `total_steps` are in optimizer steps. `schedule_unit = "micro_batch"` in
+  `train(...)` makes it advance once per micro-batch, the unit before
+  2026-11; `schedule_unit = "optimizer_step"` states the default. A block
+  that combines a schedule with accumulation and states neither gets a
+  compile-time warning (`schedule_unit_warning`,
+  `crates/nsl-semantic/src/train_config.rs`). The 0.10-lts
+  toolchain accepts the key too and keeps micro-batches as its default, so
+  the production recipes pinned to it (`models/coder500m`,
+  `models/coder1b`) state `schedule_unit = "optimizer_step"` and mean the
+  same thing on both toolchains.
 - In use: `models/coder500m/pretrain_prod.nsl`,
   `models/coder1b/pilot_finish.nsl`, `models/coder-rl/pretrain.nsl` and
   others, with `grad_accumulation` of 4 or 8, mostly with `grad_clip = 1.0`.
@@ -549,14 +553,16 @@ code only.
   layer-major schedule is the exception and is listed under Open. Test:
   `crates/nsl-cli/tests/accumulation_full_buffer_gate.rs`, against an AdamW
   written out in the test and checked there against PyTorch's.
-- Under accumulation the learning-rate schedule counts micro-batches, so
-  `warmup_steps` and `total_steps` are reached N times sooner than the same
-  number of optimizer steps, and nothing said so. The unit can now be
-  stated: `schedule_unit = "optimizer_step"` in `train(...)` counts
-  optimizer steps, `schedule_unit = "micro_batch"` is the unit a block has
-  always had. A block that combines a schedule with accumulation and states
-  neither still counts micro-batches, so no existing run changes, and gets a
-  compile-time warning. Test: `crates/nsl-cli/tests/schedule_unit_gate.rs`.
+- Under accumulation the learning-rate schedule counted micro-batches, so
+  `warmup_steps` and `total_steps` were reached N times sooner than the
+  same number of optimizer steps, and nothing said so. The schedule now
+  counts optimizer steps, and the unit can be stated:
+  `schedule_unit = "optimizer_step"` in `train(...)` is the default,
+  `schedule_unit = "micro_batch"` is the unit a block had before. A block
+  that combines a schedule with accumulation and states neither is compiled
+  with a warning, because a schedule written in micro-batches now runs N
+  times slower; a checkpoint saved under the old unit is refused on resume
+  by such a block. Test: `crates/nsl-cli/tests/schedule_unit_gate.rs`.
 - The plan's recipe carried a field `v_uses_approx` that was `true` for
   AdamW and Adam on the deferred path, whose second moment is exact (E3).
   Nothing read it. It is removed.

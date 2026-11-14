@@ -127,7 +127,7 @@ print("LOSS_STREAM_BEGIN")
 # the absence of a `[fused-lce] forward route=` line, and the PEAK_* block
 # below.
 @fused_lm_ce(enabled=true, vocab_size=49152, hidden_size=2048, batch_size=2, seq_len=2048)
-train(model=m, epochs=1, grad_accumulation=4, grad_clip=1.0, checkpoint_save="checkpoints/pretrain_prod_state.nslm", checkpoint_every=100):
+train(model=m, epochs=1, grad_accumulation=4, schedule_unit="micro_batch", grad_clip=1.0, checkpoint_save="checkpoints/pretrain_prod_state.nslm", checkpoint_every=100):
     optimizer: AdamW(lr=0.0001, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
     scheduler: warmup_cosine(warmup_steps=200, total_steps=2048, min_lr=0.00003)
     step(batch):

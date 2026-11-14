@@ -41,10 +41,10 @@ let loader = DataLoader(tokens, batch_size=1, seq_len=1024, shuffle=true, drop_l
 
 print("LOSS_STREAM_BEGIN")
 
-train(model=m, epochs=1, grad_accumulation=2,
+train(model=m, epochs=1, grad_accumulation=2, schedule_unit="optimizer_step",
       checkpoint_save="RESUME_EQUIV_CKPT", checkpoint_every=6):
     optimizer: AdamW(lr=0.0003, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
-    scheduler: warmup_cosine(warmup_steps=4, total_steps=24, min_lr=0.00003)
+    scheduler: warmup_cosine(warmup_steps=2, total_steps=12, min_lr=0.00003)
     step(batch):
         let logits = m.forward_train(batch.input_ids, false)
         let ls = logits.shape

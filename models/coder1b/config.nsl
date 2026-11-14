@@ -93,15 +93,18 @@ const WEB_VAL_TOKENS = 11942304
 #         3e-5 reversed (paired delta -0.97 by micro 17k and growing).
 # min_lr keeps the arms' 0.3 peak ratio (1.5e-5 * 0.3 = 4.5e-6).
 const PRETRAIN_LR = 0.000015
-# Warmup 8192 micro-steps = 2,048 optimizer steps = ~33.5M tokens (~0.15% of
-# the schedule). A CHOSEN default in the large-corpus convention, not a
+# Warmup 2,048 optimizer steps (8192 micro-steps) = ~33.5M tokens (~0.15% of
+# the schedule). Scheduler steps are OPTIMIZER steps, schedule_unit=
+# "optimizer_step" in pretrain_prod.nsl; until 2026-11 they were micro-batches,
+# 8192 and 5516582. A CHOSEN default in the large-corpus convention, not a
 # measurement — the item-6 pilot validated the shape (descent through
 # warmup in both arms; the ramp is not the problem). The old 200 was
 # ~9.8% of a 2048-micro toy schedule; carrying that fraction to 22.6B would
 # warm up for 2.2B tokens.
-const PRETRAIN_WARMUP = 8192
-# floor(22,595,922,912 / (2048 * 2)) = 5,516,582 micro-steps (1 epoch).
-const PRETRAIN_TOTAL_STEPS = 5516582
+const PRETRAIN_WARMUP = 2048
+# floor(22,595,922,912 / (2048 * 2)) = 5,516,582 micro-steps (1 epoch);
+# ceil(5,516,582 / accumulation 4) = 1,379,146 optimizer steps.
+const PRETRAIN_TOTAL_STEPS = 1379146
 const PRETRAIN_MIN_LR = 0.0000045
 const PRETRAIN_BATCH_SIZE = 2
 const PRETRAIN_GRAD_ACCUMULATION = 4

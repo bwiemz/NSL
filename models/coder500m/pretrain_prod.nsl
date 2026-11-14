@@ -25,8 +25,8 @@
 # Derivation (config.nsl carries the same numbers):
 #   micro-steps/epoch = floor(8,388,608 / (1024 * 2))    = 4096
 #   total micro-steps = 1 epoch x 4096                   = 4096
-#   warmup            = 400 micro-steps                  (~9.8%)
-#   optimizer steps   = floor(4096 / accum(8))           = 512
+#   optimizer steps   = 4096 / accum(8)                  = 512
+#   warmup            = 50 optimizer steps               (~9.8%)
 #   checkpoints       = 512 / checkpoint_every(100)      = 5
 #
 # TOKEN BUDGET — stated plainly rather than buried: 8.39M train tokens
@@ -39,10 +39,14 @@
 # is the measurement, not a failure of the run. Closing it needs a larger
 # corpus, which is roadmap item 15.
 #
-# UNITS (same as the 50M recipe): the scheduler counts MICRO-batches (lr is
-# recomputed every micro-batch; with grad_accumulation=8 the effective warmup
-# is 400/8 = 50 optimizer steps). checkpoint_every counts OPTIMIZER steps —
-# codegen converts internally. Dropout is real: DROPOUT=0.1 trains an actual
+# UNITS (same as the 50M recipe): the scheduler counts OPTIMIZER steps
+# (schedule_unit below): every micro-batch of an accumulation window runs at
+# one rate. Until 2026-11 this file was written in micro-batches (warmup 400,
+# total 4096), the only unit the compiler then had; 50 and 512 are those
+# divided by the accumulation. The unit is stated because this directory is
+# pinned to the 0.10-lts toolchain, whose default is still micro-batches; it
+# needs an 0.10-lts install that knows the key (2026-11 or later).
+# checkpoint_every counts OPTIMIZER steps as well. Dropout is real: DROPOUT=0.1 trains an actual
 # RNG mask and its backward consumes that same mask (PR #507).
 #
 # RESUME (item 8 / PR #516): `epochs` is the run TOTAL, so an interrupted run
@@ -113,9 +117,9 @@ print("LOSS_STREAM_BEGIN")
 # does not use the `let ls = logits.shape` spelling that pretrain_cert.nsl,
 # which has no fusion, is free to use.
 @fused_lm_ce(enabled=true, vocab_size=49152, hidden_size=1280, batch_size=2, seq_len=1024)
-train(model=m, epochs=1, grad_accumulation=8, grad_clip=1.0, checkpoint_save="checkpoints/pretrain_prod_state.nslm", checkpoint_every=100):
+train(model=m, epochs=1, grad_accumulation=8, schedule_unit="optimizer_step", grad_clip=1.0, checkpoint_save="checkpoints/pretrain_prod_state.nslm", checkpoint_every=100):
     optimizer: AdamW(lr=0.00015, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
-    scheduler: warmup_cosine(warmup_steps=400, total_steps=4096, min_lr=0.00003)
+    scheduler: warmup_cosine(warmup_steps=50, total_steps=512, min_lr=0.00003)
     step(batch):
         let logits = m.forward_train(batch.input_ids, true)
         let flat_logits = logits.reshape([2048, 49152])

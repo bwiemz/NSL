@@ -22,17 +22,17 @@
 # Derivation (config.nsl carries the same numbers):
 #   micro-steps/epoch = floor(8,925,916 / 1024)          = 8716
 #   total micro-steps = 3 epochs x 8716                  = 26148
-#   warmup            = 1300 micro-steps                 (~5.0%)
-#   optimizer steps   = floor(26148 / accum(8))          = 3268
-#     (26148 % 8 = 4: the trailing partial window's gradients are
-#      computed and discarded — the counter is global, so accumulation
-#      windows also straddle epoch boundaries; both are codegen-
-#      documented behavior, not choices this file makes)
+#   optimizer steps   = ceil(26148 / accum(8))           = 3269
+#     (26148 % 8 = 4: the run ends inside a window, which is stepped on
+#      the mean of the four micro-batches it holds — the counter is
+#      global, so accumulation windows also straddle epoch boundaries)
+#   warmup            = 163 optimizer steps              (~5.0%)
 #
-# UNITS: the scheduler counts MICRO-batches (lr is recomputed every
-# micro-batch; with grad_accumulation=8 the effective warmup is
-# 1300/8 ≈ 163 optimizer steps). checkpoint_every counts OPTIMIZER
-# steps — codegen converts internally. Dropout is real here: DROPOUT=0.1
+# UNITS: the scheduler counts OPTIMIZER steps (schedule_unit below): every
+# micro-batch of an accumulation window runs at one rate. Until 2026-11
+# this file was written in micro-batches (warmup 1300, total 26148), the
+# only unit the compiler then had; 163 and 3269 are those divided by the
+# accumulation. checkpoint_every counts OPTIMIZER steps as well. Dropout is real here: DROPOUT=0.1
 # trains an actual RNG mask and its backward consumes the same mask
 # (source-AD dropout fix, PR #507).
 #
@@ -52,7 +52,7 @@ let m = NSLCoder()
 m.to(cuda)
 print("================================================================")
 print("  NSL-Coder-50M production pretrain")
-print("  49152 vocab | batch=1 seq=1024 accum=8 | 3 epochs = 26148 steps")
+print("  49152 vocab | batch=1 seq=1024 accum=8 | 3 epochs = 26148 micro-steps")
 print("================================================================")
 
 let tokens = load_mmap("../../data/tokens/train_new.bin", 3)
@@ -68,9 +68,9 @@ print("LOSS_STREAM_BEGIN")
 # the same compile-time dims (a runtime `logits.shape` read keeps the
 # composite chain live and the compiler refuses the fusion).
 @fused_lm_ce(enabled=true, vocab_size=49152, hidden_size=512, batch_size=1, seq_len=1024)
-train(model=m, epochs=3, grad_accumulation=8, grad_clip=1.0, checkpoint_save="checkpoints/pretrain_prod_state.nslm", checkpoint_every=500):
+train(model=m, epochs=3, grad_accumulation=8, schedule_unit="optimizer_step", grad_clip=1.0, checkpoint_save="checkpoints/pretrain_prod_state.nslm", checkpoint_every=500):
     optimizer: AdamW(lr=0.0003, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
-    scheduler: warmup_cosine(warmup_steps=1300, total_steps=26148, min_lr=0.00003)
+    scheduler: warmup_cosine(warmup_steps=163, total_steps=3269, min_lr=0.00003)
     step(batch):
         let logits = m.forward_train(batch.input_ids, true)
         let flat_logits = logits.reshape([1024, 49152])
