@@ -251,6 +251,9 @@ impl<'a> TypeChecker<'a> {
         // the program does not contain).
         let mut seen_config: std::collections::HashSet<String> =
             std::collections::HashSet::new();
+        // For the schedule-unit warning below, as on a train block.
+        let mut accumulation: (i64, Option<nsl_errors::Span>) = (1, None);
+        let mut schedule_unit: Option<crate::train_config::ScheduleUnit> = None;
 
         for arg in &distill.config {
             let key = arg
@@ -337,7 +340,7 @@ impl<'a> TypeChecker<'a> {
                     // Passthrough, hence no CPDT optimizer-moment precision) with
                     // no diagnostic to explain why the envelope never engaged.
                     match arg.value.kind {
-                        ExprKind::IntLiteral(n) if n >= 1 => {}
+                        ExprKind::IntLiteral(n) if n >= 1 => accumulation = (n, Some(arg.span)),
                         _ => {
                             self.diagnostics.push(
                                 Diagnostic::error(
@@ -350,12 +353,38 @@ impl<'a> TypeChecker<'a> {
                     }
                     self.check_expr(&arg.value);
                 }
+                "schedule_unit" => {
+                    use crate::train_config::ScheduleUnit;
+                    match &arg.value.kind {
+                        ExprKind::StringLiteral(s) if s == "micro_batch" => {
+                            schedule_unit = Some(ScheduleUnit::MicroBatch);
+                        }
+                        ExprKind::StringLiteral(s) if s == "optimizer_step" => {
+                            schedule_unit = Some(ScheduleUnit::OptimizerStep);
+                        }
+                        _ => {
+                            self.diagnostics.push(
+                                Diagnostic::error(
+                                    "distill 'schedule_unit' must be \"micro_batch\" or \
+                                     \"optimizer_step\" (a string literal): what one step \
+                                     of the scheduler: section counts under \
+                                     grad_accumulation",
+                                )
+                                .with_label(
+                                    arg.span,
+                                    "expected \"micro_batch\" or \"optimizer_step\"",
+                                ),
+                            );
+                        }
+                    }
+                }
                 other => {
                     self.diagnostics.push(
                         Diagnostic::error(format!("unknown distill config key '{other}'"))
                             .with_label(
                                 arg.span,
-                                "expected teacher=, student=, epochs=, or grad_accumulation=",
+                                "expected teacher=, student=, epochs=, grad_accumulation=, \
+                                 or schedule_unit=",
                             ),
                     );
                 }
@@ -507,13 +536,32 @@ impl<'a> TypeChecker<'a> {
         // optimizer kwarg passed `nsl check` and refused only at build —
         // with a message naming `train`, a construct the program does not
         // contain.
-        if let Err(diags) = crate::optim_config::resolve_optim_config(
+        match crate::optim_config::resolve_optim_config(
             &distill.sections,
             distill.span,
             &|sym| self.resolve_name(sym),
             crate::train_config::TrainConfigPurpose::DistillLowering,
         ) {
-            self.diagnostics.extend(diags);
+            Err(diags) => self.diagnostics.extend(diags),
+            // The same unit question as on a train block, and the same
+            // warning: a distill block runs the train loop.
+            Ok(optim_cfg) => {
+                let stepped = optim_cfg.scheduler.as_ref().is_some_and(|s| {
+                    !matches!(s, crate::optim_config::ResolvedScheduler::ConstantLr)
+                });
+                if let Some(message) = crate::train_config::schedule_unit_warning(
+                    accumulation.0,
+                    schedule_unit,
+                    stepped,
+                ) {
+                    self.diagnostics.push(
+                        Diagnostic::warning(message).with_label(
+                            accumulation.1.unwrap_or(distill.span),
+                            "a scheduler: section is combined with this",
+                        ),
+                    );
+                }
+            }
         }
 
         let mut has_step = false;

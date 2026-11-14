@@ -104,7 +104,7 @@ pub fn schedule_unit_warning(
          {grad_accumulation} times that many micro-batches. Toolchains before 2026-11 \
          counted micro-batches here, so a schedule written for them now runs \
          {grad_accumulation} times slower. Write schedule_unit = \"optimizer_step\" in \
-         train(...) to confirm this unit and silence the warning, or schedule_unit = \
+         the train or distill header to confirm this unit and silence the warning, or schedule_unit = \
          \"micro_batch\" to count micro-batches as before"
     ))
 }

@@ -377,6 +377,10 @@ pub fn distill_as_train_block(
                     }
                 }
             }
+            // The unit of the scheduler's step under accumulation means on a
+            // distill block what it means on a train block; the train
+            // resolver validates the value.
+            "schedule_unit" => config.push(arg.clone()),
             _ => {}
         }
     }

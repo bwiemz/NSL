@@ -382,21 +382,28 @@ fn pretrain_prod_agrees_with_config_and_the_corpus_arithmetic() {
             pair.train_tokens_const
         );
 
-        // The numbers are optimizer steps, so the header must say so. The
-        // toolchain under test counts optimizer steps by default, but 500M
-        // and 1B are pinned to 0.10-lts, whose default is micro-batches: a
-        // recipe that left the key out would run a schedule
-        // `grad_accumulation` times too short there, with only a warning.
-        let code: String = prod
+        // The numbers are optimizer steps, so the train header must say so.
+        // The toolchain under test counts optimizer steps by default, but
+        // 500M and 1B are pinned to 0.10-lts, whose default is
+        // micro-batches: a recipe that left the key out would run a
+        // schedule `grad_accumulation` times too short there, with only a
+        // warning. (0.10-lts also drops a trailing partial window where
+        // this toolchain steps on it; the schedule length is the same.)
+        let headers: Vec<&str> = prod
             .lines()
-            .filter(|l| !l.trim_start().starts_with('#'))
-            .collect::<Vec<_>>()
-            .join("\n");
+            .filter(|l| l.starts_with("train("))
+            .collect();
+        assert_eq!(
+            headers.len(),
+            1,
+            "{dir}: expected exactly one train(...) header, found {headers:?}"
+        );
         assert!(
-            code.contains("schedule_unit=\"optimizer_step\"")
-                || code.contains("schedule_unit = \"optimizer_step\""),
+            headers[0].contains("schedule_unit=\"optimizer_step\"")
+                || headers[0].contains("schedule_unit = \"optimizer_step\""),
             "{dir}: the schedule is derived in optimizer steps, so the train header \
-             must say schedule_unit=\"optimizer_step\""
+             must say schedule_unit=\"optimizer_step\": {}",
+            headers[0]
         );
 
         // Warmup must fit inside the schedule with room to decay.
