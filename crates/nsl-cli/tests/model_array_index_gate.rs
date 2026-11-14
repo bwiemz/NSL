@@ -232,3 +232,147 @@ let m = Net()
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The element model declared after the model that holds the array
+// ---------------------------------------------------------------------------
+
+fn numbers_printed(out: &std::process::Output) -> Vec<f64> {
+    String::from_utf8_lossy(&out.stdout)
+        .split(|c: char| !(c.is_ascii_digit() || matches!(c, '.' | '-' | 'e' | 'E' | '+')))
+        .filter_map(|token| token.parse::<f64>().ok())
+        .collect()
+}
+
+/// The checker pre-declared every model as `Unknown` and typed it only when
+/// it reached its definition, so `[Block; 2]` ahead of `model Block`
+/// resolved to `Unknown`: the loop compiled as a list iteration and
+/// `block.w` as a dict lookup, which panicked in `dict.rs` on a misaligned
+/// pointer. A plain field `b: Block` was refused at `self.b.forward(x)` as
+/// a call on an untyped value. Both now behave as in declaration order:
+/// [1, 1] through two `ones` blocks is [4, 4], through one is [2, 2].
+#[test]
+fn a_model_declared_after_its_user_is_typed() {
+    let out = run(r#"model Net:
+    blocks: [Block; 2] = Block()
+    b: Block = Block()
+
+    fn through_array(self, x: Tensor) -> Tensor:
+        let h = x
+        for block in self.blocks:
+            h = h @ block.w
+        return h
+
+    fn through_methods(self, x: Tensor) -> Tensor:
+        let h = x
+        for block in self.blocks:
+            h = block.forward(h)
+        return h
+
+    fn through_field(self, x: Tensor) -> Tensor:
+        return self.b.forward(x)
+
+model Block:
+    w: Tensor = ones([2, 2])
+
+    fn forward(self, h: Tensor) -> Tensor:
+        return h @ self.w
+
+let m = Net()
+let x = ones([1, 2])
+print(m.through_array(x))
+print(m.through_methods(x))
+print(m.through_field(x))
+print(m.blocks[1].w)
+"#);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "run failed:\n{stderr}");
+    assert_eq!(
+        numbers_printed(&out),
+        vec![4.0, 4.0, 4.0, 4.0, 2.0, 2.0, 1.0, 1.0, 1.0, 1.0],
+        "stderr:\n{stderr}"
+    );
+    assert!(!stderr.contains("Unknown type"), "{stderr}");
+}
+
+/// One SGD step (lr 0.1) of `loss = sum(x @ w0 @ w1 @ head)` with
+/// x = [[1, 2], [3, 4]], w0 = w1 = 0.5 everywhere, head = ones([2, 1]),
+/// with the three models declared outermost first. By hand: dhead = 5,
+/// dw1 = 5 everywhere, dw0 = [[4, 4], [6, 6]], so w0 becomes
+/// [[0.1, 0.1], [-0.1, -0.1]], w1 zero and head 0.5 -- what the same
+/// program gives with its models in dependency order. In both AD modes.
+#[test]
+fn a_train_step_does_not_depend_on_declaration_order() {
+    let source = r#"model Net:
+    stack: Stack = Stack()
+    head: Tensor = ones([2, 1])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return self.stack.forward(x) @ self.head
+
+model Stack:
+    blocks: [Block; 2] = Block()
+
+    fn forward(self, h: Tensor) -> Tensor:
+        let y = h
+        for block in self.blocks:
+            y = block.forward(y)
+        return y
+
+model Block:
+    w: Tensor = full([2, 2], 0.5)
+
+    fn forward(self, h: Tensor) -> Tensor:
+        return h @ self.w
+
+let m = Net()
+let x = arange(1.0, 5.0).reshape([2, 2])
+train(model=m, epochs=1):
+    optimizer: SGD(lr=0.1)
+    step(batch):
+        let loss = sum(m.forward(x))
+print(m.stack.blocks[0].w)
+print(m.stack.blocks[1].w)
+print(m.head)
+"#;
+    let want = [0.1, 0.1, -0.1, -0.1, 0.0, 0.0, 0.0, 0.0, 0.5, 0.5];
+    for source_ad in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prog.nsl");
+        std::fs::write(&path, source).unwrap();
+        let mut cmd = Command::cargo_bin("nsl").unwrap();
+        cmd.env("NSL_STDLIB_PATH", workspace_root().join("stdlib"))
+            .current_dir(dir.path())
+            .arg("run")
+            .arg(&path)
+            .args(["--target", "cpu"]);
+        if source_ad {
+            cmd.arg("--source-ad");
+        }
+        let out = cmd.output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "source_ad={source_ad}: run failed:\n{stderr}");
+        let got = numbers_printed(&out);
+        assert_eq!(got.len(), want.len(), "source_ad={source_ad}: printed {got:?}");
+        for (g, w) in got.iter().zip(want) {
+            assert!((g - w).abs() < 1e-6, "source_ad={source_ad}: printed {got:?}, expected {want:?}");
+        }
+    }
+}
+
+/// Typing models ahead of the statements resolves each field type twice;
+/// a diagnostic that raises is reported once.
+#[test]
+fn an_undefined_field_type_is_reported_once() {
+    let out = run(r#"model Net:
+    b: Nope = Block()
+
+model Block:
+    w: Tensor = ones([2, 2])
+
+let m = Net()
+"#);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert_eq!(stderr.matches("undefined type `Nope`").count(), 1, "{stderr}");
+}

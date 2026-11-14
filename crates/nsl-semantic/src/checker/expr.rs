@@ -91,20 +91,13 @@ impl<'a> TypeChecker<'a> {
                     // which works at runtime but disables WRGA's compile-time
                     // eliminator (`--wrga-report` silently no-ops).
                     //
-                    // Forward-reference correctness: when the element model is
-                    // defined AFTER the enclosing model, `collect_top_level_decls`
-                    // pre-registers it with `Type::Unknown` and `check_model_def`
-                    // for the element model has not yet run. In that case, the
-                    // scope lookup returns Unknown — strictly worse than the
-                    // bare-Model precedent set by the for-loop arm at
-                    // `checker::stmt.rs:49-57`. So we only USE the lookup result
-                    // when it carries an already-populated `Type::Model`; for any
-                    // other shape (Unknown / missing) we fall back to the bare
-                    // Model construction, matching the for-loop arm. Member
-                    // access on a fields-empty Model returns Unknown via the
-                    // "Models have many dynamic attributes, be lenient" branch
-                    // at `checker::ops.rs:476-485` — same behavior as the
-                    // for-loop arm, no regression vs. pre-fix.
+                    // Every model of the module is typed before any statement
+                    // is checked (`collect_model_signatures`), so an element
+                    // model declared AFTER the enclosing model resolves here
+                    // too. The bare-Model fallback below is for a lookup that
+                    // finds no `Type::Model` (an element type the module does
+                    // not define); member access on a fields-empty Model is
+                    // lenient (`checker::ops.rs`), as in the for-loop arm.
                     Type::FixedModelArray { element_model, .. } => {
                         let scope_ty = self.scopes
                             .lookup(self.current_scope, *element_model)
