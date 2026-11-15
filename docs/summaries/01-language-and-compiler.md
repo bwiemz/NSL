@@ -125,7 +125,9 @@ model Transformer:
 **`model` is a keyword**, not a class. Models have:
 - Typed fields (parameters, buffers, sub-models)
 - Methods with `self` access
-- Fixed-size model arrays (`[Layer; N]`)
+- Fixed-size model arrays (`[Layer; N]`), initialised with one constructor
+  call evaluated per element (`= Layer(d)`) or a list of N elements
+  (`= [Layer(1), Layer(2)]`)
 - Automatic parameter registration
 - Native serialization (`.nslm` binary format, not pickle)
 

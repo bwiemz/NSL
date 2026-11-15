@@ -296,8 +296,17 @@ knowing that the tape prose does not cover:
 - **A write into a tensor, a container or a field is not differentiated at
   compile time** (`y[i, j] = v`, `obj.field = v`), in a function or in the
   block's own body: the block falls back to the tape, which performs the
-  write. The tape does not record such a write, so the gradient through it
-  is that of the value before the write.
+  write and records it. An element write gives the tensor a new version on
+  the tape: the overwritten elements pass no gradient back to the values
+  they replaced (`=`), or pass it scaled by the derivative of the stored
+  value (`+=`, `-=`: 1; `*= v`: `v`; `/= v`: `1/v`), as in PyTorch. A
+  write into the differentiated tensor itself is differentiated at the
+  value the tensor entered the block with. Two writes are refused at run
+  time: one over a tensor an earlier op saved for the backward (PyTorch
+  refuses it too), and the use, after the write, of another view of the
+  written storage taken before it (`v = y.reshape(...)`, `y[0, 0] = 0`,
+  then `v`), which PyTorch differentiates and the tape cannot; write into a
+  `.clone()` instead.
 - **`mse_loss` and `l1_loss` broadcast.** Both are the mean over the
   elements of the broadcast difference `pred - target`, and each operand's
   gradient is summed down to that operand's shape.

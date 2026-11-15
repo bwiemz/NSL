@@ -39,33 +39,53 @@ pub struct Batch {
 
 /// A bounded multi-producer, multi-consumer channel with backpressure.
 /// Producers block when the queue is full; consumers block when empty.
+///
+/// `closed` lives under the queue's mutex. It used to be an atomic that
+/// `close` set without taking the lock, so a waiter could read it (false),
+/// `close` could then set it and notify, and only then the waiter would
+/// enter `wait`: the notification was lost and the waiter slept forever.
+/// That is how `PrefetchPipeline::shutdown` hung, its I/O worker parked in
+/// `push` on a full queue and the caller in `join`. Under the lock, `close`
+/// cannot run between a waiter's check and its wait.
 struct BoundedChannel<T> {
-    queue: Mutex<VecDeque<T>>,
+    state: Mutex<ChannelState<T>>,
     capacity: usize,
     not_full: Condvar,
     not_empty: Condvar,
-    closed: AtomicBool,
+}
+
+struct ChannelState<T> {
+    queue: VecDeque<T>,
+    closed: bool,
 }
 
 impl<T> BoundedChannel<T> {
     fn new(capacity: usize) -> Self {
         Self {
-            queue: Mutex::new(VecDeque::with_capacity(capacity)),
+            state: Mutex::new(ChannelState {
+                queue: VecDeque::with_capacity(capacity),
+                closed: false,
+            }),
             capacity,
             not_full: Condvar::new(),
             not_empty: Condvar::new(),
-            closed: AtomicBool::new(false),
         }
     }
 
-    /// Push an item, blocking if the queue is full.
+    /// Push an item, blocking if the queue is full. Returns false (and
+    /// drops the item) once the channel is closed.
     fn push(&self, item: T) -> bool {
-        let mut guard = self.queue.lock().unwrap();
-        while guard.len() >= self.capacity {
-            if self.closed.load(Ordering::Acquire) { return false; }
+        let mut guard = self.state.lock().unwrap();
+        loop {
+            if guard.closed {
+                return false;
+            }
+            if guard.queue.len() < self.capacity {
+                break;
+            }
             guard = self.not_full.wait(guard).unwrap();
         }
-        guard.push_back(item);
+        guard.queue.push_back(item);
         self.not_empty.notify_one();
         true
     }
@@ -73,13 +93,13 @@ impl<T> BoundedChannel<T> {
     /// Pop an item, blocking if the queue is empty.
     /// Returns None if the channel is closed and empty.
     fn pop(&self) -> Option<T> {
-        let mut guard = self.queue.lock().unwrap();
+        let mut guard = self.state.lock().unwrap();
         loop {
-            if let Some(item) = guard.pop_front() {
+            if let Some(item) = guard.queue.pop_front() {
                 self.not_full.notify_one();
                 return Some(item);
             }
-            if self.closed.load(Ordering::Acquire) {
+            if guard.closed {
                 return None;
             }
             guard = self.not_empty.wait(guard).unwrap();
@@ -88,14 +108,16 @@ impl<T> BoundedChannel<T> {
 
     /// Close the channel. Wakes all waiting threads.
     fn close(&self) {
-        self.closed.store(true, Ordering::Release);
+        let mut guard = self.state.lock().unwrap();
+        guard.closed = true;
+        drop(guard);
         self.not_full.notify_all();
         self.not_empty.notify_all();
     }
 
     /// Number of items currently in the queue.
     fn len(&self) -> usize {
-        self.queue.lock().unwrap().len()
+        self.state.lock().unwrap().queue.len()
     }
 }
 
@@ -360,5 +382,68 @@ mod tests {
         // Pop to unblock
         assert_eq!(ch.pop(), Some(42));
         assert_eq!(ch.len(), 0);
+    }
+
+    /// The lost wakeup, deterministically: a thread between its check of
+    /// `closed` and its `wait` holds the channel's lock, and `close` must
+    /// not get past it. Holding the lock here stands in for that thread.
+    /// When `closed` was an atomic set without the lock, `close` finished
+    /// at once, which is the interleaving that lost the notification.
+    #[test]
+    fn close_cannot_slip_between_a_waiters_check_and_its_wait() {
+        let ch: Arc<BoundedChannel<u64>> = Arc::new(BoundedChannel::new(1));
+        let held = ch.state.lock().unwrap();
+        let ch2 = Arc::clone(&ch);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let closer = thread::spawn(move || {
+            ch2.close();
+            tx.send(()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+            "close() completed while another thread held the channel's lock"
+        );
+        assert!(!held.closed);
+        drop(held);
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("close() did not complete once the lock was free");
+        closer.join().unwrap();
+        assert!(!ch.push(7), "a closed channel accepts no item");
+    }
+
+    /// The race itself, swept: a producer blocks in `push` on a full queue
+    /// while `close` lands after a varying delay, so over the iterations it
+    /// falls on every point of the producer's way into `wait`. On the old
+    /// channel this hung within 8,000 to 131,000 iterations in three runs
+    /// (the deterministic test above is the one that always fails there);
+    /// a hang is reported by the watchdog instead of stalling the suite.
+    #[test]
+    fn close_wakes_a_blocked_producer_whenever_it_lands() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            for i in 0..20_000u64 {
+                let ch: Arc<BoundedChannel<u64>> = Arc::new(BoundedChannel::new(1));
+                assert!(ch.push(0));
+                let ch2 = Arc::clone(&ch);
+                let producer = thread::spawn(move || ch2.push(1));
+                for _ in 0..(i * 7919) % 40_000 {
+                    std::hint::spin_loop();
+                }
+                ch.close();
+                assert!(!producer.join().unwrap(), "a push past close() succeeded");
+                if i % 1000 == 0 {
+                    tx.send(i).unwrap();
+                }
+            }
+            tx.send(u64::MAX).unwrap();
+        });
+        let mut last = 0;
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+                Ok(u64::MAX) => break,
+                Ok(i) => last = i,
+                Err(_) => panic!("close() lost a producer's wakeup after iteration {last}"),
+            }
+        }
     }
 }

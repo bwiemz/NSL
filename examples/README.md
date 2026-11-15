@@ -41,5 +41,5 @@
 - [m18b_interop.nsl](m18b_interop.nsl) -- Safetensors + ONNX export
 
 ## Full Pipelines
-- [gpt2.nsl](gpt2.nsl) -- GPT-2 model definition and training
+- [gpt2.nsl](gpt2.nsl) -- GPT-2 architecture at a toy size, trained on the CPU
 - [codeforge_nano.nsl](codeforge_nano.nsl) -- Small code generation model

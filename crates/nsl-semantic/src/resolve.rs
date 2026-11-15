@@ -136,6 +136,10 @@ impl<'a> TypeResolver<'a> {
                 shape: Shape::unknown(),
                 dtype: DType::Unknown,
             },
+            // What `nsl_qtensor_quantize` returns. The checker had the type
+            // (`builtins.rs`) but no name for it, so `stdlib/nsl/quant/ops.nsl`,
+            // whose signatures spell it, failed to type-check on import.
+            "QuantizedTensor" => Type::QuantizedTensor,
             _ => {
                 // Look up in scope for user-defined types
                 if let Some((_sid, info)) = self.scopes.lookup(scope, sym) {

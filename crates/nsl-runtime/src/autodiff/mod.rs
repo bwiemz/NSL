@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 
 use crate::list::NslList;
@@ -119,6 +119,30 @@ pub enum TapeOp {
         saved_k: i64,
         saved_v: i64,
     },
+    /// An in-place write into a tensor: `y[i, j] = v` and its compound forms
+    /// (`nsl_tensor_set`, `nsl_tensor_set_compound`, `nsl_tensor_set_element`)
+    /// and `nsl_tensor_slice_assign`. The written tensor keeps its storage
+    /// but takes a new tape id, `out`; ops recorded before the write keep the
+    /// old one, `a` (see [`record_index_write`]). Backward: the gradient of
+    /// `a` is `out`'s with the elements of `region` multiplied by `keep`, the
+    /// derivative of the stored value with respect to the element it
+    /// replaced (0 for `=`, so the written elements get none; 1 for `+=` and
+    /// `-=`; `v` for `*= v`; `1/v` for `/= v`), and `src`, when it is a
+    /// tensor on the tape, gets `out`'s gradient over `region`. Fields are
+    /// tape ids already: nothing is saved.
+    IndexWrite {
+        a: i64,
+        out: i64,
+        /// Per dimension of `a`, the written range `[start, end)`.
+        region: Vec<(i64, i64)>,
+        keep: f64,
+        /// Tape id of the tensor whose elements were written, in row-major
+        /// order of `region`; 0 for a scalar value.
+        src: i64,
+        src_shape: Vec<i64>,
+        src_dtype: u16,
+        src_device: u8,
+    },
     /// Gradient checkpointing: re-run the forward function during backward
     /// instead of saving intermediate activations.
     Checkpoint {
@@ -150,17 +174,68 @@ pub(crate) struct Tape {
     /// while an entry is pending because the deferral is what keeps the
     /// allocation alive.
     pub(crate) deferred_transients: Vec<i64>,
+    /// Storage written in place during this recording, by the tensor that
+    /// owns it (a view's `data_owner`, else the tensor itself), mapped to the
+    /// tape id the write gave the written tensor. A tensor sharing that
+    /// storage whose id is older stands in the graph for the values before
+    /// the write; [`Tape::get_or_assign_id`] refuses to record it again.
+    pub(crate) written_storage: HashMap<i64, i64>,
+}
+
+/// The tensor that owns `ptr`'s data buffer: its `data_owner` when it is a
+/// view (`new_view_i64` points every view at the root owner), else itself.
+fn storage_owner(ptr: i64) -> i64 {
+    let t = crate::tensor::NslTensor::from_ptr_ref(ptr);
+    if t.data_owner != 0 { t.data_owner } else { ptr }
 }
 
 impl Tape {
     fn new() -> Self {
-        Tape { ops: Vec::new(), param_set: HashSet::new(), recording: false, pause_depth: 0, next_id: 1, deferred_transients: Vec::new() }
+        Tape {
+            ops: Vec::new(),
+            param_set: HashSet::new(),
+            recording: false,
+            pause_depth: 0,
+            next_id: 1,
+            deferred_transients: Vec::new(),
+            written_storage: HashMap::new(),
+        }
     }
     fn get_or_assign_id(&mut self, ptr: i64) -> i64 {
         if ptr == 0 { return 0; }
+        if !self.written_storage.is_empty() {
+            self.refuse_stale_alias(ptr);
+        }
         let t = crate::tensor::NslTensor::from_ptr(ptr);
         if t.tape_id == 0 { t.tape_id = self.next_id; self.next_id += 1; }
         t.tape_id
+    }
+
+    /// Abort when `ptr` shares storage with a tensor written in place since
+    /// `ptr` got its tape id. Its id then names the values before the write,
+    /// so an op recorded on it would send the gradient of the written
+    /// elements to their old producers: `v = y.reshape(...)`, `y[0, 0] = 0`,
+    /// then a loss on `v`. (PyTorch rebases such a view onto the write; the
+    /// tape has no view relation to rebase along.) Ids are monotonic, so
+    /// "older" is "smaller".
+    fn refuse_stale_alias(&self, ptr: i64) {
+        let t = crate::tensor::NslTensor::from_ptr_ref(ptr);
+        if t.tape_id == 0 {
+            return;
+        }
+        let Some(&written_as) = self.written_storage.get(&storage_owner(ptr)) else {
+            return;
+        };
+        if t.tape_id < written_as {
+            crate::nsl_log!(ERROR, "tape-ad",
+                "nsl: a tensor that shares its storage with one written in place (`y[i, j] = v`) \
+                 earlier in this grad/train block is used after the write. The two are views of \
+                 one buffer (reshape, transpose, unsqueeze, expand), and the gradient of the one \
+                 not written would ignore the write. Write into a copy instead \
+                 (`let y = x.clone()`), or take the view after the write."
+            );
+            std::process::abort();
+        }
     }
 }
 
@@ -215,6 +290,7 @@ impl TapeOp {
             TapeOp::Expand { .. } => "Expand",
             TapeOp::Stack { .. } => "Stack",
             TapeOp::FlashAttention { .. } => "FlashAttention",
+            TapeOp::IndexWrite { .. } => "IndexWrite",
             TapeOp::Checkpoint { .. } => "Checkpoint",
         }
     }
@@ -266,6 +342,10 @@ impl TapeOp {
                 // out stays raw pointer — backward reads tape_id from tensor
             }
             TapeOp::Checkpoint { output, .. } => { *output = tape.get_or_assign_id(*output); }
+            // Built with ids by `record_index_write`, never through
+            // `maybe_record`: its `a` is the id the tensor had BEFORE the
+            // write, which a pointer could not name.
+            TapeOp::IndexWrite { .. } => {}
         }
     }
 }
@@ -445,6 +525,9 @@ fn tape_op_trace(op: &TapeOp) -> String {
         TapeOp::MeanReduce { a, out, dim, .. } => format!("MeanReduce a={a} out={out} dim={dim}"),
         TapeOp::Transpose { a, out, .. } => format!("Transpose a={a} out={out}"),
         TapeOp::Reshape { a, out, .. } => format!("Reshape a={a} out={out}"),
+        TapeOp::IndexWrite { a, out, keep, src, .. } => {
+            format!("IndexWrite a={a} out={out} keep={keep} src={src}")
+        }
         _ => op.variant_name().to_string(),
     }
 }
@@ -514,6 +597,7 @@ pub extern "C" fn nsl_tape_start(param_list: i64) {
         release_tape_op_refs(&tape.ops);
         tape.ops.clear();
         tape.param_set.clear();
+        tape.written_storage.clear();
         std::mem::take(&mut tape.deferred_transients)
     });
     // Stale deferred transients from an unstopped session: free them outside
@@ -539,6 +623,101 @@ pub extern "C" fn nsl_tape_start(param_list: i64) {
     });
 }
 
+/// Call `f` on every tensor reference `op` holds: the values its backward
+/// reads, each kept alive by a refcount the op owns. The one list both
+/// [`release_tape_op_refs`] (which drops them) and [`record_index_write`]
+/// (which refuses to overwrite one) read. A field the backward has already
+/// consumed is 0.
+fn for_each_saved_ref(op: &TapeOp, mut f: impl FnMut(i64)) {
+    match op {
+        TapeOp::Mul { saved_a, saved_b, .. }
+        | TapeOp::Div { saved_a, saved_b, .. }
+        | TapeOp::MatMul { saved_a, saved_b, .. }
+        | TapeOp::Fp8MatMul { saved_a, saved_b, .. } => {
+            f(*saved_a);
+            f(*saved_b);
+        }
+        TapeOp::Exp { saved_out, .. }
+        | TapeOp::Sqrt { saved_out, .. }
+        | TapeOp::Sigmoid { saved_out, .. }
+        | TapeOp::Tanh { saved_out, .. }
+        | TapeOp::Softmax { saved_out, .. }
+        | TapeOp::LogSoftmax { saved_out, .. } => {
+            f(*saved_out);
+        }
+        TapeOp::Log { saved_a, .. }
+        | TapeOp::Abs { saved_a, .. }
+        | TapeOp::Clamp { saved_a, .. }
+        | TapeOp::ReLU { saved_a, .. }
+        | TapeOp::GELU { saved_a, .. }
+        | TapeOp::SiLU { saved_a, .. }
+        | TapeOp::Sin { saved_a, .. }
+        | TapeOp::Cos { saved_a, .. } => {
+            f(*saved_a);
+        }
+        TapeOp::Gather { indices_ptr, .. } => {
+            f(*indices_ptr);
+        }
+        TapeOp::EmbeddingLookup { saved_weight, saved_indices, .. } => {
+            f(*saved_weight);
+            f(*saved_indices);
+        }
+        TapeOp::LayerNorm { saved_input, saved_mean, saved_inv_std, saved_weight, .. } => {
+            f(*saved_input);
+            f(*saved_mean);
+            f(*saved_inv_std);
+            f(*saved_weight);
+        }
+        TapeOp::RMSNorm { saved_input, saved_rms, saved_weight, .. } => {
+            f(*saved_input);
+            f(*saved_rms);
+            f(*saved_weight);
+        }
+        TapeOp::Dropout { saved_mask, .. } => {
+            f(*saved_mask);
+        }
+        TapeOp::Conv2d { saved_input, saved_weight, .. } => {
+            f(*saved_input);
+            f(*saved_weight);
+        }
+        TapeOp::FlashAttention { saved_q, saved_k, saved_v, out, logsumexp, .. } => {
+            f(*saved_q);
+            f(*saved_k);
+            f(*saved_v);
+            f(*out);
+            f(*logsumexp);
+        }
+        TapeOp::Checkpoint { all_args, tensor_arg_indices, .. } => {
+            for &idx in tensor_arg_indices {
+                if idx < all_args.len() {
+                    f(all_args[idx]);
+                }
+            }
+        }
+        // Identity-only fields (tape ids after assign_ids): nothing saved.
+        TapeOp::Add { .. }
+        | TapeOp::Sub { .. }
+        | TapeOp::Neg { .. }
+        | TapeOp::Cast { .. }
+        | TapeOp::MulScalar { .. }
+        | TapeOp::AddScalar { .. }
+        | TapeOp::Transpose { .. }
+        | TapeOp::SumReduce { .. }
+        | TapeOp::MeanReduce { .. }
+        | TapeOp::ReduceMax { .. }
+        | TapeOp::Slice { .. }
+        | TapeOp::Reshape { .. }
+        | TapeOp::Cat { .. }
+        | TapeOp::MaxPool2d { .. }
+        | TapeOp::RotateHalf { .. }
+        | TapeOp::BiasAdd { .. }
+        | TapeOp::Unsqueeze { .. }
+        | TapeOp::Expand { .. }
+        | TapeOp::Stack { .. }
+        | TapeOp::IndexWrite { .. } => {}
+    }
+}
+
 /// Release saved tensor refcounts held by tape ops.
 /// Must be called before clearing ops to prevent refcount leaks.
 pub(crate) fn release_tape_op_refs(ops: &[TapeOp]) {
@@ -546,85 +725,91 @@ pub(crate) fn release_tape_op_refs(ops: &[TapeOp]) {
         if crate::tensor::tensor_trace_on() {
             crate::nsl_log!(INFO, "tape-trace", "[tape-trace] release {}", tape_op_trace(op));
         }
-        match op {
-            TapeOp::Mul { saved_a, saved_b, .. }
-            | TapeOp::Div { saved_a, saved_b, .. }
-            | TapeOp::MatMul { saved_a, saved_b, .. }
-            | TapeOp::Fp8MatMul { saved_a, saved_b, .. } => {
-                tensor_free(*saved_a);
-                tensor_free(*saved_b);
-            }
-            TapeOp::Exp { saved_out, .. }
-            | TapeOp::Sqrt { saved_out, .. }
-            | TapeOp::Sigmoid { saved_out, .. }
-            | TapeOp::Tanh { saved_out, .. }
-            | TapeOp::Softmax { saved_out, .. }
-            | TapeOp::LogSoftmax { saved_out, .. } => {
-                tensor_free(*saved_out);
-            }
-            TapeOp::Log { saved_a, .. }
-            | TapeOp::Abs { saved_a, .. }
-            | TapeOp::Clamp { saved_a, .. }
-            | TapeOp::ReLU { saved_a, .. }
-            | TapeOp::GELU { saved_a, .. }
-            | TapeOp::SiLU { saved_a, .. }
-            | TapeOp::Sin { saved_a, .. }
-            | TapeOp::Cos { saved_a, .. } => {
-                tensor_free(*saved_a);
-            }
-            TapeOp::Gather { indices_ptr, .. } => {
-                tensor_free(*indices_ptr);
-            }
-            TapeOp::EmbeddingLookup { saved_weight, saved_indices, .. } => {
-                tensor_free(*saved_weight);
-                tensor_free(*saved_indices);
-            }
-            TapeOp::LayerNorm { saved_input, saved_mean, saved_inv_std, saved_weight, .. } => {
-                tensor_free(*saved_input);
-                tensor_free(*saved_mean);
-                tensor_free(*saved_inv_std);
-                tensor_free(*saved_weight);
-            }
-            TapeOp::RMSNorm { saved_input, saved_rms, saved_weight, .. } => {
-                tensor_free(*saved_input);
-                tensor_free(*saved_rms);
-                tensor_free(*saved_weight);
-            }
-            TapeOp::Dropout { saved_mask, .. } => {
-                tensor_free(*saved_mask);
-            }
-            TapeOp::Conv2d { saved_input, saved_weight, .. } => {
-                tensor_free(*saved_input);
-                tensor_free(*saved_weight);
-            }
-            TapeOp::BiasAdd { .. } => {
-                // tensor/bias are tape_ids after assign_ids — nothing to free
-            }
-            TapeOp::Unsqueeze { .. } => {}
-            TapeOp::Expand { .. } => {}
-            TapeOp::Reshape { .. } => {
-                // identity-only fields (tape_ids) — nothing saved to free
-            }
-            TapeOp::Stack { .. } | TapeOp::Cat { .. } => {
-                // inputs are tape_ids after assign_ids — nothing to free
-            }
-            TapeOp::FlashAttention { saved_q, saved_k, saved_v, out, logsumexp, .. } => {
-                tensor_free(*saved_q);
-                tensor_free(*saved_k);
-                tensor_free(*saved_v);
-                tensor_free(*out);
-                tensor_free(*logsumexp);
-            }
-            TapeOp::Checkpoint { all_args, tensor_arg_indices, .. } => {
-                for &idx in tensor_arg_indices {
-                    if idx < all_args.len() {
-                        tensor_free(all_args[idx]);
-                    }
-                }
-            }
-            _ => {}
-        }
+        for_each_saved_ref(op, |p| tensor_free(p));
     }
+}
+
+/// Record an in-place write into `target_ptr` on the tape, BEFORE the
+/// caller stores anything: `region` is the written range per dimension of
+/// the target, `keep` the derivative of each stored value with respect to
+/// the element it replaces (see [`TapeOp::IndexWrite`]), `src_ptr` the
+/// tensor whose elements are stored (0 for a scalar). A no-op while the
+/// tape is not recording.
+///
+/// The write mutates storage the tape may already depend on, so it is
+/// refused (the process aborts with the reason) when an op recorded earlier
+/// holds a reference into the same storage for its backward: that backward
+/// would read the written values, as PyTorch refuses ("one of the variables
+/// needed for gradient computation has been modified by an inplace
+/// operation"). This covers `+=` as well.
+///
+/// Otherwise, unless the write leaves every gradient unchanged (`keep` 1
+/// and a scalar value), the target takes a fresh tape id and an
+/// [`TapeOp::IndexWrite`] links it to the old one. Ops recorded before the
+/// write keep the old id, so the gradient they send back skips the write,
+/// and ops after it use the new one, whose gradient the write's backward
+/// passes on with the overwritten elements zeroed. Other views of the same
+/// storage keep the old id; using one later is refused by
+/// [`Tape::refuse_stale_alias`].
+pub(crate) fn record_index_write(target_ptr: i64, region: &[(usize, usize)], keep: f64, src_ptr: i64) {
+    if !is_recording() {
+        return;
+    }
+    let owner = storage_owner(target_ptr);
+    TAPE.with(|t| {
+        let mut tape = t.borrow_mut();
+        for op in &tape.ops {
+            let mut hit = false;
+            for_each_saved_ref(op, |p| hit |= p != 0 && storage_owner(p) == owner);
+            if hit {
+                crate::nsl_log!(ERROR, "tape-ad",
+                    "nsl: an in-place write (`y[i, j] = v`) inside a grad/train block overwrites a \
+                     tensor that an earlier `{}` saved for the backward pass; the gradient would be \
+                     computed from the overwritten values. Write into a copy instead \
+                     (`let y = x.clone()`).",
+                    op.variant_name()
+                );
+                std::process::abort();
+            }
+        }
+        let src_id = if src_ptr != 0 && NslTensor::from_ptr_ref(src_ptr).tape_id != 0 {
+            tape.get_or_assign_id(src_ptr)
+        } else {
+            0
+        };
+        // A tensor the tape has never seen has no gradient path into it, and
+        // a `+=`/`-=` of a scalar passes every gradient through unchanged:
+        // neither needs a new version.
+        let seen = NslTensor::from_ptr_ref(target_ptr).tape_id != 0;
+        if src_id == 0 && (!seen || keep == 1.0) {
+            return;
+        }
+        let a = tape.get_or_assign_id(target_ptr);
+        let out = tape.next_id;
+        tape.next_id += 1;
+        NslTensor::from_ptr(target_ptr).tape_id = out;
+        tape.written_storage.insert(owner, out);
+        let (src_shape, src_dtype, src_device) = if src_id != 0 {
+            let s = NslTensor::from_ptr_ref(src_ptr);
+            (tape_shape(s).to_vec(), s.dtype, s.device)
+        } else {
+            (Vec::new(), 0, 0)
+        };
+        let op = TapeOp::IndexWrite {
+            a,
+            out,
+            region: region.iter().map(|&(s, e)| (s as i64, e as i64)).collect(),
+            keep,
+            src: src_id,
+            src_shape,
+            src_dtype,
+            src_device,
+        };
+        if crate::tensor::tensor_trace_on() {
+            crate::nsl_log!(INFO, "tape-trace", "[tape-trace] record {}", tape_op_trace(&op));
+        }
+        tape.ops.push(op);
+    });
 }
 
 /// Stop recording and clean up saved tensor refcounts.
@@ -644,6 +829,7 @@ pub extern "C" fn nsl_tape_stop() {
 
         tape.ops.clear();
         tape.param_set.clear();
+        tape.written_storage.clear();
         // Do NOT reset next_id — monotonic across steps to avoid collisions
         std::mem::take(&mut tape.deferred_transients)
     });
