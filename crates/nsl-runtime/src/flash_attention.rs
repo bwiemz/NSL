@@ -1009,6 +1009,12 @@ fn stage_segment_ids_device(seg_host: &[u16]) -> *mut c_void {
 /// `nsl_sdpa_fused_forward` ([out, lse]).
 #[cfg(feature = "cuda")]
 fn make_gpu_tensor(data: *mut c_void, shape: &[i64], total: usize) -> i64 {
+    make_gpu_tensor_dtype(data, shape, total, 1)
+}
+
+/// [`make_gpu_tensor`] with the dtype tag `dtype` (f32 = 1, bf16 = 3).
+#[cfg(feature = "cuda")]
+fn make_gpu_tensor_dtype(data: *mut c_void, shape: &[i64], total: usize, dtype: u16) -> i64 {
     let ndim = shape.len() as i64;
     let shape_ptr = crate::memory::checked_alloc(std::mem::size_of_val(shape)) as *mut i64;
     for (i, &s) in shape.iter().enumerate() {
@@ -1022,11 +1028,26 @@ fn make_gpu_tensor(data: *mut c_void, shape: &[i64], total: usize) -> i64 {
         ndim,
         total as i64,
         1, // device = GPU
-        1, // dtype = f32
+        dtype,
         1, // refcount
         0, // flags
     ));
     Box::into_raw(t) as i64
+}
+
+/// bf16 attention operands (bf16 activation storage) reached an attention the
+/// tensor-core kernels cannot serve; every other path reads f32.
+#[cfg(feature = "cuda")]
+fn refuse_bf16_attention(which: &str) -> ! {
+    crate::fatal::die(
+        crate::fatal::Fatal::Unsupported,
+        &format!(
+            "the attention {which} has bf16 operands (precision=\"bf16\") but cannot run on the \
+             tensor-core kernels, the only attention path that reads bf16: they need head_dim 64 or \
+             128, an unpacked batch (no segment ids), sm_80 or newer, NSL_TC_ATTENTION not set to 0, \
+             and (backward) the forward's saved log-sum-exp. Train this model with precision=\"f32\""
+        ),
+    )
 }
 
 /// Whether the tensor-core attention kernels (`crate::attention_tc`) serve
@@ -1074,10 +1095,17 @@ fn tc_sdpa_forward(
     inner::ensure_context();
     let total_out = (b * h * s * d) as usize;
     let total_lse = (b * h * s) as usize;
+    // bf16 activation storage (option (a)): Q/K/V read as bf16, O written
+    // bf16; the log-sum-exp stays f32.
+    let io = if q_t.dtype == crate::tensor::DTYPE_BF16 {
+        nsl_kir::kernels::storage::Storage::Bf16
+    } else {
+        nsl_kir::kernels::storage::Storage::F32
+    };
     // Every element is written by the kernel: no zero-fill.
-    let out_data = inner::alloc_managed(total_out * 4);
+    let out_data = inner::alloc_managed(total_out * io.bytes());
     let lse_data = inner::alloc_managed(total_lse * 4);
-    let rc = crate::attention_tc::forward(&crate::attention_tc::FwdLaunch {
+    let rc = crate::attention_tc::forward_io(&crate::attention_tc::FwdLaunch {
         q: q_t.data as u64,
         k: k_t.data as u64,
         v: v_t.data as u64,
@@ -1090,7 +1118,7 @@ fn tc_sdpa_forward(
         head_dim: d as usize,
         scale: f32::from_bits(scale_bits as u32),
         causal,
-    });
+    }, io);
     let sync_rc = if rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS && inner::sync_mode_enabled() {
         unsafe { cudarc::driver::sys::cuCtxSynchronize() }
     } else {
@@ -1109,7 +1137,7 @@ fn tc_sdpa_forward(
     if !SDPA_FUSED_LAUNCH_LOGGED.swap(true, Ordering::Relaxed) {
         crate::nsl_log!(INFO, "nsl", "[nsl] sdpa fused forward: launched (tensor-core kernels, head_dim={d})");
     }
-    let out_ptr = make_gpu_tensor(out_data, &[b, h, s, d], total_out);
+    let out_ptr = make_gpu_tensor_dtype(out_data, &[b, h, s, d], total_out, q_t.dtype);
     let lse_ptr = make_gpu_tensor(lse_data, &[b, h, s], total_lse);
     let list = crate::list::nsl_list_new();
     crate::list::nsl_list_push(list, out_ptr);
@@ -1140,13 +1168,22 @@ fn tc_sdpa_backward(
     causal: bool,
 ) -> Option<i64> {
     use crate::cuda::inner;
-    let f32_gpu = |p: i64| {
+    // f32, or (bf16 activation storage) all five bf16.
+    let io_dtype = NslTensor::from_ptr(q_ptr).dtype;
+    let same_gpu = |p: i64| {
         let t = NslTensor::from_ptr(p);
-        t.device > 0 && t.dtype == 1 && t.ndim == 4
+        t.device > 0 && t.dtype == io_dtype && t.ndim == 4
     };
-    if ![dout_ptr, q_ptr, k_ptr, v_ptr, out_ptr].iter().all(|&p| f32_gpu(p)) {
+    if !(io_dtype == 1 || io_dtype == crate::tensor::DTYPE_BF16)
+        || ![dout_ptr, q_ptr, k_ptr, v_ptr, out_ptr].iter().all(|&p| same_gpu(p))
+    {
         return None;
     }
+    let io = if io_dtype == crate::tensor::DTYPE_BF16 {
+        nsl_kir::kernels::storage::Storage::Bf16
+    } else {
+        nsl_kir::kernels::storage::Storage::F32
+    };
     let dims_ok = |p: i64, heads: usize| {
         let t = NslTensor::from_ptr(p);
         unsafe {
@@ -1167,6 +1204,11 @@ fn tc_sdpa_backward(
         None
     };
     if logsumexp_ptr != 0 && saved_lse.is_none() {
+        return None;
+    }
+    // The log-sum-exp recompute kernel reads f32 Q and K: a bf16 backward
+    // needs the forward's saved log-sum-exp (the side channel always has it).
+    if io == nsl_kir::kernels::storage::Storage::Bf16 && saved_lse.is_none() {
         return None;
     }
     inner::ensure_context();
@@ -1246,10 +1288,10 @@ fn tc_sdpa_backward(
     let gmax = inner::alloc_managed(b * h * 4);
     scratch.push(dvec);
     scratch.push(gmax);
-    let dq = inner::alloc_managed(n_q * 4);
-    let dk = inner::alloc_managed(n_kv * 4);
-    let dv = inner::alloc_managed(n_kv * 4);
-    let rc = crate::attention_tc::backward(&crate::attention_tc::BwdLaunch {
+    let dq = inner::alloc_managed(n_q * io.bytes());
+    let dk = inner::alloc_managed(n_kv * io.bytes());
+    let dv = inner::alloc_managed(n_kv * io.bytes());
+    let rc = crate::attention_tc::backward_io(&crate::attention_tc::BwdLaunch {
         q: data(q_c),
         k: data(k_c),
         v: data(v_c),
@@ -1268,7 +1310,7 @@ fn tc_sdpa_backward(
         head_dim: d,
         scale,
         causal,
-    });
+    }, io);
     let sync_rc = if rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS && inner::sync_mode_enabled() {
         unsafe { cudarc::driver::sys::cuCtxSynchronize() }
     } else {
@@ -1305,9 +1347,9 @@ fn tc_sdpa_backward(
         return None;
     }
     let list = crate::list::nsl_list_new();
-    crate::list::nsl_list_push(list, make_gpu_tensor(dq, &[b as i64, h as i64, s as i64, d as i64], n_q));
-    crate::list::nsl_list_push(list, make_gpu_tensor(dk, &[b as i64, kv_h as i64, s as i64, d as i64], n_kv));
-    crate::list::nsl_list_push(list, make_gpu_tensor(dv, &[b as i64, kv_h as i64, s as i64, d as i64], n_kv));
+    crate::list::nsl_list_push(list, make_gpu_tensor_dtype(dq, &[b as i64, h as i64, s as i64, d as i64], n_q, io_dtype));
+    crate::list::nsl_list_push(list, make_gpu_tensor_dtype(dk, &[b as i64, kv_h as i64, s as i64, d as i64], n_kv, io_dtype));
+    crate::list::nsl_list_push(list, make_gpu_tensor_dtype(dv, &[b as i64, kv_h as i64, s as i64, d as i64], n_kv, io_dtype));
     Some(list)
 }
 
@@ -1537,7 +1579,7 @@ pub extern "C" fn nsl_sdpa_fused_forward(
         let k_t = NslTensor::from_ptr(k_ptr);
         let v_t = NslTensor::from_ptr(v_ptr);
         let wrong_layout =
-            |t: &NslTensor| t.device != 1 || t.dtype != 1 || t.ndim != 4;
+            |t: &NslTensor| t.device != 1 || t.dtype != q_t.dtype || t.ndim != 4 || (t.dtype != 1 && t.dtype != 3);
         if wrong_layout(q_t) || wrong_layout(k_t) || wrong_layout(v_t) {
             decline!(format!(
                 "layout: q(dev={},dt={},nd={}) k(dev={},dt={},nd={}) v(dev={},dt={},nd={})",
@@ -1586,6 +1628,9 @@ pub extern "C" fn nsl_sdpa_fused_forward(
             {
                 return list;
             }
+        }
+        if q_t.dtype == crate::tensor::DTYPE_BF16 {
+            refuse_bf16_attention("forward");
         }
         // The codegen-synthesised kernels below need their PTX and tiles.
         if ptx_ptr == 0 || name_ptr == 0 {
@@ -7902,6 +7947,9 @@ pub extern "C" fn nsl_flash_attention_backward(
                 );
             }
             return list;
+        }
+        if dout_t.dtype == crate::tensor::DTYPE_BF16 || NslTensor::from_ptr(q_ptr).dtype == crate::tensor::DTYPE_BF16 {
+            refuse_bf16_attention("backward");
         }
 
         // PCA Stage C stride guard, reworked (scaling campaign item 1): the

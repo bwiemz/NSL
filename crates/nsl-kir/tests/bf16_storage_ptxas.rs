@@ -125,3 +125,43 @@ fn every_bf16_instantiation_is_named_typed_and_assembles() {
     }
     assert!(failures.is_empty(), "ptxas rejected:\n{}", failures.join("\n"));
 }
+
+/// Option (a) of bf16 activation storage: the tensor-core attention with its
+/// Q/K/V/O/dO/dQ/dK/dV in bf16. Each kernel must read its bf16 operands with
+/// a widening load, keep the f32 side channels (`lse`, `D`, `gmax`) f32,
+/// write its bf16 outputs rounded once, and assemble.
+#[test]
+fn the_bf16_io_attention_kernels_widen_round_once_and_assemble() {
+    use nsl_kir::kernels::flash_attn::{bwd, fwd};
+    let ptxas = find_ptxas();
+    let text = |b: Vec<u8>| String::from_utf8(b.into_iter().take_while(|&c| c != 0).collect()).unwrap();
+    let mut kernels: Vec<(String, String, bool)> = Vec::new(); // (name, ptx, writes bf16)
+    for hd in fwd::FwdConfig::HEAD_DIMS {
+        for causal in [false, true] {
+            let f = fwd::FwdConfig::new(hd, causal).with_io(Storage::Bf16);
+            kernels.push((f.kernel_name(), text(fwd::ptx(f)), true));
+            let b = bwd::BwdConfig::new(hd, causal).with_io(Storage::Bf16);
+            kernels.push((b.dq_kernel_name(), text(bwd::dq_ptx(b)), true));
+            kernels.push((b.dkdv_kernel_name(), text(bwd::dkdv_ptx(b)), true));
+        }
+        let pre = bwd::BwdConfig::pre_only(hd).with_io(Storage::Bf16);
+        kernels.push((pre.pre_kernel_name(), text(bwd::pre_ptx(pre)), false));
+    }
+    assert_eq!(kernels.len(), 14);
+    let mut failures = Vec::new();
+    for (name, ptx, writes_bf16) in &kernels {
+        assert!(name.ends_with("_bf16"), "{name}: a bf16-I/O variant must not take an f32 kernel's name");
+        assert!(ptx.contains(&format!(".visible .entry {name}(")), "{name}: entry not found");
+        assert!(ptx.contains("cvt.f32.bf16"), "{name}: no widening of a bf16 operand");
+        assert!(ptx.contains(".b16"), "{name}: no 16-bit global access");
+        if *writes_bf16 {
+            assert!(ptx.contains("cvt.rn.bf16.f32"), "{name}: bf16 output not rounded to nearest even");
+        }
+        if let Some(p) = &ptxas
+            && let Err(e) = assemble(p, ptx)
+        {
+            failures.push(format!("{name}: {e}"));
+        }
+    }
+    assert!(failures.is_empty(), "ptxas rejected:\n{}", failures.join("\n"));
+}

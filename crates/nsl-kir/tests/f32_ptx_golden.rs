@@ -11,6 +11,7 @@
 
 use std::path::PathBuf;
 
+use nsl_kir::kernels::flash_attn::{bwd, fwd};
 use nsl_kir::kernels::{det_sum, elementwise, lce_chunk, norm, rmsnorm_dx, strided_copy};
 
 fn golden_dir() -> PathBuf {
@@ -50,6 +51,19 @@ fn kernels() -> Vec<(String, Vec<u8>)> {
     }
     for op in lce_chunk::LceChunkOp::ALL {
         out.push((format!("lce_chunk_{op:?}"), lce_chunk::ptx(op)));
+    }
+    // The tensor-core attention, every head_dim and mask, at the launched
+    // tilings (bf16 I/O, option (a), must leave these bytes alone).
+    for hd in fwd::FwdConfig::HEAD_DIMS {
+        for causal in [false, true] {
+            let f = fwd::FwdConfig::new(hd, causal);
+            out.push((f.kernel_name(), fwd::ptx(f)));
+            let b = bwd::BwdConfig::new(hd, causal);
+            out.push((b.dq_kernel_name(), bwd::dq_ptx(b)));
+            out.push((b.dkdv_kernel_name(), bwd::dkdv_ptx(b)));
+        }
+        let pre = bwd::BwdConfig::pre_only(hd);
+        out.push((pre.pre_kernel_name(), bwd::pre_ptx(pre)));
     }
     out
 }

@@ -28,7 +28,8 @@
 //! The grid's x runs over query tiles, heaviest first under causal masking,
 //! y over `batch · heads`; the launch covers the whole batch.
 
-use super::{f32_global, h2, h2_shared, G, LN_2, LOG2_E, SMEM_ROW_PAD};
+use super::{f32_global, h2, h2_shared, io_global, G, LN_2, LOG2_E, SMEM_ROW_PAD};
+use crate::kernels::storage::Storage;
 use crate::kernel_ir::{
     AddressSpace, CmpOp, KernelIR, KirEdge, KirOp, KirTerminator, KirType, SmemLayout,
     SmemRegion, VarId,
@@ -42,6 +43,10 @@ pub struct FwdConfig {
     pub causal: bool,
     pub warps: u32,
     pub block_n: u32,
+    /// How Q, K, V and O are stored: f32, or bf16 (option (a) of bf16
+    /// activation storage: read and widened, the f16 tensor-core operands as
+    /// before, O rounded once to bf16 on store). The log-sum-exp is f32.
+    pub io: Storage,
 }
 
 impl FwdConfig {
@@ -56,7 +61,12 @@ impl FwdConfig {
     /// `tc_attention_kernel_times` in nsl-runtime's `attention_tc.rs`).
     pub fn new(head_dim: u32, causal: bool) -> FwdConfig {
         let (warps, block_n) = default_fwd_tiling(head_dim);
-        FwdConfig { head_dim, causal, warps, block_n }
+        FwdConfig { head_dim, causal, warps, block_n, io: Storage::F32 }
+    }
+
+    /// This variant with its Q/K/V/O stored as `io`.
+    pub fn with_io(self, io: Storage) -> FwdConfig {
+        FwdConfig { io, ..self }
     }
 
     pub fn block_m(&self) -> u32 {
@@ -74,11 +84,12 @@ impl FwdConfig {
     /// The `.visible .entry` name; the launcher launches by it.
     pub fn kernel_name(&self) -> String {
         format!(
-            "nsl_flash_tc_fwd_d{}_{}_w{}_n{}",
+            "nsl_flash_tc_fwd_d{}_{}_w{}_n{}{}",
             self.head_dim,
             if self.causal { "causal" } else { "full" },
             self.warps,
-            self.block_n
+            self.block_n,
+            if self.io == Storage::Bf16 { "_bf16" } else { "" }
         )
     }
 
@@ -155,7 +166,7 @@ impl TileMap {
             let off = g.mul_u32c(rc, head_dim);
             let off = g.add(off, self.t_col);
             let p = g.ptr(base, off);
-            let vals = g.load_vec(p, 4, AddressSpace::Global);
+            let vals = g.load_vec_f32(p, 4, AddressSpace::Global);
             for v in vals {
                 let v = match scale {
                     Some(s) => g.mul(v, s),
@@ -273,7 +284,7 @@ pub(crate) fn load_a_frags(
         let mut regs = [0; 4];
         for (r, (p, col)) in [(p_lo, 0u32), (p_hi, 0), (p_lo, 8), (p_hi, 8)].into_iter().enumerate() {
             let pp = g.ptr_c(p, 16 * t + col);
-            let v = g.load_vec(pp, 2, AddressSpace::Global);
+            let v = g.load_vec_f32(pp, 2, AddressSpace::Global);
             let (x0, x1) = match scale {
                 Some((s_lo, s_hi)) => {
                     let s = if r % 2 == 0 { s_lo } else { s_hi };
@@ -355,10 +366,10 @@ pub fn build(cfg: FwdConfig) -> KernelIR {
     let names = FwdConfig::param_names();
 
     let mut g = G::new(&cfg.kernel_name());
-    let q = g.b.add_param(names[0], f32_global(), AddressSpace::Global);
-    let k = g.b.add_param(names[1], f32_global(), AddressSpace::Global);
-    let v = g.b.add_param(names[2], f32_global(), AddressSpace::Global);
-    let o = g.b.add_param(names[3], f32_global(), AddressSpace::Global);
+    let q = g.b.add_param(names[0], io_global(cfg.io), AddressSpace::Global);
+    let k = g.b.add_param(names[1], io_global(cfg.io), AddressSpace::Global);
+    let v = g.b.add_param(names[2], io_global(cfg.io), AddressSpace::Global);
+    let o = g.b.add_param(names[3], io_global(cfg.io), AddressSpace::Global);
     let lse = g.b.add_param(names[4], f32_global(), AddressSpace::Global);
     let seq = g.b.add_param(names[5], U32, AddressSpace::Local);
     let heads = g.b.add_param(names[6], U32, AddressSpace::Local);
@@ -719,7 +730,8 @@ fn epilogue(
             let x0 = g.mul(acc[half * 2], inv);
             let x1 = g.mul(acc[half * 2 + 1], inv);
             let p = g.ptr_c(prow, n as u32 * 8);
-            g.when(valid, KirOp::StoreVec { ptr: p, vals: vec![x0, x1], space: AddressSpace::Global });
+            let vals = g.narrow_to(p, vec![x0, x1]);
+            g.when(valid, KirOp::StoreVec { ptr: p, vals, space: AddressSpace::Global });
         }
         // lse = (m·sl2 + log2 l) · ln 2
         let ms = g.mul(m[half], sl2);

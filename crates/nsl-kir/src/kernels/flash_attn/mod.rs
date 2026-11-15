@@ -91,6 +91,13 @@ pub(crate) fn f32_global() -> KirType {
     KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global)
 }
 
+/// The global pointer type of an attention operand stored as `io` (option
+/// (a) of bf16 activation storage: Q, K, V, O, dO, dQ, dK, dV in bf16; the
+/// log-sum-exp, `D` and the per-head maxima stay f32).
+pub(crate) fn io_global(io: crate::kernels::storage::Storage) -> KirType {
+    io.ptr()
+}
+
 pub(crate) fn u32_global() -> KirType {
     KirType::Ptr(Box::new(KirType::U32), AddressSpace::Global)
 }
@@ -294,6 +301,44 @@ impl G {
         let dsts: Vec<VarId> = (0..n).map(|_| self.var(pointee.clone())).collect();
         self.b.emit(KirOp::LoadVec { dsts: dsts.clone(), ptr: p, space });
         dsts
+    }
+
+    /// [`G::load_vec`] as f32 values: a bf16 pointee is widened
+    /// (`cvt.f32.bf16`, exact). For an f32 pointee this is `load_vec` itself,
+    /// so an f32 kernel emits exactly what it emitted before.
+    pub fn load_vec_f32(&mut self, p: VarId, n: usize, space: AddressSpace) -> Vec<VarId> {
+        let vals = self.load_vec(p, n, space);
+        vals.into_iter()
+            .map(|v| {
+                if self.ty(v) == KirType::Bf16 {
+                    let d = self.var(KirType::F32);
+                    self.b.emit(KirOp::Cast(d, v, KirType::F32));
+                    d
+                } else {
+                    v
+                }
+            })
+            .collect()
+    }
+
+    /// f32 `vals` in the element type `p` points to: rounded once to nearest
+    /// even (`cvt.rn.bf16.f32`) for a bf16 pointee, unchanged (no op) for an
+    /// f32 one. For a store through `p`.
+    pub fn narrow_to(&mut self, p: VarId, vals: Vec<VarId>) -> Vec<VarId> {
+        let pointee = match self.ty(p) {
+            KirType::Ptr(t, _) => *t,
+            other => panic!("flash_attn: store through a non-pointer {other:?}"),
+        };
+        if pointee != KirType::Bf16 {
+            return vals;
+        }
+        vals.into_iter()
+            .map(|v| {
+                let h = self.var(KirType::Bf16);
+                self.b.emit(KirOp::Cast(h, v, KirType::Bf16));
+                h
+            })
+            .collect()
     }
 
     pub fn store_vec(&mut self, p: VarId, vals: Vec<VarId>, space: AddressSpace) {

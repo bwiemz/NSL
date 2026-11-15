@@ -1293,6 +1293,11 @@ pub extern "C" fn nsl_tensor_contiguous(tensor_ptr: i64) -> i64 {
             // fast path returned above with a refcount bump — so this refuses
             // exactly the cases `gpu_strided_copy_f32` would have read at
             // 4 bytes per element out of a 2-byte-per-element allocation.
+            // bf16 activation storage: transposes, reshapes and GQA expands
+            // of bf16 activations (2-byte elements, `cuda::storage_copy`).
+            if t.dtype == crate::tensor::DTYPE_BF16 {
+                return record_relabel(crate::cuda::storage_copy::contiguous_bf16(tensor_ptr));
+            }
             crate::cuda::assert_gpu_f32(t, "nsl_tensor_contiguous", "input");
             return record_relabel(crate::cuda::gpu_strided_copy_f32(tensor_ptr));
         }

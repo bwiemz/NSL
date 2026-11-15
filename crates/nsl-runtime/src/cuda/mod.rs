@@ -44,6 +44,9 @@ pub(crate) mod storage_kernels;
 #[cfg(feature = "cuda")]
 pub(crate) mod storage_gemm;
 
+#[cfg(feature = "cuda")]
+pub(crate) mod storage_copy;
+
 /// Test-only views of the bf16 cast cache (re-exported from lib.rs): the
 /// integration gate drives registration through the REAL fused-AdamW extern
 /// and needs only to observe (hits, recasts, evictions) and reset between
@@ -60,6 +63,12 @@ pub fn test_bf16_cast_cache_reset() {
 /// Test-only views of the cublasLt matmul path, same shape as the cast-cache
 /// pair above: the gate observes (issued, tuned, fallbacks) and resets the
 /// plan cache between checks.
+/// Test-only: how many bf16 contiguous copies took the widen/copy/narrow path.
+#[cfg(all(feature = "cuda", feature = "test-hooks"))]
+pub fn test_storage_copy_regional_count() -> u64 {
+    storage_copy::regional_count()
+}
+
 #[cfg(all(feature = "cuda", feature = "test-hooks"))]
 pub fn test_lt_matmul_stats() -> (u64, u64, u64) {
     lt_matmul::stats()
