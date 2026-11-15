@@ -195,6 +195,13 @@ const LARGE_SEGMENT_SIZE: usize = 20 << 20; // 20 MB
 const SMALL_MIN_SPLIT: usize = 512;
 /// Minimum remainder size to justify splitting a block (large pool).
 const LARGE_MIN_SPLIT: usize = 2 << 20; // 2 MB
+/// Step-boundary release policy ([`CachingAllocator::drain_if_bloated`]): the
+/// pool may hold this much more than the last window's peak before its idle
+/// transient segments go back to the driver...
+const BLOAT_FLOOR_BYTES: usize = 1 << 30; // 1 GiB
+/// ...or this fraction (1/BLOAT_DIVISOR) of that window's transient demand,
+/// whichever is larger.
+const BLOAT_DIVISOR: usize = 2;
 
 // ---------------------------------------------------------------------------
 // Data structures
@@ -432,6 +439,12 @@ pub(crate) struct CachingAllocator<D: DriverAlloc = CudaDriverAlloc> {
     external_at_peak_bytes: usize,
     /// Configurable memory limit (0 = unlimited).
     memory_limit: usize,
+    /// Bytes in POOLED blocks currently handed out (`total_allocated` minus
+    /// the external allocations, which `total_reserved` does not hold).
+    pooled_allocated: usize,
+    /// High-water mark of `pooled_allocated` since the last step-boundary
+    /// decision ([`Self::drain_if_bloated`]).
+    window_peak_pooled: usize,
     /// The driver backend.
     driver: D,
 }
@@ -459,6 +472,8 @@ impl CachingAllocator<CudaDriverAlloc> {
             contexts_at_peak: Vec::new(),
             external_at_peak_bytes: 0,
             memory_limit,
+            pooled_allocated: 0,
+            window_peak_pooled: 0,
             driver: CudaDriverAlloc,
         }
     }
@@ -482,6 +497,8 @@ impl<D: DriverAlloc> CachingAllocator<D> {
             contexts_at_peak: Vec::new(),
             external_at_peak_bytes: 0,
             memory_limit: 0,
+            pooled_allocated: 0,
+            window_peak_pooled: 0,
             driver,
         }
     }
@@ -571,6 +588,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         // Bookkeeping
         self.allocated_blocks.insert(block.ptr as usize, block_ptr);
         self.total_allocated += block.size;
+        self.note_pooled_alloc(block.size);
         self.stats.num_allocs += 1;
         if block.alloc_pool == AllocPool::Persistent {
             self.stats.num_allocs_persistent += 1;
@@ -662,6 +680,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
 
         self.allocated_blocks.insert(base_ptr as usize, block);
         self.total_allocated += blk.size;
+        self.note_pooled_alloc(blk.size);
         self.stats.num_allocs += 1;
         if blk.alloc_pool == AllocPool::Persistent {
             self.stats.num_allocs_persistent += 1;
@@ -759,6 +778,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         let small = seg.is_small;
 
         self.total_allocated -= old_size;
+        self.pooled_allocated = self.pooled_allocated.saturating_sub(old_size);
         self.stats.num_allocs -= 1;
         if old_pool == AllocPool::Persistent {
             self.stats.num_allocs_persistent =
@@ -857,6 +877,52 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         self.stats.num_free_blocks += 1;
 
         true
+    }
+
+    fn note_pooled_alloc(&mut self, size: usize) {
+        self.pooled_allocated += size;
+        if self.pooled_allocated > self.window_peak_pooled {
+            self.window_peak_pooled = self.pooled_allocated;
+        }
+    }
+
+    /// The step-boundary release decision (`nsl_gpu_drain_cache`, emitted after
+    /// every training micro-batch): drain the idle transient segments only when
+    /// the pool holds markedly more than the window since the last decision
+    /// needed at its peak. Returns `Some(bytes released)` when it drained.
+    ///
+    /// # Why not every step, and why not never
+    ///
+    /// The drain used to run unconditionally (April 2026, when the allocator
+    /// re-grew ~1,550 fresh segments a step without it: +3.1 GB of reservation
+    /// per step until OOM). Measured in November on Coder-500M and Coder-1B
+    /// with the drain off, the pool now reaches its working set in the first
+    /// two or three micro-batches and stays flat (no driver allocation after
+    /// that, 96 and 192 micro-batches), while the unconditional drain cost ~95
+    /// `cuMemFree` (24 ms of idle GPU at 1B) and as many `cuMemAlloc` per
+    /// micro-batch: 1.02-1.05x of throughput.
+    ///
+    /// "Never" would leave a pool that DID bloat (a phase whose sizes the cache
+    /// cannot reuse, a pathological fragmentation pattern) holding that memory
+    /// until an allocation failed — and an allocation-failure drain can only
+    /// release segments the CURRENT step is not using. So the boundary still
+    /// releases, but only when the reservation exceeds the window's peak by
+    /// more than max(1 GiB, half that window's transient demand): the old
+    /// per-step reset in exactly the case it existed for, nothing in steady
+    /// state.
+    pub(crate) fn drain_if_bloated(&mut self) -> Option<usize> {
+        let drain = self.would_drain();
+        self.window_peak_pooled = self.pooled_allocated;
+        drain.then(|| self.drain_all())
+    }
+
+    /// [`Self::drain_if_bloated`]'s decision, without acting on it or opening
+    /// a new window (the caller quiets the device first when it is true).
+    pub(crate) fn would_drain(&self) -> bool {
+        let peak = self.window_peak_pooled;
+        let demand = peak.saturating_sub(self.pooled_allocated);
+        let excess = self.total_reserved.saturating_sub(peak);
+        excess > (demand / BLOAT_DIVISOR).max(BLOAT_FLOOR_BYTES)
     }
 
     /// Drain fully-free Transient segments back to the driver. Returns bytes freed.
@@ -1856,6 +1922,92 @@ mod tests {
         // Should only have 1 driver allocation (the initial segment)
         assert_eq!(a.driver.alloc_count.load(Ordering::Relaxed), 1,
                    "repeated same-size alloc/free should reuse, not grow");
+    }
+
+    // ── step-boundary release policy (drain_if_bloated) ──────────────
+
+    const MIB: usize = 1 << 20;
+
+    /// One training-step-shaped window: allocate `sizes` (cache first, then
+    /// grow — the runtime's order), free them all, then take the boundary
+    /// decision. Returns (decision, driver allocations during the window).
+    fn window(a: &mut CachingAllocator<MockDriver>, sizes: &[usize]) -> (Option<usize>, usize) {
+        let before = a.driver.alloc_count.load(Ordering::Relaxed);
+        let ptrs: Vec<_> = sizes
+            .iter()
+            .map(|&s| a.alloc_from_cache(s).or_else(|| a.alloc_with_grow(s)).unwrap())
+            .collect();
+        for p in ptrs {
+            a.free_block(p);
+        }
+        let grew = a.driver.alloc_count.load(Ordering::Relaxed) - before;
+        (a.drain_if_bloated(), grew)
+    }
+
+    /// Steady state: the same step twice keeps its segments. The second step
+    /// is served from the cache entirely, which is the point of not draining
+    /// (the old per-step drain re-allocated every segment, every step).
+    #[test]
+    fn steady_steps_keep_the_pool() {
+        let mut a = make_alloc();
+        let step = [300 * MIB, 200 * MIB, 100 * MIB, 64 * 1024, 4096];
+        let (d1, g1) = window(&mut a, &step);
+        assert_eq!(d1, None, "first step: the pool holds exactly what it needed");
+        assert!(g1 > 0);
+        let reserved = a.total_reserved;
+        for i in 2..6 {
+            let (d, g) = window(&mut a, &step);
+            assert_eq!(d, None, "step {i}: nothing to release");
+            assert_eq!(g, 0, "step {i}: served from the cache, no driver allocation");
+            assert_eq!(a.total_reserved, reserved, "step {i}: reservation flat");
+        }
+    }
+
+    /// A phase whose sizes the cache cannot reuse (twenty 100 MiB blocks, then
+    /// one 1.5 GiB block) leaves 2 GiB idle beside a 1.5 GiB working set: more
+    /// than max(1 GiB, half the demand). The boundary releases it — the per-step
+    /// reset the drain existed for, in the case it existed for.
+    #[test]
+    fn a_pool_holding_far_more_than_the_step_needed_is_released() {
+        let mut a = make_alloc();
+        let (d, _) = window(&mut a, &[100 * MIB; 20]);
+        assert_eq!(d, None);
+        assert_eq!(a.total_reserved, 2000 * MIB);
+        let (d, grew) = window(&mut a, &[1500 * MIB]);
+        assert_eq!(grew, 1, "no 100 MiB segment holds 1.5 GiB: one new segment");
+        let freed = d.expect("2 GiB idle beside a 1.5 GiB step must be released");
+        assert_eq!(freed, 3500 * MIB, "every idle transient segment goes back");
+        assert_eq!(a.total_reserved, 0);
+    }
+
+    /// Below the threshold the pool is kept: 0.9 GiB idle beside a 2 GiB step
+    /// is under the 1 GiB floor.
+    #[test]
+    fn modest_slack_is_kept() {
+        let mut a = make_alloc();
+        let (d, _) = window(&mut a, &[100 * MIB; 9]);
+        assert_eq!(d, None);
+        let (d, _) = window(&mut a, &[2000 * MIB]);
+        assert_eq!(d, None, "900 MiB idle < max(1 GiB, 1000 MiB): kept");
+        assert_eq!(a.total_reserved, 2900 * MIB);
+    }
+
+    /// Live (carried) bytes are not demand. A 4 GB block stays allocated
+    /// across the boundary; the step then moves from twelve 100 MiB blocks to
+    /// one 1.5 GiB block. Idle beside the step's peak: 1.2 GiB. Demand: 1.5 GiB
+    /// (the peak minus what is still live), so the threshold is the 1 GiB
+    /// floor and the pool is released. Counting the carried 4 GB as demand
+    /// would have raised the threshold to 2.75 GiB and kept it.
+    #[test]
+    fn carried_bytes_are_not_counted_as_demand() {
+        let mut a = make_alloc();
+        let carried = a.alloc_with_grow(4000 * MIB).unwrap();
+        let (d, _) = window(&mut a, &[100 * MIB; 12]);
+        assert_eq!(d, None, "the step used all it reserved");
+        let (d, _) = window(&mut a, &[1500 * MIB]);
+        assert_eq!(d, Some(2700 * MIB), "1.2 GiB idle > max(1 GiB, 0.75 GiB)");
+        assert_eq!(a.total_reserved, 4000 * MIB, "the carried block's segment stays");
+        a.free_block(carried);
     }
 
     // ── P0.1 per-surface VRAM accounting ─────────────────────────────

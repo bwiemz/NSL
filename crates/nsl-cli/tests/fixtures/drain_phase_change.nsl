@@ -1,0 +1,42 @@
+# Step-boundary drain gate fixture (step_boundary_drain_gpu_gate.rs): train a
+# small MLP on the GPU, then allocate one tensor larger than any segment the
+# training steps left in the allocator's cache.
+#
+# Training no longer returns its idle transient pool to the driver after every
+# micro-batch, so after the train block the cache still holds the training
+# working set. Under NSL_GPU_MEM_LIMIT (set by the harness) the big tensor fits
+# only once that idle cache is released: the allocation must fail, drain, and
+# retry (`alloc_managed`'s recovery), not die.
+#
+# Pure tensors, every input device-resident, l1_loss (mse_loss leaks an
+# intermediate per step on the source-AD path; see cuda_graph_gate.nsl).
+
+from nsl.nn.losses import l1_loss
+
+model Mlp:
+    w1: Tensor = randn([1024, 2048]) * 0.03
+    w2: Tensor = randn([2048, 1024]) * 0.02
+
+    fn forward_train(self, x: Tensor) -> Tensor:
+        return silu(x @ self.w1) @ self.w2
+
+let m = Mlp()
+m.to(cuda)
+let x = randn([4096, 1024]).to(cuda)
+let y = (randn([4096, 1024]) * 0.1).to(cuda)
+
+train(model=m, epochs=10, grad_accumulation=2):
+    optimizer: AdamW(lr=0.001, weight_decay=0.0, beta1=0.9, beta2=0.95, eps=1e-8)
+    step(batch):
+        let pred = m.forward_train(x)
+        let loss = l1_loss(pred, y)
+    callbacks:
+        on_step(step, loss):
+            print(loss)
+
+print("TRAIN_DONE")
+
+# 384 MiB in one tensor: larger than any segment of the training cache.
+let big = zeros([100663296]).to(cuda)
+print(big.sum().item())
+print("BIG_DONE")

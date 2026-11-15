@@ -2720,8 +2720,11 @@ impl Compiler<'_> {
         // P0.1: end of the Activations bracket — restore the caller's surface.
         self.compile_call_by_name(builder, "nsl_gpu_set_alloc_surface", &[surface_prev])?;
 
-        // Drain GPU caching allocator — only releases Transient segments,
-        // which are now fully free since forward/backward intermediates were freed.
+        // Step-boundary hook: host-profile report, and a release of the
+        // caching allocator's idle Transient segments ONLY when the pool holds
+        // markedly more than this step needed (`drain_if_bloated`; it used to
+        // release every step, which re-allocated the whole working set per
+        // micro-batch).
         //
         // P5 item 19: the runtime skips this drain while cuda-graph capture is
         // ARMED (per-step segment release would churn every transient address

@@ -1251,10 +1251,10 @@ pub static REGISTRY: &[EnvVar] = &[
         "NSL_SKIP_GPU_DRAIN",
         Bool,
         "1 only",
-        "off (drain each step)",
+        "off (release only a pool holding more than max(1 GiB, half the step demand) past the step peak)",
         Perf,
         Runtime,
-        "Set to 1 to skip the per-step release of idle caching-allocator GPU memory back to the driver."
+        "Set to 1 to never return idle cached GPU memory to the driver at a training step boundary, even a bloated pool (failed allocations still drain)."
     ),
     var!(
         "NSL_SOURCE_AD_ITEM_FOLD",
