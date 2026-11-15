@@ -1188,7 +1188,7 @@ impl Compiler<'_> {
                 &[weight_val, indices_val],
             );
         }
-        // bias_add(tensor, bias) -> tensor -- broadcasts 1D bias over 2D tensor
+        // bias_add(tensor, bias) -> tensor -- a 1-D bias along the last dim of [..., C]
         if func_name == "bias_add" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 2 {
                 return Err(CodegenError::new(

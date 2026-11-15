@@ -248,8 +248,8 @@ fn sixteen_bit_storage_below_the_threshold_still_compiles() {
     // The SAME fixture family as the refusing arm — the parent it was derived
     // from — with only the dtype hint flipped, so the vocabulary is the only
     // difference between this arm and that one. (`fused_lm_ce_e2e_bf16.nsl`
-    // looks like the obvious control and is not: its `bias_add` head is not
-    // source-AD-extractable, so it never fuses and never routes.)
+    // looks like the obvious control and is not: it is another fixture
+    // family, so more than the vocabulary would differ.)
     let out = build_fixture(
         "crates/nsl-cli/tests/fixtures",
         "csla_fused_lmce.nsl",

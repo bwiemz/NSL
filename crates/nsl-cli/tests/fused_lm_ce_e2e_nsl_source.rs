@@ -40,7 +40,8 @@
 //! `[rows]` input — see `cpkd_distill_basic.nsl`. A raw 3D `x` made
 //! `nsl_tensor_bias_add` (`crates/nsl-runtime/src/tensor/mod.rs`)
 //! `std::process::abort()` the whole process with "bias_add requires 2D
-//! tensor (got 3D)" the moment execution reached it. Fixtures now use
+//! tensor (got 3D)" the moment execution reached it (bias_add has since
+//! taken `[..., H]` input; `cross_entropy` still wants it flat). Fixtures now use
 //! `x = randn([64, 128])` / `targets = zeros([64])` (rows = B*S = 64).
 //!
 //! ## Why this is the right scope today

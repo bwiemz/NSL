@@ -335,16 +335,15 @@ fn disabled_decorator_on_the_same_head_compiles() {
 ///
 /// This is the OTHER way the promise breaks, and the refusal does not cover
 /// it: with no successful extraction there are no declines to report, so the
-/// hard error is unreachable. `crates/nsl-codegen/tests/fixtures/
-/// fused_lm_ce_e2e_{fp16,bf16}.nsl` both live here — their heads use
-/// `bias_add(...)`, which has no source-AD handler — which is why this warns
-/// rather than refuses.
+/// hard error is unreachable, which is why this warns rather than refuses.
+/// (The head used to be `bias_add(...)`, which source AD did not extract;
+/// it now extracts as the broadcasting Add and that head fuses.)
 #[test]
 fn enabled_decorator_with_unextractable_body_warns() {
-    // `bias_add` has no source-AD handler, so extraction fails and the run
+    // `.slice` has no source-AD handler, so extraction fails and the run
     // falls back to tape AD, where the fused kernel does not exist.
-    let head = "        let flat_hn = hn.reshape([batch_size * seq_len, 64])\n\
-    \x20       return bias_add(flat_hn @ self.embed.transpose(0, 1), self.lm_bias)";
+    let head = "        let flat_hn = hn.reshape([batch_size * seq_len, 64]).slice(1, 0, 64)\n\
+    \x20       return (flat_hn @ self.embed.transpose(0, 1)) + self.lm_bias";
     let (_ok, stderr) = build(&fixture(head, PLAIN_LOSS, "true"), "unextractable");
     assert!(
         stderr.contains("source-AD extraction of the step body failed"),

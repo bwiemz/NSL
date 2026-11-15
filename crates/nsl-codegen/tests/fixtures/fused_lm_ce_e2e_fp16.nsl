@@ -21,11 +21,9 @@
 #
 # `x`/`targets` are pre-flattened to [rows, H] / [rows] (rows = B*S) --
 # `forward`'s naive composite path (`bias_add` + `cross_entropy`) runs
-# whenever `@fused_lm_ce` doesn't substitute a fused kernel call, and
-# both `nsl_tensor_bias_add` and the stdlib `cross_entropy` gather path
-# require 2D/1D flattened input (see `cpkd_distill_basic.nsl`); a raw
-# [B, S, H] `x` aborts the process in `nsl_tensor_bias_add` with
-# "bias_add requires 2D tensor (got 3D)" the moment execution reaches it.
+# whenever `@fused_lm_ce` doesn't substitute a fused kernel call, and the
+# stdlib `cross_entropy` gather path requires 2D/1D flattened input (see
+# `cpkd_distill_basic.nsl`). (`bias_add` itself takes a [..., H] input.)
 #
 # Shape parameters here match the v5/v6 numerical-pin orchestrator
 # config (V=4096, H=128, B=2, S=32, vocab_tile=1024) so the same CPU f64
