@@ -285,7 +285,9 @@ def bf16_criterion(nsl: list[Spread], autocast_: list[Spread]) -> tuple[bool, st
     autocast shows against PyTorch f32 over the batches."""
     med = max(s.median for s in autocast_)
     worst = max(s.worst for s in autocast_)
-    bad = [i for i, s in enumerate(nsl) if s.median > med or s.worst > worst]
+    # Written as "not within" so a NaN (which compares false both ways)
+    # fails rather than passes.
+    bad = [i for i, s in enumerate(nsl) if not (s.median <= med and s.worst <= worst)]
     verdict = (
         f"bf16 criterion: NSL median/worst per batch "
         f"{', '.join(f'{s.median:.2e}/{s.worst:.2e}' for s in nsl)} against autocast's "
