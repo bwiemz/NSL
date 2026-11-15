@@ -1638,6 +1638,13 @@ fn lower_storage_op(
             "nsl_tensor_swiglu_gate_backward_dt",
             &[inputs[0], inputs[1], inputs[2], dt],
         ),
+        PrimalOp::Passthrough(name) if name == "rotate_half" || name == "rotate_half_neg" => {
+            let neg = builder.ins().iconst(cl_types::I64, i64::from(name == "rotate_half_neg"));
+            call(compiler, builder, "nsl_tensor_rotate_half_dt", &[inputs[0], neg, dt])
+        }
+        PrimalOp::Passthrough(name) if name == "reduce_to_shape" => {
+            call(compiler, builder, "nsl_tensor_reduce_to_shape_dt", &[inputs[0], inputs[1], dt])
+        }
         other => Err(CodegenError::new(format!(
             "internal: the bf16 storage plan sent {other:?} (VarId {}) to the dtype-explicit lowering, \
              which does not cover it",

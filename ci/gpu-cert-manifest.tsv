@@ -3,6 +3,7 @@
 # Columns: file<TAB>test<TAB>class<TAB>reason
 crates/nsl-cli/tests/autotune_measure_gate.rs	autotune_measures_and_compiles_consume_it_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/bf16_activation_storage_gate.rs	the_bf16_program_trains_like_f32_storage_with_bf16_gemms	gpu	requires CUDA GPU
+crates/nsl-cli/tests/bf16_activation_storage_gate.rs	the_attention_half_trains_like_f32_storage_with_bf16_gemms	gpu	requires CUDA GPU
 crates/nsl-cli/tests/ccr_checkpoint_activation_parity_gpu.rs	ccr_activation_parity_on_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/ccr_checkpoint_parity.rs	ccr_blocks_parity_on_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/ccr_checkpoint_parity.rs	ccr_blocks_parity_on_gpu_deterministic	gpu	requires CUDA GPU

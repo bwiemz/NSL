@@ -493,8 +493,10 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
         &["crates/nsl-codegen/src/stmt_train/storage_plan.rs"],
         "a precision=\"bf16\" train step's storage plan was applied: \
          `[bf16-storage] N SwiGLU MLP block(s) stored bf16: V values, O ops \
-         lowered dtype-explicit`, once per planned train block. A program \
-         with no SwiGLU block to store fails the compile instead",
+         lowered dtype-explicit`, once per planned train block, followed by \
+         `[bf16-storage] N attention half(s) stored bf16 (...)` when attention \
+         halves were planned. A program with neither to store fails the \
+         compile instead",
     ),
 ];
 

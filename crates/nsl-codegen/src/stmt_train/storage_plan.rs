@@ -77,6 +77,8 @@ pub struct StoragePlan {
     pub bf16: HashSet<VarId>,
     /// SwiGLU slices admitted.
     pub slices: usize,
+    /// Attention halves admitted (step 5).
+    pub attention: usize,
 }
 
 /// One admitted SwiGLU slice (primal VarIds).
@@ -210,18 +212,136 @@ pub fn has_dt_lowering(op: &PrimalOp) -> bool {
         || is_binary(op)
         || is_unary_dt(op)
         || is_passthrough(op, "swiglu_gate_backward")
+        || is_passthrough(op, "rotate_half")
+        || is_passthrough(op, "rotate_half_neg")
+        || is_passthrough(op, "reduce_to_shape")
+}
+
+/// Ops whose result has their (first) input's storage and that the runtime
+/// performs for either dtype: views and copies.
+fn is_dtype_preserving(op: &PrimalOp) -> bool {
+    matches!(op, PrimalOp::Transpose { .. })
+        || is_passthrough(op, "reshape")
+        || is_passthrough(op, "expand")
+        || is_passthrough(op, "contiguous")
+}
+
+/// The attention half of a block (design step 5): the values to store bf16
+/// at their producers (the attention norm, the q/k/v projections, the RoPE
+/// results the attention reads, the output projection) for every
+/// scaled-dot-product attention whose operands come from parameter GEMMs of
+/// one RMSNorm output, through views, copies and RoPE.
+fn find_attention_seeds(primal: &WengertList) -> (Vec<VarId>, Vec<VarId>) {
+    let prod = producers(primal);
+    let rd = readers(primal);
+    // Walk back through views and copies to the value's real producer.
+    let through = |mut v: VarId| -> VarId {
+        while let Some(op) = prod.get(&v) {
+            if is_dtype_preserving(&op.op) {
+                v = op.inputs[0];
+            } else {
+                break;
+            }
+        }
+        v
+    };
+    let mut seeds = Vec::new();
+    let mut norms = Vec::new();
+    for op in &primal.ops {
+        if !matches!(op.op, PrimalOp::ScaledDotProductAttention { .. }) || op.inputs.len() < 3 {
+            continue;
+        }
+        let mut gemms = Vec::new();
+        let mut ropes = Vec::new();
+        let mut ok = true;
+        for &x in &op.inputs[..3] {
+            let src = through(x);
+            if let Some(m_in) = matmul_of_param(&prod, src) {
+                let _ = m_in;
+                gemms.push(src);
+                continue;
+            }
+            // RoPE: Add(Mul(t, cos), Mul(rotate_half(t), sin)) of a view of a GEMM.
+            let Some(add) = prod.get(&src).filter(|o| matches!(o.op, PrimalOp::Add)) else {
+                ok = false;
+                break;
+            };
+            let gemm = add
+                .inputs
+                .iter()
+                .filter_map(|&m| prod.get(&m).filter(|o| matches!(o.op, PrimalOp::Mul)))
+                .flat_map(|m| m.inputs.iter().copied())
+                .map(|t| {
+                    let t = prod.get(&t).filter(|o| is_passthrough(&o.op, "rotate_half")).map_or(t, |o| o.inputs[0]);
+                    through(t)
+                })
+                .find(|&g| matmul_of_param(&prod, g).is_some());
+            match gemm {
+                Some(g) => {
+                    gemms.push(g);
+                    ropes.push(src);
+                }
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok || gemms.len() != 3 {
+            continue;
+        }
+        // One RMSNorm output feeds the three projections and nothing else.
+        let n = matmul_of_param(&prod, gemms[0]).expect("checked");
+        if gemms.iter().any(|&g| matmul_of_param(&prod, g) != Some(n))
+            || !prod.get(&n).is_some_and(|o| matches!(o.op, PrimalOp::RMSNorm { .. }))
+        {
+            continue;
+        }
+        let n_readers = rd.get(&n).map(Vec::as_slice).unwrap_or_default();
+        if !n_readers.iter().all(|o| matches!(o.op, PrimalOp::Matmul) || is_passthrough(&o.op, "shape")) {
+            continue;
+        }
+        // The output: views/copies of the attention result into a parameter GEMM.
+        let mut out = op.result;
+        while let Some([r]) = rd.get(&out).map(Vec::as_slice) {
+            if is_dtype_preserving(&r.op) {
+                out = r.result;
+            } else {
+                break;
+            }
+        }
+        let wo = rd.get(&out).and_then(|rs| match rs.as_slice() {
+            [r] if matches!(r.op, PrimalOp::Matmul) && matmul_of_param(&prod, r.result) == Some(out) => Some(r.result),
+            _ => None,
+        });
+        let Some(wo) = wo else { continue };
+        norms.push(n);
+        seeds.push(n);
+        seeds.extend(gemms.iter().copied());
+        seeds.extend(ropes);
+        seeds.push(wo);
+    }
+    seeds.sort_unstable();
+    seeds.dedup();
+    (seeds, norms)
 }
 
 struct Planner<'a> {
     plan: StoragePlan,
-    /// Values whose GRADIENT is planned bf16 (and their clones).
-    grad_bf16: HashSet<VarId>,
+    /// Norm outputs (and their clones): stored bf16, but their gradient is
+    /// f32 (summed from several GEMMs, read by the f32 norm backward).
+    norm_out: HashSet<VarId>,
     clones: &'a HashMap<VarId, VarId>,
 }
 
 impl Planner<'_> {
     fn is_bf16(&self, v: VarId) -> bool {
         self.plan.bf16.contains(&v)
+    }
+
+    /// Rule 6: a gradient is stored as its value is, except a norm output's.
+    fn grad_is_bf16(&self, target: VarId) -> bool {
+        self.is_bf16(target) && !self.norm_out.contains(&target)
     }
 
     fn set(&mut self, op: &WengertOp, st: Storage) {
@@ -240,6 +360,15 @@ impl Planner<'_> {
         )
     }
 
+    /// All of `vs` bf16, or none (`Err` names the op otherwise).
+    fn all_or_none(&self, op: &WengertOp, list: &str, vs: &[VarId]) -> Result<bool, String> {
+        let n = vs.iter().filter(|&&v| self.is_bf16(v)).count();
+        if n != 0 && n != vs.len() {
+            return Err(Self::refuse(op, list, "its tensor operands mix bf16 and f32 storage"));
+        }
+        Ok(n != 0)
+    }
+
     /// Rules 2-6 for one op of the forward (`in_adjoint` false) or the
     /// backward.
     fn visit(&mut self, op: &WengertOp, in_adjoint: bool, rd_adj: &HashMap<VarId, Vec<&WengertOp>>) -> Result<(), String> {
@@ -249,51 +378,90 @@ impl Planner<'_> {
         }
         let reads_bf16 = op.inputs.iter().any(|&i| self.is_bf16(i));
         // Rule 2: a recompute clone stores what its original stores.
-        if let Some(orig) = self.clones.get(&op.result) {
-            if self.grad_bf16.contains(orig) {
-                self.grad_bf16.insert(op.result);
+        if let Some(&orig) = self.clones.get(&op.result) {
+            if self.norm_out.contains(&orig) {
+                self.norm_out.insert(op.result);
             }
-            if self.is_bf16(*orig) {
-                if !has_dt_lowering(&op.op) {
-                    return Err(Self::refuse(op, list, "a recompute clone of a bf16 value whose op has no bf16 lowering"));
-                }
+            if self.is_bf16(orig) && has_dt_lowering(&op.op) {
                 self.set(op, Storage::Bf16);
                 return Ok(());
             }
+            if self.plan.out.get(&orig) == Some(&Storage::F32) && has_dt_lowering(&op.op) {
+                self.set(op, Storage::F32);
+                return Ok(());
+            }
+            // A view or copy clone: the general rules below, then checked.
+            self.visit_general(op, in_adjoint, reads_bf16, list, rd_adj)?;
+            if self.is_bf16(orig) != self.is_bf16(op.result) {
+                return Err(Self::refuse(op, list, "a recompute clone whose storage would differ from its original's"));
+            }
+            return Ok(());
         }
+        self.visit_general(op, in_adjoint, reads_bf16, list, rd_adj)
+    }
+
+    fn visit_general(
+        &mut self,
+        op: &WengertOp,
+        in_adjoint: bool,
+        reads_bf16: bool,
+        list: &str,
+        rd_adj: &HashMap<VarId, Vec<&WengertOp>>,
+    ) -> Result<(), String> {
+        // The single reader `reduce_to_shape(this, target)`: whose gradient this is.
+        let target = || {
+            only_reader(rd_adj, op.result)
+                .filter(|r| is_passthrough(&r.op, "reduce_to_shape") && r.inputs[0] == op.result)
+                .map(|r| r.inputs[1])
+        };
         match &op.op {
-            PrimalOp::Transpose { .. } => {
-                if reads_bf16 {
+            o if is_dtype_preserving(o) => {
+                if op.inputs.first().is_some_and(|&i| self.is_bf16(i)) {
                     self.plan.bf16.insert(op.result);
                 }
                 Ok(())
             }
             PrimalOp::Passthrough(name) if name == "shape" => Ok(()),
+            PrimalOp::ScaledDotProductAttention { .. } => {
+                // The attention writes O in its operands' storage (bf16: the
+                // tensor-core kernels, option (a)); the log-sum-exp stays f32.
+                if self.all_or_none(op, list, &op.inputs[..3])? {
+                    self.plan.bf16.insert(op.result);
+                }
+                Ok(())
+            }
+            PrimalOp::FlashAttentionBackwardExtract { .. } => {
+                // inputs: dO, q, k, v, O, scale. dQ/dK/dV in the operands' storage.
+                if self.all_or_none(op, list, &op.inputs[..5])? {
+                    self.plan.bf16.insert(op.result);
+                }
+                Ok(())
+            }
             PrimalOp::Passthrough(name) if name == "reduce_to_shape" => {
                 let (g, like) = (op.inputs[0], op.inputs[1]);
                 if self.is_bf16(g) {
-                    // Identity only: the gradient of a planned value onto that value.
-                    if !self.is_bf16(like) {
-                        return Err(Self::refuse(op, list, "a bf16 gradient reduced onto a value that is not a planned bf16 activation"));
-                    }
-                    self.plan.bf16.insert(op.result);
+                    // Identity, or a sum back to the value's shape (GQA): the
+                    // result is the gradient of `like`, stored as rule 6 says.
+                    self.set(op, if self.grad_is_bf16(like) { Storage::Bf16 } else { Storage::F32 });
                 }
                 // An f32 gradient reduced onto a bf16 value reads only its shape.
                 Ok(())
             }
             PrimalOp::Matmul => {
                 // Rule 4: the gradient of a value whose gradient is bf16.
-                let target = only_reader(rd_adj, op.result)
-                    .filter(|r| is_passthrough(&r.op, "reduce_to_shape") && r.inputs[0] == op.result)
-                    .map(|r| r.inputs[1]);
-                if in_adjoint && target.is_some_and(|t| self.grad_bf16.contains(&t)) {
+                if in_adjoint && target().is_some_and(|t| self.grad_is_bf16(t)) {
                     self.set(op, Storage::Bf16);
                 } else if reads_bf16 {
                     self.set(op, Storage::F32);
                 }
                 Ok(())
             }
-            o if is_binary(o) || is_unary_dt(o) || is_passthrough(o, "swiglu_gate_backward") => {
+            o if is_binary(o)
+                || is_unary_dt(o)
+                || is_passthrough(o, "swiglu_gate_backward")
+                || is_passthrough(o, "rotate_half")
+                || is_passthrough(o, "rotate_half_neg") =>
+            {
                 if reads_bf16 {
                     let all = op.inputs.iter().all(|&i| self.is_bf16(i));
                     self.set(op, if all { Storage::Bf16 } else { Storage::F32 });
@@ -310,20 +478,24 @@ impl Planner<'_> {
 /// `adjoint` to the primal value it recomputes (empty without CCR).
 pub fn plan(primal: &WengertList, adjoint: &WengertList, clones: &HashMap<VarId, VarId>) -> Result<StoragePlan, String> {
     let slices = find_slices(primal);
-    let mut pl = Planner { plan: StoragePlan { slices: slices.len(), ..Default::default() }, grad_bf16: HashSet::new(), clones };
+    let (attn_seeds, attn_norms) = find_attention_seeds(primal);
+    let mut pl = Planner {
+        plan: StoragePlan { slices: slices.len(), attention: attn_norms.len(), ..Default::default() },
+        norm_out: HashSet::new(),
+        clones,
+    };
     let prod = producers(primal);
     for sl in &slices {
         for v in [sl.n, sl.a, sl.s, sl.u, sl.p] {
             pl.set(prod[&v], Storage::Bf16);
         }
-        pl.grad_bf16.extend([sl.a, sl.s, sl.u, sl.p]);
-        if sl.d_f32 {
-            pl.set(prod[&sl.d], Storage::F32);
-        } else {
-            pl.set(prod[&sl.d], Storage::Bf16);
-            pl.grad_bf16.insert(sl.d);
-        }
+        pl.norm_out.insert(sl.n);
+        pl.set(prod[&sl.d], if sl.d_f32 { Storage::F32 } else { Storage::Bf16 });
     }
+    for v in attn_seeds {
+        pl.set(prod[&v], Storage::Bf16);
+    }
+    pl.norm_out.extend(attn_norms);
     let rd_adj = readers(adjoint);
     for op in &primal.ops {
         pl.visit(op, false, &rd_adj)?;
@@ -360,15 +532,16 @@ impl Compiler<'_> {
         let empty = HashMap::new();
         let clones = ccr_plan.as_ref().map_or(&empty, |p| &p.recompute_clones);
         let planned = plan(effective_primal, adjoint, clones).map_err(crate::CodegenError::new)?;
-        if planned.slices == 0 {
+        if planned.slices == 0 && planned.attention == 0 {
             // The program's fingerprint (`act=bf16`) and runtime banner were
             // decided from the key before `main`; with nothing planned they
             // would describe storage that does not exist.
             return Err(crate::CodegenError::new(
                 "precision=\"bf16\" found no block it can store in bf16: this phase stores the \
                  SwiGLU MLP half of a pre-norm block (rmsnorm -> gate and up projections -> \
-                 silu(gate) * up -> down projection -> residual add), and this train step has \
-                 none. For bf16 GEMMs over f32 activations, build with --matmul-mode bf16 and \
+                 silu(gate) * up -> down projection -> residual add) and the attention half \
+                 (rmsnorm -> q/k/v projections -> RoPE -> scaled-dot-product attention -> output \
+                 projection), and this train step has neither. For bf16 GEMMs over f32 activations, build with --matmul-mode bf16 and \
                  leave precision unset",
             ));
         }
@@ -379,6 +552,12 @@ impl Compiler<'_> {
                 planned.bf16.len(),
                 planned.out.len()
             );
+            if planned.attention > 0 {
+                nsl_log::nsl_log!(INFO, "bf16-storage",
+                    "[bf16-storage] {} attention half(s) stored bf16 (tensor-core attention with bf16 I/O)",
+                    planned.attention
+                );
+            }
         }
         self.storage_out = planned.out;
         Ok(())
@@ -552,6 +731,8 @@ mod tests {
             (751, Bf16), (752, Bf16), (753, Bf16),
             // dgrad of p bf16 (its gradient is bf16), wgrad of W_down f32
             (501, Bf16), (504, F32),
+            // reduce_to_shape of a bf16 gradient: dtype-explicit (identity here)
+            (502, Bf16), (509, Bf16),
             // d(up) = dp * s bf16; its dgrad into n f32, W_up's wgrad f32
             (508, Bf16), (511, F32), (514, F32),
             // d(gate) bf16; its dgrad into n f32, W_gate's wgrad f32
@@ -605,9 +786,9 @@ mod tests {
     #[test]
     fn an_unlowerable_reader_of_a_bf16_value_is_a_compile_error() {
         let (primal, mut adjoint, clones) = block();
-        adjoint.ops.push(op(901, pt("contiguous"), &[503]));
+        adjoint.ops.push(op(901, PrimalOp::Softmax { dim: -1 }, &[503]));
         let err = plan(&primal, &adjoint, &clones).expect_err("must refuse");
-        assert!(err.contains("contiguous") && err.contains("901"), "{err}");
+        assert!(err.contains("Softmax") && err.contains("901"), "{err}");
     }
 
     #[test]

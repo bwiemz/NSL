@@ -380,3 +380,26 @@ pub extern "C" fn nsl_tensor_matmul_dt(a: i64, b: i64, out_dtype: i64) -> i64 {
 fn storage(tag: u16) -> nsl_kir::kernels::storage::Storage {
     if tag == DTYPE_BF16 { nsl_kir::kernels::storage::Storage::Bf16 } else { nsl_kir::kernels::storage::Storage::F32 }
 }
+
+/// `reduce_to_shape(g, like)` with the result stored as `out_dtype`: the
+/// gradient of a bf16 activation summed back to its shape (grouped-query
+/// attention's dK/dV over the repeated heads). The identity (same shape, same
+/// dtype) returns `g` itself with a reference, as `nsl_tensor_reduce_to_shape`
+/// does; otherwise `g` is widened, reduced in f32 (the deterministic f32 sum)
+/// and narrowed once.
+#[unsafe(no_mangle)]
+pub extern "C" fn nsl_tensor_reduce_to_shape_dt(g: i64, like: i64, out_dtype: i64) -> i64 {
+    const NAME: &str = "nsl_tensor_reduce_to_shape_dt";
+    refuse_tape(NAME);
+    let tag = out_tag(NAME, out_dtype);
+    let tg = check_operand(NAME, g);
+    let tl = NslTensor::from_ptr_ref(like);
+    if tg.dtype == tag && tg.shape_eq(tl) {
+        tg.refcount.fetch_add(1, Ordering::SeqCst);
+        return g;
+    }
+    let w = widened(g);
+    let r = crate::tensor::ad_ops::nsl_tensor_reduce_to_shape(w, like);
+    crate::tensor::nsl_tensor_free(w);
+    narrowed(r, tag)
+}
