@@ -21,8 +21,9 @@ order a campaign uses them (each GPU one is short enough to queue on its own):
 Arms. `nsl_tf32`: the 1B production posture (PROD_FLAGS, f32 weights, the runtime's
 default TF32 cuBLAS math mode). `nsl_bf16`: the same flags built and run with
 NSL_MATMUL_BF16=1 (read at build time on main; the runtime's banner is checked).
-`nsl_*_nodrain`: the same binary under NSL_SKIP_GPU_DRAIN=1. `nsl_tf32_blocks`: PROD_FLAGS without
-`--checkpoint-selective` (full block recompute). `torch_<tf32|bf16>_<eager|compile>_
+`nsl_*_nodrain`: the same binary under NSL_SKIP_GPU_DRAIN=1. `nsl_*_oldattn`: the same
+binary under NSL_TC_ATTENTION=0 (the attention kernels before the tensor-core ones).
+`nsl_tf32_blocks`: PROD_FLAGS without `--checkpoint-selective` (full block recompute). `torch_<tf32|bf16>_<eager|compile>_
 <none|blocks|sel>`: `torch_arm.py` with that precision, compilation and checkpointing.
 
 Timing: a step-limited program per arm (the token file holds exactly `--updates`
@@ -180,6 +181,9 @@ BF16 = (("NSL_MATMUL_BF16", "1"),)
 # The runtime's documented Perf knob: skip the per-micro-batch release of cached
 # transient memory to the driver (`nsl_gpu_drain_cache`). Same binary.
 NO_DRAIN = (("NSL_SKIP_GPU_DRAIN", "1"),)
+# The attention kernels before the tensor-core ones (`NSL_TC_ATTENTION=0`): the
+# same binary, so the pair isolates the attention change. Read at run time.
+OLD_ATTN = (("NSL_TC_ATTENTION", "0"),)
 
 
 def arm(name: str) -> Arm:
@@ -188,6 +192,8 @@ def arm(name: str) -> Arm:
         "nsl_bf16": Arm(name, "nsl", "bf16", tuple(PROD_FLAGS), BF16),
         "nsl_tf32_nodrain": Arm(name, "nsl", "tf32", tuple(PROD_FLAGS), (), NO_DRAIN),
         "nsl_bf16_nodrain": Arm(name, "nsl", "bf16", tuple(PROD_FLAGS), BF16, NO_DRAIN),
+        "nsl_tf32_oldattn": Arm(name, "nsl", "tf32", tuple(PROD_FLAGS), (), OLD_ATTN),
+        "nsl_bf16_oldattn": Arm(name, "nsl", "bf16", tuple(PROD_FLAGS), BF16, OLD_ATTN),
         "nsl_tf32_blocks": Arm(name, "nsl", "tf32", tuple(BLOCKS_FLAGS)),
         "nsl_bf16_blocks": Arm(name, "nsl", "bf16", tuple(BLOCKS_FLAGS), BF16),
         "nsl_tf32_compress": Arm(name, "nsl", "tf32", tuple(COMPRESS_FLAGS)),
