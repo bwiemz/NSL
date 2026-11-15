@@ -130,6 +130,16 @@ impl Compiler<'_> {
             ))
         })?;
 
+        // The pipelined optimizer step is the stdlib call over f32 state; a
+        // bf16 first moment exists only on the fused FASE-Deferred path.
+        if optim_cfg.optimizer.first_moment_dtype == nsl_semantic::optim_config::MomentDtype::Bf16 {
+            return Err(CodegenError::new(
+                "first_moment_dtype=\"bf16\" is not supported on the @pipeline train \
+                 path (its optimizer step is the stdlib call over f32 state). Drop the \
+                 argument or the decorator",
+            ));
+        }
+
         // Deferral-must-refuse: the pipelined optimizer step passes only
         // the shared hyperparameters (no adamw_route/ns_steps/adamw_lr
         // slots, and its state allocation gives Muon one moment buffer

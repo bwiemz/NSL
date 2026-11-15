@@ -119,11 +119,22 @@ impl OptimizerKind {
             // weight_decay is REFUSED for Adam (see
             // `ADAM_COUPLED_DECAY_REFUSAL`), so neither it nor no_decay is
             // accepted; the step always receives 0.0.
-            OptimizerKind::Adam => &["lr", "beta1", "beta2", "eps"],
+            //
+            // `first_moment_dtype` (Adam and AdamW) is the storage dtype of the
+            // first moment `m`, not a step-function parameter: it is consumed
+            // by the optimizer-state allocation and the fused AdamW kernels,
+            // which read and write `m` in that dtype.
+            OptimizerKind::Adam => &["lr", "beta1", "beta2", "eps", "first_moment_dtype"],
             // adamw.nsl: (.., lr, beta1, beta2, eps, weight_decay, t)
-            OptimizerKind::AdamW => {
-                &["lr", "beta1", "beta2", "eps", "weight_decay", "no_decay"]
-            }
+            OptimizerKind::AdamW => &[
+                "lr",
+                "beta1",
+                "beta2",
+                "eps",
+                "weight_decay",
+                "no_decay",
+                "first_moment_dtype",
+            ],
             // lion.nsl: (.., lr, beta1, beta2, weight_decay) — no eps.
             OptimizerKind::Lion => &["lr", "beta1", "beta2", "weight_decay", "no_decay"],
             // soap.nsl: (.., lr, beta1, beta2, eps, t) — no weight_decay,
@@ -195,7 +206,37 @@ pub struct ResolvedOptimizer {
     /// `no_decay` included `"vector"` → exempt anything not rank-2 at
     /// runtime (mirrors `NoDecayScope.exempt_non_rank2`).
     pub no_decay_exempt_non_rank2: bool,
+    /// Adam/AdamW `first_moment_dtype`: the storage dtype of `m`. `Bf16`
+    /// keeps `m` as bf16 between steps (rounded to nearest even on store,
+    /// f32 arithmetic inside the update); `v`, the master weights and the
+    /// gradient accumulator stay f32.
+    pub first_moment_dtype: MomentDtype,
 }
+
+/// Storage dtype of an optimizer's first moment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MomentDtype {
+    #[default]
+    F32,
+    Bf16,
+}
+
+impl MomentDtype {
+    /// The spelling the source uses and the execution fingerprint records.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MomentDtype::F32 => "f32",
+            MomentDtype::Bf16 => "bf16",
+        }
+    }
+}
+
+/// Why `first_moment_dtype` is refused on an optimizer other than
+/// Adam/AdamW.
+pub const FIRST_MOMENT_DTYPE_UNSUPPORTED: &str = "first_moment_dtype is \
+    supported by Adam and AdamW (the fused AdamW step reads and writes a bf16 \
+    first moment); this optimizer keeps its state in f32. Muon's momentum has \
+    --muon-state-dtype bf16";
 
 /// A fully validated scheduler section, defaults applied. The lowering
 /// passes these as f64 constants to `nsl__optim__schedulers__<fn_name>`
@@ -498,6 +539,7 @@ fn resolve_optimizer_expr(
     let mut adamw_lr: Option<f64> = None;
     let mut no_decay_static_roles: Vec<String> = Vec::new();
     let mut no_decay_exempt_non_rank2 = false;
+    let mut first_moment_dtype = MomentDtype::F32;
     let mut lr_set = false;
     let mut momentum_set = false;
     let mut nesterov_set = false;
@@ -541,6 +583,16 @@ fn resolve_optimizer_expr(
             diags.push(
                 Diagnostic::error(format!("Adam does not accept '{key}'"))
                     .with_label(arg.span, ADAM_COUPLED_DECAY_REFUSAL),
+            );
+            continue;
+        }
+
+        if key == "first_moment_dtype"
+            && !matches!(kind, OptimizerKind::Adam | OptimizerKind::AdamW)
+        {
+            diags.push(
+                Diagnostic::error(format!("{display} does not accept 'first_moment_dtype'"))
+                    .with_label(arg.span, FIRST_MOMENT_DTYPE_UNSUPPORTED),
             );
             continue;
         }
@@ -680,6 +732,20 @@ fn resolve_optimizer_expr(
                     },
                 }
             }
+            "first_moment_dtype" => match &arg.value.kind {
+                ExprKind::StringLiteral(v) if v == "f32" => first_moment_dtype = MomentDtype::F32,
+                ExprKind::StringLiteral(v) if v == "bf16" => first_moment_dtype = MomentDtype::Bf16,
+                ExprKind::StringLiteral(v) => diags.push(
+                    Diagnostic::error(format!(
+                        "first_moment_dtype must be \"f32\" or \"bf16\" (got {v:?})"
+                    ))
+                    .with_label(arg.span, "expected \"f32\" or \"bf16\""),
+                ),
+                _ => diags.push(
+                    Diagnostic::error("first_moment_dtype must be a string literal")
+                        .with_label(arg.span, "expected \"f32\" or \"bf16\""),
+                ),
+            },
             "no_decay" => {
                 // Role names whose params are EXEMPT from weight decay. An
                 // unknown name is a compile error, not a silently-dropped
@@ -800,6 +866,7 @@ fn resolve_optimizer_expr(
         adamw_lr,
         no_decay_static_roles,
         no_decay_exempt_non_rank2,
+        first_moment_dtype,
     })
 }
 
@@ -1050,6 +1117,7 @@ mod tests {
                         ExprKind::StringLiteral("embedding".to_string()),
                     )])),
                     "beta1" | "beta2" => mk_expr(ExprKind::FloatLiteral(0.9)),
+                    "first_moment_dtype" => mk_expr(ExprKind::StringLiteral("bf16".to_string())),
                     _ => mk_expr(ExprKind::FloatLiteral(0.001)),
                 };
                 let kwarg = mk_kwarg(&mut interner, key, value);
@@ -1065,6 +1133,40 @@ mod tests {
                         .collect::<Vec<_>>())
                 );
             }
+        }
+    }
+
+    /// The first-moment storage dtype: "f32" by default, "bf16" on request,
+    /// anything else refused; and only on the optimizers whose fused step
+    /// can read and write a bf16 first moment.
+    #[test]
+    fn first_moment_dtype_is_resolved_and_refused_where_unsupported() {
+        let resolve_one = |opt: &str, value: Option<ExprKind>| {
+            let mut interner = nsl_lexer::Interner::new();
+            let mut kwargs = vec![mk_kwarg(&mut interner, "lr", mk_expr(ExprKind::FloatLiteral(0.001)))];
+            if let Some(v) = value {
+                kwargs.push(mk_kwarg(&mut interner, "first_moment_dtype", mk_expr(v)));
+            }
+            let call = mk_call(&mut interner, opt, kwargs);
+            resolve(&interner, &[TrainSection::Optimizer(call)])
+        };
+        let s = |v: &str| Some(ExprKind::StringLiteral(v.to_string()));
+        for opt in ["AdamW", "Adam"] {
+            let dt = |v| resolve_one(opt, v).expect("resolves").optimizer.first_moment_dtype;
+            assert_eq!(dt(None), MomentDtype::F32, "{opt}: the default is f32");
+            assert_eq!(dt(s("f32")), MomentDtype::F32);
+            assert_eq!(dt(s("bf16")), MomentDtype::Bf16);
+            for bad in [s("f16"), s("BF16"), Some(ExprKind::FloatLiteral(16.0))] {
+                assert!(resolve_one(opt, bad.clone()).is_err(), "{opt}: {bad:?} was accepted");
+            }
+        }
+        for opt in ["SGD", "Lion", "Muon", "SOAP"] {
+            let err = resolve_one(opt, s("bf16")).expect_err("must refuse");
+            let msgs: Vec<String> = err.into_iter().map(|d| d.message).collect();
+            assert!(
+                msgs.iter().any(|m| m.contains("does not accept 'first_moment_dtype'")),
+                "{opt}: {msgs:?}"
+            );
         }
     }
 

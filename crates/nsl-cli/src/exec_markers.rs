@@ -583,6 +583,15 @@ pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
         ],
     },
     NegativeNeedle {
+        test: "crates/nsl-cli/tests/first_moment_bf16_gate.rs",
+        asserts: "a resume across a first_moment_dtype change (bf16 <-> f32) is \
+                  refused and never reports a completed resume",
+        parts: &[
+            // nsl_log!(INFO, "checkpoint", "[checkpoint] resumed: {path} ...")
+            ("[checkpoint] resumed:", "crates/nsl-runtime/src/checkpoint.rs"),
+        ],
+    },
+    NegativeNeedle {
         test: "crates/nsl-cli/tests/train_checkpoint_gate.rs",
         asserts: "a resume refused because the model's parameters were reordered \
                   never reports a completed resume",

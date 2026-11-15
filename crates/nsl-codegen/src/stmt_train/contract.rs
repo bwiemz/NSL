@@ -51,6 +51,63 @@ pub(crate) struct TrainContract<'ast> {
     pub(crate) callbacks: Vec<&'ast nsl_ast::block::CallbackDef>,
     pub(crate) fase_plan: crate::fase::FasePlan,
     pub(crate) fase_deferred: bool,
+    /// `first_moment_dtype="bf16"`: Adam/AdamW keep `m` in bf16.
+    pub(crate) first_moment_bf16: bool,
+}
+
+/// Whether any train or distill block in `stmts` — at any depth: top level,
+/// decorated, inside a function body or a loop — asks its optimizer for
+/// `first_moment_dtype="bf16"`. `main` reads this to record `m1=bf16` in the
+/// execution fingerprint before any block compiles; the train-block lowering
+/// refuses a block that asks for it when this scan did not see it. A
+/// syntactic scan: the resolver validates the value when the block compiles.
+pub(crate) fn program_requests_bf16_first_moment(
+    stmts: &[nsl_ast::stmt::Stmt],
+    resolve_sym: &dyn Fn(nsl_ast::Symbol) -> String,
+) -> bool {
+    use nsl_ast::expr::ExprKind;
+    use nsl_ast::stmt::{Stmt, StmtKind};
+    use nsl_ast::visitor::{walk_stmt, Visitor};
+
+    struct Scan<'a> {
+        resolve_sym: &'a dyn Fn(nsl_ast::Symbol) -> String,
+        found: bool,
+    }
+    impl Scan<'_> {
+        fn asks(&self, sections: &[TrainSection]) -> bool {
+            sections.iter().any(|section| {
+                let TrainSection::Optimizer(expr) = section else {
+                    return false;
+                };
+                let ExprKind::Call { args, .. } = &expr.kind else {
+                    return false;
+                };
+                args.iter().any(|a| {
+                    a.name.is_some_and(|n| (self.resolve_sym)(n) == "first_moment_dtype")
+                        && matches!(&a.value.kind, ExprKind::StringLiteral(v) if v == "bf16")
+                })
+            })
+        }
+    }
+    impl Visitor for Scan<'_> {
+        fn visit_stmt(&mut self, stmt: &Stmt) {
+            if self.found {
+                return;
+            }
+            self.found = match &stmt.kind {
+                StmtKind::TrainBlock(train) => self.asks(&train.sections),
+                StmtKind::DistillBlock(distill) => self.asks(&distill.sections),
+                _ => false,
+            };
+            walk_stmt(self, stmt);
+        }
+    }
+
+    let mut scan = Scan { resolve_sym, found: false };
+    for stmt in stmts {
+        scan.visit_stmt(stmt);
+    }
+    scan.found
 }
 
 impl Compiler<'_> {
@@ -530,6 +587,71 @@ impl Compiler<'_> {
         .map_err(CodegenError::new)??;
         let fase_deferred = fase_plan.mode == crate::fase::FaseMode::Deferred;
 
+        // `first_moment_dtype="bf16"` lives in the fused AdamW kernels (the
+        // multi-tensor step and its per-parameter twin read and write a bf16
+        // `m`) and in the state allocation. Every path that would hand the
+        // bf16 buffer to arithmetic written for f32 refuses here.
+        let first_moment_bf16 = optim_cfg.optimizer.first_moment_dtype
+            == nsl_semantic::optim_config::MomentDtype::Bf16;
+        if first_moment_bf16 {
+            let refuse = |why: &str| {
+                Err(CodegenError::new(format!(
+                    "first_moment_dtype=\"bf16\" {why}. Drop the argument (or the \
+                     conflicting setting)"
+                )))
+            };
+            if !fase_deferred {
+                return refuse(&format!(
+                    "needs the FASE-Deferred plan, where the fused AdamW step owns the \
+                     update (grad_accumulation >= 2 with Adam/AdamW); this block's plan is \
+                     {:?} — {}",
+                    fase_plan.mode, fase_plan.rationale
+                ));
+            }
+            if self.compile_options.diagnostics.training_reference {
+                return refuse("needs the fused AdamW step, which --training-reference disables");
+            }
+            if std::env::var("NSL_FASE_FUSED_STEP").ok().as_deref() == Some("0") {
+                return refuse("needs the fused AdamW step, which NSL_FASE_FUSED_STEP=0 disables");
+            }
+            if self.compile_options.train.optim_state_offload {
+                return refuse("does not compose with --optim-state-offload yet (the offload staging is f32)");
+            }
+            if self.compile_options.train.layerwise_accum {
+                return refuse("does not compose with --layerwise-accum yet");
+            }
+            if self.features.zero_stage.is_some() {
+                return refuse("does not compose with --zero-stage yet (sharded moments are f32)");
+            }
+            if self.features.param_dtype_bf16sr {
+                return refuse("does not compose with --param-dtype bf16-sr yet");
+            }
+            if self.compile_options.wggo.moment_precision
+                || self.compile_options.wggo.memory_budget_bytes.is_some()
+            {
+                return refuse(
+                    "does not compose with --wggo-moment-precision / --wggo-memory-budget \
+                     (two owners for the first moment's dtype)",
+                );
+            }
+            if self.bus.has_wggo_overrides() {
+                return refuse(
+                    "does not compose with a WGGO plan's per-layer optimizer modes (a \
+                     FullBuffer-routed parameter would take the f32 stdlib step); drop --wggo",
+                );
+            }
+            if !self.features.program_first_moment_bf16 {
+                // A checkpoint must say which m it holds: without the
+                // fingerprint key a resume could not refuse the other dtype.
+                return Err(CodegenError::new(
+                    "first_moment_dtype=\"bf16\" is supported only in train blocks of the \
+                     program being built, where the execution fingerprint records it; this \
+                     block was not seen by that scan (a train block in an imported module, \
+                     or compiled without the program's main, e.g. under `nsl test`)",
+                ));
+            }
+        }
+
         Ok(TrainContract {
             optimizer_name,
             lr_value,
@@ -549,6 +671,7 @@ impl Compiler<'_> {
             callbacks,
             fase_plan,
             fase_deferred,
+            first_moment_bf16,
         })
     }
 }

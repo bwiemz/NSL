@@ -29,6 +29,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::tensor::NslTensor;
 
+/// Tensor dtype tag of a bf16 first moment (`first_moment_dtype="bf16"`).
+const BF16: u16 = crate::tensor_parallel::collective::DTYPE_BF16;
+
 /// Count of fused optimizer-step launches — always live (cheap atomic), used
 /// by the differential gate's anti-vacuity check via the
 /// `NSL_FASE_FUSED_COUNTER=1` atexit report (see `args.rs`) and the
@@ -171,12 +174,17 @@ pub extern "C" fn nsl_fase_fused_adamw_step(
     );
     let has_wd = wd != 0.0;
 
+    // `first_moment_dtype="bf16"` stores m as bf16 (dtype 3) next to f32
+    // theta/v/mp; the kernels and the CPU loop below read it widened and store
+    // it rounded to nearest even.
+    let m_bf16 = m.dtype == BF16;
     if th.device > 0 {
         #[cfg(feature = "cuda")]
         {
             assert!(
-                th.dtype == 1 && m.dtype == 1 && v.dtype == 1 && mp.dtype == 1,
-                "fase_fused_step: GPU path requires f32 tensors (theta={}, m={}, v={}, mp={})",
+                th.dtype == 1 && (m.dtype == 1 || m_bf16) && v.dtype == 1 && mp.dtype == 1,
+                "fase_fused_step: GPU path requires f32 tensors (an m may be bf16) \
+                 (theta={}, m={}, v={}, mp={})",
                 th.dtype, m.dtype, v.dtype, mp.dtype
             );
             // BF16 matmul cast cache: this call is what makes theta a
@@ -267,6 +275,50 @@ pub extern "C" fn nsl_fase_fused_adamw_step(
                 *td.add(i) += adj;
             }
         }
+    } else if th.dtype == 1 && m_bf16 && v.dtype == 1 && mp.dtype == 1 {
+        // `first_moment_dtype="bf16"` on CPU: the f32 loop below with m read
+        // as its exact f32 widening and m' stored rounded to nearest even —
+        // the GPU kernel's `cvt.f32.bf16` / `cvt.rn.bf16.f32`. The update reads
+        // the f32 m', not the rounded one.
+        let b1 = beta1 as f32;
+        let omb1 = one_minus_beta1 as f32;
+        let b2 = beta2 as f32;
+        let omb2 = one_minus_beta2 as f32;
+        let epsf = eps as f32;
+        let bc1 = bc1_inv as f32;
+        let bc2 = bc2_inv as f32;
+        let neg_lr = (-lr) as f32;
+        let neg_lr_wd = ((-lr) * wd) as f32;
+        let (td, md, vd, mpd) = (
+            th.data as *mut f32,
+            m.data as *mut u16,
+            v.data as *mut f32,
+            mp.data as *const f32,
+        );
+        for i in 0..n as usize {
+            unsafe {
+                let mp_i = *mpd.add(i);
+                let t1 = half::bf16::from_bits(*md.add(i)).to_f32() * b1;
+                let t2 = mp_i * omb1;
+                let m_new = t1 + t2;
+                *md.add(i) = half::bf16::from_f32(m_new).to_bits();
+                let sq = mp_i * mp_i;
+                let ssq = sq * omb2;
+                let vdec = *vd.add(i) * b2;
+                let v_new = vdec + ssq;
+                *vd.add(i) = v_new;
+                let mh = m_new * bc1;
+                let vh = v_new * bc2;
+                let t = vh.sqrt() + epsf;
+                let u = mh / t;
+                let mut adj = u * neg_lr;
+                if has_wd {
+                    let wdt = *td.add(i) * neg_lr_wd;
+                    adj += wdt;
+                }
+                *td.add(i) += adj;
+            }
+        }
     } else if th.dtype == 1 && m.dtype == 1 && v.dtype == 1 && mp.dtype == 1 {
         // Uniform CPU f32 (e.g. an f32 model trained on CPU): the decomposed
         // CPU ops run f32-native loops, so mirror them in f32 with the same
@@ -314,8 +366,8 @@ pub extern "C" fn nsl_fase_fused_adamw_step(
         crate::fatal::die(
             crate::fatal::Fatal::ShapeMismatch,
             &format!(
-                "fase_fused_step: CPU path requires uniform f64 or f32 tensors \
-                 (theta={}, m={}, v={}, mp={})",
+                "fase_fused_step: CPU path requires uniform f64 or f32 tensors, \
+                 or f32 with a bf16 m (theta={}, m={}, v={}, mp={})",
                 th.dtype, m.dtype, v.dtype, mp.dtype
             ),
         );
@@ -545,10 +597,14 @@ fn fase_multi_impl(
                     th.len as usize,
                 );
             }
+            // theta, v and mp f32; m f32 or (first_moment_dtype="bf16") bf16.
+            // m's dtype is part of the bucket key, so a launch never mixes.
             let uniform_gpu_f32 = th.device > 0
                 && [th, m, v, a].iter().all(|t| {
-                    t.device == th.device && t.dtype == 1 && t.is_contiguous() && t.len == th.len
+                    t.device == th.device && t.is_contiguous() && t.len == th.len
                 })
+                && [th, v, a].iter().all(|t| t.dtype == 1)
+                && (m.dtype == 1 || m.dtype == BF16)
                 && th.len <= u32::MAX as i64;
             // Review A1: two param entries can alias ONE theta storage
             // (tied weights). The legacy loop updated them sequentially;
@@ -572,6 +628,7 @@ fn fase_multi_impl(
                     key: UpdateKey {
                         device: th.device,
                         dtype: th.dtype,
+                        m_dtype: m.dtype,
                         wd_bits: param_wd(i, tp).to_bits(),
                     },
                 });
@@ -635,6 +692,7 @@ fn fase_multi_impl(
                 // decay-exempt bucket it still has weight decay.
                 bucket_wd != 0.0,
                 mp_scale as f32,
+                key.m_dtype == BF16,
             );
             // Keep the fused-step counter's per-param semantics (gates read it).
             FASE_FUSED_STEP_COUNT.fetch_add(k as u64, Ordering::Relaxed);
@@ -1016,6 +1074,10 @@ pub(crate) struct UpdateKey {
     /// reach a bucket today, but the key carries the field so that adding a
     /// bf16 kernel is a new bucket rather than a new eligibility branch.
     pub dtype: u16,
+    /// The first moment's dtype: f32, or bf16 under
+    /// `first_moment_dtype="bf16"`, which launches the bf16-`m` kernel. A
+    /// launch reads every member's `m` the same way, so it partitions too.
+    pub m_dtype: u16,
     /// Weight decay, as raw f64 bits so the key stays `Eq`/`Ord`.
     ///
     /// AdamW parameter groups (`no_decay=[...]`) give exempt parameters
@@ -1127,6 +1189,7 @@ mod item8_tests {
             key: UpdateKey {
                 device,
                 dtype,
+                m_dtype: dtype,
                 wd_bits: wd.to_bits(),
             },
         }
@@ -1508,7 +1571,7 @@ mod item8_gpu_bench {
             (1e-8f32, -1e-3f32, -1e-5f32, 1.0f32, 1.0f32);
         gpu_fase_fused_adamw_step_multi(
             &thetas, &ms, &vs, &mps, &lens, b1, omb1, b2, omb2, eps, neg_lr,
-            neg_lr_wd, bc1, bc2, true, 1.0,
+            neg_lr_wd, bc1, bc2, true, 1.0, false,
         );
 
         // Same arithmetic as the kernel, in f32, on the host.
@@ -1583,7 +1646,7 @@ mod item8_gpu_bench {
         let step = || {
             gpu_fase_fused_adamw_step_multi(
                 &thetas, &ms, &vs, &mps, &lens, 0.9, 0.1, 0.95, 0.05, 1e-8, -1e-3, -1e-5,
-                1.0, 1.0, true, 1.0,
+                1.0, 1.0, true, 1.0, false,
             );
         };
 
@@ -1627,6 +1690,357 @@ mod item8_gpu_bench {
         for q in bufs {
             for d in q {
                 unsafe { nsl_test_cuda_free(d) };
+            }
+        }
+    }
+}
+
+/// `first_moment_dtype="bf16"` in the runtime: the CPU twin of the bf16-`m`
+/// kernels against an f64 reference of one AdamW step, and (GPU) the real
+/// launches against the CPU twin — the per-parameter step, and a multi-tensor
+/// step whose list mixes f32 and bf16 first moments, so the dtype test that
+/// picks the kernel and the bucket key that keeps the two kernels' members
+/// apart are both on the path. The kernels' own f64 gate is
+/// `crates/nsl-codegen/tests/fase_adamw_mbf16_reference.rs`.
+#[cfg(test)]
+mod mbf16_tests {
+    use super::*;
+    use crate::tensor::nsl_tensor_free;
+    use half::bf16;
+
+    /// f32 unit roundoff: a correctly rounded op is within `U·|x|`.
+    const U: f64 = 1.0 / (1u64 << 24) as f64;
+    /// bf16 unit roundoff (8 significant bits).
+    const UB: f64 = 1.0 / 256.0;
+
+    fn lcg(s: &mut u64) -> u64 {
+        *s = s
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *s
+    }
+
+    /// Uniform in (-1, 1).
+    fn unit(s: &mut u64) -> f32 {
+        ((lcg(s) >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+    }
+
+    /// A gradient-sized number: 1e-3 down to 1e-6, either sign.
+    fn grad_sized(s: &mut u64) -> f32 {
+        let scale = [1e-3f32, 1e-4, 1e-5, 1e-6][(lcg(s) >> 33) as usize % 4];
+        scale * unit(s)
+    }
+
+    /// One parameter's state before a step, at realistic magnitudes: θ ~ 0.05,
+    /// `m` a past gradient average (bf16 bits), `v` a squared one, `g` the
+    /// accumulated gradient (`m_partial`).
+    struct State {
+        theta: Vec<f32>,
+        m: Vec<u16>,
+        v: Vec<f32>,
+        g: Vec<f32>,
+    }
+
+    fn state(n: usize, seed: u64) -> State {
+        let mut s = seed;
+        let theta = (0..n).map(|_| 0.05 * unit(&mut s)).collect();
+        let m = (0..n).map(|_| bf16::from_f32(grad_sized(&mut s)).to_bits()).collect();
+        let v = (0..n)
+            .map(|_| {
+                let x = grad_sized(&mut s);
+                x * x
+            })
+            .collect();
+        let g = (0..n).map(|_| grad_sized(&mut s)).collect();
+        State { theta, m, v, g }
+    }
+
+    /// The FFI's f64 scalars: the recipes' AdamW (lr 3e-4, β 0.9 / 0.95,
+    /// decay `wd`) at step `t`.
+    #[derive(Clone, Copy)]
+    struct Scalars {
+        lr: f64,
+        b1: f64,
+        omb1: f64,
+        b2: f64,
+        omb2: f64,
+        eps: f64,
+        wd: f64,
+        bc1: f64,
+        bc2: f64,
+    }
+
+    fn scalars(t: i32, wd: f64) -> Scalars {
+        let (b1, b2) = (0.9f64, 0.95f64);
+        Scalars {
+            lr: 3e-4,
+            b1,
+            omb1: 1.0 - b1,
+            b2,
+            omb2: 1.0 - b2,
+            eps: 1e-8,
+            wd,
+            bc1: 1.0 / (1.0 - b1.powi(t)),
+            bc2: 1.0 / (1.0 - b2.powi(t)),
+        }
+    }
+
+    /// One AdamW step in f64 from the same inputs, with the scalars as the
+    /// step uses them (each narrowed to f32 at the FFI boundary, `-lr·wd`
+    /// formed in f64 first), and how far an implementation that stores `m`
+    /// rounded once to bf16 and does the rest in correctly rounded f32 may be
+    /// from it:
+    ///
+    /// * `m'`: two products and a sum (at most (2U + U²) ≤ 3U of the terms,
+    ///   exactly), then one round to nearest even into 8 significant bits
+    ///   (UB of the value), plus half the bf16 subnormal spacing. Not
+    ///   doubled: this is a complete bound, and twice it (2^-7, one bf16 ulp)
+    ///   would admit a truncating store;
+    /// * `v'`: the square, two products and a sum (4U of the terms), doubled;
+    /// * `θ'` from the f32 `m'` — NOT the rounded one — through `·bc`, `√`,
+    ///   `+ε`, `/`, `·(-lr)`, `+ decay`, `+θ`: first-order propagation of each
+    ///   rounding, doubled for the second-order terms.
+    struct Expect {
+        m: f64,
+        m_bound: f64,
+        v: f64,
+        v_bound: f64,
+        /// `-lr·q`, the Adam term, and the whole increment: the GPU-vs-CPU
+        /// bound's inputs (read only by the CUDA test, hence the allow).
+        #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+        a: f64,
+        #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+        adj: f64,
+        theta: f64,
+        theta_bound: f64,
+    }
+
+    fn expect(theta0: f32, m0: u16, v0: f32, g: f32, s: Scalars) -> Expect {
+        let n = |x: f64| x as f32 as f64;
+        let (b1, omb1, b2, omb2, eps) = (n(s.b1), n(s.omb1), n(s.b2), n(s.omb2), n(s.eps));
+        let (bc1, bc2, neg_lr, neg_lr_wd) = (n(s.bc1), n(s.bc2), n(-s.lr), n(-s.lr * s.wd));
+        let (th0, m0, v0, g) = (theta0 as f64, bf16::from_bits(m0).to_f64(), v0 as f64, g as f64);
+
+        let m = b1 * m0 + omb1 * g;
+        let e_m = 3.0 * U * (b1 * m0.abs() + omb1 * g.abs());
+        let m_bound = UB * (m.abs() + e_m) + e_m + 2f64.powi(-134);
+
+        let v = b2 * v0 + omb2 * g * g;
+        let e_v = 4.0 * U * (b2 * v0 + omb2 * g * g);
+
+        let mh = m * bc1;
+        let e_mh = e_m * bc1 + U * mh.abs();
+        let vh = v * bc2;
+        let e_vh = e_v * bc2 + U * vh;
+        let sq = vh.sqrt();
+        let e_sq = if vh > 0.0 { e_vh / (2.0 * sq) } else { e_vh.sqrt() } + U * sq;
+        let den = sq + eps;
+        let e_den = e_sq + U * den;
+        let q = mh / den;
+        let e_q = (e_mh + q.abs() * e_den) / den + U * q.abs();
+        let a = neg_lr * q;
+        let mut e_adj = neg_lr.abs() * e_q + U * a.abs();
+        let mut adj = a;
+        if s.wd != 0.0 {
+            let d = neg_lr_wd * th0;
+            adj = a + d;
+            e_adj += U * d.abs() + U * adj.abs();
+        }
+        let theta = th0 + adj;
+        let theta_bound = 2.0 * (e_adj + U * theta.abs());
+        Expect { m, m_bound, v, v_bound: 2.0 * e_v, a, adj, theta, theta_bound }
+    }
+
+    fn cpu_tensor<T: Copy>(data: &[T], dtype: u16) -> i64 {
+        let ptr = crate::cpu::create_tensor_with_shape_rs_dtype(&[data.len() as i64], dtype);
+        let t = NslTensor::from_ptr(ptr);
+        assert_eq!(t.element_size(), std::mem::size_of::<T>());
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), t.data as *mut T, data.len()) };
+        ptr
+    }
+
+    /// θ, m, v, g as CPU tensors: f32, bf16, f32, f32.
+    fn cpu_quad(st: &State) -> [i64; 4] {
+        [
+            cpu_tensor(&st.theta, 1),
+            cpu_tensor(&st.m, BF16),
+            cpu_tensor(&st.v, 1),
+            cpu_tensor(&st.g, 1),
+        ]
+    }
+
+    /// A CPU tensor's elements (downloaded first if it lives on a device).
+    fn read<T: Copy>(ptr: i64) -> Vec<T> {
+        let on_device = NslTensor::from_ptr(ptr).device > 0;
+        #[cfg(feature = "cuda")]
+        let host = if on_device { crate::tensor::nsl_tensor_to_device(ptr, 0) } else { ptr };
+        #[cfg(not(feature = "cuda"))]
+        let host = {
+            assert!(!on_device);
+            ptr
+        };
+        let t = NslTensor::from_ptr(host);
+        assert_eq!(t.element_size(), std::mem::size_of::<T>());
+        let out = unsafe { std::slice::from_raw_parts(t.data as *const T, t.len as usize) }.to_vec();
+        if host != ptr {
+            nsl_tensor_free(host);
+        }
+        out
+    }
+
+    fn step(q: [i64; 4], s: Scalars) {
+        nsl_fase_fused_adamw_step(
+            q[0], q[1], q[2], q[3], s.lr, s.b1, s.omb1, s.b2, s.omb2, s.eps, s.wd, s.bc1, s.bc2,
+        );
+    }
+
+    /// The CPU arm (f32 θ/v/g, bf16 m) against the f64 reference: m within
+    /// one bf16 rounding, v and θ within f32 arithmetic. A truncating store of
+    /// m fails the m bound; an update that reads the rounded m (rather than
+    /// the f32 m') fails the θ bound.
+    #[test]
+    fn the_cpu_step_with_a_bf16_first_moment_matches_the_f64_reference() {
+        let n = 4099;
+        let st = state(n, 0x5eed);
+        for s in [scalars(10, 0.1), scalars(2000, 0.1), scalars(1, 0.0)] {
+            let q = cpu_quad(&st);
+            step(q, s);
+            let (theta, m, v) = (read::<f32>(q[0]), read::<u16>(q[1]), read::<f32>(q[2]));
+            let mut worst = [0f64; 3];
+            for i in 0..n {
+                let e = expect(st.theta[i], st.m[i], st.v[i], st.g[i], s);
+                let got_m = bf16::from_bits(m[i]).to_f64();
+                for (k, (name, got, want, bound)) in [
+                    ("m", got_m, e.m, e.m_bound),
+                    ("v", v[i] as f64, e.v, e.v_bound),
+                    ("theta", theta[i] as f64, e.theta, e.theta_bound),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let err = (got - want).abs();
+                    assert!(
+                        err <= bound,
+                        "{name}[{i}] (t-scalars bc1={}, wd={}): got {got:e}, f64 {want:e}, \
+                         |err| {err:e} > bound {bound:e}",
+                        s.bc1, s.wd
+                    );
+                    worst[k] = worst[k].max(err / bound);
+                }
+            }
+            // Anti-vacuity: m really was rounded (it used a visible part of
+            // its bound), so the bound is the thing being tested.
+            assert!(worst[0] > 0.5, "m never left f32 precision: {worst:?}");
+            for p in q {
+                nsl_tensor_free(p);
+            }
+        }
+    }
+
+    /// The real launches against the CPU twin. m' and v' are the same IEEE
+    /// f32 operations in the same order on both sides (`mul.rn`/`add.rn`, no
+    /// contraction; RNE into bf16 both ways), so m and v must agree bit for
+    /// bit. θ differs only through the kernel's `div.approx` (2 ulp) against
+    /// the CPU's correctly rounded division: |Δq| ≤ 2.5 ulp ≤ 5U|q|, then
+    /// each of `·(-lr)`, `+ decay`, `+θ` may round the two sides apart by
+    /// 2U of its result; doubled. Feeding the update the rounded m moves θ
+    /// by up to 2^-8 of the Adam term, far outside this.
+    ///
+    /// The multi-tensor list holds an f32-`m` member between two bf16-`m`
+    /// ones: if the bucket key did not carry m's dtype, one kernel would read
+    /// the other's m and every check below would fail by orders of magnitude.
+    #[test]
+    #[cfg(feature = "cuda")]
+    #[ignore = "requires CUDA GPU"]
+    fn the_gpu_launches_with_a_bf16_first_moment_match_the_cpu_twin() {
+        use crate::list::{nsl_list_new, nsl_list_push};
+        use crate::tensor::nsl_tensor_to_device;
+        if crate::cuda::nsl_cuda_init() != 0 {
+            crate::nsl_log!(WARN, "fase-step", "skipping: no CUDA device");
+            return;
+        }
+        let to_gpu = |q: [i64; 4]| -> [i64; 4] {
+            let d = q.map(|p| nsl_tensor_to_device(p, 1));
+            for p in q {
+                nsl_tensor_free(p);
+            }
+            d
+        };
+        let check = |name: &str, st: &State, gpu: [i64; 4], cpu: [i64; 4], s: Scalars| {
+            let (gt, gm, gv) = (read::<f32>(gpu[0]), read::<u16>(gpu[1]), read::<f32>(gpu[2]));
+            let (ct, cm, cv) = (read::<f32>(cpu[0]), read::<u16>(cpu[1]), read::<f32>(cpu[2]));
+            for i in 0..st.theta.len() {
+                assert_eq!(gm[i], cm[i], "{name}: m[{i}] bits differ from the CPU twin");
+                assert_eq!(gv[i].to_bits(), cv[i].to_bits(), "{name}: v[{i}] bits differ");
+                let e = expect(st.theta[i], st.m[i], st.v[i], st.g[i], s);
+                let bound =
+                    2.0 * (5.0 * U * e.a.abs() + 2.0 * U * (e.a.abs() + e.adj.abs() + e.theta.abs()));
+                let err = (gt[i] as f64 - ct[i] as f64).abs();
+                assert!(
+                    err <= bound,
+                    "{name}: theta[{i}] gpu {} cpu {} |diff| {err:e} > {bound:e}",
+                    gt[i], ct[i]
+                );
+            }
+        };
+
+        for s in [scalars(10, 0.1), scalars(1, 0.0)] {
+            // The per-parameter step: 1021 elements, a ragged last block.
+            let st = state(1021, 0xa11);
+            let cpu = cpu_quad(&st);
+            step(cpu, s);
+            let gpu = to_gpu(cpu_quad(&st));
+            assert_eq!(NslTensor::from_ptr(gpu[1]).dtype, BF16);
+            step(gpu, s);
+            check("single", &st, gpu, cpu, s);
+            for p in cpu.into_iter().chain(gpu) {
+                nsl_tensor_free(p);
+            }
+
+            // The multi-tensor step over [bf16 m, f32 m, bf16 m].
+            let states = [state(257, 1), state(300, 2), state(1, 3)];
+            let f32_m = |st: &State| -> [i64; 4] {
+                let m: Vec<f32> = st.m.iter().map(|&b| bf16::from_bits(b).to_f32()).collect();
+                [
+                    cpu_tensor(&st.theta, 1),
+                    cpu_tensor(&m, 1),
+                    cpu_tensor(&st.v, 1),
+                    cpu_tensor(&st.g, 1),
+                ]
+            };
+            let members: Vec<[i64; 4]> = vec![
+                to_gpu(cpu_quad(&states[0])),
+                to_gpu(f32_m(&states[1])),
+                to_gpu(cpu_quad(&states[2])),
+            ];
+            let lists = [nsl_list_new(), nsl_list_new(), nsl_list_new(), nsl_list_new()];
+            for q in &members {
+                for (l, p) in lists.iter().zip(q) {
+                    nsl_list_push(*l, *p);
+                }
+            }
+            nsl_fase_fused_adamw_step_multi(
+                lists[0], lists[1], lists[2], lists[3], s.lr, s.b1, s.omb1, s.b2, s.omb2,
+                s.eps, s.wd, s.bc1, s.bc2, 0, 0, 1.0,
+            );
+            for j in [0, 2] {
+                let cpu = cpu_quad(&states[j]);
+                step(cpu, s);
+                check(&format!("multi member {j}"), &states[j], members[j], cpu, s);
+                for p in cpu {
+                    nsl_tensor_free(p);
+                }
+            }
+            // The f32-m member took the f32 kernel: bit for bit the
+            // per-parameter f32 launch.
+            let reference = to_gpu(f32_m(&states[1]));
+            step(reference, s);
+            for k in 0..3 {
+                let (a, b) = (read::<u32>(members[1][k]), read::<u32>(reference[k]));
+                assert_eq!(a, b, "the f32-m member's tensor {k} left the f32 kernel's result");
+            }
+            for p in members.into_iter().flatten().chain(reference) {
+                nsl_tensor_free(p);
             }
         }
     }

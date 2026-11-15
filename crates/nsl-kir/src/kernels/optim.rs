@@ -55,6 +55,16 @@ fn add_adamw_scalars(b: &mut KirBuilder) -> AdamwScalars {
     AdamwScalars { b1, omb1, b2, omb2, eps, neg_lr, neg_lr_wd, bc1, bc2, has_wd }
 }
 
+/// How a kernel stores the first moment `m`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirstMoment {
+    /// f32, as the update computes it.
+    F32,
+    /// bf16, `m'` rounded to nearest even on store (`cvt.rn.bf16.f32`). The
+    /// update itself reads the f32 `m'`: only the stored copy is rounded.
+    Bf16,
+}
+
 /// The per-element AdamW update every kernel here shares, in the hand
 /// kernels' order: `m'` and `v'` computed and stored at `m[i]` / `v[i]`,
 /// then the step, then the decay branch. Returns `θ' = rn(θ + adj)`, with
@@ -67,12 +77,16 @@ fn adamw_update(
     m: VarId,
     v: VarId,
     i: VarId,
+    first_moment: FirstMoment,
 ) -> VarId {
     // m' = rn(rn(m·β₁) + rn(mp·(1-β₁)))
     let m_decay = f32_op2(b, KirOp::MulRn, mi, s.b1);
     let m_new_part = f32_op2(b, KirOp::MulRn, g, s.omb1);
     let m_next = f32_op2(b, KirOp::AddRn, m_decay, m_new_part);
-    store_f32(b, m, i, m_next);
+    match first_moment {
+        FirstMoment::F32 => store_f32(b, m, i, m_next),
+        FirstMoment::Bf16 => store_bf16_rn(b, m, i, m_next),
+    }
 
     // v' = rn(rn(v·β₂) + rn(rn(mp·mp)·(1-β₂)))
     let g2 = f32_op2(b, KirOp::MulRn, g, g);
@@ -121,10 +135,27 @@ fn adamw_update(
 /// exit:   ret
 /// ```
 pub fn build_fase_adamw_step() -> KernelIR {
+    build_step(FASE_ADAMW_STEP_NAME, FirstMoment::F32)
+}
+
+/// The per-parameter step with a bf16 first moment.
+pub const FASE_ADAMW_STEP_MBF16_NAME: &str = "nsl_fase_fused_adamw_step_f32_mbf16";
+
+/// `nsl_fase_fused_adamw_step_f32_mbf16`: [`build_fase_adamw_step`] with the
+/// first moment `m` stored as bf16 (`first_moment_dtype="bf16"`). Same
+/// signature; `m` points at bf16. `m` is widened exactly on load
+/// (`cvt.f32.bf16`), the update is the f32 kernel's op for op, and only the
+/// stored `m'` is rounded, to nearest even (`cvt.rn.bf16.f32`): `θ'` is
+/// computed from the f32 `m'`.
+pub fn build_fase_adamw_step_mbf16() -> KernelIR {
+    build_step(FASE_ADAMW_STEP_MBF16_NAME, FirstMoment::Bf16)
+}
+
+fn build_step(name: &str, first_moment: FirstMoment) -> KernelIR {
     use AddressSpace::Global;
-    let mut b = KirBuilder::new(FASE_ADAMW_STEP_NAME);
+    let mut b = KirBuilder::new(name);
     let theta = b.add_param("theta", f32_ptr(), Global);
-    let m = b.add_param("m", f32_ptr(), Global);
+    let m = b.add_param("m", m_ptr(first_moment), Global);
     let v = b.add_param("v", f32_ptr(), Global);
     let mp = b.add_param("mp", f32_ptr(), Global);
     let n = b.add_param("n", KirType::U64, Global);
@@ -132,12 +163,50 @@ pub fn build_fase_adamw_step() -> KernelIR {
 
     let (i, _, exit) = index_and_bound(&mut b, n);
     let th = load_f32(&mut b, theta, i);
-    let mi = load_f32(&mut b, m, i);
+    let mi = load_m(&mut b, m, i, first_moment);
     let vi = load_f32(&mut b, v, i);
     let g = load_f32(&mut b, mp, i);
-    let th_next = adamw_update(&mut b, &s, (th, mi, vi, g), m, v, i);
+    let th_next = adamw_update(&mut b, &s, (th, mi, vi, g), m, v, i, first_moment);
     store_f32(&mut b, theta, i, th_next);
     finish(b, exit)
+}
+
+/// The pointer type of `m` for a storage mode.
+fn m_ptr(first_moment: FirstMoment) -> KirType {
+    match first_moment {
+        FirstMoment::F32 => f32_ptr(),
+        FirstMoment::Bf16 => bf16_ptr(),
+    }
+}
+
+fn bf16_ptr() -> KirType {
+    KirType::Ptr(Box::new(KirType::Bf16), AddressSpace::Global)
+}
+
+/// `m[i]` as f32: a plain load, or a bf16 load widened exactly (`cvt.f32.bf16`).
+fn load_m(b: &mut KirBuilder, m: VarId, i: VarId, first_moment: FirstMoment) -> VarId {
+    match first_moment {
+        FirstMoment::F32 => load_f32(b, m, i),
+        FirstMoment::Bf16 => {
+            let addr = b.new_typed_var(bf16_ptr());
+            b.emit(KirOp::PtrOffset(addr, m, i));
+            let h = b.new_typed_var(KirType::Bf16);
+            b.emit(KirOp::Load(h, addr, AddressSpace::Global));
+            let x = b.new_typed_var(KirType::F32);
+            b.emit(KirOp::Cast(x, h, KirType::F32));
+            x
+        }
+    }
+}
+
+/// `base[i] = bf16(x)`, rounded to nearest even (`cvt.rn.bf16.f32`; a NaN
+/// stays a NaN, a finite value past the bf16 range rounds to infinity).
+fn store_bf16_rn(b: &mut KirBuilder, base: VarId, i: VarId, x: VarId) {
+    let h = b.new_typed_var(KirType::Bf16);
+    b.emit(KirOp::Cast(h, x, KirType::Bf16));
+    let addr = b.new_typed_var(bf16_ptr());
+    b.emit(KirOp::PtrOffset(addr, base, i));
+    b.emit(KirOp::Store(addr, h, AddressSpace::Global));
 }
 
 /// [`build_fase_adamw_step`], lowered to a NUL-terminated PTX module.
@@ -230,12 +299,28 @@ pub const FASE_ADAMW_MULTI_NAME: &str = "nsl_fase_fused_adamw_multi_f32";
 /// join(g): the single-parameter body; wd branch; θ[e] stored; mp[e] = 0
 /// ```
 pub fn build_fase_adamw_multi() -> KernelIR {
+    build_multi(FASE_ADAMW_MULTI_NAME, FirstMoment::F32)
+}
+
+/// The multi-tensor step with a bf16 first moment.
+pub const FASE_ADAMW_MULTI_MBF16_NAME: &str = "nsl_fase_fused_adamw_multi_f32_mbf16";
+
+/// `nsl_fase_fused_adamw_multi_f32_mbf16`: [`build_fase_adamw_multi`] with
+/// every first moment stored as bf16 (`first_moment_dtype="bf16"`). Same
+/// signature; `mtab` holds bf16 pointers. Per element it is
+/// [`build_fase_adamw_step_mbf16`]'s body with the multi kernel's
+/// `mp_scale` fold and `mp` zeroing.
+pub fn build_fase_adamw_multi_mbf16() -> KernelIR {
+    build_multi(FASE_ADAMW_MULTI_MBF16_NAME, FirstMoment::Bf16)
+}
+
+fn build_multi(name: &str, first_moment: FirstMoment) -> KernelIR {
     use AddressSpace::Global;
-    let mut b = KirBuilder::new(FASE_ADAMW_MULTI_NAME);
+    let mut b = KirBuilder::new(name);
     let table = || KirType::Ptr(Box::new(f32_ptr()), Global);
     let u32_ptr = || KirType::Ptr(Box::new(KirType::U32), Global);
     let ttab = b.add_param("ttab", table(), Global);
-    let mtab = b.add_param("mtab", table(), Global);
+    let mtab = b.add_param("mtab", KirType::Ptr(Box::new(m_ptr(first_moment)), Global), Global);
     let vtab = b.add_param("vtab", table(), Global);
     let mptab = b.add_param("mptab", table(), Global);
     let ntab = b.add_param("ntab", u32_ptr(), Global);
@@ -248,12 +333,12 @@ pub fn build_fase_adamw_multi() -> KernelIR {
 
     b.set_block(body);
     let theta = table_load(&mut b, ttab, param, f32_ptr());
-    let m = table_load(&mut b, mtab, param, f32_ptr());
+    let m = table_load(&mut b, mtab, param, m_ptr(first_moment));
     let v = table_load(&mut b, vtab, param, f32_ptr());
     let mp = table_load(&mut b, mptab, param, f32_ptr());
     let i = widen_u64(&mut b, e32);
     let th = load_f32(&mut b, theta, i);
-    let mi = load_f32(&mut b, m, i);
+    let mi = load_m(&mut b, m, i, first_moment);
     let vi = load_f32(&mut b, v, i);
     let g_raw = load_f32(&mut b, mp, i);
 
@@ -271,7 +356,7 @@ pub fn build_fase_adamw_multi() -> KernelIR {
     b.terminate(KirTerminator::Branch(KirEdge::with(scaled, vec![g_scaled])));
 
     b.set_block(scaled);
-    let th_next = adamw_update(&mut b, &s, (th, mi, vi, g), m, v, i);
+    let th_next = adamw_update(&mut b, &s, (th, mi, vi, g), m, v, i, first_moment);
     store_f32(&mut b, theta, i, th_next);
     // The accumulated gradient is consumed: zero it (was a separate launch).
     let fzero = b.new_typed_var(KirType::F32);
@@ -287,6 +372,24 @@ pub fn build_fase_adamw_multi() -> KernelIR {
 /// If the built kernel fails verification: a bug in this module.
 pub fn fase_adamw_multi_ptx() -> Vec<u8> {
     verified_ptx(build_fase_adamw_multi())
+}
+
+/// [`build_fase_adamw_step_mbf16`], lowered to a NUL-terminated PTX module.
+///
+/// # Panics
+///
+/// If the built kernel fails verification: a bug in this module.
+pub fn fase_adamw_step_mbf16_ptx() -> Vec<u8> {
+    verified_ptx(build_fase_adamw_step_mbf16())
+}
+
+/// [`build_fase_adamw_multi_mbf16`], lowered to a NUL-terminated PTX module.
+///
+/// # Panics
+///
+/// If the built kernel fails verification: a bug in this module.
+pub fn fase_adamw_multi_mbf16_ptx() -> Vec<u8> {
+    verified_ptx(build_fase_adamw_multi_mbf16())
 }
 
 /// The single-parameter SR-BF16 step's entry name.
@@ -447,7 +550,7 @@ pub fn build_fase_adamw_step_bf16sr() -> KernelIR {
     let mi = load_f32(&mut b, m, i);
     let vi = load_f32(&mut b, v, i);
     let g = load_f32(&mut b, mp, i);
-    let th_next = adamw_update(&mut b, &s, (th, mi, vi, g), m, v, i);
+    let th_next = adamw_update(&mut b, &s, (th, mi, vi, g), m, v, i, FirstMoment::F32);
     store_bf16_sr(&mut b, theta, i, th_next, key, ctr_base);
     finish(b, exit)
 }
@@ -535,7 +638,7 @@ pub fn build_fase_adamw_multi_bf16sr() -> KernelIR {
     let mi = load_f32(&mut b, m, i);
     let vi = load_f32(&mut b, v, i);
     let g = load_f32(&mut b, mp, i);
-    let th_next = adamw_update(&mut b, &s, (th, mi, vi, g), m, v, i);
+    let th_next = adamw_update(&mut b, &s, (th, mi, vi, g), m, v, i, FirstMoment::F32);
     store_bf16_sr(&mut b, theta, i, th_next, key, ctr_base);
     finish(b, exit)
 }
@@ -626,6 +729,38 @@ mod tests {
         assert_eq!(ptx.matches("mul.rn.f32").count(), 9, "{ptx}");
         assert_eq!(ptx.matches("add.rn.f32").count(), 5, "{ptx}");
         assert!(!ptx.contains("fma") && !ptx.contains("div.rn"), "{ptx}");
+    }
+
+    /// The bf16-first-moment kernels are the f32 kernels with `m` loaded by
+    /// one exact widening and stored by one round-to-nearest-even narrowing,
+    /// and nothing else changed: the same arithmetic instruction counts.
+    #[test]
+    fn the_bf16_first_moment_kernels_round_m_once_and_change_nothing_else() {
+        for (ir, name) in [
+            (build_fase_adamw_step_mbf16(), FASE_ADAMW_STEP_MBF16_NAME),
+            (build_fase_adamw_multi_mbf16(), FASE_ADAMW_MULTI_MBF16_NAME),
+        ] {
+            crate::kir_verify::verify(&ir).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            assert_eq!(ir.name, name);
+        }
+        let pairs = [
+            (fase_adamw_step_ptx(), fase_adamw_step_mbf16_ptx(), 9),
+            (fase_adamw_multi_ptx(), fase_adamw_multi_mbf16_ptx(), 10),
+        ];
+        for (f32_ptx, bf16_ptx, muls) in pairs {
+            let (f, h) = (String::from_utf8(f32_ptx).unwrap(), String::from_utf8(bf16_ptx).unwrap());
+            assert_eq!(h.matches("cvt.rn.bf16.f32").count(), 1, "one rounding, on the m store: {h}");
+            assert_eq!(h.matches("cvt.f32.bf16").count(), 1, "one exact widening, on the m load: {h}");
+            assert!(!h.contains("cvt.rz") && !h.contains("cvt.rm"), "{h}");
+            for (op, n) in [("mul.rn.f32", muls), ("add.rn.f32", 5), ("div.approx.f32", 1), ("sqrt.rn.f32", 1)] {
+                assert_eq!(h.matches(op).count(), n, "{op}: {h}");
+                assert_eq!(f.matches(op).count(), n, "{op}: {f}");
+            }
+            // θ, v (and in the multi kernel the zeroed mp) stay f32 stores;
+            // the f32 kernel's m store is the one that moved to bf16.
+            assert_eq!(h.matches("st.global.f32 ").count() + 1, f.matches("st.global.f32 ").count());
+            assert!(!h.contains("fma") && !h.contains("div.rn"), "{h}");
+        }
     }
 
     #[test]

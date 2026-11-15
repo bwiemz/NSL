@@ -86,6 +86,11 @@ const ARITHMETIC_KEYS: &[&str] = &[
     // checkpoint, agree by both lacking it). A resume under a program
     // specialized on other values is a different computation.
     "wspec",
+    // `first_moment_dtype="bf16"`: the optimizer keeps its first moment in
+    // bf16, a different optimizer state than the f32 one. Emitted only when
+    // some train block asks for it (`m1=bf16`), so an f32 build and every
+    // checkpoint written before the switch agree by both lacking it.
+    "m1",
 ];
 
 /// Keys that move bytes without changing the value computed.
@@ -240,6 +245,22 @@ mod tests {
         for k in ["prune_layers", "prune_frac"] {
             assert!(!super::PLACEMENT_KEYS.contains(&k), "{k} must not merely warn");
         }
+    }
+
+    /// `first_moment_dtype="bf16"` is a different optimizer state: a resume
+    /// across the switch refuses in both directions, and two f32 builds (no
+    /// key on either side) agree.
+    #[test]
+    fn a_first_moment_dtype_change_refuses_a_resume() {
+        let f32_build = "ad=source,dtype=f32";
+        let bf16_build = "ad=source,dtype=f32,m1=bf16";
+        for (saved, live) in [(f32_build, bf16_build), (bf16_build, f32_build)] {
+            let d = super::arithmetic_diff(saved, live);
+            assert!(d.iter().any(|f| f.key == "m1"), "{saved} -> {live}: {d:?}");
+        }
+        assert!(super::arithmetic_diff(f32_build, f32_build).is_empty());
+        assert!(super::arithmetic_diff(bf16_build, bf16_build).is_empty());
+        assert!(!super::PLACEMENT_KEYS.contains(&"m1"), "m1 must not merely warn");
     }
 
     #[test]
