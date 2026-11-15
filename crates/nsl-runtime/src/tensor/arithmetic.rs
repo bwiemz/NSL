@@ -1286,7 +1286,10 @@ pub extern "C" fn nsl_tensor_wgrad_accum(m_ptr: i64, x_ptr: i64, g_ptr: i64, s: 
     // Preconditions for the single-GEMM form:
     //   x: [..., d]   g: [..., o]   m: [d, o]
     //   leading dims of x and g identical (they index the same tokens)
-    //   everything GPU-resident f32 and contiguous (the flatten must be a view)
+    //   everything GPU-resident and contiguous (the flatten must be a view);
+    //   m f32 (the gradient buffer); x and g f32 or, under bf16 activation
+    //   storage, bf16 (read by a bf16 GEMM that accumulates into m in f32)
+    let storage_dtype = |d: u16| d == crate::tensor::DTYPE_F32 || d == crate::tensor::DTYPE_BF16;
     let ok = ms.len() == 2
         && xs.len() >= 2
         && gs.len() >= 2
@@ -1298,8 +1301,8 @@ pub extern "C" fn nsl_tensor_wgrad_accum(m_ptr: i64, x_ptr: i64, g_ptr: i64, s: 
         && x.device == m.device
         && g.device == m.device
         && m.dtype == crate::tensor::DTYPE_F32
-        && x.dtype == crate::tensor::DTYPE_F32
-        && g.dtype == crate::tensor::DTYPE_F32
+        && storage_dtype(x.dtype)
+        && storage_dtype(g.dtype)
         && m.is_contiguous()
         && x.is_contiguous()
         && g.is_contiguous();
@@ -1311,9 +1314,15 @@ pub extern "C" fn nsl_tensor_wgrad_accum(m_ptr: i64, x_ptr: i64, g_ptr: i64, s: 
             let d_in = ms[0];
             let d_out = ms[1];
             if n_rows > 0 && d_in > 0 && d_out > 0 {
-                crate::cuda::gpu_wgrad_accum_f32(
-                    m_ptr, x_ptr, g_ptr, n_rows as u64, d_in as u64, d_out as u64, s as f32,
-                );
+                if x.dtype == crate::tensor::DTYPE_BF16 || g.dtype == crate::tensor::DTYPE_BF16 {
+                    crate::cuda::storage_gemm::wgrad_accum(
+                        m_ptr, x_ptr, g_ptr, n_rows as u64, d_in as u64, d_out as u64, s as f32,
+                    );
+                } else {
+                    crate::cuda::gpu_wgrad_accum_f32(
+                        m_ptr, x_ptr, g_ptr, n_rows as u64, d_in as u64, d_out as u64, s as f32,
+                    );
+                }
                 WGRAD_FUSED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
@@ -1339,8 +1348,19 @@ pub extern "C" fn nsl_tensor_wgrad_accum(m_ptr: i64, x_ptr: i64, g_ptr: i64, s: 
     // Fallback: the exact chain codegen would otherwise have emitted. Keeping
     // this here means a shape the compiler's static pre-pass misjudged
     // degrades to slow-but-correct instead of producing a wrong gradient.
-    let x_t = crate::tensor::nsl_tensor_transpose(x_ptr, -2, -1);
-    let raw = nsl_tensor_matmul(x_t, g_ptr, 0);
+    // A bf16 activation (bf16 activation storage) is widened first: the
+    // decomposed chain's matmul and reduce are f32 operations.
+    let widen = |p: i64| -> i64 {
+        if NslTensor::from_ptr_ref(p).dtype == crate::tensor::DTYPE_BF16 {
+            crate::tensor::precision_cast::convert_untaped(p, crate::tensor::DTYPE_F32)
+        } else {
+            NslTensor::from_ptr(p).refcount.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            p
+        }
+    };
+    let (x_w, g_w) = (widen(x_ptr), widen(g_ptr));
+    let x_t = crate::tensor::nsl_tensor_transpose(x_w, -2, -1);
+    let raw = nsl_tensor_matmul(x_t, g_w, 0);
     let dw = crate::tensor::nsl_tensor_reduce_to_shape(raw, m_ptr);
     // Migrate to the accumulator's (device, dtype) exactly as
     // `fase_emit_accumulate` does. This matters whenever the activations are
@@ -1355,6 +1375,8 @@ pub extern "C" fn nsl_tensor_wgrad_accum(m_ptr: i64, x_ptr: i64, g_ptr: i64, s: 
     nsl_tensor_free(dw);
     nsl_tensor_free(raw);
     nsl_tensor_free(x_t);
+    nsl_tensor_free(x_w);
+    nsl_tensor_free(g_w);
 }
 
 // === Matrix multiply ===

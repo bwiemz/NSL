@@ -579,6 +579,7 @@ macro_rules! for_each_runtime_fn {
             [abi_tensor] nsl_tensor_rotate_half_dt(i64, i64, i64) -> i64 = storage_dt::nsl_tensor_rotate_half_dt;
             [abi_tensor] nsl_storage_dt_fallback_count() -> i64 = storage_dt::nsl_storage_dt_fallback_count;
             [abi_tensor] nsl_tensor_rmsnorm_dt(i64, i64, f64, i64) -> i64 = storage_dt::nsl_tensor_rmsnorm_dt;
+            [abi_tensor] nsl_tensor_matmul_dt(i64, i64, i64) -> i64 = storage_dt::nsl_tensor_matmul_dt;
             // p4 slice 3: fused Sigmoid backward — grad * y*(1-y), y = σ output.
             [abi_tensor] nsl_tensor_sigmoid_backward(i64, i64) -> i64 = tensor::activation::nsl_tensor_sigmoid_backward;
             // p4 slice 3: fused Tanh backward — grad * (1 - y*y), y = tanh output.
@@ -1346,6 +1347,6 @@ mod tests {
     fn table_is_the_recorded_size() {
         // The count is pinned so a row dropped by a bad merge is noticed; move
         // it with a row that is deliberately added or removed.
-        assert_eq!(RUNTIME_ABI.len(), 658);
+        assert_eq!(RUNTIME_ABI.len(), 659);
     }
 }

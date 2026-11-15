@@ -273,6 +273,34 @@ pub extern "C" fn nsl_tensor_rmsnorm_dt(x: i64, gamma: i64, eps: f64, out_dtype:
     narrowed(r, tag)
 }
 
+/// `a @ b` with the result stored as `out_dtype`: bf16 operands (an f32
+/// operand is rounded to bf16 once: a parameter from the weight-cast cache),
+/// f32 accumulation, one rounding of the output when it is bf16.
+///
+/// Fast path: the shapes one 2-D GEMM expresses (`b` 2-D, contiguous or a
+/// transposed view; `a` contiguous with its leading dims collapsed into rows,
+/// or a 2-D transposed view), on one device. Anything else widens, runs the
+/// f32 `nsl_tensor_matmul` (under the BF16 math mode: bf16 operands, f32
+/// output) and narrows, counted.
+#[unsafe(no_mangle)]
+pub extern "C" fn nsl_tensor_matmul_dt(a: i64, b: i64, out_dtype: i64) -> i64 {
+    const NAME: &str = "nsl_tensor_matmul_dt";
+    refuse_tape(NAME);
+    let tag = out_tag(NAME, out_dtype);
+    check_operand(NAME, a);
+    check_operand(NAME, b);
+    #[cfg(feature = "cuda")]
+    if let Some(c) = crate::cuda::storage_gemm::matmul(a, b, tag) {
+        return c;
+    }
+    announce_fallback(NAME);
+    let (wa, wb) = (widened(a), widened(b));
+    let r = crate::tensor::arithmetic::nsl_tensor_matmul(wa, wb, 0);
+    crate::tensor::nsl_tensor_free(wa);
+    crate::tensor::nsl_tensor_free(wb);
+    narrowed(r, tag)
+}
+
 #[cfg(feature = "cuda")]
 fn storage(tag: u16) -> nsl_kir::kernels::storage::Storage {
     if tag == DTYPE_BF16 { nsl_kir::kernels::storage::Storage::Bf16 } else { nsl_kir::kernels::storage::Storage::F32 }

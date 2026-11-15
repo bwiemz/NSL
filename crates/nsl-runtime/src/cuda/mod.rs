@@ -41,6 +41,9 @@ pub(crate) mod lt_matmul;
 #[cfg(feature = "cuda")]
 pub(crate) mod storage_kernels;
 
+#[cfg(feature = "cuda")]
+pub(crate) mod storage_gemm;
+
 /// Test-only views of the bf16 cast cache (re-exported from lib.rs): the
 /// integration gate drives registration through the REAL fused-AdamW extern
 /// and needs only to observe (hits, recasts, evictions) and reset between
@@ -2822,7 +2825,13 @@ pub(crate) mod cublas_inner {
         let route = |dev: *const f32, elems: usize| -> (*mut std::ffi::c_void, bool, bool) {
             match super::bf16_cast_cache::acquire(dev as u64, elems) {
                 Some((buf, needs_cast)) => (buf as *mut std::ffi::c_void, false, needs_cast),
-                None => (super::inner::alloc_managed(elems * 2), true, true),
+                // A sub-view of a registered parameter (the fused LM head's
+                // vocabulary chunks): an offset into the parent's image,
+                // which `acquire_sub` has made valid itself.
+                None => match super::bf16_cast_cache::acquire_sub(dev as u64, elems) {
+                    Some(buf) => (buf as *mut std::ffi::c_void, false, false),
+                    None => (super::inner::alloc_managed(elems * 2), true, true),
+                },
             }
         };
         let (first16, first_owned, cast_first) = route(first_dev, first_elems);

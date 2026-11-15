@@ -21,6 +21,7 @@
 //! `matmul_bf16_mode.rs` pattern).
 
 use nsl_runtime::fase_step::nsl_fase_fused_adamw_step;
+use nsl_runtime::fused_linear_ce::nsl_fused_linear_ce_forward_gemm;
 use nsl_runtime::tensor::{
     nsl_tensor_copy_data, nsl_tensor_free, nsl_tensor_matmul, nsl_tensor_to_device,
     test_build_tensor_2d_f32, test_read_tensor_f32,
@@ -189,7 +190,106 @@ fn zz_probe_child() {
         "recycled-address tensor did not compute from its own bytes"
     );
 
+    sub_view_checks();
+
     println!("CACHE-PROBE-OK");
+}
+
+/// The tensor's device data pointer (`NslTensor` is `repr(C)` and its `data`
+/// follows the `u32` magic; the fields are crate-private).
+fn data_ptr(t: i64) -> i64 {
+    #[repr(C)]
+    struct Head {
+        _magic: u32,
+        data: *mut std::ffi::c_void,
+    }
+    unsafe { (*(t as *const Head)).data as i64 }
+}
+
+/// One fused LM-head forward through the production extern (raw device
+/// pointers, i64 targets), returning (loss, lse) per row as f32 bits.
+fn lm_head_forward(x: i64, w: i64, targets: i64, rows: usize, v: usize, h: usize) -> Vec<u32> {
+    let loss = gpu_2d(rows, 1, &vec![0.0f32; rows]);
+    let lse = gpu_2d(rows, 1, &vec![0.0f32; rows]);
+    let rc = nsl_fused_linear_ce_forward_gemm(
+        data_ptr(x),
+        data_ptr(w),
+        0,
+        data_ptr(targets),
+        data_ptr(loss),
+        data_ptr(lse),
+        1,
+        rows as i64,
+        v as i64,
+        h as i64,
+        0,
+    );
+    assert_eq!(rc, 0, "fused LM-head forward failed");
+    let mut out = Vec::with_capacity(2 * rows);
+    for t in [loss, lse] {
+        let host = nsl_tensor_to_device(t, 0);
+        out.extend(test_read_tensor_f32(host).into_iter().map(f32::to_bits));
+        nsl_tensor_free(host);
+        nsl_tensor_free(t);
+    }
+    out
+}
+
+/// -- check 6: a SUB-VIEW of a registered parameter is served from the
+///    parent's image. The fused LM head's chunk GEMMs pass `W + chunk_start *
+///    h` with the chunk's element count, which the cache's (base, length) key
+///    misses: before `acquire_sub` every chunk was cast into scratch on every
+///    call. Three chunks (4096 + 4096 + a 1024 tail, which keeps every chunk
+///    at or above the 512 intensity gate): the first chunk makes the
+///    WHOLE parent image valid (one recast), the other two hit it, and the
+///    results are bit-identical to the scratch path's.
+fn sub_view_checks() {
+    let (rows, h, v) = (1024usize, 1024usize, 2 * 4096 + 1024);
+    let x = gpu_2d(rows, h, &deterministic(rows * h, 239));
+    let w = gpu_2d(v, h, &deterministic(v * h, 241));
+    let zeros = || gpu_2d(v, h, &vec![0.0f32; v * h]);
+    let (m, vv, mp) = (zeros(), zeros(), zeros());
+    // i64 targets in [0, v): each one is an (low, high) pair of 32-bit words.
+    let mut words = Vec::with_capacity(2 * rows);
+    for r in 0..rows {
+        words.push(f32::from_bits(((r * 37 + 11) % v) as u32));
+        words.push(f32::from_bits(0));
+    }
+    let targets = gpu_2d(rows, 2, &words);
+
+    test_bf16_cast_cache_reset();
+    let fresh = lm_head_forward(x, w, targets, rows, v, h);
+    assert_eq!(test_bf16_cast_cache_stats(), (0, 0, 0), "nothing registered, yet the cache moved");
+
+    register_via_zero_lr_step(w, m, vv, mp);
+    let (h0, r0, _) = test_bf16_cast_cache_stats();
+    let cached = lm_head_forward(x, w, targets, rows, v, h);
+    let (h1, r1, _) = test_bf16_cast_cache_stats();
+    assert_eq!(
+        (h1 - h0, r1 - r0),
+        (2, 1),
+        "three vocabulary chunks of a registered head: expected the first to cast the whole \
+         parent once and the other two to hit it (hits, recasts) = (2, 1)"
+    );
+    assert_eq!(cached, fresh, "the sub-view image must serve the bits the scratch cast computes");
+    let cached2 = lm_head_forward(x, w, targets, rows, v, h);
+    let (h2, r2, _) = test_bf16_cast_cache_stats();
+    assert_eq!((h2 - h1, r2 - r1), (3, 0), "a warm parent image serves every chunk");
+    assert_eq!(cached2, fresh);
+
+    // A real optimizer step stales the parent: the next call recasts it whole
+    // and computes from the moved theta.
+    let g = gpu_2d(v, h, &deterministic(v * h, 251));
+    nsl_fase_fused_adamw_step(w, m, vv, g, 0.01, 0.9, 0.1, 0.999, 0.001, 1e-8, 0.0, 1.0, 1.0);
+    let after = lm_head_forward(x, w, targets, rows, v, h);
+    assert_ne!(after, fresh, "theta moved but the head returned the pre-step loss: a stale image");
+    test_bf16_cast_cache_reset();
+    let after_fresh = lm_head_forward(x, w, targets, rows, v, h);
+    assert_eq!(after, after_fresh, "after a step, the recast parent image differs from the scratch cast");
+
+    for t in [x, w, m, vv, mp, targets, g] {
+        nsl_tensor_free(t);
+    }
 }
 
 #[test]
