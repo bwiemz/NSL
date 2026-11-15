@@ -43,6 +43,8 @@ pub(crate) struct TrainConfigSection {
     /// micro-batch: true unless the header says `schedule_unit =
     /// "micro_batch"`.
     pub(crate) schedule_in_optimizer_steps: bool,
+    /// `precision="bf16"`: bf16 activation storage for this step.
+    pub(crate) precision_bf16: bool,
 }
 
 impl Compiler<'_> {
@@ -100,6 +102,10 @@ impl Compiler<'_> {
             use nsl_semantic::train_config::ScheduleUnit;
             ScheduleUnit::resolve(cfg.schedule_unit) == ScheduleUnit::OptimizerStep
         };
+        let precision_bf16 = cfg.precision == Some(nsl_semantic::train_config::Precision::Bf16);
+        if precision_bf16 {
+            self.admit_bf16_activation_storage()?;
+        }
 
         // P5 item 19: arm the cuda-graph runtime (its enable() re-checks the
         // runtime-only incompatibilities: NSL_CUDA_SYNC, kernel profiler,
@@ -140,6 +146,46 @@ impl Compiler<'_> {
             checkpoint_every,
             checkpoint_load_path,
             schedule_in_optimizer_steps,
+            precision_bf16,
         })
+    }
+
+    /// The compositions `precision="bf16"` admits in this phase. Each refusal
+    /// names a feature that has not been checked against bf16 activations:
+    /// a refusal is a compile error, never a silent fall back to f32.
+    fn admit_bf16_activation_storage(&self) -> Result<(), CodegenError> {
+        if !self.activation_bf16 {
+            // The pre-scan of `main` (which sets the program's matmul mode
+            // and fingerprint from this key) did not see this block.
+            return Err(CodegenError::new(
+                "precision=\"bf16\" is supported on a top-level train block only: the program's \
+                 matmul mode and execution fingerprint are decided from it before `main` runs",
+            ));
+        }
+        if !self.features.source_ad_enabled {
+            return Err(CodegenError::new(
+                "precision=\"bf16\" requires --source-ad: bf16 activation storage is planned over \
+                 the source-AD step; the tape path computes and stores f32",
+            ));
+        }
+        let o = &self.compile_options;
+        let refused: [(bool, &str); 8] = [
+            (o.train.cuda_graphs, "--cuda-graphs"),
+            (o.train.layerwise_accum, "--layerwise-accum"),
+            (o.train.param_dtype_bf16sr, "--param-dtype bf16-sr"),
+            (o.checkpoint.compress.is_some(), "--checkpoint-compress"),
+            (o.memory.transient_arena, "--transient-arena"),
+            (o.weight_stream.enabled, "--weight-stream"),
+            (o.cpdt.mode == crate::cpdt::CpdtMode::Full, "--cpdt full (its precision plan)"),
+            (o.wggo.moment_precision, "the WGGO moment-precision plan"),
+        ];
+        if let Some((_, flag)) = refused.iter().find(|(on, _)| *on) {
+            return Err(CodegenError::new(format!(
+                "precision=\"bf16\" does not compose with {flag} yet: that feature sizes, copies or \
+                 re-types activations assuming f32 storage and has not been checked against the \
+                 bf16 storage plan. Drop {flag}, or train with precision=\"f32\""
+            )));
+        }
+        Ok(())
     }
 }

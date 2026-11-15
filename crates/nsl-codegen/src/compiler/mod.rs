@@ -966,6 +966,17 @@ pub struct Compiler<'a> {
     /// block so one block's offsets cannot be applied to the next block's
     /// VarIds — the counter is per-extraction, so the ids WOULD collide.
     pub arena_placements: HashMap<crate::wengert::VarId, crate::transient_arena::Placement>,
+    /// `precision="bf16"`: the output storage of every op of the train block
+    /// being lowered that the bf16 storage plan sends through a
+    /// dtype-explicit runtime entry point (`stmt_train/storage_plan.rs`).
+    /// Empty for an f32 step, which is then lowered exactly as before. Keyed
+    /// by this block's VarIds and cleared with `arena_placements`, for the
+    /// same reason.
+    pub(crate) storage_out: HashMap<crate::wengert::VarId, crate::stmt_train::storage_plan::Storage>,
+    /// Some top-level train block of this program asks for
+    /// `precision="bf16"` (resolved before `main` is emitted, because the
+    /// program's matmul mode and execution fingerprint follow from it).
+    pub activation_bf16: bool,
 
     /// Item 17 phase 3a: the packing-metadata `(segment_ids, doc_starts)`
     /// device pointers as Cranelift variables of the TRAIN-STEP function.
@@ -1294,6 +1305,8 @@ impl<'a> Compiler<'a> {
                     .to_string(),
             ),
             arena_placements: HashMap::new(),
+            storage_out: HashMap::new(),
+            activation_bf16: false,
             packing_meta_vars: None,
             active_distill_context: None,
             pca_user_strategies: options.analysis.pca_user_strategies.clone(),

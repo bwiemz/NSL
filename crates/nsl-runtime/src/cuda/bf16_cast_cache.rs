@@ -292,6 +292,38 @@ pub(crate) fn acquire(data: u64, elems: usize) -> Option<(u64, bool)> {
     }
 }
 
+/// A bf16 image of `elems` f32 elements starting at `data`, where `data` lies
+/// INSIDE a registered parameter (a sub-view: the fused LM head's vocabulary
+/// chunks of the tied embedding pass `embed + chunk_start * hidden`).
+/// [`acquire`] misses those (its key is the parameter's base and length) and
+/// the GEMM would cast the chunk into scratch on every call.
+///
+/// Unlike [`acquire`] this makes the WHOLE parent image valid itself — casting
+/// all of the parent when it is stale — before returning `image + offset`, so
+/// an image is never marked valid with only part of it cast. Returns `None`
+/// when no registered parameter contains the range.
+pub(crate) fn acquire_sub(data: u64, elems: usize) -> Option<u64> {
+    if !ACTIVE.load(Ordering::Acquire) || data == 0 || elems == 0 {
+        return None;
+    }
+    let bytes = elems as u64 * 4;
+    let parent = with_images(|map| {
+        map.iter()
+            .find(|(base, e)| {
+                **base <= data && data + bytes <= **base + e.elems as u64 * 4 && (data - **base).is_multiple_of(4)
+            })
+            .map(|(base, e)| (*base, e.elems))
+    })?;
+    let (base, parent_elems) = parent;
+    // The whole parent's image, through the ordinary protocol: `acquire`
+    // marks it valid on the `needs_cast` hand-off and the cast follows at once.
+    let (buf, needs_cast) = acquire(base, parent_elems)?;
+    if needs_cast {
+        super::gpu_cast_raw_f32_to_bf16(base, buf, parent_elems);
+    }
+    Some(buf + (data - base) / 2)
+}
+
 /// Drop the entry for `data` (if any) and free its image. Wired into
 /// `free_managed`'s top, the device-write transport helpers, and the
 /// in-place-write externs; self-gating (one relaxed load) when the cache

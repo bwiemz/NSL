@@ -496,7 +496,13 @@ pub fn compile_wengert_ops_range(
             let bytes = builder.ins().iconst(cl_types::I64, p.bytes as i64);
             call(compiler, builder, "nsl_arena_bind", &[slot, off, bytes])?;
         }
-        let result_val = lower_single_op(compiler, builder, op, var_map, var_types)?;
+        // `precision="bf16"`: an op the storage plan covers (it stores bf16,
+        // or reads a bf16 value) goes through a dtype-explicit entry point
+        // that names its output dtype. Empty plan: every op as before.
+        let result_val = match compiler.storage_out.get(&op.result).copied() {
+            Some(storage) => lower_storage_op(compiler, builder, op, var_map, storage)?,
+            None => lower_single_op(compiler, builder, op, var_map, var_types)?,
+        };
         if placement.is_some() {
             // Verify-and-disarm: the pin's exact-size rule cannot tell the
             // output from an output-sized interior allocation, so the
@@ -1573,6 +1579,73 @@ fn passthrough_norm_eps(
 }
 
 /// Lower one WengertOp to Cranelift IR.
+/// Lower an op of the bf16 storage plan (`stmt_train/storage_plan.rs`)
+/// through the runtime's dtype-explicit entry points, storing its result as
+/// `storage`. Each reads f32 or bf16 operands, computes in f32 and rounds
+/// once on a bf16 store. The plan admits only the op kinds below
+/// (`storage_plan::has_dt_lowering`), so anything else is a compiler bug.
+fn lower_storage_op(
+    compiler: &mut Compiler,
+    builder: &mut FunctionBuilder,
+    op: &WengertOp,
+    var_map: &VarMap,
+    storage: crate::stmt_train::storage_plan::Storage,
+) -> Result<Value, CodegenError> {
+    use nsl_abi::wire::dt_op;
+    let inputs = resolve_inputs(op, var_map)?;
+    let dt = builder.ins().iconst(cl_types::I64, storage.tag());
+    let code = |builder: &mut FunctionBuilder, c: i64| builder.ins().iconst(cl_types::I64, c);
+    match &op.op {
+        PrimalOp::Matmul => call(compiler, builder, "nsl_tensor_matmul_dt", &[inputs[0], inputs[1], dt]),
+        PrimalOp::Add | PrimalOp::Sub | PrimalOp::Mul | PrimalOp::Div => {
+            let c = match &op.op {
+                PrimalOp::Add => dt_op::ADD,
+                PrimalOp::Sub => dt_op::SUB,
+                PrimalOp::Mul => dt_op::MUL,
+                _ => dt_op::DIV,
+            };
+            let c = code(builder, c);
+            call(compiler, builder, "nsl_tensor_binary_dt", &[c, inputs[0], inputs[1], dt])
+        }
+        PrimalOp::Silu
+        | PrimalOp::Relu
+        | PrimalOp::Sigmoid
+        | PrimalOp::Exp
+        | PrimalOp::Log
+        | PrimalOp::Sqrt
+        | PrimalOp::Abs
+        | PrimalOp::Neg => {
+            let c = match &op.op {
+                PrimalOp::Silu => dt_op::SILU,
+                PrimalOp::Relu => dt_op::RELU,
+                PrimalOp::Sigmoid => dt_op::SIGMOID,
+                PrimalOp::Exp => dt_op::EXP,
+                PrimalOp::Log => dt_op::LOG,
+                PrimalOp::Sqrt => dt_op::SQRT,
+                PrimalOp::Abs => dt_op::ABS,
+                _ => dt_op::NEG,
+            };
+            let c = code(builder, c);
+            call(compiler, builder, "nsl_tensor_unary_dt", &[c, inputs[0], dt])
+        }
+        PrimalOp::RMSNorm { eps } => {
+            let e = norm_eps_value(builder, var_map, *eps, "rmsnorm")?;
+            call(compiler, builder, "nsl_tensor_rmsnorm_dt", &[inputs[0], inputs[1], e, dt])
+        }
+        PrimalOp::Passthrough(name) if name == "swiglu_gate_backward" => call(
+            compiler,
+            builder,
+            "nsl_tensor_swiglu_gate_backward_dt",
+            &[inputs[0], inputs[1], inputs[2], dt],
+        ),
+        other => Err(CodegenError::new(format!(
+            "internal: the bf16 storage plan sent {other:?} (VarId {}) to the dtype-explicit lowering, \
+             which does not cover it",
+            op.result
+        ))),
+    }
+}
+
 fn lower_single_op(
     compiler: &mut Compiler,
     builder: &mut FunctionBuilder,

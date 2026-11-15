@@ -62,6 +62,29 @@ pub mod dtype {
     pub const DTYPE_CUSTOM_START: u16 = 256;
 }
 
+/// The `op` argument of the dtype-explicit elementwise entry points that bf16
+/// activation storage lowers to (`nsl_tensor_binary_dt`,
+/// `nsl_tensor_unary_dt`): which operation. Codegen emits these values and
+/// the runtime decodes them; a value either side does not know is a fatal
+/// error at run time, never a different operation.
+pub mod dt_op {
+    pub const ADD: i64 = 0;
+    pub const SUB: i64 = 1;
+    pub const MUL: i64 = 2;
+    pub const DIV: i64 = 3;
+
+    pub const NEG: i64 = 0;
+    pub const RELU: i64 = 1;
+    pub const EXP: i64 = 2;
+    pub const LOG: i64 = 3;
+    pub const SQRT: i64 = 4;
+    pub const ABS: i64 = 5;
+    pub const SIGMOID: i64 = 6;
+    pub const SILU: i64 = 7;
+    pub const SIN: i64 = 8;
+    pub const COS: i64 = 9;
+}
+
 /// The runtime C-ABI version (`nsl_abi_version()`, and the
 /// `NSL_ABI_VERSION_*` macros in every generated header).
 pub mod version {

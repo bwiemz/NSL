@@ -488,6 +488,14 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
          chain-collapse for role=Block). A refused prune fails the compile \
          with a three-part `prune: ...` error instead",
     ),
+    m(
+        "[bf16-storage]",
+        &["crates/nsl-codegen/src/stmt_train/storage_plan.rs"],
+        "a precision=\"bf16\" train step's storage plan was applied: \
+         `[bf16-storage] N SwiGLU MLP block(s) stored bf16: V values, O ops \
+         lowered dtype-explicit`, once per planned train block. A program \
+         with no SwiGLU block to store fails the compile instead",
+    ),
 ];
 
 /// Look a marker up by token. Panics if it is not registered — call sites are
@@ -565,6 +573,11 @@ pub struct NegativeNeedle {
 /// loudly when its marker rots and needs no entry here; a negative one cannot
 /// fail at all, so each is pinned.
 pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
+    NegativeNeedle {
+        test: "crates/nsl-cli/tests/bf16_activation_storage_gate.rs",
+        asserts: "a program without precision=\"bf16\" plans no bf16 activation storage",
+        parts: &[("[bf16-storage]", "crates/nsl-codegen/src/stmt_train/storage_plan.rs")],
+    },
     NegativeNeedle {
         test: "crates/nsl-cli/tests/pretrain_optimized_flag.rs",
         asserts: "--pretrain-optimized no longer plans with WGGO (2026-11-15: \

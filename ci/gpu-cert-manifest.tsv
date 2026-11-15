@@ -2,6 +2,7 @@
 # Regenerate with: scripts/gpu-cert.sh --write-manifest
 # Columns: file<TAB>test<TAB>class<TAB>reason
 crates/nsl-cli/tests/autotune_measure_gate.rs	autotune_measures_and_compiles_consume_it_gpu	gpu	requires CUDA GPU
+crates/nsl-cli/tests/bf16_activation_storage_gate.rs	the_bf16_program_trains_like_f32_storage_with_bf16_gemms	gpu	requires CUDA GPU
 crates/nsl-cli/tests/ccr_checkpoint_activation_parity_gpu.rs	ccr_activation_parity_on_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/ccr_checkpoint_parity.rs	ccr_blocks_parity_on_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/ccr_checkpoint_parity.rs	ccr_blocks_parity_on_gpu_deterministic	gpu	requires CUDA GPU
@@ -434,6 +435,15 @@ crates/nsl-runtime/src/tensor_parallel/collective.rs	a_real_one_rank_communicato
 crates/nsl-runtime/src/tensor_parallel/collective.rs	nccl_device_collectives_actually_execute_on_this_gpu	gpu	requires CUDA GPU + a real libnccl (--features nccl)
 crates/nsl-runtime/src/tensor_parallel/collective.rs	unmapped_dtypes_are_refused_before_reaching_nccl	gpu	requires CUDA GPU + a real libnccl (--features nccl)
 crates/nsl-runtime/src/tensor_parallel/collective.rs	the_trait_methods_short_circuit_at_ws1_without_entering_nccl	gpu	requires CUDA GPU + a real libnccl (--features nccl)
+crates/nsl-runtime/tests/bf16_storage_gemm_gpu.rs	bf16_operand_gemms_round_once_to_the_requested_dtype	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/bf16_storage_gemm_gpu.rs	the_fused_weight_gradient_accumulates_bf16_activations_in_f32	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/bf16_storage_gemm_gpu.rs	a_shape_one_gemm_cannot_express_takes_the_counted_fallback	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/bf16_storage_kernels_gpu.rs	binary_ops_round_once_to_the_requested_dtype	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/bf16_storage_kernels_gpu.rs	unary_ops_round_once_to_the_requested_dtype	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/bf16_storage_kernels_gpu.rs	swiglu_gate_backward_rounds_once_at_gradient_magnitudes	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/bf16_storage_kernels_gpu.rs	rotate_half_is_exact_or_rounds_once	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/bf16_storage_kernels_gpu.rs	the_fallback_is_counted_and_computes_the_same_values	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/bf16_storage_kernels_gpu.rs	rmsnorm_rounds_once_to_the_requested_dtype	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/dlpack_unsupported_dtype_refusal.rs	zz_dlpack_refusal_child	helper	child process — driven by the gates below via re-exec
 crates/nsl-runtime/tests/embedding_iota_positions_gpu.rs	repeat_arange_gather_uploads_nothing	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/embedding_iota_positions_gpu.rs	longer_prefixes_grow_the_device_positions	gpu	requires CUDA GPU

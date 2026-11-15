@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+<!-- bf16 activation storage, first slice (2026-11-15). -->
+- **bf16 activation storage.**
+  - `train(..., precision = "bf16")` stores activations and their gradients in bf16 where PyTorch autocast does, computing in f32 inside every kernel with one rounding (to nearest even) on store; parameters, weight gradients, optimizer state, the residual stream and the gradient summed from several GEMMs stay f32. This first slice stores the SwiGLU MLP half of each pre-norm block (norm output, gate, up, silu, silu·up, down output and their gradients), decided by a compile-time storage plan over the source-AD step. Measured with `tools/perfcheck` against the bf16 matmul mode (`NSL_MATMUL_BF16=1`): Coder-1B 1.195x tok/s [1.187-1.198] with a 2.0 GiB lower allocator peak, Coder-500M 1.175x [1.106-1.225] and 0.54 GiB lower. At 50M its gradients are within PyTorch autocast's distance of f32 (about a third of it), and over 5 seeds and 1,000 updates its held-out loss matches the autocast twin (+0.006, 2 SE 0.030). It sets the bf16 matmul mode, adds `act=bf16` to the execution fingerprint and prints `activation storage: bf16`; it requires `--source-ad`, and is a compile error with a disagreeing `--matmul-mode`, `NSL_MATMUL_BF16=0`, `--cuda-graphs`, `--layerwise-accum`, `--weight-stream`, `--param-dtype bf16-sr`, `--checkpoint-compress`, `--transient-arena`, `--cpdt full`, a WGGO moment plan, `@pipeline`, and on a step with no SwiGLU block to store. The production recipes do not use it yet.
+  - Storage-generic KIR kernels (elementwise, unary, SwiGLU gate backward, rotate_half, RMSNorm forward) taking f32 or bf16 per operand, and GEMMs on bf16 operands with a bf16 or f32 output (the fused weight gradient accumulates bf16 activations into f32). The f32 instantiations print the same PTX as before.
+  - `tools/perfcheck` arm `nsl_bf16s`; `tools/refcheck` `--precision bf16`, `--autocast bf16` (the PyTorch twin under `torch.autocast`) and `--batches`.
+
 <!-- perf round 1 (2026-11-15): host stalls, GEMM selection and tensor-core attention, measured with tools/perfcheck against main and PyTorch. -->
 - **Memory.**
   - `Adam(...)` / `AdamW(...)` take `first_moment_dtype = "bf16"`: the first moment is stored in bf16 (rounded to nearest even on store, f32 arithmetic inside the fused AdamW step); the second moment, master weights and gradients stay f32. At Coder-1B it saves 2.00 GiB (driver peak 27.79 to 25.79 GiB in the bf16 recipe posture) at unchanged speed (paired 1.004); at Coder-500M 0.96 GiB. At 50M, held-out loss after 2,000 updates against f32 moments over 5 seeds: paired mean difference +0.008, within the pre-registered criterion. Checkpoints record the moment dtype and the execution fingerprint gains `m1=bf16`; resuming with the other dtype is refused. It requires the fused AdamW step and is a compile error with offload, layerwise accumulation, ZeRO, `bf16-sr` parameters, WGGO/CPDT moment plans, `@pipeline` and `--training-reference`.
@@ -3588,6 +3594,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- **Fused weight gradients under selective checkpointing.** `--fuse-wgrad-accum` now fuses every projection's weight gradient under `--checkpoint-selective`: the recompute splice placed a free inside Wq's chain (transpose, batched GEMM, reduce), which then ran unfused as a TF32 batched GEMM. Coder-1B 1.02-1.03x, Coder-500M 1.03-1.05x.
+- The bf16 weight-cast cache serves sub-views of a registered parameter (the fused LM head's vocabulary chunks), which were recast on every chunk.
+- The execution fingerprint no longer carries `dtype=`, which was the same ("bf16") on every build; checkpoints that have it still resume.
 - **Flags that did not do what they said.**
   - `--pretrain-optimized` is the measured production flag set (`--source-ad --checkpoint-blocks --checkpoint-selective --fuse-rmsnorm-backward --fuse-wgrad-accum`) plus `--fuse-lm-head auto`. It included `--wggo greedy` and `--csha auto`: WGGO unbatched the fused AdamW step and cost 12-18% (0.82x at Coder-1B bf16) without saving memory. `--wggo greedy` stays available on its own and its help states the cost. A typed `--checkpoint-blocks` alone keeps full block recompute.
   - `--wggo-moment-precision` on a train block where WGGO decides no reduced-precision moment is a compile error naming `first_moment_dtype = "bf16"`. It used to build a byte-identical binary and report the decision as witnessed.

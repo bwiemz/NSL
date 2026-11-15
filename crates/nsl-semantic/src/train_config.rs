@@ -44,10 +44,36 @@ pub const TRAIN_CONFIG_KEYS: &[&str] = &[
     "checkpoint_every",
     "checkpoint_load",
     "schedule_unit",
+    "precision",
 ];
 
 const EXPECTED_KEYS_LABEL: &str = "expected model=, epochs=, grad_accumulation=, \
-     grad_clip=, checkpoint_save=, checkpoint_every=, checkpoint_load=, or schedule_unit=";
+     grad_clip=, checkpoint_save=, checkpoint_every=, checkpoint_load=, schedule_unit=, \
+     or precision=";
+
+/// How a train block stores its activations (`precision=`).
+///
+/// `F32` (the default) is f32 storage throughout, GEMMs per `--matmul-mode`.
+/// `Bf16` is bf16 activation storage: activations and activation gradients
+/// the compiler's storage plan marks are stored bf16, parameters, their
+/// gradients and the optimizer state stay f32, every kernel computes in f32
+/// and rounds once on a bf16 store, and the GEMMs run on bf16 operands (the
+/// program's matmul mode is bf16). Source-AD train steps only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Precision {
+    F32,
+    Bf16,
+}
+
+impl Precision {
+    /// The spelling accepted in source.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Precision::F32 => "f32",
+            Precision::Bf16 => "bf16",
+        }
+    }
+}
 
 /// What one step of the learning-rate schedule is, under gradient
 /// accumulation: the unit of `warmup_steps`, `total_steps`, `step_size`
@@ -135,6 +161,8 @@ pub struct ResolvedTrainConfig {
     /// `Some` when `schedule_unit=` was written. `None` means the default,
     /// optimizer steps (see [`ScheduleUnit::resolve`]).
     pub schedule_unit: Option<ScheduleUnit>,
+    /// `Some` when `precision=` was written; `None` is f32 storage.
+    pub precision: Option<Precision>,
 }
 
 /// Who is asking. Distill lowering synthesizes a `TrainBlock` whose model
@@ -205,6 +233,7 @@ pub fn resolve_train_config(
     let mut checkpoint_every: i64 = 0;
     let mut checkpoint_load: Option<String> = None;
     let mut schedule_unit: Option<ScheduleUnit> = None;
+    let mut precision: Option<Precision> = None;
 
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Spans for the pairing diagnostics below, so the label lands on the
@@ -358,6 +387,17 @@ pub fn resolve_train_config(
                     .with_label(arg.span, "expected \"micro_batch\" or \"optimizer_step\""),
                 ),
             },
+            "precision" => match &arg.value.kind {
+                ExprKind::StringLiteral(s) if s == "f32" => precision = Some(Precision::F32),
+                ExprKind::StringLiteral(s) if s == "bf16" => precision = Some(Precision::Bf16),
+                _ => diags.push(
+                    Diagnostic::error(
+                        "train 'precision' must be \"f32\" or \"bf16\" (a string literal): how \
+                         the train step stores its activations",
+                    )
+                    .with_label(arg.span, "expected \"f32\" or \"bf16\""),
+                ),
+            },
             other => diags.push(
                 Diagnostic::error(format!("unknown train config key '{other}'"))
                     .with_label(arg.span, EXPECTED_KEYS_LABEL),
@@ -414,6 +454,7 @@ pub fn resolve_train_config(
             checkpoint_every,
             checkpoint_load,
             schedule_unit,
+            precision,
         })
     } else {
         Err(diags)

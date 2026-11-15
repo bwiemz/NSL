@@ -92,6 +92,22 @@ tools/refcheck/train_ref.py --size 500m --init init.nslm \
 The two curves track each other for the first few hundred steps and then
 separate the way two seeds do; compare held-out loss, not individual points.
 
+**bf16 activation storage.** A train block with `precision="bf16"` is held to
+PyTorch autocast, not to f32. `--precision bf16` writes the key into the NSL
+program; `--autocast bf16` runs the twin under `torch.autocast(bf16)` as well and
+records, per tensor, (a) autocast vs f32, (b) NSL vs f32 and (c) NSL vs
+autocast. The exit status is then the criterion fixed before any run: for every
+batch, NSL's median and worst error in (b) are no larger than the largest
+corresponding value of (a) over the batches (`grad_check.py --batches 4`), or
+than autocast's (`optimizer_check.py`). `train_ref.py --autocast bf16` is the
+loss-curve twin (its held-out loss stays f32, as NSL's eval does).
+
+```bash
+tools/refcheck/grad_check.py --tokens refcheck-work/data/train.bin --nsl target/release/nsl \
+    --precision bf16 --autocast bf16 --batches 4 \
+    -- --source-ad --checkpoint-blocks --checkpoint-selective --fuse-rmsnorm-backward
+```
+
 ## What it does not cover
 
 Dropout (the two frameworks cannot share a mask; every check runs with it off),

@@ -37,7 +37,7 @@
 //! never correctness. Everything this module checks is about *aliasing and
 //! lifetime* — the things the runtime cannot see.
 
-use crate::wengert::{PrimalOp, VarId, WengertList};
+use crate::wengert::{PrimalOp, VarId, WengertList, WengertOp};
 use std::collections::{HashMap, HashSet};
 
 /// One fusable weight-gradient chain.
@@ -89,6 +89,42 @@ fn is_last_two_dims_transpose(op: &PrimalOp) -> bool {
 
 fn is_reduce_to_shape(op: &PrimalOp) -> bool {
     matches!(op, PrimalOp::Passthrough(name) if name == "reduce_to_shape")
+}
+
+/// When `idx` is the transpose or the matmul of a weight-gradient chain
+/// SHAPED like the ones [`plan`] fuses (`Transpose{-2,-1}` at `i`,
+/// `Matmul(a_t, _)` at `i+1`, `reduce_to_shape(raw, _)` at `i+2`), the index
+/// of that chain's reduce; otherwise `None`.
+///
+/// Structure only — no parameter, reader-count or lifetime condition. A pass
+/// that places a `FreeTensor` after op `idx` uses this to place it after the
+/// reduce instead, so the marker cannot split the chain. That is correct
+/// whether or not the chain is later fused: fused, the GEMM reads `X` and `G`
+/// at the reduce and the free follows it; not fused, the freed values live
+/// one or two ops longer. Requiring the full shape (not just "a transpose")
+/// keeps every other free where its pass put it.
+pub fn chain_reduce_covering(ops: &[WengertOp], idx: usize) -> Option<usize> {
+    let is_chain_at = |t: usize| -> bool {
+        let (Some(t_op), Some(m_op), Some(r_op)) = (ops.get(t), ops.get(t + 1), ops.get(t + 2))
+        else {
+            return false;
+        };
+        is_last_two_dims_transpose(&t_op.op)
+            && t_op.inputs.len() == 1
+            && m_op.op == PrimalOp::Matmul
+            && m_op.inputs.len() == 2
+            && m_op.inputs[0] == t_op.result
+            && is_reduce_to_shape(&r_op.op)
+            && r_op.inputs.len() == 2
+            && r_op.inputs[0] == m_op.result
+    };
+    if is_chain_at(idx) {
+        return Some(idx + 2);
+    }
+    if idx >= 1 && is_chain_at(idx - 1) {
+        return Some(idx + 1);
+    }
+    None
 }
 
 /// Build the fusion plan for `wengert`, considering only chains that
@@ -258,6 +294,23 @@ mod tests {
 
     fn adj(v: VarId) -> HashSet<VarId> {
         HashSet::from([v])
+    }
+
+    #[test]
+    fn a_free_after_a_chain_op_moves_to_its_reduce_and_nowhere_else() {
+        let ops = canonical_chain();
+        assert_eq!(chain_reduce_covering(&ops, 0), Some(2), "after the transpose");
+        assert_eq!(chain_reduce_covering(&ops, 1), Some(2), "after the matmul");
+        assert_eq!(chain_reduce_covering(&ops, 2), None, "after the reduce: already outside");
+        // A transpose whose next op is not the chain's matmul is not a chain.
+        let mut broken = canonical_chain();
+        broken[1].inputs = vec![1, 10];
+        assert_eq!(chain_reduce_covering(&broken, 0), None, "matmul reads a_t on the right");
+        let mut no_reduce = canonical_chain();
+        no_reduce[2].op = PrimalOp::Add;
+        assert_eq!(chain_reduce_covering(&no_reduce, 0), None, "no reduce");
+        assert_eq!(chain_reduce_covering(&no_reduce, 1), None, "no reduce");
+        assert_eq!(chain_reduce_covering(&ops, 7), None, "past the end");
     }
 
     #[test]

@@ -168,3 +168,4 @@ pub(crate) mod plan_ccr;
 pub(crate) mod plan_csha_prune;
 pub(crate) mod plan_wggo;
 pub(crate) mod plan_wrga_cpdt;
+pub(crate) mod storage_plan;

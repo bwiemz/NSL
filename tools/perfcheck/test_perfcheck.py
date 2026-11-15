@@ -201,6 +201,21 @@ class Arms(unittest.TestCase):
             "the drain switch is read at run time: same binary",
         )
 
+    def test_the_bf16_storage_arm_is_its_own_program(self) -> None:
+        # Same flags and environment as an f32-storage arm; only the train header
+        # differs, so the program (and the binary) must too.
+        s = pc.arm("nsl_bf16s")
+        self.assertEqual((s.flags, s.build_env), (pc.arm("nsl_tf32").flags, ()))
+        self.assertEqual(s.train_args, ', precision="bf16"')
+        keys = {pc.flag_key(pc.arm(n).build_key) for n in ("nsl_tf32", "nsl_bf16", "nsl_bf16s")}
+        self.assertEqual(len(keys), 3)
+        self.assertTrue(pc.flag_key(pc.arm("nsl_bf16s@after").build_key).endswith("@after"))
+        shape = pc.read_shape("1b", None, None, None)
+        header = pc.program_text(
+            shape, 24, Path("/t.bin"), grad_clip=True, train_args=s.train_args
+        )
+        self.assertIn('grad_clip=1.0, precision="bf16"):', header)
+
     def test_torch_arm_names(self) -> None:
         a = pc.arm("torch_bf16_compile_sel")
         self.assertEqual(

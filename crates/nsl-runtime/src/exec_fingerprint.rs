@@ -43,9 +43,18 @@ static EXEC_FINGERPRINT: Mutex<String> = Mutex::new(String::new());
 /// than the run that wrote the checkpoint. Kept as an explicit list, not a
 /// negation of the placement list, so a newly added key defaults to the
 /// SILENT class only by deliberate omission from both.
+//
+// `dtype` is not here: it was the profile walker's cost dtype ("bf16" on every
+// build), never the training arithmetic. Builds stopped emitting it with
+// `act`; a checkpoint that still carries it is not compared on it.
 const ARITHMETIC_KEYS: &[&str] = &[
-    "ad", "det", "dtype", "fusion", "fuse_rms", "fuse_wgrad", "zero", "zero_elem", "ws",
+    "ad", "det", "fusion", "fuse_rms", "fuse_wgrad", "zero", "zero_elem", "ws",
     "muon_bns", "muon_resmom", "lmhead",
+    // bf16 activation storage (a train block's `precision="bf16"`): the
+    // planned activations are rounded to bf16 where an f32 run keeps them.
+    // Emitted only when bf16, so an f32 build and an older checkpoint agree
+    // by both lacking it.
+    "act",
     // The matmul family, promoted from environment variables 2026-09-02.
     //   mm        bf16 vs tf32 vs f32 operands -- different products.
     //   mmround   RNE vs SR -- a different cast, and SR re-dithers per launch.
@@ -327,6 +336,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn activation_storage_refuses_and_the_old_dtype_key_is_not_compared() {
+        // A bf16-storage checkpoint resumed by an f32 build (or the reverse)
+        // changes what is computed; an older checkpoint's `dtype=bf16` (the
+        // profile walker's dtype, emitted by every build until `act` replaced
+        // it) must not refuse a resume by a build that no longer emits it.
+        let f32_old = "ad=source,dtype=bf16,mm=tf32";
+        let f32_new = "ad=source,mm=tf32";
+        let bf16_new = "ad=source,mm=bf16,act=bf16";
+        assert!(arithmetic_diff(f32_old, f32_new).is_empty());
+        assert!(placement_diff(f32_old, f32_new).is_empty());
+        for (saved, live) in [(f32_new, bf16_new), (bf16_new, f32_new)] {
+            assert!(arithmetic_diff(saved, live).iter().any(|d| d.key == "act"), "{saved} -> {live}");
+        }
+    }
+
+    #[test]
     fn identical_fingerprints_have_no_diff() {
         let fp = "ad=source,det=1,dtype=f32";
         assert!(arithmetic_diff(fp, fp).is_empty());
@@ -359,10 +384,10 @@ mod tests {
 
     #[test]
     fn a_key_present_on_one_side_only_is_reported() {
-        let d = arithmetic_diff("ad=source", "ad=source,dtype=bf16-sr");
+        let d = arithmetic_diff("ad=source", "ad=source,act=bf16");
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].saved, "<absent>");
-        assert_eq!(d[0].live, "bf16-sr");
+        assert_eq!(d[0].live, "bf16");
     }
 
     #[test]

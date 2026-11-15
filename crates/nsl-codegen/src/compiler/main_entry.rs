@@ -22,6 +22,9 @@ impl Compiler<'_> {
         let _phase = crate::pass_trace::enter_phase(
             crate::pass_registry::CompilePhase::TrainBlock,
         );
+        // `precision="bf16"` decides the program's matmul mode and its
+        // fingerprint, both emitted at the top of `main` below.
+        self.resolve_program_precision(stmts)?;
         let top_level: Vec<_> = stmts
             .iter()
             .filter(|s| {
@@ -122,6 +125,12 @@ impl Compiler<'_> {
             // build must therefore still say so explicitly.
             {
                 let mut fp = self.compile_options.exec_fingerprint();
+                // bf16 activation storage is arithmetic. Emitted only when on,
+                // like the prune keys: an f32 build and a checkpoint written
+                // before the key existed agree by both lacking it.
+                if self.activation_bf16 {
+                    fp.push_str(",act=bf16");
+                }
                 // What the program was specialized on, when it was: emitted
                 // only then, like the layer-prune keys, so that a build with
                 // no value-dependent rewrite and an older checkpoint agree by
@@ -194,6 +203,12 @@ impl Compiler<'_> {
                     builder.ins().iconst(cl_types::I64, b(mm.bf16_lt_tune)),
                 ];
                 self.compile_call_by_name(&mut builder, "nsl_set_matmul_config", &args)?;
+                if self.activation_bf16 {
+                    // The runtime's banner beside the math mode's, which the
+                    // perfcheck harness asserts for a bf16-storage arm.
+                    let bf16 = builder.ins().iconst(cl_types::I64, 3);
+                    self.compile_call_by_name(&mut builder, "nsl_set_activation_storage", &[bf16])?;
+                }
             }
 
             // M46: Set global deterministic mode flag + seed RNG at program

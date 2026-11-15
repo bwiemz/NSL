@@ -2119,7 +2119,7 @@ impl CompileOptions {
         // The read sites treat exactly "0" as off (`!= Some("0")`); the
         // fingerprint mirrors that so `NSL_FA_FWD_MMA=1` and unset agree.
         let on_unless_zero = |name: &str| b(env(name).as_deref() != Some("0"));
-        // Free-text values ride under the same allowlist as `dtype` below;
+        // Free-text values ride under an allowlist (`sanitize_fingerprint_value`);
         // an unset variable renders as its documented default so the key is
         // never omitted (property 3).
         let text = |name: &str, unset: &str| -> String {
@@ -2148,14 +2148,11 @@ impl CompileOptions {
             Some(n) => n.to_string(),
             None => "none".to_string(),
         };
-        // `dtype` reaches us as a user-supplied `--dtype` string and ends up
-        // inside a JSON string literal in the checkpoint sidecar. An ALLOWLIST,
-        // not a blocklist of the two separators: `,` and `=` would forge extra
-        // fields when the runtime splits the record, but a `\"` or a `\\`
-        // terminates the JSON value and corrupts the whole header — turning a
-        // resume guard into an unreadable checkpoint. Everything outside
-        // [a-z0-9._-] becomes `_`.
-        let dtype: String = sanitize_fingerprint_value(&self.dtype.to_ascii_lowercase());
+        // No `dtype` key: `CompileOptions::dtype` is the profile walker's cost
+        // dtype (every build and run path sets "bf16"), not the training
+        // arithmetic, and a key that said `dtype=bf16` on every f32 run was
+        // read as though it described the run. The activation storage is
+        // `act=` (emitted by `main` when bf16), the GEMM operands `mm=`.
         // Clamp before rendering: the runtime clamps the workspace and falls
         // back on an unparseable ratio, so fingerprinting the raw values would
         // let two runs with identical arithmetic disagree.
@@ -2163,7 +2160,6 @@ impl CompileOptions {
         let mut fields = vec![
             format!("ad={}", if self.source_ad { "source" } else { "tape" }),
             format!("det={}", b(self.determinism.enabled)),
-            format!("dtype={dtype}"),
             format!("fusion={}", if self.fusion.disabled { "off" } else { "on" }),
             format!("fuse_rms={}", b(self.fusion.rmsnorm_backward)),
             format!("fuse_wgrad={}", b(self.fusion.wgrad_accum)),
@@ -2174,9 +2170,6 @@ impl CompileOptions {
             format!("muon_resmom={}", b(self.muon.resident_momentum)),
             format!("lmhead={lmhead}"),
             // --- matmul arithmetic (was the NSL_MATMUL_BF16* env family) ---
-            // `dtype` above is the MODEL dtype and defaults to bf16 whatever
-            // the GEMMs do, so it never carried this and reading it as though
-            // it did is the mistake these keys exist to prevent.
             format!("mm={}", mm.mode.as_str()),
             format!("mmround={}", mm.bf16_rounding.as_str()),
             format!("mmratio={}", mm.bf16_min_ratio),
@@ -2672,14 +2665,12 @@ mod exec_fingerprint_tests {
     }
 
     #[test]
-    fn the_matmul_mode_changes_the_fingerprint_but_dtype_does_not() {
+    fn the_matmul_mode_changes_the_fingerprint_and_no_dtype_key_pretends_to() {
         // THE BUG THIS FEATURE EXISTS FOR. Two checkpoints taken on 2026-09-02
-        // -- one banner-verified TF32, one banner-verified BF16 -- both carry
-        // `dtype=bf16`, because `dtype` is the MODEL dtype and defaults to bf16
-        // whatever the GEMMs do. Anyone auditing a sidecar would read that as
-        // the precision. Pin both halves: `mm` separates them and `dtype` does
-        // not, so a future change that drops `mm` fails here rather than
-        // silently restoring the ambiguity.
+        // -- one banner-verified TF32, one banner-verified BF16 -- both carried
+        // `dtype=bf16`, the profile walker's dtype, which every build set to
+        // bf16 whatever the GEMMs did. Anyone auditing a sidecar read that as
+        // the precision. `mm` separates them; the misleading key is gone.
         let mut tf32 = CompileOptions::default();
         tf32.matmul.mode = MatmulMode::Tf32;
         let mut bf16 = CompileOptions::default();
@@ -2690,18 +2681,10 @@ mod exec_fingerprint_tests {
         assert!(b.contains("mm=bf16"), "{b}");
         assert_ne!(a, b, "the matmul mode must change the fingerprint");
 
-        // ...and the key that LOOKS like it covers this is identical in both.
-        let dt = |s: &str| {
-            s.split(',')
-                .find(|kv| kv.starts_with("dtype="))
-                .unwrap()
-                .to_string()
-        };
-        assert_eq!(
-            dt(&a),
-            dt(&b),
-            "`dtype` must NOT be read as the GEMM mode -- it is the model dtype"
-        );
+        // ...and nothing that LOOKS like a precision key and is not one.
+        for fp in [&a, &b] {
+            assert!(!fp.split(',').any(|kv| kv.starts_with("dtype=")), "{fp}");
+        }
     }
 
     #[test]
@@ -2746,7 +2729,7 @@ mod exec_fingerprint_tests {
         // absent key as "a build that predates it" and SKIPS the check. A
         // default build must therefore state every key explicitly.
         for key in [
-            "ad=", "det=", "dtype=", "fusion=", "fuse_rms=", "fuse_wgrad=", "zero=", "zero_elem=",
+            "ad=", "det=", "fusion=", "fuse_rms=", "fuse_wgrad=", "zero=", "zero_elem=",
             "ws=", "muon_bns=", "muon_resmom=", "lmhead=", "arena=", "graphs=", "ckpt=", "offload=",
             "fa_mma=", "lce_gemm=", "fase_sumsq=", "fase_override=", "csha_save=",
         ] {
@@ -2755,48 +2738,16 @@ mod exec_fingerprint_tests {
     }
 
     #[test]
-    fn a_hostile_dtype_cannot_break_out_of_the_sidecar_json() {
-        // The record is embedded as `"exec":"<fp>"` in the sidecar header. A
-        // quote or a backslash would terminate that string and corrupt the
-        // whole header; a comma or an `=` would forge a field the runtime
-        // then compares. None may survive.
-        let mut o = CompileOptions {
+    fn the_profile_dtype_does_not_reach_the_record() {
+        // `CompileOptions::dtype` is the profile walker's cost dtype. It is
+        // not arithmetic, so it is not recorded -- not even sanitized: a
+        // hostile value (once a JSON break-out risk in the sidecar) leaves the
+        // record byte-identical to a default build's.
+        let o = CompileOptions {
             dtype: r#"f32","evil":"x,y=z\"#.to_string(),
             ..Default::default()
         };
-        let fp = o.exec_fingerprint();
-        let dtype_field = fp
-            .split(',')
-            .find(|s| s.starts_with("dtype="))
-            .expect("dtype field present");
-        assert!(
-            !dtype_field.contains('"') && !dtype_field.contains('\\'),
-            "quote or backslash survived into the record: {dtype_field}"
-        );
-        assert_eq!(
-            fp.matches("dtype=").count(),
-            1,
-            "a separator survived and forged a second field: {fp}"
-        );
-        // The hostile text may survive as literal characters INSIDE the dtype
-        // value — that is harmless. What must not survive is its structure:
-        // the record still has exactly the field count a default build emits,
-        // so nothing was forged into a key the runtime would compare.
-        assert_eq!(
-            fp.split(',').count(),
-            CompileOptions::default().exec_fingerprint().split(',').count(),
-            "a hostile dtype changed the FIELD COUNT of the record: {fp}"
-        );
-        assert!(
-            fp.split(',').all(|f| f.matches('=').count() == 1),
-            "a segment carries more than one '=', so key/value split is ambiguous: {fp}"
-        );
-
-        o.dtype = "BF16-SR".to_string();
-        assert!(
-            o.exec_fingerprint().contains("dtype=bf16-sr"),
-            "ordinary dtypes must round-trip lowercased, not be mangled"
-        );
+        assert_eq!(o.exec_fingerprint(), CompileOptions::default().exec_fingerprint());
     }
 
     /// The five compile-time behavior-tier reads reach the fingerprint, with

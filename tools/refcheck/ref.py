@@ -8,6 +8,7 @@ transposes and a gradient or an update can be compared tensor against tensor.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
@@ -244,6 +245,55 @@ def batch_from_stream(
     labels = torch.full_like(ids, -100)
     labels[:, :-1] = ids[:, 1:]
     return ids, labels
+
+
+def autocast(mode: str | None) -> contextlib.AbstractContextManager[object]:
+    """The PyTorch twin's mixed-precision context: `torch.autocast` to bf16 for
+    `mode == "bf16"` (what NSL's `precision="bf16"` is held to), else none."""
+    if mode == "bf16":
+        return torch.autocast("cuda", dtype=torch.bfloat16)
+    return contextlib.nullcontext()
+
+
+def relative_errors(
+    got: dict[str, np.ndarray], ref: dict[str, np.ndarray]
+) -> dict[str, float]:
+    """Per tensor, ||got - ref|| / ||ref|| (f64)."""
+    return {
+        name: float(np.linalg.norm(got[name] - r) / (np.linalg.norm(r) + 1e-300))
+        for name, r in ref.items()
+    }
+
+
+@dataclass(frozen=True)
+class Spread:
+    """Median and worst of a set of per-tensor relative errors."""
+
+    median: float
+    worst: float
+
+    @staticmethod
+    def of(errors: dict[str, float]) -> Spread:
+        values = list(errors.values())
+        return Spread(float(np.median(values)), max(values))
+
+
+def bf16_criterion(nsl: list[Spread], autocast_: list[Spread]) -> tuple[bool, str]:
+    """The pass criterion for bf16 activation storage (design 6.2), fixed before
+    any run: for EVERY batch, NSL's median and worst per-tensor error against
+    PyTorch f32 are no larger than the LARGEST corresponding value PyTorch
+    autocast shows against PyTorch f32 over the batches."""
+    med = max(s.median for s in autocast_)
+    worst = max(s.worst for s in autocast_)
+    bad = [i for i, s in enumerate(nsl) if s.median > med or s.worst > worst]
+    verdict = (
+        f"bf16 criterion: NSL median/worst per batch "
+        f"{', '.join(f'{s.median:.2e}/{s.worst:.2e}' for s in nsl)} against autocast's "
+        f"largest {med:.2e}/{worst:.2e}"
+    )
+    if bad:
+        return False, f"FAIL {verdict} (batches {bad} exceed it)"
+    return True, f"ok {verdict}"
 
 
 def warmup_cosine(

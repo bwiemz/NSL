@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from ref import SIZES, RefModel, batch_from_stream, read_nslm, warmup_cosine
+from ref import SIZES, RefModel, autocast, batch_from_stream, read_nslm, warmup_cosine
 
 
 def main() -> None:
@@ -51,6 +51,12 @@ def main() -> None:
         action="store_true",
         help="allow TF32 matmuls, NSL's default arithmetic",
     )
+    ap.add_argument(
+        "--autocast",
+        choices=["bf16"],
+        help='train under torch.autocast (the twin of NSL\'s precision="bf16"); '
+        "the held-out loss stays f32, as NSL's eval outside the train block does",
+    )
     a = ap.parse_args()
 
     torch.backends.cuda.matmul.allow_tf32 = a.tf32
@@ -65,7 +71,8 @@ def main() -> None:
     )
     start = time.time()
     for micro in range(a.micro_steps):
-        loss = model.loss(*batch_from_stream(tokens, micro, a.batch, seq))
+        with autocast(a.autocast):
+            loss = model.loss(*batch_from_stream(tokens, micro, a.batch, seq))
         (loss / a.accum).backward()
         if (micro + 1) % a.print_every == 0:
             print(f"micro {micro + 1} loss {loss.item():.4f}", flush=True)

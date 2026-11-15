@@ -131,8 +131,9 @@ unsafe impl Send for Plan {}
 /// Shape key. `None` plans are negative entries: the heuristic (or a launch)
 /// failed for this shape once, so every later call takes the GemmEx fallback
 /// without re-querying per GEMM.
-/// (opa, opb, m, n, k, lda, ldb, ldc, log2 of the pointer alignment class).
-type Key = (i32, i32, i32, i32, i32, i32, i32, i32, u32);
+/// (opa, opb, m, n, k, lda, ldb, ldc, log2 of the pointer alignment class,
+/// C/D stored bf16 rather than f32).
+type Key = (i32, i32, i32, i32, i32, i32, i32, i32, u32, bool);
 
 /// Roadmap A4 step 3a: was a `PLANS` `LazyLock<Mutex<..>>` static; now one
 /// map per device, parked on the CUDA context and keyed by this type. The
@@ -356,9 +357,11 @@ unsafe fn build_plan(
     ldb: i32,
     ldc: i32,
     align_log2: u32,
+    c_bf16: bool,
 ) -> Option<Plan> {
     let ok = lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS;
     let (_, ws_bytes) = workspace();
+    let c_type = if c_bf16 { lt::cudaDataType_t::CUDA_R_16BF } else { lt::cudaDataType_t::CUDA_R_32F };
     let align = 1u32 << align_log2;
 
     let mut desc: lt::cublasLtMatmulDesc_t = std::ptr::null_mut();
@@ -400,13 +403,7 @@ unsafe fn build_plan(
             let (b_rows, b_cols) = if opb == 0 { (k, n) } else { (n, k) };
             if lt::cublasLtMatrixLayoutCreate(&mut adesc, bf16, a_rows as u64, a_cols as u64, lda as i64) != ok
                 || lt::cublasLtMatrixLayoutCreate(&mut bdesc, bf16, b_rows as u64, b_cols as u64, ldb as i64) != ok
-                || lt::cublasLtMatrixLayoutCreate(
-                    &mut cdesc,
-                    lt::cudaDataType_t::CUDA_R_32F,
-                    m as u64,
-                    n as u64,
-                    ldc as i64,
-                ) != ok
+                || lt::cublasLtMatrixLayoutCreate(&mut cdesc, c_type, m as u64, n as u64, ldc as i64) != ok
             {
                 break 'build false;
             }
@@ -519,6 +516,7 @@ unsafe fn build_plan(
                 cdesc,
                 ws_bytes,
                 lt::cudaDataType_t::CUDA_R_16BF,
+                c_type,
                 lt::cublasComputeType_t::CUBLAS_COMPUTE_32F,
             )
         });
@@ -569,6 +567,31 @@ pub(crate) unsafe fn matmul_bf16_f32(
     c: *mut f32,
     ldc: i32,
 ) -> bool {
+    // SAFETY: forwarded unchanged; an f32 C/D.
+    unsafe { matmul_bf16(opa, opb, m, n, k, alpha, a16, lda, b16, ldb, beta, c as *mut std::ffi::c_void, ldc, false) }
+}
+
+/// [`matmul_bf16_f32`] with the C/D buffer stored bf16 (`c_bf16`) or f32:
+/// bf16 activation storage writes a GEMM's activation output as bf16, the
+/// f32 accumulator rounded once by the epilogue. The plan cache keys on the
+/// output type, so the two never share a plan.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn matmul_bf16(
+    opa: i32,
+    opb: i32,
+    m: i32,
+    n: i32,
+    k: i32,
+    alpha: &f32,
+    a16: *const std::ffi::c_void,
+    lda: i32,
+    b16: *const std::ffi::c_void,
+    ldb: i32,
+    beta: &f32,
+    c: *mut std::ffi::c_void,
+    ldc: i32,
+    c_bf16: bool,
+) -> bool {
     if !(opa == 0 || opa == 1) || !(opb == 0 || opb == 1) {
         FALLBACKS.fetch_add(1, Ordering::Relaxed);
         print_fallback_once("unexpected operand op");
@@ -583,7 +606,7 @@ pub(crate) unsafe fn matmul_bf16_f32(
     // path): an operand at an odd offset gets its own plan instead of failing,
     // and poisoning, the aligned shape's.
     let align_log2 = ((a16 as usize) | (b16 as usize) | (c as usize) | 256).trailing_zeros();
-    let key: Key = (opa, opb, m, n, k, lda, ldb, ldc, align_log2);
+    let key: Key = (opa, opb, m, n, k, lda, ldb, ldc, align_log2, c_bf16);
     // Plan lookup / creation. The map lock is NOT held across build_plan
     // (which synchronizes the device while timing) nor across the launch —
     // holding a lock over device-blocking work is how unrelated paths
@@ -607,7 +630,7 @@ pub(crate) unsafe fn matmul_bf16_f32(
             }
             // SAFETY: forwarded pointers are the caller's live operands.
             let plan =
-                unsafe { build_plan(handle, opa, opb, m, n, k, a16, lda, b16, ldb, ldc, align_log2) };
+                unsafe { build_plan(handle, opa, opb, m, n, k, a16, lda, b16, ldb, ldc, align_log2, c_bf16) };
             let tuple = plan
                 .as_ref()
                 .map(|p| (p.desc, p.adesc, p.bdesc, p.cdesc, p.algo, p.ws_bytes));
@@ -668,7 +691,7 @@ pub(crate) unsafe fn matmul_bf16_f32(
             beta as *const f32 as *const std::ffi::c_void,
             c as *const std::ffi::c_void,
             cdesc,
-            c as *mut std::ffi::c_void,
+            c,
             cdesc,
             &algo,
             ws_ptr as *mut std::ffi::c_void,
@@ -854,6 +877,7 @@ unsafe fn enumerate_configs(
     cdesc: lt::cublasLtMatrixLayout_t,
     ws_cap: usize,
     ab_type: lt::cudaDataType_t,
+    c_type: lt::cudaDataType_t,
     ct: lt::cublasComputeType_t,
 ) -> Vec<Candidate> {
     let ok = lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS;
@@ -862,7 +886,7 @@ unsafe fn enumerate_configs(
     let mut nids = 0i32;
     // SAFETY: out-array of 128 ints and an out-count, as the API documents.
     if unsafe {
-        lt::cublasLtMatmulAlgoGetIds(handle, ct, f32t, ab_type, ab_type, f32t, f32t, 128, ids.as_mut_ptr(), &mut nids)
+        lt::cublasLtMatmulAlgoGetIds(handle, ct, f32t, ab_type, ab_type, c_type, c_type, 128, ids.as_mut_ptr(), &mut nids)
     } != ok
     {
         return Vec::new();
@@ -890,7 +914,7 @@ unsafe fn enumerate_configs(
     for &id in &ids[..nids.clamp(0, 128) as usize] {
         // SAFETY: zeroed POD out-struct, filled by AlgoInit before any read.
         let mut algo: lt::cublasLtMatmulAlgo_t = unsafe { std::mem::zeroed() };
-        if unsafe { lt::cublasLtMatmulAlgoInit(handle, ct, f32t, ab_type, ab_type, f32t, f32t, id, &mut algo) } != ok {
+        if unsafe { lt::cublasLtMatmulAlgoInit(handle, ct, f32t, ab_type, ab_type, c_type, c_type, id, &mut algo) } != ok {
             continue;
         }
         let tiles = cap_list(&algo, lt::cublasLtMatmulAlgoCapAttributes_t::CUBLASLT_ALGO_CAP_TILE_IDS);
@@ -1122,6 +1146,7 @@ unsafe fn tf32_build_plan(
                 bdesc,
                 cdesc,
                 ws_bytes,
+                f32t,
                 f32t,
                 lt::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32,
             )
