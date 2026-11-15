@@ -503,7 +503,8 @@ unsafe fn build_plan(
     let tune = tune_enabled()
         && !super::graph_capture::enabled()
         && !crate::deterministic_ops::is_deterministic()
-        && out_bytes <= TUNE_SCRATCH_CAP_BYTES;
+        && out_bytes <= TUNE_SCRATCH_CAP_BYTES
+        && tune_budget_allows(shapes_tuned());
     // Timed selection also tries the enumerated large-tile configurations (the
     // heuristic's few candidates rarely include the fastest kernel; see the
     // TF32 section), when the operands have the alignment `AlgoCheck` assumes.
@@ -598,6 +599,12 @@ pub(crate) unsafe fn matmul_bf16_f32(
             return false;
         }
         None => {
+            // The default route (no --bf16-lt) is here only to be timed: past
+            // the budget a new shape goes back to GemmEx, uncached.
+            if !enabled() && !tune_budget_allows(shapes_tuned()) {
+                print_budget_once();
+                return false;
+            }
             // SAFETY: forwarded pointers are the caller's live operands.
             let plan =
                 unsafe { build_plan(handle, opa, opb, m, n, k, a16, lda, b16, ldb, ldc, align_log2) };
@@ -761,6 +768,34 @@ const ENUM_TILES: [i32; 5] = [19, 20, 21, 23, 24];
 
 /// Candidates re-timed in the second round of a tune.
 const TUNE_FINALISTS: usize = 4;
+
+/// Shapes a process times, over both paths. A training step has a few dozen
+/// distinct GEMM shapes; a program whose shapes keep changing (prefill over
+/// prompts of every length, say) would otherwise pay a tune, and grow the plan
+/// caches, for each new one. Past the budget a new TF32 shape takes
+/// `cublasSgemm` and a new bf16 one GemmEx (or `--bf16-lt`'s untimed pick);
+/// shapes already tuned keep their plans.
+const TUNE_BUDGET_SHAPES: u64 = 128;
+
+/// Whether one more shape may be timed, given how many have been.
+fn tune_budget_allows(tuned_so_far: u64) -> bool {
+    tuned_so_far < TUNE_BUDGET_SHAPES
+}
+
+/// Shapes timed so far, both paths.
+fn shapes_tuned() -> u64 {
+    TUNED.load(Ordering::Relaxed) + TF32_TUNED.load(Ordering::Relaxed)
+}
+
+fn print_budget_once() {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        crate::nsl_log!(INFO, "nsl-matmul",
+            "[nsl-matmul] {TUNE_BUDGET_SHAPES} GEMM shapes timed: new shapes from here on \
+             take cuBLAS's own pick (already timed shapes keep theirs)"
+        );
+    }
+}
 
 static TF32_ISSUED: AtomicU64 = AtomicU64::new(0);
 static TF32_TUNED: AtomicU64 = AtomicU64::new(0);
@@ -1243,6 +1278,10 @@ pub(crate) unsafe fn matmul_f32_tf32(
             return false;
         }
         None => {
+            if !tune_budget_allows(shapes_tuned()) {
+                print_budget_once();
+                return false;
+            }
             // Built outside the cache lock: it synchronizes the device.
             // SAFETY: the caller's live operands for this shape.
             let plan = unsafe { tf32_build_plan(handle, &key, a, b) };
@@ -1352,4 +1391,17 @@ pub(crate) fn reset_for_test() {
     ISSUED.store(0, Ordering::Relaxed);
     TUNED.store(0, Ordering::Relaxed);
     FALLBACKS.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tune_budget_tests {
+    use super::*;
+
+    #[test]
+    fn the_budget_admits_exactly_its_size() {
+        assert!(tune_budget_allows(0));
+        assert!(tune_budget_allows(TUNE_BUDGET_SHAPES - 1));
+        assert!(!tune_budget_allows(TUNE_BUDGET_SHAPES));
+        assert!(!tune_budget_allows(TUNE_BUDGET_SHAPES + 7));
+    }
 }
