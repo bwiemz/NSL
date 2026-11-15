@@ -361,11 +361,18 @@ impl Compiler<'_> {
         let clones = ccr_plan.as_ref().map_or(&empty, |p| &p.recompute_clones);
         let planned = plan(effective_primal, adjoint, clones).map_err(crate::CodegenError::new)?;
         if planned.slices == 0 {
-            nsl_log::nsl_log!(WARN, "bf16-storage",
-                "[bf16-storage] precision=\"bf16\": no SwiGLU MLP block (rmsnorm -> gate/up -> silu * up -> \
-                 down -> residual add) was found, so every activation stays f32; only the GEMMs run in bf16"
-            );
-        } else {
+            // The program's fingerprint (`act=bf16`) and runtime banner were
+            // decided from the key before `main`; with nothing planned they
+            // would describe storage that does not exist.
+            return Err(crate::CodegenError::new(
+                "precision=\"bf16\" found no block it can store in bf16: this phase stores the \
+                 SwiGLU MLP half of a pre-norm block (rmsnorm -> gate and up projections -> \
+                 silu(gate) * up -> down projection -> residual add), and this train step has \
+                 none. For bf16 GEMMs over f32 activations, build with --matmul-mode bf16 and \
+                 leave precision unset",
+            ));
+        }
+        {
             nsl_log::nsl_log!(INFO, "bf16-storage",
                 "[bf16-storage] {} SwiGLU MLP block(s) stored bf16: {} values, {} ops lowered dtype-explicit",
                 planned.slices,

@@ -8,7 +8,13 @@
 //!   and says so, and the same program without the key plans nothing.
 //! * **Refusals**: the compositions this phase does not support are compile
 //!   errors, never a silent f32 run: no `--source-ad`, a disagreeing
-//!   `--matmul-mode`, `--cuda-graphs`, an unknown precision.
+//!   `--matmul-mode`, `--cuda-graphs`, `NSL_MATMUL_BF16=0`,
+//!   `--layerwise-accum` (and `--weight-stream`, which requires it),
+//!   `--param-dtype bf16-sr`, `--checkpoint-compress`, `--transient-arena`,
+//!   `@pipeline`, an unknown precision, and a step with no SwiGLU block to
+//!   store (which would otherwise claim bf16 storage over f32 activations).
+//!   `--cpdt full` and the WGGO moment plan are refused by the same table
+//!   but need a weights file or a WGGO plan this fixture does not have.
 //! * **GPU** (`#[ignore]`, `--features cuda`): the program trains; the
 //!   runtime prints the activation-storage banner; no dtype-explicit op took
 //!   the widen/compute/narrow fallback; and every loss tracks the same
@@ -144,11 +150,18 @@ fn a_block_with_a_dropout_tail_is_planned() {
 #[test]
 fn compositions_this_phase_does_not_support_are_compile_errors() {
     let src = fixture(BF16, false);
-    let cases: [(&[&str], &[(&str, &str)], &str, &str); 4] = [
+    let cases: [(&[&str], &[(&str, &str)], &str, &str); 9] = [
         (&["build"], &[], "requires --source-ad", "no_source_ad"),
         (&["build", "--source-ad", "--matmul-mode", "tf32"], &[], "--matmul-mode tf32 was given", "mm_tf32"),
         (&["build", "--source-ad", "--cuda-graphs"], &[], "does not compose with --cuda-graphs", "graphs"),
         (&["build", "--source-ad"], &[("NSL_MATMUL_BF16", "0")], "NSL_MATMUL_BF16=0", "env0"),
+        (&["build", "--source-ad", "--checkpoint-blocks", "--layerwise-accum"], &[], "does not compose with --layerwise-accum", "layerwise"),
+        // --weight-stream requires --layerwise-accum, so the table names
+        // whichever it reaches first; the point is that it refuses.
+        (&["build", "--source-ad", "--checkpoint-blocks", "--layerwise-accum", "--weight-stream"], &[], "precision=\"bf16\" does not compose with", "weight_stream"),
+        (&["build", "--source-ad", "--param-dtype", "bf16-sr"], &[], "does not compose with --param-dtype bf16-sr", "bf16sr"),
+        (&["build", "--source-ad", "--checkpoint-blocks", "--checkpoint-selective", "--checkpoint-compress", "bf16"], &[], "does not compose with --checkpoint-compress", "compress"),
+        (&["build", "--source-ad", "--transient-arena"], &[], "does not compose with --transient-arena", "arena"),
     ];
     for (args, env, want, stem) in cases {
         let r = nsl(args, &src, stem, false, env);
@@ -156,6 +169,20 @@ fn compositions_this_phase_does_not_support_are_compile_errors() {
     }
     let r = nsl(&["build", "--source-ad"], &fixture(r#", precision="fp8""#, false), "fp8", false, &[]);
     assert!(!r.ok && r.out.contains(r#"must be "f32" or "bf16""#), "{}", r.out);
+
+    // The pipelined path is lowered without the storage plan: the program's
+    // banner and fingerprint would say bf16 over f32 activations.
+    let pipelined = src.replacen("    b1: Block = Block()", "    @pipeline(stages = 2)\n    b1: Block = Block()", 1);
+    assert_ne!(pipelined, src, "the fixture no longer has the field the @pipeline case decorates");
+    let r = nsl(&["build", "--source-ad"], &pipelined, "pipeline", false, &[]);
+    assert!(!r.ok && r.out.contains("not supported on the pipelined train path"), "{}", r.out);
+
+    // A step with nothing this phase can store (a GELU MLP instead of
+    // SwiGLU) is refused rather than built claiming bf16 storage.
+    let gelu = src.replacen("silu(n @ self.w_gate)", "gelu(n @ self.w_gate)", 1);
+    assert_ne!(gelu, src, "the fixture no longer has the silu the GELU case replaces");
+    let r = nsl(&["build", "--source-ad"], &gelu, "gelu", false, &[]);
+    assert!(!r.ok && r.out.contains("found no block it can store in bf16"), "{}", r.out);
 }
 
 fn losses(out: &str) -> Vec<f64> {

@@ -140,12 +140,26 @@ impl Compiler<'_> {
             // believes they are validating bf16 (deferral-must-refuse).
             if self.features.param_dtype_bf16sr {
                 return Err(CodegenError::new(
-                    "--param-dtype bf16-sr is not supported on the pipelined                      train path (@pipeline): the bf16 mirror schedule and the                      fused SR step are not lowered there. Drop one",
+                    "--param-dtype bf16-sr is not supported on the pipelined \
+                     train path (@pipeline): the bf16 mirror schedule and the \
+                     fused SR step are not lowered there. Drop one",
                 ));
             }
             if self.features.muon_state_bf16 {
                 return Err(CodegenError::new(
-                    "--muon-state-dtype bf16 is not supported on the pipelined                      train path (@pipeline): the CSLA state envelope is not                      lowered there. Drop one",
+                    "--muon-state-dtype bf16 is not supported on the pipelined \
+                     train path (@pipeline): the CSLA state envelope is not \
+                     lowered there. Drop one",
+                ));
+            }
+            // bf16 activation storage is planned over the non-pipelined
+            // step only: here the program's GEMM mode, fingerprint (`act=`)
+            // and banner would say bf16 while every activation stays f32.
+            if self.activation_bf16 {
+                return Err(CodegenError::new(
+                    "precision=\"bf16\" is not supported on the pipelined train \
+                     path (@pipeline): the bf16 storage plan is not lowered \
+                     there. Drop one",
                 ));
             }
             // P5 item 19: the pipelined path lowers its stages outside the
