@@ -100,7 +100,9 @@ ARENA_FLAGS = [*WS_FLAGS, "--stream-arena"]
 # The weight-stream residency policy keeps every parameter resident while free VRAM at
 # the first registration exceeds a reserve (half the card); NSL_WS_RESIDENT=0 streams
 # every layer-grouped parameter whatever the card has free. Read at run time.
-WS_ALL = (("NSL_WS_RESIDENT", "0"),)
+# NSL_WS_COUNTER=1 prints the transfer counters and the residency decision at exit.
+WS_ENV = (("NSL_WS_COUNTER", "1"),)
+WS_ALL = (*WS_ENV, ("NSL_WS_RESIDENT", "0"))
 # (flags, run-time environment, grad_clip=1.0 in the train block) per arm suffix; the
 # arm `nsl_<tf32|bf16>_<suffix>` builds in that precision.
 MEMORY_ARMS: dict[str, tuple[list[str], tuple[tuple[str, str], ...], bool]] = {
@@ -112,17 +114,20 @@ MEMORY_ARMS: dict[str, tuple[list[str], tuple[tuple[str, str], ...], bool]] = {
     "moment": ([*PROD_FLAGS, "--wggo", "greedy", "--wggo-memory-budget", "8192"], (), True),
     "nockpt": ([f for f in PROD_FLAGS if not f.startswith("--checkpoint")], (), True),
     "stride2": ([*PROD_FLAGS, "--checkpoint-stride", "2"], (), True),
+    # Full recompute, but the most expensive interiors (by the planner's operation
+    # count) stay saved up to 3 GiB: between --checkpoint-blocks and -selective.
+    "budget3g": ([*BLOCKS_FLAGS, "--checkpoint-budget-mib", "3072"], (), True),
     "asyncalloc": (PROD_FLAGS, (("NSL_ASYNC_ALLOC", "1"),), True),
     "nowgrad_noclip": (NOWGRAD_FLAGS, (), False),
     "lwsel": ([*NOWGRAD_FLAGS, "--layerwise-accum"], (), False),
     "blocks_nowgrad_noclip": ([f for f in BLOCKS_FLAGS if f != "--fuse-wgrad-accum"], (), False),
     "lw": (LW_FLAGS, (), False),
-    "ws": (WS_FLAGS, (), False),
+    "ws": (WS_FLAGS, WS_ENV, False),
     "wsall": (WS_FLAGS, WS_ALL, False),
     "wsarena": (ARENA_FLAGS, WS_ALL, False),
     "wsprefetch": ([*ARENA_FLAGS, "--stream-prefetch"], WS_ALL, False),
     "wsasync": ([*ARENA_FLAGS, "--stream-prefetch", "--stream-async-writeback"], WS_ALL, False),
-    "srbf16": ([*WS_FLAGS, "--param-dtype", "bf16-sr"], (), False),
+    "srbf16": ([*WS_FLAGS, "--param-dtype", "bf16-sr"], WS_ENV, False),
     "zero1": ([*PROD_FLAGS, "--zero-stage", "1"], (), False),
 }
 BF16_BANNER = "cuBLAS math mode: BF16"
