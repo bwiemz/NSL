@@ -37,9 +37,14 @@ from pathlib import Path
 from typing import Any
 
 CATEGORIES: list[tuple[str, str]] = [
+    # torch.compile's generated kernels are named after every op they fuse
+    # ("triton_poi_fused__scaled_dot_product_flash_attention_..._mul_neg" is RoPE),
+    # so they get their own bucket rather than whichever op name matches first.
+    ("triton_fused", r"^triton_"),
     ("attention", r"flash|fmha|sdpa|attention|attn"),
     ("cross_entropy", r"cross_entropy|crossentropy|lce|log_softmax|logsoftmax|nll|softmax"),
-    ("optimizer", r"adam|fase|lamb|multi_tensor_apply|FusedAdam"),
+    # Not "lamb": PyTorch's elementwise kernels are named after their lambdas.
+    ("optimizer", r"adam|fase_|multi_tensor_apply|FusedOptimizer|LpNorm|lpnorm_cleanup"),
     ("gemm", r"gemm|nvjet|cutlass|xmma|cublas|sgemm|splitk|sm\d+_xmma|ampere_|Kernel2"),
     ("norm", r"rmsnorm|rms_norm|layernorm|norm"),
     ("rope", r"rope|rotary"),

@@ -25,9 +25,10 @@ NSL_MATMUL_BF16=1 (read at build time on main; the runtime's banner is checked).
 <none|blocks|sel>`: `torch_arm.py` with that precision, compilation and checkpointing.
 
 Timing: a step-limited program per arm (the token file holds exactly `--updates`
-optimizer updates), one stamp per optimizer update when its loss reaches the host,
-the first `--warmup` updates discarded. tok/s is updates x tokens-per-update over the
-wall time between the first and last kept stamps.
+optimizer updates), one stamp per optimizer update when its loss reaches the host.
+The window opens at stamp `--warmup` (0-based), so `--updates - --warmup - 1` updates
+are timed (15 of 24 by default): tok/s is those updates x tokens-per-update over the
+wall time between the window's first and last stamps.
 
 Memory, three numbers per arm, all whole-process peaks:
   alloc     the caching allocator's peak of bytes handed out to tensors
@@ -434,6 +435,7 @@ def run_stamped(
 
 
 def steady(stamps: list[float], warmup: int, tokens_per_update: int) -> dict[str, Any] | None:
+    """Throughput and spread over the updates between `stamps[warmup]` and the last stamp."""
     window = stamps[warmup:]
     if len(window) < 3:
         return None
@@ -809,6 +811,7 @@ def cmd_nsys(args: argparse.Namespace) -> int:
         d = work / flag_key(a.build_key)
         binary = d / ("prog_phase" if args.phase else "prog")
         env = nsl_env()
+        env.update(dict(a.build_env))
         env.update(dict(a.env))
         cmd, cwd = [*nsys, str(binary)], d
     else:
@@ -823,7 +826,7 @@ def cmd_nsys(args: argparse.Namespace) -> int:
                "--seq", str(shape.seq), "--accum", str(shape.accum),
                "--updates", str(args.updates), "--warmup-updates", str(args.warmup),
                "--tokens", str(tokens_file(work, shape, args.updates)),
-               "--out", str(out)]  # fmt: skip
+               "--out", str(out), "--no-kernel-probe"]  # fmt: skip
         if a.compile:
             cmd.append("--compile")
         if args.phase:
@@ -871,6 +874,15 @@ def phase_split(r: dict[str, Any]) -> dict[str, float] | None:
     return {"wall": wall, "fwd": f, "bwd": b, "opt": o, "other": wall - f - b - o}
 
 
+REPORT_ORDER = [
+    "nsl_tf32", "nsl_tf32_nodrain", "nsl_tf32_blocks", "nsl_tf32_compress",
+    "nsl_bf16", "nsl_bf16_nodrain", "nsl_bf16_blocks", "nsl_bf16_compress",
+    "torch_tf32_eager_sel", "torch_tf32_eager_blocks", "torch_tf32_eager_none",
+    "torch_bf16_eager_sel", "torch_bf16_eager_blocks", "torch_bf16_eager_none",
+    "torch_bf16_compile_sel", "torch_bf16_compile_blocks", "torch_bf16_compile_none",
+]  # fmt: skip
+
+
 def cmd_report(args: argparse.Namespace) -> int:
     out = args.out.resolve()
     roof_path = out / "roofline.json"
@@ -880,6 +892,8 @@ def cmd_report(args: argparse.Namespace) -> int:
         for f in sorted((work / "results").glob("*.json")):
             r = json.loads(f.read_text())
             rows.setdefault(r["arm"], []).append(r)
+        order = [*REPORT_ORDER, *sorted(set(rows) - set(REPORT_ORDER))]
+        rows = {k: rows[k] for k in order if k in rows}
         print(f"\n### {work.name}\n")
         print(
             "| arm | rounds | tok/s median [min-max] | s/update median | within-round CV | "

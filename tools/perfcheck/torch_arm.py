@@ -231,6 +231,12 @@ def main() -> int:
         help="synchronise around forward / backward / optimizer and record each "
         "(an instrumented run: its update times are not the arm's throughput)",
     )
+    ap.add_argument(
+        "--no-kernel-probe",
+        action="store_true",
+        help="skip the torch.profiler check that flash attention ran (under Nsight "
+        "Systems, which holds the only CUPTI subscription; the trace shows the kernels)",
+    )
     a = ap.parse_args()
 
     directory, base_cfg = SIZES[a.size]
@@ -321,7 +327,7 @@ def main() -> int:
                 res.phase_peaks.append(peaks)
             res.losses.append(loss.item())  # the once-per-update sync NSL also pays
             res.stamps.append(time.perf_counter())
-            if update == 1:
+            if update == 1 and not a.no_kernel_probe:
                 # Identify the kernels after compilation and allocator warm-up, on a
                 # micro-step whose gradient is thrown away before the next update.
                 ids, labels = batch_from_stream(tokens, 0, a.micro_batch, a.seq)
