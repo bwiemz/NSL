@@ -28,6 +28,8 @@ Arms. `nsl_tf32`: the 1B production posture (PROD_FLAGS, f32 weights, the runtim
 default TF32 cuBLAS math mode). `nsl_bf16`: the same flags built and run with
 NSL_MATMUL_BF16=1 (read at build time; the runtime's banner is checked, and since
 2026-11 a binary run with a disagreeing NSL_MATMUL_BF16 refuses to start).
+`nsl_bf16s`: PROD_FLAGS with `precision="bf16"` in the train header (bf16 activation
+storage, which also sets the bf16 matmul mode; both banners are checked).
 `nsl_*_nodrain`: the same binary under NSL_SKIP_GPU_DRAIN=1. `nsl_*_oldattn`: the same
 binary under NSL_TC_ATTENTION=0 (the attention kernels before the tensor-core ones).
 `nsl_tf32_blocks`: PROD_FLAGS without `--checkpoint-selective` (full block recompute). `torch_<tf32|bf16>_<eager|compile>_
@@ -86,6 +88,9 @@ PROD_FLAGS = [
 BLOCKS_FLAGS = [f for f in PROD_FLAGS if f != "--checkpoint-selective"]
 COMPRESS_FLAGS = [*PROD_FLAGS, "--checkpoint-compress", "bf16"]
 BF16_BANNER = "cuBLAS math mode: BF16"
+ACT_BF16_BANNER = "activation storage: bf16"
+# The train-header text of a bf16 activation-storage arm (`nsl_bf16s`).
+PRECISION_BF16 = ', precision="bf16"'
 TF32_BANNER = "cuBLAS math mode: TF32"
 OOM_MARKERS = ("CUDA_ERROR_OUT_OF_MEMORY", "VRAM free", "out of memory", "OutOfMemory")
 
@@ -181,14 +186,17 @@ class Arm:
     # NSL: which toolchain builds the arm (`<arm>@<variant>`, see `--toolchain`);
     # "" is `--nsl` with the repository's stdlib.
     variant: str = ""
+    # NSL: text appended to the program's `train(...)` header (`PRECISION_BF16`).
+    train_args: str = ""
 
     @property
     def build_key(self) -> BuildKey:
-        return self.flags, self.build_env, self.variant
+        return self.flags, self.build_env, self.variant, self.train_args
 
 
-# (flags, build environment, toolchain variant): one built binary per key.
-BuildKey = tuple[tuple[str, ...], tuple[tuple[str, str], ...], str]
+# (flags, build environment, toolchain variant, train-header text): one built
+# binary per key.
+BuildKey = tuple[tuple[str, ...], tuple[tuple[str, str], ...], str, str]
 
 
 BF16 = (("NSL_MATMUL_BF16", "1"),)
@@ -213,6 +221,7 @@ def arm(name: str) -> Arm:
     nsl = {
         "nsl_tf32": Arm(name, "nsl", "tf32", tuple(PROD_FLAGS)),
         "nsl_bf16": Arm(name, "nsl", "bf16", tuple(PROD_FLAGS), BF16),
+        "nsl_bf16s": Arm(name, "nsl", "bf16", tuple(PROD_FLAGS), train_args=PRECISION_BF16),
         "nsl_tf32_nodrain": Arm(name, "nsl", "tf32", tuple(PROD_FLAGS), (), NO_DRAIN),
         "nsl_bf16_nodrain": Arm(name, "nsl", "bf16", tuple(PROD_FLAGS), BF16, NO_DRAIN),
         "nsl_tf32_oldattn": Arm(name, "nsl", "tf32", tuple(PROD_FLAGS), (), OLD_ATTN),
@@ -232,10 +241,12 @@ def arm(name: str) -> Arm:
 
 
 def flag_key(key: BuildKey) -> str:
-    flags, build_env, variant = key
+    flags, build_env, variant, train_args = key
     tag = "_".join(f.removeprefix("--").replace("-", "") for f in flags)
     if build_env:
         tag += "__" + "_".join(f"{k.removeprefix('NSL_').lower()}{v}" for k, v in build_env)
+    if train_args:
+        tag += "__" + re.sub(r"[^a-z0-9]", "", train_args.lower())
     if variant:
         tag += "@" + variant
     return "nsl_" + tag
@@ -286,7 +297,7 @@ let loader = DataLoader(tokens, batch_size={mb}, seq_len={seq}, shuffle=false, d
 print("LOSS_STREAM_BEGIN")
 
 @fused_lm_ce(enabled=true, vocab_size={vocab}, hidden_size={d_model}, batch_size={mb}, seq_len={seq})
-train(model=m, epochs=1, grad_accumulation={accum}, schedule_unit="optimizer_step", grad_clip=1.0):
+train(model=m, epochs=1, grad_accumulation={accum}, schedule_unit="optimizer_step", grad_clip=1.0{train_args}):
     optimizer: AdamW(lr=0.0001, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
     scheduler: warmup_cosine(warmup_steps=2, total_steps={updates}, min_lr=0.00003)
     step(batch):
@@ -349,7 +360,7 @@ def build_nsl(
     updates: int,
     phase: bool,
 ) -> Path:
-    flags, build_env, variant = key
+    flags, build_env, variant, train_args = key
     nsl = tc.nsl
     d = work / flag_key(key)
     d.mkdir(parents=True, exist_ok=True)
@@ -367,6 +378,7 @@ def build_nsl(
             vocab=shape.vocab,
             d_model=shape.d_model,
             rows=shape.micro_batch * shape.seq,
+            train_args=train_args,
         )
     )
     binary = d / ("prog_phase" if phase else "prog")
@@ -398,6 +410,7 @@ def build_nsl(
                 "updates": updates,
                 "nsl": str(nsl),
                 "variant": variant,
+                "train_args": train_args,
                 "stdlib": str(tc.stdlib),
             },
             indent=1,
@@ -594,7 +607,15 @@ def run_nsl_arm(
     }
     if a.precision == "bf16" and BF16_BANNER not in err:
         row["status"] = "error"
-        row["error"] = "NSL_MATMUL_BF16=1 set but the runtime did not print its BF16 banner"
+        row["error"] = "bf16 arm: the runtime did not print its BF16 math-mode banner"
+    elif a.train_args == PRECISION_BF16 and ACT_BF16_BANNER not in err:
+        row["status"] = "error"
+        row["error"] = (
+            'precision="bf16" arm: the runtime did not print its activation-storage banner'
+        )
+    elif a.train_args != PRECISION_BF16 and ACT_BF16_BANNER in err:
+        row["status"] = "error"
+        row["error"] = "an f32-storage arm printed the bf16 activation-storage banner"
     elif a.precision == "tf32" and TF32_BANNER not in err:
         row["status"] = "error"
         row["error"] = "tf32 arm: the runtime did not print its TF32 math-mode banner"
@@ -1007,7 +1028,7 @@ def phase_split(r: dict[str, Any]) -> dict[str, float] | None:
 
 REPORT_ORDER = [
     "nsl_tf32", "nsl_tf32_nodrain", "nsl_tf32_blocks", "nsl_tf32_compress",
-    "nsl_bf16", "nsl_bf16_nodrain", "nsl_bf16_blocks", "nsl_bf16_compress",
+    "nsl_bf16", "nsl_bf16s", "nsl_bf16_nodrain", "nsl_bf16_blocks", "nsl_bf16_compress",
     "torch_tf32_eager_sel", "torch_tf32_eager_blocks", "torch_tf32_eager_none",
     "torch_bf16_eager_sel", "torch_bf16_eager_blocks", "torch_bf16_eager_none",
     "torch_bf16_compile_sel", "torch_bf16_compile_blocks", "torch_bf16_compile_none",
@@ -1095,6 +1116,7 @@ PAIRS = [
     ("torch_bf16_compile_sel", "nsl_bf16"),
     ("torch_bf16_compile_sel", "nsl_tf32"),
     ("nsl_bf16", "nsl_tf32"),
+    ("nsl_bf16s", "nsl_bf16"),
     ("torch_bf16_eager_sel", "torch_tf32_eager_sel"),
     ("torch_bf16_compile_sel", "torch_bf16_eager_sel"),
     ("nsl_tf32", "nsl_tf32_blocks"),

@@ -114,6 +114,10 @@ pub const PASS_ORDER: &[TrainPassDecl] = &[
     step("AdjointGenPass", &[], Adjoint, "source_ad.rs", "AdjointGenerator::new"),
     step("AdjointTapeOptPass", &[], Adjoint, "stmt_train/adjoint_tape_opt.rs", "optimize_adjoint_tape"),
     step("CcrAdjointFreesPass", &[], Adjoint, "stmt_train/ccr_adjoint_frees.rs", "insert_ccr_adjoint_frees"),
+    // `precision="bf16"`: plans over the final lists (clones spliced, frees
+    // placed, the fused weight-gradient chains fixed), before the memory
+    // planner reads them.
+    step("StoragePlanPass", &[], Adjoint, "stmt_train/storage_plan.rs", "plan_activation_storage"),
     step(
         "ArenaProjectionPass",
         &["MemoryPlanner"],

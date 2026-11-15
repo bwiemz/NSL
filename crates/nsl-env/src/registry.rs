@@ -177,6 +177,15 @@ pub static REGISTRY: &[EnvVar] = &[
         "Test harness only: marks the re-exec'd timing child of the bf16 matmul mode gate, which prints one PROBE line for the parent."
     ),
     var!(
+        "NSL_BLESS_F32_GOLDEN",
+        Bool,
+        "1 only",
+        "unset",
+        Test,
+        Test,
+        "Test harness only: rewrite nsl-kir's f32 PTX goldens from the current builders instead of comparing against them."
+    ),
+    var!(
         "NSL_CAPI_TRACE",
         Bool,
         "any value (presence via var_os().is_some())",
@@ -831,7 +840,7 @@ pub static REGISTRY: &[EnvVar] = &[
         "off (TF32 unless NSL_MATMUL_TF32=0 or strict-matmul)",
         Behavior,
         Both,
-        "Deprecated spelling of --matmul-mode bf16, read when the program is COMPILED; a compiled program run with a disagreeing value refuses."
+        "Deprecated spelling of --matmul-mode bf16, read when COMPILED; train precision=\"bf16\" sets the mode itself and refuses 0. A disagreeing run refuses."
     ),
     var!(
         "NSL_MATMUL_BF16_CAST_CACHE",

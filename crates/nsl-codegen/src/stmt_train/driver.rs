@@ -365,6 +365,9 @@ impl Compiler<'_> {
             self.arena_placements.clear();
             let _ = self.compile_call_by_name(builder, "nsl_arena_destroy", &[]);
         }
+        // `precision="bf16"`: the storage plan is keyed by this block's
+        // VarIds, like the placements above.
+        self.storage_out.clear();
         // Item 17 phase 3a: the packing-metadata variables belong to the
         // train-step function this block just built — a later function
         // (another train block, a grad block, a model method) using them
@@ -421,6 +424,7 @@ impl Compiler<'_> {
             checkpoint_every,
             checkpoint_load_path,
             schedule_in_optimizer_steps,
+            precision_bf16,
         } = self.extract_train_config(builder, train)?;
 
         // ── 2. Resolve the optimizer/scheduler/callbacks contract ───────
@@ -1756,6 +1760,20 @@ impl Compiler<'_> {
                     fase_hook_active,
                     generator: &generator,
                 });
+
+                // 6d.2 `precision="bf16"`: the activation storage plan, over
+                // the final lists (recompute clones spliced, frees placed,
+                // the fused weight-gradient chains fixed) and before the
+                // memory planner reads them. Installed on the compiler for
+                // the lowering; a no-op for an f32 step.
+                self.plan_activation_storage(
+                    crate::stmt_train::storage_plan::StoragePlanInputs {
+                        adjoint: &adjoint,
+                        ccr_plan: &ccr_plan,
+                        effective_primal: &effective_primal,
+                        precision_bf16,
+                    },
+                )?;
 
                 // 6d.5 P0.2 gradient-integrity guard: compute the LIVE adjoint
                 // result-VarId set over the FINAL adjoint (post dead-grad

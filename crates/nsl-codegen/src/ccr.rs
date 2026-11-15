@@ -138,6 +138,11 @@ pub struct CcrPlan {
     /// saves that are freed at the segment's end after all, because the
     /// backward never reads their value.
     pub per_segment_released: Vec<Vec<VarId>>,
+    /// Filled by [`apply_to_adjoint`]: each recompute clone spliced into the
+    /// adjoint, mapped to the primal interior it recomputes. A pass that
+    /// decides something per value (the bf16 storage plan) must decide the
+    /// same for a clone as for its original.
+    pub recompute_clones: HashMap<VarId, VarId>,
 }
 
 impl CcrPlan {
@@ -977,6 +982,7 @@ fn plan_impl(
         per_segment_kept,
         shape_stubs: Vec::new(),
         per_segment_released: Vec::new(),
+        recompute_clones: HashMap::new(),
     })
 }
 
@@ -2158,6 +2164,7 @@ pub fn apply_to_adjoint(
 
     plan.shape_stubs = shape_stubs;
     plan.per_segment_released = per_segment_released;
+    plan.recompute_clones = remap.iter().map(|(original, clone)| (*clone, *original)).collect();
     validate(primal, adjoint, plan)?;
     Ok(summary)
 }

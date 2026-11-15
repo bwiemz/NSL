@@ -546,8 +546,8 @@ block0(v0: i32, v1: i64):
     v6 = iconst.i64 28
     call fn1(v4, v2, v5, v3, v6)  ; v4 = 0, v5 = 0x0002_2746, v6 = 28
     v7 = symbol_value.i64 gv2
-    v8 = iconst.i64 296
-    v9 = call fn2(v7, v8)  ; v8 = 296
+    v8 = iconst.i64 285
+    v9 = call fn2(v7, v8)  ; v8 = 285
     v10 = iconst.i64 0
     v11 = iconst.i64 0
     v12 = f64const 0x1.0000000000000p9

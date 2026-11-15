@@ -41,6 +41,34 @@ pub extern "C" fn nsl_storage_dt_fallback_count() -> i64 {
     FALLBACKS.load(Ordering::Relaxed) as i64
 }
 
+/// The program's activation storage, as `main` declared it (a train block's
+/// `precision="bf16"`); f32 unless declared.
+static ACTIVATION_STORAGE: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(DTYPE_F32);
+
+/// Declare the program's activation storage. Compiled `main` calls it, beside
+/// the matmul configuration, only for a `precision="bf16"` program, and the
+/// banner it prints is what a harness checks to know the arm it measured
+/// really stored activations bf16.
+#[unsafe(no_mangle)]
+pub extern "C" fn nsl_set_activation_storage(dtype: i64) {
+    let tag = out_tag("nsl_set_activation_storage", dtype);
+    ACTIVATION_STORAGE.store(tag, Ordering::Relaxed);
+    if tag == DTYPE_BF16 {
+        crate::nsl_log!(
+            INFO,
+            "nsl-matmul",
+            "[nsl-matmul] activation storage: bf16 (train precision=\"bf16\": the planned activations \
+             and activation gradients are stored bf16, each rounded once from f32 arithmetic; \
+             parameters, their gradients, the optimizer state and the residual stream stay f32)"
+        );
+    }
+}
+
+/// The activation storage `main` declared (`DTYPE_F32` or `DTYPE_BF16`).
+pub fn activation_storage() -> u16 {
+    ACTIVATION_STORAGE.load(Ordering::Relaxed)
+}
+
 fn refuse_tape(op: &str) {
     if crate::autodiff::is_recording() {
         crate::fatal::die(
@@ -108,10 +136,57 @@ fn widened(ptr: i64) -> i64 {
     let t = NslTensor::from_ptr_ref(ptr);
     if t.dtype == DTYPE_F32 {
         t.refcount.fetch_add(1, Ordering::SeqCst);
-        ptr
-    } else {
-        crate::tensor::precision_cast::convert_untaped(ptr, DTYPE_F32)
+        return ptr;
     }
+    #[cfg(feature = "cuda")]
+    if t.device > 0 && !t.is_contiguous() && let Some(w) = widened_dense_view(t) {
+        return w;
+    }
+    crate::tensor::precision_cast::convert_untaped(ptr, DTYPE_F32)
+}
+
+/// A strided bf16 GPU view whose elements are exactly the `len` contiguous
+/// elements from its data pointer, in some order (a transpose or other
+/// permutation of a contiguous tensor; the weight-gradient GEMM's `x^T`):
+/// widen that block and give the f32 copy the same shape and strides. The
+/// generic path would make the view contiguous first, which the GPU's f32
+/// strided copy refuses for a 2-byte element.
+#[cfg(feature = "cuda")]
+fn widened_dense_view(t: &NslTensor) -> Option<i64> {
+    let nd = t.ndim as usize;
+    if nd == 0 || t.len <= 0 {
+        return None;
+    }
+    let shape: Vec<i64> = (0..nd).map(|i| unsafe { *t.shape.add(i) }).collect();
+    let strides: Vec<i64> = (0..nd).map(|i| unsafe { *t.strides.add(i) }).collect();
+    // Dense: ordered by stride (size-1 dims carry no stride information),
+    // each stride is the product of the sizes of the dims inside it.
+    let mut dims: Vec<usize> = (0..nd).filter(|&i| shape[i] != 1).collect();
+    dims.sort_by_key(|&i| strides[i]);
+    let mut expect = 1i64;
+    for &i in &dims {
+        if strides[i] != expect {
+            return None;
+        }
+        expect *= shape[i];
+    }
+    if expect != t.len {
+        return None;
+    }
+    let n = t.len as usize;
+    crate::cuda::inner::set_oom_context("storage_dt widen");
+    let buf = crate::cuda::inner::alloc_managed(n * 4);
+    crate::cuda::gpu_cast_raw_bf16_to_f32(t.data as u64, buf as u64, n);
+    let sh = crate::memory::checked_alloc(nd * std::mem::size_of::<i64>()) as *mut i64;
+    let st = crate::memory::checked_alloc(nd * std::mem::size_of::<i64>()) as *mut i64;
+    for i in 0..nd {
+        unsafe {
+            *sh.add(i) = shape[i];
+            *st.add(i) = strides[i];
+        }
+    }
+    let out = Box::new(NslTensor::new(buf, sh, st, nd as i64, t.len, t.device, DTYPE_F32, 1, 0));
+    Some(Box::into_raw(out) as i64)
 }
 
 /// `r` (owned, f32) in `tag`: `r` itself, or a narrowed copy (and `r` freed).

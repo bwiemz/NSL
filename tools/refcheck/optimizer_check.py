@@ -18,6 +18,12 @@ Two measurements, both from the same weights and batches on each side:
         --accum 4 --clip 1.0 --wd 0.1 --schedule -- --source-ad --checkpoint-blocks
     tools/refcheck/optimizer_check.py --tokens corpus.bin --nsl target/release/nsl \\
         --applied-lr --accum 4 -- --source-ad
+
+bf16 activation storage (`--precision bf16`, written into the train header) is
+held to PyTorch autocast: with `--autocast bf16` the twin's update is also
+computed under `torch.autocast(bf16)`, and the exit status is the criterion of
+design 6.2: NSL's median and worst per-tensor update error against PyTorch f32
+are no larger than autocast's.
 """
 
 from __future__ import annotations
@@ -32,10 +38,15 @@ import torch
 from ref import (
     SIZES,
     TRAIN_PROGRAM,
+    Cfg,
     RefModel,
+    Spread,
+    autocast,
     batch_from_stream,
+    bf16_criterion,
     grad_of,
     read_nslm,
+    relative_errors,
     run_nsl,
     warmup_cosine,
     write_model,
@@ -68,6 +79,7 @@ def nsl_run(a: argparse.Namespace, cfg, seq: int, optimizer: str, micro: int) ->
         (f", grad_accumulation={a.accum}" if a.accum > 1 else "")
         + unit
         + (f", grad_clip={a.clip}" if a.clip > 0 else "")
+        + (', precision="bf16"' if a.precision == "bf16" else "")
     )
     schedule = f"    scheduler: warmup_cosine(warmup_steps={WARMUP:g}, total_steps={TOTAL:g}, min_lr={MIN_LR})\n"
     program = TRAIN_PROGRAM.format(
@@ -139,6 +151,47 @@ def update_parity(
         read_nslm(a.workdir / "init.nslm"),
         read_nslm(a.workdir / "after.nslm"),
     )
+    d_ref = reference_update(a, cfg, seq, tokens, micro, init, None)
+    d_nsl = {
+        name: after[name].astype(np.float64) - init[name].astype(np.float64)
+        for name in d_ref
+    }
+    rel_b = relative_errors(d_nsl, d_ref)
+    rels = sorted(((r, k) for k, r in rel_b.items()), reverse=True)
+    for rel, name in rels[:5]:
+        print(f"{name:32s} update relative error {rel:.2e}")
+    b = Spread.of(rel_b)
+    if a.autocast:
+        d_ac = reference_update(a, cfg, seq, tokens, micro, init, a.autocast)
+        sa = Spread.of(relative_errors(d_ac, d_ref))
+        sc = Spread.of(relative_errors(d_nsl, d_ac))
+        for label, sp in (
+            ("(a) autocast vs f32", sa),
+            ("(b) NSL vs f32     ", b),
+            ("(c) NSL vs autocast", sc),
+        ):
+            print(f"{label}  median {sp.median:.2e}  worst {sp.worst:.2e}")
+        ok, line = bf16_criterion([b], [sa])
+        print(line)
+        return 0 if ok else 1
+    ok = b.worst <= a.tol
+    print(
+        f"{'ok' if ok else 'FAIL'}: median {b.median:.2e}, worst {b.worst:.2e} over {len(rels)} parameters (tolerance {a.tol:.0e})"
+    )
+    return 0 if ok else 1
+
+
+def reference_update(
+    a: argparse.Namespace,
+    cfg: Cfg,
+    seq: int,
+    tokens: np.ndarray,
+    micro: int,
+    init: dict[str, np.ndarray],
+    mode: str | None,
+) -> dict[str, np.ndarray]:
+    """The twin's total update per parameter (f64) from `init`, under autocast
+    when `mode` says so (the optimizer, clipping and schedule stay f32)."""
     model = RefModel(cfg, init)
     model.train()
     params = list(model.params.values())
@@ -146,7 +199,9 @@ def update_parity(
         params, lr=a.lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=a.wd
     )
     for k in range(micro):
-        (model.loss(*batch_from_stream(tokens, k, 1, seq)) / a.accum).backward()
+        with autocast(mode):
+            loss = model.loss(*batch_from_stream(tokens, k, 1, seq)) / a.accum
+        loss.backward()
         if (k + 1) % a.accum == 0:
             if a.schedule:
                 for group in opt.param_groups:
@@ -157,27 +212,14 @@ def update_parity(
                 torch.nn.utils.clip_grad_norm_(params, a.clip)
             opt.step()
             opt.zero_grad(set_to_none=True)
-    rels = []
-    for name, p in model.named().items():
-        d_ref = p.detach().cpu().numpy().astype(np.float64) - init[name].astype(
-            np.float64
-        )
-        d_nsl = after[name].astype(np.float64) - init[name].astype(np.float64)
-        rels.append(
-            (
-                float(np.linalg.norm(d_ref - d_nsl) / (np.linalg.norm(d_ref) + 1e-300)),
-                name,
-            )
-        )
-    rels.sort(reverse=True)
-    for rel, name in rels[:5]:
-        print(f"{name:32s} update relative error {rel:.2e}")
-    median = float(np.median([r for r, _ in rels]))
-    ok = rels[0][0] <= a.tol
-    print(
-        f"{'ok' if ok else 'FAIL'}: median {median:.2e}, worst {rels[0][0]:.2e} over {len(rels)} parameters (tolerance {a.tol:.0e})"
-    )
-    return 0 if ok else 1
+    out = {
+        name: p.detach().cpu().numpy().astype(np.float64)
+        - init[name].astype(np.float64)
+        for name, p in model.named().items()
+    }
+    del model, opt
+    torch.cuda.empty_cache()
+    return out
 
 
 def main() -> int:
@@ -209,6 +251,17 @@ def main() -> int:
         help="recover the rate applied per micro-batch",
     )
     ap.add_argument("--tol", type=float, default=3e-2)
+    ap.add_argument(
+        "--precision",
+        choices=["f32", "bf16"],
+        default="f32",
+        help="the NSL train header's precision= (bf16: activation storage)",
+    )
+    ap.add_argument(
+        "--autocast",
+        choices=["bf16"],
+        help="also run the twin under torch.autocast and apply the bf16 criterion",
+    )
     ap.add_argument("nsl_flags", nargs="*", default=["--source-ad"])
     a = ap.parse_args()
     if a.applied_lr and (a.clip > 0 or a.wd > 0):
