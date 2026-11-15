@@ -2058,6 +2058,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **bf16 activation storage.**
+  - Under `precision = "bf16"`, a GEMM with a bf16 output that cublasLt does not serve (below 2^28 multiply-adds, or a shape it declines) went to `cublasGemmEx` with a bf16 C, which rounded it twice: at 64x520x1001, 4,672 of 64,064 outputs were one bf16 ulp from the correctly rounded value. It now writes f32 and rounds once to nearest even.
+  - `tools/refcheck`: the bf16 gradient criterion compared with `>`, so an all-NaN gradient passed.
 - **Training speed.**
   - `--checkpoint-compress bf16` dropped the flash forward's saved logsumexp, so every backward recomputed it (108 ms per call); a Coder-1B update took 9.2 s instead of 2.9 s.
 
