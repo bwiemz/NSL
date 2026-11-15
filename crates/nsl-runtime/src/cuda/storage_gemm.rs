@@ -119,7 +119,20 @@ unsafe fn gemm16(
     }
     let op = |t: bool| if t { cublas_sys::cublasOperation_t::CUBLAS_OP_T } else { cublas_sys::cublasOperation_t::CUBLAS_OP_N };
     let bf16 = cublas_sys::cudaDataType_t::CUDA_R_16BF;
-    let c_type = if c_bf16 { bf16 } else { cublas_sys::cudaDataType_t::CUDA_R_32F };
+    // cublasGemmEx does not round a bf16 C once: measured, a 64x520x1001
+    // product with a bf16 C (odd n) put 4,672 of 64,064 outputs one bf16 ulp
+    // away from the correctly rounded accumulator, in both directions (a
+    // second rounding in the kernel it picks, e.g. split-K partials reduced
+    // in C's type). So GemmEx always writes f32 here, and a bf16 C is the RNE
+    // cast of that, the one rounding the storage plan promises. This path
+    // serves GEMMs below the timed-plan size and those cublasLt declines.
+    let scratch = if c_bf16 {
+        assert!(beta == 0.0, "a bf16 C is written, never accumulated into");
+        Some(super::inner::alloc_managed((ldc * n) as usize * 4) as u64)
+    } else {
+        None
+    };
+    let c_out = scratch.unwrap_or(c);
     // SAFETY: as above.
     let st = unsafe {
         cublas_sys::cublasGemmEx(
@@ -137,8 +150,8 @@ unsafe fn gemm16(
             bf16,
             ldb as i32,
             &beta as *const f32 as *const c_void,
-            c as *mut c_void,
-            c_type,
+            c_out as *mut c_void,
+            cublas_sys::cudaDataType_t::CUDA_R_32F,
             ldc as i32,
             cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
             cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DFALT,
@@ -146,6 +159,11 @@ unsafe fn gemm16(
     };
     if st != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
         crate::fatal::die(crate::fatal::Fatal::Unsupported, &format!("bf16-storage GEMM failed: {st:?}"));
+    }
+    if let Some(s) = scratch {
+        super::gpu_cast_raw_f32_to_bf16(s, c, (ldc * n) as usize);
+        // Stream-ordered after the cast (the single-stream invariant).
+        super::inner::free_managed(s as *mut c_void);
     }
 }
 

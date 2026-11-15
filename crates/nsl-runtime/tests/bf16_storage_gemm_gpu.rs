@@ -208,6 +208,17 @@ fn bf16_operand_gemms_round_once_to_the_requested_dtype() {
                     unsafe { nsl_tensor_free(t) };
                 }
 
+                // A as the transposed view of a stored [k, m] (the unfused
+                // weight gradient's x^T): the transa route.
+                let at_vals: Vec<f64> = (0..k * m).map(|idx| av[(idx % m) * k + idx / m]).collect();
+                let (ast, _) = upload(&at_vals, &[k as i64, m as i64], BF16);
+                let aview = unsafe { nsl_tensor_transpose(ast, 0, 1) };
+                let cta = no_fallback(|| unsafe { nsl_tensor_matmul_dt(aview, b, out) });
+                check(&format!("transposed-A signed={signed} -> {out}"), &download(cta, out), &av, &bv, m, k, n, out, stride);
+                for t in [cta, aview, ast] {
+                    unsafe { nsl_tensor_free(t) };
+                }
+
                 // Mixed: an f32 B, rounded to bf16 by the GEMM path.
                 let (bf, bfv) = upload(&b_vals, &[k as i64, n as i64], F32);
                 let b_rounded: Vec<f64> = bfv.iter().map(|&v| bf16_rne(v)).collect();
@@ -225,22 +236,39 @@ fn bf16_operand_gemms_round_once_to_the_requested_dtype() {
 /// Bound: the GEMM's |s| * N * 2^-23 * sum |x g| plus the epilogue's
 /// `alpha * acc + beta * m` in f32 (two roundings of magnitude at most
 /// |s * acc| + |m|).
+///
+/// Every operand mix the storage plan produces: both bf16 (the MLP's gate and
+/// up weights), bf16 x with an f32 g (W_down: silu*up against the f32 residual
+/// gradient), and an f32 x with a bf16 g. An f32 operand is rounded to bf16
+/// once by the GEMM path, so the reference reads it rounded.
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn the_fused_weight_gradient_accumulates_bf16_activations_in_f32() {
     init();
+    for (x_dt, g_dt) in [(BF16, BF16), (BF16, F32), (F32, BF16)] {
+        fused_wgrad_case(x_dt, g_dt);
+    }
+}
+
+fn fused_wgrad_case(x_dt: i64, g_dt: i64) {
     let (batch, rows, d_in, d_out) = (2usize, 300usize, 96usize, 80usize);
     let n = batch * rows;
     let s = 0.25f64;
     let x_vals = values(n * d_in, 3, -2.0, 0.0, true);
     let g_vals = values(n * d_out, 4, -7.0, -3.0, true); // gradient magnitudes
     let m_vals = values(d_in * d_out, 5, -4.0, -2.0, true);
-    let (x, xv) = upload(&x_vals, &[batch as i64, rows as i64, d_in as i64], BF16);
-    let (g, gv) = upload(&g_vals, &[batch as i64, rows as i64, d_out as i64], BF16);
+    let (x, xs) = upload(&x_vals, &[batch as i64, rows as i64, d_in as i64], x_dt);
+    let (g, gs) = upload(&g_vals, &[batch as i64, rows as i64, d_out as i64], g_dt);
+    let xv: Vec<f64> = xs.iter().map(|&v| bf16_rne(v)).collect();
+    let gv: Vec<f64> = gs.iter().map(|&v| bf16_rne(v)).collect();
     let (m, mv) = upload(&m_vals, &[d_in as i64, d_out as i64], F32);
     let fused_before = unsafe { nsl_wgrad_fused_count() };
     unsafe { nsl_tensor_wgrad_accum(m, x, g, s) };
-    assert_eq!(unsafe { nsl_wgrad_fused_count() }, fused_before + 1, "bf16 activations must take the fused GEMM");
+    assert_eq!(
+        unsafe { nsl_wgrad_fused_count() },
+        fused_before + 1,
+        "x {x_dt} / g {g_dt}: bf16 activations must take the fused GEMM"
+    );
     let out = download(m, F32);
     let mut bad = Vec::new();
     for i in 0..d_in {
@@ -260,7 +288,13 @@ fn the_fused_weight_gradient_accumulates_bf16_activations_in_f32() {
             }
         }
     }
-    assert!(bad.is_empty(), "{} of {} outside the bracket:\n{}", bad.len(), d_in * d_out, bad[..bad.len().min(10)].join("\n"));
+    assert!(
+        bad.is_empty(),
+        "x {x_dt} / g {g_dt}: {} of {} outside the bracket:\n{}",
+        bad.len(),
+        d_in * d_out,
+        bad[..bad.len().min(10)].join("\n")
+    );
     for t in [x, g, m] {
         unsafe { nsl_tensor_free(t) };
     }
@@ -283,5 +317,45 @@ fn a_shape_one_gemm_cannot_express_takes_the_counted_fallback() {
     check("fallback 3-D B -> bf16", &download(c, BF16), &av, &bv, m, k, n, BF16, 1);
     for t in [a, b, c] {
         unsafe { nsl_tensor_free(t) };
+    }
+}
+
+/// Odd dimensions (GPT-2's 50257-entry vocabulary as n; an odd k): a bf16 C
+/// with an odd leading dimension is only 2-byte aligned. Both GEMM paths must
+/// round once into it: cublasGemmEx (every GEMM below the timed-plan size, and
+/// whatever cublasLt declines) and cublasLt (which, measured, does take the
+/// odd 64x520x50257 shape). The Lt counters say which path ran, so each case
+/// asserts the path it covers.
+#[cfg(feature = "test-hooks")]
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn odd_dimensions_round_once_on_either_gemm_path() {
+    init();
+    // (m, k, n, expect cublasLt): under 2^28 MACs the GEMM goes straight to
+    // GemmEx with a bf16 C; at or over it the timed cublasLt plan is tried.
+    for (m, k, n, lt) in [
+        (64usize, 520usize, 1001usize, false),
+        (96, 333, 515, false),
+        (64, 520, 50257, true),
+        (512, 1033, 768, true),
+    ] {
+        let a_vals = values(m * k, 8 + k as u64, -1.5, 0.0, true);
+        let b_vals = values(k * n, 9 + n as u64, -1.5, 0.0, true);
+        let (a, av) = upload(&a_vals, &[m as i64, k as i64], BF16);
+        let (b, bv) = upload(&b_vals, &[k as i64, n as i64], BF16);
+        let (i0, _, f0) = nsl_runtime::test_lt_matmul_stats();
+        let c = no_fallback(|| unsafe { nsl_tensor_matmul_dt(a, b, BF16) });
+        let (i1, _, f1) = nsl_runtime::test_lt_matmul_stats();
+        let (issued, declined) = (i1 - i0, f1 - f0);
+        if lt {
+            assert_eq!(issued + declined, 1, "{m}x{k}x{n}: the timed cublasLt plan was not tried");
+        } else {
+            assert_eq!((issued, declined), (0, 0), "{m}x{k}x{n}: expected cublasGemmEx with a bf16 C, not cublasLt");
+        }
+        eprintln!("{m}x{k}x{n}: cublasLt issued {issued}, declined {declined}");
+        check(&format!("odd {m}x{k}x{n} -> bf16"), &download(c, BF16), &av, &bv, m, k, n, BF16, if n > 5000 { 7 } else { 1 });
+        for t in [a, b, c] {
+            unsafe { nsl_tensor_free(t) };
+        }
     }
 }
