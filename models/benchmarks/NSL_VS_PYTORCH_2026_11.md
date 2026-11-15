@@ -811,6 +811,47 @@ $P pairs --out OUT --pair nsl_tf32@c1/nsl_tf32@before --pair nsl_tf32@c2/nsl_tf3
 $P nsys --size 1b --arm nsl_tf32@c5 --out OUT
 ```
 
+## Both rounds together, against `main` and PyTorch (`perf/round-1`, 2026-11-15)
+
+`perf/host-gemm` (above) and the tensor-core attention
+(`ATTENTION_TC_2026_11.md`) combined, timed against `main` at c92f9300 (`before`)
+with the PyTorch arms in the same rounds: frozen toolchains, production flags, three
+interleaved rounds, arm order reversed in the second round, ratios paired within a
+round, then the median [min-max] over rounds.
+
+| arm | Coder-1B tok/s | driver peak GiB | Coder-500M tok/s | driver peak GiB |
+|---|---|---|---|---|
+| `nsl_tf32@before` | 5,067 [5,066-5,068] | 25.83 | 8,952 [8,932-8,966] | 14.15 |
+| `nsl_tf32@after` | 7,245 [7,121-7,269] | 25.87 | 12,758 [12,729-13,066] | 14.44 |
+| `torch_tf32_eager_sel` | 7,335 [7,292-7,369] | 25.55 | 13,842 [13,809-14,009] | 12.12 |
+| `nsl_bf16@before` | 6,778 [6,739-6,793] | 27.75 | 11,639 [11,627-11,705] | 15.14 |
+| `nsl_bf16@after` | 9,619 [9,572-9,650] | 27.79 | 15,593 [15,568-15,632] | 15.17 |
+| `torch_bf16_compile_sel` | 15,209 [15,050-15,229] | 22.25 | 25,121 [25,079-25,342] | 11.38 |
+
+| paired ratio | Coder-1B | Coder-500M |
+|---|---|---|
+| `nsl_tf32@after / nsl_tf32@before` | **1.430** [1.405-1.434] | **1.423** [1.422-1.463] |
+| `nsl_bf16@after / nsl_bf16@before` | **1.420** [1.416-1.424] | **1.338** [1.336-1.341] |
+| `torch_tf32_eager_sel / nsl_tf32@after` | 1.014 [1.012-1.024] | 1.085 [1.072-1.085] |
+| `torch_bf16_compile_sel / nsl_bf16@after` | 1.578 [1.572-1.581] | 1.614 [1.608-1.621] |
+| `torch_bf16_compile_sel / nsl_bf16@before` | 2.239 [2.233-2.247] | 2.158 [2.157-2.165] |
+
+At TF32 NSL now matches eager PyTorch at 1B (1.4% behind) and is 8.5% behind at 500M,
+at the same memory. Against compiled PyTorch in bf16, the 1B recipe's posture, the
+gap is 1.58x (it was 2.24x), and NSL holds 5.5 GiB more at its peak. What remains is
+the work bf16 activation storage removes (NSL stores activations in f32 and casts
+both operands of every GEMM: 322 ms of casts and strided copies per 1B update in the
+baseline trace) and the elementwise and norm kernels torch.compile fuses.
+
+Agreement with PyTorch at 50M (`tools/refcheck`, production flags), `before` / `after`:
+`grad_check` TF32 worst relative error 2.55e-3 / 2.30e-3 (tolerance 5e-3), bf16
+6.34e-3 / 6.16e-3 (both above the 5e-3 default, which is set for TF32 operands; see
+`tools/refcheck/README.md`); `optimizer_check` TF32 4.02e-3 / 3.59e-3, bf16 9.33e-3 /
+9.08e-3 (tolerance 3e-2).
+
+Raw results: `/mnt/extrastorage/nsl-audit/research/work/PERF-ROUND1/` on the measuring
+machine (`campaign.sh`, `refcheck.sh`, `runs/`).
+
 ## Reproduce
 
 Raw results (one JSON per run, logs, traces, trace summaries) are in
