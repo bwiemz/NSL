@@ -143,15 +143,45 @@ impl Compiler<'_> {
     ) -> Result<Value, CodegenError> {
         use crate::compiler::ModuleConst as C;
         let ty = self.node_type(expr.id).clone();
+        // The machine type every other use of a value of this type has
+        // (`nsl_type_to_cl`): an `int16` is an i16, an `fp16` an f32. Picking
+        // it by hand for a few types left `int16`/`int8` consts as i64 and
+        // `fp16`/`bf16` ones as f64, which failed Cranelift's verifier at a
+        // `return` or a call typed by the signature.
+        let numeric = matches!(
+            ty,
+            Type::Int
+                | Type::Int64
+                | Type::Int32
+                | Type::Int16
+                | Type::Int8
+                | Type::Int4
+                | Type::Uint8
+                | Type::Float
+                | Type::F64
+                | Type::F32
+                | Type::Fp16
+                | Type::Bf16
+                | Type::Fp8E4m3
+                | Type::Fp8E5m2
+        );
+        let cl = if numeric { crate::types::nsl_type_to_cl(&ty) } else { cl_types::I64 };
+        // A narrow integer immediate is given in its own width (Cranelift
+        // refuses a sign-extended negative one).
+        let int_const = |builder: &mut FunctionBuilder, t: cl_types::Type, v: i64| {
+            let bits = t.bits();
+            let v = if bits < 64 { v & ((1i64 << bits) - 1) } else { v };
+            builder.ins().iconst(t, v)
+        };
         Ok(match c {
-            C::Int(v) => match ty {
-                Type::Float | Type::F64 => builder.ins().f64const(*v as f64),
-                Type::F32 => builder.ins().f32const(*v as f32),
-                Type::Int32 => builder.ins().iconst(cl_types::I32, *v),
+            C::Int(v) => match cl {
+                t if t == cl_types::F64 => builder.ins().f64const(*v as f64),
+                t if t == cl_types::F32 => builder.ins().f32const(*v as f32),
+                t if t.is_int() => int_const(builder, t, *v),
                 _ => builder.ins().iconst(cl_types::I64, *v),
             },
-            C::Float(v) => match ty {
-                Type::F32 => builder.ins().f32const(*v as f32),
+            C::Float(v) => match cl {
+                t if t == cl_types::F32 => builder.ins().f32const(*v as f32),
                 _ => builder.ins().f64const(*v),
             },
             C::Bool(v) => builder.ins().iconst(cl_types::I8, i64::from(*v)),
