@@ -836,8 +836,9 @@ round, then the median [min-max] over rounds.
 | `torch_bf16_compile_sel / nsl_bf16@after` | 1.578 [1.572-1.581] | 1.614 [1.608-1.621] |
 | `torch_bf16_compile_sel / nsl_bf16@before` | 2.239 [2.233-2.247] | 2.158 [2.157-2.165] |
 
-At TF32 NSL now matches eager PyTorch at 1B (1.4% behind) and is 8.5% behind at 500M,
-at the same memory. Against compiled PyTorch in bf16, the 1B recipe's posture, the
+At TF32 NSL now matches eager PyTorch at 1B (1.4% behind, at the same memory: 25.87
+against 25.55 GiB) and is 8.5% behind at 500M, where it holds 2.3 GiB more (14.44
+against 12.12 GiB). Against compiled PyTorch in bf16, the 1B recipe's posture, the
 gap is 1.58x (it was 2.24x), and NSL holds 5.5 GiB more at its peak. What remains is
 the work bf16 activation storage removes (NSL stores activations in f32 and casts
 both operands of every GEMM: 322 ms of casts and strided copies per 1B update in the
