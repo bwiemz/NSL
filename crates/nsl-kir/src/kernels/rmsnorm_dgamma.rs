@@ -76,10 +76,16 @@ pub const FINAL_COLS: u32 = 32;
 /// The warps of a kernel-1 or kernel-3 block, whose sums the fixed tree adds.
 pub const WARPS: u32 = 8;
 
-/// How many kernel-2 blocks [`dgamma_plan`] aims for: enough to keep every
-/// SM's memory pipe busy, few enough that the partials (`chunks · cols`
-/// floats, about 1 MiB at this target) stay a small fraction of the traffic.
-pub const PARTIAL_TARGET_BLOCKS: u64 = 1024;
+/// How many kernel-2 blocks [`dgamma_plan`] aims for. Measured on the RTX
+/// PRO 4500 (sm_120, 82 SMs) with the inputs evicted from L2 before each
+/// launch (2026-11-15): at Coder-1B's `[4096, 2048]` the kernel took 153,
+/// 156, 166, 172, 179 and 184 µs at 256, 128, 512, 1024, 2048 and 4096
+/// blocks (longer per-thread row runs stream better); at Coder-500M's
+/// `[2048, 1280]` 30.6-33.3 µs from 160 to 1280 blocks and 57 at 80; at
+/// Coder-50M's `[1024, 512]` 4.6 µs at 256 blocks, 5.8 at 128. Absolute
+/// times moved by 2x between runs on this shared card; the order held. The
+/// partials are `chunks · cols` floats, about 256 KiB at this target.
+pub const PARTIAL_TARGET_BLOCKS: u64 = 256;
 
 /// The fewest rows a chunk holds, so the partials are at most an eighth of
 /// one input.
@@ -646,20 +652,19 @@ mod tests {
     /// by hand from its definition.
     #[test]
     fn the_plan_at_the_recipe_shapes() {
-        // Coder-1B: 2 × 2048 rows of 2048. 8 column blocks, 128 chunks of 32.
-        assert_eq!(dgamma_plan(4096, 2048), DgammaPlan { col_blocks: 8, chunk_rows: 32, chunks: 128 });
-        // Coder-500M: 2 × 1024 rows of 1280. 5 column blocks; ceil(1024 / 5)
-        // = 205 target chunks of ceil(2048 / 205) = 10 rows; 205 chunks.
-        assert_eq!(dgamma_plan(2048, 1280), DgammaPlan { col_blocks: 5, chunk_rows: 10, chunks: 205 });
-        // Coder-50M: 1 × 1024 rows of 512: 512 target chunks of 2 rows,
-        // raised to the 8-row floor; 128 chunks.
+        // Coder-1B: 2 × 2048 rows of 2048. 8 column blocks, 32 chunks of 128.
+        assert_eq!(dgamma_plan(4096, 2048), DgammaPlan { col_blocks: 8, chunk_rows: 128, chunks: 32 });
+        // Coder-500M: 2 × 1024 rows of 1280. 5 column blocks; ceil(256 / 5)
+        // = 52 target chunks of ceil(2048 / 52) = 40 rows; 52 chunks.
+        assert_eq!(dgamma_plan(2048, 1280), DgammaPlan { col_blocks: 5, chunk_rows: 40, chunks: 52 });
+        // Coder-50M: 1 × 1024 rows of 512: 128 target chunks of 8 rows.
         assert_eq!(dgamma_plan(1024, 512), DgammaPlan { col_blocks: 2, chunk_rows: 8, chunks: 128 });
         // Tails: one row; no rows; a column count past the target.
         assert_eq!(dgamma_plan(1, 1), DgammaPlan { col_blocks: 1, chunk_rows: 8, chunks: 1 });
         assert_eq!(dgamma_plan(0, 7), DgammaPlan { col_blocks: 1, chunk_rows: 8, chunks: 0 });
         assert_eq!(dgamma_plan(100, 300_000), DgammaPlan { col_blocks: 1172, chunk_rows: 100, chunks: 1 });
-        // The depth at Coder-1B: 2 + 32 + 16 + 3.
-        assert_eq!(dgamma_plan(4096, 2048).depth(), 53);
+        // The depth at Coder-1B: 2 + 128 + 4 + 3.
+        assert_eq!(dgamma_plan(4096, 2048).depth(), 137);
     }
 
     #[test]
