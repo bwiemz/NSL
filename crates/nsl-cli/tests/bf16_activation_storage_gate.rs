@@ -289,6 +289,30 @@ fn an_attention_half_with_a_dropout_tail_is_planned() {
     assert!(r.out.contains(ATTN_PLANNED), "the attention halves were not planned:\n{}", r.out);
 }
 
+/// A module with an `@flash_attention` context lowers every attention through
+/// the decomposed f32 chain (or, under a CSHA claim, which needs the context,
+/// the fused CSHA forward); neither reads bf16 operands, so a planned
+/// attention half there is a compile error, not a run that mixes them. The
+/// same program with f32 storage still builds.
+#[test]
+fn an_attention_half_under_a_flash_attention_context_is_a_compile_error() {
+    let decorate = |src: String| {
+        let out = src.replacen(
+            "    fn forward(self, x: Tensor) -> Tensor:\n        let h = x + self.attn.forward(",
+            "    @flash_attention(head_dim=64)\n    fn forward(self, x: Tensor) -> Tensor:\n        let h = x + self.attn.forward(",
+            1,
+        );
+        assert_ne!(out, src, "the fixture no longer has the method the decorator goes on");
+        out
+    };
+    let mut args = vec!["build"];
+    args.extend_from_slice(PROD);
+    let r = nsl(&args, &decorate(attention_fixture(BF16, false)), "plan_attn_flash_ctx", false, &[]);
+    assert!(!r.ok && r.out.contains("has a @flash_attention context"), "{}", r.out);
+    let r = nsl(&args, &decorate(attention_fixture("", false)), "plan_attn_flash_ctx_f32", false, &[]);
+    assert!(r.ok, "the f32-storage program with the decorator must build:\n{}", r.out);
+}
+
 #[test]
 fn both_attention_halves_are_planned_with_the_mlp_halves() {
     let mut args = vec!["build"];

@@ -573,6 +573,21 @@ impl Compiler<'_> {
                  leave precision unset",
             ));
         }
+        if planned.attention > 0 && self.kernels.flash_attention_context.is_some() {
+            // The attention half is stored for the tensor-core kernels with
+            // bf16 I/O, which only the decorator-free SDPA dispatch reaches.
+            // Under a module's `@flash_attention` context every SDPA lowers
+            // through the decomposed f32 chain, or (a CSHA claim, which is
+            // published only under that context) the fused CSHA forward:
+            // neither reads bf16 operands.
+            return Err(crate::CodegenError::new(
+                "precision=\"bf16\" stores the attention half for the tensor-core attention \
+                 kernels, but this module has a @flash_attention context, under which attention \
+                 lowers through the f32 decomposition (or the CSHA fused forward) and cannot read \
+                 bf16 operands. Remove the @flash_attention decorator (decorator-free attention \
+                 takes the tensor-core kernels) or train with precision=\"f32\"",
+            ));
+        }
         {
             nsl_log::nsl_log!(INFO, "bf16-storage",
                 "[bf16-storage] {} SwiGLU MLP block(s) stored bf16: {} values, {} ops lowered dtype-explicit",
