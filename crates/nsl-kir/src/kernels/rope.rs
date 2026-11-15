@@ -79,13 +79,32 @@ pub fn build(dir: RopeDir, input: Storage, out: Storage) -> KernelIR {
     let st_d = b.add_param("stride_d", KirType::U64, Global);
     let (i, _, exit) = index_and_bound(&mut b, n);
 
-    // i = ((bb·h + hh)·s + row)·d + j
-    let j = u64v(&mut b, KirOp::Rem, i, d);
-    let t = u64v(&mut b, KirOp::Div, i, d);
-    let row = u64v(&mut b, KirOp::Rem, t, s);
-    let t2 = u64v(&mut b, KirOp::Div, t, s);
-    let hh = u64v(&mut b, KirOp::Rem, t2, h);
-    let bb = u64v(&mut b, KirOp::Div, t2, h);
+    // i = ((bb·h + hh)·s + row)·d + j, decomposed in 32 bits (the launcher
+    // admits fewer than 2^31 elements; 64-bit div/rem is several times
+    // slower), the offsets widened back to 64 bits.
+    let to = |b: &mut KirBuilder, v: VarId, ty: KirType| {
+        let d = b.new_typed_var(ty.clone());
+        b.emit(KirOp::Cast(d, v, ty));
+        d
+    };
+    let (i32_, d32, s32, h32) = (to(&mut b, i, KirType::U32), to(&mut b, d, KirType::U32), to(&mut b, s, KirType::U32), to(&mut b, h, KirType::U32));
+    let u32v = |b: &mut KirBuilder, op: fn(VarId, VarId, VarId) -> KirOp, x: VarId, y: VarId| {
+        let r = b.new_typed_var(KirType::U32);
+        b.emit(op(r, x, y));
+        r
+    };
+    let j32 = u32v(&mut b, KirOp::Rem, i32_, d32);
+    let t = u32v(&mut b, KirOp::Div, i32_, d32);
+    let row32 = u32v(&mut b, KirOp::Rem, t, s32);
+    let t2 = u32v(&mut b, KirOp::Div, t, s32);
+    let hh32 = u32v(&mut b, KirOp::Rem, t2, h32);
+    let bb32 = u32v(&mut b, KirOp::Div, t2, h32);
+    let (j, row, hh, bb) = (
+        to(&mut b, j32, KirType::U64),
+        to(&mut b, row32, KirType::U64),
+        to(&mut b, hh32, KirType::U64),
+        to(&mut b, bb32, KirType::U64),
+    );
     let ob = u64v(&mut b, KirOp::Mul, bb, st_b);
     let oh = u64v(&mut b, KirOp::Mul, hh, st_h);
     let os = u64v(&mut b, KirOp::Mul, row, st_s);
