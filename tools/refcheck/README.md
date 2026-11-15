@@ -53,8 +53,11 @@ tools/refcheck/grad_check.py --size 1b --tokens refcheck-work/data/train.bin \
 
 Expect a worst relative error near 2e-3 on the default TF32 matmuls, 1e-3 with
 `--matmul-mode f32`, and 1e-6 on `--tape-ad --matmul-mode f32`. The floor on the
-source-AD path is the attention kernels' f16 operands. Coder-1B at batch 1 needs
-about 21 GB.
+source-AD path is the attention kernels' f16 operands. Built with
+`NSL_MATMUL_BF16=1` the GEMMs' bf16 operands set the floor instead: at 50M with
+the production flags, median 3.9e-3 and worst 5.6-5.7e-3 (2026-11-14, the same
+with either attention implementation), above the default `--tol`. Coder-1B at
+batch 1 needs about 21 GB.
 
 **Optimizer stack.** AdamW with any of accumulation, clipping, weight decay and
 a warmup schedule, over three optimizer steps:

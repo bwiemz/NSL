@@ -403,6 +403,11 @@ crates/nsl-codegen/tests/tier_b_tile_skip_gpu_parity.rs	tier_b_aligned_docs_s409
 crates/nsl-codegen/tests/track_b_head_dim_128_repro.rs	track_b_d_model_128_rejected_by_validator	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/track_b_head_dim_128_repro.rs	track_b_head_dim_128_d_model_32_launches	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/wggo_sidecar_population.rs	run_harness_stub_with_wggo_hook_populates_wggo_head_gradients	broken	requires cfg(test) BSS stub injection; covered by mod.rs unit test
+crates/nsl-runtime/src/attention_tc.rs	tc_backward_matches_f64_reference_at_realistic_gradient_magnitudes	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
+crates/nsl-runtime/src/attention_tc.rs	tc_backward_small_rows_keep_their_precision	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
+crates/nsl-runtime/src/attention_tc.rs	tc_ffi_forward_and_backward_match_the_reference	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
+crates/nsl-runtime/src/attention_tc.rs	tc_attention_kernel_times	diagnostic	diagnostic: times the tensor-core attention kernels at the production shapes
+crates/nsl-runtime/src/attention_tc.rs	tc_forward_matches_f64_reference	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/src/c_api/mod.rs	zz_tensor_to_desc_null_child	helper	child process — driven by nsl_tensor_to_desc_null_ptr_does_not_deref
 crates/nsl-runtime/src/data/gds.rs	mmap_fallback_h2d_copies_bytes_to_device	gpu	requires CUDA GPU
 crates/nsl-runtime/src/fase_step.rs	unaligned_parameter_lengths_are_numerically_correct	gpu	requires CUDA GPU
