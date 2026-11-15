@@ -1,35 +1,40 @@
 //! Meta-flag expansion (roadmap 3.3).
 //!
-//! `--pretrain-optimized` bundles the pretraining stack: `--source-ad`
-//! (mandatory — WGGO/CSHA/FASE planning all live in the source-AD branch of
-//! train-block lowering, and tape AD leaves GPU params frozen), `--wggo greedy`
-//! (the ~500ms planner, within a few percent of `full` per its docs — `full`
-//! remains an explicit opt-in), `--csha auto`, and both backward fusions
-//! (`--fuse-rmsnorm-backward`, `--fuse-wgrad-accum`).
+//! `--pretrain-optimized` is the MEASURED production flag set: `--source-ad
+//! --checkpoint-blocks --checkpoint-selective --fuse-rmsnorm-backward
+//! --fuse-wgrad-accum`, plus `--fuse-lm-head auto` (which adds nothing where a
+//! `@fused_lm_ce` decorator is present, as in every recipe). It is what the
+//! recipes' run lines spell out and what `tools/perfcheck` times as the
+//! production arm.
+//!
+//! REDEFINED 2026-11-15. Until then the bundle was `--source-ad --wggo greedy
+//! --csha auto` and the two fusions. `--wggo greedy` changes no memory and took
+//! the optimizer step off the single batched multi-tensor AdamW launch
+//! (per-parameter fused steps, the stdlib AdamW for some parameters,
+//! per-parameter clip norms): 0.82x tok/s at Coder-1B bf16 and 0.89x at
+//! Coder-500M TF32 (`models/benchmarks/MEMORY_OPTIONS_2026_11.md`). `--csha auto`
+//! has no effect on the decorator-free attention the recipes use. Both stay
+//! available as explicit flags.
+//!
+//! Checkpointing fills only when the user did not choose a posture: a typed
+//! `--checkpoint-blocks` without `--checkpoint-selective` is a request for full
+//! block recompute, and the bundle leaves it so. A model without `blocks.N`
+//! parameters runs without checkpointing (CCR declines it with a warning).
 //!
 //! The two fusions change the ARITHMETIC, not just the schedule, which is why
-//! they are opt-in everywhere else. They belong here because this bundle IS the
-//! "I want pretraining throughput" request: measured +14% tok/s on Coder-50M at
-//! a max relative loss divergence of 1.2e-5 over 24 micro-batches, identical
-//! trend.
-//!
-//! That +14% is NOT "both fusions" (corrected 2026-08-07). `--fuse-wgrad-accum`
-//! fires only through the FASE-*Deferred* `on_param_grad` hook, which needs
-//! `grad_accumulation >= 2` in the train block; the measured run declared none,
-//! so the wgrad half fused zero chains and the number belongs to
-//! `--fuse-rmsnorm-backward` and the rest of the bundle. Codegen now emits
-//! `[wgrad-fusion] declined: train block #N — ...` for every train block that
-//! cannot fuse — including the `@pipeline` path, which returns before the
-//! ordinary admission — rather than leaving that invisible.
-//! `--training-reference` strips both back out. Because the bundle sets
-//! them AFTER clap has finished validating, clap can no longer enforce
+//! they are opt-in everywhere else; this bundle is the "I want pretraining
+//! throughput" request. `--fuse-wgrad-accum` fires only through the
+//! FASE-*Deferred* `on_param_grad` hook, which needs `grad_accumulation >= 2`
+//! in the train block; codegen emits `[wgrad-fusion] declined: train block #N
+//! — ...` for every train block that cannot fuse. `--training-reference`
+//! strips the fusions and the checkpointing back out. Because the bundle sets
+//! flags AFTER clap has finished validating, clap can no longer enforce
 //! `--fuse-wgrad-accum`'s conflicts — [`WgradFusionBlockers`] is what replaces
 //! that enforcement, with a matching hard error in `stmt.rs` as the backstop.
 //!
 //! Fill-None semantics: explicit user values always win — the bundle only
 //! fills flags the user left unset, mirroring the `--cpdt-report`→`--cpdt`
-//! precedent. When the user explicitly disables a member (`--wggo off` /
-//! `--csha off`), the bundle respects it and says so once on stderr.
+//! precedent.
 //!
 //! One shared helper for `nsl build` and `nsl run` so the two dispatchers
 //! cannot drift (the historical failure mode of these copy-pasted option
@@ -159,16 +164,15 @@ impl WgradFusionBlockers {
 
 /// The flags `--pretrain-optimized` expands into.
 ///
-/// A struct rather than six `&mut` out-parameters: the sixth (item 4's
-/// `--fuse-lm-head`) tipped the signature past clippy's `too_many_arguments`,
-/// and six same-shaped `&mut`s in a row is exactly the argument list a caller
-/// transposes. Both dispatchers build one of these from their locals and
-/// destructure it back, so the shared-helper property that keeps `nsl run` and
-/// `nsl build` from drifting is unchanged.
+/// A struct rather than `&mut` out-parameters: seven same-shaped `&mut`s in a
+/// row is exactly the argument list a caller transposes. Both dispatchers
+/// build one of these from their locals and destructure it back, so the
+/// shared-helper property that keeps `nsl run` and `nsl build` from drifting
+/// is unchanged.
 pub(crate) struct PretrainBundle {
-    pub(crate) wggo: Option<String>,
-    pub(crate) csha: Option<String>,
     pub(crate) source_ad: bool,
+    pub(crate) checkpoint_blocks: bool,
+    pub(crate) checkpoint_selective: bool,
     pub(crate) fuse_rmsnorm_backward: bool,
     pub(crate) fuse_wgrad_accum: bool,
     /// OUT-parameter, always built as `false`: set here when the bundle — not
@@ -188,9 +192,9 @@ pub(crate) fn expand_pretrain_optimized(
         return;
     }
     let PretrainBundle {
-        wggo,
-        csha,
         source_ad,
+        checkpoint_blocks,
+        checkpoint_selective,
         fuse_rmsnorm_backward,
         fuse_wgrad_accum,
         fuse_wgrad_accum_from_bundle,
@@ -198,15 +202,24 @@ pub(crate) fn expand_pretrain_optimized(
     } = b;
     *source_ad = true;
 
+    // Selective block checkpointing, the measured production posture (1B does
+    // not fit without checkpointing; selective is 1.11x full recompute for
+    // +5.4 GiB at 1B bf16). Only when the user chose no posture: a typed
+    // `--checkpoint-blocks` alone asks for full recompute.
+    if !*checkpoint_blocks {
+        *checkpoint_blocks = true;
+        *checkpoint_selective = true;
+    }
+
     // Item 4: the fused LM head belongs in the bundle for the same reason the
     // two backward fusions do — it is a measured win (~8.5% step time on
     // Coder-50M) that until now required hand-editing four numbers into the
     // model source. `auto`, not `require`: the bundle must not turn a program
     // whose head the compiler cannot prove into a build failure.
     //
-    // Same loud-override shape as --wggo/--csha below, and the same reason:
-    // an explicit `off` is a decision, and silently overriding it would make
-    // the bundle a worse citizen than the flags it expands to.
+    // An explicit `off` is a decision: it is honoured and said aloud, since
+    // silently overriding it would make the bundle a worse citizen than the
+    // flags it expands to.
     match fuse_lm_head.as_deref() {
         None => *fuse_lm_head = Some("auto".to_string()),
         Some("off") => nsl_log::nsl_log!(WARN, "cli", 
@@ -266,22 +279,6 @@ pub(crate) fn expand_pretrain_optimized(
              the raw gradient this fusion never materializes; the rest of the \
              bundle still applies)"
         ),
-    }
-    match wggo.as_deref() {
-        None => *wggo = Some("greedy".to_string()),
-        Some("off") => nsl_log::nsl_log!(WARN, "cli", 
-            "note: --pretrain-optimized bundle partially disabled: --wggo off \
-             (explicit flag wins; no WGGO plan will drive CSHA/FASE/PCA)"
-        ),
-        Some(_) => {} // explicit mode wins silently
-    }
-    match csha.as_deref() {
-        None => *csha = Some("auto".to_string()),
-        Some("off") => nsl_log::nsl_log!(WARN, "cli", 
-            "note: --pretrain-optimized bundle partially disabled: --csha off \
-             (explicit flag wins)"
-        ),
-        Some(_) => {}
     }
 }
 
@@ -455,44 +452,48 @@ mod tests {
         }
     }
 
-    /// `(wggo, csha, source_ad, fuse_rmsnorm, fuse_wgrad)` after expansion.
-    fn expand(
-        on: bool,
-        w: Option<&str>,
-        c: Option<&str>,
-        blockers: WgradFusionBlockers,
-    ) -> (Option<String>, Option<String>, bool, bool, bool) {
-        let (w, c, s, fr, fw, _) = expand_all(on, w, c, None, blockers);
-        (w, c, s, fr, fw)
+    /// What a bundle expansion leaves, for one starting state.
+    #[derive(Debug, PartialEq)]
+    struct Expanded {
+        source_ad: bool,
+        blocks: bool,
+        selective: bool,
+        fuse_rmsnorm: bool,
+        fuse_wgrad: bool,
+        fuse_lm_head: Option<String>,
     }
 
-    /// Same, plus the item-4 `--fuse-lm-head` slot.
-    #[allow(clippy::type_complexity)]
-    fn expand_all(
+    /// Expand from a state where the user typed `--checkpoint-blocks`
+    /// (`blocks`), `--checkpoint-selective` (`selective`) and `--fuse-lm-head`
+    /// (`lm`) as given and nothing else.
+    fn expand_from(
         on: bool,
-        w: Option<&str>,
-        c: Option<&str>,
+        (blocks, selective): (bool, bool),
         lm: Option<&str>,
         blockers: WgradFusionBlockers,
-    ) -> (Option<String>, Option<String>, bool, bool, bool, Option<String>) {
+    ) -> Expanded {
         let mut b = PretrainBundle {
-            wggo: w.map(str::to_string),
-            csha: c.map(str::to_string),
             source_ad: false,
+            checkpoint_blocks: blocks,
+            checkpoint_selective: selective,
             fuse_rmsnorm_backward: false,
             fuse_wgrad_accum: false,
             fuse_wgrad_accum_from_bundle: false,
             fuse_lm_head: lm.map(str::to_string),
         };
         expand_pretrain_optimized(on, &mut b, &blockers);
-        (
-            b.wggo,
-            b.csha,
-            b.source_ad,
-            b.fuse_rmsnorm_backward,
-            b.fuse_wgrad_accum,
-            b.fuse_lm_head,
-        )
+        Expanded {
+            source_ad: b.source_ad,
+            blocks: b.checkpoint_blocks,
+            selective: b.checkpoint_selective,
+            fuse_rmsnorm: b.fuse_rmsnorm_backward,
+            fuse_wgrad: b.fuse_wgrad_accum,
+            fuse_lm_head: b.fuse_lm_head,
+        }
+    }
+
+    fn expand(on: bool, blockers: WgradFusionBlockers) -> Expanded {
+        expand_from(on, (false, false), None, blockers)
     }
 
     /// `(fuse_wgrad_accum, fuse_wgrad_accum_from_bundle)` for a given starting
@@ -501,9 +502,9 @@ mod tests {
     /// directions are pinned here rather than only end-to-end.
     fn wgrad_provenance(on: bool, explicit: bool, blockers: WgradFusionBlockers) -> (bool, bool) {
         let mut b = PretrainBundle {
-            wggo: None,
-            csha: None,
             source_ad: false,
+            checkpoint_blocks: false,
+            checkpoint_selective: false,
             fuse_rmsnorm_backward: false,
             fuse_wgrad_accum: explicit,
             fuse_wgrad_accum_from_bundle: false,
@@ -542,24 +543,24 @@ mod tests {
 
     #[test]
     fn the_bundle_fills_fuse_lm_head_with_auto() {
-        let (.., lm) = expand_all(true, None, None, None, clear());
-        assert_eq!(lm.as_deref(), Some("auto"));
+        let e = expand(true, clear());
+        assert_eq!(e.fuse_lm_head.as_deref(), Some("auto"));
     }
 
     #[test]
     fn an_explicit_fuse_lm_head_wins_over_the_bundle() {
         // Both directions: `off` is a deliberate opt-out the bundle must not
         // overturn, and `require` must not be softened to `auto`.
-        let (.., lm) = expand_all(true, None, None, Some("off"), clear());
-        assert_eq!(lm.as_deref(), Some("off"));
-        let (.., lm) = expand_all(true, None, None, Some("require"), clear());
-        assert_eq!(lm.as_deref(), Some("require"));
+        let e = expand_from(true, (false, false), Some("off"), clear());
+        assert_eq!(e.fuse_lm_head.as_deref(), Some("off"));
+        let e = expand_from(true, (false, false), Some("require"), clear());
+        assert_eq!(e.fuse_lm_head.as_deref(), Some("require"));
     }
 
     #[test]
     fn without_the_bundle_fuse_lm_head_is_untouched() {
-        let (.., lm) = expand_all(false, None, None, None, clear());
-        assert_eq!(lm, None, "no bundle, no fill — the flag defaults to off");
+        let e = expand(false, clear());
+        assert_eq!(e.fuse_lm_head, None, "no bundle, no fill — the flag defaults to off");
     }
 
     #[test]
@@ -576,36 +577,48 @@ mod tests {
         );
     }
 
+    /// The bundle is the production flag set the recipes run with and
+    /// perfcheck times: `--source-ad --checkpoint-blocks
+    /// --checkpoint-selective --fuse-rmsnorm-backward --fuse-wgrad-accum`
+    /// (plus `--fuse-lm-head auto`). Nothing else: no WGGO, no CSHA.
     #[test]
-    fn fills_unset_members() {
-        let (w, c, s, fr, fw) = expand(true, None, None, clear());
-        assert_eq!(w.as_deref(), Some("greedy"));
-        assert_eq!(c.as_deref(), Some("auto"));
-        assert!(s);
-        assert!(fr && fw, "the bundle enables both backward fusions");
+    fn fills_the_production_flag_set() {
+        assert_eq!(
+            expand(true, clear()),
+            Expanded {
+                source_ad: true,
+                blocks: true,
+                selective: true,
+                fuse_rmsnorm: true,
+                fuse_wgrad: true,
+                fuse_lm_head: Some("auto".to_string()),
+            }
+        );
     }
 
+    /// A typed `--checkpoint-blocks` without `--checkpoint-selective` asks for
+    /// full block recompute; the bundle must not turn it into selective.
     #[test]
-    fn explicit_values_win() {
-        let (w, c, s, _, _) = expand(true, Some("full"), Some("boundary"), clear());
-        assert_eq!(w.as_deref(), Some("full"));
-        assert_eq!(c.as_deref(), Some("boundary"));
-        assert!(s, "source_ad is always forced on (planning needs it)");
-    }
-
-    #[test]
-    fn explicit_off_respected() {
-        let (w, c, s, _, _) = expand(true, Some("off"), Some("off"), clear());
-        assert_eq!(w.as_deref(), Some("off"));
-        assert_eq!(c.as_deref(), Some("off"));
-        assert!(s);
+    fn a_typed_checkpoint_posture_wins() {
+        let e = expand_from(true, (true, false), None, clear());
+        assert!(e.blocks && !e.selective, "full recompute stays full: {e:?}");
+        let e = expand_from(true, (true, true), None, clear());
+        assert!(e.blocks && e.selective);
     }
 
     #[test]
     fn noop_without_the_flag() {
-        let (w, c, s, fr, fw) = expand(false, None, None, clear());
-        assert!(w.is_none() && c.is_none() && !s);
-        assert!(!fr && !fw, "no bundle, no fusions");
+        assert_eq!(
+            expand(false, clear()),
+            Expanded {
+                source_ad: false,
+                blocks: false,
+                selective: false,
+                fuse_rmsnorm: false,
+                fuse_wgrad: false,
+                fuse_lm_head: None,
+            }
+        );
     }
 
     /// Each blocker suppresses ONLY `--fuse-wgrad-accum`. Filling it anyway
@@ -618,10 +631,10 @@ mod tests {
             ("optim_state_offload", WgradFusionBlockers { optim_state_offload: true, ..clear() }),
             ("layerwise_accum", WgradFusionBlockers { layerwise_accum: true, ..clear() }),
         ] {
-            let (_, _, s, fr, fw) = expand(true, None, None, b);
-            assert!(s, "{name}: the rest of the bundle still applies");
-            assert!(fr, "{name}: only the wgrad fusion is blocked");
-            assert!(!fw, "{name}: must not enable a fusion clap will reject");
+            let e = expand(true, b);
+            assert!(e.source_ad && e.blocks, "{name}: the rest of the bundle still applies");
+            assert!(e.fuse_rmsnorm, "{name}: only the wgrad fusion is blocked");
+            assert!(!e.fuse_wgrad, "{name}: must not enable a fusion clap will reject");
         }
     }
 
@@ -629,13 +642,18 @@ mod tests {
     /// run silently keeps a non-bit-exact fusion it never asked for.
     #[test]
     fn training_reference_strips_the_bundle_fusions() {
-        let (_, _, _, fr, fw) = expand(true, None, None, clear());
-        assert!(fr && fw);
+        let e = expand(true, clear());
+        assert!(e.fuse_rmsnorm && e.fuse_wgrad && e.blocks && e.selective);
         let mut opts = nsl_codegen::CompileOptions {
             diagnostics: nsl_codegen::DiagnosticsOptions { training_reference: true, ..Default::default() },
+            checkpoint: nsl_codegen::CheckpointOptions {
+                blocks: e.blocks,
+                selective: e.selective,
+                ..Default::default()
+            },
             fusion: nsl_codegen::FusionOptions {
-                rmsnorm_backward: fr,
-                wgrad_accum: fw,
+                rmsnorm_backward: e.fuse_rmsnorm,
+                wgrad_accum: e.fuse_wgrad,
                 ..Default::default()
             },
             ..Default::default()
@@ -644,6 +662,10 @@ mod tests {
         assert!(
             !opts.fusion.rmsnorm_backward && !opts.fusion.wgrad_accum,
             "reference mode must disable both bundle-enabled fusions"
+        );
+        assert!(
+            !opts.checkpoint.blocks && !opts.checkpoint.selective,
+            "reference mode must disable the bundle's checkpointing"
         );
     }
 }

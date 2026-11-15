@@ -118,9 +118,9 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
 
     // Meta-flag expansion (roadmap 3.3) — see the twin call in build/options.rs.
     let mut bundle = crate::meta_flags::PretrainBundle {
-        wggo,
-        csha,
         source_ad,
+        checkpoint_blocks,
+        checkpoint_selective,
         fuse_rmsnorm_backward,
         fuse_wgrad_accum,
         // Out-parameter: `expand_pretrain_optimized` raises it only when the
@@ -138,9 +138,9 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
         },
     );
     let crate::meta_flags::PretrainBundle {
-        wggo,
-        csha,
         source_ad,
+        checkpoint_blocks,
+        checkpoint_selective,
         fuse_rmsnorm_backward,
         fuse_wgrad_accum,
         fuse_wgrad_accum_from_bundle,

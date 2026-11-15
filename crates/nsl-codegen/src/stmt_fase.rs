@@ -272,6 +272,17 @@ impl Compiler<'_> {
         // would write the transient f32 working view and silently diverge
         // from the authoritative mirror on the next widen — refuse instead
         // of corrupting (deferral-must-refuse).
+        // `first_moment_dtype="bf16"`: the interpreted program would run f32
+        // ops on the bf16 `m` buffer. Only the fused kernel reads it.
+        if self.features.first_moment_bf16 && (fused_scalars.is_none() || wrap_offload) {
+            return Err(crate::error::CodegenError::new(
+                "first_moment_dtype=\"bf16\" requires the fused AdamW/Adam update \
+                 (strict structural match, no offload staging): this optimizer program \
+                 would fall to the interpreted path, which reads m as f32. Use \
+                 AdamW/Adam without NSL_FASE_FUSED_STEP=0 / --training-reference, or \
+                 drop the argument",
+            ));
+        }
         let bf16sr = self.features.param_dtype_bf16sr;
         if bf16sr && fused_scalars.is_none() {
             return Err(crate::error::CodegenError::new(

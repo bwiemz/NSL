@@ -91,6 +91,16 @@ impl Compiler<'_> {
             self.build_escape_analysis(stmts);
         }
 
+        // `first_moment_dtype="bf16"` anywhere in the program, recorded
+        // before the first train block lowers: one inside a function lowers
+        // here, before `main` emits the execution fingerprint that must
+        // carry it (see the field doc).
+        let first_moment_bf16 = crate::stmt_train::contract::program_requests_bf16_first_moment(
+            stmts,
+            &|sym| self.resolve_sym(sym).to_string(),
+        );
+        self.features.program_first_moment_bf16 |= first_moment_bf16;
+
         // The bodies source AD may inline (see the field doc). Recorded
         // here because this runs before any statement of the module body
         // -- and so before any train/distill/grad block -- is lowered.

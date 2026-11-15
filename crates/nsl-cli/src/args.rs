@@ -628,25 +628,28 @@ pub(crate) struct BuildArgs {
         #[arg(long)]
         pub(crate) source_ad: bool,
 
-        /// Pretraining bundle: expands to `--source-ad --wggo greedy --csha auto
-        /// --fuse-rmsnorm-backward --fuse-wgrad-accum` so one invocation runs
-        /// WGGO planning, applies CSHA + FASE per the plan, and takes both
-        /// backward fusions. Explicit flags win (only unset values are filled);
-        /// conflicts with `--tape-ad` (the planning stack lives in the
-        /// source-AD path).
+        /// Pretraining bundle: the measured production flag set, `--source-ad
+        /// --checkpoint-blocks --checkpoint-selective --fuse-rmsnorm-backward
+        /// --fuse-wgrad-accum`, plus `--fuse-lm-head auto`. Explicit flags win
+        /// (only unset values are filled; a typed `--checkpoint-blocks` alone
+        /// keeps full block recompute); conflicts with `--tape-ad`.
+        ///
+        /// CHANGED 2026-11-15: the bundle used to be `--source-ad --wggo greedy
+        /// --csha auto` plus the two fusions. `--wggo greedy` changes no memory
+        /// and took the optimizer step off the batched multi-tensor AdamW
+        /// launch: 0.82x tok/s at Coder-1B and 0.89x at Coder-500M against
+        /// this set (models/benchmarks/MEMORY_OPTIONS_2026_11.md). Pass `--wggo greedy` / `--csha auto`
+        /// explicitly for the planners.
         ///
         /// The two fusions change the ARITHMETIC, not just the schedule — that
-        /// is why they are opt-in elsewhere. Measured on Coder-50M (batch 4,
-        /// seq 1024): +14% tok/s, max relative loss divergence 1.2e-5 over 24
-        /// steps with an identical trend — a number produced by
-        /// `--fuse-rmsnorm-backward` and the rest of the bundle, NOT by
-        /// `--fuse-wgrad-accum`, which needs `grad_accumulation >= 2` in the
-        /// train block and fused nothing in that run (codegen says so per
-        /// train block: `[wgrad-fusion] declined: ...`).
-        /// `--training-reference` strips them back out for a reference run,
-        /// and `--fuse-wgrad-accum` is skipped (with a note) when
-        /// `--grad-integrity`, `--optim-state-offload` or `--layerwise-accum`
-        /// is set, since it refuses those.
+        /// is why they are opt-in elsewhere. `--fuse-wgrad-accum` needs
+        /// `grad_accumulation >= 2` in the train block (codegen says per block
+        /// when it declines: `[wgrad-fusion] declined: ...`). A model without
+        /// `blocks.N` parameters runs without checkpointing (CCR declines with a
+        /// warning). `--training-reference` strips the fusions and the
+        /// checkpointing back out, and `--fuse-wgrad-accum` is skipped (with a
+        /// note) when `--grad-integrity`, `--optim-state-offload` or
+        /// `--layerwise-accum` is set, since it refuses those.
         #[arg(long, conflicts_with = "tape_ad")]
         pub(crate) pretrain_optimized: bool,
 
@@ -674,7 +677,10 @@ pub(crate) struct BuildArgs {
         #[arg(long)]
         pub(crate) distribute: Option<String>,
 
-        /// M43: ZeRO optimizer sharding stage (1, 2, or 3)
+        /// M43: ZeRO optimizer sharding stage (1, 2, or 3). ZeRO shards across
+        /// ranks: with one device (`--devices 1`, the default) it shards
+        /// nothing, saves no memory (measured 2026-11) and says so at compile
+        /// time.
         #[arg(long)]
         pub(crate) zero_stage: Option<u32>,
 
@@ -750,6 +756,11 @@ pub(crate) struct BuildArgs {
 
         /// WGGO: global-optimization mode ("full", "greedy", or "off").
         /// Passing `--wggo` without a value enables full mode.
+        ///
+        /// Not a memory option. With the production flags `greedy` changes no
+        /// memory and costs 0.82x tok/s at Coder-1B bf16 and 0.89x at
+        /// Coder-500M TF32 (2026-11, models/benchmarks/MEMORY_OPTIONS_2026_11.md): its plan routes the
+        /// optimizer step off the batched multi-tensor AdamW launch.
         #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "full")]
         pub(crate) wggo: Option<String>,
 
@@ -759,8 +770,13 @@ pub(crate) struct BuildArgs {
 
         /// WGGO: lower the plan's optimizer-moment precision decisions
         /// (optim_m/v_bits) to real m/v storage dtypes. Opt-in: changes
-        /// training numerics. Works on CPU and GPU (the GPU cast envelope
-        /// uses the CFTP-v7 PTX cast kernels).
+        /// training numerics. WGGO decides reduced moments only with
+        /// sensitivity data (`--wggo-weights`) or under `--wggo-memory-budget`;
+        /// a train block for which it decided none is a compile error rather
+        /// than a run identical to one without the flag (on the production
+        /// recipes it was byte-identical, 2026-11). For a bf16 first moment
+        /// regardless of a plan, use the optimizer argument
+        /// `first_moment_dtype="bf16"`.
         #[arg(long)]
         pub(crate) wggo_moment_precision: bool,
 
@@ -814,8 +830,12 @@ pub(crate) struct BuildArgs {
 
         /// Optimizer-state offload (single-GPU ZeRO-Offload analog): keep the
         /// Adam/momentum state (m/v) HOST-resident (pinned when a GPU is
-        /// live) and stage it to the device for each optimizer step, freeing
-        /// 1-2x parameter bytes of VRAM. The update math still runs on the
+        /// live) and stage it to the device for each optimizer step. The
+        /// gradient accumulator (m_partial) is host-resident too and is
+        /// staged on every micro-batch: 3x parameter bytes of VRAM freed
+        /// for AdamW (-11.8 GiB at Coder-1B), at 0.42x tok/s there (0.60x of
+        /// the same flags without --fuse-wgrad-accum, which it refuses;
+        /// 2026-11, models/benchmarks/MEMORY_OPTIONS_2026_11.md). The update math still runs on the
         /// GPU in f32, so FASE == AdamW exactness is preserved; the copy-back
         /// overlaps the next parameter's update on a dedicated transfer
         /// stream. COMPOSES with reduced-precision moments
@@ -921,6 +941,10 @@ pub(crate) struct BuildArgs {
         /// never materializes), --optim-state-offload (host-resident
         /// m_partial the device GEMM cannot write), and --layerwise-accum
         /// (pre-sliced tapes defeat the fusion's single-reader proof).
+        ///
+        /// Measured with the other production flags (2026-11, models/benchmarks/MEMORY_OPTIONS_2026_11.md):
+        /// 1.41x tok/s at Coder-1B with bf16 GEMMs, 1.25x with TF32, 1.29x at
+        /// Coder-500M TF32, at no memory cost.
         #[arg(
             long,
             requires = "source_ad_mode",
@@ -949,13 +973,26 @@ pub(crate) struct BuildArgs {
         #[arg(long, requires = "checkpoint_blocks")]
         pub(crate) layerwise_accum: bool,
 
-        /// With --layerwise-accum: layer WEIGHT streaming (D2b). Layer-
-        /// grouped params live in pinned host mirrors and hold a device
-        /// buffer ONLY inside their brackets: the forward uploads each
+        /// With --layerwise-accum: layer WEIGHT streaming (D2b). A streamed
+        /// layer-grouped parameter lives in a pinned host mirror and holds a
+        /// device buffer only inside its brackets: the forward uploads each
         /// layer right before its CCR segment and evicts it after its last
-        /// primal read; the window backward re-uploads per replay range
-        /// and writes back after that layer's update. Teardown restores
-        /// residency for model_save/eval. Byte-preserving / bit-exact.
+        /// primal read; the window backward re-uploads per replay range and
+        /// writes back after that layer's update. Teardown restores residency
+        /// for model_save/eval. Byte-preserving / bit-exact.
+        ///
+        /// WHETHER anything streams is decided at run time: a residency
+        /// policy keeps parameters device-resident while the VRAM free at
+        /// the first registration exceeds a reserve (half the card,
+        /// NSL_WS_RESIDENT_RESERVE_MIB), and streams only the excess. On a
+        /// 32 GB card it streams nothing at Coder-1B and the run then runs
+        /// out of memory; NSL_WS_RESIDENT=0 streams every layer, and
+        /// NSL_WS_COUNTER=1 prints the decision at exit. Measured (2026-11,
+        /// models/benchmarks/MEMORY_OPTIONS_2026_11.md), streaming everything removes the layer weights
+        /// (3.4 GiB at 1B) at 0.83x of the same flags without streaming, but
+        /// --layerwise-accum's forward keeps every block's activations until
+        /// the end of the forward, so the run's peak is above the
+        /// production flags' (+0.3 GiB at 1B, +8 GiB at 500M).
         #[arg(long, requires = "layerwise_accum")]
         pub(crate) weight_stream: bool,
 
@@ -1042,6 +1079,13 @@ pub(crate) struct BuildArgs {
         /// the kernel profiler. Bit-exact (same kernels, same order, same
         /// stream). NSL_CUDA_GRAPHS=0 disables at runtime;
         /// NSL_CUDA_GRAPH_LOG=1 traces capture decisions.
+        ///
+        /// It turns off the timed cublasLt GEMM selection (the tune
+        /// synchronises) and, with bf16 GEMMs, the bf16 weight-cast cache.
+        /// Measured with the production flags (2026-11, models/benchmarks/MEMORY_OPTIONS_2026_11.md):
+        /// 0.85x tok/s at Coder-1B TF32, 0.90x with bf16 GEMMs (where it
+        /// also lowers the peak by the cast cache's 1.8 GiB), 0.84x at
+        /// Coder-500M TF32.
         #[arg(long)]
         pub(crate) cuda_graphs: bool,
 
@@ -1049,7 +1093,10 @@ pub(crate) struct BuildArgs {
         /// transfers into ONE contiguous host<->device transfer through a
         /// stable, reused device staging arena. Fewer CUDA calls, one large
         /// PCIe transaction per layer, stable device addresses, less
-        /// fragmentation. Bit-exact with the per-param path.
+        /// fragmentation. Bit-exact with the per-param path. Measured
+        /// (2026-11): 0.83x of per-parameter streaming at Coder-1B and
+        /// -500M, because every pack upload first gathers the per-parameter
+        /// host mirrors into a staging buffer with one host memcpy.
         #[arg(long, requires = "weight_stream")]
         pub(crate) stream_arena: bool,
 
@@ -1057,14 +1104,16 @@ pub(crate) struct BuildArgs {
         /// weight stream — prefetch each layer's pack (async HtoD) while the
         /// previous layer computes, guarded by a per-pack CUDA event. WGGO
         /// activates the overlap only where compute hides the transfer.
-        /// Bit-exact with the synchronous arena path.
+        /// Bit-exact with the synchronous arena path. Measured (2026-11):
+        /// within 1% of the arena path without it.
         #[arg(long, requires = "stream_arena")]
         pub(crate) stream_prefetch: bool,
 
         /// Item 11 writeback half (requires --stream-arena): issue each layer
         /// pack's post-update DtoH on the transfer stream instead of blocking
         /// — the next layer's compute overlaps the writeback; the mirror
-        /// scatter lands at the runtime's drain points. Bit-exact.
+        /// scatter lands at the runtime's drain points. Bit-exact. Measured
+        /// (2026-11), with --stream-prefetch: 1.01-1.02x of the arena path.
         #[arg(long, requires = "stream_arena")]
         pub(crate) stream_async_writeback: bool,
 
@@ -1276,25 +1325,28 @@ pub(crate) struct RunArgs {
         #[arg(long)]
         pub(crate) source_ad: bool,
 
-        /// Pretraining bundle: expands to `--source-ad --wggo greedy --csha auto
-        /// --fuse-rmsnorm-backward --fuse-wgrad-accum` so one invocation runs
-        /// WGGO planning, applies CSHA + FASE per the plan, and takes both
-        /// backward fusions. Explicit flags win (only unset values are filled);
-        /// conflicts with `--tape-ad` (the planning stack lives in the
-        /// source-AD path).
+        /// Pretraining bundle: the measured production flag set, `--source-ad
+        /// --checkpoint-blocks --checkpoint-selective --fuse-rmsnorm-backward
+        /// --fuse-wgrad-accum`, plus `--fuse-lm-head auto`. Explicit flags win
+        /// (only unset values are filled; a typed `--checkpoint-blocks` alone
+        /// keeps full block recompute); conflicts with `--tape-ad`.
+        ///
+        /// CHANGED 2026-11-15: the bundle used to be `--source-ad --wggo greedy
+        /// --csha auto` plus the two fusions. `--wggo greedy` changes no memory
+        /// and took the optimizer step off the batched multi-tensor AdamW
+        /// launch: 0.82x tok/s at Coder-1B and 0.89x at Coder-500M against
+        /// this set (models/benchmarks/MEMORY_OPTIONS_2026_11.md). Pass `--wggo greedy` / `--csha auto`
+        /// explicitly for the planners.
         ///
         /// The two fusions change the ARITHMETIC, not just the schedule — that
-        /// is why they are opt-in elsewhere. Measured on Coder-50M (batch 4,
-        /// seq 1024): +14% tok/s, max relative loss divergence 1.2e-5 over 24
-        /// steps with an identical trend — a number produced by
-        /// `--fuse-rmsnorm-backward` and the rest of the bundle, NOT by
-        /// `--fuse-wgrad-accum`, which needs `grad_accumulation >= 2` in the
-        /// train block and fused nothing in that run (codegen says so per
-        /// train block: `[wgrad-fusion] declined: ...`).
-        /// `--training-reference` strips them back out for a reference run,
-        /// and `--fuse-wgrad-accum` is skipped (with a note) when
-        /// `--grad-integrity`, `--optim-state-offload` or `--layerwise-accum`
-        /// is set, since it refuses those.
+        /// is why they are opt-in elsewhere. `--fuse-wgrad-accum` needs
+        /// `grad_accumulation >= 2` in the train block (codegen says per block
+        /// when it declines: `[wgrad-fusion] declined: ...`). A model without
+        /// `blocks.N` parameters runs without checkpointing (CCR declines with a
+        /// warning). `--training-reference` strips the fusions and the
+        /// checkpointing back out, and `--fuse-wgrad-accum` is skipped (with a
+        /// note) when `--grad-integrity`, `--optim-state-offload` or
+        /// `--layerwise-accum` is set, since it refuses those.
         #[arg(long, conflicts_with = "tape_ad")]
         pub(crate) pretrain_optimized: bool,
 
@@ -1348,7 +1400,10 @@ pub(crate) struct RunArgs {
         #[arg(long)]
         pub(crate) distribute: Option<String>,
 
-        /// M43: ZeRO optimizer sharding stage (1, 2, or 3)
+        /// M43: ZeRO optimizer sharding stage (1, 2, or 3). ZeRO shards across
+        /// ranks: with one device (`--devices 1`, the default) it shards
+        /// nothing, saves no memory (measured 2026-11) and says so at compile
+        /// time.
         #[arg(long)]
         pub(crate) zero_stage: Option<u32>,
 
@@ -1437,6 +1492,11 @@ pub(crate) struct RunArgs {
         /// Passing `--wggo` without a value enables full mode. Mirrors
         /// `nsl build --wggo` so the WGGO mode-table dispatch reaches
         /// `emit_unified_optim_step_dispatch` end-to-end via `nsl run`.
+        ///
+        /// Not a memory option. With the production flags `greedy` changes no
+        /// memory and costs 0.82x tok/s at Coder-1B bf16 and 0.89x at
+        /// Coder-500M TF32 (2026-11, models/benchmarks/MEMORY_OPTIONS_2026_11.md): its plan routes the
+        /// optimizer step off the batched multi-tensor AdamW launch.
         #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "full")]
         pub(crate) wggo: Option<String>,
 
@@ -1446,8 +1506,13 @@ pub(crate) struct RunArgs {
 
         /// WGGO: lower the plan's optimizer-moment precision decisions
         /// (optim_m/v_bits) to real m/v storage dtypes. Opt-in: changes
-        /// training numerics. Works on CPU and GPU (the GPU cast envelope
-        /// uses the CFTP-v7 PTX cast kernels).
+        /// training numerics. WGGO decides reduced moments only with
+        /// sensitivity data (`--wggo-weights`) or under `--wggo-memory-budget`;
+        /// a train block for which it decided none is a compile error rather
+        /// than a run identical to one without the flag (on the production
+        /// recipes it was byte-identical, 2026-11). For a bf16 first moment
+        /// regardless of a plan, use the optimizer argument
+        /// `first_moment_dtype="bf16"`.
         #[arg(long)]
         pub(crate) wggo_moment_precision: bool,
 
@@ -1501,8 +1566,12 @@ pub(crate) struct RunArgs {
 
         /// Optimizer-state offload (single-GPU ZeRO-Offload analog): keep the
         /// Adam/momentum state (m/v) HOST-resident (pinned when a GPU is
-        /// live) and stage it to the device for each optimizer step, freeing
-        /// 1-2x parameter bytes of VRAM. The update math still runs on the
+        /// live) and stage it to the device for each optimizer step. The
+        /// gradient accumulator (m_partial) is host-resident too and is
+        /// staged on every micro-batch: 3x parameter bytes of VRAM freed
+        /// for AdamW (-11.8 GiB at Coder-1B), at 0.42x tok/s there (0.60x of
+        /// the same flags without --fuse-wgrad-accum, which it refuses;
+        /// 2026-11, models/benchmarks/MEMORY_OPTIONS_2026_11.md). The update math still runs on the
         /// GPU in f32, so FASE == AdamW exactness is preserved; the copy-back
         /// overlaps the next parameter's update on a dedicated transfer
         /// stream. COMPOSES with reduced-precision moments
@@ -1608,6 +1677,10 @@ pub(crate) struct RunArgs {
         /// never materializes), --optim-state-offload (host-resident
         /// m_partial the device GEMM cannot write), and --layerwise-accum
         /// (pre-sliced tapes defeat the fusion's single-reader proof).
+        ///
+        /// Measured with the other production flags (2026-11, models/benchmarks/MEMORY_OPTIONS_2026_11.md):
+        /// 1.41x tok/s at Coder-1B with bf16 GEMMs, 1.25x with TF32, 1.29x at
+        /// Coder-500M TF32, at no memory cost.
         #[arg(
             long,
             requires = "source_ad_mode",
@@ -1636,13 +1709,26 @@ pub(crate) struct RunArgs {
         #[arg(long, requires = "checkpoint_blocks")]
         pub(crate) layerwise_accum: bool,
 
-        /// With --layerwise-accum: layer WEIGHT streaming (D2b). Layer-
-        /// grouped params live in pinned host mirrors and hold a device
-        /// buffer ONLY inside their brackets: the forward uploads each
+        /// With --layerwise-accum: layer WEIGHT streaming (D2b). A streamed
+        /// layer-grouped parameter lives in a pinned host mirror and holds a
+        /// device buffer only inside its brackets: the forward uploads each
         /// layer right before its CCR segment and evicts it after its last
-        /// primal read; the window backward re-uploads per replay range
-        /// and writes back after that layer's update. Teardown restores
-        /// residency for model_save/eval. Byte-preserving / bit-exact.
+        /// primal read; the window backward re-uploads per replay range and
+        /// writes back after that layer's update. Teardown restores residency
+        /// for model_save/eval. Byte-preserving / bit-exact.
+        ///
+        /// WHETHER anything streams is decided at run time: a residency
+        /// policy keeps parameters device-resident while the VRAM free at
+        /// the first registration exceeds a reserve (half the card,
+        /// NSL_WS_RESIDENT_RESERVE_MIB), and streams only the excess. On a
+        /// 32 GB card it streams nothing at Coder-1B and the run then runs
+        /// out of memory; NSL_WS_RESIDENT=0 streams every layer, and
+        /// NSL_WS_COUNTER=1 prints the decision at exit. Measured (2026-11,
+        /// models/benchmarks/MEMORY_OPTIONS_2026_11.md), streaming everything removes the layer weights
+        /// (3.4 GiB at 1B) at 0.83x of the same flags without streaming, but
+        /// --layerwise-accum's forward keeps every block's activations until
+        /// the end of the forward, so the run's peak is above the
+        /// production flags' (+0.3 GiB at 1B, +8 GiB at 500M).
         #[arg(long, requires = "layerwise_accum")]
         pub(crate) weight_stream: bool,
 
@@ -1729,22 +1815,33 @@ pub(crate) struct RunArgs {
         /// the kernel profiler. Bit-exact (same kernels, same order, same
         /// stream). NSL_CUDA_GRAPHS=0 disables at runtime;
         /// NSL_CUDA_GRAPH_LOG=1 traces capture decisions.
+        ///
+        /// It turns off the timed cublasLt GEMM selection (the tune
+        /// synchronises) and, with bf16 GEMMs, the bf16 weight-cast cache.
+        /// Measured with the production flags (2026-11, models/benchmarks/MEMORY_OPTIONS_2026_11.md):
+        /// 0.85x tok/s at Coder-1B TF32, 0.90x with bf16 GEMMs (where it
+        /// also lowers the peak by the cast cache's 1.8 GiB), 0.84x at
+        /// Coder-500M TF32.
         #[arg(long)]
         pub(crate) cuda_graphs: bool,
 
         /// Item 10 (requires --weight-stream): batch each layer's per-param
         /// transfers into ONE contiguous host<->device transfer through a
         /// stable, reused device staging arena. Bit-exact with per-param.
+        /// Measured (2026-11): 0.83x of per-parameter streaming at Coder-1B
+        /// and -500M (each upload gathers the host mirrors with a memcpy).
         #[arg(long, requires = "weight_stream")]
         pub(crate) stream_arena: bool,
 
         /// Item 11 (requires --stream-arena): double-buffer the backward
         /// weight stream with async prefetch + per-pack CUDA events. Bit-exact.
+        /// Measured (2026-11): within 1% of the arena path without it.
         #[arg(long, requires = "stream_arena")]
         pub(crate) stream_prefetch: bool,
 
         /// Item 11 writeback half (requires --stream-arena): async pack
         /// writeback DtoH on the transfer stream; scatter at drain points.
+        /// Measured (2026-11), with --stream-prefetch: 1.01-1.02x of the arena path.
         #[arg(long, requires = "stream_arena")]
         pub(crate) stream_async_writeback: bool,
 

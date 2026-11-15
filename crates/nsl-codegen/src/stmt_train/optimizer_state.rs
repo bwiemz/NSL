@@ -117,6 +117,27 @@ impl Compiler<'_> {
         // first-moment buffer to BF16 storage (code 3). Reuses the CPDT
         // precision alloc plumbing; v stays f32 (null-sloted per param on
         // the Muon route, and the AdamW arm's v is untouched by rung 2).
+        // `first_moment_dtype="bf16"`: every first-moment buffer is allocated
+        // bf16 (code 3); v stays f32. The fused AdamW kernels read the dtype
+        // off the buffer. The CPDT/WGGO precision envelope is a second owner
+        // of the same buffers' dtype — refuse rather than pick one.
+        if self.features.first_moment_bf16 && cpdt_precision_dtypes.is_some() {
+            return Err(CodegenError::new(
+                "first_moment_dtype=\"bf16\" does not compose with a CPDT/WGGO \
+                 reduced-precision moment plan (two owners for the first moment's \
+                 dtype). Drop one",
+            ));
+        }
+        let first_moment_codes: Option<Value> = if self.features.first_moment_bf16 {
+            let list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+            let bf16_code = builder.ins().iconst(cl_types::I64, 3);
+            for _ in 0..param_paths.len() {
+                self.compile_call_by_name(builder, "nsl_list_push", &[list, bf16_code])?;
+            }
+            Some(list)
+        } else {
+            None
+        };
         let muon_state_m_codes: Option<Value> = if self.features.muon_state_bf16 {
             let list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
             let bf16_code = builder.ins().iconst(cl_types::I64, 3);
@@ -266,7 +287,10 @@ impl Compiler<'_> {
             let offload = self.compile_options.train.optim_state_offload;
             // `cpdt_precision_dtypes` is `Option<(Value, Value)>` (Value: Copy),
             // so projecting each moment's dtype-code list by value is fine.
-            let m_list = cpdt_precision_dtypes.map(|(m, _)| m).or(muon_state_m_codes);
+            let m_list = cpdt_precision_dtypes
+                .map(|(m, _)| m)
+                .or(muon_state_m_codes)
+                .or(first_moment_codes);
 
             // P0.1: first-moment buffers under the OptimM surface. The offload
             // variant allocates HOST tensors — inert GPU tag (host state is not

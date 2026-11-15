@@ -1085,6 +1085,16 @@ const SWEEP_ALLOWLIST: &[(&str, &str)] = &[
         "staleness refusal, not a flag-pair incompatibility",
     ),
     ("warning \u{2014} --wrga-ablate=spectral", "advisory warning, run continues"),
+    // A single flag's INERTNESS refusal, not a pair: --wggo-moment-precision
+    // is refused when WGGO lowered no moment for the block; the other flags
+    // it names are the ways to give WGGO a decision to lower.
+    (
+        "--wggo-moment-precision has no effect on this train block",
+        "single-flag inertness refusal; the other flags named are remedies",
+    ),
+    // ADVISORY: ZeRO with one device compiles and runs the unsharded
+    // baseline; the warning says so. Not a refusal.
+    ("with one device does nothing", "advisory warning, compile succeeds"),
     // A single-flag refusal, not a composition rule: every calibration flag
     // is refused on its own because `nsl build` does not run the calibration
     // harness (roadmap item 8; it used to be accepted and dropped with a

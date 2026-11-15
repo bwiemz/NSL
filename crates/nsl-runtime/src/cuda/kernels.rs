@@ -351,6 +351,27 @@ pub(crate) fn fase_fused_adamw_multi_f32_ptx() -> &'static str {
     })
 }
 
+/// `first_moment_dtype="bf16"`: the per-parameter step with a bf16 first
+/// moment (`nsl_kir::kernels::optim::build_fase_adamw_step_mbf16` — `m`
+/// widened exactly on load, `m'` rounded to nearest even on store, the update
+/// computed from the f32 `m'`). NUL-terminated.
+pub(crate) fn fase_fused_adamw_step_f32_mbf16_ptx() -> &'static str {
+    static MODULE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    MODULE.get_or_init(|| {
+        String::from_utf8(nsl_kir::kernels::optim::fase_adamw_step_mbf16_ptx()).expect("PTX must be ASCII")
+    })
+}
+
+/// `first_moment_dtype="bf16"`: [`fase_fused_adamw_multi_f32_ptx`] with every
+/// first moment bf16 (`build_fase_adamw_multi_mbf16`). Same signature and
+/// flat grid; `mtab` holds bf16 pointers. NUL-terminated.
+pub(crate) fn fase_fused_adamw_multi_f32_mbf16_ptx() -> &'static str {
+    static MODULE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    MODULE.get_or_init(|| {
+        String::from_utf8(nsl_kir::kernels::optim::fase_adamw_multi_mbf16_ptx()).expect("PTX must be ASCII")
+    })
+}
+
 /// Roadmap item 8, bf16-SR arm: MULTI-parameter fused SR-BF16 AdamW step on
 /// the SAME flat grid as `nsl_fase_fused_adamw_multi_f32` (bptab/bbtab block
 /// tables, per-param base pointers from device tables), with the SR-BF16
