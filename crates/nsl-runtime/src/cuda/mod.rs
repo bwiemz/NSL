@@ -6794,7 +6794,7 @@ pub(crate) fn device_iota_f32(n: usize) -> *const f32 {
     // f32 holds every integer up to 2^24 exactly; past that the "index" a gather
     // reads would not be the position it names. No table is that long.
     assert!(n <= 1 << 24, "device_iota_f32: {n} positions exceed f32's exact integers");
-    let len = n.next_power_of_two().max(1024).min(1 << 24);
+    let len = n.next_power_of_two().clamp(1024, 1 << 24);
     let host: Vec<f32> = (0..len).map(|i| i as f32).collect();
     let dev = {
         use crate::cuda::caching_allocator::{AllocPool, PoolGuard};
