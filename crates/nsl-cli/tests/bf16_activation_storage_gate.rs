@@ -300,9 +300,9 @@ fn both_attention_halves_are_planned_with_the_mlp_halves() {
 }
 
 /// The attention half on the GPU: the tensor-core kernels with bf16 I/O, the
-/// bf16 copies around them and GQA's gradient sum. Losses track the same
-/// program with f32 storage and bf16 GEMMs. (RoPE still runs on the counted
-/// widen/compute/narrow path here; the fused RoPE op removes it.)
+/// fused RoPE reading the strided head view, the bf16 copies around them and
+/// GQA's gradient sum, none of them taking the widen/compute/narrow fallback.
+/// Losses track the same program with f32 storage and bf16 GEMMs.
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn the_attention_half_trains_like_f32_storage_with_bf16_gemms() {
@@ -311,6 +311,11 @@ fn the_attention_half_trains_like_f32_storage_with_bf16_gemms() {
     let bf16 = nsl(&bf16_args, &attention_fixture(BF16, true), "gpu_attn_bf16", true, &[]);
     assert!(bf16.ok, "precision=\"bf16\" run failed:\n{}", bf16.out);
     assert!(bf16.out.contains(ATTN_PLANNED), "{}", bf16.out);
+    assert!(
+        !bf16.out.contains("widens to f32, computes and narrows"),
+        "a dtype-explicit op of the attention half took the fallback (strided, host or broadcast operand):\n{}",
+        bf16.out
+    );
     let mut ref_args = bf16_args.clone();
     ref_args.extend_from_slice(&["--matmul-mode", "bf16"]);
     let reference = nsl(&ref_args, &attention_fixture("", true), "gpu_attn_ref", true, &[]);
