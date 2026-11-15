@@ -16,6 +16,12 @@ order a campaign uses them (each GPU one is short enough to queue on its own):
     diag      one NSL arm under extra diagnostic environment (NSL_HOST_PROFILE=1, ...).
     report    every result under --out as tables: median over rounds, min-max
               spread, within-round spread, MFU, allocator / reserved / driver peaks.
+    pairs     paired tok/s ratios between two arms, taken within each round.
+
+Before/after a compiler change: freeze each toolchain in a directory (`bin/nsl`,
+`lib/libnsl_runtime.a`, `stdlib/`), register it with `--toolchain NAME=DIR`, and name
+arms `nsl_tf32@NAME`; both builds then run in the same rounds and `pairs --pair
+nsl_tf32@after/nsl_tf32@before` gives the paired ratio.
 
 Arms. `nsl_tf32`: the 1B production posture (PROD_FLAGS, f32 weights, the runtime's
 default TF32 cuBLAS math mode). `nsl_bf16`: the same flags built and run with
@@ -165,10 +171,17 @@ class Arm:
     env: tuple[tuple[str, str], ...] = ()  # NSL: environment of the run
     compile: bool = False
     ckpt: str = "selective"
+    # NSL: which toolchain builds the arm (`<arm>@<variant>`, see `--toolchain`);
+    # "" is `--nsl` with the repository's stdlib.
+    variant: str = ""
 
     @property
-    def build_key(self) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
-        return self.flags, self.build_env
+    def build_key(self) -> BuildKey:
+        return self.flags, self.build_env, self.variant
+
+
+# (flags, build environment, toolchain variant): one built binary per key.
+BuildKey = tuple[tuple[str, ...], tuple[tuple[str, str], ...], str]
 
 
 BF16 = (("NSL_MATMUL_BF16", "1"),)
@@ -178,6 +191,15 @@ NO_DRAIN = (("NSL_SKIP_GPU_DRAIN", "1"),)
 
 
 def arm(name: str) -> Arm:
+    """An arm by name. `<nsl arm>@<variant>` is the same arm built by the toolchain
+    registered as `--toolchain <variant>=DIR`, so two compilers can be timed in the
+    same rounds (before/after a change) and compared with `pairs`."""
+    base, sep, variant = name.partition("@")
+    if sep:
+        a = arm(base)
+        if a.kind != "nsl" or not re.fullmatch(r"[A-Za-z0-9_.-]+", variant):
+            raise SystemExit(f"arm {name!r}: only NSL arms take an @variant (alphanumeric)")
+        return dataclasses.replace(a, name=name, variant=variant)
     nsl = {
         "nsl_tf32": Arm(name, "nsl", "tf32", tuple(PROD_FLAGS)),
         "nsl_bf16": Arm(name, "nsl", "bf16", tuple(PROD_FLAGS), BF16),
@@ -197,12 +219,40 @@ def arm(name: str) -> Arm:
     return Arm(name, "torch", m.group(1), compile=m.group(2) == "compile", ckpt=ckpt)
 
 
-def flag_key(key: tuple[tuple[str, ...], tuple[tuple[str, str], ...]]) -> str:
-    flags, build_env = key
+def flag_key(key: BuildKey) -> str:
+    flags, build_env, variant = key
     tag = "_".join(f.removeprefix("--").replace("-", "") for f in flags)
     if build_env:
         tag += "__" + "_".join(f"{k.removeprefix('NSL_').lower()}{v}" for k, v in build_env)
+    if variant:
+        tag += "@" + variant
     return "nsl_" + tag
+
+
+@dataclasses.dataclass(frozen=True)
+class Toolchain:
+    """What builds an NSL arm: the `nsl` binary and the stdlib it compiles against."""
+
+    nsl: Path
+    stdlib: Path
+
+
+def toolchains(args: argparse.Namespace) -> dict[str, Toolchain]:
+    """`--toolchain NAME=DIR` registrations. DIR is a frozen toolchain: `bin/nsl`,
+    `lib/libnsl_runtime.a` (found by `nsl` next to its own `bin/`), `stdlib/`. The
+    empty name is `--nsl` with the repository's stdlib."""
+    out = {"": Toolchain(args.nsl.resolve(), REPO / "stdlib")}
+    for spec in getattr(args, "toolchain", None) or []:
+        name, sep, d = spec.partition("=")
+        root = Path(d).resolve()
+        if not sep or not (root / "bin" / "nsl").is_file():
+            raise SystemExit(f"--toolchain {spec!r}: want NAME=DIR with DIR/bin/nsl")
+        if not (root / "lib" / "libnsl_runtime.a").is_file():
+            raise SystemExit(f"--toolchain {spec!r}: DIR/lib/libnsl_runtime.a missing")
+        if not (root / "stdlib").is_dir():
+            raise SystemExit(f"--toolchain {spec!r}: DIR/stdlib missing")
+        out[name] = Toolchain(root / "bin" / "nsl", root / "stdlib")
+    return out
 
 
 # ── the NSL program ──────────────────────────────────────────────────────────
@@ -280,14 +330,15 @@ def nsl_env() -> dict[str, str]:
 
 
 def build_nsl(
-    nsl: Path,
+    tc: Toolchain,
     work: Path,
     shape: Shape,
-    key: tuple[tuple[str, ...], tuple[tuple[str, str], ...]],
+    key: BuildKey,
     updates: int,
     phase: bool,
 ) -> Path:
-    flags, build_env = key
+    flags, build_env, variant = key
+    nsl = tc.nsl
     d = work / flag_key(key)
     d.mkdir(parents=True, exist_ok=True)
     for f in ("model.nsl", "config.nsl"):
@@ -308,6 +359,7 @@ def build_nsl(
     )
     binary = d / ("prog_phase" if phase else "prog")
     env = nsl_env()
+    env["NSL_STDLIB_PATH"] = str(tc.stdlib)
     env.update(dict(build_env))
     if phase:
         env["NSL_PHASE_TIMING"] = "1"  # read at COMPILE time
@@ -333,6 +385,8 @@ def build_nsl(
                 "build_env": dict(build_env),
                 "updates": updates,
                 "nsl": str(nsl),
+                "variant": variant,
+                "stdlib": str(tc.stdlib),
             },
             indent=1,
         )
@@ -733,10 +787,13 @@ def cmd_build(args: argparse.Namespace) -> int:
     shape = read_shape(args.size, args.micro_batch, args.seq, args.accum)
     work = size_dir(args.out.resolve(), args.size, shape)
     keys = {arm(n).build_key for n in args.arms.split(",") if arm(n).kind == "nsl"}
+    tcs = toolchains(args)
     for key in sorted(keys):
+        if key[2] not in tcs:
+            raise SystemExit(f"variant {key[2]!r}: no --toolchain {key[2]}=DIR given")
         for phase in (False, True) if args.phase else (False,):
             t = time.monotonic()
-            b = build_nsl(args.nsl.resolve(), work, shape, key, args.updates, phase)
+            b = build_nsl(tcs[key[2]], work, shape, key, args.updates, phase)
             print(f"[build] {b} ({time.monotonic() - t:.0f} s)", flush=True)
     return 0
 
@@ -938,6 +995,50 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def paired_ratios(
+    rows: dict[str, list[dict[str, Any]]], num: str, den: str
+) -> list[tuple[int, float]]:
+    """tok/s of `num` over tok/s of `den`, per round in which both ran ok (round, ratio).
+    A ratio is only taken within a round: the two runs were minutes apart under the
+    same machine conditions, which is what cancels a machine-wide shift."""
+
+    def by_round(arm_name: str) -> dict[int, float]:
+        return {
+            r["round"]: r["steady"]["tok_s"]
+            for r in rows.get(arm_name, [])
+            if r["status"] == "ok" and r.get("steady")
+        }
+
+    a, b = by_round(num), by_round(den)
+    return [(k, a[k] / b[k]) for k in sorted(set(a) & set(b))]
+
+
+def cmd_pairs(args: argparse.Namespace) -> int:
+    """Paired ratios NUM/DEN (tok/s) for each `--pair NUM/DEN`, per size directory."""
+    out = args.out.resolve()
+    for work in sorted(p for p in out.iterdir() if (p / "results").is_dir()):
+        rows: dict[str, list[dict[str, Any]]] = {}
+        for f in sorted((work / "results").glob("*.json")):
+            r = json.loads(f.read_text())
+            rows.setdefault(r["arm"], []).append(r)
+        printed = False
+        for spec in args.pair:
+            num, sep, den = spec.partition("/")
+            if not sep:
+                raise SystemExit(f"--pair {spec!r}: want NUM/DEN")
+            rs = paired_ratios(rows, num, den)
+            if not rs:
+                continue
+            if not printed:
+                print(f"\n### {work.name}\n\n| ratio | rounds | per round | median [min-max] |")
+                print("|---|---|---|---|")
+                printed = True
+            vals = [v for _, v in rs]
+            per = " ".join(f"{v:.3f}" for v in vals)
+            print(f"| {num} / {den} | {len(vals)} | {per} | {_fmt_range(vals, '.3f')} |")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -954,6 +1055,12 @@ def main() -> int:
         p.add_argument("--warmup", type=int, default=8, help="updates discarded per run")
         p.add_argument("--timeout", type=float, default=840.0)
         p.add_argument("--nsl", type=Path, default=REPO / "target" / "release" / "nsl")
+        p.add_argument(
+            "--toolchain",
+            action="append",
+            default=[],
+            help="NAME=DIR: build arms named <arm>@NAME with DIR/bin/nsl and DIR/stdlib",
+        )
         p.add_argument("--python", default=sys.executable)
 
     p = sub.add_parser("roofline")
@@ -980,6 +1087,9 @@ def main() -> int:
     p.add_argument("--tag", required=True)
     p = sub.add_parser("report")
     p.add_argument("--out", type=Path, required=True)
+    p = sub.add_parser("pairs")
+    p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--pair", action="append", required=True, help="NUM/DEN arm names")
     args = ap.parse_args()
     if args.cmd == "roofline":
         return cmd_roofline(args)
@@ -993,6 +1103,8 @@ def main() -> int:
         return cmd_nsys(args)
     if args.cmd == "diag":
         return cmd_diag(args)
+    if args.cmd == "pairs":
+        return cmd_pairs(args)
     return cmd_report(args)
 
 

@@ -10,6 +10,7 @@ time from intervals whose union is known.
 
 from __future__ import annotations
 
+import dataclasses
 import sys
 import unittest
 from pathlib import Path
@@ -92,6 +93,40 @@ class Arms(unittest.TestCase):
         )
         with self.assertRaises(SystemExit):
             pc.arm("torch_fp8_eager_sel")
+
+    def test_toolchain_variants_are_their_own_builds(self) -> None:
+        base, after = pc.arm("nsl_bf16_nodrain"), pc.arm("nsl_bf16_nodrain@after")
+        self.assertEqual(after.name, "nsl_bf16_nodrain@after")
+        self.assertEqual(after.variant, "after")
+        # Same arm in every respect but the compiler that builds it.
+        self.assertEqual(dataclasses.replace(after, name=base.name, variant=""), base)
+        self.assertNotEqual(pc.flag_key(base.build_key), pc.flag_key(after.build_key))
+        self.assertTrue(pc.flag_key(after.build_key).endswith("@after"))
+        for bad in ("torch_tf32_eager_sel@after", "nsl_tf32@a/b", "nsl_tf32@"):
+            with self.assertRaises(SystemExit, msg=bad):
+                pc.arm(bad)
+
+
+class Pairs(unittest.TestCase):
+    @staticmethod
+    def row(arm: str, rnd: int, tok_s: float, status: str = "ok") -> dict[str, object]:
+        return {"arm": arm, "round": rnd, "status": status, "steady": {"tok_s": tok_s}}
+
+    def test_ratios_are_taken_within_a_round(self) -> None:
+        rows = {
+            "a": [self.row("a", 0, 110.0), self.row("a", 1, 99.0), self.row("a", 2, 50.0)],
+            # Round 1 is a machine-wide slow round: both arms ~10% down, ratio unchanged.
+            "b": [self.row("b", 0, 100.0), self.row("b", 1, 90.0), self.row("b", 3, 1.0)],
+        }
+        # Rounds 2 and 3 have only one of the two arms: no ratio for them.
+        self.assertEqual(pc.paired_ratios(rows, "a", "b"), [(0, 1.1), (1, 1.1)])
+
+    def test_failed_runs_are_not_paired(self) -> None:
+        rows = {
+            "a": [self.row("a", 0, 110.0), self.row("a", 1, 0.0, status="oom")],
+            "b": [self.row("b", 0, 100.0), self.row("b", 1, 100.0)],
+        }
+        self.assertEqual(pc.paired_ratios(rows, "a", "b"), [(0, 1.1)])
 
 
 def iv(s: int, e: int, name: str = "k") -> ns.Interval:
