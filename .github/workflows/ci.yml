@@ -46,11 +46,11 @@ jobs:
         include:
           - os: ubuntu-latest
           - os: windows-latest
-          # macOS ARM64 PIE text-relocation issue is addressed by the Cranelift
-          # is_pic fix in binary_codegen.rs (this PR).  A follow-up CI run will
-          # verify the fix and graduate macOS to required once all tests pass.
-          - os: macos-14
-            optional: true
+          # macOS (macos-latest is ARM64) stays optional until it has a run of
+          # green builds. There is no macos-14 entry: GitHub retired that image
+          # ("The configuration 'macos-14-arm64-us-default' is not supported"),
+          # the job was cancelled at start on every run, and a cancelled job
+          # marks the whole run cancelled, so a green main read as cancelled.
           - os: macos-latest
             optional: true
     runs-on: ${{ matrix.os }}

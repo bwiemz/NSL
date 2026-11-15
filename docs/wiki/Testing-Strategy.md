@@ -285,7 +285,7 @@ instead; that is recorded as follow-on work, not silently skipped.
 
 ### CI
 
-The CI workflow (`.github/workflows/ci.yml`) runs on a matrix of `ubuntu-latest`, `windows-latest`, `macos-14`, and `macos-latest`. It does **not** provision a CUDA device, so GPU-gated (`#[ignore]`) tests are never triggered in CI. What CI does run:
+The CI workflow (`.github/workflows/ci.yml`) runs on a matrix of `ubuntu-latest`, `windows-latest` and `macos-latest` (ARM64, optional). It does **not** provision a CUDA device, so GPU-gated (`#[ignore]`) tests are never triggered in CI. What CI does run:
 
 | Step | Command |
 |------|---------|
