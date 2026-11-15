@@ -584,6 +584,122 @@ fn checkpoint_blocks_does_not_disable_the_fusion() {
     assert_eq!(on_w2, off_w2, "trailing parse block differs (see above)");
 }
 
+/// A recomputed activation read by several projections — the norm output that
+/// feeds q, k and v in every transformer block — must not cost the LAST
+/// projection its fused weight gradient.
+///
+/// Under `--checkpoint-blocks` the activation is recomputed in the backward and
+/// the clone is freed after its last adjoint reader. That reader is the
+/// transpose of the last projection's weight-gradient chain, so the clone's
+/// `FreeTensor` landed between the chain's transpose and matmul and the plan
+/// declined that chain, silently, in every block. Measured at Coder-1B: 96 of
+/// 112 chains fused; Wq's gradient ran as a generic transposed copy plus a
+/// batched TF32 GEMM, 75 ms per optimizer update.
+///
+/// Fixture: two blocks of three projections of `rmsnorm(h)` (recomputed under
+/// the selective policy, as in the real block — a `gelu` there is saved instead,
+/// and with nothing recomputed the splice never runs) plus the head: 3 x 2 + 1 =
+/// 7 chains. Measured: 5 with the free placed after the transpose, 7 after the
+/// reduce. Parity on CPU, where every fused call takes the exact decomposed
+/// fallback, keeps the moved free honest: freed too early, a weight would differ.
+#[test]
+fn every_projection_of_a_recomputed_activation_keeps_its_fused_wgrad() {
+    let src = r#"from nsl.nn.losses import mse_loss
+
+model Block:
+    wq: Tensor = (arange(16).reshape([4, 4])) * 0.02
+    wk: Tensor = (arange(16).reshape([4, 4])) * 0.015
+    wv: Tensor = (arange(16).reshape([4, 4])) * 0.01
+    g: Tensor = ones([4])
+
+    fn forward(self, h: Tensor) -> Tensor:
+        let n = rmsnorm(h, self.g, 0.00001)
+        return h + (n @ self.wq) * (n @ self.wk) + n @ self.wv
+
+model Net:
+    blocks: [Block; 2] = Block()
+    head: Tensor = (arange(12).reshape([4, 3])) * 0.03
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = x
+        for b in self.blocks:
+            h = b.forward(h)
+        return h @ self.head
+
+let m = Net()
+let x = (arange(40).reshape([2, 5, 4])) * 0.01
+let y = (arange(30).reshape([2, 5, 3])) * 0.01
+
+train(model=m, epochs=8, grad_accumulation=4):
+    optimizer: AdamW(lr=0.01, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.0)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y)
+
+print("W1_BEGIN")
+print(m.blocks[0].wq)
+print("W1_END")
+print("W2_BEGIN")
+print(m.blocks[1].wv)
+print("W2_END")
+"#;
+    let p = std::env::temp_dir().join("nsl_wgrad_accum_gate_shared_input.nsl");
+    std::fs::write(&p, src).expect("write fixture");
+    let flags = ["--checkpoint-blocks", "--checkpoint-selective"];
+    let off = run(&p, false, &flags);
+    assert!(off.ok, "flag-off run failed:\n{}", off.stderr);
+    let mut on_flags = vec!["--fuse-wgrad-accum"];
+    on_flags.extend(flags);
+    let on = run(&p, false, &on_flags);
+    assert!(on.ok, "flag-on run failed:\n{}", on.stderr);
+
+    // ANTI-VACUITY: CCR ran and recomputed something, so a recompute clone and
+    // its free exist to be misplaced.
+    assert!(
+        !on.stderr.contains("running without checkpointing"),
+        "CCR declined this fixture, so --checkpoint-blocks was a no-op:\n{}",
+        on.stderr
+    );
+    let recomputed = on
+        .stderr
+        .lines()
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix("[ccr] backward: ")
+                .and_then(|r| r.split_once(" freed interior(s) recomputed"))
+                .and_then(|(n, _)| n.trim().parse::<u64>().ok())
+        })
+        .unwrap_or(0);
+    assert!(
+        recomputed > 0,
+        "nothing was recomputed, so the splice this arm pins never ran:\n{}",
+        on.stderr
+    );
+
+    let fired = fused_chains(&on.stderr).unwrap_or(0);
+    assert_eq!(
+        fired, 7,
+        "expected all 7 weight-gradient chains fused (three projections per \
+         block x 2 + the head); a recompute free splitting the last \
+         projection's chain gives 5.\nstderr:\n{}",
+        on.stderr
+    );
+    let (_, fallback) = wgrad_runtime_counts(&on.stderr)
+        .unwrap_or_else(|| panic!("no [wgrad-accum] counter line\nstderr:\n{}", on.stderr));
+    assert!(fallback >= 7, "the planned chains never executed ({fallback} calls)");
+
+    let (on_w1, on_w2) = weights(&on.stdout);
+    let (off_w1, off_w2) = weights(&off.stdout);
+    assert_eq!(on_w1.len(), 16, "expected blocks[0].wq's 16 values, got {}", on_w1.len());
+    assert_eq!(on_w2.len(), 16, "expected blocks[1].wv's 16 values, got {}", on_w2.len());
+    assert!(
+        on_w1[0].abs() > 1e-6 && on_w2[0].abs() > 1e-6,
+        "a weight never moved off its 0.0 init — no gradient flowed"
+    );
+    assert_eq!(on_w1, off_w1, "blocks[0].wq differs with the fusion on (CPU fallback is exact)");
+    assert_eq!(on_w2, off_w2, "blocks[1].wv differs with the fusion on (CPU fallback is exact)");
+}
+
 // ─────────── The silent-inertness pair: accum >= 2 vs accum == 1 ───────────
 
 /// `grad_accumulation` is the whole difference between a fusion that fires and

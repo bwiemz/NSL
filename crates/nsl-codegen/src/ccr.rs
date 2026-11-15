@@ -2114,6 +2114,17 @@ pub fn apply_to_adjoint(
             .iter()
             .rposition(|op| op.inputs.iter().any(|i| fresh_set.contains(i)));
         if let Some(idx) = last {
+            // Never between the three ops of a weight-gradient chain. The
+            // last reader of a block's recomputed norm output is the
+            // transpose of the LAST projection's weight-gradient chain (Wq
+            // at Coder-1B: `transpose(x.ccr_recompute)`, then the matmul and
+            // the reduce), so the markers landed between the transpose and
+            // the matmul and `wgrad_fusion::plan` declined that chain in
+            // every layer: 96 of 112 chains fused at 1B, and Wq's gradient
+            // ran as a generic transposed copy plus a batched TF32 GEMM,
+            // 75 ms per optimizer update. After the reduce is correct either
+            // way — see `wgrad_fusion::chain_reduce_covering`.
+            let idx = crate::wgrad_fusion::chain_reduce_covering(&adjoint.ops, idx).unwrap_or(idx);
             frees.push((idx, fresh_set.into_iter().collect()));
         }
     }
@@ -2722,6 +2733,60 @@ mod tests {
             .count();
         assert_eq!(free_count, 2);
         // Frees come after last uses (validate() already enforced this).
+    }
+
+    /// A block's recomputed value whose last adjoint reader is the transpose of
+    /// a weight-gradient chain is freed after that chain's reduce, not inside
+    /// it. Coder-1B's recomputed attention-norm output feeds the q, k and v
+    /// projections; the last of the three weight-gradient chains read it last,
+    /// the splice put the clone's `FreeTensor` between that chain's transpose
+    /// and matmul, and `--fuse-wgrad-accum` declined Wq's chain in every layer
+    /// (96 of 112 chains fused).
+    #[test]
+    fn a_recompute_free_does_not_split_a_weight_gradient_chain() {
+        let primal = toy_primal();
+        let mut plan = plan(&primal, None, CcrPolicy::Block, false, 1).unwrap();
+        let t = |pos, result, x| {
+            adj_op(
+                pos,
+                result,
+                PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX },
+                vec![x],
+            )
+        };
+        // Three projections of v3 (block 0's recomputed interior), each
+        // `reduce_to_shape(transpose(v3) @ G, W)`.
+        let mut adjoint = adjoint_of(vec![
+            t(0, 100, 3),
+            adj_op(1, 101, PrimalOp::Matmul, vec![100, 0]),
+            reduce(2, 102, 101, 1),
+            t(3, 103, 3),
+            adj_op(4, 104, PrimalOp::Matmul, vec![103, 0]),
+            reduce(5, 105, 104, 1),
+            t(6, 106, 3),
+            adj_op(7, 107, PrimalOp::Matmul, vec![106, 0]),
+            reduce(8, 108, 107, 1),
+        ]);
+        let mut fresh = 200;
+        let summary = apply_to_adjoint(&primal, &mut adjoint, &mut plan, &mut fresh, true).unwrap();
+        assert_eq!(summary.recomputed, 1, "v3 must be recomputed for this to test anything");
+        let frees: Vec<usize> = adjoint
+            .ops
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| matches!(o.op, PrimalOp::FreeTensor))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(frees.len(), 1, "one free for the clone: {:?}", adjoint.ops);
+        let last_reduce = adjoint.ops.iter().position(|o| o.result == 108).unwrap();
+        assert_eq!(frees[0], last_reduce + 1, "the clone's free must follow the chain's reduce");
+        let fusable = crate::wgrad_fusion::plan(&adjoint, &HashSet::from([102, 105, 108]));
+        assert_eq!(
+            fusable.by_reduce_result.len(),
+            3,
+            "every chain must stay fusable after the splice: {:?}",
+            adjoint.ops
+        );
     }
 
     /// The tape of `toy_primal` with a Relu between block 0's matrix product
