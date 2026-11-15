@@ -1687,6 +1687,11 @@ impl AdjointGenerator {
                 self.emit_op(PrimalOp::RoPEInverse { dim }, vec![y_bar])
             }
 
+            // --- rope backward: one fused op, the transpose of the rotation ---
+            AdjointExpr::RopeBackward(y_bar, cos, sin) => {
+                self.emit_op(PrimalOp::Passthrough("rope_backward".into()), vec![y_bar, cos, sin])
+            }
+
             // --- rotate_half backward: -rotate_half(grad) ---
             // forward: y[..h] = -x[h..], y[h..] = x[..h]
             // backward: dx[..h] = dy[h..], dx[h..] = -dy[..h]
@@ -1694,11 +1699,6 @@ impl AdjointGenerator {
             // (a permutation with a sign flip — rounding-free, so bit-exact
             // against the decomposed pair). NSL_FUSE_ROPE_NEG=0 (compile-time
             // env) restores the rotate_half + Neg pair for differential gating.
-            // --- rope backward: one fused op, the transpose of the rotation ---
-            AdjointExpr::RopeBackward(y_bar, cos, sin) => {
-                self.emit_op(PrimalOp::Passthrough("rope_backward".into()), vec![y_bar, cos, sin])
-            }
-
             AdjointExpr::RotateHalfBackward(y_bar) => {
                 if std::env::var("NSL_FUSE_ROPE_NEG").ok().as_deref() == Some("0") {
                     let rotated = self.emit_op(
