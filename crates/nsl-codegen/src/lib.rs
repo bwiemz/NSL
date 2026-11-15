@@ -2412,6 +2412,7 @@ pub fn compile_and_calibrate(
         compiler.intern_string("")?;
         compiler.collect_strings(&parsed.module.stmts)?;
         compiler.collect_enums(&parsed.module.stmts)?;
+        compiler.collect_module_consts(&parsed.module.stmts)?;
         compiler.collect_structs(&parsed.module.stmts)?;
         compiler.collect_models(&parsed.module.stmts)?;
         compiler.declare_runtime_functions()?;

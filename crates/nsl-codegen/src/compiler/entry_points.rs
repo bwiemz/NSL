@@ -640,6 +640,7 @@ pub fn compile_returning_splice_count_for_tests(
     compiler.intern_string("")?;
     compiler.collect_strings(&ast.stmts)?;
     compiler.collect_enums(&ast.stmts)?;
+    compiler.collect_module_consts(&ast.stmts)?;
     compiler.collect_structs(&ast.stmts)?;
     compiler.collect_models(&ast.stmts)?;
     populate_calibration_retention_from_ast_if_unset(&mut compiler, ast, interner)?;
@@ -740,6 +741,7 @@ fn compile_returning_plan_impl(
     compiler.intern_string("")?;
     compiler.collect_strings(&ast.stmts)?;
     compiler.collect_enums(&ast.stmts)?;
+    compiler.collect_module_consts(&ast.stmts)?;
     compiler.collect_structs(&ast.stmts)?;
     compiler.collect_models(&ast.stmts)?;
     // CPDT Part III: non-WGGO MoE dead-expert prune. Runs here (not under the
@@ -943,6 +945,7 @@ fn compile_standalone_best_effort_plan(
         compiler.intern_string("")?;
         compiler.collect_strings(&ast.stmts)?;
         compiler.collect_enums(&ast.stmts)?;
+        compiler.collect_module_consts(&ast.stmts)?;
         compiler.collect_structs(&ast.stmts)?;
         compiler.collect_models(&ast.stmts)?;
         populate_calibration_retention_from_ast_if_unset(&mut compiler, ast, interner)?;
@@ -994,6 +997,7 @@ pub fn compile_test(
     compiler.intern_string("")?;
     compiler.collect_strings(&ast.stmts)?;
     compiler.collect_enums(&ast.stmts)?;
+    compiler.collect_module_consts(&ast.stmts)?;
     compiler.collect_structs(&ast.stmts)?;
     compiler.collect_models(&ast.stmts)?;
     populate_calibration_retention_from_ast_if_unset(&mut compiler, ast, interner)?;
@@ -1226,6 +1230,7 @@ pub fn compile_module_with_imports_best_effort_plans(
         compiler.intern_string("")?;
         compiler.collect_strings(&ast.stmts)?;
         compiler.collect_enums(&ast.stmts)?;
+        compiler.collect_module_consts(&ast.stmts)?;
         compiler.collect_structs(&ast.stmts)?;
         compiler.collect_models(&ast.stmts)?;
         populate_calibration_retention_from_ast_if_unset(&mut compiler, ast, interner)?;
@@ -1453,6 +1458,7 @@ fn compile_entry_impl(
     compiler.intern_string("")?;
     compiler.collect_strings(&ast.stmts)?;
     compiler.collect_enums(&ast.stmts)?;
+    compiler.collect_module_consts(&ast.stmts)?;
     compiler.collect_structs(&ast.stmts)?;
     compiler.collect_models(&ast.stmts)?;
 

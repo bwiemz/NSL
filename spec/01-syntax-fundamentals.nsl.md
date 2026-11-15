@@ -91,6 +91,14 @@ counter = counter + 1            # OK: let is mutable
 # MAX_SEQ = 4096                 # COMPILE ERROR: const is immutable
 ```
 
+A module-level `const` whose value is a literal, or arithmetic (`+ - * / // %`,
+negation) on literals and earlier such constants, is a compile-time constant:
+functions, model methods and field initialisers read it, and a `DataLoader`
+keyword that takes a constant accepts it (`batch_size = BATCH`). Other
+module-level bindings belong to the program's top level only; a function reads
+them through its parameters. (`train(...)` header keys and decorator arguments
+still take literals.)
+
 ### Example 2: Function Definition with Type Annotations
 
 ```nsl
