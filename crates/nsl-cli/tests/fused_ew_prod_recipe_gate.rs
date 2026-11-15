@@ -8,7 +8,11 @@
 //! --checkpoint-blocks --fuse-rmsnorm-backward`): 72 chains (48x
 //! mul+scale-imm, 24x add+add residual joins — reduce_to_shape is a chain
 //! BARRIER after measurement showed every absorbed rts was a real GQA
-//! reduce that replayed) and 48 rope folds. Drift below the floor means a matcher regression or a
+//! reduce that replayed) and 48 rope folds. Since the `rope` builtin
+//! (2026-11-15) the stdlib's RoPE is one fused op with its own adjoint, so
+//! the fold has nothing left to fold: the gate now requires the source-AD
+//! tape (`NSL_DEBUG_WENGERT`'s primal dump) to hold the fused `rope` op, one
+//! per RoPE application (48: 24 blocks x q and k), and no fold to fire. Drift below the floor means a matcher regression or a
 //! recipe/stdlib change that silently starved the fuser — either way the
 //! perf the campaign measured is gone and this gate is the tell.
 
@@ -47,6 +51,7 @@ fn prod_500m_recipe_fuses_above_the_observed_floor() {
         .arg(tmp.join("prod500m.o"))
         .current_dir(root.join("models/coder500m"))
         .env("NSL_STDLIB_PATH", root.join("stdlib"))
+        .env("NSL_DEBUG_WENGERT", "1")
         .output()
         .expect("spawn nsl build");
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
@@ -73,15 +78,16 @@ fn prod_500m_recipe_fuses_above_the_observed_floor() {
          starved the fuser:\n{stderr}"
     );
 
-    let rope = marker_count(&stderr, "[fuse] rope backward folds:").unwrap_or_else(|| {
-        panic!(
-            "no `[fuse] rope backward folds:` marker — the RoPE fold did not \
-             fire on the prod recipe (vacuous):\n{stderr}"
-        )
-    });
+    // The RoPE is the fused builtin (one op per application, its adjoint the
+    // certified `rope_backward`), not a folded decomposition.
+    let rope_ops = stderr.lines().filter(|l| l.contains("= Passthrough(\"rope\")")).count();
+    assert_eq!(
+        rope_ops, 48,
+        "expected the fused rope op once per RoPE application (24 blocks x q and k) on the \
+         source-AD tape, found {rope_ops}:\n{stderr}"
+    );
     assert!(
-        rope >= 40,
-        "rope fold count {rope} fell below the floor (40 = 0.8 x 48 observed \
-         2026-08-25):\n{stderr}"
+        marker_count(&stderr, "[fuse] rope backward folds:").unwrap_or(0) == 0,
+        "the RoPE backward fold fired on the prod recipe: the decomposed RoPE is back:\n{stderr}"
     );
 }
