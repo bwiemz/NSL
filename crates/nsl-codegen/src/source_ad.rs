@@ -5316,6 +5316,11 @@ impl<'a> WengertExtractor<'a> {
                     "log" => PrimalOp::Log,
                     "sqrt" => PrimalOp::Sqrt,
                     "abs" => PrimalOp::Abs,
+                    // `bias_add(x, b)` is `x + b` with `b` broadcast along
+                    // the last dimension: the Add rule, whose adjoint sums
+                    // each operand's gradient down to its shape. The block
+                    // fell back to the tape on it.
+                    "bias_add" if input_vars.len() == 2 => PrimalOp::Add,
                     // Linear algebra
                     "matmul" => PrimalOp::Matmul,
                     // Reductions — extract dim from second arg if present

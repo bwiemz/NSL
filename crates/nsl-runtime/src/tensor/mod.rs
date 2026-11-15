@@ -4132,15 +4132,18 @@ pub extern "C" fn nsl_tensor_maxpool2d(
     result_ptr
 }
 
-/// Add 1D bias to 2D tensor.
+/// Add a 1-D bias of length `C` along the last dimension of a `[..., C]`
+/// tensor (every leading dimension broadcast), as `x + b` does. Only 2-D
+/// input used to be accepted, so the stdlib `Linear` and `MLP` refused a
+/// `[batch, seq, features]` activation.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
     require_same_dtype("nsl_tensor_bias_add", tensor_ptr, bias_ptr);
     let tensor = NslTensor::from_ptr(tensor_ptr);
     let bias = NslTensor::from_ptr(bias_ptr);
 
-    if tensor.ndim != 2 { crate::nsl_log!(ERROR, "nsl", "nsl: bias_add requires 2D tensor (got {}D)", tensor.ndim); std::process::abort(); }
-    if bias.ndim != 1 { crate::nsl_log!(WARN, "nsl", "nsl: bias_add requires 1D bias (got {}D)", bias.ndim); std::process::abort(); }
+    if tensor.ndim < 1 { crate::nsl_log!(ERROR, "nsl", "nsl: bias_add needs a tensor of at least 1 dimension (got a 0-d one)"); std::process::abort(); }
+    if bias.ndim != 1 { crate::nsl_log!(ERROR, "nsl", "nsl: bias_add requires 1D bias (got {}D)", bias.ndim); std::process::abort(); }
 
     // GPU path: launch fused bias_add kernel when tensor is on GPU.
     if tensor.device > 0 {
@@ -4162,12 +4165,13 @@ pub extern "C" fn nsl_tensor_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
         { crate::fatal::cuda_not_compiled(); }
     }
 
-    let rows = unsafe { *tensor.shape.add(0) } as usize;
-    let cols = unsafe { *tensor.shape.add(1) } as usize;
+    let ndim = tensor.ndim as usize;
+    let cols = unsafe { *tensor.shape.add(ndim - 1) } as usize;
+    let rows = if cols == 0 { 0 } else { tensor.len as usize / cols };
     let bias_len = unsafe { *bias.shape.add(0) } as usize;
 
     if cols != bias_len {
-        crate::nsl_log!(ERROR, "nsl", "nsl: bias_add shape mismatch -- tensor has {} cols but bias has {} elements", cols, bias_len);
+        crate::nsl_log!(ERROR, "nsl", "nsl: bias_add shape mismatch -- tensor's last dimension is {} but bias has {} elements", cols, bias_len);
         std::process::abort();
     }
 
@@ -4177,10 +4181,9 @@ pub extern "C" fn nsl_tensor_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
         other => crate::fatal::unsupported_dtype("nsl_tensor_bias_add", other),
     };
 
-    let out_ndim: i64 = 2;
+    let out_ndim = tensor.ndim;
     let out_len = (rows * cols) as i64;
-    let out_shape = checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
-    unsafe { *out_shape.add(0) = rows as i64; *out_shape.add(1) = cols as i64; }
+    let out_shape = NslTensor::copy_shape(tensor.shape, out_ndim);
     let out_strides = NslTensor::compute_strides(out_shape, out_ndim);
     let elem_size = if out_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
     let out_data_raw = checked_alloc((out_len as usize) * elem_size);

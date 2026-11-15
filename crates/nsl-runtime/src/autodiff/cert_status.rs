@@ -249,7 +249,9 @@ pub fn tape_cert_status(op: &TapeOp) -> TapeCertStatus {
         TapeOp::RotateHalf { .. } => {
             Certified(&["rotate_half", "rotate_half_vgrad", "rotate_half_vin"])
         }
-        TapeOp::BiasAdd { .. } => Certified(&["bias_add", "bias_add_vgrad", "bias_add_vin"]),
+        TapeOp::BiasAdd { .. } => {
+            Certified(&["bias_add", "bias_add_3d", "bias_add_vgrad", "bias_add_vin"])
+        }
         TapeOp::Unsqueeze { .. } => Certified(&["unsqueeze", "unsqueeze_vgrad", "unsqueeze_vin"]),
         TapeOp::Expand { .. } => Certified(&["expand", "expand_vgrad"]),
         TapeOp::Stack { .. } => Certified(&[
