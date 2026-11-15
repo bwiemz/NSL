@@ -58,9 +58,13 @@
 //!    checkpoint/model restore into a live model, `copy_data`, `zero_`, and
 //!    every future transport-mediated writer automatically.
 //! 4. **In-place writes that bypass transport** — a PTX kernel mutating its
-//!    destination (`add_inplace`, `mul_scalar_inplace`, `scalar_mul_add`) or
-//!    a host deref of managed memory (`set_element`, `slice_assign`) — carry
-//!    explicit [`evict`] hooks at their externs.
+//!    destination (`add_inplace`, `mul_scalar_inplace`, `scalar_mul_add`) —
+//!    carry explicit [`evict`] hooks at their externs. The host element
+//!    writes (`nsl_tensor_set`, `_set_compound`, `_set_element`,
+//!    `_slice_assign`) refuse a device tensor before writing
+//!    (`refuse_host_write_to_device` in `tensor/mod.rs`), so they cannot
+//!    reach a cached parameter; `element_write_gpu_gate.rs` holds that
+//!    under `NSL_MATMUL_BF16=1` with the cache warm.
 //!
 //! The remaining load-bearing assumption is only class 4: a FUTURE in-place
 //! KERNEL that writes theta must call [`evict`]/[`note_param_stepped`] or

@@ -1193,10 +1193,13 @@ pub extern "C" fn nsl_tensor_set_compound(tensor_ptr: i64, indices_list: i64, va
     tensor_set_impl(tensor_ptr, indices_list, value, keep);
 }
 
-fn tensor_set_impl(tensor_ptr: i64, indices_list: i64, value: f64, keep: f64) {
-    let tensor = NslTensor::from_ptr_ref(tensor_ptr);
-    let indices = NslList::from_ptr(indices_list);
-
+/// Every host-side element write (`nsl_tensor_set`, `_set_compound`,
+/// `_set_element`, `_slice_assign`) stops here on a device tensor, before
+/// it changes anything. Writing device memory host-side would corrupt it,
+/// and it is also what keeps the BF16 matmul mode's cached weight images
+/// (`cuda::bf16_cast_cache`) fresh: a parameter those images copy lives on
+/// a device, so no host write can change it behind its image.
+fn refuse_host_write_to_device(tensor: &NslTensor) {
     if tensor.device > 0 {
         crate::nsl_log!(ERROR, "nsl", "nsl: element write on a GPU tensor is not supported; move it to the \
              CPU first (e.g. `t.to(cpu)`) — writing device memory host-side \
@@ -1204,6 +1207,13 @@ fn tensor_set_impl(tensor_ptr: i64, indices_list: i64, value: f64, keep: f64) {
         );
         std::process::abort();
     }
+}
+
+fn tensor_set_impl(tensor_ptr: i64, indices_list: i64, value: f64, keep: f64) {
+    let tensor = NslTensor::from_ptr_ref(tensor_ptr);
+    let indices = NslList::from_ptr(indices_list);
+
+    refuse_host_write_to_device(tensor);
     if indices.len != tensor.ndim {
         crate::nsl_log!(ERROR, "nsl", "nsl: tensor index dimension mismatch (got {}, expected {})",
             indices.len, tensor.ndim
@@ -4755,6 +4765,7 @@ pub extern "C" fn nsl_tensor_set_element(
     tensor_ptr: i64, indices_ptr: i64, num_indices: i64, value: f64,
 ) {
     let tensor = NslTensor::from_ptr(tensor_ptr);
+    refuse_host_write_to_device(tensor);
     let ndim = tensor.ndim as usize;
     let n = num_indices as usize;
 
@@ -4778,9 +4789,7 @@ pub extern "C" fn nsl_tensor_set_element(
     }
 
     autodiff::record_index_write(tensor_ptr, &region, 0.0, 0);
-    let tensor = NslTensor::from_ptr(tensor_ptr);
-    evict_bf16_cast_image(tensor);
-    tensor.write_scalar_from_f64(offset, value);
+    NslTensor::from_ptr_ref(tensor_ptr).write_scalar_from_f64(offset, value);
 }
 
 #[unsafe(no_mangle)]
@@ -4788,7 +4797,7 @@ pub extern "C" fn nsl_tensor_slice_assign(
     target_ptr: i64, src_ptr: i64, dims_ptr: i64, num_dims: i64,
 ) {
     let target = NslTensor::from_ptr(target_ptr);
-    evict_bf16_cast_image(target);
+    refuse_host_write_to_device(target);
     let ndim = num_dims as usize;
     if ndim != target.ndim as usize {
         crate::nsl_log!(ERROR, "nsl", "nsl: slice_assign: expected {} dims, got {}",
