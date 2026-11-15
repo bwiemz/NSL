@@ -4144,6 +4144,14 @@ pub extern "C" fn nsl_tensor_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
 
     if tensor.ndim < 1 { crate::nsl_log!(ERROR, "nsl", "nsl: bias_add needs a tensor of at least 1 dimension (got a 0-d one)"); std::process::abort(); }
     if bias.ndim != 1 { crate::nsl_log!(ERROR, "nsl", "nsl: bias_add requires 1D bias (got {}D)", bias.ndim); std::process::abort(); }
+    // Checked before either device's arm: the GPU kernel reads
+    // `bias[i % cols]` and read past a short bias, returning garbage.
+    let cols = unsafe { *tensor.shape.add(tensor.ndim as usize - 1) } as usize;
+    let bias_len = unsafe { *bias.shape.add(0) } as usize;
+    if cols != bias_len {
+        crate::nsl_log!(ERROR, "nsl", "nsl: bias_add shape mismatch -- tensor's last dimension is {} but bias has {} elements", cols, bias_len);
+        std::process::abort();
+    }
 
     // GPU path: launch fused bias_add kernel when tensor is on GPU.
     if tensor.device > 0 {
@@ -4165,15 +4173,7 @@ pub extern "C" fn nsl_tensor_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
         { crate::fatal::cuda_not_compiled(); }
     }
 
-    let ndim = tensor.ndim as usize;
-    let cols = unsafe { *tensor.shape.add(ndim - 1) } as usize;
     let rows = if cols == 0 { 0 } else { tensor.len as usize / cols };
-    let bias_len = unsafe { *bias.shape.add(0) } as usize;
-
-    if cols != bias_len {
-        crate::nsl_log!(ERROR, "nsl", "nsl: bias_add shape mismatch -- tensor's last dimension is {} but bias has {} elements", cols, bias_len);
-        std::process::abort();
-    }
 
     let in_dtype = tensor.dtype;
     let out_dtype: u16 = match in_dtype {
