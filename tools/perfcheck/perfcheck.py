@@ -26,7 +26,8 @@ nsl_tf32@after/nsl_tf32@before` gives the paired ratio.
 
 Arms. `nsl_tf32`: the 1B production posture (PROD_FLAGS, f32 weights, the runtime's
 default TF32 cuBLAS math mode). `nsl_bf16`: the same flags built and run with
-NSL_MATMUL_BF16=1 (read at build time on main; the runtime's banner is checked).
+NSL_MATMUL_BF16=1 (read at build time; the runtime's banner is checked, and since
+2026-11 a binary run with a disagreeing NSL_MATMUL_BF16 refuses to start).
 `nsl_*_nodrain`: the same binary under NSL_SKIP_GPU_DRAIN=1. `nsl_tf32_blocks`: PROD_FLAGS without
 `--checkpoint-selective` (full block recompute). `torch_<tf32|bf16>_<eager|compile>_
 <none|blocks|sel>`: `torch_arm.py` with that precision, compilation and checkpointing.
@@ -169,9 +170,9 @@ class Arm:
     kind: str  # "nsl" | "torch"
     precision: str  # "tf32" | "bf16": selects the roofline
     flags: tuple[str, ...] = ()
-    # NSL: environment read by `nsl build` (the matmul mode is a COMPILE-time setting
-    # on main: `MatmulConfig::with_env_fallback`; the runtime ignores NSL_MATMUL_BF16
-    # so a binary cannot run an arithmetic its fingerprint does not record).
+    # NSL: environment read by `nsl build` (the matmul mode is a COMPILE-time setting:
+    # `MatmulConfig::with_env_fallback`; the runtime never switches mode on its own
+    # environment, and refuses a run whose NSL_MATMUL_BF16 disagrees with the binary).
     build_env: tuple[tuple[str, str], ...] = ()
     env: tuple[tuple[str, str], ...] = ()  # NSL: environment of the run
     compile: bool = False

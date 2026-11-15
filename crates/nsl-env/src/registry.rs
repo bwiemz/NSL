@@ -827,11 +827,11 @@ pub static REGISTRY: &[EnvVar] = &[
     var!(
         "NSL_MATMUL_BF16",
         Bool,
-        "1 only engages; 0 or anything else is a no-op (falls through to TF32/pedantic resolution)",
+        "1 engages at compile time; at run time 1/0 must match the compiled mode or the program refuses",
         "off (TF32 unless NSL_MATMUL_TF32=0 or strict-matmul)",
         Behavior,
         Both,
-        "Run cuBLAS matmuls with bf16 tensor-core compute (bf16 operand storage); beats NSL_MATMUL_TF32, loses to NSL_MATMUL_PEDANTIC."
+        "Deprecated spelling of --matmul-mode bf16, read when the program is COMPILED; a compiled program run with a disagreeing value refuses."
     ),
     var!(
         "NSL_MATMUL_BF16_CAST_CACHE",

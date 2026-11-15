@@ -10,8 +10,12 @@ checkpoint is written, not six hours after. Arms:
     P1  P0 + --fuse-wgrad-accum
     P2  P1 + --cuda-graphs
     P3  --source-ad --checkpoint-selective --fuse-rmsnorm-backward --fuse-wgrad-accum
-    P4  P3's binary, run under NSL_MATMUL_BF16=1 (cuBLAS math mode is a
-        RUNTIME env — same artifact, different run)
+    P4  P3 + --matmul-mode bf16: its own artifact. The matmul mode is a
+        COMPILE-time setting recorded in the execution fingerprint; until
+        2026-11 this arm ran P3's binary with NSL_MATMUL_BF16=1 in the run
+        environment, which the runtime ignored, so P4 silently measured TF32
+        (found by the November NSL-vs-PyTorch baseline). The runtime now
+        refuses that combination, and every arm's banner is checked below.
 
 P0-P2 answer the wgrad and graphs questions on the shipped posture; P3/P4
 measure the proposed run posture (checkpoint-selective + bf16) AT 1B — its
@@ -54,6 +58,7 @@ import gpu_guard  # noqa: E402
 BASE = ["--source-ad", "--checkpoint-blocks", "--fuse-rmsnorm-backward"]
 SELECTIVE = ["--source-ad", "--checkpoint-blocks", "--checkpoint-selective",
              "--fuse-rmsnorm-backward"]
+TF32 = ["--matmul-mode", "tf32"]
 
 
 @dataclasses.dataclass
@@ -72,13 +77,22 @@ class FlagArm:
 
 
 ARMS = [
-    FlagArm("P0_blocks", BASE, {}),
-    FlagArm("P1_wgrad", BASE + ["--fuse-wgrad-accum"], {}),
-    FlagArm("P2_graphs", BASE + ["--fuse-wgrad-accum", "--cuda-graphs"], {}),
-    FlagArm("P3_selective", SELECTIVE + ["--fuse-wgrad-accum"], {}),
-    FlagArm("P4_sel_bf16", SELECTIVE + ["--fuse-wgrad-accum"],
-            {"NSL_MATMUL_BF16": "1"}),
+    # Every arm names its matmul mode explicitly, so an NSL_MATMUL_BF16 inherited
+    # from the shell at build time cannot change what an arm measures.
+    FlagArm("P0_blocks", BASE + TF32, {}),
+    FlagArm("P1_wgrad", BASE + ["--fuse-wgrad-accum"] + TF32, {}),
+    FlagArm("P2_graphs", BASE + ["--fuse-wgrad-accum", "--cuda-graphs"] + TF32, {}),
+    FlagArm("P3_selective", SELECTIVE + ["--fuse-wgrad-accum"] + TF32, {}),
+    FlagArm("P4_sel_bf16", SELECTIVE + ["--fuse-wgrad-accum", "--matmul-mode", "bf16"], {}),
 ]
+
+# The runtime's math-mode banner, which each arm's stderr must carry.
+BANNER = {"tf32": "cuBLAS math mode: TF32", "bf16": "cuBLAS math mode: BF16"}
+
+
+def matmul_mode(a: FlagArm) -> str:
+    i = a.flag_list.index("--matmul-mode")
+    return a.flag_list[i + 1]
 
 GRAPH_RE = re.compile(
     r"\[cuda-graph\] regions=(\d+) captured=(\d+) replays=(\d+) taints=(\d+) "
@@ -106,7 +120,7 @@ def main() -> int:
     if not tokens_path.exists() or tokens_path.stat().st_size != n_tokens * 2:
         rb.gen_tokens.generate(tokens_path, n_tokens, rb.VOCAB, rb.TOKENS_PER_UPDATE)
 
-    # P4 shares P3's artifact: build unique flag-sets once.
+    # One artifact per distinct flag set (every arm's is distinct today).
     binaries: dict[str, Path] = {}
     build_key = {a.key: " ".join(a.flag_list) for a in ARMS}
     built: dict[str, Path] = {}
@@ -143,6 +157,9 @@ def main() -> int:
                     print(f"      {a.key}: OOM — arm retired", flush=True)
                     continue
                 raise RuntimeError(f"{a.key} r{rnd}: rc={rc}\n{stderr_text[-1500:]}")
+            want = BANNER[matmul_mode(a)]
+            if want not in stderr_text:
+                raise RuntimeError(f"{a.key} r{rnd}: the runtime did not print {want!r}")
             timing = rb.parse_timing(lines, a, args.warmup_opt_steps)
             if timing is None:
                 raise RuntimeError(f"{a.key} r{rnd}: too few OPT_STEP stamps")
