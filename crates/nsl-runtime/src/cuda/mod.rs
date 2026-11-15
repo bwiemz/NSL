@@ -38,6 +38,9 @@ pub(crate) mod bf16_cast_cache;
 #[cfg(feature = "cuda")]
 pub(crate) mod lt_matmul;
 
+#[cfg(feature = "cuda")]
+pub(crate) mod storage_kernels;
+
 /// Test-only views of the bf16 cast cache (re-exported from lib.rs): the
 /// integration gate drives registration through the REAL fused-AdamW extern
 /// and needs only to observe (hits, recasts, evictions) and reset between

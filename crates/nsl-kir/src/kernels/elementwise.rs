@@ -45,6 +45,7 @@
 //! 32 bits and widened, as the hand kernels did; the bound and the
 //! addresses are 64-bit.
 
+use super::storage::{load_as_f32, store_from_f32, variant_name, Storage};
 use crate::backend_ptx::lower_kir_to_ptx;
 use crate::kernel_ir::{
     AddressSpace, CmpOp, ConstValue, KernelIR, KirBuilder, KirConst, KirEdge, KirOp, KirTerminator,
@@ -61,7 +62,7 @@ pub const ELEMENTWISE_BLOCK: u32 = 256;
 /// `Div` divides with `div.approx.f32` (`KirOp::DivApprox`), as the
 /// hand-written `nsl_div_f32` did: the decomposed kernels that the fused ones
 /// are held bit-exact to divide with it, so it is the runtime's f32 division.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinaryOp {
     Add,
     Sub,
@@ -105,12 +106,20 @@ pub(crate) fn f32_ptr() -> KirType {
 /// exit:   ret
 /// ```
 pub fn build_binary(op: BinaryOp) -> KernelIR {
-    use AddressSpace::Global;
-    let mut b = KirBuilder::new(op.kernel_name());
+    build_binary_st(op, [Storage::F32, Storage::F32], Storage::F32)
+}
 
-    let a = b.add_param("a", f32_ptr(), Global);
-    let bp = b.add_param("b", f32_ptr(), Global);
-    let c = b.add_param("c", f32_ptr(), Global);
+/// [`build_binary`] with each operand stored as `ins` / `out` say, f32
+/// arithmetic, one rounding on a bf16 store; named by
+/// [`variant_name`] (the all-f32 instantiation is `op.kernel_name()`, byte
+/// for byte the f32 kernel).
+pub fn build_binary_st(op: BinaryOp, ins: [Storage; 2], out: Storage) -> KernelIR {
+    use AddressSpace::Global;
+    let mut b = KirBuilder::new(&variant_name(op.kernel_name(), &ins, out));
+
+    let a = b.add_param("a", ins[0].ptr(), Global);
+    let bp = b.add_param("b", ins[1].ptr(), Global);
+    let c = b.add_param("c", out.ptr(), Global);
     let n = b.add_param("n", KirType::U64, Global);
 
     let entry = b.new_block();
@@ -127,20 +136,11 @@ pub fn build_binary(op: BinaryOp) -> KernelIR {
     b.terminate(KirTerminator::CondBranch(past, KirEdge::to(exit), KirEdge::to(body)));
 
     b.set_block(body);
-    let load = |b: &mut KirBuilder, base: VarId| {
-        let addr = b.new_typed_var(f32_ptr());
-        b.emit(KirOp::PtrOffset(addr, base, i));
-        let v = b.new_typed_var(KirType::F32);
-        b.emit(KirOp::Load(v, addr, Global));
-        v
-    };
-    let x = load(&mut b, a);
-    let y = load(&mut b, bp);
+    let x = load_as_f32(&mut b, a, i, ins[0]);
+    let y = load_as_f32(&mut b, bp, i, ins[1]);
     let z = b.new_typed_var(KirType::F32);
     b.emit((op.op())(z, x, y));
-    let out = b.new_typed_var(f32_ptr());
-    b.emit(KirOp::PtrOffset(out, c, i));
-    b.emit(KirOp::Store(out, z, Global));
+    store_from_f32(&mut b, c, i, z, out);
     b.terminate(KirTerminator::Branch(KirEdge::to(exit)));
 
     b.set_block(exit);
@@ -165,10 +165,15 @@ pub fn binary_ptx(op: BinaryOp) -> Vec<u8> {
     lower_kir_to_ptx(&ir)
 }
 
+/// [`build_binary_st`] lowered to a NUL-terminated PTX module.
+pub fn binary_ptx_st(op: BinaryOp, ins: [Storage; 2], out: Storage) -> Vec<u8> {
+    verified_ptx(build_binary_st(op, ins, out))
+}
+
 /// A scalar-operand kernel, `c[i] = a[i] op s`, with signature
 /// `(a, c, s, n)`: `s` is an `.f32` parameter, the rest `.u64`. `Div`
 /// divides with `div.approx.f32`, like [`BinaryOp::Div`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScalarOp {
     Mul,
     Add,
@@ -202,11 +207,16 @@ impl ScalarOp {
 /// Build `op` as KIR: [`build_binary`]'s shape with `b[i]` replaced by the
 /// parameter `s`, in the hand kernels' operand order (`a[i] op s`).
 pub fn build_scalar(op: ScalarOp) -> KernelIR {
-    use AddressSpace::Global;
-    let mut b = KirBuilder::new(op.kernel_name());
+    build_scalar_st(op, Storage::F32, Storage::F32)
+}
 
-    let a = b.add_param("a", f32_ptr(), Global);
-    let c = b.add_param("c", f32_ptr(), Global);
+/// [`build_scalar`] with the tensor operand and the result stored as given.
+pub fn build_scalar_st(op: ScalarOp, input: Storage, out: Storage) -> KernelIR {
+    use AddressSpace::Global;
+    let mut b = KirBuilder::new(&variant_name(op.kernel_name(), &[input], out));
+
+    let a = b.add_param("a", input.ptr(), Global);
+    let c = b.add_param("c", out.ptr(), Global);
     let s = b.add_param("s", KirType::F32, Global);
     let n = b.add_param("n", KirType::U64, Global);
 
@@ -224,15 +234,10 @@ pub fn build_scalar(op: ScalarOp) -> KernelIR {
     b.terminate(KirTerminator::CondBranch(past, KirEdge::to(exit), KirEdge::to(body)));
 
     b.set_block(body);
-    let src = b.new_typed_var(f32_ptr());
-    b.emit(KirOp::PtrOffset(src, a, i));
-    let x = b.new_typed_var(KirType::F32);
-    b.emit(KirOp::Load(x, src, Global));
+    let x = load_as_f32(&mut b, a, i, input);
     let z = b.new_typed_var(KirType::F32);
     b.emit((op.op())(z, x, s));
-    let out = b.new_typed_var(f32_ptr());
-    b.emit(KirOp::PtrOffset(out, c, i));
-    b.emit(KirOp::Store(out, z, Global));
+    store_from_f32(&mut b, c, i, z, out);
     b.terminate(KirTerminator::Branch(KirEdge::to(exit)));
 
     b.set_block(exit);
@@ -254,6 +259,11 @@ pub fn scalar_ptx(op: ScalarOp) -> Vec<u8> {
         panic!("elementwise kernel `{}` failed KIR verification: {errors:?}", op.kernel_name());
     }
     lower_kir_to_ptx(&ir)
+}
+
+/// [`build_scalar_st`] lowered to a NUL-terminated PTX module.
+pub fn scalar_ptx_st(op: ScalarOp, input: Storage, out: Storage) -> Vec<u8> {
+    verified_ptx(build_scalar_st(op, input, out))
 }
 
 /// The thread index and the bounds branch every elementwise kernel opens
@@ -372,7 +382,7 @@ pub fn muon_scale_inv_frob_ptx() -> Vec<u8> {
 
 /// A unary kernel, `c[i] = f(a[i])`, with signature `(a, c, n)`; `Clamp`
 /// adds two `.f32` bounds, `(a, c, n, lo, hi)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnaryOp {
     Neg,
     Relu,
@@ -457,11 +467,16 @@ fn sigmoid_of(b: &mut KirBuilder, x: VarId) -> VarId {
 
 /// Build `op` as KIR: the binary kernels' shape with one input.
 pub fn build_unary(op: UnaryOp) -> KernelIR {
-    use AddressSpace::Global;
-    let mut b = KirBuilder::new(op.kernel_name());
+    build_unary_st(op, Storage::F32, Storage::F32)
+}
 
-    let a = b.add_param("a", f32_ptr(), Global);
-    let c = b.add_param("c", f32_ptr(), Global);
+/// [`build_unary`] with the operand and the result stored as given.
+pub fn build_unary_st(op: UnaryOp, input: Storage, out: Storage) -> KernelIR {
+    use AddressSpace::Global;
+    let mut b = KirBuilder::new(&variant_name(op.kernel_name(), &[input], out));
+
+    let a = b.add_param("a", input.ptr(), Global);
+    let c = b.add_param("c", out.ptr(), Global);
     let n = b.add_param("n", KirType::U64, Global);
     let bounds = (op == UnaryOp::Clamp).then(|| {
         let lo = b.add_param("lo", KirType::F32, Global);
@@ -483,10 +498,7 @@ pub fn build_unary(op: UnaryOp) -> KernelIR {
     b.terminate(KirTerminator::CondBranch(past, KirEdge::to(exit), KirEdge::to(body)));
 
     b.set_block(body);
-    let src = b.new_typed_var(f32_ptr());
-    b.emit(KirOp::PtrOffset(src, a, i));
-    let x = b.new_typed_var(KirType::F32);
-    b.emit(KirOp::Load(x, src, Global));
+    let x = load_as_f32(&mut b, a, i, input);
     let y = match op {
         UnaryOp::Neg => f32_op1(&mut b, KirOp::Neg, x),
         UnaryOp::Relu => {
@@ -525,9 +537,7 @@ pub fn build_unary(op: UnaryOp) -> KernelIR {
             f32_op2(&mut b, KirOp::Min, t, hi)
         }
     };
-    let dst = b.new_typed_var(f32_ptr());
-    b.emit(KirOp::PtrOffset(dst, c, i));
-    b.emit(KirOp::Store(dst, y, Global));
+    store_from_f32(&mut b, c, i, y, out);
     b.terminate(KirTerminator::Branch(KirEdge::to(exit)));
 
     b.set_block(exit);
@@ -551,6 +561,11 @@ pub fn unary_ptx(op: UnaryOp) -> Vec<u8> {
     lower_kir_to_ptx(&ir)
 }
 
+/// [`build_unary_st`] lowered to a NUL-terminated PTX module.
+pub fn unary_ptx_st(op: UnaryOp, input: Storage, out: Storage) -> Vec<u8> {
+    verified_ptx(build_unary_st(op, input, out))
+}
+
 /// An activation-backward kernel: the gradient of a unary activation, one
 /// thread per element. Each reads the upstream gradient and one saved
 /// tensor, `(grad, input | saved, out, n)`; `SwigluGate` reads a second
@@ -567,7 +582,7 @@ pub fn unary_ptx(op: UnaryOp) -> Vec<u8> {
 /// [`build_gelu_backward`]; both AD modes use it.
 /// `nsl_clamp_backward_f32` follows once the interpreter its gate runs on
 /// models `and.pred`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BackwardOp {
     /// `out = input > 0 ? grad : 0`.
     Relu,
@@ -642,24 +657,42 @@ fn srcad_silu_tail(b: &mut KirBuilder, x: VarId, s: VarId) -> VarId {
 /// bound, the loads in parameter order (the SwiGLU gate scales `grad` by
 /// `up` before it loads `input`), the derivative, one store.
 pub fn build_backward(op: BackwardOp) -> KernelIR {
+    let ins = vec![Storage::F32; op.param_names().len() - 2];
+    build_backward_st(op, &ins, Storage::F32)
+}
+
+/// [`build_backward`] with the tensor inputs (in parameter order: `grad`,
+/// `up` for the SwiGLU gate, then the saved operand) and the result stored
+/// as given.
+///
+/// # Panics
+///
+/// If `ins` does not have one storage per tensor input of `op`.
+pub fn build_backward_st(op: BackwardOp, ins: &[Storage], out: Storage) -> KernelIR {
     use AddressSpace::Global;
-    let mut b = KirBuilder::new(op.kernel_name());
     let names = op.param_names();
+    assert_eq!(ins.len(), names.len() - 2, "{}: one storage per tensor input", op.kernel_name());
+    let mut b = KirBuilder::new(&variant_name(op.kernel_name(), ins, out));
     let mut params = Vec::with_capacity(names.len());
-    for &name in names {
-        let ty = if name == "n" { KirType::U64 } else { f32_ptr() };
+    for (k, &name) in names.iter().enumerate() {
+        let ty = match name {
+            "n" => KirType::U64,
+            "out" => out.ptr(),
+            _ => ins[k].ptr(),
+        };
         params.push(b.add_param(name, ty, Global));
     }
     let param = |name: &str| params[names.iter().position(|n| *n == name).expect("a declared parameter")];
+    let storage = |name: &str| ins[names.iter().position(|n| *n == name).expect("a declared parameter")];
     let (i, _, exit) = index_and_bound(&mut b, param("n"));
 
-    let mut g = load_f32(&mut b, param("grad"), i);
+    let mut g = load_as_f32(&mut b, param("grad"), i, storage("grad"));
     if op == BackwardOp::SwigluGate {
-        let up = load_f32(&mut b, param("up"), i);
+        let up = load_as_f32(&mut b, param("up"), i, storage("up"));
         g = f32_op2(&mut b, KirOp::MulRn, g, up);
     }
     let saved = if matches!(op, BackwardOp::Sigmoid | BackwardOp::Tanh) { "saved" } else { "input" };
-    let x = load_f32(&mut b, param(saved), i);
+    let x = load_as_f32(&mut b, param(saved), i, storage(saved));
 
     let y = match op {
         BackwardOp::Relu => {
@@ -710,7 +743,7 @@ pub fn build_backward(op: BackwardOp) -> KernelIR {
             f32_op2(&mut b, KirOp::MulRn, g, t)
         }
     };
-    store_f32(&mut b, param("out"), i, y);
+    store_from_f32(&mut b, param("out"), i, y, out);
     finish(b, exit)
 }
 
@@ -723,10 +756,15 @@ pub fn backward_ptx(op: BackwardOp) -> Vec<u8> {
     verified_ptx(build_backward(op))
 }
 
+/// [`build_backward_st`] lowered to a NUL-terminated PTX module.
+pub fn backward_ptx_st(op: BackwardOp, ins: &[Storage], out: Storage) -> Vec<u8> {
+    verified_ptx(build_backward_st(op, ins, out))
+}
+
 /// The RoPE `rotate_half` pair over the last dimension: with `col = i %
 /// last_dim` and `half = last_dim / 2`, element `i` takes the partner
 /// `half` away (`i + half` in the first half, `i - half` in the second).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RotateHalfOp {
     /// `nsl_rotate_half_f32`: `out[..h] = -in[h..]`, `out[h..] = in[..h]`.
     Plain,
@@ -753,10 +791,16 @@ impl RotateHalfOp {
 /// [`RotateHalfOp::Plain`] negates in the first arm, [`RotateHalfOp::Neg`]
 /// in the second.
 pub fn build_rotate_half(op: RotateHalfOp) -> KernelIR {
+    build_rotate_half_st(op, Storage::F32, Storage::F32)
+}
+
+/// [`build_rotate_half`] with the operand and the result stored as given.
+/// A bf16-to-bf16 rotation is exact: it moves and negates values.
+pub fn build_rotate_half_st(op: RotateHalfOp, input: Storage, out: Storage) -> KernelIR {
     use AddressSpace::Global;
-    let mut b = KirBuilder::new(op.kernel_name());
-    let a = b.add_param("a", f32_ptr(), Global);
-    let c = b.add_param("c", f32_ptr(), Global);
+    let mut b = KirBuilder::new(&variant_name(op.kernel_name(), &[input], out));
+    let a = b.add_param("a", input.ptr(), Global);
+    let c = b.add_param("c", out.ptr(), Global);
     let n = b.add_param("n", KirType::U64, Global);
     let last_dim = b.add_param("last_dim", KirType::U64, Global);
     let half = b.add_param("half", KirType::U64, Global);
@@ -774,11 +818,11 @@ pub fn build_rotate_half(op: RotateHalfOp) -> KernelIR {
         b.set_block(block);
         let src = b.new_typed_var(KirType::U64);
         b.emit(if from_second_half { KirOp::Add(src, i, half) } else { KirOp::Sub(src, i, half) });
-        let v = load_f32(&mut b, a, src);
+        let v = load_as_f32(&mut b, a, src, input);
         // Plain negates what the first half reads; Neg what the second does.
         let negate = from_second_half == (op == RotateHalfOp::Plain);
         let v = if negate { f32_op1(&mut b, KirOp::Neg, v) } else { v };
-        store_f32(&mut b, c, i, v);
+        store_from_f32(&mut b, c, i, v, out);
         b.terminate(KirTerminator::Branch(KirEdge::to(exit)));
     }
 
@@ -796,6 +840,11 @@ pub fn build_rotate_half(op: RotateHalfOp) -> KernelIR {
 /// If the built kernel fails verification: a bug in this module.
 pub fn rotate_half_ptx(op: RotateHalfOp) -> Vec<u8> {
     verified_ptx(build_rotate_half(op))
+}
+
+/// [`build_rotate_half_st`] lowered to a NUL-terminated PTX module.
+pub fn rotate_half_ptx_st(op: RotateHalfOp, input: Storage, out: Storage) -> Vec<u8> {
+    verified_ptx(build_rotate_half_st(op, input, out))
 }
 
 /// The clamp adjoint's entry name.
