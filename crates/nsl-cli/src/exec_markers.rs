@@ -566,6 +566,23 @@ pub struct NegativeNeedle {
 /// fail at all, so each is pinned.
 pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
     NegativeNeedle {
+        test: "crates/nsl-cli/tests/pretrain_optimized_flag.rs",
+        asserts: "--pretrain-optimized no longer plans with WGGO (2026-11-15: \
+                  `--wggo greedy` cost 12-18% and left the bundle); a WGGO plan \
+                  announces itself with the `[wggo]` prefix",
+        parts: &[
+            // nsl_log!(INFO, "wggo", "[wggo] consumed pre-solved plan ...")
+            ("[wggo] consumed pre-solved plan", "crates/nsl-codegen/src/stmt_train/plan_wggo.rs"),
+        ],
+    },
+    NegativeNeedle {
+        test: "crates/nsl-cli/tests/honest_flags_gate.rs",
+        asserts: "the same: a --pretrain-optimized build carries no WGGO plan",
+        parts: &[
+            ("[wggo] consumed pre-solved plan", "crates/nsl-codegen/src/stmt_train/plan_wggo.rs"),
+        ],
+    },
+    NegativeNeedle {
         test: "crates/nsl-cli/tests/train_checkpoint_gate.rs",
         asserts: "a resume refused because the model's parameters were reordered \
                   never reports a completed resume",

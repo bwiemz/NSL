@@ -26,7 +26,8 @@
 //!   across KV tiles, by `crates/nsl-codegen/tests/sdpa_fused_packed_gpu_parity.rs`.
 //!
 //! * `wggo_reports_fused_consumption_on_gpu` (cuda, ignored) — under
-//!   `--pretrain-optimized` the plan's segment_id packing decision must be
+//!   `--pretrain-optimized --wggo greedy --csha auto` the plan's segment_id
+//!   packing decision must be
 //!   reported consumed through the Stage-C channel:
 //!   `-> fused segment-masked flash kernel (Stage C plain family)`.
 
@@ -346,7 +347,7 @@ fn wggo_reports_fused_consumption_on_gpu() {
         "gpu_wggo",
         true,
         &[],
-        &["--pretrain-optimized"],
+        &["--pretrain-optimized", "--wggo", "greedy", "--csha", "auto"],
     );
     assert_trains(&r, "gpu wggo");
     assert!(

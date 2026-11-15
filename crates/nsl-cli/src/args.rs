@@ -628,25 +628,28 @@ pub(crate) struct BuildArgs {
         #[arg(long)]
         pub(crate) source_ad: bool,
 
-        /// Pretraining bundle: expands to `--source-ad --wggo greedy --csha auto
-        /// --fuse-rmsnorm-backward --fuse-wgrad-accum` so one invocation runs
-        /// WGGO planning, applies CSHA + FASE per the plan, and takes both
-        /// backward fusions. Explicit flags win (only unset values are filled);
-        /// conflicts with `--tape-ad` (the planning stack lives in the
-        /// source-AD path).
+        /// Pretraining bundle: the measured production flag set, `--source-ad
+        /// --checkpoint-blocks --checkpoint-selective --fuse-rmsnorm-backward
+        /// --fuse-wgrad-accum`, plus `--fuse-lm-head auto`. Explicit flags win
+        /// (only unset values are filled; a typed `--checkpoint-blocks` alone
+        /// keeps full block recompute); conflicts with `--tape-ad`.
+        ///
+        /// CHANGED 2026-11-15: the bundle used to be `--source-ad --wggo greedy
+        /// --csha auto` plus the two fusions. `--wggo greedy` changes no memory
+        /// and took the optimizer step off the batched multi-tensor AdamW
+        /// launch: 0.82x tok/s at Coder-1B and 0.89x at Coder-500M against
+        /// this set (models/benchmarks/MEMORY_OPTIONS_2026_11.md). Pass `--wggo greedy` / `--csha auto`
+        /// explicitly for the planners.
         ///
         /// The two fusions change the ARITHMETIC, not just the schedule — that
-        /// is why they are opt-in elsewhere. Measured on Coder-50M (batch 4,
-        /// seq 1024): +14% tok/s, max relative loss divergence 1.2e-5 over 24
-        /// steps with an identical trend — a number produced by
-        /// `--fuse-rmsnorm-backward` and the rest of the bundle, NOT by
-        /// `--fuse-wgrad-accum`, which needs `grad_accumulation >= 2` in the
-        /// train block and fused nothing in that run (codegen says so per
-        /// train block: `[wgrad-fusion] declined: ...`).
-        /// `--training-reference` strips them back out for a reference run,
-        /// and `--fuse-wgrad-accum` is skipped (with a note) when
-        /// `--grad-integrity`, `--optim-state-offload` or `--layerwise-accum`
-        /// is set, since it refuses those.
+        /// is why they are opt-in elsewhere. `--fuse-wgrad-accum` needs
+        /// `grad_accumulation >= 2` in the train block (codegen says per block
+        /// when it declines: `[wgrad-fusion] declined: ...`). A model without
+        /// `blocks.N` parameters runs without checkpointing (CCR declines with a
+        /// warning). `--training-reference` strips the fusions and the
+        /// checkpointing back out, and `--fuse-wgrad-accum` is skipped (with a
+        /// note) when `--grad-integrity`, `--optim-state-offload` or
+        /// `--layerwise-accum` is set, since it refuses those.
         #[arg(long, conflicts_with = "tape_ad")]
         pub(crate) pretrain_optimized: bool,
 
@@ -674,7 +677,10 @@ pub(crate) struct BuildArgs {
         #[arg(long)]
         pub(crate) distribute: Option<String>,
 
-        /// M43: ZeRO optimizer sharding stage (1, 2, or 3)
+        /// M43: ZeRO optimizer sharding stage (1, 2, or 3). ZeRO shards across
+        /// ranks: with one device (`--devices 1`, the default) it shards
+        /// nothing, saves no memory (measured 2026-11) and says so at compile
+        /// time.
         #[arg(long)]
         pub(crate) zero_stage: Option<u32>,
 
@@ -750,6 +756,11 @@ pub(crate) struct BuildArgs {
 
         /// WGGO: global-optimization mode ("full", "greedy", or "off").
         /// Passing `--wggo` without a value enables full mode.
+        ///
+        /// Not a memory option. With the production flags `greedy` changes no
+        /// memory and costs 0.82x tok/s at Coder-1B bf16 and 0.89x at
+        /// Coder-500M TF32 (2026-11, models/benchmarks/MEMORY_OPTIONS_2026_11.md): its plan routes the
+        /// optimizer step off the batched multi-tensor AdamW launch.
         #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "full")]
         pub(crate) wggo: Option<String>,
 
@@ -759,8 +770,13 @@ pub(crate) struct BuildArgs {
 
         /// WGGO: lower the plan's optimizer-moment precision decisions
         /// (optim_m/v_bits) to real m/v storage dtypes. Opt-in: changes
-        /// training numerics. Works on CPU and GPU (the GPU cast envelope
-        /// uses the CFTP-v7 PTX cast kernels).
+        /// training numerics. WGGO decides reduced moments only with
+        /// sensitivity data (`--wggo-weights`) or under `--wggo-memory-budget`;
+        /// a train block for which it decided none is a compile error rather
+        /// than a run identical to one without the flag (on the production
+        /// recipes it was byte-identical, 2026-11). For a bf16 first moment
+        /// regardless of a plan, use the optimizer argument
+        /// `first_moment_dtype="bf16"`.
         #[arg(long)]
         pub(crate) wggo_moment_precision: bool,
 
@@ -1309,25 +1325,28 @@ pub(crate) struct RunArgs {
         #[arg(long)]
         pub(crate) source_ad: bool,
 
-        /// Pretraining bundle: expands to `--source-ad --wggo greedy --csha auto
-        /// --fuse-rmsnorm-backward --fuse-wgrad-accum` so one invocation runs
-        /// WGGO planning, applies CSHA + FASE per the plan, and takes both
-        /// backward fusions. Explicit flags win (only unset values are filled);
-        /// conflicts with `--tape-ad` (the planning stack lives in the
-        /// source-AD path).
+        /// Pretraining bundle: the measured production flag set, `--source-ad
+        /// --checkpoint-blocks --checkpoint-selective --fuse-rmsnorm-backward
+        /// --fuse-wgrad-accum`, plus `--fuse-lm-head auto`. Explicit flags win
+        /// (only unset values are filled; a typed `--checkpoint-blocks` alone
+        /// keeps full block recompute); conflicts with `--tape-ad`.
+        ///
+        /// CHANGED 2026-11-15: the bundle used to be `--source-ad --wggo greedy
+        /// --csha auto` plus the two fusions. `--wggo greedy` changes no memory
+        /// and took the optimizer step off the batched multi-tensor AdamW
+        /// launch: 0.82x tok/s at Coder-1B and 0.89x at Coder-500M against
+        /// this set (models/benchmarks/MEMORY_OPTIONS_2026_11.md). Pass `--wggo greedy` / `--csha auto`
+        /// explicitly for the planners.
         ///
         /// The two fusions change the ARITHMETIC, not just the schedule — that
-        /// is why they are opt-in elsewhere. Measured on Coder-50M (batch 4,
-        /// seq 1024): +14% tok/s, max relative loss divergence 1.2e-5 over 24
-        /// steps with an identical trend — a number produced by
-        /// `--fuse-rmsnorm-backward` and the rest of the bundle, NOT by
-        /// `--fuse-wgrad-accum`, which needs `grad_accumulation >= 2` in the
-        /// train block and fused nothing in that run (codegen says so per
-        /// train block: `[wgrad-fusion] declined: ...`).
-        /// `--training-reference` strips them back out for a reference run,
-        /// and `--fuse-wgrad-accum` is skipped (with a note) when
-        /// `--grad-integrity`, `--optim-state-offload` or `--layerwise-accum`
-        /// is set, since it refuses those.
+        /// is why they are opt-in elsewhere. `--fuse-wgrad-accum` needs
+        /// `grad_accumulation >= 2` in the train block (codegen says per block
+        /// when it declines: `[wgrad-fusion] declined: ...`). A model without
+        /// `blocks.N` parameters runs without checkpointing (CCR declines with a
+        /// warning). `--training-reference` strips the fusions and the
+        /// checkpointing back out, and `--fuse-wgrad-accum` is skipped (with a
+        /// note) when `--grad-integrity`, `--optim-state-offload` or
+        /// `--layerwise-accum` is set, since it refuses those.
         #[arg(long, conflicts_with = "tape_ad")]
         pub(crate) pretrain_optimized: bool,
 
@@ -1381,7 +1400,10 @@ pub(crate) struct RunArgs {
         #[arg(long)]
         pub(crate) distribute: Option<String>,
 
-        /// M43: ZeRO optimizer sharding stage (1, 2, or 3)
+        /// M43: ZeRO optimizer sharding stage (1, 2, or 3). ZeRO shards across
+        /// ranks: with one device (`--devices 1`, the default) it shards
+        /// nothing, saves no memory (measured 2026-11) and says so at compile
+        /// time.
         #[arg(long)]
         pub(crate) zero_stage: Option<u32>,
 
@@ -1470,6 +1492,11 @@ pub(crate) struct RunArgs {
         /// Passing `--wggo` without a value enables full mode. Mirrors
         /// `nsl build --wggo` so the WGGO mode-table dispatch reaches
         /// `emit_unified_optim_step_dispatch` end-to-end via `nsl run`.
+        ///
+        /// Not a memory option. With the production flags `greedy` changes no
+        /// memory and costs 0.82x tok/s at Coder-1B bf16 and 0.89x at
+        /// Coder-500M TF32 (2026-11, models/benchmarks/MEMORY_OPTIONS_2026_11.md): its plan routes the
+        /// optimizer step off the batched multi-tensor AdamW launch.
         #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "full")]
         pub(crate) wggo: Option<String>,
 
@@ -1479,8 +1506,13 @@ pub(crate) struct RunArgs {
 
         /// WGGO: lower the plan's optimizer-moment precision decisions
         /// (optim_m/v_bits) to real m/v storage dtypes. Opt-in: changes
-        /// training numerics. Works on CPU and GPU (the GPU cast envelope
-        /// uses the CFTP-v7 PTX cast kernels).
+        /// training numerics. WGGO decides reduced moments only with
+        /// sensitivity data (`--wggo-weights`) or under `--wggo-memory-budget`;
+        /// a train block for which it decided none is a compile error rather
+        /// than a run identical to one without the flag (on the production
+        /// recipes it was byte-identical, 2026-11). For a bf16 first moment
+        /// regardless of a plan, use the optimizer argument
+        /// `first_moment_dtype="bf16"`.
         #[arg(long)]
         pub(crate) wggo_moment_precision: bool,
 

@@ -10,8 +10,8 @@
 #   - The model consumes the mask through the stdlib GQA forward_masked
 #     (PCA Stage B: scaled_dot_product_attention_masked, decomposed
 #     source-AD backward).
-#   - Driven with --pretrain-optimized (source AD + wggo greedy + csha
-#     auto): WGGO pre-plans per-layer decisions; the masked-attention call
+#   - Driven with --pretrain-optimized --wggo greedy --csha auto (the
+#     production flags plus both planners): WGGO pre-plans per-layer decisions; the masked-attention call
 #     makes the module packing-capable, so the plan may select
 #     packing_mode=segment_id (Stage D honesty).
 #

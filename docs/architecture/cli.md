@@ -216,9 +216,13 @@ the same file, is the registry of `NSL_EVENTS` JSONL kinds and their fields —
 the machine-readable twins of the markers.
 
 **`meta_flags.rs` — bundles.** `--pretrain-optimized` expands
-(`expand_pretrain_optimized`, returning a `PretrainBundle`) into
-`--source-ad`, `--wggo greedy`, `--csha auto`, `--fuse-rmsnorm-backward` and
-`--fuse-wgrad-accum`, filling only flags the user left unset. Because the
+(`expand_pretrain_optimized`, returning a `PretrainBundle`) into the measured
+production flag set, `--source-ad`, `--checkpoint-blocks`,
+`--checkpoint-selective`, `--fuse-rmsnorm-backward`, `--fuse-wgrad-accum` and
+`--fuse-lm-head auto`, filling only flags the user left unset (a typed
+`--checkpoint-blocks` keeps full recompute). Until 2026-11-15 it was
+`--source-ad --wggo greedy --csha auto` plus the fusions; `--wggo greedy` cost
+12-18% (`models/benchmarks/MEMORY_OPTIONS_2026_11.md`). Because the
 bundle is applied after clap has validated, clap can no longer enforce
 `--fuse-wgrad-accum`'s conflicts; `WgradFusionBlockers` re-checks them, with
 a matching hard error in the codegen's `stmt.rs` as backstop.

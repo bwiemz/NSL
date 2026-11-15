@@ -1,8 +1,9 @@
 //! WGGO-orchestrated PACKED pretraining, end to end (CPU).
 //!
 //! The campaign's integration moment: a GQA transformer trained on a
-//! packed token stream under `--pretrain-optimized` (source AD + wggo
-//! greedy + csha auto), where
+//! packed token stream under `--pretrain-optimized --wggo greedy --csha
+//! auto` (the production flags plus the planners; the bundle stopped
+//! including them on 2026-11-15), where
 //!   - the DataLoader builds block-diagonal packed batches at runtime
 //!     (packing=true, pack_separator) with real document boundaries,
 //!   - the model consumes the additive mask through the stdlib GQA
@@ -38,7 +39,7 @@ fn packed_pretrain_trains_and_consumes_the_wggo_plan() {
         .arg(root.join("Cargo.toml"))
         .args(["-p", "nsl-cli", "--features", if cfg!(feature = "cuda") { "cuda" } else { "" }, "--", "run"])
         .arg(&fixture)
-        .arg("--pretrain-optimized")
+        .args(["--pretrain-optimized", "--wggo", "greedy", "--csha", "auto"])
         .current_dir(tmp.path())
         .env("NSL_STDLIB_PATH", root.join("stdlib"))
         .output()

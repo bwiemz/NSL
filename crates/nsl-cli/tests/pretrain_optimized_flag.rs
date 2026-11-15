@@ -65,8 +65,11 @@ fn pretrain_optimized_conflicts_with_tape_ad() {
 }
 
 /// A bundled invocation must run a real training program to completion —
-/// the expanded `--source-ad --wggo greedy --csha auto` path may not wedge
-/// a program that runs fine unbundled.
+/// the expanded production flags may not wedge a program that runs fine
+/// unbundled. This fixture has no `blocks.N` parameters, so the bundle's
+/// checkpointing must decline (with its warning) rather than fail the build,
+/// and the bundle must not plan with WGGO: since 2026-11-15 it is the measured
+/// production set, and `--wggo greedy` (what it used to include) cost 12-18%.
 #[test]
 fn pretrain_optimized_runs_end_to_end() {
     let (ok, out, err) = run_nsl(&["--pretrain-optimized"], &fixture_source(), "e2e");
@@ -74,4 +77,9 @@ fn pretrain_optimized_runs_end_to_end() {
         ok && out.contains("BUNDLE_DONE"),
         "bundled run failed.\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
     );
+    assert!(
+        err.contains("--checkpoint-blocks requested but the tape has no"),
+        "the bundle did not request block checkpointing:\n{err}"
+    );
+    assert!(!err.contains("[wggo]"), "the bundle planned with WGGO:\n{err}");
 }
