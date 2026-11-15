@@ -112,3 +112,37 @@ print(a // b)
 "#);
     assert_eq!(numbers(&out), [3.5, 3.5, 3.0]);
 }
+
+/// Every position that needs an int refuses a float with the `//` hint,
+/// where it used to fail Cranelift's verifier without a span (`range(n /
+/// 2)`, `xs[n / 2]`) or truncate without a word: `[4, n / 2]` was a list
+/// of ints (typed by its first element) and reshaped a 12-element tensor
+/// to [4, 3]. A list with a float element is now a list of floats.
+#[test]
+fn a_float_where_an_int_is_needed_is_refused() {
+    let cases = [
+        ("let n = 7\nfor i in range(n / 2):\n    print(i)\n", "a range() argument must be an int"),
+        ("const H = 8 / 2\nfor i in range(H):\n    print(i)\n", "a range() argument must be an int"),
+        ("for i in 0..7 / 2:\n    print(i)\n", "a range bound must be an int"),
+        ("let xs = [10, 20, 30, 40]\nlet n = 7\nprint(xs[n / 2])\n", "an index must be an int"),
+        ("let xs = [10, 20, 30, 40]\nlet n = 7\nprint(xs[1:n / 2])\n", "an index must be an int"),
+        ("let t = ones([2, 2])\nlet n = 3\nprint(t[0, n / 2])\n", "an index must be an int"),
+        (
+            "let x = ones([2, 6])\nlet n = 7\nlet s = [4, n / 2]\nprint(x.reshape(s))\n",
+            "the shape is a list of floats",
+        ),
+        (
+            "let n = 7\nlet s = [n / 2, 4]\nprint(zeros(s))\n",
+            "the shape is a list of floats",
+        ),
+        ("fn f(k: int) -> int:\n    return k\nprint(f(7 / 2))\n", "argument 1: expected int, got float"),
+    ];
+    for (src, want) in cases {
+        let out = run(src);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "ran:\n{src}\n{}", String::from_utf8_lossy(&out.stdout));
+        assert!(stderr.contains(want), "{src}\nwanted {want:?} in:\n{stderr}");
+        assert!(stderr.contains("`//`"), "{src}\nno `//` hint in:\n{stderr}");
+        assert!(!stderr.contains("Verifier"), "{src}\n{stderr}");
+    }
+}

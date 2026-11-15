@@ -668,3 +668,17 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 
     pi == plen
 }
+
+/// A scalar float type (the checker's `float`, or a sized float).
+pub(crate) fn is_float_scalar(ty: &Type) -> bool {
+    dtype_rank(ty).0 == 2
+}
+
+/// What to say where a float stands for an int: `/` is true division.
+pub(crate) fn float_where_int_hint(expr: &Expr) -> &'static str {
+    if matches!(expr.kind, ExprKind::BinaryOp { op: BinOp::Div, .. }) {
+        "`/` is true division and gives a float; use `//` for integer division"
+    } else {
+        "an int is needed here: use `//` for integer division, or `int(...)`"
+    }
+}
