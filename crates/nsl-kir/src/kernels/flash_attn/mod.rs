@@ -38,6 +38,26 @@
 //! What f16 operands cost against f32 (TF32) matmuls is the operands'
 //! 11-bit significand; `tools/refcheck` measures the end-to-end effect
 //! against PyTorch (see its README).
+//!
+//! # Against the kernels these replace
+//!
+//! The operand precision is the same (f16, round to nearest, f32
+//! accumulation), so the f32 / TF32 training path's agreement with PyTorch
+//! is unchanged in kind. Three things differ, each toward the exact answer
+//! or toward reproducibility:
+//!
+//! - the forward output is stored as f32 instead of being rounded to f16;
+//! - the gradient prescale is per row (dQ) and per batch and kv-head group
+//!   (dK/dV) instead of per (batch-head, 64-row query tile), with the same
+//!   target binade;
+//! - dQ is formed without atomics, so two runs give the same bits.
+//!
+//! Measured 2026-11-14 with `tools/refcheck/grad_check.py` at Coder-50M,
+//! production flags, TF32: median 1.21e-3 / worst 2.10e-3 relative error
+//! against PyTorch here, against 1.22e-3 / 2.95e-3 for the kernels these
+//! replace; with `NSL_MATMUL_BF16=1` 3.93e-3 / 5.62e-3 against 3.92e-3 /
+//! 5.74e-3 (the bf16 GEMMs set that floor). Kernel-level checks against f64
+//! are the `tc_*` tests in nsl-runtime's `attention_tc.rs`.
 
 pub mod bwd;
 pub mod fwd;

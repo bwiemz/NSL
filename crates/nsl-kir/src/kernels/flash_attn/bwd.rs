@@ -102,7 +102,7 @@ impl BwdConfig {
     // ── pre-pass ──
 
     pub fn pre_kernel_name(&self) -> String {
-        format!("nsl_fa2_bwd_pre_d{}", self.head_dim)
+        format!("nsl_flash_tc_bwd_pre_d{}", self.head_dim)
     }
 
     pub fn pre_threads(&self) -> u32 {
@@ -123,7 +123,7 @@ impl BwdConfig {
     // ── dQ ──
 
     pub fn dq_kernel_name(&self) -> String {
-        format!("nsl_fa2_bwd_dq_{}_w{}_n{}", self.tag(), self.dq_warps, self.dq_block_n)
+        format!("nsl_flash_tc_bwd_dq_{}_w{}_n{}", self.tag(), self.dq_warps, self.dq_block_n)
     }
 
     pub fn dq_block_m(&self) -> u32 {
@@ -151,7 +151,7 @@ impl BwdConfig {
     // ── dK/dV ──
 
     pub fn dkdv_kernel_name(&self) -> String {
-        format!("nsl_fa2_bwd_dkdv_{}_w{}_q{}", self.tag(), self.dkdv_warps, self.dkdv_block_q)
+        format!("nsl_flash_tc_bwd_dkdv_{}_w{}_q{}", self.tag(), self.dkdv_warps, self.dkdv_block_q)
     }
 
     pub fn dkdv_block_n(&self) -> u32 {

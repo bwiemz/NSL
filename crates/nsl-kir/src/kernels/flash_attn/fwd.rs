@@ -74,7 +74,7 @@ impl FwdConfig {
     /// The `.visible .entry` name; the launcher launches by it.
     pub fn kernel_name(&self) -> String {
         format!(
-            "nsl_fa2_fwd_d{}_{}_w{}_n{}",
+            "nsl_flash_tc_fwd_d{}_{}_w{}_n{}",
             self.head_dim,
             if self.causal { "causal" } else { "full" },
             self.warps,
@@ -119,9 +119,9 @@ pub(crate) struct TileMap {
 impl TileMap {
     pub fn new(g: &mut G, tid: VarId, head_dim: u32, rows: u32, threads: u32) -> TileMap {
         let per_row = head_dim / 4;
-        assert!(per_row.is_power_of_two() && threads % per_row == 0);
+        assert!(per_row.is_power_of_two() && threads.is_multiple_of(per_row));
         let chunks = rows * per_row / threads;
-        assert!(chunks >= 1 && (rows * per_row) % threads == 0, "tile {rows}x{head_dim} on {threads} threads");
+        assert!(chunks >= 1 && (rows * per_row).is_multiple_of(threads), "tile {rows}x{head_dim} on {threads} threads");
         let sh = g.u32c(per_row.trailing_zeros());
         let t_row = g.shr(tid, sh);
         let m = g.u32c(per_row - 1);
@@ -134,6 +134,7 @@ impl TileMap {
     /// head_dim]` f32 matrix): rows at or past `seq` read row `seq - 1`'s
     /// address and are replaced by zeros. Returns `chunks · 4` values,
     /// optionally each multiplied by `scale`.
+    #[allow(clippy::too_many_arguments)] // the tile's geometry, spelled out at each call
     pub fn load(
         &self,
         g: &mut G,
