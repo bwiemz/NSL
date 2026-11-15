@@ -12,6 +12,7 @@ order a campaign uses them (each GPU one is short enough to queue on its own):
               fresh process, in an order rotated by the round number.
     phases    instrumented runs (device syncs around forward, backward, optimizer);
               their update times are discarded, only the split is kept.
+    workspace whether PyTorch's allocator peak counts the cuBLAS workspace.
     nsys      one arm under Nsight Systems; `nsys_summary.py` reads the trace.
     diag      one NSL arm under extra diagnostic environment (NSL_HOST_PROFILE=1, ...).
     report    every result under --out as tables: median over rounds, min-max
@@ -54,6 +55,7 @@ import argparse
 import dataclasses
 import itertools
 import json
+import math
 import os
 import re
 import shutil
@@ -124,8 +126,6 @@ class Shape:
         return 6.0 * self.matmul_params() + attn
 
 
-# The production recipes' step shapes (`models/<dir>/pretrain_prod.nsl`).
-RECIPE_STEP = {"50m": (1, 1024, 8), "500m": (2, 1024, 8), "1b": (2, 2048, 4)}
 SIZE_DIR = {"50m": "coder50m", "500m": "coder500m", "1b": "coder1b"}
 
 
@@ -139,7 +139,12 @@ def read_shape(size: str, micro_batch: int | None, seq: int | None, accum: int |
             raise ValueError(f"models/{directory}/config.nsl: no `const {name}`")
         return int(m.group(1))
 
-    mb, sq, ac = RECIPE_STEP[size]
+    # The recipe's step: `config.nsl` must agree with `pretrain_prod.nsl`
+    # (crates/nsl-cli/tests/pretrain_prod_agreement_gate.rs), and every recipe trains
+    # at MAX_SEQ_LEN.
+    mb = const("PRETRAIN_BATCH_SIZE")
+    sq = const("MAX_SEQ_LEN")
+    ac = const("PRETRAIN_GRAD_ACCUMULATION")
     return Shape(
         directory=directory,
         vocab=const("VOCAB_SIZE"),
@@ -507,6 +512,31 @@ def steady(stamps: list[float], warmup: int, tokens_per_update: int) -> dict[str
     }
 
 
+def parse_loss(line: str) -> float | None:
+    """The value of a printed scalar tensor (`tensor([11.2])`, `tensor([NaN])`) or a bare
+    number; None when the line is neither. `float` reads nan/inf in any case."""
+    m = re.fullmatch(r"\s*(?:tensor\(\[)?\s*([^\]\s]+)\s*(?:\]\))?\s*", line)
+    if m is None:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
+def loss_problem(losses: list[float], updates: int) -> str | None:
+    """Why a run's per-update losses cannot be trusted, or None: one per update, all
+    finite, and lower at the end than at the start (24 updates of AdamW at lr 1e-4 from
+    a fresh init fall by 0.04-0.26 nats on both frameworks)."""
+    if len(losses) != updates:
+        return f"{len(losses)} losses for {updates} updates"
+    if not all(math.isfinite(x) for x in losses):
+        return f"non-finite loss: {losses}"
+    if losses[-1] >= losses[0]:
+        return f"loss did not fall: {losses[0]} -> {losses[-1]}"
+    return None
+
+
 def after(text: list[str], marker: str) -> int | None:
     try:
         return int(float(text[text.index(marker) + 1]))
@@ -571,13 +601,14 @@ def run_nsl_arm(
     losses: list[float] = []
     for i, s in enumerate(text):
         if s == "OPT_STEP" and i + 1 < len(text):
-            m = re.search(r"[-+0-9.eE]+(?:nan|inf)?", text[i + 1].replace("tensor(", ""))
-            if m:
-                try:
-                    losses.append(float(m.group(0)))
-                except ValueError:
-                    pass
+            v = parse_loss(text[i + 1])
+            if v is not None:
+                losses.append(v)
     row["losses"] = losses
+    problem = loss_problem(losses, updates)
+    if problem is not None and row["status"] == "ok":
+        row["status"] = "error"
+        row["error"] = problem
     row["stamps"] = stamps
     row["steady"] = steady(stamps, warmup, shape.tokens_per_update)
     if len(stamps) > warmup:
@@ -653,6 +684,10 @@ def run_torch_arm(
     row: dict[str, Any] = json.loads(out.read_text())
     row["kind"] = "torch"
     row["driver_peak_mib"] = driver
+    problem = loss_problem(row["losses"], updates)
+    if problem is not None and row["status"] == "ok":
+        row["status"] = "error"
+        row["error"] = problem
     row["steady"] = steady(row["stamps"], warmup, shape.tokens_per_update)
     if len(row["stamps"]) > warmup:
         row["card_steady"] = sampler.card_between(row["stamps"][warmup], row["stamps"][-1])
@@ -666,8 +701,13 @@ def cmd_roofline(args: argparse.Namespace) -> int:
     gpu_guard.acquire_or_refuse("perfcheck-roofline")
     import torch
 
-    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+    # PyTorch's defaults are kept and recorded: TF32 off except in the tf32 rows, and
+    # reduced-precision (16-bit) split-K reductions allowed for bf16, as the bf16 arms
+    # run with them too.
     out: dict[str, Any] = {
+        "allow_bf16_reduced_precision_reduction": (
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
+        ),
         "device": torch.cuda.get_device_name(0),
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
@@ -722,6 +762,33 @@ def cmd_roofline(args: argparse.Namespace) -> int:
         print(f"nsl: {out['nsl_gemm']}", flush=True)
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "roofline.json").write_text(json.dumps(out, indent=1))
+    return 0
+
+
+def cmd_workspace(args: argparse.Namespace) -> int:
+    """Whether PyTorch's `max_memory_allocated` counts the cuBLAS workspace: the
+    allocated-bytes delta across the process's first GEMM, whose output is freed."""
+    gpu_guard.acquire_or_refuse("perfcheck-workspace")
+    import torch
+
+    a = torch.randn(2048, 2048, device="cuda")
+    b = torch.randn(2048, 2048, device="cuda")
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    c = a @ b
+    del c
+    torch.cuda.synchronize()
+    out = {
+        "first_gemm_retained_bytes": torch.cuda.memory_allocated() - before,
+        "CUBLAS_WORKSPACE_CONFIG": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+        "allow_bf16_reduced_precision_reduction": (
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
+        ),
+        "torch": torch.__version__,
+    }
+    print(json.dumps(out), flush=True)
+    args.out.mkdir(parents=True, exist_ok=True)
+    (args.out / "torch_workspace.json").write_text(json.dumps(out, indent=1))
     return 0
 
 
@@ -948,6 +1015,11 @@ def cmd_report(args: argparse.Namespace) -> int:
         rows: dict[str, list[dict[str, Any]]] = {}
         for f in sorted((work / "results").glob("*.json")):
             r = json.loads(f.read_text())
+            # Re-check results written before the loss check existed, and any since.
+            problem = loss_problem(r.get("losses") or [], r.get("updates", 0))
+            if r["status"] == "ok" and problem is not None:
+                r["status"] = "error"
+                r["error"] = problem
             rows.setdefault(r["arm"], []).append(r)
         order = [*REPORT_ORDER, *sorted(set(rows) - set(REPORT_ORDER))]
         rows = {k: rows[k] for k in order if k in rows}
@@ -979,38 +1051,153 @@ def cmd_report(args: argparse.Namespace) -> int:
             )
         if (work / "phases").is_dir():
             print(
-                "\n| arm (instrumented) | wall s/update | forward | backward | optimizer "
-                "| rest |\n|---|---|---|---|---|---|"
+                "\n| arm (instrumented) | wall s/update | vs timed median | forward | backward "
+                "| optimizer | rest | alloc peak fwd / bwd / opt GiB |"
+                "\n|---|---|---|---|---|---|---|---|"
             )
             for f in sorted((work / "phases").glob("*.json")):
                 r = json.loads(f.read_text())
                 sp = phase_split(r) if r["status"] == "ok" else None
                 if sp is None:
-                    print(f"| {r['arm']} | {r['status']} | | | | |")
+                    print(f"| {r['arm']} | {r['status']} | | | | | | |")
                     continue
-                print(
-                    f"| {r['arm']} | {sp['wall']:.3f} | {sp['fwd']:.3f} | {sp['bwd']:.3f} | "
-                    f"{sp['opt']:.3f} | {sp['other']:.3f} |"
+                timed = [x["steady"]["update_s_median"] for x in rows.get(r["arm"], [])
+                         if x["status"] == "ok" and x.get("steady")]  # fmt: skip
+                cost = (
+                    f"{100 * (sp['wall'] / statistics.median(timed) - 1):+.1f}%" if timed else "-"
                 )
+                peaks = "-"
+                if r.get("phase_peaks"):
+                    last = r["phase_peaks"][-1]
+                    peaks = " / ".join(f"{last[k] / 2**30:.2f}" for k in ("fwd", "bwd", "opt"))
+                print(
+                    f"| {r['arm']} | {sp['wall']:.3f} | {cost} | {sp['fwd']:.3f} | "
+                    f"{sp['bwd']:.3f} | {sp['opt']:.3f} | {sp['other']:.3f} | {peaks} |"
+                )
+        report_rounds(rows)
+        report_pairs(rows)
+        report_nsl_memory(work, rows)
+        report_host_profile(work)
     return 0
+
+
+# Comparisons the write-up quotes, as (numerator arm, denominator arm).
+PAIRS = [
+    ("torch_tf32_eager_sel", "nsl_tf32"),
+    ("torch_bf16_eager_sel", "nsl_bf16"),
+    ("torch_bf16_compile_sel", "nsl_bf16"),
+    ("torch_bf16_compile_sel", "nsl_tf32"),
+    ("nsl_bf16", "nsl_tf32"),
+    ("torch_bf16_eager_sel", "torch_tf32_eager_sel"),
+    ("torch_bf16_compile_sel", "torch_bf16_eager_sel"),
+    ("nsl_tf32", "nsl_tf32_blocks"),
+    ("torch_tf32_eager_sel", "torch_tf32_eager_blocks"),
+    ("torch_bf16_compile_sel", "torch_bf16_compile_blocks"),
+    ("torch_bf16_compile_none", "torch_bf16_compile_sel"),
+    ("nsl_tf32_nodrain", "nsl_tf32"),
+    ("nsl_bf16_nodrain", "nsl_bf16"),
+    ("nsl_tf32_compress", "nsl_tf32"),
+    ("nsl_bf16_compress", "nsl_bf16"),
+]
+
+
+def tok_by_round(rs: list[dict[str, Any]]) -> dict[int, float]:
+    return {r["round"]: r["steady"]["tok_s"] for r in rs if r["status"] == "ok" and r.get("steady")}
 
 
 def paired_ratios(
     rows: dict[str, list[dict[str, Any]]], num: str, den: str
 ) -> list[tuple[int, float]]:
-    """tok/s of `num` over tok/s of `den`, per round in which both ran ok (round, ratio).
-    A ratio is only taken within a round: the two runs were minutes apart under the
-    same machine conditions, which is what cancels a machine-wide shift."""
-
-    def by_round(arm_name: str) -> dict[int, float]:
-        return {
-            r["round"]: r["steady"]["tok_s"]
-            for r in rows.get(arm_name, [])
-            if r["status"] == "ok" and r.get("steady")
-        }
-
-    a, b = by_round(num), by_round(den)
+    """tok/s of `num` over `den` within each round both completed, in round order."""
+    a, b = tok_by_round(rows.get(num, [])), tok_by_round(rows.get(den, []))
     return [(k, a[k] / b[k]) for k in sorted(set(a) & set(b))]
+
+
+def report_pairs(rows: dict[str, list[dict[str, Any]]]) -> None:
+    print("\n| paired ratio (tok/s, same round) | per round | median |\n|---|---|---|")
+    for num, den in PAIRS:
+        pr = paired_ratios(rows, num, den)
+        if pr:
+            per = " ".join(f"r{k}:{v:.3f}" for k, v in pr)
+            print(f"| {num} / {den} | {per} | {statistics.median(v for _, v in pr):.3f} |")
+
+
+def report_rounds(rows: dict[str, list[dict[str, Any]]]) -> None:
+    """Each arm's tok/s per round and its deviation from the arm's median."""
+    print("\n| arm | tok/s per round (deviation from the arm's median) |\n|---|---|")
+    for name, rs in rows.items():
+        by = tok_by_round(rs)
+        if not by:
+            continue
+        med = statistics.median(by.values())
+        cells = " ".join(
+            f"r{k}:{v:,.0f} ({100 * (v / med - 1):+.1f}%)" for k, v in sorted(by.items())
+        )
+        print(f"| {name} | {cells} |")
+
+
+def top_contexts_at_peak(stderr_text: str) -> list[tuple[str, str]]:
+    """The `NSL_MEMSTATS=1` summary's "Top contexts at peak" rows: (context, size)."""
+    block = stderr_text.split("Top contexts at peak:", 1)
+    if len(block) < 2:
+        return []
+    out = []
+    for line in block[1].splitlines()[1:]:
+        m = re.match(r"\s+(.+?): ([0-9.]+ [KMG]?B) \(\d+ blocks\)", line)
+        if m is None:
+            break
+        out.append((m.group(1), m.group(2)))
+    return out
+
+
+def report_nsl_memory(work: Path, rows: dict[str, list[dict[str, Any]]]) -> None:
+    """NSL's allocator surfaces and allocation contexts at its global peak (round 0)."""
+    printed = False
+    for name, rs in rows.items():
+        r0 = next((r for r in rs if r.get("kind") == "nsl" and r["round"] == 0), None)
+        log = work / "logs" / f"{name}_r0.stderr"
+        if r0 is None or not log.exists():
+            continue
+        if not printed:
+            print("\n| NSL arm, round 0 | surfaces at peak (GiB) | top contexts at peak |"
+                  "\n|---|---|---|")  # fmt: skip
+            printed = True
+        surf = ", ".join(f"{k} {v / 2**30:.2f}" for k, v in r0["surfaces_at_peak"].items() if v)
+        ctx = ", ".join(f"{c} {b}" for c, b in top_contexts_at_peak(log.read_text())[:5])
+        print(f"| {name} | {surf} | {ctx} |")
+
+
+def host_profile_summary(stderr_text: str) -> dict[str, float] | None:
+    """Medians over the `NSL_HOST_PROFILE=1` per-step reports: attributed ms, and per probe
+    the calls and ms per step."""
+    steps = stderr_text.split("[host-profile] step:")[1:]
+    if not steps:
+        return None
+    total: list[float] = []
+    per: dict[str, list[tuple[float, float]]] = {}
+    for st in steps:
+        m = re.match(r"\s*([0-9.]+) ms attributed", st)
+        if m is None:
+            continue
+        total.append(float(m.group(1)))
+        for pm in re.finditer(r"^\s+(\w+)\s+([0-9.]+) ms\s+(\d+) calls", st, re.MULTILINE):
+            per.setdefault(pm.group(1), []).append((float(pm.group(2)), float(pm.group(3))))
+    out = {"attributed_ms": statistics.median(total), "steps": float(len(total))}
+    for probe, xs in per.items():
+        out[f"{probe}_ms"] = statistics.median(x[0] for x in xs)
+        out[f"{probe}_calls"] = statistics.median(x[1] for x in xs)
+    return out
+
+
+def report_host_profile(work: Path) -> None:
+    for log in sorted((work / "logs").glob("*_diag_hostprof.stderr")):
+        hp = host_profile_summary(log.read_text())
+        if hp is None:
+            continue
+        print(f"\n{log.name}: median per micro-batch over {hp['steps']:.0f} steps:")
+        for k, v in hp.items():
+            if k != "steps":
+                print(f"  {k} {v:.1f}")
 
 
 def cmd_pairs(args: argparse.Namespace) -> int:
@@ -1066,6 +1253,8 @@ def main() -> int:
     p = sub.add_parser("roofline")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--nsl", type=Path, default=REPO / "target" / "release" / "nsl")
+    p = sub.add_parser("workspace")
+    p.add_argument("--out", type=Path, required=True)
     p = sub.add_parser("build")
     common(p)
     p.add_argument("--arms", default="nsl_tf32")
@@ -1093,6 +1282,8 @@ def main() -> int:
     args = ap.parse_args()
     if args.cmd == "roofline":
         return cmd_roofline(args)
+    if args.cmd == "workspace":
+        return cmd_workspace(args)
     if args.cmd == "build":
         return cmd_build(args)
     if args.cmd == "run":
