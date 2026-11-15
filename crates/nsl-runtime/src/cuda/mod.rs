@@ -2934,8 +2934,11 @@ pub(crate) mod cublas_inner {
         // decline falls through to the GemmEx call below, which computes the
         // identical product (`lt_matmul` guarantees a failed launch wrote
         // nothing).
+        // Also by default when timed plan selection applies (as for TF32): the
+        // same arithmetic, a faster kernel per shape (`lt_matmul`).
         if let Some(s) = scratch
-            && super::lt_matmul::enabled()
+            && (super::lt_matmul::enabled()
+                || super::lt_matmul::timed_lt_applies(m as u64, n as u64, k as u64))
         {
             let op_code = |o: cublas_sys::cublasOperation_t| match o {
                 cublas_sys::cublasOperation_t::CUBLAS_OP_N => 0i32,
@@ -2969,7 +2972,7 @@ pub(crate) mod cublas_inner {
         // arithmetic as the TF32 mode's GEMMs, so it takes the same tuned
         // cublasLt plan when one applies (a decline falls through below).
         if scratch.is_none()
-            && super::lt_matmul::tf32_lt_applies(m as u64, n as u64, k as u64)
+            && super::lt_matmul::timed_lt_applies(m as u64, n as u64, k as u64)
             && unsafe {
                 super::lt_matmul::matmul_f32_tf32(
                     transa == cublas_sys::cublasOperation_t::CUBLAS_OP_T,
@@ -3166,7 +3169,7 @@ pub(crate) mod cublas_inner {
         // 64x64-tile kernels for most transformer shapes on sm_120). A decline
         // wrote nothing and falls through to the sgemm it always was.
         if resolved_math_mode() == CublasMathMode::Tf32
-            && super::lt_matmul::tf32_lt_applies(m, n, k)
+            && super::lt_matmul::timed_lt_applies(m, n, k)
             && unsafe {
                 super::lt_matmul::matmul_f32_tf32(
                     transb,
@@ -3446,7 +3449,7 @@ pub(crate) mod cublas_inner {
         // TF32: the tuned cublasLt plan, as in `sgemm_row_major_t`. beta = 1
         // accumulates into C exactly as the sgemm below does.
         if resolved_math_mode() == CublasMathMode::Tf32
-            && super::lt_matmul::tf32_lt_applies(d_out, d_in, n_rows)
+            && super::lt_matmul::timed_lt_applies(d_out, d_in, n_rows)
             && unsafe {
                 super::lt_matmul::matmul_f32_tf32(
                     false,
