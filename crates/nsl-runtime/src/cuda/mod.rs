@@ -8517,10 +8517,14 @@ pub(crate) fn gpu_rmsnorm_dgamma_backward_f32(
     let ndim = x.ndim as usize;
     let shape_slice = unsafe { std::slice::from_raw_parts(x.shape, ndim) };
     let cols = shape_slice[ndim - 1] as u64;
-    let rows = (x.len as u64) / cols;
+    // An empty last dimension has no columns to reduce (and no rows to speak
+    // of); the kernels then skip or write nothing.
+    let rows = if cols == 0 { 0 } else { (x.len as u64) / cols };
 
     let g = NslTensor::from_ptr(gamma_ptr);
     assert_gpu_f32(g, "rmsnorm_dgamma_backward_f32", "gamma");
+    let dy = NslTensor::from_ptr(dy_ptr);
+    assert_gpu_f32(dy, "rmsnorm_dgamma_backward_f32", "dy");
     assert_eq!(
         g.len as u64, cols,
         "rmsnorm dgamma: gamma len {} != last dim {}",
@@ -8543,8 +8547,6 @@ pub(crate) fn gpu_rmsnorm_dgamma_backward_f32(
     let rinv = inner::alloc_managed(rows as usize * 4);
     let partial = inner::alloc_managed((plan.chunks * cols) as usize * 4);
 
-    let dy = NslTensor::from_ptr(dy_ptr);
-    assert_gpu_f32(dy, "rmsnorm_dgamma_backward_f32", "dy");
     let mut dy_data = dy.data as u64;
     let mut x_data = x.data as u64;
     let mut rinv_u64 = rinv as u64;
