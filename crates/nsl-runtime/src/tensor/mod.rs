@@ -2856,7 +2856,10 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
             return out_ptr;
         }
         #[cfg(not(feature = "cuda"))]
-        { crate::fatal::cuda_not_compiled(); }
+        {
+            let _ = host_iota;
+            crate::fatal::cuda_not_compiled();
+        }
     }
 
     let vocab_size = unsafe { *weight.shape.add(0) } as usize;
@@ -6736,11 +6739,11 @@ pub extern "C" fn nsl_gpu_drain_cache() {
     // NSL_SKIP_GPU_DRAIN=1: never release at a step boundary, even a bloated
     // pool (allocation failures still drain). Read once: this runs per step.
     static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *SKIP.get_or_init(|| std::env::var("NSL_SKIP_GPU_DRAIN").ok().as_deref() == Some("1")) {
-        return;
-    }
+    let skip = *SKIP.get_or_init(|| std::env::var("NSL_SKIP_GPU_DRAIN").ok().as_deref() == Some("1"));
+    #[cfg(not(feature = "cuda"))]
+    let _ = skip;
     #[cfg(feature = "cuda")]
-    {
+    if !skip {
         // No context: nothing was ever allocated, so there is nothing to keep
         // or release (and this must not force CUDA up on a CPU run).
         let Some(a) = crate::cuda::caching_allocator::allocator_if_initialized() else {
