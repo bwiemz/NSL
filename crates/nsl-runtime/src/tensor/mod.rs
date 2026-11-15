@@ -3357,7 +3357,7 @@ pub extern "C" fn nsl_tensor_rmsnorm(input_ptr: i64, weight_ptr: i64, eps: f64) 
 /// `--fuse-rmsnorm-backward` is set; equals the decomposition to f32 tolerance.
 /// P5 item 20 slice A — fused RMSNorm GAMMA gradient (`--fuse-rmsnorm-backward`):
 /// dgamma_j = sum_rows(dy_ij * x_ij / rms_i),  rms_i = sqrt(mean(x_i^2) + eps).
-/// GPU: two deterministic launches (see `gpu_rmsnorm_dgamma_backward_f32`).
+/// GPU: three deterministic launches (see `gpu_rmsnorm_dgamma_backward_f32`).
 /// CPU: f64 reference with the same summation order.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_rmsnorm_dgamma_backward(

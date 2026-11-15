@@ -8492,12 +8492,15 @@ pub(crate) fn gpu_rmsnorm_f32(input_ptr: i64, gamma_ptr: i64, eps: f32) -> i64 {
 /// `gamma` must be contiguous f32 on-device; returns a fresh f32 dx tensor of
 /// `x`'s shape. Recomputes rms internally (no saved-rms dependency), matching
 /// the correct RMSNorm dx (no mean-subtract).
-/// P5 item 20 slice A: fused RMSNorm gamma gradient.
-/// dgamma[j] = sum_rows(dy[i,j] * x[i,j] / rms_i), computed as two
-/// deterministic launches (per-row 1/rms into a tiny scratch, then a
-/// per-column sequential row loop) — replaces the 7-op decomposition and
-/// its three [rows, cols] temporaries. Fixed summation order per column,
-/// so bit-deterministic run-to-run.
+/// P5 item 20 slice A: fused RMSNorm gamma gradient,
+/// dgamma[j] = sum_rows(dy[i,j] * x[i,j] / rms_i), in place of the 7-op
+/// decomposition and its three [rows, cols] temporaries. Three launches
+/// (`nsl_kir::kernels::rmsnorm_dgamma` documents each and derives their error
+/// bounds): a block per row computes 1/rms into a [rows] scratch; a grid of
+/// (column block, row chunk) writes per-chunk column sums into a
+/// [chunks, cols] scratch; a final pass adds each column's chunk sums. The
+/// partition (`dgamma_plan`) depends on the shape alone and every sum has a
+/// fixed order, so the result is bit-deterministic run to run.
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_rmsnorm_dgamma_backward_f32(
     dy_ptr: i64,
@@ -8505,6 +8508,7 @@ pub(crate) fn gpu_rmsnorm_dgamma_backward_f32(
     gamma_ptr: i64,
     eps: f32,
 ) -> i64 {
+    use nsl_kir::kernels::rmsnorm_dgamma::{dgamma_plan, DgammaPlan, RmsNormDgammaOp};
     inner::set_oom_context("rmsnorm_dgamma_bwd_f32");
     use crate::tensor::NslTensor;
 
@@ -8513,10 +8517,14 @@ pub(crate) fn gpu_rmsnorm_dgamma_backward_f32(
     let ndim = x.ndim as usize;
     let shape_slice = unsafe { std::slice::from_raw_parts(x.shape, ndim) };
     let cols = shape_slice[ndim - 1] as u64;
-    let rows = (x.len as u64) / cols;
+    // An empty last dimension has no columns to reduce (and no rows to speak
+    // of); the kernels then skip or write nothing.
+    let rows = if cols == 0 { 0 } else { (x.len as u64) / cols };
 
     let g = NslTensor::from_ptr(gamma_ptr);
     assert_gpu_f32(g, "rmsnorm_dgamma_backward_f32", "gamma");
+    let dy = NslTensor::from_ptr(dy_ptr);
+    assert_gpu_f32(dy, "rmsnorm_dgamma_backward_f32", "dy");
     assert_eq!(
         g.len as u64, cols,
         "rmsnorm dgamma: gamma len {} != last dim {}",
@@ -8527,66 +8535,91 @@ pub(crate) fn gpu_rmsnorm_dgamma_backward_f32(
         x.len,
         "rmsnorm dgamma: dy/x length mismatch"
     );
+    // Kernel 1 is a block per row: the grid's x extent caps the rows.
+    assert!(rows < (1u64 << 31), "rmsnorm dgamma: {rows} rows exceed the grid");
+    let plan: DgammaPlan = dgamma_plan(rows, cols);
 
     // Output rides gamma's shape (rank-1 [cols] in every stdlib norm).
     let out_data = inner::alloc_managed(cols as usize * 4);
     let out_shape = NslTensor::copy_shape(g.shape, g.ndim);
     let out_strides = NslTensor::compute_strides(out_shape, g.ndim);
-    // Tiny per-row scratch for 1/rms.
+    // Scratch: 1/rms per row, and one column sum per chunk.
     let rinv = inner::alloc_managed(rows as usize * 4);
+    let partial = inner::alloc_managed((plan.chunks * cols) as usize * 4);
 
-    let dy = NslTensor::from_ptr(dy_ptr);
-    assert_gpu_f32(dy, "rmsnorm_dgamma_backward_f32", "dy");
     let mut dy_data = dy.data as u64;
     let mut x_data = x.data as u64;
     let mut rinv_u64 = rinv as u64;
+    let mut partial_u64 = partial as u64;
     let mut out_u64 = out_data as u64;
     let mut rows_val = rows;
     let mut cols_val = cols;
     let mut eps_val = eps;
+    let mut chunk_rows_val = plan.chunk_rows;
+    let mut chunks_val = plan.chunks;
 
-    let rinv_args: [*mut std::ffi::c_void; 5] = [
-        &mut x_data as *mut _ as *mut std::ffi::c_void,
-        &mut rinv_u64 as *mut _ as *mut std::ffi::c_void,
-        &mut rows_val as *mut _ as *mut std::ffi::c_void,
-        &mut cols_val as *mut _ as *mut std::ffi::c_void,
-        &mut eps_val as *mut _ as *mut std::ffi::c_void,
-    ];
-    let grid_rows = rows.div_ceil(256) as i64;
-    let result = inner::kernel_launch(
-        fused_kernels::rmsnorm_rinv_rows_f32_ptx().as_ptr(),
-        b"nsl_rmsnorm_rinv_rows_f32\0".as_ptr(),
-        [grid_rows.max(1), 1, 1],
-        [256, 1, 1],
-        &rinv_args,
-        0,
-    );
-    assert_eq!(result as u32, 0, "GPU rmsnorm rinv kernel failed: {:?}", result);
+    // With no rows there is nothing to normalise or to sum: only the final
+    // pass runs, and it writes zeros.
+    if rows > 0 {
+        let rinv_args: [*mut std::ffi::c_void; 5] = [
+            &mut x_data as *mut _ as *mut std::ffi::c_void,
+            &mut rinv_u64 as *mut _ as *mut std::ffi::c_void,
+            &mut rows_val as *mut _ as *mut std::ffi::c_void,
+            &mut cols_val as *mut _ as *mut std::ffi::c_void,
+            &mut eps_val as *mut _ as *mut std::ffi::c_void,
+        ];
+        let result = inner::kernel_launch(
+            fused_kernels::rmsnorm_rinv_rows_f32_ptx().as_ptr(),
+            b"nsl_rmsnorm_rinv_rows_f32\0".as_ptr(),
+            [rows as i64, 1, 1],
+            [i64::from(RmsNormDgammaOp::RinvRows.block()), 1, 1],
+            &rinv_args,
+            0,
+        );
+        assert_eq!(result as u32, 0, "GPU rmsnorm rinv kernel failed: {:?}", result);
 
-    let dg_args: [*mut std::ffi::c_void; 6] = [
-        &mut dy_data as *mut _ as *mut std::ffi::c_void,
-        &mut x_data as *mut _ as *mut std::ffi::c_void,
-        &mut rinv_u64 as *mut _ as *mut std::ffi::c_void,
+        let partial_args: [*mut std::ffi::c_void; 7] = [
+            &mut dy_data as *mut _ as *mut std::ffi::c_void,
+            &mut x_data as *mut _ as *mut std::ffi::c_void,
+            &mut rinv_u64 as *mut _ as *mut std::ffi::c_void,
+            &mut partial_u64 as *mut _ as *mut std::ffi::c_void,
+            &mut rows_val as *mut _ as *mut std::ffi::c_void,
+            &mut cols_val as *mut _ as *mut std::ffi::c_void,
+            &mut chunk_rows_val as *mut _ as *mut std::ffi::c_void,
+        ];
+        let result = inner::kernel_launch(
+            fused_kernels::rmsnorm_dgamma_partial_f32_ptx().as_ptr(),
+            b"nsl_rmsnorm_dgamma_partial_f32\0".as_ptr(),
+            [plan.col_blocks as i64, plan.chunks as i64, 1],
+            [i64::from(RmsNormDgammaOp::Partial.block()), 1, 1],
+            &partial_args,
+            0,
+        );
+        assert_eq!(result as u32, 0, "GPU rmsnorm dgamma partial kernel failed: {:?}", result);
+    }
+
+    let final_args: [*mut std::ffi::c_void; 4] = [
+        &mut partial_u64 as *mut _ as *mut std::ffi::c_void,
         &mut out_u64 as *mut _ as *mut std::ffi::c_void,
-        &mut rows_val as *mut _ as *mut std::ffi::c_void,
+        &mut chunks_val as *mut _ as *mut std::ffi::c_void,
         &mut cols_val as *mut _ as *mut std::ffi::c_void,
     ];
-    let grid_cols = cols.div_ceil(256) as i64;
     let result = inner::kernel_launch(
-        fused_kernels::rmsnorm_dgamma_f32_ptx().as_ptr(),
-        b"nsl_rmsnorm_dgamma_f32\0".as_ptr(),
-        [grid_cols.max(1), 1, 1],
-        [256, 1, 1],
-        &dg_args,
+        fused_kernels::rmsnorm_dgamma_final_f32_ptx().as_ptr(),
+        b"nsl_rmsnorm_dgamma_final_f32\0".as_ptr(),
+        [DgammaPlan::final_blocks(cols).max(1) as i64, 1, 1],
+        [i64::from(RmsNormDgammaOp::Final.block()), 1, 1],
+        &final_args,
         0,
     );
-    assert_eq!(result as u32, 0, "GPU rmsnorm dgamma kernel failed: {:?}", result);
+    assert_eq!(result as u32, 0, "GPU rmsnorm dgamma final kernel failed: {:?}", result);
     inner::sync_after_kernel();
 
-    // Stream-ordered pool free: the block only re-enters circulation via
-    // this thread's in-order allocator, so the kernel that read it has
-    // retired before any same-stream reuse (the caching allocator never
-    // returns memory to the driver here).
+    // Stream-ordered pool frees: a block only re-enters circulation via
+    // this thread's in-order allocator, and every later use of it is
+    // compute-stream work ordered after the kernels that read it here (the
+    // caching allocator never returns memory to the driver here).
+    inner::free_managed(partial);
     inner::free_managed(rinv);
 
     let out = Box::new(NslTensor::new(
@@ -10270,7 +10303,8 @@ mod tests {
         all.push(("nsl_rmsnorm_dx_bwd_f32", super::fused_kernels::rmsnorm_dx_bwd_f32_ptx(), true));
         all.push(("nsl_rmsnorm_dx_bwd_add_f32", super::fused_kernels::rmsnorm_dx_bwd_add_f32_ptx(), true));
         all.push(("nsl_rmsnorm_rinv_rows_f32", super::fused_kernels::rmsnorm_rinv_rows_f32_ptx(), true));
-        all.push(("nsl_rmsnorm_dgamma_f32", super::fused_kernels::rmsnorm_dgamma_f32_ptx(), true));
+        all.push(("nsl_rmsnorm_dgamma_partial_f32", super::fused_kernels::rmsnorm_dgamma_partial_f32_ptx(), true));
+        all.push(("nsl_rmsnorm_dgamma_final_f32", super::fused_kernels::rmsnorm_dgamma_final_f32_ptx(), true));
         all.push(("nsl_sum_dim_short_f32", super::fused_kernels::sum_dim_short_f32_ptx(), true));
         all.push(("nsl_ce_bwd_count_f32", super::fused_kernels::ce_bwd_count_f32_ptx(), true));
         all.push(("nsl_ce_bwd_finish_f32", super::fused_kernels::ce_bwd_finish_f32_ptx(), true));
