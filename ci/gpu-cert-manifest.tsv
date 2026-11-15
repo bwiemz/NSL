@@ -6,6 +6,7 @@ crates/nsl-cli/tests/ccr_checkpoint_activation_parity_gpu.rs	ccr_activation_pari
 crates/nsl-cli/tests/ccr_checkpoint_parity.rs	ccr_blocks_parity_on_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/ccr_checkpoint_parity.rs	ccr_blocks_parity_on_gpu_deterministic	gpu	requires CUDA GPU
 crates/nsl-cli/tests/ccr_checkpoint_parity.rs	ccr_production_gpu_tolerance	gpu	requires CUDA GPU
+crates/nsl-cli/tests/ccr_compress_saved_lse_gpu_gate.rs	compressed_saves_keep_the_forward_logsumexp	gpu	requires CUDA GPU
 crates/nsl-cli/tests/ccr_periodic_stride_gate.rs	dp_stride_activation_peak_not_worse_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/ccr_periodic_stride_gate.rs	periodic_stride_reduces_activation_peak_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/ccr_reference_gradient_gate.rs	checkpointed_training_matches_pytorch_gpu	gpu	requires CUDA GPU
