@@ -7,43 +7,62 @@ italics with "(est.)"**; everything else is a measurement.
 
 ## Summary
 
-At the production recipes' shapes, PyTorch runs the same training step
-**1.44x (1B) and 1.53x (500M) faster than NSL at the same precision policy** (f32
-weights and activations, TF32 matmuls, the same selective checkpointing), at about
-the same memory. With bf16, the recipe PyTorch users actually run (autocast plus
-`torch.compile`) is **2.23x (1B) and 2.14x (500M) faster than NSL's
-`NSL_MATMUL_BF16=1` and uses 6 GiB less memory at 1B** (20.6 against 26.5 GiB
-allocator peak). Ratios are paired within a round, medians over rounds.
+**Coder-1B's production recipe trains in bf16.** `models/coder1b/pretrain_prod.nsl`
+runs `export NSL_MATMUL_BF16=1` with `--source-ad --checkpoint-blocks
+--checkpoint-selective --fuse-rmsnorm-backward --fuse-wgrad-accum`; that is the
+`nsl_bf16` arm here. The `nsl_tf32` arm (same flags, f32 weights and activations, TF32
+matmuls) is not the 1B recipe: it is the f32 posture the recipe ran until August and
+the arm that matches PyTorch's TF32 precision policy. Coder-500M's recipe sets no
+`NSL_MATMUL_BF16` and runs TF32 (with only `--source-ad --checkpoint-blocks`; the 500M
+NSL rows use the 1B flag set at the 500M shape).
 
-| Coder-1B, 16,384 tokens per update | tok/s | MFU | allocator peak |
-|---|---|---|---|
-| NSL production posture (TF32) | 4,916 | 42.2% | 24.63 GiB |
-| PyTorch eager, TF32, same checkpointing | 7,259 | 62.3% | 24.87 GiB |
-| NSL, `NSL_MATMUL_BF16=1` | 6,747 | 27.5% | 26.53 GiB |
-| PyTorch bf16 autocast + `torch.compile`, same checkpointing | 14,981 | 61.1% | 20.58 GiB |
+- **Each framework's production posture at 1B** (NSL bf16 against PyTorch bf16 autocast
+  plus `torch.compile`, both with selective checkpointing): PyTorch is **2.23x
+  faster**; NSL runs at **27.5% MFU** against 61.1%, and peaks **5.5 GiB higher** in
+  the driver-reported process memory (27.75 against 22.25 GiB; 5.9 GiB in allocator
+  peak, 26.53 against 20.58).
+- **Same precision policy** (f32 weights and activations, TF32 matmuls, the same
+  selective checkpointing): PyTorch eager is **1.44x faster at 1B and 1.53x at 500M**,
+  at the same memory (driver peak 25.83 against 25.55 GiB at 1B).
+- **At 500M**, the production recipe's TF32 against PyTorch's compiled bf16 is 2.77x;
+  NSL bf16 against compiled bf16 is 2.14x.
 
-(Medians of four rounds; MFU against the TF32 and bf16 rooflines measured below.)
+Ratios are paired within a round, then the median over rounds.
+
+| Coder-1B, 16,384 tokens per update | tok/s | MFU | allocator peak | driver peak |
+|---|---|---|---|---|
+| **NSL production posture** (`NSL_MATMUL_BF16=1`) | 6,747 | 27.5% | 26.53 GiB | 27.75 GiB |
+| PyTorch bf16 autocast + `torch.compile`, same checkpointing | 14,981 | 61.1% | 20.58 GiB | 22.25 GiB |
+| NSL f32 / TF32 (not the 1B recipe) | 4,916 | 42.2% | 24.63 GiB | 25.83 GiB |
+| PyTorch eager, TF32, same checkpointing | 7,259 | 62.3% | 24.87 GiB | 25.55 GiB |
+
+(Medians of four rounds; MFU against the TF32 and bf16 rooflines measured below;
+"allocator peak" and "driver peak" are defined under Method.)
 
 NSL is not host-bound: the GPU is busy 96% of an update. The time goes to kernels
-that are slower than PyTorch's for the same work, in three places that account for
-the whole TF32 gap at 1B (per optimizer update, from Nsight Systems):
+that are slower than PyTorch's for the same work. At TF32 three places account for
+the whole gap at 1B (per optimizer update, from Nsight Systems):
 
 - **attention**: 673 ms against 74 ms. NSL's flash-attention backward takes 8.6 ms per
   layer and micro-batch where PyTorch's FlashAttention-2 takes 0.77 ms (11x), and its
-  forward 1.76 ms against 0.30 ms (5.9x);
+  forward 1.76 ms against 0.29 ms (6x);
 - **GEMMs**: 2,110 ms against 1,520 ms for the same FLOPs. cuBLAS 13.8's `sgemm`
   heuristic picks 64x64-tile sm80 kernels for most of NSL's backward GEMMs and five of
-  the seven forward ones; PyTorch's cuBLAS 12.8 picks 128x128 and 256x128 tiles;
+  the seven forward projections; PyTorch's cuBLAS 12.8 picks 128x128 to 256x128 tiles;
+  every projection is 15-63% slower in NSL;
 - **host synchronisation**: 131 ms of GPU idle against 9 ms, from 536 synchronous
   host-to-device copies per update and a per-micro-batch release of the allocator's
   cache to the driver.
 
-Everything else (norms, RoPE, SwiGLU, copies, loss, optimizer) costs NSL about what
-it costs eager PyTorch at TF32. It is where `torch.compile` pulls ahead at bf16.
+In the bf16 production posture the same three plus the memory-bound work separate
+NSL from compiled PyTorch: attention +584 ms, everything that is not a GEMM, attention
+or the optimizer +554 ms (`torch.compile` fuses it and keeps it in bf16), GEMMs +221
+ms, idle +113 ms, out of a 1,458 ms difference per traced update.
 
-The 1B production posture reproduces the August record (5,053 tok/s at 25.2 GiB,
-`POSTURE_1B_THROUGHPUT_2026_08_27.md`): 4,678-5,068 tok/s over four rounds at
-24.63 GiB on today's `main`.
+The f32 posture reproduces the August record it comes from (5,053 tok/s at 25.2 GiB,
+`POSTURE_1B_THROUGHPUT_2026_08_27.md`, arm P3): 4,678-5,068 tok/s over four rounds at
+24.63 GiB on today's `main`. The bf16 posture that replaced it in the recipe was
+6,568 tok/s there (arm P4); it is 6,190-6,761 here.
 
 ## Setup
 
@@ -53,9 +72,9 @@ The 1B production posture reproduces the August record (5,053 tok/s at 25.2 GiB,
 | driver | 620.70.06 |
 | NSL | `main` at 565567c5, `cargo build --release --features cuda`; links the system cuBLAS 13.8.0.4 (CUDA 13.4) |
 | PyTorch | 2.11.0+cu128 (cuBLAS 12.8.4.1, Triton 3.6.0), Python 3.12, in `/mnt/extrastorage/nsl-audit/venv-cuda` |
-| harness | `tools/perfcheck/` (commits 8048a8ad, 78243bc1) |
+| harness | `tools/perfcheck/` on branch `perf/baseline` |
 | models | Coder-500M (d 1280, 24 layers, 20/10 heads, d_ff 3520, dropout 0.1) and Coder-1B (d 2048, 16 layers, 32/8 heads, d_ff 8192, dropout 0) from `models/coder*/config.nsl`; vocab 49,152, tied LM head |
-| step shapes | the production recipes': 500M micro-batch 2 x 1024 tokens, accumulation 8; 1B 2 x 2048, accumulation 4. 16,384 tokens per optimizer update in both |
+| step shapes | the production recipes' (`PRETRAIN_BATCH_SIZE`, `MAX_SEQ_LEN`, `PRETRAIN_GRAD_ACCUMULATION` from `config.nsl`): 500M micro-batch 2 x 1024 tokens, accumulation 8; 1B 2 x 2048, accumulation 4. 16,384 tokens per optimizer update in both |
 | data | synthetic: a seeded uniform draw over the vocabulary, the same file and the same windows for both frameworks. The step does the same work whatever the ids are |
 
 ### Method
@@ -67,9 +86,13 @@ The 1B production posture reproduces the August record (5,053 tok/s at 25.2 GiB,
   the fused LM cross-entropy did not engage, and each run is refused unless the runtime's
   own `cuBLAS math mode:` banner names the arm's precision.
 - **PyTorch arms** run `torch_arm.py`, one fresh process per run.
-- **Timing.** The token file holds exactly 24 optimizer updates. Each update prints its
-  loss (NSL) or calls `loss.item()` (PyTorch): one host synchronisation per update on
-  both sides, timestamped when it arrives. The first 9 updates are not timed (cuBLAS
+- **Timing.** The token file holds exactly 24 optimizer updates. Each update's loss
+  reaches the host once (NSL prints it, PyTorch calls `loss.item()`) and is
+  timestamped when it arrives. Neither side is otherwise free of synchronisation:
+  PyTorch copies each micro-batch's ids from pageable host memory
+  (`batch_from_stream`'s `.to("cuda")`), a stream synchronisation per micro-batch (4
+  `cudaStreamSynchronize` per 1B update, plus the loss, in the trace); NSL makes 134
+  synchronous host-to-device copies per micro-batch (see "Host side"). The first 9 updates are not timed (cuBLAS
   autotuning, `torch.compile`, allocator growth): tok/s is 15 updates x 16,384 tokens
   over the wall time from the end of update 9 to the end of update 24.
 - **Repetition.** Three rounds, and a fourth for the five core arms (it repeats the
@@ -100,6 +123,24 @@ The 1B production posture reproduces the August record (5,053 tok/s at 25.2 GiB,
   PyTorch `max_memory_reserved()`); *driver*, the process's used memory from
   `nvidia-smi --query-compute-apps`, polled every 100 ms (CUDA context, library
   workspaces and module images included). The card-sizing number is *driver*.
+  The two allocator peaks do not count quite the same bytes. NSL's `gpu_peak_bytes`
+  counts its pooled blocks plus the direct and asynchronous device allocations it
+  routes through the same accounting (`record_external_alloc`: attention workspace,
+  slabs); it does not count the workspace cuBLAS allocates for itself (NSL never
+  calls `cublasSetWorkspace`) nor the 64 MiB workspace of the opt-in cublasLt path
+  (`NSL_MATMUL_BF16_LT=1`, a raw `cuMemAlloc` in `cuda/lt_matmul.rs`; not used here). PyTorch gives cuBLAS a workspace from
+  its caching allocator, so `max_memory_allocated` includes it: the first GEMM of a
+  process retains 8,519,680 bytes (the default `CUBLAS_WORKSPACE_CONFIG`, 2 x 4 MiB +
+  8 x 16 KiB; `perfcheck.py workspace`). Both differences are under 0.1 GiB; the
+  driver peak counts everything on both sides.
+- **Untested caveats.** (a) Two `nvidia-smi` pollers run during every timed window
+  (per-process memory every 100 ms, clocks every 200 ms). Whether their driver
+  queries slow either framework was not measured; NSL, which makes ~380 `cuMemAlloc`
+  and ~380 `cuMemFree` calls per 1B update through its per-micro-batch drain, is the
+  more exposed. (b) The bf16 roofline ran with PyTorch's default
+  `allow_bf16_reduced_precision_reduction=True` (split-K reductions may round to
+  bf16); whether the bf16 rate changes with it off was not measured. The TF32 and
+  f32 rows are unaffected.
 
 ## Roofline
 
@@ -127,8 +168,9 @@ served from the weight-cast cache).
 
 Median over rounds [min-max across rounds]; "CV" is the median within-run coefficient
 of variation of the 15 timed update times. MFU uses the roofline above. Arms:
-`nsl_tf32` is the production posture, `nsl_bf16` the same flags with
-`NSL_MATMUL_BF16=1`, `_nodrain` adds `NSL_SKIP_GPU_DRAIN=1`, `_blocks` drops
+`nsl_bf16` is the 1B production posture (the 1B recipe's flags, built and run with
+`NSL_MATMUL_BF16=1`), `nsl_tf32` the same flags in f32 with TF32 matmuls (the 500M
+recipe's precision, not the 1B recipe), `_nodrain` adds `NSL_SKIP_GPU_DRAIN=1`, `_blocks` drops
 `--checkpoint-selective` (full block recompute), `_compress` adds
 `--checkpoint-compress bf16`; `torch_<precision>_<eager|compile>_<sel|blocks|none>`
 names the PyTorch arm's precision, compilation and checkpointing.
@@ -177,8 +219,8 @@ is visible. Rounds 0-3 for the core arms, 0-2 for the others.
 |---|---|---|---|---|
 | PyTorch eager TF32 / NSL TF32 (same policy, same checkpointing) | 1.431 1.516 1.444 1.436 | **1.44** | 1.533 1.540 1.518 1.505 | **1.53** |
 | PyTorch eager bf16 / NSL bf16 | 1.700 1.664 1.680 1.691 | **1.69** | 1.563 1.578 1.509 1.511 | **1.54** |
-| PyTorch compiled bf16 / NSL bf16 | 2.245 2.222 2.215 2.240 | **2.23** | 2.167 2.025 2.132 2.148 | **2.14** |
-| PyTorch compiled bf16 / NSL TF32 (each one's production posture) | 2.989 3.129 2.969 2.964 | **2.98** | 2.795 2.623 2.772 2.773 | **2.77** |
+| PyTorch compiled bf16 / NSL bf16 (1B: each one's production posture) | 2.245 2.222 2.215 2.240 | **2.23** | 2.167 2.025 2.132 2.148 | **2.14** |
+| PyTorch compiled bf16 / NSL TF32 (500M: each one's production precision) | 2.989 3.129 2.969 2.964 | 2.98 | 2.795 2.623 2.772 2.773 | **2.77** |
 | NSL bf16 / NSL TF32 | 1.332 1.408 1.340 1.323 | 1.34 | 1.290 1.295 1.300 1.291 | 1.29 |
 | PyTorch eager bf16 / eager TF32 | 1.582 1.546 1.560 1.558 | 1.56 | 1.316 1.327 1.292 1.295 | 1.31 |
 | PyTorch compiled / eager (bf16) | 1.320 1.335 1.318 1.325 | 1.32 | 1.386 1.283 1.413 1.422 | 1.40 |
@@ -191,11 +233,53 @@ is visible. Rounds 0-3 for the core arms, 0-2 for the others.
 | NSL `--checkpoint-compress bf16`, TF32 | 0.332 0.351 0.319 | 0.33 | not run | |
 | NSL `--checkpoint-compress bf16`, bf16 | 0.268 0.272 0.253 | 0.27 | not run | |
 
+### Per round
+
+tok/s of every run, with its deviation from the arm's median over all its rounds.
+
+Coder-1B:
+
+| arm | tok/s per round (deviation from the arm's median) |
+|---|---|
+| nsl_tf32 | r0:5,068 (+3.1%) r1:4,801 (-2.3%) r2:5,032 (+2.3%) r3:4,678 (-4.8%) |
+| nsl_tf32_nodrain | r0:5,152 (+0.1%) r1:5,139 (-0.1%) r2:5,147 (+0.0%) |
+| nsl_tf32_blocks | r0:4,458 (+0.0%) r1:4,448 (-0.2%) r2:4,456 (+0.0%) |
+| nsl_tf32_compress | r0:1,680 (+0.0%) r1:1,685 (+0.3%) r2:1,604 (-4.5%) |
+| nsl_bf16 | r0:6,749 (+0.0%) r1:6,761 (+0.2%) r2:6,744 (-0.0%) r3:6,190 (-8.3%) |
+| nsl_bf16_nodrain | r0:6,775 (-1.0%) r1:6,843 (+0.0%) r2:6,931 (+1.3%) |
+| nsl_bf16_compress | r0:1,812 (+0.0%) r1:1,840 (+1.5%) r2:1,708 (-5.7%) |
+| torch_tf32_eager_sel | r0:7,253 (-0.1%) r1:7,278 (+0.3%) r2:7,265 (+0.1%) r3:6,719 (-7.4%) |
+| torch_tf32_eager_blocks | r0:6,463 (+1.5%) r1:6,363 (-0.1%) r2:6,368 (+0.0%) |
+| torch_bf16_eager_sel | r0:11,474 (+1.6%) r1:11,250 (-0.4%) r2:11,332 (+0.4%) r3:10,468 (-7.3%) |
+| torch_bf16_compile_sel | r0:15,150 (+1.1%) r1:15,022 (+0.3%) r2:14,940 (-0.3%) r3:13,867 (-7.4%) |
+| torch_bf16_compile_blocks | r0:13,107 (+1.2%) r1:12,954 (+0.0%) r2:12,938 (-0.1%) |
+| torch_bf16_compile_none | r0:15,778 (+0.9%) r1:15,612 (-0.2%) r2:15,637 (+0.0%) |
+
+Coder-500M:
+
+| arm | tok/s per round (deviation from the arm's median) |
+|---|---|
+| nsl_tf32 | r0:8,971 (+0.8%) r1:8,897 (-0.1%) r2:8,906 (+0.1%) r3:8,329 (-6.4%) |
+| nsl_tf32_nodrain | r0:9,408 (+0.1%) r1:9,401 (+0.0%) r2:9,355 (-0.5%) |
+| nsl_tf32_blocks | r0:8,026 (+0.3%) r1:8,000 (+0.0%) r2:7,756 (-3.0%) |
+| nsl_bf16 | r0:11,572 (+0.2%) r1:11,525 (-0.2%) r2:11,578 (+0.3%) r3:10,749 (-6.9%) |
+| nsl_bf16_nodrain | r0:12,160 (+0.3%) r1:12,129 (+0.0%) r2:12,066 (-0.5%) |
+| torch_tf32_eager_sel | r0:13,750 (+1.0%) r1:13,705 (+0.7%) r2:13,524 (-0.7%) r3:12,537 (-7.9%) |
+| torch_tf32_eager_blocks | r0:11,675 (+0.0%) r1:11,799 (+1.1%) r2:11,638 (-0.3%) |
+| torch_bf16_eager_sel | r0:18,092 (+1.7%) r1:18,181 (+2.2%) r2:17,476 (-1.7%) r3:16,239 (-8.7%) |
+| torch_bf16_compile_sel | r0:25,075 (+4.4%) r1:23,334 (-2.8%) r2:24,686 (+2.8%) r3:23,094 (-3.8%) |
+| torch_bf16_compile_blocks | r0:21,207 (+0.6%) r1:21,086 (+0.0%) r2:20,964 (-0.6%) |
+| torch_bf16_compile_none | r0:26,357 (+0.7%) r1:26,161 (+0.0%) r2:26,110 (-0.2%) |
+
 ### Reading the tables
 
+- **Production posture against production posture** at 1B (`nsl_bf16` against
+  `torch_bf16_compile_sel`): PyTorch is 2.23x faster and 5.5 GiB smaller in driver
+  peak. At 500M the NSL recipe is TF32: compiled bf16 PyTorch is 2.77x faster than it.
 - **Same precision policy, same checkpointing** (`nsl_tf32` against
   `torch_tf32_eager_sel`): PyTorch is 1.44x faster at 1B and 1.53x at 500M; the
-  allocator peaks are within 0.3 GiB at 1B and 1.3 GiB at 500M (NSL higher at 500M).
+  allocator peaks are within 0.3 GiB at 1B and 1.3 GiB at 500M (NSL higher at 500M),
+  the driver peaks within 0.3 and 2.0 GiB.
 - **bf16.** NSL's bf16 mode buys 1.34x (1B) and 1.29x (500M) over its TF32; PyTorch's
   eager autocast buys 1.56x and 1.31x over its TF32, and `torch.compile` another 1.32x
   and 1.40x. NSL's bf16 mode *raises* its memory by 1.9 GiB (1B) through the bf16
@@ -212,10 +296,10 @@ is visible. Rounds 0-3 for the core arms, 0-2 for the others.
 - **`--checkpoint-compress bf16`** (1B only) lowers NSL's allocator peak by 3.4 GiB
   (24.63 to 21.24 GiB at TF32, 26.53 to 23.13 at bf16) and runs at 0.33x and 0.27x the
   speed: 9.6 and 9.0 s per update.
-- **Spread.** In rounds 0-2, 66 of the 72 arm-rounds lie within 2% of their arm's
-  median. The six exceptions are single rounds 3-6% slow: 1B `nsl_tf32` round 1 (ran
-  at load average 12, the card no hotter than in the other rounds), both 1B compress
-  arms in round 2, and three 500M arms in rounds 1-2. The fourth round of the core
+- **Spread** (the report's per-round table). Rounds 0-2 agree within about 2% for
+  every arm but six single rounds that ran 3-6% slow: 1B `nsl_tf32` round 1 (at load
+  average 12, the card no hotter than in the other rounds), both 1B compress arms in
+  round 2, and three 500M arms in rounds 1-2. The fourth round of the core
   arms (run to repeat the disturbed one, right after the last compress round) came out
   6.5-10% slower on every arm at both sizes at once, with SM clocks 2-4% higher, the
   card in P1 and no other compute process on it; the cause was not found. The medians
@@ -224,7 +308,9 @@ is visible. Rounds 0-3 for the core arms, 0-2 for the others.
   have the largest within-run CV (2-4%): their 15 timed updates last 13-18 s.
 - **Sanity.** On these tokens both frameworks start at loss 11.20-11.23 (1B) and
   11.05-11.07 (500M) and fall by 0.20-0.26 and 0.04-0.09 over the 24 updates; NSL's
-  TF32 and bf16 arms agree to 1e-4 at the last update.
+  TF32 and bf16 arms agree to 1e-4 at the last update. A run is refused (and the
+  report re-checks stored runs) unless it has one loss per update, all finite, and
+  the last below the first; every run in these tables passes.
 
 ## What is and is not like for like
 
@@ -270,51 +356,55 @@ Not matched, and which way it leans:
   transient pool to the driver after every micro-batch (`nsl_gpu_drain_cache`,
   disabled by `NSL_SKIP_GPU_DRAIN=1`; its cost is in Results).
 
-## Where NSL's step time goes (Coder-1B, production posture)
+## Where NSL's step time goes (Coder-1B)
+
+Both NSL precisions are traced: the bf16 columns are the 1B production posture, the
+TF32 columns the matched-precision comparison.
 
 Three instruments, each in its own run so none of them is in the timed numbers:
 
 1. `NSL_PHASE_TIMING=1` builds (device syncs around each phase, compiled in) against
    `torch_arm.py --phase-timing` (the same syncs): wall time per phase.
-2. Nsight Systems (`nsys profile --trace=cuda`) of the plain production binary and of
-   the PyTorch arms, cut into updates at the optimizer kernel and into phases on the
+2. Nsight Systems (`nsys profile --trace=cuda`) of the un-instrumented NSL binaries
+   and of the PyTorch arms, cut into updates at the optimizer kernel and into phases on the
    GPU timeline (`nsys_summary.py`); 15 steady updates each. Tracing adds 7-10% of
-   wall time to NSL, 2% to eager and 12% to compiled PyTorch (host side); kernel
-   durations are GPU-timed and unaffected.
+   wall time to NSL TF32, 10% to NSL bf16, 2% to eager and 12% to compiled PyTorch
+   (host side); kernel durations are GPU-timed and unaffected.
 3. `NSL_HOST_PROFILE=1` (the runtime's own host-side timers).
 
 ### Phases (synchronised wall time per update, seconds)
 
 Coder-1B:
 
-| arm (instrumented) | wall s/update | forward | backward | optimizer | rest |
-|---|---|---|---|---|---|
-| nsl_bf16 | 2.606 | 0.588 | 1.879 | 0.059 | 0.079 |
-| nsl_tf32 | 3.365 | 0.829 | 2.381 | 0.057 | 0.098 |
-| torch_bf16_compile_blocks | 1.369 | 0.334 | 0.969 | 0.064 | 0.002 |
-| torch_bf16_compile_none | 1.128 | 0.335 | 0.727 | 0.063 | 0.002 |
-| torch_bf16_compile_sel | 1.167 | 0.331 | 0.773 | 0.063 | 0.001 |
-| torch_bf16_eager_sel | 1.571 | 0.410 | 1.096 | 0.064 | 0.001 |
-| torch_tf32_eager_blocks | 2.754 | 0.670 | 2.019 | 0.063 | 0.001 |
-| torch_tf32_eager_sel | 2.419 | 0.671 | 1.684 | 0.063 | 0.001 |
+| arm (instrumented) | wall s/update | vs timed median | forward | backward | optimizer | rest | alloc peak fwd / bwd / opt GiB |
+|---|---|---|---|---|---|---|---|
+| nsl_bf16 | 2.606 | +7.3% | 0.588 | 1.879 | 0.059 | 0.079 | - |
+| nsl_tf32 | 3.365 | +0.6% | 0.829 | 2.381 | 0.057 | 0.098 | - |
+| torch_bf16_compile_blocks | 1.369 | +8.1% | 0.334 | 0.969 | 0.064 | 0.002 | 17.10 / 20.58 / 16.02 |
+| torch_bf16_compile_none | 1.128 | +7.7% | 0.335 | 0.727 | 0.063 | 0.002 | 23.57 / 23.76 / 16.02 |
+| torch_bf16_compile_sel | 1.167 | +6.9% | 0.331 | 0.773 | 0.063 | 0.001 | 20.00 / 20.58 / 16.02 |
+| torch_bf16_eager_sel | 1.571 | +8.7% | 0.410 | 1.096 | 0.064 | 0.001 | 23.23 / 21.79 / 16.02 |
+| torch_tf32_eager_blocks | 2.754 | +7.2% | 0.670 | 2.019 | 0.063 | 0.001 | 18.11 / 18.86 / 16.02 |
+| torch_tf32_eager_sel | 2.419 | +7.3% | 0.671 | 1.684 | 0.063 | 0.001 | 24.12 / 24.87 / 16.02 |
 
 Coder-500M:
 
-| arm (instrumented) | wall s/update | forward | backward | optimizer | rest |
-|---|---|---|---|---|---|
-| nsl_bf16 | 1.498 | 0.344 | 1.041 | 0.028 | 0.085 |
-| nsl_tf32 | 1.988 | 0.505 | 1.336 | 0.029 | 0.118 |
-| torch_bf16_compile_sel | 0.727 | 0.190 | 0.504 | 0.031 | 0.002 |
-| torch_bf16_eager_sel | 0.995 | 0.279 | 0.685 | 0.030 | 0.002 |
-| torch_tf32_eager_sel | 1.298 | 0.362 | 0.903 | 0.030 | 0.002 |
+| arm (instrumented) | wall s/update | vs timed median | forward | backward | optimizer | rest | alloc peak fwd / bwd / opt GiB |
+|---|---|---|---|---|---|---|---|
+| nsl_bf16 | 1.498 | +5.6% | 0.344 | 1.041 | 0.028 | 0.085 | - |
+| nsl_tf32 | 1.988 | +8.1% | 0.505 | 1.336 | 0.029 | 0.118 | - |
+| torch_bf16_compile_sel | 0.727 | +7.1% | 0.190 | 0.504 | 0.031 | 0.002 | 9.42 / 10.01 / 7.75 |
+| torch_bf16_eager_sel | 0.995 | +9.7% | 0.279 | 0.685 | 0.030 | 0.002 | 10.94 / 10.28 / 7.70 |
+| torch_tf32_eager_sel | 1.298 | +8.6% | 0.362 | 0.903 | 0.030 | 0.002 | 11.07 / 11.45 / 7.66 |
 
 "Forward" includes the loss; "backward" includes the recompute; "optimizer" includes
 gradient clipping; "rest" is the update's wall time outside the three (NSL: the data
-loader, the per-micro-batch cache drain, scope cleanup). The syncs cost NSL 1-3% and
-PyTorch 7-9% against the untimed runs, so compare phases with phases, not with the
-throughput tables. Per-phase allocator peaks for PyTorch (reset before each phase)
-are in the phase JSONs: compiled bf16 peaks at 20.0 GiB in the forward and 20.58 GiB
-in the backward with selective checkpointing, 17.1 and 20.58 GiB with full recompute.
+loader, the per-micro-batch cache drain, scope cleanup). "vs timed median" is the
+instrumented wall time against the arm's un-instrumented median (all rounds): the
+syncs cost NSL +0.6% to +8.1% and PyTorch +6.9% to +9.7% (NSL TF32 at 1B is +3.4%
+against rounds 0-2 alone, which exclude the slow fourth round), so compare phases
+with phases, not with the throughput tables. The allocator peaks per phase are
+PyTorch's, reset before each phase of the last update; NSL has no equivalent hook.
 
 The backward is where most of the difference is. At 1B and TF32 NSL spends 0.70 s
 more than eager PyTorch in it per update, 0.16 s more in the forward, 0.10 s more
@@ -324,7 +414,7 @@ outside. At 500M and TF32: +0.43 s, +0.14 s and +0.12 s.
 
 ### Kernels (Nsight Systems, ms per update)
 
-| | NSL TF32 | PyTorch TF32 eager | NSL bf16 | PyTorch bf16 eager | PyTorch bf16 compile |
+| | NSL TF32 | PyTorch TF32 eager | NSL bf16 (1B production) | PyTorch bf16 eager | PyTorch bf16 compile |
 |---|---|---|---|---|---|
 | wall (traced) | 3,575 | 2,300 | 2,681 | 1,477 | 1,223 |
 | GPU busy | 3,445 (96.3%) | 2,291 (99.6%) | 2,562 (95.6%) | 1,469 (99.5%) | 1,217 (99.5%) |
@@ -356,89 +446,107 @@ Top NSL kernels at TF32 (ms per update, launches per update):
 | `nsl_scopy_run4_f32` | 77 | 2,048 | strided copies (head transposes, the GQA K/V expansion) |
 | `nsl_fase_fused_adamw_multi_f32` | 51 | 1 | AdamW, all 146 parameters in one launch |
 
-The same layer, GEMM by GEMM (forward, µs per call, one micro-batch of 4,096 tokens):
+Layer by layer (`nsys_summary.py --layers 16`: medians over every layer and
+micro-batch of the 15 traced updates, µs per call, one micro-batch of 4,096 tokens):
 
-| projection | NSL TF32 | PyTorch TF32 |
-|---|---|---|
-| q (2048 -> 2048) | 613 | 463 |
-| k, v (2048 -> 512) | 177, 175 | 129, 130 |
-| o (2048 -> 2048) | 801 | 489 |
-| gate, up (2048 -> 8192) | 1,842, 1,846 | 1,841, 1,833 |
-| down (8192 -> 2048) | 2,817 | 2,314 |
-| attention forward | 881 + 874 (one launch per batch row) | 302 |
+| | NSL TF32 | PyTorch TF32 eager | NSL bf16 (1B production) | PyTorch bf16 eager | PyTorch bf16 compile |
+|---|---|---|---|---|---|
+| q (2048 -> 2048) | 632 | 486 | 291 | 262 | 253 |
+| k (2048 -> 512) | 172 | 131 | 175 | 69 | 64 |
+| v (2048 -> 512) | 169 | 130 | 175 | 67 | 66 |
+| o (2048 -> 2048) | 792 | 487 | 292 | 261 | 256 |
+| gate (2048 -> 8192) | 2,121 | 1,844 | 870 | 875 | 879 |
+| up (2048 -> 8192) | 2,125 | 1,832 | 1,080 | 872 | 876 |
+| down (8192 -> 2048) | 2,821 | 2,117 | 988 | 993 | 982 |
+| attention forward, per layer | 1,760 | 289 | 1,758 | 287 | 313 |
+| backward, all GEMMs of one layer | 20,265 | 14,434 | 9,869 | 6,801 | 7,706 |
+| backward, the six FFN GEMMs of one layer | 16,633 | 11,852 | 7,753 | 5,485 | 6,172 |
 
-In the backward, one layer's FFN GEMMs take 16.6 ms in NSL (64x64 tiles, ~2.95 ms each)
-against 11.8 ms in PyTorch (256x128 tiles, ~1.95 ms each). Where cuBLAS gives NSL a
-large-tile kernel (gate and up: 128x128 against PyTorch's 256x128) the two take the
-same 1.84 ms: the gap is the kernel the heuristic returns, not NSL's operands or
-layouts being slower in themselves.
+At TF32 every projection is slower in NSL, by 15% (gate, up: cuBLAS gives NSL a
+128x128 kernel where PyTorch gets 256x128) to 63% (o: a 64x64 kernel); the backward
+layer's GEMMs take 1.40x as long. In bf16 the large projections match PyTorch's
+(gate, down) and the small ones do not (k, v 2.6x), and the backward layer's GEMMs
+take 1.45x eager PyTorch's. NSL's per-layer attention forward is the same in both
+precisions (it runs on f16 operands either way) and 6x FlashAttention-2's.
 
 ### Host side
 
-`NSL_HOST_PROFILE=1` attributes ~800 ms of host time per micro-batch, 98% of it inside
-134 synchronous `cuMemcpyHtoD` calls (1.1 MiB in all) and 2% in ~1,700 kernel
-launches at 9 µs each. A synchronous host-to-device copy from pageable memory waits
+`NSL_HOST_PROFILE=1` (medians over the 96 micro-batches of a TF32 run) attributes
+768 ms of host time per micro-batch: 750 ms (98%) inside 134 synchronous
+`cuMemcpyHtoD` calls (1.1 MiB in all), 15 ms in 1,590 kernel launches (9.5 µs each)
+and 2 ms in 1,447 device allocations. A synchronous host-to-device copy from pageable memory waits
 for the device, so each of those 134 copies is a device synchronisation: the host
 cannot run more than one copy ahead of the GPU, and the GPU idles while the host
 issues the next kernels. The trace agrees: 536 `cuMemcpyHtoD_v2` per update and
-131 ms of GPU idle. 128 of the 134 copies per micro-batch are 8,192 bytes, the size of
+131 ms of GPU idle (`--copies`: 512 of them per update, 128 per micro-batch, are
+8,192 bytes; PyTorch makes 4 host-to-device copies per update, one 32 KiB batch of ids
+per micro-batch). The 8,192-byte copies are the size of
 RoPE's position vector (2,048 f32): `RotaryEmbedding.forward` builds it with `arange`
 on the host on every call (`stdlib/nsl/nn/rope.nsl`), and 128 = 16 layers x (q, k) x
 (cos, sin lookup) x (forward, recompute). The per-micro-batch
 `nsl_gpu_drain_cache` adds a `cuCtxSynchronize` and returns ~9.6 GB of transient
-pool to the driver, which the next micro-batch allocates again (~95 `cuMemFree` and
-~95 `cuMemAlloc` per micro-batch).
+pool to the driver, which the next micro-batch allocates again (380 `cuMemFree` and
+380 `cuMemAlloc` per update in the trace, ~95 of each per micro-batch).
 
 PyTorch eager keeps its GPU 99.6% busy with 10,261 launches per update: launch
 overhead is not what separates the two.
 
 ## Five places to make NSL faster or smaller
 
-Gains are for Coder-1B at the production shape unless stated; they do not add up
-exactly, because removing one bottleneck changes the clock and the overlap of the rest.
+Gains are for Coder-1B at the production shape unless stated. The 1B recipe trains in
+bf16, so the bf16 estimate is the one that matters for it; the TF32 one is for the
+matched-precision comparison and the 500M recipe. They do not add up exactly, because
+removing one bottleneck changes the clock and the overlap of the rest.
 
 1. **The attention kernels.** Measured: 673 ms per update at TF32 and 665 ms at bf16
    against PyTorch's 74-81 ms; the backward kernel is 8.6 ms per call against
-   FlashAttention-2's 0.77 ms on the same card and shape, the forward 1.76 ms (two
-   launches, one per batch row) against 0.30 ms. Matching FlashAttention-2 would take
-   *~590 ms off a 3.3 s TF32 update (+21% tok/s, est.) and off a 2.43 s bf16 update
-   (+32%, est.)*. Attending over the 8 KV heads directly instead of materialising
+   FlashAttention-2's 0.77 ms on the same card and shape, the forward 1.76 ms per layer
+   (two launches, one per batch row) against 0.29 ms. Matching FlashAttention-2 would
+   take *~590 ms off the 2.43 s bf16 production update (+32% tok/s, est.) and off a
+   3.3 s TF32 update (+21%, est.)*. Attending over the 8 KV heads directly instead of materialising
    them 4x (`k5.expand(...).contiguous()` in `stdlib/nsl/nn/gqa.nsl`) also removes
    the expansion copies and their saved copies (*~0.5-1 GiB at 1B, est.*). Confidence
    in the size of the prize: high (both kernels measured on this card). In reaching
    it: medium, it is kernel engineering (tile sizes, a sequence-parallel backward,
    16-bit inputs end to end).
-2. **TF32 GEMM kernel selection.** Measured: 2,110 ms against 1,520 ms for identical
-   GEMM FLOPs; NSL's 8192^3 probe reaches 71 TFLOPS against PyTorch's 80. cuBLAS 13.8's
-   `sgemm` heuristic returns 64x64-tile kernels for most of the backward and for the
-   q/k/v/o/down projections; where it returns 128x128 (gate, up) NSL matches PyTorch.
-   Asking cublasLt for several algorithms per shape and timing them once (NSL already
-   does this for bf16, `NSL_MATMUL_BF16_LT_TUNE`) is the obvious route. *Gain ~0.5-0.6 s
-   per TF32 update (+18-22%, est.)*; confidence medium-high (that better kernels exist
-   for these shapes is measured; that cublasLt's candidate list contains them on
-   cuBLAS 13.8 is not). At bf16, NSL's GEMMs take 1,013 ms against 725-792 ms, plus
-   196 ms of `nsl_cast_f32_to_bf16` on activations before each GEMM.
+2. **GEMM kernel selection.** Measured, bf16 (production): NSL's GEMMs take 1,013 ms
+   per update against 725 (eager) and 792 (compiled) ms; the large projections match
+   PyTorch's, k and v are 2.6x slower and the backward layer's GEMMs 1.45x; another
+   196 ms go to `nsl_cast_f32_to_bf16` on activations before each GEMM. Measured, TF32:
+   2,110 ms against 1,520 ms for identical GEMM FLOPs; NSL's 8192^3 probe reaches
+   71 TFLOPS against PyTorch's 80. cuBLAS 13.8's `sgemm` heuristic returns 64x64-tile
+   kernels for most of the backward and for the q/k/v/o/down projections, and even gate
+   and up, where it returns 128x128, are 15% slower than PyTorch's 256x128. Asking
+   cublasLt for several algorithms per shape and timing them once is the obvious route.
+   NSL has that for bf16 behind `NSL_MATMUL_BF16_LT=1` (off by default because it
+   changes bits; not measured here: every bf16 arm ran the default `cublasGemmEx`
+   path), and nothing like it for TF32. *Gain ~0.2-0.3 s per bf16 production update
+   (+10-14%, est.), ~0.5-0.6 s per TF32 update (+18-22%, est.)*; confidence medium-high (that faster kernels exist for
+   these shapes on this card is measured; that cublasLt's candidate list on cuBLAS 13.8
+   contains them is not).
 3. **Fusing the memory-bound work.** Measured: everything that is not a GEMM, attention
    or the optimizer costs NSL 611 ms (TF32) and 832 ms (bf16) per update, against
    278 ms under `torch.compile` (bf16). Visible pieces: RoPE as ~10 kernels per q and
    per k (copies, two table lookups, mul, rotate, mul, add) at ~0.7 ms per layer and
-   micro-batch; SwiGLU's `silu` and `mul` unfused (1.1 ms per layer and micro-batch
-   forward, again in the recompute); 2,048 strided-copy launches per update; in bf16
+   micro-batch; SwiGLU's `silu` and `mul` unfused (`nsl_silu_f32` alone 45 ms per update,
+   0.35 ms per call, plus a ~0.5 ms `nsl_mul_f32` on the same tensor, forward and
+   recompute); 2,048 strided-copy launches per update; in bf16
    the activation casts. *A fused RoPE, a fused SwiGLU, residual-add + RMSNorm fusion
    and dropping the K/V expansion would remove ~300 ms per update at TF32 (+10%, est.);
    at bf16 with 16-bit activations, up to ~550 ms (+29%, est.)*. Confidence medium.
 4. **16-bit activations (memory first, then speed).** Measured: NSL's selective
    checkpointing keeps 5.4 GiB of f32 matmul outputs per micro-batch at 1B (the
    allocator's `matmul_f32` context at peak); `NSL_MATMUL_BF16=1` adds a 1.9 GiB weight
-   cast cache and keeps every activation in f32, so NSL's bf16 posture peaks at
-   26.5 GiB against PyTorch's 20.6 (compile) and 23.2 (eager). `--checkpoint-compress
+   cast cache and keeps every activation in f32, so NSL's bf16 production posture peaks
+   at 26.5 GiB allocator / 27.8 GiB driver against PyTorch's 20.6 / 22.3 (compile) and
+   23.2 / 24.4 (eager). `--checkpoint-compress
    bf16` already stores the saved matmul outputs in bf16 and takes the peak to
    21.24 GiB, but at 1,680 tok/s (3.0x slower; item in the defects below). *A bf16
    activation path (bf16 GEMM outputs, bf16 storage, f32 norms and loss, as autocast
    does) would save ~3-5 GiB at 1B and the 196 ms of casts per update (est.)*;
    confidence medium.
-5. **Host synchronisation.** Measured: 131 ms of GPU idle per TF32 update (3.7%) from
-   536 synchronous host-to-device copies, and the drain worth 1-2% (1B) and 5% (500M)
+5. **Host synchronisation.** Measured: 119 ms of GPU idle per bf16 production update
+   (4.4%) and 131 ms per TF32 update (3.7%), from 536 synchronous host-to-device copies, and the drain worth 1-2% (1B) and 5% (500M)
    on its own. Keeping small host-built tensors (RoPE's positions above all) on
    the device or staging them through pinned memory with `cuMemcpyHtoDAsync`, and
    dropping the per-micro-batch drain (or doing it once per optimizer step), would
@@ -471,37 +579,56 @@ exactly, because removing one bottleneck changes the clock and the overlap of th
 ## Reproduce
 
 Raw results (one JSON per run, logs, traces, trace summaries) are in
-`/mnt/extrastorage/nsl-audit/research/work/PERF/runs/` on the measuring machine; this
-document quotes `perfcheck.py report` on that directory. Commands, from the repository
-root, each GPU one queued separately on this machine
-(`/mnt/extrastorage/nsl-audit/bin/nslq gpu -- ...`):
+`/mnt/extrastorage/nsl-audit/research/work/PERF/runs/` on the measuring machine. Every
+number above comes from one of the commands below: the throughput, memory, per-round,
+paired-ratio, phase, NSL memory-context and host-profile tables from `report`; the
+roofline and NSL GEMM probe from `roofline` (`roofline.json`); the cuBLAS workspace
+bytes from `workspace`; every per-update kernel, phase, copy and per-layer figure from
+`nsys_summary.py` on the five traces. Each GPU command was queued on its own on this
+machine (`/mnt/extrastorage/nsl-audit/bin/nslq gpu -- ...`).
 
 ```bash
 cargo build --release --bin nsl --features cuda
 uv venv --python 3.12 VENV
 uv pip install --python VENV/bin/python torch --index-url https://download.pytorch.org/whl/cu128
 uv pip install --python VENV/bin/python numpy tokenizers
+VENV/bin/python tools/perfcheck/test_perfcheck.py      # harness arithmetic; needs torch, no GPU
 P="VENV/bin/python tools/perfcheck/perfcheck.py"; OUT=/a/real/disk/perf
 CORE=nsl_tf32,nsl_bf16,torch_tf32_eager_sel,torch_bf16_eager_sel,torch_bf16_compile_sel
 EXTRA=nsl_tf32_nodrain,nsl_bf16_nodrain,nsl_tf32_blocks,torch_tf32_eager_blocks,torch_bf16_compile_blocks,torch_bf16_compile_none
 
 $P roofline --out $OUT
+$P workspace --out $OUT
 for s in 1b 500m; do
   $P build --size $s --arms nsl_tf32,nsl_bf16,nsl_tf32_blocks,nsl_tf32_compress,nsl_bf16_compress --phase --out $OUT
   for r in 0 1 2; do $P run --size $s --arms $CORE --round $r --out $OUT
                      $P run --size $s --arms $EXTRA --round $r --out $OUT; done
+  $P run --size $s --arms $CORE --round 3 --out $OUT
   $P phases --size $s --arms $CORE --out $OUT
 done
-$P run --size 1b --arms nsl_tf32_compress,nsl_bf16_compress --round 0 --out $OUT   # rounds 0-2
+for r in 0 1 2; do $P run --size 1b --arms nsl_tf32_compress,nsl_bf16_compress --round $r --out $OUT; done
+$P phases --size 1b --arms torch_bf16_compile_blocks,torch_bf16_compile_none,torch_tf32_eager_blocks --out $OUT
 for a in nsl_tf32 nsl_bf16 torch_tf32_eager_sel torch_bf16_eager_sel torch_bf16_compile_sel; do
   $P nsys --size 1b --arm $a --out $OUT; done
 $P diag --size 1b --arm nsl_tf32 --env NSL_HOST_PROFILE=1 --tag hostprof --out $OUT
 $P report --out $OUT
-python3 tools/perfcheck/test_perfcheck.py   # the harness's own arithmetic, no GPU
+
+N="VENV/bin/python tools/perfcheck/nsys_summary.py"; T=$OUT/1b_b2_s2048_a4/nsys
+COMMON="--copies --layers 16 --top 40"
+for a in nsl_tf32 nsl_bf16; do
+  $N $T/$a.sqlite $COMMON --boundary fase_fused_adamw --fwd-start nsl_embedding_i32idx \
+    --bwd-start lce_chunk_dlogits --layer-mark flash_attn_bwd_main \
+    --recompute 'nsl_rmsnorm_f32|rmsnorm_rinv|rotate_half|nsl_silu_f32|embedding_f32'; done
+for a in torch_tf32_eager_sel torch_bf16_eager_sel; do
+  $N $T/$a.sqlite $COMMON --boundary FusedAdam --opt-start LpNormFunctor \
+    --fwd-start vectorized_gather_kernel --bwd-start nll_loss_backward \
+    --layer-mark flash_bwd_dq_dk_dv \
+    --recompute 'pow_tensor_scalar|MeanOps|silu_kernel|neg_kernel|CatArrayBatchedCopy|rsqrt'; done
+$N $T/torch_bf16_compile_sel.sqlite $COMMON --boundary FusedAdam --opt-start LpNormFunctor \
+  --fwd-start fused__to_copy_add_div_index_mean --bwd-start log_softmax_backward_data \
+  --layer-mark flash_bwd_dq_dk_dv
 ```
 
-Trace summaries (`nsys_summary.py TRACE --boundary B --fwd-start F --bwd-start W
-[--opt-start O]`): NSL `B=fase_fused_adamw F=nsl_embedding_i32idx
-W=lce_chunk_dlogits`; PyTorch eager `B=FusedAdam O=LpNormFunctor
-F=vectorized_gather_kernel W=nll_loss_backward`; PyTorch compiled `B=FusedAdam
-O=LpNormFunctor F=fused__to_copy_add_div_index_mean W=log_softmax_backward_data`.
+`nsys_summary.py --sequence 40` additionally prints one forward's first kernels and one
+backward layer in order, the source of the kernel-by-kernel descriptions above (RoPE
+as ~10 kernels, the per-row attention launches).
