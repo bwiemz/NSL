@@ -347,6 +347,22 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
                 ModelMember::Method(fn_def, decos) => {
+                    // A model's constructor is its parameter list and its
+                    // field initialisers (spec §4). `fn __init__` was
+                    // compiled as an ordinary method nothing calls, and a
+                    // call passing it arguments failed Cranelift's verifier
+                    // on the argument count.
+                    if self.resolve_name(fn_def.name) == "__init__" {
+                        let model = self.resolve_name(model_def.name);
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "`fn __init__` is not a constructor in NSL: a model is built from \
+                                 its parameter list and field initialisers, as in `model {model}(k: \
+                                 float):` with `w: Tensor = full([2, 2], k)`"
+                            ))
+                            .with_label(fn_def.span, "not a constructor"),
+                        );
+                    }
                     let method_ty = self.build_fn_type(fn_def);
                     methods.push((fn_def.name, method_ty));
 

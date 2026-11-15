@@ -105,6 +105,10 @@ pub struct TypeChecker<'a> {
     /// refuse a named argument that is not in its parameter's position — see
     /// `check_named_argument_order`.
     pub(crate) call_param_names: HashMap<(Option<Symbol>, Symbol), Vec<Symbol>>,
+    /// For each model this module declares, its constructor's parameter
+    /// count and whether any of them is written with a default (which code
+    /// generation does not implement): a constructor call is held to it.
+    pub(crate) model_ctor_params: HashMap<Symbol, (usize, bool)>,
     /// The same, for callables imported from other modules (supplied by the
     /// module loader, which has their declarations). Consulted after
     /// `call_param_names`, so a declaration in this module shadows an import
@@ -134,6 +138,7 @@ impl<'a> TypeChecker<'a> {
             fused_kl_ce_configs: Vec::new(),
             pca_configs: Vec::new(),
             call_param_names: HashMap::new(),
+            model_ctor_params: HashMap::new(),
             import_param_names: crate::ImportedParamNames::default(),
         }
     }
@@ -287,6 +292,10 @@ impl<'a> TypeChecker<'a> {
 
         let mut models = Vec::new();
         models_in(stmts, &mut models);
+        for md in &models {
+            let has_default = md.params.iter().any(|p| p.default.is_some());
+            self.model_ctor_params.insert(md.name, (md.params.len(), has_default));
+        }
         if models.is_empty() {
             return;
         }

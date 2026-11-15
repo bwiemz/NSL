@@ -736,7 +736,31 @@ impl<'a> TypeChecker<'a> {
 
                 *ret.clone()
             }
-            Type::Model { .. } => callee_ty.clone(),
+            Type::Model { name, .. } => {
+                // A constructor call passes one argument per model parameter.
+                // A mismatch used to reach code generation and fail
+                // Cranelift's verifier on the call's argument count.
+                if let ExprKind::Ident(sym) = &callee.kind
+                    && *sym == *name
+                    && let Some(&(expected, has_default)) = self.model_ctor_params.get(sym)
+                    && args.len() != expected
+                {
+                    let model = self.resolve_name(*name);
+                    let note = if has_default && args.len() < expected {
+                        " (default values of model parameters are not supported: pass every argument)"
+                    } else {
+                        ""
+                    };
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "model '{model}' takes {expected} constructor argument(s), got {}{note}",
+                            args.len()
+                        ))
+                        .with_label(span, "wrong number of arguments"),
+                    );
+                }
+                callee_ty.clone()
+            }
             Type::Struct { .. } => callee_ty.clone(),
             Type::Error => Type::Error,
             Type::Unknown => Type::Unknown,
