@@ -4438,7 +4438,23 @@ pub(crate) fn gpu_fase_fused_adamw_step(
     let m = NslTensor::from_ptr_ref(m_ptr);
     let v = NslTensor::from_ptr_ref(v_ptr);
     let mp = NslTensor::from_ptr_ref(mp_ptr);
-    gpu_fase_fused_adamw_step_raw(
+    // `first_moment_dtype="bf16"`: same arguments, the kernel whose `m` is
+    // bf16 (dtype 3). Every other tensor is f32 either way.
+    let op = "gpu_fase_fused_adamw_step";
+    assert_gpu_f32(th, op, "theta");
+    assert_gpu_f32(v, op, "v");
+    assert_gpu_f32(mp, op, "m_partial");
+    let m_bf16 = m.dtype == crate::tensor_parallel::collective::DTYPE_BF16;
+    if !m_bf16 {
+        assert_gpu_f32(m, op, "m");
+    }
+    let (ptx, name): (&str, &[u8]) = if m_bf16 {
+        (kernels::fase_fused_adamw_step_f32_mbf16_ptx(), b"nsl_fase_fused_adamw_step_f32_mbf16\0")
+    } else {
+        (kernels::fase_fused_adamw_step_f32_ptx(), b"nsl_fase_fused_adamw_step_f32\0")
+    };
+    gpu_fase_fused_adamw_step_kernel(
+        ptx, name,
         th.data as u64, m.data as u64, v.data as u64, mp.data as u64, n,
         b1, omb1, b2, omb2, eps, neg_lr, neg_lr_wd, bc1, bc2, has_wd,
     );
@@ -4456,6 +4472,24 @@ pub(crate) fn gpu_fase_fused_adamw_step(
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gpu_fase_fused_adamw_step_raw(
+    th_data: u64, m_data: u64, v_data: u64, mp_data: u64, n: usize,
+    b1: f32, omb1: f32, b2: f32, omb2: f32, eps: f32,
+    neg_lr: f32, neg_lr_wd: f32, bc1: f32, bc2: f32, has_wd: bool,
+) {
+    gpu_fase_fused_adamw_step_kernel(
+        kernels::fase_fused_adamw_step_f32_ptx(),
+        b"nsl_fase_fused_adamw_step_f32\0",
+        th_data, m_data, v_data, mp_data, n,
+        b1, omb1, b2, omb2, eps, neg_lr, neg_lr_wd, bc1, bc2, has_wd,
+    );
+}
+
+/// The per-parameter fused AdamW launch for either first-moment storage:
+/// `ptx`/`name` select the f32 kernel or the bf16-`m` one (same signature).
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn gpu_fase_fused_adamw_step_kernel(
+    ptx: &str, name: &[u8],
     th_data: u64, m_data: u64, v_data: u64, mp_data: u64, n: usize,
     b1: f32, omb1: f32, b2: f32, omb2: f32, eps: f32,
     neg_lr: f32, neg_lr_wd: f32, bc1: f32, bc2: f32, has_wd: bool,
@@ -4492,8 +4526,8 @@ pub(crate) fn gpu_fase_fused_adamw_step_raw(
     let block = 256i64;
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
-        kernels::fase_fused_adamw_step_f32_ptx().as_ptr(),
-        b"nsl_fase_fused_adamw_step_f32\0".as_ptr(),
+        ptx.as_ptr(),
+        name.as_ptr(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(
@@ -4613,6 +4647,9 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi(
     b1: f32, omb1: f32, b2: f32, omb2: f32, eps: f32,
     neg_lr: f32, neg_lr_wd: f32, bc1: f32, bc2: f32, has_wd: bool,
     mp_scale: f32,
+    // `first_moment_dtype="bf16"`: every `m_ptrs` entry points at bf16, and
+    // the bf16-`m` kernel (same signature and grid) is launched.
+    m_bf16: bool,
 ) {
     let k = t_ptrs.len();
     if k == 0 {
@@ -4775,9 +4812,14 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi(
         &mut mp_scale_val as *mut _ as *mut c_void,
     ];
     let grid_x = blk_count as i64;
+    let (ptx, name): (&str, &[u8]) = if m_bf16 {
+        (kernels::fase_fused_adamw_multi_f32_mbf16_ptx(), b"nsl_fase_fused_adamw_multi_f32_mbf16\0")
+    } else {
+        (kernels::fase_fused_adamw_multi_f32_ptx(), b"nsl_fase_fused_adamw_multi_f32\0")
+    };
     let result = inner::kernel_launch(
-        kernels::fase_fused_adamw_multi_f32_ptx().as_ptr(),
-        b"nsl_fase_fused_adamw_multi_f32\0".as_ptr(),
+        ptx.as_ptr(),
+        name.as_ptr(),
         [grid_x, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(
@@ -9875,8 +9917,17 @@ mod dtype_guard_drift {
         ),
         (
             "gpu_fase_fused_adamw_step_multi",
-            "bucket members are admitted only when dtype == DTYPE_F32 \
-             (fase_step.rs:76 and :471), so a non-f32 parameter never reaches a bucket",
+            "bucket members are admitted only when theta, v and mp are DTYPE_F32 \
+             and m is DTYPE_F32 or (first_moment_dtype=\"bf16\") DTYPE_BF16, with \
+             m's dtype part of the bucket key (fase_step.rs fase_multi_impl), so a \
+             launch's m_bf16 flag matches every member",
+        ),
+        (
+            "gpu_fase_fused_adamw_step_kernel",
+            "bare u64 device pointers, no NslTensor and so no dtype to read; its two \
+             callers pick the kernel from validated dtypes: the fase wrapper from m's \
+             dtype after fase_step.rs asserts theta/v/mp f32 and m f32 or bf16, \
+             gpu_fase_fused_adamw_step_raw always the f32 kernel",
         ),
         (
             "gpu_relu_backward",

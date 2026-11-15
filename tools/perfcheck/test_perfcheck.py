@@ -15,6 +15,7 @@ GPU-busy time from intervals whose union is known.
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import math
 import re
 import sqlite3
@@ -219,6 +220,117 @@ class Arms(unittest.TestCase):
         for bad in ("torch_tf32_eager_sel@after", "nsl_tf32@a/b", "nsl_tf32@"):
             with self.assertRaises(SystemExit, msg=bad):
                 pc.arm(bad)
+
+    def test_existing_build_directories_keep_their_names(self) -> None:
+        # Results of earlier campaigns live under these directory names; adding the
+        # grad_clip axis to the build key must not rename them.
+        self.assertEqual(
+            pc.flag_key(pc.arm("nsl_tf32").build_key),
+            "nsl_sourcead_checkpointblocks_checkpointselective_fusermsnormbackward_fusewgradaccum",
+        )
+        self.assertEqual(
+            pc.flag_key(pc.arm("nsl_bf16_compress@after").build_key),
+            "nsl_sourcead_checkpointblocks_checkpointselective_fusermsnormbackward_"
+            "fusewgradaccum_checkpointcompress_bf16__matmul_bf161@after",
+        )
+
+
+def feature_rules() -> list[tuple[str, str, str, bool]]:
+    """(flag, Requires|Conflicts, partner, clap) for every rule in the compiler's
+    composition registry, `crates/nsl-cli/src/feature_rules.rs`. Clap rules name the
+    partner by its clap FIELD (`optim_state_offload`), source rules by its spelling
+    (`grad_clip=`, `--weight-stream`, or prose for a non-flag partner)."""
+    src = (pc.REPO / "crates" / "nsl-cli" / "src" / "feature_rules.rs").read_text()
+    clap = re.findall(r'clap_rule\("(--[a-z0-9-]+)", RuleKind::(\w+), "(\w+)"\)', src)
+    source = re.findall(r'src_rule\(\s*"(--[a-z0-9-]+)",\s*RuleKind::(\w+),\s*"([^"]+)"', src)
+    assert len(clap) >= 15 and len(source) >= 20, "the registry's layout changed"
+    return [(f, k, "--" + o.replace("_", "-"), True) for f, k, o in clap] + [
+        (f, k, o, False) for f, k, o in source
+    ]
+
+
+class MemoryArms(unittest.TestCase):
+    def test_arms_respect_the_compilers_composition_rules(self) -> None:
+        rules = feature_rules()
+        for prec in ("tf32", "bf16"):
+            for suffix in [*pc.MEMORY_ARMS, *pc.OPTIM_ARMS]:
+                a = pc.arm(f"nsl_{prec}_{suffix}")
+                flags = set(a.flags)
+                # A flag followed by a value (`--zero-stage 1`): its source rules are
+                # conditions on the value ("--zero-stage 3 requires ..."), not on the
+                # flag, which this table cannot express. Its clap rules still apply.
+                valued = {f for f, v in itertools.pairwise(a.flags) if not v.startswith("--")}
+                for flag, kind, partner, clap in rules:
+                    if flag not in flags or (not clap and flag in valued):
+                        continue
+                    if not (partner.startswith("--") or partner == "grad_clip="):
+                        continue  # prose partner ("FASE-Deferred plan")
+                    if partner == "--source-ad-mode":  # clap group: either spelling
+                        has = bool(flags & {"--source-ad", "--pretrain-optimized"})
+                    elif partner == "grad_clip=":
+                        has = a.grad_clip
+                    else:
+                        has = partner in flags
+                    if kind == "Conflicts":
+                        self.assertFalse(has, f"{a.name}: {flag} refuses {partner}")
+                    elif kind == "Requires" and partner.startswith("--"):
+                        self.assertTrue(has, f"{a.name}: {flag} requires {partner}")
+
+    def test_the_offload_and_layerwise_arms_drop_only_what_is_refused(self) -> None:
+        prod = set(pc.PROD_FLAGS)
+        offload = set(pc.arm("nsl_bf16_offload").flags)
+        self.assertEqual(prod - offload, {"--fuse-wgrad-accum"})
+        self.assertEqual(offload - prod, {"--optim-state-offload"})
+        lw = pc.arm("nsl_bf16_lw")
+        self.assertEqual(
+            set(lw.flags),
+            {"--source-ad", "--checkpoint-blocks", "--fuse-rmsnorm-backward", "--layerwise-accum"},
+        )
+        self.assertFalse(lw.grad_clip)
+        # Each layerwise arm has a control with the same drops and no option.
+        self.assertEqual(
+            set(pc.arm("nsl_bf16_blocks_nowgrad_noclip").flags) | {"--layerwise-accum"},
+            set(lw.flags),
+        )
+        self.assertFalse(pc.arm("nsl_bf16_blocks_nowgrad_noclip").grad_clip)
+
+    def test_clip_is_part_of_the_build(self) -> None:
+        shape = pc.read_shape("1b", None, None, None)
+        on = pc.program_text(shape, 24, Path("/t.bin"), grad_clip=True)
+        off = pc.program_text(shape, 24, Path("/t.bin"), grad_clip=False)
+        train = 'train(model=m, epochs=1, grad_accumulation=4, schedule_unit="optimizer_step"'
+        self.assertIn(train + ", grad_clip=1.0):\n", on)
+        self.assertIn(train + "):\n", off)
+        self.assertNotIn("grad_clip=", off)
+        clip, noclip = pc.arm("nsl_bf16_nowgrad"), pc.arm("nsl_bf16_nowgrad_noclip")
+        self.assertEqual(clip.flags, noclip.flags)
+        self.assertNotEqual(pc.flag_key(clip.build_key), pc.flag_key(noclip.build_key))
+
+    def test_optimizer_arguments_are_part_of_the_build(self) -> None:
+        shape = pc.read_shape("1b", None, None, None)
+        base = pc.program_text(shape, 24, Path("/t.bin"), grad_clip=True)
+        m1 = pc.program_text(
+            shape, 24, Path("/t.bin"), grad_clip=True, optim_args='first_moment_dtype="bf16"'
+        )
+        adamw = "    optimizer: AdamW(lr=0.0001, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8"
+        self.assertIn(adamw + ")\n", base)
+        self.assertIn(adamw + ', first_moment_dtype="bf16")\n', m1)
+        # Only the optimizer line differs.
+        self.assertEqual(base.replace(adamw + ")", adamw + ', first_moment_dtype="bf16")'), m1)
+        a, prod = pc.arm("nsl_bf16_m1bf16"), pc.arm("nsl_bf16")
+        self.assertEqual((a.flags, a.build_env, a.env), (prod.flags, prod.build_env, prod.env))
+        self.assertEqual(a.optim_args, 'first_moment_dtype="bf16"')
+        self.assertEqual(
+            pc.flag_key(a.build_key), pc.flag_key(prod.build_key) + "__firstmomentdtypebf16"
+        )
+        self.assertEqual(pc.arm("nsl_tf32_m1bf16@mem").variant, "mem")
+
+    def test_run_time_switches_share_the_binary(self) -> None:
+        # NSL_WS_RESIDENT and NSL_ASYNC_ALLOC are read by the runtime: same build.
+        for opt, base in (("wsall", "ws"), ("asyncalloc", "")):
+            a, b = pc.arm(f"nsl_bf16_{opt}"), pc.arm("nsl_bf16" + (f"_{base}" if base else ""))
+            self.assertEqual(pc.flag_key(a.build_key), pc.flag_key(b.build_key), opt)
+            self.assertNotEqual(a.env, b.env, opt)
 
 
 def iv(s: int, e: int, name: str = "k") -> ns.Interval:

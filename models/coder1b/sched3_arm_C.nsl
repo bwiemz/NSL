@@ -161,7 +161,8 @@
 #                           at 1B for +5.8 GiB of peak (19.4 -> 25.2 GiB alloc;
 #                           POSTURE_1B_THROUGHPUT_2026_08_27.md). 73% of the
 #                           no-recompute speedup for 18% of its memory.
-#   --fuse-wgrad-accum      +11.5% at 1B, no memory cost. In the line BEFORE
+#   --fuse-wgrad-accum      1.41x at 1B bf16, 1.25x TF32 (2026-11;
+#                           +11.5% in Aug 2026), no memory cost. In the line BEFORE
 #                           the checkpoint chain began on purpose: #519's
 #                           execution fingerprint treats the wgrad choice as
 #                           arithmetic identity, so adding it mid-chain would
@@ -200,9 +201,10 @@
 #                           bf16 because a copied driver carried this variable
 #                           and nothing read the banner back.
 #                           Record: POSTURE_1B_THROUGHPUT_2026_08_27.md.
-#                           --cuda-graphs measured +0.8% with clean counters
-#                           (76 captured / 2,052 replays / 0 taints) and
-#                           stays OUT: not worth carrying for <1%.
+#                           --cuda-graphs measured +0.8% in Aug 2026; since
+#                           the timed GEMM selection, which graphs switch
+#                           off, it is 0.89x at 1B bf16 and stays OUT
+#                           (MEMORY_OPTIONS_2026_11.md).
 #   --optim-state-offload   NOT in the line anymore (item 6). Before item 11
 #                           the resident configuration OOM'd in the forward
 #                           and this flag was load-bearing; per-segment

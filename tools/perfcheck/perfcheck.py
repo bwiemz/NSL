@@ -30,7 +30,11 @@ NSL_MATMUL_BF16=1 (read at build time; the runtime's banner is checked, and sinc
 2026-11 a binary run with a disagreeing NSL_MATMUL_BF16 refuses to start).
 `nsl_*_nodrain`: the same binary under NSL_SKIP_GPU_DRAIN=1. `nsl_*_oldattn`: the same
 binary under NSL_TC_ATTENTION=0 (the attention kernels before the tensor-core ones).
-`nsl_tf32_blocks`: PROD_FLAGS without `--checkpoint-selective` (full block recompute). `torch_<tf32|bf16>_<eager|compile>_
+`nsl_tf32_blocks`: PROD_FLAGS without `--checkpoint-selective` (full block recompute).
+`nsl_<tf32|bf16>_<suffix>` for each MEMORY_ARMS suffix: one memory option on top of
+PROD_FLAGS, or on the nearest flag set it accepts (see MEMORY_ARMS); likewise each
+OPTIM_ARMS suffix, an optimizer argument in the program instead of a flag
+(`nsl_bf16_m1bf16`: `first_moment_dtype="bf16"`). `torch_<tf32|bf16>_<eager|compile>_
 <none|blocks|sel>`: `torch_arm.py` with that precision, compilation and checkpointing.
 
 Timing: a step-limited program per arm (the token file holds exactly `--updates`
@@ -85,6 +89,56 @@ PROD_FLAGS = [
 ]
 BLOCKS_FLAGS = [f for f in PROD_FLAGS if f != "--checkpoint-selective"]
 COMPRESS_FLAGS = [*PROD_FLAGS, "--checkpoint-compress", "bf16"]
+# The memory options. Each is PROD_FLAGS plus the option; where the compiler refuses
+# a production flag next to it, the arm drops that flag, and a control arm without
+# the option but with the same drop is listed too. `--optim-state-offload` and
+# `--layerwise-accum` refuse `--fuse-wgrad-accum`; `--layerwise-accum` and
+# `--zero-stage` also refuse the recipe's `grad_clip=1.0` (those arms build the
+# program without it).
+NOWGRAD_FLAGS = [f for f in PROD_FLAGS if f != "--fuse-wgrad-accum"]
+LW_FLAGS = [*(f for f in BLOCKS_FLAGS if f != "--fuse-wgrad-accum"), "--layerwise-accum"]
+WS_FLAGS = [*LW_FLAGS, "--weight-stream"]
+ARENA_FLAGS = [*WS_FLAGS, "--stream-arena"]
+# The weight-stream residency policy keeps every parameter resident while free VRAM at
+# the first registration exceeds a reserve (half the card); NSL_WS_RESIDENT=0 streams
+# every layer-grouped parameter whatever the card has free. Read at run time.
+# NSL_WS_COUNTER=1 prints the transfer counters and the residency decision at exit.
+WS_ENV = (("NSL_WS_COUNTER", "1"),)
+WS_ALL = (*WS_ENV, ("NSL_WS_RESIDENT", "0"))
+# (flags, run-time environment, grad_clip=1.0 in the train block) per arm suffix; the
+# arm `nsl_<tf32|bf16>_<suffix>` builds in that precision.
+MEMORY_ARMS: dict[str, tuple[list[str], tuple[tuple[str, str], ...], bool]] = {
+    "nowgrad": (NOWGRAD_FLAGS, (), True),
+    "offload": ([*NOWGRAD_FLAGS, "--optim-state-offload"], (), True),
+    "nocastcache": ([*PROD_FLAGS, "--no-bf16-cast-cache"], (), True),
+    "graphs": ([*PROD_FLAGS, "--cuda-graphs"], (), True),
+    "wggo": ([*PROD_FLAGS, "--wggo", "greedy"], (), True),
+    "moment": ([*PROD_FLAGS, "--wggo", "greedy", "--wggo-memory-budget", "8192"], (), True),
+    "nockpt": ([f for f in PROD_FLAGS if not f.startswith("--checkpoint")], (), True),
+    "stride2": ([*PROD_FLAGS, "--checkpoint-stride", "2"], (), True),
+    # Full recompute, but the most expensive interiors (by the planner's operation
+    # count) stay saved up to 3 GiB: between --checkpoint-blocks and -selective.
+    "budget3g": ([*BLOCKS_FLAGS, "--checkpoint-budget-mib", "3072"], (), True),
+    "asyncalloc": (PROD_FLAGS, (("NSL_ASYNC_ALLOC", "1"),), True),
+    "nowgrad_noclip": (NOWGRAD_FLAGS, (), False),
+    "lwsel": ([*NOWGRAD_FLAGS, "--layerwise-accum"], (), False),
+    "blocks_nowgrad_noclip": ([f for f in BLOCKS_FLAGS if f != "--fuse-wgrad-accum"], (), False),
+    "lw": (LW_FLAGS, (), False),
+    "ws": (WS_FLAGS, WS_ENV, False),
+    "wsall": (WS_FLAGS, WS_ALL, False),
+    "wsarena": (ARENA_FLAGS, WS_ALL, False),
+    "wsprefetch": ([*ARENA_FLAGS, "--stream-prefetch"], WS_ALL, False),
+    "wsasync": ([*ARENA_FLAGS, "--stream-prefetch", "--stream-async-writeback"], WS_ALL, False),
+    "srbf16": ([*WS_FLAGS, "--param-dtype", "bf16-sr"], WS_ENV, False),
+    "zero1": ([*PROD_FLAGS, "--zero-stage", "1"], (), False),
+}
+# Memory options that are optimizer arguments rather than flags: (flags, the extra
+# AdamW arguments of the generated program) per arm suffix. A different program, so a
+# different build.
+OPTIM_ARMS: dict[str, tuple[list[str], str]] = {
+    # The first moment stored bf16 (rounded to nearest even; f32 arithmetic).
+    "m1bf16": (PROD_FLAGS, 'first_moment_dtype="bf16"'),
+}
 BF16_BANNER = "cuBLAS math mode: BF16"
 TF32_BANNER = "cuBLAS math mode: TF32"
 OOM_MARKERS = ("CUDA_ERROR_OUT_OF_MEMORY", "VRAM free", "out of memory", "OutOfMemory")
@@ -181,14 +235,19 @@ class Arm:
     # NSL: which toolchain builds the arm (`<arm>@<variant>`, see `--toolchain`);
     # "" is `--nsl` with the repository's stdlib.
     variant: str = ""
+    # NSL: whether the generated train block keeps the recipe's grad_clip=1.0.
+    grad_clip: bool = True
+    # NSL: extra arguments of the generated program's AdamW (see OPTIM_ARMS).
+    optim_args: str = ""
 
     @property
     def build_key(self) -> BuildKey:
-        return self.flags, self.build_env, self.variant
+        return self.flags, self.build_env, self.variant, self.grad_clip, self.optim_args
 
 
-# (flags, build environment, toolchain variant): one built binary per key.
-BuildKey = tuple[tuple[str, ...], tuple[tuple[str, str], ...], str]
+# (flags, build environment, toolchain variant, grad_clip, AdamW arguments): one built
+# binary per key.
+BuildKey = tuple[tuple[str, ...], tuple[tuple[str, str], ...], str, bool, str]
 
 
 BF16 = (("NSL_MATMUL_BF16", "1"),)
@@ -222,6 +281,15 @@ def arm(name: str) -> Arm:
         "nsl_tf32_compress": Arm(name, "nsl", "tf32", tuple(COMPRESS_FLAGS)),
         "nsl_bf16_compress": Arm(name, "nsl", "bf16", tuple(COMPRESS_FLAGS), BF16),
     }
+    for prec, build_env in (("tf32", ()), ("bf16", BF16)):
+        for suffix, (flags, env, clip) in MEMORY_ARMS.items():
+            nsl[f"nsl_{prec}_{suffix}"] = Arm(
+                name, "nsl", prec, tuple(flags), build_env, env, grad_clip=clip
+            )
+        for suffix, (flags, optim_args) in OPTIM_ARMS.items():
+            nsl[f"nsl_{prec}_{suffix}"] = Arm(
+                name, "nsl", prec, tuple(flags), build_env, optim_args=optim_args
+            )
     if name in nsl:
         return nsl[name]
     m = re.fullmatch(r"torch_(tf32|bf16)_(eager|compile)_(none|blocks|sel)", name)
@@ -232,10 +300,14 @@ def arm(name: str) -> Arm:
 
 
 def flag_key(key: BuildKey) -> str:
-    flags, build_env, variant = key
+    flags, build_env, variant, grad_clip, optim_args = key
     tag = "_".join(f.removeprefix("--").replace("-", "") for f in flags)
     if build_env:
         tag += "__" + "_".join(f"{k.removeprefix('NSL_').lower()}{v}" for k, v in build_env)
+    if not grad_clip:
+        tag += "__noclip"
+    if optim_args:
+        tag += "__" + re.sub(r"[^a-z0-9]", "", optim_args.lower())
     if variant:
         tag += "@" + variant
     return "nsl_" + tag
@@ -271,9 +343,10 @@ def toolchains(args: argparse.Namespace) -> dict[str, Toolchain]:
 
 TEMPLATE = """\
 # GENERATED by tools/perfcheck/perfcheck.py; not a recipe.
-# The pretrain_prod.nsl step (AdamW, warmup_cosine, grad_clip 1.0, @fused_lm_ce,
-# optimizer-step schedule unit) without checkpoints or validation. The token file
-# holds exactly {updates} optimizer updates; one OPT_STEP line per update.
+# The pretrain_prod.nsl step (AdamW, warmup_cosine, grad_clip 1.0 unless the arm
+# drops it, @fused_lm_ce, optimizer-step schedule unit) without checkpoints or
+# validation. The token file holds exactly {updates} optimizer updates; one OPT_STEP
+# line per update.
 from model import NSLCoder
 from nsl.nn.losses import cross_entropy
 
@@ -286,8 +359,8 @@ let loader = DataLoader(tokens, batch_size={mb}, seq_len={seq}, shuffle=false, d
 print("LOSS_STREAM_BEGIN")
 
 @fused_lm_ce(enabled=true, vocab_size={vocab}, hidden_size={d_model}, batch_size={mb}, seq_len={seq})
-train(model=m, epochs=1, grad_accumulation={accum}, schedule_unit="optimizer_step", grad_clip=1.0):
-    optimizer: AdamW(lr=0.0001, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
+train(model=m, epochs=1, grad_accumulation={accum}, schedule_unit="optimizer_step"{clip}):
+    optimizer: AdamW(lr=0.0001, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8{optim})
     scheduler: warmup_cosine(warmup_steps=2, total_steps={updates}, min_lr=0.00003)
     step(batch):
         let logits = m.forward_train(batch.input_ids, true)
@@ -315,6 +388,24 @@ print("PEAK_ACTIVATIONS")
 print(gpu_surface_at_peak_bytes(6))
 print("PERFCHECK_COMPLETE")
 """
+
+
+def program_text(
+    shape: Shape, updates: int, tokens: Path, grad_clip: bool, optim_args: str = ""
+) -> str:
+    """The generated training program for one shape and token file."""
+    return TEMPLATE.format(
+        updates=updates,
+        tokens=tokens,
+        mb=shape.micro_batch,
+        seq=shape.seq,
+        accum=shape.accum,
+        vocab=shape.vocab,
+        d_model=shape.d_model,
+        rows=shape.micro_batch * shape.seq,
+        clip=", grad_clip=1.0" if grad_clip else "",
+        optim=f", {optim_args}" if optim_args else "",
+    )
 
 
 def size_dir(out: Path, size: str, shape: Shape) -> Path:
@@ -349,7 +440,7 @@ def build_nsl(
     updates: int,
     phase: bool,
 ) -> Path:
-    flags, build_env, variant = key
+    flags, build_env, variant, grad_clip, optim_args = key
     nsl = tc.nsl
     d = work / flag_key(key)
     d.mkdir(parents=True, exist_ok=True)
@@ -357,18 +448,7 @@ def build_nsl(
         shutil.copyfile(REPO / "models" / shape.directory / f, d / f)
     tokens = tokens_file(work, shape, updates)
     src = d / "bench.nsl"
-    src.write_text(
-        TEMPLATE.format(
-            updates=updates,
-            tokens=tokens,
-            mb=shape.micro_batch,
-            seq=shape.seq,
-            accum=shape.accum,
-            vocab=shape.vocab,
-            d_model=shape.d_model,
-            rows=shape.micro_batch * shape.seq,
-        )
-    )
+    src.write_text(program_text(shape, updates, tokens, grad_clip, optim_args))
     binary = d / ("prog_phase" if phase else "prog")
     env = nsl_env()
     env["NSL_STDLIB_PATH"] = str(tc.stdlib)
@@ -395,6 +475,8 @@ def build_nsl(
             {
                 "flags": list(flags),
                 "build_env": dict(build_env),
+                "grad_clip": grad_clip,
+                "optim_args": optim_args,
                 "updates": updates,
                 "nsl": str(nsl),
                 "variant": variant,
@@ -585,6 +667,8 @@ def run_nsl_arm(
         "flags": list(a.flags),
         "build_env": dict(a.build_env),
         "env": dict(a.env),
+        "grad_clip": a.grad_clip,
+        "optim_args": a.optim_args,
         "round": rnd,
         "updates": updates,
         "warmup_updates": warmup,

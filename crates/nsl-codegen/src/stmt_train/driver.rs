@@ -447,6 +447,7 @@ impl Compiler<'_> {
             callbacks,
             fase_plan,
             fase_deferred,
+            first_moment_bf16,
         } = self.resolve_train_contract(
             builder,
             state,
@@ -528,6 +529,10 @@ impl Compiler<'_> {
         // ── 4. Create optimizer state buffers ─────────────────────────
         // Moved to `stmt_train/optimizer_state.rs` byte-for-byte (roadmap
         // A1); the driver destructures the five bindings it needs.
+        // `first_moment_dtype="bf16"`: read by the state allocation (bf16 `m`
+        // buffers); the fused kernels pick their variant from the buffers'
+        // dtype at run time.
+        self.features.first_moment_bf16 = first_moment_bf16;
         let OptimizerState {
             num_state_buffers,
             muon_state_m_codes,

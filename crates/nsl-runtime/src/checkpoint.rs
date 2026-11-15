@@ -823,10 +823,12 @@ fn read_moment_bytes(tensor_ptr: i64, which: &str, idx: usize, buf: &mut Vec<u8>
         std::process::abort();
     }
     let tensor = NslTensor::from_ptr(tensor_ptr);
-    if tensor.dtype != 1 {
+    // f32 moments, or a bf16 first moment (`first_moment_dtype="bf16"`), which
+    // is serialized as its bf16 bytes and named "bf16" in the header.
+    if !(tensor.dtype == DTYPE_F32 || (which == "m" && tensor.dtype == DTYPE_BF16)) {
         crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_save: {which}[{idx}] has dtype {} — only \
-             plain f32 moments are checkpointable (CPDT moment precision is \
-             refused at compile time)",
+             f32 moments and a bf16 first moment are checkpointable (CPDT moment \
+             precision is refused at compile time)",
             tensor.dtype
         );
         std::process::abort();
@@ -968,8 +970,12 @@ pub extern "C" fn nsl_train_checkpoint_save(
             }
             .to_str()
             .unwrap_or("?");
+            // The moment's own dtype: "f32", or "bf16" for a first moment
+            // kept in bf16 (`first_moment_dtype="bf16"`). `read_moment_bytes`
+            // refuses anything else before the data is written.
+            let dtype = checkpoint_dtype_name(tensor.dtype);
             params_json.push(format!(
-                r#"{{"name":"{prefix}:{name}","shape":{shape:?},"dtype":"f32","offset":{data_offset},"nbytes":{nbytes}}}"#,
+                r#"{{"name":"{prefix}:{name}","shape":{shape:?},"dtype":"{dtype}","offset":{data_offset},"nbytes":{nbytes}}}"#,
             ));
             data_offset += nbytes;
         }
@@ -1563,11 +1569,29 @@ pub extern "C" fn nsl_train_checkpoint_load(
                 );
                 std::process::abort();
             }
-            if tensor.dtype != DTYPE_F32 || e.dtype != "f32" {
+            // The first moment may be bf16 (`first_moment_dtype="bf16"`); it
+            // must be the SAME dtype on both sides. A conversion is refused
+            // rather than performed: f32 -> bf16 would round the saved moments
+            // and bf16 -> f32 would resume a different optimizer than the one
+            // that wrote them, and the execution fingerprint's `m1` key refuses
+            // that change too. Re-run with the optimizer argument the
+            // checkpoint was trained with.
+            let live_dtype = checkpoint_dtype_name(tensor.dtype);
+            let restorable = tensor.dtype == DTYPE_F32 || (which == "m" && tensor.dtype == DTYPE_BF16);
+            if !restorable || e.dtype != live_dtype {
+                let hint = if which == "m" && (e.dtype == "bf16" || live_dtype == "bf16") {
+                    format!(
+                        " — the first moment was stored as {} when the checkpoint was \
+                         written and is {live_dtype} in this program: the optimizer's \
+                         first_moment_dtype changed. Resume with first_moment_dtype=\"{}\"",
+                        e.dtype, e.dtype
+                    )
+                } else {
+                    " — only f32 moments and a bf16 first moment are restorable".to_string()
+                };
                 crate::nsl_log!(ERROR, "nsl", "nsl: train_checkpoint_load: {which}[{i}] is {} in the \
-                     sidecar and {} live — only plain f32 moments are restorable",
-                    e.dtype,
-                    checkpoint_dtype_name(tensor.dtype)
+                     sidecar and {live_dtype} live{hint}",
+                    e.dtype
                 );
                 std::process::abort();
             }
