@@ -33,6 +33,7 @@
 //! its fold, so ptxas unrolls the fold as it does the hand kernels'.
 
 use super::elementwise::{f32_ptr, verified_ptx};
+use super::storage::{load_as_f32, store_from_f32, variant_name, Storage};
 use crate::kernel_ir::{
     AddressSpace, BlockId, CmpOp, ConstValue, KernelIR, KirBuilder, KirConst, KirEdge, KirOp, KirTerminator, KirType,
     SmemLayout, SmemRegion, VarId,
@@ -43,7 +44,7 @@ use crate::kernel_ir::{
 pub const NORM_BLOCK: u32 = 256;
 
 /// Which kernel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NormOp {
     /// `out = ((x - mean) · rsqrt(var + eps)) · gamma + beta`.
     LayerNorm,
@@ -238,12 +239,20 @@ fn inv_std(b: &mut KirBuilder, total: VarId, cols: VarId, eps: VarId) -> VarId {
 ///            o[k] = (in[k] · inv) · gamma[k]
 /// ```
 pub fn build(op: NormOp) -> KernelIR {
+    build_st(op, Storage::F32, Storage::F32)
+}
+
+/// [`build`] with the input rows and the output stored as given (`gamma`
+/// and `beta` stay f32). Statistics and normalisation are f32; a bf16 output
+/// is rounded once, on its store. Bf16 activation storage writes the norm
+/// output (a GEMM operand) as bf16 from the f32 residual stream.
+pub fn build_st(op: NormOp, input: Storage, output: Storage) -> KernelIR {
     use AddressSpace::{Global, Shared};
     use KirType::{F32, U32, U64};
     let names = op.params();
-    let mut b = KirBuilder::new(op.kernel_name());
-    let inp = b.add_param(names[0], f32_ptr(), Global);
-    let out = b.add_param(names[1], f32_ptr(), Global);
+    let mut b = KirBuilder::new(&variant_name(op.kernel_name(), &[input], output));
+    let inp = b.add_param(names[0], input.ptr(), Global);
+    let out = b.add_param(names[1], output.ptr(), Global);
     let gamma = b.add_param(names[2], f32_ptr(), Global);
     let beta = (op == NormOp::LayerNorm).then(|| b.add_param(names[3], f32_ptr(), Global));
     let at = names.len() - 3;
@@ -275,10 +284,21 @@ pub fn build(op: NormOp) -> KernelIR {
     let tid = var(&mut b, U64);
     b.emit(KirOp::Cast(tid, tid32, U64));
     let base = op2(&mut b, U64, KirOp::Mul, row, cols);
-    let in_row = var(&mut b, f32_ptr());
+    let in_row = var(&mut b, input.ptr());
     b.emit(KirOp::PtrOffset(in_row, inp, base));
-    let out_row = var(&mut b, f32_ptr());
+    let out_row = var(&mut b, output.ptr());
     b.emit(KirOp::PtrOffset(out_row, out, base));
+    // The row loads and the output store through the operand storages: the
+    // f32 forms are `load_at` / `store_at` themselves (the same op sequence),
+    // so the f32 kernel's bytes do not move.
+    let load_x = move |b: &mut KirBuilder, k: VarId| match input {
+        Storage::F32 => load_at(b, Global, in_row, k),
+        Storage::Bf16 => load_as_f32(b, in_row, k, Storage::Bf16),
+    };
+    let store_y = move |b: &mut KirBuilder, k: VarId, y: VarId| match output {
+        Storage::F32 => store_at(b, Global, out_row, k, y),
+        Storage::Bf16 => store_from_f32(b, out_row, k, y, Storage::Bf16),
+    };
     let sm: Vec<VarId> = (0..op.regions().len() as u32)
         .map(|region| {
             let p = var(&mut b, KirType::Ptr(Box::new(F32), Shared));
@@ -291,14 +311,14 @@ pub fn build(op: NormOp) -> KernelIR {
     match op {
         NormOp::LayerNorm => {
             let s = column_loop(&mut b, tid, cols, Some(zero), |b, k, acc| {
-                let x = load_at(b, Global, in_row, k);
+                let x = load_x(b, k);
                 Some(op2(b, F32, KirOp::AddRn, acc.expect("acc"), x))
             })
             .expect("acc");
             let mean = block_sum(&mut b, sm[0], tid32, s, |b, total| per_column(b, total, cols));
             let zero = konst(&mut b, F32, ConstValue::F32(0.0));
             let q = column_loop(&mut b, tid, cols, Some(zero), |b, k, acc| {
-                let x = load_at(b, Global, in_row, k);
+                let x = load_x(b, k);
                 let d = op2(b, F32, KirOp::SubRn, x, mean);
                 let sq = op2(b, F32, KirOp::MulRn, d, d);
                 Some(op2(b, F32, KirOp::AddRn, acc.expect("acc"), sq))
@@ -307,31 +327,31 @@ pub fn build(op: NormOp) -> KernelIR {
             let inv = block_sum(&mut b, sm[1], tid32, q, |b, total| inv_std(b, total, cols, eps));
             let beta = beta.expect("LayerNorm has beta");
             column_loop(&mut b, tid, cols, None, |b, k, _| {
-                let x = load_at(b, Global, in_row, k);
+                let x = load_x(b, k);
                 let d = op2(b, F32, KirOp::SubRn, x, mean);
                 let n = op2(b, F32, KirOp::MulRn, d, inv);
                 let g = load_at(b, Global, gamma, k);
                 let scaled = op2(b, F32, KirOp::MulRn, n, g);
                 let bt = load_at(b, Global, beta, k);
                 let y = op2(b, F32, KirOp::AddRn, scaled, bt);
-                store_at(b, Global, out_row, k, y);
+                store_y(b, k, y);
                 None
             });
         }
         NormOp::RmsNorm => {
             let q = column_loop(&mut b, tid, cols, Some(zero), |b, k, acc| {
-                let x = load_at(b, Global, in_row, k);
+                let x = load_x(b, k);
                 let sq = op2(b, F32, KirOp::MulRn, x, x);
                 Some(op2(b, F32, KirOp::AddRn, acc.expect("acc"), sq))
             })
             .expect("acc");
             let inv = block_sum(&mut b, sm[0], tid32, q, |b, total| inv_std(b, total, cols, eps));
             column_loop(&mut b, tid, cols, None, |b, k, _| {
-                let x = load_at(b, Global, in_row, k);
+                let x = load_x(b, k);
                 let n = op2(b, F32, KirOp::MulRn, x, inv);
                 let g = load_at(b, Global, gamma, k);
                 let y = op2(b, F32, KirOp::MulRn, n, g);
-                store_at(b, Global, out_row, k, y);
+                store_y(b, k, y);
                 None
             });
         }
@@ -352,6 +372,11 @@ pub fn build(op: NormOp) -> KernelIR {
 /// If the built kernel fails verification: a bug in this module.
 pub fn ptx(op: NormOp) -> Vec<u8> {
     verified_ptx(build(op))
+}
+
+/// [`build_st`] lowered to a NUL-terminated PTX module.
+pub fn ptx_st(op: NormOp, input: Storage, output: Storage) -> Vec<u8> {
+    verified_ptx(build_st(op, input, output))
 }
 
 #[cfg(test)]

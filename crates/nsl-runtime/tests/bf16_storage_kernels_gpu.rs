@@ -36,6 +36,7 @@ unsafe extern "C" {
     fn nsl_tensor_swiglu_gate_backward_dt(grad: i64, up: i64, input: i64, out_dtype: i64) -> i64;
     fn nsl_tensor_rotate_half_dt(a: i64, neg: i64, out_dtype: i64) -> i64;
     fn nsl_storage_dt_fallback_count() -> i64;
+    fn nsl_tensor_rmsnorm_dt(x: i64, gamma: i64, eps: f64, out_dtype: i64) -> i64;
 }
 
 const F32: i64 = 1;
@@ -368,5 +369,50 @@ fn the_fallback_is_counted_and_computes_the_same_values() {
     bracket("mul fallback bf16 x host bf16 -> bf16", &out, &want, &err, BF16);
     for t in [a, b, b_host, c] {
         unsafe { nsl_tensor_free(t) };
+    }
+}
+
+/// RMSNorm `y = x * rsqrt(mean(x^2) + eps) * gamma` from an f32 residual
+/// stream (and from bf16) to bf16 (and f32).
+///
+/// The kernel: each of 256 threads sums the squares of its columns
+/// (`mul.rn`, `add.rn`, `cols / 256` terms), thread 0 folds the 256 partials
+/// in order, `div.approx` by `cols` (2 ulp), `add.rn` eps, `rsqrt.approx`
+/// (2^-22.9 relative, PTX ISA §9.7.3), then `x *rn inv *rn gamma`. With the
+/// summation depth d = ceil(cols / 256) + 256, the sum of squares is within
+/// (d + 1) * 2^-24 of exact (relative; all terms are non-negative), so
+/// rel(inv) <= ((d + 1) * 2^-24 + 2^-22 + 2^-24) / 2 + 2^-22.9 and
+/// rel(y) <= rel(inv) + 2 * 2^-24.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn rmsnorm_rounds_once_to_the_requested_dtype() {
+    init();
+    for cols in [2048usize, 1300] {
+        let rows = 5usize;
+        let dims = [rows as i64, cols as i64];
+        let x_vals = values(rows * cols, 10 + cols as u64, -2.0, 1.0);
+        let g_vals: Vec<f64> = (0..cols).map(|j| 0.5 + (j % 97) as f64 / 97.0).collect();
+        let eps = 1e-5;
+        let depth = cols.div_ceil(256) as f64 + 256.0;
+        let rel_inv = ((depth + 1.0) * U + 4.0 * U + U) / 2.0 + 2f64.powf(-22.9);
+        let rel_y = rel_inv + 2.0 * U;
+        for (din, dout) in [(F32, BF16), (BF16, BF16), (F32, F32)] {
+            let (x, xv) = upload(&x_vals, &dims, din);
+            let (g, gv) = upload(&g_vals, &[cols as i64], F32);
+            let c = no_fallback(|| unsafe { nsl_tensor_rmsnorm_dt(x, g, eps, dout) });
+            let out = download(c, dout);
+            let mut want = Vec::with_capacity(rows * cols);
+            for r in 0..rows {
+                let row = &xv[r * cols..(r + 1) * cols];
+                let ms: f64 = row.iter().map(|v| v * v).sum::<f64>() / cols as f64;
+                let inv = 1.0 / (ms + eps).sqrt();
+                want.extend(row.iter().zip(&gv).map(|(v, gm)| v * inv * gm));
+            }
+            let err: Vec<f64> = want.iter().map(|y| rel_y * y.abs()).collect();
+            bracket(&format!("rmsnorm cols={cols} {din}->{dout}"), &out, &want, &err, dout);
+            for t in [x, g, c] {
+                unsafe { nsl_tensor_free(t) };
+            }
+        }
     }
 }

@@ -11,6 +11,7 @@ use nsl_kir::kernels::elementwise::{
     backward_ptx_st, binary_ptx_st, rotate_half_ptx_st, scalar_ptx_st, unary_ptx_st, BackwardOp, BinaryOp,
     RotateHalfOp, ScalarOp, UnaryOp,
 };
+use nsl_kir::kernels::norm::{ptx_st as norm_ptx_st, NormOp};
 use nsl_kir::kernels::storage::{variant_name, Storage};
 
 fn find_ptxas() -> Option<String> {
@@ -75,6 +76,9 @@ fn instantiations() -> Vec<(String, String, Vec<Storage>, Storage)> {
             for op in RotateHalfOp::ALL {
                 out.push((variant_name(op.kernel_name(), &[i], o), text(rotate_half_ptx_st(op, i, o)), vec![i], o));
             }
+            for op in NormOp::ALL {
+                out.push((variant_name(op.kernel_name(), &[i], o), text(norm_ptx_st(op, i, o)), vec![i], o));
+            }
         }
     }
     for op in BackwardOp::ALL {
@@ -95,8 +99,9 @@ fn every_bf16_instantiation_is_named_typed_and_assembles() {
     }
     let all = instantiations();
     // binary 4 ops x 7 storage triples, scalar 4 x 3, unary 12 x 3,
-    // rotate_half 2 x 3, backward 8 x 2 (all-bf16 inputs, either output).
-    assert_eq!(all.len(), 4 * 7 + 4 * 3 + 12 * 3 + 2 * 3 + 8 * 2, "instantiation count");
+    // rotate_half 2 x 3, norm 2 x 3, backward 8 x 2 (all-bf16 inputs, either
+    // output).
+    assert_eq!(all.len(), 4 * 7 + 4 * 3 + 12 * 3 + 2 * 3 + 2 * 3 + 8 * 2, "instantiation count");
     let mut failures = Vec::new();
     for (name, ptx, ins, out) in &all {
         assert!(ptx.contains(&format!(".visible .entry {name}(")), "{name}: entry not found:\n{ptx}");

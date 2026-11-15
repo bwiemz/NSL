@@ -438,6 +438,7 @@ crates/nsl-runtime/tests/bf16_storage_kernels_gpu.rs	unary_ops_round_once_to_the
 crates/nsl-runtime/tests/bf16_storage_kernels_gpu.rs	swiglu_gate_backward_rounds_once_at_gradient_magnitudes	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/bf16_storage_kernels_gpu.rs	rotate_half_is_exact_or_rounds_once	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/bf16_storage_kernels_gpu.rs	the_fallback_is_counted_and_computes_the_same_values	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/bf16_storage_kernels_gpu.rs	rmsnorm_rounds_once_to_the_requested_dtype	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/dlpack_unsupported_dtype_refusal.rs	zz_dlpack_refusal_child	helper	child process — driven by the gates below via re-exec
 crates/nsl-runtime/tests/embedding_iota_positions_gpu.rs	repeat_arange_gather_uploads_nothing	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/embedding_iota_positions_gpu.rs	longer_prefixes_grow_the_device_positions	gpu	requires CUDA GPU

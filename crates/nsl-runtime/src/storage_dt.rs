@@ -244,6 +244,35 @@ pub extern "C" fn nsl_tensor_rotate_half_dt(a: i64, neg: i64, out_dtype: i64) ->
     narrowed(r, tag)
 }
 
+/// RMSNorm over the last dimension with the output in `out_dtype`: `x` f32 or
+/// bf16, `gamma` f32. Statistics are f32 and a bf16 output is rounded once:
+/// the norm output that bf16 activation storage hands to the GEMMs.
+#[unsafe(no_mangle)]
+pub extern "C" fn nsl_tensor_rmsnorm_dt(x: i64, gamma: i64, eps: f64, out_dtype: i64) -> i64 {
+    const NAME: &str = "nsl_tensor_rmsnorm_dt";
+    refuse_tape(NAME);
+    let tag = out_tag(NAME, out_dtype);
+    let tx = check_operand(NAME, x);
+    let tg = NslTensor::from_ptr_ref(gamma);
+    let cols = if tx.ndim == 0 { 0 } else { unsafe { *tx.shape.add(tx.ndim as usize - 1) } };
+    #[cfg(feature = "cuda")]
+    if fast_path(&[tx])
+        && tg.dtype == DTYPE_F32
+        && tg.device == tx.device
+        && tg.is_contiguous()
+        && cols > 0
+        && tg.len == cols
+    {
+        return crate::cuda::storage_kernels::rmsnorm(x, gamma, eps as f32, storage(tag));
+    }
+    let _ = (tg, cols);
+    announce_fallback(NAME);
+    let wx = widened(x);
+    let r = crate::tensor::nsl_tensor_rmsnorm(wx, gamma, eps);
+    crate::tensor::nsl_tensor_free(wx);
+    narrowed(r, tag)
+}
+
 #[cfg(feature = "cuda")]
 fn storage(tag: u16) -> nsl_kir::kernels::storage::Storage {
     if tag == DTYPE_BF16 { nsl_kir::kernels::storage::Storage::Bf16 } else { nsl_kir::kernels::storage::Storage::F32 }

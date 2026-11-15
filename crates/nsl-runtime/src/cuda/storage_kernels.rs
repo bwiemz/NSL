@@ -17,6 +17,7 @@ use std::ffi::c_void;
 use std::sync::Mutex;
 
 use nsl_kir::kernels::elementwise::{BackwardOp, BinaryOp, RotateHalfOp, UnaryOp};
+use nsl_kir::kernels::norm::NormOp;
 use nsl_kir::kernels::storage::Storage;
 
 use crate::tensor::{NslTensor, DTYPE_BF16, DTYPE_F32};
@@ -28,6 +29,7 @@ enum Kernel {
     Unary(UnaryOp, Storage, Storage),
     SwigluGate([Storage; 3], Storage),
     RotateHalf(RotateHalfOp, Storage, Storage),
+    Norm(NormOp, Storage, Storage),
 }
 
 /// The NUL-terminated PTX module and entry name of `k`, lowered once and kept
@@ -44,6 +46,7 @@ fn module(k: Kernel) -> (&'static str, &'static str) {
             Kernel::Unary(op, i, out) => ew::build_unary_st(op, i, out),
             Kernel::SwigluGate(ins, out) => ew::build_backward_st(BackwardOp::SwigluGate, &ins, out),
             Kernel::RotateHalf(op, i, out) => ew::build_rotate_half_st(op, i, out),
+            Kernel::Norm(op, i, out) => nsl_kir::kernels::norm::build_st(op, i, out),
         };
         let name: &'static str = Box::leak(format!("{}\0", ir.name).into_boxed_str());
         if let Err(errors) = nsl_kir::kir_verify::verify(&ir) {
@@ -89,11 +92,16 @@ fn data(ptr: i64) -> u64 {
 /// `u64` or `f32` stored in a `u64` slot as the kernel's parameter list
 /// says). Fatal on a launch error: the output would be garbage.
 fn launch(k: Kernel, n: usize, args: &mut [u64]) {
+    let block = 256i64;
+    launch_grid(k, (n as i64 + block - 1) / block, 0, args);
+}
+
+/// `launch` with an explicit grid and shared-memory size (256-thread blocks).
+fn launch_grid(k: Kernel, grid: i64, shared: u32, args: &mut [u64]) {
     let (ptx, name) = module(k);
     let ptrs: Vec<*mut c_void> = args.iter_mut().map(|a| a as *mut u64 as *mut c_void).collect();
     let block = 256i64;
-    let grid = (n as i64 + block - 1) / block;
-    let rc = super::inner::kernel_launch(ptx.as_ptr(), name.as_ptr(), [grid, 1, 1], [block, 1, 1], &ptrs, 0);
+    let rc = super::inner::kernel_launch(ptx.as_ptr(), name.as_ptr(), [grid, 1, 1], [block, 1, 1], &ptrs, shared);
     if rc as u32 != 0 {
         crate::fatal::die(
             crate::fatal::Fatal::Unsupported,
@@ -148,5 +156,20 @@ pub(crate) fn rotate_half(op: RotateHalfOp, a: i64, out: Storage) -> i64 {
     let c = alloc_like(ta, out);
     let n = ta.len as usize;
     launch(k, n, &mut [data(a), data(c), n as u64, last as u64, (last / 2) as u64]);
+    c
+}
+
+/// RMSNorm over the last dimension, one 256-thread block per row, as
+/// `gpu_rmsnorm_f32` launches the f32 kernel. `x` contiguous (f32 or bf16),
+/// `gamma` a contiguous f32 vector of the last dimension's length.
+pub(crate) fn rmsnorm(x: i64, gamma: i64, eps: f32, out: Storage) -> i64 {
+    super::inner::set_oom_context("rmsnorm_dt");
+    let tx = NslTensor::from_ptr_ref(x);
+    let cols = unsafe { *tx.shape.add(tx.ndim as usize - 1) } as u64;
+    let rows = tx.len as u64 / cols;
+    let k = Kernel::Norm(NormOp::RmsNorm, storage_of(tx), out);
+    let c = alloc_like(tx, out);
+    // The kernel's eps is an `.f32` parameter: its bits in the slot's low half.
+    launch_grid(k, rows as i64, 256 * 4, &mut [data(x), data(c), data(gamma), rows, cols, u64::from(eps.to_bits())]);
     c
 }
