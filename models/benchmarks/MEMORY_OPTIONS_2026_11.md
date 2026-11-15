@@ -5,7 +5,8 @@ Every memory option NSL ships, applied one at a time on top of the production fl
 --fuse-wgrad-accum`), measured with `tools/perfcheck` at Coder-1B (2 x 2048, accumulation 4)
 and Coder-500M (2 x 1024, accumulation 8) in both matmul postures, checked for numerics at
 Coder-50M, and given a verdict. The measurements were taken with no change to the compiler
-or runtime; the flag changes that followed from them are listed at the end.
+or runtime; the changes that followed from them, including a new option measured the same way
+(`first_moment_dtype="bf16"`), are in [Changes made after the measurements](#changes-made-after-the-measurements).
 
 Toolchain: one frozen build (compiler, CUDA runtime archive, stdlib) of `perf/memory-audit`
 at 7687d576 (`perf/round-1`: `main` plus cublasLt GEMM selection and the tensor-core
@@ -26,7 +27,7 @@ measuring machine.
 | `--checkpoint-stride 2` | **+0.63** / +0.55 | 1.014 | -0.12, 1.019 | bit-exact | **retire** for selective recipes |
 | `--optim-state-offload` (needs dropping `--fuse-wgrad-accum`) | **-11.84 / -11.90** (14.68 / 15.90) | 0.423 (0.596 vs the same drop without offload) | -5.97 (6.75 alloc, 8.00 driver), 0.477 | bit-exact | **keep** as the small-card escape hatch; **fix** its composition (m_partial) |
 | `--cuda-graphs` | -1.80 (it switches the cast cache off) | 0.895 | 0, 0.842 | bit-exact | **retire** (or fix, see below) |
-| `--wggo-moment-precision` | none: byte-identical binary | - | none | - | **fix** (inert) |
+| `--wggo-moment-precision` | none: byte-identical binary | - | none | - | **fix** (inert; now a compile error where inert) |
 | `--wggo-memory-budget` (the only way to get bf16 m) | refused at compile time on every recipe | - | refused | - | **fix** |
 | `--wggo greedy` (what the two above need) | 0 | **0.824** | 0, 0.885 | - | **fix** (not memory: costs 12-18%) |
 | `--layerwise-accum` (needs no clip, no `--fuse-wgrad-accum`) | OOM at 1B | - | **+9.97 GiB** vs its control (22.68), 0.965 vs control | bit-exact | **fix** (D1) |
@@ -36,9 +37,12 @@ measuring machine.
 | `--param-dtype bf16-sr` (needs `--weight-stream`) | +2.10 / +2.26 (weights 4.02 -> 2.43 GiB) | 0.611 (0.933 vs control) | +9.15, 0.687 | held-out loss = f32 params (mean diff +0.000, 3 seeds) | **fix** (decouple from streaming) |
 | `--zero-stage 1` (one GPU, needs no clip) | 0 | 1.006 | 0, 1.003 | bit-exact | **retire** for one GPU |
 | `NSL_ASYNC_ALLOC=1` | driver **+1.18** | 0.984 | driver +0.35, 0.974 | bit-exact | **retire** |
+| `first_moment_dtype="bf16"` (AdamW argument, added after the audit) | **-2.00 / -2.00** (24.52 / 25.79) | 1.004 | -0.96, 1.001 | held-out loss: pre-registered test passed (5 seeds) | **keep**; candidate default (see the end) |
 
-No option qualifies for **default**: every saving costs speed, and the large ones cost
-5-60%. The two most useful facts for the recipes:
+No option measured in the audit qualifies for **default**: every saving costs speed, and the
+large ones cost 5-60%. The one added after it, `first_moment_dtype="bf16"`, costs no speed; it is
+a default candidate once a longer convergence run than the 50M one supports it. The two most
+useful facts for the recipes:
 
 * Dropping `--checkpoint-selective` takes the 1B recipe from 27.79 to **22.48 GiB driver**,
   the same as PyTorch bf16 + `torch.compile` (22.25), for 10% speed, bit-exactly.
@@ -256,7 +260,8 @@ is unknown: the reduced-precision envelope also takes the step off the fused Ada
 (`stmt_fase.rs`, `fused_scalars` requires `!wrap_precision`). Verdict: **fix**, with a direct
 switch and a fused kernel for bf16 m, or the WGGO sizing fix.
 
-**`--wggo greedy`** (the plan the two flags above need; also part of `--pretrain-optimized`).
+**`--wggo greedy`** (the plan the two flags above need; part of `--pretrain-optimized` until
+the bundle was redefined, see the end).
 It changes no memory and costs 18% at 1B bf16 and 11.5% at 500M TF32. The plan takes the
 optimizer step off the single batched multi-tensor AdamW launch. Diffing the call lists of the
 two binaries: `nsl_fase_fused_adamw_step_multi` and `nsl_fase_sum_sq_list` are replaced by
@@ -420,7 +425,8 @@ transients. In the order I would build them, with estimated savings at 1B:
    cache, because the parameter is the image. No PCIe cost, and fewer casts. Its numerics are
    already measured above (no difference at 50M).
 3. **A reachable bf16 first moment** (a direct switch plus a fused AdamW kernel reading and
-   writing bf16 m; or fix WGGO's sizing): -2.0 GiB.
+   writing bf16 m; or fix WGGO's sizing): -2.0 GiB. Done: `first_moment_dtype="bf16"`, measured
+   at the end.
 4. **D1**: the per-segment early-free in the CSLA and weight-stream forwards. Then CSLA can drop
    `m_partial` (-3.4 GiB, but no clip) and streaming can drop the layer weights (-3.4 GiB, PCIe).
 5. **Offload with a device-resident `m_partial`**, so `--fuse-wgrad-accum` composes: -8 GiB for
@@ -448,7 +454,8 @@ and offload (8-12 GiB) then remain as stated trade-offs for smaller cards.
   `perfcheck.py build --size 1b --arms nsl_bf16_moment` (refused); `nsl build` of the
   production program with and without `--wggo-moment-precision`, then `cmp` of the binaries.
 * **D4**: `--wggo greedy` costs 12-18% by unbatching the optimizer step (call-list diff above).
-  `--pretrain-optimized` includes it.
+  `--pretrain-optimized` includes it. (The bundle no longer does; D3's inert case is now a
+  compile error. See the end.)
 * **D5**: `--stream-arena` gathers host mirrors through a single-threaded `memcpy` per upload,
   making it 0.83x of per-parameter streaming.
 * **D6**: `--checkpoint-compress` keeps the 16 outputs per micro-batch the backward never reads,
@@ -462,6 +469,81 @@ and offload (8-12 GiB) then remain as stated trade-offs for smaller cards.
   at 500M TF32 and 1.40x at 500M bf16 (paired `P` / `nowgrad`; doc and recipe header: "+11.5%"). The recipe header's `--cuda-graphs`
   "+0.8%" predates the GEMM tune. The CLI help says `--weight-stream` holds a parameter's device
   buffer only inside its brackets, but by default on this card it streams nothing.
+
+## Changes made after the measurements
+
+Three commits on `perf/memory-audit` act on the verdicts above:
+
+1. **Corrected claims.** This document; the `--fuse-wgrad-accum`, `--cuda-graphs`, offload and
+   checkpointing figures in the recipe headers and CLI help; the `--weight-stream` help (it
+   holds parameters on the device whenever its residency policy decides they fit); measured
+   costs in the help of `--cuda-graphs`, the streaming sub-options, `--optim-state-offload` and
+   `NSL_ASYNC_ALLOC`.
+2. **Flags that say what they do.** `--wggo-moment-precision` on a train block where WGGO
+   decides no reduced-precision moment (every recipe: no sensitivity data, no budget) is a
+   compile error that names `first_moment_dtype="bf16"`, so it can no longer be reported as
+   witnessed (D3, first half). `--pretrain-optimized` is now `P` plus `--fuse-lm-head auto`;
+   `--wggo greedy` and `--csha auto` left it, and `--wggo`'s help states its cost (D4).
+   `--zero-stage` with one device warns at compile time that it shards nothing.
+3. **A reachable bf16 first moment**, below.
+
+### `first_moment_dtype="bf16"`
+
+`optimizer: AdamW(..., first_moment_dtype="bf16")` (also `Adam`; the default is `"f32"`; every
+other optimizer refuses the argument). The first moment `m` is stored bf16 between steps,
+rounded to nearest even on store; the update reads it widened and does its arithmetic in f32,
+and `θ'` is computed from the f32 `m'`, not the rounded one. `v`, the f32 master weights and the
+gradient accumulator are unchanged. It lives in the fused AdamW step: two KIR kernels
+(`nsl_fase_fused_adamw_multi_f32_mbf16` and the per-parameter
+`nsl_fase_fused_adamw_step_f32_mbf16`, `crates/nsl-kir/src/kernels/optim.rs`) chosen by `m`'s
+dtype, which is also part of the multi-tensor launch's bucket key. So it needs the
+FASE-Deferred plan (`grad_accumulation >= 2`). Every composition that would hand the bf16
+buffer to f32 arithmetic is a compile error: no deferred plan, `--training-reference`,
+`NSL_FASE_FUSED_STEP=0`, `--optim-state-offload`, `--layerwise-accum`, `--zero-stage`,
+`--param-dtype bf16-sr`, WGGO/CPDT moment precision or per-layer plans, `@pipeline`. A
+checkpoint's sidecar names each moment's dtype and the execution fingerprint carries `m1=bf16`.
+A resume across a change of the argument is refused in both directions rather than converted:
+f32 -> bf16 would round the saved moments, and bf16 -> f32 would continue a different optimizer
+from the one that wrote them.
+
+Measured with a toolchain frozen at the commit that adds the perfcheck arm (b5a3cf65):
+`nsl_<prec>_m1bf16` (`P` plus the argument) paired with `nsl_<prec>` in one job, 3 rounds,
+order alternating:
+
+| posture | `P` tok/s, median [range] | bf16 m, paired ratio | allocator GiB | reserved GiB | driver GiB | `m` at the peak |
+|---|---|---|---|---|---|---|
+| 1B, bf16 GEMMs (recipe) | 9,587 [9,576-9,778] | 1.004 [0.992-1.004] | 26.53 -> **24.52 (-2.00)** | 27.41 -> 25.41 | 27.79 -> **25.79 (-2.00)** | 4.00 -> 2.00 |
+| 1B, TF32 | 7,222 [7,218-7,237] | 1.001 [0.994-1.004] | 24.63 -> 22.63 (-2.00) | 25.48 -> 23.48 | 25.87 -> 23.87 (-2.00) | 4.00 -> 2.00 |
+| 500M, TF32 (recipe) | 12,710 [12,708-12,720] | 1.001 [0.987-1.004] | 12.72 -> 11.76 (-0.96) | 14.05 -> 12.93 | 14.44 -> 13.31 (-1.12) | 2.06 -> 1.10 |
+| 500M, bf16 GEMMs | 15,519 [15,507-15,571] | 1.003 [1.001-1.003] | 13.70 -> 12.74 (-0.96) | 14.79 -> 13.61 | 15.17 -> 13.99 (-1.18) | 2.06 -> 1.10 |
+
+The saving is the predicted half of `m` (at 500M, 1.10 rather than 1.03 GiB remain: the 2 MiB
+block rounding, D8, is a larger share of the smaller buffers). Speed does not move: every ratio's
+range spans 1.0. The production arms reproduce the audit's numbers (identical memory; 1B bf16
+9,587 against 9,626 tok/s).
+
+Convergence, Coder-50M, held-out loss after 2,000 updates (the setup of the training comparisons
+above: `P`, bf16 GEMMs, clip 1.0), `first_moment_dtype` f32 against bf16 with the same seeds and
+data. The pass criterion was written down before any bf16 run: the mean paired difference must
+be within 2 standard errors of the paired differences AND within the f32 arm's range across
+seeds. A run that failed would have counted against its arm.
+
+| seed | 1 | 2 | 3 | 4 | 5 |
+|---|---|---|---|---|---|
+| f32 m | 6.1684 | 6.1637 | 6.1982 | 6.1140 | 6.1343 |
+| bf16 m | 6.1398 | 6.2001 | 6.2032 | 6.1141 | 6.1618 |
+| difference | -0.0285 | +0.0363 | +0.0050 | +0.0001 | +0.0275 |
+
+Mean difference +0.0081, standard error 0.0114 (2 SE = 0.0228), f32 range 0.0842: **pass** on
+both conditions. Its resolution is limited: the 95% interval of the mean difference is -0.023 to
++0.040 (t with 4 degrees of freedom), so an effect smaller than about 0.04 in held-out loss is
+not excluded. Part of the spread is production mode's run-to-run nondeterminism (D7), which a
+fixed seed does not remove. Both arms' 50M peaks confirm the argument took effect (1,489,061,888
+-> 1,375,798,272 bytes, -108 MiB for 49.8 M parameters).
+
+Verdict: **keep**. It is 2 GiB at 1B for no speed, and passed the 50M test. Making it the
+default would change every existing recipe's arithmetic and its checkpoint fingerprint. That
+wants a longer run at 500M or 1B first, because the 50M test cannot see an effect under 0.04.
 
 ## Reproduce
 
@@ -494,7 +576,9 @@ NSL_CCR_SEGMENT_FREE=0 NSL_MATMUL_BF16=1 DIR/bin/nsl build --source-ad --checkpo
 ```
 
 The weight-stream arms run with `NSL_WS_COUNTER=1`, which prints the residency decision and the
-transfer counters at exit. The 50M training comparisons are `train(...)` blocks with the 50M
+transfer counters at exit. The first-moment arms are `nsl_<tf32|bf16>_m1bf16` (perfcheck
+`OPTIM_ARMS`: the argument is part of the generated program, so of the build key), run as
+`--arms nsl_bf16@m1,nsl_bf16_m1bf16@m1 --toolchain m1=DIR`. The 50M training comparisons are `train(...)` blocks with the 50M
 model (dropout 0), `DataLoader(batch_size=1, seq_len=1024, shuffle=false)` over the first
 2,000 x 4,096 tokens of the refcheck corpus (`tools/refcheck/make_corpus.py`), AdamW(lr 3e-4,
 weight decay 0.1, betas 0.9/0.95), `warmup_cosine(100, 2000, 3e-5)`, accumulation 4, then a
