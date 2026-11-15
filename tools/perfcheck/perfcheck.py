@@ -32,7 +32,9 @@ NSL_MATMUL_BF16=1 (read at build time; the runtime's banner is checked, and sinc
 binary under NSL_TC_ATTENTION=0 (the attention kernels before the tensor-core ones).
 `nsl_tf32_blocks`: PROD_FLAGS without `--checkpoint-selective` (full block recompute).
 `nsl_<tf32|bf16>_<suffix>` for each MEMORY_ARMS suffix: one memory option on top of
-PROD_FLAGS, or on the nearest flag set it accepts (see MEMORY_ARMS). `torch_<tf32|bf16>_<eager|compile>_
+PROD_FLAGS, or on the nearest flag set it accepts (see MEMORY_ARMS); likewise each
+OPTIM_ARMS suffix, an optimizer argument in the program instead of a flag
+(`nsl_bf16_m1bf16`: `first_moment_dtype="bf16"`). `torch_<tf32|bf16>_<eager|compile>_
 <none|blocks|sel>`: `torch_arm.py` with that precision, compilation and checkpointing.
 
 Timing: a step-limited program per arm (the token file holds exactly `--updates`
@@ -129,6 +131,13 @@ MEMORY_ARMS: dict[str, tuple[list[str], tuple[tuple[str, str], ...], bool]] = {
     "wsasync": ([*ARENA_FLAGS, "--stream-prefetch", "--stream-async-writeback"], WS_ALL, False),
     "srbf16": ([*WS_FLAGS, "--param-dtype", "bf16-sr"], WS_ENV, False),
     "zero1": ([*PROD_FLAGS, "--zero-stage", "1"], (), False),
+}
+# Memory options that are optimizer arguments rather than flags: (flags, the extra
+# AdamW arguments of the generated program) per arm suffix. A different program, so a
+# different build.
+OPTIM_ARMS: dict[str, tuple[list[str], str]] = {
+    # The first moment stored bf16 (rounded to nearest even; f32 arithmetic).
+    "m1bf16": (PROD_FLAGS, 'first_moment_dtype="bf16"'),
 }
 BF16_BANNER = "cuBLAS math mode: BF16"
 TF32_BANNER = "cuBLAS math mode: TF32"
@@ -228,14 +237,17 @@ class Arm:
     variant: str = ""
     # NSL: whether the generated train block keeps the recipe's grad_clip=1.0.
     grad_clip: bool = True
+    # NSL: extra arguments of the generated program's AdamW (see OPTIM_ARMS).
+    optim_args: str = ""
 
     @property
     def build_key(self) -> BuildKey:
-        return self.flags, self.build_env, self.variant, self.grad_clip
+        return self.flags, self.build_env, self.variant, self.grad_clip, self.optim_args
 
 
-# (flags, build environment, toolchain variant, grad_clip): one built binary per key.
-BuildKey = tuple[tuple[str, ...], tuple[tuple[str, str], ...], str, bool]
+# (flags, build environment, toolchain variant, grad_clip, AdamW arguments): one built
+# binary per key.
+BuildKey = tuple[tuple[str, ...], tuple[tuple[str, str], ...], str, bool, str]
 
 
 BF16 = (("NSL_MATMUL_BF16", "1"),)
@@ -274,6 +286,10 @@ def arm(name: str) -> Arm:
             nsl[f"nsl_{prec}_{suffix}"] = Arm(
                 name, "nsl", prec, tuple(flags), build_env, env, grad_clip=clip
             )
+        for suffix, (flags, optim_args) in OPTIM_ARMS.items():
+            nsl[f"nsl_{prec}_{suffix}"] = Arm(
+                name, "nsl", prec, tuple(flags), build_env, optim_args=optim_args
+            )
     if name in nsl:
         return nsl[name]
     m = re.fullmatch(r"torch_(tf32|bf16)_(eager|compile)_(none|blocks|sel)", name)
@@ -284,12 +300,14 @@ def arm(name: str) -> Arm:
 
 
 def flag_key(key: BuildKey) -> str:
-    flags, build_env, variant, grad_clip = key
+    flags, build_env, variant, grad_clip, optim_args = key
     tag = "_".join(f.removeprefix("--").replace("-", "") for f in flags)
     if build_env:
         tag += "__" + "_".join(f"{k.removeprefix('NSL_').lower()}{v}" for k, v in build_env)
     if not grad_clip:
         tag += "__noclip"
+    if optim_args:
+        tag += "__" + re.sub(r"[^a-z0-9]", "", optim_args.lower())
     if variant:
         tag += "@" + variant
     return "nsl_" + tag
@@ -342,7 +360,7 @@ print("LOSS_STREAM_BEGIN")
 
 @fused_lm_ce(enabled=true, vocab_size={vocab}, hidden_size={d_model}, batch_size={mb}, seq_len={seq})
 train(model=m, epochs=1, grad_accumulation={accum}, schedule_unit="optimizer_step"{clip}):
-    optimizer: AdamW(lr=0.0001, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
+    optimizer: AdamW(lr=0.0001, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8{optim})
     scheduler: warmup_cosine(warmup_steps=2, total_steps={updates}, min_lr=0.00003)
     step(batch):
         let logits = m.forward_train(batch.input_ids, true)
@@ -372,7 +390,9 @@ print("PERFCHECK_COMPLETE")
 """
 
 
-def program_text(shape: Shape, updates: int, tokens: Path, grad_clip: bool) -> str:
+def program_text(
+    shape: Shape, updates: int, tokens: Path, grad_clip: bool, optim_args: str = ""
+) -> str:
     """The generated training program for one shape and token file."""
     return TEMPLATE.format(
         updates=updates,
@@ -384,6 +404,7 @@ def program_text(shape: Shape, updates: int, tokens: Path, grad_clip: bool) -> s
         d_model=shape.d_model,
         rows=shape.micro_batch * shape.seq,
         clip=", grad_clip=1.0" if grad_clip else "",
+        optim=f", {optim_args}" if optim_args else "",
     )
 
 
@@ -419,7 +440,7 @@ def build_nsl(
     updates: int,
     phase: bool,
 ) -> Path:
-    flags, build_env, variant, grad_clip = key
+    flags, build_env, variant, grad_clip, optim_args = key
     nsl = tc.nsl
     d = work / flag_key(key)
     d.mkdir(parents=True, exist_ok=True)
@@ -427,7 +448,7 @@ def build_nsl(
         shutil.copyfile(REPO / "models" / shape.directory / f, d / f)
     tokens = tokens_file(work, shape, updates)
     src = d / "bench.nsl"
-    src.write_text(program_text(shape, updates, tokens, grad_clip))
+    src.write_text(program_text(shape, updates, tokens, grad_clip, optim_args))
     binary = d / ("prog_phase" if phase else "prog")
     env = nsl_env()
     env["NSL_STDLIB_PATH"] = str(tc.stdlib)
@@ -455,6 +476,7 @@ def build_nsl(
                 "flags": list(flags),
                 "build_env": dict(build_env),
                 "grad_clip": grad_clip,
+                "optim_args": optim_args,
                 "updates": updates,
                 "nsl": str(nsl),
                 "variant": variant,
@@ -646,6 +668,7 @@ def run_nsl_arm(
         "build_env": dict(a.build_env),
         "env": dict(a.env),
         "grad_clip": a.grad_clip,
+        "optim_args": a.optim_args,
         "round": rnd,
         "updates": updates,
         "warmup_updates": warmup,

@@ -253,7 +253,7 @@ class MemoryArms(unittest.TestCase):
     def test_arms_respect_the_compilers_composition_rules(self) -> None:
         rules = feature_rules()
         for prec in ("tf32", "bf16"):
-            for suffix in pc.MEMORY_ARMS:
+            for suffix in [*pc.MEMORY_ARMS, *pc.OPTIM_ARMS]:
                 a = pc.arm(f"nsl_{prec}_{suffix}")
                 flags = set(a.flags)
                 # A flag followed by a value (`--zero-stage 1`): its source rules are
@@ -305,6 +305,25 @@ class MemoryArms(unittest.TestCase):
         clip, noclip = pc.arm("nsl_bf16_nowgrad"), pc.arm("nsl_bf16_nowgrad_noclip")
         self.assertEqual(clip.flags, noclip.flags)
         self.assertNotEqual(pc.flag_key(clip.build_key), pc.flag_key(noclip.build_key))
+
+    def test_optimizer_arguments_are_part_of_the_build(self) -> None:
+        shape = pc.read_shape("1b", None, None, None)
+        base = pc.program_text(shape, 24, Path("/t.bin"), grad_clip=True)
+        m1 = pc.program_text(
+            shape, 24, Path("/t.bin"), grad_clip=True, optim_args='first_moment_dtype="bf16"'
+        )
+        adamw = "    optimizer: AdamW(lr=0.0001, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8"
+        self.assertIn(adamw + ")\n", base)
+        self.assertIn(adamw + ', first_moment_dtype="bf16")\n', m1)
+        # Only the optimizer line differs.
+        self.assertEqual(base.replace(adamw + ")", adamw + ', first_moment_dtype="bf16")'), m1)
+        a, prod = pc.arm("nsl_bf16_m1bf16"), pc.arm("nsl_bf16")
+        self.assertEqual((a.flags, a.build_env, a.env), (prod.flags, prod.build_env, prod.env))
+        self.assertEqual(a.optim_args, 'first_moment_dtype="bf16"')
+        self.assertEqual(
+            pc.flag_key(a.build_key), pc.flag_key(prod.build_key) + "__firstmomentdtypebf16"
+        )
+        self.assertEqual(pc.arm("nsl_tf32_m1bf16@mem").variant, "mem")
 
     def test_run_time_switches_share_the_binary(self) -> None:
         # NSL_WS_RESIDENT and NSL_ASYNC_ALLOC are read by the runtime: same build.
