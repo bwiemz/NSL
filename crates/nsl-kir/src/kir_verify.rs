@@ -749,8 +749,10 @@ pub fn op_dst(op: &KirOp) -> Option<VarId> {
         | KirOp::PtrOffset(d, _, _)
         | KirOp::SharedBase(d) => Some(*d),
         KirOp::SharedRegion { dst, .. } => Some(*dst),
+        KirOp::CvtPack { dst, .. } => Some(*dst),
         KirOp::Store(_, _, _)
         | KirOp::AtomicAdd(_, _, _)
+        | KirOp::AtomicMax(_, _, _)
         | KirOp::Barrier
         | KirOp::SharedMemFence
         | KirOp::CpAsync { .. }
@@ -817,8 +819,9 @@ pub fn op_uses(op: &KirOp) -> Vec<VarId> {
             v.extend(op_uses(op));
             v
         }
-        KirOp::Store(p, v, _) | KirOp::AtomicAdd(p, v, _) => vec![*p, *v],
+        KirOp::Store(p, v, _) | KirOp::AtomicAdd(p, v, _) | KirOp::AtomicMax(p, v, _) => vec![*p, *v],
         KirOp::CpAsync { dst, src, .. } => vec![*dst, *src],
+        KirOp::CvtPack { hi, lo, .. } => vec![*hi, *lo],
         KirOp::LdMatrix { addr, .. } => vec![*addr],
         KirOp::Mma { a, b, c, .. } => {
             let mut v = a.clone();
@@ -1116,6 +1119,26 @@ fn check_types(
             Some(found) => errors.push(KirVerifyError::NotAPointer { var: *p, block, op_index, found }),
             None => {}
         },
+        KirOp::AtomicMax(p, v, _) => {
+            match ty(p) {
+                Some(KirType::Ptr(pointee, _)) => expect(*v, "value", &pointee),
+                Some(found) => errors.push(KirVerifyError::NotAPointer { var: *p, block, op_index, found }),
+                None => {}
+            }
+            // `red.max` has integer forms only (rule 3).
+            if let Some(found) = ty(v)
+                && !matches!(found, KirType::U32 | KirType::I32 | KirType::U64 | KirType::I64)
+            {
+                errors.push(KirVerifyError::TypeMismatch {
+                    var: *v,
+                    block,
+                    op_index,
+                    role: "value (AtomicMax takes U32, I32, U64 or I64)",
+                    expected: KirType::U32,
+                    found,
+                });
+            }
+        }
         KirOp::Store(p, v, _) | KirOp::AtomicAdd(p, v, _) => match ty(p) {
             Some(KirType::Ptr(pointee, _)) => expect(*v, "value", &pointee),
             Some(found) => errors.push(KirVerifyError::NotAPointer { var: *p, block, op_index, found }),
@@ -1262,6 +1285,13 @@ fn check_types(
                     });
                 }
             }
+        }
+        // Rule 6: the packed destination carries `ty`'s fragment type and
+        // both halves are f32, as `cvt.rn.{f16x2|bf16x2}.f32` requires.
+        KirOp::CvtPack { dst, hi, lo, ty: pack_ty } => {
+            expect(*dst, "packed fragment", &pack_ty.fragment_ty());
+            expect(*hi, "hi", &KirType::F32);
+            expect(*lo, "lo", &KirType::F32);
         }
         KirOp::CpAsyncCommit
         | KirOp::CpAsyncWait { .. }
@@ -2413,6 +2443,79 @@ mod tests {
                 role: "accumulator",
                 expected: KirType::F32,
                 found: frag(),
+            }])
+        );
+    }
+
+    /// Rule 6 for `CvtPack`: the destination carries the packed type of the
+    /// pack's own `ty` (an f16x2 pack into a bf16x2 register would feed a
+    /// bf16 `mma` f16 bits), and both sources are f32.
+    #[test]
+    fn a_pack_is_typed_by_its_operand_type() {
+        let mut b = KirBuilder::new("t");
+        let entry = b.new_block();
+        b.set_block(entry);
+        let lo = b.new_typed_var(KirType::F32);
+        b.emit(KirOp::Const(lo, KirConst { ty: KirType::F32, value: ConstValue::F32(1.0) }));
+        let hi_wrong = b.new_typed_var(KirType::F64);
+        b.emit(KirOp::Const(hi_wrong, KirConst { ty: KirType::F64, value: ConstValue::F64(2.0) }));
+        let good = b.new_typed_var(frag());
+        b.emit(KirOp::CvtPack { dst: good, hi: lo, lo, ty: MmaOperandTy::F16 });
+        let bf_dst = b.new_typed_var(frag());
+        b.emit(KirOp::CvtPack { dst: bf_dst, hi: lo, lo, ty: MmaOperandTy::Bf16 });
+        let bad_src = b.new_typed_var(frag());
+        b.emit(KirOp::CvtPack { dst: bad_src, hi: hi_wrong, lo, ty: MmaOperandTy::F16 });
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+        assert_eq!(
+            verify(&ir),
+            Err(vec![
+                KirVerifyError::TypeMismatch {
+                    var: bf_dst,
+                    block: 0,
+                    op_index: 3,
+                    role: "packed fragment",
+                    expected: MmaOperandTy::Bf16.fragment_ty(),
+                    found: frag(),
+                },
+                KirVerifyError::TypeMismatch {
+                    var: hi_wrong,
+                    block: 0,
+                    op_index: 4,
+                    role: "hi",
+                    expected: KirType::F32,
+                    found: KirType::F64,
+                },
+            ])
+        );
+    }
+
+    /// `red.max` has integer forms only: an f32 running maximum must be
+    /// kept on the bit pattern, explicitly.
+    #[test]
+    fn an_atomic_max_takes_an_integer() {
+        let mut b = KirBuilder::new("t");
+        let pf = b.add_param("pf", KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global), AddressSpace::Global);
+        let pu = b.add_param("pu", KirType::Ptr(Box::new(KirType::U32), AddressSpace::Global), AddressSpace::Global);
+        let entry = b.new_block();
+        b.set_block(entry);
+        let f = b.new_typed_var(KirType::F32);
+        b.emit(KirOp::Const(f, KirConst { ty: KirType::F32, value: ConstValue::F32(1.0) }));
+        let u = b.new_typed_var(KirType::U32);
+        b.emit(KirOp::Bitcast(u, f));
+        b.emit(KirOp::AtomicMax(pu, u, AddressSpace::Global));
+        b.emit(KirOp::AtomicMax(pf, f, AddressSpace::Global));
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+        assert_eq!(
+            verify(&ir),
+            Err(vec![KirVerifyError::TypeMismatch {
+                var: f,
+                block: 0,
+                op_index: 3,
+                role: "value (AtomicMax takes U32, I32, U64 or I64)",
+                expected: KirType::U32,
+                found: KirType::F32,
             }])
         );
     }

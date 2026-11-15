@@ -437,6 +437,11 @@ pub enum KirOp {
     Load(VarId, VarId, AddressSpace),
     Store(VarId, VarId, AddressSpace), // *ptr = val
     AtomicAdd(VarId, VarId, AddressSpace),
+    /// `*ptr = max(*ptr, val)` atomically, with no result (`red.<space>.max`).
+    /// Integers only (`U32`, `I32`, `U64`, `I64`): a running maximum of
+    /// non-negative f32 values is kept on their bit patterns, which order
+    /// the same way (the flash-attention backward's `max|dO|` per head).
+    AtomicMax(VarId, VarId, AddressSpace),
 
     // Thread indexing (dst, dim: 0=x, 1=y, 2=z)
     ThreadId(VarId, u8),
@@ -497,7 +502,7 @@ pub enum KirOp {
     StoreVec { ptr: VarId, vals: Vec<VarId>, space: AddressSpace },
     /// Roadmap A2 step 4: a predicated side effect — `op` runs only when
     /// `pred` (a `Bool`) is true (`negate`: false). Only ops with no
-    /// destination may be predicated (`Store`, `StoreVec`, `AtomicAdd`,
+    /// destination may be predicated (`Store`, `StoreVec`, `AtomicAdd`, `AtomicMax`,
     /// `CpAsync`, the barriers); a predicated definition would be partial,
     /// which SSA forbids — use `Select` or a branch for a value.
     Predicated { pred: VarId, negate: bool, op: Box<KirOp> },
@@ -574,6 +579,16 @@ pub enum KirOp {
         b: Vec<VarId>,
         c: Vec<VarId>,
     },
+    /// Round two `F32` values to the 16-bit type `ty` (round to nearest
+    /// even) and pack them into one fragment register:
+    /// `cvt.rn.{f16x2|bf16x2}.f32 dst, hi, lo`. `lo` lands in the low half,
+    /// `hi` in the high half, so `CvtPack { lo: x[c], hi: x[c + 1] }` is the
+    /// packed pair an `Mma` A/B fragment holds for columns `c, c + 1` (see
+    /// `fragment_layout`). `dst` is `ty.fragment_ty()`. This is how an f32
+    /// accumulator becomes the next `mma`'s operand without a trip through
+    /// shared memory (the flash-attention P and dS tiles), and how f32
+    /// tensor data becomes an f16 operand.
+    CvtPack { dst: VarId, hi: VarId, lo: VarId, ty: MmaOperandTy },
 }
 
 #[derive(Debug, Clone)]
@@ -802,6 +817,15 @@ impl KirBuilder {
             KirOp::Mma { a_ty, .. } => {
                 self.required_features |= FeatureSet::TENSOR_CORES;
                 if matches!(a_ty, MmaOperandTy::Bf16) {
+                    self.required_features |= FeatureSet::BF16_ARITHMETIC;
+                }
+            }
+            // `cvt.rn.f16x2.f32` is a PTX 7.0 / sm_80 instruction, like the
+            // tensor-core ops whose operands it builds; the bf16x2 form needs
+            // the bf16 feature as well.
+            KirOp::CvtPack { ty, .. } => {
+                self.required_features |= FeatureSet::TENSOR_CORES;
+                if matches!(ty, MmaOperandTy::Bf16) {
                     self.required_features |= FeatureSet::BF16_ARITHMETIC;
                 }
             }
