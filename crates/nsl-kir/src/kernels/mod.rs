@@ -20,6 +20,7 @@ pub mod det_sum;
 pub mod dropout;
 pub mod elementwise;
 pub mod embedding_bwd;
+pub mod flash_attn;
 pub mod flash_lse;
 pub mod lce_chunk;
 pub mod lce_finalize;
