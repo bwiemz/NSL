@@ -1,0 +1,16 @@
+# Tool configuration for the perfcheck scripts. Not a package: nothing here is
+# installed or imported from elsewhere.
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint.isort]
+# `torch_arm.py` imports refcheck's twin as a sibling module (`from ref import ...`,
+# with tools/refcheck on sys.path) and `perfcheck.py` imports models/benchmarks'
+# `gpu_guard` the same way.
+known-first-party = ["ref", "gpu_guard"]
+
+[tool.basedpyright]
+# torch and numpy come from the environment the benchmark runs in (a venv with a
+# CUDA build of PyTorch), not from the repository.
+extraPaths = ["../refcheck", "../../models/benchmarks"]
