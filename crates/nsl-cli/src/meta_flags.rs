@@ -217,9 +217,9 @@ pub(crate) fn expand_pretrain_optimized(
     // model source. `auto`, not `require`: the bundle must not turn a program
     // whose head the compiler cannot prove into a build failure.
     //
-    // Same loud-override shape as --wggo/--csha below, and the same reason:
-    // an explicit `off` is a decision, and silently overriding it would make
-    // the bundle a worse citizen than the flags it expands to.
+    // An explicit `off` is a decision: it is honoured and said aloud, since
+    // silently overriding it would make the bundle a worse citizen than the
+    // flags it expands to.
     match fuse_lm_head.as_deref() {
         None => *fuse_lm_head = Some("auto".to_string()),
         Some("off") => nsl_log::nsl_log!(WARN, "cli", 
