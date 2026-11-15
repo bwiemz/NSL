@@ -2652,6 +2652,12 @@ pub(crate) mod cublas_inner {
     /// break-even near mnk/(a_elems + b_elems) ~ 250; the default of 512
     /// stays a factor of 2 above break-even so marginal shapes do not
     /// thrash. `NSL_MATMUL_BF16_MIN_RATIO` overrides (integer, elements).
+    /// [`bf16_storage_worthwhile`] for callers that issue their own bf16 GEMMs
+    /// (the fused LM head), so they take bf16 exactly where the mode would.
+    pub(crate) fn bf16_gate(m: i64, n: i64, k: i64, a_elems: usize, b_elems: usize) -> bool {
+        bf16_storage_worthwhile(m, n, k, a_elems, b_elems)
+    }
+
     fn bf16_storage_worthwhile(m: i64, n: i64, k: i64, a_elems: usize, b_elems: usize) -> bool {
         static MIN_RATIO: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
         let min_ratio = *MIN_RATIO.get_or_init(|| {

@@ -306,6 +306,85 @@ pub(crate) fn launch_backward(
 #[cfg(feature = "cuda")]
 const LCE_GEMM_CHUNK: u64 = 4096;
 
+/// The LM head's GEMM operands under the BF16 math mode, each rounded to bf16
+/// ONCE per call instead of once per chunk GEMM: `x` (read by every chunk's
+/// logits GEMM and again by every chunk's dW GEMM), the head's weight (the
+/// cast cache's image of the whole tied embedding, when it is registered),
+/// and in the backward each chunk's dlogits once for both its dx and its dW
+/// GEMM. The same RNE-rounded values the per-GEMM casts produced, so the
+/// same arithmetic; at Coder-1B that is 36 casts of x and 24 of dlogits per
+/// micro-batch fewer. `None` (the per-GEMM path) unless the mode is BF16, no
+/// CUDA graph is being captured, and every chunk GEMM passes the mode's own
+/// intensity gate (so bf16 runs exactly where it ran before).
+struct Bf16Head {
+    x16: u64,
+    w16: Option<u64>,
+    dl16: u64,
+}
+
+impl Bf16Head {
+    fn new(x_dev: u64, w_dev: u64, rows: u64, v: u64, h: u64, chunk: u64, backward: bool) -> Option<Bf16Head> {
+        use crate::cuda::cublas_inner::{bf16_gate, resolved_math_mode, CublasMathMode};
+        if resolved_math_mode() != CublasMathMode::Bf16 || crate::cuda::graph_capture::enabled() {
+            return None;
+        }
+        let tail = if v % chunk == 0 { chunk } else { v % chunk };
+        let (r, hh) = (rows as i64, h as i64);
+        for cols in [chunk as i64, tail as i64] {
+            let fwd = bf16_gate(r, cols, hh, (r * hh) as usize, (cols * hh) as usize);
+            let dx = bf16_gate(r, hh, cols, (r * cols) as usize, (cols * hh) as usize);
+            let dw = bf16_gate(cols, hh, r, (r * cols) as usize, (r * hh) as usize);
+            if !fwd || (backward && !(dx && dw)) {
+                return None;
+            }
+        }
+        use crate::cuda::inner;
+        let x16 = inner::alloc_managed((rows * h * 2) as usize) as u64;
+        crate::cuda::gpu_cast_raw_f32_to_bf16(x_dev, x16, (rows * h) as usize);
+        let w16 = crate::cuda::bf16_cast_cache::acquire(w_dev, (v * h) as usize).map(|(buf, needs_cast)| {
+            if needs_cast {
+                crate::cuda::gpu_cast_raw_f32_to_bf16(w_dev, buf, (v * h) as usize);
+            }
+            buf
+        });
+        let dl16 = if backward { inner::alloc_managed((rows * chunk * 2) as usize) as u64 } else { 0 };
+        Some(Bf16Head { x16, w16, dl16 })
+    }
+
+    /// The bf16 rows `[chunk_start, chunk_start + cols)` of the head weight:
+    /// an offset into the cached image, or a scratch cast (returned to free).
+    fn w_chunk(&self, w_dev: u64, chunk_start: u64, cols: u64, h: u64) -> (u64, Option<u64>) {
+        match self.w16 {
+            Some(buf) => (buf + chunk_start * h * 2, None),
+            None => {
+                let s = crate::cuda::inner::alloc_managed((cols * h * 2) as usize) as u64;
+                crate::cuda::gpu_cast_raw_f32_to_bf16(w_dev + chunk_start * h * 4, s, (cols * h) as usize);
+                (s, Some(s))
+            }
+        }
+    }
+
+    /// `logits[rows, cols] = x @ W_chunk^T` (f32 out).
+    fn logits(&self, w16c: u64, logits: u64, rows: u64, cols: u64, h: u64) {
+        // SAFETY: buffers sized by the caller's shapes (row-major, as
+        // `storage_gemm::matmul` maps them onto cuBLAS's column-major call).
+        unsafe {
+            crate::cuda::storage_gemm::gemm16(true, false, cols, rows, h, 1.0, w16c, h, self.x16, h, 0.0, logits, cols, false)
+        }
+    }
+}
+
+impl Drop for Bf16Head {
+    fn drop(&mut self) {
+        crate::cuda::inner::free_managed(self.x16 as *mut c_void);
+        if self.dl16 != 0 {
+            crate::cuda::inner::free_managed(self.dl16 as *mut c_void);
+        }
+    }
+}
+
+
+
 /// Online-softmax forward over vocab chunks.
 ///
 /// All pointers are raw DEVICE pointers: `x [rows, h]`, `w [v, h]`,
@@ -367,11 +446,20 @@ pub(crate) fn gemm_forward(
     inner::memset_d8(sstate as *mut c_void, (rows * 4) as usize);
     inner::memset_d8(tlstate as *mut c_void, (rows * 4) as usize);
 
+    let head = Bf16Head::new(x_dev, w_dev, rows, v, h, chunk, false);
     let mut chunk_start = 0u64;
     while chunk_start < v {
         let cols = chunk.min(v - chunk_start);
         // logits_chunk [rows, cols] = x @ W[chunk_start.., :]^T
-        let gemm = unsafe {
+        let gemm = if let Some(hd) = &head {
+            let (w16c, scratch) = hd.w_chunk(w_dev, chunk_start, cols, h);
+            hd.logits(w16c, logits_buf, rows, cols, h);
+            if let Some(s) = scratch {
+                inner::free_managed(s as *mut c_void);
+            }
+            Ok(())
+        } else {
+            unsafe {
             crate::cuda::cublas_inner::sgemm_row_major_t(
                 x_dev as *const f32,
                 (w_dev + chunk_start * h * 4) as *const f32,
@@ -384,6 +472,7 @@ pub(crate) fn gemm_forward(
                 1.0,
                 0.0,
             )
+            }
         };
         if gemm.is_err() {
             crate::nsl_log!(WARN, "fused-lce-gemm", "[fused-lce-gemm] forward chunk gemm failed at {chunk_start}");
@@ -494,12 +583,18 @@ pub(crate) fn gemm_backward(
         rc
     };
 
+    let head = Bf16Head::new(x_dev, w_dev, rows, v, h, chunk, true);
     let mut chunk_start = 0u64;
     while chunk_start < v {
         let cols = chunk.min(v - chunk_start);
         let w_chunk = w_dev + chunk_start * h * 4;
+        let head_w = head.as_ref().map(|hd| hd.w_chunk(w_dev, chunk_start, cols, h));
         // Recompute logits chunk.
-        let gemm = unsafe {
+        let gemm = if let (Some(hd), Some((w16c, _))) = (&head, head_w) {
+            hd.logits(w16c, logits_buf, rows, cols, h);
+            Ok(())
+        } else {
+            unsafe {
             crate::cuda::cublas_inner::sgemm_row_major_t(
                 x_dev as *const f32,
                 w_chunk as *const f32,
@@ -512,6 +607,7 @@ pub(crate) fn gemm_backward(
                 1.0,
                 0.0,
             )
+            }
         };
         if gemm.is_err() {
             crate::nsl_log!(WARN, "fused-lce-gemm", "[fused-lce-gemm] backward logits gemm failed at {chunk_start}");
@@ -553,6 +649,24 @@ pub(crate) fn gemm_backward(
         if rc != 0 {
             crate::nsl_log!(WARN, "fused-lce-gemm", "[fused-lce-gemm] chunk dlogits launch failed: {rc}");
             return free_all(3);
+        }
+        if let (Some(hd), Some((w16c, scratch))) = (&head, head_w) {
+            // dlogits rounded to bf16 once for both GEMMs, then
+            // dx[rows, h] += dlogits @ W_chunk and dW_chunk[cols, h] +=
+            // dlogits^T @ x, f32 accumulators (beta = 1).
+            crate::cuda::gpu_cast_raw_f32_to_bf16(logits_buf, hd.dl16, (rows * cols) as usize);
+            // SAFETY: buffers sized by the shapes above.
+            unsafe {
+                crate::cuda::storage_gemm::gemm16(false, false, h, rows, cols, 1.0, w16c, h, hd.dl16, cols, 1.0, dx_dev, h, false);
+                crate::cuda::storage_gemm::gemm16(
+                    false, true, h, cols, rows, 1.0, hd.x16, h, hd.dl16, cols, 1.0, dw_dev + chunk_start * h * 4, h, false,
+                );
+            }
+            if let Some(s) = scratch {
+                inner::free_managed(s as *mut c_void);
+            }
+            chunk_start += cols;
+            continue;
         }
         // dx += dlogits_chunk @ W_chunk       [rows, h]
         let gemm = unsafe {

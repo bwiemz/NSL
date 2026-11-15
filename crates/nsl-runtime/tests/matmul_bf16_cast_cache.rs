@@ -239,10 +239,10 @@ fn lm_head_forward(x: i64, w: i64, targets: i64, rows: usize, v: usize, h: usize
 ///    parent's image. The fused LM head's chunk GEMMs pass `W + chunk_start *
 ///    h` with the chunk's element count, which the cache's (base, length) key
 ///    misses: before `acquire_sub` every chunk was cast into scratch on every
-///    call. Three chunks (4096 + 4096 + a 1024 tail, which keeps every chunk
-///    at or above the 512 intensity gate): the first chunk makes the
-///    WHOLE parent image valid (one recast), the other two hit it, and the
-///    results are bit-identical to the scratch path's.
+///    call. The fused LM head now takes the WHOLE parent's image once per
+///    call (one recast cold, one hit warm) and serves its three chunks (4096
+///    + 4096 + a 1024 tail, every chunk at or above the 512 intensity gate)
+///    from it; the results are bit-identical to the scratch path's.
 fn sub_view_checks() {
     let (rows, h, v) = (1024usize, 1024usize, 2 * 4096 + 1024);
     let x = gpu_2d(rows, h, &deterministic(rows * h, 239));
@@ -267,14 +267,14 @@ fn sub_view_checks() {
     let (h1, r1, _) = test_bf16_cast_cache_stats();
     assert_eq!(
         (h1 - h0, r1 - r0),
-        (2, 1),
-        "three vocabulary chunks of a registered head: expected the first to cast the whole \
-         parent once and the other two to hit it (hits, recasts) = (2, 1)"
+        (0, 1),
+        "a registered head: the call takes the whole parent's image once (one recast, served \
+         to all three vocabulary chunks) (hits, recasts) = (0, 1)"
     );
     assert_eq!(cached, fresh, "the sub-view image must serve the bits the scratch cast computes");
     let cached2 = lm_head_forward(x, w, targets, rows, v, h);
     let (h2, r2, _) = test_bf16_cast_cache_stats();
-    assert_eq!((h2 - h1, r2 - r1), (3, 0), "a warm parent image serves every chunk");
+    assert_eq!((h2 - h1, r2 - r1), (1, 0), "a warm parent image serves the call");
     assert_eq!(cached2, fresh);
 
     // A real optimizer step stales the parent: the next call recasts it whole
