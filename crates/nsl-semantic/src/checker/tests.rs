@@ -3745,3 +3745,24 @@ fn a_refused_parameter_type_is_reported_once() {
     let n = errs.iter().filter(|m| m.contains("f64 tensors cannot be on cuda")).count();
     assert_eq!(n, 1, "{errs:?}");
 }
+
+// -----------------------------------------------------------------------
+// Signature diagnostics are reported once
+// -----------------------------------------------------------------------
+
+/// A function's signature was resolved three times (pre-declaration,
+/// `build_fn_type` in `check_fn_def`, then each parameter again), and a
+/// method's three times too, so an undefined type in a signature was
+/// reported two or three times.
+#[test]
+fn each_signature_error_is_reported_once() {
+    let diags = check_source(
+        "fn f(x: Nope) -> Nope2:\n    return x\n\n\
+         model M:\n    w: Tensor = ones([2])\n    fn g(self, y: Nope3) -> Nope4:\n        return y\n\n\
+         let m = M()\n",
+    );
+    for name in ["Nope", "Nope2", "Nope3", "Nope4"] {
+        let n = diags.iter().filter(|d| d.message == format!("undefined type `{name}`")).count();
+        assert_eq!(n, 1, "`{name}` reported {n} times: {diags:?}");
+    }
+}

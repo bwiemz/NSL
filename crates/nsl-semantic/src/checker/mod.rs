@@ -186,7 +186,12 @@ impl<'a> TypeChecker<'a> {
         for stmt in stmts {
             match &stmt.kind {
                 StmtKind::FnDef(fn_def) => {
+                    // `check_fn_def` resolves the signature again and
+                    // reports what resolving it raises; reporting it here too
+                    // printed every signature error twice.
+                    let before = self.diagnostics.len();
                     let ty = self.build_fn_type(fn_def);
+                    self.diagnostics.truncate(before);
                     self.declare_symbol(fn_def.name, ty, stmt.span, true, false);
                 }
                 StmtKind::ModelDef(model_def) => {
@@ -422,6 +427,28 @@ impl<'a> TypeChecker<'a> {
             params,
             ret: Box::new(ret),
             effect,
+        }
+    }
+
+    /// Declare a function's or method's parameters with the types its
+    /// signature (`build_fn_type`, which skips `self`) already resolved,
+    /// rather than resolving each annotation again: a second resolution
+    /// reported every error in a parameter type a second time.
+    fn declare_params_from_signature(&mut self, fn_def: &FnDef, fn_ty: &Type) {
+        let resolved: Vec<Type> = match fn_ty {
+            Type::Function { params, .. } => params.clone(),
+            _ => Vec::new(),
+        };
+        let mut resolved = resolved.into_iter();
+        for param in &fn_def.params {
+            if self.resolve_name(param.name) == "self" {
+                continue;
+            }
+            let param_ty = resolved.next().unwrap_or(Type::Unknown);
+            self.declare_symbol(param.name, param_ty, param.span, false, true);
+            if let Some(default) = &param.default {
+                self.check_expr(default);
+            }
         }
     }
 
