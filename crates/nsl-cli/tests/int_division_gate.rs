@@ -97,3 +97,18 @@ fn a_float_shape_dimension_is_a_type_error_naming_floor_division() {
         "tensor([[[0.0, 1.0, 2.0, 3.0], [4.0, 5.0, 6.0, 7.0]], [[8.0, 9.0, 10.0, 11.0], [12.0, 13.0, 14.0, 15.0]]])"
     );
 }
+
+/// `/` is true division for every integer width, not only `int`:
+/// `int64 / int64` and `int32 / int32` stayed integers (`sdiv`, 3).
+#[test]
+fn sized_int_division_is_a_float_too() {
+    let out = run(r#"let a: int64 = 7
+let b: int64 = 2
+print(a / b)
+let c: int32 = 7
+let d: int32 = 2
+print(c / d)
+print(a // b)
+"#);
+    assert_eq!(numbers(&out), [3.5, 3.5, 3.0]);
+}

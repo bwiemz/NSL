@@ -146,6 +146,12 @@ impl<'a> TypeChecker<'a> {
             (l, r) if dtype_rank(l).0 > 0 && dtype_rank(r).0 > 0 => {
                 let (lf, lr) = dtype_rank(l);
                 let (rf, rr) = dtype_rank(r);
+                // `/` is true division for every integer width, as for
+                // `int`: `int64 / int64` stayed an integer and codegen
+                // emitted `sdiv`, so `/` meant two things.
+                if matches!(op, BinOp::Div) && lf == 1 && rf == 1 {
+                    return Type::Float;
+                }
                 if lf == rf {
                     // Same family: return the wider type
                     if lr >= rr { l.clone() } else { r.clone() }
