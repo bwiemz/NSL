@@ -28,7 +28,9 @@
 //!    a train program with no attention must carry none of it.
 //! 3. `decorator_free_sdpa_backward_dispatches_on_gpu` (GPU, ignored):
 //!    `nsl run` with NSL_FLASH_DEBUG=1 must print the
-//!    `[flash-bwd] GPU backward dispatched` line for a decorator-free
+//!    `[flash-bwd] tensor-core backward dispatched` line (the
+//!    `[flash-bwd] GPU backward dispatched` line before 2026-11-14, when
+//!    the variant-table kernels served head_dim 64) for a decorator-free
 //!    model AND all trainable params must move — the positive observable
 //!    that was missing for a whole campaign (the GPU path used to be
 //!    silent on success, so "no [flash-bwd] lines" was the only, purely
@@ -261,10 +263,12 @@ fn decorator_free_sdpa_backward_dispatches_on_gpu() {
     }
 
     // The positive dispatch observable: the runtime narrates the backward
-    // dispatch under NSL_FLASH_DEBUG=1. head_dim=64 must have selected the
-    // (32,32)-tile variant.
+    // dispatch under NSL_FLASH_DEBUG=1. At head_dim=64 the runtime's
+    // tensor-core kernels (`nsl-runtime/src/attention_tc.rs`) serve it since
+    // 2026-11-14; the variant table checked above still serves packed
+    // batches, other head dims and `NSL_TC_ATTENTION=0`.
     assert!(
-        stderr.contains("[flash-bwd] GPU backward dispatched")
+        stderr.contains("[flash-bwd] tensor-core backward dispatched")
             && stderr.contains("head_dim=64"),
         "[sdpa-bwd-gpu] the decorator-free SDPA backward did NOT dispatch \
          on the GPU — either the variant table wasn't wired (look for a \

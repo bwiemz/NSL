@@ -1356,6 +1356,15 @@ pub static REGISTRY: &[EnvVar] = &[
         "Set to 1 to print each parameter's tape key, length and returned gradient length after tape backward."
     ),
     var!(
+        "NSL_TC_ATTENTION",
+        Bool,
+        "0 only",
+        "on (tensor-core attention kernels serve unpacked SDPA at head_dim 64 and 128)",
+        Behavior,
+        Runtime,
+        "Set to 0 to serve unpacked scaled_dot_product_attention with the kernels before the tensor-core ones (f16 output, atomic dQ, CPU backward on tape AD)."
+    ),
+    var!(
         "NSL_TENSOR_TO_DESC_NULL_CHILD",
         Bool,
         "present (any value)",
