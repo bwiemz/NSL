@@ -180,9 +180,20 @@ impl Compiler<'_> {
             let part_str = match part {
                 FStringPart::Text(s) => self.compile_string_literal(builder, s)?,
                 FStringPart::Expr(expr) => {
-                    let val = self.compile_expr(builder, state, expr)?;
+                    // Nested, so an owning result (`f"{t.sum()}"`) is freed
+                    // at the end of the statement, as `print` does.
+                    let val = self.compile_nested_expr(builder, state, expr)?;
                     let expr_type = self.node_type(expr.id).clone();
-                    self.value_to_string(builder, val, &expr_type)?
+                    // An expression the checker could not type but the
+                    // emission can (the fresh result of a tensor-returning
+                    // call): the same rescue `print` makes.
+                    if expr_type.is_indeterminate()
+                        && self.expr_result_is_owned_tensor(builder, state, expr, val)
+                    {
+                        self.compile_call_by_name(builder, "nsl_tensor_to_str", &[val])?
+                    } else {
+                        self.value_to_string(builder, val, &expr_type)?
+                    }
                 }
             };
 
@@ -216,7 +227,30 @@ impl Compiler<'_> {
             ),
             Type::Bool => ("nsl_bool_to_str", val),
             Type::Str => return Ok(val),
-            _ => ("nsl_int_to_str", val),
+            // What `print(t)` shows. It fell to the integer arm below and
+            // interpolated the tensor's handle (`f"loss {loss}"` in an
+            // `on_step` callback printed `loss 94297074379216`).
+            t if t.is_tensor() => ("nsl_tensor_to_str", val),
+            // No type known: decide on the value, as `print` does. A float
+            // value went to the integer conversion and failed Cranelift's
+            // verifier.
+            _ if builder.func.dfg.value_type(val).is_float() => {
+                let v = if builder.func.dfg.value_type(val) == cl_types::F32 {
+                    builder.ins().fpromote(cl_types::F64, val)
+                } else {
+                    val
+                };
+                ("nsl_float_to_str", v)
+            }
+            _ => {
+                let vt = builder.func.dfg.value_type(val);
+                let v = if vt.is_int() && vt.bits() < 64 {
+                    builder.ins().sextend(cl_types::I64, val)
+                } else {
+                    val
+                };
+                ("nsl_int_to_str", v)
+            }
         };
         let fid = self.registry.runtime_fns[rt_fn].0;
         let fref = self.module.declare_func_in_func(fid, builder.func);

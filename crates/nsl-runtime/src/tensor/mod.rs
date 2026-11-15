@@ -1309,43 +1309,69 @@ pub extern "C" fn nsl_tensor_item(tensor_ptr: i64) -> f64 {
 
 // === Display ===
 
-#[unsafe(no_mangle)]
-pub extern "C" fn nsl_tensor_print(tensor_ptr: i64) {
-    let tensor = NslTensor::from_ptr(tensor_ptr);
+/// The text `print(t)` shows for a tensor, without the newline: the value
+/// alone for a 0-d tensor, `tensor([...])` otherwise. One formatter for
+/// `nsl_tensor_print` and `nsl_tensor_to_str`, so `print(t)` and `f"{t}"`
+/// agree.
+fn format_tensor(tensor_ptr: i64) -> String {
+    use std::fmt::Write;
+    let tensor = NslTensor::from_ptr_ref(tensor_ptr);
 
     // Device memory: transfer to CPU for printing
     if tensor.device > 0 {
         let cpu_ptr = nsl_tensor_to_device(tensor_ptr, 0);
-        nsl_tensor_print(cpu_ptr);
+        let text = format_tensor(cpu_ptr);
         nsl_tensor_free(cpu_ptr);
-        return;
+        return text;
     }
 
+    let mut out = String::new();
     if tensor.ndim == 0 {
         if tensor.len > 0 {
-            let val = tensor.read_scalar_as_f64(0);
-            print_float_value(val);
-            println!();
+            write_float_value(&mut out, tensor.read_scalar_as_f64(0));
         } else {
-            println!("tensor([])");
+            out.push_str("tensor([])");
         }
-        return;
+        return out;
     }
 
-    print!("tensor(");
-    print_tensor_recursive(tensor.data as *const u8, tensor.dtype, tensor.shape, tensor.strides, tensor.ndim, 0);
-    println!(")");
+    out.push_str("tensor(");
+    write_tensor_recursive(
+        &mut out,
+        tensor.data as *const u8,
+        tensor.dtype,
+        tensor.shape,
+        tensor.strides,
+        tensor.ndim,
+        0,
+    );
+    let _ = write!(out, ")");
+    out
 }
 
-fn print_float_value(v: f64) {
+#[unsafe(no_mangle)]
+pub extern "C" fn nsl_tensor_print(tensor_ptr: i64) {
+    println!("{}", format_tensor(tensor_ptr));
+}
+
+/// `f"{t}"` for a tensor: the text `print(t)` shows, as an NSL string. It
+/// used to fall to the integer conversion and interpolate the handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn nsl_tensor_to_str(tensor_ptr: i64) -> i64 {
+    crate::string::nsl_str_from_rust(&format_tensor(tensor_ptr))
+}
+
+fn write_float_value(out: &mut String, v: f64) {
+    use std::fmt::Write;
     if v == v.floor() && v.abs() < 1e15 {
-        print!("{:.1}", v);
+        let _ = write!(out, "{:.1}", v);
     } else {
-        print!("{}", v);
+        let _ = write!(out, "{}", v);
     }
 }
 
-fn print_tensor_recursive(
+fn write_tensor_recursive(
+    out: &mut String,
     data: *const u8,
     dtype: u16,
     shape: *mut i64,
@@ -1357,34 +1383,30 @@ fn print_tensor_recursive(
     let stride = unsafe { *strides.add(dim) } as usize;
     let elem_size = dtype_element_size(dtype);
 
-    print!("[");
+    out.push('[');
     if dim as i64 == ndim - 1 {
         for i in 0..size {
-            if i > 0 { print!(", "); }
+            if i > 0 { out.push_str(", "); }
             let val = match dtype {
                 DTYPE_U16_TOKEN => unsafe { *(data as *const u16).add(i * stride) as f64 },
                 DTYPE_I32 => unsafe { *(data as *const i32).add(i * stride) as f64 },
                 1 => unsafe { *(data as *const f32).add(i * stride) as f64 },
                 0 => unsafe { *(data as *const f64).add(i * stride) },
-                d if d >= DTYPE_CUSTOM_START => {
-                    print!("?");
-                    continue;
-                }
                 _ => {
-                    print!("?");
+                    out.push('?');
                     continue;
                 }
             };
-            print_float_value(val);
+            write_float_value(out, val);
         }
     } else {
         for i in 0..size {
-            if i > 0 { print!(", "); }
+            if i > 0 { out.push_str(", "); }
             let offset_data = unsafe { data.add(i * stride * elem_size) };
-            print_tensor_recursive(offset_data, dtype, shape, strides, ndim, dim + 1);
+            write_tensor_recursive(out, offset_data, dtype, shape, strides, ndim, dim + 1);
         }
     }
-    print!("]");
+    out.push(']');
 }
 
 // === Memory ===
