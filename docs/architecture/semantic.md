@@ -249,7 +249,10 @@ The sections contract in `optim_config.rs` follows the same pattern one
 level down: `OptimizerKind` (`Sgd, Adam, AdamW, Lion, Muon, Soap`) with a
 per-optimizer `accepted_kwargs` table that is exactly the stdlib step
 function's parameters (so `SGD(beta2=0.5)` is refused, `SOAP` has no
-`no_decay`); `ResolvedScheduler` with one variant per
+`no_decay`), plus two that are not step arguments: `no_decay` where weight
+decay applies, and on `Adam`/`AdamW` `first_moment_dtype` (`"f32"` or
+`"bf16"`: how the fused step stores `m`; any other optimizer refuses it with
+`FIRST_MOMENT_DTYPE_UNSUPPORTED`); `ResolvedScheduler` with one variant per
 `stdlib/nsl/optim/schedulers.nsl` function and `fn_name()` giving the name
 codegen mangles; `CALLBACK_NAMES` = `on_step, on_epoch, on_epoch_end` with
 per-callback parameter tables; `VALID_ROLES` for `no_decay=[...]`, which
@@ -643,7 +646,8 @@ Optimizer:
 
 1. Add a variant to `OptimizerKind` (`optim_config.rs`) and update
    `as_str`, `display`, `parse`, `accepted_kwargs` (exactly the stdlib step
-   function's parameters, plus `no_decay` if it applies weight decay) and
+   function's parameters, plus `no_decay` if it applies weight decay, and
+   `first_moment_dtype` only once its fused step can store `m` in bf16) and
    `OPTIMIZER_NAMES_LABEL`.
 2. Add the stdlib module `stdlib/nsl/optim/<name>.nsl` and teach
    `inject_train_block_imports` in `crates/nsl-cli/src/loader.rs` (and the

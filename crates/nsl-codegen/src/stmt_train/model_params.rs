@@ -175,6 +175,20 @@ impl Compiler<'_> {
         // no-op collectives and rank-0 owning everything — identical to
         // the unsharded baseline by construction.
         if self.features.zero_stage.filter(|&s| s >= 1).is_some() {
+            // One rank owns every partition, so nothing is sharded: the run is
+            // the unsharded baseline (0 GiB saved at Coder-1B and -500M,
+            // measured 2026-11). A warning, not a refusal — the one-rank build
+            // is the reference the multi-rank gates compare against.
+            if self.features.world_size <= 1 {
+                nsl_log::nsl_log!(WARN, "zero",
+                    "[zero] --zero-stage {} with one device does nothing: ZeRO \
+                     shards optimizer state, gradients and parameters ACROSS ranks, \
+                     and with one rank it shards nothing, so this run uses exactly \
+                     the memory of one without the flag. Build with --devices N \
+                     (N > 1) to shard.",
+                    self.features.zero_stage.unwrap_or(1)
+                );
+            }
             let stage_val = builder
                 .ins()
                 .iconst(cl_types::I64, self.features.zero_stage.unwrap_or(1) as i64);
@@ -290,6 +304,9 @@ impl Compiler<'_> {
         // correct compile with a wrong message whenever arbitration had
         // dropped (NotLoweredNoOptIn) or merged the offer.
         let cpdt_moment_lists_consumed: Option<(Vec<u16>, Vec<u16>)>;
+        // Whether WGGO's moment-bit decision reached storage for this block:
+        // the only thing `--wggo-moment-precision` can change.
+        let mut wggo_moments_lowered = false;
         let cpdt_precision_dtypes: Option<(Value, Value)> = {
             let dtype_data: Option<(Vec<u16>, Vec<u16>)> = {
                 // Pre-S2: the FASE cast wrapping was emitted ONLY on the
@@ -441,6 +458,7 @@ impl Compiler<'_> {
                     }
                     MPA::Merged(m, v) => {
                         let sub32 = m.iter().chain(v.iter()).filter(|&&c| c != DTYPE_F32).count();
+                        wggo_moments_lowered = sub32 > 0;
                         nsl_log::nsl_log!(INFO, "cpdt", 
                             "[cpdt] WGGO optimizer-moment precision active \
                              (merged with the CPDT per-param plan, F32 wins): \
@@ -453,6 +471,7 @@ impl Compiler<'_> {
                     }
                     MPA::WggoOnly(m, v) => {
                         let sub32 = m.iter().chain(v.iter()).filter(|&&c| c != DTYPE_F32).count();
+                        wggo_moments_lowered = sub32 > 0;
                         nsl_log::nsl_log!(INFO, "cpdt", 
                             "[cpdt] WGGO optimizer-moment precision active: {sub32} \
                              first-moment buffer(s) in BF16 storage; second \
@@ -493,6 +512,27 @@ impl Compiler<'_> {
                 }
             };
             cpdt_moment_lists_consumed = dtype_data.clone();
+            // `--wggo-moment-precision` acts only through WGGO's moment-bit
+            // decision. When the user typed it (a `--wggo-memory-budget`
+            // implies it, and a budget the model fits is not an error) and
+            // that decision put nothing in reduced precision for this block,
+            // the flag is inert: the build used to be byte-identical to one
+            // without it while the activation report said "witnessed"
+            // (the production recipes, 2026-11). Refuse instead.
+            if self.compile_options.wggo.moment_precision
+                && self.compile_options.wggo.memory_budget_bytes.is_none()
+                && !wggo_moments_lowered
+            {
+                return Err(CodegenError::new(
+                    "--wggo-moment-precision has no effect on this train block: WGGO \
+                     decided no reduced-precision optimizer moment for it (it does only \
+                     with sensitivity data from --wggo-weights, or under \
+                     --wggo-memory-budget), so the run would be identical to one without \
+                     the flag. For a bf16 first moment use the optimizer argument \
+                     first_moment_dtype=\"bf16\" (e.g. `optimizer: AdamW(lr=..., \
+                     first_moment_dtype=\"bf16\")`), or drop the flag",
+                ));
+            }
             // P1 Muon item 11: muon's group update runs the stdlib muon_step
             // (no dequant->step->quant envelope), so reduced-precision
             // moments would feed BF16 buffers to an unwrapped update —

@@ -175,9 +175,9 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
     // path as hand-written flags. Shared helper with `nsl run` so the two
     // dispatchers cannot drift.
     let mut bundle = crate::meta_flags::PretrainBundle {
-        wggo,
-        csha,
         source_ad: _source_ad,
+        checkpoint_blocks,
+        checkpoint_selective,
         fuse_rmsnorm_backward,
         fuse_wgrad_accum,
         // Out-parameter: `expand_pretrain_optimized` raises it only when the
@@ -195,9 +195,9 @@ pub(crate) fn dispatch(args: crate::args::BuildArgs) {
         },
     );
     let crate::meta_flags::PretrainBundle {
-        wggo,
-        csha,
         source_ad: _source_ad,
+        checkpoint_blocks,
+        checkpoint_selective,
         fuse_rmsnorm_backward,
         fuse_wgrad_accum,
         fuse_wgrad_accum_from_bundle,

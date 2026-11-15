@@ -376,21 +376,21 @@ fn ccr_frees(stderr: &str) -> Option<u64> {
 #[test]
 fn a_non_fusing_build_keeps_every_ccr_free_marker() {
     /// Every member of `--pretrain-optimized` EXCEPT `--fuse-wgrad-accum`.
-    /// `--source-ad` is omitted because `run` already passes it.
+    /// `--source-ad` is omitted because `run` already passes it, and the
+    /// checkpoint pair because both arms TYPE `--checkpoint-blocks`, which the
+    /// bundle treats as a chosen posture (full recompute: it fills neither
+    /// member then).
     const BUNDLE_MEMBERS_EXCEPT_WGRAD: &[&str] = &[
         "--fuse-rmsnorm-backward",
         "--fuse-lm-head",
-        "auto",
-        "--wggo",
-        "greedy",
-        "--csha",
         "auto",
     ];
     // DRIFT CHECK. The list above mirrors `expand_pretrain_optimized`, which
     // this test cannot call (`PretrainBundle` is crate-private). Field count is
     // the cheapest thing that changes when a member is added: 5 flag fields
-    // (wggo, csha, source_ad, fuse_rmsnorm_backward, fuse_lm_head) + 1 for
-    // fuse_wgrad_accum + 1 for its provenance out-parameter = 7.
+    // (source_ad, checkpoint_blocks, checkpoint_selective,
+    // fuse_rmsnorm_backward, fuse_lm_head) + 1 for fuse_wgrad_accum + 1 for
+    // its provenance out-parameter = 7.
     let meta = std::fs::read_to_string(
         repo_root().join("crates").join("nsl-cli").join("src").join("meta_flags.rs"),
     )

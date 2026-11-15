@@ -418,6 +418,7 @@ crates/nsl-runtime/src/c_api/mod.rs	zz_tensor_to_desc_null_child	helper	child pr
 crates/nsl-runtime/src/data/gds.rs	mmap_fallback_h2d_copies_bytes_to_device	gpu	requires CUDA GPU
 crates/nsl-runtime/src/fase_step.rs	unaligned_parameter_lengths_are_numerically_correct	gpu	requires CUDA GPU
 crates/nsl-runtime/src/fase_step.rs	flat_grid_multi_adamw_step_at_coder50m_shapes	gpu	requires CUDA GPU
+crates/nsl-runtime/src/fase_step.rs	the_gpu_launches_with_a_bf16_first_moment_match_the_cpu_twin	gpu	requires CUDA GPU
 crates/nsl-runtime/src/flash_attention.rs	flash_lse_gpu_matches_cpu_reference	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/src/muon.rs	profile_ns_500m_step	diagnostic	requires CUDA GPU (profiling driver, not a correctness gate)
 crates/nsl-runtime/src/muon_batch.rs	batch_matches_sequential_and_is_deterministic	gpu	requires CUDA GPU

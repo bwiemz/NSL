@@ -23,8 +23,10 @@ attention and the fused cross-entropy that `pretrain.nsl`'s `@fused_lm_ce`
 decorator asks for. A bare `nsl run` (tape AD) also works — since the
 item-5 campaign it is the reference implementation the AD differential
 compares against — but it materializes the full logits surface and runs at
-reference speed, not production speed. `--pretrain-optimized` implies
-`--source-ad` and adds the WGGO/CSHA planning stack on top.
+reference speed, not production speed. `--pretrain-optimized` is the
+production flag set (`--source-ad --checkpoint-blocks --checkpoint-selective
+--fuse-rmsnorm-backward --fuse-wgrad-accum`); the WGGO/CSHA planners are
+separate flags (`--wggo greedy`, `--csha auto`).
 
 Edit the `load_mmap` path at the top of the script to point at the
 `tokens.bin` step 1 produced.

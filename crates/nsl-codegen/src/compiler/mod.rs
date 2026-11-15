@@ -503,6 +503,18 @@ pub struct FeatureConfigs {
     pub param_dtype_bf16sr: bool,
     /// P4 item 18 rung 2: BF16 Muon momentum (`--muon-state-dtype bf16`).
     pub muon_state_bf16: bool,
+    /// The train block being compiled keeps its Adam/AdamW first moment in
+    /// bf16 (`first_moment_dtype="bf16"`). Set from the block's resolved
+    /// optimizer before its state buffers are emitted.
+    pub first_moment_bf16: bool,
+    /// The program asks for `first_moment_dtype="bf16"` somewhere: the scan
+    /// of every train/distill block (`contract::program_requests_bf16_first_moment`)
+    /// run before any block lowers — at the start of `compile_user_functions`
+    /// (a block inside a function lowers there) and again in `compile_main`.
+    /// `main` then records `m1=bf16` in the execution fingerprint. A train
+    /// block that asks for it without this set is a compile error, so the
+    /// record can never silently miss a block.
+    pub program_first_moment_bf16: bool,
 
     // ── Inference Features (M32, M33, M42, M44) ──────────────────────
     /// M32: MoE layer configs — "ModelName.layer_name" → MoeInfo
@@ -603,6 +615,8 @@ impl FeatureConfigs {
             zero_elementwise: options.zero.elementwise,
             param_dtype_bf16sr: options.train.param_dtype_bf16sr,
             muon_state_bf16: options.muon.state_bf16,
+            first_moment_bf16: false,
+            program_first_moment_bf16: false,
             moe_configs: HashMap::new(),
             speculative_configs: HashMap::new(),
             grammar_configs: HashMap::new(),

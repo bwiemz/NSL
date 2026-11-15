@@ -139,6 +139,20 @@ impl Compiler<'_> {
                     fp.push(',');
                     fp.push_str(&key);
                 }
+                // `first_moment_dtype="bf16"` is optimizer state, not a flag:
+                // read it off the program's train blocks (all of `stmts`, so a
+                // block inside a function counts too). Emitted only when asked
+                // for, like the keys above, so an f32 build and every older
+                // checkpoint agree by both lacking it.
+                if self.features.program_first_moment_bf16
+                    || crate::stmt_train::contract::program_requests_bf16_first_moment(
+                        stmts,
+                        &|sym| self.resolve_sym(sym).to_string(),
+                    )
+                {
+                    fp.push_str(",m1=bf16");
+                    self.features.program_first_moment_bf16 = true;
+                }
                 let fp_len = fp.len() as i64;
                 let fp_data_id = self.intern_string(&fp)?;
                 let fp_gv = self.module.declare_data_in_func(fp_data_id, builder.func);
