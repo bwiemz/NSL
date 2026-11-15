@@ -858,7 +858,7 @@ pub static REGISTRY: &[EnvVar] = &[
         "on (self-disables under --cuda-graphs, --deterministic, or >1 GiB scratch)",
         Behavior,
         Both,
-        "Set to 0 to skip timing cublasLt candidates per GEMM shape and take the untimed heuristic[0] kernel instead."
+        "Set to 0 to skip timing cublasLt candidates per GEMM shape: --bf16-lt takes heuristic[0], TF32 GEMMs go back to cublasSgemm."
     ),
     var!(
         "NSL_MATMUL_BF16_LT_VERBOSE",
@@ -1399,6 +1399,15 @@ pub static REGISTRY: &[EnvVar] = &[
         Test,
         Test,
         "Test harness only: marks the re-exec'd child of the matmul-dispatch-under-TF32 gate."
+    ),
+    var!(
+        "NSL_TF32_LT_PROBE",
+        Enum,
+        "on = timed-Lt child, off = tune-disabled child; anything else = parent",
+        "unset",
+        Test,
+        Test,
+        "Test harness only: selects which re-exec'd child of the TF32 cublasLt GEMM gate runs (on = timed Lt plans, off = tune disabled)."
     ),
     var!(
         "NSL_TF32_PROBE",

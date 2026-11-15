@@ -58,6 +58,12 @@ pub fn test_bf16_cast_cache_reset() {
 pub fn test_lt_matmul_stats() -> (u64, u64, u64) {
     lt_matmul::stats()
 }
+/// The TF32 path's (issued, tuned, fallbacks), for the gate that checks the
+/// tuned plans actually ran.
+#[cfg(all(feature = "cuda", feature = "test-hooks"))]
+pub fn test_lt_matmul_tf32_stats() -> (u64, u64, u64) {
+    lt_matmul::tf32_stats()
+}
 #[cfg(all(feature = "cuda", feature = "test-hooks"))]
 pub fn test_lt_matmul_reset() {
     lt_matmul::reset_for_test()
@@ -2959,6 +2965,31 @@ pub(crate) mod cublas_inner {
                 return Ok(());
             }
         }
+        // A low-intensity product keeps f32 storage at FAST_TF32: the same
+        // arithmetic as the TF32 mode's GEMMs, so it takes the same tuned
+        // cublasLt plan when one applies (a decline falls through below).
+        if scratch.is_none()
+            && super::lt_matmul::tf32_lt_applies(m as u64, n as u64, k as u64)
+            && unsafe {
+                super::lt_matmul::matmul_f32_tf32(
+                    transa == cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                    transb == cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                    m,
+                    n,
+                    k,
+                    *alpha,
+                    a_dev,
+                    lda,
+                    b_dev,
+                    ldb,
+                    *beta,
+                    c_dev,
+                    ldc,
+                )
+            }
+        {
+            return Ok(());
+        }
         let (a_ptr, b_ptr, ab_type, compute) = match scratch {
             Some(s) => (
                 s.first16 as *const std::ffi::c_void,
@@ -3129,6 +3160,32 @@ pub(crate) mod cublas_inner {
                     scratch.as_ref(),
                 )
             };
+        }
+        // TF32: the shape's tuned cublasLt plan when one applies (see
+        // `lt_matmul`'s TF32 section: cuBLAS 13.8's sgemm heuristic picks
+        // 64x64-tile kernels for most transformer shapes on sm_120). A decline
+        // wrote nothing and falls through to the sgemm it always was.
+        if resolved_math_mode() == CublasMathMode::Tf32
+            && super::lt_matmul::tf32_lt_applies(m, n, k)
+            && unsafe {
+                super::lt_matmul::matmul_f32_tf32(
+                    transb,
+                    transa,
+                    n as i32,
+                    m as i32,
+                    k as i32,
+                    alpha,
+                    b_dev,
+                    if transb { k as i32 } else { n as i32 },
+                    a_dev,
+                    if transa { m as i32 } else { k as i32 },
+                    beta,
+                    c_dev,
+                    n as i32,
+                )
+            }
+        {
+            return Ok(());
         }
         unsafe {
             cublas_result::sgemm(
@@ -3385,6 +3442,30 @@ pub(crate) mod cublas_inner {
                     scratch.as_ref(),
                 )
             };
+        }
+        // TF32: the tuned cublasLt plan, as in `sgemm_row_major_t`. beta = 1
+        // accumulates into C exactly as the sgemm below does.
+        if resolved_math_mode() == CublasMathMode::Tf32
+            && super::lt_matmul::tf32_lt_applies(d_out, d_in, n_rows)
+            && unsafe {
+                super::lt_matmul::matmul_f32_tf32(
+                    false,
+                    true,
+                    d_out as i32,
+                    d_in as i32,
+                    n_rows as i32,
+                    alpha,
+                    g_dev,
+                    d_out as i32,
+                    x_dev,
+                    d_in as i32,
+                    beta,
+                    c_dev,
+                    d_out as i32,
+                )
+            }
+        {
+            return Ok(());
         }
         unsafe {
             cublas_result::sgemm(

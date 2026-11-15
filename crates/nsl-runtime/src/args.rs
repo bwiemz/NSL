@@ -505,12 +505,28 @@ extern "C" fn nsl_bf16_lt_atexit() {
             ("fallbacks", crate::events::i(fallbacks as i64)),
         ],
     );
+    // The TF32 GEMMs' cublasLt path (`lt_matmul`'s TF32 section): same
+    // anti-vacuity reason — a run whose plans all declined is a cublasSgemm
+    // run, and only these counts say so.
+    let (t_issued, t_tuned, t_fallbacks) = crate::cuda::lt_matmul::tf32_stats();
+    crate::events::emit(
+        "tf32_lt_counters",
+        None,
+        &[
+            ("issued", crate::events::i(t_issued as i64)),
+            ("tuned", crate::events::i(t_tuned as i64)),
+            ("fallbacks", crate::events::i(t_fallbacks as i64)),
+        ],
+    );
     if std::env::var("NSL_BF16_LT_COUNTER").ok().as_deref() != Some("1") {
         return;
     }
     // One formatted write — multi-rank stderr TEARS per-fragment writes
     // (see the fase-fused reporter above).
-    let report = format!("[bf16-lt] issued={issued} tuned={tuned} fallbacks={fallbacks}\n");
+    let report = format!(
+        "[bf16-lt] issued={issued} tuned={tuned} fallbacks={fallbacks}\n\
+         [tf32-lt] issued={t_issued} tuned={t_tuned} fallbacks={t_fallbacks}\n"
+    );
     use std::io::Write;
     let _ = std::io::stderr().lock().write_all(report.as_bytes());
 }
