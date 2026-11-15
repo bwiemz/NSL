@@ -46,7 +46,7 @@ Every `NSL_*` variable the toolchain reads (175 of them), from the registry in `
 | Variable | Kind | Accepted | Default | Read at | What it does |
 |---|---|---|---|---|---|
 | `NSL_ARENA_SLOT_LIMIT` | int | integer slot count (trimmed); unparseable → 0 = place nothing (fail-closed) | unlimited (i64::MAX) | runtime | Place only transient-arena slots with index below N; bisection aid for arena corruption. Unparseable values place nothing. |
-| `NSL_ASYNC_ALLOC` | bool | 1 only | off | runtime | Allocate GPU memory via cuMemAllocAsync from the driver's default pool instead of the caching allocator; incompatible with CUDA graphs. Measured 2026-11 with the production flags: +1.2 GiB driver peak and 0.98x tok/s at Coder-1B, and the allocator's reserved figure is no longer tracked. |
+| `NSL_ASYNC_ALLOC` | bool | 1 only | off | runtime | Allocate via cuMemAllocAsync (driver pool), not the caching allocator; incompatible with CUDA graphs. Measured at Coder-1B: +1.2 GiB driver peak, 0.98x tok/s. |
 | `NSL_AUTOTUNE_FALLBACK` | bool | any value (set, even empty; docs say 1) | off | compile | Skips @autotune measurement/cost-model selection and picks the median candidate of every tuning parameter (no-GPU mode). |
 | `NSL_CCR_SEGMENT_FREE` | bool | 0 disables; anything else or unset = on | on | compile | Kill switch for CCR per-segment forward early-free (memory only; already skipped under --weight-stream or --layerwise-accum). |
 | `NSL_CUDA_GRAPHS` | bool | 0 disables; anything else ignored | on when the program was compiled with --cuda-graphs | runtime | Kill switch for per-region CUDA graph capture/replay in programs built with --cuda-graphs; 0 keeps every region eager. |

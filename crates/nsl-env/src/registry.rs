@@ -93,7 +93,7 @@ pub static REGISTRY: &[EnvVar] = &[
         "off",
         Perf,
         Runtime,
-        "Allocate GPU memory via cuMemAllocAsync from the driver's default pool instead of the caching allocator; incompatible with CUDA graphs. Measured 2026-11 with the production flags: +1.2 GiB driver peak and 0.98x tok/s at Coder-1B, and the allocator's reserved figure is no longer tracked."
+        "Allocate via cuMemAllocAsync (driver pool), not the caching allocator; incompatible with CUDA graphs. Measured at Coder-1B: +1.2 GiB driver peak, 0.98x tok/s."
     ),
     var!(
         "NSL_AUTOTUNE_FALLBACK",
