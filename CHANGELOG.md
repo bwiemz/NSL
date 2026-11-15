@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+<!-- bf16 activation storage, first slice (2026-11-15). -->
+- **bf16 activation storage.**
+  - `train(..., precision = "bf16")` stores activations and their gradients in bf16 where PyTorch autocast does, computing in f32 inside every kernel with one rounding (to nearest even) on store; parameters, weight gradients, optimizer state, the residual stream and the gradient summed from several GEMMs stay f32. This first slice stores the SwiGLU MLP half of each pre-norm block (norm output, gate, up, silu, silu·up, down output and their gradients), decided by a compile-time storage plan over the source-AD step. Measured with `tools/perfcheck` against the bf16 matmul mode (`NSL_MATMUL_BF16=1`): Coder-1B 1.195x tok/s [1.187-1.198] with a 2.0 GiB lower allocator peak, Coder-500M 1.175x [1.106-1.225] and 0.54 GiB lower. At 50M its gradients are within PyTorch autocast's distance of f32 (about a third of it), and over 5 seeds and 1,000 updates its held-out loss matches the autocast twin (+0.006, 2 SE 0.030). It sets the bf16 matmul mode, adds `act=bf16` to the execution fingerprint and prints `activation storage: bf16`; it requires `--source-ad`, and is a compile error with a disagreeing `--matmul-mode`, `NSL_MATMUL_BF16=0`, `--cuda-graphs`, `--layerwise-accum`, `--weight-stream`, `--param-dtype bf16-sr`, `--checkpoint-compress`, `--transient-arena`, `--cpdt full`, a WGGO moment plan, `@pipeline`, and on a step with no SwiGLU block to store. The production recipes do not use it yet.
+  - Storage-generic KIR kernels (elementwise, unary, SwiGLU gate backward, rotate_half, RMSNorm forward) taking f32 or bf16 per operand, and GEMMs on bf16 operands with a bf16 or f32 output (the fused weight gradient accumulates bf16 activations into f32). The f32 instantiations print the same PTX as before.
+  - `tools/perfcheck` arm `nsl_bf16s`; `tools/refcheck` `--precision bf16`, `--autocast bf16` (the PyTorch twin under `torch.autocast`) and `--batches`.
+
 <!-- perf round 1 (2026-11-15): host stalls, GEMM selection and tensor-core attention, measured with tools/perfcheck against main and PyTorch. -->
 - **Training speed.**
   - Tensor-core flash attention, forward and backward, built with KIR (`mma.sync` m16n8k16, f16 operands rounded to nearest, f32 accumulation): it serves unpacked `scaled_dot_product_attention` at head dims 64 and 128 on GPUs of compute capability 8.0 and up, at sequence lengths that are not a multiple of the tile as well as those that are, reading grouped K/V in place. At the Coder-1B shape a forward takes 0.42 ms and a backward 1.4 ms per call, against 1.76 and 8.6 ms before. `NSL_TC_ATTENTION=0` restores the previous kernels. Packed batches and other head dims keep the previous kernels. Write-up: `models/benchmarks/ATTENTION_TC_2026_11.md`.
@@ -3583,6 +3589,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- **Fused weight gradients under selective checkpointing.** `--fuse-wgrad-accum` now fuses every projection's weight gradient under `--checkpoint-selective`: the recompute splice placed a free inside Wq's chain (transpose, batched GEMM, reduce), which then ran unfused as a TF32 batched GEMM. Coder-1B 1.02-1.03x, Coder-500M 1.03-1.05x.
+- The bf16 weight-cast cache serves sub-views of a registered parameter (the fused LM head's vocabulary chunks), which were recast on every chunk.
+- The execution fingerprint no longer carries `dtype=`, which was the same ("bf16") on every build; checkpoints that have it still resume.
 - **Training speed.** Measured with `tools/perfcheck` (production flags, 3 interleaved rounds, ratios paired within a round): Coder-1B trains 1.42x faster in its bf16 recipe posture (6,778 to 9,619 tok/s) and 1.43x faster at TF32 (5,067 to 7,245); Coder-500M 1.42x at TF32 (its recipe) and 1.34x in bf16. Peak memory is unchanged (driver peak within 0.3 GiB).
   - The step-boundary GPU drain returns idle cached memory to the driver only when the pool holds more than max(1 GiB, half the step's demand) beyond the step's peak. It used to drain, with a synchronisation, after every micro-batch. A failed allocation still drains and retries.
   - RoPE positions are gathered from a device-resident iota instead of an 8 KB host upload per call.
