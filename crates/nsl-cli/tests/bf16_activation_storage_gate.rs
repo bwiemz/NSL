@@ -124,6 +124,23 @@ fn both_swiglu_blocks_are_planned_and_an_f32_program_plans_nothing() {
     assert!(!r.out.contains("[bf16-storage]"), "an f32 program must not be planned:\n{}", r.out);
 }
 
+/// The 500M recipe trains with dropout 0.1 after the down projection: the
+/// block is still planned (its down output stored f32 for the f32-only
+/// dropout kernel).
+#[test]
+fn a_block_with_a_dropout_tail_is_planned() {
+    let src = fixture(BF16, false).replace(
+        "return x + (gate * up) @ self.w_down",
+        "return x + dropout((gate * up) @ self.w_down, 0.1, true)",
+    );
+    assert!(src.contains("dropout("), "fixture edit did not apply");
+    let mut args = vec!["build"];
+    args.extend_from_slice(PROD);
+    let r = nsl(&args, &src, "plan_dropout", false, &[]);
+    assert!(r.ok, "precision=\"bf16\" build with dropout failed:\n{}", r.out);
+    assert!(r.out.contains(PLANNED), "the dropout-tail blocks were not planned:\n{}", r.out);
+}
+
 #[test]
 fn compositions_this_phase_does_not_support_are_compile_errors() {
     let src = fixture(BF16, false);

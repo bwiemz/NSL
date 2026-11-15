@@ -14,6 +14,9 @@
 //! r = h + d                      f32  (the residual stream stays f32)
 //! ```
 //!
+//! (when `d` feeds a training dropout instead, whose kernel is f32-only, `d`
+//! is stored f32 and the rest of the block as above)
+//!
 //! and in the backward: the gradients of `a`, `s`, `u`, `p` are bf16 (where
 //! PyTorch autocast has them bf16); the gradient of `n` stays f32 (both its
 //! dgrads are written f32 and summed in f32, then read by the f32 norm
@@ -85,6 +88,10 @@ struct Slice {
     u: VarId,
     p: VarId,
     d: VarId,
+    /// `d` feeds a training dropout (whose kernel is f32-only) rather than
+    /// the residual add: `d` is then stored f32 (the down GEMM rounds its
+    /// f32 accumulator to f32, more precise than autocast's bf16 there).
+    d_f32: bool,
 }
 
 fn producers(list: &WengertList) -> HashMap<VarId, &WengertOp> {
@@ -160,12 +167,17 @@ fn find_slices(primal: &WengertList) -> Vec<Slice> {
         if n_readers != HashSet::from([a_prod, u_prod]) || rd.get(&n).map_or(0, Vec::len) != 2 {
             continue;
         }
-        // The down projection feeds the residual add(s) and nothing else.
+        // The down projection feeds the residual add(s), or a training
+        // dropout (its mask and its apply, both reading `d`), and nothing else.
         let d_readers = rd.get(&d).map(Vec::as_slice).unwrap_or_default();
-        if d_readers.is_empty() || !d_readers.iter().all(|o| matches!(o.op, PrimalOp::Add)) {
+        let to_residual = !d_readers.is_empty() && d_readers.iter().all(|o| matches!(o.op, PrimalOp::Add));
+        let to_dropout = d_readers.len() == 2
+            && d_readers.iter().any(|o| matches!(o.op, PrimalOp::DropoutMask { .. }))
+            && d_readers.iter().any(|o| matches!(o.op, PrimalOp::Dropout { .. }));
+        if !to_residual && !to_dropout {
             continue;
         }
-        out.push(Slice { n, a, s, u, p, d });
+        out.push(Slice { n, a, s, u, p, d, d_f32: to_dropout });
     }
     out
 }
@@ -301,10 +313,16 @@ pub fn plan(primal: &WengertList, adjoint: &WengertList, clones: &HashMap<VarId,
     let mut pl = Planner { plan: StoragePlan { slices: slices.len(), ..Default::default() }, grad_bf16: HashSet::new(), clones };
     let prod = producers(primal);
     for sl in &slices {
-        for v in [sl.n, sl.a, sl.s, sl.u, sl.p, sl.d] {
+        for v in [sl.n, sl.a, sl.s, sl.u, sl.p] {
             pl.set(prod[&v], Storage::Bf16);
         }
-        pl.grad_bf16.extend([sl.a, sl.s, sl.u, sl.p, sl.d]);
+        pl.grad_bf16.extend([sl.a, sl.s, sl.u, sl.p]);
+        if sl.d_f32 {
+            pl.set(prod[&sl.d], Storage::F32);
+        } else {
+            pl.set(prod[&sl.d], Storage::Bf16);
+            pl.grad_bf16.insert(sl.d);
+        }
     }
     let rd_adj = readers(adjoint);
     for op in &primal.ops {
@@ -544,6 +562,28 @@ mod tests {
         for v in [520, 512, 519, 496, 497, 525] {
             assert!(!got.out.contains_key(&v) && !got.bf16.contains(&v), "VarId {v} must stay f32");
         }
+    }
+
+    /// The 500M recipe's block: `dropout(d)` between the down projection and
+    /// the residual add. `d` is written f32 (the dropout kernel reads f32);
+    /// everything before it as in the dropout-free block.
+    #[test]
+    fn a_dropout_tail_keeps_the_down_output_f32_and_the_rest_bf16() {
+        let (mut primal, adjoint, clones) = block();
+        let add = primal.ops.pop().expect("residual add");
+        assert_eq!(add.result, 144);
+        primal.ops.push(op(141, PrimalOp::DropoutMask { p: 0.1 }, &[140]));
+        primal.ops.push(op(143, PrimalOp::Dropout { p: 0.1 }, &[140, 141]));
+        primal.ops.push(op(144, PrimalOp::Add, &[129, 143]));
+        let got = plan(&primal, &adjoint, &clones).expect("plans");
+        assert_eq!(got.slices, 1);
+        assert_eq!(got.out.get(&140), Some(&Storage::F32), "the down GEMM writes f32 from bf16 p");
+        assert!(!got.bf16.contains(&140) && !got.bf16.contains(&143));
+        for v in [132, 134, 135, 137, 138, 501, 508, 516] {
+            assert_eq!(got.out.get(&v), Some(&Storage::Bf16), "VarId {v}");
+        }
+        // The residual add reads two f32 values: ordinary lowering.
+        assert_eq!(got.out.get(&144), None);
     }
 
     #[test]
