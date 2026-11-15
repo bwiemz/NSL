@@ -2238,12 +2238,15 @@ pub(crate) fn run_backward_core_strict(
                         (nsl_tensor_to_device(g, 0), true)
                     } else { (g, false) };
                     let g_t = crate::tensor::NslTensor::from_ptr(g_bias_cpu);
-                    if g_t.ndim < 2 {
-                        crate::nsl_log!(ERROR, "nsl", "nsl: BiasAdd backward expects 2D+ gradient, got {}D", g_t.ndim);
+                    if g_t.ndim < 1 {
+                        crate::nsl_log!(ERROR, "nsl", "nsl: BiasAdd backward got a 0-d gradient");
                         std::process::abort();
                     }
-                    let rows = unsafe { *g_t.shape.add(0) } as usize;
-                    let cols = unsafe { *g_t.shape.add(1) } as usize;
+                    // The bias ran along the last dimension; its gradient
+                    // is the sum over every leading one. (It read dims 0 and
+                    // 1 as rows and columns, which is right only in 2-D.)
+                    let cols = unsafe { *g_t.shape.add(g_t.ndim as usize - 1) } as usize;
+                    let rows = if cols == 0 { 0 } else { g_t.len as usize / cols };
 
                     let g_dtype = g_t.dtype;
                     let grad_bias = crate::cpu::create_tensor_with_shape_rs_dtype(&[cols as i64], g_dtype);

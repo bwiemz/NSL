@@ -146,6 +146,12 @@ impl<'a> TypeChecker<'a> {
             (l, r) if dtype_rank(l).0 > 0 && dtype_rank(r).0 > 0 => {
                 let (lf, lr) = dtype_rank(l);
                 let (rf, rr) = dtype_rank(r);
+                // `/` is true division for every integer width, as for
+                // `int`: `int64 / int64` stayed an integer and codegen
+                // emitted `sdiv`, so `/` meant two things.
+                if matches!(op, BinOp::Div) && lf == 1 && rf == 1 {
+                    return Type::Float;
+                }
                 if lf == rf {
                     // Same family: return the wider type
                     if lr >= rr { l.clone() } else { r.clone() }
@@ -540,10 +546,20 @@ impl<'a> TypeChecker<'a> {
                 return Type::List(Box::new(Type::Tuple(vec![a, b])));
             }
 
+            // `range` takes ints. Its parameters are typed `Unknown` (it is
+            // variadic), so a float bound passed the checker and reached
+            // `nsl_range` as an f64: a verifier error with no span.
+            if name == "range" {
+                for (arg, ty) in args.iter().zip(&arg_types) {
+                    self.refuse_float_where_int("a range() argument", &arg.value, ty);
+                }
+            }
+
             // Tensor creation shape inference. f32 is the default float dtype
             // (C5 step 3), what the runtime makes; an annotation on the
             // declaration can choose f64 (`check_var_decl`).
             if matches!(name.as_str(), "zeros" | "ones" | "rand" | "randn" | "empty") {
+                self.check_shape_list_dims(name.as_str(), args);
                 let shape = self.extract_shape_from_args(args);
                 return Type::Tensor {
                     shape,
@@ -552,6 +568,7 @@ impl<'a> TypeChecker<'a> {
                 };
             }
             if name == "full" {
+                self.check_shape_list_dims("full", args);
                 let shape = self.extract_shape_from_args(args);
                 return Type::Tensor {
                     shape,
@@ -594,6 +611,7 @@ impl<'a> TypeChecker<'a> {
                 if let Type::Tensor { dtype, device, .. } = &obj_ty {
                     match method_name.as_str() {
                         "reshape" => {
+                            self.check_shape_list_dims("reshape", args);
                             let target_shape = self.extract_shape_from_args(args);
                             if let Type::Tensor { shape: source_shape, .. } = &obj_ty {
                                 // M49: Prove reshape correctness via shape algebra
@@ -626,6 +644,7 @@ impl<'a> TypeChecker<'a> {
                         // `extract_shape_from_args` degrades to an unknown
                         // shape for non-literal lists.
                         "expand" => {
+                            self.check_shape_list_dims("expand", args);
                             let target_shape = self.extract_shape_from_args(args);
                             return Type::Tensor {
                                 shape: target_shape,
@@ -706,6 +725,11 @@ impl<'a> TypeChecker<'a> {
                     arg_types.iter().zip(params.iter()).enumerate()
                 {
                     if !is_assignable(arg_ty, param_ty) {
+                        let label = if is_float_scalar(arg_ty) && dtype_rank(param_ty).0 == 1 {
+                            float_where_int_hint(&args[i].value)
+                        } else {
+                            "type mismatch"
+                        };
                         self.diagnostics.push(
                             Diagnostic::error(format!(
                                 "argument {}: expected {}, got {}",
@@ -713,7 +737,7 @@ impl<'a> TypeChecker<'a> {
                                 display_type(param_ty),
                                 display_type(arg_ty)
                             ))
-                            .with_label(args[i].span, "type mismatch"),
+                            .with_label(args[i].span, label),
                         );
                     }
 
@@ -732,7 +756,31 @@ impl<'a> TypeChecker<'a> {
 
                 *ret.clone()
             }
-            Type::Model { .. } => callee_ty.clone(),
+            Type::Model { name, .. } => {
+                // A constructor call passes one argument per model parameter.
+                // A mismatch used to reach code generation and fail
+                // Cranelift's verifier on the call's argument count.
+                if let ExprKind::Ident(sym) = &callee.kind
+                    && *sym == *name
+                    && let Some(&(expected, has_default)) = self.model_ctor_params.get(sym)
+                    && args.len() != expected
+                {
+                    let model = self.resolve_name(*name);
+                    let note = if has_default && args.len() < expected {
+                        " (default values of model parameters are not supported: pass every argument)"
+                    } else {
+                        ""
+                    };
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "model '{model}' takes {expected} constructor argument(s), got {}{note}",
+                            args.len()
+                        ))
+                        .with_label(span, "wrong number of arguments"),
+                    );
+                }
+                callee_ty.clone()
+            }
             Type::Struct { .. } => callee_ty.clone(),
             Type::Error => Type::Error,
             Type::Unknown => Type::Unknown,
@@ -782,6 +830,78 @@ impl<'a> TypeChecker<'a> {
             product = DimExpr::Mul(Box::new(product), Box::new(e.clone()));
         }
         Some(product)
+    }
+
+    /// A shape list's dimensions are integers. A float one (`c / nh`, where
+    /// `/` is true division) was converted to an integer on the way into the
+    /// list, truncating 3.5 to 3 without a word; it is an error that names
+    /// `//`. The list may be written in place or arrive in a variable
+    /// (`let s = [n / 2, 4]`, then `x.reshape(s)`): a list whose elements
+    /// the checker types as floats is refused either way.
+    pub(crate) fn check_shape_list_dims(&mut self, func: &str, args: &[Arg]) {
+        let Some(first) = args.first() else {
+            return;
+        };
+        if let ExprKind::ListLiteral(elems) = &first.value.kind {
+            for elem in elems {
+                let ty = self.type_map.get(&elem.id).cloned().unwrap_or(Type::Unknown);
+                if is_float_scalar(&ty) {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "{func}(): a shape dimension is a float, not an int"
+                        ))
+                        .with_label(elem.span, float_where_int_hint(elem)),
+                    );
+                }
+            }
+            return;
+        }
+        if let Some(Type::List(elem)) = self.type_map.get(&first.value.id).cloned()
+            && is_float_scalar(&elem)
+        {
+            self.diagnostics.push(
+                Diagnostic::error(format!(
+                    "{func}(): the shape is a list of floats, not of ints"
+                ))
+                .with_label(
+                    first.value.span,
+                    "a dimension must be an int: `/` is true division; use `//` for integer \
+                     division, or `int(...)`",
+                ),
+            );
+        }
+    }
+
+    /// Refuse a float where an int is required (`what` names the position).
+    pub(crate) fn refuse_float_where_int(&mut self, what: &str, expr: &Expr, ty: &Type) {
+        if is_float_scalar(ty) {
+            self.diagnostics.push(
+                Diagnostic::error(format!("{what} must be an int, not a float"))
+                    .with_label(expr.span, float_where_int_hint(expr)),
+            );
+        }
+    }
+
+    /// The index expressions of a subscript on a sequence are ints.
+    pub(crate) fn refuse_float_subscript(&mut self, kind: &nsl_ast::expr::SubscriptKind) {
+        use nsl_ast::expr::SubscriptKind;
+        let check = |this: &mut Self, e: &Expr| {
+            let ty = this.type_map.get(&e.id).cloned().unwrap_or(Type::Unknown);
+            this.refuse_float_where_int("an index", e, &ty);
+        };
+        match kind {
+            SubscriptKind::Index(e) => check(self, e),
+            SubscriptKind::Slice { lower, upper, step } => {
+                for e in [lower, upper, step].into_iter().flatten() {
+                    check(self, e);
+                }
+            }
+            SubscriptKind::MultiDim(dims) => {
+                for d in dims {
+                    self.refuse_float_subscript(d);
+                }
+            }
+        }
     }
 
     pub(crate) fn extract_shape_from_args(&self, args: &[Arg]) -> Shape {

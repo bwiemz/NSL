@@ -33,6 +33,12 @@ init_expr       ::= 'init.xavier' '(' shape ')' | 'init.kaiming' '(' shape ')'
                    | 'init.uniform' '(' shape ',' FLOAT ',' FLOAT ')'
 ```
 
+A model's constructor is its parameter list and its field initialisers:
+`Block(2.0)` binds `k` in `model Block(k: float):` and evaluates every
+field's initialiser. A call passes exactly one argument per parameter
+(default values of model parameters are not implemented), and a method named
+`__init__` is refused: it is not a constructor.
+
 ## Built-in Layer Types
 
 | Layer           | Constructor Signature                                                | Description                          |

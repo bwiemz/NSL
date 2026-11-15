@@ -949,8 +949,14 @@ fn base_certs() -> Vec<Cert> {
             expr: "stack([a, b, c], -1)", wrt: &["a", "b", "c"], out_shape: &[3, 4, 3],
             oracle: oracle!(|e| stack_ref(&[get(e, "a"), get(e, "b"), get(e, "c")], 2)), known: tape_only!("source AD does not extract `stack`"), prelude: "" },
         // The stdlib Linear's bias: `bias_add(x @ w.transpose(0, 1), b)`.
+        // Source AD extracts it as the broadcasting Add.
         Cert { name: "bias_add", inputs: XY_ROW.to_vec(), expr: "bias_add(x, y)", wrt: &["x", "y"], out_shape: &[3, 4],
-            oracle: oracle!(|e| binary(get(e, "x"), get(e, "y"), |a, b| a + b)), known: tape_only!("source AD does not extract `bias_add`"), prelude: "" },
+            oracle: oracle!(|e| binary(get(e, "x"), get(e, "y"), |a, b| a + b)), known: &[], prelude: "" },
+        // A [batch, seq, features] activation: the bias runs along the last
+        // dimension and its gradient sums over both leading ones. Only 2-D
+        // input used to be accepted.
+        Cert { name: "bias_add_3d", inputs: vec![inp("x", &[2, 3, 4]), inp("y", &[4])], expr: "bias_add(x, y)", wrt: &["x", "y"], out_shape: &[2, 3, 4],
+            oracle: oracle!(|e| binary(get(e, "x"), get(e, "y"), |a, b| a + b)), known: &[], prelude: "" },
         // Non-overlapping, overlapping (an input can win several windows, so
         // its gradient accumulates) and padded windows.
         Cert { name: "maxpool2d", inputs: X_POOL.to_vec(), expr: "maxpool2d(x, 2, 2, 2, 0)", wrt: &["x"], out_shape: &[1, 2, 2, 2],
@@ -1711,7 +1717,7 @@ cert_tests! {
     reduce_max_dim1, reduce_max_dim0, reduce_max_keepdim_last, reduce_max_keepdim_mid, reduce_max_mid,
     slice_dim1, slice_dim0, slice_neg, slice_mid,
     stack_dim0, stack_dim1, stack_neg,
-    bias_add, maxpool2d, maxpool2d_overlap, maxpool2d_pad, dropout_seeded,
+    bias_add, bias_add_3d, maxpool2d, maxpool2d_overlap, maxpool2d_pad, dropout_seeded,
     sum_dim_keepdim_mid, mean_dim_keepdim_mid,
     add_row_vgrad, sub_row_vgrad, mul_col_vgrad, div_row_vgrad, matmul_2d_vgrad, neg_vgrad,
     cast_f64_round_trip_vgrad, mul_literal_vgrad, add_literal_vgrad, transpose_3d_vgrad,

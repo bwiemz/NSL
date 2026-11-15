@@ -346,6 +346,89 @@ impl Compiler<'_> {
         Ok(())
     }
 
+    // ── Pass 0.5a': Collect module-level compile-time constants ─────
+
+    /// Record every top-level `const NAME = <expr>` whose value folds to a
+    /// literal: a literal, a negation, `+ - * / // %` of such values, or an
+    /// earlier constant. `/` of two integers is true division, as the checker
+    /// types it. A `const` whose value does not fold (a tensor, a call) is
+    /// left out: it stays a variable of `main` only.
+    pub fn collect_module_consts(&mut self, stmts: &[Stmt]) -> Result<(), CodegenError> {
+        for stmt in stmts {
+            let StmtKind::VarDecl { is_const, pattern, value, .. } = &stmt.kind else {
+                continue;
+            };
+            let nsl_ast::pattern::PatternKind::Ident(sym) = &pattern.kind else {
+                continue;
+            };
+            self.types.module_bindings.insert(*sym);
+            if *is_const
+                && let Some(value) = value
+                && let Some(v) = self.fold_module_const(value)
+            {
+                self.types.module_consts.insert(*sym, v);
+            }
+        }
+        Ok(())
+    }
+
+    fn fold_module_const(&self, expr: &Expr) -> Option<crate::compiler::ModuleConst> {
+        use crate::compiler::ModuleConst as C;
+        use nsl_ast::operator::{BinOp, UnaryOp};
+        match &expr.kind {
+            ExprKind::IntLiteral(v) => Some(C::Int(*v)),
+            ExprKind::FloatLiteral(v) => Some(C::Float(*v)),
+            ExprKind::BoolLiteral(v) => Some(C::Bool(*v)),
+            ExprKind::StringLiteral(v) => Some(C::Str(v.clone())),
+            ExprKind::Ident(sym) => self.types.module_consts.get(sym).cloned(),
+            ExprKind::Paren(inner) => self.fold_module_const(inner),
+            ExprKind::UnaryOp { op: UnaryOp::Neg, operand } => match self.fold_module_const(operand)? {
+                C::Int(v) => v.checked_neg().map(C::Int),
+                C::Float(v) => Some(C::Float(-v)),
+                _ => None,
+            },
+            ExprKind::BinaryOp { left, op, right } => {
+                let (l, r) = (self.fold_module_const(left)?, self.fold_module_const(right)?);
+                match (l, r) {
+                    (C::Int(a), C::Int(b)) => match op {
+                        BinOp::Add => a.checked_add(b).map(C::Int),
+                        BinOp::Sub => a.checked_sub(b).map(C::Int),
+                        BinOp::Mul => a.checked_mul(b).map(C::Int),
+                        BinOp::Div if b != 0 => Some(C::Float(a as f64 / b as f64)),
+                        // Python's: the quotient rounds toward -inf and
+                        // the remainder takes the divisor's sign, as the
+                        // emitted `//` and `%` do.
+                        BinOp::FloorDiv if b != 0 => {
+                            let q = a.checked_div(b)?;
+                            Some(C::Int(if a % b != 0 && ((a < 0) != (b < 0)) { q - 1 } else { q }))
+                        }
+                        BinOp::Mod if b != 0 => {
+                            let r = a.checked_rem(b)?;
+                            Some(C::Int(if r != 0 && ((r < 0) != (b < 0)) { r + b } else { r }))
+                        }
+                        _ => None,
+                    },
+                    (l, r) => {
+                        let as_f = |c: C| match c {
+                            C::Int(v) => Some(v as f64),
+                            C::Float(v) => Some(v),
+                            _ => None,
+                        };
+                        let (a, b) = (as_f(l)?, as_f(r)?);
+                        match op {
+                            BinOp::Add => Some(C::Float(a + b)),
+                            BinOp::Sub => Some(C::Float(a - b)),
+                            BinOp::Mul => Some(C::Float(a * b)),
+                            BinOp::Div => Some(C::Float(a / b)),
+                            _ => None,
+                        }
+                    }
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Look up an enum variant by name and return its integer tag.
     /// Accepts both bare names ("Red") and qualified names ("Color.Red").
     pub fn lookup_enum_variant_tag(&self, name: &str) -> Option<i64> {

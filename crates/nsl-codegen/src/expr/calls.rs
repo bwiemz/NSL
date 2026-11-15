@@ -1188,7 +1188,7 @@ impl Compiler<'_> {
                 &[weight_val, indices_val],
             );
         }
-        // bias_add(tensor, bias) -> tensor -- broadcasts 1D bias over 2D tensor
+        // bias_add(tensor, bias) -> tensor -- a 1-D bias along the last dim of [..., C]
         if func_name == "bias_add" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 2 {
                 return Err(CodegenError::new(
@@ -3139,7 +3139,28 @@ impl Compiler<'_> {
                             BOOL_KEYS.join(", ")
                         )));
                     }
-                    match &arg.value.kind {
+                    // A module `const` with a literal value is a
+                    // compile-time constant like the literal it names.
+                    let folded;
+                    let kind = match &arg.value.kind {
+                        ExprKind::Ident(sym) => match self.types.module_consts.get(sym) {
+                            Some(crate::compiler::ModuleConst::Int(v)) => {
+                                folded = ExprKind::IntLiteral(*v);
+                                &folded
+                            }
+                            Some(crate::compiler::ModuleConst::Bool(v)) => {
+                                folded = ExprKind::BoolLiteral(*v);
+                                &folded
+                            }
+                            Some(crate::compiler::ModuleConst::Float(v)) => {
+                                folded = ExprKind::FloatLiteral(*v);
+                                &folded
+                            }
+                            _ => &arg.value.kind,
+                        },
+                        other => other,
+                    };
+                    match kind {
                         ExprKind::IntLiteral(v) if wants_int => {
                             if *v < 0 {
                                 return Err(CodegenError::new(format!(

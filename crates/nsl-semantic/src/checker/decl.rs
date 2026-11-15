@@ -149,17 +149,7 @@ impl<'a> TypeChecker<'a> {
         self.check_type_param_bounds(&fn_def.type_params);
 
         // Declare params
-        for param in &fn_def.params {
-            let param_ty = param
-                .type_ann
-                .as_ref()
-                .map(|t| self.resolve_type(t))
-                .unwrap_or(Type::Unknown);
-            self.declare_symbol(param.name, param_ty, param.span, false, true);
-            if let Some(default) = &param.default {
-                self.check_expr(default);
-            }
-        }
+        self.declare_params_from_signature(fn_def, &fn_ty);
 
         // Check body (track callees for effect graph)
         let prev_callees = std::mem::take(&mut self.current_callees);

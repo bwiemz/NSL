@@ -501,7 +501,7 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         },
     );
 
-    // bias_add(tensor, bias) -> tensor — broadcasts 1D bias over 2D tensor
+    // bias_add(tensor, bias) -> tensor — a 1-D bias along the last dim of [..., C]
     def(
         "bias_add",
         Type::Function {

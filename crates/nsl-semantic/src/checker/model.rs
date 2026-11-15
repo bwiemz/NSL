@@ -347,6 +347,22 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
                 ModelMember::Method(fn_def, decos) => {
+                    // A model's constructor is its parameter list and its
+                    // field initialisers (spec §4). `fn __init__` was
+                    // compiled as an ordinary method nothing calls, and a
+                    // call passing it arguments failed Cranelift's verifier
+                    // on the argument count.
+                    if self.resolve_name(fn_def.name) == "__init__" {
+                        let model = self.resolve_name(model_def.name);
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "`fn __init__` is not a constructor in NSL: a model is built from \
+                                 its parameter list and field initialisers, as in `model {model}(k: \
+                                 float):` with `w: Tensor = full([2, 2], k)`"
+                            ))
+                            .with_label(fn_def.span, "not a constructor"),
+                        );
+                    }
                     let method_ty = self.build_fn_type(fn_def);
                     methods.push((fn_def.name, method_ty));
 
@@ -450,10 +466,14 @@ impl<'a> TypeChecker<'a> {
             methods: methods.clone(),
         };
 
-        // Pass 2: Check method bodies with complete self type
+        // Pass 2: Check method bodies with complete self type. The method's
+        // signature is the one pass 1 resolved (resolving it again
+        // reported its errors again).
+        let mut method_types = methods.iter().map(|(_, ty)| ty.clone());
         for member in &model_def.members {
             if let ModelMember::Method(fn_def, _decos) = member {
-                let method_ty = self.build_fn_type(fn_def);
+                // Pass 1 pushed one signature per method, in member order.
+                let method_ty = method_types.next().unwrap_or(Type::Unknown);
 
                 let method_scope =
                     self.scopes.push_scope(self.current_scope, ScopeKind::Method);
@@ -471,21 +491,7 @@ impl<'a> TypeChecker<'a> {
                 }
 
                 // Declare params (skip self)
-                for param in &fn_def.params {
-                    let name_str = self.resolve_name(param.name);
-                    if name_str == "self" {
-                        continue;
-                    }
-                    let param_ty = param
-                        .type_ann
-                        .as_ref()
-                        .map(|t| self.resolve_type(t))
-                        .unwrap_or(Type::Unknown);
-                    self.declare_symbol(param.name, param_ty, param.span, false, true);
-                    if let Some(default) = &param.default {
-                        self.check_expr(default);
-                    }
-                }
+                self.declare_params_from_signature(fn_def, &method_ty);
 
                 // Check method body
                 for s in &fn_def.body.stmts {

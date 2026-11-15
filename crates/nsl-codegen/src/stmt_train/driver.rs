@@ -1180,13 +1180,12 @@ impl Compiler<'_> {
                 // fused kernel only exists on the source-AD path, so a tape
                 // fallback means it definitely did not run.
                 //
-                // This is not hypothetical. `crates/nsl-codegen/tests/fixtures/
-                // fused_lm_ce_e2e_{fp16,bf16}.nsl` both carry a fully-hinted
-                // enabled decorator and both land here, because their heads use
-                // `bias_add(...)`, which has no source-AD handler. Warn rather
-                // than refuse: unlike a decline, this path has a legitimate
-                // reading (the body genuinely is not statically extractable)
-                // and refusing would break those fixtures.
+                // This is not hypothetical: any step body holding an op source
+                // AD does not extract (`.slice`, `stack`, `maxpool2d`, ...)
+                // under a fully-hinted enabled decorator lands here
+                // (`fused_lm_ce_decline_gate.rs` pins one). Warn rather than
+                // refuse: unlike a decline, this path has a legitimate reading
+                // (the body genuinely is not statically extractable).
                 nsl_log::nsl_log!(ERROR, "fused-lm-ce", 
                     "[fused-lm-ce] @fused_lm_ce(enabled = true) is active, but \
                      source-AD extraction of the step body failed — the fused \

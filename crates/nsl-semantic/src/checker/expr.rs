@@ -54,6 +54,16 @@ impl<'a> TypeChecker<'a> {
                 let obj_ty = self.check_expr(object);
                 // Type-check the index expression(s)
                 self.check_subscript_kind(index);
+                // A position in a sequence is an int (a dict key is any
+                // value). A float index used to be truncated (`xs[7 / 2]`
+                // read element 3) or to fail Cranelift's verifier.
+                if matches!(
+                    obj_ty,
+                    Type::List(_) | Type::Str | Type::Tuple(_) | Type::FixedModelArray { .. }
+                ) || obj_ty.is_tensor()
+                {
+                    self.refuse_float_subscript(index);
+                }
                 match &obj_ty {
                     Type::List(elem) => *elem.clone(),
                     Type::Dict(_, val) => *val.clone(),
@@ -141,9 +151,17 @@ impl<'a> TypeChecker<'a> {
                 if items.is_empty() {
                     Type::List(Box::new(Type::Unknown))
                 } else {
-                    let elem_ty = self.check_expr(&items[0]);
+                    let mut elem_ty = self.check_expr(&items[0]);
                     for item in &items[1..] {
-                        self.check_expr(item);
+                        let ty = self.check_expr(item);
+                        // Ints and floats together are a list of floats, as
+                        // arithmetic would join them: `[n / 2, 4]` is not a
+                        // list of ints whichever element comes first. It was
+                        // typed by its first element, so `[4, n / 2]` passed
+                        // as a shape and `[n / 2, 4]` did not.
+                        if is_float_scalar(&ty) && dtype_rank(&elem_ty).0 == 1 {
+                            elem_ty = ty;
+                        }
                     }
                     Type::List(Box::new(elem_ty))
                 }
@@ -323,11 +341,9 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             ExprKind::Range { start, end, .. } => {
-                if let Some(s) = start {
-                    self.check_expr(s);
-                }
-                if let Some(e) = end {
-                    self.check_expr(e);
+                for bound in [start, end].into_iter().flatten() {
+                    let ty = self.check_expr(bound);
+                    self.refuse_float_where_int("a range bound", bound, &ty);
                 }
                 Type::List(Box::new(Type::Int))
             }

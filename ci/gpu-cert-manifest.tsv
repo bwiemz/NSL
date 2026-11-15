@@ -50,6 +50,7 @@ crates/nsl-cli/tests/dict_local_lifetime_gate.rs	loop_local_dicts_are_cleared_pe
 crates/nsl-cli/tests/dispatch_ownership_gate.rs	unallowlisted_dispatch_results_do_not_strand	gpu	requires CUDA GPU
 crates/nsl-cli/tests/dispatch_ownership_gate.rs	identity_shaped_dispatch_does_not_steal_bindings	gpu	requires CUDA GPU
 crates/nsl-cli/tests/dropout_backward_parity_gate.rs	gpu_source_backward_matches_tape_mask_backward	broken	requires CUDA GPU; blocked on a pre-existing source-AD GPU relu-backward dtype abort (nsl_tensor_compare data_f64 on f32) — reproduces with dropout elided
+crates/nsl-cli/tests/element_write_gpu_gate.rs	an_element_write_to_a_cached_gpu_parameter_is_refused	gpu	requires CUDA GPU
 crates/nsl-cli/tests/elementwise_chain_fusion_gate.rs	chain_fusion_bit_exact_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/elementwise_chain_fusion_gate.rs	chain_fusion_replay_fallback_bit_exact_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/events_stream_gate.rs	gpu_mem_events_agree_with_stderr_and_outlive_the_throttle	gpu	requires CUDA GPU
@@ -92,6 +93,10 @@ crates/nsl-cli/tests/inference_loop_leak_gate.rs	inference_loop_method_call_live
 crates/nsl-cli/tests/inference_loop_leak_gate.rs	inference_loop_method_temp_live_blocks_iteration_independent	gpu	requires CUDA GPU
 crates/nsl-cli/tests/inference_loop_leak_gate.rs	inference_loop_borrow_rebind_does_not_free_weights	gpu	requires CUDA GPU
 crates/nsl-cli/tests/kernel_profile_timing_gate.rs	profile_kernels_reports_real_durations	gpu	requires CUDA GPU
+crates/nsl-cli/tests/linear_3d_gpu_gate.rs	a_3d_linear_on_the_gpu_matches_pytorch	gpu	requires CUDA GPU
+crates/nsl-cli/tests/linear_3d_gpu_gate.rs	a_transposed_input_on_the_gpu_is_read_in_logical_order	gpu	requires CUDA GPU
+crates/nsl-cli/tests/linear_3d_gpu_gate.rs	a_wrong_length_bias_on_the_gpu_is_refused	gpu	requires CUDA GPU
+crates/nsl-cli/tests/linear_3d_gpu_gate.rs	a_zero_element_input_on_the_gpu_gives_an_empty_output	gpu	requires CUDA GPU
 crates/nsl-cli/tests/long_run_drift_gpu_gate.rs	long_run_ccr_bit_exact_and_no_allocator_drift	gpu	requires CUDA GPU (~5 min: 3 x 48-step runs)
 crates/nsl-cli/tests/mem_accounting_gpu_gate.rs	mem_accounting_weights_attribution_and_peak_gate	gpu	requires CUDA GPU
 crates/nsl-cli/tests/mse_leak_gate.rs	mse_loss_source_ad_live_blocks_exactly_flat	gpu	requires CUDA GPU

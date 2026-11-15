@@ -1193,10 +1193,13 @@ pub extern "C" fn nsl_tensor_set_compound(tensor_ptr: i64, indices_list: i64, va
     tensor_set_impl(tensor_ptr, indices_list, value, keep);
 }
 
-fn tensor_set_impl(tensor_ptr: i64, indices_list: i64, value: f64, keep: f64) {
-    let tensor = NslTensor::from_ptr_ref(tensor_ptr);
-    let indices = NslList::from_ptr(indices_list);
-
+/// Every host-side element write (`nsl_tensor_set`, `_set_compound`,
+/// `_set_element`, `_slice_assign`) stops here on a device tensor, before
+/// it changes anything. Writing device memory host-side would corrupt it,
+/// and it is also what keeps the BF16 matmul mode's cached weight images
+/// (`cuda::bf16_cast_cache`) fresh: a parameter those images copy lives on
+/// a device, so no host write can change it behind its image.
+fn refuse_host_write_to_device(tensor: &NslTensor) {
     if tensor.device > 0 {
         crate::nsl_log!(ERROR, "nsl", "nsl: element write on a GPU tensor is not supported; move it to the \
              CPU first (e.g. `t.to(cpu)`) — writing device memory host-side \
@@ -1204,6 +1207,13 @@ fn tensor_set_impl(tensor_ptr: i64, indices_list: i64, value: f64, keep: f64) {
         );
         std::process::abort();
     }
+}
+
+fn tensor_set_impl(tensor_ptr: i64, indices_list: i64, value: f64, keep: f64) {
+    let tensor = NslTensor::from_ptr_ref(tensor_ptr);
+    let indices = NslList::from_ptr(indices_list);
+
+    refuse_host_write_to_device(tensor);
     if indices.len != tensor.ndim {
         crate::nsl_log!(ERROR, "nsl", "nsl: tensor index dimension mismatch (got {}, expected {})",
             indices.len, tensor.ndim
@@ -1299,43 +1309,69 @@ pub extern "C" fn nsl_tensor_item(tensor_ptr: i64) -> f64 {
 
 // === Display ===
 
-#[unsafe(no_mangle)]
-pub extern "C" fn nsl_tensor_print(tensor_ptr: i64) {
-    let tensor = NslTensor::from_ptr(tensor_ptr);
+/// The text `print(t)` shows for a tensor, without the newline: the value
+/// alone for a 0-d tensor, `tensor([...])` otherwise. One formatter for
+/// `nsl_tensor_print` and `nsl_tensor_to_str`, so `print(t)` and `f"{t}"`
+/// agree.
+fn format_tensor(tensor_ptr: i64) -> String {
+    use std::fmt::Write;
+    let tensor = NslTensor::from_ptr_ref(tensor_ptr);
 
     // Device memory: transfer to CPU for printing
     if tensor.device > 0 {
         let cpu_ptr = nsl_tensor_to_device(tensor_ptr, 0);
-        nsl_tensor_print(cpu_ptr);
+        let text = format_tensor(cpu_ptr);
         nsl_tensor_free(cpu_ptr);
-        return;
+        return text;
     }
 
+    let mut out = String::new();
     if tensor.ndim == 0 {
         if tensor.len > 0 {
-            let val = tensor.read_scalar_as_f64(0);
-            print_float_value(val);
-            println!();
+            write_float_value(&mut out, tensor.read_scalar_as_f64(0));
         } else {
-            println!("tensor([])");
+            out.push_str("tensor([])");
         }
-        return;
+        return out;
     }
 
-    print!("tensor(");
-    print_tensor_recursive(tensor.data as *const u8, tensor.dtype, tensor.shape, tensor.strides, tensor.ndim, 0);
-    println!(")");
+    out.push_str("tensor(");
+    write_tensor_recursive(
+        &mut out,
+        tensor.data as *const u8,
+        tensor.dtype,
+        tensor.shape,
+        tensor.strides,
+        tensor.ndim,
+        0,
+    );
+    let _ = write!(out, ")");
+    out
 }
 
-fn print_float_value(v: f64) {
+#[unsafe(no_mangle)]
+pub extern "C" fn nsl_tensor_print(tensor_ptr: i64) {
+    println!("{}", format_tensor(tensor_ptr));
+}
+
+/// `f"{t}"` for a tensor: the text `print(t)` shows, as an NSL string. It
+/// used to fall to the integer conversion and interpolate the handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn nsl_tensor_to_str(tensor_ptr: i64) -> i64 {
+    crate::string::nsl_str_from_rust(&format_tensor(tensor_ptr))
+}
+
+fn write_float_value(out: &mut String, v: f64) {
+    use std::fmt::Write;
     if v == v.floor() && v.abs() < 1e15 {
-        print!("{:.1}", v);
+        let _ = write!(out, "{:.1}", v);
     } else {
-        print!("{}", v);
+        let _ = write!(out, "{}", v);
     }
 }
 
-fn print_tensor_recursive(
+fn write_tensor_recursive(
+    out: &mut String,
     data: *const u8,
     dtype: u16,
     shape: *mut i64,
@@ -1347,34 +1383,30 @@ fn print_tensor_recursive(
     let stride = unsafe { *strides.add(dim) } as usize;
     let elem_size = dtype_element_size(dtype);
 
-    print!("[");
+    out.push('[');
     if dim as i64 == ndim - 1 {
         for i in 0..size {
-            if i > 0 { print!(", "); }
+            if i > 0 { out.push_str(", "); }
             let val = match dtype {
                 DTYPE_U16_TOKEN => unsafe { *(data as *const u16).add(i * stride) as f64 },
                 DTYPE_I32 => unsafe { *(data as *const i32).add(i * stride) as f64 },
                 1 => unsafe { *(data as *const f32).add(i * stride) as f64 },
                 0 => unsafe { *(data as *const f64).add(i * stride) },
-                d if d >= DTYPE_CUSTOM_START => {
-                    print!("?");
-                    continue;
-                }
                 _ => {
-                    print!("?");
+                    out.push('?');
                     continue;
                 }
             };
-            print_float_value(val);
+            write_float_value(out, val);
         }
     } else {
         for i in 0..size {
-            if i > 0 { print!(", "); }
+            if i > 0 { out.push_str(", "); }
             let offset_data = unsafe { data.add(i * stride * elem_size) };
-            print_tensor_recursive(offset_data, dtype, shape, strides, ndim, dim + 1);
+            write_tensor_recursive(out, offset_data, dtype, shape, strides, ndim, dim + 1);
         }
     }
-    print!("]");
+    out.push(']');
 }
 
 // === Memory ===
@@ -4100,15 +4132,26 @@ pub extern "C" fn nsl_tensor_maxpool2d(
     result_ptr
 }
 
-/// Add 1D bias to 2D tensor.
+/// Add a 1-D bias of length `C` along the last dimension of a `[..., C]`
+/// tensor (every leading dimension broadcast), as `x + b` does. Only 2-D
+/// input used to be accepted, so the stdlib `Linear` and `MLP` refused a
+/// `[batch, seq, features]` activation.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
     require_same_dtype("nsl_tensor_bias_add", tensor_ptr, bias_ptr);
     let tensor = NslTensor::from_ptr(tensor_ptr);
     let bias = NslTensor::from_ptr(bias_ptr);
 
-    if tensor.ndim != 2 { crate::nsl_log!(ERROR, "nsl", "nsl: bias_add requires 2D tensor (got {}D)", tensor.ndim); std::process::abort(); }
-    if bias.ndim != 1 { crate::nsl_log!(WARN, "nsl", "nsl: bias_add requires 1D bias (got {}D)", bias.ndim); std::process::abort(); }
+    if tensor.ndim < 1 { crate::nsl_log!(ERROR, "nsl", "nsl: bias_add needs a tensor of at least 1 dimension (got a 0-d one)"); std::process::abort(); }
+    if bias.ndim != 1 { crate::nsl_log!(ERROR, "nsl", "nsl: bias_add requires 1D bias (got {}D)", bias.ndim); std::process::abort(); }
+    // Checked before either device's arm: the GPU kernel reads
+    // `bias[i % cols]` and read past a short bias, returning garbage.
+    let cols = unsafe { *tensor.shape.add(tensor.ndim as usize - 1) } as usize;
+    let bias_len = unsafe { *bias.shape.add(0) } as usize;
+    if cols != bias_len {
+        crate::nsl_log!(ERROR, "nsl", "nsl: bias_add shape mismatch -- tensor's last dimension is {} but bias has {} elements", cols, bias_len);
+        std::process::abort();
+    }
 
     // GPU path: launch fused bias_add kernel when tensor is on GPU.
     if tensor.device > 0 {
@@ -4130,14 +4173,7 @@ pub extern "C" fn nsl_tensor_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
         { crate::fatal::cuda_not_compiled(); }
     }
 
-    let rows = unsafe { *tensor.shape.add(0) } as usize;
-    let cols = unsafe { *tensor.shape.add(1) } as usize;
-    let bias_len = unsafe { *bias.shape.add(0) } as usize;
-
-    if cols != bias_len {
-        crate::nsl_log!(ERROR, "nsl", "nsl: bias_add shape mismatch -- tensor has {} cols but bias has {} elements", cols, bias_len);
-        std::process::abort();
-    }
+    let rows = if cols == 0 { 0 } else { tensor.len as usize / cols };
 
     let in_dtype = tensor.dtype;
     let out_dtype: u16 = match in_dtype {
@@ -4145,10 +4181,9 @@ pub extern "C" fn nsl_tensor_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
         other => crate::fatal::unsupported_dtype("nsl_tensor_bias_add", other),
     };
 
-    let out_ndim: i64 = 2;
+    let out_ndim = tensor.ndim;
     let out_len = (rows * cols) as i64;
-    let out_shape = checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
-    unsafe { *out_shape.add(0) = rows as i64; *out_shape.add(1) = cols as i64; }
+    let out_shape = NslTensor::copy_shape(tensor.shape, out_ndim);
     let out_strides = NslTensor::compute_strides(out_shape, out_ndim);
     let elem_size = if out_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
     let out_data_raw = checked_alloc((out_len as usize) * elem_size);
@@ -4755,6 +4790,7 @@ pub extern "C" fn nsl_tensor_set_element(
     tensor_ptr: i64, indices_ptr: i64, num_indices: i64, value: f64,
 ) {
     let tensor = NslTensor::from_ptr(tensor_ptr);
+    refuse_host_write_to_device(tensor);
     let ndim = tensor.ndim as usize;
     let n = num_indices as usize;
 
@@ -4778,9 +4814,7 @@ pub extern "C" fn nsl_tensor_set_element(
     }
 
     autodiff::record_index_write(tensor_ptr, &region, 0.0, 0);
-    let tensor = NslTensor::from_ptr(tensor_ptr);
-    evict_bf16_cast_image(tensor);
-    tensor.write_scalar_from_f64(offset, value);
+    NslTensor::from_ptr_ref(tensor_ptr).write_scalar_from_f64(offset, value);
 }
 
 #[unsafe(no_mangle)]
@@ -4788,7 +4822,7 @@ pub extern "C" fn nsl_tensor_slice_assign(
     target_ptr: i64, src_ptr: i64, dims_ptr: i64, num_dims: i64,
 ) {
     let target = NslTensor::from_ptr(target_ptr);
-    evict_bf16_cast_image(target);
+    refuse_host_write_to_device(target);
     let ndim = num_dims as usize;
     if ndim != target.ndim as usize {
         crate::nsl_log!(ERROR, "nsl", "nsl: slice_assign: expected {} dims, got {}",

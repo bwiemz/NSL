@@ -2114,6 +2114,7 @@ pub fn emit_calibration_model_object(
     map_codegen_error("intern empty string", compiler.intern_string(""))?;
     map_codegen_error("collect strings", compiler.collect_strings(&bundle.ast.stmts))?;
     map_codegen_error("collect enums", compiler.collect_enums(&bundle.ast.stmts))?;
+    map_codegen_error("collect module consts", compiler.collect_module_consts(&bundle.ast.stmts))?;
     map_codegen_error("collect structs", compiler.collect_structs(&bundle.ast.stmts))?;
     map_codegen_error("collect models", compiler.collect_models(&bundle.ast.stmts))?;
     map_codegen_error("emit retention arena", compiler.emit_retention_arena())?;

@@ -3745,3 +3745,62 @@ fn a_refused_parameter_type_is_reported_once() {
     let n = errs.iter().filter(|m| m.contains("f64 tensors cannot be on cuda")).count();
     assert_eq!(n, 1, "{errs:?}");
 }
+
+// -----------------------------------------------------------------------
+// Signature diagnostics are reported once
+// -----------------------------------------------------------------------
+
+/// A function's signature was resolved three times (pre-declaration,
+/// `build_fn_type` in `check_fn_def`, then each parameter again), and a
+/// method's three times too, so an undefined type in a signature was
+/// reported two or three times.
+#[test]
+fn each_signature_error_is_reported_once() {
+    let diags = check_source(
+        "fn f(x: Nope) -> Nope2:\n    return x\n\n\
+         model M:\n    w: Tensor = ones([2])\n    fn g(self, y: Nope3) -> Nope4:\n        return y\n\n\
+         let m = M()\n",
+    );
+    for name in ["Nope", "Nope2", "Nope3", "Nope4"] {
+        let n = diags.iter().filter(|d| d.message == format!("undefined type `{name}`")).count();
+        assert_eq!(n, 1, "`{name}` reported {n} times: {diags:?}");
+    }
+}
+
+// -----------------------------------------------------------------------
+// Model constructors
+// -----------------------------------------------------------------------
+
+/// `fn __init__` is not a constructor (spec §4: a model is built from its
+/// parameter list and field initialisers). It compiled as a method nothing
+/// called, and `Block(2.0)` then failed Cranelift's verifier.
+#[test]
+fn fn_init_in_a_model_is_refused() {
+    let diags = check_source(
+        "model Block:\n    w: Tensor = ones([2, 2])\n\n    fn __init__(self, k: float):\n        self.w = full([2, 2], k)\n\nlet b = Block()\n",
+    );
+    assert!(
+        diags.iter().any(|d| d.message.contains("`fn __init__` is not a constructor in NSL")),
+        "{diags:?}"
+    );
+}
+
+/// A constructor call passes one argument per model parameter; a wrong
+/// count reached code generation and failed the verifier.
+#[test]
+fn a_constructor_call_with_the_wrong_argument_count_is_refused() {
+    let cases = [
+        ("model M:\n    w: Tensor = ones([2])\nlet m = M(1.0)\n", "model 'M' takes 0 constructor argument(s), got 1"),
+        ("model M(k: float):\n    w: Tensor = full([2], k)\nlet m = M()\n", "model 'M' takes 1 constructor argument(s), got 0"),
+        (
+            "model T(dim: int, hidden: int = 3):\n    w: Tensor = ones([dim, hidden])\nlet t = T(2)\n",
+            "default values of model parameters are not supported",
+        ),
+    ];
+    for (src, want) in cases {
+        let diags = check_source(src);
+        assert!(diags.iter().any(|d| d.message.contains(want)), "{src}\n{diags:?}");
+    }
+    let ok = check_source("model M(k: float):\n    w: Tensor = full([2], k)\nlet m = M(2.0)\n");
+    assert!(!ok.iter().any(|d| d.message.contains("constructor argument")), "{ok:?}");
+}

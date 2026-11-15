@@ -286,6 +286,7 @@ macro_rules! for_each_runtime_fn {
             [tensor] nsl_tensor_l2_norm(i64) -> f64 = tensor::nsl_tensor_l2_norm;
             // Tensor display
             [tensor] nsl_tensor_print(i64) -> () = tensor::nsl_tensor_print;
+            [tensor] nsl_tensor_to_str(i64) -> i64 = tensor::nsl_tensor_to_str;
             // Tensor memory
             [tensor] nsl_tensor_clone(i64) -> i64 = tensor::nsl_tensor_clone;
             [tensor] nsl_tensor_clone_if_valid(i64) -> i64 = tensor::nsl_tensor_clone_if_valid;
@@ -1337,6 +1338,6 @@ mod tests {
     fn table_is_the_recorded_size() {
         // The count is pinned so a row dropped by a bad merge is noticed; move
         // it with a row that is deliberately added or removed.
-        assert_eq!(RUNTIME_ABI.len(), 651);
+        assert_eq!(RUNTIME_ABI.len(), 652);
     }
 }

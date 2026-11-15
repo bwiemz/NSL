@@ -105,6 +105,10 @@ pub struct TypeChecker<'a> {
     /// refuse a named argument that is not in its parameter's position — see
     /// `check_named_argument_order`.
     pub(crate) call_param_names: HashMap<(Option<Symbol>, Symbol), Vec<Symbol>>,
+    /// For each model this module declares, its constructor's parameter
+    /// count and whether any of them is written with a default (which code
+    /// generation does not implement): a constructor call is held to it.
+    pub(crate) model_ctor_params: HashMap<Symbol, (usize, bool)>,
     /// The same, for callables imported from other modules (supplied by the
     /// module loader, which has their declarations). Consulted after
     /// `call_param_names`, so a declaration in this module shadows an import
@@ -134,6 +138,7 @@ impl<'a> TypeChecker<'a> {
             fused_kl_ce_configs: Vec::new(),
             pca_configs: Vec::new(),
             call_param_names: HashMap::new(),
+            model_ctor_params: HashMap::new(),
             import_param_names: crate::ImportedParamNames::default(),
         }
     }
@@ -186,7 +191,12 @@ impl<'a> TypeChecker<'a> {
         for stmt in stmts {
             match &stmt.kind {
                 StmtKind::FnDef(fn_def) => {
+                    // `check_fn_def` resolves the signature again and
+                    // reports what resolving it raises; reporting it here too
+                    // printed every signature error twice.
+                    let before = self.diagnostics.len();
                     let ty = self.build_fn_type(fn_def);
+                    self.diagnostics.truncate(before);
                     self.declare_symbol(fn_def.name, ty, stmt.span, true, false);
                 }
                 StmtKind::ModelDef(model_def) => {
@@ -282,6 +292,10 @@ impl<'a> TypeChecker<'a> {
 
         let mut models = Vec::new();
         models_in(stmts, &mut models);
+        for md in &models {
+            let has_default = md.params.iter().any(|p| p.default.is_some());
+            self.model_ctor_params.insert(md.name, (md.params.len(), has_default));
+        }
         if models.is_empty() {
             return;
         }
@@ -422,6 +436,28 @@ impl<'a> TypeChecker<'a> {
             params,
             ret: Box::new(ret),
             effect,
+        }
+    }
+
+    /// Declare a function's or method's parameters with the types its
+    /// signature (`build_fn_type`, which skips `self`) already resolved,
+    /// rather than resolving each annotation again: a second resolution
+    /// reported every error in a parameter type a second time.
+    fn declare_params_from_signature(&mut self, fn_def: &FnDef, fn_ty: &Type) {
+        let resolved: Vec<Type> = match fn_ty {
+            Type::Function { params, .. } => params.clone(),
+            _ => Vec::new(),
+        };
+        let mut resolved = resolved.into_iter();
+        for param in &fn_def.params {
+            if self.resolve_name(param.name) == "self" {
+                continue;
+            }
+            let param_ty = resolved.next().unwrap_or(Type::Unknown);
+            self.declare_symbol(param.name, param_ty, param.span, false, true);
+            if let Some(default) = &param.default {
+                self.check_expr(default);
+            }
         }
     }
 
@@ -631,4 +667,18 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     }
 
     pi == plen
+}
+
+/// A scalar float type (the checker's `float`, or a sized float).
+pub(crate) fn is_float_scalar(ty: &Type) -> bool {
+    dtype_rank(ty).0 == 2
+}
+
+/// What to say where a float stands for an int: `/` is true division.
+pub(crate) fn float_where_int_hint(expr: &Expr) -> &'static str {
+    if matches!(expr.kind, ExprKind::BinaryOp { op: BinOp::Div, .. }) {
+        "`/` is true division and gives a float; use `//` for integer division"
+    } else {
+        "an int is needed here: use `//` for integer division, or `int(...)`"
+    }
 }
