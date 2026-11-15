@@ -18,7 +18,9 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             archive: zip
-          - os: macos-14
+          # Both macOS archives build on macos-latest (ARM64): aarch64 natively,
+          # x86_64 as a cross target. The macos-14 image is retired.
+          - os: macos-latest
             target: aarch64-apple-darwin
             archive: tar.gz
           - os: macos-latest
