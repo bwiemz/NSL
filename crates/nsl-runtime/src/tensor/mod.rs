@@ -6760,23 +6760,11 @@ pub extern "C" fn nsl_gpu_drain_cache() {
         }
         if let Some(freed) = alloc.drain_if_bloated() {
             drop(alloc);
-            BLOAT_DRAINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             crate::nsl_log!(INFO, "gpu-drain",
                 "[gpu-drain] the pool held more than the step needed: released {}MB to the driver",
                 freed / (1024 * 1024));
         }
     }
-}
-
-/// Step-boundary drains that released memory (`nsl_gpu_drain_cache`).
-#[cfg(feature = "cuda")]
-static BLOAT_DRAINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// How many step boundaries released idle memory since the process started
-/// (for gates; not part of the compiled-program ABI).
-#[cfg(feature = "cuda")]
-pub fn gpu_bloat_drain_count() -> u64 {
-    BLOAT_DRAINS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Global counter for live GPU tensor allocations (debug only).
