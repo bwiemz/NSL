@@ -381,6 +381,21 @@ that saves activations and the scalar fused backward.
 
 ### Fixed
 
+- For decorated attention the plan was made on a nominal layer shape
+  (batch 1, sequence 1024, `d_model` 512, 8 heads, 4 KV heads) whatever the
+  model, the level-1 saving was the constant 0.58, and the report named a
+  kernel the build does not emit. The plan now takes batch, sequence length,
+  width, head and KV-head counts from the attention call on the train
+  block's tape (`invoke_csha_if_enabled` in
+  `crates/nsl-codegen/src/stmt_pass_bridges.rs`); when they cannot be
+  determined it falls back to the nominal layer with a warning, and the
+  report is labelled as nominal. Level-1 traffic is the baseline less the
+  norm read and write and the RoPE-Q and RoPE-K passes (`fused_hbm_bytes` in
+  `crates/nsl-codegen/src/csha_pipeline.rs`; test
+  `boundary_traffic_is_the_baseline_less_the_fused_passes`). The report
+  prints the planned kernel spec as "planned, not emitted" and lists the
+  kernels the build emits separately (`CshaPlan::render_report` in
+  `crates/nsl-codegen/src/csha.rs`).
 - `--csha` on a model whose attention is not inside an `@flash_attention`
   method printed a fusion plan ("CSHA L2-pipeline, 6.00x speedup, Backward:
   Tier B.2"), reported "CSHA fused backward rejected" four times per layer
@@ -610,9 +625,3 @@ before `CSHA_FUSED_TRAINING_WITHHELD` is lifted.
   the refusal because it serves a paged, quantized KV cache, whose query
   length in decoding need not be a whole tile; whoever wires it up has to
   decide what its tail does.
-- For decorated attention the plan is still made on a nominal layer shape
-  (batch 1, sequence 1024, `d_model` 512, 8 heads, 4 KV heads), the level-1
-  saving is the constant 0.58, and the kernel named in the report is not
-  one that is emitted. Where: `invoke_csha_if_enabled` in
-  `crates/nsl-codegen/src/stmt_pass_bridges.rs`. By reading the code only.
-  Right: plan from the model's dimensions; name only emitted kernels.
