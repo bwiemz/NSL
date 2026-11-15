@@ -1274,8 +1274,20 @@ fn tc_sdpa_backward(
     } else {
         cudarc::driver::sys::CUresult::CUDA_SUCCESS
     };
-    // Stream-ordered frees: the caching allocator reuses these only after
-    // the kernels queued before the free.
+    // Freed without a synchronisation, as every runtime op frees its
+    // temporaries (and as the kernels this path replaces did: their success
+    // path synchronises only under NSL_CUDA_SYNC=1). The caching allocator
+    // records no streams; reuse is safe because everything that can touch a
+    // recycled block is ordered after these kernels — the runtime's
+    // allocator invariant (stated on `cuda::inner::memcpy_htod_async`):
+    // every launch and async memset of this thread goes to its one compute
+    // stream (`current_stream()`, created blocking); the synchronous copies
+    // (`cuMemcpyHtoD_v2` / `DtoD` / `DtoH`) run on the legacy NULL stream,
+    // which waits for prior work on blocking streams; the async copies on
+    // the non-blocking transfer stream first wait on an event recorded on
+    // the compute stream (`transfer_stream_wait_null_stream`); and no other
+    // thread issues device work for this device during a step (the data
+    // loaders' worker threads are host-only).
     for p in scratch {
         inner::free_managed(p);
     }
@@ -1569,6 +1581,7 @@ pub extern "C" fn nsl_sdpa_fused_forward(
                 && kv_matches(v_t)
                 && kv_h > 0
                 && crate::attention_tc::supports(b as usize, d as usize, h as usize, kv_h as usize, s as usize)
+                && crate::attention_tc::device_supported()
                 && let Some(list) = tc_sdpa_forward(q_t, k_t, v_t, b, h, kv_h, s, d, scale_bits, causal != 0)
             {
                 return list;
@@ -7877,6 +7890,7 @@ pub extern "C" fn nsl_flash_attention_backward(
             && !force_cpu_bwd
             && tc_attention_enabled()
             && crate::attention_tc::supports(b, d, h, kv_h, s)
+            && crate::attention_tc::device_supported()
             && let Some(list) = tc_sdpa_backward(
                 dout_ptr, q_ptr, k_ptr, v_ptr, out_ptr, logsumexp_ptr, scale, b, h, kv_h, s, d, is_causal,
             )
@@ -7917,7 +7931,7 @@ pub extern "C" fn nsl_flash_attention_backward(
 
             // Canonical-row-major materialization for the stride-blind
             // kernels: any view input gets one device-side strided-copy.
-            // Temps collected for freeing after the (synchronizing) launch.
+            // Temps collected for freeing after the launch (stream-ordered frees).
             let mut canon_temps: Vec<i64> = Vec::new();
             let mut canon = |ptr: i64, name: &str, temps: &mut Vec<i64>| -> i64 {
                 let t = NslTensor::from_ptr(ptr);
@@ -7976,9 +7990,10 @@ pub extern "C" fn nsl_flash_attention_backward(
                 segment_ids_ptr,
             );
 
-            // The launcher synchronized before returning on every path, so
-            // the expanded/materialized copies are dead now regardless of
-            // outcome.
+            // The copies are dead once the launches that read them are
+            // queued: the launcher synchronises only on a failed launch or
+            // under NSL_CUDA_SYNC=1, and the frees below are stream-ordered
+            // (see the frees in `tc_sdpa_backward` for why that is safe).
             if k_exp_t != 0 {
                 crate::tensor::nsl_tensor_free(k_exp_t);
             }

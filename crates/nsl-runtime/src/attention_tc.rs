@@ -70,6 +70,23 @@ fn launch(which: Which, grid: [u32; 3], threads: u32, args: &[*mut c_void], smem
 /// The largest `gridDim.y` a launch may use.
 const MAX_GRID_Y: u64 = 65_535;
 
+/// The compute capability these kernels need: `ldmatrix`, `mma.sync
+/// m16n8k16` with f16 operands and the f16x2 packing `cvt.rn.f16x2.f32` are
+/// sm_80 instructions, and the PTX is printed for `.target sm_80`.
+pub(crate) const MIN_SM: u32 = 80;
+
+/// Whether the current device can run these kernels (compute capability
+/// at least [`MIN_SM`]), asked of the driver once per device. Below sm_80
+/// the module would fail to JIT on every call before falling back; with
+/// this the callers never attempt it.
+pub(crate) fn device_supported() -> bool {
+    static CACHE: OnceLock<Mutex<HashMap<i32, bool>>> = OnceLock::new();
+    let ctx = crate::cuda::context::current();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    *guard.entry(ctx.device).or_insert_with(|| ctx.sm_version() >= MIN_SM)
+}
+
 /// Whether these kernels serve a problem of this shape: head_dim 64 or 128,
 /// `heads` a positive multiple of `kv_heads`, every dimension positive, the
 /// per-head element count and the row count `batch · heads · seq` within
