@@ -82,10 +82,11 @@ fn field(line: &str, key: &str) -> Option<u64> {
 fn step_reports(stderr: &str) -> Vec<StepMem> {
     let lines: Vec<&str> = stderr.lines().collect();
     let mut out = Vec::new();
-    for (i, l) in lines.iter().enumerate() {
-        if !l.contains("[gpu-mem] step=") {
-            continue;
-        }
+    // A positive filter, not `if !l.contains(..) { continue }`: this is a
+    // line selector, not a negative assertion (the callers assert that
+    // reports were found), and feature_composition_gate reads the negated
+    // form as an unpinned negative marker assertion.
+    for (i, l) in lines.iter().enumerate().filter(|(_, l)| l.contains("[gpu-mem] step=")) {
         let next = lines.get(i + 1).copied().unwrap_or("");
         if let (Some(step), Some(reserved_mb), Some(drv_allocs), Some(drv_frees)) =
             (field(l, "step="), field(l, "reserved="), field(l, "drv_allocs="), field(l, "drv_frees="))
