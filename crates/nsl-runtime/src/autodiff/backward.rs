@@ -1432,6 +1432,109 @@ fn maxpool2d_backward_host(grad_ptr: i64, input_shape: &[i64], argmax: &[usize])
     out_ptr
 }
 
+/// The first version of tape id `id` along the chain of in-place writes
+/// `written_from` (each write's new id to the id it replaced).
+fn entry_version(written_from: &HashMap<i64, i64>, mut id: i64) -> i64 {
+    while let Some(&before) = written_from.get(&id) {
+        id = before;
+    }
+    id
+}
+
+/// Row-major storage offsets of the elements of `region` (per dimension
+/// `[start, end)`) in a row-major tensor of shape `shape`, in row-major
+/// order of the region.
+fn region_offsets(shape: &[i64], region: &[(i64, i64)]) -> Vec<usize> {
+    let ndim = shape.len();
+    let mut strides = vec![1usize; ndim];
+    for d in (0..ndim.saturating_sub(1)).rev() {
+        strides[d] = strides[d + 1] * shape[d + 1] as usize;
+    }
+    let count: usize = region.iter().map(|&(s, e)| (e - s).max(0) as usize).product();
+    let mut offsets = Vec::with_capacity(count);
+    if count == 0 {
+        return offsets;
+    }
+    let mut idx: Vec<i64> = region.iter().map(|&(s, _)| s).collect();
+    loop {
+        offsets.push(idx.iter().zip(&strides).map(|(&i, &st)| i as usize * st).sum());
+        // Odometer step, last dimension fastest.
+        let mut d = ndim;
+        loop {
+            if d == 0 {
+                return offsets;
+            }
+            d -= 1;
+            idx[d] += 1;
+            if idx[d] < region[d].1 {
+                break;
+            }
+            idx[d] = region[d].0;
+        }
+    }
+}
+
+/// [`TapeOp::IndexWrite`] backward on the gradient `g` of the written
+/// tensor: the gradient of the tensor before the write (`g` with the
+/// elements of `region` multiplied by `keep`; exactly 0 when `keep` is 0,
+/// as PyTorch's `index_put_` backward fills, so an infinite `g` there does
+/// not turn into NaN) and, when `want_src`, the gradient over `region` as a
+/// flat row-major list.
+fn index_write_backward(g: i64, region: &[(i64, i64)], keep: f64, want_src: bool) -> (i64, Vec<f64>) {
+    let device = NslTensor::from_ptr_ref(g).device;
+    let g_host = if device > 0 { nsl_tensor_to_device(g, 0) } else { g };
+    // A fresh row-major copy (the clone materializes a strided gradient),
+    // so the edit below touches no tensor anyone else holds.
+    let grad_a = tensor_clone(g_host);
+    if g_host != g {
+        tensor_free(g_host);
+    }
+    let t = NslTensor::from_ptr_ref(grad_a);
+    let shape: Vec<i64> = (0..t.ndim as usize).map(|i| unsafe { *t.shape.add(i) }).collect();
+    let mut src_vals = Vec::new();
+    for off in region_offsets(&shape, region) {
+        let v = t.read_scalar_as_f64(off);
+        if want_src {
+            src_vals.push(v);
+        }
+        t.write_scalar_from_f64(off, if keep == 0.0 { 0.0 } else { v * keep });
+    }
+    let grad_a = if device > 0 {
+        let up = nsl_tensor_to_device(grad_a, device as i64);
+        tensor_free(grad_a);
+        up
+    } else {
+        grad_a
+    };
+    (grad_a, src_vals)
+}
+
+/// The gradient of a tensor written into a region by
+/// `nsl_tensor_slice_assign`: the region's gradient `vals` (row-major, the
+/// order the write read the source in) as a tensor of the source's shape,
+/// dtype and device.
+fn index_write_src_grad(vals: Vec<f64>, shape: &[i64], dtype: u16, device: u8) -> i64 {
+    let host = crate::cpu::create_tensor_with_shape_rs_dtype(shape, crate::tensor::DTYPE_F64);
+    let t = NslTensor::from_ptr_ref(host);
+    for (i, v) in vals.into_iter().enumerate() {
+        t.write_scalar_from_f64(i, v);
+    }
+    let typed = if dtype == crate::tensor::DTYPE_F64 {
+        host
+    } else {
+        let c = crate::tensor::precision_cast::convert_untaped(host, dtype);
+        tensor_free(host);
+        c
+    };
+    if device > 0 {
+        let up = nsl_tensor_to_device(typed, device as i64);
+        tensor_free(typed);
+        up
+    } else {
+        typed
+    }
+}
+
 /// Run backward pass. `loss_ptr` is the scalar loss tensor. `param_list` is an NslList of
 /// parameter tensor pointers. Returns an NslList of gradient tensors (one per param, same order).
 #[unsafe(no_mangle)]
@@ -1514,6 +1617,15 @@ pub(crate) fn run_backward_core_strict(
     let seed = ones_like(loss_ptr);
     let loss_key = { let t = crate::tensor::NslTensor::from_ptr(loss_ptr); if t.tape_id != 0 { t.tape_id } else { loss_ptr } };
     grad_map.insert(loss_key, seed);
+
+    // In-place writes: each version id to the one it replaced.
+    let written_from: HashMap<i64, i64> = ops
+        .iter()
+        .filter_map(|op| match op {
+            TapeOp::IndexWrite { a, out, .. } => Some((*out, *a)),
+            _ => None,
+        })
+        .collect();
 
     // Walk tape in reverse, applying chain rule.
     // We iterate in reverse by index so we can mutate ops to zero out saved
@@ -2126,12 +2238,15 @@ pub(crate) fn run_backward_core_strict(
                         (nsl_tensor_to_device(g, 0), true)
                     } else { (g, false) };
                     let g_t = crate::tensor::NslTensor::from_ptr(g_bias_cpu);
-                    if g_t.ndim < 2 {
-                        crate::nsl_log!(ERROR, "nsl", "nsl: BiasAdd backward expects 2D+ gradient, got {}D", g_t.ndim);
+                    if g_t.ndim < 1 {
+                        crate::nsl_log!(ERROR, "nsl", "nsl: BiasAdd backward got a 0-d gradient");
                         std::process::abort();
                     }
-                    let rows = unsafe { *g_t.shape.add(0) } as usize;
-                    let cols = unsafe { *g_t.shape.add(1) } as usize;
+                    // The bias ran along the last dimension; its gradient
+                    // is the sum over every leading one. (It read dims 0 and
+                    // 1 as rows and columns, which is right only in 2-D.)
+                    let cols = unsafe { *g_t.shape.add(g_t.ndim as usize - 1) } as usize;
+                    let rows = if cols == 0 { 0 } else { g_t.len as usize / cols };
 
                     let g_dtype = g_t.dtype;
                     let grad_bias = crate::cpu::create_tensor_with_shape_rs_dtype(&[cols as i64], g_dtype);
@@ -2231,6 +2346,21 @@ pub(crate) fn run_backward_core_strict(
                     accumulate_grad(&mut grad_map, *a, grad_a);
                 }
             }
+            TapeOp::IndexWrite { a, out, region, keep, src, src_shape, src_dtype, src_device } => {
+                // `out` is produced by this op alone and every op that read
+                // it ran later in the forward, so its gradient is complete;
+                // nothing looks it up again (a written parameter's gradient
+                // is read under its entry id, below).
+                if let Some(g) = grad_map.remove(out) {
+                    let (grad_a, grad_src) = index_write_backward(g, region, *keep, *src != 0);
+                    tensor_free(g);
+                    accumulate_grad(&mut grad_map, *a, grad_a);
+                    if *src != 0 {
+                        let grad_src = index_write_src_grad(grad_src, src_shape, *src_dtype, *src_device);
+                        accumulate_grad(&mut grad_map, *src, grad_src);
+                    }
+                }
+            }
             TapeOp::Checkpoint { .. } => {
                 // Checkpoint ops handled by rematerialization pass
             }
@@ -2249,6 +2379,10 @@ pub(crate) fn run_backward_core_strict(
     let debug_dump = std::env::var("NSL_TAPE_DEBUG_DUMP").ok().as_deref() == Some("1");
     for ptr in param_ptrs {
         let key = { let t = crate::tensor::NslTensor::from_ptr(*ptr); if t.tape_id != 0 { t.tape_id } else { *ptr } };
+        // A parameter written in place during the forward carries the id of
+        // its last version; its gradient is the one of the value it entered
+        // the block with, the first version.
+        let key = entry_version(&written_from, key);
         if debug_dump {
             let t = crate::tensor::NslTensor::from_ptr(*ptr);
             let glen = grad_map.get(&key).map(|g| crate::tensor::NslTensor::from_ptr(*g).len);

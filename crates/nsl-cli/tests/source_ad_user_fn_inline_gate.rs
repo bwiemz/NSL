@@ -258,11 +258,9 @@ print(g)
 /// A write into a tensor inside a function: `y[0, 0] = 0.0` after
 /// `y = x * 2` with `x = [[1, 2], [3, 4]]` leaves `y = [[0, 4], [6, 8]]`,
 /// whose sum is 18. Inlined, the write used to vanish and the loss came out
-/// as 20. The function is now left to the tape, which performs the write.
-///
-/// Only the loss is asserted. The tape does not record `nsl_tensor_set`, so
-/// its gradient here is `[[2, 2], [2, 2]]` where `[[0, 2], [2, 2]]` is
-/// right; that is a defect of the tape, not of this fallback.
+/// as 20. The function is now left to the tape, which performs the write and
+/// records it: the gradient is PyTorch's `[[0, 2], [2, 2]]` (the tape gave
+/// `[[2, 2], [2, 2]]` before it recorded writes; tape_element_write_gate.rs).
 #[test]
 fn a_function_that_writes_into_a_tensor_is_left_to_the_tape() {
     let (got, stderr) = run_files(&[(
@@ -276,13 +274,14 @@ fn f(x: Tensor) -> Tensor:
 let (l, g) = grad(w):
     f(w)
 print(l)
+print(g)
 "#,
     )]);
     assert!(
         stderr.contains("'f' cannot be inlined") && stderr.contains("writes through a subscript or a field"),
         "the reason for the fallback must be stated:\n{stderr}"
     );
-    assert_close(&got, &[18.0], "loss with the element write");
+    assert_close(&got, &[18.0, 0.0, 2.0, 2.0, 2.0], "loss and gradient with the element write");
 }
 
 /// A write into a PARAMETER changes the caller's tensor. With
@@ -308,7 +307,8 @@ print(w)
 }
 
 /// The same element write in a grad block's own body: it used to be
-/// dropped there too (loss 20). The block now runs on the tape.
+/// dropped there too (loss 20). The block now runs on the tape, with
+/// PyTorch's gradient `[[0, 2], [2, 2]]`.
 #[test]
 fn an_element_write_in_a_block_body_is_left_to_the_tape() {
     let (got, stderr) = run_files(&[(
@@ -320,10 +320,11 @@ let (l, g) = grad(w):
     y[0, 0] = 0.0
     sum(y)
 print(l)
+print(g)
 "#,
     )]);
     assert!(stderr.contains("assignment through a subscript or a field"), "{stderr}");
-    assert_close(&got, &[18.0], "loss with the element write");
+    assert_close(&got, &[18.0, 0.0, 2.0, 2.0, 2.0], "loss and gradient with the element write");
 }
 
 // ---------------------------------------------------------------------------

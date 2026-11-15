@@ -105,6 +105,10 @@ pub struct TypeChecker<'a> {
     /// refuse a named argument that is not in its parameter's position — see
     /// `check_named_argument_order`.
     pub(crate) call_param_names: HashMap<(Option<Symbol>, Symbol), Vec<Symbol>>,
+    /// For each model this module declares, its constructor's parameter
+    /// count and whether any of them is written with a default (which code
+    /// generation does not implement): a constructor call is held to it.
+    pub(crate) model_ctor_params: HashMap<Symbol, (usize, bool)>,
     /// The same, for callables imported from other modules (supplied by the
     /// module loader, which has their declarations). Consulted after
     /// `call_param_names`, so a declaration in this module shadows an import
@@ -134,6 +138,7 @@ impl<'a> TypeChecker<'a> {
             fused_kl_ce_configs: Vec::new(),
             pca_configs: Vec::new(),
             call_param_names: HashMap::new(),
+            model_ctor_params: HashMap::new(),
             import_param_names: crate::ImportedParamNames::default(),
         }
     }
@@ -158,6 +163,7 @@ impl<'a> TypeChecker<'a> {
     pub fn check_module(&mut self, module: &Module) {
         // Two-pass: first collect top-level declarations, then check bodies
         self.collect_top_level_decls(&module.stmts);
+        self.collect_model_signatures(&module.stmts);
         self.collect_call_param_names(&module.stmts);
 
         for stmt in &module.stmts {
@@ -185,7 +191,12 @@ impl<'a> TypeChecker<'a> {
         for stmt in stmts {
             match &stmt.kind {
                 StmtKind::FnDef(fn_def) => {
+                    // `check_fn_def` resolves the signature again and
+                    // reports what resolving it raises; reporting it here too
+                    // printed every signature error twice.
+                    let before = self.diagnostics.len();
                     let ty = self.build_fn_type(fn_def);
+                    self.diagnostics.truncate(before);
                     self.declare_symbol(fn_def.name, ty, stmt.span, true, false);
                 }
                 StmtKind::ModelDef(model_def) => {
@@ -230,6 +241,150 @@ impl<'a> TypeChecker<'a> {
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// Give every model of the module its type -- field types and method
+    /// signatures -- before any statement is checked, so that a model may
+    /// name one declared after it. A model used to be pre-declared as
+    /// `Unknown` and typed only when the checker reached it, so in
+    /// `model Net: blocks: [Block; 2] = Block()` ahead of `model Block`, the
+    /// field resolved to `Unknown`: the loop over it compiled as a list
+    /// iteration and `block.w` as a dict lookup (a misaligned-pointer panic
+    /// in `dict.rs`), and `self.b.forward(x)` on a `b: Block` field was
+    /// refused as a call on an untyped value.
+    ///
+    /// Models are typed in an order where the models a field names come
+    /// first (a field embeds its model's type). Method signatures may name
+    /// models in a cycle, so a second round types them again with every
+    /// model known. Bodies and initialisers are checked later, in source
+    /// order, by `check_model_def`, which reports any diagnostic resolving
+    /// a type raises: the ones raised here are dropped so none is doubled.
+    fn collect_model_signatures(&mut self, stmts: &[Stmt]) {
+        fn models_in<'s>(stmts: &'s [Stmt], out: &mut Vec<&'s ModelDef>) {
+            for stmt in stmts {
+                match &stmt.kind {
+                    StmtKind::ModelDef(md) => out.push(md),
+                    StmtKind::Decorated { stmt, .. } => models_in(std::slice::from_ref(stmt), out),
+                    _ => {}
+                }
+            }
+        }
+        fn named_in(ty: &TypeExpr, out: &mut Vec<Symbol>) {
+            match &ty.kind {
+                TypeExprKind::Named(sym) => out.push(*sym),
+                TypeExprKind::Generic { name, args } => {
+                    out.push(*name);
+                    for arg in args {
+                        named_in(arg, out);
+                    }
+                }
+                TypeExprKind::FixedArray { element_type, .. } => named_in(element_type, out),
+                TypeExprKind::Borrow(inner) => named_in(inner, out),
+                TypeExprKind::Tuple(items) | TypeExprKind::Union(items) => {
+                    for t in items {
+                        named_in(t, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut models = Vec::new();
+        models_in(stmts, &mut models);
+        for md in &models {
+            let has_default = md.params.iter().any(|p| p.default.is_some());
+            self.model_ctor_params.insert(md.name, (md.params.len(), has_default));
+        }
+        if models.is_empty() {
+            return;
+        }
+        let index: HashMap<Symbol, usize> =
+            models.iter().enumerate().map(|(i, md)| (md.name, i)).collect();
+        // Depth-first, field dependencies first. A model already on the
+        // stack (a field cycle, which no finite model has) is skipped.
+        fn visit(
+            i: usize,
+            models: &[&ModelDef],
+            index: &HashMap<Symbol, usize>,
+            state: &mut [u8],
+            order: &mut Vec<usize>,
+        ) {
+            if state[i] != 0 {
+                return;
+            }
+            state[i] = 1;
+            let mut deps = Vec::new();
+            for member in &models[i].members {
+                if let ModelMember::LayerDecl { type_ann, .. } = member {
+                    named_in(type_ann, &mut deps);
+                }
+            }
+            for dep in deps {
+                if let Some(&j) = index.get(&dep) {
+                    visit(j, models, index, state, order);
+                }
+            }
+            state[i] = 2;
+            order.push(i);
+        }
+        let mut state = vec![0u8; models.len()];
+        let mut order = Vec::with_capacity(models.len());
+        for i in 0..models.len() {
+            visit(i, &models, &index, &mut state, &mut order);
+        }
+
+        let diagnostics_before = self.diagnostics.len();
+        for _round in 0..2 {
+            for &i in &order {
+                let md = models[i];
+                let ty = self.model_signature(md);
+                if let Some(info) = self.scopes.lookup_mut(self.current_scope, md.name) {
+                    info.ty = ty;
+                }
+            }
+        }
+        self.diagnostics.truncate(diagnostics_before);
+    }
+
+    /// A model's type from its declaration alone: field types from their
+    /// annotations and method signatures, in the scope `check_model_def`
+    /// resolves them in (type parameters and constructor parameters
+    /// declared). Initialisers and bodies are not looked at.
+    fn model_signature(&mut self, model_def: &ModelDef) -> Type {
+        let scope = self.scopes.push_scope(self.current_scope, ScopeKind::Model);
+        let prev = self.current_scope;
+        self.current_scope = scope;
+        for tp in &model_def.type_params {
+            self.declare_symbol(tp.name, Type::TypeVar(tp.name), tp.span, true, false);
+        }
+        for param in &model_def.params {
+            let param_ty = param
+                .type_ann
+                .as_ref()
+                .map(|t| self.resolve_type(t))
+                .unwrap_or(Type::Unknown);
+            self.declare_symbol(param.name, param_ty, param.span, false, true);
+        }
+        let mut fields = Vec::new();
+        let mut methods = Vec::new();
+        for member in &model_def.members {
+            match member {
+                ModelMember::LayerDecl { name, type_ann, .. } => {
+                    fields.push((*name, self.resolve_type(type_ann)));
+                }
+                ModelMember::Method(fn_def, _) => {
+                    methods.push((fn_def.name, self.build_fn_type(fn_def)));
+                }
+            }
+        }
+        self.current_scope = prev;
+        Type::Model {
+            name: model_def.name,
+            type_params: model_def.type_params.iter().map(|tp| tp.name).collect(),
+            type_args: Vec::new(),
+            fields,
+            methods,
         }
     }
 
@@ -281,6 +436,28 @@ impl<'a> TypeChecker<'a> {
             params,
             ret: Box::new(ret),
             effect,
+        }
+    }
+
+    /// Declare a function's or method's parameters with the types its
+    /// signature (`build_fn_type`, which skips `self`) already resolved,
+    /// rather than resolving each annotation again: a second resolution
+    /// reported every error in a parameter type a second time.
+    fn declare_params_from_signature(&mut self, fn_def: &FnDef, fn_ty: &Type) {
+        let resolved: Vec<Type> = match fn_ty {
+            Type::Function { params, .. } => params.clone(),
+            _ => Vec::new(),
+        };
+        let mut resolved = resolved.into_iter();
+        for param in &fn_def.params {
+            if self.resolve_name(param.name) == "self" {
+                continue;
+            }
+            let param_ty = resolved.next().unwrap_or(Type::Unknown);
+            self.declare_symbol(param.name, param_ty, param.span, false, true);
+            if let Some(default) = &param.default {
+                self.check_expr(default);
+            }
         }
     }
 
@@ -490,4 +667,18 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     }
 
     pi == plen
+}
+
+/// A scalar float type (the checker's `float`, or a sized float).
+pub(crate) fn is_float_scalar(ty: &Type) -> bool {
+    dtype_rank(ty).0 == 2
+}
+
+/// What to say where a float stands for an int: `/` is true division.
+pub(crate) fn float_where_int_hint(expr: &Expr) -> &'static str {
+    if matches!(expr.kind, ExprKind::BinaryOp { op: BinOp::Div, .. }) {
+        "`/` is true division and gives a float; use `//` for integer division"
+    } else {
+        "an int is needed here: use `//` for integer division, or `int(...)`"
+    }
 }

@@ -42,10 +42,6 @@ const EXPECTED_SKIPS: &[(&str, &str)] = &[
         "a `= nsl.quant...` continuation line the parser does not accept",
     ),
     (
-        "examples/gpt2.nsl",
-        "`quant(scheme = int8, ...)` where the grammar expects `static`",
-    ),
-    (
         "models/coder1b/pretrain_1b2048.nsl",
         "a template with a placeholder line",
     ),

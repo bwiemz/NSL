@@ -7055,10 +7055,34 @@ pub(crate) fn gpu_embedding_backward(
 // GPU Bias Add
 // ---------------------------------------------------------------------------
 
-/// GPU bias_add: out[i,j] = tensor[i,j] + bias[j].
+/// GPU bias_add over `[..., C]`: out[i] = tensor[i] + bias[i % C].
 /// Both tensor and bias must be on GPU (f32). Allocates output via alloc_managed.
+///
+/// The kernel indexes both operands linearly, so a strided view (a
+/// transpose) is made row-major first, as the CPU arm does; it used to be
+/// read in storage order. The caller (`nsl_tensor_bias_add`) has checked
+/// that the bias is as long as the last dimension: the kernel reads
+/// `bias[i % C]` and would read past a short one.
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
+    // Private row-major copies (or the same tensors, one ref more, when
+    // already row-major). Untaped: the caller records BiasAdd against its
+    // own operands.
+    let (t_rm, b_rm) = {
+        let _untaped = crate::autodiff::TapePause::new();
+        (
+            crate::tensor::nsl_tensor_contiguous(tensor_ptr),
+            crate::tensor::nsl_tensor_contiguous(bias_ptr),
+        )
+    };
+    let out = gpu_bias_add_row_major(t_rm, b_rm);
+    crate::tensor::nsl_tensor_free(t_rm);
+    crate::tensor::nsl_tensor_free(b_rm);
+    out
+}
+
+#[cfg(feature = "cuda")]
+fn gpu_bias_add_row_major(tensor_ptr: i64, bias_ptr: i64) -> i64 {
     inner::set_oom_context("bias_add");
     use crate::tensor::NslTensor;
 
@@ -7066,11 +7090,15 @@ pub(crate) fn gpu_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
     let bias_ref = NslTensor::from_ptr_ref(bias_ptr);
     assert_gpu_f32(tensor, "bias_add", "input");
 
-    let rows = unsafe { *tensor.shape.add(0) } as u64;
-    let cols = unsafe { *tensor.shape.add(1) } as u64;
-    let total = rows * cols;
+    // `[..., C]`: the bias runs along the last dimension, every leading one
+    // broadcast (the kernel indexes the bias by `i % cols`).
+    let ndim = tensor.ndim as usize;
+    let cols = unsafe { *tensor.shape.add(ndim - 1) } as u64;
+    let total = tensor.len as u64;
 
-    let out_data = inner::alloc_managed((total as usize) * 4);
+    // At least one element's worth, so a zero-element input gets a real
+    // buffer to own; its launch is skipped below (a zero-size grid fails).
+    let out_data = inner::alloc_managed((total.max(1) as usize) * 4);
 
     // Ensure bias is on GPU
     let bias_on_gpu = if bias_ref.device == 0 {
@@ -7087,12 +7115,8 @@ pub(crate) fn gpu_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
     // dtype survives that transfer verbatim.
     assert_gpu_f32(bias_gpu, "bias_add", "bias");
 
-    let out_shape = crate::memory::checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
-    unsafe {
-        *out_shape.add(0) = rows as i64;
-        *out_shape.add(1) = cols as i64;
-    }
-    let out_strides = NslTensor::compute_strides(out_shape, 2);
+    let out_shape = NslTensor::copy_shape(tensor.shape, tensor.ndim);
+    let out_strides = NslTensor::compute_strides(out_shape, tensor.ndim);
 
     let mut t_data = tensor.data as u64;
     let mut b_data = bias_gpu.data as u64;
@@ -7108,15 +7132,17 @@ pub(crate) fn gpu_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
         &mut cols_val as *mut _ as *mut std::ffi::c_void,
     ];
 
-    let block = 256i64;
-    let grid = ((total as i64) + block - 1) / block;
+    if total > 0 {
+        let block = 256i64;
+        let grid = ((total as i64) + block - 1) / block;
 
-    let result = inner::kernel_launch(
-        fused_kernels::bias_add_f32_ptx().as_ptr(), b"nsl_bias_add_f32\0".as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args, 0,
-    );
-    assert_eq!(result as u32, 0, "GPU bias_add kernel failed: {:?}", result);
-    inner::sync_after_kernel();
+        let result = inner::kernel_launch(
+            fused_kernels::bias_add_f32_ptx().as_ptr(), b"nsl_bias_add_f32\0".as_ptr(),
+            [grid, 1, 1], [block, 1, 1], &args, 0,
+        );
+        assert_eq!(result as u32, 0, "GPU bias_add kernel failed: {:?}", result);
+        inner::sync_after_kernel();
+    }
 
     crate::tensor::nsl_tensor_free(bias_on_gpu);
 
@@ -7124,7 +7150,7 @@ pub(crate) fn gpu_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
         out_data,
         out_shape,
         out_strides,
-        2,
+        tensor.ndim,
         total as i64,
         tensor.device,
         1, // f32

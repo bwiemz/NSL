@@ -139,6 +139,24 @@ pub struct TypeRegistry {
     pub enum_variants: HashMap<String, i64>,
     pub enum_defs: HashMap<String, Vec<(String, i64)>>,
     pub custom_dtype_ids: HashMap<String, u16>,
+    /// The module's top-level `const`s whose value is a compile-time
+    /// literal (`collect_module_consts`). Functions, model methods and
+    /// field initialisers are compiled outside `main`, where the module's
+    /// top-level bindings live, so a name they cannot find among their own
+    /// variables is looked up here.
+    pub module_consts: HashMap<Symbol, ModuleConst>,
+    /// Every name a top-level `let` or `const` binds, so a function that
+    /// reads one that is not in `module_consts` is told why it cannot.
+    pub module_bindings: HashSet<Symbol>,
+}
+
+/// The value of a module-level `const` known at compile time.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ModuleConst {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Str(String),
 }
 
 impl TypeRegistry {
@@ -148,6 +166,8 @@ impl TypeRegistry {
             enum_variants: HashMap::new(),
             enum_defs: HashMap::new(),
             custom_dtype_ids: HashMap::new(),
+            module_consts: HashMap::new(),
+            module_bindings: HashSet::new(),
         }
     }
 }

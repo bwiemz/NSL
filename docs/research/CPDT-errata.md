@@ -459,6 +459,19 @@ is as of 2026-11-13.
   "--cpdt: owner CPDT recorded no disposition", although the MoE passes had
   run. They now record what they did (`record_moe_disposition` in
   `crates/nsl-codegen/src/cpdt_moe_capacity.rs`).
+- That program then compiled and died at run time on "invalid tensor handle
+  0x2". Under `--cpdt full` the dispatch multiplies the tokens by its
+  `experts` argument (`nsl_moe_dispatch_full_v2`), and the M32 spelling
+  passes an int field there (`experts: int = 2`, ignored by the identity
+  dispatch), so the 2 was read as a tensor handle. A non-tensor expert
+  argument to `moe_dispatch`, `moe_dispatch_ffn` or `moe_dispatch_swiglu`
+  is now a compile-time error naming the size the weights file gives the
+  layer, and when the dispatch refuses its operands at run time (it returns
+  a null handle for an expert tensor of the wrong length or dtype) the
+  program stops with the reason instead of passing the null on
+  (`refuse_bad_moe_weight_operands` and `assert_moe_dispatch_result` in
+  `crates/nsl-codegen/src/expr/calls.rs`; tests in
+  `crates/nsl-cli/tests/cpdt_model_facts_gate.rs`).
 - In a debug build, a weights file naming a layer numbered at or above the
   assumed count of 8 would panic on an assertion in `position_criticality`
   (`crates/nsl-codegen/src/cpdt_sensitivity.rs`). The assertion is removed;
@@ -504,6 +517,12 @@ is as of 2026-11-13.
 
 ### Open
 
+- An inference-only program that dispatches through `moe_dispatch`, built
+  with `--cpdt full --weights`, now compiles and then stops at run time with
+  "invalid tensor handle 0x2". The compile used to be refused as inert, which
+  hid it; the gate for that case (`cpdt_model_facts_gate`) checks the compile
+  only. Reproduced by running. Right: find the handle that is passed before
+  it is created, or refuse the configuration at compile time again.
 - The INT8 blockwise code, which is not wired into the optimizer, is a linear
   absmax quantizer, and that is unsound for `v`: with a five-decade spread
   inside a block the small elements round to zero and the median step is 33
@@ -514,3 +533,15 @@ is as of 2026-11-13.
   with a non-linear code (the dynamic map bitsandbytes uses) needs that
   code's table reproduced and checked against the reference implementation,
   which was not available.
+- Under `--cpdt full` the MoE layer's shapes come from the weights file
+  (`<layer>.router.weight`, `<layer>.experts.weight`), but its values do
+  not: the dispatch multiplies by the program's own `experts` argument,
+  and those file tensors join no parameter, so `-w` reports them as not
+  loaded. The expert slicing of `--cpdt-prune-experts` edits only the
+  compiler's copy of the file and the expert count, so a pruned layer's
+  dispatch is refused at run time (the program's tensor and router keep
+  every expert). Where: `crates/nsl-codegen/src/expr/calls.rs` (the
+  `moe_dispatch` lowerings), `crates/nsl-codegen/src/cpdt_expert_prune.rs`.
+  Established: reading the code and running a two-expert program (2026-11-14).
+  Deciding whether the dispatch should read the file's expert tensors is a
+  design question for the owner.

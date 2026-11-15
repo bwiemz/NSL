@@ -91,6 +91,21 @@ counter = counter + 1            # OK: let is mutable
 # MAX_SEQ = 4096                 # COMPILE ERROR: const is immutable
 ```
 
+A module-level `const` whose value is a literal, or arithmetic (`+ - * / // %`,
+negation) on literals and earlier such constants, is a compile-time constant:
+functions, model methods and field initialisers read it, and a `DataLoader`
+keyword that takes a constant accepts it (`batch_size = BATCH`). Other
+module-level bindings belong to the program's top level only; a function reads
+them through its parameters. (`train(...)` header keys and decorator arguments
+still take literals.)
+
+`/` is true division, as in Python 3: `7 / 2` is `3.5`, a float even when both
+operands are ints. `//` is floor division (`-7 // 2` is `-4`) and `%` takes the
+divisor's sign, for every integer width. Where an int is required (a
+`range` bound, an index, a shape dimension, an `int` parameter) a float is a
+type error that asks for `//`; a list literal with a float element is a list
+of floats, so `[n / 2, 4]` is not a shape.
+
 ### Example 2: Function Definition with Type Annotations
 
 ```nsl

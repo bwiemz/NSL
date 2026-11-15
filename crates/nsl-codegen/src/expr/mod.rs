@@ -133,6 +133,35 @@ pub(crate) fn tensor_method_returns_owned_ref(method: &str) -> Option<bool> {
 }
 
 impl Compiler<'_> {
+    /// The value of a module `const` at a use site, in the machine type the
+    /// checker gave the name there (`const PI: f32 = ...` is an f32).
+    fn compile_module_const(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        expr: &Expr,
+        c: &crate::compiler::ModuleConst,
+    ) -> Result<Value, CodegenError> {
+        use crate::compiler::ModuleConst as C;
+        let ty = self.node_type(expr.id).clone();
+        Ok(match c {
+            C::Int(v) => match ty {
+                Type::Float | Type::F64 => builder.ins().f64const(*v as f64),
+                Type::F32 => builder.ins().f32const(*v as f32),
+                Type::Int32 => builder.ins().iconst(cl_types::I32, *v),
+                _ => builder.ins().iconst(cl_types::I64, *v),
+            },
+            C::Float(v) => match ty {
+                Type::F32 => builder.ins().f32const(*v as f32),
+                _ => builder.ins().f64const(*v),
+            },
+            C::Bool(v) => builder.ins().iconst(cl_types::I8, i64::from(*v)),
+            C::Str(v) => {
+                let v = v.clone();
+                return self.compile_string_literal(builder, &v);
+            }
+        })
+    }
+
     /// Compile one expression. An error raised beneath it leaves here
     /// pointing at the innermost expression that was being compiled (see
     /// `compile_stmt`; `CodegenError::with_span_if_unset` keeps the first
@@ -209,9 +238,22 @@ impl Compiler<'_> {
                     if let Some(dtype_id) = self.resolve_custom_dtype(&name) {
                         return Ok(builder.ins().iconst(cl_types::I64, dtype_id as i64));
                     }
+                    // A module-level `const` with a literal value, read
+                    // from a function, a model method or a field
+                    // initialiser, which do not see `main`'s variables.
+                    if let Some(c) = self.types.module_consts.get(sym).cloned() {
+                        return self.compile_module_const(builder, expr, &c);
+                    }
                     // Check if it's an enum variant
                     if let Some(tag) = self.lookup_enum_variant_tag(&name) {
                         Ok(builder.ins().iconst(cl_types::I64, tag))
+                    } else if self.types.module_bindings.contains(sym) {
+                        Err(CodegenError::new(format!(
+                            "'{name}' is bound at the module's top level, which a function or a \
+                             model method does not see: only a module `const` whose value is a \
+                             literal (int, float, bool or string, or arithmetic on them) is \
+                             visible there. Pass '{name}' as an argument."
+                        )))
                     } else {
                         Err(CodegenError::new(format!("undefined variable '{name}'")))
                     }

@@ -1188,7 +1188,7 @@ impl Compiler<'_> {
                 &[weight_val, indices_val],
             );
         }
-        // bias_add(tensor, bias) -> tensor -- broadcasts 1D bias over 2D tensor
+        // bias_add(tensor, bias) -> tensor -- a 1-D bias along the last dim of [..., C]
         if func_name == "bias_add" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 2 {
                 return Err(CodegenError::new(
@@ -2078,6 +2078,15 @@ impl Compiler<'_> {
             }
 
             if let Some((hidden_dim, intermediate_dim)) = v4_dims {
+                let block = num_experts * hidden_dim * intermediate_dim;
+                self.refuse_bad_moe_weight_operands(
+                    "moe_dispatch_swiglu",
+                    &[
+                        (&args[2].value, "third (experts_gate)", block),
+                        (&args[3].value, "fourth (experts_up)", block),
+                        (&args[4].value, "fifth (experts_down)", block),
+                    ],
+                )?;
                 // CPDT Part III v2.14 source-activation gate. Mirrors
                 // v3's v2.12 detection: when the WeightMap has v4
                 // biases, the source MUST use the 8-arg form so the
@@ -2163,6 +2172,17 @@ impl Compiler<'_> {
                         bias_up_arg,
                         bias_down_arg,
                     ],
+                )?;
+                self.assert_moe_dispatch_result(
+                    builder,
+                    result,
+                    &format!(
+                        "moe_dispatch_swiglu (--cpdt full): nsl_moe_dispatch_full_v4 refused its \
+                         operands; each expert projection must hold {} elements \
+                         ({num_experts} experts of {hidden_dim} x {intermediate_dim}, from the \
+                         weights file) in the tokens' dtype, and top_k must be 1 or 2",
+                        num_experts * hidden_dim * intermediate_dim
+                    ),
                 )?;
                 return Ok(result);
             }
@@ -2333,6 +2353,14 @@ impl Compiler<'_> {
             }
 
             if let Some((hidden_dim, intermediate_dim)) = v3_dims {
+                let block = num_experts * hidden_dim * intermediate_dim;
+                self.refuse_bad_moe_weight_operands(
+                    "moe_dispatch_ffn",
+                    &[
+                        (&args[2].value, "third (experts_up)", block),
+                        (&args[3].value, "fourth (experts_down)", block),
+                    ],
+                )?;
                 // CPDT Part III v2.12 source-activation gate. When the
                 // WeightMap has v3 biases, the source MUST use the 6-arg
                 // form so the bias pointers reach the FFI; the 4-arg
@@ -2434,6 +2462,17 @@ impl Compiler<'_> {
                         bias_up_arg,
                         bias_down_arg,
                     ],
+                )?;
+                self.assert_moe_dispatch_result(
+                    builder,
+                    result,
+                    &format!(
+                        "moe_dispatch_ffn (--cpdt full): nsl_moe_dispatch_full_v3 refused its \
+                         operands; each expert projection must hold {} elements \
+                         ({num_experts} experts of {hidden_dim} x {intermediate_dim}, from the \
+                         weights file) in the tokens' dtype, and top_k must be 1 or 2",
+                        num_experts * hidden_dim * intermediate_dim
+                    ),
                 )?;
                 return Ok(result);
             }
@@ -2537,6 +2576,10 @@ impl Compiler<'_> {
             };
 
             if let Some((hidden_dim, intermediate_dim)) = v2_dims {
+                self.refuse_bad_moe_weight_operands(
+                    "moe_dispatch",
+                    &[(&args[2].value, "third (experts)", num_experts * hidden_dim * intermediate_dim)],
+                )?;
                 let hidden_val = builder.ins().iconst(
                     cranelift_codegen::ir::types::I64,
                     hidden_dim as i64,
@@ -2558,6 +2601,17 @@ impl Compiler<'_> {
                         hidden_val,
                         intermediate_val,
                     ],
+                )?;
+                self.assert_moe_dispatch_result(
+                    builder,
+                    result,
+                    &format!(
+                        "moe_dispatch (--cpdt full): nsl_moe_dispatch_full_v2 refused its operands; \
+                         the experts tensor must hold {} elements ({num_experts} experts of \
+                         {hidden_dim} x {intermediate_dim}, from the weights file) in the tokens' \
+                         dtype, and top_k must be 1 or 2",
+                        num_experts * hidden_dim * intermediate_dim
+                    ),
                 )?;
                 return Ok(result);
             }
@@ -2903,6 +2957,10 @@ impl Compiler<'_> {
                 builder.seal_block(merge_blk);
                 state.current_block = Some(merge_blk);
             }
+            // The token buffer is this call's alone: the drivers write into
+            // it during the call and `nsl_cfie_tokens_to_tensor` copies out
+            // of it. It used to be left allocated, one buffer per call.
+            self.compile_call_by_name(builder, "nsl_free", &[out_ptr])?;
             return Ok(rc);
         }
 
@@ -3081,7 +3139,28 @@ impl Compiler<'_> {
                             BOOL_KEYS.join(", ")
                         )));
                     }
-                    match &arg.value.kind {
+                    // A module `const` with a literal value is a
+                    // compile-time constant like the literal it names.
+                    let folded;
+                    let kind = match &arg.value.kind {
+                        ExprKind::Ident(sym) => match self.types.module_consts.get(sym) {
+                            Some(crate::compiler::ModuleConst::Int(v)) => {
+                                folded = ExprKind::IntLiteral(*v);
+                                &folded
+                            }
+                            Some(crate::compiler::ModuleConst::Bool(v)) => {
+                                folded = ExprKind::BoolLiteral(*v);
+                                &folded
+                            }
+                            Some(crate::compiler::ModuleConst::Float(v)) => {
+                                folded = ExprKind::FloatLiteral(*v);
+                                &folded
+                            }
+                            _ => &arg.value.kind,
+                        },
+                        other => other,
+                    };
+                    match kind {
                         ExprKind::IntLiteral(v) if wants_int => {
                             if *v < 0 {
                                 return Err(CodegenError::new(format!(
@@ -3945,6 +4024,65 @@ impl Compiler<'_> {
 }
 
 impl Compiler<'_> {
+    /// The expert-weight operands of a production MoE dispatch
+    /// (`nsl_moe_dispatch_full_v2/_v3/_v4`, chosen under `--cpdt full` when
+    /// the weights file resolves the layer's shapes) are multiplied as
+    /// tensors of `want_numel` elements. Refuse an operand the checker typed
+    /// as something else -- the M32 spelling passes an int field
+    /// (`experts: int = 2`, which the identity dispatch ignores), and the
+    /// production FFI dereferenced that 2 as a tensor handle -- or as a
+    /// tensor of another size. Only a shape with dimensions is compared: an
+    /// unannotated `Tensor` has none, which the checker cannot tell from a
+    /// scalar's, and is left to the FFI's run-time refusal.
+    fn refuse_bad_moe_weight_operands(
+        &self,
+        intrinsic: &str,
+        operands: &[(&nsl_ast::expr::Expr, &str, usize)],
+    ) -> Result<(), CodegenError> {
+        for &(expr, role, want_numel) in operands {
+            let ty = self.node_type(expr.id);
+            if ty.is_indeterminate() {
+                continue;
+            }
+            if !ty.is_tensor() {
+                return Err(CodegenError::new(format!(
+                    "{intrinsic}: under --cpdt full the {role} argument is multiplied as the \
+                     expert weights, a tensor of {want_numel} elements (shape from the weights \
+                     file), but it is {ty:?}. Pass the expert weight tensor, or build without \
+                     --cpdt full for the identity dispatch."
+                )));
+            }
+            let has_dims = ty.as_tensor_parts().is_some_and(|(shape, _, _)| !shape.dims.is_empty());
+            if has_dims
+                && let Some(numel) = static_tensor_numel(ty)
+                && numel != want_numel as i64
+            {
+                return Err(CodegenError::new(format!(
+                    "{intrinsic}: the {role} argument has {numel} elements, but the weights file \
+                     gives this layer {want_numel} (num_experts x the per-expert block)."
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// A production MoE dispatch FFI returns 0 when it refuses its operands
+    /// (an expert-weight tensor of the wrong length or dtype, a `top_k`
+    /// outside {1, 2}). Abort with `message` there instead of handing 0 on
+    /// as a tensor handle.
+    fn assert_moe_dispatch_result(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        result: Value,
+        message: &str,
+    ) -> Result<(), CodegenError> {
+        let ok = builder.ins().icmp_imm_s(IntCC::NotEqual, result, 0);
+        self.intern_string(message)?;
+        let msg = self.compile_string_literal(builder, message)?;
+        self.compile_call_by_name(builder, "nsl_assert", &[ok, msg])?;
+        Ok(())
+    }
+
     /// Whether the checker typed a creation builtin call f64 -- which it does
     /// only when an annotation on the declaration chose f64 (C5 step 3);
     /// the default, f32, keeps the plain creation FFIs.

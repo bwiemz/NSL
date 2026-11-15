@@ -208,7 +208,20 @@ impl Compiler<'_> {
             || (left_type.is_indeterminate() && builder.func.dfg.value_type(lhs).is_float());
         let right_is_float = is_float_type(&right_type)
             || (right_type.is_indeterminate() && builder.func.dfg.value_type(rhs).is_float());
-        let is_float = left_is_float || right_is_float;
+        // `/` is true division: the checker types `int / int` as a float,
+        // and the value must be that float. It was emitted as `sdiv`, an
+        // integer that then met float-typed code: `let h = c / n` panicked
+        // Cranelift (an f64 variable given an i64), `print(7 / 2)` failed the
+        // verifier, and `(7 / 2) * 2.0` computed 6. A zero divisor still
+        // stops the program, as integer division did.
+        let int_true_division = matches!(op, BinOp::Div)
+            && !left_is_float
+            && !right_is_float
+            && is_float_type(&self.node_type(_full_expr.id).clone());
+        if int_true_division {
+            self.compile_divmod_guard(builder, state, rhs)?;
+        }
+        let is_float = left_is_float || right_is_float || int_true_division;
 
         // Promote int -> float if mixed types
         if is_float {

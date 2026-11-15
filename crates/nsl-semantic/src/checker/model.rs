@@ -49,6 +49,9 @@ impl<'a> TypeChecker<'a> {
                         let init_ty = self.check_expr(init_expr);
                         let init_ty = self.creation_dtype_from_annotation(init_expr, init_ty, Some(&ty));
                         self.check_field_init_dtype(*name, &ty, &init_ty, init_expr.span);
+                        if let Type::FixedModelArray { element_model, size } = ty {
+                            self.check_model_array_init(element_model, size, init_expr);
+                        }
                     }
                     for deco in decorators {
                         if deco.name.len() == 1 {
@@ -344,6 +347,22 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
                 ModelMember::Method(fn_def, decos) => {
+                    // A model's constructor is its parameter list and its
+                    // field initialisers (spec §4). `fn __init__` was
+                    // compiled as an ordinary method nothing calls, and a
+                    // call passing it arguments failed Cranelift's verifier
+                    // on the argument count.
+                    if self.resolve_name(fn_def.name) == "__init__" {
+                        let model = self.resolve_name(model_def.name);
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "`fn __init__` is not a constructor in NSL: a model is built from \
+                                 its parameter list and field initialisers, as in `model {model}(k: \
+                                 float):` with `w: Tensor = full([2, 2], k)`"
+                            ))
+                            .with_label(fn_def.span, "not a constructor"),
+                        );
+                    }
                     let method_ty = self.build_fn_type(fn_def);
                     methods.push((fn_def.name, method_ty));
 
@@ -447,10 +466,14 @@ impl<'a> TypeChecker<'a> {
             methods: methods.clone(),
         };
 
-        // Pass 2: Check method bodies with complete self type
+        // Pass 2: Check method bodies with complete self type. The method's
+        // signature is the one pass 1 resolved (resolving it again
+        // reported its errors again).
+        let mut method_types = methods.iter().map(|(_, ty)| ty.clone());
         for member in &model_def.members {
             if let ModelMember::Method(fn_def, _decos) = member {
-                let method_ty = self.build_fn_type(fn_def);
+                // Pass 1 pushed one signature per method, in member order.
+                let method_ty = method_types.next().unwrap_or(Type::Unknown);
 
                 let method_scope =
                     self.scopes.push_scope(self.current_scope, ScopeKind::Method);
@@ -468,21 +491,7 @@ impl<'a> TypeChecker<'a> {
                 }
 
                 // Declare params (skip self)
-                for param in &fn_def.params {
-                    let name_str = self.resolve_name(param.name);
-                    if name_str == "self" {
-                        continue;
-                    }
-                    let param_ty = param
-                        .type_ann
-                        .as_ref()
-                        .map(|t| self.resolve_type(t))
-                        .unwrap_or(Type::Unknown);
-                    self.declare_symbol(param.name, param_ty, param.span, false, true);
-                    if let Some(default) = &param.default {
-                        self.check_expr(default);
-                    }
-                }
+                self.declare_params_from_signature(fn_def, &method_ty);
 
                 // Check method body
                 for s in &fn_def.body.stmts {
@@ -508,6 +517,54 @@ impl<'a> TypeChecker<'a> {
             info.ty = model_ty;
         } else {
             self.declare_symbol(model_def.name, model_ty, model_def.span, true, false);
+        }
+    }
+
+    /// The initialiser of a `[M; n]` field is either one expression the
+    /// constructor evaluates once per element (`= M()`), or a list of `n`
+    /// expressions, element `i` from item `i` (`= [M(1), M(2)]`). Each
+    /// element must be an `M`. Codegen stores one pointer per element; a
+    /// list or a value of another model stored there was read later as an
+    /// `M` ("invalid tensor handle" on `block.w`).
+    fn check_model_array_init(&mut self, element_model: Symbol, size: i64, init: &Expr) {
+        let model = self.resolve_name(element_model);
+        let elements: Vec<&Expr> = match &init.kind {
+            ExprKind::ListLiteral(items) => {
+                if items.len() as i64 != size {
+                    self.diagnostics.push(
+                        Diagnostic::error(format!(
+                            "a `[{model}; {size}]` field initialised with a list needs {size} \
+                             elements, one per array element; this list has {}",
+                            items.len()
+                        ))
+                        .with_label(init.span, format!("expected {size} elements")),
+                    );
+                    return;
+                }
+                items.iter().collect()
+            }
+            _ => vec![init],
+        };
+        for element in elements {
+            let element_ty = self.type_map.get(&element.id).cloned().unwrap_or(Type::Unknown);
+            let fits = match &element_ty {
+                Type::Model { name, .. } => *name == element_model,
+                other => other.is_indeterminate(),
+            };
+            if !fits {
+                let found = match &element_ty {
+                    Type::Model { name, .. } => format!("a `{}`", self.resolve_name(*name)),
+                    other => display_type(other),
+                };
+                self.diagnostics.push(
+                    Diagnostic::error(format!(
+                        "an element of a `[{model}; {size}]` field must be a `{model}`, found \
+                         {found}; initialise the field with `{model}(...)` (one constructor call \
+                         per element) or a list of {size} of them"
+                    ))
+                    .with_label(element.span, format!("not a `{model}`")),
+                );
+            }
         }
     }
 }
