@@ -295,36 +295,46 @@ fn norm_module(op: nsl_kir::kernels::norm::NormOp) -> &'static str {
 // Matches the correct RMSNorm dx (NO mean-subtract), i.e. tape-AD's
 // `rmsnorm_backward` dx term and the source-AD `RmsNormInputBackward`
 // decomposition — validated to tolerance (approx rsqrt/div vs the CPU f64 ref).
-// P5 item 20 slice A — fused RMSNorm GAMMA backward (2 launches, no
-// full-size temps). Kernel 1: one thread per ROW computes
-// rinv[row] = 1 / sqrt(mean(x_row^2) + eps) into a tiny [rows] scratch.
-// Kernel 2: one thread per COLUMN j accumulates
-// dgamma[j] = sum_rows(dy[i,j] * x[i,j] * rinv[i]) with a sequential row
-// loop — a fixed summation order, so the result is bit-deterministic
-// run-to-run (the old 7-op decomposition materialized three [rows, cols]
-// temporaries and reduced through reduce_to_shape).
+// P5 item 20 slice A — fused RMSNorm GAMMA backward (no full-size temps),
+// three launches built by `nsl_kir::kernels::rmsnorm_dgamma`, which documents
+// the reductions and derives their error bounds: a block per row computes
+// rinv[row] = 1 / sqrt(mean(x_row^2) + eps) into a [rows] scratch; a grid of
+// (256-column block, row chunk) writes per-chunk column sums of
+// dy[i,j] * x[i,j] * rinv[i] into a [chunks, cols] scratch; a final pass adds
+// each column's chunk sums. Fixed partition and fixed summation order, so the
+// result is bit-deterministic run-to-run (the old 7-op decomposition
+// materialized three [rows, cols] temporaries and reduced through
+// reduce_to_shape).
 
-/// `nsl_rmsnorm_rinv_rows_f32(x, rinv, rows, cols, eps)`: a thread per row,
+/// `nsl_rmsnorm_rinv_rows_f32(x, rinv, rows, cols, eps)`: a block per row,
 /// `rinv[r] = 1 / sqrt(Σ_j x[r, j]² / cols + eps)`, every step correctly
 /// rounded.
 pub(crate) fn rmsnorm_rinv_rows_f32_ptx() -> &'static str {
     rmsnorm_dgamma_module(nsl_kir::kernels::rmsnorm_dgamma::RmsNormDgammaOp::RinvRows)
 }
 
-/// `nsl_rmsnorm_dgamma_f32(dy, x, rinv, dgamma, rows, cols)`: a thread per
-/// column, `dgamma[j] = Σ_i (dy[i, j] · x[i, j]) · rinv[i]` in row order.
-pub(crate) fn rmsnorm_dgamma_f32_ptx() -> &'static str {
-    rmsnorm_dgamma_module(nsl_kir::kernels::rmsnorm_dgamma::RmsNormDgammaOp::Dgamma)
+/// `nsl_rmsnorm_dgamma_partial_f32(dy, x, rinv, partial, rows, cols,
+/// chunk_rows)`: a thread per column and a grid row per chunk,
+/// `partial[c, j] = Σ_{i in chunk c} (dy[i, j] · x[i, j]) · rinv[i]` in row
+/// order.
+pub(crate) fn rmsnorm_dgamma_partial_f32_ptx() -> &'static str {
+    rmsnorm_dgamma_module(nsl_kir::kernels::rmsnorm_dgamma::RmsNormDgammaOp::Partial)
 }
 
-/// The KIR-built module for one of the two launches, built once. Both are
-/// built by `nsl_kir::kernels::rmsnorm_dgamma`; its
-/// `rmsnorm_dgamma_kir_equivalence` gate holds them to the hand-written
-/// modules they replaced. NUL-terminated.
+/// `nsl_rmsnorm_dgamma_final_f32(partial, dgamma, chunks, cols)`: 32 columns
+/// by 8 warps a block, `dgamma[j] = Σ_c partial[c, j]` in a fixed order.
+pub(crate) fn rmsnorm_dgamma_final_f32_ptx() -> &'static str {
+    rmsnorm_dgamma_module(nsl_kir::kernels::rmsnorm_dgamma::RmsNormDgammaOp::Final)
+}
+
+/// The KIR-built module for one of the three launches, built once. Its
+/// `rmsnorm_dgamma_kir_equivalence` gate holds each to an f64 reference
+/// within the derived bound and to its documented summation order.
+/// NUL-terminated.
 fn rmsnorm_dgamma_module(op: nsl_kir::kernels::rmsnorm_dgamma::RmsNormDgammaOp) -> &'static str {
     use nsl_kir::kernels::rmsnorm_dgamma::RmsNormDgammaOp;
     use std::sync::OnceLock;
-    static MODULES: [OnceLock<String>; 2] = [OnceLock::new(), OnceLock::new()];
+    static MODULES: [OnceLock<String>; 3] = [OnceLock::new(), OnceLock::new(), OnceLock::new()];
     let slot = RmsNormDgammaOp::ALL.iter().position(|o| *o == op).expect("an RMSNorm dgamma kernel");
     MODULES[slot].get_or_init(|| String::from_utf8(nsl_kir::kernels::rmsnorm_dgamma::ptx(op)).expect("PTX must be ASCII"))
 }

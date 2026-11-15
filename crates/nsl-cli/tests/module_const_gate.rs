@@ -106,3 +106,35 @@ print(f())
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("'W' is bound at the module's top level"), "{stderr}");
 }
+
+/// A sized-numeric `const` read in a function has its declared machine
+/// type: `int16`/`int8` are i16/i8 and `fp16` is an f32, as every other
+/// value of those types. They were emitted as i64 and f64, and the
+/// function's `return` failed Cranelift's verifier ("result 0 has type
+/// i64, must match function signature of i16"). Negative values check the
+/// narrow immediate is given in its own width.
+#[test]
+fn a_sized_numeric_const_has_its_machine_type_in_a_function() {
+    let out = run(r#"const S: int16 = -3
+const B: int8 = -5
+const I: int32 = -7
+const H: fp16 = 1.5
+const F: f32 = 2.5
+fn s() -> int16:
+    return S
+fn b() -> int8:
+    return B
+fn i() -> int32:
+    return I
+fn h() -> fp16:
+    return H
+fn f() -> f32:
+    return F
+print(s())
+print(b())
+print(i())
+print(h())
+print(f())
+"#);
+    assert_eq!(lines(&out), ["-3", "-5", "-7", "1.5", "2.5"]);
+}

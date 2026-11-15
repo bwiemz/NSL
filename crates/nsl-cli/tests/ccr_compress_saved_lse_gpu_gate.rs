@@ -14,7 +14,11 @@
 //! The gate trains Coder-50M (the real model, synthetic tokens) on the GPU
 //! with the production checkpointing flags, with and without compression,
 //! under the kernel profiler, and asserts that the attention backward ran on
-//! the device and the logsumexp recompute kernel did not, in both.
+//! the device and the logsumexp recompute kernel did not, in both. It does so
+//! for both attention backwards: the tensor-core kernels (`nsl_flash_tc_bwd_*`,
+//! the default) and the previous ones (`flash_attn_bwd_*`, under
+//! `NSL_TC_ATTENTION=0`). Each recomputes a missing logsumexp with its own
+//! `nsl_flash_lse_*` kernel, which is what the gate looks for.
 //!
 //! GPU-only. Run:
 //!   cargo test -p nsl-cli --features cuda --test ccr_compress_saved_lse_gpu_gate \
@@ -32,7 +36,11 @@ fn repo_root() -> PathBuf {
 }
 
 fn gpu_present() -> bool {
-    Command::new("nvidia-smi").arg("-L").output().map(|o| o.status.success()).unwrap_or(false)
+    Command::new("nvidia-smi")
+        .arg("-L")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// Two optimizer updates of batch 1 x 1024, accumulation 2: 4097 tokens and
@@ -42,7 +50,9 @@ fn write_tokens(path: &std::path::Path) {
     let mut s: u64 = 0x5EED;
     let bytes: Vec<u8> = (0..n)
         .flat_map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (((s >> 33) % 49152) as u16).to_le_bytes()
         })
         .collect();
@@ -76,9 +86,10 @@ print("LOSS_STREAM_END")
     )
 }
 
-/// Run the program with `flags` under the kernel profiler; returns (stderr,
-/// the profile's JSON).
-fn run_profiled(tag: &str, flags: &[&str]) -> (String, String) {
+/// Run the program with `flags` under the kernel profiler, with
+/// `NSL_TC_ATTENTION` set to `tc_attention`; returns (stderr, the profile's
+/// JSON).
+fn run_profiled(tag: &str, flags: &[&str], tc_attention: &str) -> (String, String) {
     let root = repo_root();
     let dir = std::env::temp_dir().join(format!("nsl_ccr_lse_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -97,6 +108,7 @@ fn run_profiled(tag: &str, flags: &[&str]) -> (String, String) {
         .current_dir(&dir)
         .env("NSL_STDLIB_PATH", root.join("stdlib"))
         .env("NSL_PROFILE_KERNELS", "1")
+        .env("NSL_TC_ATTENTION", tc_attention)
         .output()
         .expect("spawn nsl run");
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -127,23 +139,29 @@ fn compressed_saves_keep_the_forward_logsumexp() {
     }
     let mut compress: Vec<&str> = PROD.to_vec();
     compress.extend(["--checkpoint-compress", "bf16"]);
-    for (tag, flags) in [("plain", PROD.to_vec()), ("compress", compress)] {
-        let (stderr, json) = run_profiled(tag, &flags);
-        if tag == "compress" {
+    // (NSL_TC_ATTENTION, the backward kernels that serve the call under it)
+    let paths = [("1", "nsl_flash_tc_bwd"), ("0", "flash_attn_bwd")];
+    for (tc, bwd_kernel) in paths {
+        for (save, flags) in [("plain", PROD.to_vec()), ("compress", compress.clone())] {
+            let tag = format!("{save}_tc{tc}");
+            let tag = tag.as_str();
+            let (stderr, json) = run_profiled(tag, &flags, tc);
+            if save == "compress" {
+                assert!(
+                    stderr.contains("compressed saves:"),
+                    "compression did not engage, so this run proves nothing:\n{stderr}"
+                );
+            }
             assert!(
-                stderr.contains("compressed saves:"),
-                "compression did not engage, so this run proves nothing:\n{stderr}"
+                json.contains(bwd_kernel),
+                "{tag}: no {bwd_kernel}* kernel ran — the gate is not looking at the path \
+             it guards"
+            );
+            assert!(
+                !json.contains("nsl_flash_lse"),
+                "{tag}: the attention backward recomputed the logsumexp (nsl_flash_lse_*) \
+             instead of reading the forward's saved one"
             );
         }
-        assert!(
-            json.contains("flash_attn_bwd"),
-            "{tag}: no flash-attention backward kernel ran — the gate is not looking \
-             at the path it guards"
-        );
-        assert!(
-            !json.contains("nsl_flash_lse"),
-            "{tag}: the attention backward recomputed the logsumexp (nsl_flash_lse_*) \
-             instead of reading the forward's saved one"
-        );
     }
 }
