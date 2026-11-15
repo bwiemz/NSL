@@ -433,6 +433,18 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         },
     );
 
+    // rope(x, cos, sin) -> tensor: the fused rotary embedding
+    // x * cos + rotate_half(x) * sin for x [b, h, s, d] and the [s, d] position
+    // tables (constants: no gradient flows into them).
+    def(
+        "rope",
+        Type::Function {
+            params: vec![tensor_ret.clone(), tensor_ret.clone(), tensor_ret.clone()],
+            ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
+        },
+    );
+
     // embedding_lookup(weight, indices) -> tensor
     def(
         "embedding_lookup",

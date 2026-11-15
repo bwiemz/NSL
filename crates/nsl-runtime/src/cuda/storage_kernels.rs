@@ -30,6 +30,7 @@ enum Kernel {
     SwigluGate([Storage; 3], Storage),
     RotateHalf(RotateHalfOp, Storage, Storage),
     Norm(NormOp, Storage, Storage),
+    Rope(nsl_kir::kernels::rope::RopeDir, Storage, Storage),
 }
 
 /// The NUL-terminated PTX module and entry name of `k`, lowered once and kept
@@ -47,6 +48,7 @@ fn module(k: Kernel) -> (&'static str, &'static str) {
             Kernel::SwigluGate(ins, out) => ew::build_backward_st(BackwardOp::SwigluGate, &ins, out),
             Kernel::RotateHalf(op, i, out) => ew::build_rotate_half_st(op, i, out),
             Kernel::Norm(op, i, out) => nsl_kir::kernels::norm::build_st(op, i, out),
+            Kernel::Rope(dir, i, out) => nsl_kir::kernels::rope::build(dir, i, out),
         };
         let name: &'static str = Box::leak(format!("{}\0", ir.name).into_boxed_str());
         if let Err(errors) = nsl_kir::kir_verify::verify(&ir) {
@@ -171,5 +173,24 @@ pub(crate) fn rmsnorm(x: i64, gamma: i64, eps: f32, out: Storage) -> i64 {
     let c = alloc_like(tx, out);
     // The kernel's eps is an `.f32` parameter: its bits in the slot's low half.
     launch_grid(k, rows as i64, 256 * 4, &mut [data(x), data(c), data(gamma), rows, cols, u64::from(eps.to_bits())]);
+    c
+}
+
+/// The fused RoPE (`nsl_kir::kernels::rope`): `x` `[b, h, s, d]` f32 or bf16
+/// read through its own strides, `cos`/`sin` contiguous f32 `[s, d]`, the
+/// result contiguous `[b, h, s, d]` stored as `out`.
+pub(crate) fn rope(dir: nsl_kir::kernels::rope::RopeDir, x: i64, cos: i64, sin: i64, out: Storage) -> i64 {
+    super::inner::set_oom_context("rope");
+    let tx = NslTensor::from_ptr_ref(x);
+    let dim = |i: usize| unsafe { *tx.shape.add(i) } as u64;
+    let st = |i: usize| unsafe { *tx.strides.add(i) } as u64;
+    let k = Kernel::Rope(dir, storage_of(tx), out);
+    let c = alloc_like(tx, out);
+    let n = tx.len as usize;
+    launch(
+        k,
+        n,
+        &mut [data(x), data(cos), data(sin), data(c), n as u64, dim(3), dim(2), dim(1), st(0), st(1), st(2), st(3)],
+    );
     c
 }

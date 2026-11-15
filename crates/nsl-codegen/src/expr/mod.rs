@@ -582,6 +582,7 @@ impl Compiler<'_> {
                             | "tensor_sin"
                             | "tensor_cos"
                             | "rotate_half"
+                            | "rope"
                             | "tanh"
                             | "softmax"
                             | "log_softmax"

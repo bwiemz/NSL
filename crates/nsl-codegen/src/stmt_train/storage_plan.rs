@@ -215,6 +215,8 @@ pub fn has_dt_lowering(op: &PrimalOp) -> bool {
         || is_passthrough(op, "rotate_half")
         || is_passthrough(op, "rotate_half_neg")
         || is_passthrough(op, "reduce_to_shape")
+        || is_passthrough(op, "rope")
+        || is_passthrough(op, "rope_backward")
 }
 
 /// Ops whose result has their (first) input's storage and that the runtime
@@ -256,10 +258,20 @@ fn find_attention_seeds(primal: &WengertList) -> (Vec<VarId>, Vec<VarId>) {
         let mut ok = true;
         for &x in &op.inputs[..3] {
             let src = through(x);
-            if let Some(m_in) = matmul_of_param(&prod, src) {
-                let _ = m_in;
+            if matmul_of_param(&prod, src).is_some() {
                 gemms.push(src);
                 continue;
+            }
+            // The `rope` builtin of a view of a GEMM.
+            if let Some(r) = prod.get(&src).filter(|o| is_passthrough(&o.op, "rope")) {
+                let g = through(r.inputs[0]);
+                if matmul_of_param(&prod, g).is_some() {
+                    gemms.push(g);
+                    ropes.push(src);
+                    continue;
+                }
+                ok = false;
+                break;
             }
             // RoPE: Add(Mul(t, cos), Mul(rotate_half(t), sin)) of a view of a GEMM.
             let Some(add) = prod.get(&src).filter(|o| matches!(o.op, PrimalOp::Add)) else {
@@ -461,11 +473,22 @@ impl Planner<'_> {
                 }
                 Ok(())
             }
+            PrimalOp::Passthrough(name) if name == "rope_backward" => {
+                // The RoPE adjoint mixes in the f32 tables, but writes the
+                // gradient of the head view: stored as rule 6 says (rule 4).
+                if in_adjoint && target().is_some_and(|t| self.grad_is_bf16(t)) {
+                    self.set(op, Storage::Bf16);
+                } else if reads_bf16 {
+                    self.set(op, Storage::F32);
+                }
+                Ok(())
+            }
             o if is_binary(o)
                 || is_unary_dt(o)
                 || is_passthrough(o, "swiglu_gate_backward")
                 || is_passthrough(o, "rotate_half")
-                || is_passthrough(o, "rotate_half_neg") =>
+                || is_passthrough(o, "rotate_half_neg")
+                || is_passthrough(o, "rope") =>
             {
                 if reads_bf16 {
                     let all = op.inputs.iter().all(|&i| self.is_bf16(i));

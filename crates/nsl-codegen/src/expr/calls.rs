@@ -912,6 +912,17 @@ impl Compiler<'_> {
             let rt_name = format!("nsl_{func_name}");
             return self.compile_traced_call(builder, &rt_name, &[val]);
         }
+        // Fused RoPE: rope(x, cos, sin) = x * cos + rotate_half(x) * sin
+        if func_name == "rope" && !self.registry.functions.contains_key(&func_name) {
+            if args.len() != 3 {
+                return Err(CodegenError::new("rope() takes exactly 3 arguments: x, cos, sin"));
+            }
+            let x = self.compile_nested_expr(builder, state, &args[0].value)?;
+            let c = self.compile_nested_expr(builder, state, &args[1].value)?;
+            let s = self.compile_nested_expr(builder, state, &args[2].value)?;
+            return self.compile_traced_call(builder, "nsl_tensor_rope", &[x, c, s]);
+        }
+
         // Fused rotate_half for RoPE
         if func_name == "rotate_half" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 1 {

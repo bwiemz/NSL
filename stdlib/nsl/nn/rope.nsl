@@ -59,7 +59,6 @@ model RotaryEmbedding(dim: int, max_seq_len: int, theta: float):
 
     fn forward(self, x: Tensor, seq_len: int) -> Tensor:
         # x shape: [batch, heads, seq, head_dim]
-        let d = int(self._dim.item())
 
         # Rows 0..seq_len of the cached tables. This is a row GATHER, not a
         # slice: `PrimalOp::Slice` bakes its bounds in as compile-time
@@ -79,12 +78,12 @@ model RotaryEmbedding(dim: int, max_seq_len: int, theta: float):
         let cos_emb = embedding_lookup(self._cos_table, pos)
         let sin_emb = embedding_lookup(self._sin_table, pos)
 
-        # Reshape for broadcasting: [1, 1, seq, dim]
-        let cos_4d = cos_emb.reshape([1, 1, seq_len, d])
-        let sin_4d = sin_emb.reshape([1, 1, seq_len, d])
-
-        # Apply rotation: x * cos + rotate_half(x) * sin
-        return x * cos_4d + rotate_half(x) * sin_4d
+        # Apply the rotation x * cos + rotate_half(x) * sin as one fused op:
+        # the `rope` builtin reads x through its strides (the head view needs
+        # no copy) and the [seq, dim] rows directly, in the same f32
+        # arithmetic, rounding for rounding, as the expression it replaces.
+        # The tables are constants: rope passes no gradient into them.
+        return rope(x, cos_emb, sin_emb)
 
     # Packed-sequence variant: positions come from an explicit [batch, seq]
     # tensor instead of arange(seq_len), so packed batches can reset the

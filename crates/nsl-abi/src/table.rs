@@ -583,6 +583,11 @@ macro_rules! for_each_runtime_fn {
             // Compiled `main` declares bf16 activation storage (prints the banner).
             [abi_tensor] nsl_set_activation_storage(i64) -> () = storage_dt::nsl_set_activation_storage;
             [abi_tensor] nsl_tensor_reduce_to_shape_dt(i64, i64, i64) -> i64 = storage_dt::nsl_tensor_reduce_to_shape_dt;
+            // The `rope` builtin (fused RoPE) and its adjoint; `_dt` forms name the output dtype.
+            [abi_tensor] nsl_tensor_rope(i64, i64, i64) -> i64 = rope::nsl_tensor_rope;
+            [abi_tensor] nsl_tensor_rope_backward(i64, i64, i64) -> i64 = rope::nsl_tensor_rope_backward;
+            [abi_tensor] nsl_tensor_rope_dt(i64, i64, i64, i64) -> i64 = rope::nsl_tensor_rope_dt;
+            [abi_tensor] nsl_tensor_rope_backward_dt(i64, i64, i64, i64) -> i64 = rope::nsl_tensor_rope_backward_dt;
             // p4 slice 3: fused Sigmoid backward — grad * y*(1-y), y = σ output.
             [abi_tensor] nsl_tensor_sigmoid_backward(i64, i64) -> i64 = tensor::activation::nsl_tensor_sigmoid_backward;
             // p4 slice 3: fused Tanh backward — grad * (1 - y*y), y = tanh output.
@@ -1350,6 +1355,6 @@ mod tests {
     fn table_is_the_recorded_size() {
         // The count is pinned so a row dropped by a bad merge is noticed; move
         // it with a row that is deliberately added or removed.
-        assert_eq!(RUNTIME_ABI.len(), 661);
+        assert_eq!(RUNTIME_ABI.len(), 665);
     }
 }
