@@ -99,6 +99,11 @@ module-level bindings belong to the program's top level only; a function reads
 them through its parameters. (`train(...)` header keys and decorator arguments
 still take literals.)
 
+`/` is true division, as in Python 3: `7 / 2` is `3.5`, a float even when both
+operands are ints. `//` is floor division (`-7 // 2` is `-4`) and `%` takes the
+divisor's sign. A tensor shape is a list of ints, so a shape dimension written
+with `/` is a type error that asks for `//`.
+
 ### Example 2: Function Definition with Type Annotations
 
 ```nsl

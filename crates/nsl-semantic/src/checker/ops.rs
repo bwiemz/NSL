@@ -544,6 +544,7 @@ impl<'a> TypeChecker<'a> {
             // (C5 step 3), what the runtime makes; an annotation on the
             // declaration can choose f64 (`check_var_decl`).
             if matches!(name.as_str(), "zeros" | "ones" | "rand" | "randn" | "empty") {
+                self.check_shape_list_dims(name.as_str(), args);
                 let shape = self.extract_shape_from_args(args);
                 return Type::Tensor {
                     shape,
@@ -552,6 +553,7 @@ impl<'a> TypeChecker<'a> {
                 };
             }
             if name == "full" {
+                self.check_shape_list_dims("full", args);
                 let shape = self.extract_shape_from_args(args);
                 return Type::Tensor {
                     shape,
@@ -594,6 +596,7 @@ impl<'a> TypeChecker<'a> {
                 if let Type::Tensor { dtype, device, .. } = &obj_ty {
                     match method_name.as_str() {
                         "reshape" => {
+                            self.check_shape_list_dims("reshape", args);
                             let target_shape = self.extract_shape_from_args(args);
                             if let Type::Tensor { shape: source_shape, .. } = &obj_ty {
                                 // M49: Prove reshape correctness via shape algebra
@@ -626,6 +629,7 @@ impl<'a> TypeChecker<'a> {
                         // `extract_shape_from_args` degrades to an unknown
                         // shape for non-literal lists.
                         "expand" => {
+                            self.check_shape_list_dims("expand", args);
                             let target_shape = self.extract_shape_from_args(args);
                             return Type::Tensor {
                                 shape: target_shape,
@@ -782,6 +786,32 @@ impl<'a> TypeChecker<'a> {
             product = DimExpr::Mul(Box::new(product), Box::new(e.clone()));
         }
         Some(product)
+    }
+
+    /// A shape list's dimensions are integers. A float one (`c / nh`, where
+    /// `/` is true division) was converted to an integer on the way into the
+    /// list, truncating 3.5 to 3 without a word; it is an error that names
+    /// `//`.
+    pub(crate) fn check_shape_list_dims(&mut self, func: &str, args: &[Arg]) {
+        let Some(ExprKind::ListLiteral(elems)) = args.first().map(|a| &a.value.kind) else {
+            return;
+        };
+        for elem in elems {
+            let ty = self.type_map.get(&elem.id).cloned().unwrap_or(Type::Unknown);
+            if matches!(ty, Type::Float | Type::F32 | Type::F64) {
+                let hint = if matches!(elem.kind, ExprKind::BinaryOp { op: BinOp::Div, .. }) {
+                    "`/` is true division and gives a float; use `//` for integer division"
+                } else {
+                    "a dimension must be an int: use `//` for integer division, or `int(...)`"
+                };
+                self.diagnostics.push(
+                    Diagnostic::error(format!(
+                        "{func}(): a shape dimension is a float, not an int"
+                    ))
+                    .with_label(elem.span, hint),
+                );
+            }
+        }
     }
 
     pub(crate) fn extract_shape_from_args(&self, args: &[Arg]) -> Shape {
