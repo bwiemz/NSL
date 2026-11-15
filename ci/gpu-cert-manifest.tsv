@@ -6,6 +6,7 @@ crates/nsl-cli/tests/ccr_checkpoint_activation_parity_gpu.rs	ccr_activation_pari
 crates/nsl-cli/tests/ccr_checkpoint_parity.rs	ccr_blocks_parity_on_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/ccr_checkpoint_parity.rs	ccr_blocks_parity_on_gpu_deterministic	gpu	requires CUDA GPU
 crates/nsl-cli/tests/ccr_checkpoint_parity.rs	ccr_production_gpu_tolerance	gpu	requires CUDA GPU
+crates/nsl-cli/tests/ccr_compress_saved_lse_gpu_gate.rs	compressed_saves_keep_the_forward_logsumexp	gpu	requires CUDA GPU
 crates/nsl-cli/tests/ccr_periodic_stride_gate.rs	dp_stride_activation_peak_not_worse_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/ccr_periodic_stride_gate.rs	periodic_stride_reduces_activation_peak_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/ccr_reference_gradient_gate.rs	checkpointed_training_matches_pytorch_gpu	gpu	requires CUDA GPU
@@ -151,6 +152,8 @@ crates/nsl-cli/tests/sr_bf16_gate.rs	srbf16_tracks_f32_baseline_gpu	gpu	requires
 crates/nsl-cli/tests/sr_bf16_gate.rs	srbf16_parameter_surface_is_accounted_as_weights_gpu	gpu	requires GPU
 crates/nsl-cli/tests/stage_c_packed_parity.rs	packed_fused_training_smoke_on_gpu	gpu	requires CUDA GPU (two real training runs)
 crates/nsl-cli/tests/stage_c_packed_parity.rs	wggo_reports_fused_consumption_on_gpu	gpu	requires CUDA GPU
+crates/nsl-cli/tests/step_boundary_drain_gpu_gate.rs	steady_training_neither_frees_nor_allocates_after_warmup	gpu	requires CUDA GPU
+crates/nsl-cli/tests/step_boundary_drain_gpu_gate.rs	a_later_phase_gets_the_idle_training_cache_back	gpu	requires CUDA GPU
 crates/nsl-cli/tests/stream_migration_gpu_gate.rs	compute_stream_matches_legacy_null_stream_bit_exact	gpu	requires a CUDA GPU (2 CSHA training runs)
 crates/nsl-cli/tests/stream_ordering_gpu_gate.rs	stream_ordered_matches_eager_bit_exact	gpu	requires CUDA GPU (2 training runs)
 crates/nsl-cli/tests/swiglu_fusion_gate.rs	swiglu_fused_backward_gpu_deterministic_and_matches_reference	gpu	requires CUDA GPU
@@ -405,6 +408,11 @@ crates/nsl-codegen/tests/tier_b_tile_skip_gpu_parity.rs	tier_b_aligned_docs_s409
 crates/nsl-codegen/tests/track_b_head_dim_128_repro.rs	track_b_d_model_128_rejected_by_validator	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/track_b_head_dim_128_repro.rs	track_b_head_dim_128_d_model_32_launches	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/wggo_sidecar_population.rs	run_harness_stub_with_wggo_hook_populates_wggo_head_gradients	broken	requires cfg(test) BSS stub injection; covered by mod.rs unit test
+crates/nsl-runtime/src/attention_tc.rs	tc_backward_matches_f64_reference_at_realistic_gradient_magnitudes	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
+crates/nsl-runtime/src/attention_tc.rs	tc_backward_small_rows_keep_their_precision	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
+crates/nsl-runtime/src/attention_tc.rs	tc_ffi_forward_and_backward_match_the_reference	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
+crates/nsl-runtime/src/attention_tc.rs	tc_attention_kernel_times	diagnostic	diagnostic: times the tensor-core attention kernels at the production shapes
+crates/nsl-runtime/src/attention_tc.rs	tc_forward_matches_f64_reference	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/src/c_api/mod.rs	zz_tensor_to_desc_null_child	helper	child process — driven by nsl_tensor_to_desc_null_ptr_does_not_deref
 crates/nsl-runtime/src/data/gds.rs	mmap_fallback_h2d_copies_bytes_to_device	gpu	requires CUDA GPU
 crates/nsl-runtime/src/fase_step.rs	unaligned_parameter_lengths_are_numerically_correct	gpu	requires CUDA GPU
@@ -426,6 +434,9 @@ crates/nsl-runtime/src/tensor_parallel/collective.rs	nccl_device_collectives_act
 crates/nsl-runtime/src/tensor_parallel/collective.rs	unmapped_dtypes_are_refused_before_reaching_nccl	gpu	requires CUDA GPU + a real libnccl (--features nccl)
 crates/nsl-runtime/src/tensor_parallel/collective.rs	the_trait_methods_short_circuit_at_ws1_without_entering_nccl	gpu	requires CUDA GPU + a real libnccl (--features nccl)
 crates/nsl-runtime/tests/dlpack_unsupported_dtype_refusal.rs	zz_dlpack_refusal_child	helper	child process — driven by the gates below via re-exec
+crates/nsl-runtime/tests/embedding_iota_positions_gpu.rs	repeat_arange_gather_uploads_nothing	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/embedding_iota_positions_gpu.rs	longer_prefixes_grow_the_device_positions	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/embedding_iota_positions_gpu.rs	other_index_vectors_gather_what_they_name	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/fp8_dispatcher.rs	cuda_feature_required	cpu-stub	FP8 dispatcher tests require the cuda feature + sm_89+
 crates/nsl-runtime/tests/fp8_gpu_device_guard.rs	fp8_cast_of_a_gpu_tensor_matches_the_cpu_run	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/fp8_gpu_device_guard.rs	fp8_scale_probes_of_gpu_tensors_match_the_cpu_run	gpu	requires CUDA GPU
@@ -476,6 +487,7 @@ crates/nsl-runtime/tests/matmul_batch_collapse.rs	the_projection_shape_is_not_sl
 crates/nsl-runtime/tests/matmul_bf16_cast_cache.rs	zz_probe_child	helper	spawned by cast_cache_gates_gpu
 crates/nsl-runtime/tests/matmul_bf16_cast_cache.rs	cast_cache_gates_gpu	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_bf16_lt.rs	zz_lt_probe_child	helper	spawned by lt_matmul_gates_gpu
+crates/nsl-runtime/tests/matmul_bf16_lt.rs	zz_lt_default_child	helper	spawned by lt_matmul_gates_gpu
 crates/nsl-runtime/tests/matmul_bf16_lt.rs	zz_lt_off_child	helper	spawned by lt_matmul_gates_gpu
 crates/nsl-runtime/tests/matmul_bf16_lt.rs	lt_matmul_gates_gpu	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_bf16_mode.rs	bf16_is_faster_than_f32_and_less_accurate_than_tf32	gpu	requires CUDA GPU
@@ -488,6 +500,9 @@ crates/nsl-runtime/tests/matmul_dispatch_under_tf32.rs	dispatch_paths_are_correc
 crates/nsl-runtime/tests/matmul_dispatch_under_tf32.rs	copy_arm_is_correct_under_tf32	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_dispatch_under_tf32.rs	op_t_exemption_is_correct_under_tf32	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_dispatch_under_tf32.rs	op_t_override_is_correct_under_pedantic	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/matmul_tf32_lt.rs	zz_tf32_lt_on_child	helper	spawned by tf32_lt_gates_gpu
+crates/nsl-runtime/tests/matmul_tf32_lt.rs	zz_tf32_lt_off_child	helper	spawned by tf32_lt_gates_gpu
+crates/nsl-runtime/tests/matmul_tf32_lt.rs	tf32_lt_gates_gpu	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_tf32_mode.rs	tf32_is_faster_and_less_accurate_than_full_f32	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_tf32_mode.rs	the_default_mode_is_tf32_and_the_opt_out_restores_f32	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_transposed_operand.rs	a_transposed_right_operand_is_not_copied	gpu	requires CUDA GPU

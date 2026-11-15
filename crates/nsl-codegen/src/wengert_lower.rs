@@ -3697,8 +3697,28 @@ fn lower_single_op(
                 // adjoint generation — never differentiated (the ad_rules
                 // default arm yields no adjoint, which is correct: these
                 // wrap saved-for-backward-only tensors).
-                "ccr_cast_bf16" => call(compiler, builder, "nsl_ccr_compress_bf16", &[inputs[0]]),
-                "ccr_cast_f32" => call(compiler, builder, "nsl_tensor_to_f32", &[inputs[0]]),
+                //
+                // A compressed save can be a flash-attention OUTPUT, whose
+                // forward-saved logsumexp reaches the backward through
+                // `flash_attn_aux`, keyed by the output's value. The backward
+                // reads the restored copy (a different value), so the entry
+                // follows each cast: without it the backward got no saved
+                // logsumexp and recomputed it per row over the whole key range
+                // (`nsl_flash_lse_*`, 108 ms a call at Coder-1B: 6.9 s of the
+                // 9.6 s `--checkpoint-compress bf16` update, November 2026).
+                // The logsumexp is exact; only O is rounded to bf16, as before.
+                "ccr_cast_bf16" | "ccr_cast_f32" => {
+                    let ffi = if name == "ccr_cast_bf16" {
+                        "nsl_ccr_compress_bf16"
+                    } else {
+                        "nsl_tensor_to_f32"
+                    };
+                    let out = call(compiler, builder, ffi, &[inputs[0]])?;
+                    if let Some(&(_, lse)) = compiler.flash_attn_aux.get(&inputs[0]) {
+                        compiler.flash_attn_aux.insert(out, (out, lse));
+                    }
+                    Ok(out)
+                }
                 // CCR recompute-clone bracket: a recompute clone replays an
                 // original FORWARD op (e.g. `silu(x)`) but is spliced into
                 // the adjoint, which lowers with in-place suppression OFF.

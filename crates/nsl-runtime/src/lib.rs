@@ -165,7 +165,7 @@ pub use cuda::test_set_transpose_views;
 #[cfg(all(feature = "cuda", feature = "test-hooks"))]
 pub use cuda::{test_bf16_cast_cache_reset, test_bf16_cast_cache_stats};
 #[cfg(all(feature = "cuda", feature = "test-hooks"))]
-pub use cuda::{test_lt_matmul_reset, test_lt_matmul_stats};
+pub use cuda::{test_lt_matmul_reset, test_lt_matmul_stats, test_lt_matmul_tf32_stats};
 #[cfg(all(feature = "cuda", feature = "test-hooks"))]
 pub use cuda::{test_kernel_launch_census_arm, test_kernel_launch_count};
 
@@ -267,6 +267,8 @@ pub mod paged_kv;
 pub mod profiling;
 pub mod kernel_profiler;
 pub mod flash_attention;
+#[cfg(feature = "cuda")]
+pub(crate) mod attention_tc;
 pub mod pca_tier_b_runtime;
 pub mod pca_rope_runtime;
 pub mod serving;

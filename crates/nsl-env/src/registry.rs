@@ -827,11 +827,11 @@ pub static REGISTRY: &[EnvVar] = &[
     var!(
         "NSL_MATMUL_BF16",
         Bool,
-        "1 only engages; 0 or anything else is a no-op (falls through to TF32/pedantic resolution)",
+        "1 engages at compile time; at run time 1/0 must match the compiled mode or the program refuses",
         "off (TF32 unless NSL_MATMUL_TF32=0 or strict-matmul)",
         Behavior,
         Both,
-        "Run cuBLAS matmuls with bf16 tensor-core compute (bf16 operand storage); beats NSL_MATMUL_TF32, loses to NSL_MATMUL_PEDANTIC."
+        "Deprecated spelling of --matmul-mode bf16, read when the program is COMPILED; a compiled program run with a disagreeing value refuses."
     ),
     var!(
         "NSL_MATMUL_BF16_CAST_CACHE",
@@ -858,7 +858,7 @@ pub static REGISTRY: &[EnvVar] = &[
         "on (self-disables under --cuda-graphs, --deterministic, or >1 GiB scratch)",
         Behavior,
         Both,
-        "Set to 0 to skip timing cublasLt candidates per GEMM shape and take the untimed heuristic[0] kernel instead."
+        "Set to 0 to skip timing cublasLt candidates per GEMM shape: --bf16-lt takes heuristic[0], TF32 GEMMs go back to cublasSgemm."
     ),
     var!(
         "NSL_MATMUL_BF16_LT_VERBOSE",
@@ -1251,10 +1251,10 @@ pub static REGISTRY: &[EnvVar] = &[
         "NSL_SKIP_GPU_DRAIN",
         Bool,
         "1 only",
-        "off (drain each step)",
+        "off (release only a pool holding more than max(1 GiB, half the step demand) past the step peak)",
         Perf,
         Runtime,
-        "Set to 1 to skip the per-step release of idle caching-allocator GPU memory back to the driver."
+        "Set to 1 to never return idle cached GPU memory to the driver at a training step boundary, even a bloated pool (failed allocations still drain)."
     ),
     var!(
         "NSL_SOURCE_AD_ITEM_FOLD",
@@ -1356,6 +1356,15 @@ pub static REGISTRY: &[EnvVar] = &[
         "Set to 1 to print each parameter's tape key, length and returned gradient length after tape backward."
     ),
     var!(
+        "NSL_TC_ATTENTION",
+        Bool,
+        "0 only",
+        "on (tensor-core attention kernels serve unpacked SDPA at head_dim 64 and 128)",
+        Behavior,
+        Runtime,
+        "Set to 0 to serve unpacked scaled_dot_product_attention with the kernels before the tensor-core ones (f16 output, atomic dQ, CPU backward on tape AD)."
+    ),
+    var!(
         "NSL_TENSOR_TO_DESC_NULL_CHILD",
         Bool,
         "present (any value)",
@@ -1399,6 +1408,15 @@ pub static REGISTRY: &[EnvVar] = &[
         Test,
         Test,
         "Test harness only: marks the re-exec'd child of the matmul-dispatch-under-TF32 gate."
+    ),
+    var!(
+        "NSL_TF32_LT_PROBE",
+        Enum,
+        "on = timed-Lt child, off = tune-disabled child; anything else = parent",
+        "unset",
+        Test,
+        Test,
+        "Test harness only: selects which re-exec'd child of the TF32 cublasLt GEMM gate runs (on = timed Lt plans, off = tune disabled)."
     ),
     var!(
         "NSL_TF32_PROBE",

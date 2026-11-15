@@ -8,6 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+<!-- perf round 1 (2026-11-15): host stalls, GEMM selection and tensor-core attention, measured with tools/perfcheck against main and PyTorch. -->
+- **Training speed.**
+  - Tensor-core flash attention, forward and backward, built with KIR (`mma.sync` m16n8k16, f16 operands rounded to nearest, f32 accumulation): it serves unpacked `scaled_dot_product_attention` at head dims 64 and 128 on GPUs of compute capability 8.0 and up, at sequence lengths that are not a multiple of the tile as well as those that are, reading grouped K/V in place. At the Coder-1B shape a forward takes 0.42 ms and a backward 1.4 ms per call, against 1.76 and 8.6 ms before. `NSL_TC_ATTENTION=0` restores the previous kernels. Packed batches and other head dims keep the previous kernels. Write-up: `models/benchmarks/ATTENTION_TC_2026_11.md`.
+  - TF32 GEMMs of at least 2^28 multiply-adds run through cublasLt with the kernel chosen per shape on first use by timing the heuristic's candidates and an enumerated set of configurations; cuBLAS's own heuristic picked 64x64-tile kernels for this card. bf16-storage GEMMs are timed the same way over a whitelist of five large tiles (first-use tuning at 1B: 11 s before, 1 s now). At most 128 shapes per process. Off under `--deterministic`, `--cuda-graphs` and `--no-bf16-lt-tune`.
+  - `tools/perfcheck`: `--toolchain NAME=DIR` with `<arm>@NAME` times two compilers in the same rounds, `pairs` reports paired ratios, and `nsl_*_oldattn` arms run the same binary under `NSL_TC_ATTENTION=0`.
+  - KIR: `CvtPack` packs two f32 into an f16x2 or bf16x2 fragment; an integer atomic max.
+
 <!-- open-defects (2026-11-13/14): the Part 5 open lists of the fifteen research errata, worked through per subsystem. Each entry below is grouped by area. -->
 - **CEP.**
   - CEP reads `.nslm` checkpoints and both layer-name spellings (`blocks[0].x`, `blocks.0.x`), and `--cep-emit-weights` writes `.nslm` that `model_load` accepts in the emitted source.
@@ -2040,6 +2047,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **Training speed.**
+  - `--checkpoint-compress bf16` dropped the flash forward's saved logsumexp, so every backward recomputed it (108 ms per call); a Coder-1B update took 9.2 s instead of 2.9 s.
+
 - **CEP.**
   - CEP head importance read `wq` along its input axis, cut `wk`/`wv` by query head and ignored `wo`; it pruned live heads and kept dead ones.
   - CEP ranked FFN neurons by `w_gate` alone and never found NSL's FFN weights when scoring layers.
@@ -3572,6 +3582,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   restored to their pre-700bfaa8 structural assertions now that R7 is retired.
 
 ### Changed
+
+- **Training speed.** Measured with `tools/perfcheck` (production flags, 3 interleaved rounds, ratios paired within a round): Coder-1B trains 1.42x faster in its bf16 recipe posture (6,778 to 9,619 tok/s) and 1.43x faster at TF32 (5,067 to 7,245); Coder-500M 1.42x at TF32 (its recipe) and 1.34x in bf16. Peak memory is unchanged (driver peak within 0.3 GiB).
+  - The step-boundary GPU drain returns idle cached memory to the driver only when the pool holds more than max(1 GiB, half the step's demand) beyond the step's peak. It used to drain, with a synchronisation, after every micro-batch. A failed allocation still drains and retries.
+  - RoPE positions are gathered from a device-resident iota instead of an 8 KB host upload per call.
+  - A program run with an `NSL_MATMUL_BF16` setting that disagrees with the matmul mode it was compiled with refuses to start (exit 19). The variable is read at build time, so a run-time-only setting used to run TF32 without saying so.
+  - `--no-bf16-lt-tune` also turns off timed selection for TF32 GEMMs, which then use cuBLAS's own heuristic. With timing on, the kernel chosen for a shape can differ between runs, so results are not bit-reproducible across runs; `--deterministic` turns it off.
 
 - **Learning-rate schedules count optimizer steps under accumulation.**
   With `grad_accumulation = N`, `warmup_steps`, `total_steps`, `step_size`

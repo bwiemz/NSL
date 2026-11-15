@@ -17,10 +17,14 @@
 //!
 //! ## Scope and engagement
 //!
-//! Opt-in: `NSL_MATMUL_BF16_LT=1` (same literal-"1" discipline as the mode
-//! resolvers), consulted once. Reaches ONLY the bf16-storage arm of
-//! `gemm_bf16_mode` — the FAST_TF32 low-intensity arm and every non-bf16 mode
-//! keep their proven issue paths. Any decline (no heuristic candidate, a
+//! `--bf16-lt` / `NSL_MATMUL_BF16_LT=1` (same literal-"1" discipline as the
+//! mode resolvers), consulted once; and, since November 2026, by default
+//! whenever timed plan selection applies (`timed_lt_applies`: tune on, no
+//! `--deterministic`, no `--cuda-graphs`), with the enumerated large-tile
+//! candidates of the TF32 section added to the heuristic's. Reaches ONLY the
+//! bf16-storage arm of `gemm_bf16_mode`. TF32 GEMMs (the default math mode, and the bf16 mode's
+//! low-intensity FAST_TF32 arm) have their own timed plans: the TF32 section
+//! at the end of this file. Any decline (no heuristic candidate, a
 //! failed launch, an unexpected operand op) falls back to the GemmEx call
 //! mid-flight; the fallback is counted and printed once, because a run that
 //! silently degraded to DFALT would fake its own A/B.
@@ -127,7 +131,8 @@ unsafe impl Send for Plan {}
 /// Shape key. `None` plans are negative entries: the heuristic (or a launch)
 /// failed for this shape once, so every later call takes the GemmEx fallback
 /// without re-querying per GEMM.
-type Key = (i32, i32, i32, i32, i32, i32, i32, i32); // (opa, opb, m, n, k, lda, ldb, ldc)
+/// (opa, opb, m, n, k, lda, ldb, ldc, log2 of the pointer alignment class).
+type Key = (i32, i32, i32, i32, i32, i32, i32, i32, u32);
 
 /// Roadmap A4 step 3a: was a `PLANS` `LazyLock<Mutex<..>>` static; now one
 /// map per device, parked on the CUDA context and keyed by this type. The
@@ -350,9 +355,11 @@ unsafe fn build_plan(
     b16: *const std::ffi::c_void,
     ldb: i32,
     ldc: i32,
+    align_log2: u32,
 ) -> Option<Plan> {
     let ok = lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS;
-    let (ws_ptr, ws_bytes) = workspace();
+    let (_, ws_bytes) = workspace();
+    let align = 1u32 << align_log2;
 
     let mut desc: lt::cublasLtMatmulDesc_t = std::ptr::null_mut();
     let mut adesc: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
@@ -428,18 +435,22 @@ unsafe fn build_plan(
             let ws_cap = ws_bytes;
             let red_mask: u32 =
                 lt::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE as u32;
+            use lt::cublasLtMatmulPreferenceAttributes_t as P;
+            let set_u32 = |attr, v: &u32| {
+                lt::cublasLtMatmulPreferenceSetAttribute(pref, attr, v as *const u32 as *const std::ffi::c_void, 4) == ok
+            };
             let pref_ok = lt::cublasLtMatmulPreferenceSetAttribute(
                 pref,
-                lt::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                P::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
                 &ws_cap as *const usize as *const std::ffi::c_void,
                 std::mem::size_of::<usize>(),
             ) == ok
-                && lt::cublasLtMatmulPreferenceSetAttribute(
-                    pref,
-                    lt::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK,
-                    &red_mask as *const u32 as *const std::ffi::c_void,
-                    std::mem::size_of::<u32>(),
-                ) == ok;
+                && set_u32(P::CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &red_mask)
+                // The operands' real alignment (the plan is keyed by it).
+                && set_u32(P::CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, &align)
+                && set_u32(P::CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES, &align)
+                && set_u32(P::CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES, &align)
+                && set_u32(P::CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES, &align);
             let got = pref_ok
                 && lt::cublasLtMatmulAlgoGetHeuristic(
                     handle,
@@ -457,10 +468,11 @@ unsafe fn build_plan(
             got
         }
     };
-    let candidates: Vec<&lt::cublasLtMatmulHeuristicResult_t> = if query_ok {
+    let mut candidates: Vec<Candidate> = if query_ok {
         results[..returned.max(0) as usize]
             .iter()
             .filter(|r| r.state == ok && r.workspaceSize <= ws_bytes)
+            .map(|r| Candidate { algo: r.algo, ws: r.workspaceSize, from_heuristic: true })
             .collect()
     } else {
         Vec::new()
@@ -491,90 +503,35 @@ unsafe fn build_plan(
     let tune = tune_enabled()
         && !super::graph_capture::enabled()
         && !crate::deterministic_ops::is_deterministic()
-        && out_bytes <= TUNE_SCRATCH_CAP_BYTES;
+        && out_bytes <= TUNE_SCRATCH_CAP_BYTES
+        && tune_budget_allows(shapes_tuned());
+    // Timed selection also tries the enumerated large-tile configurations (the
+    // heuristic's few candidates rarely include the fastest kernel; see the
+    // TF32 section), when the operands have the alignment `AlgoCheck` assumes.
+    if tune && align >= 256 {
+        // SAFETY: handle and descriptors are live.
+        candidates.extend(unsafe {
+            enumerate_configs(
+                handle,
+                desc,
+                adesc,
+                bdesc,
+                cdesc,
+                ws_bytes,
+                lt::cudaDataType_t::CUDA_R_16BF,
+                lt::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            )
+        });
+    }
     let mut chosen: usize = 0;
     if tune && candidates.len() > 1 {
-        // Fallible by design: on a nearly-full card the tune is skipped
-        // (untimed heuristic[0]) instead of the process dying — which is
-        // what routing this through alloc_managed's oom_fatal would do.
-        let scratch = raw_device_alloc(out_bytes) as *mut std::ffi::c_void;
-        if !scratch.is_null() {
-            let stream = super::inner::current_stream() as lt::cudaStream_t;
-            let (zero, one) = (0.0f32, 1.0f32);
-            let mut best = f64::INFINITY;
-            let mut timings: Vec<f64> = Vec::with_capacity(candidates.len());
-            for (i, cand) in candidates.iter().enumerate() {
-                let mut cand_best = f64::INFINITY;
-                let mut failed = false;
-                for rep in 0..4 {
-                    // SAFETY: all handles/pointers live; scratch is sized
-                    // m*n*4 and used as both C and D with beta=0 (C is
-                    // never read); ws_ptr is either null with ws 0 or a
-                    // live process-lifetime block.
-                    let st = unsafe {
-                        cudarc::driver::sys::cuCtxSynchronize();
-                        let t0 = std::time::Instant::now();
-                        let st = lt::cublasLtMatmul(
-                            handle,
-                            desc,
-                            &one as *const f32 as *const std::ffi::c_void,
-                            a16,
-                            adesc,
-                            b16,
-                            bdesc,
-                            &zero as *const f32 as *const std::ffi::c_void,
-                            scratch,
-                            cdesc,
-                            scratch,
-                            cdesc,
-                            &cand.algo,
-                            ws_ptr as *mut std::ffi::c_void,
-                            cand.workspaceSize,
-                            stream,
-                        );
-                        cudarc::driver::sys::cuCtxSynchronize();
-                        if st == ok && rep > 0 {
-                            // rep 0 is the warmup: module load + Lt's own
-                            // first-touch costs must not pick the winner.
-                            cand_best = cand_best.min(t0.elapsed().as_secs_f64());
-                        }
-                        st
-                    };
-                    if st != ok {
-                        failed = true;
-                        break;
-                    }
-                }
-                timings.push(if failed { f64::INFINITY } else { cand_best });
-                if !failed && cand_best < best {
-                    best = cand_best;
-                    chosen = i;
-                }
-            }
-            // Every timing rep ended in a cuCtxSynchronize, so no enqueued
-            // work still reads the scratch.
-            raw_device_free(scratch as u64);
+        // SAFETY: the caller's live bf16 operand images for this shape.
+        if let Some((i, ms, h0)) =
+            unsafe { tune_two_rounds(handle, desc, adesc, bdesc, cdesc, a16, b16, out_bytes, &candidates) }
+        {
+            chosen = i;
             TUNED.fetch_add(1, Ordering::Relaxed);
-            // The candidates were all timed anyway — under
-            // NSL_MATMUL_BF16_LT_VERBOSE=1, say per shape what the untimed
-            // heuristic[0] pick would have cost vs the winner. Diagnostic
-            // only: heuristic[0]-with-our-workspace is NOT the same kernel
-            // DFALT's tiny internal workspace selects, so this line explains
-            // an A/B delta, it does not substitute for one.
-            static VERBOSE: OnceLock<bool> = OnceLock::new();
-            if *VERBOSE.get_or_init(|| {
-                std::env::var("NSL_MATMUL_BF16_LT_VERBOSE").ok().as_deref() == Some("1")
-            }) {
-                let h0 = timings.first().copied().unwrap_or(f64::INFINITY);
-                crate::nsl_log!(INFO, "bf16-lt", 
-                    "[bf16-lt] tune opa={opa} opb={opb} m={m} n={n} k={k}: \
-                     winner #{chosen} {:.3} ms, heuristic[0] {:.3} ms, \
-                     {} candidates",
-                    best * 1e3,
-                    h0 * 1e3,
-                    timings.len(),
-                );
-            }
+            log_tune("bf16-lt", opa, opb, m, n, k, &candidates[i], ms, h0, candidates.len());
         }
     }
 
@@ -584,7 +541,7 @@ unsafe fn build_plan(
         bdesc,
         cdesc,
         algo: candidates[chosen].algo,
-        ws_bytes: candidates[chosen].workspaceSize,
+        ws_bytes: candidates[chosen].ws,
     })
 }
 
@@ -622,7 +579,11 @@ pub(crate) unsafe fn matmul_bf16_f32(
         return false; // creation failure already printed its own line
     };
 
-    let key: Key = (opa, opb, m, n, k, lda, ldb, ldc);
+    // Alignment class of the three buffers, capped at 256 bytes (as the TF32
+    // path): an operand at an odd offset gets its own plan instead of failing,
+    // and poisoning, the aligned shape's.
+    let align_log2 = ((a16 as usize) | (b16 as usize) | (c as usize) | 256).trailing_zeros();
+    let key: Key = (opa, opb, m, n, k, lda, ldb, ldc, align_log2);
     // Plan lookup / creation. The map lock is NOT held across build_plan
     // (which synchronizes the device while timing) nor across the launch —
     // holding a lock over device-blocking work is how unrelated paths
@@ -638,9 +599,15 @@ pub(crate) unsafe fn matmul_bf16_f32(
             return false;
         }
         None => {
+            // The default route (no --bf16-lt) is here only to be timed: past
+            // the budget a new shape goes back to GemmEx, uncached.
+            if !enabled() && !tune_budget_allows(shapes_tuned()) {
+                print_budget_once();
+                return false;
+            }
             // SAFETY: forwarded pointers are the caller's live operands.
             let plan =
-                unsafe { build_plan(handle, opa, opb, m, n, k, a16, lda, b16, ldb, ldc) };
+                unsafe { build_plan(handle, opa, opb, m, n, k, a16, lda, b16, ldb, ldc, align_log2) };
             let tuple = plan
                 .as_ref()
                 .map(|p| (p.desc, p.adesc, p.bdesc, p.cdesc, p.algo, p.ws_bytes));
@@ -734,6 +701,653 @@ pub(crate) unsafe fn matmul_bf16_f32(
     true
 }
 
+// ---------------------------------------------------------------------------
+// TF32 GEMMs (f32 storage, `CUBLAS_COMPUTE_32F_FAST_TF32`) with an enumerated,
+// timed plan per shape.
+// ---------------------------------------------------------------------------
+//
+// ## Why
+//
+// Under the default math mode NSL issued every 2-D GEMM as `cublasSgemm_v2` on
+// a `CUBLAS_TF32_TENSOR_OP_MATH` handle, which takes cuBLAS's heuristic pick
+// unseen. On cuBLAS 13.8 / sm_120 that pick is a 64x64-tile
+// `cutlass_80_tensorop_s1688gemm_64x64_16x6` kernel for most of a transformer's
+// projections and their gradients: 48-57 TFLOPS on random data at Coder-1B's
+// shapes, against 67-76 TFLOPS for the 128x128 / 128x256 / 256x128 kernels the
+// same library ships for the same shapes (PyTorch's cuBLAS 12.8 heuristic picks
+// those; `models/benchmarks/NSL_VS_PYTORCH_2026_11.md`). The heuristic's own
+// candidate list does not help: for the NN and NT forms `cublasLtMatmulAlgoGet
+// Heuristic` returns one or two candidates, both the slow kernel. The fast ones
+// are reachable only by enumerating algorithm configurations
+// (`cublasLtMatmulAlgoGetIds` x tile x stages) and checking each with
+// `cublasLtMatmulAlgoCheck`.
+//
+// ## What runs
+//
+// First sight of a shape (key: ops, m, n, k, leading dimensions, pointer
+// alignment class) builds the candidate set: the heuristic's candidates (split-k
+// reductions limited to the deterministic `COMPUTE_TYPE` scheme, as on the bf16
+// path) plus every enumerated configuration with one of [`ENUM_TILES`] and no
+// split-k. Each candidate is timed on the live operands into a scratch output
+// (one warm-up launch, then one timed launch between CUDA events), the four
+// fastest again with the median of five, and the winner is cached for the life
+// of the process. bf16-storage products take the same tune (`build_plan`). A plan-cache hit replays the identical kernel, so within a run
+// every repeat of a shape is bit-identical.
+//
+// The arithmetic is the same class as `cublasSgemm` on the TF32 handle: f32
+// operands rounded to TF32 inside the kernel, f32 accumulation, f32 output.
+// Different kernels sum in a different order, so results move within TF32's
+// precision, not beyond it.
+//
+// ## When it does not run (cublasSgemm on the TF32 handle, as before)
+//
+// * `--deterministic`: a timed winner depends on machine state, so two runs of
+//   one program could pick different kernels and differ in bits; cuBLAS's
+//   heuristic is a pure function of the shape, library and device.
+// * `--cuda-graphs`: the tune synchronizes the device, which would invalidate a
+//   capture.
+// * `--no-bf16-lt-tune` (fingerprint `mmlttune=0`): the switch that turns timed
+//   plan selection off, for TF32 as for bf16.
+// * small products (`m*n*k` below [`TF32_LT_MIN_MNK`]): launch-bound, and the
+//   tune would cost more than it can save.
+// * no candidate, a failed handle, or a failed launch: the caller issues the
+//   `cublasSgemm` it always did (a failed launch wrote nothing).
+
+/// Below this many multiply-adds a GEMM stays on `cublasSgemm`: ~4 us of TF32
+/// work, where the kernel choice is worth less than the tune costs.
+pub(crate) const TF32_LT_MIN_MNK: u64 = 1 << 28;
+
+/// The tiles the enumeration tries (`cublasLtMatmulTile_t` ids): 64x256 (19),
+/// 128x128 (20), 256x64 (21), 128x256 (23), 256x128 (24). Every enumerated
+/// winner on Coder-500M and Coder-1B's projection, dgrad and wgrad shapes, TF32
+/// and bf16, was one of these (`perf/host-gemm` probes, November 2026); smaller
+/// tiles never won and only multiply the tune's cost. The heuristic's own
+/// candidates (any tile, including the sm_120 `nvjet` kernels) are always
+/// timed alongside.
+const ENUM_TILES: [i32; 5] = [19, 20, 21, 23, 24];
+
+/// Candidates re-timed in the second round of a tune.
+const TUNE_FINALISTS: usize = 4;
+
+/// Shapes a process times, over both paths. A training step has a few dozen
+/// distinct GEMM shapes; a program whose shapes keep changing (prefill over
+/// prompts of every length, say) would otherwise pay a tune, and grow the plan
+/// caches, for each new one. Past the budget a new TF32 shape takes
+/// `cublasSgemm` and a new bf16 one GemmEx (or `--bf16-lt`'s untimed pick);
+/// shapes already tuned keep their plans.
+const TUNE_BUDGET_SHAPES: u64 = 128;
+
+/// Whether one more shape may be timed, given how many have been.
+fn tune_budget_allows(tuned_so_far: u64) -> bool {
+    tuned_so_far < TUNE_BUDGET_SHAPES
+}
+
+/// Shapes timed so far, both paths.
+fn shapes_tuned() -> u64 {
+    TUNED.load(Ordering::Relaxed) + TF32_TUNED.load(Ordering::Relaxed)
+}
+
+fn print_budget_once() {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        crate::nsl_log!(INFO, "nsl-matmul",
+            "[nsl-matmul] {TUNE_BUDGET_SHAPES} GEMM shapes timed: new shapes from here on \
+             take cuBLAS's own pick (already timed shapes keep theirs)"
+        );
+    }
+}
+
+static TF32_ISSUED: AtomicU64 = AtomicU64::new(0);
+static TF32_TUNED: AtomicU64 = AtomicU64::new(0);
+static TF32_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// (issued, tuned_shapes, fallbacks) for the TF32 path.
+pub(crate) fn tf32_stats() -> (u64, u64, u64) {
+    (
+        TF32_ISSUED.load(Ordering::Relaxed),
+        TF32_TUNED.load(Ordering::Relaxed),
+        TF32_FALLBACKS.load(Ordering::Relaxed),
+    )
+}
+
+/// (opa, opb, m, n, k, lda, ldb, ldc, log2 of the pointer alignment class).
+type Tf32Key = (i32, i32, i32, i32, i32, i32, i32, i32, u32);
+
+/// The TF32 plans, separate from the bf16 ones: the layouts differ in dtype, so
+/// a key collision between the two would replay a plan built for other types.
+#[derive(Default)]
+struct Tf32PlanCache(HashMap<Tf32Key, Option<Plan>>);
+
+fn with_tf32_plans<R>(f: impl FnOnce(&mut HashMap<Tf32Key, Option<Plan>>) -> R) -> R {
+    super::context::current().with_cache(|c: &mut Tf32PlanCache| f(&mut c.0))
+}
+
+/// Does a GEMM of this size take the timed cublasLt path (TF32, and bf16-storage
+/// products without `--bf16-lt`)? Checked before anything is built, so a
+/// declining call costs a few loads.
+pub(crate) fn timed_lt_applies(m: u64, n: u64, k: u64) -> bool {
+    m.saturating_mul(n).saturating_mul(k) >= TF32_LT_MIN_MNK
+        && tune_enabled()
+        && !super::graph_capture::enabled()
+        && !crate::deterministic_ops::is_deterministic()
+}
+
+/// One candidate algorithm and the workspace it needs.
+struct Candidate {
+    algo: lt::cublasLtMatmulAlgo_t,
+    ws: usize,
+    from_heuristic: bool,
+}
+
+/// Every configuration of every algorithm cublasLt implements for these types
+/// (A and B `ab_type`, C and D f32, `ct` compute) that `cublasLtMatmulAlgoCheck`
+/// accepts for this problem, restricted to [`ENUM_TILES`] and no split-k.
+///
+/// # Safety
+/// `handle` and the four descriptors are live.
+#[allow(clippy::too_many_arguments)]
+unsafe fn enumerate_configs(
+    handle: lt::cublasLtHandle_t,
+    desc: lt::cublasLtMatmulDesc_t,
+    adesc: lt::cublasLtMatrixLayout_t,
+    bdesc: lt::cublasLtMatrixLayout_t,
+    cdesc: lt::cublasLtMatrixLayout_t,
+    ws_cap: usize,
+    ab_type: lt::cudaDataType_t,
+    ct: lt::cublasComputeType_t,
+) -> Vec<Candidate> {
+    let ok = lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS;
+    let f32t = lt::cudaDataType_t::CUDA_R_32F;
+    let mut ids = [0i32; 128];
+    let mut nids = 0i32;
+    // SAFETY: out-array of 128 ints and an out-count, as the API documents.
+    if unsafe {
+        lt::cublasLtMatmulAlgoGetIds(handle, ct, f32t, ab_type, ab_type, f32t, f32t, 128, ids.as_mut_ptr(), &mut nids)
+    } != ok
+    {
+        return Vec::new();
+    }
+    // An attribute that is a list of i32 (tile ids, stage ids): ask its size,
+    // then read it. An algorithm without the attribute yields `[0]`, the
+    // "undefined, let the library choose" value.
+    let cap_list = |algo: &lt::cublasLtMatmulAlgo_t, attr: lt::cublasLtMatmulAlgoCapAttributes_t| {
+        let mut bytes = 0usize;
+        // SAFETY: a size query (null buffer, zero size) on a live algo.
+        unsafe { lt::cublasLtMatmulAlgoCapGetAttribute(algo, attr, std::ptr::null_mut(), 0, &mut bytes) };
+        let n = bytes / std::mem::size_of::<i32>();
+        if n == 0 {
+            return vec![0i32];
+        }
+        let mut v = vec![0i32; n];
+        let mut written = 0usize;
+        // SAFETY: `v` holds exactly `bytes` bytes.
+        let st = unsafe {
+            lt::cublasLtMatmulAlgoCapGetAttribute(algo, attr, v.as_mut_ptr() as *mut std::ffi::c_void, bytes, &mut written)
+        };
+        if st != ok { vec![0i32] } else { v }
+    };
+    let mut out = Vec::new();
+    for &id in &ids[..nids.clamp(0, 128) as usize] {
+        // SAFETY: zeroed POD out-struct, filled by AlgoInit before any read.
+        let mut algo: lt::cublasLtMatmulAlgo_t = unsafe { std::mem::zeroed() };
+        if unsafe { lt::cublasLtMatmulAlgoInit(handle, ct, f32t, ab_type, ab_type, f32t, f32t, id, &mut algo) } != ok {
+            continue;
+        }
+        let tiles = cap_list(&algo, lt::cublasLtMatmulAlgoCapAttributes_t::CUBLASLT_ALGO_CAP_TILE_IDS);
+        let stages = cap_list(&algo, lt::cublasLtMatmulAlgoCapAttributes_t::CUBLASLT_ALGO_CAP_STAGES_IDS);
+        for &tile in tiles.iter().filter(|t| ENUM_TILES.contains(t)) {
+            for &stage in &stages {
+                let mut a = algo;
+                let one = 1i32;
+                let set = |a: &mut lt::cublasLtMatmulAlgo_t, attr, v: &i32| {
+                    // SAFETY: an i32 attribute written from a live local.
+                    let st = unsafe {
+                        lt::cublasLtMatmulAlgoConfigSetAttribute(a, attr, v as *const i32 as *const std::ffi::c_void, 4)
+                    };
+                    st == ok
+                };
+                use lt::cublasLtMatmulAlgoConfigAttributes_t as A;
+                if !set(&mut a, A::CUBLASLT_ALGO_CONFIG_TILE_ID, &tile)
+                    || !set(&mut a, A::CUBLASLT_ALGO_CONFIG_STAGES_ID, &stage)
+                    || !set(&mut a, A::CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &one)
+                {
+                    continue;
+                }
+                // SAFETY: zeroed POD out-struct; descriptors are live.
+                let mut chk: lt::cublasLtMatmulHeuristicResult_t = unsafe { std::mem::zeroed() };
+                if unsafe { lt::cublasLtMatmulAlgoCheck(handle, desc, adesc, bdesc, cdesc, cdesc, &a, &mut chk) } != ok
+                    || chk.workspaceSize > ws_cap
+                {
+                    continue;
+                }
+                out.push(Candidate { algo: a, ws: chk.workspaceSize, from_heuristic: false });
+            }
+        }
+    }
+    out
+}
+
+/// Time one launch of each candidate (after a warm-up launch) into `scratch`,
+/// median of `reps` single launches between CUDA events. `f32::INFINITY` for a
+/// candidate whose launch fails.
+///
+/// # Safety
+/// All handles live; `scratch` holds the C layout's footprint; the operands are
+/// the caller's live device buffers.
+#[allow(clippy::too_many_arguments)]
+unsafe fn time_candidates(
+    handle: lt::cublasLtHandle_t,
+    desc: lt::cublasLtMatmulDesc_t,
+    adesc: lt::cublasLtMatrixLayout_t,
+    bdesc: lt::cublasLtMatrixLayout_t,
+    cdesc: lt::cublasLtMatrixLayout_t,
+    a: *const std::ffi::c_void,
+    b: *const std::ffi::c_void,
+    scratch: *mut std::ffi::c_void,
+    ws: (u64, usize),
+    cands: &[&Candidate],
+    reps: usize,
+) -> Vec<f32> {
+    use cudarc::driver::sys as drv;
+    let stream = super::inner::current_stream();
+    let (zero, one) = (0.0f32, 1.0f32);
+    let launch = |c: &Candidate| {
+        // SAFETY: as the function's contract; beta = 0, so `scratch` is only
+        // written.
+        let st = unsafe {
+            lt::cublasLtMatmul(
+                handle,
+                desc,
+                &one as *const f32 as *const std::ffi::c_void,
+                a,
+                adesc,
+                b,
+                bdesc,
+                &zero as *const f32 as *const std::ffi::c_void,
+                scratch,
+                cdesc,
+                scratch,
+                cdesc,
+                &c.algo,
+                ws.0 as *mut std::ffi::c_void,
+                c.ws,
+                stream as lt::cudaStream_t,
+            )
+        };
+        st == lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS
+    };
+    let mut ev = [std::ptr::null_mut(); 2];
+    for e in &mut ev {
+        // SAFETY: out-pointer to a live local.
+        if unsafe { drv::cuEventCreate(e, 0) } != drv::CUresult::CUDA_SUCCESS {
+            return vec![f32::INFINITY; cands.len()];
+        }
+    }
+    let mut times = Vec::with_capacity(cands.len());
+    for c in cands {
+        if !launch(c) {
+            times.push(f32::INFINITY);
+            continue;
+        }
+        let mut ts = Vec::with_capacity(reps);
+        for _ in 0..reps {
+            let mut ms = f32::INFINITY;
+            // SAFETY: both events are live; the launch between them is on the
+            // stream they are recorded on.
+            unsafe {
+                drv::cuEventRecord(ev[0], stream);
+                let launched = launch(c);
+                drv::cuEventRecord(ev[1], stream);
+                drv::cuEventSynchronize(ev[1]);
+                if launched {
+                    drv::cuEventElapsedTime_v2(&mut ms, ev[0], ev[1]);
+                }
+            }
+            ts.push(ms);
+        }
+        ts.sort_by(f32::total_cmp);
+        times.push(ts[ts.len() / 2]);
+    }
+    for e in ev {
+        // SAFETY: created above, synchronized, destroyed once.
+        unsafe { drv::cuEventDestroy_v2(e) };
+    }
+    times
+}
+
+/// Build (and time) the plan for one TF32 shape. `None` on any failure.
+///
+/// # Safety
+/// The pointers are the caller's live device operands for this shape.
+#[allow(clippy::too_many_arguments)]
+unsafe fn tf32_build_plan(
+    handle: lt::cublasLtHandle_t,
+    key: &Tf32Key,
+    a: *const f32,
+    b: *const f32,
+) -> Option<Plan> {
+    let ok = lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS;
+    let &(opa, opb, m, n, k, lda, ldb, ldc, align_log2) = key;
+    let (_, ws_bytes) = workspace();
+    let f32t = lt::cudaDataType_t::CUDA_R_32F;
+    let mut desc: lt::cublasLtMatmulDesc_t = std::ptr::null_mut();
+    let mut adesc: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
+    let mut bdesc: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
+    let mut cdesc: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
+    // SAFETY: out-pointers to live locals; statuses checked; the half-built
+    // set is destroyed on failure.
+    let built = unsafe {
+        lt::cublasLtMatmulDescCreate(&mut desc, lt::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32, f32t) == ok
+            && [
+                (lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA, opa),
+                (lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB, opb),
+            ]
+            .iter()
+            .all(|(attr, v)| {
+                lt::cublasLtMatmulDescSetAttribute(desc, *attr, v as *const i32 as *const std::ffi::c_void, 4) == ok
+            })
+            && {
+                let (ar, ac) = if opa == 0 { (m, k) } else { (k, m) };
+                let (br, bc) = if opb == 0 { (k, n) } else { (n, k) };
+                lt::cublasLtMatrixLayoutCreate(&mut adesc, f32t, ar as u64, ac as u64, lda as i64) == ok
+                    && lt::cublasLtMatrixLayoutCreate(&mut bdesc, f32t, br as u64, bc as u64, ldb as i64) == ok
+                    && lt::cublasLtMatrixLayoutCreate(&mut cdesc, f32t, m as u64, n as u64, ldc as i64) == ok
+            }
+    };
+    if !built {
+        // SAFETY: handles as left above.
+        unsafe { destroy_handles(desc, adesc, bdesc, cdesc) };
+        return None;
+    }
+
+    // Heuristic candidates, told the operands' real alignment.
+    let align = 1u32 << align_log2;
+    let mut heur: [lt::cublasLtMatmulHeuristicResult_t; HEURISTIC_CANDIDATES] =
+        // SAFETY: POD out-array, read only up to `returned`.
+        unsafe { std::mem::zeroed() };
+    let mut returned = 0i32;
+    // SAFETY: the preference is created, set, used once, destroyed.
+    unsafe {
+        let mut pref: lt::cublasLtMatmulPreference_t = std::ptr::null_mut();
+        if lt::cublasLtMatmulPreferenceCreate(&mut pref) == ok {
+            use lt::cublasLtMatmulPreferenceAttributes_t as P;
+            let red: u32 = lt::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE as u32;
+            let set_u32 = |attr, v: &u32| {
+                lt::cublasLtMatmulPreferenceSetAttribute(pref, attr, v as *const u32 as *const std::ffi::c_void, 4) == ok
+            };
+            let set_ok = lt::cublasLtMatmulPreferenceSetAttribute(
+                pref,
+                P::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                &ws_bytes as *const usize as *const std::ffi::c_void,
+                std::mem::size_of::<usize>(),
+            ) == ok
+                && set_u32(P::CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &red)
+                && set_u32(P::CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, &align)
+                && set_u32(P::CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES, &align)
+                && set_u32(P::CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES, &align)
+                && set_u32(P::CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES, &align);
+            if !set_ok
+                || lt::cublasLtMatmulAlgoGetHeuristic(
+                    handle,
+                    desc,
+                    adesc,
+                    bdesc,
+                    cdesc,
+                    cdesc,
+                    pref,
+                    HEURISTIC_CANDIDATES as i32,
+                    heur.as_mut_ptr(),
+                    &mut returned,
+                ) != ok
+            {
+                returned = 0;
+            }
+            lt::cublasLtMatmulPreferenceDestroy(pref);
+        }
+    }
+    let mut cands: Vec<Candidate> = heur[..returned.clamp(0, HEURISTIC_CANDIDATES as i32) as usize]
+        .iter()
+        .filter(|r| r.state == ok && r.workspaceSize <= ws_bytes)
+        .map(|r| Candidate { algo: r.algo, ws: r.workspaceSize, from_heuristic: true })
+        .collect();
+    // The enumeration's `AlgoCheck` cannot be told the pointers' alignment and
+    // assumes the maximum, so it only joins when the operands have it.
+    if align >= 256 {
+        // SAFETY: handle and descriptors are live.
+        cands.extend(unsafe {
+            enumerate_configs(
+                handle,
+                desc,
+                adesc,
+                bdesc,
+                cdesc,
+                ws_bytes,
+                f32t,
+                lt::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32,
+            )
+        });
+    }
+    if cands.is_empty() {
+        // SAFETY: live, about to be abandoned.
+        unsafe { destroy_handles(desc, adesc, bdesc, cdesc) };
+        return None;
+    }
+
+    let mut chosen = 0usize;
+    let out_bytes = (ldc as usize) * (n as usize) * 4;
+    if cands.len() > 1 && out_bytes <= TUNE_SCRATCH_CAP_BYTES {
+        // SAFETY: the caller's live operands for this shape.
+        let picked = unsafe {
+            tune_two_rounds(handle, desc, adesc, bdesc, cdesc, a as *const _, b as *const _, out_bytes, &cands)
+        };
+        if let Some((i, ms, h0)) = picked {
+            chosen = i;
+            TF32_TUNED.fetch_add(1, Ordering::Relaxed);
+            log_tune("tf32-lt", opa, opb, m, n, k, &cands[i], ms, h0, cands.len());
+        }
+    }
+    let c = &cands[chosen];
+    Some(Plan { desc, adesc, bdesc, cdesc, algo: c.algo, ws_bytes: c.ws })
+}
+
+static VERBOSE: OnceLock<bool> = OnceLock::new();
+
+/// `NSL_MATMUL_BF16_LT_VERBOSE=1`: one line per tuned shape (both paths).
+fn verbose_from_env() -> bool {
+    std::env::var("NSL_MATMUL_BF16_LT_VERBOSE").ok().as_deref() == Some("1")
+}
+
+/// Time `cands` on the live operands and return the winner's index: one
+/// warm-up and one timed launch each, then the [`TUNE_FINALISTS`] fastest again
+/// with the median of five. `None` when the scratch cannot be allocated or no
+/// candidate launches (the caller then takes the heuristic's first).
+///
+/// # Safety
+/// As [`time_candidates`]; `out_bytes` is C's footprint.
+#[allow(clippy::too_many_arguments)]
+unsafe fn tune_two_rounds(
+    handle: lt::cublasLtHandle_t,
+    desc: lt::cublasLtMatmulDesc_t,
+    adesc: lt::cublasLtMatrixLayout_t,
+    bdesc: lt::cublasLtMatrixLayout_t,
+    cdesc: lt::cublasLtMatrixLayout_t,
+    a: *const std::ffi::c_void,
+    b: *const std::ffi::c_void,
+    out_bytes: usize,
+    cands: &[Candidate],
+) -> Option<(usize, f32, Option<f32>)> {
+    // Fallible on purpose (see `raw_device_alloc`): a nearly full card gets the
+    // heuristic's first candidate untimed, never an OOM exit.
+    let scratch = raw_device_alloc(out_bytes) as *mut std::ffi::c_void;
+    if scratch.is_null() {
+        return None;
+    }
+    let ws = workspace();
+    let all: Vec<&Candidate> = cands.iter().collect();
+    // SAFETY: as the function's contract; scratch sized to C's footprint.
+    let first = unsafe { time_candidates(handle, desc, adesc, bdesc, cdesc, a, b, scratch, ws, &all, 1) };
+    let mut order: Vec<usize> = (0..cands.len()).filter(|&i| first[i].is_finite()).collect();
+    order.sort_by(|&x, &y| first[x].total_cmp(&first[y]));
+    order.truncate(TUNE_FINALISTS);
+    let result = if order.is_empty() {
+        None
+    } else {
+        let finalists: Vec<&Candidate> = order.iter().map(|&i| &cands[i]).collect();
+        // SAFETY: as above.
+        let second = unsafe { time_candidates(handle, desc, adesc, bdesc, cdesc, a, b, scratch, ws, &finalists, 5) };
+        let best = (0..order.len()).min_by(|&x, &y| second[x].total_cmp(&second[y])).unwrap_or(0);
+        let h0 = cands.iter().position(|c| c.from_heuristic).map(|i| first[i]);
+        second[best].is_finite().then_some((order[best], second[best], h0))
+    };
+    // `time_candidates` synchronized on its last event after every launch, so
+    // nothing still writes the scratch.
+    raw_device_free(scratch as u64);
+    result
+}
+
+/// One `[*-lt]` verbose line for a tuned shape.
+#[allow(clippy::too_many_arguments)]
+fn log_tune(tag: &str, opa: i32, opb: i32, m: i32, n: i32, k: i32, w: &Candidate, ms: f32, h0: Option<f32>, total: usize) {
+    if !*VERBOSE.get_or_init(verbose_from_env) {
+        return;
+    }
+    let cfg = |attr| {
+        let mut v = 0i32;
+        let mut written = 0usize;
+        // SAFETY: an i32 attribute read into a live local.
+        unsafe {
+            lt::cublasLtMatmulAlgoConfigGetAttribute(&w.algo, attr, &mut v as *mut i32 as *mut std::ffi::c_void, 4, &mut written)
+        };
+        v
+    };
+    use lt::cublasLtMatmulAlgoConfigAttributes_t as A;
+    crate::nsl_log!(
+        INFO,
+        "lt-tune",
+        "[{tag}] tune opa={opa} opb={opb} m={m} n={n} k={k}: winner {ms:.3} ms \
+         (algo {} tile {} stages {}{}), heuristic[0] {}, {total} candidates",
+        cfg(A::CUBLASLT_ALGO_CONFIG_ID),
+        cfg(A::CUBLASLT_ALGO_CONFIG_TILE_ID),
+        cfg(A::CUBLASLT_ALGO_CONFIG_STAGES_ID),
+        if w.from_heuristic { ", heuristic" } else { "" },
+        h0.map_or("none".to_string(), |t| format!("{t:.3} ms")),
+    );
+}
+
+/// Issue one TF32 GEMM (f32 operands and output, cuBLAS column-major
+/// arguments exactly as `cublasSgemm_v2` takes them) through cublasLt with the
+/// shape's tuned plan. `true` = launched (the caller must not also issue it);
+/// `false` = declined, nothing was written to `c`.
+///
+/// The caller has checked [`timed_lt_applies`].
+///
+/// # Safety
+/// `a`, `b`, `c` are live device buffers for this shape and layout.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn matmul_f32_tf32(
+    opa: bool,
+    opb: bool,
+    m: i32,
+    n: i32,
+    k: i32,
+    alpha: f32,
+    a: *const f32,
+    lda: i32,
+    b: *const f32,
+    ldb: i32,
+    beta: f32,
+    c: *mut f32,
+    ldc: i32,
+) -> bool {
+    let Some(handle) = lt_handle() else {
+        TF32_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
+    // Alignment class of the three buffers, capped at 256 bytes: plans are
+    // built for it, so a sliced operand at an odd offset gets its own plan
+    // instead of failing (and poisoning) the aligned shape's.
+    let addr_bits = (a as usize) | (b as usize) | (c as usize) | 256;
+    let key: Tf32Key = (opa as i32, opb as i32, m, n, k, lda, ldb, ldc, addr_bits.trailing_zeros());
+    let hit = with_tf32_plans(|plans| {
+        plans.get(&key).map(|p| p.as_ref().map(|p| (p.desc, p.adesc, p.bdesc, p.cdesc, p.algo, p.ws_bytes)))
+    });
+    let (desc, adesc, bdesc, cdesc, algo, ws_need) = match hit {
+        Some(Some(t)) => t,
+        Some(None) => {
+            TF32_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        None => {
+            if !tune_budget_allows(shapes_tuned()) {
+                print_budget_once();
+                return false;
+            }
+            // Built outside the cache lock: it synchronizes the device.
+            // SAFETY: the caller's live operands for this shape.
+            let plan = unsafe { tf32_build_plan(handle, &key, a, b) };
+            let resolved = with_tf32_plans(|plans| match plans.entry(key) {
+                std::collections::hash_map::Entry::Occupied(e) => {
+                    if let Some(p) = plan {
+                        // SAFETY: the newcomer's handles were never published.
+                        unsafe { destroy_handles(p.desc, p.adesc, p.bdesc, p.cdesc) };
+                    }
+                    e.get().as_ref().map(|p| (p.desc, p.adesc, p.bdesc, p.cdesc, p.algo, p.ws_bytes))
+                }
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    let t = plan.as_ref().map(|p| (p.desc, p.adesc, p.bdesc, p.cdesc, p.algo, p.ws_bytes));
+                    v.insert(plan);
+                    t
+                }
+            });
+            match resolved {
+                Some(t) => t,
+                None => {
+                    TF32_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
+            }
+        }
+    };
+    let (ws_ptr, _) = workspace();
+    let stream = super::inner::current_stream() as lt::cudaStream_t;
+    // SAFETY: plan handles are process-lifetime; operands are the caller's
+    // live buffers; C doubles as D (beta may be 1: the wgrad accumulate).
+    let st = unsafe {
+        lt::cublasLtMatmul(
+            handle,
+            desc,
+            &alpha as *const f32 as *const std::ffi::c_void,
+            a as *const std::ffi::c_void,
+            adesc,
+            b as *const std::ffi::c_void,
+            bdesc,
+            &beta as *const f32 as *const std::ffi::c_void,
+            c as *const std::ffi::c_void,
+            cdesc,
+            c as *mut std::ffi::c_void,
+            cdesc,
+            &algo,
+            ws_ptr as *mut std::ffi::c_void,
+            ws_need,
+            stream,
+        )
+    };
+    if st != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+        // A failed launch wrote nothing; poison the key so it does not
+        // fail-retry per GEMM, and let the caller issue cublasSgemm.
+        let displaced = with_tf32_plans(|plans| plans.insert(key, None));
+        if let Some(Some(p)) = displaced {
+            // SAFETY: just unpublished; no launch in flight uses them.
+            unsafe { destroy_handles(p.desc, p.adesc, p.bdesc, p.cdesc) };
+        }
+        TF32_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        print_fallback_once("tf32 cublasLtMatmul launch failure");
+        return false;
+    }
+    TF32_ISSUED.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
 /// Test-only reset: destroy every plan, clear counters. The Lt handle and
 /// workspace survive (process-lifetime by design; captured graphs and the
 /// banner's once-semantics depend on them).
@@ -749,6 +1363,9 @@ pub(crate) fn reset_for_test() {
     // No context, no plans — and reaching for one here would force CUDA
     // initialisation from a reset hook, which aborts where there is no driver.
     if !super::context::initialized() {
+        TF32_ISSUED.store(0, Ordering::Relaxed);
+        TF32_TUNED.store(0, Ordering::Relaxed);
+        TF32_FALLBACKS.store(0, Ordering::Relaxed);
         ISSUED.store(0, Ordering::Relaxed);
         TUNED.store(0, Ordering::Relaxed);
         FALLBACKS.store(0, Ordering::Relaxed);
@@ -762,7 +1379,29 @@ pub(crate) fn reset_for_test() {
         // SAFETY: handles were live and are now unreachable from the map.
         unsafe { destroy_handles(p.desc, p.adesc, p.bdesc, p.cdesc) };
     }
+    let drained: Vec<Option<Plan>> =
+        with_tf32_plans(|plans| std::mem::take(plans).into_values().collect());
+    for p in drained.into_iter().flatten() {
+        // SAFETY: as above.
+        unsafe { destroy_handles(p.desc, p.adesc, p.bdesc, p.cdesc) };
+    }
+    TF32_ISSUED.store(0, Ordering::Relaxed);
+    TF32_TUNED.store(0, Ordering::Relaxed);
+    TF32_FALLBACKS.store(0, Ordering::Relaxed);
     ISSUED.store(0, Ordering::Relaxed);
     TUNED.store(0, Ordering::Relaxed);
     FALLBACKS.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tune_budget_tests {
+    use super::*;
+
+    #[test]
+    fn the_budget_admits_exactly_its_size() {
+        assert!(tune_budget_allows(0));
+        assert!(tune_budget_allows(TUNE_BUDGET_SHAPES - 1));
+        assert!(!tune_budget_allows(TUNE_BUDGET_SHAPES));
+        assert!(!tune_budget_allows(TUNE_BUDGET_SHAPES + 7));
+    }
 }

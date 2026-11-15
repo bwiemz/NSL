@@ -114,6 +114,15 @@ pub extern "C" fn nsl_set_matmul_config(
     lt_tune: i64,
 ) -> i64 {
     let (mode, explicit) = split_mode(mode);
+    match runtime_bf16_env_verdict(mode, explicit, std::env::var("NSL_MATMUL_BF16").ok().as_deref()) {
+        RuntimeBf16Env::Agrees => {}
+        RuntimeBf16Env::IgnoredExplicit(msg) => {
+            crate::nsl_log!(WARN, "nsl-matmul", "{msg}");
+        }
+        RuntimeBf16Env::Refused(msg) => {
+            crate::fatal::die(crate::fatal::Fatal::Unsupported, &msg);
+        }
+    }
     MODE.store(mode as u64, Ordering::SeqCst);
     MODE_EXPLICIT_SET.store(explicit, Ordering::SeqCst);
     ROUNDING.store(rounding as u64, Ordering::SeqCst);
@@ -124,6 +133,69 @@ pub extern "C" fn nsl_set_matmul_config(
     LT_TUNE.store(lt_tune != 0, Ordering::SeqCst);
     SET.store(true, Ordering::SeqCst);
     0
+}
+
+/// What a compiled program does with an `NSL_MATMUL_BF16` in its RUN
+/// environment.
+#[derive(Debug, PartialEq)]
+pub(crate) enum RuntimeBf16Env {
+    /// Unset, a value with no meaning (only "1" and "0" have one), or one that
+    /// names the mode the program was compiled with.
+    Agrees,
+    /// Disagrees, but the program was compiled with an explicit
+    /// `--matmul-mode`, which beats an inherited variable: warn and run.
+    IgnoredExplicit(String),
+    /// Disagrees with a mode that came from the default or from the
+    /// variable at BUILD time: refuse.
+    Refused(String),
+}
+
+/// The run-time half of the `NSL_MATMUL_BF16` contract.
+///
+/// The matmul mode is decided when the program is COMPILED (`nsl build` /
+/// `nsl run` read `--matmul-mode`, or the deprecated variable, into
+/// `CompileOptions::matmul`) and recorded in the execution fingerprint, so a
+/// checkpoint names the arithmetic that produced it. The runtime therefore
+/// never switches mode on its own environment. Until 2026-11 it also never
+/// SAID so: a binary built without the variable and run with
+/// `NSL_MATMUL_BF16=1` ran TF32 under a TF32 banner, and
+/// `models/benchmarks/posture_bench_1b.py`'s bf16 arm measured TF32 that way
+/// (found by the November NSL-vs-PyTorch baseline).
+///
+/// A run whose variable disagrees with its compiled mode is now refused with a
+/// message naming the fix. `nsl run` compiles and runs in one process with
+/// one environment, so it always agrees; an explicit `--matmul-mode` keeps its
+/// precedence over an inherited variable (warned, not refused), as it has
+/// over `NSL_MATMUL_TF32` / `NSL_MATMUL_PEDANTIC` since the 2026-10-06 review.
+pub(crate) fn runtime_bf16_env_verdict(mode: i64, explicit: bool, env: Option<&str>) -> RuntimeBf16Env {
+    let wants_bf16 = match env {
+        Some("1") => true,
+        Some("0") => false,
+        _ => return RuntimeBf16Env::Agrees,
+    };
+    if wants_bf16 == (mode == MODE_BF16) {
+        return RuntimeBf16Env::Agrees;
+    }
+    let compiled = match mode {
+        MODE_BF16 => "bf16",
+        MODE_F32 => "f32",
+        _ => "tf32",
+    };
+    let value = if wants_bf16 { "1" } else { "0" };
+    if explicit {
+        return RuntimeBf16Env::IgnoredExplicit(format!(
+            "[nsl-matmul] NSL_MATMUL_BF16={value} is set but ignored: this program was compiled \
+             with --matmul-mode {compiled}, and an explicit flag beats an inherited variable"
+        ));
+    }
+    let rebuild = if wants_bf16 { "--matmul-mode bf16" } else { "--matmul-mode tf32 (or f32)" };
+    RuntimeBf16Env::Refused(format!(
+        "NSL_MATMUL_BF16={value} is set, but this program was compiled with matmul mode \
+         {compiled}. The matmul mode is fixed when a program is compiled (it is recorded in \
+         its checkpoints), so the variable cannot change it at run time. Rebuild with \
+         {rebuild} (or with NSL_MATMUL_BF16={value} set for `nsl build`), or unset \
+         NSL_MATMUL_BF16 to run this binary as compiled."
+    ))
 }
 
 /// `nsl_set_matmul_config`'s mode argument as (mode, given explicitly).
@@ -379,6 +451,50 @@ mod tests {
     /// Clamped here as well as at the compile side: a hand-written caller can
     /// pass anything, and the runtime must never use a value the fingerprint
     /// could not have recorded.
+    /// THE REGRESSION (item 4 of the November perf work): a program compiled
+    /// in tf32 and run with NSL_MATMUL_BF16=1 used to run tf32 silently.
+    #[test]
+    fn a_run_time_bf16_variable_that_disagrees_is_refused() {
+        match runtime_bf16_env_verdict(MODE_TF32, false, Some("1")) {
+            RuntimeBf16Env::Refused(msg) => {
+                assert!(msg.contains("compiled with matmul mode tf32"), "{msg}");
+                assert!(msg.contains("--matmul-mode bf16"), "names the fix: {msg}");
+            }
+            other => panic!("tf32 binary + NSL_MATMUL_BF16=1 must be refused, got {other:?}"),
+        }
+        // The other direction: a bf16 build asked to pin bf16 off.
+        assert!(matches!(
+            runtime_bf16_env_verdict(MODE_BF16, false, Some("0")),
+            RuntimeBf16Env::Refused(_)
+        ));
+        assert!(matches!(
+            runtime_bf16_env_verdict(MODE_F32, false, Some("1")),
+            RuntimeBf16Env::Refused(_)
+        ));
+    }
+
+    #[test]
+    fn an_agreeing_or_meaningless_variable_runs() {
+        assert_eq!(runtime_bf16_env_verdict(MODE_BF16, false, Some("1")), RuntimeBf16Env::Agrees);
+        assert_eq!(runtime_bf16_env_verdict(MODE_TF32, false, Some("0")), RuntimeBf16Env::Agrees);
+        assert_eq!(runtime_bf16_env_verdict(MODE_TF32, false, None), RuntimeBf16Env::Agrees);
+        // Only the literals "1" and "0" mean anything, as at build time.
+        for v in ["true", "", "01", "yes"] {
+            assert_eq!(runtime_bf16_env_verdict(MODE_TF32, false, Some(v)), RuntimeBf16Env::Agrees, "{v:?}");
+        }
+    }
+
+    /// An explicit --matmul-mode beats an inherited variable: warn, run.
+    #[test]
+    fn an_explicit_mode_wins_with_a_warning() {
+        match runtime_bf16_env_verdict(MODE_TF32, true, Some("1")) {
+            RuntimeBf16Env::IgnoredExplicit(msg) => {
+                assert!(msg.contains("ignored") && msg.contains("--matmul-mode tf32"), "{msg}")
+            }
+            other => panic!("explicit tf32 must win over NSL_MATMUL_BF16=1, got {other:?}"),
+        }
+    }
+
     #[test]
     fn the_workspace_cap_is_clamped_from_the_environment_too() {
         assert_eq!(env(&[("NSL_MATMUL_BF16_LT_WORKSPACE_MIB", "999999")]).lt_workspace_mib, 4096);

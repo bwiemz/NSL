@@ -647,6 +647,13 @@ fn emit_op(ptx: &mut String, op: &KirOp, ir: &KernelIR) {
             )
             .unwrap();
         }
+        KirOp::AtomicMax(ptr, val, addr_space) => {
+            let space = address_space_str(*addr_space);
+            let ty = var_ptx_type(ir, *val, *val);
+            let val_prefix = var_reg_prefix(ir, *val, *val);
+            let ptr_prefix = var_reg_prefix(ir, *ptr, *ptr);
+            writeln!(ptx, "    red.{}.max.{} [{}{}], {}{};", space, ty, ptr_prefix, ptr, val_prefix, val).unwrap();
+        }
         KirOp::ThreadId(dst, dim) => {
             let dim_name = dim_char(*dim);
             writeln!(ptx, "    mov.u32 %r{}, %tid.{};", dst, dim_name).unwrap();
@@ -1005,6 +1012,23 @@ fn emit_op(ptx: &mut String, op: &KirOp, ir: &KernelIR) {
                 list(a),
                 list(b),
                 list(c)
+            )
+            .unwrap();
+        }
+        KirOp::CvtPack { dst, hi, lo, ty } => {
+            // PTX: "the value converted from input a is stored in the upper
+            // half of d and the value converted from input b in the lower
+            // half" — so `hi` is printed first.
+            writeln!(
+                ptx,
+                "    cvt.rn.{}x2.f32 {}{}, {}{}, {}{};",
+                ty.ptx_type(),
+                var_reg_prefix(ir, *dst, *dst),
+                dst,
+                var_reg_prefix(ir, *hi, *hi),
+                hi,
+                var_reg_prefix(ir, *lo, *lo),
+                lo
             )
             .unwrap();
         }
@@ -1658,6 +1682,70 @@ mod tests {
                 "    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{{}, {}, {}, {}}}, {{{}, {}, {}, {}}}, {{{}, {}}}, {{{}, {}, {}, {}}};\n",
                 n(d[0]), n(d[1]), n(d[2]), n(d[3]), n(a[0]), n(a[1]), n(a[2]), n(a[3]), n(bb[0]), n(bb[1]), n(c[0]), n(c[1]), n(c[2]), n(c[3])
             )),
+            "{ptx}"
+        );
+    }
+
+    /// `CvtPack` prints `cvt.rn.<ty>x2.f32 dst, hi, lo`: PTX puts its first
+    /// source in the HIGH half, so `hi` must be printed first. Swapping them
+    /// would still assemble and silently transpose every fragment pair.
+    #[test]
+    fn test_ptx_cvt_pack_prints_the_high_half_first() {
+        for (ty, token) in [(MmaOperandTy::F16, "f16x2"), (MmaOperandTy::Bf16, "bf16x2")] {
+            let mut b = KirBuilder::new("pack");
+            let out = b.add_param(
+                "out",
+                KirType::Ptr(Box::new(ty.fragment_ty()), AddressSpace::Global),
+                AddressSpace::Global,
+            );
+            let entry = b.new_block();
+            b.set_block(entry);
+            let lo = b.new_typed_var(KirType::F32);
+            b.emit(KirOp::Const(lo, KirConst { ty: KirType::F32, value: ConstValue::F32(1.0) }));
+            let hi = b.new_typed_var(KirType::F32);
+            b.emit(KirOp::Const(hi, KirConst { ty: KirType::F32, value: ConstValue::F32(2.0) }));
+            let packed = b.new_typed_var(ty.fragment_ty());
+            b.emit(KirOp::CvtPack { dst: packed, hi, lo, ty });
+            b.emit(KirOp::Store(out, packed, AddressSpace::Global));
+            b.terminate(KirTerminator::Return);
+            let ir = b.finalize();
+            assert_eq!(ir.verify(), Ok(()));
+            assert!(ir.required_features.contains(FeatureSet::TENSOR_CORES));
+            assert_eq!(ir.required_features.contains(FeatureSet::BF16_ARITHMETIC), ty == MmaOperandTy::Bf16);
+            let ptx = String::from_utf8(lower_kir_to_ptx(&ir)).unwrap();
+            let al = crate::regalloc::allocate(&ir);
+            let n = |v: VarId| al.name(v);
+            assert!(ptx.contains(".target sm_80"), "{ptx}");
+            assert!(
+                ptx.contains(&format!("    cvt.rn.{token}.f32 {}, {}, {};\n", n(packed), n(hi), n(lo))),
+                "{ptx}"
+            );
+            assert!(ptx.contains(&format!("    st.global.b32 [{}], {};\n", n(out), n(packed))), "{ptx}");
+        }
+    }
+
+    /// `AtomicMax` lowers to `red.<space>.max.<ty>`, the reduction without
+    /// a result, like `AtomicAdd`.
+    #[test]
+    fn test_ptx_atomic_max_lowers_to_red_max() {
+        let mut b = KirBuilder::new("amax");
+        let out = b.add_param(
+            "out",
+            KirType::Ptr(Box::new(KirType::U32), AddressSpace::Global),
+            AddressSpace::Global,
+        );
+        let entry = b.new_block();
+        b.set_block(entry);
+        let v = b.new_typed_var(KirType::U32);
+        b.emit(KirOp::Const(v, KirConst { ty: KirType::U32, value: ConstValue::U32(7) }));
+        b.emit(KirOp::AtomicMax(out, v, AddressSpace::Global));
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+        assert_eq!(ir.verify(), Ok(()));
+        let ptx = String::from_utf8(lower_kir_to_ptx(&ir)).unwrap();
+        let al = crate::regalloc::allocate(&ir);
+        assert!(
+            ptx.contains(&format!("    red.global.max.u32 [{}], {};\n", al.name(out), al.name(v))),
             "{ptx}"
         );
     }

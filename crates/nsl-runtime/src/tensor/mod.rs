@@ -2855,13 +2855,21 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
     // Device-resident indices stay unchecked — validating them would mean a
     // D2H copy plus a sync on every lookup. That gap is real; it is not new,
     // and it is not closed here.
+    //
+    // The same pass notes whether the indices are exactly `0, 1, ..., n-1` as
+    // f32 (`arange(0, n)`, RotaryEmbedding's gather): the GPU arm then reads a
+    // device-resident copy of those values instead of uploading them, which
+    // is a synchronous host-to-device copy per call. Exact float equality, so
+    // only the vector the device copy holds qualifies.
+    let mut host_iota = false;
     if indices.device == 0 && weight.ndim == 2 {
         let rows = unsafe { *weight.shape.add(0) };
         let n = unsafe { *indices.shape.add(0) } as usize;
         // `read_index(i)` reads storage linearly: check the indices in their
         // logical order, which a strided (or expanded) view's storage is not.
-        with_row_major([indices_ptr], |[idx_rm]| {
+        host_iota = with_row_major([indices_ptr], |[idx_rm]| {
             let indices = NslTensor::from_ptr_ref(idx_rm);
+            let mut iota = indices.dtype == 1;
             for i in 0..n {
                 let raw_idx = indices.read_index(i);
                 if raw_idx < 0 || raw_idx >= rows {
@@ -2871,7 +2879,11 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
                     );
                     std::process::abort();
                 }
+                if iota && unsafe { *indices.data_f32().add(i) } != i as f32 {
+                    iota = false;
+                }
             }
+            iota
         });
     }
 
@@ -2879,7 +2891,7 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
     if weight.device > 0 {
         #[cfg(feature = "cuda")]
         {
-            let out_ptr = crate::cuda::gpu_embedding_lookup(weight_ptr, indices_ptr);
+            let out_ptr = crate::cuda::gpu_embedding_lookup(weight_ptr, indices_ptr, host_iota);
             // Tape record on the GPU arm — mirrors the CPU record site below
             // (weight and indices saved with refcount bumps for backward).
             if autodiff::is_recording() {
@@ -2896,7 +2908,10 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
             return out_ptr;
         }
         #[cfg(not(feature = "cuda"))]
-        { crate::fatal::cuda_not_compiled(); }
+        {
+            let _ = host_iota;
+            crate::fatal::cuda_not_compiled();
+        }
     }
 
     let vocab_size = unsafe { *weight.shape.add(0) } as usize;
@@ -6822,8 +6837,12 @@ pub extern "C" fn nsl_gpu_reset_mem_stats() {
     }
 }
 
-/// Release idle GPU memory back to the driver. Called after each training step
-/// to prevent the caching allocator from holding stale segments.
+/// Step-boundary hook, emitted after every training micro-batch: reports the
+/// host profile and releases idle transient GPU memory to the driver WHEN the
+/// caching allocator holds markedly more than the step needed
+/// (`CachingAllocator::drain_if_bloated` says why it is no longer every step).
+/// An allocation that fails still drains and retries on its own
+/// (`alloc_managed`'s OOM recovery).
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_gpu_drain_cache() {
     // Called once per training step, so this is the natural reporting interval.
@@ -6836,19 +6855,33 @@ pub extern "C" fn nsl_gpu_drain_cache() {
     if crate::cuda::graph_capture::cuda_graphs_armed() {
         return;
     }
-    // Probe gate (2026-04-23): NSL_SKIP_GPU_DRAIN=1 bypasses this workaround
-    // so we can observe whether ELTLS frees intermediates at last use.
-    if std::env::var("NSL_SKIP_GPU_DRAIN").ok().as_deref() != Some("1") {
-        #[cfg(feature = "cuda")]
-        {
-            crate::cuda::inner::ensure_context();
-            // Sync first to ensure all async GPU ops complete so freed blocks are actually available
+    // NSL_SKIP_GPU_DRAIN=1: never release at a step boundary, even a bloated
+    // pool (allocation failures still drain). Read once: this runs per step.
+    static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let skip = *SKIP.get_or_init(|| std::env::var("NSL_SKIP_GPU_DRAIN").ok().as_deref() == Some("1"));
+    #[cfg(not(feature = "cuda"))]
+    let _ = skip;
+    #[cfg(feature = "cuda")]
+    if !skip {
+        // No context: nothing was ever allocated, so there is nothing to keep
+        // or release (and this must not force CUDA up on a CPU run).
+        let Some(a) = crate::cuda::caching_allocator::allocator_if_initialized() else {
+            return;
+        };
+        // The decision is a few loads under the allocator lock. Only a drain
+        // needs the device quiet, and `cuMemFree` synchronizes it anyway; the
+        // explicit sync keeps that ordering independent of driver behaviour.
+        let mut alloc = a.lock().unwrap();
+        if alloc.would_drain() {
+            drop(alloc);
             unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
-            let mut alloc = crate::cuda::caching_allocator::allocator().lock().unwrap();
-            let freed = alloc.drain_all();
-            if freed > 0 {
-                crate::nsl_log!(INFO, "gpu-drain", "[gpu-drain] released {}MB to driver", freed / (1024 * 1024));
-            }
+            alloc = a.lock().unwrap();
+        }
+        if let Some(freed) = alloc.drain_if_bloated() {
+            drop(alloc);
+            crate::nsl_log!(INFO, "gpu-drain",
+                "[gpu-drain] the pool held more than the step needed: released {}MB to the driver",
+                freed / (1024 * 1024));
         }
     }
 }

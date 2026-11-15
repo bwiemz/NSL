@@ -58,6 +58,12 @@ pub fn test_bf16_cast_cache_reset() {
 pub fn test_lt_matmul_stats() -> (u64, u64, u64) {
     lt_matmul::stats()
 }
+/// The TF32 path's (issued, tuned, fallbacks), for the gate that checks the
+/// tuned plans actually ran.
+#[cfg(all(feature = "cuda", feature = "test-hooks"))]
+pub fn test_lt_matmul_tf32_stats() -> (u64, u64, u64) {
+    lt_matmul::tf32_stats()
+}
 #[cfg(all(feature = "cuda", feature = "test-hooks"))]
 pub fn test_lt_matmul_reset() {
     lt_matmul::reset_for_test()
@@ -2928,8 +2934,11 @@ pub(crate) mod cublas_inner {
         // decline falls through to the GemmEx call below, which computes the
         // identical product (`lt_matmul` guarantees a failed launch wrote
         // nothing).
+        // Also by default when timed plan selection applies (as for TF32): the
+        // same arithmetic, a faster kernel per shape (`lt_matmul`).
         if let Some(s) = scratch
-            && super::lt_matmul::enabled()
+            && (super::lt_matmul::enabled()
+                || super::lt_matmul::timed_lt_applies(m as u64, n as u64, k as u64))
         {
             let op_code = |o: cublas_sys::cublasOperation_t| match o {
                 cublas_sys::cublasOperation_t::CUBLAS_OP_N => 0i32,
@@ -2958,6 +2967,31 @@ pub(crate) mod cublas_inner {
             if issued {
                 return Ok(());
             }
+        }
+        // A low-intensity product keeps f32 storage at FAST_TF32: the same
+        // arithmetic as the TF32 mode's GEMMs, so it takes the same tuned
+        // cublasLt plan when one applies (a decline falls through below).
+        if scratch.is_none()
+            && super::lt_matmul::timed_lt_applies(m as u64, n as u64, k as u64)
+            && unsafe {
+                super::lt_matmul::matmul_f32_tf32(
+                    transa == cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                    transb == cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                    m,
+                    n,
+                    k,
+                    *alpha,
+                    a_dev,
+                    lda,
+                    b_dev,
+                    ldb,
+                    *beta,
+                    c_dev,
+                    ldc,
+                )
+            }
+        {
+            return Ok(());
         }
         let (a_ptr, b_ptr, ab_type, compute) = match scratch {
             Some(s) => (
@@ -3129,6 +3163,32 @@ pub(crate) mod cublas_inner {
                     scratch.as_ref(),
                 )
             };
+        }
+        // TF32: the shape's tuned cublasLt plan when one applies (see
+        // `lt_matmul`'s TF32 section: cuBLAS 13.8's sgemm heuristic picks
+        // 64x64-tile kernels for most transformer shapes on sm_120). A decline
+        // wrote nothing and falls through to the sgemm it always was.
+        if resolved_math_mode() == CublasMathMode::Tf32
+            && super::lt_matmul::timed_lt_applies(m, n, k)
+            && unsafe {
+                super::lt_matmul::matmul_f32_tf32(
+                    transb,
+                    transa,
+                    n as i32,
+                    m as i32,
+                    k as i32,
+                    alpha,
+                    b_dev,
+                    if transb { k as i32 } else { n as i32 },
+                    a_dev,
+                    if transa { m as i32 } else { k as i32 },
+                    beta,
+                    c_dev,
+                    n as i32,
+                )
+            }
+        {
+            return Ok(());
         }
         unsafe {
             cublas_result::sgemm(
@@ -3385,6 +3445,30 @@ pub(crate) mod cublas_inner {
                     scratch.as_ref(),
                 )
             };
+        }
+        // TF32: the tuned cublasLt plan, as in `sgemm_row_major_t`. beta = 1
+        // accumulates into C exactly as the sgemm below does.
+        if resolved_math_mode() == CublasMathMode::Tf32
+            && super::lt_matmul::timed_lt_applies(d_out, d_in, n_rows)
+            && unsafe {
+                super::lt_matmul::matmul_f32_tf32(
+                    false,
+                    true,
+                    d_out as i32,
+                    d_in as i32,
+                    n_rows as i32,
+                    alpha,
+                    g_dev,
+                    d_out as i32,
+                    x_dev,
+                    d_in as i32,
+                    beta,
+                    c_dev,
+                    d_out as i32,
+                )
+            }
+        {
+            return Ok(());
         }
         unsafe {
             cublas_result::sgemm(
@@ -6676,11 +6760,84 @@ pub extern "C" fn nsl_kernel_launch_tensors(
 // GPU Embedding Lookup
 // ---------------------------------------------------------------------------
 
+/// A device-resident f32 vector holding `0.0, 1.0, 2.0, ...` with at least `n`
+/// entries, built once per device and never copied again.
+///
+/// The position vector a gather by `arange(0, n)` needs (RotaryEmbedding's
+/// cached cos/sin tables are read that way, twice per attention layer and again
+/// in the recompute) used to be uploaded from the host on every call: an
+/// 8 KB `cuMemcpyHtoD_v2` from pageable memory, which waits for the device to
+/// drain before it copies. At Coder-1B that was 128 device synchronisations per
+/// micro-batch (measured, `models/benchmarks/NSL_VS_PYTORCH_2026_11.md`). The
+/// values never change, so one upload per device serves every later call.
+///
+/// Grows geometrically when a longer prefix is asked for. Superseded buffers are
+/// kept, not freed, for the reason `upload_meta_i64_cached` keeps its entries: a
+/// captured cuda graph (or a kernel still in flight on another stream) may hold
+/// the old pointer. The waste is bounded by the final buffer's size. Persistent
+/// pool, so the buffers never pin a transient segment.
+#[cfg(feature = "cuda")]
+pub(crate) fn device_iota_f32(n: usize) -> *const f32 {
+    /// (current buffer, its length in elements, superseded buffers kept alive).
+    #[derive(Default)]
+    struct Iota {
+        ptr: u64,
+        len: usize,
+        retired: Vec<u64>,
+    }
+
+    // Short closures with the allocation between them: `with_cache` holds the
+    // device's cache mutex, and the allocator must not be called under it.
+    if let Some(p) = context::current().with_cache(|c: &mut Iota| (c.len >= n).then_some(c.ptr)) {
+        return p as *const f32;
+    }
+    // f32 holds every integer up to 2^24 exactly; past that the "index" a gather
+    // reads would not be the position it names. No table is that long.
+    assert!(n <= 1 << 24, "device_iota_f32: {n} positions exceed f32's exact integers");
+    let len = n.next_power_of_two().clamp(1024, 1 << 24);
+    let host: Vec<f32> = (0..len).map(|i| i as f32).collect();
+    let dev = {
+        use crate::cuda::caching_allocator::{AllocPool, PoolGuard};
+        let _pool = PoolGuard::new(AllocPool::Persistent);
+        inner::alloc_managed(len * std::mem::size_of::<f32>())
+    };
+    // Immediate, not `memcpy_htod`: inside a cuda-graph capture region the
+    // latter defers the bytes to graph launch, and this pointer is published
+    // for reuse right now (see `memcpy_htod_immediate`).
+    inner::memcpy_htod_immediate(
+        dev,
+        host.as_ptr() as *const std::ffi::c_void,
+        len * std::mem::size_of::<f32>(),
+    );
+    context::current().with_cache(|c: &mut Iota| {
+        if c.len >= n {
+            // Another thread published a long-enough buffer meanwhile: keep
+            // ours alive anyway (never freed, like a retired one) and use
+            // theirs. Freeing would need the allocator under this lock.
+            c.retired.push(dev as u64);
+            c.ptr as *const f32
+        } else {
+            if c.ptr != 0 {
+                c.retired.push(c.ptr);
+            }
+            c.ptr = dev as u64;
+            c.len = len;
+            dev as *const f32
+        }
+    })
+}
+
 /// GPU embedding lookup: weight is on GPU (f32), indices may be CPU or GPU.
 /// Allocates output via alloc_managed and launches the embedding PTX kernel.
 /// Returns a GPU tensor (device = weight.device).
+///
+/// `host_iota`: the caller has checked that `indices` is a HOST-resident f32
+/// vector equal to `0.0, 1.0, ..., n-1` exactly. The kernel then reads the
+/// device-resident [`device_iota_f32`] instead of an upload of the same
+/// values, which removes a synchronous host-to-device copy per call. Same
+/// kernel, same index values, same output bits.
 #[cfg(feature = "cuda")]
-pub(crate) fn gpu_embedding_lookup(weight_ptr: i64, indices_ptr: i64) -> i64 {
+pub(crate) fn gpu_embedding_lookup(weight_ptr: i64, indices_ptr: i64, host_iota: bool) -> i64 {
     inner::set_oom_context("embedding_lookup");
     use crate::tensor::NslTensor;
 
@@ -6704,15 +6861,25 @@ pub(crate) fn gpu_embedding_lookup(weight_ptr: i64, indices_ptr: i64) -> i64 {
     let out_elems = (seq_len * embed_dim) as usize;
     let out_data = inner::alloc_managed(out_elems * 4); // f32 = 4 bytes
 
-    // Ensure indices are on GPU (preserving dtype — may be i32 or f32)
-    let indices_on_gpu = if indices.device == 0 {
+    // Ensure indices are on GPU (preserving dtype — may be i32 or f32). An
+    // iota prefix is already there (`device_iota_f32`); 0 marks "no tensor
+    // to free" below.
+    let host_iota = host_iota && indices.device == 0 && indices.dtype == 1;
+    let indices_on_gpu = if host_iota {
+        0
+    } else if indices.device == 0 {
         crate::tensor::nsl_tensor_to_device(indices_ptr, weight.device as i64)
     } else {
         let t = NslTensor::from_ptr(indices_ptr);
         t.refcount.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         indices_ptr
     };
-    let indices_gpu = NslTensor::from_ptr_ref(indices_on_gpu);
+    let (indices_data, indices_dtype) = if host_iota {
+        (device_iota_f32(seq_len as usize) as u64, 1)
+    } else {
+        let t = NslTensor::from_ptr_ref(indices_on_gpu);
+        (t.data as u64, t.dtype)
+    };
 
     let out_shape = crate::memory::checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
     unsafe {
@@ -6722,7 +6889,7 @@ pub(crate) fn gpu_embedding_lookup(weight_ptr: i64, indices_ptr: i64) -> i64 {
     let out_strides = NslTensor::compute_strides(out_shape, 2);
 
     let mut w_data = weight.data as u64;
-    let mut i_data = indices_gpu.data as u64;
+    let mut i_data = indices_data;
     let mut o_data = out_data as u64;
     let mut seq_val = seq_len;
     let mut emb_val = embed_dim;
@@ -6743,7 +6910,7 @@ pub(crate) fn gpu_embedding_lookup(weight_ptr: i64, indices_ptr: i64) -> i64 {
 
     // Select kernel based on indices dtype: i32 indices use ld.global.s32,
     // f32 indices use ld.global.f32 + cvt.rzi.u64.f32
-    let (ptx, kernel_name): (&str, &[u8]) = if indices_gpu.dtype == crate::tensor::DTYPE_I32 {
+    let (ptx, kernel_name): (&str, &[u8]) = if indices_dtype == crate::tensor::DTYPE_I32 {
         (fused_kernels::embedding_i32idx_ptx(), b"nsl_embedding_i32idx\0")
     } else {
         (fused_kernels::embedding_f32_ptx(), b"nsl_embedding_f32\0")
@@ -6756,7 +6923,9 @@ pub(crate) fn gpu_embedding_lookup(weight_ptr: i64, indices_ptr: i64) -> i64 {
     assert_eq!(result as u32, 0, "GPU embedding kernel failed: {:?}", result);
     inner::sync_after_kernel();
 
-    crate::tensor::nsl_tensor_free(indices_on_gpu);
+    if indices_on_gpu != 0 {
+        crate::tensor::nsl_tensor_free(indices_on_gpu);
+    }
 
     let out = Box::new(NslTensor::new(
         out_data,

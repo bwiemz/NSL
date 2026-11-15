@@ -84,10 +84,12 @@ pub(crate) struct MatmulArgs {
     #[arg(long, value_name = "MIB")]
     pub(crate) bf16_lt_workspace_mib: Option<u32>,
 
-    /// Disable cuBLASLt timed first-use plan selection. Replaces
-    /// NSL_MATMUL_BF16_LT_TUNE=0. With tuning ON (the default) the winner
-    /// depends on live machine state, so plan choice is NOT reproducible
-    /// across processes.
+    /// Disable cuBLASLt timed first-use plan selection: for --bf16-lt GEMMs,
+    /// and for TF32 GEMMs (the default math mode), which then go back to
+    /// cuBLAS's own sgemm heuristic. Replaces NSL_MATMUL_BF16_LT_TUNE=0. With
+    /// tuning ON (the default) the winner depends on live machine state, so
+    /// plan choice is NOT reproducible across processes (--deterministic
+    /// turns the timed selection off).
     #[arg(long)]
     pub(crate) no_bf16_lt_tune: bool,
 }

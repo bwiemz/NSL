@@ -1029,6 +1029,288 @@ fn make_gpu_tensor(data: *mut c_void, shape: &[i64], total: usize) -> i64 {
     Box::into_raw(t) as i64
 }
 
+/// Whether the tensor-core attention kernels (`crate::attention_tc`) serve
+/// the unpacked `scaled_dot_product_attention` forward and backward.
+/// `NSL_TC_ATTENTION=0` turns them off (the previous kernels, and the CPU
+/// backward for tape-AD programs, serve those calls again); read once.
+#[cfg(feature = "cuda")]
+fn tc_attention_enabled() -> bool {
+    if TC_ATTENTION_PINNED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NSL_TC_ATTENTION").ok().as_deref() != Some("0"))
+}
+
+static TC_ATTENTION_PINNED_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Test hook: route this process's unpacked SDPA calls to the attention
+/// kernels before the tensor-core ones (as `NSL_TC_ATTENTION=0` does), so
+/// the gates that certify those kernels keep exercising them now that the
+/// tensor-core path serves head_dim 64 and 128 by default.
+pub fn nsl_test_pin_previous_attention_kernels() {
+    TC_ATTENTION_PINNED_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The unpacked SDPA forward on the tensor-core kernels: `[out, lse]` as an
+/// `NslList` (out f32 `[b, h, s, d]`, lse f32 `[b, h, s]`), or `None` when
+/// the launch failed (logged once; the caller declines to the decomposed
+/// graph). The caller has checked layout, strides and shapes.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn tc_sdpa_forward(
+    q_t: &NslTensor,
+    k_t: &NslTensor,
+    v_t: &NslTensor,
+    b: i64,
+    h: i64,
+    kv_h: i64,
+    s: i64,
+    d: i64,
+    scale_bits: i64,
+    causal: bool,
+) -> Option<i64> {
+    use crate::cuda::inner;
+    inner::ensure_context();
+    let total_out = (b * h * s * d) as usize;
+    let total_lse = (b * h * s) as usize;
+    // Every element is written by the kernel: no zero-fill.
+    let out_data = inner::alloc_managed(total_out * 4);
+    let lse_data = inner::alloc_managed(total_lse * 4);
+    let rc = crate::attention_tc::forward(&crate::attention_tc::FwdLaunch {
+        q: q_t.data as u64,
+        k: k_t.data as u64,
+        v: v_t.data as u64,
+        o: out_data as u64,
+        lse: lse_data as u64,
+        batch: b as usize,
+        heads: h as usize,
+        kv_heads: kv_h as usize,
+        seq: s as usize,
+        head_dim: d as usize,
+        scale: f32::from_bits(scale_bits as u32),
+        causal,
+    });
+    let sync_rc = if rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS && inner::sync_mode_enabled() {
+        unsafe { cudarc::driver::sys::cuCtxSynchronize() }
+    } else {
+        cudarc::driver::sys::CUresult::CUDA_SUCCESS
+    };
+    if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS || sync_rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+        flash_bwd_warn_once(&format!(
+            "[sdpa-fused] tensor-core attention forward FAILED (launch rc {rc:?}, sync rc {sync_rc:?}; \
+             b={b}, h={h}, kv_h={kv_h}, s={s}, d={d}) — declining to the decomposed SDPA graph"
+        ));
+        inner::free_managed(out_data);
+        inner::free_managed(lse_data);
+        return None;
+    }
+    SDPA_FUSED_LAUNCH_COUNTS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !SDPA_FUSED_LAUNCH_LOGGED.swap(true, Ordering::Relaxed) {
+        crate::nsl_log!(INFO, "nsl", "[nsl] sdpa fused forward: launched (tensor-core kernels, head_dim={d})");
+    }
+    let out_ptr = make_gpu_tensor(out_data, &[b, h, s, d], total_out);
+    let lse_ptr = make_gpu_tensor(lse_data, &[b, h, s], total_lse);
+    let list = crate::list::nsl_list_new();
+    crate::list::nsl_list_push(list, out_ptr);
+    crate::list::nsl_list_push(list, lse_ptr);
+    Some(list)
+}
+
+/// The SDPA backward on the tensor-core kernels: `[dQ, dK, dV]` as an
+/// `NslList` (dK/dV with K's `kv_h` heads), or `None` when it cannot run
+/// (non-GPU or non-f32 inputs, a logsumexp it cannot read, a failed launch;
+/// the caller falls back). Non-contiguous inputs are copied canonical first.
+/// `logsumexp_ptr` is the forward's saved lse or 0 (then it is recomputed).
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn tc_sdpa_backward(
+    dout_ptr: i64,
+    q_ptr: i64,
+    k_ptr: i64,
+    v_ptr: i64,
+    out_ptr: i64,
+    logsumexp_ptr: i64,
+    scale: f32,
+    b: usize,
+    h: usize,
+    kv_h: usize,
+    s: usize,
+    d: usize,
+    causal: bool,
+) -> Option<i64> {
+    use crate::cuda::inner;
+    let f32_gpu = |p: i64| {
+        let t = NslTensor::from_ptr(p);
+        t.device > 0 && t.dtype == 1 && t.ndim == 4
+    };
+    if ![dout_ptr, q_ptr, k_ptr, v_ptr, out_ptr].iter().all(|&p| f32_gpu(p)) {
+        return None;
+    }
+    let dims_ok = |p: i64, heads: usize| {
+        let t = NslTensor::from_ptr(p);
+        unsafe {
+            *t.shape.add(0) as usize == b
+                && *t.shape.add(1) as usize == heads
+                && *t.shape.add(2) as usize == s
+                && *t.shape.add(3) as usize == d
+        }
+    };
+    if !(dims_ok(dout_ptr, h) && dims_ok(q_ptr, h) && dims_ok(out_ptr, h) && dims_ok(k_ptr, kv_h) && dims_ok(v_ptr, kv_h))
+    {
+        return None;
+    }
+    let saved_lse: Option<*mut c_void> = if logsumexp_ptr != 0 {
+        let t = NslTensor::from_ptr(logsumexp_ptr);
+        (t.device > 0 && t.dtype == 1 && t.len >= (b * h * s) as i64 && is_canonical_row_major(t)).then_some(t.data)
+    } else {
+        None
+    };
+    if logsumexp_ptr != 0 && saved_lse.is_none() {
+        return None;
+    }
+    inner::ensure_context();
+    let _surface = crate::cuda::caching_allocator::SurfaceGuard::new(
+        crate::cuda::caching_allocator::SurfaceTag::AttnWorkspace,
+    );
+    // Canonical copies of view inputs (the kernels read stride-blind).
+    let mut temps: Vec<i64> = Vec::new();
+    let mut canon = |p: i64| -> i64 {
+        if is_canonical_row_major(NslTensor::from_ptr(p)) {
+            p
+        } else {
+            let c = crate::tensor::nsl_tensor_contiguous(p);
+            temps.push(c);
+            c
+        }
+    };
+    let (dout_c, q_c, k_c, v_c, out_c) = (canon(dout_ptr), canon(q_ptr), canon(k_ptr), canon(v_ptr), canon(out_ptr));
+    let data = |p: i64| NslTensor::from_ptr(p).data as u64;
+
+    let n_q = b * h * s * d;
+    let n_kv = b * kv_h * s * d;
+    let n_rows = b * h * s;
+    let mut scratch: Vec<*mut c_void> = Vec::new();
+    let lse_dev: u64 = match saved_lse {
+        Some(p) => p as u64,
+        None => {
+            // Recompute the logsumexp from Q and K (the decomposed forward
+            // saves none).
+            let lse_gpu = inner::alloc_managed(n_rows * 4);
+            scratch.push(lse_gpu);
+            let mut q_arg = data(q_c);
+            let mut k_arg = data(k_c);
+            let mut lse_arg = lse_gpu as u64;
+            let mut total_arg = n_rows as u64;
+            let mut seq_arg = s as u64;
+            let mut hd_arg = d as u64;
+            let mut scale_arg = scale;
+            let mut causal_arg = u64::from(causal);
+            let mut heads_arg = h as u64;
+            let mut kv_heads_arg = kv_h as u64;
+            let args: [*mut c_void; 10] = [
+                &mut q_arg as *mut _ as *mut c_void,
+                &mut k_arg as *mut _ as *mut c_void,
+                &mut lse_arg as *mut _ as *mut c_void,
+                &mut total_arg as *mut _ as *mut c_void,
+                &mut seq_arg as *mut _ as *mut c_void,
+                &mut hd_arg as *mut _ as *mut c_void,
+                &mut scale_arg as *mut _ as *mut c_void,
+                &mut causal_arg as *mut _ as *mut c_void,
+                &mut heads_arg as *mut _ as *mut c_void,
+                &mut kv_heads_arg as *mut _ as *mut c_void,
+            ];
+            let block = 256i64;
+            let rc = inner::kernel_launch(
+                crate::cuda::fused_kernels::flash_lse_gqa_f32_ptx().as_ptr(),
+                c"nsl_flash_lse_gqa_f32".as_ptr() as *const u8,
+                [(n_rows as i64 + block - 1) / block, 1, 1],
+                [block, 1, 1],
+                &args,
+                0,
+            );
+            if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                flash_bwd_warn_once(&format!("[flash-bwd] logsumexp recompute launch FAILED: {rc:?}"));
+                for p in scratch {
+                    inner::free_managed(p);
+                }
+                for t in temps {
+                    crate::tensor::nsl_tensor_free(t);
+                }
+                return None;
+            }
+            lse_gpu as u64
+        }
+    };
+    let dvec = inner::alloc_managed(n_rows * 4);
+    let gmax = inner::alloc_managed(b * h * 4);
+    scratch.push(dvec);
+    scratch.push(gmax);
+    let dq = inner::alloc_managed(n_q * 4);
+    let dk = inner::alloc_managed(n_kv * 4);
+    let dv = inner::alloc_managed(n_kv * 4);
+    let rc = crate::attention_tc::backward(&crate::attention_tc::BwdLaunch {
+        q: data(q_c),
+        k: data(k_c),
+        v: data(v_c),
+        o: data(out_c),
+        lse: lse_dev,
+        dout: data(dout_c),
+        dq: dq as u64,
+        dk: dk as u64,
+        dv: dv as u64,
+        dvec: dvec as u64,
+        gmax: gmax as u64,
+        batch: b,
+        heads: h,
+        kv_heads: kv_h,
+        seq: s,
+        head_dim: d,
+        scale,
+        causal,
+    });
+    let sync_rc = if rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS && inner::sync_mode_enabled() {
+        unsafe { cudarc::driver::sys::cuCtxSynchronize() }
+    } else {
+        cudarc::driver::sys::CUresult::CUDA_SUCCESS
+    };
+    // Freed without a synchronisation, as every runtime op frees its
+    // temporaries (and as the kernels this path replaces did: their success
+    // path synchronises only under NSL_CUDA_SYNC=1). The caching allocator
+    // records no streams; reuse is safe because everything that can touch a
+    // recycled block is ordered after these kernels — the runtime's
+    // allocator invariant (stated on `cuda::inner::memcpy_htod_async`):
+    // every launch and async memset of this thread goes to its one compute
+    // stream (`current_stream()`, created blocking); the synchronous copies
+    // (`cuMemcpyHtoD_v2` / `DtoD` / `DtoH`) run on the legacy NULL stream,
+    // which waits for prior work on blocking streams; the async copies on
+    // the non-blocking transfer stream first wait on an event recorded on
+    // the compute stream (`transfer_stream_wait_null_stream`); and no other
+    // thread issues device work for this device during a step (the data
+    // loaders' worker threads are host-only).
+    for p in scratch {
+        inner::free_managed(p);
+    }
+    for t in temps {
+        crate::tensor::nsl_tensor_free(t);
+    }
+    if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS || sync_rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+        flash_bwd_warn_once(&format!(
+            "[flash-bwd] tensor-core attention backward FAILED (launch rc {rc:?}, sync rc {sync_rc:?}; \
+             b={b}, h={h}, kv_h={kv_h}, s={s}, d={d}) — falling back"
+        ));
+        inner::free_managed(dq);
+        inner::free_managed(dk);
+        inner::free_managed(dv);
+        return None;
+    }
+    let list = crate::list::nsl_list_new();
+    crate::list::nsl_list_push(list, make_gpu_tensor(dq, &[b as i64, h as i64, s as i64, d as i64], n_q));
+    crate::list::nsl_list_push(list, make_gpu_tensor(dk, &[b as i64, kv_h as i64, s as i64, d as i64], n_kv));
+    crate::list::nsl_list_push(list, make_gpu_tensor(dv, &[b as i64, kv_h as i64, s as i64, d as i64], n_kv));
+    Some(list)
+}
+
 /// GQA→MHA expansion for the GPU flash backward (scaling campaign item 1).
 ///
 /// The phase-1/phase-2 backward kernels index K/V by the fused `b*h` block
@@ -1123,6 +1405,18 @@ fn reduce_expanded_kv_grads(
 /// Returns an `NslList*` `[out, lse]` on success:
 ///   out — `[b, h, s, d]` f32 GPU tensor (attention output)
 ///   lse — `[b, h, s]`    f32 GPU tensor (per-row logsumexp)
+///
+/// # The tensor-core path (unpacked batches)
+///
+/// Without segment ids, at head_dim 64 or 128, the call is served by the
+/// runtime's own tensor-core kernels (`crate::attention_tc`, built from
+/// `nsl_kir::kernels::flash_attn`) before any of the checks below: one
+/// launch for the whole batch, the output stored as f32, any sequence
+/// length (tail rows and keys are guarded, not refused), and K/V with
+/// `kv_heads` dividing `heads` read in place (no expansion). The codegen
+/// PTX this FFI is handed is then unused. `NSL_TC_ATTENTION=0` disables
+/// the path; everything below describes the kernels it replaces, which
+/// still serve packed batches and other head dims.
 ///
 /// # Decline protocol (return 0)
 ///
@@ -1236,11 +1530,8 @@ pub extern "C" fn nsl_sdpa_fused_forward(
             }};
         }
         // ── Decline checks: host-only struct reads, no driver calls ──
-        if ptx_ptr == 0 || name_ptr == 0 || q_ptr == 0 || k_ptr == 0 || v_ptr == 0 {
-            decline!("null ptx/name/tensor (head_dim matched no variant?)");
-        }
-        if block_q <= 0 || block_kv <= 0 {
-            decline!("non-positive block dims");
+        if q_ptr == 0 || k_ptr == 0 || v_ptr == 0 {
+            decline!("null tensor");
         }
         let q_t = NslTensor::from_ptr(q_ptr);
         let k_t = NslTensor::from_ptr(k_ptr);
@@ -1277,6 +1568,31 @@ pub extern "C" fn nsl_sdpa_fused_forward(
         };
         if b <= 0 || h <= 0 || s <= 0 || d <= 0 {
             decline!("non-positive dims");
+        }
+        // The tensor-core kernels (`attention_tc`): unpacked batches, the
+        // whole batch in one launch, f32 output, any sequence length, and
+        // K/V with fewer heads than Q (grouped-query) read in place.
+        if segment_ids_ptr == 0 && tc_attention_enabled() {
+            let kv_h = unsafe { *k_t.shape.add(1) };
+            let kv_matches = |t: &NslTensor| unsafe {
+                *t.shape.add(0) == b && *t.shape.add(1) == kv_h && *t.shape.add(2) == s && *t.shape.add(3) == d
+            };
+            if kv_matches(k_t)
+                && kv_matches(v_t)
+                && kv_h > 0
+                && crate::attention_tc::supports(b as usize, d as usize, h as usize, kv_h as usize, s as usize)
+                && crate::attention_tc::device_supported()
+                && let Some(list) = tc_sdpa_forward(q_t, k_t, v_t, b, h, kv_h, s, d, scale_bits, causal != 0)
+            {
+                return list;
+            }
+        }
+        // The codegen-synthesised kernels below need their PTX and tiles.
+        if ptx_ptr == 0 || name_ptr == 0 {
+            decline!("null ptx/name (head_dim matched no variant?)");
+        }
+        if block_q <= 0 || block_kv <= 0 {
+            decline!("non-positive block dims");
         }
         // K/V must agree with Q in [batch, seq, head_dim] and carry the
         // SAME head count — the plain fused kernel indexes K/V by the
@@ -7508,8 +7824,9 @@ pub extern "C" fn nsl_flash_attention_backward(
             if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 crate::nsl_log!(WARN, "flash-bwd", 
                     "[flash-bwd] WARNING: NSL_FLASH_BWD_CPU=0 overrides --deterministic. \
-                     The phase-2 backward accumulates dQ with a cross-CTA atomicAdd, so this \
-                     run is NOT bit-reproducible run-to-run."
+                     The phase-2 backward (packed batches, head dims other than 64 and 128, \
+                     NSL_TC_ATTENTION=0) accumulates dQ with a cross-CTA atomicAdd, so this \
+                     run is NOT guaranteed bit-reproducible run-to-run."
                 );
             }
         }
@@ -7564,6 +7881,29 @@ pub extern "C" fn nsl_flash_attention_backward(
             }
         }
 
+        // The tensor-core kernels (`attention_tc`): unpacked attention at
+        // head_dim 64 / 128, any sequence length, grouped K/V in place. They
+        // need no compiler-provided PTX, so tape-AD programs (which pass
+        // none) reach them too.
+        if dout_t.device > 0
+            && segment_ids_ptr == 0
+            && !force_cpu_bwd
+            && tc_attention_enabled()
+            && crate::attention_tc::supports(b, d, h, kv_h, s)
+            && crate::attention_tc::device_supported()
+            && let Some(list) = tc_sdpa_backward(
+                dout_ptr, q_ptr, k_ptr, v_ptr, out_ptr, logsumexp_ptr, scale, b, h, kv_h, s, d, is_causal,
+            )
+        {
+            if flash_debug {
+                crate::nsl_log!(INFO, "flash-bwd",
+                    "[flash-bwd] tensor-core backward dispatched \
+                     (batch={b}, heads={h}, kv_heads={kv_h}, seq={s}, head_dim={d}, causal={is_causal})"
+                );
+            }
+            return list;
+        }
+
         // PCA Stage C stride guard, reworked (scaling campaign item 1): the
         // GPU phase-1/phase-2 kernels read raw device pointers stride-blind,
         // so a non-contiguous VIEW input (e.g. reshape(..).transpose(1,2)
@@ -7591,7 +7931,7 @@ pub extern "C" fn nsl_flash_attention_backward(
 
             // Canonical-row-major materialization for the stride-blind
             // kernels: any view input gets one device-side strided-copy.
-            // Temps collected for freeing after the (synchronizing) launch.
+            // Temps collected for freeing after the launch (stream-ordered frees).
             let mut canon_temps: Vec<i64> = Vec::new();
             let mut canon = |ptr: i64, name: &str, temps: &mut Vec<i64>| -> i64 {
                 let t = NslTensor::from_ptr(ptr);
@@ -7650,9 +7990,10 @@ pub extern "C" fn nsl_flash_attention_backward(
                 segment_ids_ptr,
             );
 
-            // The launcher synchronized before returning on every path, so
-            // the expanded/materialized copies are dead now regardless of
-            // outcome.
+            // The copies are dead once the launches that read them are
+            // queued: the launcher synchronises only on a failed launch or
+            // under NSL_CUDA_SYNC=1, and the frees below are stream-ordered
+            // (see the frees in `tc_sdpa_backward` for why that is safe).
             if k_exp_t != 0 {
                 crate::tensor::nsl_tensor_free(k_exp_t);
             }

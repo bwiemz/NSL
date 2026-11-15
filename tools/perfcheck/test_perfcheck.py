@@ -14,6 +14,7 @@ GPU-busy time from intervals whose union is known.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import re
 import sqlite3
@@ -206,6 +207,18 @@ class Arms(unittest.TestCase):
         )
         with self.assertRaises(SystemExit):
             pc.arm("torch_fp8_eager_sel")
+
+    def test_toolchain_variants_are_their_own_builds(self) -> None:
+        base, after = pc.arm("nsl_bf16_nodrain"), pc.arm("nsl_bf16_nodrain@after")
+        self.assertEqual(after.name, "nsl_bf16_nodrain@after")
+        self.assertEqual(after.variant, "after")
+        # Same arm in every respect but the compiler that builds it.
+        self.assertEqual(dataclasses.replace(after, name=base.name, variant=""), base)
+        self.assertNotEqual(pc.flag_key(base.build_key), pc.flag_key(after.build_key))
+        self.assertTrue(pc.flag_key(after.build_key).endswith("@after"))
+        for bad in ("torch_tf32_eager_sel@after", "nsl_tf32@a/b", "nsl_tf32@"):
+            with self.assertRaises(SystemExit, msg=bad):
+                pc.arm(bad)
 
 
 def iv(s: int, e: int, name: str = "k") -> ns.Interval:

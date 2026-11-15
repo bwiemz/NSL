@@ -30,12 +30,18 @@
 //!   1. the deterministic arm's three replicates must be byte-identical;
 //!   2. the deterministic arm must REPORT the CPU-reference route (a gate that
 //!      only diffs loss streams passes when the routing never fired);
-//!   3. the plain arm must dispatch the GPU atomic kernel AT THE PINNED
+//!   3. a control arm on the atomic kernel (`NSL_TC_ATTENTION=0`, the
+//!      kernels before the tensor-core ones) must dispatch it AT THE PINNED
 //!      GEOMETRY and must DIVERGE. Guard 3 is what stops a future edit from
 //!      shrinking the fixture into a size where the race cannot express — an
 //!      earlier draft at 2 heads / seq 256 ran the atomic kernel and was still
 //!      bit-identical across replicates, which would have made guards 1 and 2
 //!      pass with the bug fully present.
+//!
+//! Since 2026-11-14 the default GPU backward at this head_dim is the
+//! tensor-core one (`nsl-runtime/src/attention_tc.rs`), which has no atomics:
+//! without --deterministic its replicates must be byte-identical too, and
+//! the gate asserts that as well.
 //!
 //! The divergence assertion is a race, so it was measured rather than assumed:
 //! at the pinned geometry, 6 replicates produced 6/6 distinct streams and 15/15
@@ -227,46 +233,52 @@ fn deterministic_flag_makes_flash_backward_bit_reproducible() {
         "--deterministic is not bit-reproducible: replicates 0 and 2 differ"
     );
 
-    // ── the control arm: without the flag this MUST still diverge ─────────
-    // Guard 3. If this arm ever goes bit-identical, the gate above has stopped
-    // proving anything: either the fixture shrank below the size where the
-    // atomic race expresses (an earlier draft at 2 heads / seq 256 did exactly
-    // that), or the phase-2 kernel gained a deterministic reduction — in which
-    // case this gate should be revisited rather than deleted.
-    let mut plain_runs = Vec::new();
-    let mut plain_stderr = String::new();
-    for r in 0..3 {
-        let out = run_fixture(&format!("plain{r}"), false);
-        assert!(
-            out.success,
-            "plain run {r} failed:\nstdout:\n{}\nstderr:\n{}",
-            out.stdout, out.stderr
-        );
-        assert_eq!(
-            det_route_count(&out.stdout),
-            0,
-            "plain run {r} took the deterministic CPU route without \
-             --deterministic — the routing predicate is inverted or the env is \
-             dirty:\n{}",
-            out.stderr
-        );
-        if r == 0 {
-            plain_stderr = out.stderr.clone();
-        }
-        plain_runs.push(loss_text(&out.stdout));
+    // ── without the flag: the tensor-core backward, deterministic too ─────
+    // The default GPU backward (`attention_tc`, head_dim 64) has no atomics:
+    // every dQ, dK and dV element has one writer. Without --deterministic its
+    // replicates must be byte-identical as well.
+    let plain = plain_arm("plain", &[]);
+    let tc_dispatch = plain
+        .stderr
+        .lines()
+        .find(|l| l.contains("[flash-bwd] tensor-core backward dispatched"))
+        .unwrap_or_else(|| {
+            panic!("the tensor-core backward was not dispatched without --deterministic:\n{}", plain.stderr)
+        });
+    for want in ["heads=8", "seq=512", "head_dim=64"] {
+        assert!(tc_dispatch.contains(want), "tensor-core backward at the wrong geometry: {want} not in `{tc_dispatch}`");
     }
+    assert_eq!(
+        plain.runs[0], plain.runs[1],
+        "the tensor-core attention backward is not bit-reproducible: replicates 0 and 1 differ"
+    );
+    assert_eq!(
+        plain.runs[0], plain.runs[2],
+        "the tensor-core attention backward is not bit-reproducible: replicates 0 and 2 differ"
+    );
+
+    // ── the control arm: the previous kernels MUST still diverge ──────────
+    // Guard 3. `NSL_TC_ATTENTION=0` restores the phase-2 kernel with its
+    // cross-CTA dQ atomics. If this arm ever goes bit-identical, the gate
+    // above has stopped proving anything: either the fixture shrank below the
+    // size where the atomic race expresses (an earlier draft at 2 heads / seq
+    // 256 did exactly that), or that kernel gained a deterministic reduction —
+    // in which case this gate should be revisited rather than deleted.
+    let atomic = plain_arm("atomic", &[("NSL_TC_ATTENTION", "0")]);
 
     // The pinned geometry, read off the kernel's own dispatch line. This is
     // what stops a future edit from shrinking the fixture into vacuity while
     // every other assertion still passes.
-    let dispatch = plain_stderr
+    let dispatch = atomic
+        .stderr
         .lines()
         .find(|l| l.contains("[flash-bwd] GPU backward dispatched"))
         .unwrap_or_else(|| {
             panic!(
-                "no GPU flash backward was dispatched without --deterministic, \
+                "no GPU flash backward was dispatched under NSL_TC_ATTENTION=0, \
                  so this fixture does not exercise the kernel the gate exists \
-                 to certify:\n{plain_stderr}"
+                 to certify:\n{}",
+                atomic.stderr
             )
         });
     for want in ["heads=8", "seq=512", "head_dim=64", "blocks=(32,32)"] {
@@ -281,16 +293,50 @@ fn deterministic_flag_makes_flash_backward_bit_reproducible() {
         );
     }
 
-    let distinct = plain_runs.iter().collect::<std::collections::HashSet<_>>();
+    let distinct = atomic.runs.iter().collect::<std::collections::HashSet<_>>();
     assert!(
         distinct.len() > 1,
-        "WITHOUT --deterministic all 3 replicates were byte-identical. Measured \
+        "under NSL_TC_ATTENTION=0 all 3 replicates were byte-identical. Measured \
          at this geometry: 6/6 distinct streams, 15/15 differing pairs. Either \
-         the fixture shrank below the size where the dK/dV atomic race \
+         the fixture shrank below the size where the dQ atomic race \
          expresses, or the phase-2 kernel is now deterministic — in both cases \
-         the positive arm above has stopped being evidence and this gate needs \
+         the positive arms above have stopped being evidence and this gate needs \
          re-deriving, not deleting"
     );
+}
+
+struct PlainArm {
+    runs: Vec<Vec<String>>,
+    /// stderr of the first replicate.
+    stderr: String,
+}
+
+/// Three replicates without --deterministic, under `envs`. Each must succeed
+/// and must not take the deterministic CPU route.
+fn plain_arm(tag: &str, envs: &[(&str, &str)]) -> PlainArm {
+    let mut runs = Vec::new();
+    let mut stderr = String::new();
+    for r in 0..3 {
+        let out = run_fixture_env(&format!("{tag}{r}"), false, envs);
+        assert!(
+            out.success,
+            "{tag} run {r} failed:\nstdout:\n{}\nstderr:\n{}",
+            out.stdout, out.stderr
+        );
+        assert_eq!(
+            det_route_count(&out.stdout),
+            0,
+            "{tag} run {r} took the deterministic CPU route without \
+             --deterministic — the routing predicate is inverted or the env is \
+             dirty:\n{}",
+            out.stderr
+        );
+        if r == 0 {
+            stderr = out.stderr.clone();
+        }
+        runs.push(loss_text(&out.stdout));
+    }
+    PlainArm { runs, stderr }
 }
 
 /// The `NSL_FLASH_BWD_CPU` escape hatch is TRI-STATE, and each state is pinned

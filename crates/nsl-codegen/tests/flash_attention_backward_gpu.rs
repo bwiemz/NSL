@@ -68,6 +68,10 @@ fn cuda_available() -> bool {
         eprintln!("skipping: NSL_SKIP_CUDA_TESTS set");
         return false;
     }
+    // These gates certify the attention kernels from before the tensor-core
+    // ones (`nsl_runtime::attention_tc`), which now serve unpacked head_dim
+    // 64 / 128 by default; pin the process to the kernels under test.
+    nsl_runtime::flash_attention::nsl_test_pin_previous_attention_kernels();
     nsl_cuda_init() == 0
 }
 

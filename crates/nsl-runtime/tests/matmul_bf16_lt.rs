@@ -30,8 +30,11 @@
 //!
 //! Process isolation: the math mode and the Lt switch resolve once per
 //! process, so the parent re-runs this binary as children — one with
-//! `NSL_MATMUL_BF16_LT=1` (engagement + correctness + determinism), one
-//! WITHOUT it (the default-off witness: zero Lt launches, same answers).
+//! `NSL_MATMUL_BF16_LT=1` (engagement + correctness + determinism), one with
+//! neither that nor timed selection (`NSL_MATMUL_BF16_LT_TUNE=0`: the GemmEx
+//! witness, zero Lt launches, same answers), and one in the DEFAULT
+//! configuration, where timed plan selection routes bf16-storage products
+//! through the tuned cublasLt plan without `--bf16-lt` (November 2026).
 
 use nsl_runtime::tensor::{
     nsl_tensor_free, nsl_tensor_matmul, nsl_tensor_to_device, nsl_tensor_wgrad_accum,
@@ -219,11 +222,42 @@ fn zz_lt_probe_child() {
 
 #[test]
 #[ignore = "spawned by lt_matmul_gates_gpu"]
+fn zz_lt_default_child() {
+    if std::env::var(PROBE).unwrap_or_default() != "default" {
+        return;
+    }
+    // bf16 mode, no NSL_MATMUL_BF16_LT, timed selection at its default (on):
+    // the tuned cublasLt plan computes the product, and it is the right one.
+    let a_data = deterministic(M * K, 431);
+    let w_data = deterministic(K * N, 433);
+    let a = gpu_2d(M, K, &a_data);
+    let w = gpu_2d(K, N, &w_data);
+    test_lt_matmul_reset();
+    let c = nsl_tensor_matmul(a, w, 0);
+    let c_host = read_gpu(c);
+    let (issued, tuned, fallbacks) = test_lt_matmul_stats();
+    assert!(
+        issued >= 1 && tuned == 1 && fallbacks == 0,
+        "default bf16 configuration: expected one timed cublasLt plan, got \
+         issued={issued} tuned={tuned} fallbacks={fallbacks}"
+    );
+    assert_sampled_product(
+        "forward-default", &c_host, &a_data, false, &w_data, M, N, K, 2048, None, 1.0,
+    );
+    nsl_tensor_free(c);
+    nsl_tensor_free(w);
+    nsl_tensor_free(a);
+    println!("LT-DEFAULT-OK");
+}
+
+#[test]
+#[ignore = "spawned by lt_matmul_gates_gpu"]
 fn zz_lt_off_child() {
     if std::env::var(PROBE).unwrap_or_default() != "off" {
         return;
     }
-    // Same bf16 mode, NO NSL_MATMUL_BF16_LT: the Lt path must never arm —
+    // Same bf16 mode, NO NSL_MATMUL_BF16_LT and timed selection OFF: the Lt
+    // path must never arm —
     // its counters are the negative witness — and the GemmEx product must
     // satisfy the same reference (the two children agreeing with one f64
     // reference is this gate's substitute for a direct cross-path compare,
@@ -239,7 +273,7 @@ fn zz_lt_off_child() {
     assert_eq!(
         (issued, fallbacks),
         (0, 0),
-        "cublasLt path moved without NSL_MATMUL_BF16_LT=1"
+        "cublasLt path moved without NSL_MATMUL_BF16_LT=1 and with timed selection off"
     );
     assert_sampled_product(
         "forward-off", &c_host, &a_data, false, &w_data, M, N, K, 2048, None, 1.0,
@@ -270,8 +304,14 @@ fn spawn_child(mode: &str, child_test: &str, expect: &str) {
         .env_remove("NSL_MATMUL_PEDANTIC")
         .env_remove("NSL_MATMUL_TF32")
         .env_remove("NSL_ASYNC_ALLOC");
-    if mode == "on" {
-        cmd.env("NSL_MATMUL_BF16_LT", "1");
+    match mode {
+        "on" => {
+            cmd.env("NSL_MATMUL_BF16_LT", "1");
+        }
+        "off" => {
+            cmd.env("NSL_MATMUL_BF16_LT_TUNE", "0");
+        }
+        _ => {}
     }
     let out = cmd.output().expect("spawn lt probe child");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -291,4 +331,5 @@ fn lt_matmul_gates_gpu() {
     }
     spawn_child("on", "zz_lt_probe_child", "LT-PROBE-OK");
     spawn_child("off", "zz_lt_off_child", "LT-OFF-OK");
+    spawn_child("default", "zz_lt_default_child", "LT-DEFAULT-OK");
 }

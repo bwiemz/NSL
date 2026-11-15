@@ -5,6 +5,12 @@ step and the same card. Every number in this document was measured on this machi
 by `tools/perfcheck/` unless it is marked as an estimate: **estimates are written in
 italics with "(est.)"**; everything else is a measurement.
 
+*Follow-up, same day (`perf/host-gemm`): GEMM kernel selection, the step-boundary drain
+and the RoPE uploads were fixed, and `--checkpoint-compress` no longer triples the step.
+NSL is 1.17x faster at 1B TF32, 1.10x at 1B bf16 (the recipe) and 1.23x at 500M TF32
+than the numbers below; see "Follow-up" near the end. The rest of this document is the
+baseline as measured.*
+
 ## Summary
 
 **Coder-1B's production recipe trains in bf16.** `models/coder1b/pretrain_prod.nsl`
@@ -563,7 +569,9 @@ removing one bottleneck changes the clock and the overlap of the rest.
   per update (paired ratio 0.33 at TF32, 0.27 at bf16) for 3.4 GiB less allocator
   peak, i.e. 1.6 s more per micro-batch. Narrowing 5.4 GiB of saved activations to
   bf16 and widening them back is ~16 GiB of memory traffic, tens of milliseconds at
-  this card's bandwidth. Not traced; the cause is open.
+  this card's bandwidth. Not traced; the cause is open. *(Traced and fixed on
+  `perf/host-gemm`: the backward lost the forward's saved logsumexp and recomputed it;
+  see the follow-up section below.)*
 - **`NSL_MATMUL_BF16` is read at build time on `main`** (`MatmulConfig::
   with_env_fallback`; the runtime ignores the variable by design, see
   `resolve_math_mode_from`). `models/benchmarks/posture_bench_1b.py`'s P4 arm runs
@@ -571,10 +579,279 @@ removing one bottleneck changes the clock and the overlap of the rest.
   env, same artifact, different run": on today's toolchain that arm silently measures
   TF32. `pretrain_prod.nsl`'s `export NSL_MATMUL_BF16=1; nsl run ...` still works,
   because `nsl run` compiles in the same process. This harness builds the bf16 arms
-  with the variable set and refuses a run whose banner does not say BF16.
+  with the variable set and refuses a run whose banner does not say BF16. *(On
+  `perf/host-gemm` a binary run with a disagreeing `NSL_MATMUL_BF16` refuses to start,
+  and P4 builds its own `--matmul-mode bf16` artifact.)*
 - **The per-micro-batch drain** (`nsl_gpu_drain_cache` after every micro-batch,
   `stmt_train/driver.rs`) returns ~9.6 GB to the driver and re-allocates it each
-  micro-batch at 1B; its own comment calls it a workaround.
+  micro-batch at 1B; its own comment calls it a workaround. *(On `perf/host-gemm` the
+  boundary releases memory only when the pool holds markedly more than the step
+  needed; see below.)*
+
+## Follow-up: host stalls, GEMM selection, compressed saves (`perf/host-gemm`, 2026-11-14)
+
+Changes against the third and fifth items above and the defects list, each measured
+on its own. Every toolchain was frozen (compiler, runtime archive, stdlib) and timed in
+the same interleaved rounds with `perfcheck --toolchain NAME=DIR` (arms
+`nsl_tf32@NAME`, `nsl_bf16@NAME`, the production flag set; `nsl_bf16` is built with
+`NSL_MATMUL_BF16=1`, how the 1B recipe trains); ratios are paired within a round, then
+the median over rounds. `before` is this document's runtime (`main` at 565567c5); each
+later toolchain adds one change to the one before it:
+
+| toolchain | change | commit |
+|---|---|---|
+| `c1` | RoPE positions gathered from a device-resident iota, not uploaded per call | 4b827951 |
+| `c2` | the step boundary releases idle GPU memory only from a bloated pool | fa10886e |
+| `c3` | TF32 GEMMs through cublasLt with an enumerated, timed plan per shape | 52c07d7d |
+| `c4` | `--checkpoint-compress` keeps the flash forward's saved logsumexp | 018fd86c |
+| `c5` | bf16-storage GEMMs take the timed plan too; large-tile whitelist, cheaper tune | e6b126fe |
+
+The run-time `NSL_MATMUL_BF16` refusal (263888b6) changes no arithmetic and is not
+timed; 49b0c43b caps the timed selection at 128 shapes per process (no effect on these
+programs, which have 15).
+
+### Results
+
+Three rounds; tok/s is the median [min-max] over rounds; each ratio is taken within a
+round against the toolchain above it (per-round values, then the median), and the last
+column against `before`. The rounds ran beside another worker's GPU jobs, which moved
+every arm together by up to 6% between rounds; the paired ratios cancel that.
+
+**Coder-1B** (2 x 2048 x 4):
+
+| `nsl_tf32` | tok/s | vs the row above, per round | median | vs `before` |
+|---|---|---|---|---|
+| `before` | 5,035 [4,759-5,050] | | | |
+| `c1` RoPE positions | 5,046 [4,742-5,057] | 0.997 1.002 1.002 | 1.002 | 1.002 |
+| `c2` drain | 5,111 [4,874-5,187] | 1.028 1.013 1.026 | 1.026 | 1.024 |
+| `c3` TF32 GEMMs | 5,886 [5,595-5,915] | 1.148 1.152 1.140 | 1.148 | **1.171** |
+| `c5` bf16 GEMMs, cheaper tune | 5,900 [5,551-5,912] | 0.992 1.002 0.999 | 0.999 | **1.171** |
+
+| `nsl_bf16` (the 1B recipe) | tok/s | vs the row above, per round | median | vs `before` |
+|---|---|---|---|---|
+| `before` | 6,721 [6,422-6,741] | | | |
+| `c1` | 6,672 [6,361-6,759] | 0.991 1.003 0.993 | 0.993 | 0.993 |
+| `c2` | 6,957 [6,501-6,980] | 1.022 1.029 1.046 | 1.029 | 1.032 |
+| `c3` | 6,971 [6,531-7,014] | 1.005 1.002 1.005 | 1.005 | 1.034 |
+| `c5` | 7,388 [6,820-7,390] | 1.044 1.060 1.053 | 1.053 | **1.096** |
+
+**Coder-500M** (2 x 1024 x 8):
+
+| `nsl_tf32` (the 500M recipe's precision) | tok/s | vs the row above, per round | median | vs `before` |
+|---|---|---|---|---|
+| `before` | 8,942 [8,349-9,030] | | | |
+| `c1` | 9,033 [8,496-9,061] | 1.003 1.018 1.010 | 1.010 | 1.010 |
+| `c2` | 9,480 [8,927-9,514] | 1.050 1.051 1.049 | 1.050 | 1.060 |
+| `c3` | 11,039 [10,383-11,076] | 1.164 1.163 1.164 | 1.164 | **1.234** |
+| `c5` | 11,078 [10,267-11,079] | 1.000 0.989 1.004 | 1.000 | **1.230** |
+
+| `nsl_bf16` | tok/s | vs the row above, per round | median | vs `before` |
+|---|---|---|---|---|
+| `before` | 11,560 [10,719-11,605] | | | |
+| `c1` | 11,008 [10,989-11,765] | 1.025 0.952 1.014 | 1.014 | 1.014 |
+| `c2` | 12,337 [11,594-12,392] | 1.055 1.121 1.053 | 1.055 | 1.068 |
+| `c3` | 12,458 [11,652-12,507] | 1.005 1.010 1.009 | 1.009 | 1.078 |
+| `c5` | 13,073 [12,245-13,150] | 1.051 1.049 1.051 | 1.051 | **1.133** |
+
+Memory: the allocator peaks do not move (24.63 / 26.53 GiB at 1B TF32 / bf16, 12.72 /
+13.70 GiB at 500M, every toolchain). The driver-reported peak moves by -0.04 to +0.04
+GiB at 1B and by +0.29 GiB at 500M TF32 (14.15 to 14.44: the pool now keeps its working
+set, +0.21 GiB reserved, and TF32 runs now hold the 64 MiB cublasLt workspace); 500M
+bf16 +0.03.
+
+**The RoPE change on its own is at the noise floor.** Against the toolchain before it,
+it is +1.0% at 500M TF32 (all three rounds positive) and between -0.7% and +1.4% on the
+other arms. Measured again on top of everything else (`c5` against `c5` with the iota
+path disabled, three more rounds): 1B 1.007 [0.987-1.023] TF32 and 0.999 [0.995-1.002]
+bf16, 500M 0.998 [0.998-1.000] TF32 and 1.009 [1.008-1.065] bf16. It removes 128
+device synchronisations per micro-batch, but the host was already ahead of the GPU
+there, so they cost the GPU little; it is kept for the 500M gain and because the
+copies it removes become a larger share as the attention kernels get faster.
+
+**`--checkpoint-compress bf16`** at 1B (`c4` against `c3`, which still has the defect):
+
+| arm | `c3` tok/s (s/update) | `c4` tok/s (s/update) | `c4` / `c3`, per round | allocator peak |
+|---|---|---|---|---|
+| TF32 + compress | 1,788 [1,684-1,790] (9.16) | 5,614 [5,288-5,619] (2.92) | 3.141 3.142 3.137 | 21.24 GiB |
+| bf16 + compress | 1,869 [1,753-1,870] (8.77) | 6,583 [6,224-6,594] (2.49) | 3.551 3.527 3.522 | 23.13 GiB |
+
+With the fix, compression costs 4.6% (TF32: 5,614 against 5,886 for `c3` without it)
+and 5.6% (bf16: 6,583 against 6,971) for 3.39 GiB less allocator peak (24.63 to 21.24
+and 26.53 to 23.13 GiB); before it cost 3x.
+
+**The first update** pays the GEMM tune once per process: at 1B TF32 it took 14.4 s
+with `c3` (11 s of tuning over 15 shapes) and 4.5 s with `c5` (about 1 s), against
+3.4 s with `before`; at 500M 1.8 s with `c5` against 1.8 s.
+
+Against PyTorch (*not paired: the PyTorch numbers are this document's, from earlier
+rounds, est.*): eager TF32 / NSL TF32 goes from 1.44x to *~1.23x* at 1B and from 1.53x
+to *~1.23x* at 500M; PyTorch bf16 + `torch.compile` / NSL bf16 at 1B from 2.23x to
+*~2.0x*. Attention (673 ms of a 3.0 s update) is now the largest single difference.
+
+### What each change does, and the evidence
+
+**RoPE positions (`c1`).** `RotaryEmbedding.forward` gathers rows `0..seq_len` of its
+cached cos/sin tables with `embedding_lookup(table, arange(0, seq_len))`. The positions
+are built on the host and were uploaded with a synchronous `cuMemcpyHtoD_v2` on every
+call: 128 per micro-batch at 1B, each waiting for the device to drain. The host-side
+bounds check now also notes whether the indices are exactly `0.0 .. n-1`; if so the
+kernel reads a device copy uploaded once per device. Same kernel, same index values,
+same output. In the 1B TF32 trace the 8 KB copies go from 12,321 per run to 34.
+
+**Step-boundary drain (`c2`).** The per-micro-batch `nsl_gpu_drain_cache` returned
+every idle transient segment to the driver (95 `cuMemFree` per micro-batch at 1B, 24 ms
+of GPU idle while the host sat in them) and the next micro-batch allocated them again.
+It was added in April 2026 when the pool grew ~3 GB per step without it. That growth no
+longer happens: with the drain off, 500M and 1B reach their working set in two or three
+micro-batches and stay flat for 192 and 96 micro-batches, with no driver allocation
+after the third (`NSL_DEBUG_MEM_ALL=1`, reserved 14,392 MB at 500M and 26,084 MB at 1B
+throughout). The boundary now releases only when the reservation exceeds the window's
+peak by more than max(1 GiB, half the window's transient demand), which never fires
+here; an allocation that fails still synchronises, drains and retries (a gate allocates
+a post-training tensor larger than any cached segment under a memory limit that fits it
+only once the idle cache is released: 7 driver frees under the limit, 0 without). The
+reserved peak moves by -0.04 GiB at 1B (25.51 to 25.47) and +0.21 GiB at 500M (13.84 to
+14.05).
+
+**TF32 GEMM selection (`c3`).** cuBLAS 13.8's `cublasSgemm` heuristic on sm_120 returns
+the 64x64-tile `cutlass_80_tensorop_s1688gemm_64x64_16x6` kernel for most of the
+projections and their gradients, and cublasLt's heuristic offers only one or two
+candidates for the NN/NT forms, both that kernel. Enumerating cublasLt's algorithm
+configurations (`cublasLtMatmulAlgoGetIds` x tile x stages, `cublasLtMatmulAlgoCheck`)
+reaches the 128x128 / 128x256 / 256x128 kernels PyTorch's cuBLAS 12.8 picks. Per call on
+random operands at 1B's shapes (ms; `gemmprobe/enum.cu` in the work directory; F/D/W
+= forward, input gradient, weight gradient):
+
+| GEMM (cuBLAS m x n x k) | sgemm | best enumerated | |
+|---|---|---|---|
+| F q, o (2048 x 4096 x 2048) | 0.62, 0.69 | 0.47, 0.47 | 1.32x, 1.47x |
+| D q, o (2048 x 4096 x 2048, A^T) | 0.61, 0.68 | 0.47, 0.48 | 1.30x, 1.40x |
+| W q, o (2048 x 2048 x 4096, B^T) | 0.67, 0.65 | 0.50, 0.50 | 1.35x, 1.28x |
+| F k/v (512 x 4096 x 2048) | 0.17 | 0.12 | 1.41x |
+| F gate/up (8192 x 4096 x 2048) | 2.02 | 1.82 | 1.11x |
+| D gate/up (2048 x 4096 x 8192) | 2.62 | 2.04 | 1.29x |
+| W gate/up (8192 x 2048 x 4096) | 2.74 | 1.95 | 1.41x |
+| F down (2048 x 4096 x 8192) | 2.80 | 2.01 | 1.39x |
+| D down (8192 x 4096 x 2048) | 1.79 | 1.79 | 1.00x |
+| W down (2048 x 8192 x 4096) | 2.84 | 1.96 | 1.45x |
+
+(Timed on random data: on zero-filled operands the same kernels run ~25% faster on this
+power-capped card, which is how an early probe under-reported the gap.) Each GEMM of at
+least 2^28 multiply-adds is now timed once per process on its live operands (the
+heuristic's candidates plus enumerated configurations, CUDA events, two rounds) and the
+winner cached; every later call of the shape replays the identical kernel. Not under
+`--deterministic` (cuBLAS's heuristic is reproducible, a timed winner is not),
+`--cuda-graphs` (the tune synchronises), or `--no-bf16-lt-tune`.
+
+**bf16 GEMMs (`c5`).** The same enumeration on bf16 operands (`gemmprobe/enum_bf16.cu`)
+against `cublasGemmEx`'s default: q/o 0.28 -> 0.24 ms, gate/up dgrad 1.26 -> 0.95, wgrad
+1.27 -> 0.94, down wgrad 1.14 -> 0.95; gate/up forward and down dgrad unchanged (0.88,
+0.90). bf16-storage products now take the timed plan by default when timed selection
+applies (before, only under `--bf16-lt`, and over the heuristic's candidates only).
+`c5` also restricts the enumeration to the five tiles every winner used and times
+each candidate once before re-timing the four fastest, which cut the 1B tune from 11 s
+of the first update (`c3`) to about 1 s with the same steady-state kernels.
+
+**Compressed saves (`c4`).** The 3x was not the casts (55 + 52 ms per update) but
+`nsl_flash_lse_f32`: 108 ms per call, 6.9 s of the 9.6 s update, a kernel the plain run
+never launches. Compression stores the attention output as bf16 and the backward reads
+a restored f32 copy; the codegen side channel that hands the backward the forward's
+saved logsumexp was keyed by the original value, so the backward got none and the
+runtime recomputed it, one thread per row over the whole key range. The side channel
+now follows both casts. On Coder-50M with the production flags the previous toolchain
+launches `nsl_flash_lse` 28 times in two updates, the fixed one never.
+
+### After, on the GPU timeline (Nsight Systems, Coder-1B, ms per update)
+
+| | TF32 before | TF32 `c5` | bf16 before | bf16 `c5` | PyTorch TF32 eager |
+|---|---|---|---|---|---|
+| wall (traced) | 3,575 | 3,031 | 2,681 | 2,434 | 2,300 |
+| GPU idle | 131 | 10 | 119 | 11 | 9 |
+| GEMM | 2,110 | 1,665 | 1,013 | 856 | 1,520 |
+| attention | 673 | 672 | 665 | 677 | 74 |
+
+The GEMMs now run `cutlass_80_tensorop_s1688gemm` 128x128 / 128x256 / 256x128 (TF32)
+and `s16816gemm_bf16` 128x128 / 256x128 (bf16) kernels. The 64x64 kernel is left on one
+batched product per layer and micro-batch (batch 2, `cublasGemmStridedBatchedEx`, which
+this change does not route: 43 ms per update). The remaining
+synchronous host-to-device copies (token ids for the embedding forward and again for
+its backward, labels, two 32 KB LM-head tables, a few scalars: about 7 per micro-batch)
+leave 10 ms of idle per update, under 1%, and were left alone.
+
+### Correctness
+
+`tools/refcheck` at 50M with the production flag set (gradient check without
+`--fuse-wgrad-accum`, which needs accumulation; optimizer check: AdamW, accumulation 4,
+clip 1.0, weight decay 0.1, schedule), relative error against the PyTorch twin, worst
+over 74 parameters [median]:
+
+| check | `before` | `c3` (TF32 GEMMs) | `c5` (bf16 GEMMs too) |
+|---|---|---|---|
+| gradient, TF32 | 2.56e-3 [1.40e-3] | 2.61e-3 [1.41e-3] | 2.62e-3 [1.41e-3] |
+| gradient, bf16 | 6.31e-3 [4.46e-3] | 6.23e-3 [4.43e-3] | 6.30e-3 [4.41e-3] |
+| 3 AdamW updates, TF32 | 4.03e-3 [2.37e-3] | 3.94e-3 [2.38e-3] | 3.95e-3 [2.37e-3] |
+| 3 AdamW updates, bf16 | 9.45e-3 [7.20e-3] | 9.01e-3 [7.23e-3] | 9.43e-3 [7.23e-3] |
+
+The bf16 gradient check exceeds the tool's 5e-3 default tolerance (a TF32 number)
+before and after alike: bf16 operands keep 8 significant bits.
+
+### Reproducing the follow-up
+
+Raw results, logs, traces and the probes are in
+`/mnt/extrastorage/nsl-audit/research/work/PERF-HOST-GEMM/` on the measuring machine
+(`runs/`, `gemmprobe/`, `campaign2.sh`, `campaign3.sh`). A toolchain is frozen as a
+directory holding `bin/nsl`, the CUDA runtime archive as `lib/libnsl_runtime.a` and
+`stdlib/`; then, per size and round, each command one queued GPU job:
+
+```bash
+P="VENV/bin/python tools/perfcheck/perfcheck.py"; T="--toolchain before=DIR0 --toolchain c1=DIR1 ..."
+$P build --size 1b --arms nsl_tf32@before,nsl_tf32@c1,... $T --out OUT
+$P run --size 1b --arms nsl_tf32@before,nsl_tf32@c1,... --round 0 --out OUT
+$P pairs --out OUT --pair nsl_tf32@c1/nsl_tf32@before --pair nsl_tf32@c2/nsl_tf32@c1
+$P nsys --size 1b --arm nsl_tf32@c5 --out OUT
+```
+
+## Both rounds together, against `main` and PyTorch (`perf/round-1`, 2026-11-15)
+
+`perf/host-gemm` (above) and the tensor-core attention
+(`ATTENTION_TC_2026_11.md`) combined, timed against `main` at c92f9300 (`before`)
+with the PyTorch arms in the same rounds: frozen toolchains, production flags, three
+interleaved rounds, arm order reversed in the second round, ratios paired within a
+round, then the median [min-max] over rounds.
+
+| arm | Coder-1B tok/s | driver peak GiB | Coder-500M tok/s | driver peak GiB |
+|---|---|---|---|---|
+| `nsl_tf32@before` | 5,067 [5,066-5,068] | 25.83 | 8,952 [8,932-8,966] | 14.15 |
+| `nsl_tf32@after` | 7,245 [7,121-7,269] | 25.87 | 12,758 [12,729-13,066] | 14.44 |
+| `torch_tf32_eager_sel` | 7,335 [7,292-7,369] | 25.55 | 13,842 [13,809-14,009] | 12.12 |
+| `nsl_bf16@before` | 6,778 [6,739-6,793] | 27.75 | 11,639 [11,627-11,705] | 15.14 |
+| `nsl_bf16@after` | 9,619 [9,572-9,650] | 27.79 | 15,593 [15,568-15,632] | 15.17 |
+| `torch_bf16_compile_sel` | 15,209 [15,050-15,229] | 22.25 | 25,121 [25,079-25,342] | 11.38 |
+
+| paired ratio | Coder-1B | Coder-500M |
+|---|---|---|
+| `nsl_tf32@after / nsl_tf32@before` | **1.430** [1.405-1.434] | **1.423** [1.422-1.463] |
+| `nsl_bf16@after / nsl_bf16@before` | **1.420** [1.416-1.424] | **1.338** [1.336-1.341] |
+| `torch_tf32_eager_sel / nsl_tf32@after` | 1.014 [1.012-1.024] | 1.085 [1.072-1.085] |
+| `torch_bf16_compile_sel / nsl_bf16@after` | 1.578 [1.572-1.581] | 1.614 [1.608-1.621] |
+| `torch_bf16_compile_sel / nsl_bf16@before` | 2.239 [2.233-2.247] | 2.158 [2.157-2.165] |
+
+At TF32 NSL now matches eager PyTorch at 1B (1.4% behind, at the same memory: 25.87
+against 25.55 GiB) and is 8.5% behind at 500M, where it holds 2.3 GiB more (14.44
+against 12.12 GiB). Against compiled PyTorch in bf16, the 1B recipe's posture, the
+gap is 1.58x (it was 2.24x), and NSL holds 5.5 GiB more at its peak. What remains is
+the work bf16 activation storage removes (NSL stores activations in f32 and casts
+both operands of every GEMM: 322 ms of casts and strided copies per 1B update in the
+baseline trace) and the elementwise and norm kernels torch.compile fuses.
+
+Agreement with PyTorch at 50M (`tools/refcheck`, production flags), `before` / `after`:
+`grad_check` TF32 worst relative error 2.55e-3 / 2.30e-3 (tolerance 5e-3), bf16
+6.34e-3 / 6.16e-3 (both above the 5e-3 default, which is set for TF32 operands; see
+`tools/refcheck/README.md`); `optimizer_check` TF32 4.02e-3 / 3.59e-3, bf16 9.33e-3 /
+9.08e-3 (tolerance 3e-2).
+
+Raw results: `/mnt/extrastorage/nsl-audit/research/work/PERF-ROUND1/` on the measuring
+machine (`campaign.sh`, `refcheck.sh`, `runs/`).
 
 ## Reproduce
 
