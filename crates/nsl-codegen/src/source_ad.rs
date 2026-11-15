@@ -3322,6 +3322,29 @@ impl<'a> WengertExtractor<'a> {
         id
     }
 
+    /// The trainable parameter (its name) a gradient into `v` would reach,
+    /// if any: a walk back over the tape so far along the edges the AD rules
+    /// differentiate (an embedding's table, not its indices; nothing through
+    /// a shape read) to the `Param` leaves, trainable as `stmt.rs` decides
+    /// (`is_trainable_param_leaf_name`).
+    fn trainable_param_behind(&self, v: VarId) -> Option<String> {
+        let producers: HashMap<VarId, &WengertOp> = self.list.ops.iter().map(|o| (o.result, o)).collect();
+        let mut stack = vec![v];
+        let mut seen = HashSet::new();
+        while let Some(v) = stack.pop() {
+            if !seen.insert(v) {
+                continue;
+            }
+            let Some(op) = producers.get(&v) else { continue };
+            match &op.op {
+                PrimalOp::Param(name) if crate::stmt::is_trainable_param_leaf_name(name) => return Some(name.clone()),
+                PrimalOp::Param(_) => {}
+                _ => stack.extend(crate::ad_rules::apply_ad_rule(op, v).into_iter().map(|a| a.input_var)),
+            }
+        }
+        None
+    }
+
     /// Push a WengertOp and auto-tag its result VarId with the correct WengertType.
     fn push_op(&mut self, op: WengertOp) {
         let ty = type_for_op(&op.op);
@@ -6180,7 +6203,26 @@ impl<'a> WengertExtractor<'a> {
                     "tensor_cos" | "cos" => PrimalOp::Passthrough("cos".into()),
                     "tensor_sin" | "sin" => PrimalOp::Passthrough("sin".into()),
                     "rotate_half" => PrimalOp::Passthrough("rotate_half".into()),
-                    "rope" => PrimalOp::Passthrough("rope".into()),
+                    "rope" => {
+                        // rope's adjoint differentiates x only: its tables are
+                        // the model's position constants (ad_rules.rs). A
+                        // table computed from a trainable parameter needs a
+                        // gradient too; tape AD gets one (the runtime records
+                        // the decomposition), here it would be dropped
+                        // without a word. Refuse instead.
+                        if let Some(p) = input_vars.iter().skip(1).take(2).find_map(|&t| self.trainable_param_behind(t)) {
+                            self.pending_refusal = Some(format!(
+                                "rope(x, cos, sin): a position table is computed from the \
+                                 trainable parameter `{p}`, but rope's adjoint differentiates x \
+                                 only (the tables are position constants), so source AD would \
+                                 drop that parameter's gradient. Make the table a `_`-prefixed \
+                                 (non-trainable) field or compute it from constants, or train \
+                                 without source AD (tape AD differentiates the tables)."
+                            ));
+                            return None;
+                        }
+                        PrimalOp::Passthrough("rope".into())
+                    }
                     // Tensor construction (non-differentiable). An f64-annotated
                     // creation (C5 step 3) never gets here: `extract_expr`
                     // refuses every f64-typed expression.

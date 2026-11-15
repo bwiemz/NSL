@@ -287,3 +287,91 @@ fn cached_tables_are_not_trainable_parameters() {
         "expected the RoPE tables to be classified as ignored config tensors: {summary}"
     );
 }
+
+/// The `rope` builtin's source-AD adjoint differentiates `x` only: its tables
+/// are position constants. A table computed from a TRAINABLE parameter (a
+/// field without the `_` prefix, directly or through other ops) would get no
+/// gradient there while tape AD gives it one, so source AD refuses the
+/// program instead of dropping it. The same program with a `_` table trains.
+#[test]
+fn rope_with_a_table_from_a_trainable_parameter_is_refused_under_source_ad() {
+    let src = |cos: &str| {
+        format!(
+            "from nsl.nn.losses import mse_loss\n\
+             \n\
+             model R:\n\
+             \x20   w: Tensor = full([4, 4], 0.1)\n\
+             \x20   cos_t: Tensor = full([4, 4], 0.5)\n\
+             \x20   _cos_c: Tensor = full([4, 4], 0.5)\n\
+             \x20   _sin_c: Tensor = full([4, 4], 0.25)\n\
+             \n\
+             \x20   fn forward(self, x: Tensor) -> Tensor:\n\
+             \x20       let h = (x @ self.w).reshape([1, 1, 4, 4])\n\
+             \x20       return rope(h, {cos}, self._sin_c)\n\
+             \n\
+             let m = R()\n\
+             let x = full([4, 4], 1.0)\n\
+             let y = full([1, 1, 4, 4], 0.0)\n\
+             \n\
+             train(model = m, epochs = 1):\n\
+             \x20   optimizer: SGD(lr = 0.001)\n\
+             \x20   step(batch):\n\
+             \x20       let loss = mse_loss(m.forward(x), y)\n\
+             \x20   callbacks:\n\
+             \x20       on_step(step, loss):\n\
+             \x20           print(loss)\n"
+        )
+    };
+    // The binary cargo built for this test run (`run_nsl` prefers an existing
+    // target/release/nsl, which can predate the compiler under test).
+    let run = |name: &str, src: &str| {
+        let dir = std::env::temp_dir().join(format!("nsl_rope_cache_gate_{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join(format!("{name}.nsl"));
+        std::fs::write(&path, src).expect("write fixture");
+        let out = Command::new(env!("CARGO_BIN_EXE_nsl"))
+            .args(["run", "--source-ad"])
+            .arg(&path)
+            .env("NSL_STDLIB_PATH", repo_root().join("stdlib"))
+            .output()
+            .expect("run nsl");
+        let _ = std::fs::remove_dir_all(&dir);
+        (String::from_utf8_lossy(&out.stdout).to_string(), String::from_utf8_lossy(&out.stderr).to_string(), out.status.success())
+    };
+    for (name, cos) in [("direct", "self.cos_t"), ("derived", "tensor_cos(self.cos_t * 2.0)")] {
+        let (stdout, stderr, ok) = run(&format!("trainable_{name}"), &src(cos));
+        let all = format!("{stdout}{stderr}");
+        assert!(
+            !ok && all.contains("rope(x, cos, sin)") && all.contains("`m.cos_t`"),
+            "{name}: a trainable table must be refused under source AD:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+    let (stdout, stderr, ok) = run("constant_table", &src("self._cos_c"));
+    assert!(ok, "a `_` table trains under source AD:\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    // The stdlib's tables are gathered at positions read from the SHAPE of a
+    // value computed from a trainable weight: a shape read and an
+    // embedding's indices carry no gradient, so this is not refused.
+    let stock = "from nsl.nn.losses import mse_loss\n\
+                 from nsl.nn.rope import RotaryEmbedding\n\
+                 \n\
+                 model R:\n\
+                 \x20   w: Tensor = full([4, 4], 0.1)\n\
+                 \x20   rot: RotaryEmbedding = RotaryEmbedding(4, 8, 10000.0)\n\
+                 \n\
+                 \x20   fn forward(self, x: Tensor) -> Tensor:\n\
+                 \x20       let h = (x @ self.w).reshape([1, 1, 4, 4])\n\
+                 \x20       let s = h.shape\n\
+                 \x20       return self.rot.forward(h, s[2])\n\
+                 \n\
+                 let m = R()\n\
+                 let x = full([4, 4], 1.0)\n\
+                 let y = full([1, 1, 4, 4], 0.0)\n\
+                 \n\
+                 train(model = m, epochs = 1):\n\
+                 \x20   optimizer: SGD(lr = 0.001)\n\
+                 \x20   step(batch):\n\
+                 \x20       let loss = mse_loss(m.forward(x), y)\n";
+    let (stdout, stderr, ok) = run("stock_rotary", stock);
+    assert!(ok, "the stdlib RotaryEmbedding trains under source AD:\nstdout:\n{stdout}\nstderr:\n{stderr}");
+}
