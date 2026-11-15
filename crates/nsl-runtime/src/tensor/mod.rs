@@ -2803,13 +2803,21 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
     // Device-resident indices stay unchecked — validating them would mean a
     // D2H copy plus a sync on every lookup. That gap is real; it is not new,
     // and it is not closed here.
+    //
+    // The same pass notes whether the indices are exactly `0, 1, ..., n-1` as
+    // f32 (`arange(0, n)`, RotaryEmbedding's gather): the GPU arm then reads a
+    // device-resident copy of those values instead of uploading them, which
+    // is a synchronous host-to-device copy per call. Exact float equality, so
+    // only the vector the device copy holds qualifies.
+    let mut host_iota = false;
     if indices.device == 0 && weight.ndim == 2 {
         let rows = unsafe { *weight.shape.add(0) };
         let n = unsafe { *indices.shape.add(0) } as usize;
         // `read_index(i)` reads storage linearly: check the indices in their
         // logical order, which a strided (or expanded) view's storage is not.
-        with_row_major([indices_ptr], |[idx_rm]| {
+        host_iota = with_row_major([indices_ptr], |[idx_rm]| {
             let indices = NslTensor::from_ptr_ref(idx_rm);
+            let mut iota = indices.dtype == 1;
             for i in 0..n {
                 let raw_idx = indices.read_index(i);
                 if raw_idx < 0 || raw_idx >= rows {
@@ -2819,7 +2827,11 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
                     );
                     std::process::abort();
                 }
+                if iota && unsafe { *indices.data_f32().add(i) } != i as f32 {
+                    iota = false;
+                }
             }
+            iota
         });
     }
 
@@ -2827,7 +2839,7 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
     if weight.device > 0 {
         #[cfg(feature = "cuda")]
         {
-            let out_ptr = crate::cuda::gpu_embedding_lookup(weight_ptr, indices_ptr);
+            let out_ptr = crate::cuda::gpu_embedding_lookup(weight_ptr, indices_ptr, host_iota);
             // Tape record on the GPU arm — mirrors the CPU record site below
             // (weight and indices saved with refcount bumps for backward).
             if autodiff::is_recording() {
