@@ -31,6 +31,7 @@ import itertools
 import json
 import re
 import sqlite3
+import statistics
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -267,6 +268,93 @@ def summarise(
     return res
 
 
+def copy_sizes(db: Path, windows: list[tuple[int, int]]) -> list[tuple[str, int, float]]:
+    """(direction, bytes, copies per update) for every memcpy size seen in the windows."""
+    con = sqlite3.connect(db)
+    kinds = {1: "HtoD", 2: "DtoH", 8: "DtoD"}
+    counts: dict[tuple[str, int], int] = defaultdict(int)
+    rows = con.execute("select start, bytes, copyKind from CUPTI_ACTIVITY_KIND_MEMCPY").fetchall()
+    for start, nbytes, kind in rows:
+        if any(lo <= start < hi for lo, hi in windows):
+            counts[(kinds.get(kind, str(kind)), nbytes)] += 1
+    n = len(windows)
+    return [(d, b, c / n) for (d, b), c in sorted(counts.items(), key=lambda kv: -kv[1])]
+
+
+def sequence(
+    db: Path,
+    boundary: str,
+    skip: int,
+    gap_ms: float,
+    marks: tuple[str, str, str, str],
+    layer_mark: str,
+) -> tuple[list[Interval], list[Interval]]:
+    """Kernels of the middle steady update's first forward, and of its first backward
+    between the first two kernels matching `layer_mark` (one layer of backward)."""
+    kernels, _, _ = load(db)
+    ends = update_ends(kernels, boundary, int(gap_ms * 1e6))[skip:]
+    lo, hi = ends[len(ends) // 2 - 1], ends[len(ends) // 2]
+    cuts = phase_cuts(within(kernels, lo, hi), lo, hi, marks[0], marks[1], marks[2])
+    fwd = next(c for c in cuts if c[0] == "fwd")
+    bwd = next(c for c in cuts if c[0] == "bwd")
+    bk = within(kernels, bwd[1], bwd[2])
+    hits = [i for i, k in enumerate(bk) if re.search(layer_mark, k.name, re.IGNORECASE)]
+    layer = bk[hits[0] + 1 : hits[1] + 1] if len(hits) >= 2 else []
+    return within(kernels, fwd[1], fwd[2]), layer
+
+
+ROLES = ("q", "k", "v", "o", "gate", "up", "down")
+
+
+def layer_tables(
+    db: Path,
+    boundary: str,
+    skip: int,
+    gap_ms: float,
+    marks: tuple[str, str, str, str],
+    n_layers: int,
+    layer_mark: str,
+) -> dict[str, float]:
+    """Medians over every layer and micro-batch of the steady window, in us:
+
+    * per projection GEMM of the forward. Both frameworks issue a layer's forward GEMMs
+      in the order q, k, v, o, gate, up, down, and the 16 layers come before the LM
+      head, so the forward's first 7 x n_layers GEMMs are the projections in order;
+    * the attention-category kernel time of the forward, per layer;
+    * per backward layer (the span between two `layer_mark` kernels): all its GEMM
+      time, and its six longest GEMMs (the FFN's three data and three weight
+      gradients at these shapes).
+    """
+    kernels, _, _ = load(db)
+    ends = update_ends(kernels, boundary, int(gap_ms * 1e6))
+    roles: dict[str, list[float]] = defaultdict(list)
+    attn_fwd: list[float] = []
+    bwd_gemm: list[float] = []
+    bwd_top6: list[float] = []
+    for lo, hi in itertools.pairwise(ends[skip:]):
+        for label, s0, s1 in phase_cuts(within(kernels, lo, hi), lo, hi, *marks[:3]):
+            ks = within(kernels, s0, s1)
+            if label == "fwd":
+                gemms = [k for k in ks if category(k.name) == "gemm"][: 7 * n_layers]
+                for i, k in enumerate(gemms):
+                    roles[ROLES[i % 7]].append((k.end - k.start) / 1e3)
+                attn = sum(k.end - k.start for k in ks if category(k.name) == "attention")
+                attn_fwd.append(attn / 1e3 / n_layers)
+            elif label == "bwd":
+                hits = [i for i, k in enumerate(ks) if re.search(layer_mark, k.name, re.IGNORECASE)]
+                for i0, i1 in itertools.pairwise(hits):
+                    g = sorted(((k.end - k.start) / 1e3 for k in ks[i0 + 1 : i1 + 1]
+                                if category(k.name) == "gemm"), reverse=True)  # fmt: skip
+                    bwd_gemm.append(sum(g))
+                    bwd_top6.append(sum(g[:6]))
+    med = statistics.median
+    out = {f"fwd_{r}_us": med(v) for r, v in roles.items()}
+    out["fwd_attention_per_layer_us"] = med(attn_fwd)
+    out["bwd_layer_gemm_us"] = med(bwd_gemm)
+    out["bwd_layer_top6_gemm_us"] = med(bwd_top6)
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -281,6 +369,21 @@ def main() -> int:
     ap.add_argument("--recompute", default="", help="regex: forward kernels seen in a backward")
     ap.add_argument("--top", type=int, default=30)
     ap.add_argument("--json", type=Path)
+    ap.add_argument("--copies", action="store_true", help="memcpy counts by direction and size")
+    ap.add_argument(
+        "--sequence",
+        type=int,
+        default=0,
+        help="print the first N kernels of a mid-window forward, and one backward layer "
+        "(between the first two `--layer-mark` kernels); needs --fwd-start/--bwd-start",
+    )
+    ap.add_argument("--layer-mark", default="flash|fmha|attn_bwd")
+    ap.add_argument(
+        "--layers",
+        type=int,
+        default=0,
+        help="number of transformer layers: print per-projection and per-layer medians",
+    )
     a = ap.parse_args()
     marks = None
     if a.fwd_start and a.bwd_start:
@@ -316,6 +419,27 @@ def main() -> int:
     print("\n| API | ms/update | calls/update |\n|---|---|---|")
     for x in res["api"]:
         print(f"| {x['name']} | {x['ms']:.2f} | {x['count']:.0f} |")
+    if a.copies:
+        kernels, _, _ = load(a.trace)
+        ends = update_ends(kernels, a.boundary, int(a.gap_ms * 1e6))
+        windows = list(itertools.pairwise(ends[a.skip :]))
+        print("\n| memcpy | bytes | per update |\n|---|---|---|")
+        for d, nbytes, c in copy_sizes(a.trace, windows)[:12]:
+            print(f"| {d} | {nbytes:,} | {c:.1f} |")
+    if a.sequence and marks is not None:
+        fwd, layer = sequence(a.trace, a.boundary, a.skip, a.gap_ms, marks, a.layer_mark)
+        print("\nforward, first kernels of one micro-batch (us):")
+        for k in fwd[: a.sequence]:
+            print(f"  {(k.end - k.start) / 1e3:9.1f}  {k.name[:100]}")
+        print(f"\none backward layer ({len(layer)} kernels, us):")
+        for k in layer:
+            print(f"  {(k.end - k.start) / 1e3:9.1f}  {k.name[:100]}")
+    if a.layers and marks is not None:
+        lt = layer_tables(a.trace, a.boundary, a.skip, a.gap_ms, marks, a.layers, a.layer_mark)
+        res["layer_medians_us"] = lt
+        print("\n| per layer, median over the window | us |\n|---|---|")
+        for k, v in lt.items():
+            print(f"| {k} | {v:.1f} |")
     if a.json:
         a.json.write_text(json.dumps(res, indent=1))
     return 0
