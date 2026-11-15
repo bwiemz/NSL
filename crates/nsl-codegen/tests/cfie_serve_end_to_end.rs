@@ -142,11 +142,26 @@ fn runtime_call_counts(src: &str) -> std::collections::HashMap<String, usize> {
         })
         .collect();
 
+    // On Apple Silicon the codegen is PIC (see `compiler/mod.rs`), so a call
+    // to a runtime function loads its address from the GOT — `adrp` + `ldr`,
+    // two relocations — and then `blr`s it. Skip the low-12-bit half of the
+    // pair so a call site counts once on every host, not twice on macOS.
+    let low_half_of_page_pair = |reloc: &object::Relocation| {
+        file.architecture() == object::Architecture::Aarch64
+            && matches!(
+                reloc.flags(),
+                object::RelocationFlags::MachO { r_type, .. }
+                    if r_type == object::macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12
+                        || r_type == object::macho::ARM64_RELOC_PAGEOFF12
+            )
+    };
+
     let mut called = std::collections::HashMap::new();
     for section in file.sections() {
         for (_offset, reloc) in section.relocations() {
             if let object::RelocationTarget::Symbol(idx) = reloc.target()
                 && let Some(name) = name_by_index.get(&idx)
+                && !low_half_of_page_pair(&reloc)
             {
                 *called.entry(name.clone()).or_insert(0) += 1;
             }
