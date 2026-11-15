@@ -276,6 +276,19 @@ train(model=m, epochs=8, grad_accumulation=4{precision}):
 
 const ATTN_PLANNED: &str = "[bf16-storage] 2 attention half(s) stored bf16";
 
+/// The 500M recipe's attention: dropout 0.1 after the output projection.
+#[test]
+fn an_attention_half_with_a_dropout_tail_is_planned() {
+    let src = attention_fixture(BF16, false)
+        .replace("GroupedQueryAttention(128, 2, 1, 64, 0.0, 64, 10000.0, 2)", "GroupedQueryAttention(128, 2, 1, 64, 0.1, 64, 10000.0, 2)");
+    assert!(src.contains("64, 0.1, 64"), "fixture edit did not apply");
+    let mut args = vec!["build"];
+    args.extend_from_slice(PROD);
+    let r = nsl(&args, &src, "plan_attn_dropout", false, &[]);
+    assert!(r.ok, "precision=\"bf16\" build with attention dropout failed:\n{}", r.out);
+    assert!(r.out.contains(ATTN_PLANNED), "the attention halves were not planned:\n{}", r.out);
+}
+
 #[test]
 fn both_attention_halves_are_planned_with_the_mlp_halves() {
     let mut args = vec!["build"];

@@ -319,7 +319,12 @@ fn find_attention_seeds(primal: &WengertList) -> (Vec<VarId>, Vec<VarId>) {
         seeds.push(n);
         seeds.extend(gemms.iter().copied());
         seeds.extend(ropes);
-        seeds.push(wo);
+        // Stored bf16 when it feeds the residual add directly. Behind a
+        // training dropout (f32-only kernel) the general rules write it f32,
+        // as the MLP's down projection.
+        if rd.get(&wo).is_some_and(|rs| !rs.is_empty() && rs.iter().all(|o| matches!(o.op, PrimalOp::Add))) {
+            seeds.push(wo);
+        }
     }
     seeds.sort_unstable();
     seeds.dedup();
