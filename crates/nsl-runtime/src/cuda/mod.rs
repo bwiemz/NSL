@@ -60,15 +60,25 @@ pub fn test_bf16_cast_cache_reset() {
     bf16_cast_cache::reset_for_test()
 }
 
-/// Test-only views of the cublasLt matmul path, same shape as the cast-cache
-/// pair above: the gate observes (issued, tuned, fallbacks) and resets the
-/// plan cache between checks.
 /// Test-only: how many bf16 contiguous copies took the widen/copy/narrow path.
 #[cfg(all(feature = "cuda", feature = "test-hooks"))]
 pub fn test_storage_copy_regional_count() -> u64 {
     storage_copy::regional_count()
 }
 
+/// Test-only: arm (and clear) or disarm the fused LM head's logits probe,
+/// returning what it recorded: per logits chunk, in call order, whether it
+/// was the backward's recompute, whether its GEMM took the bf16 head, and
+/// the chunk's f32 bits.
+#[cfg(all(feature = "cuda", feature = "test-hooks"))]
+pub fn test_lce_logits_probe(arm: bool) -> Vec<(bool, bool, Vec<u32>)> {
+    fused_ce_kernels::logits_probe::ARMED.store(arm, std::sync::atomic::Ordering::Relaxed);
+    std::mem::take(&mut *fused_ce_kernels::logits_probe::CHUNKS.lock().expect("probe lock"))
+}
+
+/// Test-only views of the cublasLt matmul path, same shape as the cast-cache
+/// pair above: the gate observes (issued, tuned, fallbacks) and resets the
+/// plan cache between checks.
 #[cfg(all(feature = "cuda", feature = "test-hooks"))]
 pub fn test_lt_matmul_stats() -> (u64, u64, u64) {
     lt_matmul::stats()

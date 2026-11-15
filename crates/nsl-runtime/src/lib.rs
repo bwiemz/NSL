@@ -165,7 +165,7 @@ pub use cuda::test_set_transpose_views;
 #[cfg(all(feature = "cuda", feature = "test-hooks"))]
 pub use cuda::{test_bf16_cast_cache_reset, test_bf16_cast_cache_stats};
 #[cfg(all(feature = "cuda", feature = "test-hooks"))]
-pub use cuda::{test_lt_matmul_reset, test_lt_matmul_stats, test_lt_matmul_tf32_stats, test_storage_copy_regional_count};
+pub use cuda::{test_lce_logits_probe, test_lt_matmul_reset, test_lt_matmul_stats, test_lt_matmul_tf32_stats, test_storage_copy_regional_count};
 #[cfg(all(feature = "cuda", feature = "test-hooks"))]
 pub use cuda::{test_kernel_launch_census_arm, test_kernel_launch_count};
 
