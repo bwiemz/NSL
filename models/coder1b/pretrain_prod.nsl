@@ -151,10 +151,14 @@
 # refuse instead of defaulting).
 #
 # RESUME (item 8 / PR #516): `epochs` is the run TOTAL, so an interrupted run
-# is resumed by re-running this file UNCHANGED with checkpoint_load= added —
-# the training epoch, the DataLoader's delivery slot and every RNG stream are
-# restored, and a corpus or `--seed` mismatch refuses rather than silently
-# training a different stream.
+# is resumed by re-running this file UNCHANGED with
+# checkpoint_load="checkpoints/pretrain_prod_state.nslm" added to the train
+# header — the training epoch, the DataLoader's delivery slot and every RNG
+# stream are restored, and a corpus or `--seed` mismatch refuses rather than
+# silently training a different stream. A fresh run leaves it out: the loader
+# aborts on a missing file rather than silently starting over. (Until 2026-11
+# the header carried it, so a fresh start aborted; the precision change began
+# a new checkpoint chain in any case, since `act=bf16` refuses older ones.)
 #
 # USE THE SAME FLAG SET AND CONFIG on the resume — and this IS now enforced:
 # #519's execution fingerprint refuses arithmetic compile-flag drift (dropping
@@ -372,7 +376,7 @@ print("LOSS_STREAM_BEGIN")
 # the absence of a `[fused-lce] forward route=` line, and the PEAK_* block
 # below.
 @fused_lm_ce(enabled=true, vocab_size=49152, hidden_size=2048, batch_size=2, seq_len=2048)
-train(model=m, epochs=1, grad_accumulation=4, schedule_unit="optimizer_step", grad_clip=1.0, precision="bf16", checkpoint_load="checkpoints/pretrain_prod_state.nslm", checkpoint_save="checkpoints/pretrain_prod_state.nslm", checkpoint_every=2000):
+train(model=m, epochs=1, grad_accumulation=4, schedule_unit="optimizer_step", grad_clip=1.0, precision="bf16", checkpoint_save="checkpoints/pretrain_prod_state.nslm", checkpoint_every=2000):
     optimizer: AdamW(lr=0.000015, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
     scheduler: warmup_cosine(warmup_steps=2048, total_steps=1379146, min_lr=0.0000045)
     step(batch):
