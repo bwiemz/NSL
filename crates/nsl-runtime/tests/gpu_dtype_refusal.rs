@@ -98,6 +98,7 @@ struct TensorView {
 }
 
 const DTYPE_F32: i64 = 1;
+const DTYPE_FP16: i64 = 2;
 const DTYPE_BF16: i64 = 3;
 
 /// Env var naming which poisoned call the child should make.
@@ -143,6 +144,11 @@ fn require_cuda() {
 /// 2026-07-30. It runs inside the child, so its failure message reaches the
 /// parent's stderr comparison and fails the gate rather than satisfying it.
 fn assert_is_bf16_on_device(ptr: i64, what: &str) {
+    assert_is_on_device_as(ptr, DTYPE_BF16, what);
+}
+
+/// [`assert_is_bf16_on_device`] for any 16-bit dtype tag.
+fn assert_is_on_device_as(ptr: i64, dtype: i64, what: &str) {
     let v = view(ptr);
     assert_eq!(
         v.device, 1,
@@ -151,11 +157,9 @@ fn assert_is_bf16_on_device(ptr: i64, what: &str) {
         v.device
     );
     assert_eq!(
-        v.dtype,
-        DTYPE_BF16 as u16,
-        "PRODUCER-REGRESSION {what}: expected DTYPE_BF16 ({DTYPE_BF16}), got \
-         dtype={} — the producer widened the tensor and this gate would have \
-         been vacuous",
+        v.dtype, dtype as u16,
+        "PRODUCER-REGRESSION {what}: expected dtype {dtype}, got dtype={} — \
+         the producer widened the tensor and this gate would have been vacuous",
         v.dtype
     );
 }
@@ -176,6 +180,25 @@ fn bf16_gpu_from_host(dims: &[i64]) -> i64 {
     let gpu = unsafe { nsl_tensor_to_device(cpu, 1) };
     unsafe { nsl_list_free(list) };
     assert_is_bf16_on_device(gpu, "bf16_gpu_from_host");
+    gpu
+}
+
+/// Producer (c): a host f16 buffer promoted to the device, the same way as (a).
+///
+/// For the one entry point that is no longer f32-only for bf16:
+/// `nsl_tensor_contiguous` copies a bf16 device view natively
+/// (`cuda::storage_copy::contiguous_bf16`, pinned bit for bit by
+/// `bf16_storage_copy_gpu`), and still refuses every other 16-bit dtype. The
+/// bit pattern is f16 1.0 (`0x3C00`).
+fn f16_gpu_from_host(dims: &[i64]) -> i64 {
+    let n: i64 = dims.iter().product();
+    let bits: Box<[u16]> = vec![0x3C00u16; n as usize].into_boxed_slice();
+    let leaked: &'static [u16] = Box::leak(bits);
+    let list = shape_list(dims);
+    let cpu = unsafe { nsl_tensor_from_static(leaked.as_ptr() as i64, list, DTYPE_FP16) };
+    let gpu = unsafe { nsl_tensor_to_device(cpu, 1) };
+    unsafe { nsl_list_free(list) };
+    assert_is_on_device_as(gpu, DTYPE_FP16, "f16_gpu_from_host");
     gpu
 }
 
@@ -223,10 +246,13 @@ fn zz_dtype_refusal_child() {
         // exercises the guard. Highest-reach site in the change —
         // `nsl_tensor_contiguous` is called by essentially every GPU kernel
         // wrapper, the tensor tracer, and matmul operand preparation.
+        // f16, not bf16: a bf16 view is copied natively since bf16 activation
+        // storage (`cuda::storage_copy::contiguous_bf16`), so bf16 here would
+        // test a path that is no longer a refusal.
         "contiguous" => {
-            let t = bf16_gpu_from_host(&[4, 3]);
+            let t = f16_gpu_from_host(&[4, 3]);
             let transposed = unsafe { nsl_tensor_transpose(t, 0, 1) };
-            assert_is_bf16_on_device(transposed, "transposed view");
+            assert_is_on_device_as(transposed, DTYPE_FP16, "transposed view");
             let _ = unsafe { nsl_tensor_contiguous(transposed) };
         }
         // `nsl_tensor_slice`'s GPU arm, which dispatched on `device > 0` alone
@@ -282,10 +308,15 @@ fn zz_dtype_refusal_child() {
 /// Run one scenario in a fresh process and assert it was refused.
 ///
 /// Requires all three of: a non-zero exit, the `f32-only` phrase, and the
-/// offending dtype tag reported as 3. The three together are what stop a gate
-/// passing because an unrelated earlier assert fired — the failure mode
+/// offending dtype tag reported as 3 (bf16). The three together are what stop
+/// a gate passing because an unrelated earlier assert fired — the failure mode
 /// `should_panic` cannot distinguish.
 fn assert_refuses(scenario: &str, expected_operand: &str) {
+    assert_refuses_dtype(scenario, expected_operand, DTYPE_BF16);
+}
+
+/// [`assert_refuses`] with the offending dtype tag given.
+fn assert_refuses_dtype(scenario: &str, expected_operand: &str, dtype: i64) {
     let exe = std::env::current_exe().expect("test binary path");
     let out = std::process::Command::new(exe)
         .args([
@@ -310,7 +341,7 @@ fn assert_refuses(scenario: &str, expected_operand: &str) {
 
     assert!(
         !stdout.contains("GUARD-DID-NOT-FIRE"),
-        "scenario '{scenario}': the bf16 operand went straight through the f32 \
+        "scenario '{scenario}': the 16-bit operand went straight through the f32 \
          kernel — the guard is missing or was removed.\n--- child stdout ---\n\
          {stdout}\n--- child stderr ---\n{stderr}"
     );
@@ -331,8 +362,9 @@ fn assert_refuses(scenario: &str, expected_operand: &str) {
          --- child stderr ---\n{stderr}"
     );
     assert!(
-        stderr.contains("got dtype 3") || stderr.contains("dtype 3 @"),
-        "scenario '{scenario}': refusal fired but did not name bf16 (dtype 3) as \
+        stderr.contains(&format!("got dtype {dtype}"))
+            || stderr.contains(&format!("dtype {dtype} @")),
+        "scenario '{scenario}': refusal fired but did not name dtype {dtype} as \
          the offending dtype, so it may be refusing something else.\n\
          --- child stderr ---\n{stderr}"
     );
@@ -345,10 +377,12 @@ fn assert_refuses(scenario: &str, expected_operand: &str) {
 
 /// Anti-vacuity, and the only gate here that runs in-process.
 ///
-/// Both poisoned-input constructions must actually produce a device-resident
-/// bf16 tensor of the right shape. If either producer regresses, this fails
-/// with a plain assertion instead of leaving six refusal gates to pass for the
-/// wrong reason.
+/// Both bf16 poisoned-input constructions, and the f16 one the contiguous gate
+/// uses, must actually produce a device-resident 16-bit tensor of the right
+/// dtype and shape. If any producer regresses, this fails with a plain
+/// assertion instead of leaving six refusal gates to pass for the wrong reason.
+/// (The name predates the f16 producer; it is kept because the GPU cert
+/// manifest lists gates by name.)
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn both_producers_yield_a_real_device_resident_bf16_tensor() {
@@ -361,12 +395,17 @@ fn both_producers_yield_a_real_device_resident_bf16_tensor() {
     let b = bf16_gpu_zeros_like_f32(&[4, 3]);
     assert_eq!(view(b).ndim, 2);
     assert_eq!(view(b).len, 12);
+
+    // The f16 producer the contiguous gate uses.
+    let c = f16_gpu_from_host(&[4, 3]);
+    assert_eq!(view(c).ndim, 2);
+    assert_eq!(view(c).len, 12);
 }
 
 #[test]
 #[ignore = "requires CUDA GPU; re-execs this test binary to observe the abort"]
-fn contiguous_refuses_a_transposed_bf16_device_view() {
-    assert_refuses("contiguous", "nsl_tensor_contiguous");
+fn contiguous_refuses_a_transposed_f16_device_view() {
+    assert_refuses_dtype("contiguous", "nsl_tensor_contiguous", DTYPE_FP16);
 }
 
 #[test]

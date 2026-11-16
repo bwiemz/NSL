@@ -460,7 +460,7 @@ crates/nsl-runtime/tests/fp8_gpu_device_guard.rs	tape_fp8_training_backward_on_g
 crates/nsl-runtime/tests/fp8_gpu_device_guard.rs	block_quantizers_on_gpu_tensors_match_the_cpu_run	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/fused_ew_fallback.rs	gpu_fast_path_matches_hand_sequenced_and_counts	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/gpu_dtype_refusal.rs	both_producers_yield_a_real_device_resident_bf16_tensor	gpu	requires CUDA GPU
-crates/nsl-runtime/tests/gpu_dtype_refusal.rs	contiguous_refuses_a_transposed_bf16_device_view	gpu	requires CUDA GPU; re-execs this test binary to observe the abort
+crates/nsl-runtime/tests/gpu_dtype_refusal.rs	contiguous_refuses_a_transposed_f16_device_view	gpu	requires CUDA GPU; re-execs this test binary to observe the abort
 crates/nsl-runtime/tests/gpu_dtype_refusal.rs	slice_refuses_a_bf16_device_tensor	gpu	requires CUDA GPU; re-execs this test binary to observe the abort
 crates/nsl-runtime/tests/gpu_dtype_refusal.rs	relu_refuses_a_bf16_device_tensor	gpu	requires CUDA GPU; re-execs this test binary to observe the abort
 crates/nsl-runtime/tests/gpu_dtype_refusal.rs	softmax_refuses_a_bf16_device_tensor	gpu	requires CUDA GPU; re-execs this test binary to observe the abort
