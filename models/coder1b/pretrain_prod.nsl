@@ -33,8 +33,10 @@
 #   optimizer steps   = ceil(5,516,582 / accum(4))       = 1,379,146
 #   warmup            = 2,048 optimizer steps            (~0.15%)
 #   tokens/opt step   = 2 * 2048 * 4                     = 16,384
-#   checkpoints       = every 2,000 opt steps            (~83 min at 6,568 tok/s)
-#   wall estimate     = 22.6B / 6,568 tok/s              = ~40 days resident
+#   checkpoints       = every 2,000 opt steps            (~41 min at 13,466 tok/s)
+#   wall estimate     = 22.6B / 13,466 tok/s             = ~19.4 days resident
+#   (13,466 tok/s: tools/perfcheck at this geometry and flag line, 2026-11;
+#   the Aug 2026 posture bench measured 6,568 under the bf16 GEMM mode alone)
 #
 # The effective batch (16,384 tokens/update) is unchanged from the toy-era
 # schedule and from the 500M recipe — deliberately, because it is the
@@ -134,9 +136,10 @@
 # (schedule_unit below): every micro-batch of an accumulation window runs at
 # one rate. Until 2026-11 this file was written in micro-batches (warmup 8192,
 # total 5516582), the only unit the compiler then had; 2048 and 1379146 are
-# those divided by the accumulation. The unit is stated because this directory
-# is pinned to the 0.10-lts toolchain, whose default is still micro-batches; it
-# needs an 0.10-lts install that knows the key (2026-11 or later). A checkpoint
+# those divided by the accumulation. The unit is stated because the 0.10-lts
+# toolchain, which this directory was pinned to until 2026-11, defaults to
+# micro-batches; a recipe that leaves it to the default reads differently on
+# the two channels. A checkpoint
 # saved by the micro-batch version of this file is refused on resume as a
 # trajectory change (NSL_RESUME_ALLOW_TRAJECTORY_DRIFT=1 acknowledges it: the
 # restored step counter lands at the same point of the schedule, and the rate
@@ -166,7 +169,7 @@
 # At 1B a checkpoint pair is 4.30 GB of theta
 # plus an 8.59 GB `.optim` sidecar (m and v for 146 parameters) — measured, not
 # estimated — so checkpoint_every=2000 optimizer steps rewrites 12.9 GB about
-# 689 times over the full epoch (~83 min cadence at the posture-bench rate). Budget the disk: `checkpoints/` is gitignored except for
+# 689 times over the full epoch (~41 min cadence at 13,466 tok/s). Budget the disk: `checkpoints/` is gitignored except for
 # its `.gitkeep`, and the runtime does NOT create the directory (it does
 # File::create and aborts), which is why that placeholder is tracked.
 #
@@ -174,10 +177,12 @@
 # any cwd; the nsl invocation must be from THIS directory (the corpus paths and
 # `from model import ...` are relative to it):
 #   cd models/coder1b
-#   export NSL_MATMUL_BF16=1        # see the taxonomy below — set it
-#                                   # EXPLICITLY and read the banner back
 #   nsl run --source-ad --checkpoint-blocks --checkpoint-selective \
 #           --fuse-rmsnorm-backward --fuse-wgrad-accum pretrain_prod.nsl
+#
+# No environment variable: the arithmetic is `precision = "bf16"` in the train
+# header below (see the taxonomy). NSL_MATMUL_BF16 may be unset or 1; 0, or a
+# --matmul-mode other than bf16, is a compile error.
 #
 # THE FLAGS ARE NOT ALL THE SAME KIND OF THING, and an earlier draft of this
 # header flattened them into "every flag is required", which is false:
@@ -198,7 +203,32 @@
 #                           execution fingerprint treats the wgrad choice as
 #                           arithmetic identity, so adding it mid-chain would
 #                           refuse every prior checkpoint.
-#   NSL_MATMUL_BF16=1       IN THE LINE. ACQUITTED by a three-arm matched
+#   precision="bf16"        IN THE TRAIN HEADER (2026-11), not a flag. Stores
+#                           activations and their gradients in bf16 where
+#                           PyTorch autocast does: both halves of every block,
+#                           with f32 math inside every kernel and one rounding
+#                           (to nearest even) on store. Weights, weight
+#                           gradients, optimizer state, the residual stream and
+#                           norm statistics stay f32. It includes the bf16 GEMM
+#                           mode below. Same toolchain, 3 interleaved rounds
+#                           (tools/perfcheck, 2026-11-15): 1.215x tok/s over the
+#                           bf16 GEMM mode alone (12,969 vs 10,678) and a
+#                           2.94 GiB lower allocator peak (23.66 vs 26.60 GiB);
+#                           13,466 tok/s on the toolchain that shipped it.
+#                           Convergence at 500M on this flag line, 5 seeds x
+#                           4,000 updates, criterion fixed before the first
+#                           run: held-out loss is no worse than TF32's or the
+#                           bf16 GEMM mode's at any 1,000-update mark (at
+#                           4,000: -0.0035 and -0.0001, 2 SE 0.018).
+#                           Record: BF16_STORAGE_CONVERGENCE_2026_11.md.
+#                           It is part of the program and of the execution
+#                           fingerprint (`act=bf16`), which closes the hazard
+#                           recorded below for NSL_MATMUL_BF16: a resume under
+#                           other arithmetic is refused. It refuses
+#                           --cuda-graphs, --layerwise-accum, --weight-stream,
+#                           --param-dtype bf16-sr and --checkpoint-compress.
+#   NSL_MATMUL_BF16=1       SUPERSEDED by precision="bf16", which sets it; kept
+#                           here for its record. ACQUITTED by a three-arm matched
 #                           pair (2026-08-31): from ONE checkpoint on identical
 #                           batches, held-out ranked bf16+RNE 4.363/6.332 <
 #                           bf16+SR 4.477/6.385 < f32 4.653/6.423 — the SAME
@@ -223,14 +253,13 @@
 #                           and no sign of the amplification. Withdrawn to
 #                           "unsettled" pending the three-arm matched pair
 #                           (f32 / bf16+RNE / bf16+SR, PR #540's SR mode).
-#                           STANDING HAZARD, unchanged: it is INVISIBLE to the
-#                           execution fingerprint, so a checkpoint cannot tell
-#                           you which arithmetic produced it and a resume will
-#                           not refuse a silent switch. Set it explicitly, and
-#                           check the runtime's `cuBLAS math mode:` banner —
+#                           THE HAZARD precision="bf16" closes: the variable is
+#                           INVISIBLE to the execution fingerprint, so a
+#                           checkpoint cannot tell you which arithmetic produced
+#                           it and a resume will not refuse a silent switch —
 #                           two chain legs were reported as f32 while running
 #                           bf16 because a copied driver carried this variable
-#                           and nothing read the banner back.
+#                           and nothing read the `cuBLAS math mode:` banner back.
 #                           Record: POSTURE_1B_THROUGHPUT_2026_08_27.md.
 #                           --cuda-graphs measured +0.8% in Aug 2026; since
 #                           the timed GEMM selection, which graphs switch
@@ -340,7 +369,7 @@ print("LOSS_STREAM_BEGIN")
 # the absence of a `[fused-lce] forward route=` line, and the PEAK_* block
 # below.
 @fused_lm_ce(enabled=true, vocab_size=49152, hidden_size=2048, batch_size=2, seq_len=2048)
-train(model=m, epochs=1, grad_accumulation=4, schedule_unit="optimizer_step", grad_clip=1.0, checkpoint_load="checkpoints/pretrain_prod_state.nslm", checkpoint_save="checkpoints/pretrain_prod_state.nslm", checkpoint_every=2000):
+train(model=m, epochs=1, grad_accumulation=4, schedule_unit="optimizer_step", grad_clip=1.0, precision="bf16", checkpoint_load="checkpoints/pretrain_prod_state.nslm", checkpoint_save="checkpoints/pretrain_prod_state.nslm", checkpoint_every=2000):
     optimizer: AdamW(lr=0.000015, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
     scheduler: warmup_cosine(warmup_steps=2048, total_steps=1379146, min_lr=0.0000045)
     step(batch):

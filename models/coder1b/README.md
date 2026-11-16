@@ -125,12 +125,15 @@ engaged.
 
 ## Running
 
-**Toolchain.** This directory is pinned to the `0.10-lts` toolchain channel
-(`nsl-toolchain.toml`, NSL V2 plan 0.1): production runs stay on the LTS
-toolchain while the V2 redesign lands on `main`. `nsl run` / `nsl build` on a
-file here hands the invocation over to `~/.nsl/toolchains/0.10-lts/bin/nsl`
-(install it once with `scripts/install-toolchain.sh 0.10-lts <git-ref>`); a
-toolchain of another channel refuses when that is not installed.
+**Toolchain.** This directory is pinned to the `0.11` toolchain channel
+(`nsl-toolchain.toml`, NSL V2 plan 0.1): production runs stay on a release
+toolchain while `main` moves. `nsl run` / `nsl build` on a file here hands the
+invocation over to `~/.nsl/toolchains/0.11/bin/nsl` (install it once with
+`scripts/install-toolchain.sh 0.11 origin/release/0.11`); a toolchain of
+another channel refuses when that is not installed. `0.11` is the first
+channel with bf16 activation storage, which `pretrain_prod.nsl` declares
+(`precision = "bf16"`: 1.215x tok/s over the bf16 GEMM mode and 2.94 GiB
+less allocator peak at 1B; see the recipe header's flag taxonomy).
 `--ignore-toolchain-pin` runs on the invoked toolchain instead — for gates
 and experiments, not production runs.
 
@@ -145,8 +148,8 @@ cargo build --release --bin nsl --features cuda
 # materializes the v1 slices the 50M/500M recipes still read.
 
 ( cd models/coder1b && ../../target/release/nsl run \
-    --source-ad --checkpoint-blocks --fuse-rmsnorm-backward \
-    pretrain_prod.nsl )
+    --source-ad --checkpoint-blocks --checkpoint-selective \
+    --fuse-rmsnorm-backward --fuse-wgrad-accum pretrain_prod.nsl )
 ```
 
 The demos below are a different thing — a memory demo at seq 512, not a

@@ -40,8 +40,8 @@
 
 use std::path::PathBuf;
 
-/// models/coder500m/ and models/coder1b/ are pinned to the LTS toolchain
-/// (`nsl-toolchain.toml`, NSL V2 plan 0.1). These gates hold the recipes to
+/// models/coder500m/ and models/coder1b/ are pinned to a release toolchain
+/// channel (`nsl-toolchain.toml`, NSL V2 plan 0.1). These gates hold the recipes to
 /// the toolchain under test, so every `nsl build` here runs on it anyway
 /// (a no-op for the unpinned coder50m).
 const IGNORE_PIN: &str = "--ignore-toolchain-pin";
@@ -179,6 +179,13 @@ struct ProdPair {
     /// `--layerwise-accum` refusal, on the contract that this codebase refuses
     /// incompatible compositions rather than silently degrading them.
     two_phase_clip: bool,
+    /// Whether the train header declares `precision="bf16"` (bf16 activation
+    /// storage). Pinned because the choice changes the arithmetic of every
+    /// step and has no other symptom in the source, and because it decides
+    /// the tape arm of `pretrain_prod_builds_under_both_ad_modes`: the
+    /// storage plan exists only on the source-AD step, so a bf16 recipe must
+    /// REFUSE to build under the tape, naming --source-ad.
+    precision_bf16: bool,
 }
 
 const PAIRS: &[ProdPair] = &[
@@ -196,6 +203,7 @@ const PAIRS: &[ProdPair] = &[
         cites_validation_record: false,
         same_stream_split: false,
         two_phase_clip: true,
+        precision_bf16: false,
     },
     ProdPair {
         dir: "coder500m",
@@ -220,6 +228,7 @@ const PAIRS: &[ProdPair] = &[
         cites_validation_record: true,
         same_stream_split: true,
         two_phase_clip: true,
+        precision_bf16: true,
     },
     // Item 6: the 1B recipe trains on the v2 corpus and scores on its TWO
     // held-out sets (stack_val repository-disjoint, web_val file-disjoint) —
@@ -261,6 +270,7 @@ const PAIRS: &[ProdPair] = &[
         cites_validation_record: true,
         same_stream_split: false,
         two_phase_clip: true,
+        precision_bf16: true,
     },
 ];
 
@@ -384,11 +394,12 @@ fn pretrain_prod_agrees_with_config_and_the_corpus_arithmetic() {
 
         // The numbers are optimizer steps, so the train header must say so.
         // The toolchain under test counts optimizer steps by default, but
-        // 500M and 1B are pinned to 0.10-lts, whose default is
-        // micro-batches: a recipe that left the key out would run a
-        // schedule `grad_accumulation` times too short there, with only a
-        // warning. (0.10-lts also drops a trailing partial window where
-        // this toolchain steps on it; the schedule length is the same.)
+        // 0.10-lts, which 500M and 1B were pinned to until 2026-11 (and
+        // 7B and RL still are), defaults to micro-batches: a recipe that
+        // left the key out would run a schedule `grad_accumulation` times
+        // too short there, with only a warning. (0.10-lts also drops a
+        // trailing partial window where this toolchain steps on it; the
+        // schedule length is the same.)
         let headers: Vec<&str> = prod
             .lines()
             .filter(|l| l.starts_with("train("))
@@ -780,7 +791,7 @@ fn pretrain_prod_builds_under_both_ad_modes() {
     let tmp = std::env::temp_dir().join(format!("nsl_prodgate_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
 
-    let mut outcomes: Vec<(&str, &str, bool, String)> = Vec::new();
+    let mut outcomes: Vec<(&ProdPair, &str, bool, String)> = Vec::new();
     for pair in PAIRS {
         for (label, extra) in [("--source-ad", vec!["--source-ad"]), ("tape", vec![])] {
             let out = std::process::Command::new(env!("CARGO_BIN_EXE_nsl"))
@@ -795,7 +806,7 @@ fn pretrain_prod_builds_under_both_ad_modes() {
                 .output()
                 .expect("spawn nsl build");
             outcomes.push((
-                pair.dir,
+                pair,
                 label,
                 out.status.success(),
                 String::from_utf8_lossy(&out.stderr).to_string(),
@@ -806,13 +817,64 @@ fn pretrain_prod_builds_under_both_ad_modes() {
     // hundred MB of objects onto the 31G tmpfs.
     let _ = std::fs::remove_dir_all(&tmp);
 
-    for (dir, label, ok, stderr) in &outcomes {
+    for (pair, label, ok, stderr) in &outcomes {
+        let dir = pair.dir;
+        if *label == "tape" && pair.precision_bf16 {
+            // bf16 activation storage is planned over the source-AD step
+            // only; the tape would compute and store f32 while the banner
+            // and fingerprint said bf16. The refusal is the contract, and it
+            // must be THIS refusal, not some other build failure.
+            assert!(
+                !*ok,
+                "models/{dir}/pretrain_prod.nsl declares precision=\"bf16\" and \
+                 still built under the tape, which stores f32\n{stderr}"
+            );
+            assert!(
+                stderr.contains("precision=\"bf16\" requires --source-ad"),
+                "models/{dir}/pretrain_prod.nsl failed under the tape, but not \
+                 with the precision refusal:\n{stderr}"
+            );
+            continue;
+        }
         assert!(
             *ok,
             "models/{dir}/pretrain_prod.nsl must build under {label}. If the \
              tape arm regressed, the misleading historical symptom was \"train \
              step body must assign to a variable named 'loss'\" from a \
              silently skipped step body.\n{stderr}"
+        );
+    }
+}
+
+/// The train header declares `precision="bf16"` exactly where the table says.
+///
+/// The precision changes the arithmetic of every step, and nothing else in
+/// the source shows it: removing the kwarg builds green and trains in f32
+/// storage at a lower speed and a higher peak. Checked on the header line
+/// itself, so a mention in a comment does not count.
+#[test]
+fn the_train_header_declares_the_tabled_precision() {
+    let root = repo_root();
+    for pair in PAIRS {
+        let prod =
+            std::fs::read_to_string(root.join(format!("models/{}/pretrain_prod.nsl", pair.dir)))
+                .unwrap();
+        let headers: Vec<&str> = prod.lines().filter(|l| l.starts_with("train(")).collect();
+        assert_eq!(
+            headers.len(),
+            1,
+            "{}: expected one train header, found {headers:?}",
+            pair.dir
+        );
+        let declared = headers[0].contains("precision=\"bf16\"");
+        assert_eq!(
+            declared, pair.precision_bf16,
+            "{}: the train header {} precision=\"bf16\" but the table says \
+             precision_bf16 = {}\n{}",
+            pair.dir,
+            if declared { "declares" } else { "does not declare" },
+            pair.precision_bf16,
+            headers[0]
         );
     }
 }
@@ -1345,6 +1407,7 @@ fn grad_clip_is_planned_and_the_incompatible_flag_still_refuses() {
 
     let mut reports: Vec<(&str, bool, String)> = Vec::new();
     let mut refusals: Vec<(&str, bool, String)> = Vec::new();
+    let mut clip_refusals_seen = 0usize;
     for pair in PAIRS {
         if !pair.two_phase_clip {
             continue;
@@ -1408,9 +1471,21 @@ fn grad_clip_is_planned_and_the_incompatible_flag_still_refuses() {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
+        // A bf16 recipe meets an earlier refusal: precision="bf16" does not
+        // compose with --layerwise-accum at all, so the grad_clip one is never
+        // reached. Either named refusal keeps the property this arm pins (the
+        // flag cannot silently cost the clip); any other failure, or a build,
+        // still fails. The grad_clip refusal itself stays pinned by the f32
+        // recipe(s) in the table, and returns here the day the two compose.
+        let refused_for_clip = text.contains("--layerwise-accum is incompatible with grad_clip");
+        let refused_for_precision = pair.precision_bf16
+            && text.contains("precision=\"bf16\" does not compose with --layerwise-accum");
+        if refused_for_clip {
+            clip_refusals_seen += 1;
+        }
         refusals.push((
             pair.dir,
-            !out.status.success() && text.contains("--layerwise-accum is incompatible with grad_clip"),
+            !out.status.success() && (refused_for_clip || refused_for_precision),
             text,
         ));
     }
@@ -1433,12 +1508,18 @@ fn grad_clip_is_planned_and_the_incompatible_flag_still_refuses() {
         assert!(
             *ok,
             "models/{dir}/pretrain_prod.nsl + --layerwise-accum must REFUSE, \
-             naming grad_clip. If this now builds, the layerwise schedule is \
+             naming grad_clip (or, for a precision=\"bf16\" recipe, the \
+             precision). If this now builds, the layerwise schedule is \
              either materializing the global norm (in which case the 1B \
              recipe should reconsider its flag set) or it is silently dropping \
              the clip.\n{text}"
         );
     }
+    assert!(
+        clip_refusals_seen > 0,
+        "no recipe reached the grad_clip refusal itself: every size now stops \
+         at an earlier refusal, so nothing pins the clip any more"
+    );
 }
 
 /// Item 10's literal acceptance criterion: "separate real recipe from

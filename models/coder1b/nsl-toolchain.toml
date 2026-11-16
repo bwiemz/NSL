@@ -1,12 +1,15 @@
 # Toolchain pin (NSL V2 plan, Phase 0 item 0.1).
 #
-# Production runs of this model stay on the long-term-support toolchain
-# (`release/0.10-lts`, correctness-only backports) while the V2 redesign
-# lands on main. `nsl run` / `nsl build` on any file in or below this
-# directory reads this pin. A toolchain of another channel hands the whole
-# invocation over to ~/.nsl/toolchains/0.10-lts/bin/nsl (install it with
-# `scripts/install-toolchain.sh 0.10-lts <git-ref>`), or refuses when that is
-# not installed. `--ignore-toolchain-pin` runs on the invoked toolchain
-# anyway. `nsl --version` prints which channel a binary is.
+# Production runs of this model stay on a release toolchain while `main`
+# moves: `release/0.11` (cut 2026-11 from a main commit whose GPU
+# certification lane was run; correctness-only backports). It is the first
+# channel with bf16 activation storage, which this model's pretrain_prod.nsl
+# declares (`precision = "bf16"`); 0.10-lts cannot build that recipe.
+# `nsl run` / `nsl build` on any file in or below this directory reads this
+# pin. A toolchain of another channel hands the whole invocation over to
+# ~/.nsl/toolchains/0.11/bin/nsl (install it with
+# `scripts/install-toolchain.sh 0.11 origin/release/0.11`), or refuses when
+# that is not installed. `--ignore-toolchain-pin` runs on the invoked
+# toolchain anyway. `nsl --version` prints which channel a binary is.
 [toolchain]
-channel = "0.10-lts"
+channel = "0.11"

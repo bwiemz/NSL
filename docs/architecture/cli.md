@@ -109,9 +109,10 @@ channel = "0.10-lts"
 
 Unknown keys are refused at both levels. The channel must match
 `[A-Za-z0-9][A-Za-z0-9._-]*`, because it becomes a directory name.
-`models/coder500m`, `coder1b`, `coder7b` and `coder-rl` are pinned to
-`0.10-lts`. `coder50m` is not, because V2's parity gate runs it on the dev
-toolchain.
+`models/coder500m` and `coder1b` are pinned to `0.11` (`release/0.11`), the
+first channel with bf16 activation storage, which their production recipes
+declare. `coder7b` and `coder-rl` stay on `0.10-lts`. `coder50m` is not
+pinned, because V2's parity gate runs it on the dev toolchain.
 
 **Lookup.** `main_inner` calls `toolchain::enforce_pin(&args.file,
 args.ignore_toolchain_pin)` for `nsl run` and `nsl build` before dispatching,
