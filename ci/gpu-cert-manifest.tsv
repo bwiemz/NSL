@@ -3,6 +3,7 @@
 # Columns: file<TAB>test<TAB>class<TAB>reason
 crates/nsl-cli/tests/autotune_measure_gate.rs	autotune_measures_and_compiles_consume_it_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/bf16_activation_storage_gate.rs	the_bf16_program_trains_like_f32_storage_with_bf16_gemms	gpu	requires CUDA GPU
+crates/nsl-cli/tests/bf16_activation_storage_gate.rs	the_attention_half_trains_like_f32_storage_with_bf16_gemms	gpu	requires CUDA GPU
 crates/nsl-cli/tests/ccr_checkpoint_activation_parity_gpu.rs	ccr_activation_parity_on_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/ccr_checkpoint_parity.rs	ccr_blocks_parity_on_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/ccr_checkpoint_parity.rs	ccr_blocks_parity_on_gpu_deterministic	gpu	requires CUDA GPU
@@ -410,6 +411,7 @@ crates/nsl-codegen/tests/track_b_head_dim_128_repro.rs	track_b_d_model_128_rejec
 crates/nsl-codegen/tests/track_b_head_dim_128_repro.rs	track_b_head_dim_128_d_model_32_launches	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/wggo_sidecar_population.rs	run_harness_stub_with_wggo_hook_populates_wggo_head_gradients	broken	requires cfg(test) BSS stub injection; covered by mod.rs unit test
 crates/nsl-runtime/src/attention_tc.rs	tc_backward_matches_f64_reference_at_realistic_gradient_magnitudes	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
+crates/nsl-runtime/src/attention_tc.rs	tc_bf16_io_is_the_f32_kernel_rounded_once	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/src/attention_tc.rs	tc_backward_small_rows_keep_their_precision	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/src/attention_tc.rs	tc_ffi_forward_and_backward_match_the_reference	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/src/attention_tc.rs	tc_attention_kernel_times	diagnostic	diagnostic: times the tensor-core attention kernels at the production shapes
@@ -435,6 +437,7 @@ crates/nsl-runtime/src/tensor_parallel/collective.rs	a_real_one_rank_communicato
 crates/nsl-runtime/src/tensor_parallel/collective.rs	nccl_device_collectives_actually_execute_on_this_gpu	gpu	requires CUDA GPU + a real libnccl (--features nccl)
 crates/nsl-runtime/src/tensor_parallel/collective.rs	unmapped_dtypes_are_refused_before_reaching_nccl	gpu	requires CUDA GPU + a real libnccl (--features nccl)
 crates/nsl-runtime/src/tensor_parallel/collective.rs	the_trait_methods_short_circuit_at_ws1_without_entering_nccl	gpu	requires CUDA GPU + a real libnccl (--features nccl)
+crates/nsl-runtime/tests/bf16_storage_copy_gpu.rs	bf16_views_copy_to_row_major_bit_for_bit	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/bf16_storage_gemm_gpu.rs	bf16_operand_gemms_round_once_to_the_requested_dtype	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/bf16_storage_gemm_gpu.rs	the_fused_weight_gradient_accumulates_bf16_activations_in_f32	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/bf16_storage_gemm_gpu.rs	a_shape_one_gemm_cannot_express_takes_the_counted_fallback	gpu	requires CUDA GPU
@@ -539,6 +542,7 @@ crates/nsl-runtime/tests/quantize_gpu_device.rs	the_4bit_packers_stage_a_gpu_vie
 crates/nsl-runtime/tests/rmsnorm_dgamma_backward_gpu.rs	dgamma_matches_an_f64_reference_within_the_derived_bound_on_tails	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/rmsnorm_dgamma_backward_gpu.rs	dgamma_matches_an_f64_reference_within_the_derived_bound_at_the_recipe_shapes	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/rmsnorm_dx_backward_gpu.rs	rmsnorm_dx_gpu_matches_cpu_reference	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/rope_fused_gpu.rs	the_fused_rope_is_the_decomposed_graph_bit_for_bit	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/sr_bf16_parity.rs	sr_bf16_gpu_tail_is_bit_identical_to_cpu_reference	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/sr_bf16_parity.rs	sr_bf16_gpu_streams_vary_with_counters	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/tier_b1_prepass_gpu.rs	x_prepass_matches_cpu_reference	gpu	requires CUDA GPU

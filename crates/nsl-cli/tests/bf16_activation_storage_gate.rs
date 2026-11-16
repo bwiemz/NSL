@@ -225,3 +225,131 @@ fn the_bf16_program_trains_like_f32_storage_with_bf16_gemms() {
         assert!((x - y).abs() <= 1e-2 * y.abs(), "step {i}: bf16 storage {x} vs f32 storage {y}\n{a:?}\n{b:?}");
     }
 }
+
+/// A pre-norm block with the stdlib's grouped-query attention (RoPE, GQA
+/// expand, head_dim 64 for the tensor-core kernels) and a SwiGLU MLP, two
+/// blocks deep: both halves of both blocks are planned (step 5).
+fn attention_fixture(precision: &str, cuda: bool) -> String {
+    let (to_device, xd, yd) = if cuda { ("m.to(cuda)\n", "x.to(cuda)", "y.to(cuda)") } else { ("", "x", "y") };
+    format!(
+        r#"from nsl.nn.norms import RMSNorm
+from nsl.nn.gqa import GroupedQueryAttention
+from nsl.nn.losses import mse_loss
+
+model Block:
+    attn_norm: RMSNorm = RMSNorm(128)
+    attn: GroupedQueryAttention = GroupedQueryAttention(128, 2, 1, 64, 0.0, 64, 10000.0, 2)
+    ffn_norm: RMSNorm = RMSNorm(128)
+    w_gate: Tensor = ((arange(32768).reshape([128, 256])) * 0.0000035) - 0.06
+    w_up: Tensor = ((arange(32768).reshape([128, 256])) * 0.0000025) - 0.045
+    w_down: Tensor = ((arange(32768).reshape([256, 128])) * 0.000002) - 0.04
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = x + self.attn.forward(self.attn_norm.forward(x), true)
+        let n = self.ffn_norm.forward(h)
+        return h + (silu(n @ self.w_gate) * (n @ self.w_up)) @ self.w_down
+
+model Net:
+    b1: Block = Block()
+    b2: Block = Block()
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return self.b2.forward(self.b1.forward(x))
+
+let m = Net()
+{to_device}let x = ((arange(8192).reshape([2, 32, 128])) * 0.0003) - 1.2
+let y = ((arange(8192).reshape([2, 32, 128])) * 0.0002) - 0.8
+let xd = {xd}
+let yd = {yd}
+
+train(model=m, epochs=8, grad_accumulation=4{precision}):
+    optimizer: AdamW(lr=0.001, beta1=0.9, beta2=0.999, eps=1e-2, weight_decay=0.0)
+    step(batch):
+        let pred = m.forward(xd)
+        let loss = mse_loss(pred, yd)
+    callbacks:
+        on_step(step, loss):
+            print(loss)
+"#
+    )
+}
+
+const ATTN_PLANNED: &str = "[bf16-storage] 2 attention half(s) stored bf16";
+
+/// The 500M recipe's attention: dropout 0.1 after the output projection.
+#[test]
+fn an_attention_half_with_a_dropout_tail_is_planned() {
+    let src = attention_fixture(BF16, false)
+        .replace("GroupedQueryAttention(128, 2, 1, 64, 0.0, 64, 10000.0, 2)", "GroupedQueryAttention(128, 2, 1, 64, 0.1, 64, 10000.0, 2)");
+    assert!(src.contains("64, 0.1, 64"), "fixture edit did not apply");
+    let mut args = vec!["build"];
+    args.extend_from_slice(PROD);
+    let r = nsl(&args, &src, "plan_attn_dropout", false, &[]);
+    assert!(r.ok, "precision=\"bf16\" build with attention dropout failed:\n{}", r.out);
+    assert!(r.out.contains(ATTN_PLANNED), "the attention halves were not planned:\n{}", r.out);
+}
+
+/// A module with an `@flash_attention` context lowers every attention through
+/// the decomposed f32 chain (or, under a CSHA claim, which needs the context,
+/// the fused CSHA forward); neither reads bf16 operands, so a planned
+/// attention half there is a compile error, not a run that mixes them. The
+/// same program with f32 storage still builds.
+#[test]
+fn an_attention_half_under_a_flash_attention_context_is_a_compile_error() {
+    let decorate = |src: String| {
+        let out = src.replacen(
+            "    fn forward(self, x: Tensor) -> Tensor:\n        let h = x + self.attn.forward(",
+            "    @flash_attention(head_dim=64)\n    fn forward(self, x: Tensor) -> Tensor:\n        let h = x + self.attn.forward(",
+            1,
+        );
+        assert_ne!(out, src, "the fixture no longer has the method the decorator goes on");
+        out
+    };
+    let mut args = vec!["build"];
+    args.extend_from_slice(PROD);
+    let r = nsl(&args, &decorate(attention_fixture(BF16, false)), "plan_attn_flash_ctx", false, &[]);
+    assert!(!r.ok && r.out.contains("has a @flash_attention context"), "{}", r.out);
+    let r = nsl(&args, &decorate(attention_fixture("", false)), "plan_attn_flash_ctx_f32", false, &[]);
+    assert!(r.ok, "the f32-storage program with the decorator must build:\n{}", r.out);
+}
+
+#[test]
+fn both_attention_halves_are_planned_with_the_mlp_halves() {
+    let mut args = vec!["build"];
+    args.extend_from_slice(PROD);
+    let r = nsl(&args, &attention_fixture(BF16, false), "plan_attn", false, &[]);
+    assert!(r.ok, "precision=\"bf16\" build with attention failed:\n{}", r.out);
+    assert!(r.out.contains(PLANNED), "the MLP halves were not planned:\n{}", r.out);
+    assert!(r.out.contains(ATTN_PLANNED), "the attention halves were not planned:\n{}", r.out);
+}
+
+/// The attention half on the GPU: the tensor-core kernels with bf16 I/O, the
+/// fused RoPE reading the strided head view, the bf16 copies around them and
+/// GQA's gradient sum, none of them taking the widen/compute/narrow fallback.
+/// Losses track the same program with f32 storage and bf16 GEMMs.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn the_attention_half_trains_like_f32_storage_with_bf16_gemms() {
+    let mut bf16_args = vec!["run"];
+    bf16_args.extend_from_slice(PROD);
+    let bf16 = nsl(&bf16_args, &attention_fixture(BF16, true), "gpu_attn_bf16", true, &[]);
+    assert!(bf16.ok, "precision=\"bf16\" run failed:\n{}", bf16.out);
+    assert!(bf16.out.contains(ATTN_PLANNED), "{}", bf16.out);
+    assert!(
+        !bf16.out.contains("widens to f32, computes and narrows"),
+        "a dtype-explicit op of the attention half took the fallback (strided, host or broadcast operand):\n{}",
+        bf16.out
+    );
+    let mut ref_args = bf16_args.clone();
+    ref_args.extend_from_slice(&["--matmul-mode", "bf16"]);
+    let reference = nsl(&ref_args, &attention_fixture("", true), "gpu_attn_ref", true, &[]);
+    assert!(reference.ok, "reference run failed:\n{}", reference.out);
+    let (a, b) = (losses(&bf16.out), losses(&reference.out));
+    eprintln!("losses, bf16 storage: {a:?}\nlosses, f32 storage:  {b:?}");
+    assert_eq!(a.len(), 8, "one loss per micro-batch:\n{}", bf16.out);
+    assert_eq!(a.len(), b.len());
+    assert!(b[7] < b[0], "the reference did not train: {b:?}");
+    for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+        assert!((x - y).abs() <= 1e-2 * y.abs(), "step {i}: bf16 storage {x} vs f32 storage {y}");
+    }
+}

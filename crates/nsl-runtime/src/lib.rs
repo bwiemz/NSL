@@ -165,7 +165,7 @@ pub use cuda::test_set_transpose_views;
 #[cfg(all(feature = "cuda", feature = "test-hooks"))]
 pub use cuda::{test_bf16_cast_cache_reset, test_bf16_cast_cache_stats};
 #[cfg(all(feature = "cuda", feature = "test-hooks"))]
-pub use cuda::{test_lt_matmul_reset, test_lt_matmul_stats, test_lt_matmul_tf32_stats};
+pub use cuda::{test_lce_logits_probe, test_lt_matmul_reset, test_lt_matmul_stats, test_lt_matmul_tf32_stats, test_storage_copy_regional_count};
 #[cfg(all(feature = "cuda", feature = "test-hooks"))]
 pub use cuda::{test_kernel_launch_census_arm, test_kernel_launch_count};
 
@@ -218,6 +218,7 @@ pub extern "C" fn nsl_muon_step_batch(
 pub mod muon_prof;
 
 pub mod sr_bf16;
+pub mod rope;
 pub mod storage_dt;
 pub mod csla_stat;
 pub mod grad_integrity;

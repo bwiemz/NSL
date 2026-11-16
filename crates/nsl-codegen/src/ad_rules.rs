@@ -312,6 +312,9 @@ pub enum AdjointExpr {
     /// rotate_half is the Jacobian of itself but reflected; the inverse is
     /// the negation of itself. args: (grad)
     RotateHalfBackward(VarId),
+    /// `rope(x, cos, sin)` backward: `rope_backward(ȳ, cos, sin)` =
+    /// ȳ·cos + rotᵀ(ȳ·sin) for `x`; the tables are constants (no adjoint).
+    RopeBackward(VarId, VarId, VarId),
 
     // Shape backward (broadcast reduction)
     /// Expand backward: sum-reduce gradient over expanded dims to match original shape.
@@ -1013,6 +1016,21 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
                         }]
                     }
                 }
+                // The fused RoPE (`rope(x, cos, sin)`): linear in `x`, the
+                // transpose of the rotation for its adjoint. `cos`/`sin` are
+                // the cached position tables, constants of the model: no
+                // adjoint (a gradient into them would be dropped silently,
+                // so the builtin documents them as non-differentiable).
+                "rope" => {
+                    if op.inputs.len() < 3 {
+                        vec![]
+                    } else {
+                        vec![InputAdjoint {
+                            input_var: op.inputs[0],
+                            expr: AdjointExpr::RopeBackward(output_bar, op.inputs[1], op.inputs[2]),
+                        }]
+                    }
+                }
                 // Expand backward: sum-reduce gradient over broadcast-expanded dims
                 "expand" => {
                     if op.inputs.is_empty() {
@@ -1284,6 +1302,7 @@ pub const RULED_PASSTHROUGHS: &[&str] = &[
     "mean_keepdim_last",
     "rotate_half",
     "expand",
+    "rope",
 ];
 
 /// The certification status of a passthrough, by name.
@@ -1297,6 +1316,7 @@ pub fn ad_cert_status_passthrough(name: &str) -> AdCertStatus {
         "cos" => Certified(&["cos"]),
         "sin" => Certified(&["sin"]),
         "rotate_half" => Certified(&["rotate_half"]),
+        "rope" => Certified(&["rope"]),
         "expand" => Certified(&["expand"]),
         "sum_keepdim_last" | "mean_keepdim_last" => {
             AdjointOnly("the softmax and normalization adjoints")
@@ -1564,7 +1584,8 @@ mod tests {
         listed.sort();
         assert_eq!(matched, listed);
         for name in RULED_PASSTHROUGHS {
-            let op = make_op(1, PrimalOp::Passthrough((*name).to_string()), vec![0]);
+            // Three operands: enough for every rule (`rope` reads x, cos, sin).
+            let op = make_op(1, PrimalOp::Passthrough((*name).to_string()), vec![0, 1, 2]);
             assert!(
                 !apply_ad_rule(&op, 9).is_empty(),
                 "{name} is listed but has no rule"

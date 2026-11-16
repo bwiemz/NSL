@@ -117,6 +117,10 @@ fn build_table() -> HashMap<&'static str, FfiOwnershipKind> {
     // eval dropout clones; the sampling ops' GPU arms return fresh
     // uploads).
     m.insert("nsl_tensor_rotate_half", OwnedNewResult);
+    m.insert("nsl_tensor_rope", OwnedNewResult);
+    m.insert("nsl_tensor_rope_backward", OwnedNewResult);
+    m.insert("nsl_tensor_rope_dt", OwnedNewResult);
+    m.insert("nsl_tensor_rope_backward_dt", OwnedNewResult);
     m.insert("nsl_tensor_cumsum", OwnedNewResult);
     m.insert("nsl_tensor_unsqueeze", OwnedNewResult);
     m.insert("nsl_tensor_causal_mask", OwnedNewResult);

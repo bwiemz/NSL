@@ -21,12 +21,12 @@
 //! `matmul_bf16_mode.rs` pattern).
 
 use nsl_runtime::fase_step::nsl_fase_fused_adamw_step;
-use nsl_runtime::fused_linear_ce::nsl_fused_linear_ce_forward_gemm;
+use nsl_runtime::fused_linear_ce::{nsl_fused_linear_ce_backward_gemm, nsl_fused_linear_ce_forward_gemm};
 use nsl_runtime::tensor::{
     nsl_tensor_copy_data, nsl_tensor_free, nsl_tensor_matmul, nsl_tensor_to_device,
     test_build_tensor_2d_f32, test_read_tensor_f32,
 };
-use nsl_runtime::{test_bf16_cast_cache_reset, test_bf16_cast_cache_stats};
+use nsl_runtime::{test_bf16_cast_cache_reset, test_bf16_cast_cache_stats, test_lce_logits_probe};
 
 /// 1024^3 puts mnk/(a+b) exactly at the 512 arithmetic-intensity gate, so
 /// the bf16-storage path (and with it the cache) engages while each GEMM
@@ -191,6 +191,7 @@ fn zz_probe_child() {
     );
 
     sub_view_checks();
+    head_route_checks();
 
     println!("CACHE-PROBE-OK");
 }
@@ -239,10 +240,10 @@ fn lm_head_forward(x: i64, w: i64, targets: i64, rows: usize, v: usize, h: usize
 ///    parent's image. The fused LM head's chunk GEMMs pass `W + chunk_start *
 ///    h` with the chunk's element count, which the cache's (base, length) key
 ///    misses: before `acquire_sub` every chunk was cast into scratch on every
-///    call. Three chunks (4096 + 4096 + a 1024 tail, which keeps every chunk
-///    at or above the 512 intensity gate): the first chunk makes the
-///    WHOLE parent image valid (one recast), the other two hit it, and the
-///    results are bit-identical to the scratch path's.
+///    call. The fused LM head now takes the WHOLE parent's image once per
+///    call (one recast cold, one hit warm) and serves its three chunks (4096
+///    + 4096 + a 1024 tail, every chunk at or above the 512 intensity gate)
+///    from it; the results are bit-identical to the scratch path's.
 fn sub_view_checks() {
     let (rows, h, v) = (1024usize, 1024usize, 2 * 4096 + 1024);
     let x = gpu_2d(rows, h, &deterministic(rows * h, 239));
@@ -267,14 +268,14 @@ fn sub_view_checks() {
     let (h1, r1, _) = test_bf16_cast_cache_stats();
     assert_eq!(
         (h1 - h0, r1 - r0),
-        (2, 1),
-        "three vocabulary chunks of a registered head: expected the first to cast the whole \
-         parent once and the other two to hit it (hits, recasts) = (2, 1)"
+        (0, 1),
+        "a registered head: the call takes the whole parent's image once (one recast, served \
+         to all three vocabulary chunks) (hits, recasts) = (0, 1)"
     );
     assert_eq!(cached, fresh, "the sub-view image must serve the bits the scratch cast computes");
     let cached2 = lm_head_forward(x, w, targets, rows, v, h);
     let (h2, r2, _) = test_bf16_cast_cache_stats();
-    assert_eq!((h2 - h1, r2 - r1), (3, 0), "a warm parent image serves every chunk");
+    assert_eq!((h2 - h1, r2 - r1), (1, 0), "a warm parent image serves the call");
     assert_eq!(cached2, fresh);
 
     // A real optimizer step stales the parent: the next call recasts it whole
@@ -288,6 +289,57 @@ fn sub_view_checks() {
     assert_eq!(after, after_fresh, "after a step, the recast parent image differs from the scratch cast");
 
     for t in [x, w, m, vv, mp, targets, g] {
+        nsl_tensor_free(t);
+    }
+}
+
+/// -- check 7: at hidden 512 (Coder-50M's) the head's logits GEMM passes the
+///    intensity gate and its dx and dW GEMMs do not. The backward must
+///    recompute the logits on the forward's route, the bf16 head, so they
+///    are the forward's logits bit for bit (before, any failing backward GEMM
+///    sent all three to the per-GEMM path, whose recompute accumulates in
+///    another order). Two chunks: 4096 columns and a 1024-column tail.
+fn head_route_checks() {
+    let (rows, h, v) = (1024usize, 512usize, 4096 + 1024);
+    let x = gpu_2d(rows, h, &deterministic(rows * h, 257));
+    let w = gpu_2d(v, h, &deterministic(v * h, 263));
+    let mut words = Vec::with_capacity(2 * rows);
+    for r in 0..rows {
+        words.push(f32::from_bits(((r * 53 + 7) % v) as u32));
+        words.push(f32::from_bits(0));
+    }
+    let targets = gpu_2d(rows, 2, &words);
+    let loss = gpu_2d(rows, 1, &vec![0.0f32; rows]);
+    let lse = gpu_2d(rows, 1, &vec![0.0f32; rows]);
+    let dx = gpu_2d(rows, h, &vec![0.0f32; rows * h]);
+    let dw = gpu_2d(v, h, &vec![0.0f32; v * h]);
+
+    let _ = test_lce_logits_probe(true);
+    let rc = nsl_fused_linear_ce_forward_gemm(
+        data_ptr(x), data_ptr(w), 0, data_ptr(targets), data_ptr(loss), data_ptr(lse),
+        1, rows as i64, v as i64, h as i64, 0,
+    );
+    assert_eq!(rc, 0, "fused LM-head forward failed");
+    let rc = nsl_fused_linear_ce_backward_gemm(
+        i64::from(1.0f32.to_bits()), data_ptr(x), data_ptr(w), 0, data_ptr(targets), data_ptr(lse),
+        data_ptr(dx), data_ptr(dw), 0, 1, rows as i64, v as i64, h as i64, rows as i64, 0,
+    );
+    assert_eq!(rc, 0, "fused LM-head backward failed");
+    let chunks = test_lce_logits_probe(false);
+
+    let (fwd, bwd): (Vec<_>, Vec<_>) = chunks.iter().partition(|c| !c.0);
+    assert_eq!((fwd.len(), bwd.len()), (2, 2), "two vocabulary chunks each way");
+    assert!(fwd.iter().all(|c| c.1), "at hidden 512 the forward's logits GEMM passes the gate: the bf16 head");
+    assert!(
+        bwd.iter().all(|c| c.1),
+        "the backward must recompute the logits on the forward's route (the bf16 head), \
+         whatever its dx and dW GEMMs do"
+    );
+    for (i, (f, b)) in fwd.iter().zip(&bwd).enumerate() {
+        let differ = f.2.iter().zip(&b.2).filter(|(p, q)| p != q).count();
+        assert_eq!(differ, 0, "chunk {i}: {differ} of {} recomputed logits differ from the forward's", f.2.len());
+    }
+    for t in [x, w, targets, loss, lse, dx, dw] {
         nsl_tensor_free(t);
     }
 }

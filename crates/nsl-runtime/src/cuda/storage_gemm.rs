@@ -63,7 +63,7 @@ pub(crate) fn operand16(t: &NslTensor, elems: usize) -> Operand16 {
 /// Column-major `C = alpha * op(A) op(B) + beta * C` over bf16 `A`, `B`
 /// (cuBLAS argument order and meaning), `C` bf16 or f32.
 #[allow(clippy::too_many_arguments)]
-unsafe fn gemm16(
+pub(crate) unsafe fn gemm16(
     transa: bool,
     transb: bool,
     m: u64,

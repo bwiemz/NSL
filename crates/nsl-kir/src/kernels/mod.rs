@@ -31,6 +31,7 @@ pub mod norm;
 pub mod optim;
 pub mod rmsnorm_dgamma;
 pub mod rmsnorm_dx;
+pub mod rope;
 pub mod softmax;
 pub mod storage;
 pub mod strided_copy;

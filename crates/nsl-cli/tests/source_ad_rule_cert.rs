@@ -703,6 +703,20 @@ fn base_certs() -> Vec<Cert> {
                 let h = v.len() / 2;
                 v[h..].iter().map(|a| -a).chain(v[..h].iter().copied()).collect()
             })), known: &[], prelude: "" },
+        // The fused RoPE builtin: linear in x; the [s, d] tables are constants.
+        Cert { name: "rope", inputs: vec![inp("x", &[1, 2, 3, 4]), inp("c", &[3, 4]), inp("s", &[3, 4])],
+            expr: "rope(x, c, s)", wrt: &["x"], out_shape: &[1, 2, 3, 4],
+            oracle: oracle!(|e| {
+                let (x, c, s) = (get(e, "x"), get(e, "c"), get(e, "s"));
+                let data = (0..x.data.len())
+                    .map(|i| {
+                        let (j, row) = (i % 4, (i / 4) % 3);
+                        let partner = if j < 2 { -x.data[i + 2] } else { x.data[i - 2] };
+                        x.data[i] * c.data[row * 4 + j] + partner * s.data[row * 4 + j]
+                    })
+                    .collect();
+                Arr { shape: vec![1, 2, 3, 4], data }
+            }), known: &[], prelude: "" },
         // --- shape -------------------------------------------------------
         Cert { name: "transpose", inputs: vec![inp("x", &[3, 4])], expr: "x.transpose(0, 1)", wrt: &["x"], out_shape: &[4, 3],
             oracle: oracle!(|e| transpose2(get(e, "x"), 0, 1)), known: &[], prelude: "" },
@@ -1706,6 +1720,7 @@ cert_tests! {
     neg, relu, sigmoid, tanh, exp, log, sqrt, gelu, silu, abs, clamp, cos, sin,
     transpose, transpose_3d, reshape, unsqueeze, expand, contiguous,
     rotate_half,
+    rope,
     sum_all, mean_all, sum_dim, mean_dim, sum_dim_neg, sum_dim_keepdim, sum_dim_last, mean_dim_last,
     softmax_last, softmax_dim0, softmax_mid, log_softmax_last, log_softmax_dim0, log_softmax_mid,
     layernorm, layernorm_eps, rmsnorm, rmsnorm_eps, layernorm_3d, layernorm_field_eps, rmsnorm_field_eps, rmsnorm_field_eps_reused,

@@ -1138,7 +1138,7 @@ impl<'a> SizeProp<'a> {
 
             PrimalOp::Passthrough(name) => match name.as_str() {
                 // Shape-preserving passthroughs.
-                "contiguous" | "cos" | "sin" | "rotate_half" | "rotate_half_neg"
+                "contiguous" | "cos" | "sin" | "rotate_half" | "rotate_half_neg" | "rope" | "rope_backward"
                 | "zeros_like" | "ones_like" | "silu_backward" | "gelu_backward"
                 | "sigmoid_backward" | "tanh_backward" | "swiglu_gate_backward" => {
                     self.input_info(op, 0)

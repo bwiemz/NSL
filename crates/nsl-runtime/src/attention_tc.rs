@@ -31,7 +31,7 @@ struct Built {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Which {
     Fwd(FwdConfig),
-    Pre(u32),
+    Pre(u32, nsl_kir::kernels::storage::Storage),
     Dq(BwdConfig),
     Dkdv(BwdConfig),
 }
@@ -43,8 +43,8 @@ fn built(which: Which) -> &'static Built {
     guard.entry(which).or_insert_with(|| {
         let (ptx, name) = match which {
             Which::Fwd(c) => (nsl_kir::kernels::flash_attn::fwd::ptx(c), c.kernel_name()),
-            Which::Pre(hd) => {
-                let c = BwdConfig::pre_only(hd);
+            Which::Pre(hd, io) => {
+                let c = BwdConfig::pre_only(hd).with_io(io);
                 (kbwd::pre_ptx(c), c.pre_kernel_name())
             }
             Which::Dq(c) => (kbwd::dq_ptx(c), c.dq_kernel_name()),
@@ -127,8 +127,17 @@ pub(crate) struct FwdLaunch {
 /// Launch the forward over the whole batch (one launch). Writes `o` and
 /// `lse`; returns the launch status (asynchronous faults surface at the
 /// next synchronisation, as for every kernel).
+// The f32 entry points the kernel gates below call; production dispatch
+// goes through the `_io` forms, which name the operand storage.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn forward(a: &FwdLaunch) -> CUresult {
-    forward_with(FwdConfig::new(a.head_dim as u32, a.causal), a)
+    forward_io(a, nsl_kir::kernels::storage::Storage::F32)
+}
+
+/// [`forward`] with Q, K, V and O stored as `io` (bf16: option (a) of bf16
+/// activation storage; the log-sum-exp stays f32).
+pub(crate) fn forward_io(a: &FwdLaunch, io: nsl_kir::kernels::storage::Storage) -> CUresult {
+    forward_with(FwdConfig::new(a.head_dim as u32, a.causal).with_io(io), a)
 }
 
 /// [`forward`] with an explicit tiling (`cfg` must match `a`'s head_dim and
@@ -186,8 +195,16 @@ pub(crate) struct BwdLaunch {
 /// Launch the backward: the D / max|dO| pre-pass, then the dQ kernel and
 /// the dK/dV kernel, in stream order. Returns the first failing launch's
 /// status.
+// The f32 entry points the kernel gates below call; production dispatch
+// goes through the `_io` forms, which name the operand storage.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn backward(a: &BwdLaunch) -> CUresult {
-    backward_with(BwdConfig::new(a.head_dim as u32, a.causal), a, [true, true, true])
+    backward_io(a, nsl_kir::kernels::storage::Storage::F32)
+}
+
+/// [`backward`] with Q, K, V, O, dO, dQ, dK and dV stored as `io`.
+pub(crate) fn backward_io(a: &BwdLaunch, io: nsl_kir::kernels::storage::Storage) -> CUresult {
+    backward_with(BwdConfig::new(a.head_dim as u32, a.causal).with_io(io), a, [true, true, true])
 }
 
 /// [`backward`] with explicit tilings, launching only the kernels `run`
@@ -212,7 +229,7 @@ pub(crate) fn backward_with(cfg: BwdConfig, a: &BwdLaunch, run: [bool; 3]) -> CU
         // gmax holds a running maximum: it must start at zero.
         inner::memset_d8(a.gmax as *mut c_void, a.batch * a.heads * 4);
         let pre_args = [p(&mut dout), p(&mut o), p(&mut dvec), p(&mut gmax), u(&mut rows_arg), u(&mut seq)];
-        let rc = launch(Which::Pre(cfg.head_dim), cfg.pre_grid(rows), cfg.pre_threads(), &pre_args, 0);
+        let rc = launch(Which::Pre(cfg.head_dim, cfg.io), cfg.pre_grid(rows), cfg.pre_threads(), &pre_args, 0);
         if rc != CUresult::CUDA_SUCCESS {
             return rc;
         }
@@ -663,6 +680,128 @@ pub(crate) mod tests {
     /// subnormal) give exactly the dQ they give alone, and that dQ is the
     /// exact gradient to f16-operand precision. dK/dV of the mixed batch
     /// (one scale per group there) still match the exact gradient.
+    /// f32 -> bf16 bits, round to nearest even (no NaNs in these tests).
+    fn bf16_bits(x: f32) -> u16 {
+        let b = x.to_bits();
+        ((b + 0x7FFF + ((b >> 16) & 1)) >> 16) as u16
+    }
+
+    fn bf16_val(bits: u16) -> f32 {
+        f32::from_bits((bits as u32) << 16)
+    }
+
+    fn upload_bf16(x: &[f32]) -> *mut c_void {
+        let bits: Vec<u16> = x.iter().map(|&v| bf16_bits(v)).collect();
+        let p = inner::alloc_managed(bits.len().max(1) * 2);
+        inner::memcpy_htod(p, bits.as_ptr() as *const c_void, bits.len() * 2);
+        p
+    }
+
+    fn download_bits(p: *mut c_void, n: usize) -> Vec<u16> {
+        let mut out = vec![0u16; n];
+        inner::memcpy_dtoh(out.as_mut_ptr() as *mut c_void, p as *const c_void, n * 2);
+        out
+    }
+
+    /// Option (a) of bf16 activation storage: with Q/K/V/O/dO/dQ/dK/dV in
+    /// bf16, every kernel of the family must compute exactly what its f32-I/O
+    /// instantiation computes on the same (bf16-representable) values, and
+    /// store each output rounded ONCE, to nearest even. So the test is
+    /// bitwise: O_bf16 == RNE(O_f32), the log-sum-exp equal, and dQ/dK/dV ==
+    /// RNE of the f32 kernel's, at O(1) gradients and at the realistic
+    /// 1e-6..1e-9 magnitudes the dO prescale exists for (bugs.md 2026-11-12).
+    /// The f32 kernels themselves are held to f64 by the tests above.
+    #[test]
+    #[ignore = "requires a CUDA GPU; run with --features cuda -- --ignored"]
+    fn tc_bf16_io_is_the_f32_kernel_rounded_once() {
+        if !gpu() {
+            return;
+        }
+        use nsl_kir::kernels::storage::Storage;
+        let cases = [
+            (Shape { b: 2, h: 4, kvh: 2, s: 200, d: 64, causal: true }, 1.0f32, 11u64),
+            (Shape { b: 1, h: 2, kvh: 2, s: 130, d: 128, causal: false }, 1e-6, 12),
+            (Shape { b: 2, h: 8, kvh: 2, s: 96, d: 64, causal: true }, 1e-9, 13),
+        ];
+        for (sh, amp, seed) in cases {
+            let mut rng = Lcg(seed);
+            let round = |v: Vec<f32>| -> Vec<f32> { v.into_iter().map(|x| bf16_val(bf16_bits(x))).collect() };
+            let n_q = sh.b * sh.h * sh.s * sh.d;
+            let n_kv = sh.b * sh.kvh * sh.s * sh.d;
+            let n_l = sh.b * sh.h * sh.s;
+            let q = round(rng.vec(n_q, 1.0));
+            let k = round(rng.vec(n_kv, 1.0));
+            let v = round(rng.vec(n_kv, 1.0));
+            let dout = round(rng.vec(n_q, amp));
+            let scale = 1.0 / (sh.d as f32).sqrt();
+            let fl = |q: u64, k: u64, v: u64, o: u64, lse: u64| FwdLaunch {
+                q, k, v, o, lse,
+                batch: sh.b, heads: sh.h, kv_heads: sh.kvh, seq: sh.s, head_dim: sh.d, scale, causal: sh.causal,
+            };
+            // f32 I/O on the bf16 values.
+            let (q32, k32, v32) = (upload(&q), upload(&k), upload(&v));
+            let (o32, l32) = (poisoned(n_q), poisoned(n_l));
+            assert_eq!(forward_io(&fl(q32 as u64, k32 as u64, v32 as u64, o32 as u64, l32 as u64), Storage::F32), CUresult::CUDA_SUCCESS);
+            // bf16 I/O.
+            let (q16, k16, v16) = (upload_bf16(&q), upload_bf16(&k), upload_bf16(&v));
+            let o16 = inner::alloc_managed(n_q * 2);
+            inner::memset_d8_value(o16, 0xFF, n_q * 2);
+            let l16 = poisoned(n_l);
+            assert_eq!(forward_io(&fl(q16 as u64, k16 as u64, v16 as u64, o16 as u64, l16 as u64), Storage::Bf16), CUresult::CUDA_SUCCESS);
+            assert_eq!(unsafe { cudarc::driver::sys::cuCtxSynchronize() }, CUresult::CUDA_SUCCESS);
+            let o_f32 = download(o32, n_q);
+            let o_b16 = download_bits(o16, n_q);
+            let want: Vec<u16> = o_f32.iter().map(|&x| bf16_bits(x)).collect();
+            let bad = o_b16.iter().zip(&want).filter(|(a, b)| a != b).count();
+            assert_eq!(bad, 0, "{sh:?}: {bad} of {n_q} bf16 O values are not RNE of the f32 kernel's O");
+            assert_eq!(download(l16, n_l), download(l32, n_l), "{sh:?}: the log-sum-exp must not depend on the I/O storage");
+
+            // Backward: both read the bf16 O (the f32 run as f32 values).
+            let o_rounded: Vec<f32> = o_b16.iter().map(|&b| bf16_val(b)).collect();
+            let o32r = upload(&o_rounded);
+            let (do32, do16) = (upload(&dout), upload_bf16(&dout));
+            let run = |io: Storage, qp, kp, vp, op, dop, lse| -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+                let w = io.bytes();
+                let (dq, dk, dv) = (inner::alloc_managed(n_q * w), inner::alloc_managed(n_kv * w), inner::alloc_managed(n_kv * w));
+                for (p, n) in [(dq, n_q), (dk, n_kv), (dv, n_kv)] {
+                    inner::memset_d8_value(p, 0xFF, n * w);
+                }
+                let (dvec, gmax) = (poisoned(n_l), poisoned(sh.b * sh.h));
+                let rc = backward_io(&BwdLaunch {
+                    q: qp, k: kp, v: vp, o: op, lse, dout: dop,
+                    dq: dq as u64, dk: dk as u64, dv: dv as u64, dvec: dvec as u64, gmax: gmax as u64,
+                    batch: sh.b, heads: sh.h, kv_heads: sh.kvh, seq: sh.s, head_dim: sh.d, scale, causal: sh.causal,
+                }, io);
+                assert_eq!(rc, CUresult::CUDA_SUCCESS, "{sh:?} {io:?} backward");
+                assert_eq!(unsafe { cudarc::driver::sys::cuCtxSynchronize() }, CUresult::CUDA_SUCCESS);
+                let get = |p: *mut c_void, n: usize| {
+                    let mut out = vec![0u8; n * w];
+                    inner::memcpy_dtoh(out.as_mut_ptr() as *mut c_void, p as *const c_void, n * w);
+                    out
+                };
+                let r = (get(dq, n_q), get(dk, n_kv), get(dv, n_kv));
+                for p in [dq, dk, dv, dvec, gmax] {
+                    inner::free_managed(p);
+                }
+                r
+            };
+            let g32 = run(Storage::F32, q32 as u64, k32 as u64, v32 as u64, o32r as u64, do32 as u64, l32 as u64);
+            let g16 = run(Storage::Bf16, q16 as u64, k16 as u64, v16 as u64, o16 as u64, do16 as u64, l16 as u64);
+            for (what, a32, a16) in [("dQ", &g32.0, &g16.0), ("dK", &g32.1, &g16.1), ("dV", &g32.2, &g16.2)] {
+                let f: Vec<f32> = a32.chunks(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                let b: Vec<u16> = a16.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+                assert!(f.iter().all(|x| x.is_finite()), "{sh:?} {what}: the f32 kernel left non-finite values");
+                let bad = f.iter().zip(&b).filter(|(x, y)| bf16_bits(**x) != **y).count();
+                let nz = f.iter().filter(|x| **x != 0.0).count();
+                assert!(nz * 2 > f.len(), "{sh:?} {what}: mostly zero gradients, the case tests nothing");
+                assert_eq!(bad, 0, "{sh:?} amp {amp}: {bad} of {} bf16 {what} values are not RNE of the f32 kernel's", f.len());
+            }
+            for p in [q32, k32, v32, o32, l32, q16, k16, v16, o16, l16, o32r, do32, do16] {
+                inner::free_managed(p);
+            }
+        }
+    }
+
     #[test]
     #[ignore = "requires a CUDA GPU; run with --features cuda -- --ignored"]
     fn tc_backward_small_rows_keep_their_precision() {

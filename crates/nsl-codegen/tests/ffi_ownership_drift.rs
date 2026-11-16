@@ -88,6 +88,7 @@ fn expected() -> BTreeMap<&'static str, Expected> {
     m.insert("tensor_sin", Ffi("nsl_tensor_sin"));
     m.insert("tensor_cos", Ffi("nsl_tensor_cos"));
     m.insert("rotate_half", Ffi("nsl_tensor_rotate_half"));
+    m.insert("rope", Ffi("nsl_tensor_rope"));
     // Reductions
     m.insert("mean", Ffi("nsl_tensor_mean"));
     m.insert("sum", Ffi("nsl_tensor_sum"));

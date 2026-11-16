@@ -41,9 +41,10 @@
 
 use super::fwd::{acc_to_a_frags, load_a_frags, mma_b_rows, mma_b_trans, Lane, TileMap};
 use super::{
-    f32_global, f32_shared, grad_scale_from_max_bits, h2, h2_shared, u32_global, G, F16_MAX, LOG2_E,
-    SMEM_ROW_PAD,
+    f32_global, f32_shared, grad_scale_from_max_bits, h2, h2_shared, io_global, u32_global, G, F16_MAX,
+    LOG2_E, SMEM_ROW_PAD,
 };
+use crate::kernels::storage::Storage;
 use crate::kernel_ir::{
     AddressSpace, CmpOp, KernelIR, KirEdge, KirOp, KirTerminator, KirType, SmemLayout, SmemRegion, VarId,
 };
@@ -60,6 +61,9 @@ pub struct BwdConfig {
     pub dq_block_n: u32,
     pub dkdv_warps: u32,
     pub dkdv_block_q: u32,
+    /// How Q, K, V, O, dO, dQ, dK and dV are stored (see
+    /// [`super::fwd::FwdConfig::io`]); `lse`, `D` and `gmax` stay f32.
+    pub io: Storage,
 }
 
 /// Warps per CTA of the pre-pass, and rows each warp reduces.
@@ -79,7 +83,7 @@ impl BwdConfig {
         // 0.60 ms and dK/dV 0.76 ms at 8 warps x 32.
         let (dq_warps, dq_block_n, dkdv_warps, dkdv_block_q) =
             if head_dim > 64 { (8, 32, 8, 32) } else { (4, 32, 4, 32) };
-        BwdConfig { head_dim, causal, dq_warps, dq_block_n, dkdv_warps, dkdv_block_q }
+        BwdConfig { head_dim, causal, dq_warps, dq_block_n, dkdv_warps, dkdv_block_q, io: Storage::F32 }
     }
 
     pub fn supported(head_dim: u32) -> bool {
@@ -88,6 +92,15 @@ impl BwdConfig {
 
     fn tag(&self) -> String {
         format!("d{}_{}", self.head_dim, if self.causal { "causal" } else { "full" })
+    }
+
+    /// This variant with its activations and their gradients stored as `io`.
+    pub fn with_io(self, io: Storage) -> BwdConfig {
+        BwdConfig { io, ..self }
+    }
+
+    fn io_suffix(&self) -> &'static str {
+        if self.io == Storage::Bf16 { "_bf16" } else { "" }
     }
 
     /// The same problem with the pre-pass's (tiling-independent) identity.
@@ -102,7 +115,7 @@ impl BwdConfig {
     // ── pre-pass ──
 
     pub fn pre_kernel_name(&self) -> String {
-        format!("nsl_flash_tc_bwd_pre_d{}", self.head_dim)
+        format!("nsl_flash_tc_bwd_pre_d{}{}", self.head_dim, self.io_suffix())
     }
 
     pub fn pre_threads(&self) -> u32 {
@@ -123,7 +136,7 @@ impl BwdConfig {
     // ── dQ ──
 
     pub fn dq_kernel_name(&self) -> String {
-        format!("nsl_flash_tc_bwd_dq_{}_w{}_n{}", self.tag(), self.dq_warps, self.dq_block_n)
+        format!("nsl_flash_tc_bwd_dq_{}_w{}_n{}{}", self.tag(), self.dq_warps, self.dq_block_n, self.io_suffix())
     }
 
     pub fn dq_block_m(&self) -> u32 {
@@ -151,7 +164,7 @@ impl BwdConfig {
     // ── dK/dV ──
 
     pub fn dkdv_kernel_name(&self) -> String {
-        format!("nsl_flash_tc_bwd_dkdv_{}_w{}_q{}", self.tag(), self.dkdv_warps, self.dkdv_block_q)
+        format!("nsl_flash_tc_bwd_dkdv_{}_w{}_q{}{}", self.tag(), self.dkdv_warps, self.dkdv_block_q, self.io_suffix())
     }
 
     pub fn dkdv_block_n(&self) -> u32 {
@@ -192,8 +205,8 @@ pub fn build_pre(cfg: BwdConfig) -> KernelIR {
     let per_lane = hd / 32; // 2 or 4 consecutive elements
     let names = BwdConfig::pre_param_names();
     let mut g = G::new(&cfg.pre_kernel_name());
-    let dout = g.b.add_param(names[0], f32_global(), AddressSpace::Global);
-    let out = g.b.add_param(names[1], f32_global(), AddressSpace::Global);
+    let dout = g.b.add_param(names[0], io_global(cfg.io), AddressSpace::Global);
+    let out = g.b.add_param(names[1], io_global(cfg.io), AddressSpace::Global);
     let dvec = g.b.add_param(names[2], f32_global(), AddressSpace::Global);
     let gmax = g.b.add_param(names[3], u32_global(), AddressSpace::Global);
     let rows = g.b.add_param(names[4], U32, AddressSpace::Local);
@@ -232,8 +245,8 @@ pub fn build_pre(cfg: BwdConfig) -> KernelIR {
         };
         let pd = g.ptr(dout, off);
         let po = g.ptr(out, off);
-        let dv = g.load_vec(pd, per_lane as usize, AddressSpace::Global);
-        let ov = g.load_vec(po, per_lane as usize, AddressSpace::Global);
+        let dv = g.load_vec_f32(pd, per_lane as usize, AddressSpace::Global);
+        let ov = g.load_vec_f32(po, per_lane as usize, AddressSpace::Global);
         let mut dot = g.mul(dv[0], ov[0]);
         let mut amax = g.abs(dv[0]);
         for e in 1..per_lane as usize {
@@ -274,13 +287,13 @@ pub fn build_dq(cfg: BwdConfig) -> KernelIR {
     let names = BwdConfig::dq_param_names();
 
     let mut g = G::new(&cfg.dq_kernel_name());
-    let q = g.b.add_param(names[0], f32_global(), AddressSpace::Global);
-    let k = g.b.add_param(names[1], f32_global(), AddressSpace::Global);
-    let v = g.b.add_param(names[2], f32_global(), AddressSpace::Global);
-    let dout = g.b.add_param(names[3], f32_global(), AddressSpace::Global);
+    let q = g.b.add_param(names[0], io_global(cfg.io), AddressSpace::Global);
+    let k = g.b.add_param(names[1], io_global(cfg.io), AddressSpace::Global);
+    let v = g.b.add_param(names[2], io_global(cfg.io), AddressSpace::Global);
+    let dout = g.b.add_param(names[3], io_global(cfg.io), AddressSpace::Global);
     let lse = g.b.add_param(names[4], f32_global(), AddressSpace::Global);
     let dvec = g.b.add_param(names[5], f32_global(), AddressSpace::Global);
-    let dq = g.b.add_param(names[6], f32_global(), AddressSpace::Global);
+    let dq = g.b.add_param(names[6], io_global(cfg.io), AddressSpace::Global);
     let seq = g.b.add_param(names[7], U32, AddressSpace::Local);
     let heads = g.b.add_param(names[8], U32, AddressSpace::Local);
     let kv_heads = g.b.add_param(names[9], U32, AddressSpace::Local);
@@ -555,7 +568,8 @@ pub fn build_dq(cfg: BwdConfig) -> KernelIR {
             let x0 = g.mul(acc[half * 2], f);
             let x1 = g.mul(acc[half * 2 + 1], f);
             let p = g.ptr_c(prow, n as u32 * 8);
-            g.when(valid, KirOp::StoreVec { ptr: p, vals: vec![x0, x1], space: AddressSpace::Global });
+            let vals = g.narrow_to(p, vec![x0, x1]);
+            g.when(valid, KirOp::StoreVec { ptr: p, vals, space: AddressSpace::Global });
         }
     }
     g.b.terminate(KirTerminator::Return);
@@ -585,7 +599,7 @@ fn load_raw_rows(
             let mut regs = [(0, 0); 4];
             for (r, (p, col)) in [(p_lo, 0u32), (p_hi, 0), (p_lo, 8), (p_hi, 8)].into_iter().enumerate() {
                 let pp = g.ptr_c(p, 16 * t + col);
-                let v = g.load_vec(pp, 2, AddressSpace::Global);
+                let v = g.load_vec_f32(pp, 2, AddressSpace::Global);
                 regs[r] = (v[0], v[1]);
             }
             regs
@@ -669,15 +683,15 @@ pub fn build_dkdv(cfg: BwdConfig) -> KernelIR {
     let names = BwdConfig::dkdv_param_names();
 
     let mut g = G::new(&cfg.dkdv_kernel_name());
-    let q = g.b.add_param(names[0], f32_global(), AddressSpace::Global);
-    let k = g.b.add_param(names[1], f32_global(), AddressSpace::Global);
-    let v = g.b.add_param(names[2], f32_global(), AddressSpace::Global);
-    let dout = g.b.add_param(names[3], f32_global(), AddressSpace::Global);
+    let q = g.b.add_param(names[0], io_global(cfg.io), AddressSpace::Global);
+    let k = g.b.add_param(names[1], io_global(cfg.io), AddressSpace::Global);
+    let v = g.b.add_param(names[2], io_global(cfg.io), AddressSpace::Global);
+    let dout = g.b.add_param(names[3], io_global(cfg.io), AddressSpace::Global);
     let lse = g.b.add_param(names[4], f32_global(), AddressSpace::Global);
     let dvec = g.b.add_param(names[5], f32_global(), AddressSpace::Global);
     let gmax = g.b.add_param(names[6], u32_global(), AddressSpace::Global);
-    let dk = g.b.add_param(names[7], f32_global(), AddressSpace::Global);
-    let dv = g.b.add_param(names[8], f32_global(), AddressSpace::Global);
+    let dk = g.b.add_param(names[7], io_global(cfg.io), AddressSpace::Global);
+    let dv = g.b.add_param(names[8], io_global(cfg.io), AddressSpace::Global);
     let seq = g.b.add_param(names[9], U32, AddressSpace::Local);
     let heads = g.b.add_param(names[10], U32, AddressSpace::Local);
     let kv_heads = g.b.add_param(names[11], U32, AddressSpace::Local);
@@ -1001,12 +1015,14 @@ pub fn build_dkdv(cfg: BwdConfig) -> KernelIR {
             let x0 = g.mul(a[half * 2], fk);
             let x1 = g.mul(a[half * 2 + 1], fk);
             let p = g.ptr_c(pk, n as u32 * 8);
-            g.when(valid, KirOp::StoreVec { ptr: p, vals: vec![x0, x1], space: AddressSpace::Global });
+            let vals = g.narrow_to(p, vec![x0, x1]);
+            g.when(valid, KirOp::StoreVec { ptr: p, vals, space: AddressSpace::Global });
             let b = accs[n_dn + n];
             let y0 = g.mul(b[half * 2], ginv);
             let y1 = g.mul(b[half * 2 + 1], ginv);
             let p = g.ptr_c(pv, n as u32 * 8);
-            g.when(valid, KirOp::StoreVec { ptr: p, vals: vec![y0, y1], space: AddressSpace::Global });
+            let vals = g.narrow_to(p, vec![y0, y1]);
+            g.when(valid, KirOp::StoreVec { ptr: p, vals, space: AddressSpace::Global });
         }
     }
     g.b.terminate(KirTerminator::Return);

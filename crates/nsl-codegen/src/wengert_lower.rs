@@ -1638,6 +1638,17 @@ fn lower_storage_op(
             "nsl_tensor_swiglu_gate_backward_dt",
             &[inputs[0], inputs[1], inputs[2], dt],
         ),
+        PrimalOp::Passthrough(name) if name == "rotate_half" || name == "rotate_half_neg" => {
+            let neg = builder.ins().iconst(cl_types::I64, i64::from(name == "rotate_half_neg"));
+            call(compiler, builder, "nsl_tensor_rotate_half_dt", &[inputs[0], neg, dt])
+        }
+        PrimalOp::Passthrough(name) if name == "reduce_to_shape" => {
+            call(compiler, builder, "nsl_tensor_reduce_to_shape_dt", &[inputs[0], inputs[1], dt])
+        }
+        PrimalOp::Passthrough(name) if name == "rope" || name == "rope_backward" => {
+            let f = if name == "rope" { "nsl_tensor_rope_dt" } else { "nsl_tensor_rope_backward_dt" };
+            call(compiler, builder, f, &[inputs[0], inputs[1], inputs[2], dt])
+        }
         other => Err(CodegenError::new(format!(
             "internal: the bf16 storage plan sent {other:?} (VarId {}) to the dtype-explicit lowering, \
              which does not cover it",
@@ -3877,6 +3888,10 @@ fn lower_single_op(
                 "cos" => call(compiler, builder, "nsl_tensor_cos", &[inputs[0]]),
                 "sin" => call(compiler, builder, "nsl_tensor_sin", &[inputs[0]]),
                 "rotate_half" => call(compiler, builder, "nsl_tensor_rotate_half", &[inputs[0]]),
+                "rope" => call(compiler, builder, "nsl_tensor_rope", &[inputs[0], inputs[1], inputs[2]]),
+                "rope_backward" => {
+                    call(compiler, builder, "nsl_tensor_rope_backward", &[inputs[0], inputs[1], inputs[2]])
+                }
                 // Fused RoPE backward: -rotate_half(dy) as one kernel (bit-exact —
                 // a permutation with a sign flip has no rounding).
                 "rotate_half_neg" => {

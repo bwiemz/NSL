@@ -44,6 +44,9 @@ pub(crate) mod storage_kernels;
 #[cfg(feature = "cuda")]
 pub(crate) mod storage_gemm;
 
+#[cfg(feature = "cuda")]
+pub(crate) mod storage_copy;
+
 /// Test-only views of the bf16 cast cache (re-exported from lib.rs): the
 /// integration gate drives registration through the REAL fused-AdamW extern
 /// and needs only to observe (hits, recasts, evictions) and reset between
@@ -55,6 +58,22 @@ pub fn test_bf16_cast_cache_stats() -> (u64, u64, u64) {
 #[cfg(all(feature = "cuda", feature = "test-hooks"))]
 pub fn test_bf16_cast_cache_reset() {
     bf16_cast_cache::reset_for_test()
+}
+
+/// Test-only: how many bf16 contiguous copies took the widen/copy/narrow path.
+#[cfg(all(feature = "cuda", feature = "test-hooks"))]
+pub fn test_storage_copy_regional_count() -> u64 {
+    storage_copy::regional_count()
+}
+
+/// Test-only: arm (and clear) or disarm the fused LM head's logits probe,
+/// returning what it recorded: per logits chunk, in call order, whether it
+/// was the backward's recompute, whether its GEMM took the bf16 head, and
+/// the chunk's f32 bits.
+#[cfg(all(feature = "cuda", feature = "test-hooks"))]
+pub fn test_lce_logits_probe(arm: bool) -> Vec<(bool, bool, Vec<u32>)> {
+    fused_ce_kernels::logits_probe::ARMED.store(arm, std::sync::atomic::Ordering::Relaxed);
+    std::mem::take(&mut *fused_ce_kernels::logits_probe::CHUNKS.lock().expect("probe lock"))
 }
 
 /// Test-only views of the cublasLt matmul path, same shape as the cast-cache
@@ -2643,6 +2662,12 @@ pub(crate) mod cublas_inner {
     /// break-even near mnk/(a_elems + b_elems) ~ 250; the default of 512
     /// stays a factor of 2 above break-even so marginal shapes do not
     /// thrash. `NSL_MATMUL_BF16_MIN_RATIO` overrides (integer, elements).
+    /// [`bf16_storage_worthwhile`] for callers that issue their own bf16 GEMMs
+    /// (the fused LM head), so they take bf16 exactly where the mode would.
+    pub(crate) fn bf16_gate(m: i64, n: i64, k: i64, a_elems: usize, b_elems: usize) -> bool {
+        bf16_storage_worthwhile(m, n, k, a_elems, b_elems)
+    }
+
     fn bf16_storage_worthwhile(m: i64, n: i64, k: i64, a_elems: usize, b_elems: usize) -> bool {
         static MIN_RATIO: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
         let min_ratio = *MIN_RATIO.get_or_init(|| {
