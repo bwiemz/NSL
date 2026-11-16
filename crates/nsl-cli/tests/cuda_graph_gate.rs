@@ -521,12 +521,16 @@ fn cuda_graph_self_heals_on_host_readbacks_gpu() {
 /// now folds the read to that constant.
 ///
 /// Stated as a DIFFERENTIAL against the kill switch rather than as
-/// `taints == 0`, for two reasons. It is non-vacuous by construction: the
-/// unfolded arm must fail to capture at all, so the folded arm's `captured`
-/// cannot be explained by anything but the fold. And it is honest about the
-/// fixture, which retains one unrelated device-to-host migration — meaning
-/// the folded arm still taints, and a gate demanding zero would be asserting
-/// something about that migration instead of about the fold.
+/// `taints == 0`. It is non-vacuous by construction: both arms bracket the
+/// same regions and differ only in the fold, so every capture the folded arm
+/// has and the unfolded arm lacks is the fold's doing. The unfolded arm need
+/// not capture nothing: a region that never held the readback captures in
+/// both arms. Until d4513e07 (#855) none did, because `l1_loss`'s backward
+/// copied its operands to the host and tainted the adjoint region in both
+/// arms; it now runs on the device, so the adjoint captures in both and the
+/// folded arm reaches `taints == 0`. The gate still does not demand zero,
+/// because a later unrelated host interaction in the fixture would then fail
+/// it for a reason that has nothing to do with the fold.
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn cuda_graph_config_item_read_folds_and_captures_gpu() {
@@ -563,11 +567,21 @@ fn cuda_graph_config_item_read_folds_and_captures_gpu() {
         "no region captured with the fold on: {c:?}\n{}",
         folded.stderr
     );
+    // Like for like: the kill switch changes only what `.item()` emits, so
+    // both arms must bracket the same regions, or the differential below
+    // compares two different programs.
     assert_eq!(
-        uc["captured"], 0,
-        "the config `.item()` readback did NOT block capture, so this fixture \
-         no longer exercises the defect and the assertion above proves nothing: \
-         {uc:?}\n{}",
+        c["regions"], uc["regions"],
+        "the kill switch changed the region structure: folded {c:?} vs \
+         unfolded {uc:?}"
+    );
+    assert!(
+        c["captured"] > uc["captured"],
+        "the config `.item()` readback did NOT block any capture that the fold \
+         restores, so this fixture no longer exercises the defect and the \
+         folded arm's captures say nothing about the fold: folded {c:?} vs \
+         unfolded {uc:?}\nfolded stderr:\n{}\nunfolded stderr:\n{}",
+        folded.stderr,
         unfolded.stderr
     );
     assert!(
@@ -576,6 +590,15 @@ fn cuda_graph_config_item_read_folds_and_captures_gpu() {
          not reaching the fold, or the fold is not what removes the readback: \
          folded {c:?} vs unfolded {uc:?}\n{}",
         unfolded.stderr
+    );
+    // And the whole of the fold's effect: every region it untaints then
+    // captures. (Both differences are positive by the two asserts above.)
+    assert_eq!(
+        c["captured"] - uc["captured"],
+        uc["taints"] - c["taints"],
+        "the fold untainted regions that then did not capture: folded {c:?} vs \
+         unfolded {uc:?}\n{}",
+        folded.stderr
     );
 
     // Folding must not change what the model computes — against the unfolded
