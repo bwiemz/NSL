@@ -1103,8 +1103,11 @@ fn t1_forward_output_invariant_under_save_activations_flag_multitile_segmented_t
     // garbage at seq > block (single-tile K/V projections + split-S/PV
     // P clobbering). The old save-flag invariance held only over that
     // garbage; the honest contract now is a loud rc=-1 on both arms.
+    // Causal: a segment-masked kernel exists only with the causal mask
+    // (the emitter refuses one without it, 283c18d9), so a non-causal
+    // fixture would stop in codegen and never reach the dispatch refusal.
     let err_no_save = run_with_saves(
-        block_q, block_kv, head_dim, heads, false, false, Some(seq), None, Some(&seg_ids),
+        block_q, block_kv, head_dim, heads, true, false, Some(seq), None, Some(&seg_ids),
     )
     .expect_err("segmented multi-tile launch must refuse (save=None arm)");
     assert!(
@@ -1117,7 +1120,7 @@ fn t1_forward_output_invariant_under_save_activations_flag_multitile_segmented_t
     };
     assert_ne!(saves.q_proj, 0, "activation alloc failed");
     let err_save = run_with_saves(
-        block_q, block_kv, head_dim, heads, false, false, Some(seq), Some(saves), Some(&seg_ids),
+        block_q, block_kv, head_dim, heads, true, false, Some(seq), Some(saves), Some(&seg_ids),
     )
     .expect_err("segmented multi-tile launch must refuse (save=Some arm)");
     unsafe { nsl_csha_free_backward_activations(saves); }
@@ -1150,8 +1153,11 @@ fn t1_forward_output_invariant_under_save_activations_flag_multitile_segmented_t
     // garbage at seq > block (single-tile K/V projections + split-S/PV
     // P clobbering). The old save-flag invariance held only over that
     // garbage; the honest contract now is a loud rc=-1 on both arms.
+    // Causal: a segment-masked kernel exists only with the causal mask
+    // (the emitter refuses one without it, 283c18d9), so a non-causal
+    // fixture would stop in codegen and never reach the dispatch refusal.
     let err_no_save = run_with_saves(
-        block_q, block_kv, head_dim, heads, false, false, Some(seq), None, Some(&seg_ids),
+        block_q, block_kv, head_dim, heads, true, false, Some(seq), None, Some(&seg_ids),
     )
     .expect_err("segmented multi-tile launch must refuse (save=None arm)");
     assert!(
@@ -1164,7 +1170,7 @@ fn t1_forward_output_invariant_under_save_activations_flag_multitile_segmented_t
     };
     assert_ne!(saves.q_proj, 0, "activation alloc failed");
     let err_save = run_with_saves(
-        block_q, block_kv, head_dim, heads, false, false, Some(seq), Some(saves), Some(&seg_ids),
+        block_q, block_kv, head_dim, heads, true, false, Some(seq), Some(saves), Some(&seg_ids),
     )
     .expect_err("segmented multi-tile launch must refuse (save=Some arm)");
     unsafe { nsl_csha_free_backward_activations(saves); }
