@@ -71,7 +71,9 @@
 # layers at batch 2 x seq 1024 that exhaust the card. Recomputing them brings
 # the activation surface to a 8.34 GB peak and the whole run to ~10.9 GB
 # driver-reported at step 5, measured with NSL_MEMSTATS=1 on an RTX PRO 4500
-# Blackwell (32 GB) with ~1.4 GB of ambient desktop VRAM in use.
+# Blackwell (32 GB) with ~1.4 GB of ambient desktop VRAM in use. Those memory
+# numbers predate bf16 activation storage (f32 storage, TF32 GEMMs); with it
+# the activation surface is smaller, and --checkpoint-blocks stays in the line.
 #
 # PRECISION (2026-11): `precision = "bf16"` in the train header stores
 # activations and their gradients in bf16 (f32 math inside every kernel, one
@@ -80,9 +82,11 @@
 # --source-ad, is part of the execution fingerprint (`act=bf16`), and is a
 # compile error with NSL_MATMUL_BF16=0 or a --matmul-mode other than bf16.
 # Measured at this geometry on the 1B recipe's flag line (tools/perfcheck,
-# 2026-11-15): 1.167x tok/s over the bf16 GEMM mode alone (20,931 vs 17,937)
-# and a 0.94 GiB lower allocator peak; 22,331 tok/s on the toolchain that
-# shipped it. Its held-out loss at this geometry over 5 seeds x 4,000 updates
+# 2026-11-15; that line adds --checkpoint-selective --fuse-rmsnorm-backward
+# --fuse-wgrad-accum to the RUN line above, so these numbers describe that
+# line, not this one): 1.167x tok/s over the bf16 GEMM mode alone (20,931 vs
+# 17,937) and a 0.94 GiB lower allocator peak; 22,331 tok/s on the toolchain
+# that shipped it. Its held-out loss at this geometry over 5 seeds x 4,000 updates
 # is no worse than TF32's or the bf16 GEMM mode's:
 # models/benchmarks/BF16_STORAGE_CONVERGENCE_2026_11.md.
 #

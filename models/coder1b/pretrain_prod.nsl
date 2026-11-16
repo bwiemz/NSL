@@ -47,10 +47,11 @@
 #
 # TOKEN BUDGET — 22.6B train tokens against ~1.07B parameters is ~21
 # tokens/param: Chinchilla-ish, the first genuinely-sized budget in this
-# repo. The full epoch is ~89 DAYS of resident single-GPU wall clock, which
-# is why it is NOT run casually: pretrain_pilot.nsl (item 6) is the
-# 98.3M-token pilot that validates the data path, scheduler, checkpointing
-# and held-out curves in ~9.5 h, and a 1-2B intermediate run comes between
+# repo. The full epoch is ~19 DAYS of resident single-GPU wall clock at
+# 13,466 tok/s (~89 days at the rate this line first quoted), which is why it
+# is NOT run casually: pretrain_pilot.nsl (item 6) is the 98.3M-token pilot
+# that validates the data path, scheduler, checkpointing and held-out curves
+# (~9.5 h at the rate of its day), and a 1-2B intermediate run comes between
 # the pilot and any full-epoch commitment.
 #
 # THE LEARNING RATE BELOW IS NOT MEASURED AT THIS SCALE — say so plainly,
@@ -226,7 +227,9 @@
 #                           recorded below for NSL_MATMUL_BF16: a resume under
 #                           other arithmetic is refused. It refuses
 #                           --cuda-graphs, --layerwise-accum, --weight-stream,
-#                           --param-dtype bf16-sr and --checkpoint-compress.
+#                           --param-dtype bf16-sr, --checkpoint-compress,
+#                           --transient-arena, --cpdt full and a WGGO moment
+#                           plan (none of them in this line).
 #   NSL_MATMUL_BF16=1       SUPERSEDED by precision="bf16", which sets it; kept
 #                           here for its record. ACQUITTED by a three-arm matched
 #                           pair (2026-08-31): from ONE checkpoint on identical
