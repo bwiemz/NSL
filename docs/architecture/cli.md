@@ -90,13 +90,14 @@ workspace root. `nsl.math` maps to `<root>/nsl/math.nsl`.
 
 ## Toolchain pinning
 
-NSL V2 plan, Phase 0 item 0.1: production coder runs stay on a
-long-term-support toolchain (`release/0.10-lts`, correctness-only backports)
-while the redesign lands on `main`. All of it lives in `src/toolchain.rs`.
+NSL V2 plan, Phase 0 item 0.1: production coder runs stay on a release
+toolchain (`release/<channel>`, cut from a main commit whose GPU certification
+lane was run, correctness-only backports) while `main` moves. The channels are
+`0.10-lts` and `0.11`. All of it lives in `src/toolchain.rs`.
 
 **Channels.** Every build belongs to one channel, `toolchain::CHANNEL`, which
-comes from the `nsl_channel!` macro. It is `"dev"` on `main`, and the LTS
-branch changes that one literal to `"0.10-lts"`. `toolchain::VERSION` is what
+comes from the `nsl_channel!` macro. It is `"dev"` on `main`, and each release
+branch changes that one literal to its channel (`"0.10-lts"`, `"0.11"`). `toolchain::VERSION` is what
 clap prints for `nsl --version` (`args.rs` passes it as the command's
 `version`): `nsl 0.10.0 (toolchain channel dev)`.
 
@@ -109,9 +110,10 @@ channel = "0.10-lts"
 
 Unknown keys are refused at both levels. The channel must match
 `[A-Za-z0-9][A-Za-z0-9._-]*`, because it becomes a directory name.
-`models/coder500m`, `coder1b`, `coder7b` and `coder-rl` are pinned to
-`0.10-lts`. `coder50m` is not, because V2's parity gate runs it on the dev
-toolchain.
+`models/coder500m` and `coder1b` are pinned to `0.11` (`release/0.11`), the
+first channel with bf16 activation storage, which their production recipes
+declare. `coder7b` and `coder-rl` stay on `0.10-lts`. `coder50m` is not
+pinned, because V2's parity gate runs it on the dev toolchain.
 
 **Lookup.** `main_inner` calls `toolchain::enforce_pin(&args.file,
 args.ignore_toolchain_pin)` for `nsl run` and `nsl build` before dispatching,

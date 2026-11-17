@@ -43,9 +43,10 @@
 # (schedule_unit below): every micro-batch of an accumulation window runs at
 # one rate. Until 2026-11 this file was written in micro-batches (warmup 400,
 # total 4096), the only unit the compiler then had; 50 and 512 are those
-# divided by the accumulation. The unit is stated because this directory is
-# pinned to the 0.10-lts toolchain, whose default is still micro-batches; it
-# needs an 0.10-lts install that knows the key (2026-11 or later).
+# divided by the accumulation. The unit is stated because the 0.10-lts
+# toolchain, which this directory was pinned to until 2026-11, defaults to
+# micro-batches; a recipe that leaves it to the default reads differently on
+# the two channels.
 # checkpoint_every counts OPTIMIZER steps as well. Dropout is real: DROPOUT=0.1 trains an actual
 # RNG mask and its backward consumes that same mask (PR #507).
 #
@@ -70,7 +71,24 @@
 # layers at batch 2 x seq 1024 that exhaust the card. Recomputing them brings
 # the activation surface to a 8.34 GB peak and the whole run to ~10.9 GB
 # driver-reported at step 5, measured with NSL_MEMSTATS=1 on an RTX PRO 4500
-# Blackwell (32 GB) with ~1.4 GB of ambient desktop VRAM in use.
+# Blackwell (32 GB) with ~1.4 GB of ambient desktop VRAM in use. Those memory
+# numbers predate bf16 activation storage (f32 storage, TF32 GEMMs); with it
+# the activation surface is smaller, and --checkpoint-blocks stays in the line.
+#
+# PRECISION (2026-11): `precision = "bf16"` in the train header stores
+# activations and their gradients in bf16 (f32 math inside every kernel, one
+# rounding to nearest even on store; weights, optimizer state and the residual
+# stream stay f32) and runs every GEMM on bf16 operands. It requires
+# --source-ad, is part of the execution fingerprint (`act=bf16`), and is a
+# compile error with NSL_MATMUL_BF16=0 or a --matmul-mode other than bf16.
+# Measured at this geometry on the 1B recipe's flag line (tools/perfcheck,
+# 2026-11-15; that line adds --checkpoint-selective --fuse-rmsnorm-backward
+# --fuse-wgrad-accum to the RUN line above, so these numbers describe that
+# line, not this one): 1.167x tok/s over the bf16 GEMM mode alone (20,931 vs
+# 17,937) and a 0.94 GiB lower allocator peak; 22,331 tok/s on the toolchain
+# that shipped it. Its held-out loss at this geometry over 5 seeds x 4,000 updates
+# is no worse than TF32's or the bf16 GEMM mode's:
+# models/benchmarks/BF16_STORAGE_CONVERGENCE_2026_11.md.
 #
 # Source AD is the production path (fused LCE/SDPA only exist there). This is
 # the same posture as the 1B recipe, which documents its own required flag
@@ -117,7 +135,7 @@ print("LOSS_STREAM_BEGIN")
 # does not use the `let ls = logits.shape` spelling that pretrain_cert.nsl,
 # which has no fusion, is free to use.
 @fused_lm_ce(enabled=true, vocab_size=49152, hidden_size=1280, batch_size=2, seq_len=1024)
-train(model=m, epochs=1, grad_accumulation=8, schedule_unit="optimizer_step", grad_clip=1.0, checkpoint_save="checkpoints/pretrain_prod_state.nslm", checkpoint_every=100):
+train(model=m, epochs=1, grad_accumulation=8, schedule_unit="optimizer_step", grad_clip=1.0, precision="bf16", checkpoint_save="checkpoints/pretrain_prod_state.nslm", checkpoint_every=100):
     optimizer: AdamW(lr=0.00015, weight_decay=0.1, beta1=0.9, beta2=0.95, eps=1e-8)
     scheduler: warmup_cosine(warmup_steps=50, total_steps=512, min_lr=0.00003)
     step(batch):
