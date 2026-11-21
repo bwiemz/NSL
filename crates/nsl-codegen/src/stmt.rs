@@ -2090,23 +2090,126 @@ impl Compiler<'_> {
         for stmt in &block.stmts {
             self.walk_stmt_model_touch(stmt, model_sym, &mut acc);
         }
+        // The walker above classifies reads and writes, but it walks only the
+        // statement and expression kinds it names: a model read inside a
+        // conditional expression, a comprehension, a lambda or a subscript,
+        // or through an alias of the model bound before the block, escapes
+        // it, and the body then runs without the residency bracket. The
+        // conservative scan finds those; what the walker could not classify
+        // is bracketed with writeback (always safe: an unmutated parameter
+        // writes back its own bytes).
+        if !acc.touches
+            && let Some(path) = self.callback_references_model(block, model_sym, false)
+        {
+            acc.touches = true;
+            acc.may_write = true;
+            acc.first_path = Some(path);
+        }
         acc
     }
 
-    /// `param_dtype=`: the first model access in a callback body (the same
-    /// analysis as item 12's residency bracket), or `None` when the body does
-    /// not reference the model.
+    /// Whether a callback body references the trained model anywhere, read
+    /// conservatively: the model's name in any expression or statement
+    /// (through the AST visitor, which walks every kind that holds one), any
+    /// expression the type checker typed as a model (an alias bound before the
+    /// block, `let m2 = m`, or a submodule, `let blk = m.b1`), and any
+    /// statement kind the visitor does not descend into. With
+    /// `exempt_model_save`, the model passed as `model_save`'s first argument
+    /// does not count (it writes the exact f32 masters of bf16-stored
+    /// parameters). What it cannot see is a tensor alias of one parameter
+    /// (`let w = m.b1.w` before the block): the runtime stops a host read of a
+    /// stored parameter, and the device kernels refuse a dtype they do not
+    /// read. Returns the first reference found, as written.
+    fn callback_references_model(
+        &self,
+        block: &nsl_ast::stmt::Block,
+        model_sym: nsl_ast::Symbol,
+        exempt_model_save: bool,
+    ) -> Option<String> {
+        use nsl_ast::expr::{Expr, ExprKind as E};
+        use nsl_ast::visitor::{Visitor, walk_expr, walk_stmt};
+
+        struct Scan<'a> {
+            is_model: &'a dyn Fn(&Expr) -> bool,
+            describe: &'a dyn Fn(&Expr) -> String,
+            is_model_save: &'a dyn Fn(nsl_ast::Symbol) -> bool,
+            exempt_model_save: bool,
+            found: Option<String>,
+        }
+        impl Visitor for Scan<'_> {
+            fn visit_stmt(&mut self, s: &Stmt) {
+                if self.found.is_some() {
+                    return;
+                }
+                if matches!(
+                    s.kind,
+                    StmtKind::QuantBlock(_) | StmtKind::ServeBlock(_) | StmtKind::DatatypeDef(_)
+                ) {
+                    // Not walked by the visitor: count it as a reference.
+                    self.found = Some("a statement the analysis does not walk".to_string());
+                    return;
+                }
+                walk_stmt(self, s);
+            }
+            fn visit_expr(&mut self, e: &Expr) {
+                if self.found.is_some() {
+                    return;
+                }
+                if (self.is_model)(e) {
+                    self.found = Some((self.describe)(e));
+                    return;
+                }
+                if let E::Call { callee, args } = &e.kind
+                    && self.exempt_model_save
+                    && matches!(&callee.kind, E::Ident(s) if (self.is_model_save)(*s))
+                {
+                    for (i, a) in args.iter().enumerate() {
+                        if i == 0
+                            && (self.is_model)(&a.value)
+                            && matches!(a.value.kind, E::Ident(_))
+                        {
+                            continue;
+                        }
+                        self.visit_expr(&a.value);
+                    }
+                    return;
+                }
+                walk_expr(self, e);
+            }
+        }
+
+        let is_model = |e: &Expr| {
+            matches!(e.kind, E::Ident(s) if s == model_sym)
+                || matches!(self.node_type(e.id), Type::Model { .. })
+        };
+        let describe = |e: &Expr| {
+            self.model_access_path(e)
+                .unwrap_or_else(|| self.resolve_sym(model_sym).to_string())
+        };
+        let is_model_save = |s: nsl_ast::Symbol| self.resolve_sym(s) == "model_save";
+        let mut scan = Scan {
+            is_model: &is_model,
+            describe: &describe,
+            is_model_save: &is_model_save,
+            exempt_model_save,
+            found: None,
+        };
+        for stmt in &block.stmts {
+            scan.visit_stmt(stmt);
+        }
+        scan.found
+    }
+
+    /// `param_dtype=`: a description of the first model access in a callback
+    /// body, or `None` when the body does not reference the model (the
+    /// conservative [`Self::callback_references_model`], with `model_save`
+    /// of the model allowed).
     pub(crate) fn callback_model_access(
         &self,
         block: &nsl_ast::stmt::Block,
         model_sym: nsl_ast::Symbol,
     ) -> Option<String> {
-        let touch = self.analyze_callback_model_touch(block, model_sym);
-        touch.touches.then(|| {
-            touch
-                .first_path
-                .unwrap_or_else(|| self.resolve_sym(model_sym).to_string())
-        })
+        self.callback_references_model(block, model_sym, true)
     }
 
     /// NSL in-place tensor mutators — the only calls that write a param

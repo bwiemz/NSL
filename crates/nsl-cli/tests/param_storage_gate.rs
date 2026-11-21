@@ -636,19 +636,67 @@ fn param_dtype_is_refused_where_the_matrices_would_be_inert_or_misread() {
         "param_dtype=\"bf16-split\" requires precision=\"bf16\"",
         "@pipeline without precision",
     );
-    for (body, path) in [
-        ("print(m.b1.w_gate.sum())", "m.b1.w_gate"),
-        ("print(mse_loss(m.forward(xd), yd))", "m"),
-    ] {
-        let src = fixture(SPLIT, 8, false, "")
-            .replace("            print(loss)", &format!("            {body}"));
-        assert!(src.contains(body), "the callback rewrite matched nothing");
+    // Each callback body compiles with f32 parameters (so a refusal below is
+    // the storage's, not a parse or type error) and is refused with
+    // param_dtype=, naming what it reads. The scan is the AST visitor's, so a
+    // reference inside a conditional expression or a lambda counts, and an
+    // alias of the model bound before the block counts by its type.
+    let cases: [(&str, &str, &str); 5] = [
+        ("", "print(m.b1.w_gate.sum())", "m.b1"),
+        ("", "print(mse_loss(m.forward(xd), yd))", "m"),
+        (
+            "",
+            "let v = if step > 0:\n                m.b1.w_gate.sum()\n            else:\n                loss\n            print(v)",
+            "m",
+        ),
+        (
+            "",
+            "let f = |t| t + m.b1.w_up.sum()\n            print(f(loss))",
+            "m",
+        ),
+        ("let m2 = m\n", "print(m2.b1.w_gate.sum())", "m2"),
+    ];
+    for (pre, body, path) in cases {
+        let with = |header: &str| {
+            fixture(header, 8, false, "")
+                .replace(
+                    "print(\"LOSS_STREAM_BEGIN\")",
+                    &format!("{pre}print(\"LOSS_STREAM_BEGIN\")"),
+                )
+                .replace("            print(loss)", &format!("            {body}"))
+        };
+        let plain = with("");
+        assert!(plain.contains(body), "the callback rewrite matched nothing");
+        let f32 = nsl(&args, &plain, &tmp("cb_f32"), "cb_f32", &[]);
+        assert!(
+            f32.ok,
+            "{body}: does not compile with f32 parameters either:\n{}",
+            f32.out
+        );
         refused(
-            &nsl(&args, &src, &tmp("cb_reads_model"), "cb_reads_model", &[]),
+            &nsl(
+                &args,
+                &with(SPLIT),
+                &tmp("cb_reads_model"),
+                "cb_reads_model",
+                &[],
+            ),
             &format!("callback `on_step` reads the model (`{path}"),
             body,
         );
     }
+    // `model_save` of the model writes the exact f32 masters, so it is allowed.
+    let save = fixture(SPLIT, 8, false, "").replace(
+        "            print(loss)",
+        "            print(loss)\n            if step == 4:\n                model_save(m, \"cb.nslm\")",
+    );
+    assert!(save.contains("model_save(m, \"cb.nslm\")"));
+    let r = nsl(&args, &save, &tmp("cb_save"), "cb_save", &[]);
+    assert!(
+        r.ok,
+        "a callback's model_save(m, ...) was refused:\n{}",
+        r.out
+    );
 }
 
 /// The health JSON `--monitor` writes in the run's directory.

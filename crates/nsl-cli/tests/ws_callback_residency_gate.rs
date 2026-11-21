@@ -133,6 +133,39 @@ fn inplace_mutator_callback_flags_writeback() {
     );
 }
 
+#[test]
+fn a_model_read_the_walker_does_not_name_is_still_bracketed() {
+    // The read/write walker names the statement and expression kinds it
+    // classifies; a model read inside a conditional expression or a lambda
+    // escaped it, and that callback ran on evicted (null) θ. The conservative
+    // scan behind it (the AST visitor) brackets such a body, with writeback
+    // since the walker could not classify it.
+    for (tag, body) in [
+        (
+            "ifexpr",
+            "let v = if step > 0:\n                m.norm_out.sum()\n            else:\n                loss\n            print(v)",
+        ),
+        (
+            "lambda",
+            "let f = |t| t + m.norm_out.sum()\n            print(f(loss))",
+        ),
+    ] {
+        let src = fixture_src("csla_ws_callback_model_read.nsl")
+            .replace(
+                "            print(m.norm_out.sum())",
+                &format!("            {body}"),
+            )
+            .replace("            model_save(m, \"CKPT_PATH\")\n", "");
+        assert!(src.contains(body), "{tag}: the rewrite matched nothing");
+        let (ok, stderr) = build_only(&src, tag);
+        assert!(ok, "{tag}: compile failed:\n{stderr}");
+        assert!(
+            stderr.contains(DIAG) && stderr.contains("(with writeback)"),
+            "{tag}: the read must be bracketed; stderr:\n{stderr}"
+        );
+    }
+}
+
 /// End-to-end GPU proof: with `# GPU_PLACEMENT` -> `m.to(cuda)` and weight
 /// streaming ON, the on_step callback reads `m.norm_out` and saves a
 /// checkpoint mid-loop — both of which dereference evicted params without
