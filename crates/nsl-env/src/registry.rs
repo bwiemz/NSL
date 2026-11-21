@@ -1068,6 +1068,24 @@ pub static REGISTRY: &[EnvVar] = &[
         "Prints the per-parameter placement plan (weight-stream/ZeRO/bf16-sr classes) derived under --layerwise-accum to stderr."
     ),
     var!(
+        "NSL_PARAM_STORAGE_ITEM_CHILD",
+        Bool,
+        "present (any value)",
+        "unset (child test body returns immediately)",
+        Test,
+        Test,
+        "Test harness only: marks the re-exec'd child that calls .item() on a stored bf16 GPU parameter, which must stop the run."
+    ),
+    var!(
+        "NSL_PARAM_STORAGE_TIED_CHILD",
+        Bool,
+        "present (any value)",
+        "unset (child test body returns immediately)",
+        Test,
+        Test,
+        "Test harness only: marks the re-exec'd child that stores a parameter tied to another, which must be refused with what to do."
+    ),
+    var!(
         "NSL_PARTIAL_BCAST_CHILD",
         Bool,
         "1 only",
