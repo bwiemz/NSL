@@ -2223,6 +2223,18 @@ impl CompileOptions {
         if env("NSL_FASE_FLUSH_TAIL").as_deref() == Some("0") {
             fields.push("fase_flush=0".to_string());
         }
+        // `--param-dtype bf16-sr` (the CSLA mirror mode): every streamed
+        // parameter's authoritative copy is bf16, stepped with stochastic
+        // rounding, so a resume across the flag changes the arithmetic of
+        // every parameter it covers. Its checkpoints save the f32 working
+        // view, so the `.nslm` dtype check cannot see it either. Emitted only
+        // when on, like the keys above: an f32 build and every older
+        // checkpoint agree by both lacking it. The train-block key
+        // `param_dtype=` (the normal-schedule modes) records other values of
+        // the same key from `main`.
+        if self.train.param_dtype_bf16sr {
+            fields.push("pdt=bf16sr-ws".to_string());
+        }
         fields.join(",")
     }
 }
@@ -2707,6 +2719,20 @@ mod exec_fingerprint_tests {
             f(&mut o);
             assert_ne!(o.exec_fingerprint(), f0, "changing {name} left the fingerprint identical");
         }
+    }
+
+    /// `--param-dtype bf16-sr` changes every streamed parameter's
+    /// arithmetic: its own key, present exactly when the flag is, so a resume
+    /// across it refuses and an f32 build matches an older checkpoint.
+    #[test]
+    fn the_csla_param_dtype_is_fingerprinted_only_when_on() {
+        let off = CompileOptions::default().exec_fingerprint();
+        assert!(!off.contains("pdt="), "{off}");
+        let mut o = CompileOptions::default();
+        o.train.param_dtype_bf16sr = true;
+        let on = o.exec_fingerprint();
+        assert!(on.split(',').any(|f| f == "pdt=bf16sr-ws"), "{on}");
+        assert_eq!(on, format!("{off},pdt=bf16sr-ws"));
     }
 
     #[test]

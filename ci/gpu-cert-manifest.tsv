@@ -152,6 +152,7 @@ crates/nsl-cli/tests/sr_bf16_gate.rs	srbf16_batched_step_matches_per_param_gpu	g
 crates/nsl-cli/tests/sr_bf16_gate.rs	srbf16_e2e_deterministic_and_sane_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/sr_bf16_gate.rs	srbf16_tracks_f32_baseline_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/sr_bf16_gate.rs	srbf16_parameter_surface_is_accounted_as_weights_gpu	gpu	requires GPU
+crates/nsl-cli/tests/sr_bf16_gate.rs	srbf16_resume_across_the_param_dtype_is_refused_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/stage_c_packed_parity.rs	packed_fused_training_smoke_on_gpu	gpu	requires CUDA GPU (two real training runs)
 crates/nsl-cli/tests/stage_c_packed_parity.rs	wggo_reports_fused_consumption_on_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/step_boundary_drain_gpu_gate.rs	steady_training_neither_frees_nor_allocates_after_warmup	gpu	requires CUDA GPU
