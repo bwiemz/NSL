@@ -2149,6 +2149,7 @@ impl Compiler<'_> {
                             adjoint: &adjoint,
                             adj_vid_to_hook_entry: &adj_vid_to_hook_entry,
                             csla_buffers,
+                            ccr_freed_primal: &ccr_freed_primal,
                             csla_pre,
                             fase_hook_active,
                             fase_plan: &fase_plan,

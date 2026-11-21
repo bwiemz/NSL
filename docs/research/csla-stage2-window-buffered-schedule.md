@@ -78,7 +78,8 @@ so parity holds; the sweep is purely against leaks).
   identically.
 
 The import set is `layerwise::adjoint_primal_imports`: adjoint-read ∩
-primal-produced, minus `Param`/`Constant` leaves (loop-invariant), computed on
+(primal-produced ∪ the CCR shape stubs the forward's per-segment free lists
+make), minus `Param`/`Constant` leaves (loop-invariant), computed on
 the FINAL adjoint (post dead-grad elimination, post CCR splice + last-use
 frees) so recompute-victim reads — remapped to clones — are correctly absent.
 Slots store i64 pointers/integers directly and f64 scalars via same-width
