@@ -1741,15 +1741,10 @@ pub extern "C" fn nsl_sdpa_fused_forward(
         // ── Marshal the v2 forward param layout: 36 base [+ 1 segment] ──
         // Widths matter — the launch wrapper reads sizeof(param_type)
         // bytes at each slot: everything u64 except scale/csha_eps (.f32)
-        // and csha_active_heads/csha_d_model (.u32).
-        let mut q = q_t.data as u64;
-        let mut k = k_t.data as u64;
-        let mut v = v_t.data as u64;
-        // Kernel writes f16 — point it at the staging buffer, NOT the
-        // final f32 tensor (see the output-dtype comment above).
-        let mut out = out_f16 as u64;
+        // and csha_active_heads/csha_d_model (.u32). q, k, v, out, the batch,
+        // lse and the segment ids are per batch row: they are set, and the
+        // argument array built from them, inside the launch loop below.
         let mut sc = f32::from_bits(scale_bits as u32);
-        let mut bb = b as u64;
         let mut hh = h as u64;
         let mut sl = s as u64;
         let mut hd = d as u64;
@@ -1764,7 +1759,6 @@ pub extern "C" fn nsl_sdpa_fused_forward(
         let mut dfs_enter: u64 = 0;
         let mut dfs_exit: u64 = 0;
         let mut num_tree_nodes: u64 = 0;
-        let mut lse = lse_data as u64;
         // CSHA extras — all disabled on the plain fused path.
         let mut csha_x: u64 = 0;
         let mut csha_nw: u64 = 0;
@@ -1783,53 +1777,6 @@ pub extern "C" fn nsl_sdpa_fused_forward(
         let mut rmax: u64 = 0;
         let mut rsum: u64 = 0;
         let mut xraw: u64 = 0;
-        // 37th param: segment_ids device pointer — pushed ONLY when
-        // launching the segment-masked kernel (which alone declares it).
-        // NEVER marshal 37 args for an unmasked kernel or 36 for a masked
-        // one: cuLaunchKernel arg counts must match the entry signature.
-        let mut seg_arg = seg_dev as u64;
-
-        let mut args: Vec<*mut c_void> = vec![
-            &mut q as *mut _ as *mut c_void,
-            &mut k as *mut _ as *mut c_void,
-            &mut v as *mut _ as *mut c_void,
-            &mut out as *mut _ as *mut c_void,
-            &mut sc as *mut _ as *mut c_void,
-            &mut bb as *mut _ as *mut c_void,
-            &mut hh as *mut _ as *mut c_void,
-            &mut sl as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-            &mut bt as *mut _ as *mut c_void,
-            &mut kp as *mut _ as *mut c_void,
-            &mut vp as *mut _ as *mut c_void,
-            &mut bs as *mut _ as *mut c_void,
-            &mut cos as *mut _ as *mut c_void,
-            &mut sin as *mut _ as *mut c_void,
-            &mut sids as *mut _ as *mut c_void,
-            &mut slens as *mut _ as *mut c_void,
-            &mut dfs_enter as *mut _ as *mut c_void,
-            &mut dfs_exit as *mut _ as *mut c_void,
-            &mut num_tree_nodes as *mut _ as *mut c_void,
-            &mut lse as *mut _ as *mut c_void,
-            &mut csha_x as *mut _ as *mut c_void,
-            &mut csha_nw as *mut _ as *mut c_void,
-            &mut csha_wq as *mut _ as *mut c_void,
-            &mut csha_wk as *mut _ as *mut c_void,
-            &mut csha_wv as *mut _ as *mut c_void,
-            &mut csha_wo as *mut _ as *mut c_void,
-            &mut csha_eps as *mut _ as *mut c_void,
-            &mut csha_ah as *mut _ as *mut c_void,
-            &mut csha_dm as *mut _ as *mut c_void,
-            &mut q_proj as *mut _ as *mut c_void,
-            &mut k_proj as *mut _ as *mut c_void,
-            &mut v_proj as *mut _ as *mut c_void,
-            &mut rmax as *mut _ as *mut c_void,
-            &mut rsum as *mut _ as *mut c_void,
-            &mut xraw as *mut _ as *mut c_void,
-        ];
-        if !seg_dev.is_null() {
-            args.push(&mut seg_arg as *mut _ as *mut c_void);
-        }
 
         // Grid/block identical to `nsl_flash_attention`: one CTA per
         // q-tile per (batch, head); 4 warps per CTA.
@@ -1851,14 +1798,63 @@ pub extern "C" fn nsl_sdpa_fused_forward(
         let row_seg = s as u64 * 2; // u16 bytes
         let mut rc = cudarc::driver::sys::CUresult::CUDA_SUCCESS;
         for bi in 0..b as u64 {
-            q = q_t.data as u64 + bi * row_qkv;
-            k = k_t.data as u64 + bi * row_qkv;
-            v = v_t.data as u64 + bi * row_qkv;
-            out = out_f16 as u64 + bi * (h * s * d) as u64 * 2; // f16 staging
-            lse = lse_data as u64 + bi * row_lse;
-            bb = 1;
+            // This row's operands, pre-indexed (batch 1 per launch). The
+            // argument array is built here, after they are final: it holds
+            // pointers that cuLaunchKernel reads at call time, so no value
+            // is written behind one.
+            let mut q = q_t.data as u64 + bi * row_qkv;
+            let mut k = k_t.data as u64 + bi * row_qkv;
+            let mut v = v_t.data as u64 + bi * row_qkv;
+            // The kernel writes f16: point it at the staging buffer, NOT
+            // the final f32 tensor (see the output-dtype comment above).
+            let mut out = out_f16 as u64 + bi * (h * s * d) as u64 * 2;
+            let mut lse = lse_data as u64 + bi * row_lse;
+            let mut bb: u64 = 1;
+            // 37th param: segment_ids device pointer — pushed ONLY when
+            // launching the segment-masked kernel (which alone declares it).
+            // NEVER marshal 37 args for an unmasked kernel or 36 for a masked
+            // one: cuLaunchKernel arg counts must match the entry signature.
+            let mut seg_arg = seg_dev as u64 + bi * row_seg;
+            let mut args: Vec<*mut c_void> = vec![
+                &mut q as *mut _ as *mut c_void,
+                &mut k as *mut _ as *mut c_void,
+                &mut v as *mut _ as *mut c_void,
+                &mut out as *mut _ as *mut c_void,
+                &mut sc as *mut _ as *mut c_void,
+                &mut bb as *mut _ as *mut c_void,
+                &mut hh as *mut _ as *mut c_void,
+                &mut sl as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut bt as *mut _ as *mut c_void,
+                &mut kp as *mut _ as *mut c_void,
+                &mut vp as *mut _ as *mut c_void,
+                &mut bs as *mut _ as *mut c_void,
+                &mut cos as *mut _ as *mut c_void,
+                &mut sin as *mut _ as *mut c_void,
+                &mut sids as *mut _ as *mut c_void,
+                &mut slens as *mut _ as *mut c_void,
+                &mut dfs_enter as *mut _ as *mut c_void,
+                &mut dfs_exit as *mut _ as *mut c_void,
+                &mut num_tree_nodes as *mut _ as *mut c_void,
+                &mut lse as *mut _ as *mut c_void,
+                &mut csha_x as *mut _ as *mut c_void,
+                &mut csha_nw as *mut _ as *mut c_void,
+                &mut csha_wq as *mut _ as *mut c_void,
+                &mut csha_wk as *mut _ as *mut c_void,
+                &mut csha_wv as *mut _ as *mut c_void,
+                &mut csha_wo as *mut _ as *mut c_void,
+                &mut csha_eps as *mut _ as *mut c_void,
+                &mut csha_ah as *mut _ as *mut c_void,
+                &mut csha_dm as *mut _ as *mut c_void,
+                &mut q_proj as *mut _ as *mut c_void,
+                &mut k_proj as *mut _ as *mut c_void,
+                &mut v_proj as *mut _ as *mut c_void,
+                &mut rmax as *mut _ as *mut c_void,
+                &mut rsum as *mut _ as *mut c_void,
+                &mut xraw as *mut _ as *mut c_void,
+            ];
             if !seg_dev.is_null() {
-                seg_arg = seg_dev as u64 + bi * row_seg;
+                args.push(&mut seg_arg as *mut _ as *mut c_void);
             }
             rc = inner::kernel_launch(
                 effective_ptx_ptr as *const u8,
@@ -2912,7 +2908,10 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
     shared_mem_bytes: i64,
     ptx_ptr: i64, name_ptr: i64,
     block_q: i64, _block_kv: i64,
-    causal: i64,
+    // The causal mask is compiled into the kernel `ptx_ptr`/`name_ptr` name
+    // (and into its multi-tile twin, from the same module); the launcher
+    // has no use for it. Kept for the C ABI.
+    _causal: i64,
     x_ptr: i64, norm_weight_ptr: i64,
     wq_ptr: i64, wk_ptr: i64, wv_ptr: i64, wo_ptr: i64,
     rmsnorm_eps_bits: i64,
@@ -3217,48 +3216,58 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
         // Sentinel 0 = identity positions (RoPE reset disabled).
         let mut doc_starts = doc_starts_ptr as u64;
 
-        let args: [*mut c_void; 38] = [
-            &mut q as *mut _ as *mut c_void,
-            &mut k as *mut _ as *mut c_void,
-            &mut v as *mut _ as *mut c_void,
-            &mut out as *mut _ as *mut c_void,
-            &mut s as *mut _ as *mut c_void,
-            &mut b as *mut _ as *mut c_void,
-            &mut h as *mut _ as *mut c_void,
-            &mut sl as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-            &mut bt as *mut _ as *mut c_void,
-            &mut kp as *mut _ as *mut c_void,
-            &mut vp as *mut _ as *mut c_void,
-            &mut bs as *mut _ as *mut c_void,
-            &mut cos as *mut _ as *mut c_void,
-            &mut sin as *mut _ as *mut c_void,
-            &mut sids as *mut _ as *mut c_void,
-            &mut slens as *mut _ as *mut c_void,
-            &mut dfs_enter as *mut _ as *mut c_void,
-            &mut dfs_exit as *mut _ as *mut c_void,
-            &mut num_tree_nodes as *mut _ as *mut c_void,
-            &mut lse as *mut _ as *mut c_void,
-            &mut x as *mut _ as *mut c_void,
-            &mut nw as *mut _ as *mut c_void,
-            &mut wq as *mut _ as *mut c_void,
-            &mut wk as *mut _ as *mut c_void,
-            &mut wv as *mut _ as *mut c_void,
-            &mut wo as *mut _ as *mut c_void,
-            &mut eps as *mut _ as *mut c_void,
-            &mut ah as *mut _ as *mut c_void,
-            &mut dm as *mut _ as *mut c_void,
-            &mut q_proj as *mut _ as *mut c_void,
-            &mut k_proj as *mut _ as *mut c_void,
-            &mut v_proj as *mut _ as *mut c_void,
-            &mut rmax as *mut _ as *mut c_void,
-            &mut rsum as *mut _ as *mut c_void,
-            &mut xraw as *mut _ as *mut c_void,
-            // PCA Tier A: segment_ids slot (trailing — matches prelude params Vec order)
-            &mut seg_ids as *mut _ as *mut c_void,
-            // PCA §4.3: doc_starts slot (trailing — matches prelude params Vec order)
-            &mut doc_starts as *mut _ as *mut c_void,
-        ];
+        // The argument array, built from the launch locals at each launch
+        // (launch A below, and the multi-tile twin, which reassigns some
+        // of them first). It holds pointers that cuLaunchKernel reads at
+        // call time, so it is rebuilt after a reassignment rather than
+        // having values written behind its pointers.
+        macro_rules! csha_launch_args {
+            () => {
+                [
+                    &mut q as *mut _ as *mut c_void,
+                    &mut k as *mut _ as *mut c_void,
+                    &mut v as *mut _ as *mut c_void,
+                    &mut out as *mut _ as *mut c_void,
+                    &mut s as *mut _ as *mut c_void,
+                    &mut b as *mut _ as *mut c_void,
+                    &mut h as *mut _ as *mut c_void,
+                    &mut sl as *mut _ as *mut c_void,
+                    &mut hd as *mut _ as *mut c_void,
+                    &mut bt as *mut _ as *mut c_void,
+                    &mut kp as *mut _ as *mut c_void,
+                    &mut vp as *mut _ as *mut c_void,
+                    &mut bs as *mut _ as *mut c_void,
+                    &mut cos as *mut _ as *mut c_void,
+                    &mut sin as *mut _ as *mut c_void,
+                    &mut sids as *mut _ as *mut c_void,
+                    &mut slens as *mut _ as *mut c_void,
+                    &mut dfs_enter as *mut _ as *mut c_void,
+                    &mut dfs_exit as *mut _ as *mut c_void,
+                    &mut num_tree_nodes as *mut _ as *mut c_void,
+                    &mut lse as *mut _ as *mut c_void,
+                    &mut x as *mut _ as *mut c_void,
+                    &mut nw as *mut _ as *mut c_void,
+                    &mut wq as *mut _ as *mut c_void,
+                    &mut wk as *mut _ as *mut c_void,
+                    &mut wv as *mut _ as *mut c_void,
+                    &mut wo as *mut _ as *mut c_void,
+                    &mut eps as *mut _ as *mut c_void,
+                    &mut ah as *mut _ as *mut c_void,
+                    &mut dm as *mut _ as *mut c_void,
+                    &mut q_proj as *mut _ as *mut c_void,
+                    &mut k_proj as *mut _ as *mut c_void,
+                    &mut v_proj as *mut _ as *mut c_void,
+                    &mut rmax as *mut _ as *mut c_void,
+                    &mut rsum as *mut _ as *mut c_void,
+                    &mut xraw as *mut _ as *mut c_void,
+                    // PCA Tier A: segment_ids slot (trailing — matches prelude params Vec order)
+                    &mut seg_ids as *mut _ as *mut c_void,
+                    // PCA §4.3: doc_starts slot (trailing — matches prelude params Vec order)
+                    &mut doc_starts as *mut _ as *mut c_void,
+                ]
+            };
+        }
+        let args: [*mut c_void; 38] = csha_launch_args!();
 
         // NSL_CSHA_DUMP_GRADS=1 forward-side diag: read the PTX kernel name
         // out of name_ptr (null-terminated C string) and print it so a
@@ -3367,9 +3376,8 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
                     return -1;
                 }
             }
-            // Mutate the launch locals in place — `args` holds pointers to
-            // them, and cuLaunchKernel reads the pointees at call time
-            // (same contract the per-q-block `slens` threading relies on).
+            // Reassign the launch locals, then rebuild the argument array from
+            // them (cuLaunchKernel reads the pointees at call time).
             q = qf as u64;
             k = kf as u64;
             v = vf as u64;
@@ -3382,7 +3390,7 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
             k_proj = 0;
             v_proj = 0;
             xraw = 0;
-            let _ = std::hint::black_box(&args);
+            let args: [*mut c_void; 38] = csha_launch_args!();
             // Same shared_mem_bytes as launch A: if the twin declares a
             // static in-body `.shared` array the dynamic request is
             // additional-but-unused; if it uses the module extern the
@@ -3497,7 +3505,7 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
         let _ = (batch, heads, seq_len, head_dim);
         let _ = (block_table_ptr, k_pool_ptr, v_pool_ptr, block_size);
         let _ = (cos_ptr, sin_ptr, seq_ids_ptr, seq_lens_ptr);
-        let _ = (shared_mem_bytes, ptx_ptr, name_ptr, block_q, _block_kv, causal);
+        let _ = (shared_mem_bytes, ptx_ptr, name_ptr, block_q, _block_kv, _causal);
         let _ = (x_ptr, norm_weight_ptr, wq_ptr, wk_ptr, wv_ptr, wo_ptr);
         let _ = (rmsnorm_eps_bits, active_heads, d_model);
         let _ = (q_proj_ptr, k_proj_ptr, v_proj_ptr, row_max_ptr, row_sum_ptr, x_raw_ptr, segment_ids_ptr, doc_starts_ptr);

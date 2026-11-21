@@ -3876,7 +3876,6 @@ pub extern "C" fn nsl_tensor_conv2d(
             if autodiff::is_recording() {
                 NslTensor::from_ptr(input_ptr).refcount.fetch_add(1, Ordering::SeqCst);
                 NslTensor::from_ptr(weight_ptr).refcount.fetch_add(1, Ordering::SeqCst);
-                let w = NslTensor::from_ptr(weight_ptr);
                 let sh = stride_h as usize; let sw = stride_w as usize;
                 let ph = pad_h as usize; let pw = pad_w as usize;
                 autodiff::maybe_record(autodiff::TapeOp::Conv2d {
