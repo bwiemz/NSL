@@ -26,6 +26,7 @@ use crate::context::FuncState;
 use crate::error::CodegenError;
 use crate::stmt::SURFACE_WEIGHTS;
 use crate::stmt_train::csla_precompute::WsForwardPlan;
+use crate::wengert::{VarId, WengertList, WengertType};
 use crate::wengert_lower::{LoweredWengert, VarMap};
 
 /// Every binding of `compile_train_block_inner` the forward lowering
@@ -49,6 +50,48 @@ pub(crate) struct CcrSegmentFree {
     /// (segment index if this slice IS a segment, start, end)
     pub(crate) slices: Vec<(Option<usize>, usize, usize)>,
     pub(crate) lists: Vec<crate::wengert::WengertList>,
+}
+
+/// The fold state a sliced forward threads through every
+/// `compile_wengert_ops_range` call — each primal slice and each segment's
+/// free list — so that the slices together record exactly what one
+/// monolithic `compile_wengert_ops` would have (one var_map every later slice
+/// and the adjoint resolve through; owned and freed sets concatenated).
+struct SlicedForward {
+    var_map: VarMap,
+    var_types: std::collections::HashMap<VarId, WengertType>,
+    owned_values: Vec<(VarId, Value, WengertType)>,
+    hook_freed_input_vars: std::collections::HashSet<VarId>,
+    explicit_freed_vars: std::collections::HashSet<VarId>,
+    /// No FASE hook runs on a forward; stays empty.
+    hook_freed_param_vars: std::collections::HashSet<VarId>,
+}
+
+impl SlicedForward {
+    fn new(primal_vars: &VarMap, primal: &WengertList) -> Self {
+        Self {
+            var_map: primal_vars.clone(),
+            var_types: primal.var_types.clone(),
+            owned_values: Vec::new(),
+            hook_freed_input_vars: std::collections::HashSet::new(),
+            explicit_freed_vars: std::collections::HashSet::new(),
+            hook_freed_param_vars: std::collections::HashSet::new(),
+        }
+    }
+}
+
+/// The per-segment early-free witness: the gates' anti-vacuity anchor
+/// (`ccr_segment_early_free_gate.rs`, `csla_layerwise_gate.rs` parse the
+/// count), printed whenever the forward ran the per-segment free lists.
+fn log_segment_free_witness(freed: usize, segments: usize) {
+    nsl_log::nsl_log!(
+        INFO,
+        "ccr",
+        "[ccr] per-segment early-free: {} interior value(s) freed \
+         across {} segment(s) during the forward",
+        freed,
+        segments,
+    );
 }
 
 impl Compiler<'_> {
@@ -146,13 +189,7 @@ impl Compiler<'_> {
             // `compile_wengert_ops_range` so the result is
             // byte-identical to the monolithic lowering — streaming
             // only interleaves resident-set changes for θ.
-            let mut var_map = primal_vars.clone();
-            let mut var_types = effective_primal.var_types.clone();
-            let mut owned_values = Vec::new();
-            let mut hook_freed_input_vars = std::collections::HashSet::new();
-            let mut explicit_freed_vars = std::collections::HashSet::new();
-            // No FASE hook on this forward-streaming path — stays empty.
-            let mut hook_freed_param_vars = std::collections::HashSet::new();
+            let mut fold = SlicedForward::new(primal_vars, effective_primal);
             let arena_mode = self.compile_options.weight_stream.arena;
             for (si, &(s, e)) in wsplan.slices.iter().enumerate() {
                 // Item 10: in arena mode a whole layer pack uploads at
@@ -212,20 +249,7 @@ impl Compiler<'_> {
                         &[prev_surf],
                     )?;
                 }
-                crate::wengert_lower::compile_wengert_ops_range(
-                    self,
-                    builder,
-                    state,
-                    effective_primal,
-                    s..e,
-                    &mut var_map,
-                    &mut var_types,
-                    &mut owned_values,
-                    &mut hook_freed_input_vars,
-                    &mut explicit_freed_vars,
-                    &mut hook_freed_param_vars,
-                    None,
-                )?;
+                self.emit_forward_slice(builder, state, effective_primal, s..e, &mut fold)?;
                 // Evict this slice's last-touch params/packs — read-only
                 // (writeback=0): forwards never mutate θ, the mirror
                 // is current by construction.
@@ -256,17 +280,7 @@ impl Compiler<'_> {
                     }
                 }
             }
-            // Same sdpa-extras adoption the monolithic wrapper does.
-            for v in self.sdpa_extra_owned.drain(..) {
-                owned_values.push((u32::MAX, v, crate::wengert::WengertType::Tensor));
-            }
-            crate::wengert_lower::LoweredWengert {
-                var_map,
-                owned_values,
-                hook_freed_input_vars,
-                explicit_freed_vars,
-                hook_freed_param_vars,
-            }
+            self.finish_sliced_forward(fold)
         } else if let Some(seg_free) = &ccr_segment_free {
             // Item 11: per-segment forward early-free. Same sliced
             // emission the weight-streaming branch above uses — one
@@ -278,82 +292,26 @@ impl Compiler<'_> {
             // still live at end-of-forward, which is where the global
             // peak sits: `--checkpoint-blocks` was reducing the
             // backward's activation wall and never the forward's.
-            let mut var_map = primal_vars.clone();
-            let mut var_types = effective_primal.var_types.clone();
-            let mut owned_values = Vec::new();
-            let mut hook_freed_input_vars = std::collections::HashSet::new();
-            let mut explicit_freed_vars = std::collections::HashSet::new();
-            let mut hook_freed_param_vars = std::collections::HashSet::new();
+            let mut fold = SlicedForward::new(primal_vars, effective_primal);
             let mut freed_count = 0usize;
             let mut segments_freed = 0usize;
             for &(si, s_op, e_op) in &seg_free.slices {
-                crate::wengert_lower::compile_wengert_ops_range(
-                    self,
-                    builder,
-                    state,
-                    effective_primal,
-                    s_op..e_op,
-                    &mut var_map,
-                    &mut var_types,
-                    &mut owned_values,
-                    &mut hook_freed_input_vars,
-                    &mut explicit_freed_vars,
-                    &mut hook_freed_param_vars,
-                    None,
-                )?;
+                self.emit_forward_slice(builder, state, effective_primal, s_op..e_op, &mut fold)?;
                 if let Some(seg_idx) = si {
-                    let free_list = &seg_free.lists[seg_idx];
-                    if free_list.ops.is_empty() {
-                        continue;
-                    }
-                    // Through the RANGE fold, not the wrapper: the
-                    // wrapper drains `sdpa_extra_owned` into a return
-                    // value, and a mid-forward call here would steal
-                    // every fused-SDPA LSE pushed by the slices before
-                    // it — un-owning them so the end-of-step bulk free
-                    // never releases them. Review finding F1
-                    // (2026-08-24), confirmed as a +8 MB/micro-step
-                    // ramp at 1B (16 layers x [2,32,2048] f32) before
-                    // this fix; the drain happens ONCE, after the last
-                    // slice, exactly as the ws branch does.
-                    let before = explicit_freed_vars.len();
-                    let mut free_var_types = free_list.var_types.clone();
-                    crate::wengert_lower::compile_wengert_ops_range(
-                        self,
+                    let freed_here = self.emit_segment_free_list(
                         builder,
                         state,
-                        free_list,
-                        0..free_list.ops.len(),
-                        &mut var_map,
-                        &mut free_var_types,
-                        &mut owned_values,
-                        &mut hook_freed_input_vars,
-                        &mut explicit_freed_vars,
-                        &mut hook_freed_param_vars,
-                        None,
+                        &seg_free.lists[seg_idx],
+                        &mut fold,
                     )?;
-                    let freed_here = explicit_freed_vars.len() - before;
                     freed_count += freed_here;
                     if freed_here > 0 {
                         segments_freed += 1;
                     }
                 }
             }
-            nsl_log::nsl_log!(INFO, "ccr", 
-                "[ccr] per-segment early-free: {} interior value(s) freed \
-                 across {} segment(s) during the forward",
-                freed_count, segments_freed,
-            );
-            for v in self.sdpa_extra_owned.drain(..) {
-                owned_values.push((u32::MAX, v, crate::wengert::WengertType::Tensor));
-            }
-            crate::wengert_lower::LoweredWengert {
-                var_map,
-                owned_values,
-                hook_freed_input_vars,
-                explicit_freed_vars,
-                hook_freed_param_vars,
-            }
+            log_segment_free_witness(freed_count, segments_freed);
+            self.finish_sliced_forward(fold)
         } else {
             crate::wengert_lower::compile_wengert_ops(
                 self,
@@ -367,6 +325,89 @@ impl Compiler<'_> {
         self.emit_inplace_suppress(builder, false)?;
 
         Ok((ccr_segment_free, full_lowered))
+    }
+
+    /// Lower the primal ops `range` of a sliced forward into `fold`.
+    fn emit_forward_slice(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        primal: &WengertList,
+        range: std::ops::Range<usize>,
+        fold: &mut SlicedForward,
+    ) -> Result<(), CodegenError> {
+        crate::wengert_lower::compile_wengert_ops_range(
+            self,
+            builder,
+            state,
+            primal,
+            range,
+            &mut fold.var_map,
+            &mut fold.var_types,
+            &mut fold.owned_values,
+            &mut fold.hook_freed_input_vars,
+            &mut fold.explicit_freed_vars,
+            &mut fold.hook_freed_param_vars,
+            None,
+        )
+    }
+
+    /// Lower one CCR segment's free list ([`crate::ccr::build_segment_free_lists`]:
+    /// its shape stubs, then its `FreeTensor`s) at that segment's end, into
+    /// the forward's fold. Returns how many values it freed.
+    ///
+    /// Through the RANGE fold, not the wrapper: the wrapper drains
+    /// `sdpa_extra_owned` into a return value, and a mid-forward call here
+    /// would steal every fused-SDPA LSE pushed by the slices before it —
+    /// un-owning them so the end-of-step bulk free never releases them.
+    /// Review finding F1 (2026-08-24), confirmed as a +8 MB/micro-step ramp
+    /// at 1B (16 layers x [2,32,2048] f32) before this fix; the drain happens
+    /// ONCE, after the last slice ([`Self::finish_sliced_forward`]).
+    fn emit_segment_free_list(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        free_list: &WengertList,
+        fold: &mut SlicedForward,
+    ) -> Result<usize, CodegenError> {
+        if free_list.ops.is_empty() {
+            return Ok(0);
+        }
+        let before = fold.explicit_freed_vars.len();
+        // The list's own type map (its stubs are Tensors); the primal's
+        // map is not extended by the list's markers.
+        let mut free_var_types = free_list.var_types.clone();
+        crate::wengert_lower::compile_wengert_ops_range(
+            self,
+            builder,
+            state,
+            free_list,
+            0..free_list.ops.len(),
+            &mut fold.var_map,
+            &mut free_var_types,
+            &mut fold.owned_values,
+            &mut fold.hook_freed_input_vars,
+            &mut fold.explicit_freed_vars,
+            &mut fold.hook_freed_param_vars,
+            None,
+        )?;
+        Ok(fold.explicit_freed_vars.len() - before)
+    }
+
+    /// Close a sliced forward: adopt the fused-SDPA extras the slices
+    /// accrued (the same adoption the monolithic wrapper does, once, after
+    /// the last slice) and hand the fold back as the lowering result.
+    fn finish_sliced_forward(&mut self, mut fold: SlicedForward) -> LoweredWengert {
+        for v in self.sdpa_extra_owned.drain(..) {
+            fold.owned_values.push((u32::MAX, v, WengertType::Tensor));
+        }
+        LoweredWengert {
+            var_map: fold.var_map,
+            owned_values: fold.owned_values,
+            hook_freed_input_vars: fold.hook_freed_input_vars,
+            explicit_freed_vars: fold.explicit_freed_vars,
+            hook_freed_param_vars: fold.hook_freed_param_vars,
+        }
     }
 
     /// Whether the forward frees each CCR segment's interiors at that

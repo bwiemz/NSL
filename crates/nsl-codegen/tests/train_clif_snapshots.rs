@@ -523,6 +523,18 @@ snapshots! {
         },
         ..source_ad()
     };
+    // `--weight-stream` (it requires `--layerwise-accum`): the forward is
+    // lowered per CCR segment slice with the upload / evict calls between
+    // slices — the streamed forward the per-segment early-free composes with.
+    csla_ffn_weight_stream: "csla_ffn", CompileOptions {
+        checkpoint: nsl_codegen::CheckpointOptions { blocks: true, ..Default::default() },
+        train: nsl_codegen::TrainOptions {
+            layerwise_accum: true,
+            ..Default::default()
+        },
+        weight_stream: nsl_codegen::WeightStreamOptions { enabled: true, ..Default::default() },
+        ..source_ad()
+    };
     csla_ffn_muon_state_bf16: "csla_ffn_muon", CompileOptions {
         checkpoint: nsl_codegen::CheckpointOptions { blocks: true, ..Default::default() },
         train: nsl_codegen::TrainOptions {
