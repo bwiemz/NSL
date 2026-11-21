@@ -773,23 +773,30 @@ fn the_monitor_reads_stored_weights_through_their_masters_gpu() {
     assert!((s - want).abs() <= 1e-2 * want, "split {s} vs f32 {want}");
 }
 
-/// A host read of a stored matrix through an alias the compiler cannot see
-/// (`let wg = m.b1.w_gate` before the block) stops the run when the matrix
-/// is downloaded, instead of printing `?` for every element.
+/// A tensor alias of a stored matrix bound before the block (`let wg =
+/// m.b1.w_gate`) is invisible to the compile-time callback scan. Read in a
+/// callback it never yields a silent misread:
+///
+/// - a host read (`print(wg)`) stops the run at the download backstop;
+/// - an f32-only device kernel refuses the dtype: `wg.sum()`'s reduction and
+///   `wg * 2.0`'s elementwise kernel both stop the run (dtype 3).
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn a_host_read_of_a_stored_weight_through_an_alias_stops_the_run_gpu() {
-    let src = fixture(SPLIT, 8, true, "")
-        .replace(
-            "print(\"LOSS_STREAM_BEGIN\")",
-            "let wg = m.b1.w_gate\nprint(\"LOSS_STREAM_BEGIN\")",
-        )
-        .replace("            print(loss)", "            print(wg)");
-    assert!(src.contains("print(wg)") && src.contains("let wg = m.b1.w_gate"));
-    let mut args = vec!["run", "--seed", "7"];
-    args.extend_from_slice(PROD);
-    let r = nsl(&args, &src, &tmp("alias_read"), "alias_read", &[]);
-    assert!(!r.ok, "the alias read ran:\n{}", r.out);
+    let run = |body: &str, tag: &str| {
+        let src = fixture(SPLIT, 8, true, "")
+            .replace(
+                "print(\"LOSS_STREAM_BEGIN\")",
+                "let wg = m.b1.w_gate\nprint(\"LOSS_STREAM_BEGIN\")",
+            )
+            .replace("            print(loss)", &format!("            {body}"));
+        assert!(src.contains(body) && src.contains("let wg = m.b1.w_gate"));
+        let mut args = vec!["run", "--seed", "7"];
+        args.extend_from_slice(PROD);
+        nsl(&args, &src, &tmp(tag), tag, &[])
+    };
+    let r = run("print(wg)", "alias_print");
+    assert!(!r.ok, "the alias print ran:\n{}", r.out);
     assert!(
         r.out
             .contains("stored bf16 by param_dtype= inside its train block"),
@@ -800,5 +807,59 @@ fn a_host_read_of_a_stored_weight_through_an_alias_stops_the_run_gpu() {
         !r.out.contains("?, ?"),
         "a stored matrix was printed:\n{}",
         r.out
+    );
+
+    let r = run("print(wg.sum())", "alias_sum");
+    assert!(!r.ok, "the alias reduction ran:\n{}", r.out);
+    assert!(
+        r.out.contains("f32-only") && r.out.contains("dtype 3"),
+        "{}",
+        r.out
+    );
+
+    // Elementwise ops on the GPU are f32-only kernels too (measured
+    // 2026-11-21: `nsl_mul_scalar_f32` refuses dtype 3).
+    let r = run("print(wg * 2.0)", "alias_scale");
+    assert!(!r.ok, "the alias scale ran:\n{}", r.out);
+    assert!(
+        r.out.contains("f32-only") && r.out.contains("dtype 3"),
+        "{}",
+        r.out
+    );
+}
+
+/// `model_save(m, ...)` in a callback is allowed: it writes the exact f32
+/// masters, so master mode's file at micro-step 100 is byte-identical to the
+/// f32 run's.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn a_callback_model_save_writes_the_exact_masters_gpu() {
+    let run = |header: &str, tag: &str, env: &[(&str, &str)]| {
+        let dir = tmp(tag);
+        let mut args = vec!["run", "--deterministic", "--seed", "7"];
+        args.extend_from_slice(PROD);
+        let mut envs: Vec<(&str, &str)> = DET_ENV.to_vec();
+        envs.extend_from_slice(env);
+        let src = fixture(header, 104, true, "").replace(
+            "            print(loss)",
+            "            print(loss)\n            if step == 100:\n                model_save(m, \"cb.nslm\")",
+        );
+        let r = nsl(&args, &src, &dir, tag, &envs);
+        assert!(r.ok, "{tag} failed:\n{}", r.out);
+        (r, dir)
+    };
+    let (_, f32) = run("", "cbsave_f32", &[]);
+    let (master_run, master) = run(MASTER, "cbsave_master", &[TEST_MODES]);
+    assert!(
+        master_run
+            .out
+            .contains("[param-storage] 14 parameters stored"),
+        "{}",
+        master_run.out
+    );
+    assert_eq!(
+        read(&master, "cb.nslm"),
+        read(&f32, "cb.nslm"),
+        "a callback's model_save in master mode is not f32 parameters' file"
     );
 }

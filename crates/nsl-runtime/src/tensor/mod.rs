@@ -1261,6 +1261,16 @@ pub extern "C" fn nsl_tensor_item(tensor_ptr: i64) -> f64 {
             // kernel queued ahead of it, so a hot-path `.item()` on a value that
             // is a compile-time constant costs a full serialization.
             let _hp = crate::host_profile::Timer::start(crate::host_profile::Probe::ScalarRead);
+            // The same backstop as `nsl_tensor_to_device`'s download: this
+            // copies the element directly, so it is checked here too.
+            if crate::param_storage::is_stored_data(tensor.data as u64) {
+                crate::fatal::die(
+                    crate::fatal::Fatal::UnsupportedDtype,
+                    ".item(): this tensor is a weight matrix stored bf16 by param_dtype= inside its train block \
+                     (the f32 value lives in optimizer state until the block ends). Read it after the train \
+                     block, or drop param_dtype=",
+                );
+            }
             unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
             match tensor.dtype {
                 DTYPE_I32 => {
@@ -1408,6 +1418,13 @@ fn write_tensor_recursive(
                 DTYPE_I32 => unsafe { *(data as *const i32).add(i * stride) as f64 },
                 1 => unsafe { *(data as *const f32).add(i * stride) as f64 },
                 0 => unsafe { *(data as *const f64).add(i * stride) },
+                // Two-byte floats print their values (they printed `?`).
+                DTYPE_BF16 => {
+                    bf16_bits_to_f32(unsafe { *(data as *const u16).add(i * stride) }) as f64
+                }
+                DTYPE_FP16 => {
+                    f16_bits_to_f32(unsafe { *(data as *const u16).add(i * stride) }) as f64
+                }
                 _ => {
                     out.push('?');
                     continue;
@@ -5200,6 +5217,27 @@ pub fn test_tensor_tape_id(ptr: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bf16 and f16 tensors print their values (they printed `?` for every
+    /// element), and as the f32 tensor of the same values does.
+    #[test]
+    fn two_byte_float_tensors_print_their_values() {
+        let vals = [3.0, -4.0, 0.5, 12.0];
+        let text = |dtype: u16| {
+            let p = crate::cpu::create_tensor_with_shape_rs_dtype(&[2, 2], dtype);
+            let t = NslTensor::from_ptr(p);
+            for (i, &v) in vals.iter().enumerate() {
+                t.write_scalar_from_f64(i, v);
+            }
+            let s = format_tensor(p);
+            nsl_tensor_free(p);
+            s
+        };
+        let want = text(DTYPE_F32);
+        assert!(!want.contains('?'), "{want}");
+        assert_eq!(text(DTYPE_BF16), want);
+        assert_eq!(text(DTYPE_FP16), want);
+    }
 
     /// Review finding on 1def2b9f (pre-existing defect): the CPU
     /// tape-recording arm of `nsl_tensor_dropout` published its mask (rc=1)

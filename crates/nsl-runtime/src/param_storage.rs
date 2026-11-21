@@ -923,6 +923,70 @@ mod tests {
         println!("CHILD-STORED-A-TIED-PARAMETER");
     }
 
+    /// `.item()` on a stored GPU parameter copies its element directly, past
+    /// `nsl_tensor_to_device`'s download backstop, so it checks for itself:
+    /// the run stops (child process: it exits) instead of reading the bf16
+    /// image.
+    #[test]
+    #[cfg(feature = "cuda")]
+    #[ignore = "requires CUDA GPU"]
+    fn item_of_a_stored_gpu_parameter_stops_the_run() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let out = std::process::Command::new(exe)
+            .args([
+                "param_storage::tests::zz_item_of_stored_child",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+                "--include-ignored",
+            ])
+            .env("NSL_PARAM_STORAGE_ITEM_CHILD", "1")
+            .env("RUST_BACKTRACE", "0")
+            .output()
+            .expect("re-exec the lib test binary");
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            all.contains("CHILD-STORED-A-GPU-SCALAR"),
+            "the child did not store the parameter:\n{all}"
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(crate::fatal::NSL_EXIT_UNSUPPORTED_DTYPE),
+            "the backstop exits `unsupported-dtype`:\n{all}"
+        );
+        assert!(
+            all.contains(".item(): this tensor is a weight matrix stored bf16"),
+            "{all}"
+        );
+        assert!(!all.contains("CHILD-READ-THE-IMAGE"), "{all}");
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    #[ignore = "child process — driven by item_of_a_stored_gpu_parameter_stops_the_run"]
+    fn zz_item_of_stored_child() {
+        if std::env::var("NSL_PARAM_STORAGE_ITEM_CHILD").is_err() {
+            return;
+        }
+        if crate::cuda::nsl_cuda_init() != 0 {
+            return;
+        }
+        let host = host_f32(&[0.25], &[1, 1]);
+        let p = crate::tensor::nsl_tensor_to_device(host, 1);
+        let list = nsl_list_new();
+        nsl_list_push(list, p);
+        let idx = nsl_list_new();
+        nsl_list_push(idx, 0);
+        assert_eq!(nsl_param_store_bf16(list, idx, wire::SPLIT), 1);
+        println!("CHILD-STORED-A-GPU-SCALAR");
+        let v = crate::tensor::nsl_tensor_item(p);
+        println!("CHILD-READ-THE-IMAGE {v}");
+    }
+
     #[test]
     #[cfg(feature = "cuda")]
     #[ignore = "requires CUDA GPU"]

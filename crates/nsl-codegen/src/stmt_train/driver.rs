@@ -489,11 +489,14 @@ impl Compiler<'_> {
 
         // `param_dtype=`: inside the block the selected weight matrices are
         // bf16 tensors (their f32 values live in optimizer state), and a
-        // callback runs inside the block. A callback that reads the model
-        // would see those tensors: an f32-only op refuses them and a host
-        // read would see the bf16 image, so refuse it here. (A read through
-        // an alias the compiler cannot see is refused at run time, when the
-        // weight is downloaded.)
+        // callback runs inside the block, so a callback that references the
+        // model anywhere is refused here (`callback_references_model`: by
+        // name, by a model-typed alias, `model_save` of the model allowed). A
+        // tensor alias of one parameter bound before the block is invisible
+        // to that scan; at run time a host read of it stops the run (the
+        // download and `.item()` backstops) and an f32-only device kernel
+        // refuses its dtype (gated by
+        // `a_host_read_of_a_stored_weight_through_an_alias_stops_the_run_gpu`).
         if let Some(pd) = param_dtype {
             for cb in &callbacks {
                 if let Some(path) = self.callback_model_access(&cb.body, model_sym) {

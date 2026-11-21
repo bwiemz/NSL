@@ -91,10 +91,11 @@ impl Precision {
 ///
 /// Inside the train block the stored matrices are bf16 tensors, and after
 /// it they are f32 again. Inside it: `model_save` and checkpoints write the
-/// exact f32 masters, and `--monitor`'s weight norms read them; a callback
-/// that reads the model is a compile error, and a host read of a stored
-/// matrix through an alias the compiler cannot see stops the run when the
-/// matrix is downloaded. Tied weights (one tensor at two parameter names)
+/// exact f32 masters, and `--monitor`'s weight norms read them (so does a
+/// callback's `model_save` of the model); any other reference to the model in
+/// a callback, by name or through a model-typed alias, is a compile error,
+/// and a host read of a stored matrix through a tensor alias the compiler
+/// cannot see stops the run when the matrix is read. Tied weights (one tensor at two parameter names)
 /// cannot be stored: the run stops at its first step and says to untie them
 /// or drop `param_dtype=`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
