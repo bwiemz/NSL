@@ -111,7 +111,7 @@ pub extern "C" fn nsl_gpu_slab_init(size_bytes: i64) -> i64 {
         // Zero the slab (tensors expect zero-initialized memory)
         crate::cuda::inner::memset_d8(ptr, size_bytes as usize);
         region().set(ptr as u64, size_bytes as u64);
-        return ptr as i64;
+        ptr as i64
     }
     #[cfg(not(feature = "cuda"))]
     { 0 }

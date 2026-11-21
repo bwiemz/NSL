@@ -382,8 +382,8 @@ fn try_cuda_launch_fused_lora(
     if !kernel_can_read(xt, wt) || !lora_pair_fits(wt, at, bt) {
         return None;
     }
-    let m = unsafe { *xt.shape.add(xt.ndim as usize - 2) } as i64;
-    let n = unsafe { *wt.shape.add(wt.ndim as usize - 1) } as i64;
+    let m = unsafe { *xt.shape.add(xt.ndim as usize - 2) };
+    let n = unsafe { *wt.shape.add(wt.ndim as usize - 1) };
 
     // Allocate output on the same device, f32 (PTX stores back as f32).
     let out_elems = (m * n) as usize;
@@ -399,7 +399,7 @@ fn try_cuda_launch_fused_lora(
         shape,
         strides,
         2,
-        (m * n) as i64,
+        m * n,
         xt.device,
         1, // f32 output
         1,
@@ -529,8 +529,8 @@ fn try_cuda_launch_fused_ia3(
     if !kernel_can_read(xt, wt) || !column_vector_fits(wt, gt) {
         return None;
     }
-    let m = unsafe { *xt.shape.add(xt.ndim as usize - 2) } as i64;
-    let n = unsafe { *wt.shape.add(wt.ndim as usize - 1) } as i64;
+    let m = unsafe { *xt.shape.add(xt.ndim as usize - 2) };
+    let n = unsafe { *wt.shape.add(wt.ndim as usize - 1) };
 
     let out_elems = (m * n) as usize;
     let out_data = inner::try_alloc_managed(out_elems * 4)?;
@@ -541,7 +541,7 @@ fn try_cuda_launch_fused_ia3(
     }
     let strides = NslTensor::compute_strides(shape, 2);
     let out_box = Box::new(NslTensor::new(
-        out_data, shape, strides, 2, (m * n) as i64, xt.device, 1, 1, 0,
+        out_data, shape, strides, 2, m * n, xt.device, 1, 1, 0,
     ));
     let out_ptr = Box::into_raw(out_box);
 
@@ -828,8 +828,8 @@ fn try_cuda_launch_fused_gatedlora(
     if !kernel_can_read(xt, wt) || !lora_pair_fits(wt, at, bt) || !column_vector_fits(wt, gat) {
         return None;
     }
-    let m = unsafe { *xt.shape.add(xt.ndim as usize - 2) } as i64;
-    let n = unsafe { *wt.shape.add(wt.ndim as usize - 1) } as i64;
+    let m = unsafe { *xt.shape.add(xt.ndim as usize - 2) };
+    let n = unsafe { *wt.shape.add(wt.ndim as usize - 1) };
 
     // Allocate output on the same device, f32 (PTX stores back as f32).
     let out_elems = (m * n) as usize;
@@ -845,7 +845,7 @@ fn try_cuda_launch_fused_gatedlora(
         shape,
         strides,
         2,
-        (m * n) as i64,
+        m * n,
         xt.device,
         1, // f32 output
         1,

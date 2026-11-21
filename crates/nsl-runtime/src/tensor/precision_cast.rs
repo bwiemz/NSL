@@ -784,7 +784,7 @@ pub extern "C" fn nsl_tensor_cast_from_host(host_src_ptr: i64, device_template_p
         let out = Box::new(NslTensor::new(
             dst_data, shape, strides, src.ndim, src.len, template.device, DTYPE_F32, 1, 0,
         ));
-        return Box::into_raw(out) as i64;
+        Box::into_raw(out) as i64
     }
     #[cfg(not(feature = "cuda"))]
     crate::fatal::die(crate::fatal::Fatal::CudaNotCompiled, &format!(

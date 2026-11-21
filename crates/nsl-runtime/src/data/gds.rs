@@ -21,7 +21,7 @@ pub fn is_gds_available() -> bool {
     // For now, check via environment variable or runtime probe
     #[cfg(feature = "cuda")]
     {
-        std::env::var("NSL_GDS_ENABLED").map_or(false, |v| v == "1")
+        std::env::var("NSL_GDS_ENABLED").is_ok_and(|v| v == "1")
     }
     #[cfg(not(feature = "cuda"))]
     { false }

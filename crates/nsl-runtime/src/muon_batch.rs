@@ -291,7 +291,7 @@ fn run_chunk(
     }
 
     // NS iterations on the wide iterate Y [k, rp, cp].
-    let r2 = (rp * rp) as i64;
+    let r2 = rp * rp;
     let mut y_cur = ws.y;
     let mut y_nxt = ws.y2;
     for _ in 0..ns_steps {
@@ -471,7 +471,9 @@ pub extern "C" fn nsl_muon_step_batch(
 
     // Group eligible params by shape, preserving encounter order.
     let mut group_keys: Vec<(usize, usize)> = Vec::new();
-    let mut groups: HashMap<(usize, usize), (Vec<u64>, Vec<u64>, Vec<u64>)> = HashMap::new();
+    // Per shape: three parallel lists of device pointers.
+    type Lists = (Vec<u64>, Vec<u64>, Vec<u64>);
+    let mut groups: HashMap<(usize, usize), Lists> = HashMap::new();
     for i in 0..count {
         let route = unsafe { *routes.data.add(i) };
         if route != 0 {

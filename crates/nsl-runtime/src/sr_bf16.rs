@@ -968,7 +968,7 @@ fn bf16sr_multi_impl(
             }
         }
 
-        let mut launch = |b: &Bucket, has_wd: bool| {
+        let launch = |b: &Bucket, has_wd: bool| {
             if b.t.is_empty() {
                 return;
             }

@@ -360,14 +360,14 @@ pub(crate) mod inner {
         alloc.drain_all()
     }
 
-    /// Thread-local context string describing the current GPU operation.
-    /// Set before allocations so OOM messages identify which op failed.
-    ///
-    /// NOTE: This is thread-local, so in multi-threaded GPU dispatch the
-    /// context reflects the calling thread only. For single-threaded
-    /// inference/training (the common case) this is correct.
     thread_local! {
-        static OOM_CONTEXT: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
+        /// Thread-local context string describing the current GPU operation.
+        /// Set before allocations so OOM messages identify which op failed.
+        ///
+        /// NOTE: This is thread-local, so in multi-threaded GPU dispatch the
+        /// context reflects the calling thread only. For single-threaded
+        /// inference/training (the common case) this is correct.
+        static OOM_CONTEXT: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
     }
 
     pub(crate) fn set_oom_context(ctx: &str) {
@@ -747,7 +747,7 @@ pub(crate) mod inner {
         super::context::current().async_alloc_enabled()
     }
 
-    /// Track async-allocated pointers (freed via cuMemFreeAsync, not cuMemFree)
+    // Track async-allocated pointers (freed via cuMemFreeAsync, not cuMemFree)
     // A4 step 1: was `static ASYNC_ALLOC_SET` — now `context.async_allocs`.
 
     // no caller anywhere in the CUDA build. Kept rather than deleted here:
@@ -2314,7 +2314,7 @@ pub(crate) mod inner {
 pub(crate) use inner::{cu_event_create, cu_event_elapsed_time, cu_event_destroy, cu_ctx_synchronize};
 
 #[cfg(feature = "cuda")]
-pub use inner::{current_stream, cu_event_create_checked, cu_event_record_on_current_stream, cu_event_synchronize_raw, cu_event_elapsed_time_raw};
+pub use inner::{cu_event_create_checked, cu_event_record_on_current_stream, cu_event_synchronize_raw, cu_event_elapsed_time_raw};
 
 /// Re-exported so callers that now CHECK a driver status (rather than
 /// discarding it) can name the success case without importing cudarc.
@@ -3665,7 +3665,7 @@ fn cpu_fallback_binary(a_ptr: i64, b_ptr: i64, kernel_name: &str) -> i64 {
 }
 
 #[cfg(feature = "cuda")]
-fn tensor_shape_slice<'a>(tensor: &'a crate::tensor::NslTensor) -> &'a [i64] {
+fn tensor_shape_slice(tensor: &crate::tensor::NslTensor) -> &[i64] {
     assert!(tensor.ndim >= 0, "tensor has negative ndim: {}", tensor.ndim);
     let ndim = tensor.ndim as usize;
     if ndim == 0 {
@@ -4330,7 +4330,7 @@ pub(crate) fn gpu_scale_raw_f32(dev: *mut std::ffi::c_void, n: usize, scalar: f3
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
         kernels::mul_scalar_f32_ptx().as_ptr(),
-        "nsl_mul_scalar_f32\0".as_ptr(),
+        c"nsl_mul_scalar_f32".as_ptr().cast(),
         [grid, 1, 1],
         [block, 1, 1],
         &args,
@@ -4447,7 +4447,7 @@ pub(crate) fn gpu_scalar_mul_add_inplace_f32(m_ptr: i64, g_ptr: i64, scale: f32)
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
         kernels::scalar_mul_add_inplace_f32_ptx().as_ptr(),
-        b"nsl_scalar_mul_add_inplace_f32\0".as_ptr(),
+        c"nsl_scalar_mul_add_inplace_f32".as_ptr().cast(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(
@@ -5056,7 +5056,7 @@ pub(crate) fn gpu_fase_fused_adamw_step_bf16sr_multi(
     let grid_x = blk_count as i64;
     let result = inner::kernel_launch(
         kernels::fase_fused_adamw_multi_bf16sr_ptx().as_ptr(),
-        b"nsl_fase_fused_adamw_multi_bf16sr\0".as_ptr(),
+        c"nsl_fase_fused_adamw_multi_bf16sr".as_ptr().cast(),
         [grid_x, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(
@@ -5151,7 +5151,7 @@ pub(crate) fn gpu_fase_fused_adamw_step_bf16sr_raw(
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
         kernels::fase_fused_adamw_step_bf16sr_ptx().as_ptr(),
-        b"nsl_fase_fused_adamw_step_bf16sr\0".as_ptr(),
+        c"nsl_fase_fused_adamw_step_bf16sr".as_ptr().cast(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(
@@ -5202,7 +5202,7 @@ pub(crate) fn gpu_cast_raw_f32_to_bf16_sr(
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
         kernels::sr_bf16_round_probe_ptx().as_ptr(),
-        b"nsl_sr_bf16_round_probe\0".as_ptr(),
+        c"nsl_sr_bf16_round_probe".as_ptr().cast(),
         [grid, 1, 1],
         [block, 1, 1],
         &args,
@@ -5239,7 +5239,7 @@ pub(crate) fn gpu_sr_bf16_round_probe(
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
         kernels::sr_bf16_round_probe_ptx().as_ptr(),
-        b"nsl_sr_bf16_round_probe\0".as_ptr(),
+        c"nsl_sr_bf16_round_probe".as_ptr().cast(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(
@@ -5973,7 +5973,7 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
 
         let result = inner::kernel_launch(
             fused_kernels::bmm_f32_ptx().as_ptr(),
-            b"nsl_bmm_f32\0".as_ptr(),
+            c"nsl_bmm_f32".as_ptr().cast(),
             [grid_x, grid_y, grid_z],
             [block, block, 1],
             &args, 0,
@@ -6395,7 +6395,7 @@ pub(crate) fn gpu_clamp_f32(a_ptr: i64, lo: f32, hi: f32) -> i64 {
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
         kernels::clamp_f32_ptx().as_ptr(),
-        "nsl_clamp_f32\0".as_ptr(),
+        c"nsl_clamp_f32".as_ptr().cast(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU clamp kernel failed: {}", result as u32);
@@ -6427,7 +6427,7 @@ pub(crate) fn gpu_clamp_f32_inplace(a_ptr: i64, lo: f32, hi: f32) {
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
         kernels::clamp_f32_ptx().as_ptr(),
-        "nsl_clamp_f32\0".as_ptr(),
+        c"nsl_clamp_f32".as_ptr().cast(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU clamp inplace kernel failed: {}", result as u32);
@@ -6488,7 +6488,7 @@ pub(crate) fn gpu_clamp_backward(grad: i64, input: i64, min_val: f32, max_val: f
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
         kernels::clamp_backward_f32_ptx().as_ptr(),
-        "nsl_clamp_backward_f32\0".as_ptr(),
+        c"nsl_clamp_backward_f32".as_ptr().cast(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU clamp_backward kernel failed: {}", result as u32);
@@ -6528,7 +6528,7 @@ pub(crate) fn gpu_log_softmax_f32(tensor_ptr: i64) -> i64 {
     let block = 256i64;
     let grid = rows as i64;
     let result = inner::kernel_launch(
-        fused_kernels::log_softmax_f32_ptx().as_ptr(), b"nsl_log_softmax_f32\0".as_ptr(),
+        fused_kernels::log_softmax_f32_ptx().as_ptr(), c"nsl_log_softmax_f32".as_ptr().cast(),
         [grid, 1, 1], [block, 1, 1], &args, 256 * 4 * 2,
     );
     assert_eq!(result as u32, 0, "GPU log_softmax kernel failed: {:?}", result);
@@ -7216,7 +7216,7 @@ fn gpu_bias_add_row_major(tensor_ptr: i64, bias_ptr: i64) -> i64 {
         let grid = ((total as i64) + block - 1) / block;
 
         let result = inner::kernel_launch(
-            fused_kernels::bias_add_f32_ptx().as_ptr(), b"nsl_bias_add_f32\0".as_ptr(),
+            fused_kernels::bias_add_f32_ptx().as_ptr(), c"nsl_bias_add_f32".as_ptr().cast(),
             [grid, 1, 1], [block, 1, 1], &args, 0,
         );
         assert_eq!(result as u32, 0, "GPU bias_add kernel failed: {:?}", result);
@@ -7277,7 +7277,7 @@ pub(crate) fn gpu_softmax_f32(tensor_ptr: i64) -> i64 {
     let grid = rows as i64;
 
     let result = inner::kernel_launch(
-        fused_kernels::softmax_f32_ptx().as_ptr(), b"nsl_softmax_f32\0".as_ptr(),
+        fused_kernels::softmax_f32_ptx().as_ptr(), c"nsl_softmax_f32".as_ptr().cast(),
         [grid, 1, 1], [block, 1, 1], &args, 256 * 4 * 2, // shared mem: smax[256] + ssum[256]
     );
     assert_eq!(result as u32, 0, "GPU softmax kernel failed: {:?}", result);
@@ -7449,7 +7449,7 @@ pub(crate) fn gpu_sum_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) -> i64
         let grid = (out_total as i64 + block - 1) / block;
         inner::kernel_launch(
             fused_kernels::sum_dim_short_f32_ptx().as_ptr(),
-            b"nsl_sum_dim_short_f32\0".as_ptr(),
+            c"nsl_sum_dim_short_f32".as_ptr().cast(),
             [grid, 1, 1],
             [block, 1, 1],
             &args,
@@ -7458,7 +7458,7 @@ pub(crate) fn gpu_sum_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) -> i64
     } else {
         inner::kernel_launch(
             fused_kernels::sum_dim_f32_ptx().as_ptr(),
-            b"nsl_sum_dim_f32\0".as_ptr(),
+            c"nsl_sum_dim_f32".as_ptr().cast(),
             [out_total as i64, 1, 1],
             [block, 1, 1],
             &args,
@@ -7512,7 +7512,7 @@ pub(crate) fn gpu_global_sum_f32(tensor_ptr: i64) -> i64 {
     let grid = 1i64;
 
     let result = inner::kernel_launch(
-        fused_kernels::global_sum_f32_ptx().as_ptr(), b"nsl_global_sum_f32\0".as_ptr(),
+        fused_kernels::global_sum_f32_ptx().as_ptr(), c"nsl_global_sum_f32".as_ptr().cast(),
         [grid, 1, 1], [block, 1, 1], &args, 256 * 4,
     );
     assert_eq!(result as u32, 0, "GPU global_sum kernel failed: {:?}", result);
@@ -7563,7 +7563,7 @@ pub(crate) fn gpu_tensor_stats_f32(tensor_ptr: i64) -> [f32; 4] {
     ];
 
     let result = inner::kernel_launch(
-        fused_kernels::tensor_stats_f32_ptx().as_ptr(), b"nsl_tensor_stats_f32\0".as_ptr(),
+        fused_kernels::tensor_stats_f32_ptx().as_ptr(), c"nsl_tensor_stats_f32".as_ptr().cast(),
         [1, 1, 1], [256, 1, 1], &args, 256 * 4 * 4, // 4 shared arrays of 256 f32
     );
     assert_eq!(result as u32, 0, "GPU tensor_stats kernel failed: {:?}", result);
@@ -7661,7 +7661,7 @@ pub(crate) fn gpu_sum_sq_many_f32(tensors: &[i64]) -> f64 {
         ];
         let rc = inner::kernel_launch(
             fused_kernels::sum_sq_f64_acc_f32_ptx().as_ptr(),
-            b"nsl_sum_sq_f64_acc_f32\0".as_ptr(),
+            c"nsl_sum_sq_f64_acc_f32".as_ptr().cast(),
             [grid_for(t.len), 1, 1],
             [BLOCK, 1, 1],
             &args,
@@ -7728,7 +7728,7 @@ pub(crate) fn gpu_tensor_sum_sq_f32(tensor_ptr: i64) -> f64 {
     ];
 
     let result = inner::kernel_launch(
-        fused_kernels::tensor_stats_f32_ptx().as_ptr(), b"nsl_tensor_stats_f32\0".as_ptr(),
+        fused_kernels::tensor_stats_f32_ptx().as_ptr(), c"nsl_tensor_stats_f32".as_ptr().cast(),
         [1, 1, 1], [256, 1, 1], &args, 256 * 4 * 4,
     );
     assert_eq!(result as u32, 0, "GPU tensor_stats kernel failed: {:?}", result);
@@ -7805,7 +7805,7 @@ pub(crate) fn gpu_cross_entropy_backward_f32(
         ];
         let r = inner::kernel_launch(
             fused_kernels::ce_bwd_count_f32_ptx().as_ptr(),
-            b"nsl_ce_bwd_count_f32\0".as_ptr(),
+            c"nsl_ce_bwd_count_f32".as_ptr().cast(),
             [1, 1, 1],
             [256, 1, 1],
             &args,
@@ -7861,7 +7861,7 @@ pub(crate) fn gpu_cross_entropy_backward_f32(
         let grid = ((total as i64) + block - 1) / block;
         let r = inner::kernel_launch(
             fused_kernels::ce_bwd_finish_f32_ptx().as_ptr(),
-            b"nsl_ce_bwd_finish_f32\0".as_ptr(),
+            c"nsl_ce_bwd_finish_f32".as_ptr().cast(),
             [grid, 1, 1],
             [block, 1, 1],
             &args,
@@ -7928,7 +7928,7 @@ pub(crate) fn gpu_muon_frobenius_scale_f32(a_ptr: i64) -> i64 {
         &mut n_val as *mut _ as *mut std::ffi::c_void,
     ];
     let result = inner::kernel_launch(
-        fused_kernels::tensor_stats_f32_ptx().as_ptr(), b"nsl_tensor_stats_f32\0".as_ptr(),
+        fused_kernels::tensor_stats_f32_ptx().as_ptr(), c"nsl_tensor_stats_f32".as_ptr().cast(),
         [1, 1, 1], [256, 1, 1], &stats_args, 256 * 4 * 4,
     );
     assert_eq!(result as u32, 0, "GPU tensor_stats kernel failed: {:?}", result);
@@ -7965,7 +7965,7 @@ pub(crate) fn gpu_muon_frobenius_scale_f32(a_ptr: i64) -> i64 {
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
         kernels::muon_scale_inv_frob_f32_ptx().as_ptr(),
-        b"nsl_muon_scale_inv_frob_f32\0".as_ptr(),
+        c"nsl_muon_scale_inv_frob_f32".as_ptr().cast(),
         [grid, 1, 1], [block, 1, 1], &scale_args, 0,
     );
     assert_eq!(
@@ -8013,10 +8013,10 @@ pub(crate) fn gpu_dequant_int8_per_head_f32(
     ];
 
     let block = 256i64;
-    let grid = ((n + 255) / 256) as i64;
+    let grid = n.div_ceil(256) as i64;
 
     let result = inner::kernel_launch(
-        fused_kernels::dequant_int8_per_head_f32_ptx().as_ptr(), b"nsl_dequant_int8_per_head_f32\0".as_ptr(),
+        fused_kernels::dequant_int8_per_head_f32_ptx().as_ptr(), c"nsl_dequant_int8_per_head_f32".as_ptr().cast(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU dequant_int8_per_head kernel failed: {:?}", result);
@@ -8052,10 +8052,10 @@ pub(crate) fn gpu_dequant_int8_per_token_f32(
     ];
 
     let block = 256i64;
-    let grid = ((n + 255) / 256) as i64;
+    let grid = n.div_ceil(256) as i64;
 
     let result = inner::kernel_launch(
-        fused_kernels::dequant_int8_per_token_f32_ptx().as_ptr(), b"nsl_dequant_int8_per_token_f32\0".as_ptr(),
+        fused_kernels::dequant_int8_per_token_f32_ptx().as_ptr(), c"nsl_dequant_int8_per_token_f32".as_ptr().cast(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU dequant_int8_per_token kernel failed: {:?}", result);
@@ -8091,10 +8091,10 @@ pub(crate) fn gpu_dequant_int4_per_group_f32(
     ];
 
     let block = 256i64;
-    let grid = ((n + 255) / 256) as i64;
+    let grid = n.div_ceil(256) as i64;
 
     let result = inner::kernel_launch(
-        fused_kernels::dequant_int4_per_group_f32_ptx().as_ptr(), b"nsl_dequant_int4_per_group_f32\0".as_ptr(),
+        fused_kernels::dequant_int4_per_group_f32_ptx().as_ptr(), c"nsl_dequant_int4_per_group_f32".as_ptr().cast(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU dequant_int4_per_group kernel failed: {:?}", result);
@@ -8121,10 +8121,10 @@ pub(crate) fn gpu_dequant_fp8_e4m3_f32(
     ];
 
     let block = 256i64;
-    let grid = ((n + 255) / 256) as i64;
+    let grid = n.div_ceil(256) as i64;
 
     let result = inner::kernel_launch(
-        fused_kernels::dequant_fp8_e4m3_f32_ptx().as_ptr(), b"nsl_dequant_fp8_e4m3_f32\0".as_ptr(),
+        fused_kernels::dequant_fp8_e4m3_f32_ptx().as_ptr(), c"nsl_dequant_fp8_e4m3_f32".as_ptr().cast(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU dequant_fp8_e4m3 kernel failed: {:?}", result);
@@ -8163,7 +8163,7 @@ pub(crate) fn gpu_det_global_sum_f32(tensor_ptr: i64) -> i64 {
 
     // Single block, single thread — guarantees sequential deterministic accumulation
     let result = inner::kernel_launch(
-        fused_kernels::det_global_sum_f32_ptx().as_ptr(), b"nsl_det_global_sum_f32\0".as_ptr(),
+        fused_kernels::det_global_sum_f32_ptx().as_ptr(), c"nsl_det_global_sum_f32".as_ptr().cast(),
         [1, 1, 1], [1, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU det_global_sum kernel failed: {:?}", result);
@@ -8242,7 +8242,7 @@ pub(crate) fn gpu_det_sum_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) ->
     // One block per output element, single thread per block — sequential accumulation
     let grid = out_total as i64;
     let result = inner::kernel_launch(
-        fused_kernels::det_sum_dim_f32_ptx().as_ptr(), b"nsl_det_sum_dim_f32\0".as_ptr(),
+        fused_kernels::det_sum_dim_f32_ptx().as_ptr(), c"nsl_det_sum_dim_f32".as_ptr().cast(),
         [grid, 1, 1], [1, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU det_sum_dim kernel failed: {:?}", result);
@@ -8339,7 +8339,7 @@ pub(crate) fn gpu_det_scatter_add_f32(
     let grid_y = ((embed_dim as i64) + block_y - 1) / block_y;
 
     let result = inner::kernel_launch(
-        fused_kernels::det_scatter_add_f32_ptx().as_ptr(), b"nsl_det_scatter_add_f32\0".as_ptr(),
+        fused_kernels::det_scatter_add_f32_ptx().as_ptr(), c"nsl_det_scatter_add_f32".as_ptr().cast(),
         [grid_x, grid_y, 1], [block_x, block_y, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU det_scatter_add kernel failed: {:?}", result);
@@ -8415,7 +8415,7 @@ pub(crate) fn gpu_max_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) -> i64
     let grid = out_total as i64;
 
     let result = inner::kernel_launch(
-        fused_kernels::max_dim_f32_ptx().as_ptr(), b"nsl_max_dim_f32\0".as_ptr(),
+        fused_kernels::max_dim_f32_ptx().as_ptr(), c"nsl_max_dim_f32".as_ptr().cast(),
         [grid, 1, 1], [block, 1, 1], &args, 256 * 4,
     );
     assert_eq!(result as u32, 0, "GPU max_dim kernel failed: {:?}", result);
@@ -8483,7 +8483,7 @@ pub(crate) fn gpu_layernorm_f32(input_ptr: i64, gamma_ptr: i64, beta_ptr: i64, e
     let grid = rows as i64;
 
     let result = inner::kernel_launch(
-        fused_kernels::layernorm_f32_ptx().as_ptr(), b"nsl_layernorm_f32\0".as_ptr(),
+        fused_kernels::layernorm_f32_ptx().as_ptr(), c"nsl_layernorm_f32".as_ptr().cast(),
         [grid, 1, 1], [block, 1, 1], &args, 256 * 4,
     );
     assert_eq!(result as u32, 0, "GPU layernorm kernel failed: {:?}", result);
@@ -8547,7 +8547,7 @@ pub(crate) fn gpu_rmsnorm_f32(input_ptr: i64, gamma_ptr: i64, eps: f32) -> i64 {
     let grid = rows as i64;
 
     let result = inner::kernel_launch(
-        fused_kernels::rmsnorm_f32_ptx().as_ptr(), b"nsl_rmsnorm_f32\0".as_ptr(),
+        fused_kernels::rmsnorm_f32_ptx().as_ptr(), c"nsl_rmsnorm_f32".as_ptr().cast(),
         [grid, 1, 1], [block, 1, 1], &args, 256 * 4,
     );
     assert_eq!(result as u32, 0, "GPU rmsnorm kernel failed: {:?}", result);
@@ -8649,7 +8649,7 @@ pub(crate) fn gpu_rmsnorm_dgamma_backward_f32(
         ];
         let result = inner::kernel_launch(
             fused_kernels::rmsnorm_rinv_rows_f32_ptx().as_ptr(),
-            b"nsl_rmsnorm_rinv_rows_f32\0".as_ptr(),
+            c"nsl_rmsnorm_rinv_rows_f32".as_ptr().cast(),
             [rows as i64, 1, 1],
             [i64::from(RmsNormDgammaOp::RinvRows.block()), 1, 1],
             &rinv_args,
@@ -8668,7 +8668,7 @@ pub(crate) fn gpu_rmsnorm_dgamma_backward_f32(
         ];
         let result = inner::kernel_launch(
             fused_kernels::rmsnorm_dgamma_partial_f32_ptx().as_ptr(),
-            b"nsl_rmsnorm_dgamma_partial_f32\0".as_ptr(),
+            c"nsl_rmsnorm_dgamma_partial_f32".as_ptr().cast(),
             [plan.col_blocks as i64, plan.chunks as i64, 1],
             [i64::from(RmsNormDgammaOp::Partial.block()), 1, 1],
             &partial_args,
@@ -8685,7 +8685,7 @@ pub(crate) fn gpu_rmsnorm_dgamma_backward_f32(
     ];
     let result = inner::kernel_launch(
         fused_kernels::rmsnorm_dgamma_final_f32_ptx().as_ptr(),
-        b"nsl_rmsnorm_dgamma_final_f32\0".as_ptr(),
+        c"nsl_rmsnorm_dgamma_final_f32".as_ptr().cast(),
         [DgammaPlan::final_blocks(cols).max(1) as i64, 1, 1],
         [i64::from(RmsNormDgammaOp::Final.block()), 1, 1],
         &final_args,
@@ -8772,7 +8772,7 @@ pub(crate) fn gpu_rmsnorm_dx_backward_add_f32(
 
     let result = inner::kernel_launch(
         fused_kernels::rmsnorm_dx_bwd_add_f32_ptx().as_ptr(),
-        b"nsl_rmsnorm_dx_bwd_add_f32\0".as_ptr(),
+        c"nsl_rmsnorm_dx_bwd_add_f32".as_ptr().cast(),
         [rows as i64, 1, 1],
         [256, 1, 1],
         &args,
@@ -8834,7 +8834,7 @@ pub(crate) fn gpu_rmsnorm_dx_backward_f32(
 
     let result = inner::kernel_launch(
         fused_kernels::rmsnorm_dx_bwd_f32_ptx().as_ptr(),
-        b"nsl_rmsnorm_dx_bwd_f32\0".as_ptr(),
+        c"nsl_rmsnorm_dx_bwd_f32".as_ptr().cast(),
         [rows as i64, 1, 1],
         [256, 1, 1],
         &args,
@@ -8925,7 +8925,7 @@ pub(crate) fn gpu_scatter_add_f32(
     let grid_y = ((embed_dim as i64) + block_y - 1) / block_y;
 
     let result = inner::kernel_launch(
-        SCATTER_ADD_F32_PTX.as_ptr(), b"nsl_scatter_add_f32\0".as_ptr(),
+        SCATTER_ADD_F32_PTX.as_ptr(), c"nsl_scatter_add_f32".as_ptr().cast(),
         [grid_x, grid_y, 1], [block_x, block_y, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU scatter_add kernel failed: {:?}", result);
@@ -9077,7 +9077,7 @@ pub(crate) fn gpu_gather_dim_f32(
     let grid = (out_elems as i64 + block - 1) / block;
     let rc = inner::kernel_launch(
         fused_kernels::gather_dim_f32_ptx().as_ptr(),
-        b"nsl_gather_dim_f32\0".as_ptr(),
+        c"nsl_gather_dim_f32".as_ptr().cast(),
         [grid, 1, 1],
         [block, 1, 1],
         &args,
@@ -9294,7 +9294,7 @@ pub(crate) fn gpu_conv2d_f32(
     let grid = ((total as i64) + block - 1) / block;
 
     let result = inner::kernel_launch(
-        fused_kernels::conv2d_f32_ptx().as_ptr(), b"nsl_conv2d_f32\0".as_ptr(),
+        fused_kernels::conv2d_f32_ptx().as_ptr(), c"nsl_conv2d_f32".as_ptr().cast(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU conv2d kernel failed: {:?}", result);
@@ -9374,7 +9374,7 @@ pub(crate) fn gpu_maxpool2d_f32(
     let grid = ((total as i64) + block - 1) / block;
 
     let result = inner::kernel_launch(
-        fused_kernels::maxpool2d_f32_ptx().as_ptr(), b"nsl_maxpool2d_f32\0".as_ptr(),
+        fused_kernels::maxpool2d_f32_ptx().as_ptr(), c"nsl_maxpool2d_f32".as_ptr().cast(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU maxpool2d kernel failed: {:?}", result);
@@ -9460,7 +9460,7 @@ pub(crate) fn gpu_dropout_f32(input_ptr: i64, p: f64) -> (i64, i64) {
     let grid = ((len as i64) + block - 1) / block;
 
     let result = inner::kernel_launch(
-        fused_kernels::dropout_f32_ptx().as_ptr(), b"nsl_dropout_f32\0".as_ptr(),
+        fused_kernels::dropout_f32_ptx().as_ptr(), c"nsl_dropout_f32".as_ptr().cast(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU dropout kernel failed: {:?}", result);
@@ -9574,10 +9574,10 @@ pub(crate) fn gpu_slice_f32_with_shape(
     ];
 
     let block = 256i64;
-    let grid = ((total as i64) + block - 1) / block;
+    let grid = (total + block - 1) / block;
 
     let result = inner::kernel_launch(
-        fused_kernels::slice_f32_ptx().as_ptr(), b"nsl_slice_f32\0".as_ptr(),
+        fused_kernels::slice_f32_ptx().as_ptr(), c"nsl_slice_f32".as_ptr().cast(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU slice kernel failed: {:?}", result);
@@ -9630,7 +9630,7 @@ pub(crate) fn gpu_strided_copy_f32(tensor_ptr: i64) -> i64 {
             // Vector moves assume 16-byte-aligned bases. The destination is a
             // fresh allocation, but the source is a view that may point into the
             // middle of a parent buffer.
-            let aligned = (t.data as usize) % 16 == 0 && (out_data as usize) % 16 == 0;
+            let aligned = (t.data as usize).is_multiple_of(16) && (out_data as usize).is_multiple_of(16);
             if !resident.plan.vec4 || aligned {
                 let (grid, block) = resident.plan.geometry();
                 let mut src_data = t.data as u64;
@@ -9699,7 +9699,7 @@ pub(crate) fn gpu_strided_copy_f32(tensor_ptr: i64) -> i64 {
     let grid = ((total as i64) + block - 1) / block;
 
     let result = inner::kernel_launch(
-        fused_kernels::strided_copy_f32_ptx().as_ptr(), b"nsl_strided_copy_f32\0".as_ptr(),
+        fused_kernels::strided_copy_f32_ptx().as_ptr(), c"nsl_strided_copy_f32".as_ptr().cast(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
     assert_eq!(result as u32, 0, "GPU strided copy kernel failed: {:?}", result);

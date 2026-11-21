@@ -30,6 +30,7 @@ use std::ffi::c_void;
 ///
 /// Returns `CUresult` as `u32` (0 = success).
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn launch_forward(
     ptx_ptr: *const u8,
     kernel_name: *const u8,
@@ -218,6 +219,7 @@ pub(crate) fn launch_forward_large(
 /// * `dbias_out_dev`— device pointer: output `dbias[V]`    f32 (zeroed before call).
 /// * `num_valid`    — count of non-ignore_index positions in targets (host-computed).
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn launch_backward(
     ptx_ptr: *const u8,
     kernel_name: *const u8,
@@ -341,7 +343,7 @@ impl Bf16Head {
         if resolved_math_mode() != CublasMathMode::Bf16 || crate::cuda::graph_capture::enabled() {
             return None;
         }
-        let tail = if v % chunk == 0 { chunk } else { v % chunk };
+        let tail = if v.is_multiple_of(chunk) { chunk } else { v % chunk };
         let (r, hh) = (rows as i64, h as i64);
         let widths = [chunk as i64, tail as i64];
         let logits = widths.iter().all(|&c| bf16_gate(r, c, hh, (r * hh) as usize, (c * hh) as usize));
@@ -560,7 +562,7 @@ pub(crate) fn gemm_forward(
         ];
         let rc = inner::kernel_launch(
             super::fused_kernels::lce_chunk_stats_f32_ptx().as_ptr(),
-            b"nsl_lce_chunk_stats_f32\0".as_ptr(),
+            c"nsl_lce_chunk_stats_f32".as_ptr().cast(),
             [rows as i64, 1, 1],
             [256, 1, 1],
             &args,
@@ -593,7 +595,7 @@ pub(crate) fn gemm_forward(
     let grid = ((rows as i64) + 255) / 256;
     let rc = inner::kernel_launch(
         super::fused_kernels::lce_finalize_f32_ptx().as_ptr(),
-        b"nsl_lce_finalize_f32\0".as_ptr(),
+        c"nsl_lce_finalize_f32".as_ptr().cast(),
         [grid.max(1), 1, 1],
         [256, 1, 1],
         &args,
@@ -710,7 +712,7 @@ pub(crate) fn gemm_backward(
         let grid = ((total + 255) / 256).max(1);
         let rc = inner::kernel_launch(
             super::fused_kernels::lce_chunk_dlogits_f32_ptx().as_ptr(),
-            b"nsl_lce_chunk_dlogits_f32\0".as_ptr(),
+            c"nsl_lce_chunk_dlogits_f32".as_ptr().cast(),
             [grid, 1, 1],
             [256, 1, 1],
             &args,

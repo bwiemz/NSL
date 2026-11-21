@@ -352,6 +352,8 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
+          # For the cuda-feature clippy step below.
+          components: clippy
 
       - name: Install CUDA toolkit (nvcc, ptxas, cudart stubs, cuBLAS)
         uses: Jimver/cuda-toolkit@v0.2.36
@@ -427,6 +429,13 @@ jobs:
       # short incremental check rather than a second full build.
       - name: Check --features cuda,test-hooks (the reset hooks)
         run: cargo check -p nsl-runtime --features cuda,test-hooks --all-targets
+
+      # The workspace clippy step above builds without CUDA, so it never sees
+      # the CUDA half of nsl-runtime; that half had collected 142 findings by
+      # 2026-11. Same scope as that step (libs and bins, -D warnings), with
+      # the CUDA features on.
+      - name: Clippy with --features cuda
+        run: cargo clippy --workspace --features cuda,nsl-runtime/test-hooks -- -D warnings
 
       # Assembles all 59 hand-written PTX modules with ptxas. Needs no GPU.
       # Would have caught the invalid `.reg .f32 %f<3>` in BIAS_ADD_F32_PTX.
