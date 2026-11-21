@@ -2067,6 +2067,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   - `tools/refcheck`: the bf16 gradient criterion compared with `>`, so an all-NaN gradient passed.
 - **Training speed.**
   - `--checkpoint-compress bf16` dropped the flash forward's saved logsumexp, so every backward recomputed it (108 ms per call); a Coder-1B update took 9.2 s instead of 2.9 s.
+- **CUDA runtime.**
+  - The fused v2 flash-attention forward and `csha_with_saves` built their kernel argument arrays (raw pointers to locals) before the last writes to those locals: the per-row loop reassigned its pointers behind the array, and the multi-tile path reassigned tile parameters after taking their addresses. Writing a local by name after taking a raw pointer to it and then reading through that pointer is undefined behaviour in Rust; the launches read the right values only because the compiler did not exploit it. Each array is now built after its values are final.
+  - `nsl-runtime` is clippy-clean with `--features cuda`; CI runs `cargo clippy --workspace --features cuda,nsl-runtime/test-hooks -- -D warnings`.
 
 - **CEP.**
   - CEP head importance read `wq` along its input axis, cut `wk`/`wv` by query head and ignored `wo`; it pruned live heads and kept dead ones.
