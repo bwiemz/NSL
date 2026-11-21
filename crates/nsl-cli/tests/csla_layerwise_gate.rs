@@ -817,6 +817,10 @@ fn csla_weight_stream_parity_gpu() {
         &["--checkpoint-blocks", "--layerwise-accum", "--weight-stream"],
     );
     assert!(ws.success, "--weight-stream arm failed:\n{}", ws.stderr);
+    // D1: the streamed forward frees each block's interiors at the block's
+    // end too (the bit-exact comparison below then also covers those frees).
+    assert_frees_per_segment("ws_a", &base);
+    assert_frees_per_segment("ws_b", &ws);
 
     // Anti-vacuity: the streaming cycle actually ran, with the EXACT part-2
     // transfer arithmetic. 13 micro-batch forwards × 6 streamed params
@@ -897,6 +901,48 @@ fn csla_weight_stream_parity_gpu() {
     assert!(
         bytes_a == bytes_b,
         "saved model bytes diverged under --weight-stream"
+    );
+
+    // D1 kill switch under streaming: the streamed forward with the
+    // post-forward free list (no stubs, nothing freed between a slice and
+    // its evicts) must be byte-identical to the streamed forward that frees
+    // per segment, and move the same bytes.
+    let save_c = tmp.join("csla_ws_nofree.nslm");
+    let nofree = run_program_env(
+        &program("csla_layerwise_ffn.nsl", true, &save_c, &[]),
+        "ws_c",
+        true,
+        true,
+        &[
+            "--checkpoint-blocks",
+            "--layerwise-accum",
+            "--weight-stream",
+        ],
+        &[("NSL_CCR_SEGMENT_FREE", "0")],
+    );
+    assert!(
+        nofree.success,
+        "--weight-stream kill-switch arm failed:\n{}",
+        nofree.stderr
+    );
+    assert!(
+        witness_count(&nofree.stderr).is_none(),
+        "NSL_CCR_SEGMENT_FREE=0 still freed per segment under --weight-stream:\n{}",
+        nofree.stderr
+    );
+    assert_eq!(
+        ws_counts(&nofree.stderr),
+        (114, 114, 36),
+        "kill-switch arm transfer counts"
+    );
+    assert_eq!(
+        ws.loss_stream, nofree.loss_stream,
+        "the per-segment free changed the loss stream under --weight-stream"
+    );
+    let bytes_c = std::fs::read(&save_c).expect("ws kill-switch model_save missing");
+    assert!(
+        bytes_b == bytes_c,
+        "the per-segment free changed the saved model under --weight-stream"
     );
 }
 

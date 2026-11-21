@@ -2023,11 +2023,15 @@ impl Compiler<'_> {
                     CodegenError::new("source AD: loss VarId not found in compiled forward graph")
                 })?;
 
-                // CCR P1.a: free the checkpointed block interiors NOW —
-                // the forward is done and the backward will recompute them.
-                // Lowered as a tiny FreeTensor-only list seeded with the
-                // primal var_map; `explicit_freed_vars` flows into the
-                // bulk-free exclusion below so nothing double-frees.
+                // CCR P1.a: the checkpointed block interiors the backward
+                // recomputes (or reads only through a shape stub) are freed
+                // during the forward, each segment's at its end (Item 11; in
+                // every mode, `--layerwise-accum` and `--weight-stream`
+                // included). Under the NSL_CCR_SEGMENT_FREE=0 kill switch
+                // they are freed NOW, after the forward, by a tiny
+                // FreeTensor-only list seeded with the primal var_map.
+                // Either way the freed set flows into the bulk-free
+                // exclusion below so nothing double-frees.
                 // (Refcounted runtime: views holding a reference keep the
                 // storage alive, so this is a decrement, not a hard free.)
                 let ccr_freed_primal: std::collections::HashSet<crate::wengert::VarId> =

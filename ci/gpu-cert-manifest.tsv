@@ -14,7 +14,9 @@ crates/nsl-cli/tests/ccr_periodic_stride_gate.rs	periodic_stride_reduces_activat
 crates/nsl-cli/tests/ccr_reference_gradient_gate.rs	checkpointed_training_matches_pytorch_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/ccr_reference_gradient_gate.rs	compressed_saves_stay_within_bf16_rounding_of_pytorch_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/ccr_segment_early_free_gate.rs	gpu_forward_activation_peak_drops_with_per_segment_free	gpu	requires CUDA GPU (two training runs, kill-switch A/B)
+crates/nsl-cli/tests/ccr_segment_early_free_gate.rs	gpu_layerwise_forward_activation_peak_drops_with_per_segment_free	gpu	requires CUDA GPU (four training runs, kill-switch A/B under CSLA and weight streaming)
 crates/nsl-cli/tests/ccr_segment_early_free_gate.rs	gpu_allocation_is_flat_across_steps	gpu	requires CUDA GPU (one training run)
+crates/nsl-cli/tests/ccr_segment_early_free_gate.rs	gpu_layerwise_allocation_is_flat_across_windows	gpu	requires CUDA GPU (one training run)
 crates/nsl-cli/tests/ccr_segment_early_free_gate.rs	gpu_train_refuses_a_host_resident_float_input	gpu	requires CUDA GPU (one refused run)
 crates/nsl-cli/tests/csha_gap_gpu_e2e_smoke.rs	csha_gap_gpu_e2e_weights_change_after_one_step	gpu	requires a CUDA-capable GPU
 crates/nsl-cli/tests/csha_toy_pretrain_gate.rs	the_example_without_csha_matches_pytorch	gpu	requires CUDA GPU

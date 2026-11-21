@@ -105,3 +105,10 @@ responsibility.
 Weight-streaming keeps its own (post-forward) free discipline; CSLA is
 excluded (its retention contract is the bulk-free's). Both documented at the
 plan-construction site; both fall back to exactly the pre-fix behaviour.
+
+*Update 2026-11-21 (D1):* both exclusions are gone. They cost +10 GiB at
+Coder-500M and an OOM at Coder-1B (`MEMORY_OPTIONS_2026_11.md`, D1). CSLA
+now frees per segment too, buffering the shape stubs the free lists make in
+its window, and the weight-streamed forward frees each segment's interiors
+before that slice's evicts. `NSL_CCR_SEGMENT_FREE=0` still restores the
+post-forward list in every mode.

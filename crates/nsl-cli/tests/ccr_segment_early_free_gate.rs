@@ -57,7 +57,20 @@ enum Shape {
     GpuSized,
 }
 
-fn fixture(gpu: bool, shape: Shape) -> String {
+/// The training schedule a run compiles (D1: the per-segment free must engage
+/// under the layerwise schedule and the streamed forward as well).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Schedule {
+    /// `--checkpoint-blocks` alone.
+    Plain,
+    /// `--layerwise-accum` (CSLA), accumulation window of 2.
+    Layerwise,
+    /// `--layerwise-accum --weight-stream`, every layer streamed
+    /// (`NSL_WS_RESIDENT=0`: the residency policy would pin this small model).
+    WeightStream,
+}
+
+fn fixture_with(gpu: bool, shape: Shape, schedule: Schedule) -> String {
     let (blocks, rows, d, ff, epochs) = match shape {
         Shape::Small => (4, 8, 128, 512, 2),
         Shape::GpuSized => (4, 8, 512, 2048, 1),
@@ -103,7 +116,7 @@ let tokens = unit.reshape([1, 128]).expand([{tiles}, 128]).contiguous().reshape(
 let loader = DataLoader(tokens, batch_size=4, seq_len={seq}, shuffle=false, drop_last=true)
 
 print("LOSS_STREAM_BEGIN")
-train(model = m, epochs = {epochs}):
+train(model = m, epochs = {epochs}{accum}):
     optimizer: AdamW(lr = 0.001)
     step(batch):
         let logits = m.forward(batch.input_ids)
@@ -118,6 +131,12 @@ print("LOSS_STREAM_END")
 print("SEG_FREE_FIXTURE_DONE")
 "#,
         place = if gpu { "m.to(cuda)" } else { "" },
+        // The layerwise schedule needs an accumulation window to buffer.
+        accum = if schedule == Schedule::Plain {
+            ""
+        } else {
+            ", grad_accumulation = 2"
+        },
         tiles = match shape {
             Shape::Small => 16,
             Shape::GpuSized => 128, // 16,384 tokens = 8 micro-steps of 4x512
@@ -163,15 +182,37 @@ fn run_with_events(
     seg_free: bool,
     events: Option<&std::path::Path>,
 ) -> Run {
+    run_schedule(tag, gpu, shape, Schedule::Plain, det, seg_free, events)
+}
+
+fn run_schedule(
+    tag: &str,
+    gpu: bool,
+    shape: Shape,
+    schedule: Schedule,
+    det: bool,
+    seg_free: bool,
+    events: Option<&std::path::Path>,
+) -> Run {
     let root = repo_root();
     let dir = std::env::temp_dir().join(format!("nsl_segfree_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let prog = dir.join("p.nsl");
-    std::fs::write(&prog, fixture(gpu, shape)).unwrap();
+    std::fs::write(&prog, fixture_with(gpu, shape, schedule)).unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_nsl"));
-    cmd.args(["run", "--source-ad", "--seed", "11", "--checkpoint-blocks"])
-        .arg(&prog)
+    cmd.args(["run", "--source-ad", "--seed", "11", "--checkpoint-blocks"]);
+    match schedule {
+        Schedule::Plain => {}
+        Schedule::Layerwise => {
+            cmd.arg("--layerwise-accum");
+        }
+        Schedule::WeightStream => {
+            cmd.args(["--layerwise-accum", "--weight-stream"])
+                .env("NSL_WS_RESIDENT", "0");
+        }
+    }
+    cmd.arg(&prog)
         .current_dir(&dir)
         .env("NSL_STDLIB_PATH", root.join("stdlib"));
     if det {
@@ -320,22 +361,75 @@ fn gpu_forward_activation_peak_drops_with_per_segment_free() {
     );
 }
 
-/// Allocation-slope guard: the post-cleanup allocated-bytes series from
-/// NSL_EVENTS must be FLAT from steady state on — byte equality, the
-/// assertion class that catches what a peak assertion hides (the +8 MB/step
-/// fused-SDPA LSE leak shipped INSIDE item 11's first draft and was found
-/// by ramp, not by any peak). Exact bytes, every step, from one snapshot
-/// per emission — no stderr parsing, no MB rounding.
+/// D1 peak guard: the same kill-switch A/B under `--layerwise-accum`, without
+/// and with `--weight-stream` (every layer streamed). Before D1 neither
+/// schedule freed per segment — the window kept every block's interiors to
+/// the end of each micro-batch's forward (+10 GiB at Coder-500M, OOM at 1B) —
+/// so both arms of each pair measured the same peak. The witness alone cannot
+/// show the frees moved the peak; only the peak can.
 #[test]
-#[ignore = "requires CUDA GPU (one training run)"]
-fn gpu_allocation_is_flat_across_steps() {
-    let ev = std::env::temp_dir().join(format!("nsl_segfree_events_{}.jsonl", std::process::id()));
-    let r = run_with_events("gpu_flat", true, Shape::GpuSized, false, true, Some(&ev));
-    assert!(r.ok, "GPU run failed:\n{}", r.stderr);
+#[ignore = "requires CUDA GPU (four training runs, kill-switch A/B under CSLA and weight streaming)"]
+fn gpu_layerwise_forward_activation_peak_drops_with_per_segment_free() {
+    for (name, schedule) in [
+        ("csla", Schedule::Layerwise),
+        ("ws", Schedule::WeightStream),
+    ] {
+        let on = run_schedule(
+            &format!("gpu_{name}_on"),
+            true,
+            Shape::GpuSized,
+            schedule,
+            false,
+            true,
+            None,
+        );
+        assert!(on.ok, "{name}: feature-on GPU run failed:\n{}", on.stderr);
+        let n = witness_count(&on.stderr)
+            .unwrap_or_else(|| panic!("{name}: no witness on GPU run:\n{}", on.stderr));
+        assert!(n > 0, "{name}: witness reports zero interiors freed");
 
-    // Per step, the LAST gpu_mem_step event (highest seq) is the
-    // post-cleanup snapshot — the step-boundary state a leak inflates.
-    let text = std::fs::read_to_string(&ev).expect("events file");
+        let off = run_schedule(
+            &format!("gpu_{name}_off"),
+            true,
+            Shape::GpuSized,
+            schedule,
+            false,
+            false,
+            None,
+        );
+        assert!(
+            off.ok,
+            "{name}: kill-switch GPU run failed:\n{}",
+            off.stderr
+        );
+        assert!(
+            witness_count(&off.stderr).is_none(),
+            "{name}: NSL_CCR_SEGMENT_FREE=0 still freed per segment:\n{}",
+            off.stderr
+        );
+
+        let (on_act, off_act) = (
+            peak_value(&on.stdout, "PEAK_ACTIVATIONS"),
+            peak_value(&off.stdout, "PEAK_ACTIVATIONS"),
+        );
+        println!(
+            "{name}: PEAK_ACTIVATIONS on={on_act} off={off_act} drop={} MiB",
+            (off_act.saturating_sub(on_act)) >> 20
+        );
+        const MARGIN: u64 = 32 << 20;
+        assert!(
+            on_act + MARGIN <= off_act,
+            "{name}: per-segment freeing did not move the activation peak under the \
+             layerwise schedule: on={on_act} off={off_act} (need >= {MARGIN} drop); \
+             the witness fired (n={n}) — the D1 regression shape."
+        );
+    }
+}
+
+/// Per step, the LAST `gpu_mem_step` event (highest seq) of an `NSL_EVENTS`
+/// file: the post-cleanup snapshot, the step-boundary state a leak inflates.
+/// `(step, allocated bytes)` in step order.
+fn post_cleanup_allocated(text: &str) -> Vec<(i64, u64)> {
     let mut by_step: std::collections::BTreeMap<i64, (i64, u64)> = Default::default();
     for line in text.lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -356,7 +450,24 @@ fn gpu_allocation_is_flat_across_steps() {
             *e = (seq, alloc);
         }
     }
-    let series: Vec<(i64, u64)> = by_step.into_iter().map(|(s, (_, a))| (s, a)).collect();
+    by_step.into_iter().map(|(s, (_, a))| (s, a)).collect()
+}
+
+/// Allocation-slope guard: the post-cleanup allocated-bytes series from
+/// NSL_EVENTS must be FLAT from steady state on — byte equality, the
+/// assertion class that catches what a peak assertion hides (the +8 MB/step
+/// fused-SDPA LSE leak shipped INSIDE item 11's first draft and was found
+/// by ramp, not by any peak). Exact bytes, every step, from one snapshot
+/// per emission — no stderr parsing, no MB rounding.
+#[test]
+#[ignore = "requires CUDA GPU (one training run)"]
+fn gpu_allocation_is_flat_across_steps() {
+    let ev = std::env::temp_dir().join(format!("nsl_segfree_events_{}.jsonl", std::process::id()));
+    let r = run_with_events("gpu_flat", true, Shape::GpuSized, false, true, Some(&ev));
+    assert!(r.ok, "GPU run failed:\n{}", r.stderr);
+
+    let text = std::fs::read_to_string(&ev).expect("events file");
+    let series = post_cleanup_allocated(&text);
     assert!(
         series.len() >= 6,
         "expected >= 6 stepped gpu_mem_step events, got {} — the fixture \
@@ -378,7 +489,58 @@ fn gpu_allocation_is_flat_across_steps() {
     let _ = std::fs::remove_file(&ev);
 }
 
-
+/// D1 twin of the slope guard under `--layerwise-accum`: the window buffers
+/// each micro-batch's imports — now including the shape stubs the forward's
+/// free lists make — and frees them after their last replay. A stub slot that
+/// is buffered and never freed grows the allocation by one stub set per
+/// window. Mid-window steps hold one micro-batch's buffer and window ends
+/// hold none, so the series alternates with the window (2): steady state is
+/// byte equality two steps apart.
+#[test]
+#[ignore = "requires CUDA GPU (one training run)"]
+fn gpu_layerwise_allocation_is_flat_across_windows() {
+    let ev = std::env::temp_dir().join(format!(
+        "nsl_segfree_csla_events_{}.jsonl",
+        std::process::id()
+    ));
+    let r = run_schedule(
+        "gpu_csla_flat",
+        true,
+        Shape::GpuSized,
+        Schedule::Layerwise,
+        false,
+        true,
+        Some(&ev),
+    );
+    assert!(r.ok, "GPU run failed:\n{}", r.stderr);
+    let n = witness_count(&r.stderr).unwrap_or(0);
+    assert!(
+        n > 0,
+        "the layerwise forward did not free per segment:\n{}",
+        r.stderr
+    );
+    let text = std::fs::read_to_string(&ev).expect("events file");
+    let series = post_cleanup_allocated(&text);
+    assert!(
+        series.len() >= 8,
+        "expected >= 8 stepped gpu_mem_step events (4 windows), got {}:\n{text}",
+        series.len()
+    );
+    // The first window warms the allocator; from the second on, each step
+    // equals the step one window before it.
+    for i in 4..series.len() {
+        assert_eq!(
+            series[i].1,
+            series[i - 2].1,
+            "allocated bytes at step {} differ from one window earlier ({} vs {}) — \
+             a per-window allocation slope. Full series: {series:?}",
+            series[i].0,
+            series[i].1,
+            series[i - 2].1
+        );
+    }
+    let _ = std::fs::remove_file(&ev);
+}
 
 /// Defect-1 refusal (item 2): a host-resident dense-float step input on a
 /// GPU-parameter model must REFUSE at the first step with the fix named —

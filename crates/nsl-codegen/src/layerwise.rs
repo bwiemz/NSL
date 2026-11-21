@@ -370,6 +370,31 @@ pub fn forward_slices(
     Ok(slices)
 }
 
+/// For each slice of [`forward_slices`], the index of the segment it IS, or
+/// `None` for a prologue, epilogue or inter-segment gap. The per-segment
+/// early-free lowers segment `i`'s free list after the slice tagged `i`.
+///
+/// Matched in order (the slices list the segments in order), so two segments
+/// with the same bounds — two empty ones — get their own indices and no list
+/// runs twice.
+pub fn segment_index_of_slices(
+    segments: &[(usize, usize)],
+    slices: &[(usize, usize)],
+) -> Vec<Option<usize>> {
+    let mut next = 0;
+    slices
+        .iter()
+        .map(|&slice| {
+            if segments.get(next) == Some(&slice) {
+                next += 1;
+                Some(next - 1)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// CSLA D2b: params that must stay RESIDENT under weight streaming — any
 /// param rooting a transitive primal VIEW chain (`view_of`: view result vid
 /// → rooting param vid) whose view lands in the buffered-import set. A
@@ -803,6 +828,36 @@ mod tests {
         assert!(forward_slices(&[(3, 7), (5, 9)], 12).is_err());
         assert!(forward_slices(&[(0, 20)], 12).is_err());
         assert!(forward_slices(&[(4, 2)], 12).is_err());
+    }
+
+    #[test]
+    fn slices_are_tagged_with_the_segment_they_are() {
+        // Prologue, segment 0, a gap, segment 1, epilogue.
+        let segments = [(2, 4), (6, 8)];
+        let slices = forward_slices(&segments, 10).unwrap();
+        assert_eq!(
+            segment_index_of_slices(&segments, &slices),
+            vec![None, Some(0), None, Some(1), None]
+        );
+        // No prologue or epilogue: every slice is a segment.
+        let segments = [(0, 5), (5, 9)];
+        let slices = forward_slices(&segments, 9).unwrap();
+        assert_eq!(
+            segment_index_of_slices(&segments, &slices),
+            vec![Some(0), Some(1)]
+        );
+        // Two empty segments at the same position are two segments, in order.
+        let segments = [(3, 3), (3, 3), (3, 6)];
+        let slices = forward_slices(&segments, 6).unwrap();
+        assert_eq!(
+            segment_index_of_slices(&segments, &slices),
+            vec![None, Some(0), Some(1), Some(2)]
+        );
+        // No segments: one untagged slice.
+        assert_eq!(
+            segment_index_of_slices(&[], &forward_slices(&[], 6).unwrap()),
+            vec![None]
+        );
     }
 
     #[test]
