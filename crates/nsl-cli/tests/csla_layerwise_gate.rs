@@ -255,6 +255,41 @@ fn window_phase_count(stderr: &str) -> Option<i64> {
         .and_then(|n| n.trim().parse::<i64>().ok())
 }
 
+/// Parse the `[ccr] per-segment early-free: N interior value(s) ...`
+/// compile-time witness (same parser as `ccr_segment_early_free_gate.rs`).
+/// `None` = the forward did not free per segment.
+fn witness_count(stderr: &str) -> Option<usize> {
+    let line = stderr
+        .lines()
+        .find(|l| l.contains("per-segment early-free"))?;
+    line.split(':')
+        .nth(1)?
+        .trim()
+        .split(' ')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// D1: the layerwise forward frees each block's interiors at the block's
+/// end. Before the fix it never did (every interior lived to the end of each
+/// micro-batch's forward: +10 GiB at Coder-500M, OOM at 1B), and a parity
+/// gate cannot see that — both arms agree either way.
+fn assert_frees_per_segment(tag: &str, out: &RunOutput) {
+    let n = witness_count(&out.stderr).unwrap_or_else(|| {
+        panic!(
+            "{tag}: no `[ccr] per-segment early-free` witness — the layerwise \
+             forward is not freeing block interiors per segment:\n{}",
+            out.stderr
+        )
+    });
+    assert!(
+        n > 0,
+        "{tag}: the per-segment early-free freed nothing:\n{}",
+        out.stderr
+    );
+}
+
 /// The parity core: baseline (`--checkpoint-blocks`) twice as a determinism
 /// probe, then the layerwise arm; bit-exact loss stream + model bytes when
 /// the environment is deterministic; exact window-phase count both arms.
@@ -342,6 +377,7 @@ fn parity_case_with_schedule(
         "CCR declined under --layerwise-accum (should have been a hard error):\n{}",
         csla.stderr
     );
+    assert_frees_per_segment(tag, &csla);
     // Anti-vacuity: the window backward fired exactly once per complete
     // accumulation window (trailing partial windows never fire; the
     // baseline arm drops the same tail because the harness compiles it
@@ -451,6 +487,125 @@ fn csla_parity_ffn_cpu_epoch_straddle() {
         &[],
         13,
     );
+}
+
+/// Parse `[ccr] backward: R freed interior(s) recomputed, S read for shape
+/// only and U not read (...); K saved tensor(s) released early` into
+/// (R, S, U, K).
+fn ccr_backward_counts(stderr: &str) -> Option<(usize, usize, usize, usize)> {
+    let line = stderr.lines().find(|l| l.contains("[ccr] backward: "))?;
+    let nums: Vec<usize> = line
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse().unwrap())
+        .collect();
+    match nums[..] {
+        [r, s, u, k] => Some((r, s, u, k)),
+        _ => None,
+    }
+}
+
+/// D1 kill-switch parity, CPU, both checkpoint policies. The layerwise
+/// schedule with the per-segment early-free (the default) against the same
+/// schedule under `NSL_CCR_SEGMENT_FREE=0` (one post-forward free list, no
+/// shape stubs, nothing released) must be byte-identical — losses and saved
+/// model — under `--deterministic`. The per-segment free moves WHEN block
+/// interiors return to the allocator, and replaces the backward's shape-only
+/// reads with stubs the window buffers per micro-batch; a value change means
+/// a freed or an unbuffered value was read during the replay.
+#[test]
+fn csla_per_segment_free_is_bit_exact_with_the_kill_switch_cpu() {
+    let tmp = std::env::temp_dir().join(format!("nsl_csla_segfree_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    for (policy, extra) in [
+        ("blocks", &[][..]),
+        ("selective", &["--checkpoint-selective"][..]),
+    ] {
+        let save_on = tmp.join(format!("{policy}_on.nslm"));
+        let save_off = tmp.join(format!("{policy}_off.nslm"));
+        let args = [&["--checkpoint-blocks", "--layerwise-accum"][..], extra].concat();
+        let on = run_program(
+            &program("csla_layerwise_ffn.nsl", false, &save_on, &[]),
+            &format!("segfree_on_{policy}"),
+            false,
+            true,
+            &args,
+        );
+        assert!(
+            on.success,
+            "{policy}: per-segment-free run failed:\n{}",
+            on.stderr
+        );
+        assert_frees_per_segment(policy, &on);
+        assert_eq!(
+            window_phase_count(&on.stderr),
+            Some(6),
+            "{policy}:\n{}",
+            on.stderr
+        );
+        // Anti-vacuity for the window side: the run must have made shape
+        // stubs (the `h + f` residual add reads `f` for its shape) and, under
+        // the selective policy, released a kept save — the two things the
+        // kill switch turns off. Without them this parity would hold
+        // vacuously for the buffering it exists to check.
+        let (_, shape_only, _, released) = ccr_backward_counts(&on.stderr)
+            .unwrap_or_else(|| panic!("{policy}: no `[ccr] backward:` line:\n{}", on.stderr));
+        assert!(
+            shape_only + released > 0,
+            "{policy}: no shape stub was made:\n{}",
+            on.stderr
+        );
+
+        let off = run_program_env(
+            &program("csla_layerwise_ffn.nsl", false, &save_off, &[]),
+            &format!("segfree_off_{policy}"),
+            false,
+            true,
+            &args,
+            &[("NSL_CCR_SEGMENT_FREE", "0")],
+        );
+        assert!(
+            off.success,
+            "{policy}: kill-switch run failed:\n{}",
+            off.stderr
+        );
+        assert!(
+            witness_count(&off.stderr).is_none(),
+            "{policy}: NSL_CCR_SEGMENT_FREE=0 must lower the post-forward list, \
+             but the per-segment witness appeared:\n{}",
+            off.stderr
+        );
+        assert_eq!(
+            ccr_backward_counts(&off.stderr).map(|(_, s, _, k)| (s, k)),
+            Some((0, 0)),
+            "{policy}: the kill switch must make no stub and release nothing:\n{}",
+            off.stderr
+        );
+        assert_eq!(
+            window_phase_count(&off.stderr),
+            Some(6),
+            "{policy}:\n{}",
+            off.stderr
+        );
+
+        assert!(
+            !on.loss_stream.is_empty(),
+            "{policy}: no losses captured:\n{}",
+            on.stdout
+        );
+        assert_eq!(
+            on.loss_stream, off.loss_stream,
+            "{policy}: the per-segment free changed the loss stream under --layerwise-accum"
+        );
+        let (bytes_on, bytes_off) = (
+            std::fs::read(&save_on).expect("per-segment-free model_save missing"),
+            std::fs::read(&save_off).expect("kill-switch model_save missing"),
+        );
+        assert!(
+            bytes_on == bytes_off,
+            "{policy}: the per-segment free changed the saved model under --layerwise-accum"
+        );
+    }
 }
 
 /// GPU twin of the FFN gate under `--deterministic` (M46 kernels).

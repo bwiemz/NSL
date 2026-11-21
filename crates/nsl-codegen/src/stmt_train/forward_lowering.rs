@@ -134,9 +134,14 @@ impl Compiler<'_> {
         //   * ws path: already sliced, keeps its own (post-forward)
         //     free discipline; composing the two is future work and
         //     silently changing ws lifetimes here is not it.
-        //   * CSLA: buffers the adjoint's primal imports across the
-        //     accumulation window; its retention contract is the
-        //     bulk-free's, not this pass's. Excluded.
+        //   * CSLA (without ws) frees per segment too. The window
+        //     buffers what the adjoint reads, and the adjoint reads no
+        //     freed interior (`ccr::validate`) — only the shape stubs
+        //     the free lists make, which the window buffers as well
+        //     (`layerwise::adjoint_primal_imports`); the save phase
+        //     checks both. Without this every block's interiors lived
+        //     to the end of each micro-batch's forward (D1: +10 GiB at
+        //     500M, OOM at 1B).
         //   * NSL_CCR_SEGMENT_FREE=0: kill switch for A/B under ONE
         //     binary (the runtime-archive lesson: never A/B by
         //     swapping binaries).
@@ -412,12 +417,12 @@ impl Compiler<'_> {
 
     /// Whether the forward frees each CCR segment's interiors at that
     /// segment's end (the per-segment free lists) and not once after the
-    /// whole forward. False under CSLA, whose window buffers the adjoint's
-    /// primal imports (weight streaming needs CSLA, so it is covered), and
-    /// under the `NSL_CCR_SEGMENT_FREE=0` kill switch. `apply_to_adjoint` is
-    /// told this before the forward is lowered, so both sites read it here.
+    /// whole forward. False under `--weight-stream` (its streamed forward
+    /// lowers no free lists; it implies `--layerwise-accum`) and under the
+    /// `NSL_CCR_SEGMENT_FREE=0` kill switch. `apply_to_adjoint` is told this
+    /// before the forward is lowered, so both sites read it here.
     pub(crate) fn ccr_frees_per_segment(&self) -> bool {
-        !self.compile_options.train.layerwise_accum
+        !(self.compile_options.train.layerwise_accum && self.compile_options.weight_stream.enabled)
             && std::env::var("NSL_CCR_SEGMENT_FREE").as_deref() != Ok("0")
     }
 

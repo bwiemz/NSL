@@ -3004,6 +3004,89 @@ mod tests {
         assert_eq!(reduce_op.inputs, vec![50, 5], "the reduce still reads the saved v5");
     }
 
+    /// D1: what the per-segment free lists free and what the CSLA window
+    /// buffers never meet, under both policies. The window buffers the
+    /// adjoint's imports (`layerwise::adjoint_primal_imports`, given the
+    /// plan's stubs); the forward frees, at each segment's end, the lists
+    /// `build_segment_free_lists` makes. A shared VarId would be a buffered
+    /// pointer to storage the allocator already took back.
+    #[test]
+    fn per_segment_frees_never_free_a_window_import() {
+        // A backward that reads a shape-only block-1 interior (v5), a
+        // block-0 interior for its value (v9 with the Relu, else v3), the
+        // two block boundaries (v4, v6) and the input (v0).
+        let adjoint_for = |value_read: VarId| {
+            adjoint_of(vec![
+                reduce(0, 100, 50, 5),
+                adj_op(1, 101, PrimalOp::Mul, vec![value_read, 100]),
+                adj_op(2, 102, PrimalOp::Mul, vec![4, 101]),
+                adj_op(3, 103, PrimalOp::Mul, vec![6, 102]),
+                adj_op(4, 104, PrimalOp::Mul, vec![0, 103]),
+            ])
+        };
+        // (`toy_primal` under Selective has nothing to recompute: no plan.)
+        let cases = [
+            ("toy, Block", toy_primal(), CcrPolicy::Block, 3),
+            ("relu, Block", toy_primal_with_relu(), CcrPolicy::Block, 9),
+            (
+                "relu, Selective",
+                toy_primal_with_relu(),
+                CcrPolicy::Selective,
+                9,
+            ),
+        ];
+        for (name, primal, policy, value_read) in cases {
+            let mut plan = plan(&primal, None, policy, false, 1).unwrap();
+            let mut adjoint = adjoint_for(value_read);
+            let mut fresh = 200;
+            apply_to_adjoint(&primal, &mut adjoint, &mut plan, &mut fresh, true).unwrap();
+            let stubs: HashSet<VarId> = plan.shape_stubs.iter().map(|&(_, s)| s).collect();
+            assert!(
+                !stubs.is_empty(),
+                "{name}: the shape-only read of v5 makes no stub"
+            );
+            let imports: HashSet<VarId> =
+                crate::layerwise::adjoint_primal_imports(&primal, &adjoint, &stubs)
+                    .into_iter()
+                    .collect();
+            let lists = build_segment_free_lists(&plan);
+            let freed: HashSet<VarId> = lists
+                .iter()
+                .flat_map(|l| &l.ops)
+                .filter(|o| matches!(o.op, PrimalOp::FreeTensor))
+                .map(|o| o.inputs[0])
+                .collect();
+            assert!(!freed.is_empty(), "{name}: the lists free nothing");
+            assert!(
+                freed.is_disjoint(&imports),
+                "{name}: freed {freed:?} meets the window imports {imports:?}"
+            );
+            // Every stub the adjoint reads rides the window.
+            for op in &adjoint.ops {
+                for v in op.inputs.iter().filter(|v| stubs.contains(v)) {
+                    assert!(imports.contains(v), "{name}: stub v{v} is not buffered");
+                }
+            }
+            // A stub is made in the same list as, and before, its victim's free.
+            for &(victim, stub) in &plan.shape_stubs {
+                let list = lists
+                    .iter()
+                    .find(|l| l.ops.iter().any(|o| o.result == stub))
+                    .unwrap_or_else(|| panic!("{name}: no list makes stub v{stub}"));
+                let made = list.ops.iter().position(|o| o.result == stub).unwrap();
+                let free = list
+                    .ops
+                    .iter()
+                    .position(|o| matches!(o.op, PrimalOp::FreeTensor) && o.inputs == [victim])
+                    .unwrap_or_else(|| panic!("{name}: v{victim} is not freed with its stub"));
+                assert!(
+                    made < free,
+                    "{name}: stub v{stub} made after v{victim} was freed"
+                );
+            }
+        }
+    }
+
     /// The knapsack does not spend budget on a victim the backward never
     /// recomputes.
     #[test]
