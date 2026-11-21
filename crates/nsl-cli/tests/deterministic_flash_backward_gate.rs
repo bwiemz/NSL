@@ -43,6 +43,24 @@
 //! without --deterministic its replicates must be byte-identical too, and
 //! the gate asserts that as well.
 //!
+//! THE ARMS WITHOUT --deterministic PIN THE TWO OTHER SOURCES (2026-11-21).
+//! Without the flag the fixture also runs two things that are nondeterministic
+//! by design, and either one made this gate flake (about 75% of runs on CUDA
+//! 13.5 / driver 620.73) while blaming the attention backward:
+//!   * the embedding backward's `red.global.add` (128 rows, 1,024 tokens per
+//!     micro-batch): the last losses flip, e.g. step 8 3.6055023670196533 vs
+//!     3.6054940223693848. `NSL_EMBEDDING_BWD_CPU=1` removed it: 8/8
+//!     identical against 7/8 with it, interleaved.
+//!   * timed first-use GEMM plan selection (`matmul_config.rs`: plan choice is
+//!     "not reproducible across processes at all"). The q/k/v projections are
+//!     exactly 2^28 multiply-adds, so they are tuned. Seen once as a
+//!     difference in the FIRST loss with the embedding backward already on the
+//!     host, which only a forward op can cause. `--no-bf16-lt-tune` turns it off.
+//!
+//! Both are pinned in the plain and the control arm, and the plain arm checks
+//! that the pins took effect, so each arm measures the attention backward
+//! alone. `--deterministic` already turns both off.
+//!
 //! The divergence assertion is a race, so it was measured rather than assumed:
 //! at the pinned geometry, 6 replicates produced 6/6 distinct streams and 15/15
 //! differing pairs. If it ever flakes, that is itself worth reading — either the
@@ -90,6 +108,15 @@ fn run_fixture(tag: &str, deterministic: bool) -> RunOutput {
 }
 
 fn run_fixture_env(tag: &str, deterministic: bool, envs: &[(&str, &str)]) -> RunOutput {
+    run_fixture_with(tag, deterministic, envs, &[])
+}
+
+fn run_fixture_with(
+    tag: &str,
+    deterministic: bool,
+    envs: &[(&str, &str)],
+    extra_args: &[&str],
+) -> RunOutput {
     let root = repo_root();
     let src = std::fs::read_to_string(
         root.join("crates/nsl-cli/tests/fixtures/deterministic_flash_bwd.nsl"),
@@ -107,6 +134,7 @@ fn run_fixture_env(tag: &str, deterministic: bool, envs: &[(&str, &str)]) -> Run
     if deterministic {
         cmd.arg("--deterministic");
     }
+    cmd.args(extra_args);
     cmd.arg(&prog)
         .current_dir(&tmp)
         .env("NSL_STDLIB_PATH", root.join("stdlib"))
@@ -236,7 +264,8 @@ fn deterministic_flag_makes_flash_backward_bit_reproducible() {
     // ── without the flag: the tensor-core backward, deterministic too ─────
     // The default GPU backward (`attention_tc`, head_dim 64) has no atomics:
     // every dQ, dK and dV element has one writer. Without --deterministic its
-    // replicates must be byte-identical as well.
+    // replicates must be byte-identical as well, once `plain_arm` has pinned
+    // the embedding backward and the GEMM plan choice.
     let plain = plain_arm("plain", &[]);
     let tc_dispatch = plain
         .stderr
@@ -313,15 +342,38 @@ struct PlainArm {
 
 /// Three replicates without --deterministic, under `envs`. Each must succeed
 /// and must not take the deterministic CPU route.
+///
+/// Every replicate pins the fixture's two other nondeterministic sources (see
+/// the header): the embedding backward runs on the host and timed GEMM plan
+/// selection is off. Each replicate must show the second pin took effect.
 fn plain_arm(tag: &str, envs: &[(&str, &str)]) -> PlainArm {
+    let mut pinned: Vec<(&str, &str)> =
+        vec![("NSL_EMBEDDING_BWD_CPU", "1"), ("NSL_BF16_LT_COUNTER", "1")];
+    pinned.extend_from_slice(envs);
     let mut runs = Vec::new();
     let mut stderr = String::new();
     for r in 0..3 {
-        let out = run_fixture_env(&format!("{tag}{r}"), false, envs);
+        let out = run_fixture_with(&format!("{tag}{r}"), false, &pinned, &["--no-bf16-lt-tune"]);
         assert!(
             out.success,
             "{tag} run {r} failed:\nstdout:\n{}\nstderr:\n{}",
             out.stdout, out.stderr
+        );
+        let tf32_lt = out
+            .stderr
+            .lines()
+            .find(|l| l.starts_with("[tf32-lt]"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{tag} run {r} printed no [tf32-lt] counter line:\n{}",
+                    out.stderr
+                )
+            });
+        assert!(
+            tf32_lt.contains(" tuned=0 "),
+            "{tag} run {r} still timed GEMM plans under --no-bf16-lt-tune (`{tf32_lt}`): \
+             plan choice varies between processes, so this arm would no longer \
+             measure the attention backward alone"
         );
         assert_eq!(
             det_route_count(&out.stdout),
