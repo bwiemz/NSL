@@ -191,7 +191,7 @@ impl Compiler<'_> {
             return Err(CodegenError::new(format!(
                 "param_dtype=\"{name}\" is a test mode (the f32 master kept whole, to check the bf16 parameter \
                  plumbing bit for bit against f32 parameters); build with NSL_PARAM_DTYPE_TEST_MODES=1 to use it, \
-                 or drop param_dtype="
+                 or write param_dtype=\"bf16-split\""
             )));
         }
         let o = &self.compile_options;
@@ -272,6 +272,7 @@ pub(crate) fn param_storage_fingerprint(
     use nsl_semantic::train_config::ParamDtype;
     match pd {
         ParamDtype::F32 => None,
+        ParamDtype::Bf16Split => Some(",pdt=bf16split"),
         ParamDtype::Bf16Master => Some(",pdt=bf16master"),
         ParamDtype::Bf16MasterTz => Some(",pdt=bf16mastertz"),
     }
@@ -284,6 +285,7 @@ pub(crate) fn param_storage_wire(pd: nsl_semantic::train_config::ParamDtype) -> 
     use nsl_semantic::train_config::ParamDtype;
     match pd {
         ParamDtype::F32 => None,
+        ParamDtype::Bf16Split => Some(wire::SPLIT),
         ParamDtype::Bf16Master => Some(wire::MASTER),
         ParamDtype::Bf16MasterTz => Some(wire::MASTER_TZ),
     }

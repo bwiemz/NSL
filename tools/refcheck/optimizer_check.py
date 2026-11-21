@@ -260,7 +260,7 @@ def main() -> int:
     )
     ap.add_argument(
         "--param-dtype",
-        choices=["f32", "bf16-master"],
+        choices=["f32", "bf16-split", "bf16-master"],
         default="f32",
         help="the NSL train header's param_dtype= (needs --precision bf16; bf16-master is a "
         "test mode: build environment NSL_PARAM_DTYPE_TEST_MODES=1)",

@@ -128,6 +128,8 @@ crates/nsl-cli/tests/param_plan_gate.rs	a_corrupted_plan_entry_aborts_the_run_gp
 crates/nsl-cli/tests/param_plan_gate.rs	the_same_run_without_fault_injection_succeeds_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/param_plan_gate.rs	two_train_blocks_in_one_process_each_verify_their_own_plan_gpu	gpu	requires CUDA GPU (2 train blocks over 2 models, one process)
 crates/nsl-cli/tests/param_storage_gate.rs	bf16_master_trains_byte_identically_to_f32_parameters_gpu	gpu	requires CUDA GPU
+crates/nsl-cli/tests/param_storage_gate.rs	bf16_split_trains_byte_identically_to_the_tz_master_gpu	gpu	requires CUDA GPU
+crates/nsl-cli/tests/param_storage_gate.rs	bf16_split_resumes_like_an_uninterrupted_run_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/posture_certificate_gpu.rs	posture_certificate_canonical_exact_attention	gpu	requires CUDA GPU
 crates/nsl-cli/tests/posture_certificate_gpu.rs	posture_certificate_chain_exact_attention	gpu	requires CUDA GPU
 crates/nsl-cli/tests/posture_certificate_gpu.rs	posture_certificate_canonical	gpu	requires CUDA GPU

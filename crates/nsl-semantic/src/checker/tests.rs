@@ -3013,12 +3013,12 @@ fn train_valid_full_header_produces_no_config_errors() {
     );
 }
 
-/// `param_dtype=`: "f32" is accepted, "bf16-sr" is the
+/// `param_dtype=`: "f32" and "bf16-split" are accepted, "bf16-sr" is the
 /// reserved spelling of a later step (refused, saying so), anything else is
 /// refused with the accepted values.
 #[test]
-fn train_param_dtype_accepts_f32_and_refuses_the_reserved_sr_spelling() {
-    for ok in ["f32"] {
+fn train_param_dtype_accepts_split_and_refuses_the_reserved_sr_spelling() {
+    for ok in ["f32", "bf16-split"] {
         let errs = train_config_errors(&format!(
             r#"train(model = m, precision = "bf16", param_dtype = "{ok}"):"#
         ));
@@ -3037,7 +3037,7 @@ fn train_param_dtype_accepts_f32_and_refuses_the_reserved_sr_spelling() {
     let bad = train_config_errors(r#"train(model = m, param_dtype = "bf16"):"#);
     assert!(
         bad.iter()
-            .any(|m| m.contains("train 'param_dtype' must be \"f32\"")),
+            .any(|m| m.contains("train 'param_dtype' must be \"f32\" or \"bf16-split\"")),
         "{bad:?}"
     );
 }

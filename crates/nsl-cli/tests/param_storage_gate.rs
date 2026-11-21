@@ -1,5 +1,5 @@
 //! `train(..., precision="bf16", param_dtype=...)`: bf16 parameter storage on
-//! the normal schedule (design `srbf16-design.md`, step 2: the test-only master modes).
+//! the normal schedule (design `srbf16-design.md`, steps 2 and F).
 //!
 //! * **Planning** (CPU build): the weight matrices of a two-block
 //!   transformer (attention and SwiGLU halves) are selected, the norm gains
@@ -15,6 +15,11 @@
 //!     moments, the fingerprint aside), the model saved after the block; the
 //!     cast cache registers no matrix in master mode; no dtype-explicit op
 //!     takes the fallback.
+//!   - `bf16-split` trains byte-identically to the master mode whose image
+//!     rounds as the split does (`bf16-master-tz`): the split's storage and
+//!     reassembly are exact over a run, not only in the kernel gates.
+//!   - `bf16-split` resumed from a checkpoint continues the uninterrupted
+//!     run bit for bit; a resume across parameter storages is refused.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -135,12 +140,10 @@ fn tmp(tag: &str) -> PathBuf {
     ))
 }
 
+const SPLIT: &str = r#", param_dtype="bf16-split""#;
 const MASTER: &str = r#", param_dtype="bf16-master""#;
 const MASTER_TZ: &str = r#", param_dtype="bf16-master-tz""#;
 const TEST_MODES: (&str, &str) = ("NSL_PARAM_DTYPE_TEST_MODES", "1");
-/// What the planning and refusal tests compile: the master mode, with its
-/// switch (the user spelling comes with the split).
-const SPLIT: &str = MASTER;
 
 fn build(header: &str, extra: &[&str], env: &[(&str, &str)], tag: &str) -> Run {
     let mut args = vec!["build"];
@@ -153,11 +156,7 @@ fn build(header: &str, extra: &[&str], env: &[(&str, &str)], tag: &str) -> Run {
             .filter(|f| !(offload && *f == "--fuse-wgrad-accum")),
     );
     args.extend_from_slice(extra);
-    let mut env = env.to_vec();
-    if header == SPLIT && !tag.ends_with("_no_env") {
-        env.push(TEST_MODES);
-    }
-    nsl(&args, &fixture(header, 8, false, ""), &tmp(tag), tag, &env)
+    nsl(&args, &fixture(header, 8, false, ""), &tmp(tag), tag, env)
 }
 
 /// The 14 matrices (q, k, v, o and the three MLP projections, two blocks)
@@ -165,10 +164,10 @@ fn build(header: &str, extra: &[&str], env: &[(&str, &str)], tag: &str) -> Run {
 #[test]
 fn the_weight_matrices_are_selected_and_the_norm_gains_are_not() {
     let r = build(SPLIT, &[], &[], "plan_split");
-    assert!(r.ok, "bf16-master build failed:\n{}", r.out);
+    assert!(r.ok, "bf16-split build failed:\n{}", r.out);
     assert!(
         r.out
-            .contains("[param-storage] 14 of 18 parameters stored bf16-master"),
+            .contains("[param-storage] 14 of 18 parameters stored bf16-split"),
         "{}",
         r.out
     );
@@ -203,13 +202,7 @@ fn param_dtype_refusals_are_compile_errors() {
     args.extend_from_slice(PROD);
     let src = fixture(SPLIT, 8, false, "").replace(r#", precision="bf16""#, "");
     expect(
-        nsl(
-            &args,
-            &src,
-            &tmp("no_precision"),
-            "no_precision",
-            &[TEST_MODES],
-        ),
+        nsl(&args, &src, &tmp("no_precision"), "no_precision", &[]),
         "requires precision=\"bf16\"",
         "no precision",
     );
@@ -221,7 +214,7 @@ fn param_dtype_refusals_are_compile_errors() {
     );
     expect(
         build(r#", param_dtype="bf16""#, &[], &[], "bad"),
-        "must be \"f32\"",
+        "must be \"f32\" or \"bf16-split\"",
         "bf16",
     );
     // The test-only master modes without their switch, and with it.
@@ -297,7 +290,7 @@ fn param_dtype_refusals_are_compile_errors() {
     assert!(sgd.contains("SGD("), "fixture edit did not apply");
     let args = ["build", "--source-ad"];
     expect(
-        nsl(&args, &sgd, &tmp("sgd"), "sgd", &[TEST_MODES]),
+        nsl(&args, &sgd, &tmp("sgd"), "sgd", &[]),
         "needs the fused multi-tensor AdamW",
         "SGD",
     );
@@ -308,13 +301,7 @@ fn param_dtype_refusals_are_compile_errors() {
         "fixture edit did not apply"
     );
     expect(
-        nsl(
-            &args,
-            &no_accum,
-            &tmp("no_accum"),
-            "no_accum",
-            &[TEST_MODES],
-        ),
+        nsl(&args, &no_accum, &tmp("no_accum"), "no_accum", &[]),
         "needs the fused multi-tensor AdamW",
         "no accumulation",
     );
@@ -485,4 +472,116 @@ fn bf16_master_trains_byte_identically_to_f32_parameters_gpu() {
     // master arm stores the image and the cache never sees a matrix.
     assert!(cache_recasts(&f32.out) >= 14 * 49, "{}", f32.out);
     assert_eq!(cache_recasts(&master.out), 0, "{}", master.out);
+}
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn bf16_split_trains_byte_identically_to_the_tz_master_gpu() {
+    let (dt, ds) = (tmp("det_tz"), tmp("det_split"));
+    let tz = run_gpu(MASTER_TZ, EPOCHS, &dt, "tz", CK, &[TEST_MODES]);
+    let split = run_gpu(SPLIT, EPOCHS, &ds, "split", CK, &[]);
+    assert!(
+        split.out.contains("parameter storage: bf16-split"),
+        "the banner is missing:\n{}",
+        split.out
+    );
+    assert!(
+        split
+            .out
+            .contains("[param-storage] 14 parameters stored bf16-split"),
+        "{}",
+        split.out
+    );
+    assert_identical_runs(
+        &tz,
+        &split,
+        &dt,
+        &ds,
+        "tz",
+        "split",
+        "bf16-split vs bf16-master-tz",
+    );
+    assert_eq!(cache_recasts(&split.out), 0, "{}", split.out);
+}
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn bf16_split_resumes_like_an_uninterrupted_run_gpu() {
+    let dir = tmp("resume_split");
+    // 20 updates, saving at the end.
+    let first = run_gpu(
+        SPLIT,
+        80,
+        &dir,
+        "first",
+        r#", checkpoint_save="half.nslm", checkpoint_every=20"#,
+        &[],
+    );
+    assert!(first.ok, "{}", first.out);
+    // The resumed run continues to 40 updates (`epochs` is the run's total).
+    let resumed = run_gpu(
+        SPLIT,
+        160,
+        &dir,
+        "resumed",
+        r#", checkpoint_load="half.nslm""#,
+        &[],
+    );
+    assert!(resumed.ok, "{}", resumed.out);
+    let straight = run_gpu(SPLIT, 160, &dir, "straight", "", &[]);
+    assert!(straight.ok, "{}", straight.out);
+    let (ls, lr) = (losses(&straight.out), losses(&resumed.out));
+    let tail: Vec<&str> = ls.lines().skip(80).collect();
+    assert_eq!(
+        lr.lines().collect::<Vec<_>>(),
+        tail,
+        "the resumed losses are not the uninterrupted run's"
+    );
+    assert_eq!(
+        read(&dir, "resumed_final.nslm"),
+        read(&dir, "straight_final.nslm"),
+        "resumed θ differs from the uninterrupted run"
+    );
+    // Across parameter storages, a resume is refused by the fingerprint.
+    let f32_dir = tmp("resume_f32");
+    let f32 = run_gpu(
+        "",
+        80,
+        &f32_dir,
+        "first",
+        r#", checkpoint_save="half.nslm", checkpoint_every=20"#,
+        &[],
+    );
+    assert!(f32.ok, "{}", f32.out);
+    let across = run_gpu(
+        SPLIT,
+        160,
+        &f32_dir,
+        "across",
+        r#", checkpoint_load="half.nslm""#,
+        &[],
+    );
+    assert!(
+        !across.ok,
+        "a split run resumed an f32 checkpoint:\n{}",
+        across.out
+    );
+    assert!(
+        across.out.contains("ARITHMETIC differs") && across.out.contains("pdt:"),
+        "{}",
+        across.out
+    );
+    let back = run_gpu(
+        "",
+        160,
+        &dir,
+        "back",
+        r#", checkpoint_load="half.nslm""#,
+        &[],
+    );
+    assert!(
+        !back.ok && back.out.contains("pdt:"),
+        "an f32 run resumed a split checkpoint:\n{}",
+        back.out
+    );
 }

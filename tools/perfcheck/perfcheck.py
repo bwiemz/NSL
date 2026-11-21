@@ -145,8 +145,9 @@ BF16_BANNER = "cuBLAS math mode: BF16"
 ACT_BF16_BANNER = "activation storage: bf16"
 # The train-header text of a bf16 activation-storage arm (`nsl_bf16s`).
 PRECISION_BF16 = ', precision="bf16"'
-# bf16 parameter storage on top of it (`nsl_bf16master`: the test-only mode that
-# keeps the f32 master whole, built with its switch).
+# bf16 parameter storage on top of it (`nsl_bf16split`; `nsl_bf16master` is the
+# test-only mode that keeps the f32 master whole, built with its switch).
+PARAM_SPLIT = PRECISION_BF16 + ', param_dtype="bf16-split"'
 PARAM_MASTER = PRECISION_BF16 + ', param_dtype="bf16-master"'
 PARAM_BANNER = "parameter storage: "
 TF32_BANNER = "cuBLAS math mode: TF32"
@@ -297,6 +298,7 @@ def arm(name: str) -> Arm:
         "nsl_tf32": Arm(name, "nsl", "tf32", tuple(PROD_FLAGS)),
         "nsl_bf16": Arm(name, "nsl", "bf16", tuple(PROD_FLAGS), BF16),
         "nsl_bf16s": Arm(name, "nsl", "bf16", tuple(PROD_FLAGS), train_args=PRECISION_BF16),
+        "nsl_bf16split": Arm(name, "nsl", "bf16", tuple(PROD_FLAGS), train_args=PARAM_SPLIT),
         "nsl_bf16master": Arm(
             name,
             "nsl",
@@ -1147,7 +1149,7 @@ def phase_split(r: dict[str, Any]) -> dict[str, float] | None:
 
 REPORT_ORDER = [
     "nsl_tf32", "nsl_tf32_nodrain", "nsl_tf32_blocks", "nsl_tf32_compress",
-    "nsl_bf16", "nsl_bf16s", "nsl_bf16master", "nsl_bf16_nodrain", "nsl_bf16_blocks", "nsl_bf16_compress",
+    "nsl_bf16", "nsl_bf16s", "nsl_bf16split", "nsl_bf16master", "nsl_bf16_nodrain", "nsl_bf16_blocks", "nsl_bf16_compress",
     "torch_tf32_eager_sel", "torch_tf32_eager_blocks", "torch_tf32_eager_none",
     "torch_bf16_eager_sel", "torch_bf16_eager_blocks", "torch_bf16_eager_none",
     "torch_bf16_compile_sel", "torch_bf16_compile_blocks", "torch_bf16_compile_none",
@@ -1236,6 +1238,7 @@ PAIRS = [
     ("torch_bf16_compile_sel", "nsl_tf32"),
     ("nsl_bf16", "nsl_tf32"),
     ("nsl_bf16s", "nsl_bf16"),
+    ("nsl_bf16split", "nsl_bf16s"),
     ("nsl_bf16master", "nsl_bf16s"),
     ("torch_bf16_eager_sel", "torch_tf32_eager_sel"),
     ("torch_bf16_compile_sel", "torch_bf16_eager_sel"),

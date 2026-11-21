@@ -80,11 +80,13 @@ impl Precision {
 /// (`param_dtype=`), under `precision="bf16"`.
 ///
 /// `F32` (the default) keeps every parameter f32; the GEMMs read a bf16
-/// image of each matrix from the weight-cast cache. `Bf16Master` and
-/// `Bf16MasterTz` store those matrices bf16 (the GEMMs borrow them; no
-/// image) and keep the whole f32 master in optimizer state; they exist to
-/// test the plumbing (the compiler refuses them outside a test build
-/// environment). `"bf16-sr"` (no master, stochastic
+/// image of each matrix from the weight-cast cache. `Bf16Split` stores
+/// those matrices bf16 (the GEMMs borrow them; no image) and keeps the low
+/// 16 bits of each f32 master in optimizer state: the optimizer steps the
+/// exact f32 master, and the parameter is its top half rounded (a tie toward
+/// the truncation). `Bf16Master` and `Bf16MasterTz` keep the whole f32 master
+/// instead; they exist to test the plumbing (the compiler refuses them
+/// outside a test build environment). `"bf16-sr"` (no master, stochastic
 /// rounding) is reserved for a later step and refused.
 ///
 /// Inside the train block the stored matrices are bf16 tensors: `model_save`
@@ -94,6 +96,7 @@ impl Precision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParamDtype {
     F32,
+    Bf16Split,
     Bf16Master,
     Bf16MasterTz,
 }
@@ -103,6 +106,7 @@ impl ParamDtype {
     pub fn as_str(self) -> &'static str {
         match self {
             ParamDtype::F32 => "f32",
+            ParamDtype::Bf16Split => "bf16-split",
             ParamDtype::Bf16Master => "bf16-master",
             ParamDtype::Bf16MasterTz => "bf16-master-tz",
         }
@@ -442,21 +446,23 @@ pub fn resolve_train_config(
             },
             "param_dtype" => match &arg.value.kind {
                 ExprKind::StringLiteral(s) if s == "f32" => param_dtype = Some(ParamDtype::F32),
+                ExprKind::StringLiteral(s) if s == "bf16-split" => param_dtype = Some(ParamDtype::Bf16Split),
                 ExprKind::StringLiteral(s) if s == "bf16-master" => param_dtype = Some(ParamDtype::Bf16Master),
                 ExprKind::StringLiteral(s) if s == "bf16-master-tz" => param_dtype = Some(ParamDtype::Bf16MasterTz),
                 ExprKind::StringLiteral(s) if s == "bf16-sr" => diags.push(
                     Diagnostic::error(
                         "train 'param_dtype' \"bf16-sr\" (bf16 parameters with stochastic rounding and no \
-                         f32 master) is reserved and not implemented yet: use \"f32\"",
+                         f32 master) is reserved and not implemented yet: use \"bf16-split\", which stores \
+                         the matrices bf16 and keeps the f32 master's low half in optimizer state",
                     )
-                    .with_label(arg.span, "reserved; expected \"f32\""),
+                    .with_label(arg.span, "reserved; expected \"f32\" or \"bf16-split\""),
                 ),
                 _ => diags.push(
                     Diagnostic::error(
-                        "train 'param_dtype' must be \"f32\" (a string literal): how the train step stores \
-                         the weight matrices its GEMMs read",
+                        "train 'param_dtype' must be \"f32\" or \"bf16-split\" (a string literal): how the \
+                         train step stores the weight matrices its GEMMs read",
                     )
-                    .with_label(arg.span, "expected \"f32\""),
+                    .with_label(arg.span, "expected \"f32\" or \"bf16-split\""),
                 ),
             },
             other => diags.push(
