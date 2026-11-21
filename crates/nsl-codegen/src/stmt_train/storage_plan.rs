@@ -843,6 +843,30 @@ impl Compiler<'_> {
                     pd.as_str()
                 )));
             }
+            // Setting the program's storage commits `main` to its banner and
+            // fingerprint key, so the preconditions every lowering path
+            // shares are checked here, not only in the block-level admission
+            // (`admit_param_storage`): the pipelined path returns before that
+            // admission, and with neither check a `@pipeline` program
+            // declared bf16 parameters and trained f32 ones.
+            if precisions
+                .iter()
+                .zip(&param_dtypes)
+                .any(|(&p, &d)| d != ParamDtype::F32 && p != Precision::Bf16)
+            {
+                return Err(crate::CodegenError::new(format!(
+                    "param_dtype=\"{}\" requires precision=\"bf16\": the bf16 storage plan's GEMMs are what read a \
+                     bf16 parameter without a cast. Add precision=\"bf16\" or drop param_dtype=",
+                    pd.as_str()
+                )));
+            }
+            if self.features.pipeline_config.is_some() {
+                return Err(crate::CodegenError::new(format!(
+                    "param_dtype=\"{}\" is not supported on the pipelined train path (@pipeline): the parameter \
+                     storage plan is not lowered there. Drop one",
+                    pd.as_str()
+                )));
+            }
             self.param_storage = Some(pd);
         }
         if !precisions.contains(&Precision::Bf16) {

@@ -585,3 +585,68 @@ fn bf16_split_resumes_like_an_uninterrupted_run_gpu() {
         back.out
     );
 }
+
+/// Where the stored matrices would be inert or misread, the compile refuses.
+///
+/// * `@pipeline`: the pipelined lowering returns before the train block's
+///   own admission, while the program pre-scan had already declared the
+///   storage, so `main` printed `parameter storage: bf16-split` and put
+///   `pdt=bf16split` in the fingerprint over a run that stored nothing. The
+///   pre-scan now refuses it, with `precision="bf16"` and without it.
+/// * A callback that reads the model runs inside the block, where the
+///   selected matrices are bf16 tensors (`print(...)` of one showed `?` for
+///   every element; a reduction panicked in an f32-only kernel).
+#[test]
+fn param_dtype_is_refused_where_the_matrices_would_be_inert_or_misread() {
+    let mut args = vec!["build"];
+    args.extend_from_slice(PROD);
+    let pipelined = |src: String| {
+        let out = src.replace(
+            "model Net:\n    b1: Block = Block()",
+            "model Net:\n    @pipeline(stages = 2)\n    b1: Block = Block()",
+        );
+        assert!(
+            out.contains("@pipeline(stages = 2)"),
+            "the @pipeline rewrite matched nothing"
+        );
+        out
+    };
+    let refused = |r: &Run, needle: &str, what: &str| {
+        assert!(!r.ok, "{what} built:\n{}", r.out);
+        assert!(
+            r.out.contains(needle),
+            "{what}: expected `{needle}` in:\n{}",
+            r.out
+        );
+        assert!(
+            !r.out.contains("panicked"),
+            "{what}: a panic, not a refusal:\n{}",
+            r.out
+        );
+    };
+    let src = pipelined(fixture(SPLIT, 8, false, ""));
+    refused(
+        &nsl(&args, &src, &tmp("pipe_bf16"), "pipe_bf16", &[]),
+        "param_dtype=\"bf16-split\" is not supported on the pipelined train path (@pipeline)",
+        "@pipeline with precision=\"bf16\"",
+    );
+    let src = pipelined(fixture(SPLIT, 8, false, "")).replace(r#", precision="bf16""#, "");
+    refused(
+        &nsl(&args, &src, &tmp("pipe_f32"), "pipe_f32", &[]),
+        "param_dtype=\"bf16-split\" requires precision=\"bf16\"",
+        "@pipeline without precision",
+    );
+    for (body, path) in [
+        ("print(m.b1.w_gate.sum())", "m.b1.w_gate"),
+        ("print(mse_loss(m.forward(xd), yd))", "m"),
+    ] {
+        let src = fixture(SPLIT, 8, false, "")
+            .replace("            print(loss)", &format!("            {body}"));
+        assert!(src.contains(body), "the callback rewrite matched nothing");
+        refused(
+            &nsl(&args, &src, &tmp("cb_reads_model"), "cb_reads_model", &[]),
+            &format!("callback `on_step` reads the model (`{path}"),
+            body,
+        );
+    }
+}

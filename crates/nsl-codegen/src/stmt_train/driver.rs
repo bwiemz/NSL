@@ -162,6 +162,16 @@ impl Compiler<'_> {
                      there. Drop one",
                 ));
             }
+            // `param_dtype=` is refused for @pipeline programs at the
+            // program pre-scan (`resolve_program_precision`), before `main`
+            // declares the storage; this is the path-local backstop.
+            if let Some(pd) = self.param_storage {
+                return Err(CodegenError::new(format!(
+                    "param_dtype=\"{}\" is not supported on the pipelined train path (@pipeline): the \
+                     parameter storage plan is not lowered there. Drop one",
+                    pd.as_str()
+                )));
+            }
             // P5 item 19: the pipelined path lowers its stages outside the
             // region-marker emission — the flag would silently train eager
             // while the user believes graphs are active.
@@ -476,6 +486,28 @@ impl Compiler<'_> {
             grad_clip,
             purpose,
         )?;
+
+        // `param_dtype=`: inside the block the selected weight matrices are
+        // bf16 tensors (their f32 values live in optimizer state), and a
+        // callback runs inside the block. A callback that reads the model
+        // would see those tensors: an f32-only op refuses them and a host
+        // read would see the bf16 image, so refuse it here. (A read through
+        // an alias the compiler cannot see is refused at run time, when the
+        // weight is downloaded.)
+        if let Some(pd) = param_dtype {
+            for cb in &callbacks {
+                if let Some(path) = self.callback_model_access(&cb.body, model_sym) {
+                    return Err(CodegenError::new(format!(
+                        "param_dtype=\"{}\": callback `{}` reads the model (`{path}`), whose weight matrices are \
+                         stored bf16 inside the train block (their f32 values are in optimizer state until the \
+                         block ends). Read the model after the train block (use checkpoint_save=/checkpoint_every= \
+                         to save during training), or drop param_dtype=",
+                        pd.as_str(),
+                        self.resolve_sym(cb.name),
+                    )));
+                }
+            }
+        }
 
         // ── Item 7 (`--fuse-wgrad-accum`) admission ─────────────────────
         // Moved to `stmt_admission.rs` byte-for-byte (roadmap A1); this

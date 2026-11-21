@@ -2093,6 +2093,22 @@ impl Compiler<'_> {
         acc
     }
 
+    /// `param_dtype=`: the first model access in a callback body (the same
+    /// analysis as item 12's residency bracket), or `None` when the body does
+    /// not reference the model.
+    pub(crate) fn callback_model_access(
+        &self,
+        block: &nsl_ast::stmt::Block,
+        model_sym: nsl_ast::Symbol,
+    ) -> Option<String> {
+        let touch = self.analyze_callback_model_touch(block, model_sym);
+        touch.touches.then(|| {
+            touch
+                .first_path
+                .unwrap_or_else(|| self.resolve_sym(model_sym).to_string())
+        })
+    }
+
     /// NSL in-place tensor mutators — the only calls that write a param
     /// through a receiver/dest operand (`copy_data(dest, src)`,
     /// `zero_inplace(t)`, the `nsl_tensor_{op}_inplace` family). Everything
