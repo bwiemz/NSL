@@ -411,6 +411,7 @@ crates/nsl-codegen/tests/tier_b_tile_skip_gpu_parity.rs	tier_b_aligned_docs_s409
 crates/nsl-codegen/tests/track_b_head_dim_128_repro.rs	track_b_d_model_128_rejected_by_validator	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/track_b_head_dim_128_repro.rs	track_b_head_dim_128_d_model_32_launches	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/wggo_sidecar_population.rs	run_harness_stub_with_wggo_hook_populates_wggo_head_gradients	broken	requires cfg(test) BSS stub injection; covered by mod.rs unit test
+crates/nsl-kir/src/kernels/optim.rs	split_round_trips_every_bit_pattern	diagnostic	diagnostic: exhaustive 2^32 sweep of the split round trip (a minute in debug; run --ignored --release)
 crates/nsl-runtime/src/attention_tc.rs	tc_backward_matches_f64_reference_at_realistic_gradient_magnitudes	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/src/attention_tc.rs	tc_bf16_io_is_the_f32_kernel_rounded_once	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/src/attention_tc.rs	tc_backward_small_rows_keep_their_precision	gpu	requires a CUDA GPU; run with --features cuda -- --ignored

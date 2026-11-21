@@ -65,6 +65,37 @@ fn kernels() -> Vec<(String, Vec<u8>)> {
         let pre = bwd::BwdConfig::pre_only(hd);
         out.push((pre.pre_kernel_name(), bwd::pre_ptx(pre)));
     }
+    // The fused optimizer steps, pinned 2026-11-20 before bf16 parameter
+    // storage (`param_dtype=`) rebuilt the multi-tensor kernel as a family
+    // over the parameter's storage: today's kernels are the family's f32 (and
+    // CSLA SR) members and must print these exact bytes.
+    use nsl_kir::kernels::optim;
+    for (name, ptx) in [
+        (optim::FASE_ADAMW_STEP_NAME, optim::fase_adamw_step_ptx()),
+        (
+            optim::FASE_ADAMW_STEP_MBF16_NAME,
+            optim::fase_adamw_step_mbf16_ptx(),
+        ),
+        (optim::FASE_ADAMW_MULTI_NAME, optim::fase_adamw_multi_ptx()),
+        (
+            optim::FASE_ADAMW_MULTI_MBF16_NAME,
+            optim::fase_adamw_multi_mbf16_ptx(),
+        ),
+        (
+            optim::FASE_ADAMW_STEP_BF16SR_NAME,
+            optim::fase_adamw_step_bf16sr_ptx(),
+        ),
+        (
+            optim::FASE_ADAMW_MULTI_BF16SR_NAME,
+            optim::fase_adamw_multi_bf16sr_ptx(),
+        ),
+        (
+            optim::SR_BF16_ROUND_PROBE_NAME,
+            optim::sr_bf16_round_probe_ptx(),
+        ),
+    ] {
+        out.push((name.to_string(), ptx));
+    }
     out
 }
 
