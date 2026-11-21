@@ -973,6 +973,15 @@ pub struct Compiler<'a> {
     /// by this block's VarIds and cleared with `arena_placements`, for the
     /// same reason.
     pub(crate) storage_out: HashMap<crate::wengert::VarId, crate::stmt_train::storage_plan::Storage>,
+    /// `param_dtype=`: the GEMMs of the train block being lowered that the
+    /// storage plan routes dtype-explicitly only because they read a
+    /// bf16-stored parameter (`nsl_tensor_matmul_pdt`, the eager bf16 matmul
+    /// mode's per-shape rule). Keyed and cleared like `storage_out`.
+    pub(crate) storage_param_gemm: std::collections::HashSet<crate::wengert::VarId>,
+    /// The program's parameter storage (`param_dtype=` on a top-level train
+    /// block, resolved before `main` for the fingerprint and the banner);
+    /// `None` for f32 parameters.
+    pub(crate) param_storage: Option<nsl_semantic::train_config::ParamDtype>,
     /// Some top-level train block of this program asks for
     /// `precision="bf16"` (resolved before `main` is emitted, because the
     /// program's matmul mode and execution fingerprint follow from it).
@@ -1306,6 +1315,8 @@ impl<'a> Compiler<'a> {
             ),
             arena_placements: HashMap::new(),
             storage_out: HashMap::new(),
+            storage_param_gemm: std::collections::HashSet::new(),
+            param_storage: None,
             activation_bf16: false,
             packing_meta_vars: None,
             active_distill_context: None,

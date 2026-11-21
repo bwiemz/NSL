@@ -45,11 +45,12 @@ pub const TRAIN_CONFIG_KEYS: &[&str] = &[
     "checkpoint_load",
     "schedule_unit",
     "precision",
+    "param_dtype",
 ];
 
 const EXPECTED_KEYS_LABEL: &str = "expected model=, epochs=, grad_accumulation=, \
      grad_clip=, checkpoint_save=, checkpoint_every=, checkpoint_load=, schedule_unit=, \
-     or precision=";
+     precision=, or param_dtype=";
 
 /// How a train block stores its activations (`precision=`).
 ///
@@ -72,6 +73,44 @@ impl Precision {
             Precision::F32 => "f32",
             Precision::Bf16 => "bf16",
         }
+    }
+}
+
+/// How a train block stores the weight matrices its GEMMs read
+/// (`param_dtype=`), under `precision="bf16"`.
+///
+/// `F32` (the default) keeps every parameter f32; the GEMMs read a bf16
+/// image of each matrix from the weight-cast cache. `Bf16Master` and
+/// `Bf16MasterTz` store those matrices bf16 (the GEMMs borrow them; no
+/// image) and keep the whole f32 master in optimizer state; they exist to
+/// test the plumbing (the compiler refuses them outside a test build
+/// environment). `"bf16-sr"` (no master, stochastic
+/// rounding) is reserved for a later step and refused.
+///
+/// Inside the train block the stored matrices are bf16 tensors: `model_save`
+/// writes their exact f32 masters, but a callback that runs the model or
+/// reads a stored weight eagerly fails (an f32-only op refuses a bf16
+/// operand). After the block they are f32 again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamDtype {
+    F32,
+    Bf16Master,
+    Bf16MasterTz,
+}
+
+impl ParamDtype {
+    /// The spelling accepted in source.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ParamDtype::F32 => "f32",
+            ParamDtype::Bf16Master => "bf16-master",
+            ParamDtype::Bf16MasterTz => "bf16-master-tz",
+        }
+    }
+
+    /// The test-only modes (the f32 master kept whole).
+    pub fn is_test_only(self) -> bool {
+        matches!(self, ParamDtype::Bf16Master | ParamDtype::Bf16MasterTz)
     }
 }
 
@@ -163,6 +202,8 @@ pub struct ResolvedTrainConfig {
     pub schedule_unit: Option<ScheduleUnit>,
     /// `Some` when `precision=` was written; `None` is f32 storage.
     pub precision: Option<Precision>,
+    /// `Some` when `param_dtype=` was written; `None` is f32 parameters.
+    pub param_dtype: Option<ParamDtype>,
 }
 
 /// Who is asking. Distill lowering synthesizes a `TrainBlock` whose model
@@ -234,6 +275,7 @@ pub fn resolve_train_config(
     let mut checkpoint_load: Option<String> = None;
     let mut schedule_unit: Option<ScheduleUnit> = None;
     let mut precision: Option<Precision> = None;
+    let mut param_dtype: Option<ParamDtype> = None;
 
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Spans for the pairing diagnostics below, so the label lands on the
@@ -398,6 +440,25 @@ pub fn resolve_train_config(
                     .with_label(arg.span, "expected \"f32\" or \"bf16\""),
                 ),
             },
+            "param_dtype" => match &arg.value.kind {
+                ExprKind::StringLiteral(s) if s == "f32" => param_dtype = Some(ParamDtype::F32),
+                ExprKind::StringLiteral(s) if s == "bf16-master" => param_dtype = Some(ParamDtype::Bf16Master),
+                ExprKind::StringLiteral(s) if s == "bf16-master-tz" => param_dtype = Some(ParamDtype::Bf16MasterTz),
+                ExprKind::StringLiteral(s) if s == "bf16-sr" => diags.push(
+                    Diagnostic::error(
+                        "train 'param_dtype' \"bf16-sr\" (bf16 parameters with stochastic rounding and no \
+                         f32 master) is reserved and not implemented yet: use \"f32\"",
+                    )
+                    .with_label(arg.span, "reserved; expected \"f32\""),
+                ),
+                _ => diags.push(
+                    Diagnostic::error(
+                        "train 'param_dtype' must be \"f32\" (a string literal): how the train step stores \
+                         the weight matrices its GEMMs read",
+                    )
+                    .with_label(arg.span, "expected \"f32\""),
+                ),
+            },
             other => diags.push(
                 Diagnostic::error(format!("unknown train config key '{other}'"))
                     .with_label(arg.span, EXPECTED_KEYS_LABEL),
@@ -455,6 +516,7 @@ pub fn resolve_train_config(
             checkpoint_load,
             schedule_unit,
             precision,
+            param_dtype,
         })
     } else {
         Err(diags)

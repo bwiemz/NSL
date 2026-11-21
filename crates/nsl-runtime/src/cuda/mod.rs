@@ -47,6 +47,9 @@ pub(crate) mod storage_gemm;
 #[cfg(feature = "cuda")]
 pub(crate) mod storage_copy;
 
+#[cfg(feature = "cuda")]
+pub(crate) mod param_store_gpu;
+
 /// Test-only views of the bf16 cast cache (re-exported from lib.rs): the
 /// integration gate drives registration through the REAL fused-AdamW extern
 /// and needs only to observe (hits, recasts, evictions) and reset between

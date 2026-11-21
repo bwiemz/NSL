@@ -376,6 +376,58 @@ pub extern "C" fn nsl_tensor_matmul_dt(a: i64, b: i64, out_dtype: i64) -> i64 {
     narrowed(r, tag)
 }
 
+/// [`nsl_tensor_matmul_pdt`] calls that took f32 operands (the eager rule
+/// declined bf16, or one GEMM could not express the layout): reported by the
+/// parameter-storage teardown line, so a run whose large GEMMs land here is
+/// visible.
+pub(crate) static PDT_F32: AtomicU64 = AtomicU64::new(0);
+
+/// `a @ b` with an f32 result, where an operand is a bf16-stored parameter
+/// (`param_dtype=`, `crate::param_storage`) and the other an f32 value: a
+/// GEMM the activation plan alone leaves to the eager bf16 matmul mode,
+/// lowered dtype-explicitly only because the parameter is bf16. The eager
+/// mode decides per shape: bf16 operands when the product is worth casting
+/// both (`bf16_gate`), f32 (TF32) operands otherwise. This keeps the rule, so
+/// storing a parameter bf16 changes no GEMM's arithmetic:
+///
+/// - worth it: `storage_gemm::matmul`, the f32 operand rounded once and the
+///   parameter borrowed (the eager mode reads the cast cache's image, the
+///   same bits in master mode), through the same cuBLAS call;
+/// - not worth it, or a layout one GEMM cannot express: the eager f32 matmul
+///   over each stored parameter's exact f32 value.
+#[unsafe(no_mangle)]
+pub extern "C" fn nsl_tensor_matmul_pdt(a: i64, b: i64) -> i64 {
+    const NAME: &str = "nsl_tensor_matmul_pdt";
+    refuse_tape(NAME);
+    let (ta, tb) = (check_operand(NAME, a), check_operand(NAME, b));
+    #[cfg(feature = "cuda")]
+    if ta.device > 0 && ta.ndim >= 2 && tb.ndim == 2 {
+        let k = unsafe { *ta.shape.add(ta.ndim as usize - 1) };
+        let n = unsafe { *tb.shape.add(1) };
+        let bf16 = k > 0
+            && crate::cuda::cublas_inner::resolved_math_mode()
+                == crate::cuda::cublas_inner::CublasMathMode::Bf16
+            && crate::cuda::cublas_inner::bf16_gate(
+                ta.len / k,
+                n,
+                k,
+                ta.len as usize,
+                tb.len as usize,
+            );
+        if bf16 && let Some(c) = crate::cuda::storage_gemm::matmul(a, b, DTYPE_F32) {
+            return c;
+        }
+    }
+    let _ = (ta, tb);
+    PDT_F32.fetch_add(1, Ordering::Relaxed);
+    let fa = crate::param_storage::exact_f32(a).unwrap_or_else(|| widened(a));
+    let fb = crate::param_storage::exact_f32(b).unwrap_or_else(|| widened(b));
+    let r = crate::tensor::arithmetic::nsl_tensor_matmul(fa, fb, 0);
+    crate::tensor::nsl_tensor_free(fa);
+    crate::tensor::nsl_tensor_free(fb);
+    r
+}
+
 #[cfg(feature = "cuda")]
 fn storage(tag: u16) -> nsl_kir::kernels::storage::Storage {
     if tag == DTYPE_BF16 { nsl_kir::kernels::storage::Storage::Bf16 } else { nsl_kir::kernels::storage::Storage::F32 }

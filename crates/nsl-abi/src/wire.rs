@@ -130,6 +130,25 @@ pub mod param_plan {
     pub const PLAN_KNOWN_BITS: i64 = PLAN_STREAMED | PLAN_BF16_SR | PLAN_SHARDED | PLAN_ELEMENTWISE;
 }
 
+/// The `mode` argument of `nsl_param_store_bf16` / `nsl_set_param_storage`:
+/// how a train block's `param_dtype=` stores its bf16 parameters on the
+/// normal schedule (`nsl_runtime::param_storage`). Codegen emits these values
+/// and the runtime decodes them; a value either side does not know is a
+/// fatal error at run time.
+pub mod param_storage {
+    /// f32 parameters (the default): nothing is stored bf16.
+    pub const F32: i64 = 0;
+    /// `bf16-master` (test-only): θ is the RNE image of an f32 master kept in
+    /// optimizer state; trains bit-identically to `F32`.
+    pub const MASTER: i64 = 1;
+    /// `bf16-master` with the split's image rounding (test-only): the
+    /// reference the split mode is held byte-identical to.
+    pub const MASTER_TZ: i64 = 2;
+    /// `bf16-split`: θ is the f32 master's rounded top half, its low half
+    /// is kept in optimizer state.
+    pub const SPLIT: i64 = 3;
+}
+
 /// Allocation-surface tags: the wire values of `nsl_gpu_set_alloc_surface`
 /// / `nsl_gpu_get_alloc_surface`. The runtime's `SurfaceTag` enum takes its
 /// discriminants from these; codegen's train-block brackets emit them.

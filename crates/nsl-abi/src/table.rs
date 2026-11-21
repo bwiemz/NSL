@@ -580,6 +580,10 @@ macro_rules! for_each_runtime_fn {
             [abi_tensor] nsl_storage_dt_fallback_count() -> i64 = storage_dt::nsl_storage_dt_fallback_count;
             [abi_tensor] nsl_tensor_rmsnorm_dt(i64, i64, f64, i64) -> i64 = storage_dt::nsl_tensor_rmsnorm_dt;
             [abi_tensor] nsl_tensor_matmul_dt(i64, i64, i64) -> i64 = storage_dt::nsl_tensor_matmul_dt;
+            // A GEMM planned only because it reads a bf16-stored parameter (`param_dtype=`):
+            // the eager bf16 matmul mode's per-shape rule, over the parameter's exact f32 value
+            // where that rule picks f32 operands.
+            [abi_tensor] nsl_tensor_matmul_pdt(i64, i64) -> i64 = storage_dt::nsl_tensor_matmul_pdt;
             // Compiled `main` declares bf16 activation storage (prints the banner).
             [abi_tensor] nsl_set_activation_storage(i64) -> () = storage_dt::nsl_set_activation_storage;
             [abi_tensor] nsl_tensor_reduce_to_shape_dt(i64, i64, i64) -> i64 = storage_dt::nsl_tensor_reduce_to_shape_dt;
@@ -818,6 +822,14 @@ macro_rules! for_each_runtime_fn {
             // this list, the emission order in `stmt.rs`, and the Rust signature in
             // `fase_step.rs` must stay in lockstep or arguments silently shift.
             [optimizer] nsl_fase_fused_adamw_step_multi(i64, i64, i64, i64, f64, f64, f64, f64, f64, f64, f64, f64, f64, i64, i64, f64) -> () = fase_step::nsl_fase_fused_adamw_step_multi;
+            // bf16 parameter storage on the normal schedule (`param_dtype=`): compiled `main`
+            // declares the mode (banner); the train step stores its selected parameters
+            // (param list, index list, mode; idempotent, emitted per micro-step) and its
+            // teardown widens them back; the converted count is the gates' anti-vacuity read.
+            [optimizer] nsl_set_param_storage(i64) -> () = param_storage::nsl_set_param_storage;
+            [optimizer] nsl_param_store_bf16(i64, i64, i64) -> i64 = param_storage::nsl_param_store_bf16;
+            [optimizer] nsl_param_store_f32(i64) -> i64 = param_storage::nsl_param_store_f32;
+            [optimizer] nsl_param_store_converted() -> i64 = param_storage::nsl_param_store_converted;
             // Item 8, CSLA half: subset variant — same contract with an extra NslList
             // of i64 param indices (arg 5) selecting which parameters to step. The
             // CSLA layerwise window emits one call per layer group. Same lockstep
@@ -1355,6 +1367,6 @@ mod tests {
     fn table_is_the_recorded_size() {
         // The count is pinned so a row dropped by a bad merge is noticed; move
         // it with a row that is deliberately added or removed.
-        assert_eq!(RUNTIME_ABI.len(), 665);
+        assert_eq!(RUNTIME_ABI.len(), 670);
     }
 }

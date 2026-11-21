@@ -55,6 +55,15 @@ pub extern "C" fn nsl_model_save(
     param_names_ptr: i64,
     param_tensors_ptr: i64,
 ) {
+    // bf16 parameter storage (`param_dtype=`): a parameter stored bf16 is
+    // saved as its exact f32 master under its own name, so the file (and a
+    // train checkpoint's) is the one an f32 run with that master writes, and
+    // loads into the f32 model after the train block.
+    if let Some((view, temps)) = crate::param_storage::save_view(param_tensors_ptr) {
+        nsl_model_save(path_ptr, path_len, param_names_ptr, view);
+        crate::param_storage::release_save_view(view, temps);
+        return;
+    }
     let path = unsafe {
         let slice = std::slice::from_raw_parts(path_ptr as *const u8, path_len as usize);
         std::str::from_utf8_unchecked(slice)

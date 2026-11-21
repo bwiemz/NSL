@@ -1041,6 +1041,15 @@ pub static REGISTRY: &[EnvVar] = &[
         "Test harness only: marks the re-exec'd child that drives the ONNX block-packed-dtype refusal, so the parent can assert its exit code."
     ),
     var!(
+        "NSL_PARAM_DTYPE_TEST_MODES",
+        Bool,
+        "1 only (exact match)",
+        "off",
+        Test,
+        Compile,
+        "Test hook: admits param_dtype=\"bf16-master\"/\"bf16-master-tz\" (the f32 master kept whole) to check bf16 parameter plumbing."
+    ),
+    var!(
         "NSL_PARAM_PLAN_FAULT",
         Int,
         "integer parameter index (trimmed i64); unparsable = off",

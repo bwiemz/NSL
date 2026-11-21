@@ -578,6 +578,20 @@ fn fase_multi_impl(
             let m = NslTensor::from_ptr_ref(mp_);
             let v = NslTensor::from_ptr_ref(vp);
             let a = NslTensor::from_ptr_ref(ap);
+            // bf16 parameter storage (`param_dtype=`): a stored parameter's
+            // f32 master lives in `param_storage`, and it launches with the
+            // kernel of its storage. A bf16 parameter nothing stored is a
+            // compiler bug, refused rather than read as f32.
+            let stored = crate::param_storage::lookup(tp);
+            if th.dtype == BF16 && stored.is_none() {
+                crate::fatal::die(
+                    crate::fatal::Fatal::UnsupportedDtype,
+                    &format!(
+                        "fase_fused_step_multi: parameter {i} is bf16 but no param_dtype= storage owns it; the \
+                         fused AdamW step updates f32 parameters and the parameter store's bf16 ones only"
+                    ),
+                );
+            }
             // BF16 matmul cast cache: BOTH arms below (batched grid and
             // sequential fallback) write theta, so the staleness note happens
             // here, before the arm split. Tied-weight aliases note twice —
@@ -599,11 +613,13 @@ fn fase_multi_impl(
             }
             // theta, v and mp f32; m f32 or (first_moment_dtype="bf16") bf16.
             // m's dtype is part of the bucket key, so a launch never mixes.
+            // A stored bf16 theta takes its own bucket (`UpdateKey::store`).
             let uniform_gpu_f32 = th.device > 0
                 && [th, m, v, a].iter().all(|t| {
                     t.device == th.device && t.is_contiguous() && t.len == th.len
                 })
-                && [th, v, a].iter().all(|t| t.dtype == 1)
+                && [v, a].iter().all(|t| t.dtype == 1)
+                && (th.dtype == 1 || stored.is_some_and(|s| s.device == th.device))
                 && (m.dtype == 1 || m.dtype == BF16)
                 && th.len <= u32::MAX as i64;
             // Review A1: two param entries can alias ONE theta storage
@@ -621,6 +637,7 @@ fn fase_multi_impl(
                 batched_thetas.push(th.data as u64);
                 descs.push(UpdateDesc {
                     theta: th.data as u64,
+                    master: stored.map_or(0, |s| s.aux()),
                     m: m.data as u64,
                     v: v.data as u64,
                     mp: a.data as u64,
@@ -630,6 +647,7 @@ fn fase_multi_impl(
                         dtype: th.dtype,
                         m_dtype: m.dtype,
                         wd_bits: param_wd(i, tp).to_bits(),
+                        store: stored.map_or(0, |s| s.mode.bucket_code()),
                     },
                 });
                 continue;
@@ -643,10 +661,19 @@ fn fase_multi_impl(
         if mp_scale != 1.0 {
             crate::tensor::nsl_tensor_mul_scalar_inplace(ap, mp_scale);
         }
-        nsl_fase_fused_adamw_step(
-            tp, mp_, vp, ap, lr, beta1, one_minus_beta1, beta2, one_minus_beta2, eps,
-            param_wd(i, tp), bc1_inv, bc2_inv,
-        );
+        if crate::param_storage::lookup(tp).is_some() {
+            // A stored bf16 parameter: its exact f32 master stepped as f32,
+            // then split or imaged back (host parameters; a GPU one batches).
+            crate::param_storage::step_unbatched(
+                tp, mp_, vp, ap, lr, beta1, one_minus_beta1, beta2, one_minus_beta2, eps,
+                param_wd(i, tp), bc1_inv, bc2_inv,
+            );
+        } else {
+            nsl_fase_fused_adamw_step(
+                tp, mp_, vp, ap, lr, beta1, one_minus_beta1, beta2, one_minus_beta2, eps,
+                param_wd(i, tp), bc1_inv, bc2_inv,
+            );
+        }
         crate::tensor::nsl_tensor_zero_inplace(ap);
         FASE_MULTI_FALLBACK_PARAMS.fetch_add(1, Ordering::Relaxed);
     }
@@ -672,28 +699,62 @@ fn fase_multi_impl(
             let vs_p: Vec<u64> = members.iter().map(|d| d.v).collect();
             let mps_p: Vec<u64> = members.iter().map(|d| d.mp).collect();
             let lens: Vec<u32> = members.iter().map(|d| d.len).collect();
-            crate::cuda::gpu_fase_fused_adamw_step_multi(
-                &thetas,
-                &ms_p,
-                &vs_p,
-                &mps_p,
-                &lens,
-                beta1 as f32,
-                one_minus_beta1 as f32,
-                beta2 as f32,
-                one_minus_beta2 as f32,
-                eps as f32,
-                (-lr) as f32,
-                ((-lr) * bucket_wd) as f32,
-                bc1_inv as f32,
-                bc2_inv as f32,
-                // `bucket_wd`, not the flat `wd`: each bucket carries its own λ
-                // from the parameter groups, so testing the scalar would tell a
-                // decay-exempt bucket it still has weight decay.
-                bucket_wd != 0.0,
-                mp_scale as f32,
-                key.m_dtype == BF16,
-            );
+            if let Some(mode) = crate::param_storage::Mode::from_bucket_code(key.store) {
+                // bf16 parameter storage: the same update, op for op, over
+                // the exact f32 master the storage keeps (see `Theta`).
+                let masters: Vec<u64> = members.iter().map(|d| d.master).collect();
+                crate::cuda::param_store_gpu::gpu_fase_fused_adamw_step_multi_param(
+                    mode.theta(),
+                    key.m_dtype == BF16,
+                    &crate::cuda::param_store_gpu::ParamBucket {
+                        theta: &thetas,
+                        master: &masters,
+                        m: &ms_p,
+                        v: &vs_p,
+                        mp: &mps_p,
+                        ctr: &[],
+                        lens: &lens,
+                    },
+                    crate::cuda::param_store_gpu::AdamwScalars {
+                        b1: beta1 as f32,
+                        omb1: one_minus_beta1 as f32,
+                        b2: beta2 as f32,
+                        omb2: one_minus_beta2 as f32,
+                        eps: eps as f32,
+                        neg_lr: (-lr) as f32,
+                        neg_lr_wd: ((-lr) * bucket_wd) as f32,
+                        bc1: bc1_inv as f32,
+                        bc2: bc2_inv as f32,
+                        has_wd: bucket_wd != 0.0,
+                    },
+                    mp_scale as f32,
+                    0,
+                );
+                crate::param_storage::note_stepped(k as u64);
+            } else {
+                crate::cuda::gpu_fase_fused_adamw_step_multi(
+                    &thetas,
+                    &ms_p,
+                    &vs_p,
+                    &mps_p,
+                    &lens,
+                    beta1 as f32,
+                    one_minus_beta1 as f32,
+                    beta2 as f32,
+                    one_minus_beta2 as f32,
+                    eps as f32,
+                    (-lr) as f32,
+                    ((-lr) * bucket_wd) as f32,
+                    bc1_inv as f32,
+                    bc2_inv as f32,
+                    // `bucket_wd`, not the flat `wd`: each bucket carries its own λ
+                    // from the parameter groups, so testing the scalar would tell a
+                    // decay-exempt bucket it still has weight decay.
+                    bucket_wd != 0.0,
+                    mp_scale as f32,
+                    key.m_dtype == BF16,
+                );
+            }
             // Keep the fused-step counter's per-param semantics (gates read it).
             FASE_FUSED_STEP_COUNT.fetch_add(k as u64, Ordering::Relaxed);
             FASE_MULTI_BATCHED_PARAMS.fetch_add(k as u64, Ordering::Relaxed);
@@ -1039,6 +1100,9 @@ mod tests {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct UpdateDesc {
     pub theta: u64,
+    /// bf16 parameter storage: the f32 master's data or the split's low
+    /// halves (`param_storage::Stored::aux`); 0 for an f32 parameter.
+    pub master: u64,
     pub m: u64,
     pub v: u64,
     pub mp: u64,
@@ -1093,6 +1157,10 @@ pub(crate) struct UpdateKey {
     /// exact equality here, and it is copied from one source value rather
     /// than computed per parameter, so bitwise identity is the right test.
     pub wd_bits: u64,
+    /// bf16 parameter storage (`param_storage::Mode::bucket_code`): which
+    /// kernel steps the bucket; 0 for f32 parameters. Last, so the order of
+    /// the f32 buckets is what it was before the field.
+    pub store: u8,
 }
 
 /// Map CUDA blocks to (parameter, element offset) for a FLAT launch grid.
@@ -1182,6 +1250,7 @@ mod item8_tests {
     fn desc_wd(theta: u64, len: u32, device: u8, dtype: u16, wd: f64) -> UpdateDesc {
         UpdateDesc {
             theta,
+            master: 0,
             m: theta + 1,
             v: theta + 2,
             mp: theta + 3,
@@ -1191,6 +1260,7 @@ mod item8_tests {
                 dtype,
                 m_dtype: dtype,
                 wd_bits: wd.to_bits(),
+                store: 0,
             },
         }
     }

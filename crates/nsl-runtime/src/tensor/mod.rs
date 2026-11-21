@@ -1495,7 +1495,7 @@ pub extern "C" fn nsl_tensor_release(tensor_ptr: i64) {
 /// (optimizer-state offload, P0.2) to `cuMemFreeHost` via the pinned
 /// registry. Everything else takes the plain heap free. Pinned buffers
 /// are driver allocations — `std::alloc::dealloc` on one is UB.
-fn free_host_tensor_data(data: *mut c_void, size: usize) {
+pub(crate) fn free_host_tensor_data(data: *mut c_void, size: usize) {
     #[cfg(feature = "cuda")]
     if crate::cuda::inner::is_pinned(data) {
         crate::cuda::inner::free_pinned(data);

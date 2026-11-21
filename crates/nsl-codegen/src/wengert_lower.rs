@@ -1596,6 +1596,14 @@ fn lower_storage_op(
     let dt = builder.ins().iconst(cl_types::I64, storage.tag());
     let code = |builder: &mut FunctionBuilder, c: i64| builder.ins().iconst(cl_types::I64, c);
     match &op.op {
+        // A GEMM planned only because it reads a bf16-stored parameter
+        // (`param_dtype=`) keeps the eager bf16 mode's per-shape operands.
+        PrimalOp::Matmul if compiler.storage_param_gemm.contains(&op.result) => call(
+            compiler,
+            builder,
+            "nsl_tensor_matmul_pdt",
+            &[inputs[0], inputs[1]],
+        ),
         PrimalOp::Matmul => call(compiler, builder, "nsl_tensor_matmul_dt", &[inputs[0], inputs[1], dt]),
         PrimalOp::Add | PrimalOp::Sub | PrimalOp::Mul | PrimalOp::Div => {
             let c = match &op.op {
