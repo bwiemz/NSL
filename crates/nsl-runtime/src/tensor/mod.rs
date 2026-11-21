@@ -4032,10 +4032,10 @@ pub extern "C" fn nsl_tensor_maxpool2d(
             // Record tape op with argmax indices
             if autodiff::is_recording() {
                 NslTensor::from_ptr(input_ptr).refcount.fetch_add(1, Ordering::SeqCst);
-                let n = unsafe { *input.shape.add(0) } as i64;
-                let c = unsafe { *input.shape.add(1) } as i64;
-                let h = unsafe { *input.shape.add(2) } as i64;
-                let w = unsafe { *input.shape.add(3) } as i64;
+                let n = unsafe { *input.shape.add(0) };
+                let c = unsafe { *input.shape.add(1) };
+                let h = unsafe { *input.shape.add(2) };
+                let w = unsafe { *input.shape.add(3) };
                 let saved_argmax: Vec<usize> = argmax_vec.iter().map(|&x| x as usize).collect();
                 autodiff::maybe_record(autodiff::TapeOp::MaxPool2d {
                     a: input_ptr, out: result, saved_argmax,

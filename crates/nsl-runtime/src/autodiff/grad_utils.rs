@@ -86,8 +86,6 @@ pub(crate) fn create_tensor_with_shape_dtype(shape: &[i64], fill: f64, dtype: u1
 /// Like `create_tensor_with_shape_dtype` but allocates data in device memory when device > 0.
 /// Uses memcpy_htod for initialization since device memory is not CPU-accessible.
 pub(crate) fn create_tensor_with_shape_dtype_device(shape: &[i64], fill: f64, dtype: u16, device: u8) -> i64 {
-    use crate::memory::checked_alloc_zeroed;
-
     if device == 0 {
         return create_tensor_with_shape_dtype(shape, fill, dtype);
     }
@@ -136,7 +134,7 @@ pub(crate) fn create_tensor_with_shape_dtype_device(shape: &[i64], fill: f64, dt
         #[cfg(not(feature = "cuda"))]
         {
             if fill == 0.0 {
-                checked_alloc_zeroed(data_size) as *mut c_void
+                crate::memory::checked_alloc_zeroed(data_size) as *mut c_void
             } else if dtype == 1 {
                 let data = crate::memory::checked_alloc(data_size) as *mut f32;
                 for i in 0..total as usize {

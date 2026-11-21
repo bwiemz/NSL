@@ -117,7 +117,7 @@ pub(crate) fn launch_x_prepass(
     ];
     super::inner::kernel_launch(
         csha_tier_b1_prepass_x_ptx().as_ptr(),
-        b"csha_tier_b1_prepass_x\0".as_ptr(),
+        c"csha_tier_b1_prepass_x".as_ptr().cast(),
         [seq as i64, 1, 1],
         [PREPASS_BLOCK as i64, 1, 1],
         &args,
@@ -165,7 +165,7 @@ pub(crate) fn launch_w_prepass(
     ];
     super::inner::kernel_launch(
         csha_tier_b1_prepass_w_ptx().as_ptr(),
-        b"csha_tier_b1_prepass_w\0".as_ptr(),
+        c"csha_tier_b1_prepass_w".as_ptr().cast(),
         [grid_x, 1, 1],
         [block, 1, 1],
         &args,
