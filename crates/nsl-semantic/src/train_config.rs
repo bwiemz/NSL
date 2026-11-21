@@ -89,10 +89,14 @@ impl Precision {
 /// outside a test build environment). `"bf16-sr"` (no master, stochastic
 /// rounding) is reserved for a later step and refused.
 ///
-/// Inside the train block the stored matrices are bf16 tensors: `model_save`
-/// writes their exact f32 masters, but a callback that runs the model or
-/// reads a stored weight eagerly fails (an f32-only op refuses a bf16
-/// operand). After the block they are f32 again.
+/// Inside the train block the stored matrices are bf16 tensors, and after
+/// it they are f32 again. Inside it: `model_save` and checkpoints write the
+/// exact f32 masters, and `--monitor`'s weight norms read them; a callback
+/// that reads the model is a compile error, and a host read of a stored
+/// matrix through an alias the compiler cannot see stops the run when the
+/// matrix is downloaded. Tied weights (one tensor at two parameter names)
+/// cannot be stored: the run stops at its first step and says to untie them
+/// or drop `param_dtype=`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParamDtype {
     F32,

@@ -294,9 +294,10 @@ pub extern "C" fn nsl_param_store_bf16(param_list: i64, idx_list: i64, mode: i64
             let other = unsafe { *params.data.add(j) };
             if j != idx as usize && (other == tp || NslTensor::from_ptr_ref(other).data == t.data) {
                 die(&format!(
-                    "param_dtype=\"{}\": parameters {idx} and {j} share one storage (tied weights); the \
-                     optimizer steps each list entry once, so a tied matrix cannot be stored bf16. Untie it \
-                     or train with f32 parameters",
+                    "param_dtype=\"{}\": parameters {idx} and {j} of the model share one storage (tied \
+                     weights, such as an output projection tied to the embedding). A stored matrix is stepped \
+                     once per parameter-list entry, so a tied one cannot be stored bf16. Give each its own \
+                     tensor (untie them), or drop param_dtype= to train with f32 parameters",
                     mode.name()
                 ));
             }
@@ -821,6 +822,107 @@ mod tests {
     /// buckets, the clip fold at 1.0 and 0.37, m f32 and bf16. Then the
     /// conversion kernels over every low half of a set of high halves (ties,
     /// carries into the exponent, ±∞, NaN) against the host split.
+    /// `--monitor`'s weight norm (`nsl_tensor_l2_norm`) of a stored parameter
+    /// is the norm of its exact f32 master, in every mode. It used to read
+    /// the bf16 tensor as f64: four times its allocation, and a NaN norm.
+    #[test]
+    fn the_weight_norm_of_a_stored_parameter_is_its_masters() {
+        for code in [wire::MASTER, wire::MASTER_TZ, wire::SPLIT] {
+            let vals = values();
+            let p = host_f32(&vals, &[6, 8]);
+            let want = crate::tensor::nsl_tensor_l2_norm(p);
+            let list = nsl_list_new();
+            nsl_list_push(list, p);
+            let idx = nsl_list_new();
+            nsl_list_push(idx, 0);
+            assert_eq!(nsl_param_store_bf16(list, idx, code), 1);
+            assert_eq!(NslTensor::from_ptr_ref(p).dtype, DTYPE_BF16);
+            assert_eq!(
+                crate::tensor::nsl_tensor_l2_norm(p).to_bits(),
+                want.to_bits(),
+                "storage {code}: the norm of the master"
+            );
+            assert_eq!(nsl_param_store_f32(list), 1);
+            crate::tensor::nsl_tensor_free(p);
+        }
+    }
+
+    /// The weight norm reads each dtype at its own width: two-byte floats
+    /// through their bits, integers as their values (it used to read every
+    /// non-f32 buffer as f64).
+    #[test]
+    fn the_weight_norm_reads_each_dtype_at_its_width() {
+        use crate::tensor::{DTYPE_FP16, DTYPE_I32};
+        let vals = [3.0, -4.0, 0.5, 12.0];
+        let want = (3.0f64 * 3.0 + 16.0 + 0.25 + 144.0).sqrt();
+        for dtype in [0u16, DTYPE_F32, DTYPE_BF16, DTYPE_FP16] {
+            let p = crate::cpu::create_tensor_with_shape_rs_dtype(&[4], dtype);
+            let t = NslTensor::from_ptr(p);
+            for (i, &v) in vals.iter().enumerate() {
+                t.write_scalar_from_f64(i, v);
+            }
+            assert_eq!(crate::tensor::nsl_tensor_l2_norm(p), want, "dtype {dtype}");
+            crate::tensor::nsl_tensor_free(p);
+        }
+        let p = crate::cpu::create_tensor_with_shape_rs_dtype(&[3], DTYPE_I32);
+        let t = NslTensor::from_ptr(p);
+        for (i, v) in [2.0, -3.0, 6.0].into_iter().enumerate() {
+            t.write_scalar_from_f64(i, v);
+        }
+        assert_eq!(crate::tensor::nsl_tensor_l2_norm(p), 7.0);
+        crate::tensor::nsl_tensor_free(p);
+    }
+
+    /// The tied-weights refusal, in a child process (it exits the process):
+    /// one tensor at two parameter-list entries cannot be stored bf16, and
+    /// the message says what to do.
+    #[test]
+    fn a_tied_parameter_is_refused_with_what_to_do() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let out = std::process::Command::new(exe)
+            .args([
+                "param_storage::tests::zz_tied_parameter_child",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+                "--include-ignored",
+            ])
+            .env("NSL_PARAM_STORAGE_TIED_CHILD", "1")
+            .env("RUST_BACKTRACE", "0")
+            .output()
+            .expect("re-exec the lib test binary");
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(crate::fatal::NSL_EXIT_UNSUPPORTED),
+            "the refusal exits `unsupported`:\n{all}"
+        );
+        for needle in ["share one storage (tied", "untie them", "drop param_dtype="] {
+            assert!(all.contains(needle), "missing {needle:?}:\n{all}");
+        }
+        assert!(!all.contains("CHILD-STORED-A-TIED-PARAMETER"), "{all}");
+    }
+
+    #[test]
+    #[ignore = "child process — driven by a_tied_parameter_is_refused_with_what_to_do"]
+    fn zz_tied_parameter_child() {
+        if std::env::var("NSL_PARAM_STORAGE_TIED_CHILD").is_err() {
+            return;
+        }
+        let p = host_f32(&values(), &[6, 8]);
+        let list = nsl_list_new();
+        nsl_list_push(list, p);
+        nsl_list_push(list, p);
+        let idx = nsl_list_new();
+        nsl_list_push(idx, 1);
+        nsl_param_store_bf16(list, idx, wire::SPLIT);
+        println!("CHILD-STORED-A-TIED-PARAMETER");
+    }
+
     #[test]
     #[cfg(feature = "cuda")]
     #[ignore = "requires CUDA GPU"]

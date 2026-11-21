@@ -1290,7 +1290,22 @@ pub extern "C" fn nsl_tensor_item(tensor_ptr: i64) -> f64 {
                     );
                     return val as f64;
                 }
-                _ => {
+                // Two-byte floats: read their own width (this arm used to
+                // fall to the f64 one and read 8 bytes from a 2-byte buffer).
+                DTYPE_BF16 | DTYPE_FP16 => {
+                    let mut bits: u16 = 0;
+                    crate::cuda::inner::memcpy_dtoh(
+                        &mut bits as *mut u16 as *mut std::ffi::c_void,
+                        tensor.data,
+                        std::mem::size_of::<u16>(),
+                    );
+                    return if tensor.dtype == DTYPE_BF16 {
+                        bf16_bits_to_f32(bits) as f64
+                    } else {
+                        f16_bits_to_f32(bits) as f64
+                    };
+                }
+                0 => {
                     let mut val: f64 = 0.0;
                     crate::cuda::inner::memcpy_dtoh(
                         &mut val as *mut f64 as *mut std::ffi::c_void,
@@ -1299,6 +1314,7 @@ pub extern "C" fn nsl_tensor_item(tensor_ptr: i64) -> f64 {
                     );
                     return val;
                 }
+                other => crate::fatal::unsupported_dtype(".item() on a device tensor", other),
             }
         }
         #[cfg(not(feature = "cuda"))]
@@ -4303,6 +4319,21 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
         }
     }
 
+    // A bf16-stored parameter (`param_dtype=`) is only the GEMMs' image of
+    // its f32 master, valid inside the train step. Downloading it is a host
+    // read of that image (a callback printing or reducing a weight through
+    // an alias the compiler cannot see), which would show bf16 values or,
+    // in a reader that treats a non-f32 buffer as f64, garbage. Refuse.
+    #[cfg(feature = "cuda")]
+    if t.device > 0 && target == 0 && crate::param_storage::is_stored_data(t.data as u64) {
+        crate::fatal::die(
+            crate::fatal::Fatal::UnsupportedDtype,
+            "nsl_tensor_to_device: this tensor is a weight matrix stored bf16 by param_dtype= inside its \
+             train block (the f32 value lives in optimizer state until the block ends). Read it after the \
+             train block, or drop param_dtype=",
+        );
+    }
+
     // Materialize views before cross-device copies. Copying a non-contiguous
     // tensor's raw backing storage as if it were row-major corrupts transfers
     // for broadcast/transpose/reshape views produced heavily in source-AD.
@@ -6656,6 +6687,15 @@ fn tensor_l2_norm(t: &NslTensor) -> f64 {
     if t.len == 0 || t.data.is_null() { return 0.0; }
     let len = t.len as usize;
 
+    // A bf16-stored parameter (`param_dtype=`, read by `--monitor`'s weight
+    // norms inside the step): its value is the exact f32 master, not the
+    // bf16 image the GEMMs read.
+    if let Some(f) = crate::param_storage::exact_f32(t as *const NslTensor as i64) {
+        let norm = tensor_l2_norm(NslTensor::from_ptr_ref(f));
+        nsl_tensor_free(f);
+        return norm;
+    }
+
     // Must read from correct device
     if t.device > 0 {
         // GPU tensor — copy to CPU for inspection
@@ -6675,10 +6715,20 @@ fn tensor_l2_norm(t: &NslTensor) -> f64 {
                 sum_sq += v * v;
             }
         }
-        _ => { // f64
+        0 => { // f64
             let data = t.data as *const f64;
             for i in 0..len {
                 let v = unsafe { *data.add(i) };
+                sum_sq += v * v;
+            }
+        }
+        // Every other dtype through the element reader, which knows each
+        // width (f16, bf16, i32, u16 tokens) and refuses the rest. This arm
+        // used to read any non-f32 buffer as f64: a bf16 tensor was read
+        // over 4x its allocation and its norm came back as garbage (NaN).
+        _ => {
+            for i in 0..len {
+                let v = t.read_scalar_as_f64(i);
                 sum_sq += v * v;
             }
         }

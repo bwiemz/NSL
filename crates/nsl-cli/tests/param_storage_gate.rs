@@ -650,3 +650,107 @@ fn param_dtype_is_refused_where_the_matrices_would_be_inert_or_misread() {
         );
     }
 }
+
+/// The health JSON `--monitor` writes in the run's directory.
+fn health_json(dir: &Path) -> String {
+    let p = std::fs::read_dir(dir)
+        .expect("run dir")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.to_string_lossy().ends_with(".nsl-health.json"))
+        .unwrap_or_else(|| panic!("no .nsl-health.json in {}", dir.display()));
+    std::fs::read_to_string(p).expect("read health json")
+}
+
+/// A top-level number of the health JSON (`null` when the run recorded a
+/// non-finite value).
+fn json_number(json: &str, key: &str) -> Option<f64> {
+    let rest = json.split_once(&format!("\"{key}\":"))?.1.trim_start();
+    let end = rest.find([',', '}']).unwrap_or(rest.len());
+    rest[..end].trim().parse().ok()
+}
+
+/// `--monitor` reads each stored matrix's weight norm from its exact f32
+/// master, so master mode records the norms of f32 parameters exactly and
+/// the split records finite ones. Before, the norm read the bf16 tensor's
+/// host copy as f64 (4x past its allocation) and the total was `null`.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn the_monitor_reads_stored_weights_through_their_masters_gpu() {
+    let run = |header: &str, tag: &str, env: &[(&str, &str)]| {
+        let dir = tmp(tag);
+        let mut args = vec!["run", "--deterministic", "--seed", "7", "--monitor"];
+        args.extend_from_slice(PROD);
+        let mut envs: Vec<(&str, &str)> = DET_ENV.to_vec();
+        envs.extend_from_slice(env);
+        // 104 micro-batches: the monitor snapshots at micro-step 0 and 100.
+        let r = nsl(&args, &fixture(header, 104, true, ""), &dir, tag, &envs);
+        assert!(r.ok, "{tag} failed:\n{}", r.out);
+        (r, health_json(&dir))
+    };
+    let (_, f32) = run("", "mon_f32", &[]);
+    let (master_run, master) = run(MASTER, "mon_master", &[TEST_MODES]);
+    let (split_run, split) = run(SPLIT, "mon_split", &[]);
+    for r in [&master_run, &split_run] {
+        assert!(
+            r.out.contains("[param-storage] 14 parameters stored"),
+            "{}",
+            r.out
+        );
+    }
+    let total = |j: &str| json_number(j, "weight_norm_total");
+    let want = total(&f32).expect("the f32 run records a weight norm");
+    assert!(want > 0.0, "{f32}");
+    assert_eq!(json_number(&f32, "step"), Some(100.0), "{f32}");
+    assert_eq!(
+        total(&master),
+        Some(want),
+        "master mode's norms are f32 parameters':\n{master}"
+    );
+    // The per-tensor map, by name (the JSON's key order is a hash order).
+    let pct = |j: &str| -> std::collections::BTreeMap<String, String> {
+        let body = j
+            .split_once("\"per_tensor_weight_pct_delta\":")
+            .and_then(|(_, r)| r.split_once('}'))
+            .map(|(v, _)| v.trim_start().trim_start_matches('{').to_string())
+            .expect("per-tensor deltas");
+        body.split(',')
+            .filter_map(|kv| kv.split_once(':'))
+            .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+            .collect()
+    };
+    let (pm, pf) = (pct(&master), pct(&f32));
+    assert_eq!(pf.len(), 18, "{f32}");
+    assert_eq!(pm, pf);
+    let s = total(&split).expect("the split's weight norm is finite");
+    assert!((s - want).abs() <= 1e-2 * want, "split {s} vs f32 {want}");
+}
+
+/// A host read of a stored matrix through an alias the compiler cannot see
+/// (`let wg = m.b1.w_gate` before the block) stops the run when the matrix
+/// is downloaded, instead of printing `?` for every element.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn a_host_read_of_a_stored_weight_through_an_alias_stops_the_run_gpu() {
+    let src = fixture(SPLIT, 8, true, "")
+        .replace(
+            "print(\"LOSS_STREAM_BEGIN\")",
+            "let wg = m.b1.w_gate\nprint(\"LOSS_STREAM_BEGIN\")",
+        )
+        .replace("            print(loss)", "            print(wg)");
+    assert!(src.contains("print(wg)") && src.contains("let wg = m.b1.w_gate"));
+    let mut args = vec!["run", "--seed", "7"];
+    args.extend_from_slice(PROD);
+    let r = nsl(&args, &src, &tmp("alias_read"), "alias_read", &[]);
+    assert!(!r.ok, "the alias read ran:\n{}", r.out);
+    assert!(
+        r.out
+            .contains("stored bf16 by param_dtype= inside its train block"),
+        "{}",
+        r.out
+    );
+    assert!(
+        !r.out.contains("?, ?"),
+        "a stored matrix was printed:\n{}",
+        r.out
+    );
+}

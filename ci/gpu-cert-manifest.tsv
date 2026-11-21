@@ -130,6 +130,8 @@ crates/nsl-cli/tests/param_plan_gate.rs	two_train_blocks_in_one_process_each_ver
 crates/nsl-cli/tests/param_storage_gate.rs	bf16_master_trains_byte_identically_to_f32_parameters_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/param_storage_gate.rs	bf16_split_trains_byte_identically_to_the_tz_master_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/param_storage_gate.rs	bf16_split_resumes_like_an_uninterrupted_run_gpu	gpu	requires CUDA GPU
+crates/nsl-cli/tests/param_storage_gate.rs	the_monitor_reads_stored_weights_through_their_masters_gpu	gpu	requires CUDA GPU
+crates/nsl-cli/tests/param_storage_gate.rs	a_host_read_of_a_stored_weight_through_an_alias_stops_the_run_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/posture_certificate_gpu.rs	posture_certificate_canonical_exact_attention	gpu	requires CUDA GPU
 crates/nsl-cli/tests/posture_certificate_gpu.rs	posture_certificate_chain_exact_attention	gpu	requires CUDA GPU
 crates/nsl-cli/tests/posture_certificate_gpu.rs	posture_certificate_canonical	gpu	requires CUDA GPU
@@ -432,6 +434,7 @@ crates/nsl-runtime/src/muon_batch.rs	batch_matches_sequential_and_is_determinist
 crates/nsl-runtime/src/muon_batch.rs	batch_nesterov_runs_and_is_deterministic	gpu	requires CUDA GPU
 crates/nsl-runtime/src/muon_batch.rs	workspace_grow_realloc_same_oriented_key	gpu	requires CUDA GPU
 crates/nsl-runtime/src/muon_batch.rs	profile_batch_ns_500m_step	diagnostic	requires CUDA GPU (timing driver, not a correctness gate)
+crates/nsl-runtime/src/param_storage.rs	zz_tied_parameter_child	helper	child process — driven by a_tied_parameter_is_refused_with_what_to_do
 crates/nsl-runtime/src/param_storage.rs	the_gpu_bf16_parameter_launches_are_the_f32_launch_of_the_exact_master	gpu	requires CUDA GPU
 crates/nsl-runtime/src/tensor/activation.rs	swiglu_gate_backward_gpu_f32_bit_exact_vs_pair	gpu	requires CUDA GPU
 crates/nsl-runtime/src/tensor/activation.rs	tanh_gpu_f32_saturates_and_keeps_nan	gpu	requires CUDA GPU

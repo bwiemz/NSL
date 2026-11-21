@@ -420,8 +420,29 @@ pub extern "C" fn nsl_tensor_matmul_pdt(a: i64, b: i64) -> i64 {
     }
     let _ = (ta, tb);
     PDT_F32.fetch_add(1, Ordering::Relaxed);
-    let fa = crate::param_storage::exact_f32(a).unwrap_or_else(|| widened(a));
-    let fb = crate::param_storage::exact_f32(b).unwrap_or_else(|| widened(b));
+    // A bf16 operand here is a stored parameter or a view of it, and its
+    // exact f32 value is found by the data pointer it starts at. The plan
+    // selects a parameter only when every reader reaches a GEMM through
+    // transposes, reshapes and expands (`storage_plan::select_bf16_params`),
+    // none of which moves that pointer, so an offset slice cannot get here.
+    // Should one ever (a runtime copy inside a reshape, a future view op),
+    // widening its bf16 image would silently drop the master's low bits:
+    // refuse instead.
+    let exact = |x: i64, t: &NslTensor| {
+        crate::param_storage::exact_f32(x).unwrap_or_else(|| {
+            if t.dtype == DTYPE_BF16 {
+                crate::fatal::die(
+                    crate::fatal::Fatal::UnsupportedDtype,
+                    "nsl_tensor_matmul_pdt: a bf16 operand of a parameter GEMM is not a stored parameter or a \
+                     view at its start, so its exact f32 value cannot be found (param_dtype= planned this GEMM \
+                     on a stored weight matrix)",
+                );
+            }
+            widened(x)
+        })
+    };
+    let fa = exact(a, ta);
+    let fb = exact(b, tb);
     let r = crate::tensor::arithmetic::nsl_tensor_matmul(fa, fb, 0);
     crate::tensor::nsl_tensor_free(fa);
     crate::tensor::nsl_tensor_free(fb);
