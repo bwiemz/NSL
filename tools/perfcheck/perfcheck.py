@@ -284,6 +284,18 @@ def param_banner(train_args: str) -> str | None:
     return None if m is None else PARAM_BANNER + m.group(1)
 
 
+def params_converted(err: str, mode: str) -> int:
+    """How many parameters the run converted to `mode` storage, from the runtime's
+    `[param-storage] N parameters stored <mode>` line (0 when there is none). The
+    banner alone is printed by `main` from the declaration, before any parameter is
+    stored, so an arm that declared the storage and converted nothing would pass on
+    the banner."""
+    m = re.search(
+        r"\[param-storage\] (\d+) parameters stored " + re.escape(mode) + r"(?![a-z0-9-])", err
+    )
+    return 0 if m is None else int(m.group(1))
+
+
 def arm(name: str) -> Arm:
     """An arm by name. `<nsl arm>@<variant>` is the same arm built by the toolchain
     registered as `--toolchain <variant>=DIR`, so two compilers can be timed in the
@@ -734,6 +746,14 @@ def run_nsl_arm(
     elif (want := param_banner(a.train_args)) is not None and want not in err:
         row["status"] = "error"
         row["error"] = f"param_dtype arm: the runtime did not print `{want}`"
+    elif (want := param_banner(a.train_args)) is not None and params_converted(
+        err, want[len(PARAM_BANNER) :]
+    ) == 0:
+        row["status"] = "error"
+        row["error"] = (
+            "param_dtype arm: no parameter was stored (no `[param-storage] N parameters "
+            "stored` line): the banner says what main declared, not what the step did"
+        )
     elif param_banner(a.train_args) is None and PARAM_BANNER in err:
         row["status"] = "error"
         row["error"] = "an f32-parameter arm printed the parameter-storage banner"
