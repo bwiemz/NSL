@@ -3697,6 +3697,10 @@ fn lower_single_op(
         // `nsl_sdpa_fused_forward` precedent). This op's result is the MASK
         // (the SSA value the adjoint multiplies by); the output is cached
         // for the paired apply op, keyed by the mask's Cranelift Value.
+        // Under NSL_DROPOUT_REGEN (the default) the call is
+        // `nsl_tensor_dropout_fwd_key` and the result is the 32-byte key the
+        // backward redraws the mask from (on a device; on the CPU it is the
+        // mask): same output, same counter claim.
         PrimalOp::DropoutMask { p } => {
             if !(*p > 0.0 && *p < 1.0) {
                 return Err(CodegenError::new(format!(
@@ -3706,12 +3710,12 @@ fn lower_single_op(
                 )));
             }
             let pv = builder.ins().f64const(*p);
-            let list = call(
-                compiler,
-                builder,
-                "nsl_tensor_dropout_fwd_mask",
-                &[inputs[0], pv],
-            )?;
+            let launch = if crate::source_ad::dropout_regen_enabled() {
+                "nsl_tensor_dropout_fwd_key"
+            } else {
+                "nsl_tensor_dropout_fwd_mask"
+            };
+            let list = call(compiler, builder, launch, &[inputs[0], pv])?;
             let idx0 = builder.ins().iconst(cl_types::I64, 0);
             let out = call(compiler, builder, "nsl_list_get", &[list, idx0])?;
             let idx1 = builder.ins().iconst(cl_types::I64, 1);
@@ -3726,16 +3730,35 @@ fn lower_single_op(
         // the launch, so this arm emits no call. The pop (vs. read) keeps
         // the Value-keyed cache empty across functions — same hygiene as
         // fused_ce_fwd_lse.
-        PrimalOp::Dropout { p: _ } => {
+        //
+        // A miss under NSL_DROPOUT_REGEN is a CCR recompute clone in the
+        // backward (`ccr::plan` lets the Block policy replay a dropout): the
+        // launch ran in the forward and its output was freed, so the output
+        // is drawn again from the input and the key
+        // (`nsl_tensor_dropout_apply`), bit for bit.
+        PrimalOp::Dropout { p } => {
             let mask_val = inputs[1];
-            compiler.dropout_fwd_out.remove(&mask_val).ok_or_else(|| {
-                CodegenError::new(
-                    "PrimalOp::Dropout: no cached forward output for this \
-                     mask — the paired DropoutMask launch must lower before \
-                     the apply op in the same function (a pass that separates \
-                     or reorders the pair breaks this invariant)",
-                )
-            })
+            if let Some(out) = compiler.dropout_fwd_out.remove(&mask_val) {
+                return Ok(out);
+            }
+            // Only a clone (adjoint-space id) may replay: a forward apply
+            // whose launch output is missing is still the broken-pair bug.
+            let clone = crate::wengert::id_space(op.id) == crate::wengert::IdSpace::Adjoint;
+            if clone && crate::source_ad::dropout_regen_enabled() {
+                let pv = builder.ins().f64const(*p);
+                return call(
+                    compiler,
+                    builder,
+                    "nsl_tensor_dropout_apply",
+                    &[inputs[0], mask_val, pv],
+                );
+            }
+            Err(CodegenError::new(
+                "PrimalOp::Dropout: no cached forward output for this \
+                 mask — the paired DropoutMask launch must lower before \
+                 the apply op in the same function (a pass that separates \
+                 or reorders the pair breaks this invariant)",
+            ))
         }
 
         // === Control flow (2 ops) ===
@@ -4014,6 +4037,20 @@ fn lower_single_op(
                     let d = parse_baked_dim(name, crate::source_ad::UNSQUEEZE_AT_PREFIX)?;
                     let dim = resolve_baked_dim(compiler, builder, d, inputs[1])?;
                     call(compiler, builder, "nsl_tensor_unsqueeze", &[inputs[0], dim])
+                }
+                // The dropout backward that redraws its mask from the key the
+                // forward kept: inputs [grad, key], `p` baked into the name.
+                _ if name.starts_with(crate::source_ad::DROPOUT_BACKWARD_PREFIX) => {
+                    let p = crate::source_ad::dropout_backward_p(name).ok_or_else(|| {
+                        CodegenError::new(format!("malformed passthrough `{name}`: no f64 bits"))
+                    })?;
+                    let pv = builder.ins().f64const(p);
+                    call(
+                        compiler,
+                        builder,
+                        "nsl_tensor_dropout_bwd",
+                        &[inputs[0], inputs[1], pv],
+                    )
                 }
                 _ if name.starts_with(crate::source_ad::GATHER_BACKWARD_PREFIX) => {
                     // inputs = [grad, input, indices]; the FFI resolves a negative dim

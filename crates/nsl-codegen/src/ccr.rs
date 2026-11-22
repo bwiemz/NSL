@@ -901,9 +901,32 @@ fn plan_impl(
                 continue;
             }
             match &op.op {
-                PrimalOp::Dropout { .. }
-                | PrimalOp::DropoutMask { .. }
-                | PrimalOp::PrologueRecompute { .. } => continue,
+                // The dropout OUTPUT. With the mask redrawn from a key (the
+                // default), the draw is never replayed but the output can be:
+                // `nsl_tensor_dropout_apply(x, key)` recomputes it bit for bit
+                // (the key is force-saved, below). And the backward of the
+                // production blocks does not read its data at all: the
+                // dropout's own adjoint reads the key, the residual add reads
+                // the output for its shape only.
+                //   * Selective: a KEPT save, like a kept matrix product,
+                //     released at the segment's end (with a shape stub) unless
+                //     an adjoint op reads its value. Replaying it instead would
+                //     keep its input (itself a kept product) for the same bytes
+                //     and add a kernel.
+                //   * Block: an ordinary recompute victim. Its input is
+                //     recomputed anyway, so replaying it costs one elementwise
+                //     kernel and saves the output.
+                // Under NSL_DROPOUT_REGEN=0 it stays force-saved, as before.
+                PrimalOp::Dropout { .. } => {
+                    if !crate::source_ad::dropout_regen_enabled() {
+                        continue;
+                    }
+                    if policy == CcrPolicy::Selective {
+                        seg_kept.push(op.result);
+                        continue;
+                    }
+                }
+                PrimalOp::DropoutMask { .. } | PrimalOp::PrologueRecompute { .. } => continue,
                 PrimalOp::FreeTensor => continue,
                 _ => {}
             }
@@ -3128,23 +3151,6 @@ mod tests {
     }
 
     #[test]
-    fn dropout_is_force_saved() {
-        let mut primal = toy_primal();
-        // Same interior placement discipline as dropout_mask_is_force_saved:
-        // v3 = Matmul(x, w0); v9 = Dropout(v3, mask); v4 = Add(v9, x).
-        // (inputs[1] is the mask slot per the two-op split; for a plan-only
-        // test any earlier var works — plan() never applies AD rules.)
-        primal.ops.insert(4, op(9, 9, PrimalOp::Dropout { p: 0.1 }, vec![3, 0]));
-        primal.ops[5] = op(4, 4, PrimalOp::Add, vec![9, 0]);
-        let plan = plan(&primal, None, CcrPolicy::Block, false, 1).unwrap();
-        assert!(
-            plan.recompute.contains(&3),
-            "control: the matmul interior must be recomputable"
-        );
-        assert!(!plan.recompute.contains(&9), "dropout must not be replayed");
-    }
-
-    #[test]
     fn dropout_mask_is_force_saved() {
         let mut primal = toy_primal();
         // The mask launch (result = the RNG mask) must never enter the
@@ -3171,6 +3177,234 @@ mod tests {
         assert!(
             !plan.recompute.contains(&9),
             "the dropout RNG mask must not be replayed"
+        );
+    }
+
+    /// With the mask redrawn from a key (the default), a dropout's DRAW is
+    /// never replayed but its output may be: under the Block policy the apply
+    /// is an ordinary recompute victim (`nsl_tensor_dropout_apply` redraws it
+    /// from the saved key), next to the matrix product it reads.
+    /// `NSL_DROPOUT_REGEN=0` force-saves it (`dropout_kir_equivalence` and the
+    /// CLI gates cover that build).
+    #[test]
+    fn a_dropout_apply_is_replayable_under_the_block_policy() {
+        assert!(
+            crate::source_ad::dropout_regen_enabled(),
+            "this test assumes the default"
+        );
+        let mut primal = toy_primal();
+        // v3 = Matmul(x, w0); v9 = Dropout(v3, key); v4 = Add(v9, x). (Any
+        // earlier var stands in for the key: plan() applies no AD rules.)
+        primal
+            .ops
+            .insert(4, op(9, 9, PrimalOp::Dropout { p: 0.1 }, vec![3, 0]));
+        primal.ops[5] = op(4, 4, PrimalOp::Add, vec![9, 0]);
+        let block = plan(&primal, None, CcrPolicy::Block, false, 1).unwrap();
+        assert!(
+            block.recompute.contains(&3),
+            "control: the matmul interior must be recomputable"
+        );
+        assert!(
+            block.recompute.contains(&9),
+            "the apply is replayed from its key under Block"
+        );
+        let selective = plan(&primal, None, CcrPolicy::Selective, false, 1);
+        // Selective recomputes nothing in this toy (two products, two adds):
+        // it declines, and no dropout output is ever a selective victim.
+        assert!(selective.is_none_or(|p| !p.recompute.contains(&9)));
+    }
+
+    /// The 500M block's dropout tail, after an interior the selective policy
+    /// recomputes: `v3 = Matmul(x, w0); v9 = Relu(v3); v11 = DropoutMask(v9);
+    /// v12 = Dropout(v9, v11); v4 = Add(v12, x)`. The key is force-saved under
+    /// either policy; the output is a kept save under Selective and a
+    /// recompute victim under Block; the backward reads it only for its shape
+    /// (the residual add) and the key only in the dropout backward, so under
+    /// both it is freed at its block's end with a stub and never recomputed.
+    fn toy_primal_with_dropout() -> WengertList {
+        let mut primal = toy_primal_with_relu();
+        primal
+            .ops
+            .insert(5, op(11, 11, PrimalOp::DropoutMask { p: 0.1 }, vec![9]));
+        primal
+            .ops
+            .insert(6, op(12, 12, PrimalOp::Dropout { p: 0.1 }, vec![9, 11]));
+        primal.ops[7] = op(4, 4, PrimalOp::Add, vec![12, 0]);
+        primal
+    }
+
+    /// The adjoint as the compiler emits it for that block: the residual
+    /// gradient reduced onto the output (shape only), then the dropout
+    /// backward reading the key.
+    fn dropout_tail_adjoint() -> WengertList {
+        let bwd = crate::source_ad::dropout_backward_name(0.1);
+        adjoint_of(vec![
+            reduce(0, 100, 50, 12),
+            adj_op(1, 101, PrimalOp::Passthrough(bwd), vec![100, 11]),
+        ])
+    }
+
+    fn the_dropout_backward(adjoint: &WengertList) -> &WengertOp {
+        adjoint
+            .ops
+            .iter()
+            .find(|o| {
+                matches!(&o.op, PrimalOp::Passthrough(n)
+                    if n.starts_with(crate::source_ad::DROPOUT_BACKWARD_PREFIX))
+            })
+            .expect("the dropout backward")
+    }
+
+    #[test]
+    fn a_dropout_output_read_for_shape_is_freed_and_its_key_stays() {
+        assert!(
+            crate::source_ad::dropout_regen_enabled(),
+            "this test assumes the default"
+        );
+        let primal = toy_primal_with_dropout();
+        for policy in [CcrPolicy::Block, CcrPolicy::Selective] {
+            let mut plan = plan(&primal, None, policy, false, 1).unwrap();
+            assert!(
+                !plan.recompute.contains(&11),
+                "{policy:?}: the draw is never replayed"
+            );
+            assert!(
+                !plan.per_segment_kept[0].contains(&11),
+                "{policy:?}: the key is force-saved, never released"
+            );
+            match policy {
+                CcrPolicy::Selective => assert!(plan.per_segment_kept[0].contains(&12)),
+                CcrPolicy::Block => assert!(plan.per_segment_recompute[0].contains(&12)),
+            }
+            let mut adjoint = dropout_tail_adjoint();
+            let mut fresh = 200;
+            let summary =
+                apply_to_adjoint(&primal, &mut adjoint, &mut plan, &mut fresh, true).unwrap();
+            // Freed at the segment's end: released (Selective) or an
+            // unrecomputed shape-only victim (Block); either way a stub.
+            let freed = build_segment_free_lists(&plan)[0]
+                .ops
+                .iter()
+                .filter(|o| matches!(o.op, PrimalOp::FreeTensor))
+                .map(|o| o.inputs[0])
+                .collect::<Vec<_>>();
+            assert!(
+                freed.contains(&12) && !freed.contains(&11),
+                "{policy:?}: {freed:?}"
+            );
+            assert!(
+                !plan.recompute_clones.values().any(|v| *v == 12),
+                "{policy:?}: a shape-only read must not recompute the output: {summary:?}"
+            );
+            let stub = plan
+                .shape_stubs
+                .iter()
+                .find(|(o, _)| *o == 12)
+                .expect("a stub for the output")
+                .1;
+            assert_eq!(
+                adjoint.ops[0].inputs,
+                vec![50, stub],
+                "{policy:?}: the reduce reads the stub"
+            );
+            assert_eq!(
+                the_dropout_backward(&adjoint).inputs,
+                vec![100, 11],
+                "{policy:?}: the backward still reads the saved key"
+            );
+            assert_eq!(
+                crate::source_ad::check_dropout_key_readers(&primal, &adjoint),
+                Ok(1)
+            );
+        }
+    }
+
+    /// A backward that reads the dropout output's VALUE: under Selective it
+    /// stays resident (no replay); under Block it is recomputed from its key
+    /// by a clone of the apply, which reads the saved key.
+    #[test]
+    fn a_dropout_output_read_for_value_is_kept_or_replayed_from_its_key() {
+        let primal = toy_primal_with_dropout();
+        let value_read = || {
+            adjoint_of(vec![
+                reduce(0, 100, 50, 12),
+                adj_op(1, 101, PrimalOp::Mul, vec![12, 100]),
+            ])
+        };
+        let mut plan = super::plan(&primal, None, CcrPolicy::Selective, false, 1).unwrap();
+        let mut adjoint = value_read();
+        let mut fresh = 200;
+        apply_to_adjoint(&primal, &mut adjoint, &mut plan, &mut fresh, true).unwrap();
+        assert!(!plan.per_segment_released[0].contains(&12));
+        assert!(!plan.recompute.contains(&12));
+        assert_eq!(
+            adjoint.ops[1].inputs,
+            vec![12, 100],
+            "the product reads the saved output"
+        );
+
+        let mut plan = super::plan(&primal, None, CcrPolicy::Block, false, 1).unwrap();
+        let mut adjoint = value_read();
+        let mut fresh = 200;
+        apply_to_adjoint(&primal, &mut adjoint, &mut plan, &mut fresh, true).unwrap();
+        let (&clone, _) = plan
+            .recompute_clones
+            .iter()
+            .find(|(_, orig)| **orig == 12)
+            .expect("the output is recomputed");
+        let replay = adjoint.ops.iter().find(|o| o.result == clone).unwrap();
+        assert!(matches!(replay.op, PrimalOp::Dropout { .. }));
+        assert_eq!(replay.inputs[1], 11, "the replay reads the saved key");
+        let product = adjoint
+            .ops
+            .iter()
+            .find(|o| matches!(o.op, PrimalOp::Mul))
+            .unwrap();
+        assert_eq!(
+            product.inputs,
+            vec![clone, 100],
+            "the product reads the replay"
+        );
+        assert_eq!(
+            crate::source_ad::check_dropout_key_readers(&primal, &adjoint),
+            Ok(1),
+            "a replay in the backward may read the key"
+        );
+    }
+
+    #[test]
+    fn a_dropout_key_read_by_anything_but_its_backward_is_refused() {
+        let primal = toy_primal_with_dropout();
+        // The stored-mask backward's multiply reading a key would read 32
+        // bytes as a tensor the size of the input.
+        let adjoint = adjoint_of(vec![adj_op(0, 101, PrimalOp::Mul, vec![100, 11])]);
+        let err = crate::source_ad::check_dropout_key_readers(&primal, &adjoint).unwrap_err();
+        assert!(
+            err.contains("VarId 11") && err.contains("NSL_DROPOUT_REGEN=0"),
+            "{err}"
+        );
+        // In the forward, only the dropout's own apply op may name it.
+        let mut bad = primal.clone();
+        bad.ops.push(op(13, 13, PrimalOp::Relu, vec![11]));
+        assert!(crate::source_ad::check_dropout_key_readers(&bad, &adjoint_of(vec![])).is_err());
+        // The key as operand 0 of the backward (a swapped pair) is refused too.
+        let bwd = crate::source_ad::dropout_backward_name(0.1);
+        let swapped = adjoint_of(vec![adj_op(
+            0,
+            101,
+            PrimalOp::Passthrough(bwd),
+            vec![11, 100],
+        )]);
+        assert!(crate::source_ad::check_dropout_key_readers(&primal, &swapped).is_err());
+        // And the name carries p exactly.
+        assert_eq!(
+            crate::source_ad::dropout_backward_p(&crate::source_ad::dropout_backward_name(0.1))
+                .map(f64::to_bits),
+            Some(0.1f64.to_bits())
+        );
+        assert_eq!(
+            crate::source_ad::dropout_backward_p("dropout_backward:12"),
+            None
         );
     }
 

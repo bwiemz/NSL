@@ -869,12 +869,15 @@ pub struct Compiler<'a> {
     pub fused_ce_bwd_cache: HashMap<Value, [Value; 3]>,
 
     // ── Dropout two-op split side-channel ─────────────────────────────
-    /// The dropout OUTPUT Value keyed by the MASK Value. Populated by the
-    /// `PrimalOp::DropoutMask` launch arm (one `nsl_tensor_dropout_fwd_mask`
-    /// call returns NslList [out, mask]); popped by the paired
-    /// `PrimalOp::Dropout` apply arm, which errors on a miss (a pass that
-    /// separates or reorders the pair breaks the invariant). Value-keyed →
-    /// cleared per function like the CSHA/fused-CE caches.
+    /// The dropout OUTPUT Value keyed by the MASK Value (the key, under
+    /// `NSL_DROPOUT_REGEN`). Populated by the `PrimalOp::DropoutMask` launch
+    /// arm (one `nsl_tensor_dropout_fwd_mask` / `_fwd_key` call returns
+    /// NslList [out, mask-or-key]); popped by the paired `PrimalOp::Dropout`
+    /// apply arm, which errors on a miss in the forward (a pass that
+    /// separates or reorders the pair breaks the invariant). A miss for a CCR
+    /// recompute clone in the backward redraws the output from the key
+    /// (`nsl_tensor_dropout_apply`). Value-keyed → cleared per function like
+    /// the CSHA/fused-CE caches.
     pub dropout_fwd_out: HashMap<Value, Value>,
 
     // ── CPKD fused KL-CE side-channels ────────────────────────────────

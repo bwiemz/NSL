@@ -8,7 +8,12 @@
 //! --checkpoint-blocks --fuse-rmsnorm-backward`): 72 chains (48x
 //! mul+scale-imm, 24x add+add residual joins — reduce_to_shape is a chain
 //! BARRIER after measurement showed every absorbed rts was a real GQA
-//! reduce that replayed) and 48 rope folds. Since the `rope` builtin
+//! reduce that replayed) and 48 rope folds. The 48 mul+scale-imm chains were
+//! the dropout backward `(dy * mask) * 1/(1-p)`; since the backward redraws
+//! the mask from a key (2026-11-21, `NSL_DROPOUT_REGEN`) it is one
+//! `dropout_backward:` op per dropout and not an elementwise chain, so the
+//! floor is now 0.8x the 24 residual joins, and the gate holds the 48
+//! dropouts to the key path (`[dropout]` witness) instead. Since the `rope` builtin
 //! (2026-11-15) the stdlib's RoPE is one fused op with its own adjoint, so
 //! the fold has nothing left to fold: the gate now requires the source-AD
 //! tape (`NSL_DEBUG_WENGERT`'s primal dump) to hold the fused `rope` op, one
@@ -72,10 +77,16 @@ fn prod_500m_recipe_fuses_above_the_observed_floor() {
             )
         });
     assert!(
-        chains >= 57,
-        "chain count {chains} fell below the floor (57 = 0.8 x 72 observed \
-         2026-08-25, post rts-barrier) — matcher regression or recipe drift \
-         starved the fuser:\n{stderr}"
+        chains >= 19,
+        "chain count {chains} fell below the floor (19 = 0.8 x the 24 residual \
+         joins; the 48 dropout chains of 2026-08-25 are now `dropout_backward:` \
+         ops) — matcher regression or recipe drift starved the fuser:\n{stderr}"
+    );
+    // The recipe's 48 dropouts (24 blocks x attention and MLP, p = 0.1)
+    // keep a key and redraw their mask: no dropout chain is left to fuse.
+    assert!(
+        stderr.contains("[dropout] 48 dropout(s) keep a 32-byte key"),
+        "the 500M recipe's dropouts did not take the regenerated-mask path:\n{stderr}"
     );
 
     // The RoPE is the fused builtin (one op per application, its adjoint the

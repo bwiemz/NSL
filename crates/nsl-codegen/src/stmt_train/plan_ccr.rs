@@ -620,6 +620,19 @@ impl Compiler<'_> {
                 shapes.insert(*var, dims.iter().map(|d| (*d).max(0) as u64).collect());
             }
         }
+        // A dropout key is 32 bytes whatever its input is. The extractor
+        // gives the key the dropout call's VarId, whose annotation is the
+        // output's shape, so the annotation-derived size above bills it the
+        // size of the mask it replaced.
+        if crate::source_ad::dropout_regen_enabled() {
+            for op in &primal.ops {
+                if matches!(op.op, crate::wengert::PrimalOp::DropoutMask { .. }) {
+                    let key = (nsl_kir::kernels::dropout::DROPOUT_KEY_WORDS * 4) as u64;
+                    bytes.insert(op.result, key);
+                    shapes.remove(&op.result);
+                }
+            }
+        }
         StaticSizes { bytes, shapes }
     }
 
@@ -678,5 +691,80 @@ impl Compiler<'_> {
             missing.len(),
             examples.join(", "),
         ))
+    }
+}
+
+impl Compiler<'_> {
+    /// Section 6d.1: the dropout keys and the build-log witness of what each
+    /// dropout keeps for its backward.
+    ///
+    /// Under `NSL_DROPOUT_REGEN` (the default) a `DropoutMask` result is a
+    /// 32-byte key, not a mask: `source_ad::check_dropout_key_readers` holds
+    /// every reader of it on the final lists to its own dropout and that
+    /// dropout's backward, and refuses the build otherwise. The witness line
+    /// counts the dropouts, the outputs CCR frees after their block (the
+    /// backward reads them for shape only) and those it redraws from the key
+    /// in the backward (read for value under full block recompute).
+    pub(crate) fn report_dropout_storage(
+        &self,
+        primal: &crate::wengert::WengertList,
+        adjoint: &crate::wengert::WengertList,
+        ccr_plan: &Option<crate::ccr::CcrPlan>,
+    ) -> Result<(), CodegenError> {
+        use crate::wengert::PrimalOp;
+        let outputs: std::collections::HashSet<crate::wengert::VarId> = primal
+            .ops
+            .iter()
+            .filter(|o| matches!(o.op, PrimalOp::Dropout { .. }))
+            .map(|o| o.result)
+            .collect();
+        if outputs.is_empty() {
+            return Ok(());
+        }
+        if !crate::source_ad::dropout_regen_enabled() {
+            nsl_log::nsl_log!(
+                INFO,
+                "dropout",
+                "[dropout] NSL_DROPOUT_REGEN=0: {} dropout(s) store an f32 mask and their output for the backward",
+                outputs.len()
+            );
+            return Ok(());
+        }
+        let keys = crate::source_ad::check_dropout_key_readers(primal, adjoint)
+            .map_err(CodegenError::new)?;
+        // Freed after their block and not recomputed: kept saves released
+        // (Selective) and recompute victims no adjoint op reads for value
+        // (Block); the backward reads them for shape only (a stub) or not at
+        // all. Recomputed: victims the backward reads for value, redrawn from
+        // the key by `nsl_tensor_dropout_apply`.
+        let (freed, replayed) = match ccr_plan {
+            Some(p) => {
+                let replayed: std::collections::HashSet<crate::wengert::VarId> = p
+                    .recompute_clones
+                    .values()
+                    .filter(|v| outputs.contains(v))
+                    .copied()
+                    .collect();
+                let freed = outputs
+                    .iter()
+                    .filter(|v| !replayed.contains(v))
+                    .filter(|v| {
+                        p.per_segment_released.iter().flatten().any(|r| r == *v)
+                            || p.free_eligible.contains(v)
+                    })
+                    .count();
+                (freed, replayed.len())
+            }
+            None => (0, 0),
+        };
+        nsl_log::nsl_log!(
+            INFO,
+            "dropout",
+            "[dropout] {keys} dropout(s) keep a 32-byte key and redraw their mask in the backward; \
+             {freed} of {} output(s) freed after their block (read for shape only), \
+             {replayed} recomputed from the key",
+            outputs.len()
+        );
+        Ok(())
     }
 }

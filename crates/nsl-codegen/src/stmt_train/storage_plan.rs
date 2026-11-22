@@ -1412,5 +1412,33 @@ mod tests {
         for v in [86, 900, 901, 88, 97, 902] {
             assert!(!got.bf16.contains(&v), "VarId {v} must stay f32");
         }
+
+        // The same half with the dropout backward that redraws its mask from
+        // the key (`NSL_DROPOUT_REGEN`, the default) in place of the fused
+        // multiply chain: one op reading the f32 gradient and the key, f32
+        // out. The plan is identical.
+        let regen = crate::source_ad::dropout_backward_name(0.1);
+        let at = adjoint
+            .ops
+            .iter()
+            .position(|o| o.result == 902)
+            .expect("the dropout backward");
+        adjoint.ops[at] = op(902, pt(&regen), &[97, 900]);
+        let with_regen = plan(&primal, &adjoint, &HashMap::new()).expect("plans");
+        assert_eq!(with_regen, got);
+    }
+
+    /// The dropout backward reads an f32 gradient; one that reads a bf16
+    /// value is a compile error (rule 6), not a silent widen.
+    #[test]
+    fn a_dropout_backward_reading_a_bf16_value_is_a_compile_error() {
+        let (primal, mut adjoint, clones) = block();
+        let regen = crate::source_ad::dropout_backward_name(0.1);
+        adjoint.ops.push(op(903, pt(&regen), &[503, 132]));
+        let err = plan(&primal, &adjoint, &clones).expect_err("must refuse");
+        assert!(
+            err.contains("dropout_backward") && err.contains("903"),
+            "{err}"
+        );
     }
 }

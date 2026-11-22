@@ -55,6 +55,11 @@ crates/nsl-cli/tests/dict_local_lifetime_gate.rs	loop_local_dicts_are_cleared_pe
 crates/nsl-cli/tests/dispatch_ownership_gate.rs	unallowlisted_dispatch_results_do_not_strand	gpu	requires CUDA GPU
 crates/nsl-cli/tests/dispatch_ownership_gate.rs	identity_shaped_dispatch_does_not_steal_bindings	gpu	requires CUDA GPU
 crates/nsl-cli/tests/dropout_backward_parity_gate.rs	gpu_source_backward_matches_tape_mask_backward	broken	requires CUDA GPU; blocked on a pre-existing source-AD GPU relu-backward dtype abort (nsl_tensor_compare data_f64 on f32) — reproduces with dropout elided
+crates/nsl-cli/tests/dropout_regen_gate.rs	the_switch_does_not_change_a_gpu_program_under_deterministic	gpu	requires CUDA GPU
+crates/nsl-cli/tests/dropout_regen_gate.rs	the_switch_does_not_change_a_bf16_storage_program	gpu	requires CUDA GPU
+crates/nsl-cli/tests/dropout_regen_gate.rs	the_allocator_peak_drops_by_the_masks_and_outputs_not_kept	gpu	requires CUDA GPU
+crates/nsl-cli/tests/dropout_regen_gate.rs	a_resume_across_the_switch_continues_the_run_bit_for_bit	gpu	requires CUDA GPU
+crates/nsl-cli/tests/dropout_regen_gate.rs	cuda_graph_regions_capture_no_less_with_the_key	gpu	requires CUDA GPU
 crates/nsl-cli/tests/element_write_gpu_gate.rs	an_element_write_to_a_cached_gpu_parameter_is_refused	gpu	requires CUDA GPU
 crates/nsl-cli/tests/elementwise_chain_fusion_gate.rs	chain_fusion_bit_exact_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/elementwise_chain_fusion_gate.rs	chain_fusion_replay_fallback_bit_exact_gpu	gpu	requires CUDA GPU

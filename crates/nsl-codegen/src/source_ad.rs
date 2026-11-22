@@ -59,6 +59,95 @@ fn item_fold_enabled() -> bool {
     })
 }
 
+/// Whether a source-AD dropout keeps a key and redraws its mask in the
+/// backward (the default) instead of storing the mask. Read at COMPILE time,
+/// once; `NSL_DROPOUT_REGEN=0` restores the stored mask.
+///
+/// The GPU dropout's draw is a pure function of a 64-bit counter
+/// (`nsl_kir::kernels::dropout`), so the forward can keep 32 bytes (the
+/// counter base, threshold, scale and length: `nsl_tensor_dropout_fwd_key`)
+/// where it kept an f32 tensor the size of its input, and the backward
+/// (`nsl_tensor_dropout_bwd`) draws the same bits again. With it, the dropout
+/// OUTPUT stops being force-saved too (`ccr::plan`), since the backward reads
+/// it only for its shape. The stream, the forward, the mask and the gradient
+/// arithmetic are those of the stored-mask path bit for bit, so the switch is
+/// not part of the execution fingerprint. The extraction, the adjoint, the
+/// lowering and CCR all read this one function.
+pub fn dropout_regen_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NSL_DROPOUT_REGEN").ok().as_deref() != Some("0"))
+}
+
+/// `dropout_backward:<p as 16 hex digits of its f64 bits>` -- inputs
+/// `[grad, key]`: the dropout backward that redraws its mask from the key
+/// the forward kept (`nsl_tensor_dropout_bwd`). `p` travels in the name so
+/// the backward uses the forward's value exactly.
+pub(crate) const DROPOUT_BACKWARD_PREFIX: &str = "dropout_backward:";
+
+/// The `dropout_backward:` op name for probability `p`.
+pub(crate) fn dropout_backward_name(p: f64) -> String {
+    format!("{DROPOUT_BACKWARD_PREFIX}{:016x}", p.to_bits())
+}
+
+/// The `p` of a `dropout_backward:` op name; `None` for any other name.
+pub(crate) fn dropout_backward_p(name: &str) -> Option<f64> {
+    let hex = name.strip_prefix(DROPOUT_BACKWARD_PREFIX)?;
+    (hex.len() == 16)
+        .then(|| u64::from_str_radix(hex, 16).ok())
+        .flatten()
+        .map(f64::from_bits)
+}
+
+/// Invariant I4 of the regenerated dropout mask: every `DropoutMask` result
+/// (a key under regeneration) is read only as operand 1 of a `Dropout` apply
+/// op (in the forward its own, which reads no data; in the backward a CCR
+/// recompute clone, `nsl_tensor_dropout_apply`), of a `dropout_backward:` op
+/// in the backward, and by frees. Anything else would hand a 32-byte key to
+/// an op that reads it as a tensor the size of the input. Checked on the
+/// final lists, before lowering. Returns the number of dropouts, or the
+/// offending op.
+pub(crate) fn check_dropout_key_readers(
+    primal: &WengertList,
+    adjoint: &WengertList,
+) -> Result<usize, String> {
+    let keys: HashSet<VarId> = primal
+        .ops
+        .iter()
+        .filter(|op| matches!(op.op, PrimalOp::DropoutMask { .. }))
+        .map(|op| op.result)
+        .collect();
+    for (list, op) in primal
+        .ops
+        .iter()
+        .map(|o| ("forward", o))
+        .chain(adjoint.ops.iter().map(|o| ("backward", o)))
+    {
+        for (i, v) in op.inputs.iter().enumerate() {
+            if !keys.contains(v) {
+                continue;
+            }
+            let allowed = match &op.op {
+                PrimalOp::Dropout { .. } => i == 1,
+                PrimalOp::Passthrough(name) => {
+                    list == "backward" && i == 1 && dropout_backward_p(name).is_some()
+                }
+                PrimalOp::FreeTensor => true,
+                _ => false,
+            };
+            if !allowed {
+                return Err(format!(
+                    "internal compiler error: the dropout key VarId {v} is read by {list} op {:?} \
+                     (result VarId {}, operand {i}); only its dropout and that dropout's backward \
+                     may read it. Build with NSL_DROPOUT_REGEN=0 to store the mask instead, and \
+                     please report this",
+                    op.op, op.result
+                ));
+            }
+        }
+    }
+    Ok(keys.len())
+}
+
 // ---------------------------------------------------------------------------
 // Adjoint generation
 // ---------------------------------------------------------------------------
@@ -1394,10 +1483,20 @@ impl AdjointGenerator {
             }
 
             // --- Dropout backward: grad * mask * (1/(1-p)) ---
-            AdjointExpr::DropoutBackward(y_bar, mask, scale) => {
-                let masked = self.emit_op(PrimalOp::Mul, vec![y_bar, mask]);
-                let inv_keep = self.emit_constant(scale);
-                self.emit_op(PrimalOp::Mul, vec![masked, inv_keep])
+            // One op that redraws the mask from the forward's key, or (the
+            // NSL_DROPOUT_REGEN=0 kill switch) the stored mask's two
+            // multiplies. Both compute (grad * m) * f32(1/(1-p)).
+            AdjointExpr::DropoutBackward(y_bar, mask, p) => {
+                if dropout_regen_enabled() {
+                    self.emit_op(
+                        PrimalOp::Passthrough(dropout_backward_name(p)),
+                        vec![y_bar, mask],
+                    )
+                } else {
+                    let masked = self.emit_op(PrimalOp::Mul, vec![y_bar, mask]);
+                    let inv_keep = self.emit_constant(1.0 / (1.0 - p));
+                    self.emit_op(PrimalOp::Mul, vec![masked, inv_keep])
+                }
             }
 
             // --- Embedding backward: scatter_add(grad, indices) into weight-shaped gradient ---

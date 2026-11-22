@@ -420,6 +420,15 @@ pub static REGISTRY: &[EnvVar] = &[
         "Test harness only: weights path handed to the DLPack unsupported-dtype refusal child scenarios."
     ),
     var!(
+        "NSL_DROPOUT_REGEN",
+        Bool,
+        "0 disables; anything else or unset = on (cached at first read per process)",
+        "on",
+        Perf,
+        Compile,
+        "Kill switch: 0 makes source-AD dropout store its f32 mask and output for the backward instead of a 32-byte key (bit-identical)."
+    ),
+    var!(
         "NSL_DTYPE_REFUSAL_SCENARIO",
         Str,
         "scenario name",

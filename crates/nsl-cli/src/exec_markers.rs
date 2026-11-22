@@ -379,6 +379,20 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
          and warns when that placement broke a weight-gradient fusion chain",
     ),
     m(
+        "[dropout]",
+        &[
+            // The build-log witness after the CCR splice: how many dropouts
+            // keep a key (NSL_DROPOUT_REGEN, the default) and how many
+            // outputs CCR frees at their block's end, or that the kill
+            // switch stores the mask.
+            "crates/nsl-codegen/src/stmt_train/plan_ccr.rs",
+        ],
+        "source-AD dropout keeps a 32-byte key and redraws its mask in the \
+         backward (or, with `NSL_DROPOUT_REGEN=0`, stores the f32 mask); the \
+         line counts the dropouts, the outputs freed after their block and \
+         those recomputed from the key",
+    ),
+    m(
         "[fused-lm-ce]",
         &[
             // stmt_train/driver.rs: the partial-decline warning, and the
@@ -563,6 +577,7 @@ pub mod tokens {
     pub const WGRAD_ACCUM: &str = "[wgrad-accum]";
     pub const WGRAD_FUSION: &str = "[wgrad-fusion]";
     pub const CCR: &str = "[ccr]";
+    pub const DROPOUT: &str = "[dropout]";
     pub const FASE: &str = "[fase]";
     pub const ACTIVATION: &str = "[activation]";
 }
