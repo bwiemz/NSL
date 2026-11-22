@@ -36,7 +36,10 @@ binary under NSL_TC_ATTENTION=0 (the attention kernels before the tensor-core on
 `nsl_<tf32|bf16>_<suffix>` for each MEMORY_ARMS suffix: one memory option on top of
 PROD_FLAGS, or on the nearest flag set it accepts (see MEMORY_ARMS); likewise each
 OPTIM_ARMS suffix, an optimizer argument in the program instead of a flag
-(`nsl_bf16_m1bf16`: `first_moment_dtype="bf16"`). `torch_<tf32|bf16>_<eager|compile>_
+(`nsl_bf16_m1bf16`: `first_moment_dtype="bf16"`). `<nsl arm>_drop01`: that arm with the
+copied model's dropout set to 0.1 (the 500M recipe's value; the 1B recipe has none), a
+different program, for measuring dropout's own cost at a size whose recipe does not
+use it. `torch_<tf32|bf16>_<eager|compile>_
 <none|blocks|sel>`: `torch_arm.py` with that precision, compilation and checkpointing.
 
 Timing: a step-limited program per arm (the token file holds exactly `--updates`
@@ -150,6 +153,9 @@ PRECISION_BF16 = ', precision="bf16"'
 PARAM_SPLIT = PRECISION_BF16 + ', param_dtype="bf16-split"'
 PARAM_MASTER = PRECISION_BF16 + ', param_dtype="bf16-master"'
 PARAM_BANNER = "parameter storage: "
+# `<nsl arm>_drop01`: the arm with the copied model's dropout set to this value.
+DROPOUT_SUFFIX = "_drop01"
+DROPOUT_ARM_P = "0.1"
 TF32_BANNER = "cuBLAS math mode: TF32"
 OOM_MARKERS = ("CUDA_ERROR_OUT_OF_MEMORY", "VRAM free", "out of memory", "OutOfMemory")
 
@@ -251,6 +257,9 @@ class Arm:
     optim_args: str = ""
     # NSL: text appended to the program's `train(...)` header (`PRECISION_BF16`).
     train_args: str = ""
+    # NSL: the copied model's dropout probability (a float literal); "" keeps the
+    # model directory's own value.
+    dropout: str = ""
 
     @property
     def build_key(self) -> BuildKey:
@@ -261,12 +270,13 @@ class Arm:
             self.grad_clip,
             self.optim_args,
             self.train_args,
+            self.dropout,
         )
 
 
 # (flags, build environment, toolchain variant, grad_clip, AdamW arguments,
-# train-header text): one built binary per key.
-BuildKey = tuple[tuple[str, ...], tuple[tuple[str, str], ...], str, bool, str, str]
+# train-header text, model dropout): one built binary per key.
+BuildKey = tuple[tuple[str, ...], tuple[tuple[str, str], ...], str, bool, str, str, str]
 
 
 BF16 = (("NSL_MATMUL_BF16", "1"),)
@@ -306,6 +316,11 @@ def arm(name: str) -> Arm:
         if a.kind != "nsl" or not re.fullmatch(r"[A-Za-z0-9_.-]+", variant):
             raise SystemExit(f"arm {name!r}: only NSL arms take an @variant (alphanumeric)")
         return dataclasses.replace(a, name=name, variant=variant)
+    if name.endswith(DROPOUT_SUFFIX):
+        a = arm(name.removesuffix(DROPOUT_SUFFIX))
+        if a.kind != "nsl":
+            raise SystemExit(f"arm {name!r}: only NSL arms take {DROPOUT_SUFFIX}")
+        return dataclasses.replace(a, name=name, dropout=DROPOUT_ARM_P)
     nsl = {
         "nsl_tf32": Arm(name, "nsl", "tf32", tuple(PROD_FLAGS)),
         "nsl_bf16": Arm(name, "nsl", "bf16", tuple(PROD_FLAGS), BF16),
@@ -347,7 +362,7 @@ def arm(name: str) -> Arm:
 
 
 def flag_key(key: BuildKey) -> str:
-    flags, build_env, variant, grad_clip, optim_args, train_args = key
+    flags, build_env, variant, grad_clip, optim_args, train_args, dropout = key
     tag = "_".join(f.removeprefix("--").replace("-", "") for f in flags)
     if build_env:
         tag += "__" + "_".join(f"{k.removeprefix('NSL_').lower()}{v}" for k, v in build_env)
@@ -357,6 +372,8 @@ def flag_key(key: BuildKey) -> str:
         tag += "__" + re.sub(r"[^a-z0-9]", "", optim_args.lower())
     if train_args:
         tag += "__" + re.sub(r"[^a-z0-9]", "", train_args.lower())
+    if dropout:
+        tag += "__drop" + re.sub(r"[^0-9]", "", dropout)
     if variant:
         tag += "@" + variant
     return "nsl_" + tag
@@ -463,6 +480,19 @@ def program_text(
     )
 
 
+def with_dropout(src: str, p: str) -> str:
+    """A `models/<dir>/model.nsl` text with its dropout probability set to `p`: the
+    `DROPOUT` constant and the block constructor's literal argument list (the sixth
+    argument is `dropout_p`; `tools/refcheck/ref.py` rewrites the same two places)."""
+    src, n = re.subn(r"^const DROPOUT = [0-9.]+", f"const DROPOUT = {p}", src, flags=re.MULTILINE)
+    block = re.search(r"TransformerBlock\((\d+(?:, [0-9.]+)*)\)", src)
+    if n != 1 or block is None:
+        raise SystemExit("model.nsl: no `const DROPOUT` or no TransformerBlock(...) literal list")
+    args = block.group(1).split(", ")
+    args[5] = p
+    return src.replace(block.group(0), f"TransformerBlock({', '.join(args)})")
+
+
 def size_dir(out: Path, size: str, shape: Shape) -> Path:
     return out / f"{size}_b{shape.micro_batch}_s{shape.seq}_a{shape.accum}"
 
@@ -495,12 +525,14 @@ def build_nsl(
     updates: int,
     phase: bool,
 ) -> Path:
-    flags, build_env, variant, grad_clip, optim_args, train_args = key
+    flags, build_env, variant, grad_clip, optim_args, train_args, dropout = key
     nsl = tc.nsl
     d = work / flag_key(key)
     d.mkdir(parents=True, exist_ok=True)
     for f in ("model.nsl", "config.nsl"):
         shutil.copyfile(REPO / "models" / shape.directory / f, d / f)
+    if dropout:
+        (d / "model.nsl").write_text(with_dropout((d / "model.nsl").read_text(), dropout))
     tokens = tokens_file(work, shape, updates)
     src = d / "bench.nsl"
     src.write_text(program_text(shape, updates, tokens, grad_clip, optim_args, train_args))
@@ -536,6 +568,7 @@ def build_nsl(
                 "nsl": str(nsl),
                 "variant": variant,
                 "train_args": train_args,
+                "dropout": dropout,
                 "stdlib": str(tc.stdlib),
             },
             indent=1,
@@ -725,6 +758,7 @@ def run_nsl_arm(
         "env": dict(a.env),
         "grad_clip": a.grad_clip,
         "optim_args": a.optim_args,
+        "dropout": a.dropout,
         "round": rnd,
         "updates": updates,
         "warmup_updates": warmup,
