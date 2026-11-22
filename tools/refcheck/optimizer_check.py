@@ -80,6 +80,7 @@ def nsl_run(a: argparse.Namespace, cfg, seq: int, optimizer: str, micro: int) ->
         + unit
         + (f", grad_clip={a.clip}" if a.clip > 0 else "")
         + (', precision="bf16"' if a.precision == "bf16" else "")
+        + (f', param_dtype="{a.param_dtype}"' if a.param_dtype != "f32" else "")
     )
     schedule = f"    scheduler: warmup_cosine(warmup_steps={WARMUP:g}, total_steps={TOTAL:g}, min_lr={MIN_LR})\n"
     program = TRAIN_PROGRAM.format(
@@ -256,6 +257,13 @@ def main() -> int:
         choices=["f32", "bf16"],
         default="f32",
         help="the NSL train header's precision= (bf16: activation storage)",
+    )
+    ap.add_argument(
+        "--param-dtype",
+        choices=["f32", "bf16-split", "bf16-master"],
+        default="f32",
+        help="the NSL train header's param_dtype= (needs --precision bf16; bf16-master is a "
+        "test mode: build environment NSL_PARAM_DTYPE_TEST_MODES=1)",
     )
     ap.add_argument(
         "--autocast",

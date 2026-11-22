@@ -100,6 +100,13 @@ const ARITHMETIC_KEYS: &[&str] = &[
     // some train block asks for it (`m1=bf16`), so an f32 build and every
     // checkpoint written before the switch agree by both lacking it.
     "m1",
+    // How trained parameters are stored and stepped: `bf16sr-ws` is the CSLA
+    // mirror mode (`--param-dtype bf16-sr`, whose checkpoints save the f32
+    // working view, so the `.nslm` dtype check cannot see it); the
+    // train-block key `param_dtype=` records its own values. Emitted only
+    // when not f32, so an f32 build and every older checkpoint agree by both
+    // lacking it.
+    "pdt",
 ];
 
 /// Keys that move bytes without changing the value computed.
@@ -270,6 +277,35 @@ mod tests {
         assert!(super::arithmetic_diff(f32_build, f32_build).is_empty());
         assert!(super::arithmetic_diff(bf16_build, bf16_build).is_empty());
         assert!(!super::PLACEMENT_KEYS.contains(&"m1"), "m1 must not merely warn");
+    }
+
+    /// The parameter storage is arithmetic: a resume from a CSLA bf16-sr
+    /// checkpoint into an f32 build refuses, the reverse refuses, two of
+    /// the normal-schedule modes refuse each other, and two f32 builds (no
+    /// key on either side) agree.
+    #[test]
+    fn a_parameter_dtype_change_refuses_a_resume() {
+        let f32_build = "ad=source,ws=1";
+        let csla = "ad=source,ws=1,pdt=bf16sr-ws";
+        let split = "ad=source,ws=1,pdt=bf16split";
+        let master = "ad=source,ws=1,pdt=bf16master";
+        for (saved, live) in [
+            (csla, f32_build),
+            (f32_build, csla),
+            (split, master),
+            (f32_build, split),
+            (split, csla),
+        ] {
+            let d = super::arithmetic_diff(saved, live);
+            assert!(d.iter().any(|f| f.key == "pdt"), "{saved} -> {live}: {d:?}");
+        }
+        for fp in [f32_build, csla, split] {
+            assert!(super::arithmetic_diff(fp, fp).is_empty(), "{fp}");
+        }
+        assert!(
+            !super::PLACEMENT_KEYS.contains(&"pdt"),
+            "pdt must not merely warn"
+        );
     }
 
     #[test]

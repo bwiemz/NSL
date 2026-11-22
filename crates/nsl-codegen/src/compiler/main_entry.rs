@@ -131,6 +131,15 @@ impl Compiler<'_> {
                 if self.activation_bf16 {
                     fp.push_str(",act=bf16");
                 }
+                // `param_dtype=` (bf16 parameter storage) is arithmetic, and the
+                // optimizer state differs per mode: a resume across it refuses.
+                // Emitted only when not f32, like `act`.
+                if let Some(key) = self
+                    .param_storage
+                    .and_then(crate::stmt_train::config::param_storage_fingerprint)
+                {
+                    fp.push_str(key);
+                }
                 // What the program was specialized on, when it was: emitted
                 // only then, like the layer-prune keys, so that a build with
                 // no value-dependent rewrite and an older checkpoint agree by
@@ -208,6 +217,15 @@ impl Compiler<'_> {
                     // perfcheck harness asserts for a bf16-storage arm.
                     let bf16 = builder.ins().iconst(cl_types::I64, 3);
                     self.compile_call_by_name(&mut builder, "nsl_set_activation_storage", &[bf16])?;
+                }
+                // `param_dtype=`: the parameter-storage banner, which the
+                // perfcheck harness asserts for a bf16-parameter arm.
+                if let Some(code) = self
+                    .param_storage
+                    .and_then(crate::stmt_train::config::param_storage_wire)
+                {
+                    let code = builder.ins().iconst(cl_types::I64, code);
+                    self.compile_call_by_name(&mut builder, "nsl_set_param_storage", &[code])?;
                 }
             }
 

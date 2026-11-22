@@ -243,6 +243,25 @@ impl Compiler<'_> {
             self.compile_call_by_name(builder, "nsl_clip_grad_norm", &[accum, max_norm_val])?;
         }
 
+        // `param_dtype=`: the bf16 parameters are stepped only by the fused
+        // multi-tensor AdamW launch (the runtime routes each stored
+        // parameter to the kernel of its storage); every other optimizer arm
+        // reads and writes f32 parameters.
+        let param_storage = self
+            .param_storage
+            .filter(|p| *p != nsl_semantic::train_config::ParamDtype::F32);
+        if let Some(pd) = param_storage
+            && (mode_table_base.is_some() || !fase_deferred || csla_active || accum_list.is_none())
+        {
+            return Err(CodegenError::new(format!(
+                "param_dtype=\"{}\" needs the fused multi-tensor AdamW/Adam step (FASE Deferred: AdamW or Adam, \
+                 grad_accumulation >= 2, no WGGO per-layer mode table, no --layerwise-accum), which is the only \
+                 optimizer path that steps bf16-stored parameters. This train block takes another. Drop \
+                 param_dtype=, or train with AdamW/Adam and gradient accumulation",
+                pd.as_str()
+            )));
+        }
+
         if let Some(mtb) = mode_table_base {
             // D3 v1: the unified mode-table dispatch has its own per-param
             // update kernel selection — owner-gating inside it is untested
@@ -378,6 +397,17 @@ impl Compiler<'_> {
                 } else {
                     None
                 };
+                if let Some(pd) = param_storage
+                    && multi_scalars.is_none()
+                {
+                    return Err(CodegenError::new(format!(
+                        "param_dtype=\"{}\" needs the fused multi-tensor AdamW step, and this train block does not \
+                         take it: a CPDT precision plan turns it off, or the optimizer is not plain AdamW/Adam (the \
+                         switches and flags that also turn it off are refused by name before this point). Drop \
+                         param_dtype=, or the plan or optimizer that disables the fused step",
+                        pd.as_str()
+                    )));
+                }
 
                 if fase_plan.two_phase_clip {
                     // Phase A batching: ONE `nsl_fase_sum_sq_list` call (a

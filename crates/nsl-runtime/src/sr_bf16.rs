@@ -70,6 +70,31 @@ pub fn sr_step_key(seed: u64, step: u64) -> u64 {
     seed ^ step.wrapping_mul(SR_STEP_SALT)
 }
 
+/// Domain of [`sr_step_key_mixed`]: keeps its keys apart from every other
+/// splitmix64 stream keyed by the same `--seed` (the CSLA mode's
+/// [`sr_step_key`], the matmul-operand SR cast).
+pub const PARAM_SR_DOMAIN: u64 = 0x5052_4D53_5242_4631; // "PRMSRBF1"
+
+/// The launch key of the normal-schedule SR parameter mode
+/// (`param_dtype="bf16-sr"`, the `nsl_fase_fused_adamw_multi_bf16sr_mp`
+/// kernels): `(seed, step)` through the splitmix64 finalizer.
+///
+/// [`sr_step_key`] combines `step·γ` with the seed by XOR, and the kernel
+/// then ADDS `counter·γ` before the finalizer. When the XOR does not disturb
+/// the low bits of `step·γ` (always for seed 0; for a seed whose highest set
+/// bit is `b`, at lag `2^(b+1)` and on a share of steps at lag 1), `key(t+1)
+/// = key(t) + L·γ`, so element `i` at step `t+1` reuses element `i + L`'s
+/// dither of step `t`: the rounding errors of neighbouring elements are
+/// correlated across steps (design `srbf16-design.md` 11.2, risk 4). Here
+/// the key is itself a finalizer output, so `key(t+1) - key(t)` is a
+/// multiple of γ below 2^20 with probability ~2^-44 per step pair. The
+/// CSLA mode keeps [`sr_step_key`] unchanged (bit-compatible with its
+/// checkpoints and gates).
+#[inline]
+pub fn sr_step_key_mixed(seed: u64, step: u64) -> u64 {
+    sr_mix64(seed ^ PARAM_SR_DOMAIN, step)
+}
+
 /// The counter base for a parameter's dither block. `elem_offset` is the
 /// flat index, within the parameter, of the first element this launch
 /// covers — 0 for a whole-tensor launch, `rank * shard` for a per-rank
@@ -1180,6 +1205,62 @@ pub fn bf16_operand_cast_rne_host(vals: &[f32]) -> Vec<u16> {
 mod tests {
     use super::*;
     use crate::tensor::bf16_bits_to_f32;
+
+    /// The steps `t` in `0..steps` at which `key(t + dt) = key(t) + L·γ` for
+    /// some element lag `L` in `1..=max_lag`: element `i` of step `t + dt`
+    /// then draws element `i + L`'s dither of step `t` (the kernel hashes
+    /// `key + counter·γ`).
+    fn aliased_steps(key: impl Fn(u64) -> u64, steps: u64, dt: u64, max_lag: u64) -> u64 {
+        let inv = {
+            // γ is odd: its inverse mod 2^64 by Newton's iteration.
+            let mut x = SR_STEP_SALT;
+            for _ in 0..6 {
+                x = x.wrapping_mul(2u64.wrapping_sub(SR_STEP_SALT.wrapping_mul(x)));
+            }
+            assert_eq!(x.wrapping_mul(SR_STEP_SALT), 1);
+            x
+        };
+        (0..steps)
+            .filter(|&t| {
+                let lag = key(t + dt).wrapping_sub(key(t)).wrapping_mul(inv);
+                (1..=max_lag).contains(&lag)
+            })
+            .count() as u64
+    }
+
+    /// The CSLA key aliases (seed 0: the next step reuses the neighbouring
+    /// element's dither at every step; seed 42: on about an eighth of the
+    /// steps, and 64 steps later by 64 elements at every step); the mixed
+    /// key of the normal-schedule SR mode does not, at any step distance up
+    /// to 64 and element lag up to 2^20.
+    #[test]
+    fn the_mixed_sr_key_does_not_alias_across_steps() {
+        let steps = 20_000;
+        assert_eq!(
+            aliased_steps(|t| sr_step_key(0, t), steps, 1, 1),
+            steps,
+            "seed 0 must alias at lag 1"
+        );
+        let lag1 = aliased_steps(|t| sr_step_key(42, t), steps, 1, 1);
+        assert!(
+            lag1 > steps / 16 && lag1 < steps / 4,
+            "seed 42 lag-1 aliasing on {lag1} of {steps} steps"
+        );
+        assert_eq!(aliased_steps(|t| sr_step_key(42, t), steps, 64, 64), steps);
+        for seed in [0u64, 1, 42, 4242, u64::MAX] {
+            for dt in 1..=64 {
+                assert_eq!(
+                    aliased_steps(|t| sr_step_key_mixed(seed, t), steps, dt, 1 << 20),
+                    0,
+                    "seed {seed} dt {dt}"
+                );
+            }
+        }
+        // Keyed on both inputs, and not on the CSLA stream.
+        assert_ne!(sr_step_key_mixed(42, 7), sr_step_key_mixed(43, 7));
+        assert_ne!(sr_step_key_mixed(42, 7), sr_step_key_mixed(42, 8));
+        assert_ne!(sr_step_key_mixed(42, 7), sr_step_key(42, 7));
+    }
 
     /// Same (seed, step, counter) → same output, across calls and value
     /// reuse; different step or counter → (overwhelmingly) different dither.

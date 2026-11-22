@@ -191,6 +191,28 @@ class Parsing(unittest.TestCase):
         self.assertEqual(hp["kernel_launch_calls"], 1700)
 
 
+class ParamStorage(unittest.TestCase):
+    def test_the_conversion_line_is_required_and_read(self) -> None:
+        err = (
+            "[nsl-matmul] parameter storage: bf16-split (train param_dtype: ...)\n"
+            "[param-storage] 112 parameters stored bf16-split (1.812 GiB of bf16 parameters)\n"
+        )
+        self.assertEqual(pc.params_converted(err, "bf16-split"), 112)
+        # The banner alone is not a conversion.
+        self.assertEqual(pc.params_converted(err.splitlines()[0], "bf16-split"), 0)
+        # Another mode's line does not count, and a prefix is not the mode.
+        self.assertEqual(pc.params_converted(err, "bf16-master"), 0)
+        self.assertEqual(
+            pc.params_converted(
+                "[param-storage] 3 parameters stored bf16-master-tz", "bf16-master"
+            ),
+            0,
+        )
+        # The compile-time plan line is not the run's conversion either.
+        plan = "[param-storage] 112 of 146 parameters stored bf16-split (32 of the GEMMs ...)"
+        self.assertEqual(pc.params_converted(plan, "bf16-split"), 0)
+
+
 class Arms(unittest.TestCase):
     def test_builds_are_distinct_where_the_arithmetic_is(self) -> None:
         keys = {pc.flag_key(pc.arm(n).build_key) for n in ("nsl_tf32", "nsl_bf16")}

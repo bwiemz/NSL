@@ -504,6 +504,19 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
          halves were planned. A program with neither to store fails the \
          compile instead",
     ),
+    m(
+        "[param-storage]",
+        &[
+            "crates/nsl-codegen/src/stmt_train/storage_plan.rs",
+            "crates/nsl-runtime/src/param_storage.rs",
+        ],
+        "a train block with param_dtype= stores weight matrices bf16: at \
+         compile time `[param-storage] N of M parameters stored <mode> (...)` \
+         per planned train block; at run time `[param-storage] N parameters \
+         stored <mode>` when they are converted and `[param-storage] \
+         teardown: N parameters widened back to f32 ...` after the block. A \
+         step with nothing to store fails the compile instead",
+    ),
 ];
 
 /// Look a marker up by token. Panics if it is not registered — call sites are
@@ -585,6 +598,14 @@ pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
         test: "crates/nsl-cli/tests/bf16_activation_storage_gate.rs",
         asserts: "a program without precision=\"bf16\" plans no bf16 activation storage",
         parts: &[("[bf16-storage]", "crates/nsl-codegen/src/stmt_train/storage_plan.rs")],
+    },
+    NegativeNeedle {
+        test: "crates/nsl-cli/tests/param_storage_gate.rs",
+        asserts: "a program without param_dtype= plans no bf16 parameter storage",
+        parts: &[
+            // nsl_log!(INFO, "param-storage", "[param-storage] {} of {} parameters stored ...")
+            ("[param-storage]", "crates/nsl-codegen/src/stmt_train/storage_plan.rs"),
+        ],
     },
     NegativeNeedle {
         test: "crates/nsl-cli/tests/pretrain_optimized_flag.rs",

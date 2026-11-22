@@ -299,7 +299,7 @@ pub const FASE_ADAMW_MULTI_NAME: &str = "nsl_fase_fused_adamw_multi_f32";
 /// join(g): the single-parameter body; wd branch; θ[e] stored; mp[e] = 0
 /// ```
 pub fn build_fase_adamw_multi() -> KernelIR {
-    build_multi(FASE_ADAMW_MULTI_NAME, FirstMoment::F32)
+    build_multi(FASE_ADAMW_MULTI_NAME, FirstMoment::F32, Theta::F32)
 }
 
 /// The multi-tensor step with a bf16 first moment.
@@ -311,20 +311,225 @@ pub const FASE_ADAMW_MULTI_MBF16_NAME: &str = "nsl_fase_fused_adamw_multi_f32_mb
 /// [`build_fase_adamw_step_mbf16`]'s body with the multi kernel's
 /// `mp_scale` fold and `mp` zeroing.
 pub fn build_fase_adamw_multi_mbf16() -> KernelIR {
-    build_multi(FASE_ADAMW_MULTI_MBF16_NAME, FirstMoment::Bf16)
+    build_multi(FASE_ADAMW_MULTI_MBF16_NAME, FirstMoment::Bf16, Theta::F32)
 }
 
-fn build_multi(name: &str, first_moment: FirstMoment) -> KernelIR {
+/// How a bf16 parameter's master-mode image is rounded from the f32 master.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Image {
+    /// `cvt.rn.bf16.f32`: what the weight-cast cache casts, so the image is
+    /// the bits today's GEMMs read.
+    Rne,
+    /// [`split_hi`]'s rounding: to nearest, a tie toward the truncation. The
+    /// test-only reference for [`Theta::Bf16Split`], whose image cannot be
+    /// RNE at every tie.
+    HalfTowardTruncation,
+}
+
+/// How a multi-tensor AdamW kernel stores and steps the parameter θ.
+///
+/// Every variant computes the same f32 update, op for op ([`adamw_update`]),
+/// folds the clip pre-scale into the gradient read (`mp_scale`) and zeroes
+/// the consumed gradient. They differ only in where the f32 θ the update
+/// reads comes from and where θ' goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Theta {
+    /// f32 θ, read and written in place: today's kernels, byte for byte.
+    F32,
+    /// bf16 θ (the GEMMs' operand) beside an f32 master in optimizer state
+    /// (`wtab`): the master is stepped exactly as [`Theta::F32`] steps θ,
+    /// then θ is written as the master's image.
+    Bf16Master(Image),
+    /// bf16 θ = the f32 master's top half rounded ([`split_hi`]) beside the
+    /// master's low 16 bits in optimizer state (`wtab`, u16): the kernel
+    /// reassembles the exact master ([`join_f32`]), steps it, and splits
+    /// θ' again. The master is never stored whole.
+    Bf16Split,
+    /// bf16 θ and no master: θ is widened exactly (`bits << 16`), and θ' is
+    /// stored with stochastic rounding ([`sr_bf16_bits`]) under the launch
+    /// key `sr_key` and the per-parameter counter base `ctrtab[p]`.
+    Bf16Sr,
+}
+
+impl Theta {
+    /// Every bf16-parameter variant, in a fixed order (the runtime's module
+    /// cache indexes by it).
+    pub const BF16: [Theta; 4] = [
+        Theta::Bf16Master(Image::Rne),
+        Theta::Bf16Master(Image::HalfTowardTruncation),
+        Theta::Bf16Split,
+        Theta::Bf16Sr,
+    ];
+
+    /// The element type of θ's table: bf16 storage for the master's RNE image
+    /// (a `cvt.rn.bf16.f32` store), raw 16-bit words for the rest.
+    fn param_elem(self) -> KirType {
+        match self {
+            Theta::F32 => KirType::F32,
+            Theta::Bf16Master(Image::Rne) => KirType::Bf16,
+            _ => KirType::U16,
+        }
+    }
+
+    /// The element type of the optimizer-state table beside θ (`wtab`): the
+    /// f32 master, or the split master's low half.
+    fn master_elem(self) -> Option<KirType> {
+        match self {
+            Theta::Bf16Master(_) => Some(KirType::F32),
+            Theta::Bf16Split => Some(KirType::U16),
+            Theta::F32 | Theta::Bf16Sr => None,
+        }
+    }
+}
+
+/// The entry name of the multi-tensor step for a parameter storage and a
+/// first-moment dtype.
+pub fn multi_name(theta: Theta, m_bf16: bool) -> &'static str {
+    match (theta, m_bf16) {
+        (Theta::F32, false) => FASE_ADAMW_MULTI_NAME,
+        (Theta::F32, true) => FASE_ADAMW_MULTI_MBF16_NAME,
+        (Theta::Bf16Master(Image::Rne), false) => "nsl_fase_fused_adamw_multi_bf16master",
+        (Theta::Bf16Master(Image::Rne), true) => "nsl_fase_fused_adamw_multi_bf16master_mbf16",
+        (Theta::Bf16Master(Image::HalfTowardTruncation), false) => {
+            "nsl_fase_fused_adamw_multi_bf16master_tz"
+        }
+        (Theta::Bf16Master(Image::HalfTowardTruncation), true) => {
+            "nsl_fase_fused_adamw_multi_bf16master_tz_mbf16"
+        }
+        (Theta::Bf16Split, false) => "nsl_fase_fused_adamw_multi_bf16split",
+        (Theta::Bf16Split, true) => "nsl_fase_fused_adamw_multi_bf16split_mbf16",
+        (Theta::Bf16Sr, false) => "nsl_fase_fused_adamw_multi_bf16sr_mp",
+        (Theta::Bf16Sr, true) => "nsl_fase_fused_adamw_multi_bf16sr_mp_mbf16",
+    }
+}
+
+/// The multi-tensor step for a parameter storage (see [`Theta`]) and a
+/// first-moment dtype. [`Theta::F32`] is [`build_fase_adamw_multi`] /
+/// [`build_fase_adamw_multi_mbf16`].
+///
+/// Signatures, after the f32 kernel's (`ttab, mtab, vtab, mptab, ntab`, the
+/// nine scalars and `has_wd`, `bptab, bbtab, mp_scale`):
+///
+/// - `Bf16Master`: `wtab` (f32 masters) after `ttab` (bf16 images);
+/// - `Bf16Split`: `wtab` (u16 low halves) after `ttab` (u16 high halves);
+/// - `Bf16Sr`: `sr_key` (u64) and `ctrtab` (u64 per parameter) after
+///   `has_wd`.
+pub fn build_param_multi(theta: Theta, m_bf16: bool) -> KernelIR {
+    let fm = if m_bf16 {
+        FirstMoment::Bf16
+    } else {
+        FirstMoment::F32
+    };
+    build_multi(multi_name(theta, m_bf16), fm, theta)
+}
+
+/// [`build_param_multi`], lowered to a NUL-terminated PTX module.
+///
+/// # Panics
+///
+/// If the built kernel fails verification: a bug in this module.
+pub fn param_multi_ptx(theta: Theta, m_bf16: bool) -> Vec<u8> {
+    verified_ptx(build_param_multi(theta, m_bf16))
+}
+
+/// The bf16 image of an f32 bit pattern under [`Theta::Bf16Split`]: the top
+/// 16 bits rounded to nearest, a tie (`bits & 0xFFFF == 0x8000`) toward the
+/// truncation, so that [`split_lo`] alone says whether the rounding carried
+/// and [`join_f32`] can undo it. Differs from round-to-nearest-even only at
+/// a tie whose truncation is odd (RNE carries there): 2^-17 of bit patterns.
+/// A NaN maps to the quiet NaN `sign | 0x7FC0` (the SR tail's rule; the
+/// carry trick would turn some NaNs into ±∞ or a zero). Host reference for
+/// the kernels' split, in the runtime's `param_storage` module.
+pub fn split_hi(bits: u32) -> u16 {
+    if bits & 0x7FFF_FFFF > 0x7F80_0000 {
+        return ((bits >> 16) & 0x8000) as u16 | 0x7FC0;
+    }
+    (bits.wrapping_add(0x7FFF) >> 16) as u16
+}
+
+/// The remainder [`split_hi`] leaves: the low 16 bits.
+pub fn split_lo(bits: u32) -> u16 {
+    bits as u16
+}
+
+/// Reassemble [`split_hi`] / [`split_lo`]: the identity on every non-NaN
+/// bit pattern (a NaN comes back a NaN). `lo > 0x8000` is exactly "the
+/// rounding carried", so the truncation is `hi - 1` there.
+pub fn join_f32(hi: u16, lo: u16) -> u32 {
+    let carry = 0x8000u32.wrapping_sub(lo as u32) >> 31;
+    ((hi as u32).wrapping_sub(carry) << 16) | lo as u32
+}
+
+/// `base[i]`, a u16, zero-extended to u32.
+fn load_u16(b: &mut KirBuilder, base: VarId, i: VarId) -> VarId {
+    let addr = b.new_typed_var(u16_ptr());
+    b.emit(KirOp::PtrOffset(addr, base, i));
+    let h = b.new_typed_var(KirType::U16);
+    b.emit(KirOp::Load(h, addr, AddressSpace::Global));
+    let w = b.new_typed_var(KirType::U32);
+    b.emit(KirOp::Cast(w, h, KirType::U32));
+    w
+}
+
+/// [`join_f32`] in KIR: the f32 master from its halves (both `U32`, zero
+/// extended). Branch-free: `carry = (0x8000 - lo) >> 31`.
+fn join_kir(b: &mut KirBuilder, hi: VarId, lo: VarId) -> VarId {
+    let half = int_const(b, KirType::U32, ConstValue::U32(0x8000));
+    let diff = int_op2(b, KirType::U32, KirOp::Sub, half, lo);
+    let carry = u32_imm(b, KirOp::Shr, diff, 31);
+    let trunc = int_op2(b, KirType::U32, KirOp::Sub, hi, carry);
+    let high = u32_imm(b, KirOp::Shl, trunc, 16);
+    let bits = int_op2(b, KirType::U32, KirOp::Or, high, lo);
+    let x = b.new_typed_var(KirType::F32);
+    b.emit(KirOp::Bitcast(x, bits));
+    x
+}
+
+/// [`split_hi`] in KIR, of the `U32` bit pattern `bits`: `(bits + 0x7FFF)
+/// >> 16`, or the quiet NaN for a NaN (a `selp`, no branch).
+fn split_hi_kir(b: &mut KirBuilder, bits: VarId) -> VarId {
+    let carried = u32_imm(b, KirOp::Add, bits, 0x7FFF);
+    let rounded = u32_imm(b, KirOp::Shr, carried, 16);
+    let mag = u32_imm(b, KirOp::And, bits, 0x7FFF_FFFF);
+    let inf = int_const(b, KirType::U32, ConstValue::U32(0x7F80_0000));
+    let nan = b.new_typed_var(KirType::Bool);
+    b.emit(KirOp::Cmp(nan, mag, inf, CmpOp::Gt));
+    let sign = u32_imm(b, KirOp::Shr, bits, 16);
+    let sign = u32_imm(b, KirOp::And, sign, 0x8000);
+    let qnan = u32_imm(b, KirOp::Or, sign, 0x7FC0);
+    let hi = b.new_typed_var(KirType::U32);
+    b.emit(KirOp::Select(hi, nan, qnan, rounded));
+    hi
+}
+
+fn build_multi(name: &str, first_moment: FirstMoment, theta_mode: Theta) -> KernelIR {
     use AddressSpace::Global;
     let mut b = KirBuilder::new(name);
-    let table = || KirType::Ptr(Box::new(f32_ptr()), Global);
+    let table =
+        |elem: KirType| KirType::Ptr(Box::new(KirType::Ptr(Box::new(elem), Global)), Global);
     let u32_ptr = || KirType::Ptr(Box::new(KirType::U32), Global);
-    let ttab = b.add_param("ttab", table(), Global);
-    let mtab = b.add_param("mtab", KirType::Ptr(Box::new(m_ptr(first_moment)), Global), Global);
-    let vtab = b.add_param("vtab", table(), Global);
-    let mptab = b.add_param("mptab", table(), Global);
+    let elem_ptr = |elem: KirType| KirType::Ptr(Box::new(elem), Global);
+    // The f32 kernel's parameters, in its order; the bf16 variants add
+    // `wtab` after `ttab`, or `sr_key, ctrtab` after the scalars.
+    let ttab = b.add_param("ttab", table(theta_mode.param_elem()), Global);
+    let wtab = theta_mode
+        .master_elem()
+        .map(|e| (b.add_param("wtab", table(e.clone()), Global), e));
+    let mtab = b.add_param(
+        "mtab",
+        KirType::Ptr(Box::new(m_ptr(first_moment)), Global),
+        Global,
+    );
+    let vtab = b.add_param("vtab", table(KirType::F32), Global);
+    let mptab = b.add_param("mptab", table(KirType::F32), Global);
     let ntab = b.add_param("ntab", u32_ptr(), Global);
     let s = add_adamw_scalars(&mut b);
+    let sr = (theta_mode == Theta::Bf16Sr).then(|| {
+        (
+            b.add_param("sr_key", KirType::U64, Global),
+            b.add_param("ctrtab", elem_ptr(KirType::U64), Global),
+        )
+    });
     let bptab = b.add_param("bptab", u32_ptr(), Global);
     let bbtab = b.add_param("bbtab", u32_ptr(), Global);
     let mp_scale = b.add_param("mp_scale", KirType::F32, Global);
@@ -332,12 +537,24 @@ fn build_multi(name: &str, first_moment: FirstMoment) -> KernelIR {
     let MultiHeader { param, e32, body, exit } = multi_header(&mut b, bptab, bbtab, ntab);
 
     b.set_block(body);
-    let theta = table_load(&mut b, ttab, param, f32_ptr());
+    let theta = table_load(&mut b, ttab, param, elem_ptr(theta_mode.param_elem()));
+    let master = wtab.map(|(w, e)| table_load(&mut b, w, param, elem_ptr(e)));
     let m = table_load(&mut b, mtab, param, m_ptr(first_moment));
     let v = table_load(&mut b, vtab, param, f32_ptr());
     let mp = table_load(&mut b, mptab, param, f32_ptr());
+    let sr = sr.map(|(key, ctrtab)| (key, table_load(&mut b, ctrtab, param, KirType::U64)));
     let i = widen_u64(&mut b, e32);
-    let th = load_f32(&mut b, theta, i);
+    let th = match (theta_mode, master) {
+        (Theta::F32, _) => load_f32(&mut b, theta, i),
+        (Theta::Bf16Master(_), Some(w)) => load_f32(&mut b, w, i),
+        (Theta::Bf16Split, Some(lo_base)) => {
+            let hi = load_u16(&mut b, theta, i);
+            let lo = load_u16(&mut b, lo_base, i);
+            join_kir(&mut b, hi, lo)
+        }
+        (Theta::Bf16Sr, _) => load_bf16(&mut b, theta, i),
+        (_, None) => unreachable!("a master-carrying variant has wtab"),
+    };
     let mi = load_m(&mut b, m, i, first_moment);
     let vi = load_f32(&mut b, v, i);
     let g_raw = load_f32(&mut b, mp, i);
@@ -357,7 +574,34 @@ fn build_multi(name: &str, first_moment: FirstMoment) -> KernelIR {
 
     b.set_block(scaled);
     let th_next = adamw_update(&mut b, &s, (th, mi, vi, g), m, v, i, first_moment);
-    store_f32(&mut b, theta, i, th_next);
+    match (theta_mode, master) {
+        (Theta::F32, _) => store_f32(&mut b, theta, i, th_next),
+        (Theta::Bf16Master(image), Some(w)) => {
+            store_f32(&mut b, w, i, th_next);
+            match image {
+                Image::Rne => store_bf16_rn(&mut b, theta, i, th_next),
+                Image::HalfTowardTruncation => {
+                    let bits = b.new_typed_var(KirType::U32);
+                    b.emit(KirOp::Bitcast(bits, th_next));
+                    let hi = split_hi_kir(&mut b, bits);
+                    store_u16(&mut b, theta, i, hi);
+                }
+            }
+        }
+        (Theta::Bf16Split, Some(lo_base)) => {
+            let bits = b.new_typed_var(KirType::U32);
+            b.emit(KirOp::Bitcast(bits, th_next));
+            let hi = split_hi_kir(&mut b, bits);
+            store_u16(&mut b, theta, i, hi);
+            // `cvt.u16.u32` keeps the low 16 bits: the remainder.
+            store_u16(&mut b, lo_base, i, bits);
+        }
+        (Theta::Bf16Sr, _) => {
+            let (key, ctr_base) = sr.expect("the SR variant has its key and counters");
+            store_bf16_sr(&mut b, theta, i, th_next, key, ctr_base);
+        }
+        (_, None) => unreachable!("a master-carrying variant has wtab"),
+    }
     // The accumulated gradient is consumed: zero it (was a separate launch).
     let fzero = b.new_typed_var(KirType::F32);
     b.emit(KirOp::Const(fzero, KirConst { ty: KirType::F32, value: ConstValue::F32(0.0) }));
@@ -686,6 +930,67 @@ pub fn sr_bf16_round_probe_ptx() -> Vec<u8> {
     verified_ptx(build_sr_bf16_round_probe())
 }
 
+/// The split-master conversion's entry name.
+pub const PARAM_SPLIT_NAME: &str = "nsl_param_split_f32";
+
+/// `nsl_param_split_f32(src, hi, lo, n)`: `hi[i] = split_hi(src[i])`, `lo[i] =
+/// split_lo(src[i])` over f32 bit patterns. Converts an f32 parameter to the
+/// split storage ([`Theta::Bf16Split`]) at train setup, and writes the
+/// half-toward-truncation image of a test-only master ([`Image`]).
+pub fn build_param_split() -> KernelIR {
+    use AddressSpace::Global;
+    let mut b = KirBuilder::new(PARAM_SPLIT_NAME);
+    let src = b.add_param("src", KirType::Ptr(Box::new(KirType::U32), Global), Global);
+    let hi = b.add_param("hi", u16_ptr(), Global);
+    let lo = b.add_param("lo", u16_ptr(), Global);
+    let n = b.add_param("n", KirType::U64, Global);
+    let (i, _, exit) = index_and_bound(&mut b, n);
+    let bits = table_load(&mut b, src, i, KirType::U32);
+    let h = split_hi_kir(&mut b, bits);
+    store_u16(&mut b, hi, i, h);
+    store_u16(&mut b, lo, i, bits);
+    finish(b, exit)
+}
+
+/// [`build_param_split`], lowered to a NUL-terminated PTX module.
+///
+/// # Panics
+///
+/// If the built kernel fails verification: a bug in this module.
+pub fn param_split_ptx() -> Vec<u8> {
+    verified_ptx(build_param_split())
+}
+
+/// The split-master reassembly's entry name.
+pub const PARAM_JOIN_NAME: &str = "nsl_param_join_f32";
+
+/// `nsl_param_join_f32(hi, lo, dst, n)`: `dst[i] = join_f32(hi[i], lo[i])`, the
+/// exact f32 master of a split parameter: what teardown widens it back to,
+/// what a checkpoint saves, and what an f32 GEMM of it reads.
+pub fn build_param_join() -> KernelIR {
+    use AddressSpace::Global;
+    let mut b = KirBuilder::new(PARAM_JOIN_NAME);
+    let hi = b.add_param("hi", u16_ptr(), Global);
+    let lo = b.add_param("lo", u16_ptr(), Global);
+    let dst = b.add_param("dst", f32_ptr(), Global);
+    let n = b.add_param("n", KirType::U64, Global);
+    let (i, _, exit) = index_and_bound(&mut b, n);
+    let h = load_u16(&mut b, hi, i);
+    let l = load_u16(&mut b, lo, i);
+    let x = join_kir(&mut b, h, l);
+    store_f32(&mut b, dst, i, x);
+    finish(b, exit)
+}
+
+/// [`build_param_join`], lowered to a NUL-terminated PTX module.
+///
+/// # Panics
+///
+/// If the built kernel fails verification: a bug in this module.
+pub fn param_join_ptx() -> Vec<u8> {
+    verified_ptx(build_param_join())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -773,5 +1078,170 @@ mod tests {
         assert_eq!(ptx.matches("add.rn.f32").count(), 5, "{ptx}");
         assert!(!ptx.contains("fma") && !ptx.contains("div.rn"), "{ptx}");
         assert!(!ptx.contains("%ntid"), "the element is bbtab[b] + tid: {ptx}");
+    }
+
+    /// The f32 members of the family are today's kernels: the same names,
+    /// and (pinned byte for byte by `tests/f32_ptx_golden.rs`) the same PTX.
+    #[test]
+    fn the_family_s_f32_members_are_today_s_kernels() {
+        assert_eq!(multi_name(Theta::F32, false), FASE_ADAMW_MULTI_NAME);
+        assert_eq!(multi_name(Theta::F32, true), FASE_ADAMW_MULTI_MBF16_NAME);
+        assert_eq!(param_multi_ptx(Theta::F32, false), fase_adamw_multi_ptx());
+        assert_eq!(
+            param_multi_ptx(Theta::F32, true),
+            fase_adamw_multi_mbf16_ptx()
+        );
+    }
+
+    /// Every bf16-parameter variant verifies, has a distinct name, keeps the
+    /// f32 kernel's arithmetic (the same rounding instructions, counted), the
+    /// clip fold and the gradient zeroing, and stores θ as 16-bit words.
+    #[test]
+    fn every_bf16_parameter_kernel_keeps_the_f32_update_the_clip_fold_and_the_zeroing() {
+        let f = String::from_utf8(fase_adamw_multi_ptx()).unwrap();
+        let mut names = std::collections::HashSet::new();
+        for theta in Theta::BF16 {
+            for m_bf16 in [false, true] {
+                let ir = build_param_multi(theta, m_bf16);
+                crate::kir_verify::verify(&ir)
+                    .unwrap_or_else(|e| panic!("{theta:?}/{m_bf16}: {e:?}"));
+                assert!(names.insert(ir.name.clone()), "duplicate name {}", ir.name);
+                let p = String::from_utf8(param_multi_ptx(theta, m_bf16)).unwrap();
+                assert!(
+                    p.contains(&format!(".visible .entry {}(", multi_name(theta, m_bf16))),
+                    "{p}"
+                );
+                for op in ["mul.rn.f32", "add.rn.f32", "div.approx.f32", "sqrt.rn.f32"] {
+                    assert_eq!(
+                        p.matches(op).count(),
+                        f.matches(op).count(),
+                        "{theta:?}/{m_bf16} {op}: {p}"
+                    );
+                }
+                assert!(
+                    !p.contains("fma") && !p.contains("div.rn") && !p.contains("%ntid"),
+                    "{p}"
+                );
+                // The gradient is zeroed: one f32 store of zero after θ'.
+                assert!(p.contains("mp_scale"), "{p}");
+                let st16 =
+                    p.matches("st.global.u16 ").count() + p.matches("st.global.b16 ").count();
+                let want16 = match theta {
+                    Theta::Bf16Split => 2,
+                    _ => 1,
+                } + usize::from(m_bf16);
+                assert_eq!(st16, want16, "{theta:?}/{m_bf16}: 16-bit stores: {p}");
+                let st32 = p.matches("st.global.f32 ").count();
+                // v and the zeroed mp, m when f32, and the f32 master in master mode.
+                let want32 =
+                    2 + usize::from(!m_bf16) + usize::from(matches!(theta, Theta::Bf16Master(_)));
+                assert_eq!(st32, want32, "{theta:?}/{m_bf16}: f32 stores: {p}");
+            }
+        }
+        let sr = String::from_utf8(param_multi_ptx(Theta::Bf16Sr, false)).unwrap();
+        for c in [SR_SPLITMIX_GAMMA, SR_SPLITMIX_M1, SR_SPLITMIX_M2] {
+            assert_eq!(sr.matches(&format!(", {c};")).count(), 1, "{c:#x}");
+        }
+        let master =
+            String::from_utf8(param_multi_ptx(Theta::Bf16Master(Image::Rne), false)).unwrap();
+        assert_eq!(
+            master.matches("cvt.rn.bf16.f32").count(),
+            1,
+            "the image is RNE of the master: {master}"
+        );
+        for theta in [
+            Theta::Bf16Split,
+            Theta::Bf16Master(Image::HalfTowardTruncation),
+        ] {
+            let p = String::from_utf8(param_multi_ptx(theta, false)).unwrap();
+            assert!(
+                !p.contains("cvt.rn.bf16.f32") && p.contains("selp.b32"),
+                "{theta:?}: {p}"
+            );
+        }
+    }
+
+    /// The host split is exact: `join(split(x)) == x` for every non-NaN f32
+    /// bit pattern, the image equals round-to-nearest-even except at a tie
+    /// with an odd truncation, and a NaN stays a NaN. Every high half
+    /// against the low halves that decide the carry, and every low half
+    /// against high halves of every class (the exhaustive 2^32 sweep is
+    /// `split_round_trips_every_bit_pattern`, ignored for its debug-build
+    /// time).
+    #[test]
+    fn the_split_round_trips_and_differs_from_rne_only_at_odd_ties() {
+        // Round to nearest even on the bit pattern (finite and infinite
+        // values; NaN returns before it is used): the textbook form, not the
+        // split's, so a slip in either shows.
+        let rne =
+            |bits: u32| -> u16 { (bits.wrapping_add(0x7FFF + ((bits >> 16) & 1)) >> 16) as u16 };
+        let mut check = |bits: u32| {
+            let (hi, lo) = (split_hi(bits), split_lo(bits));
+            let x = f32::from_bits(bits);
+            if x.is_nan() {
+                assert!(
+                    f32::from_bits(join_f32(hi, lo)).is_nan()
+                        && f32::from_bits((hi as u32) << 16).is_nan(),
+                    "{bits:#010x}"
+                );
+                return;
+            }
+            assert_eq!(join_f32(hi, lo), bits, "round trip {bits:#010x}");
+            let odd_tie = bits & 0xFFFF == 0x8000 && bits & 0x1_0000 != 0;
+            assert_eq!(
+                hi == rne(bits),
+                !odd_tie,
+                "{bits:#010x}: hi {hi:#06x} rne {:#06x}",
+                rne(bits)
+            );
+            if odd_tie {
+                assert_eq!(hi as u32, bits >> 16, "an odd tie keeps the truncation");
+            }
+        };
+        let lows = [
+            0u32, 1, 0x7FFF, 0x8000, 0x8001, 0xFFFE, 0xFFFF, 0x1234, 0xC000,
+        ];
+        for top in 0..=0xFFFFu32 {
+            for &l in &lows {
+                check((top << 16) | l);
+            }
+        }
+        let tops = [
+            0u32, 1, 0x8000, 0x8001, 0x3F80, 0xBF81, 0x7F7F, 0xFF7F, 0x7F80, 0xFF80, 0x7F81,
+            0xFFFF, 0x7FFF, 0x0080,
+        ];
+        for &t in &tops {
+            for l in 0..=0xFFFFu32 {
+                check((t << 16) | l);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic: exhaustive 2^32 sweep of the split round trip (a minute in debug; run --ignored --release)"]
+    fn split_round_trips_every_bit_pattern() {
+        for bits in 0..=u32::MAX {
+            let (hi, lo) = (split_hi(bits), split_lo(bits));
+            if f32::from_bits(bits).is_nan() {
+                assert!(f32::from_bits(join_f32(hi, lo)).is_nan());
+            } else {
+                assert_eq!(join_f32(hi, lo), bits, "{bits:#010x}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_split_and_join_kernels_verify() {
+        for (ir, name) in [
+            (build_param_split(), PARAM_SPLIT_NAME),
+            (build_param_join(), PARAM_JOIN_NAME),
+        ] {
+            crate::kir_verify::verify(&ir).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            assert_eq!(ir.name, name);
+        }
+        let s = String::from_utf8(param_split_ptx()).unwrap();
+        assert_eq!(s.matches("st.global.u16 ").count(), 2, "{s}");
+        let j = String::from_utf8(param_join_ptx()).unwrap();
+        assert_eq!(j.matches("ld.global.u16 ").count(), 2, "{j}");
     }
 }

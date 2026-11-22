@@ -162,6 +162,16 @@ impl Compiler<'_> {
                      there. Drop one",
                 ));
             }
+            // `param_dtype=` is refused for @pipeline programs at the
+            // program pre-scan (`resolve_program_precision`), before `main`
+            // declares the storage; this is the path-local backstop.
+            if let Some(pd) = self.param_storage {
+                return Err(CodegenError::new(format!(
+                    "param_dtype=\"{}\" is not supported on the pipelined train path (@pipeline): the \
+                     parameter storage plan is not lowered there. Drop one",
+                    pd.as_str()
+                )));
+            }
             // P5 item 19: the pipelined path lowers its stages outside the
             // region-marker emission — the flag would silently train eager
             // while the user believes graphs are active.
@@ -382,6 +392,7 @@ impl Compiler<'_> {
         // `precision="bf16"`: the storage plan is keyed by this block's
         // VarIds, like the placements above.
         self.storage_out.clear();
+        self.storage_param_gemm.clear();
         // Item 17 phase 3a: the packing-metadata variables belong to the
         // train-step function this block just built — a later function
         // (another train block, a grad block, a model method) using them
@@ -439,6 +450,7 @@ impl Compiler<'_> {
             checkpoint_load_path,
             schedule_in_optimizer_steps,
             precision_bf16,
+            param_dtype,
         } = self.extract_train_config(builder, train)?;
 
         // ── 2. Resolve the optimizer/scheduler/callbacks contract ───────
@@ -474,6 +486,31 @@ impl Compiler<'_> {
             grad_clip,
             purpose,
         )?;
+
+        // `param_dtype=`: inside the block the selected weight matrices are
+        // bf16 tensors (their f32 values live in optimizer state), and a
+        // callback runs inside the block, so a callback that references the
+        // model anywhere is refused here (`callback_references_model`: by
+        // name, by a model-typed alias, `model_save` of the model allowed). A
+        // tensor alias of one parameter bound before the block is invisible
+        // to that scan; at run time a host read of it stops the run (the
+        // download and `.item()` backstops) and an f32-only device kernel
+        // refuses its dtype (gated by
+        // `a_host_read_of_a_stored_weight_through_an_alias_stops_the_run_gpu`).
+        if let Some(pd) = param_dtype {
+            for cb in &callbacks {
+                if let Some(path) = self.callback_model_access(&cb.body, model_sym) {
+                    return Err(CodegenError::new(format!(
+                        "param_dtype=\"{}\": callback `{}` reads the model (`{path}`), whose weight matrices are \
+                         stored bf16 inside the train block (their f32 values are in optimizer state until the \
+                         block ends). Read the model after the train block (use checkpoint_save=/checkpoint_every= \
+                         to save during training), or drop param_dtype=",
+                        pd.as_str(),
+                        self.resolve_sym(cb.name),
+                    )));
+                }
+            }
+        }
 
         // ── Item 7 (`--fuse-wgrad-accum`) admission ─────────────────────
         // Moved to `stmt_admission.rs` byte-for-byte (roadmap A1); this
@@ -1785,14 +1822,38 @@ impl Compiler<'_> {
                 // the fused weight-gradient chains fixed) and before the
                 // memory planner reads them. Installed on the compiler for
                 // the lowering; a no-op for an f32 step.
-                self.plan_activation_storage(
+                let stored_params = self.plan_activation_storage(
                     crate::stmt_train::storage_plan::StoragePlanInputs {
                         adjoint: &adjoint,
                         ccr_plan: &ccr_plan,
                         effective_primal: &effective_primal,
                         precision_bf16,
+                        param_dtype,
+                        param_paths: &param_paths,
                     },
                 )?;
+                // `param_dtype=`: store the selected parameters bf16 before
+                // this micro-step's forward reads them. Every micro-step, and
+                // idempotent: the first call converts (after the optimizer
+                // state was allocated from the f32 parameters, and after a
+                // resume loaded their f32 values), later ones find them
+                // stored. The plan, which picks them, exists only here.
+                if let (Some(pd), false) = (param_dtype, stored_params.is_empty()) {
+                    let code = crate::stmt_train::config::param_storage_wire(pd)
+                        .expect("an admitted param_dtype is not f32");
+                    let idx_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+                    for &i in &stored_params {
+                        let iv = builder.ins().iconst(cl_types::I64, i as i64);
+                        self.compile_call_by_name(builder, "nsl_list_push", &[idx_list, iv])?;
+                    }
+                    let mode = builder.ins().iconst(cl_types::I64, code);
+                    self.compile_call_by_name(
+                        builder,
+                        "nsl_param_store_bf16",
+                        &[param_list, idx_list, mode],
+                    )?;
+                    self.compile_call_by_name(builder, "nsl_list_free", &[idx_list])?;
+                }
 
                 // 6d.5 P0.2 gradient-integrity guard: compute the LIVE adjoint
                 // result-VarId set over the FINAL adjoint (post dead-grad
@@ -2814,6 +2875,14 @@ impl Compiler<'_> {
         // A run that ends inside an accumulation window steps once more on
         // the micro-batches that window holds (stmt_train/optimizer_step.rs).
         self.emit_trailing_window_flush(builder, state, &plan, &emit)?;
+
+        // `param_dtype=`: the stored parameters go back to f32 (the master,
+        // or the split reassembled) after the last optimizer step, so code
+        // after the block (validation, `model_save`) sees the f32 tensors it
+        // always did.
+        if param_dtype.is_some() {
+            self.compile_call_by_name(builder, "nsl_param_store_f32", &[param_list])?;
+        }
 
         // Free the block's lists, sweep the trailing CSLA window, restore
         // streamed weights, print the graphs banner (stmt_train/teardown.rs).

@@ -552,3 +552,106 @@ fn srbf16_parameter_surface_is_accounted_as_weights_gpu() {
         r.stderr
     );
 }
+
+/// The train-header rewrite that adds a full-state checkpoint (`save`) or a
+/// resume from one (`load`) to the fixture.
+fn with_train_checkpoint(src: &str, ck: &Path, load: bool) -> String {
+    let ck = ck.display().to_string().replace('\\', "/");
+    let cfg = if load {
+        format!("grad_accumulation=2, checkpoint_load=\"{ck}\")")
+    } else {
+        format!("grad_accumulation=2, checkpoint_save=\"{ck}\", checkpoint_every=2)")
+    };
+    let out = src.replace("grad_accumulation=2)", &cfg);
+    assert_ne!(
+        out, src,
+        "fixture train header changed: the checkpoint rewrite matched nothing"
+    );
+    out
+}
+
+/// The CSLA mode's checkpoints save the f32 working view, so their `.nslm`
+/// looks like an f32 run's and only the execution fingerprint can tell the
+/// two apart. A resume across `--param-dtype bf16-sr` changes every streamed
+/// parameter's arithmetic: it must refuse in both directions, naming the
+/// `pdt` key, while a resume with the saved flags continues (so the refusal
+/// is the fingerprint's and not some other failure of the resume).
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn srbf16_resume_across_the_param_dtype_is_refused_gpu() {
+    let tmp = std::env::temp_dir().join(format!("nsl_srbf16_pdt_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    // The same residency schedule on both sides, so `pdt` is the only
+    // arithmetic key that differs.
+    let sr: Vec<&str> = FULL_FLAGS.to_vec();
+    let plain: Vec<&str> = FULL_FLAGS
+        .iter()
+        .copied()
+        .filter(|f| *f != "--param-dtype" && *f != "bf16-sr")
+        .collect();
+    assert_eq!(plain.len() + 2, sr.len());
+
+    for (tag, save_flags, load_flags) in [("sr_to_f32", &sr, &plain), ("f32_to_sr", &plain, &sr)] {
+        let ck = tmp.join(format!("{tag}.nslm"));
+        let saved = run_nsl(
+            &with_train_checkpoint(
+                &program(&tmp.join(format!("{tag}_a.nslm")), true),
+                &ck,
+                false,
+            ),
+            &format!("pdt_save_{tag}"),
+            save_flags,
+            600,
+        );
+        assert!(
+            saved.success,
+            "{tag}: the saving run failed:\n{}",
+            saved.stderr
+        );
+        assert!(ck.exists(), "{tag}: no checkpoint at {}", ck.display());
+        let optim = std::fs::read(tmp.join(format!("{tag}.nslm.optim"))).expect("sidecar");
+        let head = String::from_utf8_lossy(&optim[..optim.len().min(8192)]).into_owned();
+        assert_eq!(
+            head.contains("pdt=bf16sr-ws"),
+            save_flags.contains(&"bf16-sr"),
+            "{tag}: the sidecar's fingerprint must record pdt exactly for a bf16-sr build:\n{head}"
+        );
+
+        let same = run_nsl(
+            &with_train_checkpoint(
+                &program(&tmp.join(format!("{tag}_b.nslm")), true),
+                &ck,
+                true,
+            ),
+            &format!("pdt_same_{tag}"),
+            save_flags,
+            600,
+        );
+        assert!(
+            same.success,
+            "{tag}: resuming with the saved flags failed:\n{}",
+            same.stderr
+        );
+
+        let across = run_nsl(
+            &with_train_checkpoint(
+                &program(&tmp.join(format!("{tag}_c.nslm")), true),
+                &ck,
+                true,
+            ),
+            &format!("pdt_load_{tag}"),
+            load_flags,
+            600,
+        );
+        assert!(
+            !across.success,
+            "{tag}: a resume across --param-dtype bf16-sr ran:\n{}",
+            across.stdout
+        );
+        assert!(
+            across.stderr.contains("ARITHMETIC differs") && across.stderr.contains("pdt:"),
+            "{tag}: the refusal must be the fingerprint's and name pdt:\n{}",
+            across.stderr
+        );
+    }
+}

@@ -1041,6 +1041,15 @@ pub static REGISTRY: &[EnvVar] = &[
         "Test harness only: marks the re-exec'd child that drives the ONNX block-packed-dtype refusal, so the parent can assert its exit code."
     ),
     var!(
+        "NSL_PARAM_DTYPE_TEST_MODES",
+        Bool,
+        "1 only (exact match)",
+        "off",
+        Test,
+        Compile,
+        "Test hook: admits param_dtype=\"bf16-master\"/\"bf16-master-tz\" (the f32 master kept whole) to check bf16 parameter plumbing."
+    ),
+    var!(
         "NSL_PARAM_PLAN_FAULT",
         Int,
         "integer parameter index (trimmed i64); unparsable = off",
@@ -1057,6 +1066,24 @@ pub static REGISTRY: &[EnvVar] = &[
         Diagnostic,
         Compile,
         "Prints the per-parameter placement plan (weight-stream/ZeRO/bf16-sr classes) derived under --layerwise-accum to stderr."
+    ),
+    var!(
+        "NSL_PARAM_STORAGE_ITEM_CHILD",
+        Bool,
+        "present (any value)",
+        "unset (child test body returns immediately)",
+        Test,
+        Test,
+        "Test harness only: marks the re-exec'd child that calls .item() on a stored bf16 GPU parameter, which must stop the run."
+    ),
+    var!(
+        "NSL_PARAM_STORAGE_TIED_CHILD",
+        Bool,
+        "present (any value)",
+        "unset (child test body returns immediately)",
+        Test,
+        Test,
+        "Test harness only: marks the re-exec'd child that stores a parameter tied to another, which must be refused with what to do."
     ),
     var!(
         "NSL_PARTIAL_BCAST_CHILD",

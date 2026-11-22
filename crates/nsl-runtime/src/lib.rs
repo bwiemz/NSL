@@ -218,6 +218,8 @@ pub extern "C" fn nsl_muon_step_batch(
 pub mod muon_prof;
 
 pub mod sr_bf16;
+// bf16 parameter storage on the normal schedule (`param_dtype=`).
+pub mod param_storage;
 pub mod rope;
 pub mod storage_dt;
 pub mod csla_stat;

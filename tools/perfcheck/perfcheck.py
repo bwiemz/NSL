@@ -145,6 +145,11 @@ BF16_BANNER = "cuBLAS math mode: BF16"
 ACT_BF16_BANNER = "activation storage: bf16"
 # The train-header text of a bf16 activation-storage arm (`nsl_bf16s`).
 PRECISION_BF16 = ', precision="bf16"'
+# bf16 parameter storage on top of it (`nsl_bf16split`; `nsl_bf16master` is the
+# test-only mode that keeps the f32 master whole, built with its switch).
+PARAM_SPLIT = PRECISION_BF16 + ', param_dtype="bf16-split"'
+PARAM_MASTER = PRECISION_BF16 + ', param_dtype="bf16-master"'
+PARAM_BANNER = "parameter storage: "
 TF32_BANNER = "cuBLAS math mode: TF32"
 OOM_MARKERS = ("CUDA_ERROR_OUT_OF_MEMORY", "VRAM free", "out of memory", "OutOfMemory")
 
@@ -273,6 +278,24 @@ NO_DRAIN = (("NSL_SKIP_GPU_DRAIN", "1"),)
 OLD_ATTN = (("NSL_TC_ATTENTION", "0"),)
 
 
+def param_banner(train_args: str) -> str | None:
+    """The parameter-storage banner a `param_dtype=` arm's runtime must print."""
+    m = re.search(r'param_dtype="([a-z0-9-]+)"', train_args)
+    return None if m is None else PARAM_BANNER + m.group(1)
+
+
+def params_converted(err: str, mode: str) -> int:
+    """How many parameters the run converted to `mode` storage, from the runtime's
+    `[param-storage] N parameters stored <mode>` line (0 when there is none). The
+    banner alone is printed by `main` from the declaration, before any parameter is
+    stored, so an arm that declared the storage and converted nothing would pass on
+    the banner."""
+    m = re.search(
+        r"\[param-storage\] (\d+) parameters stored " + re.escape(mode) + r"(?![a-z0-9-])", err
+    )
+    return 0 if m is None else int(m.group(1))
+
+
 def arm(name: str) -> Arm:
     """An arm by name. `<nsl arm>@<variant>` is the same arm built by the toolchain
     registered as `--toolchain <variant>=DIR`, so two compilers can be timed in the
@@ -287,6 +310,15 @@ def arm(name: str) -> Arm:
         "nsl_tf32": Arm(name, "nsl", "tf32", tuple(PROD_FLAGS)),
         "nsl_bf16": Arm(name, "nsl", "bf16", tuple(PROD_FLAGS), BF16),
         "nsl_bf16s": Arm(name, "nsl", "bf16", tuple(PROD_FLAGS), train_args=PRECISION_BF16),
+        "nsl_bf16split": Arm(name, "nsl", "bf16", tuple(PROD_FLAGS), train_args=PARAM_SPLIT),
+        "nsl_bf16master": Arm(
+            name,
+            "nsl",
+            "bf16",
+            tuple(PROD_FLAGS),
+            (("NSL_PARAM_DTYPE_TEST_MODES", "1"),),
+            train_args=PARAM_MASTER,
+        ),
         "nsl_tf32_nodrain": Arm(name, "nsl", "tf32", tuple(PROD_FLAGS), (), NO_DRAIN),
         "nsl_bf16_nodrain": Arm(name, "nsl", "bf16", tuple(PROD_FLAGS), BF16, NO_DRAIN),
         "nsl_tf32_oldattn": Arm(name, "nsl", "tf32", tuple(PROD_FLAGS), (), OLD_ATTN),
@@ -703,14 +735,28 @@ def run_nsl_arm(
     if a.precision == "bf16" and BF16_BANNER not in err:
         row["status"] = "error"
         row["error"] = "bf16 arm: the runtime did not print its BF16 math-mode banner"
-    elif a.train_args == PRECISION_BF16 and ACT_BF16_BANNER not in err:
+    elif a.train_args.startswith(PRECISION_BF16) and ACT_BF16_BANNER not in err:
         row["status"] = "error"
         row["error"] = (
             'precision="bf16" arm: the runtime did not print its activation-storage banner'
         )
-    elif a.train_args != PRECISION_BF16 and ACT_BF16_BANNER in err:
+    elif not a.train_args.startswith(PRECISION_BF16) and ACT_BF16_BANNER in err:
         row["status"] = "error"
         row["error"] = "an f32-storage arm printed the bf16 activation-storage banner"
+    elif (want := param_banner(a.train_args)) is not None and want not in err:
+        row["status"] = "error"
+        row["error"] = f"param_dtype arm: the runtime did not print `{want}`"
+    elif (want := param_banner(a.train_args)) is not None and params_converted(
+        err, want[len(PARAM_BANNER) :]
+    ) == 0:
+        row["status"] = "error"
+        row["error"] = (
+            "param_dtype arm: no parameter was stored (no `[param-storage] N parameters "
+            "stored` line): the banner says what main declared, not what the step did"
+        )
+    elif param_banner(a.train_args) is None and PARAM_BANNER in err:
+        row["status"] = "error"
+        row["error"] = "an f32-parameter arm printed the parameter-storage banner"
     elif a.precision == "tf32" and TF32_BANNER not in err:
         row["status"] = "error"
         row["error"] = "tf32 arm: the runtime did not print its TF32 math-mode banner"
@@ -1123,7 +1169,7 @@ def phase_split(r: dict[str, Any]) -> dict[str, float] | None:
 
 REPORT_ORDER = [
     "nsl_tf32", "nsl_tf32_nodrain", "nsl_tf32_blocks", "nsl_tf32_compress",
-    "nsl_bf16", "nsl_bf16s", "nsl_bf16_nodrain", "nsl_bf16_blocks", "nsl_bf16_compress",
+    "nsl_bf16", "nsl_bf16s", "nsl_bf16split", "nsl_bf16master", "nsl_bf16_nodrain", "nsl_bf16_blocks", "nsl_bf16_compress",
     "torch_tf32_eager_sel", "torch_tf32_eager_blocks", "torch_tf32_eager_none",
     "torch_bf16_eager_sel", "torch_bf16_eager_blocks", "torch_bf16_eager_none",
     "torch_bf16_compile_sel", "torch_bf16_compile_blocks", "torch_bf16_compile_none",
@@ -1212,6 +1258,8 @@ PAIRS = [
     ("torch_bf16_compile_sel", "nsl_tf32"),
     ("nsl_bf16", "nsl_tf32"),
     ("nsl_bf16s", "nsl_bf16"),
+    ("nsl_bf16split", "nsl_bf16s"),
+    ("nsl_bf16master", "nsl_bf16s"),
     ("torch_bf16_eager_sel", "torch_tf32_eager_sel"),
     ("torch_bf16_compile_sel", "torch_bf16_eager_sel"),
     ("nsl_tf32", "nsl_tf32_blocks"),

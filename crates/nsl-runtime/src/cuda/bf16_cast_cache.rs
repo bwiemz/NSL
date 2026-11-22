@@ -176,6 +176,16 @@ pub(crate) fn note_param_stepped(data: u64, elems: usize) {
     if data == 0 || elems == 0 || !enabled() {
         return;
     }
+    // bf16 parameter storage (`param_dtype=`): a stored parameter IS its bf16
+    // image. Registered as an f32 parameter, its buffer would claim twice its
+    // bytes, and `acquire_sub` could serve whatever follows it as an image.
+    // The callers gate on f32; this is the backstop.
+    if crate::param_storage::is_stored_data(data) {
+        crate::fatal::die(
+            crate::fatal::Fatal::UnsupportedDtype,
+            "bf16 cast cache: a bf16-stored parameter (param_dtype=) was noted as a stepped f32 parameter",
+        );
+    }
     if super::cublas_inner::resolved_math_mode() != super::cublas_inner::CublasMathMode::Bf16 {
         return;
     }

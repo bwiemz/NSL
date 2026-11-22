@@ -79,6 +79,11 @@ pub struct StoragePlan {
     pub slices: usize,
     /// Attention halves admitted (step 5).
     pub attention: usize,
+    /// `param_dtype=`: the GEMMs planned only because they read a
+    /// bf16-stored parameter (their other operand is an f32 value): lowered
+    /// through `nsl_tensor_matmul_pdt`, which keeps the eager bf16 matmul
+    /// mode's per-shape choice of bf16 or f32 operands.
+    pub param_gemm: HashSet<VarId>,
 }
 
 /// One admitted SwiGLU slice (primal VarIds).
@@ -343,11 +348,83 @@ fn find_attention_seeds(primal: &WengertList) -> (Vec<VarId>, Vec<VarId>) {
     (seeds, norms)
 }
 
+/// `param_dtype=`: the parameters a step stores bf16. A `Param` of the step
+/// qualifies when `index_of` maps its name to a position of the train
+/// block's parameter list (it is trained, so the fused AdamW step updates
+/// it) and every reader of it, looking through views (not copies), is a GEMM
+/// or reads only its shape (`shape`, the shape operand of
+/// `reduce_to_shape`). Those are the readers that already see a bf16 copy
+/// of it under `precision="bf16"`: every storage GEMM reads its operands
+/// bf16, and the eager bf16 matmul mode its parameter operand. Anything
+/// else (an embedding gather, a norm, the fused LM head) keeps the
+/// parameter f32. Returns `(VarId, list index)` pairs, every `Param` op of a
+/// qualifying parameter (in either list) included, ordered by VarId.
+pub fn select_bf16_params(
+    primal: &WengertList,
+    adjoint: &WengertList,
+    index_of: &dyn Fn(&str) -> Option<usize>,
+) -> Vec<(VarId, usize)> {
+    let mut rd = readers(primal);
+    for (k, v) in readers(adjoint) {
+        rd.entry(k).or_default().extend(v);
+    }
+    let only_gemms = |v: VarId| -> bool {
+        let mut stack = vec![v];
+        let mut seen = HashSet::new();
+        let mut gemm = false;
+        while let Some(x) = stack.pop() {
+            if !seen.insert(x) {
+                continue;
+            }
+            for r in rd.get(&x).map(Vec::as_slice).unwrap_or_default() {
+                match &r.op {
+                    PrimalOp::Matmul => gemm = true,
+                    // Views keep the parameter's data pointer, which is how
+                    // the runtime finds its exact f32 master
+                    // (`param_storage::exact_f32`); a `contiguous` copy
+                    // would not, so it disqualifies.
+                    o if is_dtype_preserving(o)
+                        && !is_passthrough(o, "contiguous")
+                        && r.inputs.first() == Some(&x) =>
+                    {
+                        stack.push(r.result)
+                    }
+                    PrimalOp::Passthrough(n) if n == "shape" => {}
+                    PrimalOp::Passthrough(n)
+                        if n == "reduce_to_shape" && r.inputs.first() != Some(&x) => {}
+                    _ => return false,
+                }
+            }
+        }
+        gemm
+    };
+    // Every Param op of a name: a parameter is one storage however many
+    // loads of it the lists hold, so it qualifies only if all of them do.
+    let mut by_name: HashMap<&str, Vec<VarId>> = HashMap::new();
+    for op in primal.ops.iter().chain(adjoint.ops.iter()) {
+        if let PrimalOp::Param(name) = &op.op {
+            by_name.entry(name.as_str()).or_default().push(op.result);
+        }
+    }
+    let mut out: Vec<(VarId, usize)> = by_name
+        .into_iter()
+        .filter_map(|(name, vids)| Some((index_of(name)?, vids)))
+        .filter(|(_, vids)| vids.iter().all(|&v| only_gemms(v)))
+        .flat_map(|(idx, vids)| vids.into_iter().map(move |v| (v, idx)))
+        .collect();
+    out.sort_unstable();
+    out
+}
+
 struct Planner<'a> {
     plan: StoragePlan,
     /// Norm outputs (and their clones): stored bf16, but their gradient is
     /// f32 (summed from several GEMMs, read by the f32 norm backward).
     norm_out: HashSet<VarId>,
+    /// `param_dtype=`: the bf16-stored parameters and their views. A
+    /// parameter's gradient is f32 (it is accumulated in f32 and read by the
+    /// optimizer), whatever rule 6 says for values.
+    param_view: HashSet<VarId>,
     clones: &'a HashMap<VarId, VarId>,
 }
 
@@ -356,9 +433,12 @@ impl Planner<'_> {
         self.plan.bf16.contains(&v)
     }
 
-    /// Rule 6: a gradient is stored as its value is, except a norm output's.
+    /// Rule 6: a gradient is stored as its value is, except a norm output's
+    /// and a parameter's.
     fn grad_is_bf16(&self, target: VarId) -> bool {
-        self.is_bf16(target) && !self.norm_out.contains(&target)
+        self.is_bf16(target)
+            && !self.norm_out.contains(&target)
+            && !self.param_view.contains(&target)
     }
 
     fn set(&mut self, op: &WengertOp, st: Storage) {
@@ -405,6 +485,9 @@ impl Planner<'_> {
             }
             if self.plan.out.get(&orig) == Some(&Storage::F32) && has_dt_lowering(&op.op) {
                 self.set(op, Storage::F32);
+                if self.plan.param_gemm.contains(&orig) {
+                    self.plan.param_gemm.insert(op.result);
+                }
                 return Ok(());
             }
             // A view or copy clone: the general rules below, then checked.
@@ -435,6 +518,13 @@ impl Planner<'_> {
             o if is_dtype_preserving(o) => {
                 if op.inputs.first().is_some_and(|&i| self.is_bf16(i)) {
                     self.plan.bf16.insert(op.result);
+                }
+                if op
+                    .inputs
+                    .first()
+                    .is_some_and(|i| self.param_view.contains(i))
+                {
+                    self.param_view.insert(op.result);
                 }
                 Ok(())
             }
@@ -469,6 +559,16 @@ impl Planner<'_> {
                 if in_adjoint && target().is_some_and(|t| self.grad_is_bf16(t)) {
                     self.set(op, Storage::Bf16);
                 } else if reads_bf16 {
+                    // Every bf16 operand a stored parameter: without
+                    // `param_dtype` this GEMM would read f32 operands and take
+                    // the eager bf16 mode, whose per-shape rule it keeps.
+                    if op
+                        .inputs
+                        .iter()
+                        .all(|i| !self.is_bf16(*i) || self.param_view.contains(i))
+                    {
+                        self.plan.param_gemm.insert(op.result);
+                    }
                     self.set(op, Storage::F32);
                 }
                 Ok(())
@@ -504,14 +604,30 @@ impl Planner<'_> {
 
 /// Plan the step's storage. `clones` maps each CCR recompute clone in
 /// `adjoint` to the primal value it recomputes (empty without CCR).
+#[cfg(test)]
 pub fn plan(primal: &WengertList, adjoint: &WengertList, clones: &HashMap<VarId, VarId>) -> Result<StoragePlan, String> {
+    plan_with_params(primal, adjoint, clones, &HashSet::new())
+}
+
+/// [`plan`] with `params` (the `Param` VarIds of [`select_bf16_params`])
+/// stored bf16: they and their views are bf16 values, their gradients f32,
+/// and a GEMM whose only bf16 operand is one of them is in
+/// [`StoragePlan::param_gemm`].
+pub fn plan_with_params(
+    primal: &WengertList,
+    adjoint: &WengertList,
+    clones: &HashMap<VarId, VarId>,
+    params: &HashSet<VarId>,
+) -> Result<StoragePlan, String> {
     let slices = find_slices(primal);
     let (attn_seeds, attn_norms) = find_attention_seeds(primal);
     let mut pl = Planner {
         plan: StoragePlan { slices: slices.len(), attention: attn_norms.len(), ..Default::default() },
         norm_out: HashSet::new(),
+        param_view: params.clone(),
         clones,
     };
+    pl.plan.bf16.extend(params.iter().copied());
     let prod = producers(primal);
     for sl in &slices {
         for v in [sl.n, sl.a, sl.s, sl.u, sl.p] {
@@ -547,19 +663,53 @@ pub(crate) struct StoragePlanInputs<'a> {
     pub(crate) effective_primal: &'a WengertList,
     /// The train block's `precision=` resolved to bf16.
     pub(crate) precision_bf16: bool,
+    /// The train block's `param_dtype=`, when not f32 (admitted already).
+    pub(crate) param_dtype: Option<nsl_semantic::train_config::ParamDtype>,
+    /// The train block's parameter list, in list order (`param_list`).
+    pub(crate) param_paths: &'a [String],
 }
 
 impl Compiler<'_> {
     /// Plan bf16 activation storage for a `precision="bf16"` step and install
-    /// it for the lowering (`storage_out`). A no-op for an f32 step.
-    pub(crate) fn plan_activation_storage(&mut self, inputs: StoragePlanInputs<'_>) -> Result<(), crate::CodegenError> {
-        let StoragePlanInputs { adjoint, ccr_plan, effective_primal, precision_bf16 } = inputs;
+    /// it for the lowering (`storage_out`). A no-op for an f32 step. Under
+    /// `param_dtype=`, also selects the parameters stored bf16 and returns
+    /// their `param_list` indices, ascending (empty otherwise).
+    pub(crate) fn plan_activation_storage(
+        &mut self,
+        inputs: StoragePlanInputs<'_>,
+    ) -> Result<Vec<usize>, crate::CodegenError> {
+        let StoragePlanInputs {
+            adjoint,
+            ccr_plan,
+            effective_primal,
+            precision_bf16,
+            param_dtype,
+            param_paths,
+        } = inputs;
         if !precision_bf16 {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let empty = HashMap::new();
         let clones = ccr_plan.as_ref().map_or(&empty, |p| &p.recompute_clones);
-        let planned = plan(effective_primal, adjoint, clones).map_err(crate::CodegenError::new)?;
+        let selected = match param_dtype {
+            Some(pd) => {
+                let index_of = |name: &str| param_paths.iter().position(|p| p == name);
+                let sel = select_bf16_params(effective_primal, adjoint, &index_of);
+                if sel.is_empty() {
+                    return Err(crate::CodegenError::new(format!(
+                        "param_dtype=\"{}\" found no parameter it can store in bf16: it stores the weight \
+                         matrices whose every reader in the train step is a GEMM (through transposes and \
+                         reshapes), and this step has none. Drop param_dtype=",
+                        pd.as_str()
+                    )));
+                }
+                sel
+            }
+            None => Vec::new(),
+        };
+        let params: HashSet<VarId> = selected.iter().map(|&(v, _)| v).collect();
+        let planned = plan_with_params(effective_primal, adjoint, clones, &params)
+            .map_err(crate::CodegenError::new)?;
         if planned.slices == 0 && planned.attention == 0 {
             // The program's fingerprint (`act=bf16`) and runtime banner were
             // decided from the key before `main`; with nothing planned they
@@ -602,8 +752,24 @@ impl Compiler<'_> {
                 );
             }
         }
+        let mut indices: Vec<usize> = selected.iter().map(|&(_, i)| i).collect();
+        indices.sort_unstable();
+        indices.dedup();
+        if let Some(pd) = param_dtype {
+            nsl_log::nsl_log!(
+                INFO,
+                "param-storage",
+                "[param-storage] {} of {} parameters stored {} ({} of the GEMMs reading them keep the eager \
+                 bf16 mode's per-shape operand choice)",
+                indices.len(),
+                param_paths.len(),
+                pd.as_str(),
+                planned.param_gemm.len()
+            );
+        }
+        self.storage_param_gemm = planned.param_gemm;
         self.storage_out = planned.out;
-        Ok(())
+        Ok(indices)
     }
 }
 
@@ -628,21 +794,81 @@ impl Compiler<'_> {
     /// `NSL_MATMUL_BF16=0`, is a compile error), and the execution
     /// fingerprint and the runtime banner say so. The train block's own
     /// compile re-checks its key (`admit_bf16_activation_storage`).
-    pub(crate) fn resolve_program_precision(&mut self, stmts: &[nsl_ast::stmt::Stmt]) -> Result<(), crate::CodegenError> {
-        use nsl_semantic::train_config::{resolve_train_config, Precision, TrainConfigPurpose};
+    pub(crate) fn resolve_program_precision(
+        &mut self,
+        stmts: &[nsl_ast::stmt::Stmt],
+    ) -> Result<(), crate::CodegenError> {
+        use nsl_semantic::train_config::{
+            ParamDtype, Precision, TrainConfigPurpose, resolve_train_config,
+        };
         let mut blocks = Vec::new();
         top_level_train_blocks(stmts, &mut blocks);
         // A block whose config does not resolve is reported by its own
         // compile; here it counts as the default.
-        let precisions: Vec<Precision> = blocks
+        let configs: Vec<_> = blocks
             .iter()
             .map(|t| {
-                resolve_train_config(t, &|sym| self.resolve_sym(sym).to_string(), TrainConfigPurpose::UserTrainBlock)
-                    .ok()
+                resolve_train_config(
+                    t,
+                    &|sym| self.resolve_sym(sym).to_string(),
+                    TrainConfigPurpose::UserTrainBlock,
+                )
+                .ok()
+            })
+            .collect();
+        let precisions: Vec<Precision> = configs
+            .iter()
+            .map(|c| {
+                c.as_ref()
                     .and_then(|c| c.precision)
                     .unwrap_or(Precision::F32)
             })
             .collect();
+        // `param_dtype=` is arithmetic and runtime state, decided per program
+        // like the precision: every train block of a program must agree.
+        let param_dtypes: Vec<ParamDtype> = configs
+            .iter()
+            .map(|c| {
+                c.as_ref()
+                    .and_then(|c| c.param_dtype)
+                    .unwrap_or(ParamDtype::F32)
+            })
+            .collect();
+        if let Some(&pd) = param_dtypes.iter().find(|&&p| p != ParamDtype::F32) {
+            if param_dtypes.iter().any(|&p| p != pd) {
+                return Err(crate::CodegenError::new(format!(
+                    "one train block asks for param_dtype=\"{}\" and another for a different parameter storage: \
+                     the storage is recorded per program (its execution fingerprint and banner), so every train \
+                     block of a program must agree",
+                    pd.as_str()
+                )));
+            }
+            // Setting the program's storage commits `main` to its banner and
+            // fingerprint key, so the preconditions every lowering path
+            // shares are checked here, not only in the block-level admission
+            // (`admit_param_storage`): the pipelined path returns before that
+            // admission, and with neither check a `@pipeline` program
+            // declared bf16 parameters and trained f32 ones.
+            if precisions
+                .iter()
+                .zip(&param_dtypes)
+                .any(|(&p, &d)| d != ParamDtype::F32 && p != Precision::Bf16)
+            {
+                return Err(crate::CodegenError::new(format!(
+                    "param_dtype=\"{}\" requires precision=\"bf16\": the bf16 storage plan's GEMMs are what read a \
+                     bf16 parameter without a cast. Add precision=\"bf16\" or drop param_dtype=",
+                    pd.as_str()
+                )));
+            }
+            if self.features.pipeline_config.is_some() {
+                return Err(crate::CodegenError::new(format!(
+                    "param_dtype=\"{}\" is not supported on the pipelined train path (@pipeline): the parameter \
+                     storage plan is not lowered there. Drop one",
+                    pd.as_str()
+                )));
+            }
+            self.param_storage = Some(pd);
+        }
         if !precisions.contains(&Precision::Bf16) {
             return Ok(());
         }
@@ -793,6 +1019,72 @@ mod tests {
         for v in [520, 512, 519, 496, 497, 525] {
             assert!(!got.out.contains_key(&v) && !got.bf16.contains(&v), "VarId {v} must stay f32");
         }
+    }
+
+    /// `param_dtype=`: the four matrices of the MLP block (`wo` too: its only
+    /// reader is a GEMM) qualify; the norm gain (an RMSNorm reads it) and a
+    /// field outside the parameter list (`ffn_norm.eps`) do not.
+    #[test]
+    fn the_parameters_only_gemms_read_are_selected() {
+        let (primal, adjoint, _) = block();
+        let paths = ["wo", "ffn_norm.weight", "w_gate", "w_up", "w_down"];
+        let index_of = |n: &str| paths.iter().position(|p| *p == n);
+        let sel = select_bf16_params(&primal, &adjoint, &index_of);
+        assert_eq!(sel, vec![(126, 0), (133, 2), (136, 3), (139, 4)]);
+        // An embedding gather of a matrix keeps it f32.
+        let (mut primal, adjoint, _) = block();
+        primal.ops.push(op(950, PrimalOp::Embedding, &[133, 18]));
+        let sel = select_bf16_params(&primal, &adjoint, &index_of);
+        assert!(sel.iter().all(|&(v, _)| v != 133), "{sel:?}");
+        assert_eq!(sel.len(), 3);
+    }
+
+    /// The plan with the selected parameters stored bf16: they and their
+    /// transposes are bf16 values; every weight gradient stays f32 (a
+    /// parameter's gradient is f32 whatever rule 6 says, so dropping that
+    /// exception plans the wgrads bf16: mutation M7); the GEMMs the
+    /// activation plan already lowered keep their storage; and `wo`'s GEMM,
+    /// whose other operand is an f32 value, is planned f32 in `param_gemm`
+    /// (the eager mode's per-shape rule). Nothing else changes.
+    #[test]
+    fn stored_parameters_keep_f32_gradients_and_route_new_gemms_through_the_eager_rule() {
+        let (primal, adjoint, clones) = block();
+        let base = plan(&primal, &adjoint, &clones).expect("plans");
+        let params: HashSet<VarId> = [126, 133, 136, 139].into_iter().collect();
+        let got = plan_with_params(&primal, &adjoint, &clones, &params).expect("plans");
+        use Storage::{Bf16, F32};
+        for (v, st) in [
+            (504, F32),
+            (514, F32),
+            (522, F32),
+            (501, Bf16),
+            (511, F32),
+            (518, F32),
+            (134, Bf16),
+            (140, Bf16),
+        ] {
+            assert_eq!(got.out.get(&v), Some(&st), "VarId {v}");
+        }
+        assert_eq!(
+            got.out.get(&127),
+            Some(&F32),
+            "wo's GEMM reads a stored parameter"
+        );
+        assert_eq!(
+            got.param_gemm,
+            HashSet::from([127]),
+            "only wo's GEMM has no bf16 activation operand"
+        );
+        let mut want_out = base.out.clone();
+        want_out.insert(127, F32);
+        assert_eq!(
+            got.out, want_out,
+            "storing the parameters changes no other op"
+        );
+        let mut want_bf16 = base.bf16.clone();
+        want_bf16.extend([126, 133, 136, 139, 500, 510, 517]);
+        assert_eq!(got.bf16, want_bf16);
+        assert!(base.param_gemm.is_empty());
     }
 
     /// The 500M recipe's block: `dropout(d)` between the down projection and

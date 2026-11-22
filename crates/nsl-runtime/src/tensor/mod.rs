@@ -1261,6 +1261,16 @@ pub extern "C" fn nsl_tensor_item(tensor_ptr: i64) -> f64 {
             // kernel queued ahead of it, so a hot-path `.item()` on a value that
             // is a compile-time constant costs a full serialization.
             let _hp = crate::host_profile::Timer::start(crate::host_profile::Probe::ScalarRead);
+            // The same backstop as `nsl_tensor_to_device`'s download: this
+            // copies the element directly, so it is checked here too.
+            if crate::param_storage::is_stored_data(tensor.data as u64) {
+                crate::fatal::die(
+                    crate::fatal::Fatal::UnsupportedDtype,
+                    ".item(): this tensor is a weight matrix stored bf16 by param_dtype= inside its train block \
+                     (the f32 value lives in optimizer state until the block ends). Read it after the train \
+                     block, or drop param_dtype=",
+                );
+            }
             unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
             match tensor.dtype {
                 DTYPE_I32 => {
@@ -1290,7 +1300,22 @@ pub extern "C" fn nsl_tensor_item(tensor_ptr: i64) -> f64 {
                     );
                     return val as f64;
                 }
-                _ => {
+                // Two-byte floats: read their own width (this arm used to
+                // fall to the f64 one and read 8 bytes from a 2-byte buffer).
+                DTYPE_BF16 | DTYPE_FP16 => {
+                    let mut bits: u16 = 0;
+                    crate::cuda::inner::memcpy_dtoh(
+                        &mut bits as *mut u16 as *mut std::ffi::c_void,
+                        tensor.data,
+                        std::mem::size_of::<u16>(),
+                    );
+                    return if tensor.dtype == DTYPE_BF16 {
+                        bf16_bits_to_f32(bits) as f64
+                    } else {
+                        f16_bits_to_f32(bits) as f64
+                    };
+                }
+                0 => {
                     let mut val: f64 = 0.0;
                     crate::cuda::inner::memcpy_dtoh(
                         &mut val as *mut f64 as *mut std::ffi::c_void,
@@ -1299,6 +1324,7 @@ pub extern "C" fn nsl_tensor_item(tensor_ptr: i64) -> f64 {
                     );
                     return val;
                 }
+                other => crate::fatal::unsupported_dtype(".item() on a device tensor", other),
             }
         }
         #[cfg(not(feature = "cuda"))]
@@ -1392,6 +1418,13 @@ fn write_tensor_recursive(
                 DTYPE_I32 => unsafe { *(data as *const i32).add(i * stride) as f64 },
                 1 => unsafe { *(data as *const f32).add(i * stride) as f64 },
                 0 => unsafe { *(data as *const f64).add(i * stride) },
+                // Two-byte floats print their values (they printed `?`).
+                DTYPE_BF16 => {
+                    bf16_bits_to_f32(unsafe { *(data as *const u16).add(i * stride) }) as f64
+                }
+                DTYPE_FP16 => {
+                    f16_bits_to_f32(unsafe { *(data as *const u16).add(i * stride) }) as f64
+                }
                 _ => {
                     out.push('?');
                     continue;
@@ -1495,7 +1528,7 @@ pub extern "C" fn nsl_tensor_release(tensor_ptr: i64) {
 /// (optimizer-state offload, P0.2) to `cuMemFreeHost` via the pinned
 /// registry. Everything else takes the plain heap free. Pinned buffers
 /// are driver allocations — `std::alloc::dealloc` on one is UB.
-fn free_host_tensor_data(data: *mut c_void, size: usize) {
+pub(crate) fn free_host_tensor_data(data: *mut c_void, size: usize) {
     #[cfg(feature = "cuda")]
     if crate::cuda::inner::is_pinned(data) {
         crate::cuda::inner::free_pinned(data);
@@ -4303,6 +4336,21 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
         }
     }
 
+    // A bf16-stored parameter (`param_dtype=`) is only the GEMMs' image of
+    // its f32 master, valid inside the train step. Downloading it is a host
+    // read of that image (a callback printing or reducing a weight through
+    // an alias the compiler cannot see), which would show bf16 values or,
+    // in a reader that treats a non-f32 buffer as f64, garbage. Refuse.
+    #[cfg(feature = "cuda")]
+    if t.device > 0 && target == 0 && crate::param_storage::is_stored_data(t.data as u64) {
+        crate::fatal::die(
+            crate::fatal::Fatal::UnsupportedDtype,
+            "nsl_tensor_to_device: this tensor is a weight matrix stored bf16 by param_dtype= inside its \
+             train block (the f32 value lives in optimizer state until the block ends). Read it after the \
+             train block, or drop param_dtype=",
+        );
+    }
+
     // Materialize views before cross-device copies. Copying a non-contiguous
     // tensor's raw backing storage as if it were row-major corrupts transfers
     // for broadcast/transpose/reshape views produced heavily in source-AD.
@@ -5169,6 +5217,27 @@ pub fn test_tensor_tape_id(ptr: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bf16 and f16 tensors print their values (they printed `?` for every
+    /// element), and as the f32 tensor of the same values does.
+    #[test]
+    fn two_byte_float_tensors_print_their_values() {
+        let vals = [3.0, -4.0, 0.5, 12.0];
+        let text = |dtype: u16| {
+            let p = crate::cpu::create_tensor_with_shape_rs_dtype(&[2, 2], dtype);
+            let t = NslTensor::from_ptr(p);
+            for (i, &v) in vals.iter().enumerate() {
+                t.write_scalar_from_f64(i, v);
+            }
+            let s = format_tensor(p);
+            nsl_tensor_free(p);
+            s
+        };
+        let want = text(DTYPE_F32);
+        assert!(!want.contains('?'), "{want}");
+        assert_eq!(text(DTYPE_BF16), want);
+        assert_eq!(text(DTYPE_FP16), want);
+    }
 
     /// Review finding on 1def2b9f (pre-existing defect): the CPU
     /// tape-recording arm of `nsl_tensor_dropout` published its mask (rc=1)
@@ -6656,6 +6725,15 @@ fn tensor_l2_norm(t: &NslTensor) -> f64 {
     if t.len == 0 || t.data.is_null() { return 0.0; }
     let len = t.len as usize;
 
+    // A bf16-stored parameter (`param_dtype=`, read by `--monitor`'s weight
+    // norms inside the step): its value is the exact f32 master, not the
+    // bf16 image the GEMMs read.
+    if let Some(f) = crate::param_storage::exact_f32(t as *const NslTensor as i64) {
+        let norm = tensor_l2_norm(NslTensor::from_ptr_ref(f));
+        nsl_tensor_free(f);
+        return norm;
+    }
+
     // Must read from correct device
     if t.device > 0 {
         // GPU tensor — copy to CPU for inspection
@@ -6675,10 +6753,20 @@ fn tensor_l2_norm(t: &NslTensor) -> f64 {
                 sum_sq += v * v;
             }
         }
-        _ => { // f64
+        0 => { // f64
             let data = t.data as *const f64;
             for i in 0..len {
                 let v = unsafe { *data.add(i) };
+                sum_sq += v * v;
+            }
+        }
+        // Every other dtype through the element reader, which knows each
+        // width (f16, bf16, i32, u16 tokens) and refuses the rest. This arm
+        // used to read any non-f32 buffer as f64: a bf16 tensor was read
+        // over 4x its allocation and its norm came back as garbage (NaN).
+        _ => {
+            for i in 0..len {
+                let v = t.read_scalar_as_f64(i);
                 sum_sq += v * v;
             }
         }

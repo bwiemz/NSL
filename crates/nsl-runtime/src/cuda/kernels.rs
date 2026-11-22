@@ -412,6 +412,44 @@ pub(crate) fn fase_fused_adamw_multi_bf16sr_ptx() -> &'static str {
     })
 }
 
+/// bf16 parameter storage (`param_dtype=`): the bf16 members of the
+/// multi-tensor AdamW family (`nsl_kir::kernels::optim::build_param_multi`),
+/// one module per (parameter storage, first-moment dtype). NUL-terminated.
+pub(crate) fn fase_param_multi_ptx(
+    theta: nsl_kir::kernels::optim::Theta,
+    m_bf16: bool,
+) -> &'static str {
+    use nsl_kir::kernels::optim::Theta;
+    static MODULES: [std::sync::OnceLock<String>; 2 * Theta::BF16.len()] =
+        [const { std::sync::OnceLock::new() }; 2 * Theta::BF16.len()];
+    let at = Theta::BF16
+        .iter()
+        .position(|&t| t == theta)
+        .expect("a bf16 parameter storage");
+    MODULES[2 * at + usize::from(m_bf16)].get_or_init(|| {
+        String::from_utf8(nsl_kir::kernels::optim::param_multi_ptx(theta, m_bf16))
+            .expect("PTX must be ASCII")
+    })
+}
+
+/// The split master's conversion (`nsl_kir::kernels::optim::build_param_split`).
+/// NUL-terminated.
+pub(crate) fn param_split_ptx() -> &'static str {
+    static MODULE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    MODULE.get_or_init(|| {
+        String::from_utf8(nsl_kir::kernels::optim::param_split_ptx()).expect("PTX must be ASCII")
+    })
+}
+
+/// The split master's reassembly (`nsl_kir::kernels::optim::build_param_join`).
+/// NUL-terminated.
+pub(crate) fn param_join_ptx() -> &'static str {
+    static MODULE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    MODULE.get_or_init(|| {
+        String::from_utf8(nsl_kir::kernels::optim::param_join_ptx()).expect("PTX must be ASCII")
+    })
+}
+
 // P4 item 17: fused FASE-Deferred AdamW step with a BF16 AUTHORITATIVE theta
 // and counter-based stochastic rounding (SR-BF16, no FP32 master copy),
 // built by `nsl_kir::kernels::optim::build_fase_adamw_step_bf16sr` (its

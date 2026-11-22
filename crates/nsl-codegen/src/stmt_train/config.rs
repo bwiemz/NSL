@@ -45,6 +45,9 @@ pub(crate) struct TrainConfigSection {
     pub(crate) schedule_in_optimizer_steps: bool,
     /// `precision="bf16"`: bf16 activation storage for this step.
     pub(crate) precision_bf16: bool,
+    /// `param_dtype=` when it is not f32 (admitted): the weight matrices
+    /// the step's GEMMs read are stored bf16 (`param_storage`).
+    pub(crate) param_dtype: Option<nsl_semantic::train_config::ParamDtype>,
 }
 
 impl Compiler<'_> {
@@ -106,6 +109,12 @@ impl Compiler<'_> {
         if precision_bf16 {
             self.admit_bf16_activation_storage()?;
         }
+        let param_dtype = cfg
+            .param_dtype
+            .filter(|p| *p != nsl_semantic::train_config::ParamDtype::F32);
+        if let Some(pd) = param_dtype {
+            self.admit_param_storage(pd, precision_bf16)?;
+        }
 
         // P5 item 19: arm the cuda-graph runtime (its enable() re-checks the
         // runtime-only incompatibilities: NSL_CUDA_SYNC, kernel profiler,
@@ -147,7 +156,72 @@ impl Compiler<'_> {
             checkpoint_load_path,
             schedule_in_optimizer_steps,
             precision_bf16,
+            param_dtype,
         })
+    }
+
+    /// The compositions `param_dtype=` admits (design `srbf16-design.md`
+    /// 6.2). The bf16 parameters are read by the storage GEMMs of
+    /// `precision="bf16"` and stepped only by the fused multi-tensor AdamW
+    /// launch, on one device, with the optimizer state resident; each
+    /// refusal names a setting that takes another path. The optimizer itself
+    /// (AdamW/Adam with the fused multi step) is checked where the step is
+    /// emitted (`optimizer_step.rs`).
+    fn admit_param_storage(
+        &self,
+        pd: nsl_semantic::train_config::ParamDtype,
+        precision_bf16: bool,
+    ) -> Result<(), CodegenError> {
+        let name = pd.as_str();
+        if !precision_bf16 {
+            return Err(CodegenError::new(format!(
+                "param_dtype=\"{name}\" requires precision=\"bf16\": the bf16 storage plan's GEMMs are what read a \
+                 bf16 parameter without a cast. Add precision=\"bf16\" or drop param_dtype="
+            )));
+        }
+        if self.param_storage != Some(pd) {
+            return Err(CodegenError::new(format!(
+                "param_dtype=\"{name}\" is supported on a top-level train block only: the program's execution \
+                 fingerprint and banner are decided from it before `main` runs"
+            )));
+        }
+        if pd.is_test_only()
+            && std::env::var("NSL_PARAM_DTYPE_TEST_MODES").ok().as_deref() != Some("1")
+        {
+            return Err(CodegenError::new(format!(
+                "param_dtype=\"{name}\" is a test mode (the f32 master kept whole, to check the bf16 parameter \
+                 plumbing bit for bit against f32 parameters); build with NSL_PARAM_DTYPE_TEST_MODES=1 to use it, \
+                 or write param_dtype=\"bf16-split\""
+            )));
+        }
+        let o = &self.compile_options;
+        let refused: [(bool, &str); 8] = [
+            (
+                std::env::var("NSL_FASE_FUSED_STEP").ok().as_deref() == Some("0"),
+                "NSL_FASE_FUSED_STEP=0",
+            ),
+            (
+                std::env::var("NSL_FASE_MULTI_STEP").ok().as_deref() == Some("0"),
+                "NSL_FASE_MULTI_STEP=0",
+            ),
+            (o.diagnostics.training_reference, "--training-reference"),
+            (o.train.optim_state_offload, "--optim-state-offload"),
+            (self.features.zero_stage.is_some(), "--zero-stage"),
+            (self.features.world_size > 1, "--devices > 1"),
+            (o.train.param_dtype_bf16sr, "--param-dtype bf16-sr"),
+            (
+                std::env::var("NSL_FASE_FUSED_OVERRIDE").is_ok_and(|v| !v.is_empty()),
+                "NSL_FASE_FUSED_OVERRIDE (a per-layer FASE mode table)",
+            ),
+        ];
+        if let Some((_, flag)) = refused.iter().find(|(on, _)| *on) {
+            return Err(CodegenError::new(format!(
+                "param_dtype=\"{name}\" does not compose with {flag}: the bf16 parameters are stepped only by the \
+                 fused multi-tensor AdamW launch, on one device, with the optimizer state resident, and {flag} \
+                 takes another path. Drop {flag}, or drop param_dtype="
+            )));
+        }
+        Ok(())
     }
 
     /// The compositions `precision="bf16"` admits in this phase. Each refusal
@@ -187,5 +261,32 @@ impl Compiler<'_> {
             )));
         }
         Ok(())
+    }
+}
+
+/// The execution-fingerprint key of a program's parameter storage
+/// (`param_dtype=`); `None` for f32 parameters, which emit no key.
+pub(crate) fn param_storage_fingerprint(
+    pd: nsl_semantic::train_config::ParamDtype,
+) -> Option<&'static str> {
+    use nsl_semantic::train_config::ParamDtype;
+    match pd {
+        ParamDtype::F32 => None,
+        ParamDtype::Bf16Split => Some(",pdt=bf16split"),
+        ParamDtype::Bf16Master => Some(",pdt=bf16master"),
+        ParamDtype::Bf16MasterTz => Some(",pdt=bf16mastertz"),
+    }
+}
+
+/// The runtime's code for a parameter storage (`nsl_abi::wire::param_storage`);
+/// `None` for f32 parameters.
+pub(crate) fn param_storage_wire(pd: nsl_semantic::train_config::ParamDtype) -> Option<i64> {
+    use nsl_abi::wire::param_storage as wire;
+    use nsl_semantic::train_config::ParamDtype;
+    match pd {
+        ParamDtype::F32 => None,
+        ParamDtype::Bf16Split => Some(wire::SPLIT),
+        ParamDtype::Bf16Master => Some(wire::MASTER),
+        ParamDtype::Bf16MasterTz => Some(wire::MASTER_TZ),
     }
 }
