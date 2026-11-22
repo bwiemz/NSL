@@ -1313,6 +1313,14 @@ impl Compiler<'_> {
             let v_val = self.compile_nested_expr(builder, state, &args[2].value)?;
             let scale_val = self.compile_nested_expr(builder, state, &args[3].value)?;
             let mask_val = self.compile_nested_expr(builder, state, &args[4].value)?;
+            // Grouped K/V is refused with a message (the naive chain reads K
+            // and V with Q's head count).
+            let which_masked = builder.ins().iconst(cl_types::I64, 1);
+            self.compile_call_by_name(
+                builder,
+                "nsl_sdpa_require_equal_kv_heads",
+                &[q_val, k_val, v_val, which_masked],
+            )?;
 
             let dim_m2 = builder.ins().iconst(cl_types::I64, -2_i64);
             let dim_m1 = builder.ins().iconst(cl_types::I64, -1_i64);
@@ -1371,6 +1379,13 @@ impl Compiler<'_> {
             let v_val = self.compile_nested_expr(builder, state, &args[2].value)?;
             let scale_val = self.compile_nested_expr(builder, state, &args[3].value)?;
             let seg_val = self.compile_nested_expr(builder, state, &args[4].value)?;
+            // Grouped K/V is refused with a message, as on the source-AD path.
+            let which_packed = builder.ins().iconst(cl_types::I64, 0);
+            self.compile_call_by_name(
+                builder,
+                "nsl_sdpa_require_equal_kv_heads",
+                &[q_val, k_val, v_val, which_packed],
+            )?;
             let mask_val = self.compile_call_by_name(
                 builder,
                 "nsl_packed_mask_from_segment_ids",
@@ -1525,7 +1540,17 @@ impl Compiler<'_> {
                              Make them agree, or drop the decorator to take the naive path"
                     )));
                 }
-                return self.compile_flash_attention_call(builder, state, q_val, k_val, v_val, scale_val);
+                // The decorated kernels read K/V with Q's head count: grouped
+                // K/V reaches them expanded (on a live tape the expansion is
+                // recorded, so its gradient is summed back over each group).
+                let (k_use, v_use, expanded) =
+                    self.emit_sdpa_expand_kv(builder, q_val, k_val, v_val)?;
+                let out = self
+                    .compile_flash_attention_call(builder, state, q_val, k_use, v_use, scale_val)?;
+                for t in expanded {
+                    self.compile_call_by_name(builder, "nsl_tensor_free_transient", &[t])?;
+                }
+                return Ok(out);
             }
 
             // M34: `@context_parallel` decorator (ring attention).
@@ -1577,7 +1602,12 @@ impl Compiler<'_> {
             // fresh FFI shape gets wired in here and this branch
             // stops falling through.
 
-            // Naive path: softmax(apply_causal_mask((Q @ K.T) * scale)) @ V
+            // Naive path: softmax(apply_causal_mask((Q @ K.T) * scale)) @ V,
+            // on K/V expanded to Q's head count when they are grouped (the
+            // expansion is recorded on a live tape like the ops `nsl.nn.gqa`
+            // used to write out, so the backward sums each group).
+            let (k_val, v_val, kv_expanded) =
+                self.emit_sdpa_expand_kv(builder, q_val, k_val, v_val)?;
             let dim_m2 = builder.ins().iconst(cl_types::I64, -2_i64);
             let dim_m1 = builder.ins().iconst(cl_types::I64, -1_i64);
             let k_t = self.compile_call_by_name(
@@ -1637,6 +1667,7 @@ impl Compiler<'_> {
             // frees are refcount decrements on the same Cranelift Value, so
             // the dedup below keeps the count honest.
             let mut transients = vec![k_t, scores, scaled, attn_weights];
+            transients.extend(kv_expanded);
             if masked != scaled {
                 transients.push(masked);
             }
@@ -4102,5 +4133,29 @@ impl Compiler<'_> {
             self.node_type(call_expr.id).as_tensor_parts(),
             Some((_, nsl_semantic::types::DType::F64, _))
         )
+    }
+
+    /// K and V of a `scaled_dot_product_attention` for a path that computes
+    /// on K/V with Q's head count (the decomposed chain, the
+    /// `@flash_attention` launch): grouped K/V (`kv_heads` dividing `heads`)
+    /// is expanded by `nsl_sdpa_expand_kv`, with the op chain `nsl.nn.gqa`
+    /// used to write out, so the path computes what it did when the stdlib
+    /// expanded them. Returns the operands to use and the two expansion
+    /// handles (0 where nothing was expanded), which the caller releases
+    /// after the attention; releasing 0 is a no-op.
+    pub(crate) fn emit_sdpa_expand_kv(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        q: Value,
+        k: Value,
+        v: Value,
+    ) -> Result<(Value, Value, [Value; 2]), CodegenError> {
+        let ke = self.compile_call_by_name(builder, "nsl_sdpa_expand_kv", &[k, q])?;
+        let ve = self.compile_call_by_name(builder, "nsl_sdpa_expand_kv", &[v, q])?;
+        let k_made = builder.ins().icmp_imm_s(IntCC::NotEqual, ke, 0);
+        let k_use = builder.ins().select(k_made, ke, k);
+        let v_made = builder.ins().icmp_imm_s(IntCC::NotEqual, ve, 0);
+        let v_use = builder.ins().select(v_made, ve, v);
+        Ok((k_use, v_use, [ke, ve]))
     }
 }

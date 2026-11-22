@@ -4,7 +4,7 @@
 
 Every `NSL_*` variable the toolchain reads (180 of them), from the registry in `crates/nsl-env`. `nsl env list` prints the same table; `nsl env current` shows which are set in your shell. A **behavior** variable changes the semantics or numerics of what is compiled or executed and belongs in any record of a result; **perf** changes speed or memory only; **safety** variables bypass or inject a check; **platform** names paths, devices and topology; **diagnostic** ones print, dump or count; **test** ones only matter under the test harness. "Read at" says whether the compiler process (`compile`) or the runtime inside the compiled program (`runtime`) reads it; `test` means only a `cargo test` binary does. "Accepted" quotes what the code compares against: `1 only` means any other value, including `0`, is ignored.
 
-## behavior (32)
+## behavior (33)
 
 | Variable | Kind | Accepted | Default | Read at | What it does |
 |---|---|---|---|---|---|
@@ -33,6 +33,7 @@ Every `NSL_*` variable the toolchain reads (180 of them), from the registry in `
 | `NSL_MUON_BATCH_TF32` | bool | 0 = off; anything else (incl. unset) = on | on (TF32) | runtime | Set to 0 to force strict FP32 (no TF32 tensor cores) for the batched Muon Newton-Schulz GEMMs. |
 | `NSL_ROLE` | enum | router / prefill / decode; anything else = router (both sites identical) | router | runtime | Disaggregated-inference worker role for this process: router (default, monolithic), prefill, or decode. |
 | `NSL_SDPA_FUSED_DISABLE` | bool | 1 only | off (fused kernel enabled) | runtime | Set to 1 to disable the fused flash-attention SDPA forward kernel and always run the decomposed attention path. |
+| `NSL_SDPA_GQA_EXPAND` | bool | 1 only | off (tensor-core attention reads grouped K/V in place) | runtime | Set to 1 to expand grouped K/V to every query head for the attention kernels and sum dK/dV per group after (pre-native GQA). |
 | `NSL_SDPA_TIER_B_DISABLE` | bool | 1 only | off (Tier B used when eligible) | runtime | Set to 1 to force the base segment-masked attention kernel instead of the PCA Tier-B segment-skip PTX variant. |
 | `NSL_SUM_DIM_COALESCED` | bool | 0 = off; anything else = on | on | runtime | Set to 0 to disable the coalesced sum_dim kernel route (sequential accumulation, not bit-exact vs the tree-reduce kernel). |
 | `NSL_SUM_DIM_SHORT_MAX` | int | integer &gt;= 0 (u64; unparsable → 1); 0 disables both fast routes | 1 | runtime | Max reduce length (elements) routed to the one-thread-per-output sum_dim kernel; 1 is bit-exact, &gt;1 reassociates, 0 disables both. |

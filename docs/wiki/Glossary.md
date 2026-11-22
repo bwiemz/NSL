@@ -70,7 +70,7 @@ Tiled online-softmax attention algorithm (Dao et al.) that keeps Q, K, V tiles i
 8-bit floating-point format (E4M3 or E5M2) supported on H100/Hopper and RTX 4090+. NSL uses FP8 for V tensors in CSHA Tier D (per-head mixed precision); E4M3 for Q/K (range-critical) and E5M2 for V (gradient-safe). See [`spec/06-quantization.nsl.md`](../../spec/06-quantization.nsl.md).
 
 ### <a id="gqa"></a>GQA — Grouped-Query Attention
-Attention variant where multiple query heads share a single K/V head, reducing KV-cache memory. NSL's FA-2 emitter handles GQA via `source_ad.rs` expand-backward `ReduceToShape` for KV head gradients. See [Glossary#fa](#fa) and [`spec/02-tensor-type-system.nsl.md`](../../spec/02-tensor-type-system.nsl.md).
+Attention variant where multiple query heads share a single K/V head, reducing KV-cache memory. `scaled_dot_product_attention` takes grouped K/V `[b, kv_heads, s, d]` when `kv_heads` divides Q's head count (query head `h` reads K/V head `h / (heads / kv_heads)`): the tensor-core kernels read them in place and sum dK/dV over each group in the dK/dV kernel; every other path expands them to every query head and sums dK/dV with the expansion's `reduce_to_shape` adjoint (`nsl-runtime/src/sdpa_gqa.rs`, kill switch `NSL_SDPA_GQA_EXPAND=1`). The packed and masked variants take K/V with Q's head count. See [Glossary#fa](#fa) and [`spec/02-tensor-type-system.nsl.md`](../../spec/02-tensor-type-system.nsl.md).
 
 ### <a id="gptq"></a>GPTQ — Generative Pre-Trained Quantization
 Post-training weight quantization algorithm (Frantar et al.) that uses second-order Hessian information to minimize quantization error layer by layer. Supported via `quant` block in NSL. See [`spec/06-quantization.nsl.md`](../../spec/06-quantization.nsl.md).

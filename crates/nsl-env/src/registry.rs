@@ -1266,6 +1266,15 @@ pub static REGISTRY: &[EnvVar] = &[
         "Set to 1 to disable the fused flash-attention SDPA forward kernel and always run the decomposed attention path."
     ),
     var!(
+        "NSL_SDPA_GQA_EXPAND",
+        Bool,
+        "1 only",
+        "off (tensor-core attention reads grouped K/V in place)",
+        Behavior,
+        Runtime,
+        "Set to 1 to expand grouped K/V to every query head for the attention kernels and sum dK/dV per group after (pre-native GQA)."
+    ),
+    var!(
         "NSL_SDPA_TIER_B_DISABLE",
         Bool,
         "1 only",

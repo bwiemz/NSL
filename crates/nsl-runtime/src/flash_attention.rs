@@ -1406,31 +1406,86 @@ fn expand_kv_heads_device(
 /// Reduce expanded-head dK/dV back to KV heads in the backward result list.
 ///
 /// The adjoint of the head expansion above is the group-sum
-/// (`ReduceToShape` over the broadcast axis — the same rule stdlib GQA's
-/// decomposed path uses for its `expand` backward), so
-/// `dK[b, kv] = Σ_g dK_exp[b, kv*g + gi]`. Implemented with public FFIs:
-/// reshape `[b,h,s,d]` → `[b,kv,g,s,d]` (zero-copy view of a contiguous
-/// tensor) then `nsl_tensor_sum_dim(dim=2)` on the GPU. Replaces list slots
-/// 1 (dK) and 2 (dV) in place; dQ (slot 0) is untouched.
+/// (`ReduceToShape` over the broadcast axis — the rule source AD gives the
+/// stdlib's `expand`), so `dK[b, kv] = Σ_g dK_exp[b, kv*g + gi]`:
+/// `crate::sdpa_gqa::group_sum_expanded_grad`, which reduces the
+/// `[b,kv,g,s,d]` view with that same `reduce_to_shape`. `kv_like` gives
+/// the `[b, kv, s, d]` shapes (canonical K and V). Replaces list slots 1 (dK)
+/// and 2 (dV) in place; dQ (slot 0) is untouched.
 #[cfg(feature = "cuda")]
-fn reduce_expanded_kv_grads(
-    list: i64, b: usize, kv_h: usize, groups: usize, s: usize, d: usize,
-) {
-    use crate::tensor::shape_ops::nsl_tensor_reshape;
-    use crate::tensor::reduction::nsl_tensor_sum_dim;
-    for idx in [1i64, 2i64] {
+fn reduce_expanded_kv_grads(list: i64, kv_like: [i64; 2], groups: usize) {
+    for (idx, like) in [(1i64, kv_like[0]), (2i64, kv_like[1])] {
         let exp_t = crate::list::nsl_list_get(list, idx); // borrow
-        let dims = crate::list::nsl_list_new();
-        for v in [b as i64, kv_h as i64, groups as i64, s as i64, d as i64] {
-            crate::list::nsl_list_push(dims, v);
-        }
-        let view5 = nsl_tensor_reshape(exp_t, dims);
-        crate::list::nsl_list_free(dims);
-        let reduced = nsl_tensor_sum_dim(view5, 2, 0); // [b, kv_h, s, d]
-        crate::tensor::nsl_tensor_free(view5);
+        // `reduce_to_shape` of the `[b, kv_h, groups, s, d]` view — the
+        // adjoint the stdlib's expansion had, so the envelope's dK/dV are
+        // the ones a pre-expanded call produced.
+        let reduced = crate::sdpa_gqa::group_sum_expanded_grad(exp_t, like, groups);
         crate::tensor::nsl_tensor_free(exp_t);
         crate::list::nsl_list_set(list, idx, reduced);
     }
+}
+
+/// [`tc_sdpa_backward`] for grouped K/V: in place (the dK/dV kernel sums
+/// each group), or under `NSL_SDPA_GQA_EXPAND=1` on K/V expanded to every
+/// query head with dK/dV summed over each group afterwards (the computation
+/// of a call whose K/V the stdlib expanded, bit for bit).
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn tc_sdpa_backward_gqa(
+    dout_ptr: i64,
+    q_ptr: i64,
+    k_ptr: i64,
+    v_ptr: i64,
+    out_ptr: i64,
+    logsumexp_ptr: i64,
+    scale: f32,
+    b: usize,
+    h: usize,
+    kv_h: usize,
+    s: usize,
+    d: usize,
+    causal: bool,
+) -> Option<i64> {
+    if kv_h == h || !crate::sdpa_gqa::expand_mode() {
+        return tc_sdpa_backward(
+            dout_ptr,
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            out_ptr,
+            logsumexp_ptr,
+            scale,
+            b,
+            h,
+            kv_h,
+            s,
+            d,
+            causal,
+        );
+    }
+    let groups = h / kv_h;
+    let ke = crate::sdpa_gqa::expand_kv_like_stdlib(k_ptr, groups);
+    let ve = crate::sdpa_gqa::expand_kv_like_stdlib(v_ptr, groups);
+    let list = tc_sdpa_backward(
+        dout_ptr,
+        q_ptr,
+        ke,
+        ve,
+        out_ptr,
+        logsumexp_ptr,
+        scale,
+        b,
+        h,
+        h,
+        s,
+        d,
+        causal,
+    );
+    crate::tensor::nsl_tensor_free(ke);
+    crate::tensor::nsl_tensor_free(ve);
+    let list = list?;
+    reduce_expanded_kv_grads(list, [k_ptr, v_ptr], groups);
+    Some(list)
 }
 
 /// PCA Stage C: plain fused (decorator-free) SDPA forward with optional
@@ -1471,9 +1526,11 @@ fn reduce_expanded_kv_grads(
 ///   * q/k/v not canonical row-major (the kernel is stride-blind; a
 ///     transpose/reshape view would compute smoothly-wrong attention —
 ///     callers must materialize `.contiguous()` inputs to use this path)
-///   * k/v disagreeing with q in `[batch, seq, head_dim]`, or carrying a
-///     different head count (GQA callers must pre-expand KV before
-///     dispatching here)
+///   * k/v disagreeing with q in `[batch, seq, head_dim]`, or (packed
+///     batches) carrying a different head count. Unpacked grouped K/V
+///     (`kv_heads` dividing `heads`) is served: in place by the
+///     tensor-core kernels, through an expanded copy by the kernels below
+///     (`crate::sdpa_gqa`)
 ///   * `seq_len` not a multiple of `block_q`/`block_kv` (the v2 kernel has
 ///     no ragged-tail guards)
 ///   * segment path: segment tensor missing / rank != 2 / shape mismatch
@@ -1625,9 +1682,40 @@ pub extern "C" fn nsl_sdpa_fused_forward(
                 && kv_h > 0
                 && crate::attention_tc::supports(b as usize, d as usize, h as usize, kv_h as usize, s as usize)
                 && crate::attention_tc::device_supported()
-                && let Some(list) = tc_sdpa_forward(q_t, k_t, v_t, b, h, kv_h, s, d, scale_bits, causal != 0)
             {
-                return list;
+                // `NSL_SDPA_GQA_EXPAND=1`: the kernels read K/V expanded to
+                // every query head (the pre-native-GQA computation; the
+                // output is the same bits either way).
+                let expand = kv_h != h && crate::sdpa_gqa::expand_mode();
+                let (ke, ve) = if expand {
+                    let g = (h / kv_h) as usize;
+                    (
+                        crate::sdpa_gqa::expand_kv_like_stdlib(k_ptr, g),
+                        crate::sdpa_gqa::expand_kv_like_stdlib(v_ptr, g),
+                    )
+                } else {
+                    (k_ptr, v_ptr)
+                };
+                let launch_kv_h = if expand { h } else { kv_h };
+                let list = tc_sdpa_forward(
+                    q_t,
+                    NslTensor::from_ptr(ke),
+                    NslTensor::from_ptr(ve),
+                    b,
+                    h,
+                    launch_kv_h,
+                    s,
+                    d,
+                    scale_bits,
+                    causal != 0,
+                );
+                if expand {
+                    crate::tensor::nsl_tensor_free(ke);
+                    crate::tensor::nsl_tensor_free(ve);
+                }
+                if let Some(list) = list {
+                    return list;
+                }
             }
         }
         if q_t.dtype == crate::tensor::DTYPE_BF16 {
@@ -1640,21 +1728,49 @@ pub extern "C" fn nsl_sdpa_fused_forward(
         if block_q <= 0 || block_kv <= 0 {
             decline!("non-positive block dims");
         }
-        // K/V must agree with Q in [batch, seq, head_dim] and carry the
-        // SAME head count — the plain fused kernel indexes K/V by the
-        // fused batch*head block id, so GQA callers must pre-expand KV
-        // first. (Q's own head_dim vs the PTX variant is NOT re-checked:
-        // the caller selected the variant. K/V agreement with Q is a
-        // separate matter — a mismatch would read out of bounds.)
+        // K/V must agree with Q in [batch, seq, head_dim]. The plain fused
+        // kernel indexes K/V by the fused batch*head block id, so grouped
+        // K/V (an unpacked call whose `kv_heads` divides `heads`) is
+        // expanded to every query head first — the copy `nsl.nn.gqa` used
+        // to make in NSL source, so the kernel computes what it did then.
+        // Anything else declines. (Q's own head_dim vs the PTX variant is
+        // NOT re-checked: the caller selected the variant. K/V agreement
+        // with Q is a separate matter — a mismatch would read out of
+        // bounds.)
         let kv_mismatch = |t: &NslTensor| unsafe {
             *t.shape.add(0) != b
                 || *t.shape.add(1) != h
                 || *t.shape.add(2) != s
                 || *t.shape.add(3) != d
         };
-        if kv_mismatch(k_t) || kv_mismatch(v_t) {
-            decline!("k/v shape mismatch with q (GQA must be pre-expanded)");
-        }
+        let groups_k = crate::sdpa_gqa::kv_groups(q_t, k_t);
+        let groups_v = crate::sdpa_gqa::kv_groups(q_t, v_t);
+        let mut kv_expanded: Vec<i64> = Vec::new();
+        let (k_t, v_t) = match (groups_k, groups_v) {
+            (Ok(gk), Ok(gv))
+                if segment_ids_ptr == 0
+                    && gk == gv
+                    && gk > 1
+                    && s % block_q == 0
+                    && s % block_kv == 0 =>
+            {
+                let ke = crate::sdpa_gqa::expand_kv_like_stdlib(k_ptr, gk);
+                let ve = crate::sdpa_gqa::expand_kv_like_stdlib(v_ptr, gv);
+                kv_expanded.extend([ke, ve]);
+                (NslTensor::from_ptr(ke), NslTensor::from_ptr(ve))
+            }
+            _ => {
+                if kv_mismatch(k_t) || kv_mismatch(v_t) {
+                    decline!("k/v shape mismatch with q (packed GQA must be pre-expanded)");
+                }
+                (k_t, v_t)
+            }
+        };
+        let free_kv_expanded = |list: &[i64]| {
+            for &t in list {
+                crate::tensor::nsl_tensor_free(t);
+            }
+        };
         // Ragged shapes: the v2 kernel has no seq_len tail guards.
         if s % block_q != 0 || s % block_kv != 0 {
             decline!(format!("ragged seq: s={s} block_q={block_q} block_kv={block_kv}"));
@@ -1916,13 +2032,15 @@ pub extern "C" fn nsl_sdpa_fused_forward(
             inner::free_managed(seg_dev);
             inner::free_managed(out_data);
             inner::free_managed(lse_data);
+            free_kv_expanded(&kv_expanded);
             return 0;
         }
 
-        // Kernels finished — the f16 staging output and the staged
-        // segment ids are dead.
+        // Kernels finished — the f16 staging output, the staged segment
+        // ids and any expanded K/V are dead (stream-ordered frees).
         inner::free_managed(out_f16);
         inner::free_managed(seg_dev);
+        free_kv_expanded(&kv_expanded);
 
         // Per-variant launch counter (parity-gate proof, see the static's
         // doc comment) + once-per-process launch marker.
@@ -7939,14 +8057,18 @@ pub extern "C" fn nsl_flash_attention_backward(
             && tc_attention_enabled()
             && crate::attention_tc::supports(b, d, h, kv_h, s)
             && crate::attention_tc::device_supported()
-            && let Some(list) = tc_sdpa_backward(
+            && let Some(list) = tc_sdpa_backward_gqa(
                 dout_ptr, q_ptr, k_ptr, v_ptr, out_ptr, logsumexp_ptr, scale, b, h, kv_h, s, d, is_causal,
             )
         {
             if flash_debug {
+                // `gqa_expanded`: grouped K/V ran expanded to every query head
+                // (`NSL_SDPA_GQA_EXPAND=1`), not in place.
+                let gqa_expanded = kv_h != h && crate::sdpa_gqa::expand_mode();
                 crate::nsl_log!(INFO, "flash-bwd",
                     "[flash-bwd] tensor-core backward dispatched \
-                     (batch={b}, heads={h}, kv_heads={kv_h}, seq={s}, head_dim={d}, causal={is_causal})"
+                     (batch={b}, heads={h}, kv_heads={kv_h}, gqa_expanded={gqa_expanded}, seq={s}, \
+                     head_dim={d}, causal={is_causal})"
                 );
             }
             return list;
@@ -8015,6 +8137,7 @@ pub extern "C" fn nsl_flash_attention_backward(
             let force_expand = std::env::var("NSL_FLASH_GQA_BWD_EXPAND")
                 .map(|v| v == "1")
                 .unwrap_or(false)
+                || crate::sdpa_gqa::expand_mode()
                 || segment_ids_ptr != 0;
             let use_native_gqa = kv_h != h && !force_expand;
 
@@ -8051,16 +8174,17 @@ pub extern "C" fn nsl_flash_attention_backward(
             if v_exp_t != 0 {
                 crate::tensor::nsl_tensor_free(v_exp_t);
             }
+            // Group-sum is the expansion adjoint — needed ONLY when we
+            // expanded. Native GQA already produced kv-shaped dK/dV. Before
+            // the canonical copies go: K/V give the reduce its target shape.
+            if gpu_result != 0 && kv_h != h && !use_native_gqa {
+                reduce_expanded_kv_grads(gpu_result, [k_canon, v_canon], groups);
+            }
             for t in canon_temps {
                 crate::tensor::nsl_tensor_free(t);
             }
 
             if gpu_result != 0 {
-                // Group-sum is the expansion adjoint — needed ONLY when we
-                // expanded. Native GQA already produced kv-shaped dK/dV.
-                if kv_h != h && !use_native_gqa {
-                    reduce_expanded_kv_grads(gpu_result, b, kv_h, groups, s, d);
-                }
                 if flash_debug {
                     crate::nsl_log!(INFO, "flash-bwd", 
                         "[flash-bwd] GPU backward dispatched \
@@ -8259,30 +8383,81 @@ pub extern "C" fn nsl_flash_attention_backward(
     // and no logsumexp buffer was saved. Compute it from Q, K, scale, causal —
     // segment-aware when segment ids are present.
     let gqa_groups = if kv_h > 0 { h / kv_h } else { 1 };
+
+    // Grouped K/V (`kv_h` dividing `h`): compute on K/V expanded to every
+    // query head and sum dK/dV over each group afterwards (below, with the
+    // expansion's own adjoint, `crate::sdpa_gqa::group_sum_expanded_grad`).
+    // That is the computation of a call whose K/V `nsl.nn.gqa` expanded in
+    // NSL source, so this reference gives the same bits whether a program
+    // passes grouped or expanded K/V — the `--deterministic` route of every
+    // GPU attention backward included. (Accumulating dK/dV of a whole group
+    // in one buffer would round in a different order.)
+    let expand_groups = (gqa_groups > 1 && kv_h * gqa_groups == h).then_some(gqa_groups);
+    let (k_data, v_data, call_kv_h, call_groups) = match expand_groups {
+        Some(g) => {
+            let expand = |src: &[f32]| -> Vec<f32> {
+                let head = s * d;
+                let mut out = vec![0.0f32; total_qkv];
+                for bi in 0..b {
+                    for hi in 0..h {
+                        let from = (bi * kv_h + hi / g) * head;
+                        let to = (bi * h + hi) * head;
+                        out[to..to + head].copy_from_slice(&src[from..from + head]);
+                    }
+                }
+                out
+            };
+            (expand(&k_data), expand(&v_data), h, 1)
+        }
+        None => (k_data, v_data, kv_h, gqa_groups),
+    };
+    let call_total_kv = b * call_kv_h * s * d;
+
     let lse_data = if logsumexp_ptr != 0 {
         let lse_t = NslTensor::from_ptr(logsumexp_ptr);
         read_f32_data(lse_t, total_lse)
     } else {
         compute_logsumexp_gqa(
-            &q_data, &k_data, b, h, kv_h, s, d, scale, is_causal,
+            &q_data,
+            &k_data,
+            b,
+            h,
+            call_kv_h,
+            s,
+            d,
+            scale,
+            is_causal,
             seg_host.as_deref(),
         )
     };
 
     // Allocate gradient buffers (zero-initialized)
     // dQ has Q's shape [batch, heads, seq, head_dim]
-    // dK, dV have KV's shape [batch, kv_heads, seq, head_dim]
+    // dK, dV have KV's shape [batch, kv_heads, seq, head_dim] (Q's shape
+    // while K/V are expanded)
     let mut dq_data = vec![0.0f32; total_qkv];
-    let mut dk_data = vec![0.0f32; total_kv];
-    let mut dv_data = vec![0.0f32; total_kv];
+    let mut dk_data = vec![0.0f32; call_total_kv];
+    let mut dv_data = vec![0.0f32; call_total_kv];
 
     // Run the CPU backward with GQA support (segment-aware when packed)
     flash_attention_backward_cpu_gqa(
-        &q_data, &k_data, &v_data,
-        &out_data, &lse_data, &dout_data,
-        &mut dq_data, &mut dk_data, &mut dv_data,
-        b, h, kv_h, s, d,
-        scale, is_causal, gqa_groups,
+        &q_data,
+        &k_data,
+        &v_data,
+        &out_data,
+        &lse_data,
+        &dout_data,
+        &mut dq_data,
+        &mut dk_data,
+        &mut dv_data,
+        b,
+        h,
+        call_kv_h,
+        s,
+        d,
+        scale,
+        is_causal,
+        call_groups,
         seg_host.as_deref(),
     );
 
@@ -8315,7 +8490,7 @@ pub extern "C" fn nsl_flash_attention_backward(
     }
 
     let q_shape = [batch, heads, seq_len, head_dim];
-    let kv_shape = [batch, kv_h as i64, seq_len, head_dim];
+    let kv_shape = [batch, call_kv_h as i64, seq_len, head_dim];
     let mut dq_ptr = make_tensor(&dq_data, &q_shape);
     let mut dk_ptr = make_tensor(&dk_data, &kv_shape);
     let mut dv_ptr = make_tensor(&dv_data, &kv_shape);
@@ -8350,6 +8525,16 @@ pub extern "C" fn nsl_flash_attention_backward(
                 crate::tensor::nsl_tensor_free(host_ptr);
             }
             *slot = dev_ptr;
+        }
+    }
+
+    // Expanded K/V: sum each group's dK/dV into its key/value head, on the
+    // gradients' device, as the expansion's adjoint did.
+    if let Some(g) = expand_groups {
+        for (slot, like) in [(&mut dk_ptr, k_ptr), (&mut dv_ptr, v_ptr)] {
+            let reduced = crate::sdpa_gqa::group_sum_expanded_grad(*slot, like, g);
+            crate::tensor::nsl_tensor_free(*slot);
+            *slot = reduced;
         }
     }
 
@@ -9890,6 +10075,116 @@ mod tests {
         );
         let dq_norm: f32 = dq_c.iter().map(|x| x * x).sum();
         assert!(dq_norm > 1e-8, "gradients should be non-trivial");
+    }
+
+    /// The CPU reference backward with grouped K/V (`kv_heads` dividing
+    /// `heads`) gives the bits of the same call on K/V expanded to every
+    /// query head followed by the expansion's adjoint (the group sum
+    /// `reduce_to_shape` did when `nsl.nn.gqa` expanded K/V in NSL source):
+    /// dQ, and dK/dV after the group sum, bit for bit, causal or not.
+    #[test]
+    fn grouped_kv_cpu_backward_is_the_expanded_backward_bit_for_bit() {
+        fn mk(data: &[f32], shape: &[i64]) -> i64 {
+            let ndim = shape.len() as i64;
+            let shape_ptr = crate::memory::checked_alloc(std::mem::size_of_val(shape)) as *mut i64;
+            for (i, &v) in shape.iter().enumerate() {
+                unsafe { *shape_ptr.add(i) = v };
+            }
+            let strides = NslTensor::compute_strides(shape_ptr, ndim);
+            let data_ptr = crate::memory::checked_alloc(std::mem::size_of_val(data)) as *mut f32;
+            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), data_ptr, data.len()) };
+            let t = Box::new(NslTensor::new(
+                data_ptr as *mut std::ffi::c_void,
+                shape_ptr,
+                strides,
+                ndim,
+                shape.iter().product(),
+                0,
+                1,
+                1,
+                0,
+            ));
+            Box::into_raw(t) as i64
+        }
+        fn values(ptr: i64) -> Vec<u32> {
+            let t = NslTensor::from_ptr(ptr);
+            assert_eq!((t.dtype, t.device), (1, 0), "CPU f32 gradients");
+            (0..t.len as usize)
+                .map(|i| unsafe { *t.data_f32().add(i) }.to_bits())
+                .collect()
+        }
+        let (b, h, kv, s, d) = (2usize, 6usize, 2usize, 5usize, 4usize);
+        let g = h / kv;
+        let scale = 1.0 / (d as f32).sqrt();
+        let nq = b * h * s * d;
+        let nkv = b * kv * s * d;
+        let q: Vec<f32> = (0..nq).map(|i| (i as f32 * 0.37).sin() * 0.8).collect();
+        let k: Vec<f32> = (0..nkv)
+            .map(|i| (i as f32 * 0.19 + 1.0).cos() * 0.7)
+            .collect();
+        let v: Vec<f32> = (0..nkv)
+            .map(|i| (i as f32 * 0.41 + 2.0).sin() * 0.6)
+            .collect();
+        let dout: Vec<f32> = (0..nq)
+            .map(|i| (i as f32 * 0.53 + 3.0).cos() * 1e-3)
+            .collect();
+        let expand = |src: &[f32]| -> Vec<f32> {
+            let mut out = vec![0.0f32; nq];
+            for bi in 0..b {
+                for hi in 0..h {
+                    let from = (bi * kv + hi / g) * s * d;
+                    let to = (bi * h + hi) * s * d;
+                    out[to..to + s * d].copy_from_slice(&src[from..from + s * d]);
+                }
+            }
+            out
+        };
+        let (k_exp, v_exp) = (expand(&k), expand(&v));
+        let q_shape = [b as i64, h as i64, s as i64, d as i64];
+        let kv_shape = [b as i64, kv as i64, s as i64, d as i64];
+        for causal in [false, true] {
+            let (out, _) = naive_attention_forward(&q, &k_exp, &v_exp, b, h, s, d, scale, causal);
+            let run = |k_data: &[f32], v_data: &[f32], shape: &[i64]| -> i64 {
+                nsl_flash_attention_backward(
+                    mk(&dout, &q_shape),
+                    mk(&q, &q_shape),
+                    mk(k_data, shape),
+                    mk(v_data, shape),
+                    mk(&out, &q_shape),
+                    0,
+                    scale.to_bits() as i64,
+                    b as i64,
+                    h as i64,
+                    s as i64,
+                    d as i64,
+                    i64::from(causal),
+                    0,
+                    0,
+                    0,
+                    0, // no PTX -> CPU reference
+                    0,
+                    0,
+                    0,
+                )
+            };
+            let grouped = run(&k, &v, &kv_shape);
+            let expanded = run(&k_exp, &v_exp, &q_shape);
+            let gl = crate::list::NslList::from_ptr(grouped);
+            let el = crate::list::NslList::from_ptr(expanded);
+            let at = |l: &crate::list::NslList, i: usize| unsafe { *l.data.add(i) };
+            assert_eq!(values(at(gl, 0)), values(at(el, 0)), "dQ, causal={causal}");
+            let kv_like = mk(&k, &kv_shape);
+            for (i, what) in [(1usize, "dK"), (2, "dV")] {
+                let summed = crate::sdpa_gqa::group_sum_expanded_grad(at(el, i), kv_like, g);
+                let got = values(at(gl, i));
+                assert_eq!(got, values(summed), "{what}, causal={causal}");
+                assert_eq!(got.len(), nkv);
+                assert!(
+                    got.iter().any(|&x| f32::from_bits(x) != 0.0),
+                    "{what} is not all zero"
+                );
+            }
+        }
     }
 
     // ── CSHA A.2.5: FFI launch path tests ────────────────────────────

@@ -2695,6 +2695,12 @@ fn lower_single_op(
                 None
             };
 
+            // Grouped K/V (`kv_heads` dividing `heads`): the decomposed chain
+            // computes on K/V expanded to Q's head count, the copy `nsl.nn.gqa`
+            // used to make in NSL source, so it computes what it did then. The
+            // backward (`nsl_flash_attention_backward`) takes grouped K/V as
+            // they are.
+            let (k, v, kv_expanded) = compiler.emit_sdpa_expand_kv(builder, q, k, v)?;
             // K_T = transpose(K, -2, -1)
             let dim_m2 = builder.ins().iconst(cl_types::I64, -2_i64);
             let dim_m1 = builder.ins().iconst(cl_types::I64, -1_i64);
@@ -2744,6 +2750,9 @@ fn lower_single_op(
             }
             free_tensor_value(compiler, builder, masked)?;
             free_tensor_value(compiler, builder, attn_weights)?;
+            for t in kv_expanded {
+                free_tensor_value(compiler, builder, t)?;
+            }
 
             // NOTE: save-buffer allocation for claimed chains is handled
             // above by option 3a's `emit_fused_forward_under_claim` —
@@ -2809,6 +2818,10 @@ fn lower_single_op(
             let k = inputs[1];
             let v = inputs[2];
             let seg = inputs[4];
+            // Grouped K/V is refused with a message: the packed kernels and
+            // the mask-driven fallback read K/V with Q's head count.
+            let which_packed = builder.ins().iconst(cl_types::I64, 0);
+            call(compiler, builder, "nsl_sdpa_require_equal_kv_heads", &[q, k, v, which_packed])?;
 
             let scale_ty = op
                 .inputs

@@ -540,6 +540,16 @@ macro_rules! for_each_runtime_fn {
             // is the tile-skip variant behind the runtime gate. Keep in lock-step
             // with `nsl_sdpa_fused_forward` in nsl-runtime/src/flash_attention.rs.
             [abi_tensor] nsl_sdpa_fused_forward(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 = flash_attention::nsl_sdpa_fused_forward;
+            // Grouped-query attention: K or V expanded to Q's head count for a
+            // path that computes on expanded K/V (the decomposed SDPA chain, the
+            // `@flash_attention` launch), or 0 when there is nothing to expand.
+            // Keep in lock-step with `nsl_sdpa_expand_kv` in
+            // nsl-runtime/src/sdpa_gqa.rs.
+            [abi_tensor] nsl_sdpa_expand_kv(i64, i64) -> i64 = sdpa_gqa::nsl_sdpa_expand_kv;
+            // The packed and masked attention builtins refuse grouped K/V with a
+            // message (which: 0 = packed, 1 = masked). Keep in lock-step with
+            // `nsl_sdpa_require_equal_kv_heads` in nsl-runtime/src/sdpa_gqa.rs.
+            [abi_tensor] nsl_sdpa_require_equal_kv_heads(i64, i64, i64, i64) -> () = sdpa_gqa::nsl_sdpa_require_equal_kv_heads;
             // PCA Stage C: align packed-batch mask/segment tensors to the params'
             // device at step start (train-block batch prep). No-op for CPU models
             // and unpacked batches. Keep in lock-step with
@@ -1374,6 +1384,6 @@ mod tests {
     fn table_is_the_recorded_size() {
         // The count is pinned so a row dropped by a bad merge is noticed; move
         // it with a row that is deliberately added or removed.
-        assert_eq!(RUNTIME_ABI.len(), 673);
+        assert_eq!(RUNTIME_ABI.len(), 675);
     }
 }

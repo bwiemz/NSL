@@ -990,11 +990,24 @@ impl<'a> SizeProp<'a> {
             }
 
             // out = q's leading dims + v's last dim, valid only in the
-            // regime every lowering path enforces (k exactly q-shaped, v
-            // agreeing in the leading dims); anything looser hits matmul
-            // batch-broadcast in the decomposed path and is refused here.
+            // regime every lowering path enforces: k exactly q-shaped and v
+            // agreeing in the leading dims, or (the plain op, rank 4)
+            // grouped K/V `[b, kv, s, d]` with `kv` dividing q's head count,
+            // v agreeing with k. Anything looser is refused at run time and
+            // left unsized here.
             PrimalOp::ScaledDotProductAttention { .. }
             | PrimalOp::ScaledDotProductAttentionPacked => {
+                let grouped = |sq: &[i64], sk: &[i64], sv: &[i64]| {
+                    matches!(op.op, PrimalOp::ScaledDotProductAttention { .. })
+                        && sq.len() == 4
+                        && sk.len() == 4
+                        && sv.len() == 4
+                        && sk[0] == sq[0]
+                        && sk[2..] == sq[2..]
+                        && sk[1] > 0
+                        && sq[1] % sk[1] == 0
+                        && sv[..3] == sk[..3]
+                };
                 match (
                     self.input_info(op, 0)?,
                     self.input_info(op, 1)?,
@@ -1002,9 +1015,10 @@ impl<'a> SizeProp<'a> {
                 ) {
                     (Shape(sq), Shape(sk), Shape(sv))
                         if sq.len() >= 2
-                            && sk == sq
-                            && sv.len() == sq.len()
-                            && sv[..sv.len() - 1] == sq[..sq.len() - 1] =>
+                            && ((sk == sq
+                                && sv.len() == sq.len()
+                                && sv[..sv.len() - 1] == sq[..sq.len() - 1])
+                                || grouped(&sq, &sk, &sv)) =>
                     {
                         let mut out = sq;
                         let last = out.len() - 1;
@@ -2536,12 +2550,20 @@ mod shape_prop_tests {
     }
 
     #[test]
-    fn sdpa_requires_the_uniform_regime() {
+    fn sdpa_requires_the_uniform_or_grouped_regime() {
         let sdpa = |r, q, k_, v| {
             op(
                 r,
                 r,
                 PrimalOp::ScaledDotProductAttention { causal: true },
+                vec![q, k_, v],
+            )
+        };
+        let packed = |r, q, k_, v| {
+            op(
+                r,
+                r,
+                PrimalOp::ScaledDotProductAttentionPacked,
                 vec![q, k_, v],
             )
         };
@@ -2552,6 +2574,12 @@ mod shape_prop_tests {
             sdpa(3, 0, 1, 2),
             op(4, 4, PrimalOp::Input("k2".into()), vec![]),
             sdpa(5, 0, 4, 2),
+            op(6, 6, PrimalOp::Input("v2".into()), vec![]),
+            sdpa(7, 0, 4, 6),
+            op(8, 8, PrimalOp::Input("k3".into()), vec![]),
+            op(9, 9, PrimalOp::Input("v3".into()), vec![]),
+            sdpa(10, 0, 8, 9),
+            packed(11, 0, 4, 6),
         ]);
         let k = run(
             &fwd,
@@ -2560,12 +2588,30 @@ mod shape_prop_tests {
                 (0, vec![2, 8, 128, 64]),
                 (1, vec![2, 8, 128, 64]),
                 (2, vec![2, 8, 128, 64]),
-                (4, vec![2, 4, 128, 64]), // GQA-unexpanded K: refuse
+                (4, vec![2, 4, 128, 64]), // grouped K
+                (6, vec![2, 4, 128, 64]), // grouped V
+                (8, vec![2, 3, 128, 64]), // 3 does not divide 8
+                (9, vec![2, 3, 128, 64]),
             ],
             &[],
         );
         assert_eq!(k.get(&3), Some(&Shape(vec![2, 8, 128, 64])));
-        assert_eq!(k.get(&5), None, "K not q-shaped -> outside the proven regime");
+        assert_eq!(
+            k.get(&5),
+            None,
+            "grouped K with expanded V -> outside the proven regime"
+        );
+        assert_eq!(
+            k.get(&7),
+            Some(&Shape(vec![2, 8, 128, 64])),
+            "grouped K/V: q-shaped output"
+        );
+        assert_eq!(
+            k.get(&10),
+            None,
+            "kv heads that do not divide q heads are refused at run time"
+        );
+        assert_eq!(k.get(&11), None, "the packed op refuses grouped K/V");
     }
 
     #[test]
