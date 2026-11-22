@@ -426,6 +426,9 @@ struct Planner<'a> {
     /// optimizer), whatever rule 6 says for values.
     param_view: HashSet<VarId>,
     clones: &'a HashMap<VarId, VarId>,
+    /// Each recompute clone and each CCR shape stub, mapped to the primal
+    /// value it stands for (see [`Planner::grad_is_bf16`]).
+    stand_in: HashMap<VarId, VarId>,
 }
 
 impl Planner<'_> {
@@ -435,10 +438,18 @@ impl Planner<'_> {
 
     /// Rule 6: a gradient is stored as its value is, except a norm output's
     /// and a parameter's.
+    ///
+    /// A target that is a recompute clone or a shape stub is the value it
+    /// stands for (rule 2), resolved through its original: the backward can
+    /// reach the GEMM producing a value's gradient before the clone group
+    /// that recomputes the value (CCR splices a block's clones at their
+    /// first reader, and the down projection's dgrad reads none of them), and
+    /// a stub is no op of either list. Asking the clone itself made such a
+    /// GEMM, and the whole MLP backward after it, f32 in exactly the blocks
+    /// whose clones were spliced late.
     fn grad_is_bf16(&self, target: VarId) -> bool {
-        self.is_bf16(target)
-            && !self.norm_out.contains(&target)
-            && !self.param_view.contains(&target)
+        let t = self.stand_in.get(&target).copied().unwrap_or(target);
+        self.is_bf16(t) && !self.norm_out.contains(&t) && !self.param_view.contains(&t)
     }
 
     fn set(&mut self, op: &WengertOp, st: Storage) {
@@ -606,26 +617,34 @@ impl Planner<'_> {
 /// `adjoint` to the primal value it recomputes (empty without CCR).
 #[cfg(test)]
 pub fn plan(primal: &WengertList, adjoint: &WengertList, clones: &HashMap<VarId, VarId>) -> Result<StoragePlan, String> {
-    plan_with_params(primal, adjoint, clones, &HashSet::new())
+    plan_with_params(primal, adjoint, clones, &[], &HashSet::new())
 }
 
 /// [`plan`] with `params` (the `Param` VarIds of [`select_bf16_params`])
 /// stored bf16: they and their views are bf16 values, their gradients f32,
 /// and a GEMM whose only bf16 operand is one of them is in
-/// [`StoragePlan::param_gemm`].
+/// [`StoragePlan::param_gemm`]. `stubs` are CCR's shape stubs
+/// (`CcrPlan::shape_stubs`, `(original, stub)`): the backward reads a stub
+/// in place of its original for that value's shape, so a gradient reduced
+/// onto a stub is the original's gradient, stored as rule 6 says for the
+/// original (as for a clone).
 pub fn plan_with_params(
     primal: &WengertList,
     adjoint: &WengertList,
     clones: &HashMap<VarId, VarId>,
+    stubs: &[(VarId, VarId)],
     params: &HashSet<VarId>,
 ) -> Result<StoragePlan, String> {
     let slices = find_slices(primal);
     let (attn_seeds, attn_norms) = find_attention_seeds(primal);
+    let stand_in: HashMap<VarId, VarId> =
+        clones.iter().map(|(&c, &o)| (c, o)).chain(stubs.iter().map(|&(o, s)| (s, o))).collect();
     let mut pl = Planner {
         plan: StoragePlan { slices: slices.len(), attention: attn_norms.len(), ..Default::default() },
         norm_out: HashSet::new(),
         param_view: params.clone(),
         clones,
+        stand_in,
     };
     pl.plan.bf16.extend(params.iter().copied());
     let prod = producers(primal);
@@ -708,7 +727,8 @@ impl Compiler<'_> {
             None => Vec::new(),
         };
         let params: HashSet<VarId> = selected.iter().map(|&(v, _)| v).collect();
-        let planned = plan_with_params(effective_primal, adjoint, clones, &params)
+        let stubs = ccr_plan.as_ref().map_or(&[][..], |p| &p.shape_stubs[..]);
+        let planned = plan_with_params(effective_primal, adjoint, clones, stubs, &params)
             .map_err(crate::CodegenError::new)?;
         if planned.slices == 0 && planned.attention == 0 {
             // The program's fingerprint (`act=bf16`) and runtime banner were
@@ -985,6 +1005,31 @@ mod tests {
         (primal, adjoint, clones)
     }
 
+    /// CCR splices a block's clone group at its first reader, which can be
+    /// AFTER the down projection's dgrad (that GEMM reads none of the
+    /// victims; its reduce onto the clone of `p` does). The dgrad's storage
+    /// is decided from its target's (rule 4), the clone of `p`, which must
+    /// count as `p` even though the clone has not been visited yet: the plan
+    /// is the same as with the clones spliced first.
+    #[test]
+    fn a_dgrad_before_its_targets_clone_is_planned_as_after_it() {
+        let (primal, adjoint, clones) = block();
+        let want = plan(&primal, &adjoint, &clones).expect("plans");
+        let mut late = adjoint.clone();
+        let pos = |l: &WengertList, v: VarId| l.ops.iter().position(|o| o.result == v).unwrap();
+        // Move the clones of `s` and `p` (752, 753) to right before the
+        // reduce onto `p`'s clone (502), i.e. after the dgrad (501).
+        let s_clone = late.ops.remove(pos(&late, 752));
+        let p_clone = late.ops.remove(pos(&late, 753));
+        let at = pos(&late, 502);
+        late.ops.splice(at..at, [s_clone, p_clone]);
+        assert!(pos(&late, 501) < pos(&late, 753), "the fixture must put the dgrad first");
+        let got = plan(&primal, &late, &clones).expect("plans");
+        assert_eq!(got.out.get(&501), Some(&Storage::Bf16), "the dgrad of p's gradient");
+        assert_eq!(got.out, want.out);
+        assert_eq!(got.bf16, want.bf16);
+    }
+
     /// Every value's dtype and every dtype-explicit op, derived by hand from
     /// the design's table (3.2) for this block, then compared whole.
     #[test]
@@ -1051,7 +1096,7 @@ mod tests {
         let (primal, adjoint, clones) = block();
         let base = plan(&primal, &adjoint, &clones).expect("plans");
         let params: HashSet<VarId> = [126, 133, 136, 139].into_iter().collect();
-        let got = plan_with_params(&primal, &adjoint, &clones, &params).expect("plans");
+        let got = plan_with_params(&primal, &adjoint, &clones, &[], &params).expect("plans");
         use Storage::{Bf16, F32};
         for (v, st) in [
             (504, F32),
