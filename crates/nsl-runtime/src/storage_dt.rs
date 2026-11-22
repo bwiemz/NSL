@@ -69,7 +69,7 @@ pub fn activation_storage() -> u16 {
     ACTIVATION_STORAGE.load(Ordering::Relaxed)
 }
 
-fn refuse_tape(op: &str) {
+pub(crate) fn refuse_tape(op: &str) {
     if crate::autodiff::is_recording() {
         crate::fatal::die(
             crate::fatal::Fatal::Unsupported,
@@ -117,7 +117,7 @@ fn fast_path(ts: &[&NslTensor]) -> bool {
         && ts.iter().all(|t| t.device == first.device && t.is_contiguous() && t.shape_eq(first))
 }
 
-fn announce_fallback(op: &str) {
+pub(crate) fn announce_fallback(op: &str) {
     FALLBACKS.fetch_add(1, Ordering::Relaxed);
     if !ANNOUNCED.swap(true, Ordering::Relaxed) {
         crate::nsl_log!(

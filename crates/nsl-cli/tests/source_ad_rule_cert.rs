@@ -717,6 +717,15 @@ fn base_certs() -> Vec<Cert> {
                     .collect();
                 Arr { shape: vec![1, 2, 3, 4], data }
             }), known: &[], prelude: "" },
+        // The fused SwiGLU: source AD rewrites `silu(x) * y` into one
+        // `swiglu` op (`fuse_swiglu_forward`) with its own adjoint; the tape
+        // records the silu and the multiply. The row variant broadcasts `y`,
+        // which takes the runtime op's decomposed path and the up adjoint's
+        // reduce back to `y`'s shape.
+        Cert { name: "swiglu", inputs: XY_SAME.to_vec(), expr: "silu(x) * y", wrt: &["x", "y"], out_shape: &[3, 4],
+            oracle: oracle!(|e| binary(get(e, "x"), get(e, "y"), |a, b| a * sigmoid_ref(a) * b)), known: &[], prelude: "" },
+        Cert { name: "swiglu_row", inputs: XY_ROW.to_vec(), expr: "silu(x) * y", wrt: &["x", "y"], out_shape: &[3, 4],
+            oracle: oracle!(|e| binary(get(e, "x"), get(e, "y"), |a, b| a * sigmoid_ref(a) * b)), known: &[], prelude: "" },
         // --- shape -------------------------------------------------------
         Cert { name: "transpose", inputs: vec![inp("x", &[3, 4])], expr: "x.transpose(0, 1)", wrt: &["x"], out_shape: &[4, 3],
             oracle: oracle!(|e| transpose2(get(e, "x"), 0, 1)), known: &[], prelude: "" },
@@ -1721,6 +1730,7 @@ cert_tests! {
     transpose, transpose_3d, reshape, unsqueeze, expand, contiguous,
     rotate_half,
     rope,
+    swiglu, swiglu_row,
     sum_all, mean_all, sum_dim, mean_dim, sum_dim_neg, sum_dim_keepdim, sum_dim_last, mean_dim_last,
     softmax_last, softmax_dim0, softmax_mid, log_softmax_last, log_softmax_dim0, log_softmax_mid,
     layernorm, layernorm_eps, rmsnorm, rmsnorm_eps, layernorm_3d, layernorm_field_eps, rmsnorm_field_eps, rmsnorm_field_eps_reused,

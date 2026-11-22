@@ -104,10 +104,20 @@ impl Compiler<'_> {
                 .assert_tape_unchanged_since("WRGA", extractor.wengert_list())
                 .map_err(CodegenError::new)?;
         }
-        let effective_primal: crate::wengert::WengertList = match wrga_plan {
+        let mut effective_primal: crate::wengert::WengertList = match wrga_plan {
             Some(plan) => plan.prune.pruned.clone(),
             None => extractor.wengert_list().clone(),
         };
+        // `silu(g) * u` -> one `swiglu` op, on the fork every later phase
+        // reads: CCR plans its recompute set over the fused op, the adjoint
+        // is generated from it, the storage plan stores it. Here, after the
+        // positional consumers of the extractor's list (WRGA above) and
+        // before the first planner of the fork (CCR below).
+        // `NSL_FUSE_SWIGLU=0` keeps the unfused pair.
+        let swiglu_fused = crate::source_ad::fuse_swiglu_forward(&mut effective_primal, &Default::default());
+        if swiglu_fused > 0 {
+            nsl_log::nsl_log!(INFO, "fuse", "[fuse] swiglu forward: {swiglu_fused}");
+        }
 
         // Dev-tools paper completion: snapshot the REAL train-block
         // artifacts for `nsl profile`'s real path. The slot is
@@ -158,7 +168,6 @@ impl Compiler<'_> {
         // `@checkpoint(policy="selective")` decorator used to switch it on
         // too, for the whole train block and whether or not the step called
         // the decorated function; the checker now refuses that policy.
-        let mut effective_primal = effective_primal;
         let mut ccr_compress_map: std::collections::HashMap<
             crate::wengert::VarId,
             crate::wengert::VarId,

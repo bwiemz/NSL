@@ -300,6 +300,13 @@ pub fn compile_wengert_ops_range(
         None
     };
     let range_start = range.start;
+    // The fused SwiGLU's adjoints (and the backward's own `swiglu` of the
+    // same operands), lowered as ONE launch where they are in this range
+    // (see `swiglu_backward_groups`). `swiglu_stash` carries the up adjoint's
+    // (and the forward value's) Value from the launch at the gate op to the
+    // op that defines it.
+    let swiglu_groups = swiglu_backward_groups(compiler, wengert, range.clone());
+    let mut swiglu_stash: HashMap<VarId, Value> = HashMap::new();
     for (rel_i, op) in wengert.ops[range].iter().enumerate() {
         let abs_i = range_start + rel_i;
         // Item 7: the transpose and batched matmul of a fused weight-gradient
@@ -499,9 +506,21 @@ pub fn compile_wengert_ops_range(
         // `precision="bf16"`: an op the storage plan covers (it stores bf16,
         // or reads a bf16 value) goes through a dtype-explicit entry point
         // that names its output dtype. Empty plan: every op as before.
-        let result_val = match compiler.storage_out.get(&op.result).copied() {
-            Some(storage) => lower_storage_op(compiler, builder, op, var_map, storage)?,
-            None => lower_single_op(compiler, builder, op, var_map, var_types)?,
+        let result_val = if let Some(v) = swiglu_stash.remove(&op.result) {
+            // Computed by the grouped launch at its gate op.
+            v
+        } else if let Some(&(up_vid, h_vid)) = swiglu_groups.get(&op.result) {
+            let (dgate, dup, h) = lower_swiglu_backward_group(compiler, builder, op, h_vid.is_some(), var_map)?;
+            swiglu_stash.insert(up_vid, dup);
+            if let (Some(h_vid), Some(h)) = (h_vid, h) {
+                swiglu_stash.insert(h_vid, h);
+            }
+            dgate
+        } else {
+            match compiler.storage_out.get(&op.result).copied() {
+                Some(storage) => lower_storage_op(compiler, builder, op, var_map, storage)?,
+                None => lower_single_op(compiler, builder, op, var_map, var_types)?,
+            }
         };
         if placement.is_some() {
             // Verify-and-disarm: the pin's exact-size rule cannot tell the
@@ -1578,6 +1597,96 @@ fn passthrough_norm_eps(
     Ok(builder.ins().f64const(f64::from_bits(bits)))
 }
 
+/// The fused SwiGLU's adjoint groups of `wengert.ops[range]` that lower as
+/// one launch: `swiglu_gate_backward(grad, up, gate)`, a LATER
+/// `swiglu_up_backward(grad, gate)` reading the same `grad` and `gate`, and,
+/// when there is one later still, a `swiglu(gate, up)` of the same operands
+/// (the forward value the backward recomputes for the down projection's
+/// weight gradient, `source_ad::fuse_swiglu_recompute_into_backward`). All
+/// with the same planned storage (bf16 plan) or all unplanned, and none
+/// pinned by the transient arena (a pin is single-allocation; the grouped
+/// launch makes several). Maps the gate op's result to the up op's and the
+/// recompute's. A group split across two ranges (a CSLA replay boundary)
+/// lowers op by op. `NSL_FUSE_SWIGLU=fwd` disables the grouping.
+fn swiglu_backward_groups(
+    compiler: &Compiler,
+    wengert: &WengertList,
+    range: std::ops::Range<usize>,
+) -> HashMap<VarId, (VarId, Option<VarId>)> {
+    let mut pairs = HashMap::new();
+    if crate::source_ad::swiglu_fusion_mode() != crate::source_ad::SwigluFusion::Full {
+        return pairs;
+    }
+    let is = |op: &WengertOp, name: &str, n: usize| {
+        matches!(&op.op, PrimalOp::Passthrough(p) if p == name) && op.inputs.len() == n
+    };
+    let ops = &wengert.ops[range];
+    let mut taken: std::collections::HashSet<VarId> = std::collections::HashSet::new();
+    for (i, g) in ops.iter().enumerate() {
+        if !is(g, "swiglu_gate_backward", 3) {
+            continue;
+        }
+        let (grad, gate) = (g.inputs[0], g.inputs[2]);
+        let Some(u) = ops[i + 1..].iter().find(|u| {
+            is(u, "swiglu_up_backward", 2)
+                && u.inputs[0] == grad
+                && u.inputs[1] == gate
+                && !taken.contains(&u.result)
+        }) else {
+            continue;
+        };
+        let alike = |o: &WengertOp| {
+            compiler.storage_out.get(&o.result) == compiler.storage_out.get(&g.result)
+                && !compiler.arena_placements.contains_key(&o.result)
+        };
+        if !alike(g) || !alike(u) {
+            continue;
+        }
+        let up = g.inputs[1];
+        let h = ops[i + 1..]
+            .iter()
+            .find(|h| is(h, "swiglu", 2) && h.inputs == [gate, up] && !taken.contains(&h.result) && alike(h))
+            .map(|h| h.result);
+        taken.insert(u.result);
+        if let Some(h) = h {
+            taken.insert(h);
+        }
+        pairs.insert(g.result, (u.result, h));
+    }
+    pairs
+}
+
+/// Lower a grouped `swiglu_gate_backward(grad, up, gate)` (see
+/// [`swiglu_backward_groups`]) as one launch: `(dgate, dup, p)`, `p` (the
+/// forward value) only when `recompute`, each stored as the plan stores the
+/// gate op's result.
+fn lower_swiglu_backward_group(
+    compiler: &mut Compiler,
+    builder: &mut FunctionBuilder,
+    op: &WengertOp,
+    recompute: bool,
+    var_map: &VarMap,
+) -> Result<(Value, Value, Option<Value>), CodegenError> {
+    let inputs = resolve_inputs(op, var_map)?;
+    let base = if recompute { "nsl_tensor_swiglu_backward_recompute" } else { "nsl_tensor_swiglu_backward" };
+    let list = match compiler.storage_out.get(&op.result).copied() {
+        Some(storage) => {
+            let dt = builder.ins().iconst(cl_types::I64, storage.tag());
+            call(compiler, builder, &format!("{base}_dt"), &[inputs[0], inputs[1], inputs[2], dt])?
+        }
+        None => call(compiler, builder, base, &[inputs[0], inputs[1], inputs[2]])?,
+    };
+    let mut get = |builder: &mut FunctionBuilder, k: i64| {
+        let idx = builder.ins().iconst(cl_types::I64, k);
+        call(compiler, builder, "nsl_list_get", &[list, idx])
+    };
+    let dgate = get(builder, 0)?;
+    let dup = get(builder, 1)?;
+    let p = if recompute { Some(get(builder, 2)?) } else { None };
+    call(compiler, builder, "nsl_list_free", &[list])?;
+    Ok((dgate, dup, p))
+}
+
 /// Lower one WengertOp to Cranelift IR.
 /// Lower an op of the bf16 storage plan (`stmt_train/storage_plan.rs`)
 /// through the runtime's dtype-explicit entry points, storing its result as
@@ -1646,6 +1755,12 @@ fn lower_storage_op(
             "nsl_tensor_swiglu_gate_backward_dt",
             &[inputs[0], inputs[1], inputs[2], dt],
         ),
+        PrimalOp::Passthrough(name) if name == "swiglu" => {
+            call(compiler, builder, "nsl_tensor_swiglu_dt", &[inputs[0], inputs[1], dt])
+        }
+        PrimalOp::Passthrough(name) if name == "swiglu_up_backward" => {
+            call(compiler, builder, "nsl_tensor_swiglu_up_backward_dt", &[inputs[0], inputs[1], dt])
+        }
         PrimalOp::Passthrough(name) if name == "rotate_half" || name == "rotate_half_neg" => {
             let neg = builder.ins().iconst(cl_types::I64, i64::from(name == "rotate_half_neg"));
             call(compiler, builder, "nsl_tensor_rotate_half_dt", &[inputs[0], neg, dt])
@@ -3922,6 +4037,12 @@ fn lower_single_op(
                 "rope" => call(compiler, builder, "nsl_tensor_rope", &[inputs[0], inputs[1], inputs[2]]),
                 "rope_backward" => {
                     call(compiler, builder, "nsl_tensor_rope_backward", &[inputs[0], inputs[1], inputs[2]])
+                }
+                // The fused SwiGLU (`source_ad::fuse_swiglu_forward`) and the
+                // up branch's adjoint; inputs [gate, up] and [grad, gate].
+                "swiglu" => call(compiler, builder, "nsl_tensor_swiglu", &[inputs[0], inputs[1]]),
+                "swiglu_up_backward" => {
+                    call(compiler, builder, "nsl_tensor_swiglu_up_backward", &[inputs[0], inputs[1]])
                 }
                 // Fused RoPE backward: -rotate_half(dy) as one kernel (bit-exact —
                 // a permutation with a sign flip has no rounding).

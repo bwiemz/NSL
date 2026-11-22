@@ -30,6 +30,11 @@ pub(crate) struct AdjointTapeOptInputs<'a> {
     pub(crate) generator: &'a crate::source_ad::AdjointGenerator,
     /// The WRGA plan; `Some` carries the backward-live set of the prune pass.
     pub(crate) wrga_plan: &'a Option<crate::wrga::WrgaPlan>,
+    /// The forward the adjoint was generated from (the SwiGLU recompute
+    /// fold reads its fused ops).
+    pub(crate) effective_primal: &'a crate::wengert::WengertList,
+    /// The CCR plan, before its splice (`None` without checkpointing).
+    pub(crate) ccr_plan: &'a Option<crate::ccr::CcrPlan>,
 }
 
 impl Compiler<'_> {
@@ -41,6 +46,8 @@ impl Compiler<'_> {
             extractor,
             generator,
             wrga_plan,
+            effective_primal,
+            ccr_plan,
         } = inputs;
 
         // 6a. (removed) The WRGA backward-live filter used to run here and
@@ -83,6 +90,39 @@ impl Compiler<'_> {
         let swiglu_fused = crate::source_ad::fuse_swiglu_gate_backward(&mut adjoint.ops, &adjoint_needed);
         if swiglu_fused > 0 {
             nsl_log::nsl_log!(INFO, "fuse", "[fuse] swiglu gate-backward pairs: {swiglu_fused}");
+        }
+        // The SwiGLU fusion, step 2: where CCR recomputes a fused
+        // `swiglu` value only for the down projection's weight gradient,
+        // the backward's adjoint launch produces it instead (see
+        // `fuse_swiglu_recompute_into_backward`). Only where CCR will serve
+        // the remaining shape read with a stub (segment-end frees), will not
+        // flip the value back to a save (no byte budget), and does not
+        // partition this tape by position (`--layerwise-accum`).
+        if let Some(plan) = ccr_plan
+            && self.ccr_frees_per_segment()
+            && self.compile_options.checkpoint.budget_mib.is_none()
+            && !self.compile_options.train.layerwise_accum
+        {
+            let mut fresh = effective_primal
+                .ops
+                .iter()
+                .chain(adjoint.ops.iter())
+                .flat_map(|o| std::iter::once(o.result).chain(o.inputs.iter().copied()))
+                .max()
+                .map_or(0, |m| m + 1);
+            // Only a victim CCR may free: a shape read of any other is still
+            // served by a clone (`ccr::backward_reads`), and the fold would then
+            // compute `p` twice.
+            let foldable: HashSet<VarId> = plan.recompute.intersection(&plan.free_eligible).copied().collect();
+            let folded = crate::source_ad::fuse_swiglu_recompute_into_backward(
+                adjoint,
+                effective_primal,
+                &foldable,
+                &mut fresh,
+            );
+            if folded > 0 {
+                nsl_log::nsl_log!(INFO, "fuse", "[fuse] swiglu recompute folded into the backward: {folded}");
+            }
         }
         // P5 slice C: fold residual-gradient accumulates into fused
         // RMSNorm dx ops (bit-exact; no-op unless

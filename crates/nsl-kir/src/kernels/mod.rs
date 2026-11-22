@@ -36,5 +36,6 @@ pub mod softmax;
 pub mod storage;
 pub mod strided_copy;
 pub mod sum_sq;
+pub mod swiglu;
 pub mod tensor_stats;
 pub mod tier_b1_prepass;

@@ -31,6 +31,7 @@ enum Kernel {
     RotateHalf(RotateHalfOp, Storage, Storage),
     Norm(NormOp, Storage, Storage),
     Rope(nsl_kir::kernels::rope::RopeDir, Storage, Storage),
+    Swiglu(nsl_kir::kernels::swiglu::SwigluKernel),
 }
 
 /// The NUL-terminated PTX module and entry name of `k`, lowered once and kept
@@ -49,6 +50,7 @@ fn module(k: Kernel) -> (&'static str, &'static str) {
             Kernel::RotateHalf(op, i, out) => ew::build_rotate_half_st(op, i, out),
             Kernel::Norm(op, i, out) => nsl_kir::kernels::norm::build_st(op, i, out),
             Kernel::Rope(dir, i, out) => nsl_kir::kernels::rope::build(dir, i, out),
+            Kernel::Swiglu(k) => k.build(),
         };
         let name: &'static str = Box::leak(format!("{}\0", ir.name).into_boxed_str());
         if let Err(errors) = nsl_kir::kir_verify::verify(&ir) {
@@ -193,4 +195,197 @@ pub(crate) fn rope(dir: nsl_kir::kernels::rope::RopeDir, x: i64, cos: i64, sin: 
         &mut [data(x), data(cos), data(sin), data(c), n as u64, dim(3), dim(2), dim(1), st(0), st(1), st(2), st(3)],
     );
     c
+}
+
+/// The fused SwiGLU kernels' elements per thread (`nsl_kir::kernels::swiglu`):
+/// the widest of the family's widths, up to `SWIGLU_MAX_WIDTH`, that divides
+/// `n` and to whose four-element vector access every operand is aligned;
+/// one element per thread otherwise.
+const SWIGLU_MAX_WIDTH: u32 = 8;
+
+fn swiglu_width(n: usize, operands: &[(i64, Storage)]) -> u32 {
+    let aligned = operands.iter().all(|&(t, s)| data(t).is_multiple_of(4 * s.bytes() as u64));
+    nsl_kir::kernels::swiglu::WIDTHS
+        .iter()
+        .rev()
+        .copied()
+        .find(|&w| w <= SWIGLU_MAX_WIDTH && (w == 1 || (aligned && n.is_multiple_of(w as usize))))
+        .unwrap_or(1)
+}
+
+/// Launch a fused SwiGLU kernel over `n` elements: `tensors` are its tensor
+/// parameters in order (inputs, then outputs), all `n` long.
+fn launch_swiglu(op: nsl_kir::kernels::swiglu::SwigluOp, ins: &[i64], outs: &[i64], out: Storage, round_silu: bool) {
+    launch_swiglu_width(op, ins, outs, out, round_silu, None);
+}
+
+/// [`launch_swiglu`] with the width forced (`Some`, which the caller must
+/// have checked is legal for these operands) or chosen (`None`).
+fn launch_swiglu_width(
+    op: nsl_kir::kernels::swiglu::SwigluOp,
+    ins: &[i64],
+    outs: &[i64],
+    out: Storage,
+    round_silu: bool,
+    width: Option<u32>,
+) {
+    let n = NslTensor::from_ptr_ref(ins[0]).len as usize;
+    let in_st: Vec<Storage> = ins.iter().map(|&t| storage_of(NslTensor::from_ptr_ref(t))).collect();
+    let operands: Vec<(i64, Storage)> =
+        ins.iter().copied().zip(in_st.iter().copied()).chain(outs.iter().map(|&t| (t, out))).collect();
+    let width = width.unwrap_or_else(|| swiglu_width(n, &operands));
+    let k = Kernel::Swiglu(nsl_kir::kernels::swiglu::SwigluKernel::new(op, &in_st, out, width, round_silu));
+    let mut args: Vec<u64> = ins.iter().chain(outs).map(|&t| data(t)).collect();
+    args.push(n as u64);
+    let threads = (n / width as usize) as i64;
+    launch_grid(k, (threads + 255) / 256, 0, &mut args);
+}
+
+/// `silu(gate) * up`, both one shape and contiguous.
+pub(crate) fn swiglu_forward(gate: i64, up: i64, out: Storage, round_silu: bool) -> i64 {
+    super::inner::set_oom_context("swiglu");
+    let c = alloc_like(NslTensor::from_ptr_ref(gate), out);
+    launch_swiglu(nsl_kir::kernels::swiglu::SwigluOp::Forward, &[gate, up], &[c], out, round_silu);
+    c
+}
+
+/// `grad * silu(gate)`, both one shape and contiguous.
+pub(crate) fn swiglu_up_backward(grad: i64, gate: i64, out: Storage, round_silu: bool) -> i64 {
+    super::inner::set_oom_context("swiglu_up_backward");
+    let c = alloc_like(NslTensor::from_ptr_ref(grad), out);
+    launch_swiglu(nsl_kir::kernels::swiglu::SwigluOp::UpBackward, &[grad, gate], &[c], out, round_silu);
+    c
+}
+
+/// `(dgate, dup, p)` from one launch (`p = silu(gate) * up`, the forward
+/// value), every operand one shape and contiguous.
+pub(crate) fn swiglu_backward_recompute(grad: i64, up: i64, gate: i64, out: Storage, round_silu: bool) -> (i64, i64, i64) {
+    super::inner::set_oom_context("swiglu_backward_recompute");
+    let like = NslTensor::from_ptr_ref(grad);
+    let dg = alloc_like(like, out);
+    let du = alloc_like(like, out);
+    let p = alloc_like(like, out);
+    launch_swiglu(
+        nsl_kir::kernels::swiglu::SwigluOp::BackwardRecompute,
+        &[grad, up, gate],
+        &[dg, du, p],
+        out,
+        round_silu,
+    );
+    (dg, du, p)
+}
+
+/// `(dgate, dup)` from one launch, every operand one shape and contiguous.
+pub(crate) fn swiglu_backward(grad: i64, up: i64, gate: i64, out: Storage, round_silu: bool) -> (i64, i64) {
+    super::inner::set_oom_context("swiglu_backward");
+    let like = NslTensor::from_ptr_ref(grad);
+    let dg = alloc_like(like, out);
+    let du = alloc_like(like, out);
+    launch_swiglu(nsl_kir::kernels::swiglu::SwigluOp::Backward, &[grad, up, gate], &[dg, du], out, round_silu);
+    (dg, du)
+}
+
+#[cfg(test)]
+mod swiglu_timing {
+    //! Diagnostic, not a gate: GPU time of the fused SwiGLU kernels at each
+    //! width against the unfused launches they replace, on the Coder-1B MLP
+    //! activation (`[4096, 8192]` bf16). Run with
+    //! `cargo test -p nsl-runtime --lib --features cuda swiglu_timing -- --ignored --nocapture`.
+    //! The printed times are host wall time over 20 calls (a loaded CPU inflates them);
+    //! the kernel profiler is on, so `kernel_profile.json` in the working directory has
+    //! each launch's GPU time from CUDA events.
+    use super::*;
+    use nsl_kir::kernels::elementwise::{BinaryOp, UnaryOp};
+    use nsl_kir::kernels::swiglu::SwigluOp;
+
+    fn randn_bf16(rows: i64, cols: i64) -> i64 {
+        let l = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(l, rows);
+        crate::list::nsl_list_push(l, cols);
+        let host = crate::tensor::creation::nsl_tensor_randn(l);
+        crate::list::nsl_list_free(l);
+        let dev = crate::tensor::nsl_tensor_to_device(host, 1);
+        crate::tensor::nsl_tensor_free(host);
+        let b = crate::tensor::precision_cast::convert_untaped(dev, DTYPE_BF16);
+        crate::tensor::nsl_tensor_free(dev);
+        b
+    }
+
+    /// Mean microseconds per call of `f` over `reps` calls (after 3 warm-up
+    /// calls), each call's outputs freed at once (the caching allocator hands
+    /// the same blocks back, so no call pays for a driver allocation).
+    fn time(reps: usize, mut f: impl FnMut() -> Vec<i64>) -> f64 {
+        let mut call = || {
+            for t in f() {
+                crate::tensor::nsl_tensor_free(t);
+            }
+        };
+        for _ in 0..3 {
+            call();
+        }
+        crate::math::nsl_cuda_device_synchronize();
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            call();
+        }
+        crate::math::nsl_cuda_device_synchronize();
+        t0.elapsed().as_secs_f64() * 1e6 / reps as f64
+    }
+
+    #[test]
+    #[ignore = "diagnostic: times the fused SwiGLU kernels on the GPU"]
+    fn swiglu_kernel_timing() {
+        assert_eq!(crate::cuda::nsl_cuda_init(), 0);
+        crate::kernel_profiler::nsl_kernel_profiler_start();
+        let (rows, cols) = (4096i64, 8192i64);
+        let (g, u, dy) = (randn_bf16(rows, cols), randn_bf16(rows, cols), randn_bf16(rows, cols));
+        let pass_mib = (rows * cols * 2) as f64 / (1024.0 * 1024.0);
+        let report = |name: &str, passes: f64, us: f64| {
+            let gbs = passes * pass_mib * 1024.0 * 1024.0 / (us * 1e-6) / 1e9;
+            eprintln!("{name:<44} {us:>8.1} us  {passes:>2} passes  {gbs:>6.0} GB/s");
+        };
+        let b = Storage::Bf16;
+        let reps = 20;
+        // Twice each, in turn, so a first-use cost or a clock change shows up
+        // as a disagreement between the two passes.
+        for pass in 0..2 {
+            eprintln!("-- pass {pass}");
+            report("unfused silu (nsl_silu_b_b)", 2.0, time(reps, || vec![unary(UnaryOp::Silu, g, b)]));
+            report("unfused mul (nsl_mul_bb_b)", 3.0, time(reps, || vec![binary(BinaryOp::Mul, g, u, b)]));
+            report("unfused gate backward (swiglu_gate_bbb_b)", 4.0, time(reps, || vec![swiglu_gate(dy, u, g, b)]));
+            report("copy-like: unary neg (nsl_neg_b_b)", 2.0, time(reps, || vec![unary(UnaryOp::Neg, g, b)]));
+        for w in nsl_kir::kernels::swiglu::WIDTHS {
+            let fwd = time(reps, || {
+                let c = alloc_like(NslTensor::from_ptr_ref(g), b);
+                launch_swiglu_width(SwigluOp::Forward, &[g, u], &[c], b, false, Some(w));
+                vec![c]
+            });
+            report(&format!("fused forward width {w}"), 3.0, fwd);
+            let up = time(reps, || {
+                let c = alloc_like(NslTensor::from_ptr_ref(g), b);
+                launch_swiglu_width(SwigluOp::UpBackward, &[dy, g], &[c], b, false, Some(w));
+                vec![c]
+            });
+            report(&format!("fused up backward width {w}"), 3.0, up);
+            let bwd = time(reps, || {
+                let dg = alloc_like(NslTensor::from_ptr_ref(g), b);
+                let du = alloc_like(NslTensor::from_ptr_ref(g), b);
+                launch_swiglu_width(SwigluOp::Backward, &[dy, u, g], &[dg, du], b, false, Some(w));
+                vec![dg, du]
+            });
+            report(&format!("fused backward (dg, du) width {w}"), 5.0, bwd);
+            let bwdh = time(reps, || {
+                let dg = alloc_like(NslTensor::from_ptr_ref(g), b);
+                let du = alloc_like(NslTensor::from_ptr_ref(g), b);
+                let p = alloc_like(NslTensor::from_ptr_ref(g), b);
+                launch_swiglu_width(SwigluOp::BackwardRecompute, &[dy, u, g], &[dg, du, p], b, false, Some(w));
+                vec![dg, du, p]
+            });
+            report(&format!("fused backward (dg, du, h) width {w}"), 6.0, bwdh);
+        }
+        }
+        for t in [g, u, dy] {
+            crate::tensor::nsl_tensor_free(t);
+        }
+    }
 }

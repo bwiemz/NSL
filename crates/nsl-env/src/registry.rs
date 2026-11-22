@@ -681,13 +681,22 @@ pub static REGISTRY: &[EnvVar] = &[
         "Kill switch for rewriting x OP const backward ops into scalar-immediate launches (bit-exact; skips the host scalar alloc/HtoD)."
     ),
     var!(
+        "NSL_FUSE_SWIGLU",
+        Enum,
+        "0 = off; fwd = forward only (two backward launches); anything else or unset = on",
+        "on",
+        Behavior,
+        Compile,
+        "Kill switch for the fused SwiGLU silu(g)*u op and its one-launch backward; 0 restores the unfused lowering (bf16 storage: rounds silu once more)."
+    ),
+    var!(
         "NSL_FUSE_SWIGLU_GATE",
         Bool,
         "0 disables; anything else or unset = on",
         "on",
         Perf,
         Compile,
-        "Kill switch for fusing the SwiGLU gate gradient (Mul, reduce_to_shape, silu_backward) into one swiglu_gate_backward op (bit-exact)."
+        "Kill switch for the bit-exact gate-gradient peephole (Mul, reduce_to_shape, silu_backward); only the unfused graph (NSL_FUSE_SWIGLU=0) has that pair."
     ),
     var!(
         "NSL_GATHER_DIM_GPU",
@@ -1381,6 +1390,15 @@ pub static REGISTRY: &[EnvVar] = &[
         Behavior,
         Runtime,
         "Set to 1 to compute a GPU tensor's sum of squares with the exact f64 CPU reduction instead of the f32-accumulating kernel."
+    ),
+    var!(
+        "NSL_SWIGLU_ROUND_SILU",
+        Bool,
+        "1 only",
+        "off",
+        Behavior,
+        Runtime,
+        "Set to 1 to round silu(g) to bf16 inside the fused SwiGLU kernels, as the unfused chain stores it: bit-identical to NSL_FUSE_SWIGLU=0."
     ),
     var!(
         "NSL_TAPE_ALLOW_DISCONNECTED",
