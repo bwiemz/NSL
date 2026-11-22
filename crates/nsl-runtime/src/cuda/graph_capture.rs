@@ -1610,7 +1610,7 @@ mod imp {
         }
         let to_repair = with_active(|act| {
             let mut guard = act.borrow_mut();
-            let Some(active) = guard.as_mut() else { return None };
+            let active = guard.as_mut()?;
             match active.mode {
                 Mode::EagerRest => None,
                 Mode::Recording { ref mut tainted } => {

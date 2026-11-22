@@ -1072,7 +1072,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
 
     pub fn contexts_at_peak_sorted(&self) -> Vec<(String, usize, usize)> {
         let mut v = self.contexts_at_peak.clone();
-        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.sort_by_key(|a| std::cmp::Reverse(a.1));
         v
     }
 
@@ -1254,7 +1254,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
     /// Format: Vec<(context, count, total_bytes)> sorted by total_bytes descending.
     pub fn allocated_block_summary(&self) -> Vec<(String, usize, usize)> {
         let mut by_context: HashMap<String, (usize, usize)> = HashMap::new();
-        for (_, &block_ptr) in &self.allocated_blocks {
+        for &block_ptr in self.allocated_blocks.values() {
             let block = unsafe { &*block_ptr };
             let ctx = if block.context.is_empty() { "(no context)" } else { &block.context };
             let entry = by_context.entry(ctx.to_string()).or_insert((0, 0));
@@ -1264,7 +1264,7 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         let mut result: Vec<_> = by_context.into_iter()
             .map(|(ctx, (count, bytes))| (ctx, count, bytes))
             .collect();
-        result.sort_by(|a, b| b.2.cmp(&a.2));
+        result.sort_by_key(|a| std::cmp::Reverse(a.2));
         result
     }
 }
@@ -1521,7 +1521,7 @@ pub(crate) fn print_memory_summary() {
         entry.1 += 1;
     }
     let mut top_contexts: Vec<_> = context_totals.into_iter().collect();
-    top_contexts.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+    top_contexts.sort_by_key(|a| std::cmp::Reverse(a.1 .0));
     let mut top_context_lines = String::new();
     for (context, (bytes, count)) in top_contexts.into_iter().take(8) {
         top_context_lines.push_str(&format!(

@@ -782,7 +782,7 @@ impl CollectiveBackend for GpuStagedBackend {
         if bw == 0 {
             return -1;
         }
-        if count % ws != 0 {
+        if !count.is_multiple_of(ws) {
             return -3;
         }
         let staged = Self::dtoh(sendbuf, count * bw);
