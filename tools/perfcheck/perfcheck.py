@@ -24,12 +24,14 @@ Before/after a compiler change: freeze each toolchain in a directory (`bin/nsl`,
 arms `nsl_tf32@NAME`; both builds then run in the same rounds and `pairs --pair
 nsl_tf32@after/nsl_tf32@before` gives the paired ratio.
 
-Arms. `nsl_tf32`: the 1B production posture (PROD_FLAGS, f32 weights, the runtime's
-default TF32 cuBLAS math mode). `nsl_bf16`: the same flags built and run with
+Arms. `nsl_tf32`: the production flag line (PROD_FLAGS: the run line of the 1B recipe
+and, since 2026-11-22, of the 500M recipe) with f32 weights and the runtime's default
+TF32 cuBLAS math mode. `nsl_bf16`: the same flags built and run with
 NSL_MATMUL_BF16=1 (read at build time; the runtime's banner is checked, and since
 2026-11 a binary run with a disagreeing NSL_MATMUL_BF16 refuses to start).
 `nsl_bf16s`: PROD_FLAGS with `precision="bf16"` in the train header (bf16 activation
-storage, which also sets the bf16 matmul mode; both banners are checked).
+storage, which also sets the bf16 matmul mode; both banners are checked): the posture
+both production recipes run.
 `nsl_*_nodrain`: the same binary under NSL_SKIP_GPU_DRAIN=1. `nsl_*_oldattn`: the same
 binary under NSL_TC_ATTENTION=0 (the attention kernels before the tensor-core ones).
 `nsl_tf32_blocks`: PROD_FLAGS without `--checkpoint-selective` (full block recompute).
@@ -85,6 +87,8 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO / "models" / "benchmarks"))
 import gpu_guard
 
+# The production run line of models/coder1b and models/coder500m (their pretrain_prod.nsl
+# headers; pinned by crates/nsl-cli/tests/pretrain_prod_agreement_gate.rs).
 PROD_FLAGS = [
     "--source-ad",
     "--checkpoint-blocks",

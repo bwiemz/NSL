@@ -3435,6 +3435,39 @@ mod tests {
     }
 
     #[test]
+    fn dropout_is_not_recomputed_under_the_selective_policy() {
+        // The force-save tests above plan under Block. Coder-500M's production
+        // line runs --checkpoint-selective with dropout 0.1, and Selective
+        // replays exactly the cheap elementwise interiors a dropout sits among.
+        // Neither the draw nor the dropout's output may be a recompute victim
+        // there: a re-run draw is a different mask, and the backward would
+        // differentiate values the forward never produced. The dropout sits
+        // after a Relu, which Selective does replay (the control):
+        //   v3 = Matmul(x, w0); v10 = Relu(v3); v9 = <dropout op>(v10);
+        //   v4 = Add(v9, x)
+        for (what, dropout, inputs) in [
+            ("DropoutMask", PrimalOp::DropoutMask { p: 0.1 }, vec![10]),
+            // inputs[1] is the mask slot of the two-op split.
+            ("Dropout", PrimalOp::Dropout { p: 0.1 }, vec![10, 0]),
+        ] {
+            let mut primal = toy_primal();
+            primal.ops[4] = op(4, 4, PrimalOp::Add, vec![9, 0]);
+            primal.ops.insert(4, op(9, 9, dropout, inputs));
+            primal.ops.insert(4, op(10, 10, PrimalOp::Relu, vec![3]));
+            let plan = plan(&primal, None, CcrPolicy::Selective, false, 1).unwrap();
+            assert!(
+                plan.recompute.contains(&10),
+                "control ({what}): the relu before the draw must be replayed, or the \
+                 segment does not cover the op this test is about"
+            );
+            assert!(
+                !plan.recompute.contains(&9),
+                "{what} must not be replayed under the Selective policy"
+            );
+        }
+    }
+
+    #[test]
     fn selective_saves_matmuls_recomputes_cheap() {
         let mut primal = toy_primal();
         // Insert a Relu over block-0's Matmul so the block has one cheap

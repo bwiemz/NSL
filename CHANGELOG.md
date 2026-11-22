@@ -3618,6 +3618,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- **Coder-500M runs the 1B recipe's flag line, at twice the speed.**
+  - `models/coder500m/pretrain_prod.nsl` and its README now run `--source-ad --checkpoint-blocks --checkpoint-selective --fuse-rmsnorm-backward --fuse-wgrad-accum`; the line was `--source-ad --checkpoint-blocks`. Measured on the recipe's pinned 0.11 toolchain with the recipe itself (3 interleaved rounds, 40 updates timed after 20): 22,526 against 11,340 tok/s, 1.986x paired (1.975-1.989), for a 1.60 GiB higher allocator peak (12.88 against 11.28 GiB; driver 14.22 against 12.50).
+  - The two fusions change the summation order of the weight and RMSNorm-gain gradients. Over the first 480 micro-steps the per-step losses of the two lines differ by at most 0.71% (mean 0.03%); two runs of the old line differ by up to 0.68%. Neither diverges over that span.
+  - Dropout (0.1 at this size) is saved, not re-drawn, under selective recomputation. With the run-to-run nondeterminism pinned, 48 micro-steps of the new line are bit-identical to the same flags without checkpointing. New unit test `dropout_is_not_recomputed_under_the_selective_policy`: the existing force-save tests planned under full block recompute only.
+  - A checkpoint written under the old line is refused under the new one: the fusions are arithmetic keys of the execution fingerprint.
+  - "`--checkpoint-blocks` is required" was measured with f32 activation storage. With bf16 storage the run fits a 32 GB card without checkpointing: 19.99 GiB allocator peak, 1.077x the new line. The recipe keeps checkpointing for those 7.1 GiB.
+  - `pretrain_prod_agreement_gate` and `fused_ew_prod_recipe_gate` build the new line.
 - **Production recipes: bf16 activation storage on the `0.11` toolchain channel.**
   - `models/coder500m` and `models/coder1b`: `pretrain_prod.nsl` declares `precision = "bf16"`, and both directories are pinned to the new channel `0.11` (`release/0.11`, cut from `main` after its GPU certification lane). It is the first channel with bf16 activation storage; 0.10-lts cannot build these recipes. The pin covers the whole directory, so the other programs there (the 1B endurance benchmark, the certification and experiment arms) also hand over to 0.11; they declare no precision, so their arithmetic is unchanged, and their speed is 0.11's. `coder7b` and `coder-rl` stay on 0.10-lts.
   - Against the bf16 GEMM mode the 1B recipe used, on the same toolchain: 1.215x tok/s and a 2.94 GiB lower allocator peak at Coder-1B, 1.167x and 0.94 GiB lower at Coder-500M. The 1B recipe's wall estimate falls from about 40 days to about 19.

@@ -224,7 +224,15 @@ const PAIRS: &[ProdPair] = &[
             ("VAL_TOKENS", "data/tokens/prod_val_slice.bin"),
         ],
         shuffle: Some(true),
-        run_line_flags: &["--checkpoint-blocks"],
+        // The 1B line since 2026-11-22: full block recompute alone ran at half
+        // its speed on the recipe's 0.11 toolchain (README, "Production
+        // pretraining").
+        run_line_flags: &[
+            "--checkpoint-blocks",
+            "--checkpoint-selective",
+            "--fuse-rmsnorm-backward",
+            "--fuse-wgrad-accum",
+        ],
         cites_validation_record: true,
         same_stream_split: true,
         two_phase_clip: true,
