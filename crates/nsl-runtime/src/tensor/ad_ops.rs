@@ -660,6 +660,116 @@ pub extern "C" fn nsl_embedding_backward(
 }
 
 // ---------------------------------------------------------------------------
+// 5b'. nsl_embedding_backward_accum — the scatter-add straight into a buffer
+// ---------------------------------------------------------------------------
+
+/// Embedding backward accumulated in place: `acc[idx[i], :] += scale ·
+/// grad[i, :]` for every position `i`, into `acc` — a weight-shaped
+/// `[vocab, embed_dim]` f32 buffer that keeps what it held (a tied
+/// embedding's gradient-accumulation buffer, `scale` the accumulation
+/// window's `1 / N`). Nothing is allocated or zero-filled.
+///
+/// On the device, with the atomic scatter enabled, one kernel
+/// (`nsl_embedding_bwd_acc_*`) adds the scaled rows. Every other case —
+/// `--deterministic` (whose scatter is the per-output-row kernel),
+/// `NSL_EMBEDDING_BWD_CPU=1`, a host buffer, an index dtype without a kernel
+/// — computes the gradient with [`nsl_embedding_backward`] as before and
+/// adds `scale ·` it into `acc` (`nsl_tensor_scalar_mul_add_inplace`), so
+/// those routes keep their summation order and determinism.
+///
+/// `acc` must be a contiguous f32 tensor of shape `[vocab, embed_dim]` on
+/// the gradient's device; anything else stops the program.
+#[unsafe(no_mangle)]
+pub extern "C" fn nsl_embedding_backward_accum(
+    acc_ptr: i64,
+    grad_ptr: i64,
+    indices_ptr: i64,
+    scale: f64,
+) {
+    {
+        let acc = NslTensor::from_ptr_ref(acc_ptr);
+        let grad = NslTensor::from_ptr_ref(grad_ptr);
+        let embed = if acc.ndim == 2 {
+            unsafe { *acc.shape.add(1) }
+        } else {
+            -1
+        };
+        let grad_cols = if grad.ndim >= 1 {
+            unsafe { *grad.shape.add(grad.ndim as usize - 1) }
+        } else {
+            -1
+        };
+        if acc.ndim != 2
+            || acc.dtype != 1
+            || !acc.is_contiguous()
+            || acc.device != grad.device
+            || embed != grad_cols
+        {
+            crate::fatal::die(
+                crate::fatal::Fatal::ShapeMismatch,
+                &format!(
+                    "nsl_embedding_backward_accum: the accumulator must be a contiguous f32 \
+                     [vocab, embed_dim] tensor on the gradient's device (got ndim {}, dtype {}, \
+                     device {} for a gradient with {} columns on device {})",
+                    acc.ndim, acc.dtype, acc.device, grad_cols, grad.device
+                ),
+            );
+        }
+    }
+    #[cfg(feature = "cuda")]
+    {
+        static FORCE_CPU: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let force_cpu = *FORCE_CPU
+            .get_or_init(|| std::env::var("NSL_EMBEDDING_BWD_CPU").ok().as_deref() == Some("1"));
+        let acc = NslTensor::from_ptr_ref(acc_ptr);
+        let grad_t = NslTensor::from_ptr_ref(grad_ptr);
+        if !force_cpu
+            && !crate::deterministic_ops::is_deterministic()
+            && acc.device > 0
+            && grad_t.dtype == 1
+        {
+            let grad_c = nsl_tensor_contiguous(grad_ptr);
+            let idx_c = nsl_tensor_contiguous(indices_ptr);
+            let idx_t = NslTensor::from_ptr_ref(idx_c);
+            let idx_dev = if idx_t.device != acc.device {
+                let up = nsl_tensor_to_device(idx_c, acc.device as i64);
+                (up != 0).then_some(up)
+            } else {
+                None
+            };
+            let idx_eff = idx_dev.unwrap_or(idx_c);
+            let done = NslTensor::from_ptr_ref(idx_eff).device == acc.device && {
+                let vocab = unsafe { *acc.shape } as u64;
+                let embed = unsafe { *acc.shape.add(1) } as u64;
+                let seq = NslTensor::from_ptr_ref(idx_eff).len as u64;
+                crate::cuda::gpu_embedding_backward_accum(
+                    acc_ptr,
+                    grad_c,
+                    idx_eff,
+                    scale as f32,
+                    vocab,
+                    embed,
+                    seq,
+                )
+            };
+            if let Some(up) = idx_dev {
+                nsl_tensor_free(up);
+            }
+            nsl_tensor_free(grad_c);
+            nsl_tensor_free(idx_c);
+            if done {
+                return;
+            }
+        }
+    }
+    // The materialising route: the gradient as `nsl_embedding_backward`
+    // computes it (zero-filled, then the scatter), then `acc += scale · g`.
+    let g = nsl_embedding_backward(grad_ptr, indices_ptr, acc_ptr);
+    super::arithmetic::nsl_tensor_scalar_mul_add_inplace(acc_ptr, g, scale);
+    nsl_tensor_free(g);
+}
+
+// ---------------------------------------------------------------------------
 // 5c. nsl_cross_entropy_backward — CE gradient: (softmax(logits) - one_hot(targets)) / N
 // ---------------------------------------------------------------------------
 

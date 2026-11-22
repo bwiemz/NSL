@@ -67,6 +67,28 @@ impl EmbeddingBwd {
     pub const PARAMS: [&'static str; 6] = ["grad", "indices", "out", "seq_len", "embed_dim", "vocab"];
 }
 
+/// The accumulating scatter's entry name: the atomic kernel that adds
+/// `scale · grad[i, j]` into an output that already holds values (a tied
+/// embedding's gradient accumulation buffer), see [`build_accumulate`].
+pub fn accumulate_kernel_name(idx: IndexDtype) -> &'static str {
+    match idx {
+        IndexDtype::F32 => "nsl_embedding_bwd_acc_f32",
+        IndexDtype::I32 => "nsl_embedding_bwd_acc_i32idx",
+    }
+}
+
+/// The accumulating scatter's parameters, in launch order: the atomic
+/// kernel's, then `scale` (f32).
+pub const ACC_PARAMS: [&str; 7] = [
+    "grad",
+    "indices",
+    "out",
+    "seq_len",
+    "embed_dim",
+    "vocab",
+    "scale",
+];
+
 fn var(b: &mut KirBuilder, ty: KirType) -> VarId {
     b.new_typed_var(ty)
 }
@@ -143,9 +165,40 @@ fn flat(b: &mut KirBuilder, row: VarId, cols: VarId, j: VarId) -> VarId {
 /// neither if-converts nor unrolls the loop the way it does the hand
 /// kernel's.
 pub fn build(op: EmbeddingBwd, idx: IndexDtype) -> KernelIR {
+    build_with(op, idx, false)
+}
+
+/// The atomic scatter adding `scale · grad[i, j]` (rounded once, then added
+/// with `red.global.add.f32`) into `out`, which keeps what it held: the
+/// in-place accumulation of a tied embedding's gradient into its
+/// gradient-accumulation buffer, `scale` being the accumulation window's
+/// `1 / N`. Same grid, bounds and index handling as the atomic kernel.
+pub fn build_accumulate(idx: IndexDtype) -> KernelIR {
+    build_with(EmbeddingBwd::Atomic, idx, true)
+}
+
+/// [`build_accumulate`] lowered to a NUL-terminated PTX module.
+///
+/// # Panics
+///
+/// If the built kernel fails verification: a bug in this module.
+pub fn accumulate_ptx(idx: IndexDtype) -> Vec<u8> {
+    verified_ptx(build_accumulate(idx))
+}
+
+fn build_with(op: EmbeddingBwd, idx: IndexDtype, scaled: bool) -> KernelIR {
     use AddressSpace::Global;
     use KirType::{F32, I64, U64};
-    let mut b = KirBuilder::new(op.kernel_name(idx));
+    debug_assert!(
+        !scaled || op == EmbeddingBwd::Atomic,
+        "only the atomic scatter accumulates scaled"
+    );
+    let name = if scaled {
+        accumulate_kernel_name(idx)
+    } else {
+        op.kernel_name(idx)
+    };
+    let mut b = KirBuilder::new(name);
     let grad = b.add_param("grad", f32_ptr(), Global);
     let idx_ty = match idx {
         IndexDtype::F32 => F32,
@@ -156,6 +209,7 @@ pub fn build(op: EmbeddingBwd, idx: IndexDtype) -> KernelIR {
     let seq_len = b.add_param("seq_len", U64, Global);
     let embed = b.add_param("embed_dim", U64, Global);
     let vocab = b.add_param("vocab", U64, Global);
+    let scale = scaled.then(|| b.add_param("scale", F32, Global));
 
     let entry = b.new_block();
     let col = b.new_block();
@@ -194,6 +248,11 @@ pub fn build(op: EmbeddingBwd, idx: IndexDtype) -> KernelIR {
             b.set_block(add);
             let src = flat(&mut b, x, embed, j);
             let g = load_f32(&mut b, grad, src);
+            // `mul.rn`: the product is rounded once, never contracted.
+            let g = match scale {
+                Some(sc) => op2(&mut b, F32, KirOp::MulRn, g, sc),
+                None => g,
+            };
             let dst = flat(&mut b, u, embed, j);
             let addr = var(&mut b, f32_ptr());
             b.emit(KirOp::PtrOffset(addr, out, dst));
@@ -283,6 +342,28 @@ mod tests {
                 }
                 assert!(!p.contains(".maxntid"), "{p}");
             }
+        }
+    }
+
+    #[test]
+    fn the_accumulating_scatter_scales_then_adds_atomically() {
+        for idx in IndexDtype::ALL {
+            let p = String::from_utf8(accumulate_ptx(idx)).expect("ASCII");
+            assert!(
+                p.contains(&format!(".visible .entry {}(", accumulate_kernel_name(idx))),
+                "{p}"
+            );
+            for name in ACC_PARAMS {
+                assert!(
+                    p.contains(&format!("[param_{name}]")),
+                    "{idx:?}: {name}\n{p}"
+                );
+            }
+            assert!(p.contains(".param .f32 param_scale"), "{p}");
+            assert!(p.contains("mul.rn.f32"), "{p}");
+            assert!(p.contains("red.global.add.f32"), "{p}");
+            // The plain atomic kernel is unchanged: no scale.
+            assert!(!text(EmbeddingBwd::Atomic, idx).contains("param_scale"));
         }
     }
 

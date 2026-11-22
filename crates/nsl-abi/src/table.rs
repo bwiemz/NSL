@@ -581,6 +581,11 @@ macro_rules! for_each_runtime_fn {
             [abi_tensor] nsl_tensor_scatter_add(i64, i64, i64) -> i64 = tensor::ad_ops::nsl_tensor_scatter_add;
             [abi_tensor] nsl_tensor_gather_backward(i64, i64, i64, i64) -> i64 = tensor::ad_ops::nsl_tensor_gather_backward;
             [abi_tensor] nsl_embedding_backward(i64, i64, i64) -> i64 = tensor::ad_ops::nsl_embedding_backward;
+            // The embedding backward scatter-added, scaled (f64, the window's
+            // 1/N), into an existing [vocab, embed] accumulation buffer (a tied
+            // embedding's gradient in place). Keep in lock-step with
+            // `nsl_embedding_backward_accum` in nsl-runtime/src/tensor/ad_ops.rs.
+            [abi_tensor] nsl_embedding_backward_accum(i64, i64, i64, f64) -> () = tensor::ad_ops::nsl_embedding_backward_accum;
             [abi_tensor] nsl_cross_entropy_backward(i64, i64, i64) -> i64 = tensor::ad_ops::nsl_cross_entropy_backward;
             [abi_tensor] nsl_mse_backward(i64, i64, i64) -> i64 = tensor::ad_ops::nsl_mse_backward;
             [abi_tensor] nsl_l1_backward(i64, i64, i64) -> i64 = tensor::ad_ops::nsl_l1_backward;
@@ -733,6 +738,11 @@ macro_rules! for_each_runtime_fn {
             // pointers are the literal 0 when has_bias == 0.
             [training] nsl_fused_linear_ce_forward_gemm(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 = fused_linear_ce::nsl_fused_linear_ce_forward_gemm;
             [training] nsl_fused_linear_ce_backward_gemm(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 = fused_linear_ce::nsl_fused_linear_ce_backward_gemm;
+            // The same backward with dW ADDED, times dw_alpha (f32 bits, the
+            // 16th arg), into a weight's accumulation buffer (a tied embedding's
+            // gradient in place). Keep in lock-step with
+            // `nsl_fused_linear_ce_backward_gemm_acc` in nsl-runtime/src/fused_linear_ce.rs.
+            [training] nsl_fused_linear_ce_backward_gemm_acc(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 = fused_linear_ce::nsl_fused_linear_ce_backward_gemm_acc;
             // CPKD: fused KL-CE distillation loss (forward + backward).
             //
             // ABI LOCK-STEP: these declarations, the call sites in
@@ -1384,6 +1394,6 @@ mod tests {
     fn table_is_the_recorded_size() {
         // The count is pinned so a row dropped by a bad merge is noticed; move
         // it with a row that is deliberately added or removed.
-        assert_eq!(RUNTIME_ABI.len(), 675);
+        assert_eq!(RUNTIME_ABI.len(), 677);
     }
 }

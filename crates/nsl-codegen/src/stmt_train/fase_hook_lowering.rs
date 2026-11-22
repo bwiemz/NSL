@@ -153,6 +153,21 @@ impl Compiler<'_> {
                     )?;
                     return Ok(());
                 }
+                crate::wengert_lower::ParamGradSource::AccumulatedInPlace => {
+                    // A tied embedding's gradient went into `m_partial` where
+                    // its contributions were computed
+                    // (`crate::tied_embed_fusion`, planned only without
+                    // grad-integrity and offload): nothing to add or free.
+                    if c.compile_options.diagnostics.grad_integrity || off {
+                        return Err(CodegenError::new(
+                            "internal: a gradient accumulated in place reached the FASE hook \
+                             while gradients are observed for the integrity gate or the \
+                             accumulation buffers live on the host; the tied-embedding plan \
+                             excludes both",
+                        ));
+                    }
+                    return Ok(());
+                }
                 crate::wengert_lower::ParamGradSource::Materialized(v) => v,
             };
             // P0.3: note this parameter's gradient BEFORE accumulate
@@ -197,6 +212,19 @@ impl Compiler<'_> {
         // adjoint lowering, then disarm before the match so it
         // never leaks into a later (forward / free-list) lowering.
         self.grad_live_results = grad_live_set.clone();
+        // The accumulation buffers, for gradients added in where they are
+        // computed (`crate::tied_embed_fusion`). Device-resident only: under
+        // optimizer-state offload `m_partial` lives on the host.
+        self.fase_inplace = (!self.compile_options.train.optim_state_offload).then(|| {
+            crate::wengert_lower::FaseInplaceAccum {
+                accum_list: accum_val,
+                idx_of: adj_vid_to_hook_entry
+                    .iter()
+                    .map(|(&v, e)| (v, e.accum_idx))
+                    .collect(),
+                scale: accum_scale,
+            }
+        });
         let fase_lowered = crate::wengert_lower::compile_wengert_ops(
             self,
             builder,
@@ -205,6 +233,7 @@ impl Compiler<'_> {
             full_vars,
             Some((param_adj_set, &mut fase_cb)),
         );
+        self.fase_inplace = None;
         self.grad_live_results = None;
         let fase_out = match fase_lowered {
             Ok(gv) => Some(gv),

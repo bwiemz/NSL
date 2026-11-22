@@ -392,3 +392,122 @@ fn the_index_widening_is_pinned() {
         assert!(!caught(i, |p| p.replacen("cvt.s64.s32 ", "cvt.u64.u32 ", 1)), "{op:?}: named equivalent mutant");
     }
 }
+
+// ---------------------------------------------------------------------------
+// The accumulating scatter (tied embedding gradient in place)
+// ---------------------------------------------------------------------------
+
+/// `nsl_embedding_bwd_acc_*` leaves `init + Σ round(scale · grad)` (increasing
+/// position under the interpreter's schedule): the atomic scatter with each
+/// row scaled before it is added, into an output that keeps what it held.
+/// With `scale = 1` it is the atomic kernel byte for byte.
+#[test]
+fn the_accumulating_scatter_adds_scaled_rows_to_what_the_output_held() {
+    use nsl_kir::kernels::embedding_bwd::{ACC_PARAMS, accumulate_ptx};
+    let run_acc = |idx: IndexDtype,
+                   (seq, embed, vocab): (usize, usize, usize),
+                   seed: u64,
+                   scale: f32|
+     -> Run {
+        let text = String::from_utf8(accumulate_ptx(idx))
+            .expect("ASCII")
+            .trim_end_matches('\0')
+            .to_string();
+        let grad = values(seq * embed, seed);
+        let idxw = indices(idx, seq, vocab, seed);
+        let init = values(vocab * embed, seed + 99);
+        let prog = parse(&text);
+        let mut global = vec![
+            Segment {
+                base: GRAD,
+                bytes: le32(&grad),
+            },
+            Segment {
+                base: INDICES,
+                bytes: le32(&idxw),
+            },
+            Segment {
+                base: OUT,
+                bytes: le32(&[init.clone(), vec![POISON; TAIL]].concat()),
+            },
+        ];
+        let args: HashMap<String, u64> = ACC_PARAMS
+            .iter()
+            .zip([
+                GRAD,
+                INDICES,
+                OUT,
+                seq as u64,
+                embed as u64,
+                vocab as u64,
+                u64::from(scale.to_bits()),
+            ])
+            .map(|(n, v)| (n.to_string(), v))
+            .collect();
+        let grid_x = seq.div_ceil(LOOKUP_BLOCK[0] as usize) as u32 + 1;
+        let grid_y = embed.div_ceil(LOOKUP_BLOCK[1] as usize) as u32 + 1;
+        for (x, y) in (0..grid_y).flat_map(|y| (0..grid_x).map(move |x| (x, y))) {
+            let mut l = Launch {
+                prog: &prog,
+                args: &args,
+                global: &mut global,
+                shared: vec![],
+                ctaid: x,
+                ctaid_y: y,
+                nctaid_x: 0,
+                nctaid_y: grid_y,
+                ntid: LOOKUP_BLOCK[0],
+                steps: 0,
+            };
+            run_cta_2d(&mut l, LOOKUP_BLOCK[1], Order::Ascending);
+        }
+        Run {
+            grad,
+            idx: idxw,
+            init,
+            mem: global.into_iter().map(|s| s.bytes).collect(),
+        }
+    };
+    for idx in IndexDtype::ALL {
+        for (n, &(seq, embed, vocab)) in SHAPES.iter().enumerate() {
+            let seed = n as u64 + 1;
+            for scale in [0.25f32, 0.125, 0.3] {
+                let r = run_acc(idx, (seq, embed, vocab), seed, scale);
+                let out = words(&r.mem[2]);
+                for v in 0..vocab {
+                    for j in 0..embed {
+                        let want = (0..seq)
+                            .filter(|&i| row(idx, r.idx[i], vocab) == Some(v))
+                            .fold(f32::from_bits(r.init[v * embed + j]), |s, i| {
+                                s + scale * f32::from_bits(r.grad[i * embed + j])
+                            });
+                        assert_eq!(
+                            out[v * embed + j],
+                            want.to_bits(),
+                            "{idx:?} scale {scale} ({v}, {j})"
+                        );
+                    }
+                }
+                assert!(
+                    out[vocab * embed..].iter().all(|&w| w == POISON),
+                    "{idx:?}: wrote past the output"
+                );
+            }
+            // scale 1: the atomic kernel's bytes.
+            let acc = run_acc(idx, (seq, embed, vocab), seed, 1.0).mem;
+            let atomic = run(
+                K(Atomic, idx),
+                &kir_ptx(K(Atomic, idx)),
+                (seq, embed, vocab),
+                LOOKUP_BLOCK,
+                seed,
+                Order::Ascending,
+            )
+            .mem;
+            assert!(
+                acc == atomic,
+                "{idx:?} {seq}x{embed}x{vocab}: scale 1 differs from the atomic scatter"
+            );
+        }
+    }
+}

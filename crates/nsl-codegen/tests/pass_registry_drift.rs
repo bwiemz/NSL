@@ -741,6 +741,15 @@ const NOT_A_PASS: &[(&str, &str)] = &[
     ),
     ("tensor_parallel", "tensor-parallel sharding"),
     ("test_helpers", "test-only helpers"),
+    (
+        "tied_embed_fusion",
+        "perf round 2: the tied embedding's in-place gradient plan — a \
+         LOWERING-time plan over the adjoint tape that `wengert_lower.rs` \
+         consults while emitting Cranelift IR (same considered line as \
+         `wgrad_fusion`), not a registered pass. It reports its own effect \
+         (`[tied-embed] N tied embedding gradient(s) accumulated in place`, \
+         pinned by an exec-marker)",
+    ),
     ("training_report", "training report emission"),
     ("transient_arena", "transient-memory arena (roadmap item 4)"),
     ("types", "type machinery"),

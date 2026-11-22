@@ -809,6 +809,14 @@ pub struct Compiler<'a> {
     /// referencing a ghost adjoint used to be silently dropped, zeroing all
     /// parameter gradients with no diagnostic.
     pub grad_live_results: Option<std::collections::HashSet<crate::wengert::VarId>>,
+    /// The FASE hook's accumulation buffers while the FASE-Deferred adjoint
+    /// is lowered (device-resident only), so a gradient can be added into
+    /// them where it is computed (`crate::tied_embed_fusion`). `None`
+    /// everywhere else.
+    pub(crate) fase_inplace: Option<crate::wengert_lower::FaseInplaceAccum>,
+    /// The tied-embedding plan of the adjoint tape being lowered (see
+    /// `crate::tied_embed_fusion`), set by `compile_wengert_ops_range`.
+    pub(crate) tied_embed_plan: Option<crate::tied_embed_fusion::TiedEmbedPlan>,
     /// Gap C (CSHA fused backward): seven-slot side-channel keyed by the
     /// Cranelift Value Gap D chooses as the "chain key" (see
     /// `PrimalOp::CshaFusedBackwardExtract` in `wengert.rs`).  The eight
@@ -1297,6 +1305,8 @@ impl<'a> Compiler<'a> {
             flash_attn_bwd_cache: HashMap::new(),
             sdpa_extra_owned: Vec::new(),
             grad_live_results: None,
+            fase_inplace: None,
+            tied_embed_plan: None,
             csha_fused_bwd_cache: HashMap::new(),
             fused_ce_fwd_lse: HashMap::new(),
             fused_ce_fwd_casts: HashMap::new(),

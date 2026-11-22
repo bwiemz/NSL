@@ -615,6 +615,11 @@ pub(crate) fn gemm_forward(
 /// chunk (one extra GEMM pass) instead of caching them — trading ~1.4 ms for
 /// never holding more than one [rows, chunk] scratch.
 ///
+/// `dw_alpha` multiplies the dW GEMMs' product: `dw += dw_alpha · dlogitsᵀ
+/// x`. 1 for a zeroed `dw`; a gradient-accumulation window's `1 / N` when
+/// `dw` is the weight's accumulation buffer (a tied embedding's gradient
+/// accumulated in place, no zeroed scratch and no separate add).
+///
 /// PRECONDITION (unenforceable here): as `gemm_forward` — every pointer is a
 /// bare device address and every buffer is sized at 4 bytes per element, so
 /// f32 storage is required and cannot be checked from this frame.
@@ -634,6 +639,7 @@ pub(crate) fn gemm_backward(
     h: u64,
     scale: f32,
     has_bias: bool,
+    dw_alpha: f32,
 ) -> u32 {
     use crate::cuda::inner;
     let chunk = LCE_GEMM_CHUNK.min(v);
@@ -759,7 +765,20 @@ pub(crate) fn gemm_backward(
                 // SAFETY: buffers sized by the shapes above.
                 unsafe {
                     crate::cuda::storage_gemm::gemm16(
-                        false, true, h, cols, rows, 1.0, hd.x16, h, hd.dl16, cols, 1.0, dw_dev + chunk_start * h * 4, h, false,
+                        false,
+                        true,
+                        h,
+                        cols,
+                        rows,
+                        dw_alpha,
+                        hd.x16,
+                        h,
+                        hd.dl16,
+                        cols,
+                        1.0,
+                        dw_dev + chunk_start * h * 4,
+                        h,
+                        false,
                     );
                 }
                 Ok(())
@@ -772,7 +791,7 @@ pub(crate) fn gemm_backward(
                     rows,
                     cols,
                     h,
-                    1.0,
+                    dw_alpha,
                     1.0,
                 )
             },

@@ -7133,6 +7133,74 @@ pub(crate) fn gpu_embedding_backward(
     NslTensor::publish(out)
 }
 
+/// The embedding backward accumulated in place: `acc[idx[i], j] += scale ·
+/// grad[i, j]` for every position `i`, into `acc` (a device f32 `[vocab,
+/// embed]` buffer that keeps what it held — a tied embedding's gradient
+/// accumulation buffer), with the atomic scatter (`nsl_embedding_bwd_acc_*`).
+/// No allocation, no zero-fill. Returns false when the index dtype has no
+/// kernel (the caller takes the materialising path). Out-of-range and
+/// negative ids are skipped, as by [`gpu_embedding_backward`]; the order of
+/// the additions is the hardware's, as there.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_embedding_backward_accum(
+    acc_ptr: i64,
+    grad_ptr: i64,
+    indices_ptr: i64,
+    scale: f32,
+    vocab_size: u64,
+    embed_dim: u64,
+    seq_len: u64,
+) -> bool {
+    use crate::tensor::NslTensor;
+    use nsl_kir::kernels::lookup::IndexDtype;
+    let grad = NslTensor::from_ptr_ref(grad_ptr);
+    let indices = NslTensor::from_ptr_ref(indices_ptr);
+    let acc = NslTensor::from_ptr_ref(acc_ptr);
+    assert_gpu_f32(grad, "embedding_backward_accum", "grad");
+    assert_gpu_f32(acc, "embedding_backward_accum", "accumulator");
+    let (idx, name): (IndexDtype, &[u8]) = match indices.dtype {
+        crate::tensor::DTYPE_I32 => (IndexDtype::I32, b"nsl_embedding_bwd_acc_i32idx\0"),
+        1 => (IndexDtype::F32, b"nsl_embedding_bwd_acc_f32\0"),
+        _ => return false,
+    };
+    let ptx = fused_kernels::embedding_bwd_acc_ptx(idx);
+    let mut g_data = grad.data as u64;
+    let mut i_data = indices.data as u64;
+    let mut o_data = acc.data as u64;
+    let mut seq_val = seq_len;
+    let mut emb_val = embed_dim;
+    let mut vocab_val = vocab_size;
+    let mut scale_val = scale;
+    let args: [*mut std::ffi::c_void; 7] = [
+        &mut g_data as *mut _ as *mut std::ffi::c_void,
+        &mut i_data as *mut _ as *mut std::ffi::c_void,
+        &mut o_data as *mut _ as *mut std::ffi::c_void,
+        &mut seq_val as *mut _ as *mut std::ffi::c_void,
+        &mut emb_val as *mut _ as *mut std::ffi::c_void,
+        &mut vocab_val as *mut _ as *mut std::ffi::c_void,
+        &mut scale_val as *mut _ as *mut std::ffi::c_void,
+    ];
+    // One thread per INPUT element (seq x embed), as the atomic scatter.
+    let (block_x, block_y) = (16i64, 16i64);
+    let grid_x = (seq_len as i64 + block_x - 1) / block_x;
+    let grid_y = (embed_dim as i64 + block_y - 1) / block_y;
+    let result = inner::kernel_launch(
+        ptx.as_ptr(),
+        name.as_ptr(),
+        [grid_x.max(1), grid_y.max(1), 1],
+        [block_x, block_y, 1],
+        &args,
+        0,
+    );
+    assert_eq!(
+        result as u32, 0,
+        "GPU embedding_bwd_acc kernel failed: {:?}",
+        result
+    );
+    inner::sync_after_kernel();
+    true
+}
+
 // ---------------------------------------------------------------------------
 // GPU Bias Add
 // ---------------------------------------------------------------------------
@@ -10596,6 +10664,13 @@ mod tests {
         all.push(("nsl_embedding_bwd_i32idx", super::fused_kernels::embedding_bwd_i32idx_ptx(), true));
         all.push(("nsl_embedding_bwd_det_f32", super::fused_kernels::embedding_bwd_det_f32_ptx(), true));
         all.push(("nsl_embedding_bwd_det_i32idx", super::fused_kernels::embedding_bwd_det_i32idx_ptx(), true));
+        for idx in nsl_kir::kernels::lookup::IndexDtype::ALL {
+            all.push((
+                nsl_kir::kernels::embedding_bwd::accumulate_kernel_name(idx),
+                super::fused_kernels::embedding_bwd_acc_ptx(idx),
+                true,
+            ));
+        }
         for (op, module) in [
             (nsl_kir::kernels::muon_batch::MuonBatchOp::Mom, super::fused_kernels::muon_batch_mom_f32_ptx()),
             (nsl_kir::kernels::muon_batch::MuonBatchOp::Sumsq, super::fused_kernels::muon_batch_sumsq_f32_ptx()),
