@@ -600,6 +600,34 @@ pub(crate) fn dropout_f32_ptx() -> &'static str {
     MODULE.get_or_init(|| String::from_utf8(nsl_kir::kernels::dropout::dropout_ptx()).expect("PTX must be ASCII"))
 }
 
+/// `nsl_dropout_key_f32`: `nsl_dropout_f32`'s output, a 32-byte key instead
+/// of the mask (`nsl_kir::kernels::dropout`). NUL-terminated.
+pub(crate) fn dropout_key_f32_ptx() -> &'static str {
+    static MODULE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    MODULE.get_or_init(|| {
+        String::from_utf8(nsl_kir::kernels::dropout::dropout_key_ptx()).expect("PTX must be ASCII")
+    })
+}
+
+/// `nsl_dropout_apply_f32`: a dropout's output recomputed from its input and
+/// its key (`nsl_kir::kernels::dropout`). NUL-terminated.
+pub(crate) fn dropout_apply_f32_ptx() -> &'static str {
+    static MODULE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    MODULE.get_or_init(|| {
+        String::from_utf8(nsl_kir::kernels::dropout::dropout_apply_ptx())
+            .expect("PTX must be ASCII")
+    })
+}
+
+/// `nsl_dropout_bwd_f32`: the dropout backward that redraws the mask from a
+/// key (`nsl_kir::kernels::dropout`). NUL-terminated.
+pub(crate) fn dropout_bwd_f32_ptx() -> &'static str {
+    static MODULE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    MODULE.get_or_init(|| {
+        String::from_utf8(nsl_kir::kernels::dropout::dropout_bwd_ptx()).expect("PTX must be ASCII")
+    })
+}
+
 // ---------------------------------------------------------------------------
 // GPU Strided Batched Matmul (cuBLAS-style BMM)
 // Single kernel launch handles ALL batch slices via blockIdx.z.

@@ -886,13 +886,22 @@ impl<'a> SizeProp<'a> {
             | PrimalOp::RMSNorm { .. }
             | PrimalOp::BatchNorm { .. }
             | PrimalOp::Dropout { .. }
-            | PrimalOp::DropoutMask { .. }
             | PrimalOp::RoPE { .. }
             | PrimalOp::RoPEInverse { .. }
             | PrimalOp::Reshape { .. }
             | PrimalOp::Broadcast
             | PrimalOp::Split { .. }
             | PrimalOp::Condition(_) => self.input_info(op, 0),
+
+            // The mask is x-shaped; the key that replaces it (the default,
+            // `source_ad::dropout_regen_enabled`) is 32 bytes whatever x is.
+            PrimalOp::DropoutMask { .. } => {
+                if crate::source_ad::dropout_regen_enabled() {
+                    Some(Numel(nsl_kir::kernels::dropout::DROPOUT_KEY_WORDS as u64))
+                } else {
+                    self.input_info(op, 0)
+                }
+            }
 
             PrimalOp::Add | PrimalOp::Sub | PrimalOp::Mul | PrimalOp::Div => {
                 self.binary_size(self.input_info(op, 0)?, self.input_info(op, 1)?)
@@ -1144,6 +1153,10 @@ impl<'a> SizeProp<'a> {
                     self.input_info(op, 0)
                 }
                 n if n.starts_with("ccr_cast_") => self.input_info(op, 0),
+                // The dropout backward: the gradient's shape.
+                n if n.starts_with(crate::source_ad::DROPOUT_BACKWARD_PREFIX) => {
+                    self.input_info(op, 0)
+                }
                 // Backward FFIs whose result is a NON-FIRST input's shape.
                 n if n.starts_with("rmsnorm_dx_backward") => self.input_info(op, 1),
                 n if n.starts_with("rmsnorm_dgamma_backward") => self.input_info(op, 2),

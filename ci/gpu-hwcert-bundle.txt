@@ -28,11 +28,14 @@
 # the report, and a report inside a worktree dies with it.
 #
 # Known holes -- listed so nobody reads a green bundle as covering them:
-#  * dropout BACKWARD: `dropout_backward_parity_gate.rs::
+#  * dropout BACKWARD against TAPE AD: `dropout_backward_parity_gate.rs::
 #    gpu_source_backward_matches_tape_mask_backward` is tiered `broken` for a
 #    `nsl_tensor_compare` dtype abort that acd2535c FIXED on 2026-08-25, nine
 #    days after the gate was parked. It joins this list once it passes on the
 #    device and is re-tiered; until then the filter would (rightly) refuse it.
+#    The source-AD dropout backward itself (the one the recipes run, which
+#    redraws its mask from a key) is held bit-exact to the stored-mask
+#    backward on the device by section 06's second gate.
 #  * `nsl_log_softmax_f32`: no public entry point, no GPU gate.
 #  * Performance: nothing here times a kernel. Benchmarks are a separate step.
 
@@ -80,6 +83,7 @@ crates/nsl-runtime/tests/sr_bf16_parity.rs	sr_bf16_gpu_streams_vary_with_counter
 
 # ── 06  dropout (bit-exact against the kernel's documented hash) ──
 crates/nsl-runtime/tests/hwcert_kir_numerics_gpu.rs	dropout_kir_kernel_is_bit_exact_against_its_documented_hash_on_silicon
+crates/nsl-runtime/tests/hwcert_kir_numerics_gpu.rs	dropout_regenerated_mask_is_bit_exact_against_the_stored_mask_on_silicon
 
 # ── 07  gradient-clip sum of squares ──
 crates/nsl-runtime/src/tensor/mod.rs	sum_sq_gpu_matches_cpu_reference

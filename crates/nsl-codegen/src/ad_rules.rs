@@ -188,7 +188,10 @@ pub enum AdjointExpr {
     RmsNormInputBackward(VarId, VarId, VarId, NormEps),
 
     // Regularization
-    /// Dropout backward: grad * mask / (1-p).  args: (grad, mask)
+    /// Dropout backward: grad * mask / (1-p).  args: (grad, mask, p). The
+    /// mask operand is the paired `DropoutMask` result: the f32 mask, or
+    /// under `NSL_DROPOUT_REGEN` (the default) the key the mask is redrawn
+    /// from (`source_ad::dropout_regen_enabled`).
     DropoutBackward(VarId, VarId, f64),
 
     // Indexing backward
@@ -614,7 +617,7 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
             });
             vec![InputAdjoint {
                 input_var: op.inputs[0],
-                expr: AdjointExpr::DropoutBackward(output_bar, mask, 1.0 / (1.0 - p)),
+                expr: AdjointExpr::DropoutBackward(output_bar, mask, *p),
             }]
         }
         // The mask is an RNG draw — no gradient flows through it to x.
@@ -1120,8 +1123,8 @@ pub fn saved_for_backward(op: &PrimalOp) -> SavedRequirement {
 
         // The mask op's OUTPUT is what the paired Dropout's backward
         // multiplies by (DropoutBackward reads the mask var, which is this
-        // op's result). The RNG draw is not replayable, so the mask must
-        // survive to the backward.
+        // op's result: the mask, or the 32-byte key it is redrawn from). The
+        // RNG draw is never replayed, so it must survive to the backward.
         PrimalOp::DropoutMask { .. } => SavedRequirement::Output,
 
         // Non-differentiable — nothing needed
@@ -1990,10 +1993,10 @@ mod tests {
         let adj = apply_ad_rule(&op, 100);
         assert_eq!(adj.len(), 1);
         match &adj[0].expr {
-            AdjointExpr::DropoutBackward(y_bar, mask, scale) => {
+            AdjointExpr::DropoutBackward(y_bar, mask, p) => {
                 assert_eq!(*y_bar, 100);
                 assert_eq!(*mask, 1); // inputs[1] = the DropoutMask result
-                assert!((scale - 1.0 / 0.9).abs() < 1e-6); // 1/(1-0.1)
+                assert_eq!(p.to_bits(), 0.1f64.to_bits()); // the forward's p, exactly
             }
             other => panic!("Expected DropoutBackward, got {:?}", other),
         }

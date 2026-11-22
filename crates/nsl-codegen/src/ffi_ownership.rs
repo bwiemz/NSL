@@ -131,6 +131,10 @@ fn build_table() -> HashMap<&'static str, FfiOwnershipKind> {
     // two element tensors become the DropoutMask/Dropout op results and are
     // freed by the wengert owned-values cleanup.
     m.insert("nsl_tensor_dropout_fwd_mask", NotATensor);
+    // Same contract with a key in place of the mask (NSL_DROPOUT_REGEN).
+    m.insert("nsl_tensor_dropout_fwd_key", NotATensor);
+    m.insert("nsl_tensor_dropout_bwd", OwnedNewResult);
+    m.insert("nsl_tensor_dropout_apply", OwnedNewResult);
     m.insert("nsl_tensor_layernorm", OwnedNewResult);
     m.insert("nsl_tensor_bias_add", OwnedNewResult);
     m.insert("nsl_tensor_embedding_lookup", OwnedNewResult);

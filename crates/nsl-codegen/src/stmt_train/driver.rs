@@ -1817,6 +1817,12 @@ impl Compiler<'_> {
                     generator: &generator,
                 });
 
+                // 6d.1 Dropout: each key is read only by its own dropout and
+                // that dropout's backward (invariant I4 of the regenerated
+                // mask), checked on the final lists; then the build-log
+                // witness of what dropout keeps for the backward.
+                self.report_dropout_storage(&effective_primal, &adjoint, &ccr_plan)?;
+
                 // 6d.2 `precision="bf16"`: the activation storage plan, over
                 // the final lists (recompute clones spliced, frees placed,
                 // the fused weight-gradient chains fixed) and before the
