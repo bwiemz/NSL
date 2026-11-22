@@ -1233,6 +1233,20 @@ impl AdjointGenerator {
                 self.emit_op(PrimalOp::Passthrough("silu_backward".into()), vec![y_bar, x])
             }
 
+            // --- The fused SwiGLU's two adjoints (`fuse_swiglu_forward`) ---
+            // The gate's is the op the gate-pair peephole emits for the
+            // unfused graph (`fuse_swiglu_gate_backward`): the same value.
+            // The up operand's is `grad * silu(gate)`, the unfused
+            // `MulElementwise(grad, silu(gate), up)` without the stored silu;
+            // reduced to `up`'s shape as that one was.
+            AdjointExpr::SwigluGateBackward(y_bar, up, gate) => {
+                self.emit_op(PrimalOp::Passthrough("swiglu_gate_backward".into()), vec![y_bar, up, gate])
+            }
+            AdjointExpr::SwigluUpBackward(y_bar, gate, up) => {
+                let raw = self.emit_op(PrimalOp::Passthrough("swiglu_up_backward".into()), vec![y_bar, gate]);
+                self.reduce_to(raw, up)
+            }
+
             // --- Abs backward: grad * sign(x) ---
             AdjointExpr::SignMul(y_bar, x) => {
                 let zero = self.emit_constant(0.0);
@@ -2091,6 +2105,116 @@ pub fn fuse_swiglu_gate_backward(
     });
     crate::wengert::renumber_adjoint_ops(ops);
     fused
+}
+
+/// The kill switch of the SwiGLU fusion (`NSL_FUSE_SWIGLU`, compile-time):
+/// `0` keeps the unfused lowering everywhere (no `swiglu` op, no fused
+/// backward); `fwd` fuses the forward but lowers the two adjoints as two
+/// launches (a diagnostic, to measure the paired backward alone); anything
+/// else, or unset, fuses both.
+pub fn swiglu_fusion_mode() -> SwigluFusion {
+    match std::env::var("NSL_FUSE_SWIGLU").ok().as_deref() {
+        Some("0") => SwigluFusion::Off,
+        Some("fwd") => SwigluFusion::ForwardOnly,
+        _ => SwigluFusion::Full,
+    }
+}
+
+/// See [`swiglu_fusion_mode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwigluFusion {
+    Off,
+    ForwardOnly,
+    Full,
+}
+
+/// Fuse the forward SwiGLU pair of a PRIMAL tape:
+///     s = Silu(g)
+///     p = Mul(s, u)        (or Mul(u, s))
+/// becomes
+///     p = Passthrough("swiglu")(g, u)
+/// when `s` has exactly that one reader. The Silu op is deleted (ids are
+/// not renumbered: `OpId`s are stable across deletion, see
+/// [`crate::wengert::WengertList`]); the fused op keeps the Mul's id, result
+/// and position, where `g` and `u` are both defined.
+///
+/// Why: the pair is two launches with `silu(g)` written to memory and read
+/// back, in the forward and again in every CCR recompute, and the adjoint
+/// of the Mul reads the stored `silu(g)` once more. The fused op's adjoint
+/// (`ad_rules`, `"swiglu"`) is the gate-branch op the gate peephole already
+/// emits plus `grad * silu(g)` computed from `g`, so nothing stores `silu(g)`
+/// at all. Shapes are not known here: the runtime ops take one kernel when
+/// every operand has one shape and fall back to the decomposed chain (which
+/// broadcasts) otherwise.
+///
+/// Values: with f32 storage the fused kernels compute the chain's values bit
+/// for bit; with bf16 storage they skip its rounding of `silu(g)` to bf16
+/// (see `nsl_runtime::swiglu`).
+///
+/// Run before anything plans over the primal (CCR's segments and recompute
+/// set, the bf16 storage plan) and before the adjoint is generated. `keep`
+/// names values a caller reads by VarId after the tape is built (a grad
+/// block's target and named locals); a `silu` result among them is not
+/// fused away. `NSL_FUSE_SWIGLU=0` disables it. Returns the number of pairs
+/// fused.
+pub fn fuse_swiglu_forward(list: &mut WengertList, keep: &HashSet<VarId>) -> usize {
+    list.assert_ids_in_space(crate::wengert::IdSpace::Primal, "source_ad::fuse_swiglu_forward (argument)");
+    if swiglu_fusion_mode() == SwigluFusion::Off {
+        return 0;
+    }
+    let mut readers: HashMap<VarId, Vec<usize>> = HashMap::new();
+    for (i, op) in list.ops.iter().enumerate() {
+        for &v in &op.inputs {
+            readers.entry(v).or_default().push(i);
+        }
+    }
+    let is_tensor = |list: &WengertList, v: VarId| {
+        list.var_types.get(&v).is_none_or(|t| *t == WengertType::Tensor)
+    };
+    let mut delete: HashSet<usize> = HashSet::new();
+    let mut rewrites: Vec<(usize, VarId, VarId)> = Vec::new();
+    for (i, op) in list.ops.iter().enumerate() {
+        if !matches!(op.op, PrimalOp::Silu) || op.inputs.len() != 1 || op.checkpointed {
+            continue;
+        }
+        let (s, g) = (op.result, op.inputs[0]);
+        if s == list.output || keep.contains(&s) {
+            continue;
+        }
+        let Some([j]) = readers.get(&s).map(Vec::as_slice) else { continue };
+        let j = *j;
+        let mul = &list.ops[j];
+        if !matches!(mul.op, PrimalOp::Mul) || mul.inputs.len() != 2 || mul.checkpointed || j <= i {
+            continue;
+        }
+        // Exactly one operand is `s` (`s * s` is silu(g)², not SwiGLU).
+        let u = match (mul.inputs[0] == s, mul.inputs[1] == s) {
+            (true, false) => mul.inputs[1],
+            (false, true) => mul.inputs[0],
+            _ => continue,
+        };
+        if !is_tensor(list, g) || !is_tensor(list, u) || !is_tensor(list, s) {
+            continue;
+        }
+        delete.insert(i);
+        rewrites.push((j, g, u));
+    }
+    for &(j, g, u) in &rewrites {
+        let op = &mut list.ops[j];
+        op.op = PrimalOp::Passthrough("swiglu".into());
+        op.inputs = vec![g, u];
+    }
+    if delete.is_empty() {
+        return 0;
+    }
+    let mut idx = 0;
+    list.ops.retain(|_| {
+        let keep = !delete.contains(&idx);
+        idx += 1;
+        keep
+    });
+    list.assert_unique_op_ids("source_ad::fuse_swiglu_forward (post-commit)");
+    rewrites.len()
 }
 
 pub fn eliminate_dead_gradients(
@@ -7797,6 +7921,130 @@ mod tests {
         assert_eq!(fused, 0);
         assert_eq!(ops.len(), 3);
         assert!(matches!(&ops[1].op, PrimalOp::Passthrough(n) if n == "silu_backward"));
+    }
+
+    /// A primal list of `ops` (primal-space ids = positions), every value a tensor.
+    fn primal_list(ops: Vec<(u32, PrimalOp, Vec<u32>)>, output: u32) -> crate::wengert::WengertList {
+        let ops: Vec<WengertOp> = ops
+            .into_iter()
+            .enumerate()
+            .map(|(i, (result, op, inputs))| WengertOp {
+                id: i as u32,
+                result,
+                op,
+                inputs,
+                saved_for_backward: false,
+                checkpointed: false,
+            })
+            .collect();
+        crate::wengert::WengertList {
+            ops,
+            output,
+            var_names: Default::default(),
+            var_types: Default::default(),
+        }
+    }
+
+    #[test]
+    fn swiglu_forward_fuses_the_silu_mul_pair_either_operand_order() {
+        for silu_first in [true, false] {
+            // g = Param, u = Param, s = silu(g), p = s*u (or u*s), out = p + p
+            let mul_in = if silu_first { vec![12, 11] } else { vec![11, 12] };
+            let mut list = primal_list(
+                vec![
+                    (10, PrimalOp::Param("g".into()), vec![]),
+                    (11, PrimalOp::Param("u".into()), vec![]),
+                    (12, PrimalOp::Silu, vec![10]),
+                    (13, PrimalOp::Mul, mul_in),
+                    (14, PrimalOp::Add, vec![13, 13]),
+                ],
+                14,
+            );
+            assert_eq!(super::fuse_swiglu_forward(&mut list, &Default::default()), 1);
+            assert_eq!(list.ops.len(), 4, "the silu op is deleted");
+            let f = &list.ops[2];
+            assert!(matches!(&f.op, PrimalOp::Passthrough(n) if n == "swiglu"));
+            assert_eq!(f.inputs, vec![10, 11], "inputs are [gate, up] whatever the multiply's order");
+            assert_eq!((f.result, f.id), (13, 3), "the Mul's result and id survive");
+            assert_eq!(list.ops[3].id, 4, "ids are not renumbered");
+        }
+    }
+
+    #[test]
+    fn swiglu_forward_keeps_a_silu_with_another_reader_or_a_kept_value() {
+        let build = || {
+            primal_list(
+                vec![
+                    (10, PrimalOp::Param("g".into()), vec![]),
+                    (11, PrimalOp::Param("u".into()), vec![]),
+                    (12, PrimalOp::Silu, vec![10]),
+                    (13, PrimalOp::Mul, vec![12, 11]),
+                    (14, PrimalOp::Add, vec![13, 12]),
+                ],
+                14,
+            )
+        };
+        // `s` is read twice (the Mul and the Add).
+        let mut list = build();
+        assert_eq!(super::fuse_swiglu_forward(&mut list, &Default::default()), 0);
+        assert_eq!(list.ops.len(), 5);
+        // A single-reader silu the caller keeps (a grad target, a named local).
+        let mut list = build();
+        list.ops[4].inputs = vec![13, 13];
+        let keep: HashSet<VarId> = [12].into_iter().collect();
+        assert_eq!(super::fuse_swiglu_forward(&mut list, &keep), 0);
+        // `silu(g) * silu(g)` is not SwiGLU.
+        let mut list = build();
+        list.ops[3].inputs = vec![12, 12];
+        list.ops[4].inputs = vec![13, 13];
+        assert_eq!(super::fuse_swiglu_forward(&mut list, &Default::default()), 0);
+        // The silu is the list's output.
+        let mut list = build();
+        list.ops.truncate(3);
+        list.output = 12;
+        assert_eq!(super::fuse_swiglu_forward(&mut list, &Default::default()), 0);
+    }
+
+    /// The fused op's adjoint: the gate op the peephole emits for the
+    /// unfused graph, then the up adjoint reduced to `u`'s shape.
+    #[test]
+    fn swiglu_forward_adjoint_is_the_gate_op_then_the_reduced_up_op() {
+        let mut list = primal_list(
+            vec![
+                (10, PrimalOp::Param("g".into()), vec![]),
+                (11, PrimalOp::Param("u".into()), vec![]),
+                (12, PrimalOp::Silu, vec![10]),
+                (13, PrimalOp::Mul, vec![12, 11]),
+                (14, PrimalOp::Sum { dim: None }, vec![13]),
+            ],
+            14,
+        );
+        assert_eq!(super::fuse_swiglu_forward(&mut list, &Default::default()), 1);
+        let mut generator = AdjointGenerator::new(100);
+        let adjoint = generator.generate(&list);
+        let names: Vec<String> = adjoint
+            .ops
+            .iter()
+            .filter_map(|o| match &o.op {
+                PrimalOp::Passthrough(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        let at = |n: &str| names.iter().position(|x| x == n).unwrap_or_else(|| panic!("no {n} in {names:?}"));
+        assert!(at("swiglu_gate_backward") < at("swiglu_up_backward"), "{names:?}");
+        let gate = adjoint.ops.iter().find(|o| matches!(&o.op, PrimalOp::Passthrough(n) if n == "swiglu_gate_backward")).unwrap();
+        let up = adjoint.ops.iter().find(|o| matches!(&o.op, PrimalOp::Passthrough(n) if n == "swiglu_up_backward")).unwrap();
+        assert_eq!(gate.inputs[1..], [11, 10], "gate op reads (grad, up, gate)");
+        assert_eq!(up.inputs[1], 10, "up op reads (grad, gate)");
+        assert_eq!(gate.inputs[0], up.inputs[0], "both read the same upstream gradient");
+        let reduce = adjoint
+            .ops
+            .iter()
+            .find(|o| matches!(&o.op, PrimalOp::Passthrough(n) if n == "reduce_to_shape") && o.inputs[0] == up.result)
+            .expect("the up adjoint is reduced to u's shape");
+        assert_eq!(reduce.inputs[1], 11);
+        assert_eq!(generator.adjoint_of(10), Some(gate.result));
+        assert_eq!(generator.adjoint_of(11), Some(reduce.result));
     }
 
     use super::*;

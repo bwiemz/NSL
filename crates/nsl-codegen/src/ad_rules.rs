@@ -318,6 +318,14 @@ pub enum AdjointExpr {
     /// `rope(x, cos, sin)` backward: `rope_backward(ȳ, cos, sin)` =
     /// ȳ·cos + rotᵀ(ȳ·sin) for `x`; the tables are constants (no adjoint).
     RopeBackward(VarId, VarId, VarId),
+    /// The gate's adjoint of the fused SwiGLU `swiglu(gate, up) = silu(gate)
+    /// * up`: `swiglu_gate_backward(grad, up, gate)` = `(grad·up)·silu'(gate)`,
+    /// reduced to `gate`'s shape by the runtime op. args: (grad, up, gate)
+    SwigluGateBackward(VarId, VarId, VarId),
+    /// The up operand's adjoint of the fused SwiGLU:
+    /// `reduce_to_shape(swiglu_up_backward(grad, gate), up)` =
+    /// `grad·silu(gate)` summed back to `up`'s shape. args: (grad, gate, up)
+    SwigluUpBackward(VarId, VarId, VarId),
 
     // Shape backward (broadcast reduction)
     /// Expand backward: sum-reduce gradient over expanded dims to match original shape.
@@ -1034,6 +1042,27 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
                         }]
                     }
                 }
+                // The fused SwiGLU `swiglu(gate, up) = silu(gate) * up`
+                // (`source_ad::fuse_swiglu_forward` writes it in place of
+                // that pair). The gate's adjoint first, then the up
+                // operand's: the lowering pairs the two into one launch.
+                "swiglu" => {
+                    if op.inputs.len() < 2 {
+                        vec![]
+                    } else {
+                        let (gate, up) = (op.inputs[0], op.inputs[1]);
+                        vec![
+                            InputAdjoint {
+                                input_var: gate,
+                                expr: AdjointExpr::SwigluGateBackward(output_bar, up, gate),
+                            },
+                            InputAdjoint {
+                                input_var: up,
+                                expr: AdjointExpr::SwigluUpBackward(output_bar, gate, up),
+                            },
+                        ]
+                    }
+                }
                 // Expand backward: sum-reduce gradient over broadcast-expanded dims
                 "expand" => {
                     if op.inputs.is_empty() {
@@ -1306,6 +1335,7 @@ pub const RULED_PASSTHROUGHS: &[&str] = &[
     "rotate_half",
     "expand",
     "rope",
+    "swiglu",
 ];
 
 /// The certification status of a passthrough, by name.
@@ -1320,6 +1350,7 @@ pub fn ad_cert_status_passthrough(name: &str) -> AdCertStatus {
         "sin" => Certified(&["sin"]),
         "rotate_half" => Certified(&["rotate_half"]),
         "rope" => Certified(&["rope"]),
+        "swiglu" => Certified(&["swiglu", "swiglu_row"]),
         "expand" => Certified(&["expand"]),
         "sum_keepdim_last" | "mean_keepdim_last" => {
             AdjointOnly("the softmax and normalization adjoints")

@@ -135,6 +135,9 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
             // The adjoint tape optimizations (sections 6a–6b.5 of the
             // train block's source-AD arm) — the fold / fusion counts.
             "crates/nsl-codegen/src/stmt_train/adjoint_tape_opt.rs",
+            // The forward SwiGLU fusion (`[fuse] swiglu forward: N`), on the
+            // fork CCR plans over.
+            "crates/nsl-codegen/src/stmt_train/plan_ccr.rs",
         ],
         "a fusion peephole fired",
     ),
@@ -823,6 +826,16 @@ pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
                 "[fuse] swiglu gate-backward pairs:",
                 "crates/nsl-codegen/src/stmt_grad.rs",
             ),
+        ],
+    },
+    NegativeNeedle {
+        test: "crates/nsl-cli/tests/swiglu_fusion_gate.rs",
+        asserts: "the forward SwiGLU fusion did NOT fire with NSL_FUSE_SWIGLU=0",
+        // Two emit sites: the train block's CCR planning site (the fork every
+        // later phase reads) and the grad-block lowering.
+        parts: &[
+            ("[fuse] swiglu forward:", "crates/nsl-codegen/src/stmt_train/plan_ccr.rs"),
+            ("[fuse] swiglu forward:", "crates/nsl-codegen/src/stmt_grad.rs"),
         ],
     },
     NegativeNeedle {

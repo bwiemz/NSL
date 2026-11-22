@@ -173,6 +173,8 @@ crates/nsl-cli/tests/step_boundary_drain_gpu_gate.rs	a_later_phase_gets_the_idle
 crates/nsl-cli/tests/stream_migration_gpu_gate.rs	compute_stream_matches_legacy_null_stream_bit_exact	gpu	requires a CUDA GPU (2 CSHA training runs)
 crates/nsl-cli/tests/stream_ordering_gpu_gate.rs	stream_ordered_matches_eager_bit_exact	gpu	requires CUDA GPU (2 training runs)
 crates/nsl-cli/tests/swiglu_fusion_gate.rs	swiglu_fused_backward_gpu_deterministic_and_matches_reference	gpu	requires CUDA GPU
+crates/nsl-cli/tests/swiglu_fusion_gate.rs	swiglu_forward_fusion_gpu_is_bit_exact_and_its_kernels_run	gpu	requires CUDA GPU
+crates/nsl-cli/tests/swiglu_fusion_gate.rs	swiglu_fusion_under_bf16_storage_is_exact_up_to_the_silu_rounding	gpu	requires CUDA GPU
 crates/nsl-cli/tests/tokbench_reference_encoder_gate.rs	tokbench_pretokenize_matches_the_crate_and_guards_the_u16_cast	multiproc	spawns cargo to build tools/tokbench, then runs the reference-encoder differential
 crates/nsl-cli/tests/train_checkpoint_resume_gpu.rs	gpu_resume_bit_exact_canonical	gpu	requires CUDA GPU
 crates/nsl-cli/tests/train_checkpoint_resume_gpu.rs	gpu_resume_bit_exact_canonical_bf16sr	gpu	requires CUDA GPU
