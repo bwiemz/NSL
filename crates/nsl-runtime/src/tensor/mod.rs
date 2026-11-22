@@ -3882,6 +3882,179 @@ pub extern "C" fn nsl_tensor_dropout_fwd_mask(tensor_ptr: i64, p: f64) -> i64 {
     list
 }
 
+/// Source-AD dropout forward that keeps what its backward needs in 32 bytes:
+/// returns an `NslList [out, key]`, both caller-owned. Records no tape op.
+///
+/// On a device, `out` is `nsl_tensor_dropout_fwd_mask`'s output bit for bit
+/// (same counter claim, same kernel arithmetic) and `key` is the launch's
+/// counter base, threshold, scale and length (`cuda::gpu_dropout_key_f32`), from
+/// which `nsl_tensor_dropout_bwd` redraws the mask. On the CPU the draw comes
+/// from the thread-local sampling stream, which cannot be indexed by element,
+/// so `key` IS the mask, exactly as `nsl_tensor_dropout_fwd_mask` returns it.
+///
+/// Contract: 0 < p < 1 (as `nsl_tensor_dropout_fwd_mask`).
+#[unsafe(no_mangle)]
+pub extern "C" fn nsl_tensor_dropout_fwd_key(tensor_ptr: i64, p: f64) -> i64 {
+    if !(p > 0.0 && p < 1.0) {
+        crate::nsl_log!(
+            ERROR,
+            "nsl",
+            "nsl: nsl_tensor_dropout_fwd_key called with p={p} outside (0, 1) — \
+             the compiler must elide p==0 and refuse out-of-range p"
+        );
+        std::process::abort();
+    }
+    if NslTensor::from_ptr(tensor_ptr).device == 0 {
+        return nsl_tensor_dropout_fwd_mask(tensor_ptr, p);
+    }
+    #[cfg(feature = "cuda")]
+    {
+        let c_ptr = nsl_tensor_contiguous(tensor_ptr);
+        let (result_ptr, key_ptr) = crate::cuda::gpu_dropout_key_f32(c_ptr, p);
+        nsl_tensor_free(c_ptr);
+        let list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(list, result_ptr);
+        crate::list::nsl_list_push(list, key_ptr);
+        list
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        crate::fatal::cuda_not_compiled();
+    }
+}
+
+/// Source-AD dropout replay: the output `nsl_tensor_dropout_fwd_key` returned
+/// for `tensor_ptr`, recomputed from its key (a CCR recompute clone of the
+/// dropout, so checkpointing need not save the output). Bit-identical to the
+/// forward's output when `tensor_ptr` holds the forward's input, which a
+/// recompute guarantees: on a device the forward's instructions run over the
+/// counter base the key holds; on the CPU the "key" is the mask and this is
+/// the CPU forward's own arithmetic (one f64 product per element, one cast).
+/// Records no tape op. Contract: 0 < p < 1, the forward's.
+#[unsafe(no_mangle)]
+pub extern "C" fn nsl_tensor_dropout_apply(tensor_ptr: i64, key_ptr: i64, p: f64) -> i64 {
+    if !(p > 0.0 && p < 1.0) {
+        crate::nsl_log!(
+            ERROR,
+            "nsl",
+            "nsl: nsl_tensor_dropout_apply called with p={p} outside (0, 1)"
+        );
+        std::process::abort();
+    }
+    if NslTensor::from_ptr(key_ptr).device > 0 {
+        #[cfg(feature = "cuda")]
+        {
+            let c_ptr = nsl_tensor_contiguous(tensor_ptr);
+            let out = crate::cuda::gpu_dropout_apply_f32(c_ptr, key_ptr, p);
+            nsl_tensor_free(c_ptr);
+            return out;
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            crate::fatal::cuda_not_compiled();
+        }
+    }
+    // CPU: `key_ptr` is the f32 or f64 mask `nsl_tensor_dropout_fwd_mask` drew,
+    // in the input's dtype and row-major.
+    let c_ptr = nsl_tensor_contiguous(tensor_ptr);
+    let a = NslTensor::from_ptr(c_ptr);
+    let mask = NslTensor::from_ptr(key_ptr);
+    if mask.len != a.len || mask.dtype != a.dtype || !mask.is_contiguous() {
+        crate::fatal::die(
+            crate::fatal::Fatal::ShapeMismatch,
+            &format!(
+                "nsl_tensor_dropout_apply: the CPU mask does not match the input ({} element(s) \
+                 of dtype {} against {} of dtype {})",
+                mask.len, mask.dtype, a.len, a.dtype
+            ),
+        );
+    }
+    let len = a.len as usize;
+    let ndim = a.ndim;
+    let in_dtype = a.dtype;
+    let shape = NslTensor::copy_shape(a.shape, ndim);
+    let strides = NslTensor::compute_strides(shape, ndim);
+    let elem_size = if in_dtype == 1 {
+        std::mem::size_of::<f32>()
+    } else {
+        std::mem::size_of::<f64>()
+    };
+    let out_data_raw = checked_alloc(len * elem_size);
+    let scale = 1.0 / (1.0 - p);
+    if in_dtype == 1 {
+        let out_data = out_data_raw as *mut f32;
+        for i in 0..len {
+            unsafe {
+                let keep = *mask.data_f32().add(i) as f64;
+                *out_data.add(i) = (*a.data_f32().add(i) as f64 * keep * scale) as f32;
+            }
+        }
+    } else {
+        let out_data = out_data_raw as *mut f64;
+        for i in 0..len {
+            unsafe {
+                let keep = *mask.data_f64().add(i);
+                *out_data.add(i) = *a.data_f64().add(i) * keep * scale;
+            }
+        }
+    }
+    nsl_tensor_free(c_ptr);
+    NslTensor::publish(Box::new(NslTensor::new(
+        out_data_raw as *mut c_void,
+        shape,
+        strides,
+        ndim,
+        len as i64,
+        0,
+        in_dtype,
+        1,
+        0,
+    )))
+}
+
+/// Source-AD dropout backward over `nsl_tensor_dropout_fwd_key`'s second
+/// result: `dx = (grad * m) * f32(1/(1-p))`, a new tensor with `grad`'s shape.
+///
+/// A device key: `m` is redrawn from the key (`cuda::gpu_dropout_bwd_f32`),
+/// bit-identical to the mask `nsl_tensor_dropout_fwd_mask` would have stored,
+/// and the two multiplies are those of the stored-mask backward. A CPU "key"
+/// is the mask itself; this replays the decomposed stored-mask lowering
+/// (`nsl_tensor_mul` by the mask, then by `nsl_tensor_scalar(1/(1-p), f32)`),
+/// so the CPU arithmetic is unchanged too.
+#[unsafe(no_mangle)]
+pub extern "C" fn nsl_tensor_dropout_bwd(grad_ptr: i64, key_ptr: i64, p: f64) -> i64 {
+    if !(p > 0.0 && p < 1.0) {
+        crate::nsl_log!(
+            ERROR,
+            "nsl",
+            "nsl: nsl_tensor_dropout_bwd called with p={p} outside (0, 1)"
+        );
+        std::process::abort();
+    }
+    let scale = 1.0 / (1.0 - p);
+    if NslTensor::from_ptr(key_ptr).device == 0 {
+        let masked = arithmetic::nsl_tensor_mul(grad_ptr, key_ptr, 0);
+        let s = ad_ops::nsl_tensor_scalar(scale, 1);
+        let dx = arithmetic::nsl_tensor_mul(masked, s, 0);
+        nsl_tensor_free(s);
+        nsl_tensor_free(masked);
+        return dx;
+    }
+    #[cfg(feature = "cuda")]
+    {
+        // Element i of the key's stream is the i-th element in row-major
+        // order (the forward drew over a contiguous copy of its input).
+        let c_ptr = nsl_tensor_contiguous(grad_ptr);
+        let dx = crate::cuda::gpu_dropout_bwd_f32(c_ptr, key_ptr, p);
+        nsl_tensor_free(c_ptr);
+        dx
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        crate::fatal::cuda_not_compiled();
+    }
+}
+
 // === Conv2d ===
 
 #[unsafe(no_mangle)]

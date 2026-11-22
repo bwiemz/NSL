@@ -630,3 +630,213 @@ fn dropout_kir_kernel_is_bit_exact_against_its_documented_hash_on_silicon() {
 
     set_gpu_dropout_counter(saved_counter);
 }
+
+/// A device tensor's words, read as u32 (the dropout key is an i32 tensor).
+fn download_words(t: i64, n: usize) -> Vec<u32> {
+    let cpu = nsl_tensor_to_device(t, 0);
+    let p = nsl_tensor_data_ptr(cpu);
+    assert_ne!(p, 0, "downloaded tensor has no data pointer");
+    assert_eq!(
+        nsl_tensor_get_dtype(cpu),
+        9,
+        "the dropout key is an i32 tensor"
+    );
+    let out = unsafe { std::slice::from_raw_parts(p as *const u32, n) }.to_vec();
+    nsl_tensor_free(cpu);
+    out
+}
+
+/// The regenerated dropout mask on silicon (`NSL_DROPOUT_REGEN`, the source-AD
+/// default), BIT-EXACT against the stored-mask path it replaces.
+///
+/// From one counter base the gate runs both forwards and both backwards:
+///
+/// * `nsl_tensor_dropout_fwd_key`'s output equals `nsl_tensor_dropout_fwd_mask`'s
+///   bit for bit, both claim exactly `len` counter values, and the key holds the
+///   documented words (magic, base, threshold, scale bits, length);
+/// * the stored mask is the documented hash's decision (as the gate above checks
+///   for `nsl_dropout_f32`), so the key's mask is checked against the contract
+///   too, not only against the other kernel;
+/// * `nsl_tensor_dropout_bwd(dy, key, p)` equals the stored-mask backward computed
+///   through the runtime's own decomposed ops, `(dy * mask) * f32(1/(1-p))`
+///   (`nsl_tensor_mul` twice, the scale an f32 scalar as the compiler's constant
+///   is), bit for bit, for gradients with signed zeros, infinities, NaN,
+///   denormals and the largest finite value;
+/// * a key handed to a backward of another `p` (threshold and scale disagree)
+///   turns every element into NaN rather than training on a wrong mask;
+/// * `nsl_tensor_dropout_apply(x, key, p)`, the replay a checkpointed backward
+///   runs instead of saving the output, is the key forward's output bit for
+///   bit and claims no counter.
+///
+/// The base sits so the launch spans two of the hash's 2^32 blocks.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn dropout_regenerated_mask_is_bit_exact_against_the_stored_mask_on_silicon() {
+    use nsl_runtime::list::nsl_list_get;
+    use nsl_runtime::rng_state::{gpu_dropout_counter, set_gpu_dropout_counter};
+    use nsl_runtime::tensor::{
+        nsl_tensor_dropout_apply, nsl_tensor_dropout_bwd, nsl_tensor_dropout_fwd_key,
+        nsl_tensor_dropout_fwd_mask, nsl_tensor_mul, nsl_tensor_scalar,
+    };
+    let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    if !cuda_available() {
+        eprintln!("skipping: no usable CUDA GPU");
+        return;
+    }
+    // Not a multiple of the block, so the last block is partial.
+    let len = (1usize << 16) + 37;
+    let x: Vec<f32> = (0..len)
+        .map(|i| ((i % 97) as f32 - 48.5) * 0.37 + weyl(i, 0.0, 0.01))
+        .collect();
+    const SPECIALS: [u32; 9] = [
+        0x0000_0000,
+        0x8000_0000,
+        0x7F80_0000,
+        0xFF80_0000,
+        0x7FC0_0000,
+        0x0000_0001,
+        0x8040_0000,
+        0x7F7F_FFFF,
+        0x0080_0000,
+    ];
+    let dy: Vec<f32> = (0..len)
+        .map(|i| {
+            if i % 13 == 6 {
+                f32::from_bits(SPECIALS[(i / 13) % SPECIALS.len()])
+            } else {
+                weyl(i, -3.0, 3.0)
+            }
+        })
+        .collect();
+    let saved_counter = gpu_dropout_counter();
+    test_kernel_launch_census_arm();
+
+    let pair = |list: i64| -> (i64, i64) {
+        let pair = (nsl_list_get(list, 0), nsl_list_get(list, 1));
+        nsl_list_free(list);
+        pair
+    };
+    for &p in &[0.1f64, 0.5] {
+        let base: u64 = 0x1_FFFF_C000;
+        let threshold = ((1.0 - p) * u32::MAX as f64) as u32;
+        let scale = (1.0 / (1.0 - p)) as f32;
+        let t = upload(&[len], &x);
+        let g = upload(&[len], &dy);
+
+        set_gpu_dropout_counter(base);
+        let (out_m, mask) = pair(nsl_tensor_dropout_fwd_mask(t, p));
+        assert_eq!(
+            gpu_dropout_counter(),
+            base + len as u64,
+            "p={p}: the mask forward claims len"
+        );
+        set_gpu_dropout_counter(base);
+        let (out_k, key) = pair(nsl_tensor_dropout_fwd_key(t, p));
+        assert_eq!(
+            gpu_dropout_counter(),
+            base + len as u64,
+            "p={p}: the key forward claims len, the same window"
+        );
+
+        let (ym, yk, m) = (
+            download(out_m, len),
+            download(out_k, len),
+            download(mask, len),
+        );
+        // The replay a checkpointed backward runs: the forward's output again
+        // from its input and key, without claiming a counter.
+        let again_t = nsl_tensor_dropout_apply(t, key, p);
+        assert_eq!(
+            gpu_dropout_counter(),
+            base + len as u64,
+            "p={p}: the replay claims nothing"
+        );
+        let again = download(again_t, len);
+        for i in 0..len {
+            assert_eq!(
+                again[i].to_bits(),
+                yk[i].to_bits(),
+                "p={p} element {i}: the replay differs"
+            );
+        }
+        for i in 0..len {
+            assert_eq!(
+                yk[i].to_bits(),
+                ym[i].to_bits(),
+                "p={p} element {i}: the key forward's output differs"
+            );
+            let keep = dropout_keep(base, i as u64, threshold);
+            assert_eq!(
+                m[i],
+                if keep { 1.0 } else { 0.0 },
+                "p={p} element {i}: the stored mask is not the hash's"
+            );
+        }
+        let words = download_words(key, 8);
+        assert_eq!(
+            words,
+            [
+                0x4B4F_5244,
+                base as u32,
+                (base >> 32) as u32,
+                threshold,
+                scale.to_bits(),
+                len as u32,
+                0,
+                0
+            ],
+            "p={p}: the key's words"
+        );
+
+        // The stored-mask backward through the runtime's own decomposed ops.
+        let masked = nsl_tensor_mul(g, mask, 0);
+        let s = nsl_tensor_scalar(1.0 / (1.0 - p), 1);
+        let want_t = nsl_tensor_mul(masked, s, 0);
+        let got_t = nsl_tensor_dropout_bwd(g, key, p);
+        let (want, got) = (download(want_t, len), download(got_t, len));
+        let mut nans = 0;
+        for i in 0..len {
+            assert_eq!(
+                got[i].to_bits(),
+                want[i].to_bits(),
+                "p={p} element {i}: regenerated {:#010x} vs stored-mask {:#010x} (dy {:#010x}, mask {})",
+                got[i].to_bits(),
+                want[i].to_bits(),
+                dy[i].to_bits(),
+                m[i]
+            );
+            nans += usize::from(got[i].is_nan());
+        }
+        println!(
+            "dropout p={p}: regenerated backward bit-exact over {len} elements ({nans} NaN from NaN/inf inputs)"
+        );
+
+        // The key of this p, read by a backward of another p: every element NaN.
+        let other = if p == 0.1 { 0.5 } else { 0.1 };
+        let wrong_t = nsl_tensor_dropout_bwd(g, key, other);
+        let wrong = download(wrong_t, len);
+        assert!(
+            wrong.iter().all(|v| v.is_nan()),
+            "p={p}: a key read with p={other} must poison the gradient"
+        );
+
+        for h in [
+            out_m, mask, out_k, key, again_t, masked, s, want_t, got_t, wrong_t, t, g,
+        ] {
+            nsl_tensor_free(h);
+        }
+    }
+    for (kernel, at_least) in [
+        ("nsl_dropout_f32", 2),
+        ("nsl_dropout_key_f32", 2),
+        ("nsl_dropout_bwd_f32", 4),
+        ("nsl_dropout_apply_f32", 2),
+    ] {
+        let n = test_kernel_launch_count(kernel);
+        assert!(
+            n >= at_least,
+            "{kernel} launched {n} time(s), expected at least {at_least}"
+        );
+    }
+    set_gpu_dropout_counter(saved_counter);
+}

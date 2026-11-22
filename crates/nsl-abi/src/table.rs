@@ -468,6 +468,13 @@ macro_rules! for_each_runtime_fn {
             // compiled backward can consume the exact RNG mask (two-op split,
             // wengert.rs DropoutMask).
             [abi_tensor] nsl_tensor_dropout_fwd_mask(i64, f64) -> i64 = tensor::nsl_tensor_dropout_fwd_mask;
+            // The same forward keeping a 32-byte key (counter base, threshold, scale,
+            // length) instead of the mask on a device: NslList [out, key].
+            [abi_tensor] nsl_tensor_dropout_fwd_key(i64, f64) -> i64 = tensor::nsl_tensor_dropout_fwd_key;
+            // Its backward: (grad, key, p) -> dx, the mask redrawn from the key.
+            [abi_tensor] nsl_tensor_dropout_bwd(i64, i64, f64) -> i64 = tensor::nsl_tensor_dropout_bwd;
+            // Its replay: (x, key, p) -> the forward's output again (a CCR recompute).
+            [abi_tensor] nsl_tensor_dropout_apply(i64, i64, f64) -> i64 = tensor::nsl_tensor_dropout_apply;
             [abi_tensor] nsl_tensor_conv2d(i64, i64, i64, i64, i64, i64, i64) -> i64 = tensor::nsl_tensor_conv2d;
             // Source-AD conv2d backward FFIs: (grad, input, weight, sh, sw, ph, pw) -> grad.
             [abi_tensor] nsl_conv2d_input_backward(i64, i64, i64, i64, i64, i64, i64) -> i64 = autodiff::backward::nsl_conv2d_input_backward;
@@ -1367,6 +1374,6 @@ mod tests {
     fn table_is_the_recorded_size() {
         // The count is pinned so a row dropped by a bad merge is noticed; move
         // it with a row that is deliberately added or removed.
-        assert_eq!(RUNTIME_ABI.len(), 670);
+        assert_eq!(RUNTIME_ABI.len(), 673);
     }
 }

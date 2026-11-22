@@ -9432,10 +9432,7 @@ pub(crate) fn gpu_dropout_f32(input_ptr: i64, p: f64) -> (i64, i64) {
     let mask_shape = NslTensor::copy_shape(input.shape, ndim);
     let mask_strides = NslTensor::compute_strides(mask_shape, ndim);
 
-    // threshold: hash values below this → keep (inverted: keep probability = 1-p)
-    // u32::MAX * (1-p) gives the threshold
-    let threshold = ((1.0 - p) * u32::MAX as f64) as u32;
-    let scale = (1.0 / (1.0 - p)) as f32;
+    let (threshold, scale) = dropout_threshold_scale(p);
     // The counter lives in `rng_state` (not a function-local static) so a
     // training checkpoint can capture and restore it, and so `--seed` can
     // key it — see that module's header.
@@ -9478,6 +9475,236 @@ pub(crate) fn gpu_dropout_f32(input_ptr: i64, p: f64) -> (i64, i64) {
         ndim, len as i64, input.device, 1, 1, 0,
     ));
     (NslTensor::publish(out), NslTensor::publish(mask))
+}
+
+/// The keep threshold and the survivors' scale of GPU dropout at `p`: hash
+/// values below `threshold` keep their element (keep probability `1-p`),
+/// and a kept element is multiplied by `scale = f32(1/(1-p))`. One function
+/// for the forward kernels and the regenerating backward, which must agree
+/// bit for bit (the backward's key check compares them).
+#[cfg(feature = "cuda")]
+pub(crate) fn dropout_threshold_scale(p: f64) -> (u32, f32) {
+    (
+        ((1.0 - p) * u32::MAX as f64) as u32,
+        (1.0 / (1.0 - p)) as f32,
+    )
+}
+
+/// GPU dropout that keeps a KEY for its backward instead of a mask: returns
+/// `(out, key)`. `out` is `gpu_dropout_f32`'s, bit for bit (one builder makes
+/// both kernels, and the counter is claimed by the same call). The key is a
+/// [`nsl_kir::kernels::dropout::DROPOUT_KEY_WORDS`]-word i32 tensor on the
+/// input's device holding the counter base, threshold, scale and length,
+/// written by the kernel's first thread; `gpu_dropout_bwd_f32` redraws the
+/// mask from it. 32 bytes instead of `4 * len`.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_dropout_key_f32(input_ptr: i64, p: f64) -> (i64, i64) {
+    use nsl_kir::kernels::dropout::DROPOUT_KEY_WORDS;
+    inner::set_oom_context("dropout_key_f32");
+    use crate::tensor::NslTensor;
+
+    let input = NslTensor::from_ptr_ref(input_ptr);
+    assert_gpu_f32(input, "dropout_key_f32", "input");
+    let len = input.len as u64;
+    let ndim = input.ndim;
+
+    let out_data = inner::alloc_managed(len as usize * 4);
+    let key_data = inner::alloc_managed(DROPOUT_KEY_WORDS * 4);
+    let out_shape = NslTensor::copy_shape(input.shape, ndim);
+    let out_strides = NslTensor::compute_strides(out_shape, ndim);
+    let key_shape = NslTensor::copy_shape([DROPOUT_KEY_WORDS as i64].as_ptr(), 1);
+    let key_strides = NslTensor::compute_strides(key_shape, 1);
+
+    let (threshold, scale) = dropout_threshold_scale(p);
+    // Claimed exactly as `gpu_dropout_f32` claims it: the stream (and the
+    // counter a checkpoint saves) does not depend on which kernel runs.
+    let seed = crate::rng_state::gpu_dropout_next_seed(len);
+
+    let mut inp_data = input.data as u64;
+    let mut out_val = out_data as u64;
+    let mut key_val = key_data as u64;
+    let mut len_val = len;
+    let mut thresh_val = threshold;
+    let mut scale_val = scale;
+    let mut seed_val = seed;
+    let args: [*mut std::ffi::c_void; 7] = [
+        &mut inp_data as *mut _ as *mut std::ffi::c_void,
+        &mut out_val as *mut _ as *mut std::ffi::c_void,
+        &mut key_val as *mut _ as *mut std::ffi::c_void,
+        &mut len_val as *mut _ as *mut std::ffi::c_void,
+        &mut thresh_val as *mut _ as *mut std::ffi::c_void,
+        &mut scale_val as *mut _ as *mut std::ffi::c_void,
+        &mut seed_val as *mut _ as *mut std::ffi::c_void,
+    ];
+    let block = 256i64;
+    // At least one block: the first thread writes the key whatever `len` is.
+    let grid = ((len as i64) + block - 1).max(block) / block;
+    let result = inner::kernel_launch(
+        fused_kernels::dropout_key_f32_ptx().as_ptr(),
+        c"nsl_dropout_key_f32".as_ptr().cast(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        0,
+    );
+    assert_eq!(
+        result as u32, 0,
+        "GPU dropout (key) kernel failed: {:?}",
+        result
+    );
+    inner::sync_after_kernel();
+
+    let out = Box::new(NslTensor::new(
+        out_data,
+        out_shape,
+        out_strides,
+        ndim,
+        len as i64,
+        input.device,
+        1,
+        1,
+        0,
+    ));
+    let key = Box::new(NslTensor::new(
+        key_data,
+        key_shape,
+        key_strides,
+        1,
+        DROPOUT_KEY_WORDS as i64,
+        input.device,
+        crate::tensor::DTYPE_I32,
+        1,
+        0,
+    ));
+    (NslTensor::publish(out), NslTensor::publish(key))
+}
+
+/// Whether `t` is a dropout key (`gpu_dropout_key_f32`'s second result) by its
+/// header: an i32 vector of `DROPOUT_KEY_WORDS` on a device. A shape stub, an
+/// f32 mask or a recompute clone in its place fails this.
+#[cfg(feature = "cuda")]
+pub(crate) fn is_dropout_key(t: &crate::tensor::NslTensor) -> bool {
+    t.device > 0
+        && t.dtype == crate::tensor::DTYPE_I32
+        && t.ndim == 1
+        && t.len == nsl_kir::kernels::dropout::DROPOUT_KEY_WORDS as i64
+}
+
+/// The dropout backward from a key: `dx = (dy * m) * scale` with `m` redrawn
+/// from the key's counter base, bit-identical to `(dy * mask) * scale` over
+/// the mask `gpu_dropout_f32` would have stored. `grad_ptr` must be a
+/// contiguous f32 device tensor with the forward input's shape; `p` is the
+/// forward's. The kernel turns every element into NaN when the key's magic,
+/// threshold, scale or length disagree with this launch.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_dropout_bwd_f32(grad_ptr: i64, key_ptr: i64, p: f64) -> i64 {
+    inner::set_oom_context("dropout_bwd_f32");
+    gpu_dropout_from_key(
+        grad_ptr,
+        key_ptr,
+        p,
+        "nsl_tensor_dropout_bwd",
+        fused_kernels::dropout_bwd_f32_ptx(),
+        c"nsl_dropout_bwd_f32",
+    )
+}
+
+/// A dropout's output recomputed from its input and its key: bit-identical to
+/// the output `gpu_dropout_key_f32` returned for that input (the same
+/// instructions over the same counter base). `input_ptr` must be a contiguous
+/// f32 device tensor; `p` is the forward's. NaN in every element when the key
+/// is not this launch's, as in the backward.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_dropout_apply_f32(input_ptr: i64, key_ptr: i64, p: f64) -> i64 {
+    inner::set_oom_context("dropout_apply_f32");
+    gpu_dropout_from_key(
+        input_ptr,
+        key_ptr,
+        p,
+        "nsl_tensor_dropout_apply",
+        fused_kernels::dropout_apply_f32_ptx(),
+        c"nsl_dropout_apply_f32",
+    )
+}
+
+/// The launch both key readers share: `(src, dst, key, len, threshold,
+/// scale)`, one thread per element of `src`, `dst` a new f32 tensor of
+/// `src`'s shape. Refuses a key that is not one by its header.
+#[cfg(feature = "cuda")]
+fn gpu_dropout_from_key(
+    src_ptr: i64,
+    key_ptr: i64,
+    p: f64,
+    entry: &str,
+    ptx: &str,
+    kernel: &std::ffi::CStr,
+) -> i64 {
+    use crate::tensor::NslTensor;
+
+    let src = NslTensor::from_ptr_ref(src_ptr);
+    let key = NslTensor::from_ptr_ref(key_ptr);
+    assert_gpu_f32(src, entry, "operand");
+    if !is_dropout_key(key) || key.device != src.device {
+        crate::fatal::die(
+            crate::fatal::Fatal::ShapeMismatch,
+            &format!(
+                "{entry}: the key operand is not this device's dropout key (dtype {}, \
+                 ndim {}, {} element(s), device {}; operand on device {}). The compiled \
+                 program handed something other than its forward's key to a dropout that \
+                 reads one: a compiler bug. NSL_DROPOUT_REGEN=0 at build time stores the \
+                 mask instead.",
+                key.dtype, key.ndim, key.len, key.device, src.device
+            ),
+        );
+    }
+    let len = src.len as u64;
+    let ndim = src.ndim;
+    let dst_data = inner::alloc_managed(len as usize * 4);
+    let dst_shape = NslTensor::copy_shape(src.shape, ndim);
+    let dst_strides = NslTensor::compute_strides(dst_shape, ndim);
+    let (threshold, scale) = dropout_threshold_scale(p);
+
+    if len > 0 {
+        let mut src_val = src.data as u64;
+        let mut dst_val = dst_data as u64;
+        let mut key_val = key.data as u64;
+        let mut len_val = len;
+        let mut thresh_val = threshold;
+        let mut scale_val = scale;
+        let args: [*mut std::ffi::c_void; 6] = [
+            &mut src_val as *mut _ as *mut std::ffi::c_void,
+            &mut dst_val as *mut _ as *mut std::ffi::c_void,
+            &mut key_val as *mut _ as *mut std::ffi::c_void,
+            &mut len_val as *mut _ as *mut std::ffi::c_void,
+            &mut thresh_val as *mut _ as *mut std::ffi::c_void,
+            &mut scale_val as *mut _ as *mut std::ffi::c_void,
+        ];
+        let block = 256i64;
+        let grid = ((len as i64) + block - 1) / block;
+        let result = inner::kernel_launch(
+            ptx.as_ptr(),
+            kernel.as_ptr().cast(),
+            [grid, 1, 1],
+            [block, 1, 1],
+            &args,
+            0,
+        );
+        assert_eq!(result as u32, 0, "{entry}: GPU kernel failed: {:?}", result);
+        inner::sync_after_kernel();
+    }
+
+    let dst = Box::new(NslTensor::new(
+        dst_data,
+        dst_shape,
+        dst_strides,
+        ndim,
+        len as i64,
+        src.device,
+        1,
+        1,
+        0,
+    ));
+    NslTensor::publish(dst)
 }
 
 // ---------------------------------------------------------------------------
@@ -10357,6 +10584,9 @@ mod tests {
         ));
         all.push((nsl_kir::kernels::dequant::FP8_E4M3_NAME, super::fused_kernels::dequant_fp8_e4m3_f32_ptx(), true));
         all.push((nsl_kir::kernels::dropout::DROPOUT_NAME, super::fused_kernels::dropout_f32_ptx(), true));
+        all.push((nsl_kir::kernels::dropout::DROPOUT_KEY_NAME, super::fused_kernels::dropout_key_f32_ptx(), true));
+        all.push((nsl_kir::kernels::dropout::DROPOUT_BWD_NAME, super::fused_kernels::dropout_bwd_f32_ptx(), true));
+        all.push((nsl_kir::kernels::dropout::DROPOUT_APPLY_NAME, super::fused_kernels::dropout_apply_f32_ptx(), true));
         all.push((nsl_kir::kernels::data_movement::GATHER_DIM_NAME, super::fused_kernels::gather_dim_f32_ptx(), true));
         all.push(("nsl_embedding_f32", super::fused_kernels::embedding_f32_ptx(), true));
         all.push(("nsl_embedding_i32idx", super::fused_kernels::embedding_i32idx_ptx(), true));
