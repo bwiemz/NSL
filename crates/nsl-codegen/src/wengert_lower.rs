@@ -300,10 +300,11 @@ pub fn compile_wengert_ops_range(
         None
     };
     let range_start = range.start;
-    // The fused SwiGLU's adjoints, lowered as ONE launch where both are in
-    // this range (see `swiglu_backward_groups`). `swiglu_stash` carries the
-    // up adjoint's Value from the launch at the gate op to the op that
-    // defines it.
+    // The fused SwiGLU's adjoints (and the backward's own `swiglu` of the
+    // same operands), lowered as ONE launch where they are in this range
+    // (see `swiglu_backward_groups`). `swiglu_stash` carries the up adjoint's
+    // (and the forward value's) Value from the launch at the gate op to the
+    // op that defines it.
     let swiglu_groups = swiglu_backward_groups(compiler, wengert, range.clone());
     let mut swiglu_stash: HashMap<VarId, Value> = HashMap::new();
     for (rel_i, op) in wengert.ops[range].iter().enumerate() {
@@ -1597,14 +1598,16 @@ fn passthrough_norm_eps(
 }
 
 /// The fused SwiGLU's adjoint groups of `wengert.ops[range]` that lower as
-/// one launch: `swiglu_gate_backward(grad, up, gate)` and a LATER
-/// `swiglu_up_backward(grad, gate)` reading the same `grad` and `gate`, both
-/// with the same planned storage (bf16 plan) or both unplanned, and neither
+/// one launch: `swiglu_gate_backward(grad, up, gate)`, a LATER
+/// `swiglu_up_backward(grad, gate)` reading the same `grad` and `gate`, and,
+/// when there is one later still, a `swiglu(gate, up)` of the same operands
+/// (the forward value the backward recomputes for the down projection's
+/// weight gradient, `source_ad::fuse_swiglu_recompute_into_backward`). All
+/// with the same planned storage (bf16 plan) or all unplanned, and none
 /// pinned by the transient arena (a pin is single-allocation; the grouped
-/// launch makes two). Maps the gate op's result to the up op's (and to a
-/// recomputed forward value: none yet). A group split across two ranges (a
-/// CSLA replay boundary) lowers op by op. `NSL_FUSE_SWIGLU=fwd` disables the
-/// grouping.
+/// launch makes several). Maps the gate op's result to the up op's and the
+/// recompute's. A group split across two ranges (a CSLA replay boundary)
+/// lowers op by op. `NSL_FUSE_SWIGLU=fwd` disables the grouping.
 fn swiglu_backward_groups(
     compiler: &Compiler,
     wengert: &WengertList,
@@ -1639,8 +1642,16 @@ fn swiglu_backward_groups(
         if !alike(g) || !alike(u) {
             continue;
         }
+        let up = g.inputs[1];
+        let h = ops[i + 1..]
+            .iter()
+            .find(|h| is(h, "swiglu", 2) && h.inputs == [gate, up] && !taken.contains(&h.result) && alike(h))
+            .map(|h| h.result);
         taken.insert(u.result);
-        pairs.insert(g.result, (u.result, None));
+        if let Some(h) = h {
+            taken.insert(h);
+        }
+        pairs.insert(g.result, (u.result, h));
     }
     pairs
 }

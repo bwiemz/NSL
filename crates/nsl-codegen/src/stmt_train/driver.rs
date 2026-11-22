@@ -1681,6 +1681,8 @@ impl Compiler<'_> {
                     extractor: &extractor,
                     generator: &generator,
                     wrga_plan: &wrga_plan,
+                    effective_primal: &effective_primal,
+                    ccr_plan: &ccr_plan,
                 });
 
                 // 6c. CCR P1.a: splice recompute clones + FreeTensor markers

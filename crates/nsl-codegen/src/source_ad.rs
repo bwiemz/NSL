@@ -2217,6 +2217,148 @@ pub fn fuse_swiglu_forward(list: &mut WengertList, keep: &HashSet<VarId>) -> usi
     rewrites.len()
 }
 
+/// Step 2 of the SwiGLU fusion: let the backward launch that produces the
+/// two adjoints also produce the forward value the down projection's weight
+/// gradient reads, instead of CCR recomputing it with a forward launch.
+///
+/// For a fused `p = swiglu(g, u)` (`fuse_swiglu_forward`) that CCR will
+/// recompute (`recompute` holds `p`), the adjoint reads `p` twice: for its
+/// VALUE in the down projection's weight-gradient chain
+///     t = Transpose(p); m = Matmul(t, d̄); dW = reduce_to_shape(m, W)
+/// and for its SHAPE in `p̄ = reduce_to_shape(x, p)`. The value read is moved
+/// onto a new adjoint op `h = swiglu(g, u)` placed right after the fused
+/// adjoints `swiglu_gate_backward(p̄, u, g)` / `swiglu_up_backward(p̄, g)`,
+/// and the chain is moved (as a unit: the wgrad fusion needs its three ops
+/// adjacent) to right after `h`. `p` is then read for shape only, which CCR
+/// serves with a shape stub, so nothing recomputes it in a forward launch;
+/// the lowering folds `h` into the adjoints' launch
+/// (`nsl_tensor_swiglu_backward_recompute`): 6 passes over the activation
+/// instead of 3 (recompute) + 5 (adjoints).
+///
+/// Values: `h` is the forward kernel's arithmetic on the same operands, the
+/// value the clone would have computed.
+///
+/// Runs before the CCR splice and free insertion, and only where the caller
+/// knows CCR serves a shape-only read with a stub (`ccr_frees_per_segment`)
+/// and will not flip `p` back to a save. `fresh` must be above every VarId of
+/// both lists; it is advanced. Returns the number of chains rewritten.
+pub fn fuse_swiglu_recompute_into_backward(
+    adjoint: &mut WengertList,
+    primal: &WengertList,
+    recompute: &HashSet<VarId>,
+    fresh: &mut VarId,
+) -> usize {
+    adjoint.assert_ids_in_space(
+        crate::wengert::IdSpace::Adjoint,
+        "source_ad::fuse_swiglu_recompute_into_backward (adjoint argument)",
+    );
+    if swiglu_fusion_mode() != SwigluFusion::Full {
+        return 0;
+    }
+    debug_assert!(
+        !adjoint.ops.iter().any(|op| matches!(op.op, PrimalOp::FreeTensor)),
+        "fuse_swiglu_recompute_into_backward must run before free insertion"
+    );
+    let is = |op: &WengertOp, name: &str, n: usize| {
+        matches!(&op.op, PrimalOp::Passthrough(p) if p == name) && op.inputs.len() == n
+    };
+    let mut done = 0;
+    for pop in &primal.ops {
+        if !is(pop, "swiglu", 2) || !recompute.contains(&pop.result) {
+            continue;
+        }
+        let (p, g, u) = (pop.result, pop.inputs[0], pop.inputs[1]);
+        let ops = &adjoint.ops;
+        let readers_of = |v: VarId| -> Vec<usize> {
+            ops.iter().enumerate().filter(|(_, o)| o.inputs.contains(&v)).map(|(i, _)| i).collect()
+        };
+        // Every reader of `p`: shape reads, and exactly one value read, the
+        // transpose opening a weight-gradient chain.
+        let mut chain_at = None;
+        let mut ok = true;
+        for i in readers_of(p) {
+            let o = &ops[i];
+            if is(o, "reduce_to_shape", 2) && o.inputs[1] == p && o.inputs[0] != p {
+                continue;
+            }
+            if matches!(o.op, PrimalOp::Transpose { .. }) && o.inputs == [p] && chain_at.is_none() {
+                chain_at = Some(i);
+                continue;
+            }
+            ok = false;
+        }
+        let Some(t) = chain_at.filter(|_| ok) else { continue };
+        if t + 2 >= ops.len() {
+            continue;
+        }
+        let (tr, mm, red) = (&ops[t], &ops[t + 1], &ops[t + 2]);
+        if !matches!(mm.op, PrimalOp::Matmul)
+            || mm.inputs.first() != Some(&tr.result)
+            || !is(red, "reduce_to_shape", 2)
+            || red.inputs[0] != mm.result
+            || readers_of(tr.result) != [t + 1]
+            || readers_of(mm.result) != [t + 2]
+        {
+            continue;
+        }
+        // The fused adjoints of this `p`.
+        let Some(gi) = ops.iter().position(|o| is(o, "swiglu_gate_backward", 3) && o.inputs[1] == u && o.inputs[2] == g)
+        else {
+            continue;
+        };
+        let pbar = ops[gi].inputs[0];
+        let Some(ui) = ops
+            .iter()
+            .enumerate()
+            .skip(gi + 1)
+            .find(|(_, o)| is(o, "swiglu_up_backward", 2) && o.inputs == [pbar, g])
+            .map(|(i, _)| i)
+        else {
+            continue;
+        };
+        // `h` goes right after the adjoints, the chain right after `h`. A
+        // chain that sits before the adjoints moves later: nothing between
+        // may read what it produces (its reduce is the weight's gradient).
+        let at = gi.max(ui);
+        if t < at {
+            let produced = [tr.result, mm.result, red.result];
+            if ops[t + 3..=at].iter().any(|o| o.inputs.iter().any(|v| produced.contains(v))) {
+                continue;
+            }
+        }
+        let h = *fresh;
+        *fresh += 1;
+        let h_op = WengertOp {
+            // Renumbered below, as every adjoint rewriter's ids are.
+            id: crate::wengert::ADJOINT_ID_BASE,
+            result: h,
+            op: PrimalOp::Passthrough("swiglu".into()),
+            inputs: vec![g, u],
+            saved_for_backward: false,
+            checkpointed: false,
+        };
+        adjoint.var_types.insert(h, WengertType::Tensor);
+        let name = primal.var_names.get(&p).cloned().unwrap_or_else(|| format!("v{p}"));
+        adjoint.var_names.insert(h, format!("{name}.swiglu_backward"));
+        let ops = &mut adjoint.ops;
+        if t < at {
+            let mut chain: Vec<WengertOp> = ops.drain(t..t + 3).collect();
+            chain[0].inputs = vec![h];
+            // `at` moved down by the three drained ops.
+            let insert_at = at - 3 + 1;
+            ops.splice(insert_at..insert_at, std::iter::once(h_op).chain(chain));
+        } else {
+            ops[t].inputs = vec![h];
+            ops.insert(at + 1, h_op);
+        }
+        done += 1;
+    }
+    if done > 0 {
+        crate::wengert::renumber_adjoint_ops(&mut adjoint.ops);
+    }
+    done
+}
+
 pub fn eliminate_dead_gradients(
     adjoint_ops: &[WengertOp],
     needed_vars: &HashSet<VarId>,
@@ -8003,6 +8145,93 @@ mod tests {
         list.ops.truncate(3);
         list.output = 12;
         assert_eq!(super::fuse_swiglu_forward(&mut list, &Default::default()), 0);
+    }
+
+    /// The adjoint of a fused SwiGLU block before the CCR splice: `p` (138)
+    /// is read for its shape by `p̄`'s reduce and for its value by the down
+    /// projection's weight-gradient chain (503..505), which sits before the
+    /// fused adjoints (516, 508).
+    fn swiglu_block_adjoint(extra_reader: bool) -> (crate::wengert::WengertList, crate::wengert::WengertList) {
+        let primal = primal_list(
+            vec![
+                (132, PrimalOp::Param("n".into()), vec![]),
+                (134, PrimalOp::Matmul, vec![132, 133]),
+                (137, PrimalOp::Matmul, vec![132, 136]),
+                (138, PrimalOp::Passthrough("swiglu".into()), vec![134, 137]),
+                (140, PrimalOp::Matmul, vec![138, 139]),
+            ],
+            140,
+        );
+        let pt = |n: &str| PrimalOp::Passthrough(n.into());
+        let tr = PrimalOp::Transpose { dim0: 0, dim1: 1 };
+        let mut ops = vec![
+            (501, PrimalOp::Matmul, vec![497, 500]),
+            (502, pt("reduce_to_shape"), vec![501, 138]),
+            (503, tr, vec![138]),
+            (504, PrimalOp::Matmul, vec![503, 497]),
+            (505, pt("reduce_to_shape"), vec![504, 139]),
+            (516, pt("swiglu_gate_backward"), vec![502, 137, 134]),
+            (508, pt("swiglu_up_backward"), vec![502, 134]),
+            (509, pt("reduce_to_shape"), vec![508, 137]),
+        ];
+        if extra_reader {
+            ops.push((510, PrimalOp::Mul, vec![138, 509]));
+        }
+        let ops = ops
+            .into_iter()
+            .enumerate()
+            .map(|(i, (result, op, inputs))| WengertOp {
+                id: crate::wengert::adjoint_op_id(i),
+                result,
+                op,
+                inputs,
+                saved_for_backward: false,
+                checkpointed: false,
+            })
+            .collect();
+        let adjoint = crate::wengert::WengertList {
+            ops,
+            output: 0,
+            var_names: Default::default(),
+            var_types: Default::default(),
+        };
+        (primal, adjoint)
+    }
+
+    #[test]
+    fn swiglu_recompute_moves_the_down_wgrad_after_the_backwards_own_value() {
+        let (primal, mut adjoint) = swiglu_block_adjoint(false);
+        let recompute: HashSet<VarId> = [138].into_iter().collect();
+        let mut fresh = 1000;
+        assert_eq!(super::fuse_swiglu_recompute_into_backward(&mut adjoint, &primal, &recompute, &mut fresh), 1);
+        assert_eq!(fresh, 1001);
+        let order: Vec<u32> = adjoint.ops.iter().map(|o| o.result).collect();
+        assert_eq!(order, vec![501, 502, 516, 508, 1000, 503, 504, 505, 509]);
+        let h = &adjoint.ops[4];
+        assert!(matches!(&h.op, PrimalOp::Passthrough(n) if n == "swiglu"));
+        assert_eq!(h.inputs, vec![134, 137]);
+        assert_eq!(adjoint.ops[5].inputs, vec![1000], "the chain reads the backward's value");
+        // `p` is now read for its shape only.
+        let readers: Vec<u32> = adjoint.ops.iter().filter(|o| o.inputs.contains(&138)).map(|o| o.result).collect();
+        assert_eq!(readers, vec![502]);
+        // Positional adjoint ids.
+        for (i, o) in adjoint.ops.iter().enumerate() {
+            assert_eq!(o.id, crate::wengert::adjoint_op_id(i));
+        }
+    }
+
+    #[test]
+    fn swiglu_recompute_is_left_alone_unless_ccr_recomputes_p_and_the_chain_is_its_only_value_read() {
+        let mut fresh = 1000;
+        // Not recomputed (saved): reading it costs nothing.
+        let (primal, mut adjoint) = swiglu_block_adjoint(false);
+        assert_eq!(super::fuse_swiglu_recompute_into_backward(&mut adjoint, &primal, &HashSet::new(), &mut fresh), 0);
+        // Another value reader of `p`: it would still have to be recomputed.
+        let (primal, mut adjoint) = swiglu_block_adjoint(true);
+        let recompute: HashSet<VarId> = [138].into_iter().collect();
+        assert_eq!(super::fuse_swiglu_recompute_into_backward(&mut adjoint, &primal, &recompute, &mut fresh), 0);
+        assert_eq!(adjoint.ops.len(), 9);
+        assert_eq!(fresh, 1000);
     }
 
     /// The fused op's adjoint: the gate op the peephole emits for the

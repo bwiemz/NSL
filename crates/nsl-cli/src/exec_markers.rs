@@ -839,6 +839,15 @@ pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
         ],
     },
     NegativeNeedle {
+        test: "crates/nsl-cli/tests/swiglu_fusion_gate.rs",
+        asserts: "the SwiGLU recompute was NOT folded into the backward launch with \
+                  NSL_FUSE_SWIGLU=0",
+        parts: &[(
+            "[fuse] swiglu recompute folded into the backward:",
+            "crates/nsl-codegen/src/stmt_train/adjoint_tape_opt.rs",
+        )],
+    },
+    NegativeNeedle {
         test: "crates/nsl-cli/tests/fused_lm_ce_decline_gate.rs",
         asserts: "a matching LM head, and a disabled decorator, produced NO \
                   fused linear-CE fallback diagnostic",

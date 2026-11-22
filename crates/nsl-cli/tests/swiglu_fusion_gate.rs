@@ -462,10 +462,12 @@ fn bf16_losses(out: &str) -> Vec<f64> {
 
 /// bf16 activation storage, production flags. With the diagnostic that
 /// reinstates the unfused chain's rounding of `silu(g)`, the fused program
-/// prints the unfused program's losses bit for bit: the paired launch and
-/// the storage plan of the fused ops are exact. Without it the fused program
-/// carries one rounding fewer and tracks the unfused one to that rounding;
-/// it is deterministic run to run. The profile shows the paired launch.
+/// prints the unfused program's losses bit for bit: CCR's recompute folded
+/// into the backward, the grouped launch, the storage plan of the fused ops
+/// and the shape stub are all exact. Without it the fused program carries
+/// one rounding fewer and tracks the unfused one to that rounding; it is
+/// deterministic run to run. The profile shows the grouped launch (adjoints
+/// and the recomputed value) and no forward recompute of `p`.
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn swiglu_fusion_under_bf16_storage_is_exact_up_to_the_silu_rounding() {
@@ -478,13 +480,17 @@ fn swiglu_fusion_under_bf16_storage_is_exact_up_to_the_silu_rounding() {
         assert!(!err.contains("widens to f32, computes and narrows"), "a dtype-explicit op fell back:\n{err}");
     }
     assert!(fused_err.contains("[fuse] swiglu forward: 2"), "{fused_err}");
+    assert!(fused_err.contains("[fuse] swiglu recompute folded into the backward: 2"), "{fused_err}");
+    assert!(!plain_err.contains("[fuse] swiglu recompute folded"), "{plain_err}");
+    // CCR serves `p`'s remaining shape read with a stub instead of a clone.
+    assert!(fused_err.contains("2 read for shape only"), "{fused_err}");
     for err in [&fused_err, &plain_err] {
         assert!(err.contains("[wgrad-fusion] 6 chain(s) fused"), "a weight-gradient chain stopped fusing:
 {err}");
     }
     let has = |prof: &str, stem: &str| prof.contains(&format!("\"name\":\"{stem}"));
     assert!(has(&fused_prof, "nsl_swiglu_bb_b"), "no fused forward:\n{fused_prof}");
-    assert!(has(&fused_prof, "nsl_swiglu_backward_bbb_b"), "no paired backward:\n{fused_prof}");
+    assert!(has(&fused_prof, "nsl_swiglu_backward_h_bbb_b"), "no grouped backward:\n{fused_prof}");
     for stem in ["nsl_silu_b_b", "nsl_swiglu_gate_backward_bbb_b", "nsl_swiglu_up_backward"] {
         assert!(!has(&fused_prof, stem), "the fused program still launched {stem}:\n{fused_prof}");
     }
@@ -500,4 +506,26 @@ fn swiglu_fusion_under_bf16_storage_is_exact_up_to_the_silu_rounding() {
     for (i, (x, y)) in f.iter().zip(&p).enumerate() {
         assert!((x - y).abs() <= 1e-2 * y.abs(), "step {i}: fused {x} vs unfused {y}");
     }
+}
+
+/// f32 storage, production flags with checkpointing: the fused program (the
+/// grouped backward launch producing the recomputed forward value, CCR's
+/// shape stub in place of its clone) prints the unfused program's losses bit
+/// for bit, since the f32 kernels compute the unfused launches' values.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn swiglu_fusion_with_checkpointing_is_bit_exact_under_f32_storage() {
+    let (fused, fused_err, fused_prof) = run_mlp_blocks("f32_fused", "", &[]);
+    let (plain, plain_err, _) = run_mlp_blocks("f32_plain", "", &[("NSL_FUSE_SWIGLU", "0")]);
+    assert!(fused_err.contains("[fuse] swiglu recompute folded into the backward: 2"), "{fused_err}");
+    assert!(fused_err.contains("[wgrad-fusion] 6 chain(s) fused"), "the moved weight-gradient chains must still fuse:\n{fused_err}");
+    assert!(plain_err.contains("[wgrad-fusion] 6 chain(s) fused"), "{plain_err}");
+    assert!(
+        fused_prof.contains("\"name\":\"nsl_swiglu_backward_h_f32"),
+        "no grouped backward launch:\n{fused_prof}"
+    );
+    let (f, p) = (bf16_losses(&fused), bf16_losses(&plain));
+    assert_eq!(p.len(), 8, "{plain}");
+    assert!(p[7] < p[0], "the unfused program did not train: {p:?}");
+    assert_eq!(f, p, "fused and unfused f32 programs differ");
 }
