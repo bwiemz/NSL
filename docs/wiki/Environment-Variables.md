@@ -4,7 +4,7 @@
 
 Every `NSL_*` variable the toolchain reads (180 of them), from the registry in `crates/nsl-env`. `nsl env list` prints the same table; `nsl env current` shows which are set in your shell. A **behavior** variable changes the semantics or numerics of what is compiled or executed and belongs in any record of a result; **perf** changes speed or memory only; **safety** variables bypass or inject a check; **platform** names paths, devices and topology; **diagnostic** ones print, dump or count; **test** ones only matter under the test harness. "Read at" says whether the compiler process (`compile`) or the runtime inside the compiled program (`runtime`) reads it; `test` means only a `cargo test` binary does. "Accepted" quotes what the code compares against: `1 only` means any other value, including `0`, is ignored.
 
-## behavior (32)
+## behavior (33)
 
 | Variable | Kind | Accepted | Default | Read at | What it does |
 |---|---|---|---|---|---|
@@ -38,6 +38,7 @@ Every `NSL_*` variable the toolchain reads (180 of them), from the registry in `
 | `NSL_SUM_DIM_SHORT_MAX` | int | integer &gt;= 0 (u64; unparsable → 1); 0 disables both fast routes | 1 | runtime | Max reduce length (elements) routed to the one-thread-per-output sum_dim kernel; 1 is bit-exact, &gt;1 reassociates, 0 disables both. |
 | `NSL_SUM_SQ_BLOCKS` | int | integer &gt;= 1 (i64; else 256) | 256 | runtime | Grid-block cap per tensor for the f64-accumulated gradient sum-of-squares kernel; changes partial-sum order, 1 = single block. |
 | `NSL_SUM_SQ_CPU` | bool | 1 only | off (GPU kernel) | runtime | Set to 1 to compute a GPU tensor's sum of squares with the exact f64 CPU reduction instead of the f32-accumulating kernel. |
+| `NSL_SWIGLU_ROUND_SILU` | bool | 1 only | off | runtime | Set to 1 to round silu(g) to bf16 inside the fused SwiGLU kernels, as the unfused chain stores it: bit-identical to NSL_FUSE_SWIGLU=0. |
 | `NSL_TC_ATTENTION` | bool | 0 only | on (tensor-core attention kernels serve unpacked SDPA at head_dim 64 and 128) | runtime | Set to 0 to serve unpacked scaled_dot_product_attention with the kernels before the tensor-core ones (f16 output, atomic dQ, CPU backward on tape AD). |
 | `NSL_WRGA_FUSED_CUDA` | bool | 1 only (read per call, not cached) | off (unfused adapter ops) | both | Set to 1 to compile @adapter sites to the fused call on a pinned sm_80+ target and launch its kernel at run time. Half precision, base product included. |
 

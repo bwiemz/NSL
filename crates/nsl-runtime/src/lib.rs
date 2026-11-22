@@ -222,6 +222,8 @@ pub mod sr_bf16;
 pub mod param_storage;
 pub mod rope;
 pub mod storage_dt;
+// Fused SwiGLU (source AD's `swiglu` op and its adjoint).
+pub mod swiglu;
 pub mod csla_stat;
 pub mod grad_integrity;
 pub mod weight_stream;

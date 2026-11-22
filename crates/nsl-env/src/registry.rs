@@ -1383,6 +1383,15 @@ pub static REGISTRY: &[EnvVar] = &[
         "Set to 1 to compute a GPU tensor's sum of squares with the exact f64 CPU reduction instead of the f32-accumulating kernel."
     ),
     var!(
+        "NSL_SWIGLU_ROUND_SILU",
+        Bool,
+        "1 only",
+        "off",
+        Behavior,
+        Runtime,
+        "Set to 1 to round silu(g) to bf16 inside the fused SwiGLU kernels, as the unfused chain stores it: bit-identical to NSL_FUSE_SWIGLU=0."
+    ),
+    var!(
         "NSL_TAPE_ALLOW_DISCONNECTED",
         Bool,
         "1 only",

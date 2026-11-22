@@ -432,6 +432,7 @@ crates/nsl-runtime/src/attention_tc.rs	tc_ffi_forward_and_backward_match_the_ref
 crates/nsl-runtime/src/attention_tc.rs	tc_attention_kernel_times	diagnostic	diagnostic: times the tensor-core attention kernels at the production shapes
 crates/nsl-runtime/src/attention_tc.rs	tc_forward_matches_f64_reference	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/src/c_api/mod.rs	zz_tensor_to_desc_null_child	helper	child process — driven by nsl_tensor_to_desc_null_ptr_does_not_deref
+crates/nsl-runtime/src/cuda/storage_kernels.rs	swiglu_kernel_timing	diagnostic	diagnostic: times the fused SwiGLU kernels on the GPU
 crates/nsl-runtime/src/data/gds.rs	mmap_fallback_h2d_copies_bytes_to_device	gpu	requires CUDA GPU
 crates/nsl-runtime/src/fase_step.rs	unaligned_parameter_lengths_are_numerically_correct	gpu	requires CUDA GPU
 crates/nsl-runtime/src/fase_step.rs	flat_grid_multi_adamw_step_at_coder50m_shapes	gpu	requires CUDA GPU
@@ -565,6 +566,11 @@ crates/nsl-runtime/tests/rmsnorm_dx_backward_gpu.rs	rmsnorm_dx_gpu_matches_cpu_r
 crates/nsl-runtime/tests/rope_fused_gpu.rs	the_fused_rope_is_the_decomposed_graph_bit_for_bit	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/sr_bf16_parity.rs	sr_bf16_gpu_tail_is_bit_identical_to_cpu_reference	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/sr_bf16_parity.rs	sr_bf16_gpu_streams_vary_with_counters	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/swiglu_fused_gpu.rs	f32_fused_kernels_equal_the_unfused_launches_bit_for_bit	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/swiglu_fused_gpu.rs	bf16_outputs_are_the_f32_result_rounded_once	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/swiglu_fused_gpu.rs	bf16_fused_results_are_within_one_ulp_of_the_unfused_chain	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/swiglu_fused_gpu.rs	a_broadcast_operand_takes_the_decomposed_path	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/swiglu_round_silu_gpu.rs	with_the_silu_rounding_reinstated_the_fused_kernels_equal_the_unfused_bf16_chain	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/tier_b1_prepass_gpu.rs	x_prepass_matches_cpu_reference	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/tier_b1_prepass_gpu.rs	w_prepass_matches_cpu_reference	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/transfer_preserves_dtype_gpu.rs	f32_round_trip_keeps_the_tag_and_every_bit	gpu	requires CUDA GPU
