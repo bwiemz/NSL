@@ -1763,6 +1763,10 @@ pub(crate) struct CslaPre {
         crate::wengert::VarId,
     >,
     pub(crate) imports: Vec<crate::wengert::VarId>,
+    /// The CCR shape stubs the forward's per-segment free lists make
+    /// (`CcrPlan::shape_stubs`, stub side); every one the adjoint reads is
+    /// in `imports`. The save phase checks that each was buffered.
+    pub(crate) shape_stubs: std::collections::HashSet<crate::wengert::VarId>,
     pub(crate) schedule: CslaSchedule,
 }
 
@@ -1775,6 +1779,10 @@ pub(crate) struct CslaSaveInputs<'a> {
     pub(crate) adj_vid_to_hook_entry: &'a std::collections::HashMap<crate::wengert::VarId, ParamHookEntry>,
     /// The window save-list and dict-list variables (allocated when CSLA is on).
     pub(crate) csla_buffers: Option<(Variable, Variable)>,
+    /// The forward values CCR already freed — at their segment's end, or by
+    /// the post-forward list (the driver's `ccr_freed_primal`). None may
+    /// become a window slot.
+    pub(crate) ccr_freed_primal: &'a std::collections::HashSet<crate::wengert::VarId>,
     /// The pre-forward schedule product (consumed here).
     pub(crate) csla_pre: Option<CslaPre>,
     pub(crate) fase_hook_active: bool,
@@ -1813,6 +1821,7 @@ impl Compiler<'_> {
             adjoint,
             adj_vid_to_hook_entry,
             csla_buffers,
+            ccr_freed_primal,
             csla_pre,
             fase_hook_active,
             fase_plan,
@@ -1977,6 +1986,13 @@ impl Compiler<'_> {
                 )));
             }
         }
+        check_window_slots(
+            &slots.iter().map(|(v, _)| *v).collect(),
+            &|v| ccr_freed_primal.contains(v) || full_lowered.explicit_freed_vars.contains(v),
+            &pre.shape_stubs,
+            adjoint,
+            full_vars,
+        )?;
         // LSE tape-carry: append one slot per fused-SDPA aux
         // entry whose forward output the adjoint reads. The
         // stored value is the aux LSE (join-block param on the
@@ -2177,5 +2193,111 @@ impl Compiler<'_> {
             csla_loss_buffered,
             csla_teardown_slots,
         })
+    }
+}
+
+/// The two invariants the window buffer rests on, checked where the slot list
+/// is final (D1, design invariants I1 and I2). Both hold by construction —
+/// `ccr::validate` refuses an adjoint that reads a freed interior, and
+/// `layerwise::adjoint_primal_imports` is given the stubs — so a failure is a
+/// compiler bug, and it must be a compile error: both would otherwise run.
+///
+/// * I1: no slot was freed by the forward (`freed`). A buffered pointer to
+///   storage the allocator has taken back is read by every replayed
+///   micro-batch after it.
+/// * I2: every shape stub the forward made (`lowered`) and the adjoint reads
+///   is a slot. An unbuffered stub resolves at replay from the current
+///   iteration's forward values, which the per-iteration bulk free has
+///   released before the window backward runs.
+fn check_window_slots(
+    slots: &std::collections::HashSet<crate::wengert::VarId>,
+    freed: &dyn Fn(&crate::wengert::VarId) -> bool,
+    shape_stubs: &std::collections::HashSet<crate::wengert::VarId>,
+    adjoint: &crate::wengert::WengertList,
+    lowered: &crate::wengert_lower::VarMap,
+) -> Result<(), CodegenError> {
+    let mut slot_ids: Vec<crate::wengert::VarId> = slots.iter().copied().collect();
+    slot_ids.sort_unstable();
+    if let Some(v) = slot_ids.into_iter().find(|v| freed(v)) {
+        return Err(CodegenError::new(format!(
+            "internal compiler error (CSLA): the window would buffer v{v}, which \
+             the forward already freed (CCR early-free); please report this"
+        )));
+    }
+    let mut unbuffered: Vec<crate::wengert::VarId> = adjoint
+        .ops
+        .iter()
+        .flat_map(|op| op.inputs.iter().copied())
+        .filter(|v| shape_stubs.contains(v) && lowered.contains_key(v) && !slots.contains(v))
+        .collect();
+    unbuffered.sort_unstable();
+    if let Some(s) = unbuffered.first() {
+        return Err(CodegenError::new(format!(
+            "internal compiler error (CSLA): the adjoint reads shape stub v{s} \
+             but the window does not buffer it; please report this"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_window_slots;
+    use crate::wengert::{PrimalOp, VarId, WengertList, WengertOp};
+    use std::collections::{HashMap, HashSet};
+
+    /// A one-op adjoint reading `inputs`, and a lowering that defined `defined`.
+    fn case(inputs: Vec<VarId>, defined: &[VarId]) -> (WengertList, crate::wengert_lower::VarMap) {
+        let adjoint = WengertList {
+            ops: vec![WengertOp {
+                id: crate::wengert::adjoint_op_id(0),
+                result: 1000,
+                op: PrimalOp::Passthrough("reduce_to_shape".into()),
+                inputs,
+                saved_for_backward: false,
+                checkpointed: false,
+            }],
+            output: 0,
+            var_names: HashMap::new(),
+            var_types: HashMap::new(),
+        };
+        // Any Value will do: the check only asks whether the key exists.
+        let mut func = cranelift_codegen::ir::Function::new();
+        let block = func.dfg.make_block();
+        let value = func
+            .dfg
+            .append_block_param(block, cranelift_codegen::ir::types::I64);
+        let lowered = defined.iter().map(|&v| (v, value)).collect();
+        (adjoint, lowered)
+    }
+
+    #[test]
+    fn a_buffered_stub_and_unfreed_slots_pass() {
+        let (adjoint, lowered) = case(vec![7, 50], &[7, 50]);
+        let slots: HashSet<VarId> = [7, 50].into_iter().collect();
+        let stubs: HashSet<VarId> = [50].into_iter().collect();
+        assert!(check_window_slots(&slots, &|_| false, &stubs, &adjoint, &lowered).is_ok());
+    }
+
+    #[test]
+    fn a_slot_the_forward_freed_is_an_internal_error() {
+        let (adjoint, lowered) = case(vec![7], &[7]);
+        let slots: HashSet<VarId> = [7].into_iter().collect();
+        let err = check_window_slots(&slots, &|v| *v == 7, &HashSet::new(), &adjoint, &lowered)
+            .unwrap_err();
+        assert!(err.message.contains("would buffer v7"), "{}", err.message);
+    }
+
+    #[test]
+    fn an_unbuffered_stub_the_adjoint_reads_is_an_internal_error() {
+        let (adjoint, lowered) = case(vec![7, 50], &[7, 50]);
+        let slots: HashSet<VarId> = [7].into_iter().collect();
+        let stubs: HashSet<VarId> = [50].into_iter().collect();
+        let err = check_window_slots(&slots, &|_| false, &stubs, &adjoint, &lowered).unwrap_err();
+        assert!(err.message.contains("shape stub v50"), "{}", err.message);
+        // A stub the forward never made (the kill switch: no free lists ran)
+        // is a ghost the replay skips, not an error.
+        let (adjoint, lowered) = case(vec![7, 50], &[7]);
+        assert!(check_window_slots(&slots, &|_| false, &stubs, &adjoint, &lowered).is_ok());
     }
 }

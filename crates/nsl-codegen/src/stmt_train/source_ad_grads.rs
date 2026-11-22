@@ -313,8 +313,9 @@ impl Compiler<'_> {
 
         let mut retained_full_vars = std::collections::HashSet::new();
         retained_full_vars.insert(loss_var_id);
-        // CCR: block interiors were freed right after the forward
-        // (the early-free mini list) — the bulk free must skip them.
+        // CCR: block interiors were freed during the forward (per
+        // segment, or by the post-forward list under the kill switch) —
+        // the bulk free must skip them.
         retained_full_vars.extend(ccr_freed_primal.iter().copied());
         // CCR compressed saves: originals were freed by the primal
         // TAIL (recorded on the main primal lowering), and the half

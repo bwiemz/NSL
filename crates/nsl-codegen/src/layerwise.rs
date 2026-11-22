@@ -220,11 +220,21 @@ pub fn analyze(
     }
 }
 
-/// CSLA Stage-2: the adjoint's imports from the primal tape — every VarId
-/// produced by a primal op and read by at least one adjoint op.
+/// CSLA Stage-2: the adjoint's imports from the forward — every VarId the
+/// forward lowering defines (a primal op's result, or one of
+/// `forward_defined`) and at least one adjoint op reads.
 ///
 /// These are exactly the values the window-buffered schedule must carry from
-/// each micro-batch's forward to the deferred backward phase. `Param` and
+/// each micro-batch's forward to the deferred backward phase.
+///
+/// `forward_defined` names the values the forward lowering makes beyond the
+/// primal tape's own ops: the CCR shape stubs (`CcrPlan::shape_stubs`), made
+/// by the per-segment free lists just before the interior they stand in for
+/// is freed. The adjoint reads a stub in place of that interior, so it is
+/// per-micro-batch like any activation and must ride the window: left out,
+/// the replay would resolve it from the CURRENT iteration's forward values,
+/// which the per-iteration bulk free has released by then (and whose shape
+/// belongs to another micro-batch). `Param` and
 /// `Constant` leaves are excluded: their lowered values are loop-invariant
 /// (the same runtime parameter pointer / immediate every micro-batch — FASE
 /// Deferred only updates θ at window boundaries, after the buffered backward
@@ -238,7 +248,11 @@ pub fn analyze(
 /// correctly absent, and only true boundary/saved values are buffered.
 ///
 /// Sorted by VarId so buffer slot indices are deterministic across builds.
-pub fn adjoint_primal_imports(primal: &WengertList, adjoint: &WengertList) -> Vec<VarId> {
+pub fn adjoint_primal_imports(
+    primal: &WengertList,
+    adjoint: &WengertList,
+    forward_defined: &HashSet<VarId>,
+) -> Vec<VarId> {
     let mut loop_invariant: HashSet<VarId> = HashSet::new();
     let mut primal_results: HashSet<VarId> = HashSet::new();
     for op in &primal.ops {
@@ -251,7 +265,10 @@ pub fn adjoint_primal_imports(primal: &WengertList, adjoint: &WengertList) -> Ve
         .ops
         .iter()
         .flat_map(|op| op.inputs.iter().copied())
-        .filter(|v| primal_results.contains(v) && !loop_invariant.contains(v))
+        .filter(|v| {
+            (primal_results.contains(v) || forward_defined.contains(v))
+                && !loop_invariant.contains(v)
+        })
         .collect();
     let mut imports: Vec<VarId> = import_set.into_iter().collect();
     imports.sort_unstable();
@@ -351,6 +368,31 @@ pub fn forward_slices(
         slices.push((cursor, primal_len));
     }
     Ok(slices)
+}
+
+/// For each slice of [`forward_slices`], the index of the segment it IS, or
+/// `None` for a prologue, epilogue or inter-segment gap. The per-segment
+/// early-free lowers segment `i`'s free list after the slice tagged `i`.
+///
+/// Matched in order (the slices list the segments in order), so two segments
+/// with the same bounds — two empty ones — get their own indices and no list
+/// runs twice.
+pub fn segment_index_of_slices(
+    segments: &[(usize, usize)],
+    slices: &[(usize, usize)],
+) -> Vec<Option<usize>> {
+    let mut next = 0;
+    slices
+        .iter()
+        .map(|&slice| {
+            if segments.get(next) == Some(&slice) {
+                next += 1;
+                Some(next - 1)
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// CSLA D2b: params that must stay RESIDENT under weight streaming — any
@@ -626,11 +668,44 @@ mod tests {
             primal_op(2, 102, PrimalOp::Matmul, vec![100, 3, 2]),
             primal_op(3, 103, PrimalOp::Add, vec![101, 102]),
         ]);
-        let imports = adjoint_primal_imports(&primal, &adj);
+        let imports = adjoint_primal_imports(&primal, &adj, &HashSet::new());
         // Param(1) and Constant(2) excluded (loop-invariant); adjoint-internal
         // 100/101/102 excluded (not primal results). Input(3), act(4), and
         // loss(5) are the window-buffered set.
         assert_eq!(imports, vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn window_imports_include_shape_stubs_the_adjoint_reads() {
+        // Primal: input(1), param(2), act = input @ param (3),
+        // out = act + input (4). The per-segment free list freed `act` after
+        // making stub 50 of it; the add's backward reads the stub (the target
+        // of its reduce_to_shape). Stub 51 exists but nothing reads it.
+        let primal = adjoint(vec![
+            primal_op(0, 1, PrimalOp::Input("batch".into()), vec![]),
+            primal_op(1, 2, PrimalOp::Param("m.blocks.0.w".into()), vec![]),
+            primal_op(2, 3, PrimalOp::Matmul, vec![1, 2]),
+            primal_op(3, 4, PrimalOp::Add, vec![3, 1]),
+        ]);
+        let adj = adjoint(vec![
+            primal_op(
+                0,
+                100,
+                PrimalOp::Passthrough("reduce_to_shape".into()),
+                vec![99, 50],
+            ),
+            primal_op(1, 101, PrimalOp::Matmul, vec![100, 2, 1]),
+        ]);
+        let stubs: HashSet<VarId> = [50, 51].into_iter().collect();
+        // Without the stub set the stub is not an import: the replay would
+        // read the current iteration's stub (the bug this parameter closes).
+        assert_eq!(
+            adjoint_primal_imports(&primal, &adj, &HashSet::new()),
+            vec![1]
+        );
+        // With it, the read stub rides the window; the unread one does not,
+        // and the adjoint-internal 99 never does.
+        assert_eq!(adjoint_primal_imports(&primal, &adj, &stubs), vec![1, 50]);
     }
 
     #[test]
@@ -643,7 +718,10 @@ mod tests {
             primal_op(0, 200, PrimalOp::Relu, vec![9, 4]),
             primal_op(1, 201, PrimalOp::Relu, vec![4, 9]),
         ]);
-        assert_eq!(adjoint_primal_imports(&primal, &adj), vec![4, 9]);
+        assert_eq!(
+            adjoint_primal_imports(&primal, &adj, &HashSet::new()),
+            vec![4, 9]
+        );
     }
 
     #[test]
@@ -750,6 +828,36 @@ mod tests {
         assert!(forward_slices(&[(3, 7), (5, 9)], 12).is_err());
         assert!(forward_slices(&[(0, 20)], 12).is_err());
         assert!(forward_slices(&[(4, 2)], 12).is_err());
+    }
+
+    #[test]
+    fn slices_are_tagged_with_the_segment_they_are() {
+        // Prologue, segment 0, a gap, segment 1, epilogue.
+        let segments = [(2, 4), (6, 8)];
+        let slices = forward_slices(&segments, 10).unwrap();
+        assert_eq!(
+            segment_index_of_slices(&segments, &slices),
+            vec![None, Some(0), None, Some(1), None]
+        );
+        // No prologue or epilogue: every slice is a segment.
+        let segments = [(0, 5), (5, 9)];
+        let slices = forward_slices(&segments, 9).unwrap();
+        assert_eq!(
+            segment_index_of_slices(&segments, &slices),
+            vec![Some(0), Some(1)]
+        );
+        // Two empty segments at the same position are two segments, in order.
+        let segments = [(3, 3), (3, 3), (3, 6)];
+        let slices = forward_slices(&segments, 6).unwrap();
+        assert_eq!(
+            segment_index_of_slices(&segments, &slices),
+            vec![None, Some(0), Some(1), Some(2)]
+        );
+        // No segments: one untagged slice.
+        assert_eq!(
+            segment_index_of_slices(&[], &forward_slices(&[], 6).unwrap()),
+            vec![None]
+        );
     }
 
     #[test]

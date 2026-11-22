@@ -466,7 +466,7 @@ Block-granular activation checkpointing on the decorator-free source-AD path. Th
 
 1. **Segments** the flat inlined primal tape into per-transformer-block ranges using the same `blocks.N` parameter-name prefixes WGGO uses (`wggo_graph::layer_prefix`).
 2. **Classifies** each in-segment result: *escaping* (consumed by a later primal op — the residual stream and anything else crossing the block boundary) stays SAVED; *interior* (consumed only inside the segment and/or by the adjoint) becomes RECOMPUTE.
-3. **Early-frees** the original interiors, each at the end of its own segment during the forward (after the whole forward under `--layerwise-accum`).
+3. **Early-frees** the original interiors, each at the end of its own segment during the forward (after the whole forward with `NSL_CCR_SEGMENT_FREE=0`). Under `--layerwise-accum` the accumulation window buffers the shape stubs of step 4 per micro-batch, with everything else the backward reads; under `--weight-stream` a segment's interiors are freed before its weights are evicted.
 4. **Splices** clones of the interior-producing ops into the adjoint immediately before the first adjoint op that consumes them, remapping those consumers. Only an interior whose *value* the backward reads is cloned (`backward_reads`). One it reads for shape only — the operand of a residual add, read as the target of a `reduce_to_shape` — is not recomputed: a one-element shape stub captured just before the free stands in for it. One it does not read at all is simply freed.
 5. **Frees** each recomputed tensor right after the last adjoint op that consumes it.
 

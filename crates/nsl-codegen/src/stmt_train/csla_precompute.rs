@@ -152,9 +152,18 @@ impl Compiler<'_> {
                         }
                     }
                 }
+                // The shape stubs the forward's per-segment free lists make
+                // (`ccr::apply_to_adjoint` rewrote the adjoint to read them):
+                // per-micro-batch values the window must buffer like any
+                // other forward value the adjoint reads.
+                let shape_stubs: std::collections::HashSet<crate::wengert::VarId> = ccr_plan
+                    .as_ref()
+                    .map(|p| p.shape_stubs.iter().map(|&(_, stub)| stub).collect())
+                    .unwrap_or_default();
                 let imports = crate::layerwise::adjoint_primal_imports(
                     effective_primal,
                     adjoint,
+                    &shape_stubs,
                 );
 
                 // ── D1b schedule derivation (moved from the window
@@ -491,6 +500,7 @@ impl Compiler<'_> {
                         params: csla_params,
                         primal_view_of,
                         imports,
+                        shape_stubs,
                         schedule: CslaSchedule {
                             ranges,
                             layer_group,

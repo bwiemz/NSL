@@ -26,6 +26,7 @@ use crate::context::FuncState;
 use crate::error::CodegenError;
 use crate::stmt::SURFACE_WEIGHTS;
 use crate::stmt_train::csla_precompute::WsForwardPlan;
+use crate::wengert::{VarId, WengertList, WengertType};
 use crate::wengert_lower::{LoweredWengert, VarMap};
 
 /// Every binding of `compile_train_block_inner` the forward lowering
@@ -49,6 +50,81 @@ pub(crate) struct CcrSegmentFree {
     /// (segment index if this slice IS a segment, start, end)
     pub(crate) slices: Vec<(Option<usize>, usize, usize)>,
     pub(crate) lists: Vec<crate::wengert::WengertList>,
+}
+
+/// The fold state a sliced forward threads through every
+/// `compile_wengert_ops_range` call — each primal slice and each segment's
+/// free list — so that the slices together record exactly what one
+/// monolithic `compile_wengert_ops` would have (one var_map every later slice
+/// and the adjoint resolve through; owned and freed sets concatenated).
+struct SlicedForward {
+    var_map: VarMap,
+    var_types: std::collections::HashMap<VarId, WengertType>,
+    owned_values: Vec<(VarId, Value, WengertType)>,
+    hook_freed_input_vars: std::collections::HashSet<VarId>,
+    explicit_freed_vars: std::collections::HashSet<VarId>,
+    /// No FASE hook runs on a forward; stays empty.
+    hook_freed_param_vars: std::collections::HashSet<VarId>,
+}
+
+impl SlicedForward {
+    fn new(primal_vars: &VarMap, primal: &WengertList) -> Self {
+        Self {
+            var_map: primal_vars.clone(),
+            var_types: primal.var_types.clone(),
+            owned_values: Vec::new(),
+            hook_freed_input_vars: std::collections::HashSet::new(),
+            explicit_freed_vars: std::collections::HashSet::new(),
+            hook_freed_param_vars: std::collections::HashSet::new(),
+        }
+    }
+}
+
+/// What a forward's segment free lists freed: values, and segments that
+/// freed at least one (the witness line's two counts).
+#[derive(Default)]
+struct FreeTally {
+    freed: usize,
+    segments: usize,
+}
+
+/// I5 (D1): the streamed forward and the per-segment free lists must slice
+/// the forward identically — the lists are indexed by the per-segment plan's
+/// slices, the loop by the streaming plan's. Both come from
+/// `layerwise::forward_slices` over the same CCR segments today; a future
+/// divergence would free a segment's interiors at another slice's end (too
+/// early: a use after free; too late: memory) without any other symptom.
+fn streamed_slices_match_segments(
+    segment_slices: &[(Option<usize>, usize, usize)],
+    streamed: &[(usize, usize)],
+) -> Result<(), CodegenError> {
+    let same = segment_slices.len() == streamed.len()
+        && segment_slices
+            .iter()
+            .zip(streamed)
+            .all(|(&(_, s, e), &(ws, we))| s == ws && e == we);
+    if same {
+        Ok(())
+    } else {
+        Err(CodegenError::new(
+            "internal compiler error (CCR/weight-stream): the streamed forward's slices \
+             differ from the CCR segment slices; please report this",
+        ))
+    }
+}
+
+/// The per-segment early-free witness: the gates' anti-vacuity anchor
+/// (`ccr_segment_early_free_gate.rs`, `csla_layerwise_gate.rs` parse the
+/// count), printed whenever the forward ran the per-segment free lists.
+fn log_segment_free_witness(freed: usize, segments: usize) {
+    nsl_log::nsl_log!(
+        INFO,
+        "ccr",
+        "[ccr] per-segment early-free: {} interior value(s) freed \
+         across {} segment(s) during the forward",
+        freed,
+        segments,
+    );
 }
 
 impl Compiler<'_> {
@@ -87,18 +163,23 @@ impl Compiler<'_> {
         // Item 11: plan the per-segment forward early-free. Built
         // here — after the CCR plan's owned-tensor restriction and
         // after the weight-stream plan exists — so the eligibility
-        // conditions are all decidable:
-        //   * ws path: already sliced, keeps its own (post-forward)
-        //     free discipline; composing the two is future work and
-        //     silently changing ws lifetimes here is not it.
-        //   * CSLA: buffers the adjoint's primal imports across the
-        //     accumulation window; its retention contract is the
-        //     bulk-free's, not this pass's. Excluded.
+        // conditions are all decidable. It applies in every mode:
+        //   * CSLA (`--layerwise-accum`): the window buffers what the
+        //     adjoint reads, and the adjoint reads no freed interior
+        //     (`ccr::validate`) — only the shape stubs the free lists
+        //     make, which the window buffers as well
+        //     (`layerwise::adjoint_primal_imports`); the save phase
+        //     checks both. Without this every block's interiors lived
+        //     to the end of each micro-batch's forward (D1: +10 GiB at
+        //     500M, OOM at 1B).
+        //   * `--weight-stream`: its forward is sliced on the same CCR
+        //     segments, so each segment's list runs inside the streamed
+        //     loop, before that slice's evicts (checked below).
         //   * NSL_CCR_SEGMENT_FREE=0: kill switch for A/B under ONE
         //     binary (the runtime-archive lesson: never A/B by
         //     swapping binaries).
         let ccr_segment_free: Option<CcrSegmentFree> = match ccr_plan {
-            Some(plan) if ws_fwd_plan.is_none() && self.ccr_frees_per_segment() => {
+            Some(plan) if self.ccr_frees_per_segment() => {
                 let seg_bounds: Vec<(usize, usize)> = plan
                     .segments
                     .iter()
@@ -109,13 +190,11 @@ impl Compiler<'_> {
                     effective_primal.ops.len(),
                 )
                 .map_err(CodegenError::new)?;
-                let mut tagged = Vec::with_capacity(slices.len());
-                for &(s_op, e_op) in &slices {
-                    let si = seg_bounds
-                        .iter()
-                        .position(|&(bs, be)| bs == s_op && be == e_op);
-                    tagged.push((si, s_op, e_op));
-                }
+                let tagged = crate::layerwise::segment_index_of_slices(&seg_bounds, &slices)
+                    .into_iter()
+                    .zip(&slices)
+                    .map(|(si, &(s_op, e_op))| (si, s_op, e_op))
+                    .collect();
                 Some(CcrSegmentFree {
                     slices: tagged,
                     lists: crate::ccr::build_segment_free_lists(plan),
@@ -146,13 +225,18 @@ impl Compiler<'_> {
             // `compile_wengert_ops_range` so the result is
             // byte-identical to the monolithic lowering — streaming
             // only interleaves resident-set changes for θ.
-            let mut var_map = primal_vars.clone();
-            let mut var_types = effective_primal.var_types.clone();
-            let mut owned_values = Vec::new();
-            let mut hook_freed_input_vars = std::collections::HashSet::new();
-            let mut explicit_freed_vars = std::collections::HashSet::new();
-            // No FASE hook on this forward-streaming path — stays empty.
-            let mut hook_freed_param_vars = std::collections::HashSet::new();
+            //
+            // D1: each CCR segment's free list runs right after its slice
+            // and BEFORE that slice's evicts, so an interior that is a
+            // view of a streamed parameter is released while the
+            // parameter's storage is still on the device. Before, the
+            // streamed forward lowered no list at all and the driver freed
+            // every interior after the whole forward.
+            if let Some(seg_free) = &ccr_segment_free {
+                streamed_slices_match_segments(&seg_free.slices, &wsplan.slices)?;
+            }
+            let mut fold = SlicedForward::new(primal_vars, effective_primal);
+            let mut tally = FreeTally::default();
             let arena_mode = self.compile_options.weight_stream.arena;
             for (si, &(s, e)) in wsplan.slices.iter().enumerate() {
                 // Item 10: in arena mode a whole layer pack uploads at
@@ -212,20 +296,10 @@ impl Compiler<'_> {
                         &[prev_surf],
                     )?;
                 }
-                crate::wengert_lower::compile_wengert_ops_range(
-                    self,
-                    builder,
-                    state,
-                    effective_primal,
-                    s..e,
-                    &mut var_map,
-                    &mut var_types,
-                    &mut owned_values,
-                    &mut hook_freed_input_vars,
-                    &mut explicit_freed_vars,
-                    &mut hook_freed_param_vars,
-                    None,
-                )?;
+                self.emit_forward_slice(builder, state, effective_primal, s..e, &mut fold)?;
+                if let Some(seg_free) = &ccr_segment_free {
+                    self.emit_slice_end_frees(builder, state, seg_free, si, &mut fold, &mut tally)?;
+                }
                 // Evict this slice's last-touch params/packs — read-only
                 // (writeback=0): forwards never mutate θ, the mirror
                 // is current by construction.
@@ -256,17 +330,10 @@ impl Compiler<'_> {
                     }
                 }
             }
-            // Same sdpa-extras adoption the monolithic wrapper does.
-            for v in self.sdpa_extra_owned.drain(..) {
-                owned_values.push((u32::MAX, v, crate::wengert::WengertType::Tensor));
+            if ccr_segment_free.is_some() {
+                log_segment_free_witness(tally.freed, tally.segments);
             }
-            crate::wengert_lower::LoweredWengert {
-                var_map,
-                owned_values,
-                hook_freed_input_vars,
-                explicit_freed_vars,
-                hook_freed_param_vars,
-            }
+            self.finish_sliced_forward(fold)
         } else if let Some(seg_free) = &ccr_segment_free {
             // Item 11: per-segment forward early-free. Same sliced
             // emission the weight-streaming branch above uses — one
@@ -278,82 +345,14 @@ impl Compiler<'_> {
             // still live at end-of-forward, which is where the global
             // peak sits: `--checkpoint-blocks` was reducing the
             // backward's activation wall and never the forward's.
-            let mut var_map = primal_vars.clone();
-            let mut var_types = effective_primal.var_types.clone();
-            let mut owned_values = Vec::new();
-            let mut hook_freed_input_vars = std::collections::HashSet::new();
-            let mut explicit_freed_vars = std::collections::HashSet::new();
-            let mut hook_freed_param_vars = std::collections::HashSet::new();
-            let mut freed_count = 0usize;
-            let mut segments_freed = 0usize;
-            for &(si, s_op, e_op) in &seg_free.slices {
-                crate::wengert_lower::compile_wengert_ops_range(
-                    self,
-                    builder,
-                    state,
-                    effective_primal,
-                    s_op..e_op,
-                    &mut var_map,
-                    &mut var_types,
-                    &mut owned_values,
-                    &mut hook_freed_input_vars,
-                    &mut explicit_freed_vars,
-                    &mut hook_freed_param_vars,
-                    None,
-                )?;
-                if let Some(seg_idx) = si {
-                    let free_list = &seg_free.lists[seg_idx];
-                    if free_list.ops.is_empty() {
-                        continue;
-                    }
-                    // Through the RANGE fold, not the wrapper: the
-                    // wrapper drains `sdpa_extra_owned` into a return
-                    // value, and a mid-forward call here would steal
-                    // every fused-SDPA LSE pushed by the slices before
-                    // it — un-owning them so the end-of-step bulk free
-                    // never releases them. Review finding F1
-                    // (2026-08-24), confirmed as a +8 MB/micro-step
-                    // ramp at 1B (16 layers x [2,32,2048] f32) before
-                    // this fix; the drain happens ONCE, after the last
-                    // slice, exactly as the ws branch does.
-                    let before = explicit_freed_vars.len();
-                    let mut free_var_types = free_list.var_types.clone();
-                    crate::wengert_lower::compile_wengert_ops_range(
-                        self,
-                        builder,
-                        state,
-                        free_list,
-                        0..free_list.ops.len(),
-                        &mut var_map,
-                        &mut free_var_types,
-                        &mut owned_values,
-                        &mut hook_freed_input_vars,
-                        &mut explicit_freed_vars,
-                        &mut hook_freed_param_vars,
-                        None,
-                    )?;
-                    let freed_here = explicit_freed_vars.len() - before;
-                    freed_count += freed_here;
-                    if freed_here > 0 {
-                        segments_freed += 1;
-                    }
-                }
+            let mut fold = SlicedForward::new(primal_vars, effective_primal);
+            let mut tally = FreeTally::default();
+            for (k, &(_, s_op, e_op)) in seg_free.slices.iter().enumerate() {
+                self.emit_forward_slice(builder, state, effective_primal, s_op..e_op, &mut fold)?;
+                self.emit_slice_end_frees(builder, state, seg_free, k, &mut fold, &mut tally)?;
             }
-            nsl_log::nsl_log!(INFO, "ccr", 
-                "[ccr] per-segment early-free: {} interior value(s) freed \
-                 across {} segment(s) during the forward",
-                freed_count, segments_freed,
-            );
-            for v in self.sdpa_extra_owned.drain(..) {
-                owned_values.push((u32::MAX, v, crate::wengert::WengertType::Tensor));
-            }
-            crate::wengert_lower::LoweredWengert {
-                var_map,
-                owned_values,
-                hook_freed_input_vars,
-                explicit_freed_vars,
-                hook_freed_param_vars,
-            }
+            log_segment_free_witness(tally.freed, tally.segments);
+            self.finish_sliced_forward(fold)
         } else {
             crate::wengert_lower::compile_wengert_ops(
                 self,
@@ -369,15 +368,119 @@ impl Compiler<'_> {
         Ok((ccr_segment_free, full_lowered))
     }
 
+    /// Lower the primal ops `range` of a sliced forward into `fold`.
+    fn emit_forward_slice(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        primal: &WengertList,
+        range: std::ops::Range<usize>,
+        fold: &mut SlicedForward,
+    ) -> Result<(), CodegenError> {
+        crate::wengert_lower::compile_wengert_ops_range(
+            self,
+            builder,
+            state,
+            primal,
+            range,
+            &mut fold.var_map,
+            &mut fold.var_types,
+            &mut fold.owned_values,
+            &mut fold.hook_freed_input_vars,
+            &mut fold.explicit_freed_vars,
+            &mut fold.hook_freed_param_vars,
+            None,
+        )
+    }
+
+    /// After slice `slice` of a sliced forward: when that slice is a CCR
+    /// segment, lower the segment's free list and tally what it freed.
+    fn emit_slice_end_frees(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        seg_free: &CcrSegmentFree,
+        slice: usize,
+        fold: &mut SlicedForward,
+        tally: &mut FreeTally,
+    ) -> Result<(), CodegenError> {
+        let Some(seg_idx) = seg_free.slices[slice].0 else {
+            return Ok(());
+        };
+        let freed = self.emit_segment_free_list(builder, state, &seg_free.lists[seg_idx], fold)?;
+        tally.freed += freed;
+        if freed > 0 {
+            tally.segments += 1;
+        }
+        Ok(())
+    }
+
+    /// Lower one CCR segment's free list ([`crate::ccr::build_segment_free_lists`]:
+    /// its shape stubs, then its `FreeTensor`s) at that segment's end, into
+    /// the forward's fold. Returns how many values it freed.
+    ///
+    /// Through the RANGE fold, not the wrapper: the wrapper drains
+    /// `sdpa_extra_owned` into a return value, and a mid-forward call here
+    /// would steal every fused-SDPA LSE pushed by the slices before it —
+    /// un-owning them so the end-of-step bulk free never releases them.
+    /// Review finding F1 (2026-08-24), confirmed as a +8 MB/micro-step ramp
+    /// at 1B (16 layers x [2,32,2048] f32) before this fix; the drain happens
+    /// ONCE, after the last slice ([`Self::finish_sliced_forward`]).
+    fn emit_segment_free_list(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        free_list: &WengertList,
+        fold: &mut SlicedForward,
+    ) -> Result<usize, CodegenError> {
+        if free_list.ops.is_empty() {
+            return Ok(0);
+        }
+        let before = fold.explicit_freed_vars.len();
+        // The list's own type map (its stubs are Tensors); the primal's
+        // map is not extended by the list's markers.
+        let mut free_var_types = free_list.var_types.clone();
+        crate::wengert_lower::compile_wengert_ops_range(
+            self,
+            builder,
+            state,
+            free_list,
+            0..free_list.ops.len(),
+            &mut fold.var_map,
+            &mut free_var_types,
+            &mut fold.owned_values,
+            &mut fold.hook_freed_input_vars,
+            &mut fold.explicit_freed_vars,
+            &mut fold.hook_freed_param_vars,
+            None,
+        )?;
+        Ok(fold.explicit_freed_vars.len() - before)
+    }
+
+    /// Close a sliced forward: adopt the fused-SDPA extras the slices
+    /// accrued (the same adoption the monolithic wrapper does, once, after
+    /// the last slice) and hand the fold back as the lowering result.
+    fn finish_sliced_forward(&mut self, mut fold: SlicedForward) -> LoweredWengert {
+        for v in self.sdpa_extra_owned.drain(..) {
+            fold.owned_values.push((u32::MAX, v, WengertType::Tensor));
+        }
+        LoweredWengert {
+            var_map: fold.var_map,
+            owned_values: fold.owned_values,
+            hook_freed_input_vars: fold.hook_freed_input_vars,
+            explicit_freed_vars: fold.explicit_freed_vars,
+            hook_freed_param_vars: fold.hook_freed_param_vars,
+        }
+    }
+
     /// Whether the forward frees each CCR segment's interiors at that
     /// segment's end (the per-segment free lists) and not once after the
-    /// whole forward. False under CSLA, whose window buffers the adjoint's
-    /// primal imports (weight streaming needs CSLA, so it is covered), and
-    /// under the `NSL_CCR_SEGMENT_FREE=0` kill switch. `apply_to_adjoint` is
-    /// told this before the forward is lowered, so both sites read it here.
+    /// whole forward: in every mode (plain, `--layerwise-accum`,
+    /// `--weight-stream`) unless the `NSL_CCR_SEGMENT_FREE=0` kill switch is
+    /// set. `apply_to_adjoint` is told this before the forward is lowered, so
+    /// both sites read it here.
     pub(crate) fn ccr_frees_per_segment(&self) -> bool {
-        !self.compile_options.train.layerwise_accum
-            && std::env::var("NSL_CCR_SEGMENT_FREE").as_deref() != Ok("0")
+        std::env::var("NSL_CCR_SEGMENT_FREE").as_deref() != Ok("0")
     }
 
     /// Close the tape region before the forward is lowered: free the
@@ -419,6 +522,39 @@ impl Compiler<'_> {
                     primal_vars.contains_key(&op.result)
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::streamed_slices_match_segments;
+
+    #[test]
+    fn the_streamed_slices_must_be_the_segment_slices() {
+        // Prologue, two segments, epilogue — as `layerwise::forward_slices`
+        // makes them for both plans.
+        let tagged = [
+            (None, 0, 3),
+            (Some(0), 3, 7),
+            (Some(1), 7, 12),
+            (None, 12, 15),
+        ];
+        let same = [(0, 3), (3, 7), (7, 12), (12, 15)];
+        assert!(streamed_slices_match_segments(&tagged, &same).is_ok());
+        // A boundary moved by one op, a slice missing, a slice extra: each
+        // would run a segment's frees at the wrong place.
+        for streamed in [
+            &[(0, 3), (3, 8), (8, 12), (12, 15)][..],
+            &[(0, 3), (3, 7), (7, 15)][..],
+            &[(0, 3), (3, 7), (7, 12), (12, 14), (14, 15)][..],
+        ] {
+            let err = streamed_slices_match_segments(&tagged, streamed).unwrap_err();
+            assert!(
+                err.message.contains("internal compiler error"),
+                "{}",
+                err.message
+            );
         }
     }
 }

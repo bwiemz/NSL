@@ -210,7 +210,7 @@ pub static REGISTRY: &[EnvVar] = &[
         "on",
         Perf,
         Compile,
-        "Kill switch for CCR per-segment forward early-free (memory only; already skipped under --weight-stream or --layerwise-accum)."
+        "Kill switch for CCR per-segment forward early-free (memory only; every mode, --layerwise-accum and --weight-stream included)."
     ),
     var!(
         "NSL_CKPT_DTYPE_PATH",

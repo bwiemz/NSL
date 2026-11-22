@@ -440,7 +440,7 @@ and offload (8-12 GiB) then remain as stated trade-offs for smaller cards.
 
 ## Defects found (not fixed here)
 
-* **D1**: `--layerwise-accum` and `--weight-stream` lose the forward per-segment early-free
+* **D1** (fixed 2026-11-21, `perf/d1-early-free`; see "D1 fixed" below): `--layerwise-accum` and `--weight-stream` lose the forward per-segment early-free
   (`forward_lowering.rs:378` `ccr_frees_per_segment`, `:101` ws path). Reproducer: perfcheck arms
   `nsl_bf16_lw` / `nsl_bf16_ws` at 1B (OOM), and `nsl_tf32_lw` at 500M (+9.97 GiB vs
   `nsl_tf32_blocks_nowgrad_noclip`). Contrast: `P` built with `NSL_CCR_SEGMENT_FREE=0` OOMs at 1B
@@ -544,6 +544,58 @@ fixed seed does not remove. Both arms' 50M peaks confirm the argument took effec
 Verdict: **keep**. It is 2 GiB at 1B for no speed, and passed the 50M test. Making it the
 default would change every existing recipe's arithmetic and its checkpoint fingerprint. That
 wants a longer run at 500M or 1B first, because the 50M test cannot see an effect under 0.04.
+
+### D1 fixed (2026-11-21, `perf/d1-early-free`)
+
+The layerwise forward (`--layerwise-accum`) and the streamed forward (`--weight-stream`) now free
+each checkpointed block's interiors at the block's end, as the other schedules do. The CSLA window
+also buffers the shape stubs the free lists make (one `nsl_tensor_shape_stub` per residual add
+whose operand was freed), and the streamed forward frees a segment's interiors before evicting
+its weights. `NSL_CCR_SEGMENT_FREE=0` restores the old lifetimes in every mode. Same harness as
+above (`tools/perfcheck`, MEMORY_ARMS), toolchains `tc_fix` (b6a9e200) and `tc_main` (7eea4517),
+3 rounds per arm (1 for the two 1B arms at main); allocator / reserved / driver peaks were
+identical in every round.
+
+| arm | alloc GiB | reserved | driver | tok/s median | paired |
+|---|---|---|---|---|---|
+| 500M TF32 `blocks_nowgrad_noclip` (control) | 10.66 | 11.75 | 12.13 | 9,862 | - |
+| 500M TF32 `lw`, main | 21.56 | 25.06 | 25.44 | 9,558 | - |
+| 500M TF32 `lw`, fixed | 18.19 | 19.85 | 20.22 | 9,598 | 1.005 vs main, 0.972 vs control |
+| 500M TF32 `ws` (default residency), fixed | 18.19 | 19.85 | 20.22 | 9,580 | 0.999 vs `lw` |
+| 500M TF32 `wsall`, fixed | 16.44 | 17.82 | 18.20 | 8,109 | 0.823 vs control |
+| 1B bf16 `blocks_nowgrad_noclip` (control) | 21.32 | 22.21 | 22.59 | 6,741 | - |
+| 1B bf16 `lw`, main | OOM | 29.14 | 29.52 | - | - |
+| 1B bf16 `lw`, fixed | 19.57 | 20.39 | 20.77 | 6,691 | 0.993 vs control |
+| 1B bf16 `ws` (default residency), fixed (main: OOM in the audit) | 19.57 | 20.39 | 20.77 | 6,699 | - |
+| 1B bf16 `wsall`, main | 25.13 | 28.11 | 28.49 | 5,539 (1 round) | - |
+| 1B bf16 `wsall`, fixed | 14.35 | 15.18 | 15.57 | 5,669 | 0.846 vs `ws` |
+
+At 1B the per-block signature is gone. On main the peak held `nsl_silu_f32` 2.00 GB and
+`nsl_mul_f32` 1.88-2.00 GB (all 16 blocks) and `rope` 2.76 GB; after the fix none of them is
+among the largest contexts at the peak. `lw`'s activations are 6.95 GiB against the control's 5.30, and its `m_partial` is 0.60 GiB against 4.00: 1.75 GiB under the
+control. The forward frees 624 interiors over 16 segments per micro-batch (compile-time witness).
+`ws` at default residency pins all 144 parameters on this card (D2, not changed here), so it
+measures the same as `lw`.
+
+At 500M the fix removes 3.37 GiB (activations at the peak 15.36 -> 11.68 GiB), but `lw` stays
+7.5 GiB above its control, and the design's estimate (about 0.25 GiB of buffered boundaries per
+micro-batch) was wrong. The window's activations grow by 1,220 MB per buffered micro-batch
+(`[gpu-mem]` surfaces, steps 1-5). At the peak, `dropout_f32` holds 7.50 GB in 768 blocks: 8
+micro-batches x 24 blocks x 2 dropouts x (output + f32 mask), 10 MiB each. CCR never recomputes
+a random draw, so both are force-saved, and the window holds them for all 8 micro-batches where
+the control holds one (960 MB). The residual-stream boundaries are another 1.81 GB
+(`nsl_add_f32`). The 500M recipe has dropout 0.1; 1B has none.
+Not done here, and unmeasured: the backward appears to read each dropout output only through
+the residual add's `reduce_to_shape` (500M reports 0 shape-only reads of recompute victims, 1B
+reports 16), so a stub for force-saved outputs could save up to 480 MiB per buffered
+micro-batch; a 1-byte mask a further 360 MiB.
+
+Bit-exactness at 50M (`--deterministic`, `PERF-D1/exact_det.sh`): `lw` against a repeat of
+itself, `blocks_nowgrad_noclip`, `lw` with `NSL_CCR_SEGMENT_FREE=0`, `ws`, `wsall`; `wsall`
+against `wsall` with the kill switch and against `--stream-arena`; `nowgrad_noclip` against
+`lwsel`; `lwsel` against `lwsel` with the kill switch. Each has init equal, 0 of 49,816,392
+parameters differing and identical losses, and every run agrees with PyTorch (median 1.69e-3,
+worst 2.40e-3).
 
 ## Reproduce
 
