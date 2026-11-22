@@ -321,6 +321,12 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
         "the cuBLASLt BF16 matmul counts at exit (NSL_BF16_LT_COUNTER=1), or a tuning note",
     ),
     m(
+        "[tf32-lt]",
+        &["crates/nsl-runtime/src/args.rs"],
+        "the cuBLASLt TF32 matmul counts at exit (NSL_BF16_LT_COUNTER=1): issued, timed-tuned \
+         and fallback GEMMs",
+    ),
+    m(
         "[weight-stream]",
         &[
             "crates/nsl-codegen/src/stmt.rs",
@@ -931,7 +937,7 @@ pub const EVENT_SCHEMAS: &[EventSchema] = &[
         marker: "[wgrad-accum]",
         fields: &["fused_gemm", "decomposed_fallback"],
     },
-    // The two below are emitted at exit by a CUDA build only
+    // The three below are emitted at exit by a CUDA build only
     // (`nsl-runtime/src/args.rs`), which is how they went unregistered: the
     // gate that checks every emitted kind against this table runs its
     // fixture on the CPU-only build in CI, and failed on the first CUDA
@@ -944,6 +950,11 @@ pub const EVENT_SCHEMAS: &[EventSchema] = &[
     EventSchema {
         kind: "bf16_lt_counters",
         marker: "[bf16-lt]",
+        fields: &["issued", "tuned", "fallbacks"],
+    },
+    EventSchema {
+        kind: "tf32_lt_counters",
+        marker: "[tf32-lt]",
         fields: &["issued", "tuned", "fallbacks"],
     },
     EventSchema {
