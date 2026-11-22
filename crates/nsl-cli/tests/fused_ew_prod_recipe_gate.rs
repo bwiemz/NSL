@@ -12,7 +12,9 @@
 //! (2026-11-15) the stdlib's RoPE is one fused op with its own adjoint, so
 //! the fold has nothing left to fold: the gate now requires the source-AD
 //! tape (`NSL_DEBUG_WENGERT`'s primal dump) to hold the fused `rope` op, one
-//! per RoPE application (48: 24 blocks x q and k), and no fold to fire. Drift below the floor means a matcher regression or a
+//! per RoPE application (48: 24 blocks x q and k), and no fold to fire. Since
+//! 2026-11-22 the gate builds the recipe's documented run line (the 1B
+//! recipe's). Drift below the floor means a matcher regression or a
 //! recipe/stdlib change that silently starved the fuser — either way the
 //! perf the campaign measured is gone and this gate is the tell.
 
@@ -42,7 +44,14 @@ fn prod_500m_recipe_fuses_above_the_observed_floor() {
     std::fs::create_dir_all(&tmp).unwrap();
 
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_nsl"))
-        .args(["build", "--source-ad", "--checkpoint-blocks", "--fuse-rmsnorm-backward"])
+        .args([
+            "build",
+            "--source-ad",
+            "--checkpoint-blocks",
+            "--checkpoint-selective",
+            "--fuse-rmsnorm-backward",
+            "--fuse-wgrad-accum",
+        ])
         // models/coder500m/ is pinned to a release toolchain channel
         // (nsl-toolchain.toml); this gate measures the dev toolchain.
         .arg("--ignore-toolchain-pin")

@@ -69,14 +69,64 @@ and experiments, not production runs.
 ```bash
 python models/benchmarks/make_prod_split.py          # once, from the repo root
 cd models/coder500m
-nsl run --source-ad --checkpoint-blocks pretrain_prod.nsl
+nsl run --source-ad --checkpoint-blocks --checkpoint-selective \
+    --fuse-rmsnorm-backward --fuse-wgrad-accum pretrain_prod.nsl
 ```
 
-`--checkpoint-blocks` is **required**, and that is measured: without it the
-run dies in the first backward with 168 MB free of 31.39 GB. The persistent
-state is only 8.25 GB (weights 2.07 + optim m/v 2.06 each + m_partial 2.06) —
-it is the stored activations of 24 layers at batch 2 × seq 1024 that exhaust a
-32 GB card. Recomputing them puts the activation peak at 8.34 GB.
+**The run line is the 1B recipe's** (since 2026-11-22). Until then it was
+`--source-ad --checkpoint-blocks`, which runs at half the speed. Measured on
+this directory's `0.11` toolchain (`nsl build` here handed over to
+`~/.nsl/toolchains/0.11`, release/0.11 at 6445d66a) with the recipe itself —
+batch 2 × 1024, accumulation 8, dropout 0.1; only its corpus paths and its
+`on_step` callback changed, to stop at micro-step 480 (and, in the runs the
+losses below come from, to print every step) — 3 interleaved rounds, 40
+updates timed after the first 20:
+
+| line | tok/s | allocator peak | reserved | driver peak |
+| --- | --- | --- | --- | --- |
+| `--source-ad --checkpoint-blocks` (until 2026-11-22) | 11,340 | 11.28 GiB | 12.11 GiB | 12.50 GiB |
+| this line | 22,526 (1.986x paired, 1.975-1.989) | 12.88 GiB | 13.84 GiB | 14.22 GiB |
+| this line without `--checkpoint-blocks --checkpoint-selective` | 24,287 (1.077x this line) | 19.99 GiB | 20.78 GiB | 21.16 GiB |
+
+The corpus was a same-size slice of another corpus with the same tokenizer
+(`data/tokens/train_new.bin` was not on the measuring machine); the step does
+the same work whatever the ids are. The persistent state is 8.26 GiB of every
+row (weights 2.07 + optim m, v and m_partial 2.06 each).
+
+- **`--checkpoint-blocks` is no longer required on a 32 GB card.** It was in
+  2026-08, when activations were stored f32: the run died in the first
+  backward with 168 MB free of 31.39 GB. With bf16 activation storage
+  (`precision = "bf16"`, 0.11) the run fits without any checkpointing (last
+  row). It stays in the line because the 7.1 GiB that dropping it costs buy
+  only 1.077x.
+- **Why selective checkpointing fits.** Full block recompute replays every
+  block interior in the backward, GEMMs included; `--checkpoint-selective`
+  keeps the matmul-class outputs and replays only norms, RoPE and elementwise
+  ops. Stored bf16, what it keeps puts the activation surface at the peak at
+  4.62 GiB, against 3.50 GiB for full recompute with the same fusions and
+  8.34 GB for full recompute with f32 storage in 2026-08.
+- **Losses.** `--fuse-wgrad-accum` and `--fuse-rmsnorm-backward` change the
+  summation order of the weight and RMSNorm-gain gradients, so the losses are
+  not bit-equal to the old line's. Over the first 480 micro-steps (warmup and
+  80 more) the two lines' per-step losses differ by at most 0.71% (mean 0.03%),
+  while two runs of the old line differ by up to 0.68% and two of the new one
+  by up to 0.38%: neither line is bit-reproducible run to run (timed GEMM
+  selection, the atomic embedding backward). Both descend from 11.05 (mean of
+  the first 8 micro-steps) to 7.84 (mean of the last 8), with no non-finite
+  loss.
+- **Dropout is not re-drawn.** Replaying a dropout in the backward would draw a
+  different mask. Neither recompute policy replays a draw: on 0.11 CCR
+  force-saves every dropout mask and output (`crates/nsl-codegen/src/ccr.rs`;
+  on `main` the unit test `dropout_is_not_recomputed_under_the_selective_policy`
+  holds the selective policy to it). On 0.11, with the run-to-run
+  nondeterminism pinned (`NSL_EMBEDDING_BWD_CPU=1`, `--no-bf16-lt-tune`), the
+  first 48 micro-step losses of this line are bit-identical to the same flags
+  with full block recompute and with no checkpointing at all, a backward with
+  nothing to recompute. The step makes 48 dropout draws (24 blocks × attention
+  and MLP outputs, p = 0.1), so the comparison is not vacuous.
+- **Resume.** The two fusions are arithmetic keys of the execution
+  fingerprint: a checkpoint written under the old line is refused under this
+  one. Finish such a run with the line it started on.
 
 The learning rate is **measured, not inherited**: `lr = 1.5e-4` with 400
 micro-steps of warmup, against the `3e-4 / 200` this repo carries at every

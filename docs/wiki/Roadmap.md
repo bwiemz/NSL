@@ -211,7 +211,10 @@ Validated on GPU, not just compiled — see
 [`PROD500M_VALIDATION_2026_08_19.md`](../../models/benchmarks/PROD500M_VALIDATION_2026_08_19.md).
 Two results worth carrying forward. `--checkpoint-blocks` is **required** —
 the bare configuration OOMs with 168 MB free of 31.39 GB; recomputation puts
-the activation peak at 8.34 GB alongside 8.25 GB of persistent state. And
+the activation peak at 8.34 GB alongside 8.25 GB of persistent state. (That
+was f32 activation storage. With bf16 storage, on the 0.11 toolchain, the run
+fits without checkpointing, and since 2026-11-22 the recipe runs the 1B
+recipe's flag line at twice the old line's speed: `models/coder500m/README.md`.) And
 **the `lr = 3e-4` this repo carries unchanged across d_model 512 / 1280 / 2048
 is too high at 500M**: halving it and doubling the warmup turned an erratic
 epoch (excursions to 10.94 and 12.17) into a monotone one and took 0.57 nats

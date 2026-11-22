@@ -48,32 +48,78 @@
 # micro-batches; a recipe that leaves it to the default reads differently on
 # the two channels.
 # checkpoint_every counts OPTIMIZER steps as well. Dropout is real: DROPOUT=0.1 trains an actual
-# RNG mask and its backward consumes that same mask (PR #507).
+# RNG mask and its backward consumes that same mask (PR #507); the recompute
+# below never draws it again (see DROPOUT UNDER RECOMPUTE).
 #
 # RESUME (item 8 / PR #516): `epochs` is the run TOTAL, so an interrupted run
 # is resumed by re-running this file UNCHANGED with checkpoint_load= added —
 # the training epoch, the DataLoader's delivery slot and every RNG stream are
 # restored, and a corpus or `--seed` mismatch refuses rather than silently
-# training a different stream.
+# training a different stream. Resume with the same flag line:
+# --fuse-rmsnorm-backward and --fuse-wgrad-accum are arithmetic keys of the
+# execution fingerprint, so a checkpoint written under this file's previous
+# line (--source-ad --checkpoint-blocks, until 2026-11-22) is refused here.
 #
 # RUN — the split script resolves the repo from its own path, so it works from
 # any cwd; the nsl invocation must be from THIS directory (the corpus paths and
 # `from model import ...` are relative to it):
 #   python models/benchmarks/make_prod_split.py     # once
 #   cd models/coder500m
-#   nsl run --source-ad --checkpoint-blocks pretrain_prod.nsl
+#   nsl run --source-ad --checkpoint-blocks --checkpoint-selective \
+#           --fuse-rmsnorm-backward --fuse-wgrad-accum pretrain_prod.nsl
 #
-# `--checkpoint-blocks` IS REQUIRED, and that is a measurement, not caution.
-# Without it this configuration OOMs on a 32 GB card: the run dies in the
-# first backward with "VRAM free: 168.2 MB / 31.39 GB" at allocation #3819
-# (matmul_f32). The persistent state is only 8.25 GB — weights 2.07 + optim_m
-# 2.06 + optim_v 2.06 + m_partial 2.06 — so it is the stored activations of 24
-# layers at batch 2 x seq 1024 that exhaust the card. Recomputing them brings
-# the activation surface to a 8.34 GB peak and the whole run to ~10.9 GB
-# driver-reported at step 5, measured with NSL_MEMSTATS=1 on an RTX PRO 4500
-# Blackwell (32 GB) with ~1.4 GB of ambient desktop VRAM in use. Those memory
-# numbers predate bf16 activation storage (f32 storage, TF32 GEMMs); with it
-# the activation surface is smaller, and --checkpoint-blocks stays in the line.
+# THE LINE IS THE 1B RECIPE'S, since 2026-11-22. It was --source-ad
+# --checkpoint-blocks, which runs at half the speed. Measured on this
+# directory's 0.11 toolchain at this file's step (batch 2 x 1024, accumulation
+# 8, dropout 0.1) over a same-size slice of another corpus with the same
+# tokenizer, 3 interleaved rounds, 40 updates timed after the first 20:
+#   line                              tok/s     alloc peak   driver peak
+#   --source-ad --checkpoint-blocks   11,340    11.28 GiB    12.50 GiB
+#   this line                         22,526    12.88 GiB    14.22 GiB
+# 1.986x paired (1.975-1.989), for 1.60 GiB more allocator peak. 8.26 GiB of
+# each is persistent state (weights 2.07, optim_m, optim_v, m_partial 2.06
+# each). The fusions change the summation order of the weight and RMSNorm-gain
+# gradients, so the losses are not bit-equal to the old line's: over the first
+# 480 micro-steps (the 400 of warmup and 80 more) they differ by at most 0.71%
+# relative (mean 0.03%), while two runs of the old line differ by up to 0.68%
+# and two of this one by up to 0.38% (neither line is bit-reproducible run to
+# run: timed GEMM selection, the atomic embedding backward). Both descend from
+# 11.05 to 7.84 (means of the first and last 8 micro-steps), with no
+# non-finite loss.
+#
+#   --checkpoint-blocks     activation recomputation per block. NO LONGER
+#                           REQUIRED on a 32 GB card: it was in 2026-08, when
+#                           activations were stored f32 (the run died in the
+#                           first backward, "VRAM free: 168.2 MB / 31.39 GB").
+#                           With bf16 activation storage this line without
+#                           either checkpoint flag fits: 19.99 GiB alloc /
+#                           21.16 GiB driver, 1.077x this line's tok/s. It stays
+#                           in the line for those 7.1 GiB.
+#   --checkpoint-selective  modifier of --checkpoint-blocks (clap requires the
+#                           pair). Keeps the matmul-class outputs and replays
+#                           only norms, RoPE and elementwise ops instead of
+#                           every block interior, GEMMs included: activations
+#                           at the peak 4.62 GiB against full recompute's 3.50
+#                           with the same fusions (8.34 GB with f32 storage,
+#                           2026-08).
+#   --fuse-wgrad-accum      each weight gradient's transpose, batched GEMM,
+#                           reduce and FASE accumulate become one cuBLAS call
+#                           writing into m_partial.
+#   --fuse-rmsnorm-backward fused kernels for the RMSNorm input and gain
+#                           gradients instead of their decompositions.
+#                           Neither fusion is bit-equal to what it replaces.
+#
+# DROPOUT UNDER RECOMPUTE. A replayed dropout would draw a different mask and
+# differentiate values the forward never produced. Neither recompute policy
+# replays a draw: on 0.11 CCR force-saves every dropout mask and output
+# (nsl-codegen ccr.rs; on main the unit test
+# dropout_is_not_recomputed_under_the_selective_policy holds the selective
+# policy to it). Checked on 0.11 with the run-to-run nondeterminism pinned
+# (NSL_EMBEDDING_BWD_CPU=1, --no-bf16-lt-tune): 48 micro-steps of this line
+# are bit-identical to the same flags with full block recompute and with no
+# checkpointing at all, a backward that has nothing to recompute. The tape
+# holds 48 dropout draws (24 blocks x attention and MLP outputs, p = 0.1), so
+# the check is not vacuous.
 #
 # PRECISION (2026-11): `precision = "bf16"` in the train header stores
 # activations and their gradients in bf16 (f32 math inside every kernel, one
@@ -81,19 +127,16 @@
 # stream stay f32) and runs every GEMM on bf16 operands. It requires
 # --source-ad, is part of the execution fingerprint (`act=bf16`), and is a
 # compile error with NSL_MATMUL_BF16=0 or a --matmul-mode other than bf16.
-# Measured at this geometry on the 1B recipe's flag line (tools/perfcheck,
-# 2026-11-15; that line adds --checkpoint-selective --fuse-rmsnorm-backward
-# --fuse-wgrad-accum to the RUN line above, so these numbers describe that
-# line, not this one): 1.167x tok/s over the bf16 GEMM mode alone (20,931 vs
-# 17,937) and a 0.94 GiB lower allocator peak; 22,331 tok/s on the toolchain
-# that shipped it. Its held-out loss at this geometry over 5 seeds x 4,000 updates
+# Measured at this geometry on the RUN line above (tools/perfcheck,
+# 2026-11-15): 1.167x tok/s over the bf16 GEMM mode alone (20,931 vs 17,937)
+# and a 0.94 GiB lower allocator peak; 22,331 tok/s on the toolchain that
+# shipped it. Its held-out loss at this geometry over 5 seeds x 4,000 updates
 # is no worse than TF32's or the bf16 GEMM mode's:
 # models/benchmarks/BF16_STORAGE_CONVERGENCE_2026_11.md.
 #
-# Source AD is the production path (fused LCE/SDPA only exist there). This is
-# the same posture as the 1B recipe, which documents its own required flag
-# set; the 50M recipe is small enough to run bare, which is why its header
-# does not carry one.
+# Source AD is the production path (fused LCE/SDPA only exist there). The
+# flag line is the 1B recipe's; the 50M recipe is small enough to run bare,
+# which is why its header does not carry one.
 
 from model import NSLCoder
 from nsl.nn.losses import cross_entropy
