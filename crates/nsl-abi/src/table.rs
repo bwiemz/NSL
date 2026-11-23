@@ -610,6 +610,9 @@ macro_rules! for_each_runtime_fn {
             // Both adjoints and the recomputed forward value: an NslList [dgate, dup, p].
             [abi_tensor] nsl_tensor_swiglu_backward_recompute(i64, i64, i64) -> i64 = swiglu::nsl_tensor_swiglu_backward_recompute;
             [abi_tensor] nsl_tensor_swiglu_backward_recompute_dt(i64, i64, i64, i64) -> i64 = swiglu::nsl_tensor_swiglu_backward_recompute_dt;
+            // The pre-norm residual add and the RMSNorm of its sum in one launch: an NslList
+            // [h, n]; the two i64 are the unfused calls' routes (0 plain, 1 f32, 3 bf16).
+            [abi_tensor] nsl_tensor_add_rmsnorm(i64, i64, i64, f64, i64, i64) -> i64 = residual_norm::nsl_tensor_add_rmsnorm;
             // p4 slice 3: fused Sigmoid backward — grad * y*(1-y), y = σ output.
             [abi_tensor] nsl_tensor_sigmoid_backward(i64, i64) -> i64 = tensor::activation::nsl_tensor_sigmoid_backward;
             // p4 slice 3: fused Tanh backward — grad * (1 - y*y), y = tanh output.
@@ -1385,6 +1388,6 @@ mod tests {
     fn table_is_the_recorded_size() {
         // The count is pinned so a row dropped by a bad merge is noticed; move
         // it with a row that is deliberately added or removed.
-        assert_eq!(RUNTIME_ABI.len(), 681);
+        assert_eq!(RUNTIME_ABI.len(), 682);
     }
 }

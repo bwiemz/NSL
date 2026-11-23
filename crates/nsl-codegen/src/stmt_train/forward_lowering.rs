@@ -216,6 +216,7 @@ impl Compiler<'_> {
             ));
         }
         self.emit_inplace_suppress(builder, true)?;
+        let add_norm_before = self.add_norm_fused.0;
         let full_lowered = if let Some(wsplan) = ws_fwd_plan {
             // Segment-streamed forward: lower the primal per CCR
             // slice with upload/evict FFI calls between slices. All
@@ -347,9 +348,27 @@ impl Compiler<'_> {
             // backward's activation wall and never the forward's.
             let mut fold = SlicedForward::new(primal_vars, effective_primal);
             let mut tally = FreeTally::default();
+            // Round-2 item 6: a block ends with its residual add and the next block
+            // starts with the RMSNorm of that sum, one slice later, with the segment's
+            // free list between them (which frees the block's interiors, the add's
+            // operand among them). So the pair is planned over the whole forward and
+            // launched at the Add, before the free list. (Not under weight streaming,
+            // above: the next block's gain may not be resident at the Add.)
+            self.add_norm_groups = Some(crate::wengert_lower::add_rmsnorm_groups(
+                effective_primal,
+                0..effective_primal.ops.len(),
+            ));
             for (k, &(_, s_op, e_op)) in seg_free.slices.iter().enumerate() {
                 self.emit_forward_slice(builder, state, effective_primal, s_op..e_op, &mut fold)?;
                 self.emit_slice_end_frees(builder, state, seg_free, k, &mut fold, &mut tally)?;
+            }
+            self.add_norm_groups = None;
+            if !self.add_norm_stash.is_empty() {
+                return Err(CodegenError::new(format!(
+                    "internal: the forward's residual add + RMSNorm launches produced norm output(s) {:?} \
+                     whose op was never lowered; please report this (NSL_FUSE_ADD_RMSNORM=0 avoids it)",
+                    self.add_norm_stash.keys().collect::<Vec<_>>()
+                )));
             }
             log_segment_free_witness(tally.freed, tally.segments);
             self.finish_sliced_forward(fold)
@@ -364,6 +383,7 @@ impl Compiler<'_> {
             )?
         };
         self.emit_inplace_suppress(builder, false)?;
+        self.add_norm_fused.1 += self.add_norm_fused.0 - add_norm_before;
 
         Ok((ccr_segment_free, full_lowered))
     }

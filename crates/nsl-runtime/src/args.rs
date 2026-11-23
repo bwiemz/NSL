@@ -523,9 +523,14 @@ extern "C" fn nsl_bf16_lt_atexit() {
     }
     // One formatted write — multi-rank stderr TEARS per-fragment writes
     // (see the fase-fused reporter above).
+    // Round-2 item 6's runtime witness: a residual add + RMSNorm whose fast path
+    // declined runs the unfused pair silently (same values), so only this count says
+    // the fused launch ran.
+    let (norm_fused, norm_pairs) = crate::residual_norm::counts();
     let report = format!(
         "[bf16-lt] issued={issued} tuned={tuned} fallbacks={fallbacks}\n\
-         [tf32-lt] issued={t_issued} tuned={t_tuned} fallbacks={t_fallbacks}\n"
+         [tf32-lt] issued={t_issued} tuned={t_tuned} fallbacks={t_fallbacks}\n\
+         [add-rmsnorm] fused={norm_fused} pairs={norm_pairs}\n"
     );
     use std::io::Write;
     let _ = std::io::stderr().lock().write_all(report.as_bytes());

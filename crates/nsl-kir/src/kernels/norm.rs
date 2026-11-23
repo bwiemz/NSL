@@ -31,6 +31,15 @@
 //! LayerNorm's `· gamma + beta` into `fma` on hardware; these kernels round
 //! twice, as the PTX (and the CPU reference) do. Thread 0 reads `%ntid.x` once, before
 //! its fold, so ptxas unrolls the fold as it does the hand kernels'.
+//!
+//! **Residual add + RMSNorm** (`build_add_rmsnorm`, round-2 item 6): the RMSNorm kernel
+//! with the pre-norm block's residual add as its first loop's prologue,
+//! `nsl_add_rmsnorm_<x><o>_<h><n>(x, o, h, out, gamma, rows, cols, eps)`. The first column
+//! loop computes `h = x + o` (`add.rn`, each operand widened exactly), stores it, and
+//! squares the value as STORED (a bf16 `h` is rounded first, as the unfused norm reads it
+//! back); the reduction, `inv` and the normalize loop (which re-reads `h` from global, as
+//! the norm reads its input) are the RMSNorm kernel's own code. So `h` is the add kernel's
+//! output and `out` the norm kernel's, bit for bit, in one launch.
 
 use super::elementwise::{f32_ptr, verified_ptx};
 use super::storage::{load_as_f32, store_from_f32, variant_name, Storage};
@@ -247,13 +256,84 @@ pub fn build(op: NormOp) -> KernelIR {
 /// is rounded once, on its store. Bf16 activation storage writes the norm
 /// output (a GEMM operand) as bf16 from the f32 residual stream.
 pub fn build_st(op: NormOp, input: Storage, output: Storage) -> KernelIR {
+    build_impl(op, RowSource::Load(input), output)
+}
+
+/// Where a norm kernel's rows come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowSource {
+    /// The input tensor `inp`, stored as given.
+    Load(Storage),
+    /// `h = x + o`, computed by the first column loop and stored to `h`
+    /// (RMSNorm only); the norm reads `h`.
+    AddResidual { x: Storage, o: Storage, h: Storage },
+}
+
+/// The parameter names of [`build_add_rmsnorm`], in launch order.
+pub const ADD_RMSNORM_PARAMS: [&str; 8] = ["x", "o", "h", "out", "gamma", "rows", "cols", "eps"];
+
+/// The entry name of [`build_add_rmsnorm`]'s instantiation: `nsl_add_rmsnorm_f32` when
+/// every operand is f32, else `nsl_add_rmsnorm_<x><o>_<h><out>` (`f` / `b`).
+pub fn add_rmsnorm_name(x: Storage, o: Storage, h: Storage, out: Storage) -> String {
+    if [x, o, h, out].iter().all(|s| *s == Storage::F32) {
+        return "nsl_add_rmsnorm_f32".to_string();
+    }
+    format!(
+        "nsl_add_rmsnorm_{}{}_{}{}",
+        x.letter(),
+        o.letter(),
+        h.letter(),
+        out.letter()
+    )
+}
+
+/// The residual add and the RMSNorm of its sum in one launch (module header):
+/// `h = x + o` stored as `h`, `out = rmsnorm(h, gamma, eps)` stored as `out`, one
+/// 256-thread block per row as [`build_st`]'s RMSNorm.
+pub fn build_add_rmsnorm(x: Storage, o: Storage, h: Storage, out: Storage) -> KernelIR {
+    build_impl(NormOp::RmsNorm, RowSource::AddResidual { x, o, h }, out)
+}
+
+/// [`build_add_rmsnorm`] lowered to a NUL-terminated PTX module.
+pub fn ptx_add_rmsnorm(x: Storage, o: Storage, h: Storage, out: Storage) -> Vec<u8> {
+    verified_ptx(build_add_rmsnorm(x, o, h, out))
+}
+
+fn build_impl(op: NormOp, source: RowSource, output: Storage) -> KernelIR {
     use AddressSpace::{Global, Shared};
     use KirType::{F32, U32, U64};
-    let names = op.params();
-    let mut b = KirBuilder::new(&variant_name(op.kernel_name(), &[input], output));
-    let inp = b.add_param(names[0], input.ptr(), Global);
-    let out = b.add_param(names[1], output.ptr(), Global);
-    let gamma = b.add_param(names[2], f32_ptr(), Global);
+    // The fused residual add exists for RMSNorm only (pre-norm transformer blocks).
+    assert!(
+        matches!(source, RowSource::Load(_)) || op == NormOp::RmsNorm,
+        "the residual-add prologue is built for RMSNorm only"
+    );
+    let names: &[&str] = match source {
+        RowSource::Load(_) => op.params(),
+        RowSource::AddResidual { .. } => &ADD_RMSNORM_PARAMS,
+    };
+    let kernel_name = match source {
+        RowSource::Load(input) => variant_name(op.kernel_name(), &[input], output),
+        RowSource::AddResidual { x, o, h } => add_rmsnorm_name(x, o, h, output),
+    };
+    // The storage the normalize loop reads its rows in: the input, or the stored sum.
+    let input = match source {
+        RowSource::Load(input) => input,
+        RowSource::AddResidual { h, .. } => h,
+    };
+    let mut b = KirBuilder::new(&kernel_name);
+    // Load: `inp`. AddResidual: `x`, `o` and the sum `h` (which the rows are read from).
+    let (inp, residual) = match source {
+        RowSource::Load(input) => (b.add_param(names[0], input.ptr(), Global), None),
+        RowSource::AddResidual { x, o, h } => {
+            let xp = b.add_param(names[0], x.ptr(), Global);
+            let op_ = b.add_param(names[1], o.ptr(), Global);
+            let hp = b.add_param(names[2], h.ptr(), Global);
+            (hp, Some((xp, op_, x, o)))
+        }
+    };
+    let first_out = if residual.is_some() { 3 } else { 1 };
+    let out = b.add_param(names[first_out], output.ptr(), Global);
+    let gamma = b.add_param(names[first_out + 1], f32_ptr(), Global);
     let beta = (op == NormOp::LayerNorm).then(|| b.add_param(names[3], f32_ptr(), Global));
     let at = names.len() - 3;
     let rows = b.add_param(names[at], U64, Global);
@@ -288,6 +368,14 @@ pub fn build_st(op: NormOp, input: Storage, output: Storage) -> KernelIR {
     b.emit(KirOp::PtrOffset(in_row, inp, base));
     let out_row = var(&mut b, output.ptr());
     b.emit(KirOp::PtrOffset(out_row, out, base));
+    // The residual add's operand rows (`x`, `o`); `in_row` is then the sum's row.
+    let residual_rows = residual.map(|(xp, op_, xs, os)| {
+        let x_row = var(&mut b, xs.ptr());
+        b.emit(KirOp::PtrOffset(x_row, xp, base));
+        let o_row = var(&mut b, os.ptr());
+        b.emit(KirOp::PtrOffset(o_row, op_, base));
+        (x_row, o_row, xs, os)
+    });
     // The row loads and the output store through the operand storages: the
     // f32 forms are `load_at` / `store_at` themselves (the same op sequence),
     // so the f32 kernel's bytes do not move.
@@ -340,7 +428,31 @@ pub fn build_st(op: NormOp, input: Storage, output: Storage) -> KernelIR {
         }
         NormOp::RmsNorm => {
             let q = column_loop(&mut b, tid, cols, Some(zero), |b, k, acc| {
-                let x = load_x(b, k);
+                let x = match residual_rows {
+                    None => load_x(b, k),
+                    // h = x + o, stored; the square reads the value as stored.
+                    Some((x_row, o_row, xs, os)) => {
+                        let xv = load_as_f32(b, x_row, k, xs);
+                        let ov = load_as_f32(b, o_row, k, os);
+                        let h = op2(b, F32, KirOp::AddRn, xv, ov);
+                        match input {
+                            Storage::F32 => {
+                                store_at(b, Global, in_row, k, h);
+                                h
+                            }
+                            Storage::Bf16 => {
+                                let hb = var(b, KirType::Bf16);
+                                b.emit(KirOp::Cast(hb, h, KirType::Bf16));
+                                let addr = var(b, Storage::Bf16.ptr());
+                                b.emit(KirOp::PtrOffset(addr, in_row, k));
+                                b.emit(KirOp::Store(addr, hb, Global));
+                                let hw = var(b, F32);
+                                b.emit(KirOp::Cast(hw, hb, F32));
+                                hw
+                            }
+                        }
+                    }
+                };
                 let sq = op2(b, F32, KirOp::MulRn, x, x);
                 Some(op2(b, F32, KirOp::AddRn, acc.expect("acc"), sq))
             })
@@ -414,6 +526,81 @@ mod tests {
             assert_eq!(p.matches("bar.sync 0;").count(), 2 * stats, "{p}");
             assert!(!p.contains("fma") && !p.contains("add.f32") && !p.contains("mul.f32 "), "{p}");
             assert!(!p.contains("sub.f32"), "{p}");
+        }
+    }
+
+    /// Every storage combination the bf16 plan can produce (and all-f32): the fused
+    /// kernel verifies, keeps its entry and parameters, and is the RMSNorm kernel of
+    /// its sum plus exactly the residual add (one `add.rn`) and the sum's store; no
+    /// contractible spelling, the same statistic.
+    #[test]
+    fn the_fused_residual_add_is_the_norm_kernel_plus_one_add_and_one_store() {
+        use Storage::{Bf16, F32};
+        for x in Storage::ALL {
+            for o in Storage::ALL {
+                for h in Storage::ALL {
+                    for n in Storage::ALL {
+                        let p = String::from_utf8(ptx_add_rmsnorm(x, o, h, n)).expect("ASCII");
+                        let name = add_rmsnorm_name(x, o, h, n);
+                        assert!(p.contains(&format!(".visible .entry {name}(")), "{p}");
+                        for param in ADD_RMSNORM_PARAMS {
+                            assert!(p.contains(&format!("[param_{param}]")), "{name}: {param}");
+                        }
+                        let norm = String::from_utf8(ptx_st(NormOp::RmsNorm, h, n)).expect("ASCII");
+                        let count = |t: &str, pat: &str| t.matches(pat).count();
+                        assert_eq!(
+                            count(&p, "add.rn.f32"),
+                            count(&norm, "add.rn.f32") + 1,
+                            "{name}"
+                        );
+                        assert_eq!(
+                            count(&p, "mul.rn.f32"),
+                            count(&norm, "mul.rn.f32"),
+                            "{name}"
+                        );
+                        assert_eq!(count(&p, "rsqrt.approx.f32"), 1, "{name}");
+                        assert_eq!(count(&p, "div.approx.f32"), 1, "{name}");
+                        assert_eq!(count(&p, "bar.sync 0;"), 2, "{name}");
+                        assert_eq!(
+                            count(&p, "st.global."),
+                            count(&norm, "st.global.") + 1,
+                            "{name}"
+                        );
+                        assert!(
+                            !p.contains("fma") && !p.contains("add.f32") && !p.contains("mul.f32 "),
+                            "{p}"
+                        );
+                        // A bf16 operand is read with a 16-bit load; an f32 sum is not rounded.
+                        let b16_loads = [x, o, h].iter().filter(|s| **s == Bf16).count();
+                        assert_eq!(count(&p, "ld.global.b16") >= b16_loads, true, "{name}");
+                        if h == F32 && n == F32 {
+                            assert!(
+                                !p.contains("cvt.rn.bf16.f32"),
+                                "{name}: nothing is narrowed\n{p}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(add_rmsnorm_name(F32, F32, F32, F32), "nsl_add_rmsnorm_f32");
+        assert_eq!(
+            add_rmsnorm_name(F32, Bf16, F32, Bf16),
+            "nsl_add_rmsnorm_fb_fb"
+        );
+    }
+
+    /// The refactor that added the prologue leaves the plain norms' instruction stream
+    /// alone (the f32 bytes are also pinned by `tests/f32_ptx_golden.rs`).
+    #[test]
+    fn the_plain_norm_kernels_have_no_residual_parameters() {
+        for op in NormOp::ALL {
+            for i in Storage::ALL {
+                for o in Storage::ALL {
+                    let p = String::from_utf8(ptx_st(op, i, o)).expect("ASCII");
+                    assert!(!p.contains("[param_x]") && !p.contains("[param_h]"), "{p}");
+                }
+            }
         }
     }
 

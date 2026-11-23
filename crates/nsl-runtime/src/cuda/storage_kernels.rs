@@ -32,6 +32,8 @@ enum Kernel {
     Norm(NormOp, Storage, Storage),
     Rope(nsl_kir::kernels::rope::RopeDir, Storage, Storage),
     Swiglu(nsl_kir::kernels::swiglu::SwigluKernel),
+    /// The residual add + RMSNorm: storages of `x`, `o`, the sum `h`, the norm output.
+    AddRmsNorm([Storage; 4]),
 }
 
 /// The NUL-terminated PTX module and entry name of `k`, lowered once and kept
@@ -51,6 +53,9 @@ fn module(k: Kernel) -> (&'static str, &'static str) {
             Kernel::Norm(op, i, out) => nsl_kir::kernels::norm::build_st(op, i, out),
             Kernel::Rope(dir, i, out) => nsl_kir::kernels::rope::build(dir, i, out),
             Kernel::Swiglu(k) => k.build(),
+            Kernel::AddRmsNorm([x, o, h, n]) => {
+                nsl_kir::kernels::norm::build_add_rmsnorm(x, o, h, n)
+            }
         };
         let name: &'static str = Box::leak(format!("{}\0", ir.name).into_boxed_str());
         if let Err(errors) = nsl_kir::kir_verify::verify(&ir) {
@@ -176,6 +181,44 @@ pub(crate) fn rmsnorm(x: i64, gamma: i64, eps: f32, out: Storage) -> i64 {
     // The kernel's eps is an `.f32` parameter: its bits in the slot's low half.
     launch_grid(k, rows as i64, 256 * 4, &mut [data(x), data(c), data(gamma), rows, cols, u64::from(eps.to_bits())]);
     c
+}
+
+/// The residual add and the RMSNorm of its sum in one launch
+/// (`nsl_kir::kernels::norm::build_add_rmsnorm`): `h = x + o` stored as `h_st`, `n =
+/// rmsnorm(h, gamma, eps)` stored as `n_st`, one 256-thread block per row as [`rmsnorm`].
+/// `x` and `o` contiguous, one shape, on one device; `gamma` a contiguous f32 vector of
+/// the last dimension's length. Returns `(h, n)`.
+pub(crate) fn add_rmsnorm(
+    x: i64,
+    o: i64,
+    gamma: i64,
+    eps: f32,
+    h_st: Storage,
+    n_st: Storage,
+) -> (i64, i64) {
+    super::inner::set_oom_context("add_rmsnorm");
+    let (tx, to) = (NslTensor::from_ptr_ref(x), NslTensor::from_ptr_ref(o));
+    let cols = unsafe { *tx.shape.add(tx.ndim as usize - 1) } as u64;
+    let rows = tx.len as u64 / cols;
+    let k = Kernel::AddRmsNorm([storage_of(tx), storage_of(to), h_st, n_st]);
+    let h = alloc_like(tx, h_st);
+    let n = alloc_like(tx, n_st);
+    launch_grid(
+        k,
+        rows as i64,
+        256 * 4,
+        &mut [
+            data(x),
+            data(o),
+            data(h),
+            data(n),
+            data(gamma),
+            rows,
+            cols,
+            u64::from(eps.to_bits()),
+        ],
+    );
+    (h, n)
 }
 
 /// The fused RoPE (`nsl_kir::kernels::rope`): `x` `[b, h, s, d]` f32 or bf16

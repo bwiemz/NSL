@@ -224,6 +224,8 @@ pub mod rope;
 pub mod storage_dt;
 // Fused SwiGLU (source AD's `swiglu` op and its adjoint).
 pub mod swiglu;
+// The pre-norm residual add and its RMSNorm in one launch (round-2 item 6).
+pub mod residual_norm;
 pub mod csla_stat;
 pub mod grad_integrity;
 pub mod weight_stream;

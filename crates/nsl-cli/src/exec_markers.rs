@@ -138,6 +138,10 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
             // The forward SwiGLU fusion (`[fuse] swiglu forward: N`), on the
             // fork CCR plans over.
             "crates/nsl-codegen/src/stmt_train/plan_ccr.rs",
+            // The residual add + RMSNorm launches of a train block
+            // (`[fuse] add+rmsnorm pairs: N (F forward, B backward)`), counted
+            // over its lowerings and printed when the block is done.
+            "crates/nsl-codegen/src/stmt_train/driver.rs",
         ],
         "a fusion peephole fired",
     ),
@@ -328,6 +332,12 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
         &["crates/nsl-runtime/src/args.rs"],
         "the cuBLASLt TF32 matmul counts at exit (NSL_BF16_LT_COUNTER=1): issued, timed-tuned \
          and fallback GEMMs",
+    ),
+    m(
+        "[add-rmsnorm]",
+        &["crates/nsl-runtime/src/args.rs"],
+        "the residual add + RMSNorm launches at exit (NSL_BF16_LT_COUNTER=1): one fused \
+         kernel or the unfused pair",
     ),
     m(
         "[weight-stream]",
@@ -845,6 +855,14 @@ pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
         parts: &[(
             "[fuse] swiglu recompute folded into the backward:",
             "crates/nsl-codegen/src/stmt_train/adjoint_tape_opt.rs",
+        )],
+    },
+    NegativeNeedle {
+        test: "crates/nsl-cli/tests/resid_norm_fusion_gate.rs",
+        asserts: "no residual add + RMSNorm launch with NSL_FUSE_ADD_RMSNORM=0",
+        parts: &[(
+            "[fuse] add+rmsnorm pairs:",
+            "crates/nsl-codegen/src/stmt_train/driver.rs",
         )],
     },
     NegativeNeedle {

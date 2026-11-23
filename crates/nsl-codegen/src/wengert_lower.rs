@@ -307,6 +307,16 @@ pub fn compile_wengert_ops_range(
     // op that defines it.
     let swiglu_groups = swiglu_backward_groups(compiler, wengert, range.clone());
     let mut swiglu_stash: HashMap<VarId, Value> = HashMap::new();
+    // Round-2 item 6: a residual `Add` and the `RMSNorm` of its sum, lowered as one
+    // launch at the Add (`add_rmsnorm_groups`). The norm's output waits in
+    // `compiler.add_norm_stash` until its op. A caller that splits one list into
+    // ranges with code between them plans the groups over the whole list
+    // (`compiler.add_norm_groups`); otherwise this range plans its own.
+    let add_norm_local = compiler.add_norm_groups.is_none();
+    let add_norm_groups: HashMap<VarId, WengertOp> = match &compiler.add_norm_groups {
+        Some(g) => g.clone(),
+        None => add_rmsnorm_groups(wengert, range.clone()),
+    };
     for (rel_i, op) in wengert.ops[range].iter().enumerate() {
         let abs_i = range_start + rel_i;
         // Item 7: the transpose and batched matmul of a fused weight-gradient
@@ -509,6 +519,17 @@ pub fn compile_wengert_ops_range(
         let result_val = if let Some(v) = swiglu_stash.remove(&op.result) {
             // Computed by the grouped launch at its gate op.
             v
+        } else if let Some(v) = compiler.add_norm_stash.remove(&op.result) {
+            // The RMSNorm of a grouped residual add: computed by the launch at its Add.
+            v
+        } else if let Some(norm) = add_norm_groups
+            .get(&op.result)
+            .filter(|norm| add_rmsnorm_can_group(compiler, op, norm, var_map, var_types))
+        {
+            let (h, n) = lower_add_rmsnorm(compiler, builder, op, norm, var_map)?;
+            compiler.add_norm_stash.insert(norm.result, n);
+            compiler.add_norm_fused.0 += 1;
+            h
         } else if let Some(&(up_vid, h_vid)) = swiglu_groups.get(&op.result) {
             let (dgate, dup, h) = lower_swiglu_backward_group(compiler, builder, op, h_vid.is_some(), var_map)?;
             swiglu_stash.insert(up_vid, dup);
@@ -645,6 +666,15 @@ pub fn compile_wengert_ops_range(
             owned_values.push((op.result, result_val, result_type));
         }
         var_types.insert(op.result, result_type);
+    }
+    if add_norm_local && !compiler.add_norm_stash.is_empty() {
+        // Every group planned in this range has both ops in it; a norm output left
+        // here would be computed and never bound (a leak, and a missing value).
+        return Err(CodegenError::new(format!(
+            "internal: a residual add + RMSNorm launch produced norm output(s) {:?} whose op was not \
+             reached in the same lowering range; please report this (NSL_FUSE_ADD_RMSNORM=0 avoids it)",
+            compiler.add_norm_stash.keys().collect::<Vec<_>>()
+        )));
     }
     if let Some(id) = graph_region_id {
         let idv = builder.ins().iconst(cl_types::I64, id);
@@ -1654,6 +1684,129 @@ fn swiglu_backward_groups(
         pairs.insert(g.result, (u.result, h));
     }
     pairs
+}
+
+/// Round-2 item 6: the residual adds of `wengert.ops[scope]` whose sum is normalized by
+/// a later `RMSNorm` in the same scope (operand 0), keyed by the Add's result, with that
+/// norm op. `NSL_FUSE_ADD_RMSNORM=0` (compile time): none.
+///
+/// The launch runs at the Add, so the norm's other operands must exist there: its gain
+/// and a run-time eps are taken only when no op of the list produces them (parameters
+/// and scalar fields, pre-seeded in the var map; a computed gain is left to the norm's
+/// own position). The rest of the conditions are checked where the Add is lowered
+/// (`add_rmsnorm_can_group`), against the lowering's state.
+pub(crate) fn add_rmsnorm_groups(
+    wengert: &WengertList,
+    scope: std::ops::Range<usize>,
+) -> HashMap<VarId, WengertOp> {
+    let mut groups = HashMap::new();
+    if std::env::var("NSL_FUSE_ADD_RMSNORM").ok().as_deref() == Some("0") {
+        return groups;
+    }
+    let produced: std::collections::HashSet<VarId> = wengert
+        .ops
+        .iter()
+        .filter(|o| !matches!(o.op, PrimalOp::Param(_) | PrimalOp::Input(_)))
+        .map(|o| o.result)
+        .collect();
+    let ops = &wengert.ops[scope];
+    for (i, add) in ops.iter().enumerate() {
+        if !matches!(add.op, PrimalOp::Add) || add.inputs.len() != 2 {
+            continue;
+        }
+        let Some(norm) = ops[i + 1..].iter().find(|n| {
+            matches!(n.op, PrimalOp::RMSNorm { .. }) && n.inputs.first() == Some(&add.result)
+        }) else {
+            continue;
+        };
+        let PrimalOp::RMSNorm { eps } = norm.op else {
+            unreachable!()
+        };
+        let Some(&gamma) = norm.inputs.get(1) else {
+            continue;
+        };
+        if produced.contains(&gamma) {
+            continue;
+        }
+        if let crate::wengert::NormEps::Var(v) = eps
+            && produced.contains(&v)
+        {
+            continue;
+        }
+        groups.insert(add.result, norm.clone());
+    }
+    groups
+}
+
+/// Whether the Add `op` lowers with its grouped `norm` here: both operands tensors
+/// (the plain Add would otherwise do integer or scalar arithmetic), the norm's gain
+/// and eps already lowered, and no arena placement on either result (a pin places one
+/// allocation; the launch makes two).
+fn add_rmsnorm_can_group(
+    compiler: &Compiler,
+    op: &WengertOp,
+    norm: &WengertOp,
+    var_map: &VarMap,
+    var_types: &HashMap<VarId, WengertType>,
+) -> bool {
+    let tensor =
+        |v: &VarId| var_types.get(v).copied().unwrap_or(WengertType::Tensor) == WengertType::Tensor;
+    let PrimalOp::RMSNorm { eps } = norm.op else {
+        return false;
+    };
+    let eps_ready = match eps {
+        crate::wengert::NormEps::Const(_) => true,
+        crate::wengert::NormEps::Var(v) => var_map.contains_key(&v),
+    };
+    op.inputs.iter().all(tensor)
+        && norm.inputs.first() == Some(&op.result)
+        && norm.inputs.get(1).is_some_and(|g| var_map.contains_key(g))
+        && eps_ready
+        && !compiler.arena_placements.contains_key(&op.result)
+        && !compiler.arena_placements.contains_key(&norm.result)
+}
+
+/// The route the unfused lowering takes for `v`'s op (`nsl_tensor_add_rmsnorm`'s
+/// `*_route`): 0 = the plain entry point, else the storage plan's output dtype tag.
+fn storage_route(compiler: &Compiler, v: VarId) -> i64 {
+    compiler.storage_out.get(&v).map_or(0, |st| st.tag())
+}
+
+/// Lower a grouped residual add `op` and its `norm` as one `nsl_tensor_add_rmsnorm`
+/// launch: `(h, n)`, each stored as the unfused op would have stored it.
+fn lower_add_rmsnorm(
+    compiler: &mut Compiler,
+    builder: &mut FunctionBuilder,
+    op: &WengertOp,
+    norm: &WengertOp,
+    var_map: &VarMap,
+) -> Result<(Value, Value), CodegenError> {
+    let inputs = resolve_inputs(op, var_map)?;
+    let PrimalOp::RMSNorm { eps } = norm.op else {
+        return Err(CodegenError::new(
+            "internal: a residual-add group without its RMSNorm",
+        ));
+    };
+    let gamma = var_map[&norm.inputs[1]];
+    let e = norm_eps_value(builder, var_map, eps, "rmsnorm")?;
+    let h_route = builder
+        .ins()
+        .iconst(cl_types::I64, storage_route(compiler, op.result));
+    let n_route = builder
+        .ins()
+        .iconst(cl_types::I64, storage_route(compiler, norm.result));
+    let list = call(
+        compiler,
+        builder,
+        "nsl_tensor_add_rmsnorm",
+        &[inputs[0], inputs[1], gamma, e, h_route, n_route],
+    )?;
+    let i0 = builder.ins().iconst(cl_types::I64, 0);
+    let h = call(compiler, builder, "nsl_list_get", &[list, i0])?;
+    let i1 = builder.ins().iconst(cl_types::I64, 1);
+    let n = call(compiler, builder, "nsl_list_get", &[list, i1])?;
+    call(compiler, builder, "nsl_list_free", &[list])?;
+    Ok((h, n))
 }
 
 /// Lower a grouped `swiglu_gate_backward(grad, up, gate)` (see
