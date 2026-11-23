@@ -79,6 +79,35 @@ pub(crate) unsafe fn gemm16(
     ldc: u64,
     c_bf16: bool,
 ) {
+    // SAFETY: the caller's contract; C doubles as D.
+    unsafe {
+        gemm16_into(
+            transa, transb, m, n, k, alpha, a16, lda, b16, ldb, beta, c, c, ldc, c_bf16,
+        )
+    }
+}
+
+/// [`gemm16`] writing `D = alpha * op(A) op(B) + beta * C` into `d`, which has C's
+/// layout (`d == c`: in place). cublasLt takes the two buffers as they are; the GemmEx
+/// fallback (in place only) first copies C into D, stream-ordered.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn gemm16_into(
+    transa: bool,
+    transb: bool,
+    m: u64,
+    n: u64,
+    k: u64,
+    alpha: f32,
+    a16: u64,
+    lda: u64,
+    b16: u64,
+    ldb: u64,
+    beta: f32,
+    c_in: u64,
+    c: u64,
+    ldc: u64,
+    c_bf16: bool,
+) {
     if super::graph_capture::enabled() {
         crate::fatal::die(
             crate::fatal::Fatal::Unsupported,
@@ -97,7 +126,7 @@ pub(crate) unsafe fn gemm16(
     // allocate them from the operands' shapes).
     if lt_applies
         && unsafe {
-            super::lt_matmul::matmul_bf16(
+            super::lt_matmul::matmul_bf16_into(
                 i32::from(transa),
                 i32::from(transb),
                 m as i32,
@@ -109,6 +138,7 @@ pub(crate) unsafe fn gemm16(
                 b16 as *const c_void,
                 ldb as i32,
                 &beta,
+                c_in as *mut c_void,
                 c as *mut c_void,
                 ldc as i32,
                 c_bf16,
@@ -116,6 +146,17 @@ pub(crate) unsafe fn gemm16(
         }
     {
         return;
+    }
+    if c_in != c {
+        // GemmEx accumulates in place: D starts as a copy of C (stream-ordered).
+        assert!(!c_bf16, "an out-of-place accumulation writes an f32 D");
+        if beta != 0.0 {
+            super::inner::memcpy_dtod(
+                c as *mut c_void,
+                c_in as *const c_void,
+                (ldc * n) as usize * 4,
+            );
+        }
     }
     let op = |t: bool| if t { cublas_sys::cublasOperation_t::CUBLAS_OP_T } else { cublas_sys::cublasOperation_t::CUBLAS_OP_N };
     let bf16 = cublas_sys::cudaDataType_t::CUDA_R_16BF;
@@ -240,6 +281,113 @@ pub(crate) fn matmul(a_ptr: i64, b_ptr: i64, out_tag: u16) -> Option<i64> {
             c as u64,
             n,
             out_tag == DTYPE_BF16,
+        );
+    }
+    drop(a16);
+    drop(b16);
+    super::inner::sync_after_kernel();
+    Some(out_ptr)
+}
+
+/// `c + a @ b` into a new f32 tensor shaped like `c`, as one GEMM that adds `c` in its
+/// epilogue (beta = 1; `source_ad::fuse_dgrad_accumulate`), when the shapes are ones
+/// [`matmul`] expresses and its product has `c`'s shape: `c` f32, contiguous, on `a`'s
+/// device. The operands are the bf16 images [`matmul`] would read (the same bytes), and
+/// the product runs the same plan as [`matmul`]'s for that shape, so the result is
+/// `matmul(a, b, f32) + c` with the add's one rounding. `None` otherwise.
+pub(crate) fn matmul_acc(a_ptr: i64, b_ptr: i64, c_ptr: i64) -> Option<i64> {
+    let (a, b, cc) = (
+        NslTensor::from_ptr_ref(a_ptr),
+        NslTensor::from_ptr_ref(b_ptr),
+        NslTensor::from_ptr_ref(c_ptr),
+    );
+    if a.device == 0
+        || a.device != b.device
+        || a.ndim < 2
+        || b.ndim != 2
+        || a.len == 0
+        || b.len == 0
+    {
+        return None;
+    }
+    if cc.device != a.device || cc.dtype != DTYPE_F32 || !cc.is_contiguous() {
+        return None;
+    }
+    let a_shape = unsafe { std::slice::from_raw_parts(a.shape, a.ndim as usize) };
+    let (b_rows, b_cols) = unsafe { (*b.shape, *b.shape.add(1)) };
+    let k = a_shape[a.ndim as usize - 1];
+    if k != b_rows {
+        return None;
+    }
+    let transb = if b.is_contiguous() {
+        false
+    } else if is_transposed_2d(b) {
+        true
+    } else {
+        return None;
+    };
+    let transa = if a.is_contiguous() {
+        false
+    } else if is_transposed_2d(a) {
+        true
+    } else {
+        return None;
+    };
+    let m = a.len / k;
+    let n = b_cols;
+    if m > i32::MAX as i64 || n > i32::MAX as i64 || k > i32::MAX as i64 {
+        return None;
+    }
+    let mut out_shape: Vec<i64> = a_shape.to_vec();
+    *out_shape.last_mut().expect("ndim >= 2") = n;
+    let c_shape = unsafe { std::slice::from_raw_parts(cc.shape, cc.ndim as usize) };
+    if c_shape != out_shape.as_slice() {
+        return None;
+    }
+    super::inner::set_oom_context("matmul_acc");
+    let total = (m * n) as usize;
+    let d = super::inner::alloc_managed(total * 4);
+    let shape =
+        crate::memory::checked_alloc(out_shape.len() * std::mem::size_of::<i64>()) as *mut i64;
+    for (i, &dim) in out_shape.iter().enumerate() {
+        unsafe { *shape.add(i) = dim };
+    }
+    let strides = NslTensor::compute_strides(shape, out_shape.len() as i64);
+    let out = Box::new(NslTensor::new(
+        d,
+        shape,
+        strides,
+        out_shape.len() as i64,
+        total as i64,
+        a.device,
+        DTYPE_F32,
+        1,
+        0,
+    ));
+    let out_ptr = Box::into_raw(out) as i64;
+
+    let a16 = operand16(a, a.len as usize);
+    let b16 = operand16(b, b.len as usize);
+    let (m, n, k) = (m as u64, n as u64, k as u64);
+    // As `matmul`: row-major C[m,n] = A[m,k] @ B[k,n] as column-major C^T = B^T A^T.
+    // SAFETY: a16/b16 hold a.len/b.len bf16 values; c and d hold m*n f32 values.
+    unsafe {
+        gemm16_into(
+            transb,
+            transa,
+            n,
+            m,
+            k,
+            1.0,
+            b16.ptr,
+            if transb { k } else { n },
+            a16.ptr,
+            if transa { m } else { k },
+            1.0,
+            cc.data as u64,
+            d as u64,
+            n,
+            false,
         );
     }
     drop(a16);

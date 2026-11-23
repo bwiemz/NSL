@@ -592,6 +592,37 @@ pub(crate) unsafe fn matmul_bf16(
     ldc: i32,
     c_bf16: bool,
 ) -> bool {
+    // SAFETY: forwarded unchanged; C doubles as D (in place).
+    unsafe {
+        matmul_bf16_into(
+            opa, opb, m, n, k, alpha, a16, lda, b16, ldb, beta, c, c, ldc, c_bf16,
+        )
+    }
+}
+
+/// [`matmul_bf16`] writing `D = alpha * op(A) op(B) + beta * C` into `d` (out of place,
+/// `d` with C's layout; `d == c` is the in-place form). The plan cache keys on neither
+/// pointer's identity (only the alignment class of all buffers), so the accumulating
+/// launch replays the same algorithm as the standalone product of that shape: the same
+/// f32 accumulator, then the epilogue's `alpha * acc + beta * C`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn matmul_bf16_into(
+    opa: i32,
+    opb: i32,
+    m: i32,
+    n: i32,
+    k: i32,
+    alpha: &f32,
+    a16: *const std::ffi::c_void,
+    lda: i32,
+    b16: *const std::ffi::c_void,
+    ldb: i32,
+    beta: &f32,
+    c: *mut std::ffi::c_void,
+    d: *mut std::ffi::c_void,
+    ldc: i32,
+    c_bf16: bool,
+) -> bool {
     if !(opa == 0 || opa == 1) || !(opb == 0 || opb == 1) {
         FALLBACKS.fetch_add(1, Ordering::Relaxed);
         print_fallback_once("unexpected operand op");
@@ -605,7 +636,8 @@ pub(crate) unsafe fn matmul_bf16(
     // Alignment class of the three buffers, capped at 256 bytes (as the TF32
     // path): an operand at an odd offset gets its own plan instead of failing,
     // and poisoning, the aligned shape's.
-    let align_log2 = ((a16 as usize) | (b16 as usize) | (c as usize) | 256).trailing_zeros();
+    let align_log2 =
+        ((a16 as usize) | (b16 as usize) | (c as usize) | (d as usize) | 256).trailing_zeros();
     let key: Key = (opa, opb, m, n, k, lda, ldb, ldc, align_log2, c_bf16);
     // Plan lookup / creation. The map lock is NOT held across build_plan
     // (which synchronizes the device while timing) nor across the launch —
@@ -677,8 +709,8 @@ pub(crate) unsafe fn matmul_bf16(
     let (ws_ptr, _) = workspace();
     let stream = super::inner::current_stream() as lt::cudaStream_t;
     // SAFETY: plan handles are process-lifetime; operand/output pointers are
-    // the caller's live device buffers; C doubles as D (in-place accumulate,
-    // the layout the heuristic was queried with).
+    // the caller's live device buffers; D has C's layout (the layout the heuristic
+    // was queried with), in place (`d == c`) or out of place.
     let st = unsafe {
         lt::cublasLtMatmul(
             handle,
@@ -691,7 +723,7 @@ pub(crate) unsafe fn matmul_bf16(
             beta as *const f32 as *const std::ffi::c_void,
             c as *const std::ffi::c_void,
             cdesc,
-            c,
+            d,
             cdesc,
             &algo,
             ws_ptr as *mut std::ffi::c_void,

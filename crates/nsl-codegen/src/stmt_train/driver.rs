@@ -393,6 +393,19 @@ impl Compiler<'_> {
         // VarIds, like the placements above.
         self.storage_out.clear();
         self.storage_param_gemm.clear();
+        // Item 6: the witness of the residual add + RMSNorm grouping, per train block.
+        let (fused, fwd) = std::mem::take(&mut self.add_norm_fused);
+        if fused > 0 {
+            nsl_log::nsl_log!(
+                INFO,
+                "fuse",
+                "[fuse] add+rmsnorm pairs: {} ({fwd} forward, {} backward)",
+                fused,
+                fused - fwd
+            );
+        }
+        self.add_norm_stash.clear();
+        self.add_norm_groups = None;
         // Item 17 phase 3a: the packing-metadata variables belong to the
         // train-step function this block just built — a later function
         // (another train block, a grad block, a model method) using them

@@ -19,9 +19,14 @@
 //! tape (`NSL_DEBUG_WENGERT`'s primal dump) to hold the fused `rope` op, one
 //! per RoPE application (48: 24 blocks x q and k), and no fold to fire. Since
 //! 2026-11-22 the gate builds the recipe's documented run line (the 1B
-//! recipe's). Drift below the floor means a matcher regression or a
-//! recipe/stdlib change that silently starved the fuser — either way the
-//! perf the campaign measured is gone and this gate is the tell.
+//! recipe's). Since round-2 item 6 (2026-11-22) the 24 residual joins, which
+//! are the attention projections' input-gradient sums `(dv + dk) + dq`, are
+//! GEMM accumulations (`[fuse] dgrad accumulations:`, 72 = 24 blocks x k, q
+//! and gate): the default build holds those, and a build with
+//! `NSL_FUSE_DGRAD_ACCUM=0` holds the fuser to its floor on the joins.
+//! Drift below a floor means a matcher regression or a recipe/stdlib change
+//! that silently starved the fuser — either way the perf the campaign
+//! measured is gone and this gate is the tell.
 
 use std::path::PathBuf;
 
@@ -42,13 +47,19 @@ fn marker_count(stderr: &str, marker: &str) -> Option<u64> {
     })
 }
 
-#[test]
-fn prod_500m_recipe_fuses_above_the_observed_floor() {
+/// `nsl build` of the 500M recipe on its documented run line with `env`:
+/// the build's stderr (the build must succeed).
+fn build_prod_500m(tag: &str, env: &[(&str, &str)]) -> String {
     let root = repo_root();
-    let tmp = std::env::temp_dir().join(format!("nsl_ewprod_{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("nsl_ewprod_{tag}_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
 
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nsl"))
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_nsl"));
+    cmd.env_remove("NSL_FUSE_DGRAD_ACCUM");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd
         .args([
             "build",
             "--source-ad",
@@ -77,19 +88,33 @@ fn prod_500m_recipe_fuses_above_the_observed_floor() {
         out.status.success(),
         "prod recipe must build in the prod posture:\n{stderr}"
     );
+    stderr
+}
 
-    let chains = marker_count(&stderr, "[fuse] elementwise backward chains:")
+#[test]
+fn prod_500m_recipe_fuses_above_the_observed_floor() {
+    let stderr = build_prod_500m("on", &[]);
+    // The attention and MLP input-gradient sums: k and q onto v, gate onto up.
+    assert_eq!(
+        marker_count(&stderr, "[fuse] dgrad accumulations:"),
+        Some(72),
+        "the 500M recipe's input-gradient sums (24 blocks x k, q, gate) must be GEMM \
+         accumulations:\n{stderr}"
+    );
+    // Without them the 24 joins are elementwise chains again, and the fuser must take them.
+    let joins = build_prod_500m("joins", &[("NSL_FUSE_DGRAD_ACCUM", "0")]);
+    let chains = marker_count(&joins, "[fuse] elementwise backward chains:")
         .unwrap_or_else(|| {
             panic!(
                 "no `[fuse] elementwise backward chains:` marker — the fuser \
-                 did not run on the prod recipe (vacuous):\n{stderr}"
+                 did not run on the prod recipe (vacuous):\n{joins}"
             )
         });
     assert!(
         chains >= 19,
         "chain count {chains} fell below the floor (19 = 0.8 x the 24 residual \
          joins; the 48 dropout chains of 2026-08-25 are now `dropout_backward:` \
-         ops) — matcher regression or recipe drift starved the fuser:\n{stderr}"
+         ops) — matcher regression or recipe drift starved the fuser:\n{joins}"
     );
     // The recipe's 48 dropouts (24 blocks x attention and MLP, p = 0.1)
     // keep a key and redraw their mask: no dropout chain is left to fuse.

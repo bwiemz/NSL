@@ -338,6 +338,16 @@ def arm(name: str) -> Arm:
             (("NSL_PARAM_DTYPE_TEST_MODES", "1"),),
             train_args=PARAM_MASTER,
         ),
+        # Both memory options on top of `nsl_bf16s`: bf16-split parameters and the bf16
+        # first moment (the candidate recipe posture once a channel carries both).
+        "nsl_bf16splitm1": Arm(
+            name,
+            "nsl",
+            "bf16",
+            tuple(PROD_FLAGS),
+            train_args=PARAM_SPLIT,
+            optim_args='first_moment_dtype="bf16"',
+        ),
         "nsl_tf32_nodrain": Arm(name, "nsl", "tf32", tuple(PROD_FLAGS), (), NO_DRAIN),
         "nsl_bf16_nodrain": Arm(name, "nsl", "bf16", tuple(PROD_FLAGS), BF16, NO_DRAIN),
         "nsl_tf32_oldattn": Arm(name, "nsl", "tf32", tuple(PROD_FLAGS), (), OLD_ATTN),
@@ -1207,7 +1217,8 @@ def phase_split(r: dict[str, Any]) -> dict[str, float] | None:
 
 REPORT_ORDER = [
     "nsl_tf32", "nsl_tf32_nodrain", "nsl_tf32_blocks", "nsl_tf32_compress",
-    "nsl_bf16", "nsl_bf16s", "nsl_bf16split", "nsl_bf16master", "nsl_bf16_nodrain", "nsl_bf16_blocks", "nsl_bf16_compress",
+    "nsl_bf16", "nsl_bf16s", "nsl_bf16split", "nsl_bf16splitm1", "nsl_bf16master",
+    "nsl_bf16_nodrain", "nsl_bf16_blocks", "nsl_bf16_compress",
     "torch_tf32_eager_sel", "torch_tf32_eager_blocks", "torch_tf32_eager_none",
     "torch_bf16_eager_sel", "torch_bf16_eager_blocks", "torch_bf16_eager_none",
     "torch_bf16_compile_sel", "torch_bf16_compile_blocks", "torch_bf16_compile_none",
@@ -1298,6 +1309,11 @@ PAIRS = [
     ("nsl_bf16s", "nsl_bf16"),
     ("nsl_bf16split", "nsl_bf16s"),
     ("nsl_bf16master", "nsl_bf16s"),
+    ("nsl_bf16splitm1", "nsl_bf16s"),
+    ("torch_bf16_compile_sel", "nsl_bf16s"),
+    ("torch_bf16_eager_sel", "nsl_bf16s"),
+    ("torch_bf16_compile_sel", "nsl_bf16splitm1"),
+    ("torch_bf16_eager_sel", "nsl_bf16splitm1"),
     ("torch_bf16_eager_sel", "torch_tf32_eager_sel"),
     ("torch_bf16_compile_sel", "torch_bf16_eager_sel"),
     ("nsl_tf32", "nsl_tf32_blocks"),
