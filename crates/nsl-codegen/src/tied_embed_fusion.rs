@@ -111,6 +111,18 @@ pub fn plan(
     }
     let producer: HashMap<VarId, &crate::wengert::WengertOp> =
         adjoint.ops.iter().map(|o| (o.result, o)).collect();
+    // dW extracts per LM-head launch. The launch is cached under its forward
+    // key and, once planned in place, its dW slot is a placeholder: every
+    // dW extract of that key would read it. Only a key with exactly one dW
+    // extract (the one feeding the Add) may be planned.
+    let mut dw_extracts: HashMap<VarId, usize> = HashMap::new();
+    for o in &adjoint.ops {
+        if matches!(o.op, PrimalOp::FusedLinearCeBackwardExtract { component: 1, .. })
+            && let Some(&k) = o.inputs.get(5)
+        {
+            *dw_extracts.entry(k).or_insert(0) += 1;
+        }
+    }
     let mut keys_seen: HashSet<VarId> = HashSet::new();
     for op in &adjoint.ops {
         if op.op != PrimalOp::Add || op.inputs.len() != 2 || !param_adj_set.contains(&op.result) {
@@ -141,8 +153,9 @@ pub fn plan(
             continue;
         }
         // One LM head, one accumulator: a head whose dW fed two parameters
-        // cannot write both.
-        if !keys_seen.insert(lce_key) {
+        // cannot write both, and a second dW extract of the same launch
+        // would read the placeholder.
+        if dw_extracts.get(&lce_key).copied().unwrap_or(0) != 1 || !keys_seen.insert(lce_key) {
             continue;
         }
         let f = TiedEmbedFusion {
@@ -279,7 +292,9 @@ mod tests {
     #[test]
     fn one_head_feeds_one_accumulator() {
         // A second parameter adjoint summing the same head's dW with another
-        // scatter is not planned (and the first one is).
+        // scatter: neither is planned. Planning the first would make the
+        // shared launch write dW in place and hand the second extract (24)
+        // the placeholder instead of a materialised dW.
         let mut ops = tied(false);
         ops.push(op(4, 24, extract(1, false), vec![1, 2, 3, 4, 5, 6]));
         ops.push(op(
@@ -290,7 +305,21 @@ mod tests {
         ));
         ops.push(op(6, 26, PrimalOp::Add, vec![24, 25]));
         let p = plan(&list(ops), &HashSet::from([23, 26]), true);
-        assert_eq!(p.by_param_adjoint.len(), 1);
-        assert!(p.by_param_adjoint.contains_key(&23));
+        assert!(p.is_empty(), "{p:?}");
+    }
+
+    #[test]
+    fn a_second_dw_extract_of_the_launch_blocks_the_plan() {
+        // Another reader of the same launch's dW (here a plain gradient sum
+        // that is not a parameter adjoint) would get the placeholder.
+        let mut ops = tied(false);
+        ops.push(op(4, 24, extract(1, false), vec![1, 2, 3, 4, 5, 6]));
+        ops.push(op(5, 40, PrimalOp::Neg, vec![24]));
+        assert!(plan(&list(ops), &HashSet::from([23]), true).is_empty());
+        // A dW extract of a different launch does not.
+        let mut ops = tied(false);
+        ops.push(op(4, 24, extract(1, false), vec![1, 2, 3, 4, 5, 9]));
+        ops.push(op(5, 40, PrimalOp::Neg, vec![24]));
+        assert!(!plan(&list(ops), &HashSet::from([23]), true).is_empty());
     }
 }
