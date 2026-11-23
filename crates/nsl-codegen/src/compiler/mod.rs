@@ -989,6 +989,18 @@ pub struct Compiler<'a> {
     /// bf16-stored parameter (`nsl_tensor_matmul_pdt`, the eager bf16 matmul
     /// mode's per-shape rule). Keyed and cleared like `storage_out`.
     pub(crate) storage_param_gemm: std::collections::HashSet<crate::wengert::VarId>,
+    /// Round-2 item 6: the RMSNorm outputs a grouped residual-add + RMSNorm launch
+    /// (`wengert_lower::add_rmsnorm_groups`) produced at its Add, keyed by the norm op's
+    /// result VarId and taken when that op is reached. Empty outside a lowering (a range
+    /// that plans its own groups checks so at its end; the sliced forward at its end).
+    pub(crate) add_norm_stash: HashMap<crate::wengert::VarId, Value>,
+    /// The groups of a list whose lowering is split into ranges with code between them
+    /// (the per-segment sliced forward: a block-end Add ends one slice and the next
+    /// block's norm starts the next): Add result -> the RMSNorm op. `None`: each
+    /// `compile_wengert_ops_range` call plans the groups inside its own range.
+    pub(crate) add_norm_groups: Option<HashMap<crate::wengert::VarId, crate::wengert::WengertOp>>,
+    /// Grouped launches emitted for the train block being lowered: (all, forward).
+    pub(crate) add_norm_fused: (usize, usize),
     /// The program's parameter storage (`param_dtype=` on a top-level train
     /// block, resolved before `main` for the fingerprint and the banner);
     /// `None` for f32 parameters.
@@ -1329,6 +1341,9 @@ impl<'a> Compiler<'a> {
             arena_placements: HashMap::new(),
             storage_out: HashMap::new(),
             storage_param_gemm: std::collections::HashSet::new(),
+            add_norm_stash: HashMap::new(),
+            add_norm_groups: None,
+            add_norm_fused: (0, 0),
             param_storage: None,
             activation_bf16: false,
             packing_meta_vars: None,
@@ -1534,6 +1549,9 @@ impl<'a> Compiler<'a> {
         // apply arm pops on consumption, so this only matters if a future
         // pass dead-eliminates an apply op after its launch lowered.
         self.dropout_fwd_out.clear();
+        // Item 6: Value-keyed as well; empty after every complete lowering.
+        self.add_norm_stash.clear();
+        self.add_norm_groups = None;
     }
 
     /// Dev Tools Phase 2: resolve the constituent `NodeId`s folded into the

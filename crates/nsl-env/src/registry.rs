@@ -156,7 +156,7 @@ pub static REGISTRY: &[EnvVar] = &[
         "off",
         Diagnostic,
         Runtime,
-        "Print cublasLt bf16 GEMM issued/tuned/fallback counts to stderr at exit; NSL_EVENTS gets the JSON twin regardless."
+        "Print cublasLt bf16/TF32 GEMM counts, one-GEMM dgrad sums and add+RMSNorm launches to stderr at exit; NSL_EVENTS gets the GEMM JSON."
     ),
     var!(
         "NSL_BF16_LT_PROBE",
@@ -643,6 +643,24 @@ pub static REGISTRY: &[EnvVar] = &[
         Safety,
         Runtime,
         "Reinstate the v6 refusal: fused linear-CE FFIs return -1 for non-f32 (f16/bf16) operands instead of running the kernel."
+    ),
+    var!(
+        "NSL_FUSE_ADD_RMSNORM",
+        Bool,
+        "0 disables; anything else or unset = on",
+        "on",
+        Perf,
+        Compile,
+        "Kill switch for lowering a residual Add and the RMSNorm of its sum as one launch (bit-exact)."
+    ),
+    var!(
+        "NSL_FUSE_DGRAD_ACCUM",
+        Bool,
+        "0 disables; anything else or unset = on",
+        "on",
+        Perf,
+        Compile,
+        "Kill switch for summing a value's input gradients from several GEMMs by GEMM accumulation (beta = 1)."
     ),
     var!(
         "NSL_FUSE_ELEMENTWISE_BWD",

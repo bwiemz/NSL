@@ -401,22 +401,10 @@ pub extern "C" fn nsl_tensor_matmul_pdt(a: i64, b: i64) -> i64 {
     refuse_tape(NAME);
     let (ta, tb) = (check_operand(NAME, a), check_operand(NAME, b));
     #[cfg(feature = "cuda")]
-    if ta.device > 0 && ta.ndim >= 2 && tb.ndim == 2 {
-        let k = unsafe { *ta.shape.add(ta.ndim as usize - 1) };
-        let n = unsafe { *tb.shape.add(1) };
-        let bf16 = k > 0
-            && crate::cuda::cublas_inner::resolved_math_mode()
-                == crate::cuda::cublas_inner::CublasMathMode::Bf16
-            && crate::cuda::cublas_inner::bf16_gate(
-                ta.len / k,
-                n,
-                k,
-                ta.len as usize,
-                tb.len as usize,
-            );
-        if bf16 && let Some(c) = crate::cuda::storage_gemm::matmul(a, b, DTYPE_F32) {
-            return c;
-        }
+    if pdt_takes_bf16(ta, tb)
+        && let Some(c) = crate::cuda::storage_gemm::matmul(a, b, DTYPE_F32)
+    {
+        return c;
     }
     let _ = (ta, tb);
     PDT_F32.fetch_add(1, Ordering::Relaxed);
@@ -447,6 +435,127 @@ pub extern "C" fn nsl_tensor_matmul_pdt(a: i64, b: i64) -> i64 {
     crate::tensor::nsl_tensor_free(fa);
     crate::tensor::nsl_tensor_free(fb);
     r
+}
+
+/// The eager bf16 matmul mode's per-shape choice for a parameter GEMM
+/// ([`nsl_tensor_matmul_pdt`]): bf16 operands when the product is worth casting both.
+#[cfg(feature = "cuda")]
+fn pdt_takes_bf16(ta: &NslTensor, tb: &NslTensor) -> bool {
+    if ta.device == 0 || ta.ndim < 2 || tb.ndim != 2 {
+        return false;
+    }
+    let k = unsafe { *ta.shape.add(ta.ndim as usize - 1) };
+    let n = unsafe { *tb.shape.add(1) };
+    k > 0
+        && crate::cuda::cublas_inner::resolved_math_mode()
+            == crate::cuda::cublas_inner::CublasMathMode::Bf16
+        && crate::cuda::cublas_inner::bf16_gate(ta.len / k, n, k, ta.len as usize, tb.len as usize)
+}
+
+/// Whether the eager matmul (`nsl_tensor_matmul`: `sgemm_row_major_t`, the BF16 math
+/// mode's `gemm_bf16_mode`) runs `a @ b` as the bf16 GEMM over round-to-nearest operand
+/// images, with the layout `storage_gemm::matmul` issues (B first, the batch dims of `a`
+/// collapsed into rows, a transposed 2-D operand read as `OP_T`). Then the one-GEMM
+/// accumulation over `storage_gemm`'s images of the same operands runs that product.
+#[cfg(feature = "cuda")]
+fn eager_takes_bf16(ta: &NslTensor, tb: &NslTensor) -> bool {
+    use crate::cuda::cublas_inner::{Bf16Rounding, bf16_rounding};
+    ta.dtype == DTYPE_F32
+        && tb.dtype == DTYPE_F32
+        && bf16_rounding() == Bf16Rounding::Rne
+        && !crate::cuda::graph_capture::enabled()
+        && !crate::autodiff::is_recording()
+        && (ta.ndim <= 2 || !crate::cuda::batch_collapse_disabled())
+        && pdt_takes_bf16(ta, tb)
+}
+
+static ACC_FUSED: AtomicU64 = AtomicU64::new(0);
+static ACC_DECOMPOSED: AtomicU64 = AtomicU64::new(0);
+
+/// `(one-GEMM accumulations, decomposed ones)` of [`nsl_tensor_matmul_acc`] so far.
+pub fn matmul_acc_counts() -> (u64, u64) {
+    (
+        ACC_FUSED.load(Ordering::Relaxed),
+        ACC_DECOMPOSED.load(Ordering::Relaxed),
+    )
+}
+
+/// `c + reduce_to_shape(a @ b, c)` in f32: a linear layer's input gradient added to the
+/// gradient summed so far for the same value (`source_ad::fuse_dgrad_accumulate`; `c`
+/// has that value's shape). `route` names the GEMM's call in the unfused program: 0
+/// `nsl_tensor_matmul`, 1 `nsl_tensor_matmul_dt(.., f32)` (bf16 activation storage), 2
+/// `nsl_tensor_matmul_pdt` (a bf16-stored parameter), 3 a bf16 sum (the value's
+/// gradient is bf16: the unfused program's bf16 GEMM, `_dt` reduce and `_dt` add, which
+/// this route replays as they were, one rounding each).
+///
+/// Fast path (route 1; routes 0 and 2 where the eager bf16 math mode takes bf16 operands
+/// for the product): one GEMM over the same bf16 operand images with beta = 1 into a
+/// fresh f32 tensor (`storage_gemm::matmul_acc`): the same plan, hence the same
+/// accumulator, as the standalone product, and the epilogue's one rounding of `acc + c`
+/// is the add kernel's. Otherwise the unfused program's three calls (that GEMM,
+/// `nsl_tensor_reduce_to_shape` onto `c`, `nsl_tensor_add`), counted.
+#[unsafe(no_mangle)]
+pub extern "C" fn nsl_tensor_matmul_acc(a: i64, b: i64, c: i64, route: i64) -> i64 {
+    const NAME: &str = "nsl_tensor_matmul_acc";
+    if !(0..=3).contains(&route) {
+        crate::fatal::die(
+            crate::fatal::Fatal::Unsupported,
+            &format!("{NAME}: unknown GEMM route {route}"),
+        );
+    }
+    if route != 0 {
+        refuse_tape(NAME);
+        let (ta, tb) = (check_operand(NAME, a), check_operand(NAME, b));
+        #[cfg(feature = "cuda")]
+        if (route == 1 || (route == 2 && pdt_takes_bf16(ta, tb)))
+            && let Some(d) = crate::cuda::storage_gemm::matmul_acc(a, b, c)
+        {
+            ACC_FUSED.fetch_add(1, Ordering::Relaxed);
+            return d;
+        }
+        let _ = (ta, tb);
+    } else {
+        // The plain matmul's product: one GEMM where the eager bf16 mode issues it as
+        // the bf16-storage GEMM (an f32 program's TF32 products decompose).
+        #[cfg(feature = "cuda")]
+        {
+            let (ta, tb) = (NslTensor::from_ptr_ref(a), NslTensor::from_ptr_ref(b));
+            if ta.device > 0
+                && tb.device == ta.device
+                && eager_takes_bf16(ta, tb)
+                && let Some(d) = crate::cuda::storage_gemm::matmul_acc(a, b, c)
+            {
+                ACC_FUSED.fetch_add(1, Ordering::Relaxed);
+                return d;
+            }
+        }
+    }
+    ACC_DECOMPOSED.fetch_add(1, Ordering::Relaxed);
+    if route == 3 {
+        let bf16 = i64::from(DTYPE_BF16);
+        let g = nsl_tensor_matmul_dt(a, b, bf16);
+        let r = nsl_tensor_reduce_to_shape_dt(g, c, bf16);
+        let sum = nsl_tensor_binary_dt(dt_op::ADD, c, r, bf16);
+        crate::tensor::nsl_tensor_free(r);
+        crate::tensor::nsl_tensor_free(g);
+        return sum;
+    }
+    let g = match route {
+        0 => crate::tensor::arithmetic::nsl_tensor_matmul(a, b, 0),
+        1 => nsl_tensor_matmul_dt(a, b, i64::from(DTYPE_F32)),
+        _ => nsl_tensor_matmul_pdt(a, b),
+    };
+    let r = crate::tensor::nsl_tensor_reduce_to_shape(g, c);
+    let both_f32 = NslTensor::from_ptr_ref(c).dtype == DTYPE_F32
+        && NslTensor::from_ptr_ref(r).dtype == DTYPE_F32;
+    let sum = if both_f32 {
+        crate::tensor::arithmetic::nsl_tensor_add(c, r, 0)
+    } else {
+        nsl_tensor_binary_dt(dt_op::ADD, c, r, i64::from(DTYPE_F32))
+    };
+    crate::tensor::nsl_tensor_free(r);
+    crate::tensor::nsl_tensor_free(g);
+    sum
 }
 
 #[cfg(feature = "cuda")]
