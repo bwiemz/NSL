@@ -614,6 +614,17 @@ macro_rules! for_each_runtime_fn {
             [abi_tensor] nsl_tensor_rope_backward(i64, i64, i64) -> i64 = rope::nsl_tensor_rope_backward;
             [abi_tensor] nsl_tensor_rope_dt(i64, i64, i64, i64) -> i64 = rope::nsl_tensor_rope_dt;
             [abi_tensor] nsl_tensor_rope_backward_dt(i64, i64, i64, i64) -> i64 = rope::nsl_tensor_rope_backward_dt;
+            // Fused SwiGLU (source AD's `swiglu` op): forward, the up branch's adjoint, and both
+            // adjoints from one launch (an NslList [dgate, dup]); `_dt` forms name the output dtype.
+            [abi_tensor] nsl_tensor_swiglu(i64, i64) -> i64 = swiglu::nsl_tensor_swiglu;
+            [abi_tensor] nsl_tensor_swiglu_dt(i64, i64, i64) -> i64 = swiglu::nsl_tensor_swiglu_dt;
+            [abi_tensor] nsl_tensor_swiglu_up_backward(i64, i64) -> i64 = swiglu::nsl_tensor_swiglu_up_backward;
+            [abi_tensor] nsl_tensor_swiglu_up_backward_dt(i64, i64, i64) -> i64 = swiglu::nsl_tensor_swiglu_up_backward_dt;
+            [abi_tensor] nsl_tensor_swiglu_backward(i64, i64, i64) -> i64 = swiglu::nsl_tensor_swiglu_backward;
+            [abi_tensor] nsl_tensor_swiglu_backward_dt(i64, i64, i64, i64) -> i64 = swiglu::nsl_tensor_swiglu_backward_dt;
+            // Both adjoints and the recomputed forward value: an NslList [dgate, dup, p].
+            [abi_tensor] nsl_tensor_swiglu_backward_recompute(i64, i64, i64) -> i64 = swiglu::nsl_tensor_swiglu_backward_recompute;
+            [abi_tensor] nsl_tensor_swiglu_backward_recompute_dt(i64, i64, i64, i64) -> i64 = swiglu::nsl_tensor_swiglu_backward_recompute_dt;
             // p4 slice 3: fused Sigmoid backward — grad * y*(1-y), y = σ output.
             [abi_tensor] nsl_tensor_sigmoid_backward(i64, i64) -> i64 = tensor::activation::nsl_tensor_sigmoid_backward;
             // p4 slice 3: fused Tanh backward — grad * (1 - y*y), y = tanh output.
@@ -1394,6 +1405,6 @@ mod tests {
     fn table_is_the_recorded_size() {
         // The count is pinned so a row dropped by a bad merge is noticed; move
         // it with a row that is deliberately added or removed.
-        assert_eq!(RUNTIME_ABI.len(), 677);
+        assert_eq!(RUNTIME_ABI.len(), 685);
     }
 }

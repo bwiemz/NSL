@@ -223,6 +223,18 @@ impl Compiler<'_> {
             );
             return Ok(None);
         };
+        // `silu(g) * u` -> one `swiglu` op, as in the train block's arm
+        // (`fork_wrga_and_plan_ccr`). The target and every named local keep
+        // their producers.
+        {
+            let mut keep: std::collections::HashSet<crate::wengert::VarId> =
+                extractor.symbol_var_map().values().copied().collect();
+            keep.insert(target_var_id);
+            let fused = crate::source_ad::fuse_swiglu_forward(extractor.wengert_list_mut(), &keep);
+            if fused > 0 {
+                nsl_log::nsl_log!(INFO, "fuse", "[fuse] swiglu forward: {fused}");
+            }
+        }
 
         // Both walks in name order, as in the train block's source-AD
         // arm: `use_var` numbers a value per call (see

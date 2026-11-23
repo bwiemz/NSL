@@ -91,7 +91,9 @@ pub struct StoragePlan {
 struct Slice {
     n: VarId,
     a: VarId,
-    s: VarId,
+    /// `silu(a)`; `None` for the fused form `p = swiglu(a, u)`
+    /// (`source_ad::fuse_swiglu_forward`), which stores no such value.
+    s: Option<VarId>,
     u: VarId,
     p: VarId,
     d: VarId,
@@ -142,22 +144,32 @@ fn find_slices(primal: &WengertList) -> Vec<Slice> {
     let rd = readers(primal);
     let mut out = Vec::new();
     for op in &primal.ops {
-        if !matches!(op.op, PrimalOp::Silu) || op.inputs.len() != 1 {
+        // `s = silu(a); p = s * u`, or the fused `p = swiglu(a, u)`.
+        let (a, s, u, p) = if matches!(op.op, PrimalOp::Silu) && op.inputs.len() == 1 {
+            let (s, a) = (op.result, op.inputs[0]);
+            let Some(p_op) = only_reader(&rd, s) else { continue };
+            if !matches!(p_op.op, PrimalOp::Mul) || p_op.inputs.len() != 2 {
+                continue;
+            }
+            let u = if p_op.inputs[0] == s { p_op.inputs[1] } else { p_op.inputs[0] };
+            if u == s || !p_op.inputs.contains(&s) {
+                continue;
+            }
+            (a, Some(s), u, p_op.result)
+        } else if is_passthrough(&op.op, "swiglu") && op.inputs.len() == 2 {
+            (op.inputs[0], None, op.inputs[1], op.result)
+        } else {
+            continue;
+        };
+        if a == u {
             continue;
         }
-        let (s, a) = (op.result, op.inputs[0]);
         let Some(n) = matmul_of_param(&prod, a) else { continue };
-        let Some(p_op) = only_reader(&rd, s) else { continue };
-        if !matches!(p_op.op, PrimalOp::Mul) || p_op.inputs.len() != 2 {
+        if matmul_of_param(&prod, u) != Some(n) {
             continue;
         }
-        let u = if p_op.inputs[0] == s { p_op.inputs[1] } else { p_op.inputs[0] };
-        if u == s || !p_op.inputs.contains(&s) || matmul_of_param(&prod, u) != Some(n) {
-            continue;
-        }
-        let p = p_op.result;
         let (Some(a_r), Some(u_r)) = (only_reader(&rd, a), only_reader(&rd, u)) else { continue };
-        if a_r.result != s || u_r.result != p {
+        if a_r.result != s.unwrap_or(p) || u_r.result != p {
             continue;
         }
         let Some(d_op) = only_reader(&rd, p) else { continue };
@@ -217,6 +229,8 @@ pub fn has_dt_lowering(op: &PrimalOp) -> bool {
         || is_binary(op)
         || is_unary_dt(op)
         || is_passthrough(op, "swiglu_gate_backward")
+        || is_passthrough(op, "swiglu")
+        || is_passthrough(op, "swiglu_up_backward")
         || is_passthrough(op, "rotate_half")
         || is_passthrough(op, "rotate_half_neg")
         || is_passthrough(op, "reduce_to_shape")
@@ -426,6 +440,9 @@ struct Planner<'a> {
     /// optimizer), whatever rule 6 says for values.
     param_view: HashSet<VarId>,
     clones: &'a HashMap<VarId, VarId>,
+    /// Each recompute clone and each CCR shape stub, mapped to the primal
+    /// value it stands for (see [`Planner::grad_is_bf16`]).
+    stand_in: HashMap<VarId, VarId>,
 }
 
 impl Planner<'_> {
@@ -435,10 +452,18 @@ impl Planner<'_> {
 
     /// Rule 6: a gradient is stored as its value is, except a norm output's
     /// and a parameter's.
+    ///
+    /// A target that is a recompute clone or a shape stub is the value it
+    /// stands for (rule 2), resolved through its original: the backward can
+    /// reach the GEMM producing a value's gradient before the clone group
+    /// that recomputes the value (CCR splices a block's clones at their
+    /// first reader, and the down projection's dgrad reads none of them), and
+    /// a stub is no op of either list. Asking the clone itself made such a
+    /// GEMM, and the whole MLP backward after it, f32 in exactly the blocks
+    /// whose clones were spliced late.
     fn grad_is_bf16(&self, target: VarId) -> bool {
-        self.is_bf16(target)
-            && !self.norm_out.contains(&target)
-            && !self.param_view.contains(&target)
+        let t = self.stand_in.get(&target).copied().unwrap_or(target);
+        self.is_bf16(t) && !self.norm_out.contains(&t) && !self.param_view.contains(&t)
     }
 
     fn set(&mut self, op: &WengertOp, st: Storage) {
@@ -586,6 +611,8 @@ impl Planner<'_> {
             o if is_binary(o)
                 || is_unary_dt(o)
                 || is_passthrough(o, "swiglu_gate_backward")
+                || is_passthrough(o, "swiglu")
+                || is_passthrough(o, "swiglu_up_backward")
                 || is_passthrough(o, "rotate_half")
                 || is_passthrough(o, "rotate_half_neg")
                 || is_passthrough(o, "rope") =>
@@ -606,31 +633,39 @@ impl Planner<'_> {
 /// `adjoint` to the primal value it recomputes (empty without CCR).
 #[cfg(test)]
 pub fn plan(primal: &WengertList, adjoint: &WengertList, clones: &HashMap<VarId, VarId>) -> Result<StoragePlan, String> {
-    plan_with_params(primal, adjoint, clones, &HashSet::new())
+    plan_with_params(primal, adjoint, clones, &[], &HashSet::new())
 }
 
 /// [`plan`] with `params` (the `Param` VarIds of [`select_bf16_params`])
 /// stored bf16: they and their views are bf16 values, their gradients f32,
 /// and a GEMM whose only bf16 operand is one of them is in
-/// [`StoragePlan::param_gemm`].
+/// [`StoragePlan::param_gemm`]. `stubs` are CCR's shape stubs
+/// (`CcrPlan::shape_stubs`, `(original, stub)`): the backward reads a stub
+/// in place of its original for that value's shape, so a gradient reduced
+/// onto a stub is the original's gradient, stored as rule 6 says for the
+/// original (as for a clone).
 pub fn plan_with_params(
     primal: &WengertList,
     adjoint: &WengertList,
     clones: &HashMap<VarId, VarId>,
+    stubs: &[(VarId, VarId)],
     params: &HashSet<VarId>,
 ) -> Result<StoragePlan, String> {
     let slices = find_slices(primal);
     let (attn_seeds, attn_norms) = find_attention_seeds(primal);
+    let stand_in: HashMap<VarId, VarId> =
+        clones.iter().map(|(&c, &o)| (c, o)).chain(stubs.iter().map(|&(o, s)| (s, o))).collect();
     let mut pl = Planner {
         plan: StoragePlan { slices: slices.len(), attention: attn_norms.len(), ..Default::default() },
         norm_out: HashSet::new(),
         param_view: params.clone(),
         clones,
+        stand_in,
     };
     pl.plan.bf16.extend(params.iter().copied());
     let prod = producers(primal);
     for sl in &slices {
-        for v in [sl.n, sl.a, sl.s, sl.u, sl.p] {
+        for v in [Some(sl.n), Some(sl.a), sl.s, Some(sl.u), Some(sl.p)].into_iter().flatten() {
             pl.set(prod[&v], Storage::Bf16);
         }
         pl.norm_out.insert(sl.n);
@@ -708,7 +743,8 @@ impl Compiler<'_> {
             None => Vec::new(),
         };
         let params: HashSet<VarId> = selected.iter().map(|&(v, _)| v).collect();
-        let planned = plan_with_params(effective_primal, adjoint, clones, &params)
+        let stubs = ccr_plan.as_ref().map_or(&[][..], |p| &p.shape_stubs[..]);
+        let planned = plan_with_params(effective_primal, adjoint, clones, stubs, &params)
             .map_err(crate::CodegenError::new)?;
         if planned.slices == 0 && planned.attention == 0 {
             // The program's fingerprint (`act=bf16`) and runtime banner were
@@ -985,6 +1021,132 @@ mod tests {
         (primal, adjoint, clones)
     }
 
+    /// CCR splices a block's clone group at its first reader, which can be
+    /// AFTER the down projection's dgrad (that GEMM reads none of the
+    /// victims; its reduce onto the clone of `p` does). The dgrad's storage
+    /// is decided from its target's (rule 4), the clone of `p`, which must
+    /// count as `p` even though the clone has not been visited yet: the plan
+    /// is the same as with the clones spliced first.
+    #[test]
+    fn a_dgrad_before_its_targets_clone_is_planned_as_after_it() {
+        let (primal, adjoint, clones) = block();
+        let want = plan(&primal, &adjoint, &clones).expect("plans");
+        let mut late = adjoint.clone();
+        let pos = |l: &WengertList, v: VarId| l.ops.iter().position(|o| o.result == v).unwrap();
+        // Move the clones of `s` and `p` (752, 753) to right before the
+        // reduce onto `p`'s clone (502), i.e. after the dgrad (501).
+        let s_clone = late.ops.remove(pos(&late, 752));
+        let p_clone = late.ops.remove(pos(&late, 753));
+        let at = pos(&late, 502);
+        late.ops.splice(at..at, [s_clone, p_clone]);
+        assert!(pos(&late, 501) < pos(&late, 753), "the fixture must put the dgrad first");
+        let got = plan(&primal, &late, &clones).expect("plans");
+        assert_eq!(got.out.get(&501), Some(&Storage::Bf16), "the dgrad of p's gradient");
+        assert_eq!(got.out, want.out);
+        assert_eq!(got.bf16, want.bf16);
+    }
+
+    /// [`block`] after the SwiGLU fusion: the forward `s = silu(a); p = s*u`
+    /// is one `p = swiglu(a, u)`; the backward's up adjoint reads `a`
+    /// instead of the recomputed `s`; and, with the recompute folded into
+    /// the backward (`fold`), CCR clones nothing for `p` (its shape is read
+    /// through a stub) and the down projection's weight gradient reads the
+    /// backward's own `h = swiglu(a, u)`.
+    fn fused_block(fold: bool) -> (WengertList, WengertList, HashMap<VarId, VarId>, Vec<(VarId, VarId)>) {
+        let (mut primal, _, _) = block();
+        primal.ops.retain(|o| o.result != 135);
+        for o in primal.ops.iter_mut().filter(|o| o.result == 138) {
+            o.op = pt("swiglu");
+            o.inputs = vec![134, 137];
+        }
+        let rms = PrimalOp::RMSNorm { eps: NormEps::Var(131) };
+        // `p`'s value in the backward: the clone (753) or the fold's `h` (900);
+        // its shape: the clone or the stub (809).
+        let (value, shape) = if fold { (900, 809) } else { (753, 753) };
+        let mut ops = vec![op(750, PrimalOp::Add, &[18, 127]), op(751, rms, &[750, 130, 131])];
+        if !fold {
+            ops.push(op(753, pt("swiglu"), &[134, 137]));
+        }
+        ops.extend([
+            op(496, pt("reduce_to_shape"), &[493, 750]),
+            op(497, pt("reduce_to_shape"), &[493, 808]),
+            op(500, T, &[139]),
+            op(501, PrimalOp::Matmul, &[497, 500]),
+            op(502, pt("reduce_to_shape"), &[501, shape]),
+        ]);
+        let wgrad = [
+            op(503, T, &[value]),
+            op(504, PrimalOp::Matmul, &[503, 497]),
+            op(505, pt("reduce_to_shape"), &[504, 139]),
+        ];
+        if !fold {
+            ops.extend(wgrad.clone());
+        }
+        ops.extend([
+            op(516, pt("swiglu_gate_backward"), &[502, 137, 134]),
+            op(508, pt("swiglu_up_backward"), &[502, 134]),
+        ]);
+        if fold {
+            ops.push(op(900, pt("swiglu"), &[134, 137]));
+            ops.extend(wgrad);
+        }
+        ops.extend([
+            op(509, pt("reduce_to_shape"), &[508, 137]),
+            op(510, T, &[136]),
+            op(511, PrimalOp::Matmul, &[509, 510]),
+            op(512, pt("reduce_to_shape"), &[511, 751]),
+            op(513, T, &[751]),
+            op(514, PrimalOp::Matmul, &[513, 509]),
+            op(515, pt("reduce_to_shape"), &[514, 136]),
+            op(517, T, &[133]),
+            op(518, PrimalOp::Matmul, &[516, 517]),
+            op(519, pt("reduce_to_shape"), &[518, 751]),
+            op(520, PrimalOp::Add, &[512, 519]),
+            op(521, T, &[751]),
+            op(522, PrimalOp::Matmul, &[521, 516]),
+            op(523, pt("reduce_to_shape"), &[522, 133]),
+            op(525, pt("rmsnorm_dx_backward_add:var"), &[520, 750, 130, 496, 131]),
+            op(526, pt("rmsnorm_dgamma_backward:var"), &[520, 750, 130, 131]),
+        ]);
+        let mut clones = HashMap::from([(750, 129), (751, 132)]);
+        if !fold {
+            clones.insert(753, 138);
+        }
+        let stubs = if fold { vec![(138, 809)] } else { vec![] };
+        (primal, list(ops), clones, stubs)
+    }
+
+    /// The fused block stores what the unfused one does, minus `silu(a)`:
+    /// the fused op, its clone or the backward's `h`, both adjoints and the
+    /// down projection's dgrad bf16, the weight gradients f32. With the fold,
+    /// the dgrad's target is `p`'s shape stub, which must count as `p`.
+    #[test]
+    fn the_fused_mlp_block_stores_what_the_unfused_one_does() {
+        use Storage::{Bf16, F32};
+        for fold in [false, true] {
+            let (primal, adjoint, clones, stubs) = fused_block(fold);
+            let got = plan_with_params(&primal, &adjoint, &clones, &stubs, &HashSet::new()).expect("plans");
+            assert_eq!(got.slices, 1, "fold={fold}");
+            let value = if fold { 900 } else { 753 };
+            let want_out: HashMap<VarId, Storage> = HashMap::from([
+                (132, Bf16), (134, Bf16), (137, Bf16), (138, Bf16), (140, Bf16), (144, F32),
+                (751, Bf16), (value, Bf16),
+                (501, Bf16), (504, F32), (502, Bf16),
+                (516, Bf16), (508, Bf16), (509, Bf16), (511, F32), (514, F32), (518, F32), (522, F32),
+            ]);
+            assert_eq!(got.out, want_out, "fold={fold}");
+            for v in [520, 512, 519, 496, 497, 525] {
+                assert!(!got.out.contains_key(&v) && !got.bf16.contains(&v), "fold={fold}: VarId {v} must stay f32");
+            }
+        }
+        // Without the stub's mapping the dgrad (and with it both adjoints)
+        // would fall back to f32: the mapping is what keeps the fold from
+        // changing the plan.
+        let (primal, adjoint, clones, _) = fused_block(true);
+        let got = plan_with_params(&primal, &adjoint, &clones, &[], &HashSet::new()).expect("plans");
+        assert!(!got.bf16.contains(&501) && got.out.get(&516) == Some(&F32), "{:?}", got.out);
+    }
+
     /// Every value's dtype and every dtype-explicit op, derived by hand from
     /// the design's table (3.2) for this block, then compared whole.
     #[test]
@@ -1051,7 +1213,7 @@ mod tests {
         let (primal, adjoint, clones) = block();
         let base = plan(&primal, &adjoint, &clones).expect("plans");
         let params: HashSet<VarId> = [126, 133, 136, 139].into_iter().collect();
-        let got = plan_with_params(&primal, &adjoint, &clones, &params).expect("plans");
+        let got = plan_with_params(&primal, &adjoint, &clones, &[], &params).expect("plans");
         use Storage::{Bf16, F32};
         for (v, st) in [
             (504, F32),

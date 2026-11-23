@@ -1166,6 +1166,11 @@ impl<'a> SizeProp<'a> {
                 | "sigmoid_backward" | "tanh_backward" | "swiglu_gate_backward" => {
                     self.input_info(op, 0)
                 }
+                // The fused SwiGLU and its up adjoint: elementwise over two
+                // operands that may broadcast, as the Mul they replace.
+                "swiglu" | "swiglu_up_backward" => {
+                    self.binary_size(self.input_info(op, 0)?, self.input_info(op, 1)?)
+                }
                 n if n.starts_with("ccr_cast_") => self.input_info(op, 0),
                 // The dropout backward: the gradient's shape.
                 n if n.starts_with(crate::source_ad::DROPOUT_BACKWARD_PREFIX) => {

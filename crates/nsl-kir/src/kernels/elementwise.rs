@@ -455,7 +455,7 @@ pub(crate) fn f32_op2(b: &mut KirBuilder, op: fn(VarId, VarId, VarId) -> KirOp, 
 }
 
 /// `1 / (1 + 2^(-x * log2 e))`: the hand kernels' sigmoid, `-x` first.
-fn sigmoid_of(b: &mut KirBuilder, x: VarId) -> VarId {
+pub(crate) fn sigmoid_of(b: &mut KirBuilder, x: VarId) -> VarId {
     let negated = f32_op1(b, KirOp::Neg, x);
     let log2e = f32_const(b, LOG2_E);
     let scaled = f32_op2(b, KirOp::Mul, negated, log2e);
@@ -644,7 +644,7 @@ impl BackwardOp {
 
 /// `s·(1 + x·(1 − s))` in explicitly rounded steps, `s` already computed:
 /// the source-AD derivative tail shared by SiLU and the SwiGLU gate.
-fn srcad_silu_tail(b: &mut KirBuilder, x: VarId, s: VarId) -> VarId {
+pub(crate) fn srcad_silu_tail(b: &mut KirBuilder, x: VarId, s: VarId) -> VarId {
     let one = f32_const(b, 1.0f32.to_bits());
     let t = f32_op2(b, KirOp::SubRn, one, s);
     let t = f32_op2(b, KirOp::MulRn, x, t);
