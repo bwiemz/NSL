@@ -1647,6 +1647,13 @@ fn emit_model_backward_bridge(
                          calibration binary without --fuse-wgrad-accum.",
                     ));
                 }
+                // Planned only inside the FASE-Deferred lowering.
+                crate::wengert_lower::ParamGradSource::AccumulatedInPlace => {
+                    return Err(crate::error::CodegenError::new(
+                        "internal: a gradient accumulated in place reached the calibration \
+                         arena; the tied-embedding plan runs only in the FASE hook lowering",
+                    ));
+                }
             };
             // `still_needed`: this param grad is a shared intermediate that a
             // later adjoint op still reads. wengert_lower keeps it live in

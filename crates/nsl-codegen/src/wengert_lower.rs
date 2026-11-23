@@ -121,6 +121,62 @@ pub enum ParamGradSource {
     /// is nothing here for the hook to free — `x` and `g` remain owned by the
     /// normal end-of-backward cleanup.
     FusedWgrad { x: Value, g: Value },
+    /// The gradient's contributions were already added into `m_partial`,
+    /// scaled, where they were computed (a tied embedding, see
+    /// [`crate::tied_embed_fusion`]). There is no tensor and nothing to add
+    /// or free.
+    AccumulatedInPlace,
+}
+
+/// The FASE hook's accumulation buffers, for an adjoint lowering that adds a
+/// gradient into them where it is computed ([`crate::tied_embed_fusion`]).
+/// Set by the FASE-Deferred lowering around its `compile_wengert_ops` call
+/// (device-resident buffers only), `None` everywhere else.
+#[derive(Debug, Clone)]
+pub struct FaseInplaceAccum {
+    /// The accumulation buffer list (`m_partial` per parameter).
+    pub accum_list: Value,
+    /// Parameter-adjoint VarId -> its index in `accum_list`.
+    pub idx_of: HashMap<VarId, i64>,
+    /// `1 / grad_accumulation`.
+    pub scale: f64,
+}
+
+/// `NSL_TIED_EMBED_INPLACE=0` (compile time) keeps a tied embedding's
+/// gradient materialised and summed (see [`crate::tied_embed_fusion`]).
+fn tied_embed_inplace_enabled() -> bool {
+    std::env::var("NSL_TIED_EMBED_INPLACE").ok().as_deref() != Some("0")
+}
+
+/// `m_partial` and the scale for the parameter adjoint `param_adjoint`, read
+/// out of the FASE hook's accumulation list (see [`FaseInplaceAccum`]).
+fn fase_inplace_target(
+    compiler: &mut Compiler,
+    builder: &mut FunctionBuilder,
+    param_adjoint: VarId,
+) -> Result<(Value, f64), CodegenError> {
+    let ctx = compiler.fase_inplace.as_ref().ok_or_else(|| {
+        CodegenError::new(
+            "internal: a tied embedding was planned in place outside the FASE hook lowering",
+        )
+    })?;
+    let (list, scale) = (ctx.accum_list, ctx.scale);
+    let idx = *ctx.idx_of.get(&param_adjoint).ok_or_else(|| {
+        CodegenError::new(format!(
+            "internal: the tied embedding's adjoint VarId {param_adjoint} has no accumulation buffer"
+        ))
+    })?;
+    let idx_v = builder.ins().iconst(cl_types::I64, idx);
+    let m_partial = call(compiler, builder, "nsl_list_get", &[list, idx_v])?;
+    Ok((m_partial, scale))
+}
+
+/// The tied-embedding plan for the parameter adjoint a planned op feeds.
+fn tied_plan_entry(
+    compiler: &Compiler,
+    by: impl Fn(&crate::tied_embed_fusion::TiedEmbedPlan) -> Option<VarId>,
+) -> Option<VarId> {
+    compiler.tied_embed_plan.as_ref().and_then(by)
 }
 
 /// `on_param_grad`, when `Some((set, cb))`, causes `cb` to be invoked
@@ -216,7 +272,7 @@ pub fn compile_wengert_ops_range(
     hook_freed_input_vars: &mut std::collections::HashSet<VarId>,
     explicit_freed_vars: &mut std::collections::HashSet<VarId>,
     hook_freed_param_vars: &mut std::collections::HashSet<VarId>,
-    mut on_param_grad: Option<(
+    on_param_grad: Option<(
         &std::collections::HashSet<VarId>,
         &mut dyn FnMut(
             &mut Compiler,
@@ -267,6 +323,85 @@ pub fn compile_wengert_ops_range(
         range.end,
         wengert.ops.len()
     );
+    // A tied embedding's gradient accumulated in place (see
+    // `crate::tied_embed_fusion`): planned only inside the FASE hook
+    // lowering, which publishes device-resident accumulation buffers, and
+    // never when the gradient must be observed (grad-integrity) or lives on
+    // the host (optimizer-state offload). Whole-tape only, like the wgrad
+    // plan: the two contributions are lowered far apart.
+    let tied_plan = match &on_param_grad {
+        Some((param_set, _))
+            if compiler.fase_inplace.is_some()
+                && tied_embed_inplace_enabled()
+                && !compiler.compile_options.diagnostics.grad_integrity
+                && !compiler.compile_options.train.optim_state_offload
+                && range.start == 0
+                && range.end == wengert.ops.len() =>
+        {
+            let (dtype_tag, _) = fused_ce_dtype_for_compiler(compiler);
+            let gemm_route =
+                dtype_tag == 0 && std::env::var("NSL_FUSED_LCE_GEMM").ok().as_deref() != Some("0");
+            crate::tied_embed_fusion::plan(wengert, param_set, gemm_route)
+        }
+        _ => crate::tied_embed_fusion::TiedEmbedPlan::default(),
+    };
+    if !tied_plan.is_empty() {
+        nsl_log::nsl_log!(
+            INFO,
+            "tied-embed",
+            "[tied-embed] {} tied embedding gradient(s) accumulated in place: the LM head's dW GEMMs \
+             (beta 1) and the embedding scatter add into the accumulation buffer, no [V, H] scratch",
+            tied_plan.by_param_adjoint.len()
+        );
+    }
+    let saved_tied_plan = compiler.tied_embed_plan.replace(tied_plan);
+    let lowered = compile_wengert_ops_range_inner(
+        compiler,
+        builder,
+        state,
+        wengert,
+        range,
+        var_map,
+        var_types,
+        owned_values,
+        hook_freed_input_vars,
+        explicit_freed_vars,
+        hook_freed_param_vars,
+        on_param_grad,
+        last_input_use,
+        wgrad_plan,
+    );
+    compiler.tied_embed_plan = saved_tied_plan;
+    lowered
+}
+
+/// [`compile_wengert_ops_range`] after its plans are made.
+#[allow(clippy::too_many_arguments)]
+fn compile_wengert_ops_range_inner(
+    compiler: &mut Compiler,
+    builder: &mut FunctionBuilder,
+    state: &mut FuncState,
+    wengert: &WengertList,
+    range: std::ops::Range<usize>,
+    var_map: &mut VarMap,
+    var_types: &mut HashMap<VarId, WengertType>,
+    owned_values: &mut Vec<(VarId, Value, WengertType)>,
+    hook_freed_input_vars: &mut std::collections::HashSet<VarId>,
+    explicit_freed_vars: &mut std::collections::HashSet<VarId>,
+    hook_freed_param_vars: &mut std::collections::HashSet<VarId>,
+    mut on_param_grad: Option<(
+        &std::collections::HashSet<VarId>,
+        &mut dyn FnMut(
+            &mut Compiler,
+            VarId,
+            ParamGradSource,
+            bool,
+            &mut FunctionBuilder,
+        ) -> Result<(), CodegenError>,
+    )>,
+    last_input_use: Option<HashMap<VarId, usize>>,
+    wgrad_plan: crate::wgrad_fusion::WgradFusionPlan,
+) -> Result<(), CodegenError> {
     if compiler.compile_options.fusion.wgrad_accum && on_param_grad.is_some() {
         // Non-vacuity signal for the parity gate: a flag-on-vs-flag-off loss
         // comparison passes trivially if the fusion never fired. Print the
@@ -379,6 +514,30 @@ pub fn compile_wengert_ops_range(
                     // Never "still needed": the plan requires zero later
                     // readers of this param adjoint, and no tensor was
                     // materialized for one to read.
+                    false,
+                    builder,
+                )?;
+                hook_freed_param_vars.insert(op.result);
+            }
+            continue;
+        }
+        // A tied embedding's gradient (`crate::tied_embed_fusion`): both
+        // contributions were added into `m_partial` where they were lowered
+        // (their results are placeholders), so the sum is not computed and
+        // the hook only learns that the gradient is in.
+        if tied_plan_entry(compiler, |p| {
+            p.by_param_adjoint
+                .contains_key(&op.result)
+                .then_some(op.result)
+        })
+        .is_some()
+        {
+            if let Some(ref mut hook) = on_param_grad {
+                let (_, cb) = hook;
+                cb(
+                    compiler,
+                    op.result,
+                    ParamGradSource::AccumulatedInPlace,
                     false,
                     builder,
                 )?;
@@ -2614,20 +2773,33 @@ fn lower_single_op(
             ignore_index,
             has_bias,
             x_rank3,
-        } => lower_fused_linear_ce_backward_extract(
-            compiler,
-            builder,
-            &inputs,
-            *component,
-            *vocab_size,
-            *hidden_size,
-            *batch_size,
-            *seq_len,
-            *vocab_tile,
-            *ignore_index,
-            *has_bias,
-            *x_rank3,
-        ),
+        } => {
+            // A tied embedding planned in place: the backward launch writes
+            // dW into the embedding's accumulation buffer.
+            let tied = match op
+                .inputs
+                .get(5)
+                .and_then(|k| tied_plan_entry(compiler, |p| p.by_lce_key.get(k).copied()))
+            {
+                Some(param_adjoint) => Some(fase_inplace_target(compiler, builder, param_adjoint)?),
+                None => None,
+            };
+            lower_fused_linear_ce_backward_extract(
+                compiler,
+                builder,
+                &inputs,
+                *component,
+                *vocab_size,
+                *hidden_size,
+                *batch_size,
+                *seq_len,
+                *vocab_tile,
+                *ignore_index,
+                *has_bias,
+                *x_rank3,
+                tied,
+            )
+        }
         // CPKD: fused KL-CE distillation loss (forward).
         PrimalOp::FusedKlCe {
             vocab_size,
@@ -2810,6 +2982,12 @@ fn lower_single_op(
                 None
             };
 
+            // Grouped K/V (`kv_heads` dividing `heads`): the decomposed chain
+            // computes on K/V expanded to Q's head count, the copy `nsl.nn.gqa`
+            // used to make in NSL source, so it computes what it did then. The
+            // backward (`nsl_flash_attention_backward`) takes grouped K/V as
+            // they are.
+            let (k, v, kv_expanded) = compiler.emit_sdpa_expand_kv(builder, q, k, v)?;
             // K_T = transpose(K, -2, -1)
             let dim_m2 = builder.ins().iconst(cl_types::I64, -2_i64);
             let dim_m1 = builder.ins().iconst(cl_types::I64, -1_i64);
@@ -2859,6 +3037,9 @@ fn lower_single_op(
             }
             free_tensor_value(compiler, builder, masked)?;
             free_tensor_value(compiler, builder, attn_weights)?;
+            for t in kv_expanded {
+                free_tensor_value(compiler, builder, t)?;
+            }
 
             // NOTE: save-buffer allocation for claimed chains is handled
             // above by option 3a's `emit_fused_forward_under_claim` —
@@ -2924,6 +3105,10 @@ fn lower_single_op(
             let k = inputs[1];
             let v = inputs[2];
             let seg = inputs[4];
+            // Grouped K/V is refused with a message: the packed kernels and
+            // the mask-driven fallback read K/V with Q's head count.
+            let which_packed = builder.ins().iconst(cl_types::I64, 0);
+            call(compiler, builder, "nsl_sdpa_require_equal_kv_heads", &[q, k, v, which_packed])?;
 
             let scale_ty = op
                 .inputs
@@ -4297,13 +4482,31 @@ fn lower_single_op(
                 }
                 "embedding_backward" => {
                     // inputs = [grad, indices, weight]
-                    // Creates zeros_like(weight) then scatter-adds grad rows
-                    call(
-                        compiler,
-                        builder,
-                        "nsl_embedding_backward",
-                        &[inputs[0], inputs[1], inputs[2]],
-                    )
+                    // Creates zeros_like(weight) then scatter-adds grad rows —
+                    // or, for a tied embedding planned in place
+                    // (`crate::tied_embed_fusion`), scatter-adds them scaled
+                    // into its accumulation buffer and yields a placeholder.
+                    if let Some(param_adjoint) =
+                        tied_plan_entry(compiler, |p| p.by_emb.get(&op.result).copied())
+                    {
+                        let (m_partial, scale) =
+                            fase_inplace_target(compiler, builder, param_adjoint)?;
+                        let scale_v = builder.ins().f64const(scale);
+                        call(
+                            compiler,
+                            builder,
+                            "nsl_embedding_backward_accum",
+                            &[m_partial, inputs[0], inputs[1], scale_v],
+                        )?;
+                        Ok(builder.ins().iconst(cl_types::I64, 0))
+                    } else {
+                        call(
+                            compiler,
+                            builder,
+                            "nsl_embedding_backward",
+                            &[inputs[0], inputs[1], inputs[2]],
+                        )
+                    }
                 }
                 "cross_entropy_backward" => {
                     // inputs = [grad_output, logits, targets]
@@ -5376,6 +5579,10 @@ fn lower_fused_linear_ce_backward_extract(
     ignore_index: i64,
     has_bias: bool,
     x_rank3: bool,
+    // `(m_partial, 1/N)`: the weight's gradient goes into this accumulation
+    // buffer, scaled (a tied embedding, `crate::tied_embed_fusion`), and
+    // the dW component is a placeholder.
+    dw_into: Option<(Value, f64)>,
 ) -> Result<Value, CodegenError> {
     if component > 2 {
         return Err(CodegenError::new(format!(
@@ -5457,11 +5664,20 @@ fn lower_fused_linear_ce_backward_extract(
                 &[rows, hidden_size as i64],
             )?
         };
-        let dw_out = alloc_gpu_f32_tensor(
-            compiler,
-            builder,
-            &[vocab_size as i64, hidden_size as i64],
-        )?;
+        if dw_into.is_some() && (has_bias || !use_gemm) {
+            return Err(CodegenError::new(
+                "internal: a tied embedding was planned in place but its LM head's backward is not \
+                 the biasless GEMM route",
+            ));
+        }
+        // In place: dW goes into the accumulation buffer, no `[V, H]`
+        // scratch; the component's result is a placeholder (0) nothing reads.
+        let dw_out = match dw_into {
+            Some(_) => builder.ins().iconst(cl_types::I64, 0),
+            None => {
+                alloc_gpu_f32_tensor(compiler, builder, &[vocab_size as i64, hidden_size as i64])?
+            }
+        };
         // Biasless (GEMM-only): component 2 is never emitted by the AD
         // rule, so no dbias buffer exists — the slot carries dx_out as a
         // never-read placeholder.
@@ -5552,7 +5768,12 @@ fn lower_fused_linear_ce_backward_extract(
         )?;
         let lse_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_out])?;
         let dx_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[dx_out])?;
-        let dw_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[dw_out])?;
+        // In place: the accumulation buffer itself (the `_acc` entry checks
+        // it before writing); otherwise the scratch's data pointer.
+        let dw_ptr = match dw_into {
+            Some((m_partial, _)) => m_partial,
+            None => call(compiler, builder, "nsl_tensor_data_ptr", &[dw_out])?,
+        };
         let dbias_ptr = if has_bias {
             call(compiler, builder, "nsl_tensor_data_ptr", &[dbias_out])?
         } else {
@@ -5610,28 +5831,34 @@ fn lower_fused_linear_ce_backward_extract(
             };
             let has_bias_val =
                 builder.ins().iconst(cl_types::I64, i64::from(has_bias));
-            let _rc = call(
-                compiler,
-                builder,
-                "nsl_fused_linear_ce_backward_gemm",
-                &[
-                    grad_bits,
-                    x_ptr,
-                    w_ptr,
-                    bias_ptr_val,
-                    tgt_ptr,
-                    lse_ptr,
-                    dx_ptr,
-                    dw_ptr,
-                    dbias_ptr,
-                    b_val,
-                    s_val,
-                    v_val,
-                    h_val,
-                    num_valid,
-                    has_bias_val,
-                ],
-            )?;
+            let mut args = vec![
+                grad_bits,
+                x_ptr,
+                w_ptr,
+                bias_ptr_val,
+                tgt_ptr,
+                lse_ptr,
+                dx_ptr,
+                dw_ptr,
+                dbias_ptr,
+                b_val,
+                s_val,
+                v_val,
+                h_val,
+                num_valid,
+                has_bias_val,
+            ];
+            let entry = match dw_into {
+                Some((_, scale)) => {
+                    let alpha_bits = builder
+                        .ins()
+                        .iconst(cl_types::I64, i64::from((scale as f32).to_bits()));
+                    args.push(alpha_bits);
+                    "nsl_fused_linear_ce_backward_gemm_acc"
+                }
+                None => "nsl_fused_linear_ce_backward_gemm",
+            };
+            let _rc = call(compiler, builder, entry, &args)?;
         } else {
             // Backward PTX synthesis + embed (v1 kernels).
             let bwd_ptx_bytes =

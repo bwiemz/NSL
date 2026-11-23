@@ -1338,6 +1338,116 @@ pub extern "C" fn nsl_fused_linear_ce_backward_gemm(
     num_valid: i64,
     has_bias: i64,
 ) -> i64 {
+    backward_gemm(
+        grad_output_bits,
+        x_ptr,
+        w_ptr,
+        bias_ptr,
+        targets_ptr,
+        lse_ptr,
+        dx_out_ptr,
+        dw_out_ptr,
+        dbias_out_ptr,
+        b,
+        s,
+        v,
+        h,
+        num_valid,
+        has_bias,
+        1.0,
+    )
+}
+
+/// [`nsl_fused_linear_ce_backward_gemm`] with the weight gradient ADDED,
+/// times `dw_alpha` (f32 bits), into the tensor `dw_acc`: `dw_acc +=
+/// dw_alpha · dlogitsᵀ x`. `dw_acc` is a weight's gradient-accumulation
+/// buffer (a tied embedding's, `dw_alpha` the accumulation window's `1 /
+/// N`), so no zeroed `[V, H]` scratch is allocated and no separate add
+/// follows; it is not zeroed. Unlike the plain entry it takes the tensor,
+/// not its data pointer: anything but a contiguous device f32 `[V, H]`
+/// stops the program before it is written, and so does a failed GEMM (the
+/// buffer would hold a partial sum). `dx` (and `dbias`) must be zeroed as
+/// for the plain entry.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn nsl_fused_linear_ce_backward_gemm_acc(
+    grad_output_bits: i64,
+    x_ptr: i64,
+    w_ptr: i64,
+    bias_ptr: i64,
+    targets_ptr: i64,
+    lse_ptr: i64,
+    dx_out_ptr: i64,
+    dw_acc: i64,
+    dbias_out_ptr: i64,
+    b: i64,
+    s: i64,
+    v: i64,
+    h: i64,
+    num_valid: i64,
+    has_bias: i64,
+    dw_alpha_bits: i64,
+) -> i64 {
+    let acc = crate::tensor::NslTensor::from_ptr_ref(dw_acc);
+    if acc.dtype != 1 || acc.device == 0 || !acc.is_contiguous() || acc.len != v * h {
+        crate::fatal::die(
+            crate::fatal::Fatal::ShapeMismatch,
+            &format!(
+                "nsl_fused_linear_ce_backward_gemm_acc: the accumulator must be a contiguous device \
+                 f32 tensor of {v} x {h} elements (got dtype {}, device {}, {} elements)",
+                acc.dtype, acc.device, acc.len
+            ),
+        );
+    }
+    let rc = backward_gemm(
+        grad_output_bits,
+        x_ptr,
+        w_ptr,
+        bias_ptr,
+        targets_ptr,
+        lse_ptr,
+        dx_out_ptr,
+        acc.data as i64,
+        dbias_out_ptr,
+        b,
+        s,
+        v,
+        h,
+        num_valid,
+        has_bias,
+        f32::from_bits(dw_alpha_bits as u32),
+    );
+    if rc != 0 {
+        crate::fatal::die(
+            crate::fatal::Fatal::Cublas,
+            &format!(
+                "nsl_fused_linear_ce_backward_gemm_acc: the LM head's backward failed (rc {rc}) after it \
+                 may have added part of the weight gradient into the accumulation buffer"
+            ),
+        );
+    }
+    rc
+}
+
+#[allow(clippy::too_many_arguments)]
+fn backward_gemm(
+    grad_output_bits: i64,
+    x_ptr: i64,
+    w_ptr: i64,
+    bias_ptr: i64,
+    targets_ptr: i64,
+    lse_ptr: i64,
+    dx_out_ptr: i64,
+    dw_out_ptr: i64,
+    dbias_out_ptr: i64,
+    b: i64,
+    s: i64,
+    v: i64,
+    h: i64,
+    num_valid: i64,
+    has_bias: i64,
+    dw_alpha: f32,
+) -> i64 {
     let grad_output = f32::from_bits(grad_output_bits as u32);
     #[cfg(feature = "cuda")]
     {
@@ -1360,6 +1470,7 @@ pub extern "C" fn nsl_fused_linear_ce_backward_gemm(
             h as u64,
             scale,
             has_bias != 0,
+            dw_alpha,
         );
         if rc != 0 {
             crate::nsl_log!(ERROR, "fused-linear-ce", "nsl_fused_linear_ce_backward_gemm: failed rc={rc}");
@@ -1372,8 +1483,22 @@ pub extern "C" fn nsl_fused_linear_ce_backward_gemm(
     #[cfg(not(feature = "cuda"))]
     {
         let _ = (
-            grad_output, x_ptr, w_ptr, bias_ptr, targets_ptr, lse_ptr, dx_out_ptr,
-            dw_out_ptr, dbias_out_ptr, b, s, v, h, num_valid, has_bias,
+            grad_output,
+            x_ptr,
+            w_ptr,
+            bias_ptr,
+            targets_ptr,
+            lse_ptr,
+            dx_out_ptr,
+            dw_out_ptr,
+            dbias_out_ptr,
+            b,
+            s,
+            v,
+            h,
+            num_valid,
+            has_bias,
+            dw_alpha,
         );
         crate::nsl_log!(WARN, "fused-linear-ce", "nsl_fused_linear_ce_backward_gemm: compiled without cuda feature");
         -1

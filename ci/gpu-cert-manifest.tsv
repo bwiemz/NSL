@@ -161,6 +161,11 @@ crates/nsl-cli/tests/sampling_device_gate.rs	returned_sampling_results_do_not_do
 crates/nsl-cli/tests/sampling_device_gate.rs	topk_dicts_no_longer_strand	gpu	requires CUDA GPU
 crates/nsl-cli/tests/scalar_immediate_fold_gate.rs	scalar_immediates_bit_exact_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/sdpa_decorator_free_gpu_backward.rs	decorator_free_sdpa_backward_dispatches_on_gpu	gpu	requires a CUDA-capable GPU
+crates/nsl-cli/tests/sdpa_native_gqa_gate.rs	on_the_gpu_grouped_kv_is_the_expanded_computation_under_deterministic	gpu	requires CUDA GPU
+crates/nsl-cli/tests/sdpa_native_gqa_gate.rs	the_previous_attention_kernels_take_grouped_kv	gpu	requires CUDA GPU
+crates/nsl-cli/tests/sdpa_native_gqa_gate.rs	tape_ad_on_the_gpu_takes_grouped_kv	gpu	requires CUDA GPU
+crates/nsl-cli/tests/sdpa_native_gqa_gate.rs	the_kill_switch_reproduces_the_expanded_tensor_core_backward	gpu	requires CUDA GPU
+crates/nsl-cli/tests/sdpa_native_gqa_gate.rs	the_tensor_core_backward_sums_each_group_in_place	gpu	requires CUDA GPU
 crates/nsl-cli/tests/sr_bf16_gate.rs	srbf16_batched_step_matches_per_param_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/sr_bf16_gate.rs	srbf16_e2e_deterministic_and_sane_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/sr_bf16_gate.rs	srbf16_tracks_f32_baseline_gpu	gpu	requires CUDA GPU
@@ -176,6 +181,8 @@ crates/nsl-cli/tests/swiglu_fusion_gate.rs	swiglu_fused_backward_gpu_determinist
 crates/nsl-cli/tests/swiglu_fusion_gate.rs	swiglu_forward_fusion_gpu_is_bit_exact_and_its_kernels_run	gpu	requires CUDA GPU
 crates/nsl-cli/tests/swiglu_fusion_gate.rs	swiglu_fusion_under_bf16_storage_is_exact_up_to_the_silu_rounding	gpu	requires CUDA GPU
 crates/nsl-cli/tests/swiglu_fusion_gate.rs	swiglu_fusion_with_checkpointing_is_bit_exact_under_f32_storage	gpu	requires CUDA GPU
+crates/nsl-cli/tests/tied_embed_inplace_gate.rs	the_tied_embedding_gradient_is_accumulated_in_place	gpu	requires CUDA GPU
+crates/nsl-cli/tests/tied_embed_inplace_gate.rs	in_place_accumulation_keeps_deterministic_runs_reproducible	gpu	requires CUDA GPU
 crates/nsl-cli/tests/tokbench_reference_encoder_gate.rs	tokbench_pretokenize_matches_the_crate_and_guards_the_u16_cast	multiproc	spawns cargo to build tools/tokbench, then runs the reference-encoder differential
 crates/nsl-cli/tests/train_checkpoint_resume_gpu.rs	gpu_resume_bit_exact_canonical	gpu	requires CUDA GPU
 crates/nsl-cli/tests/train_checkpoint_resume_gpu.rs	gpu_resume_bit_exact_canonical_bf16sr	gpu	requires CUDA GPU
@@ -431,6 +438,7 @@ crates/nsl-kir/src/kernels/optim.rs	split_round_trips_every_bit_pattern	diagnost
 crates/nsl-runtime/src/attention_tc.rs	tc_backward_matches_f64_reference_at_realistic_gradient_magnitudes	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/src/attention_tc.rs	tc_bf16_io_is_the_f32_kernel_rounded_once	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/src/attention_tc.rs	tc_backward_small_rows_keep_their_precision	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
+crates/nsl-runtime/src/attention_tc.rs	grouped_kv_is_the_expanded_computation_up_to_the_group_sum	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/src/attention_tc.rs	tc_ffi_forward_and_backward_match_the_reference	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/src/attention_tc.rs	tc_attention_kernel_times	diagnostic	diagnostic: times the tensor-core attention kernels at the production shapes
 crates/nsl-runtime/src/attention_tc.rs	tc_forward_matches_f64_reference	gpu	requires a CUDA GPU; run with --features cuda -- --ignored

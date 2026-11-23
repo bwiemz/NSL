@@ -1,0 +1,105 @@
+# sdpa_native_gqa.nsl — fixture for sdpa_native_gqa_gate.rs
+#
+# One attention block (RMSNorm -> grouped-query attention with RoPE ->
+# residual) under a weight-tied LM head, trained a few updates. The gate
+# compiles it twice: ATTN = GroupedQueryAttention (nsl.nn.gqa, which hands
+# scaled_dot_product_attention grouped K/V) and ATTN = ExpandedGqa below, the
+# stdlib's forward as it was before scaled_dot_product_attention took grouped
+# K/V: it expanded K and V to every query head in NSL source. The two models
+# have the same fields in the same order, so `--seed` initialises them alike.
+#
+# 4 query heads of 64 over 2 key/value heads: head_dim 64 is a tensor-core
+# attention shape on the GPU, and two query heads share each key/value head.
+
+from nsl.nn.norms import RMSNorm
+from nsl.nn.gqa import GroupedQueryAttention
+from nsl.nn.rope import RotaryEmbedding
+from nsl.nn.losses import cross_entropy
+
+model ExpandedGqa(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, dropout_p: float, max_seq_len: int, rope_theta: float, n_layers: int):
+    _d_model: Tensor = full([1], float(d_model))
+    _n_heads: Tensor = full([1], float(n_heads))
+    _n_kv_heads: Tensor = full([1], float(n_kv_heads))
+    _head_dim: Tensor = full([1], float(head_dim))
+    _n_rep: Tensor = full([1], float(n_heads // n_kv_heads))
+    _dropout_p: Tensor = full([1], dropout_p)
+    wq: Tensor = randn([d_model, n_heads * head_dim]) * sqrt(full([1], 2.0 / float(d_model + n_heads * head_dim)))
+    wk: Tensor = randn([d_model, n_kv_heads * head_dim]) * sqrt(full([1], 2.0 / float(d_model + n_kv_heads * head_dim)))
+    wv: Tensor = randn([d_model, n_kv_heads * head_dim]) * sqrt(full([1], 2.0 / float(d_model + n_kv_heads * head_dim)))
+    wo: Tensor = randn([n_heads * head_dim, d_model]) * sqrt(full([1], 2.0 / float(n_heads * head_dim + d_model))) * full([1], 1.0 / sqrt(full([1], float(2 * n_layers))).item())
+    rope: RotaryEmbedding = RotaryEmbedding(head_dim, max_seq_len, rope_theta)
+
+    fn forward(self, x: Tensor, training: bool) -> Tensor:
+        let s = x.shape
+        let batch = s[0]
+        let seq_len = s[1]
+        let nh = int(self._n_heads.item())
+        let nkv = int(self._n_kv_heads.item())
+        let hd = int(self._head_dim.item())
+        let n_rep = int(self._n_rep.item())
+        let dp = self._dropout_p.item()
+        let q = x @ self.wq
+        let k = x @ self.wk
+        let v = x @ self.wv
+        let q4 = q.reshape([batch, seq_len, nh, hd]).transpose(1, 2)
+        let k4 = k.reshape([batch, seq_len, nkv, hd]).transpose(1, 2)
+        let v4 = v.reshape([batch, seq_len, nkv, hd]).transpose(1, 2)
+        let q_rope = self.rope.forward(q4, seq_len)
+        let k_rope = self.rope.forward(k4, seq_len)
+        let k5 = k_rope.reshape([batch, nkv, 1, seq_len, hd])
+        let k_exp = k5.expand([batch, nkv, n_rep, seq_len, hd]).contiguous().reshape([batch, nh, seq_len, hd])
+        let v5 = v4.reshape([batch, nkv, 1, seq_len, hd])
+        let v_exp = v5.expand([batch, nkv, n_rep, seq_len, hd]).contiguous().reshape([batch, nh, seq_len, hd])
+        let scale = 1.0 / sqrt(float(hd))
+        let attn_out = scaled_dot_product_attention(q_rope, k_exp, v_exp, scale, true)
+        let attn_t = attn_out.transpose(1, 2)
+        let attn_flat = attn_t.reshape([batch, seq_len, nh * hd])
+        let out = attn_flat @ self.wo
+        return dropout(out, dp, training)
+
+model Probe:
+    embed: Tensor = randn([128, 256]) * full([1], 0.02)
+    norm: RMSNorm = RMSNorm(256)
+    attn: ATTN = ATTN(256, 4, 2, 64, 0.0, 128, 10000.0, 1)
+
+    fn forward_train(self, input_ids: Tensor, training: bool) -> Tensor:
+        let sh = input_ids.shape
+        let b = sh[0]
+        let s = sh[1]
+        let emb = embedding_lookup(self.embed, input_ids.reshape([b * s]))
+        let x = emb.reshape([b, s, 256])
+        let h = x + self.attn.forward(self.norm.forward(x), training)
+        return h @ self.embed.transpose(0, 1)
+
+let m = Probe()
+# GPU_PLACEMENT
+
+# 8 micro-batches of 2 x 128 tokens, 4 optimizer updates. Token ids stay in
+# the 128-row embedding. The gate appends `, precision="bf16"` to the train
+# header for its bf16 arms.
+let unit = arange(128)
+let tokens = unit.reshape([1, 128]).expand([16, 128]).contiguous().reshape([2048])
+let loader = DataLoader(tokens, batch_size=2, seq_len=128, shuffle=false, drop_last=true)
+
+print("LOSS_STREAM_BEGIN")
+
+train(model=m, epochs=1, grad_accumulation=2):
+    optimizer: AdamW(lr=0.01, weight_decay=0.0, beta1=0.9, beta2=0.95, eps=1e-8)
+    step(batch):
+        let logits = m.forward_train(batch.input_ids, true)
+        let ls = logits.shape
+        let flat_logits = logits.reshape([ls[0] * ls[1], ls[2]])
+        let flat_labels = batch.labels.reshape([ls[0] * ls[1]])
+        let loss = cross_entropy(flat_logits, flat_labels)
+    callbacks:
+        on_step(step, loss):
+            print(loss)
+
+print("LOSS_STREAM_END")
+print("WEIGHTS_BEGIN")
+print(m.attn.wq.sum())
+print(m.attn.wk.sum())
+print(m.attn.wv.sum())
+print(m.attn.wo.sum())
+print(m.embed.sum())
+print("WEIGHTS_END")

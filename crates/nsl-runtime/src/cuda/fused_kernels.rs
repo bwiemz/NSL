@@ -83,6 +83,24 @@ fn embedding_bwd_module(
     MODULES[slot].get_or_init(|| String::from_utf8(ptx(op, idx)).expect("PTX must be ASCII"))
 }
 
+/// The accumulating atomic scatter `nsl_embedding_bwd_acc_{f32,i32idx}`
+/// (`nsl_kir::kernels::embedding_bwd::build_accumulate`): adds `scale ·
+/// grad` rows into an output that keeps what it held — a tied embedding's
+/// gradient accumulation buffer. Built once per index dtype; NUL-terminated.
+pub(crate) fn embedding_bwd_acc_ptx(idx: nsl_kir::kernels::lookup::IndexDtype) -> &'static str {
+    use nsl_kir::kernels::lookup::IndexDtype;
+    use std::sync::OnceLock;
+    static MODULES: [OnceLock<String>; 2] = [OnceLock::new(), OnceLock::new()];
+    let slot = match idx {
+        IndexDtype::F32 => 0,
+        IndexDtype::I32 => 1,
+    };
+    MODULES[slot].get_or_init(|| {
+        String::from_utf8(nsl_kir::kernels::embedding_bwd::accumulate_ptx(idx))
+            .expect("PTX must be ASCII")
+    })
+}
+
 /// GPU embedding backward with i32 integer indices (mirrors
 /// `nsl_embedding_i32idx`'s ld.global.s32 + cvt.s64.s32 index read).
 pub(crate) fn embedding_bwd_i32idx_ptx() -> &'static str {

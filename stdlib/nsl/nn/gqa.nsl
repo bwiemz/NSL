@@ -63,7 +63,6 @@ model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, head_di
         let nh = int(self._n_heads.item())
         let nkv = int(self._n_kv_heads.item())
         let hd = int(self._head_dim.item())
-        let n_rep = int(self._n_rep.item())
         let dp = self._dropout_p.item()
 
         # Project Q, K, V
@@ -80,16 +79,20 @@ model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, head_di
         let q_rope = self.rope.forward(q4, seq_len)
         let k_rope = self.rope.forward(k4, seq_len)
 
-        # GQA: expand KV heads to match Q heads
-        let k5 = k_rope.reshape([batch, nkv, 1, seq_len, hd])
-        let k_exp = k5.expand([batch, nkv, n_rep, seq_len, hd]).contiguous().reshape([batch, nh, seq_len, hd])
-        let v5 = v4.reshape([batch, nkv, 1, seq_len, hd])
-        let v_exp = v5.expand([batch, nkv, n_rep, seq_len, hd]).contiguous().reshape([batch, nh, seq_len, hd])
+        # Grouped-query attention: K and V keep their `nkv` heads, each read
+        # by `nh / nkv` query heads (query head h reads key/value head
+        # h / (nh / nkv)). The tensor-core kernels read them in place and sum
+        # dK/dV over each group; every other path expands them itself (see
+        # nsl-runtime `sdpa_gqa`). The fused kernels read their operands
+        # row-major, so V's head view is copied once (a quarter of the
+        # expanded copy at 4 query heads per key/value head); RoPE already
+        # writes K row-major.
+        let v_c = v4.contiguous()
 
         # Fused attention: uses FlashAttention when on GPU, naive when on CPU.
         # Output shape: [batch, heads, seq, head_dim]
         let scale = 1.0 / sqrt(float(hd))
-        let attn_out = scaled_dot_product_attention(q_rope, k_exp, v_exp, scale, true)
+        let attn_out = scaled_dot_product_attention(q_rope, k_rope, v_c, scale, true)
 
         # Reshape back: [batch, heads, seq, head_dim] -> [batch, seq, n_heads * head_dim]
         let attn_t = attn_out.transpose(1, 2)
@@ -146,6 +149,7 @@ model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, head_di
         let q_rope = self.rope.forward_with_positions(q4, position_ids)
         let k_rope = self.rope.forward_with_positions(k4, position_ids)
 
+        # The packed builtin reads K and V with Q's head count: expand them.
         let k5 = k_rope.reshape([batch, nkv, 1, seq_len, hd])
         let k_exp = k5.expand([batch, nkv, n_rep, seq_len, hd]).contiguous().reshape([batch, nh, seq_len, hd])
         let v5 = v4.reshape([batch, nkv, 1, seq_len, hd])
@@ -193,6 +197,7 @@ model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, head_di
         let q_rope = self.rope.forward(q4, seq_len)
         let k_rope = self.rope.forward(k4, seq_len)
 
+        # The masked builtin reads K and V with Q's head count: expand them.
         let k5 = k_rope.reshape([batch, nkv, 1, seq_len, hd])
         let k_exp = k5.expand([batch, nkv, n_rep, seq_len, hd]).contiguous().reshape([batch, nh, seq_len, hd])
         let v5 = v4.reshape([batch, nkv, 1, seq_len, hd])

@@ -1275,6 +1275,15 @@ pub static REGISTRY: &[EnvVar] = &[
         "Set to 1 to disable the fused flash-attention SDPA forward kernel and always run the decomposed attention path."
     ),
     var!(
+        "NSL_SDPA_GQA_EXPAND",
+        Bool,
+        "1 only",
+        "off (tensor-core attention reads grouped K/V in place)",
+        Behavior,
+        Runtime,
+        "Set to 1 to expand grouped K/V to every query head for the attention kernels and sum dK/dV per group after (pre-native GQA)."
+    ),
+    var!(
         "NSL_SDPA_TIER_B_DISABLE",
         Bool,
         "1 only",
@@ -1489,6 +1498,15 @@ pub static REGISTRY: &[EnvVar] = &[
         Test,
         Test,
         "Test harness only: marks the re-exec'd timing child of the TF32 matmul mode gate, which prints one PROBE line for the parent."
+    ),
+    var!(
+        "NSL_TIED_EMBED_INPLACE",
+        Bool,
+        "0 only",
+        "on (a tied embedding's gradient is accumulated in place)",
+        Behavior,
+        Compile,
+        "Set to 0 at build time to materialise a tied embedding's two gradient contributions and add their sum, instead of in place."
     ),
     var!(
         "NSL_TP_BARRIER_TIMEOUT_SECS",

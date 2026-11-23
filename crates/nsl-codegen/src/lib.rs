@@ -133,6 +133,7 @@ pub mod vmap;
 pub mod wengert;
 pub mod wengert_lower;
 pub mod wgrad_fusion;
+pub mod tied_embed_fusion;
 
 // --- Quantization & precision --------------------------------------------
 pub mod bitnet;
