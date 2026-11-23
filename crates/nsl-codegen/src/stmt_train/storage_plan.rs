@@ -135,13 +135,20 @@ fn matmul_of_param(prod: &HashMap<VarId, &WengertOp>, v: VarId) -> Option<VarId>
 
 /// Whether `v` is read, directly or through transposes, reshapes and
 /// copies of it, by at least one GEMM and by nothing else (a `shape` read
-/// aside): rule 4b's GEMM-ready gradient.
+/// aside): rule 4b's GEMM-ready gradient. A summed input gradient's GEMM
+/// (`matmul_acc`, `source_ad::fuse_dgrad_accumulate`) counts when `v` is one
+/// of its two GEMM operands, not its accumulator.
 fn feeds_only_gemms(rd: &HashMap<VarId, Vec<&WengertOp>>, v: VarId) -> bool {
     let mut stack = vec![v];
     let mut gemms = 0usize;
     while let Some(x) = stack.pop() {
         for r in rd.get(&x).map(Vec::as_slice).unwrap_or_default() {
-            if matches!(r.op, PrimalOp::Matmul) {
+            if matches!(r.op, PrimalOp::Matmul)
+                || (is_passthrough(&r.op, "matmul_acc")
+                    && r.inputs.len() == 3
+                    && r.inputs[..2].contains(&x)
+                    && r.inputs[2] != x)
+            {
                 gemms += 1;
             } else if is_passthrough(&r.op, "shape") {
                 continue;
@@ -1707,6 +1714,52 @@ mod tests {
         let p2 = plan(&primal, &adj2, &HashMap::new()).expect("plans");
         assert_eq!(p2.out.get(&144), Some(&F32));
         assert_eq!(p2.out.get(&152), Some(&Bf16));
+    }
+
+    /// Rule 4b with the norm output's gradient summed by GEMM accumulation
+    /// (`source_ad::fuse_dgrad_accumulate`: v's dgrad, then k's and q's
+    /// accumulated onto it): the RoPE adjoints still feed only GEMMs, as the
+    /// accumulations' GEMM operands, and are written bf16; each accumulation
+    /// reads a bf16 gradient into the f32 sum. A view of q's adjoint read as
+    /// an accumulator is not a GEMM operand: q's adjoint stays f32.
+    #[test]
+    fn rule_4b_counts_a_dgrad_accumulation_as_a_gemm() {
+        use Storage::{Bf16, F32};
+        let (primal, mut adjoint) = attention_block();
+        adjoint.ops.retain(|o| ![181, 188, 190].contains(&o.result));
+        for o in adjoint.ops.iter_mut() {
+            match o.result {
+                182 => (o.op, o.inputs) = (pt("matmul_acc"), vec![168, 180, 176]),
+                189 => (o.op, o.inputs) = (pt("matmul_acc"), vec![172, 187, 182]),
+                217 => o.inputs[0] = 189,
+                _ => {}
+            }
+        }
+        let got = plan(&primal, &adjoint, &HashMap::new()).expect("plans");
+        for (v, st) in [(144, Bf16), (152, Bf16), (182, F32), (189, F32)] {
+            assert_eq!(got.out.get(&v), Some(&st), "VarId {v}");
+        }
+        assert!(!got.param_gemm.contains(&182) && !got.param_gemm.contains(&189));
+        let off = plan_with_params(
+            &primal,
+            &adjoint,
+            &HashMap::new(),
+            &[],
+            &HashSet::new(),
+            false,
+        )
+        .expect("plans");
+        assert_eq!(
+            (off.out.get(&144), off.out.get(&152)),
+            (Some(&F32), Some(&F32))
+        );
+        let mut acc = adjoint.clone();
+        acc.ops.push(op(301, pt("matmul_acc"), &[164, 187, 172]));
+        let p = plan(&primal, &acc, &HashMap::new()).expect("plans");
+        assert_eq!(
+            (p.out.get(&144), p.out.get(&152)),
+            (Some(&Bf16), Some(&F32))
+        );
     }
 
     /// The 500M recipe's attention: `dropout(Wo)` before the residual add.
