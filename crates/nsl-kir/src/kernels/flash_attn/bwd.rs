@@ -64,6 +64,9 @@ pub struct BwdConfig {
     /// How Q, K, V, O, dO, dQ, dK and dV are stored (see
     /// [`super::fwd::FwdConfig::io`]); `lse`, `D` and `gmax` stay f32.
     pub io: Storage,
+    /// Heaviest-first grid order for the dQ and dK/dV kernels (causal only;
+    /// see [`super::fwd::FwdConfig::lpt`] and [`super::grid_order`]).
+    pub lpt: bool,
 }
 
 /// Warps per CTA of the pre-pass, and rows each warp reduces.
@@ -83,7 +86,7 @@ impl BwdConfig {
         // 0.60 ms and dK/dV 0.76 ms at 8 warps x 32.
         let (dq_warps, dq_block_n, dkdv_warps, dkdv_block_q) =
             if head_dim > 64 { (8, 32, 8, 32) } else { (4, 32, 4, 32) };
-        BwdConfig { head_dim, causal, dq_warps, dq_block_n, dkdv_warps, dkdv_block_q, io: Storage::F32 }
+        BwdConfig { head_dim, causal, dq_warps, dq_block_n, dkdv_warps, dkdv_block_q, io: Storage::F32, lpt: false }
     }
 
     pub fn supported(head_dim: u32) -> bool {
@@ -99,8 +102,18 @@ impl BwdConfig {
         BwdConfig { io, ..self }
     }
 
+    /// This variant with the heaviest-first grid order (a no-op without
+    /// causal masking).
+    pub fn with_lpt(self, on: bool) -> BwdConfig {
+        BwdConfig { lpt: on && self.causal, ..self }
+    }
+
     fn io_suffix(&self) -> &'static str {
         if self.io == Storage::Bf16 { "_bf16" } else { "" }
+    }
+
+    fn lpt_suffix(&self) -> &'static str {
+        if self.lpt { "_lpt" } else { "" }
     }
 
     /// The same problem with the pre-pass's (tiling-independent) identity.
@@ -136,7 +149,14 @@ impl BwdConfig {
     // ── dQ ──
 
     pub fn dq_kernel_name(&self) -> String {
-        format!("nsl_flash_tc_bwd_dq_{}_w{}_n{}{}", self.tag(), self.dq_warps, self.dq_block_n, self.io_suffix())
+        format!(
+            "nsl_flash_tc_bwd_dq_{}_w{}_n{}{}{}",
+            self.tag(),
+            self.dq_warps,
+            self.dq_block_n,
+            self.io_suffix(),
+            self.lpt_suffix()
+        )
     }
 
     pub fn dq_block_m(&self) -> u32 {
@@ -152,7 +172,7 @@ impl BwdConfig {
     }
 
     pub fn dq_grid(&self, batch: u32, heads: u32, seq: u32) -> [u32; 3] {
-        [seq.div_ceil(self.dq_block_m()), batch * heads, 1]
+        super::grid_order(self.lpt, seq.div_ceil(self.dq_block_m()), batch * heads)
     }
 
     /// `q, k, v, dout, lse, dvec, dq` f32 device pointers, `seq, heads,
@@ -164,7 +184,14 @@ impl BwdConfig {
     // ── dK/dV ──
 
     pub fn dkdv_kernel_name(&self) -> String {
-        format!("nsl_flash_tc_bwd_dkdv_{}_w{}_q{}{}", self.tag(), self.dkdv_warps, self.dkdv_block_q, self.io_suffix())
+        format!(
+            "nsl_flash_tc_bwd_dkdv_{}_w{}_q{}{}{}",
+            self.tag(),
+            self.dkdv_warps,
+            self.dkdv_block_q,
+            self.io_suffix(),
+            self.lpt_suffix()
+        )
     }
 
     pub fn dkdv_block_n(&self) -> u32 {
@@ -180,7 +207,7 @@ impl BwdConfig {
     }
 
     pub fn dkdv_grid(&self, batch: u32, kv_heads: u32, seq: u32) -> [u32; 3] {
-        [seq.div_ceil(self.dkdv_block_n()), batch * kv_heads, 1]
+        super::grid_order(self.lpt, seq.div_ceil(self.dkdv_block_n()), batch * kv_heads)
     }
 
     /// The dK/dV kernel's dynamic shared memory, in bytes (the launch
@@ -319,10 +346,7 @@ pub fn build_dq(cfg: BwdConfig) -> KernelIR {
     let tid = g.var(U32);
     g.b.emit(KirOp::ThreadId(tid, 0));
     let ln = Lane::new(&mut g, tid);
-    let qt_raw = g.var(U32);
-    g.b.emit(KirOp::BlockIdx(qt_raw, 0));
-    let bh = g.var(U32);
-    g.b.emit(KirOp::BlockIdx(bh, 1));
+    let (qt_raw, bh) = super::tile_and_row(&mut g, cfg.lpt);
     let one = g.u32c(1);
 
     let n_qt = {
@@ -718,10 +742,7 @@ pub fn build_dkdv(cfg: BwdConfig) -> KernelIR {
     let tid = g.var(U32);
     g.b.emit(KirOp::ThreadId(tid, 0));
     let ln = Lane::new(&mut g, tid);
-    let kt = g.var(U32);
-    g.b.emit(KirOp::BlockIdx(kt, 0));
-    let bkv = g.var(U32);
-    g.b.emit(KirOp::BlockIdx(bkv, 1));
+    let (kt, bkv) = super::tile_and_row(&mut g, cfg.lpt);
     let one = g.u32c(1);
     let k0 = g.mul_u32c(kt, bn);
     let b_idx = g.div(bkv, kv_heads);
@@ -1056,8 +1077,11 @@ mod tests {
     #[test]
     fn every_backward_variant_verifies_and_lowers() {
         for hd in BwdConfig::HEAD_DIMS {
-            for causal in [false, true] {
-                let cfg = BwdConfig::new(hd, causal);
+            for (causal, lpt) in [(false, false), (true, false), (true, true)] {
+                let cfg = BwdConfig::new(hd, causal).with_lpt(lpt);
+                assert_eq!(cfg.lpt, lpt);
+                assert_eq!(cfg.dkdv_kernel_name().ends_with("_lpt"), lpt);
+                assert_eq!(cfg.dq_kernel_name().ends_with("_lpt"), lpt);
                 for (name, ir) in [
                     (cfg.pre_kernel_name(), build_pre(cfg)),
                     (cfg.dq_kernel_name(), build_dq(cfg)),

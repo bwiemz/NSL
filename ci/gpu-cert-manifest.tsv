@@ -437,6 +437,7 @@ crates/nsl-codegen/tests/wggo_sidecar_population.rs	run_harness_stub_with_wggo_h
 crates/nsl-kir/src/kernels/optim.rs	split_round_trips_every_bit_pattern	diagnostic	diagnostic: exhaustive 2^32 sweep of the split round trip (a minute in debug; run --ignored --release)
 crates/nsl-runtime/src/attention_tc.rs	tc_backward_matches_f64_reference_at_realistic_gradient_magnitudes	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/src/attention_tc.rs	tc_bf16_io_is_the_f32_kernel_rounded_once	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
+crates/nsl-runtime/src/attention_tc.rs	the_lpt_grid_order_gives_the_same_bits	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/src/attention_tc.rs	tc_backward_small_rows_keep_their_precision	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/src/attention_tc.rs	grouped_kv_is_the_expanded_computation_up_to_the_group_sum	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/src/attention_tc.rs	tc_ffi_forward_and_backward_match_the_reference	gpu	requires a CUDA GPU; run with --features cuda -- --ignored

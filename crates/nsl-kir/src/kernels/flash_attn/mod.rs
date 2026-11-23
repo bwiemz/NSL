@@ -418,6 +418,36 @@ impl G {
     }
 }
 
+/// The launch grid of a kernel with `tiles` sequence tiles per `rows`
+/// (`batch · heads` or `batch · kv_heads`) row: `[tiles, rows, 1]`, or with
+/// `lpt` (largest processing time first) `[rows, tiles, 1]`.
+///
+/// Under causal masking a CTA's work grows (forward, dQ) or shrinks (dK/dV)
+/// with its tile index, by up to the tile count. The kernels already map
+/// `blockIdx` so that within a row the heaviest tile comes first; but the
+/// block scheduler dispatches in `blockIdx` order, x fastest, so with x over
+/// tiles the heaviest CTAs of the last rows are dispatched only after every
+/// earlier row's light ones, and finish last. With x over rows, every row's
+/// heaviest tile is dispatched in the first wave and the lightest CTAs fill
+/// the end: the greedy longest-first schedule. It matters most for the
+/// grouped dK/dV kernel, whose CTAs each walk a whole group of query heads,
+/// so there are `heads / kv_heads` times fewer, longer ones. Which CTA does
+/// which tile is unchanged, so the results are the same bits.
+pub(crate) fn grid_order(lpt: bool, tiles: u32, rows: u32) -> [u32; 3] {
+    if lpt { [rows, tiles, 1] } else { [tiles, rows, 1] }
+}
+
+/// The `(tile, row)` block indices of a kernel launched with
+/// [`grid_order`]`(lpt, ..)`.
+pub(crate) fn tile_and_row(g: &mut G, lpt: bool) -> (VarId, VarId) {
+    let (tile_axis, row_axis) = if lpt { (1, 0) } else { (0, 1) };
+    let tile = g.var(KirType::U32);
+    g.b.emit(KirOp::BlockIdx(tile, tile_axis));
+    let row = g.var(KirType::U32);
+    g.b.emit(KirOp::BlockIdx(row, row_axis));
+    (tile, row)
+}
+
 /// The power of two that lifts a gradient whose largest magnitude has the
 /// f32 bit pattern `max_bits` (non-negative, so its biased exponent is
 /// `max_bits >> 23`) into `[2^GRAD_SCALE_EXP, 2^(GRAD_SCALE_EXP + 1))`, and

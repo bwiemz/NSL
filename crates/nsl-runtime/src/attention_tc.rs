@@ -134,10 +134,26 @@ pub(crate) fn forward(a: &FwdLaunch) -> CUresult {
     forward_io(a, nsl_kir::kernels::storage::Storage::F32)
 }
 
+/// Whether causal launches use the heaviest-first grid order
+/// ([`FwdConfig::lpt`], [`BwdConfig::lpt`]). `NSL_TC_ATTN_LPT=0` restores the
+/// tile-major order (the same per-CTA work and results, dispatched in a
+/// different order); read once.
+fn lpt_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NSL_TC_ATTN_LPT").ok().as_deref() != Some("0"))
+}
+
+/// The heaviest-first grid puts the tile count in `gridDim.y`.
+fn lpt_fits(tiles: u32) -> bool {
+    u64::from(tiles) <= MAX_GRID_Y
+}
+
 /// [`forward`] with Q, K, V and O stored as `io` (bf16: option (a) of bf16
 /// activation storage; the log-sum-exp stays f32).
 pub(crate) fn forward_io(a: &FwdLaunch, io: nsl_kir::kernels::storage::Storage) -> CUresult {
-    forward_with(FwdConfig::new(a.head_dim as u32, a.causal).with_io(io), a)
+    let cfg = FwdConfig::new(a.head_dim as u32, a.causal).with_io(io);
+    let lpt = lpt_enabled() && lpt_fits((a.seq as u32).div_ceil(cfg.block_m()));
+    forward_with(cfg.with_lpt(lpt), a)
 }
 
 /// [`forward`] with an explicit tiling (`cfg` must match `a`'s head_dim and
@@ -204,7 +220,12 @@ pub(crate) fn backward(a: &BwdLaunch) -> CUresult {
 
 /// [`backward`] with Q, K, V, O, dO, dQ, dK and dV stored as `io`.
 pub(crate) fn backward_io(a: &BwdLaunch, io: nsl_kir::kernels::storage::Storage) -> CUresult {
-    backward_with(BwdConfig::new(a.head_dim as u32, a.causal).with_io(io), a, [true, true, true])
+    let cfg = BwdConfig::new(a.head_dim as u32, a.causal).with_io(io);
+    let seq = a.seq as u32;
+    let lpt = lpt_enabled()
+        && lpt_fits(seq.div_ceil(cfg.dq_block_m()))
+        && lpt_fits(seq.div_ceil(cfg.dkdv_block_n()));
+    backward_with(cfg.with_lpt(lpt), a, [true, true, true])
 }
 
 /// [`backward`] with explicit tilings, launching only the kernels `run`
@@ -802,6 +823,125 @@ pub(crate) mod tests {
         }
     }
 
+    /// Every output of one forward and backward with explicit kernel
+    /// configurations, as the raw bytes the kernels wrote.
+    pub(crate) struct RawRun {
+        pub o: Vec<u8>,
+        pub lse: Vec<u8>,
+        pub dq: Vec<u8>,
+        pub dk: Vec<u8>,
+        pub dv: Vec<u8>,
+    }
+
+    /// Forward (`fcfg`) then backward (`bcfg`) on operands given as raw bytes
+    /// in `bcfg.io` storage (the backward reads the forward's O and lse).
+    pub(crate) fn raw_run(sh: Shape, fcfg: FwdConfig, bcfg: BwdConfig, q: &[u8], k: &[u8], v: &[u8], dout: &[u8]) -> RawRun {
+        let w = bcfg.io.bytes();
+        let n_q = sh.b * sh.h * sh.s * sh.d;
+        let n_kv = sh.b * sh.kvh * sh.s * sh.d;
+        let n_l = sh.b * sh.h * sh.s;
+        let up = |bytes: &[u8]| {
+            let p = inner::alloc_managed(bytes.len().max(1));
+            inner::memcpy_htod(p, bytes.as_ptr() as *const c_void, bytes.len());
+            p
+        };
+        let fresh = |n: usize| {
+            let p = inner::alloc_managed(n.max(1));
+            inner::memset_d8_value(p, 0xFF, n.max(1));
+            p
+        };
+        let (qd, kd, vd, dod) = (up(q), up(k), up(v), up(dout));
+        let (od, ld) = (fresh(n_q * w), fresh(n_l * 4));
+        let (dqd, dkd, dvd) = (fresh(n_q * w), fresh(n_kv * w), fresh(n_kv * w));
+        let (dvec, gmax) = (fresh(n_l * 4), fresh(sh.b * sh.h * 4));
+        let scale = 1.0 / (sh.d as f32).sqrt();
+        let rc = forward_with(
+            fcfg,
+            &FwdLaunch {
+                q: qd as u64, k: kd as u64, v: vd as u64, o: od as u64, lse: ld as u64,
+                batch: sh.b, heads: sh.h, kv_heads: sh.kvh, seq: sh.s, head_dim: sh.d, scale, causal: sh.causal,
+            },
+        );
+        assert_eq!(rc, CUresult::CUDA_SUCCESS, "{sh:?} forward {}", fcfg.kernel_name());
+        let rc = backward_with(
+            bcfg,
+            &BwdLaunch {
+                q: qd as u64, k: kd as u64, v: vd as u64, o: od as u64, lse: ld as u64, dout: dod as u64,
+                dq: dqd as u64, dk: dkd as u64, dv: dvd as u64, dvec: dvec as u64, gmax: gmax as u64,
+                batch: sh.b, heads: sh.h, kv_heads: sh.kvh, seq: sh.s, head_dim: sh.d, scale, causal: sh.causal,
+            },
+            [true, true, true],
+        );
+        assert_eq!(rc, CUresult::CUDA_SUCCESS, "{sh:?} backward {}", bcfg.dkdv_kernel_name());
+        assert_eq!(unsafe { cudarc::driver::sys::cuCtxSynchronize() }, CUresult::CUDA_SUCCESS, "{sh:?}");
+        let get = |p: *mut c_void, n: usize| {
+            let mut out = vec![0u8; n];
+            inner::memcpy_dtoh(out.as_mut_ptr() as *mut c_void, p as *const c_void, n);
+            out
+        };
+        let r = RawRun {
+            o: get(od, n_q * w),
+            lse: get(ld, n_l * 4),
+            dq: get(dqd, n_q * w),
+            dk: get(dkd, n_kv * w),
+            dv: get(dvd, n_kv * w),
+        };
+        for p in [qd, kd, vd, dod, od, ld, dqd, dkd, dvd, dvec, gmax] {
+            inner::free_managed(p);
+        }
+        r
+    }
+
+    /// `x` (f32 values) as raw bytes in `io` storage (bf16: rounded to nearest even).
+    pub(crate) fn to_bytes(x: &[f32], io: nsl_kir::kernels::storage::Storage) -> Vec<u8> {
+        match io {
+            nsl_kir::kernels::storage::Storage::F32 => x.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            nsl_kir::kernels::storage::Storage::Bf16 => x.iter().flat_map(|&v| bf16_bits(v).to_le_bytes()).collect(),
+        }
+    }
+
+    /// The heaviest-first grid order changes which CTA is dispatched when and
+    /// nothing else: forward, dQ and dK/dV give the same bits as the
+    /// tile-major order, with grouped K/V, ragged tails, both head dims and
+    /// both storages, at realistic gradient magnitudes. Causal only (without
+    /// causal masking there is no such variant).
+    #[test]
+    #[ignore = "requires a CUDA GPU; run with --features cuda -- --ignored"]
+    fn the_lpt_grid_order_gives_the_same_bits() {
+        if !gpu() {
+            return;
+        }
+        use nsl_kir::kernels::storage::Storage;
+        let cases = [
+            (Shape { b: 2, h: 8, kvh: 2, s: 333, d: 64, causal: true }, Storage::F32),
+            (Shape { b: 2, h: 8, kvh: 2, s: 256, d: 64, causal: true }, Storage::Bf16),
+            (Shape { b: 1, h: 4, kvh: 4, s: 200, d: 128, causal: true }, Storage::F32),
+            (Shape { b: 3, h: 6, kvh: 3, s: 130, d: 128, causal: true }, Storage::Bf16),
+        ];
+        for (n, (sh, io)) in cases.into_iter().enumerate() {
+            let mut rng = Lcg(0x1b7 + n as u64);
+            let q = to_bytes(&rng.vec(sh.b * sh.h * sh.s * sh.d, 1.0), io);
+            let k = to_bytes(&rng.vec(sh.b * sh.kvh * sh.s * sh.d, 1.0), io);
+            let v = to_bytes(&rng.vec(sh.b * sh.kvh * sh.s * sh.d, 1.0), io);
+            let dout = to_bytes(&rng.vec(sh.b * sh.h * sh.s * sh.d, 1e-6), io);
+            let f = FwdConfig::new(sh.d as u32, sh.causal).with_io(io);
+            let b = BwdConfig::new(sh.d as u32, sh.causal).with_io(io);
+            let tile_major = raw_run(sh, f, b, &q, &k, &v, &dout);
+            let lpt = raw_run(sh, f.with_lpt(true), b.with_lpt(true), &q, &k, &v, &dout);
+            assert!(f.with_lpt(true).lpt && b.with_lpt(true).lpt);
+            for (what, x, y) in [
+                ("O", &tile_major.o, &lpt.o),
+                ("lse", &tile_major.lse, &lpt.lse),
+                ("dQ", &tile_major.dq, &lpt.dq),
+                ("dK", &tile_major.dk, &lpt.dk),
+                ("dV", &tile_major.dv, &lpt.dv),
+            ] {
+                assert!(x.iter().any(|&byte| byte != 0xFF), "{sh:?} {what}: unwritten");
+                assert!(x == y, "{sh:?} {io:?} {what}: the heaviest-first order changed the result");
+            }
+        }
+    }
+
     #[test]
     #[ignore = "requires a CUDA GPU; run with --features cuda -- --ignored"]
     fn tc_backward_small_rows_keep_their_precision() {
@@ -1059,6 +1199,43 @@ pub(crate) mod tests {
         }
     }
 
+    /// Median GPU milliseconds of one `f()` (which may launch several
+    /// kernels), over `n` calls after 3 warm-up calls: a CUDA event pair is
+    /// recorded on the compute stream around each call.
+    pub(crate) fn gpu_ms_per_call(f: &dyn Fn() -> CUresult, n: usize) -> f64 {
+        use crate::cuda::inner::{
+            cu_event_create_checked, cu_event_destroy, cu_event_elapsed_time_raw, cu_event_record_on_current_stream,
+        };
+        for _ in 0..3 {
+            assert_eq!(f(), CUresult::CUDA_SUCCESS);
+        }
+        let evs: Vec<(u64, u64)> = (0..n)
+            .map(|_| unsafe { (cu_event_create_checked().expect("event"), cu_event_create_checked().expect("event")) })
+            .collect();
+        for &(a, b) in &evs {
+            unsafe {
+                assert_eq!(cu_event_record_on_current_stream(a), CUresult::CUDA_SUCCESS);
+                assert_eq!(f(), CUresult::CUDA_SUCCESS);
+                assert_eq!(cu_event_record_on_current_stream(b), CUresult::CUDA_SUCCESS);
+            }
+        }
+        assert_eq!(unsafe { cudarc::driver::sys::cuCtxSynchronize() }, CUresult::CUDA_SUCCESS);
+        let mut ts: Vec<f64> = evs
+            .iter()
+            .map(|&(a, b)| {
+                let mut ms = 0f32;
+                assert_eq!(unsafe { cu_event_elapsed_time_raw(&mut ms, a, b) }, CUresult::CUDA_SUCCESS);
+                unsafe {
+                    cu_event_destroy(a);
+                    cu_event_destroy(b);
+                }
+                ms as f64
+            })
+            .collect();
+        ts.sort_by(f64::total_cmp);
+        ts[n / 2]
+    }
+
     /// Kernel time per call at the production recipes' attention shapes
     /// (Coder-1B: batch 2, 32 heads, seq 2048, head_dim 64; Coder-500M:
     /// batch 2, 20 heads, seq 1024), K/V expanded to every head as the
@@ -1067,7 +1244,10 @@ pub(crate) mod tests {
     /// defaults in `FwdConfig::new` / `BwdConfig::new` come from. Prints;
     /// asserts nothing but successful launches. FLOPs: the forward's two
     /// products; dQ recomputes S and dP and forms dQ (1.5x); dK/dV forms
-    /// S, dV, dP and dK (2x).
+    /// S, dV, dP and dK (2x). Each default is also timed with the
+    /// heaviest-first grid order (`lpt`, causal only). Times are the median
+    /// GPU time per call between CUDA events recorded around each call, so a
+    /// loaded host (nslq runs at idle priority) does not inflate them.
     #[test]
     #[ignore = "diagnostic: times the tensor-core attention kernels at the production shapes"]
     fn tc_attention_kernel_times() {
@@ -1078,6 +1258,7 @@ pub(crate) mod tests {
             ("1B expanded", Shape { b: 2, h: 32, kvh: 32, s: 2048, d: 64, causal: true }),
             ("1B gqa", Shape { b: 2, h: 32, kvh: 8, s: 2048, d: 64, causal: true }),
             ("500M expanded", Shape { b: 2, h: 20, kvh: 20, s: 1024, d: 64, causal: true }),
+            ("500M gqa", Shape { b: 2, h: 20, kvh: 10, s: 1024, d: 64, causal: true }),
             ("hd128", Shape { b: 2, h: 16, kvh: 16, s: 2048, d: 128, causal: true }),
         ];
         let mut warm = true;
@@ -1129,19 +1310,7 @@ pub(crate) mod tests {
                 scale: 0.125,
                 causal: sh.causal,
             };
-            let time = |f: &dyn Fn() -> CUresult| {
-                for _ in 0..3 {
-                    assert_eq!(f(), CUresult::CUDA_SUCCESS);
-                }
-                unsafe { cudarc::driver::sys::cuCtxSynchronize() };
-                let n = 20;
-                let t0 = std::time::Instant::now();
-                for _ in 0..n {
-                    assert_eq!(f(), CUresult::CUDA_SUCCESS);
-                }
-                assert_eq!(unsafe { cudarc::driver::sys::cuCtxSynchronize() }, CUresult::CUDA_SUCCESS);
-                t0.elapsed().as_secs_f64() * 1e3 / n as f64
-            };
+            let time = |f: &dyn Fn() -> CUresult| gpu_ms_per_call(f, 20);
             if warm {
                 // Bring the clocks up (and JIT the default modules) before
                 // the first timed configuration.
@@ -1167,6 +1336,11 @@ pub(crate) mod tests {
                 let mark = if cfg == def { " (default)" } else { "" };
                 eprintln!("{label}: forward w{warps} n{block_n}: {t:.3} ms, {:.1} TFLOPS{mark}", flops / t / 1e9);
             }
+            if sh.causal {
+                let cfg = def.with_lpt(true);
+                let t = time(&|| forward_with(cfg, &fl));
+                eprintln!("{label}: forward default, lpt grid: {t:.3} ms, {:.1} TFLOPS", flops / t / 1e9);
+            }
             assert_eq!(forward(&fl), CUresult::CUDA_SUCCESS);
             let bdef = BwdConfig::new(hd, sh.causal);
             let t_pre = time(&|| backward_with(bdef, &bl, [true, false, false]));
@@ -1177,6 +1351,11 @@ pub(crate) mod tests {
                 let mark = if cfg == bdef { " (default)" } else { "" };
                 eprintln!("{label}: dQ w{warps} n{block_n}: {t:.3} ms, {:.1} TFLOPS{mark}", 1.5 * flops / t / 1e9);
             }
+            if sh.causal {
+                let cfg = bdef.with_lpt(true);
+                let t = time(&|| backward_with(cfg, &bl, [false, true, false]));
+                eprintln!("{label}: dQ default, lpt grid: {t:.3} ms, {:.1} TFLOPS", 1.5 * flops / t / 1e9);
+            }
             for &(warps, block_q) in tilings {
                 let cfg = BwdConfig { dkdv_warps: warps, dkdv_block_q: block_q, ..bdef };
                 if cfg.dkdv_smem_bytes() > nsl_kir::kernel_ir::SMEM_DYNAMIC_BUDGET {
@@ -1185,6 +1364,11 @@ pub(crate) mod tests {
                 let t = time(&|| backward_with(cfg, &bl, [false, false, true]));
                 let mark = if cfg == bdef { " (default)" } else { "" };
                 eprintln!("{label}: dK/dV w{warps} q{block_q}: {t:.3} ms, {:.1} TFLOPS{mark}", 2.0 * flops / t / 1e9);
+            }
+            if sh.causal {
+                let cfg = bdef.with_lpt(true);
+                let t = time(&|| backward_with(cfg, &bl, [false, false, true]));
+                eprintln!("{label}: dK/dV default, lpt grid: {t:.3} ms, {:.1} TFLOPS", 2.0 * flops / t / 1e9);
             }
             let tb = time(&|| backward(&bl));
             eprintln!("{label}: whole backward (defaults) {tb:.3} ms");

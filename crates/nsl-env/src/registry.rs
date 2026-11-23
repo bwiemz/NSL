@@ -1437,6 +1437,15 @@ pub static REGISTRY: &[EnvVar] = &[
         "Set to 0 to serve unpacked scaled_dot_product_attention with the kernels before the tensor-core ones (f16 output, atomic dQ, CPU backward on tape AD)."
     ),
     var!(
+        "NSL_TC_ATTN_LPT",
+        Bool,
+        "0 only",
+        "on (causal tensor-core attention kernels dispatch their heaviest CTAs first)",
+        Perf,
+        Runtime,
+        "Set to 0 to launch the causal tensor-core attention kernels in tile-major grid order (same results, the previous CTA dispatch order)."
+    ),
+    var!(
         "NSL_TENSOR_TO_DESC_NULL_CHILD",
         Bool,
         "present (any value)",

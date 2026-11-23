@@ -47,6 +47,13 @@ pub struct FwdConfig {
     /// activation storage: read and widened, the f16 tensor-core operands as
     /// before, O rounded once to bf16 on store). The log-sum-exp is f32.
     pub io: Storage,
+    /// Heaviest-first CTA order across the whole grid (causal only): the
+    /// grid's x runs over `batch · heads` and y over query tiles, heaviest
+    /// first, so the CTAs that walk the most key tiles are dispatched before
+    /// any lighter one (see [`grid_order`](super::grid_order)). Off, x runs
+    /// over query tiles (heaviest first within each `batch · head` row only).
+    /// The arithmetic of every CTA is the same either way.
+    pub lpt: bool,
 }
 
 impl FwdConfig {
@@ -61,12 +68,18 @@ impl FwdConfig {
     /// `tc_attention_kernel_times` in nsl-runtime's `attention_tc.rs`).
     pub fn new(head_dim: u32, causal: bool) -> FwdConfig {
         let (warps, block_n) = default_fwd_tiling(head_dim);
-        FwdConfig { head_dim, causal, warps, block_n, io: Storage::F32 }
+        FwdConfig { head_dim, causal, warps, block_n, io: Storage::F32, lpt: false }
     }
 
     /// This variant with its Q/K/V/O stored as `io`.
     pub fn with_io(self, io: Storage) -> FwdConfig {
         FwdConfig { io, ..self }
+    }
+
+    /// This variant with the heaviest-first grid order (a no-op without
+    /// causal masking, where every CTA does the same work).
+    pub fn with_lpt(self, on: bool) -> FwdConfig {
+        FwdConfig { lpt: on && self.causal, ..self }
     }
 
     pub fn block_m(&self) -> u32 {
@@ -84,18 +97,20 @@ impl FwdConfig {
     /// The `.visible .entry` name; the launcher launches by it.
     pub fn kernel_name(&self) -> String {
         format!(
-            "nsl_flash_tc_fwd_d{}_{}_w{}_n{}{}",
+            "nsl_flash_tc_fwd_d{}_{}_w{}_n{}{}{}",
             self.head_dim,
             if self.causal { "causal" } else { "full" },
             self.warps,
             self.block_n,
-            if self.io == Storage::Bf16 { "_bf16" } else { "" }
+            if self.io == Storage::Bf16 { "_bf16" } else { "" },
+            if self.lpt { "_lpt" } else { "" }
         )
     }
 
-    /// `[query tiles, batch · heads, 1]`.
+    /// `[query tiles, batch · heads, 1]`, or with [`FwdConfig::lpt`]
+    /// `[batch · heads, query tiles, 1]`.
     pub fn grid(&self, batch: u32, heads: u32, seq: u32) -> [u32; 3] {
-        [seq.div_ceil(self.block_m()), batch * heads, 1]
+        super::grid_order(self.lpt, seq.div_ceil(self.block_m()), batch * heads)
     }
 
     /// Parameter names in launch order: `q, k, v, o, lse` are f32 device
@@ -397,10 +412,7 @@ pub fn build(cfg: FwdConfig) -> KernelIR {
     let tid = g.var(U32);
     g.b.emit(KirOp::ThreadId(tid, 0));
     let ln = Lane::new(&mut g, tid);
-    let qt_raw = g.var(U32);
-    g.b.emit(KirOp::BlockIdx(qt_raw, 0));
-    let bh = g.var(U32);
-    g.b.emit(KirOp::BlockIdx(bh, 1));
+    let (qt_raw, bh) = super::tile_and_row(&mut g, cfg.lpt);
 
     // Query tile (heaviest first when causal).
     let n_qt = {
@@ -753,11 +765,30 @@ pub fn ptx(cfg: FwdConfig) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// The heaviest-first order swaps the grid's axes and nothing else: the
+    /// kernel reads its tile from `blockIdx.y` and its row from `blockIdx.x`.
+    /// Without causal masking there is no heaviest tile, and no variant.
+    #[test]
+    fn the_lpt_grid_swaps_tiles_and_rows() {
+        let c = FwdConfig::new(64, true);
+        assert_eq!(c.grid(2, 32, 2048), [16, 64, 1]);
+        assert_eq!(c.with_lpt(true).grid(2, 32, 2048), [64, 16, 1]);
+        assert_eq!(FwdConfig::new(64, false).with_lpt(true), FwdConfig::new(64, false));
+        let text = String::from_utf8(ptx(c.with_lpt(true))).unwrap();
+        let plain = String::from_utf8(ptx(c)).unwrap();
+        assert!(text.contains("%ctaid.y") && plain.contains("%ctaid.y"));
+        // Same instructions up to the entry name and the two ctaid reads.
+        let norm = |t: &str| t.replace("_lpt", "").replace("%ctaid.x", "@").replace("%ctaid.y", "@");
+        assert_eq!(norm(&text), norm(&plain));
+        assert_ne!(text.replace("_lpt", ""), plain);
+    }
+
     #[test]
     fn every_variant_verifies_and_lowers_to_tensor_core_ops() {
         for hd in FwdConfig::HEAD_DIMS {
-            for causal in [false, true] {
-                let cfg = FwdConfig::new(hd, causal);
+            for (causal, lpt) in [(false, false), (true, false), (true, true)] {
+                let cfg = FwdConfig::new(hd, causal).with_lpt(lpt);
+                assert_eq!(cfg.kernel_name().ends_with("_lpt"), lpt);
                 let ir = build(cfg);
                 assert_eq!(ir.verify(), Ok(()), "{}", cfg.kernel_name());
                 let text = String::from_utf8(ptx(cfg)).unwrap();
