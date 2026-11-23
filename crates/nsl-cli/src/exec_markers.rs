@@ -278,6 +278,12 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
         "the flash-attention backward ran",
     ),
     m(
+        "[tied-embed]",
+        &["crates/nsl-codegen/src/wengert_lower.rs"],
+        "a tied embedding's gradient was planned in place: the LM head's dW GEMMs and the \
+         embedding scatter add into its accumulation buffer",
+    ),
+    m(
         "[arena]",
         &[
             // The transient-memory arena projection (section 6e of the
@@ -586,6 +592,7 @@ pub mod tokens {
     pub const PASS_TRACE: &str = "[pass-trace]";
     pub const PASS_BUS: &str = "[pass-bus]";
     pub const FLASH_BWD: &str = "[flash-bwd]";
+    pub const TIED_EMBED: &str = "[tied-embed]";
     pub const ARENA: &str = "[arena]";
     pub const GPU_MEM: &str = "[gpu-mem]";
     pub const GPU_LAUNCH_COUNT: &str = "[nsl-gpu-launch-count]";

@@ -1374,6 +1374,14 @@ impl Compiler<'_> {
                                  supposed to be refused at option validation.",
                             ));
                         }
+                        // Planned only inside the FASE-Deferred lowering.
+                        crate::wengert_lower::ParamGradSource::AccumulatedInPlace => {
+                            return Err(CodegenError::new(
+                                "internal: a gradient accumulated in place reached the CSLA \
+                                 window replay; the tied-embedding plan runs only in the FASE \
+                                 hook lowering",
+                            ));
+                        }
                     };
                     let Some(&accum_idx) = hook_idx_map.get(&var_id) else {
                         return Ok(());

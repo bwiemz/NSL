@@ -839,6 +839,128 @@ pub(crate) mod tests {
         }
     }
 
+    /// Grouped K/V read in place against K/V expanded to every query head
+    /// (what `nsl.nn.gqa` handed the attention before it took grouped K/V):
+    /// the forward (O, lse) and dQ are the same bits — each query head reads
+    /// the same K/V values and dQ's prescale is per row — while dK/dV differ
+    /// only in how the group is summed (one f32 accumulator over the group's
+    /// query heads, against per-head dK/dV summed after), and are no less
+    /// accurate against the f64 gradient. At realistic gradient magnitudes.
+    #[test]
+    #[ignore = "requires a CUDA GPU; run with --features cuda -- --ignored"]
+    fn grouped_kv_is_the_expanded_computation_up_to_the_group_sum() {
+        if !gpu() {
+            return;
+        }
+        let cases = [
+            Shape {
+                b: 2,
+                h: 8,
+                kvh: 2,
+                s: 256,
+                d: 64,
+                causal: true,
+            },
+            Shape {
+                b: 1,
+                h: 4,
+                kvh: 1,
+                s: 200,
+                d: 128,
+                causal: true,
+            },
+            Shape {
+                b: 1,
+                h: 6,
+                kvh: 3,
+                s: 130,
+                d: 64,
+                causal: false,
+            },
+        ];
+        for (n, sh) in cases.into_iter().enumerate() {
+            let g = sh.h / sh.kvh;
+            let ex = Shape { kvh: sh.h, ..sh };
+            let mut rng = Lcg(0x6a6a + n as u64);
+            let q = rng.vec(sh.b * sh.h * sh.s * sh.d, 1.0);
+            let k = rng.vec(sh.b * sh.kvh * sh.s * sh.d, 1.0);
+            let v = rng.vec(sh.b * sh.kvh * sh.s * sh.d, 1.0);
+            let dout = rng.vec(sh.b * sh.h * sh.s * sh.d, 1e-6);
+            let head = sh.s * sh.d;
+            let expand = |x: &[f32]| -> Vec<f32> {
+                let mut out = vec![0.0f32; sh.b * sh.h * head];
+                for bi in 0..sh.b {
+                    for hi in 0..sh.h {
+                        let from = (bi * sh.kvh + sh.kv_head(hi)) * head;
+                        let to = (bi * sh.h + hi) * head;
+                        out[to..to + head].copy_from_slice(&x[from..from + head]);
+                    }
+                }
+                out
+            };
+            let (ke, ve) = (expand(&k), expand(&v));
+            let scale = 1.0 / (sh.d as f32).sqrt();
+            let bits = |x: &[f32]| x.iter().map(|v| v.to_bits()).collect::<Vec<u32>>();
+            let (o_g, l_g) = run_forward(sh, &q, &k, &v, scale);
+            let (o_e, l_e) = run_forward(ex, &q, &ke, &ve, scale);
+            assert_eq!(bits(&o_g), bits(&o_e), "{sh:?}: O");
+            assert_eq!(bits(&l_g), bits(&l_e), "{sh:?}: lse");
+            let gr = run_backward(sh, &q, &k, &v, &dout, scale);
+            let er = run_backward(ex, &q, &ke, &ve, &dout, scale);
+            assert_eq!(bits(&gr.dq), bits(&er.dq), "{sh:?}: dQ");
+            // The expanded run's dK/dV summed over each group in head order.
+            let sum = |x: &[f32]| -> Vec<f32> {
+                let mut out = vec![0.0f32; sh.b * sh.kvh * head];
+                for bi in 0..sh.b {
+                    for kv in 0..sh.kvh {
+                        for gi in 0..g {
+                            let from = (bi * sh.h + kv * g + gi) * head;
+                            let to = (bi * sh.kvh + kv) * head;
+                            for r in 0..head {
+                                out[to + r] += x[from + r];
+                            }
+                        }
+                    }
+                }
+                out
+            };
+            let exact = reference_backward(
+                sh,
+                &q,
+                &k,
+                &v,
+                &dout,
+                scale as f64,
+                |x| x as f64,
+                |x| x as f64,
+            );
+            for (name, native, expanded, want) in [
+                ("dK", &gr.dk, sum(&er.dk), &exact.1),
+                ("dV", &gr.dv, sum(&er.dv), &exact.2),
+            ] {
+                let want_f: Vec<f64> = expanded.iter().map(|&x| x as f64).collect();
+                let (diff, _) = rel_err(native, &want_f, 1e-6);
+                let (fe_n, me_n) = rel_err(native, want, 1e-6);
+                let (fe_e, me_e) = rel_err(&expanded, want, 1e-6);
+                eprintln!(
+                    "{sh:?} {name}: native vs expanded frob {diff:.2e}; vs f64 native frob {fe_n:.2e} max {me_n:.2e}, \
+                     expanded frob {fe_e:.2e} max {me_e:.2e}"
+                );
+                // Only the summation order differs: f32 rounding, far below
+                // the f16-operand error both share.
+                assert!(diff < 1e-5, "{name}: native and expanded differ by {diff}");
+                assert!(
+                    fe_n <= fe_e * 1.01 + 1e-7,
+                    "{name}: native {fe_n} less accurate than expanded {fe_e}"
+                );
+                assert!(
+                    fe_n < 5e-3 && me_n < 2e-2,
+                    "{name} vs exact: frob {fe_n}, max {me_n}"
+                );
+            }
+        }
+    }
+
     /// A GPU f32 tensor of `shape` holding `vals`.
     fn tensor_of(shape: &[i64], vals: &[f32]) -> i64 {
         let list = crate::list::nsl_list_new();

@@ -275,6 +275,7 @@ pub mod paged_kv;
 pub mod profiling;
 pub mod kernel_profiler;
 pub mod flash_attention;
+pub mod sdpa_gqa;
 #[cfg(feature = "cuda")]
 pub(crate) mod attention_tc;
 pub mod pca_tier_b_runtime;
