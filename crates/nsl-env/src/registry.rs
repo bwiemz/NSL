@@ -156,7 +156,7 @@ pub static REGISTRY: &[EnvVar] = &[
         "off",
         Diagnostic,
         Runtime,
-        "Print cublasLt bf16/TF32 GEMM counts and add+RMSNorm launches to stderr at exit; NSL_EVENTS gets the GEMM JSON."
+        "Print cublasLt bf16/TF32 GEMM counts, one-GEMM dgrad sums and add+RMSNorm launches to stderr at exit; NSL_EVENTS gets the GEMM JSON."
     ),
     var!(
         "NSL_BF16_LT_PROBE",
@@ -652,6 +652,15 @@ pub static REGISTRY: &[EnvVar] = &[
         Perf,
         Compile,
         "Kill switch for lowering a residual Add and the RMSNorm of its sum as one launch (bit-exact)."
+    ),
+    var!(
+        "NSL_FUSE_DGRAD_ACCUM",
+        Bool,
+        "0 disables; anything else or unset = on",
+        "on",
+        Perf,
+        Compile,
+        "Kill switch for summing a value's input gradients from several GEMMs by GEMM accumulation (beta = 1)."
     ),
     var!(
         "NSL_FUSE_ELEMENTWISE_BWD",

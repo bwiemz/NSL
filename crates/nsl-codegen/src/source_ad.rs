@@ -2006,6 +2006,160 @@ pub fn fuse_rmsnorm_dx_residual(
     fused
 }
 
+/// `NSL_FUSE_DGRAD_ACCUM=0` (compile time) turns [`fuse_dgrad_accumulate`] off.
+pub fn dgrad_accumulate_enabled() -> bool {
+    std::env::var("NSL_FUSE_DGRAD_ACCUM").ok().as_deref() != Some("0")
+}
+
+/// Round-2 item 6, part 2: sum a value's input gradients from several GEMMs by GEMM
+/// accumulation instead of separate GEMM outputs and add kernels.
+///
+/// A value read by several linear layers (`x -> q, k, v`; `x -> gate, up`) receives one
+/// gradient per layer, accumulated as each arrives (`Add(existing, value)`), each term
+/// the layer's input gradient `reduce_to_shape(Matmul(G, T(W)), x)`. Rewrite
+///
+/// ```text
+///   g = Matmul(a, T(W))   r = reduce_to_shape(g, like)   s = Add(c, r)
+///     =>  s = Passthrough("matmul_acc")(a, T(W), c)
+/// ```
+///
+/// deleting `g` and `r`. `matmul_acc(a, b, c) = c + reduce_to_shape(a @ b, c)`: one GEMM
+/// that adds `c` in its epilogue (beta = 1) where the shapes allow, the three ops
+/// otherwise (`nsl_tensor_matmul_acc`). Conditions, each a real hazard:
+///
+/// - `g` and `r` each have one reader (they are deleted) and neither is a needed
+///   parameter gradient;
+/// - `W` is a parameter read through the `[-2, -1]` transpose source AD emits: this is
+///   a linear layer's INPUT gradient. Weight gradients (`Matmul(T(x), G)`) belong to the
+///   FASE hook and `--fuse-wgrad-accum`, and are never matched;
+/// - `c` has `like`'s shape by construction: it is itself `reduce_to_shape(_, like)` for
+///   the same `like`, or an earlier `matmul_acc` onto it. So `like` is not an operand
+///   (CCR's shape-only read accounting is untouched; the deleted reduce was one of
+///   `like`'s shape reads);
+/// - the sum `s` is not a needed parameter gradient.
+///
+/// The latest term (`value`, operand 1) is the one folded first, so `(dv + dk) + dq`
+/// becomes v's GEMM -> accumulate k -> accumulate q: the same association, so the same
+/// sum (the runtime's fast path rounds `acc + c` once, as the add kernel did).
+///
+/// Runs on the adjoint before free insertion and before the CCR splice (`ops` must be
+/// free of `FreeTensor`), so the GEMM's move from `g`'s position to the Add's crosses no
+/// free of its operands. `params` holds every `Param` VarId of both tapes. Ops are
+/// renumbered positionally. Returns the number of accumulations.
+pub fn fuse_dgrad_accumulate(
+    ops: &mut Vec<crate::wengert::WengertOp>,
+    needed: &std::collections::HashSet<crate::wengert::VarId>,
+    params: &std::collections::HashSet<crate::wengert::VarId>,
+) -> usize {
+    crate::wengert::assert_ids_in_space(
+        ops,
+        crate::wengert::IdSpace::Adjoint,
+        "source_ad::fuse_dgrad_accumulate (argument)",
+    );
+    use crate::wengert::{PrimalOp, VarId};
+    use std::collections::HashMap;
+
+    if !dgrad_accumulate_enabled() {
+        return 0;
+    }
+    debug_assert!(
+        !ops.iter().any(|op| matches!(op.op, PrimalOp::FreeTensor)),
+        "fuse_dgrad_accumulate must run before free insertion"
+    );
+
+    let mut reads: HashMap<VarId, usize> = HashMap::new();
+    let mut producer: HashMap<VarId, usize> = HashMap::new();
+    for (i, op) in ops.iter().enumerate() {
+        for inp in &op.inputs {
+            *reads.entry(*inp).or_default() += 1;
+        }
+        producer.insert(op.result, i);
+    }
+    let is_pt = |op: &crate::wengert::WengertOp, name: &str, n: usize| {
+        matches!(&op.op, PrimalOp::Passthrough(p) if p == name) && op.inputs.len() == n
+    };
+    // The `like` of each value known to have its shape: reduce_to_shape results, and the
+    // accumulations made below.
+    let mut like_of: HashMap<VarId, VarId> = ops
+        .iter()
+        .filter(|op| is_pt(op, "reduce_to_shape", 2))
+        .map(|op| (op.result, op.inputs[1]))
+        .collect();
+
+    let mut remove: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut fused = 0usize;
+    for i in 0..ops.len() {
+        if !matches!(ops[i].op, PrimalOp::Add)
+            || ops[i].inputs.len() != 2
+            || needed.contains(&ops[i].result)
+        {
+            continue;
+        }
+        let (p, q) = (ops[i].inputs[0], ops[i].inputs[1]);
+        if p == q {
+            continue;
+        }
+        // `value` (operand 1, the latest contribution) first.
+        let found = [(p, q), (q, p)].into_iter().find_map(|(c, r)| {
+            if reads.get(&r).copied() != Some(1) || needed.contains(&r) {
+                return None;
+            }
+            let &jr = producer.get(&r)?;
+            if jr >= i || remove.contains(&jr) || !is_pt(&ops[jr], "reduce_to_shape", 2) {
+                return None;
+            }
+            let (g, like) = (ops[jr].inputs[0], ops[jr].inputs[1]);
+            if reads.get(&g).copied() != Some(1) || needed.contains(&g) {
+                return None;
+            }
+            let &jg = producer.get(&g)?;
+            if jg >= jr
+                || remove.contains(&jg)
+                || ops[jg].op != PrimalOp::Matmul
+                || ops[jg].inputs.len() != 2
+            {
+                return None;
+            }
+            let (a, bt) = (ops[jg].inputs[0], ops[jg].inputs[1]);
+            // `bt` = T(W), W a parameter: an input gradient.
+            let &jt = producer.get(&bt)?;
+            let input_gradient = matches!(
+                ops[jt].op,
+                PrimalOp::Transpose { dim0, dim1 } if dim0 == usize::MAX - 1 && dim1 == usize::MAX
+            ) && ops[jt].inputs.len() == 1
+                && params.contains(&ops[jt].inputs[0]);
+            if !input_gradient || a == c || bt == c {
+                return None;
+            }
+            // `c` has `like`'s shape.
+            if like_of.get(&c) != Some(&like) {
+                return None;
+            }
+            Some((a, bt, c, like, jg, jr))
+        });
+        let Some((a, bt, c, like, jg, jr)) = found else {
+            continue;
+        };
+        ops[i].op = PrimalOp::Passthrough("matmul_acc".into());
+        ops[i].inputs = vec![a, bt, c];
+        like_of.insert(ops[i].result, like);
+        remove.insert(jg);
+        remove.insert(jr);
+        fused += 1;
+    }
+    if fused == 0 {
+        return 0;
+    }
+    let mut idx = 0;
+    ops.retain(|_| {
+        let keep = !remove.contains(&idx);
+        idx += 1;
+        keep
+    });
+    crate::wengert::renumber_adjoint_ops(ops);
+    fused
+}
+
 pub fn fuse_swiglu_gate_backward(
     ops: &mut Vec<crate::wengert::WengertOp>,
     needed: &std::collections::HashSet<crate::wengert::VarId>,
@@ -7897,6 +8051,162 @@ impl<'a> WengertExtractor<'a> {
 
 #[cfg(test)]
 mod tests {
+    /// The q/k/v input gradients of one norm output `n` (5) as source AD emits them:
+    /// v, k, q (reverse order), each `reduce_to_shape(Matmul(G, T(W)), n)`, accumulated
+    /// with `Add(existing, value)`, k's and q's weight-gradient chains interleaved, then
+    /// the norm backward reading the sum. Parameters 1, 2, 3 (Wv, Wk, Wq).
+    fn qkv_dgrad_tape() -> Vec<crate::wengert::WengertOp> {
+        use crate::wengert::{adjoint_op_id, PrimalOp, WengertOp};
+        let t = PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX };
+        let r = || PrimalOp::Passthrough("reduce_to_shape".into());
+        let rows: Vec<(u32, PrimalOp, Vec<u32>)> = vec![
+            (200, t.clone(), vec![1]),
+            (201, PrimalOp::Matmul, vec![10, 200]),
+            (202, r(), vec![201, 5]),
+            (220, t.clone(), vec![5]),
+            (221, PrimalOp::Matmul, vec![220, 10]),
+            (222, r(), vec![221, 1]),
+            (203, t.clone(), vec![2]),
+            (204, PrimalOp::Matmul, vec![11, 203]),
+            (205, r(), vec![204, 5]),
+            (206, PrimalOp::Add, vec![202, 205]),
+            (223, t.clone(), vec![5]),
+            (224, PrimalOp::Matmul, vec![223, 11]),
+            (225, r(), vec![224, 2]),
+            (207, t.clone(), vec![3]),
+            (208, PrimalOp::Matmul, vec![12, 207]),
+            (209, r(), vec![208, 5]),
+            (210, PrimalOp::Add, vec![206, 209]),
+            (226, t, vec![5]),
+            (227, PrimalOp::Matmul, vec![226, 12]),
+            (228, r(), vec![227, 3]),
+            (
+                211,
+                PrimalOp::Passthrough("rmsnorm_dx_backward_add:var".into()),
+                vec![210, 6, 7, 8, 9],
+            ),
+        ];
+        rows.into_iter()
+            .enumerate()
+            .map(|(i, (result, op, inputs))| WengertOp {
+                id: adjoint_op_id(i),
+                result,
+                op,
+                inputs,
+                saved_for_backward: false,
+                checkpointed: false,
+            })
+            .collect()
+    }
+
+    fn qkv_params() -> std::collections::HashSet<u32> {
+        [1, 2, 3].into_iter().collect()
+    }
+
+    #[test]
+    fn dgrad_accumulation_folds_the_qkv_sum_in_its_order_and_leaves_weight_gradients() {
+        use crate::wengert::PrimalOp;
+        let mut ops = qkv_dgrad_tape();
+        let needed: std::collections::HashSet<u32> = [222, 225, 228].into_iter().collect();
+        assert_eq!(super::fuse_dgrad_accumulate(&mut ops, &needed, &qkv_params()), 2);
+        let by = |v: u32| ops.iter().find(|o| o.result == v).unwrap_or_else(|| panic!("no {v}"));
+        // v's GEMM and its reduce stay; k accumulates onto v; q onto the sum.
+        assert!(matches!(by(201).op, PrimalOp::Matmul) && by(202).inputs == vec![201, 5]);
+        assert!(matches!(&by(206).op, PrimalOp::Passthrough(n) if n == "matmul_acc"));
+        assert_eq!(by(206).inputs, vec![11, 203, 202]);
+        assert!(matches!(&by(210).op, PrimalOp::Passthrough(n) if n == "matmul_acc"));
+        assert_eq!(by(210).inputs, vec![12, 207, 206]);
+        for gone in [204, 205, 208, 209] {
+            assert!(
+                !ops.iter().any(|o| o.result == gone),
+                "{gone} must be deleted"
+            );
+        }
+        // The weight-gradient chains are untouched and still contiguous.
+        for (t, m, r) in [(220, 221, 222), (223, 224, 225), (226, 227, 228)] {
+            let i = ops.iter().position(|o| o.result == t).expect("transpose");
+            assert_eq!((ops[i + 1].result, ops[i + 2].result), (m, r));
+        }
+        // Ids renumbered positionally in the adjoint space.
+        for (i, o) in ops.iter().enumerate() {
+            assert_eq!(o.id, crate::wengert::adjoint_op_id(i));
+        }
+    }
+
+    #[test]
+    fn dgrad_accumulation_refuses_what_it_cannot_prove() {
+        use crate::wengert::PrimalOp;
+        let none: std::collections::HashSet<u32> = Default::default();
+        // W not a parameter: not a linear layer's input gradient.
+        let mut ops = qkv_dgrad_tape();
+        assert_eq!(
+            super::fuse_dgrad_accumulate(&mut ops, &none, &Default::default()),
+            0
+        );
+        // A term's GEMM output read elsewhere.
+        let mut ops = qkv_dgrad_tape();
+        ops.push(ops[0].clone());
+        let last = ops.len() - 1;
+        ops[last].result = 300;
+        ops[last].op = PrimalOp::Mul;
+        ops[last].inputs = vec![204, 208];
+        crate::wengert::renumber_adjoint_ops(&mut ops);
+        // k's and q's GEMM outputs are shared, so they stay; v's term folds onto k's
+        // (the other operand order: one rounding of a commutative add, the same sum).
+        assert_eq!(
+            super::fuse_dgrad_accumulate(&mut ops, &none, &qkv_params()),
+            1
+        );
+        let s1 = ops.iter().find(|o| o.result == 206).expect("the first sum");
+        assert_eq!(s1.inputs, vec![10, 200, 205]);
+        assert!(ops.iter().any(|o| o.result == 204) && ops.iter().any(|o| o.result == 208));
+        // The sum itself needed (a parameter gradient), and a needed term.
+        let mut ops = qkv_dgrad_tape();
+        let needed: std::collections::HashSet<u32> = [206, 209].into_iter().collect();
+        assert_eq!(
+            super::fuse_dgrad_accumulate(&mut ops, &needed, &qkv_params()),
+            0
+        );
+        // The accumulator not of the term's shape (another `like`).
+        let mut ops = qkv_dgrad_tape();
+        for o in ops.iter_mut().filter(|o| o.result == 202) {
+            o.inputs = vec![201, 99];
+        }
+        // k's Add then has nothing proven; q's Add folds onto nothing either (206 unproven).
+        assert_eq!(
+            super::fuse_dgrad_accumulate(&mut ops, &none, &qkv_params()),
+            0
+        );
+        // A sum of weight gradients (a parameter used twice) is never matched.
+        let t = PrimalOp::Transpose {
+            dim0: usize::MAX - 1,
+            dim1: usize::MAX,
+        };
+        let r = PrimalOp::Passthrough("reduce_to_shape".into());
+        let mk =
+            |i: usize, result: u32, op: PrimalOp, inputs: Vec<u32>| crate::wengert::WengertOp {
+                id: crate::wengert::adjoint_op_id(i),
+                result,
+                op,
+                inputs,
+                saved_for_backward: false,
+                checkpointed: false,
+            };
+        let mut ops = vec![
+            mk(0, 400, t.clone(), vec![40]),
+            mk(1, 401, PrimalOp::Matmul, vec![400, 41]),
+            mk(2, 402, r.clone(), vec![401, 1]),
+            mk(3, 403, t, vec![42]),
+            mk(4, 404, PrimalOp::Matmul, vec![403, 43]),
+            mk(5, 405, r, vec![404, 1]),
+            mk(6, 406, PrimalOp::Add, vec![402, 405]),
+        ];
+        assert_eq!(
+            super::fuse_dgrad_accumulate(&mut ops, &none, &qkv_params()),
+            0
+        );
+    }
+
     #[test]
     fn rmsnorm_residual_fold_fuses_both_operand_orders() {
         use crate::wengert::{adjoint_op_id, PrimalOp, WengertOp};

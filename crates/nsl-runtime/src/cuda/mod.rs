@@ -5318,7 +5318,7 @@ fn gpu_cast_raw(ptx: *const u8, kname: *const u8, src: u64, dst: u64, n: usize) 
 static BATCH_COLLAPSE_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 #[cfg(feature = "cuda")]
-fn batch_collapse_disabled() -> bool {
+pub(crate) fn batch_collapse_disabled() -> bool {
     use std::sync::atomic::Ordering;
     match BATCH_COLLAPSE_STATE.load(Ordering::Relaxed) {
         1 => false,

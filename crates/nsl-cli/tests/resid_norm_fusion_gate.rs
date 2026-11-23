@@ -1,13 +1,16 @@
 //! Round-2 perf item 6 gates: the residual add lowered together with the RMSNorm of its
-//! sum (one launch, `NSL_FUSE_ADD_RMSNORM`).
+//! sum (one launch, `NSL_FUSE_ADD_RMSNORM`), and a value's input gradients from several
+//! GEMMs summed by GEMM accumulation (`NSL_FUSE_DGRAD_ACCUM`).
 //!
-//! Claimed bit-exact: the fused kernel is the add kernel and the norm kernel's
-//! arithmetic, so a program prints the same losses, to the last digit, with the kill
-//! switch. Fixture: two pre-norm transformer blocks (stdlib grouped-query attention,
-//! SwiGLU MLP, residual adds) in a `blocks` array, the production flag line,
-//! `--deterministic`, four micro-batches per optimizer step. Compiled pairs: 3 forward
-//! (each block's mid-block add, block 0's output into block 1's attention norm) and 2 in
-//! CCR's recompute.
+//! Both are claimed bit-exact: the fused kernel is the add kernel and the norm kernel's
+//! arithmetic, and the accumulating GEMM runs the standalone product's plan with the
+//! add's one rounding in its epilogue. So a program prints the same losses, to the last
+//! digit, with either or both kill switches. Fixture: two pre-norm transformer blocks
+//! (stdlib grouped-query attention, SwiGLU MLP, residual adds) in a `blocks` array, the
+//! production flag line, `--deterministic`, four micro-batches per optimizer step.
+//! Per micro-batch: 3 forward pairs (each block's mid-block add, block 0's output into
+//! block 1's attention norm) and 2 in CCR's recompute; 3 accumulations per block (k and
+//! q onto v, gate onto up).
 
 use std::process::Command;
 
@@ -105,6 +108,7 @@ fn run(tag: &str, src: &str, flags: &[&str], env: &[(&str, &str)]) -> (String, S
         .current_dir(&tmp)
         .env("NSL_STDLIB_PATH", root.join("stdlib"))
         .env_remove("NSL_FUSE_ADD_RMSNORM")
+        .env_remove("NSL_FUSE_DGRAD_ACCUM")
         .env_remove("NSL_MATMUL_BF16");
     for (k, v) in env {
         cmd.env(k, v);
@@ -162,61 +166,88 @@ fn assert_fused_launches(tag: &str, err: &str) {
     );
 }
 
-/// The two arms (the fusion and its kill switch) of one program: their losses are
-/// identical; the marker fires only with the fusion. Returns the default arm's
-/// (stderr, profile).
-fn two_arms(
+/// The four arms (both fusions, each alone, neither) of one program: their losses are
+/// identical; the markers fire exactly in the arms that enable them. Returns the
+/// default arm's (stderr, profile).
+fn four_arms(
     tag: &str,
     src: &str,
     flags: &[&str],
     env: &[(&str, &str)],
     pairs: &str,
+    accs: &str,
 ) -> (String, String) {
     let with = |extra: &[(&'static str, &'static str)]| -> Vec<(&str, &str)> {
         env.iter()
             .copied()
             .chain(extra.iter().copied())
-            .chain([("NSL_PROFILE_KERNELS", "1")])
+            .chain([("NSL_PROFILE_KERNELS", "1"), ("NSL_BF16_LT_COUNTER", "1")])
             .collect()
     };
     let (on, on_err, on_prof) = run(&format!("{tag}_on"), src, flags, &with(&[]));
-    let (off, off_err, off_prof) = run(
-        &format!("{tag}_off"),
+    let (no_a, no_a_err, no_a_prof) = run(
+        &format!("{tag}_noA"),
         src,
         flags,
         &with(&[("NSL_FUSE_ADD_RMSNORM", "0")]),
     );
+    let (no_b, no_b_err, _) = run(
+        &format!("{tag}_noB"),
+        src,
+        flags,
+        &with(&[("NSL_FUSE_DGRAD_ACCUM", "0")]),
+    );
+    let (off, off_err, _) = run(
+        &format!("{tag}_off"),
+        src,
+        flags,
+        &with(&[("NSL_FUSE_ADD_RMSNORM", "0"), ("NSL_FUSE_DGRAD_ACCUM", "0")]),
+    );
     assert!(on_err.contains(pairs), "{tag}: want `{pairs}`:\n{on_err}");
+    assert!(on_err.contains(accs), "{tag}: want `{accs}`:\n{on_err}");
     assert!(
-        !off_err.contains("[fuse] add+rmsnorm pairs:"),
+        no_a_err.contains(accs) && !no_a_err.contains("[fuse] add+rmsnorm pairs:"),
+        "{tag}:\n{no_a_err}"
+    );
+    assert!(
+        no_b_err.contains(pairs) && !no_b_err.contains("[fuse] dgrad accumulations:"),
+        "{tag}:\n{no_b_err}"
+    );
+    assert!(
+        !off_err.contains("[fuse] add+rmsnorm pairs:")
+            && !off_err.contains("[fuse] dgrad accumulations:"),
         "{tag}:\n{off_err}"
     );
-    let (l_on, l_off) = (losses(&on), losses(&off));
+    let (l_on, l_a, l_b, l_off) = (losses(&on), losses(&no_a), losses(&no_b), losses(&off));
     assert_eq!(l_off.len(), 8, "{tag}: one loss per micro-batch:\n{off}");
     assert!(
         l_off[7] < l_off[0],
         "{tag}: the program did not train: {l_off:?}"
     );
-    assert_eq!(l_on, l_off, "{tag}: the add+norm launch vs the kill switch");
-    if !off_prof.is_empty() {
+    assert_eq!(l_on, l_off, "{tag}: both fusions vs neither");
+    assert_eq!(l_a, l_off, "{tag}: the accumulation alone vs neither");
+    assert_eq!(l_b, l_off, "{tag}: the add+norm launch alone vs neither");
+    if !no_a_prof.is_empty() {
         assert!(
-            !off_prof.contains("\"name\":\"nsl_add_rmsnorm"),
+            !no_a_prof.contains("\"name\":\"nsl_add_rmsnorm"),
             "{tag}: the kill switch still launched it"
         );
     }
+    let _ = on_prof.len();
     (on_err, on_prof)
 }
 
-/// On the host the grouping runs (the runtime takes the two calls there), so the marker
-/// and the losses check the compiler side in the default test run.
+/// On the host both rewrites run (the runtime takes the decomposed calls there), so the
+/// markers and the losses check the compiler side in the default test run.
 #[test]
 fn resid_norm_fusions_fire_and_are_bit_exact_cpu() {
-    two_arms(
+    four_arms(
         "cpu",
         &fixture(false, false, false),
         PROD,
         &[],
         "[fuse] add+rmsnorm pairs: 5 (3 forward, 2 backward)",
+        "[fuse] dgrad accumulations: 6",
     );
 }
 
@@ -225,35 +256,40 @@ fn resid_norm_fusions_fire_and_are_bit_exact_cpu() {
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn resid_norm_fusions_are_bit_exact_under_f32_storage_gpu() {
-    let (err, prof) = two_arms(
+    let (err, prof) = four_arms(
         "f32",
         &fixture(true, false, false),
         PROD,
         &[],
         "[fuse] add+rmsnorm pairs: 5 (3 forward, 2 backward)",
+        "[fuse] dgrad accumulations: 6",
     );
     assert!(
         prof.contains("\"name\":\"nsl_add_rmsnorm_f32"),
         "no fused launch:\n{prof}"
     );
     assert_fused_launches("f32", &err);
+    // An f32 program's products are TF32: its sums are the unfused calls by design.
+    assert_eq!(counter(&err, "[dgrad-acc] one-gemm="), 0, "{err}");
+    assert!(counter(&err, " decomposed=") > 0, "{err}");
 }
 
 /// bf16 activation storage with the production flags (the tensor-core attention backward
 /// kept on the device under `--deterministic`): the fused kernel reads the f32 residual
-/// and the bf16 projection and writes the f32 sum and the bf16 norm output, with GEMMs
-/// through GemmEx and, with `NSL_MATMUL_BF16_LT=1`, cublasLt. Bit-identical to the kill
-/// switch.
+/// and the bf16 projection and writes the f32 sum and the bf16 norm output; the
+/// accumulating GEMMs take the bf16-storage route through GemmEx and, with
+/// `NSL_MATMUL_BF16_LT=1`, through cublasLt. Bit-identical to the kill switches.
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn resid_norm_fusions_are_bit_exact_under_bf16_storage_gpu() {
     for (tag, lt) in [("bf16", "0"), ("bf16lt", "1")] {
-        let (err, prof) = two_arms(
+        let (err, prof) = four_arms(
             tag,
             &fixture(true, true, false),
             PROD,
             &[("NSL_FLASH_BWD_CPU", "0"), ("NSL_MATMUL_BF16_LT", lt)],
             "[fuse] add+rmsnorm pairs: 5 (3 forward, 2 backward)",
+            "[fuse] dgrad accumulations: 6",
         );
         assert!(
             err.contains("[bf16-storage] 2 SwiGLU MLP block(s) stored bf16"),
@@ -264,6 +300,12 @@ fn resid_norm_fusions_are_bit_exact_under_bf16_storage_gpu() {
             "{tag}: no fused launch:\n{prof}"
         );
         assert_fused_launches(tag, &err);
+        // The gate/up sums (bf16 gradients, the storage route) take one GEMM; the
+        // fixture's q/k sums are below the eager bf16 mode's intensity gate (TF32).
+        assert!(
+            counter(&err, "[dgrad-acc] one-gemm=") > 0,
+            "{tag}: no one-GEMM sum ran:\n{err}"
+        );
     }
 }
 
@@ -273,12 +315,13 @@ fn resid_norm_fusions_are_bit_exact_under_bf16_storage_gpu() {
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn resid_norm_fusions_compose_with_dropout_under_bf16_storage_gpu() {
-    let (err, prof) = two_arms(
+    let (err, prof) = four_arms(
         "bf16drop",
         &fixture(true, true, true),
         PROD,
         &[("NSL_FLASH_BWD_CPU", "0")],
         "[fuse] add+rmsnorm pairs: 5 (3 forward, 2 backward)",
+        "[fuse] dgrad accumulations: 6",
     );
     assert!(
         prof.contains("\"name\":\"nsl_add_rmsnorm_ff_fb"),

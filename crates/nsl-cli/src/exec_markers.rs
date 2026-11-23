@@ -334,6 +334,12 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
          and fallback GEMMs",
     ),
     m(
+        "[dgrad-acc]",
+        &["crates/nsl-runtime/src/args.rs"],
+        "the input-gradient sums at exit (NSL_BF16_LT_COUNTER=1): accumulated by one GEMM \
+         (beta = 1) or run as the unfused GEMM, reduce and add",
+    ),
+    m(
         "[add-rmsnorm]",
         &["crates/nsl-runtime/src/args.rs"],
         "the residual add + RMSNorm launches at exit (NSL_BF16_LT_COUNTER=1): one fused \
@@ -863,6 +869,14 @@ pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
         parts: &[(
             "[fuse] add+rmsnorm pairs:",
             "crates/nsl-codegen/src/stmt_train/driver.rs",
+        )],
+    },
+    NegativeNeedle {
+        test: "crates/nsl-cli/tests/resid_norm_fusion_gate.rs",
+        asserts: "no input-gradient sum by GEMM accumulation with NSL_FUSE_DGRAD_ACCUM=0",
+        parts: &[(
+            "[fuse] dgrad accumulations:",
+            "crates/nsl-codegen/src/stmt_train/adjoint_tape_opt.rs",
         )],
     },
     NegativeNeedle {

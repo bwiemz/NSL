@@ -1921,6 +1921,23 @@ fn lower_storage_op(
         PrimalOp::Passthrough(name) if name == "reduce_to_shape" => {
             call(compiler, builder, "nsl_tensor_reduce_to_shape_dt", &[inputs[0], inputs[1], dt])
         }
+        PrimalOp::Passthrough(name) if name == "matmul_acc" => {
+            // Route 3: a bf16 sum (the value's gradient is bf16), replayed as the
+            // unfused bf16 GEMM, reduce and add; route 2: the GEMM the eager bf16 rule
+            // decides (`nsl_tensor_matmul_pdt`); route 1: `_dt` to f32.
+            let route = match storage {
+                crate::stmt_train::storage_plan::Storage::Bf16 => 3,
+                _ if compiler.storage_param_gemm.contains(&op.result) => 2,
+                _ => 1,
+            };
+            let route = builder.ins().iconst(cl_types::I64, route);
+            call(
+                compiler,
+                builder,
+                "nsl_tensor_matmul_acc",
+                &[inputs[0], inputs[1], inputs[2], route],
+            )
+        }
         PrimalOp::Passthrough(name) if name == "rope" || name == "rope_backward" => {
             let f = if name == "rope" { "nsl_tensor_rope_dt" } else { "nsl_tensor_rope_backward_dt" };
             call(compiler, builder, f, &[inputs[0], inputs[1], inputs[2], dt])
@@ -4190,6 +4207,17 @@ fn lower_single_op(
                 "rope" => call(compiler, builder, "nsl_tensor_rope", &[inputs[0], inputs[1], inputs[2]]),
                 "rope_backward" => {
                     call(compiler, builder, "nsl_tensor_rope_backward", &[inputs[0], inputs[1], inputs[2]])
+                }
+                // A gradient summed from several GEMMs (`source_ad::fuse_dgrad_accumulate`):
+                // `c + a @ b`, inputs [a, b, c]; route 0 = the plain matmul's.
+                "matmul_acc" => {
+                    let route = builder.ins().iconst(cl_types::I64, 0);
+                    call(
+                        compiler,
+                        builder,
+                        "nsl_tensor_matmul_acc",
+                        &[inputs[0], inputs[1], inputs[2], route],
+                    )
                 }
                 // The fused SwiGLU (`source_ad::fuse_swiglu_forward`) and the
                 // up branch's adjoint; inputs [gate, up] and [grad, gate].

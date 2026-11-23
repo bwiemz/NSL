@@ -613,6 +613,9 @@ macro_rules! for_each_runtime_fn {
             // The pre-norm residual add and the RMSNorm of its sum in one launch: an NslList
             // [h, n]; the two i64 are the unfused calls' routes (0 plain, 1 f32, 3 bf16).
             [abi_tensor] nsl_tensor_add_rmsnorm(i64, i64, i64, f64, i64, i64) -> i64 = residual_norm::nsl_tensor_add_rmsnorm;
+            // A linear layer's input gradient added to the gradient summed so far for the same
+            // value, by GEMM accumulation (beta = 1): (a, b, c, route) -> c + a @ b, f32.
+            [abi_tensor] nsl_tensor_matmul_acc(i64, i64, i64, i64) -> i64 = storage_dt::nsl_tensor_matmul_acc;
             // p4 slice 3: fused Sigmoid backward — grad * y*(1-y), y = σ output.
             [abi_tensor] nsl_tensor_sigmoid_backward(i64, i64) -> i64 = tensor::activation::nsl_tensor_sigmoid_backward;
             // p4 slice 3: fused Tanh backward — grad * (1 - y*y), y = tanh output.
@@ -1388,6 +1391,6 @@ mod tests {
     fn table_is_the_recorded_size() {
         // The count is pinned so a row dropped by a bad merge is noticed; move
         // it with a row that is deliberately added or removed.
-        assert_eq!(RUNTIME_ABI.len(), 682);
+        assert_eq!(RUNTIME_ABI.len(), 683);
     }
 }

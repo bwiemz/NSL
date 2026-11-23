@@ -132,6 +132,22 @@ impl Compiler<'_> {
         if norm_res_folds > 0 {
             nsl_log::nsl_log!(INFO, "fuse", "[fuse] rmsnorm dx+residual folds: {norm_res_folds}");
         }
+        // Round-2 item 6: a value's input gradients from several GEMMs (x -> q, k, v;
+        // x -> gate, up) summed by GEMM accumulation (beta = 1) instead of separate
+        // outputs and add kernels. Before the elementwise-chain fuser, which would
+        // otherwise claim the adds.
+        let params: HashSet<VarId> = effective_primal
+            .ops
+            .iter()
+            .chain(adjoint.ops.iter())
+            .filter(|o| matches!(o.op, crate::wengert::PrimalOp::Param(_)))
+            .map(|o| o.result)
+            .collect();
+        let dgrad_accs =
+            crate::source_ad::fuse_dgrad_accumulate(&mut adjoint.ops, &adjoint_needed, &params);
+        if dgrad_accs > 0 {
+            nsl_log::nsl_log!(INFO, "fuse", "[fuse] dgrad accumulations: {dgrad_accs}");
+        }
         // MFU campaign C2: the RoPE backward fold is generation-time
         // (rotate_half_neg emitted instead of rotate_half + Neg);
         // count the ops here so gates have an anti-vacuity witness.
