@@ -682,9 +682,12 @@ impl Planner<'_> {
                 // (through the head view's adjoint views: the q/k projections'
                 // dgrad and wgrad) is written bf16, the operand those GEMMs
                 // take, instead of f32 for each GEMM to round.
-                if in_adjoint && target().is_some_and(|t| self.grad_is_bf16(t)) {
-                    self.set(op, Storage::Bf16);
-                } else if reads_bf16 && in_adjoint && self.rope_grad_bf16 && feeds_only_gemms(rd_adj, op.result) {
+                if (in_adjoint && target().is_some_and(|t| self.grad_is_bf16(t)))
+                    || (reads_bf16
+                        && in_adjoint
+                        && self.rope_grad_bf16
+                        && feeds_only_gemms(rd_adj, op.result))
+                {
                     self.set(op, Storage::Bf16);
                 } else if reads_bf16 {
                     self.set(op, Storage::F32);

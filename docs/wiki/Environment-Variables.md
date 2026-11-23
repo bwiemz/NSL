@@ -46,7 +46,7 @@ Every `NSL_*` variable the toolchain reads (189 of them), from the registry in `
 | `NSL_TIED_EMBED_INPLACE` | bool | 0 only | on (a tied embedding's gradient is accumulated in place) | compile | Set to 0 at build time to materialise a tied embedding's two gradient contributions and add their sum, instead of in place. |
 | `NSL_WRGA_FUSED_CUDA` | bool | 1 only (read per call, not cached) | off (unfused adapter ops) | both | Set to 1 to compile @adapter sites to the fused call on a pinned sm_80+ target and launch its kernel at run time. Half precision, base product included. |
 
-## perf (32)
+## perf (34)
 
 | Variable | Kind | Accepted | Default | Read at | What it does |
 |---|---|---|---|---|---|
